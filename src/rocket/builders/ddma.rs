@@ -6,6 +6,7 @@ use crate::rocket::{
 // ========================================================================
 // CFG_OUTSTANDING (0x8000)
 // ========================================================================
+#[derive(Debug, Clone, Copy)]
 pub struct DdmaCfgOutstanding;
 
 impl RegisterMeta for DdmaCfgOutstanding {
@@ -30,6 +31,7 @@ impl Register<DdmaCfgOutstanding> {
 // ========================================================================
 // RD_WEIGHT_0 (0x8004)
 // ========================================================================
+#[derive(Debug, Clone, Copy)]
 pub struct DdmaRdWeight0;
 
 impl RegisterMeta for DdmaRdWeight0 {
@@ -66,6 +68,7 @@ impl Register<DdmaRdWeight0> {
 // ========================================================================
 // WR_WEIGHT_0 (0x8008)
 // ========================================================================
+#[derive(Debug, Clone, Copy)]
 pub struct DdmaWrWeight0;
 
 impl RegisterMeta for DdmaWrWeight0 {
@@ -90,6 +93,7 @@ impl Register<DdmaWrWeight0> {
 // ========================================================================
 // CFG_ID_ERROR (0x800C)
 // ========================================================================
+#[derive(Debug, Clone, Copy)]
 pub struct DdmaCfgIdError;
 
 impl RegisterMeta for DdmaCfgIdError {
@@ -114,6 +118,7 @@ impl Register<DdmaCfgIdError> {
 // ========================================================================
 // RD_WEIGHT_1 (0x8010)
 // ========================================================================
+#[derive(Debug, Clone, Copy)]
 pub struct DdmaRdWeight1;
 
 impl RegisterMeta for DdmaRdWeight1 {
@@ -132,6 +137,7 @@ impl Register<DdmaRdWeight1> {
 // ========================================================================
 // CFG_DMA_FIFO_CLR (0x8014)
 // ========================================================================
+#[derive(Debug, Clone, Copy)]
 pub struct DdmaCfgDmaFifoClr;
 
 impl RegisterMeta for DdmaCfgDmaFifoClr {
@@ -150,6 +156,7 @@ impl Register<DdmaCfgDmaFifoClr> {
 // ========================================================================
 // CFG_DMA_ARB (0x8018)
 // ========================================================================
+#[derive(Debug, Clone, Copy)]
 pub struct DdmaCfgDmaArb;
 
 impl RegisterMeta for DdmaCfgDmaArb {
@@ -186,6 +193,7 @@ impl Register<DdmaCfgDmaArb> {
 // ========================================================================
 // CFG_DMA_RD_QOS (0x8020)
 // ========================================================================
+#[derive(Debug, Clone, Copy)]
 pub struct DdmaCfgDmaRdQos;
 
 impl RegisterMeta for DdmaCfgDmaRdQos {
@@ -228,6 +236,7 @@ impl Register<DdmaCfgDmaRdQos> {
 // ========================================================================
 // CFG_DMA_RD_CFG (0x8024)
 // ========================================================================
+#[derive(Debug, Clone, Copy)]
 pub struct DdmaCfgDmaRdCfg;
 
 impl RegisterMeta for DdmaCfgDmaRdCfg {
@@ -270,6 +279,7 @@ impl Register<DdmaCfgDmaRdCfg> {
 // ========================================================================
 // CFG_DMA_WR_CFG (0x8028)
 // ========================================================================
+#[derive(Debug, Clone, Copy)]
 pub struct DdmaCfgDmaWrCfg;
 
 impl RegisterMeta for DdmaCfgDmaWrCfg {
@@ -312,6 +322,7 @@ impl Register<DdmaCfgDmaWrCfg> {
 // ========================================================================
 // CFG_DMA_WSTRB (0x802C)
 // ========================================================================
+#[derive(Debug, Clone, Copy)]
 pub struct DdmaCfgDmaWstrb;
 
 impl RegisterMeta for DdmaCfgDmaWstrb {
@@ -330,6 +341,7 @@ impl Register<DdmaCfgDmaWstrb> {
 // ========================================================================
 // CFG_STATUS (0x8030)
 // ========================================================================
+#[derive(Debug, Clone, Copy)]
 pub struct DdmaCfgStatus;
 
 impl RegisterMeta for DdmaCfgStatus {

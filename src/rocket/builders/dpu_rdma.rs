@@ -6,6 +6,7 @@ use crate::rocket::{
 // ========================================================================
 // RDMA_S_STATUS (0x5000)
 // ========================================================================
+#[derive(Debug, Clone, Copy)]
 pub struct DpuRdmaSStatus;
 
 impl RegisterMeta for DpuRdmaSStatus {
@@ -30,6 +31,7 @@ impl Register<DpuRdmaSStatus> {
 // ========================================================================
 // RDMA_S_POINTER (0x5004)
 // ========================================================================
+#[derive(Debug, Clone, Copy)]
 pub struct DpuRdmaSPointer;
 
 impl RegisterMeta for DpuRdmaSPointer {
@@ -84,6 +86,7 @@ impl Register<DpuRdmaSPointer> {
 // ========================================================================
 // RDMA_OPERATION_ENABLE (0x5008)
 // ========================================================================
+#[derive(Debug, Clone, Copy)]
 pub struct DpuRdmaOperationEnable;
 
 impl RegisterMeta for DpuRdmaOperationEnable {
@@ -102,6 +105,7 @@ impl Register<DpuRdmaOperationEnable> {
 // ========================================================================
 // RDMA_DATA_CUBE_WIDTH (0x500C)
 // ========================================================================
+#[derive(Debug, Clone, Copy)]
 pub struct DpuRdmaDataCubeWidth;
 
 impl RegisterMeta for DpuRdmaDataCubeWidth {
@@ -120,6 +124,7 @@ impl Register<DpuRdmaDataCubeWidth> {
 // ========================================================================
 // RDMA_DATA_CUBE_HEIGHT (0x5010)
 // ========================================================================
+#[derive(Debug, Clone, Copy)]
 pub struct DpuRdmaDataCubeHeight;
 
 impl RegisterMeta for DpuRdmaDataCubeHeight {
@@ -145,6 +150,7 @@ impl Register<DpuRdmaDataCubeHeight> {
 // ========================================================================
 // RDMA_DATA_CUBE_CHANNEL (0x5014)
 // ========================================================================
+#[derive(Debug, Clone, Copy)]
 pub struct DpuRdmaDataCubeChannel;
 
 impl RegisterMeta for DpuRdmaDataCubeChannel {
@@ -163,6 +169,7 @@ impl Register<DpuRdmaDataCubeChannel> {
 // ========================================================================
 // RDMA_SRC_BASE_ADDR (0x5018)
 // ========================================================================
+#[derive(Debug, Clone, Copy)]
 pub struct DpuRdmaSrcBaseAddr;
 
 impl RegisterMeta for DpuRdmaSrcBaseAddr {
@@ -181,6 +188,7 @@ impl Register<DpuRdmaSrcBaseAddr> {
 // ========================================================================
 // RDMA_BRDMA_CFG (0x501C)
 // ========================================================================
+#[derive(Debug, Clone, Copy)]
 pub struct DpuRdmaBrdmaCfg;
 
 impl RegisterMeta for DpuRdmaBrdmaCfg {
@@ -199,6 +207,7 @@ impl Register<DpuRdmaBrdmaCfg> {
 // ========================================================================
 // RDMA_BS_BASE_ADDR (0x5020)
 // ========================================================================
+#[derive(Debug, Clone, Copy)]
 pub struct DpuRdmaBsBaseAddr;
 
 impl RegisterMeta for DpuRdmaBsBaseAddr {
@@ -217,6 +226,7 @@ impl Register<DpuRdmaBsBaseAddr> {
 // ========================================================================
 // RDMA_NRDMA_CFG (0x5028)
 // ========================================================================
+#[derive(Debug, Clone, Copy)]
 pub struct DpuRdmaNrdmaCfg;
 
 impl RegisterMeta for DpuRdmaNrdmaCfg {
@@ -235,6 +245,7 @@ impl Register<DpuRdmaNrdmaCfg> {
 // ========================================================================
 // RDMA_BN_BASE_ADDR (0x502C)
 // ========================================================================
+#[derive(Debug, Clone, Copy)]
 pub struct DpuRdmaBnBaseAddr;
 
 impl RegisterMeta for DpuRdmaBnBaseAddr {
@@ -253,6 +264,7 @@ impl Register<DpuRdmaBnBaseAddr> {
 // ========================================================================
 // RDMA_ERDMA_CFG (0x5034)
 // ========================================================================
+#[derive(Debug, Clone, Copy)]
 pub struct DpuRdmaErdmaCfg;
 
 impl RegisterMeta for DpuRdmaErdmaCfg {
@@ -301,6 +313,7 @@ impl Register<DpuRdmaErdmaCfg> {
 // ========================================================================
 // RDMA_EW_BASE_ADDR (0x5038)
 // ========================================================================
+#[derive(Debug, Clone, Copy)]
 pub struct DpuRdmaEwBaseAddr;
 
 impl RegisterMeta for DpuRdmaEwBaseAddr {
@@ -319,6 +332,7 @@ impl Register<DpuRdmaEwBaseAddr> {
 // ========================================================================
 // RDMA_EW_SURF_STRIDE (0x5040)
 // ========================================================================
+#[derive(Debug, Clone, Copy)]
 pub struct DpuRdmaEwSurfStride;
 
 impl RegisterMeta for DpuRdmaEwSurfStride {
@@ -337,6 +351,7 @@ impl Register<DpuRdmaEwSurfStride> {
 // ========================================================================
 // RDMA_FEATURE_MODE_CFG (0x5044)
 // ========================================================================
+#[derive(Debug, Clone, Copy)]
 pub struct DpuRdmaFeatureModeCfg;
 
 impl RegisterMeta for DpuRdmaFeatureModeCfg {
@@ -401,6 +416,7 @@ impl Register<DpuRdmaFeatureModeCfg> {
 // ========================================================================
 // RDMA_SRC_DMA_CFG (0x5048)
 // ========================================================================
+#[derive(Debug, Clone, Copy)]
 pub struct DpuRdmaSrcDmaCfg;
 
 impl RegisterMeta for DpuRdmaSrcDmaCfg {
@@ -457,6 +473,7 @@ impl Register<DpuRdmaSrcDmaCfg> {
 // ========================================================================
 // RDMA_SURF_NOTCH (0x504C)
 // ========================================================================
+#[derive(Debug, Clone, Copy)]
 pub struct DpuRdmaSurfNotch;
 
 impl RegisterMeta for DpuRdmaSurfNotch {
@@ -475,6 +492,7 @@ impl Register<DpuRdmaSurfNotch> {
 // ========================================================================
 // RDMA_PAD_CFG (0x5064)
 // ========================================================================
+#[derive(Debug, Clone, Copy)]
 pub struct DpuRdmaPadCfg;
 
 impl RegisterMeta for DpuRdmaPadCfg {
@@ -505,6 +523,7 @@ impl Register<DpuRdmaPadCfg> {
 // ========================================================================
 // RDMA_WEIGHT (0x5068)
 // ========================================================================
+#[derive(Debug, Clone, Copy)]
 pub struct DpuRdmaWeight;
 
 impl RegisterMeta for DpuRdmaWeight {
@@ -541,6 +560,7 @@ impl Register<DpuRdmaWeight> {
 // ========================================================================
 // RDMA_EW_SURF_NOTCH (0x506C)
 // ========================================================================
+#[derive(Debug, Clone, Copy)]
 pub struct DpuRdmaEwSurfNotch;
 
 impl RegisterMeta for DpuRdmaEwSurfNotch {

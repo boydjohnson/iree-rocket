@@ -3,6 +3,7 @@ use crate::rocket::{
     registers::*,
 };
 
+#[derive(Debug, Clone, Copy)]
 pub struct PCOperationEnable;
 
 impl RegisterMeta for PCOperationEnable {
@@ -16,6 +17,7 @@ impl Register<PCOperationEnable> {
     }
 }
 
+#[derive(Debug, Clone, Copy)]
 pub struct PCBaseAddress;
 
 impl RegisterMeta for PCBaseAddress {
@@ -35,6 +37,7 @@ impl Register<PCBaseAddress> {
     }
 }
 
+#[derive(Debug, Clone, Copy)]
 pub struct PCRegisterAmounts;
 
 impl RegisterMeta for PCRegisterAmounts {
@@ -50,6 +53,7 @@ impl Register<PCRegisterAmounts> {
     }
 }
 
+#[derive(Debug, Clone, Copy)]
 pub struct PCInterruptMask;
 
 impl RegisterMeta for PCInterruptMask {
@@ -115,6 +119,7 @@ impl Register<PCInterruptMask> {
     }
 }
 
+#[derive(Debug, Clone, Copy)]
 pub struct PCInterruptClear;
 
 impl RegisterMeta for PCInterruptClear {
@@ -180,6 +185,7 @@ impl Register<PCInterruptClear> {
     }
 }
 
+#[derive(Debug, Clone, Copy)]
 pub struct PCTaskCon;
 
 impl RegisterMeta for PCTaskCon {
@@ -207,6 +213,7 @@ impl Register<PCTaskCon> {
     }
 }
 
+#[derive(Debug, Clone, Copy)]
 pub struct PCTaskDMABaseAddr;
 
 impl RegisterMeta for PCTaskDMABaseAddr {

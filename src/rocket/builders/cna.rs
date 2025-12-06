@@ -651,6 +651,7 @@ impl Register<CnaFcCon2> {
     }
 }
 
+#[derive(Debug, Clone, Copy)]
 pub struct CnaDmaCon0;
 
 impl RegisterMeta for CnaDmaCon0 {
@@ -678,6 +679,7 @@ impl Register<CnaDmaCon0> {
     }
 }
 
+#[derive(Debug, Clone, Copy)]
 pub struct CnaDmaCon1;
 
 impl RegisterMeta for CnaDmaCon1 {
@@ -693,6 +695,7 @@ impl Register<CnaDmaCon1> {
     }
 }
 
+#[derive(Debug, Clone, Copy)]
 pub struct CnaDmaCon2;
 
 impl RegisterMeta for CnaDmaCon2 {
@@ -711,6 +714,7 @@ impl Register<CnaDmaCon2> {
 // ========================================================================
 // FC_DATA_SIZE0 (0x1084)
 // ========================================================================
+#[derive(Debug, Clone, Copy)]
 pub struct CnaFcDataSize0;
 
 impl RegisterMeta for CnaFcDataSize0 {
@@ -735,6 +739,7 @@ impl Register<CnaFcDataSize0> {
 // ========================================================================
 // FC_DATA_SIZE1 (0x1088)
 // ========================================================================
+#[derive(Debug, Clone, Copy)]
 pub struct CnaFcDataSize1;
 
 impl RegisterMeta for CnaFcDataSize1 {
@@ -753,6 +758,7 @@ impl Register<CnaFcDataSize1> {
 // ========================================================================
 // CLK_GATE (0x1090)
 // ========================================================================
+#[derive(Debug, Clone, Copy)]
 pub struct CnaClkGate;
 
 impl RegisterMeta for CnaClkGate {
@@ -792,6 +798,7 @@ impl Register<CnaClkGate> {
 // ========================================================================
 // DCOMP_CTRL (0x1100)
 // ========================================================================
+#[derive(Debug, Clone, Copy)]
 pub struct CnaDcompCtrl;
 
 impl RegisterMeta for CnaDcompCtrl {
@@ -816,6 +823,7 @@ impl Register<CnaDcompCtrl> {
 // ========================================================================
 // DCOMP_REGNUM (0x1104)
 // ========================================================================
+#[derive(Debug, Clone, Copy)]
 pub struct CnaDcompRegnum;
 
 impl RegisterMeta for CnaDcompRegnum {
@@ -834,6 +842,7 @@ impl Register<CnaDcompRegnum> {
 // ========================================================================
 // DCOMP_ADDR0 (0x1110)
 // ========================================================================
+#[derive(Debug, Clone, Copy)]
 pub struct CnaDcompAddr0;
 
 impl RegisterMeta for CnaDcompAddr0 {
@@ -851,6 +860,7 @@ impl Register<CnaDcompAddr0> {
 
 macro_rules! define_dcomp_amount {
     ($name:ident, $offset:expr, $field_mask:ident, $field_macro:ident) => {
+        #[derive(Debug, Clone, Copy)]
         pub struct $name;
 
         impl RegisterMeta for $name {
@@ -963,6 +973,7 @@ define_dcomp_amount!(
     CNA_DCOMP_AMOUNT15_DCOMP_AMOUNT15
 );
 
+#[derive(Debug, Clone, Copy)]
 pub struct CnaCvtCon5;
 
 impl RegisterMeta for CnaCvtCon5 {
@@ -978,6 +989,7 @@ impl Register<CnaCvtCon5> {
     }
 }
 
+#[derive(Debug, Clone, Copy)]
 pub struct CnaPadCon1;
 
 impl RegisterMeta for CnaPadCon1 {

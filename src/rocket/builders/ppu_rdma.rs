@@ -6,6 +6,7 @@ use crate::rocket::{
 // ========================================================================
 // RDMA_S_STATUS (0x7000)
 // ========================================================================
+#[derive(Debug, Clone, Copy)]
 pub struct PpuRdmaSStatus;
 
 impl RegisterMeta for PpuRdmaSStatus {
@@ -30,6 +31,7 @@ impl Register<PpuRdmaSStatus> {
 // ========================================================================
 // RDMA_S_POINTER (0x7004)
 // ========================================================================
+#[derive(Debug, Clone, Copy)]
 pub struct PpuRdmaSPointer;
 
 impl RegisterMeta for PpuRdmaSPointer {
@@ -84,6 +86,7 @@ impl Register<PpuRdmaSPointer> {
 // ========================================================================
 // RDMA_OPERATION_ENABLE (0x7008)
 // ========================================================================
+#[derive(Debug, Clone, Copy)]
 pub struct PpuRdmaOperationEnable;
 
 impl RegisterMeta for PpuRdmaOperationEnable {
@@ -102,6 +105,7 @@ impl Register<PpuRdmaOperationEnable> {
 // ========================================================================
 // RDMA_CUBE_IN_WIDTH (0x700C)
 // ========================================================================
+#[derive(Debug, Clone, Copy)]
 pub struct PpuRdmaCubeInWidth;
 
 impl RegisterMeta for PpuRdmaCubeInWidth {
@@ -120,6 +124,7 @@ impl Register<PpuRdmaCubeInWidth> {
 // ========================================================================
 // RDMA_CUBE_IN_HEIGHT (0x7010)
 // ========================================================================
+#[derive(Debug, Clone, Copy)]
 pub struct PpuRdmaCubeInHeight;
 
 impl RegisterMeta for PpuRdmaCubeInHeight {
@@ -138,6 +143,7 @@ impl Register<PpuRdmaCubeInHeight> {
 // ========================================================================
 // RDMA_CUBE_IN_CHANNEL (0x7014)
 // ========================================================================
+#[derive(Debug, Clone, Copy)]
 pub struct PpuRdmaCubeInChannel;
 
 impl RegisterMeta for PpuRdmaCubeInChannel {
@@ -157,6 +163,7 @@ impl Register<PpuRdmaCubeInChannel> {
 // ========================================================================
 // RDMA_SRC_BASE_ADDR (0x701C)
 // ========================================================================
+#[derive(Debug, Clone, Copy)]
 pub struct PpuRdmaSrcBaseAddr;
 
 impl RegisterMeta for PpuRdmaSrcBaseAddr {
@@ -175,6 +182,7 @@ impl Register<PpuRdmaSrcBaseAddr> {
 // ========================================================================
 // RDMA_SRC_LINE_STRIDE (0x7024)
 // ========================================================================
+#[derive(Debug, Clone, Copy)]
 pub struct PpuRdmaSrcLineStride;
 
 impl RegisterMeta for PpuRdmaSrcLineStride {
@@ -194,6 +202,7 @@ impl Register<PpuRdmaSrcLineStride> {
 // ========================================================================
 // RDMA_SRC_SURF_STRIDE (0x7028)
 // ========================================================================
+#[derive(Debug, Clone, Copy)]
 pub struct PpuRdmaSrcSurfStride;
 
 impl RegisterMeta for PpuRdmaSrcSurfStride {
@@ -213,6 +222,7 @@ impl Register<PpuRdmaSrcSurfStride> {
 // ========================================================================
 // RDMA_DATA_FORMAT (0x7030)
 // ========================================================================
+#[derive(Debug, Clone, Copy)]
 pub struct PpuRdmaDataFormat;
 
 impl RegisterMeta for PpuRdmaDataFormat {

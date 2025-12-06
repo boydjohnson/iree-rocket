@@ -6,6 +6,7 @@ use crate::rocket::{
 // ========================================================================
 // S_STATUS (0x3000)
 // ========================================================================
+#[derive(Debug, Clone, Copy)]
 pub struct CoreSStatus;
 
 impl RegisterMeta for CoreSStatus {
@@ -30,6 +31,7 @@ impl Register<CoreSStatus> {
 // ========================================================================
 // S_POINTER (0x3004)
 // ========================================================================
+#[derive(Debug, Clone, Copy)]
 pub struct CoreSPointer;
 
 impl RegisterMeta for CoreSPointer {
@@ -84,6 +86,7 @@ impl Register<CoreSPointer> {
 // ========================================================================
 // OPERATION_ENABLE (0x3008)
 // ========================================================================
+#[derive(Debug, Clone, Copy)]
 pub struct CoreOperationEnable;
 
 impl RegisterMeta for CoreOperationEnable {
@@ -102,6 +105,7 @@ impl Register<CoreOperationEnable> {
 // ========================================================================
 // MAC_GATING (0x300C)
 // ========================================================================
+#[derive(Debug, Clone, Copy)]
 pub struct CoreMacGating;
 
 impl RegisterMeta for CoreMacGating {
@@ -120,6 +124,7 @@ impl Register<CoreMacGating> {
 // ========================================================================
 // MISC_CFG (0x3010)
 // ========================================================================
+#[derive(Debug, Clone, Copy)]
 pub struct CoreMiscCfg;
 
 impl RegisterMeta for CoreMiscCfg {
@@ -156,6 +161,7 @@ impl Register<CoreMiscCfg> {
 // ========================================================================
 // DATAOUT_SIZE_0 (0x3014)
 // ========================================================================
+#[derive(Debug, Clone, Copy)]
 pub struct CoreDataoutSize0;
 
 impl RegisterMeta for CoreDataoutSize0 {
@@ -180,6 +186,7 @@ impl Register<CoreDataoutSize0> {
 // ========================================================================
 // DATAOUT_SIZE_1 (0x3018)
 // ========================================================================
+#[derive(Debug, Clone, Copy)]
 pub struct CoreDataoutSize1;
 
 impl RegisterMeta for CoreDataoutSize1 {
@@ -198,6 +205,7 @@ impl Register<CoreDataoutSize1> {
 // ========================================================================
 // CLIP_TRUNCATE (0x301C)
 // ========================================================================
+#[derive(Debug, Clone, Copy)]
 pub struct CoreClipTruncate;
 
 impl RegisterMeta for CoreClipTruncate {

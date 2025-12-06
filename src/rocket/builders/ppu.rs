@@ -6,6 +6,7 @@ use crate::rocket::{
 // ========================================================================
 // S_STATUS (0x6000)
 // ========================================================================
+#[derive(Debug, Clone, Copy)]
 pub struct PpuSStatus;
 
 impl RegisterMeta for PpuSStatus {
@@ -30,6 +31,7 @@ impl Register<PpuSStatus> {
 // ========================================================================
 // S_POINTER (0x6004)
 // ========================================================================
+#[derive(Debug, Clone, Copy)]
 pub struct PpuSPointer;
 
 impl RegisterMeta for PpuSPointer {
@@ -84,6 +86,7 @@ impl Register<PpuSPointer> {
 // ========================================================================
 // OPERATION_ENABLE (0x6008)
 // ========================================================================
+#[derive(Debug, Clone, Copy)]
 pub struct PpuOperationEnable;
 
 impl RegisterMeta for PpuOperationEnable {
@@ -102,6 +105,7 @@ impl Register<PpuOperationEnable> {
 // ========================================================================
 // DATA_CUBE_IN_WIDTH (0x600C)
 // ========================================================================
+#[derive(Debug, Clone, Copy)]
 pub struct PpuDataCubeInWidth;
 
 impl RegisterMeta for PpuDataCubeInWidth {
@@ -120,6 +124,7 @@ impl Register<PpuDataCubeInWidth> {
 // ========================================================================
 // DATA_CUBE_IN_HEIGHT (0x6010)
 // ========================================================================
+#[derive(Debug, Clone, Copy)]
 pub struct PpuDataCubeInHeight;
 
 impl RegisterMeta for PpuDataCubeInHeight {
@@ -138,6 +143,7 @@ impl Register<PpuDataCubeInHeight> {
 // ========================================================================
 // DATA_CUBE_IN_CHANNEL (0x6014)
 // ========================================================================
+#[derive(Debug, Clone, Copy)]
 pub struct PpuDataCubeInChannel;
 
 impl RegisterMeta for PpuDataCubeInChannel {
@@ -156,6 +162,7 @@ impl Register<PpuDataCubeInChannel> {
 // ========================================================================
 // DATA_CUBE_OUT_WIDTH (0x6018)
 // ========================================================================
+#[derive(Debug, Clone, Copy)]
 pub struct PpuDataCubeOutWidth;
 
 impl RegisterMeta for PpuDataCubeOutWidth {
@@ -174,6 +181,7 @@ impl Register<PpuDataCubeOutWidth> {
 // ========================================================================
 // DATA_CUBE_OUT_HEIGHT (0x601C)
 // ========================================================================
+#[derive(Debug, Clone, Copy)]
 pub struct PpuDataCubeOutHeight;
 
 impl RegisterMeta for PpuDataCubeOutHeight {
@@ -192,6 +200,7 @@ impl Register<PpuDataCubeOutHeight> {
 // ========================================================================
 // DATA_CUBE_OUT_CHANNEL (0x6020)
 // ========================================================================
+#[derive(Debug, Clone, Copy)]
 pub struct PpuDataCubeOutChannel;
 
 impl RegisterMeta for PpuDataCubeOutChannel {
@@ -210,6 +219,7 @@ impl Register<PpuDataCubeOutChannel> {
 // ========================================================================
 // OPERATION_MODE_CFG (0x6024)
 // ========================================================================
+#[derive(Debug, Clone, Copy)]
 pub struct PpuOperationModeCfg;
 
 impl RegisterMeta for PpuOperationModeCfg {
@@ -252,6 +262,7 @@ impl Register<PpuOperationModeCfg> {
 // ========================================================================
 // POOLING_KERNEL_CFG (0x6034)
 // ========================================================================
+#[derive(Debug, Clone, Copy)]
 pub struct PpuPoolingKernelCfg;
 
 impl RegisterMeta for PpuPoolingKernelCfg {
@@ -288,6 +299,7 @@ impl Register<PpuPoolingKernelCfg> {
 // ========================================================================
 // RECIP_KERNEL_WIDTH (0x6038)
 // ========================================================================
+#[derive(Debug, Clone, Copy)]
 pub struct PpuRecipKernelWidth;
 
 impl RegisterMeta for PpuRecipKernelWidth {
@@ -306,6 +318,7 @@ impl Register<PpuRecipKernelWidth> {
 // ========================================================================
 // RECIP_KERNEL_HEIGHT (0x603C)
 // ========================================================================
+#[derive(Debug, Clone, Copy)]
 pub struct PpuRecipKernelHeight;
 
 impl RegisterMeta for PpuRecipKernelHeight {
@@ -324,6 +337,7 @@ impl Register<PpuRecipKernelHeight> {
 // ========================================================================
 // POOLING_PADDING_CFG (0x6040)
 // ========================================================================
+#[derive(Debug, Clone, Copy)]
 pub struct PpuPoolingPaddingCfg;
 
 impl RegisterMeta for PpuPoolingPaddingCfg {
@@ -360,6 +374,7 @@ impl Register<PpuPoolingPaddingCfg> {
 // ========================================================================
 // PADDING_VALUE_1_CFG (0x6044)
 // ========================================================================
+#[derive(Debug, Clone, Copy)]
 pub struct PpuPaddingValue1Cfg;
 
 impl RegisterMeta for PpuPaddingValue1Cfg {
@@ -378,6 +393,7 @@ impl Register<PpuPaddingValue1Cfg> {
 // ========================================================================
 // PADDING_VALUE_2_CFG (0x6048)
 // ========================================================================
+#[derive(Debug, Clone, Copy)]
 pub struct PpuPaddingValue2Cfg;
 
 impl RegisterMeta for PpuPaddingValue2Cfg {
@@ -396,6 +412,7 @@ impl Register<PpuPaddingValue2Cfg> {
 // ========================================================================
 // DST_BASE_ADDR (0x6070)
 // ========================================================================
+#[derive(Debug, Clone, Copy)]
 pub struct PpuDstBaseAddr;
 
 impl RegisterMeta for PpuDstBaseAddr {
@@ -414,6 +431,7 @@ impl Register<PpuDstBaseAddr> {
 // ========================================================================
 // DST_SURF_STRIDE (0x607C)
 // ========================================================================
+#[derive(Debug, Clone, Copy)]
 pub struct PpuDstSurfStride;
 
 impl RegisterMeta for PpuDstSurfStride {
@@ -432,6 +450,7 @@ impl Register<PpuDstSurfStride> {
 // ========================================================================
 // DATA_FORMAT (0x6084)
 // ========================================================================
+#[derive(Debug, Clone, Copy)]
 pub struct PpuDataFormat;
 
 impl RegisterMeta for PpuDataFormat {
@@ -462,6 +481,7 @@ impl Register<PpuDataFormat> {
 // ========================================================================
 // MISC_CTRL (0x60DC)
 // ========================================================================
+#[derive(Debug, Clone, Copy)]
 pub struct PpuMiscCtrl;
 
 impl RegisterMeta for PpuMiscCtrl {

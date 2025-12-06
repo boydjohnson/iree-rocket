@@ -6,6 +6,7 @@ use crate::rocket::{
 // ========================================================================
 // S_STATUS (0x4000)
 // ========================================================================
+#[derive(Debug, Clone, Copy)]
 pub struct DpuSStatus;
 
 impl RegisterMeta for DpuSStatus {
@@ -30,6 +31,7 @@ impl Register<DpuSStatus> {
 // ========================================================================
 // S_POINTER (0x4004)
 // ========================================================================
+#[derive(Debug, Clone, Copy)]
 pub struct DpuSPointer;
 
 impl RegisterMeta for DpuSPointer {
@@ -84,6 +86,7 @@ impl Register<DpuSPointer> {
 // ========================================================================
 // OPERATION_ENABLE (0x4008)
 // ========================================================================
+#[derive(Debug, Clone, Copy)]
 pub struct DpuOperationEnable;
 
 impl RegisterMeta for DpuOperationEnable {
@@ -102,6 +105,7 @@ impl Register<DpuOperationEnable> {
 // ========================================================================
 // FEATURE_MODE_CFG (0x400C)
 // ========================================================================
+#[derive(Debug, Clone, Copy)]
 pub struct DpuFeatureModeCfg;
 
 impl RegisterMeta for DpuFeatureModeCfg {
@@ -168,6 +172,7 @@ impl Register<DpuFeatureModeCfg> {
 // ========================================================================
 // DATA_FORMAT (0x4010)
 // ========================================================================
+#[derive(Debug, Clone, Copy)]
 pub struct DpuDataFormat;
 
 impl RegisterMeta for DpuDataFormat {
@@ -222,6 +227,7 @@ impl Register<DpuDataFormat> {
 // ========================================================================
 // OFFSET_PEND (0x4014)
 // ========================================================================
+#[derive(Debug, Clone, Copy)]
 pub struct DpuOffsetPend;
 
 impl RegisterMeta for DpuOffsetPend {
@@ -240,6 +246,7 @@ impl Register<DpuOffsetPend> {
 // ========================================================================
 // DST_BASE_ADDR (0x4020)
 // ========================================================================
+#[derive(Debug, Clone, Copy)]
 pub struct DpuDstBaseAddr;
 
 impl RegisterMeta for DpuDstBaseAddr {
@@ -258,6 +265,7 @@ impl Register<DpuDstBaseAddr> {
 // ========================================================================
 // DST_SURF_STRIDE (0x4024)
 // ========================================================================
+#[derive(Debug, Clone, Copy)]
 pub struct DpuDstSurfStride;
 
 impl RegisterMeta for DpuDstSurfStride {
@@ -276,6 +284,7 @@ impl Register<DpuDstSurfStride> {
 // ========================================================================
 // DATA_CUBE_WIDTH (0x4030)
 // ========================================================================
+#[derive(Debug, Clone, Copy)]
 pub struct DpuDataCubeWidth;
 
 impl RegisterMeta for DpuDataCubeWidth {
@@ -294,6 +303,7 @@ impl Register<DpuDataCubeWidth> {
 // ========================================================================
 // DATA_CUBE_HEIGHT (0x4034)
 // ========================================================================
+#[derive(Debug, Clone, Copy)]
 pub struct DpuDataCubeHeight;
 
 impl RegisterMeta for DpuDataCubeHeight {
@@ -318,6 +328,7 @@ impl Register<DpuDataCubeHeight> {
 // ========================================================================
 // DATA_CUBE_NOTCH_ADDR (0x4038)
 // ========================================================================
+#[derive(Debug, Clone, Copy)]
 pub struct DpuDataCubeNotchAddr;
 
 impl RegisterMeta for DpuDataCubeNotchAddr {
@@ -342,6 +353,7 @@ impl Register<DpuDataCubeNotchAddr> {
 // ========================================================================
 // DATA_CUBE_CHANNEL (0x403C)
 // ========================================================================
+#[derive(Debug, Clone, Copy)]
 pub struct DpuDataCubeChannel;
 
 impl RegisterMeta for DpuDataCubeChannel {
@@ -366,6 +378,7 @@ impl Register<DpuDataCubeChannel> {
 // ========================================================================
 // BS_CFG (0x4040)
 // ========================================================================
+#[derive(Debug, Clone, Copy)]
 pub struct DpuBsCfg;
 
 impl RegisterMeta for DpuBsCfg {
@@ -426,6 +439,7 @@ impl Register<DpuBsCfg> {
 // ========================================================================
 // BS_ALU_CFG (0x4044)
 // ========================================================================
+#[derive(Debug, Clone, Copy)]
 pub struct DpuBsAluCfg;
 
 impl RegisterMeta for DpuBsAluCfg {
@@ -444,6 +458,7 @@ impl Register<DpuBsAluCfg> {
 // ========================================================================
 // BS_MUL_CFG (0x4048)
 // ========================================================================
+#[derive(Debug, Clone, Copy)]
 pub struct DpuBsMulCfg;
 
 impl RegisterMeta for DpuBsMulCfg {
@@ -480,6 +495,7 @@ impl Register<DpuBsMulCfg> {
 // ========================================================================
 // BS_RELUX_CMP_VALUE (0x404C)
 // ========================================================================
+#[derive(Debug, Clone, Copy)]
 pub struct DpuBsReluxCmpValue;
 
 impl RegisterMeta for DpuBsReluxCmpValue {
@@ -498,6 +514,7 @@ impl Register<DpuBsReluxCmpValue> {
 // ========================================================================
 // BS_OW_CFG (0x4050)
 // ========================================================================
+#[derive(Debug, Clone, Copy)]
 pub struct DpuBsOwCfg;
 
 impl RegisterMeta for DpuBsOwCfg {
@@ -552,6 +569,7 @@ impl Register<DpuBsOwCfg> {
 // ========================================================================
 // BS_OW_OP (0x4054)
 // ========================================================================
+#[derive(Debug, Clone, Copy)]
 pub struct DpuBsOwOp;
 
 impl RegisterMeta for DpuBsOwOp {
@@ -570,6 +588,7 @@ impl Register<DpuBsOwOp> {
 // ========================================================================
 // WDMA_SIZE_0 (0x4058)
 // ========================================================================
+#[derive(Debug, Clone, Copy)]
 pub struct DpuWdmaSize0;
 
 impl RegisterMeta for DpuWdmaSize0 {
@@ -600,6 +619,7 @@ impl Register<DpuWdmaSize0> {
 // ========================================================================
 // WDMA_SIZE_1 (0x405C)
 // ========================================================================
+#[derive(Debug, Clone, Copy)]
 pub struct DpuWdmaSize1;
 
 impl RegisterMeta for DpuWdmaSize1 {
@@ -624,6 +644,7 @@ impl Register<DpuWdmaSize1> {
 // ========================================================================
 // BN_CFG (0x4060)
 // ========================================================================
+#[derive(Debug, Clone, Copy)]
 pub struct DpuBnCfg;
 
 impl RegisterMeta for DpuBnCfg {
@@ -684,6 +705,7 @@ impl Register<DpuBnCfg> {
 // ========================================================================
 // BN_ALU_CFG (0x4064)
 // ========================================================================
+#[derive(Debug, Clone, Copy)]
 pub struct DpuBnAluCfg;
 
 impl RegisterMeta for DpuBnAluCfg {
@@ -702,6 +724,7 @@ impl Register<DpuBnAluCfg> {
 // ========================================================================
 // BN_MUL_CFG (0x4068)
 // ========================================================================
+#[derive(Debug, Clone, Copy)]
 pub struct DpuBnMulCfg;
 
 impl RegisterMeta for DpuBnMulCfg {
@@ -738,6 +761,7 @@ impl Register<DpuBnMulCfg> {
 // ========================================================================
 // BN_RELUX_CMP_VALUE (0x406C)
 // ========================================================================
+#[derive(Debug, Clone, Copy)]
 pub struct DpuBnReluxCmpValue;
 
 impl RegisterMeta for DpuBnReluxCmpValue {
@@ -756,6 +780,7 @@ impl Register<DpuBnReluxCmpValue> {
 // ========================================================================
 // EW_CFG (0x4070)
 // ========================================================================
+#[derive(Debug, Clone, Copy)]
 pub struct DpuEwCfg;
 
 impl RegisterMeta for DpuEwCfg {
@@ -864,6 +889,7 @@ impl Register<DpuEwCfg> {
 // ========================================================================
 // EW_CVT_OFFSET_VALUE (0x4074)
 // ========================================================================
+#[derive(Debug, Clone, Copy)]
 pub struct DpuEwCvtOffsetValue;
 
 impl RegisterMeta for DpuEwCvtOffsetValue {
@@ -882,6 +908,7 @@ impl Register<DpuEwCvtOffsetValue> {
 // ========================================================================
 // EW_CVT_SCALE_VALUE (0x4078)
 // ========================================================================
+#[derive(Debug, Clone, Copy)]
 pub struct DpuEwCvtScaleValue;
 
 impl RegisterMeta for DpuEwCvtScaleValue {
@@ -912,6 +939,7 @@ impl Register<DpuEwCvtScaleValue> {
 // ========================================================================
 // EW_RELUX_CMP_VALUE (0x407C)
 // ========================================================================
+#[derive(Debug, Clone, Copy)]
 pub struct DpuEwReluxCmpValue;
 
 impl RegisterMeta for DpuEwReluxCmpValue {
@@ -930,6 +958,7 @@ impl Register<DpuEwReluxCmpValue> {
 // ========================================================================
 // OUT_CVT_OFFSET (0x4080)
 // ========================================================================
+#[derive(Debug, Clone, Copy)]
 pub struct DpuOutCvtOffset;
 
 impl RegisterMeta for DpuOutCvtOffset {
@@ -948,6 +977,7 @@ impl Register<DpuOutCvtOffset> {
 // ========================================================================
 // OUT_CVT_SCALE (0x4084)
 // ========================================================================
+#[derive(Debug, Clone, Copy)]
 pub struct DpuOutCvtScale;
 
 impl RegisterMeta for DpuOutCvtScale {
@@ -972,6 +1002,7 @@ impl Register<DpuOutCvtScale> {
 // ========================================================================
 // OUT_CVT_SHIFT (0x4088)
 // ========================================================================
+#[derive(Debug, Clone, Copy)]
 pub struct DpuOutCvtShift;
 
 impl RegisterMeta for DpuOutCvtShift {
@@ -1010,6 +1041,7 @@ impl Register<DpuOutCvtShift> {
 // ========================================================================
 macro_rules! define_dpu_ew_op_value {
     ($name:ident, $offset:expr, $field_mask:ident, $field_macro:ident) => {
+        #[derive(Debug, Clone, Copy)]
         pub struct $name;
 
         impl RegisterMeta for $name {
@@ -1077,6 +1109,7 @@ define_dpu_ew_op_value!(
 // ========================================================================
 // SURFACE_ADD (0x40C0)
 // ========================================================================
+#[derive(Debug, Clone, Copy)]
 pub struct DpuSurfaceAdd;
 
 impl RegisterMeta for DpuSurfaceAdd {
@@ -1095,6 +1128,7 @@ impl Register<DpuSurfaceAdd> {
 // ========================================================================
 // LUT_ACCESS_CFG (0x4100)
 // ========================================================================
+#[derive(Debug, Clone, Copy)]
 pub struct DpuLutAccessCfg;
 
 impl RegisterMeta for DpuLutAccessCfg {
@@ -1125,6 +1159,7 @@ impl Register<DpuLutAccessCfg> {
 // ========================================================================
 // LUT_ACCESS_DATA (0x4104)
 // ========================================================================
+#[derive(Debug, Clone, Copy)]
 pub struct DpuLutAccessData;
 
 impl RegisterMeta for DpuLutAccessData {
@@ -1143,6 +1178,7 @@ impl Register<DpuLutAccessData> {
 // ========================================================================
 // LUT_CFG (0x4108)
 // ========================================================================
+#[derive(Debug, Clone, Copy)]
 pub struct DpuLutCfg;
 
 impl RegisterMeta for DpuLutCfg {
@@ -1197,6 +1233,7 @@ impl Register<DpuLutCfg> {
 // ========================================================================
 // LUT_INFO (0x410C)
 // ========================================================================
+#[derive(Debug, Clone, Copy)]
 pub struct DpuLutInfo;
 
 impl RegisterMeta for DpuLutInfo {
@@ -1221,6 +1258,7 @@ impl Register<DpuLutInfo> {
 // ========================================================================
 // LUT_LE_START (0x4110)
 // ========================================================================
+#[derive(Debug, Clone, Copy)]
 pub struct DpuLutLeStart;
 
 impl RegisterMeta for DpuLutLeStart {
@@ -1239,6 +1277,7 @@ impl Register<DpuLutLeStart> {
 // ========================================================================
 // LUT_LE_END (0x4114)
 // ========================================================================
+#[derive(Debug, Clone, Copy)]
 pub struct DpuLutLeEnd;
 
 impl RegisterMeta for DpuLutLeEnd {
@@ -1257,6 +1296,7 @@ impl Register<DpuLutLeEnd> {
 // ========================================================================
 // LUT_LO_START (0x4118)
 // ========================================================================
+#[derive(Debug, Clone, Copy)]
 pub struct DpuLutLoStart;
 
 impl RegisterMeta for DpuLutLoStart {
@@ -1275,6 +1315,7 @@ impl Register<DpuLutLoStart> {
 // ========================================================================
 // LUT_LO_END (0x411C)
 // ========================================================================
+#[derive(Debug, Clone, Copy)]
 pub struct DpuLutLoEnd;
 
 impl RegisterMeta for DpuLutLoEnd {
@@ -1293,6 +1334,7 @@ impl Register<DpuLutLoEnd> {
 // ========================================================================
 // LUT_LE_SLOPE_SCALE (0x4120)
 // ========================================================================
+#[derive(Debug, Clone, Copy)]
 pub struct DpuLutLeSlopeScale;
 
 impl RegisterMeta for DpuLutLeSlopeScale {
@@ -1323,6 +1365,7 @@ impl Register<DpuLutLeSlopeScale> {
 // ========================================================================
 // LUT_LE_SLOPE_SHIFT (0x4124)
 // ========================================================================
+#[derive(Debug, Clone, Copy)]
 pub struct DpuLutLeSlopeShift;
 
 impl RegisterMeta for DpuLutLeSlopeShift {
@@ -1353,6 +1396,7 @@ impl Register<DpuLutLeSlopeShift> {
 // ========================================================================
 // LUT_LO_SLOPE_SCALE (0x4128)
 // ========================================================================
+#[derive(Debug, Clone, Copy)]
 pub struct DpuLutLoSlopeScale;
 
 impl RegisterMeta for DpuLutLoSlopeScale {
@@ -1383,6 +1427,7 @@ impl Register<DpuLutLoSlopeScale> {
 // ========================================================================
 // LUT_LO_SLOPE_SHIFT (0x412C)
 // ========================================================================
+#[derive(Debug, Clone, Copy)]
 pub struct DpuLutLoSlopeShift;
 
 impl RegisterMeta for DpuLutLoSlopeShift {
