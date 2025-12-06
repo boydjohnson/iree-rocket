@@ -3,6 +3,7 @@ use crate::rocket::{
     registers::*,
 };
 
+#[derive(Debug, Clone, Copy)]
 pub struct CnaSPointer;
 
 impl RegisterMeta for CnaSPointer {
@@ -54,6 +55,7 @@ impl Register<CnaSPointer> {
     }
 }
 
+#[derive(Debug, Clone, Copy)]
 pub struct CnaOperationEnable;
 
 impl RegisterMeta for CnaOperationEnable {
@@ -69,6 +71,7 @@ impl Register<CnaOperationEnable> {
     }
 }
 
+#[derive(Debug, Clone, Copy)]
 pub struct CnaConvCon1;
 
 impl RegisterMeta for CnaConvCon1 {
@@ -120,6 +123,7 @@ impl Register<CnaConvCon1> {
     }
 }
 
+#[derive(Debug, Clone, Copy)]
 pub struct CnaConvCon2;
 
 impl RegisterMeta for CnaConvCon2 {
@@ -159,6 +163,7 @@ impl Register<CnaConvCon2> {
     }
 }
 
+#[derive(Debug, Clone, Copy)]
 pub struct CnaConvCon3;
 
 impl RegisterMeta for CnaConvCon3 {
@@ -210,6 +215,7 @@ impl Register<CnaConvCon3> {
     }
 }
 
+#[derive(Debug, Clone, Copy)]
 pub struct CnaDataSize0;
 
 impl RegisterMeta for CnaDataSize0 {
@@ -231,6 +237,7 @@ impl Register<CnaDataSize0> {
     }
 }
 
+#[derive(Debug, Clone, Copy)]
 pub struct CnaDataSize1;
 
 impl RegisterMeta for CnaDataSize1 {
@@ -252,6 +259,7 @@ impl Register<CnaDataSize1> {
     }
 }
 
+#[derive(Debug, Clone, Copy)]
 pub struct CnaDataSize2;
 
 impl RegisterMeta for CnaDataSize2 {
@@ -267,6 +275,7 @@ impl Register<CnaDataSize2> {
     }
 }
 
+#[derive(Debug, Clone, Copy)]
 pub struct CnaDataSize3;
 
 impl RegisterMeta for CnaDataSize3 {
@@ -288,6 +297,7 @@ impl Register<CnaDataSize3> {
     }
 }
 
+#[derive(Debug, Clone, Copy)]
 pub struct CnaWeightSize0;
 
 impl RegisterMeta for CnaWeightSize0 {
@@ -303,6 +313,7 @@ impl Register<CnaWeightSize0> {
     }
 }
 
+#[derive(Debug, Clone, Copy)]
 pub struct CnaWeightSize1;
 
 impl RegisterMeta for CnaWeightSize1 {
@@ -318,6 +329,7 @@ impl Register<CnaWeightSize1> {
     }
 }
 
+#[derive(Debug, Clone, Copy)]
 pub struct CnaWeightSize2;
 
 impl RegisterMeta for CnaWeightSize2 {
@@ -345,6 +357,7 @@ impl Register<CnaWeightSize2> {
     }
 }
 
+#[derive(Debug, Clone, Copy)]
 pub struct CnaCbufCon0;
 
 impl RegisterMeta for CnaCbufCon0 {
@@ -384,6 +397,7 @@ impl Register<CnaCbufCon0> {
     }
 }
 
+#[derive(Debug, Clone, Copy)]
 pub struct CnaCbufCon1;
 
 impl RegisterMeta for CnaCbufCon1 {
@@ -399,6 +413,7 @@ impl Register<CnaCbufCon1> {
     }
 }
 
+#[derive(Debug, Clone, Copy)]
 pub struct CnaCvtCon0;
 
 impl RegisterMeta for CnaCvtCon0 {
@@ -456,6 +471,7 @@ impl Register<CnaCvtCon0> {
     }
 }
 
+#[derive(Debug, Clone, Copy)]
 pub struct CnaCvtCon1;
 
 impl RegisterMeta for CnaCvtCon1 {
@@ -477,6 +493,7 @@ impl Register<CnaCvtCon1> {
     }
 }
 
+#[derive(Debug, Clone, Copy)]
 pub struct CnaCvtCon2;
 
 impl RegisterMeta for CnaCvtCon2 {
@@ -498,6 +515,7 @@ impl Register<CnaCvtCon2> {
     }
 }
 
+#[derive(Debug, Clone, Copy)]
 pub struct CnaCvtCon3;
 
 impl RegisterMeta for CnaCvtCon3 {
@@ -519,6 +537,7 @@ impl Register<CnaCvtCon3> {
     }
 }
 
+#[derive(Debug, Clone, Copy)]
 pub struct CnaCvtCon4;
 
 impl RegisterMeta for CnaCvtCon4 {
@@ -540,6 +559,7 @@ impl Register<CnaCvtCon4> {
     }
 }
 
+#[derive(Debug, Clone, Copy)]
 pub struct CnaFcCon0;
 
 impl RegisterMeta for CnaFcCon0 {
@@ -561,6 +581,7 @@ impl Register<CnaFcCon0> {
     }
 }
 
+#[derive(Debug, Clone, Copy)]
 pub struct CnaFcCon1;
 
 impl RegisterMeta for CnaFcCon1 {
@@ -576,6 +597,7 @@ impl Register<CnaFcCon1> {
     }
 }
 
+#[derive(Debug, Clone, Copy)]
 pub struct CnaPadCon0;
 
 impl RegisterMeta for CnaPadCon0 {
@@ -597,6 +619,7 @@ impl Register<CnaPadCon0> {
     }
 }
 
+#[derive(Debug, Clone, Copy)]
 pub struct CnaFeatureDataAddr;
 
 impl RegisterMeta for CnaFeatureDataAddr {
@@ -612,6 +635,7 @@ impl Register<CnaFeatureDataAddr> {
     }
 }
 
+#[derive(Debug, Clone, Copy)]
 pub struct CnaFcCon2;
 
 impl RegisterMeta for CnaFcCon2 {

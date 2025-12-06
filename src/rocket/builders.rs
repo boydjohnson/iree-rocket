@@ -55,7 +55,7 @@ impl<R: RegisterMeta> Register<R> {
     }
 }
 
-pub struct RegCmd(pub(crate) u64);
+pub struct RegCmd(pub u64);
 
 impl RegCmd {
     // Helper to pack (Domain ID | Value | Offset)

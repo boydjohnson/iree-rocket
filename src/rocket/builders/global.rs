@@ -6,6 +6,7 @@ use crate::rocket::{
 // ========================================================================
 // OPERATION_ENABLE (0xF008)
 // ========================================================================
+#[derive(Clone, Copy)]
 pub struct GlobalOperationEnable;
 
 impl RegisterMeta for GlobalOperationEnable {
