@@ -8,6 +8,7 @@ pub mod dpu_rdma;
 pub mod pc;
 pub mod ppu;
 pub mod ppu_rdma;
+pub mod sdma;
 
 #[derive(Clone, Copy)]
 pub struct Register<R> {
