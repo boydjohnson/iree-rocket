@@ -5,6 +5,7 @@ pub mod core;
 pub mod ddma;
 pub mod dpu;
 pub mod dpu_rdma;
+pub mod global;
 pub mod pc;
 pub mod ppu;
 pub mod ppu_rdma;
