@@ -5,6 +5,7 @@ pub mod core;
 pub mod dpu;
 pub mod dpu_rdma;
 pub mod pc;
+pub mod ppu;
 
 #[derive(Clone, Copy)]
 pub struct Register<R> {
