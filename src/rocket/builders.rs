@@ -1,6 +1,7 @@
 use std::marker::PhantomData;
 
 pub mod cna;
+pub mod core;
 pub mod pc;
 
 #[derive(Clone, Copy)]
