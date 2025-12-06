@@ -2,6 +2,7 @@ use std::marker::PhantomData;
 
 pub mod cna;
 pub mod core;
+pub mod ddma;
 pub mod dpu;
 pub mod dpu_rdma;
 pub mod pc;
