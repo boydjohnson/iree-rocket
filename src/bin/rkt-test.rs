@@ -1,6 +1,6 @@
 use std::{ffi::c_char, fs::File, mem::MaybeUninit, os::fd::AsRawFd};
 
-use iree_rocket_hal::api::drm_version;
+use iree_rocket_hal::rocket::api::drm_version;
 
 nix::ioctl_readwrite!(drm_get_version, b'd', 0x00, drm_version);
 

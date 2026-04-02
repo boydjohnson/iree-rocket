@@ -1,11 +1,14 @@
-use iree_rocket_hal::api::drm_rocket_create_bo;
+use iree_rocket_hal::rocket::api::drm_rocket_create_bo;
 use nix::sys::mman::{MapFlags, ProtFlags, mmap};
-use std::fs::OpenOptions;
-use std::num::NonZeroUsize;
-use std::os::fd::FromRawFd;
-use std::os::fd::RawFd;
-use std::os::unix::io::AsRawFd;
-use std::ptr;
+use std::{
+    fs::OpenOptions,
+    num::NonZeroUsize,
+    os::{
+        fd::{FromRawFd, RawFd},
+        unix::io::AsRawFd,
+    },
+    ptr,
+};
 
 // 2. The IOCTL
 // Base 'd' (0x64), Index 0x40 (DRM_COMMAND_BASE + 0)
