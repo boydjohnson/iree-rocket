@@ -65,8 +65,8 @@ impl RegisterMeta for CnaOperationEnable {
 
 impl Register<CnaOperationEnable> {
     pub fn op_en(&mut self, op_en: Bits<1>) -> &mut Self {
-        self.set_field(CNA_S_POINTER_EXECUTER_PP_EN__MASK, unsafe {
-            CNA_S_POINTER_EXECUTER_PP_EN(op_en.val())
+        self.set_field(CNA_OPERATION_ENABLE_OP_EN__MASK, unsafe {
+            CNA_OPERATION_ENABLE_OP_EN(op_en.val())
         })
     }
 }
