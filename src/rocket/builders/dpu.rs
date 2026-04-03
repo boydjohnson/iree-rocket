@@ -10,7 +10,7 @@ use crate::rocket::{
 pub struct DpuSStatus;
 
 impl RegisterMeta for DpuSStatus {
-    const DOMAIN: u32 = target_DPU;
+    const DOMAIN: u32 = crate::rocket::builders::DOMAIN_DPU;
     const OFFSET: u32 = REG_DPU_S_STATUS;
 }
 
@@ -35,7 +35,7 @@ impl Register<DpuSStatus> {
 pub struct DpuSPointer;
 
 impl RegisterMeta for DpuSPointer {
-    const DOMAIN: u32 = target_DPU;
+    const DOMAIN: u32 = crate::rocket::builders::DOMAIN_DPU;
     const OFFSET: u32 = REG_DPU_S_POINTER;
 }
 
@@ -90,7 +90,7 @@ impl Register<DpuSPointer> {
 pub struct DpuOperationEnable;
 
 impl RegisterMeta for DpuOperationEnable {
-    const DOMAIN: u32 = target_DPU;
+    const DOMAIN: u32 = crate::rocket::builders::DOMAIN_DPU;
     const OFFSET: u32 = REG_DPU_OPERATION_ENABLE;
 }
 
@@ -109,7 +109,7 @@ impl Register<DpuOperationEnable> {
 pub struct DpuFeatureModeCfg;
 
 impl RegisterMeta for DpuFeatureModeCfg {
-    const DOMAIN: u32 = target_DPU;
+    const DOMAIN: u32 = crate::rocket::builders::DOMAIN_DPU;
     const OFFSET: u32 = REG_DPU_FEATURE_MODE_CFG;
 }
 
@@ -176,7 +176,7 @@ impl Register<DpuFeatureModeCfg> {
 pub struct DpuDataFormat;
 
 impl RegisterMeta for DpuDataFormat {
-    const DOMAIN: u32 = target_DPU;
+    const DOMAIN: u32 = crate::rocket::builders::DOMAIN_DPU;
     const OFFSET: u32 = REG_DPU_DATA_FORMAT;
 }
 
@@ -231,7 +231,7 @@ impl Register<DpuDataFormat> {
 pub struct DpuOffsetPend;
 
 impl RegisterMeta for DpuOffsetPend {
-    const DOMAIN: u32 = target_DPU;
+    const DOMAIN: u32 = crate::rocket::builders::DOMAIN_DPU;
     const OFFSET: u32 = REG_DPU_OFFSET_PEND;
 }
 
@@ -250,7 +250,7 @@ impl Register<DpuOffsetPend> {
 pub struct DpuDstBaseAddr;
 
 impl RegisterMeta for DpuDstBaseAddr {
-    const DOMAIN: u32 = target_DPU;
+    const DOMAIN: u32 = crate::rocket::builders::DOMAIN_DPU;
     const OFFSET: u32 = REG_DPU_DST_BASE_ADDR;
 }
 
@@ -269,7 +269,7 @@ impl Register<DpuDstBaseAddr> {
 pub struct DpuDstSurfStride;
 
 impl RegisterMeta for DpuDstSurfStride {
-    const DOMAIN: u32 = target_DPU;
+    const DOMAIN: u32 = crate::rocket::builders::DOMAIN_DPU;
     const OFFSET: u32 = REG_DPU_DST_SURF_STRIDE;
 }
 
@@ -288,7 +288,7 @@ impl Register<DpuDstSurfStride> {
 pub struct DpuDataCubeWidth;
 
 impl RegisterMeta for DpuDataCubeWidth {
-    const DOMAIN: u32 = target_DPU;
+    const DOMAIN: u32 = crate::rocket::builders::DOMAIN_DPU;
     const OFFSET: u32 = REG_DPU_DATA_CUBE_WIDTH;
 }
 
@@ -307,7 +307,7 @@ impl Register<DpuDataCubeWidth> {
 pub struct DpuDataCubeHeight;
 
 impl RegisterMeta for DpuDataCubeHeight {
-    const DOMAIN: u32 = target_DPU;
+    const DOMAIN: u32 = crate::rocket::builders::DOMAIN_DPU;
     const OFFSET: u32 = REG_DPU_DATA_CUBE_HEIGHT;
 }
 
@@ -332,7 +332,7 @@ impl Register<DpuDataCubeHeight> {
 pub struct DpuDataCubeNotchAddr;
 
 impl RegisterMeta for DpuDataCubeNotchAddr {
-    const DOMAIN: u32 = target_DPU;
+    const DOMAIN: u32 = crate::rocket::builders::DOMAIN_DPU;
     const OFFSET: u32 = REG_DPU_DATA_CUBE_NOTCH_ADDR;
 }
 
@@ -357,7 +357,7 @@ impl Register<DpuDataCubeNotchAddr> {
 pub struct DpuDataCubeChannel;
 
 impl RegisterMeta for DpuDataCubeChannel {
-    const DOMAIN: u32 = target_DPU;
+    const DOMAIN: u32 = crate::rocket::builders::DOMAIN_DPU;
     const OFFSET: u32 = REG_DPU_DATA_CUBE_CHANNEL;
 }
 
@@ -382,7 +382,7 @@ impl Register<DpuDataCubeChannel> {
 pub struct DpuBsCfg;
 
 impl RegisterMeta for DpuBsCfg {
-    const DOMAIN: u32 = target_DPU;
+    const DOMAIN: u32 = crate::rocket::builders::DOMAIN_DPU;
     const OFFSET: u32 = REG_DPU_BS_CFG;
 }
 
@@ -443,7 +443,7 @@ impl Register<DpuBsCfg> {
 pub struct DpuBsAluCfg;
 
 impl RegisterMeta for DpuBsAluCfg {
-    const DOMAIN: u32 = target_DPU;
+    const DOMAIN: u32 = crate::rocket::builders::DOMAIN_DPU;
     const OFFSET: u32 = REG_DPU_BS_ALU_CFG;
 }
 
@@ -462,7 +462,7 @@ impl Register<DpuBsAluCfg> {
 pub struct DpuBsMulCfg;
 
 impl RegisterMeta for DpuBsMulCfg {
-    const DOMAIN: u32 = target_DPU;
+    const DOMAIN: u32 = crate::rocket::builders::DOMAIN_DPU;
     const OFFSET: u32 = REG_DPU_BS_MUL_CFG;
 }
 
@@ -499,7 +499,7 @@ impl Register<DpuBsMulCfg> {
 pub struct DpuBsReluxCmpValue;
 
 impl RegisterMeta for DpuBsReluxCmpValue {
-    const DOMAIN: u32 = target_DPU;
+    const DOMAIN: u32 = crate::rocket::builders::DOMAIN_DPU;
     const OFFSET: u32 = REG_DPU_BS_RELUX_CMP_VALUE;
 }
 
@@ -518,7 +518,7 @@ impl Register<DpuBsReluxCmpValue> {
 pub struct DpuBsOwCfg;
 
 impl RegisterMeta for DpuBsOwCfg {
-    const DOMAIN: u32 = target_DPU;
+    const DOMAIN: u32 = crate::rocket::builders::DOMAIN_DPU;
     const OFFSET: u32 = REG_DPU_BS_OW_CFG;
 }
 
@@ -573,7 +573,7 @@ impl Register<DpuBsOwCfg> {
 pub struct DpuBsOwOp;
 
 impl RegisterMeta for DpuBsOwOp {
-    const DOMAIN: u32 = target_DPU;
+    const DOMAIN: u32 = crate::rocket::builders::DOMAIN_DPU;
     const OFFSET: u32 = REG_DPU_BS_OW_OP;
 }
 
@@ -592,7 +592,7 @@ impl Register<DpuBsOwOp> {
 pub struct DpuWdmaSize0;
 
 impl RegisterMeta for DpuWdmaSize0 {
-    const DOMAIN: u32 = target_DPU;
+    const DOMAIN: u32 = crate::rocket::builders::DOMAIN_DPU;
     const OFFSET: u32 = REG_DPU_WDMA_SIZE_0;
 }
 
@@ -623,7 +623,7 @@ impl Register<DpuWdmaSize0> {
 pub struct DpuWdmaSize1;
 
 impl RegisterMeta for DpuWdmaSize1 {
-    const DOMAIN: u32 = target_DPU;
+    const DOMAIN: u32 = crate::rocket::builders::DOMAIN_DPU;
     const OFFSET: u32 = REG_DPU_WDMA_SIZE_1;
 }
 
@@ -648,7 +648,7 @@ impl Register<DpuWdmaSize1> {
 pub struct DpuBnCfg;
 
 impl RegisterMeta for DpuBnCfg {
-    const DOMAIN: u32 = target_DPU;
+    const DOMAIN: u32 = crate::rocket::builders::DOMAIN_DPU;
     const OFFSET: u32 = REG_DPU_BN_CFG;
 }
 
@@ -709,7 +709,7 @@ impl Register<DpuBnCfg> {
 pub struct DpuBnAluCfg;
 
 impl RegisterMeta for DpuBnAluCfg {
-    const DOMAIN: u32 = target_DPU;
+    const DOMAIN: u32 = crate::rocket::builders::DOMAIN_DPU;
     const OFFSET: u32 = REG_DPU_BN_ALU_CFG;
 }
 
@@ -728,7 +728,7 @@ impl Register<DpuBnAluCfg> {
 pub struct DpuBnMulCfg;
 
 impl RegisterMeta for DpuBnMulCfg {
-    const DOMAIN: u32 = target_DPU;
+    const DOMAIN: u32 = crate::rocket::builders::DOMAIN_DPU;
     const OFFSET: u32 = REG_DPU_BN_MUL_CFG;
 }
 
@@ -765,7 +765,7 @@ impl Register<DpuBnMulCfg> {
 pub struct DpuBnReluxCmpValue;
 
 impl RegisterMeta for DpuBnReluxCmpValue {
-    const DOMAIN: u32 = target_DPU;
+    const DOMAIN: u32 = crate::rocket::builders::DOMAIN_DPU;
     const OFFSET: u32 = REG_DPU_BN_RELUX_CMP_VALUE;
 }
 
@@ -784,7 +784,7 @@ impl Register<DpuBnReluxCmpValue> {
 pub struct DpuEwCfg;
 
 impl RegisterMeta for DpuEwCfg {
-    const DOMAIN: u32 = target_DPU;
+    const DOMAIN: u32 = crate::rocket::builders::DOMAIN_DPU;
     const OFFSET: u32 = REG_DPU_EW_CFG;
 }
 
@@ -893,7 +893,7 @@ impl Register<DpuEwCfg> {
 pub struct DpuEwCvtOffsetValue;
 
 impl RegisterMeta for DpuEwCvtOffsetValue {
-    const DOMAIN: u32 = target_DPU;
+    const DOMAIN: u32 = crate::rocket::builders::DOMAIN_DPU;
     const OFFSET: u32 = REG_DPU_EW_CVT_OFFSET_VALUE;
 }
 
@@ -912,7 +912,7 @@ impl Register<DpuEwCvtOffsetValue> {
 pub struct DpuEwCvtScaleValue;
 
 impl RegisterMeta for DpuEwCvtScaleValue {
-    const DOMAIN: u32 = target_DPU;
+    const DOMAIN: u32 = crate::rocket::builders::DOMAIN_DPU;
     const OFFSET: u32 = REG_DPU_EW_CVT_SCALE_VALUE;
 }
 
@@ -943,7 +943,7 @@ impl Register<DpuEwCvtScaleValue> {
 pub struct DpuEwReluxCmpValue;
 
 impl RegisterMeta for DpuEwReluxCmpValue {
-    const DOMAIN: u32 = target_DPU;
+    const DOMAIN: u32 = crate::rocket::builders::DOMAIN_DPU;
     const OFFSET: u32 = REG_DPU_EW_RELUX_CMP_VALUE;
 }
 
@@ -962,7 +962,7 @@ impl Register<DpuEwReluxCmpValue> {
 pub struct DpuOutCvtOffset;
 
 impl RegisterMeta for DpuOutCvtOffset {
-    const DOMAIN: u32 = target_DPU;
+    const DOMAIN: u32 = crate::rocket::builders::DOMAIN_DPU;
     const OFFSET: u32 = REG_DPU_OUT_CVT_OFFSET;
 }
 
@@ -981,7 +981,7 @@ impl Register<DpuOutCvtOffset> {
 pub struct DpuOutCvtScale;
 
 impl RegisterMeta for DpuOutCvtScale {
-    const DOMAIN: u32 = target_DPU;
+    const DOMAIN: u32 = crate::rocket::builders::DOMAIN_DPU;
     const OFFSET: u32 = REG_DPU_OUT_CVT_SCALE;
 }
 
@@ -1006,7 +1006,7 @@ impl Register<DpuOutCvtScale> {
 pub struct DpuOutCvtShift;
 
 impl RegisterMeta for DpuOutCvtShift {
-    const DOMAIN: u32 = target_DPU;
+    const DOMAIN: u32 = crate::rocket::builders::DOMAIN_DPU;
     const OFFSET: u32 = REG_DPU_OUT_CVT_SHIFT;
 }
 
@@ -1045,7 +1045,7 @@ macro_rules! define_dpu_ew_op_value {
         pub struct $name;
 
         impl RegisterMeta for $name {
-            const DOMAIN: u32 = target_DPU;
+            const DOMAIN: u32 = crate::rocket::builders::DOMAIN_DPU;
             const OFFSET: u32 = $offset;
         }
 
@@ -1113,7 +1113,7 @@ define_dpu_ew_op_value!(
 pub struct DpuSurfaceAdd;
 
 impl RegisterMeta for DpuSurfaceAdd {
-    const DOMAIN: u32 = target_DPU;
+    const DOMAIN: u32 = crate::rocket::builders::DOMAIN_DPU;
     const OFFSET: u32 = REG_DPU_SURFACE_ADD;
 }
 
@@ -1132,7 +1132,7 @@ impl Register<DpuSurfaceAdd> {
 pub struct DpuLutAccessCfg;
 
 impl RegisterMeta for DpuLutAccessCfg {
-    const DOMAIN: u32 = target_DPU;
+    const DOMAIN: u32 = crate::rocket::builders::DOMAIN_DPU;
     const OFFSET: u32 = REG_DPU_LUT_ACCESS_CFG;
 }
 
@@ -1163,7 +1163,7 @@ impl Register<DpuLutAccessCfg> {
 pub struct DpuLutAccessData;
 
 impl RegisterMeta for DpuLutAccessData {
-    const DOMAIN: u32 = target_DPU;
+    const DOMAIN: u32 = crate::rocket::builders::DOMAIN_DPU;
     const OFFSET: u32 = REG_DPU_LUT_ACCESS_DATA;
 }
 
@@ -1182,7 +1182,7 @@ impl Register<DpuLutAccessData> {
 pub struct DpuLutCfg;
 
 impl RegisterMeta for DpuLutCfg {
-    const DOMAIN: u32 = target_DPU;
+    const DOMAIN: u32 = crate::rocket::builders::DOMAIN_DPU;
     const OFFSET: u32 = REG_DPU_LUT_CFG;
 }
 
@@ -1237,7 +1237,7 @@ impl Register<DpuLutCfg> {
 pub struct DpuLutInfo;
 
 impl RegisterMeta for DpuLutInfo {
-    const DOMAIN: u32 = target_DPU;
+    const DOMAIN: u32 = crate::rocket::builders::DOMAIN_DPU;
     const OFFSET: u32 = REG_DPU_LUT_INFO;
 }
 
@@ -1262,7 +1262,7 @@ impl Register<DpuLutInfo> {
 pub struct DpuLutLeStart;
 
 impl RegisterMeta for DpuLutLeStart {
-    const DOMAIN: u32 = target_DPU;
+    const DOMAIN: u32 = crate::rocket::builders::DOMAIN_DPU;
     const OFFSET: u32 = REG_DPU_LUT_LE_START;
 }
 
@@ -1281,7 +1281,7 @@ impl Register<DpuLutLeStart> {
 pub struct DpuLutLeEnd;
 
 impl RegisterMeta for DpuLutLeEnd {
-    const DOMAIN: u32 = target_DPU;
+    const DOMAIN: u32 = crate::rocket::builders::DOMAIN_DPU;
     const OFFSET: u32 = REG_DPU_LUT_LE_END;
 }
 
@@ -1300,7 +1300,7 @@ impl Register<DpuLutLeEnd> {
 pub struct DpuLutLoStart;
 
 impl RegisterMeta for DpuLutLoStart {
-    const DOMAIN: u32 = target_DPU;
+    const DOMAIN: u32 = crate::rocket::builders::DOMAIN_DPU;
     const OFFSET: u32 = REG_DPU_LUT_LO_START;
 }
 
@@ -1319,7 +1319,7 @@ impl Register<DpuLutLoStart> {
 pub struct DpuLutLoEnd;
 
 impl RegisterMeta for DpuLutLoEnd {
-    const DOMAIN: u32 = target_DPU;
+    const DOMAIN: u32 = crate::rocket::builders::DOMAIN_DPU;
     const OFFSET: u32 = REG_DPU_LUT_LO_END;
 }
 
@@ -1338,7 +1338,7 @@ impl Register<DpuLutLoEnd> {
 pub struct DpuLutLeSlopeScale;
 
 impl RegisterMeta for DpuLutLeSlopeScale {
-    const DOMAIN: u32 = target_DPU;
+    const DOMAIN: u32 = crate::rocket::builders::DOMAIN_DPU;
     const OFFSET: u32 = REG_DPU_LUT_LE_SLOPE_SCALE;
 }
 
@@ -1369,7 +1369,7 @@ impl Register<DpuLutLeSlopeScale> {
 pub struct DpuLutLeSlopeShift;
 
 impl RegisterMeta for DpuLutLeSlopeShift {
-    const DOMAIN: u32 = target_DPU;
+    const DOMAIN: u32 = crate::rocket::builders::DOMAIN_DPU;
     const OFFSET: u32 = REG_DPU_LUT_LE_SLOPE_SHIFT;
 }
 
@@ -1400,7 +1400,7 @@ impl Register<DpuLutLeSlopeShift> {
 pub struct DpuLutLoSlopeScale;
 
 impl RegisterMeta for DpuLutLoSlopeScale {
-    const DOMAIN: u32 = target_DPU;
+    const DOMAIN: u32 = crate::rocket::builders::DOMAIN_DPU;
     const OFFSET: u32 = REG_DPU_LUT_LO_SLOPE_SCALE;
 }
 
@@ -1431,7 +1431,7 @@ impl Register<DpuLutLoSlopeScale> {
 pub struct DpuLutLoSlopeShift;
 
 impl RegisterMeta for DpuLutLoSlopeShift {
-    const DOMAIN: u32 = target_DPU;
+    const DOMAIN: u32 = crate::rocket::builders::DOMAIN_DPU;
     const OFFSET: u32 = REG_DPU_LUT_LO_SLOPE_SHIFT;
 }
 

@@ -10,7 +10,7 @@ use crate::rocket::{
 pub struct GlobalOperationEnable;
 
 impl RegisterMeta for GlobalOperationEnable {
-    const DOMAIN: u32 = target_GLOBAL;
+    const DOMAIN: u32 = crate::rocket::builders::DOMAIN_GLOBAL;
     const OFFSET: u32 = REG_GLOBAL_OPERATION_ENABLE;
 }
 

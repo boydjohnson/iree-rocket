@@ -7,7 +7,7 @@ use crate::rocket::{
 pub struct PCOperationEnable;
 
 impl RegisterMeta for PCOperationEnable {
-    const DOMAIN: u32 = target_PC;
+    const DOMAIN: u32 = crate::rocket::builders::DOMAIN_PC;
     const OFFSET: u32 = REG_PC_OPERATION_ENABLE;
 }
 
@@ -21,7 +21,7 @@ impl Register<PCOperationEnable> {
 pub struct PCBaseAddress;
 
 impl RegisterMeta for PCBaseAddress {
-    const DOMAIN: u32 = target_PC;
+    const DOMAIN: u32 = crate::rocket::builders::DOMAIN_PC;
     const OFFSET: u32 = REG_PC_BASE_ADDRESS;
 }
 
@@ -41,7 +41,7 @@ impl Register<PCBaseAddress> {
 pub struct PCRegisterAmounts;
 
 impl RegisterMeta for PCRegisterAmounts {
-    const DOMAIN: u32 = target_PC;
+    const DOMAIN: u32 = crate::rocket::builders::DOMAIN_PC;
     const OFFSET: u32 = REG_PC_REGISTER_AMOUNTS;
 }
 
@@ -57,7 +57,7 @@ impl Register<PCRegisterAmounts> {
 pub struct PCInterruptMask;
 
 impl RegisterMeta for PCInterruptMask {
-    const DOMAIN: u32 = target_PC;
+    const DOMAIN: u32 = crate::rocket::builders::DOMAIN_PC;
     const OFFSET: u32 = REG_PC_INTERRUPT_MASK;
 }
 
@@ -123,7 +123,7 @@ impl Register<PCInterruptMask> {
 pub struct PCInterruptClear;
 
 impl RegisterMeta for PCInterruptClear {
-    const DOMAIN: u32 = target_PC;
+    const DOMAIN: u32 = crate::rocket::builders::DOMAIN_PC;
     const OFFSET: u32 = REG_PC_INTERRUPT_CLEAR;
 }
 
@@ -189,7 +189,7 @@ impl Register<PCInterruptClear> {
 pub struct PCTaskCon;
 
 impl RegisterMeta for PCTaskCon {
-    const DOMAIN: u32 = target_PC;
+    const DOMAIN: u32 = crate::rocket::builders::DOMAIN_PC;
     const OFFSET: u32 = REG_PC_TASK_CON;
 }
 
@@ -217,7 +217,7 @@ impl Register<PCTaskCon> {
 pub struct PCTaskDMABaseAddr;
 
 impl RegisterMeta for PCTaskDMABaseAddr {
-    const DOMAIN: u32 = target_PC;
+    const DOMAIN: u32 = crate::rocket::builders::DOMAIN_PC;
     const OFFSET: u32 = REG_PC_TASK_DMA_BASE_ADDR;
 }
 

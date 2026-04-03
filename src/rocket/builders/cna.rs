@@ -7,7 +7,7 @@ use crate::rocket::{
 pub struct CnaSPointer;
 
 impl RegisterMeta for CnaSPointer {
-    const DOMAIN: u32 = target_CNA;
+    const DOMAIN: u32 = crate::rocket::builders::DOMAIN_CNA;
     const OFFSET: u32 = REG_CNA_S_POINTER;
 }
 
@@ -59,7 +59,7 @@ impl Register<CnaSPointer> {
 pub struct CnaOperationEnable;
 
 impl RegisterMeta for CnaOperationEnable {
-    const DOMAIN: u32 = target_CNA;
+    const DOMAIN: u32 = crate::rocket::builders::DOMAIN_CNA;
     const OFFSET: u32 = REG_CNA_OPERATION_ENABLE;
 }
 
@@ -75,7 +75,7 @@ impl Register<CnaOperationEnable> {
 pub struct CnaConvCon1;
 
 impl RegisterMeta for CnaConvCon1 {
-    const DOMAIN: u32 = target_CNA;
+    const DOMAIN: u32 = crate::rocket::builders::DOMAIN_CNA;
     const OFFSET: u32 = REG_CNA_CONV_CON1;
 }
 
@@ -127,7 +127,7 @@ impl Register<CnaConvCon1> {
 pub struct CnaConvCon2;
 
 impl RegisterMeta for CnaConvCon2 {
-    const DOMAIN: u32 = target_CNA;
+    const DOMAIN: u32 = crate::rocket::builders::DOMAIN_CNA;
     const OFFSET: u32 = REG_CNA_CONV_CON2;
 }
 
@@ -167,7 +167,7 @@ impl Register<CnaConvCon2> {
 pub struct CnaConvCon3;
 
 impl RegisterMeta for CnaConvCon3 {
-    const DOMAIN: u32 = target_CNA;
+    const DOMAIN: u32 = crate::rocket::builders::DOMAIN_CNA;
     const OFFSET: u32 = REG_CNA_CONV_CON3;
 }
 
@@ -219,7 +219,7 @@ impl Register<CnaConvCon3> {
 pub struct CnaDataSize0;
 
 impl RegisterMeta for CnaDataSize0 {
-    const DOMAIN: u32 = target_CNA;
+    const DOMAIN: u32 = crate::rocket::builders::DOMAIN_CNA;
     const OFFSET: u32 = REG_CNA_DATA_SIZE0;
 }
 
@@ -241,7 +241,7 @@ impl Register<CnaDataSize0> {
 pub struct CnaDataSize1;
 
 impl RegisterMeta for CnaDataSize1 {
-    const DOMAIN: u32 = target_CNA;
+    const DOMAIN: u32 = crate::rocket::builders::DOMAIN_CNA;
     const OFFSET: u32 = REG_CNA_DATA_SIZE1;
 }
 
@@ -263,7 +263,7 @@ impl Register<CnaDataSize1> {
 pub struct CnaDataSize2;
 
 impl RegisterMeta for CnaDataSize2 {
-    const DOMAIN: u32 = target_CNA;
+    const DOMAIN: u32 = crate::rocket::builders::DOMAIN_CNA;
     const OFFSET: u32 = REG_CNA_DATA_SIZE2;
 }
 
@@ -279,7 +279,7 @@ impl Register<CnaDataSize2> {
 pub struct CnaDataSize3;
 
 impl RegisterMeta for CnaDataSize3 {
-    const DOMAIN: u32 = target_CNA;
+    const DOMAIN: u32 = crate::rocket::builders::DOMAIN_CNA;
     const OFFSET: u32 = REG_CNA_DATA_SIZE3;
 }
 
@@ -301,7 +301,7 @@ impl Register<CnaDataSize3> {
 pub struct CnaWeightSize0;
 
 impl RegisterMeta for CnaWeightSize0 {
-    const DOMAIN: u32 = target_CNA;
+    const DOMAIN: u32 = crate::rocket::builders::DOMAIN_CNA;
     const OFFSET: u32 = REG_CNA_WEIGHT_SIZE0;
 }
 
@@ -317,7 +317,7 @@ impl Register<CnaWeightSize0> {
 pub struct CnaWeightSize1;
 
 impl RegisterMeta for CnaWeightSize1 {
-    const DOMAIN: u32 = target_CNA;
+    const DOMAIN: u32 = crate::rocket::builders::DOMAIN_CNA;
     const OFFSET: u32 = REG_CNA_WEIGHT_SIZE1;
 }
 
@@ -333,7 +333,7 @@ impl Register<CnaWeightSize1> {
 pub struct CnaWeightSize2;
 
 impl RegisterMeta for CnaWeightSize2 {
-    const DOMAIN: u32 = target_CNA;
+    const DOMAIN: u32 = crate::rocket::builders::DOMAIN_CNA;
     const OFFSET: u32 = REG_CNA_WEIGHT_SIZE2;
 }
 
@@ -361,7 +361,7 @@ impl Register<CnaWeightSize2> {
 pub struct CnaCbufCon0;
 
 impl RegisterMeta for CnaCbufCon0 {
-    const DOMAIN: u32 = target_CNA;
+    const DOMAIN: u32 = crate::rocket::builders::DOMAIN_CNA;
     const OFFSET: u32 = REG_CNA_CBUF_CON0;
 }
 
@@ -401,7 +401,7 @@ impl Register<CnaCbufCon0> {
 pub struct CnaCbufCon1;
 
 impl RegisterMeta for CnaCbufCon1 {
-    const DOMAIN: u32 = target_CNA;
+    const DOMAIN: u32 = crate::rocket::builders::DOMAIN_CNA;
     const OFFSET: u32 = REG_CNA_CBUF_CON1;
 }
 
@@ -417,7 +417,7 @@ impl Register<CnaCbufCon1> {
 pub struct CnaCvtCon0;
 
 impl RegisterMeta for CnaCvtCon0 {
-    const DOMAIN: u32 = target_CNA;
+    const DOMAIN: u32 = crate::rocket::builders::DOMAIN_CNA;
     const OFFSET: u32 = REG_CNA_CVT_CON0;
 }
 
@@ -475,7 +475,7 @@ impl Register<CnaCvtCon0> {
 pub struct CnaCvtCon1;
 
 impl RegisterMeta for CnaCvtCon1 {
-    const DOMAIN: u32 = target_CNA;
+    const DOMAIN: u32 = crate::rocket::builders::DOMAIN_CNA;
     const OFFSET: u32 = REG_CNA_CVT_CON1;
 }
 
@@ -497,7 +497,7 @@ impl Register<CnaCvtCon1> {
 pub struct CnaCvtCon2;
 
 impl RegisterMeta for CnaCvtCon2 {
-    const DOMAIN: u32 = target_CNA;
+    const DOMAIN: u32 = crate::rocket::builders::DOMAIN_CNA;
     const OFFSET: u32 = REG_CNA_CVT_CON2;
 }
 
@@ -519,7 +519,7 @@ impl Register<CnaCvtCon2> {
 pub struct CnaCvtCon3;
 
 impl RegisterMeta for CnaCvtCon3 {
-    const DOMAIN: u32 = target_CNA;
+    const DOMAIN: u32 = crate::rocket::builders::DOMAIN_CNA;
     const OFFSET: u32 = REG_CNA_CVT_CON3;
 }
 
@@ -541,7 +541,7 @@ impl Register<CnaCvtCon3> {
 pub struct CnaCvtCon4;
 
 impl RegisterMeta for CnaCvtCon4 {
-    const DOMAIN: u32 = target_CNA;
+    const DOMAIN: u32 = crate::rocket::builders::DOMAIN_CNA;
     const OFFSET: u32 = REG_CNA_CVT_CON4;
 }
 
@@ -563,7 +563,7 @@ impl Register<CnaCvtCon4> {
 pub struct CnaFcCon0;
 
 impl RegisterMeta for CnaFcCon0 {
-    const DOMAIN: u32 = target_CNA;
+    const DOMAIN: u32 = crate::rocket::builders::DOMAIN_CNA;
     const OFFSET: u32 = REG_CNA_FC_CON0;
 }
 
@@ -585,7 +585,7 @@ impl Register<CnaFcCon0> {
 pub struct CnaFcCon1;
 
 impl RegisterMeta for CnaFcCon1 {
-    const DOMAIN: u32 = target_CNA;
+    const DOMAIN: u32 = crate::rocket::builders::DOMAIN_CNA;
     const OFFSET: u32 = REG_CNA_FC_CON1;
 }
 
@@ -601,7 +601,7 @@ impl Register<CnaFcCon1> {
 pub struct CnaPadCon0;
 
 impl RegisterMeta for CnaPadCon0 {
-    const DOMAIN: u32 = target_CNA;
+    const DOMAIN: u32 = crate::rocket::builders::DOMAIN_CNA;
     const OFFSET: u32 = REG_CNA_PAD_CON0;
 }
 
@@ -623,7 +623,7 @@ impl Register<CnaPadCon0> {
 pub struct CnaFeatureDataAddr;
 
 impl RegisterMeta for CnaFeatureDataAddr {
-    const DOMAIN: u32 = target_CNA;
+    const DOMAIN: u32 = crate::rocket::builders::DOMAIN_CNA;
     const OFFSET: u32 = REG_CNA_FEATURE_DATA_ADDR;
 }
 
@@ -639,7 +639,7 @@ impl Register<CnaFeatureDataAddr> {
 pub struct CnaFcCon2;
 
 impl RegisterMeta for CnaFcCon2 {
-    const DOMAIN: u32 = target_CNA;
+    const DOMAIN: u32 = crate::rocket::builders::DOMAIN_CNA;
     const OFFSET: u32 = REG_CNA_FC_CON2;
 }
 
@@ -655,7 +655,7 @@ impl Register<CnaFcCon2> {
 pub struct CnaDmaCon0;
 
 impl RegisterMeta for CnaDmaCon0 {
-    const DOMAIN: u32 = target_CNA;
+    const DOMAIN: u32 = crate::rocket::builders::DOMAIN_CNA;
     const OFFSET: u32 = REG_CNA_DMA_CON0;
 }
 
@@ -683,7 +683,7 @@ impl Register<CnaDmaCon0> {
 pub struct CnaDmaCon1;
 
 impl RegisterMeta for CnaDmaCon1 {
-    const DOMAIN: u32 = target_CNA;
+    const DOMAIN: u32 = crate::rocket::builders::DOMAIN_CNA;
     const OFFSET: u32 = REG_CNA_DMA_CON1;
 }
 
@@ -699,7 +699,7 @@ impl Register<CnaDmaCon1> {
 pub struct CnaDmaCon2;
 
 impl RegisterMeta for CnaDmaCon2 {
-    const DOMAIN: u32 = target_CNA;
+    const DOMAIN: u32 = crate::rocket::builders::DOMAIN_CNA;
     const OFFSET: u32 = REG_CNA_DMA_CON2;
 }
 
@@ -718,7 +718,7 @@ impl Register<CnaDmaCon2> {
 pub struct CnaFcDataSize0;
 
 impl RegisterMeta for CnaFcDataSize0 {
-    const DOMAIN: u32 = target_CNA;
+    const DOMAIN: u32 = crate::rocket::builders::DOMAIN_CNA;
     const OFFSET: u32 = REG_CNA_FC_DATA_SIZE0;
 }
 
@@ -743,7 +743,7 @@ impl Register<CnaFcDataSize0> {
 pub struct CnaFcDataSize1;
 
 impl RegisterMeta for CnaFcDataSize1 {
-    const DOMAIN: u32 = target_CNA;
+    const DOMAIN: u32 = crate::rocket::builders::DOMAIN_CNA;
     const OFFSET: u32 = REG_CNA_FC_DATA_SIZE1;
 }
 
@@ -762,7 +762,7 @@ impl Register<CnaFcDataSize1> {
 pub struct CnaClkGate;
 
 impl RegisterMeta for CnaClkGate {
-    const DOMAIN: u32 = target_CNA;
+    const DOMAIN: u32 = crate::rocket::builders::DOMAIN_CNA;
     const OFFSET: u32 = REG_CNA_CLK_GATE;
 }
 
@@ -802,7 +802,7 @@ impl Register<CnaClkGate> {
 pub struct CnaDcompCtrl;
 
 impl RegisterMeta for CnaDcompCtrl {
-    const DOMAIN: u32 = target_CNA;
+    const DOMAIN: u32 = crate::rocket::builders::DOMAIN_CNA;
     const OFFSET: u32 = REG_CNA_DCOMP_CTRL;
 }
 
@@ -827,7 +827,7 @@ impl Register<CnaDcompCtrl> {
 pub struct CnaDcompRegnum;
 
 impl RegisterMeta for CnaDcompRegnum {
-    const DOMAIN: u32 = target_CNA;
+    const DOMAIN: u32 = crate::rocket::builders::DOMAIN_CNA;
     const OFFSET: u32 = REG_CNA_DCOMP_REGNUM;
 }
 
@@ -846,7 +846,7 @@ impl Register<CnaDcompRegnum> {
 pub struct CnaDcompAddr0;
 
 impl RegisterMeta for CnaDcompAddr0 {
-    const DOMAIN: u32 = target_CNA;
+    const DOMAIN: u32 = crate::rocket::builders::DOMAIN_CNA;
     const OFFSET: u32 = REG_CNA_DCOMP_ADDR0;
 }
 
@@ -864,7 +864,7 @@ macro_rules! define_dcomp_amount {
         pub struct $name;
 
         impl RegisterMeta for $name {
-            const DOMAIN: u32 = target_CNA;
+            const DOMAIN: u32 = crate::rocket::builders::DOMAIN_CNA;
             const OFFSET: u32 = $offset;
         }
 
@@ -977,7 +977,7 @@ define_dcomp_amount!(
 pub struct CnaCvtCon5;
 
 impl RegisterMeta for CnaCvtCon5 {
-    const DOMAIN: u32 = target_CNA;
+    const DOMAIN: u32 = crate::rocket::builders::DOMAIN_CNA;
     const OFFSET: u32 = REG_CNA_CVT_CON5;
 }
 
@@ -993,7 +993,7 @@ impl Register<CnaCvtCon5> {
 pub struct CnaPadCon1;
 
 impl RegisterMeta for CnaPadCon1 {
-    const DOMAIN: u32 = target_CNA;
+    const DOMAIN: u32 = crate::rocket::builders::DOMAIN_CNA;
     const OFFSET: u32 = REG_CNA_PAD_CON1;
 }
 

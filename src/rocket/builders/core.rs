@@ -10,7 +10,7 @@ use crate::rocket::{
 pub struct CoreSStatus;
 
 impl RegisterMeta for CoreSStatus {
-    const DOMAIN: u32 = target_CORE;
+    const DOMAIN: u32 = crate::rocket::builders::DOMAIN_CORE;
     const OFFSET: u32 = REG_CORE_S_STATUS;
 }
 
@@ -35,7 +35,7 @@ impl Register<CoreSStatus> {
 pub struct CoreSPointer;
 
 impl RegisterMeta for CoreSPointer {
-    const DOMAIN: u32 = target_CORE;
+    const DOMAIN: u32 = crate::rocket::builders::DOMAIN_CORE;
     const OFFSET: u32 = REG_CORE_S_POINTER;
 }
 
@@ -90,7 +90,7 @@ impl Register<CoreSPointer> {
 pub struct CoreOperationEnable;
 
 impl RegisterMeta for CoreOperationEnable {
-    const DOMAIN: u32 = target_CORE;
+    const DOMAIN: u32 = crate::rocket::builders::DOMAIN_CORE;
     const OFFSET: u32 = REG_CORE_OPERATION_ENABLE;
 }
 
@@ -109,7 +109,7 @@ impl Register<CoreOperationEnable> {
 pub struct CoreMacGating;
 
 impl RegisterMeta for CoreMacGating {
-    const DOMAIN: u32 = target_CORE;
+    const DOMAIN: u32 = crate::rocket::builders::DOMAIN_CORE;
     const OFFSET: u32 = REG_CORE_MAC_GATING;
 }
 
@@ -128,7 +128,7 @@ impl Register<CoreMacGating> {
 pub struct CoreMiscCfg;
 
 impl RegisterMeta for CoreMiscCfg {
-    const DOMAIN: u32 = target_CORE;
+    const DOMAIN: u32 = crate::rocket::builders::DOMAIN_CORE;
     const OFFSET: u32 = REG_CORE_MISC_CFG;
 }
 
@@ -165,7 +165,7 @@ impl Register<CoreMiscCfg> {
 pub struct CoreDataoutSize0;
 
 impl RegisterMeta for CoreDataoutSize0 {
-    const DOMAIN: u32 = target_CORE;
+    const DOMAIN: u32 = crate::rocket::builders::DOMAIN_CORE;
     const OFFSET: u32 = REG_CORE_DATAOUT_SIZE_0;
 }
 
@@ -190,7 +190,7 @@ impl Register<CoreDataoutSize0> {
 pub struct CoreDataoutSize1;
 
 impl RegisterMeta for CoreDataoutSize1 {
-    const DOMAIN: u32 = target_CORE;
+    const DOMAIN: u32 = crate::rocket::builders::DOMAIN_CORE;
     const OFFSET: u32 = REG_CORE_DATAOUT_SIZE_1;
 }
 
@@ -209,7 +209,7 @@ impl Register<CoreDataoutSize1> {
 pub struct CoreClipTruncate;
 
 impl RegisterMeta for CoreClipTruncate {
-    const DOMAIN: u32 = target_CORE;
+    const DOMAIN: u32 = crate::rocket::builders::DOMAIN_CORE;
     const OFFSET: u32 = REG_CORE_CLIP_TRUNCATE;
 }
 
