@@ -75,7 +75,7 @@ impl RegCmd {
 #[derive(Clone, Copy, Debug)]
 pub struct Bits<const N: usize>(u32);
 
-impl<const N: usize> Bits<const N: usize> {
+impl<const N: usize> Bits<N> {
     pub const fn new(val: u32) -> Self {
         // Use u64 for check to avoid overflow if N=32
         if N < 32 {
