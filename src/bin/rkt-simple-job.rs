@@ -1,5 +1,5 @@
 use std::{fs::OpenOptions, marker::PhantomData, num::NonZeroUsize, os::fd::AsRawFd};
-
+use iree_rocket_hal::rocket::builders;
 use iree_rocket_hal::rocket::{
     api::{
         DRM_COMMAND_BASE, DRM_IOCTL_BASE, DRM_ROCKET_CREATE_BO, DRM_ROCKET_FINI_BO,
@@ -280,7 +280,7 @@ impl CnaCore1x1Job {
         cmds.push(Register::<CnaDataSize1>::new().datain_channel(Bits::new(self.in_channels - 1)).datain_channel_real(Bits::new(self.in_channels)).build());
         cmds.push(Register::<CnaDataSize2>::new().dataout_width(Bits::new(self.width)).build());
         cmds.push(Register::<CnaDataSize3>::new().dataout_atomics(Bits::new(self.width * self.height)).build());
-        
+
         let line_stride = self.width * self.in_channels;
         cmds.push(Register::<CnaDmaCon1>::new().line_stride(Bits::new(line_stride)).build());
         cmds.push(Register::<CnaDmaCon2>::new().surf_stride(Bits::new(self.height * line_stride)).build());
@@ -301,11 +301,11 @@ impl CnaCore1x1Job {
         cmds.push(Register::<CnaConvCon3>::new().conv_x_stride(Bits::new(1)).conv_y_stride(Bits::new(1)).build());
         cmds.push(Register::<CnaCbufCon0>::new().data_bank(Bits::new(0)).weight_bank(Bits::new(1)).build());
         cmds.push(Register::<CnaCbufCon1>::new().data_entries(Bits::new(1)).build());
-        
+
         // Identity Converters (CNA)
         cmds.push(Register::<CnaCvtCon0>::new().cvt_bypass(Bits::new(0)).build());
         cmds.push(Register::<CnaCvtCon1>::new().cvt_scale0(Bits::new(1)).cvt_offset0(Bits::new(0)).build());
-        
+
         // Block Kicks
         cmds.push(Register::<CnaOperationEnable>::new().op_en(Bits::new(1)).build());
         cmds.push(Register::<CoreDataoutSize0>::new().dataout_width(Bits::new(self.width)).dataout_height(Bits::new(self.height)).build());
@@ -326,13 +326,13 @@ impl CnaCore1x1Job {
         cmds.push(Register::<DpuEwCfg>::new().ew_bypass(Bits::new(1)).build());
         cmds.push(Register::<DpuWdmaSize0>::new().channel_wdma(Bits::new(self.out_channels - 1)).size_c_wdma(Bits::new(self.out_channels - 1)).build());
         cmds.push(Register::<DpuWdmaSize1>::new().width_wdma(Bits::new(self.width - 1)).height_wdma(Bits::new(self.height - 1)).build());
-        
+
         // Identity Converter (DPU)
         cmds.push(Register::<DpuOutCvtScale>::new().out_cvt_scale(Bits::new(1)).build());
         cmds.push(Register::<DpuOperationEnable>::new().op_en(Bits::new(1)).build());
 
         // 5. GLOBAL KICK (Broad Enable)
-        cmds.push(RegCmd::new(crate::rocket::builders::DOMAIN_GLOBAL, 0x0008, 0x7F));
+        cmds.push(RegCmd::new(builders::DOMAIN_GLOBAL, 0x0008, 0x7F));
 
         // Final Master Kick via PC
         cmds.push(Register::<PCOperationEnable>::new().op_enable(true).build());
