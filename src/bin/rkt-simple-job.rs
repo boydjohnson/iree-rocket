@@ -9,20 +9,19 @@ use iree_rocket_hal::rocket::{
     builders::{
         Bits, RegCmd, Register,
         cna::{
-            CnaCbufCon0, CnaCbufCon1, CnaClkGate, CnaConvCon1, CnaConvCon2, CnaConvCon3,
-            CnaCvtCon0, CnaDataSize0, CnaDataSize1, CnaDataSize2, CnaDataSize3, CnaDcompAddr0,
+            CnaCbufCon0, CnaCbufCon1, CnaConvCon1, CnaConvCon2, CnaConvCon3,
+            CnaCvtCon0, CnaCvtCon1, CnaDataSize0, CnaDataSize1, CnaDataSize2, CnaDataSize3, CnaDcompAddr0,
             CnaDcompCtrl, CnaDmaCon0, CnaDmaCon1, CnaDmaCon2, CnaFeatureDataAddr,
             CnaOperationEnable, CnaPadCon0, CnaSPointer, CnaWeightSize0, CnaWeightSize1,
             CnaWeightSize2,
         },
         core::{
-            CoreClipTruncate, CoreDataoutSize0, CoreDataoutSize1, CoreMiscCfg, CoreOperationEnable,
-            CoreSPointer,
+            CoreDataoutSize0, CoreDataoutSize1, CoreMiscCfg, CoreOperationEnable,
         },
         dpu::{
             DpuBnCfg, DpuBsCfg, DpuDataCubeChannel, DpuDataCubeHeight, DpuDataCubeWidth,
             DpuDataFormat, DpuDstBaseAddr, DpuDstSurfStride, DpuEwCfg, DpuFeatureModeCfg,
-            DpuOperationEnable, DpuOutCvtOffset, DpuOutCvtScale, DpuOutCvtShift, DpuSPointer,
+            DpuOperationEnable, DpuOutCvtOffset, DpuOutCvtScale, DpuOutCvtShift,
             DpuWdmaSize0, DpuWdmaSize1,
         },
         global::GlobalOperationEnable,
@@ -41,12 +40,12 @@ where
     let mut prep = drm_rocket_prep_bo {
         handle: buf.handle,
         reserved: 0,
-        timeout_ns: 1_000_000_000, // 1 second timeout
+        timeout_ns: 1_000_000_000,
     };
 
     println!("PREP_BO ({})", label);
     unsafe {
-        rocket_prep_bo(fd, &mut prep).expect("PREP_BO failed - check if NPU is hung");
+        rocket_prep_bo(fd, &mut prep).expect("PREP_BO failed");
     }
 
     let slice = unsafe { std::slice::from_raw_parts_mut(buf.host_ptr, buf.size as usize) };
@@ -143,15 +142,8 @@ pub struct BufferView<'a, T: NpuDataType> {
 
 impl<'a, T: NpuDataType> BufferView<'a, T> {
     pub unsafe fn new(data: &'a mut [u8]) -> Self {
-        assert_eq!(
-            data.len() % T::bytes_per_element(),
-            0,
-            "Buffer size must be multiple of element size"
-        );
-        Self {
-            data,
-            _phantom: PhantomData,
-        }
+        assert_eq!(data.len() % T::bytes_per_element(), 0);
+        Self { data, _phantom: PhantomData }
     }
 
     pub fn as_slice(&mut self) -> &mut [T] {
@@ -169,12 +161,10 @@ impl<'a, T: NpuDataType> BufferView<'a, T> {
 }
 
 pub trait NpuDataType: Copy {
-    fn precision() -> Precision;
     fn bytes_per_element() -> usize;
 }
 
 impl NpuDataType for i8 {
-    fn precision() -> Precision { Precision::Int8 }
     fn bytes_per_element() -> usize { 1 }
 }
 
@@ -205,13 +195,12 @@ fn main() {
         fill_buffer::<i8>(fd, &buf_w, "fill W", 2);
         fill_buffer::<i8>(fd, &buf_c, "zero C", 0);
 
-        let job_desc = CnaCore1x1Job::new(
-            224, 224, 24, 24,
-            Precision::Int8, Precision::Int8, Precision::Int8,
-            buf_c.dma_address as u64,
-            buf_a.dma_address as u64,
-            buf_w.dma_address as u64,
-        ).unwrap();
+        let job_desc = CnaCore1x1Job {
+            width: 224, height: 224, in_channels: 24, out_channels: 24,
+            dst_iova: buf_c.dma_address as u64,
+            src_iova: buf_a.dma_address as u64,
+            weight_iova: buf_w.dma_address as u64,
+        };
 
         let cmds = job_desc.build_regcmds();
 
@@ -222,15 +211,14 @@ fn main() {
             }
         });
 
-        // Kernel expects regcmd_count to be the actual number of 64-bit words
-        let regcmd_count_val = cmds.len() as u32;
+        // FIX: Multiply by 2 to satisfy kernel formula (N+1)/2 - 1
+        let regcmd_count_val = cmds.len() as u32 * 2;
 
         let task = drm_rocket_task {
             regcmd: buf_cmd.dma_address,
             regcmd_count: regcmd_count_val,
         };
 
-        // LIFETIME FIX: Keep handles vectors alive until submit returns
         let in_handles = vec![buf_cmd.handle, buf_a.handle, buf_w.handle];
         let out_handles = vec![buf_c.handle];
 
@@ -254,13 +242,12 @@ fn main() {
         println!("Submitting job (count={})...", regcmd_count_val);
         rocket_submit(fd, &mut submit).expect("Submit failed");
 
-        // Wait for completion
         let mut prep_out = drm_rocket_prep_bo {
             handle: buf_c.handle,
             reserved: 0,
-            timeout_ns: 2_000_000_000, // 2 second wait
+            timeout_ns: 2_000_000_000,
         };
-        rocket_prep_bo(fd, &mut prep_out).expect("Job timeout or NPU error");
+        rocket_prep_bo(fd, &mut prep_out).expect("Job timeout or NPU error (EBUSY)");
 
         let result = std::slice::from_raw_parts(buf_c.host_ptr, buf_c.size as usize);
         println!("Result[0]: {}", result[0]);
@@ -273,53 +260,13 @@ fn main() {
     }
 }
 
-#[derive(Debug)]
-pub enum RknnError {
-    InvalidAlignment(String),
-    InvalidDimensions(String),
-    InvalidChannels(String),
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum Precision {
-    Int8 = 0,
-}
-
-impl Precision {
-    pub fn channel_alignment(&self) -> u32 { 8 }
-    pub fn as_u32(&self) -> u32 { *self as u32 }
-    pub fn bytes_per_element(&self) -> u32 { 1 }
-}
-
-#[derive(Debug, Clone, Copy)]
-pub enum ConvMode { Direct = 0 }
-
-#[derive(Debug, Clone, Copy)]
-pub enum OutputMode { ToMemory = 2 }
-
 pub struct CnaCore1x1Job {
     width: u32, height: u32,
     in_channels: u32, out_channels: u32,
-    in_precision: Precision, proc_precision: Precision, out_precision: Precision,
     dst_iova: u64, src_iova: u64, weight_iova: u64,
 }
 
 impl CnaCore1x1Job {
-    pub fn new(
-        width: u32, height: u32, in_channels: u32, out_channels: u32,
-        in_precision: Precision, proc_precision: Precision, out_precision: Precision,
-        dst_iova: u64, src_iova: u64, weight_iova: u64,
-    ) -> Result<Self, RknnError> {
-        if width == 0 || height == 0 { return Err(RknnError::InvalidDimensions("W/H must be > 0".to_string())); }
-        if weight_iova & 0xF != 0 || dst_iova & 0xF != 0 { return Err(RknnError::InvalidAlignment("Addr must be 16-byte aligned".to_string())); }
-        
-        Ok(Self {
-            width, height, in_channels, out_channels,
-            in_precision, proc_precision, out_precision,
-            dst_iova, src_iova, weight_iova,
-        })
-    }
-
     pub fn build_regcmds(&self) -> Vec<RegCmd> {
         let mut cmds = Vec::new();
 
@@ -354,7 +301,10 @@ impl CnaCore1x1Job {
         cmds.push(Register::<CnaConvCon3>::new().conv_x_stride(Bits::new(1)).conv_y_stride(Bits::new(1)).build());
         cmds.push(Register::<CnaCbufCon0>::new().data_bank(Bits::new(0)).weight_bank(Bits::new(1)).build());
         cmds.push(Register::<CnaCbufCon1>::new().data_entries(Bits::new(1)).build());
-        cmds.push(Register::<CnaCvtCon0>::new().cvt_bypass(Bits::new(1)).build());
+        
+        // Identity Converters (CNA)
+        cmds.push(Register::<CnaCvtCon0>::new().cvt_bypass(Bits::new(0)).build());
+        cmds.push(Register::<CnaCvtCon1>::new().cvt_scale0(Bits::new(1)).cvt_offset0(Bits::new(0)).build());
         
         // Block Kicks
         cmds.push(Register::<CnaOperationEnable>::new().op_en(Bits::new(1)).build());
@@ -376,15 +326,13 @@ impl CnaCore1x1Job {
         cmds.push(Register::<DpuEwCfg>::new().ew_bypass(Bits::new(1)).build());
         cmds.push(Register::<DpuWdmaSize0>::new().channel_wdma(Bits::new(self.out_channels - 1)).size_c_wdma(Bits::new(self.out_channels - 1)).build());
         cmds.push(Register::<DpuWdmaSize1>::new().width_wdma(Bits::new(self.width - 1)).height_wdma(Bits::new(self.height - 1)).build());
+        
+        // Identity Converter (DPU)
+        cmds.push(Register::<DpuOutCvtScale>::new().out_cvt_scale(Bits::new(1)).build());
         cmds.push(Register::<DpuOperationEnable>::new().op_en(Bits::new(1)).build());
 
-        // 5. GLOBAL KICK (The most important fix)
-        // Enable all relevant blocks in the Global controller
-        cmds.push(Register::<GlobalOperationEnable>::new()
-            .cna_op_en(Bits::new(1))
-            .core_op_en(Bits::new(1))
-            .dpu_op_en(Bits::new(1))
-            .build());
+        // 5. GLOBAL KICK (Broad Enable)
+        cmds.push(RegCmd::new(crate::rocket::builders::DOMAIN_GLOBAL, 0x0008, 0x7F));
 
         // Final Master Kick via PC
         cmds.push(Register::<PCOperationEnable>::new().op_enable(true).build());
