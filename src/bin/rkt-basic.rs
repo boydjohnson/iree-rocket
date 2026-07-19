@@ -136,7 +136,15 @@ fn main() {
 
     unsafe {
         let buf_a = Buffer::new(fd, tensor_size, &file);
-        ptr::write_bytes(buf_a.host_ptr, 10, tensor_size);
+        // Sanity-check value: 200 instead of 10 -- well above the CNA CVT
+        // stage's implicit 128 zero-point (see top-of-file doc comment),
+        // vs. 10 which is well below it. If real MAC/accumulate is
+        // happening, this should flip the accumulator's sign and visibly
+        // change Result[0] from the previous run's 128 -- if it stays
+        // exactly 128, that's a red flag that the output is just the
+        // OUT_CVT offset applied to a zero/hollow accumulator, not real
+        // computed data.
+        ptr::write_bytes(buf_a.host_ptr, 200, tensor_size);
 
         let buf_w = Buffer::new(fd, tensor_size, &file);
         ptr::write_bytes(buf_w.host_ptr, 2, tensor_size);
