@@ -48,9 +48,12 @@
 //!     example). PC's own registers (BASE_ADDRESS/REGISTER_AMOUNTS/
 //!     TASK_CON) are left to the kernel driver via
 //!     `drm_rocket_task.regcmd`/`regcmd_count` rather than pushed into the
-//!     stream -- see the comment at the kick sequence below for why,
-//!     cross-checked against the vendor kernel driver's own
-//!     `rknpu_job_subcore_commit` disassembly.
+//!     stream -- confirmed directly from the mainline kernel driver's own
+//!     source now (`drivers/accel/rocket/rocket_job.c`,
+//!     `rocket_job_hw_submit`), not just inferred from the vendor driver's
+//!     `rknpu_job_subcore_commit` disassembly the way it originally was.
+//!     That source is also where the `regcmd_count * 2` below comes from
+//!     -- see the comment at the `drm_rocket_task` construction.
 //!   - STILL UNCONFIRMED, flagged inline: feature_grains and
 //!     CBUF_CON1.data_entries (both shape-dependent; the real conv.rknn
 //!     example's values don't cleanly scale down to our much smaller test
@@ -590,18 +593,26 @@ fn main() {
         )
         .ok();
 
-        // NOT cmds.len() * 2 -- that was carried over from an earlier
-        // version's "(Count Fix)" comment, on the theory that the kernel
-        // applies some (N+1)/2-1-style formula to this count. rkt-job.rs
-        // (which doesn't multiply) submits and completes without hanging;
-        // this file and rkt-simple-job.rs (which both did multiply) both
-        // hang and time out in PREP_BO instead of erroring cleanly --
-        // consistent with PC reading past the real regcmd data into
-        // whatever (likely zeroed) memory follows it, rather than the
-        // multiplier being a real requirement.
+        // cmds.len() * 2 IS correct -- confirmed straight from the
+        // mainline kernel driver source (drivers/accel/rocket/rocket_job.c,
+        // rocket_job_hw_submit), not inferred:
+        //
+        //   rocket_pc_writel(core, REGISTER_AMOUNTS,
+        //       PC_REGISTER_AMOUNTS_PC_DATA_AMOUNT((task->regcmd_count + 1) / 2 - 1));
+        //
+        // i.e. the kernel itself divides regcmd_count by 2 (rounding) and
+        // subtracts 1 before writing PC_REGISTER_AMOUNTS. An earlier
+        // revision of this file removed the `* 2` on the theory that it
+        // was an unconfirmed guess causing PC to read past the real
+        // regcmd data -- that reasoning was wrong (the correlation with
+        // rkt-job.rs not hanging was actually explained by rkt-job.rs
+        // never enabling CORE at all, unrelated to this count), and
+        // removing it silently told PC to read roughly half the real
+        // regcmd stream, stopping before ever reaching the trailing
+        // GLOBAL_OPERATION_ENABLE/kick entries. Restored.
         let task = drm_rocket_task {
             regcmd: buf_cmd.dma_address,
-            regcmd_count: cmds.len() as u32,
+            regcmd_count: cmds.len() as u32 * 2,
         };
 
         let in_handles = vec![buf_cmd.handle, buf_a.handle, buf_w.handle];
