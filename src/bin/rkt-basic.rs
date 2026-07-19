@@ -513,9 +513,18 @@ fn main() {
         )
         .ok();
 
+        // NOT cmds.len() * 2 -- that was carried over from an earlier
+        // version's "(Count Fix)" comment, on the theory that the kernel
+        // applies some (N+1)/2-1-style formula to this count. rkt-job.rs
+        // (which doesn't multiply) submits and completes without hanging;
+        // this file and rkt-simple-job.rs (which both did multiply) both
+        // hang and time out in PREP_BO instead of erroring cleanly --
+        // consistent with PC reading past the real regcmd data into
+        // whatever (likely zeroed) memory follows it, rather than the
+        // multiplier being a real requirement.
         let task = drm_rocket_task {
             regcmd: buf_cmd.dma_address,
-            regcmd_count: cmds.len() as u32 * 2,
+            regcmd_count: cmds.len() as u32,
         };
 
         let in_handles = vec![buf_cmd.handle, buf_a.handle, buf_w.handle];
