@@ -123,6 +123,19 @@ fn zero<R: RegisterMeta>() -> RegCmd {
 }
 
 fn main() {
+    // Sanity-check knob: input fill byte, default 10. The CNA CVT stage
+    // subtracts an implicit 128 zero-point (see top-of-file doc comment)
+    // before the MAC, so values far from 128 in either direction saturate
+    // the int8 output range -- sweeping values close to 128 is what
+    // actually distinguishes "real, proportional MAC computation" from
+    // "hollow completion that just saturates to a rail regardless of
+    // input" (both produce a plausible-looking single result on their
+    // own, but only real computation tracks input near the zero-point).
+    let input_fill: u8 = std::env::args()
+        .nth(1)
+        .map(|s| s.parse().expect("input fill byte must be 0-255"))
+        .unwrap_or(10);
+
     let file = OpenOptions::new()
         .read(true)
         .write(true)
@@ -131,20 +144,13 @@ fn main() {
     let fd = file.as_raw_fd();
 
     println!("--- NPU Diagnostic: Minimal 1x1 Conv (full Mesa regcmd port) ---");
+    println!("input_fill = {input_fill}");
 
     let tensor_size = 4096; // 4KB aligned
 
     unsafe {
         let buf_a = Buffer::new(fd, tensor_size, &file);
-        // Sanity-check value: 200 instead of 10 -- well above the CNA CVT
-        // stage's implicit 128 zero-point (see top-of-file doc comment),
-        // vs. 10 which is well below it. If real MAC/accumulate is
-        // happening, this should flip the accumulator's sign and visibly
-        // change Result[0] from the previous run's 128 -- if it stays
-        // exactly 128, that's a red flag that the output is just the
-        // OUT_CVT offset applied to a zero/hollow accumulator, not real
-        // computed data.
-        ptr::write_bytes(buf_a.host_ptr, 200, tensor_size);
+        ptr::write_bytes(buf_a.host_ptr, input_fill, tensor_size);
 
         let buf_w = Buffer::new(fd, tensor_size, &file);
         ptr::write_bytes(buf_w.host_ptr, 2, tensor_size);
