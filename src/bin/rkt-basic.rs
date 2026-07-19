@@ -86,8 +86,9 @@ use iree_rocket_hal::rocket::{
         Bits, DOMAIN_CORE, DOMAIN_DPU, DOMAIN_PC, RegCmd, Register,
         cna::{
             CnaCbufCon0, CnaCbufCon1, CnaConvCon1, CnaConvCon2, CnaConvCon3, CnaCvtCon0,
-            CnaDataSize0, CnaDataSize1, CnaDataSize2, CnaDataSize3, CnaDcompAddr0, CnaDcompCtrl,
-            CnaDmaCon0, CnaFeatureDataAddr, CnaPadCon0, CnaWeightSize0, CnaWeightSize1,
+            CnaCvtCon1, CnaCvtCon2, CnaCvtCon3, CnaCvtCon4, CnaCvtCon5, CnaDataSize0, CnaDataSize1,
+            CnaDataSize2, CnaDataSize3, CnaDcompAddr0, CnaDcompCtrl, CnaDmaCon0, CnaDmaCon1,
+            CnaDmaCon2, CnaFeatureDataAddr, CnaPadCon0, CnaPadCon1, CnaWeightSize0, CnaWeightSize1,
             CnaWeightSize2,
         },
         core::{CoreClipTruncate, CoreDataoutSize0, CoreDataoutSize1, CoreMiscCfg},
@@ -167,12 +168,23 @@ fn main() {
         // isn't independently confirmed to mean "float16" for OUR raw
         // test buffers, just that 2 is a real, hardware-accepted value
         // (unlike our original guess of 0).
+        // nonalign_dma/group_line_off/argb_in are set here because
+        // IN_CHANNELS==1 -- Mesa's fill_first_regcmd has a dedicated
+        // `if (task->input_channels_real == 1)` branch that ORs these
+        // three bits into CONV_CON1's value, on top of the fields already
+        // set below. Our previous real-decode cross-check used a capture
+        // with 3 real input channels, which takes the *other* branch (no
+        // extra bits here) -- these bits were silently missing for our
+        // actual 1-channel test shape specifically.
         cmds.push(
             Register::<CnaConvCon1>::new()
                 .conv_mode(Bits::new(0))
                 .in_precision(Bits::new(2))
                 .proc_precision(Bits::new(2))
                 .deconv(Bits::new(0))
+                .nonalign_dma(Bits::new(1))
+                .group_line_off(Bits::new(1))
+                .argb_in(Bits::new(8))
                 .build(),
         );
 
@@ -208,12 +220,23 @@ fn main() {
                 .pointer_pp_en(Bits::new(1))
                 .build(),
         );
+        // nonalign_dma/group_line_off/argb_in are set here because
+        // IN_CHANNELS==1 -- Mesa's fill_first_regcmd has a dedicated
+        // `if (task->input_channels_real == 1)` branch that ORs these
+        // three bits into CONV_CON1's value, on top of the fields already
+        // set below. Our previous real-decode cross-check used a capture
+        // with 3 real input channels, which takes the *other* branch (no
+        // extra bits here) -- these bits were silently missing for our
+        // actual 1-channel test shape specifically.
         cmds.push(
             Register::<CnaConvCon1>::new()
                 .conv_mode(Bits::new(0))
                 .in_precision(Bits::new(2))
                 .proc_precision(Bits::new(2))
                 .deconv(Bits::new(0))
+                .nonalign_dma(Bits::new(1))
+                .group_line_off(Bits::new(1))
+                .argb_in(Bits::new(8))
                 .build(),
         );
 
@@ -320,17 +343,53 @@ fn main() {
                 .build(),
         );
 
-        // CVT_CON0: bypass input requantization entirely -- we're feeding
-        // raw values, not a quantized real model, so there's no scale/
-        // offset to apply. cvt_bypass=1 confirmed correct against the real
-        // decode; cvt_type=1/data_sign=1 are set there too even though
-        // CVT is bypassed (so presumably don't-care when bypassed, but
-        // matching real usage in case they aren't).
+        // CVT_CON0-5: input requantization. This file previously used the
+        // "bypass" pattern (cvt_bypass=1) unconditionally -- correct for
+        // Mesa's `input_channels_real != 1` branch (matches our earlier
+        // real-decode cross-check, which happened to use a 3-real-channel
+        // capture), but WRONG for our actual shape: IN_CHANNELS=1 means
+        // Mesa's fill_first_regcmd takes the *other* branch entirely,
+        // which does not bypass CVT at all and instead sets real
+        // truncate/scale/offset values:
+        //   truncate = 14, scale = 16384, offset = 65408
+        //   (15/32388 instead, only if addition_input -- not our case)
+        //   CVT_CON0 = TRUNCATE_3(t)|TRUNCATE_2(t)|TRUNCATE_1(t)|TRUNCATE_0(t)
+        //   CVT_CON1..4 = SCALE{0..3}(scale) | OFFSET{0..3}(offset)
+        //   CVT_CON5 = 65535 (also branch-specific; else-branch is 0)
+        // No cvt_bypass field involved in this branch at all.
+        const CVT_TRUNCATE: u32 = 14;
+        const CVT_SCALE: u32 = 16384;
+        const CVT_OFFSET: u32 = 65408;
         cmds.push(
             Register::<CnaCvtCon0>::new()
-                .cvt_bypass(Bits::new(1))
-                .cvt_type(Bits::new(1))
-                .data_sign(Bits::new(1))
+                .cvt_truncate_0(Bits::new(CVT_TRUNCATE))
+                .cvt_truncate_1(Bits::new(CVT_TRUNCATE))
+                .cvt_truncate_2(Bits::new(CVT_TRUNCATE))
+                .cvt_truncate_3(Bits::new(CVT_TRUNCATE))
+                .build(),
+        );
+        cmds.push(
+            Register::<CnaCvtCon1>::new()
+                .cvt_scale0(Bits::new(CVT_SCALE))
+                .cvt_offset0(Bits::new(CVT_OFFSET))
+                .build(),
+        );
+        cmds.push(
+            Register::<CnaCvtCon2>::new()
+                .cvt_scale1(Bits::new(CVT_SCALE))
+                .cvt_offset1(Bits::new(CVT_OFFSET))
+                .build(),
+        );
+        cmds.push(
+            Register::<CnaCvtCon3>::new()
+                .cvt_scale2(Bits::new(CVT_SCALE))
+                .cvt_offset2(Bits::new(CVT_OFFSET))
+                .build(),
+        );
+        cmds.push(
+            Register::<CnaCvtCon4>::new()
+                .cvt_scale3(Bits::new(CVT_SCALE))
+                .cvt_offset3(Bits::new(CVT_OFFSET))
                 .build(),
         );
 
@@ -345,11 +404,50 @@ fn main() {
                 .build(),
         );
 
+        // DMA_CON1/CON2: line/surface stride for the feature DMA read.
+        // Previously entirely missing (left at implicit 0). Mesa's
+        // calc_line_stride()/fill_task() (rkt_task.c): for our case
+        // (input_channels_real==1, output_channels_real==1, no
+        // addition_input -- so NOT the special wide-atomic branch),
+        // line_stride = width * ATOMIC_K_SIZE / 4 = 4*16/4 = 16;
+        // surface_stride = line_stride * (height/4 - 1) = 16*0 = 0.
+        cmds.push(
+            Register::<CnaDmaCon1>::new()
+                .line_stride(Bits::new(16))
+                .build(),
+        );
+        cmds.push(
+            Register::<CnaDmaCon2>::new()
+                .surf_stride(Bits::new(0))
+                .build(),
+        );
+
         // PAD_CON0: no padding.
         cmds.push(
             Register::<CnaPadCon0>::new()
                 .pad_top(Bits::new(0))
                 .pad_left(Bits::new(0))
+                .build(),
+        );
+
+        // CVT_CON5: also part of the input_channels_real==1 branch above
+        // (65535; the else-branch/non-1-channel case, which our earlier
+        // real-decode cross-check used, writes 0 here instead).
+        cmds.push(
+            Register::<CnaCvtCon5>::new()
+                .per_channel_cvt_en(Bits::new(65535))
+                .build(),
+        );
+
+        // PAD_CON1: pad value. Mesa always computes and writes this
+        // (rkt_regcmd.c), previously missing here entirely. Our
+        // weights_width=1 (not >=3) and no addition_input/depthwise, so:
+        // pad_con1 = input_zero_point - 0x80. Treating input_zero_point
+        // as 0 (raw non-quantized test data, no real zero-point) gives
+        // 0 - 0x80 = -128, i.e. 0xffffff80 as u32.
+        cmds.push(
+            Register::<CnaPadCon1>::new()
+                .pad_value(Bits::new(0xffffff80u32))
                 .build(),
         );
 
