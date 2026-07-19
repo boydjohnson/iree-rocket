@@ -98,6 +98,7 @@ use iree_rocket_hal::rocket::{
 use nix::{
     ioctl_readwrite, ioctl_write_ptr,
     sys::mman::{MapFlags, ProtFlags, mmap},
+    time::{ClockId, clock_gettime},
 };
 
 // 1 input channel, 1 output channel, 1x1 kernel, 4x4 spatial, stride 1, no
@@ -886,10 +887,22 @@ fn main() {
         println!("Submitting...");
         rocket_submit(fd, &mut submit).expect("IOCTL Failed");
 
+        // rocket_gem.c's rocket_ioctl_prep_bo() converts timeout_ns via
+        // drm_timeout_abs_to_jiffies() -- that takes an ABSOLUTE
+        // CLOCK_MONOTONIC deadline, not a relative duration (standard DRM
+        // wait-ioctl convention). A bare `2_000_000_000` here is
+        // interpreted as "2 seconds after the monotonic clock's zero
+        // point", which is always already in the past on a booted system
+        // -- drm_timeout_abs_to_jiffies clamps that to an already-expired
+        // deadline, so dma_resv_wait_timeout returns immediately with
+        // -EBUSY regardless of whether/when the job actually completes.
+        // This was silently wrong in every previous revision of this file.
+        let now = clock_gettime(ClockId::CLOCK_MONOTONIC).expect("clock_gettime failed");
+        let now_ns = now.tv_sec() as u64 * 1_000_000_000 + now.tv_nsec() as u64;
         let prep = drm_rocket_prep_bo {
             handle: buf_c.handle,
             reserved: 0,
-            timeout_ns: 2_000_000_000,
+            timeout_ns: (now_ns + 2_000_000_000) as i64, // 2s from now, as an absolute deadline
         };
 
         match rocket_prep_bo(fd, &prep) {
