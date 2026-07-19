@@ -16,24 +16,36 @@
 //! left at 0 (ping-pong pointers, reserved bits, DMA burst lengths) are
 //! left unset deliberately, matching hardware POR-style defaults.
 //!
-//! Confidence levels, since this hasn't been validated against a real
-//! decoded regcmd program yet (see NOTES.md in rknpu-spelunking for the
-//! plan to decode one out of conv.rknn or a live vendor-driver capture):
-//!   - HIGH: all addresses and dimensions. PC's own registers
-//!     (BASE_ADDRESS/REGISTER_AMOUNTS/TASK_CON) are left to the kernel
-//!     driver via `drm_rocket_task.regcmd`/`regcmd_count` rather than
-//!     pushed into the stream -- see the comment at the kick sequence
-//!     below for why, cross-checked against the vendor kernel driver's own
+//! Confidence levels. Most of the enum/mode fields below were validated by
+//! decoding a real regcmd program out of a compiled conv.rknn (see
+//! NOTES.md in rknpu-spelunking for the byte-offset scan + field decode) --
+//! the container format is undocumented but the wire encoding of each
+//! individual (domain, offset, value) entry matches `rkt_registers.h`
+//! exactly, so real per-field values could be read straight out of it and
+//! cross-checked against every field we'd guessed at:
+//!   - CONFIRMED against the real decode: conv_mode=0, deconv=0,
+//!     in/out/proc_precision=2 (not 0 -- corrected), kernel_group=0 (not 1
+//!     -- corrected), atrous dilation=0 for "none" (not 1 -- corrected;
+//!     dilation and stride turned out to use different encoding
+//!     conventions in the same register), DMA/DPU burst lengths=15/max
+//!     (not 0 -- corrected, and CNA_DMA_CON0 was missing entirely before),
+//!     DPU output_mode=2 (not 0 -- corrected), cvt_bypass=1, bn_bypass=1,
+//!     ew_bypass=1, out_cvt_scale=1 (all as originally guessed).
+//!   - HIGH but not from the decode: all addresses and dimensions (shape-
+//!     dependent, so not directly comparable to the 32x32x8-ish real
+//!     example). PC's own registers (BASE_ADDRESS/REGISTER_AMOUNTS/
+//!     TASK_CON) are left to the kernel driver via
+//!     `drm_rocket_task.regcmd`/`regcmd_count` rather than pushed into the
+//!     stream -- see the comment at the kick sequence below for why,
+//!     cross-checked against the vendor kernel driver's own
 //!     `rknpu_job_subcore_commit` disassembly.
-//!   - MEDIUM: every `*_bypass` flag (CVT, weight decompression, BS/BN/EW).
-//!     Bit semantics for a "bypass" flag are conventionally 1=skip,
-//!     0=enabled, and bypassing everything optional minimizes how much
-//!     unverified state we depend on.
-//!   - LOW / best-guess, flagged inline: conv_mode, in/out/proc precision
-//!     enum values, out_cvt_scale/shift, feature_grains, kernel_group,
-//!     cache-buffer bank allocation. Picked the most conservative/literal
-//!     reading of each field name, but these are the values most likely to
-//!     need correcting first if this doesn't produce a correct result.
+//!   - STILL UNCONFIRMED, flagged inline: feature_grains and cache-buffer
+//!     bank allocation (both shape-dependent; the real example's values
+//!     don't cleanly scale down to our much smaller test tensor, so no
+//!     formula yet), and out_cvt_shift (the real example only confirms
+//!     scale=1, not shift=0 -- DPU_OUT_CVT_SCALE also has an
+//!     FP32TOFP16_EN bit the current builder doesn't expose at all, a gap
+//!     worth fixing in builders/dpu.rs separately).
 
 use std::{fs::OpenOptions, mem, num::NonZeroUsize, os::unix::io::AsRawFd, ptr};
 
@@ -48,8 +60,8 @@ use iree_rocket_hal::rocket::{
         cna::{
             CnaCbufCon0, CnaCbufCon1, CnaConvCon1, CnaConvCon2, CnaConvCon3, CnaCvtCon0,
             CnaDataSize0, CnaDataSize1, CnaDataSize2, CnaDataSize3, CnaDcompAddr0, CnaDcompCtrl,
-            CnaFeatureDataAddr, CnaOperationEnable, CnaPadCon0, CnaWeightSize0, CnaWeightSize1,
-            CnaWeightSize2,
+            CnaDmaCon0, CnaFeatureDataAddr, CnaOperationEnable, CnaPadCon0, CnaWeightSize0,
+            CnaWeightSize1, CnaWeightSize2,
         },
         core::{
             CoreClipTruncate, CoreDataoutSize0, CoreDataoutSize1, CoreMiscCfg, CoreOperationEnable,
@@ -115,37 +127,50 @@ fn main() {
         // ==================================================================
 
         // CONV_CON1 (0x100c) -- the register the old code never wrote.
-        // conv_mode/in_precision/proc_precision: 0 is the most conservative
-        // reading (plain direct conv, int8-family), unverified. deconv=0
-        // (this is a forward conv, not a transpose conv).
+        // conv_mode=0 (plain direct conv) and deconv=0 (forward, not
+        // transpose) confirmed against a real compiled regcmd (see
+        // NOTES.md's conv.rknn decode). in_precision/proc_precision=2 is
+        // also taken directly from that decode -- it's what the real
+        // compiler used for this model's float16 tensors; codepoint 2
+        // isn't independently confirmed to mean "float16" for OUR raw
+        // test buffers, just that 2 is a real, hardware-accepted value
+        // (unlike our original guess of 0).
         cmds.push(
             Register::<CnaConvCon1>::new()
                 .conv_mode(Bits::new(0))
-                .in_precision(Bits::new(0))
-                .proc_precision(Bits::new(0))
+                .in_precision(Bits::new(2))
+                .proc_precision(Bits::new(2))
                 .deconv(Bits::new(0))
                 .build(),
         );
 
         // CONV_CON2 (0x1010) -- what the old code mislabeled CONV_CON0 and
-        // zeroed. feature_grains/kernel_group: 1 is the literal reading
-        // ("1 grain", "1 group") for a single-channel, non-grouped conv;
-        // exact grain-size semantics unconfirmed.
+        // zeroed. kernel_group=0 confirmed (real decode showed 0, not the
+        // "1 group = literal 1" guess this had before). feature_grains is
+        // still an open guess -- the real decode used 36 for a 32x32x8
+        // input, which doesn't cleanly divide down to anything obvious for
+        // our 4x4x1 case, so this stays at the previous literal-reading
+        // guess of 1 pending a real derivation.
         cmds.push(
             Register::<CnaConvCon2>::new()
                 .cmd_fifo_srst(Bits::new(1)) // reset CNA's command fifo before this task
                 .feature_grains(Bits::new(1))
-                .kernel_group(Bits::new(1))
+                .kernel_group(Bits::new(0))
                 .build(),
         );
 
-        // CONV_CON3 (0x1014) -- stride 1, no dilation.
+        // CONV_CON3 (0x1014) -- stride 1, no dilation. Confirmed against
+        // the real decode: stride is stored literally (1 = stride 1,
+        // matching what we already had), but dilation is NOT -- the real
+        // no-dilation encoding is 0, not 1. Different encoding convention
+        // for two fields in the same register; the earlier guess of 1 for
+        // dilation was wrong.
         cmds.push(
             Register::<CnaConvCon3>::new()
                 .conv_x_stride(Bits::new(1))
                 .conv_y_stride(Bits::new(1))
-                .atrous_x_dilation(Bits::new(1))
-                .atrous_y_dilation(Bits::new(1))
+                .atrous_x_dilation(Bits::new(0))
+                .atrous_y_dilation(Bits::new(0))
                 .build(),
         );
 
@@ -209,10 +234,26 @@ fn main() {
 
         // CVT_CON0: bypass input requantization entirely -- we're feeding
         // raw values, not a quantized real model, so there's no scale/
-        // offset to apply.
+        // offset to apply. cvt_bypass=1 confirmed correct against the real
+        // decode; cvt_type=1/data_sign=1 are set there too even though
+        // CVT is bypassed (so presumably don't-care when bypassed, but
+        // matching real usage in case they aren't).
         cmds.push(
             Register::<CnaCvtCon0>::new()
                 .cvt_bypass(Bits::new(1))
+                .cvt_type(Bits::new(1))
+                .data_sign(Bits::new(1))
+                .build(),
+        );
+
+        // DMA_CON0: burst lengths. The real decode uses max burst (15) for
+        // both feature and weight DMA rather than the 0 we'd otherwise
+        // default to -- this register was missing entirely from the first
+        // draft of this file.
+        cmds.push(
+            Register::<CnaDmaCon0>::new()
+                .data_burst_len(Bits::new(15))
+                .weight_burst_len(Bits::new(15))
                 .build(),
         );
 
@@ -256,7 +297,7 @@ fn main() {
 
         cmds.push(
             Register::<CoreMiscCfg>::new()
-                .proc_precision(Bits::new(0)) // must agree with CNA's proc_precision
+                .proc_precision(Bits::new(2)) // must agree with CNA's proc_precision -- confirmed =2, not 0
                 .build(),
         );
         cmds.push(
@@ -290,18 +331,23 @@ fn main() {
         // all bypassed -- nothing but a straight conv here)
         // ==================================================================
 
+        // conv_mode=0 confirmed. output_mode=2 and burst_len=15(max) are
+        // corrections from the real decode -- both were guessed at 0.
         cmds.push(
             Register::<DpuFeatureModeCfg>::new()
                 .conv_mode(Bits::new(0))
-                .output_mode(Bits::new(0))
-                .burst_len(Bits::new(0))
+                .output_mode(Bits::new(2))
+                .burst_len(Bits::new(15))
                 .build(),
         );
+        // Precision fields =2 across the board (CNA/CORE/DPU), matching
+        // CnaConvCon1 above -- confirmed via the real decode, corrected
+        // from the original guess of 0.
         cmds.push(
             Register::<DpuDataFormat>::new()
-                .in_precision(Bits::new(0))
-                .out_precision(Bits::new(0))
-                .proc_precision(Bits::new(0))
+                .in_precision(Bits::new(2))
+                .out_precision(Bits::new(2))
+                .proc_precision(Bits::new(2))
                 .build(),
         );
         cmds.push(
@@ -328,9 +374,15 @@ fn main() {
         // Output conversion is not bypass-able the way BS/BN/EW are, so
         // this needs an identity-ish scale/shift even with no real
         // quantization: out = (acc * scale) >> shift + offset, scale=1
-        // shift=0 offset=0. Biggest remaining unknown in this file -- if
-        // this is actually a fixed-point Q-format multiplier rather than a
-        // plain integer one, scale=1 will not be identity.
+        // shift=0 offset=0. scale=1 is confirmed against the real decode
+        // (so it likely is a plain integer multiplier, not a fixed-point
+        // Q-format one as originally worried) -- shift=0 and offset=0 are
+        // still unconfirmed guesses, since the real example's shift wasn't
+        // isolated from its other fields. The real decode also showed an
+        // FP32TOFP16_EN bit in this same register that the builder below
+        // doesn't expose at all (see the confidence-level doc comment up
+        // top) -- not needed here since we're not asking for fp16 output,
+        // but worth knowing it exists.
         cmds.push(
             Register::<DpuOutCvtOffset>::new()
                 .out_cvt_offset(Bits::new(0))
