@@ -1,0 +1,20 @@
+[package]
+name = "rocket-hal-driver"
+version = "0.1.0"
+edition = "2024"
+
+[lib]
+# cdylib is the eventual target (an IREE host process would dlopen or link
+# this as a HAL driver plugin), but that requires IREE's own compiled
+# runtime libraries (libiree_hal, libiree_base, ...) to actually exist and
+# be linkable -- a separate, substantial build (CMake/ninja) not done yet.
+# rlib only for now so `cargo check`/`cargo build` work standalone against
+# just the vendored headers; add "cdylib" back once IREE's runtime is built
+# and there's a real host to link against.
+crate-type = ["rlib"]
+
+[dependencies]
+iree-rocket-hal = { path = "../iree-rocket-hal" }
+
+[build-dependencies]
+bindgen = "0.72.1"
