@@ -13,8 +13,12 @@
 //! This version routes every register write through `crate::rocket::builders`
 //! (`Register<T>` + `RegisterMeta`), which covers every CNA/CORE/DPU/PC/
 //! Global field by name and mask, generated from `rkt_registers.h`. Fields
-//! left at 0 (ping-pong pointers, reserved bits, DMA burst lengths) are
-//! left unset deliberately, matching hardware POR-style defaults.
+//! left at 0 (reserved bits, DMA burst lengths) are left unset
+//! deliberately, matching hardware POR-style defaults. The "ping-pong
+//! pointer" registers (DPU_S_POINTER / DPU_RDMA_RDMA_S_POINTER) used to be
+//! lumped into that same "leave at 0" bucket -- wrong, they're explicitly
+//! written by every real regcmd program (see the comment at their push
+//! calls below); fixed after decoding the real bytes in conv.rknn.
 //!
 //! Also worth knowing: `builders.rs`'s `DOMAIN_CNA`/`DOMAIN_PC`/
 //! `DOMAIN_CORE`/`DOMAIN_DPU` (which every register in this file's
@@ -83,20 +87,18 @@ use iree_rocket_hal::rocket::{
         cna::{
             CnaCbufCon0, CnaCbufCon1, CnaConvCon1, CnaConvCon2, CnaConvCon3, CnaCvtCon0,
             CnaDataSize0, CnaDataSize1, CnaDataSize2, CnaDataSize3, CnaDcompAddr0, CnaDcompCtrl,
-            CnaDmaCon0, CnaFeatureDataAddr, CnaOperationEnable, CnaPadCon0, CnaWeightSize0,
-            CnaWeightSize1, CnaWeightSize2,
+            CnaDmaCon0, CnaFeatureDataAddr, CnaPadCon0, CnaWeightSize0, CnaWeightSize1,
+            CnaWeightSize2,
         },
-        core::{
-            CoreClipTruncate, CoreDataoutSize0, CoreDataoutSize1, CoreMiscCfg, CoreOperationEnable,
-        },
+        core::{CoreClipTruncate, CoreDataoutSize0, CoreDataoutSize1, CoreMiscCfg},
         dpu::{
             DpuBnCfg, DpuBsCfg, DpuDataCubeChannel, DpuDataCubeHeight, DpuDataCubeWidth,
             DpuDataFormat, DpuDstBaseAddr, DpuDstSurfStride, DpuEwCfg, DpuFeatureModeCfg,
-            DpuOperationEnable, DpuOutCvtOffset, DpuOutCvtScale, DpuOutCvtShift,
+            DpuOutCvtOffset, DpuOutCvtScale, DpuOutCvtShift, DpuSPointer,
         },
         dpu_rdma::{
             DpuRdmaDataCubeChannel, DpuRdmaDataCubeHeight, DpuRdmaDataCubeWidth,
-            DpuRdmaFeatureModeCfg, DpuRdmaOperationEnable,
+            DpuRdmaFeatureModeCfg, DpuRdmaSPointer,
         },
     },
     debug::dump_cmds,
@@ -165,6 +167,47 @@ fn main() {
         // isn't independently confirmed to mean "float16" for OUR raw
         // test buffers, just that 2 is a real, hardware-accepted value
         // (unlike our original guess of 0).
+        cmds.push(
+            Register::<CnaConvCon1>::new()
+                .conv_mode(Bits::new(0))
+                .in_precision(Bits::new(2))
+                .proc_precision(Bits::new(2))
+                .deconv(Bits::new(0))
+                .build(),
+        );
+
+        // DPU_S_POINTER / DPU_RDMA_RDMA_S_POINTER ("ping-pong pointer"
+        // registers) -- this file's own top-of-file doc comment used to
+        // claim these were "left unset deliberately, matching hardware
+        // POR-style defaults." That was wrong: decoding the real regcmd
+        // bytes embedded in conv.rknn (rknpu-spelunking/conv_rknn_decode.txt)
+        // shows both written, with this exact bit pattern, immediately
+        // after the first CONV_CON1 write and before a *second* CONV_CON1
+        // write -- and Mesa's rkt_regcmd.c (fill_first_regcmd) has the
+        // identical sequence in the identical position:
+        //   EMIT(REG_CNA_CONV_CON1, con1);
+        //   EMIT(REG_DPU_S_POINTER, PP_MODE(1)|EXECUTER_PP_EN(1)|POINTER_PP_EN(1));
+        //   EMIT(REG_DPU_RDMA_RDMA_S_POINTER, same three bits);
+        //   EMIT(REG_CNA_CONV_CON1, con1);  // again
+        // The real capture's raw value (14 = 0b1110) field-decodes to
+        // exactly POINTER_PP_MODE=1, EXECUTER_PP_EN=1, POINTER_PP_EN=1,
+        // everything else 0 -- confirmed against rkt_registers.h's own
+        // mask/shift tables, not just visual pattern-matching. Entirely
+        // missing from every previous revision of this file.
+        cmds.push(
+            Register::<DpuSPointer>::new()
+                .pointer_pp_mode(Bits::new(1))
+                .executer_pp_en(Bits::new(1))
+                .pointer_pp_en(Bits::new(1))
+                .build(),
+        );
+        cmds.push(
+            Register::<DpuRdmaSPointer>::new()
+                .pointer_pp_mode(Bits::new(1))
+                .executer_pp_en(Bits::new(1))
+                .pointer_pp_en(Bits::new(1))
+                .build(),
+        );
         cmds.push(
             Register::<CnaConvCon1>::new()
                 .conv_mode(Bits::new(0))
@@ -330,11 +373,19 @@ fn main() {
                 .build(),
         );
 
-        cmds.push(
-            Register::<CnaOperationEnable>::new()
-                .op_en(Bits::new(1))
-                .build(),
-        );
+        // NOTE: no CnaOperationEnable write here. The real regcmd bytes
+        // embedded in conv.rknn (rknpu-spelunking/conv_rknn_decode.txt) and
+        // Mesa's rkt_regcmd.c both never write ANY per-block
+        // OPERATION_ENABLE register (CNA/CORE/DPU/DPU_RDMA) -- only the
+        // single domain=0x81 broadcast write at the very end of the stream
+        // (see the "Kick sequence" comment near the bottom of this file)
+        // enables every block simultaneously. Every previous revision of
+        // this file wrote all four per-block enables individually, each
+        // right after its own section finished configuring -- meaning CNA
+        // was told to start running before CORE/DPU/DPU_RDMA were even
+        // configured yet. That's a very plausible hang: a block starting
+        // prematurely and stalling on downstream state that isn't ready.
+        // Removed all four (this one, plus Core/Dpu/DpuRdma below).
 
         // ==================================================================
         // CORE: MAC array / accumulation
@@ -376,11 +427,8 @@ fn main() {
         // Previously missing entirely from this file.
         cmds.push(RegCmd::new(DOMAIN_CORE, 0x3030, 0));
 
-        cmds.push(
-            Register::<CoreOperationEnable>::new()
-                .op_en(Bits::new(1))
-                .build(),
-        );
+        // No CoreOperationEnable write -- see the comment where
+        // CnaOperationEnable used to be, above.
 
         // ==================================================================
         // DPU: output requantization + writeback (bias/batchnorm/elementwise
@@ -488,11 +536,8 @@ fn main() {
         // regardless of EW state, so it's kept independent of that).
         cmds.push(RegCmd::new(DOMAIN_DPU, 0x40c4, 0));
 
-        cmds.push(
-            Register::<DpuOperationEnable>::new()
-                .op_en(Bits::new(1))
-                .build(),
-        );
+        // No DpuOperationEnable write -- see the comment where
+        // CnaOperationEnable used to be, above.
 
         // ==================================================================
         // DPU_RDMA -- required even though nothing about this test needs
@@ -536,11 +581,8 @@ fn main() {
                 .in_precision(Bits::new(2))
                 .build(),
         );
-        cmds.push(
-            Register::<DpuRdmaOperationEnable>::new()
-                .op_en(Bits::new(1))
-                .build(),
-        );
+        // No DpuRdmaOperationEnable write -- see the comment where
+        // CnaOperationEnable used to be, above.
 
         // ==================================================================
         // Kick sequence -- ported verbatim from Mesa's reference gallium
