@@ -1,78 +1,51 @@
-//! NPU diagnostic: minimal 1x1 conv, built from the typed register builders
-//! instead of hand-rolled offsets.
+//! NPU diagnostic: minimal 1x1 conv, built as a faithful field-for-field
+//! port of Mesa's real gallium driver (`mesa-rocket-userspace/rkt_regcmd.c`,
+//! `fill_first_regcmd()` + `rkt_task.c`, `fill_task()`/`rkt_split_tasks()`),
+//! specialized for this file's one fixed operation shape (4x4 spatial,
+//! 1 input channel, 1 output channel, 1x1 kernel, stride 1, no padding, no
+//! depthwise, no bias/batchnorm/elementwise-add tensors).
 //!
-//! The previous version of this file defined its own `REG_CNA_CONV_CON0 =
-//! 0x1010` and wrote 0 to it. That register doesn't exist -- per
-//! `rkt_registers.h`, CNA register numbering starts at CONV_CON1 (0x100c),
-//! and 0x1010 is actually CONV_CON2. So the old code silently wrote to the
-//! wrong register (zeroing feature_grains/kernel_group) and never touched
-//! CONV_CON1 at all, meaning conv_mode/in_precision/proc_precision were
-//! left unset. That's the leading suspect for the EBUSY timeout this file
-//! already had error handling for.
+//! Why the full rewrite: a live comparison against a real, hardware-
+//! confirmed-working regcmd stream (captured via `ROCKET_DEBUG=dump_bos`
+//! while running Mesa's own Teflon TFLite delegate through the same kernel
+//! driver on this board -- see rknpu-spelunking/NOTES.md, "Real Mesa
+//! rocket/Teflon driver built and run end-to-end") showed this file was
+//! missing roughly half of the real register program (~56 entries here vs.
+//! ~130 in the real capture) -- entire register families (DCOMP_AMOUNT0-15,
+//! all DPU_BS_*/DPU_WDMA_*/DPU_EW_OP_VALUE_*/DPU_LUT_*, most of DPU_RDMA_*,
+//! CNA_FC_*) were simply never written. Since these are real MMIO registers
+//! with persistent hardware state, not writing them left CNA/DPU/DPU_RDMA
+//! running on stale/undefined state from whatever job last touched that
+//! core -- confirmed via `scripts/rocket_kernel_trace.bt`: the real Teflon
+//! client's jobs get a genuine DPU completion IRQ on 210/210 tries, while
+//! this file's job never triggers `rocket_job_irq_handler` even once before
+//! `drm_sched`'s 500ms timeout gives up. Everything upstream of hardware
+//! register programming (ioctl dispatch, DRM scheduling, PM, IOMMU) was
+//! already confirmed identical and working in both cases.
 //!
-//! This version routes every register write through `crate::rocket::builders`
-//! (`Register<T>` + `RegisterMeta`), which covers every CNA/CORE/DPU/PC/
-//! Global field by name and mask, generated from `rkt_registers.h`. Fields
-//! left at 0 (reserved bits, DMA burst lengths) are left unset
-//! deliberately, matching hardware POR-style defaults. The "ping-pong
-//! pointer" registers (DPU_S_POINTER / DPU_RDMA_RDMA_S_POINTER) used to be
-//! lumped into that same "leave at 0" bucket -- wrong, they're explicitly
-//! written by every real regcmd program (see the comment at their push
-//! calls below); fixed after decoding the real bytes in conv.rknn.
-//!
-//! Also worth knowing: `builders.rs`'s `DOMAIN_CNA`/`DOMAIN_PC`/
-//! `DOMAIN_CORE`/`DOMAIN_DPU` (which every register in this file's
-//! `RegCmd`s is tagged with, via each type's `RegisterMeta::DOMAIN`) were
-//! wrong until just before this revision -- they didn't match Mesa's own
-//! registers.xml `target` enum, even though other builder files in this
-//! same crate (dpu_rdma.rs, ppu.rs, ...) already used the correct,
-//! bindgen-generated equivalents. See `builders.rs` and NOTES.md for the
-//! full story. This was arguably a bigger deal than any single field
-//! value guessed at below -- a wrong domain tag can misdirect (or fail
-//! to reach) the intended hardware engine regardless of how correct the
-//! register's own value is.
-//!
-//! Confidence levels. Most of the enum/mode fields below were validated by
-//! decoding a real regcmd program out of a compiled conv.rknn (see
-//! NOTES.md in rknpu-spelunking for the byte-offset scan + field decode) --
-//! the container format is undocumented but the wire encoding of each
-//! individual (domain, offset, value) entry matches `rkt_registers.h`
-//! exactly, so real per-field values could be read straight out of it and
-//! cross-checked against every field we'd guessed at:
-//!   - CONFIRMED against the real decode: conv_mode=0, deconv=0,
-//!     in/out/proc_precision=2 (not 0 -- corrected), kernel_group=0 (not 1
-//!     -- corrected), atrous dilation=0 for "none" (not 1 -- corrected;
-//!     dilation and stride turned out to use different encoding
-//!     conventions in the same register), DMA/DPU burst lengths=15/max
-//!     (not 0 -- corrected, and CNA_DMA_CON0 was missing entirely before),
-//!     DPU output_mode=2 (not 0 -- corrected), cvt_bypass=1, bn_bypass=1,
-//!     ew_bypass=1, out_cvt_scale=1 (all as originally guessed).
-//!   - HIGH but not from the decode: all addresses and dimensions (shape-
-//!     dependent, so not directly comparable to the 32x32x8-ish real
-//!     example). PC's own registers (BASE_ADDRESS/REGISTER_AMOUNTS/
-//!     TASK_CON) are left to the kernel driver via
-//!     `drm_rocket_task.regcmd`/`regcmd_count` rather than pushed into the
-//!     stream -- confirmed directly from the mainline kernel driver's own
-//!     source now (`drivers/accel/rocket/rocket_job.c`,
-//!     `rocket_job_hw_submit`), not just inferred from the vendor driver's
-//!     `rknpu_job_subcore_commit` disassembly the way it originally was.
-//!     That source is also where the `regcmd_count * 2` below comes from
-//!     -- see the comment at the `drm_rocket_task` construction.
-//!   - feature_grains and CBUF_CON1.data_entries were both flagged
-//!     STILL UNCONFIRMED for a long time (the real conv.rknn example's
-//!     values didn't cleanly scale down to our much smaller test tensor).
-//!     Both are now formula-derived from Mesa's rkt_regcmd.c/rkt_task.c
-//!     instead: data_entries = width*height for the input_channels_real==1
-//!     case (matches what this file already had); feature_grains =
-//!     50 + stride_y + 1 (this file previously had a bare guess of 1,
-//!     wildly off). CBUF_CON0's weight_bank/data_bank *are* also
-//!     formula-derived (see the comment at that register) rather than
-//!     guessed -- weight_bank was wrong (1, should be 2) until corrected
-//!     by running that formula, a plausible cause of hangs since it under-
-//!     allocates CNA's weight cache. out_cvt_shift (the real example only confirms
-//!     scale=1, not shift=0 -- DPU_OUT_CVT_SCALE also has an
-//!     FP32TOFP16_EN bit the current builder doesn't expose at all, a gap
-//!     worth fixing in builders/dpu.rs separately).
+//! Beyond raw completeness, going line-by-line through `fill_first_regcmd()`
+//! also caught several previously-guessed field VALUES that turned out
+//! wrong (not just missing registers) -- all cited inline at the write site
+//! below, but the headline ones: CORE_MISC_CFG needs QD_EN(1), which this
+//! file never set (it set an invented `proc_precision` field instead, which
+//! Mesa never touches on this register); DPU_BS_CFG is never actually
+//! bypassed by Mesa the way this file assumed -- it always runs the bias-
+//! subtract ALU (ALU_ALGO(2)|ALU_SRC(1)), which in turn means a real
+//! (if zero-filled) biases buffer has to exist and be wired into
+//! DPU_RDMA_RDMA_BS_BASE_ADDR, something this file never allocated at all;
+//! several CNA_CONV_CON1/CONV_CON2/DPU_DATA_FORMAT/DPU_RDMA_FEATURE_MODE_CFG
+//! fields this file set (conv_mode, in/proc_precision, cmd_fifo_srst) are
+//! never touched by Mesa's real code at all for this register/branch
+//! combination -- they were carried over from an earlier cross-check against
+//! a *vendor*-compiled regcmd (conv.rknn, a different compiler/toolchain
+//! than Mesa entirely), which is a lower-confidence source now that a real,
+//! byte-exact Mesa capture exists; and every channel/bank count below needed
+//! the hardware's own alignment padding (input channels round up to 16,
+//! output channels to 32, weight kernel count to a multiple of 2) rather
+//! than the raw logical shape -- e.g. CBUF_CON0.weight_bank is 11, not the
+//! 2 this file used to compute, because `rkt_split_tasks()`'s single-task
+//! branch sets it to `CBUF_BANKS - input_banks`, not the weights-size-based
+//! formula that value used to come from.
 
 use std::{fs::OpenOptions, mem, num::NonZeroUsize, os::unix::io::AsRawFd, ptr};
 
@@ -83,23 +56,37 @@ use iree_rocket_hal::rocket::{
         drm_rocket_job, drm_rocket_prep_bo, drm_rocket_submit, drm_rocket_task,
     },
     builders::{
-        Bits, DOMAIN_CORE, DOMAIN_DPU, DOMAIN_PC, RegCmd, Register,
+        Bits, DOMAIN_CORE, DOMAIN_DPU, DOMAIN_PC, RegCmd, Register, RegisterMeta,
         cna::{
             CnaCbufCon0, CnaCbufCon1, CnaConvCon1, CnaConvCon2, CnaConvCon3, CnaCvtCon0,
             CnaCvtCon1, CnaCvtCon2, CnaCvtCon3, CnaCvtCon4, CnaCvtCon5, CnaDataSize0, CnaDataSize1,
-            CnaDataSize2, CnaDataSize3, CnaDcompAddr0, CnaDcompCtrl, CnaDmaCon0, CnaDmaCon1,
-            CnaDmaCon2, CnaFeatureDataAddr, CnaPadCon0, CnaPadCon1, CnaWeightSize0, CnaWeightSize1,
-            CnaWeightSize2,
+            CnaDataSize2, CnaDataSize3, CnaDcompAddr0, CnaDcompAmount0, CnaDcompAmount1,
+            CnaDcompAmount2, CnaDcompAmount3, CnaDcompAmount4, CnaDcompAmount5, CnaDcompAmount6,
+            CnaDcompAmount7, CnaDcompAmount8, CnaDcompAmount9, CnaDcompAmount10, CnaDcompAmount11,
+            CnaDcompAmount12, CnaDcompAmount13, CnaDcompAmount14, CnaDcompAmount15, CnaDcompCtrl,
+            CnaDcompRegnum, CnaDmaCon0, CnaDmaCon1, CnaDmaCon2, CnaFcCon0, CnaFcCon1, CnaFcCon2,
+            CnaFcDataSize0, CnaFcDataSize1, CnaFeatureDataAddr, CnaPadCon0, CnaPadCon1,
+            CnaWeightSize0, CnaWeightSize1, CnaWeightSize2,
         },
         core::{CoreClipTruncate, CoreDataoutSize0, CoreDataoutSize1, CoreMiscCfg},
         dpu::{
-            DpuBnCfg, DpuBsCfg, DpuDataCubeChannel, DpuDataCubeHeight, DpuDataCubeWidth,
-            DpuDataFormat, DpuDstBaseAddr, DpuDstSurfStride, DpuEwCfg, DpuFeatureModeCfg,
-            DpuOutCvtOffset, DpuOutCvtScale, DpuOutCvtShift, DpuSPointer,
+            DpuBnAluCfg, DpuBnCfg, DpuBnMulCfg, DpuBnReluxCmpValue, DpuBsAluCfg, DpuBsCfg,
+            DpuBsMulCfg, DpuBsOwCfg, DpuBsOwOp, DpuBsReluxCmpValue, DpuDataCubeChannel,
+            DpuDataCubeHeight, DpuDataCubeNotchAddr, DpuDataCubeWidth, DpuDataFormat,
+            DpuDstBaseAddr, DpuDstSurfStride, DpuEwCfg, DpuEwCvtOffsetValue, DpuEwCvtScaleValue,
+            DpuEwOpValue0, DpuEwOpValue1, DpuEwOpValue2, DpuEwOpValue3, DpuEwOpValue4,
+            DpuEwOpValue5, DpuEwOpValue6, DpuEwOpValue7, DpuEwReluxCmpValue, DpuFeatureModeCfg,
+            DpuLutAccessCfg, DpuLutAccessData, DpuLutCfg, DpuLutInfo, DpuLutLeEnd,
+            DpuLutLeSlopeScale, DpuLutLeSlopeShift, DpuLutLeStart, DpuLutLoEnd, DpuLutLoSlopeScale,
+            DpuLutLoSlopeShift, DpuLutLoStart, DpuOffsetPend, DpuOutCvtOffset, DpuOutCvtScale,
+            DpuOutCvtShift, DpuSPointer, DpuSurfaceAdd, DpuWdmaSize0, DpuWdmaSize1,
         },
         dpu_rdma::{
-            DpuRdmaDataCubeChannel, DpuRdmaDataCubeHeight, DpuRdmaDataCubeWidth,
-            DpuRdmaFeatureModeCfg, DpuRdmaSPointer,
+            DpuRdmaBnBaseAddr, DpuRdmaBrdmaCfg, DpuRdmaBsBaseAddr, DpuRdmaDataCubeChannel,
+            DpuRdmaDataCubeHeight, DpuRdmaDataCubeWidth, DpuRdmaErdmaCfg, DpuRdmaEwBaseAddr,
+            DpuRdmaEwSurfNotch, DpuRdmaEwSurfStride, DpuRdmaFeatureModeCfg, DpuRdmaNrdmaCfg,
+            DpuRdmaPadCfg, DpuRdmaSPointer, DpuRdmaSrcBaseAddr, DpuRdmaSrcDmaCfg, DpuRdmaSurfNotch,
+            DpuRdmaWeight,
         },
     },
     debug::dump_cmds,
@@ -115,16 +102,24 @@ use nix::{
 
 // 1 input channel, 1 output channel, 1x1 kernel, 4x4 spatial, stride 1, no
 // padding, no dilation -- the smallest real convolution (not just an
-// elementwise op) this hardware can do.
+// elementwise op) this hardware can do. These are the *logical* operation
+// dimensions Mesa calls `operation->*` -- the hardware-visible register
+// values are mostly the alignment-padded `task->*` versions computed below,
+// not these raw numbers directly.
 const IN_WIDTH: u32 = 4;
 const IN_HEIGHT: u32 = 4;
 const IN_CHANNELS: u32 = 1;
 const OUT_CHANNELS: u32 = 1;
-// 1x1 stride-1 no-pad conv preserves spatial dims.
 const OUT_WIDTH: u32 = IN_WIDTH;
 const OUT_HEIGHT: u32 = IN_HEIGHT;
-// int8 weights, 1x1 kernel, 1 in-channel, 1 out-channel.
-const WEIGHT_BYTES: u32 = 1;
+const ZERO_POINT: u32 = 0; // raw non-quantized test data: input/output/weights all use 0
+
+// Helper for registers we write as a bare zero -- still routes through the
+// real register type's RegisterMeta (correct domain+offset), just with no
+// fields set, matching how Mesa's EMIT(REG_..., 0) calls behave.
+fn zero<R: RegisterMeta>() -> RegCmd {
+    Register::<R>::new().build()
+}
 
 fn main() {
     let file = OpenOptions::new()
@@ -134,7 +129,7 @@ fn main() {
         .expect("Failed to open device");
     let fd = file.as_raw_fd();
 
-    println!("--- NPU Diagnostic: Minimal 1x1 Conv (typed register builders) ---");
+    println!("--- NPU Diagnostic: Minimal 1x1 Conv (full Mesa regcmd port) ---");
 
     let tensor_size = 4096; // 4KB aligned
 
@@ -148,64 +143,140 @@ fn main() {
         let buf_c = Buffer::new(fd, tensor_size, &file);
         ptr::write_bytes(buf_c.host_ptr, 0, tensor_size);
 
+        // Biases buffer -- Mesa's fill_first_regcmd() unconditionally wires
+        // DPU_RDMA_RDMA_BS_BASE_ADDR at operation->biases's physical address
+        // and always runs DPU's BS (bias-subtract) ALU (see DPU_BS_CFG
+        // below); there's no "no bias" bypass path. Zero-filled: a zero
+        // bias is a numeric no-op for this diagnostic, but the buffer
+        // itself and its DMA wiring have to be real.
+        let buf_bias = Buffer::new(fd, tensor_size, &file);
+        ptr::write_bytes(buf_bias.host_ptr, 0, tensor_size);
+
         println!(
-            "Buffers: A@0x{:x}, W@0x{:x}, C@0x{:x}",
-            buf_a.dma_address, buf_w.dma_address, buf_c.dma_address
+            "Buffers: A@0x{:x}, W@0x{:x}, Bias@0x{:x}, C@0x{:x}",
+            buf_a.dma_address, buf_w.dma_address, buf_bias.dma_address, buf_c.dma_address
         );
+
+        // ==================================================================
+        // Task-level derived values -- ported from rkt_task.c's
+        // calc_entries_per_slice()/calc_input_banks()/fill_task() and
+        // rkt_split_tasks()'s "full weights, full input" single-task
+        // branch, specialized to this file's fixed IN_*/OUT_* shape. This
+        // op is far too small to ever need the general multi-task
+        // splitting logic, but the *formulas* that branch uses for buffer
+        // geometry and CBUF bank allocation still apply and matter.
+        // ==================================================================
+
+        // rkt_ml.h geometry constants.
+        const CBUF_ENTRY_SIZE: u32 = 128; // CBUF_BANK_SIZE(32768) / CBUF_ENTRIES_PER_BANK(256)
+        const CBUF_ENTRIES_PER_BANK: u32 = 256;
+        const CBUF_BANKS: u32 = 12;
+        const FEATURE_ATOMIC_SIZE: u32 = 16;
+        const ATOMIC_K_SIZE: u32 = 16;
+
+        // calc_entries_per_slice() (bpe=1, int8).
+        let atomics_per_entry = CBUF_ENTRY_SIZE / FEATURE_ATOMIC_SIZE;
+        let total_c_atomics = IN_CHANNELS.div_ceil(FEATURE_ATOMIC_SIZE);
+        let last_c_atomics = total_c_atomics % atomics_per_entry;
+        let int_c_entries = (total_c_atomics / atomics_per_entry) * IN_WIDTH;
+        let frac_c_entries = if last_c_atomics == 3 {
+            IN_WIDTH
+        } else {
+            (last_c_atomics * IN_WIDTH).div_ceil(atomics_per_entry)
+        };
+        let entries_per_slice = int_c_entries + frac_c_entries;
+
+        // calc_input_banks().
+        let input_banks = (entries_per_slice * IN_HEIGHT).div_ceil(CBUF_ENTRIES_PER_BANK);
+
+        // rkt_split_tasks(): the single-task branch sets weight_banks to
+        // CBUF_BANKS - input_banks directly -- NOT calc_weights_banks()'s
+        // own result (that function's output only decides the
+        // reuse/no-reuse branch elsewhere, never reaches CBUF_CON0 here).
+        let weight_banks = CBUF_BANKS - input_banks;
+
+        // fill_task(): channel/kernel counts round up to the hardware's
+        // atomic granularity, independent of the op's logical shape.
+        let task_input_channels = IN_CHANNELS
+            .max(FEATURE_ATOMIC_SIZE)
+            .next_multiple_of(FEATURE_ATOMIC_SIZE);
+        let task_output_channels = OUT_CHANNELS.max(32).next_multiple_of(32); // not depthwise: no extra doubling
+        let weights_kernels = OUT_CHANNELS.next_multiple_of(2); // not depthwise: align(output_channels, 2)
+
+        let line_stride = |w: u32| w * ATOMIC_K_SIZE; // calc_line_stride()
+        // input_channels_real(1)==1 and not(output_channels_real>1 or
+        // addition input) -> fill_task()'s else branch:
+        let input_line_stride = line_stride(IN_WIDTH) / 4;
+        let input_surface_stride = input_line_stride * (IN_HEIGHT / 4 - 1);
+        let output_surface_stride = (line_stride(OUT_WIDTH) * OUT_HEIGHT) / FEATURE_ATOMIC_SIZE;
+        let surfaces_per_row = OUT_WIDTH * OUT_HEIGHT * 2; // not depthwise: no further *2
+
+        // DPU_OUT_CVT_SCALE/SHIFT: rkt_regcmd.c's non-add_tensor branch.
+        // Our buffers aren't real quantized tensors (input/weights/output
+        // scale are all 1.0, i.e. no rescaling) but the register values
+        // still go through the same float-bits fixed-point conversion Mesa
+        // uses -- f32::to_bits() is a bit-exact match for the C `fui()`
+        // reinterpret-cast this formula is built on.
+        let conv_scale: f32 = (1.0_f32 * 1.0_f32) / 1.0_f32; // input_scale * weights_scale / output_scale
+        let scale_bits = conv_scale.to_bits();
+        let out_cvt_shift = 127 + 31 - 32 - (scale_bits >> 23) + 16; // truncate_bits=0: no decrement
+        let mut out_cvt_scale = ((scale_bits >> 9) & 0x7fff) + 1;
+        if out_cvt_scale < (1 << 14) {
+            out_cvt_scale |= 1 << 14;
+        }
+        let out_cvt_offset = ZERO_POINT.wrapping_sub(0x80); // output_zero_point - 0x80
 
         let mut cmds: Vec<RegCmd> = Vec::new();
 
         // ==================================================================
-        // CNA: feature/weight DMA staging + convolution shape
+        // CNA: feature/weight DMA staging + convolution shape. Order and
+        // field values below follow mesa-rocket-userspace/rkt_regcmd.c's
+        // fill_first_regcmd() line for line.
         // ==================================================================
 
-        // CONV_CON1 (0x100c) -- the register the old code never wrote.
-        // conv_mode=0 (plain direct conv) and deconv=0 (forward, not
-        // transpose) confirmed against a real compiled regcmd (see
-        // NOTES.md's conv.rknn decode). in_precision/proc_precision=2 is
-        // also taken directly from that decode -- it's what the real
-        // compiler used for this model's float16 tensors; codepoint 2
-        // isn't independently confirmed to mean "float16" for OUR raw
-        // test buffers, just that 2 is a real, hardware-accepted value
-        // (unlike our original guess of 0).
-        // nonalign_dma/group_line_off/argb_in are set here because
-        // IN_CHANNELS==1 -- Mesa's fill_first_regcmd has a dedicated
-        // `if (task->input_channels_real == 1)` branch that ORs these
-        // three bits into CONV_CON1's value, on top of the fields already
-        // set below. Our previous real-decode cross-check used a capture
-        // with 3 real input channels, which takes the *other* branch (no
-        // extra bits here) -- these bits were silently missing for our
-        // actual 1-channel test shape specifically.
+        let cbuf_con0 = Register::<CnaCbufCon0>::new()
+            .weight_bank(Bits::new(weight_banks))
+            .data_bank(Bits::new(input_banks))
+            .build();
+        // Written here (before anything else) AND again after WEIGHT_SIZE2
+        // below -- Mesa's fill_first_regcmd() genuinely emits it twice,
+        // confirmed both in source and in the real regcmd capture.
+        cmds.push(
+            Register::<CnaCbufCon0>::new()
+                .weight_bank(Bits::new(weight_banks))
+                .data_bank(Bits::new(input_banks))
+                .build(),
+        );
+
+        cmds.push(zero::<CnaDcompRegnum>());
+        cmds.push(zero::<CnaDcompCtrl>());
+
+        // CONV_CON1: Mesa's con1 starts at 0 and only ORs in
+        // NONALIGN_DMA/GROUP_LINE_OFF/ARGB_IN when input_channels_real==1
+        // (our case) and CONV_MODE(3) when depthwise (not our case) --
+        // conv_mode/in_precision/proc_precision/deconv are NOT set by this
+        // function at all for this register. Previous revisions of this
+        // file set those extra fields too, sourced from cross-checking a
+        // *vendor*-toolchain-compiled regcmd (conv.rknn) rather than Mesa's
+        // own code -- a different compiler entirely, now superseded by a
+        // real byte-exact Mesa capture as the higher-confidence source.
+        let conv_con1 = Register::<CnaConvCon1>::new()
+            .nonalign_dma(Bits::new(1))
+            .group_line_off(Bits::new(1))
+            .argb_in(Bits::new(8))
+            .build();
         cmds.push(
             Register::<CnaConvCon1>::new()
-                .conv_mode(Bits::new(0))
-                .in_precision(Bits::new(2))
-                .proc_precision(Bits::new(2))
-                .deconv(Bits::new(0))
                 .nonalign_dma(Bits::new(1))
                 .group_line_off(Bits::new(1))
                 .argb_in(Bits::new(8))
                 .build(),
         );
 
-        // DPU_S_POINTER / DPU_RDMA_RDMA_S_POINTER ("ping-pong pointer"
-        // registers) -- this file's own top-of-file doc comment used to
-        // claim these were "left unset deliberately, matching hardware
-        // POR-style defaults." That was wrong: decoding the real regcmd
-        // bytes embedded in conv.rknn (rknpu-spelunking/conv_rknn_decode.txt)
-        // shows both written, with this exact bit pattern, immediately
-        // after the first CONV_CON1 write and before a *second* CONV_CON1
-        // write -- and Mesa's rkt_regcmd.c (fill_first_regcmd) has the
-        // identical sequence in the identical position:
-        //   EMIT(REG_CNA_CONV_CON1, con1);
-        //   EMIT(REG_DPU_S_POINTER, PP_MODE(1)|EXECUTER_PP_EN(1)|POINTER_PP_EN(1));
-        //   EMIT(REG_DPU_RDMA_RDMA_S_POINTER, same three bits);
-        //   EMIT(REG_CNA_CONV_CON1, con1);  // again
-        // The real capture's raw value (14 = 0b1110) field-decodes to
-        // exactly POINTER_PP_MODE=1, EXECUTER_PP_EN=1, POINTER_PP_EN=1,
-        // everything else 0 -- confirmed against rkt_registers.h's own
-        // mask/shift tables, not just visual pattern-matching. Entirely
-        // missing from every previous revision of this file.
+        // DPU_S_POINTER / DPU_RDMA_RDMA_S_POINTER ("ping-pong pointer")
+        // immediately after the first CONV_CON1 write, then CONV_CON1 is
+        // written a second time -- confirmed both by the real conv.rknn
+        // decode and by Mesa's source, in this exact position.
         cmds.push(
             Register::<DpuSPointer>::new()
                 .pointer_pp_mode(Bits::new(1))
@@ -220,71 +291,43 @@ fn main() {
                 .pointer_pp_en(Bits::new(1))
                 .build(),
         );
-        // nonalign_dma/group_line_off/argb_in are set here because
-        // IN_CHANNELS==1 -- Mesa's fill_first_regcmd has a dedicated
-        // `if (task->input_channels_real == 1)` branch that ORs these
-        // three bits into CONV_CON1's value, on top of the fields already
-        // set below. Our previous real-decode cross-check used a capture
-        // with 3 real input channels, which takes the *other* branch (no
-        // extra bits here) -- these bits were silently missing for our
-        // actual 1-channel test shape specifically.
-        cmds.push(
-            Register::<CnaConvCon1>::new()
-                .conv_mode(Bits::new(0))
-                .in_precision(Bits::new(2))
-                .proc_precision(Bits::new(2))
-                .deconv(Bits::new(0))
-                .nonalign_dma(Bits::new(1))
-                .group_line_off(Bits::new(1))
-                .argb_in(Bits::new(8))
-                .build(),
-        );
+        cmds.push(conv_con1);
 
-        // CONV_CON2 (0x1010) -- what the old code mislabeled CONV_CON0 and
-        // zeroed. kernel_group=0 confirmed (real decode showed 0, not the
-        // "1 group = literal 1" guess this had before). feature_grains was
-        // an open guess (literal 1) for a long time -- Mesa's rkt_regcmd.c
-        // has the real formula (its own comment calls it "Magic: Seems to
-        // pass the most tests", so even Mesa doesn't fully explain it, but
-        // it's what every real submission through this driver actually
-        // uses): `50 + stride_y + 1`. For our stride_y=1, that's 52, wildly
-        // different from the previous guess of 1 -- this was sitting
-        // unapplied in already-read source for a while before being
-        // connected back to this field.
+        // CONV_CON2: only FEATURE_GRAINS is set by Mesa here (its own
+        // comment: "Magic: Seems to pass the most tests") -- no
+        // cmd_fifo_srst field, which a previous revision of this file
+        // invented.
         cmds.push(
             Register::<CnaConvCon2>::new()
-                .cmd_fifo_srst(Bits::new(1)) // reset CNA's command fifo before this task
-                .feature_grains(Bits::new(50 + 1 + 1))
-                .kernel_group(Bits::new(0))
+                .feature_grains(Bits::new(50 + 1 + 1)) // 50 + stride_y(1) + 1
                 .build(),
         );
 
-        // CONV_CON3 (0x1014) -- stride 1, no dilation. Confirmed against
-        // the real decode: stride is stored literally (1 = stride 1,
-        // matching what we already had), but dilation is NOT -- the real
-        // no-dilation encoding is 0, not 1. Different encoding convention
-        // for two fields in the same register; the earlier guess of 1 for
-        // dilation was wrong.
+        // CONV_CON3: stride only -- Mesa doesn't set atrous dilation
+        // fields here either (they default to 0, which is what our no-
+        // dilation case needs anyway, so no functional difference either
+        // way -- omitted here to match Mesa's actual EMIT call exactly).
         cmds.push(
             Register::<CnaConvCon3>::new()
                 .conv_x_stride(Bits::new(1))
                 .conv_y_stride(Bits::new(1))
-                .atrous_x_dilation(Bits::new(0))
-                .atrous_y_dilation(Bits::new(0))
                 .build(),
         );
 
-        // DATA_SIZE0-3: input/output geometry.
         cmds.push(
             Register::<CnaDataSize0>::new()
                 .datain_width(Bits::new(IN_WIDTH))
                 .datain_height(Bits::new(IN_HEIGHT))
                 .build(),
         );
+        // datain_channel_real is N-1 (task->input_channels_real - 1);
+        // datain_channel is the atomic-aligned count (task->input_channels,
+        // 16 here) -- NOT the raw logical IN_CHANNELS(1) this file used to
+        // write to both subfields.
         cmds.push(
             Register::<CnaDataSize1>::new()
-                .datain_channel(Bits::new(IN_CHANNELS))
-                .datain_channel_real(Bits::new(IN_CHANNELS))
+                .datain_channel_real(Bits::new(IN_CHANNELS - 1))
+                .datain_channel(Bits::new(task_input_channels))
                 .build(),
         );
         cmds.push(
@@ -298,65 +341,38 @@ fn main() {
                 .build(),
         );
 
-        // WEIGHT_SIZE0-2: 1x1 kernel, 1 in-channel, OUT_CHANNELS kernels.
+        // WEIGHT_SIZE0/1 use the atomic-aligned input channel count and
+        // the aligned weights_kernels(2), not the raw logical values this
+        // file used before (weights_width*weights_height*1*1=1 byte) --
+        // real hardware always reads weight data laid out against the
+        // aligned channel/kernel geometry.
         cmds.push(
             Register::<CnaWeightSize0>::new()
-                .weight_bytes(Bits::new(WEIGHT_BYTES))
+                .weight_bytes(Bits::new(1 * 1 * task_input_channels * weights_kernels))
                 .build(),
         );
         cmds.push(
             Register::<CnaWeightSize1>::new()
-                .weight_bytes_per_kernel(Bits::new(WEIGHT_BYTES))
+                .weight_bytes_per_kernel(Bits::new(1 * 1 * task_input_channels))
                 .build(),
         );
         cmds.push(
             Register::<CnaWeightSize2>::new()
                 .weight_width(Bits::new(1))
                 .weight_height(Bits::new(1))
-                .weight_kernels(Bits::new(OUT_CHANNELS))
+                .weight_kernels(Bits::new(weights_kernels))
                 .build(),
         );
 
-        // CBUF_CON0/1: internal SRAM cache-buffer bank allocation. These
-        // were both hardcoded to 1 (smallest legal allocation) as an
-        // unconfirmed guess. rkt-job.rs separately ports a real formula
-        // for this (ConvTaskConfig::calculate, constants named after
-        // rkt_ml.h) rather than guessing -- running that formula for this
-        // file's actual 4x4x1 shape gives data_bank=1 (matches) but
-        // weight_bank=2 (did NOT match -- this file was under-allocating
-        // CNA's weight cache by one bank). Formula, for reference:
-        //   w_bytes = weights_w * weights_h * in_c * bpe (* out_c if not
-        //             depthwise)
-        //   w_entries = ceil(w_bytes / CBUF_ENTRY_SIZE)      # 128
-        //   weight_bank = ceil(w_entries / CBUF_ENTRIES_PER_BANK) + 1  # 256
-        // For our 1x1x1x1 int8 weight: w_bytes=1, w_entries=1,
-        // weight_bank=ceil(1/256)+1=2.
-        cmds.push(
-            Register::<CnaCbufCon0>::new()
-                .weight_bank(Bits::new(2))
-                .data_bank(Bits::new(1))
-                .build(),
-        );
+        cmds.push(cbuf_con0);
+
         cmds.push(
             Register::<CnaCbufCon1>::new()
-                .data_entries(Bits::new(IN_WIDTH * IN_HEIGHT))
+                .data_entries(Bits::new(IN_WIDTH * IN_HEIGHT)) // input_channels_real==1 branch
                 .build(),
         );
 
-        // CVT_CON0-5: input requantization. This file previously used the
-        // "bypass" pattern (cvt_bypass=1) unconditionally -- correct for
-        // Mesa's `input_channels_real != 1` branch (matches our earlier
-        // real-decode cross-check, which happened to use a 3-real-channel
-        // capture), but WRONG for our actual shape: IN_CHANNELS=1 means
-        // Mesa's fill_first_regcmd takes the *other* branch entirely,
-        // which does not bypass CVT at all and instead sets real
-        // truncate/scale/offset values:
-        //   truncate = 14, scale = 16384, offset = 65408
-        //   (15/32388 instead, only if addition_input -- not our case)
-        //   CVT_CON0 = TRUNCATE_3(t)|TRUNCATE_2(t)|TRUNCATE_1(t)|TRUNCATE_0(t)
-        //   CVT_CON1..4 = SCALE{0..3}(scale) | OFFSET{0..3}(offset)
-        //   CVT_CON5 = 65535 (also branch-specific; else-branch is 0)
-        // No cvt_bypass field involved in this branch at all.
+        // CVT_CON0-5: input_channels_real==1, no addition_input branch.
         const CVT_TRUNCATE: u32 = 14;
         const CVT_SCALE: u32 = 16384;
         const CVT_OFFSET: u32 = 65408;
@@ -393,176 +409,153 @@ fn main() {
                 .build(),
         );
 
-        // DMA_CON0: burst lengths. The real decode uses max burst (15) for
-        // both feature and weight DMA rather than the 0 we'd otherwise
-        // default to -- this register was missing entirely from the first
-        // draft of this file.
-        cmds.push(
-            Register::<CnaDmaCon0>::new()
-                .data_burst_len(Bits::new(15))
-                .weight_burst_len(Bits::new(15))
-                .build(),
-        );
-
-        // DMA_CON1/CON2: line/surface stride for the feature DMA read.
-        // Previously entirely missing (left at implicit 0). Mesa's
-        // calc_line_stride()/fill_task() (rkt_task.c): for our case
-        // (input_channels_real==1, output_channels_real==1, no
-        // addition_input -- so NOT the special wide-atomic branch),
-        // line_stride = width * ATOMIC_K_SIZE / 4 = 4*16/4 = 16;
-        // surface_stride = line_stride * (height/4 - 1) = 16*0 = 0.
-        cmds.push(
-            Register::<CnaDmaCon1>::new()
-                .line_stride(Bits::new(16))
-                .build(),
-        );
-        cmds.push(
-            Register::<CnaDmaCon2>::new()
-                .surf_stride(Bits::new(0))
-                .build(),
-        );
-
-        // PAD_CON0: no padding.
+        cmds.push(zero::<CnaFcCon0>());
+        cmds.push(zero::<CnaFcCon1>());
         cmds.push(
             Register::<CnaPadCon0>::new()
                 .pad_top(Bits::new(0))
                 .pad_left(Bits::new(0))
                 .build(),
         );
-
-        // CVT_CON5: also part of the input_channels_real==1 branch above
-        // (65535; the else-branch/non-1-channel case, which our earlier
-        // real-decode cross-check used, writes 0 here instead).
-        cmds.push(
-            Register::<CnaCvtCon5>::new()
-                .per_channel_cvt_en(Bits::new(65535))
-                .build(),
-        );
-
-        // PAD_CON1: pad value. Mesa always computes and writes this
-        // (rkt_regcmd.c), previously missing here entirely. Our
-        // weights_width=1 (not >=3) and no addition_input/depthwise, so:
-        // pad_con1 = input_zero_point - 0x80. Treating input_zero_point
-        // as 0 (raw non-quantized test data, no real zero-point) gives
-        // 0 - 0x80 = -128, i.e. 0xffffff80 as u32.
-        cmds.push(
-            Register::<CnaPadCon1>::new()
-                .pad_value(Bits::new(0xffffff80u32))
-                .build(),
-        );
-
-        // DCOMP_CTRL: bypass weight decompression -- buf_w holds raw
-        // uncompressed weight bytes, not Rockchip's compressed weight
-        // format.
-        cmds.push(
-            Register::<CnaDcompCtrl>::new()
-                .wt_dec_bypass(Bits::new(1))
-                .build(),
-        );
-
         cmds.push(
             Register::<CnaFeatureDataAddr>::new()
                 .feature_base_addr(Bits::new(buf_a.dma_address))
                 .build(),
         );
+        cmds.push(zero::<CnaFcCon2>());
+        cmds.push(
+            Register::<CnaDmaCon0>::new()
+                .data_burst_len(Bits::new(15))
+                .weight_burst_len(Bits::new(15))
+                .build(),
+        );
+        cmds.push(
+            Register::<CnaDmaCon1>::new()
+                .line_stride(Bits::new(input_line_stride))
+                .build(),
+        );
+        cmds.push(
+            Register::<CnaDmaCon2>::new()
+                .surf_stride(Bits::new(input_surface_stride))
+                .build(),
+        );
+
+        cmds.push(
+            Register::<CnaFcDataSize0>::new()
+                .dma_width(Bits::new(IN_WIDTH)) // operation->input_width
+                .dma_height(Bits::new(IN_HEIGHT)) // task->input_height
+                .build(),
+        );
+        cmds.push(
+            Register::<CnaFcDataSize1>::new()
+                .dma_channel(Bits::new(task_input_channels))
+                .build(),
+        );
+
+        // DCOMP_CTRL/REGNUM written again (Mesa emits both twice -- once
+        // in the preamble above, once here). Plain 0, no wt_dec_bypass
+        // field -- a previous revision of this file set that field
+        // (reasoning: buf_w holds raw uncompressed bytes), but Mesa's real
+        // code never touches it for this path at all.
+        cmds.push(zero::<CnaDcompCtrl>());
+        cmds.push(zero::<CnaDcompRegnum>());
         cmds.push(
             Register::<CnaDcompAddr0>::new()
                 .decompress_addr0(Bits::new(buf_w.dma_address))
                 .build(),
         );
+        cmds.push(zero::<CnaDcompAmount0>());
+        cmds.push(zero::<CnaDcompAmount1>());
+        cmds.push(zero::<CnaDcompAmount2>());
+        cmds.push(zero::<CnaDcompAmount3>());
+        cmds.push(zero::<CnaDcompAmount4>());
+        cmds.push(zero::<CnaDcompAmount5>());
+        cmds.push(zero::<CnaDcompAmount6>());
+        cmds.push(zero::<CnaDcompAmount7>());
+        cmds.push(zero::<CnaDcompAmount8>());
+        cmds.push(zero::<CnaDcompAmount9>());
+        cmds.push(zero::<CnaDcompAmount10>());
+        cmds.push(zero::<CnaDcompAmount11>());
+        cmds.push(zero::<CnaDcompAmount12>());
+        cmds.push(zero::<CnaDcompAmount13>());
+        cmds.push(zero::<CnaDcompAmount14>());
+        cmds.push(zero::<CnaDcompAmount15>());
 
-        // NOTE: no CnaOperationEnable write here. The real regcmd bytes
-        // embedded in conv.rknn (rknpu-spelunking/conv_rknn_decode.txt) and
-        // Mesa's rkt_regcmd.c both never write ANY per-block
-        // OPERATION_ENABLE register (CNA/CORE/DPU/DPU_RDMA) -- only the
-        // single domain=0x81 broadcast write at the very end of the stream
-        // (see the "Kick sequence" comment near the bottom of this file)
-        // enables every block simultaneously. Every previous revision of
-        // this file wrote all four per-block enables individually, each
-        // right after its own section finished configuring -- meaning CNA
-        // was told to start running before CORE/DPU/DPU_RDMA were even
-        // configured yet. That's a very plausible hang: a block starting
-        // prematurely and stalling on downstream state that isn't ready.
-        // Removed all four (this one, plus Core/Dpu/DpuRdma below).
+        cmds.push(
+            Register::<CnaCvtCon5>::new()
+                .per_channel_cvt_en(Bits::new(65535)) // input_channels_real==1 branch
+                .build(),
+        );
+
+        // PAD_CON1: weights_width(1) < 3, not addition, not depthwise ->
+        // input_zero_point - 0x80.
+        cmds.push(
+            Register::<CnaPadCon1>::new()
+                .pad_value(Bits::new(out_cvt_offset)) // same formula/value as out_cvt_offset (both zero points are 0)
+                .build(),
+        );
 
         // ==================================================================
         // CORE: MAC array / accumulation
         // ==================================================================
 
-        cmds.push(
-            Register::<CoreMiscCfg>::new()
-                .proc_precision(Bits::new(2)) // must agree with CNA's proc_precision -- confirmed =2, not 0
-                .build(),
-        );
+        // QD_EN(1) unconditionally -- this file previously never set it
+        // (and instead set an invented `proc_precision` field Mesa never
+        // touches on CORE_MISC_CFG at all).
+        cmds.push(Register::<CoreMiscCfg>::new().qd_en(Bits::new(1)).build());
+        // DATAOUT_HEIGHT/WIDTH are N-1 (task->output_height/width - 1) --
+        // this file previously wrote the raw counts here, inconsistent
+        // with its own sibling DPU_DATA_CUBE_WIDTH/HEIGHT below (which
+        // already had the -1 right).
         cmds.push(
             Register::<CoreDataoutSize0>::new()
-                .dataout_width(Bits::new(OUT_WIDTH))
-                .dataout_height(Bits::new(OUT_HEIGHT))
+                .dataout_width(Bits::new(OUT_WIDTH - 1))
+                .dataout_height(Bits::new(OUT_HEIGHT - 1))
                 .build(),
         );
-        // dataout_channel is N-1, not the direct count -- see the
-        // DpuDataCubeWidth/Height/Channel comment below, same finding.
+        // dataout_channel uses the atomic-aligned output channel count
+        // (task->output_channels - 1 = 31), not the raw OUT_CHANNELS-1(0).
         cmds.push(
             Register::<CoreDataoutSize1>::new()
-                .dataout_channel(Bits::new(OUT_CHANNELS - 1))
+                .dataout_channel(Bits::new(task_output_channels - 1))
                 .build(),
         );
-        // clip_truncate=0: no extra right-shift when narrowing the MAC
-        // accumulator back down. Least-confirmed CORE field -- if output is
-        // saturated/garbage this is the first thing to revisit.
         cmds.push(
             Register::<CoreClipTruncate>::new()
-                .clip_truncate(Bits::new(0))
+                .clip_truncate(Bits::new(0)) // operation->truncate_bits = 0
                 .build(),
         );
-
-        // Undocumented/unnamed CORE register at offset 0x3030 -- not in
-        // rkt_registers.h at all (no REG_CORE_* constant covers it; it's
-        // the very next 4-byte slot after CLIP_TRUNCATE's 12316). Mesa's
-        // rkt_regcmd.c writes it to 0 unconditionally right after
-        // CLIP_TRUNCATE (`emit_raw(regs, CORE | 0x1, 0x3030, 0);`) with no
-        // explanation -- presumably a TRM-mandated reserved-bit write.
-        // Previously missing entirely from this file.
+        // Undocumented/unnamed CORE register at 0x3030 -- TRM-mandated
+        // reserved-bit write right after CLIP_TRUNCATE, no REG_CORE_*
+        // constant covers it. See mesa-rocket-userspace/rkt_regcmd.c.
         cmds.push(RegCmd::new(DOMAIN_CORE, 0x3030, 0));
 
-        // No CoreOperationEnable write -- see the comment where
-        // CnaOperationEnable used to be, above.
-
         // ==================================================================
-        // DPU: output requantization + writeback (bias/batchnorm/elementwise
-        // all bypassed -- nothing but a straight conv here)
+        // DPU: output requantization + writeback
         // ==================================================================
 
-        // conv_mode=0 confirmed. output_mode=2 and burst_len=15(max) are
-        // corrections from the real decode -- both were guessed at 0.
         cmds.push(
             Register::<DpuFeatureModeCfg>::new()
-                .conv_mode(Bits::new(0))
-                .output_mode(Bits::new(2))
                 .burst_len(Bits::new(15))
+                .output_mode(Bits::new(2))
                 .build(),
         );
-        // Precision fields =2 across the board (CNA/CORE/DPU), matching
-        // CnaConvCon1 above -- confirmed via the real decode, corrected
-        // from the original guess of 0.
+        // Plain 0 -- Mesa never sets precision fields on DPU_DATA_FORMAT
+        // for this path (a previous revision invented in/out/proc_precision
+        // here, sourced from the vendor-toolchain cross-check mentioned in
+        // the top-of-file doc comment).
+        cmds.push(zero::<DpuDataFormat>());
+        cmds.push(zero::<DpuOffsetPend>());
         cmds.push(
-            Register::<DpuDataFormat>::new()
-                .in_precision(Bits::new(2))
-                .out_precision(Bits::new(2))
-                .proc_precision(Bits::new(2))
+            Register::<DpuDstBaseAddr>::new()
+                .dst_base_addr(Bits::new(buf_c.dma_address))
                 .build(),
         );
-        // DPU_DATA_CUBE_WIDTH/HEIGHT and CHANNEL's own `channel` subfield
-        // are all N-1, not the direct count -- this was wrong in the
-        // previous revision (used the direct value) and is the most
-        // likely reason that version still hit EBUSY/timeout even after
-        // the domain-tag and precision-field fixes. Found by cross-
-        // referencing rkt-job.rs/rkt-simple-job.rs (both already used
-        // N-1 here) against the conv.rknn decode, which confirms it:
-        // DPU_DATA_CUBE_WIDTH read back as 0x1f=31 for a real width of
-        // 32. `orig_channel` is NOT N-1 though -- rkt-simple-job.rs uses
-        // the direct count for it, a different encoding for two
-        // subfields of the same register.
+        cmds.push(
+            Register::<DpuDstSurfStride>::new()
+                .dst_surf_stride(Bits::new(output_surface_stride))
+                .build(),
+        );
         cmds.push(
             Register::<DpuDataCubeWidth>::new()
                 .width(Bits::new(OUT_WIDTH - 1))
@@ -573,87 +566,146 @@ fn main() {
                 .height(Bits::new(OUT_HEIGHT - 1))
                 .build(),
         );
+        cmds.push(zero::<DpuDataCubeNotchAddr>());
         cmds.push(
             Register::<DpuDataCubeChannel>::new()
-                .channel(Bits::new(OUT_CHANNELS - 1))
-                .orig_channel(Bits::new(OUT_CHANNELS))
+                .orig_channel(Bits::new(OUT_CHANNELS - 1)) // output_channels_real - 1
+                .channel(Bits::new(task_output_channels - 1)) // aligned output_channels - 1
                 .build(),
         );
 
-        cmds.push(Register::<DpuBsCfg>::new().bs_bypass(Bits::new(1)).build());
-        cmds.push(Register::<DpuBnCfg>::new().bn_bypass(Bits::new(1)).build());
-        cmds.push(Register::<DpuEwCfg>::new().ew_bypass(Bits::new(1)).build());
+        // BS (bias-subtract): Mesa never bypasses this block outright --
+        // it always runs the ALU (ALGO(2)|SRC(1)), with RELU/MUL bypassed.
+        // A previous revision of this file set only bs_bypass(1), which
+        // isn't what Mesa's real value is at all -- and never allocated
+        // the biases buffer this implies DPU_RDMA needs to feed it (see
+        // buf_bias above / DPU_RDMA_RDMA_BS_BASE_ADDR below).
+        cmds.push(
+            Register::<DpuBsCfg>::new()
+                .bs_alu_algo(Bits::new(2))
+                .bs_alu_src(Bits::new(1))
+                .bs_relu_bypass(Bits::new(1))
+                .bs_mul_bypass(Bits::new(1))
+                .build(),
+        );
+        cmds.push(zero::<DpuBsAluCfg>());
+        cmds.push(zero::<DpuBsMulCfg>());
+        cmds.push(zero::<DpuBsReluxCmpValue>());
+        // Not depthwise: SIZE_E_0/1/2 = 1 each (depthwise branch uses 3).
+        cmds.push(
+            Register::<DpuBsOwCfg>::new()
+                .size_e_0(Bits::new(1))
+                .size_e_1(Bits::new(1))
+                .size_e_2(Bits::new(1))
+                .build(),
+        );
+        cmds.push(
+            Register::<DpuBsOwOp>::new()
+                .ow_op(Bits::new(0x80 - ZERO_POINT)) // 0x80 - weights_zero_point
+                .build(),
+        );
+        cmds.push(
+            Register::<DpuWdmaSize0>::new()
+                .channel_wdma(Bits::new(task_output_channels - 1))
+                .build(),
+        );
+        cmds.push(
+            Register::<DpuWdmaSize1>::new()
+                .height_wdma(Bits::new(OUT_HEIGHT - 1))
+                .width_wdma(Bits::new(OUT_WIDTH - 1))
+                .build(),
+        );
 
-        // Output conversion is not bypass-able the way BS/BN/EW are, so
-        // this needs an identity-ish scale/shift even with no real
-        // quantization: out = (acc * scale) >> shift + offset, scale=1
-        // shift=0 offset=0. scale=1 is confirmed against the real decode
-        // (so it likely is a plain integer multiplier, not a fixed-point
-        // Q-format one as originally worried) -- shift=0 and offset=0 are
-        // still unconfirmed guesses, since the real example's shift wasn't
-        // isolated from its other fields. The real decode also showed an
-        // FP32TOFP16_EN bit in this same register that the builder below
-        // doesn't expose at all (see the confidence-level doc comment up
-        // top) -- not needed here since we're not asking for fp16 output,
-        // but worth knowing it exists.
+        // BN (batchnorm): genuinely fully bypassed by Mesa, unlike BS above
+        // -- but all four bypass bits are set (RELU/MUL/ALU/BN), not just
+        // bn_bypass(1) alone the way this file had it before.
+        cmds.push(
+            Register::<DpuBnCfg>::new()
+                .bn_relu_bypass(Bits::new(1))
+                .bn_mul_bypass(Bits::new(1))
+                .bn_alu_bypass(Bits::new(1))
+                .bn_bypass(Bits::new(1))
+                .build(),
+        );
+        cmds.push(zero::<DpuBnAluCfg>());
+        cmds.push(zero::<DpuBnMulCfg>());
+        cmds.push(zero::<DpuBnReluxCmpValue>());
+
+        // EW (elementwise): add_tensor == -1 branch -- fully bypassed, all
+        // five bypass bits set (this file previously set only ew_bypass(1)).
+        cmds.push(
+            Register::<DpuEwCfg>::new()
+                .ew_relu_bypass(Bits::new(1))
+                .ew_op_cvt_bypass(Bits::new(1))
+                .ew_lut_bypass(Bits::new(1))
+                .ew_op_bypass(Bits::new(1))
+                .ew_bypass(Bits::new(1))
+                .build(),
+        );
+        cmds.push(zero::<DpuEwCvtOffsetValue>());
+        cmds.push(
+            Register::<DpuEwCvtScaleValue>::new()
+                .ew_op_cvt_scale(Bits::new(1))
+                .build(),
+        );
+        cmds.push(zero::<DpuEwReluxCmpValue>());
+
+        // Output requantization -- real formula (float-bits based fixed-
+        // point conversion), not the placeholder scale=1/shift=0/offset=0
+        // this file used before. See the derivation above.
         cmds.push(
             Register::<DpuOutCvtOffset>::new()
-                .out_cvt_offset(Bits::new(0))
+                .out_cvt_offset(Bits::new(out_cvt_offset))
                 .build(),
         );
         cmds.push(
             Register::<DpuOutCvtScale>::new()
-                .out_cvt_scale(Bits::new(1))
+                .out_cvt_scale(Bits::new(out_cvt_scale))
                 .build(),
         );
         cmds.push(
             Register::<DpuOutCvtShift>::new()
-                .out_cvt_shift(Bits::new(0))
+                .out_cvt_shift(Bits::new(out_cvt_shift - 1))
                 .build(),
         );
 
+        cmds.push(zero::<DpuEwOpValue0>());
+        cmds.push(zero::<DpuEwOpValue1>());
+        cmds.push(zero::<DpuEwOpValue2>());
+        cmds.push(zero::<DpuEwOpValue3>());
+        cmds.push(zero::<DpuEwOpValue4>());
+        cmds.push(zero::<DpuEwOpValue5>());
+        cmds.push(zero::<DpuEwOpValue6>());
+        cmds.push(zero::<DpuEwOpValue7>());
+
         cmds.push(
-            Register::<DpuDstBaseAddr>::new()
-                .dst_base_addr(Bits::new(buf_c.dma_address))
-                .build(),
-        );
-        cmds.push(
-            Register::<DpuDstSurfStride>::new()
-                .dst_surf_stride(Bits::new(OUT_WIDTH * OUT_HEIGHT))
+            Register::<DpuSurfaceAdd>::new()
+                .surf_add(Bits::new(surfaces_per_row))
                 .build(),
         );
 
-        // Undocumented/unnamed DPU register at offset 0x40c4 -- same
-        // situation as CORE's 0x3030 above: not in rkt_registers.h, sits
-        // right after REG_DPU_SURFACE_ADD (16576) in the address space,
-        // and Mesa's rkt_regcmd.c writes it to 0 unconditionally
-        // (`emit_raw(regs, DPU | 0x1, 0x40c4, 0);`) right after
-        // SURFACE_ADD (which this file doesn't otherwise set -- EW is
-        // fully bypassed here so surfaces_per_row shouldn't matter, but
-        // the reserved-register write below is unconditional in Mesa
-        // regardless of EW state, so it's kept independent of that).
+        // Undocumented/unnamed DPU register at 0x40c4 -- TRM-mandated
+        // reserved-bit write right after SURFACE_ADD.
         cmds.push(RegCmd::new(DOMAIN_DPU, 0x40c4, 0));
 
-        // No DpuOperationEnable write -- see the comment where
-        // CnaOperationEnable used to be, above.
+        cmds.push(zero::<DpuLutAccessCfg>());
+        cmds.push(zero::<DpuLutAccessData>());
+        cmds.push(zero::<DpuLutCfg>());
+        cmds.push(zero::<DpuLutInfo>());
+        cmds.push(zero::<DpuLutLeStart>());
+        cmds.push(zero::<DpuLutLeEnd>());
+        cmds.push(zero::<DpuLutLoStart>());
+        cmds.push(zero::<DpuLutLoEnd>());
+        cmds.push(zero::<DpuLutLeSlopeScale>());
+        cmds.push(zero::<DpuLutLeSlopeShift>());
+        cmds.push(zero::<DpuLutLoSlopeScale>());
+        cmds.push(zero::<DpuLutLoSlopeShift>());
 
         // ==================================================================
-        // DPU_RDMA -- required even though nothing about this test needs
-        // it to actually read anything. Missing entirely (like it was in
-        // an earlier draft of this file, and still is in rkt-simple-job.rs)
-        // is the leading suspect for the EBUSY hang: the real, confirmed-
-        // working conv.rknn regcmd decode (NOTES.md) enables CNA+CORE+DPU+
-        // DPU_RDMA together (GLOBAL_OPERATION_ENABLE=0x1d), never just the
-        // first three -- DPU_RDMA is architecturally chained to DPU, and
-        // skipping it plausibly leaves PC's completion/interrupt
-        // aggregation waiting on an engine that was never told to
-        // participate. The specific field values are also non-obvious and
-        // came from that decode, not guesswork: MRDMA_DISABLE=1 (the main
-        // read-DMA path is OFF) in the real, working capture --
-        // rkt-job.rs guesses 0 there (enabled), the opposite of what
-        // real hardware does. Data-cube dims mirror DPU's own (the real
-        // decode's DPU_RDMA dims matched DPU's dims exactly for that
-        // layer).
+        // DPU_RDMA -- architecturally chained to DPU; PC's completion
+        // aggregation needs it configured and participating even though
+        // this op doesn't need it to read anything itself (MRDMA_DISABLE=1
+        // below). Also now feeds BS's biases buffer (see DpuBsCfg above).
         // ==================================================================
 
         cmds.push(
@@ -666,52 +718,68 @@ fn main() {
                 .height(Bits::new(OUT_HEIGHT - 1))
                 .build(),
         );
+        // Aligned output channel count, matching CORE_DATAOUT_SIZE_1/
+        // DPU_DATA_CUBE_CHANNEL's `channel` subfield above -- not the raw
+        // OUT_CHANNELS-1(0) this file used before.
         cmds.push(
             Register::<DpuRdmaDataCubeChannel>::new()
-                .channel(Bits::new(OUT_CHANNELS - 1))
+                .channel(Bits::new(task_output_channels - 1))
+                .build(),
+        );
+
+        cmds.push(zero::<DpuRdmaSrcBaseAddr>()); // add_tensor == -1
+        cmds.push(
+            Register::<DpuRdmaBrdmaCfg>::new()
+                .brdma_data_use(Bits::new(1))
                 .build(),
         );
         cmds.push(
-            Register::<DpuRdmaFeatureModeCfg>::new()
-                .mrdma_disable(Bits::new(1))
-                .burst_len(Bits::new(15))
-                .proc_precision(Bits::new(2))
-                .in_precision(Bits::new(2))
+            Register::<DpuRdmaBsBaseAddr>::new()
+                .bs_base_addr(Bits::new(buf_bias.dma_address))
                 .build(),
         );
-        // No DpuRdmaOperationEnable write -- see the comment where
-        // CnaOperationEnable used to be, above.
+        cmds.push(zero::<DpuRdmaNrdmaCfg>());
+        cmds.push(zero::<DpuRdmaBnBaseAddr>());
+
+        // add_tensor == -1 branch throughout below.
+        cmds.push(
+            Register::<DpuRdmaErdmaCfg>::new()
+                .erdma_disable(Bits::new(1))
+                .build(),
+        );
+        cmds.push(zero::<DpuRdmaEwBaseAddr>());
+        cmds.push(zero::<DpuRdmaEwSurfStride>());
+
+        cmds.push(
+            Register::<DpuRdmaFeatureModeCfg>::new()
+                .burst_len(Bits::new(15))
+                .mrdma_disable(Bits::new(1))
+                .build(),
+        );
+        cmds.push(zero::<DpuRdmaSrcDmaCfg>());
+        cmds.push(zero::<DpuRdmaSurfNotch>()); // add_tensor == -1 branch
+        cmds.push(zero::<DpuRdmaPadCfg>());
+        cmds.push(
+            Register::<DpuRdmaWeight>::new()
+                .e_weight(Bits::new(1))
+                .n_weight(Bits::new(1))
+                .b_weight(Bits::new(1))
+                .m_weight(Bits::new(1))
+                .build(),
+        );
+        cmds.push(zero::<DpuRdmaEwSurfNotch>()); // add_tensor == -1 branch
 
         // ==================================================================
         // Kick sequence -- ported verbatim from Mesa's reference gallium
-        // driver (rkt_regcmd.c, fill_first_regcmd, the only userspace
-        // that's ever actually driven this mainline kernel module
-        // successfully), not reconstructed from guesswork. This replaces
-        // this file's previous two-write GlobalOperationEnable +
-        // PCOperationEnable kick, which doesn't correspond to anything
-        // Mesa actually sends -- there is no "GLOBAL" register block with
-        // individually addressable per-engine enable bits; DOMAIN_GLOBAL
-        // (0x81) is really a broadcast-style domain override used only for
-        // this one final write, at PC's own OPERATION_ENABLE offset.
-        //
-        // Four entries, in this exact order (see mesa-rocket-userspace/
-        // rkt_regcmd.c around line 436):
-        //   1. PC_BASE_ADDRESS placeholder -- Mesa emits this as a bare
-        //      untagged 0 for a single-task job (only patched/tagged for
-        //      multi-task chaining, which we don't do).
-        //   2. PC_REGISTER_AMOUNTS placeholder -- also just 0 here; only
-        //      patched by Mesa's compile_operation() when chaining to a
-        //      next task.
+        // driver (rkt_regcmd.c, fill_first_regcmd's tail, num_tasks == 1
+        // branch). Four entries, in this exact order:
+        //   1. PC_BASE_ADDRESS placeholder -- bare untagged 0 (single task,
+        //      only patched for multi-task chaining, which we don't do).
+        //   2. PC_REGISTER_AMOUNTS placeholder -- also 0 here.
         //   3. A raw, untagged magic word ("TRM: before op_en,
-        //      64'h0041_xxxx_xxxx_xxxx must be set") -- not decomposable
-        //      into a domain/offset/value triple, so appended literally
-        //      like Mesa does.
-        //   4. The actual kick: domain 0x81 at REG_PC_OPERATION_ENABLE's
-        //      offset, value = PC_OPERATION_ENABLE_RESERVED_0(14) |
-        //      PC_OPERATION_ENABLE_OP_EN(1) -- computed via the same
-        //      bindgen-generated bit-packing functions Mesa's C macros
-        //      expand to, so this is byte-for-byte what Mesa's own build
-        //      produces, not a hand-transcribed literal.
+        //      64'h0041_xxxx_xxxx_xxxx must be set").
+        //   4. The actual kick: domain 0x81 (broadcast override, not a
+        //      real addressable block) at REG_PC_OPERATION_ENABLE.
         // ==================================================================
 
         cmds.push(RegCmd::new_raw(0x0)); // PC_BASE_ADDRESS placeholder (single task)
@@ -723,25 +791,18 @@ fn main() {
             PC_OPERATION_ENABLE_RESERVED_0(14) | PC_OPERATION_ENABLE_OP_EN(1),
         ));
 
-        // Pad to an even entry count. The kernel's PC_REGISTER_AMOUNTS
-        // formula ((regcmd_count + 1) / 2 - 1) implies PC reads regcmd
-        // entries in pairs -- for an odd count, integer division makes it
-        // read one word past our populated data. Still within the same
-        // (zeroed, page-granular) GEM allocation, so almost certainly
-        // harmless, and our real kick entry is always within the valid
-        // range either way -- but free to eliminate as a variable.
+        // Pad to an even entry count -- PC reads regcmd entries in pairs
+        // ((regcmd_count + 1) / 2 - 1 in the kernel), so an odd count
+        // would make it read one word past our populated data. Still
+        // within the same zeroed, page-granular GEM allocation either way.
         if cmds.len() % 2 != 0 {
             cmds.push(RegCmd::new_raw(0x0));
         }
 
         // Printed to stderr before touching hardware, so it's visible even
-        // if SUBMIT/PREP_BO hangs afterward. Compare against the conv.rknn
-        // regcmd decode (rknpu-spelunking/NOTES.md) register-by-register.
+        // if SUBMIT/PREP_BO hangs afterward.
         dump_cmds("rkt-basic", &cmds);
 
-        // Create Command Buffer -- sized from the actual cmds vector
-        // (8 bytes per RegCmd) rather than a hardcoded 4096, rounded up to
-        // a page since mmap'd GEM allocations are page-granular anyway.
         let cmd_bytes = cmds.len() * mem::size_of::<u64>();
         let cmd_len = cmd_bytes.next_multiple_of(4096);
         let buf_cmd = Buffer::new(fd, cmd_len, &file);
@@ -769,6 +830,14 @@ fn main() {
         rocket_fini_bo(
             fd,
             &drm_rocket_fini_bo {
+                handle: buf_bias.handle,
+                reserved: 0,
+            },
+        )
+        .ok();
+        rocket_fini_bo(
+            fd,
+            &drm_rocket_fini_bo {
                 handle: buf_c.handle,
                 reserved: 0,
             },
@@ -783,30 +852,18 @@ fn main() {
         )
         .ok();
 
-        // NOT doubled -- reversed again, this time from Mesa's actual
-        // submission code (rkt_ml.c, rkt_ml_subgraph_invoke):
-        //
-        //   ktask->regcmd_count = task->regcfg_amount;
-        //
-        // where regcfg_amount is set in compile_operation() to the raw
-        // util_dynarray_num_elements() count of uint64_t regcmd entries --
-        // i.e. exactly `cmds.len()`, no `* 2`. The kernel's own
-        // `(task->regcmd_count + 1) / 2 - 1` halving (rocket_job.c,
-        // rocket_job_hw_submit) is the kernel's internal conversion to
-        // whatever unit PC_REGISTER_AMOUNTS is actually counted in (likely
-        // 16-byte/2-entry DMA burst granules) -- it describes what the
-        // kernel does WITH the count it's given, not what value userspace
-        // is supposed to pre-multiply by. Mistook that distinction
-        // previously and restored the `* 2` based on the kernel formula
-        // alone; Mesa's own reference client is the actual ground truth
-        // for what regcmd_count means as an ioctl input, and it does not
-        // double it.
+        // Not doubled -- Mesa's rkt_ml_subgraph_invoke() sets
+        // ktask->regcmd_count = task->regcfg_amount, the raw entry count
+        // (cmds.len()), no `* 2`. The kernel's own
+        // `(regcmd_count + 1) / 2 - 1` halving (rocket_job_hw_submit) is
+        // its internal conversion to whatever unit PC_REGISTER_AMOUNTS
+        // counts in, not a pre-multiplication contract on this field.
         let task = drm_rocket_task {
             regcmd: buf_cmd.dma_address,
             regcmd_count: cmds.len() as u32,
         };
 
-        let in_handles = vec![buf_cmd.handle, buf_a.handle, buf_w.handle];
+        let in_handles = vec![buf_cmd.handle, buf_a.handle, buf_w.handle, buf_bias.handle];
         let out_handles = vec![buf_c.handle];
 
         let job = drm_rocket_job {
