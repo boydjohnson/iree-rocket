@@ -75,7 +75,7 @@ use iree_rocket_hal::rocket::{
         drm_rocket_job, drm_rocket_prep_bo, drm_rocket_submit, drm_rocket_task,
     },
     builders::{
-        Bits, DOMAIN_PC, RegCmd, Register,
+        Bits, DOMAIN_CORE, DOMAIN_DPU, DOMAIN_PC, RegCmd, Register,
         cna::{
             CnaCbufCon0, CnaCbufCon1, CnaConvCon1, CnaConvCon2, CnaConvCon3, CnaCvtCon0,
             CnaDataSize0, CnaDataSize1, CnaDataSize2, CnaDataSize3, CnaDcompAddr0, CnaDcompCtrl,
@@ -359,6 +359,15 @@ fn main() {
                 .build(),
         );
 
+        // Undocumented/unnamed CORE register at offset 0x3030 -- not in
+        // rkt_registers.h at all (no REG_CORE_* constant covers it; it's
+        // the very next 4-byte slot after CLIP_TRUNCATE's 12316). Mesa's
+        // rkt_regcmd.c writes it to 0 unconditionally right after
+        // CLIP_TRUNCATE (`emit_raw(regs, CORE | 0x1, 0x3030, 0);`) with no
+        // explanation -- presumably a TRM-mandated reserved-bit write.
+        // Previously missing entirely from this file.
+        cmds.push(RegCmd::new(DOMAIN_CORE, 0x3030, 0));
+
         cmds.push(
             Register::<CoreOperationEnable>::new()
                 .op_en(Bits::new(1))
@@ -459,6 +468,17 @@ fn main() {
                 .dst_surf_stride(Bits::new(OUT_WIDTH * OUT_HEIGHT))
                 .build(),
         );
+
+        // Undocumented/unnamed DPU register at offset 0x40c4 -- same
+        // situation as CORE's 0x3030 above: not in rkt_registers.h, sits
+        // right after REG_DPU_SURFACE_ADD (16576) in the address space,
+        // and Mesa's rkt_regcmd.c writes it to 0 unconditionally
+        // (`emit_raw(regs, DPU | 0x1, 0x40c4, 0);`) right after
+        // SURFACE_ADD (which this file doesn't otherwise set -- EW is
+        // fully bypassed here so surfaces_per_row shouldn't matter, but
+        // the reserved-register write below is unconditional in Mesa
+        // regardless of EW state, so it's kept independent of that).
+        cmds.push(RegCmd::new(DOMAIN_DPU, 0x40c4, 0));
 
         cmds.push(
             Register::<DpuOperationEnable>::new()
