@@ -86,6 +86,7 @@ use iree_rocket_hal::rocket::{
         global::GlobalOperationEnable,
         pc::PCOperationEnable,
     },
+    debug::dump_cmds,
 };
 use nix::{
     ioctl_readwrite, ioctl_write_ptr,
@@ -471,6 +472,11 @@ fn main() {
                 .build(),
         );
         cmds.push(Register::<PCOperationEnable>::new().op_enable(true).build());
+
+        // Printed to stderr before touching hardware, so it's visible even
+        // if SUBMIT/PREP_BO hangs afterward. Compare against the conv.rknn
+        // regcmd decode (rknpu-spelunking/NOTES.md) register-by-register.
+        dump_cmds("rkt-basic", &cmds);
 
         // Create Command Buffer
         let cmd_len = 4096;
