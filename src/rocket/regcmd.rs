@@ -108,6 +108,14 @@ pub fn build_conv_regcmd(shape: &ConvShape, bufs: &ConvBuffers) -> Vec<RegCmd> {
 
     // calc_input_banks().
     let input_banks = (entries_per_slice * shape.input_height).div_ceil(CBUF_ENTRIES_PER_BANK);
+    assert!(
+        input_banks < CBUF_BANKS,
+        "build_conv_regcmd: shape needs {input_banks} input CBUF banks (only \
+         {CBUF_BANKS} total) -- too big for the single-task path this \
+         function implements (rkt_split_tasks()'s general multi-task \
+         splitting branch isn't ported); shrink the operation or add that \
+         support"
+    );
 
     // rkt_split_tasks(): the single-task branch sets weight_banks to
     // CBUF_BANKS - input_banks directly -- NOT calc_weights_banks()'s own

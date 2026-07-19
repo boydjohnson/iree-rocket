@@ -187,9 +187,18 @@ fn main() {
         .expect("Failed to open device");
     let fd = file.as_raw_fd();
 
-    println!("--- NPU Diagnostic: 224x224x24 1x1 Conv (shared regcmd builder) ---");
+    println!("--- NPU Diagnostic: 32x32x24 1x1 Conv (shared regcmd builder) ---");
 
-    let tensor_size = 224 * 224 * 24;
+    // Originally 224x224x24 -- that needs 49 CBUF input banks (only 12
+    // exist total), which requires Mesa's multi-task splitting
+    // (rkt_split_tasks()'s general branch, not just its single-task
+    // shortcut). build_conv_regcmd() only implements the single-task
+    // path (see its own scope doc comment) and now asserts loudly on
+    // this rather than silently underflowing into a confusing panic
+    // somewhere unrelated. Shrunk to 32x32 spatial, which fits in 1 bank,
+    // while keeping 24 channels as this file's distinguishing shape from
+    // rkt-job.rs's 64x64x64.
+    let tensor_size = 32 * 32 * 24;
 
     unsafe {
         let buf_a = Buffer::new(fd, tensor_size, &file);
@@ -217,11 +226,11 @@ fn main() {
         fill_buffer::<i8>(fd, &buf_bias, "zero Bias", 0);
 
         let shape = ConvShape {
-            input_width: 224,
-            input_height: 224,
+            input_width: 32,
+            input_height: 32,
             input_channels: 24,
-            output_width: 224,
-            output_height: 224,
+            output_width: 32,
+            output_height: 32,
             output_channels: 24,
             weights_width: 1,
             weights_height: 1,
