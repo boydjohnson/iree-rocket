@@ -75,7 +75,7 @@ use iree_rocket_hal::rocket::{
         drm_rocket_job, drm_rocket_prep_bo, drm_rocket_submit, drm_rocket_task,
     },
     builders::{
-        Bits, RegCmd, Register,
+        Bits, DOMAIN_PC, RegCmd, Register,
         cna::{
             CnaCbufCon0, CnaCbufCon1, CnaConvCon1, CnaConvCon2, CnaConvCon3, CnaCvtCon0,
             CnaDataSize0, CnaDataSize1, CnaDataSize2, CnaDataSize3, CnaDcompAddr0, CnaDcompCtrl,
@@ -94,10 +94,12 @@ use iree_rocket_hal::rocket::{
             DpuRdmaDataCubeChannel, DpuRdmaDataCubeHeight, DpuRdmaDataCubeWidth,
             DpuRdmaFeatureModeCfg, DpuRdmaOperationEnable,
         },
-        global::GlobalOperationEnable,
-        pc::PCOperationEnable,
     },
     debug::dump_cmds,
+    registers::{
+        PC_OPERATION_ENABLE_OP_EN, PC_OPERATION_ENABLE_RESERVED_0, REG_PC_OPERATION_ENABLE,
+        REG_PC_REGISTER_AMOUNTS,
+    },
 };
 use nix::{
     ioctl_readwrite, ioctl_write_ptr,
@@ -513,36 +515,45 @@ fn main() {
         );
 
         // ==================================================================
-        // Kick: Global master-enable, selecting which engines participate.
+        // Kick sequence -- ported verbatim from Mesa's reference gallium
+        // driver (rkt_regcmd.c, fill_first_regcmd, the only userspace
+        // that's ever actually driven this mainline kernel module
+        // successfully), not reconstructed from guesswork. This replaces
+        // this file's previous two-write GlobalOperationEnable +
+        // PCOperationEnable kick, which doesn't correspond to anything
+        // Mesa actually sends -- there is no "GLOBAL" register block with
+        // individually addressable per-engine enable bits; DOMAIN_GLOBAL
+        // (0x81) is really a broadcast-style domain override used only for
+        // this one final write, at PC's own OPERATION_ENABLE offset.
         //
-        // PC_BASE_ADDRESS / PC_REGISTER_AMOUNTS / PC_TASK_CON deliberately
-        // are NOT pushed into this stream, unlike an earlier draft of this
-        // file. PC has to already know where the regcmd buffer is and how
-        // long it is *before* it can read the first entry out of it, so
-        // those three can't logically live inside the stream they describe
-        // -- that's exactly why DRM_ROCKET_SUBMIT takes `regcmd`/
-        // `regcmd_count` as explicit ioctl fields below: the kernel driver
-        // programs those PC registers itself before dispatching. This
-        // matches what the vendor driver's `rknpu_job_subcore_commit` does
-        // kernel-side (see rknpu-spelunking/NOTES.md) -- mainline almost
-        // certainly does the analogous thing from `drm_rocket_task`.
-        // PC_OPERATION_ENABLE is kept as a harmless no-op parity with the
-        // previous version of this file: by the time PC reaches this last
-        // entry in the stream it's already reading (driver-triggered), so
-        // re-setting the same bit here shouldn't do anything -- but it
-        // also doesn't need to be here, so it's the first thing to try
-        // removing if something goes wrong.
+        // Four entries, in this exact order (see mesa-rocket-userspace/
+        // rkt_regcmd.c around line 436):
+        //   1. PC_BASE_ADDRESS placeholder -- Mesa emits this as a bare
+        //      untagged 0 for a single-task job (only patched/tagged for
+        //      multi-task chaining, which we don't do).
+        //   2. PC_REGISTER_AMOUNTS placeholder -- also just 0 here; only
+        //      patched by Mesa's compile_operation() when chaining to a
+        //      next task.
+        //   3. A raw, untagged magic word ("TRM: before op_en,
+        //      64'h0041_xxxx_xxxx_xxxx must be set") -- not decomposable
+        //      into a domain/offset/value triple, so appended literally
+        //      like Mesa does.
+        //   4. The actual kick: domain 0x81 at REG_PC_OPERATION_ENABLE's
+        //      offset, value = PC_OPERATION_ENABLE_RESERVED_0(14) |
+        //      PC_OPERATION_ENABLE_OP_EN(1) -- computed via the same
+        //      bindgen-generated bit-packing functions Mesa's C macros
+        //      expand to, so this is byte-for-byte what Mesa's own build
+        //      produces, not a hand-transcribed literal.
         // ==================================================================
 
-        cmds.push(
-            Register::<GlobalOperationEnable>::new()
-                .cna_op_en(Bits::new(1))
-                .core_op_en(Bits::new(1))
-                .dpu_op_en(Bits::new(1))
-                .dpu_rdma_op_en(Bits::new(1))
-                .build(),
-        );
-        cmds.push(Register::<PCOperationEnable>::new().op_enable(true).build());
+        cmds.push(RegCmd::new_raw(0x0)); // PC_BASE_ADDRESS placeholder (single task)
+        cmds.push(RegCmd::new(DOMAIN_PC, REG_PC_REGISTER_AMOUNTS, 0)); // PC_REGISTER_AMOUNTS placeholder
+        cmds.push(RegCmd::new_raw(0x0041000000000000)); // TRM: required immediately before op_en
+        cmds.push(RegCmd::new(
+            0x81,
+            REG_PC_OPERATION_ENABLE,
+            PC_OPERATION_ENABLE_RESERVED_0(14) | PC_OPERATION_ENABLE_OP_EN(1),
+        ));
 
         // Printed to stderr before touching hardware, so it's visible even
         // if SUBMIT/PREP_BO hangs afterward. Compare against the conv.rknn
@@ -593,26 +604,27 @@ fn main() {
         )
         .ok();
 
-        // cmds.len() * 2 IS correct -- confirmed straight from the
-        // mainline kernel driver source (drivers/accel/rocket/rocket_job.c,
-        // rocket_job_hw_submit), not inferred:
+        // NOT doubled -- reversed again, this time from Mesa's actual
+        // submission code (rkt_ml.c, rkt_ml_subgraph_invoke):
         //
-        //   rocket_pc_writel(core, REGISTER_AMOUNTS,
-        //       PC_REGISTER_AMOUNTS_PC_DATA_AMOUNT((task->regcmd_count + 1) / 2 - 1));
+        //   ktask->regcmd_count = task->regcfg_amount;
         //
-        // i.e. the kernel itself divides regcmd_count by 2 (rounding) and
-        // subtracts 1 before writing PC_REGISTER_AMOUNTS. An earlier
-        // revision of this file removed the `* 2` on the theory that it
-        // was an unconfirmed guess causing PC to read past the real
-        // regcmd data -- that reasoning was wrong (the correlation with
-        // rkt-job.rs not hanging was actually explained by rkt-job.rs
-        // never enabling CORE at all, unrelated to this count), and
-        // removing it silently told PC to read roughly half the real
-        // regcmd stream, stopping before ever reaching the trailing
-        // GLOBAL_OPERATION_ENABLE/kick entries. Restored.
+        // where regcfg_amount is set in compile_operation() to the raw
+        // util_dynarray_num_elements() count of uint64_t regcmd entries --
+        // i.e. exactly `cmds.len()`, no `* 2`. The kernel's own
+        // `(task->regcmd_count + 1) / 2 - 1` halving (rocket_job.c,
+        // rocket_job_hw_submit) is the kernel's internal conversion to
+        // whatever unit PC_REGISTER_AMOUNTS is actually counted in (likely
+        // 16-byte/2-entry DMA burst granules) -- it describes what the
+        // kernel does WITH the count it's given, not what value userspace
+        // is supposed to pre-multiply by. Mistook that distinction
+        // previously and restored the `* 2` based on the kernel formula
+        // alone; Mesa's own reference client is the actual ground truth
+        // for what regcmd_count means as an ioctl input, and it does not
+        // double it.
         let task = drm_rocket_task {
             regcmd: buf_cmd.dma_address,
-            regcmd_count: cmds.len() as u32 * 2,
+            regcmd_count: cmds.len() as u32,
         };
 
         let in_handles = vec![buf_cmd.handle, buf_a.handle, buf_w.handle];
