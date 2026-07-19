@@ -218,8 +218,7 @@ fn main() {
             }
         });
 
-        // FIX: Multiply by 2 to satisfy kernel formula (N+1)/2 - 1
-        let regcmd_count_val = cmds.len() as u32 * 2;
+        let regcmd_count_val = cmds.len() as u32;
 
         let task = drm_rocket_task {
             regcmd: buf_cmd.dma_address,
