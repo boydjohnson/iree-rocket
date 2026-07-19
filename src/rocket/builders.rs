@@ -79,7 +79,10 @@ impl<const N: usize> Bits<N> {
     pub const fn new(val: u32) -> Self {
         // Use u64 for check to avoid overflow if N=32
         if N < 32 {
-            assert!((val as u64) < (1u64 << N), "Value exceeds designated bit width!");
+            assert!(
+                (val as u64) < (1u64 << N),
+                "Value exceeds designated bit width!"
+            );
         }
         Bits(val)
     }
