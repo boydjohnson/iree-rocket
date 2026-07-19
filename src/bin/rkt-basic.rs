@@ -54,11 +54,15 @@
 //!     `rknpu_job_subcore_commit` disassembly the way it originally was.
 //!     That source is also where the `regcmd_count * 2` below comes from
 //!     -- see the comment at the `drm_rocket_task` construction.
-//!   - STILL UNCONFIRMED, flagged inline: feature_grains and
-//!     CBUF_CON1.data_entries (both shape-dependent; the real conv.rknn
-//!     example's values don't cleanly scale down to our much smaller test
-//!     tensor, so no formula yet). CBUF_CON0's weight_bank/data_bank *are*
-//!     now formula-derived (see the comment at that register) rather than
+//!   - feature_grains and CBUF_CON1.data_entries were both flagged
+//!     STILL UNCONFIRMED for a long time (the real conv.rknn example's
+//!     values didn't cleanly scale down to our much smaller test tensor).
+//!     Both are now formula-derived from Mesa's rkt_regcmd.c/rkt_task.c
+//!     instead: data_entries = width*height for the input_channels_real==1
+//!     case (matches what this file already had); feature_grains =
+//!     50 + stride_y + 1 (this file previously had a bare guess of 1,
+//!     wildly off). CBUF_CON0's weight_bank/data_bank *are* also
+//!     formula-derived (see the comment at that register) rather than
 //!     guessed -- weight_bank was wrong (1, should be 2) until corrected
 //!     by running that formula, a plausible cause of hangs since it under-
 //!     allocates CNA's weight cache. out_cvt_shift (the real example only confirms
@@ -172,15 +176,19 @@ fn main() {
 
         // CONV_CON2 (0x1010) -- what the old code mislabeled CONV_CON0 and
         // zeroed. kernel_group=0 confirmed (real decode showed 0, not the
-        // "1 group = literal 1" guess this had before). feature_grains is
-        // still an open guess -- the real decode used 36 for a 32x32x8
-        // input, which doesn't cleanly divide down to anything obvious for
-        // our 4x4x1 case, so this stays at the previous literal-reading
-        // guess of 1 pending a real derivation.
+        // "1 group = literal 1" guess this had before). feature_grains was
+        // an open guess (literal 1) for a long time -- Mesa's rkt_regcmd.c
+        // has the real formula (its own comment calls it "Magic: Seems to
+        // pass the most tests", so even Mesa doesn't fully explain it, but
+        // it's what every real submission through this driver actually
+        // uses): `50 + stride_y + 1`. For our stride_y=1, that's 52, wildly
+        // different from the previous guess of 1 -- this was sitting
+        // unapplied in already-read source for a while before being
+        // connected back to this field.
         cmds.push(
             Register::<CnaConvCon2>::new()
                 .cmd_fifo_srst(Bits::new(1)) // reset CNA's command fifo before this task
-                .feature_grains(Bits::new(1))
+                .feature_grains(Bits::new(50 + 1 + 1))
                 .kernel_group(Bits::new(0))
                 .build(),
         );
