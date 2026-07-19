@@ -23,6 +23,7 @@ use iree_rocket_hal::rocket::registers::*;
 use nix::{
     ioctl_readwrite,
     sys::mman::{MapFlags, ProtFlags, mmap},
+    time::{ClockId, clock_gettime},
 };
 
 // 0x40 + 0 = 0x40
@@ -212,10 +213,22 @@ fn main() {
         println!("Submitting...");
         rocket_submit(fd, &mut submit).expect("Submit failed");
 
+        // rocket_gem.c's rocket_ioctl_prep_bo() converts timeout_ns via
+        // drm_timeout_abs_to_jiffies() -- that takes an ABSOLUTE
+        // CLOCK_MONOTONIC deadline, not a relative duration (standard DRM
+        // wait-ioctl convention; see rkt-basic.rs / NOTES.md for the full
+        // story). `i64::MAX` here happened to avoid the "always already
+        // expired" symptom that bit rkt-basic.rs/rkt-simple-job.rs (it's
+        // so far in the future the kernel's own overflow clamp treats it
+        // as "wait basically forever" instead), but it's still not a real
+        // timeout -- a job that never completes would hang this call
+        // indefinitely instead of erroring out.
+        let now = clock_gettime(ClockId::CLOCK_MONOTONIC).expect("clock_gettime failed");
+        let now_ns = now.tv_sec() as u64 * 1_000_000_000 + now.tv_nsec() as u64;
         let mut prep = drm_rocket_prep_bo {
             handle: buf_c.handle,
             reserved: 0,
-            timeout_ns: i64::MAX,
+            timeout_ns: (now_ns + 2_000_000_000) as i64, // 2s from now, as an absolute deadline
         };
         rocket_prep_bo(fd, &mut prep).expect("Wait failed");
 

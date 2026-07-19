@@ -28,8 +28,23 @@ use iree_rocket_hal::rocket::{
 use nix::{
     ioctl_readwrite,
     sys::mman::{MapFlags, ProtFlags, mmap},
+    time::{ClockId, clock_gettime},
 };
 use std::{fs::OpenOptions, marker::PhantomData, num::NonZeroUsize, os::fd::AsRawFd};
+
+// rocket_gem.c's rocket_ioctl_prep_bo() converts timeout_ns via
+// drm_timeout_abs_to_jiffies() -- that takes an ABSOLUTE CLOCK_MONOTONIC
+// deadline, not a relative duration (standard DRM wait-ioctl convention;
+// see rkt-basic.rs / NOTES.md for the full story). A bare literal like
+// `1_000_000_000` is interpreted as "1 second after the monotonic clock's
+// zero point", always already in the past on a booted system, so the wait
+// returns immediately with -EBUSY regardless of whether the job actually
+// completes.
+fn abs_timeout_ns(relative_ns: u64) -> i64 {
+    let now = clock_gettime(ClockId::CLOCK_MONOTONIC).expect("clock_gettime failed");
+    let now_ns = now.tv_sec() as u64 * 1_000_000_000 + now.tv_nsec() as u64;
+    (now_ns + relative_ns) as i64
+}
 
 fn with_cpu_access<F>(fd: i32, buf: &Buffer, label: &str, mut f: F)
 where
@@ -38,7 +53,7 @@ where
     let mut prep = drm_rocket_prep_bo {
         handle: buf.handle,
         reserved: 0,
-        timeout_ns: 1_000_000_000,
+        timeout_ns: abs_timeout_ns(1_000_000_000),
     };
 
     println!("PREP_BO ({})", label);
@@ -251,7 +266,7 @@ fn main() {
         let mut prep_out = drm_rocket_prep_bo {
             handle: buf_c.handle,
             reserved: 0,
-            timeout_ns: 2_000_000_000,
+            timeout_ns: abs_timeout_ns(2_000_000_000),
         };
         rocket_prep_bo(fd, &mut prep_out).expect("Job timeout or NPU error (EBUSY)");
 
