@@ -248,9 +248,18 @@ pub fn build_calculated_conv_cmd(op: &ConvOp) -> Vec<RegCmd> {
             .build(),
     );
 
-    // DCOMP: Decompression control (Usually bypassed/default for raw weights)
+    // DCOMP: Decompression control -- buf_w holds raw, uncompressed weight
+    // bytes, so this must actually bypass (the comment always said so, the
+    // code never did): with wt_dec_bypass left at 0 and DCOMP_REGNUM=0,
+    // decompression was active but had no descriptor, most likely
+    // presenting CNA with an effective weight of zero -- consistent with
+    // getting a clean 0 result instead of a timeout or garbage.
     cmds.push(Register::<CnaDcompRegnum>::new().build());
-    cmds.push(Register::<CnaDcompCtrl>::new().build());
+    cmds.push(
+        Register::<CnaDcompCtrl>::new()
+            .wt_dec_bypass(Bits::new(1))
+            .build(),
+    );
 
     // DATA_SIZE: Input Dimensions
     cmds.push(
@@ -348,9 +357,13 @@ pub fn build_calculated_conv_cmd(op: &ConvOp) -> Vec<RegCmd> {
             .height(Bits::new(op.output_h - 1))
             .build(),
     );
+    // orig_channel is the direct (non-N-1) real channel count -- a third
+    // encoding variant living in the same register as channel's N-1;
+    // rkt-simple-job.rs sets both, this was missing it (defaulted to 0).
     cmds.push(
         Register::<DpuDataCubeChannel>::new()
             .channel(Bits::new(op.output_c - 1))
+            .orig_channel(Bits::new(op.output_c))
             .build(),
     );
 
@@ -360,6 +373,13 @@ pub fn build_calculated_conv_cmd(op: &ConvOp) -> Vec<RegCmd> {
             .dst_surf_stride(Bits::new(op.output_w))
             .build(),
     );
+
+    // Bias-scale / batchnorm bypass -- previously left unwritten entirely
+    // (only EW was bypassed), leaving these stages in an unconfirmed
+    // power-on-reset state rather than a deliberate one. Both siblings
+    // (rkt-basic.rs, rkt-simple-job.rs) bypass both explicitly.
+    cmds.push(Register::<DpuBsCfg>::new().bs_bypass(Bits::new(1)).build());
+    cmds.push(Register::<DpuBnCfg>::new().bn_bypass(Bits::new(1)).build());
 
     // Element-Wise / Post-Process Bypass (We just want raw multiplication)
     cmds.push(
