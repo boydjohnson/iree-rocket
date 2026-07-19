@@ -575,6 +575,17 @@ fn main() {
             PC_OPERATION_ENABLE_RESERVED_0(14) | PC_OPERATION_ENABLE_OP_EN(1),
         ));
 
+        // Pad to an even entry count. The kernel's PC_REGISTER_AMOUNTS
+        // formula ((regcmd_count + 1) / 2 - 1) implies PC reads regcmd
+        // entries in pairs -- for an odd count, integer division makes it
+        // read one word past our populated data. Still within the same
+        // (zeroed, page-granular) GEM allocation, so almost certainly
+        // harmless, and our real kick entry is always within the valid
+        // range either way -- but free to eliminate as a variable.
+        if cmds.len() % 2 != 0 {
+            cmds.push(RegCmd::new_raw(0x0));
+        }
+
         // Printed to stderr before touching hardware, so it's visible even
         // if SUBMIT/PREP_BO hangs afterward. Compare against the conv.rknn
         // regcmd decode (rknpu-spelunking/NOTES.md) register-by-register.
