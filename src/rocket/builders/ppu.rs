@@ -10,7 +10,7 @@ use crate::rocket::{
 pub struct PpuSStatus;
 
 impl RegisterMeta for PpuSStatus {
-    const DOMAIN: u32 = target_PPU;
+    const DOMAIN: u32 = crate::rocket::builders::DOMAIN_PPU;
     const OFFSET: u32 = REG_PPU_S_STATUS;
 }
 
@@ -35,7 +35,7 @@ impl Register<PpuSStatus> {
 pub struct PpuSPointer;
 
 impl RegisterMeta for PpuSPointer {
-    const DOMAIN: u32 = target_PPU;
+    const DOMAIN: u32 = crate::rocket::builders::DOMAIN_PPU;
     const OFFSET: u32 = REG_PPU_S_POINTER;
 }
 
@@ -90,7 +90,7 @@ impl Register<PpuSPointer> {
 pub struct PpuOperationEnable;
 
 impl RegisterMeta for PpuOperationEnable {
-    const DOMAIN: u32 = target_PPU;
+    const DOMAIN: u32 = crate::rocket::builders::DOMAIN_PPU;
     const OFFSET: u32 = REG_PPU_OPERATION_ENABLE;
 }
 
@@ -109,7 +109,7 @@ impl Register<PpuOperationEnable> {
 pub struct PpuDataCubeInWidth;
 
 impl RegisterMeta for PpuDataCubeInWidth {
-    const DOMAIN: u32 = target_PPU;
+    const DOMAIN: u32 = crate::rocket::builders::DOMAIN_PPU;
     const OFFSET: u32 = REG_PPU_DATA_CUBE_IN_WIDTH;
 }
 
@@ -128,7 +128,7 @@ impl Register<PpuDataCubeInWidth> {
 pub struct PpuDataCubeInHeight;
 
 impl RegisterMeta for PpuDataCubeInHeight {
-    const DOMAIN: u32 = target_PPU;
+    const DOMAIN: u32 = crate::rocket::builders::DOMAIN_PPU;
     const OFFSET: u32 = REG_PPU_DATA_CUBE_IN_HEIGHT;
 }
 
@@ -147,7 +147,7 @@ impl Register<PpuDataCubeInHeight> {
 pub struct PpuDataCubeInChannel;
 
 impl RegisterMeta for PpuDataCubeInChannel {
-    const DOMAIN: u32 = target_PPU;
+    const DOMAIN: u32 = crate::rocket::builders::DOMAIN_PPU;
     const OFFSET: u32 = REG_PPU_DATA_CUBE_IN_CHANNEL;
 }
 
@@ -166,7 +166,7 @@ impl Register<PpuDataCubeInChannel> {
 pub struct PpuDataCubeOutWidth;
 
 impl RegisterMeta for PpuDataCubeOutWidth {
-    const DOMAIN: u32 = target_PPU;
+    const DOMAIN: u32 = crate::rocket::builders::DOMAIN_PPU;
     const OFFSET: u32 = REG_PPU_DATA_CUBE_OUT_WIDTH;
 }
 
@@ -185,7 +185,7 @@ impl Register<PpuDataCubeOutWidth> {
 pub struct PpuDataCubeOutHeight;
 
 impl RegisterMeta for PpuDataCubeOutHeight {
-    const DOMAIN: u32 = target_PPU;
+    const DOMAIN: u32 = crate::rocket::builders::DOMAIN_PPU;
     const OFFSET: u32 = REG_PPU_DATA_CUBE_OUT_HEIGHT;
 }
 
@@ -204,7 +204,7 @@ impl Register<PpuDataCubeOutHeight> {
 pub struct PpuDataCubeOutChannel;
 
 impl RegisterMeta for PpuDataCubeOutChannel {
-    const DOMAIN: u32 = target_PPU;
+    const DOMAIN: u32 = crate::rocket::builders::DOMAIN_PPU;
     const OFFSET: u32 = REG_PPU_DATA_CUBE_OUT_CHANNEL;
 }
 
@@ -223,7 +223,7 @@ impl Register<PpuDataCubeOutChannel> {
 pub struct PpuOperationModeCfg;
 
 impl RegisterMeta for PpuOperationModeCfg {
-    const DOMAIN: u32 = target_PPU;
+    const DOMAIN: u32 = crate::rocket::builders::DOMAIN_PPU;
     const OFFSET: u32 = REG_PPU_OPERATION_MODE_CFG;
 }
 
@@ -266,7 +266,7 @@ impl Register<PpuOperationModeCfg> {
 pub struct PpuPoolingKernelCfg;
 
 impl RegisterMeta for PpuPoolingKernelCfg {
-    const DOMAIN: u32 = target_PPU;
+    const DOMAIN: u32 = crate::rocket::builders::DOMAIN_PPU;
     const OFFSET: u32 = REG_PPU_POOLING_KERNEL_CFG;
 }
 
@@ -303,7 +303,7 @@ impl Register<PpuPoolingKernelCfg> {
 pub struct PpuRecipKernelWidth;
 
 impl RegisterMeta for PpuRecipKernelWidth {
-    const DOMAIN: u32 = target_PPU;
+    const DOMAIN: u32 = crate::rocket::builders::DOMAIN_PPU;
     const OFFSET: u32 = REG_PPU_RECIP_KERNEL_WIDTH;
 }
 
@@ -322,7 +322,7 @@ impl Register<PpuRecipKernelWidth> {
 pub struct PpuRecipKernelHeight;
 
 impl RegisterMeta for PpuRecipKernelHeight {
-    const DOMAIN: u32 = target_PPU;
+    const DOMAIN: u32 = crate::rocket::builders::DOMAIN_PPU;
     const OFFSET: u32 = REG_PPU_RECIP_KERNEL_HEIGHT;
 }
 
@@ -341,7 +341,7 @@ impl Register<PpuRecipKernelHeight> {
 pub struct PpuPoolingPaddingCfg;
 
 impl RegisterMeta for PpuPoolingPaddingCfg {
-    const DOMAIN: u32 = target_PPU;
+    const DOMAIN: u32 = crate::rocket::builders::DOMAIN_PPU;
     const OFFSET: u32 = REG_PPU_POOLING_PADDING_CFG;
 }
 
@@ -378,7 +378,7 @@ impl Register<PpuPoolingPaddingCfg> {
 pub struct PpuPaddingValue1Cfg;
 
 impl RegisterMeta for PpuPaddingValue1Cfg {
-    const DOMAIN: u32 = target_PPU;
+    const DOMAIN: u32 = crate::rocket::builders::DOMAIN_PPU;
     const OFFSET: u32 = REG_PPU_PADDING_VALUE_1_CFG;
 }
 
@@ -397,7 +397,7 @@ impl Register<PpuPaddingValue1Cfg> {
 pub struct PpuPaddingValue2Cfg;
 
 impl RegisterMeta for PpuPaddingValue2Cfg {
-    const DOMAIN: u32 = target_PPU;
+    const DOMAIN: u32 = crate::rocket::builders::DOMAIN_PPU;
     const OFFSET: u32 = REG_PPU_PADDING_VALUE_2_CFG;
 }
 
@@ -416,7 +416,7 @@ impl Register<PpuPaddingValue2Cfg> {
 pub struct PpuDstBaseAddr;
 
 impl RegisterMeta for PpuDstBaseAddr {
-    const DOMAIN: u32 = target_PPU;
+    const DOMAIN: u32 = crate::rocket::builders::DOMAIN_PPU;
     const OFFSET: u32 = REG_PPU_DST_BASE_ADDR;
 }
 
@@ -435,7 +435,7 @@ impl Register<PpuDstBaseAddr> {
 pub struct PpuDstSurfStride;
 
 impl RegisterMeta for PpuDstSurfStride {
-    const DOMAIN: u32 = target_PPU;
+    const DOMAIN: u32 = crate::rocket::builders::DOMAIN_PPU;
     const OFFSET: u32 = REG_PPU_DST_SURF_STRIDE;
 }
 
@@ -454,7 +454,7 @@ impl Register<PpuDstSurfStride> {
 pub struct PpuDataFormat;
 
 impl RegisterMeta for PpuDataFormat {
-    const DOMAIN: u32 = target_PPU;
+    const DOMAIN: u32 = crate::rocket::builders::DOMAIN_PPU;
     const OFFSET: u32 = REG_PPU_DATA_FORMAT;
 }
 
@@ -485,7 +485,7 @@ impl Register<PpuDataFormat> {
 pub struct PpuMiscCtrl;
 
 impl RegisterMeta for PpuMiscCtrl {
-    const DOMAIN: u32 = target_PPU;
+    const DOMAIN: u32 = crate::rocket::builders::DOMAIN_PPU;
     const OFFSET: u32 = REG_PPU_MISC_CTRL;
 }
 

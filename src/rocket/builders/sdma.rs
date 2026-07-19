@@ -3,6 +3,12 @@ use crate::rocket::{
     registers::*,
 };
 
+// target_SDMA (0x20000) doesn't fit in the 16-bit domain field the
+// RegCmd packing scheme uses (bits 48-63) -- same problem as
+// DOMAIN_GLOBAL, see builders.rs. Unfixed here since nothing currently
+// uses this module; flagged so it doesn't look silently correct if that
+// changes.
+
 // ========================================================================
 // CFG_OUTSTANDING (0x9000)
 // ========================================================================

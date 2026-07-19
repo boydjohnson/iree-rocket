@@ -1,8 +1,11 @@
 use std::{ffi::c_char, fs::File, mem::MaybeUninit, os::fd::AsRawFd};
 
-use iree_rocket_hal::rocket::api::drm_version;
+use iree_rocket_hal::rocket::api::{DRM_IOCTL_BASE, drm_version};
 
-nix::ioctl_readwrite!(drm_get_version, b'd', 0x00, drm_version);
+// nr=0x00 is DRM_IOCTL_VERSION, a generic core-DRM ioctl (not rocket-
+// specific), so there's no rocket-side named constant for it -- unlike
+// DRM_COMMAND_BASE + DRM_ROCKET_* used elsewhere in this crate.
+nix::ioctl_readwrite!(drm_get_version, DRM_IOCTL_BASE, 0x00, drm_version);
 
 fn main() {
     println!("Opening /dev/accel/accel0...");

@@ -10,7 +10,7 @@ use crate::rocket::{
 pub struct PpuRdmaSStatus;
 
 impl RegisterMeta for PpuRdmaSStatus {
-    const DOMAIN: u32 = target_PPU_RDMA;
+    const DOMAIN: u32 = crate::rocket::builders::DOMAIN_PPU_RDMA;
     const OFFSET: u32 = REG_PPU_RDMA_RDMA_S_STATUS;
 }
 
@@ -35,7 +35,7 @@ impl Register<PpuRdmaSStatus> {
 pub struct PpuRdmaSPointer;
 
 impl RegisterMeta for PpuRdmaSPointer {
-    const DOMAIN: u32 = target_PPU_RDMA;
+    const DOMAIN: u32 = crate::rocket::builders::DOMAIN_PPU_RDMA;
     const OFFSET: u32 = REG_PPU_RDMA_RDMA_S_POINTER;
 }
 
@@ -90,7 +90,7 @@ impl Register<PpuRdmaSPointer> {
 pub struct PpuRdmaOperationEnable;
 
 impl RegisterMeta for PpuRdmaOperationEnable {
-    const DOMAIN: u32 = target_PPU_RDMA;
+    const DOMAIN: u32 = crate::rocket::builders::DOMAIN_PPU_RDMA;
     const OFFSET: u32 = REG_PPU_RDMA_RDMA_OPERATION_ENABLE;
 }
 
@@ -109,7 +109,7 @@ impl Register<PpuRdmaOperationEnable> {
 pub struct PpuRdmaCubeInWidth;
 
 impl RegisterMeta for PpuRdmaCubeInWidth {
-    const DOMAIN: u32 = target_PPU_RDMA;
+    const DOMAIN: u32 = crate::rocket::builders::DOMAIN_PPU_RDMA;
     const OFFSET: u32 = REG_PPU_RDMA_RDMA_CUBE_IN_WIDTH;
 }
 
@@ -128,7 +128,7 @@ impl Register<PpuRdmaCubeInWidth> {
 pub struct PpuRdmaCubeInHeight;
 
 impl RegisterMeta for PpuRdmaCubeInHeight {
-    const DOMAIN: u32 = target_PPU_RDMA;
+    const DOMAIN: u32 = crate::rocket::builders::DOMAIN_PPU_RDMA;
     const OFFSET: u32 = REG_PPU_RDMA_RDMA_CUBE_IN_HEIGHT;
 }
 
@@ -147,7 +147,7 @@ impl Register<PpuRdmaCubeInHeight> {
 pub struct PpuRdmaCubeInChannel;
 
 impl RegisterMeta for PpuRdmaCubeInChannel {
-    const DOMAIN: u32 = target_PPU_RDMA;
+    const DOMAIN: u32 = crate::rocket::builders::DOMAIN_PPU_RDMA;
     const OFFSET: u32 = REG_PPU_RDMA_RDMA_CUBE_IN_CHANNEL;
 }
 
@@ -167,7 +167,7 @@ impl Register<PpuRdmaCubeInChannel> {
 pub struct PpuRdmaSrcBaseAddr;
 
 impl RegisterMeta for PpuRdmaSrcBaseAddr {
-    const DOMAIN: u32 = target_PPU_RDMA;
+    const DOMAIN: u32 = crate::rocket::builders::DOMAIN_PPU_RDMA;
     const OFFSET: u32 = REG_PPU_RDMA_RDMA_SRC_BASE_ADDR;
 }
 
@@ -186,7 +186,7 @@ impl Register<PpuRdmaSrcBaseAddr> {
 pub struct PpuRdmaSrcLineStride;
 
 impl RegisterMeta for PpuRdmaSrcLineStride {
-    const DOMAIN: u32 = target_PPU_RDMA;
+    const DOMAIN: u32 = crate::rocket::builders::DOMAIN_PPU_RDMA;
     const OFFSET: u32 = REG_PPU_RDMA_RDMA_SRC_LINE_STRIDE;
 }
 
@@ -206,7 +206,7 @@ impl Register<PpuRdmaSrcLineStride> {
 pub struct PpuRdmaSrcSurfStride;
 
 impl RegisterMeta for PpuRdmaSrcSurfStride {
-    const DOMAIN: u32 = target_PPU_RDMA;
+    const DOMAIN: u32 = crate::rocket::builders::DOMAIN_PPU_RDMA;
     const OFFSET: u32 = REG_PPU_RDMA_RDMA_SRC_SURF_STRIDE;
 }
 
@@ -226,7 +226,7 @@ impl Register<PpuRdmaSrcSurfStride> {
 pub struct PpuRdmaDataFormat;
 
 impl RegisterMeta for PpuRdmaDataFormat {
-    const DOMAIN: u32 = target_PPU_RDMA;
+    const DOMAIN: u32 = crate::rocket::builders::DOMAIN_PPU_RDMA;
     const OFFSET: u32 = REG_PPU_RDMA_RDMA_DATA_FORMAT;
 }
 

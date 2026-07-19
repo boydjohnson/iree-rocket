@@ -1,4 +1,6 @@
-use iree_rocket_hal::rocket::api::drm_rocket_create_bo;
+use iree_rocket_hal::rocket::api::{
+    DRM_COMMAND_BASE, DRM_IOCTL_BASE, DRM_ROCKET_CREATE_BO, drm_rocket_create_bo,
+};
 use nix::sys::mman::{MapFlags, ProtFlags, mmap};
 use std::{
     fs::OpenOptions,
@@ -10,9 +12,13 @@ use std::{
     ptr,
 };
 
-// 2. The IOCTL
-// Base 'd' (0x64), Index 0x40 (DRM_COMMAND_BASE + 0)
-nix::ioctl_readwrite!(rocket_create_bo, b'd', 0x40, drm_rocket_create_bo);
+// Base 'd' (0x64), Index 0x40 (DRM_COMMAND_BASE + DRM_ROCKET_CREATE_BO)
+nix::ioctl_readwrite!(
+    rocket_create_bo,
+    DRM_IOCTL_BASE,
+    DRM_COMMAND_BASE + DRM_ROCKET_CREATE_BO,
+    drm_rocket_create_bo
+);
 
 fn main() {
     println!("--- Level 2: Allocation & Mapping ---");

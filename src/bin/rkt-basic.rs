@@ -318,9 +318,11 @@ fn main() {
                 .dataout_height(Bits::new(OUT_HEIGHT))
                 .build(),
         );
+        // dataout_channel is N-1, not the direct count -- see the
+        // DpuDataCubeWidth/Height/Channel comment below, same finding.
         cmds.push(
             Register::<CoreDataoutSize1>::new()
-                .dataout_channel(Bits::new(OUT_CHANNELS))
+                .dataout_channel(Bits::new(OUT_CHANNELS - 1))
                 .build(),
         );
         // clip_truncate=0: no extra right-shift when narrowing the MAC
@@ -362,19 +364,30 @@ fn main() {
                 .proc_precision(Bits::new(2))
                 .build(),
         );
+        // DPU_DATA_CUBE_WIDTH/HEIGHT and CHANNEL's own `channel` subfield
+        // are all N-1, not the direct count -- this was wrong in the
+        // previous revision (used the direct value) and is the most
+        // likely reason that version still hit EBUSY/timeout even after
+        // the domain-tag and precision-field fixes. Found by cross-
+        // referencing rkt-job.rs/rkt-simple-job.rs (both already used
+        // N-1 here) against the conv.rknn decode, which confirms it:
+        // DPU_DATA_CUBE_WIDTH read back as 0x1f=31 for a real width of
+        // 32. `orig_channel` is NOT N-1 though -- rkt-simple-job.rs uses
+        // the direct count for it, a different encoding for two
+        // subfields of the same register.
         cmds.push(
             Register::<DpuDataCubeWidth>::new()
-                .width(Bits::new(OUT_WIDTH))
+                .width(Bits::new(OUT_WIDTH - 1))
                 .build(),
         );
         cmds.push(
             Register::<DpuDataCubeHeight>::new()
-                .height(Bits::new(OUT_HEIGHT))
+                .height(Bits::new(OUT_HEIGHT - 1))
                 .build(),
         );
         cmds.push(
             Register::<DpuDataCubeChannel>::new()
-                .channel(Bits::new(OUT_CHANNELS))
+                .channel(Bits::new(OUT_CHANNELS - 1))
                 .orig_channel(Bits::new(OUT_CHANNELS))
                 .build(),
         );
