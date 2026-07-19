@@ -11,13 +11,43 @@ pub mod ppu;
 pub mod ppu_rdma;
 pub mod sdma;
 
-// Domain IDs for the 64-bit RegCmd packing (Bits 48-55)
-// These are specific to the Rocket NPU hardware implementation.
-pub const DOMAIN_CNA: u32 = 0x01;
-pub const DOMAIN_PC: u32 = 0x02;
-pub const DOMAIN_CORE: u32 = 0x11;
-pub const DOMAIN_DPU: u32 = 0x41;
-pub const DOMAIN_GLOBAL: u32 = 0x81;
+// Domain IDs for the 64-bit RegCmd packing (bits 48-63).
+//
+// These used to be hand-rolled (0x01/0x02/0x11/0x41/0x81) and did NOT
+// match Mesa's own registers.xml `target` enum (PC=0x100, CNA=0x200,
+// CORE=0x800, DPU=0x1000, DPU_RDMA=0x2000, PPU=0x4000, PPU_RDMA=0x8000,
+// DDMA=0x10000, SDMA=0x20000, GLOBAL=0x40000 -- see
+// gitlab.freedesktop.org/mesa/mesa, src/gallium/drivers/rocket/registers.xml).
+// dpu_rdma.rs/ppu.rs/ppu_rdma.rs/ddma.rs/sdma.rs already reference the
+// bindgen-generated `target_*` constants from that same enum (via
+// `rkt_registers.h` -> `registers.rs`'s `include!`) directly and were
+// therefore already correct; cna.rs/core.rs/dpu.rs/pc.rs/global.rs used
+// these wrong constants instead -- an inconsistency introduced when the
+// later files switched to using the generated constants but the earlier
+// ones (which is everything rkt-basic.rs actually exercises) were never
+// updated to match.
+//
+// The `| 1` matches what a real compiled regcmd program (decoded out of
+// conv.rknn -- see rknpu-spelunking/NOTES.md) actually puts in this field
+// for every domain that was checkable: CNA/PC/CORE/DPU/DPU_RDMA/PPU/
+// PPU_RDMA all showed up as (target value | 1), never the bare target
+// value. Mesa's target enum values are conspicuously all even, which is
+// consistent with bit 0 being a separate flag outside the domain
+// selector proper; unconfirmed whether mainline's kernel driver actually
+// requires it or just ignores it, but matching known-working vendor
+// output is the lower-risk choice either way.
+//
+// DOMAIN_GLOBAL is NOT fixed by this -- target_GLOBAL is 0x40000, which
+// doesn't fit in a 16-bit domain field at all (`<< 48` on a value that
+// big overflows/truncates in a u64 RegCmd). The old 0x81 was already
+// wrong under the corrected scheme too, and we don't have a confirmed
+// replacement -- GLOBAL_OPERATION_ENABLE's real wire encoding is still
+// an open question (see NOTES.md). Left unchanged, still flagged wrong.
+pub const DOMAIN_CNA: u32 = crate::rocket::registers::target_CNA | 1;
+pub const DOMAIN_PC: u32 = crate::rocket::registers::target_PC | 1;
+pub const DOMAIN_CORE: u32 = crate::rocket::registers::target_CORE | 1;
+pub const DOMAIN_DPU: u32 = crate::rocket::registers::target_DPU | 1;
+pub const DOMAIN_GLOBAL: u32 = 0x81; // UNCONFIRMED -- see comment above
 
 #[derive(Clone, Copy)]
 pub struct Register<R> {

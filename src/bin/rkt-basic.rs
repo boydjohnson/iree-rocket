@@ -16,6 +16,18 @@
 //! left at 0 (ping-pong pointers, reserved bits, DMA burst lengths) are
 //! left unset deliberately, matching hardware POR-style defaults.
 //!
+//! Also worth knowing: `builders.rs`'s `DOMAIN_CNA`/`DOMAIN_PC`/
+//! `DOMAIN_CORE`/`DOMAIN_DPU` (which every register in this file's
+//! `RegCmd`s is tagged with, via each type's `RegisterMeta::DOMAIN`) were
+//! wrong until just before this revision -- they didn't match Mesa's own
+//! registers.xml `target` enum, even though other builder files in this
+//! same crate (dpu_rdma.rs, ppu.rs, ...) already used the correct,
+//! bindgen-generated equivalents. See `builders.rs` and NOTES.md for the
+//! full story. This was arguably a bigger deal than any single field
+//! value guessed at below -- a wrong domain tag can misdirect (or fail
+//! to reach) the intended hardware engine regardless of how correct the
+//! register's own value is.
+//!
 //! Confidence levels. Most of the enum/mode fields below were validated by
 //! decoding a real regcmd program out of a compiled conv.rknn (see
 //! NOTES.md in rknpu-spelunking for the byte-offset scan + field decode) --
