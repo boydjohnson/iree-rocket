@@ -22,8 +22,8 @@ pub fn decode(cmd: &RegCmd) -> (u32, u32, u32) {
 
 pub fn domain_name(domain: u32) -> &'static str {
     use crate::rocket::builders::{
-        DOMAIN_CNA, DOMAIN_CORE, DOMAIN_DPU, DOMAIN_DPU_RDMA, DOMAIN_GLOBAL, DOMAIN_PC,
-        DOMAIN_PPU, DOMAIN_PPU_RDMA,
+        DOMAIN_CNA, DOMAIN_CORE, DOMAIN_DPU, DOMAIN_DPU_RDMA, DOMAIN_GLOBAL, DOMAIN_PC, DOMAIN_PPU,
+        DOMAIN_PPU_RDMA,
     };
     match domain {
         d if d == DOMAIN_CNA => "CNA",

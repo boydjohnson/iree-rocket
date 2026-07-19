@@ -51,10 +51,14 @@
 //!     stream -- see the comment at the kick sequence below for why,
 //!     cross-checked against the vendor kernel driver's own
 //!     `rknpu_job_subcore_commit` disassembly.
-//!   - STILL UNCONFIRMED, flagged inline: feature_grains and cache-buffer
-//!     bank allocation (both shape-dependent; the real example's values
-//!     don't cleanly scale down to our much smaller test tensor, so no
-//!     formula yet), and out_cvt_shift (the real example only confirms
+//!   - STILL UNCONFIRMED, flagged inline: feature_grains and
+//!     CBUF_CON1.data_entries (both shape-dependent; the real conv.rknn
+//!     example's values don't cleanly scale down to our much smaller test
+//!     tensor, so no formula yet). CBUF_CON0's weight_bank/data_bank *are*
+//!     now formula-derived (see the comment at that register) rather than
+//!     guessed -- weight_bank was wrong (1, should be 2) until corrected
+//!     by running that formula, a plausible cause of hangs since it under-
+//!     allocates CNA's weight cache. out_cvt_shift (the real example only confirms
 //!     scale=1, not shift=0 -- DPU_OUT_CVT_SCALE also has an
 //!     FP32TOFP16_EN bit the current builder doesn't expose at all, a gap
 //!     worth fixing in builders/dpu.rs separately).
@@ -230,12 +234,23 @@ fn main() {
                 .build(),
         );
 
-        // CBUF_CON0/1: internal SRAM cache-buffer bank allocation. 1 bank
-        // each is the smallest legal allocation and this tensor is tiny;
-        // exact bank-count semantics unconfirmed.
+        // CBUF_CON0/1: internal SRAM cache-buffer bank allocation. These
+        // were both hardcoded to 1 (smallest legal allocation) as an
+        // unconfirmed guess. rkt-job.rs separately ports a real formula
+        // for this (ConvTaskConfig::calculate, constants named after
+        // rkt_ml.h) rather than guessing -- running that formula for this
+        // file's actual 4x4x1 shape gives data_bank=1 (matches) but
+        // weight_bank=2 (did NOT match -- this file was under-allocating
+        // CNA's weight cache by one bank). Formula, for reference:
+        //   w_bytes = weights_w * weights_h * in_c * bpe (* out_c if not
+        //             depthwise)
+        //   w_entries = ceil(w_bytes / CBUF_ENTRY_SIZE)      # 128
+        //   weight_bank = ceil(w_entries / CBUF_ENTRIES_PER_BANK) + 1  # 256
+        // For our 1x1x1x1 int8 weight: w_bytes=1, w_entries=1,
+        // weight_bank=ceil(1/256)+1=2.
         cmds.push(
             Register::<CnaCbufCon0>::new()
-                .weight_bank(Bits::new(1))
+                .weight_bank(Bits::new(2))
                 .data_bank(Bits::new(1))
                 .build(),
         );
@@ -478,8 +493,11 @@ fn main() {
         // regcmd decode (rknpu-spelunking/NOTES.md) register-by-register.
         dump_cmds("rkt-basic", &cmds);
 
-        // Create Command Buffer
-        let cmd_len = 4096;
+        // Create Command Buffer -- sized from the actual cmds vector
+        // (8 bytes per RegCmd) rather than a hardcoded 4096, rounded up to
+        // a page since mmap'd GEM allocations are page-granular anyway.
+        let cmd_bytes = cmds.len() * mem::size_of::<u64>();
+        let cmd_len = cmd_bytes.next_multiple_of(4096);
         let buf_cmd = Buffer::new(fd, cmd_len, &file);
         let cmd_slice = std::slice::from_raw_parts_mut(buf_cmd.host_ptr as *mut u64, cmds.len());
         for (i, c) in cmds.iter().enumerate() {
