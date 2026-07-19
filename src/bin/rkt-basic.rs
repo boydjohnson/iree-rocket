@@ -87,6 +87,10 @@ use iree_rocket_hal::rocket::{
             DpuDataFormat, DpuDstBaseAddr, DpuDstSurfStride, DpuEwCfg, DpuFeatureModeCfg,
             DpuOperationEnable, DpuOutCvtOffset, DpuOutCvtScale, DpuOutCvtShift,
         },
+        dpu_rdma::{
+            DpuRdmaDataCubeChannel, DpuRdmaDataCubeHeight, DpuRdmaDataCubeWidth,
+            DpuRdmaFeatureModeCfg, DpuRdmaOperationEnable,
+        },
         global::GlobalOperationEnable,
         pc::PCOperationEnable,
     },
@@ -458,6 +462,54 @@ fn main() {
         );
 
         // ==================================================================
+        // DPU_RDMA -- required even though nothing about this test needs
+        // it to actually read anything. Missing entirely (like it was in
+        // an earlier draft of this file, and still is in rkt-simple-job.rs)
+        // is the leading suspect for the EBUSY hang: the real, confirmed-
+        // working conv.rknn regcmd decode (NOTES.md) enables CNA+CORE+DPU+
+        // DPU_RDMA together (GLOBAL_OPERATION_ENABLE=0x1d), never just the
+        // first three -- DPU_RDMA is architecturally chained to DPU, and
+        // skipping it plausibly leaves PC's completion/interrupt
+        // aggregation waiting on an engine that was never told to
+        // participate. The specific field values are also non-obvious and
+        // came from that decode, not guesswork: MRDMA_DISABLE=1 (the main
+        // read-DMA path is OFF) in the real, working capture --
+        // rkt-job.rs guesses 0 there (enabled), the opposite of what
+        // real hardware does. Data-cube dims mirror DPU's own (the real
+        // decode's DPU_RDMA dims matched DPU's dims exactly for that
+        // layer).
+        // ==================================================================
+
+        cmds.push(
+            Register::<DpuRdmaDataCubeWidth>::new()
+                .width(Bits::new(OUT_WIDTH - 1))
+                .build(),
+        );
+        cmds.push(
+            Register::<DpuRdmaDataCubeHeight>::new()
+                .height(Bits::new(OUT_HEIGHT - 1))
+                .build(),
+        );
+        cmds.push(
+            Register::<DpuRdmaDataCubeChannel>::new()
+                .channel(Bits::new(OUT_CHANNELS - 1))
+                .build(),
+        );
+        cmds.push(
+            Register::<DpuRdmaFeatureModeCfg>::new()
+                .mrdma_disable(Bits::new(1))
+                .burst_len(Bits::new(15))
+                .proc_precision(Bits::new(2))
+                .in_precision(Bits::new(2))
+                .build(),
+        );
+        cmds.push(
+            Register::<DpuRdmaOperationEnable>::new()
+                .op_en(Bits::new(1))
+                .build(),
+        );
+
+        // ==================================================================
         // Kick: Global master-enable, selecting which engines participate.
         //
         // PC_BASE_ADDRESS / PC_REGISTER_AMOUNTS / PC_TASK_CON deliberately
@@ -484,6 +536,7 @@ fn main() {
                 .cna_op_en(Bits::new(1))
                 .core_op_en(Bits::new(1))
                 .dpu_op_en(Bits::new(1))
+                .dpu_rdma_op_en(Bits::new(1))
                 .build(),
         );
         cmds.push(Register::<PCOperationEnable>::new().op_enable(true).build());
