@@ -13,8 +13,20 @@ fn main() {
     // preprocess standalone against just this vendored subset (base, hal,
     // async, io, schemas) with no CMake-generated config headers involved
     // -- see vendor/IREE_COMMIT.txt for the pinned upstream commit.
+    // iree/async/util/proactor_pool.h isn't pulled in transitively by
+    // iree/hal/api.h (device_create_params_t only needs the opaque
+    // iree_async_proactor_pool_t forward-decl for that), but
+    // device::create needs its real functions (pool_retain/get/release)
+    // to obtain a proactor for semaphore creation -- see semaphore.rs's
+    // module doc comment for why that's needed at all.
     let bindings = bindgen::Builder::default()
         .header(iree_headers.join("iree/hal/api.h").to_str().unwrap())
+        .header(
+            iree_headers
+                .join("iree/async/util/proactor_pool.h")
+                .to_str()
+                .unwrap(),
+        )
         .clang_arg(format!("-I{}", iree_headers.display()))
         .allowlist_file(".*/iree/(hal|base|async|io|schemas)/.*")
         .parse_callbacks(Box::new(bindgen::CargoCallbacks::new()))

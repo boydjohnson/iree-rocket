@@ -8,16 +8,23 @@
 //! comment for what's actually planned to replace its stubs, and
 //! rknpu-spelunking/NOTES.md for the research this crate started from.
 //!
-//! `[lib] crate-type = ["rlib"]` in Cargo.toml, not yet `cdylib` -- turning
-//! this into an actually loadable HAL driver plugin needs IREE's own
-//! compiled runtime libraries (libiree_hal, libiree_base, ...) to exist
-//! and be linkable, which requires building IREE's runtime from source
-//! (CMake/ninja) -- a separate, substantial milestone not done yet. Until
-//! then this only needs to type-check against the vendored headers
-//! (`vendor/iree-headers/`, pinned to the commit in
-//! `vendor/IREE_COMMIT.txt`).
+//! `[lib] crate-type = ["staticlib", "rlib"]` in Cargo.toml -- confirmed
+//! from IREE's own source that `iree_register_external_hal_driver` (CMake)
+//! links a static library target directly, no dlopen involved (see
+//! Cargo.toml's comment for the exact files checked). The `rlib` half is
+//! for `cargo check`/internal use without the CMake side built.
+//!
+//! `iree_hal_rocket_driver_module_register` below is this crate's real,
+//! `#[no_mangle]` C ABI entry point -- what
+//! `IREE_EXTERNAL_ROCKET_HAL_DRIVER_REGISTER` will name once the CMake
+//! wiring exists.
 
-#![allow(non_upper_case_globals, non_camel_case_types, non_snake_case, dead_code)]
+#![allow(
+    non_upper_case_globals,
+    non_camel_case_types,
+    non_snake_case,
+    dead_code
+)]
 
 pub mod bindings {
     include!(concat!(env!("OUT_DIR"), "/bindings.rs"));
@@ -36,3 +43,14 @@ pub mod driver;
 pub mod executable;
 pub mod executable_cache;
 pub mod semaphore;
+
+/// Mirrors `iree_hal_null_driver_module_register()`'s C ABI signature
+/// exactly -- the name a CMake `IREE_EXTERNAL_ROCKET_HAL_DRIVER_REGISTER`
+/// property will reference once the CMake side (see rocket-hal-driver's
+/// task list / rknpu-spelunking/NOTES.md) is wired up.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn iree_hal_rocket_driver_module_register(
+    registry: *mut bindings::iree_hal_driver_registry_t,
+) -> bindings::iree_status_t {
+    unsafe { driver::register(registry) }
+}

@@ -4,17 +4,24 @@ version = "0.1.0"
 edition = "2024"
 
 [lib]
-# cdylib is the eventual target (an IREE host process would dlopen or link
-# this as a HAL driver plugin), but that requires IREE's own compiled
-# runtime libraries (libiree_hal, libiree_base, ...) to actually exist and
-# be linkable -- a separate, substantial build (CMake/ninja) not done yet.
-# rlib only for now so `cargo check`/`cargo build` work standalone against
-# just the vendored headers; add "cdylib" back once IREE's runtime is built
-# and there's a real host to link against.
-crate-type = ["rlib"]
+# staticlib, not cdylib: confirmed directly from IREE's own source
+# (runtime/src/iree/hal/drivers/{CMakeLists.txt,init_external.c.in}) that
+# there is no dlopen-based HAL driver plugin mechanism anywhere in
+# driver_registry.c/init.c -- iree_register_external_hal_driver() is a
+# CMake-time static-link mechanism: it expects a static library target
+# name and a register function resolved at LINK time, then generates
+# init_external.c with a direct `extern` call to it. (The dlopen
+# mechanisms that do exist in IREE are unrelated: CUDA/HIP/Vulkan/AMDGPU
+# drivers dlopen their own vendor SDKs, and iree/hal/local/plugins/
+# system_library_plugin.c dlopens precompiled *kernels* for the CPU
+# driver's executable loader -- neither is HAL driver registration.)
+# rlib kept alongside for `cargo check`/internal testing without needing
+# the CMake side built.
+crate-type = ["staticlib", "rlib"]
 
 [dependencies]
 iree-rocket-hal = { path = "../iree-rocket-hal" }
+nix = { version = "0.30.1", features = ["mman"] }
 
 [build-dependencies]
 bindgen = "0.72.1"

@@ -1,31 +1,78 @@
-//! `iree_hal_allocator_vtable_t`. `allocate_buffer`/`import_buffer` are the
-//! two slots that matter most for this driver -- they're where our
-//! existing `Buffer` (CREATE_BO + mmap, in `iree-rocket-hal`) plugs in.
-//! Virtual-memory reservation (`virtual_memory_*`, `physical_memory_*`)
-//! isn't something the rocket driver needs -- CREATE_BO already gives a
-//! CPU-mapped, DMA-capable allocation directly, no separate reserve/map
-//! step -- so those stay UNIMPLEMENTED indefinitely, not just for now.
+//! `iree_hal_allocator_vtable_t`. `allocate_buffer`/`deallocate_buffer` are
+//! backed by our existing `Buffer` (`iree_rocket_hal::rocket::device`,
+//! `DRM_ROCKET_CREATE_BO` + `mmap`). Virtual-memory reservation
+//! (`virtual_memory_*`, `physical_memory_*`) isn't something the rocket
+//! driver needs -- CREATE_BO already gives a CPU-mapped, DMA-capable
+//! allocation directly, no separate reserve/map step -- so those stay
+//! UNIMPLEMENTED indefinitely, not just for now.
+
+use std::os::fd::AsRawFd;
+
+use iree_rocket_hal::rocket::device;
 
 use crate::bindings::{
     iree_allocator_t, iree_device_size_t, iree_hal_allocator_memory_heap_t,
     iree_hal_allocator_statistics_t, iree_hal_allocator_t, iree_hal_allocator_vtable_t,
-    iree_hal_buffer_compatibility_bits_t_IREE_HAL_BUFFER_COMPATIBILITY_NONE,
-    iree_hal_buffer_compatibility_t, iree_hal_buffer_params_t, iree_hal_buffer_release_callback_t,
-    iree_hal_buffer_t, iree_hal_external_buffer_flags_t, iree_hal_external_buffer_t,
-    iree_hal_external_buffer_type_t, iree_hal_memory_advice_t, iree_hal_memory_protection_t,
-    iree_hal_physical_memory_t, iree_hal_queue_affinity_t, iree_host_size_t,
+    iree_hal_buffer_compatibility_bits_t_IREE_HAL_BUFFER_COMPATIBILITY_ALLOCATABLE,
+    iree_hal_buffer_compatibility_bits_t_IREE_HAL_BUFFER_COMPATIBILITY_QUEUE_DISPATCH,
+    iree_hal_buffer_compatibility_bits_t_IREE_HAL_BUFFER_COMPATIBILITY_QUEUE_TRANSFER,
+    iree_hal_buffer_compatibility_t, iree_hal_buffer_params_t, iree_hal_buffer_placement_t,
+    iree_hal_buffer_release_callback_t, iree_hal_buffer_t, iree_hal_external_buffer_flags_t,
+    iree_hal_external_buffer_t, iree_hal_external_buffer_type_t, iree_hal_memory_advice_t,
+    iree_hal_memory_protection_t, iree_hal_memory_type_bits_t_IREE_HAL_MEMORY_TYPE_OPTIMAL,
+    iree_hal_physical_memory_t, iree_hal_queue_affinity_t, iree_hal_resource_t, iree_host_size_t,
+    iree_status_t,
 };
+use crate::{buffer::RocketBuffer, status};
 
-void_stub!(destroy(allocator: *mut iree_hal_allocator_t));
+/// What every `iree_hal_allocator_t*` this driver hands out actually
+/// points to. `iree_hal_allocator_t` (unlike `iree_hal_buffer_t`) has no
+/// public field definition at all -- its header only forward-declares it
+/// -- so `resource` (not some `iree_hal_allocator_t` we can't even name a
+/// concrete instance of) is the real base-at-offset-0 field, exactly like
+/// every driver's own allocator struct in IREE itself
+/// (`iree_hal_null_allocator_t`, mirrored at
+/// rknpu-spelunking/iree-null-driver-reference/allocator.c).
+#[repr(C)]
+pub struct RocketAllocator {
+    pub resource: iree_hal_resource_t,
+    pub host_allocator: iree_allocator_t,
+    /// The open `/dev/accel/accel0` handle -- kept alive for the
+    /// allocator's lifetime; every `Buffer::new` mmap needs a live `File`.
+    pub file: std::fs::File,
+}
 
-#[allow(unused_variables)]
-pub unsafe extern "C" fn host_allocator(
-    allocator: *const iree_hal_allocator_t,
-) -> iree_allocator_t {
-    iree_allocator_t {
-        self_: std::ptr::null_mut(),
-        ctl: None,
+/// Mirrors `iree_hal_null_allocator_create()`. Not called from anywhere
+/// yet -- `driver::factory_try_create` (still UNIMPLEMENTED) is what will
+/// eventually open `/dev/accel/accel0` and call this.
+pub fn create(file: std::fs::File, host_allocator: iree_allocator_t) -> *mut iree_hal_allocator_t {
+    let allocator = Box::new(RocketAllocator {
+        resource: iree_hal_resource_t {
+            ref_count: 1,
+            vtable: &VTABLE as *const _ as *const std::ffi::c_void,
+        },
+        host_allocator,
+        file,
+    });
+    Box::into_raw(allocator) as *mut iree_hal_allocator_t
+}
+
+unsafe fn cast(allocator: *mut iree_hal_allocator_t) -> *mut RocketAllocator {
+    allocator as *mut RocketAllocator
+}
+
+unsafe extern "C" fn destroy(allocator: *mut iree_hal_allocator_t) {
+    // Dropping the Box drops the embedded File, closing the fd -- the
+    // kernel then cleans up any GEM handles still outstanding (see
+    // buffer::destroy's TODO on explicit GEM_CLOSE).
+    unsafe {
+        drop(Box::from_raw(cast(allocator)));
     }
+}
+
+unsafe extern "C" fn host_allocator(allocator: *const iree_hal_allocator_t) -> iree_allocator_t {
+    let alloc = unsafe { &*cast(allocator as *mut iree_hal_allocator_t) };
+    alloc.host_allocator
 }
 
 status_stub!(trim(allocator: *mut iree_hal_allocator_t) -> iree_status_t);
@@ -43,28 +90,91 @@ status_stub!(query_memory_heaps(
 ) -> iree_status_t);
 
 #[allow(unused_variables)]
-pub unsafe extern "C" fn query_buffer_compatibility(
+unsafe extern "C" fn query_buffer_compatibility(
     allocator: *mut iree_hal_allocator_t,
     params: *mut iree_hal_buffer_params_t,
     allocation_size: *mut iree_device_size_t,
 ) -> iree_hal_buffer_compatibility_t {
-    iree_hal_buffer_compatibility_bits_t_IREE_HAL_BUFFER_COMPATIBILITY_NONE
+    unsafe {
+        // Unified memory (RK3588's NPU shares system DRAM with the CPU,
+        // not discrete VRAM) -- we're always "optimal" regardless of what
+        // was requested, matching null's own pattern for this bit.
+        (*params).type_ &= !iree_hal_memory_type_bits_t_IREE_HAL_MEMORY_TYPE_OPTIMAL;
+        // Guard the 0-byte corner case (real apps can hit this).
+        if *allocation_size == 0 {
+            *allocation_size = 4;
+        }
+    }
+    iree_hal_buffer_compatibility_bits_t_IREE_HAL_BUFFER_COMPATIBILITY_ALLOCATABLE
+        | iree_hal_buffer_compatibility_bits_t_IREE_HAL_BUFFER_COMPATIBILITY_QUEUE_TRANSFER
+        | iree_hal_buffer_compatibility_bits_t_IREE_HAL_BUFFER_COMPATIBILITY_QUEUE_DISPATCH
 }
 
-// TODO: the real one -- allocate via iree-rocket-hal's Buffer::new
-// (DRM_ROCKET_CREATE_BO + mmap) and wrap the result in an iree_hal_buffer_t
-// (see buffer.rs).
-status_stub!(allocate_buffer(
+unsafe extern "C" fn allocate_buffer(
     allocator: *mut iree_hal_allocator_t,
     params: *const iree_hal_buffer_params_t,
     allocation_size: iree_device_size_t,
     out_buffer: *mut *mut iree_hal_buffer_t,
-) -> iree_status_t);
+) -> iree_status_t {
+    let alloc = unsafe { &*cast(allocator) };
+    let params = unsafe { &*params };
 
-void_stub!(deallocate_buffer(
+    let raw = unsafe {
+        device::Buffer::new(
+            alloc.file.as_raw_fd(),
+            allocation_size as usize,
+            &alloc.file,
+        )
+    };
+
+    let buffer = Box::new(RocketBuffer {
+        // Filled in by iree_hal_buffer_initialize below -- this is just
+        // reserving the memory; the real fields (resource/vtable/sizes/
+        // memory_type/...) get set by that call, matching how every real
+        // HAL driver's allocate_buffer works.
+        base: unsafe { std::mem::zeroed() },
+        handle: raw.handle,
+        dma_address: raw.dma_address,
+        host_ptr: raw.host_ptr,
+        fd: alloc.file.as_raw_fd(),
+    });
+    let buffer_ptr = Box::into_raw(buffer);
+
+    unsafe {
+        let placement = iree_hal_buffer_placement_t {
+            device: std::ptr::null_mut(),
+            queue_affinity: 0,
+            flags: 0,
+            reserved: 0,
+        };
+        crate::bindings::iree_hal_buffer_initialize(
+            placement,
+            &mut (*buffer_ptr).base,
+            allocation_size,
+            0,
+            allocation_size,
+            params.type_,
+            params.access,
+            params.usage,
+            &crate::buffer::VTABLE,
+            &mut (*buffer_ptr).base,
+        );
+        *out_buffer = buffer_ptr as *mut iree_hal_buffer_t;
+    }
+    status::ok()
+}
+
+unsafe extern "C" fn deallocate_buffer(
     allocator: *mut iree_hal_allocator_t,
     buffer: *mut iree_hal_buffer_t,
-));
+) {
+    let _ = allocator; // buffer::destroy doesn't need it back
+    // Real IREE helper -- calls our buffer vtable's .destroy after
+    // handling the base iree_hal_buffer_t bookkeeping (see
+    // iree-null-driver-reference/allocator.c's deallocate_buffer, which
+    // does exactly this).
+    unsafe { crate::bindings::iree_hal_buffer_destroy(buffer) }
+}
 
 status_stub!(import_buffer(
     allocator: *mut iree_hal_allocator_t,

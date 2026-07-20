@@ -1,25 +1,22 @@
-//! `iree_hal_device_vtable_t` -- the biggest vtable (36 slots). Most return
-//! `iree_status_t` and are handled by `status_stub!`; a handful return
-//! other value types (`id`, `host_allocator`, `device_allocator`,
-//! `topology_info`, `query_semaphore_compatibility`) and are written out by
-//! hand below with a sensible default.
-//!
-//! `queue_execute` is the one slot with real design intent already: per
-//! the research this crate started from, it should mirror
-//! `sync_device.c`'s fully-synchronous pattern -- SUBMIT, then a blocking
-//! PREP_BO wait (our existing `Buffer`/`SUBMIT`/`PREP_BO` primitives from
-//! `iree-rocket-hal`), then signal a host-side semaphore for the timeline
-//! value -- rather than the async/polling model
-//! `iree/hal/utils/deferred_work_queue.h` assumes, which doesn't fit a
-//! driver whose only completion signal is a blocking ioctl.
+//! `iree_hal_device_vtable_t`. `create` opens `/dev/accel/accel0` and
+//! wires up the sub-objects (allocator, proactor-from-pool); `queue_execute`
+//! is the real dispatch path: wait on `wait_semaphore_list`, pull the
+//! regcmd program `command_buffer::dispatch` recorded, write it to a GEM
+//! buffer, `SUBMIT`, blocking `PREP_BO`, then signal
+//! `signal_semaphore_list` -- the synchronous pattern from
+//! `local_sync/sync_device.c` that this crate's research phase identified
+//! as the right model for a driver whose only completion signal is a
+//! blocking ioctl rather than a native timeline/fence primitive.
+
+use std::os::fd::AsRawFd;
 
 use crate::bindings::{
     iree_allocator_t, iree_const_byte_span_t, iree_device_size_t, iree_hal_alloca_flags_t,
     iree_hal_allocator_t, iree_hal_buffer_binding_table_t, iree_hal_buffer_params_t,
     iree_hal_buffer_ref_list_t, iree_hal_buffer_t, iree_hal_channel_params_t,
-    iree_hal_channel_provider_t, iree_hal_channel_t,
-    iree_hal_command_buffer_mode_t, iree_hal_command_buffer_t, iree_hal_command_category_t,
-    iree_hal_copy_flags_t, iree_hal_dealloca_flags_t, iree_hal_device_capabilities_t,
+    iree_hal_channel_provider_t, iree_hal_channel_t, iree_hal_command_buffer_mode_t,
+    iree_hal_command_buffer_t, iree_hal_command_category_t, iree_hal_copy_flags_t,
+    iree_hal_dealloca_flags_t, iree_hal_device_capabilities_t, iree_hal_device_create_params_t,
     iree_hal_device_external_capture_options_t, iree_hal_device_profiling_options_t,
     iree_hal_device_t, iree_hal_device_topology_info_t, iree_hal_device_vtable_t,
     iree_hal_dispatch_config_t, iree_hal_dispatch_flags_t, iree_hal_event_flags_t,
@@ -27,38 +24,126 @@ use crate::bindings::{
     iree_hal_executable_t, iree_hal_execute_flags_t, iree_hal_external_file_flags_t,
     iree_hal_file_t, iree_hal_fill_flags_t, iree_hal_host_call_flags_t, iree_hal_host_call_t,
     iree_hal_memory_access_t, iree_hal_pool_t, iree_hal_queue_affinity_t,
-    iree_hal_queue_pool_backend_t, iree_hal_read_flags_t, iree_hal_semaphore_compatibility_bits_t_IREE_HAL_SEMAPHORE_COMPATIBILITY_NONE,
+    iree_hal_queue_pool_backend_t, iree_hal_read_flags_t, iree_hal_resource_t,
+    iree_hal_semaphore_compatibility_bits_t_IREE_HAL_SEMAPHORE_COMPATIBILITY_ALL,
     iree_hal_semaphore_compatibility_t, iree_hal_semaphore_flags_t, iree_hal_semaphore_list_t,
     iree_hal_semaphore_t, iree_hal_topology_edge_t, iree_hal_update_flags_t,
     iree_hal_write_flags_t, iree_host_size_t, iree_io_file_handle_t,
-    iree_string_view_t,
+    iree_status_code_e_IREE_STATUS_INVALID_ARGUMENT, iree_status_code_e_IREE_STATUS_UNAVAILABLE,
+    iree_status_t, iree_string_view_t, iree_timeout_t, iree_timeout_type_e_IREE_TIMEOUT_ABSOLUTE,
 };
+use crate::status;
+use iree_rocket_hal::rocket::device as rocket_device;
 
-void_stub!(destroy(device: *mut iree_hal_device_t));
+const DEVICE_PATH: &str = "/dev/accel/accel0";
 
-#[allow(unused_variables)]
-pub unsafe extern "C" fn id(device: *mut iree_hal_device_t) -> iree_string_view_t {
-    // TODO: return a real identifier ("rocket") once there's a device
-    // instance carrying one -- see rkt_device.c-style identifier storage.
+/// What every `iree_hal_device_t*` this driver hands out actually points
+/// to. Opaque base type, `resource` at offset 0.
+#[repr(C)]
+pub struct RocketDevice {
+    pub resource: iree_hal_resource_t,
+    pub host_allocator: iree_allocator_t,
+    pub identifier: Vec<u8>,
+    pub file: std::fs::File,
+    pub device_allocator: *mut iree_hal_allocator_t,
+    pub proactor_pool: *mut crate::bindings::iree_async_proactor_pool_t,
+    pub proactor: *mut crate::bindings::iree_async_proactor_t,
+}
+
+unsafe fn cast(device: *mut iree_hal_device_t) -> *mut RocketDevice {
+    device as *mut RocketDevice
+}
+
+/// Mirrors `iree_hal_null_device_create()`. `identifier` is borrowed only
+/// for the duration of this call (copied into the device's own storage).
+pub unsafe fn create(
+    identifier: &[u8],
+    create_params: *const iree_hal_device_create_params_t,
+    host_allocator: iree_allocator_t,
+    out_device: *mut *mut iree_hal_device_t,
+) -> iree_status_t {
+    if create_params.is_null() {
+        return status::from_code(iree_status_code_e_IREE_STATUS_INVALID_ARGUMENT as u32);
+    }
+    let proactor_pool = unsafe { (*create_params).proactor_pool };
+    if proactor_pool.is_null() {
+        // Real requirement, not a relaxation this driver invented -- see
+        // module doc comment / iree-null-driver-reference/device.c's own
+        // IREE_ASSERT_ARGUMENT(create_params->proactor_pool).
+        return status::from_code(iree_status_code_e_IREE_STATUS_INVALID_ARGUMENT as u32);
+    }
+
+    let file = match std::fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .open(DEVICE_PATH)
+    {
+        Ok(f) => f,
+        Err(_) => return status::from_code(iree_status_code_e_IREE_STATUS_UNAVAILABLE as u32),
+    };
+    let allocator_file = match file.try_clone() {
+        Ok(f) => f,
+        Err(_) => return status::from_code(iree_status_code_e_IREE_STATUS_UNAVAILABLE as u32),
+    };
+
+    unsafe {
+        crate::bindings::iree_async_proactor_pool_retain(proactor_pool);
+    }
+    let mut proactor: *mut crate::bindings::iree_async_proactor_t = std::ptr::null_mut();
+    let proactor_status =
+        unsafe { crate::bindings::iree_async_proactor_pool_get(proactor_pool, 0, &mut proactor) };
+    if !proactor_status.is_null() {
+        unsafe {
+            crate::bindings::iree_async_proactor_pool_release(proactor_pool);
+        }
+        return proactor_status;
+    }
+
+    let device_allocator = crate::allocator::create(allocator_file, host_allocator);
+
+    let device = Box::new(RocketDevice {
+        resource: iree_hal_resource_t {
+            ref_count: 1,
+            vtable: &VTABLE as *const _ as *const std::ffi::c_void,
+        },
+        host_allocator,
+        identifier: identifier.to_vec(),
+        file,
+        device_allocator,
+        proactor_pool,
+        proactor,
+    });
+    unsafe {
+        *out_device = Box::into_raw(device) as *mut iree_hal_device_t;
+    }
+    status::ok()
+}
+
+unsafe extern "C" fn destroy(device: *mut iree_hal_device_t) {
+    unsafe {
+        let d = &*cast(device);
+        crate::bindings::iree_hal_allocator_release(d.device_allocator);
+        crate::bindings::iree_async_proactor_pool_release(d.proactor_pool);
+        drop(Box::from_raw(cast(device)));
+    }
+}
+
+unsafe extern "C" fn id(device: *mut iree_hal_device_t) -> iree_string_view_t {
+    let d = unsafe { &*cast(device) };
     iree_string_view_t {
-        data: std::ptr::null(),
-        size: 0,
+        data: d.identifier.as_ptr() as *const std::os::raw::c_char,
+        size: d.identifier.len(),
     }
 }
 
-#[allow(unused_variables)]
-pub unsafe extern "C" fn host_allocator(device: *mut iree_hal_device_t) -> iree_allocator_t {
-    iree_allocator_t {
-        self_: std::ptr::null_mut(),
-        ctl: None,
-    }
+unsafe extern "C" fn host_allocator(device: *mut iree_hal_device_t) -> iree_allocator_t {
+    unsafe { (*cast(device)).host_allocator }
 }
 
-#[allow(unused_variables)]
-pub unsafe extern "C" fn device_allocator(
-    device: *mut iree_hal_device_t,
-) -> *mut iree_hal_allocator_t {
-    std::ptr::null_mut()
+unsafe extern "C" fn device_allocator(device: *mut iree_hal_device_t) -> *mut iree_hal_allocator_t {
+    // Not retained -- matches iree-null-driver-reference/device.c's own
+    // iree_hal_null_device_allocator (caller borrows it).
+    unsafe { (*cast(device)).device_allocator }
 }
 
 void_stub!(replace_device_allocator(
@@ -86,7 +171,7 @@ status_stub!(query_capabilities(
 ) -> iree_status_t);
 
 #[allow(unused_variables)]
-pub unsafe extern "C" fn topology_info(
+unsafe extern "C" fn topology_info(
     device: *mut iree_hal_device_t,
 ) -> *const iree_hal_device_topology_info_t {
     std::ptr::null()
@@ -110,14 +195,27 @@ status_stub!(create_channel(
     out_channel: *mut *mut iree_hal_channel_t,
 ) -> iree_status_t);
 
-status_stub!(create_command_buffer(
+#[allow(unused_variables)]
+unsafe extern "C" fn create_command_buffer(
     device: *mut iree_hal_device_t,
     mode: iree_hal_command_buffer_mode_t,
     command_categories: iree_hal_command_category_t,
     queue_affinity: iree_hal_queue_affinity_t,
     binding_capacity: iree_host_size_t,
     out_command_buffer: *mut *mut iree_hal_command_buffer_t,
-) -> iree_status_t);
+) -> iree_status_t {
+    let d = unsafe { &*cast(device) };
+    unsafe {
+        *out_command_buffer = crate::command_buffer::create(
+            d.device_allocator,
+            mode,
+            command_categories,
+            queue_affinity,
+            binding_capacity,
+        );
+    }
+    status::ok()
+}
 
 status_stub!(create_event(
     device: *mut iree_hal_device_t,
@@ -126,11 +224,17 @@ status_stub!(create_event(
     out_event: *mut *mut iree_hal_event_t,
 ) -> iree_status_t);
 
-status_stub!(create_executable_cache(
+#[allow(unused_variables)]
+unsafe extern "C" fn create_executable_cache(
     device: *mut iree_hal_device_t,
     identifier: iree_string_view_t,
     out_executable_cache: *mut *mut iree_hal_executable_cache_t,
-) -> iree_status_t);
+) -> iree_status_t {
+    unsafe {
+        *out_executable_cache = crate::executable_cache::create();
+    }
+    status::ok()
+}
 
 status_stub!(import_file(
     device: *mut iree_hal_device_t,
@@ -141,20 +245,32 @@ status_stub!(import_file(
     out_file: *mut *mut iree_hal_file_t,
 ) -> iree_status_t);
 
-status_stub!(create_semaphore(
+#[allow(unused_variables)]
+unsafe extern "C" fn create_semaphore(
     device: *mut iree_hal_device_t,
     queue_affinity: iree_hal_queue_affinity_t,
     initial_value: u64,
     flags: iree_hal_semaphore_flags_t,
     out_semaphore: *mut *mut iree_hal_semaphore_t,
-) -> iree_status_t);
+) -> iree_status_t {
+    let d = unsafe { &*cast(device) };
+    unsafe {
+        *out_semaphore = crate::semaphore::create(d.proactor, initial_value, d.host_allocator);
+    }
+    status::ok()
+}
 
 #[allow(unused_variables)]
-pub unsafe extern "C" fn query_semaphore_compatibility(
+unsafe extern "C" fn query_semaphore_compatibility(
     device: *mut iree_hal_device_t,
     semaphore: *mut iree_hal_semaphore_t,
 ) -> iree_hal_semaphore_compatibility_t {
-    iree_hal_semaphore_compatibility_bits_t_IREE_HAL_SEMAPHORE_COMPATIBILITY_NONE
+    // We don't yet distinguish semaphores created by this device from
+    // ones created elsewhere (no cross-driver import support) -- assume
+    // full compatibility, matching every semaphore this driver could
+    // plausibly be handed today (it's the only HAL driver in the process
+    // in any realistic near-term usage).
+    iree_hal_semaphore_compatibility_bits_t_IREE_HAL_SEMAPHORE_COMPATIBILITY_ALL
 }
 
 status_stub!(query_queue_pool_backend(
@@ -272,13 +388,8 @@ status_stub!(queue_dispatch(
     flags: iree_hal_dispatch_flags_t,
 ) -> iree_status_t);
 
-// TODO: this is the one slot with real design intent already -- see the
-// module doc comment. Wire up: SUBMIT via iree-rocket-hal's ioctl bindings,
-// blocking PREP_BO wait (absolute CLOCK_MONOTONIC deadline -- see
-// rknpu-spelunking/NOTES.md for why that matters), then signal
-// signal_semaphore_list. Still UNIMPLEMENTED until a real device/command
-// buffer type exists to operate on.
-status_stub!(queue_execute(
+#[allow(unused_variables)]
+unsafe extern "C" fn queue_execute(
     device: *mut iree_hal_device_t,
     queue_affinity: iree_hal_queue_affinity_t,
     wait_semaphore_list: iree_hal_semaphore_list_t,
@@ -286,7 +397,81 @@ status_stub!(queue_execute(
     command_buffer: *mut iree_hal_command_buffer_t,
     binding_table: iree_hal_buffer_binding_table_t,
     flags: iree_hal_execute_flags_t,
-) -> iree_status_t);
+) -> iree_status_t {
+    let d = unsafe { &*cast(device) };
+
+    let infinite = iree_timeout_t {
+        type_: iree_timeout_type_e_IREE_TIMEOUT_ABSOLUTE,
+        nanos: i64::MAX, // IREE_TIME_INFINITE_FUTURE
+    };
+    unsafe {
+        for i in 0..wait_semaphore_list.count as isize {
+            let sem = *wait_semaphore_list.semaphores.offset(i);
+            let value = *wait_semaphore_list.payload_values.offset(i);
+            let st = crate::bindings::iree_hal_semaphore_wait(sem, value, infinite, 0);
+            if !st.is_null() {
+                return st;
+            }
+        }
+    }
+
+    let cmds = match unsafe { crate::command_buffer::regcmd(command_buffer) } {
+        Some(c) if !c.is_empty() => c,
+        _ => return status::from_code(iree_status_code_e_IREE_STATUS_INVALID_ARGUMENT as u32),
+    };
+
+    let fd = d.file.as_raw_fd();
+    let cmd_bytes = cmds.len() * std::mem::size_of::<u64>();
+    let cmd_len = cmd_bytes.next_multiple_of(4096);
+    let cmd_buf = unsafe { rocket_device::Buffer::new(fd, cmd_len, &d.file) };
+    unsafe {
+        let cmd_slice = std::slice::from_raw_parts_mut(cmd_buf.host_ptr as *mut u64, cmds.len());
+        for (i, c) in cmds.iter().enumerate() {
+            cmd_slice[i] = c.0;
+        }
+    }
+    if unsafe { rocket_device::fini_bo(fd, cmd_buf.handle) }.is_err() {
+        return status::from_code(iree_status_code_e_IREE_STATUS_UNAVAILABLE as u32);
+    }
+
+    // TODO: real input/output GEM handles from the command buffer's
+    // recorded buffer bindings -- for now this only knows the regcmd
+    // buffer's own handle, which is enough to prove SUBMIT/PREP_BO
+    // round-trips but not enough for a real dispatch to complete
+    // (matches this being an early, hardcoded-shape milestone -- see
+    // executable.rs/command_buffer.rs's doc comments).
+    let in_handles = [cmd_buf.handle];
+    let out_handles: [u32; 0] = [];
+    if unsafe {
+        rocket_device::submit(
+            fd,
+            cmd_buf.dma_address,
+            cmds.len() as u32,
+            &in_handles,
+            &out_handles,
+        )
+    }
+    .is_err()
+    {
+        return status::from_code(iree_status_code_e_IREE_STATUS_UNAVAILABLE as u32);
+    }
+
+    if unsafe { rocket_device::prep_bo(fd, cmd_buf.handle, 2_000_000_000) }.is_err() {
+        return status::from_code(iree_status_code_e_IREE_STATUS_UNAVAILABLE as u32);
+    }
+
+    unsafe {
+        for i in 0..signal_semaphore_list.count as isize {
+            let sem = *signal_semaphore_list.semaphores.offset(i);
+            let value = *signal_semaphore_list.payload_values.offset(i);
+            let st = crate::bindings::iree_hal_semaphore_signal(sem, value, std::ptr::null());
+            if !st.is_null() {
+                return st;
+            }
+        }
+    }
+    status::ok()
+}
 
 status_stub!(queue_flush(
     device: *mut iree_hal_device_t,
