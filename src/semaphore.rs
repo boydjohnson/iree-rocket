@@ -67,8 +67,15 @@ pub unsafe fn create(
     });
     let semaphore_ptr = Box::into_raw(semaphore);
     unsafe {
+        // Must be VTABLE.async_ (the async_ field embedded in the full
+        // iree_hal_semaphore_vtable_t), not the standalone ASYNC_VTABLE --
+        // iree_hal_semaphore_release() reinterprets this same pointer as
+        // iree_hal_semaphore_vtable_t* (toll-free bridging, see module doc
+        // comment) and reads the trailing wait/import_timepoint/
+        // export_timepoint fields past it. Pointing at ASYNC_VTABLE (only
+        // 4 fields) reads garbage there and crashes.
         crate::bindings::iree_async_semaphore_initialize(
-            &ASYNC_VTABLE,
+            &VTABLE.async_,
             proactor,
             initial_value,
             0,

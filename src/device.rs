@@ -48,6 +48,15 @@ pub struct RocketDevice {
     pub device_allocator: *mut iree_hal_allocator_t,
     pub proactor_pool: *mut crate::bindings::iree_async_proactor_pool_t,
     pub proactor: *mut crate::bindings::iree_async_proactor_t,
+    /// Zeroed (not part of a topology) until `assign_topology_info` is
+    /// called by `iree_hal_device_group_builder_finalize` -- mirrors
+    /// iree-null-driver-reference/device.c's `topology_info` field. Does
+    /// NOT retain/register with `topology_info.frontier.tracker` (unlike
+    /// the null driver) -- frontier_tracker.h isn't in this crate's
+    /// bindgen allowlist (see build.rs) and nothing exercised by this
+    /// driver today needs cross-device causal tracking. Revisit if/when
+    /// multi-device topologies or real frontier-based sync matter.
+    pub topology_info: crate::bindings::iree_hal_device_topology_info_t,
 }
 
 unsafe fn cast(device: *mut iree_hal_device_t) -> *mut RocketDevice {
@@ -112,6 +121,7 @@ pub unsafe fn create(
         device_allocator,
         proactor_pool,
         proactor,
+        topology_info: unsafe { std::mem::zeroed() },
     });
     unsafe {
         *out_device = Box::into_raw(device) as *mut iree_hal_device_t;
@@ -165,28 +175,54 @@ status_stub!(query_i64(
     out_value: *mut i64,
 ) -> iree_status_t);
 
-status_stub!(query_capabilities(
+#[allow(unused_variables)]
+unsafe extern "C" fn query_capabilities(
     device: *mut iree_hal_device_t,
     out_capabilities: *mut iree_hal_device_capabilities_t,
-) -> iree_status_t);
+) -> iree_status_t {
+    // Zeroed = no special hardware capabilities declared yet -- mirrors
+    // iree-null-driver-reference/device.c's query_capabilities exactly.
+    // Enough for iree_hal_device_group_builder_finalize() to build a
+    // single-device topology (numa_node=0, no import/export types) without
+    // UNIMPLEMENTED bubbling up and leaving the CTS's cached device_group
+    // half-built.
+    unsafe {
+        *out_capabilities = std::mem::zeroed();
+    }
+    status::ok()
+}
 
-#[allow(unused_variables)]
 unsafe extern "C" fn topology_info(
     device: *mut iree_hal_device_t,
 ) -> *const iree_hal_device_topology_info_t {
-    std::ptr::null()
+    let d = unsafe { &*cast(device) };
+    &d.topology_info
 }
 
-status_stub!(refine_topology_edge(
+#[allow(unused_variables)]
+unsafe extern "C" fn refine_topology_edge(
     src_device: *mut iree_hal_device_t,
     dst_device: *mut iree_hal_device_t,
     edge: *mut iree_hal_topology_edge_t,
-) -> iree_status_t);
+) -> iree_status_t {
+    // Only called for same-driver device pairs; rocket has no multi-device
+    // interconnect knowledge to contribute yet, so the capability-derived
+    // edge stands as-is -- matches iree-null-driver-reference exactly.
+    status::ok()
+}
 
-status_stub!(assign_topology_info(
+unsafe extern "C" fn assign_topology_info(
     device: *mut iree_hal_device_t,
     topology_info: *const iree_hal_device_topology_info_t,
-) -> iree_status_t);
+) -> iree_status_t {
+    let d = unsafe { &mut *cast(device) };
+    d.topology_info = if topology_info.is_null() {
+        unsafe { std::mem::zeroed() }
+    } else {
+        unsafe { std::ptr::read(topology_info) }
+    };
+    status::ok()
+}
 
 status_stub!(create_channel(
     device: *mut iree_hal_device_t,

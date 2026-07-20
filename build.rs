@@ -19,6 +19,15 @@ fn main() {
     // device::create needs its real functions (pool_retain/get/release)
     // to obtain a proactor for semaphore creation -- see semaphore.rs's
     // module doc comment for why that's needed at all.
+    // bindgen defaults to the HOST clang target, which is wrong when cross-
+    // compiling (e.g. `cargo build --target aarch64-unknown-linux-gnu` from
+    // this x86_64 dev machine, for the actual RK3588 board) -- struct
+    // layouts/padding/alignment must be computed for the TARGET, not the
+    // build host. Cargo always sets TARGET to the real `--target` triple
+    // (host or cross) during build.rs, so pass it straight through as
+    // clang's `--target`.
+    let target = env::var("TARGET").unwrap();
+
     let bindings = bindgen::Builder::default()
         .header(iree_headers.join("iree/hal/api.h").to_str().unwrap())
         .header(
@@ -28,6 +37,7 @@ fn main() {
                 .unwrap(),
         )
         .clang_arg(format!("-I{}", iree_headers.display()))
+        .clang_arg(format!("--target={target}"))
         .allowlist_file(".*/iree/(hal|base|async|io|schemas)/.*")
         .parse_callbacks(Box::new(bindgen::CargoCallbacks::new()))
         .generate()
