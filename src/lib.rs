@@ -40,8 +40,10 @@ pub mod buffer;
 pub mod command_buffer;
 pub mod device;
 pub mod driver;
+pub mod event;
 pub mod executable;
 pub mod executable_cache;
+pub mod file;
 pub mod semaphore;
 
 /// Mirrors `iree_hal_null_driver_module_register()`'s C ABI signature

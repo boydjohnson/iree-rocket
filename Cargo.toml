@@ -25,3 +25,13 @@ nix = { version = "0.30.1", features = ["mman"] }
 
 [build-dependencies]
 bindgen = "0.72.1"
+
+[profile.release]
+# Keep full optimization but retain DWARF debug info (Cargo's release
+# default is debug = 0, which is why the board's gdb session had no
+# symbol/line info and had to fall back to raw disassembly) -- this crate
+# is still under active debugging (see the command_buffer_tests segfault
+# in progress) and a real backtrace with locals is worth the larger
+# binary. Applies to the whole build graph (iree-rocket-hal included)
+# since there's no cargo workspace here to scope it more narrowly.
+debug = true

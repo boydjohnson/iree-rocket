@@ -1,11 +1,15 @@
 //! `iree_hal_executable_vtable_t`. For this driver an "executable" isn't
-//! compiled machine code -- it's a stored `ConvShape`
-//! (`iree_rocket_hal::rocket::regcmd::ConvShape`). No real MLIR codegen
-//! target exists for this hardware yet (see the `custom_dispatch` research
-//! this crate started from -- that mechanism doesn't fit a regcmd-bitstream
-//! device), so `executable_cache::prepare_executable` currently produces
-//! exactly one hardcoded shape regardless of what `executable_data` says --
-//! a deliberate placeholder, not a real executable-format parser.
+//! compiled machine code -- it's a stored `UkernelShape` (one of this
+//! driver's fixed regcmd-template shapes, see `regcmd.rs`'s module doc
+//! comment for why the NPU pipeline itself is a small fixed set of these
+//! rather than a general codegen target). No real MLIR codegen target
+//! exists for this hardware yet (see the `custom_dispatch` research this
+//! crate started from -- that mechanism doesn't fit a regcmd-bitstream
+//! device), so `executable_cache::prepare_executable` currently only picks
+//! between a small number of hardcoded shapes via a one-byte tag prefix on
+//! `executable_data` -- still a deliberate placeholder, not a real
+//! executable-format parser (see that module's doc comment for the exact
+//! tag convention).
 
 use crate::bindings::{
     iree_hal_buffer_t, iree_hal_executable_function_info_t,
@@ -14,7 +18,18 @@ use crate::bindings::{
     iree_hal_resource_t, iree_host_size_t, iree_status_t, iree_string_view_t,
 };
 use crate::status;
-use iree_rocket_hal::rocket::regcmd::ConvShape;
+use iree_rocket_hal::rocket::regcmd::{ConvShape, PoolingShape};
+
+/// One of this driver's fixed regcmd-template shapes -- see `regcmd.rs`'s
+/// module doc comment in iree-rocket-hal for why the NPU pipeline itself
+/// is a small, fixed set of these ("ukernels") rather than a general
+/// codegen target. Extend this enum (and `command_buffer::dispatch`'s
+/// match on it) as more of iree-rocket-hal's `build_*_regcmd` functions
+/// gain HAL-level wiring.
+pub enum UkernelShape {
+    Conv2d(ConvShape),
+    Pooling(PoolingShape),
+}
 
 /// What every `iree_hal_executable_t*` this driver hands out actually
 /// points to. `iree_hal_executable_t` is opaque (no public field
@@ -25,14 +40,14 @@ pub struct RocketExecutable {
     /// Exactly one "function" (ordinal 0) -- the hardcoded shape. A real
     /// executable format would carry N functions/entry points; this
     /// placeholder only ever has one.
-    pub shape: ConvShape,
+    pub shape: UkernelShape,
 }
 
 unsafe fn cast(executable: *mut iree_hal_executable_t) -> *mut RocketExecutable {
     executable as *mut RocketExecutable
 }
 
-pub fn create(shape: ConvShape) -> *mut iree_hal_executable_t {
+pub fn create(shape: UkernelShape) -> *mut iree_hal_executable_t {
     let executable = Box::new(RocketExecutable {
         resource: iree_hal_resource_t {
             ref_count: 1,
@@ -44,8 +59,9 @@ pub fn create(shape: ConvShape) -> *mut iree_hal_executable_t {
 }
 
 /// Not part of the vtable -- `command_buffer::dispatch` calls this
-/// directly to get at the shape it needs for `build_conv_regcmd`.
-pub unsafe fn shape(executable: *mut iree_hal_executable_t) -> *const ConvShape {
+/// directly to get at the shape it needs for the matching `build_*_regcmd`
+/// call.
+pub unsafe fn shape(executable: *mut iree_hal_executable_t) -> *const UkernelShape {
     unsafe { &(*cast(executable)).shape }
 }
 

@@ -42,10 +42,32 @@ pub struct RocketBuffer {
     pub dma_address: u32,
     pub host_ptr: *mut u8,
     pub fd: RawFd,
+    /// Set by `device::queue_dealloca`. The real GEM allocation isn't freed
+    /// eagerly (see `destroy`'s TODO on explicit GEM_CLOSE) -- this is a
+    /// logical marker so further queue ops against an already-dealloca'd
+    /// buffer correctly fail (CTS's `QueueAllocaTest.DeallocaReleasesMemory`)
+    /// instead of silently succeeding against memory the caller has already
+    /// been told is gone.
+    pub deallocated: std::sync::atomic::AtomicBool,
 }
 
 unsafe fn cast(buffer: *mut iree_hal_buffer_t) -> *mut RocketBuffer {
     buffer as *mut RocketBuffer
+}
+
+/// Not part of the vtable -- `device::queue_dealloca`/`queue_fill`/
+/// `queue_update`/`queue_copy` call these directly to enforce the
+/// dealloca contract described on `RocketBuffer::deallocated`.
+pub unsafe fn is_deallocated(buffer: *mut iree_hal_buffer_t) -> bool {
+    unsafe { (*cast(buffer)).deallocated.load(std::sync::atomic::Ordering::Acquire) }
+}
+
+pub unsafe fn mark_deallocated(buffer: *mut iree_hal_buffer_t) {
+    unsafe {
+        (*cast(buffer))
+            .deallocated
+            .store(true, std::sync::atomic::Ordering::Release)
+    }
 }
 
 unsafe extern "C" fn recycle(buffer: *mut iree_hal_buffer_t) {

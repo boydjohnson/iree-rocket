@@ -22,8 +22,9 @@ use crate::bindings::{
     iree_hal_dispatch_config_t, iree_hal_dispatch_flags_t, iree_hal_event_flags_t,
     iree_hal_event_t, iree_hal_executable_cache_t, iree_hal_executable_function_t,
     iree_hal_executable_t, iree_hal_execute_flags_t, iree_hal_external_file_flags_t,
-    iree_hal_file_t, iree_hal_fill_flags_t, iree_hal_host_call_flags_t, iree_hal_host_call_t,
-    iree_hal_memory_access_t, iree_hal_pool_t, iree_hal_queue_affinity_t,
+    iree_hal_file_t, iree_hal_fill_flags_t, iree_hal_host_call_context_t,
+    iree_hal_host_call_flag_bits_e_IREE_HAL_HOST_CALL_FLAG_NON_BLOCKING, iree_hal_host_call_flags_t,
+    iree_hal_host_call_t, iree_hal_memory_access_t, iree_hal_pool_t, iree_hal_queue_affinity_t,
     iree_hal_queue_pool_backend_t, iree_hal_read_flags_t, iree_hal_resource_t,
     iree_hal_semaphore_compatibility_bits_t_IREE_HAL_SEMAPHORE_COMPATIBILITY_ALL,
     iree_hal_semaphore_compatibility_t, iree_hal_semaphore_flags_t, iree_hal_semaphore_list_t,
@@ -33,9 +34,55 @@ use crate::bindings::{
     iree_status_t, iree_string_view_t, iree_timeout_t, iree_timeout_type_e_IREE_TIMEOUT_ABSOLUTE,
 };
 use crate::status;
+use iree_rocket_hal::rocket::api::{DRM_IOCTL_BASE, drm_version};
 use iree_rocket_hal::rocket::device as rocket_device;
 
 const DEVICE_PATH: &str = "/dev/accel/accel0";
+
+// nr=0x00 is generic DRM_IOCTL_VERSION, not rocket-specific -- see
+// rkt-test.rs's identical use of this pattern.
+nix::ioctl_readwrite!(drm_get_version, DRM_IOCTL_BASE, 0x00, drm_version);
+
+const EXPECTED_DRIVER_NAME: &[u8] = b"rocket";
+
+/// `/dev/accel/accel0` is a generic DRM accel-subsystem path -- nothing
+/// guarantees the node at that path is actually bound to the mainline
+/// `rocket` driver rather than some other accelerator's DRM node (e.g. an
+/// Intel NPU's `intel_vpu` driver on a dev laptop, which registers under
+/// the exact same `/dev/accel/accel0` path). Opening it always succeeds
+/// either way, so `std::fs::File::open` alone can't tell them apart --
+/// only a DRM_IOCTL_VERSION round-trip (same identification strategy
+/// librknnrt.so itself uses to find "rknpu" among `/dev/dri/cardN`, see
+/// NOTES.md) can. Sending our rocket-specific ioctls to an unrelated
+/// driver's ioctl handler is exactly what caused CTS's buffer/
+/// command_buffer suites to abort the whole test process on such hosts
+/// (`iree_rocket_hal::rocket::device::Buffer::new`'s `.expect(...)` on an
+/// unexpected ioctl failure) instead of the intended, gracefully-skipped
+/// UNAVAILABLE outcome.
+fn is_rocket_device(file: &std::fs::File) -> bool {
+    let fd = file.as_raw_fd();
+    let mut version = drm_version {
+        version_major: 0,
+        version_minor: 0,
+        version_patchlevel: 0,
+        name_len: 0,
+        name: std::ptr::null_mut(),
+        date_len: 0,
+        date: std::ptr::null_mut(),
+        desc_len: 0,
+        desc: std::ptr::null_mut(),
+    };
+    if unsafe { drm_get_version(fd, &mut version) }.is_err() {
+        return false;
+    }
+    let mut name_buf = vec![0u8; version.name_len as usize];
+    version.name = name_buf.as_mut_ptr() as *mut std::os::raw::c_char;
+    if unsafe { drm_get_version(fd, &mut version) }.is_err() {
+        return false;
+    }
+    name_buf.truncate(version.name_len as usize);
+    name_buf == EXPECTED_DRIVER_NAME
+}
 
 /// What every `iree_hal_device_t*` this driver hands out actually points
 /// to. Opaque base type, `resource` at offset 0.
@@ -61,6 +108,176 @@ pub struct RocketDevice {
 
 unsafe fn cast(device: *mut iree_hal_device_t) -> *mut RocketDevice {
     device as *mut RocketDevice
+}
+
+/// Every `queue_*` op below is synchronous (this driver's only completion
+/// signals are blocking ioctls, see module doc comment), so "queue order"
+/// is enforced simply: block on every wait semaphore before doing any
+/// work, then signal (or, on failure, fail) the signal list after. Shared
+/// by `queue_execute` and every `queue_alloca`/`queue_dealloca`/
+/// `queue_fill`/`queue_update`/`queue_copy`/`queue_host_call` below.
+unsafe fn wait_all(list: iree_hal_semaphore_list_t) -> iree_status_t {
+    let infinite = iree_timeout_t {
+        type_: iree_timeout_type_e_IREE_TIMEOUT_ABSOLUTE,
+        nanos: i64::MAX, // IREE_TIME_INFINITE_FUTURE
+    };
+    unsafe {
+        for i in 0..list.count as isize {
+            let sem = *list.semaphores.offset(i);
+            let value = *list.payload_values.offset(i);
+            let st = crate::bindings::iree_hal_semaphore_wait(sem, value, infinite, 0);
+            if !st.is_null() {
+                return st;
+            }
+        }
+    }
+    status::ok()
+}
+
+unsafe fn signal_all(list: iree_hal_semaphore_list_t) -> iree_status_t {
+    unsafe { crate::bindings::iree_hal_semaphore_list_signal(list, std::ptr::null()) }
+}
+
+unsafe fn fail_all(list: iree_hal_semaphore_list_t, failure: iree_status_t) {
+    unsafe { crate::bindings::iree_hal_semaphore_list_fail(list, failure) }
+}
+
+/// Wraps a `!Send` value (almost always a raw pointer into IREE's C
+/// object graph) so it can move into a thread spawned by
+/// `run_after_wait`. Sound here because every value this wraps is either
+/// a refcounted HAL object retained before crossing the thread boundary
+/// (see the `iree_hal_*_retain` calls at each `run_after_wait` call site)
+/// or plain data with no aliasing concerns (byte buffers, small
+/// `Copy` structs) that has already been deep-copied out of caller-owned
+/// memory.
+struct AssertSend<T>(T);
+unsafe impl<T> Send for AssertSend<T> {}
+
+impl<T> AssertSend<T> {
+    /// Deliberately a method, not a `.0` field access: Rust's 2021+
+    /// disjoint-closure-capture rules see straight through a bare `.0`
+    /// projection and capture just the inner (non-`Send`) field instead of
+    /// the whole `AssertSend<T>` wrapper, silently defeating the `unsafe
+    /// impl Send` above. A method call is opaque to that analysis and
+    /// forces capture of the whole wrapper.
+    fn into_inner(self) -> T {
+        self.0
+    }
+}
+
+/// Deep, retained copy of an `iree_hal_semaphore_list_t`. The original's
+/// `semaphores`/`payload_values` arrays are typically stack-allocated in
+/// the caller's own frame (e.g. CTS's `SemaphoreList` test helper) and
+/// don't outlive the call that handed them to a `queue_*` vtable function
+/// -- fine for `run_after_wait`'s synchronous fast path (same call, same
+/// frame), fatal for its deferred path, whose background thread runs
+/// after the call -- and the caller's frame -- may already have returned.
+/// Retains every semaphore on construction and releases them on drop, so
+/// the semaphore objects themselves also survive independent of whatever
+/// the caller does with its own references in the meantime.
+struct OwnedSemaphoreList {
+    semaphores: Vec<*mut iree_hal_semaphore_t>,
+    payload_values: Vec<u64>,
+}
+
+unsafe impl Send for OwnedSemaphoreList {}
+
+impl OwnedSemaphoreList {
+    unsafe fn new(list: iree_hal_semaphore_list_t) -> Self {
+        // std::slice::from_raw_parts requires a non-null, aligned pointer
+        // even for a zero-length slice -- an empty semaphore list (a
+        // legitimate, common case: not every queue_* call needs to signal
+        // or wait on anything) is typically {count: 0, semaphores: NULL,
+        // payload_values: NULL}, which would be UB to hand to it directly.
+        if list.count == 0 {
+            return Self {
+                semaphores: Vec::new(),
+                payload_values: Vec::new(),
+            };
+        }
+        let semaphores: Vec<*mut iree_hal_semaphore_t> = unsafe {
+            std::slice::from_raw_parts(list.semaphores, list.count as usize).to_vec()
+        };
+        let payload_values: Vec<u64> = unsafe {
+            std::slice::from_raw_parts(list.payload_values, list.count as usize).to_vec()
+        };
+        for &sem in &semaphores {
+            unsafe { crate::bindings::iree_hal_semaphore_retain(sem) };
+        }
+        Self {
+            semaphores,
+            payload_values,
+        }
+    }
+
+    fn as_list(&mut self) -> iree_hal_semaphore_list_t {
+        iree_hal_semaphore_list_t {
+            count: self.semaphores.len() as iree_host_size_t,
+            semaphores: self.semaphores.as_mut_ptr(),
+            payload_values: self.payload_values.as_mut_ptr(),
+        }
+    }
+}
+
+impl Drop for OwnedSemaphoreList {
+    fn drop(&mut self) {
+        for &sem in &self.semaphores {
+            unsafe { crate::bindings::iree_hal_semaphore_release(sem) };
+        }
+    }
+}
+
+/// Real IREE queue semantics: a `queue_*` call enqueues work against the
+/// device queue and returns immediately -- it must not block the calling
+/// thread on its own `wait_list`. CTS's `QueueAllocaTest.
+/// AllocaWithWaitSemaphores` is a direct test of this: it signals its
+/// wait semaphore from the SAME thread only *after* the `queue_alloca`
+/// call returns, so a driver that blocks inside the call deadlocks. This
+/// driver has no real async executor, so "enqueue and return" is
+/// approximated with a detached `std::thread` per deferred call when the
+/// wait isn't already satisfied -- not efficient, but correct, and every
+/// `queue_*` op here is cheap enough (a host memcpy or a blocking ioctl)
+/// that thread-per-call overhead doesn't matter for a test-focused
+/// driver.
+///
+/// When `wait_list` is already satisfied, runs `work` synchronously right
+/// now instead of spawning anything -- the common case (empty/already-
+/// signaled waits), and on failure returns the error directly rather than
+/// routing it through `signal_list`, preserving the exact behavior every
+/// already-passing test depends on. `work` receives the signal list to
+/// use (either the original, in the synchronous case, or an owned/
+/// retained copy that outlives the deferred call) for callers that need
+/// to hand it to something else (e.g. `queue_host_call`'s callback
+/// context) rather than just signaling it themselves.
+unsafe fn run_after_wait(
+    wait_list: iree_hal_semaphore_list_t,
+    signal_list: iree_hal_semaphore_list_t,
+    work: impl FnOnce(iree_hal_semaphore_list_t) -> iree_status_t + Send + 'static,
+) -> iree_status_t {
+    if unsafe { crate::bindings::iree_hal_semaphore_list_poll(wait_list) } {
+        let st = work(signal_list);
+        if !st.is_null() {
+            return st;
+        }
+        return unsafe { signal_all(signal_list) };
+    }
+
+    let mut owned_wait = unsafe { OwnedSemaphoreList::new(wait_list) };
+    let mut owned_signal = unsafe { OwnedSemaphoreList::new(signal_list) };
+    std::thread::spawn(move || {
+        let st = unsafe { wait_all(owned_wait.as_list()) };
+        if !st.is_null() {
+            unsafe { fail_all(owned_signal.as_list(), st) };
+            return;
+        }
+        let st = work(owned_signal.as_list());
+        if !st.is_null() {
+            unsafe { fail_all(owned_signal.as_list(), st) };
+            return;
+        }
+        unsafe { signal_all(owned_signal.as_list()) };
+    });
+    status::ok()
 }
 
 /// Mirrors `iree_hal_null_device_create()`. `identifier` is borrowed only
@@ -90,6 +307,9 @@ pub unsafe fn create(
         Ok(f) => f,
         Err(_) => return status::from_code(iree_status_code_e_IREE_STATUS_UNAVAILABLE as u32),
     };
+    if !is_rocket_device(&file) {
+        return status::from_code(iree_status_code_e_IREE_STATUS_UNAVAILABLE as u32);
+    }
     let allocator_file = match file.try_clone() {
         Ok(f) => f,
         Err(_) => return status::from_code(iree_status_code_e_IREE_STATUS_UNAVAILABLE as u32),
@@ -123,8 +343,14 @@ pub unsafe fn create(
         proactor,
         topology_info: unsafe { std::mem::zeroed() },
     });
+    let device_ptr = Box::into_raw(device) as *mut iree_hal_device_t;
+    // Chicken-and-egg: the allocator needs to know its owning device (see
+    // RocketAllocator::device's doc comment) but is itself one of the
+    // fields used to construct RocketDevice above, so the device's final
+    // pointer doesn't exist until just now.
+    unsafe { crate::allocator::set_device(device_allocator, device_ptr) };
     unsafe {
-        *out_device = Box::into_raw(device) as *mut iree_hal_device_t;
+        *out_device = device_ptr;
     }
     status::ok()
 }
@@ -253,12 +479,16 @@ unsafe extern "C" fn create_command_buffer(
     status::ok()
 }
 
-status_stub!(create_event(
+#[allow(unused_variables)]
+unsafe extern "C" fn create_event(
     device: *mut iree_hal_device_t,
     queue_affinity: iree_hal_queue_affinity_t,
     flags: iree_hal_event_flags_t,
     out_event: *mut *mut iree_hal_event_t,
-) -> iree_status_t);
+) -> iree_status_t {
+    let d = unsafe { &*cast(device) };
+    unsafe { crate::event::create(queue_affinity, flags, d.host_allocator, out_event) }
+}
 
 #[allow(unused_variables)]
 unsafe extern "C" fn create_executable_cache(
@@ -272,14 +502,18 @@ unsafe extern "C" fn create_executable_cache(
     status::ok()
 }
 
-status_stub!(import_file(
+#[allow(unused_variables)]
+unsafe extern "C" fn import_file(
     device: *mut iree_hal_device_t,
     queue_affinity: iree_hal_queue_affinity_t,
     access: iree_hal_memory_access_t,
     handle: *mut iree_io_file_handle_t,
     flags: iree_hal_external_file_flags_t,
     out_file: *mut *mut iree_hal_file_t,
-) -> iree_status_t);
+) -> iree_status_t {
+    let d = unsafe { &*cast(device) };
+    unsafe { crate::file::import(access, handle, d.host_allocator, out_file) }
+}
 
 #[allow(unused_variables)]
 unsafe extern "C" fn create_semaphore(
@@ -315,7 +549,8 @@ status_stub!(query_queue_pool_backend(
     out_backend: *mut iree_hal_queue_pool_backend_t,
 ) -> iree_status_t);
 
-status_stub!(queue_alloca(
+#[allow(unused_variables)]
+unsafe extern "C" fn queue_alloca(
     device: *mut iree_hal_device_t,
     queue_affinity: iree_hal_queue_affinity_t,
     wait_semaphore_list: iree_hal_semaphore_list_t,
@@ -325,18 +560,75 @@ status_stub!(queue_alloca(
     allocation_size: iree_device_size_t,
     flags: iree_hal_alloca_flags_t,
     out_buffer: *mut *mut iree_hal_buffer_t,
-) -> iree_status_t);
+) -> iree_status_t {
+    if !pool.is_null() {
+        // Real pooling (TLSF/FixedBlock/Passthrough pool backends, cross-
+        // queue wait-frontier semantics, ...) isn't implemented -- every
+        // direct (pool=NULL) allocation below is. See device.rs's task
+        // list.
+        return status::unimplemented();
+    }
+    let d = unsafe { &*cast(device) };
+    // The real allocation has no data dependency on wait_semaphore_list
+    // (nothing has read/written through the new buffer yet), so unlike
+    // every other queue_* op here it's safe -- and necessary -- to do
+    // eagerly: *out_buffer must be valid the instant this call returns
+    // (CTS's QueueAllocaTest.AllocaWithWaitSemaphores checks this
+    // immediately, before it ever signals the wait), matching real IREE
+    // queue-submission semantics where the call enqueues and returns
+    // without blocking on its own wait list. Only the signal is deferred.
+    let st = unsafe {
+        crate::bindings::iree_hal_allocator_allocate_buffer(
+            d.device_allocator,
+            params,
+            allocation_size,
+            out_buffer,
+        )
+    };
+    if !st.is_null() {
+        return st;
+    }
+    unsafe { run_after_wait(wait_semaphore_list, signal_semaphore_list, |_sig| status::ok()) }
+}
 
-status_stub!(queue_dealloca(
+#[allow(unused_variables)]
+unsafe extern "C" fn queue_dealloca(
     device: *mut iree_hal_device_t,
     queue_affinity: iree_hal_queue_affinity_t,
     wait_semaphore_list: iree_hal_semaphore_list_t,
     signal_semaphore_list: iree_hal_semaphore_list_t,
     buffer: *mut iree_hal_buffer_t,
     flags: iree_hal_dealloca_flags_t,
-) -> iree_status_t);
+) -> iree_status_t {
+    unsafe { crate::bindings::iree_hal_buffer_retain(buffer) };
+    let buffer = AssertSend(buffer);
+    unsafe {
+        run_after_wait(wait_semaphore_list, signal_semaphore_list, move |_sig| {
+            let buffer = buffer.into_inner();
+            // Logical only -- see RocketBuffer::deallocated's doc comment.
+            // The caller retains its own reference and is still
+            // responsible for eventually releasing `buffer`; this only
+            // makes further queue ops against it correctly fail.
+            unsafe {
+                crate::buffer::mark_deallocated(buffer);
+                crate::bindings::iree_hal_buffer_release(buffer);
+            }
+            status::ok()
+        })
+    }
+}
 
-status_stub!(queue_fill(
+// queue_fill/queue_update/queue_copy: the device-level (non-command-buffer)
+// counterparts of command_buffer.rs's fill_buffer/update_buffer/copy_buffer.
+// Real IREE callers use these directly for standalone transfers outside a
+// recorded command buffer -- e.g. the CTS test harness's own
+// CreateDeviceBufferWithData helper uses queue_update, not the command-
+// buffer op, for uploads above the command-buffer inline-payload size.
+// Since these are also host-mapped-memory operations (see buffer.rs), wait
+// (via run_after_wait, deferred if not already satisfied) then apply then
+// signal, same as every other queue_* op here.
+#[allow(unused_variables)]
+unsafe extern "C" fn queue_fill(
     device: *mut iree_hal_device_t,
     queue_affinity: iree_hal_queue_affinity_t,
     wait_semaphore_list: iree_hal_semaphore_list_t,
@@ -347,9 +639,47 @@ status_stub!(queue_fill(
     pattern: *const std::ffi::c_void,
     pattern_length: iree_host_size_t,
     flags: iree_hal_fill_flags_t,
-) -> iree_status_t);
+) -> iree_status_t {
+    if pattern_length as usize > 8 {
+        return status::from_code(iree_status_code_e_IREE_STATUS_INVALID_ARGUMENT as u32);
+    }
+    // pattern may point to the caller's stack (a local variable, in every
+    // CTS test that hits this) -- copy it now since a deferred call (see
+    // run_after_wait) runs after the caller's frame may already be gone.
+    let mut pattern_buf = [0u8; 8];
+    unsafe {
+        std::ptr::copy_nonoverlapping(
+            pattern as *const u8,
+            pattern_buf.as_mut_ptr(),
+            pattern_length as usize,
+        );
+    }
+    unsafe { crate::bindings::iree_hal_buffer_retain(target_buffer) };
+    let target_buffer = AssertSend(target_buffer);
+    unsafe {
+        run_after_wait(wait_semaphore_list, signal_semaphore_list, move |_sig| {
+            let target_buffer = target_buffer.into_inner();
+            let st = unsafe {
+                if crate::buffer::is_deallocated(target_buffer) {
+                    status::from_code(iree_status_code_e_IREE_STATUS_INVALID_ARGUMENT as u32)
+                } else {
+                    crate::bindings::iree_hal_buffer_map_fill(
+                        target_buffer,
+                        target_offset,
+                        length,
+                        pattern_buf.as_ptr() as *const std::ffi::c_void,
+                        pattern_length,
+                    )
+                }
+            };
+            unsafe { crate::bindings::iree_hal_buffer_release(target_buffer) };
+            st
+        })
+    }
+}
 
-status_stub!(queue_update(
+#[allow(unused_variables)]
+unsafe extern "C" fn queue_update(
     device: *mut iree_hal_device_t,
     queue_affinity: iree_hal_queue_affinity_t,
     wait_semaphore_list: iree_hal_semaphore_list_t,
@@ -360,9 +690,40 @@ status_stub!(queue_update(
     target_offset: iree_device_size_t,
     length: iree_device_size_t,
     flags: iree_hal_update_flags_t,
-) -> iree_status_t);
+) -> iree_status_t {
+    // source_buffer may point to the caller's stack/heap memory that
+    // won't survive past this call if deferred -- copy it now, same
+    // reasoning as queue_fill's pattern copy.
+    let mut source = vec![0u8; length as usize];
+    unsafe {
+        let src = (source_buffer as *const u8).add(source_offset as usize);
+        std::ptr::copy_nonoverlapping(src, source.as_mut_ptr(), length as usize);
+    }
+    unsafe { crate::bindings::iree_hal_buffer_retain(target_buffer) };
+    let target_buffer = AssertSend(target_buffer);
+    unsafe {
+        run_after_wait(wait_semaphore_list, signal_semaphore_list, move |_sig| {
+            let target_buffer = target_buffer.into_inner();
+            let st = unsafe {
+                if crate::buffer::is_deallocated(target_buffer) {
+                    status::from_code(iree_status_code_e_IREE_STATUS_INVALID_ARGUMENT as u32)
+                } else {
+                    crate::bindings::iree_hal_buffer_map_write(
+                        target_buffer,
+                        target_offset,
+                        source.as_ptr() as *const std::ffi::c_void,
+                        length,
+                    )
+                }
+            };
+            unsafe { crate::bindings::iree_hal_buffer_release(target_buffer) };
+            st
+        })
+    }
+}
 
-status_stub!(queue_copy(
+#[allow(unused_variables)]
+unsafe extern "C" fn queue_copy(
     device: *mut iree_hal_device_t,
     queue_affinity: iree_hal_queue_affinity_t,
     wait_semaphore_list: iree_hal_semaphore_list_t,
@@ -373,9 +734,51 @@ status_stub!(queue_copy(
     target_offset: iree_device_size_t,
     length: iree_device_size_t,
     flags: iree_hal_copy_flags_t,
-) -> iree_status_t);
+) -> iree_status_t {
+    unsafe {
+        crate::bindings::iree_hal_buffer_retain(source_buffer);
+        crate::bindings::iree_hal_buffer_retain(target_buffer);
+    }
+    let source_buffer = AssertSend(source_buffer);
+    let target_buffer = AssertSend(target_buffer);
+    unsafe {
+        run_after_wait(wait_semaphore_list, signal_semaphore_list, move |_sig| {
+            let source_buffer = source_buffer.into_inner();
+            let target_buffer = target_buffer.into_inner();
+            let st = unsafe {
+                if crate::buffer::is_deallocated(source_buffer)
+                    || crate::buffer::is_deallocated(target_buffer)
+                {
+                    status::from_code(iree_status_code_e_IREE_STATUS_INVALID_ARGUMENT as u32)
+                } else {
+                    crate::bindings::iree_hal_buffer_map_copy(
+                        source_buffer,
+                        source_offset,
+                        target_buffer,
+                        target_offset,
+                        length,
+                    )
+                }
+            };
+            unsafe {
+                crate::bindings::iree_hal_buffer_release(source_buffer);
+                crate::bindings::iree_hal_buffer_release(target_buffer);
+            }
+            st
+        })
+    }
+}
 
-status_stub!(queue_read(
+// Delegate to IREE's own iree_hal_file_read/write -- generic wrappers that
+// dispatch to file.rs's read/write vtable slots, which do the real
+// host-memcpy work via iree_hal_buffer_map_write/_read. Same deferred
+// wait-then-work-then-signal pattern (via run_after_wait) as every other
+// queue_* op here; both the file and the buffer are refcounted HAL
+// objects (not raw caller memory), so retaining them for the deferred
+// call's duration is enough -- no byte-level copy needed like queue_fill/
+// queue_update's pattern/source_buffer.
+#[allow(unused_variables)]
+unsafe extern "C" fn queue_read(
     device: *mut iree_hal_device_t,
     queue_affinity: iree_hal_queue_affinity_t,
     wait_semaphore_list: iree_hal_semaphore_list_t,
@@ -386,9 +789,37 @@ status_stub!(queue_read(
     target_offset: iree_device_size_t,
     length: iree_device_size_t,
     flags: iree_hal_read_flags_t,
-) -> iree_status_t);
+) -> iree_status_t {
+    unsafe {
+        crate::bindings::iree_hal_file_retain(source_file);
+        crate::bindings::iree_hal_buffer_retain(target_buffer);
+    }
+    let source_file = AssertSend(source_file);
+    let target_buffer = AssertSend(target_buffer);
+    unsafe {
+        run_after_wait(wait_semaphore_list, signal_semaphore_list, move |_sig| {
+            let source_file = source_file.into_inner();
+            let target_buffer = target_buffer.into_inner();
+            let st = unsafe {
+                crate::bindings::iree_hal_file_read(
+                    source_file,
+                    source_offset,
+                    target_buffer,
+                    target_offset,
+                    length,
+                )
+            };
+            unsafe {
+                crate::bindings::iree_hal_file_release(source_file);
+                crate::bindings::iree_hal_buffer_release(target_buffer);
+            }
+            st
+        })
+    }
+}
 
-status_stub!(queue_write(
+#[allow(unused_variables)]
+unsafe extern "C" fn queue_write(
     device: *mut iree_hal_device_t,
     queue_affinity: iree_hal_queue_affinity_t,
     wait_semaphore_list: iree_hal_semaphore_list_t,
@@ -399,9 +830,42 @@ status_stub!(queue_write(
     target_offset: u64,
     length: iree_device_size_t,
     flags: iree_hal_write_flags_t,
-) -> iree_status_t);
+) -> iree_status_t {
+    unsafe {
+        crate::bindings::iree_hal_buffer_retain(source_buffer);
+        crate::bindings::iree_hal_file_retain(target_file);
+    }
+    let source_buffer = AssertSend(source_buffer);
+    let target_file = AssertSend(target_file);
+    unsafe {
+        run_after_wait(wait_semaphore_list, signal_semaphore_list, move |_sig| {
+            let source_buffer = source_buffer.into_inner();
+            let target_file = target_file.into_inner();
+            let st = unsafe {
+                crate::bindings::iree_hal_file_write(
+                    target_file,
+                    target_offset,
+                    source_buffer,
+                    source_offset,
+                    length,
+                )
+            };
+            unsafe {
+                crate::bindings::iree_hal_buffer_release(source_buffer);
+                crate::bindings::iree_hal_file_release(target_file);
+            }
+            st
+        })
+    }
+}
 
-status_stub!(queue_host_call(
+// Blocking mode only (IREE_HAL_HOST_CALL_FLAG_NONE) -- deferred/async
+// callbacks (a callback returning IREE_STATUS_DEFERRED and signaling the
+// cloned signal_semaphore_list itself later) aren't implemented. Neither
+// mode may block on wait_semaphore_list itself (see run_after_wait's doc
+// comment) -- deferred here too, when the wait isn't already satisfied.
+#[allow(unused_variables)]
+unsafe extern "C" fn queue_host_call(
     device: *mut iree_hal_device_t,
     queue_affinity: iree_hal_queue_affinity_t,
     wait_semaphore_list: iree_hal_semaphore_list_t,
@@ -409,7 +873,110 @@ status_stub!(queue_host_call(
     call: iree_hal_host_call_t,
     args: *const u64,
     flags: iree_hal_host_call_flags_t,
-) -> iree_status_t);
+) -> iree_status_t {
+    // args always points to exactly 4 values (iree_hal_device_queue_
+    // host_call's own public signature is `const uint64_t args[4]`) and,
+    // like every per-call payload here, may point to the caller's stack --
+    // copy it now since a deferred call (see run_after_wait) runs after
+    // the caller's frame may already be gone.
+    let mut args_buf = [0u64; 4];
+    unsafe { std::ptr::copy_nonoverlapping(args, args_buf.as_mut_ptr(), 4) };
+    let device = AssertSend(device);
+    let user_data = AssertSend(call.user_data);
+
+    let non_blocking =
+        flags & (iree_hal_host_call_flag_bits_e_IREE_HAL_HOST_CALL_FLAG_NON_BLOCKING as u64) != 0;
+    if non_blocking {
+        // "The signal semaphores ... will be signaled immediately after the
+        // queue has issued the call ... any error returned is ignored."
+        // Also omitted from the callback's own context (per
+        // iree_hal_host_call_context_t::signal_semaphore_list's doc
+        // comment) -- an empty list, not the real one, so the callback
+        // can't (successfully) signal them itself and double up with the
+        // signal below. This is "signal, then call" (not run_after_wait's
+        // "work, then signal on success" ordering), so it's handled
+        // directly rather than through that helper.
+        let f = call.fn_.map(AssertSend);
+        let signal_then_call = move |sig: iree_hal_semaphore_list_t| {
+            let sig_status = unsafe { signal_all(sig) };
+            if let Some(f) = f {
+                let mut context = iree_hal_host_call_context_t {
+                    device: device.into_inner(),
+                    queue_affinity,
+                    signal_semaphore_list: iree_hal_semaphore_list_t {
+                        count: 0,
+                        semaphores: std::ptr::null_mut(),
+                        payload_values: std::ptr::null_mut(),
+                    },
+                };
+                let _ = unsafe { (f.into_inner())(user_data.into_inner(), args_buf.as_ptr(), &mut context) };
+            }
+            sig_status
+        };
+        if unsafe { crate::bindings::iree_hal_semaphore_list_poll(wait_semaphore_list) } {
+            return signal_then_call(signal_semaphore_list);
+        }
+        let mut owned_wait = unsafe { OwnedSemaphoreList::new(wait_semaphore_list) };
+        let mut owned_signal = unsafe { OwnedSemaphoreList::new(signal_semaphore_list) };
+        std::thread::spawn(move || {
+            let st = unsafe { wait_all(owned_wait.as_list()) };
+            if !st.is_null() {
+                unsafe { fail_all(owned_signal.as_list(), st) };
+                return;
+            }
+            signal_then_call(owned_signal.as_list());
+        });
+        return status::ok();
+    }
+
+    let Some(f) = call.fn_ else {
+        return status::from_code(iree_status_code_e_IREE_STATUS_INVALID_ARGUMENT as u32);
+    };
+    let f = AssertSend(f);
+    // Not routed through run_after_wait: its fast path returns a failed
+    // `work()` directly as the caller's own return status, which is right
+    // for e.g. queue_fill (a validation failure is a synchronous
+    // rejection) but wrong here -- queue_host_call's own documented
+    // contract is "if the call succeeds and returns OK the semaphores
+    // will be signaled and otherwise they will be failed": the callback's
+    // result is ALWAYS routed through fail_all/signal_all, and this
+    // function ALWAYS returns OK once past the `call.fn_` precondition
+    // check above, on both the fast and deferred paths alike. Getting
+    // this wrong (returning the callback's error directly on the fast
+    // path) surfaced as CTS's QueueHostCallTest.CallbackReturnsError
+    // seeing the raw PERMISSION_DENIED as queue_host_call's own return
+    // value, then hanging forever waiting on a signal_semaphore_list that
+    // never got signaled or failed.
+    let invoke_and_report = move |sig: iree_hal_semaphore_list_t| -> iree_status_t {
+        let mut context = iree_hal_host_call_context_t {
+            device: device.into_inner(),
+            queue_affinity,
+            signal_semaphore_list: sig,
+        };
+        let result =
+            unsafe { (f.into_inner())(user_data.into_inner(), args_buf.as_ptr(), &mut context) };
+        if result.is_null() {
+            unsafe { signal_all(sig) }
+        } else {
+            unsafe { fail_all(sig, result) };
+            status::ok()
+        }
+    };
+    if unsafe { crate::bindings::iree_hal_semaphore_list_poll(wait_semaphore_list) } {
+        return invoke_and_report(signal_semaphore_list);
+    }
+    let mut owned_wait = unsafe { OwnedSemaphoreList::new(wait_semaphore_list) };
+    let mut owned_signal = unsafe { OwnedSemaphoreList::new(signal_semaphore_list) };
+    std::thread::spawn(move || {
+        let st = unsafe { wait_all(owned_wait.as_list()) };
+        if !st.is_null() {
+            unsafe { fail_all(owned_signal.as_list(), st) };
+            return;
+        }
+        invoke_and_report(owned_signal.as_list());
+    });
+    status::ok()
+}
 
 status_stub!(queue_dispatch(
     device: *mut iree_hal_device_t,
@@ -434,79 +1001,116 @@ unsafe extern "C" fn queue_execute(
     binding_table: iree_hal_buffer_binding_table_t,
     flags: iree_hal_execute_flags_t,
 ) -> iree_status_t {
-    let d = unsafe { &*cast(device) };
-
-    let infinite = iree_timeout_t {
-        type_: iree_timeout_type_e_IREE_TIMEOUT_ABSOLUTE,
-        nanos: i64::MAX, // IREE_TIME_INFINITE_FUTURE
-    };
+    // `command_buffer` may legitimately be NULL: `iree_hal_device_queue_
+    // barrier()` (device.c) calls `iree_hal_device_queue_execute(..., NULL,
+    // ...)` directly as a pure sync point with no actual work -- e.g.
+    // `iree_hal_device_queue_dealloca()` takes this path for any buffer
+    // whose placement isn't flagged ASYNCHRONOUS (true for every buffer
+    // this driver hands out, since allocator::allocate_buffer never sets
+    // that flag), which is how CTS's `TransientBufferTest.
+    // DeallocateTransient` ends up calling straight into `queue_execute`
+    // with no command buffer at all -- segfaulted here (null-deref inside
+    // apply_ops) before this check existed.
+    if !command_buffer.is_null() {
+        unsafe { crate::bindings::iree_hal_command_buffer_retain(command_buffer) };
+    }
+    let device = AssertSend(device);
+    let command_buffer = AssertSend(command_buffer);
     unsafe {
-        for i in 0..wait_semaphore_list.count as isize {
-            let sem = *wait_semaphore_list.semaphores.offset(i);
-            let value = *wait_semaphore_list.payload_values.offset(i);
-            let st = crate::bindings::iree_hal_semaphore_wait(sem, value, infinite, 0);
-            if !st.is_null() {
-                return st;
+        run_after_wait(wait_semaphore_list, signal_semaphore_list, move |_sig| {
+            let device = device.into_inner();
+            let command_buffer = command_buffer.into_inner();
+            let d = unsafe { &*cast(device) };
+
+            // Replay every recorded fill/update/copy (host-side, no
+            // hardware involved) and pull out the one recorded
+            // `dispatch`'s regcmd, if any. A non-null command buffer with
+            // no recorded `dispatch` (e.g. CTS's EventTest -- just
+            // signal_event/reset_event, nothing to actually run on the
+            // NPU) is likewise a legitimate empty job, not an error: skip
+            // straight to signaling. Matches the coarse per-command-buffer
+            // sync granularity documented in event.rs -- there's
+            // genuinely nothing to submit to hardware.
+            let cmds = if command_buffer.is_null() {
+                None
+            } else {
+                match unsafe { crate::command_buffer::apply_ops(command_buffer) } {
+                    Ok(cmds) => cmds,
+                    Err(st) => {
+                        unsafe { crate::bindings::iree_hal_command_buffer_release(command_buffer) };
+                        return st;
+                    }
+                }
+            };
+            let result = 'result: {
+                if let Some(job) = cmds.filter(|j| !j.regcmd.is_empty()) {
+                    let fd = d.file.as_raw_fd();
+                    let cmd_bytes = job.regcmd.len() * std::mem::size_of::<u64>();
+                    let cmd_len = cmd_bytes.next_multiple_of(4096);
+                    let cmd_buf = unsafe { rocket_device::Buffer::new(fd, cmd_len, &d.file) };
+                    unsafe {
+                        let cmd_slice = std::slice::from_raw_parts_mut(
+                            cmd_buf.host_ptr as *mut u64,
+                            job.regcmd.len(),
+                        );
+                        for (i, c) in job.regcmd.iter().enumerate() {
+                            cmd_slice[i] = c.0;
+                        }
+                    }
+                    if unsafe { rocket_device::fini_bo(fd, cmd_buf.handle) }.is_err() {
+                        break 'result status::from_code(
+                            iree_status_code_e_IREE_STATUS_UNAVAILABLE as u32,
+                        );
+                    }
+
+                    // Real input/output GEM handles from the command
+                    // buffer's recorded dispatch (command_buffer.rs's
+                    // `RecordedOp::Dispatch`), same convention
+                    // conv_hw.rs's hand-rolled ioctl call already validates
+                    // against real hardware: the regcmd buffer's own
+                    // handle plus every buffer the dispatch reads go in
+                    // in_bo_handles, everything it writes goes in
+                    // out_bo_handles. Without these the kernel driver's
+                    // implicit fencing has no way to know the job touches
+                    // those buffers at all -- SUBMIT/PREP_BO would still
+                    // round-trip (proving the ioctl plumbing works) but
+                    // give no real completion/dependency guarantee for the
+                    // tensors themselves.
+                    let mut in_handles = Vec::with_capacity(1 + job.in_bo_handles.len());
+                    in_handles.push(cmd_buf.handle);
+                    in_handles.extend_from_slice(job.in_bo_handles);
+                    if unsafe {
+                        rocket_device::submit(
+                            fd,
+                            cmd_buf.dma_address,
+                            job.regcmd.len() as u32,
+                            &in_handles,
+                            job.out_bo_handles,
+                        )
+                    }
+                    .is_err()
+                    {
+                        break 'result status::from_code(
+                            iree_status_code_e_IREE_STATUS_UNAVAILABLE as u32,
+                        );
+                    }
+
+                    if unsafe { rocket_device::prep_bo(fd, cmd_buf.handle, 2_000_000_000) }
+                        .is_err()
+                    {
+                        break 'result status::from_code(
+                            iree_status_code_e_IREE_STATUS_UNAVAILABLE as u32,
+                        );
+                    }
+                }
+                status::ok()
+            };
+            if !command_buffer.is_null() {
+                unsafe { crate::bindings::iree_hal_command_buffer_release(command_buffer) };
             }
-        }
+            result
+        })
     }
-
-    let cmds = match unsafe { crate::command_buffer::regcmd(command_buffer) } {
-        Some(c) if !c.is_empty() => c,
-        _ => return status::from_code(iree_status_code_e_IREE_STATUS_INVALID_ARGUMENT as u32),
-    };
-
-    let fd = d.file.as_raw_fd();
-    let cmd_bytes = cmds.len() * std::mem::size_of::<u64>();
-    let cmd_len = cmd_bytes.next_multiple_of(4096);
-    let cmd_buf = unsafe { rocket_device::Buffer::new(fd, cmd_len, &d.file) };
-    unsafe {
-        let cmd_slice = std::slice::from_raw_parts_mut(cmd_buf.host_ptr as *mut u64, cmds.len());
-        for (i, c) in cmds.iter().enumerate() {
-            cmd_slice[i] = c.0;
-        }
-    }
-    if unsafe { rocket_device::fini_bo(fd, cmd_buf.handle) }.is_err() {
-        return status::from_code(iree_status_code_e_IREE_STATUS_UNAVAILABLE as u32);
-    }
-
-    // TODO: real input/output GEM handles from the command buffer's
-    // recorded buffer bindings -- for now this only knows the regcmd
-    // buffer's own handle, which is enough to prove SUBMIT/PREP_BO
-    // round-trips but not enough for a real dispatch to complete
-    // (matches this being an early, hardcoded-shape milestone -- see
-    // executable.rs/command_buffer.rs's doc comments).
-    let in_handles = [cmd_buf.handle];
-    let out_handles: [u32; 0] = [];
-    if unsafe {
-        rocket_device::submit(
-            fd,
-            cmd_buf.dma_address,
-            cmds.len() as u32,
-            &in_handles,
-            &out_handles,
-        )
-    }
-    .is_err()
-    {
-        return status::from_code(iree_status_code_e_IREE_STATUS_UNAVAILABLE as u32);
-    }
-
-    if unsafe { rocket_device::prep_bo(fd, cmd_buf.handle, 2_000_000_000) }.is_err() {
-        return status::from_code(iree_status_code_e_IREE_STATUS_UNAVAILABLE as u32);
-    }
-
-    unsafe {
-        for i in 0..signal_semaphore_list.count as isize {
-            let sem = *signal_semaphore_list.semaphores.offset(i);
-            let value = *signal_semaphore_list.payload_values.offset(i);
-            let st = crate::bindings::iree_hal_semaphore_signal(sem, value, std::ptr::null());
-            if !st.is_null() {
-                return st;
-            }
-        }
-    }
-    status::ok()
 }
 
 status_stub!(queue_flush(

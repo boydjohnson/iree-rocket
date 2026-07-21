@@ -16,7 +16,9 @@ use crate::bindings::{
     iree_hal_buffer_compatibility_bits_t_IREE_HAL_BUFFER_COMPATIBILITY_ALLOCATABLE,
     iree_hal_buffer_compatibility_bits_t_IREE_HAL_BUFFER_COMPATIBILITY_QUEUE_DISPATCH,
     iree_hal_buffer_compatibility_bits_t_IREE_HAL_BUFFER_COMPATIBILITY_QUEUE_TRANSFER,
-    iree_hal_buffer_compatibility_t, iree_hal_buffer_params_t, iree_hal_buffer_placement_t,
+    iree_hal_buffer_compatibility_t, iree_hal_buffer_params_t,
+    iree_hal_buffer_placement_flag_bits_t_IREE_HAL_BUFFER_PLACEMENT_FLAG_ASYNCHRONOUS,
+    iree_hal_buffer_placement_t,
     iree_hal_buffer_release_callback_t, iree_hal_buffer_t, iree_hal_external_buffer_flags_t,
     iree_hal_external_buffer_t, iree_hal_external_buffer_type_t, iree_hal_memory_advice_t,
     iree_hal_memory_protection_t, iree_hal_memory_type_bits_t_IREE_HAL_MEMORY_TYPE_OPTIMAL,
@@ -40,6 +42,14 @@ pub struct RocketAllocator {
     /// The open `/dev/accel/accel0` handle -- kept alive for the
     /// allocator's lifetime; every `Buffer::new` mmap needs a live `File`.
     pub file: std::fs::File,
+    /// The device that owns this allocator, stamped into every buffer's
+    /// `iree_hal_buffer_placement_t` (see `allocate_buffer`). Not owned/
+    /// retained -- the allocator is itself a field of `RocketDevice`, so
+    /// it can never outlive its owning device. Set via `set_device` right
+    /// after `device::create` has the device's final, boxed pointer (the
+    /// allocator has to exist before that pointer does, since it's one of
+    /// the fields used to construct `RocketDevice` in the first place).
+    pub device: *mut crate::bindings::iree_hal_device_t,
 }
 
 /// Mirrors `iree_hal_null_allocator_create()`. Not called from anywhere
@@ -53,8 +63,18 @@ pub fn create(file: std::fs::File, host_allocator: iree_allocator_t) -> *mut ire
         },
         host_allocator,
         file,
+        device: std::ptr::null_mut(),
     });
     Box::into_raw(allocator) as *mut iree_hal_allocator_t
+}
+
+/// See `RocketAllocator::device`'s doc comment for why this is a
+/// separate, post-construction step rather than a `create` parameter.
+pub unsafe fn set_device(
+    allocator: *mut iree_hal_allocator_t,
+    device: *mut crate::bindings::iree_hal_device_t,
+) {
+    unsafe { (*cast(allocator)).device = device };
 }
 
 unsafe fn cast(allocator: *mut iree_hal_allocator_t) -> *mut RocketAllocator {
@@ -119,13 +139,18 @@ unsafe extern "C" fn allocate_buffer(
     let alloc = unsafe { &*cast(allocator) };
     let params = unsafe { &*params };
 
-    let raw = unsafe {
-        device::Buffer::new(
-            alloc.file.as_raw_fd(),
-            allocation_size as usize,
-            &alloc.file,
-        )
-    };
+    // Same 0-byte guard as query_buffer_compatibility (real apps -- and
+    // CTS's AllocatorTest.AllocateEmptyBuffer -- hit this): unlike that
+    // query, iree_hal_allocator_allocate_buffer() dispatches straight to
+    // this vtable slot with the raw, unclamped size, so allocate_buffer
+    // itself must not pass 0 through to the kernel. The real
+    // `accel/rocket` driver's CREATE_BO rejects a 0-byte request with
+    // ENOSPC (drm_mm_insert_node_generic can't place a zero-length node),
+    // and even if it didn't, iree_rocket_hal's own Buffer::new immediately
+    // follows with `NonZeroUsize::new(size).unwrap()` for the mmap length,
+    // which panics on exactly this input.
+    let real_size = allocation_size.max(4);
+    let raw = unsafe { device::Buffer::new(alloc.file.as_raw_fd(), real_size as usize, &alloc.file) };
 
     let buffer = Box::new(RocketBuffer {
         // Filled in by iree_hal_buffer_initialize below -- this is just
@@ -137,20 +162,42 @@ unsafe extern "C" fn allocate_buffer(
         dma_address: raw.dma_address,
         host_ptr: raw.host_ptr,
         fd: alloc.file.as_raw_fd(),
+        deallocated: std::sync::atomic::AtomicBool::new(false),
     });
     let buffer_ptr = Box::into_raw(buffer);
 
     unsafe {
         let placement = iree_hal_buffer_placement_t {
-            device: std::ptr::null_mut(),
-            queue_affinity: 0,
-            flags: 0,
+            device: alloc.device,
+            // This driver has exactly one real queue -- IREE_HAL_QUEUE_
+            // AFFINITY_ANY (all bits set) gets resolved to that single
+            // concrete queue (bit 0) here, matching what a real multi-
+            // queue driver would do when actually placing a buffer.
+            // iree_hal_queue_affinity_count(placement.queue_affinity) == 1
+            // is a real, checked contract (CTS's QueueAllocaTest.
+            // BufferMetadata), not just documentation -- leaving this as
+            // 0 or as an unresolved wildcard both fail it.
+            queue_affinity: 1,
+            // Every buffer this driver hands out can be deallocated via
+            // queue_dealloca (see device.rs) -- without this flag,
+            // iree_hal_device_queue_dealloca() (device.c) treats the
+            // buffer as synchronously-owned and silently substitutes a
+            // no-op barrier (iree_hal_device_queue_barrier(), which calls
+            // straight into queue_execute with a NULL command buffer)
+            // instead of ever calling our real queue_dealloca. That NULL
+            // command buffer is exactly what queue_execute segfaulted on
+            // before it learned to tolerate it, and without this flag
+            // queue_dealloca's deallocated-marking (see buffer.rs) would
+            // never actually run for any test that goes through the
+            // standard iree_hal_device_queue_dealloca API.
+            flags: iree_hal_buffer_placement_flag_bits_t_IREE_HAL_BUFFER_PLACEMENT_FLAG_ASYNCHRONOUS
+                as u32,
             reserved: 0,
         };
         crate::bindings::iree_hal_buffer_initialize(
             placement,
             &mut (*buffer_ptr).base,
-            allocation_size,
+            real_size,
             0,
             allocation_size,
             params.type_,

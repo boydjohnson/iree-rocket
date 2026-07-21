@@ -47,3 +47,28 @@ iree_hal_cts_test_suite(
   NAME
     rocket
 )
+
+# Hand-written (not iree_hal_cts_test_suite's generic dispatch tests --
+# structurally skipped for "rocket", see backends.cc) end-to-end test for
+# the pooling ukernel, driving the real public IREE HAL API directly. See
+# pooling_dispatch_test.cc's own module doc comment for why this exists
+# alongside iree-rocket-hal/tests/pooling_hw.rs rather than instead of it.
+#
+# UNVERIFIED against a real build (no IREE source tree available while
+# writing this): the exact gtest DEPS target name(s) below are a guess by
+# analogy to other iree_cc_test() call sites elsewhere in IREE's own tree
+# (commonly "gtest" + "gtest_main", sometimes bundled as a single
+# "iree::testing::gtest"-style target) -- confirm/fix against whichever
+# convention this project's actual IREE checkout uses before trusting this
+# builds.
+iree_cc_test(
+  NAME
+    pooling_dispatch_test
+  SRCS
+    "pooling_dispatch_test.cc"
+  DEPS
+    iree::hal
+    rocket_hal_driver_static
+    gtest
+    gtest_main
+)
