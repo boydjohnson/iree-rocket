@@ -29,7 +29,7 @@
 use crate::rocket::{
     builders::{
         Bits, DOMAIN_CORE, DOMAIN_DPU, DOMAIN_PC, RegCmd, Register, RegisterMeta, cna::*, core::*,
-        dpu::*, dpu_rdma::*,
+        dpu::*, dpu_rdma::*, ppu::*, ppu_rdma::*,
     },
     registers::{
         PC_OPERATION_ENABLE_OP_EN, PC_OPERATION_ENABLE_RESERVED_0, REG_PC_OPERATION_ENABLE,
@@ -706,6 +706,308 @@ pub fn build_conv_regcmd(shape: &ConvShape, bufs: &ConvBuffers) -> Vec<RegCmd> {
     cmds.push(RegCmd::new_raw(0x0)); // PC_BASE_ADDRESS placeholder (single task)
     cmds.push(RegCmd::new(DOMAIN_PC, REG_PC_REGISTER_AMOUNTS, 0));
     cmds.push(RegCmd::new_raw(0x0041000000000000)); // TRM: required immediately before op_en
+    cmds.push(RegCmd::new(0x81, REG_PC_OPERATION_ENABLE, unsafe {
+        PC_OPERATION_ENABLE_RESERVED_0(14) | PC_OPERATION_ENABLE_OP_EN(1)
+    }));
+
+    if cmds.len() % 2 != 0 {
+        cmds.push(RegCmd::new_raw(0x0));
+    }
+
+    cmds
+}
+
+//===========================================================================
+// Pooling (standalone PPU, "flying mode" -- TRM Ch.36 Fig 36-6): PPU_RDMA
+// reads the input straight from memory and feeds PPU directly, bypassing
+// CNA/CORE/DPU entirely. There is NO Mesa/Teflon reference for this path
+// (`rkt_ml.c` only ever implements convolution) -- every field below is
+// derived from the PPU/PPU_RDMA register layout in `builders/ppu.rs` /
+// `builders/ppu_rdma.rs` (bindgen'd from Mesa's own `registers.xml`, see
+// builders.rs's DOMAIN_* comment) plus the TRM Ch.36 §4.6/§4.7 prose and
+// `build_conv_regcmd`'s established conventions (N-1 encoding on every
+// *_RDMA/CORE/DPU cube dimension, the same four-entry PC kick tail). NONE
+// of the following has been hardware-validated yet -- see the UNCONFIRMED
+// markers below and iree-rocket-hal/tests/pooling_hw.rs's doc comment for
+// the sweep tests needed before trusting this in production:
+//
+// - `PoolingMethod`'s bit encoding (0/1/2 for max/min/avg) -- the TRM
+//   prose lists "avg/max/min" but that's not necessarily encoding order.
+// - PPU_RDMA's `src_line_stride`/`src_surf_stride` and PPU's
+//   `dst_surf_stride`/`misc_ctrl.surf_len` formulas -- derived by analogy
+//   to CNA's input-side and DPU's output-side stride math in
+//   `build_conv_regcmd`, not independently confirmed for PPU/PPU_RDMA.
+// - Whether firing the same all-blocks op_en kick as `build_conv_regcmd`
+//   (which also asserts CNA/CORE/DPU/DPU_RDMA's op_en, not just PPU/
+//   PPU_RDMA's) is actually safe when those blocks have no configured
+//   task -- vs. needing a pooling-only op_en combination instead.
+//===========================================================================
+
+/// UNCONFIRMED bit encoding -- see module doc comment above. Best guess
+/// only; must be swept against real hardware (feed a kernel window with a
+/// known max/min/mean-distinguishing pattern and see which value of
+/// `PPU_OPERATION_MODE_CFG_POOLING_METHOD` actually produces which result)
+/// before trusting this mapping.
+#[derive(Clone, Copy)]
+pub enum PoolingMethod {
+    Max,
+    Min,
+    Avg,
+}
+
+impl PoolingMethod {
+    fn bits(self) -> u32 {
+        match self {
+            PoolingMethod::Max => 0,
+            PoolingMethod::Min => 1,
+            PoolingMethod::Avg => 2,
+        }
+    }
+}
+
+/// Logical shape of a single standalone pooling operation. Single-task
+/// only, no CBUF-budget splitting to worry about (PPU has no CBUF -- that
+/// concern is CNA/CORE-specific), no `index_en` output wiring yet (that
+/// needs a second output buffer for argmax/argmin positions, not plumbed
+/// here).
+pub struct PoolingShape {
+    pub input_width: u32,
+    pub input_height: u32,
+    pub input_channels: u32,
+    pub output_width: u32,
+    pub output_height: u32,
+    pub output_channels: u32,
+    pub kernel_width: u32,
+    pub kernel_height: u32,
+    pub stride_x: u32,
+    pub stride_y: u32,
+    pub method: PoolingMethod,
+    pub pad_left: u32,
+    pub pad_top: u32,
+    pub pad_right: u32,
+    pub pad_bottom: u32,
+    /// Fill value for padded taps (e.g. -inf-ish for max, 0 for avg --
+    /// caller's responsibility to pick something sane for `method`).
+    pub pad_value: u32,
+}
+
+/// DMA addresses for the two buffers a standalone pooling op needs.
+pub struct PoolingBuffers {
+    pub input_addr: u32,
+    /// NOTE: `PPU_DST_BASE_ADDR` is a genuinely 28-bit hardware field
+    /// (unlike every other block's 32-bit `*_BASE_ADDR` registers -- see
+    /// `PpuDstBaseAddr::dst_base_addr`'s `Bits<28>` parameter, confirmed
+    /// against the bindgen'd header, not a guess). A `CREATE_BO`
+    /// allocation whose `dma_address` lands >= 0x1000_0000 (256MiB) into
+    /// DMA-visible space cannot be addressed by PPU's output stage as-is.
+    /// `build_pooling_regcmd` asserts this explicitly (a clear panic
+    /// message) rather than letting `Bits::<28>::new` fail with its
+    /// generic "value exceeds designated bit width" message. Whether the
+    /// real fix is "PPU output must live in the first 256MiB" or "this
+    /// field is actually a shifted/word address with more real range"
+    /// is unconfirmed -- needs checking once a test allocates enough
+    /// buffers to push an output address past the boundary.
+    pub output_addr: u32,
+}
+
+pub fn build_pooling_regcmd(shape: &PoolingShape, bufs: &PoolingBuffers) -> Vec<RegCmd> {
+    const PPU_DST_BASE_ADDR_BITS: u32 = 28;
+    assert!(
+        bufs.output_addr < (1u32 << PPU_DST_BASE_ADDR_BITS),
+        "build_pooling_regcmd: output_addr {:#x} does not fit PPU_DST_BASE_ADDR's \
+         {PPU_DST_BASE_ADDR_BITS}-bit field (see PoolingBuffers::output_addr's doc \
+         comment) -- this buffer's physical/DMA address lands past the 256MiB PPU \
+         can currently address for output",
+        bufs.output_addr
+    );
+
+    const ATOMIC_K_SIZE: u32 = 16;
+    const FEATURE_ATOMIC_SIZE: u32 = 16;
+
+    // UNCONFIRMED, derived by analogy to CNA's input-side stride math in
+    // build_conv_regcmd -- see module doc comment.
+    let src_line_stride = shape.input_width * ATOMIC_K_SIZE;
+    let src_surf_stride = src_line_stride * shape.input_height;
+
+    // UNCONFIRMED, derived by analogy to DPU's output-side stride math in
+    // build_conv_regcmd -- see module doc comment.
+    let dst_surf_stride =
+        (shape.output_width * ATOMIC_K_SIZE * shape.output_height) / FEATURE_ATOMIC_SIZE;
+    let surf_len = shape.output_width * shape.output_height;
+
+    // Average-pooling's divide-as-multiply trick (TRM §4.6): precomputed
+    // reciprocal of the kernel dimension, x2^16. Always computed (not just
+    // under Avg) -- build_conv_regcmd's own precedent is to always fill
+    // every register regardless of which branch is logically active.
+    let recip_kernel_width = ((1u64 << 16) / shape.kernel_width as u64) as u32;
+    let recip_kernel_height = ((1u64 << 16) / shape.kernel_height as u64) as u32;
+
+    let mut cmds: Vec<RegCmd> = Vec::new();
+
+    // ========================================================================
+    // Ping-pong pointers -- same pattern/values as build_conv_regcmd's
+    // DPU/DPU_RDMA pair, applied to the two blocks this op actually uses.
+    // ========================================================================
+
+    cmds.push(
+        Register::<PpuSPointer>::new()
+            .pointer_pp_mode(Bits::new(1))
+            .executer_pp_en(Bits::new(1))
+            .pointer_pp_en(Bits::new(1))
+            .build(),
+    );
+    cmds.push(
+        Register::<PpuRdmaSPointer>::new()
+            .pointer_pp_mode(Bits::new(1))
+            .executer_pp_en(Bits::new(1))
+            .pointer_pp_en(Bits::new(1))
+            .build(),
+    );
+
+    // ========================================================================
+    // PPU_RDMA -- standalone read side, feeds PPU directly from memory.
+    // ========================================================================
+
+    cmds.push(
+        Register::<PpuRdmaCubeInWidth>::new()
+            .cube_in_width(Bits::new(shape.input_width - 1))
+            .build(),
+    );
+    cmds.push(
+        Register::<PpuRdmaCubeInHeight>::new()
+            .cube_in_height(Bits::new(shape.input_height - 1))
+            .build(),
+    );
+    cmds.push(
+        Register::<PpuRdmaCubeInChannel>::new()
+            .cube_in_channel(Bits::new(shape.input_channels - 1))
+            .build(),
+    );
+    cmds.push(
+        Register::<PpuRdmaSrcBaseAddr>::new()
+            .src_base_addr(Bits::new(bufs.input_addr))
+            .build(),
+    );
+    cmds.push(
+        Register::<PpuRdmaSrcLineStride>::new()
+            .src_line_stride(Bits::new(src_line_stride))
+            .build(),
+    );
+    cmds.push(
+        Register::<PpuRdmaSrcSurfStride>::new()
+            .src_surf_stride(Bits::new(src_surf_stride))
+            .build(),
+    );
+    cmds.push(zero::<PpuRdmaDataFormat>()); // in_precision = 0 (int8)
+
+    // ========================================================================
+    // PPU
+    // ========================================================================
+
+    cmds.push(
+        Register::<PpuDataCubeInWidth>::new()
+            .cube_in_width(Bits::new(shape.input_width - 1))
+            .build(),
+    );
+    cmds.push(
+        Register::<PpuDataCubeInHeight>::new()
+            .cube_in_height(Bits::new(shape.input_height - 1))
+            .build(),
+    );
+    cmds.push(
+        Register::<PpuDataCubeInChannel>::new()
+            .cube_in_channel(Bits::new(shape.input_channels - 1))
+            .build(),
+    );
+    cmds.push(
+        Register::<PpuDataCubeOutWidth>::new()
+            .cube_out_width(Bits::new(shape.output_width - 1))
+            .build(),
+    );
+    cmds.push(
+        Register::<PpuDataCubeOutHeight>::new()
+            .cube_out_height(Bits::new(shape.output_height - 1))
+            .build(),
+    );
+    cmds.push(
+        Register::<PpuDataCubeOutChannel>::new()
+            .cube_out_channel(Bits::new(shape.output_channels - 1))
+            .build(),
+    );
+
+    cmds.push(
+        Register::<PpuOperationModeCfg>::new()
+            .pooling_method(Bits::new(shape.method.bits()))
+            .flying_mode(Bits::new(1)) // standalone via PPU_RDMA, not pipelined after DPU
+            .index_en(Bits::new(0)) // no argmax/argmin output wiring yet
+            .use_cnt(Bits::new(0))
+            .notch_addr(Bits::new(0))
+            .build(),
+    );
+    cmds.push(
+        Register::<PpuPoolingKernelCfg>::new()
+            .kernel_width(Bits::new(shape.kernel_width - 1))
+            .kernel_height(Bits::new(shape.kernel_height - 1))
+            .kernel_stride_width(Bits::new(shape.stride_x - 1))
+            .kernel_stride_height(Bits::new(shape.stride_y - 1))
+            .build(),
+    );
+    cmds.push(
+        Register::<PpuRecipKernelWidth>::new()
+            .recip_kernel_width(Bits::new(recip_kernel_width))
+            .build(),
+    );
+    cmds.push(
+        Register::<PpuRecipKernelHeight>::new()
+            .recip_kernel_height(Bits::new(recip_kernel_height))
+            .build(),
+    );
+    cmds.push(
+        Register::<PpuPoolingPaddingCfg>::new()
+            .pad_left(Bits::new(shape.pad_left))
+            .pad_top(Bits::new(shape.pad_top))
+            .pad_right(Bits::new(shape.pad_right))
+            .pad_bottom(Bits::new(shape.pad_bottom))
+            .build(),
+    );
+    cmds.push(
+        Register::<PpuPaddingValue1Cfg>::new()
+            .pad_value_0(Bits::new(shape.pad_value))
+            .build(),
+    );
+    cmds.push(zero::<PpuPaddingValue2Cfg>());
+
+    cmds.push(
+        Register::<PpuDstBaseAddr>::new()
+            .dst_base_addr(Bits::new(bufs.output_addr))
+            .build(),
+    );
+    cmds.push(
+        Register::<PpuDstSurfStride>::new()
+            .dst_surf_stride(Bits::new(dst_surf_stride))
+            .build(),
+    );
+    cmds.push(zero::<PpuDataFormat>()); // proc_precision=0 (int8), dpu_flyin=0 (standalone)
+    cmds.push(
+        Register::<PpuMiscCtrl>::new()
+            .burst_len(Bits::new(15))
+            .nonalign(Bits::new(0))
+            .mc_surf_out(Bits::new(0))
+            .surf_len(Bits::new(surf_len))
+            .build(),
+    );
+
+    // ========================================================================
+    // Kick sequence -- identical tail to build_conv_regcmd's (single task,
+    // all-blocks op_en broadcast). See that function's own comment; whether
+    // this is safe to fire unconditionally for CNA/CORE/DPU/DPU_RDMA when
+    // this op never configured them is one of the open questions flagged
+    // in this section's module doc comment.
+    // ========================================================================
+
+    cmds.push(RegCmd::new_raw(0x0));
+    cmds.push(RegCmd::new(DOMAIN_PC, REG_PC_REGISTER_AMOUNTS, 0));
+    cmds.push(RegCmd::new_raw(0x0041000000000000));
     cmds.push(RegCmd::new(0x81, REG_PC_OPERATION_ENABLE, unsafe {
         PC_OPERATION_ENABLE_RESERVED_0(14) | PC_OPERATION_ENABLE_OP_EN(1)
     }));
