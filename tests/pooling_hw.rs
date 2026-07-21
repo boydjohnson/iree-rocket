@@ -148,6 +148,14 @@ unsafe fn run_pooling(
 
         fini_bo(fd, buf_in.handle).ok();
         fini_bo(fd, buf_cmd.handle).ok();
+        // buf_out was CPU-zero-filled by the caller (run_uniform_pooling /
+        // pooling_method_encoding_discovery) -- that write needs the same
+        // dma_sync_sgtable_for_device() hand-off as every other buffer the
+        // device touches, or the CPU's dirty cache line for it can race the
+        // device's real write and win, silently clobbering the result back
+        // to zero. conv_hw.rs's known-good buf_c handling already does
+        // this; this file previously didn't.
+        fini_bo(fd, buf_out.handle).ok();
 
         let in_handles = [buf_cmd.handle, buf_in.handle];
         let out_handles = [buf_out.handle];
@@ -272,4 +280,65 @@ fn pooling_method_encoding_discovery() {
          them to differ given a genuinely bimodal input",
         results
     );
+}
+
+/// Diagnostic, not a correctness check -- added after
+/// `pooling_*_completes_and_output_tracks_input` came back all-zero on
+/// real hardware for every method and every fill level. That specific
+/// failure signature (not just "methods agree with each other" but
+/// literally zero everywhere) rules out a mislabeled-but-working
+/// `pooling_method` and pointed first at `PPU_DST_BASE_ADDR`'s address
+/// convention (fixed to write `output_addr >> 4`, matching TRM's
+/// documented `pc_base_address` bits[31:4] precedent) -- but a full-buffer
+/// dump still came back all zero even after that fix. That's ambiguous on
+/// its own: pre-filling the output buffer with zero means "PPU wrote real
+/// zeros here" and "PPU never touched this buffer at all" look identical.
+///
+/// Pre-fills with a distinctive non-zero sentinel (0xAA) instead, so ANY
+/// write reaching this buffer -- even a wrong/garbage one -- must knock at
+/// least some bytes off 0xAA. Two outcomes:
+/// - Still all 0xAA: PPU's write genuinely never lands in this buffer at
+///   all (address still wrong, or PPU/PPU_RDMA's op_en never really
+///   fired for this dispatch despite PREP_BO completing).
+/// - Anything else: the address is right and PPU is writing here, so the
+///   remaining suspect is the *input* side -- PPU_RDMA's
+///   `src_line_stride`/`src_surf_stride` formulas (flagged UNCONFIRMED in
+///   build_pooling_regcmd's module doc comment), which would make PPU
+///   compute over fetched garbage/zeroed memory rather than the real
+///   input, landing on 0 (or some other wrong-but-real value) regardless
+///   of method.
+#[test]
+#[ignore = "needs the real NPU device -- cross-compile for aarch64, copy to the board, run there; \
+            diagnostic only, not a pass/fail check -- read the printed hex dump"]
+fn pooling_dump_full_output_buffer() {
+    let shape = tiled_shape(PoolingMethod::Max);
+    let file = OpenOptions::new()
+        .read(true)
+        .write(true)
+        .open(DEVICE_PATH)
+        .expect("failed to open NPU device");
+    let fd = file.as_raw_fd();
+
+    unsafe {
+        let buf_in = Buffer::new(fd, TENSOR_SIZE, &file);
+        ptr::write_bytes(buf_in.host_ptr, 200u8, TENSOR_SIZE);
+
+        let buf_out = Buffer::new(fd, TENSOR_SIZE, &file);
+        ptr::write_bytes(buf_out.host_ptr, 0xAAu8, TENSOR_SIZE);
+
+        run_pooling(&file, fd, &shape, &buf_in, &buf_out, 4);
+
+        let raw = std::slice::from_raw_parts(buf_out.host_ptr, TENSOR_SIZE);
+        eprintln!("pooling_dump_full_output_buffer: full {TENSOR_SIZE}-byte output buffer (sentinel-filled 0xAA, input uniformly filled with 200):");
+        for (row, chunk) in raw.chunks(32).enumerate() {
+            let hex: String = chunk.iter().map(|b| format!("{b:02x} ")).collect();
+            eprintln!("  {:04x}: {hex}", row * 32);
+        }
+        let unchanged_count = raw.iter().filter(|&&b| b == 0xAA).count();
+        eprintln!(
+            "pooling_dump_full_output_buffer: {unchanged_count}/{TENSOR_SIZE} bytes still == 0xAA \
+             (if this is TENSOR_SIZE, PPU's write never reached this buffer at all; if less, \
+             something did write here -- check what value landed where)"
+        );
+    }
 }
