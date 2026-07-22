@@ -396,6 +396,23 @@ pub struct AddTensor {
     /// capture behind this code needed `1` for its own particular
     /// calibration.
     pub cvt_offset: u32,
+    /// Raw `ew_alu_algo` opcode (bits 19:16 of `EW_CFG`) -- the TRM
+    /// documents `0=Max, 1=Min, 2=Add, 3=Div, 4=Minus, 5=Abs, 6=Neg,
+    /// 7=Floor, 8=Ceil` for this field. Only `2` (Add, with `scale`'s
+    /// sign giving Add vs. Subtract -- see this struct's own doc
+    /// comment) is hardware-confirmed correct end-to-end (register
+    /// recipe AND live numeric output). Other values, including `3`
+    /// (Div), are driven directly from the TRM's documented opcode list
+    /// as a genuine hardware experiment -- no compiled model was ever
+    /// observed emitting them (a standalone `x / y` ONNX export compiled
+    /// with NO active EW/BN/BS-mul dispatch anywhere in the file, i.e.
+    /// the real vendor compiler doesn't appear to route division through
+    /// this opcode at all, for reasons not otherwise understood -- see
+    /// `rknpu-spelunking/NOTES.md`'s "Elementwise tensor-tensor ops"
+    /// section), so `ew_add_cvt`'s scale/shift formula (derived from
+    /// Mesa's ADD-specific math) is NOT known to apply for these other
+    /// opcodes at all -- treat any non-`2` result as exploratory.
+    pub algo: u32,
 }
 
 /// Logical shape of a single conv operation (`operation->*` in Mesa).
@@ -1025,7 +1042,7 @@ fn build_conv_cna_core_dpu_dpu_rdma(
                 .ew_cvt_type(Bits::new(1))
                 .ew_data_mode(Bits::new(1))
                 .edata_size(Bits::new(1))
-                .ew_alu_algo(Bits::new(2)) // Add -- TRM's ew_alu_algo encoding
+                .ew_alu_algo(Bits::new(add.algo)) // see AddTensor::algo's doc comment
                 .ew_relu_bypass(Bits::new(1))
                 .ew_lut_bypass(Bits::new(1))
                 .ew_op_src(Bits::new(1)) // operand from outside (the second tensor)

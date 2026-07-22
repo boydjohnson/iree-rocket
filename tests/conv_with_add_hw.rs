@@ -65,17 +65,21 @@ fn conv_shape() -> ConvShape {
     }
 }
 
-/// Runs `x + scale*y` with the whole `x` plane filled with `x_fill`,
-/// the whole `y` plane filled with `y_fill`, a 1x1 identity-ish weight
-/// (`weight_fill`), and returns the 16 real output pixels. `scale=1.0`
-/// is addition; `scale=-1.0` is subtraction (`x - y`) -- see
-/// `AddTensor`'s own doc comment on why a negative `scale` is the right
-/// way to get subtraction out of this same struct/builder.
+/// Runs `x <algo> scale*y` (where `<algo>` is `EW_CFG`'s raw
+/// `ew_alu_algo` opcode -- `2`=Add, `3`=Div, etc, see `AddTensor::algo`'s
+/// doc comment) with the whole `x` plane filled with `x_fill`, the
+/// whole `y` plane filled with `y_fill`, a 1x1 identity-ish weight
+/// (`weight_fill`), and returns the 16 real output pixels. `algo=2,
+/// scale=1.0` is addition; `algo=2, scale=-1.0` is subtraction (`x - y`)
+/// -- see `AddTensor`'s own doc comment on why a negative `scale` is
+/// the right way to get subtraction out of the SAME `algo=2` rather
+/// than a distinct opcode.
 fn run_uniform_conv_with_add_scaled(
     x_fill: u8,
     y_fill: u8,
     weight_fill: u8,
     scale: f32,
+    algo: u32,
 ) -> Vec<u8> {
     let file = OpenOptions::new()
         .read(true)
@@ -113,6 +117,7 @@ fn run_uniform_conv_with_add_scaled(
             ew_addr: buf_y.dma_address,
             scale,
             cvt_offset: 0,
+            algo,
         };
         let cmds = build_conv_with_add_regcmd(&conv_shape(), &bufs, &addition);
 
@@ -179,7 +184,7 @@ fn run_uniform_conv_with_add_scaled(
 #[test]
 #[ignore = "needs the real NPU device -- cross-compile for aarch64, copy to the board, run there"]
 fn conv_with_add_completes() {
-    let out = run_uniform_conv_with_add_scaled(0, 0, 64, 1.0);
+    let out = run_uniform_conv_with_add_scaled(0, 0, 64, 1.0, 2);
     eprintln!("conv_with_add_completes: output={out:?}");
 }
 
@@ -217,7 +222,7 @@ fn conv_with_add_tracks_x_plus_y() {
     let mut prev: Option<u8> = None;
 
     for x_fill in fills {
-        let raw = run_uniform_conv_with_add_scaled(x_fill, 128, 0x81, 1.0)[0];
+        let raw = run_uniform_conv_with_add_scaled(x_fill, 128, 0x81, 1.0, 2)[0];
         eprintln!(
             "conv_with_add_tracks_x_plus_y: x_fill={x_fill} (real={}) y_fill=128 (real=0): raw={raw} (real={})",
             x_fill as i32 - 0x80,
@@ -358,7 +363,7 @@ fn conv_with_add_tracks_y_alone() {
     let mut prev: Option<u8> = None;
 
     for y_fill in fills {
-        let raw = run_uniform_conv_with_add_scaled(128, y_fill, 0x80, 1.0)[0];
+        let raw = run_uniform_conv_with_add_scaled(128, y_fill, 0x80, 1.0, 2)[0];
         eprintln!(
             "conv_with_add_tracks_y_alone: x_fill=128 (real=0, weight_real=0) y_fill={y_fill} (real={}): raw={raw} (real={})",
             y_fill as i32 - 0x80,
@@ -410,7 +415,7 @@ fn conv_with_sub_tracks_neg_y() {
     let mut prev: Option<u8> = None;
 
     for y_fill in fills {
-        let raw = run_uniform_conv_with_add_scaled(128, y_fill, 0x80, -1.0)[0];
+        let raw = run_uniform_conv_with_add_scaled(128, y_fill, 0x80, -1.0, 2)[0];
         eprintln!(
             "conv_with_sub_tracks_neg_y: x_fill=128 (real=0, weight_real=0) y_fill={y_fill} (real={}): raw={raw} (real={})",
             y_fill as i32 - 0x80,
@@ -427,4 +432,58 @@ fn conv_with_sub_tracks_neg_y() {
         }
         prev = Some(raw);
     }
+}
+
+/// Most basic possible check for Div (`algo=3`): does the EW unit even
+/// accept this opcode without hanging the NPU? Same `weight_fill=64`
+/// convention as `conv_with_add_completes` -- see that test's own doc
+/// comment for why this alone doesn't confirm correctness, only that
+/// the job runs. **No compiled model was ever observed emitting
+/// `ew_alu_algo=3`** -- a standalone `x / y` ONNX export compiled with
+/// no active EW/BN/BS-mul dispatch anywhere in the file at all (see
+/// `AddTensor::algo`'s doc comment and `rknpu-spelunking/NOTES.md`) --
+/// so this is a genuine first hardware experiment driving a TRM-
+/// documented opcode directly, not confirming a real vendor-compiled
+/// recipe the way `algo=2` (Add) was.
+#[test]
+#[ignore = "needs the real NPU device -- cross-compile for aarch64, copy to the board, run there"]
+fn conv_with_div_completes() {
+    let out = run_uniform_conv_with_add_scaled(0, 0, 64, 1.0, 3);
+    eprintln!("conv_with_div_completes: output={out:?}");
+}
+
+/// Numeric check for Div, same `weight_fill=0x80` (real weight `0`,
+/// accumulator held at a clean `0`) isolation trick as `conv_with_add_
+/// tracks_y_alone`/`conv_with_sub_tracks_neg_y`. Originally asserted
+/// `0 / y_real == 0` for every nonzero `y_fill` (if `algo=3` divides
+/// the accumulator BY `y`) -- **that assertion was wrong and panicked
+/// on the very first point** (`y_fill=118`, real `-10`, came back real
+/// `-128` -- saturated at the int8 floor, not `0`). Real `-128` for a
+/// NEGATIVE `y` is exactly what you'd expect from computing `y /
+/// accumulator` = `-10 / 0`, saturating toward negative infinity --
+/// i.e. the operand ORDER may be backwards from what `Add`/`Sub`'s
+/// `src`(primary)/`ew`(fused operand) roles would suggest. Rewritten to
+/// collect and print the WHOLE sweep before drawing any conclusion,
+/// rather than aborting on the first surprising point -- if the `y /
+/// accumulator` hypothesis is right, POSITIVE `y_fill` values should
+/// saturate the OTHER direction (real `127`, the int8 ceiling), and
+/// `y_fill=128` (`y_real=0`, i.e. `0/0`) is the genuine wildcard, left
+/// unasserted either way.
+#[test]
+#[ignore = "needs the real NPU device -- cross-compile for aarch64, copy to the board, run there"]
+fn conv_with_div_zero_over_y() {
+    let fills = [118u8, 121, 124, 127, 128, 129, 132, 135, 138];
+    let mut results = Vec::new();
+
+    for y_fill in fills {
+        let raw = run_uniform_conv_with_add_scaled(128, y_fill, 0x80, 1.0, 3)[0];
+        eprintln!(
+            "conv_with_div_zero_over_y: x_fill=128 (real=0, weight_real=0) y_fill={y_fill} (real={}): raw={raw} (real={})",
+            y_fill as i32 - 0x80,
+            raw as i32 - 0x80
+        );
+        results.push((y_fill, raw));
+    }
+
+    eprintln!("conv_with_div_zero_over_y: full sweep = {results:?}");
 }
