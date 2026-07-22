@@ -293,6 +293,78 @@ fn lut_out_cvt(output_scale: f32) -> (u32, u32) {
     (operand, shift as u32)
 }
 
+/// `EW_CVT_SCALE_VALUE`'s packed `(scale, shift)` for `AddTensor` --
+/// ported directly from Mesa's `rkt_regcmd.c` (`float add_scale =
+/// operation->addition_scale / (task->input_scale *
+/// task->weights_scale); ... add_shift = 127+31-32-(add_scale_bits>>23)+
+/// 16; scale = (add_scale_bits>>9) & 0x7fff; if (scale < 1<<14) scale |=
+/// 1<<14;`) -- the same float-bits mantissa/exponent split
+/// `build_conv_cna_core_dpu_dpu_rdma`'s own `out_scale`/`out_shift`
+/// already uses, just a different formula input and NO `+ 1` on the
+/// scale (unlike `out_scale`). Confirmed bit-exact against a real
+/// hardware capture of a standalone `x + y` int8 model (see
+/// `AddTensor`'s doc comment) -- not reverse-engineered, a direct port.
+fn ew_add_cvt(addition_scale: f32, input_scale: f32, weights_scale: f32) -> (u32, u32) {
+    let add_scale = addition_scale / (input_scale * weights_scale);
+    let add_scale_bits = add_scale.to_bits();
+    let add_scale_exponent = ((add_scale_bits >> 23) & 0xff) as i32;
+    let add_shift = 127 + 31 - 32 - add_scale_exponent + 16;
+    let mut scale = (add_scale_bits >> 9) & 0x7fff;
+    if scale < (1 << 14) {
+        scale |= 1 << 14;
+    }
+    (scale, (add_shift - 1) as u32)
+}
+
+/// Element-wise "add_tensor" fusion onto a conv's own DPU pass -- Mesa's
+/// `rkt_regcmd.c` `operation->add_tensor != -1` branch, ported directly
+/// from that C source (see `build_conv_cna_core_dpu_dpu_rdma`'s doc
+/// comment for exactly which fields are hardware-confirmed vs. taken
+/// as-is from Mesa without independent re-derivation). Phase 5's EW-core
+/// research spike found this dispatch's real register values match a
+/// live hardware capture of a standalone `x + y` model bit-exact
+/// (`rknpu-spelunking/NOTES.md`'s "Elementwise tensor-tensor ops"
+/// section) -- `ew_alu_algo=2` (Add) is the confirmed opcode; the TRM
+/// documents `3=Div, 4=Minus, 0=Max, 1=Min, 5=Abs, 6=Neg, 7=Floor,
+/// 8=Ceil` as the same field's other values, none tested yet.
+#[derive(Clone, Copy)]
+pub struct AddTensor {
+    /// Real DMA address `DPU_RDMA_RDMA_SRC_BASE_ADDR` reads from. Mesa's
+    /// own C computes this as the add_tensor's own `phys_addr +
+    /// task->output_offset` -- NOT simply "the conv's usual primary
+    /// input" (a plain conv's DPU pass is pipelined on-chip from
+    /// CNA/CORE and never uses this register at all -- it reads 0 in
+    /// every other builder in this module; it's only ever nonzero in
+    /// this fused case, confirmed in the live capture too). Exposed here
+    /// as a plain resolved address like every other `*_addr` field in
+    /// this module, rather than replicating Mesa's own internal
+    /// tensor/subgraph offset arithmetic.
+    pub src_addr: u32,
+    /// Real DMA address `DPU_RDMA_RDMA_EW_BASE_ADDR`/ERDMA reads from --
+    /// the actual second operand EW's ALU adds to the conv's own
+    /// accumulator. In Mesa's own C this is the SAME tensor as
+    /// `src_addr` above, offset by one whole output plane
+    /// (`output_width * output_height * ATOMIC_K_SIZE` bytes) -- a
+    /// caller that wants to match Mesa's own buffer layout can replicate
+    /// that itself; this crate doesn't assume or enforce the
+    /// relationship between the two addresses.
+    pub ew_addr: u32,
+    /// The second tensor's own quantization scale. `EW_CVT_SCALE_VALUE`'s
+    /// packed shift/scale is `addition_scale / (input_scale *
+    /// weights_scale)`, ported directly from Mesa's C formula (not
+    /// reverse-engineered) -- confirmed bit-exact against a real
+    /// hardware capture for one calibration.
+    pub scale: f32,
+    /// Raw value written to `EW_CVT_OFFSET_VALUE` verbatim. Mesa's own
+    /// `operation->addition_offset` is used as-is in its C source with
+    /// no zero-point-based formula shown deriving it -- this crate does
+    /// the same rather than guessing one. UNCONFIRMED what real-world
+    /// zero point this should be derived from in general; the one real
+    /// capture behind this code needed `1` for its own particular
+    /// calibration.
+    pub cvt_offset: u32,
+}
+
 /// Logical shape of a single conv operation (`operation->*` in Mesa).
 #[derive(Clone, Copy)]
 pub struct ConvShape {
@@ -375,10 +447,18 @@ pub struct LutBuffers {
 /// -- UNCONFIRMED whether the hardware truly ignores them in that case or
 /// just doesn't care what's there, but 0 matches this codebase's existing
 /// "safe default when unused" convention.
+///
+/// `addition`, when `Some`, fuses Mesa's `add_tensor` element-wise-add
+/// path into this same DPU pass instead of the usual fully-bypassed
+/// EW/ERDMA block -- see `AddTensor`'s own doc comment for exactly
+/// what's hardware-confirmed. Every existing caller passes `None`
+/// (unchanged behavior); only `build_conv_with_add_regcmd` passes
+/// `Some`.
 fn build_conv_cna_core_dpu_dpu_rdma(
     shape: &ConvShape,
     bufs: &ConvBuffers,
     dpu_output_mode: u32,
+    addition: Option<&AddTensor>,
 ) -> Vec<RegCmd> {
     let input_channels_real_is_one = shape.input_channels == 1;
     assert!(
@@ -902,24 +982,53 @@ fn build_conv_cna_core_dpu_dpu_rdma(
     cmds.push(zero::<DpuBnMulCfg>());
     cmds.push(zero::<DpuBnReluxCmpValue>());
 
-    // EW (elementwise): add_tensor == -1 branch (unconditional -- no
-    // add_tensor support in this function), fully bypassed, all five bits.
-    cmds.push(
-        Register::<DpuEwCfg>::new()
-            .ew_relu_bypass(Bits::new(1))
-            .ew_op_cvt_bypass(Bits::new(1))
-            .ew_lut_bypass(Bits::new(1))
-            .ew_op_bypass(Bits::new(1))
-            .ew_bypass(Bits::new(1))
-            .build(),
-    );
-    cmds.push(zero::<DpuEwCvtOffsetValue>());
-    cmds.push(
-        Register::<DpuEwCvtScaleValue>::new()
-            .ew_op_cvt_scale(Bits::new(1))
-            .build(),
-    );
-    cmds.push(zero::<DpuEwReluxCmpValue>());
+    // EW (elementwise): `addition.is_none()` is the original add_tensor==-1
+    // branch (fully bypassed, all five bits), unchanged. `Some` fuses
+    // Mesa's add_tensor path -- ported directly from `rkt_regcmd.c`, see
+    // `AddTensor`'s doc comment for what's hardware-confirmed.
+    if let Some(add) = addition {
+        cmds.push(
+            Register::<DpuEwCfg>::new()
+                .ew_cvt_type(Bits::new(1))
+                .ew_data_mode(Bits::new(1))
+                .edata_size(Bits::new(1))
+                .ew_alu_algo(Bits::new(2)) // Add -- TRM's ew_alu_algo encoding
+                .ew_relu_bypass(Bits::new(1))
+                .ew_lut_bypass(Bits::new(1))
+                .ew_op_src(Bits::new(1)) // operand from outside (the second tensor)
+                .build(),
+        );
+        cmds.push(
+            Register::<DpuEwCvtOffsetValue>::new()
+                .ew_op_cvt_offset(Bits::new(add.cvt_offset))
+                .build(),
+        );
+        let (ew_scale, ew_shift) = ew_add_cvt(add.scale, shape.input_scale, shape.weights_scale);
+        cmds.push(
+            Register::<DpuEwCvtScaleValue>::new()
+                .ew_op_cvt_scale(Bits::new(ew_scale))
+                .ew_op_cvt_shift(Bits::new(ew_shift))
+                .build(),
+        );
+        cmds.push(zero::<DpuEwReluxCmpValue>());
+    } else {
+        cmds.push(
+            Register::<DpuEwCfg>::new()
+                .ew_relu_bypass(Bits::new(1))
+                .ew_op_cvt_bypass(Bits::new(1))
+                .ew_lut_bypass(Bits::new(1))
+                .ew_op_bypass(Bits::new(1))
+                .ew_bypass(Bits::new(1))
+                .build(),
+        );
+        cmds.push(zero::<DpuEwCvtOffsetValue>());
+        cmds.push(
+            Register::<DpuEwCvtScaleValue>::new()
+                .ew_op_cvt_scale(Bits::new(1))
+                .build(),
+        );
+        cmds.push(zero::<DpuEwReluxCmpValue>());
+    }
 
     cmds.push(
         Register::<DpuOutCvtOffset>::new()
@@ -986,7 +1095,15 @@ fn build_conv_cna_core_dpu_dpu_rdma(
             .build(),
     );
 
-    cmds.push(zero::<DpuRdmaSrcBaseAddr>()); // add_tensor == -1
+    if let Some(add) = addition {
+        cmds.push(
+            Register::<DpuRdmaSrcBaseAddr>::new()
+                .src_base_addr(Bits::new(add.src_addr))
+                .build(),
+        );
+    } else {
+        cmds.push(zero::<DpuRdmaSrcBaseAddr>()); // add_tensor == -1
+    }
     cmds.push(
         Register::<DpuRdmaBrdmaCfg>::new()
             .brdma_data_use(Bits::new(1))
@@ -1000,13 +1117,34 @@ fn build_conv_cna_core_dpu_dpu_rdma(
     cmds.push(zero::<DpuRdmaNrdmaCfg>());
     cmds.push(zero::<DpuRdmaBnBaseAddr>());
 
-    cmds.push(
-        Register::<DpuRdmaErdmaCfg>::new()
-            .erdma_disable(Bits::new(1))
-            .build(),
-    ); // add_tensor == -1
-    cmds.push(zero::<DpuRdmaEwBaseAddr>());
-    cmds.push(zero::<DpuRdmaEwSurfStride>());
+    if let Some(add) = addition {
+        cmds.push(
+            Register::<DpuRdmaErdmaCfg>::new()
+                .erdma_data_mode(Bits::new(1))
+                .erdma_data_size(Bits::new(1))
+                .build(),
+        );
+        cmds.push(
+            Register::<DpuRdmaEwBaseAddr>::new()
+                .ew_base_addr(Bits::new(add.ew_addr))
+                .build(),
+        );
+        // Mesa: `MAX2(operation->output_width * operation->output_height, 12)`.
+        let ew_stride = (shape.output_width * shape.output_height).max(12);
+        cmds.push(
+            Register::<DpuRdmaEwSurfStride>::new()
+                .ew_surf_stride(Bits::new(ew_stride))
+                .build(),
+        );
+    } else {
+        cmds.push(
+            Register::<DpuRdmaErdmaCfg>::new()
+                .erdma_disable(Bits::new(1))
+                .build(),
+        ); // add_tensor == -1
+        cmds.push(zero::<DpuRdmaEwBaseAddr>());
+        cmds.push(zero::<DpuRdmaEwSurfStride>());
+    }
 
     let mut rdma_feat_mode_builder = Register::<DpuRdmaFeatureModeCfg>::new();
     rdma_feat_mode_builder
@@ -1315,7 +1453,40 @@ pub fn build_lut_regcmd(shape: &LutShape, bufs: &LutBuffers, table: LutTable) ->
 }
 
 pub fn build_conv_regcmd(shape: &ConvShape, bufs: &ConvBuffers) -> Vec<RegCmd> {
-    let mut cmds = build_conv_cna_core_dpu_dpu_rdma(shape, bufs, 2); // 2 = outside/memory only, unchanged original behavior
+    let mut cmds = build_conv_cna_core_dpu_dpu_rdma(shape, bufs, 2, None); // 2 = outside/memory only, unchanged original behavior
+    push_kick(&mut cmds, KICK_CNA | KICK_CORE | KICK_DPU | KICK_DPU_RDMA);
+    cmds
+}
+
+/// A single conv task with Mesa's `add_tensor` element-wise-add fused
+/// onto its own DPU pass -- see `AddTensor`'s doc comment for the full
+/// derivation (TRM's documented `ew_alu_algo` opcodes, Mesa's
+/// `rkt_regcmd.c` source this is ported from, and the live hardware
+/// capture of a standalone `x + y` model that confirmed the resulting
+/// register values bit-exact). Same single task/kick shape as
+/// `build_conv_regcmd` -- `addition` only changes what the DPU pass's
+/// own EW/ERDMA block does, not the task structure around it.
+///
+/// NOT YET HARDWARE-VALIDATED THROUGH THIS EXACT FUNCTION: the real
+/// captured model that confirmed `AddTensor`'s register recipe compiled
+/// to a 3-task chain (a real conv-shaped task producing an intermediate,
+/// paired with a second task doing the actual EW-add dispatch), not the
+/// single conv-with-fused-EW task this function builds -- the data-flow
+/// difference between "one task, real primary input direct to DPU_RDMA/
+/// ERDMA" (what this function assumes, mirroring `build_lut_regcmd`'s
+/// existing single-task shape) and "two tasks, one producing an
+/// intermediate the other reads" (what the one real capture actually
+/// showed) has NOT been independently distinguished by hardware testing
+/// -- see `rknpu-spelunking/NOTES.md`'s "Elementwise tensor-tensor ops"
+/// section. If this hangs or produces wrong output on real hardware,
+/// suspect that gap first, not the `EW_CFG`/`EW_CVT_SCALE_VALUE` values
+/// themselves (those parts are bit-exact confirmed).
+pub fn build_conv_with_add_regcmd(
+    shape: &ConvShape,
+    bufs: &ConvBuffers,
+    addition: &AddTensor,
+) -> Vec<RegCmd> {
+    let mut cmds = build_conv_cna_core_dpu_dpu_rdma(shape, bufs, 2, Some(addition));
     push_kick(&mut cmds, KICK_CNA | KICK_CORE | KICK_DPU | KICK_DPU_RDMA);
     cmds
 }
@@ -1988,6 +2159,7 @@ pub fn build_pooling_via_dpu_bypass_regcmd(
             output_addr: bufs.bypass_output_addr,
         },
         2, // outside/memory, matching the real capture
+        None,
     );
     // KICK_DPU_RDMA included despite the real vendor capture's kick reading
     // 0x0d (no DPU_RDMA bit) -- hardware evidence from the two-submit fix
@@ -2107,6 +2279,7 @@ pub fn build_conv_then_pooling_regcmd(
             output_addr: 0,
         },
         1,
+        None,
     );
 
     // ========================================================================
