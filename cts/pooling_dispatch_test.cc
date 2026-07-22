@@ -26,9 +26,12 @@
 // runs bindgen against IREE's headers and never links IREE's compiled
 // runtime itself.
 
+#include <string>
 #include <vector>
 
 #include "gtest/gtest.h"
+#include "iree/async/util/proactor_pool.h"
+#include "iree/base/threading/numa.h"
 #include "iree/hal/api.h"
 
 extern "C" iree_status_t iree_hal_rocket_driver_module_register(
@@ -53,8 +56,14 @@ void CheckOk(iree_status_t status, const char* what) {
 // duplicated (not shared -- that one has file-local `static` linkage) to
 // keep this file self-contained. Returns false (does not fail the test)
 // if the rocket device is unavailable, matching CtsRegistry's own
-// UNAVAILABLE-means-skip convention.
-bool CreateDevice(iree_hal_driver_t** out_driver, iree_hal_device_t** out_device) {
+// UNAVAILABLE-means-skip convention. On failure, `out_error` gets the real
+// iree_status_t message (caller's responsibility to free) -- previously
+// this discarded the status entirely and the caller's GTEST_SKIP() printed
+// a fixed, guessed reason ("no /dev/accel/accel0?") regardless of what
+// actually failed, which was actively misleading once the device file
+// turned out to exist and the kernel module was loaded.
+bool CreateDevice(iree_hal_driver_t** out_driver, iree_hal_device_t** out_device,
+                   std::string* out_error) {
   iree_status_t status =
       iree_hal_rocket_driver_module_register(iree_hal_driver_registry_default());
   if (iree_status_is_already_exists(status)) {
@@ -69,15 +78,43 @@ bool CreateDevice(iree_hal_driver_t** out_driver, iree_hal_device_t** out_device
         iree_allocator_system(), &driver);
   }
 
+  // device.rs's create() (device.rs:294-299) hard-requires a non-null
+  // create_params->proactor_pool -- IREE_ASSERT_ARGUMENT-equivalent, per
+  // its own comment, matching iree-null-driver-reference/device.c. A
+  // zeroed iree_hal_device_create_params_t (this function's previous
+  // behavior) leaves it null, which is exactly what surfaced as a bare,
+  // message-less INVALID_ARGUMENT status once CreateDevice's real error
+  // got surfaced instead of being discarded. Build a real pool per
+  // proactor_pool.h's own documented "Typical usage" recipe.
+  iree_async_proactor_pool_t* proactor_pool = nullptr;
+  if (iree_status_is_ok(status)) {
+    status = iree_async_proactor_pool_create(
+        iree_numa_node_count(), /*node_ids=*/nullptr,
+        iree_async_proactor_pool_options_default(), iree_allocator_system(),
+        &proactor_pool);
+  }
+
   iree_hal_device_t* device = nullptr;
   if (iree_status_is_ok(status)) {
-    iree_hal_device_create_params_t params;
-    memset(&params, 0, sizeof(params));
+    iree_hal_device_create_params_t params = iree_hal_device_create_params_default();
+    params.proactor_pool = proactor_pool;
     status = iree_hal_driver_create_default_device(driver, &params,
                                                     iree_allocator_system(), &device);
   }
+  // The device retains the pool on success (proactor_pool.h: "Device
+  // retains the pool — caller can release immediately"); release our
+  // reference either way, matching the header's documented usage.
+  if (proactor_pool) {
+    iree_async_proactor_pool_release(proactor_pool);
+  }
 
   if (!iree_status_is_ok(status)) {
+    iree_allocator_t allocator = iree_allocator_system();
+    char* message = nullptr;
+    iree_host_size_t length = 0;
+    iree_status_to_string(status, &allocator, &message, &length);
+    *out_error = message ? std::string(message, length) : std::string("(no message)");
+    if (message) iree_allocator_free(allocator, message);
     iree_status_free(status);
     if (driver) iree_hal_driver_release(driver);
     return false;
@@ -145,6 +182,16 @@ uint8_t RunPooling(iree_hal_device_t* device, uint8_t input_fill) {
   bindings.values = refs;
   iree_hal_dispatch_config_t config;
   memset(&config, 0, sizeof(config));
+  // iree_hal_command_buffer_dispatch (command_buffer.c) treats an all-zero
+  // static workgroup_count as an intentional no-op dispatch and returns
+  // iree_ok_status() WITHOUT ever calling this driver's vtable dispatch --
+  // "no (intentional) side-effects" is the exact comment there. This
+  // driver's dispatch (command_buffer.rs) ignores workgroup_count entirely
+  // (each executable is a single fixed-shape ukernel, not a grid), so any
+  // non-zero value here is fine -- it only needs to not read as "no work".
+  config.workgroup_count[0] = 1;
+  config.workgroup_count[1] = 1;
+  config.workgroup_count[2] = 1;
   iree_hal_executable_function_t function;
   function.value = 0;
   CheckOk(iree_hal_command_buffer_dispatch(cb, executable, function, config,
@@ -167,10 +214,30 @@ uint8_t RunPooling(iree_hal_device_t* device, uint8_t input_fill) {
                                          iree_hal_buffer_binding_table_empty(),
                                          IREE_HAL_EXECUTE_FLAG_NONE),
           "iree_hal_device_queue_execute");
-  CheckOk(iree_hal_semaphore_wait(sem, 1, iree_infinite_timeout()), "iree_hal_semaphore_wait");
+  CheckOk(iree_hal_semaphore_wait(sem, 1, iree_infinite_timeout(),
+                                   IREE_ASYNC_WAIT_FLAG_NONE),
+          "iree_hal_semaphore_wait");
 
+  // Not iree_hal_buffer_map_read(): that convenience wrapper never calls
+  // iree_hal_buffer_mapping_invalidate_range (confirmed by inspection --
+  // no caller anywhere in iree/hal/buffer.c) regardless of memory type, so
+  // it never triggers buffer.rs's invalidate_range (-> device::prep_bo)
+  // that actually makes the PPU's DMA write visible to this CPU read on
+  // rocket's genuinely non-coherent memory. Map manually and invalidate
+  // before reading instead -- same fix class as the missing fini_bo(buf_out)
+  // bug already found and fixed in iree-rocket-hal/tests/{pooling,
+  // conv_then_pooling}_hw.rs, one layer up the stack.
   uint8_t result = 0;
-  CheckOk(iree_hal_buffer_map_read(output, 0, &result, 1), "iree_hal_buffer_map_read");
+  {
+    iree_hal_buffer_mapping_t mapping;
+    CheckOk(iree_hal_buffer_map_range(output, IREE_HAL_MAPPING_MODE_SCOPED,
+                                       IREE_HAL_MEMORY_ACCESS_READ, 0, 1, &mapping),
+            "iree_hal_buffer_map_range");
+    CheckOk(iree_hal_buffer_mapping_invalidate_range(&mapping, 0, IREE_HAL_WHOLE_BUFFER),
+            "iree_hal_buffer_mapping_invalidate_range");
+    result = mapping.contents.data[0];
+    CheckOk(iree_hal_buffer_unmap_range(&mapping), "iree_hal_buffer_unmap_range");
+  }
 
   iree_hal_semaphore_release(sem);
   iree_hal_command_buffer_release(cb);
@@ -184,8 +251,9 @@ uint8_t RunPooling(iree_hal_device_t* device, uint8_t input_fill) {
 TEST(RocketPoolingDispatch, OutputTracksInput) {
   iree_hal_driver_t* driver = nullptr;
   iree_hal_device_t* device = nullptr;
-  if (!CreateDevice(&driver, &device)) {
-    GTEST_SKIP() << "rocket device unavailable (no /dev/accel/accel0?)";
+  std::string error;
+  if (!CreateDevice(&driver, &device, &error)) {
+    GTEST_SKIP() << "rocket device unavailable: " << error;
   }
 
   uint8_t low = RunPooling(device, 10);

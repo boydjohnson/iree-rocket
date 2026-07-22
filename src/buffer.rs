@@ -59,7 +59,11 @@ unsafe fn cast(buffer: *mut iree_hal_buffer_t) -> *mut RocketBuffer {
 /// `queue_update`/`queue_copy` call these directly to enforce the
 /// dealloca contract described on `RocketBuffer::deallocated`.
 pub unsafe fn is_deallocated(buffer: *mut iree_hal_buffer_t) -> bool {
-    unsafe { (*cast(buffer)).deallocated.load(std::sync::atomic::Ordering::Acquire) }
+    unsafe {
+        (*cast(buffer))
+            .deallocated
+            .load(std::sync::atomic::Ordering::Acquire)
+    }
 }
 
 pub unsafe fn mark_deallocated(buffer: *mut iree_hal_buffer_t) {

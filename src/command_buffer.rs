@@ -422,7 +422,11 @@ unsafe extern "C" fn dispatch(
     flags: iree_hal_dispatch_flags_t,
 ) -> iree_status_t {
     let cb = unsafe { &mut *cast(command_buffer) };
-    if cb.ops.iter().any(|op| matches!(op, RecordedOp::Dispatch { .. })) {
+    if cb
+        .ops
+        .iter()
+        .any(|op| matches!(op, RecordedOp::Dispatch { .. }))
+    {
         // Only one dispatch per command buffer supported -- see module doc
         // comment.
         return status::unimplemented();
@@ -432,8 +436,7 @@ unsafe extern "C" fn dispatch(
     let refs = unsafe { std::slice::from_raw_parts(bindings.values, bindings.count as usize) };
     let addr =
         |r: &iree_hal_buffer_ref_t| unsafe { (*(r.buffer as *mut RocketBuffer)).dma_address };
-    let handle =
-        |r: &iree_hal_buffer_ref_t| unsafe { (*(r.buffer as *mut RocketBuffer)).handle };
+    let handle = |r: &iree_hal_buffer_ref_t| unsafe { (*(r.buffer as *mut RocketBuffer)).handle };
 
     // Binding convention (still entirely this driver's own choosing, no
     // real compiler emits a layout -- see executable.rs's module doc

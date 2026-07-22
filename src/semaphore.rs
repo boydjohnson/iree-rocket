@@ -147,8 +147,8 @@ unsafe extern "C" fn async_query(semaphore: *mut iree_async_semaphore_t) -> u64 
     // callers see a hollow OK/0 forever (the CTS SemaphoreTest.Failure family
     // this was breaking).
     unsafe {
-        let failure_ptr = &(*semaphore).failure_status as *const isize
-            as *const std::sync::atomic::AtomicIsize;
+        let failure_ptr =
+            &(*semaphore).failure_status as *const isize as *const std::sync::atomic::AtomicIsize;
         let failure = (*failure_ptr).load(std::sync::atomic::Ordering::Acquire);
         if failure != 0 {
             return crate::bindings::IREE_HAL_SEMAPHORE_FAILURE_VALUE_STATUS_BIT as u64
@@ -179,8 +179,11 @@ unsafe extern "C" fn async_signal(
         // parked on a timepoint that never fires -- CTS's
         // SemaphoreThreadTest.WaitLaterSignaledBeyond (waiter blocks before
         // the signaling thread runs) hung forever on exactly this.
-        let status =
-            crate::bindings::iree_async_semaphore_advance_timeline(semaphore, value, std::ptr::null());
+        let status = crate::bindings::iree_async_semaphore_advance_timeline(
+            semaphore,
+            value,
+            std::ptr::null(),
+        );
         if status.is_null() {
             crate::bindings::iree_async_semaphore_dispatch_timepoints(semaphore, value);
         }

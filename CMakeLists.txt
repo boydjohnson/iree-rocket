@@ -51,5 +51,22 @@ add_custom_target(rocket_hal_driver_cargo DEPENDS "${ROCKET_LIB_PATH}")
 add_library(rocket_hal_driver_static STATIC IMPORTED GLOBAL)
 set_target_properties(rocket_hal_driver_static PROPERTIES
   IMPORTED_LOCATION "${ROCKET_LIB_PATH}"
+  # CMake can't introspect an externally-built (cargo) .a's symbol table,
+  # so without this it has no way to know rocket_hal_driver_static itself
+  # needs iree::hal/iree::async symbols (iree_hal_file_*,
+  # iree_async_proactor_pool_* -- device.rs's queue_read/queue_write/
+  # create/destroy) resolved *after* it on the final link line. Omitting
+  # this worked by accident for consumers whose own link graph happened to
+  # place iree::hal/iree::async after this target already (e.g. the
+  # iree_hal_cts_test_suite()-generated binaries, which pull rocket-cts's
+  # `backends` OBJECT library's dependencies in independently) but broke
+  # for cts/pooling_dispatch_test.cc's hand-written iree_cc_test(), whose
+  # DEPS list happened to put iree::hal before rocket_hal_driver_static --
+  # ld's single left-to-right archive pass never revisits an already-
+  # scanned .a for symbols a later archive turns out to need. Setting this
+  # makes CMake place iree::hal/iree::async after rocket_hal_driver_static
+  # on every consumer's link line automatically, regardless of that
+  # consumer's own DEPS order.
+  INTERFACE_LINK_LIBRARIES "iree::hal;iree::async;iree::async::util::proactor_pool"
 )
 add_dependencies(rocket_hal_driver_static rocket_hal_driver_cargo)

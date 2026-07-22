@@ -18,12 +18,13 @@ use crate::bindings::{
     iree_hal_buffer_compatibility_bits_t_IREE_HAL_BUFFER_COMPATIBILITY_QUEUE_TRANSFER,
     iree_hal_buffer_compatibility_t, iree_hal_buffer_params_t,
     iree_hal_buffer_placement_flag_bits_t_IREE_HAL_BUFFER_PLACEMENT_FLAG_ASYNCHRONOUS,
-    iree_hal_buffer_placement_t,
-    iree_hal_buffer_release_callback_t, iree_hal_buffer_t, iree_hal_external_buffer_flags_t,
-    iree_hal_external_buffer_t, iree_hal_external_buffer_type_t, iree_hal_memory_advice_t,
-    iree_hal_memory_protection_t, iree_hal_memory_type_bits_t_IREE_HAL_MEMORY_TYPE_OPTIMAL,
-    iree_hal_physical_memory_t, iree_hal_queue_affinity_t, iree_hal_resource_t, iree_host_size_t,
-    iree_status_t,
+    iree_hal_buffer_placement_t, iree_hal_buffer_release_callback_t, iree_hal_buffer_t,
+    iree_hal_external_buffer_flags_t, iree_hal_external_buffer_t, iree_hal_external_buffer_type_t,
+    iree_hal_memory_advice_t, iree_hal_memory_protection_t,
+    iree_hal_memory_type_bits_t_IREE_HAL_MEMORY_TYPE_DEVICE_VISIBLE,
+    iree_hal_memory_type_bits_t_IREE_HAL_MEMORY_TYPE_HOST_VISIBLE,
+    iree_hal_memory_type_bits_t_IREE_HAL_MEMORY_TYPE_OPTIMAL, iree_hal_physical_memory_t,
+    iree_hal_queue_affinity_t, iree_hal_resource_t, iree_host_size_t, iree_status_t,
 };
 use crate::{buffer::RocketBuffer, status};
 
@@ -117,9 +118,19 @@ unsafe extern "C" fn query_buffer_compatibility(
 ) -> iree_hal_buffer_compatibility_t {
     unsafe {
         // Unified memory (RK3588's NPU shares system DRAM with the CPU,
-        // not discrete VRAM) -- we're always "optimal" regardless of what
-        // was requested, matching null's own pattern for this bit.
+        // not discrete VRAM) -- every buffer this driver hands out is both
+        // genuinely CPU-mappable (permanently mmap'd, see buffer.rs) and
+        // NPU-visible (via dma_address), so OPTIMAL always canonicalizes to
+        // that concrete pair rather than just having its placeholder bit
+        // cleared -- an allocate_buffer/dispatch caller that validates the
+        // resulting memory_type (e.g. iree_hal_command_buffer_dispatch's
+        // binding validation) needs DEVICE_VISIBLE actually set, not just
+        // OPTIMAL cleared to 0. Deliberately not HOST_COHERENT -- this
+        // memory is genuinely non-coherent (see buffer.rs's flush_range/
+        // invalidate_range -> FINI_BO/PREP_BO doc comments).
         (*params).type_ &= !iree_hal_memory_type_bits_t_IREE_HAL_MEMORY_TYPE_OPTIMAL;
+        (*params).type_ |= iree_hal_memory_type_bits_t_IREE_HAL_MEMORY_TYPE_HOST_VISIBLE
+            | iree_hal_memory_type_bits_t_IREE_HAL_MEMORY_TYPE_DEVICE_VISIBLE;
         // Guard the 0-byte corner case (real apps can hit this).
         if *allocation_size == 0 {
             *allocation_size = 4;
@@ -139,6 +150,26 @@ unsafe extern "C" fn allocate_buffer(
     let alloc = unsafe { &*cast(allocator) };
     let params = unsafe { &*params };
 
+    // iree_hal_allocator_allocate_buffer (allocator.c) canonicalizes zero
+    // fields (iree_hal_buffer_params_canonicalize) but never calls
+    // query_buffer_compatibility -- that's only invoked by the separate
+    // iree_hal_allocator_query_buffer_compatibility entry point, which
+    // nothing in this driver's own dispatch path calls before allocating.
+    // So a caller that passes plain IREE_HAL_MEMORY_TYPE_OPTIMAL (as
+    // canonicalize's own default, and as CTS/hand-written tests commonly
+    // do) reaches here with `params.type_` still just the OPTIMAL
+    // placeholder bit -- no concrete HOST_VISIBLE/DEVICE_VISIBLE bits ever
+    // get set on the resulting iree_hal_buffer_t. That's exactly what
+    // surfaced as command_buffer.c's dispatch-binding validation rejecting
+    // every real dispatch with "buffer has OPTIMAL, operation requires
+    // DEVICE_VISIBLE" (PERMISSION_DENIED) the first time a real workgroup
+    // count made it reach validation at all. Canonicalize here too, same
+    // concrete bits query_buffer_compatibility above now sets.
+    let mut memory_type = params.type_;
+    memory_type &= !iree_hal_memory_type_bits_t_IREE_HAL_MEMORY_TYPE_OPTIMAL;
+    memory_type |= iree_hal_memory_type_bits_t_IREE_HAL_MEMORY_TYPE_HOST_VISIBLE
+        | iree_hal_memory_type_bits_t_IREE_HAL_MEMORY_TYPE_DEVICE_VISIBLE;
+
     // Same 0-byte guard as query_buffer_compatibility (real apps -- and
     // CTS's AllocatorTest.AllocateEmptyBuffer -- hit this): unlike that
     // query, iree_hal_allocator_allocate_buffer() dispatches straight to
@@ -150,7 +181,8 @@ unsafe extern "C" fn allocate_buffer(
     // follows with `NonZeroUsize::new(size).unwrap()` for the mmap length,
     // which panics on exactly this input.
     let real_size = allocation_size.max(4);
-    let raw = unsafe { device::Buffer::new(alloc.file.as_raw_fd(), real_size as usize, &alloc.file) };
+    let raw =
+        unsafe { device::Buffer::new(alloc.file.as_raw_fd(), real_size as usize, &alloc.file) };
 
     let buffer = Box::new(RocketBuffer {
         // Filled in by iree_hal_buffer_initialize below -- this is just
@@ -200,7 +232,7 @@ unsafe extern "C" fn allocate_buffer(
             real_size,
             0,
             allocation_size,
-            params.type_,
+            memory_type,
             params.access,
             params.usage,
             &crate::buffer::VTABLE,

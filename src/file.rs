@@ -14,10 +14,9 @@
 //! just a raw host span.
 
 use crate::bindings::{
-    iree_allocator_t, iree_async_file_t, iree_device_size_t, iree_hal_buffer_t,
-    iree_hal_file_t, iree_hal_file_vtable_t, iree_hal_memory_access_t, iree_hal_resource_t,
-    iree_io_file_handle_t, iree_io_file_handle_type_e_IREE_IO_FILE_HANDLE_TYPE_HOST_ALLOCATION,
-    iree_status_t,
+    iree_allocator_t, iree_async_file_t, iree_device_size_t, iree_hal_buffer_t, iree_hal_file_t,
+    iree_hal_file_vtable_t, iree_hal_memory_access_t, iree_hal_resource_t, iree_io_file_handle_t,
+    iree_io_file_handle_type_e_IREE_IO_FILE_HANDLE_TYPE_HOST_ALLOCATION, iree_status_t,
 };
 use crate::status;
 

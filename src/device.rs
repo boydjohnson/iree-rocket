@@ -23,9 +23,10 @@ use crate::bindings::{
     iree_hal_event_t, iree_hal_executable_cache_t, iree_hal_executable_function_t,
     iree_hal_executable_t, iree_hal_execute_flags_t, iree_hal_external_file_flags_t,
     iree_hal_file_t, iree_hal_fill_flags_t, iree_hal_host_call_context_t,
-    iree_hal_host_call_flag_bits_e_IREE_HAL_HOST_CALL_FLAG_NON_BLOCKING, iree_hal_host_call_flags_t,
-    iree_hal_host_call_t, iree_hal_memory_access_t, iree_hal_pool_t, iree_hal_queue_affinity_t,
-    iree_hal_queue_pool_backend_t, iree_hal_read_flags_t, iree_hal_resource_t,
+    iree_hal_host_call_flag_bits_e_IREE_HAL_HOST_CALL_FLAG_NON_BLOCKING,
+    iree_hal_host_call_flags_t, iree_hal_host_call_t, iree_hal_memory_access_t, iree_hal_pool_t,
+    iree_hal_queue_affinity_t, iree_hal_queue_pool_backend_t, iree_hal_read_flags_t,
+    iree_hal_resource_t,
     iree_hal_semaphore_compatibility_bits_t_IREE_HAL_SEMAPHORE_COMPATIBILITY_ALL,
     iree_hal_semaphore_compatibility_t, iree_hal_semaphore_flags_t, iree_hal_semaphore_list_t,
     iree_hal_semaphore_t, iree_hal_topology_edge_t, iree_hal_update_flags_t,
@@ -195,9 +196,8 @@ impl OwnedSemaphoreList {
                 payload_values: Vec::new(),
             };
         }
-        let semaphores: Vec<*mut iree_hal_semaphore_t> = unsafe {
-            std::slice::from_raw_parts(list.semaphores, list.count as usize).to_vec()
-        };
+        let semaphores: Vec<*mut iree_hal_semaphore_t> =
+            unsafe { std::slice::from_raw_parts(list.semaphores, list.count as usize).to_vec() };
         let payload_values: Vec<u64> = unsafe {
             std::slice::from_raw_parts(list.payload_values, list.count as usize).to_vec()
         };
@@ -588,7 +588,11 @@ unsafe extern "C" fn queue_alloca(
     if !st.is_null() {
         return st;
     }
-    unsafe { run_after_wait(wait_semaphore_list, signal_semaphore_list, |_sig| status::ok()) }
+    unsafe {
+        run_after_wait(wait_semaphore_list, signal_semaphore_list, |_sig| {
+            status::ok()
+        })
+    }
 }
 
 #[allow(unused_variables)]
@@ -909,7 +913,9 @@ unsafe extern "C" fn queue_host_call(
                         payload_values: std::ptr::null_mut(),
                     },
                 };
-                let _ = unsafe { (f.into_inner())(user_data.into_inner(), args_buf.as_ptr(), &mut context) };
+                let _ = unsafe {
+                    (f.into_inner())(user_data.into_inner(), args_buf.as_ptr(), &mut context)
+                };
             }
             sig_status
         };
@@ -1095,12 +1101,31 @@ unsafe extern "C" fn queue_execute(
                         );
                     }
 
-                    if unsafe { rocket_device::prep_bo(fd, cmd_buf.handle, 2_000_000_000) }
-                        .is_err()
-                    {
-                        break 'result status::from_code(
-                            iree_status_code_e_IREE_STATUS_UNAVAILABLE as u32,
-                        );
+                    // PREP_BO waits on DMA_RESV_USAGE_WRITE fences for the
+                    // *specific handle passed* (rocket_gem.c:
+                    // dma_resv_wait_timeout(gem_obj->resv,
+                    // DMA_RESV_USAGE_WRITE, ...)) -- not "wait for this
+                    // job" in general. cmd_buf is only ever in in_handles
+                    // (the device reads it, never writes it), so it likely
+                    // has no write fence attached at all, making a wait on
+                    // it return near-immediately regardless of whether the
+                    // dispatch that actually writes job.out_bo_handles has
+                    // even started. Confirmed as the cause of pooling_
+                    // dispatch_test.cc always reading back stale/zero
+                    // output despite completing in a few ms with no error:
+                    // fast, silent, unsynchronized completion is exactly
+                    // what an always-instantly-satisfied wait produces.
+                    // conv_hw.rs/pooling_hw.rs never hit this because
+                    // their hand-written ioctl calls always prep_bo a real
+                    // *output* handle. Wait on every buffer this job
+                    // actually writes instead.
+                    for &out_handle in job.out_bo_handles {
+                        if unsafe { rocket_device::prep_bo(fd, out_handle, 2_000_000_000) }.is_err()
+                        {
+                            break 'result status::from_code(
+                                iree_status_code_e_IREE_STATUS_UNAVAILABLE as u32,
+                            );
+                        }
                     }
                 }
                 status::ok()
