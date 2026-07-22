@@ -6,6 +6,9 @@
 //! indexed as `(x - region_start) >> 5`. Values are the vendor compiler's own
 //! quantized output samples, not independently recomputed -- this is the
 //! authentic proven-correct data, not a reimplementation of the underlying math.
+//!
+//! `EXP_LE`/`EXP_LO` (Phase 5, softmax's exp(x) step) are a different case --
+//! see their own doc comments below.
 
 pub const SIGMOID_LE: [u16; 513] = [
     59, 60, 61, 62, 62, 63, 64, 65, 66, 66, 67, 68, 69, 70, 71, 72, 72, 73, 74, 75, 76, 77, 78, 79,
@@ -168,3 +171,75 @@ pub const TANH_LO: [u16; 513] = [
     32570, 32572, 32575, 32577, 32579, 32581, 32583, 32586, 32588, 32590, 32592, 32594, 32596,
     32598, 32600, 32602, 32604, 32606, 32608, 32609, 32611,
 ];
+
+/// Real captured `REG_DPU_LUT_ACCESS_DATA` table content for softmax's
+/// exp(x) step, extracted from a self-consistent live hardware capture
+/// (`rknpu-spelunking/softmax-dump/` + `softmax-tail2/`, stitched --
+/// see `rknpu-spelunking/NOTES.md`'s softmax Phase 5 "Follow-up 4"
+/// section for the full derivation, including two real bpftrace
+/// `%r`-escaping bugs that had to be found and fixed to extract this
+/// byte-exact). Same domain/indexing convention as `SIGMOID_LE`/
+/// `TANH_LE` (`(x - (-16384)) >> 5`, 513 entries, Q15-style
+/// `32768 = 1.0` output encoding) -- but unlike sigmoid/tanh, only this
+/// LE half is real: softmax always subtracts the per-row max before
+/// exp() for numerical stability, so every input this op's LUT ever
+/// sees is <= 0, and the vendor compiler apparently never bothers
+/// populating the LO half with anything meaningful (see `EXP_LO`).
+///
+/// Precisely fits `table[i] = round(exp(x_fixed(i) / 3276.7184) * 32768)`
+/// for `x_fixed(i) = -16384 + i*32` -- max deviation 2/32768, 449/513
+/// exact -- but this raw captured data is what's used here, not the
+/// fitted formula (same "authentic captured data, not reimplemented
+/// math" policy as `SIGMOID_LE`/`TANH_LE` above). Two adjacent entries
+/// (index 455-456) were corrupted by the capture's escaping bug in a
+/// way the general fix couldn't recover and were linearly interpolated
+/// from clean neighbors before being written here.
+pub const EXP_LE: [u16; 513] = [
+    221, 223, 225, 227, 230, 232, 234, 236, 239, 241, 243, 246, 248, 251, 253, 256, 258, 261, 263,
+    266, 268, 271, 274, 276, 279, 282, 285, 287, 290, 293, 296, 299, 302, 305, 308, 311, 314, 317,
+    320, 323, 326, 329, 333, 336, 339, 343, 346, 349, 353, 356, 360, 363, 367, 370, 374, 378, 381,
+    385, 389, 393, 397, 401, 404, 408, 412, 417, 421, 425, 429, 433, 437, 442, 446, 450, 455, 459,
+    464, 468, 473, 478, 482, 487, 492, 497, 501, 506, 511, 516, 521, 527, 532, 537, 542, 548, 553,
+    558, 564, 569, 575, 581, 586, 592, 598, 604, 610, 616, 622, 628, 634, 640, 646, 653, 659, 666,
+    672, 679, 685, 692, 699, 706, 713, 720, 727, 734, 741, 748, 756, 763, 771, 778, 786, 794, 801,
+    809, 817, 825, 833, 841, 850, 858, 866, 875, 884, 892, 901, 910, 919, 928, 937, 946, 955, 965,
+    974, 984, 993, 1003, 1013, 1023, 1033, 1043, 1053, 1064, 1074, 1085, 1095, 1106, 1117, 1128,
+    1139, 1150, 1161, 1173, 1184, 1196, 1208, 1219, 1231, 1244, 1256, 1268, 1280, 1293, 1306, 1319,
+    1331, 1345, 1358, 1371, 1385, 1398, 1412, 1426, 1440, 1454, 1468, 1482, 1497, 1512, 1527, 1542,
+    1557, 1572, 1587, 1603, 1619, 1635, 1651, 1667, 1683, 1700, 1716, 1733, 1750, 1767, 1785, 1802,
+    1820, 1838, 1856, 1874, 1892, 1911, 1930, 1949, 1968, 1987, 2007, 2026, 2046, 2066, 2087, 2107,
+    2128, 2149, 2170, 2191, 2212, 2234, 2256, 2278, 2301, 2323, 2346, 2369, 2392, 2416, 2439, 2463,
+    2488, 2512, 2537, 2562, 2587, 2612, 2638, 2664, 2690, 2716, 2743, 2770, 2797, 2824, 2852, 2880,
+    2908, 2937, 2966, 2995, 3024, 3054, 3084, 3114, 3145, 3175, 3207, 3238, 3270, 3302, 3334, 3367,
+    3400, 3433, 3467, 3501, 3536, 3570, 3605, 3641, 3676, 3712, 3749, 3786, 3823, 3860, 3898, 3936,
+    3975, 4014, 4053, 4093, 4133, 4174, 4215, 4256, 4298, 4340, 4383, 4426, 4469, 4513, 4557, 4602,
+    4647, 4693, 4739, 4786, 4832, 4880, 4928, 4976, 5025, 5074, 5124, 5174, 5225, 5276, 5328, 5380,
+    5433, 5487, 5540, 5595, 5650, 5705, 5761, 5818, 5875, 5932, 5991, 6049, 6109, 6169, 6229, 6290,
+    6352, 6415, 6477, 6541, 6605, 6670, 6735, 6802, 6868, 6936, 7004, 7073, 7142, 7212, 7283, 7354,
+    7426, 7499, 7573, 7647, 7722, 7798, 7875, 7952, 8030, 8109, 8188, 8269, 8350, 8432, 8514, 8598,
+    8682, 8768, 8854, 8941, 9028, 9117, 9206, 9297, 9388, 9480, 9573, 9667, 9762, 9858, 9954,
+    10052, 10151, 10250, 10351, 10453, 10555, 10659, 10763, 10869, 10976, 11083, 11192, 11302,
+    11413, 11525, 11638, 11752, 11867, 11984, 12101, 12220, 12340, 12461, 12584, 12707, 12832,
+    12958, 13085, 13213, 13343, 13474, 13606, 13740, 13874, 14011, 14148, 14287, 14427, 14569,
+    14712, 14856, 15002, 15149, 15298, 15448, 15599, 15753, 15907, 16063, 16221, 16380, 16541,
+    16703, 16867, 17033, 17200, 17368, 17539, 17711, 17885, 18060, 18238, 18417, 18597, 18781,
+    18966, 19150, 19338, 19528, 19720, 19913, 20108, 20306, 20505, 20706, 20909, 21115, 21322,
+    21531, 21742, 21956, 22171, 22389, 22609, 22830, 23054, 23281, 23509, 23740, 23973, 24208,
+    24446, 24686, 24928, 25172, 25419, 25669, 25921, 26175, 26432, 26691, 26953, 27218, 27485,
+    27755, 28027, 28302, 28580, 28860, 29144, 29430, 29718, 30010, 30305, 30602, 30902, 31205,
+    31512, 31821, 32133, 32449, 32767,
+];
+
+/// Placeholder for exp(x)'s LO half (`x >= 0`) -- NOT captured from real
+/// hardware. Softmax's max-subtraction guarantees every real input to
+/// this op's LUT is <= 0, so the vendor-compiled capture this crate's
+/// data comes from never exercises the LO half at all (see `EXP_LE`'s
+/// doc comment) -- there is no real table content to port. Filled with
+/// a constant `32768` (`exp(0) = 1.0` in the same Q15-style encoding)
+/// as a safe, self-consistent default for the one input value (`x=0`)
+/// this half's domain edge could plausibly see, rather than leaving it
+/// zeroed (which would misrepresent `exp(0)` as `0.0`). UNCONFIRMED
+/// against real hardware -- if a future capture or use case actually
+/// exercises `x > 0` here (it shouldn't, given the max-subtraction
+/// invariant), this constant has no evidence behind it at all.
+pub const EXP_LO: [u16; 513] = [32768u16; 513];

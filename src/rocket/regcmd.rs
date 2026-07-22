@@ -66,17 +66,10 @@ pub enum Activation {
     Relux {
         cmp: u32,
     },
-    /// LUT-based nonlinear activation (sigmoid/tanh/...), routed through
-    /// DPU's EW core rather than BS -- see `LutTable`'s doc comment. Not
-    /// yet hardware-validated through this crate's own builder (the
-    /// recipe below was decoded from a vendor-compiler capture, not run
-    /// on real RK3588 through `build_conv_regcmd` before this variant
-    /// existed).
-    Lut(LutTable),
 }
 
 /// A DPU LUT (piecewise lookup table) configuration, as used by
-/// `Activation::Lut`. Confirmed via `rknpu-spelunking/NOTES.md`'s
+/// `build_lut_regcmd`. Confirmed via `rknpu-spelunking/NOTES.md`'s
 /// "Decoding the DPU LUT block: sigmoid/tanh regcmd capture" section --
 /// exported standalone `nn.Sigmoid()`/`nn.Tanh()` ONNX models through
 /// `rknn-convert` (real `rknn-toolkit2` under the hood) and decoded the
@@ -127,6 +120,42 @@ impl LutTable {
         LutTable {
             le_entries: &crate::rocket::lut_tables::TANH_LE,
             lo_entries: &crate::rocket::lut_tables::TANH_LO,
+            ew_op_bypass: 1,
+            le_slope_uflow_scale: 0,
+            le_slope_uflow_shift: 0,
+        }
+    }
+
+    /// Softmax's exp(x) step (Phase 5 of the ukernel roadmap), routed
+    /// through this exact same standalone DPU LUT path -- confirmed via
+    /// live hardware trace of the vendor runtime, byte-identical recipe to
+    /// `sigmoid()`/`tanh()` above (`rknpu-spelunking/NOTES.md`'s softmax
+    /// Phase 5 "Follow-up 4" section): same domain split, same 513-entry
+    /// indexing, same `EW_CFG` field layout. Two things are specific to
+    /// exp and confirmed only from this one real capture (not fit across
+    /// multiple scales/zero-points the way `sigmoid()`/`tanh()`'s tables
+    /// were cross-validated against each other):
+    /// - `le_slope_uflow_scale`/`_shift` = 0 (flat clamp below `x=-16384`,
+    ///   same choice as `tanh()`, confirmed by direct register capture,
+    ///   not inferred by analogy).
+    /// - `EXP_LO` (the `x >= 0` half) is a placeholder, not real captured
+    ///   data -- see its own doc comment in `lut_tables.rs`. Softmax's
+    ///   max-subtraction guarantees this half is never legitimately read,
+    ///   but a caller building a *different* op around this table (not
+    ///   softmax's own max-subtract-then-exp pattern) would get an
+    ///   unvalidated constant `1.0` for any `x >= 0` input.
+    ///
+    /// One piece of good, independent supporting evidence this recipe
+    /// generalizes correctly: the real captured `BN_MUL_CFG=0x6a660000`
+    /// for this op backs out to `input_scale ~= 10.49` via the *existing*
+    /// `lut_bn_mul()`/`LUT_BN_SCALE_K=2596.513` formula (fit from
+    /// sigmoid/tanh captures, not exp) -- i.e. `build_lut_regcmd`'s
+    /// generic `input_scale`/`input_zero_point` handling doesn't need any
+    /// exp-specific change, only this table.
+    pub fn exp() -> Self {
+        LutTable {
+            le_entries: &crate::rocket::lut_tables::EXP_LE,
+            lo_entries: &crate::rocket::lut_tables::EXP_LO,
             ew_op_bypass: 1,
             le_slope_uflow_scale: 0,
             le_slope_uflow_shift: 0,
@@ -204,13 +233,13 @@ fn push_lut_tables_and_config(cmds: &mut Vec<RegCmd>, table: LutTable) {
 }
 
 /// Empirically-fit constant relating a shape's `input_scale` to DPU BN's
-/// multiply stage on the `Activation::Lut` path -- reverse-engineered from
+/// multiply stage in `build_lut_regcmd` -- reverse-engineered from
 /// 5 independent int8-quantized `rknn-toolkit2` sigmoid captures at
 /// different calibration scales (see `lut_bn_mul`'s doc comment and
 /// `rknpu-spelunking/NOTES.md`). Not a documented hardware constant.
 const LUT_BN_SCALE_K: f32 = 2596.513;
 
-/// `BN_MUL_OPERAND`/`BN_MUL_SHIFT` for the `Activation::Lut` path:
+/// `BN_MUL_OPERAND`/`BN_MUL_SHIFT` for `build_lut_regcmd`:
 /// `multiplier = input_scale * LUT_BN_SCALE_K`, normalized (standard
 /// mantissa/exponent split) so `operand = round(multiplier * 2^shift)`
 /// lands in `[16384, 32768)` -- reconstructs the captured register values
@@ -225,7 +254,7 @@ fn lut_bn_mul(input_scale: f32) -> (u32, u32) {
     (operand, shift as u32)
 }
 
-/// `BN_ALU_OPERAND` for the `Activation::Lut` path: `-real_zero_point *
+/// `BN_ALU_OPERAND` for `build_lut_regcmd`: `-real_zero_point *
 /// bn_mul_operand`. Exact for 3 of 5 known data points; an unresolved ~1/16
 /// discrepancy showed up for the other 2 (both `real_zero_point == 42`) --
 /// see the call site's doc comment. Always exactly right when
@@ -242,7 +271,7 @@ fn lut_bn_alu_supports_zero_point(real_zero_point: i32) -> bool {
     matches!(real_zero_point, -128 | -2 | 0 | 127)
 }
 
-/// `OUT_CVT_SCALE`/`OUT_CVT_SHIFT` for the `Activation::Lut` path.
+/// `OUT_CVT_SCALE`/`OUT_CVT_SHIFT` for `build_lut_regcmd`.
 /// `build_conv_cna_core_dpu_dpu_rdma`'s normal `out_scale`/`out_shift`
 /// computation targets a raw conv accumulator's magnitude (via
 /// `conv_scale = input_scale*weights_scale/output_scale`) -- the wrong
@@ -303,10 +332,15 @@ pub struct ConvBuffers {
     pub output_addr: u32,
 }
 
-/// Logical shape for a standalone DPU LUT pass. Unlike `Activation::Lut`
-/// on `ConvShape`, this path matches the vendor compiler's decoded
-/// sigmoid/tanh routing: DPU runs in flying mode, DPU_RDMA/MRDMA supplies
-/// the input tensor directly from memory, and CNA/CORE are not kicked.
+/// Logical shape for a standalone DPU LUT pass -- the only LUT-activation
+/// path this crate builds, matching the vendor compiler's decoded
+/// sigmoid/tanh routing (confirmed via live hardware trace of the vendor
+/// runtime itself, see `rknpu-spelunking/NOTES.md`): DPU runs in flying
+/// mode, DPU_RDMA/MRDMA supplies the input tensor directly from memory,
+/// and CNA/CORE are not kicked. Chain a `build_conv_regcmd` task (with
+/// `Activation::None`) into this via `build_conv_then_lut_regcmd` for a
+/// conv-then-sigmoid/tanh pipeline -- LUT activations are never fused
+/// into the conv's own DPU pass, unlike `Relu`/`Relux`.
 #[derive(Clone, Copy)]
 pub struct LutShape {
     pub width: u32,
@@ -450,21 +484,6 @@ fn build_conv_cna_core_dpu_dpu_rdma(
     if out_scale < (1 << 14) {
         out_scale |= 1 << 14;
     }
-
-    let lut = match shape.activation {
-        Activation::Lut(table) => Some(table),
-        _ => None,
-    };
-    // Computed early (rather than inline in the BN block below) because
-    // `DPU_DATA_FORMAT.bn_mul_shift_value_neg` -- emitted well before BN's
-    // own registers -- needs the same shift value: confirmed via 4
-    // independent int8-quantized sigmoid captures (see `lut_bn_mul`'s doc
-    // comment) that this field always exactly mirrors `BN_MUL_CFG`'s own
-    // `bn_mul_shift_value`, not a separately-derived quantity. Previously
-    // missed entirely -- `DpuDataFormat` was emitted unconditionally zero
-    // for every activation, silently leaving this field 0 whenever the
-    // real shift was nonzero (which is virtually always).
-    let lut_bn_mul_result = lut.map(|_| lut_bn_mul(shape.input_scale));
 
     let mut cmds: Vec<RegCmd> = Vec::new();
 
@@ -771,12 +790,7 @@ fn build_conv_cna_core_dpu_dpu_rdma(
     }
     cmds.push(feat_mode_builder.build());
 
-    cmds.push(match lut_bn_mul_result {
-        Some((_, bn_mul_shift)) => Register::<DpuDataFormat>::new()
-            .bn_mul_shift_value_neg(Bits::new(bn_mul_shift))
-            .build(),
-        None => zero::<DpuDataFormat>(),
-    });
+    cmds.push(zero::<DpuDataFormat>());
     cmds.push(zero::<DpuOffsetPend>());
     // bit1 clear (not writing "outside"/memory) -> 0, see this function's
     // own doc comment.
@@ -824,38 +838,20 @@ fn build_conv_cna_core_dpu_dpu_rdma(
     // originally expose (see `Activation` above) -- MUL stays permanently
     // bypassed, matching Mesa (no client of this function needs BS's mul
     // stage).
-    //
-    // *Except* for `Activation::Lut`: the vendor int8 capture used for
-    // `lut_bn_mul`/`lut_out_cvt` has BS **fully** bypassed for the
-    // LUT-using task (`BS_CFG=0x53` -- `bs_bypass`/`bs_alu_bypass`/
-    // `bs_mul_bypass`/`bs_relu_bypass` all set, `BS_ALU_CFG`/`BS_MUL_CFG`
-    // both zero), not just "relu/relux off" -- found by cross-checking
-    // this register against the same capture after BN/OUT_CVT fixes alone
-    // still didn't reveal a sigmoid/tanh difference. Bias-add-of-zero
-    // should be a numeric no-op regardless, so this may not be
-    // load-bearing, but it's a confirmed, real byte-for-byte discrepancy
-    // from the vendor's own working recipe, worth matching exactly.
     let (bs_relu_bypass, bs_relux_en, bs_relux_cmp) = match shape.activation {
         Activation::None => (1, 0, 0),
         Activation::Relu => (0, 0, 0),
         Activation::Relux { cmp } => (0, 1, cmp),
-        Activation::Lut(_) => (1, 0, 0),
     };
-    cmds.push(match lut {
-        Some(_) => Register::<DpuBsCfg>::new()
-            .bs_bypass(Bits::new(1))
-            .bs_alu_bypass(Bits::new(1))
-            .bs_mul_bypass(Bits::new(1))
-            .bs_relu_bypass(Bits::new(1))
-            .build(),
-        None => Register::<DpuBsCfg>::new()
+    cmds.push(
+        Register::<DpuBsCfg>::new()
             .bs_alu_algo(Bits::new(2))
             .bs_alu_src(Bits::new(1))
             .bs_relu_bypass(Bits::new(bs_relu_bypass))
             .bs_relux_en(Bits::new(bs_relux_en))
             .bs_mul_bypass(Bits::new(1))
             .build(),
-    });
+    );
     cmds.push(zero::<DpuBsAluCfg>());
     cmds.push(zero::<DpuBsMulCfg>());
     cmds.push(
@@ -863,27 +859,24 @@ fn build_conv_cna_core_dpu_dpu_rdma(
             .bs_relux_cmp_dat(Bits::new(bs_relux_cmp))
             .build(),
     );
-    cmds.push(match lut {
-        Some(_) => Register::<DpuBsOwCfg>::new()
-            .od_bypass(Bits::new(1))
-            .build(),
-        None if shape.depthwise => Register::<DpuBsOwCfg>::new()
+    cmds.push(if shape.depthwise {
+        Register::<DpuBsOwCfg>::new()
             .size_e_0(Bits::new(3))
             .size_e_1(Bits::new(3))
             .size_e_2(Bits::new(3))
-            .build(),
-        None => Register::<DpuBsOwCfg>::new()
+            .build()
+    } else {
+        Register::<DpuBsOwCfg>::new()
             .size_e_0(Bits::new(1))
             .size_e_1(Bits::new(1))
             .size_e_2(Bits::new(1))
-            .build(),
+            .build()
     });
-    cmds.push(match lut {
-        Some(_) => zero::<DpuBsOwOp>(),
-        None => Register::<DpuBsOwOp>::new()
+    cmds.push(
+        Register::<DpuBsOwOp>::new()
             .ow_op(Bits::new(0x80 - shape.weights_zero_point))
             .build(),
-    });
+    );
     cmds.push(
         Register::<DpuWdmaSize0>::new()
             .channel_wdma(Bits::new(task_output_channels - 1))
@@ -896,117 +889,30 @@ fn build_conv_cna_core_dpu_dpu_rdma(
             .build(),
     );
 
-    // BN (batchnorm): genuinely fully bypassed, all four bits -- *except*
-    // for `Activation::Lut`, where the vendor capture shows BN very much
-    // *not* bypassed (`BN_CFG=0x00020040` plus a nonzero `BN_ALU_CFG`/
-    // `BN_MUL_CFG`). First round of hardware testing without this (BN
-    // unconditionally bypassed regardless of activation) dispatched
-    // cleanly but produced output indistinguishable from `Activation::None`
-    // for both sigmoid and tanh -- strong evidence BN is the stage that
-    // converts the raw accumulator into the LUT's fixed `[-16384, 16384]`
-    // x-domain, and skipping it left EW/LUT indexing on raw, unconverted
-    // data (almost certainly saturating at one table edge regardless of
-    // input).
-    //
-    // A single fp16-mode capture's literal bytes weren't enough here (its
-    // BN_ALU_CFG turned out to just be -0.0f's bit pattern, an artifact of
-    // fp16 mode, not a real int8-domain operand) -- `lut_bn_mul`/
-    // `lut_bn_alu` below instead implement a formula reverse-engineered
-    // from 5 independent int8-quantized (`do_quantization=true`) sigmoid
-    // captures at different calibration scales (see
-    // `rknpu-spelunking/NOTES.md`'s LUT section): `BN_MUL_OPERAND`/
-    // `_SHIFT` reconstruct *exactly* for all 5 via `multiplier =
-    // input_scale * LUT_BN_SCALE_K`, normalized so `operand =
-    // round(multiplier * 2^shift)` lands in `[16384, 32768)`. `BN_ALU_
-    // OPERAND = -real_zero_point * bn_mul_operand` matched exactly for 3
-    // of the 5 (zero points -2, -128, 127); the other 2 (both zero_point
-    // 42) were low by a consistent but unexplained ~1/16 factor -- a real,
-    // open discrepancy, not resolved. It doesn't affect this crate's
-    // existing zero-point-0 test shapes: `input_zero_point: 0` decodes
-    // (via the same `wrapping_sub(0x80)` convention `pad_con1` already
-    // uses below) to a real signed zero-point of -128, one of the 3
-    // exactly-matching cases.
-    match lut_bn_mul_result {
-        Some((bn_mul_operand, bn_mul_shift)) => {
-            let real_zero_point = shape.input_zero_point.wrapping_sub(0x80) as i8 as i32;
-            assert!(
-                lut_bn_alu_supports_zero_point(real_zero_point),
-                "Activation::Lut only supports input_zero_point values whose decoded signed \
-                 zero point is one of -128, -2, 0, or 127 for now; got raw input_zero_point={} \
-                 (decoded {}). The BN_ALU formula is known not to match vendor captures for \
-                 every zero point yet.",
-                shape.input_zero_point,
-                real_zero_point
-            );
-            let bn_alu_operand = lut_bn_alu(real_zero_point, bn_mul_operand);
-            cmds.push(
-                Register::<DpuBnCfg>::new()
-                    .bn_alu_algo(Bits::new(2))
-                    .bn_alu_src(Bits::new(0))
-                    .bn_relux_en(Bits::new(0))
-                    .bn_relu_bypass(Bits::new(1))
-                    .bn_mul_prelu(Bits::new(0))
-                    .bn_mul_bypass(Bits::new(0))
-                    .bn_alu_bypass(Bits::new(0))
-                    .bn_bypass(Bits::new(0))
-                    .build(),
-            );
-            cmds.push(
-                Register::<DpuBnAluCfg>::new()
-                    .bn_alu_operand(Bits::new(bn_alu_operand))
-                    .build(),
-            );
-            cmds.push(
-                Register::<DpuBnMulCfg>::new()
-                    .bn_mul_operand(Bits::new(bn_mul_operand))
-                    .bn_mul_shift_value(Bits::new(bn_mul_shift))
-                    .bn_mul_src(Bits::new(0))
-                    .bn_truncate_src(Bits::new(0))
-                    .build(),
-            );
-            cmds.push(zero::<DpuBnReluxCmpValue>());
-        }
-        None => {
-            cmds.push(
-                Register::<DpuBnCfg>::new()
-                    .bn_relu_bypass(Bits::new(1))
-                    .bn_mul_bypass(Bits::new(1))
-                    .bn_alu_bypass(Bits::new(1))
-                    .bn_bypass(Bits::new(1))
-                    .build(),
-            );
-            cmds.push(zero::<DpuBnAluCfg>());
-            cmds.push(zero::<DpuBnMulCfg>());
-            cmds.push(zero::<DpuBnReluxCmpValue>());
-        }
-    }
+    // BN (batchnorm): genuinely fully bypassed, all four bits.
+    cmds.push(
+        Register::<DpuBnCfg>::new()
+            .bn_relu_bypass(Bits::new(1))
+            .bn_mul_bypass(Bits::new(1))
+            .bn_alu_bypass(Bits::new(1))
+            .bn_bypass(Bits::new(1))
+            .build(),
+    );
+    cmds.push(zero::<DpuBnAluCfg>());
+    cmds.push(zero::<DpuBnMulCfg>());
+    cmds.push(zero::<DpuBnReluxCmpValue>());
 
     // EW (elementwise): add_tensor == -1 branch (unconditional -- no
-    // add_tensor support in this function). Fully bypassed unless
-    // `Activation::Lut` requests the LUT path -- confirmed via
-    // `rknpu-spelunking/NOTES.md`'s LUT decode: every non-LUT op in the
-    // vendor capture has `EW_CFG=0x383` (all bypassed, matching the
-    // `else` branch below byte-for-byte), while the sigmoid/tanh op flips
-    // `EW_LUT_BYPASS` and `EW_BYPASS`. `EW_OP_BYPASS` is per-function in
-    // the capture (`0` for sigmoid, `1` for tanh), so it is stored on
-    // `LutTable` rather than inferred here.
-    cmds.push(if let Some(table) = lut {
-        Register::<DpuEwCfg>::new()
-            .ew_relu_bypass(Bits::new(1))
-            .ew_op_cvt_bypass(Bits::new(1))
-            .ew_lut_bypass(Bits::new(0))
-            .ew_op_bypass(Bits::new(table.ew_op_bypass as u32))
-            .ew_bypass(Bits::new(0))
-            .build()
-    } else {
+    // add_tensor support in this function), fully bypassed, all five bits.
+    cmds.push(
         Register::<DpuEwCfg>::new()
             .ew_relu_bypass(Bits::new(1))
             .ew_op_cvt_bypass(Bits::new(1))
             .ew_lut_bypass(Bits::new(1))
             .ew_op_bypass(Bits::new(1))
             .ew_bypass(Bits::new(1))
-            .build()
-    });
+            .build(),
+    );
     cmds.push(zero::<DpuEwCvtOffsetValue>());
     cmds.push(
         Register::<DpuEwCvtScaleValue>::new()
@@ -1015,10 +921,6 @@ fn build_conv_cna_core_dpu_dpu_rdma(
     );
     cmds.push(zero::<DpuEwReluxCmpValue>());
 
-    let (out_cvt_scale, out_cvt_shift) = match lut {
-        Some(_) => lut_out_cvt(shape.output_scale),
-        None => (out_scale, out_shift - 1),
-    };
     cmds.push(
         Register::<DpuOutCvtOffset>::new()
             .out_cvt_offset(Bits::new(out_offset))
@@ -1026,12 +928,12 @@ fn build_conv_cna_core_dpu_dpu_rdma(
     );
     cmds.push(
         Register::<DpuOutCvtScale>::new()
-            .out_cvt_scale(Bits::new(out_cvt_scale))
+            .out_cvt_scale(Bits::new(out_scale))
             .build(),
     );
     cmds.push(
         Register::<DpuOutCvtShift>::new()
-            .out_cvt_shift(Bits::new(out_cvt_shift))
+            .out_cvt_shift(Bits::new(out_shift - 1))
             .build(),
     );
 
@@ -1051,31 +953,18 @@ fn build_conv_cna_core_dpu_dpu_rdma(
     );
     cmds.push(RegCmd::new(DOMAIN_DPU, 0x40c4, 0)); // TRM-mandated reserved write, no REG_DPU_* name
 
-    match lut {
-        Some(table) => {
-            // Table upload: this crate always builds one self-contained
-            // kicked task per call, unlike the vendor compiler's
-            // preload-once-reuse-across-ops graph, so the table content
-            // is (re-)uploaded inline here, ahead of the LUT_CFG/INFO/
-            // START/END/SLOPE registers that reference it -- both are
-            // part of the same task in our model, kicked together.
-            push_lut_tables_and_config(&mut cmds, table);
-        }
-        None => {
-            cmds.push(zero::<DpuLutAccessCfg>());
-            cmds.push(zero::<DpuLutAccessData>());
-            cmds.push(zero::<DpuLutCfg>());
-            cmds.push(zero::<DpuLutInfo>());
-            cmds.push(zero::<DpuLutLeStart>());
-            cmds.push(zero::<DpuLutLeEnd>());
-            cmds.push(zero::<DpuLutLoStart>());
-            cmds.push(zero::<DpuLutLoEnd>());
-            cmds.push(zero::<DpuLutLeSlopeScale>());
-            cmds.push(zero::<DpuLutLeSlopeShift>());
-            cmds.push(zero::<DpuLutLoSlopeScale>());
-            cmds.push(zero::<DpuLutLoSlopeShift>());
-        }
-    }
+    cmds.push(zero::<DpuLutAccessCfg>());
+    cmds.push(zero::<DpuLutAccessData>());
+    cmds.push(zero::<DpuLutCfg>());
+    cmds.push(zero::<DpuLutInfo>());
+    cmds.push(zero::<DpuLutLeStart>());
+    cmds.push(zero::<DpuLutLeEnd>());
+    cmds.push(zero::<DpuLutLoStart>());
+    cmds.push(zero::<DpuLutLoEnd>());
+    cmds.push(zero::<DpuLutLeSlopeScale>());
+    cmds.push(zero::<DpuLutLeSlopeShift>());
+    cmds.push(zero::<DpuLutLoSlopeScale>());
+    cmds.push(zero::<DpuLutLoSlopeShift>());
 
     // ========================================================================
     // DPU_RDMA
@@ -1429,6 +1318,64 @@ pub fn build_conv_regcmd(shape: &ConvShape, bufs: &ConvBuffers) -> Vec<RegCmd> {
     let mut cmds = build_conv_cna_core_dpu_dpu_rdma(shape, bufs, 2); // 2 = outside/memory only, unchanged original behavior
     push_kick(&mut cmds, KICK_CNA | KICK_CORE | KICK_DPU | KICK_DPU_RDMA);
     cmds
+}
+
+/// DMA addresses for a conv-then-LUT-activation pipeline. Unlike
+/// `ConvThenPoolingBuffers` (whose DPU->PPU handoff stays on-chip), `Relu`/
+/// `Relux` fuse into the conv's own DPU pass but sigmoid/tanh never do --
+/// confirmed by live hardware tracing of the vendor runtime itself
+/// (`rknpu-spelunking/NOTES.md`), which showed a real separate task
+/// reading the conv's output back from memory, not on-chip pipelining.
+/// `intermediate_addr` is that real round-trip buffer: pure inter-task DMA
+/// memory the CPU never touches, so it doesn't need `prep_bo()`/`fini_bo()`
+/// the way a job-boundary buffer would.
+pub struct ConvThenLutBuffers {
+    pub input_addr: u32,
+    pub weights_addr: u32,
+    pub bias_addr: u32,
+    pub intermediate_addr: u32,
+    pub output_addr: u32,
+}
+
+/// Builds a conv task (forced `Activation::None` -- LUT activations are
+/// never fused into the conv's own DPU pass, see `ConvThenLutBuffers`'s
+/// doc comment) chained into a standalone LUT task, matching the vendor
+/// runtime's own real routing for conv->sigmoid/tanh. Returns
+/// `(conv_cmds, lut_cmds)` -- submit both as one multi-task job via
+/// `device::submit_tasks(fd, &[(conv_cmd_addr, conv_cmds.len() as u32), \
+/// (lut_cmd_addr, lut_cmds.len() as u32)], ...)`, not as two separate
+/// jobs (the kernel dispatches task 2 only after task 1's own hardware
+/// completion IRQ fires, so no CPU-side wait on `intermediate_addr` is
+/// needed in between -- see `submit_tasks`'s doc comment).
+pub fn build_conv_then_lut_regcmd(
+    conv_shape: &ConvShape,
+    lut_shape: &LutShape,
+    table: LutTable,
+    bufs: &ConvThenLutBuffers,
+) -> (Vec<RegCmd>, Vec<RegCmd>) {
+    assert!(
+        matches!(conv_shape.activation, Activation::None),
+        "build_conv_then_lut_regcmd: conv_shape.activation must be Activation::None -- \
+         LUT activations always run as a separate task, never fused into the conv's own DPU pass"
+    );
+    let conv_cmds = build_conv_regcmd(
+        conv_shape,
+        &ConvBuffers {
+            input_addr: bufs.input_addr,
+            weights_addr: bufs.weights_addr,
+            bias_addr: bufs.bias_addr,
+            output_addr: bufs.intermediate_addr,
+        },
+    );
+    let lut_cmds = build_lut_regcmd(
+        lut_shape,
+        &LutBuffers {
+            input_addr: bufs.intermediate_addr,
+            output_addr: bufs.output_addr,
+        },
+        table,
+    );
+    (conv_cmds, lut_cmds)
 }
 
 //===========================================================================
@@ -2301,4 +2248,120 @@ pub fn build_conv_then_pooling_regcmd(
     );
 
     cmds
+}
+
+//===========================================================================
+// Softmax, Phase 5 of the ukernel roadmap. Research spike, NOT a complete
+// hardware-validated op yet -- see `rknpu-spelunking/NOTES.md`'s softmax
+// Phase 5 section (all 5 "Follow-up"s) and
+// `project_softmax_phase5_status.md` in this repo's memory for the full
+// derivation. Two of three pieces are confirmed:
+//
+// 1. exp(x) itself is the standalone DPU LUT path above, unchanged --
+//    `LutTable::exp()` plus `build_conv_then_lut_regcmd`/`build_lut_regcmd`
+//    already handle it, no new code needed.
+// 2. Max-reduction is a confirmed **N-stage tree** of (bypass-conv,
+//    PPU-max-pool) pairs -- structurally identical to
+//    `build_pooling_via_dpu_bypass_regcmd`'s single-stage shape, just
+//    repeated with each stage's output feeding the next stage's input.
+//    Live, self-consistent hardware capture found exactly 5 such stages
+//    for one specific (32-channel) test shape, exactly matching the
+//    static `.rknn` file's original prediction of 5
+//    `PPU_OPERATION_MODE_CFG=0x11` blocks. `build_max_reduction_tree_regcmd`
+//    below generalizes the PAIRED-STAGE SHAPE (not a specific stage count
+//    or kernel-size schedule -- that part is caller-supplied, like every
+//    other shape struct in this file) to arbitrary `N`.
+//
+// What's still missing, deliberately NOT implemented here (would be
+// fabricating unconfirmed behavior rather than porting a proven recipe):
+// - How the just-computed max actually gets subtracted from each element
+//   before the exp LUT reads it. The confirmed exp dispatch's own
+//   `BN_BASE_ADDR` was captured as 0, and its `SRC_BASE_ADDR` reads
+//   directly from the graph's real conv output, not from the max-tree's
+//   output buffer -- so the subtraction is NOT wired through DPU_RDMA's
+//   per-position bias-buffer mechanism the way a first guess might
+//   assume. Real data-flow between the max tree and the exp step is
+//   still unmapped (see NOTES.md's Follow-up 5 "working hypothesis"
+//   section).
+// - The reciprocal/normalize (divide-by-sum) step. Exhaustively searched
+//   for as a second DPU LUT/BN dispatch or a Sum/Avg-mode PPU block
+//   across a complete, self-consistent capture -- found nowhere. Current
+//   best guess is it isn't a distinct on-chip step in this graph at all
+//   (folded into output requant, or done off-chip) -- nothing to port
+//   until that's settled.
+//
+// There is deliberately no `build_softmax_regcmd` top-level entry point
+// yet -- assembling one now would silently paper over the two gaps
+// above with guesses. What's below is the reusable, structurally-
+// confirmed piece (the max-reduction tree) plus a pointer to the
+// already-existing exp LUT piece; wire them into a real op once the
+// missing data-flow is confirmed on hardware.
+//===========================================================================
+
+/// One stage of a max-reduction tree: a near-identity bypass conv (same
+/// role as `build_pooling_via_dpu_bypass_regcmd`'s `bypass_shape`) paired
+/// with a PPU pooling stage that actually does the reduction. Caller
+/// supplies both shapes explicitly per stage -- this module does not
+/// guess a general "how many stages / what kernel size" schedule from an
+/// element count; the one real hardware capture behind this code only
+/// confirms the PAIRED-STAGE SHAPE generalizes, not any particular
+/// tiling algorithm (see this section's module doc comment).
+pub struct MaxReductionStage {
+    pub bypass_shape: ConvShape,
+    pub pooling_shape: PoolingShape,
+}
+
+/// DMA addresses for one stage of the tree. `output_addr` is this stage's
+/// real memory output -- either the next stage's `bypass_input_addr`, or
+/// (for the last stage) the tree's final reduced-max output.
+pub struct MaxReductionStageBuffers {
+    pub bypass_input_addr: u32,
+    pub bypass_weights_addr: u32,
+    pub bypass_bias_addr: u32,
+    pub bypass_output_addr: u32,
+    pub output_addr: u32,
+}
+
+/// Builds an `N`-stage max-reduction tree, each stage reusing
+/// `build_pooling_via_dpu_bypass_regcmd` unchanged. Returns one
+/// `(bypass_cmds, pooling_cmds)` pair per stage, in order -- the caller
+/// must `submit()`+`prep_bo()`-wait through EVERY pair sequentially
+/// (bypass stage, then pooling stage, then the next stage's bypass,
+/// ...), exactly like `build_pooling_via_dpu_bypass_regcmd`'s own
+/// single-stage discipline (see its doc comment for why: a combined
+/// single-`submit_tasks()` job silently left one real hardware round
+/// unwritten). Chaining `N>1` stages this way has the same *mechanism*
+/// as the proven `N=1` case, but the specific 5-stage chain itself is
+/// NOT YET independently hardware-validated end-to-end through this
+/// exact function -- only the underlying single-stage building block is.
+pub fn build_max_reduction_tree_regcmd(
+    stages: &[MaxReductionStage],
+    bufs: &[MaxReductionStageBuffers],
+) -> Vec<(Vec<RegCmd>, Vec<RegCmd>)> {
+    assert!(
+        !stages.is_empty(),
+        "build_max_reduction_tree_regcmd: at least one stage is required"
+    );
+    assert_eq!(
+        stages.len(),
+        bufs.len(),
+        "build_max_reduction_tree_regcmd: one MaxReductionStageBuffers entry is required per stage"
+    );
+    stages
+        .iter()
+        .zip(bufs.iter())
+        .map(|(stage, buf)| {
+            build_pooling_via_dpu_bypass_regcmd(
+                &stage.bypass_shape,
+                &stage.pooling_shape,
+                &PoolingViaBypassBuffers {
+                    input_addr: buf.bypass_input_addr,
+                    weights_addr: buf.bypass_weights_addr,
+                    bias_addr: buf.bypass_bias_addr,
+                    bypass_output_addr: buf.bypass_output_addr,
+                    output_addr: buf.output_addr,
+                },
+            )
+        })
+        .collect()
 }

@@ -90,27 +90,45 @@ impl Buffer {
     }
 }
 
-/// Submits a single-task job (the only shape any client in this project
-/// has needed so far) built from an already-written regcmd GEM buffer.
-/// `in_handles`/`out_handles` are the GEM handles the job reads from/
-/// writes to -- must include the regcmd buffer's own handle in
-/// `in_handles` (the kernel needs it retained for the job's duration).
-pub unsafe fn submit(
+/// Submits a multi-task job -- tasks run in order, on the same core,
+/// dispatched task-by-task only after each prior task's own hardware
+/// completion IRQ fires (mainline `rocket_job.c`'s `rocket_job_run()`
+/// dispatches just the first task; `rocket_job_handle_irq()` re-enters
+/// `rocket_job_hw_submit()` for the next one once `next_task_idx <
+/// task_count`, only signaling the job's `done_fence` after the last
+/// task completes) -- a real, kernel-implemented mechanism
+/// (`drm_rocket_job.task_count`/`.tasks` already support an array; no
+/// uapi struct changes needed), just never exercised by this crate
+/// before `build_conv_then_lut_regcmd` needed it.
+///
+/// `in_handles`/`out_handles` are job-wide, not per-task (matches
+/// `drm_rocket_job`'s own field layout: one flat GEM-handle list covers
+/// every task in the job) -- must include every buffer any task reads
+/// from or writes to, including each task's own regcmd buffer handle in
+/// `in_handles`. A buffer that only tasks *within this job* touch (never
+/// read/written by the CPU, e.g. one task's output feeding the next
+/// task's input) does not need to appear in either list -- there is no
+/// kernel-mediated sync point between tasks in the same job for the CPU
+/// to wait on anyway (only real hardware writes + the completion IRQ
+/// mediate visibility from one task to the next).
+pub unsafe fn submit_tasks(
     fd: i32,
-    regcmd_dma_address: u32,
-    regcmd_count: u32,
+    tasks: &[(u32, u32)], // (regcmd_dma_address, regcmd_count) per task, in order
     in_handles: &[u32],
     out_handles: &[u32],
 ) -> nix::Result<()> {
-    let task = drm_rocket_task {
-        regcmd: regcmd_dma_address,
-        regcmd_count,
-    };
+    let raw_tasks: Vec<drm_rocket_task> = tasks
+        .iter()
+        .map(|&(regcmd, regcmd_count)| drm_rocket_task {
+            regcmd,
+            regcmd_count,
+        })
+        .collect();
     let job = drm_rocket_job {
-        tasks: &task as *const _ as u64,
+        tasks: raw_tasks.as_ptr() as u64,
         in_bo_handles: in_handles.as_ptr() as u64,
         out_bo_handles: out_handles.as_ptr() as u64,
-        task_count: 1,
+        task_count: raw_tasks.len() as u32,
         task_struct_size: std::mem::size_of::<drm_rocket_task>() as u32,
         in_bo_handle_count: in_handles.len() as u32,
         out_bo_handle_count: out_handles.len() as u32,
@@ -125,6 +143,27 @@ pub unsafe fn submit(
         rocket_submit(fd, &mut submit)?;
     }
     Ok(())
+}
+
+/// Submits a single-task job built from an already-written regcmd GEM
+/// buffer. `in_handles`/`out_handles` are the GEM handles the job reads
+/// from/writes to -- must include the regcmd buffer's own handle in
+/// `in_handles` (the kernel needs it retained for the job's duration).
+pub unsafe fn submit(
+    fd: i32,
+    regcmd_dma_address: u32,
+    regcmd_count: u32,
+    in_handles: &[u32],
+    out_handles: &[u32],
+) -> nix::Result<()> {
+    unsafe {
+        submit_tasks(
+            fd,
+            &[(regcmd_dma_address, regcmd_count)],
+            in_handles,
+            out_handles,
+        )
+    }
 }
 
 pub unsafe fn fini_bo(fd: i32, handle: u32) -> nix::Result<()> {
