@@ -40,7 +40,7 @@ use std::{fs::OpenOptions, mem, os::unix::io::AsRawFd, ptr};
 
 use iree_rocket_hal::rocket::{
     device::{Buffer, fini_bo, prep_bo, submit},
-    regcmd::{PoolingBuffers, PoolingMethod, PoolingShape, build_pooling_regcmd},
+    regcmd::{Activation, PoolingBuffers, PoolingMethod, PoolingShape, build_pooling_regcmd},
 };
 
 const DEVICE_PATH: &str = "/dev/accel/accel0";
@@ -68,6 +68,7 @@ fn tiled_shape(method: PoolingMethod) -> PoolingShape {
         pad_right: 0,
         pad_bottom: 0,
         pad_value: 0,
+        activation: Activation::None,
     }
 }
 
@@ -94,6 +95,7 @@ fn whole_input_shape(method: PoolingMethod) -> PoolingShape {
         pad_right: 0,
         pad_bottom: 0,
         pad_value: 0,
+        activation: Activation::None,
     }
 }
 
@@ -220,11 +222,24 @@ completes_and_tracks_input_test!(
 );
 
 /// See module doc comment -- exploratory, not a strict correctness check
-/// of which raw value means what. Splits the input plane in half (first
-/// TENSOR_SIZE/2 bytes low, rest high) so a single whole-input pooling
-/// window is guaranteed to see both values no matter the real per-pixel
-/// packing order, then checks the one invariant that must hold for any
-/// internally-consistent max/min/avg encoding.
+/// of which raw value means what. Splits the *real image footprint* in
+/// half (first `IMAGE_BYTES/2` bytes low, rest high) so a single
+/// whole-input pooling window is guaranteed to see both values no matter
+/// the real per-pixel packing order, then checks the one invariant that
+/// must hold for any internally-consistent max/min/avg encoding.
+///
+/// UPDATE: previously split the entire `TENSOR_SIZE` (4096-byte) buffer in
+/// half rather than just the real 4x4x1 image (256 bytes = 4 rows * 16
+/// bytes/pixel * 4 pixels/row). That accidentally worked before the
+/// `src_line_stride`/`src_surf_stride` fix (see `build_ppu_standalone_
+/// flying`'s doc comment) because the old, 16x-too-large stride formula
+/// happened to read far enough past the real image to sample both this
+/// test's low and high halves regardless. With the corrected (smaller,
+/// TRM-confirmed) stride, PPU_RDMA's read is now tightly confined to the
+/// real 256-byte image -- which sat entirely inside the old fill's "low"
+/// half, so every method read a genuinely uniform 10 and (correctly)
+/// produced identical output. Splitting within the real image footprint
+/// instead restores a genuinely bimodal window.
 #[test]
 #[ignore = "needs the real NPU device -- cross-compile for aarch64, copy to the board, run there; \
             exploratory -- read the printed mapping and fix PoolingMethod::bits() if needed"]
@@ -236,6 +251,9 @@ fn pooling_method_encoding_discovery() {
         .expect("failed to open NPU device");
     let fd = file.as_raw_fd();
 
+    // whole_input_shape()'s 4x4x1 image at 16 bytes/pixel.
+    const IMAGE_BYTES: usize = 4 * 4 * 16;
+
     let mut results: Vec<(u8, u8)> = Vec::new(); // (raw encoding, output byte)
     for (raw, method) in [
         (0u8, PoolingMethod::Max),
@@ -245,11 +263,11 @@ fn pooling_method_encoding_discovery() {
         let shape = whole_input_shape(method);
         unsafe {
             let buf_in = Buffer::new(fd, TENSOR_SIZE, &file);
-            ptr::write_bytes(buf_in.host_ptr, 10u8, TENSOR_SIZE / 2);
+            ptr::write_bytes(buf_in.host_ptr, 10u8, IMAGE_BYTES / 2);
             ptr::write_bytes(
-                buf_in.host_ptr.add(TENSOR_SIZE / 2),
+                buf_in.host_ptr.add(IMAGE_BYTES / 2),
                 200u8,
-                TENSOR_SIZE - TENSOR_SIZE / 2,
+                TENSOR_SIZE - IMAGE_BYTES / 2,
             );
             let buf_out = Buffer::new(fd, TENSOR_SIZE, &file);
             ptr::write_bytes(buf_out.host_ptr, 0, TENSOR_SIZE);
@@ -329,7 +347,9 @@ fn pooling_dump_full_output_buffer() {
         run_pooling(&file, fd, &shape, &buf_in, &buf_out, 4);
 
         let raw = std::slice::from_raw_parts(buf_out.host_ptr, TENSOR_SIZE);
-        eprintln!("pooling_dump_full_output_buffer: full {TENSOR_SIZE}-byte output buffer (sentinel-filled 0xAA, input uniformly filled with 200):");
+        eprintln!(
+            "pooling_dump_full_output_buffer: full {TENSOR_SIZE}-byte output buffer (sentinel-filled 0xAA, input uniformly filled with 200):"
+        );
         for (row, chunk) in raw.chunks(32).enumerate() {
             let hex: String = chunk.iter().map(|b| format!("{b:02x} ")).collect();
             eprintln!("  {:04x}: {hex}", row * 32);

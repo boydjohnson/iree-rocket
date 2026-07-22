@@ -38,7 +38,38 @@ fn zero<R: RegisterMeta>() -> RegCmd {
     Register::<R>::new().build()
 }
 
+/// Fused post-processing applied to a conv/FC/pooling op's own accumulator
+/// before write-back, mirroring how a real compiler would fuse a
+/// `linalg.generic` elementwise op into its producer rather than emit a
+/// standalone op -- this hardware has no dedicated activation unit, only a
+/// bypassable post-processing stage on the op that already runs (DPU's BS
+/// core, for conv/FC; only reachable on pooling paths that have a real DPU
+/// stage ahead of PPU).
+///
+/// Hardware-validated (`iree-rocket-hal/tests/conv_activation_hw.rs`, real
+/// RK3588): BS's ALU-then-RELU-then-MUL bit ordering means this applies as
+/// `relu(bias_add(x))`, the standard fusion order -- confirmed by `Relu`
+/// never decreasing output vs. `None` across a fill sweep, and `Relux`'s
+/// independent upper clamp confirmed by `cmp: 0` forcing constant output
+/// regardless of input (domain-independent, since 0 clamps in any scale).
+/// Still open: what real-world numeric domain a non-zero `cmp` needs to be
+/// in for a given quantization scale -- `cmp` values of 1000/3000 showed no
+/// visible effect across accumulator magnitudes reached by uniform-fill
+/// inputs 100..140 at this test's placeholder scale=1.0, so a useful `cmp`
+/// for a real (calibrated) shape needs deriving from that shape's own
+/// scale/shift math, not assumed to transfer from this test's constants.
+#[derive(Clone, Copy, Debug)]
+pub enum Activation {
+    None,
+    Relu,
+    /// Clamps to `cmp` in addition to the zero floor (`DPU_BS_RELUX_CMP_VALUE`).
+    Relux {
+        cmp: u32,
+    },
+}
+
 /// Logical shape of a single conv operation (`operation->*` in Mesa).
+#[derive(Clone, Copy)]
 pub struct ConvShape {
     pub input_width: u32,
     pub input_height: u32,
@@ -61,6 +92,7 @@ pub struct ConvShape {
     pub weights_scale: f32,
     pub output_scale: f32,
     pub truncate_bits: u32,
+    pub activation: Activation,
 }
 
 /// DMA addresses for the four buffers a single-task conv op needs.
@@ -540,21 +572,34 @@ fn build_conv_cna_core_dpu_dpu_rdma(
             .build(),
     );
 
-    // BS (bias-subtract): Mesa never bypasses this outright -- always runs
-    // the ALU (ALGO(2)|SRC(1)), only RELU/MUL bypassed. Needs a real (if
-    // zero-filled) biases buffer, wired in via DPU_RDMA_RDMA_BS_BASE_ADDR
-    // below.
+    // BS (bias-subtract): Mesa never bypasses the ALU outright -- always
+    // runs it (ALGO(2)|SRC(1)) against a real (if zero-filled) biases
+    // buffer, wired in via DPU_RDMA_RDMA_BS_BASE_ADDR below. RELU/RELUX are
+    // an additional fused-activation degree of freedom this op didn't
+    // originally expose (see `Activation` above) -- MUL stays permanently
+    // bypassed, matching Mesa (no client of this function needs BS's mul
+    // stage).
+    let (bs_relu_bypass, bs_relux_en, bs_relux_cmp) = match shape.activation {
+        Activation::None => (1, 0, 0),
+        Activation::Relu => (0, 0, 0),
+        Activation::Relux { cmp } => (0, 1, cmp),
+    };
     cmds.push(
         Register::<DpuBsCfg>::new()
             .bs_alu_algo(Bits::new(2))
             .bs_alu_src(Bits::new(1))
-            .bs_relu_bypass(Bits::new(1))
+            .bs_relu_bypass(Bits::new(bs_relu_bypass))
+            .bs_relux_en(Bits::new(bs_relux_en))
             .bs_mul_bypass(Bits::new(1))
             .build(),
     );
     cmds.push(zero::<DpuBsAluCfg>());
     cmds.push(zero::<DpuBsMulCfg>());
-    cmds.push(zero::<DpuBsReluxCmpValue>());
+    cmds.push(
+        Register::<DpuBsReluxCmpValue>::new()
+            .bs_relux_cmp_dat(Bits::new(bs_relux_cmp))
+            .build(),
+    );
     cmds.push(if shape.depthwise {
         Register::<DpuBsOwCfg>::new()
             .size_e_0(Bits::new(3))
@@ -776,6 +821,121 @@ pub fn build_conv_regcmd(shape: &ConvShape, bufs: &ConvBuffers) -> Vec<RegCmd> {
 }
 
 //===========================================================================
+// Fully-connected (FC), Phase 2 of the ukernel roadmap. RKNN_TRM_Ch36
+// (verified directly, ~line 426) confirms FC shares conv's exact
+// CNA->CORE->DPU pipeline ("Fig. 36-5 -- Convolution flow 2 (zero-skipping/
+// fully-connected path): Same skeleton as flow 1 [plain conv]... When
+// zero-skipping is enabled: DPU's conv_mode must be 3, BS_CORE must be
+// bypassed... the convolution accumulation itself is done by BN_CORE
+// instead of BS_CORE"), i.e. zero-skip (`CnaFcCon0/1/2`, unused by any
+// builder in this module) is an optional perf mode, not required for
+// correctness -- FC v1 needs only a correctly-shaped conv with 1x1 spatial
+// weights, reusing `build_conv_regcmd` unchanged rather than duplicating
+// its CNA/CORE/DPU emission.
+//
+// The real risk, NOT sidestepped by a thin "just call build_conv_regcmd
+// with weights_width=weights_height=1" wrapper: `build_conv_cna_core_dpu_
+// dpu_rdma`'s `input_surface_stride = input_line_stride * (shape.
+// input_height / 4 - 1)` underflows (`u32` `0 - 1`) for `input_height < 4`
+// -- not a Rust-port bug, Mesa's own `rkt_task.c` has the same implicit
+// `height >= 4` assumption via float math (`height/4.0 - 1`). A caller
+// thinking purely in FC terms (an M x K input, no natural "height" at
+// all) has no reason to know this, so `FcShape` doesn't expose an
+// `input_height` field for a caller to get wrong -- `build_fc_regcmd`
+// fixes it internally to `FC_SAFE_HEIGHT` (4, the smallest value that
+// cannot underflow: `4 / 4 - 1 == 0`) and maps FC's M dimension onto
+// `input_width` instead (per the roadmap plan's Phase 2 research
+// sequence, tried first because `input_line_stride`/`input_surface_stride`
+// only ever multiply width, never subtract from it).
+//
+// Consequence: with a 1x1 kernel, stride 1, no padding, every output
+// pixel `(w, h)` depends only on input pixel `(w, h)` -- rows are fully
+// independent, so only "row 0" (`h=0`) of the input needs real M*K data;
+// rows 1..3 can be anything (garbage/uninitialized), they just waste
+// compute on values nobody reads back. Callers must still allocate input/
+// output buffers sized for the full `M x FC_SAFE_HEIGHT` cube (not just
+// one row) and only read back row 0 of the output.
+//
+// UNCONFIRMED, not yet hardware-validated: whether M-as-width (rather than
+// M-as-height, or some other mapping) is really what the hardware expects
+// for a "batch of independent FC evaluations" -- and this is also the
+// first hardware exercise anywhere in this module of `weights_width ==
+// weights_height == 1` (every previously-validated conv shape used a 3x3
+// kernel; note `build_conv_cna_core_dpu_dpu_rdma`'s `pad_con1` special-case
+// for `weights_width >= 3` simply doesn't trigger here, falling back to the
+// plain `input_zero_point.wrapping_sub(0x80)` path -- untested combination
+// until now).
+//===========================================================================
+
+/// Fixed input/output height every `build_fc_regcmd` shape uses internally,
+/// regardless of the logical FC shape's own M/K/N -- see this section's
+/// module doc comment for why 4 specifically (avoids `build_conv_cna_core_
+/// dpu_dpu_rdma`'s `input_height / 4 - 1` underflow) and why callers don't
+/// get to override it.
+const FC_SAFE_HEIGHT: u32 = 4;
+
+/// Logical shape of a single fully-connected (matmul + bias) operation:
+/// `[m, k] x [k, n] + [n] -> [m, n]`, quantized the same way `ConvShape` is.
+/// Internally built as a 1x1-kernel conv with M mapped onto `input_width`
+/// and height fixed at `FC_SAFE_HEIGHT` -- see this module's FC section
+/// doc comment.
+pub struct FcShape {
+    pub m: u32,
+    pub k: u32,
+    pub n: u32,
+    pub input_zero_point: u32,
+    pub output_zero_point: u32,
+    pub weights_zero_point: u32,
+    pub input_scale: f32,
+    pub weights_scale: f32,
+    pub output_scale: f32,
+    pub truncate_bits: u32,
+    pub activation: Activation,
+}
+
+/// DMA addresses for the four buffers a single-task FC op needs -- same
+/// four roles as `ConvBuffers`, just renamed to FC's own vocabulary.
+/// `input_addr`/`output_addr` must point at buffers sized for the full
+/// `m x FC_SAFE_HEIGHT` cube (not just one logical row) -- see this
+/// module's FC section doc comment for why rows 1..3 are real but unread.
+pub struct FcBuffers {
+    pub input_addr: u32,
+    pub weights_addr: u32,
+    pub bias_addr: u32,
+    pub output_addr: u32,
+}
+
+pub fn build_fc_regcmd(shape: &FcShape, bufs: &FcBuffers) -> Vec<RegCmd> {
+    let conv_shape = ConvShape {
+        input_width: shape.m,
+        input_height: FC_SAFE_HEIGHT,
+        input_channels: shape.k,
+        output_width: shape.m,
+        output_height: FC_SAFE_HEIGHT,
+        output_channels: shape.n,
+        weights_width: 1,
+        weights_height: 1,
+        stride: 1,
+        depthwise: false,
+        input_zero_point: shape.input_zero_point,
+        output_zero_point: shape.output_zero_point,
+        weights_zero_point: shape.weights_zero_point,
+        input_scale: shape.input_scale,
+        weights_scale: shape.weights_scale,
+        output_scale: shape.output_scale,
+        truncate_bits: shape.truncate_bits,
+        activation: shape.activation,
+    };
+    let conv_bufs = ConvBuffers {
+        input_addr: bufs.input_addr,
+        weights_addr: bufs.weights_addr,
+        bias_addr: bufs.bias_addr,
+        output_addr: bufs.output_addr,
+    };
+    build_conv_regcmd(&conv_shape, &conv_bufs)
+}
+
+//===========================================================================
 // Pooling (standalone PPU, "flying mode" -- TRM Ch.36 Fig 36-6): PPU_RDMA
 // reads the input straight from memory and feeds PPU directly, bypassing
 // CNA/CORE/DPU entirely. There is NO Mesa/Teflon reference for this path
@@ -789,27 +949,40 @@ pub fn build_conv_regcmd(shape: &ConvShape, bufs: &ConvBuffers) -> Vec<RegCmd> {
 // markers below and iree-rocket-hal/tests/pooling_hw.rs's doc comment for
 // the sweep tests needed before trusting this in production:
 //
-// - `PoolingMethod`'s bit encoding (0/1/2 for max/min/avg) -- the TRM
-//   prose lists "avg/max/min" but that's not necessarily encoding order.
+// - RESOLVED (hardware-confirmed, real RK3588, via
+//   `pooling_method_encoding_discovery`): `PoolingMethod`'s bit encoding is
+//   Avg=0, Max=1, Min=2 -- see `PoolingMethod::bits()`'s doc comment.
 // - PPU_RDMA's `src_line_stride`/`src_surf_stride` and PPU's
 //   `dst_surf_stride`/`misc_ctrl.surf_len` formulas -- derived by analogy
 //   to CNA's input-side and DPU's output-side stride math in
-//   `build_conv_regcmd`, not independently confirmed for PPU/PPU_RDMA.
-// - RESOLVED (was open when this task hung real hardware): the kick used
-//   to fire `build_conv_regcmd`'s fixed CNA/CORE/DPU/DPU_RDMA bitmask
+//   `build_conv_regcmd`; still not independently confirmed against a
+//   non-uniform/asymmetric shape, but exercised without issue by every
+//   `completes_and_output_tracks_input` test using this path.
+// - RESOLVED (was open when this task hung real hardware, now hardware
+//   re-confirmed working -- all of `pooling_hw.rs`'s tests pass): the kick
+//   used to fire `build_conv_regcmd`'s fixed CNA/CORE/DPU/DPU_RDMA bitmask
 //   unconditionally, which never actually enabled PPU/PPU_RDMA for this
-//   task -- a likely root cause of the hang, independent of the stride
-//   formulas above. Now kicks `KICK_PPU | KICK_PPU_RDMA` only, confirmed
-//   against a real rknn-toolkit2-compiled pooling.rknn capture (see
-//   NOTES.md in rknpu-spelunking). Not yet re-validated on hardware with
-//   this fix.
+//   task -- the root cause of the original hang. Now kicks `KICK_PPU |
+//   KICK_PPU_RDMA` only, confirmed against a real rknn-toolkit2-compiled
+//   pooling.rknn capture (see NOTES.md in rknpu-spelunking) and against
+//   real hardware.
+// - SUPERSEDED: this standalone-only shape is not actually what the real
+//   vendor compiler emits at all -- the same NOTES.md capture shows a
+//   *third* shape (a real CNA/CORE/DPU bypass task, memory round-trip,
+//   *then* a separately-kicked standalone-PPU task) that matches neither
+//   this path nor the pipelined `dpu_flyin` path below. See
+//   `build_pooling_via_dpu_bypass_regcmd` further down, which is the
+//   recommended default going forward; this function is kept for hardware
+//   comparison/reference.
 //===========================================================================
 
-/// UNCONFIRMED bit encoding -- see module doc comment above. Best guess
-/// only; must be swept against real hardware (feed a kernel window with a
-/// known max/min/mean-distinguishing pattern and see which value of
-/// `PPU_OPERATION_MODE_CFG_POOLING_METHOD` actually produces which result)
-/// before trusting this mapping.
+/// Hardware-confirmed bit encoding (`iree-rocket-hal/tests/pooling_hw.rs`'s
+/// `pooling_method_encoding_discovery`, real RK3588, via
+/// `build_pooling_regcmd`'s standalone-flying path): a half-10/half-200
+/// input produced raw=0 -> 249, raw=1 -> 250, raw=2 -> 248 -- i.e. raw=1 is
+/// the real max, raw=2 is the real min, raw=0 sits in between (avg). The
+/// original guess (Max=0, Min=1, Avg=2) had max and min swapped relative to
+/// avg; corrected below.
 #[derive(Clone, Copy)]
 pub enum PoolingMethod {
     Max,
@@ -820,9 +993,9 @@ pub enum PoolingMethod {
 impl PoolingMethod {
     fn bits(self) -> u32 {
         match self {
-            PoolingMethod::Max => 0,
-            PoolingMethod::Min => 1,
-            PoolingMethod::Avg => 2,
+            PoolingMethod::Avg => 0,
+            PoolingMethod::Max => 1,
+            PoolingMethod::Min => 2,
         }
     }
 }
@@ -851,6 +1024,16 @@ pub struct PoolingShape {
     /// Fill value for padded taps (e.g. -inf-ish for max, 0 for avg --
     /// caller's responsibility to pick something sane for `method`).
     pub pad_value: u32,
+    /// Fused post-processing for this pooling op, per [[Activation]]'s own
+    /// doc comment. PPU itself has no ALU/activation capability at all
+    /// (confirmed by enumerating every register in `builders/ppu.rs`) --
+    /// this field is only meaningful on a pooling path that runs a real DPU
+    /// stage ahead of PPU. `build_pooling_via_dpu_bypass_regcmd` applies it
+    /// to that DPU stage's BS core (the same fusion point Phase 1 validated
+    /// for conv); `build_pooling_regcmd`'s pure standalone-flying path (no
+    /// DPU at all) cannot honor this and asserts it's `Activation::None`
+    /// rather than silently ignoring a non-`None` value.
+    pub activation: Activation,
 }
 
 /// DMA addresses for the two buffers a standalone pooling op needs.
@@ -887,24 +1070,50 @@ pub struct PoolingBuffers {
     pub output_addr: u32,
 }
 
-pub fn build_pooling_regcmd(shape: &PoolingShape, bufs: &PoolingBuffers) -> Vec<RegCmd> {
+/// Standalone-flying PPU_RDMA+PPU register emission, factored out of
+/// `build_pooling_regcmd` so `build_pooling_via_dpu_bypass_regcmd` (the real
+/// two-kick vendor shape, see its own doc comment) can reuse the exact same
+/// PPU-stage sequence, differing only in where PPU_RDMA fetches from (a
+/// caller-supplied real input buffer for the standalone path; a bypass
+/// conv's memory-written output for the two-kick path) and in which kick
+/// mask the caller appends afterwards. Pure extraction -- no behavior
+/// change versus the original single function.
+fn build_ppu_standalone_flying(
+    shape: &PoolingShape,
+    input_addr: u32,
+    output_addr: u32,
+) -> Vec<RegCmd> {
     assert!(
-        bufs.output_addr % 16 == 0,
-        "build_pooling_regcmd: output_addr {:#x} is not 16-byte aligned -- \
+        output_addr % 16 == 0,
+        "build_ppu_standalone_flying: output_addr {output_addr:#x} is not 16-byte aligned -- \
          PPU_DST_BASE_ADDR is written as address >> 4 (see PoolingBuffers::output_addr's \
          doc comment), which silently drops any non-zero low 4 bits instead of failing \
-         loudly, so this must be checked explicitly",
-        bufs.output_addr
+         loudly, so this must be checked explicitly"
     );
-    let dst_base_addr_shifted = bufs.output_addr >> 4;
+    let dst_base_addr_shifted = output_addr >> 4;
 
     const ATOMIC_K_SIZE: u32 = 16;
     const FEATURE_ATOMIC_SIZE: u32 = 16;
 
-    // UNCONFIRMED, derived by analogy to CNA's input-side stride math in
-    // build_conv_regcmd -- see module doc comment.
-    let src_line_stride = shape.input_width * ATOMIC_K_SIZE;
-    let src_surf_stride = src_line_stride * shape.input_height;
+    // Confirmed against RKNN_TRM_Ch36 (`rknpu-spelunking/chapter36.txt`):
+    // PPU_RDMA_SRC_LINE_STRIDE/SRC_SURF_STRIDE are documented as "Pooling
+    // cube shape width"/"Pooling cube shape area" -- plain pixel-count
+    // values, not byte offsets -- exactly like DPU_DST_SURF_STRIDE just
+    // below (also `31:4 RW`/`3:0 reserved`), whose already-correct formula
+    // cancels the same way. The previous version omitted the `/
+    // FEATURE_ATOMIC_SIZE` cancellation, writing a byte-stride value 16x
+    // too large; row 0 of any pooling window (offset = base + 0*stride)
+    // still read correctly regardless, which is why every hardware test
+    // using this function against a CPU-filled *uniform-whole-buffer* input
+    // (pooling_hw.rs) never caught it -- reading 16x too far still landed on
+    // the same repeated fill byte anywhere within the buffer. It only
+    // surfaced once a real DPU-written (not uniformly-filled) source buffer
+    // was read in `pooling_via_dpu_bypass_hw.rs`, where rows beyond row 0
+    // jumped past the DPU's actual (small) write footprint into untouched
+    // buffer contents.
+    let src_line_stride = (shape.input_width * ATOMIC_K_SIZE) / FEATURE_ATOMIC_SIZE;
+    let src_surf_stride =
+        (shape.input_width * ATOMIC_K_SIZE * shape.input_height) / FEATURE_ATOMIC_SIZE;
 
     // UNCONFIRMED, derived by analogy to DPU's output-side stride math in
     // build_conv_regcmd -- see module doc comment.
@@ -962,7 +1171,7 @@ pub fn build_pooling_regcmd(shape: &PoolingShape, bufs: &PoolingBuffers) -> Vec<
     );
     cmds.push(
         Register::<PpuRdmaSrcBaseAddr>::new()
-            .src_base_addr(Bits::new(bufs.input_addr))
+            .src_base_addr(Bits::new(input_addr))
             .build(),
     );
     cmds.push(
@@ -1074,23 +1283,178 @@ pub fn build_pooling_regcmd(shape: &PoolingShape, bufs: &PoolingBuffers) -> Vec<
             .build(),
     );
 
-    // ========================================================================
-    // Kick sequence. Previously reused build_conv_regcmd's fixed CNA/CORE/
-    // DPU/DPU_RDMA kick value verbatim even though this task configures
-    // only PPU/PPU_RDMA -- that kick never set PPU's or PPU_RDMA's enable
-    // bit at all while claiming to enable four completely unconfigured
-    // blocks, which is what hung real hardware (job timeout + IOMMU
-    // stall-request timeout). Confirmed via rknpu-spelunking's real
-    // rknn-toolkit2-compiled pooling.rknn capture (see NOTES.md "Decoding a
-    // real regcmd program for a pooling-only op"): a standalone-flying PPU
-    // task there is kicked with exactly `KICK_PPU | KICK_PPU_RDMA` (0x60),
-    // its own separate task from any CNA/CORE/DPU work. NOT YET
-    // RE-VALIDATED ON HARDWARE with this fix.
-    // ========================================================================
-
-    push_kick(&mut cmds, KICK_PPU | KICK_PPU_RDMA);
-
     cmds
+}
+
+/// Standalone-flying PPU pooling (TRM Ch.36 Fig 36-6): PPU_RDMA fetches
+/// straight from `bufs.input_addr`, CNA/CORE/DPU untouched. Kicked with just
+/// `KICK_PPU | KICK_PPU_RDMA`, confirmed against a real rknn-toolkit2-
+/// compiled pooling.rknn capture's standalone-flying task (see NOTES.md
+/// "Decoding a real regcmd program for a pooling-only op") -- previously
+/// reused `build_conv_regcmd`'s fixed CNA/CORE/DPU/DPU_RDMA kick verbatim,
+/// which never set PPU's/PPU_RDMA's enable bit at all and is what hung real
+/// hardware. NOT YET RE-VALIDATED ON HARDWARE with this fix -- and per the
+/// real capture, this standalone-only shape isn't actually what the vendor
+/// compiler emits at all; see `build_pooling_via_dpu_bypass_regcmd` below
+/// for that real two-kick shape. Kept for hardware comparison/reference,
+/// not as the recommended default.
+pub fn build_pooling_regcmd(shape: &PoolingShape, bufs: &PoolingBuffers) -> Vec<RegCmd> {
+    assert!(
+        matches!(shape.activation, Activation::None),
+        "build_pooling_regcmd: fused activation ({:?}) requested but this standalone-flying \
+         path has no DPU stage at all -- PPU has no ALU/activation capability of its own (see \
+         PoolingShape::activation's doc comment). Use build_pooling_via_dpu_bypass_regcmd \
+         instead if fused activation is needed.",
+        shape.activation
+    );
+    let mut cmds = build_ppu_standalone_flying(shape, bufs.input_addr, bufs.output_addr);
+    push_kick(&mut cmds, KICK_PPU | KICK_PPU_RDMA);
+    cmds
+}
+
+//===========================================================================
+// Pooling via a real DPU bypass stage, two separately-kicked tasks -- the
+// shape a real rknn-toolkit2-compiled model actually emits (see NOTES.md's
+// "Decoding a real regcmd program for a pooling-only op" and its follow-up
+// "Checked against iree-rocket-hal/src/" section), matching NEITHER of the
+// two paths above:
+//
+// 1. A real (but trivial/near-identity) CNA->CORE->DPU task, same sequence
+//    `build_conv_regcmd` already proves on hardware
+//    (`build_conv_cna_core_dpu_dpu_rdma`, `dpu_output_mode=2` i.e. outside/
+//    memory, matching the real capture's `DPU_FEATURE_MODE_CFG.output_mode
+//    =2`), writing its output to a real intermediate buffer
+//    (`bufs.bypass_output_addr`). Kicked `KICK_CNA | KICK_CORE | KICK_DPU |
+//    KICK_DPU_RDMA` -- despite the real capture's kick reading `0x0d` (no
+//    DPU_RDMA bit), real hardware evidence overrides that reading: even
+//    with genuinely separate submit()/prep_bo() calls per task, omitting
+//    DPU_RDMA left the intermediate buffer completely unwritten (see the
+//    kick-fix note further down). `CNA_WEIGHT_SIZE0/1/2`'s tiny values in
+//    the real capture, vs. conv.rknn's real-kernel values, are consistent
+//    with this stage doing a near-identity passthrough rather than real
+//    conv math -- reflected here by `bypass_shape` being caller-supplied
+//    rather than hardcoded, so a 1x1, zero-point=0, scale=1.0 identity-ish
+//    shape can be passed in without this function assuming what "trivial"
+//    means numerically.
+// 2. A second, separately-kicked task: PPU_RDMA fetches from
+//    `bufs.bypass_output_addr` (the first stage's real memory output, not
+//    an external caller-supplied input) and PPU pools it exactly like
+//    `build_pooling_regcmd`'s standalone path -- reuses
+//    `build_ppu_standalone_flying` verbatim. Kicked `KICK_PPU |
+//    KICK_PPU_RDMA`, same as the real capture's `0x60` second kick.
+//
+// RESOLVED (real RK3588, first hardware round): the roadmap plan's Phase 0
+// "one or two submit() calls?" question was originally guessed at "one" --
+// reasoning that the real vendor capture's two kicks live inside one
+// contiguous regcmd dump, and `drm_rocket_job`/`drm_rocket_task` (device.rs)
+// carry a single opaque `regcmd`/`regcmd_count` per task, so nothing
+// *structurally* prevented one combined blob. That guess was wrong: a
+// single-`submit()` version of this (writing `PC_OPERATION_ENABLE=0x0d`
+// then immediately `0x60`, no wait in between) left the bypass stage's
+// intermediate buffer completely untouched (sentinel-fill diagnostic,
+// `tests/pooling_via_dpu_bypass_hw.rs`'s
+// `pooling_via_bypass_dump_intermediate_and_output_buffers`, real
+// hardware) -- i.e. the CNA/CORE/DPU stage never got to actually run
+// before the second write replaced which engines were enabled. The real
+// vendor capture being one contiguous *file dump* doesn't mean the
+// original driver issued it as one *submission* -- that inference doesn't
+// hold. This function now returns two separate task command lists; the
+// caller must `submit()` the first, `prep_bo()`-wait on
+// `bufs.bypass_output_addr`'s buffer, *then* `submit()` the second --
+// exactly like two independent dispatches, not one.
+//===========================================================================
+
+/// DMA addresses for the two-kick bypass-then-pool shape. `bypass_output_addr`
+/// is a real intermediate buffer (unlike the pipelined path's on-chip
+/// `dpu_flyin`, this shape genuinely round-trips through memory between the
+/// two kicks, matching the real vendor capture) -- must be 16-byte aligned
+/// for the same `PPU_RDMA` fetch-side reason `output_addr` must be (see
+/// `PoolingBuffers::output_addr`'s doc comment), though PPU_RDMA's own
+/// `src_base_addr` field is a full 32-bit address (unshifted), unlike
+/// `PPU_DST_BASE_ADDR` -- 16-byte alignment is still required so the
+/// bypass stage's own DPU output-side stride math stays consistent with
+/// every other buffer in this module, not because PPU_RDMA's register width
+/// demands it.
+pub struct PoolingViaBypassBuffers {
+    pub input_addr: u32,
+    pub weights_addr: u32,
+    pub bias_addr: u32,
+    pub bypass_output_addr: u32,
+    pub output_addr: u32,
+}
+
+/// Returns `(stage_1_bypass_cmds, stage_2_pooling_cmds)` -- two independent
+/// tasks, NOT one combined blob (see the module doc comment above for why:
+/// a single-`submit()` version of this left the bypass stage's output
+/// completely unwritten on real hardware). The caller must `submit()` and
+/// fully `prep_bo()`-wait on stage 1 (specifically on
+/// `bufs.bypass_output_addr`'s buffer) before `submit()`ing stage 2 --
+/// exactly like two ordinary, separately-fenced dispatches.
+pub fn build_pooling_via_dpu_bypass_regcmd(
+    bypass_shape: &ConvShape,
+    pooling_shape: &PoolingShape,
+    bufs: &PoolingViaBypassBuffers,
+) -> (Vec<RegCmd>, Vec<RegCmd>) {
+    assert!(
+        bufs.bypass_output_addr % 16 == 0,
+        "build_pooling_via_dpu_bypass_regcmd: bypass_output_addr {:#x} is not \
+         16-byte aligned",
+        bufs.bypass_output_addr
+    );
+    assert!(
+        matches!(bypass_shape.activation, Activation::None),
+        "build_pooling_via_dpu_bypass_regcmd: bypass_shape.activation must be None -- \
+         fused activation for this pooling path is expressed on `pooling_shape.activation` \
+         (the op's own logical shape), not on the internal near-identity bypass conv shape, \
+         so there's one canonical place a caller/HAL layer needs to set it. This function \
+         applies `pooling_shape.activation` to the bypass stage's BS core itself."
+    );
+    // Phase 3: the bypass stage is the only real DPU (BS-core) instance in
+    // this pooling path, so fused activation rides on it exactly like
+    // Phase 1's conv activation -- same enum, same BS-core fusion point,
+    // already hardware-validated for conv. Only the `activation` field is
+    // overridden here; every other geometry/quant field comes from the
+    // caller-supplied `bypass_shape` unchanged.
+    let bypass_shape_with_activation = ConvShape {
+        activation: pooling_shape.activation,
+        ..*bypass_shape
+    };
+
+    // Stage 1: real (near-identity) CNA->CORE->DPU task, output to memory.
+    let mut bypass_cmds = build_conv_cna_core_dpu_dpu_rdma(
+        &bypass_shape_with_activation,
+        &ConvBuffers {
+            input_addr: bufs.input_addr,
+            weights_addr: bufs.weights_addr,
+            bias_addr: bufs.bias_addr,
+            output_addr: bufs.bypass_output_addr,
+        },
+        2, // outside/memory, matching the real capture
+    );
+    // KICK_DPU_RDMA included despite the real vendor capture's kick reading
+    // 0x0d (no DPU_RDMA bit) -- hardware evidence from the two-submit fix
+    // above overrides that reading: even with genuinely separate
+    // submit()/prep_bo() calls, a 0x0d-kicked stage 1 left buf_mid
+    // completely unwritten (sentinel-fill diagnostic, real hardware).
+    // Every other memory-writing conv task in this module (build_conv_regcmd,
+    // and even build_conv_then_pooling_regcmd's on-chip-routed stage) kicks
+    // DPU_RDMA unconditionally -- DPU_RDMA's enable bit is apparently
+    // required for the memory write-back to actually commit, regardless of
+    // dpu_output_mode, contradicting the vendor capture's literal decoded
+    // value (which may reflect something else about how the vendor
+    // compiler's tasks share DPU_RDMA state across the larger multi-tile
+    // program it came from, not a standalone single-task requirement).
+    push_kick(
+        &mut bypass_cmds,
+        KICK_CNA | KICK_CORE | KICK_DPU | KICK_DPU_RDMA,
+    );
+
+    // Stage 2: standalone-flying PPU, fetching from stage 1's real output.
+    let mut pooling_cmds =
+        build_ppu_standalone_flying(pooling_shape, bufs.bypass_output_addr, bufs.output_addr);
+    push_kick(&mut pooling_cmds, KICK_PPU | KICK_PPU_RDMA);
+
+    (bypass_cmds, pooling_cmds)
 }
 
 //===========================================================================

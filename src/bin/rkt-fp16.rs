@@ -56,7 +56,7 @@ use iree_rocket_hal::rocket::{
         drm_rocket_job, drm_rocket_prep_bo, drm_rocket_submit, drm_rocket_task,
     },
     debug::dump_cmds,
-    regcmd::{ConvBuffers, ConvShape, build_conv_regcmd},
+    regcmd::{Activation, ConvBuffers, ConvShape, build_conv_regcmd},
     registers::{
         CNA_CVT_CON0_CVT_BYPASS, CNA_CVT_CON0_CVT_BYPASS__MASK, CNA_CVT_CON0_CVT_TYPE,
         CNA_CVT_CON0_CVT_TYPE__MASK, CNA_CVT_CON0_DATA_SIGN, CNA_CVT_CON0_DATA_SIGN__MASK,
@@ -298,6 +298,7 @@ fn main() {
             weights_scale: 1.0,
             output_scale: 1.0,
             truncate_bits: 0,
+            activation: Activation::None,
         };
         let bufs = ConvBuffers {
             input_addr: buf_a.dma_address,

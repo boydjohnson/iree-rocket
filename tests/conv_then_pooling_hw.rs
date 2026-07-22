@@ -28,7 +28,7 @@ use std::{fs::OpenOptions, mem, os::unix::io::AsRawFd, ptr};
 use iree_rocket_hal::rocket::{
     device::{Buffer, fini_bo, prep_bo, submit},
     regcmd::{
-        ConvShape, ConvThenPoolingBuffers, PipelinedPoolingShape, PoolingMethod,
+        Activation, ConvShape, ConvThenPoolingBuffers, PipelinedPoolingShape, PoolingMethod,
         build_conv_then_pooling_regcmd,
     },
 };
@@ -56,6 +56,7 @@ fn conv_shape() -> ConvShape {
         weights_scale: 1.0,
         output_scale: 1.0,
         truncate_bits: 0,
+        activation: Activation::None,
     }
 }
 
@@ -143,9 +144,8 @@ fn run_uniform(pooling: &PipelinedPoolingShape, input_fill: u8, weight_fill: u8)
         )
         .expect("SUBMIT ioctl failed");
 
-        prep_bo(fd, buf_out.handle, 2_000_000_000).unwrap_or_else(|e| {
-            panic!("job did not complete within timeout: {e}")
-        });
+        prep_bo(fd, buf_out.handle, 2_000_000_000)
+            .unwrap_or_else(|e| panic!("job did not complete within timeout: {e}"));
 
         let raw = std::slice::from_raw_parts(buf_out.host_ptr, 64);
         (0..4).map(|i| raw[i * 16]).collect()
@@ -178,9 +178,18 @@ macro_rules! completes_and_tracks_input_test {
     };
 }
 
-completes_and_tracks_input_test!(conv_then_pooling_max_completes_and_tracks_input, PoolingMethod::Max);
-completes_and_tracks_input_test!(conv_then_pooling_min_completes_and_tracks_input, PoolingMethod::Min);
-completes_and_tracks_input_test!(conv_then_pooling_avg_completes_and_tracks_input, PoolingMethod::Avg);
+completes_and_tracks_input_test!(
+    conv_then_pooling_max_completes_and_tracks_input,
+    PoolingMethod::Max
+);
+completes_and_tracks_input_test!(
+    conv_then_pooling_min_completes_and_tracks_input,
+    PoolingMethod::Min
+);
+completes_and_tracks_input_test!(
+    conv_then_pooling_avg_completes_and_tracks_input,
+    PoolingMethod::Avg
+);
 
 /// Diagnostic, not a correctness check -- added after all three tests
 /// above came back stuck at constant 0 regardless of input_fill, same

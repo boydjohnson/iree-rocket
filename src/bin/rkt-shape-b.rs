@@ -43,7 +43,7 @@ use iree_rocket_hal::rocket::{
         drm_rocket_job, drm_rocket_prep_bo, drm_rocket_submit, drm_rocket_task,
     },
     debug::dump_cmds,
-    regcmd::{ConvBuffers, ConvShape, build_conv_regcmd},
+    regcmd::{Activation, ConvBuffers, ConvShape, build_conv_regcmd},
 };
 use nix::{
     ioctl_readwrite, ioctl_write_ptr,
@@ -105,6 +105,7 @@ fn main() {
             weights_scale: 1.0,
             output_scale: 1.0,
             truncate_bits: 0,
+            activation: Activation::None,
         };
         let bufs = ConvBuffers {
             input_addr: buf_a.dma_address,

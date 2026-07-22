@@ -15,7 +15,7 @@ use nix::{
 
 use crate::rocket::api::{
     DRM_COMMAND_BASE, DRM_IOCTL_BASE, DRM_ROCKET_CREATE_BO, DRM_ROCKET_FINI_BO, DRM_ROCKET_PREP_BO,
-    DRM_ROCKET_SUBMIT, drm_rocket_create_bo, drm_rocket_fini_bo, drm_rocket_job,
+    DRM_ROCKET_SUBMIT, drm_gem_close, drm_rocket_create_bo, drm_rocket_fini_bo, drm_rocket_job,
     drm_rocket_prep_bo, drm_rocket_submit, drm_rocket_task,
 };
 
@@ -43,6 +43,15 @@ ioctl_write_ptr!(
     DRM_COMMAND_BASE + DRM_ROCKET_FINI_BO,
     drm_rocket_fini_bo
 );
+// GEM_CLOSE is a generic (core DRM, not rocket-specific) ioctl -- nr=0x09
+// per every DRM driver's shared <drm/drm.h>, NOT offset by
+// DRM_COMMAND_BASE the way every other ioctl in this module is (those are
+// all rocket-driver-specific commands). No client of this crate has ever
+// called this before this session -- every `Buffer::new()` GEM allocation
+// in every test/bin in this repo has leaked its handle for the lifetime of
+// the process, which turned out to matter for tests doing many repeated
+// allocations in one process (see `close_bo`'s doc comment).
+ioctl_write_ptr!(gem_close, DRM_IOCTL_BASE, 0x09, drm_gem_close);
 
 pub struct Buffer {
     pub handle: u32,
@@ -150,6 +159,24 @@ pub unsafe fn prep_bo(fd: i32, handle: u32, relative_timeout_ns: u64) -> nix::Re
                 timeout_ns: (now_ns + relative_timeout_ns) as i64,
             },
         )?;
+    }
+    Ok(())
+}
+
+/// Releases a GEM handle (`DRM_IOCTL_GEM_CLOSE`) -- the counterpart
+/// `Buffer::new()` never had. Added after a real hardware investigation
+/// (rknpu-spelunking's ukernel roadmap, Phase 0 pooling reconciliation)
+/// found that test functions calling `Buffer::new()` many times in a row
+/// within one process (each call leaking its handle -- nothing in this
+/// crate has ever closed one before) started producing corrupted/stale
+/// dispatch results after several repeated allocations, while the exact
+/// same dispatch run once in a fresh process was clean. Does NOT unmap the
+/// buffer's `host_ptr` -- callers that also `mmap`'d (i.e. everyone using
+/// `Buffer::new()`) should `munmap` separately if the address space itself
+/// needs reclaiming; this only releases the kernel-side GEM object/handle.
+pub unsafe fn close_bo(fd: i32, handle: u32) -> nix::Result<()> {
+    unsafe {
+        gem_close(fd, &drm_gem_close { handle, pad: 0 })?;
     }
     Ok(())
 }
