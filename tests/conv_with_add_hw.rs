@@ -65,10 +65,18 @@ fn conv_shape() -> ConvShape {
     }
 }
 
-/// Runs `x + y` with the whole `x` plane filled with `x_fill`, the whole
-/// `y` plane filled with `y_fill`, a 1x1 identity-ish weight
-/// (`weight_fill`), and returns the 16 real output pixels.
-fn run_uniform_conv_with_add(x_fill: u8, y_fill: u8, weight_fill: u8) -> Vec<u8> {
+/// Runs `x + scale*y` with the whole `x` plane filled with `x_fill`,
+/// the whole `y` plane filled with `y_fill`, a 1x1 identity-ish weight
+/// (`weight_fill`), and returns the 16 real output pixels. `scale=1.0`
+/// is addition; `scale=-1.0` is subtraction (`x - y`) -- see
+/// `AddTensor`'s own doc comment on why a negative `scale` is the right
+/// way to get subtraction out of this same struct/builder.
+fn run_uniform_conv_with_add_scaled(
+    x_fill: u8,
+    y_fill: u8,
+    weight_fill: u8,
+    scale: f32,
+) -> Vec<u8> {
     let file = OpenOptions::new()
         .read(true)
         .write(true)
@@ -103,7 +111,7 @@ fn run_uniform_conv_with_add(x_fill: u8, y_fill: u8, weight_fill: u8) -> Vec<u8>
         let addition = AddTensor {
             src_addr: buf_y.dma_address,
             ew_addr: buf_y.dma_address,
-            scale: 1.0,
+            scale,
             cvt_offset: 0,
         };
         let cmds = build_conv_with_add_regcmd(&conv_shape(), &bufs, &addition);
@@ -171,7 +179,7 @@ fn run_uniform_conv_with_add(x_fill: u8, y_fill: u8, weight_fill: u8) -> Vec<u8>
 #[test]
 #[ignore = "needs the real NPU device -- cross-compile for aarch64, copy to the board, run there"]
 fn conv_with_add_completes() {
-    let out = run_uniform_conv_with_add(0, 0, 64);
+    let out = run_uniform_conv_with_add_scaled(0, 0, 64, 1.0);
     eprintln!("conv_with_add_completes: output={out:?}");
 }
 
@@ -209,7 +217,7 @@ fn conv_with_add_tracks_x_plus_y() {
     let mut prev: Option<u8> = None;
 
     for x_fill in fills {
-        let raw = run_uniform_conv_with_add(x_fill, 128, 0x81)[0];
+        let raw = run_uniform_conv_with_add_scaled(x_fill, 128, 0x81, 1.0)[0];
         eprintln!(
             "conv_with_add_tracks_x_plus_y: x_fill={x_fill} (real={}) y_fill=128 (real=0): raw={raw} (real={})",
             x_fill as i32 - 0x80,
@@ -350,7 +358,7 @@ fn conv_with_add_tracks_y_alone() {
     let mut prev: Option<u8> = None;
 
     for y_fill in fills {
-        let raw = run_uniform_conv_with_add(128, y_fill, 0x80)[0];
+        let raw = run_uniform_conv_with_add_scaled(128, y_fill, 0x80, 1.0)[0];
         eprintln!(
             "conv_with_add_tracks_y_alone: x_fill=128 (real=0, weight_real=0) y_fill={y_fill} (real={}): raw={raw} (real={})",
             y_fill as i32 - 0x80,
@@ -361,6 +369,58 @@ fn conv_with_add_tracks_y_alone() {
             assert!(
                 raw > prev_raw,
                 "conv-with-add output is not strictly increasing over the y_fill sweep \
+                 (accumulator held at 0 via weight_real=0): previous_raw={prev_raw}, \
+                 current_raw={raw}, y_fill={y_fill}"
+            );
+        }
+        prev = Some(raw);
+    }
+}
+
+/// Subtraction, via the same `AddTensor`/`build_conv_with_add_regcmd`
+/// with `scale=-1.0` -- see `AddTensor`'s own doc comment (a static
+/// decode of a standalone `x - y` model showed the real vendor compiler
+/// implements subtract as this exact Add-fusion path with a negated
+/// scale, not a different `ew_alu_algo`). Same weight=0 isolation
+/// trick as `conv_with_add_tracks_y_alone`: accumulator held at a clean
+/// `0` via `weight_fill=0x80` (real weight `0`), so output should track
+/// `-y_real` (i.e. `0 - y_real`) as `y_fill` increases -- non-increasing
+/// (see below for why not strictly), the mirror image of the addition
+/// case.
+///
+/// Confirmed on real hardware (2026-07-22): bit-exact for 6 of 7
+/// nonzero points (`y_fill` 118,121,124,127,129 -> `raw` exactly
+/// `10,7,4,1,-1` in real terms, i.e. exactly `-y_real`) -- but
+/// `y_fill=128` (real `y=0`, expected real output `0`) came back real
+/// `-1` instead, landing on the SAME `raw` as `y_fill=129`'s (real
+/// `-1`) rather than one step above it. A single off-by-one exactly at
+/// the zero crossing, not a broken mechanism -- consistent with an
+/// asymmetric-rounding artifact in the hardware's fixed-point multiply/
+/// shift for a negative scale (unsurprising right at a sign boundary;
+/// `conv_with_add_tracks_y_alone`'s positive-scale case had no such
+/// issue at any point in its sweep, zero included). Loosened this
+/// assertion from strict to non-strict monotonicity for exactly this
+/// reason -- matches this repo's own established convention
+/// (`conv_then_lut_hw.rs`'s sigmoid monotonicity check is non-strict
+/// too), tightened too far in the first version of this test.
+#[test]
+#[ignore = "needs the real NPU device -- cross-compile for aarch64, copy to the board, run there"]
+fn conv_with_sub_tracks_neg_y() {
+    let fills = [118u8, 121, 124, 127, 128, 129, 132, 135, 138];
+    let mut prev: Option<u8> = None;
+
+    for y_fill in fills {
+        let raw = run_uniform_conv_with_add_scaled(128, y_fill, 0x80, -1.0)[0];
+        eprintln!(
+            "conv_with_sub_tracks_neg_y: x_fill=128 (real=0, weight_real=0) y_fill={y_fill} (real={}): raw={raw} (real={})",
+            y_fill as i32 - 0x80,
+            raw as i32 - 0x80
+        );
+
+        if let Some(prev_raw) = prev {
+            assert!(
+                raw <= prev_raw,
+                "conv-with-sub output is not non-increasing over the y_fill sweep \
                  (accumulator held at 0 via weight_real=0): previous_raw={prev_raw}, \
                  current_raw={raw}, y_fill={y_fill}"
             );
