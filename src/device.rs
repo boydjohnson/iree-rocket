@@ -1237,7 +1237,6 @@ unsafe extern "C" fn queue_execute(
                             iree_status_code_e_IREE_STATUS_UNAVAILABLE as u32,
                         );
                     }
-
                     // PREP_BO waits on DMA_RESV_USAGE_WRITE fences for the
                     // *specific handle passed* (rocket_gem.c:
                     // dma_resv_wait_timeout(gem_obj->resv,

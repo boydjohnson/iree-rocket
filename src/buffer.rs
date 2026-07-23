@@ -22,7 +22,9 @@ use iree_rocket_hal::rocket::device;
 
 use crate::bindings::{
     iree_byte_span_t, iree_device_size_t, iree_hal_buffer_mapping_t, iree_hal_buffer_t,
-    iree_hal_buffer_vtable_t, iree_hal_mapping_mode_t, iree_hal_memory_access_t, iree_status_t,
+    iree_hal_buffer_vtable_t, iree_hal_mapping_mode_t,
+    iree_hal_memory_access_bits_t_IREE_HAL_MEMORY_ACCESS_WRITE, iree_hal_memory_access_t,
+    iree_status_t,
 };
 use crate::status;
 
@@ -130,9 +132,39 @@ unsafe extern "C" fn unmap_range(
     local_byte_length: iree_device_size_t,
     mapping: *mut iree_hal_buffer_mapping_t,
 ) -> iree_status_t {
-    // Nothing to do -- the buffer stays mmap'd for its whole lifetime
-    // (see module doc comment), map_range/unmap_range just hand out/
-    // release a view into it rather than doing real (un)mapping work.
+    // The buffer stays mmap'd for its whole lifetime (see module doc
+    // comment), so there's no real (un)mapping work to do here -- EXCEPT
+    // for one real, load-bearing piece of semantics a genuine hardware
+    // driver's unmap would naturally provide and this no-op previously
+    // didn't: on this non-coherent device, a WRITE mapping's contents
+    // aren't visible to the NPU until FINI_BO runs (see flush_range's own
+    // doc comment). Most direct callers know this and call
+    // iree_hal_buffer_mapping_flush_range/iree_hal_buffer_map_write
+    // explicitly (which check IREE_HAL_MEMORY_TYPE_HOST_COHERENT and flush
+    // when it's absent, as this driver's buffers always report) -- but
+    // IREE's own `iree_hal_buffer_view_generate_buffer_in_situ`
+    // (buffer_view_util.c, the exact code path `iree-run-module --input=`
+    // splat/fill values go through) does NOT: it maps for
+    // DISCARD_WRITE, runs its fill callback, and unmaps, relying entirely
+    // on unmap to make the write visible -- which a true no-op unmap never
+    // does. Confirmed as a real bug on hardware: input/weights buffers
+    // populated this way looked correct to the CPU (same-address
+    // same-core load-after-store is always coherent, mapping or not) but
+    // the DPU read stale/pre-existing physical memory instead, producing a
+    // deterministic, input-independent garbage result. Flushing here
+    // whenever the mapping allowed any write access closes that gap for
+    // every caller, not just this one -- and is a no-op (one extra
+    // already-cheap FINI_BO ioctl) for the callers that already flush
+    // explicitly themselves.
+    let allowed_access = unsafe { (*mapping).impl_.allowed_access };
+    if allowed_access & (iree_hal_memory_access_bits_t_IREE_HAL_MEMORY_ACCESS_WRITE as u16) != 0 {
+        let rb = unsafe { &*cast(buffer) };
+        if unsafe { device::fini_bo(rb.fd, rb.handle) }.is_err() {
+            return status::from_code(
+                crate::bindings::iree_status_code_e_IREE_STATUS_INTERNAL as u32,
+            );
+        }
+    }
     status::ok()
 }
 

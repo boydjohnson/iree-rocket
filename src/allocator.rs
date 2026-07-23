@@ -19,6 +19,9 @@ use crate::bindings::{
     iree_hal_buffer_compatibility_t, iree_hal_buffer_params_t,
     iree_hal_buffer_placement_flag_bits_t_IREE_HAL_BUFFER_PLACEMENT_FLAG_ASYNCHRONOUS,
     iree_hal_buffer_placement_t, iree_hal_buffer_release_callback_t, iree_hal_buffer_t,
+    iree_hal_buffer_usage_bits_t_IREE_HAL_BUFFER_USAGE_MAPPING_ACCESS_RANDOM,
+    iree_hal_buffer_usage_bits_t_IREE_HAL_BUFFER_USAGE_MAPPING_PERSISTENT,
+    iree_hal_buffer_usage_bits_t_IREE_HAL_BUFFER_USAGE_MAPPING_SCOPED,
     iree_hal_external_buffer_flags_t, iree_hal_external_buffer_t, iree_hal_external_buffer_type_t,
     iree_hal_memory_advice_t, iree_hal_memory_protection_t,
     iree_hal_memory_type_bits_t_IREE_HAL_MEMORY_TYPE_DEVICE_VISIBLE,
@@ -131,6 +134,26 @@ unsafe extern "C" fn query_buffer_compatibility(
         (*params).type_ &= !iree_hal_memory_type_bits_t_IREE_HAL_MEMORY_TYPE_OPTIMAL;
         (*params).type_ |= iree_hal_memory_type_bits_t_IREE_HAL_MEMORY_TYPE_HOST_VISIBLE
             | iree_hal_memory_type_bits_t_IREE_HAL_MEMORY_TYPE_DEVICE_VISIBLE;
+        // Same real-hardware truth as the memory_type bits just above: since
+        // every buffer this driver hands out is unconditionally, permanently
+        // host-mmap'd (buffer.rs), it can always honor persistent/scoped/
+        // random-access host mapping -- there is no allocation this driver
+        // could produce that DOESN'T support this, so advertise it
+        // unconditionally rather than only when a caller happens to ask for
+        // it (mirrors iree_hal_heap_allocator_query_buffer_compatibility's
+        // identical opportunistic-mapping stance in allocator_heap.c).
+        // Real, load-bearing bug this fixes (found empirically on hardware,
+        // multi-device rocket+local-sync program): a buffer allocated via
+        // THIS allocator but later actually computed on by a DIFFERENT
+        // device's queue_execute (e.g. local-sync, which genuinely needs a
+        // persistent host pointer for inline CPU dispatch) failed
+        // `iree_hal_buffer_validate_usage` with PERMISSION_DENIED --
+        // "operation requires MAPPING_PERSISTENT" -- because this allocator
+        // never granted it, unlike the heap allocator every other local
+        // device already gets this from automatically.
+        (*params).usage |= iree_hal_buffer_usage_bits_t_IREE_HAL_BUFFER_USAGE_MAPPING_SCOPED
+            | iree_hal_buffer_usage_bits_t_IREE_HAL_BUFFER_USAGE_MAPPING_PERSISTENT
+            | iree_hal_buffer_usage_bits_t_IREE_HAL_BUFFER_USAGE_MAPPING_ACCESS_RANDOM;
         // Guard the 0-byte corner case (real apps can hit this).
         if *allocation_size == 0 {
             *allocation_size = 4;
@@ -169,6 +192,27 @@ unsafe extern "C" fn allocate_buffer(
     memory_type &= !iree_hal_memory_type_bits_t_IREE_HAL_MEMORY_TYPE_OPTIMAL;
     memory_type |= iree_hal_memory_type_bits_t_IREE_HAL_MEMORY_TYPE_HOST_VISIBLE
         | iree_hal_memory_type_bits_t_IREE_HAL_MEMORY_TYPE_DEVICE_VISIBLE;
+
+    // Same real-hardware truth as query_buffer_compatibility above (and this
+    // function's own memory_type canonicalization just above): every buffer
+    // this driver hands out is unconditionally, permanently host-mmap'd
+    // (buffer.rs), so it can always honor persistent/scoped/random-access
+    // host mapping regardless of what the caller happened to request --
+    // this is the entry point CTS/hand-written tests and a real compiled
+    // .vmfb's `hal.device.queue.alloca` actually go through (unlike
+    // query_buffer_compatibility, see this function's own top doc comment),
+    // so it must carry this fix too, not just that other entry point. Fixes
+    // a real bug found on hardware: a buffer allocated here but later
+    // genuinely computed on by a DIFFERENT device's queue_execute (e.g.
+    // local-sync, in a rocket+local-sync multi-device program) failed
+    // `iree_hal_buffer_validate_usage` with PERMISSION_DENIED -- "operation
+    // requires MAPPING_PERSISTENT" -- because this allocator never granted
+    // it, unlike every other local device's heap allocator (allocator_heap.c)
+    // already does automatically.
+    let usage = params.usage
+        | iree_hal_buffer_usage_bits_t_IREE_HAL_BUFFER_USAGE_MAPPING_SCOPED
+        | iree_hal_buffer_usage_bits_t_IREE_HAL_BUFFER_USAGE_MAPPING_PERSISTENT
+        | iree_hal_buffer_usage_bits_t_IREE_HAL_BUFFER_USAGE_MAPPING_ACCESS_RANDOM;
 
     // Same 0-byte guard as query_buffer_compatibility (real apps -- and
     // CTS's AllocatorTest.AllocateEmptyBuffer -- hit this): unlike that
@@ -234,7 +278,7 @@ unsafe extern "C" fn allocate_buffer(
             allocation_size,
             memory_type,
             params.access,
-            params.usage,
+            usage,
             &crate::buffer::VTABLE,
             &mut (*buffer_ptr).base,
         );
