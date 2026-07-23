@@ -738,13 +738,17 @@ impl RegisterMeta for CnaCbufCon1 {
 impl Register<CnaCbufCon1> {
     /// Description: Number of CBUF bank-spaces needed to store one feature map row.
     ///
-    /// Bit width: 14
-    /// Range of values: 0x0000-0x3FFF (per code's `Bits<14>`; see Known limitations).
-    /// Known limitations: TRM lists this field as bits 12:0 (13 bits), while the code
-    /// models it as `Bits<14>` — a one-bit width mismatch against the raw TRM table that
-    /// is left as-is per the instruction to not alter the code.
+    /// Bit width: 13
+    /// Range of values: 0x0000-0x1FFF, per the TRM's bit table (bits 12:0; bits 31:13
+    /// reserved).
+    /// Known limitations: The compiled register mask (`CNA_CBUF_CON1_DATA_ENTRIES__MASK`,
+    /// from Mesa's `rkt_registers.h`) is actually 0x3fff (14 bits) — one bit wider than
+    /// the TRM's own reserved-bit boundary. `Bits<13>` here is a deliberately tighter
+    /// caller-side assertion matching the TRM table; it can never write a value that the
+    /// wider hardware mask wouldn't also have accepted, so this only forbids the one
+    /// TRM-reserved bit (12 vs 13) without changing what's actually written to hardware.
     /// Related registers: `cna_cbuf_con0.data_bank`.
-    pub fn data_entries(&mut self, data_entries: Bits<14>) -> &mut Self {
+    pub fn data_entries(&mut self, data_entries: Bits<13>) -> &mut Self {
         self.set_field(CNA_CBUF_CON1_DATA_ENTRIES__MASK, unsafe {
             CNA_CBUF_CON1_DATA_ENTRIES(data_entries.val())
         })
@@ -1474,10 +1478,20 @@ impl Register<CnaDcompAddr0> {
     /// Bit width: 32
     /// Range of values: 0x00000000-0xFFFFFFFF (per code's `Bits<32>`; see Known
     /// limitations).
-    /// Known limitations: TRM lists the writable field as bits 31:4 (28 bits) with bits
-    /// 3:0 reserved/read-only (implying 16-byte address alignment), while the code
-    /// models the whole word as `Bits<32>` — left as-is per the instruction to not alter
-    /// the code.
+    /// Known limitations: TRM's bit table lists this field as bits 31:4 (28 bits) with
+    /// bits 3:0 reserved/read-only (implying 16-byte address alignment, same convention
+    /// as `PpuDstBaseAddr::dst_base_addr` and `pc_base_address.pc_src_address`). However,
+    /// unlike those two registers, the generated macro for this field
+    /// (`CNA_DCOMP_ADDR0_DECOMPRESS_ADDR0`, from `rkt_registers.h`) has shift=0 and
+    /// mask=0xffffffff — i.e. Mesa's own reverse-engineered header does *not* encode the
+    /// bits[31:4] convention here, unlike the PC/PPU registers where its shift=4 agrees
+    /// with the TRM table. Since weight decompression is bypassed on every path this
+    /// crate currently builds (`cna_dcomp_ctrl`/`cna_dcomp_regnum` always zeroed), this
+    /// field's value is inert on every test that can currently be run, so the
+    /// TRM-vs-Mesa disagreement is unconfirmed either way. Kept as `Bits<32>` (matching
+    /// what the compiled macro actually does) rather than introducing an address shift
+    /// that the macro wouldn't apply back — shifting here would silently drop the top 4
+    /// address bits without the fix the PPU/PC precedent relies on.
     /// Related registers: `cna_dcomp_ctrl`, `cna_dcomp_regnum.dcomp_regnum`, the 16
     /// `dcomp_amountN` registers.
     pub fn decompress_addr0(&mut self, decompress_addr0: Bits<32>) -> &mut Self {
