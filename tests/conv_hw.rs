@@ -41,8 +41,11 @@
 use std::{fs::OpenOptions, mem, os::unix::io::AsRawFd, ptr};
 
 use iree_rocket_hal::rocket::{
-    device::{Buffer, fini_bo, prep_bo, submit},
-    regcmd::{Activation, ConvBuffers, ConvShape, Precision, build_conv_regcmd},
+    device::{Buffer, fini_bo, prep_bo, submit, submit_tasks},
+    regcmd::{
+        Activation, CONV_OUTPUT_ATOMIC_STRIDE, ConvBuffers, ConvShape, Precision,
+        build_conv_regcmd, build_conv_regcmd_tasks, conv_output_scratch_bytes, plan_conv_tasks,
+    },
 };
 
 const DEVICE_PATH: &str = "/dev/accel/accel0";
@@ -622,4 +625,226 @@ fn conv_fp16_multi_channel_output_tracks_input() {
          input_fill=10.5 ({low}) and input_fill=100.0 ({high}) -- suggests \
          the op isn't really reading the input"
     );
+}
+
+//===========================================================================
+// Position-dependent fp16 input -- MobileNetV2's C32 -> C16 1x1 conv.
+//
+// Uniform input fills intentionally hide input-layout and task-offset bugs.
+// These cases instead use dense NHWC input where every element is derived
+// from its (y, x, c) coordinate. Uniform 1/32 weights make every output
+// channel equal the input-channel average, so the reference remains simple
+// while still detecting spatially misplaced or missing input data.
+//===========================================================================
+
+const POSITION_INPUT_CHANNELS: u32 = 32;
+const POSITION_OUTPUT_CHANNELS: u32 = 16;
+const POSITION_WEIGHT: f32 = 1.0 / POSITION_INPUT_CHANNELS as f32;
+
+fn fp16_position_shape(width: u32, height: u32) -> ConvShape {
+    ConvShape {
+        input_width: width,
+        input_height: height,
+        input_channels: POSITION_INPUT_CHANNELS,
+        output_width: width,
+        output_height: height,
+        output_channels: POSITION_OUTPUT_CHANNELS,
+        weights_width: 1,
+        weights_height: 1,
+        stride: 1,
+        depthwise: false,
+        input_zero_point: 0,
+        output_zero_point: 0,
+        weights_zero_point: 0,
+        input_scale: 1.0,
+        weights_scale: 1.0,
+        output_scale: 1.0,
+        truncate_bits: 0,
+        activation: Activation::None,
+        precision: Precision::Fp16,
+    }
+}
+
+/// Coordinate-derived dense NHWC input value.
+///
+/// The spatial term cycles through 1..=16 in a nontrivial row/column
+/// pattern, while `channel` makes all 32 values within a pixel distinct.
+/// Every value is an integer and therefore exactly representable in fp16.
+fn fp16_position_input_value(y: u32, x: u32, channel: u32) -> f32 {
+    let spatial = 1 + (y * 7 + x * 3) % 16;
+    (spatial + channel) as f32
+}
+
+/// With all 32 weights equal to 1/32, sum_c(spatial + c) / 32 is
+/// `spatial + 15.5`. The result and every intermediate product are exact
+/// binary fractions within fp16's precision at this magnitude.
+fn fp16_position_expected(y: u32, x: u32) -> f32 {
+    let spatial = 1 + (y * 7 + x * 3) % 16;
+    spatial as f32 + 15.5
+}
+
+fn page_aligned_size(byte_len: usize) -> usize {
+    byte_len.max(1).next_multiple_of(4096)
+}
+
+/// Runs a C32 -> C16 fp16 convolution from a dense NHWC input and decodes
+/// DPU's feature-atomic output surfaces back into dense NHWC order.
+fn run_position_conv_fp16(shape: &ConvShape) -> Vec<f32> {
+    assert_eq!(shape.input_channels, POSITION_INPUT_CHANNELS);
+    assert_eq!(shape.output_channels, POSITION_OUTPUT_CHANNELS);
+
+    const BPE: usize = 2;
+    let input_elements =
+        shape.input_width as usize * shape.input_height as usize * shape.input_channels as usize;
+    let weight_elements = shape.input_channels as usize * shape.output_channels as usize; // 1x1 HWIO
+    let output_scratch_len = conv_output_scratch_bytes(shape);
+
+    let file = OpenOptions::new()
+        .read(true)
+        .write(true)
+        .open(DEVICE_PATH)
+        .expect("failed to open NPU device");
+    let fd = file.as_raw_fd();
+
+    unsafe {
+        let buf_a = Buffer::new(fd, page_aligned_size(input_elements * BPE), &file);
+        ptr::write_bytes(buf_a.host_ptr, 0, buf_a.size);
+        let input = std::slice::from_raw_parts_mut(buf_a.host_ptr as *mut u16, input_elements);
+        for y in 0..shape.input_height {
+            for x in 0..shape.input_width {
+                for channel in 0..shape.input_channels {
+                    let index =
+                        ((y * shape.input_width + x) * shape.input_channels + channel) as usize;
+                    input[index] = f32_to_f16_bits(fp16_position_input_value(y, x, channel));
+                }
+            }
+        }
+
+        let buf_w = Buffer::new(fd, page_aligned_size(weight_elements * BPE), &file);
+        ptr::write_bytes(buf_w.host_ptr, 0, buf_w.size);
+        fill_u16(
+            buf_w.host_ptr,
+            weight_elements * BPE,
+            f32_to_f16_bits(POSITION_WEIGHT),
+        );
+
+        let buf_bias = Buffer::new(fd, TENSOR_SIZE, &file);
+        ptr::write_bytes(buf_bias.host_ptr, 0, TENSOR_SIZE);
+
+        let buf_c = Buffer::new(fd, page_aligned_size(output_scratch_len), &file);
+        ptr::write_bytes(buf_c.host_ptr, 0, buf_c.size);
+
+        let bufs = ConvBuffers {
+            input_addr: buf_a.dma_address,
+            weights_addr: buf_w.dma_address,
+            bias_addr: buf_bias.dma_address,
+            output_addr: buf_c.dma_address,
+        };
+        let regcmd_tasks =
+            build_conv_regcmd_tasks(shape, &bufs).expect("failed to build convolution tasks");
+        let mut cmd_buffers = Vec::with_capacity(regcmd_tasks.len());
+        for cmds in &regcmd_tasks {
+            let cmd_bytes = cmds.len() * mem::size_of::<u64>();
+            let buf_cmd = Buffer::new(fd, page_aligned_size(cmd_bytes), &file);
+            let cmd_slice =
+                std::slice::from_raw_parts_mut(buf_cmd.host_ptr as *mut u64, cmds.len());
+            for (slot, command) in cmd_slice.iter_mut().zip(cmds) {
+                *slot = command.0;
+            }
+            fini_bo(fd, buf_cmd.handle).ok();
+            cmd_buffers.push(buf_cmd);
+        }
+
+        fini_bo(fd, buf_a.handle).ok();
+        fini_bo(fd, buf_w.handle).ok();
+        fini_bo(fd, buf_bias.handle).ok();
+        fini_bo(fd, buf_c.handle).ok();
+
+        let task_descriptors: Vec<_> = cmd_buffers
+            .iter()
+            .zip(&regcmd_tasks)
+            .map(|(buffer, commands)| (buffer.dma_address, commands.len() as u32))
+            .collect();
+        let mut in_handles: Vec<_> = cmd_buffers.iter().map(|buffer| buffer.handle).collect();
+        in_handles.extend([buf_a.handle, buf_w.handle, buf_bias.handle]);
+        let out_handles = [buf_c.handle];
+
+        submit_tasks(fd, &task_descriptors, &in_handles, &out_handles)
+            .expect("SUBMIT ioctl failed");
+        prep_bo(fd, buf_c.handle, 2_000_000_000)
+            .expect("convolution job did not complete within timeout");
+
+        let scratch = std::slice::from_raw_parts(buf_c.host_ptr, output_scratch_len);
+        let pixel_count = shape.output_width as usize * shape.output_height as usize;
+        let surface_stride = pixel_count * CONV_OUTPUT_ATOMIC_STRIDE as usize;
+        let mut output = Vec::with_capacity(pixel_count * shape.output_channels as usize);
+        for pixel in 0..pixel_count {
+            for channel in 0..shape.output_channels as usize {
+                let channel_byte = channel * BPE;
+                let surface = channel_byte / CONV_OUTPUT_ATOMIC_STRIDE as usize;
+                let byte_in_surface = channel_byte % CONV_OUTPUT_ATOMIC_STRIDE as usize;
+                let offset = surface * surface_stride
+                    + pixel * CONV_OUTPUT_ATOMIC_STRIDE as usize
+                    + byte_in_surface;
+                output.push(f16_to_f32(u16::from_le_bytes([
+                    scratch[offset],
+                    scratch[offset + 1],
+                ])));
+            }
+        }
+        output
+    }
+}
+
+fn assert_position_conv_output(shape: &ConvShape, actual: &[f32]) {
+    let mut mismatches = Vec::new();
+    for y in 0..shape.output_height {
+        for x in 0..shape.output_width {
+            let expected = fp16_position_expected(y, x);
+            for channel in 0..shape.output_channels {
+                let index =
+                    ((y * shape.output_width + x) * shape.output_channels + channel) as usize;
+                if actual[index] != expected && mismatches.len() < 16 {
+                    mismatches.push(format!(
+                        "[{y}, {x}, {channel}]: expected {expected}, got {}",
+                        actual[index]
+                    ));
+                }
+            }
+        }
+    }
+    assert!(
+        mismatches.is_empty(),
+        "{} of the first mismatches:\n{}",
+        mismatches.len(),
+        mismatches.join("\n")
+    );
+}
+
+#[test]
+#[ignore = "needs the real NPU device -- cross-compile for aarch64, copy to the board, run there"]
+fn conv_fp16_c32_to_c16_position_values_single_task() {
+    let shape = fp16_position_shape(4, 4);
+    assert_eq!(
+        plan_conv_tasks(&shape)
+            .expect("single-task shape should be valid")
+            .len(),
+        1
+    );
+    let actual = run_position_conv_fp16(&shape);
+    assert_position_conv_output(&shape, &actual);
+}
+
+#[test]
+#[ignore = "needs the real NPU device -- cross-compile for aarch64, copy to the board, run there"]
+fn conv_fp16_c32_to_c16_position_values_height_splits() {
+    let shape = fp16_position_shape(112, 112);
+    assert_eq!(
+        plan_conv_tasks(&shape)
+            .expect("MobileNet-sized shape should be valid")
+            .len(),
+        3
+    );
+    let actual = run_position_conv_fp16(&shape);
+    assert_position_conv_output(&shape, &actual);
 }

@@ -1956,28 +1956,25 @@ pub(crate) fn compute_task_output_channels(shape: &ConvShape) -> u32 {
     task_output_channels
 }
 
-/// The real per-real-output-pixel byte stride the DPU write-back uses --
-/// confirmed on real hardware for both `Precision::Int8` (`NOTES.md`'s
-/// "RESOLVED: the only pixel [0,0] written" investigation) and
-/// `Precision::Fp16` (this crate's own `rkt-fp16.rs`), and derived
-/// algebraically from `output_surface_stride`'s formula in
-/// `build_conv_cna_core_dpu_dpu_rdma` (`ATOMIC_K_SIZE == FEATURE_ATOMIC_
-/// SIZE == 16`, canceling out to a flat per-pixel constant with no
-/// dependency on `depthwise`/`truncate_bits`/precision beyond this).
-/// Dtype-invariant: fp16's real 2-byte value still occupies only the
-/// first 2 bytes of a 16-byte slot, not a wider one.
+/// Byte width of one DPU feature-atomic output surface.
 pub const CONV_OUTPUT_ATOMIC_STRIDE: u32 = 16;
 
-/// Real hardware output footprint for a single-real-output-channel conv
-/// (`output_channels == 1`, the only case `build_conv_cna_core_dpu_dpu_rdma`
-/// supports -- see its own `assert!` on the unimplemented "wide atomic"
-/// branch) -- `output_width * output_height` real pixels, each occupying
-/// one `CONV_OUTPUT_ATOMIC_STRIDE`-byte slot. This is what a caller
-/// writing the hardware's *real* output needs to allocate; it is NOT the
-/// same as the dense `output_width * output_height * bytes_per_element`
-/// size a logical tensor of this shape would need.
+/// Conservative physical DPU output allocation for a convolution.
+///
+/// DPU write-back addresses output in 16-byte feature-atomic surfaces and
+/// programs the atomically-rounded task channel count, not just the logical
+/// output channel count. Allocate enough complete surfaces for that padded
+/// channel count so multi-channel dispatch cannot write past the backing BO.
+/// This is a physical allocation size, not a statement that the resulting
+/// surface layout is already the dense NHWC ABI expected by IREE.
 pub fn conv_output_scratch_bytes(shape: &ConvShape) -> usize {
-    shape.output_width as usize * shape.output_height as usize * CONV_OUTPUT_ATOMIC_STRIDE as usize
+    let channel_bytes =
+        compute_task_output_channels(shape) as usize * shape.precision.bytes_per_element() as usize;
+    let surface_count = channel_bytes.div_ceil(CONV_OUTPUT_ATOMIC_STRIDE as usize);
+    shape.output_width as usize
+        * shape.output_height as usize
+        * surface_count
+        * CONV_OUTPUT_ATOMIC_STRIDE as usize
 }
 
 fn require_single_conv_task(shape: &ConvShape) -> ConvTask {
@@ -3183,6 +3180,24 @@ mod conv_task_tests {
                 shape.output_height
             );
         }
+    }
+
+    #[test]
+    fn scratch_footprint_covers_padded_fp16_output_surfaces() {
+        let shape = mobilenet_1x1(112, 112, 32, 16);
+        let padded_channel_bytes =
+            compute_task_output_channels(&shape) * shape.precision.bytes_per_element();
+        let expected = shape.output_width as usize
+            * shape.output_height as usize
+            * padded_channel_bytes as usize;
+        assert_eq!(conv_output_scratch_bytes(&shape), expected);
+        assert!(
+            conv_output_scratch_bytes(&shape)
+                >= shape.output_width as usize
+                    * shape.output_height as usize
+                    * shape.output_channels as usize
+                    * shape.precision.bytes_per_element() as usize
+        );
     }
 
     #[test]
