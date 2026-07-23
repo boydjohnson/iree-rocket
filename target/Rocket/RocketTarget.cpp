@@ -11,8 +11,10 @@
 // VMVX only shows the TargetBackend half, since it reuses IREE's own
 // "local" device; "rocket" is a genuinely separate device the way CUDA is):
 //
-//   RocketTargetDevice : TargetDevice  -- embeds #hal.device.target<"rocket",...>
-//   RocketTargetBackend : TargetBackend -- embeds #hal.executable.target<"rocket",...>
+//   RocketTargetDevice : TargetDevice
+//     embeds #hal.device.target<"rocket",...>
+//   RocketTargetBackend : TargetBackend
+//     embeds #hal.executable.target<"rocket",...>
 //
 // v1 scope: Conv2d only, and deliberately does NOT rely on IREE's generic
 // Flow/DispatchCreation to auto-form dispatch regions targeting "rocket" --
@@ -23,13 +25,11 @@
 // hand-authored hal.executable already targeting "rocket", with the
 // matched op's static shape/dtype facts stamped directly onto that
 // executable's #hal.executable.target config dict (see the key list in
-// buildRocketConv2dShapeFromConfig below) -- there is nothing left for
+// buildRocketConv2dConfigFromTarget below) -- there is nothing left for
 // this backend's own pass pipeline to derive. serializeExecutable reads
-// that config dict back out and emits the wire-format bytes
-// rocket-hal-driver::executable_cache::prepare_executable's tag=3 path
-// consumes (see RocketConv2dEncoding.h and
-// iree-rocket-hal/src/rocket/executable_format.rs, which this file's
-// encoding must stay byte-for-byte in sync with).
+// that config dict back out and emits the RKT1 FlatBuffer defined by the
+// sibling rocket-schema repository. Generated FlatCC bindings keep this
+// producer in sync with the Rust consumers.
 //
 // Real, honest limitation, not glossed over: nothing in this whole project
 // wires up real calibrated quantization. Every config-dict-authored shape
@@ -38,12 +38,17 @@
 // same placeholders rocket-hal-driver's own tag=0 hardcoded shape already
 // uses.
 
-#include "RocketConv2dEncoding.h"
+#include <array>
+#include <cstdint>
+#include <optional>
+
 #include "iree/compiler/Dialect/HAL/Target/TargetBackend.h"
 #include "iree/compiler/Dialect/HAL/Target/TargetRegistry.h"
 #include "iree/compiler/PluginAPI/Client.h"
+#include "iree/compiler/Utils/FlatbufferUtils.h"
 #include "mlir/IR/Builders.h"
 #include "mlir/IR/BuiltinOps.h"
+#include "rocket_executable_def_builder.h"
 
 namespace mlir::iree_compiler::IREE::HAL {
 namespace {
@@ -56,24 +61,48 @@ struct RocketOptions {
   void bindOptions(OptionsBinder &binder) {}
 };
 
-// The 19 ConvShape-mirroring config-dict keys a hand-authored
-// #hal.executable.target<"rocket", "rocket-conv2d-v1", {...}> is expected
+// The 20 ConvShape-mirroring config-dict keys a hand-authored
+// #hal.executable.target<"rocket", "rocket-flatbuffer-v1", {...}> is expected
 // to carry, and the one place both the transform-script author and this
 // backend need to agree on exact key spelling. Deliberately snake_case,
 // matching iree-rocket-hal::rocket::regcmd::ConvShape's own field names
 // 1:1 for direct visual correspondence between the .mlir config dict and
 // the Rust struct it's standing in for.
 constexpr std::array<const char *, 20> kRequiredConfigKeys = {
-    "input_width",       "input_height",       "input_channels",
-    "output_width",      "output_height",      "output_channels",
-    "weights_width",     "weights_height",     "stride",
-    "depthwise",         "input_zero_point",   "output_zero_point",
-    "weights_zero_point", "input_scale",       "weights_scale",
-    "output_scale",      "truncate_bits",      "activation",
-    "activation_cmp",    "precision",
+    "input_width",        "input_height",     "input_channels",
+    "output_width",       "output_height",    "output_channels",
+    "weights_width",      "weights_height",   "stride",
+    "depthwise",          "input_zero_point", "output_zero_point",
+    "weights_zero_point", "input_scale",      "weights_scale",
+    "output_scale",       "truncate_bits",    "activation",
+    "activation_cmp",     "precision",
 };
 
-// Reads the config dict back into a RocketConv2dShapeV1. Returns
+struct RocketConv2dConfig {
+  uint32_t inputWidth = 0;
+  uint32_t inputHeight = 0;
+  uint32_t inputChannels = 0;
+  uint32_t outputWidth = 0;
+  uint32_t outputHeight = 0;
+  uint32_t outputChannels = 0;
+  uint32_t weightsWidth = 0;
+  uint32_t weightsHeight = 0;
+  uint32_t stride = 0;
+  bool depthwise = false;
+  uint32_t inputZeroPoint = 0;
+  uint32_t outputZeroPoint = 0;
+  uint32_t weightsZeroPoint = 0;
+  float inputScale = 1.0f;
+  float weightsScale = 1.0f;
+  float outputScale = 1.0f;
+  uint32_t truncateBits = 0;
+  iree_hal_rocket_Activation_enum_t activation =
+      iree_hal_rocket_Activation_NONE;
+  uint32_t activationCmp = 0;
+  iree_hal_rocket_Precision_enum_t precision = iree_hal_rocket_Precision_INT8;
+};
+
+// Reads the config dict back into a RocketConv2dConfig. Returns
 // std::nullopt (and emits a clear diagnostic via `diagFn`) if any required
 // key is missing or the wrong attribute kind -- this IS the defensive
 // check guarding against some OTHER op ever getting silently routed to
@@ -81,7 +110,7 @@ constexpr std::array<const char *, 20> kRequiredConfigKeys = {
 // since nothing in DispatchCreation is target-aware -- see this plugin's
 // design notes): a real conv2d dispatch spliced in by the transform script
 // always carries all 20 keys; anything else won't.
-std::optional<rocket::RocketConv2dShapeV1> buildRocketConv2dShapeFromConfig(
+std::optional<RocketConv2dConfig> buildRocketConv2dConfigFromTarget(
     DictionaryAttr config, llvm::function_ref<InFlightDiagnostic()> diagFn) {
   if (!config) {
     diagFn() << "rocket backend requires a non-empty executable target "
@@ -108,7 +137,7 @@ std::optional<rocket::RocketConv2dShapeV1> buildRocketConv2dShapeFromConfig(
     return llvm::cast<FloatAttr>(config.get(key)).getValueAsDouble();
   };
 
-  rocket::RocketConv2dShapeV1 shape;
+  RocketConv2dConfig shape;
   shape.inputWidth = getU32("input_width");
   shape.inputHeight = getU32("input_height");
   shape.inputChannels = getU32("input_channels");
@@ -128,24 +157,26 @@ std::optional<rocket::RocketConv2dShapeV1> buildRocketConv2dShapeFromConfig(
   shape.truncateBits = getU32("truncate_bits");
   shape.activationCmp = getU32("activation_cmp");
 
-  StringRef activation = llvm::cast<StringAttr>(config.get("activation")).getValue();
+  StringRef activation =
+      llvm::cast<StringAttr>(config.get("activation")).getValue();
   if (activation == "none") {
-    shape.activation = rocket::Activation::None;
+    shape.activation = iree_hal_rocket_Activation_NONE;
   } else if (activation == "relu") {
-    shape.activation = rocket::Activation::Relu;
+    shape.activation = iree_hal_rocket_Activation_RELU;
   } else if (activation == "relux") {
-    shape.activation = rocket::Activation::Relux;
+    shape.activation = iree_hal_rocket_Activation_RELUX;
   } else {
     diagFn() << "rocket backend: unrecognized 'activation' config value '"
              << activation << "' (expected none/relu/relux)";
     return std::nullopt;
   }
 
-  StringRef precision = llvm::cast<StringAttr>(config.get("precision")).getValue();
+  StringRef precision =
+      llvm::cast<StringAttr>(config.get("precision")).getValue();
   if (precision == "int8") {
-    shape.precision = rocket::Precision::Int8;
+    shape.precision = iree_hal_rocket_Precision_INT8;
   } else if (precision == "fp16") {
-    shape.precision = rocket::Precision::Fp16;
+    shape.precision = iree_hal_rocket_Precision_FP16;
   } else {
     diagFn() << "rocket backend: unrecognized 'precision' config value '"
              << precision << "' (expected int8/fp16)";
@@ -190,7 +221,7 @@ public:
     // time, not derivable generically at this "what targets exist" query
     // point (this function has no specific op in hand yet).
     executableTargetAttrs.push_back(b.getAttr<IREE::HAL::ExecutableTargetAttr>(
-        b.getStringAttr("rocket"), b.getStringAttr("rocket-conv2d-v1"),
+        b.getStringAttr("rocket"), b.getStringAttr("rocket-flatbuffer-v1"),
         b.getDictionaryAttr({})));
   }
 
@@ -204,33 +235,63 @@ public:
   LogicalResult serializeExecutable(const SerializationOptions &serOptions,
                                     IREE::HAL::ExecutableVariantOp variantOp,
                                     OpBuilder &executableBuilder) final {
+    if (variantOp.getTarget().getFormat() != "rocket-flatbuffer-v1") {
+      return variantOp.emitOpError()
+             << "unsupported Rocket executable format '"
+             << variantOp.getTarget().getFormat().getValue()
+             << "'; expected 'rocket-flatbuffer-v1'";
+    }
+
     auto diagFn = [&]() { return variantOp.emitOpError(); };
-    std::optional<rocket::RocketConv2dShapeV1> shape =
-        buildRocketConv2dShapeFromConfig(variantOp.getTarget().getConfiguration(),
-                                         diagFn);
+    std::optional<RocketConv2dConfig> shape = buildRocketConv2dConfigFromTarget(
+        variantOp.getTarget().getConfiguration(), diagFn);
     if (!shape) {
       return failure();
     }
 
-    std::array<uint8_t, rocket::kConv2dV1TotalLen> encoded =
-        rocket::encodeConv2dShapeV1(*shape);
+    auto exportOps = llvm::to_vector(variantOp.getExportOps());
+    if (exportOps.size() != 1) {
+      return variantOp.emitOpError()
+             << "rocket-flatbuffer-v1 currently requires exactly one export "
+                "per executable variant, but found "
+             << exportOps.size();
+    }
+    IREE::HAL::ExecutableExportOp exportOp = exportOps.front();
+    auto ordinalAttr = exportOp.getOrdinalAttr();
+    if (!ordinalAttr || ordinalAttr.getInt() != 0) {
+      return exportOp.emitOpError()
+             << "rocket-flatbuffer-v1 requires its single export to have "
+                "ordinal 0";
+    }
 
-    // No flatbuffer wrapping -- rocket-hal-driver's prepare_executable
-    // (executable_cache.rs) reads iree_hal_executable_params_t's
-    // executable_data as raw bytes, so this buffer IS the tag+payload,
-    // verbatim. Same DenseIntElementsAttr-of-i8 + ExecutableBinaryOp
-    // pattern VMVX's serializeExecutable uses for its own (differently-
-        // shaped) raw byte buffer.
-    auto bufferAttr = DenseIntElementsAttr::get(
-        VectorType::get({static_cast<int64_t>(encoded.size())},
-                        IntegerType::get(executableBuilder.getContext(), 8)),
-        llvm::ArrayRef<uint8_t>(encoded.data(), encoded.size()));
+    FlatbufferBuilder builder;
+    iree_hal_rocket_ExecutableDef_start_as_root(builder);
+    auto convRef = iree_hal_rocket_Conv2DDef_create(
+        builder, shape->inputWidth, shape->inputHeight, shape->inputChannels,
+        shape->outputWidth, shape->outputHeight, shape->outputChannels,
+        shape->weightsWidth, shape->weightsHeight, shape->stride,
+        shape->depthwise, shape->inputZeroPoint, shape->outputZeroPoint,
+        shape->weightsZeroPoint, shape->inputScale, shape->weightsScale,
+        shape->outputScale, shape->truncateBits, shape->activation,
+        shape->activationCmp, shape->precision);
+    auto exportNameRef = builder.createString(exportOp.getName());
+    auto exportRef = iree_hal_rocket_ExportDef_create(
+        builder, exportNameRef,
+        iree_hal_rocket_KernelDef_as_Conv2DDef(convRef));
+    auto exportsRef =
+        iree_hal_rocket_ExportDef_vec_create(builder, &exportRef, 1);
+    iree_hal_rocket_ExecutableDef_exports_add(builder, exportsRef);
+    iree_hal_rocket_ExecutableDef_end_as_root(builder);
 
     auto binaryOp = IREE::HAL::ExecutableBinaryOp::create(
         executableBuilder, variantOp.getLoc(), variantOp.getSymName(),
-        variantOp.getTarget().getFormat(), bufferAttr);
+        variantOp.getTarget().getFormat(),
+        builder.getHeaderPrefixedBufferAttr(
+            executableBuilder.getContext(),
+            iree_hal_rocket_ExecutableDef_file_identifier,
+            /*version=*/0));
     binaryOp.setMimeTypeAttr(
-        executableBuilder.getStringAttr("application/octet-stream"));
+        executableBuilder.getStringAttr("application/x-flatbuffers"));
 
     return success();
   }
@@ -266,4 +327,5 @@ extern "C" bool iree_register_compiler_plugin_hal_target_rocket(
   return true;
 }
 
-IREE_DEFINE_COMPILER_OPTION_FLAGS(mlir::iree_compiler::IREE::HAL::RocketOptions);
+IREE_DEFINE_COMPILER_OPTION_FLAGS(
+    mlir::iree_compiler::IREE::HAL::RocketOptions);

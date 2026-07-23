@@ -84,7 +84,7 @@
 // resolves it, which is well after device declaration. Confirmed via
 // `iree-dump-module` on the resulting .vmfb: both `@cpu_device`
 // (`llvm-cpu`/`embedded-elf-x86_64`) and `@rocket_device`
-// (`rocket`/`rocket-conv2d-v1`) appear as independently-queried HAL devices,
+// (`rocket`/`rocket-flatbuffer-v1`) appear as independently-queried HAL devices,
 // and the unrelated matmul's executable only ever lists
 // `embedded-elf-x86_64` as an available format.
 //
@@ -136,7 +136,7 @@
 // technique (and same files) as the two GEM-handle bugs found earlier this
 // project. Removed once both fixes were confirmed on hardware.
 
-#rocket_target = #hal.executable.target<"rocket", "rocket-conv2d-v1", {
+#rocket_target = #hal.executable.target<"rocket", "rocket-flatbuffer-v1", {
   input_width = 4 : i32, input_height = 4 : i32, input_channels = 1 : i32,
   output_width = 4 : i32, output_height = 4 : i32, output_channels = 1 : i32,
   weights_width = 1 : i32, weights_height = 1 : i32, stride = 1 : i32,
