@@ -46,6 +46,7 @@ use iree_rocket_hal::rocket::{
         Activation, CONV_OUTPUT_ATOMIC_STRIDE, ConvBuffers, ConvShape, Precision,
         build_conv_regcmd, build_conv_regcmd_tasks, conv_output_scratch_bytes, plan_conv_tasks,
     },
+    tensor_layout::{nc1hwc2_storage_size, pack_nhwc_to_nc1hwc2},
 };
 
 const DEVICE_PATH: &str = "/dev/accel/accel0";
@@ -687,17 +688,32 @@ fn page_aligned_size(byte_len: usize) -> usize {
     byte_len.max(1).next_multiple_of(4096)
 }
 
-/// Runs a C32 -> C16 fp16 convolution from a dense NHWC input and decodes
-/// DPU's feature-atomic output surfaces back into dense NHWC order.
+/// Packs a dense NHWC C32 input into NC1HWC2, runs the fp16 convolution,
+/// and decodes DPU's feature-atomic output surfaces into dense NHWC order.
 fn run_position_conv_fp16(shape: &ConvShape) -> Vec<f32> {
     assert_eq!(shape.input_channels, POSITION_INPUT_CHANNELS);
     assert_eq!(shape.output_channels, POSITION_OUTPUT_CHANNELS);
 
     const BPE: usize = 2;
-    let input_elements =
-        shape.input_width as usize * shape.input_height as usize * shape.input_channels as usize;
+    let pixel_count = shape.input_width as usize * shape.input_height as usize;
+    let input_bytes_per_pixel = shape.input_channels as usize * BPE;
+    let input_bytes = pixel_count * input_bytes_per_pixel;
+    let input_scratch_len = nc1hwc2_storage_size(pixel_count, input_bytes_per_pixel).unwrap();
     let weight_elements = shape.input_channels as usize * shape.output_channels as usize; // 1x1 HWIO
     let output_scratch_len = conv_output_scratch_bytes(shape);
+
+    let mut dense_input = vec![0u8; input_bytes];
+    for y in 0..shape.input_height {
+        for x in 0..shape.input_width {
+            for channel in 0..shape.input_channels {
+                let index = ((y * shape.input_width + x) * shape.input_channels + channel) as usize;
+                let offset = index * BPE;
+                dense_input[offset..offset + BPE].copy_from_slice(
+                    &f32_to_f16_bits(fp16_position_input_value(y, x, channel)).to_le_bytes(),
+                );
+            }
+        }
+    }
 
     let file = OpenOptions::new()
         .read(true)
@@ -707,18 +723,16 @@ fn run_position_conv_fp16(shape: &ConvShape) -> Vec<f32> {
     let fd = file.as_raw_fd();
 
     unsafe {
-        let buf_a = Buffer::new(fd, page_aligned_size(input_elements * BPE), &file);
+        let buf_a = Buffer::new(fd, page_aligned_size(input_scratch_len), &file);
         ptr::write_bytes(buf_a.host_ptr, 0, buf_a.size);
-        let input = std::slice::from_raw_parts_mut(buf_a.host_ptr as *mut u16, input_elements);
-        for y in 0..shape.input_height {
-            for x in 0..shape.input_width {
-                for channel in 0..shape.input_channels {
-                    let index =
-                        ((y * shape.input_width + x) * shape.input_channels + channel) as usize;
-                    input[index] = f32_to_f16_bits(fp16_position_input_value(y, x, channel));
-                }
-            }
-        }
+        let packed_input = std::slice::from_raw_parts_mut(buf_a.host_ptr, input_scratch_len);
+        pack_nhwc_to_nc1hwc2(
+            &dense_input,
+            pixel_count,
+            input_bytes_per_pixel,
+            packed_input,
+        )
+        .expect("failed to pack test input as NC1HWC2");
 
         let buf_w = Buffer::new(fd, page_aligned_size(weight_elements * BPE), &file);
         ptr::write_bytes(buf_w.host_ptr, 0, buf_w.size);
