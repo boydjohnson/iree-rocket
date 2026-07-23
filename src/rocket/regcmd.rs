@@ -58,7 +58,7 @@ fn zero<R: RegisterMeta>() -> RegCmd {
 /// inputs 100..140 at this test's placeholder scale=1.0, so a useful `cmp`
 /// for a real (calibrated) shape needs deriving from that shape's own
 /// scale/shift math, not assumed to transfer from this test's constants.
-#[derive(Clone, Copy, Debug)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Activation {
     None,
     Relu,
@@ -464,7 +464,7 @@ pub struct AddTensor {
 }
 
 /// Logical shape of a single conv operation (`operation->*` in Mesa).
-#[derive(Clone, Copy)]
+#[derive(Clone, Copy, Debug, PartialEq)]
 pub struct ConvShape {
     pub input_width: u32,
     pub input_height: u32,
@@ -576,26 +576,13 @@ fn build_conv_cna_core_dpu_dpu_rdma(
     );
 
     // rkt_ml.h geometry constants.
-    const CBUF_ENTRY_SIZE: u32 = 128; // CBUF_BANK_SIZE(32768) / CBUF_ENTRIES_PER_BANK(256)
-    const CBUF_ENTRIES_PER_BANK: u32 = 256;
     const CBUF_BANKS: u32 = 12;
     const FEATURE_ATOMIC_SIZE: u32 = 16;
     const ATOMIC_K_SIZE: u32 = 16;
 
-    // calc_entries_per_slice() (bpe=1, int8).
-    let atomics_per_entry = CBUF_ENTRY_SIZE / FEATURE_ATOMIC_SIZE;
-    let total_c_atomics = shape.input_channels.div_ceil(FEATURE_ATOMIC_SIZE);
-    let last_c_atomics = total_c_atomics % atomics_per_entry;
-    let int_c_entries = (total_c_atomics / atomics_per_entry) * shape.input_width;
-    let frac_c_entries = if last_c_atomics == 3 {
-        shape.input_width
-    } else {
-        (last_c_atomics * shape.input_width).div_ceil(atomics_per_entry)
-    };
-    let entries_per_slice = int_c_entries + frac_c_entries;
-
-    // calc_input_banks().
-    let input_banks = (entries_per_slice * shape.input_height).div_ceil(CBUF_ENTRIES_PER_BANK);
+    // calc_entries_per_slice() + calc_input_banks() -- see compute_input_banks's
+    // own doc comment for why this is a separate function rather than inline.
+    let input_banks = compute_input_banks(shape);
     assert!(
         input_banks < CBUF_BANKS,
         "build_conv_regcmd: shape needs {input_banks} input CBUF banks (only \
@@ -612,18 +599,11 @@ fn build_conv_cna_core_dpu_dpu_rdma(
     let weight_banks = CBUF_BANKS - input_banks;
 
     // fill_task(): channel/kernel counts round up to the hardware's
-    // atomic granularity, independent of the op's logical shape.
-    let task_input_channels = shape
-        .input_channels
-        .max(FEATURE_ATOMIC_SIZE)
-        .next_multiple_of(FEATURE_ATOMIC_SIZE);
-    let mut task_output_channels = shape.output_channels.max(32).next_multiple_of(32);
-    if shape.depthwise {
-        if shape.output_channels <= 32 {
-            task_output_channels *= 2;
-        }
-        task_output_channels = task_output_channels.next_multiple_of(64);
-    }
+    // atomic granularity, independent of the op's logical shape. See
+    // compute_task_input_channels/compute_task_output_channels's own doc
+    // comments for why these are separate functions.
+    let task_input_channels = compute_task_input_channels(shape);
+    let task_output_channels = compute_task_output_channels(shape);
     let weights_kernels = if shape.depthwise {
         1
     } else {
@@ -654,19 +634,21 @@ fn build_conv_cna_core_dpu_dpu_rdma(
     // rkt_regcmd.c: DPU_OUT_CVT_OFFSET/SCALE/SHIFT -- float-bits-based
     // fixed-point conversion (f32::to_bits() is bit-exact for C's fui()).
     let out_offset = shape.output_zero_point.wrapping_sub(0x80);
+    // See compute_out_shift's own doc comment for why the shift itself is
+    // a separate function; out_scale isn't part of that assert's guarded
+    // value so it's still derived inline here.
+    let out_shift_raw = compute_out_shift(shape);
+    assert!(
+        out_shift_raw >= 0,
+        "unsupported output conversion scale: input_scale={}, weights_scale={}, output_scale={}, \
+         computed out_shift={out_shift_raw}",
+        shape.input_scale,
+        shape.weights_scale,
+        shape.output_scale,
+    );
+    let out_shift = out_shift_raw as u32;
     let conv_scale = (shape.input_scale * shape.weights_scale) / shape.output_scale;
     let scale_bits = conv_scale.to_bits();
-    let scale_exponent = ((scale_bits >> 23) & 0xff) as i32;
-    let mut out_shift = 127 + 31 - 32 - scale_exponent + 16;
-    if shape.truncate_bits > 0 {
-        out_shift -= 1;
-    }
-    assert!(
-        out_shift >= 0,
-        "unsupported output conversion scale: conv_scale={conv_scale}, exponent={scale_exponent}, \
-         computed out_shift={out_shift}"
-    );
-    let out_shift = out_shift as u32;
     let mut out_scale = ((scale_bits >> 9) & 0x7fff) + 1;
     if out_scale < (1 << 14) {
         out_scale |= 1 << 14;
@@ -1629,6 +1611,81 @@ pub fn build_lut_regcmd(shape: &LutShape, bufs: &LutBuffers, table: LutTable) ->
 
     push_kick(&mut cmds, KICK_DPU | KICK_DPU_RDMA);
     cmds
+}
+
+/// calc_entries_per_slice() + calc_input_banks() (rkt_task.c) -- how many
+/// of CBUF's 12 total banks this shape's input tensor needs. Extracted out
+/// of `build_conv_cna_core_dpu_dpu_rdma` as a pure function (no behavior
+/// change -- verified identical formula) so `executable_format`'s
+/// `validate_conv_shape` can check the exact same value that function's own
+/// `assert!` protects, without re-deriving the formula a second time and
+/// risking the two copies silently drifting apart.
+pub(crate) fn compute_input_banks(shape: &ConvShape) -> u32 {
+    const CBUF_ENTRY_SIZE: u32 = 128; // CBUF_BANK_SIZE(32768) / CBUF_ENTRIES_PER_BANK(256)
+    const CBUF_ENTRIES_PER_BANK: u32 = 256;
+    const FEATURE_ATOMIC_SIZE: u32 = 16;
+
+    // calc_entries_per_slice() (bpe=1, int8).
+    let atomics_per_entry = CBUF_ENTRY_SIZE / FEATURE_ATOMIC_SIZE;
+    let total_c_atomics = shape.input_channels.div_ceil(FEATURE_ATOMIC_SIZE);
+    let last_c_atomics = total_c_atomics % atomics_per_entry;
+    let int_c_entries = (total_c_atomics / atomics_per_entry) * shape.input_width;
+    let frac_c_entries = if last_c_atomics == 3 {
+        shape.input_width
+    } else {
+        (last_c_atomics * shape.input_width).div_ceil(atomics_per_entry)
+    };
+    let entries_per_slice = int_c_entries + frac_c_entries;
+
+    // calc_input_banks().
+    (entries_per_slice * shape.input_height).div_ceil(CBUF_ENTRIES_PER_BANK)
+}
+
+/// rkt_regcmd.c's `DPU_OUT_CVT_SHIFT` formula (float-bits-based fixed-point
+/// conversion, `conv_scale = input_scale*weights_scale/output_scale`).
+/// Returns the raw shift value, NOT yet checked for non-negativity or cast
+/// to `u32` -- the caller is responsible for both (see
+/// `build_conv_cna_core_dpu_dpu_rdma`'s own `assert!`). Extracted as a pure
+/// function (no behavior change) for the same single-source-of-truth
+/// reason as `compute_input_banks` above: `validate_conv_shape` needs to
+/// check the exact value the builder's `assert!` protects.
+pub(crate) fn compute_out_shift(shape: &ConvShape) -> i32 {
+    let conv_scale = (shape.input_scale * shape.weights_scale) / shape.output_scale;
+    let scale_bits = conv_scale.to_bits();
+    let scale_exponent = ((scale_bits >> 23) & 0xff) as i32;
+    let mut out_shift = 127 + 31 - 32 - scale_exponent + 16;
+    if shape.truncate_bits > 0 {
+        out_shift -= 1;
+    }
+    out_shift
+}
+
+/// fill_task()'s input-channel atomic rounding (`CNA_DATA_SIZE1.datain_channel`,
+/// a 16-bit field -- see `builders/cna.rs`). Extracted as a pure function
+/// for the same single-source-of-truth reason as `compute_input_banks`:
+/// `validate_conv_shape` needs to check this against the field's real bit
+/// width without re-deriving the rounding formula a second time.
+pub(crate) fn compute_task_input_channels(shape: &ConvShape) -> u32 {
+    const FEATURE_ATOMIC_SIZE: u32 = 16;
+    shape
+        .input_channels
+        .max(FEATURE_ATOMIC_SIZE)
+        .next_multiple_of(FEATURE_ATOMIC_SIZE)
+}
+
+/// fill_task()'s output-channel atomic rounding, feeding `DPU_..._CHANNEL`
+/// (13-bit fields, see `builders/dpu.rs`'s `channel`/`channel_wdma`) as
+/// `task_output_channels - 1`. Extracted as a pure function for the same
+/// reason as `compute_task_input_channels` above.
+pub(crate) fn compute_task_output_channels(shape: &ConvShape) -> u32 {
+    let mut task_output_channels = shape.output_channels.max(32).next_multiple_of(32);
+    if shape.depthwise {
+        if shape.output_channels <= 32 {
+            task_output_channels *= 2;
+        }
+        task_output_channels = task_output_channels.next_multiple_of(64);
+    }
+    task_output_channels
 }
 
 pub fn build_conv_regcmd(shape: &ConvShape, bufs: &ConvBuffers) -> Vec<RegCmd> {
