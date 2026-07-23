@@ -31,9 +31,11 @@ use crate::bindings::{
     iree_hal_semaphore_compatibility_t, iree_hal_semaphore_flags_t, iree_hal_semaphore_list_t,
     iree_hal_semaphore_t, iree_hal_topology_edge_t, iree_hal_update_flags_t,
     iree_hal_write_flags_t, iree_host_size_t, iree_io_file_handle_t,
-    iree_status_code_e_IREE_STATUS_INVALID_ARGUMENT, iree_status_code_e_IREE_STATUS_UNAVAILABLE,
-    iree_status_t, iree_string_view_t, iree_timeout_t, iree_timeout_type_e_IREE_TIMEOUT_ABSOLUTE,
+    iree_status_code_e_IREE_STATUS_INTERNAL, iree_status_code_e_IREE_STATUS_INVALID_ARGUMENT,
+    iree_status_code_e_IREE_STATUS_UNAVAILABLE, iree_status_t, iree_string_view_t, iree_timeout_t,
+    iree_timeout_type_e_IREE_TIMEOUT_ABSOLUTE,
 };
+use crate::buffer::RocketBuffer;
 use crate::status;
 use iree_rocket_hal::rocket::api::{DRM_IOCTL_BASE, drm_version};
 use iree_rocket_hal::rocket::device as rocket_device;
@@ -1056,6 +1058,70 @@ status_stub!(queue_dispatch(
 ) -> iree_status_t);
 
 #[allow(unused_variables)]
+/// Copies `bytes_per_pixel` bytes out of each 16-byte-strided atomic slot in
+/// `scratch` into `dst`, densely packed -- the host-side half of Conv2d
+/// output compaction (see `command_buffer::OutputCompaction`'s doc comment
+/// for the hardware reason this exists). Pure and unit-testable without
+/// hardware; bounds-checked against both slices rather than trusting the
+/// caller's `pixel_count`/`bytes_per_pixel` inputs. Returns the number of
+/// bytes written to `dst`.
+fn compact_conv_output(
+    scratch: &[u8],
+    pixel_count: usize,
+    bytes_per_pixel: usize,
+    dst: &mut [u8],
+) -> usize {
+    const ATOMIC_STRIDE: usize = 16;
+    let mut written = 0;
+    for i in 0..pixel_count {
+        let src_off = i * ATOMIC_STRIDE;
+        let dst_off = i * bytes_per_pixel;
+        if src_off + bytes_per_pixel > scratch.len() || dst_off + bytes_per_pixel > dst.len() {
+            break;
+        }
+        dst[dst_off..dst_off + bytes_per_pixel]
+            .copy_from_slice(&scratch[src_off..src_off + bytes_per_pixel]);
+        written += bytes_per_pixel;
+    }
+    written
+}
+
+#[cfg(test)]
+mod compaction_tests {
+    use super::compact_conv_output;
+
+    #[test]
+    fn compacts_16_byte_slots_into_dense_output() {
+        const PIXELS: usize = 4;
+        const BPP: usize = 2;
+        let mut scratch = vec![0xAAu8; PIXELS * 16];
+        for i in 0..PIXELS {
+            scratch[i * 16] = i as u8;
+            scratch[i * 16 + 1] = 0x10 + i as u8;
+        }
+        let mut dst = vec![0u8; PIXELS * BPP];
+        let written = compact_conv_output(&scratch, PIXELS, BPP, &mut dst);
+        assert_eq!(written, PIXELS * BPP);
+        assert_eq!(dst, vec![0x00, 0x10, 0x01, 0x11, 0x02, 0x12, 0x03, 0x13]);
+    }
+
+    #[test]
+    fn stops_short_when_dst_too_small() {
+        let scratch = vec![0u8; 64];
+        let mut dst = vec![0u8; 2];
+        let written = compact_conv_output(&scratch, 4, 2, &mut dst);
+        assert_eq!(written, 2);
+    }
+
+    #[test]
+    fn stops_short_when_scratch_too_small() {
+        let scratch = vec![0u8; 16];
+        let mut dst = vec![0u8; 8];
+        let written = compact_conv_output(&scratch, 4, 2, &mut dst);
+        assert_eq!(written, 2);
+    }
+}
+
 unsafe extern "C" fn queue_execute(
     device: *mut iree_hal_device_t,
     queue_affinity: iree_hal_queue_affinity_t,
@@ -1140,9 +1206,22 @@ unsafe extern "C" fn queue_execute(
                     // round-trip (proving the ioctl plumbing works) but
                     // give no real completion/dependency guarantee for the
                     // tensors themselves.
+                    // Deduplicated: a real compiled program can pack
+                    // multiple bindings (e.g. input+weights) into one
+                    // combined transient buffer at different offsets, so
+                    // the same GEM handle can legitimately appear more than
+                    // once in job.in_bo_handles -- untested against the
+                    // kernel driver's fence/dependency tracking before now
+                    // (every prior hand-driven test used one dedicated
+                    // buffer per binding), so dedupe defensively rather
+                    // than assume DRM_ROCKET_SUBMIT tolerates duplicates.
                     let mut in_handles = Vec::with_capacity(1 + job.in_bo_handles.len());
                     in_handles.push(cmd_buf.handle);
-                    in_handles.extend_from_slice(job.in_bo_handles);
+                    for &h in job.in_bo_handles {
+                        if !in_handles.contains(&h) {
+                            in_handles.push(h);
+                        }
+                    }
                     if unsafe {
                         rocket_device::submit(
                             fd,
@@ -1184,6 +1263,32 @@ unsafe extern "C" fn queue_execute(
                                 iree_status_code_e_IREE_STATUS_UNAVAILABLE as u32,
                             );
                         }
+                    }
+
+                    // Conv2d only (see `command_buffer::OutputCompaction`'s
+                    // doc comment): the hardware write above landed in a
+                    // driver-private scratch buffer, atomic-slot-strided,
+                    // not the real IREE-visible output buffer. Compact it
+                    // into the real buffer now that prep_bo above confirmed
+                    // the write is complete and host-visible.
+                    if let Some(oc) = job.output_compaction {
+                        let expected_bytes = oc.pixel_count * oc.bytes_per_pixel;
+                        if expected_bytes as u64 > oc.output_length as u64 {
+                            break 'result status::from_code(
+                                iree_status_code_e_IREE_STATUS_INTERNAL as u32,
+                            );
+                        }
+                        let scratch_len = oc.pixel_count * 16;
+                        let scratch =
+                            unsafe { std::slice::from_raw_parts(oc.scratch_ptr, scratch_len) };
+                        let out_rb = unsafe { &*(oc.output_buffer as *const RocketBuffer) };
+                        let dst = unsafe {
+                            std::slice::from_raw_parts_mut(
+                                out_rb.host_ptr.add(oc.output_offset as usize),
+                                expected_bytes,
+                            )
+                        };
+                        compact_conv_output(scratch, oc.pixel_count, oc.bytes_per_pixel, dst);
                     }
                 }
                 status::ok()

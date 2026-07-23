@@ -54,9 +54,11 @@
 //! the recording call), matching `iree_hal_deferred_command_buffer_t`'s
 //! identical requirement.
 
+use std::os::fd::{AsRawFd, BorrowedFd, RawFd};
+
 use crate::bindings::{
     iree_const_byte_span_t, iree_device_size_t, iree_hal_buffer_barrier_t,
-    iree_hal_buffer_ref_list_t, iree_hal_buffer_ref_t, iree_hal_channel_t,
+    iree_hal_buffer_ref_list_t, iree_hal_buffer_ref_t, iree_hal_buffer_t, iree_hal_channel_t,
     iree_hal_collective_op_t, iree_hal_command_buffer_mode_t, iree_hal_command_buffer_t,
     iree_hal_command_buffer_vtable_t, iree_hal_command_category_t, iree_hal_copy_flags_t,
     iree_hal_dispatch_config_t, iree_hal_dispatch_flags_t, iree_hal_event_t,
@@ -71,8 +73,33 @@ use crate::executable::UkernelShape;
 use crate::status;
 use iree_rocket_hal::rocket::{
     builders::RegCmd,
-    regcmd::{ConvBuffers, PoolingBuffers, build_conv_regcmd, build_pooling_regcmd},
+    device::Buffer as RocketDeviceBuffer,
+    regcmd::{
+        ConvBuffers, PoolingBuffers, build_conv_regcmd, build_pooling_regcmd,
+        conv_output_scratch_bytes,
+    },
 };
+
+/// Bridges the RK3588 DPU's atomic-slot output write-back (16-byte-aligned
+/// slots regardless of dtype, `FEATURE_ATOMIC_SIZE=16`) to IREE's densely-
+/// packed ABI output buffer -- see `iree-rocket-hal/src/rocket/regcmd.rs`'s
+/// `conv_output_scratch_bytes` doc comment and the "Conv2d output
+/// compaction" investigation this fixes. `dispatch()` points the regcmd at
+/// a driver-private scratch buffer instead of the real output buffer;
+/// `queue_execute`, after its existing post-dispatch `prep_bo` wait
+/// confirms the hardware write is complete, copies `bytes_per_pixel` bytes
+/// out of each scratch slot into `output_buffer` (the real, dense IREE
+/// buffer, retained at record time via `output_buffer` below so it survives
+/// until `queue_execute` runs).
+#[derive(Clone, Copy)]
+pub struct OutputCompaction {
+    pub output_buffer: *mut iree_hal_buffer_t,
+    pub output_offset: iree_device_size_t,
+    pub output_length: iree_device_size_t,
+    pub scratch_ptr: *mut u8,
+    pub pixel_count: usize,
+    pub bytes_per_pixel: usize,
+}
 
 /// One recorded command-buffer operation, in call order -- see module doc
 /// comment for why these are recorded rather than applied immediately.
@@ -111,6 +138,12 @@ pub enum RecordedOp {
         in_bo_handles: Vec<u32>,
         /// GEM handles of every buffer this dispatch writes.
         out_bo_handles: Vec<u32>,
+        /// Set only for `Conv2d` (`output_channels == 1`, the only case
+        /// reachable today) -- see `OutputCompaction`'s own doc comment.
+        /// `None` for `Pooling` (unaffected today, flagged as a follow-up
+        /// risk -- same DPU write-back stage almost certainly has the same
+        /// atomic-slot mismatch, just not fixed here).
+        output_compaction: Option<OutputCompaction>,
     },
 }
 
@@ -122,6 +155,7 @@ pub struct DispatchJob {
     pub regcmd: &'static [RegCmd],
     pub in_bo_handles: &'static [u32],
     pub out_bo_handles: &'static [u32],
+    pub output_compaction: Option<OutputCompaction>,
 }
 
 /// What every `iree_hal_command_buffer_t*` this driver hands out actually
@@ -147,6 +181,18 @@ pub struct RocketCommandBuffer {
     /// plain field (rather than mimicking the null driver reference's
     /// single-trailing-allocation trick) is fine.
     validation_state: Vec<u8>,
+    /// A raw, borrowed device fd -- populated in `create()` from
+    /// `device_allocator`'s own `RocketAllocator.file`. Needed so
+    /// `dispatch()` can allocate a driver-private scratch GEM buffer for
+    /// Conv2d output compaction (see `OutputCompaction`) at record time,
+    /// before `build_conv_regcmd` bakes a DMA address into the regcmd
+    /// program. Sound to use independently of `RocketAllocator.file`'s own
+    /// lifetime: `RocketAllocator.file` and `RocketDevice.file` are
+    /// `try_clone()`'d duplicates of the same open file description (DRM
+    /// GEM handles are namespaced per underlying `struct file`, not per fd
+    /// integer), and `device_allocator` is guaranteed to outlive every
+    /// command buffer created against it.
+    fd: RawFd,
 }
 
 unsafe fn cast(command_buffer: *mut iree_hal_command_buffer_t) -> *mut RocketCommandBuffer {
@@ -241,11 +287,13 @@ pub unsafe fn apply_ops(
                 regcmd,
                 in_bo_handles,
                 out_bo_handles,
+                output_compaction,
             } => {
                 dispatch_job = Some(DispatchJob {
                     regcmd: regcmd.as_slice(),
                     in_bo_handles: in_bo_handles.as_slice(),
                     out_bo_handles: out_bo_handles.as_slice(),
+                    output_compaction: *output_compaction,
                 });
             }
         }
@@ -263,10 +311,16 @@ pub unsafe fn create(
     let validation_state_size = unsafe {
         crate::bindings::iree_hal_command_buffer_validation_state_size(mode, binding_capacity)
     };
+    let fd = unsafe {
+        (*(device_allocator as *mut crate::allocator::RocketAllocator))
+            .file
+            .as_raw_fd()
+    };
     let cb = Box::new(RocketCommandBuffer {
         base: unsafe { std::mem::zeroed() }, // filled by iree_hal_command_buffer_initialize below
         ops: Vec::new(),
         validation_state: vec![0u8; validation_state_size],
+        fd,
     });
     let cb_ptr = Box::into_raw(cb);
     unsafe {
@@ -287,11 +341,14 @@ pub unsafe fn create(
 unsafe extern "C" fn destroy(command_buffer: *mut iree_hal_command_buffer_t) {
     unsafe {
         let cb = Box::from_raw(cast(command_buffer));
-        // Release exactly what fill_buffer/update_buffer/copy_buffer
-        // retained at record time -- see those functions' own comments.
-        // Dispatch isn't included: it never retains a buffer reference
-        // (only extracts DMA address/GEM handle immediately, at record
-        // time, via addr()/handle() -- see dispatch()'s own doc comment).
+        // Release exactly what fill_buffer/update_buffer/copy_buffer/
+        // dispatch retained at record time -- see those functions' own
+        // comments. Most of Dispatch's own fields (regcmd, GEM handles)
+        // are plain extracted values, not retained buffer references --
+        // but Conv2d's `output_compaction`, when present, does retain the
+        // real output buffer (see `OutputCompaction`'s own doc comment),
+        // since it must survive until `queue_execute`'s post-dispatch
+        // compaction step long after this recording call returns.
         for op in &cb.ops {
             match op {
                 RecordedOp::Fill { target, .. } => {
@@ -304,7 +361,13 @@ unsafe extern "C" fn destroy(command_buffer: *mut iree_hal_command_buffer_t) {
                     crate::bindings::iree_hal_buffer_release(source.buffer);
                     crate::bindings::iree_hal_buffer_release(target.buffer);
                 }
-                RecordedOp::Dispatch { .. } => {}
+                RecordedOp::Dispatch {
+                    output_compaction, ..
+                } => {
+                    if let Some(oc) = output_compaction {
+                        crate::bindings::iree_hal_buffer_release(oc.output_buffer);
+                    }
+                }
             }
         }
         drop(cb);
@@ -543,8 +606,20 @@ unsafe extern "C" fn dispatch(
         );
     }
 
-    let addr =
-        |r: &iree_hal_buffer_ref_t| unsafe { (*(r.buffer as *mut RocketBuffer)).dma_address };
+    // `r.offset` is the byte offset of this binding WITHIN its underlying
+    // buffer -- always 0 in every hand-driven CTS test so far (each of
+    // those constructs its own dedicated buffer per binding via
+    // iree_hal_make_buffer_ref(buf, 0, size)), but a REAL compiled IREE
+    // program routinely sub-allocates multiple tensor arguments out of one
+    // combined transient buffer at nonzero offsets (confirmed on real
+    // hardware: input/weights bindings shared one buffer, weights at
+    // offset=64). Forgetting to add it here silently pointed the regcmd's
+    // weight-read register at byte 0 of that shared buffer (the INPUT
+    // tensor's own data) instead of the real weight value 64 bytes in --
+    // found via a hardware diagnostic dump, not by inspection.
+    let addr = |r: &iree_hal_buffer_ref_t| unsafe {
+        (*(r.buffer as *mut RocketBuffer)).dma_address + r.offset as u32
+    };
     let handle = |r: &iree_hal_buffer_ref_t| unsafe { (*(r.buffer as *mut RocketBuffer)).handle };
 
     // Binding convention: per-ukernel-kind, since each kind's regcmd
@@ -558,12 +633,22 @@ unsafe extern "C" fn dispatch(
                     crate::bindings::iree_status_code_e_IREE_STATUS_INVALID_ARGUMENT as u32,
                 );
             }
-            // 0=input, 1=weights, 2=bias, 3=output.
+            // DPU's atomic-slot output write-back (16-byte-aligned slots
+            // regardless of dtype) doesn't match IREE's densely-packed ABI
+            // output buffer -- see `OutputCompaction`'s own doc comment.
+            // Bridge it with a driver-private scratch buffer: the regcmd
+            // writes there instead of the real output buffer, and
+            // `queue_execute` compacts the real values into the real
+            // buffer after the hardware write completes.
+            let scratch_bytes = conv_output_scratch_bytes(shape).max(1);
+            let scratch = unsafe {
+                RocketDeviceBuffer::new(cb.fd, scratch_bytes, BorrowedFd::borrow_raw(cb.fd))
+            };
             let bufs = ConvBuffers {
                 input_addr: addr(&refs[0]),
                 weights_addr: addr(&refs[1]),
                 bias_addr: addr(&refs[2]),
-                output_addr: addr(&refs[3]),
+                output_addr: scratch.dma_address,
             };
             // catch_unwind backstop -- see module doc comment for exactly
             // why. Safe to assert unwind-safety here: build_conv_regcmd
@@ -580,10 +665,23 @@ unsafe extern "C" fn dispatch(
                     );
                 }
             };
+            // Retained here so the real output buffer survives until
+            // `queue_execute`'s post-dispatch compaction step; released in
+            // `destroy()`'s `OutputCompaction` arm.
+            unsafe { crate::bindings::iree_hal_buffer_retain(refs[3].buffer) };
+            let output_compaction = Some(OutputCompaction {
+                output_buffer: refs[3].buffer,
+                output_offset: refs[3].offset,
+                output_length: refs[3].length,
+                scratch_ptr: scratch.host_ptr,
+                pixel_count: shape.output_width as usize * shape.output_height as usize,
+                bytes_per_pixel: shape.precision.bytes_per_element() as usize,
+            });
             cb.ops.push(RecordedOp::Dispatch {
                 regcmd,
                 in_bo_handles: vec![handle(&refs[0]), handle(&refs[1]), handle(&refs[2])],
-                out_bo_handles: vec![handle(&refs[3])],
+                out_bo_handles: vec![scratch.handle],
+                output_compaction,
             });
         }
         UkernelShape::Pooling(shape) => {
@@ -602,6 +700,7 @@ unsafe extern "C" fn dispatch(
                 regcmd: build_pooling_regcmd(shape, &bufs),
                 in_bo_handles: vec![handle(&refs[0])],
                 out_bo_handles: vec![handle(&refs[1])],
+                output_compaction: None,
             });
         }
     }
