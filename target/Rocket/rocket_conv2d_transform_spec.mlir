@@ -41,8 +41,23 @@
 //     --iree-hal-target-device=cpu_device=local \
 //     --iree-hal-local-target-device-backends=llvm-cpu \
 //     --iree-hal-default-device=cpu_device \
+//     --iree-hal-indirect-command-buffers=false \
 //     --iree-preprocessing-transform-spec-filename=rocket_conv2d_transform_spec.mlir \
 //     model.mlir -o model.vmfb
+//
+// `--iree-hal-indirect-command-buffers=false` is required (not new to this
+// file, but easy to forget when copying this recipe): rocket-hal-driver
+// does not implement indirect-binding support (deferred regcmd construction
+// at execute time -- see project memory). Without this flag, iree-compile's
+// default indirect command buffers require every dispatch-bound buffer to
+// carry `MAPPING_PERSISTENT` usage for host-side binding-table resolution,
+// which fails at runtime with a `PERMISSION_DENIED` from
+// `hal.device.queue.execute.indirect` ("requested usage was not specified
+// when the buffer was allocated") -- confirmed empirically on real
+// hardware with this exact multi-device module. Disabling indirect command
+// buffers switches the emitted VM import to plain `hal.device.queue.execute`
+// and removes the requirement entirely (confirmed via `iree-dump-module`:
+// no `.indirect` import remains anywhere in the compiled module).
 //
 // This is real, non-experimental, wired-up IREE machinery -- not a hack:
 // `DeviceAnalysis::gatherRequiredExecutableTargets`
