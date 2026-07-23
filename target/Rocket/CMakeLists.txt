@@ -1,0 +1,23 @@
+iree_cc_library(
+  NAME
+    Rocket
+  HDRS
+    "RocketConv2dEncoding.h"
+  SRCS
+    "RocketTarget.cpp"
+  DEPS
+    LLVMSupport
+    MLIRIR
+    MLIRPass
+    MLIRSupport
+    iree::compiler::Dialect::HAL::Target
+    iree::compiler::PluginAPI
+  PUBLIC
+)
+
+iree_compiler_register_plugin(
+  PLUGIN_ID
+    hal_target_rocket
+  TARGET
+    ::Rocket
+)
