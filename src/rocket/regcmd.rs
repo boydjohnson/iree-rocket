@@ -97,7 +97,7 @@ impl Precision {
     /// load-bearing once a real, non-uniform weight/input pair exposed
     /// it (a uniformly-filled weight buffer can't distinguish a wrong
     /// byte count from a correct one).
-    fn bytes_per_element(self) -> u32 {
+    pub fn bytes_per_element(self) -> u32 {
         match self {
             Precision::Int8 => 1,
             Precision::Fp16 => 2,
@@ -1686,6 +1686,30 @@ pub(crate) fn compute_task_output_channels(shape: &ConvShape) -> u32 {
         task_output_channels = task_output_channels.next_multiple_of(64);
     }
     task_output_channels
+}
+
+/// The real per-real-output-pixel byte stride the DPU write-back uses --
+/// confirmed on real hardware for both `Precision::Int8` (`NOTES.md`'s
+/// "RESOLVED: the only pixel [0,0] written" investigation) and
+/// `Precision::Fp16` (this crate's own `rkt-fp16.rs`), and derived
+/// algebraically from `output_surface_stride`'s formula in
+/// `build_conv_cna_core_dpu_dpu_rdma` (`ATOMIC_K_SIZE == FEATURE_ATOMIC_
+/// SIZE == 16`, canceling out to a flat per-pixel constant with no
+/// dependency on `depthwise`/`truncate_bits`/precision beyond this).
+/// Dtype-invariant: fp16's real 2-byte value still occupies only the
+/// first 2 bytes of a 16-byte slot, not a wider one.
+pub const CONV_OUTPUT_ATOMIC_STRIDE: u32 = 16;
+
+/// Real hardware output footprint for a single-real-output-channel conv
+/// (`output_channels == 1`, the only case `build_conv_cna_core_dpu_dpu_rdma`
+/// supports -- see its own `assert!` on the unimplemented "wide atomic"
+/// branch) -- `output_width * output_height` real pixels, each occupying
+/// one `CONV_OUTPUT_ATOMIC_STRIDE`-byte slot. This is what a caller
+/// writing the hardware's *real* output needs to allocate; it is NOT the
+/// same as the dense `output_width * output_height * bytes_per_element`
+/// size a logical tensor of this shape would need.
+pub fn conv_output_scratch_bytes(shape: &ConvShape) -> usize {
+    shape.output_width as usize * shape.output_height as usize * CONV_OUTPUT_ATOMIC_STRIDE as usize
 }
 
 pub fn build_conv_regcmd(shape: &ConvShape, bufs: &ConvBuffers) -> Vec<RegCmd> {

@@ -5,7 +5,7 @@
 //! consumers (`rocket-hal-driver`) can use the same primitives instead of
 //! re-deriving them.
 
-use std::{fs::File, num::NonZeroUsize};
+use std::num::NonZeroUsize;
 
 use nix::{
     ioctl_readwrite, ioctl_write_ptr,
@@ -61,7 +61,7 @@ pub struct Buffer {
 }
 
 impl Buffer {
-    pub unsafe fn new(fd: i32, size: usize, file: &File) -> Self {
+    pub unsafe fn new(fd: i32, size: usize, file: impl std::os::fd::AsFd) -> Self {
         unsafe {
             let mut create_params = drm_rocket_create_bo {
                 size: size as u32,
