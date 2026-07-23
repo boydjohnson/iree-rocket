@@ -1,0 +1,83 @@
+// Copyright 2026 Boyd Johnson
+//
+// Licensed under the Apache License v2.0 with LLVM Exceptions.
+// See https://llvm.org/LICENSE.txt for license information.
+// SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
+
+namespace iree.hal.rocket;
+
+// Rocket executable schema, major version 1.
+file_identifier "RKT1";
+file_extension "rkt1";
+
+// Wire-format values. These are independent of hardware register encodings.
+enum Precision : ubyte {
+  INT8 = 0,
+  FP16 = 1,
+}
+
+// Wire-format values. RELUX uses Conv2DDef.activation_cmp.
+enum Activation : ubyte {
+  NONE = 0,
+  RELU = 1,
+  RELUX = 2,
+}
+
+// Describes one NHWC/HWCF 2-D convolution.
+//
+// Version 1 has one stride because the current Rocket ConvShape and register
+// command path require equal height and width strides. Dilation is implicitly
+// 1. The runtime must reject operations that do not satisfy those constraints.
+table Conv2DDef {
+  input_width:uint32;
+  input_height:uint32;
+  input_channels:uint32;
+
+  output_width:uint32;
+  output_height:uint32;
+  output_channels:uint32;
+
+  weights_width:uint32;
+  weights_height:uint32;
+
+  stride:uint32;
+  depthwise:bool = false;
+
+  input_zero_point:uint32;
+  output_zero_point:uint32;
+  weights_zero_point:uint32;
+
+  input_scale:float = 1.0;
+  weights_scale:float = 1.0;
+  output_scale:float = 1.0;
+
+  truncate_bits:uint32;
+  activation:Activation = NONE;
+
+  // Only meaningful when activation is RELUX.
+  activation_cmp:uint32;
+
+  precision:Precision = INT8;
+}
+
+// Add future Rocket kernel kinds here. Existing numeric values must not be
+// changed or reused.
+union KernelDef {
+  Conv2DDef,
+}
+
+// Information about one exported kernel.
+table ExportDef {
+  // Diagnostic symbol name. Dispatch selects exports by ordinal.
+  name:string (required);
+
+  kernel:KernelDef (required);
+}
+
+table ExecutableDef {
+  // Exports in canonical IREE executable ordinal order.
+  exports:[ExportDef] (required);
+}
+
+root_type ExecutableDef;
+
