@@ -48,16 +48,14 @@
 // `--iree-hal-indirect-command-buffers=false` is required (not new to this
 // file, but easy to forget when copying this recipe): rocket-hal-driver
 // does not implement indirect-binding support (deferred regcmd construction
-// at execute time -- see project memory). Without this flag, iree-compile's
-// default indirect command buffers require every dispatch-bound buffer to
-// carry `MAPPING_PERSISTENT` usage for host-side binding-table resolution,
-// which fails at runtime with a `PERMISSION_DENIED` from
-// `hal.device.queue.execute.indirect` ("requested usage was not specified
-// when the buffer was allocated") -- confirmed empirically on real
-// hardware with this exact multi-device module. Disabling indirect command
-// buffers switches the emitted VM import to plain `hal.device.queue.execute`
-// and removes the requirement entirely (confirmed via `iree-dump-module`:
-// no `.indirect` import remains anywhere in the compiled module).
+// at execute time -- see project memory). Confirmed via `iree-dump-module`
+// that this flag switches the emitted VM import from
+// `hal.device.queue.execute.indirect` to plain `hal.device.queue.execute`
+// (no `.indirect` import remains anywhere in the compiled module). Note this
+// does NOT by itself fix the `MAPPING_PERSISTENT` `PERMISSION_DENIED` a
+// mixed rocket+llvm-cpu module hits at runtime -- that recurs on the plain
+// (direct) `hal.device.queue.execute` path too and needed a separate real
+// fix in `rocket-hal-driver`'s own allocator (see below).
 //
 // This is real, non-experimental, wired-up IREE machinery -- not a hack:
 // `DeviceAnalysis::gatherRequiredExecutableTargets`
@@ -89,6 +87,54 @@
 // (`rocket`/`rocket-conv2d-v1`) appear as independently-queried HAL devices,
 // and the unrelated matmul's executable only ever lists
 // `embedded-elf-x86_64` as an available format.
+//
+// TWO REAL RUNTIME BUGS FOUND AND FIXED IN `rocket-hal-driver` GETTING THIS
+// EXACT rocket+llvm-cpu MULTI-DEVICE MODULE WORKING END TO END ON REAL
+// HARDWARE (both hardware-confirmed; correct conv=6.0 and matmul=4.0
+// simultaneously, from one compiled module, on the actual RK3588 board):
+//
+// 1. `RocketAllocator`'s `allocate_buffer`/`query_buffer_compatibility`
+//    passed the caller's requested `usage` bits straight through, unlike
+//    IREE's generic heap allocator (`allocator_heap.c`, used by
+//    `local-sync`/`local-task`) which always opportunistically grants
+//    `MAPPING_SCOPED|MAPPING_PERSISTENT|MAPPING_ACCESS_RANDOM`. Since
+//    `iree-run-module`'s tooling allocates every `--input=` buffer via ONE
+//    lead device's allocator (`rocket`, ordinal 0 here) regardless of which
+//    device actually consumes it, buffers destined for the cpu_device's
+//    matmul lacked the mapping bits its inline CPU dispatch execution
+//    genuinely needs, and `hal.device.queue.execute` failed with
+//    `PERMISSION_DENIED`: "requested usage was not specified when the
+//    buffer was allocated ... operation requires MAPPING_PERSISTENT".
+//    Fixed by having `RocketAllocator` unconditionally grant those same
+//    mapping bits too -- truthful given every rocket buffer genuinely is
+//    permanently host-mmap'd, unified-memory hardware (see `buffer.rs`'s own
+//    doc comment) -- rather than only when a caller happened to ask.
+//
+// 2. Separately (and this is the one that produced silently WRONG NUMBERS,
+//    not a crash): `RocketBuffer::unmap_range` was a total no-op (matching
+//    the driver's "stays mmap'd forever" design), correct for callers that
+//    explicitly flush themselves (`iree_hal_buffer_map_write`, used by every
+//    hand-driven CTS test, checks `HOST_COHERENT` and calls flush when
+//    absent) -- but IREE's OWN `iree_hal_buffer_view_generate_buffer_in_situ`
+//    (`buffer_view_util.c`, the exact code path `iree-run-module
+//    --input=<shape>=<fill>` splat values go through) does NOT flush
+//    explicitly; it relies entirely on unmap to make the write visible,
+//    which a true no-op unmap never provides. Concretely: input/weight
+//    buffers populated this way read back correctly on the CPU (same-address
+//    same-core load-after-store is always coherent, mapping or not) but the
+//    DPU read stale/pre-existing physical memory instead of the real values
+//    -- a deterministic, INPUT-INDEPENDENT garbage result (confirmed by
+//    feeding two different input values and getting byte-identical hardware
+//    output both times). Fixed by having `unmap_range` flush (`FINI_BO`)
+//    whenever the mapping allowed write access, matching what a real
+//    hardware driver's unmap would naturally provide.
+//
+// Diagnostic method that found both: temporary `eprintln!` instrumentation
+// in `command_buffer.rs`'s `dispatch()` and `device.rs`'s `queue_execute()`
+// printing real buffer addresses/handles/host-side bytes at record time, and
+// the full scratch/output bytes before and after compaction -- same
+// technique (and same files) as the two GEM-handle bugs found earlier this
+// project. Removed once both fixes were confirmed on hardware.
 
 #rocket_target = #hal.executable.target<"rocket", "rocket-conv2d-v1", {
   input_width = 4 : i32, input_height = 4 : i32, input_channels = 1 : i32,
