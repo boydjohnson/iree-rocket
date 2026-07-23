@@ -566,14 +566,21 @@ fn build_conv_cna_core_dpu_dpu_rdma(
          fill_task()'s \"wide atomic\" branch, not implemented here (no \
          current client's shape exercises it)"
     );
-    assert!(
-        shape.precision == Precision::Int8 || input_channels_real_is_one,
-        "build_conv_regcmd: Precision::Fp16 is only hardware-validated for \
-         the single-input-channel path (see Precision's own doc comment) \
-         -- input_channels={} needs the multi-channel CVT convention \
-         independently re-derived and validated for fp16 first",
-        shape.input_channels
-    );
+    // EXPERIMENTAL, awaiting hardware validation (see project memory /
+    // MobileNetV2 Fp16 multi-channel investigation): the multi-channel
+    // branch below is precision-generic in every place it was checked
+    // (CnaCvtCon0-4's bypass convention already covers multi-channel int8
+    // AND single-channel fp16 identically; DpuOutCvtScale/PadCon1/BsOwCfg
+    // etc. all branch on `shape.precision` alone, never on channel count).
+    // The two real channel-count-AND-byte-width-dependent formulas
+    // (`compute_input_banks`, `input_data_entries` below) have been
+    // generalized to scale by `Precision::bytes_per_element()`, mirroring
+    // Mesa's own `calc_entries_per_slice()` (`rkt_task.c`), which threads a
+    // `bpe` factor through the exact same math -- hardcoded to
+    // `sizeof(uint8_t)` there since Mesa never emits non-int8 ops, but
+    // structurally the same generalization. Not yet hardware-confirmed for
+    // input_channels>1 -- assert relaxed to allow real hardware testing,
+    // NOT because this has been proven correct.
 
     // rkt_ml.h geometry constants.
     const CBUF_BANKS: u32 = 12;
@@ -622,13 +629,24 @@ fn build_conv_cna_core_dpu_dpu_rdma(
     let surfaces_per_row =
         shape.output_width * shape.output_height * 2 * if shape.depthwise { 2 } else { 1 };
 
-    // fill_task(): input_data_entries, three-way branch.
+    // fill_task(): input_data_entries, three-way branch. The multi-channel
+    // (`else`) arm is EXPERIMENTAL for Fp16 (bpe>1): Mesa's own source
+    // (`rkt_task.c`) computes this arm with a hardcoded `bpe=sizeof(uint8_t)`
+    // implicitly baked into the channel-count term (never generalized,
+    // since Mesa never emits non-int8 ops) -- generalized here by analogy
+    // with that same file's OWN `calc_entries_per_slice()`, which DOES
+    // thread a `bpe` factor through the identical
+    // `DIV_ROUND_UP(channels * bpe, FEATURE_ATOMIC_SIZE)` pattern (also
+    // hardcoded to 1 there, but structurally the general form). Not yet
+    // hardware-confirmed for bpe>1.
+    let bpe = shape.precision.bytes_per_element();
     let input_data_entries = if input_channels_real_is_one {
         shape.input_width * shape.input_height
     } else if shape.input_width == 40 && shape.input_channels == 40 {
         40
     } else {
-        (shape.input_width * 2 * shape.input_channels.div_ceil(FEATURE_ATOMIC_SIZE)).div_ceil(8)
+        (shape.input_width * 2 * (shape.input_channels * bpe).div_ceil(FEATURE_ATOMIC_SIZE))
+            .div_ceil(8)
     };
 
     // rkt_regcmd.c: DPU_OUT_CVT_OFFSET/SCALE/SHIFT -- float-bits-based
@@ -1620,14 +1638,25 @@ pub fn build_lut_regcmd(shape: &LutShape, bufs: &LutBuffers, table: LutTable) ->
 /// `validate_conv_shape` can check the exact same value that function's own
 /// `assert!` protects, without re-deriving the formula a second time and
 /// risking the two copies silently drifting apart.
+///
+/// EXPERIMENTAL for `Precision::Fp16` (bpe>1): Mesa's real
+/// `calc_entries_per_slice()` hardcodes `unsigned bpe = sizeof(uint8_t)`
+/// (Mesa never emits non-int8 ops) but threads that `bpe` through
+/// `DIV_ROUND_UP(input_channels * bpe, FEATURE_ATOMIC_SIZE)` -- i.e. the
+/// formula's own general form already scales the channel count by byte
+/// width before dividing by the atomic size. Generalized here by using
+/// `Precision::bytes_per_element()` in that same position (bpe=1
+/// reproduces the exact original int8 formula, unchanged). Not yet
+/// hardware-confirmed for bpe>1.
 pub(crate) fn compute_input_banks(shape: &ConvShape) -> u32 {
     const CBUF_ENTRY_SIZE: u32 = 128; // CBUF_BANK_SIZE(32768) / CBUF_ENTRIES_PER_BANK(256)
     const CBUF_ENTRIES_PER_BANK: u32 = 256;
     const FEATURE_ATOMIC_SIZE: u32 = 16;
 
-    // calc_entries_per_slice() (bpe=1, int8).
+    // calc_entries_per_slice().
+    let bpe = shape.precision.bytes_per_element();
     let atomics_per_entry = CBUF_ENTRY_SIZE / FEATURE_ATOMIC_SIZE;
-    let total_c_atomics = shape.input_channels.div_ceil(FEATURE_ATOMIC_SIZE);
+    let total_c_atomics = (shape.input_channels * bpe).div_ceil(FEATURE_ATOMIC_SIZE);
     let last_c_atomics = total_c_atomics % atomics_per_entry;
     let int_c_entries = (total_c_atomics / atomics_per_entry) * shape.input_width;
     let frac_c_entries = if last_c_atomics == 3 {

@@ -243,12 +243,11 @@ pub fn validate_conv_shape(shape: &ConvShape) -> Result<(), &'static str> {
              atomic\" branch, not implemented in build_conv_regcmd",
         );
     }
-    if shape.precision == Precision::Fp16 && !input_channels_real_is_one {
-        return Err(
-            "Precision::Fp16 is only hardware-validated for the single-input-channel \
-             path",
-        );
-    }
+    // Precision::Fp16 multi-channel: EXPERIMENTAL, see
+    // build_conv_cna_core_dpu_dpu_rdma's own matching comment -- this used
+    // to unconditionally reject it here; relaxed in lockstep with that
+    // function's own assert so the wire-format decode path doesn't reject
+    // shapes the regcmd builder is now willing to attempt.
 
     const CBUF_BANKS: u32 = 12;
     if compute_input_banks(shape) >= CBUF_BANKS {
@@ -484,13 +483,19 @@ mod tests {
     }
 
     #[test]
-    fn validate_rejects_fp16_multichannel() {
+    fn validate_allows_fp16_multichannel() {
+        // Was `validate_rejects_fp16_multichannel` -- this combination is
+        // now EXPERIMENTALLY allowed through (see `validate_conv_shape`'s
+        // own comment and `build_conv_cna_core_dpu_dpu_rdma`'s matching
+        // one), pending real hardware validation. Not yet hardware-
+        // confirmed correct -- this test only asserts the shape isn't
+        // rejected at validation time, matching the relaxed gate.
         let shape = ConvShape {
             input_channels: 3,
             precision: Precision::Fp16,
             ..known_good_shape()
         };
-        assert!(validate_conv_shape(&shape).is_err());
+        assert_eq!(validate_conv_shape(&shape), Ok(()));
     }
 
     #[test]

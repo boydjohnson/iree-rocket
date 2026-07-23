@@ -427,3 +427,199 @@ fn conv_fp16_uniform_fill_pixels_agree() {
         );
     }
 }
+
+//===========================================================================
+// fp16 multi-channel (`input_channels > 1`) -- MobileNetV2 Fp16 support
+// investigation. EXPERIMENTAL: `build_conv_cna_core_dpu_dpu_rdma`'s
+// multi-channel branch was previously `assert!`-blocked for
+// `Precision::Fp16` (every fp16 hw test above uses `input_channels == 1`);
+// see that function's own comment on the two real generalizations made
+// (`compute_input_banks`/`input_data_entries` now scale by
+// `Precision::bytes_per_element()`, mirroring Mesa's `calc_entries_per_
+// slice()`'s own -- currently hardcoded-to-1 -- `bpe` factor) to allow this.
+// Deliberately keeps `output_channels == 1` and the proven 1x1-kernel/4x4
+// spatial geometry from `fp16_shape()` unchanged -- isolates "does
+// multi-input-channel accumulation work for fp16" as the ONLY new variable,
+// rather than also introducing an untested kernel size or the SEPARATE
+// (rocket-hal-driver-side) output_channels>1 compaction gap in the same
+// experiment.
+//===========================================================================
+
+/// `fp16_shape()`'s exact proven geometry, with `input_channels` bumped up
+/// from 1 -- see this section's own module-level doc comment for why
+/// nothing else changes.
+fn fp16_multi_channel_shape(input_channels: u32) -> ConvShape {
+    ConvShape {
+        input_channels,
+        ..fp16_shape()
+    }
+}
+
+/// Same idea as `run_uniform_conv_fp16`, but for a real `input_channels`
+/// that may be smaller than the hardware's padded `task_input_channels`
+/// (`.max(16).next_multiple_of(16)`, see `compute_task_input_channels`):
+/// uniformly filling the ENTIRE weight buffer (as `run_uniform_conv_fp16`
+/// does) is only correct when `input_channels` is already a multiple of
+/// 16 -- otherwise the DPU genuinely reads `task_input_channels` worth of
+/// weight data per `CNA_WEIGHT_SIZE1`/`weight_bytes_per_kernel`
+/// (`weights_width*weights_height*task_input_channels*bpe`, confirmed by
+/// `build_conv_regcmd`'s own register construction), and a real compiled
+/// model's weight tensor is zero-padded past its real channel count --
+/// the padding channels contribute `input * 0 = 0` regardless of what's in
+/// the input buffer there. First hardware round of this test uniformly
+/// filled the WHOLE weight buffer (matching `run_uniform_conv_fp16`,
+/// correct for `single_channel`/int8-multi-channel's existing tests only
+/// because their fills happened to be int8-byte-uniform in a way that
+/// didn't matter, or channel counts that were already 16-aligned) and got
+/// exactly `42.0 == 16 * 2.625` for `input_channels=3` -- not garbage, a
+/// clean confirmation the hardware/CVT/banking math is right and reads
+/// exactly `task_input_channels=16` channels of real (uniformly-filled,
+/// undifferentiated) weight data, i.e. a real test-methodology gap, not a
+/// regcmd bug. This constructs the weight buffer the way a real compiler
+/// would instead: `weight_fill` for the first `input_channels` real
+/// channels of kernel 0 (1x1 kernel, so no per-tap layout to also get
+/// right), zero for every padding channel and for kernel 1 (the
+/// `weights_kernels`-padding kernel `output_channels=1` rounds up to,
+/// irrelevant to the one real output channel this test reads back).
+fn run_multi_channel_conv_fp16(shape: &ConvShape, input_fill: f32, weight_fill: f32) -> Vec<f32> {
+    const FEATURE_ATOMIC_SIZE: u32 = 16;
+    const BPE: usize = 2; // Precision::Fp16::bytes_per_element()
+
+    let input_bits = f32_to_f16_bits(input_fill);
+    let weight_bits = f32_to_f16_bits(weight_fill);
+    let task_input_channels = shape
+        .input_channels
+        .max(FEATURE_ATOMIC_SIZE)
+        .next_multiple_of(FEATURE_ATOMIC_SIZE) as usize;
+    let weights_kernels = shape.output_channels.next_multiple_of(2) as usize;
+    let bytes_per_kernel = task_input_channels * BPE; // 1x1 kernel: no tap dimension
+    let real_channel_bytes = shape.input_channels as usize * BPE;
+
+    let file = OpenOptions::new()
+        .read(true)
+        .write(true)
+        .open(DEVICE_PATH)
+        .expect("failed to open NPU device");
+    let fd = file.as_raw_fd();
+
+    unsafe {
+        let buf_a = Buffer::new(fd, TENSOR_SIZE, &file);
+        fill_u16(buf_a.host_ptr, TENSOR_SIZE, input_bits);
+
+        let buf_w = Buffer::new(fd, TENSOR_SIZE, &file);
+        // Zero the whole buffer first (covers every padding channel AND
+        // every padding kernel uniformly), then fill in only the real
+        // channels of the one real kernel (kernel 0).
+        ptr::write_bytes(buf_w.host_ptr, 0, TENSOR_SIZE);
+        assert!(
+            weights_kernels * bytes_per_kernel <= TENSOR_SIZE,
+            "test buffer too small for this shape's real weight footprint"
+        );
+        fill_u16(buf_w.host_ptr, real_channel_bytes, weight_bits);
+
+        let buf_bias = Buffer::new(fd, TENSOR_SIZE, &file);
+        ptr::write_bytes(buf_bias.host_ptr, 0, TENSOR_SIZE);
+
+        let buf_c = Buffer::new(fd, TENSOR_SIZE, &file);
+        ptr::write_bytes(buf_c.host_ptr, 0, TENSOR_SIZE);
+
+        let bufs = ConvBuffers {
+            input_addr: buf_a.dma_address,
+            weights_addr: buf_w.dma_address,
+            bias_addr: buf_bias.dma_address,
+            output_addr: buf_c.dma_address,
+        };
+        let cmds = build_conv_regcmd(shape, &bufs);
+
+        let cmd_bytes = cmds.len() * mem::size_of::<u64>();
+        let cmd_len = cmd_bytes.next_multiple_of(4096);
+        let buf_cmd = Buffer::new(fd, cmd_len, &file);
+        let cmd_slice = std::slice::from_raw_parts_mut(buf_cmd.host_ptr as *mut u64, cmds.len());
+        for (i, c) in cmds.iter().enumerate() {
+            cmd_slice[i] = c.0;
+        }
+
+        fini_bo(fd, buf_a.handle).ok();
+        fini_bo(fd, buf_w.handle).ok();
+        fini_bo(fd, buf_bias.handle).ok();
+        fini_bo(fd, buf_c.handle).ok();
+        fini_bo(fd, buf_cmd.handle).ok();
+
+        let in_handles = [buf_cmd.handle, buf_a.handle, buf_w.handle, buf_bias.handle];
+        let out_handles = [buf_c.handle];
+
+        submit(
+            fd,
+            buf_cmd.dma_address,
+            cmds.len() as u32,
+            &in_handles,
+            &out_handles,
+        )
+        .expect("SUBMIT ioctl failed");
+
+        prep_bo(fd, buf_c.handle, 2_000_000_000).unwrap_or_else(|e| {
+            panic!(
+                "job did not complete within timeout (input_channels={}, \
+                 input_fill={input_fill}, weight_fill={weight_fill}): {e}",
+                shape.input_channels
+            )
+        });
+
+        let raw = std::slice::from_raw_parts(buf_c.host_ptr, 256);
+        (0..16)
+            .map(|i| f16_to_f32(u16::from_le_bytes([raw[i * 16], raw[i * 16 + 1]])))
+            .collect()
+    }
+}
+
+/// Real (non-16-aligned-friendly) per-channel fill across every spatial
+/// position -- with a 1x1 kernel this makes the expected output an EXACT
+/// multiple of `conv_fp16_tracks_exact_product`'s own single-channel
+/// result: `input_channels * input_fill * weight_fill`. This is
+/// deliberately a stronger check than "all pixels agree" or "output
+/// changed": if the multi-channel CVT/banking generalization silently
+/// only reads channel 0 (or reads garbage past it), the result would NOT
+/// scale linearly with `input_channels` the way a real per-channel
+/// accumulation must.
+#[test]
+#[ignore = "needs the real NPU device -- cross-compile for aarch64, copy to the board, run there"]
+fn conv_fp16_multi_channel_tracks_exact_product() {
+    for input_channels in [3u32, 16] {
+        let shape = fp16_multi_channel_shape(input_channels);
+        for (input_fill, weight_fill, single_channel_expected) in [
+            (10.5f32, 0.25f32, 2.625f32),
+            (3.0, 2.0, 6.0),
+            (4.0, 4.0, 16.0),
+        ] {
+            let expected = single_channel_expected * input_channels as f32;
+            let pixels = run_multi_channel_conv_fp16(&shape, input_fill, weight_fill);
+            assert!(
+                pixels.iter().all(|&p| p == expected),
+                "input_channels={input_channels}, input_fill={input_fill}, \
+                 weight_fill={weight_fill}: expected all 16 output pixels == \
+                 {expected} exactly ({input_channels} channels x \
+                 {single_channel_expected}), got {pixels:?}"
+            );
+        }
+    }
+}
+
+/// Multi-channel counterpart to `conv_fp16_uniform_fill_pixels_agree` --
+/// guards against a hollow "completes but doesn't really touch channel
+/// data" pass the exact-product test's uniform fill could theoretically
+/// still satisfy by coincidence (e.g. a stuck-at-zero accumulator that
+/// happens to also fail the exact-product check loudly, but a weaker bug
+/// might not).
+#[test]
+#[ignore = "needs the real NPU device -- cross-compile for aarch64, copy to the board, run there"]
+fn conv_fp16_multi_channel_output_tracks_input() {
+    let shape = fp16_multi_channel_shape(3);
+    let low = run_uniform_conv_fp16(&shape, 10.5, 0.25)[0];
+    let high = run_uniform_conv_fp16(&shape, 100.0, 0.25)[0];
+    assert_ne!(
+        low, high,
+        "input_channels=3: output pixel value didn't change between \
+         input_fill=10.5 ({low}) and input_fill=100.0 ({high}) -- suggests \
+         the op isn't really reading the input"
+    );
+}
