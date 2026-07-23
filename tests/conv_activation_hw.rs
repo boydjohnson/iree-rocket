@@ -18,6 +18,18 @@
 //! Same uniform-whole-buffer-fill strategy as `conv_hw.rs` throughout, for
 //! the same reason: sidesteps not knowing the real per-tap weight-buffer
 //! packing order.
+//!
+//! `conv_fp16_relu_*` below is the fp16 counterpart, first real hardware
+//! test of `Activation` combined with `ConvShape::precision =
+//! Precision::Fp16` (see `conv_hw.rs`'s own `conv_fp16_*` tests and
+//! rknpu-spelunking/NOTES.md's fp16 section) -- `DPU_BS_CFG`'s relu bits
+//! and fp16's CVT/OUT_CVT/CPEND-bypass fields are set by independent code
+//! paths in `build_conv_cna_core_dpu_dpu_rdma`, but this combination had
+//! never actually been run on real hardware before these tests. fp16
+//! gets a strictly stronger check here than int8's inequality-based tests
+//! above: real negative/positive accumulator values chosen so the
+//! expected post-relu output is known exactly, not just relative to
+//! `Activation::None`'s own output.
 
 use std::{fs::OpenOptions, mem, os::unix::io::AsRawFd, ptr};
 
@@ -264,5 +276,183 @@ fn conv_3x3_relux_cmp_zero_forces_constant_output() {
          non-constant result here means bs_relux_en/DPU_BS_RELUX_CMP_VALUE \
          isn't actually taking effect on hardware, not just a miscalibrated \
          cmp value"
+    );
+}
+
+//===========================================================================
+// fp16 (`Precision::Fp16`) -- see this file's module doc comment.
+//===========================================================================
+
+/// `rkt-fp16.rs`'s/`conv_hw.rs`'s exact proven fp16 geometry (4x4x1 ->
+/// 4x4x1, 1x1 kernel, stride 1) -- NOT this file's 6x6/3x3 int8 geometry
+/// above, which has never run `Precision::Fp16` on real hardware, and
+/// which `build_conv_regcmd` doesn't even permit for `Fp16` (asserts
+/// `input_channels==1`).
+fn fp16_shape_with_activation(activation: Activation) -> ConvShape {
+    ConvShape {
+        input_width: 4,
+        input_height: 4,
+        input_channels: 1,
+        output_width: 4,
+        output_height: 4,
+        output_channels: 1,
+        weights_width: 1,
+        weights_height: 1,
+        stride: 1,
+        depthwise: false,
+        input_zero_point: 0,
+        output_zero_point: 0,
+        weights_zero_point: 0,
+        input_scale: 1.0,
+        weights_scale: 1.0,
+        output_scale: 1.0,
+        truncate_bits: 0,
+        activation,
+        precision: Precision::Fp16,
+    }
+}
+
+/// Duplicated from `conv_hw.rs`'s own copy (see this file's `run_uniform_conv`
+/// doc comment on why integration tests each carry their own copy).
+fn f16_to_f32(bits: u16) -> f32 {
+    let sign = ((bits >> 15) & 0x1) as u32;
+    let exp = ((bits >> 10) & 0x1f) as u32;
+    let frac = (bits & 0x3ff) as u32;
+    let f32_bits = if exp == 0 {
+        if frac == 0 {
+            sign << 31
+        } else {
+            let subnormal = (frac as f32) * 2f32.powi(-24);
+            return if sign == 1 { -subnormal } else { subnormal };
+        }
+    } else if exp == 0x1f {
+        (sign << 31) | (0xff << 23) | (frac << 13)
+    } else {
+        let new_exp = exp + (127 - 15);
+        (sign << 31) | (new_exp << 23) | (frac << 13)
+    };
+    f32::from_bits(f32_bits)
+}
+
+fn f32_to_f16_bits(v: f32) -> u16 {
+    let bits = v.to_bits();
+    let sign = (bits >> 31) & 0x1;
+    let exp = ((bits >> 23) & 0xff) as i32;
+    let frac = bits & 0x7f_ffff;
+    let new_exp = exp - 127 + 15;
+    assert!((1..31).contains(&new_exp), "value out of easy f16 range");
+    ((sign << 15) | ((new_exp as u32) << 10) | (frac >> 13)) as u16
+}
+
+unsafe fn fill_u16(ptr: *mut u8, byte_len: usize, val: u16) {
+    let slice = unsafe { std::slice::from_raw_parts_mut(ptr as *mut u16, byte_len / 2) };
+    slice.fill(val);
+}
+
+/// fp16 counterpart to `run_uniform_conv`, duplicated from `conv_hw.rs`'s
+/// own `run_uniform_conv_fp16`.
+fn run_uniform_conv_fp16(shape: &ConvShape, input_fill: f32, weight_fill: f32) -> Vec<f32> {
+    let input_bits = f32_to_f16_bits(input_fill);
+    let weight_bits = f32_to_f16_bits(weight_fill);
+
+    let file = OpenOptions::new()
+        .read(true)
+        .write(true)
+        .open(DEVICE_PATH)
+        .expect("failed to open NPU device");
+    let fd = file.as_raw_fd();
+
+    unsafe {
+        let buf_a = Buffer::new(fd, TENSOR_SIZE, &file);
+        fill_u16(buf_a.host_ptr, TENSOR_SIZE, input_bits);
+
+        let buf_w = Buffer::new(fd, TENSOR_SIZE, &file);
+        fill_u16(buf_w.host_ptr, TENSOR_SIZE, weight_bits);
+
+        let buf_bias = Buffer::new(fd, TENSOR_SIZE, &file);
+        ptr::write_bytes(buf_bias.host_ptr, 0, TENSOR_SIZE);
+
+        let buf_c = Buffer::new(fd, TENSOR_SIZE, &file);
+        ptr::write_bytes(buf_c.host_ptr, 0, TENSOR_SIZE);
+
+        let bufs = ConvBuffers {
+            input_addr: buf_a.dma_address,
+            weights_addr: buf_w.dma_address,
+            bias_addr: buf_bias.dma_address,
+            output_addr: buf_c.dma_address,
+        };
+        let cmds = build_conv_regcmd(shape, &bufs);
+
+        let cmd_bytes = cmds.len() * mem::size_of::<u64>();
+        let cmd_len = cmd_bytes.next_multiple_of(4096);
+        let buf_cmd = Buffer::new(fd, cmd_len, &file);
+        let cmd_slice = std::slice::from_raw_parts_mut(buf_cmd.host_ptr as *mut u64, cmds.len());
+        for (i, c) in cmds.iter().enumerate() {
+            cmd_slice[i] = c.0;
+        }
+
+        fini_bo(fd, buf_a.handle).ok();
+        fini_bo(fd, buf_w.handle).ok();
+        fini_bo(fd, buf_bias.handle).ok();
+        fini_bo(fd, buf_c.handle).ok();
+        fini_bo(fd, buf_cmd.handle).ok();
+
+        let in_handles = [buf_cmd.handle, buf_a.handle, buf_w.handle, buf_bias.handle];
+        let out_handles = [buf_c.handle];
+
+        submit(
+            fd,
+            buf_cmd.dma_address,
+            cmds.len() as u32,
+            &in_handles,
+            &out_handles,
+        )
+        .expect("SUBMIT ioctl failed");
+
+        prep_bo(fd, buf_c.handle, 2_000_000_000).unwrap_or_else(|e| {
+            panic!(
+                "job did not complete within timeout (input_fill={input_fill}, \
+                 weight_fill={weight_fill}): {e}"
+            )
+        });
+
+        let raw = std::slice::from_raw_parts(buf_c.host_ptr, 256);
+        (0..16)
+            .map(|i| f16_to_f32(u16::from_le_bytes([raw[i * 16], raw[i * 16 + 1]])))
+            .collect()
+    }
+}
+
+/// Real negative accumulator (`weight_fill=-2.0, input_fill=3.0` ->
+/// `-6.0`, exactly representable, no relu): relu must clamp every pixel
+/// to exactly `0.0`, not just "less than the unclamped value" the way
+/// int8's `conv_3x3_relu_never_decreases_output` has to settle for --
+/// fp16 lets this test know the exact pre-clamp value ahead of time.
+#[test]
+#[ignore = "needs the real NPU device -- cross-compile for aarch64, copy to the board, run there"]
+fn conv_fp16_relu_clamps_negative_to_zero() {
+    let shape = fp16_shape_with_activation(Activation::Relu);
+    let pixels = run_uniform_conv_fp16(&shape, 3.0, -2.0);
+    assert!(
+        pixels.iter().all(|&p| p == 0.0),
+        "weight_fill=-2.0, input_fill=3.0 (unclamped product -6.0): expected \
+         every relu-clamped output pixel == 0.0 exactly, got {pixels:?}"
+    );
+}
+
+/// Counterpart with a genuinely positive accumulator
+/// (`weight_fill=2.0, input_fill=3.0` -> `6.0`): relu must pass it
+/// through completely unchanged, confirming the clamp-to-zero test above
+/// isn't passing for the wrong reason (e.g. relu clamping everything
+/// regardless of sign).
+#[test]
+#[ignore = "needs the real NPU device -- cross-compile for aarch64, copy to the board, run there"]
+fn conv_fp16_relu_passes_positive_unclamped() {
+    let shape = fp16_shape_with_activation(Activation::Relu);
+    let pixels = run_uniform_conv_fp16(&shape, 3.0, 2.0);
+    assert!(
+        pixels.iter().all(|&p| p == 6.0),
+        "weight_fill=2.0, input_fill=3.0: expected every relu-passthrough \
+         output pixel == 6.0 exactly, got {pixels:?}"
     );
 }
