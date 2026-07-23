@@ -21,11 +21,24 @@
 //! rknpu-spelunking's `project_conv_dtype_coverage` memory). Note tag `2`'s
 //! buffers are `u16`-element (2 bytes/pixel) fp16 data, not `u8` int8 --
 //! callers must size/fill bindings accordingly (see
-//! `cts/conv_dispatch_test.cc`). This has nothing to do with any real
-//! serialized executable format; it exists purely so a test harness (which
-//! fully controls `executable_data` itself, since there's no compiler in
-//! the loop) can select which hardcoded ukernel to exercise through the
-//! real HAL API rather than only ever getting conv2d.
+//! `cts/conv_dispatch_test.cc`). Tags `0`/`1`/`2` have nothing to do with
+//! any real serialized executable format; they exist purely so a test
+//! harness (which fully controls `executable_data` itself) can select
+//! which hardcoded ukernel to exercise through the real HAL API.
+//!
+//! **Tag `3` is different: it's the first tag backed by a real, versioned
+//! wire format** (`iree_rocket_hal::rocket::executable_format`, see that
+//! module's own doc comment for the exact byte layout) -- the rest of
+//! `executable_data` after the tag byte is decoded into a real `ConvShape`
+//! via `decode_conv_shape_v1`, then checked via `validate_conv_shape`. This
+//! is real prep for a genuine IREE compiler `TargetBackend` (a separate,
+//! not-yet-written C++ project) to eventually emit: unlike tags `0`-`2`,
+//! this path is fallible -- malformed or unsupported bytes return a real
+//! `IREE_STATUS_INVALID_ARGUMENT`, not a silent fallback to some other
+//! hardcoded shape. Note this validation is deliberately not exhaustive of
+//! every panic reachable from `build_conv_regcmd` -- see
+//! `command_buffer.rs`'s `catch_unwind` wrapper around that call for the
+//! backstop covering whatever gap remains.
 
 use crate::bindings::{
     iree_const_byte_span_t, iree_hal_executable_cache_t, iree_hal_executable_cache_vtable_t,
@@ -34,6 +47,9 @@ use crate::bindings::{
 };
 use crate::executable::UkernelShape;
 use crate::status;
+use iree_rocket_hal::rocket::executable_format::{
+    CONV2D_V1_TAG, decode_conv_shape_v1, validate_conv_shape,
+};
 use iree_rocket_hal::rocket::regcmd::{
     Activation, ConvShape, PoolingMethod, PoolingShape, Precision,
 };
@@ -103,6 +119,31 @@ unsafe extern "C" fn prepare_executable(
     } else {
         0
     };
+
+    if tag == CONV2D_V1_TAG {
+        let payload = if data.data_length >= 1 {
+            unsafe { std::slice::from_raw_parts(data.data.add(1), data.data_length as usize - 1) }
+        } else {
+            &[]
+        };
+        let shape = match decode_conv_shape_v1(payload) {
+            Ok(shape) => shape,
+            Err(_) => {
+                return status::from_code(
+                    crate::bindings::iree_status_code_e_IREE_STATUS_INVALID_ARGUMENT as u32,
+                );
+            }
+        };
+        if validate_conv_shape(&shape).is_err() {
+            return status::from_code(
+                crate::bindings::iree_status_code_e_IREE_STATUS_INVALID_ARGUMENT as u32,
+            );
+        }
+        unsafe {
+            *out_executable = crate::executable::create(UkernelShape::Conv2d(shape));
+        }
+        return status::ok();
+    }
 
     let shape = match tag {
         1 => UkernelShape::Pooling(PoolingShape {

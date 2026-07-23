@@ -6,11 +6,29 @@
 //! it touches, see `RecordedOp::Dispatch`) on the command buffer, to be
 //! submitted as one job by `device::queue_execute`.
 //!
-//! Binding convention (since there's no real compiler emitting a binding
-//! layout yet -- see executable.rs's module doc comment) is per-ukernel-
-//! kind: `Conv2d` is binding 0 = input, 1 = weights, 2 = bias, 3 = output;
-//! `Pooling` is binding 0 = input, 1 = output (no weights/bias). Entirely a
-//! placeholder of our own choosing, not derived from anything.
+//! Binding convention is per-ukernel-kind: `Conv2d` is binding 0 = input,
+//! 1 = weights, 2 = bias, 3 = output; `Pooling` is binding 0 = input,
+//! 1 = output (no weights/bias). This started as an arbitrary placeholder
+//! of our own choosing (no real compiler emitted a binding layout), but as
+//! of `executable_cache.rs`'s tag `3` (a real, versioned wire format for
+//! `ConvShape`, see that module's doc comment and
+//! `iree_rocket_hal::rocket::executable_format`), it's a **frozen
+//! cross-repo ABI contract**: a real IREE compiler `TargetBackend` (not
+//! part of this crate, not yet written) would need to emit dispatches
+//! respecting this exact binding order, since nothing here validates
+//! binding *semantics* -- only binding *count* is checked (see the
+//! `bindings.count < 4`/`< 2` guards below).
+//!
+//! `Conv2d`'s `build_conv_regcmd` call is wrapped in `catch_unwind` (see
+//! below) as a backstop: `executable_cache.rs`'s `validate_conv_shape` is
+//! deliberately not proven exhaustive of every panic reachable from
+//! `build_conv_regcmd` (some of its internal `assert!`s, and every
+//! register-field `Bits::<N>::new` bit-width check, are gated on formulas
+//! derived from the shape rather than direct fields) -- without this,
+//! any validation gap would abort the whole host process (an unwind
+//! crossing a plain `extern "C"` boundary calls `process::abort()` since
+//! Rust 1.71, uncatchable as an IREE status) instead of failing this one
+//! dispatch gracefully.
 //!
 //! Only supports recording exactly one `dispatch` per command buffer right
 //! now (matches every current `build_*_regcmd` function's own single-
@@ -438,10 +456,10 @@ unsafe extern "C" fn dispatch(
         |r: &iree_hal_buffer_ref_t| unsafe { (*(r.buffer as *mut RocketBuffer)).dma_address };
     let handle = |r: &iree_hal_buffer_ref_t| unsafe { (*(r.buffer as *mut RocketBuffer)).handle };
 
-    // Binding convention (still entirely this driver's own choosing, no
-    // real compiler emits a layout -- see executable.rs's module doc
-    // comment): per-ukernel-kind, since each kind's regcmd builder needs a
-    // different set of buffers.
+    // Binding convention: per-ukernel-kind, since each kind's regcmd
+    // builder needs a different set of buffers -- see module doc comment
+    // for why this is now a frozen cross-repo ABI contract, not just a
+    // placeholder.
     match shape {
         UkernelShape::Conv2d(shape) => {
             if bindings.count < 4 {
@@ -456,8 +474,23 @@ unsafe extern "C" fn dispatch(
                 bias_addr: addr(&refs[2]),
                 output_addr: addr(&refs[3]),
             };
+            // catch_unwind backstop -- see module doc comment for exactly
+            // why. Safe to assert unwind-safety here: build_conv_regcmd
+            // only builds and returns a fresh local Vec<RegCmd>, so a
+            // panic mid-build just drops that local value -- no shared or
+            // global state is left half-mutated.
+            let regcmd = match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                build_conv_regcmd(shape, &bufs)
+            })) {
+                Ok(regcmd) => regcmd,
+                Err(_) => {
+                    return status::from_code(
+                        crate::bindings::iree_status_code_e_IREE_STATUS_INTERNAL as u32,
+                    );
+                }
+            };
             cb.ops.push(RecordedOp::Dispatch {
-                regcmd: build_conv_regcmd(shape, &bufs),
+                regcmd,
                 in_bo_handles: vec![handle(&refs[0]), handle(&refs[1]), handle(&refs[2])],
                 out_bo_handles: vec![handle(&refs[3])],
             });

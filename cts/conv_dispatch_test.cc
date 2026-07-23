@@ -19,6 +19,22 @@
 // Precision::Fp16 correctly through this driver's own dispatch path, not
 // re-deriving the recipe.
 //
+// The tag=3 tests exercise the real, versioned wire format
+// (iree_rocket_hal::rocket::executable_format -- see that module's doc
+// comment for the exact byte layout `EncodeConv2dV1` below mirrors) added
+// as prep work for a genuine IREE compiler TargetBackend: a valid-shape
+// end-to-end dispatch, a malformed-payload rejection at
+// prepare_executable time, a validate_conv_shape-rejected shape (also at
+// prepare_executable time), and -- the one thing this crate's own Rust
+// tests can't prove without a hardware round trip through this exact HAL
+// path -- the command_buffer.rs `catch_unwind` backstop actually
+// converting a panic into a graceful failing status instead of aborting
+// this test binary, using the exact shape
+// iree-rocket-hal::rocket::executable_format's own test suite already
+// confirmed (a) passes validate_conv_shape and (b) empirically panics in
+// build_conv_regcmd (see that module's
+// `weight_bytes_per_kernel_overflow_shape_actually_panics` test).
+//
 // Built by the same CMake path as pooling_dispatch_test.cc
 // (cts/CMakeLists.txt) -- links against a real, compiled IREE runtime.
 
@@ -183,13 +199,83 @@ uint16_t F32ToF16Bits(float v) {
                                (frac >> 13));
 }
 
+// Mirrors iree_rocket_hal::rocket::executable_format::encode_conv_shape_v1's
+// defaults conceptually -- a ConvShape with the same field values as this
+// file's/rkt-basic.rs's known-good int8 4x4x1, 1x1-kernel baseline.
+// activation_tag/precision_tag are the wire format's OWN tags (0=None/
+// Relu/Relux and 0=Int8/1=Fp16 respectively -- NOT Precision's internal
+// hardware-register encoding), matching that module's doc comment.
+struct Conv2dV1Shape {
+  uint32_t input_width = 4;
+  uint32_t input_height = 4;
+  uint32_t input_channels = 1;
+  uint32_t output_width = 4;
+  uint32_t output_height = 4;
+  uint32_t output_channels = 1;
+  uint32_t weights_width = 1;
+  uint32_t weights_height = 1;
+  uint32_t stride = 1;
+  bool depthwise = false;
+  uint32_t input_zero_point = 0;
+  uint32_t output_zero_point = 0;
+  uint32_t weights_zero_point = 0;
+  float input_scale = 1.0f;
+  float weights_scale = 1.0f;
+  float output_scale = 1.0f;
+  uint32_t truncate_bits = 0;
+  uint32_t activation_tag = 0;   // 0=None, 1=Relu, 2=Relux
+  uint32_t activation_cmp = 0;
+  uint32_t precision_tag = 0;    // 0=Int8, 1=Fp16
+};
+
+// Encodes `s` per iree_rocket_hal::rocket::executable_format's documented
+// byte layout (format_version + 20 u32-sized fields, all little-endian) --
+// the payload AFTER the outer tag byte; callers prepend tag=3 themselves
+// (see CONV2D_V1_TAG in that module).
+std::vector<uint8_t> EncodeConv2dV1(const Conv2dV1Shape& s) {
+  std::vector<uint8_t> out;
+  auto push_u32 = [&](uint32_t v) {
+    for (int i = 0; i < 4; ++i) out.push_back(static_cast<uint8_t>((v >> (8 * i)) & 0xff));
+  };
+  auto push_f32 = [&](float v) {
+    uint32_t bits;
+    memcpy(&bits, &v, sizeof(bits));
+    push_u32(bits);
+  };
+  push_u32(1);  // format_version
+  push_u32(s.input_width);
+  push_u32(s.input_height);
+  push_u32(s.input_channels);
+  push_u32(s.output_width);
+  push_u32(s.output_height);
+  push_u32(s.output_channels);
+  push_u32(s.weights_width);
+  push_u32(s.weights_height);
+  push_u32(s.stride);
+  push_u32(s.depthwise ? 1 : 0);
+  push_u32(s.input_zero_point);
+  push_u32(s.output_zero_point);
+  push_u32(s.weights_zero_point);
+  push_f32(s.input_scale);
+  push_f32(s.weights_scale);
+  push_f32(s.output_scale);
+  push_u32(s.truncate_bits);
+  push_u32(s.activation_tag);
+  push_u32(s.activation_cmp);
+  push_u32(s.precision_tag);
+  return out;
+}
+
 // Runs the Conv2d ukernel (executable_cache.rs's tag-byte convention) end
 // to end through the real command-buffer/dispatch/queue_execute path.
-// `tag` selects which hardcoded ConvShape (0=int8, 2=fp16 -- see that
-// module's doc comment); `input`/`weights` are the raw byte contents this
-// test wants in those two buffers, uniformly filled by the caller so the
-// real per-pixel packing stride doesn't need to be known.
-std::vector<uint8_t> RunConv(iree_hal_device_t* device, uint8_t tag,
+// `executable_data` is the full byte span this test wants
+// iree_hal_executable_params_t to carry -- for tags 0/2 that's just the
+// one tag byte; for tag=3 it's the tag byte followed by an
+// EncodeConv2dV1-produced payload. `input`/`weights` are the raw byte
+// contents this test wants in those two buffers, uniformly filled by the
+// caller so the real per-pixel packing stride doesn't need to be known.
+std::vector<uint8_t> RunConv(iree_hal_device_t* device,
+                             const std::vector<uint8_t>& executable_data,
                              iree_hal_buffer_t* input, iree_hal_buffer_t* weights) {
   constexpr iree_device_size_t kSize = 4096;
   iree_hal_buffer_t* bias = AllocateAndFill(device, kSize, 0);
@@ -202,7 +288,8 @@ std::vector<uint8_t> RunConv(iree_hal_device_t* device, uint8_t tag,
   iree_hal_executable_params_t exec_params;
   memset(&exec_params, 0, sizeof(exec_params));
   exec_params.executable_format = iree_make_cstring_view("");
-  exec_params.executable_data = iree_make_const_byte_span(&tag, 1);
+  exec_params.executable_data =
+      iree_make_const_byte_span(executable_data.data(), executable_data.size());
   iree_hal_executable_t* executable = nullptr;
   CheckOk(iree_hal_executable_cache_prepare_executable(cache, &exec_params, &executable),
           "iree_hal_executable_cache_prepare_executable");
@@ -285,7 +372,7 @@ float RunConvFp16(iree_hal_device_t* device, float input_fill, float weight_fill
   constexpr iree_device_size_t kSize = 4096;
   iree_hal_buffer_t* input = AllocateAndFillU16(device, kSize, F32ToF16Bits(input_fill));
   iree_hal_buffer_t* weights = AllocateAndFillU16(device, kSize, F32ToF16Bits(weight_fill));
-  std::vector<uint8_t> raw = RunConv(device, /*tag=*/2, input, weights);
+  std::vector<uint8_t> raw = RunConv(device, /*executable_data=*/{2}, input, weights);
   iree_hal_buffer_release(input);
   iree_hal_buffer_release(weights);
   uint16_t bits = static_cast<uint16_t>(raw[0]) | (static_cast<uint16_t>(raw[1]) << 8);
@@ -342,10 +429,214 @@ TEST(RocketConvDispatch, Int8DefaultShapeCompletes) {
   constexpr iree_device_size_t kSize = 4096;
   iree_hal_buffer_t* input = AllocateAndFill(device, kSize, 200);
   iree_hal_buffer_t* weights = AllocateAndFill(device, kSize, 2);
-  std::vector<uint8_t> raw = RunConv(device, /*tag=*/0, input, weights);
+  std::vector<uint8_t> raw = RunConv(device, /*executable_data=*/{0}, input, weights);
   iree_hal_buffer_release(input);
   iree_hal_buffer_release(weights);
   (void)raw;  // Dispatch completing without CheckOk aborting is the assertion.
+
+  iree_hal_device_release(device);
+  iree_hal_driver_release(driver);
+}
+
+TEST(RocketConvDispatch, Tag3ValidShapeDispatchesCorrectly) {
+  iree_hal_driver_t* driver = nullptr;
+  iree_hal_device_t* device = nullptr;
+  std::string error;
+  if (!CreateDevice(&driver, &device, &error)) {
+    GTEST_SKIP() << "rocket device unavailable: " << error;
+  }
+
+  // A real, versioned-wire-format-encoded shape (not one of tag 0/2's
+  // hardcoded literals) -- proves decode_conv_shape_v1/validate_conv_shape
+  // thread a genuinely-parsed ConvShape through prepare_executable and
+  // command_buffer.rs's existing Conv2d binding code correctly. Same
+  // non-assertive-value caution as Int8DefaultShapeCompletes above (the
+  // open identity-weight precision bug) -- this test's job is proving
+  // tag=3 dispatches at all, not the numeric question.
+  std::vector<uint8_t> executable_data = {3};
+  std::vector<uint8_t> payload = EncodeConv2dV1(Conv2dV1Shape{});
+  executable_data.insert(executable_data.end(), payload.begin(), payload.end());
+
+  constexpr iree_device_size_t kSize = 4096;
+  iree_hal_buffer_t* input = AllocateAndFill(device, kSize, 200);
+  iree_hal_buffer_t* weights = AllocateAndFill(device, kSize, 2);
+  std::vector<uint8_t> raw = RunConv(device, executable_data, input, weights);
+  iree_hal_buffer_release(input);
+  iree_hal_buffer_release(weights);
+  (void)raw;  // Dispatch completing without CheckOk aborting is the assertion.
+
+  iree_hal_device_release(device);
+  iree_hal_driver_release(driver);
+}
+
+TEST(RocketConvDispatch, Tag3RejectsTruncatedPayload) {
+  iree_hal_driver_t* driver = nullptr;
+  iree_hal_device_t* device = nullptr;
+  std::string error;
+  if (!CreateDevice(&driver, &device, &error)) {
+    GTEST_SKIP() << "rocket device unavailable: " << error;
+  }
+
+  // Regression proof that prepare_executable is no longer infallible for
+  // tag=3: a payload far shorter than decode_conv_shape_v1's expected 84
+  // bytes must return a real failing status, not silently succeed (the
+  // way tags 0/1/2 always do, since they ignore executable_data entirely
+  // beyond the tag byte).
+  std::vector<uint8_t> executable_data = {3, 1, 2, 3};  // tag=3, 3 garbage bytes.
+
+  iree_hal_executable_cache_t* cache = nullptr;
+  CheckOk(iree_hal_executable_cache_create(device, iree_make_cstring_view("test"), &cache),
+          "iree_hal_executable_cache_create");
+  iree_hal_executable_params_t exec_params;
+  memset(&exec_params, 0, sizeof(exec_params));
+  exec_params.executable_format = iree_make_cstring_view("");
+  exec_params.executable_data =
+      iree_make_const_byte_span(executable_data.data(), executable_data.size());
+  iree_hal_executable_t* executable = nullptr;
+  iree_status_t status =
+      iree_hal_executable_cache_prepare_executable(cache, &exec_params, &executable);
+  EXPECT_FALSE(iree_status_is_ok(status))
+      << "prepare_executable should reject a truncated tag=3 payload, not succeed";
+  // prepare_executable never writes *out_executable on the error path
+  // (see executable_cache.rs), so there's nothing to release here.
+  (void)executable;
+  iree_status_free(status);
+  iree_hal_executable_cache_release(cache);
+
+  iree_hal_device_release(device);
+  iree_hal_driver_release(driver);
+}
+
+TEST(RocketConvDispatch, Tag3RejectsShapeFailingValidation) {
+  iree_hal_driver_t* driver = nullptr;
+  iree_hal_device_t* device = nullptr;
+  std::string error;
+  if (!CreateDevice(&driver, &device, &error)) {
+    GTEST_SKIP() << "rocket device unavailable: " << error;
+  }
+
+  // weights_width=64 exceeds CNA_WEIGHT_SIZE2's 5-bit field width (max
+  // 31) -- validate_conv_shape rejects this at prepare_executable time,
+  // per iree_rocket_hal::rocket::executable_format's own
+  // validate_rejects_oversized_weights unit test.
+  Conv2dV1Shape s;
+  s.weights_width = 64;
+  std::vector<uint8_t> executable_data = {3};
+  std::vector<uint8_t> payload = EncodeConv2dV1(s);
+  executable_data.insert(executable_data.end(), payload.begin(), payload.end());
+
+  iree_hal_executable_cache_t* cache = nullptr;
+  CheckOk(iree_hal_executable_cache_create(device, iree_make_cstring_view("test"), &cache),
+          "iree_hal_executable_cache_create");
+  iree_hal_executable_params_t exec_params;
+  memset(&exec_params, 0, sizeof(exec_params));
+  exec_params.executable_format = iree_make_cstring_view("");
+  exec_params.executable_data =
+      iree_make_const_byte_span(executable_data.data(), executable_data.size());
+  iree_hal_executable_t* executable = nullptr;
+  iree_status_t status =
+      iree_hal_executable_cache_prepare_executable(cache, &exec_params, &executable);
+  EXPECT_FALSE(iree_status_is_ok(status))
+      << "prepare_executable should reject weights_width=64 (exceeds the 5-bit field width)";
+  // prepare_executable never writes *out_executable on the error path
+  // (see executable_cache.rs), so there's nothing to release here.
+  (void)executable;
+  iree_status_free(status);
+  iree_hal_executable_cache_release(cache);
+
+  iree_hal_device_release(device);
+  iree_hal_driver_release(driver);
+}
+
+TEST(RocketConvDispatch, Tag3CatchUnwindBackstopConvertsGracefully) {
+  iree_hal_driver_t* driver = nullptr;
+  iree_hal_device_t* device = nullptr;
+  std::string error;
+  if (!CreateDevice(&driver, &device, &error)) {
+    GTEST_SKIP() << "rocket device unavailable: " << error;
+  }
+
+  // The exact shape iree_rocket_hal::rocket::executable_format's own test
+  // suite confirms (a) PASSES validate_conv_shape (every individual field
+  // is within the bounds that function checks) and (b) empirically
+  // panics inside build_conv_regcmd anyway -- weights_width * weights_
+  // height * task_input_channels overflows CNA_WEIGHT_SIZE1's 19-bit
+  // weight_bytes_per_kernel field, a product validate_conv_shape
+  // deliberately doesn't re-derive (see that module's own doc comment).
+  // prepare_executable must therefore SUCCEED here; the failure this test
+  // proves happens one step later, in command_buffer.rs's dispatch(),
+  // where the catch_unwind wrapper around build_conv_regcmd must convert
+  // the panic into a real failing status instead of aborting this test
+  // binary.
+  Conv2dV1Shape s;
+  s.input_width = 1;
+  s.input_height = 4;
+  s.input_channels = 65520;
+  s.output_width = 4;
+  s.output_height = 4;
+  s.output_channels = 1;
+  s.weights_width = 31;
+  s.weights_height = 31;
+  std::vector<uint8_t> executable_data = {3};
+  std::vector<uint8_t> payload = EncodeConv2dV1(s);
+  executable_data.insert(executable_data.end(), payload.begin(), payload.end());
+
+  constexpr iree_device_size_t kSize = 4096;
+  iree_hal_buffer_t* input = AllocateAndFill(device, kSize, 1);
+  iree_hal_buffer_t* weights = AllocateAndFill(device, kSize, 1);
+  iree_hal_buffer_t* bias = AllocateAndFill(device, kSize, 0);
+  iree_hal_buffer_t* output = AllocateAndFill(device, kSize, 0);
+
+  iree_hal_executable_cache_t* cache = nullptr;
+  CheckOk(iree_hal_executable_cache_create(device, iree_make_cstring_view("test"), &cache),
+          "iree_hal_executable_cache_create");
+  iree_hal_executable_params_t exec_params;
+  memset(&exec_params, 0, sizeof(exec_params));
+  exec_params.executable_format = iree_make_cstring_view("");
+  exec_params.executable_data =
+      iree_make_const_byte_span(executable_data.data(), executable_data.size());
+  iree_hal_executable_t* executable = nullptr;
+  CheckOk(iree_hal_executable_cache_prepare_executable(cache, &exec_params, &executable),
+          "iree_hal_executable_cache_prepare_executable (this shape must pass validation)");
+
+  iree_hal_command_buffer_t* cb = nullptr;
+  CheckOk(iree_hal_command_buffer_create(device, IREE_HAL_COMMAND_BUFFER_MODE_ONE_SHOT,
+                                          IREE_HAL_COMMAND_CATEGORY_DISPATCH,
+                                          IREE_HAL_QUEUE_AFFINITY_ANY,
+                                          /*binding_capacity=*/0, &cb),
+          "iree_hal_command_buffer_create");
+  CheckOk(iree_hal_command_buffer_begin(cb), "iree_hal_command_buffer_begin");
+
+  iree_hal_buffer_ref_t refs[4] = {
+      iree_hal_make_buffer_ref(input, 0, kSize),
+      iree_hal_make_buffer_ref(weights, 0, kSize),
+      iree_hal_make_buffer_ref(bias, 0, kSize),
+      iree_hal_make_buffer_ref(output, 0, kSize),
+  };
+  iree_hal_buffer_ref_list_t bindings;
+  bindings.count = 4;
+  bindings.values = refs;
+  iree_hal_dispatch_config_t config;
+  memset(&config, 0, sizeof(config));
+  config.workgroup_count[0] = 1;
+  config.workgroup_count[1] = 1;
+  config.workgroup_count[2] = 1;
+  iree_hal_executable_function_t function;
+  function.value = 0;
+  iree_status_t dispatch_status = iree_hal_command_buffer_dispatch(
+      cb, executable, function, config, iree_const_byte_span_empty(), bindings,
+      IREE_HAL_DISPATCH_FLAG_NONE);
+  EXPECT_FALSE(iree_status_is_ok(dispatch_status))
+      << "dispatch should fail gracefully (catch_unwind backstop) rather than succeed or abort";
+  iree_status_free(dispatch_status);
+
+  iree_hal_command_buffer_release(cb);
+  iree_hal_executable_release(executable);
+  iree_hal_executable_cache_release(cache);
+  iree_hal_buffer_release(input);
+  iree_hal_buffer_release(weights);
+  iree_hal_buffer_release(bias);
+  iree_hal_buffer_release(output);
 
   iree_hal_device_release(device);
   iree_hal_driver_release(driver);
