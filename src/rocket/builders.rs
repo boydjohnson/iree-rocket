@@ -74,6 +74,19 @@ impl<R: RegisterMeta> Register<R> {
         }
     }
 
+    /// Seeds the builder from an already-encoded register value instead of
+    /// starting at 0 -- lets a caller round-trip a register a builder
+    /// didn't originally construct (e.g. patching one field of an
+    /// existing `RegCmd` from `build_conv_regcmd`'s output) through the
+    /// same typed setters as a fresh `new()`, preserving every other
+    /// field already present in `val`.
+    pub fn from_val(val: u32) -> Self {
+        Self {
+            val,
+            _marker: PhantomData,
+        }
+    }
+
     pub fn build(self) -> RegCmd {
         RegCmd::new(R::DOMAIN, R::OFFSET, self.val)
     }
