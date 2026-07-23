@@ -29,7 +29,7 @@ use iree_rocket_hal::rocket::{
     device::{Buffer, fini_bo, prep_bo, submit},
     regcmd::{
         Activation, ConvShape, ConvThenPoolingBuffers, PipelinedPoolingShape, PoolingMethod,
-        build_conv_then_pooling_regcmd,
+        Precision, build_conv_then_pooling_regcmd,
     },
 };
 
@@ -57,6 +57,7 @@ fn conv_shape() -> ConvShape {
         output_scale: 1.0,
         truncate_bits: 0,
         activation: Activation::None,
+        precision: Precision::Int8,
     }
 }
 

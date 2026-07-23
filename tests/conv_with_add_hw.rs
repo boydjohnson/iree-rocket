@@ -34,7 +34,7 @@ use std::{fs::OpenOptions, mem, os::unix::io::AsRawFd, ptr};
 use iree_rocket_hal::rocket::{
     device::{Buffer, fini_bo, prep_bo, submit},
     regcmd::{
-        Activation, AddTensor, ConvBuffers, ConvShape, build_conv_regcmd,
+        Activation, AddTensor, ConvBuffers, ConvShape, Precision, build_conv_regcmd,
         build_conv_with_add_regcmd,
     },
 };
@@ -62,6 +62,7 @@ fn conv_shape() -> ConvShape {
         output_scale: 1.0,
         truncate_bits: 0,
         activation: Activation::None,
+        precision: Precision::Int8,
     }
 }
 

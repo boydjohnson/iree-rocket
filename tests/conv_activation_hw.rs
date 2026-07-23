@@ -23,7 +23,7 @@ use std::{fs::OpenOptions, mem, os::unix::io::AsRawFd, ptr};
 
 use iree_rocket_hal::rocket::{
     device::{Buffer, fini_bo, prep_bo, submit},
-    regcmd::{Activation, ConvBuffers, ConvShape, build_conv_regcmd},
+    regcmd::{Activation, ConvBuffers, ConvShape, Precision, build_conv_regcmd},
 };
 
 const DEVICE_PATH: &str = "/dev/accel/accel0";
@@ -51,6 +51,7 @@ fn shape_with_activation(activation: Activation) -> ConvShape {
         output_scale: 1.0,
         truncate_bits: 0,
         activation,
+        precision: Precision::Int8,
     }
 }
 

@@ -37,7 +37,8 @@ use std::{fs::OpenOptions, mem, os::unix::io::AsRawFd, ptr};
 use iree_rocket_hal::rocket::{
     device::{Buffer, close_bo, fini_bo, prep_bo, submit_tasks},
     regcmd::{
-        Activation, ConvShape, ConvThenLutBuffers, LutShape, LutTable, build_conv_then_lut_regcmd,
+        Activation, ConvShape, ConvThenLutBuffers, LutShape, LutTable, Precision,
+        build_conv_then_lut_regcmd,
     },
 };
 
@@ -64,6 +65,7 @@ fn conv_shape() -> ConvShape {
         output_scale: 1.0,
         truncate_bits: 0,
         activation: Activation::None,
+        precision: Precision::Int8,
     }
 }
 

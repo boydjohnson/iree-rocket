@@ -32,7 +32,7 @@ use std::{fs::OpenOptions, mem, os::unix::io::AsRawFd, ptr};
 use iree_rocket_hal::rocket::{
     device::{Buffer, close_bo, fini_bo, prep_bo, submit},
     regcmd::{
-        Activation, ConvShape, PoolingMethod, PoolingShape, PoolingViaBypassBuffers,
+        Activation, ConvShape, PoolingMethod, PoolingShape, PoolingViaBypassBuffers, Precision,
         build_pooling_via_dpu_bypass_regcmd,
     },
 };
@@ -66,6 +66,7 @@ fn bypass_shape() -> ConvShape {
         output_scale: 1.0,
         truncate_bits: 0,
         activation: Activation::None,
+        precision: Precision::Int8,
     }
 }
 

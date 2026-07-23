@@ -68,6 +68,54 @@ pub enum Activation {
     },
 }
 
+/// Which numeric domain a conv op computes in. Hardware-validated:
+/// `Int8` by essentially every hw test in this repo; `Fp16` by
+/// `rkt-fp16.rs`'s round-7 recipe (rknpu-spelunking/NOTES.md's
+/// "Attempted real fp16 dispatch on hardware" section through its
+/// resolution) -- a real, non-uniform weight/input pair (`0.25 * 10.5`)
+/// computing a bit-exact correct product (`2.625`) on real hardware.
+///
+/// `Fp16` is only wired up for the `input_channels == 1` path below --
+/// every fp16 hardware test used that shape, and the multi-channel
+/// branch's CVT convention (already its own distinct code path for
+/// int8) was never independently re-derived or validated for fp16.
+/// `build_conv_cna_core_dpu_dpu_rdma` asserts this rather than silently
+/// emitting untested output for it, matching this file's existing
+/// convention for other untested shape combinations (see the module doc
+/// comment's "wide atomic" note).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Precision {
+    Int8,
+    Fp16,
+}
+
+impl Precision {
+    /// Bytes per element -- scales the byte-footprint-only fields
+    /// (`CNA_WEIGHT_SIZE0/1`) that Mesa's original `fill_task()` formula
+    /// assumes are always 1 byte/element. Flagged as an open question in
+    /// early fp16 rounds ("not patched or ruled out"), later confirmed
+    /// load-bearing once a real, non-uniform weight/input pair exposed
+    /// it (a uniformly-filled weight buffer can't distinguish a wrong
+    /// byte count from a correct one).
+    fn bytes_per_element(self) -> u32 {
+        match self {
+            Precision::Int8 => 1,
+            Precision::Fp16 => 2,
+        }
+    }
+
+    /// The shared 3-bit precision enum `CNA_CONV_CON1`/`CORE_MISC_CFG`
+    /// use, which also matches `DPU_DATA_FORMAT`/`DPU_RDMA_FEATURE_
+    /// MODE_CFG`'s own wider 6-value enum for every value in use here
+    /// (int8=0, fp16=2 in both) -- per TRM chapter36.txt.
+    fn enum_value(self) -> u32 {
+        match self {
+            Precision::Int8 => 0,
+            Precision::Fp16 => 2,
+        }
+    }
+}
+
 /// A DPU LUT (piecewise lookup table) configuration, as used by
 /// `build_lut_regcmd`. Confirmed via `rknpu-spelunking/NOTES.md`'s
 /// "Decoding the DPU LUT block: sigmoid/tanh regcmd capture" section --
@@ -440,6 +488,7 @@ pub struct ConvShape {
     pub output_scale: f32,
     pub truncate_bits: u32,
     pub activation: Activation,
+    pub precision: Precision,
 }
 
 /// DMA addresses for the four buffers a single-task conv op needs.
@@ -516,6 +565,14 @@ fn build_conv_cna_core_dpu_dpu_rdma(
         "build_conv_regcmd: input_channels==1 && output_channels>1 needs \
          fill_task()'s \"wide atomic\" branch, not implemented here (no \
          current client's shape exercises it)"
+    );
+    assert!(
+        shape.precision == Precision::Int8 || input_channels_real_is_one,
+        "build_conv_regcmd: Precision::Fp16 is only hardware-validated for \
+         the single-input-channel path (see Precision's own doc comment) \
+         -- input_channels={} needs the multi-channel CVT convention \
+         independently re-derived and validated for fp16 first",
+        shape.input_channels
     );
 
     // rkt_ml.h geometry constants.
@@ -640,6 +697,9 @@ fn build_conv_cna_core_dpu_dpu_rdma(
     if shape.depthwise {
         conv_con1_builder.conv_mode(Bits::new(3));
     }
+    conv_con1_builder
+        .in_precision(Bits::new(shape.precision.enum_value()))
+        .proc_precision(Bits::new(shape.precision.enum_value()));
     cmds.push(conv_con1_builder.build());
 
     cmds.push(
@@ -693,17 +753,22 @@ fn build_conv_cna_core_dpu_dpu_rdma(
             .build(),
     );
 
+    let bpe = shape.precision.bytes_per_element();
     cmds.push(
         Register::<CnaWeightSize0>::new()
             .weight_bytes(Bits::new(
-                shape.weights_width * shape.weights_height * task_input_channels * weights_kernels,
+                shape.weights_width
+                    * shape.weights_height
+                    * task_input_channels
+                    * weights_kernels
+                    * bpe,
             ))
             .build(),
     );
     cmds.push(
         Register::<CnaWeightSize1>::new()
             .weight_bytes_per_kernel(Bits::new(
-                shape.weights_width * shape.weights_height * task_input_channels,
+                shape.weights_width * shape.weights_height * task_input_channels * bpe,
             ))
             .build(),
     );
@@ -723,7 +788,7 @@ fn build_conv_cna_core_dpu_dpu_rdma(
             .build(),
     );
 
-    if input_channels_real_is_one {
+    if input_channels_real_is_one && shape.precision == Precision::Int8 {
         const CVT_TRUNCATE: u32 = 14;
         const CVT_SCALE: u32 = 16384;
         const CVT_OFFSET: u32 = 65408;
@@ -760,6 +825,13 @@ fn build_conv_cna_core_dpu_dpu_rdma(
                 .build(),
         );
     } else {
+        // Two cases share this bypassed-CVT convention: the multi-channel
+        // int8 branch (its own original use), and single-channel Fp16
+        // (round 5's diff against real `conv.rknn` ground truth found
+        // this exact recipe -- `cvt_bypass=1, data_sign=1, cvt_type=1`
+        // on CON0, `cvt_scale=1, cvt_offset=0` on CON1-4 -- byte-for-byte
+        // identical to what the real compiler already emits here, no
+        // separate fp16-specific formula needed).
         cmds.push(
             Register::<CnaCvtCon0>::new()
                 .data_sign(Bits::new(1))
@@ -856,15 +928,22 @@ fn build_conv_cna_core_dpu_dpu_rdma(
     cmds.push(zero::<CnaDcompAmount14>());
     cmds.push(zero::<CnaDcompAmount15>());
 
-    cmds.push(if input_channels_real_is_one {
-        Register::<CnaCvtCon5>::new()
-            .per_channel_cvt_en(Bits::new(65535))
-            .build()
-    } else {
-        zero::<CnaCvtCon5>()
-    });
+    cmds.push(
+        if input_channels_real_is_one && shape.precision == Precision::Int8 {
+            Register::<CnaCvtCon5>::new()
+                .per_channel_cvt_en(Bits::new(65535))
+                .build()
+        } else {
+            zero::<CnaCvtCon5>()
+        },
+    );
 
-    let mut pad_con1 = if shape.weights_width >= 3 && shape.input_zero_point == 0 {
+    // Fp16's ground truth (round 5) has PAD_CON1 at a plain 0 -- the
+    // int8-only zero-point-centering convention below doesn't apply once
+    // CVT is genuinely bypassed.
+    let mut pad_con1 = if shape.precision == Precision::Fp16 {
+        0
+    } else if shape.weights_width >= 3 && shape.input_zero_point == 0 {
         0xffff8080u32
     } else {
         shape.input_zero_point.wrapping_sub(0x80)
@@ -883,7 +962,12 @@ fn build_conv_cna_core_dpu_dpu_rdma(
     // ========================================================================
 
     let mut misc_cfg_builder = Register::<CoreMiscCfg>::new();
-    misc_cfg_builder.qd_en(Bits::new(1));
+    // qd_en is int8-quantization-specific -- real fp16 ground truth
+    // (round 5) has it clear.
+    if shape.precision == Precision::Int8 {
+        misc_cfg_builder.qd_en(Bits::new(1));
+    }
+    misc_cfg_builder.proc_precision(Bits::new(shape.precision.enum_value()));
     if shape.depthwise {
         misc_cfg_builder.dw_en(Bits::new(1));
     }
@@ -920,7 +1004,20 @@ fn build_conv_cna_core_dpu_dpu_rdma(
     }
     cmds.push(feat_mode_builder.build());
 
-    cmds.push(zero::<DpuDataFormat>());
+    // build_conv_regcmd used to hardcode int8 here regardless of what CNA
+    // says -- confirmed wrong for non-int8 by the real conv_w16a16i.rknn
+    // capture (Step 1 of the dtype-coverage investigation) and by
+    // conv.rknn's own fp16-shaped ground truth (round 5): the real
+    // compiler sets all three precision fields here too.
+    cmds.push(if shape.precision == Precision::Int8 {
+        zero::<DpuDataFormat>()
+    } else {
+        Register::<DpuDataFormat>::new()
+            .in_precision(Bits::new(shape.precision.enum_value()))
+            .out_precision(Bits::new(shape.precision.enum_value()))
+            .proc_precision(Bits::new(shape.precision.enum_value()))
+            .build()
+    });
     cmds.push(zero::<DpuOffsetPend>());
     // bit1 clear (not writing "outside"/memory) -> 0, see this function's
     // own doc comment.
@@ -989,22 +1086,31 @@ fn build_conv_cna_core_dpu_dpu_rdma(
             .bs_relux_cmp_dat(Bits::new(bs_relux_cmp))
             .build(),
     );
-    cmds.push(if shape.depthwise {
-        Register::<DpuBsOwCfg>::new()
+    let mut bs_ow_cfg_builder = Register::<DpuBsOwCfg>::new();
+    if shape.depthwise {
+        bs_ow_cfg_builder
             .size_e_0(Bits::new(3))
             .size_e_1(Bits::new(3))
-            .size_e_2(Bits::new(3))
-            .build()
+            .size_e_2(Bits::new(3));
     } else {
-        Register::<DpuBsOwCfg>::new()
+        bs_ow_cfg_builder
             .size_e_0(Bits::new(1))
             .size_e_1(Bits::new(1))
-            .size_e_2(Bits::new(1))
-            .build()
-    });
+            .size_e_2(Bits::new(1));
+    }
+    // Round 6's fp16 fix: real ground truth bypasses the CPEND stage
+    // entirely here (`od_bypass=1`) rather than feeding it the int8
+    // zero-point-derived operand below.
+    if shape.precision == Precision::Fp16 {
+        bs_ow_cfg_builder.od_bypass(Bits::new(1));
+    }
+    cmds.push(bs_ow_cfg_builder.build());
     cmds.push(
         Register::<DpuBsOwOp>::new()
-            .ow_op(Bits::new(0x80 - shape.weights_zero_point))
+            .ow_op(Bits::new(match shape.precision {
+                Precision::Int8 => 0x80 - shape.weights_zero_point,
+                Precision::Fp16 => 0,
+            }))
             .build(),
     );
     cmds.push(
@@ -1080,21 +1186,42 @@ fn build_conv_cna_core_dpu_dpu_rdma(
         cmds.push(zero::<DpuEwReluxCmpValue>());
     }
 
-    cmds.push(
-        Register::<DpuOutCvtOffset>::new()
-            .out_cvt_offset(Bits::new(out_offset))
-            .build(),
-    );
-    cmds.push(
-        Register::<DpuOutCvtScale>::new()
-            .out_cvt_scale(Bits::new(out_scale))
-            .build(),
-    );
-    cmds.push(
-        Register::<DpuOutCvtShift>::new()
-            .out_cvt_shift(Bits::new(out_shift - 1))
-            .build(),
-    );
+    match shape.precision {
+        Precision::Int8 => {
+            cmds.push(
+                Register::<DpuOutCvtOffset>::new()
+                    .out_cvt_offset(Bits::new(out_offset))
+                    .build(),
+            );
+            cmds.push(
+                Register::<DpuOutCvtScale>::new()
+                    .out_cvt_scale(Bits::new(out_scale))
+                    .build(),
+            );
+            cmds.push(
+                Register::<DpuOutCvtShift>::new()
+                    .out_cvt_shift(Bits::new(out_shift - 1))
+                    .build(),
+            );
+        }
+        Precision::Fp16 => {
+            // int8's OUT_CVT formula above (`out_offset`/`out_scale`/
+            // `out_shift`) is a fixed-point requantization derived by
+            // bit-tricking a float32's mantissa/exponent -- it doesn't
+            // apply to real fp16 output. Ground truth (rounds 1-3 for
+            // `fp32tofp16_en`, round 5 for `out_cvt_scale=1`): offset and
+            // shift both zeroed, scale is the fp32->fp16 conversion
+            // enable bit plus a plain identity scale of 1.
+            cmds.push(zero::<DpuOutCvtOffset>());
+            cmds.push(
+                Register::<DpuOutCvtScale>::new()
+                    .fp32tofp16_en(Bits::new(1))
+                    .out_cvt_scale(Bits::new(1))
+                    .build(),
+            );
+            cmds.push(zero::<DpuOutCvtShift>());
+        }
+    }
 
     cmds.push(zero::<DpuEwOpValue0>());
     cmds.push(zero::<DpuEwOpValue1>());
@@ -1199,7 +1326,9 @@ fn build_conv_cna_core_dpu_dpu_rdma(
     let mut rdma_feat_mode_builder = Register::<DpuRdmaFeatureModeCfg>::new();
     rdma_feat_mode_builder
         .burst_len(Bits::new(15))
-        .mrdma_disable(Bits::new(1));
+        .mrdma_disable(Bits::new(1))
+        .in_precision(Bits::new(shape.precision.enum_value()))
+        .proc_precision(Bits::new(shape.precision.enum_value()));
     if shape.depthwise {
         rdma_feat_mode_builder.conv_mode(Bits::new(3));
     }
@@ -1704,6 +1833,7 @@ pub fn build_fc_regcmd(shape: &FcShape, bufs: &FcBuffers) -> Vec<RegCmd> {
         output_scale: shape.output_scale,
         truncate_bits: shape.truncate_bits,
         activation: shape.activation,
+        precision: Precision::Int8,
     };
     let conv_bufs = ConvBuffers {
         input_addr: bufs.input_addr,
