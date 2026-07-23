@@ -394,12 +394,70 @@ void_stub!(replace_channel_provider(
 
 status_stub!(trim(device: *mut iree_hal_device_t) -> iree_status_t);
 
-status_stub!(query_i64(
+/// Real device-configuration query support, unlike most of this file's
+/// other `status_stub!`s -- this one is load-bearing at compiled-module
+/// load time, not just an optional capability probe. A compiled `.vmfb`
+/// targeting `#hal.device.target<"rocket", [#hal.executable.target<
+/// "rocket", "rocket-conv2d-v1">]>` embeds a compiler-generated device-
+/// selection initializer (`TargetDevice::buildDeviceTargetMatch`'s
+/// default implementation, `DeviceTargetAttr::buildDeviceIDAndExecutable
+/// FormatsMatch`, compiler/src/iree/compiler/Dialect/HAL/IR/HALAttrs.cpp)
+/// that queries EXACTLY two categories on whatever device `--device=`
+/// already created, before ever executing anything: `"hal.device.id"`
+/// (must glob-match this device's own identifier, "rocket") and
+/// `"hal.executable.format"` (must match at least one of the compiled
+/// module's executable target format strings). Leaving this as the
+/// original always-`UNIMPLEMENTED` stub meant EVERY compiled module ever
+/// silently failed device selection with a generic "HAL device not found
+/// or unavailable" error, no matter how correct the rest of the pipeline
+/// was -- found the hard way, on real hardware, compiling the first real
+/// program through the new `rocket` IREE compiler plugin (a separate
+/// sibling repo). None of this project's own hand-driven CTS tests
+/// (`cts/conv_dispatch_test.cc`/`pooling_dispatch_test.cc`) ever exercise
+/// this path -- they call `iree_hal_executable_cache_create`/
+/// `iree_hal_command_buffer_dispatch` directly, bypassing the compiled-
+/// module device-selection initializer entirely.
+///
+/// Modeled on `iree-null-driver-reference/device.c`'s
+/// `iree_hal_null_device_query_i64` (same category names, same "return
+/// NOT_FOUND for anything unrecognized" convention) -- this driver's
+/// identifier is always the fixed literal `b"rocket"` (`driver.rs`'s
+/// `DRIVER_NAME`) and the only executable format it ever produces is
+/// `"rocket-conv2d-v1"` (`iree-rocket-hal::rocket::executable_format`),
+/// so plain byte-equality is correct and sufficient here -- no need for
+/// the reference driver's full glob-pattern matching
+/// (`iree_string_view_match_pattern`) until a second device/format
+/// variant actually exists to distinguish.
+unsafe extern "C" fn query_i64(
     device: *mut iree_hal_device_t,
     category: iree_string_view_t,
     key: iree_string_view_t,
     out_value: *mut i64,
-) -> iree_status_t);
+) -> iree_status_t {
+    let d = unsafe { &*cast(device) };
+    let category =
+        unsafe { std::slice::from_raw_parts(category.data as *const u8, category.size as usize) };
+    let key = unsafe { std::slice::from_raw_parts(key.data as *const u8, key.size as usize) };
+
+    unsafe {
+        *out_value = 0;
+    }
+
+    if category == b"hal.device.id" {
+        unsafe {
+            *out_value = if key == d.identifier.as_slice() { 1 } else { 0 };
+        }
+        return status::ok();
+    }
+    if category == b"hal.executable.format" {
+        unsafe {
+            *out_value = if key == b"rocket-conv2d-v1" { 1 } else { 0 };
+        }
+        return status::ok();
+    }
+
+    status::from_code(crate::bindings::iree_status_code_e_IREE_STATUS_NOT_FOUND as u32)
+}
 
 #[allow(unused_variables)]
 unsafe extern "C" fn query_capabilities(

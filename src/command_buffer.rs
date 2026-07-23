@@ -165,6 +165,32 @@ pub unsafe fn apply_ops(
     let cb = unsafe { &*cast(command_buffer) };
     let mut dispatch_job = None;
     for op in &cb.ops {
+        // Indirect bindings (buffer == NULL, real buffer resolved from
+        // binding_table.buffer_slot -- see command_buffer.h's own doc
+        // comment on iree_hal_buffer_ref_t) aren't resolved anywhere in
+        // this file today. Found the hard way, as a real segfault on real
+        // hardware (iree_hal_buffer_map_copy called with a garbage/null
+        // buffer pointer) the first time an actual compiled `.vmfb`
+        // reached this code -- this project's own hand-driven CTS tests
+        // only ever construct direct bindings. Reject cleanly instead of
+        // dereferencing a null buffer; real indirect-binding support would
+        // need resolving `binding_table` here (queue_execute's caller
+        // does have it available, per device.rs, but nothing plumbs it
+        // into apply_ops today) -- out of scope for this fix.
+        let indirect_ref = match op {
+            RecordedOp::Fill { target, .. } => target.buffer.is_null(),
+            RecordedOp::Update { target, .. } => target.buffer.is_null(),
+            RecordedOp::Copy { source, target } => {
+                source.buffer.is_null() || target.buffer.is_null()
+            }
+            RecordedOp::Dispatch { .. } => false, // rejected earlier, in dispatch() itself.
+        };
+        if indirect_ref {
+            return Err(status::from_code(
+                crate::bindings::iree_status_code_e_IREE_STATUS_UNIMPLEMENTED as u32,
+            ));
+        }
+
         match op {
             RecordedOp::Fill {
                 target,
@@ -259,7 +285,30 @@ pub unsafe fn create(
 }
 
 unsafe extern "C" fn destroy(command_buffer: *mut iree_hal_command_buffer_t) {
-    unsafe { drop(Box::from_raw(cast(command_buffer))) }
+    unsafe {
+        let cb = Box::from_raw(cast(command_buffer));
+        // Release exactly what fill_buffer/update_buffer/copy_buffer
+        // retained at record time -- see those functions' own comments.
+        // Dispatch isn't included: it never retains a buffer reference
+        // (only extracts DMA address/GEM handle immediately, at record
+        // time, via addr()/handle() -- see dispatch()'s own doc comment).
+        for op in &cb.ops {
+            match op {
+                RecordedOp::Fill { target, .. } => {
+                    crate::bindings::iree_hal_buffer_release(target.buffer);
+                }
+                RecordedOp::Update { target, .. } => {
+                    crate::bindings::iree_hal_buffer_release(target.buffer);
+                }
+                RecordedOp::Copy { source, target } => {
+                    crate::bindings::iree_hal_buffer_release(source.buffer);
+                    crate::bindings::iree_hal_buffer_release(target.buffer);
+                }
+                RecordedOp::Dispatch { .. } => {}
+            }
+        }
+        drop(cb);
+    }
 }
 
 // Real no-ops (not status_stub -- that returns UNIMPLEMENTED, which would
@@ -373,6 +422,15 @@ unsafe extern "C" fn fill_buffer(
             pattern_length as usize,
         );
     }
+    // See RecordedOp's own doc comment: recorded ops hold onto their
+    // buffer_ref's raw `buffer` pointer for later use in `apply_ops`,
+    // which runs at queue_execute time -- potentially well after this
+    // recording call returns and the caller drops its own reference.
+    // Without retaining here, that's a real use-after-free (found the
+    // hard way, as a real segfault on real hardware).
+    unsafe {
+        crate::bindings::iree_hal_buffer_retain(target_ref.buffer);
+    }
     let cb = unsafe { &mut *cast(command_buffer) };
     cb.ops.push(RecordedOp::Fill {
         target: target_ref,
@@ -396,6 +454,10 @@ unsafe extern "C" fn update_buffer(
         let src = (source_buffer as *const u8).add(source_offset as usize);
         std::ptr::copy_nonoverlapping(src, source.as_mut_ptr(), len);
     }
+    // See fill_buffer's comment on why this retain is needed.
+    unsafe {
+        crate::bindings::iree_hal_buffer_retain(target_ref.buffer);
+    }
     let cb = unsafe { &mut *cast(command_buffer) };
     cb.ops.push(RecordedOp::Update {
         target: target_ref,
@@ -411,6 +473,11 @@ unsafe extern "C" fn copy_buffer(
     target_ref: iree_hal_buffer_ref_t,
     flags: iree_hal_copy_flags_t,
 ) -> iree_status_t {
+    // See fill_buffer's comment on why these retains are needed.
+    unsafe {
+        crate::bindings::iree_hal_buffer_retain(source_ref.buffer);
+        crate::bindings::iree_hal_buffer_retain(target_ref.buffer);
+    }
     let cb = unsafe { &mut *cast(command_buffer) };
     cb.ops.push(RecordedOp::Copy {
         source: source_ref,
@@ -452,6 +519,30 @@ unsafe extern "C" fn dispatch(
 
     let shape = unsafe { &*crate::executable::shape(executable) };
     let refs = unsafe { std::slice::from_raw_parts(bindings.values, bindings.count as usize) };
+
+    // Indirect bindings (iree_hal_buffer_ref_t.buffer == NULL, real buffer
+    // resolved from a binding_table.buffer_slot at queue_execute time, not
+    // known yet at this record-time call -- see command_buffer.h's own doc
+    // comment on iree_hal_buffer_ref_t) are the default IREE compiles
+    // programs with (`--iree-hal-indirect-command-buffers` defaults to
+    // true). This driver's whole design builds the real regcmd (with
+    // concrete DMA addresses) immediately here, at record time, which is
+    // fundamentally incompatible with a binding whose concrete buffer isn't
+    // known yet -- found the hard way, as a real segfault on real hardware,
+    // the first time an actual compiled `.vmfb` (as opposed to this
+    // project's own hand-driven CTS tests, which only ever construct direct
+    // bindings via iree_hal_make_buffer_ref) reached this function. Rather
+    // than dereference a null `RocketBuffer*` (undefined behavior), reject
+    // indirect bindings with a clear, real error -- true support would need
+    // deferring regcmd construction to queue_execute time, a larger
+    // redesign out of scope for this fix.
+    if let Some(r) = refs.iter().find(|r| r.buffer.is_null()) {
+        let _ = r;
+        return status::from_code(
+            crate::bindings::iree_status_code_e_IREE_STATUS_UNIMPLEMENTED as u32,
+        );
+    }
+
     let addr =
         |r: &iree_hal_buffer_ref_t| unsafe { (*(r.buffer as *mut RocketBuffer)).dma_address };
     let handle = |r: &iree_hal_buffer_ref_t| unsafe { (*(r.buffer as *mut RocketBuffer)).handle };
