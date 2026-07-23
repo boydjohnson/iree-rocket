@@ -9,15 +9,23 @@
 //! present, selects which of this driver's hardcoded shapes to produce --
 //! `0` (or an empty/missing `executable_data`, preserving every existing
 //! caller's behavior) for `UkernelShape::Conv2d` (matching `rkt-basic.rs`'s
-//! validated 4x4 spatial, 1 channel, 1x1 kernel shape -- see
-//! rknpu-spelunking/NOTES.md), `1` for `UkernelShape::Pooling` (a 4x4x1,
-//! 2x2 kernel/stride shape -- NOT yet hardware-validated, see
+//! validated 4x4 spatial, 1 channel, 1x1 kernel shape, `Precision::Int8` --
+//! see rknpu-spelunking/NOTES.md), `1` for `UkernelShape::Pooling` (a
+//! 4x4x1, 2x2 kernel/stride shape -- NOT yet hardware-validated, see
 //! iree-rocket-hal's `build_pooling_regcmd` module doc comment and
-//! `tests/pooling_hw.rs`/`tests/pooling_dispatch.rs`). This has nothing to
-//! do with any real serialized executable format; it exists purely so a
-//! test harness (which fully controls `executable_data` itself, since
-//! there's no compiler in the loop) can select which hardcoded ukernel to
-//! exercise through the real HAL API rather than only ever getting conv2d.
+//! `tests/pooling_hw.rs`/`tests/pooling_dispatch.rs`), `2` for
+//! `UkernelShape::Conv2d` again but with `Precision::Fp16` -- same
+//! geometry as tag `0`, matching iree-rocket-hal's `tests/conv_hw.rs`'s
+//! `fp16_shape()`, the shape round 7's hardware fix confirmed produces a
+//! bit-exact-correct fp16 conv (see
+//! rknpu-spelunking's `project_conv_dtype_coverage` memory). Note tag `2`'s
+//! buffers are `u16`-element (2 bytes/pixel) fp16 data, not `u8` int8 --
+//! callers must size/fill bindings accordingly (see
+//! `cts/conv_dispatch_test.cc`). This has nothing to do with any real
+//! serialized executable format; it exists purely so a test harness (which
+//! fully controls `executable_data` itself, since there's no compiler in
+//! the loop) can select which hardcoded ukernel to exercise through the
+//! real HAL API rather than only ever getting conv2d.
 
 use crate::bindings::{
     iree_const_byte_span_t, iree_hal_executable_cache_t, iree_hal_executable_cache_vtable_t,
@@ -26,7 +34,9 @@ use crate::bindings::{
 };
 use crate::executable::UkernelShape;
 use crate::status;
-use iree_rocket_hal::rocket::regcmd::{ConvShape, PoolingMethod, PoolingShape};
+use iree_rocket_hal::rocket::regcmd::{
+    Activation, ConvShape, PoolingMethod, PoolingShape, Precision,
+};
 
 /// What every `iree_hal_executable_cache_t*` this driver hands out
 /// actually points to. Opaque base type, `resource` at offset 0 like
@@ -115,6 +125,32 @@ unsafe extern "C" fn prepare_executable(
             pad_right: 0,
             pad_bottom: 0,
             pad_value: 0,
+            activation: Activation::None,
+        }),
+        2 => UkernelShape::Conv2d(ConvShape {
+            // Same geometry as tag 0's validated int8 shape, but
+            // Precision::Fp16 -- matches iree-rocket-hal's
+            // tests/conv_hw.rs's fp16_shape(), hardware-confirmed
+            // bit-exact-correct (see module doc comment above).
+            input_width: 4,
+            input_height: 4,
+            input_channels: 1,
+            output_width: 4,
+            output_height: 4,
+            output_channels: 1,
+            weights_width: 1,
+            weights_height: 1,
+            stride: 1,
+            depthwise: false,
+            input_zero_point: 0,
+            output_zero_point: 0,
+            weights_zero_point: 0,
+            input_scale: 1.0,
+            weights_scale: 1.0,
+            output_scale: 1.0,
+            truncate_bits: 0,
+            activation: Activation::None,
+            precision: Precision::Fp16,
         }),
         _ => UkernelShape::Conv2d(ConvShape {
             // rkt-basic.rs's validated shape (see module doc comment).
@@ -135,6 +171,8 @@ unsafe extern "C" fn prepare_executable(
             weights_scale: 1.0,
             output_scale: 1.0,
             truncate_bits: 0,
+            activation: Activation::None,
+            precision: Precision::Int8,
         }),
     };
     unsafe {

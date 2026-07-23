@@ -72,3 +72,19 @@ iree_cc_test(
     gtest
     gtest_main
 )
+
+# Same hand-written end-to-end pattern as pooling_dispatch_test.cc above,
+# covering Conv2d instead -- see conv_dispatch_test.cc's own module doc
+# comment. Notably exercises executable_cache.rs's tag=2 (Precision::Fp16),
+# the newest addition to the tag convention.
+iree_cc_test(
+  NAME
+    conv_dispatch_test
+  SRCS
+    "conv_dispatch_test.cc"
+  DEPS
+    iree::hal
+    rocket_hal_driver_static
+    gtest
+    gtest_main
+)
