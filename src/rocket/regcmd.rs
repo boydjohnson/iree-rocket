@@ -1,4 +1,4 @@
-//! Shared, Mesa-faithful regcmd construction for a single conv operation.
+//! Shared, Mesa-faithful regcmd construction for conv operations.
 //!
 //! Ported field-for-field from `mesa-rocket-userspace/rkt_regcmd.c`'s
 //! `fill_first_regcmd()` and `rkt_task.c`'s `fill_task()`/
@@ -11,11 +11,12 @@
 //! share it instead of each carrying their own independently incomplete
 //! regcmd builders.
 //!
-//! Scope, deliberately not general beyond what any of this repo's test
-//! clients actually need:
-//! - Single-task operations only (`rkt_split_tasks()`'s "full weights,
-//!   full input" branch) -- covers every shape small enough not to need
-//!   multi-task CBUF splitting, which is all three clients in this repo.
+//! Scope, deliberately not general beyond what this repo currently needs:
+//! - Convolutions larger than CBUF are split along output height using
+//!   Mesa's `rkt_split_tasks()` algorithm. The public multi-task builder
+//!   returns one regcmd buffer per split for `device::submit_tasks`.
+//! - The serialized shape currently has no padding fields, so convolution
+//!   planning supports zero-padding valid convolutions only.
 //! - No `addition_input`/`add_tensor` support -- none of the three bins
 //!   use a second input tensor, so the DPU_RDMA/EW "add_tensor != -1"
 //!   branches in Mesa's source are simply not implemented here.
@@ -31,7 +32,10 @@ use crate::rocket::{
         Bits, DOMAIN_CORE, DOMAIN_DPU, DOMAIN_PC, RegCmd, Register, RegisterMeta, cna::*, core::*,
         dpu::*, dpu_rdma::*, ppu::*, ppu_rdma::*,
     },
-    registers::{REG_DPU_LUT_ACCESS_DATA, REG_PC_OPERATION_ENABLE, REG_PC_REGISTER_AMOUNTS},
+    registers::{
+        REG_DPU_LUT_ACCESS_DATA, REG_PC_BASE_ADDRESS, REG_PC_OPERATION_ENABLE,
+        REG_PC_REGISTER_AMOUNTS,
+    },
 };
 
 fn zero<R: RegisterMeta>() -> RegCmd {
@@ -503,6 +507,282 @@ pub struct ConvBuffers {
     pub output_addr: u32,
 }
 
+/// One height split produced by Mesa's `rkt_split_tasks()` policy.
+///
+/// Offsets use the NPU's 16-byte feature-atomic row layout, matching the
+/// register builder's existing `calc_line_stride` port. A caller should
+/// normally consume this through [`build_conv_regcmd_tasks`] rather than
+/// applying the offsets itself.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct ConvTask {
+    pub index: u32,
+    pub input_top: u32,
+    pub input_height: u32,
+    pub output_top: u32,
+    pub output_height: u32,
+    pub input_offset_bytes: u32,
+    pub output_offset_bytes: u32,
+    pub input_banks: u32,
+    pub weights_banks: u32,
+    pub overlap_slices: u32,
+    pub retain_slices: u32,
+    /// Whether this task reuses weights left in CBUF by the preceding task.
+    pub reuse_weights: bool,
+}
+
+#[derive(Clone, Copy)]
+struct ConvTaskDraft {
+    top: u32,
+    bottom: u32,
+    overlap_slices: u32,
+    retain_slices: u32,
+}
+
+const CBUF_BANKS: u32 = 12;
+const CBUF_ENTRIES_PER_BANK: u64 = 256;
+const FEATURE_ATOMIC_SIZE: u64 = 16;
+const CBUF_ENTRY_SIZE: u64 = 128;
+const ATOMIC_K_SIZE: u64 = 16;
+
+fn conv_entries_per_slice(shape: &ConvShape) -> Result<u64, &'static str> {
+    let bpe = u64::from(shape.precision.bytes_per_element());
+    let input_channels = u64::from(shape.input_channels);
+    let input_width = u64::from(shape.input_width);
+    let atomics_per_entry = CBUF_ENTRY_SIZE / FEATURE_ATOMIC_SIZE;
+    let channel_bytes = input_channels
+        .checked_mul(bpe)
+        .ok_or("input channel byte count overflows task planning")?;
+    let total_c_atomics = channel_bytes.div_ceil(FEATURE_ATOMIC_SIZE);
+    let last_c_atomics = total_c_atomics % atomics_per_entry;
+    let integer_entries = (total_c_atomics / atomics_per_entry)
+        .checked_mul(input_width)
+        .ok_or("input entries per slice overflow task planning")?;
+    let fractional_entries = if last_c_atomics == 3 {
+        input_width
+    } else {
+        last_c_atomics
+            .checked_mul(input_width)
+            .ok_or("input entries per slice overflow task planning")?
+            .div_ceil(atomics_per_entry)
+    };
+    integer_entries
+        .checked_add(fractional_entries)
+        .ok_or("input entries per slice overflow task planning")
+}
+
+fn conv_weights_banks(shape: &ConvShape) -> Result<u64, &'static str> {
+    let mut bytes = u64::from(shape.weights_width)
+        .checked_mul(u64::from(shape.weights_height))
+        .and_then(|value| value.checked_mul(u64::from(shape.input_channels)))
+        .and_then(|value| value.checked_mul(u64::from(shape.precision.bytes_per_element())))
+        .ok_or("weight byte count overflows task planning")?;
+    if !shape.depthwise {
+        bytes = bytes
+            .checked_mul(u64::from(shape.output_channels))
+            .ok_or("weight byte count overflows task planning")?;
+    }
+
+    // Mesa reserves one extra bank in addition to the rounded weight size.
+    let entries = bytes.div_ceil(CBUF_ENTRY_SIZE);
+    entries
+        .div_ceil(CBUF_ENTRIES_PER_BANK)
+        .checked_add(1)
+        .ok_or("weight bank count overflows task planning")
+}
+
+/// Plans zero-padding convolution height splits using Mesa's
+/// `rkt_split_tasks()` CBUF policy.
+///
+/// The current executable schema has no padding fields, so this requires
+/// valid-convolution geometry:
+/// `output = (input - kernel) / stride + 1`.
+pub fn plan_conv_tasks(shape: &ConvShape) -> Result<Vec<ConvTask>, &'static str> {
+    if shape.input_width == 0
+        || shape.input_height == 0
+        || shape.input_channels == 0
+        || shape.output_width == 0
+        || shape.output_height == 0
+        || shape.output_channels == 0
+        || shape.weights_width == 0
+        || shape.weights_height == 0
+    {
+        return Err("convolution dimensions and channel counts must be nonzero");
+    }
+    if shape.stride == 0 {
+        return Err("convolution stride must be nonzero");
+    }
+    if shape.weights_width > shape.input_width || shape.weights_height > shape.input_height {
+        return Err("convolution kernel exceeds the zero-padded input extent");
+    }
+
+    let expected_output_width = (shape.input_width - shape.weights_width) / shape.stride + 1;
+    let expected_output_height = (shape.input_height - shape.weights_height) / shape.stride + 1;
+    if shape.output_width != expected_output_width || shape.output_height != expected_output_height
+    {
+        return Err("output shape does not match zero-padding valid-convolution geometry");
+    }
+
+    let entries_per_slice = conv_entries_per_slice(shape)?;
+    if entries_per_slice == 0 {
+        return Err("convolution requires zero CBUF entries per input slice");
+    }
+    let input_banks_required = entries_per_slice
+        .checked_mul(u64::from(shape.input_height))
+        .ok_or("input bank count overflows task planning")?
+        .div_ceil(CBUF_ENTRIES_PER_BANK);
+    let weights_banks_required = conv_weights_banks(shape)?;
+
+    let weights_with_guard_bank = weights_banks_required
+        .checked_add(1)
+        .ok_or("weight bank count overflows task planning")?;
+    let (available_input_banks, available_weights_banks, reuse_weights) =
+        if weights_with_guard_bank < u64::from(CBUF_BANKS) {
+            (
+                u64::from(CBUF_BANKS) - weights_banks_required,
+                weights_banks_required,
+                true,
+            )
+        } else {
+            // Mesa's partial-weights/partial-input split.
+            (7, 5, false)
+        };
+
+    if input_banks_required <= available_input_banks {
+        return Ok(vec![ConvTask {
+            index: 0,
+            input_top: 0,
+            input_height: shape.input_height,
+            output_top: 0,
+            output_height: shape.output_height,
+            input_offset_bytes: 0,
+            output_offset_bytes: 0,
+            input_banks: u32::try_from(input_banks_required)
+                .map_err(|_| "input bank count exceeds u32")?,
+            weights_banks: CBUF_BANKS
+                - u32::try_from(input_banks_required)
+                    .map_err(|_| "input bank count exceeds u32")?,
+            overlap_slices: 0,
+            retain_slices: 0,
+            reuse_weights: false,
+        }]);
+    }
+
+    let available_slices = CBUF_ENTRIES_PER_BANK * available_input_banks / entries_per_slice;
+    if available_slices == 0 {
+        return Err("one input row does not fit in the CBUF banks reserved for input");
+    }
+    let available_slices =
+        u32::try_from(available_slices).map_err(|_| "available slice count exceeds u32")?;
+    if available_slices < shape.weights_height {
+        return Err("CBUF input slice capacity is smaller than the convolution kernel height");
+    }
+
+    let mut drafts = vec![ConvTaskDraft {
+        top: 0,
+        bottom: available_slices - 1,
+        overlap_slices: 0,
+        retain_slices: 0,
+    }];
+    let mut slice = shape.weights_height - 1;
+    while slice < shape.input_height {
+        let previous = *drafts.last().expect("first task is present");
+        while slice <= previous.bottom {
+            slice = slice
+                .checked_add(shape.stride)
+                .ok_or("split slice index overflows u32")?;
+        }
+        slice -= shape.stride;
+
+        let top = slice
+            .min(previous.bottom)
+            .checked_sub(shape.weights_height - 1)
+            .and_then(|value| value.checked_add(shape.stride))
+            .ok_or("split top slice underflows or overflows u32")?;
+        let mut bottom = top
+            .checked_add(available_slices - 1)
+            .ok_or("split bottom slice overflows u32")?;
+        if bottom >= shape.input_height - 1 {
+            bottom = shape.input_height - 1;
+            drafts.push(ConvTaskDraft {
+                top,
+                bottom,
+                overlap_slices: 0,
+                retain_slices: 0,
+            });
+            break;
+        }
+
+        slice = top
+            .checked_add(shape.weights_height - 1)
+            .ok_or("split slice index overflows u32")?;
+        drafts.push(ConvTaskDraft {
+            top,
+            bottom,
+            overlap_slices: 0,
+            retain_slices: 0,
+        });
+    }
+
+    if drafts.len() < 2 {
+        return Err("CBUF split planning did not make forward progress");
+    }
+
+    for index in 1..drafts.len() {
+        let previous_bottom = drafts[index - 1].bottom;
+        let current_top = drafts[index].top;
+        if previous_bottom >= current_top {
+            let overlap = previous_bottom - current_top + 1;
+            drafts[index].overlap_slices = overlap;
+            drafts[index - 1].retain_slices = overlap;
+        }
+    }
+
+    let input_line_stride = u64::from(shape.input_width) * ATOMIC_K_SIZE;
+    let output_line_stride = u64::from(shape.output_width) * ATOMIC_K_SIZE;
+    let mut output_height_processed = 0u32;
+    let mut tasks = Vec::with_capacity(drafts.len());
+    for (index, draft) in drafts.into_iter().enumerate() {
+        let input_height = draft.bottom - draft.top + 1;
+        let output_height = (input_height - shape.weights_height) / shape.stride + 1;
+        if output_height == 0 {
+            return Err("CBUF split produces a task with no output rows");
+        }
+
+        let input_offset = input_line_stride
+            .checked_mul(u64::from(draft.top))
+            .ok_or("input task offset overflows")?;
+        let output_offset = output_line_stride
+            .checked_mul(u64::from(output_height_processed))
+            .ok_or("output task offset overflows")?;
+        tasks.push(ConvTask {
+            index: u32::try_from(index).map_err(|_| "task count exceeds u32")?,
+            input_top: draft.top,
+            input_height,
+            output_top: output_height_processed,
+            output_height,
+            input_offset_bytes: u32::try_from(input_offset)
+                .map_err(|_| "input task offset exceeds u32")?,
+            output_offset_bytes: u32::try_from(output_offset)
+                .map_err(|_| "output task offset exceeds u32")?,
+            input_banks: u32::try_from(available_input_banks)
+                .map_err(|_| "input bank count exceeds u32")?,
+            weights_banks: u32::try_from(available_weights_banks)
+                .map_err(|_| "weight bank count exceeds u32")?,
+            overlap_slices: draft.overlap_slices,
+            retain_slices: draft.retain_slices,
+            reuse_weights: reuse_weights && index > 0,
+        });
+        output_height_processed = output_height_processed
+            .checked_add(output_height)
+            .ok_or("planned output height overflows")?;
+    }
+
+    if output_height_processed != shape.output_height {
+        return Err("split tasks do not cover the declared output height exactly");
+    }
+    Ok(tasks)
+}
+
 /// Logical shape for a standalone DPU LUT pass -- the only LUT-activation
 /// path this crate builds, matching the vendor compiler's decoded
 /// sigmoid/tanh routing (confirmed via live hardware trace of the vendor
@@ -556,6 +836,7 @@ pub struct LutBuffers {
 fn build_conv_cna_core_dpu_dpu_rdma(
     shape: &ConvShape,
     bufs: &ConvBuffers,
+    task: &ConvTask,
     dpu_output_mode: u32,
     addition: Option<&AddTensor>,
 ) -> Vec<RegCmd> {
@@ -573,7 +854,7 @@ fn build_conv_cna_core_dpu_dpu_rdma(
     // AND single-channel fp16 identically; DpuOutCvtScale/PadCon1/BsOwCfg
     // etc. all branch on `shape.precision` alone, never on channel count).
     // The two real channel-count-AND-byte-width-dependent formulas
-    // (`compute_input_banks`, `input_data_entries` below) have been
+    // (`conv_entries_per_slice`, `input_data_entries` below) have been
     // generalized to scale by `Precision::bytes_per_element()`, mirroring
     // Mesa's own `calc_entries_per_slice()` (`rkt_task.c`), which threads a
     // `bpe` factor through the exact same math -- hardcoded to
@@ -582,28 +863,8 @@ fn build_conv_cna_core_dpu_dpu_rdma(
     // input_channels>1 -- assert relaxed to allow real hardware testing,
     // NOT because this has been proven correct.
 
-    // rkt_ml.h geometry constants.
-    const CBUF_BANKS: u32 = 12;
-    const FEATURE_ATOMIC_SIZE: u32 = 16;
-    const ATOMIC_K_SIZE: u32 = 16;
-
-    // calc_entries_per_slice() + calc_input_banks() -- see compute_input_banks's
-    // own doc comment for why this is a separate function rather than inline.
-    let input_banks = compute_input_banks(shape);
-    assert!(
-        input_banks < CBUF_BANKS,
-        "build_conv_regcmd: shape needs {input_banks} input CBUF banks (only \
-         {CBUF_BANKS} total) -- too big for the single-task path this \
-         function implements (rkt_split_tasks()'s general multi-task \
-         splitting branch isn't ported); shrink the operation or add that \
-         support"
-    );
-
-    // rkt_split_tasks(): the single-task branch sets weight_banks to
-    // CBUF_BANKS - input_banks directly -- NOT calc_weights_banks()'s own
-    // result (that function's output only decides the reuse/no-reuse
-    // branch elsewhere, never reaches CBUF_CON0 here).
-    let weight_banks = CBUF_BANKS - input_banks;
+    let input_banks = task.input_banks;
+    let weight_banks = task.weights_banks;
 
     // fill_task(): channel/kernel counts round up to the hardware's
     // atomic granularity, independent of the op's logical shape. See
@@ -621,11 +882,11 @@ fn build_conv_cna_core_dpu_dpu_rdma(
     // addition) selects a "wide atomic" branch -- asserted unreachable
     // above, so this is always the plain else branch for every shape this
     // function actually gets called with.
-    let line_stride = |w: u32| w * ATOMIC_K_SIZE;
+    let line_stride = |w: u32| w * ATOMIC_K_SIZE as u32;
     let input_line_stride = line_stride(shape.input_width) / 4;
     let input_surface_stride = input_line_stride * (shape.input_height / 4 - 1);
     let output_surface_stride =
-        (line_stride(shape.output_width) * shape.output_height) / FEATURE_ATOMIC_SIZE;
+        (line_stride(shape.output_width) * shape.output_height) / FEATURE_ATOMIC_SIZE as u32;
     let surfaces_per_row =
         shape.output_width * shape.output_height * 2 * if shape.depthwise { 2 } else { 1 };
 
@@ -645,7 +906,7 @@ fn build_conv_cna_core_dpu_dpu_rdma(
     } else if shape.input_width == 40 && shape.input_channels == 40 {
         40
     } else {
-        (shape.input_width * 2 * (shape.input_channels * bpe).div_ceil(FEATURE_ATOMIC_SIZE))
+        (shape.input_width * 2 * (shape.input_channels * bpe).div_ceil(FEATURE_ATOMIC_SIZE as u32))
             .div_ceil(8)
     };
 
@@ -682,6 +943,9 @@ fn build_conv_cna_core_dpu_dpu_rdma(
     cbuf_con0_builder
         .weight_bank(Bits::new(weight_banks))
         .data_bank(Bits::new(input_banks));
+    if task.reuse_weights {
+        cbuf_con0_builder.weight_reuse(Bits::new(1));
+    }
     cmds.push(cbuf_con0_builder.build()); // written again after WEIGHT_SIZE2 below -- Mesa emits it twice
 
     cmds.push(zero::<CnaDcompRegnum>());
@@ -733,7 +997,7 @@ fn build_conv_cna_core_dpu_dpu_rdma(
     cmds.push(
         Register::<CnaDataSize0>::new()
             .datain_width(Bits::new(shape.input_width))
-            .datain_height(Bits::new(shape.input_height))
+            .datain_height(Bits::new(task.input_height))
             .build(),
     );
     cmds.push(
@@ -749,7 +1013,7 @@ fn build_conv_cna_core_dpu_dpu_rdma(
     );
     cmds.push(
         Register::<CnaDataSize3>::new()
-            .dataout_atomics(Bits::new(shape.output_width * shape.output_height))
+            .dataout_atomics(Bits::new(shape.output_width * task.output_height))
             .build(),
     );
 
@@ -871,7 +1135,11 @@ fn build_conv_cna_core_dpu_dpu_rdma(
     );
     cmds.push(
         Register::<CnaFeatureDataAddr>::new()
-            .feature_base_addr(Bits::new(bufs.input_addr))
+            .feature_base_addr(Bits::new(
+                bufs.input_addr
+                    .checked_add(task.input_offset_bytes)
+                    .expect("input task address overflows u32"),
+            ))
             .build(),
     );
     cmds.push(zero::<CnaFcCon2>());
@@ -895,7 +1163,7 @@ fn build_conv_cna_core_dpu_dpu_rdma(
     cmds.push(
         Register::<CnaFcDataSize0>::new()
             .dma_width(Bits::new(shape.input_width))
-            .dma_height(Bits::new(shape.input_height))
+            .dma_height(Bits::new(task.input_height))
             .build(),
     );
     cmds.push(
@@ -976,7 +1244,7 @@ fn build_conv_cna_core_dpu_dpu_rdma(
     cmds.push(
         Register::<CoreDataoutSize0>::new()
             .dataout_width(Bits::new(shape.output_width - 1))
-            .dataout_height(Bits::new(shape.output_height - 1))
+            .dataout_height(Bits::new(task.output_height - 1))
             .build(),
     );
     cmds.push(
@@ -1026,6 +1294,8 @@ fn build_conv_cna_core_dpu_dpu_rdma(
         Register::<DpuDstBaseAddr>::new()
             .dst_base_addr(Bits::new(if dpu_writes_to_memory {
                 bufs.output_addr
+                    .checked_add(task.output_offset_bytes)
+                    .expect("output task address overflows u32")
             } else {
                 0
             }))
@@ -1047,7 +1317,7 @@ fn build_conv_cna_core_dpu_dpu_rdma(
     );
     cmds.push(
         Register::<DpuDataCubeHeight>::new()
-            .height(Bits::new(shape.output_height - 1))
+            .height(Bits::new(task.output_height - 1))
             .build(),
     );
     cmds.push(zero::<DpuDataCubeNotchAddr>());
@@ -1120,7 +1390,7 @@ fn build_conv_cna_core_dpu_dpu_rdma(
     );
     cmds.push(
         Register::<DpuWdmaSize1>::new()
-            .height_wdma(Bits::new(shape.output_height - 1))
+            .height_wdma(Bits::new(task.output_height - 1))
             .width_wdma(Bits::new(shape.output_width - 1))
             .build(),
     );
@@ -1263,7 +1533,7 @@ fn build_conv_cna_core_dpu_dpu_rdma(
     );
     cmds.push(
         Register::<DpuRdmaDataCubeHeight>::new()
-            .height(Bits::new(shape.output_height - 1))
+            .height(Bits::new(task.output_height - 1))
             .build(),
     );
     cmds.push(
@@ -1379,8 +1649,12 @@ const KICK_PPU_RDMA: u32 = 1 << 6;
 /// single task the same way, differing only in which blocks that task's
 /// kick should actually enable (see `KICK_*` above -- pass exactly the
 /// bits for the blocks this task configured, not a fixed value).
-fn push_kick(cmds: &mut Vec<RegCmd>, enable_mask: u32) {
-    cmds.push(RegCmd::new_raw(0x0)); // PC_BASE_ADDRESS placeholder (single task)
+fn push_kick_for_task_count(cmds: &mut Vec<RegCmd>, enable_mask: u32, task_count: usize) {
+    if task_count == 1 {
+        cmds.push(RegCmd::new_raw(0x0)); // Mesa's single-task placeholder
+    } else {
+        cmds.push(RegCmd::new(DOMAIN_PC, REG_PC_BASE_ADDRESS, 0));
+    }
     cmds.push(RegCmd::new(DOMAIN_PC, REG_PC_REGISTER_AMOUNTS, 0));
     cmds.push(RegCmd::new_raw(0x0041000000000000)); // TRM: required immediately before op_en
     cmds.push(RegCmd::new(0x81, REG_PC_OPERATION_ENABLE, enable_mask));
@@ -1388,6 +1662,10 @@ fn push_kick(cmds: &mut Vec<RegCmd>, enable_mask: u32) {
     if cmds.len() % 2 != 0 {
         cmds.push(RegCmd::new_raw(0x0));
     }
+}
+
+fn push_kick(cmds: &mut Vec<RegCmd>, enable_mask: u32) {
+    push_kick_for_task_count(cmds, enable_mask, 1);
 }
 
 pub fn build_lut_regcmd(shape: &LutShape, bufs: &LutBuffers, table: LutTable) -> Vec<RegCmd> {
@@ -1631,53 +1909,14 @@ pub fn build_lut_regcmd(shape: &LutShape, bufs: &LutBuffers, table: LutTable) ->
     cmds
 }
 
-/// calc_entries_per_slice() + calc_input_banks() (rkt_task.c) -- how many
-/// of CBUF's 12 total banks this shape's input tensor needs. Extracted out
-/// of `build_conv_cna_core_dpu_dpu_rdma` as a pure function (no behavior
-/// change -- verified identical formula) so `executable_format`'s
-/// `validate_conv_shape` can check the exact same value that function's own
-/// `assert!` protects, without re-deriving the formula a second time and
-/// risking the two copies silently drifting apart.
-///
-/// EXPERIMENTAL for `Precision::Fp16` (bpe>1): Mesa's real
-/// `calc_entries_per_slice()` hardcodes `unsigned bpe = sizeof(uint8_t)`
-/// (Mesa never emits non-int8 ops) but threads that `bpe` through
-/// `DIV_ROUND_UP(input_channels * bpe, FEATURE_ATOMIC_SIZE)` -- i.e. the
-/// formula's own general form already scales the channel count by byte
-/// width before dividing by the atomic size. Generalized here by using
-/// `Precision::bytes_per_element()` in that same position (bpe=1
-/// reproduces the exact original int8 formula, unchanged). Not yet
-/// hardware-confirmed for bpe>1.
-pub(crate) fn compute_input_banks(shape: &ConvShape) -> u32 {
-    const CBUF_ENTRY_SIZE: u32 = 128; // CBUF_BANK_SIZE(32768) / CBUF_ENTRIES_PER_BANK(256)
-    const CBUF_ENTRIES_PER_BANK: u32 = 256;
-    const FEATURE_ATOMIC_SIZE: u32 = 16;
-
-    // calc_entries_per_slice().
-    let bpe = shape.precision.bytes_per_element();
-    let atomics_per_entry = CBUF_ENTRY_SIZE / FEATURE_ATOMIC_SIZE;
-    let total_c_atomics = (shape.input_channels * bpe).div_ceil(FEATURE_ATOMIC_SIZE);
-    let last_c_atomics = total_c_atomics % atomics_per_entry;
-    let int_c_entries = (total_c_atomics / atomics_per_entry) * shape.input_width;
-    let frac_c_entries = if last_c_atomics == 3 {
-        shape.input_width
-    } else {
-        (last_c_atomics * shape.input_width).div_ceil(atomics_per_entry)
-    };
-    let entries_per_slice = int_c_entries + frac_c_entries;
-
-    // calc_input_banks().
-    (entries_per_slice * shape.input_height).div_ceil(CBUF_ENTRIES_PER_BANK)
-}
-
 /// rkt_regcmd.c's `DPU_OUT_CVT_SHIFT` formula (float-bits-based fixed-point
 /// conversion, `conv_scale = input_scale*weights_scale/output_scale`).
 /// Returns the raw shift value, NOT yet checked for non-negativity or cast
 /// to `u32` -- the caller is responsible for both (see
 /// `build_conv_cna_core_dpu_dpu_rdma`'s own `assert!`). Extracted as a pure
 /// function (no behavior change) for the same single-source-of-truth
-/// reason as `compute_input_banks` above: `validate_conv_shape` needs to
-/// check the exact value the builder's `assert!` protects.
+/// reason as the task-planning helpers above: `validate_conv_shape` needs
+/// to check the exact value the builder's `assert!` protects.
 pub(crate) fn compute_out_shift(shape: &ConvShape) -> i32 {
     let conv_scale = (shape.input_scale * shape.weights_scale) / shape.output_scale;
     let scale_bits = conv_scale.to_bits();
@@ -1691,7 +1930,7 @@ pub(crate) fn compute_out_shift(shape: &ConvShape) -> i32 {
 
 /// fill_task()'s input-channel atomic rounding (`CNA_DATA_SIZE1.datain_channel`,
 /// a 16-bit field -- see `builders/cna.rs`). Extracted as a pure function
-/// for the same single-source-of-truth reason as `compute_input_banks`:
+/// for the same single-source-of-truth reason as the task-planning helpers:
 /// `validate_conv_shape` needs to check this against the field's real bit
 /// width without re-deriving the rounding formula a second time.
 pub(crate) fn compute_task_input_channels(shape: &ConvShape) -> u32 {
@@ -1741,8 +1980,59 @@ pub fn conv_output_scratch_bytes(shape: &ConvShape) -> usize {
     shape.output_width as usize * shape.output_height as usize * CONV_OUTPUT_ATOMIC_STRIDE as usize
 }
 
+fn require_single_conv_task(shape: &ConvShape) -> ConvTask {
+    let tasks = plan_conv_tasks(shape).expect("build_conv_regcmd: invalid convolution task plan");
+    assert!(
+        tasks.len() == 1,
+        "build_conv_regcmd: convolution requires {} CBUF height splits; \
+         use build_conv_regcmd_tasks and device::submit_tasks",
+        tasks.len()
+    );
+    tasks[0]
+}
+
+/// Builds one regcmd buffer per CBUF height split.
+///
+/// Allocate each returned vector in its own command buffer and submit the
+/// `(address, command_count)` pairs together through
+/// [`crate::rocket::device::submit_tasks`]. Keeping the splits in one kernel
+/// job is required for `reuse_weights` tasks to observe the preceding task's
+/// CBUF contents.
+pub fn build_conv_regcmd_tasks(
+    shape: &ConvShape,
+    bufs: &ConvBuffers,
+) -> Result<Vec<Vec<RegCmd>>, &'static str> {
+    let tasks = plan_conv_tasks(shape)?;
+    for task in &tasks {
+        bufs.input_addr
+            .checked_add(task.input_offset_bytes)
+            .ok_or("input task DMA address exceeds u32")?;
+        bufs.output_addr
+            .checked_add(task.output_offset_bytes)
+            .ok_or("output task DMA address exceeds u32")?;
+    }
+
+    let task_count = tasks.len();
+    Ok(tasks
+        .iter()
+        .map(|task| {
+            let mut cmds = build_conv_cna_core_dpu_dpu_rdma(shape, bufs, task, 2, None);
+            push_kick_for_task_count(
+                &mut cmds,
+                KICK_CNA | KICK_CORE | KICK_DPU | KICK_DPU_RDMA,
+                task_count,
+            );
+            cmds
+        })
+        .collect())
+}
+
+/// Builds the historical one-task convolution command buffer.
+///
+/// Shapes that need CBUF splitting must use [`build_conv_regcmd_tasks`].
 pub fn build_conv_regcmd(shape: &ConvShape, bufs: &ConvBuffers) -> Vec<RegCmd> {
-    let mut cmds = build_conv_cna_core_dpu_dpu_rdma(shape, bufs, 2, None); // 2 = outside/memory only, unchanged original behavior
+    let task = require_single_conv_task(shape);
+    let mut cmds = build_conv_cna_core_dpu_dpu_rdma(shape, bufs, &task, 2, None);
     push_kick(&mut cmds, KICK_CNA | KICK_CORE | KICK_DPU | KICK_DPU_RDMA);
     cmds
 }
@@ -1775,7 +2065,8 @@ pub fn build_conv_with_add_regcmd(
     bufs: &ConvBuffers,
     addition: &AddTensor,
 ) -> Vec<RegCmd> {
-    let mut cmds = build_conv_cna_core_dpu_dpu_rdma(shape, bufs, 2, Some(addition));
+    let task = require_single_conv_task(shape);
+    let mut cmds = build_conv_cna_core_dpu_dpu_rdma(shape, bufs, &task, 2, Some(addition));
     push_kick(&mut cmds, KICK_CNA | KICK_CORE | KICK_DPU | KICK_DPU_RDMA);
     cmds
 }
@@ -2440,6 +2731,7 @@ pub fn build_pooling_via_dpu_bypass_regcmd(
     };
 
     // Stage 1: real (near-identity) CNA->CORE->DPU task, output to memory.
+    let bypass_task = require_single_conv_task(&bypass_shape_with_activation);
     let mut bypass_cmds = build_conv_cna_core_dpu_dpu_rdma(
         &bypass_shape_with_activation,
         &ConvBuffers {
@@ -2448,6 +2740,7 @@ pub fn build_pooling_via_dpu_bypass_regcmd(
             bias_addr: bufs.bias_addr,
             output_addr: bufs.bypass_output_addr,
         },
+        &bypass_task,
         2, // outside/memory, matching the real capture
         None,
     );
@@ -2560,6 +2853,7 @@ pub fn build_conv_then_pooling_regcmd(
     // ("outside"/memory) deliberately left clear, see module doc comment.
     // The conv-stage buffers (input/weights/bias) are real; output_addr
     // there is irrelevant (never written) since bit1 is clear.
+    let conv_task = require_single_conv_task(conv_shape);
     let mut cmds = build_conv_cna_core_dpu_dpu_rdma(
         conv_shape,
         &ConvBuffers {
@@ -2568,6 +2862,7 @@ pub fn build_conv_then_pooling_regcmd(
             bias_addr: bufs.bias_addr,
             output_addr: 0,
         },
+        &conv_task,
         1,
         None,
     );
@@ -2827,4 +3122,154 @@ pub fn build_max_reduction_tree_regcmd(
             )
         })
         .collect()
+}
+
+#[cfg(test)]
+mod conv_task_tests {
+    use super::*;
+
+    fn mobilenet_1x1(
+        height: u32,
+        width: u32,
+        input_channels: u32,
+        output_channels: u32,
+    ) -> ConvShape {
+        ConvShape {
+            input_width: width,
+            input_height: height,
+            input_channels,
+            output_width: width,
+            output_height: height,
+            output_channels,
+            weights_width: 1,
+            weights_height: 1,
+            stride: 1,
+            depthwise: false,
+            input_zero_point: 0,
+            output_zero_point: 0,
+            weights_zero_point: 0,
+            input_scale: 1.0,
+            weights_scale: 1.0,
+            output_scale: 1.0,
+            truncate_bits: 0,
+            activation: Activation::None,
+            precision: Precision::Fp16,
+        }
+    }
+
+    #[test]
+    fn plans_mobilenet_fp16_height_splits() {
+        let cases = [
+            (mobilenet_1x1(112, 112, 32, 16), vec![45, 45, 22]),
+            (mobilenet_1x1(56, 56, 96, 24), vec![30, 26]),
+            (mobilenet_1x1(56, 56, 24, 144), vec![45, 11]),
+        ];
+
+        for (shape, expected_heights) in cases {
+            let tasks = plan_conv_tasks(&shape).unwrap();
+            assert_eq!(
+                tasks
+                    .iter()
+                    .map(|task| task.output_height)
+                    .collect::<Vec<_>>(),
+                expected_heights
+            );
+            assert_eq!(tasks[0].input_banks, 10);
+            assert_eq!(tasks[0].weights_banks, 2);
+            assert!(!tasks[0].reuse_weights);
+            assert!(tasks.iter().skip(1).all(|task| task.reuse_weights));
+            assert_eq!(
+                tasks.iter().map(|task| task.output_height).sum::<u32>(),
+                shape.output_height
+            );
+        }
+    }
+
+    #[test]
+    fn plans_kernel_overlap_for_strided_3x3_splits() {
+        let mut shape = mobilenet_1x1(100, 100, 32, 16);
+        shape.weights_width = 3;
+        shape.weights_height = 3;
+        shape.stride = 2;
+        shape.output_width = 49;
+        shape.output_height = 49;
+
+        let tasks = plan_conv_tasks(&shape).unwrap();
+        assert_eq!(tasks.len(), 2);
+        assert_eq!(tasks[0].input_height, 51);
+        assert_eq!(tasks[0].output_height, 25);
+        assert_eq!(tasks[0].retain_slices, 1);
+        assert_eq!(tasks[1].input_top, 50);
+        assert_eq!(tasks[1].input_height, 50);
+        assert_eq!(tasks[1].output_top, 25);
+        assert_eq!(tasks[1].output_height, 24);
+        assert_eq!(tasks[1].overlap_slices, 1);
+    }
+
+    #[test]
+    fn split_regcmd_builder_returns_one_buffer_per_task() {
+        let shape = mobilenet_1x1(112, 112, 32, 16);
+        let buffers = ConvBuffers {
+            input_addr: 0x1000,
+            weights_addr: 0x2000,
+            bias_addr: 0x3000,
+            output_addr: 0x4000,
+        };
+        let plans = plan_conv_tasks(&shape).unwrap();
+        let command_buffers = build_conv_regcmd_tasks(&shape, &buffers).unwrap();
+
+        assert_eq!(command_buffers.len(), plans.len());
+        assert!(command_buffers.iter().all(|commands| !commands.is_empty()));
+
+        for (plan, commands) in plans.iter().zip(&command_buffers) {
+            let expected_input_addr = Register::<CnaFeatureDataAddr>::new()
+                .feature_base_addr(Bits::new(buffers.input_addr + plan.input_offset_bytes))
+                .build()
+                .0;
+            let expected_output_addr = Register::<DpuDstBaseAddr>::new()
+                .dst_base_addr(Bits::new(buffers.output_addr + plan.output_offset_bytes))
+                .build()
+                .0;
+            let expected_input_size = Register::<CnaDataSize0>::new()
+                .datain_width(Bits::new(shape.input_width))
+                .datain_height(Bits::new(plan.input_height))
+                .build()
+                .0;
+            let expected_output_size = Register::<CoreDataoutSize0>::new()
+                .dataout_width(Bits::new(shape.output_width - 1))
+                .dataout_height(Bits::new(plan.output_height - 1))
+                .build()
+                .0;
+            let mut cbuf = Register::<CnaCbufCon0>::new();
+            cbuf.weight_bank(Bits::new(plan.weights_banks))
+                .data_bank(Bits::new(plan.input_banks));
+            if plan.reuse_weights {
+                cbuf.weight_reuse(Bits::new(1));
+            }
+
+            for expected in [
+                expected_input_addr,
+                expected_output_addr,
+                expected_input_size,
+                expected_output_size,
+                cbuf.build().0,
+                RegCmd::new(DOMAIN_PC, REG_PC_BASE_ADDRESS, 0).0,
+            ] {
+                assert!(
+                    commands.iter().any(|command| command.0 == expected),
+                    "task {} is missing expected regcmd {expected:#018x}",
+                    plan.index
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn keeps_small_convolution_on_the_historical_single_task_path() {
+        let shape = mobilenet_1x1(4, 4, 16, 16);
+        let tasks = plan_conv_tasks(&shape).unwrap();
+        assert_eq!(tasks.len(), 1);
+        assert_eq!(tasks[0].input_banks, 1);
+        assert_eq!(tasks[0].weights_banks, CBUF_BANKS - tasks[0].input_banks);
+    }
 }

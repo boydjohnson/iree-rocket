@@ -42,9 +42,11 @@
 //! This is `rocket-hal-driver`'s tag value `3` in `executable_cache.rs`'s
 //! tag convention -- see that module's doc comment.
 
+#[cfg(test)]
+use crate::rocket::regcmd::plan_conv_tasks;
 use crate::rocket::regcmd::{
-    Activation, ConvShape, Precision, compute_input_banks, compute_out_shift,
-    compute_task_input_channels, compute_task_output_channels,
+    Activation, ConvShape, Precision, compute_out_shift, compute_task_input_channels,
+    compute_task_output_channels,
 };
 
 pub const CONV2D_V1_FORMAT_VERSION: u32 = 1;
@@ -249,10 +251,10 @@ pub fn validate_conv_shape(shape: &ConvShape) -> Result<(), &'static str> {
     // function's own assert so the wire-format decode path doesn't reject
     // shapes the regcmd builder is now willing to attempt.
 
-    const CBUF_BANKS: u32 = 12;
-    if compute_input_banks(shape) >= CBUF_BANKS {
-        return Err("shape needs more input CBUF banks than the single-task path has");
-    }
+    // Input tensors that need 12 or more CBUF banks are accepted here:
+    // `build_conv_regcmd_tasks` splits them along height. The exact task
+    // plan is intentionally owned by regcmd.rs rather than duplicated in
+    // wire-format validation.
     if compute_out_shift(shape) < 0 {
         return Err("unsupported output conversion scale: computed out_shift is negative");
     }
@@ -474,6 +476,22 @@ mod tests {
     }
 
     #[test]
+    fn validate_accepts_shape_that_requires_cbuf_height_splitting() {
+        let shape = ConvShape {
+            input_width: 112,
+            input_height: 112,
+            input_channels: 32,
+            output_width: 112,
+            output_height: 112,
+            output_channels: 16,
+            precision: Precision::Fp16,
+            ..known_good_shape()
+        };
+        assert!(plan_conv_tasks(&shape).unwrap().len() > 1);
+        assert_eq!(validate_conv_shape(&shape), Ok(()));
+    }
+
+    #[test]
     fn validate_rejects_wide_atomic_combo() {
         let shape = ConvShape {
             output_channels: 2,
@@ -527,20 +545,14 @@ mod tests {
 
     #[test]
     fn validate_rejects_task_input_channels_overflowing_16_bits() {
-        // input_width=1 (not known_good_shape's 4) keeps compute_input_banks
-        // small enough that THIS shape isolates the 16-bit
-        // CNA_DATA_SIZE1.datain_channel check specifically, rather than
-        // tripping the CBUF-bank check first.
+        // This shape isolates the 16-bit CNA_DATA_SIZE1.datain_channel
+        // check.
         let shape = ConvShape {
             input_width: 1,
             input_channels: 65535,
             output_channels: 1,
             ..known_good_shape()
         };
-        assert!(
-            compute_input_banks(&shape) < 12,
-            "test shape must not trip the CBUF-bank check first"
-        );
         assert!(validate_conv_shape(&shape).is_err());
     }
 
@@ -622,7 +634,6 @@ mod tests {
             weights_height: 31,
             ..known_good_shape()
         };
-        assert!(compute_input_banks(&shape) < 12);
         assert!(compute_task_input_channels(&shape) <= u16::MAX as u32);
         assert_eq!(
             validate_conv_shape(&shape),
