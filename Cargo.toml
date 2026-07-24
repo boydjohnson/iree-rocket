@@ -1,0 +1,19 @@
+[workspace]
+resolver = "2"
+members = [
+    "rocket-schema",
+    "iree-rocket-hal",
+    "rocket-hal-driver",
+]
+
+[profile.release]
+# Keep full optimization but retain DWARF debug info (Cargo's release
+# default is debug = 0, which is why the board's gdb session had no
+# symbol/line info and had to fall back to raw disassembly) -- rocket-hal-driver
+# is still under active debugging (see the command_buffer_tests segfault
+# in progress) and a real backtrace with locals is worth the larger
+# binary. Was previously set per-crate on rocket-hal-driver/Cargo.toml
+# (applying build-graph-wide since there was no workspace to scope it to);
+# moved here because member-crate [profile.*] sections are ignored once a
+# workspace root exists.
+debug = true
