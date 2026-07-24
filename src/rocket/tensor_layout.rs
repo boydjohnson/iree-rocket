@@ -8,11 +8,19 @@
 /// Physical byte width of one NC1HWC2 inner-channel block.
 pub const FEATURE_ATOMIC_BYTES: usize = 16;
 
-/// Physical byte width of one coefficient atom.
+/// Physical byte width of one output-kernel coefficient atom.
 ///
 /// The convolution kernel group is 32 lanes for int8 and 16 lanes for
 /// fp16, so both occupy 32 bytes.
 pub const WEIGHT_ATOMIC_BYTES: usize = 32;
+
+/// Number of input channels in one coefficient group.
+///
+/// Unlike the output-kernel group, this remains 32 channels for fp16.
+/// A C32-to-C16 fp16 hardware probe distinguished this from a 16-channel
+/// interpretation exactly: the latter split each logical output across two
+/// hardware output kernels.
+pub const WEIGHT_INPUT_GROUP_CHANNELS: usize = 32;
 
 /// Returns the NC1HWC2 storage required for `pixel_count` dense pixels.
 ///
@@ -110,12 +118,15 @@ pub fn rocket_weight_storage_size(
 ///
 /// The physical nesting is:
 ///
-/// `output_block -> input_block -> filter_x -> filter_y ->
+/// `output_block -> input_group -> filter_x -> filter_y ->
 /// output_lane -> input_lane`
 ///
-/// A block is one 32-byte weight atom: 32 channels for int8 or 16 channels
-/// for fp16. Input channels are zero-padded to the register-programmed
-/// 16-channel granularity and output kernels to a multiple of two.
+/// An output block is one 32-byte weight atom: 32 kernels for int8 or 16
+/// kernels for fp16. Input groups remain 32 channels for both precisions,
+/// with a partial final group when the register-programmed input channel
+/// count is not divisible by 32. Input channels are zero-padded to the
+/// register-programmed 16-channel granularity and output kernels to a
+/// multiple of two.
 pub fn pack_hwcf_to_rocket_weights(
     dense: &[u8],
     filter_height: usize,
@@ -147,24 +158,28 @@ pub fn pack_hwcf_to_rocket_weights(
     }
     packed[..packed_len].fill(0);
 
-    let block_channels = WEIGHT_ATOMIC_BYTES / element_size;
+    let output_block_channels = WEIGHT_ATOMIC_BYTES / element_size;
     let padded_input_channels = input_channels.max(16).next_multiple_of(16);
     let padded_output_channels = output_channels.next_multiple_of(2);
-    let input_blocks = padded_input_channels.div_ceil(block_channels);
-    let output_blocks = padded_output_channels.div_ceil(block_channels);
+    let input_groups = padded_input_channels.div_ceil(WEIGHT_INPUT_GROUP_CHANNELS);
+    let output_blocks = padded_output_channels.div_ceil(output_block_channels);
     let mut dst_offset = 0;
 
     for output_block in 0..output_blocks {
-        for input_block in 0..input_blocks {
+        for input_group in 0..input_groups {
             for filter_x in 0..filter_width {
                 for filter_y in 0..filter_height {
-                    for output_lane in 0..block_channels {
-                        let output_channel = output_block * block_channels + output_lane;
+                    for output_lane in 0..output_block_channels {
+                        let output_channel = output_block * output_block_channels + output_lane;
                         if output_channel >= padded_output_channels {
                             continue;
                         }
-                        for input_lane in 0..block_channels {
-                            let input_channel = input_block * block_channels + input_lane;
+                        for input_lane in 0..WEIGHT_INPUT_GROUP_CHANNELS {
+                            let input_channel =
+                                input_group * WEIGHT_INPUT_GROUP_CHANNELS + input_lane;
+                            if input_channel >= padded_input_channels {
+                                continue;
+                            }
                             if input_channel < input_channels && output_channel < output_channels {
                                 let src_element = (((filter_y * filter_width + filter_x)
                                     * input_channels
@@ -260,27 +275,15 @@ mod tests {
             .chunks_exact(BPE)
             .map(|bytes| u16::from_le_bytes([bytes[0], bytes[1]]))
             .collect::<Vec<_>>();
-        assert_eq!(&values[0..16], &(0u16..16).collect::<Vec<_>>());
-        assert_eq!(&values[16..32], &(100u16..116).collect::<Vec<_>>());
+        assert_eq!(&values[0..32], &(0u16..32).collect::<Vec<_>>());
+        assert_eq!(&values[32..64], &(100u16..132).collect::<Vec<_>>());
         assert_eq!(
-            &values[16 * 16..16 * 16 + 16],
-            &(16u16..32).collect::<Vec<_>>()
+            &values[16 * 32..16 * 32 + 32],
+            &(1600u16..1632).collect::<Vec<_>>()
         );
         assert_eq!(
-            &values[32 * 16..32 * 16 + 16],
-            &(1600u16..1616).collect::<Vec<_>>()
-        );
-        assert_eq!(
-            &values[33 * 16..33 * 16 + 16],
-            &(1700u16..1716).collect::<Vec<_>>()
-        );
-        assert_eq!(
-            &values[34 * 16..34 * 16 + 16],
-            &(1616u16..1632).collect::<Vec<_>>()
-        );
-        assert_eq!(
-            &values[35 * 16..35 * 16 + 16],
-            &(1716u16..1732).collect::<Vec<_>>()
+            &values[17 * 32..17 * 32 + 32],
+            &(1700u16..1732).collect::<Vec<_>>()
         );
     }
 }
