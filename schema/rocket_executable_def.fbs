@@ -16,11 +16,25 @@ enum Precision : ubyte {
   FP16 = 1,
 }
 
-// Wire-format values. RELUX uses Conv2DDef.activation_cmp.
+// Wire-format values. RELUX uses the selected kernel definition's
+// activation_cmp field.
 enum Activation : ubyte {
   NONE = 0,
   RELU = 1,
   RELUX = 2,
+}
+
+// Conv2D shape fields that may be supplied by dispatch push constants.
+// Numeric values are wire-format ABI and must not be changed or reused.
+enum Conv2DDimension : ubyte {
+  INPUT_WIDTH = 0,
+  INPUT_HEIGHT = 1,
+  INPUT_CHANNELS = 2,
+  OUTPUT_WIDTH = 3,
+  OUTPUT_HEIGHT = 4,
+  OUTPUT_CHANNELS = 5,
+  WEIGHTS_WIDTH = 6,
+  WEIGHTS_HEIGHT = 7,
 }
 
 // Describes one NHWC/HWCF 2-D convolution.
@@ -58,12 +72,47 @@ table Conv2DDef {
   activation_cmp:uint32;
 
   precision:Precision = INT8;
+
+  // Ordered list mapping dispatch push-constant ordinal to a shape field.
+  // Each entry consumes one uint32 push constant. A listed field must be zero
+  // in this table and is replaced by the nonzero dispatch value before runtime
+  // semantic validation and register-command construction. Entries must be
+  // unique. An absent/empty vector preserves the original fully-static ABI.
+  runtime_dimensions:[Conv2DDimension];
+}
+
+// Describes one row-major [M,K] x [K,N] fully-connected operation.
+//
+// The runtime lowers this to the NPU's 1x1-convolution path. The fixed
+// physical-height padding required by that lowering is a runtime storage
+// detail and is deliberately not part of the logical executable ABI.
+table FullyConnectedDef {
+  m:uint32;
+  k:uint32;
+  n:uint32;
+
+  input_zero_point:uint32;
+  output_zero_point:uint32;
+  weights_zero_point:uint32;
+
+  input_scale:float = 1.0;
+  weights_scale:float = 1.0;
+  output_scale:float = 1.0;
+
+  truncate_bits:uint32;
+  activation:Activation = NONE;
+
+  // Only meaningful when activation is RELUX.
+  activation_cmp:uint32;
+
+  precision:Precision = INT8;
 }
 
 // Add future Rocket kernel kinds here. Existing numeric values must not be
 // changed or reused.
 union KernelDef {
   Conv2DDef,
+  FullyConnectedDef,
 }
 
 // Information about one exported kernel.
@@ -80,4 +129,3 @@ table ExecutableDef {
 }
 
 root_type ExecutableDef;
-

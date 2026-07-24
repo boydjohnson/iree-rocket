@@ -25,6 +25,21 @@ string. Fields and enum values must not be removed or reused.
 The IREE `iree_flatbuffer_file_header_t` version remains `0`. The FlatBuffer
 file identifier carries the Rocket format version.
 
+## Runtime Conv2D dimensions
+
+`Conv2DDef.runtime_dimensions` is an optional ordered mapping from dispatch
+push-constant ordinals to logical shape fields. Existing executables omit the
+vector and remain fully static.
+
+Each vector entry consumes one 32-bit push constant. The corresponding scalar
+field in `Conv2DDef` must be zero and is replaced with the nonzero runtime
+value before semantic validation. Entries must be known and unique, and the
+runtime must reject missing, extra, zero, or hardware-invalid values.
+
+The vector supports input/output width, height, channels, and filter width and
+height. Batch remains fixed at one; stride, dilation, depthwise mode, numeric
+parameters, and precision remain executable properties.
+
 ## Export ordinals
 
 `ExecutableDef.exports` is in canonical IREE export ordinal order. The
@@ -61,4 +76,5 @@ Consumers should share binary golden fixtures produced from this schema:
 - Missing required fields, invalid unions, and truncated buffers are rejected.
 - Structurally valid but hardware-invalid convolution shapes are rejected by
   runtime semantic validation.
-
+- Runtime dimension mappings reject unknown or duplicate fields and dispatches
+  reject missing, extra, zero, or hardware-invalid push constants.
