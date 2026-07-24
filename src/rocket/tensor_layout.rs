@@ -51,6 +51,25 @@ pub fn pack_nhwc_to_nc1hwc2(
     bytes_per_pixel: usize,
     packed: &mut [u8],
 ) -> Result<usize, &'static str> {
+    pack_nhwc_to_nc1hwc2_padded(dense, pixel_count, bytes_per_pixel, bytes_per_pixel, packed)
+}
+
+/// Packs dense NHWC bytes into NC1HWC2 with an explicitly padded pixel width.
+///
+/// `bytes_per_pixel` describes the logical dense input. The packed layout
+/// has enough surfaces for `packed_bytes_per_pixel`, allowing callers to
+/// match a hardware channel count that is wider than the logical tensor.
+/// All padding surfaces and lanes are zero-filled.
+pub fn pack_nhwc_to_nc1hwc2_padded(
+    dense: &[u8],
+    pixel_count: usize,
+    bytes_per_pixel: usize,
+    packed_bytes_per_pixel: usize,
+    packed: &mut [u8],
+) -> Result<usize, &'static str> {
+    if packed_bytes_per_pixel < bytes_per_pixel {
+        return Err("packed NC1HWC2 pixel width is smaller than the dense pixel width");
+    }
     let dense_len = pixel_count
         .checked_mul(bytes_per_pixel)
         .ok_or("dense NHWC storage size overflows usize")?;
@@ -58,7 +77,7 @@ pub fn pack_nhwc_to_nc1hwc2(
         return Err("dense NHWC input is smaller than its declared shape");
     }
 
-    let packed_len = nc1hwc2_storage_size(pixel_count, bytes_per_pixel)?;
+    let packed_len = nc1hwc2_storage_size(pixel_count, packed_bytes_per_pixel)?;
     if packed.len() < packed_len {
         return Err("NC1HWC2 destination is smaller than its declared shape");
     }
@@ -246,9 +265,43 @@ mod tests {
     }
 
     #[test]
+    fn zero_pads_fp16_c24_to_the_hardware_c32_width() {
+        const PIXELS: usize = 2;
+        const BYTES_PER_PIXEL: usize = 24 * 2;
+        const PACKED_BYTES_PER_PIXEL: usize = 32 * 2;
+        let dense: Vec<_> = (0..PIXELS * BYTES_PER_PIXEL)
+            .map(|value| value as u8)
+            .collect();
+        let mut packed = vec![0xFF; nc1hwc2_storage_size(PIXELS, PACKED_BYTES_PER_PIXEL).unwrap()];
+
+        let written = pack_nhwc_to_nc1hwc2_padded(
+            &dense,
+            PIXELS,
+            BYTES_PER_PIXEL,
+            PACKED_BYTES_PER_PIXEL,
+            &mut packed,
+        )
+        .unwrap();
+
+        assert_eq!(written, PIXELS * 4 * FEATURE_ATOMIC_BYTES);
+        for surface in 0..3 {
+            for pixel in 0..PIXELS {
+                let packed_offset = (surface * PIXELS + pixel) * FEATURE_ATOMIC_BYTES;
+                let dense_offset = pixel * BYTES_PER_PIXEL + surface * FEATURE_ATOMIC_BYTES;
+                assert_eq!(
+                    &packed[packed_offset..packed_offset + FEATURE_ATOMIC_BYTES],
+                    &dense[dense_offset..dense_offset + FEATURE_ATOMIC_BYTES]
+                );
+            }
+        }
+        assert_eq!(&packed[PIXELS * 3 * FEATURE_ATOMIC_BYTES..], &[0; 32]);
+    }
+
+    #[test]
     fn rejects_short_buffers_and_size_overflow() {
         assert!(pack_nhwc_to_nc1hwc2(&[0; 3], 1, 4, &mut [0; 16]).is_err());
         assert!(pack_nhwc_to_nc1hwc2(&[0; 4], 1, 4, &mut [0; 15]).is_err());
+        assert!(pack_nhwc_to_nc1hwc2_padded(&[0; 4], 1, 4, 3, &mut [0; 16]).is_err());
         assert!(nc1hwc2_storage_size(usize::MAX, 17).is_err());
     }
 
