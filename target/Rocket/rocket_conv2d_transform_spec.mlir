@@ -399,7 +399,19 @@ module attributes {transform.with_named_sequence} {
 
   transform.named_sequence @__transform_main(%module: !transform.any_op) {
     %funcs = transform.structured.match ops{["util.func"]} in %module : (!transform.any_op) -> !transform.any_op
-    transform.foreach %funcs : !transform.any_op {
+    // ONNX commonly imports Conv as NCHW/FCHW, while Rocket's logical
+    // convolution ABI and the matchers above use NHWC/HWCF. Run IREE's
+    // semantics-preserving layout conversion before attempting any Rocket
+    // specialization. It inserts the required input/filter/init/output
+    // transposes for regular convolutions. Later canonicalization can fold
+    // adjacent transposes across the graph. Depthwise NCHW conversion remains
+    // separate work; the current Rocket transform has no depthwise matcher.
+    %channels_last_funcs = transform.apply_registered_pass
+        "iree-preprocessing-convert-conv-to-channels-last" to %funcs
+        : (!transform.any_op) -> !transform.any_op
+    %canonical_funcs = transform.apply_registered_pass "canonicalize"
+        to %channels_last_funcs : (!transform.any_op) -> !transform.any_op
+    transform.foreach %canonical_funcs : !transform.any_op {
       ^bb1(%func: !transform.any_op):
         transform.foreach_match in %func
             @match_conv2d_0 -> @cast_and_call_conv2d_0,

@@ -12,3 +12,7 @@ iree_setup_c_src_root(
 )
 
 add_subdirectory(${CMAKE_CURRENT_LIST_DIR}/target/Rocket target/Rocket)
+
+if(IREE_BUILD_TESTS)
+  add_subdirectory(${CMAKE_CURRENT_LIST_DIR}/test test)
+endif()
