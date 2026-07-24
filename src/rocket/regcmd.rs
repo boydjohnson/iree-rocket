@@ -897,22 +897,20 @@ fn build_conv_cna_core_dpu_dpu_rdma(
         shape.output_width * shape.output_height * 2 * if shape.depthwise { 2 } else { 1 };
 
     // fill_task(): input_data_entries, three-way branch. The multi-channel
-    // (`else`) arm is EXPERIMENTAL for Fp16 (bpe>1): Mesa's own source
-    // (`rkt_task.c`) computes this arm with a hardcoded `bpe=sizeof(uint8_t)`
-    // implicitly baked into the channel-count term (never generalized,
-    // since Mesa never emits non-int8 ops) -- generalized here by analogy
-    // with that same file's OWN `calc_entries_per_slice()`, which DOES
-    // thread a `bpe` factor through the identical
-    // `DIV_ROUND_UP(channels * bpe, FEATURE_ATOMIC_SIZE)` pattern (also
-    // hardcoded to 1 there, but structurally the general form). Not yet
-    // hardware-confirmed for bpe>1.
+    // count must use the padded channel width programmed into
+    // CNA_DATA_SIZE1, not the logical channel count. They are equivalent
+    // for Mesa's int8 path after conversion to 16-byte feature atomics, but
+    // differ for fp16 shapes such as C24: logical C24 is three atomics while
+    // task C32 is four. Programming three produced a 42-entry row for W56,
+    // causing each output row to begin 14 pixels early; four produces the
+    // required 56 entries.
     let bpe = shape.precision.bytes_per_element();
     let input_data_entries = if input_channels_real_is_one {
         shape.input_width * shape.input_height
     } else if shape.input_width == 40 && shape.input_channels == 40 {
         40
     } else {
-        (shape.input_width * 2 * (shape.input_channels * bpe).div_ceil(FEATURE_ATOMIC_SIZE as u32))
+        (shape.input_width * 2 * (task_input_channels * bpe).div_ceil(FEATURE_ATOMIC_SIZE as u32))
             .div_ceil(8)
     };
 
@@ -3346,6 +3344,28 @@ mod conv_task_tests {
                 );
             }
         }
+    }
+
+    #[test]
+    fn fp16_c24_programs_entries_for_the_padded_c32_row() {
+        let shape = mobilenet_1x1(56, 56, 24, 144);
+        let buffers = ConvBuffers {
+            input_addr: 0x1000,
+            weights_addr: 0x2000,
+            bias_addr: 0x3000,
+            output_addr: 0x4000,
+        };
+        let command_buffers = build_conv_regcmd_tasks(&shape, &buffers).unwrap();
+        let expected = Register::<CnaCbufCon1>::new()
+            .data_entries(Bits::new(56))
+            .build()
+            .0;
+
+        assert!(
+            command_buffers
+                .iter()
+                .all(|commands| { commands.iter().any(|command| command.0 == expected) })
+        );
     }
 
     #[test]
