@@ -29,16 +29,32 @@
 //!   secretly cross-contaminating (wrong stride math, wrong CBUF geometry
 //!   assumption), this is what would catch it -- a uniform fill alone
 //!   cannot.
+//! - `fc_uniform_fill_all_output_channels_agree`: decodes all N=32 output
+//!   channels, crossing the 16-byte feature-surface boundary that the older
+//!   row helpers never inspected.
+//! - `fc_packed_weights_select_one_output_channel`: starts from logical
+//!   `[M,K]`/`[K,N]` tensors, packs them with the same layout helpers the HAL
+//!   driver uses, and proves that one nonzero logical weight column changes
+//!   only the matching output channel.
+//! - `fc_non_square_m_columns_are_independent`: repeats the M-as-width check
+//!   at M=7, so the original square M=4/height=4 geometry cannot accidentally
+//!   hide a line/surface-stride error.
 
 use std::{fs::OpenOptions, mem, os::unix::io::AsRawFd, ptr};
 
 use iree_rocket_hal::rocket::{
     device::{Buffer, close_bo, fini_bo, prep_bo, submit},
     regcmd::{Activation, FcBuffers, FcShape, build_fc_regcmd},
+    tensor_layout::{
+        nc1hwc2_storage_size, pack_hwcf_to_rocket_weights, pack_nhwc_to_nc1hwc2,
+        rocket_weight_storage_size,
+    },
 };
 
 const DEVICE_PATH: &str = "/dev/accel/accel0";
 const TENSOR_SIZE: usize = 4096;
+const FC_SAFE_HEIGHT: usize = 4;
+const FEATURE_ATOMIC_BYTES: usize = 16;
 
 /// Smallest atomic-aligned FC shape: m=4 (maps onto input_width, matches
 /// FC_SAFE_HEIGHT so the padded cube is square), k=16 (one full
@@ -69,6 +85,14 @@ fn small_shape() -> FcShape {
 /// pooling_hw.rs -- output_channels padding still lands each pixel at a
 /// full 16-byte-aligned atomic slot regardless of real channel count.
 fn run_uniform_fc(shape: &FcShape, input_fill: u8, weight_fill: u8) -> Vec<u8> {
+    let dense = run_uniform_fc_all_channels(shape, input_fill, weight_fill);
+    first_output_channel(shape, &dense)
+}
+
+/// Uniform-fill runner that preserves all `N` channels of row 0 in dense
+/// `[M,N]` order. The older FC tests intentionally sampled only channel 0;
+/// tests that need to validate output-surface addressing use this instead.
+fn run_uniform_fc_all_channels(shape: &FcShape, input_fill: u8, weight_fill: u8) -> Vec<u8> {
     let file = OpenOptions::new()
         .read(true)
         .write(true)
@@ -89,15 +113,43 @@ fn run_uniform_fc(shape: &FcShape, input_fill: u8, weight_fill: u8) -> Vec<u8> {
         let buf_out = Buffer::new(fd, TENSOR_SIZE, &file);
         ptr::write_bytes(buf_out.host_ptr, 0, TENSOR_SIZE);
 
-        let pixels = run_fc(&file, fd, shape, &buf_in, &buf_w, &buf_bias, &buf_out);
+        let output = run_fc(&file, fd, shape, &buf_in, &buf_w, &buf_bias, &buf_out);
 
         close_bo(fd, buf_in.handle).ok();
         close_bo(fd, buf_w.handle).ok();
         close_bo(fd, buf_bias.handle).ok();
         close_bo(fd, buf_out.handle).ok();
 
-        pixels
+        output
     }
+}
+
+fn first_output_channel(shape: &FcShape, dense_output: &[u8]) -> Vec<u8> {
+    (0..shape.m as usize)
+        .map(|m| dense_output[m * shape.n as usize])
+        .collect()
+}
+
+/// Converts the DPU's feature-surface output into the logical row-0 `[M,N]`
+/// tensor. The physical cube contains four spatial rows; only row 0 belongs
+/// to the public FC result, but every channel surface is still strided over
+/// all `M * FC_SAFE_HEIGHT` physical pixels.
+fn decode_fc_row0(shape: &FcShape, raw: &[u8]) -> Vec<u8> {
+    let m = shape.m as usize;
+    let n = shape.n as usize;
+    let physical_pixels = m * FC_SAFE_HEIGHT;
+    let surface_stride = physical_pixels * FEATURE_ATOMIC_BYTES;
+    let mut dense = vec![0u8; m * n];
+
+    for row in 0..m {
+        for channel in 0..n {
+            let surface = channel / FEATURE_ATOMIC_BYTES;
+            let lane = channel % FEATURE_ATOMIC_BYTES;
+            let src = surface * surface_stride + row * FEATURE_ATOMIC_BYTES + lane;
+            dense[row * n + channel] = raw[src];
+        }
+    }
+    dense
 }
 
 /// Shared dispatch/readback plumbing -- factored out so the per-row-
@@ -150,11 +202,77 @@ unsafe fn run_fc(
         prep_bo(fd, buf_out.handle, 2_000_000_000).expect("job did not complete within timeout");
         close_bo(fd, buf_cmd.handle).ok();
 
-        // Row 0 only (h=0) -- rows 1..FC_SAFE_HEIGHT-1 hold real but unread
-        // output for garbage input, per regcmd.rs's FC section doc comment.
-        // m=4 real output columns, each landing at a 16-byte-aligned slot.
-        let raw = std::slice::from_raw_parts(buf_out.host_ptr, shape.m as usize * 16);
-        (0..shape.m as usize).map(|i| raw[i * 16]).collect()
+        // Row 0 only (h=0) is logically returned, but decoding channel
+        // surfaces requires retaining their full four-row physical stride.
+        let physical_pixels = shape.m as usize * FC_SAFE_HEIGHT;
+        let surface_count = (shape.n as usize).div_ceil(FEATURE_ATOMIC_BYTES);
+        let raw_len = physical_pixels * surface_count * FEATURE_ATOMIC_BYTES;
+        assert!(
+            raw_len <= TENSOR_SIZE,
+            "test output buffer too small for m={} n={}",
+            shape.m,
+            shape.n
+        );
+        let raw = std::slice::from_raw_parts(buf_out.host_ptr, raw_len);
+        decode_fc_row0(shape, raw)
+    }
+}
+
+/// Runs logical dense `[M,K]` input and `[K,N]` weights through the explicit
+/// host-side layouts required by the convolution-backed FC implementation.
+/// Rows 1..3 of the physical input cube are filled with the input zero point;
+/// only row 0 receives the caller's logical M rows.
+fn run_packed_fc(shape: &FcShape, input: &[u8], weights: &[u8]) -> Vec<u8> {
+    let m = shape.m as usize;
+    let k = shape.k as usize;
+    let n = shape.n as usize;
+    assert_eq!(input.len(), m * k);
+    assert_eq!(weights.len(), k * n);
+
+    let physical_pixels = m * FC_SAFE_HEIGHT;
+    let mut physical_dense_input = vec![shape.input_zero_point as u8; physical_pixels * k];
+    physical_dense_input[..input.len()].copy_from_slice(input);
+    let packed_input_len = nc1hwc2_storage_size(physical_pixels, k).unwrap();
+    let mut packed_input = vec![0u8; packed_input_len];
+    pack_nhwc_to_nc1hwc2(&physical_dense_input, physical_pixels, k, &mut packed_input).unwrap();
+
+    let packed_weights_len = rocket_weight_storage_size(1, 1, k, n, 1).unwrap();
+    let mut packed_weights = vec![shape.weights_zero_point as u8; packed_weights_len];
+    pack_hwcf_to_rocket_weights(weights, 1, 1, k, n, 1, &mut packed_weights).unwrap();
+
+    assert!(packed_input_len <= TENSOR_SIZE);
+    assert!(packed_weights_len <= TENSOR_SIZE);
+
+    let file = OpenOptions::new()
+        .read(true)
+        .write(true)
+        .open(DEVICE_PATH)
+        .expect("failed to open NPU device");
+    let fd = file.as_raw_fd();
+
+    unsafe {
+        let buf_in = Buffer::new(fd, TENSOR_SIZE, &file);
+        ptr::write_bytes(buf_in.host_ptr, shape.input_zero_point as u8, TENSOR_SIZE);
+        ptr::copy_nonoverlapping(packed_input.as_ptr(), buf_in.host_ptr, packed_input_len);
+
+        let buf_w = Buffer::new(fd, TENSOR_SIZE, &file);
+        ptr::write_bytes(buf_w.host_ptr, shape.weights_zero_point as u8, TENSOR_SIZE);
+        ptr::copy_nonoverlapping(packed_weights.as_ptr(), buf_w.host_ptr, packed_weights_len);
+
+        let buf_bias = Buffer::new(fd, TENSOR_SIZE, &file);
+        ptr::write_bytes(buf_bias.host_ptr, 0, TENSOR_SIZE);
+
+        let buf_out = Buffer::new(fd, TENSOR_SIZE, &file);
+        ptr::write_bytes(buf_out.host_ptr, 0, TENSOR_SIZE);
+
+        let output = run_fc(&file, fd, shape, &buf_in, &buf_w, &buf_bias, &buf_out);
+
+        close_bo(fd, buf_in.handle).ok();
+        close_bo(fd, buf_w.handle).ok();
+        close_bo(fd, buf_bias.handle).ok();
+        close_bo(fd, buf_out.handle).ok();
+
+        output
     }
 }
 
@@ -188,6 +306,93 @@ fn fc_output_tracks_input() {
         low, high,
         "output column value didn't change between input_fill=10 ({low}) and \
          input_fill=200 ({high}) -- suggests the op isn't really reading the input"
+    );
+}
+
+/// The original FC tests used N=32 but sampled only channel 0. This decodes
+/// both 16-byte output surfaces and verifies that uniform input/weights
+/// produce the same value in every logical `[M,N]` position.
+#[test]
+#[ignore = "needs the real NPU device -- cross-compile for aarch64, copy to the board, run there"]
+fn fc_uniform_fill_all_output_channels_agree() {
+    let shape = small_shape();
+    let output = run_uniform_fc_all_channels(&shape, 118, 2);
+    assert!(
+        output.iter().all(|&value| value == output[0]),
+        "uniform input/weights should agree across all {}x{} logical FC outputs, got {output:?}",
+        shape.m,
+        shape.n
+    );
+}
+
+/// Validates the logical `[K,N]` weight ABI and the second output surface:
+/// all-zero-real weights establish a per-element baseline, then only logical
+/// output channel 17 receives a nonzero coefficient for every K. No other
+/// output channel may change.
+#[test]
+#[ignore = "needs the real NPU device -- cross-compile for aarch64, copy to the board, run there"]
+fn fc_packed_weights_select_one_output_channel() {
+    const SELECTED_CHANNEL: usize = 17;
+    let shape = FcShape {
+        input_zero_point: 0x80,
+        output_zero_point: 0x80,
+        weights_zero_point: 0x80,
+        ..small_shape()
+    };
+    let input = vec![0x81; shape.m as usize * shape.k as usize];
+    let baseline_weights = vec![0x80; shape.k as usize * shape.n as usize];
+    let baseline = run_packed_fc(&shape, &input, &baseline_weights);
+
+    let mut selected_weights = baseline_weights;
+    for k in 0..shape.k as usize {
+        selected_weights[k * shape.n as usize + SELECTED_CHANNEL] = 0x82;
+    }
+    let selected = run_packed_fc(&shape, &input, &selected_weights);
+
+    for m in 0..shape.m as usize {
+        for n in 0..shape.n as usize {
+            let index = m * shape.n as usize + n;
+            if n == SELECTED_CHANNEL {
+                assert_ne!(
+                    selected[index], baseline[index],
+                    "m={m}: selected output channel {n} did not respond to its nonzero weights"
+                );
+            } else {
+                assert_eq!(
+                    selected[index], baseline[index],
+                    "m={m}: output channel {n} changed when only channel {SELECTED_CHANNEL}'s weights changed"
+                );
+            }
+        }
+    }
+}
+
+/// Exercises M-as-width when M differs from the internal fixed height (4).
+/// Logical input rows have increasing fills and are packed into physical row
+/// 0; output channel 0 must preserve that order without cross-contamination.
+#[test]
+#[ignore = "needs the real NPU device -- cross-compile for aarch64, copy to the board, run there"]
+fn fc_non_square_m_columns_are_independent() {
+    let shape = FcShape {
+        m: 7,
+        ..small_shape()
+    };
+    let mut input = vec![0u8; shape.m as usize * shape.k as usize];
+    for m in 0..shape.m as usize {
+        input[m * shape.k as usize..(m + 1) * shape.k as usize].fill((10 + m * 30) as u8);
+    }
+    let weights = vec![2u8; shape.k as usize * shape.n as usize];
+    let dense = run_packed_fc(&shape, &input, &weights);
+    let columns = first_output_channel(&shape, &dense);
+
+    assert!(
+        columns.windows(2).all(|pair| pair[0] <= pair[1]),
+        "expected M=7 output columns to be non-decreasing, got {columns:?}"
+    );
+    assert_ne!(
+        columns.first(),
+        columns.last(),
+        "first and last M=7 outputs are identical despite distinct logical input rows: {columns:?}"
     );
 }
 
@@ -235,7 +440,8 @@ fn fc_columns_are_independent() {
         let buf_out = Buffer::new(fd, TENSOR_SIZE, &file);
         ptr::write_bytes(buf_out.host_ptr, 0, TENSOR_SIZE);
 
-        let pixels = run_fc(&file, fd, &shape, &buf_in, &buf_w, &buf_bias, &buf_out);
+        let dense = run_fc(&file, fd, &shape, &buf_in, &buf_w, &buf_bias, &buf_out);
+        let pixels = first_output_channel(&shape, &dense);
 
         close_bo(fd, buf_in.handle).ok();
         close_bo(fd, buf_w.handle).ok();
