@@ -776,6 +776,16 @@ unsafe extern "C" fn dispatch(
     }
 
     let shape = unsafe { &*crate::executable::shape(executable) };
+    let constants = if constants.data_length == 0 {
+        &[]
+    } else {
+        if constants.data.is_null() {
+            return status::from_code(
+                crate::bindings::iree_status_code_e_IREE_STATUS_INVALID_ARGUMENT as u32,
+            );
+        }
+        unsafe { std::slice::from_raw_parts(constants.data, constants.data_length as usize) }
+    };
     let refs = unsafe { std::slice::from_raw_parts(bindings.values, bindings.count as usize) };
 
     // Indirect bindings (iree_hal_buffer_ref_t.buffer == NULL, real buffer
@@ -822,7 +832,16 @@ unsafe extern "C" fn dispatch(
     // for why this is now a frozen cross-repo ABI contract, not just a
     // placeholder.
     match shape {
-        UkernelShape::Conv2d(shape) => {
+        UkernelShape::Conv2d(executable) => {
+            let resolved_shape = match executable.resolve_shape(constants) {
+                Ok(shape) => shape,
+                Err(_) => {
+                    return status::from_code(
+                        crate::bindings::iree_status_code_e_IREE_STATUS_INVALID_ARGUMENT as u32,
+                    );
+                }
+            };
+            let shape = &resolved_shape;
             if bindings.count < 4 {
                 return status::from_code(
                     crate::bindings::iree_status_code_e_IREE_STATUS_INVALID_ARGUMENT as u32,
@@ -1014,6 +1033,11 @@ unsafe extern "C" fn dispatch(
             });
         }
         UkernelShape::FullyConnected(shape) => {
+            if !constants.is_empty() {
+                return status::from_code(
+                    crate::bindings::iree_status_code_e_IREE_STATUS_INVALID_ARGUMENT as u32,
+                );
+            }
             if bindings.count < 4 {
                 return status::from_code(
                     crate::bindings::iree_status_code_e_IREE_STATUS_INVALID_ARGUMENT as u32,
@@ -1224,6 +1248,11 @@ unsafe extern "C" fn dispatch(
             });
         }
         UkernelShape::Pooling(shape) => {
+            if !constants.is_empty() {
+                return status::from_code(
+                    crate::bindings::iree_status_code_e_IREE_STATUS_INVALID_ARGUMENT as u32,
+                );
+            }
             if bindings.count < 2 {
                 return status::from_code(
                     crate::bindings::iree_status_code_e_IREE_STATUS_INVALID_ARGUMENT as u32,

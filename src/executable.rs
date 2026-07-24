@@ -18,7 +18,148 @@ use crate::bindings::{
     iree_hal_resource_t, iree_host_size_t, iree_status_t, iree_string_view_t,
 };
 use crate::status;
+use iree_rocket_hal::rocket::executable_format::validate_conv_shape;
 use iree_rocket_hal::rocket::regcmd::{ConvShape, FcShape, PoolingShape};
+
+/// A logical Conv2D shape field supplied by one uint32 dispatch push constant.
+///
+/// Ordering is carried by [`Conv2dExecutable::runtime_dimensions`], not this
+/// enum's numeric representation. The FlatBuffer decoder maps the schema enum
+/// into this runtime-owned type so command recording never depends on generated
+/// FlatBuffer objects remaining alive.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum RuntimeConv2dDimension {
+    InputWidth,
+    InputHeight,
+    InputChannels,
+    OutputWidth,
+    OutputHeight,
+    OutputChannels,
+    WeightsWidth,
+    WeightsHeight,
+}
+
+impl RuntimeConv2dDimension {
+    fn index(self) -> usize {
+        match self {
+            Self::InputWidth => 0,
+            Self::InputHeight => 1,
+            Self::InputChannels => 2,
+            Self::OutputWidth => 3,
+            Self::OutputHeight => 4,
+            Self::OutputChannels => 5,
+            Self::WeightsWidth => 6,
+            Self::WeightsHeight => 7,
+        }
+    }
+
+    fn get(self, shape: &ConvShape) -> u32 {
+        match self {
+            Self::InputWidth => shape.input_width,
+            Self::InputHeight => shape.input_height,
+            Self::InputChannels => shape.input_channels,
+            Self::OutputWidth => shape.output_width,
+            Self::OutputHeight => shape.output_height,
+            Self::OutputChannels => shape.output_channels,
+            Self::WeightsWidth => shape.weights_width,
+            Self::WeightsHeight => shape.weights_height,
+        }
+    }
+
+    fn set(self, shape: &mut ConvShape, value: u32) {
+        match self {
+            Self::InputWidth => shape.input_width = value,
+            Self::InputHeight => shape.input_height = value,
+            Self::InputChannels => shape.input_channels = value,
+            Self::OutputWidth => shape.output_width = value,
+            Self::OutputHeight => shape.output_height = value,
+            Self::OutputChannels => shape.output_channels = value,
+            Self::WeightsWidth => shape.weights_width = value,
+            Self::WeightsHeight => shape.weights_height = value,
+        }
+    }
+}
+
+/// Conv2D executable metadata before per-dispatch runtime dimensions resolve.
+#[derive(Clone, Debug, PartialEq)]
+pub struct Conv2dExecutable {
+    pub shape_template: ConvShape,
+    pub runtime_dimensions: Vec<RuntimeConv2dDimension>,
+}
+
+impl Conv2dExecutable {
+    pub fn new_static(shape: ConvShape) -> Self {
+        Self {
+            shape_template: shape,
+            runtime_dimensions: Vec::new(),
+        }
+    }
+
+    /// Validates the schema-level dynamic mapping independently of runtime
+    /// values. Full hardware validation happens in [`resolve_shape`].
+    pub fn validate_template(&self) -> Result<(), &'static str> {
+        let mut seen = [false; 8];
+        for dimension in &self.runtime_dimensions {
+            let index = dimension.index();
+            if seen[index] {
+                return Err("runtime Conv2D dimensions must be unique");
+            }
+            seen[index] = true;
+            if dimension.get(&self.shape_template) != 0 {
+                return Err("runtime Conv2D dimensions must be zero in the executable template");
+            }
+        }
+
+        let all_dimensions = [
+            RuntimeConv2dDimension::InputWidth,
+            RuntimeConv2dDimension::InputHeight,
+            RuntimeConv2dDimension::InputChannels,
+            RuntimeConv2dDimension::OutputWidth,
+            RuntimeConv2dDimension::OutputHeight,
+            RuntimeConv2dDimension::OutputChannels,
+            RuntimeConv2dDimension::WeightsWidth,
+            RuntimeConv2dDimension::WeightsHeight,
+        ];
+        for dimension in all_dimensions {
+            if !seen[dimension.index()] && dimension.get(&self.shape_template) == 0 {
+                return Err("static Conv2D dimensions must be nonzero in the executable template");
+            }
+        }
+
+        if self.runtime_dimensions.is_empty() {
+            validate_conv_shape(&self.shape_template)?;
+        }
+        Ok(())
+    }
+
+    /// Resolves runtime dimensions from native-endian uint32 push constants,
+    /// then performs the same authoritative validation as static executables.
+    pub fn resolve_shape(&self, constants: &[u8]) -> Result<ConvShape, &'static str> {
+        let expected_bytes = self
+            .runtime_dimensions
+            .len()
+            .checked_mul(std::mem::size_of::<u32>())
+            .ok_or("runtime Conv2D push-constant byte count overflow")?;
+        if constants.len() != expected_bytes {
+            return Err("runtime Conv2D push-constant byte count does not match the executable");
+        }
+
+        let mut shape = self.shape_template;
+        for (dimension, bytes) in self
+            .runtime_dimensions
+            .iter()
+            .zip(constants.chunks_exact(std::mem::size_of::<u32>()))
+        {
+            let value = u32::from_ne_bytes(bytes.try_into().unwrap());
+            if value == 0 {
+                return Err("runtime Conv2D dimensions must be nonzero");
+            }
+            dimension.set(&mut shape, value);
+        }
+        validate_conv_shape(&shape)?;
+        Ok(shape)
+    }
+}
 
 /// One of this driver's fixed regcmd-template shapes -- see `regcmd.rs`'s
 /// module doc comment in iree-rocket-hal for why the NPU pipeline itself
@@ -27,7 +168,7 @@ use iree_rocket_hal::rocket::regcmd::{ConvShape, FcShape, PoolingShape};
 /// match on it) as more of iree-rocket-hal's `build_*_regcmd` functions
 /// gain HAL-level wiring.
 pub enum UkernelShape {
-    Conv2d(ConvShape),
+    Conv2d(Conv2dExecutable),
     FullyConnected(FcShape),
     Pooling(PoolingShape),
 }
@@ -116,3 +257,91 @@ pub static VTABLE: iree_hal_executable_vtable_t = iree_hal_executable_vtable_t {
     lookup_function_by_name: Some(lookup_function_by_name),
     lookup_global_by_name: Some(lookup_global_by_name),
 };
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use iree_rocket_hal::rocket::regcmd::{Activation, Precision};
+
+    fn dynamic_spatial_executable() -> Conv2dExecutable {
+        Conv2dExecutable {
+            shape_template: ConvShape {
+                input_width: 0,
+                input_height: 0,
+                input_channels: 32,
+                output_width: 0,
+                output_height: 0,
+                output_channels: 16,
+                weights_width: 1,
+                weights_height: 1,
+                stride: 1,
+                depthwise: false,
+                input_zero_point: 0,
+                output_zero_point: 0,
+                weights_zero_point: 0,
+                input_scale: 1.0,
+                weights_scale: 1.0,
+                output_scale: 1.0,
+                truncate_bits: 0,
+                activation: Activation::None,
+                precision: Precision::Fp16,
+            },
+            runtime_dimensions: vec![
+                RuntimeConv2dDimension::InputHeight,
+                RuntimeConv2dDimension::InputWidth,
+                RuntimeConv2dDimension::OutputHeight,
+                RuntimeConv2dDimension::OutputWidth,
+            ],
+        }
+    }
+
+    fn constants(values: &[u32]) -> Vec<u8> {
+        values
+            .iter()
+            .flat_map(|value| value.to_ne_bytes())
+            .collect()
+    }
+
+    #[test]
+    fn runtime_dimensions_resolve_in_declared_order() {
+        let executable = dynamic_spatial_executable();
+        executable.validate_template().unwrap();
+        let shape = executable
+            .resolve_shape(&constants(&[112, 96, 112, 96]))
+            .unwrap();
+        assert_eq!((shape.input_width, shape.input_height), (96, 112));
+        assert_eq!((shape.output_width, shape.output_height), (96, 112));
+        assert_eq!((shape.input_channels, shape.output_channels), (32, 16));
+    }
+
+    #[test]
+    fn runtime_dimensions_reject_wrong_constant_count_and_zero() {
+        let executable = dynamic_spatial_executable();
+        assert!(
+            executable
+                .resolve_shape(&constants(&[112, 96, 112]))
+                .is_err()
+        );
+        assert!(
+            executable
+                .resolve_shape(&constants(&[112, 0, 112, 96]))
+                .is_err()
+        );
+    }
+
+    #[test]
+    fn runtime_dimensions_reject_invalid_mapping_and_hardware_shape() {
+        let mut executable = dynamic_spatial_executable();
+        executable
+            .runtime_dimensions
+            .push(RuntimeConv2dDimension::InputWidth);
+        assert!(executable.validate_template().is_err());
+
+        let executable = dynamic_spatial_executable();
+        assert!(
+            executable
+                .resolve_shape(&constants(&[3, 96, 3, 96]))
+                .is_err()
+        );
+    }
+}

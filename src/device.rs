@@ -41,6 +41,7 @@ use iree_rocket_hal::rocket::api::{DRM_IOCTL_BASE, drm_version};
 use iree_rocket_hal::rocket::device as rocket_device;
 
 const DEVICE_PATH: &str = "/dev/accel/accel0";
+const DISPATCH_COMPLETION_TIMEOUT_NS: u64 = 10_000_000_000;
 
 // nr=0x00 is generic DRM_IOCTL_VERSION, not rocket-specific -- see
 // rkt-test.rs's identical use of this pattern.
@@ -1319,8 +1320,14 @@ unsafe extern "C" fn queue_execute(
                         // host-visible, waiting here prevents the next split
                         // from entering the kernel until this one has completed.
                         for &out_handle in job.out_bo_handles {
-                            if unsafe { rocket_device::prep_bo(fd, out_handle, 2_000_000_000) }
-                                .is_err()
+                            if unsafe {
+                                rocket_device::prep_bo(
+                                    fd,
+                                    out_handle,
+                                    DISPATCH_COMPLETION_TIMEOUT_NS,
+                                )
+                            }
+                            .is_err()
                             {
                                 break 'result status::from_code(
                                     iree_status_code_e_IREE_STATUS_UNAVAILABLE as u32,

@@ -45,7 +45,7 @@ use crate::bindings::{
     iree_hal_executable_caching_mode_t, iree_hal_executable_params_t, iree_hal_executable_t,
     iree_hal_resource_t, iree_host_size_t, iree_status_t, iree_string_view_t,
 };
-use crate::executable::UkernelShape;
+use crate::executable::{Conv2dExecutable, RuntimeConv2dDimension, UkernelShape};
 use crate::status;
 use iree_rocket_hal::rocket::executable_format::{
     CONV2D_V1_TAG, decode_conv_shape_v1, validate_conv_shape,
@@ -110,7 +110,7 @@ fn decode_flatbuffer_shape(data: &[u8]) -> Result<UkernelShape, ()> {
     match export.kernel_type() {
         schema::KernelDef::Conv2DDef => {
             let conv = export.kernel_as_conv_2ddef().ok_or(())?;
-            let shape = ConvShape {
+            let shape_template = ConvShape {
                 input_width: conv.input_width(),
                 input_height: conv.input_height(),
                 input_channels: conv.input_channels(),
@@ -131,8 +131,42 @@ fn decode_flatbuffer_shape(data: &[u8]) -> Result<UkernelShape, ()> {
                 activation: decode_activation(conv.activation(), conv.activation_cmp())?,
                 precision: decode_precision(conv.precision())?,
             };
-            validate_conv_shape(&shape).map_err(|_| ())?;
-            Ok(UkernelShape::Conv2d(shape))
+            let mut runtime_dimensions = Vec::new();
+            if let Some(dimensions) = conv.runtime_dimensions() {
+                for index in 0..dimensions.len() {
+                    runtime_dimensions.push(match dimensions.get(index) {
+                        schema::Conv2DDimension::INPUT_WIDTH => RuntimeConv2dDimension::InputWidth,
+                        schema::Conv2DDimension::INPUT_HEIGHT => {
+                            RuntimeConv2dDimension::InputHeight
+                        }
+                        schema::Conv2DDimension::INPUT_CHANNELS => {
+                            RuntimeConv2dDimension::InputChannels
+                        }
+                        schema::Conv2DDimension::OUTPUT_WIDTH => {
+                            RuntimeConv2dDimension::OutputWidth
+                        }
+                        schema::Conv2DDimension::OUTPUT_HEIGHT => {
+                            RuntimeConv2dDimension::OutputHeight
+                        }
+                        schema::Conv2DDimension::OUTPUT_CHANNELS => {
+                            RuntimeConv2dDimension::OutputChannels
+                        }
+                        schema::Conv2DDimension::WEIGHTS_WIDTH => {
+                            RuntimeConv2dDimension::WeightsWidth
+                        }
+                        schema::Conv2DDimension::WEIGHTS_HEIGHT => {
+                            RuntimeConv2dDimension::WeightsHeight
+                        }
+                        _ => return Err(()),
+                    });
+                }
+            }
+            let executable = Conv2dExecutable {
+                shape_template,
+                runtime_dimensions,
+            };
+            executable.validate_template().map_err(|_| ())?;
+            Ok(UkernelShape::Conv2d(executable))
         }
         schema::KernelDef::FullyConnectedDef => {
             let fc = export.kernel_as_fully_connected_def().ok_or(())?;
@@ -290,7 +324,9 @@ unsafe extern "C" fn prepare_executable(
             );
         }
         unsafe {
-            *out_executable = crate::executable::create(UkernelShape::Conv2d(shape));
+            *out_executable = crate::executable::create(UkernelShape::Conv2d(
+                Conv2dExecutable::new_static(shape),
+            ));
         }
         return status::ok();
     }
@@ -318,7 +354,7 @@ unsafe extern "C" fn prepare_executable(
             pad_value: 0,
             activation: Activation::None,
         }),
-        2 => UkernelShape::Conv2d(ConvShape {
+        2 => UkernelShape::Conv2d(Conv2dExecutable::new_static(ConvShape {
             // Same geometry as tag 0's validated int8 shape, but
             // Precision::Fp16 -- matches iree-rocket-hal's
             // tests/conv_hw.rs's fp16_shape(), hardware-confirmed
@@ -342,8 +378,8 @@ unsafe extern "C" fn prepare_executable(
             truncate_bits: 0,
             activation: Activation::None,
             precision: Precision::Fp16,
-        }),
-        _ => UkernelShape::Conv2d(ConvShape {
+        })),
+        _ => UkernelShape::Conv2d(Conv2dExecutable::new_static(ConvShape {
             // rkt-basic.rs's validated shape (see module doc comment).
             input_width: 4,
             input_height: 4,
@@ -364,7 +400,7 @@ unsafe extern "C" fn prepare_executable(
             truncate_bits: 0,
             activation: Activation::None,
             precision: Precision::Int8,
-        }),
+        })),
     };
     unsafe {
         *out_executable = crate::executable::create(shape);
@@ -421,6 +457,55 @@ mod tests {
         data
     }
 
+    fn encode_dynamic_conv_executable(
+        dimensions: &[schema::Conv2DDimension],
+        input_width: u32,
+    ) -> Vec<u8> {
+        let mut builder = flatbuffers::FlatBufferBuilder::new();
+        let runtime_dimensions = builder.create_vector(dimensions);
+        let name = builder.create_string("rocket_dynamic_conv");
+        let conv = schema::Conv2DDef::create(
+            &mut builder,
+            &schema::Conv2DDefArgs {
+                input_width,
+                input_height: 0,
+                input_channels: 32,
+                output_width: 0,
+                output_height: 0,
+                output_channels: 16,
+                weights_width: 1,
+                weights_height: 1,
+                stride: 1,
+                precision: schema::Precision::FP16,
+                runtime_dimensions: Some(runtime_dimensions),
+                ..Default::default()
+            },
+        );
+        let export = schema::ExportDef::create(
+            &mut builder,
+            &schema::ExportDefArgs {
+                name: Some(name),
+                kernel_type: schema::KernelDef::Conv2DDef,
+                kernel: Some(conv.as_union_value()),
+            },
+        );
+        let exports = builder.create_vector(&[export]);
+        let executable = schema::ExecutableDef::create(
+            &mut builder,
+            &schema::ExecutableDefArgs {
+                exports: Some(exports),
+            },
+        );
+        schema::finish_executable_def_buffer(&mut builder, executable);
+
+        let flatbuffer = builder.finished_data();
+        let mut data = vec![0u8; IREE_FLATBUFFER_HEADER_SIZE];
+        data[0..4].copy_from_slice(b"RKT1");
+        data[8..16].copy_from_slice(&(flatbuffer.len() as u64).to_le_bytes());
+        data.extend_from_slice(flatbuffer);
+        data
+    }
+
     #[test]
     fn decodes_compiler_produced_flatbuffer() {
         let data = include_bytes!(concat!(
@@ -431,6 +516,7 @@ mod tests {
         let UkernelShape::Conv2d(shape) = shape else {
             panic!("expected Conv2d");
         };
+        let shape = shape.shape_template;
         assert_eq!(shape.input_width, 112);
         assert_eq!(shape.input_height, 112);
         assert_eq!(shape.input_channels, 32);
@@ -438,6 +524,66 @@ mod tests {
         assert_eq!(shape.output_height, 112);
         assert_eq!(shape.output_channels, 16);
         assert_eq!(shape.precision, Precision::Fp16);
+    }
+
+    #[test]
+    fn decodes_and_resolves_runtime_conv_dimensions() {
+        let data = encode_dynamic_conv_executable(
+            &[
+                schema::Conv2DDimension::INPUT_HEIGHT,
+                schema::Conv2DDimension::INPUT_WIDTH,
+                schema::Conv2DDimension::OUTPUT_HEIGHT,
+                schema::Conv2DDimension::OUTPUT_WIDTH,
+            ],
+            0,
+        );
+        let UkernelShape::Conv2d(executable) = decode_flatbuffer_shape(&data).unwrap() else {
+            panic!("expected Conv2d");
+        };
+        let constants: Vec<u8> = [112u32, 96, 112, 96]
+            .into_iter()
+            .flat_map(u32::to_ne_bytes)
+            .collect();
+        let shape = executable.resolve_shape(&constants).unwrap();
+        assert_eq!((shape.input_width, shape.input_height), (96, 112));
+        assert_eq!((shape.output_width, shape.output_height), (96, 112));
+    }
+
+    #[test]
+    fn rejects_invalid_runtime_conv_dimension_mappings() {
+        let duplicate = encode_dynamic_conv_executable(
+            &[
+                schema::Conv2DDimension::INPUT_WIDTH,
+                schema::Conv2DDimension::INPUT_WIDTH,
+                schema::Conv2DDimension::INPUT_HEIGHT,
+                schema::Conv2DDimension::OUTPUT_WIDTH,
+                schema::Conv2DDimension::OUTPUT_HEIGHT,
+            ],
+            0,
+        );
+        assert!(decode_flatbuffer_shape(&duplicate).is_err());
+
+        let unknown = encode_dynamic_conv_executable(
+            &[
+                schema::Conv2DDimension(99),
+                schema::Conv2DDimension::INPUT_HEIGHT,
+                schema::Conv2DDimension::OUTPUT_WIDTH,
+                schema::Conv2DDimension::OUTPUT_HEIGHT,
+            ],
+            0,
+        );
+        assert!(decode_flatbuffer_shape(&unknown).is_err());
+
+        let nonzero_template = encode_dynamic_conv_executable(
+            &[
+                schema::Conv2DDimension::INPUT_WIDTH,
+                schema::Conv2DDimension::INPUT_HEIGHT,
+                schema::Conv2DDimension::OUTPUT_WIDTH,
+                schema::Conv2DDimension::OUTPUT_HEIGHT,
+            ],
+            96,
+        );
+        assert!(decode_flatbuffer_shape(&nonzero_template).is_err());
     }
 
     #[test]
