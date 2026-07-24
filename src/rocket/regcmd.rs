@@ -637,16 +637,15 @@ pub fn plan_conv_tasks(shape: &ConvShape) -> Result<Vec<ConvTask>, &'static str>
     let weights_with_guard_bank = weights_banks_required
         .checked_add(1)
         .ok_or("weight bank count overflows task planning")?;
-    let (available_input_banks, available_weights_banks, reuse_weights) =
+    let (available_input_banks, available_weights_banks) =
         if weights_with_guard_bank < u64::from(CBUF_BANKS) {
             (
                 u64::from(CBUF_BANKS) - weights_banks_required,
                 weights_banks_required,
-                true,
             )
         } else {
             // Mesa's partial-weights/partial-input split.
-            (7, 5, false)
+            (7, 5)
         };
 
     if input_banks_required <= available_input_banks {
@@ -772,7 +771,11 @@ pub fn plan_conv_tasks(shape: &ConvShape) -> Result<Vec<ConvTask>, &'static str>
                 .map_err(|_| "weight bank count exceeds u32")?,
             overlap_slices: draft.overlap_slices,
             retain_slices: draft.retain_slices,
-            reuse_weights: reuse_weights && index > 0,
+            // Reload weights for every split until CBUF retention across the
+            // kernel driver's IRQ-mediated task transition is proven. On real
+            // RK3588 hardware, enabling Mesa's later-task WEIGHT_REUSE bit
+            // produced correct task 0 output followed by all-zero rows.
+            reuse_weights: false,
         });
         output_height_processed = output_height_processed
             .checked_add(output_height)
@@ -1995,9 +1998,9 @@ fn require_single_conv_task(shape: &ConvShape) -> ConvTask {
 /// Allocate each returned vector in its own command buffer, call
 /// [`link_regcmd_tasks`] with their DMA addresses, and submit the
 /// `(address, command_count)` pairs together through
-/// [`crate::rocket::device::submit_tasks`]. Keeping the splits in one kernel
-/// job is required for `reuse_weights` tasks to observe the preceding task's
-/// CBUF contents.
+/// [`crate::rocket::device::submit_tasks`]. Splits currently reload weights
+/// independently; keeping them in one kernel job preserves their declared
+/// execution order.
 pub fn build_conv_regcmd_tasks(
     shape: &ConvShape,
     bufs: &ConvBuffers,
@@ -3237,8 +3240,7 @@ mod conv_task_tests {
             );
             assert_eq!(tasks[0].input_banks, 10);
             assert_eq!(tasks[0].weights_banks, 2);
-            assert!(!tasks[0].reuse_weights);
-            assert!(tasks.iter().skip(1).all(|task| task.reuse_weights));
+            assert!(tasks.iter().all(|task| !task.reuse_weights));
             assert_eq!(
                 tasks.iter().map(|task| task.output_height).sum::<u32>(),
                 shape.output_height
