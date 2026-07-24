@@ -1,0 +1,41 @@
+[package]
+name = "rocket-hal-driver"
+version = "0.1.0"
+edition = "2024"
+
+[lib]
+# staticlib, not cdylib: confirmed directly from IREE's own source
+# (runtime/src/iree/hal/drivers/{CMakeLists.txt,init_external.c.in}) that
+# there is no dlopen-based HAL driver plugin mechanism anywhere in
+# driver_registry.c/init.c -- iree_register_external_hal_driver() is a
+# CMake-time static-link mechanism: it expects a static library target
+# name and a register function resolved at LINK time, then generates
+# init_external.c with a direct `extern` call to it. (The dlopen
+# mechanisms that do exist in IREE are unrelated: CUDA/HIP/Vulkan/AMDGPU
+# drivers dlopen their own vendor SDKs, and iree/hal/local/plugins/
+# system_library_plugin.c dlopens precompiled *kernels* for the CPU
+# driver's executable loader -- neither is HAL driver registration.)
+# rlib kept alongside for `cargo check`/internal testing without needing
+# the CMake side built.
+crate-type = ["staticlib", "rlib"]
+
+[dependencies]
+iree-rocket-hal = { path = "../iree-rocket-hal" }
+nix = { version = "0.30.1", features = ["mman"] }
+rocket-schema = { path = "../rocket-schema" }
+
+[build-dependencies]
+bindgen = "0.72.1"
+
+[dev-dependencies]
+flatbuffers = "=2.0.0"
+
+[profile.release]
+# Keep full optimization but retain DWARF debug info (Cargo's release
+# default is debug = 0, which is why the board's gdb session had no
+# symbol/line info and had to fall back to raw disassembly) -- this crate
+# is still under active debugging (see the command_buffer_tests segfault
+# in progress) and a real backtrace with locals is worth the larger
+# binary. Applies to the whole build graph (iree-rocket-hal included)
+# since there's no cargo workspace here to scope it more narrowly.
+debug = true
