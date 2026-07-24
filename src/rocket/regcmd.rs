@@ -14,9 +14,8 @@
 //! Scope, deliberately not general beyond what this repo currently needs:
 //! - Convolutions larger than CBUF are split along output height using
 //!   Mesa's `rkt_split_tasks()` algorithm. The public multi-task builder
-//!   returns one regcmd buffer per split. After allocating the buffers, callers
-//!   patch their DMA addresses with `link_regcmd_tasks` and pass them to
-//!   `device::submit_tasks`.
+//!   returns one regcmd buffer per split. The hardware-validated path submits
+//!   and waits for each split as a separate DRM job.
 //! - The serialized shape currently has no padding fields, so convolution
 //!   planning supports zero-padding valid convolutions only.
 //! - No `addition_input`/`add_tensor` support -- none of the three bins
@@ -529,6 +528,8 @@ pub struct ConvTask {
     pub overlap_slices: u32,
     pub retain_slices: u32,
     /// Whether this task reuses weights left in CBUF by the preceding task.
+    /// Current split planning leaves this false because task-to-task CBUF
+    /// retention is not reliable through the mainline kernel driver.
     pub reuse_weights: bool,
 }
 
@@ -1987,7 +1988,7 @@ fn require_single_conv_task(shape: &ConvShape) -> ConvTask {
     assert!(
         tasks.len() == 1,
         "build_conv_regcmd: convolution requires {} CBUF height splits; \
-         use build_conv_regcmd_tasks and device::submit_tasks",
+         use build_conv_regcmd_tasks and submit each task sequentially",
         tasks.len()
     );
     tasks[0]
@@ -1995,12 +1996,10 @@ fn require_single_conv_task(shape: &ConvShape) -> ConvTask {
 
 /// Builds one regcmd buffer per CBUF height split.
 ///
-/// Allocate each returned vector in its own command buffer, call
-/// [`link_regcmd_tasks`] with their DMA addresses, and submit the
-/// `(address, command_count)` pairs together through
-/// [`crate::rocket::device::submit_tasks`]. Splits currently reload weights
-/// independently; keeping them in one kernel job preserves their declared
-/// execution order.
+/// Allocate each returned vector in its own command buffer and submit each
+/// through [`crate::rocket::device::submit`], waiting for its output fence
+/// before submitting the next split. Splits reload weights independently, so
+/// no CBUF state must survive between jobs.
 pub fn build_conv_regcmd_tasks(
     shape: &ConvShape,
     bufs: &ConvBuffers,
@@ -2059,6 +2058,10 @@ fn task_link_trailer_index(commands: &[RegCmd]) -> Result<usize, &'static str> {
 /// Mesa patches those registers to the next task before submission so the
 /// alternate ping-pong register group is prepared while the current task
 /// runs. The final task retains its zero-valued link.
+///
+/// This path remains experimental: real RK3588 testing with the mainline
+/// driver produced only task 0's output when linked tasks were submitted in
+/// one DRM job. Production callers should submit and fence tasks separately.
 pub fn link_regcmd_tasks(
     tasks: &mut [Vec<RegCmd>],
     task_dma_addresses: &[u32],

@@ -41,11 +41,10 @@
 use std::{fs::OpenOptions, mem, os::unix::io::AsRawFd, ptr};
 
 use iree_rocket_hal::rocket::{
-    device::{Buffer, fini_bo, prep_bo, submit, submit_tasks},
+    device::{Buffer, fini_bo, prep_bo, submit},
     regcmd::{
         Activation, CONV_OUTPUT_ATOMIC_STRIDE, ConvBuffers, ConvShape, Precision,
-        build_conv_regcmd, build_conv_regcmd_tasks, conv_output_scratch_bytes, link_regcmd_tasks,
-        plan_conv_tasks,
+        build_conv_regcmd, build_conv_regcmd_tasks, conv_output_scratch_bytes, plan_conv_tasks,
     },
     tensor_layout::{nc1hwc2_storage_size, pack_nhwc_to_nc1hwc2},
 };
@@ -689,15 +688,14 @@ fn page_aligned_size(byte_len: usize) -> usize {
     byte_len.max(1).next_multiple_of(4096)
 }
 
-#[derive(Clone, Copy)]
-enum PositionTaskSubmission {
-    OneJob,
-    SeparateJobs,
-}
-
 /// Packs a dense NHWC C32 input into NC1HWC2, runs the fp16 convolution,
 /// and decodes DPU's feature-atomic output surfaces into dense NHWC order.
-fn run_position_conv_fp16(shape: &ConvShape, submission: PositionTaskSubmission) -> Vec<f32> {
+///
+/// Height splits are submitted as individually fenced DRM jobs. A real
+/// RK3588 run of the same regcmds as multiple tasks in one `drm_rocket_job`
+/// produced correct task-0 rows and left every later row at zero; separate
+/// jobs produced the complete expected tensor.
+fn run_position_conv_fp16(shape: &ConvShape) -> Vec<f32> {
     assert_eq!(shape.input_channels, POSITION_INPUT_CHANNELS);
     assert_eq!(shape.output_channels, POSITION_OUTPUT_CHANNELS);
 
@@ -761,21 +759,13 @@ fn run_position_conv_fp16(shape: &ConvShape, submission: PositionTaskSubmission)
             bias_addr: buf_bias.dma_address,
             output_addr: buf_c.dma_address,
         };
-        let mut regcmd_tasks =
+        let regcmd_tasks =
             build_conv_regcmd_tasks(shape, &bufs).expect("failed to build convolution tasks");
         let mut cmd_buffers = Vec::with_capacity(regcmd_tasks.len());
         for cmds in &regcmd_tasks {
             let cmd_bytes = cmds.len() * mem::size_of::<u64>();
             let buf_cmd = Buffer::new(fd, page_aligned_size(cmd_bytes), &file);
             cmd_buffers.push(buf_cmd);
-        }
-        let task_addresses = cmd_buffers
-            .iter()
-            .map(|buffer| buffer.dma_address)
-            .collect::<Vec<_>>();
-        if matches!(submission, PositionTaskSubmission::OneJob) {
-            link_regcmd_tasks(&mut regcmd_tasks, &task_addresses)
-                .expect("failed to link split regcmd ping-pong trailers");
         }
         for (cmds, buf_cmd) in regcmd_tasks.iter().zip(&cmd_buffers) {
             let cmd_slice =
@@ -800,21 +790,11 @@ fn run_position_conv_fp16(shape: &ConvShape, submission: PositionTaskSubmission)
         in_handles.extend([buf_a.handle, buf_w.handle, buf_bias.handle]);
         let out_handles = [buf_c.handle];
 
-        match submission {
-            PositionTaskSubmission::OneJob => {
-                submit_tasks(fd, &task_descriptors, &in_handles, &out_handles)
-                    .expect("SUBMIT ioctl failed");
-                prep_bo(fd, buf_c.handle, 2_000_000_000)
-                    .expect("convolution job did not complete within timeout");
-            }
-            PositionTaskSubmission::SeparateJobs => {
-                for &(regcmd_addr, regcmd_count) in &task_descriptors {
-                    submit(fd, regcmd_addr, regcmd_count, &in_handles, &out_handles)
-                        .expect("single-task SUBMIT ioctl failed");
-                    prep_bo(fd, buf_c.handle, 2_000_000_000)
-                        .expect("single-task convolution did not complete within timeout");
-                }
-            }
+        for &(regcmd_addr, regcmd_count) in &task_descriptors {
+            submit(fd, regcmd_addr, regcmd_count, &in_handles, &out_handles)
+                .expect("single-task SUBMIT ioctl failed");
+            prep_bo(fd, buf_c.handle, 2_000_000_000)
+                .expect("single-task convolution did not complete within timeout");
         }
 
         let scratch = std::slice::from_raw_parts(buf_c.host_ptr, output_scratch_len);
@@ -874,7 +854,7 @@ fn conv_fp16_c32_to_c16_position_values_single_task() {
             .len(),
         1
     );
-    let actual = run_position_conv_fp16(&shape, PositionTaskSubmission::OneJob);
+    let actual = run_position_conv_fp16(&shape);
     assert_position_conv_output(&shape, &actual);
 }
 
@@ -888,20 +868,6 @@ fn conv_fp16_c32_to_c16_position_values_height_splits() {
             .len(),
         3
     );
-    let actual = run_position_conv_fp16(&shape, PositionTaskSubmission::OneJob);
-    assert_position_conv_output(&shape, &actual);
-}
-
-#[test]
-#[ignore = "needs the real NPU device -- cross-compile for aarch64, copy to the board, run there"]
-fn conv_fp16_c32_to_c16_position_values_height_splits_separate_jobs() {
-    let shape = fp16_position_shape(112, 112);
-    assert_eq!(
-        plan_conv_tasks(&shape)
-            .expect("MobileNet-sized shape should be valid")
-            .len(),
-        3
-    );
-    let actual = run_position_conv_fp16(&shape, PositionTaskSubmission::SeparateJobs);
+    let actual = run_position_conv_fp16(&shape);
     assert_position_conv_output(&shape, &actual);
 }
