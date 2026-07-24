@@ -8,6 +8,12 @@
 /// Physical byte width of one NC1HWC2 inner-channel block.
 pub const FEATURE_ATOMIC_BYTES: usize = 16;
 
+/// Physical byte width of one coefficient atom.
+///
+/// The convolution kernel group is 32 lanes for int8 and 16 lanes for
+/// fp16, so both occupy 32 bytes.
+pub const WEIGHT_ATOMIC_BYTES: usize = 32;
+
 /// Returns the NC1HWC2 storage required for `pixel_count` dense pixels.
 ///
 /// `bytes_per_pixel` is the logical channel count times the element size.
@@ -68,6 +74,119 @@ pub fn pack_nhwc_to_nc1hwc2(
     Ok(packed_len)
 }
 
+/// Returns the storage needed for an uncompressed Rocket convolution filter.
+///
+/// `input_channels` are padded exactly as the convolution register builder
+/// programs them: at least 16 channels and then to a multiple of 16.
+/// Output kernels are padded only to the hardware's two-kernel granularity.
+pub fn rocket_weight_storage_size(
+    filter_height: usize,
+    filter_width: usize,
+    input_channels: usize,
+    output_channels: usize,
+    element_size: usize,
+) -> Result<usize, &'static str> {
+    if filter_height == 0
+        || filter_width == 0
+        || input_channels == 0
+        || output_channels == 0
+        || element_size == 0
+        || WEIGHT_ATOMIC_BYTES % element_size != 0
+    {
+        return Err("invalid Rocket convolution filter shape");
+    }
+
+    let padded_input_channels = input_channels.max(16).next_multiple_of(16);
+    let padded_output_channels = output_channels.next_multiple_of(2);
+    filter_height
+        .checked_mul(filter_width)
+        .and_then(|value| value.checked_mul(padded_input_channels))
+        .and_then(|value| value.checked_mul(padded_output_channels))
+        .and_then(|value| value.checked_mul(element_size))
+        .ok_or("Rocket convolution filter storage size overflows usize")
+}
+
+/// Packs a logical HWCF filter into the RK3588 CNA coefficient order.
+///
+/// The physical nesting is:
+///
+/// `output_block -> input_block -> filter_x -> filter_y ->
+/// output_lane -> input_lane`
+///
+/// A block is one 32-byte weight atom: 32 channels for int8 or 16 channels
+/// for fp16. Input channels are zero-padded to the register-programmed
+/// 16-channel granularity and output kernels to a multiple of two.
+pub fn pack_hwcf_to_rocket_weights(
+    dense: &[u8],
+    filter_height: usize,
+    filter_width: usize,
+    input_channels: usize,
+    output_channels: usize,
+    element_size: usize,
+    packed: &mut [u8],
+) -> Result<usize, &'static str> {
+    let dense_len = filter_height
+        .checked_mul(filter_width)
+        .and_then(|value| value.checked_mul(input_channels))
+        .and_then(|value| value.checked_mul(output_channels))
+        .and_then(|value| value.checked_mul(element_size))
+        .ok_or("dense HWCF storage size overflows usize")?;
+    if dense.len() < dense_len {
+        return Err("dense HWCF filter is smaller than its declared shape");
+    }
+
+    let packed_len = rocket_weight_storage_size(
+        filter_height,
+        filter_width,
+        input_channels,
+        output_channels,
+        element_size,
+    )?;
+    if packed.len() < packed_len {
+        return Err("Rocket weight destination is smaller than its declared shape");
+    }
+    packed[..packed_len].fill(0);
+
+    let block_channels = WEIGHT_ATOMIC_BYTES / element_size;
+    let padded_input_channels = input_channels.max(16).next_multiple_of(16);
+    let padded_output_channels = output_channels.next_multiple_of(2);
+    let input_blocks = padded_input_channels.div_ceil(block_channels);
+    let output_blocks = padded_output_channels.div_ceil(block_channels);
+    let mut dst_offset = 0;
+
+    for output_block in 0..output_blocks {
+        for input_block in 0..input_blocks {
+            for filter_x in 0..filter_width {
+                for filter_y in 0..filter_height {
+                    for output_lane in 0..block_channels {
+                        let output_channel = output_block * block_channels + output_lane;
+                        if output_channel >= padded_output_channels {
+                            continue;
+                        }
+                        for input_lane in 0..block_channels {
+                            let input_channel = input_block * block_channels + input_lane;
+                            if input_channel < input_channels && output_channel < output_channels {
+                                let src_element = (((filter_y * filter_width + filter_x)
+                                    * input_channels
+                                    + input_channel)
+                                    * output_channels)
+                                    + output_channel;
+                                let src_offset = src_element * element_size;
+                                packed[dst_offset..dst_offset + element_size]
+                                    .copy_from_slice(&dense[src_offset..src_offset + element_size]);
+                            }
+                            dst_offset += element_size;
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    debug_assert_eq!(dst_offset, packed_len);
+    Ok(packed_len)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -116,5 +235,52 @@ mod tests {
         assert!(pack_nhwc_to_nc1hwc2(&[0; 3], 1, 4, &mut [0; 16]).is_err());
         assert!(pack_nhwc_to_nc1hwc2(&[0; 4], 1, 4, &mut [0; 15]).is_err());
         assert!(nc1hwc2_storage_size(usize::MAX, 17).is_err());
+    }
+
+    #[test]
+    fn packs_fp16_hwcf_in_output_and_input_blocks() {
+        const H: usize = 1;
+        const W: usize = 1;
+        const C: usize = 32;
+        const F: usize = 18;
+        const BPE: usize = 2;
+        let mut dense = vec![0u8; H * W * C * F * BPE];
+        for input_channel in 0..C {
+            for output_channel in 0..F {
+                let value = (output_channel * 100 + input_channel) as u16;
+                let offset = (input_channel * F + output_channel) * BPE;
+                dense[offset..offset + BPE].copy_from_slice(&value.to_le_bytes());
+            }
+        }
+        let mut packed = vec![0u8; rocket_weight_storage_size(H, W, C, F, BPE).unwrap()];
+
+        pack_hwcf_to_rocket_weights(&dense, H, W, C, F, BPE, &mut packed).unwrap();
+
+        let values = packed
+            .chunks_exact(BPE)
+            .map(|bytes| u16::from_le_bytes([bytes[0], bytes[1]]))
+            .collect::<Vec<_>>();
+        assert_eq!(&values[0..16], &(0u16..16).collect::<Vec<_>>());
+        assert_eq!(&values[16..32], &(100u16..116).collect::<Vec<_>>());
+        assert_eq!(
+            &values[16 * 16..16 * 16 + 16],
+            &(16u16..32).collect::<Vec<_>>()
+        );
+        assert_eq!(
+            &values[32 * 16..32 * 16 + 16],
+            &(1600u16..1616).collect::<Vec<_>>()
+        );
+        assert_eq!(
+            &values[33 * 16..33 * 16 + 16],
+            &(1700u16..1716).collect::<Vec<_>>()
+        );
+        assert_eq!(
+            &values[34 * 16..34 * 16 + 16],
+            &(1616u16..1632).collect::<Vec<_>>()
+        );
+        assert_eq!(
+            &values[35 * 16..35 * 16 + 16],
+            &(1716u16..1732).collect::<Vec<_>>()
+        );
     }
 }

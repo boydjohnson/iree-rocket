@@ -46,7 +46,10 @@ use iree_rocket_hal::rocket::{
         Activation, CONV_OUTPUT_ATOMIC_STRIDE, ConvBuffers, ConvShape, Precision,
         build_conv_regcmd, build_conv_regcmd_tasks, conv_output_scratch_bytes, plan_conv_tasks,
     },
-    tensor_layout::{nc1hwc2_storage_size, pack_nhwc_to_nc1hwc2},
+    tensor_layout::{
+        nc1hwc2_storage_size, pack_hwcf_to_rocket_weights, pack_nhwc_to_nc1hwc2,
+        rocket_weight_storage_size,
+    },
 };
 
 const DEVICE_PATH: &str = "/dev/accel/accel0";
@@ -695,7 +698,7 @@ fn page_aligned_size(byte_len: usize) -> usize {
 /// RK3588 run of the same regcmds as multiple tasks in one `drm_rocket_job`
 /// produced correct task-0 rows and left every later row at zero; separate
 /// jobs produced the complete expected tensor.
-fn run_position_conv_fp16(shape: &ConvShape) -> Vec<f32> {
+fn run_position_conv_fp16_with_weights(shape: &ConvShape, packed_weights: &[u8]) -> Vec<f32> {
     assert_eq!(shape.input_channels, POSITION_INPUT_CHANNELS);
     assert_eq!(shape.output_channels, POSITION_OUTPUT_CHANNELS);
 
@@ -704,7 +707,6 @@ fn run_position_conv_fp16(shape: &ConvShape) -> Vec<f32> {
     let input_bytes_per_pixel = shape.input_channels as usize * BPE;
     let input_bytes = pixel_count * input_bytes_per_pixel;
     let input_scratch_len = nc1hwc2_storage_size(pixel_count, input_bytes_per_pixel).unwrap();
-    let weight_elements = shape.input_channels as usize * shape.output_channels as usize; // 1x1 HWIO
     let output_scratch_len = conv_output_scratch_bytes(shape);
 
     let mut dense_input = vec![0u8; input_bytes];
@@ -739,12 +741,12 @@ fn run_position_conv_fp16(shape: &ConvShape) -> Vec<f32> {
         )
         .expect("failed to pack test input as NC1HWC2");
 
-        let buf_w = Buffer::new(fd, page_aligned_size(weight_elements * BPE), &file);
+        let buf_w = Buffer::new(fd, page_aligned_size(packed_weights.len()), &file);
         ptr::write_bytes(buf_w.host_ptr, 0, buf_w.size);
-        fill_u16(
+        ptr::copy_nonoverlapping(
+            packed_weights.as_ptr(),
             buf_w.host_ptr,
-            weight_elements * BPE,
-            f32_to_f16_bits(POSITION_WEIGHT),
+            packed_weights.len(),
         );
 
         let buf_bias = Buffer::new(fd, TENSOR_SIZE, &file);
@@ -819,6 +821,16 @@ fn run_position_conv_fp16(shape: &ConvShape) -> Vec<f32> {
     }
 }
 
+fn run_position_conv_fp16(shape: &ConvShape) -> Vec<f32> {
+    const BPE: usize = 2;
+    let weight_bytes = shape.input_channels as usize * shape.output_channels as usize * BPE;
+    let mut packed_weights = vec![0u8; weight_bytes];
+    for bytes in packed_weights.chunks_exact_mut(BPE) {
+        bytes.copy_from_slice(&f32_to_f16_bits(POSITION_WEIGHT).to_le_bytes());
+    }
+    run_position_conv_fp16_with_weights(shape, &packed_weights)
+}
+
 fn assert_position_conv_output(shape: &ConvShape, actual: &[f32]) {
     let mut mismatches = Vec::new();
     for y in 0..shape.output_height {
@@ -856,6 +868,66 @@ fn conv_fp16_c32_to_c16_position_values_single_task() {
     );
     let actual = run_position_conv_fp16(&shape);
     assert_position_conv_output(&shape, &actual);
+}
+
+#[test]
+#[ignore = "needs the real NPU device -- cross-compile for aarch64, copy to the board, run there"]
+fn conv_fp16_c32_to_c16_distinct_weights_follow_channels() {
+    const BPE: usize = 2;
+    let shape = fp16_position_shape(4, 4);
+    let dense_len = shape.input_channels as usize * shape.output_channels as usize * BPE;
+    let mut dense_hwcf = vec![0u8; dense_len];
+    for output_channel in 0..shape.output_channels {
+        let selected_input = (output_channel * 2 + 1) % shape.input_channels;
+        let element = (selected_input * shape.output_channels + output_channel) as usize;
+        dense_hwcf[element * BPE..element * BPE + BPE]
+            .copy_from_slice(&f32_to_f16_bits(1.0).to_le_bytes());
+    }
+    let packed_len = rocket_weight_storage_size(
+        1,
+        1,
+        shape.input_channels as usize,
+        shape.output_channels as usize,
+        BPE,
+    )
+    .unwrap();
+    let mut packed_weights = vec![0u8; packed_len];
+    pack_hwcf_to_rocket_weights(
+        &dense_hwcf,
+        1,
+        1,
+        shape.input_channels as usize,
+        shape.output_channels as usize,
+        BPE,
+        &mut packed_weights,
+    )
+    .unwrap();
+
+    let actual = run_position_conv_fp16_with_weights(&shape, &packed_weights);
+    let mut mismatches = Vec::new();
+    for y in 0..shape.output_height {
+        for x in 0..shape.output_width {
+            for output_channel in 0..shape.output_channels {
+                let selected_input = (output_channel * 2 + 1) % shape.input_channels;
+                let expected = fp16_position_input_value(y, x, selected_input);
+                let index = ((y * shape.output_width + x) * shape.output_channels + output_channel)
+                    as usize;
+                if actual[index] != expected && mismatches.len() < 16 {
+                    mismatches.push(format!(
+                        "[{y}, {x}, {output_channel}]: input channel {selected_input}, \
+                         expected {expected}, got {}",
+                        actual[index]
+                    ));
+                }
+            }
+        }
+    }
+    assert!(
+        mismatches.is_empty(),
+        "{} of the first mismatches:\n{}",
+        mismatches.len(),
+        mismatches.join("\n")
+    );
 }
 
 #[test]
