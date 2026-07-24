@@ -22,6 +22,7 @@ crate-type = ["staticlib", "rlib"]
 [dependencies]
 iree-rocket-hal = { path = "../iree-rocket-hal" }
 nix = { version = "0.30.1", features = ["mman"] }
+rocket-schema = { path = "../rocket-schema" }
 
 [build-dependencies]
 bindgen = "0.72.1"

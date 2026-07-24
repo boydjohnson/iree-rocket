@@ -33,6 +33,11 @@ endif()
 file(GLOB_RECURSE ROCKET_RUST_SOURCES CONFIGURE_DEPENDS
   "${CMAKE_CURRENT_SOURCE_DIR}/src/*.rs"
 )
+file(GLOB_RECURSE ROCKET_SCHEMA_SOURCES CONFIGURE_DEPENDS
+  "${CMAKE_CURRENT_SOURCE_DIR}/../rocket-schema/src/*.rs"
+  "${CMAKE_CURRENT_SOURCE_DIR}/../rocket-schema/generated/rust/*.rs"
+  "${CMAKE_CURRENT_SOURCE_DIR}/../rocket-schema/schema/*.fbs"
+)
 
 add_custom_command(
   OUTPUT "${ROCKET_LIB_PATH}"
@@ -42,7 +47,11 @@ add_custom_command(
           --target-dir "${ROCKET_TARGET_DIR}"
           ${ROCKET_CARGO_TARGET_ARGS}
   WORKING_DIRECTORY "${CMAKE_CURRENT_SOURCE_DIR}"
-  DEPENDS ${ROCKET_RUST_SOURCES} "${CMAKE_CURRENT_SOURCE_DIR}/Cargo.toml"
+  DEPENDS
+    ${ROCKET_RUST_SOURCES}
+    ${ROCKET_SCHEMA_SOURCES}
+    "${CMAKE_CURRENT_SOURCE_DIR}/Cargo.toml"
+    "${CMAKE_CURRENT_SOURCE_DIR}/../rocket-schema/Cargo.toml"
   COMMENT "Building rocket-hal-driver (cargo build --release${ROCKET_CARGO_TARGET_ARGS})"
   VERBATIM
 )

@@ -400,7 +400,7 @@ status_stub!(trim(device: *mut iree_hal_device_t) -> iree_status_t);
 /// other `status_stub!`s -- this one is load-bearing at compiled-module
 /// load time, not just an optional capability probe. A compiled `.vmfb`
 /// targeting `#hal.device.target<"rocket", [#hal.executable.target<
-/// "rocket", "rocket-conv2d-v1">]>` embeds a compiler-generated device-
+/// "rocket", "rocket-flatbuffer-v1">]>` embeds a compiler-generated device-
 /// selection initializer (`TargetDevice::buildDeviceTargetMatch`'s
 /// default implementation, `DeviceTargetAttr::buildDeviceIDAndExecutable
 /// FormatsMatch`, compiler/src/iree/compiler/Dialect/HAL/IR/HALAttrs.cpp)
@@ -424,12 +424,8 @@ status_stub!(trim(device: *mut iree_hal_device_t) -> iree_status_t);
 /// `iree_hal_null_device_query_i64` (same category names, same "return
 /// NOT_FOUND for anything unrecognized" convention) -- this driver's
 /// identifier is always the fixed literal `b"rocket"` (`driver.rs`'s
-/// `DRIVER_NAME`) and the only executable format it ever produces is
-/// `"rocket-conv2d-v1"` (`iree-rocket-hal::rocket::executable_format`),
-/// so plain byte-equality is correct and sufficient here -- no need for
-/// the reference driver's full glob-pattern matching
-/// (`iree_string_view_match_pattern`) until a second device/format
-/// variant actually exists to distinguish.
+/// `DRIVER_NAME`). The FlatBuffer format is the compiler/runtime contract;
+/// the manual format remains advertised temporarily for legacy CTS inputs.
 unsafe extern "C" fn query_i64(
     device: *mut iree_hal_device_t,
     category: iree_string_view_t,
@@ -453,7 +449,11 @@ unsafe extern "C" fn query_i64(
     }
     if category == b"hal.executable.format" {
         unsafe {
-            *out_value = if key == b"rocket-conv2d-v1" { 1 } else { 0 };
+            *out_value = if key == b"rocket-flatbuffer-v1" || key == b"rocket-conv2d-v1" {
+                1
+            } else {
+                0
+            };
         }
         return status::ok();
     }
@@ -1058,13 +1058,13 @@ status_stub!(queue_dispatch(
 ) -> iree_status_t);
 
 #[allow(unused_variables)]
-/// Copies `bytes_per_pixel` bytes out of each 16-byte-strided atomic slot in
-/// `scratch` into `dst`, densely packed -- the host-side half of Conv2d
-/// output compaction (see `command_buffer::OutputCompaction`'s doc comment
-/// for the hardware reason this exists). Pure and unit-testable without
-/// hardware; bounds-checked against both slices rather than trusting the
-/// caller's `pixel_count`/`bytes_per_pixel` inputs. Returns the number of
-/// bytes written to `dst`.
+/// Interleaves DPU feature-atomic output surfaces into dense NHWC pixels.
+///
+/// Each 16-byte surface stores one channel group for every spatial pixel;
+/// `DPU_DST_SURF_STRIDE` advances between those full spatial surfaces.
+/// Dense NHWC instead stores every channel group for one pixel contiguously,
+/// so copy one surface chunk at a time into each destination pixel. The final
+/// logical surface may use fewer than 16 bytes.
 fn compact_conv_output(
     scratch: &[u8],
     pixel_count: usize,
@@ -1073,15 +1073,21 @@ fn compact_conv_output(
 ) -> usize {
     const ATOMIC_STRIDE: usize = 16;
     let mut written = 0;
-    for i in 0..pixel_count {
-        let src_off = i * ATOMIC_STRIDE;
-        let dst_off = i * bytes_per_pixel;
-        if src_off + bytes_per_pixel > scratch.len() || dst_off + bytes_per_pixel > dst.len() {
-            break;
+    for pixel in 0..pixel_count {
+        let mut pixel_written = 0;
+        while pixel_written < bytes_per_pixel {
+            let surface = pixel_written / ATOMIC_STRIDE;
+            let chunk_len = (bytes_per_pixel - pixel_written).min(ATOMIC_STRIDE);
+            let src_off = surface * pixel_count * ATOMIC_STRIDE + pixel * ATOMIC_STRIDE;
+            let dst_off = pixel * bytes_per_pixel + pixel_written;
+            if src_off + chunk_len > scratch.len() || dst_off + chunk_len > dst.len() {
+                return written;
+            }
+            dst[dst_off..dst_off + chunk_len]
+                .copy_from_slice(&scratch[src_off..src_off + chunk_len]);
+            written += chunk_len;
+            pixel_written += chunk_len;
         }
-        dst[dst_off..dst_off + bytes_per_pixel]
-            .copy_from_slice(&scratch[src_off..src_off + bytes_per_pixel]);
-        written += bytes_per_pixel;
     }
     written
 }
@@ -1103,6 +1109,25 @@ mod compaction_tests {
         let written = compact_conv_output(&scratch, PIXELS, BPP, &mut dst);
         assert_eq!(written, PIXELS * BPP);
         assert_eq!(dst, vec![0x00, 0x10, 0x01, 0x11, 0x02, 0x12, 0x03, 0x13]);
+    }
+
+    #[test]
+    fn interleaves_multiple_channel_surfaces() {
+        const PIXELS: usize = 2;
+        const BPP: usize = 20;
+        let mut scratch = vec![0xAAu8; PIXELS * 2 * 16];
+        scratch[0..16].copy_from_slice(&[0; 16]);
+        scratch[16..32].copy_from_slice(&[1; 16]);
+        scratch[32..48].copy_from_slice(&[2; 16]);
+        scratch[48..64].copy_from_slice(&[3; 16]);
+
+        let mut dst = vec![0u8; PIXELS * BPP];
+        let written = compact_conv_output(&scratch, PIXELS, BPP, &mut dst);
+        assert_eq!(written, PIXELS * BPP);
+        assert_eq!(&dst[0..16], &[0; 16]);
+        assert_eq!(&dst[16..20], &[2; 4]);
+        assert_eq!(&dst[20..36], &[1; 16]);
+        assert_eq!(&dst[36..40], &[3; 4]);
     }
 
     #[test]
@@ -1173,24 +1198,41 @@ unsafe extern "C" fn queue_execute(
                 }
             };
             let result = 'result: {
-                if let Some(job) = cmds.filter(|j| !j.regcmd.is_empty()) {
+                if let Some(job) = cmds.filter(|j| !j.regcmd_tasks.is_empty()) {
                     let fd = d.file.as_raw_fd();
-                    let cmd_bytes = job.regcmd.len() * std::mem::size_of::<u64>();
-                    let cmd_len = cmd_bytes.next_multiple_of(4096);
-                    let cmd_buf = unsafe { rocket_device::Buffer::new(fd, cmd_len, &d.file) };
-                    unsafe {
-                        let cmd_slice = std::slice::from_raw_parts_mut(
-                            cmd_buf.host_ptr as *mut u64,
-                            job.regcmd.len(),
-                        );
-                        for (i, c) in job.regcmd.iter().enumerate() {
-                            cmd_slice[i] = c.0;
-                        }
-                    }
-                    if unsafe { rocket_device::fini_bo(fd, cmd_buf.handle) }.is_err() {
+                    let regcmd_tasks = job.regcmd_tasks;
+                    if regcmd_tasks.iter().any(Vec::is_empty) {
                         break 'result status::from_code(
-                            iree_status_code_e_IREE_STATUS_UNAVAILABLE as u32,
+                            iree_status_code_e_IREE_STATUS_INTERNAL as u32,
                         );
+                    }
+
+                    // Allocate every split before submission so all command
+                    // buffers remain alive until the dispatch is complete.
+                    let mut cmd_bufs = Vec::with_capacity(regcmd_tasks.len());
+                    for regcmd in regcmd_tasks {
+                        let cmd_bytes = regcmd.len() * std::mem::size_of::<u64>();
+                        let cmd_len = cmd_bytes.next_multiple_of(4096);
+                        cmd_bufs.push(unsafe { rocket_device::Buffer::new(fd, cmd_len, &d.file) });
+                    }
+
+                    let mut task_descriptors = Vec::with_capacity(regcmd_tasks.len());
+                    for (regcmd, cmd_buf) in regcmd_tasks.iter().zip(&cmd_bufs) {
+                        unsafe {
+                            let cmd_slice = std::slice::from_raw_parts_mut(
+                                cmd_buf.host_ptr as *mut u64,
+                                regcmd.len(),
+                            );
+                            for (i, c) in regcmd.iter().enumerate() {
+                                cmd_slice[i] = c.0;
+                            }
+                        }
+                        if unsafe { rocket_device::fini_bo(fd, cmd_buf.handle) }.is_err() {
+                            break 'result status::from_code(
+                                iree_status_code_e_IREE_STATUS_UNAVAILABLE as u32,
+                            );
+                        }
+                        task_descriptors.push((cmd_buf.dma_address, regcmd.len() as u32));
                     }
 
                     // Real input/output GEM handles from the command
@@ -1215,52 +1257,52 @@ unsafe extern "C" fn queue_execute(
                     // (every prior hand-driven test used one dedicated
                     // buffer per binding), so dedupe defensively rather
                     // than assume DRM_ROCKET_SUBMIT tolerates duplicates.
-                    let mut in_handles = Vec::with_capacity(1 + job.in_bo_handles.len());
-                    in_handles.push(cmd_buf.handle);
+                    let mut in_handles =
+                        Vec::with_capacity(cmd_bufs.len() + job.in_bo_handles.len());
+                    for cmd_buf in &cmd_bufs {
+                        in_handles.push(cmd_buf.handle);
+                    }
                     for &h in job.in_bo_handles {
                         if !in_handles.contains(&h) {
                             in_handles.push(h);
                         }
                     }
-                    if unsafe {
-                        rocket_device::submit(
-                            fd,
-                            cmd_buf.dma_address,
-                            job.regcmd.len() as u32,
-                            &in_handles,
-                            job.out_bo_handles,
-                        )
-                    }
-                    .is_err()
-                    {
-                        break 'result status::from_code(
-                            iree_status_code_e_IREE_STATUS_UNAVAILABLE as u32,
-                        );
-                    }
-                    // PREP_BO waits on DMA_RESV_USAGE_WRITE fences for the
-                    // *specific handle passed* (rocket_gem.c:
-                    // dma_resv_wait_timeout(gem_obj->resv,
-                    // DMA_RESV_USAGE_WRITE, ...)) -- not "wait for this
-                    // job" in general. cmd_buf is only ever in in_handles
-                    // (the device reads it, never writes it), so it likely
-                    // has no write fence attached at all, making a wait on
-                    // it return near-immediately regardless of whether the
-                    // dispatch that actually writes job.out_bo_handles has
-                    // even started. Confirmed as the cause of pooling_
-                    // dispatch_test.cc always reading back stale/zero
-                    // output despite completing in a few ms with no error:
-                    // fast, silent, unsynchronized completion is exactly
-                    // what an always-instantly-satisfied wait produces.
-                    // conv_hw.rs/pooling_hw.rs never hit this because
-                    // their hand-written ioctl calls always prep_bo a real
-                    // *output* handle. Wait on every buffer this job
-                    // actually writes instead.
-                    for &out_handle in job.out_bo_handles {
-                        if unsafe { rocket_device::prep_bo(fd, out_handle, 2_000_000_000) }.is_err()
+                    // The mainline driver's IRQ-mediated transition between
+                    // tasks in one drm_rocket_job is not reliable on RK3588:
+                    // task 0 completes correctly, but every later split leaves
+                    // its output rows untouched. Submitting the same regcmds
+                    // as individually fenced jobs is hardware-validated. Each
+                    // split reloads its weights, so no CBUF state must survive
+                    // between jobs.
+                    for &(regcmd_addr, regcmd_count) in &task_descriptors {
+                        if unsafe {
+                            rocket_device::submit(
+                                fd,
+                                regcmd_addr,
+                                regcmd_count,
+                                &in_handles,
+                                job.out_bo_handles,
+                            )
+                        }
+                        .is_err()
                         {
                             break 'result status::from_code(
                                 iree_status_code_e_IREE_STATUS_UNAVAILABLE as u32,
                             );
+                        }
+
+                        // PREP_BO waits on DMA_RESV_USAGE_WRITE fences for the
+                        // specific output handle. Besides making results
+                        // host-visible, waiting here prevents the next split
+                        // from entering the kernel until this one has completed.
+                        for &out_handle in job.out_bo_handles {
+                            if unsafe { rocket_device::prep_bo(fd, out_handle, 2_000_000_000) }
+                                .is_err()
+                            {
+                                break 'result status::from_code(
+                                    iree_status_code_e_IREE_STATUS_UNAVAILABLE as u32,
+                                );
+                            }
                         }
                     }
 
@@ -1277,9 +1319,9 @@ unsafe extern "C" fn queue_execute(
                                 iree_status_code_e_IREE_STATUS_INTERNAL as u32,
                             );
                         }
-                        let scratch_len = oc.pixel_count * 16;
-                        let scratch =
-                            unsafe { std::slice::from_raw_parts(oc.scratch_ptr, scratch_len) };
+                        let scratch = unsafe {
+                            std::slice::from_raw_parts(oc.scratch_ptr, oc.scratch_length)
+                        };
                         let out_rb = unsafe { &*(oc.output_buffer as *const RocketBuffer) };
                         let dst = unsafe {
                             std::slice::from_raw_parts_mut(

@@ -1,10 +1,10 @@
 //! `iree_hal_command_buffer_vtable_t`. `dispatch` is the real regcmd
 //! integration point: turns the executable's `UkernelShape`
 //! (`executable::shape`) plus this dispatch's buffer bindings into a
-//! regcmd program via the matching `iree_rocket_hal::rocket::regcmd::
-//! build_*_regcmd` function and stashes it (regcmd + the real GEM handles
-//! it touches, see `RecordedOp::Dispatch`) on the command buffer, to be
-//! submitted as one job by `device::queue_execute`.
+//! regcmd task list via the matching `iree_rocket_hal::rocket::regcmd::
+//! build_*_regcmd` function and stashes it (regcmd tasks + the real GEM
+//! handles it touches, see `RecordedOp::Dispatch`) on the command buffer,
+//! to be submitted as one job by `device::queue_execute`.
 //!
 //! Binding convention is per-ukernel-kind: `Conv2d` is binding 0 = input,
 //! 1 = weights, 2 = bias, 3 = output; `Pooling` is binding 0 = input,
@@ -19,7 +19,7 @@
 //! binding *semantics* -- only binding *count* is checked (see the
 //! `bindings.count < 4`/`< 2` guards below).
 //!
-//! `Conv2d`'s `build_conv_regcmd` call is wrapped in `catch_unwind` (see
+//! `Conv2d`'s `build_conv_regcmd_tasks` call is wrapped in `catch_unwind` (see
 //! below) as a backstop: `executable_cache.rs`'s `validate_conv_shape` is
 //! deliberately not proven exhaustive of every panic reachable from
 //! `build_conv_regcmd` (some of its internal `assert!`s, and every
@@ -31,8 +31,8 @@
 //! dispatch gracefully.
 //!
 //! Only supports recording exactly one `dispatch` per command buffer right
-//! now (matches every current `build_*_regcmd` function's own single-
-//! task-only scope, see regcmd.rs) -- a second `dispatch` call returns
+//! now. One dispatch may contain multiple ordered hardware tasks for CBUF
+//! height splitting; a second IREE dispatch call returns
 //! `IREE_STATUS_UNIMPLEMENTED` rather than silently overwriting or
 //! chaining tasks incorrectly. `collective` (multi-device reduce/
 //! broadcast/etc.) isn't applicable to a single discrete NPU and stays
@@ -75,10 +75,54 @@ use iree_rocket_hal::rocket::{
     builders::RegCmd,
     device::Buffer as RocketDeviceBuffer,
     regcmd::{
-        ConvBuffers, PoolingBuffers, build_conv_regcmd, build_pooling_regcmd,
+        ConvBuffers, PoolingBuffers, Precision, build_conv_regcmd_tasks, build_pooling_regcmd,
         conv_output_scratch_bytes,
     },
+    tensor_layout::{
+        nc1hwc2_storage_size, pack_hwcf_to_rocket_weights, pack_nhwc_to_nc1hwc2_padded,
+        rocket_weight_storage_size,
+    },
 };
+
+/// Defers dense-NHWC to NC1HWC2 packing until command-buffer execution.
+///
+/// The scratch allocation and its DMA address are fixed while recording so
+/// the regcmd can be built immediately. The copy itself must happen later,
+/// after preceding recorded update/fill/copy operations have populated the
+/// real IREE input buffer.
+#[derive(Clone, Copy)]
+pub struct InputPacking {
+    pub input_buffer: *mut iree_hal_buffer_t,
+    pub input_offset: iree_device_size_t,
+    pub input_length: iree_device_size_t,
+    pub scratch_ptr: *mut u8,
+    pub scratch_length: usize,
+    pub scratch_handle: u32,
+    pub pixel_count: usize,
+    pub bytes_per_pixel: usize,
+    pub packed_bytes_per_pixel: usize,
+}
+
+/// Defers logical HWCF-to-Rocket coefficient packing until execution.
+///
+/// The original binding can be populated by earlier recorded operations, so
+/// the copy cannot happen while recording the dispatch. The regcmd points at
+/// `scratch_handle`; `apply_ops` fills and flushes it immediately before the
+/// hardware submission.
+#[derive(Clone, Copy)]
+pub struct WeightPacking {
+    pub weight_buffer: *mut iree_hal_buffer_t,
+    pub weight_offset: iree_device_size_t,
+    pub weight_length: iree_device_size_t,
+    pub scratch_ptr: *mut u8,
+    pub scratch_length: usize,
+    pub scratch_handle: u32,
+    pub filter_height: usize,
+    pub filter_width: usize,
+    pub input_channels: usize,
+    pub output_channels: usize,
+    pub element_size: usize,
+}
 
 /// Bridges the RK3588 DPU's atomic-slot output write-back (16-byte-aligned
 /// slots regardless of dtype, `FEATURE_ATOMIC_SIZE=16`) to IREE's densely-
@@ -87,16 +131,17 @@ use iree_rocket_hal::rocket::{
 /// compaction" investigation this fixes. `dispatch()` points the regcmd at
 /// a driver-private scratch buffer instead of the real output buffer;
 /// `queue_execute`, after its existing post-dispatch `prep_bo` wait
-/// confirms the hardware write is complete, copies `bytes_per_pixel` bytes
-/// out of each scratch slot into `output_buffer` (the real, dense IREE
-/// buffer, retained at record time via `output_buffer` below so it survives
-/// until `queue_execute` runs).
+/// confirms the hardware write is complete, interleaves the 16-byte channel
+/// surfaces into `output_buffer` (the real, dense IREE buffer, retained at
+/// record time via `output_buffer` below so it survives until
+/// `queue_execute` runs).
 #[derive(Clone, Copy)]
 pub struct OutputCompaction {
     pub output_buffer: *mut iree_hal_buffer_t,
     pub output_offset: iree_device_size_t,
     pub output_length: iree_device_size_t,
     pub scratch_ptr: *mut u8,
+    pub scratch_length: usize,
     pub pixel_count: usize,
     pub bytes_per_pixel: usize,
 }
@@ -124,7 +169,7 @@ pub enum RecordedOp {
         target: iree_hal_buffer_ref_t,
     },
     Dispatch {
-        regcmd: Vec<RegCmd>,
+        regcmd_tasks: Vec<Vec<RegCmd>>,
         /// GEM handles of every buffer this dispatch reads (bindings other
         /// than the output) -- must be listed in `drm_rocket_job.in_bo_handles`
         /// (device.rs's `queue_execute`) so the kernel driver's implicit
@@ -138,8 +183,13 @@ pub enum RecordedOp {
         in_bo_handles: Vec<u32>,
         /// GEM handles of every buffer this dispatch writes.
         out_bo_handles: Vec<u32>,
-        /// Set only for `Conv2d` (`output_channels == 1`, the only case
-        /// reachable today) -- see `OutputCompaction`'s own doc comment.
+        /// Set for multi-channel Conv2d dispatches whose dense IREE input
+        /// must be packed into NC1HWC2 before the NPU reads it.
+        input_packing: Option<InputPacking>,
+        /// Set for regular fp16 Conv2d dispatches whose logical HWCF filter
+        /// must be packed into the CNA's blocked coefficient order.
+        weight_packing: Option<WeightPacking>,
+        /// Set only for `Conv2d` -- see `OutputCompaction`'s own doc comment.
         /// `None` for `Pooling` (unaffected today, flagged as a follow-up
         /// risk -- same DPU write-back stage almost certainly has the same
         /// atomic-slot mismatch, just not fixed here).
@@ -152,7 +202,7 @@ pub enum RecordedOp {
 /// `device::queue_execute` can build a correct `drm_rocket_job` instead of
 /// submitting with only the regcmd buffer's own handle listed.
 pub struct DispatchJob {
-    pub regcmd: &'static [RegCmd],
+    pub regcmd_tasks: &'static [Vec<RegCmd>],
     pub in_bo_handles: &'static [u32],
     pub out_bo_handles: &'static [u32],
     pub output_compaction: Option<OutputCompaction>,
@@ -284,13 +334,114 @@ pub unsafe fn apply_ops(
                 }
             }
             RecordedOp::Dispatch {
-                regcmd,
+                regcmd_tasks,
                 in_bo_handles,
                 out_bo_handles,
+                input_packing,
+                weight_packing,
                 output_compaction,
             } => {
+                if let Some(packing) = input_packing {
+                    let dense_len = packing
+                        .pixel_count
+                        .checked_mul(packing.bytes_per_pixel)
+                        .ok_or_else(|| {
+                            status::from_code(
+                                crate::bindings::iree_status_code_e_IREE_STATUS_INTERNAL as u32,
+                            )
+                        })?;
+                    if dense_len as u64 > packing.input_length as u64 {
+                        return Err(status::from_code(
+                            crate::bindings::iree_status_code_e_IREE_STATUS_INVALID_ARGUMENT as u32,
+                        ));
+                    }
+                    let input = unsafe { &*(packing.input_buffer as *const RocketBuffer) };
+                    let dense = unsafe {
+                        std::slice::from_raw_parts(
+                            input.host_ptr.add(packing.input_offset as usize),
+                            dense_len,
+                        )
+                    };
+                    let scratch = unsafe {
+                        std::slice::from_raw_parts_mut(packing.scratch_ptr, packing.scratch_length)
+                    };
+                    if pack_nhwc_to_nc1hwc2_padded(
+                        dense,
+                        packing.pixel_count,
+                        packing.bytes_per_pixel,
+                        packing.packed_bytes_per_pixel,
+                        scratch,
+                    )
+                    .is_err()
+                    {
+                        return Err(status::from_code(
+                            crate::bindings::iree_status_code_e_IREE_STATUS_INTERNAL as u32,
+                        ));
+                    }
+                    if unsafe {
+                        iree_rocket_hal::rocket::device::fini_bo(cb.fd, packing.scratch_handle)
+                    }
+                    .is_err()
+                    {
+                        return Err(status::from_code(
+                            crate::bindings::iree_status_code_e_IREE_STATUS_INTERNAL as u32,
+                        ));
+                    }
+                }
+                if let Some(packing) = weight_packing {
+                    let dense_len = packing
+                        .filter_height
+                        .checked_mul(packing.filter_width)
+                        .and_then(|value| value.checked_mul(packing.input_channels))
+                        .and_then(|value| value.checked_mul(packing.output_channels))
+                        .and_then(|value| value.checked_mul(packing.element_size))
+                        .ok_or_else(|| {
+                            status::from_code(
+                                crate::bindings::iree_status_code_e_IREE_STATUS_INTERNAL as u32,
+                            )
+                        })?;
+                    if dense_len as u64 > packing.weight_length as u64 {
+                        return Err(status::from_code(
+                            crate::bindings::iree_status_code_e_IREE_STATUS_INVALID_ARGUMENT as u32,
+                        ));
+                    }
+                    let weights = unsafe { &*(packing.weight_buffer as *const RocketBuffer) };
+                    let dense = unsafe {
+                        std::slice::from_raw_parts(
+                            weights.host_ptr.add(packing.weight_offset as usize),
+                            dense_len,
+                        )
+                    };
+                    let scratch = unsafe {
+                        std::slice::from_raw_parts_mut(packing.scratch_ptr, packing.scratch_length)
+                    };
+                    if pack_hwcf_to_rocket_weights(
+                        dense,
+                        packing.filter_height,
+                        packing.filter_width,
+                        packing.input_channels,
+                        packing.output_channels,
+                        packing.element_size,
+                        scratch,
+                    )
+                    .is_err()
+                    {
+                        return Err(status::from_code(
+                            crate::bindings::iree_status_code_e_IREE_STATUS_INTERNAL as u32,
+                        ));
+                    }
+                    if unsafe {
+                        iree_rocket_hal::rocket::device::fini_bo(cb.fd, packing.scratch_handle)
+                    }
+                    .is_err()
+                    {
+                        return Err(status::from_code(
+                            crate::bindings::iree_status_code_e_IREE_STATUS_INTERNAL as u32,
+                        ));
+                    }
+                }
                 dispatch_job = Some(DispatchJob {
-                    regcmd: regcmd.as_slice(),
+                    regcmd_tasks: regcmd_tasks.as_slice(),
                     in_bo_handles: in_bo_handles.as_slice(),
                     out_bo_handles: out_bo_handles.as_slice(),
                     output_compaction: *output_compaction,
@@ -362,8 +513,17 @@ unsafe extern "C" fn destroy(command_buffer: *mut iree_hal_command_buffer_t) {
                     crate::bindings::iree_hal_buffer_release(target.buffer);
                 }
                 RecordedOp::Dispatch {
-                    output_compaction, ..
+                    input_packing,
+                    weight_packing,
+                    output_compaction,
+                    ..
                 } => {
+                    if let Some(packing) = input_packing {
+                        crate::bindings::iree_hal_buffer_release(packing.input_buffer);
+                    }
+                    if let Some(packing) = weight_packing {
+                        crate::bindings::iree_hal_buffer_release(packing.weight_buffer);
+                    }
                     if let Some(oc) = output_compaction {
                         crate::bindings::iree_hal_buffer_release(oc.output_buffer);
                     }
@@ -633,6 +793,123 @@ unsafe extern "C" fn dispatch(
                     crate::bindings::iree_status_code_e_IREE_STATUS_INVALID_ARGUMENT as u32,
                 );
             }
+            let pixel_count = shape.input_width as usize * shape.input_height as usize;
+            let input_bytes_per_pixel =
+                shape.input_channels as usize * shape.precision.bytes_per_element() as usize;
+            let packed_input_bytes_per_pixel = shape.input_channels.max(16).next_multiple_of(16)
+                as usize
+                * shape.precision.bytes_per_element() as usize;
+            if !matches!(
+                pixel_count.checked_mul(input_bytes_per_pixel),
+                Some(value) if value as u64 <= refs[0].length as u64
+            ) {
+                return status::from_code(
+                    crate::bindings::iree_status_code_e_IREE_STATUS_INVALID_ARGUMENT as u32,
+                );
+            }
+
+            // CNA's multi-channel DMA path consumes 16-byte feature-atomic
+            // NC1HWC2 surfaces. Keep input_channels==1 on its existing
+            // direct path: that register path explicitly enables
+            // nonalign_dma and has separate hardware behavior.
+            let (input_addr, input_handle, input_packing) = if shape.input_channels > 1 {
+                let scratch_bytes =
+                    match nc1hwc2_storage_size(pixel_count, packed_input_bytes_per_pixel) {
+                        Ok(value) => value,
+                        Err(_) => {
+                            return status::from_code(
+                                crate::bindings::iree_status_code_e_IREE_STATUS_INVALID_ARGUMENT
+                                    as u32,
+                            );
+                        }
+                    };
+                let scratch = unsafe {
+                    RocketDeviceBuffer::new(
+                        cb.fd,
+                        scratch_bytes.max(1),
+                        BorrowedFd::borrow_raw(cb.fd),
+                    )
+                };
+                (
+                    scratch.dma_address,
+                    scratch.handle,
+                    Some(InputPacking {
+                        input_buffer: refs[0].buffer,
+                        input_offset: refs[0].offset,
+                        input_length: refs[0].length,
+                        scratch_ptr: scratch.host_ptr,
+                        scratch_length: scratch_bytes,
+                        scratch_handle: scratch.handle,
+                        pixel_count,
+                        bytes_per_pixel: input_bytes_per_pixel,
+                        packed_bytes_per_pixel: packed_input_bytes_per_pixel,
+                    }),
+                )
+            } else {
+                (addr(&refs[0]), handle(&refs[0]), None)
+            };
+            // IREE's conv ABI supplies a logical HWCF filter. Regular fp16
+            // convolution consumes a blocked coefficient stream instead:
+            // output-block, input-group, X, Y, output-lane, input-lane.
+            // This is independently deferred for the same reason as input
+            // packing: an earlier recorded operation may populate weights.
+            let element_size = shape.precision.bytes_per_element() as usize;
+            let (weights_addr, weights_handle, weight_packing) =
+                if shape.precision == Precision::Fp16 && !shape.depthwise {
+                    if !matches!(
+                        (shape.weights_height as usize)
+                        .checked_mul(shape.weights_width as usize)
+                        .and_then(|value| value.checked_mul(shape.input_channels as usize))
+                        .and_then(|value| value.checked_mul(shape.output_channels as usize))
+                        .and_then(|value| value.checked_mul(element_size)),
+                        Some(value) if value as u64 <= refs[1].length as u64
+                    ) {
+                        return status::from_code(
+                            crate::bindings::iree_status_code_e_IREE_STATUS_INVALID_ARGUMENT as u32,
+                        );
+                    }
+                    let scratch_bytes = match rocket_weight_storage_size(
+                        shape.weights_height as usize,
+                        shape.weights_width as usize,
+                        shape.input_channels as usize,
+                        shape.output_channels as usize,
+                        element_size,
+                    ) {
+                        Ok(value) => value,
+                        Err(_) => {
+                            return status::from_code(
+                                crate::bindings::iree_status_code_e_IREE_STATUS_INVALID_ARGUMENT
+                                    as u32,
+                            );
+                        }
+                    };
+                    let scratch = unsafe {
+                        RocketDeviceBuffer::new(
+                            cb.fd,
+                            scratch_bytes.max(1),
+                            BorrowedFd::borrow_raw(cb.fd),
+                        )
+                    };
+                    (
+                        scratch.dma_address,
+                        scratch.handle,
+                        Some(WeightPacking {
+                            weight_buffer: refs[1].buffer,
+                            weight_offset: refs[1].offset,
+                            weight_length: refs[1].length,
+                            scratch_ptr: scratch.host_ptr,
+                            scratch_length: scratch_bytes,
+                            scratch_handle: scratch.handle,
+                            filter_height: shape.weights_height as usize,
+                            filter_width: shape.weights_width as usize,
+                            input_channels: shape.input_channels as usize,
+                            output_channels: shape.output_channels as usize,
+                            element_size,
+                        }),
+                    )
+                } else {
+                    (addr(&refs[1]), handle(&refs[1]), None)
+                };
             // DPU's atomic-slot output write-back (16-byte-aligned slots
             // regardless of dtype) doesn't match IREE's densely-packed ABI
             // output buffer -- see `OutputCompaction`'s own doc comment.
@@ -645,42 +922,55 @@ unsafe extern "C" fn dispatch(
                 RocketDeviceBuffer::new(cb.fd, scratch_bytes, BorrowedFd::borrow_raw(cb.fd))
             };
             let bufs = ConvBuffers {
-                input_addr: addr(&refs[0]),
-                weights_addr: addr(&refs[1]),
+                input_addr,
+                weights_addr,
                 bias_addr: addr(&refs[2]),
                 output_addr: scratch.dma_address,
             };
             // catch_unwind backstop -- see module doc comment for exactly
-            // why. Safe to assert unwind-safety here: build_conv_regcmd
-            // only builds and returns a fresh local Vec<RegCmd>, so a
-            // panic mid-build just drops that local value -- no shared or
-            // global state is left half-mutated.
-            let regcmd = match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                build_conv_regcmd(shape, &bufs)
+            // why. The builder only returns fresh local vectors, so a
+            // panic mid-build leaves no shared state half-mutated.
+            let regcmd_tasks = match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                build_conv_regcmd_tasks(shape, &bufs)
             })) {
-                Ok(regcmd) => regcmd,
+                Ok(Ok(tasks)) => tasks,
+                Ok(Err(_)) => {
+                    return status::from_code(
+                        crate::bindings::iree_status_code_e_IREE_STATUS_INVALID_ARGUMENT as u32,
+                    );
+                }
                 Err(_) => {
                     return status::from_code(
                         crate::bindings::iree_status_code_e_IREE_STATUS_INTERNAL as u32,
                     );
                 }
             };
-            // Retained here so the real output buffer survives until
-            // `queue_execute`'s post-dispatch compaction step; released in
-            // `destroy()`'s `OutputCompaction` arm.
+            // Retained here so the dense input survives until pre-dispatch
+            // packing and the real output survives until post-dispatch
+            // compaction. Both are released by `destroy()`.
+            if input_packing.is_some() {
+                unsafe { crate::bindings::iree_hal_buffer_retain(refs[0].buffer) };
+            }
+            if weight_packing.is_some() {
+                unsafe { crate::bindings::iree_hal_buffer_retain(refs[1].buffer) };
+            }
             unsafe { crate::bindings::iree_hal_buffer_retain(refs[3].buffer) };
             let output_compaction = Some(OutputCompaction {
                 output_buffer: refs[3].buffer,
                 output_offset: refs[3].offset,
                 output_length: refs[3].length,
                 scratch_ptr: scratch.host_ptr,
+                scratch_length: scratch_bytes,
                 pixel_count: shape.output_width as usize * shape.output_height as usize,
-                bytes_per_pixel: shape.precision.bytes_per_element() as usize,
+                bytes_per_pixel: shape.output_channels as usize
+                    * shape.precision.bytes_per_element() as usize,
             });
             cb.ops.push(RecordedOp::Dispatch {
-                regcmd,
-                in_bo_handles: vec![handle(&refs[0]), handle(&refs[1]), handle(&refs[2])],
+                regcmd_tasks,
+                in_bo_handles: vec![input_handle, weights_handle, handle(&refs[2])],
                 out_bo_handles: vec![scratch.handle],
+                input_packing,
+                weight_packing,
                 output_compaction,
             });
         }
@@ -697,9 +987,11 @@ unsafe extern "C" fn dispatch(
                 output_addr: addr(&refs[1]),
             };
             cb.ops.push(RecordedOp::Dispatch {
-                regcmd: build_pooling_regcmd(shape, &bufs),
+                regcmd_tasks: vec![build_pooling_regcmd(shape, &bufs)],
                 in_bo_handles: vec![handle(&refs[0])],
                 out_bo_handles: vec![handle(&refs[1])],
+                input_packing: None,
+                weight_packing: None,
                 output_compaction: None,
             });
         }
