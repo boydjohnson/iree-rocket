@@ -326,50 +326,63 @@ fn fc_uniform_fill_all_output_channels_agree() {
 }
 
 /// Validates the logical `[K,N]` weight ABI and the second output surface.
-/// Only logical output channel 17 receives the same nonzero coefficient used
-/// by `fc_output_tracks_input`; changing the input must therefore change that
-/// channel and no other channel.
+/// Only logical output channel 17 changes between two otherwise-identical
+/// weight tensors: from a strongly negative coefficient (`0x40`, real -64)
+/// to a strongly positive one (`0xc0`, real +64). Every other logical weight
+/// stays at the confirmed neutral representation (`0x80`, real zero), so only
+/// channel 17 may change.
 ///
-/// Deliberately uses the already-proven zero-point=0, weight=2 regime. The
-/// tempting symmetric-zero-point version (`0x80` baseline, `0x82` selected
-/// weight) is not diagnostic: the shared int8 1x1-conv output-conversion bug
-/// collapses both its zero and small-positive accumulators to raw 127.
+/// The large selected-weight swing is deliberate. A smaller symmetric
+/// zero-point probe (`0x80` baseline versus `0x82`) was swallowed by the
+/// shared int8 1x1-conv output-conversion bug, producing raw 127 for both.
+/// Conversely, zero-point=0 with raw-zero "inactive" weights is also not a
+/// valid isolation probe on this pipeline: hardware showed all 32 channels
+/// responding to the input, meaning raw zero was not acting as a neutral
+/// coefficient in that configuration.
 #[test]
 #[ignore = "needs the real NPU device -- cross-compile for aarch64, copy to the board, run there"]
 fn fc_packed_weights_select_one_output_channel() {
     const SELECTED_CHANNEL: usize = 17;
-    let shape = small_shape();
-    let mut selected_weights = vec![0u8; shape.k as usize * shape.n as usize];
+    let shape = FcShape {
+        input_zero_point: 0x80,
+        output_zero_point: 0x80,
+        weights_zero_point: 0x80,
+        ..small_shape()
+    };
+    let input = vec![0xc8; shape.m as usize * shape.k as usize];
+    let mut negative_weights = vec![0x80u8; shape.k as usize * shape.n as usize];
+    let mut positive_weights = negative_weights.clone();
     for k in 0..shape.k as usize {
-        selected_weights[k * shape.n as usize + SELECTED_CHANNEL] = 2;
+        let index = k * shape.n as usize + SELECTED_CHANNEL;
+        negative_weights[index] = 0x40;
+        positive_weights[index] = 0xc0;
     }
-    let low_input = vec![10u8; shape.m as usize * shape.k as usize];
-    let high_input = vec![200u8; shape.m as usize * shape.k as usize];
-    let low = run_packed_fc(&shape, &low_input, &selected_weights);
-    let high = run_packed_fc(&shape, &high_input, &selected_weights);
+    let negative = run_packed_fc(&shape, &input, &negative_weights);
+    let positive = run_packed_fc(&shape, &input, &positive_weights);
 
     let changed_channels = (0..shape.n as usize)
         .filter(|&n| {
             (0..shape.m as usize).any(|m| {
                 let index = m * shape.n as usize + n;
-                low[index] != high[index]
+                negative[index] != positive[index]
             })
         })
         .collect::<Vec<_>>();
     let selected_values = (0..shape.m as usize)
         .map(|m| {
             let index = m * shape.n as usize + SELECTED_CHANNEL;
-            (low[index], high[index])
+            (negative[index], positive[index])
         })
         .collect::<Vec<_>>();
     eprintln!(
-        "logical output channels responding to input sweep: {changed_channels:?}; \
-         selected channel {SELECTED_CHANNEL} (low, high) by M: {selected_values:?}"
+        "logical output channels responding to selected-weight sign change: \
+         {changed_channels:?}; selected channel {SELECTED_CHANNEL} \
+         (negative, positive) by M: {selected_values:?}"
     );
     assert_eq!(
         changed_channels,
         vec![SELECTED_CHANNEL],
-        "expected only logical output channel {SELECTED_CHANNEL} to respond to input changing from 10 to 200"
+        "expected only logical output channel {SELECTED_CHANNEL} to respond when its weights changed from real -64 to +64"
     );
 }
 
