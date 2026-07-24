@@ -51,7 +51,7 @@ use iree_rocket_hal::rocket::executable_format::{
     CONV2D_V1_TAG, decode_conv_shape_v1, validate_conv_shape,
 };
 use iree_rocket_hal::rocket::regcmd::{
-    Activation, ConvShape, PoolingMethod, PoolingShape, Precision,
+    Activation, ConvShape, FcShape, PoolingMethod, PoolingShape, Precision, fc_as_conv_shape,
 };
 use rocket_schema::rocket as schema;
 
@@ -59,7 +59,29 @@ const FLATBUFFER_FORMAT: &[u8] = b"rocket-flatbuffer-v1";
 const LEGACY_FORMAT: &[u8] = b"rocket-conv2d-v1";
 const IREE_FLATBUFFER_HEADER_SIZE: usize = 64;
 
-fn decode_flatbuffer_conv_shape(data: &[u8]) -> Result<ConvShape, ()> {
+fn decode_activation(
+    activation: schema::Activation,
+    activation_cmp: u32,
+) -> Result<Activation, ()> {
+    match activation {
+        schema::Activation::NONE => Ok(Activation::None),
+        schema::Activation::RELU => Ok(Activation::Relu),
+        schema::Activation::RELUX => Ok(Activation::Relux {
+            cmp: activation_cmp,
+        }),
+        _ => Err(()),
+    }
+}
+
+fn decode_precision(precision: schema::Precision) -> Result<Precision, ()> {
+    match precision {
+        schema::Precision::INT8 => Ok(Precision::Int8),
+        schema::Precision::FP16 => Ok(Precision::Fp16),
+        _ => Err(()),
+    }
+}
+
+fn decode_flatbuffer_shape(data: &[u8]) -> Result<UkernelShape, ()> {
     if data.len() < IREE_FLATBUFFER_HEADER_SIZE || &data[..4] != b"RKT1" {
         return Err(());
     }
@@ -85,46 +107,57 @@ fn decode_flatbuffer_conv_shape(data: &[u8]) -> Result<ConvShape, ()> {
     }
 
     let export = exports.get(0);
-    if export.kernel_type() != schema::KernelDef::Conv2DDef {
-        return Err(());
+    match export.kernel_type() {
+        schema::KernelDef::Conv2DDef => {
+            let conv = export.kernel_as_conv_2ddef().ok_or(())?;
+            let shape = ConvShape {
+                input_width: conv.input_width(),
+                input_height: conv.input_height(),
+                input_channels: conv.input_channels(),
+                output_width: conv.output_width(),
+                output_height: conv.output_height(),
+                output_channels: conv.output_channels(),
+                weights_width: conv.weights_width(),
+                weights_height: conv.weights_height(),
+                stride: conv.stride(),
+                depthwise: conv.depthwise(),
+                input_zero_point: conv.input_zero_point(),
+                output_zero_point: conv.output_zero_point(),
+                weights_zero_point: conv.weights_zero_point(),
+                input_scale: conv.input_scale(),
+                weights_scale: conv.weights_scale(),
+                output_scale: conv.output_scale(),
+                truncate_bits: conv.truncate_bits(),
+                activation: decode_activation(conv.activation(), conv.activation_cmp())?,
+                precision: decode_precision(conv.precision())?,
+            };
+            validate_conv_shape(&shape).map_err(|_| ())?;
+            Ok(UkernelShape::Conv2d(shape))
+        }
+        schema::KernelDef::FullyConnectedDef => {
+            let fc = export.kernel_as_fully_connected_def().ok_or(())?;
+            if fc.m() == 0 || fc.k() == 0 || fc.n() == 0 {
+                return Err(());
+            }
+            let shape = FcShape {
+                m: fc.m(),
+                k: fc.k(),
+                n: fc.n(),
+                input_zero_point: fc.input_zero_point(),
+                output_zero_point: fc.output_zero_point(),
+                weights_zero_point: fc.weights_zero_point(),
+                input_scale: fc.input_scale(),
+                weights_scale: fc.weights_scale(),
+                output_scale: fc.output_scale(),
+                truncate_bits: fc.truncate_bits(),
+                activation: decode_activation(fc.activation(), fc.activation_cmp())?,
+                precision: decode_precision(fc.precision())?,
+            };
+            validate_conv_shape(&fc_as_conv_shape(&shape)).map_err(|_| ())?;
+            Ok(UkernelShape::FullyConnected(shape))
+        }
+        _ => Err(()),
     }
-    let conv = export.kernel_as_conv_2ddef().ok_or(())?;
-    let activation = match conv.activation() {
-        schema::Activation::NONE => Activation::None,
-        schema::Activation::RELU => Activation::Relu,
-        schema::Activation::RELUX => Activation::Relux {
-            cmp: conv.activation_cmp(),
-        },
-        _ => return Err(()),
-    };
-    let precision = match conv.precision() {
-        schema::Precision::INT8 => Precision::Int8,
-        schema::Precision::FP16 => Precision::Fp16,
-        _ => return Err(()),
-    };
-    let shape = ConvShape {
-        input_width: conv.input_width(),
-        input_height: conv.input_height(),
-        input_channels: conv.input_channels(),
-        output_width: conv.output_width(),
-        output_height: conv.output_height(),
-        output_channels: conv.output_channels(),
-        weights_width: conv.weights_width(),
-        weights_height: conv.weights_height(),
-        stride: conv.stride(),
-        depthwise: conv.depthwise(),
-        input_zero_point: conv.input_zero_point(),
-        output_zero_point: conv.output_zero_point(),
-        weights_zero_point: conv.weights_zero_point(),
-        input_scale: conv.input_scale(),
-        weights_scale: conv.weights_scale(),
-        output_scale: conv.output_scale(),
-        truncate_bits: conv.truncate_bits(),
-        activation,
-        precision,
-    };
-    validate_conv_shape(&shape).map_err(|_| ())?;
-    Ok(shape)
 }
 
 /// What every `iree_hal_executable_cache_t*` this driver hands out
@@ -214,7 +247,7 @@ unsafe extern "C" fn prepare_executable(
     };
 
     if format == FLATBUFFER_FORMAT {
-        let shape = match decode_flatbuffer_conv_shape(bytes) {
+        let shape = match decode_flatbuffer_shape(bytes) {
             Ok(shape) => shape,
             Err(()) => {
                 return status::from_code(
@@ -223,7 +256,7 @@ unsafe extern "C" fn prepare_executable(
             }
         };
         unsafe {
-            *out_executable = crate::executable::create(UkernelShape::Conv2d(shape));
+            *out_executable = crate::executable::create(shape);
         }
         return status::ok();
     }
@@ -350,13 +383,54 @@ pub static VTABLE: iree_hal_executable_cache_vtable_t = iree_hal_executable_cach
 mod tests {
     use super::*;
 
+    fn encode_fc_executable() -> Vec<u8> {
+        let mut builder = flatbuffers::FlatBufferBuilder::new();
+        let name = builder.create_string("rocket_fc_0");
+        let fc = schema::FullyConnectedDef::create(
+            &mut builder,
+            &schema::FullyConnectedDefArgs {
+                m: 4,
+                k: 32,
+                n: 16,
+                precision: schema::Precision::FP16,
+                ..Default::default()
+            },
+        );
+        let export = schema::ExportDef::create(
+            &mut builder,
+            &schema::ExportDefArgs {
+                name: Some(name),
+                kernel_type: schema::KernelDef::FullyConnectedDef,
+                kernel: Some(fc.as_union_value()),
+            },
+        );
+        let exports = builder.create_vector(&[export]);
+        let executable = schema::ExecutableDef::create(
+            &mut builder,
+            &schema::ExecutableDefArgs {
+                exports: Some(exports),
+            },
+        );
+        schema::finish_executable_def_buffer(&mut builder, executable);
+
+        let flatbuffer = builder.finished_data();
+        let mut data = vec![0u8; IREE_FLATBUFFER_HEADER_SIZE];
+        data[0..4].copy_from_slice(b"RKT1");
+        data[8..16].copy_from_slice(&(flatbuffer.len() as u64).to_le_bytes());
+        data.extend_from_slice(flatbuffer);
+        data
+    }
+
     #[test]
     fn decodes_compiler_produced_flatbuffer() {
         let data = include_bytes!(concat!(
             env!("CARGO_MANIFEST_DIR"),
             "/../rocket-schema/testdata/mnv2_conv0.rkt1"
         ));
-        let shape = decode_flatbuffer_conv_shape(data).unwrap();
+        let shape = decode_flatbuffer_shape(data).unwrap();
+        let UkernelShape::Conv2d(shape) = shape else {
+            panic!("expected Conv2d");
+        };
         assert_eq!(shape.input_width, 112);
         assert_eq!(shape.input_height, 112);
         assert_eq!(shape.input_channels, 32);
@@ -372,6 +446,16 @@ mod tests {
             env!("CARGO_MANIFEST_DIR"),
             "/../rocket-schema/testdata/mnv2_conv0.rkt1"
         ));
-        assert!(decode_flatbuffer_conv_shape(&data[..data.len() - 1]).is_err());
+        assert!(decode_flatbuffer_shape(&data[..data.len() - 1]).is_err());
+    }
+
+    #[test]
+    fn decodes_fully_connected_flatbuffer() {
+        let shape = decode_flatbuffer_shape(&encode_fc_executable()).unwrap();
+        let UkernelShape::FullyConnected(shape) = shape else {
+            panic!("expected FullyConnected");
+        };
+        assert_eq!((shape.m, shape.k, shape.n), (4, 32, 16));
+        assert_eq!(shape.precision, Precision::Fp16);
     }
 }

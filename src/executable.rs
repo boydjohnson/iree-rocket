@@ -18,7 +18,7 @@ use crate::bindings::{
     iree_hal_resource_t, iree_host_size_t, iree_status_t, iree_string_view_t,
 };
 use crate::status;
-use iree_rocket_hal::rocket::regcmd::{ConvShape, PoolingShape};
+use iree_rocket_hal::rocket::regcmd::{ConvShape, FcShape, PoolingShape};
 
 /// One of this driver's fixed regcmd-template shapes -- see `regcmd.rs`'s
 /// module doc comment in iree-rocket-hal for why the NPU pipeline itself
@@ -28,6 +28,7 @@ use iree_rocket_hal::rocket::regcmd::{ConvShape, PoolingShape};
 /// gain HAL-level wiring.
 pub enum UkernelShape {
     Conv2d(ConvShape),
+    FullyConnected(FcShape),
     Pooling(PoolingShape),
 }
 

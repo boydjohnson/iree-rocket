@@ -75,14 +75,20 @@ use iree_rocket_hal::rocket::{
     builders::RegCmd,
     device::Buffer as RocketDeviceBuffer,
     regcmd::{
-        ConvBuffers, PoolingBuffers, Precision, build_conv_regcmd_tasks, build_pooling_regcmd,
-        conv_output_scratch_bytes,
+        ConvBuffers, FC_PHYSICAL_HEIGHT, FcBuffers, PoolingBuffers, Precision,
+        build_conv_regcmd_tasks, build_fc_regcmd, build_pooling_regcmd, conv_output_scratch_bytes,
     },
     tensor_layout::{
         nc1hwc2_storage_size, pack_hwcf_to_rocket_weights, pack_nhwc_to_nc1hwc2_padded,
         rocket_weight_storage_size,
     },
 };
+
+#[derive(Clone, Copy)]
+pub enum InputPackingLayout {
+    Dense,
+    Nc1hwc2,
+}
 
 /// Defers dense-NHWC to NC1HWC2 packing until command-buffer execution.
 ///
@@ -98,9 +104,12 @@ pub struct InputPacking {
     pub scratch_ptr: *mut u8,
     pub scratch_length: usize,
     pub scratch_handle: u32,
-    pub pixel_count: usize,
+    pub source_pixel_count: usize,
+    pub packed_pixel_count: usize,
     pub bytes_per_pixel: usize,
     pub packed_bytes_per_pixel: usize,
+    pub padding_byte: u8,
+    pub layout: InputPackingLayout,
 }
 
 /// Defers logical HWCF-to-Rocket coefficient packing until execution.
@@ -142,7 +151,8 @@ pub struct OutputCompaction {
     pub output_length: iree_device_size_t,
     pub scratch_ptr: *mut u8,
     pub scratch_length: usize,
-    pub pixel_count: usize,
+    pub source_pixel_count: usize,
+    pub output_pixel_count: usize,
     pub bytes_per_pixel: usize,
 }
 
@@ -343,7 +353,7 @@ pub unsafe fn apply_ops(
             } => {
                 if let Some(packing) = input_packing {
                     let dense_len = packing
-                        .pixel_count
+                        .source_pixel_count
                         .checked_mul(packing.bytes_per_pixel)
                         .ok_or_else(|| {
                             status::from_code(
@@ -362,18 +372,43 @@ pub unsafe fn apply_ops(
                             dense_len,
                         )
                     };
+                    let padded_dense = if packing.source_pixel_count != packing.packed_pixel_count {
+                        let padded_len = packing
+                            .packed_pixel_count
+                            .checked_mul(packing.bytes_per_pixel)
+                            .ok_or_else(|| {
+                                status::from_code(
+                                    crate::bindings::iree_status_code_e_IREE_STATUS_INTERNAL as u32,
+                                )
+                            })?;
+                        let mut padded = vec![packing.padding_byte; padded_len];
+                        padded[..dense_len].copy_from_slice(dense);
+                        Some(padded)
+                    } else {
+                        None
+                    };
+                    let dense = padded_dense.as_deref().unwrap_or(dense);
                     let scratch = unsafe {
                         std::slice::from_raw_parts_mut(packing.scratch_ptr, packing.scratch_length)
                     };
-                    if pack_nhwc_to_nc1hwc2_padded(
-                        dense,
-                        packing.pixel_count,
-                        packing.bytes_per_pixel,
-                        packing.packed_bytes_per_pixel,
-                        scratch,
-                    )
-                    .is_err()
-                    {
+                    let packing_result = match packing.layout {
+                        InputPackingLayout::Dense => {
+                            if dense.len() > scratch.len() {
+                                Err("dense padded input exceeds its scratch buffer")
+                            } else {
+                                scratch[..dense.len()].copy_from_slice(dense);
+                                Ok(dense.len())
+                            }
+                        }
+                        InputPackingLayout::Nc1hwc2 => pack_nhwc_to_nc1hwc2_padded(
+                            dense,
+                            packing.packed_pixel_count,
+                            packing.bytes_per_pixel,
+                            packing.packed_bytes_per_pixel,
+                            scratch,
+                        ),
+                    };
+                    if packing_result.is_err() {
                         return Err(status::from_code(
                             crate::bindings::iree_status_code_e_IREE_STATUS_INTERNAL as u32,
                         ));
@@ -840,9 +875,12 @@ unsafe extern "C" fn dispatch(
                         scratch_ptr: scratch.host_ptr,
                         scratch_length: scratch_bytes,
                         scratch_handle: scratch.handle,
-                        pixel_count,
+                        source_pixel_count: pixel_count,
+                        packed_pixel_count: pixel_count,
                         bytes_per_pixel: input_bytes_per_pixel,
                         packed_bytes_per_pixel: packed_input_bytes_per_pixel,
+                        padding_byte: 0,
+                        layout: InputPackingLayout::Nc1hwc2,
                     }),
                 )
             } else {
@@ -961,7 +999,8 @@ unsafe extern "C" fn dispatch(
                 output_length: refs[3].length,
                 scratch_ptr: scratch.host_ptr,
                 scratch_length: scratch_bytes,
-                pixel_count: shape.output_width as usize * shape.output_height as usize,
+                source_pixel_count: shape.output_width as usize * shape.output_height as usize,
+                output_pixel_count: shape.output_width as usize * shape.output_height as usize,
                 bytes_per_pixel: shape.output_channels as usize
                     * shape.precision.bytes_per_element() as usize,
             });
@@ -972,6 +1011,216 @@ unsafe extern "C" fn dispatch(
                 input_packing,
                 weight_packing,
                 output_compaction,
+            });
+        }
+        UkernelShape::FullyConnected(shape) => {
+            if bindings.count < 4 {
+                return status::from_code(
+                    crate::bindings::iree_status_code_e_IREE_STATUS_INVALID_ARGUMENT as u32,
+                );
+            }
+
+            let m = shape.m as usize;
+            let k = shape.k as usize;
+            let n = shape.n as usize;
+            let element_size = shape.precision.bytes_per_element() as usize;
+            let physical_pixel_count = match m.checked_mul(FC_PHYSICAL_HEIGHT as usize) {
+                Some(value) => value,
+                None => {
+                    return status::from_code(
+                        crate::bindings::iree_status_code_e_IREE_STATUS_INVALID_ARGUMENT as u32,
+                    );
+                }
+            };
+            let input_bytes_per_pixel = match k.checked_mul(element_size) {
+                Some(value) => value,
+                None => {
+                    return status::from_code(
+                        crate::bindings::iree_status_code_e_IREE_STATUS_INVALID_ARGUMENT as u32,
+                    );
+                }
+            };
+            let output_bytes_per_pixel = match n.checked_mul(element_size) {
+                Some(value) => value,
+                None => {
+                    return status::from_code(
+                        crate::bindings::iree_status_code_e_IREE_STATUS_INVALID_ARGUMENT as u32,
+                    );
+                }
+            };
+            let input_len = m.checked_mul(input_bytes_per_pixel);
+            let weights_len = k
+                .checked_mul(n)
+                .and_then(|value| value.checked_mul(element_size));
+            let bias_len = n.checked_mul(element_size);
+            let output_len = m.checked_mul(output_bytes_per_pixel);
+            if !matches!(input_len, Some(value) if value as u64 <= refs[0].length as u64)
+                || !matches!(weights_len, Some(value) if value as u64 <= refs[1].length as u64)
+                || !matches!(bias_len, Some(value) if value as u64 <= refs[2].length as u64)
+                || !matches!(output_len, Some(value) if value as u64 <= refs[3].length as u64)
+                || (shape.precision == Precision::Int8 && shape.input_zero_point > u8::MAX as u32)
+            {
+                return status::from_code(
+                    crate::bindings::iree_status_code_e_IREE_STATUS_INVALID_ARGUMENT as u32,
+                );
+            }
+
+            // FC is lowered by build_fc_regcmd to a 1x1 convolution with a
+            // fixed physical height of four. The public input contains only
+            // logical row 0, so materialize the remaining three rows in
+            // driver-private storage before applying the same NC1HWC2
+            // channel blocking used by convolution.
+            let packed_input_bytes_per_pixel = k.max(16).next_multiple_of(16) * element_size;
+            let (input_scratch_bytes, input_layout) = if k > 1 {
+                match nc1hwc2_storage_size(physical_pixel_count, packed_input_bytes_per_pixel) {
+                    Ok(value) => (value, InputPackingLayout::Nc1hwc2),
+                    Err(_) => {
+                        return status::from_code(
+                            crate::bindings::iree_status_code_e_IREE_STATUS_INVALID_ARGUMENT as u32,
+                        );
+                    }
+                }
+            } else {
+                match physical_pixel_count.checked_mul(input_bytes_per_pixel) {
+                    Some(value) => (value, InputPackingLayout::Dense),
+                    None => {
+                        return status::from_code(
+                            crate::bindings::iree_status_code_e_IREE_STATUS_INVALID_ARGUMENT as u32,
+                        );
+                    }
+                }
+            };
+            if input_scratch_bytes > u32::MAX as usize {
+                return status::from_code(
+                    crate::bindings::iree_status_code_e_IREE_STATUS_INVALID_ARGUMENT as u32,
+                );
+            }
+            let input_scratch = unsafe {
+                RocketDeviceBuffer::new(
+                    cb.fd,
+                    input_scratch_bytes.max(1),
+                    BorrowedFd::borrow_raw(cb.fd),
+                )
+            };
+            let input_packing = Some(InputPacking {
+                input_buffer: refs[0].buffer,
+                input_offset: refs[0].offset,
+                input_length: refs[0].length,
+                scratch_ptr: input_scratch.host_ptr,
+                scratch_length: input_scratch_bytes,
+                scratch_handle: input_scratch.handle,
+                source_pixel_count: m,
+                packed_pixel_count: physical_pixel_count,
+                bytes_per_pixel: input_bytes_per_pixel,
+                packed_bytes_per_pixel: packed_input_bytes_per_pixel,
+                padding_byte: if shape.precision == Precision::Int8 {
+                    shape.input_zero_point as u8
+                } else {
+                    0
+                },
+                layout: input_layout,
+            });
+
+            // FC weights arrive as a logical row-major [K,N] matrix, which
+            // is exactly a 1x1 HWCF filter and therefore always needs the
+            // CNA coefficient transform (for both int8 and fp16).
+            let weight_scratch_bytes = match rocket_weight_storage_size(1, 1, k, n, element_size) {
+                Ok(value) => value,
+                Err(_) => {
+                    return status::from_code(
+                        crate::bindings::iree_status_code_e_IREE_STATUS_INVALID_ARGUMENT as u32,
+                    );
+                }
+            };
+            if weight_scratch_bytes > u32::MAX as usize {
+                return status::from_code(
+                    crate::bindings::iree_status_code_e_IREE_STATUS_INVALID_ARGUMENT as u32,
+                );
+            }
+            let weight_scratch = unsafe {
+                RocketDeviceBuffer::new(
+                    cb.fd,
+                    weight_scratch_bytes.max(1),
+                    BorrowedFd::borrow_raw(cb.fd),
+                )
+            };
+            let weight_packing = Some(WeightPacking {
+                weight_buffer: refs[1].buffer,
+                weight_offset: refs[1].offset,
+                weight_length: refs[1].length,
+                scratch_ptr: weight_scratch.host_ptr,
+                scratch_length: weight_scratch_bytes,
+                scratch_handle: weight_scratch.handle,
+                filter_height: 1,
+                filter_width: 1,
+                input_channels: k,
+                output_channels: n,
+                element_size,
+            });
+
+            let output_scratch_bytes =
+                match nc1hwc2_storage_size(physical_pixel_count, output_bytes_per_pixel) {
+                    Ok(value) => value,
+                    Err(_) => {
+                        return status::from_code(
+                            crate::bindings::iree_status_code_e_IREE_STATUS_INVALID_ARGUMENT as u32,
+                        );
+                    }
+                };
+            if output_scratch_bytes > u32::MAX as usize {
+                return status::from_code(
+                    crate::bindings::iree_status_code_e_IREE_STATUS_INVALID_ARGUMENT as u32,
+                );
+            }
+            let output_scratch = unsafe {
+                RocketDeviceBuffer::new(
+                    cb.fd,
+                    output_scratch_bytes.max(1),
+                    BorrowedFd::borrow_raw(cb.fd),
+                )
+            };
+            let bufs = FcBuffers {
+                input_addr: input_scratch.dma_address,
+                weights_addr: weight_scratch.dma_address,
+                bias_addr: addr(&refs[2]),
+                output_addr: output_scratch.dma_address,
+            };
+            let regcmd_tasks = match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                build_fc_regcmd(shape, &bufs)
+            })) {
+                Ok(task) => vec![task],
+                Err(_) => {
+                    return status::from_code(
+                        crate::bindings::iree_status_code_e_IREE_STATUS_INVALID_ARGUMENT as u32,
+                    );
+                }
+            };
+
+            unsafe {
+                crate::bindings::iree_hal_buffer_retain(refs[0].buffer);
+                crate::bindings::iree_hal_buffer_retain(refs[1].buffer);
+                crate::bindings::iree_hal_buffer_retain(refs[3].buffer);
+            }
+            cb.ops.push(RecordedOp::Dispatch {
+                regcmd_tasks,
+                in_bo_handles: vec![
+                    input_scratch.handle,
+                    weight_scratch.handle,
+                    handle(&refs[2]),
+                ],
+                out_bo_handles: vec![output_scratch.handle],
+                input_packing,
+                weight_packing,
+                output_compaction: Some(OutputCompaction {
+                    output_buffer: refs[3].buffer,
+                    output_offset: refs[3].offset,
+                    output_length: refs[3].length,
+                    scratch_ptr: output_scratch.host_ptr,
+                    scratch_length: output_scratch_bytes,
+                    source_pixel_count: physical_pixel_count,
+                    output_pixel_count: m,
+                    bytes_per_pixel: output_bytes_per_pixel,
+                }),
             });
         }
         UkernelShape::Pooling(shape) => {

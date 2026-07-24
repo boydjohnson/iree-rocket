@@ -1065,20 +1065,21 @@ status_stub!(queue_dispatch(
 /// Dense NHWC instead stores every channel group for one pixel contiguously,
 /// so copy one surface chunk at a time into each destination pixel. The final
 /// logical surface may use fewer than 16 bytes.
-fn compact_conv_output(
+fn compact_atomic_output(
     scratch: &[u8],
-    pixel_count: usize,
+    source_pixel_count: usize,
+    output_pixel_count: usize,
     bytes_per_pixel: usize,
     dst: &mut [u8],
 ) -> usize {
     const ATOMIC_STRIDE: usize = 16;
     let mut written = 0;
-    for pixel in 0..pixel_count {
+    for pixel in 0..output_pixel_count {
         let mut pixel_written = 0;
         while pixel_written < bytes_per_pixel {
             let surface = pixel_written / ATOMIC_STRIDE;
             let chunk_len = (bytes_per_pixel - pixel_written).min(ATOMIC_STRIDE);
-            let src_off = surface * pixel_count * ATOMIC_STRIDE + pixel * ATOMIC_STRIDE;
+            let src_off = surface * source_pixel_count * ATOMIC_STRIDE + pixel * ATOMIC_STRIDE;
             let dst_off = pixel * bytes_per_pixel + pixel_written;
             if src_off + chunk_len > scratch.len() || dst_off + chunk_len > dst.len() {
                 return written;
@@ -1094,7 +1095,7 @@ fn compact_conv_output(
 
 #[cfg(test)]
 mod compaction_tests {
-    use super::compact_conv_output;
+    use super::compact_atomic_output;
 
     #[test]
     fn compacts_16_byte_slots_into_dense_output() {
@@ -1106,7 +1107,7 @@ mod compaction_tests {
             scratch[i * 16 + 1] = 0x10 + i as u8;
         }
         let mut dst = vec![0u8; PIXELS * BPP];
-        let written = compact_conv_output(&scratch, PIXELS, BPP, &mut dst);
+        let written = compact_atomic_output(&scratch, PIXELS, PIXELS, BPP, &mut dst);
         assert_eq!(written, PIXELS * BPP);
         assert_eq!(dst, vec![0x00, 0x10, 0x01, 0x11, 0x02, 0x12, 0x03, 0x13]);
     }
@@ -1122,7 +1123,7 @@ mod compaction_tests {
         scratch[48..64].copy_from_slice(&[3; 16]);
 
         let mut dst = vec![0u8; PIXELS * BPP];
-        let written = compact_conv_output(&scratch, PIXELS, BPP, &mut dst);
+        let written = compact_atomic_output(&scratch, PIXELS, PIXELS, BPP, &mut dst);
         assert_eq!(written, PIXELS * BPP);
         assert_eq!(&dst[0..16], &[0; 16]);
         assert_eq!(&dst[16..20], &[2; 4]);
@@ -1134,7 +1135,7 @@ mod compaction_tests {
     fn stops_short_when_dst_too_small() {
         let scratch = vec![0u8; 64];
         let mut dst = vec![0u8; 2];
-        let written = compact_conv_output(&scratch, 4, 2, &mut dst);
+        let written = compact_atomic_output(&scratch, 4, 4, 2, &mut dst);
         assert_eq!(written, 2);
     }
 
@@ -1142,8 +1143,30 @@ mod compaction_tests {
     fn stops_short_when_scratch_too_small() {
         let scratch = vec![0u8; 16];
         let mut dst = vec![0u8; 8];
-        let written = compact_conv_output(&scratch, 4, 2, &mut dst);
+        let written = compact_atomic_output(&scratch, 4, 4, 2, &mut dst);
         assert_eq!(written, 2);
+    }
+
+    #[test]
+    fn compacts_fc_row_zero_with_physical_height_padding() {
+        const LOGICAL_PIXELS: usize = 2;
+        const PHYSICAL_PIXELS: usize = LOGICAL_PIXELS * 4;
+        const BPP: usize = 20;
+        let mut scratch = vec![0xAAu8; PHYSICAL_PIXELS * 2 * 16];
+        scratch[0..16].copy_from_slice(&[1; 16]);
+        scratch[16..32].copy_from_slice(&[2; 16]);
+        let second_surface = PHYSICAL_PIXELS * 16;
+        scratch[second_surface..second_surface + 16].copy_from_slice(&[3; 16]);
+        scratch[second_surface + 16..second_surface + 32].copy_from_slice(&[4; 16]);
+
+        let mut dst = vec![0u8; LOGICAL_PIXELS * BPP];
+        let written =
+            compact_atomic_output(&scratch, PHYSICAL_PIXELS, LOGICAL_PIXELS, BPP, &mut dst);
+        assert_eq!(written, LOGICAL_PIXELS * BPP);
+        assert_eq!(&dst[0..16], &[1; 16]);
+        assert_eq!(&dst[16..20], &[3; 4]);
+        assert_eq!(&dst[20..36], &[2; 16]);
+        assert_eq!(&dst[36..40], &[4; 4]);
     }
 }
 
@@ -1313,7 +1336,7 @@ unsafe extern "C" fn queue_execute(
                     // into the real buffer now that prep_bo above confirmed
                     // the write is complete and host-visible.
                     if let Some(oc) = job.output_compaction {
-                        let expected_bytes = oc.pixel_count * oc.bytes_per_pixel;
+                        let expected_bytes = oc.output_pixel_count * oc.bytes_per_pixel;
                         if expected_bytes as u64 > oc.output_length as u64 {
                             break 'result status::from_code(
                                 iree_status_code_e_IREE_STATUS_INTERNAL as u32,
@@ -1329,7 +1352,13 @@ unsafe extern "C" fn queue_execute(
                                 expected_bytes,
                             )
                         };
-                        compact_conv_output(scratch, oc.pixel_count, oc.bytes_per_pixel, dst);
+                        compact_atomic_output(
+                            scratch,
+                            oc.source_pixel_count,
+                            oc.output_pixel_count,
+                            oc.bytes_per_pixel,
+                            dst,
+                        );
                     }
                 }
                 status::ok()

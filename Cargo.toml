@@ -27,6 +27,9 @@ rocket-schema = { path = "../rocket-schema" }
 [build-dependencies]
 bindgen = "0.72.1"
 
+[dev-dependencies]
+flatbuffers = "=2.0.0"
+
 [profile.release]
 # Keep full optimization but retain DWARF debug info (Cargo's release
 # default is debug = 0, which is why the board's gdb session had no
