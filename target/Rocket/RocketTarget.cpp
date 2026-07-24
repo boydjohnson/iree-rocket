@@ -41,6 +41,8 @@
 #include <array>
 #include <cstdint>
 #include <optional>
+#include <utility>
+#include <vector>
 
 #include "iree/compiler/Dialect/HAL/Target/TargetBackend.h"
 #include "iree/compiler/Dialect/HAL/Target/TargetRegistry.h"
@@ -116,6 +118,7 @@ struct RocketConv2dConfig {
       iree_hal_rocket_Activation_NONE;
   uint32_t activationCmp = 0;
   iree_hal_rocket_Precision_enum_t precision = iree_hal_rocket_Precision_INT8;
+  std::vector<iree_hal_rocket_Conv2DDimension_enum_t> runtimeDimensions;
 };
 
 struct RocketFullyConnectedConfig {
@@ -226,6 +229,82 @@ std::optional<RocketConv2dConfig> buildRocketConv2dConfigFromTarget(
   if (failed(parseActivationAndPrecision(config, shape.activation,
                                          shape.precision, diagFn))) {
     return std::nullopt;
+  }
+
+  std::array<bool, 8> isRuntimeDimension = {};
+  if (Attribute runtimeDimensionsAttr = config.get("runtime_dimensions")) {
+    auto runtimeDimensions = llvm::dyn_cast<ArrayAttr>(runtimeDimensionsAttr);
+    if (!runtimeDimensions) {
+      diagFn() << "rocket backend: optional 'runtime_dimensions' config "
+                  "value must be an array of strings";
+      return std::nullopt;
+    }
+
+    for (Attribute dimensionAttr : runtimeDimensions) {
+      auto dimensionName = llvm::dyn_cast<StringAttr>(dimensionAttr);
+      if (!dimensionName) {
+        diagFn() << "rocket backend: every 'runtime_dimensions' entry must "
+                    "be a string";
+        return std::nullopt;
+      }
+
+      std::optional<iree_hal_rocket_Conv2DDimension_enum_t> dimension;
+      StringRef name = dimensionName.getValue();
+      if (name == "input_width") {
+        dimension = iree_hal_rocket_Conv2DDimension_INPUT_WIDTH;
+      } else if (name == "input_height") {
+        dimension = iree_hal_rocket_Conv2DDimension_INPUT_HEIGHT;
+      } else if (name == "input_channels") {
+        dimension = iree_hal_rocket_Conv2DDimension_INPUT_CHANNELS;
+      } else if (name == "output_width") {
+        dimension = iree_hal_rocket_Conv2DDimension_OUTPUT_WIDTH;
+      } else if (name == "output_height") {
+        dimension = iree_hal_rocket_Conv2DDimension_OUTPUT_HEIGHT;
+      } else if (name == "output_channels") {
+        dimension = iree_hal_rocket_Conv2DDimension_OUTPUT_CHANNELS;
+      } else if (name == "weights_width") {
+        dimension = iree_hal_rocket_Conv2DDimension_WEIGHTS_WIDTH;
+      } else if (name == "weights_height") {
+        dimension = iree_hal_rocket_Conv2DDimension_WEIGHTS_HEIGHT;
+      } else {
+        diagFn() << "rocket backend: unknown runtime Conv2D dimension '" << name
+                 << "'";
+        return std::nullopt;
+      }
+
+      size_t dimensionIndex = static_cast<size_t>(*dimension);
+      if (isRuntimeDimension[dimensionIndex]) {
+        diagFn() << "rocket backend: duplicate runtime Conv2D dimension '"
+                 << name << "'";
+        return std::nullopt;
+      }
+      isRuntimeDimension[dimensionIndex] = true;
+      shape.runtimeDimensions.push_back(*dimension);
+    }
+  }
+
+  const std::array<std::pair<StringRef, uint32_t>, 8> dimensions = {{
+      {"input_width", shape.inputWidth},
+      {"input_height", shape.inputHeight},
+      {"input_channels", shape.inputChannels},
+      {"output_width", shape.outputWidth},
+      {"output_height", shape.outputHeight},
+      {"output_channels", shape.outputChannels},
+      {"weights_width", shape.weightsWidth},
+      {"weights_height", shape.weightsHeight},
+  }};
+  for (size_t i = 0; i < dimensions.size(); ++i) {
+    const auto &[name, value] = dimensions[i];
+    if (isRuntimeDimension[i] && value != 0) {
+      diagFn() << "rocket backend: runtime Conv2D dimension '" << name
+               << "' must use 0 as its executable template value";
+      return std::nullopt;
+    }
+    if (!isRuntimeDimension[i] && value == 0) {
+      diagFn() << "rocket backend: zero Conv2D dimension '" << name
+               << "' must be listed in 'runtime_dimensions'";
+      return std::nullopt;
+    }
   }
 
   return shape;
@@ -377,6 +456,15 @@ public:
              << "rocket-flatbuffer-v1 requires its single export to have "
                 "ordinal 0";
     }
+    int64_t pipelineConstantCount = exportOp.getLayoutAttr().getConstants();
+    size_t runtimeDimensionCount =
+        convShape ? convShape->runtimeDimensions.size() : 0;
+    if (pipelineConstantCount != static_cast<int64_t>(runtimeDimensionCount)) {
+      return exportOp.emitOpError()
+             << "Rocket pipeline layout declares " << pipelineConstantCount
+             << " push constants, but the executable target declares "
+             << runtimeDimensionCount << " runtime dimensions";
+    }
 
     FlatbufferBuilder builder;
     iree_hal_rocket_ExecutableDef_start_as_root(builder);
@@ -390,6 +478,12 @@ public:
           fcShape->precision);
       kernelRef = iree_hal_rocket_KernelDef_as_FullyConnectedDef(fcRef);
     } else {
+      iree_hal_rocket_Conv2DDimension_vec_ref_t runtimeDimensionsRef = 0;
+      if (!convShape->runtimeDimensions.empty()) {
+        runtimeDimensionsRef = iree_hal_rocket_Conv2DDimension_vec_create(
+            builder, convShape->runtimeDimensions.data(),
+            convShape->runtimeDimensions.size());
+      }
       auto convRef = iree_hal_rocket_Conv2DDef_create(
           builder, convShape->inputWidth, convShape->inputHeight,
           convShape->inputChannels, convShape->outputWidth,
@@ -399,8 +493,8 @@ public:
           convShape->outputZeroPoint, convShape->weightsZeroPoint,
           convShape->inputScale, convShape->weightsScale,
           convShape->outputScale, convShape->truncateBits,
-          convShape->activation, convShape->activationCmp,
-          convShape->precision);
+          convShape->activation, convShape->activationCmp, convShape->precision,
+          runtimeDimensionsRef);
       kernelRef = iree_hal_rocket_KernelDef_as_Conv2DDef(convRef);
     }
     auto exportNameRef = builder.createString(exportOp.getName());
