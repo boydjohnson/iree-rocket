@@ -1,0 +1,10 @@
+iree_lit_test_suite(
+  NAME
+    rocket_conv_layout
+  SRCS
+    "rocket_conv_layout.mlir"
+    "rocket_runtime_dimensions.mlir"
+  TOOLS
+    FileCheck
+    iree-compile
+)
