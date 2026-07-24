@@ -1,144 +1,40 @@
-// Copyright 2026
+// v3 separates generic convolution recognition from the static executable
+// specializations required by the current Rocket backend. The matchers below
+// use ConvolutionOpInterface to inspect element types, dimensions, stride, and
+// dilation without spelling complete tensor types in a DAG.
 //
-// Licensed under the Apache License v2.0 with LLVM Exceptions.
-// See https://llvm.org/LICENSE.txt for license information.
-// SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
+// RocketTarget.cpp still requires literal shape fields in every
+// #hal.executable.target config. Consequently, each executable keeps an exact
+// dimension guard. An unsupported shape fails these matchers and remains on
+// the default CPU device instead of being sent to Rocket with a wrong config.
 
-// Hand-authored Transform Dialect script referenced by RocketTarget.cpp's top
-// doc comment (modeled on
-// samples/custom_dispatch/cpu/embedded/example_transform_spec.mlir in the
-// IREE tree). Matches `linalg.conv_2d_nhwc_hwcf` (this exact static shape --
-// v1 is deliberately not shape-generic, see RocketTarget.cpp) and splices in
-// a `flow.dispatch` to a hand-authored `hal.executable` already targeting
-// "rocket", with the matched op's static shape/dtype facts stamped directly
-// onto that executable's `#hal.executable.target` config dict.
-//
-// Usage: `--iree-preprocessing-transform-spec-filename=<this file>`.
-//
-// MULTI-DEVICE USAGE (the load-bearing part of this file beyond the basic
-// splice): if the containing program has ANY other ops besides the matched
-// conv2d (a real model, not a conv-only toy graph), do NOT compile with
-// `--iree-hal-target-backends=rocket,llvm-cpu` (or any two-backend list on
-// one implicit device) -- IREE's plain multi-backend flag means "compile
-// every dispatch for BOTH listed backends" (portability/fat-binary
-// semantics), not "route each dispatch to whichever backend can handle it".
-// Concretely confirmed on a real MobileNetV2 graph: RocketTargetBackend's
-// translation pipeline is intentionally empty (it only knows how to
-// serialize the specific pre-spliced `rocket_executable` this file builds),
-// so IREE tries to compile every OTHER dispatch (e.g. the classifier's
-// `linalg.matmul`) for "rocket" too, and `serializeExecutable` has nothing to
-// emit -- a hard compile error, before conv-matching is even reached.
-//
-// The real fix, proven to compile clean end-to-end (rocket conv2d +
-// unrelated llvm-cpu matmul in one module, both correctly and
-// independently resolved -- see the `stream.affinity` attribute on the
-// `flow.dispatch` below): declare TWO NAMED devices and give the
-// rocket-targeted dispatch an explicit affinity to the rocket one, letting
-// everything else default to the other:
-//
-//   iree-compile \
-//     --iree-hal-target-device=rocket_device=rocket \
-//     --iree-hal-target-device=cpu_device=local \
-//     --iree-hal-local-target-device-backends=llvm-cpu \
-//     --iree-hal-default-device=cpu_device \
-//     --iree-hal-indirect-command-buffers=false \
-//     --iree-preprocessing-transform-spec-filename=rocket_conv2d_transform_spec.mlir \
-//     model.mlir -o model.vmfb
-//
-// `--iree-hal-indirect-command-buffers=false` is required (not new to this
-// file, but easy to forget when copying this recipe): rocket-hal-driver
-// does not implement indirect-binding support (deferred regcmd construction
-// at execute time -- see project memory). Confirmed via `iree-dump-module`
-// that this flag switches the emitted VM import from
-// `hal.device.queue.execute.indirect` to plain `hal.device.queue.execute`
-// (no `.indirect` import remains anywhere in the compiled module). Note this
-// does NOT by itself fix the `MAPPING_PERSISTENT` `PERMISSION_DENIED` a
-// mixed rocket+llvm-cpu module hits at runtime -- that recurs on the plain
-// (direct) `hal.device.queue.execute` path too and needed a separate real
-// fix in `rocket-hal-driver`'s own allocator (see below).
-//
-// This is real, non-experimental, wired-up IREE machinery -- not a hack:
-// `DeviceAnalysis::gatherRequiredExecutableTargets`
-// (compiler/.../HAL/Analysis/DeviceAnalysis.cpp) resolves each dispatch's
-// affinity to its device's own `#hal.executable.target` list and requires
-// ONLY those targets for that dispatch's executable; ops with no affinity
-// fall back to `stream.affinity.default` (set by `--iree-hal-default-device`)
-// and never require the rocket backend at all.
-//
-// IMPORTANT gotcha found empirically and worth preserving here: use
-// `#hal.device.affinity<@rocket_device>`, NOT `#hal.device.promise<@rocket_device>`,
-// even though HALAttrs.td's own doc comment for `#hal.device.promise`
-// describes it as the mechanism for "input programs" to reference a device
-// "prior to [it] being declared" (exactly this preprocessing-stage use
-// case, on paper). In practice `#hal.device.promise`'s `$device` parameter
-// is a plain `StringAttr`, not a real `SymbolRefAttr` -- so generic MLIR
-// symbol-use analysis does NOT see it as a live reference to the
-// CLI-materialized `util.global private @rocket_device`, and that global
-// gets silently DCE'd as dead before `ResolveDevicePromisesPass` ever runs,
-// producing `error: ... references a promised device that was not
-// declared`. `#hal.device.affinity`'s `$device` IS a real `SymbolRefAttr`,
-// which generic symbol-use tracking DOES see (keeping the global alive
-// regardless of DCE passes running in between), and nothing in the real
-// HAL pass pipeline requires the referenced device to already exist at the
-// point the attribute is written -- only when `DeviceAnalysis` actually
-// resolves it, which is well after device declaration. Confirmed via
-// `iree-dump-module` on the resulting .vmfb: both `@cpu_device`
-// (`llvm-cpu`/`embedded-elf-x86_64`) and `@rocket_device`
-// (`rocket`/`rocket-flatbuffer-v1`) appear as independently-queried HAL devices,
-// and the unrelated matmul's executable only ever lists
-// `embedded-elf-x86_64` as an available format.
-//
-// TWO REAL RUNTIME BUGS FOUND AND FIXED IN `rocket-hal-driver` GETTING THIS
-// EXACT rocket+llvm-cpu MULTI-DEVICE MODULE WORKING END TO END ON REAL
-// HARDWARE (both hardware-confirmed; correct conv=6.0 and matmul=4.0
-// simultaneously, from one compiled module, on the actual RK3588 board):
-//
-// 1. `RocketAllocator`'s `allocate_buffer`/`query_buffer_compatibility`
-//    passed the caller's requested `usage` bits straight through, unlike
-//    IREE's generic heap allocator (`allocator_heap.c`, used by
-//    `local-sync`/`local-task`) which always opportunistically grants
-//    `MAPPING_SCOPED|MAPPING_PERSISTENT|MAPPING_ACCESS_RANDOM`. Since
-//    `iree-run-module`'s tooling allocates every `--input=` buffer via ONE
-//    lead device's allocator (`rocket`, ordinal 0 here) regardless of which
-//    device actually consumes it, buffers destined for the cpu_device's
-//    matmul lacked the mapping bits its inline CPU dispatch execution
-//    genuinely needs, and `hal.device.queue.execute` failed with
-//    `PERMISSION_DENIED`: "requested usage was not specified when the
-//    buffer was allocated ... operation requires MAPPING_PERSISTENT".
-//    Fixed by having `RocketAllocator` unconditionally grant those same
-//    mapping bits too -- truthful given every rocket buffer genuinely is
-//    permanently host-mmap'd, unified-memory hardware (see `buffer.rs`'s own
-//    doc comment) -- rather than only when a caller happened to ask.
-//
-// 2. Separately (and this is the one that produced silently WRONG NUMBERS,
-//    not a crash): `RocketBuffer::unmap_range` was a total no-op (matching
-//    the driver's "stays mmap'd forever" design), correct for callers that
-//    explicitly flush themselves (`iree_hal_buffer_map_write`, used by every
-//    hand-driven CTS test, checks `HOST_COHERENT` and calls flush when
-//    absent) -- but IREE's OWN `iree_hal_buffer_view_generate_buffer_in_situ`
-//    (`buffer_view_util.c`, the exact code path `iree-run-module
-//    --input=<shape>=<fill>` splat values go through) does NOT flush
-//    explicitly; it relies entirely on unmap to make the write visible,
-//    which a true no-op unmap never provides. Concretely: input/weight
-//    buffers populated this way read back correctly on the CPU (same-address
-//    same-core load-after-store is always coherent, mapping or not) but the
-//    DPU read stale/pre-existing physical memory instead of the real values
-//    -- a deterministic, INPUT-INDEPENDENT garbage result (confirmed by
-//    feeding two different input values and getting byte-identical hardware
-//    output both times). Fixed by having `unmap_range` flush (`FINI_BO`)
-//    whenever the mapping allowed write access, matching what a real
-//    hardware driver's unmap would naturally provide.
-//
-// Diagnostic method that found both: temporary `eprintln!` instrumentation
-// in `command_buffer.rs`'s `dispatch()` and `device.rs`'s `queue_execute()`
-// printing real buffer addresses/handles/host-side bytes at record time, and
-// the full scratch/output bytes before and after compaction -- same
-// technique (and same files) as the two GEM-handle bugs found earlier this
-// project. Removed once both fixes were confirmed on hardware.
+#rocket_target_0 = #hal.executable.target<"rocket", "rocket-flatbuffer-v1", {
+  input_width = 112 : i32, input_height = 112 : i32, input_channels = 32 : i32,
+  output_width = 112 : i32, output_height = 112 : i32, output_channels = 16 : i32,
+  weights_width = 1 : i32, weights_height = 1 : i32, stride = 1 : i32,
+  depthwise = false,
+  input_zero_point = 0 : i32, output_zero_point = 0 : i32, weights_zero_point = 0 : i32,
+  input_scale = 1.0 : f32, weights_scale = 1.0 : f32, output_scale = 1.0 : f32,
+  truncate_bits = 0 : i32,
+  activation = "none", activation_cmp = 0 : i32,
+  precision = "fp16"
+}>
 
-#rocket_target = #hal.executable.target<"rocket", "rocket-flatbuffer-v1", {
-  input_width = 4 : i32, input_height = 4 : i32, input_channels = 1 : i32,
-  output_width = 4 : i32, output_height = 4 : i32, output_channels = 1 : i32,
+#rocket_target_1 = #hal.executable.target<"rocket", "rocket-flatbuffer-v1", {
+  input_width = 56 : i32, input_height = 56 : i32, input_channels = 96 : i32,
+  output_width = 56 : i32, output_height = 56 : i32, output_channels = 24 : i32,
+  weights_width = 1 : i32, weights_height = 1 : i32, stride = 1 : i32,
+  depthwise = false,
+  input_zero_point = 0 : i32, output_zero_point = 0 : i32, weights_zero_point = 0 : i32,
+  input_scale = 1.0 : f32, weights_scale = 1.0 : f32, output_scale = 1.0 : f32,
+  truncate_bits = 0 : i32,
+  activation = "none", activation_cmp = 0 : i32,
+  precision = "fp16"
+}>
+
+#rocket_target_2 = #hal.executable.target<"rocket", "rocket-flatbuffer-v1", {
+  input_width = 56 : i32, input_height = 56 : i32, input_channels = 24 : i32,
+  output_width = 56 : i32, output_height = 56 : i32, output_channels = 144 : i32,
   weights_width = 1 : i32, weights_height = 1 : i32, stride = 1 : i32,
   depthwise = false,
   input_zero_point = 0 : i32, output_zero_point = 0 : i32, weights_zero_point = 0 : i32,
@@ -155,61 +51,343 @@
   #hal.pipeline.binding<storage_buffer>
 ]>
 
+// IMPORTANT: unlike the CollapseDimensionsPass fix above, `stream.topology`
+// must live on the TARGET module being compiled (standalone_repro.mlir /
+// mnv2_fp16_clean.mlir), not on THIS transform-spec file's own module --
+// they are two separate MLIR modules (the transform interpreter loads this
+// file as a library and applies it to the real target module; top-level
+// attributes on this file never get copied over). It is injected below via
+// `transform.annotate` + `transform.param.constant` inside
+// @cast_and_call_conv2d_0, targeting `%module`
+// (transform.util.get_nearest_symbol_table's result, i.e. the real target
+// module), each time our matcher fires. `transform.annotate` just does a
+// plain `setAttr`, so repeated firings (multiple matched convs) simply
+// overwrite the same value idempotently -- harmless.
+//
+// SECOND real bug found (after the CollapseDimensionsPass attr-drop above):
+// once the rocket dispatch's f16 output is consumed DIRECTLY by another
+// dispatch on a DIFFERENT device within the same computation (a genuine
+// cross-device data dependency, not just "two independent unrelated
+// dispatches on different devices" like the doc-comment example in
+// rocket_conv2d_transform_spec.mlir), Stream correctly forms a
+// `!stream.resource<transient>` allocated `on(#hal.device.optimal<[cpu,
+// rocket]>)` (see --compile-to=stream output) with explicit
+// `stream.cmd.flush` sync between the two device partitions -- this is
+// real, intentional IREE multi-device machinery, not a bug on its own.
+// But lowering it through HAL requires
+// `ResolveTopologyQueriesPass::resolveMemoryPropertiesOp`
+// (Dialect/HAL/Transforms/ResolveTopologyQueries.cpp) to prove the
+// cross-device buffer can actually be shared -- it does this via
+// `tryAddSharedUsageBits`, which needs the module's `stream.topology`
+// attribute (`#hal.device.topology<links = [...]>`) to declare
+// `transparent_access`/`unified_memory` between rocket_device and
+// cpu_device. With NO topology attribute at all (the default, and what
+// design_b_fix_dispatch_region.mlir implicitly had), this silently fails
+// (the pass ignores resolveMemoryPropertiesOp's LogicalResult) and leaves
+// a `hal.allocator.resolve_memory_properties` op with no lowering, which
+// then hard-fails much later at VM conversion with "failed to legalize
+// operation 'hal.allocator.resolve_memory_properties'" -- a confusing
+// error far from its real cause. Declaring the topology below (truthfully
+// -- RK3588's rocket NPU really is unified, host-mmap'd memory, see
+// project memory's RocketAllocator/RocketBuffer notes) fixes it cleanly.
 module attributes {transform.with_named_sequence} {
 
-  hal.executable private @rocket_executable {
-    hal.executable.variant public @rocket_conv2d_v1 target(#rocket_target) {
-      hal.executable.export public @rocket_conv2d ordinal(0) layout(#pipeline_layout) count(%device: !hal.device, %workload: index) -> (index, index, index) {
+  hal.executable private @rocket_executable_0 {
+    hal.executable.variant public @rocket_conv2d_v1_0 target(#rocket_target_0) {
+      hal.executable.export public @rocket_conv2d_0 ordinal(0) layout(#pipeline_layout) count(%device: !hal.device, %workload: index) -> (index, index, index) {
         %c1 = arith.constant 1 : index
         hal.return %c1, %c1, %c1 : index, index, index
       }
       builtin.module {
-        func.func @rocket_conv2d() {
+        func.func @rocket_conv2d_0() {
           return
         }
       }
     }
   }
 
-  // 0=input, 1=weights, 2=bias, 3=output.
-  //
-  // `stream.affinity` here is the multi-device fix documented at the top of
-  // this file -- pins this specific dispatch to `@rocket_device` so it
-  // never gets bundled into a generic multi-backend requirement set with
-  // whatever the rest of the program targets. `@rocket_device` itself does
-  // not need to exist yet when this file is applied (preprocessing runs
-  // before `--iree-hal-target-device` is materialized into real
-  // `util.global`s) -- only by the time `DeviceAnalysis`/
-  // `MaterializeInterfaces` actually resolve it.
-  util.func private @call_rocket_conv2d(%input: tensor<1x4x4x1xf16>, %filter: tensor<1x1x1x1xf16>) -> tensor<1x4x4x1xf16> {
-    %cst = arith.constant 0.000000e+00 : f16
-    %bias_empty = tensor.empty() : tensor<1x1x1x1xf16>
-    %bias = linalg.fill ins(%cst : f16) outs(%bias_empty : tensor<1x1x1x1xf16>) -> tensor<1x1x1x1xf16>
-    %0 = flow.dispatch @rocket_executable::@rocket_conv2d_v1::@rocket_conv2d(%input, %filter, %bias)
+  // Only the bare conv op is matched/replaced. filter-transpose, bias
+  // extf/broadcast, and everything downstream (expand_shape, truncf,
+  // relu6 clamp) stay exactly as they were in the real graph, untouched --
+  // this dispatch does a ZERO-bias raw conv on the NPU, upcasts to f32,
+  // and adds the real (already-broadcast) bias back in on CPU, matching
+  // the bare conv op's exact original semantics (outs + conv(ins)).
+  util.func private @call_rocket_conv2d_0(%input: tensor<1x112x112x32xf16>, %filter: tensor<1x1x32x16xf16>, %bias_bcast: tensor<1x112x112x16xf32>) -> tensor<1x112x112x16xf32> {
+    %zero_bias_empty = tensor.empty() : tensor<16xf16>
+    %zero_f16 = arith.constant 0.0 : f16
+    %zero_bias = linalg.fill ins(%zero_f16 : f16) outs(%zero_bias_empty : tensor<16xf16>) -> tensor<16xf16>
+    %raw_f16 = flow.dispatch @rocket_executable_0::@rocket_conv2d_v1_0::@rocket_conv2d_0(%input, %filter, %zero_bias)
         {stream.affinity = #hal.device.affinity<@rocket_device>}
-        : (tensor<1x4x4x1xf16>, tensor<1x1x1x1xf16>, tensor<1x1x1x1xf16>) -> tensor<1x4x4x1xf16>
-    util.return %0 : tensor<1x4x4x1xf16>
+        : (tensor<1x112x112x32xf16>, tensor<1x1x32x16xf16>, tensor<16xf16>) -> tensor<1x112x112x16xf16>
+    // ROOT CAUSE (confirmed by reading IREE source + bisecting IR dumps
+    // stage-by-stage with --mlir-print-ir-after-all, not guessed):
+    //
+    // A hand-authored `flow.dispatch.region ... attributes {stream.affinity
+    // = ...}` (the design_b_fix_dispatch_region.mlir attempt) is NOT
+    // sufficient. It survives Preprocessing and GlobalOptimization intact
+    // (confirmed via --compile-to=global-optimization), but
+    // DispatchCreation's `CollapseDimensionsPass` unconditionally destroys
+    // it. That pass's `hoistTensorReshapesOutOfDispatchRegion()`
+    // (DispatchCreation/CollapseDimensions.cpp) is called via
+    // `funcOp->walk<DispatchRegionOp>` on EVERY `flow.dispatch.region` in
+    // the function -- unconditionally, regardless of whether any reshape
+    // ops are actually present to hoist -- and unconditionally rebuilds the
+    // op via a bare `IREE::Flow::DispatchRegionOp::create(rewriter, loc,
+    // newReturnTypes, newDynamicDims, dispatchOp.getWorkload())` at line
+    // 913, which does NOT call `setDialectAttrs()` (unlike
+    // ConvertRegionToWorkgroups.cpp:167, which does). So our
+    // `stream.affinity` attribute is silently dropped before
+    // ConvertDispatchRegionsToWorkgroupsPass even runs. Confirmed by
+    // diffing --compile-to=dispatch-creation output before/after this exact
+    // pass: attribute present right before CollapseDimensionsPass, gone
+    // right after, on the exact same op. This is a genuine IREE upstream
+    // bug (attribute-preservation oversight in CollapseDimensionsPass), not
+    // a conceptual misunderstanding about affinity/util.call boundaries.
+    //
+    // ALSO confirmed dead-end: setting `stream.affinity` directly as a
+    // linalg.generic's own `attrs = {...}` clause (the very first thing
+    // tried, before any dispatch.region) has no effect for a different
+    // reason -- `wrapOpInDispatchRegion`/`makeEmptyDispatchRegion`
+    // (Flow/Transforms/RegionOpUtils.cpp), which
+    // CloneProducersIntoDispatchRegionsPass uses to auto-wrap any bare
+    // linalg.generic left outside a dispatch, creates a brand new empty
+    // region and never consults the wrapped op's own attributes at all.
+    //
+    // WORKAROUND (this file): skip `flow.dispatch.region` entirely and
+    // hand-author the ALREADY-OUTLINED `flow.dispatch.workgroups` form
+    // directly (with real iree_tensor_ext.dispatch.tensor.load/store
+    // boilerplate, mechanically copied from what
+    // ConvertDispatchRegionsToWorkgroupsPass itself produces for an
+    // equivalent region -- see the dispatch-creation IR dump captured
+    // while root-causing this). CollapseDimensionsPass's walk only matches
+    // `IREE::Flow::DispatchRegionOp`; a `flow.dispatch.workgroups` op is a
+    // different op type (already "isolated from above", already
+    // dispatch-shaped) and is never visited by it, so the attribute we set
+    // here is never at risk of being dropped by that pass. It is also never
+    // touched by FormDispatchRegions/ElementwiseOpFusion/
+    // CloneProducersIntoDispatchRegions (those only cluster ops NOT already
+    // inside a dispatch). It only gets touched once more, by
+    // OutlineDispatchRegions at the `flow` stage, which DOES correctly
+    // preserve dialect attrs (confirmed via source read,
+    // OutlineDispatchRegions.cpp:81,144) -- and empirically confirmed here:
+    // `stream.affinity` is present on the resulting flow.dispatch call
+    // through dispatch-creation, flow, and stream stages, and the module
+    // compiles clean end-to-end (see design_b_fix_v2_workgroups compile log
+    // in project memory / agent report).
+    %final = flow.dispatch.workgroups(%raw_f16, %bias_bcast) : (tensor<1x112x112x16xf16>, tensor<1x112x112x16xf32>) -> tensor<1x112x112x16xf32>
+        attributes { stream.affinity = #hal.device.affinity<@cpu_device> } =
+        (%arg3: !iree_tensor_ext.dispatch.tensor<readonly:tensor<1x112x112x16xf16>>, %arg4: !iree_tensor_ext.dispatch.tensor<readonly:tensor<1x112x112x16xf32>>, %arg5: !iree_tensor_ext.dispatch.tensor<writeonly:tensor<1x112x112x16xf32>>) {
+      %raw_f16_ld = iree_tensor_ext.dispatch.tensor.load %arg3, offsets = [0, 0, 0, 0], sizes = [1, 112, 112, 16], strides = [1, 1, 1, 1] : !iree_tensor_ext.dispatch.tensor<readonly:tensor<1x112x112x16xf16>> -> tensor<1x112x112x16xf16>
+      %bias_ld = iree_tensor_ext.dispatch.tensor.load %arg4, offsets = [0, 0, 0, 0], sizes = [1, 112, 112, 16], strides = [1, 1, 1, 1] : !iree_tensor_ext.dispatch.tensor<readonly:tensor<1x112x112x16xf32>> -> tensor<1x112x112x16xf32>
+      %final_empty = tensor.empty() : tensor<1x112x112x16xf32>
+      %final_inner = linalg.generic {indexing_maps = [affine_map<(d0, d1, d2, d3) -> (d0, d1, d2, d3)>, affine_map<(d0, d1, d2, d3) -> (d0, d1, d2, d3)>, affine_map<(d0, d1, d2, d3) -> (d0, d1, d2, d3)>], iterator_types = ["parallel", "parallel", "parallel", "parallel"]} ins(%raw_f16_ld, %bias_ld : tensor<1x112x112x16xf16>, tensor<1x112x112x16xf32>) outs(%final_empty : tensor<1x112x112x16xf32>) {
+      ^bb0(%a: f16, %b: f32, %out: f32):
+        %ae = arith.extf %a : f16 to f32
+        %s = arith.addf %ae, %b : f32
+        linalg.yield %s : f32
+      } -> tensor<1x112x112x16xf32>
+      iree_tensor_ext.dispatch.tensor.store %final_inner, %arg5, offsets = [0, 0, 0, 0], sizes = [1, 112, 112, 16], strides = [1, 1, 1, 1] : tensor<1x112x112x16xf32> -> !iree_tensor_ext.dispatch.tensor<writeonly:tensor<1x112x112x16xf32>>
+      flow.return
+    } count() -> (index, index, index) {
+      %x, %y, %z = iree_tensor_ext.dispatch.workgroup_count_from_slice()
+      flow.return %x, %y, %z : index, index, index
+    }
+    util.return %final : tensor<1x112x112x16xf32>
   }
 
-  transform.named_sequence @match_conv2d(%root: !transform.any_op {transform.readonly}) -> (!transform.any_value, !transform.any_value) {
-    %ins, %outs = transform.iree.match.cast_compatible_dag_from_root %root {
-      ^bb0(%input: tensor<1x4x4x1xf16>, %filter: tensor<1x1x1x1xf16>):
-        %cst = arith.constant 0.000000e+00 : f16
-        %empty = tensor.empty() {"match.operation_name_only"} : tensor<1x4x4x1xf16>
-        %filled = linalg.fill ins(%cst : f16) outs(%empty : tensor<1x4x4x1xf16>) -> tensor<1x4x4x1xf16>
-        %result = linalg.conv_2d_nhwc_hwcf {dilations = dense<1> : tensor<2xi64>, strides = dense<1> : tensor<2xi64>}
-            ins(%input, %filter : tensor<1x4x4x1xf16>, tensor<1x1x1x1xf16>)
-            outs(%filled : tensor<1x4x4x1xf16>) -> tensor<1x4x4x1xf16>
-    } : (!transform.any_op) -> (!transform.any_value, !transform.any_value)
-    transform.yield %ins, %outs : !transform.any_value, !transform.any_value
+  hal.executable private @rocket_executable_1 {
+    hal.executable.variant public @rocket_conv2d_v1_1 target(#rocket_target_1) {
+      hal.executable.export public @rocket_conv2d_1 ordinal(0) layout(#pipeline_layout) count(%device: !hal.device, %workload: index) -> (index, index, index) {
+        %c1 = arith.constant 1 : index
+        hal.return %c1, %c1, %c1 : index, index, index
+      }
+      builtin.module {
+        func.func @rocket_conv2d_1() {
+          return
+        }
+      }
+    }
   }
 
-  transform.named_sequence @cast_and_call_conv2d(%ins: !transform.any_value {transform.readonly},
-                                                  %out: !transform.any_value {transform.readonly}) {
-    %root = transform.get_defining_op %out : (!transform.any_value) -> !transform.any_op
+  hal.executable private @rocket_executable_2 {
+    hal.executable.variant public @rocket_conv2d_v1_2 target(#rocket_target_2) {
+      hal.executable.export public @rocket_conv2d_2 ordinal(0) layout(#pipeline_layout) count(%device: !hal.device, %workload: index) -> (index, index, index) {
+        %c1 = arith.constant 1 : index
+        hal.return %c1, %c1, %c1 : index, index, index
+      }
+      builtin.module {
+        func.func @rocket_conv2d_2() {
+          return
+        }
+      }
+    }
+  }
+
+  // Shape 1: 1x56x56x96 -> 1x56x56x24 (filter 24x96x1x1). Mechanically
+  // identical structure to call_rocket_conv2d_0, just a different static
+  // shape -- proves the fix is shape-generic, not a one-off.
+  util.func private @call_rocket_conv2d_1(%input: tensor<1x56x56x96xf16>, %filter: tensor<1x1x96x24xf16>, %bias_bcast: tensor<1x56x56x24xf32>) -> tensor<1x56x56x24xf32> {
+    %zero_bias_empty = tensor.empty() : tensor<24xf16>
+    %zero_f16 = arith.constant 0.0 : f16
+    %zero_bias = linalg.fill ins(%zero_f16 : f16) outs(%zero_bias_empty : tensor<24xf16>) -> tensor<24xf16>
+    %raw_f16 = flow.dispatch @rocket_executable_1::@rocket_conv2d_v1_1::@rocket_conv2d_1(%input, %filter, %zero_bias)
+        {stream.affinity = #hal.device.affinity<@rocket_device>}
+        : (tensor<1x56x56x96xf16>, tensor<1x1x96x24xf16>, tensor<24xf16>) -> tensor<1x56x56x24xf16>
+    %final = flow.dispatch.workgroups(%raw_f16, %bias_bcast) : (tensor<1x56x56x24xf16>, tensor<1x56x56x24xf32>) -> tensor<1x56x56x24xf32>
+        attributes { stream.affinity = #hal.device.affinity<@cpu_device> } =
+        (%arg3: !iree_tensor_ext.dispatch.tensor<readonly:tensor<1x56x56x24xf16>>, %arg4: !iree_tensor_ext.dispatch.tensor<readonly:tensor<1x56x56x24xf32>>, %arg5: !iree_tensor_ext.dispatch.tensor<writeonly:tensor<1x56x56x24xf32>>) {
+      %raw_f16_ld = iree_tensor_ext.dispatch.tensor.load %arg3, offsets = [0, 0, 0, 0], sizes = [1, 56, 56, 24], strides = [1, 1, 1, 1] : !iree_tensor_ext.dispatch.tensor<readonly:tensor<1x56x56x24xf16>> -> tensor<1x56x56x24xf16>
+      %bias_ld = iree_tensor_ext.dispatch.tensor.load %arg4, offsets = [0, 0, 0, 0], sizes = [1, 56, 56, 24], strides = [1, 1, 1, 1] : !iree_tensor_ext.dispatch.tensor<readonly:tensor<1x56x56x24xf32>> -> tensor<1x56x56x24xf32>
+      %final_empty = tensor.empty() : tensor<1x56x56x24xf32>
+      %final_inner = linalg.generic {indexing_maps = [affine_map<(d0, d1, d2, d3) -> (d0, d1, d2, d3)>, affine_map<(d0, d1, d2, d3) -> (d0, d1, d2, d3)>, affine_map<(d0, d1, d2, d3) -> (d0, d1, d2, d3)>], iterator_types = ["parallel", "parallel", "parallel", "parallel"]} ins(%raw_f16_ld, %bias_ld : tensor<1x56x56x24xf16>, tensor<1x56x56x24xf32>) outs(%final_empty : tensor<1x56x56x24xf32>) {
+      ^bb0(%a: f16, %b: f32, %out: f32):
+        %ae = arith.extf %a : f16 to f32
+        %s = arith.addf %ae, %b : f32
+        linalg.yield %s : f32
+      } -> tensor<1x56x56x24xf32>
+      iree_tensor_ext.dispatch.tensor.store %final_inner, %arg5, offsets = [0, 0, 0, 0], sizes = [1, 56, 56, 24], strides = [1, 1, 1, 1] : tensor<1x56x56x24xf32> -> !iree_tensor_ext.dispatch.tensor<writeonly:tensor<1x56x56x24xf32>>
+      flow.return
+    } count() -> (index, index, index) {
+      %x, %y, %z = iree_tensor_ext.dispatch.workgroup_count_from_slice()
+      flow.return %x, %y, %z : index, index, index
+    }
+    util.return %final : tensor<1x56x56x24xf32>
+  }
+
+  // Shape 2: 1x56x56x24 -> 1x56x56x144 (filter 144x24x1x1).
+  util.func private @call_rocket_conv2d_2(%input: tensor<1x56x56x24xf16>, %filter: tensor<1x1x24x144xf16>, %bias_bcast: tensor<1x56x56x144xf32>) -> tensor<1x56x56x144xf32> {
+    %zero_bias_empty = tensor.empty() : tensor<144xf16>
+    %zero_f16 = arith.constant 0.0 : f16
+    %zero_bias = linalg.fill ins(%zero_f16 : f16) outs(%zero_bias_empty : tensor<144xf16>) -> tensor<144xf16>
+    %raw_f16 = flow.dispatch @rocket_executable_2::@rocket_conv2d_v1_2::@rocket_conv2d_2(%input, %filter, %zero_bias)
+        {stream.affinity = #hal.device.affinity<@rocket_device>}
+        : (tensor<1x56x56x24xf16>, tensor<1x1x24x144xf16>, tensor<144xf16>) -> tensor<1x56x56x144xf16>
+    %final = flow.dispatch.workgroups(%raw_f16, %bias_bcast) : (tensor<1x56x56x144xf16>, tensor<1x56x56x144xf32>) -> tensor<1x56x56x144xf32>
+        attributes { stream.affinity = #hal.device.affinity<@cpu_device> } =
+        (%arg3: !iree_tensor_ext.dispatch.tensor<readonly:tensor<1x56x56x144xf16>>, %arg4: !iree_tensor_ext.dispatch.tensor<readonly:tensor<1x56x56x144xf32>>, %arg5: !iree_tensor_ext.dispatch.tensor<writeonly:tensor<1x56x56x144xf32>>) {
+      %raw_f16_ld = iree_tensor_ext.dispatch.tensor.load %arg3, offsets = [0, 0, 0, 0], sizes = [1, 56, 56, 144], strides = [1, 1, 1, 1] : !iree_tensor_ext.dispatch.tensor<readonly:tensor<1x56x56x144xf16>> -> tensor<1x56x56x144xf16>
+      %bias_ld = iree_tensor_ext.dispatch.tensor.load %arg4, offsets = [0, 0, 0, 0], sizes = [1, 56, 56, 144], strides = [1, 1, 1, 1] : !iree_tensor_ext.dispatch.tensor<readonly:tensor<1x56x56x144xf32>> -> tensor<1x56x56x144xf32>
+      %final_empty = tensor.empty() : tensor<1x56x56x144xf32>
+      %final_inner = linalg.generic {indexing_maps = [affine_map<(d0, d1, d2, d3) -> (d0, d1, d2, d3)>, affine_map<(d0, d1, d2, d3) -> (d0, d1, d2, d3)>, affine_map<(d0, d1, d2, d3) -> (d0, d1, d2, d3)>], iterator_types = ["parallel", "parallel", "parallel", "parallel"]} ins(%raw_f16_ld, %bias_ld : tensor<1x56x56x144xf16>, tensor<1x56x56x144xf32>) outs(%final_empty : tensor<1x56x56x144xf32>) {
+      ^bb0(%a: f16, %b: f32, %out: f32):
+        %ae = arith.extf %a : f16 to f32
+        %s = arith.addf %ae, %b : f32
+        linalg.yield %s : f32
+      } -> tensor<1x56x56x144xf32>
+      iree_tensor_ext.dispatch.tensor.store %final_inner, %arg5, offsets = [0, 0, 0, 0], sizes = [1, 56, 56, 144], strides = [1, 1, 1, 1] : tensor<1x56x56x144xf32> -> !iree_tensor_ext.dispatch.tensor<writeonly:tensor<1x56x56x144xf32>>
+      flow.return
+    } count() -> (index, index, index) {
+      %x, %y, %z = iree_tensor_ext.dispatch.workgroup_count_from_slice()
+      flow.return %x, %y, %z : index, index, index
+    }
+    util.return %final : tensor<1x56x56x144xf32>
+  }
+
+  transform.named_sequence @match_conv2d_0(%root: !transform.any_op {transform.readonly}) -> !transform.any_op {
+    transform.match.operation_name %root ["linalg.conv_2d_nhwc_hwcf"] : !transform.any_op
+    %batch, %out_img, %out_ch, %filter, %in_ch, %depth, %strides, %dilations =
+        transform.iree.match.convolution %root,
+          lhs_type = f16, rhs_type = f16, output_type = f32
+          : !transform.any_op -> !transform.param<i64>
+    transform.iree.match.dims_equal %batch, [1] : !transform.param<i64>
+    transform.iree.match.dims_equal %out_img, [112, 112] : !transform.param<i64>
+    transform.iree.match.dims_equal %out_ch, [16] : !transform.param<i64>
+    transform.iree.match.dims_equal %filter, [1, 1] : !transform.param<i64>
+    transform.iree.match.dims_equal %in_ch, [32] : !transform.param<i64>
+    transform.iree.match.dims_equal %depth, [] : !transform.param<i64>
+    transform.iree.match.dims_equal %strides, [1, 1] : !transform.param<i64>
+    transform.iree.match.dims_equal %dilations, [1, 1] : !transform.param<i64>
+    transform.yield %root : !transform.any_op
+  }
+
+  transform.named_sequence @cast_and_call_conv2d_0(%root: !transform.any_op {transform.readonly}) {
+    %ins = transform.get_operand %root[all] : (!transform.any_op) -> !transform.any_value
+    %out = transform.get_result %root[all] : (!transform.any_op) -> !transform.any_value
     %module = transform.util.get_nearest_symbol_table %root : (!transform.any_op) -> !transform.any_op
-    %executable = transform.util.import_symbol @rocket_executable into %module if undefined : (!transform.any_op) -> !transform.any_op
-    %func = transform.util.import_symbol @call_rocket_conv2d into %module if undefined : (!transform.any_op) -> !transform.any_op
+    // Declare truthfully that rocket_device and cpu_device share unified,
+    // transparently-accessible memory (real RK3588 hardware fact -- see
+    // project memory's RocketAllocator/RocketBuffer notes) so
+    // ResolveTopologyQueriesPass can resolve the `#hal.device.optimal<[cpu,
+    // rocket]>`-affinitized cross-device buffer Stream forms for values
+    // flowing directly from our rocket dispatch into CPU-side compute. Must
+    // be set on the REAL target module (%module), not this transform-spec
+    // file's own module -- see file-level comment above. Idempotent: fires
+    // once per matched conv, each time just overwriting the same value.
+    %topology_attr = transform.param.constant #hal.device.topology<links = [
+        (@rocket_device -> @cpu_device = {transparent_access = true, unified_memory = true}),
+        (@cpu_device -> @rocket_device = {transparent_access = true, unified_memory = true})
+      ]> -> !transform.any_param
+    transform.annotate %module "stream.topology" = %topology_attr : !transform.any_op, !transform.any_param
+    %executable = transform.util.import_symbol @rocket_executable_0 into %module if undefined : (!transform.any_op) -> !transform.any_op
+    %func = transform.util.import_symbol @call_rocket_conv2d_0 into %module if undefined : (!transform.any_op) -> !transform.any_op
+    transform.util.cast_and_call %func(%ins) -> %out after %root {
+          transform.type_conversion.tensor.cast_shape_dynamic_dims
+      } : (!transform.any_op, !transform.any_value, !transform.any_value, !transform.any_op) -> !transform.any_op
+    transform.yield
+  }
+
+  transform.named_sequence @match_conv2d_1(%root: !transform.any_op {transform.readonly}) -> !transform.any_op {
+    transform.match.operation_name %root ["linalg.conv_2d_nhwc_hwcf"] : !transform.any_op
+    %batch, %out_img, %out_ch, %filter, %in_ch, %depth, %strides, %dilations =
+        transform.iree.match.convolution %root,
+          lhs_type = f16, rhs_type = f16, output_type = f32
+          : !transform.any_op -> !transform.param<i64>
+    transform.iree.match.dims_equal %batch, [1] : !transform.param<i64>
+    transform.iree.match.dims_equal %out_img, [56, 56] : !transform.param<i64>
+    transform.iree.match.dims_equal %out_ch, [24] : !transform.param<i64>
+    transform.iree.match.dims_equal %filter, [1, 1] : !transform.param<i64>
+    transform.iree.match.dims_equal %in_ch, [96] : !transform.param<i64>
+    transform.iree.match.dims_equal %depth, [] : !transform.param<i64>
+    transform.iree.match.dims_equal %strides, [1, 1] : !transform.param<i64>
+    transform.iree.match.dims_equal %dilations, [1, 1] : !transform.param<i64>
+    transform.yield %root : !transform.any_op
+  }
+
+  transform.named_sequence @cast_and_call_conv2d_1(%root: !transform.any_op {transform.readonly}) {
+    %ins = transform.get_operand %root[all] : (!transform.any_op) -> !transform.any_value
+    %out = transform.get_result %root[all] : (!transform.any_op) -> !transform.any_value
+    %module = transform.util.get_nearest_symbol_table %root : (!transform.any_op) -> !transform.any_op
+    %topology_attr = transform.param.constant #hal.device.topology<links = [
+        (@rocket_device -> @cpu_device = {transparent_access = true, unified_memory = true}),
+        (@cpu_device -> @rocket_device = {transparent_access = true, unified_memory = true})
+      ]> -> !transform.any_param
+    transform.annotate %module "stream.topology" = %topology_attr : !transform.any_op, !transform.any_param
+    %executable = transform.util.import_symbol @rocket_executable_1 into %module if undefined : (!transform.any_op) -> !transform.any_op
+    %func = transform.util.import_symbol @call_rocket_conv2d_1 into %module if undefined : (!transform.any_op) -> !transform.any_op
+    transform.util.cast_and_call %func(%ins) -> %out after %root {
+          transform.type_conversion.tensor.cast_shape_dynamic_dims
+      } : (!transform.any_op, !transform.any_value, !transform.any_value, !transform.any_op) -> !transform.any_op
+    transform.yield
+  }
+
+  transform.named_sequence @match_conv2d_2(%root: !transform.any_op {transform.readonly}) -> !transform.any_op {
+    transform.match.operation_name %root ["linalg.conv_2d_nhwc_hwcf"] : !transform.any_op
+    %batch, %out_img, %out_ch, %filter, %in_ch, %depth, %strides, %dilations =
+        transform.iree.match.convolution %root,
+          lhs_type = f16, rhs_type = f16, output_type = f32
+          : !transform.any_op -> !transform.param<i64>
+    transform.iree.match.dims_equal %batch, [1] : !transform.param<i64>
+    transform.iree.match.dims_equal %out_img, [56, 56] : !transform.param<i64>
+    transform.iree.match.dims_equal %out_ch, [144] : !transform.param<i64>
+    transform.iree.match.dims_equal %filter, [1, 1] : !transform.param<i64>
+    transform.iree.match.dims_equal %in_ch, [24] : !transform.param<i64>
+    transform.iree.match.dims_equal %depth, [] : !transform.param<i64>
+    transform.iree.match.dims_equal %strides, [1, 1] : !transform.param<i64>
+    transform.iree.match.dims_equal %dilations, [1, 1] : !transform.param<i64>
+    transform.yield %root : !transform.any_op
+  }
+
+  transform.named_sequence @cast_and_call_conv2d_2(%root: !transform.any_op {transform.readonly}) {
+    %ins = transform.get_operand %root[all] : (!transform.any_op) -> !transform.any_value
+    %out = transform.get_result %root[all] : (!transform.any_op) -> !transform.any_value
+    %module = transform.util.get_nearest_symbol_table %root : (!transform.any_op) -> !transform.any_op
+    %topology_attr = transform.param.constant #hal.device.topology<links = [
+        (@rocket_device -> @cpu_device = {transparent_access = true, unified_memory = true}),
+        (@cpu_device -> @rocket_device = {transparent_access = true, unified_memory = true})
+      ]> -> !transform.any_param
+    transform.annotate %module "stream.topology" = %topology_attr : !transform.any_op, !transform.any_param
+    %executable = transform.util.import_symbol @rocket_executable_2 into %module if undefined : (!transform.any_op) -> !transform.any_op
+    %func = transform.util.import_symbol @call_rocket_conv2d_2 into %module if undefined : (!transform.any_op) -> !transform.any_op
     transform.util.cast_and_call %func(%ins) -> %out after %root {
           transform.type_conversion.tensor.cast_shape_dynamic_dims
       } : (!transform.any_op, !transform.any_value, !transform.any_value, !transform.any_op) -> !transform.any_op
@@ -221,7 +399,9 @@ module attributes {transform.with_named_sequence} {
     transform.foreach %funcs : !transform.any_op {
       ^bb1(%func: !transform.any_op):
         transform.foreach_match in %func
-            @match_conv2d -> @cast_and_call_conv2d
+            @match_conv2d_0 -> @cast_and_call_conv2d_0,
+            @match_conv2d_1 -> @cast_and_call_conv2d_1,
+            @match_conv2d_2 -> @cast_and_call_conv2d_2
           : (!transform.any_op) -> (!transform.any_op)
     }
     transform.apply_dce to %module : !transform.any_op
