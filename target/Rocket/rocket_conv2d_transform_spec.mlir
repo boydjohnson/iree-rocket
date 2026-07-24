@@ -9,6 +9,7 @@
 // the default CPU device instead of being sent to Rocket with a wrong config.
 
 #rocket_target_0 = #hal.executable.target<"rocket", "rocket-flatbuffer-v1", {
+  kernel = "conv2d",
   input_width = 112 : i32, input_height = 112 : i32, input_channels = 32 : i32,
   output_width = 112 : i32, output_height = 112 : i32, output_channels = 16 : i32,
   weights_width = 1 : i32, weights_height = 1 : i32, stride = 1 : i32,
@@ -21,6 +22,7 @@
 }>
 
 #rocket_target_1 = #hal.executable.target<"rocket", "rocket-flatbuffer-v1", {
+  kernel = "conv2d",
   input_width = 56 : i32, input_height = 56 : i32, input_channels = 96 : i32,
   output_width = 56 : i32, output_height = 56 : i32, output_channels = 24 : i32,
   weights_width = 1 : i32, weights_height = 1 : i32, stride = 1 : i32,
@@ -33,6 +35,7 @@
 }>
 
 #rocket_target_2 = #hal.executable.target<"rocket", "rocket-flatbuffer-v1", {
+  kernel = "conv2d",
   input_width = 56 : i32, input_height = 56 : i32, input_channels = 24 : i32,
   output_width = 56 : i32, output_height = 56 : i32, output_channels = 144 : i32,
   weights_width = 1 : i32, weights_height = 1 : i32, stride = 1 : i32,

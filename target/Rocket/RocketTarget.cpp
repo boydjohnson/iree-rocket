@@ -16,10 +16,10 @@
 //   RocketTargetBackend : TargetBackend
 //     embeds #hal.executable.target<"rocket",...>
 //
-// v1 scope: Conv2d only, and deliberately does NOT rely on IREE's generic
-// Flow/DispatchCreation to auto-form dispatch regions targeting "rocket" --
-// buildTranslationPassPipeline is empty. The real "codegen" for this
-// backend is a hand-authored Transform Dialect script (modeled on
+// v1 scope: Conv2d and FullyConnected, and deliberately does NOT rely on IREE's
+// generic Flow/DispatchCreation to auto-form dispatch regions targeting
+// "rocket" -- buildTranslationPassPipeline is empty. The real "codegen" for
+// this backend is a hand-authored Transform Dialect script (modeled on
 // samples/custom_dispatch/cpu/embedded/example_transform_spec.mlir) that
 // matches linalg.conv_2d_nhwc_hwcf and splices in a flow.dispatch to a
 // hand-authored hal.executable already targeting "rocket", with the
@@ -78,6 +78,22 @@ constexpr std::array<const char *, 20> kRequiredConfigKeys = {
     "activation_cmp",     "precision",
 };
 
+constexpr std::array<const char *, 13> kRequiredFcConfigKeys = {
+    "m",
+    "k",
+    "n",
+    "input_zero_point",
+    "output_zero_point",
+    "weights_zero_point",
+    "input_scale",
+    "weights_scale",
+    "output_scale",
+    "truncate_bits",
+    "activation",
+    "activation_cmp",
+    "precision",
+};
+
 struct RocketConv2dConfig {
   uint32_t inputWidth = 0;
   uint32_t inputHeight = 0;
@@ -101,6 +117,56 @@ struct RocketConv2dConfig {
   uint32_t activationCmp = 0;
   iree_hal_rocket_Precision_enum_t precision = iree_hal_rocket_Precision_INT8;
 };
+
+struct RocketFullyConnectedConfig {
+  uint32_t m = 0;
+  uint32_t k = 0;
+  uint32_t n = 0;
+  uint32_t inputZeroPoint = 0;
+  uint32_t outputZeroPoint = 0;
+  uint32_t weightsZeroPoint = 0;
+  float inputScale = 1.0f;
+  float weightsScale = 1.0f;
+  float outputScale = 1.0f;
+  uint32_t truncateBits = 0;
+  iree_hal_rocket_Activation_enum_t activation =
+      iree_hal_rocket_Activation_NONE;
+  uint32_t activationCmp = 0;
+  iree_hal_rocket_Precision_enum_t precision = iree_hal_rocket_Precision_INT8;
+};
+
+LogicalResult
+parseActivationAndPrecision(DictionaryAttr config,
+                            iree_hal_rocket_Activation_enum_t &activationValue,
+                            iree_hal_rocket_Precision_enum_t &precisionValue,
+                            llvm::function_ref<InFlightDiagnostic()> diagFn) {
+  StringRef activation =
+      llvm::cast<StringAttr>(config.get("activation")).getValue();
+  if (activation == "none") {
+    activationValue = iree_hal_rocket_Activation_NONE;
+  } else if (activation == "relu") {
+    activationValue = iree_hal_rocket_Activation_RELU;
+  } else if (activation == "relux") {
+    activationValue = iree_hal_rocket_Activation_RELUX;
+  } else {
+    diagFn() << "rocket backend: unrecognized 'activation' config value '"
+             << activation << "' (expected none/relu/relux)";
+    return failure();
+  }
+
+  StringRef precision =
+      llvm::cast<StringAttr>(config.get("precision")).getValue();
+  if (precision == "int8") {
+    precisionValue = iree_hal_rocket_Precision_INT8;
+  } else if (precision == "fp16") {
+    precisionValue = iree_hal_rocket_Precision_FP16;
+  } else {
+    diagFn() << "rocket backend: unrecognized 'precision' config value '"
+             << precision << "' (expected int8/fp16)";
+    return failure();
+  }
+  return success();
+}
 
 // Reads the config dict back into a RocketConv2dConfig. Returns
 // std::nullopt (and emits a clear diagnostic via `diagFn`) if any required
@@ -157,32 +223,59 @@ std::optional<RocketConv2dConfig> buildRocketConv2dConfigFromTarget(
   shape.truncateBits = getU32("truncate_bits");
   shape.activationCmp = getU32("activation_cmp");
 
-  StringRef activation =
-      llvm::cast<StringAttr>(config.get("activation")).getValue();
-  if (activation == "none") {
-    shape.activation = iree_hal_rocket_Activation_NONE;
-  } else if (activation == "relu") {
-    shape.activation = iree_hal_rocket_Activation_RELU;
-  } else if (activation == "relux") {
-    shape.activation = iree_hal_rocket_Activation_RELUX;
-  } else {
-    diagFn() << "rocket backend: unrecognized 'activation' config value '"
-             << activation << "' (expected none/relu/relux)";
+  if (failed(parseActivationAndPrecision(config, shape.activation,
+                                         shape.precision, diagFn))) {
     return std::nullopt;
   }
 
-  StringRef precision =
-      llvm::cast<StringAttr>(config.get("precision")).getValue();
-  if (precision == "int8") {
-    shape.precision = iree_hal_rocket_Precision_INT8;
-  } else if (precision == "fp16") {
-    shape.precision = iree_hal_rocket_Precision_FP16;
-  } else {
-    diagFn() << "rocket backend: unrecognized 'precision' config value '"
-             << precision << "' (expected int8/fp16)";
+  return shape;
+}
+
+std::optional<RocketFullyConnectedConfig>
+buildRocketFullyConnectedConfigFromTarget(
+    DictionaryAttr config, llvm::function_ref<InFlightDiagnostic()> diagFn) {
+  if (!config) {
+    diagFn() << "rocket fully-connected backend requires a non-empty "
+                "executable target config dict";
     return std::nullopt;
   }
+  for (const char *key : kRequiredFcConfigKeys) {
+    if (!config.get(key)) {
+      diagFn() << "rocket fully-connected executable target config is "
+                  "missing required key '"
+               << key << "'";
+      return std::nullopt;
+    }
+  }
 
+  auto getU32 = [&](StringRef key) -> uint32_t {
+    return static_cast<uint32_t>(
+        llvm::cast<IntegerAttr>(config.get(key)).getInt());
+  };
+  auto getF32 = [&](StringRef key) -> float {
+    return llvm::cast<FloatAttr>(config.get(key)).getValueAsDouble();
+  };
+
+  RocketFullyConnectedConfig shape;
+  shape.m = getU32("m");
+  shape.k = getU32("k");
+  shape.n = getU32("n");
+  if (shape.m == 0 || shape.k == 0 || shape.n == 0) {
+    diagFn() << "rocket fully-connected dimensions m/k/n must be nonzero";
+    return std::nullopt;
+  }
+  shape.inputZeroPoint = getU32("input_zero_point");
+  shape.outputZeroPoint = getU32("output_zero_point");
+  shape.weightsZeroPoint = getU32("weights_zero_point");
+  shape.inputScale = getF32("input_scale");
+  shape.weightsScale = getF32("weights_scale");
+  shape.outputScale = getF32("output_scale");
+  shape.truncateBits = getU32("truncate_bits");
+  shape.activationCmp = getU32("activation_cmp");
+  if (failed(parseActivationAndPrecision(config, shape.activation,
+                                         shape.precision, diagFn))) {
+    return std::nullopt;
+  }
   return shape;
 }
 
@@ -243,9 +336,30 @@ public:
     }
 
     auto diagFn = [&]() { return variantOp.emitOpError(); };
-    std::optional<RocketConv2dConfig> shape = buildRocketConv2dConfigFromTarget(
-        variantOp.getTarget().getConfiguration(), diagFn);
-    if (!shape) {
+    DictionaryAttr config = variantOp.getTarget().getConfiguration();
+    StringRef kernel = "conv2d";
+    if (Attribute kernelAttr = config ? config.get("kernel") : Attribute{}) {
+      auto kernelString = llvm::dyn_cast<StringAttr>(kernelAttr);
+      if (!kernelString) {
+        return variantOp.emitOpError()
+               << "rocket executable target 'kernel' must be a string";
+      }
+      kernel = kernelString.getValue();
+    }
+    if (kernel != "conv2d" && kernel != "fully_connected") {
+      return variantOp.emitOpError()
+             << "unsupported Rocket kernel '" << kernel
+             << "'; expected 'conv2d' or 'fully_connected'";
+    }
+
+    std::optional<RocketConv2dConfig> convShape;
+    std::optional<RocketFullyConnectedConfig> fcShape;
+    if (kernel == "fully_connected") {
+      fcShape = buildRocketFullyConnectedConfigFromTarget(config, diagFn);
+    } else {
+      convShape = buildRocketConv2dConfigFromTarget(config, diagFn);
+    }
+    if (!convShape && !fcShape) {
       return failure();
     }
 
@@ -266,18 +380,32 @@ public:
 
     FlatbufferBuilder builder;
     iree_hal_rocket_ExecutableDef_start_as_root(builder);
-    auto convRef = iree_hal_rocket_Conv2DDef_create(
-        builder, shape->inputWidth, shape->inputHeight, shape->inputChannels,
-        shape->outputWidth, shape->outputHeight, shape->outputChannels,
-        shape->weightsWidth, shape->weightsHeight, shape->stride,
-        shape->depthwise, shape->inputZeroPoint, shape->outputZeroPoint,
-        shape->weightsZeroPoint, shape->inputScale, shape->weightsScale,
-        shape->outputScale, shape->truncateBits, shape->activation,
-        shape->activationCmp, shape->precision);
+    iree_hal_rocket_KernelDef_union_ref_t kernelRef;
+    if (fcShape) {
+      auto fcRef = iree_hal_rocket_FullyConnectedDef_create(
+          builder, fcShape->m, fcShape->k, fcShape->n, fcShape->inputZeroPoint,
+          fcShape->outputZeroPoint, fcShape->weightsZeroPoint,
+          fcShape->inputScale, fcShape->weightsScale, fcShape->outputScale,
+          fcShape->truncateBits, fcShape->activation, fcShape->activationCmp,
+          fcShape->precision);
+      kernelRef = iree_hal_rocket_KernelDef_as_FullyConnectedDef(fcRef);
+    } else {
+      auto convRef = iree_hal_rocket_Conv2DDef_create(
+          builder, convShape->inputWidth, convShape->inputHeight,
+          convShape->inputChannels, convShape->outputWidth,
+          convShape->outputHeight, convShape->outputChannels,
+          convShape->weightsWidth, convShape->weightsHeight, convShape->stride,
+          convShape->depthwise, convShape->inputZeroPoint,
+          convShape->outputZeroPoint, convShape->weightsZeroPoint,
+          convShape->inputScale, convShape->weightsScale,
+          convShape->outputScale, convShape->truncateBits,
+          convShape->activation, convShape->activationCmp,
+          convShape->precision);
+      kernelRef = iree_hal_rocket_KernelDef_as_Conv2DDef(convRef);
+    }
     auto exportNameRef = builder.createString(exportOp.getName());
-    auto exportRef = iree_hal_rocket_ExportDef_create(
-        builder, exportNameRef,
-        iree_hal_rocket_KernelDef_as_Conv2DDef(convRef));
+    auto exportRef =
+        iree_hal_rocket_ExportDef_create(builder, exportNameRef, kernelRef);
     auto exportsRef =
         iree_hal_rocket_ExportDef_vec_create(builder, &exportRef, 1);
     iree_hal_rocket_ExecutableDef_exports_add(builder, exportsRef);
