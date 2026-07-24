@@ -39,12 +39,15 @@
 //! - `fc_non_square_m_columns_are_independent`: repeats the M-as-width check
 //!   at M=7, so the original square M=4/height=4 geometry cannot accidentally
 //!   hide a line/surface-stride error.
+//! - `fc_fp16_uniform_average_is_exact` and
+//!   `fc_fp16_distinct_weights_follow_channels`: exercise the fp16 FC path
+//!   with logical tensor packing and bit-exact matrix results.
 
 use std::{fs::OpenOptions, mem, os::unix::io::AsRawFd, ptr};
 
 use iree_rocket_hal::rocket::{
     device::{Buffer, close_bo, fini_bo, prep_bo, submit},
-    regcmd::{Activation, FcBuffers, FcShape, build_fc_regcmd},
+    regcmd::{Activation, FcBuffers, FcShape, Precision, build_fc_regcmd},
     tensor_layout::{
         nc1hwc2_storage_size, pack_hwcf_to_rocket_weights, pack_nhwc_to_nc1hwc2,
         rocket_weight_storage_size,
@@ -73,6 +76,7 @@ fn small_shape() -> FcShape {
         output_scale: 1.0,
         truncate_bits: 0,
         activation: Activation::None,
+        precision: Precision::Int8,
     }
 }
 
@@ -125,6 +129,7 @@ fn run_uniform_fc_all_channels(shape: &FcShape, input_fill: u8, weight_fill: u8)
 }
 
 fn first_output_channel(shape: &FcShape, dense_output: &[u8]) -> Vec<u8> {
+    assert_eq!(shape.precision, Precision::Int8);
     (0..shape.m as usize)
         .map(|m| dense_output[m * shape.n as usize])
         .collect()
@@ -137,16 +142,20 @@ fn first_output_channel(shape: &FcShape, dense_output: &[u8]) -> Vec<u8> {
 fn decode_fc_row0(shape: &FcShape, raw: &[u8]) -> Vec<u8> {
     let m = shape.m as usize;
     let n = shape.n as usize;
+    let element_size = shape.precision.bytes_per_element() as usize;
+    let bytes_per_pixel = n * element_size;
     let physical_pixels = m * FC_SAFE_HEIGHT;
     let surface_stride = physical_pixels * FEATURE_ATOMIC_BYTES;
-    let mut dense = vec![0u8; m * n];
+    let mut dense = vec![0u8; m * bytes_per_pixel];
 
     for row in 0..m {
         for channel in 0..n {
-            let surface = channel / FEATURE_ATOMIC_BYTES;
-            let lane = channel % FEATURE_ATOMIC_BYTES;
+            let channel_byte = channel * element_size;
+            let surface = channel_byte / FEATURE_ATOMIC_BYTES;
+            let lane = channel_byte % FEATURE_ATOMIC_BYTES;
             let src = surface * surface_stride + row * FEATURE_ATOMIC_BYTES + lane;
-            dense[row * n + channel] = raw[src];
+            let dst = row * bytes_per_pixel + channel_byte;
+            dense[dst..dst + element_size].copy_from_slice(&raw[src..src + element_size]);
         }
     }
     dense
@@ -205,7 +214,9 @@ unsafe fn run_fc(
         // Row 0 only (h=0) is logically returned, but decoding channel
         // surfaces requires retaining their full four-row physical stride.
         let physical_pixels = shape.m as usize * FC_SAFE_HEIGHT;
-        let surface_count = (shape.n as usize).div_ceil(FEATURE_ATOMIC_BYTES);
+        let output_bytes_per_pixel =
+            shape.n as usize * shape.precision.bytes_per_element() as usize;
+        let surface_count = output_bytes_per_pixel.div_ceil(FEATURE_ATOMIC_BYTES);
         let raw_len = physical_pixels * surface_count * FEATURE_ATOMIC_BYTES;
         assert!(
             raw_len <= TENSOR_SIZE,
@@ -226,19 +237,31 @@ fn run_packed_fc(shape: &FcShape, input: &[u8], weights: &[u8]) -> Vec<u8> {
     let m = shape.m as usize;
     let k = shape.k as usize;
     let n = shape.n as usize;
-    assert_eq!(input.len(), m * k);
-    assert_eq!(weights.len(), k * n);
+    let element_size = shape.precision.bytes_per_element() as usize;
+    assert_eq!(input.len(), m * k * element_size);
+    assert_eq!(weights.len(), k * n * element_size);
 
     let physical_pixels = m * FC_SAFE_HEIGHT;
-    let mut physical_dense_input = vec![shape.input_zero_point as u8; physical_pixels * k];
+    let padding_byte = match shape.precision {
+        Precision::Int8 => shape.input_zero_point as u8,
+        Precision::Fp16 => 0,
+    };
+    let mut physical_dense_input = vec![padding_byte; physical_pixels * k * element_size];
     physical_dense_input[..input.len()].copy_from_slice(input);
-    let packed_input_len = nc1hwc2_storage_size(physical_pixels, k).unwrap();
+    let input_bytes_per_pixel = k * element_size;
+    let packed_input_len = nc1hwc2_storage_size(physical_pixels, input_bytes_per_pixel).unwrap();
     let mut packed_input = vec![0u8; packed_input_len];
-    pack_nhwc_to_nc1hwc2(&physical_dense_input, physical_pixels, k, &mut packed_input).unwrap();
+    pack_nhwc_to_nc1hwc2(
+        &physical_dense_input,
+        physical_pixels,
+        input_bytes_per_pixel,
+        &mut packed_input,
+    )
+    .unwrap();
 
-    let packed_weights_len = rocket_weight_storage_size(1, 1, k, n, 1).unwrap();
+    let packed_weights_len = rocket_weight_storage_size(1, 1, k, n, element_size).unwrap();
     let mut packed_weights = vec![shape.weights_zero_point as u8; packed_weights_len];
-    pack_hwcf_to_rocket_weights(weights, 1, 1, k, n, 1, &mut packed_weights).unwrap();
+    pack_hwcf_to_rocket_weights(weights, 1, 1, k, n, element_size, &mut packed_weights).unwrap();
 
     assert!(packed_input_len <= TENSOR_SIZE);
     assert!(packed_weights_len <= TENSOR_SIZE);
@@ -274,6 +297,75 @@ fn run_packed_fc(shape: &FcShape, input: &[u8], weights: &[u8]) -> Vec<u8> {
 
         output
     }
+}
+
+fn fp16_shape() -> FcShape {
+    FcShape {
+        m: 4,
+        k: 32,
+        n: 16,
+        input_zero_point: 0,
+        output_zero_point: 0,
+        weights_zero_point: 0,
+        input_scale: 1.0,
+        weights_scale: 1.0,
+        output_scale: 1.0,
+        truncate_bits: 0,
+        activation: Activation::None,
+        precision: Precision::Fp16,
+    }
+}
+
+fn f32_to_f16_bits(value: f32) -> u16 {
+    let bits = value.to_bits();
+    let sign = (bits >> 31) & 0x1;
+    if value == 0.0 {
+        return (sign << 15) as u16;
+    }
+    let exp = ((bits >> 23) & 0xff) as i32;
+    let frac = bits & 0x7f_ffff;
+    let new_exp = exp - 127 + 15;
+    assert!(
+        (1..31).contains(&new_exp),
+        "value {value} is outside this test helper's normal fp16 range"
+    );
+    ((sign << 15) | ((new_exp as u32) << 10) | (frac >> 13)) as u16
+}
+
+fn f16_to_f32(bits: u16) -> f32 {
+    let sign = ((bits >> 15) & 0x1) as u32;
+    let exp = ((bits >> 10) & 0x1f) as u32;
+    let frac = (bits & 0x3ff) as u32;
+    let f32_bits = if exp == 0 {
+        if frac == 0 {
+            sign << 31
+        } else {
+            let subnormal = (frac as f32) * 2f32.powi(-24);
+            return if sign == 1 { -subnormal } else { subnormal };
+        }
+    } else if exp == 0x1f {
+        (sign << 31) | (0xff << 23) | (frac << 13)
+    } else {
+        let new_exp = exp + (127 - 15);
+        (sign << 31) | (new_exp << 23) | (frac << 13)
+    };
+    f32::from_bits(f32_bits)
+}
+
+fn encode_fp16(values: impl IntoIterator<Item = f32>) -> Vec<u8> {
+    values
+        .into_iter()
+        .flat_map(|value| f32_to_f16_bits(value).to_le_bytes())
+        .collect()
+}
+
+fn decode_fp16_output(shape: &FcShape, bytes: &[u8]) -> Vec<f32> {
+    assert_eq!(shape.precision, Precision::Fp16);
+    assert_eq!(bytes.len(), shape.m as usize * shape.n as usize * 2);
+    bytes
+        .chunks_exact(2)
+        .map(|bytes| f16_to_f32(u16::from_le_bytes([bytes[0], bytes[1]])))
+        .collect()
 }
 
 /// Uniform-fill sanity check: every one of m=4 output columns should agree
@@ -413,6 +505,70 @@ fn fc_non_square_m_columns_are_independent() {
         columns.last(),
         "first and last M=7 outputs are identical despite distinct logical input rows: {columns:?}"
     );
+}
+
+/// Every M row contains one exactly-representable integer repeated over K=32,
+/// and every weight is exactly 1/32. The FC result is therefore the original
+/// row value in every N channel, exactly representable at every multiply,
+/// partial sum, and final fp16 write-back.
+#[test]
+#[ignore = "needs the real NPU device -- cross-compile for aarch64, copy to the board, run there"]
+fn fc_fp16_uniform_average_is_exact() {
+    let shape = fp16_shape();
+    let input = encode_fp16((0..shape.m).flat_map(|m| {
+        let value = (m + 1) as f32;
+        std::iter::repeat_n(value, shape.k as usize)
+    }));
+    let weights = encode_fp16(std::iter::repeat_n(
+        1.0 / shape.k as f32,
+        shape.k as usize * shape.n as usize,
+    ));
+    let output = decode_fp16_output(&shape, &run_packed_fc(&shape, &input, &weights));
+
+    for m in 0..shape.m as usize {
+        for n in 0..shape.n as usize {
+            let expected = (m + 1) as f32;
+            let actual = output[m * shape.n as usize + n];
+            assert_eq!(
+                actual, expected,
+                "fp16 FC [{m}, {n}]: expected exact average {expected}, got {actual}"
+            );
+        }
+    }
+}
+
+/// Gives every `[M,K]` input element a distinct exactly-representable integer.
+/// Output channel N selects exactly one K channel with a weight of 1.0, so
+/// this checks the full logical `[K,N]` packing permutation and both fp16
+/// output surfaces with an exact per-element reference.
+#[test]
+#[ignore = "needs the real NPU device -- cross-compile for aarch64, copy to the board, run there"]
+fn fc_fp16_distinct_weights_follow_channels() {
+    let shape = fp16_shape();
+    let input_value = |m: usize, k: usize| (m * shape.k as usize + k + 1) as f32;
+    let input = encode_fp16(
+        (0..shape.m as usize).flat_map(|m| (0..shape.k as usize).map(move |k| input_value(m, k))),
+    );
+
+    let mut weight_values = vec![0.0f32; shape.k as usize * shape.n as usize];
+    for n in 0..shape.n as usize {
+        let selected_k = (n * 2 + 1) % shape.k as usize;
+        weight_values[selected_k * shape.n as usize + n] = 1.0;
+    }
+    let weights = encode_fp16(weight_values);
+    let output = decode_fp16_output(&shape, &run_packed_fc(&shape, &input, &weights));
+
+    for m in 0..shape.m as usize {
+        for n in 0..shape.n as usize {
+            let selected_k = (n * 2 + 1) % shape.k as usize;
+            let expected = input_value(m, selected_k);
+            let actual = output[m * shape.n as usize + n];
+            assert_eq!(
+                actual, expected,
+                "fp16 FC [{m}, {n}] selects K={selected_k}: expected {expected}, got {actual}"
+            );
+        }
+    }
 }
 
 /// Load-bearing check for the M-as-width mapping itself: gives each of the

@@ -2230,15 +2230,16 @@ pub fn build_conv_then_lut_regcmd(
 // output buffers sized for the full `M x FC_SAFE_HEIGHT` cube (not just
 // one row) and only read back row 0 of the output.
 //
-// UNCONFIRMED, not yet hardware-validated: whether M-as-width (rather than
-// M-as-height, or some other mapping) is really what the hardware expects
-// for a "batch of independent FC evaluations" -- and this is also the
-// first hardware exercise anywhere in this module of `weights_width ==
-// weights_height == 1` (every previously-validated conv shape used a 3x3
-// kernel; note `build_conv_cna_core_dpu_dpu_rdma`'s `pad_con1` special-case
-// for `weights_width >= 3` simply doesn't trigger here, falling back to the
-// plain `input_zero_point.wrapping_sub(0x80)` path -- untested combination
-// until now).
+// Hardware-validated for int8 on RK3588 (2026-07-23,
+// `tests/fc_hw.rs`): M-as-width preserves independent logical rows for both
+// M=4 and non-square M=7; packed `[K,N]` weights select the intended output
+// channel across multiple feature surfaces; all N=32 uniformly-computed
+// outputs agree. These tests also cover the 1x1-kernel `pad_con1` fallback
+// (the `weights_width >= 3` special case does not trigger).
+//
+// `FcShape::precision` also permits fp16 through the same already-validated
+// multi-channel Conv path. Its exact-value FC-specific hardware tests live
+// beside the int8 tests in `tests/fc_hw.rs`.
 //===========================================================================
 
 /// Fixed input/output height every `build_fc_regcmd` shape uses internally,
@@ -2249,7 +2250,8 @@ pub fn build_conv_then_lut_regcmd(
 const FC_SAFE_HEIGHT: u32 = 4;
 
 /// Logical shape of a single fully-connected (matmul + bias) operation:
-/// `[m, k] x [k, n] + [n] -> [m, n]`, quantized the same way `ConvShape` is.
+/// `[m, k] x [k, n] + [n] -> [m, n]`, with the same numeric-domain fields as
+/// `ConvShape`.
 /// Internally built as a 1x1-kernel conv with M mapped onto `input_width`
 /// and height fixed at `FC_SAFE_HEIGHT` -- see this module's FC section
 /// doc comment.
@@ -2265,6 +2267,7 @@ pub struct FcShape {
     pub output_scale: f32,
     pub truncate_bits: u32,
     pub activation: Activation,
+    pub precision: Precision,
 }
 
 /// DMA addresses for the four buffers a single-task FC op needs -- same
@@ -2299,7 +2302,7 @@ pub fn build_fc_regcmd(shape: &FcShape, bufs: &FcBuffers) -> Vec<RegCmd> {
         output_scale: shape.output_scale,
         truncate_bits: shape.truncate_bits,
         activation: shape.activation,
-        precision: Precision::Int8,
+        precision: shape.precision,
     };
     let conv_bufs = ConvBuffers {
         input_addr: bufs.input_addr,
