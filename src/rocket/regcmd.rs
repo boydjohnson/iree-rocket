@@ -14,7 +14,9 @@
 //! Scope, deliberately not general beyond what this repo currently needs:
 //! - Convolutions larger than CBUF are split along output height using
 //!   Mesa's `rkt_split_tasks()` algorithm. The public multi-task builder
-//!   returns one regcmd buffer per split for `device::submit_tasks`.
+//!   returns one regcmd buffer per split. After allocating the buffers, callers
+//!   patch their DMA addresses with `link_regcmd_tasks` and pass them to
+//!   `device::submit_tasks`.
 //! - The serialized shape currently has no padding fields, so convolution
 //!   planning supports zero-padding valid convolutions only.
 //! - No `addition_input`/`add_tensor` support -- none of the three bins
@@ -1990,7 +1992,8 @@ fn require_single_conv_task(shape: &ConvShape) -> ConvTask {
 
 /// Builds one regcmd buffer per CBUF height split.
 ///
-/// Allocate each returned vector in its own command buffer and submit the
+/// Allocate each returned vector in its own command buffer, call
+/// [`link_regcmd_tasks`] with their DMA addresses, and submit the
 /// `(address, command_count)` pairs together through
 /// [`crate::rocket::device::submit_tasks`]. Keeping the splits in one kernel
 /// job is required for `reuse_weights` tasks to observe the preceding task's
@@ -2022,6 +2025,66 @@ pub fn build_conv_regcmd_tasks(
             cmds
         })
         .collect())
+}
+
+fn task_link_trailer_index(commands: &[RegCmd]) -> Result<usize, &'static str> {
+    let is_register = |command: &RegCmd, domain: u32, offset: u32| {
+        ((command.0 >> 48) & 0xff) == u64::from(domain) && (command.0 & 0xffff) == u64::from(offset)
+    };
+    if commands.len() < 4 {
+        return Err("regcmd task is too short to contain a PC link trailer");
+    }
+
+    for index in (0..=commands.len() - 4).rev() {
+        if is_register(&commands[index], DOMAIN_PC, REG_PC_BASE_ADDRESS)
+            && is_register(&commands[index + 1], DOMAIN_PC, REG_PC_REGISTER_AMOUNTS)
+            && commands[index + 2].0 == 0x0041_0000_0000_0000
+            && is_register(&commands[index + 3], 0x81, REG_PC_OPERATION_ENABLE)
+        {
+            return Ok(index);
+        }
+    }
+    Err("regcmd task has no PC link trailer")
+}
+
+/// Patches Mesa's embedded next-task PC links after command-buffer DMA
+/// addresses are known.
+///
+/// Multi-split operations use both the kernel's ordered task array and the
+/// trailing `PC_BASE_ADDRESS`/`PC_REGISTER_AMOUNTS` pair in each regcmd.
+/// Mesa patches those registers to the next task before submission so the
+/// alternate ping-pong register group is prepared while the current task
+/// runs. The final task retains its zero-valued link.
+pub fn link_regcmd_tasks(
+    tasks: &mut [Vec<RegCmd>],
+    task_dma_addresses: &[u32],
+) -> Result<(), &'static str> {
+    if tasks.len() != task_dma_addresses.len() {
+        return Err("regcmd task and DMA-address counts differ");
+    }
+    if tasks.len() <= 1 {
+        return Ok(());
+    }
+
+    let trailer_indices = tasks
+        .iter()
+        .map(|commands| task_link_trailer_index(commands))
+        .collect::<Result<Vec<_>, _>>()?;
+    for index in 0..tasks.len() - 1 {
+        let next_payload_commands = trailer_indices[index + 1];
+        let next_register_amount = (next_payload_commands / 2).next_multiple_of(2);
+        let next_register_amount = u32::try_from(next_register_amount)
+            .map_err(|_| "next regcmd register amount exceeds u32")?;
+        let trailer = trailer_indices[index];
+        tasks[index][trailer] = RegCmd::new(
+            DOMAIN_PC,
+            REG_PC_BASE_ADDRESS,
+            task_dma_addresses[index + 1],
+        );
+        tasks[index][trailer + 1] =
+            RegCmd::new(DOMAIN_PC, REG_PC_REGISTER_AMOUNTS, next_register_amount);
+    }
+    Ok(())
 }
 
 /// Builds the historical one-task convolution command buffer.
@@ -3277,6 +3340,59 @@ mod conv_task_tests {
                 );
             }
         }
+    }
+
+    #[test]
+    fn links_split_regcmd_ping_pong_trailers() {
+        let shape = mobilenet_1x1(112, 112, 32, 16);
+        let buffers = ConvBuffers {
+            input_addr: 0x1000,
+            weights_addr: 0x2000,
+            bias_addr: 0x3000,
+            output_addr: 0x4000,
+        };
+        let mut tasks = build_conv_regcmd_tasks(&shape, &buffers).unwrap();
+        let addresses = [0x1000_0000, 0x1000_1000, 0x1000_2000];
+        let trailers = tasks
+            .iter()
+            .map(|task| task_link_trailer_index(task).unwrap())
+            .collect::<Vec<_>>();
+
+        link_regcmd_tasks(&mut tasks, &addresses).unwrap();
+
+        for index in 0..tasks.len() - 1 {
+            let next_amount = (trailers[index + 1] / 2).next_multiple_of(2) as u32;
+            assert_eq!(
+                tasks[index][trailers[index]].0,
+                RegCmd::new(DOMAIN_PC, REG_PC_BASE_ADDRESS, addresses[index + 1]).0
+            );
+            assert_eq!(
+                tasks[index][trailers[index] + 1].0,
+                RegCmd::new(DOMAIN_PC, REG_PC_REGISTER_AMOUNTS, next_amount).0
+            );
+        }
+        let last = tasks.len() - 1;
+        assert_eq!(
+            tasks[last][trailers[last]].0,
+            RegCmd::new(DOMAIN_PC, REG_PC_BASE_ADDRESS, 0).0
+        );
+        assert_eq!(
+            tasks[last][trailers[last] + 1].0,
+            RegCmd::new(DOMAIN_PC, REG_PC_REGISTER_AMOUNTS, 0).0
+        );
+    }
+
+    #[test]
+    fn rejects_mismatched_regcmd_link_address_count() {
+        let shape = mobilenet_1x1(112, 112, 32, 16);
+        let buffers = ConvBuffers {
+            input_addr: 0x1000,
+            weights_addr: 0x2000,
+            bias_addr: 0x3000,
+            output_addr: 0x4000,
+        };
+        let mut tasks = build_conv_regcmd_tasks(&shape, &buffers).unwrap();
+        assert!(link_regcmd_tasks(&mut tasks, &[0x1000_0000]).is_err());
     }
 
     #[test]

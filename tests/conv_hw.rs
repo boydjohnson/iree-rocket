@@ -44,7 +44,8 @@ use iree_rocket_hal::rocket::{
     device::{Buffer, fini_bo, prep_bo, submit, submit_tasks},
     regcmd::{
         Activation, CONV_OUTPUT_ATOMIC_STRIDE, ConvBuffers, ConvShape, Precision,
-        build_conv_regcmd, build_conv_regcmd_tasks, conv_output_scratch_bytes, plan_conv_tasks,
+        build_conv_regcmd, build_conv_regcmd_tasks, conv_output_scratch_bytes, link_regcmd_tasks,
+        plan_conv_tasks,
     },
     tensor_layout::{nc1hwc2_storage_size, pack_nhwc_to_nc1hwc2},
 };
@@ -754,19 +755,27 @@ fn run_position_conv_fp16(shape: &ConvShape) -> Vec<f32> {
             bias_addr: buf_bias.dma_address,
             output_addr: buf_c.dma_address,
         };
-        let regcmd_tasks =
+        let mut regcmd_tasks =
             build_conv_regcmd_tasks(shape, &bufs).expect("failed to build convolution tasks");
         let mut cmd_buffers = Vec::with_capacity(regcmd_tasks.len());
         for cmds in &regcmd_tasks {
             let cmd_bytes = cmds.len() * mem::size_of::<u64>();
             let buf_cmd = Buffer::new(fd, page_aligned_size(cmd_bytes), &file);
+            cmd_buffers.push(buf_cmd);
+        }
+        let task_addresses = cmd_buffers
+            .iter()
+            .map(|buffer| buffer.dma_address)
+            .collect::<Vec<_>>();
+        link_regcmd_tasks(&mut regcmd_tasks, &task_addresses)
+            .expect("failed to link split regcmd ping-pong trailers");
+        for (cmds, buf_cmd) in regcmd_tasks.iter().zip(&cmd_buffers) {
             let cmd_slice =
                 std::slice::from_raw_parts_mut(buf_cmd.host_ptr as *mut u64, cmds.len());
             for (slot, command) in cmd_slice.iter_mut().zip(cmds) {
                 *slot = command.0;
             }
             fini_bo(fd, buf_cmd.handle).ok();
-            cmd_buffers.push(buf_cmd);
         }
 
         fini_bo(fd, buf_a.handle).ok();
