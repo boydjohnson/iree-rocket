@@ -1,12 +1,10 @@
-// v3 separates generic convolution recognition from the static executable
-// specializations required by the current Rocket backend. The matchers below
-// use ConvolutionOpInterface to inspect element types, dimensions, stride, and
-// dilation without spelling complete tensor types in a DAG.
-//
-// RocketTarget.cpp still requires literal shape fields in every
-// #hal.executable.target config. Consequently, each executable keeps an exact
-// dimension guard. An unsupported shape fails these matchers and remains on
-// the default CPU device instead of being sent to Rocket with a wrong config.
+// Generic convolution recognition is separated from executable
+// specialization. The matchers below use ConvolutionOpInterface to inspect
+// element types, dimensions, stride, and dilation without spelling complete
+// tensor types in a DAG. Known static MobileNet shapes retain their dedicated
+// executables. The final 1x1 fallback uses the runtime-dimension ABI and a
+// cast-compatible dynamic helper, allowing input/output spatial and channel
+// dimensions to remain unknown until dispatch. Batch remains statically one.
 
 #rocket_target_0 = #hal.executable.target<"rocket", "rocket-flatbuffer-v1", {
   kernel = "conv2d",
@@ -47,7 +45,32 @@
   precision = "fp16"
 }>
 
+#rocket_dynamic_target = #hal.executable.target<"rocket", "rocket-flatbuffer-v1", {
+  kernel = "conv2d",
+  input_width = 0 : i32, input_height = 0 : i32, input_channels = 0 : i32,
+  output_width = 0 : i32, output_height = 0 : i32, output_channels = 0 : i32,
+  weights_width = 0 : i32, weights_height = 0 : i32, stride = 1 : i32,
+  depthwise = false,
+  input_zero_point = 0 : i32, output_zero_point = 0 : i32, weights_zero_point = 0 : i32,
+  input_scale = 1.0 : f32, weights_scale = 1.0 : f32, output_scale = 1.0 : f32,
+  truncate_bits = 0 : i32,
+  activation = "none", activation_cmp = 0 : i32,
+  precision = "fp16",
+  runtime_dimensions = [
+    "input_width", "input_height", "input_channels",
+    "output_width", "output_height", "output_channels",
+    "weights_width", "weights_height"
+  ]
+}>
+
 #pipeline_layout = #hal.pipeline.layout<constants = 0, bindings = [
+  #hal.pipeline.binding<storage_buffer, ReadOnly>,
+  #hal.pipeline.binding<storage_buffer, ReadOnly>,
+  #hal.pipeline.binding<storage_buffer, ReadOnly>,
+  #hal.pipeline.binding<storage_buffer>
+]>
+
+#dynamic_pipeline_layout = #hal.pipeline.layout<constants = 8, bindings = [
   #hal.pipeline.binding<storage_buffer, ReadOnly>,
   #hal.pipeline.binding<storage_buffer, ReadOnly>,
   #hal.pipeline.binding<storage_buffer, ReadOnly>,
@@ -94,6 +117,151 @@
 // -- RK3588's rocket NPU really is unified, host-mmap'd memory, see
 // project memory's RocketAllocator/RocketBuffer notes) fixes it cleanly.
 module attributes {transform.with_named_sequence} {
+
+  hal.executable private @rocket_dynamic_executable {
+    hal.executable.variant public @rocket_dynamic_conv2d_v1 target(#rocket_dynamic_target) {
+      hal.executable.export public @rocket_dynamic_conv2d ordinal(0) layout(#dynamic_pipeline_layout) count(%device: !hal.device, %workload: index) -> (index, index, index) {
+        %c1 = arith.constant 1 : index
+        hal.return %c1, %c1, %c1 : index, index, index
+      }
+      builtin.module {
+        func.func @rocket_dynamic_conv2d() {
+          return
+        }
+      }
+    }
+  }
+
+  // Generic runtime-shape adapter. Batch remains statically one because it is
+  // fixed by the Rocket Conv ABI. Every other logical Conv dimension is read
+  // from the cast-compatible tensor operands and passed as an i32 push
+  // constant in exactly the order declared by #rocket_dynamic_target.
+  util.func private @call_rocket_dynamic_conv2d(
+      %input: tensor<1x?x?x?xf16>,
+      %filter: tensor<?x?x?x?xf16>,
+      %init: tensor<1x?x?x?xf32>) -> tensor<1x?x?x?xf32> {
+    %c0 = arith.constant 0 : index
+    %c1 = arith.constant 1 : index
+    %c2 = arith.constant 2 : index
+    %c3 = arith.constant 3 : index
+
+    %input_height = tensor.dim %input, %c1 : tensor<1x?x?x?xf16>
+    %input_width = tensor.dim %input, %c2 : tensor<1x?x?x?xf16>
+    %input_channels = tensor.dim %input, %c3 : tensor<1x?x?x?xf16>
+    %weights_height = tensor.dim %filter, %c0 : tensor<?x?x?x?xf16>
+    %weights_width = tensor.dim %filter, %c1 : tensor<?x?x?x?xf16>
+    %output_height = tensor.dim %init, %c1 : tensor<1x?x?x?xf32>
+    %output_width = tensor.dim %init, %c2 : tensor<1x?x?x?xf32>
+    %output_channels = tensor.dim %init, %c3 : tensor<1x?x?x?xf32>
+
+    %input_width_i32 = arith.index_cast %input_width : index to i32
+    %input_height_i32 = arith.index_cast %input_height : index to i32
+    %input_channels_i32 = arith.index_cast %input_channels : index to i32
+    %output_width_i32 = arith.index_cast %output_width : index to i32
+    %output_height_i32 = arith.index_cast %output_height : index to i32
+    %output_channels_i32 = arith.index_cast %output_channels : index to i32
+    %weights_width_i32 = arith.index_cast %weights_width : index to i32
+    %weights_height_i32 = arith.index_cast %weights_height : index to i32
+
+    %zero_bias_empty = tensor.empty(%output_channels) : tensor<?xf16>
+    %zero_f16 = arith.constant 0.0 : f16
+    %zero_bias = linalg.fill ins(%zero_f16 : f16)
+        outs(%zero_bias_empty : tensor<?xf16>) -> tensor<?xf16>
+
+    %raw_f16 = flow.dispatch
+        @rocket_dynamic_executable::@rocket_dynamic_conv2d_v1::@rocket_dynamic_conv2d(
+          %input_width_i32, %input_height_i32, %input_channels_i32,
+          %output_width_i32, %output_height_i32, %output_channels_i32,
+          %weights_width_i32, %weights_height_i32,
+          %input, %filter, %zero_bias)
+        {stream.affinity = #hal.device.affinity<@rocket_device>}
+        : (i32, i32, i32, i32, i32, i32, i32, i32,
+           tensor<1x?x?x?xf16>{%input_height, %input_width, %input_channels},
+           tensor<?x?x?x?xf16>{%weights_height, %weights_width, %input_channels, %output_channels},
+           tensor<?xf16>{%output_channels})
+        -> tensor<1x?x?x?xf16>{%output_height, %output_width, %output_channels}
+
+    %final = flow.dispatch.workgroups[
+        %output_height, %output_width, %output_channels](
+        %raw_f16, %init, %output_height, %output_width, %output_channels)
+        : (tensor<1x?x?x?xf16>{%output_height, %output_width, %output_channels},
+           tensor<1x?x?x?xf32>{%output_height, %output_width, %output_channels},
+           index, index, index)
+        -> tensor<1x?x?x?xf32>{%output_height, %output_width, %output_channels}
+        attributes { stream.affinity = #hal.device.affinity<@cpu_device> } =
+        (%raw_binding: !iree_tensor_ext.dispatch.tensor<readonly:tensor<1x?x?x?xf16>>,
+         %init_binding: !iree_tensor_ext.dispatch.tensor<readonly:tensor<1x?x?x?xf32>>,
+         %output_height_arg: index,
+         %output_width_arg: index,
+         %output_channels_arg: index,
+         %final_binding: !iree_tensor_ext.dispatch.tensor<writeonly:tensor<1x?x?x?xf32>>) {
+      %output_height_size = iree_tensor_ext.dispatch.workload.ordinal
+          %output_height_arg, 0 : index
+      %output_width_size = iree_tensor_ext.dispatch.workload.ordinal
+          %output_width_arg, 1 : index
+      %output_channels_size = iree_tensor_ext.dispatch.workload.ordinal
+          %output_channels_arg, 2 : index
+      %raw_shaped = flow.dispatch.tie_shape %raw_binding
+          : !iree_tensor_ext.dispatch.tensor<readonly:tensor<1x?x?x?xf16>>{
+              %output_height_size, %output_width_size, %output_channels_size}
+      %init_shaped = flow.dispatch.tie_shape %init_binding
+          : !iree_tensor_ext.dispatch.tensor<readonly:tensor<1x?x?x?xf32>>{
+              %output_height_size, %output_width_size, %output_channels_size}
+      %final_shaped = flow.dispatch.tie_shape %final_binding
+          : !iree_tensor_ext.dispatch.tensor<writeonly:tensor<1x?x?x?xf32>>{
+              %output_height_size, %output_width_size, %output_channels_size}
+      %raw_loaded = iree_tensor_ext.dispatch.tensor.load %raw_shaped,
+          offsets = [0, 0, 0, 0],
+          sizes = [1, %output_height_size, %output_width_size, %output_channels_size],
+          strides = [1, 1, 1, 1]
+          : !iree_tensor_ext.dispatch.tensor<readonly:tensor<1x?x?x?xf16>>{
+              %output_height_size, %output_width_size, %output_channels_size}
+          -> tensor<1x?x?x?xf16>
+      %init_loaded = iree_tensor_ext.dispatch.tensor.load %init_shaped,
+          offsets = [0, 0, 0, 0],
+          sizes = [1, %output_height_size, %output_width_size, %output_channels_size],
+          strides = [1, 1, 1, 1]
+          : !iree_tensor_ext.dispatch.tensor<readonly:tensor<1x?x?x?xf32>>{
+              %output_height_size, %output_width_size, %output_channels_size}
+          -> tensor<1x?x?x?xf32>
+      %final_empty = tensor.empty(
+          %output_height_size, %output_width_size, %output_channels_size)
+          : tensor<1x?x?x?xf32>
+      %final_inner = linalg.generic {
+          indexing_maps = [
+            affine_map<(d0, d1, d2, d3) -> (d0, d1, d2, d3)>,
+            affine_map<(d0, d1, d2, d3) -> (d0, d1, d2, d3)>,
+            affine_map<(d0, d1, d2, d3) -> (d0, d1, d2, d3)>
+          ],
+          iterator_types = ["parallel", "parallel", "parallel", "parallel"]
+        } ins(%raw_loaded, %init_loaded
+            : tensor<1x?x?x?xf16>, tensor<1x?x?x?xf32>)
+          outs(%final_empty : tensor<1x?x?x?xf32>) {
+        ^bb0(%raw: f16, %initial: f32, %out: f32):
+          %raw_f32 = arith.extf %raw : f16 to f32
+          %sum = arith.addf %raw_f32, %initial : f32
+          linalg.yield %sum : f32
+      } -> tensor<1x?x?x?xf32>
+      iree_tensor_ext.dispatch.tensor.store %final_inner, %final_shaped,
+          offsets = [0, 0, 0, 0],
+          sizes = [1, %output_height_size, %output_width_size, %output_channels_size],
+          strides = [1, 1, 1, 1]
+          : tensor<1x?x?x?xf32>
+          -> !iree_tensor_ext.dispatch.tensor<writeonly:tensor<1x?x?x?xf32>>{
+              %output_height_size, %output_width_size, %output_channels_size}
+      flow.return
+    } count(%output_height_workload: index,
+            %output_width_workload: index,
+            %output_channels_workload: index) -> (index, index, index) {
+      %x, %y, %z = iree_tensor_ext.dispatch.workgroup_count_from_slice(
+          %output_height_workload,
+          %output_width_workload,
+          %output_channels_workload)
+      flow.return %x, %y, %z : index, index, index
+    }
+
+    util.return %final : tensor<1x?x?x?xf32>
+  }
 
   hal.executable private @rocket_executable_0 {
     hal.executable.variant public @rocket_conv2d_v1_0 target(#rocket_target_0) {
@@ -397,6 +565,45 @@ module attributes {transform.with_named_sequence} {
     transform.yield
   }
 
+  // This fallback accepts regular 1x1 f16/f16->f32 NHWC/HWCF convolutions
+  // whose batch is statically one and whose stride/dilation are one. The
+  // adapter above drops all other static shape information and materializes
+  // it uniformly through runtime dimensions, so it also works when any of
+  // those dimensions are dynamic in the source type.
+  transform.named_sequence @match_dynamic_conv2d(%root: !transform.any_op {transform.readonly}) -> !transform.any_op {
+    transform.match.operation_name %root ["linalg.conv_2d_nhwc_hwcf"] : !transform.any_op
+    %batch, %out_img, %out_ch, %filter, %in_ch, %depth, %strides, %dilations =
+        transform.iree.match.convolution %root,
+          lhs_type = f16, rhs_type = f16, output_type = f32
+          : !transform.any_op -> !transform.param<i64>
+    transform.iree.match.dims_equal %batch, [1] : !transform.param<i64>
+    transform.iree.match.dims_equal %out_img, [-1, -1] : !transform.param<i64>
+    transform.iree.match.dims_equal %out_ch, [-1] : !transform.param<i64>
+    transform.iree.match.dims_equal %filter, [1, 1] : !transform.param<i64>
+    transform.iree.match.dims_equal %in_ch, [-1] : !transform.param<i64>
+    transform.iree.match.dims_equal %depth, [] : !transform.param<i64>
+    transform.iree.match.dims_equal %strides, [1, 1] : !transform.param<i64>
+    transform.iree.match.dims_equal %dilations, [1, 1] : !transform.param<i64>
+    transform.yield %root : !transform.any_op
+  }
+
+  transform.named_sequence @cast_and_call_dynamic_conv2d(%root: !transform.any_op {transform.readonly}) {
+    %ins = transform.get_operand %root[all] : (!transform.any_op) -> !transform.any_value
+    %out = transform.get_result %root[all] : (!transform.any_op) -> !transform.any_value
+    %module = transform.util.get_nearest_symbol_table %root : (!transform.any_op) -> !transform.any_op
+    %topology_attr = transform.param.constant #hal.device.topology<links = [
+        (@rocket_device -> @cpu_device = {transparent_access = true, unified_memory = true}),
+        (@cpu_device -> @rocket_device = {transparent_access = true, unified_memory = true})
+      ]> -> !transform.any_param
+    transform.annotate %module "stream.topology" = %topology_attr : !transform.any_op, !transform.any_param
+    %executable = transform.util.import_symbol @rocket_dynamic_executable into %module if undefined : (!transform.any_op) -> !transform.any_op
+    %func = transform.util.import_symbol @call_rocket_dynamic_conv2d into %module if undefined : (!transform.any_op) -> !transform.any_op
+    transform.util.cast_and_call %func(%ins) -> %out after %root {
+          transform.type_conversion.tensor.cast_shape_dynamic_dims
+      } : (!transform.any_op, !transform.any_value, !transform.any_value, !transform.any_op) -> !transform.any_op
+    transform.yield
+  }
+
   transform.named_sequence @__transform_main(%module: !transform.any_op) {
     %funcs = transform.structured.match ops{["util.func"]} in %module : (!transform.any_op) -> !transform.any_op
     // ONNX commonly imports Conv as NCHW/FCHW, while Rocket's logical
@@ -416,7 +623,8 @@ module attributes {transform.with_named_sequence} {
         transform.foreach_match in %func
             @match_conv2d_0 -> @cast_and_call_conv2d_0,
             @match_conv2d_1 -> @cast_and_call_conv2d_1,
-            @match_conv2d_2 -> @cast_and_call_conv2d_2
+            @match_conv2d_2 -> @cast_and_call_conv2d_2,
+            @match_dynamic_conv2d -> @cast_and_call_dynamic_conv2d
           : (!transform.any_op) -> (!transform.any_op)
     }
     transform.apply_dce to %module : !transform.any_op
