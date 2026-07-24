@@ -132,7 +132,7 @@ impl Precision {
 /// The domain/indexing recipe is compiler-generic, confirmed byte-
 /// identical between the sigmoid and tanh captures, and is therefore
 /// hardcoded inside the builder rather than exposed here (same
-/// risk-avoidance choice as `FC_SAFE_HEIGHT` in the FC section below --
+/// risk-avoidance choice as `FC_PHYSICAL_HEIGHT` in the FC section below --
 /// narrow the API to only what's actually been observed): the LUT domain
 /// is always split at `x=0` into `LE = [-16384, 0)` and `LO = [0, 16384]`,
 /// each table addressed as `index = (x - region_start) >> 5`, giving
@@ -2216,7 +2216,7 @@ pub fn build_conv_then_lut_regcmd(
 // thinking purely in FC terms (an M x K input, no natural "height" at
 // all) has no reason to know this, so `FcShape` doesn't expose an
 // `input_height` field for a caller to get wrong -- `build_fc_regcmd`
-// fixes it internally to `FC_SAFE_HEIGHT` (4, the smallest value that
+// fixes it internally to `FC_PHYSICAL_HEIGHT` (4, the smallest value that
 // cannot underflow: `4 / 4 - 1 == 0`) and maps FC's M dimension onto
 // `input_width` instead (per the roadmap plan's Phase 2 research
 // sequence, tried first because `input_line_stride`/`input_surface_stride`
@@ -2227,7 +2227,7 @@ pub fn build_conv_then_lut_regcmd(
 // independent, so only "row 0" (`h=0`) of the input needs real M*K data;
 // rows 1..3 can be anything (garbage/uninitialized), they just waste
 // compute on values nobody reads back. Callers must still allocate input/
-// output buffers sized for the full `M x FC_SAFE_HEIGHT` cube (not just
+// output buffers sized for the full `M x FC_PHYSICAL_HEIGHT` cube (not just
 // one row) and only read back row 0 of the output.
 //
 // Hardware-validated for int8 on RK3588 (2026-07-23,
@@ -2247,13 +2247,13 @@ pub fn build_conv_then_lut_regcmd(
 /// module doc comment for why 4 specifically (avoids `build_conv_cna_core_
 /// dpu_dpu_rdma`'s `input_height / 4 - 1` underflow) and why callers don't
 /// get to override it.
-const FC_SAFE_HEIGHT: u32 = 4;
+pub const FC_PHYSICAL_HEIGHT: u32 = 4;
 
 /// Logical shape of a single fully-connected (matmul + bias) operation:
 /// `[m, k] x [k, n] + [n] -> [m, n]`, with the same numeric-domain fields as
 /// `ConvShape`.
 /// Internally built as a 1x1-kernel conv with M mapped onto `input_width`
-/// and height fixed at `FC_SAFE_HEIGHT` -- see this module's FC section
+/// and height fixed at `FC_PHYSICAL_HEIGHT` -- see this module's FC section
 /// doc comment.
 pub struct FcShape {
     pub m: u32,
@@ -2273,7 +2273,7 @@ pub struct FcShape {
 /// DMA addresses for the four buffers a single-task FC op needs -- same
 /// four roles as `ConvBuffers`, just renamed to FC's own vocabulary.
 /// `input_addr`/`output_addr` must point at buffers sized for the full
-/// `m x FC_SAFE_HEIGHT` cube (not just one logical row) -- see this
+/// `m x FC_PHYSICAL_HEIGHT` cube (not just one logical row) -- see this
 /// module's FC section doc comment for why rows 1..3 are real but unread.
 pub struct FcBuffers {
     pub input_addr: u32,
@@ -2282,13 +2282,18 @@ pub struct FcBuffers {
     pub output_addr: u32,
 }
 
-pub fn build_fc_regcmd(shape: &FcShape, bufs: &FcBuffers) -> Vec<RegCmd> {
-    let conv_shape = ConvShape {
+/// Returns the physical 1x1-convolution shape used to execute `shape`.
+///
+/// Runtime integrations can use this to apply the same validation and
+/// storage calculations as the register-command builder without duplicating
+/// FC's fixed-height lowering contract.
+pub fn fc_as_conv_shape(shape: &FcShape) -> ConvShape {
+    ConvShape {
         input_width: shape.m,
-        input_height: FC_SAFE_HEIGHT,
+        input_height: FC_PHYSICAL_HEIGHT,
         input_channels: shape.k,
         output_width: shape.m,
-        output_height: FC_SAFE_HEIGHT,
+        output_height: FC_PHYSICAL_HEIGHT,
         output_channels: shape.n,
         weights_width: 1,
         weights_height: 1,
@@ -2303,7 +2308,11 @@ pub fn build_fc_regcmd(shape: &FcShape, bufs: &FcBuffers) -> Vec<RegCmd> {
         truncate_bits: shape.truncate_bits,
         activation: shape.activation,
         precision: shape.precision,
-    };
+    }
+}
+
+pub fn build_fc_regcmd(shape: &FcShape, bufs: &FcBuffers) -> Vec<RegCmd> {
+    let conv_shape = fc_as_conv_shape(shape);
     let conv_bufs = ConvBuffers {
         input_addr: bufs.input_addr,
         weights_addr: bufs.weights_addr,
