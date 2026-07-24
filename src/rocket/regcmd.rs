@@ -2029,7 +2029,8 @@ pub fn build_conv_regcmd_tasks(
 
 fn task_link_trailer_index(commands: &[RegCmd]) -> Result<usize, &'static str> {
     let is_register = |command: &RegCmd, domain: u32, offset: u32| {
-        ((command.0 >> 48) & 0xff) == u64::from(domain) && (command.0 & 0xffff) == u64::from(offset)
+        ((command.0 >> 48) & 0xff) == u64::from(domain & 0xff)
+            && (command.0 & 0xffff) == u64::from(offset)
     };
     if commands.len() < 4 {
         return Err("regcmd task is too short to contain a PC link trailer");
