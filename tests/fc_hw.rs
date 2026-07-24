@@ -325,46 +325,52 @@ fn fc_uniform_fill_all_output_channels_agree() {
     );
 }
 
-/// Validates the logical `[K,N]` weight ABI and the second output surface:
-/// all-zero-real weights establish a per-element baseline, then only logical
-/// output channel 17 receives a nonzero coefficient for every K. No other
-/// output channel may change.
+/// Validates the logical `[K,N]` weight ABI and the second output surface.
+/// Only logical output channel 17 receives the same nonzero coefficient used
+/// by `fc_output_tracks_input`; changing the input must therefore change that
+/// channel and no other channel.
+///
+/// Deliberately uses the already-proven zero-point=0, weight=2 regime. The
+/// tempting symmetric-zero-point version (`0x80` baseline, `0x82` selected
+/// weight) is not diagnostic: the shared int8 1x1-conv output-conversion bug
+/// collapses both its zero and small-positive accumulators to raw 127.
 #[test]
 #[ignore = "needs the real NPU device -- cross-compile for aarch64, copy to the board, run there"]
 fn fc_packed_weights_select_one_output_channel() {
     const SELECTED_CHANNEL: usize = 17;
-    let shape = FcShape {
-        input_zero_point: 0x80,
-        output_zero_point: 0x80,
-        weights_zero_point: 0x80,
-        ..small_shape()
-    };
-    let input = vec![0x81; shape.m as usize * shape.k as usize];
-    let baseline_weights = vec![0x80; shape.k as usize * shape.n as usize];
-    let baseline = run_packed_fc(&shape, &input, &baseline_weights);
-
-    let mut selected_weights = baseline_weights;
+    let shape = small_shape();
+    let mut selected_weights = vec![0u8; shape.k as usize * shape.n as usize];
     for k in 0..shape.k as usize {
-        selected_weights[k * shape.n as usize + SELECTED_CHANNEL] = 0x82;
+        selected_weights[k * shape.n as usize + SELECTED_CHANNEL] = 2;
     }
-    let selected = run_packed_fc(&shape, &input, &selected_weights);
+    let low_input = vec![10u8; shape.m as usize * shape.k as usize];
+    let high_input = vec![200u8; shape.m as usize * shape.k as usize];
+    let low = run_packed_fc(&shape, &low_input, &selected_weights);
+    let high = run_packed_fc(&shape, &high_input, &selected_weights);
 
-    for m in 0..shape.m as usize {
-        for n in 0..shape.n as usize {
-            let index = m * shape.n as usize + n;
-            if n == SELECTED_CHANNEL {
-                assert_ne!(
-                    selected[index], baseline[index],
-                    "m={m}: selected output channel {n} did not respond to its nonzero weights"
-                );
-            } else {
-                assert_eq!(
-                    selected[index], baseline[index],
-                    "m={m}: output channel {n} changed when only channel {SELECTED_CHANNEL}'s weights changed"
-                );
-            }
-        }
-    }
+    let changed_channels = (0..shape.n as usize)
+        .filter(|&n| {
+            (0..shape.m as usize).any(|m| {
+                let index = m * shape.n as usize + n;
+                low[index] != high[index]
+            })
+        })
+        .collect::<Vec<_>>();
+    let selected_values = (0..shape.m as usize)
+        .map(|m| {
+            let index = m * shape.n as usize + SELECTED_CHANNEL;
+            (low[index], high[index])
+        })
+        .collect::<Vec<_>>();
+    eprintln!(
+        "logical output channels responding to input sweep: {changed_channels:?}; \
+         selected channel {SELECTED_CHANNEL} (low, high) by M: {selected_values:?}"
+    );
+    assert_eq!(
+        changed_channels,
+        vec![SELECTED_CHANNEL],
+        "expected only logical output channel {SELECTED_CHANNEL} to respond to input changing from 10 to 200"
+    );
 }
 
 /// Exercises M-as-width when M differs from the internal fixed height (4).
