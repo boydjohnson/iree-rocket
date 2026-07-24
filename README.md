@@ -15,23 +15,34 @@ for the Rocket NPU backend (RK3588). This repository produces:
 | [`iree-rocket-hal`](iree-rocket-hal) | Low-level Rust crate: ioctl/mmap access to the RK3588 NPU and register command building. |
 | [`rocket-hal-driver`](rocket-hal-driver) | Rust `staticlib` implementing IREE's HAL driver interface, statically linked into IREE via `iree_register_external_hal_driver()`. Depends on `iree-rocket-hal` and `rocket-schema`. Includes HAL CTS wiring under `cts/`. |
 | [`rocket-compiler-plugin`](rocket-compiler-plugin) | C++ IREE compiler target plugin ("Rocket"), loaded via `IREE_CMAKE_PLUGIN_PATHS`. Serializes executables using `rocket-schema`'s FlatBuffer format. |
-| `iree-src` | `iree-org/iree` as a pinned git submodule. |
-| `iree-build` | CMake wrapper projects used to configure IREE with the Rocket driver/plugin. |
+| `iree-build/iree-src` | `iree-org/iree` as a pinned git submodule. |
+| `iree-build` | CMake configuration used to build IREE with the Rocket driver/plugin. |
 
 ## Building
 
-Three [CMake presets](CMakePresets.json) cover the three artifacts:
+Each of the three artifacts has its own build directory under `iree-build/`,
+since each configures a different CMake source root (the vendored `iree-src`
+directly, vs. one of two small wrapper projects that register the Rocket HAL
+driver before IREE's own `add_subdirectory` runs):
 
 ```sh
 # iree-compile, with the Rocket compiler target registered
-cmake --preset compiler-host && cmake --build --preset compiler-host
+./iree-build/configure-compiler-host.sh
+cmake --build iree-build/build
 
 # iree-run-module / iree-benchmark-module, host build, with HAL CTS
-cmake --preset runtime-host && cmake --build --preset runtime-host
+(cd iree-build/host && cmake --preset runtime-host && cmake --build --preset runtime-host)
 
 # iree-run-module / iree-benchmark-module, cross-compiled for the RK3588 board
-cmake --preset runtime-aarch64 && cmake --build --preset runtime-aarch64
+(cd iree-build/host-aarch64 && cmake --preset runtime-aarch64 && cmake --build --preset runtime-aarch64)
 ```
+
+`iree-build/host/CMakePresets.json` and `iree-build/host-aarch64/CMakePresets.json`
+each live next to the wrapper `CMakeLists.txt` they configure (CMake presets
+are always rooted at the directory containing the `CMakeLists.txt`, so a
+single repo-root `CMakePresets.json` can't span these plus the vendored
+`iree-src` tree). `configure-compiler-host.sh` covers the third case, which
+has no wrapper project at all.
 
 The Rust crates (`rocket-schema`, `iree-rocket-hal`, `rocket-hal-driver`) form
 a single Cargo workspace and can be built/checked independently of the CMake

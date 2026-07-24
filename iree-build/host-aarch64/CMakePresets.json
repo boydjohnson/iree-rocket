@@ -1,0 +1,20 @@
+{
+  "version": 6,
+  "cmakeMinimumRequired": { "major": 3, "minor": 23, "patch": 0 },
+  "configurePresets": [
+    {
+      "name": "runtime-aarch64",
+      "displayName": "Rocket runtime (aarch64, RK3588 board)",
+      "description": "iree-run-module / iree-benchmark-module cross-compiled for the RK3588 board, with the rocket HAL driver statically linked.",
+      "generator": "Ninja",
+      "binaryDir": "${sourceDir}/build",
+      "toolchainFile": "${sourceDir}/../aarch64_linux_gnu.cmake"
+    }
+  ],
+  "buildPresets": [
+    {
+      "name": "runtime-aarch64",
+      "configurePreset": "runtime-aarch64"
+    }
+  ]
+}

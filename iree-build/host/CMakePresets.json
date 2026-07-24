@@ -1,0 +1,19 @@
+{
+  "version": 6,
+  "cmakeMinimumRequired": { "major": 3, "minor": 23, "patch": 0 },
+  "configurePresets": [
+    {
+      "name": "runtime-host",
+      "displayName": "Rocket runtime (host)",
+      "description": "iree-run-module / iree-benchmark-module with the rocket HAL driver statically linked, plus HAL CTS.",
+      "generator": "Ninja",
+      "binaryDir": "${sourceDir}/build"
+    }
+  ],
+  "buildPresets": [
+    {
+      "name": "runtime-host",
+      "configurePreset": "runtime-host"
+    }
+  ]
+}
