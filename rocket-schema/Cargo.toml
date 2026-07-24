@@ -1,0 +1,9 @@
+[package]
+name = "rocket-schema"
+version = "0.1.0"
+edition = "2024"
+license = "Apache-2.0 WITH LLVM-exception"
+description = "Generated FlatBuffers bindings for Rocket executable schemas"
+
+[dependencies]
+flatbuffers = "=2.0.0"
