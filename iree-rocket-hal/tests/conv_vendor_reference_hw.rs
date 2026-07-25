@@ -12,8 +12,12 @@
 //!   ./conv_vendor_reference_hw-<hash> --ignored --nocapture
 //!
 //! The captured program is specifically a `32x32x3 -> 32x32x8` fp16
-//! convolution. Input and weights are both 1.0, unused input lanes and bias
-//! are zero, so every output has a simple exact value:
+//! convolution. Its input is dense NHWC, not NC1HWC2: the alternative
+//! height-split groups advance the input address by exactly
+//! `rows * 32 * 3 * sizeof(fp16)` (`0xc00` for 16 rows in the 1x1 capture,
+//! and `0xb40` for 15 rows in the overlapping 3x3 capture). Input and
+//! weights are both 1.0 and bias is zero, so every output has a simple exact
+//! value:
 //!
 //! - 1x1: `3`
 //! - padded 3x3: `12` at corners, `18` at non-corner edges, `27` inside
@@ -40,13 +44,13 @@ const DEVICE_PATH: &str = "/dev/accel/accel0";
 const WIDTH: usize = 32;
 const HEIGHT: usize = 32;
 const INPUT_CHANNELS: usize = 3;
-const PHYSICAL_INPUT_CHANNELS: usize = 8;
+const WEIGHT_INPUT_CHANNELS: usize = 8;
 const OUTPUT_CHANNELS: usize = 8;
 const FP16_BYTES: usize = 2;
 const FEATURE_ATOM_BYTES: usize = 16;
 const PAGE_BYTES: usize = 4096;
 
-const INPUT_BYTES: usize = WIDTH * HEIGHT * FEATURE_ATOM_BYTES;
+const INPUT_BYTES: usize = WIDTH * HEIGHT * INPUT_CHANNELS * FP16_BYTES;
 // DPU_DATA_CUBE_CHANNEL/DPU_WDMA_SIZE_0 program 16 physical fp16 channels.
 // They occupy two 16-byte NC1HWC2 surfaces; the eight real outputs are in
 // the first surface and DST_SURF_STRIDE places the second after 0x4000 bytes.
@@ -133,18 +137,18 @@ fn run_vendor_reference_conv(kernels: Kernels) -> Vec<f32> {
     let fd = file.as_raw_fd();
 
     unsafe {
-        let buf_input = Buffer::new(fd, INPUT_BYTES, &file);
+        let buf_input = Buffer::new(fd, page_aligned_size(INPUT_BYTES), &file);
         ptr::write_bytes(buf_input.host_ptr, 0, buf_input.size);
         let input = std::slice::from_raw_parts_mut(
             buf_input.host_ptr as *mut u16,
             INPUT_BYTES / FP16_BYTES,
         );
-        for pixel in input.chunks_exact_mut(PHYSICAL_INPUT_CHANNELS) {
-            pixel[..INPUT_CHANNELS].fill(FP16_ONE);
-        }
+        // The vendor feature DMA consumes three contiguous fp16 values per
+        // NHWC pixel. It performs the physical C8 padding internally.
+        input.fill(FP16_ONE);
 
         let weight_bytes =
-            kernels[0] * kernels[1] * PHYSICAL_INPUT_CHANNELS * OUTPUT_CHANNELS * FP16_BYTES;
+            kernels[0] * kernels[1] * WEIGHT_INPUT_CHANNELS * OUTPUT_CHANNELS * FP16_BYTES;
         let buf_weights = Buffer::new(fd, page_aligned_size(weight_bytes), &file);
         ptr::write_bytes(buf_weights.host_ptr, 0, buf_weights.size);
         let weights =
