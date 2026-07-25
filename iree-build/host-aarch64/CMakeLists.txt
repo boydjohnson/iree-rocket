@@ -8,6 +8,14 @@
 cmake_minimum_required(VERSION 3.16)
 project(rocket_hal_driver_host C CXX ASM)
 
+# iree-src enables testing within its own subtree, but that doesn't propagate
+# to rocket-cts below -- it's added as a *sibling* subdirectory of this
+# project, not nested inside iree-src, and CMake's enable_testing() only
+# cascades from a directory to its own descendants. Without this, rocket-cts's
+# add_test() calls are silently inert: the binaries build, but `ctest -N`
+# finds nothing (no rocket-cts/CTestTestfile.cmake gets generated at all).
+enable_testing()
+
 set(IREE_SOURCE_DIR "${CMAKE_CURRENT_SOURCE_DIR}/../iree-src" CACHE PATH "")
 set(ROCKET_HAL_DRIVER_DIR "${CMAKE_CURRENT_SOURCE_DIR}/../../rocket-hal-driver" CACHE PATH "")
 
