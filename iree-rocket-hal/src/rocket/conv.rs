@@ -10,7 +10,7 @@
 //! multi-core-plan inputs.
 
 use crate::rocket::builders::{
-    DOMAIN_CORE, DOMAIN_DPU, RegCmd, Register, RegisterMeta,
+    Bits, DOMAIN_CORE, DOMAIN_DPU, RegCmd, Register, RegisterMeta,
     cna::{
         CnaCbufCon0, CnaCbufCon1, CnaConvCon1, CnaConvCon2, CnaConvCon3, CnaCvtCon0, CnaCvtCon1,
         CnaCvtCon2, CnaCvtCon3, CnaCvtCon4, CnaCvtCon5, CnaDataSize0, CnaDataSize1, CnaDataSize2,
@@ -50,44 +50,32 @@ pub type Kernels = [usize; 2];
 
 #[derive(Clone, Copy)]
 struct KernelProgramming {
+    // The builder accepts the 10-bit field value. The encoded register
+    // words are therefore 0x210/0x240 because the field starts at bit 4.
     feature_grains: u32,
-    weight_bytes: u32,
-    weight_bytes_per_kernel: u32,
-    weight_size: u32,
+    size: u32,
     padding: u32,
 }
 
 fn kernel_programming(kernels: Kernels) -> KernelProgramming {
     match kernels {
         [1, 1] => KernelProgramming {
-            feature_grains: 0x0000_0210,
-            weight_bytes: 0x0000_0080,
-            weight_bytes_per_kernel: 0x0000_0010,
-            weight_size: 0x0101_0008,
+            feature_grains: 0x21,
+            size: 1,
             padding: 0,
         },
         [3, 3] => KernelProgramming {
-            feature_grains: 0x0000_0240,
-            weight_bytes: 0x0000_0480,
-            weight_bytes_per_kernel: 0x0000_0090,
-            weight_size: 0x0303_0008,
-            padding: 0x0000_0011,
+            feature_grains: 0x24,
+            size: 3,
+            padding: 1,
         },
         _ => panic!("conv_2d only has vendor reference data for 1x1 and 3x3 square kernels"),
     }
 }
 
 #[inline]
-fn register<R: RegisterMeta>(value: u32) -> RegCmd {
-    Register::<R>::from_val(value).build()
-}
-
-macro_rules! push_registers {
-    ($commands:expr; $($register:ty => $value:expr),+ $(,)?) => {
-        $(
-            $commands.push(register::<$register>($value));
-        )+
-    };
+fn zero<R: RegisterMeta>() -> RegCmd {
+    Register::<R>::new().build()
 }
 
 /// Builds the vendor-matching single-core regcmd program for the captured
@@ -102,166 +90,416 @@ macro_rules! push_registers {
 /// 2-3 and 4-6 are alternative two- and three-core height-split programs,
 /// not continuations of this command stream.
 pub fn conv_2d(kernels: Kernels) -> Vec<RegCmd> {
+    const WIDTH: u32 = 32;
+    const HEIGHT: u32 = 32;
+    const INPUT_CHANNELS: u32 = 3;
+    const TASK_INPUT_CHANNELS: u32 = 8;
+    const OUTPUT_CHANNELS: u32 = 8;
+    const TASK_OUTPUT_CHANNELS: u32 = 16;
+    const FP16_PRECISION: u32 = 2;
+    const FP16_BYTES: u32 = 2;
+    const BURST_16: u32 = 15;
+    const OUTPUT_TO_MEMORY: u32 = 0b10;
+    const ARGB_C3: u32 = 10;
+    const WEIGHT_BANKS: u32 = 11;
+    const DATA_BANKS: u32 = 1;
+    const PC_REQUIRED_MARKER: u64 = 0x0041_0000_0000_0000;
+    const PC_KICK_CONV_BLOCKS: u64 = 0x0081_0000_001d_0008;
+
     let kernel = kernel_programming(kernels);
+    let weight_bytes_per_kernel = kernel.size * kernel.size * TASK_INPUT_CHANNELS * FP16_BYTES;
+    let weight_bytes = weight_bytes_per_kernel * OUTPUT_CHANNELS;
     let mut commands = Vec::with_capacity(136);
 
     // CNA preamble, followed by the DPU/DPU_RDMA ping-pong pointers.
-    push_registers!(commands;
-        CnaCbufCon0 => 0x0000_00b1,
-        CnaDcompRegnum => 0,
-        CnaDcompCtrl => 0,
-        CnaConvCon1 => 0x6000_a120,
-        DpuSPointer => 0x0000_000e,
-        DpuRdmaSPointer => 0x0000_000e,
+    let mut cbuf_con0 = Register::<CnaCbufCon0>::new();
+    cbuf_con0
+        .weight_bank(Bits::new(WEIGHT_BANKS))
+        .data_bank(Bits::new(DATA_BANKS));
+    commands.push(cbuf_con0.build());
+    commands.push(zero::<CnaDcompRegnum>());
+    commands.push(zero::<CnaDcompCtrl>());
+
+    let mut conv_con1 = Register::<CnaConvCon1>::new();
+    conv_con1
+        .nonalign_dma(Bits::new(1))
+        .group_line_off(Bits::new(1))
+        .argb_in(Bits::new(ARGB_C3))
+        .proc_precision(Bits::new(FP16_PRECISION))
+        .in_precision(Bits::new(FP16_PRECISION));
+    commands.push(conv_con1.build());
+    commands.push(
+        Register::<DpuSPointer>::new()
+            .pointer_pp_mode(Bits::new(1))
+            .executer_pp_en(Bits::new(1))
+            .pointer_pp_en(Bits::new(1))
+            .build(),
+    );
+    commands.push(
+        Register::<DpuRdmaSPointer>::new()
+            .pointer_pp_mode(Bits::new(1))
+            .executer_pp_en(Bits::new(1))
+            .pointer_pp_en(Bits::new(1))
+            .build(),
     );
 
     // CNA convolution and DMA programming.
-    push_registers!(commands;
-        CnaConvCon1 => 0x6000_a120,
-        CnaConvCon2 => kernel.feature_grains,
-        CnaConvCon3 => 0x0000_0009,
-        CnaDataSize0 => 0x0020_0020,
-        CnaDataSize1 => 0x0002_0008,
-        CnaDataSize2 => 0x0000_0020,
-        CnaDataSize3 => 0x0000_0400,
-        CnaWeightSize0 => kernel.weight_bytes,
-        CnaWeightSize1 => kernel.weight_bytes_per_kernel,
-        CnaWeightSize2 => kernel.weight_size,
-        CnaCbufCon0 => 0x0000_00b1,
-        CnaCbufCon1 => 0x0000_0400,
-        CnaCvtCon0 => 0x0000_000b,
-        CnaCvtCon1 => 0x0001_0000,
-        CnaCvtCon2 => 0x0001_0000,
-        CnaCvtCon3 => 0x0001_0000,
-        CnaCvtCon4 => 0x0001_0000,
-        CnaFcCon0 => 0,
-        CnaFcCon1 => 0,
-        CnaPadCon0 => kernel.padding,
-        CnaFeatureDataAddr => 0,
-        CnaFcCon2 => 0,
-        CnaDmaCon0 => 0x000f_000f,
-        CnaDmaCon1 => 0x0000_0020,
-        CnaDmaCon2 => 0x0000_03e0,
-        CnaFcDataSize0 => 0x0020_0020,
-        CnaFcDataSize1 => 0x0000_0008,
-        CnaDcompCtrl => 0,
-        CnaDcompRegnum => 0,
-        CnaDcompAddr0 => 0,
-        CnaDcompAmount0 => 0,
-        CnaDcompAmount1 => 0,
-        CnaDcompAmount2 => 0,
-        CnaDcompAmount3 => 0,
-        CnaDcompAmount4 => 0,
-        CnaDcompAmount5 => 0,
-        CnaDcompAmount6 => 0,
-        CnaDcompAmount7 => 0,
-        CnaDcompAmount8 => 0,
-        CnaDcompAmount9 => 0,
-        CnaDcompAmount10 => 0,
-        CnaDcompAmount11 => 0,
-        CnaDcompAmount12 => 0,
-        CnaDcompAmount13 => 0,
-        CnaDcompAmount14 => 0,
-        CnaDcompAmount15 => 0,
-        CnaCvtCon5 => 0,
-        CnaPadCon1 => 0,
+    commands.push(conv_con1.build());
+    commands.push(
+        Register::<CnaConvCon2>::new()
+            .feature_grains(Bits::new(kernel.feature_grains))
+            .build(),
     );
+    commands.push(
+        Register::<CnaConvCon3>::new()
+            .conv_x_stride(Bits::new(1))
+            .conv_y_stride(Bits::new(1))
+            .build(),
+    );
+    commands.push(
+        Register::<CnaDataSize0>::new()
+            .datain_width(Bits::new(WIDTH))
+            .datain_height(Bits::new(HEIGHT))
+            .build(),
+    );
+    commands.push(
+        Register::<CnaDataSize1>::new()
+            .datain_channel_real(Bits::new(INPUT_CHANNELS - 1))
+            .datain_channel(Bits::new(TASK_INPUT_CHANNELS))
+            .build(),
+    );
+    commands.push(
+        Register::<CnaDataSize2>::new()
+            .dataout_width(Bits::new(WIDTH))
+            .build(),
+    );
+    commands.push(
+        Register::<CnaDataSize3>::new()
+            .dataout_atomics(Bits::new(WIDTH * HEIGHT))
+            .build(),
+    );
+    commands.push(
+        Register::<CnaWeightSize0>::new()
+            .weight_bytes(Bits::new(weight_bytes))
+            .build(),
+    );
+    commands.push(
+        Register::<CnaWeightSize1>::new()
+            .weight_bytes_per_kernel(Bits::new(weight_bytes_per_kernel))
+            .build(),
+    );
+    commands.push(
+        Register::<CnaWeightSize2>::new()
+            .weight_width(Bits::new(kernel.size))
+            .weight_height(Bits::new(kernel.size))
+            .weight_kernels(Bits::new(OUTPUT_CHANNELS))
+            .build(),
+    );
+    commands.push(cbuf_con0.build());
+    commands.push(
+        Register::<CnaCbufCon1>::new()
+            .data_entries(Bits::new(WIDTH * HEIGHT))
+            .build(),
+    );
+    commands.push(
+        Register::<CnaCvtCon0>::new()
+            .data_sign(Bits::new(1))
+            .cvt_type(Bits::new(1))
+            .cvt_bypass(Bits::new(1))
+            .build(),
+    );
+    commands.push(
+        Register::<CnaCvtCon1>::new()
+            .cvt_scale0(Bits::new(1))
+            .build(),
+    );
+    commands.push(
+        Register::<CnaCvtCon2>::new()
+            .cvt_scale1(Bits::new(1))
+            .build(),
+    );
+    commands.push(
+        Register::<CnaCvtCon3>::new()
+            .cvt_scale2(Bits::new(1))
+            .build(),
+    );
+    commands.push(
+        Register::<CnaCvtCon4>::new()
+            .cvt_scale3(Bits::new(1))
+            .build(),
+    );
+    commands.push(zero::<CnaFcCon0>());
+    commands.push(zero::<CnaFcCon1>());
+    commands.push(
+        Register::<CnaPadCon0>::new()
+            .pad_top(Bits::new(kernel.padding))
+            .pad_left(Bits::new(kernel.padding))
+            .build(),
+    );
+    commands.push(zero::<CnaFeatureDataAddr>());
+    commands.push(zero::<CnaFcCon2>());
+    commands.push(
+        Register::<CnaDmaCon0>::new()
+            .data_burst_len(Bits::new(BURST_16))
+            .weight_burst_len(Bits::new(BURST_16))
+            .build(),
+    );
+    commands.push(
+        Register::<CnaDmaCon1>::new()
+            .line_stride(Bits::new(WIDTH))
+            .build(),
+    );
+    commands.push(
+        Register::<CnaDmaCon2>::new()
+            .surf_stride(Bits::new(WIDTH * (HEIGHT - 1)))
+            .build(),
+    );
+    commands.push(
+        Register::<CnaFcDataSize0>::new()
+            .dma_width(Bits::new(WIDTH))
+            .dma_height(Bits::new(HEIGHT))
+            .build(),
+    );
+    commands.push(
+        Register::<CnaFcDataSize1>::new()
+            .dma_channel(Bits::new(TASK_INPUT_CHANNELS))
+            .build(),
+    );
+    commands.push(zero::<CnaDcompCtrl>());
+    commands.push(zero::<CnaDcompRegnum>());
+    commands.push(zero::<CnaDcompAddr0>());
+    commands.push(zero::<CnaDcompAmount0>());
+    commands.push(zero::<CnaDcompAmount1>());
+    commands.push(zero::<CnaDcompAmount2>());
+    commands.push(zero::<CnaDcompAmount3>());
+    commands.push(zero::<CnaDcompAmount4>());
+    commands.push(zero::<CnaDcompAmount5>());
+    commands.push(zero::<CnaDcompAmount6>());
+    commands.push(zero::<CnaDcompAmount7>());
+    commands.push(zero::<CnaDcompAmount8>());
+    commands.push(zero::<CnaDcompAmount9>());
+    commands.push(zero::<CnaDcompAmount10>());
+    commands.push(zero::<CnaDcompAmount11>());
+    commands.push(zero::<CnaDcompAmount12>());
+    commands.push(zero::<CnaDcompAmount13>());
+    commands.push(zero::<CnaDcompAmount14>());
+    commands.push(zero::<CnaDcompAmount15>());
+    commands.push(zero::<CnaCvtCon5>());
+    commands.push(zero::<CnaPadCon1>());
 
     // CORE. Offset 0x3030 is present in the vendor stream but is absent
     // from registers.xml/rkt_registers.h, so it cannot use a typed builder.
-    push_registers!(commands;
-        CoreMiscCfg => 0x0000_0200,
-        CoreDataoutSize0 => 0x001f_001f,
-        CoreDataoutSize1 => 0x0000_000f,
-        CoreClipTruncate => 0,
+    commands.push(
+        Register::<CoreMiscCfg>::new()
+            .proc_precision(Bits::new(FP16_PRECISION))
+            .build(),
     );
+    commands.push(
+        Register::<CoreDataoutSize0>::new()
+            .dataout_width(Bits::new(WIDTH - 1))
+            .dataout_height(Bits::new(HEIGHT - 1))
+            .build(),
+    );
+    commands.push(
+        Register::<CoreDataoutSize1>::new()
+            .dataout_channel(Bits::new(TASK_OUTPUT_CHANNELS - 1))
+            .build(),
+    );
+    commands.push(zero::<CoreClipTruncate>());
     commands.push(RegCmd::new(DOMAIN_CORE, 0x3030, 0));
 
     // DPU output, conversion, and disabled LUT programming.
-    push_registers!(commands;
-        DpuFeatureModeCfg => 0x0000_01e4,
-        DpuDataFormat => 0x4800_0002,
-        DpuOffsetPend => 0,
-        DpuDstBaseAddr => 0,
-        DpuDstSurfStride => 0x0000_4000,
-        DpuDataCubeWidth => 0x0000_001f,
-        DpuDataCubeHeight => 0x0000_001f,
-        DpuDataCubeNotchAddr => 0,
-        DpuDataCubeChannel => 0x0007_000f,
-        DpuBsCfg => 0x0002_0150,
-        DpuBsAluCfg => 0,
-        DpuBsMulCfg => 0,
-        DpuBsReluxCmpValue => 0,
-        DpuBsOwCfg => 0x0000_0126,
-        DpuBsOwOp => 0,
-        DpuWdmaSize0 => 0x0000_000f,
-        DpuWdmaSize1 => 0x001f_001f,
-        DpuBnCfg => 0x0000_0053,
-        DpuBnAluCfg => 0,
-        DpuBnMulCfg => 0,
-        DpuBnReluxCmpValue => 0,
-        DpuEwCfg => 0x0000_0383,
-        DpuEwCvtOffsetValue => 0,
-        DpuEwCvtScaleValue => 1,
-        DpuEwReluxCmpValue => 0,
-        DpuOutCvtOffset => 0,
-        DpuOutCvtScale => 0x0001_0001,
-        DpuOutCvtShift => 0,
-        DpuEwOpValue0 => 0,
-        DpuEwOpValue1 => 0,
-        DpuEwOpValue2 => 0,
-        DpuEwOpValue3 => 0,
-        DpuEwOpValue4 => 0,
-        DpuEwOpValue5 => 0,
-        DpuEwOpValue6 => 0,
-        DpuEwOpValue7 => 0,
-        DpuSurfaceAdd => 0x0000_8000,
+    commands.push(
+        Register::<DpuFeatureModeCfg>::new()
+            .burst_len(Bits::new(BURST_16))
+            .output_mode(Bits::new(OUTPUT_TO_MEMORY))
+            .build(),
+    );
+    commands.push(
+        Register::<DpuDataFormat>::new()
+            .in_precision(Bits::new(FP16_PRECISION))
+            .out_precision(Bits::new(FP16_PRECISION))
+            .proc_precision(Bits::new(FP16_PRECISION))
+            .build(),
+    );
+    commands.push(zero::<DpuOffsetPend>());
+    commands.push(zero::<DpuDstBaseAddr>());
+    commands.push(
+        Register::<DpuDstSurfStride>::new()
+            .dst_surf_stride(Bits::new(WIDTH * HEIGHT))
+            .build(),
+    );
+    commands.push(
+        Register::<DpuDataCubeWidth>::new()
+            .width(Bits::new(WIDTH - 1))
+            .build(),
+    );
+    commands.push(
+        Register::<DpuDataCubeHeight>::new()
+            .height(Bits::new(HEIGHT - 1))
+            .build(),
+    );
+    commands.push(zero::<DpuDataCubeNotchAddr>());
+    commands.push(
+        Register::<DpuDataCubeChannel>::new()
+            .orig_channel(Bits::new(OUTPUT_CHANNELS - 1))
+            .channel(Bits::new(TASK_OUTPUT_CHANNELS - 1))
+            .build(),
+    );
+    commands.push(
+        Register::<DpuBsCfg>::new()
+            .bs_alu_algo(Bits::new(2))
+            .bs_alu_src(Bits::new(1))
+            .bs_relu_bypass(Bits::new(1))
+            .bs_mul_bypass(Bits::new(1))
+            .build(),
+    );
+    commands.push(zero::<DpuBsAluCfg>());
+    commands.push(zero::<DpuBsMulCfg>());
+    commands.push(zero::<DpuBsReluxCmpValue>());
+    commands.push(
+        Register::<DpuBsOwCfg>::new()
+            .size_e_0(Bits::new(1))
+            .size_e_1(Bits::new(1))
+            .size_e_2(Bits::new(1))
+            .od_bypass(Bits::new(1))
+            .build(),
+    );
+    commands.push(zero::<DpuBsOwOp>());
+    commands.push(
+        Register::<DpuWdmaSize0>::new()
+            .channel_wdma(Bits::new(TASK_OUTPUT_CHANNELS - 1))
+            .build(),
+    );
+    commands.push(
+        Register::<DpuWdmaSize1>::new()
+            .height_wdma(Bits::new(HEIGHT - 1))
+            .width_wdma(Bits::new(WIDTH - 1))
+            .build(),
+    );
+    commands.push(
+        Register::<DpuBnCfg>::new()
+            .bn_relu_bypass(Bits::new(1))
+            .bn_mul_bypass(Bits::new(1))
+            .bn_alu_bypass(Bits::new(1))
+            .bn_bypass(Bits::new(1))
+            .build(),
+    );
+    commands.push(zero::<DpuBnAluCfg>());
+    commands.push(zero::<DpuBnMulCfg>());
+    commands.push(zero::<DpuBnReluxCmpValue>());
+    commands.push(
+        Register::<DpuEwCfg>::new()
+            .ew_relu_bypass(Bits::new(1))
+            .ew_op_cvt_bypass(Bits::new(1))
+            .ew_lut_bypass(Bits::new(1))
+            .ew_op_bypass(Bits::new(1))
+            .ew_bypass(Bits::new(1))
+            .build(),
+    );
+    commands.push(zero::<DpuEwCvtOffsetValue>());
+    commands.push(
+        Register::<DpuEwCvtScaleValue>::new()
+            .ew_op_cvt_scale(Bits::new(1))
+            .build(),
+    );
+    commands.push(zero::<DpuEwReluxCmpValue>());
+    commands.push(zero::<DpuOutCvtOffset>());
+    commands.push(
+        Register::<DpuOutCvtScale>::new()
+            .fp32tofp16_en(Bits::new(1))
+            .out_cvt_scale(Bits::new(1))
+            .build(),
+    );
+    commands.push(zero::<DpuOutCvtShift>());
+    commands.push(zero::<DpuEwOpValue0>());
+    commands.push(zero::<DpuEwOpValue1>());
+    commands.push(zero::<DpuEwOpValue2>());
+    commands.push(zero::<DpuEwOpValue3>());
+    commands.push(zero::<DpuEwOpValue4>());
+    commands.push(zero::<DpuEwOpValue5>());
+    commands.push(zero::<DpuEwOpValue6>());
+    commands.push(zero::<DpuEwOpValue7>());
+    commands.push(
+        Register::<DpuSurfaceAdd>::new()
+            .surf_add(Bits::new(WIDTH * HEIGHT * FP16_BYTES))
+            .build(),
     );
     // Like CORE 0x3030, DPU 0x40c4 has no generated register definition.
     commands.push(RegCmd::new(DOMAIN_DPU, 0x40c4, 0));
-    push_registers!(commands;
-        DpuLutAccessCfg => 0,
-        DpuLutAccessData => 0,
-        DpuLutCfg => 0,
-        DpuLutInfo => 0,
-        DpuLutLeStart => 0,
-        DpuLutLeEnd => 0,
-        DpuLutLoStart => 0,
-        DpuLutLoEnd => 0,
-        DpuLutLeSlopeScale => 0,
-        DpuLutLeSlopeShift => 0,
-        DpuLutLoSlopeScale => 0,
-        DpuLutLoSlopeShift => 0,
-    );
+    commands.push(zero::<DpuLutAccessCfg>());
+    commands.push(zero::<DpuLutAccessData>());
+    commands.push(zero::<DpuLutCfg>());
+    commands.push(zero::<DpuLutInfo>());
+    commands.push(zero::<DpuLutLeStart>());
+    commands.push(zero::<DpuLutLeEnd>());
+    commands.push(zero::<DpuLutLoStart>());
+    commands.push(zero::<DpuLutLoEnd>());
+    commands.push(zero::<DpuLutLeSlopeScale>());
+    commands.push(zero::<DpuLutLeSlopeShift>());
+    commands.push(zero::<DpuLutLoSlopeScale>());
+    commands.push(zero::<DpuLutLoSlopeShift>());
 
     // DPU_RDMA. The main feature path is disabled because CNA/CORE feed
     // DPU directly; BRDMA supplies the bias data.
-    push_registers!(commands;
-        DpuRdmaDataCubeWidth => 0x0000_001f,
-        DpuRdmaDataCubeHeight => 0x0000_001f,
-        DpuRdmaDataCubeChannel => 0x0000_000f,
-        DpuRdmaSrcBaseAddr => 0,
-        DpuRdmaBrdmaCfg => 0x0000_0002,
-        DpuRdmaBsBaseAddr => 0,
-        DpuRdmaNrdmaCfg => 0,
-        DpuRdmaBnBaseAddr => 0,
-        DpuRdmaErdmaCfg => 1,
-        DpuRdmaEwBaseAddr => 0,
-        DpuRdmaEwSurfStride => 0,
-        DpuRdmaFeatureModeCfg => 0x0001_7850,
-        DpuRdmaSrcDmaCfg => 0,
-        DpuRdmaSurfNotch => 0,
-        DpuRdmaPadCfg => 0,
-        DpuRdmaWeight => 0x0101_0101,
-        DpuRdmaEwSurfNotch => 0,
+    commands.push(
+        Register::<DpuRdmaDataCubeWidth>::new()
+            .width(Bits::new(WIDTH - 1))
+            .build(),
     );
+    commands.push(
+        Register::<DpuRdmaDataCubeHeight>::new()
+            .height(Bits::new(HEIGHT - 1))
+            .build(),
+    );
+    commands.push(
+        Register::<DpuRdmaDataCubeChannel>::new()
+            .channel(Bits::new(TASK_OUTPUT_CHANNELS - 1))
+            .build(),
+    );
+    commands.push(zero::<DpuRdmaSrcBaseAddr>());
+    commands.push(
+        Register::<DpuRdmaBrdmaCfg>::new()
+            .brdma_data_use(Bits::new(1))
+            .build(),
+    );
+    commands.push(zero::<DpuRdmaBsBaseAddr>());
+    commands.push(zero::<DpuRdmaNrdmaCfg>());
+    commands.push(zero::<DpuRdmaBnBaseAddr>());
+    commands.push(
+        Register::<DpuRdmaErdmaCfg>::new()
+            .erdma_disable(Bits::new(1))
+            .build(),
+    );
+    commands.push(zero::<DpuRdmaEwBaseAddr>());
+    commands.push(zero::<DpuRdmaEwSurfStride>());
+    commands.push(
+        Register::<DpuRdmaFeatureModeCfg>::new()
+            .burst_len(Bits::new(BURST_16))
+            .mrdma_disable(Bits::new(1))
+            .in_precision(Bits::new(FP16_PRECISION))
+            .proc_precision(Bits::new(FP16_PRECISION))
+            .build(),
+    );
+    commands.push(zero::<DpuRdmaSrcDmaCfg>());
+    commands.push(zero::<DpuRdmaSurfNotch>());
+    commands.push(zero::<DpuRdmaPadCfg>());
+    commands.push(
+        Register::<DpuRdmaWeight>::new()
+            .e_weight(Bits::new(1))
+            .n_weight(Bits::new(1))
+            .b_weight(Bits::new(1))
+            .m_weight(Bits::new(1))
+            .build(),
+    );
+    commands.push(zero::<DpuRdmaEwSurfNotch>());
 
     // Vendor PC trailer: placeholder, zero register count, required marker,
     // combined operation-enable mask, and six words of alignment padding.
     commands.push(RegCmd::new_raw(0));
-    commands.push(register::<PCRegisterAmounts>(0));
-    commands.push(RegCmd::new_raw(0x0041_0000_0000_0000));
-    commands.push(RegCmd::new_raw(0x0081_0000_001d_0008));
+    commands.push(zero::<PCRegisterAmounts>());
+    commands.push(RegCmd::new_raw(PC_REQUIRED_MARKER));
+    commands.push(RegCmd::new_raw(PC_KICK_CONV_BLOCKS));
     commands.extend((0..6).map(|_| RegCmd::new_raw(0)));
 
     debug_assert_eq!(commands.len(), 136);
