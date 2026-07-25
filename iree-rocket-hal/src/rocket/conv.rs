@@ -44,27 +44,56 @@
 //! finished". That is the actual latency win -- register fetch for tile N+1
 //! overlaps tile N's compute.
 //!
-//! # What this crate already programs, and what it doesn't
+//! # Who programs ping-pong: the driver already does
 //!
-//! Ping-pong is *half*-configured today, which is easy to miss:
+//! **[`PointerMode`] has been hardware-tested and makes no difference.**
+//! Keeping it, and this explanation, because the reason is worth knowing.
+//!
+//! Within this crate, ping-pong looks half-configured:
 //! `build_conv_cna_core_dpu_dpu_rdma` emits `DPU_S_POINTER` and
 //! `DPU_RDMA_S_POINTER` with `pointer_pp_en`, `executer_pp_en` and
 //! `pointer_pp_mode=1` all set (`regcmd.rs`, immediately after
 //! `CNA_CONV_CON1` -- a faithful port of Mesa, which sets them
-//! unconditionally). `CNA_S_POINTER` and `CORE_S_POINTER` are never written
-//! by anything in this crate, so those two blocks sit at reset: group 0,
-//! ping-pong disabled. `PC_TASK_CON` is never written either, so
-//! `task_number` stays 0 no matter how many tasks a job carries.
+//! unconditionally), while nothing here ever writes `CNA_S_POINTER` or
+//! `CORE_S_POINTER`.
 //!
-//! So across a multi-task job the two DPU-side blocks are told to advance
-//! their register group per task while CNA and CORE keep reprogramming
-//! group 0. That asymmetry is the leading suspect for the "task 0 rows
-//! correct, every later row zero" result recorded in `regcmd.rs`'s
-//! `link_regcmd_tasks` doc comment. [`PointerMode`] is the knob for
-//! testing it: [`PointerMode::Off`] leaves the payload exactly as it is
-//! today (the control), [`PointerMode::AutoToggle`] brings CNA and CORE
-//! into the same armed state, and [`PointerMode::ExplicitPerTask`] takes
-//! the pointer away from hardware in all four blocks.
+//! But the *kernel* fills that gap. Mainline `rocket_job.c`'s
+//! `rocket_job_hw_submit()` writes, over AHB, before every single task's
+//! kick:
+//!
+//! ```text
+//! rocket_cna_writel(core, S_POINTER, CNA_S_POINTER_POINTER_PP_EN(1) |
+//!                    CNA_S_POINTER_EXECUTER_PP_EN(1) |
+//!                    CNA_S_POINTER_POINTER_PP_MODE(1) | extra_bit);
+//! rocket_core_writel(core, S_POINTER, CORE_S_POINTER_POINTER_PP_EN(1) |
+//!                     CORE_S_POINTER_EXECUTER_PP_EN(1) |
+//!                     CORE_S_POINTER_POINTER_PP_MODE(1) | extra_bit);
+//! ```
+//!
+//! (`extra_bit = 0x10000000 * core->index`, a reserved-bit core selector
+//! not documented in the TRM.) So all four blocks are already armed
+//! identically before this module writes anything, which is exactly why
+//! [`PointerMode::Off`], [`PointerMode::AutoToggle`] and
+//! [`PointerMode::ExplicitPerTask`] produced identical hardware results:
+//! nothing here was ever the deciding factor.
+//!
+//! Note also that the driver's value leaves the `pointer` field itself at
+//! 0, re-selecting group 0 on every task -- so whatever advances a group
+//! between tasks, it is not a pointer the driver preserves.
+//!
+//! `PC_TASK_CON` is likewise the driver's, and it hardcodes **one** task
+//! per kick:
+//!
+//! ```text
+//! rocket_pc_writel(core, TASK_CON, PC_TASK_CON_RESERVED_0(1) |
+//!                   PC_TASK_CON_TASK_COUNT_CLEAR(1) |
+//!                   PC_TASK_CON_TASK_NUMBER(1) |
+//!                   PC_TASK_CON_TASK_PP_EN(1));
+//! ```
+//!
+//! That is the load-bearing constraint on everything below: the driver's
+//! design is one PC task per kernel task, re-kicked from each task's
+//! completion IRQ -- not one PC run walking a chain.
 //!
 //! # Two ways to run the sequence
 //!
@@ -80,17 +109,37 @@
 //! - **hardware-walked**: [`link_tiled_conv_regcmds`] patches each tile's
 //!   trailing `PC_BASE_ADDRESS`/`PC_REGISTER_AMOUNTS` pair to point at the
 //!   *next* tile's regcmd buffer, then the caller submits **only tile 0**
-//!   as a single-task job. The PC follows the embedded chain for the rest.
-//!   This is the configuration ping-pong is actually for, and the one whose
-//!   interrupt behavior (`pc_interrupt_mask` "sets the masking that applies
-//!   to the last task in the running group", chapter36.txt:93-94 as
-//!   documented in `builders/pc.rs`) means one completion IRQ for the whole
-//!   chain.
+//!   as a single-task job. The PC would follow the embedded chain for the
+//!   rest, raising one completion IRQ for the whole run
+//!   (`pc_interrupt_mask` "sets the masking that applies to the last task
+//!   in the running group", chapter36.txt:93-94 as documented in
+//!   `builders/pc.rs`).
 //!
-//! Neither multi-tile path is hardware-validated yet -- that is what
-//! `tests/tiled_conv_hw.rs` is for. The single-tile path degenerates to
-//! exactly what `build_conv_regcmd` already emits (plus an optional
-//! `S_POINTER`/`PC_TASK_CON` preamble), so it is the cheap sanity anchor.
+//!   **This cannot work through the mainline driver as it stands**, and the
+//!   hardware run agrees (only tile 0's rows landed, identically for both
+//!   [`RegisterAmount`] encodings). `rocket_job_hw_submit()` writes
+//!   `PC_TASK_CON` with `TASK_NUMBER(1)` and `TASK_COUNT_CLEAR(1)` on every
+//!   kick, so the PC is told there is exactly one task to run. A tile 0
+//!   regcmd that raises `task_number` is fetched *after* that write, i.e.
+//!   after the run it would need to describe has already started. Making
+//!   this path real needs a driver change (pass the job's task count
+//!   through to `PC_TASK_CON`), not a regcmd change; it is kept here
+//!   because the emission side is ready for that driver, and because it
+//!   cleanly rules the chain out as an explanation for anything else.
+//!
+//! # Hardware status (`tests/tiled_conv_hw.rs`, real RK3588)
+//!
+//! - one tile, and row tiles as one DRM job each: **correct**, exact
+//!   against a position-dependent oracle;
+//! - row tiles as multiple tasks in one job: **tile 0's rows correct, every
+//!   later row zero**, identically across all three [`PointerMode`]s and
+//!   both [`RegisterAmount`]s.
+//!
+//! The fence *is* signaled rather than timing out, and the driver only
+//! signals `done_fence` once `next_task_idx == task_count`, so every task
+//! was submitted -- the later tiles run and produce nothing, rather than
+//! never being dispatched. Root cause still open; see that file's
+//! diagnostic tests.
 
 use crate::rocket::{
     builders::{
@@ -724,31 +773,56 @@ pub fn build_tiled_conv_regcmds(
 /// What value a chained tile's `PC_REGISTER_AMOUNTS` link should carry for
 /// its successor.
 ///
-/// This is an unresolved unit question, and it is worth being explicit
-/// about rather than burying. `drm_rocket_task.regcmd_count` is documented
-/// as "number of commands in the register command buffer"
-/// (`vendor/linux-headers/drm/rocket_accel.h`), i.e. 64-bit words, and the
-/// kernel converts it to whatever `PC_REGISTER_AMOUNTS.pc_data_amount`
-/// actually wants before writing the register. A regcmd-embedded write
-/// bypasses that conversion entirely and must carry the register-level
-/// value -- so the word count the kernel is handed and the number a link
-/// needs are not necessarily the same number, and this crate has never had
-/// a working chained run to tell them apart.
+/// `drm_rocket_task.regcmd_count` is documented as "number of commands in
+/// the register command buffer" (`vendor/linux-headers/drm/rocket_accel.h`),
+/// i.e. 64-bit words, and the kernel converts that to the register's own
+/// units before writing it. A regcmd-embedded link bypasses the conversion
+/// and must carry the already-converted value, so the two are different
+/// numbers.
 ///
-/// Both candidates are therefore selectable, so a hardware run can
-/// distinguish them instead of a guess being baked in.
+/// [`Self::Driver`] is that conversion, read off `rocket_job_hw_submit()`,
+/// and is the only one of these with any authority. The other two are the
+/// guesses that predated finding it, kept only so the hardware tests that
+/// ran against them stay reproducible.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Default)]
 pub enum RegisterAmount {
-    /// `regcmd::link_regcmd_tasks`' existing formula, `(words / 2)` rounded
-    /// up to even -- inherited from Mesa's own patching and never validated
-    /// on hardware. The default only because it is the incumbent.
+    /// The kernel's own formula, verbatim from `rocket_job_hw_submit()`:
+    ///
+    /// ```text
+    /// rocket_pc_writel(core, REGISTER_AMOUNTS,
+    ///     PC_REGISTER_AMOUNTS_PC_DATA_AMOUNT((task->regcmd_count + 1) / 2 - 1));
+    /// ```
+    ///
+    /// So the register counts *pairs* of 64-bit words, less one -- a
+    /// 128-word tile is 63, not 128 and not 64. Underflows for a 0-word
+    /// task, which cannot occur here (every tile carries a payload).
     #[default]
+    Driver,
+    /// `regcmd::link_regcmd_tasks`' pre-existing formula, `(words / 2)`
+    /// rounded up to even. Inherited from Mesa-era patching; now known to
+    /// be off by one against [`Self::Driver`] even where it rounds to the
+    /// same pair count.
     MesaHalvedEven,
-    /// The successor's raw 64-bit-word count: the same number this crate
-    /// hands the kernel as `regcmd_count` for a task it submits directly
-    /// (which does work), on the theory that the register wants word counts
-    /// and the driver passes them through unscaled.
+    /// The successor's raw 64-bit-word count -- the number handed to the
+    /// kernel as `regcmd_count`, on the since-disproved theory that the
+    /// driver passed it through unscaled.
     KernelWordCount,
+}
+
+/// `PC_REGISTER_AMOUNTS.pc_data_amount` for a regcmd of `words` 64-bit
+/// commands, as the kernel computes it:
+///
+/// ```text
+/// PC_REGISTER_AMOUNTS_PC_DATA_AMOUNT((task->regcmd_count + 1) / 2 - 1)
+/// ```
+///
+/// Spelled the same way as `rocket_job_hw_submit()` rather than as
+/// `words.div_ceil(2) - 1` so it reads identically to the C it is taken
+/// from. Panics (debug) / wraps (release) at `words == 0`, matching the
+/// kernel's own lack of a guard; every tile here carries a payload.
+#[allow(clippy::manual_div_ceil)]
+pub fn driver_register_amount(words: u32) -> u32 {
+    (words + 1) / 2 - 1
 }
 
 /// Patches each tile's trailing PC link to point at the next tile's regcmd
@@ -767,7 +841,7 @@ pub fn link_tiled_conv_regcmds(
         // Same trailer format, so the incumbent formula stays in one place
         // rather than being reimplemented here.
         RegisterAmount::MesaHalvedEven => link_regcmd_tasks(tasks, task_dma_addresses),
-        RegisterAmount::KernelWordCount => {
+        RegisterAmount::Driver | RegisterAmount::KernelWordCount => {
             if tasks.len() != task_dma_addresses.len() {
                 return Err("regcmd task and DMA-address counts differ");
             }
@@ -781,9 +855,14 @@ pub fn link_tiled_conv_regcmds(
             let word_counts = tasks
                 .iter()
                 .map(|commands| {
-                    u32::try_from(commands.len()).map_err(|_| "regcmd word count exceeds u32")
+                    let words = u32::try_from(commands.len())
+                        .map_err(|_| "regcmd word count exceeds u32")?;
+                    Ok(match amount {
+                        RegisterAmount::Driver => driver_register_amount(words),
+                        _ => words,
+                    })
                 })
-                .collect::<Result<Vec<_>, _>>()?;
+                .collect::<Result<Vec<_>, &'static str>>()?;
             for index in 0..tasks.len() - 1 {
                 let trailer = trailers[index];
                 tasks[index][trailer] = RegCmd::new(
@@ -1288,12 +1367,28 @@ mod tests {
         }
     }
 
+    /// Independent check of the kernel's amount formula against numbers
+    /// worked by hand, so the helper isn't only ever compared to itself:
+    /// this module's tiles are 128 words (and tile 0 is 134), which the
+    /// register wants as pair-counts-less-one, not word counts.
+    #[test]
+    fn driver_register_amount_counts_word_pairs_less_one() {
+        assert_eq!(driver_register_amount(128), 63);
+        assert_eq!(driver_register_amount(134), 66);
+        assert_eq!(driver_register_amount(2), 0);
+        // The value this supersedes, for contrast: `link_regcmd_tasks`'
+        // formula on a 124-word payload yields 62, one short of the 63 a
+        // 128-word task really needs.
+        assert_eq!((124 / 2u32).next_multiple_of(2), 62);
+    }
+
     /// A hardware-walked chain needs every tile but the last pointing at
     /// its successor's command buffer, under either amount convention.
     #[test]
     fn linking_chains_each_tile_to_its_successor() {
         let addresses = [0x1000_0000u32, 0x1000_1000, 0x1000_2000];
         for amount in [
+            RegisterAmount::Driver,
             RegisterAmount::MesaHalvedEven,
             RegisterAmount::KernelWordCount,
         ] {
@@ -1324,6 +1419,9 @@ mod tests {
                     0
                 } else {
                     match amount {
+                        RegisterAmount::Driver => {
+                            driver_register_amount(word_counts[index + 1] as u32)
+                        }
                         RegisterAmount::MesaHalvedEven => {
                             (trailers[index + 1] / 2).next_multiple_of(2) as u32
                         }
@@ -1349,6 +1447,7 @@ mod tests {
         .unwrap();
         let mut tasks = build_tiled_conv_regcmds(&plan, &buffers()).unwrap();
         for amount in [
+            RegisterAmount::Driver,
             RegisterAmount::MesaHalvedEven,
             RegisterAmount::KernelWordCount,
         ] {

@@ -27,19 +27,34 @@
 //!
 //! So every test here runs the *same tensor with the same oracle* and
 //! varies only how the task sequence is dispatched and how the ping-pong
-//! registers are programmed. A failure is then attributable:
+//! registers are programmed.
 //!
-//! | test | dispatch | ping-pong | what a failure means |
-//! |---|---|---|---|
-//! | `single_tile_matches_the_oracle` | one job | armed | `conv.rs`'s tiling/emission is broken independently of everything else |
-//! | `row_tiles_as_separate_jobs_match_the_oracle` | job per tile | armed | caller-driven row tiling (as opposed to CBUF-driven splits) is wrong |
-//! | `row_tiles_as_kernel_tasks_without_ping_pong` | one job, N tasks | off | reproduces the known failure -- expected to fail until the mechanism is understood |
-//! | `row_tiles_as_kernel_tasks_with_ping_pong` | one job, N tasks | armed | CNA/CORE arming alone doesn't fix the kernel-walked path |
-//! | `row_tiles_as_hardware_chain_*` | one task, PC-walked chain | armed | the PC's own task walk or the `PC_REGISTER_AMOUNTS` unit is wrong |
+//! # Results so far (real RK3588)
 //!
-//! The two `hardware_chain` variants differ only in
-//! [`RegisterAmount`] -- see its doc comment for why that unit is an open
-//! question rather than a settled one.
+//! | test | dispatch | result |
+//! |---|---|---|
+//! | `single_tile_matches_the_oracle` | one job, one tile | **pass** |
+//! | `row_tiles_as_separate_jobs_match_the_oracle` | job per tile | **pass** |
+//! | `row_tiles_as_kernel_tasks_without_ping_pong` | one job, 3 tasks | fail: rows 38..=111 zero |
+//! | `row_tiles_as_kernel_tasks_with_ping_pong` | one job, 3 tasks | fail: identical |
+//! | `row_tiles_as_kernel_tasks_with_explicit_pointers` | one job, 3 tasks | fail: identical |
+//! | `row_tiles_as_hardware_chain_*` | one task, PC-walked chain | fail: identical |
+//!
+//! Two conclusions worth keeping in front of anyone reading this file:
+//!
+//! **Ping-pong programming is not the variable.** All three
+//! [`PointerMode`]s give byte-identical results, and `separate_jobs`
+//! (passes) and `kernel_tasks` (fails) submit *byte-identical command
+//! buffers*. The difference between pass and fail contains no regcmd
+//! content at all. `rocket_job.c` also arms CNA/CORE `S_POINTER` itself
+//! before every task, so this crate was never the deciding factor -- see
+//! `conv.rs`'s module doc.
+//!
+//! **The later tasks are dispatched, and they do run.** The driver signals
+//! `done_fence` only once `next_task_idx == task_count`, and the failing
+//! runs' `prep_bo` returns successfully rather than timing out. So the
+//! remaining question is why a task that runs writes nothing -- which is
+//! what the diagnostics section below narrows.
 
 use std::{
     fs::OpenOptions,
@@ -154,6 +169,16 @@ fn page_aligned(byte_len: usize) -> usize {
     byte_len.max(1).next_multiple_of(4096)
 }
 
+/// Order the tiles are handed to the kernel in. Tiles read disjoint input
+/// rows and write disjoint output rows (1x1 kernel, no halo), so a correct
+/// implementation produces the identical tensor either way -- which makes
+/// `Reversed` a clean probe for *position*-dependent failure.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Order {
+    Forward,
+    Reversed,
+}
+
 /// How the tile sequence reaches the hardware. See this file's doc comment
 /// table for what each one isolates.
 #[derive(Clone, Copy, Debug)]
@@ -162,18 +187,24 @@ enum Dispatch {
     /// submitted. The arrangement `conv_hw.rs` found working; ping-pong buys
     /// nothing here, since the PC is re-kicked from scratch every time.
     SeparateJobs,
-    /// All tiles as one job's task array. Mainline `rocket_job.c` dispatches
-    /// task N+1 from task N's completion IRQ.
-    KernelTasks,
+    /// All tiles as one job's task array. `rocket_job.c` dispatches task N+1
+    /// from task N's completion IRQ and only signals the job's `done_fence`
+    /// once `next_task_idx == task_count`.
+    KernelTasks(Order),
     /// Only tile 0 submitted; its regcmd's trailing PC link points at tile
-    /// 1, and so on. The PC walks the chain itself -- the configuration
-    /// ping-pong is actually for.
+    /// 1, and so on. Cannot work through the mainline driver, which pins
+    /// `PC_TASK_CON.task_number` to 1 -- see `conv::RegisterAmount` and
+    /// `conv.rs`'s module doc.
     HardwareChain(RegisterAmount),
 }
 
 struct Run {
     /// Output decoded to dense NHWC order.
     output: Vec<f32>,
+    /// The same buffer re-fenced and re-decoded after a settling delay, when
+    /// one was requested. Distinguishes "the later tiles never wrote" from
+    /// "they wrote after the CPU looked".
+    output_after_settle: Option<Vec<f32>>,
     /// Submit-to-completion wall clock, summed across jobs for
     /// `SeparateJobs`.
     elapsed: Duration,
@@ -199,6 +230,23 @@ fn run_tiled_conv(
     tiling: Tiling,
     ping_pong: PingPong,
     dispatch: Dispatch,
+) -> Run {
+    run_tiled_conv_settling(shape, tiling, ping_pong, dispatch, None)
+}
+
+/// As [`run_tiled_conv`], but when `settle` is set, the output buffer is
+/// re-fenced with a second `prep_bo` after that delay and decoded a second
+/// time into `Run::output_after_settle`.
+///
+/// `prep_bo` on an already-signaled fence returns immediately and just
+/// re-invalidates the mapping for the CPU, so this is a genuine second look
+/// at device memory rather than a re-read of the same cached bytes.
+fn run_tiled_conv_settling(
+    shape: &ConvShape,
+    tiling: Tiling,
+    ping_pong: PingPong,
+    dispatch: Dispatch,
+    settle: Option<Duration>,
 ) -> Run {
     let plan = plan_tiled_conv(shape, tiling, ping_pong).expect("tiled convolution plan");
     let tile_output_rows = plan.tiles.iter().map(|tile| tile.output_height).collect();
@@ -295,11 +343,14 @@ fn run_tiled_conv(
         let mut in_handles: Vec<u32> = cmd_buffers.iter().map(|buf| buf.handle).collect();
         in_handles.extend([buf_in.handle, buf_w.handle, buf_bias.handle]);
         let out_handles = [buf_out.handle];
-        let descriptors: Vec<(u32, u32)> = cmd_buffers
+        let mut descriptors: Vec<(u32, u32)> = cmd_buffers
             .iter()
             .zip(&tasks)
             .map(|(buf, cmds)| (buf.dma_address, cmds.len() as u32))
             .collect();
+        if matches!(dispatch, Dispatch::KernelTasks(Order::Reversed)) {
+            descriptors.reverse();
+        }
 
         let started = Instant::now();
         match dispatch {
@@ -311,7 +362,7 @@ fn run_tiled_conv(
                         .expect("per-tile job did not complete within timeout");
                 }
             }
-            Dispatch::KernelTasks => {
+            Dispatch::KernelTasks(_) => {
                 submit_tasks(fd, &descriptors, &in_handles, &out_handles)
                     .expect("multi-task SUBMIT ioctl failed");
                 prep_bo(fd, buf_out.handle, JOB_TIMEOUT_NS)
@@ -330,27 +381,16 @@ fn run_tiled_conv(
         }
         let elapsed = started.elapsed();
 
-        // DPU write-back is 16-byte feature-atomic surfaces: surface S holds
-        // channel bytes [16S, 16S+16) for every pixel, planar. Same decode
-        // as `conv_hw.rs`'s position test.
         let scratch = std::slice::from_raw_parts(buf_out.host_ptr, output_scratch_len);
-        let output_pixels = shape.output_width as usize * shape.output_height as usize;
-        let surface_stride = output_pixels * CONV_OUTPUT_ATOMIC_STRIDE as usize;
-        let mut output = Vec::with_capacity(output_pixels * shape.output_channels as usize);
-        for pixel in 0..output_pixels {
-            for channel in 0..shape.output_channels as usize {
-                let channel_byte = channel * BPE;
-                let surface = channel_byte / CONV_OUTPUT_ATOMIC_STRIDE as usize;
-                let byte_in_surface = channel_byte % CONV_OUTPUT_ATOMIC_STRIDE as usize;
-                let offset = surface * surface_stride
-                    + pixel * CONV_OUTPUT_ATOMIC_STRIDE as usize
-                    + byte_in_surface;
-                output.push(f16_to_f32(u16::from_le_bytes([
-                    scratch[offset],
-                    scratch[offset + 1],
-                ])));
-            }
-        }
+        let output = decode_output(shape, scratch);
+
+        // Second look at the same device memory: if the later tiles ran but
+        // landed after the CPU's first read, their rows appear here.
+        let output_after_settle = settle.map(|delay| {
+            std::thread::sleep(delay);
+            prep_bo(fd, buf_out.handle, JOB_TIMEOUT_NS).ok();
+            decode_output(shape, scratch)
+        });
 
         close_bo(fd, buf_in.handle).ok();
         close_bo(fd, buf_w.handle).ok();
@@ -362,10 +402,60 @@ fn run_tiled_conv(
 
         Run {
             output,
+            output_after_settle,
             elapsed,
             tile_output_rows,
             estimated_cycles,
         }
+    }
+}
+
+/// DPU write-back is 16-byte feature-atomic surfaces: surface S holds
+/// channel bytes `[16S, 16S+16)` for every pixel, planar. Same decode as
+/// `conv_hw.rs`'s position test.
+fn decode_output(shape: &ConvShape, scratch: &[u8]) -> Vec<f32> {
+    let output_pixels = shape.output_width as usize * shape.output_height as usize;
+    let surface_stride = output_pixels * CONV_OUTPUT_ATOMIC_STRIDE as usize;
+    let mut output = Vec::with_capacity(output_pixels * shape.output_channels as usize);
+    for pixel in 0..output_pixels {
+        for channel in 0..shape.output_channels as usize {
+            let channel_byte = channel * BPE;
+            let surface = channel_byte / CONV_OUTPUT_ATOMIC_STRIDE as usize;
+            let byte_in_surface = channel_byte % CONV_OUTPUT_ATOMIC_STRIDE as usize;
+            let offset = surface * surface_stride
+                + pixel * CONV_OUTPUT_ATOMIC_STRIDE as usize
+                + byte_in_surface;
+            output.push(f16_to_f32(u16::from_le_bytes([
+                scratch[offset],
+                scratch[offset + 1],
+            ])));
+        }
+    }
+    output
+}
+
+/// Which output rows are entirely zero -- the signature of a tile that
+/// never wrote anything, as distinct from one that wrote wrong values.
+fn zero_rows(shape: &ConvShape, output: &[f32]) -> Vec<u32> {
+    (0..shape.output_height)
+        .filter(|&y| {
+            (0..shape.output_width).all(|x| {
+                (0..shape.output_channels).all(|channel| {
+                    let index =
+                        ((y * shape.output_width + x) * shape.output_channels + channel) as usize;
+                    output[index] == 0.0
+                })
+            })
+        })
+        .collect()
+}
+
+/// Compact `first..last` summary of a row list, so a 74-row report reads as
+/// one range instead of 74 numbers.
+fn row_span(rows: &[u32]) -> String {
+    match (rows.first(), rows.last()) {
+        (Some(first), Some(last)) => format!("{} rows, {first}..={last}", rows.len()),
+        _ => "none".to_string(),
     }
 }
 
@@ -478,7 +568,7 @@ fn row_tiles_as_kernel_tasks_without_ping_pong() {
         &shape,
         Tiling::Tiles(3),
         PingPong::off(),
-        Dispatch::KernelTasks,
+        Dispatch::KernelTasks(Order::Forward),
     );
     report("kernel_tasks_ping_pong_off", &shape, &run);
     assert_matches_oracle(&shape, &run, "kernel_tasks_ping_pong_off");
@@ -494,7 +584,7 @@ fn row_tiles_as_kernel_tasks_with_ping_pong() {
         &shape,
         Tiling::Tiles(3),
         PingPong::default(),
-        Dispatch::KernelTasks,
+        Dispatch::KernelTasks(Order::Forward),
     );
     report("kernel_tasks_auto_toggle", &shape, &run);
     assert_matches_oracle(&shape, &run, "kernel_tasks_auto_toggle");
@@ -515,16 +605,130 @@ fn row_tiles_as_kernel_tasks_with_explicit_pointers() {
             executers: true,
             pc_task_fetch: true,
         },
-        Dispatch::KernelTasks,
+        Dispatch::KernelTasks(Order::Forward),
     );
     report("kernel_tasks_explicit_pointer", &shape, &run);
     assert_matches_oracle(&shape, &run, "kernel_tasks_explicit_pointer");
 }
 
+//===========================================================================
+// Diagnostics for the "tile 0 correct, later rows zero" failure.
+//
+// What the driver source (`rocket_job.c`) already rules out: the later tasks
+// ARE dispatched. `rocket_job_handle_irq()` re-enters
+// `rocket_job_hw_submit()` while `next_task_idx < task_count` and signals
+// `done_fence` only after the last task -- and the failing runs' `prep_bo`
+// returns successfully in ~510 ms rather than hitting its 2 s timeout, so
+// the fence was signaled, so every task was submitted. The later tiles run
+// and produce nothing; they are not skipped.
+//
+// Note also that `pm_runtime_get_sync` and `iommu_attach_group` are in
+// `rocket_job_run` (once per job), not in `hw_submit` (once per task), so
+// the ~510 ms per-job constant says nothing about how many tasks ran -- a
+// per-task IRQ round trip is microseconds against it.
+//===========================================================================
+
+/// Did the later tiles write *late* rather than not at all? Re-fences and
+/// re-decodes the output buffer after a settling delay.
+///
+/// Asserts nothing about the first read (that failure is already covered
+/// above); it asserts that the second read is no better than the first, i.e.
+/// that this is genuinely not a CPU-looked-too-early problem. If the second
+/// read IS better, that inverts the whole investigation: the fix would be on
+/// the fence/wait side, not in the register programming.
+#[test]
+#[ignore = "needs the real NPU device -- cross-compile for aarch64, copy to the board, run there"]
+fn late_tile_rows_do_not_appear_after_settling() {
+    let shape = shape(112, 112);
+    let run = run_tiled_conv_settling(
+        &shape,
+        Tiling::Tiles(3),
+        PingPong::default(),
+        Dispatch::KernelTasks(Order::Forward),
+        Some(Duration::from_millis(500)),
+    );
+    let before = zero_rows(&shape, &run.output);
+    let settled = run
+        .output_after_settle
+        .as_ref()
+        .expect("a settling delay was requested");
+    let after = zero_rows(&shape, settled);
+
+    eprintln!(
+        "settle probe: zero rows before = {}, after 500ms = {}",
+        row_span(&before),
+        row_span(&after)
+    );
+
+    assert_eq!(
+        before,
+        after,
+        "output CHANGED after a 500ms settle: zero rows went from {} to {}. \
+         The later tasks do write, just after the CPU's first read -- so the \
+         fault is in completion signaling/fencing, not in the tile regcmds, \
+         and this whole file's premise needs reframing.",
+        row_span(&before),
+        row_span(&after)
+    );
+}
+
+/// Is the failure positional (only the *first* submitted task works) or
+/// content-based (only *tile 0's* regcmd works)?
+///
+/// Tiles read and write disjoint rows, so submitting them in reverse is
+/// still a correct program and a working implementation returns the same
+/// full tensor. The diagnostic value is in *which* rows survive:
+///
+/// - tile 2's rows (75..=111) correct, 0..=74 zero -> positional: whichever
+///   task goes first is the only one that runs to completion, and tile 0's
+///   regcmd content is not special;
+/// - tile 0's rows (0..=37) correct again -> content-based: something about
+///   the first tile's own program (it is the one carrying the `PC_TASK_CON`
+///   and `S_POINTER` preamble, and it is 134 words vs the others' 128) is
+///   what makes it work;
+/// - all rows correct -> reversal fixed it, which would point at the
+///   input-side CBUF/DMA state carried between tasks rather than at
+///   dispatch.
+#[test]
+#[ignore = "needs the real NPU device -- cross-compile for aarch64, copy to the board, run there"]
+fn reversed_task_order_shows_whether_the_failure_is_positional() {
+    let shape = shape(112, 112);
+    let run = run_tiled_conv(
+        &shape,
+        Tiling::Tiles(3),
+        PingPong::default(),
+        Dispatch::KernelTasks(Order::Reversed),
+    );
+    report("kernel_tasks_reversed", &shape, &run);
+    eprintln!(
+        "reversed order: zero rows = {} (tile row spans: 0..=37, 38..=74, 75..=111)",
+        row_span(&zero_rows(&shape, &run.output))
+    );
+    assert_matches_oracle(&shape, &run, "kernel_tasks_reversed");
+}
+
 /// The real target: one kernel task, the PC walking the tile chain itself
-/// with `task_number = 3` and `task_pp_en` set. The two amount conventions
-/// are separate tests so a hang or a wrong result attributes to one of
-/// them; see [`RegisterAmount`].
+/// with `task_number = 3` and `task_pp_en` set.
+///
+/// Known to be unreachable through the mainline driver, which pins
+/// `PC_TASK_CON.task_number` to 1 on every kick -- kept as a regression
+/// witness for that, and so the emission side is ready if the driver gains
+/// a task-count passthrough. `RegisterAmount::Driver` is the encoding the
+/// driver itself uses; the other two are the superseded guesses.
+#[test]
+#[ignore = "needs the real NPU device -- cross-compile for aarch64, copy to the board, run there"]
+fn row_tiles_as_hardware_chain_driver_amount() {
+    let shape = shape(112, 112);
+    let run = run_tiled_conv(
+        &shape,
+        Tiling::Tiles(3),
+        PingPong::default(),
+        Dispatch::HardwareChain(RegisterAmount::Driver),
+    );
+    report("hardware_chain_driver_amount", &shape, &run);
+    assert_matches_oracle(&shape, &run, "hardware_chain_driver_amount");
+}
+
 #[test]
 #[ignore = "needs the real NPU device -- cross-compile for aarch64, copy to the board, run there"]
 fn row_tiles_as_hardware_chain_mesa_amount() {
@@ -572,11 +776,15 @@ fn ping_pong_wall_clock_report() {
             PingPong::default(),
             Dispatch::SeparateJobs,
         ),
-        ("kernel_tasks / off", PingPong::off(), Dispatch::KernelTasks),
+        (
+            "kernel_tasks / off",
+            PingPong::off(),
+            Dispatch::KernelTasks(Order::Forward),
+        ),
         (
             "kernel_tasks / armed",
             PingPong::default(),
-            Dispatch::KernelTasks,
+            Dispatch::KernelTasks(Order::Forward),
         ),
         (
             "hardware_chain / armed",
