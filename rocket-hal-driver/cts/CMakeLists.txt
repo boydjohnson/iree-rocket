@@ -33,6 +33,7 @@ iree_cc_library(
   SRCS
     "backends.cc"
   DEPS
+    iree::base::tooling::flags
     iree::hal
     iree::hal::cts::util::registry
     rocket_hal_driver_static
