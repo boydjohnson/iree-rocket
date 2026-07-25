@@ -1,7 +1,7 @@
 use std::{env, path::PathBuf};
 
 fn main() {
-    println!("cargo:rerun-if-changed=rkt_registers.hpp");
+    println!("cargo:rerun-if-changed=rkt_registers.h");
 
     let out_path = PathBuf::from(env::var("OUT_DIR").unwrap());
 
