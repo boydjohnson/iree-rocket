@@ -170,10 +170,38 @@
 //!   after the DPU has already written correct output.
 //!
 //! So multi-task dispatch cannot work, in any [`PointerMode`] or with any
-//! chain encoding, until the interrupt path is fixed. Nothing in this module
-//! writes `PC_INTERRUPT_MASK`/`PC_INTERRUPT_CLEAR` (verified: no builder in
-//! this crate emits either), so the regcmds are not masking it off -- the
-//! remaining suspects are all on the driver/SoC side.
+//! chain encoding, until the interrupt path is fixed.
+//!
+//! `/proc/interrupts` narrows it further: the NPU's three shared GIC lines
+//! (`fdab0000.npu`, `fdac0000.npu`, `fdad0000.npu`) report **byte-identical
+//! counts before and after a full test run**, across three separate runs. So
+//! the line is never asserted at all -- this is upstream of the driver's hard
+//! handler and its `PC_INTERRUPT_RAW_STATUS` check. Nothing rejects the
+//! interrupt; there is none.
+//!
+//! Ruled out:
+//!
+//! - **regcmd masking.** No builder in this crate emits `PC_INTERRUPT_MASK`
+//!   or `PC_INTERRUPT_CLEAR` at all (except the deliberate override below).
+//! - **amount of work.** A 4x4 tile (16 cycles) times out exactly like a
+//!   112x112 one, so this is not the op running long.
+//! - **a driver regression or a distro patch.** The 7.1 source is
+//!   byte-identical to v6.18 through the whole IRQ/submit path (same
+//!   `IRQF_SHARED` `devm_request_threaded_irq`, same handler, same
+//!   `hw_submit`), and no Armbian `rockchip64-7.1` patch touches
+//!   `drivers/accel/rocket`.
+//!
+//! Not yet ruled out, despite an earlier read of the evidence saying so:
+//!
+//! - **mask polarity.** [`InterruptMask::All`]/[`InterruptMask::DpuOnly`] both
+//!   left a single-tile job timing out -- but they were emitted with
+//!   [`PcWriteDomain::TargetPc`], a domain tag this crate has never confirmed
+//!   works. See [`PcWriteDomain`]; retry via [`PcWriteDomain::Kick`] first.
+//! - **the DPU never reaching a "done" condition.** A regcmd-content problem,
+//!   and the shape of it fits: the output is *correct*, so it would be a stall
+//!   after the final write rather than missing work.
+//! - **the interrupt not being enabled or wired outside the PC's register
+//!   block** on this board -- clock/reset domain, or the DT's NPU node.
 
 use crate::rocket::{
     builders::{
@@ -191,7 +219,7 @@ use crate::rocket::{
         compute_task_input_channels, conv_entries_per_slice, conv_weights_banks, link_regcmd_tasks,
         push_kick_for_task_count, task_link_trailer_index,
     },
-    registers::{REG_PC_BASE_ADDRESS, REG_PC_REGISTER_AMOUNTS},
+    registers::{REG_PC_BASE_ADDRESS, REG_PC_INTERRUPT_MASK, REG_PC_REGISTER_AMOUNTS},
 };
 
 /// NPU cores on an RK3588. The design notes' worked example row-tiles a
@@ -758,6 +786,17 @@ fn apply_payload_s_pointer(payload: &mut Vec<RegCmd>, value: Option<u32>) {
 /// This is testable from userspace without touching the kernel, because a
 /// regcmd is fetched by the PC *after* the driver's AHB writes and can
 /// therefore overwrite the mask before the blocks are enabled.
+///
+/// # Hardware result: inconclusive, not negative
+///
+/// Both [`Self::All`] and [`Self::DpuOnly`] were run on a single-tile job and
+/// both still took ~500 ms (526 ms / 504 ms) with `/proc/interrupts` unmoved.
+/// That looked like a clean refutation, but it rests on the override actually
+/// reaching the register -- and it was emitted with
+/// [`PcWriteDomain::TargetPc`], which this crate has **never** had positive
+/// evidence for. See that type: the one PC-domain regcmd write known to work
+/// is tagged `0x81`, not `0x101`. Retry via [`PcWriteDomain::Kick`] before
+/// concluding anything about the mask.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Default)]
 pub enum InterruptMask {
     /// Emit nothing; the driver's `DPU_0 | DPU_1` stands. Current behavior.
@@ -773,6 +812,51 @@ pub enum InterruptMask {
     /// if `All` fixes it and this does not, the polarity is inverted; if
     /// both fix it, the driver's write is not landing at all.
     DpuOnly,
+}
+
+/// Which domain tag a PC-block register write inside a regcmd carries.
+///
+/// This is an unresolved question about the regcmd wire format itself, and it
+/// undermines more than one experiment, so it is worth stating separately.
+///
+/// `builders::DOMAIN_PC` is `target_PC | 1` == `0x101`, following Mesa's
+/// `registers.xml` target enum and the `| 1` convention decoded out of real
+/// compiled regcmd programs. Every `PC_BASE_ADDRESS`/`PC_REGISTER_AMOUNTS`
+/// write this crate emits uses it -- but in the *single-task* path those
+/// writes carry the value **zero**, so a write that silently never landed
+/// would be indistinguishable from one that landed and did nothing. There is
+/// no positive evidence that a `0x101`-tagged write takes effect.
+///
+/// Meanwhile the kick -- the one PC-domain regcmd write with unambiguous
+/// hardware evidence, since nothing runs at all without it -- is tagged
+/// `0x81`:
+///
+/// ```text
+/// cmds.push(RegCmd::new(0x81, REG_PC_OPERATION_ENABLE, enable_mask));
+/// ```
+///
+/// If `0x101` is simply the wrong tag for the PC block, two separate results
+/// in this module are explained at once: the [`InterruptMask`] override
+/// appearing to do nothing, and the hardware-walked chain
+/// ([`link_tiled_conv_regcmds`]) behaving exactly as if its embedded
+/// `PC_BASE_ADDRESS` link were absent.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Default)]
+pub enum PcWriteDomain {
+    /// `0x101`, i.e. `builders::DOMAIN_PC`. The incumbent, and the default
+    /// only because it is what the rest of the crate already emits.
+    #[default]
+    TargetPc,
+    /// `0x81`, matching the kick's own `PC_OPERATION_ENABLE` write.
+    Kick,
+}
+
+impl PcWriteDomain {
+    fn tag(self) -> u32 {
+        match self {
+            PcWriteDomain::TargetPc => DOMAIN_PC,
+            PcWriteDomain::Kick => 0x81,
+        }
+    }
 }
 
 impl InterruptMask {
@@ -809,6 +893,7 @@ pub fn build_tiled_conv_regcmds(
     plan: &TiledConv,
     bufs: &ConvBuffers,
     interrupt_mask: InterruptMask,
+    pc_domain: PcWriteDomain,
 ) -> Result<Vec<Vec<RegCmd>>, &'static str> {
     if plan.tiles.is_empty() {
         return Err("tiled convolution plan has no tiles");
@@ -864,7 +949,10 @@ pub fn build_tiled_conv_regcmds(
             // Last thing before the kick tail, so it overrides the driver's
             // own AHB write and still lands before any block is enabled.
             if let Some(mask) = interrupt_mask.value() {
-                cmds.push(Register::<PCInterruptMask>::from_val(mask).build());
+                // Built by hand rather than through `Register::build()`, which
+                // would hardcode `PCInterruptMask::DOMAIN` -- the domain tag
+                // is exactly the variable under test here.
+                cmds.push(RegCmd::new(pc_domain.tag(), REG_PC_INTERRUPT_MASK, mask));
             }
 
             // The multi-task tail even for `task_count == 1`: it costs one
@@ -1356,7 +1444,13 @@ mod tests {
             PingPong::default(),
         )
         .unwrap();
-        let tasks = build_tiled_conv_regcmds(&plan, &buffers(), InterruptMask::default()).unwrap();
+        let tasks = build_tiled_conv_regcmds(
+            &plan,
+            &buffers(),
+            InterruptMask::default(),
+            PcWriteDomain::default(),
+        )
+        .unwrap();
         assert_eq!(tasks.len(), 3);
 
         // Tile 0, all four blocks: pointer group 0, both pp_clear pulses,
@@ -1403,7 +1497,13 @@ mod tests {
             },
         )
         .unwrap();
-        let tasks = build_tiled_conv_regcmds(&plan, &buffers(), InterruptMask::default()).unwrap();
+        let tasks = build_tiled_conv_regcmds(
+            &plan,
+            &buffers(),
+            InterruptMask::default(),
+            PcWriteDomain::default(),
+        )
+        .unwrap();
 
         for (index, task) in tasks.iter().enumerate() {
             // pointer = index & 1, everything else clear (`executers:
@@ -1426,7 +1526,13 @@ mod tests {
         let shape = fp16_c32_to_c16(112, 112);
         let bufs = buffers();
         let plan = plan_tiled_conv(&shape, Tiling::Tiles(3), PingPong::off()).unwrap();
-        let tasks = build_tiled_conv_regcmds(&plan, &bufs, InterruptMask::default()).unwrap();
+        let tasks = build_tiled_conv_regcmds(
+            &plan,
+            &bufs,
+            InterruptMask::default(),
+            PcWriteDomain::default(),
+        )
+        .unwrap();
 
         let payload_value = (1 << 3) | (1 << 2) | (1 << 1);
         for (tile, task) in plan.tiles.iter().zip(&tasks) {
@@ -1456,7 +1562,13 @@ mod tests {
         let shape = fp16_c32_to_c16(112, 112);
         let bufs = buffers();
         let plan = plan_tiled_conv(&shape, Tiling::Tiles(3), PingPong::default()).unwrap();
-        let tasks = build_tiled_conv_regcmds(&plan, &bufs, InterruptMask::default()).unwrap();
+        let tasks = build_tiled_conv_regcmds(
+            &plan,
+            &bufs,
+            InterruptMask::default(),
+            PcWriteDomain::default(),
+        )
+        .unwrap();
 
         for (tile, commands) in plan.tiles.iter().zip(&tasks) {
             let single = crate::rocket::regcmd::build_conv_cna_core_dpu_dpu_rdma(
@@ -1490,7 +1602,13 @@ mod tests {
         )
         .unwrap();
 
-        let untouched = build_tiled_conv_regcmds(&plan, &buffers(), InterruptMask::Driver).unwrap();
+        let untouched = build_tiled_conv_regcmds(
+            &plan,
+            &buffers(),
+            InterruptMask::Driver,
+            PcWriteDomain::default(),
+        )
+        .unwrap();
         for task in &untouched {
             assert_eq!(writes::<PCInterruptMask>(task), Vec::<u32>::new());
         }
@@ -1501,22 +1619,42 @@ mod tests {
             // PC_INTERRUPT_MASK_DPU_0 | PC_INTERRUPT_MASK_DPU_1.
             (InterruptMask::DpuOnly, (1 << 8) | (1 << 9)),
         ] {
-            let tasks = build_tiled_conv_regcmds(&plan, &buffers(), mask).unwrap();
-            for task in &tasks {
-                assert_eq!(writes::<PCInterruptMask>(task), vec![expected], "{mask:?}");
+            for domain in [PcWriteDomain::TargetPc, PcWriteDomain::Kick] {
+                let tasks = build_tiled_conv_regcmds(&plan, &buffers(), mask, domain).unwrap();
+                for task in &tasks {
+                    // Located by offset alone, not by `is_register`, since the
+                    // domain tag is what varies -- a lookup keyed on
+                    // `PCInterruptMask::DOMAIN` would miss the `Kick` variant
+                    // entirely, which is exactly the bug this guards against.
+                    let found: Vec<_> = task
+                        .iter()
+                        .enumerate()
+                        .filter(|(_, command)| {
+                            (command.0 & 0xffff) == u64::from(REG_PC_INTERRUPT_MASK)
+                        })
+                        .collect();
+                    assert_eq!(found.len(), 1, "{mask:?}/{domain:?}");
+                    let (mask_index, command) = found[0];
+                    assert_eq!(
+                        (command.0 >> 48) & 0xffff,
+                        u64::from(domain.tag()),
+                        "{mask:?}/{domain:?}: wrong domain tag"
+                    );
+                    assert_eq!(
+                        ((command.0 >> 16) & 0xffff_ffff) as u32,
+                        expected,
+                        "{mask:?}/{domain:?}: wrong value"
+                    );
 
-                let mask_index = task
-                    .iter()
-                    .position(is_register::<PCInterruptMask>)
-                    .expect("the override is emitted");
-                let trailer = crate::rocket::regcmd::task_link_trailer_index(task).unwrap();
-                assert_eq!(
-                    mask_index + 1,
-                    trailer,
-                    "{mask:?}: the mask write must sit immediately before the \
-                     PC link trailer, i.e. after every payload register and \
-                     before PC_OPERATION_ENABLE"
-                );
+                    let trailer = crate::rocket::regcmd::task_link_trailer_index(task).unwrap();
+                    assert_eq!(
+                        mask_index + 1,
+                        trailer,
+                        "{mask:?}/{domain:?}: the mask write must sit immediately \
+                         before the PC link trailer, i.e. after every payload \
+                         register and before PC_OPERATION_ENABLE"
+                    );
+                }
             }
         }
     }
@@ -1552,8 +1690,13 @@ mod tests {
                 PingPong::default(),
             )
             .unwrap();
-            let mut tasks =
-                build_tiled_conv_regcmds(&plan, &buffers(), InterruptMask::default()).unwrap();
+            let mut tasks = build_tiled_conv_regcmds(
+                &plan,
+                &buffers(),
+                InterruptMask::default(),
+                PcWriteDomain::default(),
+            )
+            .unwrap();
             let trailers = tasks
                 .iter()
                 .map(|task| crate::rocket::regcmd::task_link_trailer_index(task).unwrap())
@@ -1600,8 +1743,13 @@ mod tests {
             PingPong::default(),
         )
         .unwrap();
-        let mut tasks =
-            build_tiled_conv_regcmds(&plan, &buffers(), InterruptMask::default()).unwrap();
+        let mut tasks = build_tiled_conv_regcmds(
+            &plan,
+            &buffers(),
+            InterruptMask::default(),
+            PcWriteDomain::default(),
+        )
+        .unwrap();
         for amount in [
             RegisterAmount::Driver,
             RegisterAmount::MesaHalvedEven,

@@ -41,8 +41,15 @@
 //! | `row_tiles_as_kernel_tasks_with_explicit_pointers` | one job, 3 tasks | fail: identical |
 //! | `reversed_task_order_...` | one job, 3 tasks reversed | fail: zero rows **0..=74** |
 //! | `row_tiles_as_hardware_chain_*` | one task, PC-walked chain | fail: rows 38..=111 zero |
+//! | `single_tile_with_*_interrupts_unmasked_*` | one job, one tile | fail: still ~500 ms (526 / 504) |
+//! | `row_tiles_as_kernel_tasks_with_all_interrupts_unmasked` | one job, 3 tasks | fail: rows 38..=111 zero |
+//! | `*_via_kick_domain_*` | mask override tagged `0x81` | not yet run |
 //!
-//! Three conclusions, in the order they were established:
+//! Every red test above has the same single root cause (below). The two green
+//! ones are the real contract: `conv.rs`'s tiling and emission are correct,
+//! and stay correct, on the dispatch path that works.
+//!
+//! Four conclusions, in the order they were established:
 //!
 //! **Ping-pong programming is not the variable.** All three
 //! [`PointerMode`]s give byte-identical results, and `separate_jobs`
@@ -67,6 +74,23 @@
 //! corollaries -- in particular, that the ~510 ms every test below reports
 //! is the scheduler's timeout, and that the passing tests are passing
 //! *through* the reset path rather than through clean completion.
+//!
+//! **The NPU never asserts its interrupt line.** `/proc/interrupts` shows the
+//! three `*.npu` GIC lines byte-identical before and after a run, across three
+//! runs -- so the driver's hard handler never even gets a chance to reject
+//! anything, and `dmesg` carries nothing but the bare `NPU job timed out`
+//! lines (no IOMMU faults, no reset failures). A 4x4 tile times out just like
+//! a 112x112 one, so it is not the op running long. The driver is not at
+//! fault by version either: mainline 7.1's rocket is byte-identical to v6.18
+//! through the IRQ/submit path, and no Armbian `rockchip64-7.1` patch touches
+//! it.
+//!
+//! Overriding `PC_INTERRUPT_MASK` from the regcmd changed nothing in either
+//! polarity's favour -- but see `conv::PcWriteDomain`: those overrides used a
+//! domain tag (`0x101`) that this crate has never confirmed reaches the
+//! hardware, so that result is **inconclusive, not negative**, and
+//! `single_tile_with_all_interrupts_unmasked_via_kick_domain_...` retries it
+//! with the tag the kick uses.
 
 use std::{
     fs::OpenOptions,
@@ -78,8 +102,8 @@ use std::{
 
 use iree_rocket_hal::rocket::{
     conv::{
-        InterruptMask, PingPong, PointerMode, RegisterAmount, Tiling, build_tiled_conv_regcmds,
-        cycles_per_pixel, link_tiled_conv_regcmds, plan_tiled_conv,
+        InterruptMask, PcWriteDomain, PingPong, PointerMode, RegisterAmount, Tiling,
+        build_tiled_conv_regcmds, cycles_per_pixel, link_tiled_conv_regcmds, plan_tiled_conv,
     },
     device::{Buffer, close_bo, fini_bo, prep_bo, submit, submit_tasks},
     regcmd::{
@@ -249,6 +273,7 @@ fn run_tiled_conv(
         ping_pong,
         dispatch,
         InterruptMask::default(),
+        PcWriteDomain::default(),
         None,
     )
 }
@@ -260,8 +285,17 @@ fn run_tiled_conv_masked(
     ping_pong: PingPong,
     dispatch: Dispatch,
     interrupt_mask: InterruptMask,
+    pc_domain: PcWriteDomain,
 ) -> Run {
-    run_tiled_conv_settling(shape, tiling, ping_pong, dispatch, interrupt_mask, None)
+    run_tiled_conv_settling(
+        shape,
+        tiling,
+        ping_pong,
+        dispatch,
+        interrupt_mask,
+        pc_domain,
+        None,
+    )
 }
 
 /// As [`run_tiled_conv`], but when `settle` is set, the output buffer is
@@ -277,6 +311,7 @@ fn run_tiled_conv_settling(
     ping_pong: PingPong,
     dispatch: Dispatch,
     interrupt_mask: InterruptMask,
+    pc_domain: PcWriteDomain,
     settle: Option<Duration>,
 ) -> Run {
     let plan = plan_tiled_conv(shape, tiling, ping_pong).expect("tiled convolution plan");
@@ -340,7 +375,7 @@ fn run_tiled_conv_settling(
             bias_addr: buf_bias.dma_address,
             output_addr: buf_out.dma_address,
         };
-        let mut tasks = build_tiled_conv_regcmds(&plan, &bufs, interrupt_mask)
+        let mut tasks = build_tiled_conv_regcmds(&plan, &bufs, interrupt_mask, pc_domain)
             .expect("tiled convolution regcmds");
 
         // One command buffer per tile. Addresses have to exist before the
@@ -678,6 +713,7 @@ fn late_tile_rows_do_not_appear_after_settling() {
         PingPong::default(),
         Dispatch::KernelTasks(Order::Forward),
         InterruptMask::default(),
+        PcWriteDomain::default(),
         Some(Duration::from_millis(500)),
     );
     let before = zero_rows(&shape, &run.output);
@@ -755,14 +791,19 @@ fn reversed_task_order_shows_whether_the_failure_is_positional() {
 //
 // A regcmd is fetched after the driver's AHB register writes, so userspace
 // can overwrite `PC_INTERRUPT_MASK` before any block is enabled -- see
-// `conv::InterruptMask`. If the register's polarity is the opposite of what
-// the TRM documents, the driver masks off exactly the two DPU completion
-// events it waits for, and these tests fix it without a kernel change.
+// `conv::InterruptMask`. If the register's polarity were the opposite of what
+// the TRM documents, the driver would be masking off exactly the two DPU
+// completion events it waits for, and these tests would fix it without a
+// kernel change.
 //
 // The signal to watch is wall clock, not just correctness: a job that
 // completes cleanly should finish in single-digit milliseconds, against the
 // ~510 ms every other test here reports. Correct output alone proves
 // nothing, since the reset path already delivers that.
+//
+// **Hardware result: ruled out.** Both overrides still time out (526 ms /
+// 504 ms) and the interrupt counters stay put. These three tests are kept as
+// the record of that, and stay red with everything else in this file.
 //===========================================================================
 
 /// Does un-masking every interrupt source make a *single-task* job complete
@@ -771,6 +812,8 @@ fn reversed_task_order_shows_whether_the_failure_is_positional() {
 /// Deliberately one tile: this isolates the completion interrupt from
 /// multi-task dispatch entirely. Output correctness is already established
 /// for this shape, so the assertion that matters is the wall clock.
+///
+/// **Hardware result: no.** 526 ms, i.e. still the timeout.
 #[test]
 #[ignore = "needs the real NPU device -- cross-compile for aarch64, copy to the board, run there"]
 fn single_tile_with_all_interrupts_unmasked_completes_without_timeout() {
@@ -781,6 +824,7 @@ fn single_tile_with_all_interrupts_unmasked_completes_without_timeout() {
         PingPong::default(),
         Dispatch::SeparateJobs,
         InterruptMask::All,
+        PcWriteDomain::TargetPc,
     );
     report("single_tile / mask=All", &shape, &run);
     assert_matches_oracle(&shape, &run, "single_tile / mask=All");
@@ -797,6 +841,9 @@ fn single_tile_with_all_interrupts_unmasked_completes_without_timeout() {
 /// Same probe with only the two bits the driver intends. Distinguishes a
 /// wrong mask *value* (this fails, `mask=All` passes -> inverted polarity)
 /// from a driver write that never lands (both pass).
+///
+/// **Hardware result: neither.** 504 ms, same as `mask=All` -- both still hit
+/// the timeout, so the mask is not the deciding register at all.
 #[test]
 #[ignore = "needs the real NPU device -- cross-compile for aarch64, copy to the board, run there"]
 fn single_tile_with_dpu_interrupts_unmasked_completes_without_timeout() {
@@ -807,6 +854,7 @@ fn single_tile_with_dpu_interrupts_unmasked_completes_without_timeout() {
         PingPong::default(),
         Dispatch::SeparateJobs,
         InterruptMask::DpuOnly,
+        PcWriteDomain::TargetPc,
     );
     report("single_tile / mask=DpuOnly", &shape, &run);
     assert_matches_oracle(&shape, &run, "single_tile / mask=DpuOnly");
@@ -821,7 +869,9 @@ fn single_tile_with_dpu_interrupts_unmasked_completes_without_timeout() {
 /// driver's `rocket_job_handle_irq()` should re-enter `hw_submit` for tiles 1
 /// and 2, and the whole tensor should land from one multi-task job.
 ///
-/// Expected to keep failing exactly as before if the mask is not the issue.
+/// **Hardware result: fails exactly as before**, zero rows 38..=111 -- as
+/// expected once the single-tile probes above showed the mask is not the
+/// issue.
 #[test]
 #[ignore = "needs the real NPU device -- cross-compile for aarch64, copy to the board, run there"]
 fn row_tiles_as_kernel_tasks_with_all_interrupts_unmasked() {
@@ -832,6 +882,7 @@ fn row_tiles_as_kernel_tasks_with_all_interrupts_unmasked() {
         PingPong::default(),
         Dispatch::KernelTasks(Order::Forward),
         InterruptMask::All,
+        PcWriteDomain::TargetPc,
     );
     report("kernel_tasks / mask=All", &shape, &run);
     eprintln!(
@@ -839,6 +890,66 @@ fn row_tiles_as_kernel_tasks_with_all_interrupts_unmasked() {
         row_span(&zero_rows(&shape, &run.output))
     );
     assert_matches_oracle(&shape, &run, "kernel_tasks / mask=All");
+}
+
+/// The mask override again, tagged the way the kick is (`0x81`) instead of
+/// `target_PC | 1` (`0x101`).
+///
+/// This exists because the two probes above are **inconclusive, not
+/// negative**: they emitted `PC_INTERRUPT_MASK` with the `0x101` tag, and this
+/// crate has never had positive evidence that a `0x101`-tagged regcmd write
+/// lands at all -- the only other ones it emits carry the value zero in the
+/// path that works. The kick's `0x81` is the tag with real evidence behind it,
+/// since nothing runs without it. See `conv::PcWriteDomain`.
+///
+/// So: if this one completes in single-digit milliseconds, the mask *was* the
+/// problem all along and the earlier probes were simply not reaching the
+/// register. If it still takes ~500 ms, then either tag is fine for a PC
+/// write and the mask really is exonerated.
+#[test]
+#[ignore = "needs the real NPU device -- cross-compile for aarch64, copy to the board, run there"]
+fn single_tile_with_all_interrupts_unmasked_via_kick_domain_completes_without_timeout() {
+    let shape = shape(4, 4);
+    let run = run_tiled_conv_masked(
+        &shape,
+        Tiling::Tiles(1),
+        PingPong::default(),
+        Dispatch::SeparateJobs,
+        InterruptMask::All,
+        PcWriteDomain::Kick,
+    );
+    report("single_tile / mask=All domain=0x81", &shape, &run);
+    assert_matches_oracle(&shape, &run, "single_tile / mask=All domain=0x81");
+    assert!(
+        run.elapsed < Duration::from_millis(400),
+        "took {:?}: still the ~500ms drm_sched timeout even with the mask \
+         override tagged 0x81 like the kick. Both domain tags now behave the \
+         same, so the tag is not the confound and the mask really is \
+         exonerated -- move on to whether the DPU ever signals done.",
+        run.elapsed
+    );
+}
+
+/// Multi-task counterpart, run only because it is nearly free once the
+/// single-tile probe above exists.
+#[test]
+#[ignore = "needs the real NPU device -- cross-compile for aarch64, copy to the board, run there"]
+fn row_tiles_as_kernel_tasks_unmasked_via_kick_domain() {
+    let shape = shape(112, 112);
+    let run = run_tiled_conv_masked(
+        &shape,
+        Tiling::Tiles(3),
+        PingPong::default(),
+        Dispatch::KernelTasks(Order::Forward),
+        InterruptMask::All,
+        PcWriteDomain::Kick,
+    );
+    report("kernel_tasks / mask=All domain=0x81", &shape, &run);
+    eprintln!(
+        "kernel_tasks / mask=All domain=0x81: zero rows = {}",
+        row_span(&zero_rows(&shape, &run.output))
+    );
+    assert_matches_oracle(&shape, &run, "kernel_tasks / mask=All domain=0x81");
 }
 
 /// The real target: one kernel task, the PC walking the tile chain itself
