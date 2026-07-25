@@ -29,18 +29,20 @@
 //! varies only how the task sequence is dispatched and how the ping-pong
 //! registers are programmed.
 //!
-//! # Results so far (real RK3588)
+//! # Results (real RK3588, kernel 7.1.0-edge-rockchip64)
 //!
 //! | test | dispatch | result |
 //! |---|---|---|
 //! | `single_tile_matches_the_oracle` | one job, one tile | **pass** |
 //! | `row_tiles_as_separate_jobs_match_the_oracle` | job per tile | **pass** |
+//! | `late_tile_rows_do_not_appear_after_settling` | one job, 3 tasks | **pass**: zero rows 38..=111 before AND after |
 //! | `row_tiles_as_kernel_tasks_without_ping_pong` | one job, 3 tasks | fail: rows 38..=111 zero |
 //! | `row_tiles_as_kernel_tasks_with_ping_pong` | one job, 3 tasks | fail: identical |
 //! | `row_tiles_as_kernel_tasks_with_explicit_pointers` | one job, 3 tasks | fail: identical |
-//! | `row_tiles_as_hardware_chain_*` | one task, PC-walked chain | fail: identical |
+//! | `reversed_task_order_...` | one job, 3 tasks reversed | fail: zero rows **0..=74** |
+//! | `row_tiles_as_hardware_chain_*` | one task, PC-walked chain | fail: rows 38..=111 zero |
 //!
-//! Two conclusions worth keeping in front of anyone reading this file:
+//! Three conclusions, in the order they were established:
 //!
 //! **Ping-pong programming is not the variable.** All three
 //! [`PointerMode`]s give byte-identical results, and `separate_jobs`
@@ -50,11 +52,21 @@
 //! before every task, so this crate was never the deciding factor -- see
 //! `conv.rs`'s module doc.
 //!
-//! **The later tasks are dispatched, and they do run.** The driver signals
-//! `done_fence` only once `next_task_idx == task_count`, and the failing
-//! runs' `prep_bo` returns successfully rather than timing out. So the
-//! remaining question is why a task that runs writes nothing -- which is
-//! what the diagnostics section below narrows.
+//! **The failure is positional, and the later tiles never write.** Reversing
+//! the submission order moves the surviving rows to 75..=111 -- tile 2's,
+//! i.e. whichever task went *first*. And a 500 ms settle changes nothing, so
+//! this is not the CPU reading before a late write lands.
+//!
+//! **Only the first task per job is ever dispatched, because the completion
+//! IRQ never arrives.** An eBPF trace of the driver counted 69 jobs with
+//! `ops=0, timeouts=69, resets=69`: every job times out in `drm_sched` and
+//! is force-reset, and the hw_submit -> IRQ pairing never completes once.
+//! `rocket_job_handle_irq()` is the only thing that re-enters
+//! `rocket_job_hw_submit()` for task N+1, so with no interrupt there is no
+//! task N+1. See `conv.rs`'s module doc for the full trace and its two
+//! corollaries -- in particular, that the ~510 ms every test below reports
+//! is the scheduler's timeout, and that the passing tests are passing
+//! *through* the reset path rather than through clean completion.
 
 use std::{
     fs::OpenOptions,
@@ -66,8 +78,8 @@ use std::{
 
 use iree_rocket_hal::rocket::{
     conv::{
-        PingPong, PointerMode, RegisterAmount, Tiling, build_tiled_conv_regcmds, cycles_per_pixel,
-        link_tiled_conv_regcmds, plan_tiled_conv,
+        InterruptMask, PingPong, PointerMode, RegisterAmount, Tiling, build_tiled_conv_regcmds,
+        cycles_per_pixel, link_tiled_conv_regcmds, plan_tiled_conv,
     },
     device::{Buffer, close_bo, fini_bo, prep_bo, submit, submit_tasks},
     regcmd::{
@@ -231,7 +243,25 @@ fn run_tiled_conv(
     ping_pong: PingPong,
     dispatch: Dispatch,
 ) -> Run {
-    run_tiled_conv_settling(shape, tiling, ping_pong, dispatch, None)
+    run_tiled_conv_settling(
+        shape,
+        tiling,
+        ping_pong,
+        dispatch,
+        InterruptMask::default(),
+        None,
+    )
+}
+
+/// As [`run_tiled_conv`], with an explicit [`InterruptMask`] override.
+fn run_tiled_conv_masked(
+    shape: &ConvShape,
+    tiling: Tiling,
+    ping_pong: PingPong,
+    dispatch: Dispatch,
+    interrupt_mask: InterruptMask,
+) -> Run {
+    run_tiled_conv_settling(shape, tiling, ping_pong, dispatch, interrupt_mask, None)
 }
 
 /// As [`run_tiled_conv`], but when `settle` is set, the output buffer is
@@ -246,6 +276,7 @@ fn run_tiled_conv_settling(
     tiling: Tiling,
     ping_pong: PingPong,
     dispatch: Dispatch,
+    interrupt_mask: InterruptMask,
     settle: Option<Duration>,
 ) -> Run {
     let plan = plan_tiled_conv(shape, tiling, ping_pong).expect("tiled convolution plan");
@@ -309,7 +340,8 @@ fn run_tiled_conv_settling(
             bias_addr: buf_bias.dma_address,
             output_addr: buf_out.dma_address,
         };
-        let mut tasks = build_tiled_conv_regcmds(&plan, &bufs).expect("tiled convolution regcmds");
+        let mut tasks = build_tiled_conv_regcmds(&plan, &bufs, interrupt_mask)
+            .expect("tiled convolution regcmds");
 
         // One command buffer per tile. Addresses have to exist before the
         // PC links can be patched, so allocate first, then link, then fill.
@@ -612,20 +644,19 @@ fn row_tiles_as_kernel_tasks_with_explicit_pointers() {
 }
 
 //===========================================================================
-// Diagnostics for the "tile 0 correct, later rows zero" failure.
+// Diagnostics for the "first task only" failure. Both have now run on
+// hardware; their answers are recorded in this file's doc comment and drove
+// the eBPF tracing that found the root cause. They stay as regression
+// witnesses -- if the interrupt path is ever fixed, both should flip.
 //
-// What the driver source (`rocket_job.c`) already rules out: the later tasks
-// ARE dispatched. `rocket_job_handle_irq()` re-enters
-// `rocket_job_hw_submit()` while `next_task_idx < task_count` and signals
-// `done_fence` only after the last task -- and the failing runs' `prep_bo`
-// returns successfully in ~510 ms rather than hitting its 2 s timeout, so
-// the fence was signaled, so every task was submitted. The later tiles run
-// and produce nothing; they are not skipped.
-//
-// Note also that `pm_runtime_get_sync` and `iommu_attach_group` are in
-// `rocket_job_run` (once per job), not in `hw_submit` (once per task), so
-// the ~510 ms per-job constant says nothing about how many tasks ran -- a
-// per-task IRQ round trip is microseconds against it.
+// A caution for anyone repeating this reasoning: `prep_bo` returning
+// successfully does NOT mean the job completed cleanly. It returns because
+// the timeout-and-reset path force-completes the fence. An earlier revision
+// of this comment argued from a successful `prep_bo` that every task must
+// have been dispatched; the eBPF trace showed the opposite. Likewise, the
+// ~510 ms per job says nothing about how many tasks ran -- it is the
+// scheduler's timeout, and `pm_runtime_get_sync`/`iommu_attach_group` are
+// per-job (`rocket_job_run`) rather than per-task (`hw_submit`) anyway.
 //===========================================================================
 
 /// Did the later tiles write *late* rather than not at all? Re-fences and
@@ -633,9 +664,10 @@ fn row_tiles_as_kernel_tasks_with_explicit_pointers() {
 ///
 /// Asserts nothing about the first read (that failure is already covered
 /// above); it asserts that the second read is no better than the first, i.e.
-/// that this is genuinely not a CPU-looked-too-early problem. If the second
-/// read IS better, that inverts the whole investigation: the fix would be on
-/// the fence/wait side, not in the register programming.
+/// that this is genuinely not a CPU-looked-too-early problem.
+///
+/// **Hardware result: passes** -- zero rows are 38..=111 both before and
+/// after 500 ms. The later tiles never write at all.
 #[test]
 #[ignore = "needs the real NPU device -- cross-compile for aarch64, copy to the board, run there"]
 fn late_tile_rows_do_not_appear_after_settling() {
@@ -645,6 +677,7 @@ fn late_tile_rows_do_not_appear_after_settling() {
         Tiling::Tiles(3),
         PingPong::default(),
         Dispatch::KernelTasks(Order::Forward),
+        InterruptMask::default(),
         Some(Duration::from_millis(500)),
     );
     let before = zero_rows(&shape, &run.output);
@@ -689,6 +722,12 @@ fn late_tile_rows_do_not_appear_after_settling() {
 /// - all rows correct -> reversal fixed it, which would point at the
 ///   input-side CBUF/DMA state carried between tasks rather than at
 ///   dispatch.
+///
+/// **Hardware result: the first case.** Zero rows came back as 0..=74, so
+/// tile 2 -- submitted first -- is the one that ran. Purely positional. The
+/// assertion below is still the correct one (a fixed driver must produce the
+/// whole tensor regardless of order), so this test stays red until the
+/// interrupt path is fixed.
 #[test]
 #[ignore = "needs the real NPU device -- cross-compile for aarch64, copy to the board, run there"]
 fn reversed_task_order_shows_whether_the_failure_is_positional() {
@@ -705,6 +744,101 @@ fn reversed_task_order_shows_whether_the_failure_is_positional() {
         row_span(&zero_rows(&shape, &run.output))
     );
     assert_matches_oracle(&shape, &run, "kernel_tasks_reversed");
+}
+
+//===========================================================================
+// The interrupt path. `/proc/interrupts` on the board shows the NPU's three
+// shared GIC lines (`fdab0000.npu` and siblings) at byte-identical counts
+// before and after a full test run: not one interrupt is delivered. The NPU
+// never asserts the line, so the driver's hard handler never runs and every
+// job is force-completed ~500 ms later by the scheduler's timeout.
+//
+// A regcmd is fetched after the driver's AHB register writes, so userspace
+// can overwrite `PC_INTERRUPT_MASK` before any block is enabled -- see
+// `conv::InterruptMask`. If the register's polarity is the opposite of what
+// the TRM documents, the driver masks off exactly the two DPU completion
+// events it waits for, and these tests fix it without a kernel change.
+//
+// The signal to watch is wall clock, not just correctness: a job that
+// completes cleanly should finish in single-digit milliseconds, against the
+// ~510 ms every other test here reports. Correct output alone proves
+// nothing, since the reset path already delivers that.
+//===========================================================================
+
+/// Does un-masking every interrupt source make a *single-task* job complete
+/// cleanly instead of being force-reset?
+///
+/// Deliberately one tile: this isolates the completion interrupt from
+/// multi-task dispatch entirely. Output correctness is already established
+/// for this shape, so the assertion that matters is the wall clock.
+#[test]
+#[ignore = "needs the real NPU device -- cross-compile for aarch64, copy to the board, run there"]
+fn single_tile_with_all_interrupts_unmasked_completes_without_timeout() {
+    let shape = shape(4, 4);
+    let run = run_tiled_conv_masked(
+        &shape,
+        Tiling::Tiles(1),
+        PingPong::default(),
+        Dispatch::SeparateJobs,
+        InterruptMask::All,
+    );
+    report("single_tile / mask=All", &shape, &run);
+    assert_matches_oracle(&shape, &run, "single_tile / mask=All");
+    assert!(
+        run.elapsed < Duration::from_millis(400),
+        "took {:?}, i.e. still the ~500ms drm_sched timeout -- unmasking every \
+         interrupt source did not make the NPU raise its completion IRQ, so \
+         the mask polarity is not the explanation. Compare \
+         `single_tile_matches_the_oracle`'s own ~517ms.",
+        run.elapsed
+    );
+}
+
+/// Same probe with only the two bits the driver intends. Distinguishes a
+/// wrong mask *value* (this fails, `mask=All` passes -> inverted polarity)
+/// from a driver write that never lands (both pass).
+#[test]
+#[ignore = "needs the real NPU device -- cross-compile for aarch64, copy to the board, run there"]
+fn single_tile_with_dpu_interrupts_unmasked_completes_without_timeout() {
+    let shape = shape(4, 4);
+    let run = run_tiled_conv_masked(
+        &shape,
+        Tiling::Tiles(1),
+        PingPong::default(),
+        Dispatch::SeparateJobs,
+        InterruptMask::DpuOnly,
+    );
+    report("single_tile / mask=DpuOnly", &shape, &run);
+    assert_matches_oracle(&shape, &run, "single_tile / mask=DpuOnly");
+    assert!(
+        run.elapsed < Duration::from_millis(400),
+        "took {:?}, i.e. still the ~500ms drm_sched timeout",
+        run.elapsed
+    );
+}
+
+/// The payoff, if either probe above works: with a real completion IRQ, the
+/// driver's `rocket_job_handle_irq()` should re-enter `hw_submit` for tiles 1
+/// and 2, and the whole tensor should land from one multi-task job.
+///
+/// Expected to keep failing exactly as before if the mask is not the issue.
+#[test]
+#[ignore = "needs the real NPU device -- cross-compile for aarch64, copy to the board, run there"]
+fn row_tiles_as_kernel_tasks_with_all_interrupts_unmasked() {
+    let shape = shape(112, 112);
+    let run = run_tiled_conv_masked(
+        &shape,
+        Tiling::Tiles(3),
+        PingPong::default(),
+        Dispatch::KernelTasks(Order::Forward),
+        InterruptMask::All,
+    );
+    report("kernel_tasks / mask=All", &shape, &run);
+    eprintln!(
+        "kernel_tasks / mask=All: zero rows = {}",
+        row_span(&zero_rows(&shape, &run.output))
+    );
+    assert_matches_oracle(&shape, &run, "kernel_tasks / mask=All");
 }
 
 /// The real target: one kernel task, the PC walking the tile chain itself

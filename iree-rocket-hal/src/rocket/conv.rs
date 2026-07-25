@@ -131,20 +131,58 @@
 //!
 //! - one tile, and row tiles as one DRM job each: **correct**, exact
 //!   against a position-dependent oracle;
-//! - row tiles as multiple tasks in one job: **tile 0's rows correct, every
-//!   later row zero**, identically across all three [`PointerMode`]s and
-//!   both [`RegisterAmount`]s.
+//! - row tiles as multiple tasks in one job: **only the first submitted
+//!   task's rows are written**, every later row zero -- identically across
+//!   all three [`PointerMode`]s and all three [`RegisterAmount`]s.
 //!
-//! The fence *is* signaled rather than timing out, and the driver only
-//! signals `done_fence` once `next_task_idx == task_count`, so every task
-//! was submitted -- the later tiles run and produce nothing, rather than
-//! never being dispatched. Root cause still open; see that file's
-//! diagnostic tests.
+//! # Root cause: the NPU's completion IRQ never reaches the driver
+//!
+//! An eBPF trace of the driver on the board (`rocket-npu-trace`, kprobes on
+//! `rocket_job_run` / `rocket_job_hw_submit.part.0` /
+//! `rocket_job_irq_handler_thread` / `rocket_job_free` /
+//! `rocket_job_timedout` / `rocket_reset.part.0`) shows, across 69 jobs:
+//!
+//! ```text
+//! submits=69  ops=0  jobs_done=69  timeouts=69  resets=69
+//! op latency (hw_submit -> irq):  (no data yet)
+//! job latency (run -> free):      268.44ms-536.87ms
+//! ```
+//!
+//! Every job times out in `drm_sched` and is force-reset. `ops=0`: the
+//! hw_submit -> IRQ pairing never completes even once. That is the whole
+//! explanation for the multi-task failure, because
+//! `rocket_job_handle_irq()` is the *only* thing that re-enters
+//! `rocket_job_hw_submit()` for task N+1 -- driven by an interrupt that
+//! never arrives, so later tasks are never dispatched at all. The
+//! hardware-tested signature agrees exactly: submit the tiles in reverse
+//! and it is tile *2*'s rows that survive, not tile 0's, so the fault is
+//! positional (first task only) rather than anything about a particular
+//! tile's register program.
+//!
+//! Two corollaries worth stating plainly:
+//!
+//! - the ~510 ms "per job" cost every hardware test in this crate shows is
+//!   the `drm_sched` **timeout**, not hardware time, not power management;
+//! - every passing hardware test in this crate has been completing through
+//!   the timeout-and-reset path rather than through clean completion. The
+//!   compute is right; completion signaling has apparently never worked on
+//!   this board. Single-task tests do not notice, because the reset happens
+//!   after the DPU has already written correct output.
+//!
+//! So multi-task dispatch cannot work, in any [`PointerMode`] or with any
+//! chain encoding, until the interrupt path is fixed. Nothing in this module
+//! writes `PC_INTERRUPT_MASK`/`PC_INTERRUPT_CLEAR` (verified: no builder in
+//! this crate emits either), so the regcmds are not masking it off -- the
+//! remaining suspects are all on the driver/SoC side.
 
 use crate::rocket::{
     builders::{
-        Bits, DOMAIN_PC, RegCmd, Register, RegisterMeta, cna::CnaSPointer, core::CoreSPointer,
-        dpu::DpuSPointer, dpu_rdma::DpuRdmaSPointer, pc::PCTaskCon,
+        Bits, DOMAIN_PC, RegCmd, Register, RegisterMeta,
+        cna::CnaSPointer,
+        core::CoreSPointer,
+        dpu::DpuSPointer,
+        dpu_rdma::DpuRdmaSPointer,
+        pc::{PCInterruptMask, PCTaskCon},
     },
     executable_format::validate_conv_shape,
     regcmd::{
@@ -692,19 +730,85 @@ fn apply_payload_s_pointer(payload: &mut Vec<RegCmd>, value: Option<u32>) {
     }
 }
 
+/// Whether a tile's regcmd re-programs `PC_INTERRUPT_MASK`, and to what.
+///
+/// # Why this knob exists
+///
+/// On the board, the NPU's shared GIC lines (`fdab0000.npu` and siblings)
+/// show **zero** delivered interrupts across a whole test run -- the
+/// counters in `/proc/interrupts` are byte-identical before and after. So
+/// the NPU never asserts its line, which is upstream of the driver's hard
+/// handler and its `PC_INTERRUPT_RAW_STATUS` check: nothing rejects the
+/// interrupt, there simply isn't one.
+///
+/// `rocket_job_hw_submit()` writes, over AHB, before every kick:
+///
+/// ```text
+/// rocket_pc_writel(core, INTERRUPT_MASK, PC_INTERRUPT_MASK_DPU_0 |
+///                                        PC_INTERRUPT_MASK_DPU_1);
+/// ```
+///
+/// The TRM has this register's 17-bit field enabling propagation, reset
+/// `0x1ffff` (everything on) -- so that write is *intended* to enable the
+/// two DPU completion events and disable the other fifteen. If the real
+/// polarity is inverted (1 = masked), the driver masks off precisely the two
+/// events it then waits for, on every kick, which would produce exactly the
+/// observed "no interrupt, ever, on any job".
+///
+/// This is testable from userspace without touching the kernel, because a
+/// regcmd is fetched by the PC *after* the driver's AHB writes and can
+/// therefore overwrite the mask before the blocks are enabled.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Default)]
+pub enum InterruptMask {
+    /// Emit nothing; the driver's `DPU_0 | DPU_1` stands. Current behavior.
+    #[default]
+    Driver,
+    /// Write the register's reset value, all 17 sources on. If the polarity
+    /// is inverted this un-masks the DPU events and the job should complete
+    /// cleanly instead of being force-completed ~500 ms later by the
+    /// scheduler's timeout.
+    All,
+    /// Write the same two bits the driver intends, but from here. Separates
+    /// "the value is wrong" from "the write is being lost or overridden" --
+    /// if `All` fixes it and this does not, the polarity is inverted; if
+    /// both fix it, the driver's write is not landing at all.
+    DpuOnly,
+}
+
+impl InterruptMask {
+    /// The `PC_INTERRUPT_MASK` value to emit, or `None` to emit nothing.
+    fn value(self) -> Option<u32> {
+        match self {
+            InterruptMask::Driver => None,
+            // 0x1ffff via `from_val` rather than the typed setters: bits
+            // 14-16 are inside the TRM's 17-bit field and its reset value,
+            // but have no documented event, so `PCInterruptMask` has no
+            // setter for them.
+            InterruptMask::All => Some(0x1_ffff),
+            InterruptMask::DpuOnly => Some(
+                Register::<PCInterruptMask>::new()
+                    .dpu_0(true)
+                    .dpu_1(true)
+                    .into_val(),
+            ),
+        }
+    }
+}
+
 /// Builds one regcmd buffer per tile, in dispatch order.
 ///
 /// Each buffer is a complete conv task program for its row window
 /// (`build_conv_regcmd`'s emission, with the tile's own input/output byte
 /// offsets and CBUF bank split) wrapped in this module's ping-pong
-/// preamble and a multi-task kick tail. The tail's trailing
-/// `PC_BASE_ADDRESS`/`PC_REGISTER_AMOUNTS` pair is left zeroed; a
-/// hardware-walked chain patches it via [`link_tiled_conv_regcmds`] once
-/// the command buffers' DMA addresses are known, and a kernel-walked
-/// submission leaves it alone.
+/// preamble, an optional [`InterruptMask`] override, and a multi-task kick
+/// tail. The tail's trailing `PC_BASE_ADDRESS`/`PC_REGISTER_AMOUNTS` pair is
+/// left zeroed; a hardware-walked chain patches it via
+/// [`link_tiled_conv_regcmds`] once the command buffers' DMA addresses are
+/// known, and a kernel-walked submission leaves it alone.
 pub fn build_tiled_conv_regcmds(
     plan: &TiledConv,
     bufs: &ConvBuffers,
+    interrupt_mask: InterruptMask,
 ) -> Result<Vec<Vec<RegCmd>>, &'static str> {
     if plan.tiles.is_empty() {
         return Err("tiled convolution plan has no tiles");
@@ -756,6 +860,13 @@ pub fn build_tiled_conv_regcmds(
                 apply_payload_s_pointer(&mut payload, s_pointer);
             }
             cmds.extend(payload);
+
+            // Last thing before the kick tail, so it overrides the driver's
+            // own AHB write and still lands before any block is enabled.
+            if let Some(mask) = interrupt_mask.value() {
+                cmds.push(Register::<PCInterruptMask>::from_val(mask).build());
+            }
+
             // The multi-task tail even for `task_count == 1`: it costs one
             // regcmd word over the single-task placeholder and keeps the
             // link trailer at a findable offset, so a one-tile plan stays
@@ -1245,7 +1356,7 @@ mod tests {
             PingPong::default(),
         )
         .unwrap();
-        let tasks = build_tiled_conv_regcmds(&plan, &buffers()).unwrap();
+        let tasks = build_tiled_conv_regcmds(&plan, &buffers(), InterruptMask::default()).unwrap();
         assert_eq!(tasks.len(), 3);
 
         // Tile 0, all four blocks: pointer group 0, both pp_clear pulses,
@@ -1292,7 +1403,7 @@ mod tests {
             },
         )
         .unwrap();
-        let tasks = build_tiled_conv_regcmds(&plan, &buffers()).unwrap();
+        let tasks = build_tiled_conv_regcmds(&plan, &buffers(), InterruptMask::default()).unwrap();
 
         for (index, task) in tasks.iter().enumerate() {
             // pointer = index & 1, everything else clear (`executers:
@@ -1315,7 +1426,7 @@ mod tests {
         let shape = fp16_c32_to_c16(112, 112);
         let bufs = buffers();
         let plan = plan_tiled_conv(&shape, Tiling::Tiles(3), PingPong::off()).unwrap();
-        let tasks = build_tiled_conv_regcmds(&plan, &bufs).unwrap();
+        let tasks = build_tiled_conv_regcmds(&plan, &bufs, InterruptMask::default()).unwrap();
 
         let payload_value = (1 << 3) | (1 << 2) | (1 << 1);
         for (tile, task) in plan.tiles.iter().zip(&tasks) {
@@ -1345,7 +1456,7 @@ mod tests {
         let shape = fp16_c32_to_c16(112, 112);
         let bufs = buffers();
         let plan = plan_tiled_conv(&shape, Tiling::Tiles(3), PingPong::default()).unwrap();
-        let tasks = build_tiled_conv_regcmds(&plan, &bufs).unwrap();
+        let tasks = build_tiled_conv_regcmds(&plan, &bufs, InterruptMask::default()).unwrap();
 
         for (tile, commands) in plan.tiles.iter().zip(&tasks) {
             let single = crate::rocket::regcmd::build_conv_cna_core_dpu_dpu_rdma(
@@ -1362,6 +1473,49 @@ mod tests {
                     "tile {} dropped payload regcmd {:#018x}",
                     tile.index,
                     expected.0
+                );
+            }
+        }
+    }
+
+    /// The mask override has to be the last register write before the kick
+    /// tail (so it beats the driver's AHB write and still precedes any block
+    /// being enabled), and absent entirely by default.
+    #[test]
+    fn interrupt_mask_override_lands_just_before_the_kick() {
+        let plan = plan_tiled_conv(
+            &fp16_c32_to_c16(112, 112),
+            Tiling::Tiles(3),
+            PingPong::default(),
+        )
+        .unwrap();
+
+        let untouched = build_tiled_conv_regcmds(&plan, &buffers(), InterruptMask::Driver).unwrap();
+        for task in &untouched {
+            assert_eq!(writes::<PCInterruptMask>(task), Vec::<u32>::new());
+        }
+
+        for (mask, expected) in [
+            (InterruptMask::All, 0x1_ffff),
+            // dpu_0 | dpu_1 == bits 8 and 9, matching the driver's own
+            // PC_INTERRUPT_MASK_DPU_0 | PC_INTERRUPT_MASK_DPU_1.
+            (InterruptMask::DpuOnly, (1 << 8) | (1 << 9)),
+        ] {
+            let tasks = build_tiled_conv_regcmds(&plan, &buffers(), mask).unwrap();
+            for task in &tasks {
+                assert_eq!(writes::<PCInterruptMask>(task), vec![expected], "{mask:?}");
+
+                let mask_index = task
+                    .iter()
+                    .position(is_register::<PCInterruptMask>)
+                    .expect("the override is emitted");
+                let trailer = crate::rocket::regcmd::task_link_trailer_index(task).unwrap();
+                assert_eq!(
+                    mask_index + 1,
+                    trailer,
+                    "{mask:?}: the mask write must sit immediately before the \
+                     PC link trailer, i.e. after every payload register and \
+                     before PC_OPERATION_ENABLE"
                 );
             }
         }
@@ -1398,7 +1552,8 @@ mod tests {
                 PingPong::default(),
             )
             .unwrap();
-            let mut tasks = build_tiled_conv_regcmds(&plan, &buffers()).unwrap();
+            let mut tasks =
+                build_tiled_conv_regcmds(&plan, &buffers(), InterruptMask::default()).unwrap();
             let trailers = tasks
                 .iter()
                 .map(|task| crate::rocket::regcmd::task_link_trailer_index(task).unwrap())
@@ -1445,7 +1600,8 @@ mod tests {
             PingPong::default(),
         )
         .unwrap();
-        let mut tasks = build_tiled_conv_regcmds(&plan, &buffers()).unwrap();
+        let mut tasks =
+            build_tiled_conv_regcmds(&plan, &buffers(), InterruptMask::default()).unwrap();
         for amount in [
             RegisterAmount::Driver,
             RegisterAmount::MesaHalvedEven,
