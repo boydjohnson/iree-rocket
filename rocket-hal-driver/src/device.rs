@@ -10,35 +10,39 @@
 
 use std::os::fd::AsRawFd;
 
-use crate::bindings::{
-    iree_allocator_t, iree_const_byte_span_t, iree_device_size_t, iree_hal_alloca_flags_t,
-    iree_hal_allocator_t, iree_hal_buffer_binding_table_t, iree_hal_buffer_params_t,
-    iree_hal_buffer_ref_list_t, iree_hal_buffer_t, iree_hal_channel_params_t,
-    iree_hal_channel_provider_t, iree_hal_channel_t, iree_hal_command_buffer_mode_t,
-    iree_hal_command_buffer_t, iree_hal_command_category_t, iree_hal_copy_flags_t,
-    iree_hal_dealloca_flags_t, iree_hal_device_capabilities_t, iree_hal_device_create_params_t,
-    iree_hal_device_external_capture_options_t, iree_hal_device_profiling_options_t,
-    iree_hal_device_t, iree_hal_device_topology_info_t, iree_hal_device_vtable_t,
-    iree_hal_dispatch_config_t, iree_hal_dispatch_flags_t, iree_hal_event_flags_t,
-    iree_hal_event_t, iree_hal_executable_cache_t, iree_hal_executable_function_t,
-    iree_hal_executable_t, iree_hal_execute_flags_t, iree_hal_external_file_flags_t,
-    iree_hal_file_t, iree_hal_fill_flags_t, iree_hal_host_call_context_t,
-    iree_hal_host_call_flag_bits_e_IREE_HAL_HOST_CALL_FLAG_NON_BLOCKING,
-    iree_hal_host_call_flags_t, iree_hal_host_call_t, iree_hal_memory_access_t, iree_hal_pool_t,
-    iree_hal_queue_affinity_t, iree_hal_queue_pool_backend_t, iree_hal_read_flags_t,
-    iree_hal_resource_t,
-    iree_hal_semaphore_compatibility_bits_t_IREE_HAL_SEMAPHORE_COMPATIBILITY_ALL,
-    iree_hal_semaphore_compatibility_t, iree_hal_semaphore_flags_t, iree_hal_semaphore_list_t,
-    iree_hal_semaphore_t, iree_hal_topology_edge_t, iree_hal_update_flags_t,
-    iree_hal_write_flags_t, iree_host_size_t, iree_io_file_handle_t,
-    iree_status_code_e_IREE_STATUS_INTERNAL, iree_status_code_e_IREE_STATUS_INVALID_ARGUMENT,
-    iree_status_code_e_IREE_STATUS_UNAVAILABLE, iree_status_t, iree_string_view_t, iree_timeout_t,
-    iree_timeout_type_e_IREE_TIMEOUT_ABSOLUTE,
+use crate::{
+    bindings::{
+        iree_allocator_t, iree_const_byte_span_t, iree_device_size_t, iree_hal_alloca_flags_t,
+        iree_hal_allocator_t, iree_hal_buffer_binding_table_t, iree_hal_buffer_params_t,
+        iree_hal_buffer_ref_list_t, iree_hal_buffer_t, iree_hal_channel_params_t,
+        iree_hal_channel_provider_t, iree_hal_channel_t, iree_hal_command_buffer_mode_t,
+        iree_hal_command_buffer_t, iree_hal_command_category_t, iree_hal_copy_flags_t,
+        iree_hal_dealloca_flags_t, iree_hal_device_capabilities_t, iree_hal_device_create_params_t,
+        iree_hal_device_external_capture_options_t, iree_hal_device_profiling_options_t,
+        iree_hal_device_t, iree_hal_device_topology_info_t, iree_hal_device_vtable_t,
+        iree_hal_dispatch_config_t, iree_hal_dispatch_flags_t, iree_hal_event_flags_t,
+        iree_hal_event_t, iree_hal_executable_cache_t, iree_hal_executable_function_t,
+        iree_hal_executable_t, iree_hal_execute_flags_t, iree_hal_external_file_flags_t,
+        iree_hal_file_t, iree_hal_fill_flags_t, iree_hal_host_call_context_t,
+        iree_hal_host_call_flag_bits_e_IREE_HAL_HOST_CALL_FLAG_NON_BLOCKING,
+        iree_hal_host_call_flags_t, iree_hal_host_call_t, iree_hal_memory_access_t,
+        iree_hal_pool_t, iree_hal_queue_affinity_t, iree_hal_queue_pool_backend_t,
+        iree_hal_read_flags_t, iree_hal_resource_t,
+        iree_hal_semaphore_compatibility_bits_t_IREE_HAL_SEMAPHORE_COMPATIBILITY_ALL,
+        iree_hal_semaphore_compatibility_t, iree_hal_semaphore_flags_t, iree_hal_semaphore_list_t,
+        iree_hal_semaphore_t, iree_hal_topology_edge_t, iree_hal_update_flags_t,
+        iree_hal_write_flags_t, iree_host_size_t, iree_io_file_handle_t,
+        iree_status_code_e_IREE_STATUS_INTERNAL, iree_status_code_e_IREE_STATUS_INVALID_ARGUMENT,
+        iree_status_code_e_IREE_STATUS_UNAVAILABLE, iree_status_t, iree_string_view_t,
+        iree_timeout_t, iree_timeout_type_e_IREE_TIMEOUT_ABSOLUTE,
+    },
+    buffer::RocketBuffer,
+    status,
 };
-use crate::buffer::RocketBuffer;
-use crate::status;
-use iree_rocket_hal::rocket::api::{DRM_IOCTL_BASE, drm_version};
-use iree_rocket_hal::rocket::device as rocket_device;
+use iree_rocket_hal::rocket::{
+    api::{DRM_IOCTL_BASE, drm_version},
+    device as rocket_device,
+};
 
 const DEVICE_PATH: &str = "/dev/accel/accel0";
 const DISPATCH_COMPLETION_TIMEOUT_NS: u64 = 10_000_000_000;

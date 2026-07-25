@@ -4,14 +4,17 @@
 //! `create_device_by_path` open a fresh handle and hand off to
 //! `device::create`.
 
-use crate::bindings::{
-    iree_allocator_t, iree_hal_device_create_params_t, iree_hal_device_id_t,
-    iree_hal_device_info_t, iree_hal_device_t, iree_hal_driver_factory_t, iree_hal_driver_info_t,
-    iree_hal_driver_registry_t, iree_hal_driver_t, iree_hal_driver_vtable_t, iree_hal_resource_t,
-    iree_host_size_t, iree_status_code_e_IREE_STATUS_UNAVAILABLE, iree_status_t,
-    iree_string_builder_t, iree_string_pair_t, iree_string_view_t,
+use crate::{
+    bindings::{
+        iree_allocator_t, iree_hal_device_create_params_t, iree_hal_device_id_t,
+        iree_hal_device_info_t, iree_hal_device_t, iree_hal_driver_factory_t,
+        iree_hal_driver_info_t, iree_hal_driver_registry_t, iree_hal_driver_t,
+        iree_hal_driver_vtable_t, iree_hal_resource_t, iree_host_size_t,
+        iree_status_code_e_IREE_STATUS_UNAVAILABLE, iree_status_t, iree_string_builder_t,
+        iree_string_pair_t, iree_string_view_t,
+    },
+    status,
 };
-use crate::status;
 
 const DRIVER_NAME: &[u8] = b"rocket";
 const DEVICE_PATH: &str = "/dev/accel/accel0";

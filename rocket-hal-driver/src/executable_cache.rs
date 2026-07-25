@@ -40,18 +40,20 @@
 //! `command_buffer.rs`'s `catch_unwind` wrapper around that call for the
 //! backstop covering whatever gap remains.
 
-use crate::bindings::{
-    iree_const_byte_span_t, iree_hal_executable_cache_t, iree_hal_executable_cache_vtable_t,
-    iree_hal_executable_caching_mode_t, iree_hal_executable_params_t, iree_hal_executable_t,
-    iree_hal_resource_t, iree_host_size_t, iree_status_t, iree_string_view_t,
+use crate::{
+    bindings::{
+        iree_const_byte_span_t, iree_hal_executable_cache_t, iree_hal_executable_cache_vtable_t,
+        iree_hal_executable_caching_mode_t, iree_hal_executable_params_t, iree_hal_executable_t,
+        iree_hal_resource_t, iree_host_size_t, iree_status_t, iree_string_view_t,
+    },
+    executable::{Conv2dExecutable, RuntimeConv2dDimension, UkernelShape},
+    status,
 };
-use crate::executable::{Conv2dExecutable, RuntimeConv2dDimension, UkernelShape};
-use crate::status;
-use iree_rocket_hal::rocket::executable_format::{
-    CONV2D_V1_TAG, decode_conv_shape_v1, validate_conv_shape,
-};
-use iree_rocket_hal::rocket::regcmd::{
-    Activation, ConvShape, FcShape, PoolingMethod, PoolingShape, Precision, fc_as_conv_shape,
+use iree_rocket_hal::rocket::{
+    executable_format::{CONV2D_V1_TAG, decode_conv_shape_v1, validate_conv_shape},
+    regcmd::{
+        Activation, ConvShape, FcShape, PoolingMethod, PoolingShape, Precision, fc_as_conv_shape,
+    },
 };
 use rocket_schema::rocket as schema;
 

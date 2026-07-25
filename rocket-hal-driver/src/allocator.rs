@@ -10,26 +10,29 @@ use std::os::fd::AsRawFd;
 
 use iree_rocket_hal::rocket::device;
 
-use crate::bindings::{
-    iree_allocator_t, iree_device_size_t, iree_hal_allocator_memory_heap_t,
-    iree_hal_allocator_statistics_t, iree_hal_allocator_t, iree_hal_allocator_vtable_t,
-    iree_hal_buffer_compatibility_bits_t_IREE_HAL_BUFFER_COMPATIBILITY_ALLOCATABLE,
-    iree_hal_buffer_compatibility_bits_t_IREE_HAL_BUFFER_COMPATIBILITY_QUEUE_DISPATCH,
-    iree_hal_buffer_compatibility_bits_t_IREE_HAL_BUFFER_COMPATIBILITY_QUEUE_TRANSFER,
-    iree_hal_buffer_compatibility_t, iree_hal_buffer_params_t,
-    iree_hal_buffer_placement_flag_bits_t_IREE_HAL_BUFFER_PLACEMENT_FLAG_ASYNCHRONOUS,
-    iree_hal_buffer_placement_t, iree_hal_buffer_release_callback_t, iree_hal_buffer_t,
-    iree_hal_buffer_usage_bits_t_IREE_HAL_BUFFER_USAGE_MAPPING_ACCESS_RANDOM,
-    iree_hal_buffer_usage_bits_t_IREE_HAL_BUFFER_USAGE_MAPPING_PERSISTENT,
-    iree_hal_buffer_usage_bits_t_IREE_HAL_BUFFER_USAGE_MAPPING_SCOPED,
-    iree_hal_external_buffer_flags_t, iree_hal_external_buffer_t, iree_hal_external_buffer_type_t,
-    iree_hal_memory_advice_t, iree_hal_memory_protection_t,
-    iree_hal_memory_type_bits_t_IREE_HAL_MEMORY_TYPE_DEVICE_VISIBLE,
-    iree_hal_memory_type_bits_t_IREE_HAL_MEMORY_TYPE_HOST_VISIBLE,
-    iree_hal_memory_type_bits_t_IREE_HAL_MEMORY_TYPE_OPTIMAL, iree_hal_physical_memory_t,
-    iree_hal_queue_affinity_t, iree_hal_resource_t, iree_host_size_t, iree_status_t,
+use crate::{
+    bindings::{
+        iree_allocator_t, iree_device_size_t, iree_hal_allocator_memory_heap_t,
+        iree_hal_allocator_statistics_t, iree_hal_allocator_t, iree_hal_allocator_vtable_t,
+        iree_hal_buffer_compatibility_bits_t_IREE_HAL_BUFFER_COMPATIBILITY_ALLOCATABLE,
+        iree_hal_buffer_compatibility_bits_t_IREE_HAL_BUFFER_COMPATIBILITY_QUEUE_DISPATCH,
+        iree_hal_buffer_compatibility_bits_t_IREE_HAL_BUFFER_COMPATIBILITY_QUEUE_TRANSFER,
+        iree_hal_buffer_compatibility_t, iree_hal_buffer_params_t,
+        iree_hal_buffer_placement_flag_bits_t_IREE_HAL_BUFFER_PLACEMENT_FLAG_ASYNCHRONOUS,
+        iree_hal_buffer_placement_t, iree_hal_buffer_release_callback_t, iree_hal_buffer_t,
+        iree_hal_buffer_usage_bits_t_IREE_HAL_BUFFER_USAGE_MAPPING_ACCESS_RANDOM,
+        iree_hal_buffer_usage_bits_t_IREE_HAL_BUFFER_USAGE_MAPPING_PERSISTENT,
+        iree_hal_buffer_usage_bits_t_IREE_HAL_BUFFER_USAGE_MAPPING_SCOPED,
+        iree_hal_external_buffer_flags_t, iree_hal_external_buffer_t,
+        iree_hal_external_buffer_type_t, iree_hal_memory_advice_t, iree_hal_memory_protection_t,
+        iree_hal_memory_type_bits_t_IREE_HAL_MEMORY_TYPE_DEVICE_VISIBLE,
+        iree_hal_memory_type_bits_t_IREE_HAL_MEMORY_TYPE_HOST_VISIBLE,
+        iree_hal_memory_type_bits_t_IREE_HAL_MEMORY_TYPE_OPTIMAL, iree_hal_physical_memory_t,
+        iree_hal_queue_affinity_t, iree_hal_resource_t, iree_host_size_t, iree_status_t,
+    },
+    buffer::RocketBuffer,
+    status,
 };
-use crate::{buffer::RocketBuffer, status};
 
 /// What every `iree_hal_allocator_t*` this driver hands out actually
 /// points to. `iree_hal_allocator_t` (unlike `iree_hal_buffer_t`) has no

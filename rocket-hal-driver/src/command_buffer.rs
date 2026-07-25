@@ -56,21 +56,23 @@
 
 use std::os::fd::{AsRawFd, BorrowedFd, RawFd};
 
-use crate::bindings::{
-    iree_const_byte_span_t, iree_device_size_t, iree_hal_buffer_barrier_t,
-    iree_hal_buffer_ref_list_t, iree_hal_buffer_ref_t, iree_hal_buffer_t, iree_hal_channel_t,
-    iree_hal_collective_op_t, iree_hal_command_buffer_mode_t, iree_hal_command_buffer_t,
-    iree_hal_command_buffer_vtable_t, iree_hal_command_category_t, iree_hal_copy_flags_t,
-    iree_hal_dispatch_config_t, iree_hal_dispatch_flags_t, iree_hal_event_t,
-    iree_hal_executable_function_t, iree_hal_executable_t, iree_hal_execution_barrier_flags_t,
-    iree_hal_execution_stage_t, iree_hal_fill_flags_t, iree_hal_label_color_t,
-    iree_hal_label_location_t, iree_hal_memory_advise_flags_t, iree_hal_memory_barrier_t,
-    iree_hal_queue_affinity_t, iree_hal_update_flags_t, iree_host_size_t, iree_status_t,
-    iree_string_view_t,
+use crate::{
+    bindings::{
+        iree_const_byte_span_t, iree_device_size_t, iree_hal_buffer_barrier_t,
+        iree_hal_buffer_ref_list_t, iree_hal_buffer_ref_t, iree_hal_buffer_t, iree_hal_channel_t,
+        iree_hal_collective_op_t, iree_hal_command_buffer_mode_t, iree_hal_command_buffer_t,
+        iree_hal_command_buffer_vtable_t, iree_hal_command_category_t, iree_hal_copy_flags_t,
+        iree_hal_dispatch_config_t, iree_hal_dispatch_flags_t, iree_hal_event_t,
+        iree_hal_executable_function_t, iree_hal_executable_t, iree_hal_execution_barrier_flags_t,
+        iree_hal_execution_stage_t, iree_hal_fill_flags_t, iree_hal_label_color_t,
+        iree_hal_label_location_t, iree_hal_memory_advise_flags_t, iree_hal_memory_barrier_t,
+        iree_hal_queue_affinity_t, iree_hal_update_flags_t, iree_host_size_t, iree_status_t,
+        iree_string_view_t,
+    },
+    buffer::RocketBuffer,
+    executable::UkernelShape,
+    status,
 };
-use crate::buffer::RocketBuffer;
-use crate::executable::UkernelShape;
-use crate::status;
 use iree_rocket_hal::rocket::{
     builders::RegCmd,
     device::Buffer as RocketDeviceBuffer,

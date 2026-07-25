@@ -20,13 +20,15 @@ use std::os::fd::RawFd;
 
 use iree_rocket_hal::rocket::device;
 
-use crate::bindings::{
-    iree_byte_span_t, iree_device_size_t, iree_hal_buffer_mapping_t, iree_hal_buffer_t,
-    iree_hal_buffer_vtable_t, iree_hal_mapping_mode_t,
-    iree_hal_memory_access_bits_t_IREE_HAL_MEMORY_ACCESS_WRITE, iree_hal_memory_access_t,
-    iree_status_t,
+use crate::{
+    bindings::{
+        iree_byte_span_t, iree_device_size_t, iree_hal_buffer_mapping_t, iree_hal_buffer_t,
+        iree_hal_buffer_vtable_t, iree_hal_mapping_mode_t,
+        iree_hal_memory_access_bits_t_IREE_HAL_MEMORY_ACCESS_WRITE, iree_hal_memory_access_t,
+        iree_status_t,
+    },
+    status,
 };
-use crate::status;
 
 /// What every `iree_hal_buffer_t*` this driver hands out actually points
 /// to. `base` (the real, fully-defined `iree_hal_buffer_t` -- see

@@ -11,15 +11,19 @@
 //! executable-format parser (see that module's doc comment for the exact
 //! tag convention).
 
-use crate::bindings::{
-    iree_hal_buffer_t, iree_hal_executable_function_info_t,
-    iree_hal_executable_function_parameter_t, iree_hal_executable_function_t,
-    iree_hal_executable_t, iree_hal_executable_vtable_t, iree_hal_queue_affinity_t,
-    iree_hal_resource_t, iree_host_size_t, iree_status_t, iree_string_view_t,
+use crate::{
+    bindings::{
+        iree_hal_buffer_t, iree_hal_executable_function_info_t,
+        iree_hal_executable_function_parameter_t, iree_hal_executable_function_t,
+        iree_hal_executable_t, iree_hal_executable_vtable_t, iree_hal_queue_affinity_t,
+        iree_hal_resource_t, iree_host_size_t, iree_status_t, iree_string_view_t,
+    },
+    status,
 };
-use crate::status;
-use iree_rocket_hal::rocket::executable_format::validate_conv_shape;
-use iree_rocket_hal::rocket::regcmd::{ConvShape, FcShape, PoolingShape};
+use iree_rocket_hal::rocket::{
+    executable_format::validate_conv_shape,
+    regcmd::{ConvShape, FcShape, PoolingShape},
+};
 
 /// A logical Conv2D shape field supplied by one uint32 dispatch push constant.
 ///
