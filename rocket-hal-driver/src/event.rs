@@ -14,11 +14,13 @@
 //! them as a no-op execution barrier is exactly what's correct given the
 //! per-command-buffer sync granularity above.
 
-use crate::bindings::{
-    iree_allocator_t, iree_hal_event_flags_t, iree_hal_event_t, iree_hal_event_vtable_t,
-    iree_hal_queue_affinity_t, iree_hal_resource_t, iree_status_t,
+use crate::{
+    bindings::{
+        iree_allocator_t, iree_hal_event_flags_t, iree_hal_event_t, iree_hal_event_vtable_t,
+        iree_hal_queue_affinity_t, iree_hal_resource_t, iree_status_t,
+    },
+    status,
 };
-use crate::status;
 
 #[repr(C)]
 pub struct RocketEvent {

@@ -33,7 +33,10 @@ cmake --build iree-build/build
 # iree-run-module / iree-benchmark-module, host build, with HAL CTS
 (cd iree-build/host && cmake --preset runtime-host && cmake --build --preset runtime-host)
 
-# iree-run-module / iree-benchmark-module, cross-compiled for the RK3588 board
+# iree-run-module / iree-benchmark-module, cross-compiled for the RK3588 board.
+# Build compiler-host first: this preset points IREE_HOST_BIN_DIR at
+# iree-build/build/tools for codegen tools (e.g. iree-c-embed-data) that
+# IREE's build runs on the host even when cross-compiling the runtime.
 (cd iree-build/host-aarch64 && cmake --preset runtime-aarch64 && cmake --build --preset runtime-aarch64)
 ```
 

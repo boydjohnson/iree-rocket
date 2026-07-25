@@ -8,6 +8,14 @@
 cmake_minimum_required(VERSION 3.16)
 project(rocket_hal_driver_host C CXX ASM)
 
+# iree-src enables testing within its own subtree, but that doesn't propagate
+# to rocket-cts below -- it's added as a *sibling* subdirectory of this
+# project, not nested inside iree-src, and CMake's enable_testing() only
+# cascades from a directory to its own descendants. Without this, rocket-cts's
+# add_test() calls are silently inert: the binaries build, but `ctest -N`
+# finds nothing (no rocket-cts/CTestTestfile.cmake gets generated at all).
+enable_testing()
+
 set(IREE_SOURCE_DIR "${CMAKE_CURRENT_SOURCE_DIR}/../iree-src" CACHE PATH "")
 set(ROCKET_HAL_DRIVER_DIR "${CMAKE_CURRENT_SOURCE_DIR}/../../rocket-hal-driver" CACHE PATH "")
 
@@ -32,6 +40,16 @@ set(IREE_BUILD_TESTS ON CACHE BOOL "" FORCE)
 set(IREE_BUILD_SAMPLES OFF CACHE BOOL "" FORCE)
 set(IREE_BUILD_DOCS OFF CACHE BOOL "" FORCE)
 set(IREE_HAL_DRIVER_VULKAN OFF CACHE BOOL "" FORCE)
+# iree_check_test_suite() normally skips generating a check-test module for
+# backends whose HAL driver is disabled (see the driver-availability check in
+# build_tools/cmake/iree_check_test.cmake), but this flag (IREE default: ON)
+# forces every default backend's module to build regardless. That includes
+# vulkan-spirv, which the host iree-compile this project's IREE_HOST_BIN_DIR
+# points at (built with IREE_TARGET_BACKEND_VULKAN_SPIRV=OFF, see
+# ../configure-compiler-host.sh) can't target -- `ninja` then fails on that
+# check-test module's generation. OFF makes the module generation actually
+# respect IREE_HAL_DRIVER_VULKAN=OFF above instead of overriding it.
+set(IREE_BUILD_ALL_CHECK_TEST_MODULES OFF CACHE BOOL "" FORCE)
 
 add_subdirectory("${IREE_SOURCE_DIR}" "${CMAKE_CURRENT_BINARY_DIR}/iree")
 

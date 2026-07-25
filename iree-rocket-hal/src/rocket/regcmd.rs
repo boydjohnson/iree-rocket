@@ -1663,7 +1663,7 @@ fn push_kick_for_task_count(cmds: &mut Vec<RegCmd>, enable_mask: u32, task_count
     cmds.push(RegCmd::new_raw(0x0041000000000000)); // TRM: required immediately before op_en
     cmds.push(RegCmd::new(0x81, REG_PC_OPERATION_ENABLE, enable_mask));
 
-    if cmds.len() % 2 != 0 {
+    if !cmds.len().is_multiple_of(2) {
         cmds.push(RegCmd::new_raw(0x0));
     }
 }
@@ -2471,7 +2471,7 @@ fn build_ppu_standalone_flying(
     output_addr: u32,
 ) -> Vec<RegCmd> {
     assert!(
-        output_addr % 16 == 0,
+        output_addr.is_multiple_of(16),
         "build_ppu_standalone_flying: output_addr {output_addr:#x} is not 16-byte aligned -- \
          PPU_DST_BASE_ADDR is written as address >> 4 (see PoolingBuffers::output_addr's \
          doc comment), which silently drops any non-zero low 4 bits instead of failing \
@@ -2783,7 +2783,7 @@ pub fn build_pooling_via_dpu_bypass_regcmd(
     bufs: &PoolingViaBypassBuffers,
 ) -> (Vec<RegCmd>, Vec<RegCmd>) {
     assert!(
-        bufs.bypass_output_addr % 16 == 0,
+        bufs.bypass_output_addr.is_multiple_of(16),
         "build_pooling_via_dpu_bypass_regcmd: bypass_output_addr {:#x} is not \
          16-byte aligned",
         bufs.bypass_output_addr
@@ -2916,7 +2916,7 @@ pub fn build_conv_then_pooling_regcmd(
     bufs: &ConvThenPoolingBuffers,
 ) -> Vec<RegCmd> {
     assert!(
-        bufs.output_addr % 16 == 0,
+        bufs.output_addr.is_multiple_of(16),
         "build_conv_then_pooling_regcmd: output_addr {:#x} is not 16-byte aligned -- \
          PPU_DST_BASE_ADDR is written as address >> 4 (see build_pooling_regcmd's \
          PoolingBuffers::output_addr doc comment for why)",

@@ -40,18 +40,20 @@
 //! `command_buffer.rs`'s `catch_unwind` wrapper around that call for the
 //! backstop covering whatever gap remains.
 
-use crate::bindings::{
-    iree_const_byte_span_t, iree_hal_executable_cache_t, iree_hal_executable_cache_vtable_t,
-    iree_hal_executable_caching_mode_t, iree_hal_executable_params_t, iree_hal_executable_t,
-    iree_hal_resource_t, iree_host_size_t, iree_status_t, iree_string_view_t,
+use crate::{
+    bindings::{
+        iree_const_byte_span_t, iree_hal_executable_cache_t, iree_hal_executable_cache_vtable_t,
+        iree_hal_executable_caching_mode_t, iree_hal_executable_params_t, iree_hal_executable_t,
+        iree_hal_resource_t, iree_host_size_t, iree_status_t, iree_string_view_t,
+    },
+    executable::{Conv2dExecutable, RuntimeConv2dDimension, UkernelShape},
+    status,
 };
-use crate::executable::{Conv2dExecutable, RuntimeConv2dDimension, UkernelShape};
-use crate::status;
-use iree_rocket_hal::rocket::executable_format::{
-    CONV2D_V1_TAG, decode_conv_shape_v1, validate_conv_shape,
-};
-use iree_rocket_hal::rocket::regcmd::{
-    Activation, ConvShape, FcShape, PoolingMethod, PoolingShape, Precision, fc_as_conv_shape,
+use iree_rocket_hal::rocket::{
+    executable_format::{CONV2D_V1_TAG, decode_conv_shape_v1, validate_conv_shape},
+    regcmd::{
+        Activation, ConvShape, FcShape, PoolingMethod, PoolingShape, Precision, fc_as_conv_shape,
+    },
 };
 use rocket_schema::rocket as schema;
 
@@ -239,10 +241,7 @@ pub unsafe extern "C" fn can_prepare_format(
         return false;
     }
     let format = unsafe {
-        std::slice::from_raw_parts(
-            executable_format.data as *const u8,
-            executable_format.size as usize,
-        )
+        std::slice::from_raw_parts(executable_format.data as *const u8, executable_format.size)
     };
     format == FLATBUFFER_FORMAT || format == LEGACY_FORMAT
 }
@@ -258,26 +257,22 @@ unsafe extern "C" fn prepare_executable(
     }
     let params = unsafe { &*executable_params };
     if params.executable_format.size == 0 || params.executable_format.data.is_null() {
-        return status::from_code(
-            crate::bindings::iree_status_code_e_IREE_STATUS_INVALID_ARGUMENT as u32,
-        );
+        return status::from_code(crate::bindings::iree_status_code_e_IREE_STATUS_INVALID_ARGUMENT);
     }
     let format = unsafe {
         std::slice::from_raw_parts(
             params.executable_format.data as *const u8,
-            params.executable_format.size as usize,
+            params.executable_format.size,
         )
     };
     let data = params.executable_data;
     if data.data_length != 0 && data.data.is_null() {
-        return status::from_code(
-            crate::bindings::iree_status_code_e_IREE_STATUS_INVALID_ARGUMENT as u32,
-        );
+        return status::from_code(crate::bindings::iree_status_code_e_IREE_STATUS_INVALID_ARGUMENT);
     }
     let bytes = if data.data_length == 0 {
         &[]
     } else {
-        unsafe { std::slice::from_raw_parts(data.data, data.data_length as usize) }
+        unsafe { std::slice::from_raw_parts(data.data, data.data_length) }
     };
 
     if format == FLATBUFFER_FORMAT {
@@ -285,7 +280,7 @@ unsafe extern "C" fn prepare_executable(
             Ok(shape) => shape,
             Err(()) => {
                 return status::from_code(
-                    crate::bindings::iree_status_code_e_IREE_STATUS_INVALID_ARGUMENT as u32,
+                    crate::bindings::iree_status_code_e_IREE_STATUS_INVALID_ARGUMENT,
                 );
             }
         };
@@ -295,7 +290,7 @@ unsafe extern "C" fn prepare_executable(
         return status::ok();
     }
     if format != LEGACY_FORMAT {
-        return status::from_code(crate::bindings::iree_status_code_e_IREE_STATUS_NOT_FOUND as u32);
+        return status::from_code(crate::bindings::iree_status_code_e_IREE_STATUS_NOT_FOUND);
     }
 
     let tag = if data.data_length >= 1 {
@@ -306,7 +301,7 @@ unsafe extern "C" fn prepare_executable(
 
     if tag == CONV2D_V1_TAG {
         let payload = if data.data_length >= 1 {
-            unsafe { std::slice::from_raw_parts(data.data.add(1), data.data_length as usize - 1) }
+            unsafe { std::slice::from_raw_parts(data.data.add(1), data.data_length - 1) }
         } else {
             &[]
         };
@@ -314,13 +309,13 @@ unsafe extern "C" fn prepare_executable(
             Ok(shape) => shape,
             Err(_) => {
                 return status::from_code(
-                    crate::bindings::iree_status_code_e_IREE_STATUS_INVALID_ARGUMENT as u32,
+                    crate::bindings::iree_status_code_e_IREE_STATUS_INVALID_ARGUMENT,
                 );
             }
         };
         if validate_conv_shape(&shape).is_err() {
             return status::from_code(
-                crate::bindings::iree_status_code_e_IREE_STATUS_INVALID_ARGUMENT as u32,
+                crate::bindings::iree_status_code_e_IREE_STATUS_INVALID_ARGUMENT,
             );
         }
         unsafe {

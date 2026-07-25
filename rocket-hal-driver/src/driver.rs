@@ -4,14 +4,17 @@
 //! `create_device_by_path` open a fresh handle and hand off to
 //! `device::create`.
 
-use crate::bindings::{
-    iree_allocator_t, iree_hal_device_create_params_t, iree_hal_device_id_t,
-    iree_hal_device_info_t, iree_hal_device_t, iree_hal_driver_factory_t, iree_hal_driver_info_t,
-    iree_hal_driver_registry_t, iree_hal_driver_t, iree_hal_driver_vtable_t, iree_hal_resource_t,
-    iree_host_size_t, iree_status_code_e_IREE_STATUS_UNAVAILABLE, iree_status_t,
-    iree_string_builder_t, iree_string_pair_t, iree_string_view_t,
+use crate::{
+    bindings::{
+        iree_allocator_t, iree_hal_device_create_params_t, iree_hal_device_id_t,
+        iree_hal_device_info_t, iree_hal_device_t, iree_hal_driver_factory_t,
+        iree_hal_driver_info_t, iree_hal_driver_registry_t, iree_hal_driver_t,
+        iree_hal_driver_vtable_t, iree_hal_resource_t, iree_host_size_t,
+        iree_status_code_e_IREE_STATUS_UNAVAILABLE, iree_status_t, iree_string_builder_t,
+        iree_string_pair_t, iree_string_view_t,
+    },
+    status,
 };
-use crate::status;
 
 const DRIVER_NAME: &[u8] = b"rocket";
 const DEVICE_PATH: &str = "/dev/accel/accel0";
@@ -153,17 +156,16 @@ unsafe extern "C" fn factory_try_create(
     host_allocator: iree_allocator_t,
     out_driver: *mut *mut iree_hal_driver_t,
 ) -> iree_status_t {
-    let requested = unsafe {
-        std::slice::from_raw_parts(driver_name.data as *const u8, driver_name.size as usize)
-    };
+    let requested =
+        unsafe { std::slice::from_raw_parts(driver_name.data as *const u8, driver_name.size) };
     if requested != DRIVER_NAME {
-        return status::from_code(iree_status_code_e_IREE_STATUS_UNAVAILABLE as u32);
+        return status::from_code(iree_status_code_e_IREE_STATUS_UNAVAILABLE);
     }
 
     // Probe -- confirms the kernel driver is actually present rather than
     // deferring that discovery to the first create_device_by_id call.
     if std::fs::metadata(DEVICE_PATH).is_err() {
-        return status::from_code(iree_status_code_e_IREE_STATUS_UNAVAILABLE as u32);
+        return status::from_code(iree_status_code_e_IREE_STATUS_UNAVAILABLE);
     }
 
     let driver = Box::new(RocketDriver {

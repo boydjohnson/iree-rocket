@@ -118,7 +118,7 @@ pub fn rocket_weight_storage_size(
         || input_channels == 0
         || output_channels == 0
         || element_size == 0
-        || WEIGHT_ATOMIC_BYTES % element_size != 0
+        || !WEIGHT_ATOMIC_BYTES.is_multiple_of(element_size)
     {
         return Err("invalid Rocket convolution filter shape");
     }

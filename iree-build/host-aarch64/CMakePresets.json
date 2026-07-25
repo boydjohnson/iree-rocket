@@ -8,7 +8,10 @@
       "description": "iree-run-module / iree-benchmark-module cross-compiled for the RK3588 board, with the rocket HAL driver statically linked.",
       "generator": "Ninja",
       "binaryDir": "${sourceDir}/build",
-      "toolchainFile": "${sourceDir}/../aarch64_linux_gnu.cmake"
+      "toolchainFile": "${sourceDir}/../aarch64_linux_gnu.cmake",
+      "cacheVariables": {
+        "IREE_HOST_BIN_DIR": "${sourceDir}/../build/tools"
+      }
     }
   ],
   "buildPresets": [

@@ -9,3 +9,7 @@
 /iree-build/build/
 /iree-build/host/build/
 /iree-build/host-aarch64/build/
+
+# lit test run artifacts
+.lit_test_times.txt
+/rocket-compiler-plugin/test/Output/

@@ -56,21 +56,23 @@
 
 use std::os::fd::{AsRawFd, BorrowedFd, RawFd};
 
-use crate::bindings::{
-    iree_const_byte_span_t, iree_device_size_t, iree_hal_buffer_barrier_t,
-    iree_hal_buffer_ref_list_t, iree_hal_buffer_ref_t, iree_hal_buffer_t, iree_hal_channel_t,
-    iree_hal_collective_op_t, iree_hal_command_buffer_mode_t, iree_hal_command_buffer_t,
-    iree_hal_command_buffer_vtable_t, iree_hal_command_category_t, iree_hal_copy_flags_t,
-    iree_hal_dispatch_config_t, iree_hal_dispatch_flags_t, iree_hal_event_t,
-    iree_hal_executable_function_t, iree_hal_executable_t, iree_hal_execution_barrier_flags_t,
-    iree_hal_execution_stage_t, iree_hal_fill_flags_t, iree_hal_label_color_t,
-    iree_hal_label_location_t, iree_hal_memory_advise_flags_t, iree_hal_memory_barrier_t,
-    iree_hal_queue_affinity_t, iree_hal_update_flags_t, iree_host_size_t, iree_status_t,
-    iree_string_view_t,
+use crate::{
+    bindings::{
+        iree_const_byte_span_t, iree_device_size_t, iree_hal_buffer_barrier_t,
+        iree_hal_buffer_ref_list_t, iree_hal_buffer_ref_t, iree_hal_buffer_t, iree_hal_channel_t,
+        iree_hal_collective_op_t, iree_hal_command_buffer_mode_t, iree_hal_command_buffer_t,
+        iree_hal_command_buffer_vtable_t, iree_hal_command_category_t, iree_hal_copy_flags_t,
+        iree_hal_dispatch_config_t, iree_hal_dispatch_flags_t, iree_hal_event_t,
+        iree_hal_executable_function_t, iree_hal_executable_t, iree_hal_execution_barrier_flags_t,
+        iree_hal_execution_stage_t, iree_hal_fill_flags_t, iree_hal_label_color_t,
+        iree_hal_label_location_t, iree_hal_memory_advise_flags_t, iree_hal_memory_barrier_t,
+        iree_hal_queue_affinity_t, iree_hal_update_flags_t, iree_host_size_t, iree_status_t,
+        iree_string_view_t,
+    },
+    buffer::RocketBuffer,
+    executable::UkernelShape,
+    status,
 };
-use crate::buffer::RocketBuffer;
-use crate::executable::UkernelShape;
-use crate::status;
 use iree_rocket_hal::rocket::{
     builders::RegCmd,
     device::Buffer as RocketDeviceBuffer,
@@ -293,7 +295,7 @@ pub unsafe fn apply_ops(
         };
         if indirect_ref {
             return Err(status::from_code(
-                crate::bindings::iree_status_code_e_IREE_STATUS_UNIMPLEMENTED as u32,
+                crate::bindings::iree_status_code_e_IREE_STATUS_UNIMPLEMENTED,
             ));
         }
 
@@ -357,18 +359,18 @@ pub unsafe fn apply_ops(
                         .checked_mul(packing.bytes_per_pixel)
                         .ok_or_else(|| {
                             status::from_code(
-                                crate::bindings::iree_status_code_e_IREE_STATUS_INTERNAL as u32,
+                                crate::bindings::iree_status_code_e_IREE_STATUS_INTERNAL,
                             )
                         })?;
                     if dense_len as u64 > packing.input_length as u64 {
                         return Err(status::from_code(
-                            crate::bindings::iree_status_code_e_IREE_STATUS_INVALID_ARGUMENT as u32,
+                            crate::bindings::iree_status_code_e_IREE_STATUS_INVALID_ARGUMENT,
                         ));
                     }
                     let input = unsafe { &*(packing.input_buffer as *const RocketBuffer) };
                     let dense = unsafe {
                         std::slice::from_raw_parts(
-                            input.host_ptr.add(packing.input_offset as usize),
+                            input.host_ptr.add(packing.input_offset),
                             dense_len,
                         )
                     };
@@ -378,7 +380,7 @@ pub unsafe fn apply_ops(
                             .checked_mul(packing.bytes_per_pixel)
                             .ok_or_else(|| {
                                 status::from_code(
-                                    crate::bindings::iree_status_code_e_IREE_STATUS_INTERNAL as u32,
+                                    crate::bindings::iree_status_code_e_IREE_STATUS_INTERNAL,
                                 )
                             })?;
                         let mut padded = vec![packing.padding_byte; padded_len];
@@ -410,7 +412,7 @@ pub unsafe fn apply_ops(
                     };
                     if packing_result.is_err() {
                         return Err(status::from_code(
-                            crate::bindings::iree_status_code_e_IREE_STATUS_INTERNAL as u32,
+                            crate::bindings::iree_status_code_e_IREE_STATUS_INTERNAL,
                         ));
                     }
                     if unsafe {
@@ -419,7 +421,7 @@ pub unsafe fn apply_ops(
                     .is_err()
                     {
                         return Err(status::from_code(
-                            crate::bindings::iree_status_code_e_IREE_STATUS_INTERNAL as u32,
+                            crate::bindings::iree_status_code_e_IREE_STATUS_INTERNAL,
                         ));
                     }
                 }
@@ -432,18 +434,18 @@ pub unsafe fn apply_ops(
                         .and_then(|value| value.checked_mul(packing.element_size))
                         .ok_or_else(|| {
                             status::from_code(
-                                crate::bindings::iree_status_code_e_IREE_STATUS_INTERNAL as u32,
+                                crate::bindings::iree_status_code_e_IREE_STATUS_INTERNAL,
                             )
                         })?;
                     if dense_len as u64 > packing.weight_length as u64 {
                         return Err(status::from_code(
-                            crate::bindings::iree_status_code_e_IREE_STATUS_INVALID_ARGUMENT as u32,
+                            crate::bindings::iree_status_code_e_IREE_STATUS_INVALID_ARGUMENT,
                         ));
                     }
                     let weights = unsafe { &*(packing.weight_buffer as *const RocketBuffer) };
                     let dense = unsafe {
                         std::slice::from_raw_parts(
-                            weights.host_ptr.add(packing.weight_offset as usize),
+                            weights.host_ptr.add(packing.weight_offset),
                             dense_len,
                         )
                     };
@@ -462,7 +464,7 @@ pub unsafe fn apply_ops(
                     .is_err()
                     {
                         return Err(status::from_code(
-                            crate::bindings::iree_status_code_e_IREE_STATUS_INTERNAL as u32,
+                            crate::bindings::iree_status_code_e_IREE_STATUS_INTERNAL,
                         ));
                     }
                     if unsafe {
@@ -471,7 +473,7 @@ pub unsafe fn apply_ops(
                     .is_err()
                     {
                         return Err(status::from_code(
-                            crate::bindings::iree_status_code_e_IREE_STATUS_INTERNAL as u32,
+                            crate::bindings::iree_status_code_e_IREE_STATUS_INTERNAL,
                         ));
                     }
                 }
@@ -667,17 +669,15 @@ unsafe extern "C" fn fill_buffer(
     pattern_length: iree_host_size_t,
     flags: iree_hal_fill_flags_t,
 ) -> iree_status_t {
-    if pattern_length as usize > 8 {
-        return status::from_code(
-            crate::bindings::iree_status_code_e_IREE_STATUS_INVALID_ARGUMENT as u32,
-        );
+    if pattern_length > 8 {
+        return status::from_code(crate::bindings::iree_status_code_e_IREE_STATUS_INVALID_ARGUMENT);
     }
     let mut pattern_buf = [0u8; 8];
     unsafe {
         std::ptr::copy_nonoverlapping(
             pattern as *const u8,
             pattern_buf.as_mut_ptr(),
-            pattern_length as usize,
+            pattern_length,
         );
     }
     // See RecordedOp's own doc comment: recorded ops hold onto their
@@ -706,10 +706,10 @@ unsafe extern "C" fn update_buffer(
     target_ref: iree_hal_buffer_ref_t,
     flags: iree_hal_update_flags_t,
 ) -> iree_status_t {
-    let len = target_ref.length as usize;
+    let len = target_ref.length;
     let mut source = vec![0u8; len];
     unsafe {
-        let src = (source_buffer as *const u8).add(source_offset as usize);
+        let src = (source_buffer as *const u8).add(source_offset);
         std::ptr::copy_nonoverlapping(src, source.as_mut_ptr(), len);
     }
     // See fill_buffer's comment on why this retain is needed.
@@ -781,12 +781,12 @@ unsafe extern "C" fn dispatch(
     } else {
         if constants.data.is_null() {
             return status::from_code(
-                crate::bindings::iree_status_code_e_IREE_STATUS_INVALID_ARGUMENT as u32,
+                crate::bindings::iree_status_code_e_IREE_STATUS_INVALID_ARGUMENT,
             );
         }
-        unsafe { std::slice::from_raw_parts(constants.data, constants.data_length as usize) }
+        unsafe { std::slice::from_raw_parts(constants.data, constants.data_length) }
     };
-    let refs = unsafe { std::slice::from_raw_parts(bindings.values, bindings.count as usize) };
+    let refs = unsafe { std::slice::from_raw_parts(bindings.values, bindings.count) };
 
     // Indirect bindings (iree_hal_buffer_ref_t.buffer == NULL, real buffer
     // resolved from a binding_table.buffer_slot at queue_execute time, not
@@ -806,9 +806,7 @@ unsafe extern "C" fn dispatch(
     // redesign out of scope for this fix.
     if let Some(r) = refs.iter().find(|r| r.buffer.is_null()) {
         let _ = r;
-        return status::from_code(
-            crate::bindings::iree_status_code_e_IREE_STATUS_UNIMPLEMENTED as u32,
-        );
+        return status::from_code(crate::bindings::iree_status_code_e_IREE_STATUS_UNIMPLEMENTED);
     }
 
     // `r.offset` is the byte offset of this binding WITHIN its underlying
@@ -837,14 +835,14 @@ unsafe extern "C" fn dispatch(
                 Ok(shape) => shape,
                 Err(_) => {
                     return status::from_code(
-                        crate::bindings::iree_status_code_e_IREE_STATUS_INVALID_ARGUMENT as u32,
+                        crate::bindings::iree_status_code_e_IREE_STATUS_INVALID_ARGUMENT,
                     );
                 }
             };
             let shape = &resolved_shape;
             if bindings.count < 4 {
                 return status::from_code(
-                    crate::bindings::iree_status_code_e_IREE_STATUS_INVALID_ARGUMENT as u32,
+                    crate::bindings::iree_status_code_e_IREE_STATUS_INVALID_ARGUMENT,
                 );
             }
             let pixel_count = shape.input_width as usize * shape.input_height as usize;
@@ -858,7 +856,7 @@ unsafe extern "C" fn dispatch(
                 Some(value) if value as u64 <= refs[0].length as u64
             ) {
                 return status::from_code(
-                    crate::bindings::iree_status_code_e_IREE_STATUS_INVALID_ARGUMENT as u32,
+                    crate::bindings::iree_status_code_e_IREE_STATUS_INVALID_ARGUMENT,
                 );
             }
 
@@ -872,8 +870,7 @@ unsafe extern "C" fn dispatch(
                         Ok(value) => value,
                         Err(_) => {
                             return status::from_code(
-                                crate::bindings::iree_status_code_e_IREE_STATUS_INVALID_ARGUMENT
-                                    as u32,
+                                crate::bindings::iree_status_code_e_IREE_STATUS_INVALID_ARGUMENT,
                             );
                         }
                     };
@@ -922,7 +919,7 @@ unsafe extern "C" fn dispatch(
                         Some(value) if value as u64 <= refs[1].length as u64
                     ) {
                         return status::from_code(
-                            crate::bindings::iree_status_code_e_IREE_STATUS_INVALID_ARGUMENT as u32,
+                            crate::bindings::iree_status_code_e_IREE_STATUS_INVALID_ARGUMENT,
                         );
                     }
                     let scratch_bytes = match rocket_weight_storage_size(
@@ -935,8 +932,7 @@ unsafe extern "C" fn dispatch(
                         Ok(value) => value,
                         Err(_) => {
                             return status::from_code(
-                                crate::bindings::iree_status_code_e_IREE_STATUS_INVALID_ARGUMENT
-                                    as u32,
+                                crate::bindings::iree_status_code_e_IREE_STATUS_INVALID_ARGUMENT,
                             );
                         }
                     };
@@ -993,12 +989,12 @@ unsafe extern "C" fn dispatch(
                 Ok(Ok(tasks)) => tasks,
                 Ok(Err(_)) => {
                     return status::from_code(
-                        crate::bindings::iree_status_code_e_IREE_STATUS_INVALID_ARGUMENT as u32,
+                        crate::bindings::iree_status_code_e_IREE_STATUS_INVALID_ARGUMENT,
                     );
                 }
                 Err(_) => {
                     return status::from_code(
-                        crate::bindings::iree_status_code_e_IREE_STATUS_INTERNAL as u32,
+                        crate::bindings::iree_status_code_e_IREE_STATUS_INTERNAL,
                     );
                 }
             };
@@ -1035,12 +1031,12 @@ unsafe extern "C" fn dispatch(
         UkernelShape::FullyConnected(shape) => {
             if !constants.is_empty() {
                 return status::from_code(
-                    crate::bindings::iree_status_code_e_IREE_STATUS_INVALID_ARGUMENT as u32,
+                    crate::bindings::iree_status_code_e_IREE_STATUS_INVALID_ARGUMENT,
                 );
             }
             if bindings.count < 4 {
                 return status::from_code(
-                    crate::bindings::iree_status_code_e_IREE_STATUS_INVALID_ARGUMENT as u32,
+                    crate::bindings::iree_status_code_e_IREE_STATUS_INVALID_ARGUMENT,
                 );
             }
 
@@ -1052,7 +1048,7 @@ unsafe extern "C" fn dispatch(
                 Some(value) => value,
                 None => {
                     return status::from_code(
-                        crate::bindings::iree_status_code_e_IREE_STATUS_INVALID_ARGUMENT as u32,
+                        crate::bindings::iree_status_code_e_IREE_STATUS_INVALID_ARGUMENT,
                     );
                 }
             };
@@ -1060,7 +1056,7 @@ unsafe extern "C" fn dispatch(
                 Some(value) => value,
                 None => {
                     return status::from_code(
-                        crate::bindings::iree_status_code_e_IREE_STATUS_INVALID_ARGUMENT as u32,
+                        crate::bindings::iree_status_code_e_IREE_STATUS_INVALID_ARGUMENT,
                     );
                 }
             };
@@ -1068,7 +1064,7 @@ unsafe extern "C" fn dispatch(
                 Some(value) => value,
                 None => {
                     return status::from_code(
-                        crate::bindings::iree_status_code_e_IREE_STATUS_INVALID_ARGUMENT as u32,
+                        crate::bindings::iree_status_code_e_IREE_STATUS_INVALID_ARGUMENT,
                     );
                 }
             };
@@ -1085,7 +1081,7 @@ unsafe extern "C" fn dispatch(
                 || (shape.precision == Precision::Int8 && shape.input_zero_point > u8::MAX as u32)
             {
                 return status::from_code(
-                    crate::bindings::iree_status_code_e_IREE_STATUS_INVALID_ARGUMENT as u32,
+                    crate::bindings::iree_status_code_e_IREE_STATUS_INVALID_ARGUMENT,
                 );
             }
 
@@ -1100,7 +1096,7 @@ unsafe extern "C" fn dispatch(
                     Ok(value) => (value, InputPackingLayout::Nc1hwc2),
                     Err(_) => {
                         return status::from_code(
-                            crate::bindings::iree_status_code_e_IREE_STATUS_INVALID_ARGUMENT as u32,
+                            crate::bindings::iree_status_code_e_IREE_STATUS_INVALID_ARGUMENT,
                         );
                     }
                 }
@@ -1109,14 +1105,14 @@ unsafe extern "C" fn dispatch(
                     Some(value) => (value, InputPackingLayout::Dense),
                     None => {
                         return status::from_code(
-                            crate::bindings::iree_status_code_e_IREE_STATUS_INVALID_ARGUMENT as u32,
+                            crate::bindings::iree_status_code_e_IREE_STATUS_INVALID_ARGUMENT,
                         );
                     }
                 }
             };
             if input_scratch_bytes > u32::MAX as usize {
                 return status::from_code(
-                    crate::bindings::iree_status_code_e_IREE_STATUS_INVALID_ARGUMENT as u32,
+                    crate::bindings::iree_status_code_e_IREE_STATUS_INVALID_ARGUMENT,
                 );
             }
             let input_scratch = unsafe {
@@ -1152,13 +1148,13 @@ unsafe extern "C" fn dispatch(
                 Ok(value) => value,
                 Err(_) => {
                     return status::from_code(
-                        crate::bindings::iree_status_code_e_IREE_STATUS_INVALID_ARGUMENT as u32,
+                        crate::bindings::iree_status_code_e_IREE_STATUS_INVALID_ARGUMENT,
                     );
                 }
             };
             if weight_scratch_bytes > u32::MAX as usize {
                 return status::from_code(
-                    crate::bindings::iree_status_code_e_IREE_STATUS_INVALID_ARGUMENT as u32,
+                    crate::bindings::iree_status_code_e_IREE_STATUS_INVALID_ARGUMENT,
                 );
             }
             let weight_scratch = unsafe {
@@ -1187,13 +1183,13 @@ unsafe extern "C" fn dispatch(
                     Ok(value) => value,
                     Err(_) => {
                         return status::from_code(
-                            crate::bindings::iree_status_code_e_IREE_STATUS_INVALID_ARGUMENT as u32,
+                            crate::bindings::iree_status_code_e_IREE_STATUS_INVALID_ARGUMENT,
                         );
                     }
                 };
             if output_scratch_bytes > u32::MAX as usize {
                 return status::from_code(
-                    crate::bindings::iree_status_code_e_IREE_STATUS_INVALID_ARGUMENT as u32,
+                    crate::bindings::iree_status_code_e_IREE_STATUS_INVALID_ARGUMENT,
                 );
             }
             let output_scratch = unsafe {
@@ -1215,7 +1211,7 @@ unsafe extern "C" fn dispatch(
                 Ok(task) => vec![task],
                 Err(_) => {
                     return status::from_code(
-                        crate::bindings::iree_status_code_e_IREE_STATUS_INVALID_ARGUMENT as u32,
+                        crate::bindings::iree_status_code_e_IREE_STATUS_INVALID_ARGUMENT,
                     );
                 }
             };
@@ -1250,12 +1246,12 @@ unsafe extern "C" fn dispatch(
         UkernelShape::Pooling(shape) => {
             if !constants.is_empty() {
                 return status::from_code(
-                    crate::bindings::iree_status_code_e_IREE_STATUS_INVALID_ARGUMENT as u32,
+                    crate::bindings::iree_status_code_e_IREE_STATUS_INVALID_ARGUMENT,
                 );
             }
             if bindings.count < 2 {
                 return status::from_code(
-                    crate::bindings::iree_status_code_e_IREE_STATUS_INVALID_ARGUMENT as u32,
+                    crate::bindings::iree_status_code_e_IREE_STATUS_INVALID_ARGUMENT,
                 );
             }
             // 0=input, 1=output -- no weights/bias for a standalone

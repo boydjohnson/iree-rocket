@@ -10,35 +10,39 @@
 
 use std::os::fd::AsRawFd;
 
-use crate::bindings::{
-    iree_allocator_t, iree_const_byte_span_t, iree_device_size_t, iree_hal_alloca_flags_t,
-    iree_hal_allocator_t, iree_hal_buffer_binding_table_t, iree_hal_buffer_params_t,
-    iree_hal_buffer_ref_list_t, iree_hal_buffer_t, iree_hal_channel_params_t,
-    iree_hal_channel_provider_t, iree_hal_channel_t, iree_hal_command_buffer_mode_t,
-    iree_hal_command_buffer_t, iree_hal_command_category_t, iree_hal_copy_flags_t,
-    iree_hal_dealloca_flags_t, iree_hal_device_capabilities_t, iree_hal_device_create_params_t,
-    iree_hal_device_external_capture_options_t, iree_hal_device_profiling_options_t,
-    iree_hal_device_t, iree_hal_device_topology_info_t, iree_hal_device_vtable_t,
-    iree_hal_dispatch_config_t, iree_hal_dispatch_flags_t, iree_hal_event_flags_t,
-    iree_hal_event_t, iree_hal_executable_cache_t, iree_hal_executable_function_t,
-    iree_hal_executable_t, iree_hal_execute_flags_t, iree_hal_external_file_flags_t,
-    iree_hal_file_t, iree_hal_fill_flags_t, iree_hal_host_call_context_t,
-    iree_hal_host_call_flag_bits_e_IREE_HAL_HOST_CALL_FLAG_NON_BLOCKING,
-    iree_hal_host_call_flags_t, iree_hal_host_call_t, iree_hal_memory_access_t, iree_hal_pool_t,
-    iree_hal_queue_affinity_t, iree_hal_queue_pool_backend_t, iree_hal_read_flags_t,
-    iree_hal_resource_t,
-    iree_hal_semaphore_compatibility_bits_t_IREE_HAL_SEMAPHORE_COMPATIBILITY_ALL,
-    iree_hal_semaphore_compatibility_t, iree_hal_semaphore_flags_t, iree_hal_semaphore_list_t,
-    iree_hal_semaphore_t, iree_hal_topology_edge_t, iree_hal_update_flags_t,
-    iree_hal_write_flags_t, iree_host_size_t, iree_io_file_handle_t,
-    iree_status_code_e_IREE_STATUS_INTERNAL, iree_status_code_e_IREE_STATUS_INVALID_ARGUMENT,
-    iree_status_code_e_IREE_STATUS_UNAVAILABLE, iree_status_t, iree_string_view_t, iree_timeout_t,
-    iree_timeout_type_e_IREE_TIMEOUT_ABSOLUTE,
+use crate::{
+    bindings::{
+        iree_allocator_t, iree_const_byte_span_t, iree_device_size_t, iree_hal_alloca_flags_t,
+        iree_hal_allocator_t, iree_hal_buffer_binding_table_t, iree_hal_buffer_params_t,
+        iree_hal_buffer_ref_list_t, iree_hal_buffer_t, iree_hal_channel_params_t,
+        iree_hal_channel_provider_t, iree_hal_channel_t, iree_hal_command_buffer_mode_t,
+        iree_hal_command_buffer_t, iree_hal_command_category_t, iree_hal_copy_flags_t,
+        iree_hal_dealloca_flags_t, iree_hal_device_capabilities_t, iree_hal_device_create_params_t,
+        iree_hal_device_external_capture_options_t, iree_hal_device_profiling_options_t,
+        iree_hal_device_t, iree_hal_device_topology_info_t, iree_hal_device_vtable_t,
+        iree_hal_dispatch_config_t, iree_hal_dispatch_flags_t, iree_hal_event_flags_t,
+        iree_hal_event_t, iree_hal_executable_cache_t, iree_hal_executable_function_t,
+        iree_hal_executable_t, iree_hal_execute_flags_t, iree_hal_external_file_flags_t,
+        iree_hal_file_t, iree_hal_fill_flags_t, iree_hal_host_call_context_t,
+        iree_hal_host_call_flag_bits_e_IREE_HAL_HOST_CALL_FLAG_NON_BLOCKING,
+        iree_hal_host_call_flags_t, iree_hal_host_call_t, iree_hal_memory_access_t,
+        iree_hal_pool_t, iree_hal_queue_affinity_t, iree_hal_queue_pool_backend_t,
+        iree_hal_read_flags_t, iree_hal_resource_t,
+        iree_hal_semaphore_compatibility_bits_t_IREE_HAL_SEMAPHORE_COMPATIBILITY_ALL,
+        iree_hal_semaphore_compatibility_t, iree_hal_semaphore_flags_t, iree_hal_semaphore_list_t,
+        iree_hal_semaphore_t, iree_hal_topology_edge_t, iree_hal_update_flags_t,
+        iree_hal_write_flags_t, iree_host_size_t, iree_io_file_handle_t,
+        iree_status_code_e_IREE_STATUS_INTERNAL, iree_status_code_e_IREE_STATUS_INVALID_ARGUMENT,
+        iree_status_code_e_IREE_STATUS_UNAVAILABLE, iree_status_t, iree_string_view_t,
+        iree_timeout_t, iree_timeout_type_e_IREE_TIMEOUT_ABSOLUTE,
+    },
+    buffer::RocketBuffer,
+    status,
 };
-use crate::buffer::RocketBuffer;
-use crate::status;
-use iree_rocket_hal::rocket::api::{DRM_IOCTL_BASE, drm_version};
-use iree_rocket_hal::rocket::device as rocket_device;
+use iree_rocket_hal::rocket::{
+    api::{DRM_IOCTL_BASE, drm_version},
+    device as rocket_device,
+};
 
 const DEVICE_PATH: &str = "/dev/accel/accel0";
 const DISPATCH_COMPLETION_TIMEOUT_NS: u64 = 10_000_000_000;
@@ -200,10 +204,9 @@ impl OwnedSemaphoreList {
             };
         }
         let semaphores: Vec<*mut iree_hal_semaphore_t> =
-            unsafe { std::slice::from_raw_parts(list.semaphores, list.count as usize).to_vec() };
-        let payload_values: Vec<u64> = unsafe {
-            std::slice::from_raw_parts(list.payload_values, list.count as usize).to_vec()
-        };
+            unsafe { std::slice::from_raw_parts(list.semaphores, list.count).to_vec() };
+        let payload_values: Vec<u64> =
+            unsafe { std::slice::from_raw_parts(list.payload_values, list.count).to_vec() };
         for &sem in &semaphores {
             unsafe { crate::bindings::iree_hal_semaphore_retain(sem) };
         }
@@ -292,14 +295,14 @@ pub unsafe fn create(
     out_device: *mut *mut iree_hal_device_t,
 ) -> iree_status_t {
     if create_params.is_null() {
-        return status::from_code(iree_status_code_e_IREE_STATUS_INVALID_ARGUMENT as u32);
+        return status::from_code(iree_status_code_e_IREE_STATUS_INVALID_ARGUMENT);
     }
     let proactor_pool = unsafe { (*create_params).proactor_pool };
     if proactor_pool.is_null() {
         // Real requirement, not a relaxation this driver invented -- see
         // module doc comment / iree-null-driver-reference/device.c's own
         // IREE_ASSERT_ARGUMENT(create_params->proactor_pool).
-        return status::from_code(iree_status_code_e_IREE_STATUS_INVALID_ARGUMENT as u32);
+        return status::from_code(iree_status_code_e_IREE_STATUS_INVALID_ARGUMENT);
     }
 
     let file = match std::fs::OpenOptions::new()
@@ -308,14 +311,14 @@ pub unsafe fn create(
         .open(DEVICE_PATH)
     {
         Ok(f) => f,
-        Err(_) => return status::from_code(iree_status_code_e_IREE_STATUS_UNAVAILABLE as u32),
+        Err(_) => return status::from_code(iree_status_code_e_IREE_STATUS_UNAVAILABLE),
     };
     if !is_rocket_device(&file) {
-        return status::from_code(iree_status_code_e_IREE_STATUS_UNAVAILABLE as u32);
+        return status::from_code(iree_status_code_e_IREE_STATUS_UNAVAILABLE);
     }
     let allocator_file = match file.try_clone() {
         Ok(f) => f,
-        Err(_) => return status::from_code(iree_status_code_e_IREE_STATUS_UNAVAILABLE as u32),
+        Err(_) => return status::from_code(iree_status_code_e_IREE_STATUS_UNAVAILABLE),
     };
 
     unsafe {
@@ -434,9 +437,8 @@ unsafe extern "C" fn query_i64(
     out_value: *mut i64,
 ) -> iree_status_t {
     let d = unsafe { &*cast(device) };
-    let category =
-        unsafe { std::slice::from_raw_parts(category.data as *const u8, category.size as usize) };
-    let key = unsafe { std::slice::from_raw_parts(key.data as *const u8, key.size as usize) };
+    let category = unsafe { std::slice::from_raw_parts(category.data as *const u8, category.size) };
+    let key = unsafe { std::slice::from_raw_parts(key.data as *const u8, key.size) };
 
     unsafe {
         *out_value = 0;
@@ -459,7 +461,7 @@ unsafe extern "C" fn query_i64(
         return status::ok();
     }
 
-    status::from_code(crate::bindings::iree_status_code_e_IREE_STATUS_NOT_FOUND as u32)
+    status::from_code(crate::bindings::iree_status_code_e_IREE_STATUS_NOT_FOUND)
 }
 
 #[allow(unused_variables)]
@@ -705,8 +707,8 @@ unsafe extern "C" fn queue_fill(
     pattern_length: iree_host_size_t,
     flags: iree_hal_fill_flags_t,
 ) -> iree_status_t {
-    if pattern_length as usize > 8 {
-        return status::from_code(iree_status_code_e_IREE_STATUS_INVALID_ARGUMENT as u32);
+    if pattern_length > 8 {
+        return status::from_code(iree_status_code_e_IREE_STATUS_INVALID_ARGUMENT);
     }
     // pattern may point to the caller's stack (a local variable, in every
     // CTS test that hits this) -- copy it now since a deferred call (see
@@ -716,7 +718,7 @@ unsafe extern "C" fn queue_fill(
         std::ptr::copy_nonoverlapping(
             pattern as *const u8,
             pattern_buf.as_mut_ptr(),
-            pattern_length as usize,
+            pattern_length,
         );
     }
     unsafe { crate::bindings::iree_hal_buffer_retain(target_buffer) };
@@ -726,7 +728,7 @@ unsafe extern "C" fn queue_fill(
             let target_buffer = target_buffer.into_inner();
             let st = unsafe {
                 if crate::buffer::is_deallocated(target_buffer) {
-                    status::from_code(iree_status_code_e_IREE_STATUS_INVALID_ARGUMENT as u32)
+                    status::from_code(iree_status_code_e_IREE_STATUS_INVALID_ARGUMENT)
                 } else {
                     crate::bindings::iree_hal_buffer_map_fill(
                         target_buffer,
@@ -759,10 +761,10 @@ unsafe extern "C" fn queue_update(
     // source_buffer may point to the caller's stack/heap memory that
     // won't survive past this call if deferred -- copy it now, same
     // reasoning as queue_fill's pattern copy.
-    let mut source = vec![0u8; length as usize];
+    let mut source = vec![0u8; length];
     unsafe {
-        let src = (source_buffer as *const u8).add(source_offset as usize);
-        std::ptr::copy_nonoverlapping(src, source.as_mut_ptr(), length as usize);
+        let src = (source_buffer as *const u8).add(source_offset);
+        std::ptr::copy_nonoverlapping(src, source.as_mut_ptr(), length);
     }
     unsafe { crate::bindings::iree_hal_buffer_retain(target_buffer) };
     let target_buffer = AssertSend(target_buffer);
@@ -771,7 +773,7 @@ unsafe extern "C" fn queue_update(
             let target_buffer = target_buffer.into_inner();
             let st = unsafe {
                 if crate::buffer::is_deallocated(target_buffer) {
-                    status::from_code(iree_status_code_e_IREE_STATUS_INVALID_ARGUMENT as u32)
+                    status::from_code(iree_status_code_e_IREE_STATUS_INVALID_ARGUMENT)
                 } else {
                     crate::bindings::iree_hal_buffer_map_write(
                         target_buffer,
@@ -814,7 +816,7 @@ unsafe extern "C" fn queue_copy(
                 if crate::buffer::is_deallocated(source_buffer)
                     || crate::buffer::is_deallocated(target_buffer)
                 {
-                    status::from_code(iree_status_code_e_IREE_STATUS_INVALID_ARGUMENT as u32)
+                    status::from_code(iree_status_code_e_IREE_STATUS_INVALID_ARGUMENT)
                 } else {
                     crate::bindings::iree_hal_buffer_map_copy(
                         source_buffer,
@@ -997,7 +999,7 @@ unsafe extern "C" fn queue_host_call(
     }
 
     let Some(f) = call.fn_ else {
-        return status::from_code(iree_status_code_e_IREE_STATUS_INVALID_ARGUMENT as u32);
+        return status::from_code(iree_status_code_e_IREE_STATUS_INVALID_ARGUMENT);
     };
     let f = AssertSend(f);
     // Not routed through run_after_wait: its fast path returns a failed
@@ -1173,12 +1175,12 @@ mod compaction_tests {
 
 unsafe extern "C" fn queue_execute(
     device: *mut iree_hal_device_t,
-    queue_affinity: iree_hal_queue_affinity_t,
+    _queue_affinity: iree_hal_queue_affinity_t,
     wait_semaphore_list: iree_hal_semaphore_list_t,
     signal_semaphore_list: iree_hal_semaphore_list_t,
     command_buffer: *mut iree_hal_command_buffer_t,
-    binding_table: iree_hal_buffer_binding_table_t,
-    flags: iree_hal_execute_flags_t,
+    _binding_table: iree_hal_buffer_binding_table_t,
+    _flags: iree_hal_execute_flags_t,
 ) -> iree_status_t {
     // `command_buffer` may legitimately be NULL: `iree_hal_device_queue_
     // barrier()` (device.c) calls `iree_hal_device_queue_execute(..., NULL,
@@ -1226,9 +1228,7 @@ unsafe extern "C" fn queue_execute(
                     let fd = d.file.as_raw_fd();
                     let regcmd_tasks = job.regcmd_tasks;
                     if regcmd_tasks.iter().any(Vec::is_empty) {
-                        break 'result status::from_code(
-                            iree_status_code_e_IREE_STATUS_INTERNAL as u32,
-                        );
+                        break 'result status::from_code(iree_status_code_e_IREE_STATUS_INTERNAL);
                     }
 
                     // Allocate every split before submission so all command
@@ -1253,7 +1253,7 @@ unsafe extern "C" fn queue_execute(
                         }
                         if unsafe { rocket_device::fini_bo(fd, cmd_buf.handle) }.is_err() {
                             break 'result status::from_code(
-                                iree_status_code_e_IREE_STATUS_UNAVAILABLE as u32,
+                                iree_status_code_e_IREE_STATUS_UNAVAILABLE,
                             );
                         }
                         task_descriptors.push((cmd_buf.dma_address, regcmd.len() as u32));
@@ -1311,7 +1311,7 @@ unsafe extern "C" fn queue_execute(
                         .is_err()
                         {
                             break 'result status::from_code(
-                                iree_status_code_e_IREE_STATUS_UNAVAILABLE as u32,
+                                iree_status_code_e_IREE_STATUS_UNAVAILABLE,
                             );
                         }
 
@@ -1330,7 +1330,7 @@ unsafe extern "C" fn queue_execute(
                             .is_err()
                             {
                                 break 'result status::from_code(
-                                    iree_status_code_e_IREE_STATUS_UNAVAILABLE as u32,
+                                    iree_status_code_e_IREE_STATUS_UNAVAILABLE,
                                 );
                             }
                         }
@@ -1346,7 +1346,7 @@ unsafe extern "C" fn queue_execute(
                         let expected_bytes = oc.output_pixel_count * oc.bytes_per_pixel;
                         if expected_bytes as u64 > oc.output_length as u64 {
                             break 'result status::from_code(
-                                iree_status_code_e_IREE_STATUS_INTERNAL as u32,
+                                iree_status_code_e_IREE_STATUS_INTERNAL,
                             );
                         }
                         let scratch = unsafe {
@@ -1355,7 +1355,7 @@ unsafe extern "C" fn queue_execute(
                         let out_rb = unsafe { &*(oc.output_buffer as *const RocketBuffer) };
                         let dst = unsafe {
                             std::slice::from_raw_parts_mut(
-                                out_rb.host_ptr.add(oc.output_offset as usize),
+                                out_rb.host_ptr.add(oc.output_offset),
                                 expected_bytes,
                             )
                         };
