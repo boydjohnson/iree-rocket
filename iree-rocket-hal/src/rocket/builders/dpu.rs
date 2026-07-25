@@ -445,8 +445,10 @@ impl Register<DpuDstSurfStride> {
     /// Description: Output shape surface stride in external memory.
     ///
     /// Bit width: 28
-    /// Range of values: 0 to 2^28-1 (this field occupies bits 31:4 of the word; bits 3:0 are hardware-reserved).
-    /// Known limitations: None documented.
+    /// Range of values: 0 to 2^28-1, in 16-byte units. Pass `stride_bytes / 16`;
+    /// the builder shifts that logical field value into register bits 31:4.
+    /// Known limitations: The byte stride must be 16-byte aligned. Passing the already
+    /// encoded register word would shift it a second time.
     /// Related registers: dst_base_addr.
     pub fn dst_surf_stride(&mut self, dst_surf_stride: Bits<28>) -> &mut Self {
         self.set_field(DPU_DST_SURF_STRIDE_DST_SURF_STRIDE__MASK, unsafe {
@@ -1760,14 +1762,34 @@ impl Register<DpuSurfaceAdd> {
     /// Description: Number of surfaces in a row for DPU's output addressing.
     ///
     /// Bit width: 28
-    /// Range of values: 0 to 2^28-1 (this field occupies bits 31:4 of the word; bits 3:0 are hardware-reserved).
-    /// Known limitations: None documented.
+    /// Range of values: 0 to 2^28-1, in 16-byte units. Pass the logical field value;
+    /// the builder shifts it into register bits 31:4.
+    /// Known limitations: Passing an already encoded register word would shift it a
+    /// second time.
     /// Related registers: dst_surf_stride, data_format.mc_surf_out.
     pub fn surf_add(&mut self, surf_add: Bits<28>) -> &mut Self {
         self.set_field(DPU_SURFACE_ADD_SURF_ADD__MASK, unsafe {
             DPU_SURFACE_ADD_SURF_ADD(surf_add.val())
         })
     }
+}
+
+// ========================================================================
+// RESERVED_40C4 (0x40C4)
+// ========================================================================
+
+/// Mandatory zero write found in vendor and Mesa DPU programs.
+///
+/// Offset `0x40c4` is absent from `registers.xml` and `rkt_registers.h`, so
+/// its hardware purpose and field layout remain unknown. Modeling the known
+/// zero-valued write as a register type keeps call sites typed without
+/// pretending that arbitrary values or fields are understood.
+#[derive(Debug, Clone, Copy)]
+pub struct DpuReserved40c4;
+
+impl RegisterMeta for DpuReserved40c4 {
+    const DOMAIN: u32 = crate::rocket::builders::DOMAIN_DPU;
+    const OFFSET: u32 = 0x40c4;
 }
 
 // ========================================================================

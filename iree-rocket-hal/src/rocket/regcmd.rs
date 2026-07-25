@@ -30,8 +30,14 @@
 
 use crate::rocket::{
     builders::{
-        Bits, DOMAIN_CORE, DOMAIN_DPU, DOMAIN_PC, RegCmd, Register, RegisterMeta, cna::*, core::*,
-        dpu::*, dpu_rdma::*, ppu::*, ppu_rdma::*,
+        Bits, DOMAIN_DPU, DOMAIN_PC, RegCmd, Register, RegisterMeta,
+        cna::*,
+        core::*,
+        dpu::*,
+        dpu_rdma::*,
+        pc::{PCOperationMask, PCRegisterAmounts, PCTrailer},
+        ppu::*,
+        ppu_rdma::*,
     },
     registers::{
         REG_DPU_LUT_ACCESS_DATA, REG_PC_BASE_ADDRESS, REG_PC_OPERATION_ENABLE,
@@ -1261,7 +1267,7 @@ fn build_conv_cna_core_dpu_dpu_rdma(
             .clip_truncate(Bits::new(shape.truncate_bits))
             .build(),
     );
-    cmds.push(RegCmd::new(DOMAIN_CORE, 0x3030, 0)); // TRM-mandated reserved write, no REG_CORE_* name
+    cmds.push(zero::<CoreReserved3030>());
 
     // ========================================================================
     // DPU
@@ -1511,7 +1517,7 @@ fn build_conv_cna_core_dpu_dpu_rdma(
             .surf_add(Bits::new(surfaces_per_row))
             .build(),
     );
-    cmds.push(RegCmd::new(DOMAIN_DPU, 0x40c4, 0)); // TRM-mandated reserved write, no REG_DPU_* name
+    cmds.push(zero::<DpuReserved40c4>());
 
     cmds.push(zero::<DpuLutAccessCfg>());
     cmds.push(zero::<DpuLutAccessData>());
@@ -1639,12 +1645,12 @@ fn build_conv_cna_core_dpu_dpu_rdma(
 // (`PC_OPERATION_ENABLE_OP_EN` in rkt_registers.h's naming) clear, which
 // is what revealed that bit isn't a generic mandatory "go" flag -- it's
 // just CNA's own enable bit, like every other bit here.
-const KICK_CNA: u32 = 1 << 0;
-const KICK_CORE: u32 = 1 << 2;
-const KICK_DPU: u32 = 1 << 3;
-const KICK_DPU_RDMA: u32 = 1 << 4;
-const KICK_PPU: u32 = 1 << 5;
-const KICK_PPU_RDMA: u32 = 1 << 6;
+const KICK_CNA: PCOperationMask = PCOperationMask::CNA;
+const KICK_CORE: PCOperationMask = PCOperationMask::CORE;
+const KICK_DPU: PCOperationMask = PCOperationMask::DPU;
+const KICK_DPU_RDMA: PCOperationMask = PCOperationMask::DPU_RDMA;
+const KICK_PPU: PCOperationMask = PCOperationMask::PPU;
+const KICK_PPU_RDMA: PCOperationMask = PCOperationMask::PPU_RDMA;
 
 /// Appends the standard single-task "kick" tail (ported verbatim from
 /// Mesa's fill_first_regcmd(), num_tasks == 1 branch -- see rkt-basic.rs's
@@ -1653,22 +1659,26 @@ const KICK_PPU_RDMA: u32 = 1 << 6;
 /// single task the same way, differing only in which blocks that task's
 /// kick should actually enable (see `KICK_*` above -- pass exactly the
 /// bits for the blocks this task configured, not a fixed value).
-fn push_kick_for_task_count(cmds: &mut Vec<RegCmd>, enable_mask: u32, task_count: usize) {
+fn push_kick_for_task_count(
+    cmds: &mut Vec<RegCmd>,
+    enable_mask: PCOperationMask,
+    task_count: usize,
+) {
     if task_count == 1 {
-        cmds.push(RegCmd::new_raw(0x0)); // Mesa's single-task placeholder
+        cmds.push(PCTrailer::single_task_placeholder());
     } else {
         cmds.push(RegCmd::new(DOMAIN_PC, REG_PC_BASE_ADDRESS, 0));
     }
-    cmds.push(RegCmd::new(DOMAIN_PC, REG_PC_REGISTER_AMOUNTS, 0));
-    cmds.push(RegCmd::new_raw(0x0041000000000000)); // TRM: required immediately before op_en
-    cmds.push(RegCmd::new(0x81, REG_PC_OPERATION_ENABLE, enable_mask));
+    cmds.push(zero::<PCRegisterAmounts>());
+    cmds.push(PCTrailer::required_marker());
+    cmds.push(PCTrailer::operation_enable(enable_mask));
 
     if !cmds.len().is_multiple_of(2) {
-        cmds.push(RegCmd::new_raw(0x0));
+        cmds.push(PCTrailer::alignment_padding());
     }
 }
 
-fn push_kick(cmds: &mut Vec<RegCmd>, enable_mask: u32) {
+fn push_kick(cmds: &mut Vec<RegCmd>, enable_mask: PCOperationMask) {
     push_kick_for_task_count(cmds, enable_mask, 1);
 }
 
@@ -1855,7 +1865,7 @@ pub fn build_lut_regcmd(shape: &LutShape, bufs: &LutBuffers, table: LutTable) ->
             .surf_add(Bits::new(surface_stride))
             .build(),
     );
-    cmds.push(RegCmd::new(DOMAIN_DPU, 0x40c4, 0));
+    cmds.push(zero::<DpuReserved40c4>());
 
     push_lut_tables_and_config(&mut cmds, table);
 

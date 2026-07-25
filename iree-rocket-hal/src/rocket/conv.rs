@@ -10,7 +10,7 @@
 //! multi-core-plan inputs.
 
 use crate::rocket::builders::{
-    Bits, DOMAIN_CORE, DOMAIN_DPU, RegCmd, Register, RegisterMeta,
+    Bits, RegCmd, Register, RegisterMeta,
     cna::{
         CnaCbufCon0, CnaCbufCon1, CnaConvCon1, CnaConvCon2, CnaConvCon3, CnaCvtCon0, CnaCvtCon1,
         CnaCvtCon2, CnaCvtCon3, CnaCvtCon4, CnaCvtCon5, CnaDataSize0, CnaDataSize1, CnaDataSize2,
@@ -22,7 +22,7 @@ use crate::rocket::builders::{
         CnaFcDataSize1, CnaFeatureDataAddr, CnaPadCon0, CnaPadCon1, CnaWeightSize0, CnaWeightSize1,
         CnaWeightSize2,
     },
-    core::{CoreClipTruncate, CoreDataoutSize0, CoreDataoutSize1, CoreMiscCfg},
+    core::{CoreClipTruncate, CoreDataoutSize0, CoreDataoutSize1, CoreMiscCfg, CoreReserved3030},
     dpu::{
         DpuBnAluCfg, DpuBnCfg, DpuBnMulCfg, DpuBnReluxCmpValue, DpuBsAluCfg, DpuBsCfg, DpuBsMulCfg,
         DpuBsOwCfg, DpuBsOwOp, DpuBsReluxCmpValue, DpuDataCubeChannel, DpuDataCubeHeight,
@@ -32,8 +32,8 @@ use crate::rocket::builders::{
         DpuEwReluxCmpValue, DpuFeatureModeCfg, DpuLutAccessCfg, DpuLutAccessData, DpuLutCfg,
         DpuLutInfo, DpuLutLeEnd, DpuLutLeSlopeScale, DpuLutLeSlopeShift, DpuLutLeStart,
         DpuLutLoEnd, DpuLutLoSlopeScale, DpuLutLoSlopeShift, DpuLutLoStart, DpuOffsetPend,
-        DpuOutCvtOffset, DpuOutCvtScale, DpuOutCvtShift, DpuSPointer, DpuSurfaceAdd, DpuWdmaSize0,
-        DpuWdmaSize1,
+        DpuOutCvtOffset, DpuOutCvtScale, DpuOutCvtShift, DpuReserved40c4, DpuSPointer,
+        DpuSurfaceAdd, DpuWdmaSize0, DpuWdmaSize1,
     },
     dpu_rdma::{
         DpuRdmaBnBaseAddr, DpuRdmaBrdmaCfg, DpuRdmaBsBaseAddr, DpuRdmaDataCubeChannel,
@@ -42,7 +42,8 @@ use crate::rocket::builders::{
         DpuRdmaPadCfg, DpuRdmaSPointer, DpuRdmaSrcBaseAddr, DpuRdmaSrcDmaCfg, DpuRdmaSurfNotch,
         DpuRdmaWeight,
     },
-    pc::PCRegisterAmounts,
+    pc::{PCOperationMask, PCRegisterAmounts, PCTrailer},
+    values::{ArgbInputMode, BurstLength, DataPrecision, DpuOutputMode},
 };
 
 /// `[kernel_height, kernel_width]`.
@@ -96,15 +97,9 @@ pub fn conv_2d(kernels: Kernels) -> Vec<RegCmd> {
     const TASK_INPUT_CHANNELS: u32 = 8;
     const OUTPUT_CHANNELS: u32 = 8;
     const TASK_OUTPUT_CHANNELS: u32 = 16;
-    const FP16_PRECISION: u32 = 2;
     const FP16_BYTES: u32 = 2;
-    const BURST_16: u32 = 15;
-    const OUTPUT_TO_MEMORY: u32 = 0b10;
-    const ARGB_C3: u32 = 10;
     const WEIGHT_BANKS: u32 = 11;
     const DATA_BANKS: u32 = 1;
-    const PC_REQUIRED_MARKER: u64 = 0x0041_0000_0000_0000;
-    const PC_KICK_CONV_BLOCKS: u64 = 0x0081_0000_001d_0008;
 
     let kernel = kernel_programming(kernels);
     let weight_bytes_per_kernel = kernel.size * kernel.size * TASK_INPUT_CHANNELS * FP16_BYTES;
@@ -124,9 +119,9 @@ pub fn conv_2d(kernels: Kernels) -> Vec<RegCmd> {
     conv_con1
         .nonalign_dma(Bits::new(1))
         .group_line_off(Bits::new(1))
-        .argb_in(Bits::new(ARGB_C3))
-        .proc_precision(Bits::new(FP16_PRECISION))
-        .in_precision(Bits::new(FP16_PRECISION));
+        .argb_in(ArgbInputMode::ThreeChannels.into())
+        .proc_precision(DataPrecision::Fp16.into())
+        .in_precision(DataPrecision::Fp16.into());
     commands.push(conv_con1.build());
     commands.push(
         Register::<DpuSPointer>::new()
@@ -240,8 +235,8 @@ pub fn conv_2d(kernels: Kernels) -> Vec<RegCmd> {
     commands.push(zero::<CnaFcCon2>());
     commands.push(
         Register::<CnaDmaCon0>::new()
-            .data_burst_len(Bits::new(BURST_16))
-            .weight_burst_len(Bits::new(BURST_16))
+            .data_burst_len(BurstLength::Sixteen.into())
+            .weight_burst_len(BurstLength::Sixteen.into())
             .build(),
     );
     commands.push(
@@ -287,11 +282,10 @@ pub fn conv_2d(kernels: Kernels) -> Vec<RegCmd> {
     commands.push(zero::<CnaCvtCon5>());
     commands.push(zero::<CnaPadCon1>());
 
-    // CORE. Offset 0x3030 is present in the vendor stream but is absent
-    // from registers.xml/rkt_registers.h, so it cannot use a typed builder.
+    // CORE.
     commands.push(
         Register::<CoreMiscCfg>::new()
-            .proc_precision(Bits::new(FP16_PRECISION))
+            .proc_precision(DataPrecision::Fp16.into())
             .build(),
     );
     commands.push(
@@ -306,20 +300,20 @@ pub fn conv_2d(kernels: Kernels) -> Vec<RegCmd> {
             .build(),
     );
     commands.push(zero::<CoreClipTruncate>());
-    commands.push(RegCmd::new(DOMAIN_CORE, 0x3030, 0));
+    commands.push(zero::<CoreReserved3030>());
 
     // DPU output, conversion, and disabled LUT programming.
     commands.push(
         Register::<DpuFeatureModeCfg>::new()
-            .burst_len(Bits::new(BURST_16))
-            .output_mode(Bits::new(OUTPUT_TO_MEMORY))
+            .burst_len(BurstLength::Sixteen.into())
+            .output_mode(DpuOutputMode::ExternalMemory.into())
             .build(),
     );
     commands.push(
         Register::<DpuDataFormat>::new()
-            .in_precision(Bits::new(FP16_PRECISION))
-            .out_precision(Bits::new(FP16_PRECISION))
-            .proc_precision(Bits::new(FP16_PRECISION))
+            .in_precision(DataPrecision::Fp16.into())
+            .out_precision(DataPrecision::Fp16.into())
+            .proc_precision(DataPrecision::Fp16.into())
             .build(),
     );
     commands.push(zero::<DpuOffsetPend>());
@@ -425,8 +419,7 @@ pub fn conv_2d(kernels: Kernels) -> Vec<RegCmd> {
             .surf_add(Bits::new(WIDTH * HEIGHT * FP16_BYTES))
             .build(),
     );
-    // Like CORE 0x3030, DPU 0x40c4 has no generated register definition.
-    commands.push(RegCmd::new(DOMAIN_DPU, 0x40c4, 0));
+    commands.push(zero::<DpuReserved40c4>());
     commands.push(zero::<DpuLutAccessCfg>());
     commands.push(zero::<DpuLutAccessData>());
     commands.push(zero::<DpuLutCfg>());
@@ -475,10 +468,10 @@ pub fn conv_2d(kernels: Kernels) -> Vec<RegCmd> {
     commands.push(zero::<DpuRdmaEwSurfStride>());
     commands.push(
         Register::<DpuRdmaFeatureModeCfg>::new()
-            .burst_len(Bits::new(BURST_16))
+            .burst_len(BurstLength::Sixteen.into())
             .mrdma_disable(Bits::new(1))
-            .in_precision(Bits::new(FP16_PRECISION))
-            .proc_precision(Bits::new(FP16_PRECISION))
+            .in_precision(DataPrecision::Fp16.into())
+            .proc_precision(DataPrecision::Fp16.into())
             .build(),
     );
     commands.push(zero::<DpuRdmaSrcDmaCfg>());
@@ -496,11 +489,11 @@ pub fn conv_2d(kernels: Kernels) -> Vec<RegCmd> {
 
     // Vendor PC trailer: placeholder, zero register count, required marker,
     // combined operation-enable mask, and six words of alignment padding.
-    commands.push(RegCmd::new_raw(0));
+    commands.push(PCTrailer::single_task_placeholder());
     commands.push(zero::<PCRegisterAmounts>());
-    commands.push(RegCmd::new_raw(PC_REQUIRED_MARKER));
-    commands.push(RegCmd::new_raw(PC_KICK_CONV_BLOCKS));
-    commands.extend((0..6).map(|_| RegCmd::new_raw(0)));
+    commands.push(PCTrailer::required_marker());
+    commands.push(PCTrailer::operation_enable(PCOperationMask::CONVOLUTION));
+    commands.extend((0..6).map(|_| PCTrailer::alignment_padding()));
 
     debug_assert_eq!(commands.len(), 136);
     commands

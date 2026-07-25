@@ -346,3 +346,21 @@ impl Register<CoreClipTruncate> {
         })
     }
 }
+
+// ============================================================================
+// RESERVED_3030 (0x3030)
+// ============================================================================
+
+/// Mandatory zero write found in vendor and Mesa convolution programs.
+///
+/// Offset `0x3030` is absent from `registers.xml` and `rkt_registers.h`, so
+/// its hardware purpose and field layout remain unknown. Modeling the known
+/// zero-valued write as a register type keeps call sites typed without
+/// pretending that arbitrary values or fields are understood.
+#[derive(Debug, Clone, Copy)]
+pub struct CoreReserved3030;
+
+impl RegisterMeta for CoreReserved3030 {
+    const DOMAIN: u32 = crate::rocket::builders::DOMAIN_CORE;
+    const OFFSET: u32 = 0x3030;
+}

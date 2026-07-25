@@ -293,7 +293,9 @@ impl Register<CnaConvCon2> {
     /// Bit width: 10
     /// Range of values: 0x000-0x3FF; TRM suggests setting this to
     /// `y_stride + weight_height + 1`.
-    /// Known limitations: None documented.
+    /// Known limitations: Pass the logical 10-bit field value, not an encoded register
+    /// word. The hardware field begins at bit 4, so `feature_grains(Bits::new(0x21))`
+    /// produces register value `0x210`.
     /// Related registers: `cna_conv_con3.conv_y_stride`, `cna_weight_size2.weight_height`
     /// (used to derive the suggested value).
     pub fn feature_grains(&mut self, feature_grain: Bits<10>) -> &mut Self {
@@ -698,10 +700,12 @@ impl Register<CnaCbufCon0> {
     /// the top bank.
     ///
     /// Bit width: 4
-    /// Range of values: 4'd1: Bank 7 occupied by weight data; 4'd2: Bank 6/7 occupied by
-    /// weight data; ... 4'd7: Bank 1-7 occupied by weight data.
+    /// Range of values: 0-15, matching the complete 4-bit hardware field. The older TRM
+    /// description only enumerates 1-7, but a working RK3588 vendor convolution capture
+    /// programs 11.
     /// Known limitations: Must be allocated so it doesn't overlap the banks claimed by
-    /// `data_bank`; the CBUF is 384KB of internal SRAM total (TRM §1).
+    /// `data_bank`. The exact bank-count/topology interpretation for values above 7 is
+    /// not documented by the older TRM.
     /// Related registers: `data_bank`, `fc_data_bank`, `weight_reuse`.
     pub fn weight_bank(&mut self, weight_bank: Bits<4>) -> &mut Self {
         self.set_field(CNA_CBUF_CON0_WEIGHT_BANK__MASK, unsafe {

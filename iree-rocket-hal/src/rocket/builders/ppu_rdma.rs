@@ -278,8 +278,11 @@ impl Register<PpuRdmaSrcLineStride> {
     /// Description: Stride (in bytes) between consecutive rows of the source pooling cube, including any "virtual box" padding beyond the logical cube width.
     ///
     /// Bit width: 28
-    /// Range of values: 28-bit value occupying bits 31:4 of the register (bits 3:0 are reserved/read-only, so the effective stride is always a multiple of 16 bytes).
-    /// Known limitations: Must account for padding beyond the actual cube shape ("including Virtual box" per the TRM notes); only used when PPU is in flying mode fed by PPU_RDMA.
+    /// Range of values: 0 to 2^28-1, in 16-byte units. Pass `stride_bytes / 16`;
+    /// the builder shifts that logical field value into register bits 31:4.
+    /// Known limitations: The byte stride must be 16-byte aligned and must account for
+    /// padding beyond the actual cube shape ("including Virtual box" per the TRM notes).
+    /// Passing the already encoded register word would shift it a second time.
     /// Related registers: cube_in_width, src_surf_stride, src_base_addr.
     pub fn src_line_stride(&mut self, src_line_stride: Bits<28>) -> &mut Self {
         self.set_field(
@@ -304,8 +307,11 @@ impl Register<PpuRdmaSrcSurfStride> {
     /// Description: Stride (in bytes) between consecutive surfaces/planes of the source pooling cube, including any "virtual box" padding beyond the logical cube area.
     ///
     /// Bit width: 28
-    /// Range of values: 28-bit value occupying bits 31:4 of the register (bits 3:0 are reserved/read-only, so the effective stride is always a multiple of 16 bytes).
-    /// Known limitations: Must account for padding beyond the actual cube shape ("including Virtual box" per the TRM notes); only used when PPU is in flying mode fed by PPU_RDMA.
+    /// Range of values: 0 to 2^28-1, in 16-byte units. Pass `stride_bytes / 16`;
+    /// the builder shifts that logical field value into register bits 31:4.
+    /// Known limitations: The byte stride must be 16-byte aligned and must account for
+    /// padding beyond the actual cube shape ("including Virtual box" per the TRM notes).
+    /// Passing the already encoded register word would shift it a second time.
     /// Related registers: cube_in_channel, src_line_stride, src_base_addr.
     pub fn src_surf_stride(&mut self, src_surf_stride: Bits<28>) -> &mut Self {
         self.set_field(

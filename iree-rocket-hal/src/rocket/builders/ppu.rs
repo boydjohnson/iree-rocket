@@ -647,8 +647,10 @@ impl Register<PpuDstSurfStride> {
     /// Description: Stride (area) of one output surface — the byte span occupied by one surface of the output shape.
     ///
     /// Bit width: 28
-    /// Range of values: Any value representing bits [31:4] of a 32-bit stride.
-    /// Known limitations: Occupies bits [31:4] of the register; bits [3:0] are reserved/read-only.
+    /// Range of values: 0 to 2^28-1, in 16-byte units. Pass `stride_bytes / 16`;
+    /// the builder shifts that logical field value into register bits 31:4.
+    /// Known limitations: The byte stride must be 16-byte aligned. Passing the already
+    /// encoded register word would shift it a second time.
     /// Related registers: `PpuDstBaseAddr::dst_base_addr`, `PpuDataFormat::index_add` (which equals this value, or this value times surface count when `index_en` is set).
     pub fn dst_surf_stride(&mut self, dst_surf_stride: Bits<28>) -> &mut Self {
         self.set_field(PPU_DST_SURF_STRIDE_DST_SURF_STRIDE__MASK, unsafe {
