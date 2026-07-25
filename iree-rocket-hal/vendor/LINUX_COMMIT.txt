@@ -1,0 +1,4 @@
+https://git.kernel.org/pub/scm/linux/kernel/git/stable/linux.git
+linux-6.18.y (longterm)
+tag v6.18.40
+221fc2f4d0eda59d02af2e751a9282fa013a8e97 (2026-07-24 16:17:26 +0200)
