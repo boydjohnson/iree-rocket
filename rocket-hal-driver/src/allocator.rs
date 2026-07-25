@@ -225,8 +225,7 @@ unsafe extern "C" fn allocate_buffer(
     // follows with `NonZeroUsize::new(size).unwrap()` for the mmap length,
     // which panics on exactly this input.
     let real_size = allocation_size.max(4);
-    let raw =
-        unsafe { device::Buffer::new(alloc.file.as_raw_fd(), real_size as usize, &alloc.file) };
+    let raw = unsafe { device::Buffer::new(alloc.file.as_raw_fd(), real_size, &alloc.file) };
 
     let buffer = Box::new(RocketBuffer {
         // Filled in by iree_hal_buffer_initialize below -- this is just
@@ -266,8 +265,8 @@ unsafe extern "C" fn allocate_buffer(
             // queue_dealloca's deallocated-marking (see buffer.rs) would
             // never actually run for any test that goes through the
             // standard iree_hal_device_queue_dealloca API.
-            flags: iree_hal_buffer_placement_flag_bits_t_IREE_HAL_BUFFER_PLACEMENT_FLAG_ASYNCHRONOUS
-                as u32,
+            flags:
+                iree_hal_buffer_placement_flag_bits_t_IREE_HAL_BUFFER_PLACEMENT_FLAG_ASYNCHRONOUS,
             reserved: 0,
         };
         crate::bindings::iree_hal_buffer_initialize(

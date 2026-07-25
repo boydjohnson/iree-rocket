@@ -115,7 +115,7 @@ unsafe extern "C" fn map_range(
     let rb = unsafe { &*cast(buffer) };
     unsafe {
         (*mapping).contents = iree_byte_span_t {
-            data: rb.host_ptr.add(local_byte_offset as usize),
+            data: rb.host_ptr.add(local_byte_offset),
             data_length: local_byte_length,
         };
         (*mapping).buffer = buffer;
@@ -160,9 +160,7 @@ unsafe extern "C" fn unmap_range(
     if allowed_access & (iree_hal_memory_access_bits_t_IREE_HAL_MEMORY_ACCESS_WRITE as u16) != 0 {
         let rb = unsafe { &*cast(buffer) };
         if unsafe { device::fini_bo(rb.fd, rb.handle) }.is_err() {
-            return status::from_code(
-                crate::bindings::iree_status_code_e_IREE_STATUS_INTERNAL as u32,
-            );
+            return status::from_code(crate::bindings::iree_status_code_e_IREE_STATUS_INTERNAL);
         }
     }
     status::ok()
@@ -185,9 +183,9 @@ unsafe extern "C" fn invalidate_range(
     // prep_bo), not a bare absolute deadline.
     match unsafe { device::prep_bo(rb.fd, rb.handle, 5_000_000_000) } {
         Ok(()) => status::ok(),
-        Err(_) => status::from_code(
-            crate::bindings::iree_status_code_e_IREE_STATUS_DEADLINE_EXCEEDED as u32,
-        ),
+        Err(_) => {
+            status::from_code(crate::bindings::iree_status_code_e_IREE_STATUS_DEADLINE_EXCEEDED)
+        }
     }
 }
 
@@ -203,9 +201,7 @@ unsafe extern "C" fn flush_range(
     // done, safe for the NPU to read).
     match unsafe { device::fini_bo(rb.fd, rb.handle) } {
         Ok(()) => status::ok(),
-        Err(_) => {
-            status::from_code(crate::bindings::iree_status_code_e_IREE_STATUS_INTERNAL as u32)
-        }
+        Err(_) => status::from_code(crate::bindings::iree_status_code_e_IREE_STATUS_INTERNAL),
     }
 }
 

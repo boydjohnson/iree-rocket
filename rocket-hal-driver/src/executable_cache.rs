@@ -239,10 +239,7 @@ pub unsafe extern "C" fn can_prepare_format(
         return false;
     }
     let format = unsafe {
-        std::slice::from_raw_parts(
-            executable_format.data as *const u8,
-            executable_format.size as usize,
-        )
+        std::slice::from_raw_parts(executable_format.data as *const u8, executable_format.size)
     };
     format == FLATBUFFER_FORMAT || format == LEGACY_FORMAT
 }
@@ -258,26 +255,22 @@ unsafe extern "C" fn prepare_executable(
     }
     let params = unsafe { &*executable_params };
     if params.executable_format.size == 0 || params.executable_format.data.is_null() {
-        return status::from_code(
-            crate::bindings::iree_status_code_e_IREE_STATUS_INVALID_ARGUMENT as u32,
-        );
+        return status::from_code(crate::bindings::iree_status_code_e_IREE_STATUS_INVALID_ARGUMENT);
     }
     let format = unsafe {
         std::slice::from_raw_parts(
             params.executable_format.data as *const u8,
-            params.executable_format.size as usize,
+            params.executable_format.size,
         )
     };
     let data = params.executable_data;
     if data.data_length != 0 && data.data.is_null() {
-        return status::from_code(
-            crate::bindings::iree_status_code_e_IREE_STATUS_INVALID_ARGUMENT as u32,
-        );
+        return status::from_code(crate::bindings::iree_status_code_e_IREE_STATUS_INVALID_ARGUMENT);
     }
     let bytes = if data.data_length == 0 {
         &[]
     } else {
-        unsafe { std::slice::from_raw_parts(data.data, data.data_length as usize) }
+        unsafe { std::slice::from_raw_parts(data.data, data.data_length) }
     };
 
     if format == FLATBUFFER_FORMAT {
@@ -285,7 +278,7 @@ unsafe extern "C" fn prepare_executable(
             Ok(shape) => shape,
             Err(()) => {
                 return status::from_code(
-                    crate::bindings::iree_status_code_e_IREE_STATUS_INVALID_ARGUMENT as u32,
+                    crate::bindings::iree_status_code_e_IREE_STATUS_INVALID_ARGUMENT,
                 );
             }
         };
@@ -295,7 +288,7 @@ unsafe extern "C" fn prepare_executable(
         return status::ok();
     }
     if format != LEGACY_FORMAT {
-        return status::from_code(crate::bindings::iree_status_code_e_IREE_STATUS_NOT_FOUND as u32);
+        return status::from_code(crate::bindings::iree_status_code_e_IREE_STATUS_NOT_FOUND);
     }
 
     let tag = if data.data_length >= 1 {
@@ -306,7 +299,7 @@ unsafe extern "C" fn prepare_executable(
 
     if tag == CONV2D_V1_TAG {
         let payload = if data.data_length >= 1 {
-            unsafe { std::slice::from_raw_parts(data.data.add(1), data.data_length as usize - 1) }
+            unsafe { std::slice::from_raw_parts(data.data.add(1), data.data_length - 1) }
         } else {
             &[]
         };
@@ -314,13 +307,13 @@ unsafe extern "C" fn prepare_executable(
             Ok(shape) => shape,
             Err(_) => {
                 return status::from_code(
-                    crate::bindings::iree_status_code_e_IREE_STATUS_INVALID_ARGUMENT as u32,
+                    crate::bindings::iree_status_code_e_IREE_STATUS_INVALID_ARGUMENT,
                 );
             }
         };
         if validate_conv_shape(&shape).is_err() {
             return status::from_code(
-                crate::bindings::iree_status_code_e_IREE_STATUS_INVALID_ARGUMENT as u32,
+                crate::bindings::iree_status_code_e_IREE_STATUS_INVALID_ARGUMENT,
             );
         }
         unsafe {

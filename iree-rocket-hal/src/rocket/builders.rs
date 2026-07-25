@@ -66,6 +66,12 @@ pub trait RegisterMeta {
     const OFFSET: u32;
 }
 
+impl<R: RegisterMeta> Default for Register<R> {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl<R: RegisterMeta> Register<R> {
     pub fn new() -> Self {
         Self {

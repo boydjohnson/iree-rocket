@@ -20,5 +20,5 @@ pub fn ok() -> iree_status_t {
 }
 
 pub fn unimplemented() -> iree_status_t {
-    from_code(iree_status_code_e_IREE_STATUS_UNIMPLEMENTED as u32)
+    from_code(iree_status_code_e_IREE_STATUS_UNIMPLEMENTED)
 }
