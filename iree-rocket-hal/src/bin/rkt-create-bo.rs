@@ -2,15 +2,7 @@ use iree_rocket_hal::rocket::api::{
     DRM_COMMAND_BASE, DRM_IOCTL_BASE, DRM_ROCKET_CREATE_BO, drm_rocket_create_bo,
 };
 use nix::sys::mman::{MapFlags, ProtFlags, mmap};
-use std::{
-    fs::OpenOptions,
-    num::NonZeroUsize,
-    os::{
-        fd::{FromRawFd, RawFd},
-        unix::io::AsRawFd,
-    },
-    ptr,
-};
+use std::{fs::OpenOptions, num::NonZeroUsize, os::unix::io::AsRawFd, ptr};
 
 // Base 'd' (0x64), Index 0x40 (DRM_COMMAND_BASE + DRM_ROCKET_CREATE_BO)
 nix::ioctl_readwrite!(

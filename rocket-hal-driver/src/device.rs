@@ -1173,12 +1173,12 @@ mod compaction_tests {
 
 unsafe extern "C" fn queue_execute(
     device: *mut iree_hal_device_t,
-    queue_affinity: iree_hal_queue_affinity_t,
+    _queue_affinity: iree_hal_queue_affinity_t,
     wait_semaphore_list: iree_hal_semaphore_list_t,
     signal_semaphore_list: iree_hal_semaphore_list_t,
     command_buffer: *mut iree_hal_command_buffer_t,
-    binding_table: iree_hal_buffer_binding_table_t,
-    flags: iree_hal_execute_flags_t,
+    _binding_table: iree_hal_buffer_binding_table_t,
+    _flags: iree_hal_execute_flags_t,
 ) -> iree_status_t {
     // `command_buffer` may legitimately be NULL: `iree_hal_device_queue_
     // barrier()` (device.c) calls `iree_hal_device_queue_execute(..., NULL,

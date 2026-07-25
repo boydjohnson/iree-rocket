@@ -235,28 +235,30 @@ struct Buffer {
 
 impl Buffer {
     unsafe fn new(fd: i32, size: usize, file: &std::fs::File) -> Self {
-        let mut create_params = drm_rocket_create_bo {
-            size: size as u32,
-            handle: 0,
-            dma_address: 0,
-            offset: 0,
-        };
-        rocket_create_bo(fd, &mut create_params).expect("Failed to create BO");
-        let map_len = NonZeroUsize::new(size).unwrap();
-        let map_addr = mmap(
-            None,
-            map_len,
-            ProtFlags::PROT_READ | ProtFlags::PROT_WRITE,
-            MapFlags::MAP_SHARED,
-            file,
-            create_params.offset as i64,
-        )
-        .expect("mmap failed");
-        Buffer {
-            handle: create_params.handle,
-            dma_address: create_params.dma_address as u32,
-            size,
-            host_ptr: map_addr.as_ptr() as *mut u8,
+        unsafe {
+            let mut create_params = drm_rocket_create_bo {
+                size: size as u32,
+                handle: 0,
+                dma_address: 0,
+                offset: 0,
+            };
+            rocket_create_bo(fd, &mut create_params).expect("Failed to create BO");
+            let map_len = NonZeroUsize::new(size).unwrap();
+            let map_addr = mmap(
+                None,
+                map_len,
+                ProtFlags::PROT_READ | ProtFlags::PROT_WRITE,
+                MapFlags::MAP_SHARED,
+                file,
+                create_params.offset as i64,
+            )
+            .expect("mmap failed");
+            Buffer {
+                handle: create_params.handle,
+                dma_address: create_params.dma_address as u32,
+                size,
+                host_ptr: map_addr.as_ptr() as *mut u8,
+            }
         }
     }
 }

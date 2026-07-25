@@ -1,4 +1,4 @@
-use std::{ffi::c_char, fs::File, mem::MaybeUninit, os::fd::AsRawFd};
+use std::{ffi::c_char, fs::File, os::fd::AsRawFd};
 
 use iree_rocket_hal::rocket::api::{DRM_IOCTL_BASE, drm_version};
 
