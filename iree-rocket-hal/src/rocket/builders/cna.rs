@@ -47,7 +47,7 @@ impl Register<CnaSPointer> {
     /// Known limitations: None documented.
     /// Related registers: `executer`, `executer_pp_clear`; mirrors `pointer_pp_en` but for
     /// the executer group rather than the register group.
-    pub fn executor_pp_en(&mut self, pp_en: Bits<1>) -> &mut Self {
+    pub fn executer_pp_en(&mut self, pp_en: Bits<1>) -> &mut Self {
         self.set_field(CNA_S_POINTER_EXECUTER_PP_EN__MASK, unsafe {
             CNA_S_POINTER_EXECUTER_PP_EN(pp_en.val())
         })
@@ -96,7 +96,7 @@ impl Register<CnaSPointer> {
     /// Bit width: 1
     /// Range of values: 1'd0: Executer group 0; 1'd1: Executer group 1.
     /// Known limitations: None documented.
-    /// Related registers: `executor_pp_en`, `executer_pp_clear`; readable back via
+    /// Related registers: `executer_pp_en`, `executer_pp_clear`; readable back via
     /// `cna_s_status`'s `status_0`/`status_1` idle/operating/pending fields.
     pub fn executer(&mut self, executer: Bits<1>) -> &mut Self {
         self.set_field(CNA_S_POINTER_EXECUTER__MASK, unsafe {

@@ -541,13 +541,18 @@ struct ConvTaskDraft {
     retain_slices: u32,
 }
 
-const CBUF_BANKS: u32 = 12;
-const CBUF_ENTRIES_PER_BANK: u64 = 256;
+// `pub(crate)` rather than private: `conv.rs`'s caller-driven row tiling
+// plans the same `ConvTask` shape this module's CBUF-driven
+// `plan_conv_tasks` does, so it needs the same CBUF geometry constants and
+// bank math rather than a second copy that can drift out of sync with the
+// builder those tasks are handed to.
+pub(crate) const CBUF_BANKS: u32 = 12;
+pub(crate) const CBUF_ENTRIES_PER_BANK: u64 = 256;
 const FEATURE_ATOMIC_SIZE: u64 = 16;
 const CBUF_ENTRY_SIZE: u64 = 128;
-const ATOMIC_K_SIZE: u64 = 16;
+pub(crate) const ATOMIC_K_SIZE: u64 = 16;
 
-fn conv_entries_per_slice(shape: &ConvShape) -> Result<u64, &'static str> {
+pub(crate) fn conv_entries_per_slice(shape: &ConvShape) -> Result<u64, &'static str> {
     let bpe = u64::from(shape.precision.bytes_per_element());
     let input_channels = u64::from(shape.input_channels);
     let input_width = u64::from(shape.input_width);
@@ -573,7 +578,7 @@ fn conv_entries_per_slice(shape: &ConvShape) -> Result<u64, &'static str> {
         .ok_or("input entries per slice overflow task planning")
 }
 
-fn conv_weights_banks(shape: &ConvShape) -> Result<u64, &'static str> {
+pub(crate) fn conv_weights_banks(shape: &ConvShape) -> Result<u64, &'static str> {
     let mut bytes = u64::from(shape.weights_width)
         .checked_mul(u64::from(shape.weights_height))
         .and_then(|value| value.checked_mul(u64::from(shape.input_channels)))
@@ -839,7 +844,7 @@ pub struct LutBuffers {
 /// what's hardware-confirmed. Every existing caller passes `None`
 /// (unchanged behavior); only `build_conv_with_add_regcmd` passes
 /// `Some`.
-fn build_conv_cna_core_dpu_dpu_rdma(
+pub(crate) fn build_conv_cna_core_dpu_dpu_rdma(
     shape: &ConvShape,
     bufs: &ConvBuffers,
     task: &ConvTask,
@@ -1639,10 +1644,10 @@ fn build_conv_cna_core_dpu_dpu_rdma(
 // (`PC_OPERATION_ENABLE_OP_EN` in rkt_registers.h's naming) clear, which
 // is what revealed that bit isn't a generic mandatory "go" flag -- it's
 // just CNA's own enable bit, like every other bit here.
-const KICK_CNA: u32 = 1 << 0;
-const KICK_CORE: u32 = 1 << 2;
-const KICK_DPU: u32 = 1 << 3;
-const KICK_DPU_RDMA: u32 = 1 << 4;
+pub(crate) const KICK_CNA: u32 = 1 << 0;
+pub(crate) const KICK_CORE: u32 = 1 << 2;
+pub(crate) const KICK_DPU: u32 = 1 << 3;
+pub(crate) const KICK_DPU_RDMA: u32 = 1 << 4;
 const KICK_PPU: u32 = 1 << 5;
 const KICK_PPU_RDMA: u32 = 1 << 6;
 
@@ -1653,7 +1658,11 @@ const KICK_PPU_RDMA: u32 = 1 << 6;
 /// single task the same way, differing only in which blocks that task's
 /// kick should actually enable (see `KICK_*` above -- pass exactly the
 /// bits for the blocks this task configured, not a fixed value).
-fn push_kick_for_task_count(cmds: &mut Vec<RegCmd>, enable_mask: u32, task_count: usize) {
+pub(crate) fn push_kick_for_task_count(
+    cmds: &mut Vec<RegCmd>,
+    enable_mask: u32,
+    task_count: usize,
+) {
     if task_count == 1 {
         cmds.push(RegCmd::new_raw(0x0)); // Mesa's single-task placeholder
     } else {
@@ -2027,7 +2036,7 @@ pub fn build_conv_regcmd_tasks(
         .collect())
 }
 
-fn task_link_trailer_index(commands: &[RegCmd]) -> Result<usize, &'static str> {
+pub(crate) fn task_link_trailer_index(commands: &[RegCmd]) -> Result<usize, &'static str> {
     let is_register = |command: &RegCmd, domain: u32, offset: u32| {
         ((command.0 >> 48) & 0xff) == u64::from(domain & 0xff)
             && (command.0 & 0xffff) == u64::from(offset)

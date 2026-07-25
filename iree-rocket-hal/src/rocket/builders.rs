@@ -97,6 +97,16 @@ impl<R: RegisterMeta> Register<R> {
         RegCmd::new(R::DOMAIN, R::OFFSET, self.val)
     }
 
+    /// The encoded register value without the domain/offset wrapper -- the
+    /// inverse of `from_val`. Lets a caller build a value through one
+    /// block's typed setters and replay it into a sibling block whose
+    /// register has the identical bit layout (the `S_POINTER` family, which
+    /// the TRM documents once and repeats per block), instead of
+    /// re-deriving the same field pattern per block.
+    pub fn into_val(self) -> u32 {
+        self.val
+    }
+
     #[inline]
     pub fn set_flag(&mut self, mask: u32, enable: bool) -> &mut Self {
         if enable {
