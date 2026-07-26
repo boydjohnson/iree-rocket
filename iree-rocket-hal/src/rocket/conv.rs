@@ -376,6 +376,18 @@ impl Multiplier {
         }
     }
 
+    /// Encodes the per-tensor half of a requantisation whose per-channel BS
+    /// multipliers are normalised to [`BS_UNIT_MULTIPLIER`].
+    ///
+    /// The hardware applies `(accumulator * bs_multiplier) >>
+    /// BS_MULTIPLIER_SHIFT` before this stage sees it, so a plane at unit
+    /// contributes a gain of `2^(14 - 7)` that has to come back out here.
+    /// Measured on hardware; see [`BS_MULTIPLIER_SHIFT`].
+    pub fn for_unit_bs(total_ratio: f64) -> Multiplier {
+        let bs_gain = f64::from(BS_UNIT_MULTIPLIER >> BS_MULTIPLIER_SHIFT);
+        Multiplier::from_ratio(total_ratio / bs_gain)
+    }
+
     /// The real multiplier this pair encodes.
     pub fn ratio(&self) -> f64 {
         f64::from(self.scale) / 2f64.powi(self.shift as i32)
@@ -887,6 +899,113 @@ fn zero<R: RegisterMeta>() -> RegCmd {
 /// addresses first.
 ///
 /// The returned 136-word sequence is group 1 of the vendor blob. Groups
+/// Output channels one BS block covers.
+pub const BS_CHANNELS_PER_BLOCK: usize = 8;
+
+/// Bytes one BS block occupies: eight `i32` biases, eight `i16` of a
+/// constant, and eight `i16` multipliers, each plane padded to eight
+/// channels whether or not they are all used.
+pub const BS_BLOCK_BYTES: usize = 64;
+
+/// The `i16` plane between the biases and the multipliers.
+///
+/// Constant at 128 in every model measured -- across `Cout` 4, 8 and 16,
+/// uniform and per-channel weight magnitudes, zero and nonzero biases.
+/// Nothing has been found that moves it, so no meaning is claimed for it
+/// beyond "the value the vendor writes".
+pub const BS_CONSTANT: i16 = 128;
+
+/// Multiplier the channel carrying the largest weight scale is given.
+///
+/// The per-channel multipliers are `round(BS_UNIT_MULTIPLIER * scale[c] /
+/// max(scale))`, so the widest channel gets exactly this and the rest scale
+/// down from it. Reproduces every measured table exactly.
+pub const BS_UNIT_MULTIPLIER: i16 = 1 << 14;
+
+/// Right shift the BS stage applies to `accumulator * bs_multiplier`.
+///
+/// **Measured, not read off a register.** `DPU_BS_MUL_CFG.bs_mul_shift_value`
+/// is 14 in every capture and the multiplier plane normalises to `2^14`,
+/// which made 14 the obvious reading -- and it is wrong by a factor of 128.
+/// `conv_int8_probe_hw` pins it two independent ways: holding the
+/// accumulator at 1 and sweeping `out_cvt_shift`, the output reaches 1 at
+/// 21, and `28 - 21 = 7`; holding the shift at 14 and sweeping the BS
+/// multiplier, the output is 1 at 128 and doubles from there.
+///
+/// Nothing in the corpus could have shown this. The vendor never programs a
+/// case where a wrong shift is observable, because whatever it does is
+/// absorbed into `OUT_CVT` -- so the constant was unobservable in captures
+/// and had to come from hardware.
+///
+/// One thing this does not explain: with the vendor's own values, a peak
+/// plane entry of `2^14` and an `OUT_CVT` multiplier equal to the textbook
+/// `input_scale * weight_scale / output_scale`, the composite comes out 128
+/// times too large. Either a further divisor exists that has not been
+/// found, or the vendor's plane feeds a stage this probe did not move. The
+/// law below is validated where it was measured and is not a claim about
+/// what the vendor's configuration means.
+pub const BS_MULTIPLIER_SHIFT: u32 = 7;
+
+/// One output channel's entry in the BS (bias/scale) buffer.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct BsEntry {
+    /// `round(bias / (input_scale * weight_scale[c]))`.
+    pub bias: i32,
+    /// `round(BS_UNIT_MULTIPLIER * weight_scale[c] / max(weight_scale))`.
+    pub multiplier: i16,
+}
+
+impl Default for BsEntry {
+    /// A zero bias at unit multiplier -- what a convolution with uniform
+    /// weight scales and no bias needs. Pair it with
+    /// [`Multiplier::for_unit_bs`], which cancels the gain this carries.
+    fn default() -> BsEntry {
+        BsEntry {
+            bias: 0,
+            multiplier: BS_UNIT_MULTIPLIER,
+        }
+    }
+}
+
+/// Bytes the BS buffer occupies for `out_channels` output channels.
+pub fn bs_buffer_bytes(out_channels: u32) -> usize {
+    (out_channels as usize).div_ceil(BS_CHANNELS_PER_BLOCK) * BS_BLOCK_BYTES
+}
+
+/// Writes the BS buffer `DPU_RDMA_RDMA_BS_BASE_ADDR` points at.
+///
+/// Required for int8: `brdma_data_use` is 7 there rather than the fp16 1, so
+/// BRDMA fetches a multiplier operand alongside the bias, and `bs_mul_src`
+/// makes the BS stage use it. A zeroed buffer supplies a zero multiplier and
+/// produces a zero output, which is why the fp16 tests' habit of zeroing the
+/// bias buffer does not carry over.
+///
+/// The layout is planar within a block of eight output channels and repeats
+/// per block, which is not what a flat array of per-channel structs would
+/// look like -- it was read off three converted models whose biases and
+/// per-channel weight magnitudes were varied independently.
+pub fn write_bs_buffer(buffer: &mut [u8], entries: &[BsEntry]) {
+    let needed = bs_buffer_bytes(entries.len() as u32);
+    assert!(
+        buffer.len() >= needed,
+        "BS buffer is {} bytes, needs {needed} for {} channels",
+        buffer.len(),
+        entries.len()
+    );
+    buffer[..needed].fill(0);
+    for (index, entry) in entries.iter().enumerate() {
+        let block = index / BS_CHANNELS_PER_BLOCK;
+        let lane = index % BS_CHANNELS_PER_BLOCK;
+        let base = block * BS_BLOCK_BYTES;
+        let bias = base + lane * 4;
+        buffer[bias..bias + 4].copy_from_slice(&entry.bias.to_le_bytes());
+        let constant = base + 32 + lane * 2;
+        buffer[constant..constant + 2].copy_from_slice(&BS_CONSTANT.to_le_bytes());
+        let multiplier = base + 48 + lane * 2;
+        buffer[multiplier..multiplier + 2].copy_from_slice(&entry.multiplier.to_le_bytes());
+    }
+}
+
 /// 2-3 and 4-6 are alternative two- and three-core height-split programs,
 /// not continuations of this command stream.
 pub fn conv_2d(kernels: Kernels) -> Vec<RegCmd> {
@@ -2342,6 +2461,96 @@ mod tests {
                 assert!(error < 1.0 / f64::from(MANTISSA_FLOOR), "ratio {ratio}");
             }
         }
+    }
+
+    #[test]
+    fn unit_bs_multiplier_cancels_out_of_the_requantisation() {
+        // The composite gain is `(bs_mul >> 7) * (scale / 2^shift)`, so a
+        // unit plane entry has to be divided back out. Measured on hardware:
+        // at cvt_shift 14 a BS multiplier of 128 gives unit gain, and the
+        // output doubles with each doubling of it from there.
+        let bs_gain = f64::from(BS_UNIT_MULTIPLIER >> BS_MULTIPLIER_SHIFT);
+        assert_eq!(bs_gain, 128.0);
+        for exponent in 0..8u32 {
+            let wanted = 1.0 / f64::from(1u32 << exponent);
+            let multiplier = Multiplier::for_unit_bs(wanted);
+            let composite = bs_gain * multiplier.ratio();
+            assert!(
+                (composite - wanted).abs() < wanted / 1024.0,
+                "composite gain {composite} for a requested {wanted}"
+            );
+        }
+        // The probe's own crossing point, restated: unit total gain leaves
+        // the per-tensor stage at 2^-7 of unity, which normalises to a
+        // mantissa of 2^14 at shift 21.
+        let unit = Multiplier::for_unit_bs(1.0);
+        assert_eq!((unit.scale, unit.shift), (1 << 14, 21));
+    }
+
+    #[test]
+    fn bs_buffer_matches_the_converted_models() {
+        // Byte-for-byte against `co16`, a Cout=16 model with per-channel
+        // weight magnitudes 0.01*(c+1) and biases 0.05*(c+1). Two blocks,
+        // and the second block is what shows the layout repeats rather than
+        // running as one flat plane.
+        let entries: Vec<BsEntry> = (0..16)
+            .map(|c| BsEntry {
+                bias: 162675,
+                multiplier: 1024 * (c + 1),
+            })
+            .collect();
+        let mut buffer = vec![0u8; bs_buffer_bytes(16)];
+        assert_eq!(buffer.len(), 128);
+        write_bs_buffer(&mut buffer, &entries);
+
+        // First block: biases at 0, the constant plane at 32, multipliers
+        // at 48.
+        assert_eq!(&buffer[0..4], &162675i32.to_le_bytes());
+        assert_eq!(&buffer[32..34], &128i16.to_le_bytes());
+        assert_eq!(&buffer[48..50], &1024i16.to_le_bytes());
+        assert_eq!(&buffer[62..64], &8192i16.to_le_bytes());
+        // Second block repeats the same three planes for channels 8..15.
+        assert_eq!(&buffer[64..68], &162675i32.to_le_bytes());
+        assert_eq!(&buffer[96..98], &128i16.to_le_bytes());
+        assert_eq!(&buffer[112..114], &9216i16.to_le_bytes());
+        assert_eq!(&buffer[126..128], &16384i16.to_le_bytes());
+
+        // A partial block is padded, not packed: Cout 4 still occupies 64
+        // bytes with the unused lanes left zero.
+        let mut partial = vec![0xffu8; bs_buffer_bytes(4)];
+        assert_eq!(partial.len(), 64);
+        write_bs_buffer(
+            &mut partial,
+            &[
+                BsEntry {
+                    bias: 162675,
+                    multiplier: 4096,
+                },
+                BsEntry {
+                    bias: 162675,
+                    multiplier: 8192,
+                },
+                BsEntry {
+                    bias: 162675,
+                    multiplier: 12288,
+                },
+                BsEntry {
+                    bias: 162675,
+                    multiplier: 16384,
+                },
+            ],
+        );
+        assert_eq!(
+            &partial[48..56],
+            &[0x00, 0x10, 0x00, 0x20, 0x00, 0x30, 0x00, 0x40]
+        );
+        assert!(partial[16..32].iter().all(|&b| b == 0), "unused bias lanes");
+        assert!(partial[56..64].iter().all(|&b| b == 0), "unused mul lanes");
+
+        // The default entry is what a uniform-scale, zero-bias convolution
+        // needs, and it is not a zeroed buffer.
+        assert_eq!(BsEntry::default().multiplier, BS_UNIT_MULTIPLIER);
+        assert_ne!(BsEntry::default().multiplier, 0);
     }
 
     #[test]
