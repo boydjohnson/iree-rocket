@@ -13,9 +13,22 @@
 //! 35 captures (212 convolution programs) spanning widths 32..256 and heights
 //! 32..256. Registers that vary in no capture stay literal constants.
 //!
-//! Supported case: `Cin=3` dense NHWC, `Cout=8`, stride 1, 1x1 or 3x3
-//! kernels. Wider channel counts move the feature map onto multiple NC1HWC2
-//! surfaces and change the row strides; nothing here covers that.
+//! Supported case: `Cin` 1..=80, `Cout=8`, strides 1..4, 1x1 or 3x3 kernels.
+//!
+//! Input channel count picks the memory layout. While a pixel fits in half a
+//! feature atom -- `Cin` up to 4 -- the vendor keeps it dense NHWC and the
+//! CNA pads internally. From `Cin` 5 the map becomes NC1HWC2 surfaces, and
+//! the row strides, the CBUF bank split and `data_entries` all change with
+//! it; `data_entries` in particular stops depending on the tile height
+//! entirely. `FeatureLayout` names the two regimes.
+//!
+//! Channel padding is a table rather than arithmetic. It is `atoms * 8`
+//! except at three atoms, where `datain_channel` stays 24 but coefficients
+//! use 32, and at seven, where both round to 64. Atom counts 5, 6, 9 and 10
+//! are unpadded, so no arithmetic rule fits and none is invented.
+//!
+//! `Cout > 8` is a separate axis: it needs the fp16 kernel-group split,
+//! which no formula here covers.
 //!
 //! Keeping this separate from `rocket::regcmd` keeps a capture-derived path
 //! distinct from that module's Mesa-derived one.
@@ -85,13 +98,48 @@ pub const IMAGE_HEIGHT: u32 = 32;
 /// Width of the originally captured image, in pixels.
 pub const IMAGE_WIDTH: u32 = 32;
 
-/// Input channels this builder supports. A C3 fp16 pixel is 6 bytes and
-/// occupies one 16-byte feature atom once padded to the CNA's C8 task width,
-/// which is what keeps the row strides below single-surface.
+/// Default input channels: the C3 dense NHWC case of the original captures.
 pub const INPUT_CHANNELS: u32 = 3;
+
+/// Largest input channel count with capture backing.
+pub const MAX_INPUT_CHANNELS: u32 = 80;
+
+/// Widest input pixel the vendor keeps in dense NHWC, in bytes.
+///
+/// A C4 fp16 pixel is 8 bytes and stays dense; a C5 pixel is 10 bytes and
+/// switches to NC1HWC2 surfaces. The boundary is half a 16-byte feature
+/// atom, not a whole one -- `Cin` 5, 6 and 7 are already surfaces.
+const DENSE_PIXEL_BYTES: u32 = 8;
+
+/// Padded channel counts by feature-atom count, `(datain_channel, weights)`.
+///
+/// Indexed by `ceil(Cin / 8) - 1`. Padding is `atoms * 8` everywhere except
+/// two measured exceptions, so this is a table rather than arithmetic:
+///
+/// - 3 atoms (`Cin` 17..24): `datain_channel` stays 24 but weights use 32
+/// - 7 atoms (`Cin` 49..56): both round up to 64
+///
+/// Atom counts 5, 6, 9 and 10 are unpadded, so this is neither "round to a
+/// power of two" nor "round to even", and no rule is claimed. Encoding the
+/// measurements directly avoids inventing one.
+const CHANNEL_PADDING: [(u32, u32); 10] = [
+    (8, 8),
+    (16, 16),
+    (24, 32),
+    (32, 32),
+    (40, 40),
+    (48, 48),
+    (64, 64),
+    (64, 64),
+    (72, 72),
+    (80, 80),
+];
 
 /// Output channels this builder supports: one fp16 kernel group.
 pub const OUTPUT_CHANNELS: u32 = 8;
+
+/// Physical width of one feature atom.
+const FEATURE_ATOM_BYTES: u32 = 16;
 
 /// Total CBUF banks the CNA partitions between feature data and weights.
 const CBUF_BANKS: u32 = 12;
@@ -122,6 +170,18 @@ pub struct Shape {
     /// Equal in both axes; `CNA_CONV_CON3` programs it directly, confirmed
     /// across 150 stride-2, -3 and -4 programs.
     pub stride: u32,
+    /// Real input channels, before any padding.
+    pub in_channels: u32,
+}
+
+/// How the feature map is laid out in memory, which the channel count picks.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum FeatureLayout {
+    /// Dense NHWC: the pixel is narrower than half a feature atom and the
+    /// CNA pads it internally. This is the C3 case of the original captures.
+    Dense,
+    /// NC1HWC2: one 16-byte atom per pixel per surface.
+    Surfaces,
 }
 
 impl Shape {
@@ -130,6 +190,7 @@ impl Shape {
         width: IMAGE_WIDTH,
         height: IMAGE_HEIGHT,
         stride: 1,
+        in_channels: INPUT_CHANNELS,
     };
 
     pub fn new(width: u32, height: u32) -> Shape {
@@ -137,15 +198,55 @@ impl Shape {
     }
 
     pub fn with_stride(width: u32, height: u32, stride: u32) -> Shape {
+        Shape::with_channels(width, height, stride, INPUT_CHANNELS)
+    }
+
+    pub fn with_channels(width: u32, height: u32, stride: u32, in_channels: u32) -> Shape {
         assert!(
             width > 0 && height > 0,
             "convolution extents must be nonzero"
         );
         assert!(stride > 0, "convolution stride must be nonzero");
+        assert!(
+            (1..=MAX_INPUT_CHANNELS).contains(&in_channels),
+            "input channels must be 1..={MAX_INPUT_CHANNELS}; beyond that the \
+             channel padding has no capture backing"
+        );
         Shape {
             width,
             height,
             stride,
+            in_channels,
+        }
+    }
+
+    /// Feature atoms one pixel occupies once padded.
+    pub fn feature_atoms(&self) -> u32 {
+        self.in_channels.div_ceil(8)
+    }
+
+    /// Channel count programmed into `CNA_DATA_SIZE1.datain_channel`.
+    pub fn padded_channels(&self) -> u32 {
+        CHANNEL_PADDING[self.feature_atoms() as usize - 1].0
+    }
+
+    /// Channel count the coefficient footprint is computed from.
+    pub fn weight_channels(&self) -> u32 {
+        CHANNEL_PADDING[self.feature_atoms() as usize - 1].1
+    }
+
+    /// Atoms per pixel implied by the weight padding, which is what the CBUF
+    /// accounting follows -- not `feature_atoms`. At 3 atoms the two differ.
+    fn weight_atoms(&self) -> u32 {
+        self.weight_channels() / 8
+    }
+
+    /// Whether the feature map is dense NHWC or NC1HWC2 surfaces.
+    pub fn layout(&self) -> FeatureLayout {
+        if self.in_channels * 2 <= DENSE_PIXEL_BYTES {
+            FeatureLayout::Dense
+        } else {
+            FeatureLayout::Surfaces
         }
     }
 
@@ -162,9 +263,21 @@ impl Shape {
         (self.height + 2 * kernel.padding - kernel.size) / self.stride + 1
     }
 
-    /// Byte stride of one dense NHWC input row.
+    /// Byte stride of one input row.
+    ///
+    /// Dense rows are exactly `Cin` fp16 values wide. Surface rows carry one
+    /// 16-byte atom per pixel, and the surfaces themselves sit
+    /// `width * height * 16` bytes apart.
     pub fn input_row_stride(&self) -> u32 {
-        self.width * INPUT_CHANNELS * 2
+        match self.layout() {
+            FeatureLayout::Dense => self.width * self.in_channels * 2,
+            FeatureLayout::Surfaces => self.width * FEATURE_ATOM_BYTES,
+        }
+    }
+
+    /// Byte distance between consecutive NC1HWC2 input surfaces.
+    pub fn input_surface_stride(&self) -> u32 {
+        self.width * self.height * FEATURE_ATOM_BYTES
     }
 
     /// Byte stride of one output row. Output geometry, not input: at stride
@@ -181,9 +294,17 @@ impl Shape {
     /// `data_banks + weight_banks == 12`. The cap at 11 leaves one bank for
     /// weights, which no capture goes below.
     pub fn data_banks(&self) -> u32 {
-        (self.width * self.height)
-            .div_ceil(PIXELS_PER_BANK_STEP)
-            .clamp(1, CBUF_BANKS - 1)
+        let pixels = self.width * self.height;
+        let step = match self.layout() {
+            FeatureLayout::Dense => pixels.div_ceil(PIXELS_PER_BANK_STEP),
+            // Surfaces charge per atom, at twice the pixels per step. Fits
+            // every measured point: at 32x32 this is `ceil(atoms / 2)`,
+            // giving 1,1,2,2,3,3,4,4,5,5 across atom counts 1 through 10.
+            FeatureLayout::Surfaces => {
+                (pixels * self.weight_atoms()).div_ceil(2 * PIXELS_PER_BANK_STEP)
+            }
+        };
+        step.clamp(1, CBUF_BANKS - 1)
     }
 
     /// CBUF banks the vendor assigns to weights.
@@ -242,6 +363,21 @@ fn kernel_programming(kernels: Kernels) -> KernelProgramming {
             padding: 1,
         },
         _ => panic!("conv_2d only has vendor reference data for 1x1 and 3x3 square kernels"),
+    }
+}
+
+/// ARGB input mode for a dense feature map.
+///
+/// Only reachable for `Cin` 1..=4, since wider pixels use surfaces. The
+/// captures confirm 3 and 4 directly; 1 and 2 follow the enum's own
+/// definition, which came from the vendor register description.
+fn argb_input_mode(in_channels: u32) -> ArgbInputMode {
+    match in_channels {
+        1 => ArgbInputMode::OneChannel,
+        2 => ArgbInputMode::TwoChannels,
+        3 => ArgbInputMode::ThreeChannels,
+        4 => ArgbInputMode::FourChannels,
+        _ => unreachable!("dense layout is only used up to four input channels"),
     }
 }
 
@@ -388,7 +524,8 @@ pub fn conv_2d_tile_with_grains(
     tile: &Tile,
     feature_grains: u32,
 ) -> Vec<RegCmd> {
-    const TASK_INPUT_CHANNELS: u32 = 8;
+    let padded_channels = shape.padded_channels();
+    let weight_channels = shape.weight_channels();
     const TASK_OUTPUT_CHANNELS: u32 = 16;
     const FP16_BYTES: u32 = 2;
 
@@ -421,7 +558,22 @@ pub fn conv_2d_tile_with_grains(
     );
 
     let kernel = kernel_programming(kernels);
-    let weight_bytes_per_kernel = kernel.size * kernel.size * TASK_INPUT_CHANNELS * FP16_BYTES;
+
+    // Layout-dependent programming. Dense rows are counted in pixels and the
+    // whole tile is resident, so `data_entries` scales with the tile height.
+    // Surfaces are counted in atoms and `data_entries` does not depend on the
+    // tile at all -- the same field carries different quantities in the two
+    // regimes, which is why they are computed apart rather than parameterised.
+    let (line_stride, surf_stride, data_entries) = match shape.layout() {
+        FeatureLayout::Dense => (width, width * (height - 1), width * tile.in_rows),
+        FeatureLayout::Surfaces => (
+            width * 4,
+            width * (height - 4),
+            width * shape.weight_atoms() / 4,
+        ),
+    };
+
+    let weight_bytes_per_kernel = kernel.size * kernel.size * weight_channels * FP16_BYTES;
     let weight_bytes = weight_bytes_per_kernel * OUTPUT_CHANNELS;
     let mut commands = Vec::with_capacity(136);
 
@@ -434,11 +586,31 @@ pub fn conv_2d_tile_with_grains(
     commands.push(zero::<CnaDcompRegnum>());
     commands.push(zero::<CnaDcompCtrl>());
 
+    // The dense regime is the CNA's ARGB image-input path: `argb_in` names
+    // the channel count (OneChannel = 8 through FourChannels = 11) and both
+    // `nonalign_dma` and `group_line_off` are set. The surface regime clears
+    // all three. Measured across the channel sweep: Cin 3 programs 10/1/1,
+    // Cin 4 programs 11/1/1, and every Cin from 5 up programs 0/0/0.
+    //
+    // Leaving these at the captured C3 values made the hardware read three
+    // channels per pixel at every channel count, which is what
+    // `conv_multichannel_hw` caught.
     let mut conv_con1 = Register::<CnaConvCon1>::new();
+    match shape.layout() {
+        FeatureLayout::Dense => {
+            conv_con1
+                .nonalign_dma(Bits::new(1))
+                .group_line_off(Bits::new(1))
+                .argb_in(argb_input_mode(shape.in_channels).into());
+        }
+        FeatureLayout::Surfaces => {
+            conv_con1
+                .nonalign_dma(Bits::new(0))
+                .group_line_off(Bits::new(0))
+                .argb_in(Bits::new(0));
+        }
+    }
     conv_con1
-        .nonalign_dma(Bits::new(1))
-        .group_line_off(Bits::new(1))
-        .argb_in(ArgbInputMode::ThreeChannels.into())
         .proc_precision(DataPrecision::Fp16.into())
         .in_precision(DataPrecision::Fp16.into());
     commands.push(conv_con1.build());
@@ -478,8 +650,8 @@ pub fn conv_2d_tile_with_grains(
     );
     commands.push(
         Register::<CnaDataSize1>::new()
-            .datain_channel_real(Bits::new(INPUT_CHANNELS - 1))
-            .datain_channel(Bits::new(TASK_INPUT_CHANNELS))
+            .datain_channel_real(Bits::new(shape.in_channels - 1))
+            .datain_channel(Bits::new(padded_channels))
             .build(),
     );
     commands.push(
@@ -512,7 +684,7 @@ pub fn conv_2d_tile_with_grains(
     commands.push(cbuf_con0.build());
     commands.push(
         Register::<CnaCbufCon1>::new()
-            .data_entries(Bits::new(width * tile.in_rows))
+            .data_entries(Bits::new(data_entries))
             .build(),
     );
     commands.push(
@@ -568,12 +740,12 @@ pub fn conv_2d_tile_with_grains(
     );
     commands.push(
         Register::<CnaDmaCon1>::new()
-            .line_stride(Bits::new(width))
+            .line_stride(Bits::new(line_stride))
             .build(),
     );
     commands.push(
         Register::<CnaDmaCon2>::new()
-            .surf_stride(Bits::new(width * (height - 1)))
+            .surf_stride(Bits::new(surf_stride))
             .build(),
     );
     commands.push(
@@ -584,7 +756,7 @@ pub fn conv_2d_tile_with_grains(
     );
     commands.push(
         Register::<CnaFcDataSize1>::new()
-            .dma_channel(Bits::new(TASK_INPUT_CHANNELS))
+            .dma_channel(Bits::new(padded_channels))
             .build(),
     );
     commands.push(zero::<CnaDcompCtrl>());
@@ -915,6 +1087,19 @@ mod tests {
         Tile::split(Shape::CAPTURED, kernels, tiles)[index as usize]
     }
 
+    /// First write to `R`. A few registers are written twice per program --
+    /// CnaConvCon1 and CnaCbufCon0 among them -- always with the same value.
+    fn first_value_of<R: RegisterMeta>(commands: &[RegCmd]) -> u32 {
+        commands
+            .iter()
+            .filter(|command| {
+                (command.0 >> 48) as u32 == R::DOMAIN && (command.0 as u32 & 0xffff) == R::OFFSET
+            })
+            .map(|command| (command.0 >> 16) as u32)
+            .next()
+            .expect("register is never written")
+    }
+
     fn value_of<R: RegisterMeta>(commands: &[RegCmd]) -> u32 {
         let matches: Vec<u32> = commands
             .iter()
@@ -1229,6 +1414,160 @@ mod tests {
         let flat = Shape::new(128, 64);
         assert_eq!(flat.output_height([3, 3]), 64);
         assert_eq!(Tile::split(flat, [3, 3], 2)[1].in_first, 31);
+    }
+
+    #[test]
+    fn channel_layout_boundary_is_half_an_atom() {
+        // Cin 4 is the last dense case (8 bytes); Cin 5 is already surfaces.
+        // Measured directly: line_stride/width is 1.00 up to Cin 4 and 4.00
+        // from Cin 5 onward.
+        for cin in 1..=4 {
+            assert_eq!(
+                Shape::with_channels(32, 32, 1, cin).layout(),
+                FeatureLayout::Dense,
+                "Cin {cin}"
+            );
+        }
+        for cin in [5, 6, 7, 8, 16, 80] {
+            assert_eq!(
+                Shape::with_channels(32, 32, 1, cin).layout(),
+                FeatureLayout::Surfaces,
+                "Cin {cin}"
+            );
+        }
+    }
+
+    #[test]
+    fn channel_padding_matches_the_fill_in_sweep() {
+        // (Cin, datain_channel, weight_channels) read out of the captures.
+        // The two exceptions are 3 atoms, where the fields disagree, and
+        // 7 atoms, where both round up.
+        const OBSERVED: [(u32, u32, u32); 16] = [
+            (3, 8, 8),
+            (4, 8, 8),
+            (5, 8, 8),
+            (8, 8, 8),
+            (9, 16, 16),
+            (12, 16, 16),
+            (16, 16, 16),
+            (20, 24, 32),
+            (24, 24, 32),
+            (28, 32, 32),
+            (32, 32, 32),
+            (36, 40, 40),
+            (40, 40, 40),
+            (48, 48, 48),
+            (56, 64, 64),
+            (64, 64, 64),
+        ];
+        for (cin, padded, weights) in OBSERVED {
+            let shape = Shape::with_channels(32, 32, 1, cin);
+            assert_eq!(shape.padded_channels(), padded, "datain_channel Cin {cin}");
+            assert_eq!(
+                shape.weight_channels(),
+                weights,
+                "weight channels Cin {cin}"
+            );
+        }
+        // 72 and 80 are unpadded, confirming this is not a power-of-two rule.
+        assert_eq!(Shape::with_channels(32, 32, 1, 72).weight_channels(), 72);
+        assert_eq!(Shape::with_channels(32, 32, 1, 80).weight_channels(), 80);
+    }
+
+    #[test]
+    fn argb_input_mode_follows_the_layout() {
+        // CNA_CONV_CON1 across the channel sweep: dense programs the ARGB
+        // image path with nonalign_dma and group_line_off set, surfaces
+        // clear all three. Cin 3 -> 10/1/1, Cin 4 -> 11/1/1, Cin >= 5 ->
+        // 0/0/0. Leaving these at the C3 values made every channel count
+        // read as three channels.
+        const ARGB_IN: u32 = 0x0000_f000;
+        const NONALIGN_DMA: u32 = 0x4000_0000;
+        const GROUP_LINE_OFF: u32 = 0x2000_0000;
+        let field = |program: &[RegCmd], mask: u32| {
+            (first_value_of::<CnaConvCon1>(program) & mask) >> (mask.trailing_zeros())
+        };
+
+        for (cin, argb) in [(3u32, 10u32), (4, 11)] {
+            let shape = Shape::with_channels(32, 32, 1, cin);
+            let program = conv_2d_tile(shape, [3, 3], &Tile::whole(shape, [3, 3]));
+            assert_eq!(field(&program, ARGB_IN), argb, "argb_in at Cin {cin}");
+            assert_eq!(field(&program, NONALIGN_DMA), 1, "nonalign at Cin {cin}");
+            assert_eq!(
+                field(&program, GROUP_LINE_OFF),
+                1,
+                "group_line at Cin {cin}"
+            );
+        }
+        for cin in [5u32, 8, 16, 24, 64] {
+            let shape = Shape::with_channels(32, 32, 1, cin);
+            let program = conv_2d_tile(shape, [3, 3], &Tile::whole(shape, [3, 3]));
+            assert_eq!(field(&program, ARGB_IN), 0, "argb_in at Cin {cin}");
+            assert_eq!(field(&program, NONALIGN_DMA), 0, "nonalign at Cin {cin}");
+            assert_eq!(
+                field(&program, GROUP_LINE_OFF),
+                0,
+                "group_line at Cin {cin}"
+            );
+        }
+    }
+
+    #[test]
+    fn channel_bank_split_matches_the_sweep() {
+        // At 32x32 the surface rule reduces to ceil(weight_atoms / 2).
+        for (cin, banks) in [
+            (8u32, 1u32),
+            (16, 1),
+            (20, 2),
+            (32, 2),
+            (40, 3),
+            (48, 3),
+            (56, 4),
+            (64, 4),
+            (72, 5),
+            (80, 5),
+        ] {
+            assert_eq!(
+                Shape::with_channels(32, 32, 1, cin).data_banks(),
+                banks,
+                "data_bank at Cin {cin}"
+            );
+        }
+        // Dense stays on the pixel rule it was derived with.
+        assert_eq!(Shape::with_channels(128, 32, 1, 3).data_banks(), 4);
+        assert_eq!(Shape::with_channels(128, 32, 1, 4).data_banks(), 4);
+        // ...and the surface rule diverges immediately at the boundary.
+        assert_eq!(Shape::with_channels(128, 32, 1, 8).data_banks(), 2);
+    }
+
+    #[test]
+    fn multi_channel_registers_match_the_captures() {
+        // conv-w128-h32-k3-s1-ci16-co8: line_stride 512, surf_stride 3584,
+        // data_entries 64, datain_channel 16, data_bank 4.
+        let shape = Shape::with_channels(128, 32, 1, 16);
+        let program = conv_2d_tile(shape, [3, 3], &Tile::whole(shape, [3, 3]));
+        assert_eq!(value_of::<CnaDmaCon1>(&program), 512);
+        assert_eq!(value_of::<CnaDmaCon2>(&program), 3584);
+        assert_eq!(value_of::<CnaCbufCon1>(&program), 64);
+        assert_eq!(value_of::<CnaDataSize1>(&program) & 0xffff, 16);
+        assert_eq!(shape.data_banks(), 4);
+        // Weight footprint follows the weight padding, not datain_channel.
+        assert_eq!(value_of::<CnaWeightSize1>(&program), 9 * 16 * 2);
+        assert_eq!(value_of::<CnaWeightSize0>(&program), 9 * 16 * 2 * 8);
+
+        // Cin 24 is the case where the two paddings disagree: datain_channel
+        // stays 24 while the coefficients occupy 32 channels.
+        let odd = Shape::with_channels(32, 32, 1, 24);
+        let odd_program = conv_2d_tile(odd, [3, 3], &Tile::whole(odd, [3, 3]));
+        assert_eq!(value_of::<CnaDataSize1>(&odd_program) & 0xffff, 24);
+        assert_eq!(value_of::<CnaWeightSize1>(&odd_program), 9 * 32 * 2);
+        assert_eq!(value_of::<CnaCbufCon1>(&odd_program), 32);
+    }
+
+    #[test]
+    #[should_panic(expected = "input channels must be")]
+    fn rejects_channels_beyond_the_validated_range() {
+        let _ = Shape::with_channels(32, 32, 1, 96);
     }
 
     #[test]
