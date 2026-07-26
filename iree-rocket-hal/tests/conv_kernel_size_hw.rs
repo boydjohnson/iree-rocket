@@ -15,8 +15,8 @@
 //! The focused capture sweep found typical CBUF splits of 8/4 for 7x7, 6/6
 //! for 9x9, and 7/5 for 11x11, but also showed that the vendor's allocation
 //! is not a simple function of whole feature and coefficient footprints.
-//! One test covers 24 points from that sweep with explicit bank counts. Three
-//! more tests cover the capture-derived rectangular replacements for the
+//! One test covers 24 points using `ConvPlan`'s measured bank policies. Three
+//! more tests cover its capture-derived rectangular replacements for the
 //! high-`Cin` shapes that cannot run as full-width row tiles. Run all four
 //! with the command above, or select one by its ordinary Rust test name:
 //!
@@ -41,7 +41,7 @@ use iree_rocket_hal::rocket::{
         dpu::DpuDstBaseAddr,
         dpu_rdma::DpuRdmaBsBaseAddr,
     },
-    conv::{FeatureLayout, Kernels, Shape, Tile, Tile2D, conv_2d_tile_2d_with_cbuf_banks},
+    conv::{ConvPlan, FeatureLayout, Shape},
     device::{Buffer, JobDesc, close_bo, fini_bo, prep_bo, submit_jobs},
 };
 
@@ -136,13 +136,9 @@ struct Failure {
     samples: Vec<String>,
 }
 
-fn run(
-    shape: Shape,
-    kernels: Kernels,
-    data_banks: u32,
-    weight_banks: u32,
-    output_column_widths: Option<&[u32]>,
-) -> Result<u32, Failure> {
+fn run(plan: &ConvPlan) -> Result<u32, Failure> {
+    let shape = plan.shape();
+    let kernels = plan.kernels();
     let width = shape.width as usize;
     let height = shape.height as usize;
     let out_width = shape.output_width(kernels) as usize;
@@ -183,20 +179,9 @@ fn run(
         let buf_output = Buffer::new(fd, page_aligned_size(output_bytes), &file);
         ptr::write_bytes(buf_output.host_ptr, 0, buf_output.size);
 
-        let split = if let Some(output_column_widths) = output_column_widths {
-            Tile2D::grid(shape, kernels, output_column_widths, data_banks)
-        } else {
-            let tiles = shape.min_tiles_for_data_banks(kernels, data_banks);
-            let columns = Tile2D::whole(shape, kernels).columns;
-            Tile::split(shape, kernels, tiles)
-                .into_iter()
-                .map(|rows| Tile2D { rows, columns })
-                .collect()
-        };
-        let mut command_buffers = Vec::with_capacity(split.len());
-        for tile in &split {
-            let mut commands =
-                conv_2d_tile_2d_with_cbuf_banks(shape, kernels, tile, data_banks, weight_banks);
+        let programs = plan.programs();
+        let mut command_buffers = Vec::with_capacity(programs.len());
+        for mut commands in programs {
             relocate::<CnaFeatureDataAddr>(&mut commands, buf_input.dma_address);
             relocate::<CnaDcompAddr0>(&mut commands, buf_weights.dma_address);
             relocate::<DpuRdmaBsBaseAddr>(&mut commands, buf_bias.dma_address);
@@ -301,27 +286,28 @@ fn run(
         }
 
         if failure.mismatches == 0 {
-            Ok(split.len() as u32)
+            Ok(plan.tiles().len() as u32)
         } else {
             Err(failure)
         }
     }
 }
 
-fn attempt(
-    shape: Shape,
-    kernel: usize,
-    data_banks: u32,
-    weight_banks: u32,
-    failures: &mut Vec<String>,
-) {
+fn attempt(shape: Shape, kernel: usize, failures: &mut Vec<String>) {
     let kernels = [kernel, kernel];
+    let plan = ConvPlan::new(shape, kernels);
+    let data_banks = plan.data_banks();
+    let weight_banks = plan.weight_banks();
+    let tiles = plan.tiles().len();
     let label = format!(
-        "k{kernel:<2} Cin {:>2} Cout {:>2} {}x{} d{data_banks}/w{weight_banks}",
-        shape.in_channels, shape.out_channels, shape.width, shape.height,
+        "k{kernel:<2} Cin {:>2} Cout {:>2} {}x{} d{data_banks}/w{weight_banks} columns {:?}",
+        shape.in_channels,
+        shape.out_channels,
+        shape.width,
+        shape.height,
+        plan.output_column_widths(),
     );
-    let tiles = shape.min_tiles_for_data_banks(kernels, data_banks);
-    match run(shape, kernels, data_banks, weight_banks, None) {
+    match run(&plan) {
         Ok(tiles) => println!(
             "  ok   {label} {tiles:>2} tile(s)  padded {}  weights {}B",
             shape.padded_out_channels(),
@@ -340,41 +326,6 @@ fn attempt(
     }
 }
 
-fn attempt_2d(
-    shape: Shape,
-    kernel: usize,
-    data_banks: u32,
-    weight_banks: u32,
-    output_column_widths: &[u32],
-    failures: &mut Vec<String>,
-) {
-    let kernels = [kernel, kernel];
-    let label = format!(
-        "k{kernel:<2} Cin {:>2} Cout {:>2} {}x{} d{data_banks}/w{weight_banks} columns {output_column_widths:?}",
-        shape.in_channels, shape.out_channels, shape.width, shape.height,
-    );
-    match run(
-        shape,
-        kernels,
-        data_banks,
-        weight_banks,
-        Some(output_column_widths),
-    ) {
-        Ok(tiles) => println!(
-            "  ok   {label} {tiles:>2} tile(s)  padded {}  weights {}B",
-            shape.padded_out_channels(),
-            shape.weight_bytes(kernels),
-        ),
-        Err(failure) => {
-            println!("  FAIL {label}  {} mismatches", failure.mismatches);
-            for sample in &failure.samples {
-                println!("         {sample}");
-            }
-            failures.push(label);
-        }
-    }
-}
-
 fn assert_no_failures(failures: Vec<String>) {
     assert!(
         failures.is_empty(),
@@ -384,23 +335,14 @@ fn assert_no_failures(failures: Vec<String>) {
     );
 }
 
-fn run_rectangular_probe(
-    kernel: usize,
-    in_channels: u32,
-    data_banks: u32,
-    weight_banks: u32,
-    output_column_widths: &[u32],
-) {
+fn run_rectangular_probe(kernel: usize, in_channels: u32) {
     let _device_guard = NPU_TEST_LOCK
         .lock()
         .unwrap_or_else(|poisoned| poisoned.into_inner());
     let mut failures = Vec::new();
-    attempt_2d(
+    attempt(
         Shape::with_out_channels(256, 32, 1, in_channels, 64),
         kernel,
-        data_banks,
-        weight_banks,
-        output_column_widths,
         &mut failures,
     );
     assert_no_failures(failures);
@@ -417,38 +359,34 @@ fn large_kernel_cbuf_partitions_run_on_npu() {
     // Cin axis of the focused sweep. The center Cout is 64. The first split
     // for each kernel is the stable capture regime. The high-Cin shapes that
     // require horizontal tiling have separate rectangular tests below.
-    for &(kernel, cin, data_banks, weight_banks) in &[
-        (7usize, 16u32, 8u32, 4u32),
-        (7, 24, 8, 4),
-        (7, 32, 8, 4),
-        (7, 48, 8, 4),
-        (7, 64, 8, 4),
-        (9, 16, 6, 6),
-        (9, 24, 6, 6),
-        (9, 32, 6, 6),
-        (9, 48, 7, 5),
-        (11, 16, 7, 5),
-        (11, 24, 7, 5),
-        (11, 32, 7, 5),
+    for &(kernel, cin) in &[
+        (7usize, 16u32),
+        (7, 24),
+        (7, 32),
+        (7, 48),
+        (7, 64),
+        (9, 16),
+        (9, 24),
+        (9, 32),
+        (9, 48),
+        (11, 16),
+        (11, 24),
+        (11, 32),
     ] {
         attempt(
             Shape::with_out_channels(256, 32, 1, cin, 64),
             kernel,
-            data_banks,
-            weight_banks,
             &mut failures,
         );
     }
 
     // Cout axis of the focused sweep at Cin 32. Cout 64 was covered above;
     // run the remaining four points with the same typical per-kernel split.
-    for &(kernel, data_banks, weight_banks) in &[(7usize, 8u32, 4u32), (9, 6, 6), (11, 7, 5)] {
+    for kernel in [7usize, 9, 11] {
         for cout in [16u32, 32, 48, 96] {
             attempt(
                 Shape::with_out_channels(256, 32, 1, 32, cout),
                 kernel,
-                data_banks,
-                weight_banks,
                 &mut failures,
             );
         }
@@ -460,17 +398,17 @@ fn large_kernel_cbuf_partitions_run_on_npu() {
 #[test]
 #[ignore = "needs /dev/accel/accel0 -- cross-compile for aarch64 and run on the RK3588 board"]
 fn k9_ci64_rectangular_tiles_run_on_npu() {
-    run_rectangular_probe(9, 64, 6, 6, &[135, 121]);
+    run_rectangular_probe(9, 64);
 }
 
 #[test]
 #[ignore = "needs /dev/accel/accel0 -- cross-compile for aarch64 and run on the RK3588 board"]
 fn k11_ci48_rectangular_tiles_run_on_npu() {
-    run_rectangular_probe(11, 48, 5, 7, &[137, 119]);
+    run_rectangular_probe(11, 48);
 }
 
 #[test]
 #[ignore = "needs /dev/accel/accel0 -- cross-compile for aarch64 and run on the RK3588 board"]
 fn k11_ci64_rectangular_tiles_run_on_npu() {
-    run_rectangular_probe(11, 64, 3, 9, &[59, 54, 54, 54, 35]);
+    run_rectangular_probe(11, 64);
 }

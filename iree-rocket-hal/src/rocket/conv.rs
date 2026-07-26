@@ -13,10 +13,10 @@
 //! 35 captures (212 convolution programs) spanning widths 32..256 and heights
 //! 32..256. Registers that vary in no capture stay literal constants.
 //!
-//! Supported case: `Cin` 1..=80, `Cout` 1..=512, strides 1..4, and 1x1 or
-//! 3x3 kernels. Odd square kernels through 11x11 can additionally be emitted
-//! with an explicit CBUF partition for hardware probing; their automatic
-//! bank selection is not generalized yet.
+//! The ordinary tile builder supports fp16 `Cin` 1..=80, int8 `Cin`
+//! 1..=128, `Cout` 1..=512, strides 1..4, and 1x1 or 3x3 kernels.
+//! [`ConvPlan`] additionally plans fp16 stride-1 odd square kernels through
+//! 11x11, including horizontal tiling where a full-width row cannot fit.
 //!
 //! Input channel count picks the memory layout. While a pixel fits in half a
 //! feature atom -- `Cin` up to 4 -- the vendor keeps it dense NHWC and the
@@ -27,11 +27,13 @@
 //!
 //! Channel padding is a table rather than arithmetic. It is `atoms * 8`
 //! except at three atoms, where `datain_channel` stays 24 but coefficients
-//! use 32, and at seven, where both round to 64. Atom counts 5, 6, 9 and 10
-//! are unpadded, so no arithmetic rule fits and none is invented.
+//! use 32, and at seven, where `datain_channel` stays 56 but coefficients
+//! use 64. Atom counts 5, 6, 9 and 10 are unpadded, so no arithmetic rule
+//! fits and none is invented.
 //!
-//! `Cout > 8` is a separate axis: it needs the fp16 kernel-group split,
-//! which no formula here covers.
+//! Output channels remain one streamed kernel set rather than splitting into
+//! fp16 kernel groups. The capture corpus covers this through `Cout = 512`,
+//! with hardware validation through `Cout = 128`.
 //!
 //! Keeping this separate from `rocket::regcmd` keeps a capture-derived path
 //! distinct from that module's Mesa-derived one.
@@ -676,6 +678,18 @@ impl Shape {
         self.weight_bytes(kernels).div_ceil(CBUF_BANK_BYTES).max(1)
     }
 
+    fn demand_based_cbuf_partition(&self, kernels: Kernels) -> (u32, u32) {
+        let data = self.data_bank_demand();
+        let weights = self.weight_bank_demand(kernels);
+        let granted = if data <= weights {
+            data
+        } else {
+            data.min(CBUF_BANKS.saturating_sub(weights))
+        };
+        let data_banks = granted.clamp(1, CBUF_BANKS - 1);
+        (data_banks, CBUF_BANKS - data_banks)
+    }
+
     /// CBUF banks the vendor assigns to feature data.
     ///
     /// The two claimants split all 12 banks: every capture satisfies
@@ -693,14 +707,7 @@ impl Shape {
     /// takes two, pushing the data allocation from 11 banks down to 10.
     pub fn data_banks(&self, kernels: Kernels) -> u32 {
         assert_default_cbuf_kernel(kernels);
-        let data = self.data_bank_demand();
-        let weights = self.weight_bank_demand(kernels);
-        let granted = if data <= weights {
-            data
-        } else {
-            data.min(CBUF_BANKS.saturating_sub(weights))
-        };
-        granted.clamp(1, CBUF_BANKS - 1)
+        self.demand_based_cbuf_partition(kernels).0
     }
 
     /// CBUF banks the vendor assigns to weights: everything left over.
@@ -839,7 +846,7 @@ fn assert_default_cbuf_kernel(kernels: Kernels) {
     assert!(
         matches!(kernels, [1, 1] | [3, 3]),
         "automatic CBUF allocation only has runtime backing for 1x1 and 3x3; \
-         use conv_2d_tile_with_cbuf_banks for the large-kernel hardware probe"
+         use ConvPlan, or conv_2d_tile_with_cbuf_banks for an explicit override"
     );
 }
 
@@ -1079,6 +1086,233 @@ impl Tile2D {
     }
 }
 
+/// A complete standalone-job plan for one convolution.
+///
+/// The plan owns the policy that the low-level tile builders intentionally
+/// leave with their caller: the CBUF split, horizontal partition (if any),
+/// and the row split for each column. Programs returned by [`ConvPlan::programs`]
+/// retain tile-relative buffer offsets and still need normal DMA relocation.
+///
+/// For 1x1 and 3x3 this is the existing demand-based allocator. The fp16
+/// stride-1 5x5 through 11x11 policies are the conservative partitions from
+/// the focused capture and hardware sweep. The three shapes that require
+/// horizontal tiling retain their hardware-proven captured boundaries;
+/// other surface-layout shapes fall back to the fewest balanced columns that
+/// satisfy the same two-dimensional CBUF capacity bound. Those fallback
+/// partitions are derived rather than hardware-validated.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ConvPlan {
+    shape: Shape,
+    kernels: Kernels,
+    data_banks: u32,
+    weight_banks: u32,
+    output_column_widths: Vec<u32>,
+    tiles: Vec<Tile2D>,
+}
+
+impl ConvPlan {
+    /// Plans all standalone jobs needed to cover `shape` exactly once.
+    ///
+    /// Panics when the requested operation lies outside the supported policy.
+    /// In particular, kernels above 3x3 currently require fp16, stride 1,
+    /// and NC1HWC2 input if horizontal tiling is necessary.
+    pub fn new(shape: Shape, kernels: Kernels) -> ConvPlan {
+        let kernel = kernel_programming(kernels);
+        let (data_banks, weight_banks) = match kernel.size {
+            1 | 3 => shape.demand_based_cbuf_partition(kernels),
+            5 => {
+                assert_large_kernel_plan_case(shape);
+                shape.demand_based_cbuf_partition(kernels)
+            }
+            7 => {
+                assert_large_kernel_plan_case(shape);
+                (8, 4)
+            }
+            9 => {
+                assert_large_kernel_plan_case(shape);
+                if (33..=48).contains(&shape.in_channels) {
+                    (7, 5)
+                } else {
+                    (6, 6)
+                }
+            }
+            11 => {
+                assert_large_kernel_plan_case(shape);
+                match shape.in_channels {
+                    1..=32 => (7, 5),
+                    33..=48 => (5, 7),
+                    _ => (3, 9),
+                }
+            }
+            _ => unreachable!("kernel_programming accepted an unsupported kernel"),
+        };
+
+        let full_width = vec![shape.output_width(kernels)];
+        if let Some(tiles) = plan_grid(shape, kernels, &full_width, data_banks) {
+            return ConvPlan {
+                shape,
+                kernels,
+                data_banks,
+                weight_banks,
+                output_column_widths: full_width,
+                tiles,
+            };
+        }
+
+        assert_eq!(
+            shape.layout(),
+            FeatureLayout::Surfaces,
+            "convolution needs horizontal tiling, which is only capture-backed for NC1HWC2 surfaces"
+        );
+        assert_eq!(
+            shape.stride, 1,
+            "convolution needs horizontal tiling, which is only capture-backed at stride 1"
+        );
+
+        if let Some(output_column_widths) = captured_column_partition(shape, kernels) {
+            let tiles = Tile2D::grid(shape, kernels, &output_column_widths, data_banks);
+            assert!(
+                grid_fits(shape, &tiles, data_banks),
+                "captured column partition exceeds its measured CBUF capacity"
+            );
+            return ConvPlan {
+                shape,
+                kernels,
+                data_banks,
+                weight_banks,
+                output_column_widths,
+                tiles,
+            };
+        }
+
+        let output_width = shape.output_width(kernels);
+        for column_count in 2..=output_width {
+            let output_column_widths = balanced_column_widths(output_width, column_count);
+            if let Some(tiles) = plan_grid(shape, kernels, &output_column_widths, data_banks) {
+                return ConvPlan {
+                    shape,
+                    kernels,
+                    data_banks,
+                    weight_banks,
+                    output_column_widths,
+                    tiles,
+                };
+            }
+        }
+
+        panic!(
+            "no standalone tile fits {shape:?} {kernels:?} with CBUF split \
+             {data_banks}/{weight_banks}"
+        );
+    }
+
+    pub fn shape(&self) -> Shape {
+        self.shape
+    }
+
+    pub fn kernels(&self) -> Kernels {
+        self.kernels
+    }
+
+    pub fn data_banks(&self) -> u32 {
+        self.data_banks
+    }
+
+    pub fn weight_banks(&self) -> u32 {
+        self.weight_banks
+    }
+
+    pub fn output_column_widths(&self) -> &[u32] {
+        &self.output_column_widths
+    }
+
+    pub fn tiles(&self) -> &[Tile2D] {
+        &self.tiles
+    }
+
+    /// Emits one relocatable register program per planned tile.
+    pub fn programs(&self) -> Vec<Vec<RegCmd>> {
+        self.tiles
+            .iter()
+            .map(|tile| {
+                conv_2d_tile_program(
+                    self.shape,
+                    self.kernels,
+                    tile,
+                    feature_grains(self.kernels, &tile.rows),
+                    self.data_banks,
+                    self.weight_banks,
+                )
+            })
+            .collect()
+    }
+}
+
+fn assert_large_kernel_plan_case(shape: Shape) {
+    assert!(
+        matches!(shape.precision, Precision::Fp16),
+        "automatic planning above 3x3 currently has capture backing only for fp16"
+    );
+    assert_eq!(
+        shape.stride, 1,
+        "automatic planning above 3x3 currently has capture backing only at stride 1"
+    );
+}
+
+fn captured_column_partition(shape: Shape, kernels: Kernels) -> Option<Vec<u32>> {
+    let focused_shape = shape.width == 256
+        && shape.height == 32
+        && shape.stride == 1
+        && shape.out_channels == 64
+        && matches!(shape.precision, Precision::Fp16);
+    if !focused_shape {
+        return None;
+    }
+    match (kernels[0], shape.in_channels) {
+        (9, 64) => Some(vec![135, 121]),
+        (11, 48) => Some(vec![137, 119]),
+        (11, 64) => Some(vec![59, 54, 54, 54, 35]),
+        _ => None,
+    }
+}
+
+fn balanced_column_widths(output_width: u32, columns: u32) -> Vec<u32> {
+    let base = output_width / columns;
+    let remainder = output_width % columns;
+    (0..columns)
+        .map(|index| base + u32::from(index < remainder))
+        .collect()
+}
+
+fn plan_grid(
+    shape: Shape,
+    kernels: Kernels,
+    output_widths: &[u32],
+    data_banks: u32,
+) -> Option<Vec<Tile2D>> {
+    let columns = ColumnTile::split(shape, kernels, output_widths);
+    let mut tiles = Vec::new();
+    for columns in columns {
+        let max_rows =
+            shape.max_tile_input_rows_for_width_and_data_banks(columns.in_cols, data_banks);
+        let row_tiles = (1..=shape.output_height(kernels)).find_map(|count| {
+            let rows = Tile::split(shape, kernels, count);
+            rows.iter()
+                .all(|tile| tile.in_rows <= max_rows)
+                .then_some(rows)
+        })?;
+        tiles.extend(row_tiles.into_iter().map(|rows| Tile2D { rows, columns }));
+    }
+    Some(tiles)
+}
+
+fn grid_fits(shape: Shape, tiles: &[Tile2D], data_banks: u32) -> bool {
+    tiles.iter().all(|tile| {
+        tile.rows.in_rows
+            <= shape.max_tile_input_rows_for_width_and_data_banks(tile.columns.in_cols, data_banks)
+    })
+}
+
 #[inline]
 fn zero<R: RegisterMeta>() -> RegCmd {
     Register::<R>::new().build()
@@ -1262,13 +1496,14 @@ pub fn conv_2d_tile_with_grains(
     )
 }
 
-/// Builds a large-kernel probe program with an explicit CBUF partition.
+/// Builds a large-kernel program with an explicit CBUF partition.
 ///
 /// The focused kernel sweep shows that 7x7, 9x9, and 11x11 do not follow the
 /// automatic allocator derived from the 1x1/3x3 corpus. This entry point
-/// keeps that unresolved policy out of [`conv_2d_tile`] while allowing the
-/// captured partitions to be tested on hardware. The two bank counts must be
-/// nonzero and sum to the RK3588's twelve CBUF banks.
+/// keeps that unresolved policy out of [`conv_2d_tile`]. Prefer [`ConvPlan`]
+/// when its capture-backed policy covers the operation; this entry point is
+/// the low-level override. The two bank counts must be nonzero and sum to the
+/// RK3588's twelve CBUF banks.
 pub fn conv_2d_tile_with_cbuf_banks(
     shape: Shape,
     kernels: Kernels,
@@ -2021,6 +2256,65 @@ mod tests {
                     136
                 );
             }
+        }
+    }
+
+    #[test]
+    fn conv_plan_preserves_the_captured_single_program() {
+        let plan = ConvPlan::new(Shape::CAPTURED, [3, 3]);
+        assert_eq!((plan.data_banks(), plan.weight_banks()), (1, 11));
+        assert_eq!(plan.output_column_widths(), &[32]);
+        assert_eq!(plan.tiles(), &[Tile2D::whole(Shape::CAPTURED, [3, 3])]);
+        let programs = plan.programs();
+        assert_eq!(programs.len(), 1);
+        assert_eq!(fnv1a(&programs[0]), fnv1a(&conv_2d([3, 3])));
+    }
+
+    #[test]
+    fn conv_plan_selects_the_focused_large_kernel_policies() {
+        let shape = Shape::with_out_channels(256, 32, 1, 32, 64);
+        for (kernel, banks, tiles) in [
+            (5usize, (8u32, 4u32), 3usize),
+            (7, (8, 4), 4),
+            (9, (6, 6), 8),
+            (11, (7, 5), 8),
+        ] {
+            let plan = ConvPlan::new(shape, [kernel, kernel]);
+            assert_eq!(
+                (plan.data_banks(), plan.weight_banks()),
+                banks,
+                "k{kernel} banks"
+            );
+            assert_eq!(plan.output_column_widths(), &[256], "k{kernel} columns");
+            assert_eq!(plan.tiles().len(), tiles, "k{kernel} tiles");
+            assert!(plan.programs().iter().all(|program| program.len() == 136));
+        }
+    }
+
+    #[test]
+    fn conv_plan_reproduces_the_three_hardware_proven_rectangular_grids() {
+        for (kernel, in_channels, banks, columns, tiles) in [
+            (9usize, 64u32, (6u32, 6u32), &[135u32, 121][..], 19usize),
+            (11, 48, (5, 7), &[137, 119][..], 27),
+            (11, 64, (3, 9), &[59, 54, 54, 54, 35][..], 68),
+        ] {
+            let shape = Shape::with_out_channels(256, 32, 1, in_channels, 64);
+            let plan = ConvPlan::new(shape, [kernel, kernel]);
+            assert_eq!(
+                (plan.data_banks(), plan.weight_banks()),
+                banks,
+                "k{kernel} Cin {in_channels} banks"
+            );
+            assert_eq!(
+                plan.output_column_widths(),
+                columns,
+                "k{kernel} Cin {in_channels} columns"
+            );
+            assert_eq!(
+                plan.tiles().len(),
+                tiles,
+                "k{kernel} Cin {in_channels} tiles"
+            );
         }
     }
 
