@@ -94,7 +94,12 @@ fn relocate<R: RegisterMeta>(commands: &mut [RegCmd], address: u32) {
         R::DOMAIN,
         R::OFFSET
     );
-    commands[matches[0]] = RegCmd::new(R::DOMAIN, R::OFFSET, address);
+    // Add rather than overwrite: a tile program already carries its own byte
+    // offset from the tensor base in these registers, exactly as the vendor's
+    // own height-split programs do. For a whole-image program the existing
+    // value is zero and this is an assignment.
+    let tile_offset = (commands[matches[0]].0 >> 16) as u32;
+    commands[matches[0]] = RegCmd::new(R::DOMAIN, R::OFFSET, address + tile_offset);
 }
 
 fn f16_to_f32(bits: u16) -> f32 {
