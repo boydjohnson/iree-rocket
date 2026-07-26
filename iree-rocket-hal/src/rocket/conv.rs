@@ -104,12 +104,32 @@ pub const INPUT_CHANNELS: u32 = 3;
 /// Largest input channel count with capture backing.
 pub const MAX_INPUT_CHANNELS: u32 = 80;
 
+/// `CNA_DATA_SIZE1.datain_channel_real` counts `Cin - 1` modulo this, even
+/// though the field is 14 bits wide and could hold far more.
+///
+/// Confirmed in both precisions and only visible above 64 channels, which no
+/// hardware test had reached: fp16 `Cin` 72 programs 7 and 80 programs 15;
+/// int8 `Cin` 112 programs 47 and 128 programs 63.
+const CHANNEL_REAL_MODULUS: u32 = 64;
+
+/// Largest input-channel count the int8 sweep measures.
+pub const MAX_INT8_INPUT_CHANNELS: u32 = 128;
+
 /// Widest input pixel the vendor keeps in dense NHWC, in bytes.
 ///
 /// A C4 fp16 pixel is 8 bytes and stays dense; a C5 pixel is 10 bytes and
 /// switches to NC1HWC2 surfaces. The boundary is half a 16-byte feature
 /// atom, not a whole one -- `Cin` 5, 6 and 7 are already surfaces.
-const DENSE_PIXEL_BYTES: u32 = 8;
+/// Most input channels the dense ARGB path carries.
+///
+/// This is a channel-count boundary, not a byte-width one. The fp16 rule
+/// used to be written as "a pixel narrower than half a feature atom", which
+/// comes out at four channels and is right -- but for the wrong reason: at
+/// int8 the same byte test would put the boundary at eight, and it does not
+/// move. `Cin` 4 programs the ARGB path in both precisions and `Cin` 8
+/// programs surfaces in both. The real constraint is `ArgbInputMode`, which
+/// enumerates one to four channels because it is an image-input path.
+const MAX_DENSE_CHANNELS: u32 = 4;
 
 /// Padded channel counts by feature-atom count, `(datain_channel, weights)`.
 ///
@@ -117,7 +137,11 @@ const DENSE_PIXEL_BYTES: u32 = 8;
 /// two measured exceptions, so this is a table rather than arithmetic:
 ///
 /// - 3 atoms (`Cin` 17..24): `datain_channel` stays 24 but weights use 32
-/// - 7 atoms (`Cin` 49..56): both round up to 64
+/// - 7 atoms (`Cin` 49..56): `datain_channel` stays 56 but weights use 64
+///
+/// The two exceptions are the same shape as each other, and the same shape
+/// as the CBUF atom rounding in [`Shape::cbuf_atoms`]: three and seven atoms
+/// round up, five, six, nine and ten do not.
 ///
 /// Atom counts 5, 6, 9 and 10 are unpadded, so this is neither "round to a
 /// power of two" nor "round to even", and no rule is claimed. Encoding the
@@ -129,7 +153,7 @@ const CHANNEL_PADDING: [(u32, u32); 10] = [
     (32, 32),
     (40, 40),
     (48, 48),
-    (64, 64),
+    (56, 64),
     (64, 64),
     (72, 72),
     (80, 80),
@@ -148,16 +172,16 @@ pub const OUTPUT_CHANNELS: u32 = 8;
 /// `MAX_INPUT_CHANNELS`.
 pub const MAX_OUTPUT_CHANNELS: u32 = 512;
 
-/// Granularity the DPU's output-channel count is rounded up to.
-///
-/// Four registers -- `CORE_DATAOUT_SIZE_1.dataout_channel`,
-/// `DPU_DATA_CUBE_CHANNEL.channel`, `DPU_RDMA_RDMA_DATA_CUBE_CHANNEL.channel`
-/// and `DPU_WDMA_SIZE_0.channel_wdma` -- carry this padded count while
-/// `weight_kernels` and `orig_channel` carry the true one. Unlike the input
-/// channel padding, this is a clean rule with no table and no exceptions:
-/// verified at every Cout in the corpus, including the awkward 20, 24, 28,
-/// 40, 56 and 72 where the input padding needed special cases.
-const OUTPUT_CHANNEL_GRANULE: u32 = 16;
+/// `DPU_BS_MUL_CFG.bs_mul_shift_value`, and its negated twin
+/// `DPU_DATA_FORMAT.bs_mul_shift_value_neg`, in every quantized capture.
+const BS_MUL_SHIFT_VALUE: u32 = 14;
+
+/// `DPU_RDMA_RDMA_BRDMA_CFG.brdma_data_use` when BRDMA supplies bias only.
+const BRDMA_DATA_USE_BIAS: u32 = 1;
+
+/// The same field once requantization is active and BRDMA also supplies the
+/// scale and shift operands.
+const BRDMA_DATA_USE_QUANTIZED: u32 = 7;
 
 /// Physical width of one feature atom.
 const FEATURE_ATOM_BYTES: u32 = 16;
@@ -181,6 +205,183 @@ const MAX_DATA_ENTRIES: u32 = 0x3fff;
 /// half-bank steps, which is the 1024 below.
 const PIXELS_PER_BANK_STEP: u32 = 1024;
 
+/// Element precision of a convolution.
+///
+/// The int8 side is derived from a corpus deliberately built to mirror the
+/// fp16 geometries, so every int8 capture is one half of a two-point diff in
+/// which precision is the only thing that moved. Across 21 such pairs
+/// exactly 33 register fields differ.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Precision {
+    Fp16,
+    /// Quantized int8, carrying the parameters that are not derivable from
+    /// the shape and must come from the compiler.
+    Int8(Quantization),
+}
+
+impl Precision {
+    /// Bytes one feature or coefficient element occupies.
+    pub fn element_bytes(&self) -> u32 {
+        match self {
+            Precision::Fp16 => 2,
+            Precision::Int8(_) => 1,
+        }
+    }
+
+    /// Channels one 16-byte feature atom carries.
+    pub fn channels_per_atom(&self) -> u32 {
+        FEATURE_ATOM_BYTES / self.element_bytes()
+    }
+
+    /// Granularity the DPU's output-channel count rounds up to.
+    ///
+    /// Four registers -- `CORE_DATAOUT_SIZE_1.dataout_channel`,
+    /// `DPU_DATA_CUBE_CHANNEL.channel`,
+    /// `DPU_RDMA_RDMA_DATA_CUBE_CHANNEL.channel` and
+    /// `DPU_WDMA_SIZE_0.channel_wdma` -- carry the padded count while
+    /// `weight_kernels` and `orig_channel` carry the true one.
+    ///
+    /// Twice the atom width in both precisions: 16 for fp16 and 32 for int8.
+    /// A clean rule with no table and no exceptions in either -- verified at
+    /// every fp16 Cout in the corpus, including the awkward 20, 24, 28, 40,
+    /// 56 and 72 where the *input* padding needed special cases, and at 10
+    /// int8 values from 8 to 112.
+    pub fn out_channel_granule(&self) -> u32 {
+        2 * self.channels_per_atom()
+    }
+
+    /// Bytes one pixel of a dense ARGB feature map occupies: four channels
+    /// wide whatever the real channel count, so 8 at fp16 and 4 at int8.
+    pub fn dense_pixel_bytes(&self) -> u32 {
+        4 * self.element_bytes()
+    }
+
+    /// Most input channels this builder will program.
+    ///
+    /// fp16 stops at 80, where `CHANNEL_PADDING` runs out of measured rows.
+    /// int8 reaches 128, where its sweep stops -- the padding there is a
+    /// rule rather than a table, so the limit is the extent of the evidence
+    /// rather than the extent of the arithmetic.
+    pub fn max_in_channels(&self) -> u32 {
+        match self {
+            Precision::Fp16 => MAX_INPUT_CHANNELS,
+            Precision::Int8(_) => MAX_INT8_INPUT_CHANNELS,
+        }
+    }
+
+    fn data_precision(&self) -> DataPrecision {
+        match self {
+            Precision::Fp16 => DataPrecision::Fp16,
+            Precision::Int8(_) => DataPrecision::Int8,
+        }
+    }
+
+    fn quantization(&self) -> Option<Quantization> {
+        match self {
+            Precision::Fp16 => None,
+            Precision::Int8(quantization) => Some(*quantization),
+        }
+    }
+}
+
+/// Quantization parameters for an int8 convolution.
+///
+/// None of these are derivable from the shape -- they come from calibration,
+/// so the compiler supplies them. What *is* derivable is how they are
+/// encoded, which is what [`Multiplier`] captures.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Quantization {
+    /// Quantized encoding of 0.0 on the input, programmed into
+    /// `CNA_PAD_CON1.pad_value`.
+    ///
+    /// This is the value an out-of-image tap contributes, and it is *not*
+    /// zero. Every fp16 capture pads with 0 and every int8 capture pads with
+    /// the input zero point; carrying the fp16 constant across would leave
+    /// interior pixels correct and every pixel touching an image edge wrong
+    /// by a constant.
+    pub input_zero_point: i32,
+    /// Quantized encoding of 0.0 on the output, programmed into
+    /// `DPU_OUT_CVT_OFFSET`.
+    pub output_zero_point: i32,
+    /// Requantization multiplier, `input_scale * weight_scale / output_scale`.
+    pub multiplier: Multiplier,
+}
+
+/// A requantization multiplier in the hardware's normalized fixed-point form.
+///
+/// `DPU_OUT_CVT_SCALE` holds a mantissa and `DPU_OUT_CVT_SHIFT` its negative
+/// exponent, so the real multiplier is `scale / 2^shift`. Every one of the 21
+/// int8 captures has its mantissa inside `[2^14, 2^15)` -- the shift is
+/// chosen to normalize it there, which is what makes the pair recoverable
+/// from a single real number.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Multiplier {
+    pub scale: u32,
+    pub shift: u32,
+}
+
+/// Lowest mantissa the normalized form uses; `2 * MANTISSA_FLOOR` is the
+/// exclusive upper bound.
+const MANTISSA_FLOOR: u32 = 1 << 14;
+
+/// Largest shift `DPU_OUT_CVT_SHIFT` encodes. The field is 6 bits; the
+/// corpus only reaches 26.
+const MAX_CVT_SHIFT: u32 = 63;
+
+impl Multiplier {
+    /// Encodes a real multiplier, normalizing the mantissa into
+    /// `[2^14, 2^15)`.
+    ///
+    /// Panics rather than saturating on a multiplier the form cannot carry:
+    /// a silently clamped requantization scale is a whole-tensor error that
+    /// would be very hard to attribute later.
+    pub fn from_ratio(ratio: f64) -> Multiplier {
+        assert!(
+            ratio.is_finite() && ratio > 0.0,
+            "requantization multiplier must be finite and positive, got {ratio}"
+        );
+        // `scaled` is `ratio * 2^shift` throughout, driven into the mantissa
+        // range. The exponent is signed while it is being searched for: a
+        // multiplier above 1 normalizes to a shift below 14, and only the
+        // final value has to be a nonnegative field.
+        let mut shift: i32 = 14;
+        let mut scaled = ratio * f64::from(MANTISSA_FLOOR);
+        while scaled < f64::from(MANTISSA_FLOOR) {
+            scaled *= 2.0;
+            shift += 1;
+            assert!(
+                shift <= MAX_CVT_SHIFT as i32,
+                "requantization multiplier {ratio} is too small to encode; \
+                 DPU_OUT_CVT_SHIFT tops out at {MAX_CVT_SHIFT}"
+            );
+        }
+        while scaled >= f64::from(2 * MANTISSA_FLOOR) {
+            scaled /= 2.0;
+            shift -= 1;
+        }
+        // Rounding can carry the mantissa back out of range at the top.
+        let mut scale = scaled.round() as u32;
+        if scale >= 2 * MANTISSA_FLOOR {
+            scale /= 2;
+            shift -= 1;
+        }
+        assert!(
+            shift >= 0,
+            "requantization multiplier {ratio} is too large to encode; \
+             DPU_OUT_CVT_SHIFT cannot be negative"
+        );
+        Multiplier {
+            scale,
+            shift: shift as u32,
+        }
+    }
+
+    /// The real multiplier this pair encodes.
+    pub fn ratio(&self) -> f64 {
+        f64::from(self.scale) / 2f64.powi(self.shift as i32)
+    }
+}
+
 /// Logical geometry of the whole feature map a program operates on.
 ///
 /// Every register formula below is validated against a sweep of 35 vendor
@@ -202,6 +403,8 @@ pub struct Shape {
     /// corpus confirms 23 distinct values from 1 to 512, including 9, 14,
     /// 20, 28, 40, 56 and 72.
     pub out_channels: u32,
+    /// Element precision, and for int8 the quantization parameters with it.
+    pub precision: Precision,
 }
 
 /// How the feature map is laid out in memory, which the channel count picks.
@@ -222,6 +425,7 @@ impl Shape {
         stride: 1,
         in_channels: INPUT_CHANNELS,
         out_channels: OUTPUT_CHANNELS,
+        precision: Precision::Fp16,
     };
 
     pub fn new(width: u32, height: u32) -> Shape {
@@ -243,15 +447,34 @@ impl Shape {
         in_channels: u32,
         out_channels: u32,
     ) -> Shape {
+        Shape::with_precision(
+            width,
+            height,
+            stride,
+            in_channels,
+            out_channels,
+            Precision::Fp16,
+        )
+    }
+
+    pub fn with_precision(
+        width: u32,
+        height: u32,
+        stride: u32,
+        in_channels: u32,
+        out_channels: u32,
+        precision: Precision,
+    ) -> Shape {
         assert!(
             width > 0 && height > 0,
             "convolution extents must be nonzero"
         );
         assert!(stride > 0, "convolution stride must be nonzero");
         assert!(
-            (1..=MAX_INPUT_CHANNELS).contains(&in_channels),
-            "input channels must be 1..={MAX_INPUT_CHANNELS}; beyond that the \
-             channel padding has no capture backing"
+            (1..=precision.max_in_channels()).contains(&in_channels),
+            "input channels must be 1..={}; beyond that the channel padding \
+             has no capture backing at this precision",
+            precision.max_in_channels()
         );
         assert!(
             (1..=MAX_OUTPUT_CHANNELS).contains(&out_channels),
@@ -264,22 +487,39 @@ impl Shape {
             stride,
             in_channels,
             out_channels,
+            precision,
         }
     }
 
     /// Feature atoms one pixel occupies once padded.
     pub fn feature_atoms(&self) -> u32 {
-        self.in_channels.div_ceil(8)
+        self.in_channels
+            .div_ceil(self.precision.channels_per_atom())
+            .max(1)
     }
 
     /// Channel count programmed into `CNA_DATA_SIZE1.datain_channel`.
+    ///
+    /// The fp16 padding is a measured table with two exceptions. The int8
+    /// padding is a clean `round_up(Cin, 16)` -- checked at 15 values from 3
+    /// to 128 with no deviation, including three atoms and seven atoms,
+    /// where the fp16 table needed its exceptions. Neither recurs.
     pub fn padded_channels(&self) -> u32 {
-        CHANNEL_PADDING[self.feature_atoms() as usize - 1].0
+        match self.precision {
+            Precision::Fp16 => CHANNEL_PADDING[self.feature_atoms() as usize - 1].0,
+            Precision::Int8(_) => self.feature_atoms() * self.precision.channels_per_atom(),
+        }
     }
 
     /// Channel count the coefficient footprint is computed from.
+    ///
+    /// At int8 this is always equal to `padded_channels`; the fp16 quirk
+    /// where the two disagree at three atoms does not recur.
     pub fn weight_channels(&self) -> u32 {
-        CHANNEL_PADDING[self.feature_atoms() as usize - 1].1
+        match self.precision {
+            Precision::Fp16 => CHANNEL_PADDING[self.feature_atoms() as usize - 1].1,
+            Precision::Int8(_) => self.padded_channels(),
+        }
     }
 
     /// Output channel count the DPU is programmed with, rounded up to a
@@ -289,9 +529,8 @@ impl Shape {
     /// which is why the shape-only corpus -- fixed at Cout 8 -- could not
     /// distinguish this from the true count.
     pub fn padded_out_channels(&self) -> u32 {
-        self.out_channels
-            .next_multiple_of(OUTPUT_CHANNEL_GRANULE)
-            .max(OUTPUT_CHANNEL_GRANULE)
+        let granule = self.precision.out_channel_granule();
+        self.out_channels.next_multiple_of(granule).max(granule)
     }
 
     /// Bytes of fp16 coefficients the whole kernel set occupies.
@@ -303,18 +542,39 @@ impl Shape {
     /// and it is the weight one that this follows.
     pub fn weight_bytes(&self, kernels: Kernels) -> u32 {
         let kernel = kernel_programming(kernels);
-        kernel.size * kernel.size * self.weight_channels() * self.out_channels * 2
+        kernel.size
+            * kernel.size
+            * self.weight_channels()
+            * self.out_channels
+            * self.precision.element_bytes()
     }
 
-    /// Atoms per pixel implied by the weight padding, which is what the CBUF
-    /// accounting follows -- not `feature_atoms`. At 3 atoms the two differ.
+    /// Atoms per pixel implied by the weight padding.
     fn weight_atoms(&self) -> u32 {
-        self.weight_channels() / 8
+        self.weight_channels() / self.precision.channels_per_atom()
+    }
+
+    /// Atoms per pixel the CBUF charges for, which is neither
+    /// `feature_atoms` nor `weight_atoms`.
+    ///
+    /// Three atoms are charged as four and seven as eight; five, six, nine
+    /// and ten are charged as themselves. At fp16 this is invisible because
+    /// `CHANNEL_PADDING` already bumps exactly those two rows on its weight
+    /// side, so `weight_atoms` comes out pre-rounded. At int8 the padding is
+    /// exact, and the rounding has to be applied here or `data_entries`
+    /// comes out short -- `Cin` 33..48 programs 4 atoms' worth and `Cin`
+    /// 97..112 programs 8, against padded counts of 48 and 112.
+    fn cbuf_atoms(&self) -> u32 {
+        match self.feature_atoms() {
+            3 => 4,
+            7 => 8,
+            atoms => atoms,
+        }
     }
 
     /// Whether the feature map is dense NHWC or NC1HWC2 surfaces.
     pub fn layout(&self) -> FeatureLayout {
-        if self.in_channels * 2 <= DENSE_PIXEL_BYTES {
+        if self.in_channels <= MAX_DENSE_CHANNELS {
             FeatureLayout::Dense
         } else {
             FeatureLayout::Surfaces
@@ -341,7 +601,7 @@ impl Shape {
     /// `width * height * 16` bytes apart.
     pub fn input_row_stride(&self) -> u32 {
         match self.layout() {
-            FeatureLayout::Dense => self.width * self.in_channels * 2,
+            FeatureLayout::Dense => self.width * self.in_channels * self.precision.element_bytes(),
             FeatureLayout::Surfaces => self.width * FEATURE_ATOM_BYTES,
         }
     }
@@ -371,10 +631,19 @@ impl Shape {
     fn data_bank_demand(&self) -> u32 {
         let pixels = self.width * self.height;
         match self.layout() {
-            FeatureLayout::Dense => pixels.div_ceil(PIXELS_PER_BANK_STEP),
+            // The dense demand is expressed in bytes so it carries across
+            // precision: an int8 ARGB pixel is 4 bytes where an fp16 one is
+            // 8, and the int8 captures allocate exactly half the banks for
+            // the same geometry. At fp16 this is the original
+            // `pixels / 1024`.
+            FeatureLayout::Dense => {
+                (pixels * self.precision.dense_pixel_bytes()).div_ceil(8 * PIXELS_PER_BANK_STEP)
+            }
             // Surfaces charge per atom, at twice the pixels per step. Fits
-            // every measured point: at 32x32 this is `ceil(atoms / 2)`,
+            // every measured point: at 32x32 fp16 this is `ceil(atoms / 2)`,
             // giving 1,1,2,2,3,3,4,4,5,5 across atom counts 1 through 10.
+            // Already precision-neutral, because an int8 atom holds twice
+            // the channels and so a pixel needs half as many.
             FeatureLayout::Surfaces => {
                 (pixels * self.weight_atoms()).div_ceil(2 * PIXELS_PER_BANK_STEP)
             }
@@ -453,9 +722,16 @@ impl Shape {
     pub fn max_tile_input_rows(&self, kernels: Kernels) -> u32 {
         let banks = self.data_banks(kernels);
         let capacity = match self.layout() {
-            FeatureLayout::Dense => banks * PIXELS_PER_BANK_STEP / self.width,
+            // A quarter of a bank per 1024 dense pixels, which is what the
+            // fp16 width sweep measured; written in bytes so the int8 case
+            // falls out of the narrower pixel rather than needing its own
+            // constant.
+            FeatureLayout::Dense => {
+                banks * (CBUF_BANK_BYTES / 4) / (self.width * self.precision.dense_pixel_bytes())
+            }
+            // Surfaces get the whole bank, exactly.
             FeatureLayout::Surfaces => {
-                2 * banks * PIXELS_PER_BANK_STEP / (self.width * self.weight_atoms())
+                banks * CBUF_BANK_BYTES / (self.width * self.weight_atoms() * FEATURE_ATOM_BYTES)
             }
         };
         capacity.min(MAX_DATA_ENTRIES / self.width).max(1)
@@ -662,9 +938,30 @@ pub fn conv_2d_tile_with_grains(
     let weight_channels = shape.weight_channels();
     // The DPU counts output channels in whole granules while the CNA counts
     // the real kernels. Both appear below, and they differ at every Cout
-    // that is not already a multiple of 16.
+    // that is not already a multiple of the granule.
     let padded_out_channels = shape.padded_out_channels();
-    const FP16_BYTES: u32 = 2;
+
+    // Precision reaches the program in three ways: an enum replicated across
+    // eight fields in four blocks, a set of bypasses that the quantized path
+    // clears, and the requantization constants themselves.
+    let precision = shape.precision.data_precision();
+    let quantization = shape.precision.quantization();
+    // `BS_MUL_SHIFT_VALUE` and its negated twin in `DPU_DATA_FORMAT` are a
+    // constant 14 in every int8 capture and 0 in every fp16 one. Nothing in
+    // the corpus varies it, so it is not derived from anything.
+    let bs_mul_shift = if quantization.is_some() {
+        BS_MUL_SHIFT_VALUE
+    } else {
+        0
+    };
+    // BRDMA carries bias alone at fp16 and the full bias/scale/shift triple
+    // once requantization is active.
+    let brdma_data_use = if quantization.is_some() {
+        BRDMA_DATA_USE_QUANTIZED
+    } else {
+        BRDMA_DATA_USE_BIAS
+    };
+    let element_bytes = shape.precision.element_bytes();
 
     let width = shape.width;
     let height = shape.height;
@@ -706,11 +1003,11 @@ pub fn conv_2d_tile_with_grains(
         FeatureLayout::Surfaces => (
             width * 4,
             width * (height - 4),
-            width * shape.weight_atoms() / 4,
+            width * shape.cbuf_atoms() / 4,
         ),
     };
 
-    let weight_bytes_per_kernel = kernel.size * kernel.size * weight_channels * FP16_BYTES;
+    let weight_bytes_per_kernel = kernel.size * kernel.size * weight_channels * element_bytes;
     let weight_bytes = shape.weight_bytes(kernels);
     let mut commands = Vec::with_capacity(136);
 
@@ -748,8 +1045,8 @@ pub fn conv_2d_tile_with_grains(
         }
     }
     conv_con1
-        .proc_precision(DataPrecision::Fp16.into())
-        .in_precision(DataPrecision::Fp16.into());
+        .proc_precision(precision.into())
+        .in_precision(precision.into());
     commands.push(conv_con1.build());
     commands.push(
         Register::<DpuSPointer>::new()
@@ -787,7 +1084,7 @@ pub fn conv_2d_tile_with_grains(
     );
     commands.push(
         Register::<CnaDataSize1>::new()
-            .datain_channel_real(Bits::new(shape.in_channels - 1))
+            .datain_channel_real(Bits::new((shape.in_channels - 1) % CHANNEL_REAL_MODULUS))
             .datain_channel(Bits::new(padded_channels))
             .build(),
     );
@@ -916,12 +1213,22 @@ pub fn conv_2d_tile_with_grains(
     commands.push(zero::<CnaDcompAmount14>());
     commands.push(zero::<CnaDcompAmount15>());
     commands.push(zero::<CnaCvtCon5>());
-    commands.push(zero::<CnaPadCon1>());
+    // Out-of-image taps contribute the quantized encoding of 0.0, which is
+    // the input zero point and not zero. fp16 pads with a literal 0 in every
+    // capture; int8 pads with the zero point in every capture.
+    commands.push(
+        Register::<CnaPadCon1>::new()
+            .pad_value(Bits::new(
+                quantization.map_or(0, |q| q.input_zero_point as u32),
+            ))
+            .build(),
+    );
 
     // CORE.
     commands.push(
         Register::<CoreMiscCfg>::new()
-            .proc_precision(DataPrecision::Fp16.into())
+            .proc_precision(precision.into())
+            .qd_en(Bits::new(u32::from(quantization.is_some())))
             .build(),
     );
     commands.push(
@@ -947,9 +1254,10 @@ pub fn conv_2d_tile_with_grains(
     );
     commands.push(
         Register::<DpuDataFormat>::new()
-            .in_precision(DataPrecision::Fp16.into())
-            .out_precision(DataPrecision::Fp16.into())
-            .proc_precision(DataPrecision::Fp16.into())
+            .in_precision(precision.into())
+            .out_precision(precision.into())
+            .proc_precision(precision.into())
+            .bs_mul_shift_value_neg(Bits::new(bs_mul_shift))
             .build(),
     );
     commands.push(zero::<DpuOffsetPend>());
@@ -985,18 +1293,24 @@ pub fn conv_2d_tile_with_grains(
             .bs_alu_algo(Bits::new(2))
             .bs_alu_src(Bits::new(1))
             .bs_relu_bypass(Bits::new(1))
-            .bs_mul_bypass(Bits::new(1))
+            .bs_mul_bypass(Bits::new(u32::from(quantization.is_none())))
             .build(),
     );
     commands.push(zero::<DpuBsAluCfg>());
-    commands.push(zero::<DpuBsMulCfg>());
+    commands.push(
+        Register::<DpuBsMulCfg>::new()
+            .bs_mul_shift_value(Bits::new(bs_mul_shift))
+            .bs_mul_src(Bits::new(u32::from(quantization.is_some())))
+            .build(),
+    );
     commands.push(zero::<DpuBsReluxCmpValue>());
     commands.push(
         Register::<DpuBsOwCfg>::new()
             .size_e_0(Bits::new(1))
             .size_e_1(Bits::new(1))
             .size_e_2(Bits::new(1))
-            .od_bypass(Bits::new(1))
+            .od_bypass(Bits::new(u32::from(quantization.is_none())))
+            .ow_src(Bits::new(u32::from(quantization.is_some())))
             .build(),
     );
     commands.push(zero::<DpuBsOwOp>());
@@ -1038,14 +1352,27 @@ pub fn conv_2d_tile_with_grains(
             .build(),
     );
     commands.push(zero::<DpuEwReluxCmpValue>());
-    commands.push(zero::<DpuOutCvtOffset>());
+    // Output conversion. fp16 bypasses requantization entirely and lets
+    // `fp32tofp16_en` do the narrowing; int8 programs the multiplier as a
+    // normalized mantissa/shift pair and the output zero point as an offset.
     commands.push(
-        Register::<DpuOutCvtScale>::new()
-            .fp32tofp16_en(Bits::new(1))
-            .out_cvt_scale(Bits::new(1))
+        Register::<DpuOutCvtOffset>::new()
+            .out_cvt_offset(Bits::new(
+                quantization.map_or(0, |q| q.output_zero_point as u32),
+            ))
             .build(),
     );
-    commands.push(zero::<DpuOutCvtShift>());
+    commands.push(
+        Register::<DpuOutCvtScale>::new()
+            .fp32tofp16_en(Bits::new(u32::from(quantization.is_none())))
+            .out_cvt_scale(Bits::new(quantization.map_or(1, |q| q.multiplier.scale)))
+            .build(),
+    );
+    commands.push(
+        Register::<DpuOutCvtShift>::new()
+            .out_cvt_shift(Bits::new(quantization.map_or(0, |q| q.multiplier.shift)))
+            .build(),
+    );
     commands.push(zero::<DpuEwOpValue0>());
     commands.push(zero::<DpuEwOpValue1>());
     commands.push(zero::<DpuEwOpValue2>());
@@ -1055,8 +1382,11 @@ pub fn conv_2d_tile_with_grains(
     commands.push(zero::<DpuEwOpValue6>());
     commands.push(zero::<DpuEwOpValue7>());
     commands.push(
+        // Half an output atom per pixel, and *not* precision-dependent:
+        // this field is byte-identical across every fp16/int8 capture pair,
+        // unlike `weight_bytes_per_kernel` right above, which halves.
         Register::<DpuSurfaceAdd>::new()
-            .surf_add(Bits::new(out_width * out_height * FP16_BYTES))
+            .surf_add(Bits::new(out_width * out_height * 2))
             .build(),
     );
     commands.push(zero::<DpuReserved40c4>());
@@ -1093,7 +1423,7 @@ pub fn conv_2d_tile_with_grains(
     commands.push(zero::<DpuRdmaSrcBaseAddr>());
     commands.push(
         Register::<DpuRdmaBrdmaCfg>::new()
-            .brdma_data_use(Bits::new(1))
+            .brdma_data_use(Bits::new(brdma_data_use))
             .build(),
     );
     commands.push(zero::<DpuRdmaBsBaseAddr>());
@@ -1110,8 +1440,8 @@ pub fn conv_2d_tile_with_grains(
         Register::<DpuRdmaFeatureModeCfg>::new()
             .burst_len(BurstLength::Sixteen.into())
             .mrdma_disable(Bits::new(1))
-            .in_precision(DataPrecision::Fp16.into())
-            .proc_precision(DataPrecision::Fp16.into())
+            .in_precision(precision.into())
+            .proc_precision(precision.into())
             .build(),
     );
     commands.push(zero::<DpuRdmaSrcDmaCfg>());
@@ -1594,7 +1924,11 @@ mod tests {
             (36, 40, 40),
             (40, 40, 40),
             (48, 48, 48),
-            (56, 64, 64),
+            // Seven atoms pads the coefficients to 64 but leaves
+            // datain_channel at 56, the same split three atoms makes. This
+            // row read (56, 64, 64) until a field-by-field comparison
+            // against the whole corpus showed the capture programs 56.
+            (56, 56, 64),
             (64, 64, 64),
         ];
         for (cin, padded, weights) in OBSERVED {
@@ -1810,6 +2144,204 @@ mod tests {
     #[should_panic(expected = "output channels must be")]
     fn rejects_output_channels_beyond_the_validated_range() {
         let _ = Shape::with_out_channels(32, 32, 1, 3, 513);
+    }
+
+    /// The quantization of `conv-w32-h32-k3-s1-i8`, read off the capture.
+    fn captured_int8() -> Precision {
+        Precision::Int8(Quantization {
+            input_zero_point: 0,
+            output_zero_point: -3,
+            multiplier: Multiplier {
+                scale: 19636,
+                shift: 24,
+            },
+        })
+    }
+
+    #[test]
+    fn int8_channel_padding_is_a_rule_not_a_table() {
+        // An int8 atom carries 16 channels, so both paddings double their
+        // granule. Measured at 15 Cin values and 10 Cout values with no
+        // deviation -- including three atoms (33..48) and seven atoms (112),
+        // where the fp16 table needs exceptions. Neither recurs.
+        for (in_channels, padded) in [
+            (3u32, 16u32),
+            (4, 16),
+            (16, 16),
+            (17, 32),
+            (24, 32),
+            (32, 32),
+            (33, 48),
+            (40, 48),
+            (48, 48),
+            (64, 64),
+            (80, 80),
+            (112, 112),
+            (128, 128),
+        ] {
+            let shape =
+                Shape::with_precision(32, 32, 1, in_channels, 8, Precision::Int8(quantization()));
+            assert_eq!(
+                shape.padded_channels(),
+                padded,
+                "int8 datain_channel at Cin {in_channels}"
+            );
+            // Unlike fp16, the two padded counts never disagree.
+            assert_eq!(shape.weight_channels(), padded);
+        }
+
+        for (out_channels, padded) in [
+            (8u32, 32u32),
+            (16, 32),
+            (20, 32),
+            (32, 32),
+            (40, 64),
+            (48, 64),
+            (64, 64),
+            (96, 96),
+            (112, 128),
+        ] {
+            let shape =
+                Shape::with_precision(32, 32, 1, 3, out_channels, Precision::Int8(quantization()));
+            assert_eq!(
+                shape.padded_out_channels(),
+                padded,
+                "int8 padded Cout at {out_channels}"
+            );
+        }
+    }
+
+    fn quantization() -> Quantization {
+        match captured_int8() {
+            Precision::Int8(quantization) => quantization,
+            Precision::Fp16 => unreachable!(),
+        }
+    }
+
+    #[test]
+    fn dense_layout_boundary_is_channels_not_bytes() {
+        // The boundary is four channels in *both* precisions. Written as a
+        // byte-width test -- "narrower than half a feature atom" -- it comes
+        // out right at fp16 and wrong at int8, where it would allow eight.
+        // The captures put Cin 4 on the ARGB path and Cin 8 on surfaces at
+        // both precisions.
+        for precision in [Precision::Fp16, Precision::Int8(quantization())] {
+            for (in_channels, layout) in [
+                (1u32, FeatureLayout::Dense),
+                (4, FeatureLayout::Dense),
+                (5, FeatureLayout::Surfaces),
+                (8, FeatureLayout::Surfaces),
+            ] {
+                let shape = Shape::with_precision(32, 32, 1, in_channels, 8, precision);
+                assert_eq!(
+                    shape.layout(),
+                    layout,
+                    "layout at Cin {in_channels}, {precision:?}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn int8_registers_match_the_captures() {
+        // conv-w32-h32-k3-s1-i8, single-core plan. Every field this builder
+        // writes matches the capture; the values below are the ones that
+        // move with precision.
+        let shape = Shape::with_precision(32, 32, 1, 3, 8, captured_int8());
+        let program = conv_2d_tile(shape, [3, 3], &Tile::whole(shape, [3, 3]));
+
+        // Coefficients are one byte per element, so the footprint halves
+        // even though the padded channel count doubles.
+        assert_eq!(value_of::<CnaWeightSize0>(&program), 16 * 9 * 8);
+        assert_eq!(value_of::<CnaWeightSize1>(&program), 16 * 9);
+
+        // Padding contributes the input zero point, not zero.
+        assert_eq!(value_of::<CnaPadCon1>(&program), 0);
+        let offset = Shape::with_precision(
+            32,
+            32,
+            1,
+            3,
+            8,
+            Precision::Int8(Quantization {
+                input_zero_point: -1,
+                ..quantization()
+            }),
+        );
+        let offset_program = conv_2d_tile(offset, [3, 3], &Tile::whole(offset, [3, 3]));
+        assert_eq!(value_of::<CnaPadCon1>(&offset_program), u32::MAX);
+
+        // Requantization: the multiplier, its shift, and the output zero
+        // point, none of which the fp16 path programs at all.
+        assert_eq!(value_of::<DpuOutCvtScale>(&program), 19636);
+        assert_eq!(value_of::<DpuOutCvtShift>(&program), 24);
+        assert_eq!(value_of::<DpuOutCvtOffset>(&program), (-3i32) as u32);
+    }
+
+    #[test]
+    fn fp16_and_int8_differ_only_where_the_corpus_says_they_do() {
+        // A paired diff, the same comparison the corpus was built to allow.
+        // The fp16 side is already hardware-validated, so this pins the int8
+        // side against it rather than against a second unknown.
+        let fp16 = Shape::new(32, 32);
+        let int8 = Shape::with_precision(32, 32, 1, 3, 8, captured_int8());
+        let a = conv_2d_tile(fp16, [3, 3], &Tile::whole(fp16, [3, 3]));
+        let b = conv_2d_tile(int8, [3, 3], &Tile::whole(int8, [3, 3]));
+        assert_eq!(a.len(), b.len(), "precision must not change program length");
+
+        let differing = a
+            .iter()
+            .zip(&b)
+            .filter(|(left, right)| left.0 != right.0)
+            .count();
+        // Seventeen distinct registers, and `CNA_CONV_CON1` is written
+        // twice per program, so eighteen words. That is fewer than the 33
+        // fields the sweep reports across all geometries for two reasons:
+        // several fields share a register, and several move only where the
+        // channel padding or the bank split reacts, neither of which does
+        // at Cin 3 Cout 8.
+        assert_eq!(
+            differing, 18,
+            "unexpected number of registers differing between precisions"
+        );
+    }
+
+    #[test]
+    fn requantization_multiplier_normalizes_its_mantissa() {
+        // Every OUT_CVT_SCALE in the corpus lands in [2^14, 2^15), with the
+        // shift chosen to put it there. These are real (scale, shift) pairs
+        // from int8 captures; re-encoding their ratio must reproduce them.
+        for (scale, shift) in [
+            (19636u32, 24u32),
+            (27245, 23),
+            (29533, 26),
+            (32573, 24),
+            (16625, 24),
+            (23916, 25),
+        ] {
+            let encoded = Multiplier::from_ratio(Multiplier { scale, shift }.ratio());
+            assert_eq!(
+                (encoded.scale, encoded.shift),
+                (scale, shift),
+                "round trip of {scale}/2^{shift}"
+            );
+        }
+
+        // The normalization itself, over a wide range of multipliers.
+        for exponent in -30i32..4 {
+            for step in 1..8 {
+                let ratio = 2f64.powi(exponent) * (1.0 + f64::from(step) / 8.0);
+                let encoded = Multiplier::from_ratio(ratio);
+                assert!(
+                    (MANTISSA_FLOOR..2 * MANTISSA_FLOOR).contains(&encoded.scale),
+                    "mantissa {} out of range for ratio {ratio}",
+                    encoded.scale
+                );
+                // Within half a mantissa step of the real value.
+                let error = (encoded.ratio() - ratio).abs() / ratio;
+                assert!(error < 1.0 / f64::from(MANTISSA_FLOOR), "ratio {ratio}");
+            }
+        }
     }
 
     #[test]
