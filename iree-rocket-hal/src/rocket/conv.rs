@@ -715,22 +715,41 @@ impl Shape {
     /// focused `(Cin, Cout, k)` capture sweep rather than the 1x1/3x3
     /// automatic allocator.
     pub fn max_tile_input_rows_for_data_banks(&self, data_banks: u32) -> u32 {
+        self.max_tile_input_rows_for_width_and_data_banks(self.width, data_banks)
+    }
+
+    /// Most input rows that fit when a task reads only `input_width`.
+    ///
+    /// Horizontal tiling changes the resident CBUF footprint without
+    /// changing the tensor's memory strides. The three large-kernel captures
+    /// that require it sit exactly on this product bound:
+    /// `input_width * input_rows * atoms * 16 <= data_banks * 32768`.
+    pub fn max_tile_input_rows_for_width_and_data_banks(
+        &self,
+        input_width: u32,
+        data_banks: u32,
+    ) -> u32 {
         assert!(
             (1..CBUF_BANKS).contains(&data_banks),
             "data banks must be between 1 and {}, leaving at least one weight bank",
             CBUF_BANKS - 1
         );
+        assert!(
+            (1..=self.width).contains(&input_width),
+            "tile input width must be between 1 and the tensor width {}",
+            self.width
+        );
         let capacity = match self.layout() {
             FeatureLayout::Dense => {
                 data_banks * (CBUF_BANK_BYTES / 4)
-                    / (self.width * self.precision.dense_pixel_bytes())
+                    / (input_width * self.precision.dense_pixel_bytes())
             }
             FeatureLayout::Surfaces => {
                 data_banks * CBUF_BANK_BYTES
-                    / (self.width * self.weight_atoms() * FEATURE_ATOM_BYTES)
+                    / (input_width * self.weight_atoms() * FEATURE_ATOM_BYTES)
             }
         };
-        capacity.min(MAX_DATA_ENTRIES / self.width).max(1)
+        capacity.min(MAX_DATA_ENTRIES / input_width).max(1)
     }
 
     /// Most input rows one program may read.
@@ -775,9 +794,19 @@ impl Shape {
 
     /// Fewest output-row tiles needed with an explicit feature-data split.
     pub fn min_tiles_for_data_banks(&self, kernels: Kernels, data_banks: u32) -> u32 {
+        self.min_tiles_for_width_and_data_banks(kernels, self.width, data_banks)
+    }
+
+    /// Fewest output-row tiles needed at an explicit input-tile width.
+    pub fn min_tiles_for_width_and_data_banks(
+        &self,
+        kernels: Kernels,
+        input_width: u32,
+        data_banks: u32,
+    ) -> u32 {
         let halo = 2 * kernel_programming(kernels).padding;
         let rows = self
-            .max_tile_input_rows_for_data_banks(data_banks)
+            .max_tile_input_rows_for_width_and_data_banks(input_width, data_banks)
             .saturating_sub(halo)
             .max(1);
         // A tile of `r` output rows reads about `r * stride` input rows.
@@ -910,6 +939,143 @@ impl Tile {
     /// Byte offset of this tile's first output row from the tensor base.
     pub fn output_offset(&self, shape: Shape, kernels: Kernels) -> u32 {
         self.out_first * shape.output_row_stride(kernels)
+    }
+}
+
+/// One contiguous range of output columns and the input columns it reads.
+///
+/// This is the horizontal analogue of [`Tile`]. `in_cols` includes the
+/// overlap with neighbouring column tiles and excludes columns supplied by
+/// zero padding. The tensor's row and surface strides remain those of the
+/// full [`Shape`]; only the task-local geometry and base offset change.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct ColumnTile {
+    pub out_first: u32,
+    pub out_cols: u32,
+    pub in_first: u32,
+    pub in_cols: u32,
+    pub pad_left: u32,
+}
+
+impl ColumnTile {
+    /// Derives one horizontal tile from an output-column range.
+    pub fn from_output_range(
+        shape: Shape,
+        kernels: Kernels,
+        out_first: u32,
+        out_cols: u32,
+    ) -> ColumnTile {
+        let output_width = shape.output_width(kernels);
+        assert!(
+            out_cols > 0 && out_first + out_cols <= output_width,
+            "tile output columns {out_first}..{} fall outside the {output_width}-column output",
+            out_first + out_cols
+        );
+        let kernel = kernel_programming(kernels);
+        let projected_first = out_first * shape.stride;
+        let in_first = projected_first.saturating_sub(kernel.padding);
+        let last_tap = (out_first + out_cols - 1) * shape.stride + kernel.padding;
+        let exact = last_tap.min(shape.width - 1) - in_first + 1;
+        let in_cols = exact
+            .max(out_cols * shape.stride)
+            .min(shape.width - in_first);
+
+        ColumnTile {
+            out_first,
+            out_cols,
+            in_first,
+            in_cols,
+            pad_left: kernel.padding.saturating_sub(projected_first),
+        }
+    }
+
+    /// Splits the output into explicitly sized column ranges.
+    ///
+    /// Explicit widths keep the capture-derived partition boundaries visible:
+    /// 9x9/Cin64 uses 135+121, 11x11/Cin48 uses 137+119, and
+    /// 11x11/Cin64 uses 59+54+54+54+35.
+    pub fn split(shape: Shape, kernels: Kernels, output_widths: &[u32]) -> Vec<ColumnTile> {
+        assert!(
+            !output_widths.is_empty(),
+            "at least one column tile is required"
+        );
+        assert_eq!(
+            output_widths.iter().sum::<u32>(),
+            shape.output_width(kernels),
+            "column-tile widths must cover the output exactly"
+        );
+        let mut out_first = 0;
+        output_widths
+            .iter()
+            .map(|&out_cols| {
+                let tile = ColumnTile::from_output_range(shape, kernels, out_first, out_cols);
+                out_first += out_cols;
+                tile
+            })
+            .collect()
+    }
+
+    pub fn whole(shape: Shape, kernels: Kernels) -> ColumnTile {
+        ColumnTile::from_output_range(shape, kernels, 0, shape.output_width(kernels))
+    }
+
+    fn input_offset(&self, shape: Shape) -> u32 {
+        match shape.layout() {
+            FeatureLayout::Dense => {
+                self.in_first * shape.in_channels * shape.precision.element_bytes()
+            }
+            FeatureLayout::Surfaces => self.in_first * FEATURE_ATOM_BYTES,
+        }
+    }
+
+    fn output_offset(&self) -> u32 {
+        self.out_first * FEATURE_ATOM_BYTES
+    }
+}
+
+/// A rectangular output tile with both vertical and horizontal input halos.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Tile2D {
+    pub rows: Tile,
+    pub columns: ColumnTile,
+}
+
+impl Tile2D {
+    pub fn whole(shape: Shape, kernels: Kernels) -> Tile2D {
+        Tile2D {
+            rows: Tile::whole(shape, kernels),
+            columns: ColumnTile::whole(shape, kernels),
+        }
+    }
+
+    /// Builds a rectangular grid using explicit output-column widths and the
+    /// conservative row capacity for each resulting input width.
+    pub fn grid(
+        shape: Shape,
+        kernels: Kernels,
+        output_widths: &[u32],
+        data_banks: u32,
+    ) -> Vec<Tile2D> {
+        let columns = ColumnTile::split(shape, kernels, output_widths);
+        let mut tiles = Vec::new();
+        for columns in columns {
+            let row_tiles =
+                shape.min_tiles_for_width_and_data_banks(kernels, columns.in_cols, data_banks);
+            tiles.extend(
+                Tile::split(shape, kernels, row_tiles)
+                    .into_iter()
+                    .map(|rows| Tile2D { rows, columns }),
+            );
+        }
+        tiles
+    }
+
+    fn input_offset(&self, shape: Shape) -> u32 {
+        self.rows.input_offset(shape) + self.columns.input_offset(shape)
+    }
+
+    fn output_offset(&self, shape: Shape, kernels: Kernels) -> u32 {
+        self.rows.output_offset(shape, kernels) + self.columns.output_offset()
     }
 }
 
@@ -1082,10 +1248,14 @@ pub fn conv_2d_tile_with_grains(
     feature_grains: u32,
 ) -> Vec<RegCmd> {
     assert_default_cbuf_kernel(kernels);
+    let tile = Tile2D {
+        rows: *tile,
+        columns: ColumnTile::whole(shape, kernels),
+    };
     conv_2d_tile_program(
         shape,
         kernels,
-        tile,
+        &tile,
         feature_grains,
         shape.data_banks(kernels),
         shape.weight_banks(kernels),
@@ -1111,17 +1281,66 @@ pub fn conv_2d_tile_with_cbuf_banks(
         "explicit CBUF partition must have nonzero data and weight banks summing to {CBUF_BANKS}; \
          got data={data_banks}, weights={weight_banks}"
     );
+    let tile = Tile2D {
+        rows: *tile,
+        columns: ColumnTile::whole(shape, kernels),
+    };
     assert!(
-        tile.in_rows <= shape.max_tile_input_rows_for_data_banks(data_banks),
+        tile.rows.in_rows <= shape.max_tile_input_rows_for_data_banks(data_banks),
         "tile reads {} input rows, but {data_banks} data banks fit at most {} for this shape",
-        tile.in_rows,
+        tile.rows.in_rows,
         shape.max_tile_input_rows_for_data_banks(data_banks),
     );
     conv_2d_tile_program(
         shape,
         kernels,
+        &tile,
+        feature_grains(kernels, &tile.rows),
+        data_banks,
+        weight_banks,
+    )
+}
+
+/// Builds one rectangular large-kernel tile with an explicit CBUF split.
+///
+/// Horizontal tiles use the capture-derived grouped-line DMA mode and retain
+/// the full tensor strides. Prefer [`conv_2d_tile_with_cbuf_banks`] for a
+/// full-width row tile.
+pub fn conv_2d_tile_2d_with_cbuf_banks(
+    shape: Shape,
+    kernels: Kernels,
+    tile: &Tile2D,
+    data_banks: u32,
+    weight_banks: u32,
+) -> Vec<RegCmd> {
+    assert_eq!(
+        shape.layout(),
+        FeatureLayout::Surfaces,
+        "horizontal tiling currently has capture backing only for NC1HWC2 surfaces"
+    );
+    assert_eq!(
+        shape.stride, 1,
+        "horizontal tiling currently has capture backing only at stride 1"
+    );
+    assert!(
+        data_banks > 0 && weight_banks > 0 && data_banks + weight_banks == CBUF_BANKS,
+        "explicit CBUF partition must have nonzero data and weight banks summing to {CBUF_BANKS}; \
+         got data={data_banks}, weights={weight_banks}"
+    );
+    let max_rows =
+        shape.max_tile_input_rows_for_width_and_data_banks(tile.columns.in_cols, data_banks);
+    assert!(
+        tile.rows.in_rows <= max_rows,
+        "tile reads {}x{} input pixels, but {data_banks} data banks fit at most \
+         {max_rows} rows at this width",
+        tile.columns.in_cols,
+        tile.rows.in_rows,
+    );
+    conv_2d_tile_program(
+        shape,
+        kernels,
         tile,
-        feature_grains(kernels, tile),
+        feature_grains(kernels, &tile.rows),
         data_banks,
         weight_banks,
     )
@@ -1130,7 +1349,7 @@ pub fn conv_2d_tile_with_cbuf_banks(
 fn conv_2d_tile_program(
     shape: Shape,
     kernels: Kernels,
-    tile: &Tile,
+    tile: &Tile2D,
     feature_grains: u32,
     data_banks: u32,
     weight_banks: u32,
@@ -1164,30 +1383,46 @@ fn conv_2d_tile_program(
     };
     let element_bytes = shape.precision.element_bytes();
 
-    let width = shape.width;
+    let rows = &tile.rows;
+    let columns = &tile.columns;
+    let full_width = shape.width;
     let height = shape.height;
-    let out_width = shape.output_width(kernels);
+    let full_out_width = shape.output_width(kernels);
     let out_height = shape.output_height(kernels);
+    let input_width = columns.in_cols;
+    let out_width = columns.out_cols;
+    let horizontally_tiled = columns.out_first != 0 || out_width != full_out_width;
 
     assert!(
-        tile.out_rows > 0 && tile.out_first + tile.out_rows <= out_height,
+        rows.out_rows > 0 && rows.out_first + rows.out_rows <= out_height,
         "tile output rows {}..{} fall outside the {out_height}-row output",
-        tile.out_first,
-        tile.out_first + tile.out_rows
+        rows.out_first,
+        rows.out_first + rows.out_rows
     );
     assert!(
-        tile.in_rows * width <= MAX_DATA_ENTRIES,
-        "tile reads {} rows of {width} pixels; CNA_CBUF_CON1.data_entries is \
-         14 bits and holds at most {MAX_DATA_ENTRIES}. Split into at least {} \
-         tiles (Shape::min_tiles)",
-        tile.in_rows,
-        shape.min_tiles(kernels),
+        columns.out_cols > 0 && columns.out_first + columns.out_cols <= full_out_width,
+        "tile output columns {}..{} fall outside the {full_out_width}-column output",
+        columns.out_first,
+        columns.out_first + columns.out_cols
     );
     assert!(
-        tile.in_rows > 0 && tile.in_first + tile.in_rows <= height,
+        rows.in_rows * input_width <= MAX_DATA_ENTRIES,
+        "tile reads {}x{} pixels; CNA_CBUF_CON1.data_entries is 14 bits and \
+         holds at most {MAX_DATA_ENTRIES}",
+        input_width,
+        rows.in_rows,
+    );
+    assert!(
+        rows.in_rows > 0 && rows.in_first + rows.in_rows <= height,
         "tile input rows {}..{} fall outside the {height}-row image",
-        tile.in_first,
-        tile.in_first + tile.in_rows
+        rows.in_first,
+        rows.in_first + rows.in_rows
+    );
+    assert!(
+        columns.in_cols > 0 && columns.in_first + columns.in_cols <= full_width,
+        "tile input columns {}..{} fall outside the {full_width}-column image",
+        columns.in_first,
+        columns.in_first + columns.in_cols
     );
 
     let kernel = kernel_programming(kernels);
@@ -1197,12 +1432,25 @@ fn conv_2d_tile_program(
     // Surfaces are counted in atoms and `data_entries` does not depend on the
     // tile at all -- the same field carries different quantities in the two
     // regimes, which is why they are computed apart rather than parameterised.
-    let (line_stride, surf_stride, data_entries) = match shape.layout() {
-        FeatureLayout::Dense => (width, width * (height - 1), width * tile.in_rows),
-        FeatureLayout::Surfaces => (
-            width * 4,
-            width * (height - 4),
-            width * shape.cbuf_atoms() / 4,
+    let (line_stride, surf_stride, data_entries) = match (shape.layout(), horizontally_tiled) {
+        (FeatureLayout::Dense, _) => (
+            full_width,
+            full_width * (height - 1),
+            input_width * rows.in_rows,
+        ),
+        (FeatureLayout::Surfaces, false) => (
+            full_width * 4,
+            full_width * (height - 4),
+            input_width * shape.cbuf_atoms() / 4,
+        ),
+        // Every captured width-partitioned task enables grouped-line mode
+        // below and switches to these strides. `surf_stride` is the full
+        // surface area less the local input width: exact for 125/139 at 9x9,
+        // 124/142 at 11x11/Cin48, and 40/64 at 11x11/Cin64.
+        (FeatureLayout::Surfaces, true) => (
+            full_width,
+            full_width * height - input_width,
+            input_width * shape.cbuf_atoms() / 4,
         ),
     };
 
@@ -1221,9 +1469,10 @@ fn conv_2d_tile_program(
 
     // The dense regime is the CNA's ARGB image-input path: `argb_in` names
     // the channel count (OneChannel = 8 through FourChannels = 11) and both
-    // `nonalign_dma` and `group_line_off` are set. The surface regime clears
-    // all three. Measured across the channel sweep: Cin 3 programs 10/1/1,
-    // Cin 4 programs 11/1/1, and every Cin from 5 up programs 0/0/0.
+    // `nonalign_dma` and `group_line_off` are set. The full-width surface
+    // regime clears all three. Horizontal surface tiles set `group_line_off`
+    // while leaving the other two clear, exactly as every width-partitioned
+    // task in the focused kernel captures does.
     //
     // Leaving these at the captured C3 values made the hardware read three
     // channels per pixel at every channel count, which is what
@@ -1239,7 +1488,7 @@ fn conv_2d_tile_program(
         FeatureLayout::Surfaces => {
             conv_con1
                 .nonalign_dma(Bits::new(0))
-                .group_line_off(Bits::new(0))
+                .group_line_off(Bits::new(u32::from(horizontally_tiled)))
                 .argb_in(Bits::new(0));
         }
     }
@@ -1277,8 +1526,8 @@ fn conv_2d_tile_program(
     );
     commands.push(
         Register::<CnaDataSize0>::new()
-            .datain_width(Bits::new(width))
-            .datain_height(Bits::new(tile.in_rows))
+            .datain_width(Bits::new(input_width))
+            .datain_height(Bits::new(rows.in_rows))
             .build(),
     );
     commands.push(
@@ -1294,7 +1543,7 @@ fn conv_2d_tile_program(
     );
     commands.push(
         Register::<CnaDataSize3>::new()
-            .dataout_atomics(Bits::new(out_width * tile.out_rows))
+            .dataout_atomics(Bits::new(out_width * rows.out_rows))
             .build(),
     );
     commands.push(
@@ -1350,13 +1599,11 @@ fn conv_2d_tile_program(
     commands.push(zero::<CnaFcCon0>());
     commands.push(zero::<CnaFcCon1>());
     commands.push(
-        // pad_left is a kernel property (width is never tiled); pad_top is a
-        // tile property. The untiled captures set both to 1 and cannot
-        // distinguish them -- groups 3, 5, and 6 program 0x10, separating the
-        // two nibbles.
+        // Both axes carry only the padding still visible at the tile's first
+        // output coordinate. Interior horizontal tiles clear `pad_left`.
         Register::<CnaPadCon0>::new()
-            .pad_top(Bits::new(tile.pad_top))
-            .pad_left(Bits::new(kernel.padding))
+            .pad_top(Bits::new(rows.pad_top))
+            .pad_left(Bits::new(columns.pad_left))
             .build(),
     );
     commands.push(
@@ -1383,8 +1630,8 @@ fn conv_2d_tile_program(
     );
     commands.push(
         Register::<CnaFcDataSize0>::new()
-            .dma_width(Bits::new(width))
-            .dma_height(Bits::new(tile.in_rows))
+            .dma_width(Bits::new(input_width))
+            .dma_height(Bits::new(rows.in_rows))
             .build(),
     );
     commands.push(
@@ -1433,7 +1680,7 @@ fn conv_2d_tile_program(
     commands.push(
         Register::<CoreDataoutSize0>::new()
             .dataout_width(Bits::new(out_width - 1))
-            .dataout_height(Bits::new(tile.out_rows - 1))
+            .dataout_height(Bits::new(rows.out_rows - 1))
             .build(),
     );
     commands.push(
@@ -1467,7 +1714,7 @@ fn conv_2d_tile_program(
     );
     commands.push(
         Register::<DpuDstSurfStride>::new()
-            .dst_surf_stride(Bits::new(out_width * out_height))
+            .dst_surf_stride(Bits::new(full_out_width * out_height))
             .build(),
     );
     commands.push(
@@ -1477,10 +1724,16 @@ fn conv_2d_tile_program(
     );
     commands.push(
         Register::<DpuDataCubeHeight>::new()
-            .height(Bits::new(tile.out_rows - 1))
+            .height(Bits::new(rows.out_rows - 1))
             .build(),
     );
-    commands.push(zero::<DpuDataCubeNotchAddr>());
+    let notch = full_out_width - out_width;
+    commands.push(
+        Register::<DpuDataCubeNotchAddr>::new()
+            .notch_addr_0(Bits::new(notch))
+            .notch_addr_1(Bits::new(notch))
+            .build(),
+    );
     commands.push(
         Register::<DpuDataCubeChannel>::new()
             .orig_channel(Bits::new(shape.out_channels - 1))
@@ -1520,7 +1773,7 @@ fn conv_2d_tile_program(
     );
     commands.push(
         Register::<DpuWdmaSize1>::new()
-            .height_wdma(Bits::new(tile.out_rows - 1))
+            .height_wdma(Bits::new(rows.out_rows - 1))
             .width_wdma(Bits::new(out_width - 1))
             .build(),
     );
@@ -1585,7 +1838,7 @@ fn conv_2d_tile_program(
         // this field is byte-identical across every fp16/int8 capture pair,
         // unlike `weight_bytes_per_kernel` right above, which halves.
         Register::<DpuSurfaceAdd>::new()
-            .surf_add(Bits::new(out_width * out_height * 2))
+            .surf_add(Bits::new(full_out_width * out_height * 2))
             .build(),
     );
     commands.push(zero::<DpuReserved40c4>());
@@ -1611,7 +1864,7 @@ fn conv_2d_tile_program(
     );
     commands.push(
         Register::<DpuRdmaDataCubeHeight>::new()
-            .height(Bits::new(tile.out_rows - 1))
+            .height(Bits::new(rows.out_rows - 1))
             .build(),
     );
     commands.push(
@@ -1908,6 +2161,121 @@ mod tests {
                 .collect::<Vec<_>>(),
             [5, 4, 3, 2, 1, 0, 0]
         );
+    }
+
+    #[test]
+    fn column_tiles_reproduce_large_kernel_capture_boundaries() {
+        let k9 = Shape::with_out_channels(256, 32, 1, 64, 64);
+        assert_eq!(
+            ColumnTile::split(k9, [9, 9], &[135, 121]),
+            [
+                ColumnTile {
+                    out_first: 0,
+                    out_cols: 135,
+                    in_first: 0,
+                    in_cols: 139,
+                    pad_left: 4,
+                },
+                ColumnTile {
+                    out_first: 135,
+                    out_cols: 121,
+                    in_first: 131,
+                    in_cols: 125,
+                    pad_left: 0,
+                },
+            ]
+        );
+
+        let k11_c48 = Shape::with_out_channels(256, 32, 1, 48, 64);
+        assert_eq!(
+            ColumnTile::split(k11_c48, [11, 11], &[137, 119]),
+            [
+                ColumnTile {
+                    out_first: 0,
+                    out_cols: 137,
+                    in_first: 0,
+                    in_cols: 142,
+                    pad_left: 5,
+                },
+                ColumnTile {
+                    out_first: 137,
+                    out_cols: 119,
+                    in_first: 132,
+                    in_cols: 124,
+                    pad_left: 0,
+                },
+            ]
+        );
+
+        let k11_c64 = Shape::with_out_channels(256, 32, 1, 64, 64);
+        let columns = ColumnTile::split(k11_c64, [11, 11], &[59, 54, 54, 54, 35]);
+        assert_eq!(
+            columns
+                .iter()
+                .map(|tile| (tile.out_first, tile.in_first, tile.in_cols, tile.pad_left))
+                .collect::<Vec<_>>(),
+            [
+                (0, 0, 64, 5),
+                (59, 54, 64, 0),
+                (113, 108, 64, 0),
+                (167, 162, 64, 0),
+                (221, 216, 40, 0),
+            ]
+        );
+    }
+
+    #[test]
+    fn horizontal_programming_matches_captured_11x11_tiles() {
+        let shape = Shape::with_out_channels(256, 32, 1, 64, 64);
+        let columns = ColumnTile::split(shape, [11, 11], &[59, 54, 54, 54, 35]);
+        let rows = Tile {
+            out_first: 0,
+            out_rows: 7,
+            in_first: 0,
+            in_rows: 12,
+            pad_top: 5,
+        };
+
+        let left = conv_2d_tile_2d_with_cbuf_banks(
+            shape,
+            [11, 11],
+            &Tile2D {
+                rows,
+                columns: columns[0],
+            },
+            3,
+            9,
+        );
+        assert_eq!(first_value_of::<CnaConvCon1>(&left), 0x2000_0120);
+        assert_eq!(first_value_of::<CnaCbufCon0>(&left), 0x93);
+        assert_eq!(value_of::<CnaDataSize0>(&left), 0x0040_000c);
+        assert_eq!(value_of::<CnaDataSize2>(&left), 59);
+        assert_eq!(value_of::<CnaDataSize3>(&left), 59 * 7);
+        assert_eq!(value_of::<CnaCbufCon1>(&left), 128);
+        assert_eq!(value_of::<CnaPadCon0>(&left), 0x55);
+        assert_eq!(value_of::<CnaDmaCon1>(&left), 256);
+        assert_eq!(value_of::<CnaDmaCon2>(&left), 8192 - 64);
+        assert_eq!(value_of::<CnaFcDataSize0>(&left), 0x0040_000c);
+        assert_eq!(value_of::<CoreDataoutSize0>(&left), 0x0006_003a);
+        assert_eq!(value_of::<DpuDataCubeNotchAddr>(&left), 0x00c5_00c5);
+        assert_eq!(value_of::<DpuDstSurfStride>(&left), 256 * 32 * 16);
+        assert_eq!(value_of::<DpuSurfaceAdd>(&left), 256 * 32 * 32);
+
+        let middle = conv_2d_tile_2d_with_cbuf_banks(
+            shape,
+            [11, 11],
+            &Tile2D {
+                rows,
+                columns: columns[1],
+            },
+            3,
+            9,
+        );
+        assert_eq!(value_of::<CnaDataSize2>(&middle), 54);
+        assert_eq!(value_of::<CnaPadCon0>(&middle), 0x05);
+        assert_eq!(value_of::<CnaFeatureDataAddr>(&middle), 54 * 16);
+        assert_eq!(value_of::<DpuDstBaseAddr>(&middle), 59 * 16);
+        assert_eq!(value_of::<DpuDataCubeNotchAddr>(&middle), 0x00ca_00ca);
     }
 
     #[test]

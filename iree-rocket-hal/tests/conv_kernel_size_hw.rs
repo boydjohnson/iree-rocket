@@ -31,6 +31,12 @@
 //! that standalone row-tile jobs can avoid reproducing the vendor's
 //! width-partitioned multi-core schedule.
 //!
+//! The capture-derived rectangular replacements are:
+//!
+//!   KERNEL_PROBE_CASE=k9-ci64-2d  ./conv_kernel_size_hw-<hash> --ignored --nocapture
+//!   KERNEL_PROBE_CASE=k11-ci48-2d ./conv_kernel_size_hw-<hash> --ignored --nocapture
+//!   KERNEL_PROBE_CASE=k11-ci64-2d ./conv_kernel_size_hw-<hash> --ignored --nocapture
+//!
 //! Input and weights are 1.0, with padded input lanes zero. Each output is
 //! therefore `Cin * valid_y_taps * valid_x_taps`, independent of coefficient
 //! order. All tested values are exactly representable in fp16.
@@ -44,7 +50,7 @@ use iree_rocket_hal::rocket::{
         dpu::DpuDstBaseAddr,
         dpu_rdma::DpuRdmaBsBaseAddr,
     },
-    conv::{FeatureLayout, Kernels, Shape, Tile, conv_2d_tile_with_cbuf_banks},
+    conv::{FeatureLayout, Kernels, Shape, Tile, Tile2D, conv_2d_tile_2d_with_cbuf_banks},
     device::{Buffer, JobDesc, close_bo, fini_bo, prep_bo, submit_jobs},
 };
 
@@ -139,7 +145,13 @@ struct Failure {
     samples: Vec<String>,
 }
 
-fn run(shape: Shape, kernels: Kernels, data_banks: u32, weight_banks: u32) -> Result<u32, Failure> {
+fn run(
+    shape: Shape,
+    kernels: Kernels,
+    data_banks: u32,
+    weight_banks: u32,
+    output_column_widths: Option<&[u32]>,
+) -> Result<u32, Failure> {
     let width = shape.width as usize;
     let height = shape.height as usize;
     let out_width = shape.output_width(kernels) as usize;
@@ -180,12 +192,20 @@ fn run(shape: Shape, kernels: Kernels, data_banks: u32, weight_banks: u32) -> Re
         let buf_output = Buffer::new(fd, page_aligned_size(output_bytes), &file);
         ptr::write_bytes(buf_output.host_ptr, 0, buf_output.size);
 
-        let tiles = shape.min_tiles_for_data_banks(kernels, data_banks);
-        let split = Tile::split(shape, kernels, tiles);
+        let split = if let Some(output_column_widths) = output_column_widths {
+            Tile2D::grid(shape, kernels, output_column_widths, data_banks)
+        } else {
+            let tiles = shape.min_tiles_for_data_banks(kernels, data_banks);
+            let columns = Tile2D::whole(shape, kernels).columns;
+            Tile::split(shape, kernels, tiles)
+                .into_iter()
+                .map(|rows| Tile2D { rows, columns })
+                .collect()
+        };
         let mut command_buffers = Vec::with_capacity(split.len());
         for tile in &split {
             let mut commands =
-                conv_2d_tile_with_cbuf_banks(shape, kernels, tile, data_banks, weight_banks);
+                conv_2d_tile_2d_with_cbuf_banks(shape, kernels, tile, data_banks, weight_banks);
             relocate::<CnaFeatureDataAddr>(&mut commands, buf_input.dma_address);
             relocate::<CnaDcompAddr0>(&mut commands, buf_weights.dma_address);
             relocate::<DpuRdmaBsBaseAddr>(&mut commands, buf_bias.dma_address);
@@ -295,7 +315,7 @@ fn run(shape: Shape, kernels: Kernels, data_banks: u32, weight_banks: u32) -> Re
         }
 
         if failure.mismatches == 0 {
-            Ok(tiles)
+            Ok(split.len() as u32)
         } else {
             Err(failure)
         }
@@ -315,7 +335,7 @@ fn attempt(
         shape.in_channels, shape.out_channels, shape.width, shape.height,
     );
     let tiles = shape.min_tiles_for_data_banks(kernels, data_banks);
-    match run(shape, kernels, data_banks, weight_banks) {
+    match run(shape, kernels, data_banks, weight_banks, None) {
         Ok(tiles) => println!(
             "  ok   {label} {tiles:>2} tile(s)  padded {}  weights {}B",
             shape.padded_out_channels(),
@@ -334,30 +354,74 @@ fn attempt(
     }
 }
 
+fn attempt_2d(
+    shape: Shape,
+    kernel: usize,
+    data_banks: u32,
+    weight_banks: u32,
+    output_column_widths: &[u32],
+    failures: &mut Vec<String>,
+) {
+    let kernels = [kernel, kernel];
+    let label = format!(
+        "k{kernel:<2} Cin {:>2} Cout {:>2} {}x{} d{data_banks}/w{weight_banks} columns {output_column_widths:?}",
+        shape.in_channels, shape.out_channels, shape.width, shape.height,
+    );
+    match run(
+        shape,
+        kernels,
+        data_banks,
+        weight_banks,
+        Some(output_column_widths),
+    ) {
+        Ok(tiles) => println!(
+            "  ok   {label} {tiles:>2} tile(s)  padded {}  weights {}B",
+            shape.padded_out_channels(),
+            shape.weight_bytes(kernels),
+        ),
+        Err(failure) => {
+            println!("  FAIL {label}  {} mismatches", failure.mismatches);
+            for sample in &failure.samples {
+                println!("         {sample}");
+            }
+            failures.push(label);
+        }
+    }
+}
+
 #[test]
 #[ignore = "needs /dev/accel/accel0 -- cross-compile for aarch64 and run on the RK3588 board"]
 fn large_kernel_cbuf_partitions_run_on_npu() {
     let mut failures = Vec::new();
 
     if let Ok(probe) = std::env::var("KERNEL_PROBE_CASE") {
-        let (kernel, cin, data_banks, weight_banks) = match probe.as_str() {
-            "k9-ci64" | "k9-ci64-w2" => (9usize, 64u32, 10u32, 2u32),
-            "k9-ci64-w3" => (9, 64, 9, 3),
-            "k11-ci48" => (11, 48, 9, 3),
-            "k11-ci64" => (11, 64, 11, 1),
+        let (kernel, cin, data_banks, weight_banks, output_column_widths) = match probe.as_str() {
+            "k9-ci64" | "k9-ci64-w2" => (9usize, 64u32, 10u32, 2u32, None),
+            "k9-ci64-w3" => (9, 64, 9, 3, None),
+            "k11-ci48" => (11, 48, 9, 3, None),
+            "k11-ci64" => (11, 64, 11, 1, None),
+            "k9-ci64-2d" => (9, 64, 6, 6, Some(&[135u32, 121][..])),
+            "k11-ci48-2d" => (11, 48, 5, 7, Some(&[137u32, 119][..])),
+            "k11-ci64-2d" => (11, 64, 3, 9, Some(&[59u32, 54, 54, 54, 35][..])),
             _ => panic!(
                 "unknown KERNEL_PROBE_CASE={probe:?}; expected k9-ci64-w2, k9-ci64-w3, \
-                 k11-ci48, or k11-ci64"
+                 k11-ci48, k11-ci64, k9-ci64-2d, k11-ci48-2d, or k11-ci64-2d"
             ),
         };
-        println!("isolated timeout-risk probe: {probe}");
-        attempt(
-            Shape::with_out_channels(256, 32, 1, cin, 64),
-            kernel,
-            data_banks,
-            weight_banks,
-            &mut failures,
-        );
+        println!("isolated probe: {probe}");
+        let shape = Shape::with_out_channels(256, 32, 1, cin, 64);
+        if let Some(output_column_widths) = output_column_widths {
+            attempt_2d(
+                shape,
+                kernel,
+                data_banks,
+                weight_banks,
+                output_column_widths,
+                &mut failures,
+            );
+        } else {
+            attempt(shape, kernel, data_banks, weight_banks, &mut failures);
+        }
         assert!(
             failures.is_empty(),
             "{} configuration(s) produced wrong output: {}",
