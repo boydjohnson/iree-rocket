@@ -728,8 +728,7 @@ mod tests {
         let matches: Vec<u32> = commands
             .iter()
             .filter(|command| {
-                (command.0 >> 48) as u32 == R::DOMAIN | 1
-                    && (command.0 as u32 & 0xffff) == R::OFFSET & 0xffff
+                (command.0 >> 48) as u32 == R::DOMAIN && (command.0 as u32 & 0xffff) == R::OFFSET
             })
             .map(|command| (command.0 >> 16) as u32)
             .collect();
