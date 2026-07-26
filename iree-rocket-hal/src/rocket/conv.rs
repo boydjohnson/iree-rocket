@@ -135,14 +135,38 @@ const CHANNEL_PADDING: [(u32, u32); 10] = [
     (80, 80),
 ];
 
-/// Output channels this builder supports: one fp16 kernel group.
+/// Output channels of the captured reference convolution.
 pub const OUTPUT_CHANNELS: u32 = 8;
+
+/// Largest output-channel count this builder will program.
+///
+/// `CNA_WEIGHT_SIZE2.weight_kernels` is 14 bits, so 16383 is the encodable
+/// ceiling. The corpus reaches 512 in a single unsplit program, and nothing
+/// in it suggests a limit below the field width -- the vendor never splits
+/// the kernel set for capacity at any point measured. The cap is set at the
+/// measured extent rather than the encodable one, on the same principle as
+/// `MAX_INPUT_CHANNELS`.
+pub const MAX_OUTPUT_CHANNELS: u32 = 512;
+
+/// Granularity the DPU's output-channel count is rounded up to.
+///
+/// Four registers -- `CORE_DATAOUT_SIZE_1.dataout_channel`,
+/// `DPU_DATA_CUBE_CHANNEL.channel`, `DPU_RDMA_RDMA_DATA_CUBE_CHANNEL.channel`
+/// and `DPU_WDMA_SIZE_0.channel_wdma` -- carry this padded count while
+/// `weight_kernels` and `orig_channel` carry the true one. Unlike the input
+/// channel padding, this is a clean rule with no table and no exceptions:
+/// verified at every Cout in the corpus, including the awkward 20, 24, 28,
+/// 40, 56 and 72 where the input padding needed special cases.
+const OUTPUT_CHANNEL_GRANULE: u32 = 16;
 
 /// Physical width of one feature atom.
 const FEATURE_ATOM_BYTES: u32 = 16;
 
 /// Total CBUF banks the CNA partitions between feature data and weights.
 const CBUF_BANKS: u32 = 12;
+
+/// Bytes one CBUF bank holds: 256 entries of 128 bytes.
+const CBUF_BANK_BYTES: u32 = 256 * 128;
 
 /// Largest value `CNA_CBUF_CON1.data_entries` can encode. The field is 14
 /// bits and holds `tile_input_rows * width`, so it is a hard bound on how
@@ -172,6 +196,12 @@ pub struct Shape {
     pub stride: u32,
     /// Real input channels, before any padding.
     pub in_channels: u32,
+    /// Real output channels, before any padding. Programmed directly into
+    /// `CNA_WEIGHT_SIZE2.weight_kernels` and
+    /// `DPU_DATA_CUBE_CHANNEL.orig_channel` with no rounding at all: the
+    /// corpus confirms 23 distinct values from 1 to 512, including 9, 14,
+    /// 20, 28, 40, 56 and 72.
+    pub out_channels: u32,
 }
 
 /// How the feature map is laid out in memory, which the channel count picks.
@@ -191,6 +221,7 @@ impl Shape {
         height: IMAGE_HEIGHT,
         stride: 1,
         in_channels: INPUT_CHANNELS,
+        out_channels: OUTPUT_CHANNELS,
     };
 
     pub fn new(width: u32, height: u32) -> Shape {
@@ -202,6 +233,16 @@ impl Shape {
     }
 
     pub fn with_channels(width: u32, height: u32, stride: u32, in_channels: u32) -> Shape {
+        Shape::with_out_channels(width, height, stride, in_channels, OUTPUT_CHANNELS)
+    }
+
+    pub fn with_out_channels(
+        width: u32,
+        height: u32,
+        stride: u32,
+        in_channels: u32,
+        out_channels: u32,
+    ) -> Shape {
         assert!(
             width > 0 && height > 0,
             "convolution extents must be nonzero"
@@ -212,11 +253,17 @@ impl Shape {
             "input channels must be 1..={MAX_INPUT_CHANNELS}; beyond that the \
              channel padding has no capture backing"
         );
+        assert!(
+            (1..=MAX_OUTPUT_CHANNELS).contains(&out_channels),
+            "output channels must be 1..={MAX_OUTPUT_CHANNELS}, the range the \
+             capture corpus covers and the 14-bit weight_kernels field encodes"
+        );
         Shape {
             width,
             height,
             stride,
             in_channels,
+            out_channels,
         }
     }
 
@@ -233,6 +280,30 @@ impl Shape {
     /// Channel count the coefficient footprint is computed from.
     pub fn weight_channels(&self) -> u32 {
         CHANNEL_PADDING[self.feature_atoms() as usize - 1].1
+    }
+
+    /// Output channel count the DPU is programmed with, rounded up to a
+    /// whole [`OUTPUT_CHANNEL_GRANULE`] and never below one.
+    ///
+    /// The floor is what makes Cout 8 and Cout 16 program the same value,
+    /// which is why the shape-only corpus -- fixed at Cout 8 -- could not
+    /// distinguish this from the true count.
+    pub fn padded_out_channels(&self) -> u32 {
+        self.out_channels
+            .next_multiple_of(OUTPUT_CHANNEL_GRANULE)
+            .max(OUTPUT_CHANNEL_GRANULE)
+    }
+
+    /// Bytes of fp16 coefficients the whole kernel set occupies.
+    ///
+    /// `weight_channels * k * k * Cout * 2`, which reproduces
+    /// `CNA_WEIGHT_SIZE0.weight_bytes` in all 829 programs of the corpus.
+    /// Note the *padded* input channel count, and specifically the weight
+    /// padding rather than the data padding -- at three atoms the two differ,
+    /// and it is the weight one that this follows.
+    pub fn weight_bytes(&self, kernels: Kernels) -> u32 {
+        let kernel = kernel_programming(kernels);
+        kernel.size * kernel.size * self.weight_channels() * self.out_channels * 2
     }
 
     /// Atoms per pixel implied by the weight padding, which is what the CBUF
@@ -280,22 +351,26 @@ impl Shape {
         self.width * self.height * FEATURE_ATOM_BYTES
     }
 
-    /// Byte stride of one output row. Output geometry, not input: at stride
-    /// greater than one the two differ, and the corpus programs the output
-    /// dimensions in every one of 150 such programs.
+    /// Byte stride of one output row.
+    ///
+    /// The output is always NC1HWC2 with one 16-byte atom per pixel per
+    /// surface, so this does not depend on `Cout` -- the channel count sets
+    /// how many surfaces there are, not how wide a row is. Output geometry,
+    /// not input: at stride greater than one the two differ, and the corpus
+    /// programs the output dimensions in every one of 150 such programs.
     pub fn output_row_stride(&self, kernels: Kernels) -> u32 {
-        self.output_width(kernels) * OUTPUT_CHANNELS * 2
+        self.output_width(kernels) * FEATURE_ATOM_BYTES
     }
 
-    /// CBUF banks the vendor assigns to feature data.
+    /// CBUF banks the feature data would take if nothing competed for them.
     ///
     /// Derived from 134 captured programs across 11 distinct `(width,
-    /// height)` shapes, every one of which also satisfies
-    /// `data_banks + weight_banks == 12`. The cap at 11 leaves one bank for
-    /// weights, which no capture goes below.
-    pub fn data_banks(&self) -> u32 {
+    /// height)` shapes. Deliberately uncapped: a demand above the 12 banks
+    /// that exist is meaningful, because it is what makes the weights the
+    /// smaller claim in [`data_banks`].
+    fn data_bank_demand(&self) -> u32 {
         let pixels = self.width * self.height;
-        let step = match self.layout() {
+        match self.layout() {
             FeatureLayout::Dense => pixels.div_ceil(PIXELS_PER_BANK_STEP),
             // Surfaces charge per atom, at twice the pixels per step. Fits
             // every measured point: at 32x32 this is `ceil(atoms / 2)`,
@@ -303,31 +378,87 @@ impl Shape {
             FeatureLayout::Surfaces => {
                 (pixels * self.weight_atoms()).div_ceil(2 * PIXELS_PER_BANK_STEP)
             }
-        };
-        step.clamp(1, CBUF_BANKS - 1)
+        }
+        .max(1)
     }
 
-    /// CBUF banks the vendor assigns to weights.
-    pub fn weight_banks(&self) -> u32 {
-        CBUF_BANKS - self.data_banks()
+    /// CBUF banks the weights would take if nothing competed for them.
+    ///
+    /// Weights are streamed rather than held resident -- a 512-kernel
+    /// program with 589824 bytes of coefficients runs with 8 banks, which
+    /// hold 262144 -- so exceeding the CBUF is not an error. Like the data
+    /// demand, this stays uncapped so the comparison below can see it.
+    fn weight_bank_demand(&self, kernels: Kernels) -> u32 {
+        self.weight_bytes(kernels).div_ceil(CBUF_BANK_BYTES).max(1)
+    }
+
+    /// CBUF banks the vendor assigns to feature data.
+    ///
+    /// The two claimants split all 12 banks: every capture satisfies
+    /// `data_banks + weight_banks == 12`. When they fit together each takes
+    /// what it asked for; when they do not, the *smaller* claim is honoured
+    /// in full and the larger takes the remainder. Both halves of that are
+    /// measured -- 256x32 Cin 32 Cout 64 wants 16 data banks and 2 weight
+    /// banks and is programmed 10/2, while 32x32 Cin 64 Cout 512 wants 4 and
+    /// 18 and is programmed 4/8.
+    ///
+    /// This is the only path by which `Cout` reaches the bank split, and it
+    /// opens only once the feature data is already over budget. The corpus
+    /// shows it exactly once: at 256x32 with Cin 32, Cout 16 needs 9216
+    /// bytes of coefficients and takes one bank, Cout 64 needs 36864 and
+    /// takes two, pushing the data allocation from 11 banks down to 10.
+    pub fn data_banks(&self, kernels: Kernels) -> u32 {
+        let data = self.data_bank_demand();
+        let weights = self.weight_bank_demand(kernels);
+        let granted = if data <= weights {
+            data
+        } else {
+            data.min(CBUF_BANKS.saturating_sub(weights))
+        };
+        granted.clamp(1, CBUF_BANKS - 1)
+    }
+
+    /// CBUF banks the vendor assigns to weights: everything left over.
+    pub fn weight_banks(&self, kernels: Kernels) -> u32 {
+        CBUF_BANKS - self.data_banks(kernels)
     }
 
     /// Most input rows one program may read.
     ///
-    /// Two bounds apply and the vendor's is the tighter one. The hard limit
-    /// is the 14-bit `CNA_CBUF_CON1.data_entries` field, which holds
-    /// `rows * width`. The vendor never approaches it: across the width
-    /// sweep it keeps `rows * width` within `data_banks * 1024`, which
-    /// predicts its largest tile exactly at every width measured -- 32 rows
-    /// at 256 wide, 22 at 512, 14 at 768, 11 at 1024, 7 at 1536.
+    /// Two bounds apply and the CBUF one is the tighter. The hard limit is
+    /// the 14-bit `CNA_CBUF_CON1.data_entries` field, which holds
+    /// `rows * width`; the vendor never approaches it.
     ///
-    /// Hardware tolerates the looser bound (`conv_wide_shape_hw` passes at
-    /// ~33 rows on a 256-wide map, above the vendor's 32), so this is
-    /// conservatism rather than a correctness requirement -- the same
-    /// pattern as `feature_grains`. The vendor rule is used anyway.
-    pub fn max_tile_input_rows(&self) -> u32 {
-        let vendor = self.data_banks() * PIXELS_PER_BANK_STEP / self.width;
-        vendor.min(MAX_DATA_ENTRIES / self.width).max(1)
+    /// The CBUF bound is the inverse of [`data_bank_demand`]: a bank holds
+    /// 1024 dense pixels or 2048 pixel-atoms, so the rows that fit are
+    /// whatever the banks granted can carry *at this shape's cost per
+    /// pixel*. Charging one atom per pixel unconditionally -- which is what
+    /// this did while every capture backing it had `Cin = 3` -- is right in
+    /// the dense regime and over-optimistic by a factor of `weight_atoms` in
+    /// the surface one. `conv_outchannel_hw` caught it at 256x32 with
+    /// `Cin = 32`, where the old rule allowed 44 rows against a real
+    /// capacity of 22 and the tile silently lost its last input rows.
+    ///
+    /// Predicts the vendor's own largest single-core tile in all 17 corpus
+    /// captures that split, against 12 for the atom-blind version: 32 rows
+    /// at 256 wide with `Cin` 3, 22 at 512, 14 at 768, 11 at 1024, 7 at
+    /// 1536, and 22 at 256 wide with `Cin` 32 -- dropping to 20 when a
+    /// larger `Cout` takes a second bank for coefficients.
+    ///
+    /// Hardware tolerates the looser bound in the dense regime
+    /// (`conv_wide_shape_hw` passes at ~33 rows on a 256-wide map, above the
+    /// vendor's 32), so there it is conservatism rather than a correctness
+    /// requirement -- the same pattern as `feature_grains`. In the surface
+    /// regime it is a correctness requirement.
+    pub fn max_tile_input_rows(&self, kernels: Kernels) -> u32 {
+        let banks = self.data_banks(kernels);
+        let capacity = match self.layout() {
+            FeatureLayout::Dense => banks * PIXELS_PER_BANK_STEP / self.width,
+            FeatureLayout::Surfaces => {
+                2 * banks * PIXELS_PER_BANK_STEP / (self.width * self.weight_atoms())
+            }
+        };
+        capacity.min(MAX_DATA_ENTRIES / self.width).max(1)
     }
 
     /// Fewest tiles this shape must be split into to stay encodable.
@@ -337,7 +468,10 @@ impl Shape {
     /// than discovered as an overflow inside the builder.
     pub fn min_tiles(&self, kernels: Kernels) -> u32 {
         let halo = 2 * kernel_programming(kernels).padding;
-        let rows = self.max_tile_input_rows().saturating_sub(halo).max(1);
+        let rows = self
+            .max_tile_input_rows(kernels)
+            .saturating_sub(halo)
+            .max(1);
         // A tile of `r` output rows reads about `r * stride` input rows.
         let output_rows = rows.div_ceil(self.stride).max(1);
         self.output_height(kernels).div_ceil(output_rows)
@@ -526,15 +660,18 @@ pub fn conv_2d_tile_with_grains(
 ) -> Vec<RegCmd> {
     let padded_channels = shape.padded_channels();
     let weight_channels = shape.weight_channels();
-    const TASK_OUTPUT_CHANNELS: u32 = 16;
+    // The DPU counts output channels in whole granules while the CNA counts
+    // the real kernels. Both appear below, and they differ at every Cout
+    // that is not already a multiple of 16.
+    let padded_out_channels = shape.padded_out_channels();
     const FP16_BYTES: u32 = 2;
 
     let width = shape.width;
     let height = shape.height;
     let out_width = shape.output_width(kernels);
     let out_height = shape.output_height(kernels);
-    let weight_banks = shape.weight_banks();
-    let data_banks = shape.data_banks();
+    let weight_banks = shape.weight_banks(kernels);
+    let data_banks = shape.data_banks(kernels);
 
     assert!(
         tile.out_rows > 0 && tile.out_first + tile.out_rows <= out_height,
@@ -574,7 +711,7 @@ pub fn conv_2d_tile_with_grains(
     };
 
     let weight_bytes_per_kernel = kernel.size * kernel.size * weight_channels * FP16_BYTES;
-    let weight_bytes = weight_bytes_per_kernel * OUTPUT_CHANNELS;
+    let weight_bytes = shape.weight_bytes(kernels);
     let mut commands = Vec::with_capacity(136);
 
     // CNA preamble, followed by the DPU/DPU_RDMA ping-pong pointers.
@@ -678,7 +815,7 @@ pub fn conv_2d_tile_with_grains(
         Register::<CnaWeightSize2>::new()
             .weight_width(Bits::new(kernel.size))
             .weight_height(Bits::new(kernel.size))
-            .weight_kernels(Bits::new(OUTPUT_CHANNELS))
+            .weight_kernels(Bits::new(shape.out_channels))
             .build(),
     );
     commands.push(cbuf_con0.build());
@@ -795,7 +932,7 @@ pub fn conv_2d_tile_with_grains(
     );
     commands.push(
         Register::<CoreDataoutSize1>::new()
-            .dataout_channel(Bits::new(TASK_OUTPUT_CHANNELS - 1))
+            .dataout_channel(Bits::new(padded_out_channels - 1))
             .build(),
     );
     commands.push(zero::<CoreClipTruncate>());
@@ -839,8 +976,8 @@ pub fn conv_2d_tile_with_grains(
     commands.push(zero::<DpuDataCubeNotchAddr>());
     commands.push(
         Register::<DpuDataCubeChannel>::new()
-            .orig_channel(Bits::new(OUTPUT_CHANNELS - 1))
-            .channel(Bits::new(TASK_OUTPUT_CHANNELS - 1))
+            .orig_channel(Bits::new(shape.out_channels - 1))
+            .channel(Bits::new(padded_out_channels - 1))
             .build(),
     );
     commands.push(
@@ -865,7 +1002,7 @@ pub fn conv_2d_tile_with_grains(
     commands.push(zero::<DpuBsOwOp>());
     commands.push(
         Register::<DpuWdmaSize0>::new()
-            .channel_wdma(Bits::new(TASK_OUTPUT_CHANNELS - 1))
+            .channel_wdma(Bits::new(padded_out_channels - 1))
             .build(),
     );
     commands.push(
@@ -950,7 +1087,7 @@ pub fn conv_2d_tile_with_grains(
     );
     commands.push(
         Register::<DpuRdmaDataCubeChannel>::new()
-            .channel(Bits::new(TASK_OUTPUT_CHANNELS - 1))
+            .channel(Bits::new(padded_out_channels - 1))
             .build(),
     );
     commands.push(zero::<DpuRdmaSrcBaseAddr>());
@@ -1314,12 +1451,12 @@ mod tests {
         for (width, height, data_bank) in OBSERVED {
             let shape = Shape::new(width, height);
             assert_eq!(
-                shape.data_banks(),
+                shape.data_banks([3, 3]),
                 data_bank,
                 "data_bank for {width}x{height}"
             );
             assert_eq!(
-                shape.data_banks() + shape.weight_banks(),
+                shape.data_banks([3, 3]) + shape.weight_banks([3, 3]),
                 12,
                 "bank split for {width}x{height} must cover all 12 CBUF banks"
             );
@@ -1332,7 +1469,7 @@ mod tests {
         // 256 wide caps a tile at 44 input rows by the vendor's own CBUF
         // rule (11 data banks x 1024 pixels / 256), so 64 rows need two.
         let shape = Shape::new(256, 64);
-        assert_eq!(shape.max_tile_input_rows(), 44);
+        assert_eq!(shape.max_tile_input_rows([3, 3]), 44);
         assert_eq!(shape.min_tiles([3, 3]), 2);
 
         let split = Tile::split(shape, [3, 3], 2);
@@ -1372,7 +1509,7 @@ mod tests {
         for (width, rows) in [(256u32, 32u32), (512, 22), (768, 14), (1024, 11), (1536, 7)] {
             let shape = Shape::new(width, 32);
             assert_eq!(
-                shape.max_tile_input_rows(),
+                shape.max_tile_input_rows([3, 3]),
                 rows,
                 "max tile rows at {width} wide"
             );
@@ -1528,16 +1665,16 @@ mod tests {
             (80, 5),
         ] {
             assert_eq!(
-                Shape::with_channels(32, 32, 1, cin).data_banks(),
+                Shape::with_channels(32, 32, 1, cin).data_banks([3, 3]),
                 banks,
                 "data_bank at Cin {cin}"
             );
         }
         // Dense stays on the pixel rule it was derived with.
-        assert_eq!(Shape::with_channels(128, 32, 1, 3).data_banks(), 4);
-        assert_eq!(Shape::with_channels(128, 32, 1, 4).data_banks(), 4);
+        assert_eq!(Shape::with_channels(128, 32, 1, 3).data_banks([3, 3]), 4);
+        assert_eq!(Shape::with_channels(128, 32, 1, 4).data_banks([3, 3]), 4);
         // ...and the surface rule diverges immediately at the boundary.
-        assert_eq!(Shape::with_channels(128, 32, 1, 8).data_banks(), 2);
+        assert_eq!(Shape::with_channels(128, 32, 1, 8).data_banks([3, 3]), 2);
     }
 
     #[test]
@@ -1550,7 +1687,7 @@ mod tests {
         assert_eq!(value_of::<CnaDmaCon2>(&program), 3584);
         assert_eq!(value_of::<CnaCbufCon1>(&program), 64);
         assert_eq!(value_of::<CnaDataSize1>(&program) & 0xffff, 16);
-        assert_eq!(shape.data_banks(), 4);
+        assert_eq!(shape.data_banks([3, 3]), 4);
         // Weight footprint follows the weight padding, not datain_channel.
         assert_eq!(value_of::<CnaWeightSize1>(&program), 9 * 16 * 2);
         assert_eq!(value_of::<CnaWeightSize0>(&program), 9 * 16 * 2 * 8);
@@ -1568,6 +1705,143 @@ mod tests {
     #[should_panic(expected = "input channels must be")]
     fn rejects_channels_beyond_the_validated_range() {
         let _ = Shape::with_channels(32, 32, 1, 96);
+    }
+
+    #[test]
+    fn output_channels_pad_to_whole_granules() {
+        // Every value the corpus covers. Unlike the input padding this is a
+        // rule rather than a table: no exceptions at 20, 24, 40, 56 or 72,
+        // the values where the input padding needed them.
+        for (out_channels, padded) in [
+            (1u32, 16u32),
+            (2, 16),
+            (8, 16),
+            (14, 16),
+            (16, 16),
+            (20, 32),
+            (24, 32),
+            (28, 32),
+            (32, 32),
+            (40, 48),
+            (48, 48),
+            (56, 64),
+            (64, 64),
+            (72, 80),
+            (80, 80),
+            (96, 96),
+            (128, 128),
+            (256, 256),
+            (512, 512),
+        ] {
+            let shape = Shape::with_out_channels(32, 32, 1, 3, out_channels);
+            assert_eq!(
+                shape.padded_out_channels(),
+                padded,
+                "padded output channels at Cout {out_channels}"
+            );
+        }
+    }
+
+    #[test]
+    fn output_channel_registers_match_the_captures() {
+        // conv-w32-h32-k3-s1-ci3-co40, single-core plan: weight_bytes 5760,
+        // weight_kernels 40, orig_channel 39, and the four padded-count
+        // registers 47 -- Cout 40 rounds to 48. Cout 40 is chosen because
+        // every one of those five numbers is distinct there.
+        let shape = Shape::with_out_channels(32, 32, 1, 3, 40);
+        let program = conv_2d_tile(shape, [3, 3], &Tile::whole(shape, [3, 3]));
+        assert_eq!(value_of::<CnaWeightSize0>(&program), 5760);
+        assert_eq!(value_of::<CnaWeightSize1>(&program), 144);
+        assert_eq!(value_of::<CnaWeightSize2>(&program), 50_528_296);
+        assert_eq!(value_of::<DpuDataCubeChannel>(&program), 2_555_951);
+        assert_eq!(value_of::<DpuWdmaSize0>(&program), 47);
+        assert_eq!(value_of::<CoreDataoutSize1>(&program), 47);
+
+        // The output is NC1HWC2 regardless of Cout: the channel count sets
+        // how many 8-channel surfaces there are, not how wide a row is, so
+        // both output strides are the same as the Cout 8 capture's.
+        assert_eq!(value_of::<DpuDstSurfStride>(&program), 32 * 32 * 16);
+
+        // Cout 9 is the smallest value where the true and padded counts
+        // differ by more than the granule rounding of a multiple of 8.
+        let odd = Shape::with_out_channels(32, 32, 1, 3, 9);
+        let odd_program = conv_2d_tile(odd, [3, 3], &Tile::whole(odd, [3, 3]));
+        assert_eq!(value_of::<CnaWeightSize0>(&odd_program), 1296);
+        assert_eq!(value_of::<DpuDataCubeChannel>(&odd_program), 524_303);
+        assert_eq!(value_of::<DpuWdmaSize0>(&odd_program), 15);
+    }
+
+    #[test]
+    fn output_channels_reach_the_bank_split_only_through_the_weight_footprint() {
+        // The one place in the corpus where Cout moves the CBUF allocation.
+        // At 256x32 with Cin 32 the feature data wants 16 banks and cannot
+        // have them, so whatever the weights take comes straight off it.
+        let narrow = Shape::with_out_channels(256, 32, 1, 32, 16);
+        assert_eq!(narrow.weight_bytes([3, 3]), 9216); // one bank
+        assert_eq!(narrow.data_banks([3, 3]), 11);
+        assert_eq!(narrow.weight_banks([3, 3]), 1);
+
+        let wide = Shape::with_out_channels(256, 32, 1, 32, 64);
+        assert_eq!(wide.weight_bytes([3, 3]), 36864); // two banks
+        assert_eq!(wide.data_banks([3, 3]), 10);
+        assert_eq!(wide.weight_banks([3, 3]), 2);
+
+        // Where the data is *not* over budget, a bigger kernel set changes
+        // nothing: the weights are taking slack that was already theirs.
+        for out_channels in [8u32, 16, 64, 128] {
+            let shape = Shape::with_out_channels(32, 32, 1, 3, out_channels);
+            assert_eq!(
+                shape.data_banks([3, 3]),
+                1,
+                "32x32 Cin 3 keeps one data bank at Cout {out_channels}"
+            );
+        }
+
+        // And when the weights are the larger claim they are the ones cut
+        // short: 589824 bytes want 18 banks, more than the CBUF holds, but
+        // the feature data still gets the 4 it asked for.
+        let huge = Shape::with_out_channels(32, 32, 1, 64, 512);
+        assert_eq!(huge.weight_bytes([3, 3]), 589_824);
+        assert_eq!(huge.data_banks([3, 3]), 4);
+        assert_eq!(huge.weight_banks([3, 3]), 8);
+    }
+
+    #[test]
+    #[should_panic(expected = "output channels must be")]
+    fn rejects_output_channels_beyond_the_validated_range() {
+        let _ = Shape::with_out_channels(32, 32, 1, 3, 513);
+    }
+
+    #[test]
+    fn tile_capacity_charges_surfaces_per_atom() {
+        // A surface pixel costs `weight_atoms` times what a dense one does,
+        // so the same bank allocation carries proportionally fewer rows.
+        // Charging one atom per pixel here let a 256x32 Cin 32 tile claim 44
+        // rows against a real capacity of 22, and the hardware quietly
+        // dropped the rows past the end -- the taps below the cut came back
+        // as if they were off the bottom of the image.
+        let narrow = Shape::with_out_channels(256, 32, 1, 32, 16);
+        assert_eq!(narrow.data_banks([3, 3]), 11);
+        assert_eq!(narrow.max_tile_input_rows([3, 3]), 22);
+        assert_eq!(narrow.min_tiles([3, 3]), 2);
+
+        // The same shape with a kernel set big enough to take a second bank
+        // for coefficients loses two rows of capacity with it. Both numbers
+        // are the vendor's own split: 22/12 rows here, 20/14 below.
+        let wide = Shape::with_out_channels(256, 32, 1, 32, 64);
+        assert_eq!(wide.data_banks([3, 3]), 10);
+        assert_eq!(wide.max_tile_input_rows([3, 3]), 20);
+        assert_eq!(wide.min_tiles([3, 3]), 2);
+
+        // The dense regime is unchanged: one atom per pixel is correct there,
+        // which is why the Cin 3 width sweep never saw this.
+        for (width, rows) in [(256u32, 32u32), (512, 22), (768, 14), (1024, 11), (1536, 7)] {
+            assert_eq!(
+                Shape::new(width, 32).max_tile_input_rows([3, 3]),
+                rows,
+                "dense capacity at {width} wide"
+            );
+        }
     }
 
     #[test]

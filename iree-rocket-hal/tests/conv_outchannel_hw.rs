@@ -1,4 +1,4 @@
-//! Hardware validation of convolutions with more than four input channels.
+//! Hardware validation of convolutions with more than eight output channels.
 //!
 //! This test is ignored on the development host because it needs the RK3588
 //! NPU device. Cross-compile it, copy the printed test binary to the board,
@@ -6,33 +6,40 @@
 //!
 //!   CARGO_TARGET_AARCH64_UNKNOWN_LINUX_GNU_LINKER=aarch64-linux-gnu-gcc \
 //!     cargo test --target aarch64-unknown-linux-gnu --release \
-//!       --test conv_multichannel_hw --no-run
+//!       --test conv_outchannel_hw --no-run
 //!
-//!   ./conv_multichannel_hw-<hash> --ignored --nocapture
+//!   ./conv_outchannel_hw-<hash> --ignored --nocapture
 //!
-//! # Why this is separate
+//! # What this is checking
 //!
-//! Every earlier convolution test feeds a dense NHWC buffer, which is what
-//! the vendor uses while a pixel fits in half a feature atom -- `Cin` up to
-//! 4. From `Cin` 5 the feature map becomes NC1HWC2 surfaces: one 16-byte
-//! atom per pixel per surface, surfaces `width * height * 16` bytes apart.
-//! The input has to be packed accordingly, so the buffer setup differs
-//! enough from the dense tests to keep apart.
+//! `Cout` splits across two register groups. The CNA counts real kernels
+//! (`weight_kernels`, and `weight_bytes` scaled by them) while the DPU counts
+//! whole 16-channel granules (`dataout_channel`, `data_cube_channel.channel`,
+//! the RDMA's copy of it, and `channel_wdma`), with `orig_channel` the odd one
+//! out on the DPU side carrying the true count. Getting the two mixed up is
+//! invisible at `Cout` 8 and 16, where the padded value is 16 either way --
+//! which is exactly the range every earlier test covers.
+//!
+//! The second thing under test is the CBUF split. `Cout` reaches it only
+//! through the coefficient footprint, and only when the feature data is
+//! already asking for more banks than exist. The corpus contains one such
+//! shape and it is included below.
 //!
 //! # What makes the check independent of coefficient order
 //!
-//! Real channels are filled with 1.0 and every padding channel with zero,
-//! and all weights are 1.0. Each output is then exactly the number of real
-//! input channels times the taps that landed inside the image, whatever
-//! order the hardware walks the coefficients in, because the padding
-//! channels contribute nothing. Values stay small enough to be exact in
-//! fp16 -- the largest here is `80 * 9 = 720`.
+//! Real input channels are filled with 1.0 and every padding channel with
+//! zero, and all weights are 1.0. Each output is then exactly the number of
+//! real input channels times the taps that landed inside the image, whatever
+//! order the hardware walks the coefficients in. That holds per output
+//! channel too, so every real output channel must carry the same value --
+//! and a program that miscounts them writes some of them not at all, which
+//! shows up as a zero rather than a wrong number.
+//!
+//! Values stay exact in fp16: the largest here is `32 * 9 = 288`.
 //!
 //! # Scope
 //!
-//! `Cout=8`, stride 1, 1x1 and 3x3 kernels, `Cin` 1..=80. The channel
-//! padding beyond 80 has no capture backing and `Shape::with_channels`
-//! rejects it.
+//! `Cout` 1..=128, `Cin` 3..=32, stride 1, 1x1 and 3x3 kernels.
 
 use std::{fs::OpenOptions, mem, os::unix::io::AsRawFd, ptr};
 
@@ -48,7 +55,6 @@ use iree_rocket_hal::rocket::{
 };
 
 const DEVICE_PATH: &str = "/dev/accel/accel0";
-const OUTPUT_CHANNELS: usize = 8;
 const FP16_BYTES: usize = 2;
 const FEATURE_ATOM_BYTES: usize = 16;
 const CHANNELS_PER_ATOM: usize = 8;
@@ -104,10 +110,6 @@ fn valid_taps(coordinate: usize, extent: usize, kernel: usize) -> usize {
 }
 
 /// Writes the input feature map, real channels 1.0 and padding zero.
-///
-/// Surfaces are allocated from the *weight* padding rather than
-/// `datain_channel`, because the two disagree at three atoms and allocating
-/// the larger of them satisfies either reading.
 unsafe fn fill_input(base: *mut u8, size: usize, shape: Shape, surfaces: usize) {
     unsafe {
         ptr::write_bytes(base, 0, size);
@@ -149,13 +151,16 @@ fn run(shape: Shape, kernels: Kernels, tiles: u32) -> Result<(), Failure> {
     let height = shape.height as usize;
     let out_width = shape.output_width(kernels) as usize;
     let out_height = shape.output_height(kernels) as usize;
-    let surfaces = (shape.weight_channels() / 8) as usize;
+    let in_surfaces = (shape.weight_channels() / 8) as usize;
+    // The DPU writes whole granules, so the destination has to hold the
+    // padded channel count even when the caller only wants `out_channels`.
+    let out_surfaces = (shape.padded_out_channels() / 8) as usize;
 
     let input_bytes = match shape.layout() {
         FeatureLayout::Dense => width * height * shape.in_channels as usize * FP16_BYTES,
-        FeatureLayout::Surfaces => surfaces * width * height * FEATURE_ATOM_BYTES,
+        FeatureLayout::Surfaces => in_surfaces * width * height * FEATURE_ATOM_BYTES,
     };
-    let output_bytes = out_width * out_height * FEATURE_ATOM_BYTES * 2;
+    let output_bytes = out_surfaces * out_width * out_height * FEATURE_ATOM_BYTES;
 
     let file = OpenOptions::new()
         .read(true)
@@ -166,15 +171,12 @@ fn run(shape: Shape, kernels: Kernels, tiles: u32) -> Result<(), Failure> {
 
     unsafe {
         let buf_input = Buffer::new(fd, page_aligned_size(input_bytes), &file);
-        fill_input(buf_input.host_ptr, buf_input.size, shape, surfaces);
+        fill_input(buf_input.host_ptr, buf_input.size, shape, in_surfaces);
 
-        // Coefficients cover the padded channel count, all ones. Padding
-        // channels multiply zeroed input, so they contribute nothing.
-        let weight_bytes = kernels[0]
-            * kernels[1]
-            * shape.weight_channels() as usize
-            * OUTPUT_CHANNELS
-            * FP16_BYTES;
+        // Coefficients cover the padded input channel count and the real
+        // output count, all ones. Padding channels multiply zeroed input, so
+        // they contribute nothing.
+        let weight_bytes = shape.weight_bytes(kernels) as usize;
         let buf_weights = Buffer::new(fd, page_aligned_size(weight_bytes), &file);
         ptr::write_bytes(buf_weights.host_ptr, 0, buf_weights.size);
         std::slice::from_raw_parts_mut(buf_weights.host_ptr as *mut u16, weight_bytes / 2)
@@ -258,8 +260,15 @@ fn run(shape: Shape, kernels: Kernels, tiles: u32) -> Result<(), Failure> {
                 let want = (shape.in_channels as usize
                     * valid_taps(y * stride, height, kernels[0])
                     * valid_taps(x * stride, width, kernels[1])) as f32;
-                for channel in 0..OUTPUT_CHANNELS {
-                    let offset = (y * out_width + x) * FEATURE_ATOM_BYTES + channel * FP16_BYTES;
+                // Only the real output channels are checked. What the
+                // hardware leaves in the padding lanes of the last granule
+                // is not something the vendor captures constrain.
+                for channel in 0..shape.out_channels as usize {
+                    let surface = channel / CHANNELS_PER_ATOM;
+                    let lane = channel % CHANNELS_PER_ATOM;
+                    let offset = surface * out_width * out_height * FEATURE_ATOM_BYTES
+                        + (y * out_width + x) * FEATURE_ATOM_BYTES
+                        + lane * FP16_BYTES;
                     let got = f16_to_f32(u16::from_le_bytes([raw[offset], raw[offset + 1]]));
                     if got != want {
                         failure.mismatches += 1;
@@ -293,47 +302,79 @@ fn run(shape: Shape, kernels: Kernels, tiles: u32) -> Result<(), Failure> {
     }
 }
 
+fn attempt(shape: Shape, kernels: Kernels, failures: &mut Vec<String>) {
+    let tiles = shape.min_tiles(kernels);
+    let label = format!(
+        "Cin {:>2} Cout {:>3} {}x{} {kernels:?}",
+        shape.in_channels, shape.out_channels, shape.width, shape.height
+    );
+    match run(shape, kernels, tiles) {
+        Ok(()) => println!(
+            "  ok   {label} {tiles} tile(s)  padded {} banks d{}/w{}  weights {}B",
+            shape.padded_out_channels(),
+            shape.data_banks(kernels),
+            shape.weight_banks(kernels),
+            shape.weight_bytes(kernels),
+        ),
+        Err(failure) => {
+            println!(
+                "  FAIL {label} {tiles} tile(s)  {} mismatches",
+                failure.mismatches
+            );
+            for sample in &failure.samples {
+                println!("         {sample}");
+            }
+            failures.push(label);
+        }
+    }
+}
+
 #[test]
 #[ignore = "needs /dev/accel/accel0 -- cross-compile for aarch64 and run on the RK3588 board"]
-fn multi_channel_convs_run_on_npu() {
-    // Channel counts chosen to cover both sides of the dense/surface
-    // boundary, every distinct padding row in the table, and both of the
-    // measured exceptions: Cin 20 and 24 pad their coefficients to 32 while
-    // datain_channel stays 24, and Cin 56 rounds both up to 64.
-    const CHANNELS: [u32; 12] = [3, 4, 5, 8, 12, 16, 20, 24, 32, 40, 56, 64];
+fn multi_output_channel_convs_run_on_npu() {
+    // Values chosen so that the true and padded counts disagree in every way
+    // they can: below one granule (1, 3), exactly one (8, 16), and each of
+    // the ragged points between granules (9, 20, 40, 56, 72). 8 and 16 are
+    // kept as the controls -- they are the only ones earlier tests covered.
+    const OUT_CHANNELS: [u32; 12] = [1, 3, 8, 9, 16, 20, 32, 40, 48, 56, 64, 128];
 
     let mut failures = Vec::new();
-    for cin in CHANNELS {
+    for cout in OUT_CHANNELS {
         for kernels in [[1usize, 1], [3, 3]] {
-            let shape = Shape::with_channels(64, 32, 1, cin);
-            let tiles = shape.min_tiles(kernels);
-            match run(shape, kernels, tiles) {
-                Ok(()) => println!(
-                    "  ok   Cin {cin:>3} {kernels:?} {tiles} tile(s)  {:?}  \
-                     dchan {} weights {} banks d{}",
-                    shape.layout(),
-                    shape.padded_channels(),
-                    shape.weight_channels(),
-                    shape.data_banks(kernels),
-                ),
-                Err(failure) => {
-                    println!(
-                        "  FAIL Cin {cin:>3} {kernels:?} {tiles} tile(s)  {:?}  {} mismatches",
-                        shape.layout(),
-                        failure.mismatches
-                    );
-                    for sample in &failure.samples {
-                        println!("         {sample}");
-                    }
-                    failures.push(format!("Cin {cin} {kernels:?}"));
-                }
-            }
+            attempt(
+                Shape::with_out_channels(64, 32, 1, 8, cout),
+                kernels,
+                &mut failures,
+            );
         }
+    }
+
+    // A dense input at a large kernel count: the ARGB path and the output
+    // granule padding have never been exercised together.
+    for cout in [16u32, 40, 128] {
+        attempt(
+            Shape::with_out_channels(64, 32, 1, 3, cout),
+            [3, 3],
+            &mut failures,
+        );
+    }
+
+    // The one shape in the corpus where Cout moves the CBUF bank split: at
+    // 256x32 with Cin 32 the feature data wants 16 banks, so the two extra
+    // banks the Cout 64 coefficients need come straight off it (11/1 at
+    // Cout 16, 10/2 at Cout 64). Both sides are run so a regression in the
+    // contention rule cannot pass by accident.
+    for cout in [16u32, 64] {
+        attempt(
+            Shape::with_out_channels(256, 32, 1, 32, cout),
+            [3, 3],
+            &mut failures,
+        );
     }
 
     assert!(
         failures.is_empty(),
-        "{} channel counts produced wrong output: {}",
+        "{} configuration(s) produced wrong output: {}",
         failures.len(),
         failures.join(", ")
     );

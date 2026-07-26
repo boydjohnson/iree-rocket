@@ -308,9 +308,9 @@ fn shape_generalised_convs_run_on_npu() {
                          out {}x{}  banks d{}/w{}  max_rows {}",
                         shape.output_width(kernels),
                         shape.output_height(kernels),
-                        shape.data_banks(),
-                        shape.weight_banks(),
-                        shape.max_tile_input_rows(),
+                        shape.data_banks(kernels),
+                        shape.weight_banks(kernels),
+                        shape.max_tile_input_rows(kernels),
                     ),
                     Err(failure) => {
                         println!(
