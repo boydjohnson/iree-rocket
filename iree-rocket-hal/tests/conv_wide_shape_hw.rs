@@ -19,18 +19,29 @@
 //!
 //! # Scope
 //!
-//! `Cin=3` dense NHWC, `Cout=8`, stride 1, 1x1 and 3x3 kernels -- the case
-//! the register formulas were validated for. Wider channel counts move the
-//! feature map to multiple NC1HWC2 surfaces and change the row strides, and
-//! nothing here covers that.
+//! `Cin=3` dense NHWC, `Cout=8`, 1x1 and 3x3 kernels, strides 1 to 4 -- the
+//! case the register formulas were validated for. Wider channel counts move
+//! the feature map to multiple NC1HWC2 surfaces and change the row strides,
+//! and nothing here covers that.
 //!
 //! # The capacity ceiling
 //!
+//! Two bounds limit how much of a feature map one program may cover.
 //! `CNA_CBUF_CON1.data_entries` is 14 bits and holds `tile_input_rows *
-//! width`, so a single program cannot cover more than 16383 input pixels per
-//! row-tile: 63 rows at 256 wide, 127 at 128 wide. Shapes below exercise both
-//! sides of that -- geometries that fit whole, and geometries that must be
-//! split for capacity, which is the case that matters for real feature maps.
+//! width`, a hard 16383. The vendor's own rule is tighter -- it keeps that
+//! product within `data_banks * 1024`, giving 32 rows at 256 wide and 7 at
+//! 1536 -- and `Shape::max_tile_input_rows` follows the vendor. Shapes below
+//! exercise both sides: geometries that fit whole, and geometries that must
+//! be split, which is the case real feature maps hit.
+//!
+//! # Stride
+//!
+//! At stride greater than one the output geometry shrinks, so output-side
+//! registers and the output buffer follow `output_width`/`output_height`
+//! rather than the input extents, and a tile's halo projects back through
+//! the stride as `out_first * stride - pad`. Both were confirmed on 150
+//! stride-2, -3 and -4 programs in the sweep corpus; these runs are the
+//! hardware half.
 
 use std::{fs::OpenOptions, mem, os::unix::io::AsRawFd, ptr};
 
@@ -105,9 +116,12 @@ fn valid_taps(coordinate: usize, extent: usize, kernel: usize) -> usize {
 /// Uniform inputs and weights of 1.0 make every output the count of taps that
 /// landed inside the image, which is exact in fp16 for these sizes.
 fn expected(kernels: Kernels, shape: Shape, y: usize, x: usize) -> f32 {
+    // Output pixel (y, x) is centred on input (y*s, x*s); the tap count is
+    // whatever lands inside the image.
+    let stride = shape.stride as usize;
     (INPUT_CHANNELS
-        * valid_taps(y, shape.height as usize, kernels[0])
-        * valid_taps(x, shape.width as usize, kernels[1])) as f32
+        * valid_taps(y * stride, shape.height as usize, kernels[0])
+        * valid_taps(x * stride, shape.width as usize, kernels[1])) as f32
 }
 
 struct Failure {
@@ -120,9 +134,11 @@ struct Failure {
 fn run(shape: Shape, kernels: Kernels, tiles: u32) -> Result<(), Failure> {
     let width = shape.width as usize;
     let height = shape.height as usize;
+    let out_width = shape.output_width(kernels) as usize;
+    let out_height = shape.output_height(kernels) as usize;
     let input_bytes = width * height * INPUT_CHANNELS * FP16_BYTES;
     // Two NC1HWC2 surfaces: eight real fp16 channels sit in the first.
-    let output_bytes = width * height * FEATURE_ATOM_BYTES * 2;
+    let output_bytes = out_width * out_height * FEATURE_ATOM_BYTES * 2;
 
     let file = OpenOptions::new()
         .read(true)
@@ -218,11 +234,11 @@ fn run(shape: Shape, kernels: Kernels, tiles: u32) -> Result<(), Failure> {
             mismatches: 0,
             samples: Vec::new(),
         };
-        for y in 0..height {
-            for x in 0..width {
+        for y in 0..out_height {
+            for x in 0..out_width {
                 let want = expected(kernels, shape, y, x);
                 for channel in 0..OUTPUT_CHANNELS {
-                    let offset = (y * width + x) * FEATURE_ATOM_BYTES + channel * FP16_BYTES;
+                    let offset = (y * out_width + x) * FEATURE_ATOM_BYTES + channel * FP16_BYTES;
                     let got = f16_to_f32(u16::from_le_bytes([raw[offset], raw[offset + 1]]));
                     if got != want {
                         failure.mismatches += 1;
@@ -263,18 +279,24 @@ fn shape_generalised_convs_run_on_npu() {
     // non-square geometry, both kernels, and both sides of the 14-bit
     // data_entries ceiling. 256x64 and 128x128 exceed it whole and are only
     // reachable by splitting.
-    const SHAPES: [(u32, u32); 6] = [
-        (64, 32),
-        (32, 64),
-        (64, 64),
-        (128, 32),
-        (256, 64),
-        (128, 128),
+    const SHAPES: [(u32, u32, u32); 10] = [
+        // stride 1
+        (64, 32, 1),
+        (32, 64, 1),
+        (64, 64, 1),
+        (128, 32, 1),
+        (256, 64, 1),
+        (128, 128, 1),
+        // stride > 1: output geometry, halo projection, and CONV_CON3
+        (64, 64, 2),
+        (128, 64, 2),
+        (128, 64, 3),
+        (64, 64, 4),
     ];
 
     let mut failures = Vec::new();
-    for (width, height) in SHAPES {
-        let shape = Shape::new(width, height);
+    for (width, height, stride) in SHAPES {
+        let shape = Shape::with_stride(width, height, stride);
         for kernels in [[1usize, 1], [3, 3]] {
             let minimum = shape.min_tiles(kernels);
             // The smallest legal split, and one more, so multi-job submission
@@ -282,22 +304,26 @@ fn shape_generalised_convs_run_on_npu() {
             for tiles in [minimum, minimum + 1] {
                 match run(shape, kernels, tiles) {
                     Ok(()) => println!(
-                        "  ok   {width:>3}x{height:<3} {kernels:?} {tiles} tile(s)  \
-                         banks d{}/w{}  max_rows {}",
+                        "  ok   {width:>3}x{height:<3} s{stride} {kernels:?} {tiles} tile(s)  \
+                         out {}x{}  banks d{}/w{}  max_rows {}",
+                        shape.output_width(kernels),
+                        shape.output_height(kernels),
                         shape.data_banks(),
                         shape.weight_banks(),
                         shape.max_tile_input_rows(),
                     ),
                     Err(failure) => {
                         println!(
-                            "  FAIL {width:>3}x{height:<3} {kernels:?} {tiles} tile(s)  \
+                            "  FAIL {width:>3}x{height:<3} s{stride} {kernels:?} {tiles} tile(s)  \
                              {} mismatches",
                             failure.mismatches
                         );
                         for sample in &failure.samples {
                             println!("         {sample}");
                         }
-                        failures.push(format!("{width}x{height} {kernels:?} {tiles} tiles"));
+                        failures.push(format!(
+                            "{width}x{height} s{stride} {kernels:?} {tiles} tiles"
+                        ));
                     }
                 }
             }

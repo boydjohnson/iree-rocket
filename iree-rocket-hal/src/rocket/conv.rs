@@ -119,21 +119,47 @@ const PIXELS_PER_BANK_STEP: u32 = 1024;
 pub struct Shape {
     pub width: u32,
     pub height: u32,
+    /// Equal in both axes; `CNA_CONV_CON3` programs it directly, confirmed
+    /// across 150 stride-2, -3 and -4 programs.
+    pub stride: u32,
 }
 
 impl Shape {
-    /// The `32x32` geometry of the original vendor captures.
+    /// The `32x32` stride-1 geometry of the original vendor captures.
     pub const CAPTURED: Shape = Shape {
         width: IMAGE_WIDTH,
         height: IMAGE_HEIGHT,
+        stride: 1,
     };
 
     pub fn new(width: u32, height: u32) -> Shape {
+        Shape::with_stride(width, height, 1)
+    }
+
+    pub fn with_stride(width: u32, height: u32, stride: u32) -> Shape {
         assert!(
             width > 0 && height > 0,
             "convolution extents must be nonzero"
         );
-        Shape { width, height }
+        assert!(stride > 0, "convolution stride must be nonzero");
+        Shape {
+            width,
+            height,
+            stride,
+        }
+    }
+
+    /// Output width, `floor((w + 2 * pad - k) / stride) + 1`. Matches all 150
+    /// stride-2, -3 and -4 programs in the sweep corpus.
+    pub fn output_width(&self, kernels: Kernels) -> u32 {
+        let kernel = kernel_programming(kernels);
+        (self.width + 2 * kernel.padding - kernel.size) / self.stride + 1
+    }
+
+    /// Output height, by the same rule.
+    pub fn output_height(&self, kernels: Kernels) -> u32 {
+        let kernel = kernel_programming(kernels);
+        (self.height + 2 * kernel.padding - kernel.size) / self.stride + 1
     }
 
     /// Byte stride of one dense NHWC input row.
@@ -141,9 +167,11 @@ impl Shape {
         self.width * INPUT_CHANNELS * 2
     }
 
-    /// Byte stride of one output row.
-    pub fn output_row_stride(&self) -> u32 {
-        self.width * OUTPUT_CHANNELS * 2
+    /// Byte stride of one output row. Output geometry, not input: at stride
+    /// greater than one the two differ, and the corpus programs the output
+    /// dimensions in every one of 150 such programs.
+    pub fn output_row_stride(&self, kernels: Kernels) -> u32 {
+        self.output_width(kernels) * OUTPUT_CHANNELS * 2
     }
 
     /// CBUF banks the vendor assigns to feature data.
@@ -163,10 +191,22 @@ impl Shape {
         CBUF_BANKS - self.data_banks()
     }
 
-    /// Most input rows one program may read, bounded by the 14-bit
-    /// `CNA_CBUF_CON1.data_entries` field.
+    /// Most input rows one program may read.
+    ///
+    /// Two bounds apply and the vendor's is the tighter one. The hard limit
+    /// is the 14-bit `CNA_CBUF_CON1.data_entries` field, which holds
+    /// `rows * width`. The vendor never approaches it: across the width
+    /// sweep it keeps `rows * width` within `data_banks * 1024`, which
+    /// predicts its largest tile exactly at every width measured -- 32 rows
+    /// at 256 wide, 22 at 512, 14 at 768, 11 at 1024, 7 at 1536.
+    ///
+    /// Hardware tolerates the looser bound (`conv_wide_shape_hw` passes at
+    /// ~33 rows on a 256-wide map, above the vendor's 32), so this is
+    /// conservatism rather than a correctness requirement -- the same
+    /// pattern as `feature_grains`. The vendor rule is used anyway.
     pub fn max_tile_input_rows(&self) -> u32 {
-        MAX_DATA_ENTRIES / self.width
+        let vendor = self.data_banks() * PIXELS_PER_BANK_STEP / self.width;
+        vendor.min(MAX_DATA_ENTRIES / self.width).max(1)
     }
 
     /// Fewest tiles this shape must be split into to stay encodable.
@@ -176,8 +216,10 @@ impl Shape {
     /// than discovered as an overflow inside the builder.
     pub fn min_tiles(&self, kernels: Kernels) -> u32 {
         let halo = 2 * kernel_programming(kernels).padding;
-        let budget = self.max_tile_input_rows().saturating_sub(halo).max(1);
-        self.height.div_ceil(budget)
+        let rows = self.max_tile_input_rows().saturating_sub(halo).max(1);
+        // A tile of `r` output rows reads about `r * stride` input rows.
+        let output_rows = rows.div_ceil(self.stride).max(1);
+        self.output_height(kernels).div_ceil(output_rows)
     }
 }
 
@@ -226,26 +268,42 @@ impl Tile {
     /// splits: `tiles = 1` gives 32 rows, `tiles = 2` gives 16+16, and
     /// `tiles = 3` gives 11+11+10, matching captured groups 1, 2-3, and 4-6.
     pub fn split(shape: Shape, kernels: Kernels, tiles: u32) -> Vec<Tile> {
+        let output_height = shape.output_height(kernels);
         assert!(
-            (1..=shape.height).contains(&tiles),
-            "tile count must be between 1 and the {} image rows",
-            shape.height
+            (1..=output_height).contains(&tiles),
+            "tile count must be between 1 and the {output_height} output rows"
         );
         let padding = kernel_programming(kernels).padding;
-        let base = shape.height / tiles;
-        let remainder = shape.height % tiles;
+        let stride = shape.stride;
+        let base = output_height / tiles;
+        let remainder = output_height % tiles;
 
         let mut out = Vec::with_capacity(tiles as usize);
         let mut out_first: u32 = 0;
         for index in 0..tiles {
             let out_rows = base + u32::from(index < remainder);
-            let in_first = out_first.saturating_sub(padding);
-            let in_last = (out_first + out_rows - 1 + padding).min(shape.height - 1);
+
+            // Halo: the first input row a tile touches is its first output
+            // row projected back through the stride, less the padding it
+            // would otherwise read above the image. Matches all 150
+            // stride-2, -3 and -4 programs in the corpus.
+            let in_first = (out_first * stride).saturating_sub(padding);
+            let last_tap = (out_first + out_rows - 1) * stride + padding;
+            let exact = last_tap.min(shape.height - 1) - in_first + 1;
+
+            // The vendor reads at least a full stride block per output row,
+            // which exceeds the exact tap span at stride > 1. Taking the
+            // larger of the two is safe by construction: it is never below
+            // `exact`, so every tap the tile needs is resident. Where the
+            // corpus disagrees it reads more still, which costs DMA rather
+            // than correctness.
+            let in_rows = exact.max(out_rows * stride).min(shape.height - in_first);
+
             out.push(Tile {
                 out_first,
                 out_rows,
                 in_first,
-                in_rows: in_last - in_first + 1,
+                in_rows,
                 pad_top: if out_first == 0 { padding } else { 0 },
             });
             out_first += out_rows;
@@ -264,8 +322,8 @@ impl Tile {
     }
 
     /// Byte offset of this tile's first output row from the tensor base.
-    pub fn output_offset(&self, shape: Shape) -> u32 {
-        self.out_first * shape.output_row_stride()
+    pub fn output_offset(&self, shape: Shape, kernels: Kernels) -> u32 {
+        self.out_first * shape.output_row_stride(kernels)
     }
 }
 
@@ -336,12 +394,14 @@ pub fn conv_2d_tile_with_grains(
 
     let width = shape.width;
     let height = shape.height;
+    let out_width = shape.output_width(kernels);
+    let out_height = shape.output_height(kernels);
     let weight_banks = shape.weight_banks();
     let data_banks = shape.data_banks();
 
     assert!(
-        tile.out_rows > 0 && tile.out_first + tile.out_rows <= height,
-        "tile output rows {}..{} fall outside the {height}-row image",
+        tile.out_rows > 0 && tile.out_first + tile.out_rows <= out_height,
+        "tile output rows {}..{} fall outside the {out_height}-row output",
         tile.out_first,
         tile.out_first + tile.out_rows
     );
@@ -406,8 +466,8 @@ pub fn conv_2d_tile_with_grains(
     );
     commands.push(
         Register::<CnaConvCon3>::new()
-            .conv_x_stride(Bits::new(1))
-            .conv_y_stride(Bits::new(1))
+            .conv_x_stride(Bits::new(shape.stride))
+            .conv_y_stride(Bits::new(shape.stride))
             .build(),
     );
     commands.push(
@@ -424,12 +484,12 @@ pub fn conv_2d_tile_with_grains(
     );
     commands.push(
         Register::<CnaDataSize2>::new()
-            .dataout_width(Bits::new(width))
+            .dataout_width(Bits::new(out_width))
             .build(),
     );
     commands.push(
         Register::<CnaDataSize3>::new()
-            .dataout_atomics(Bits::new(width * tile.out_rows))
+            .dataout_atomics(Bits::new(out_width * tile.out_rows))
             .build(),
     );
     commands.push(
@@ -557,7 +617,7 @@ pub fn conv_2d_tile_with_grains(
     );
     commands.push(
         Register::<CoreDataoutSize0>::new()
-            .dataout_width(Bits::new(width - 1))
+            .dataout_width(Bits::new(out_width - 1))
             .dataout_height(Bits::new(tile.out_rows - 1))
             .build(),
     );
@@ -586,17 +646,17 @@ pub fn conv_2d_tile_with_grains(
     commands.push(zero::<DpuOffsetPend>());
     commands.push(
         Register::<DpuDstBaseAddr>::new()
-            .dst_base_addr(Bits::new(tile.output_offset(shape)))
+            .dst_base_addr(Bits::new(tile.output_offset(shape, kernels)))
             .build(),
     );
     commands.push(
         Register::<DpuDstSurfStride>::new()
-            .dst_surf_stride(Bits::new(width * height))
+            .dst_surf_stride(Bits::new(out_width * out_height))
             .build(),
     );
     commands.push(
         Register::<DpuDataCubeWidth>::new()
-            .width(Bits::new(width - 1))
+            .width(Bits::new(out_width - 1))
             .build(),
     );
     commands.push(
@@ -639,7 +699,7 @@ pub fn conv_2d_tile_with_grains(
     commands.push(
         Register::<DpuWdmaSize1>::new()
             .height_wdma(Bits::new(tile.out_rows - 1))
-            .width_wdma(Bits::new(width - 1))
+            .width_wdma(Bits::new(out_width - 1))
             .build(),
     );
     commands.push(
@@ -687,7 +747,7 @@ pub fn conv_2d_tile_with_grains(
     commands.push(zero::<DpuEwOpValue7>());
     commands.push(
         Register::<DpuSurfaceAdd>::new()
-            .surf_add(Bits::new(width * height * FP16_BYTES))
+            .surf_add(Bits::new(out_width * out_height * FP16_BYTES))
             .build(),
     );
     commands.push(zero::<DpuReserved40c4>());
@@ -708,7 +768,7 @@ pub fn conv_2d_tile_with_grains(
     // DPU directly; BRDMA supplies the bias data.
     commands.push(
         Register::<DpuRdmaDataCubeWidth>::new()
-            .width(Bits::new(width - 1))
+            .width(Bits::new(out_width - 1))
             .build(),
     );
     commands.push(
@@ -918,7 +978,7 @@ mod tests {
         assert_eq!(
             three
                 .iter()
-                .map(|t| t.output_offset(Shape::CAPTURED))
+                .map(|t| t.output_offset(Shape::CAPTURED, [3, 3]))
                 .collect::<Vec<_>>(),
             [0x0000, 0x1600, 0x2c00]
         );
@@ -1084,9 +1144,10 @@ mod tests {
     #[test]
     fn wider_shapes_scale_the_geometry_registers() {
         // Formulas validated against 212 C3 stride-1 programs from 35 captures.
-        // 256 wide caps a tile at 63 input rows, so a 64-row image needs two.
+        // 256 wide caps a tile at 44 input rows by the vendor's own CBUF
+        // rule (11 data banks x 1024 pixels / 256), so 64 rows need two.
         let shape = Shape::new(256, 64);
-        assert_eq!(shape.max_tile_input_rows(), 63);
+        assert_eq!(shape.max_tile_input_rows(), 44);
         assert_eq!(shape.min_tiles([3, 3]), 2);
 
         let split = Tile::split(shape, [3, 3], 2);
@@ -1107,7 +1168,7 @@ mod tests {
 
         // Row strides follow the dense NHWC input and C8 fp16 output.
         assert_eq!(shape.input_row_stride(), 256 * 3 * 2);
-        assert_eq!(shape.output_row_stride(), 256 * 8 * 2);
+        assert_eq!(shape.output_row_stride([3, 3]), 256 * 8 * 2);
 
         // A three-way split of 64 rows, with the 3x3 halo on continuations.
         let three = Tile::split(shape, [3, 3], 3);
@@ -1116,7 +1177,58 @@ mod tests {
             [22, 21, 21]
         );
         assert_eq!(three[1].in_first, 21);
-        assert_eq!(three[1].output_offset(shape), 22 * 256 * 8 * 2);
+        assert_eq!(three[1].output_offset(shape, [3, 3]), 22 * 256 * 8 * 2);
+    }
+
+    #[test]
+    fn vendor_capacity_rule_matches_the_width_sweep() {
+        // Largest tile the vendor emits at each width, from the width sweep:
+        // data_banks * 1024 / width, exact at every measured point.
+        for (width, rows) in [(256u32, 32u32), (512, 22), (768, 14), (1024, 11), (1536, 7)] {
+            let shape = Shape::new(width, 32);
+            assert_eq!(
+                shape.max_tile_input_rows(),
+                rows,
+                "max tile rows at {width} wide"
+            );
+        }
+    }
+
+    #[test]
+    fn stride_scales_output_geometry_and_halo() {
+        // Formulas confirmed on 150 stride-2, -3 and -4 programs.
+        let shape = Shape::with_stride(128, 64, 2);
+        assert_eq!(shape.output_width([3, 3]), 64);
+        assert_eq!(shape.output_height([3, 3]), 32);
+        assert_eq!(shape.output_row_stride([3, 3]), 64 * 8 * 2);
+
+        // A two-way split of the 32 output rows. The continuation tile
+        // projects back through the stride: 16 * 2 - 1 = 31.
+        let split = Tile::split(shape, [3, 3], 2);
+        assert_eq!(
+            split.iter().map(|t| t.out_rows).collect::<Vec<_>>(),
+            [16, 16]
+        );
+        assert_eq!(split[0].in_first, 0);
+        assert_eq!(split[0].in_rows, 32);
+        assert_eq!(split[0].pad_top, 1);
+        assert_eq!(split[1].in_first, 31);
+        assert_eq!(split[1].in_rows, 33);
+        assert_eq!(split[1].pad_top, 0);
+
+        // The stride reaches CNA_CONV_CON3, and output-side registers carry
+        // output geometry rather than input.
+        let program = conv_2d_tile(shape, [3, 3], &split[0]);
+        assert_eq!(value_of::<CnaConvCon3>(&program), (2 << 3) | 2);
+        assert_eq!(value_of::<CnaDataSize2>(&program), 64);
+        // Raw word: the DST_SURF_STRIDE field is shifted 4, so the encoded
+        // word is sixteen times the 64 * 32 field value.
+        assert_eq!(value_of::<DpuDstSurfStride>(&program), 64 * 32 * 16);
+
+        // Stride 1 is unchanged.
+        let flat = Shape::new(128, 64);
+        assert_eq!(flat.output_height([3, 3]), 64);
+        assert_eq!(Tile::split(flat, [3, 3], 2)[1].in_first, 31);
     }
 
     #[test]
