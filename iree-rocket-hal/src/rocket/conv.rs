@@ -13,7 +13,10 @@
 //! 35 captures (212 convolution programs) spanning widths 32..256 and heights
 //! 32..256. Registers that vary in no capture stay literal constants.
 //!
-//! Supported case: `Cin` 1..=80, `Cout=8`, strides 1..4, 1x1 or 3x3 kernels.
+//! Supported case: `Cin` 1..=80, `Cout` 1..=512, strides 1..4, and 1x1 or
+//! 3x3 kernels. Odd square kernels through 11x11 can additionally be emitted
+//! with an explicit CBUF partition for hardware probing; their automatic
+//! bank selection is not generalized yet.
 //!
 //! Input channel count picks the memory layout. While a pixel fits in half a
 //! feature atom -- `Cin` up to 4 -- the vendor keeps it dense NHWC and the
@@ -689,6 +692,7 @@ impl Shape {
     /// bytes of coefficients and takes one bank, Cout 64 needs 36864 and
     /// takes two, pushing the data allocation from 11 banks down to 10.
     pub fn data_banks(&self, kernels: Kernels) -> u32 {
+        assert_default_cbuf_kernel(kernels);
         let data = self.data_bank_demand();
         let weights = self.weight_bank_demand(kernels);
         let granted = if data <= weights {
@@ -702,6 +706,31 @@ impl Shape {
     /// CBUF banks the vendor assigns to weights: everything left over.
     pub fn weight_banks(&self, kernels: Kernels) -> u32 {
         CBUF_BANKS - self.data_banks(kernels)
+    }
+
+    /// Most input rows that fit in an explicit feature-data bank allocation.
+    ///
+    /// This is the capacity half of [`max_tile_input_rows`], exposed for the
+    /// large-kernel hardware probe whose CBUF partition comes from the
+    /// focused `(Cin, Cout, k)` capture sweep rather than the 1x1/3x3
+    /// automatic allocator.
+    pub fn max_tile_input_rows_for_data_banks(&self, data_banks: u32) -> u32 {
+        assert!(
+            (1..CBUF_BANKS).contains(&data_banks),
+            "data banks must be between 1 and {}, leaving at least one weight bank",
+            CBUF_BANKS - 1
+        );
+        let capacity = match self.layout() {
+            FeatureLayout::Dense => {
+                data_banks * (CBUF_BANK_BYTES / 4)
+                    / (self.width * self.precision.dense_pixel_bytes())
+            }
+            FeatureLayout::Surfaces => {
+                data_banks * CBUF_BANK_BYTES
+                    / (self.width * self.weight_atoms() * FEATURE_ATOM_BYTES)
+            }
+        };
+        capacity.min(MAX_DATA_ENTRIES / self.width).max(1)
     }
 
     /// Most input rows one program may read.
@@ -732,21 +761,7 @@ impl Shape {
     /// requirement -- the same pattern as `feature_grains`. In the surface
     /// regime it is a correctness requirement.
     pub fn max_tile_input_rows(&self, kernels: Kernels) -> u32 {
-        let banks = self.data_banks(kernels);
-        let capacity = match self.layout() {
-            // A quarter of a bank per 1024 dense pixels, which is what the
-            // fp16 width sweep measured; written in bytes so the int8 case
-            // falls out of the narrower pixel rather than needing its own
-            // constant.
-            FeatureLayout::Dense => {
-                banks * (CBUF_BANK_BYTES / 4) / (self.width * self.precision.dense_pixel_bytes())
-            }
-            // Surfaces get the whole bank, exactly.
-            FeatureLayout::Surfaces => {
-                banks * CBUF_BANK_BYTES / (self.width * self.weight_atoms() * FEATURE_ATOM_BYTES)
-            }
-        };
-        capacity.min(MAX_DATA_ENTRIES / self.width).max(1)
+        self.max_tile_input_rows_for_data_banks(self.data_banks(kernels))
     }
 
     /// Fewest tiles this shape must be split into to stay encodable.
@@ -755,9 +770,14 @@ impl Shape {
     /// rows once its halo is counted, so the padding is charged here rather
     /// than discovered as an overflow inside the builder.
     pub fn min_tiles(&self, kernels: Kernels) -> u32 {
+        self.min_tiles_for_data_banks(kernels, self.data_banks(kernels))
+    }
+
+    /// Fewest output-row tiles needed with an explicit feature-data split.
+    pub fn min_tiles_for_data_banks(&self, kernels: Kernels, data_banks: u32) -> u32 {
         let halo = 2 * kernel_programming(kernels).padding;
         let rows = self
-            .max_tile_input_rows(kernels)
+            .max_tile_input_rows_for_data_banks(data_banks)
             .saturating_sub(halo)
             .max(1);
         // A tile of `r` output rows reads about `r * stride` input rows.
@@ -773,19 +793,25 @@ struct KernelProgramming {
 }
 
 fn kernel_programming(kernels: Kernels) -> KernelProgramming {
-    // Deliberately not `(k - 1) / 2`: only these two geometries have capture
-    // backing, and guessing is what this module exists to avoid.
     match kernels {
-        [1, 1] => KernelProgramming {
-            size: 1,
-            padding: 0,
-        },
-        [3, 3] => KernelProgramming {
-            size: 3,
-            padding: 1,
-        },
-        _ => panic!("conv_2d only has vendor reference data for 1x1 and 3x3 square kernels"),
+        [height, width] if height == width && (1..=11).contains(&height) && height % 2 == 1 => {
+            KernelProgramming {
+                size: height as u32,
+                padding: (height / 2) as u32,
+            }
+        }
+        _ => panic!(
+            "conv_2d only has vendor reference data for odd square kernels from 1x1 through 11x11"
+        ),
     }
+}
+
+fn assert_default_cbuf_kernel(kernels: Kernels) {
+    assert!(
+        matches!(kernels, [1, 1] | [3, 3]),
+        "automatic CBUF allocation only has runtime backing for 1x1 and 3x3; \
+         use conv_2d_tile_with_cbuf_banks for the large-kernel hardware probe"
+    );
 }
 
 /// ARGB input mode for a dense feature map.
@@ -807,9 +833,10 @@ fn argb_input_mode(in_channels: u32) -> ArgbInputMode {
 ///
 /// `in_rows` counts input rows actually fetched from memory: it includes the
 /// halo row a continuation tile reads from its neighbour, and excludes rows
-/// supplied by zero padding. `pad_top` is 1 only for a tile whose first
-/// output row sits at the top of the image and therefore has no real input
-/// row above it.
+/// supplied by zero padding. `pad_top` is the part of the kernel's top
+/// padding still visible at this output range. It is usually nonzero only
+/// for the first tile, but a large kernel split into very short tiles can
+/// leave the second or later tile inside the image's top-padding region.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Tile {
     pub out_first: u32,
@@ -857,12 +884,13 @@ impl Tile {
             // than correctness.
             let in_rows = exact.max(out_rows * stride).min(shape.height - in_first);
 
+            let projected_first = out_first * stride;
             out.push(Tile {
                 out_first,
                 out_rows,
                 in_first,
                 in_rows,
-                pad_top: if out_first == 0 { padding } else { 0 },
+                pad_top: padding.saturating_sub(projected_first),
             });
             out_first += out_rows;
         }
@@ -1053,6 +1081,60 @@ pub fn conv_2d_tile_with_grains(
     tile: &Tile,
     feature_grains: u32,
 ) -> Vec<RegCmd> {
+    assert_default_cbuf_kernel(kernels);
+    conv_2d_tile_program(
+        shape,
+        kernels,
+        tile,
+        feature_grains,
+        shape.data_banks(kernels),
+        shape.weight_banks(kernels),
+    )
+}
+
+/// Builds a large-kernel probe program with an explicit CBUF partition.
+///
+/// The focused kernel sweep shows that 7x7, 9x9, and 11x11 do not follow the
+/// automatic allocator derived from the 1x1/3x3 corpus. This entry point
+/// keeps that unresolved policy out of [`conv_2d_tile`] while allowing the
+/// captured partitions to be tested on hardware. The two bank counts must be
+/// nonzero and sum to the RK3588's twelve CBUF banks.
+pub fn conv_2d_tile_with_cbuf_banks(
+    shape: Shape,
+    kernels: Kernels,
+    tile: &Tile,
+    data_banks: u32,
+    weight_banks: u32,
+) -> Vec<RegCmd> {
+    assert!(
+        data_banks > 0 && weight_banks > 0 && data_banks + weight_banks == CBUF_BANKS,
+        "explicit CBUF partition must have nonzero data and weight banks summing to {CBUF_BANKS}; \
+         got data={data_banks}, weights={weight_banks}"
+    );
+    assert!(
+        tile.in_rows <= shape.max_tile_input_rows_for_data_banks(data_banks),
+        "tile reads {} input rows, but {data_banks} data banks fit at most {} for this shape",
+        tile.in_rows,
+        shape.max_tile_input_rows_for_data_banks(data_banks),
+    );
+    conv_2d_tile_program(
+        shape,
+        kernels,
+        tile,
+        feature_grains(kernels, tile),
+        data_banks,
+        weight_banks,
+    )
+}
+
+fn conv_2d_tile_program(
+    shape: Shape,
+    kernels: Kernels,
+    tile: &Tile,
+    feature_grains: u32,
+    data_banks: u32,
+    weight_banks: u32,
+) -> Vec<RegCmd> {
     let padded_channels = shape.padded_channels();
     let weight_channels = shape.weight_channels();
     // The DPU counts output channels in whole granules while the CNA counts
@@ -1086,8 +1168,6 @@ pub fn conv_2d_tile_with_grains(
     let height = shape.height;
     let out_width = shape.output_width(kernels);
     let out_height = shape.output_height(kernels);
-    let weight_banks = shape.weight_banks(kernels);
-    let data_banks = shape.data_banks(kernels);
 
     assert!(
         tile.out_rows > 0 && tile.out_first + tile.out_rows <= out_height,
@@ -1659,9 +1739,36 @@ mod tests {
     }
 
     #[test]
-    #[should_panic(expected = "only has vendor reference data")]
-    fn rejects_uncaptured_kernel_geometry() {
+    #[should_panic(expected = "automatic CBUF allocation")]
+    fn default_builder_rejects_large_kernel_without_explicit_banks() {
         let _ = conv_2d([5, 5]);
+    }
+
+    #[test]
+    fn explicit_cbuf_builder_accepts_focused_large_kernels() {
+        let shape = Shape::with_out_channels(256, 32, 1, 32, 64);
+        for (kernel, data_banks, weight_banks, max_rows, min_tiles) in [
+            (7usize, 8u32, 4u32, 16u32, 4u32),
+            (9, 6, 6, 12, 8),
+            (11, 7, 5, 14, 8),
+        ] {
+            let kernels = [kernel, kernel];
+            assert_eq!(
+                shape.max_tile_input_rows_for_data_banks(data_banks),
+                max_rows
+            );
+            assert_eq!(
+                shape.min_tiles_for_data_banks(kernels, data_banks),
+                min_tiles
+            );
+            for tile in Tile::split(shape, kernels, min_tiles) {
+                assert_eq!(
+                    conv_2d_tile_with_cbuf_banks(shape, kernels, &tile, data_banks, weight_banks,)
+                        .len(),
+                    136
+                );
+            }
+        }
     }
 
     /// The six captured groups, in the order they appear in the regcmd blob:
@@ -1762,6 +1869,44 @@ mod tests {
         assert_eq!(
             three.iter().map(|t| t.pad_top).collect::<Vec<_>>(),
             [1, 0, 0]
+        );
+    }
+
+    #[test]
+    fn short_large_kernel_tiles_retain_remaining_top_padding() {
+        // Hardware exposed this at 7x7/Cin64: two output rows fit per tile,
+        // so the second tile starts at output row 2 while one of the three
+        // top-padding rows is still in force. Treating every continuation
+        // tile as unpadded shifted that tile's convolution down by one row.
+        let shape = Shape::with_out_channels(256, 32, 1, 64, 64);
+        let split = Tile::split(shape, [7, 7], 16);
+        assert_eq!(
+            split
+                .iter()
+                .take(3)
+                .map(|tile| tile.out_first)
+                .collect::<Vec<_>>(),
+            [0, 2, 4]
+        );
+        assert_eq!(
+            split
+                .iter()
+                .take(3)
+                .map(|tile| tile.pad_top)
+                .collect::<Vec<_>>(),
+            [3, 1, 0]
+        );
+
+        // The one-row 11x11/Cin64 plan keeps decreasing the padding until
+        // the sixth output row finally has a complete real-input footprint.
+        let split = Tile::split(shape, [11, 11], 32);
+        assert_eq!(
+            split
+                .iter()
+                .take(7)
+                .map(|tile| tile.pad_top)
+                .collect::<Vec<_>>(),
+            [5, 4, 3, 2, 1, 0, 0]
         );
     }
 
