@@ -15,33 +15,24 @@
 //! The focused capture sweep found typical CBUF splits of 8/4 for 7x7, 6/6
 //! for 9x9, and 7/5 for 11x11, but also showed that the vendor's allocation
 //! is not a simple function of whole feature and coefficient footprints.
-//! The default run covers 24 points from that sweep with explicit bank
-//! counts. The three high-`Cin` cases where the typical split cannot hold one
-//! full-width kernel footprint are isolated behind `KERNEL_PROBE_CASE` so a
-//! hardware timeout cannot hide the rest of the matrix:
+//! One test covers 24 points from that sweep with explicit bank counts. Three
+//! more tests cover the capture-derived rectangular replacements for the
+//! high-`Cin` shapes that cannot run as full-width row tiles. Run all four
+//! with the command above, or select one by its ordinary Rust test name:
 //!
-//!   KERNEL_PROBE_CASE=k9-ci64-w3 ./conv_kernel_size_hw-<hash> --ignored --nocapture
-//!   KERNEL_PROBE_CASE=k11-ci48 ./conv_kernel_size_hw-<hash> --ignored --nocapture
-//!   KERNEL_PROBE_CASE=k11-ci64 ./conv_kernel_size_hw-<hash> --ignored --nocapture
+//!   ./conv_kernel_size_hw-<hash> --ignored --nocapture \
+//!     k11_ci64_rectangular_tiles_run_on_npu
 //!
-//! The original 9x9/Cin64 experiment at 10/2 banks is retained as
-//! `k9-ci64-w2`; it completes but leaves the whole output zero. The `w3`
-//! case is the only remaining full-width allocation: nine data banks are the
-//! minimum that can hold a nine-row footprint. A passing result would show
-//! that standalone row-tile jobs can avoid reproducing the vendor's
-//! width-partitioned multi-core schedule.
-//!
-//! The capture-derived rectangular replacements are:
-//!
-//!   KERNEL_PROBE_CASE=k9-ci64-2d  ./conv_kernel_size_hw-<hash> --ignored --nocapture
-//!   KERNEL_PROBE_CASE=k11-ci48-2d ./conv_kernel_size_hw-<hash> --ignored --nocapture
-//!   KERNEL_PROBE_CASE=k11-ci64-2d ./conv_kernel_size_hw-<hash> --ignored --nocapture
+//! The failed full-width experiments are recorded in `DESIGN_NOTES.md`, but
+//! are not retained as tests: they trigger the kernel watchdog and cannot
+//! pass. The rectangular replacements are the regression coverage for those
+//! shapes.
 //!
 //! Input and weights are 1.0, with padded input lanes zero. Each output is
 //! therefore `Cin * valid_y_taps * valid_x_taps`, independent of coefficient
 //! order. All tested values are exactly representable in fp16.
 
-use std::{fs::OpenOptions, mem, os::unix::io::AsRawFd, ptr};
+use std::{fs::OpenOptions, mem, os::unix::io::AsRawFd, ptr, sync::Mutex};
 
 use iree_rocket_hal::rocket::{
     builders::{
@@ -61,7 +52,7 @@ const CHANNELS_PER_ATOM: usize = 8;
 const PAGE_BYTES: usize = 4096;
 const FP16_ONE: u16 = 0x3c00;
 const COMPLETION_TIMEOUT_NS: u64 = 10_000_000_000;
-const ISOLATED_COMPLETION_TIMEOUT_NS: u64 = 30_000_000_000;
+static NPU_TEST_LOCK: Mutex<()> = Mutex::new(());
 
 fn page_aligned_size(size: usize) -> usize {
     size.div_ceil(PAGE_BYTES) * PAGE_BYTES
@@ -261,12 +252,7 @@ fn run(
 
         submit_jobs(fd, &jobs)
             .unwrap_or_else(|error| panic!("{shape:?} {kernels:?} SUBMIT failed: {error}"));
-        let timeout_ns = if std::env::var_os("KERNEL_PROBE_CASE").is_some() {
-            ISOLATED_COMPLETION_TIMEOUT_NS
-        } else {
-            COMPLETION_TIMEOUT_NS
-        };
-        prep_bo(fd, buf_output.handle, timeout_ns)
+        prep_bo(fd, buf_output.handle, COMPLETION_TIMEOUT_NS)
             .unwrap_or_else(|error| panic!("{shape:?} {kernels:?} did not complete: {error}"));
 
         let raw = std::slice::from_raw_parts(buf_output.host_ptr, output_bytes);
@@ -389,52 +375,48 @@ fn attempt_2d(
     }
 }
 
+fn assert_no_failures(failures: Vec<String>) {
+    assert!(
+        failures.is_empty(),
+        "{} configuration(s) produced wrong output: {}",
+        failures.len(),
+        failures.join(", ")
+    );
+}
+
+fn run_rectangular_probe(
+    kernel: usize,
+    in_channels: u32,
+    data_banks: u32,
+    weight_banks: u32,
+    output_column_widths: &[u32],
+) {
+    let _device_guard = NPU_TEST_LOCK
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    let mut failures = Vec::new();
+    attempt_2d(
+        Shape::with_out_channels(256, 32, 1, in_channels, 64),
+        kernel,
+        data_banks,
+        weight_banks,
+        output_column_widths,
+        &mut failures,
+    );
+    assert_no_failures(failures);
+}
+
 #[test]
 #[ignore = "needs /dev/accel/accel0 -- cross-compile for aarch64 and run on the RK3588 board"]
 fn large_kernel_cbuf_partitions_run_on_npu() {
+    let _device_guard = NPU_TEST_LOCK
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
     let mut failures = Vec::new();
 
-    if let Ok(probe) = std::env::var("KERNEL_PROBE_CASE") {
-        let (kernel, cin, data_banks, weight_banks, output_column_widths) = match probe.as_str() {
-            "k9-ci64" | "k9-ci64-w2" => (9usize, 64u32, 10u32, 2u32, None),
-            "k9-ci64-w3" => (9, 64, 9, 3, None),
-            "k11-ci48" => (11, 48, 9, 3, None),
-            "k11-ci64" => (11, 64, 11, 1, None),
-            "k9-ci64-2d" => (9, 64, 6, 6, Some(&[135u32, 121][..])),
-            "k11-ci48-2d" => (11, 48, 5, 7, Some(&[137u32, 119][..])),
-            "k11-ci64-2d" => (11, 64, 3, 9, Some(&[59u32, 54, 54, 54, 35][..])),
-            _ => panic!(
-                "unknown KERNEL_PROBE_CASE={probe:?}; expected k9-ci64-w2, k9-ci64-w3, \
-                 k11-ci48, k11-ci64, k9-ci64-2d, k11-ci48-2d, or k11-ci64-2d"
-            ),
-        };
-        println!("isolated probe: {probe}");
-        let shape = Shape::with_out_channels(256, 32, 1, cin, 64);
-        if let Some(output_column_widths) = output_column_widths {
-            attempt_2d(
-                shape,
-                kernel,
-                data_banks,
-                weight_banks,
-                output_column_widths,
-                &mut failures,
-            );
-        } else {
-            attempt(shape, kernel, data_banks, weight_banks, &mut failures);
-        }
-        assert!(
-            failures.is_empty(),
-            "{} configuration(s) produced wrong output: {}",
-            failures.len(),
-            failures.join(", ")
-        );
-        return;
-    }
-
     // Cin axis of the focused sweep. The center Cout is 64. The first split
-    // for each kernel is the stable capture regime; the high-Cin overrides
-    // that can time out the NPU are selected separately with
-    // KERNEL_PROBE_CASE, above.
+    // for each kernel is the stable capture regime. The high-Cin shapes that
+    // require horizontal tiling have separate rectangular tests below.
     for &(kernel, cin, data_banks, weight_banks) in &[
         (7usize, 16u32, 8u32, 4u32),
         (7, 24, 8, 4),
@@ -472,15 +454,23 @@ fn large_kernel_cbuf_partitions_run_on_npu() {
         }
     }
 
-    println!(
-        "  note: run KERNEL_PROBE_CASE=k9-ci64-w3, k11-ci48, and k11-ci64 separately \
-         to cover the three timeout-risk points"
-    );
+    assert_no_failures(failures);
+}
 
-    assert!(
-        failures.is_empty(),
-        "{} configuration(s) produced wrong output: {}",
-        failures.len(),
-        failures.join(", ")
-    );
+#[test]
+#[ignore = "needs /dev/accel/accel0 -- cross-compile for aarch64 and run on the RK3588 board"]
+fn k9_ci64_rectangular_tiles_run_on_npu() {
+    run_rectangular_probe(9, 64, 6, 6, &[135, 121]);
+}
+
+#[test]
+#[ignore = "needs /dev/accel/accel0 -- cross-compile for aarch64 and run on the RK3588 board"]
+fn k11_ci48_rectangular_tiles_run_on_npu() {
+    run_rectangular_probe(11, 48, 5, 7, &[137, 119]);
+}
+
+#[test]
+#[ignore = "needs /dev/accel/accel0 -- cross-compile for aarch64 and run on the RK3588 board"]
+fn k11_ci64_rectangular_tiles_run_on_npu() {
+    run_rectangular_probe(11, 64, 3, 9, &[59, 54, 54, 54, 35]);
 }
