@@ -745,14 +745,20 @@ impl Register<CnaCbufCon1> {
     /// Bit width: 13
     /// Range of values: 0x0000-0x1FFF, per the TRM's bit table (bits 12:0; bits 31:13
     /// reserved).
-    /// Known limitations: The compiled register mask (`CNA_CBUF_CON1_DATA_ENTRIES__MASK`,
-    /// from Mesa's `rkt_registers.h`) is actually 0x3fff (14 bits) — one bit wider than
-    /// the TRM's own reserved-bit boundary. `Bits<13>` here is a deliberately tighter
-    /// caller-side assertion matching the TRM table; it can never write a value that the
-    /// wider hardware mask wouldn't also have accepted, so this only forbids the one
-    /// TRM-reserved bit (12 vs 13) without changing what's actually written to hardware.
+    /// Known limitations: the compiled register mask (`CNA_CBUF_CON1_DATA_ENTRIES__MASK`)
+    /// is 0x3fff (14 bits), one bit wider than the TRM's own reserved-bit boundary. This
+    /// was previously narrowed to `Bits<13>` to match the TRM table, on the reasoning that
+    /// the tighter assertion could only forbid a reserved bit. A shape sweep of vendor
+    /// captures disproves that: a `128x128` convolution programs `data_entries = 11264`,
+    /// which needs bit 13. The TRM's boundary is wrong (or the bit is usable in practice),
+    /// the 14-bit mask is real, and narrowing here rejected shapes the vendor itself emits.
+    ///
+    /// The 14-bit ceiling is load-bearing rather than incidental. This field holds
+    /// `tile_input_rows * width`, so 16383 caps a single program at 63 input rows when the
+    /// feature map is 256 wide, and 127 rows at 128 wide. That is the hardware reason tall
+    /// convolutions must be split for capacity; see `conv::Shape::max_tile_input_rows`.
     /// Related registers: `cna_cbuf_con0.data_bank`.
-    pub fn data_entries(&mut self, data_entries: Bits<13>) -> &mut Self {
+    pub fn data_entries(&mut self, data_entries: Bits<14>) -> &mut Self {
         self.set_field(CNA_CBUF_CON1_DATA_ENTRIES__MASK, unsafe {
             CNA_CBUF_CON1_DATA_ENTRIES(data_entries.val())
         })

@@ -52,7 +52,7 @@ use iree_rocket_hal::rocket::{
         dpu::DpuDstBaseAddr,
         dpu_rdma::DpuRdmaBsBaseAddr,
     },
-    conv::{Kernels, Tile, conv_2d_tile},
+    conv::{Kernels, Shape, Tile, conv_2d_tile},
     device::{Buffer, JobDesc, close_bo, fini_bo, prep_bo, submit_jobs},
 };
 
@@ -177,10 +177,10 @@ fn run_tiled_conv(kernels: Kernels, tiles: u32) -> Vec<f32> {
 
         // One regcmd buffer per tile. All tiles share the four data buffers;
         // only the base addresses inside each program differ.
-        let split = Tile::split(kernels, tiles);
+        let split = Tile::split(Shape::CAPTURED, kernels, tiles);
         let mut command_buffers = Vec::with_capacity(split.len());
         for tile in &split {
-            let mut commands = conv_2d_tile(kernels, tile);
+            let mut commands = conv_2d_tile(Shape::CAPTURED, kernels, tile);
             relocate::<CnaFeatureDataAddr>(&mut commands, buf_input.dma_address);
             relocate::<CnaDcompAddr0>(&mut commands, buf_weights.dma_address);
             relocate::<DpuRdmaBsBaseAddr>(&mut commands, buf_bias.dma_address);
@@ -272,7 +272,7 @@ fn run_tiled_conv(kernels: Kernels, tiles: u32) -> Vec<f32> {
 /// Output rows that begin a tile other than the first -- where a wrong halo
 /// or feature-base offset shows up.
 fn boundary_rows(kernels: Kernels, tiles: u32) -> Vec<usize> {
-    Tile::split(kernels, tiles)
+    Tile::split(Shape::CAPTURED, kernels, tiles)
         .iter()
         .skip(1)
         .flat_map(|tile| {

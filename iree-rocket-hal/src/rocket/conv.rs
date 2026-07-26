@@ -1,13 +1,24 @@
 //! Vendor-derived convolution register program.
 //!
-//! This is deliberately a narrow reference implementation: it reproduces
-//! group 1 (the complete single-core alternative) from the vendor-compiled
-//! `32x32x3 -> 32x32x8` fp16 convolution captures. The two captures differ
-//! only in kernel geometry: 1x1/no padding versus 3x3/SAME padding.
+//! This began as a bit-exact reproduction of group 1 (the complete
+//! single-core alternative) from the vendor-compiled `32x32x3 -> 32x32x8`
+//! fp16 convolution captures, which differ only in kernel geometry: 1x1 with
+//! no padding versus 3x3 with SAME padding. [`conv_2d`] still reproduces that
+//! program byte for byte, and the hash tests below pin it.
 //!
-//! Keeping this separate from `rocket::regcmd` gives us a bit-exact baseline
-//! while the general convolution builder grows the missing padding and
-//! multi-core-plan inputs.
+//! It now generalises to arbitrary [`Shape`] and to output-row [`Tile`]s.
+//! Every shape- and tile-dependent register formula is derived from vendor
+//! captures rather than assumed: the tile formulas from a cross-group diff of
+//! the six captured plans, and the width and height formulas from a sweep of
+//! 35 captures (212 convolution programs) spanning widths 32..256 and heights
+//! 32..256. Registers that vary in no capture stay literal constants.
+//!
+//! Supported case: `Cin=3` dense NHWC, `Cout=8`, stride 1, 1x1 or 3x3
+//! kernels. Wider channel counts move the feature map onto multiple NC1HWC2
+//! surfaces and change the row strides; nothing here covers that.
+//!
+//! Keeping this separate from `rocket::regcmd` keeps a capture-derived path
+//! distinct from that module's Mesa-derived one.
 //!
 //! # Output-row tiles
 //!
@@ -68,17 +79,107 @@ use crate::rocket::builders::{
 /// `[kernel_height, kernel_width]`.
 pub type Kernels = [usize; 2];
 
-/// Height of the captured image, in rows.
+/// Height of the originally captured image, in rows.
 pub const IMAGE_HEIGHT: u32 = 32;
 
-/// Width of the captured image, in pixels.
+/// Width of the originally captured image, in pixels.
 pub const IMAGE_WIDTH: u32 = 32;
 
-/// Byte stride of one dense NHWC input row: `32 * 3 * sizeof(fp16)`.
-pub const INPUT_ROW_STRIDE: u32 = IMAGE_WIDTH * 3 * 2;
+/// Input channels this builder supports. A C3 fp16 pixel is 6 bytes and
+/// occupies one 16-byte feature atom once padded to the CNA's C8 task width,
+/// which is what keeps the row strides below single-surface.
+pub const INPUT_CHANNELS: u32 = 3;
 
-/// Byte stride of one output row: `32 * 8 * sizeof(fp16)`.
-pub const OUTPUT_ROW_STRIDE: u32 = IMAGE_WIDTH * 8 * 2;
+/// Output channels this builder supports: one fp16 kernel group.
+pub const OUTPUT_CHANNELS: u32 = 8;
+
+/// Total CBUF banks the CNA partitions between feature data and weights.
+const CBUF_BANKS: u32 = 12;
+
+/// Largest value `CNA_CBUF_CON1.data_entries` can encode. The field is 14
+/// bits and holds `tile_input_rows * width`, so it is a hard bound on how
+/// much of a feature map one program may cover -- 63 input rows at 256 wide,
+/// 127 at 128 wide. This is the hardware reason the vendor splits tall
+/// convolutions for capacity: its own `256x256` capture uses 44-row tiles,
+/// comfortably under the 63-row ceiling.
+const MAX_DATA_ENTRIES: u32 = 0x3fff;
+
+/// Feature pixels one CBUF bank holds: 256 entries of 128 bytes, at one
+/// 16-byte feature atom per pixel, is 2048 -- but the vendor allocates in
+/// half-bank steps, which is the 1024 below.
+const PIXELS_PER_BANK_STEP: u32 = 1024;
+
+/// Logical geometry of the whole feature map a program operates on.
+///
+/// Every register formula below is validated against a sweep of 35 vendor
+/// captures (212 convolution programs) spanning widths 32..256 and heights
+/// 32..256, restricted to the supported case: `Cin=3`, `Cout=8`, stride 1,
+/// and 1x1 or 3x3 kernels.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Shape {
+    pub width: u32,
+    pub height: u32,
+}
+
+impl Shape {
+    /// The `32x32` geometry of the original vendor captures.
+    pub const CAPTURED: Shape = Shape {
+        width: IMAGE_WIDTH,
+        height: IMAGE_HEIGHT,
+    };
+
+    pub fn new(width: u32, height: u32) -> Shape {
+        assert!(
+            width > 0 && height > 0,
+            "convolution extents must be nonzero"
+        );
+        Shape { width, height }
+    }
+
+    /// Byte stride of one dense NHWC input row.
+    pub fn input_row_stride(&self) -> u32 {
+        self.width * INPUT_CHANNELS * 2
+    }
+
+    /// Byte stride of one output row.
+    pub fn output_row_stride(&self) -> u32 {
+        self.width * OUTPUT_CHANNELS * 2
+    }
+
+    /// CBUF banks the vendor assigns to feature data.
+    ///
+    /// Derived from 134 captured programs across 11 distinct `(width,
+    /// height)` shapes, every one of which also satisfies
+    /// `data_banks + weight_banks == 12`. The cap at 11 leaves one bank for
+    /// weights, which no capture goes below.
+    pub fn data_banks(&self) -> u32 {
+        (self.width * self.height)
+            .div_ceil(PIXELS_PER_BANK_STEP)
+            .clamp(1, CBUF_BANKS - 1)
+    }
+
+    /// CBUF banks the vendor assigns to weights.
+    pub fn weight_banks(&self) -> u32 {
+        CBUF_BANKS - self.data_banks()
+    }
+
+    /// Most input rows one program may read, bounded by the 14-bit
+    /// `CNA_CBUF_CON1.data_entries` field.
+    pub fn max_tile_input_rows(&self) -> u32 {
+        MAX_DATA_ENTRIES / self.width
+    }
+
+    /// Fewest tiles this shape must be split into to stay encodable.
+    ///
+    /// A tile producing `r` output rows reads up to `r + 2 * padding` input
+    /// rows once its halo is counted, so the padding is charged here rather
+    /// than discovered as an overflow inside the builder.
+    pub fn min_tiles(&self, kernels: Kernels) -> u32 {
+        let halo = 2 * kernel_programming(kernels).padding;
+        let budget = self.max_tile_input_rows().saturating_sub(halo).max(1);
+        self.height.div_ceil(budget)
+    }
+}
 
 #[derive(Clone, Copy)]
 struct KernelProgramming {
@@ -119,26 +220,27 @@ pub struct Tile {
 }
 
 impl Tile {
-    /// Splits the captured image into `tiles` row ranges.
+    /// Splits `shape` into `tiles` output-row ranges.
     ///
-    /// Reproduces the vendor's own splits: `tiles = 1` gives 32 rows,
-    /// `tiles = 2` gives 16+16, and `tiles = 3` gives 11+11+10, matching
-    /// captured groups 1, 2-3, and 4-6 respectively.
-    pub fn split(kernels: Kernels, tiles: u32) -> Vec<Tile> {
+    /// At the captured `32x32` geometry this reproduces the vendor's own
+    /// splits: `tiles = 1` gives 32 rows, `tiles = 2` gives 16+16, and
+    /// `tiles = 3` gives 11+11+10, matching captured groups 1, 2-3, and 4-6.
+    pub fn split(shape: Shape, kernels: Kernels, tiles: u32) -> Vec<Tile> {
         assert!(
-            (1..=IMAGE_HEIGHT).contains(&tiles),
-            "tile count must be between 1 and {IMAGE_HEIGHT}"
+            (1..=shape.height).contains(&tiles),
+            "tile count must be between 1 and the {} image rows",
+            shape.height
         );
         let padding = kernel_programming(kernels).padding;
-        let base = IMAGE_HEIGHT / tiles;
-        let remainder = IMAGE_HEIGHT % tiles;
+        let base = shape.height / tiles;
+        let remainder = shape.height % tiles;
 
         let mut out = Vec::with_capacity(tiles as usize);
         let mut out_first: u32 = 0;
         for index in 0..tiles {
             let out_rows = base + u32::from(index < remainder);
             let in_first = out_first.saturating_sub(padding);
-            let in_last = (out_first + out_rows - 1 + padding).min(IMAGE_HEIGHT - 1);
+            let in_last = (out_first + out_rows - 1 + padding).min(shape.height - 1);
             out.push(Tile {
                 out_first,
                 out_rows,
@@ -151,19 +253,19 @@ impl Tile {
         out
     }
 
-    /// The single tile covering the whole captured image.
-    pub fn whole(kernels: Kernels) -> Tile {
-        Tile::split(kernels, 1)[0]
+    /// The single tile covering the whole image.
+    pub fn whole(shape: Shape, kernels: Kernels) -> Tile {
+        Tile::split(shape, kernels, 1)[0]
     }
 
     /// Byte offset of this tile's first input row from the tensor base.
-    pub fn input_offset(&self) -> u32 {
-        self.in_first * INPUT_ROW_STRIDE
+    pub fn input_offset(&self, shape: Shape) -> u32 {
+        self.in_first * shape.input_row_stride()
     }
 
     /// Byte offset of this tile's first output row from the tensor base.
-    pub fn output_offset(&self) -> u32 {
-        self.out_first * OUTPUT_ROW_STRIDE
+    pub fn output_offset(&self, shape: Shape) -> u32 {
+        self.out_first * shape.output_row_stride()
     }
 }
 
@@ -184,7 +286,8 @@ fn zero<R: RegisterMeta>() -> RegCmd {
 /// 2-3 and 4-6 are alternative two- and three-core height-split programs,
 /// not continuations of this command stream.
 pub fn conv_2d(kernels: Kernels) -> Vec<RegCmd> {
-    conv_2d_tile(kernels, &Tile::whole(kernels))
+    let shape = Shape::CAPTURED;
+    conv_2d_tile(shape, kernels, &Tile::whole(shape, kernels))
 }
 
 /// Builds the single-core regcmd program for one output-row `tile`.
@@ -198,38 +301,66 @@ pub fn conv_2d(kernels: Kernels) -> Vec<RegCmd> {
 /// from the tensor base, exactly as the vendor's own split programs do. A
 /// caller relocating these must add the buffer's DMA address to the existing
 /// value rather than overwrite it.
-pub fn conv_2d_tile(kernels: Kernels, tile: &Tile) -> Vec<RegCmd> {
-    const WIDTH: u32 = IMAGE_WIDTH;
-    const HEIGHT: u32 = IMAGE_HEIGHT;
-    const INPUT_CHANNELS: u32 = 3;
+pub fn conv_2d_tile(shape: Shape, kernels: Kernels, tile: &Tile) -> Vec<RegCmd> {
+    conv_2d_tile_with_grains(shape, kernels, tile, feature_grains(kernels, tile))
+}
+
+/// The `CNA_CONV_CON2.feature_grains` value this module programs.
+///
+/// Feature rows the CNA buffers before the convolution starts. A shape sweep
+/// of 49 vendor captures shows the vendor does not use one formula: across
+/// 297 programs it matches this prefetch value 63% of the time, uses exactly
+/// `in_rows` 28% of the time, and goes *below* `in_rows` in 6% -- and no
+/// register field in the corpus separates those cases, so the choice appears
+/// to come from compiler state that never reaches the register program.
+///
+/// The TRM calls its own formula "suggested", which implies a range of valid
+/// settings rather than one correct value, and this larger-than-vendor value
+/// is the one the passing hardware tests use. `conv_grains_probe_hw` measures
+/// the range that actually works.
+pub fn feature_grains(kernels: Kernels, tile: &Tile) -> u32 {
+    tile.in_rows + kernel_programming(kernels).size + tile.pad_top
+}
+
+/// Builds a tile program with an explicit `feature_grains`, for probing which
+/// values the hardware accepts. Prefer [`conv_2d_tile`].
+pub fn conv_2d_tile_with_grains(
+    shape: Shape,
+    kernels: Kernels,
+    tile: &Tile,
+    feature_grains: u32,
+) -> Vec<RegCmd> {
     const TASK_INPUT_CHANNELS: u32 = 8;
-    const OUTPUT_CHANNELS: u32 = 8;
     const TASK_OUTPUT_CHANNELS: u32 = 16;
     const FP16_BYTES: u32 = 2;
-    const WEIGHT_BANKS: u32 = 11;
-    const DATA_BANKS: u32 = 1;
+
+    let width = shape.width;
+    let height = shape.height;
+    let weight_banks = shape.weight_banks();
+    let data_banks = shape.data_banks();
 
     assert!(
-        tile.out_rows > 0 && tile.out_first + tile.out_rows <= HEIGHT,
-        "tile output rows {}..{} fall outside the captured {HEIGHT}-row image",
+        tile.out_rows > 0 && tile.out_first + tile.out_rows <= height,
+        "tile output rows {}..{} fall outside the {height}-row image",
         tile.out_first,
         tile.out_first + tile.out_rows
     );
     assert!(
-        tile.in_rows > 0 && tile.in_first + tile.in_rows <= HEIGHT,
-        "tile input rows {}..{} fall outside the captured {HEIGHT}-row image",
+        tile.in_rows * width <= MAX_DATA_ENTRIES,
+        "tile reads {} rows of {width} pixels; CNA_CBUF_CON1.data_entries is \
+         14 bits and holds at most {MAX_DATA_ENTRIES}. Split into at least {} \
+         tiles (Shape::min_tiles)",
+        tile.in_rows,
+        shape.min_tiles(kernels),
+    );
+    assert!(
+        tile.in_rows > 0 && tile.in_first + tile.in_rows <= height,
+        "tile input rows {}..{} fall outside the {height}-row image",
         tile.in_first,
         tile.in_first + tile.in_rows
     );
 
     let kernel = kernel_programming(kernels);
-
-    // Derived from the six captured groups (12 observations per register).
-    // FEATURE_GRAINS is the count of feature rows buffered before the
-    // convolution starts. The TRM suggests `y_stride + weight_height + 1`
-    // (chapter 36), but the vendor programs a value that scales with tile
-    // height -- it buffers the whole tile, not a sliding window.
-    let feature_grains = tile.in_rows + kernel.size + tile.pad_top;
     let weight_bytes_per_kernel = kernel.size * kernel.size * TASK_INPUT_CHANNELS * FP16_BYTES;
     let weight_bytes = weight_bytes_per_kernel * OUTPUT_CHANNELS;
     let mut commands = Vec::with_capacity(136);
@@ -237,8 +368,8 @@ pub fn conv_2d_tile(kernels: Kernels, tile: &Tile) -> Vec<RegCmd> {
     // CNA preamble, followed by the DPU/DPU_RDMA ping-pong pointers.
     let mut cbuf_con0 = Register::<CnaCbufCon0>::new();
     cbuf_con0
-        .weight_bank(Bits::new(WEIGHT_BANKS))
-        .data_bank(Bits::new(DATA_BANKS));
+        .weight_bank(Bits::new(weight_banks))
+        .data_bank(Bits::new(data_banks));
     commands.push(cbuf_con0.build());
     commands.push(zero::<CnaDcompRegnum>());
     commands.push(zero::<CnaDcompCtrl>());
@@ -281,7 +412,7 @@ pub fn conv_2d_tile(kernels: Kernels, tile: &Tile) -> Vec<RegCmd> {
     );
     commands.push(
         Register::<CnaDataSize0>::new()
-            .datain_width(Bits::new(WIDTH))
+            .datain_width(Bits::new(width))
             .datain_height(Bits::new(tile.in_rows))
             .build(),
     );
@@ -293,12 +424,12 @@ pub fn conv_2d_tile(kernels: Kernels, tile: &Tile) -> Vec<RegCmd> {
     );
     commands.push(
         Register::<CnaDataSize2>::new()
-            .dataout_width(Bits::new(WIDTH))
+            .dataout_width(Bits::new(width))
             .build(),
     );
     commands.push(
         Register::<CnaDataSize3>::new()
-            .dataout_atomics(Bits::new(WIDTH * tile.out_rows))
+            .dataout_atomics(Bits::new(width * tile.out_rows))
             .build(),
     );
     commands.push(
@@ -321,7 +452,7 @@ pub fn conv_2d_tile(kernels: Kernels, tile: &Tile) -> Vec<RegCmd> {
     commands.push(cbuf_con0.build());
     commands.push(
         Register::<CnaCbufCon1>::new()
-            .data_entries(Bits::new(WIDTH * tile.in_rows))
+            .data_entries(Bits::new(width * tile.in_rows))
             .build(),
     );
     commands.push(
@@ -365,7 +496,7 @@ pub fn conv_2d_tile(kernels: Kernels, tile: &Tile) -> Vec<RegCmd> {
     );
     commands.push(
         Register::<CnaFeatureDataAddr>::new()
-            .feature_base_addr(Bits::new(tile.input_offset()))
+            .feature_base_addr(Bits::new(tile.input_offset(shape)))
             .build(),
     );
     commands.push(zero::<CnaFcCon2>());
@@ -377,17 +508,17 @@ pub fn conv_2d_tile(kernels: Kernels, tile: &Tile) -> Vec<RegCmd> {
     );
     commands.push(
         Register::<CnaDmaCon1>::new()
-            .line_stride(Bits::new(WIDTH))
+            .line_stride(Bits::new(width))
             .build(),
     );
     commands.push(
         Register::<CnaDmaCon2>::new()
-            .surf_stride(Bits::new(WIDTH * (HEIGHT - 1)))
+            .surf_stride(Bits::new(width * (height - 1)))
             .build(),
     );
     commands.push(
         Register::<CnaFcDataSize0>::new()
-            .dma_width(Bits::new(WIDTH))
+            .dma_width(Bits::new(width))
             .dma_height(Bits::new(tile.in_rows))
             .build(),
     );
@@ -426,7 +557,7 @@ pub fn conv_2d_tile(kernels: Kernels, tile: &Tile) -> Vec<RegCmd> {
     );
     commands.push(
         Register::<CoreDataoutSize0>::new()
-            .dataout_width(Bits::new(WIDTH - 1))
+            .dataout_width(Bits::new(width - 1))
             .dataout_height(Bits::new(tile.out_rows - 1))
             .build(),
     );
@@ -455,17 +586,17 @@ pub fn conv_2d_tile(kernels: Kernels, tile: &Tile) -> Vec<RegCmd> {
     commands.push(zero::<DpuOffsetPend>());
     commands.push(
         Register::<DpuDstBaseAddr>::new()
-            .dst_base_addr(Bits::new(tile.output_offset()))
+            .dst_base_addr(Bits::new(tile.output_offset(shape)))
             .build(),
     );
     commands.push(
         Register::<DpuDstSurfStride>::new()
-            .dst_surf_stride(Bits::new(WIDTH * HEIGHT))
+            .dst_surf_stride(Bits::new(width * height))
             .build(),
     );
     commands.push(
         Register::<DpuDataCubeWidth>::new()
-            .width(Bits::new(WIDTH - 1))
+            .width(Bits::new(width - 1))
             .build(),
     );
     commands.push(
@@ -508,7 +639,7 @@ pub fn conv_2d_tile(kernels: Kernels, tile: &Tile) -> Vec<RegCmd> {
     commands.push(
         Register::<DpuWdmaSize1>::new()
             .height_wdma(Bits::new(tile.out_rows - 1))
-            .width_wdma(Bits::new(WIDTH - 1))
+            .width_wdma(Bits::new(width - 1))
             .build(),
     );
     commands.push(
@@ -556,7 +687,7 @@ pub fn conv_2d_tile(kernels: Kernels, tile: &Tile) -> Vec<RegCmd> {
     commands.push(zero::<DpuEwOpValue7>());
     commands.push(
         Register::<DpuSurfaceAdd>::new()
-            .surf_add(Bits::new(WIDTH * HEIGHT * FP16_BYTES))
+            .surf_add(Bits::new(width * height * FP16_BYTES))
             .build(),
     );
     commands.push(zero::<DpuReserved40c4>());
@@ -577,7 +708,7 @@ pub fn conv_2d_tile(kernels: Kernels, tile: &Tile) -> Vec<RegCmd> {
     // DPU directly; BRDMA supplies the bias data.
     commands.push(
         Register::<DpuRdmaDataCubeWidth>::new()
-            .width(Bits::new(WIDTH - 1))
+            .width(Bits::new(width - 1))
             .build(),
     );
     commands.push(
@@ -721,7 +852,7 @@ mod tests {
 
     fn captured_tile(kernels: Kernels, group: usize) -> Tile {
         let (tiles, index) = CAPTURED_PLANS[group];
-        Tile::split(kernels, tiles)[index as usize]
+        Tile::split(Shape::CAPTURED, kernels, tiles)[index as usize]
     }
 
     fn value_of<R: RegisterMeta>(commands: &[RegCmd]) -> u32 {
@@ -746,13 +877,18 @@ mod tests {
         // across the three captured plans.
         let rows: Vec<Vec<u32>> = [1, 2, 3]
             .iter()
-            .map(|&n| Tile::split([3, 3], n).iter().map(|t| t.out_rows).collect())
+            .map(|&n| {
+                Tile::split(Shape::CAPTURED, [3, 3], n)
+                    .iter()
+                    .map(|t| t.out_rows)
+                    .collect()
+            })
             .collect();
         assert_eq!(rows, vec![vec![32], vec![16, 16], vec![11, 11, 10]]);
 
         // Every plan covers the image exactly once, with no gap or overlap.
         for tiles in 1..=IMAGE_HEIGHT {
-            let split = Tile::split([3, 3], tiles);
+            let split = Tile::split(Shape::CAPTURED, [3, 3], tiles);
             assert_eq!(split.iter().map(|t| t.out_rows).sum::<u32>(), IMAGE_HEIGHT);
             for pair in split.windows(2) {
                 assert_eq!(pair[0].out_first + pair[0].out_rows, pair[1].out_first);
@@ -764,18 +900,26 @@ mod tests {
     fn tile_halo_matches_captured_feature_offsets() {
         // DESIGN_NOTES: the 3x3 programs begin each continuation tile one
         // input row earlier than the 1x1 programs do.
-        let three = Tile::split([3, 3], 3);
-        let one = Tile::split([1, 1], 3);
+        let three = Tile::split(Shape::CAPTURED, [3, 3], 3);
+        let one = Tile::split(Shape::CAPTURED, [1, 1], 3);
         assert_eq!(
-            three.iter().map(|t| t.input_offset()).collect::<Vec<_>>(),
+            three
+                .iter()
+                .map(|t| t.input_offset(Shape::CAPTURED))
+                .collect::<Vec<_>>(),
             [0x0000, 0x0780, 0x0fc0]
         );
         assert_eq!(
-            one.iter().map(|t| t.input_offset()).collect::<Vec<_>>(),
+            one.iter()
+                .map(|t| t.input_offset(Shape::CAPTURED))
+                .collect::<Vec<_>>(),
             [0x0000, 0x0840, 0x1080]
         );
         assert_eq!(
-            three.iter().map(|t| t.output_offset()).collect::<Vec<_>>(),
+            three
+                .iter()
+                .map(|t| t.output_offset(Shape::CAPTURED))
+                .collect::<Vec<_>>(),
             [0x0000, 0x1600, 0x2c00]
         );
 
@@ -829,7 +973,7 @@ mod tests {
         for (row, kernels) in [(0usize, [3usize, 3]), (1, [1, 1])] {
             for group in 0..6 {
                 let tile = captured_tile(kernels, group);
-                let program = conv_2d_tile(kernels, &tile);
+                let program = conv_2d_tile(Shape::CAPTURED, kernels, &tile);
                 let at = |what: &str, got: u32, want: u32| {
                     assert_eq!(
                         got,
@@ -905,9 +1049,80 @@ mod tests {
     }
 
     #[test]
+    fn cbuf_bank_split_matches_every_swept_shape() {
+        // (width, height) -> data_bank, read out of CNA_CBUF_CON0 across the
+        // 134 C3/Cout8/stride-1 programs in the shape-sweep corpus. Every one
+        // also satisfies data_bank + weight_bank == 12.
+        const OBSERVED: [(u32, u32, u32); 11] = [
+            (32, 32, 1),
+            (32, 64, 2),
+            (32, 128, 4),
+            (32, 256, 8),
+            (64, 32, 2),
+            (64, 64, 4),
+            (96, 32, 3),
+            (128, 32, 4),
+            (128, 128, 11),
+            (192, 32, 6),
+            (256, 32, 8),
+        ];
+        for (width, height, data_bank) in OBSERVED {
+            let shape = Shape::new(width, height);
+            assert_eq!(
+                shape.data_banks(),
+                data_bank,
+                "data_bank for {width}x{height}"
+            );
+            assert_eq!(
+                shape.data_banks() + shape.weight_banks(),
+                12,
+                "bank split for {width}x{height} must cover all 12 CBUF banks"
+            );
+        }
+    }
+
+    #[test]
+    fn wider_shapes_scale_the_geometry_registers() {
+        // Formulas validated against 212 C3 stride-1 programs from 35 captures.
+        // 256 wide caps a tile at 63 input rows, so a 64-row image needs two.
+        let shape = Shape::new(256, 64);
+        assert_eq!(shape.max_tile_input_rows(), 63);
+        assert_eq!(shape.min_tiles([3, 3]), 2);
+
+        let split = Tile::split(shape, [3, 3], 2);
+        let tile = split[0];
+        let program = conv_2d_tile(shape, [3, 3], &tile);
+
+        assert_eq!(
+            value_of::<CnaDataSize0>(&program),
+            (256 << 16) | tile.in_rows
+        );
+        assert_eq!(value_of::<CnaCbufCon1>(&program), 256 * tile.in_rows);
+        assert_eq!(value_of::<CnaDataSize3>(&program), 256 * tile.out_rows);
+        assert_eq!(
+            value_of::<CoreDataoutSize0>(&program),
+            ((tile.out_rows - 1) << 16) | 255
+        );
+        assert_eq!(value_of::<DpuDataCubeHeight>(&program), tile.out_rows - 1);
+
+        // Row strides follow the dense NHWC input and C8 fp16 output.
+        assert_eq!(shape.input_row_stride(), 256 * 3 * 2);
+        assert_eq!(shape.output_row_stride(), 256 * 8 * 2);
+
+        // A three-way split of 64 rows, with the 3x3 halo on continuations.
+        let three = Tile::split(shape, [3, 3], 3);
+        assert_eq!(
+            three.iter().map(|t| t.out_rows).collect::<Vec<_>>(),
+            [22, 21, 21]
+        );
+        assert_eq!(three[1].in_first, 21);
+        assert_eq!(three[1].output_offset(shape), 22 * 256 * 8 * 2);
+    }
+
+    #[test]
     fn tiles_of_a_plan_write_disjoint_output_ranges() {
         for tiles in 1..=3 {
-            let split = Tile::split([3, 3], tiles);
+            let split = Tile::split(Shape::CAPTURED, [3, 3], tiles);
             let mut covered = vec![0u32; IMAGE_HEIGHT as usize];
             for tile in &split {
                 for row in tile.out_first..tile.out_first + tile.out_rows {
