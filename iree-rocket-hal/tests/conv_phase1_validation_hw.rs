@@ -140,6 +140,18 @@ fn int8_quantization() -> Precision {
     })
 }
 
+fn int8_identity_precision() -> Precision {
+    Precision::Int8(Quantization {
+        input_zero_point: 0,
+        output_zero_point: 0,
+        multiplier: Multiplier::from_ratio(1.0),
+    })
+}
+
+fn identity_bs_multiplier() -> i16 {
+    i16::try_from(1u32 << BS_MULTIPLIER_SHIFT).unwrap()
+}
+
 fn zero_bias(shape: Shape) -> Vec<u8> {
     match shape.precision {
         Precision::Fp16 => vec![0; shape.bs_buffer_bytes()],
@@ -514,17 +526,11 @@ fn clamped_int8_activation_register_path_runs_on_npu() {
     // `conv_int8_probe_hw`: a BS multiplier of 2^7 and a unit OUT_CVT. That
     // keeps the accumulator unchanged at BN, making both pass-through (4)
     // and clamped (6) values directly observable.
-    let identity_bs_multiplier = i16::try_from(1u32 << BS_MULTIPLIER_SHIFT).unwrap();
-    let precision = Precision::Int8(Quantization {
-        input_zero_point: 0,
-        output_zero_point: 0,
-        multiplier: Multiplier::from_ratio(1.0),
-    });
-    let plain = Shape::with_precision(32, 32, 1, 1, 8, precision);
+    let plain = Shape::with_precision(32, 32, 1, 1, 8, int8_identity_precision());
     let shape = plain.with_activation(activation);
     let input = fill_int8_input(shape, 1);
     let weights = vec![1; shape.weight_bytes(KERNEL) as usize];
-    let bias = int8_bias_with_multiplier(shape, identity_bs_multiplier);
+    let bias = int8_bias_with_multiplier(shape, identity_bs_multiplier());
 
     // The unactivated control proves that this synthetic identity pair
     // really returns the accumulator before drawing any conclusion about
@@ -604,6 +610,35 @@ fn clamped_int8_activation_with_default_bs_runs_on_npu() {
     );
 }
 
+/// Tests the factor implied by the two activation runs above. The default
+/// unit-BS path needs OUT_CVT to divide by `2^BS_MULTIPLIER_SHIFT`; if BN
+/// sees the value before that division, its ceiling must be in the same
+/// enlarged domain for the final quantized result to clamp at six.
+#[test]
+#[ignore = "needs /dev/accel/accel0 -- diagnoses default-BS activation scaling"]
+fn clamped_int8_default_bs_accepts_a_scaled_ceiling() {
+    let accumulator_ceiling = 6u32 << BS_MULTIPLIER_SHIFT;
+    let plain = Shape::with_precision(32, 32, 1, 1, 8, int8_quantization());
+    let shape = plain.with_activation(Activation::Clamped {
+        cmp: accumulator_ceiling,
+    });
+    let input = fill_int8_input(shape, 1);
+    let weights = vec![1; shape.weight_bytes(KERNEL) as usize];
+    let (_, output) = execute(shape, KERNEL, &input, &weights, &zero_bias(shape));
+
+    assert_int8_output(
+        "clamped int8 activation with scaled default-BS ceiling",
+        shape,
+        KERNEL,
+        &output,
+        |_, y, x| {
+            (valid_taps(y, shape.height as usize) * valid_taps(x, shape.width as usize)).min(6)
+                as i32
+        },
+        1,
+    );
+}
+
 #[test]
 #[ignore = "needs /dev/accel/accel0 -- cross-compile for aarch64 and run on the RK3588 board"]
 fn int8_depthwise_layout_reproduces_its_filter() {
@@ -611,7 +646,8 @@ fn int8_depthwise_layout_reproduces_its_filter() {
     // channel count is 12 while the packed tap stride is 16, so this fails
     // under both a channel-major layout and a tap-major layout using Cin as
     // its stride.
-    let shape = Shape::with_precision(32, 32, 1, 12, 12, int8_quantization()).with_depthwise();
+    let shape =
+        Shape::with_precision(32, 32, 1, 12, 12, int8_identity_precision()).with_depthwise();
     let mut input = vec![0; input_bytes(shape)];
     for channel in 0..shape.in_channels as usize {
         input[feature_offset(shape, channel, IMPULSE, IMPULSE)] = 1;
@@ -621,6 +657,7 @@ fn int8_depthwise_layout_reproduces_its_filter() {
         packed_stride, 16,
         "the test must distinguish real Cin 12 from packed stride 16"
     );
+    let bias = int8_bias_with_multiplier(shape, identity_bs_multiplier());
 
     // The first board run used distinct coefficient magnitudes and found
     // that int8 depthwise returned 1 for every nonzero byte. That result
@@ -633,7 +670,7 @@ fn int8_depthwise_layout_reproduces_its_filter() {
         for live_kx in 0..KERNEL[1] {
             for channel_bit in 0..4 {
                 let weights = depthwise_binary_tap_weights(shape, live_ky, live_kx, channel_bit);
-                let (_, output) = execute(shape, KERNEL, &input, &weights, &zero_bias(shape));
+                let (_, output) = execute(shape, KERNEL, &input, &weights, &bias);
                 let live_y = IMPULSE + 1 - live_ky;
                 let live_x = IMPULSE + 1 - live_kx;
                 assert_int8_output(
@@ -672,6 +709,38 @@ fn int8_depthwise_coefficient_magnitudes_are_preserved() {
 
     assert_int8_output(
         "int8 depthwise coefficient magnitudes",
+        shape,
+        KERNEL,
+        &output,
+        |channel, y, x| {
+            if y + 1 >= IMPULSE && y <= IMPULSE + 1 && x + 1 >= IMPULSE && x <= IMPULSE + 1 {
+                coefficient(channel, IMPULSE + 1 - y, IMPULSE + 1 - x)
+            } else {
+                0
+            }
+        },
+        1,
+    );
+}
+
+/// The same magnitude check with the probe-backed identity BS/CVT pair. If
+/// this passes while the default-BS case above returns one, coefficient DMA
+/// and packing are sound and the remaining defect is downstream scaling.
+#[test]
+#[ignore = "needs /dev/accel/accel0 -- diagnoses depthwise BS/CVT scaling"]
+fn int8_depthwise_magnitudes_with_identity_bs_are_preserved() {
+    let shape =
+        Shape::with_precision(32, 32, 1, 12, 12, int8_identity_precision()).with_depthwise();
+    let mut input = vec![0; input_bytes(shape)];
+    for channel in 0..shape.in_channels as usize {
+        input[feature_offset(shape, channel, IMPULSE, IMPULSE)] = 1;
+    }
+    let weights = depthwise_weights(shape);
+    let bias = int8_bias_with_multiplier(shape, identity_bs_multiplier());
+    let (_, output) = execute(shape, KERNEL, &input, &weights, &bias);
+
+    assert_int8_output(
+        "int8 depthwise coefficient magnitudes with identity BS",
         shape,
         KERNEL,
         &output,
