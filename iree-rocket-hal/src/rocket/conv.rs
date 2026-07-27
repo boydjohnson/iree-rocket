@@ -126,7 +126,15 @@ pub const IMAGE_WIDTH: u32 = 32;
 pub const INPUT_CHANNELS: u32 = 3;
 
 /// Largest input channel count with capture backing.
-pub const MAX_INPUT_CHANNELS: u32 = 80;
+///
+/// The large-`Cin` sweep walks both precisions to 512 -- 66 distinct fp16
+/// channel counts and 44 int8 -- and finds the padding and the CBUF atom
+/// charge regular the whole way. Above 512 nothing is measured.
+///
+/// This bounds the *channel* rules only. Whether a given `(Cin, Cout,
+/// kernel)` fits the twelve CBUF banks is a separate question, and one
+/// [`ConvPlan`] answers on its own.
+pub const MAX_INPUT_CHANNELS: u32 = 512;
 
 /// `CNA_DATA_SIZE1.datain_channel_real` counts `Cin - 1` modulo this, even
 /// though the field is 14 bits wide and could hold far more.
@@ -137,7 +145,7 @@ pub const MAX_INPUT_CHANNELS: u32 = 80;
 const CHANNEL_REAL_MODULUS: u32 = 64;
 
 /// Largest input-channel count the int8 sweep measures.
-pub const MAX_INT8_INPUT_CHANNELS: u32 = 128;
+pub const MAX_INT8_INPUT_CHANNELS: u32 = 512;
 
 /// Widest input pixel the vendor keeps in dense NHWC, in bytes.
 ///
@@ -155,33 +163,29 @@ pub const MAX_INT8_INPUT_CHANNELS: u32 = 128;
 /// enumerates one to four channels because it is an image-input path.
 const MAX_DENSE_CHANNELS: u32 = 4;
 
-/// Padded channel counts by feature-atom count, `(datain_channel, weights)`.
+/// Rounds a feature-atom count up to a whole group of four.
 ///
-/// Indexed by `ceil(Cin / 8) - 1`. Padding is `atoms * 8` everywhere except
-/// two measured exceptions, so this is a table rather than arithmetic:
+/// A count one short of a multiple of four takes the next multiple; every
+/// other count passes through. So 3 becomes 4, 7 becomes 8, 11 becomes 12,
+/// and 5, 6, 9, 10 are left alone.
 ///
-/// - 3 atoms (`Cin` 17..24): `datain_channel` stays 24 but weights use 32
-/// - 7 atoms (`Cin` 49..56): `datain_channel` stays 56 but weights use 64
+/// This was a two-entry table for as long as the corpus stopped at `Cin` 80,
+/// where only the 3- and 7-atom exceptions were reachable. Those two suggest
+/// `2**n - 1`, which is wrong: the large-`Cin` sweep finds exceptions at 11,
+/// 15, 19, 23, 27, 31, 35, 43, 55 and 63 atoms as well, and every one of
+/// them -- like 3 and 7 -- is one short of a multiple of four.
 ///
-/// The two exceptions are the same shape as each other, and the same shape
-/// as the CBUF atom rounding in [`Shape::cbuf_atoms`]: three and seven atoms
-/// round up, five, six, nine and ten do not.
+/// Two different quantities round this way, and they are not the same
+/// quantity:
 ///
-/// Atom counts 5, 6, 9 and 10 are unpadded, so this is neither "round to a
-/// power of two" nor "round to even", and no rule is claimed. Encoding the
-/// measurements directly avoids inventing one.
-const CHANNEL_PADDING: [(u32, u32); 10] = [
-    (8, 8),
-    (16, 16),
-    (24, 32),
-    (32, 32),
-    (40, 40),
-    (48, 48),
-    (56, 64),
-    (64, 64),
-    (72, 72),
-    (80, 80),
-];
+/// - the fp16 *weight* channel padding ([`Shape::weight_channels`]), which
+///   int8 does not share;
+/// - the CBUF atom charge ([`Shape::cbuf_atoms`]), which both precisions do.
+///
+/// Fits all 66 fp16 and all 44 int8 channel counts measured from 3 to 512.
+fn quad_atoms(atoms: u32) -> u32 {
+    if atoms % 4 == 3 { atoms + 1 } else { atoms }
+}
 
 /// Output channels of the captured reference convolution.
 pub const OUTPUT_CHANNELS: u32 = 8;
@@ -536,24 +540,32 @@ impl Shape {
 
     /// Channel count programmed into `CNA_DATA_SIZE1.datain_channel`.
     ///
-    /// The fp16 padding is a measured table with two exceptions. The int8
-    /// padding is a clean `round_up(Cin, 16)` -- checked at 15 values from 3
-    /// to 128 with no deviation, including three atoms and seven atoms,
-    /// where the fp16 table needed its exceptions. Neither recurs.
+    /// Whole atoms in both precisions, with no exception anywhere: `Cin`
+    /// rounded up to 8 at fp16 and to 16 at int8. The fp16 side used to be a
+    /// table, but only because the same table carried the weight padding,
+    /// which is where the exceptions actually live -- the feature side never
+    /// had any. Measured at 66 fp16 and 44 int8 channel counts to 512.
     pub fn padded_channels(&self) -> u32 {
-        match self.precision {
-            Precision::Fp16 => CHANNEL_PADDING[self.feature_atoms() as usize - 1].0,
-            Precision::Int8(_) => self.feature_atoms() * self.precision.channels_per_atom(),
-        }
+        self.feature_atoms() * self.precision.channels_per_atom()
     }
 
     /// Channel count the coefficient footprint is computed from.
     ///
-    /// At int8 this is always equal to `padded_channels`; the fp16 quirk
-    /// where the two disagree at three atoms does not recur.
+    /// At fp16 the atom count rounds up to a whole group of four, so `Cin`
+    /// 17..24 pads to 32 while `datain_channel` stays 24, and the same bump
+    /// lands on 88, 120, 152, 184, 216, 248, 280, 344, 440 and 504 -- every
+    /// count where `ceil(Cin / 8)` is `3 mod 4`, out to the 512 measured.
+    /// At int8 it does not: the coefficient padding is exactly
+    /// `padded_channels` at all 44 measured counts, including int8's own 3-,
+    /// 7-, 11- and 15-atom points where the fp16 rule would have bumped it.
+    ///
+    /// The asymmetry is the fp16 weight layout: the TRM has fp16 loading 16
+    /// kernels per group against int8's 32.
     pub fn weight_channels(&self) -> u32 {
         match self.precision {
-            Precision::Fp16 => CHANNEL_PADDING[self.feature_atoms() as usize - 1].1,
+            Precision::Fp16 => {
+                quad_atoms(self.feature_atoms()) * self.precision.channels_per_atom()
+            }
             Precision::Int8(_) => self.padded_channels(),
         }
     }
@@ -594,19 +606,26 @@ impl Shape {
     /// Atoms per pixel the CBUF charges for, which is neither
     /// `feature_atoms` nor `weight_atoms`.
     ///
-    /// Three atoms are charged as four and seven as eight; five, six, nine
-    /// and ten are charged as themselves. At fp16 this is invisible because
-    /// `CHANNEL_PADDING` already bumps exactly those two rows on its weight
-    /// side, so `weight_atoms` comes out pre-rounded. At int8 the padding is
-    /// exact, and the rounding has to be applied here or `data_entries`
-    /// comes out short -- `Cin` 33..48 programs 4 atoms' worth and `Cin`
-    /// 97..112 programs 8, against padded counts of 48 and 112.
+    /// The atom count rounds up to a whole group of four in *both*
+    /// precisions -- three charged as four, seven as eight, eleven as
+    /// twelve -- while five, six, nine and ten are charged as themselves.
+    ///
+    /// At fp16 below `Cin` 80 this is invisible, because the weight padding
+    /// bumps the same counts and `weight_atoms` arrives pre-rounded. At int8
+    /// the padding is exact and the rounding has to be applied here or
+    /// `data_entries` comes out short: `Cin` 33..48 programs 4 atoms' worth
+    /// against a padded 48, and 97..112 programs 8 against a padded 112.
+    ///
+    /// Above `Cin` 80 it stops being invisible at fp16 too. This was a
+    /// two-entry match while the corpus ended there; the large-`Cin` sweep
+    /// reads the charge back out of `data_entries` at 47 fp16 and 27 int8
+    /// channel counts, and the two-entry version is wrong at 20 of the fp16
+    /// and 10 of the int8 -- every one of them a `3 mod 4` atom count above
+    /// the old ceiling. Charging one atom short there would silently drop a
+    /// tile's last input rows, which is how the same class of bug surfaced
+    /// in `conv_outchannel_hw` at 256x32.
     fn cbuf_atoms(&self) -> u32 {
-        match self.feature_atoms() {
-            3 => 4,
-            7 => 8,
-            atoms => atoms,
-        }
+        quad_atoms(self.feature_atoms())
     }
 
     /// Whether the feature map is dense NHWC or NC1HWC2 surfaces.
@@ -3165,6 +3184,127 @@ mod tests {
     }
 
     #[test]
+    fn fp16_channel_padding_follows_the_quad_atom_rule_to_512() {
+        // (Cin, datain_channel, weight_channels) from the large-Cin sweep.
+        // Read against the old two-entry table, 24 and 56 look like a
+        // `2**n - 1` rule; 88, 120, 152 and the rest show it is not. Every
+        // row where the two counts disagree has an atom count of 3 mod 4,
+        // and the rows on either side of each are here to keep a rule
+        // separable from a table.
+        const OBSERVED: [(u32, u32, u32); 24] = [
+            (81, 88, 96),
+            (88, 88, 96),
+            (89, 96, 96),
+            (96, 96, 96),
+            (104, 104, 104),
+            (112, 112, 112),
+            (113, 120, 128),
+            (120, 120, 128),
+            (121, 128, 128),
+            (128, 128, 128),
+            (136, 136, 136),
+            (144, 144, 144),
+            (152, 152, 160),
+            (160, 160, 160),
+            (184, 184, 192),
+            (185, 192, 192),
+            (216, 216, 224),
+            (224, 224, 224),
+            (248, 248, 256),
+            (256, 256, 256),
+            (280, 280, 288),
+            (344, 344, 352),
+            (440, 440, 448),
+            (504, 504, 512),
+        ];
+        for (cin, padded, weights) in OBSERVED {
+            let shape = Shape::with_channels(32, 32, 1, cin);
+            assert_eq!(shape.padded_channels(), padded, "datain_channel Cin {cin}");
+            assert_eq!(
+                shape.weight_channels(),
+                weights,
+                "weight channels Cin {cin}"
+            );
+        }
+    }
+
+    #[test]
+    fn int8_channel_padding_stays_exact_where_fp16_bumps() {
+        // The same atom counts that bump at fp16 -- 11 and 15, here 176 and
+        // 240 -- pass through unchanged at int8, out to 512. The coefficient
+        // padding never leaves `padded_channels`.
+        for cin in [
+            129u32, 144, 175, 176, 177, 225, 240, 241, 304, 368, 432, 496, 512,
+        ] {
+            let shape = Shape::with_precision(32, 32, 1, cin, 8, Precision::Int8(quantization()));
+            let whole_atoms = cin.div_ceil(16) * 16;
+            assert_eq!(
+                shape.padded_channels(),
+                whole_atoms,
+                "int8 datain Cin {cin}"
+            );
+            assert_eq!(
+                shape.weight_channels(),
+                whole_atoms,
+                "int8 weights Cin {cin}"
+            );
+        }
+    }
+
+    #[test]
+    fn cbuf_atom_charge_rounds_to_whole_groups_in_both_precisions() {
+        // Recovered from `CNA_CBUF_CON1.data_entries`, which carries
+        // `input_width * cbuf_atoms / 4` in the surface regime. The two-entry
+        // version this replaced was right only below the old ceilings; every
+        // value here past them is one it charged an atom short.
+        for (cin, charged) in [
+            (32u32, 4u32),
+            (48, 6),
+            (56, 8),
+            (88, 12),
+            (96, 12),
+            (104, 13),
+            (112, 14),
+            (120, 16),
+            (128, 16),
+            (152, 20),
+            (184, 24),
+            (216, 28),
+            (248, 32),
+            (280, 36),
+            (344, 44),
+            (440, 56),
+            (504, 64),
+        ] {
+            assert_eq!(
+                Shape::with_channels(32, 32, 1, cin).cbuf_atoms(),
+                charged,
+                "fp16 CBUF atom charge at Cin {cin}"
+            );
+        }
+
+        // int8 charges the same way even though its padding does not bump.
+        for (cin, charged) in [
+            (48u32, 4u32),
+            (112, 8),
+            (176, 12),
+            (192, 12),
+            (240, 16),
+            (304, 20),
+            (368, 24),
+            (432, 28),
+            (496, 32),
+        ] {
+            let shape = Shape::with_precision(32, 32, 1, cin, 8, Precision::Int8(quantization()));
+            assert_eq!(
+                shape.cbuf_atoms(),
+                charged,
+                "int8 CBUF atom charge at Cin {cin}"
+            );
+        }
+    }
+
+    #[test]
     fn argb_input_mode_follows_the_layout() {
         // CNA_CONV_CON1 across the channel sweep: dense programs the ARGB
         // image path with nonalign_dma and group_line_off set, surfaces
@@ -3257,7 +3397,9 @@ mod tests {
     #[test]
     #[should_panic(expected = "input channels must be")]
     fn rejects_channels_beyond_the_validated_range() {
-        let _ = Shape::with_channels(32, 32, 1, 96);
+        // 96 was beyond it until the large-Cin sweep; 513 is the first value
+        // past what either precision now measures.
+        let _ = Shape::with_channels(32, 32, 1, MAX_INPUT_CHANNELS + 1);
     }
 
     #[test]

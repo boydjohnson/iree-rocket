@@ -293,15 +293,66 @@ fn run(shape: Shape, kernels: Kernels, tiles: u32) -> Result<(), Failure> {
     }
 }
 
+// Channel counts chosen to cover both sides of the dense/surface
+// boundary and every place the two padded counts can disagree.
+//
+// Below 80 these are the original rows: Cin 20 and 24 pad their
+// coefficients to 32 while datain_channel stays 24, and Cin 56 rounds
+// both up to 64. Above it are the counts the large-Cin sweep added,
+// where the same bump lands on every `3 mod 4` atom count -- 88, 120,
+// 152, 184, 216, 248, 344, 440, 504 -- with a neighbour on each side so
+// an off-by-one atom cannot pass. Those are also the counts where the
+// CBUF atom charge rounds up, which is what sizes a tile: charging one
+// atom short there drops a tile's last input rows rather than producing
+// an obviously wrong number, so the whole-map check is what catches it.
+//
+// 81 and 113 are deliberately ragged, exercising padded input lanes that
+// must contribute zero at a count the hardware rounds twice.
+//
+// Every expected value stays exact in fp16: the largest is Cin 512 at
+// nine taps, 4608, which is a multiple of four and inside the range
+// where fp16 spaces integers by four.
+const CHANNELS: [u32; 32] = [
+    3, 4, 5, 8, 12, 16, 20, 24, 32, 40, 56, 64, 72, 80, 81, 88, 96, 104, 112, 113, 120, 128, 152,
+    160, 184, 216, 248, 256, 344, 440, 504, 512,
+];
+
+/// Checks every channel count in the matrix is buildable, without a device.
+///
+/// The failure this guards against is quiet. If a tile's input rows exceed
+/// what its data banks hold, the hardware does not fault -- it reads what it
+/// has and the tile loses its last rows, which is how the capacity bug
+/// surfaced at 256x32 Cin 32. At high `Cin` the capacity shrinks fast, so
+/// every count here needs its split checked rather than assumed.
+#[test]
+fn channel_matrix_tiles_fit_their_data_banks() {
+    for cin in CHANNELS {
+        for kernels in [[1usize, 1], [3, 3]] {
+            let shape = Shape::with_channels(64, 32, 1, cin);
+            let capacity = shape.max_tile_input_rows(kernels);
+            let tiles = Tile::split(shape, kernels, shape.min_tiles(kernels));
+            for tile in &tiles {
+                assert!(
+                    tile.in_rows <= capacity,
+                    "Cin {cin} {kernels:?}: tile reads {} input rows against a \
+                     {capacity}-row capacity in {} data banks",
+                    tile.in_rows,
+                    shape.data_banks(kernels),
+                );
+            }
+            let covered: u32 = tiles.iter().map(|tile| tile.out_rows).sum();
+            assert_eq!(
+                covered,
+                shape.output_height(kernels),
+                "Cin {cin} {kernels:?}: tiles do not cover the output"
+            );
+        }
+    }
+}
+
 #[test]
 #[ignore = "needs /dev/accel/accel0 -- cross-compile for aarch64 and run on the RK3588 board"]
 fn multi_channel_convs_run_on_npu() {
-    // Channel counts chosen to cover both sides of the dense/surface
-    // boundary, every distinct padding row in the table, and both of the
-    // measured exceptions: Cin 20 and 24 pad their coefficients to 32 while
-    // datain_channel stays 24, and Cin 56 rounds both up to 64.
-    const CHANNELS: [u32; 12] = [3, 4, 5, 8, 12, 16, 20, 24, 32, 40, 56, 64];
-
     let mut failures = Vec::new();
     for cin in CHANNELS {
         for kernels in [[1usize, 1], [3, 3]] {

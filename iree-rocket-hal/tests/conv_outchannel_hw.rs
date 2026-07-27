@@ -329,34 +329,54 @@ fn attempt(shape: Shape, kernels: Kernels, failures: &mut Vec<String>) {
     }
 }
 
-#[test]
-#[ignore = "needs /dev/accel/accel0 -- cross-compile for aarch64 and run on the RK3588 board"]
-fn multi_output_channel_convs_run_on_npu() {
+/// Every `(shape, kernels)` the device test runs, as one list so the
+/// buildability check below cannot drift from it.
+fn matrix() -> Vec<(Shape, Kernels)> {
     // Values chosen so that the true and padded counts disagree in every way
     // they can: below one granule (1, 3), exactly one (8, 16), and each of
     // the ragged points between granules (9, 20, 40, 56, 72). 8 and 16 are
     // kept as the controls -- they are the only ones earlier tests covered.
-    const OUT_CHANNELS: [u32; 12] = [1, 3, 8, 9, 16, 20, 32, 40, 48, 56, 64, 128];
+    //
+    // The tail past 128 is new. Cout has capture backing to 512 and the
+    // 14-bit `weight_kernels` field encodes it, but hardware had only ever
+    // run to 128. Unlike Cin, the output padding is a clean granule with no
+    // exceptions, so these cover the range rather than probe a rule -- the
+    // interesting part is that the coefficient footprint grows with Cout
+    // until it no longer fits the CBUF, and the vendor's own single-core
+    // plan streams it rather than splitting the kernel set.
+    const OUT_CHANNELS: [u32; 18] = [
+        1, 3, 8, 9, 16, 20, 32, 40, 48, 56, 64, 128, 160, 192, 256, 320, 384, 512,
+    ];
 
-    let mut failures = Vec::new();
+    let mut cases = Vec::new();
     for cout in OUT_CHANNELS {
         for kernels in [[1usize, 1], [3, 3]] {
-            attempt(
-                Shape::with_out_channels(64, 32, 1, 8, cout),
-                kernels,
-                &mut failures,
-            );
+            cases.push((Shape::with_out_channels(64, 32, 1, 8, cout), kernels));
         }
     }
 
     // A dense input at a large kernel count: the ARGB path and the output
     // granule padding have never been exercised together.
     for cout in [16u32, 40, 128] {
-        attempt(
-            Shape::with_out_channels(64, 32, 1, 3, cout),
+        cases.push((Shape::with_out_channels(64, 32, 1, 3, cout), [3, 3]));
+    }
+
+    // Both channel axes large at once, where the coefficient footprint stops
+    // fitting the CBUF and has to stream. Cin 64 / Cout 512 is the vendor's
+    // own captured shape: 589824 bytes of coefficients, an 18-bank demand
+    // against the eight the builder grants it, and the builder computes the
+    // 4/8 split the capture programs. Cin 128 / Cout 256 is the same
+    // footprint reached from the other axis.
+    //
+    // These are the shapes that would need kernel-set splitting if streaming
+    // did not work. The vendor's single-core plan does not split -- no
+    // plan-0 program in 576 captures covers a partial kernel set -- so what
+    // is under test is whether the builder's one task is enough.
+    for (in_channels, out_channels) in [(64u32, 512u32), (128, 256)] {
+        cases.push((
+            Shape::with_out_channels(32, 32, 1, in_channels, out_channels),
             [3, 3],
-            &mut failures,
-        );
+        ));
     }
 
     // The one shape in the corpus where Cout moves the CBUF bank split: at
@@ -365,11 +385,50 @@ fn multi_output_channel_convs_run_on_npu() {
     // Cout 16, 10/2 at Cout 64). Both sides are run so a regression in the
     // contention rule cannot pass by accident.
     for cout in [16u32, 64] {
-        attempt(
-            Shape::with_out_channels(256, 32, 1, 32, cout),
-            [3, 3],
-            &mut failures,
+        cases.push((Shape::with_out_channels(256, 32, 1, 32, cout), [3, 3]));
+    }
+    cases
+}
+
+/// Checks every case is buildable, without a device.
+///
+/// A tile whose input rows exceed what its data banks hold does not fault --
+/// the hardware reads what it has and the tile loses its last rows. At large
+/// Cout the coefficients take banks away from the feature data, so the
+/// capacity has to be checked at every point rather than assumed.
+#[test]
+fn output_channel_matrix_tiles_fit_their_data_banks() {
+    for (shape, kernels) in matrix() {
+        let capacity = shape.max_tile_input_rows(kernels);
+        let tiles = Tile::split(shape, kernels, shape.min_tiles(kernels));
+        for tile in &tiles {
+            assert!(
+                tile.in_rows <= capacity,
+                "Cin {} Cout {} {kernels:?}: tile reads {} input rows against a \
+                 {capacity}-row capacity in {} data banks",
+                shape.in_channels,
+                shape.out_channels,
+                tile.in_rows,
+                shape.data_banks(kernels),
+            );
+        }
+        let covered: u32 = tiles.iter().map(|tile| tile.out_rows).sum();
+        assert_eq!(
+            covered,
+            shape.output_height(kernels),
+            "Cin {} Cout {} {kernels:?}: tiles do not cover the output",
+            shape.in_channels,
+            shape.out_channels,
         );
+    }
+}
+
+#[test]
+#[ignore = "needs /dev/accel/accel0 -- cross-compile for aarch64 and run on the RK3588 board"]
+fn multi_output_channel_convs_run_on_npu() {
+    let mut failures = Vec::new();
+    for (shape, kernels) in matrix() {
+        attempt(shape, kernels, &mut failures);
     }
 
     assert!(

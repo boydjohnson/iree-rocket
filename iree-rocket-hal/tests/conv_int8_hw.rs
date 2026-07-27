@@ -391,21 +391,61 @@ fn attempt(
     }
 }
 
+/// Checks the matrix is buildable, without a device.
+///
+/// A tile whose input rows exceed what its data banks hold does not fault;
+/// it silently loses its last rows. The int8 capacity is the fp16 one at
+/// twice the channels per atom, and the atom charge rounds up at every
+/// `3 mod 4` count, so the high-Cin rows need checking rather than assuming.
+#[test]
+fn int8_channel_matrix_tiles_fit_their_data_banks() {
+    for in_channels in [
+        1u32, 3, 4, 8, 16, 17, 32, 64, 112, 128, 175, 176, 177, 224, 239, 240, 256, 384, 512,
+    ] {
+        for kernel in [1usize, 3] {
+            let kernels = [kernel, kernel];
+            let shift = shift_for(in_channels, kernel);
+            let precision = Precision::Int8(Quantization {
+                input_zero_point: 0,
+                output_zero_point: 0,
+                multiplier: Multiplier::for_unit_bs(1.0 / f64::from(1u32 << shift)),
+            });
+            let shape = Shape::with_precision(64, 32, 1, in_channels, 8, precision);
+            let capacity = shape.max_tile_input_rows(kernels);
+            for tile in Tile::split(shape, kernels, shape.min_tiles(kernels)) {
+                assert!(
+                    tile.in_rows <= capacity,
+                    "Cin {in_channels} {kernels:?}: tile reads {} rows against {capacity}",
+                    tile.in_rows,
+                );
+            }
+        }
+    }
+}
+
 #[test]
 #[ignore = "needs /dev/accel/accel0 -- cross-compile for aarch64 and run on the RK3588 board"]
 fn int8_convs_run_on_npu() {
     let mut failures = Vec::new();
 
-    // Both sides of the dense/surface boundary, which int8 does not move.
-    for in_channels in [1u32, 3, 4, 8, 16, 17, 32, 64] {
+    // Both sides of the dense/surface boundary, which int8 does not move,
+    // then the range the large-Cin sweep opened. int8 pads to whole 16-lane
+    // atoms with no exception anywhere to 512 -- unlike fp16, which bumps
+    // every `3 mod 4` atom count -- so 176 and 240 are the values that would
+    // have bumped had the fp16 rule applied here, and 175/177 and 239/241
+    // straddle them. The CBUF atom charge does round up at those counts in
+    // both precisions, and that is what sizes the tiles below.
+    for in_channels in [
+        1u32, 3, 4, 8, 16, 17, 32, 64, 112, 128, 175, 176, 177, 224, 239, 240, 256, 384, 512,
+    ] {
         for kernel in [1usize, 3] {
             attempt(in_channels, 8, 64, kernel, 0, &mut failures);
         }
     }
 
     // Output channels across the 32-wide granule, including values that are
-    // not multiples of it.
-    for out_channels in [1u32, 8, 16, 20, 32, 40, 64] {
+    // not multiples of it, out to the 512 the corpus covers.
+    for out_channels in [1u32, 8, 16, 20, 32, 40, 64, 128, 256, 320, 512] {
         attempt(16, out_channels, 64, 3, 0, &mut failures);
     }
 
