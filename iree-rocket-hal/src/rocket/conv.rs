@@ -29,6 +29,14 @@
 //! non-square kernels only up to the demand where the captures still agree
 //! and otherwise requires an explicit split.
 //!
+//! All of that holds in both precisions. A matching int8 sweep of 60
+//! captures reproduces every kernel-geometry formula unchanged, and the
+//! paired fp16/int8 diff moves only the fields precision already moved --
+//! the precision selectors, the doubled channel counts, and the
+//! requantization path. `weight_width`, `weight_height`, `pad_left` and
+//! `pad_top` are byte-identical across precision at every rectangular
+//! geometry.
+//!
 //! Input channel count picks the memory layout. While a pixel fits in half a
 //! feature atom -- `Cin` up to 4 -- the vendor keeps it dense NHWC and the
 //! CNA pads internally. From `Cin` 5 the map becomes NC1HWC2 surfaces, and
@@ -1333,31 +1341,34 @@ fn assert_large_kernel_plan_case(shape: Shape) {
 /// Largest coefficient demand at which a non-square kernel's CBUF split is
 /// still the demand-based one.
 ///
-/// Every non-square capture at or below this takes exactly the partition
-/// [`Shape::demand_based_cbuf_partition`] computes: all 28 rectangular shapes
-/// at `Cin` 3, and the six 256x32 `Cin` 32 `Cout` 64 captures whose demand is
-/// four or five banks. The first disagreement is at seven.
+/// Every non-square capture at or below this, in *both* precisions, takes
+/// exactly the partition [`Shape::demand_based_cbuf_partition`] computes: all
+/// 28 rectangular shapes at `Cin` 3, and the 256x32 `Cin` 32 captures whose
+/// demand is one to five banks. The first disagreement is at seven.
 const MAX_NON_SQUARE_DEMAND_BASED_WEIGHT_BANKS: u32 = 5;
 
 /// CBUF split for a non-square kernel.
 ///
 /// The rectangular sweep shows the vendor's split is not a function of
-/// coefficient demand alone. At 256x32, `Cin` 32, `Cout` 64 the mirrored
+/// coefficient demand alone. At 256x32, `Cin` 32, `Cout` 64 fp16 the mirrored
 /// pairs 5x11/11x5, 7x9/9x7 and 9x11/11x9 each share a demand and each split
 /// differently, with the taller kernel of every pair landing on 8/4 while the
-/// wider one keeps its coefficient claim. Kernel height reaches the policy by
-/// a route no capture in this corpus isolates -- presumably the halo's cost
-/// on the data side, since a tall kernel needs more input rows resident.
+/// wider one keeps its coefficient claim.
+///
+/// The int8 sweep separates demand from precision. An int8 coefficient is one
+/// byte, so the same geometries ask for half the banks and stay demand-based;
+/// doubling `Cout` to 128 restores the fp16 demands exactly, and there the
+/// split leaves the demand rule too. So the break follows coefficient demand
+/// rather than precision -- but *how* it breaks does not: at matched demand
+/// all three int8 mirrored pairs split symmetrically (8/4, 8/4, 5/7) where no
+/// fp16 pair does. Whatever carries kernel height into the fp16 policy does
+/// not survive quantization, and no capture in either corpus isolates it.
 ///
 /// Below the disagreement the question does not arise, and there the
-/// 1x1/3x3 allocator is exact. Above it this refuses rather than guesses;
-/// `conv_2d_tile_with_cbuf_banks` and [`ConvPlan::with_cbuf_banks`] take an
-/// explicit split.
+/// 1x1/3x3 allocator is exact in both precisions. Above it this refuses
+/// rather than guesses; `conv_2d_tile_with_cbuf_banks` and
+/// [`ConvPlan::with_cbuf_banks`] take an explicit split.
 fn non_square_cbuf_partition(shape: Shape, kernels: Kernels) -> (u32, u32) {
-    assert!(
-        matches!(shape.precision, Precision::Fp16),
-        "non-square kernels currently have capture backing only for fp16"
-    );
     assert_eq!(
         shape.stride, 1,
         "non-square kernels currently have capture backing only at stride 1"
@@ -2516,6 +2527,63 @@ mod tests {
             ([5, 7], (7, 5)),
         ] {
             let shape = Shape::with_out_channels(256, 32, 1, 32, 64);
+            let plan = ConvPlan::new(shape, kernels);
+            assert_eq!(
+                (plan.data_banks(), plan.weight_banks()),
+                banks,
+                "{kernels:?} CBUF split"
+            );
+        }
+    }
+
+    #[test]
+    fn int8_non_square_kernels_program_the_same_geometry_words_as_fp16() {
+        // `conv-w32-h32-k3x7-s1-i8` and `conv-w32-h32-k7x3-s1-i8` in
+        // rknn-files/sweep-kshape-i8. Every geometry word matches the fp16
+        // capture of the same shape exactly -- including the coefficient
+        // footprint, where an int8 atom's doubled channel padding and halved
+        // element size cancel at these channel counts.
+        for (kernels, weight_size2, pad_con0, conv_con2, weight_bytes, per_kernel) in
+            CAPTURED_NON_SQUARE
+        {
+            if kernels == [1, 11] {
+                continue; // no int8 capture at this shape
+            }
+            let shape = Shape::with_precision(32, 32, 1, 3, 8, captured_int8());
+            let plan = ConvPlan::new(shape, kernels);
+            let program = &plan.programs()[0];
+            assert_eq!(
+                value_of::<CnaWeightSize2>(program),
+                weight_size2,
+                "{kernels:?}"
+            );
+            assert_eq!(value_of::<CnaPadCon0>(program), pad_con0, "{kernels:?}");
+            assert_eq!(value_of::<CnaConvCon2>(program), conv_con2, "{kernels:?}");
+            assert_eq!(
+                value_of::<CnaWeightSize0>(program),
+                weight_bytes,
+                "{kernels:?}"
+            );
+            assert_eq!(
+                value_of::<CnaWeightSize1>(program),
+                per_kernel,
+                "{kernels:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn int8_non_square_plans_take_the_captured_split() {
+        // 256x32, Cin 32, Cout 64 int8: an int8 coefficient is one byte, so
+        // these ask for half the fp16 demand and every one stays
+        // demand-based -- including 9x7, whose fp16 twin does not.
+        for (kernels, banks) in [
+            ([3usize, 9usize], (8u32, 4u32)),
+            ([9, 3], (8, 4)),
+            ([5, 7], (8, 4)),
+            ([7, 5], (8, 4)),
+        ] {
+            let shape = Shape::with_precision(256, 32, 1, 32, 64, captured_int8());
             let plan = ConvPlan::new(shape, kernels);
             assert_eq!(
                 (plan.data_banks(), plan.weight_banks()),
