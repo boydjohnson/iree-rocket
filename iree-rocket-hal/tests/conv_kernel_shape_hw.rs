@@ -530,6 +530,22 @@ const EVEN_KERNEL_CASES: [(Kernels, Option<Padding>); 15] = [
 /// explicit-padding cases and exercises the surface-layout DMA path.
 const EVEN_GEOMETRIES: [(u32, u32, u32, u32); 2] = [(32, 32, 3, 8), (40, 24, 16, 16)];
 
+/// Even kernels at the 256x32 `Cin` 32 pressure geometry, as
+/// `(extents, Cout)`.
+///
+/// `EVEN_GEOMETRIES` runs at one or two banks of coefficient demand, so it
+/// says nothing about the CBUF split. These are the demands the fill-in
+/// captures measured: 4x8 at four banks, 6x8 at six, and 10x10 at five and
+/// seven, the two that showed the extent was never what made 10x10 deviate.
+const EVEN_PRESSURE_CASES: [(Kernels, u32); 4] =
+    [([4, 8], 64), ([6, 8], 64), ([10, 10], 24), ([10, 10], 32)];
+
+/// The int8 half, with `Cout` doubled so the coefficient demand matches its
+/// fp16 twin. `6x8` is missing on purpose -- at demand 6 int8 leaves the
+/// demand rule where fp16 does not, so `ConvPlan::new` refuses it.
+const INT8_EVEN_PRESSURE_CASES: [(Kernels, u32); 3] =
+    [([4, 8], 128), ([10, 10], 48), ([10, 10], 64)];
+
 fn even_shape(
     width: u32,
     height: u32,
@@ -666,6 +682,25 @@ fn even_kernel_hardware_matrix_is_plannable() {
     }
 
     assert_eq!(plans, EVEN_GEOMETRIES.len() * EVEN_KERNEL_CASES.len() * 2);
+
+    // The pressure cases, where the CBUF split rather than the geometry is
+    // what is under test. These are planned per precision because the two
+    // bounds differ there, so the fp16 and int8 sets are not the same shapes.
+    for (kernels, out_channels) in EVEN_PRESSURE_CASES {
+        let shape = Shape::with_out_channels(256, 32, 1, 32, out_channels);
+        assert!(
+            !ConvPlan::new(shape, kernels).tiles().is_empty(),
+            "fp16 pressure {kernels:?} Cout {out_channels} planned no tiles"
+        );
+    }
+    for (kernels, out_channels) in INT8_EVEN_PRESSURE_CASES {
+        let shift = shift_for(32, kernels);
+        let shape = Shape::with_precision(256, 32, 1, 32, out_channels, int8_precision(shift));
+        assert!(
+            !ConvPlan::new(shape, kernels).tiles().is_empty(),
+            "int8 pressure {kernels:?} Cout {out_channels} planned no tiles"
+        );
+    }
 }
 
 #[test]
@@ -745,6 +780,17 @@ fn fp16_even_square_and_rectangular_kernels_run_on_npu() {
         }
     }
 
+    // The pressure geometry, which the matrix above never reaches: at Cin 32
+    // and these Cout the coefficient claim is five and seven banks rather
+    // than one or two, so the CBUF split is doing real work. 10x10 is here
+    // because it is newly plannable -- the fill-in captures show it follows
+    // the demand rule below the ceiling, where a single Cout 64 capture had
+    // previously made the whole extent look special.
+    for (kernels, out_channels) in EVEN_PRESSURE_CASES {
+        let shape = Shape::with_out_channels(256, 32, 1, 32, out_channels);
+        attempt(&ConvPlan::new(shape, kernels), 0, &mut failures);
+    }
+
     assert_no_failures(failures);
 }
 
@@ -806,6 +852,17 @@ fn int8_even_square_and_rectangular_kernels_run_on_npu() {
             );
             attempt(&ConvPlan::new(shape, kernels), shift, &mut failures);
         }
+    }
+
+    // The int8 pressure set is not the fp16 one with a doubled Cout. A 6x8
+    // reaches demand 6 there, which int8 captures as 8/4 against the demand
+    // rule's 6/6, so the planner refuses it and it is absent here. The square
+    // 10x10 cases stay, because the even square bound holds in both
+    // precisions.
+    for (kernels, out_channels) in INT8_EVEN_PRESSURE_CASES {
+        let shift = shift_for(32, kernels);
+        let shape = Shape::with_precision(256, 32, 1, 32, out_channels, int8_precision(shift));
+        attempt(&ConvPlan::new(shape, kernels), shift, &mut failures);
     }
 
     assert_no_failures(failures);

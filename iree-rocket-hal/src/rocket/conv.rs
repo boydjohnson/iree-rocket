@@ -1265,7 +1265,8 @@ impl Tile2D {
 ///
 /// For 1x1 and 3x3 this is the existing demand-based allocator. Even kernels
 /// use that allocator too, at stride 1, through the demands the even sweep
-/// measures: eight banks square and six with two even extents. The fp16
+/// measures: eight banks square in both precisions, and with two even extents
+/// six in fp16 and four in int8. The fp16
 /// stride-1 5x5 through 11x11 policies are the conservative partitions from
 /// the focused capture and hardware sweep. The three shapes that require
 /// horizontal tiling retain their hardware-proven captured boundaries; other
@@ -1482,27 +1483,54 @@ const MAX_NON_SQUARE_DEMAND_BASED_WEIGHT_BANKS: u32 = 5;
 /// Largest coefficient demand for which the even square captures follow the
 /// demand-based CBUF split.
 ///
-/// The even sweep reaches eight banks at 8x8 and agrees exactly. A 10x10
-/// pressure shape asks for thirteen and is instead programmed 5/7, so demand
-/// alone no longer chooses the split there. Nothing measures the demands
-/// between, because no even square extent lands in 9..=12 at the pressure
-/// geometry.
+/// The even sweep reaches eight banks at 8x8 and agrees exactly. Eight is
+/// also where it stops, which the fill-in row measures directly rather than
+/// leaving to the gap between 8x8 and 10x10: holding the kernel at 8x8 and
+/// walking `Cout` through 72, 80, 88, 96 and 104 steps the demand through
+/// 9..=13, and every one of those five is captured 8/4 where the demand rule
+/// asks for 3/9, 2/10 and 1/11.
+///
+/// This also settles what the lone 10x10 capture meant. It was read as an
+/// extent the vendor treats differently; it is not. A 10x10 at `Cout` 24 and
+/// 32 -- demands 5 and 7 -- takes the demand-based split exactly, so 10x10
+/// plans unaided below the ceiling like any other even square, and the 5/7 at
+/// `Cout` 64 is the demand-13 behaviour rather than a property of the kernel.
+///
+/// Holds in both precisions: every int8 even square at or below eight matches
+/// too.
 const MAX_EVEN_SQUARE_DEMAND_BASED_WEIGHT_BANKS: u32 = 8;
 
 /// Largest coefficient demand for which a kernel with two even extents
-/// follows the demand-based CBUF split.
+/// follows the demand-based CBUF split, in fp16.
 ///
 /// Separate from [`MAX_NON_SQUARE_DEMAND_BASED_WEIGHT_BANKS`] because the odd
 /// corpus and the even one disagree about where demand stops deciding, and
 /// each measures its own parity. The even pressure row runs 4x8/8x4 at four
-/// banks, 4x10/10x4 at five and 6x8/8x6 at six, and every mirrored pair takes
-/// the demand-based split -- where the odd rectangles already disagree with
-/// their mirrors at seven (5x11/11x5) and eight (7x9/9x7).
+/// banks, 4x10/10x4 at five and 6x8/8x6 at six, and every one of those takes
+/// the demand-based split.
 ///
-/// Six rather than the square path's eight because six is where the even
-/// rectangles stop: no captured even non-square shape lands between seven and
-/// twelve banks at the pressure geometry.
-const MAX_EVEN_NON_SQUARE_DEMAND_BASED_WEIGHT_BANKS: u32 = 6;
+/// Six is where they stop, and the fill-in row measures the stop rather than
+/// assuming it: at eight banks the mirrored pair 6x10 / 10x6 splits 4/8
+/// against 8/4. So the orientation asymmetry the odd rectangles show at seven
+/// and eight is *not* absent from even extents -- it starts one demand step
+/// later. In both parities the member that departs from demand is the taller
+/// of the pair, and in both the corpus offers no rule for which way it goes.
+const MAX_EVEN_NON_SQUARE_FP16_DEMAND_BASED_WEIGHT_BANKS: u32 = 6;
+
+/// The same bound in int8, where it is lower.
+///
+/// int8 leaves the demand rule earlier and less tidily. At `Cin` 32, `Cout`
+/// 128 the mirrored pairs 4x8/8x4 (demand 4) match, 6x8/8x6 (six) are
+/// captured 8/4 where demand asks 6/6, 6x10/10x6 (eight) match again, and
+/// 8x10/10x8 (ten) split 2/10 against 7/5. Agreement is not monotone in
+/// demand, so the last demand below the first disagreement is the only bound
+/// the data supports, and that is four.
+///
+/// That a lower bound is needed at all was found by measurement, not
+/// prediction: the fp16 fill-in row was what prompted running the same
+/// comparison in int8, and the int8 disagreement at six sits below the fp16
+/// bound of six.
+const MAX_EVEN_NON_SQUARE_INT8_DEMAND_BASED_WEIGHT_BANKS: u32 = 4;
 
 fn even_square_cbuf_partition(shape: Shape, kernels: Kernels) -> (u32, u32) {
     assert_eq!(
@@ -1541,10 +1569,12 @@ fn even_square_cbuf_partition(shape: Shape, kernels: Kernels) -> (u32, u32) {
 /// rather than guesses; `conv_2d_tile_with_cbuf_banks` and
 /// [`ConvPlan::with_cbuf_banks`] take an explicit split.
 ///
-/// A kernel with two even extents is bounded by its own corpus instead. The
-/// odd disagreement is not evidence about shapes the even sweep measured
-/// directly, and refusing a captured 6x8 because an uncaptured 5x11 misbehaves
-/// would be reading one parity's policy off the other's.
+/// A kernel with two even extents is bounded by its own corpus instead, and
+/// per precision. The odd disagreement is not evidence about shapes the even
+/// sweep measured directly, and refusing a captured 6x8 because an uncaptured
+/// 5x11 misbehaves would be reading one parity's policy off the other's. The
+/// even bounds are lower than the even square path's eight because a mirrored
+/// pair can disagree where a square has no mirror to disagree with.
 fn non_square_cbuf_partition(shape: Shape, kernels: Kernels) -> (u32, u32) {
     assert_eq!(
         shape.stride, 1,
@@ -1552,10 +1582,10 @@ fn non_square_cbuf_partition(shape: Shape, kernels: Kernels) -> (u32, u32) {
     );
     let kernel = shape.kernel_programming(kernels);
     let both_even = kernel.height.is_multiple_of(2) && kernel.width.is_multiple_of(2);
-    let (limit, parity) = if both_even {
-        (MAX_EVEN_NON_SQUARE_DEMAND_BASED_WEIGHT_BANKS, "even")
-    } else {
-        (MAX_NON_SQUARE_DEMAND_BASED_WEIGHT_BANKS, "non-square")
+    let (limit, parity) = match (both_even, shape.precision) {
+        (true, Precision::Fp16) => (MAX_EVEN_NON_SQUARE_FP16_DEMAND_BASED_WEIGHT_BANKS, "even"),
+        (true, _) => (MAX_EVEN_NON_SQUARE_INT8_DEMAND_BASED_WEIGHT_BANKS, "even"),
+        (false, _) => (MAX_NON_SQUARE_DEMAND_BASED_WEIGHT_BANKS, "non-square"),
     };
     let demand = shape.weight_bank_demand(kernels);
     assert!(
@@ -2618,9 +2648,9 @@ mod tests {
     #[test]
     fn even_non_square_plans_take_the_captured_split_at_every_measured_demand() {
         // The even sweep's pressure row: 256x32, Cin 32, Cout 64 fp16, where
-        // coefficient demand is `ceil(kh * kw / 8)`. Unlike the odd
-        // rectangles, every mirrored even pair agrees with its twin and with
-        // the demand-based allocator, through six banks.
+        // coefficient demand is `ceil(kh * kw / 8)`. Through six banks every
+        // mirrored even pair agrees with its twin and with the demand-based
+        // allocator.
         for (kernels, banks) in [
             ([4usize, 8usize], (8u32, 4u32)),
             ([8, 4], (8, 4)),
@@ -2640,12 +2670,49 @@ mod tests {
     }
 
     #[test]
+    fn even_square_plans_follow_demand_to_the_measured_ceiling() {
+        // 10x10 was refused outright before the fill-in row, on the strength
+        // of a single Cout 64 capture at demand 13. Walking Cout down shows
+        // the extent was never the problem: at demands 5 and 7 a 10x10 takes
+        // exactly the demand-based split the captures show.
+        for (cout, banks) in [(24u32, (7u32, 5u32)), (32, (5, 7))] {
+            let plan = ConvPlan::new(Shape::with_out_channels(256, 32, 1, 32, cout), [10, 10]);
+            assert_eq!(
+                (plan.data_banks(), plan.weight_banks()),
+                banks,
+                "10x10 Cout {cout} CBUF split"
+            );
+        }
+        // 8x8 at Cout 64 is the last demand the ladder confirms, at eight.
+        let plan = ConvPlan::new(Shape::with_out_channels(256, 32, 1, 32, 64), [8, 8]);
+        assert_eq!((plan.data_banks(), plan.weight_banks()), (4, 8));
+    }
+
+    #[test]
+    #[should_panic(expected = "even square kernel [8, 8] needs 9")]
+    fn automatic_plan_refuses_the_even_square_ladder_above_eight_banks() {
+        // Cout 72 puts 8x8 at demand 9, the first rung the ladder shows
+        // leaving the demand rule: the capture is 8/4 where demand asks 3/9.
+        let _ = ConvPlan::new(Shape::with_out_channels(256, 32, 1, 32, 72), [8, 8]);
+    }
+
+    #[test]
     #[should_panic(expected = "even kernel [6, 10] needs 8")]
-    fn automatic_plan_refuses_even_non_square_demand_the_even_sweep_skips() {
-        // 6x10 asks for eight banks. The even square path reaches eight at
-        // 8x8, but no captured even *rectangle* lands between seven and
-        // twelve, so the square's ceiling is not evidence about this shape.
+    fn automatic_plan_refuses_the_even_rectangle_that_disagrees_with_its_mirror() {
+        // 6x10 and 10x6 both ask for eight banks and are captured 4/8 and
+        // 8/4. Demand cannot choose between them, so neither is planned --
+        // even though 6x10's own capture happens to match the demand rule.
         let _ = ConvPlan::new(Shape::with_out_channels(256, 32, 1, 32, 64), [6, 10]);
+    }
+
+    #[test]
+    #[should_panic(expected = "even kernel [6, 8] needs 6")]
+    fn automatic_plan_refuses_int8_even_rectangles_fp16_still_plans() {
+        // The one place the two precisions need different bounds. At Cin 32,
+        // Cout 128 int8 a 6x8 is captured 8/4 where demand asks 6/6, while
+        // the matching fp16 shape at demand 6 takes 6/6 exactly.
+        let shape = Shape::with_precision(256, 32, 1, 32, 128, captured_int8());
+        let _ = ConvPlan::new(shape, [6, 8]);
     }
 
     #[test]
