@@ -722,13 +722,17 @@ fn int8_depthwise_raw_slot_probe() {
         );
     }
 
-    println!("int8 depthwise zero-based raw-slot responses:");
+    println!("int8 depthwise 0x80-based raw-slot responses:");
 
     for slot in [
         0usize, 1, 8, 11, 12, 15, 16, 17, 123, 127, 128, 139, 140, 143,
     ] {
-        let mut weights = vec![0; weight_bytes];
-        weights[slot] = 1;
+        // The uniform sweep above establishes 0x80 as a neutral byte for
+        // this depthwise path. A single 0x00 against that background gives
+        // a visible one-LSB response without the 3x3/all-channel background
+        // that made the original zero-based probe uninterpretable.
+        let mut weights = vec![0x80; weight_bytes];
+        weights[slot] = 0;
         let (_, output) = execute(shape, KERNEL, &input, &weights, &bias);
 
         let mut count = 0usize;
