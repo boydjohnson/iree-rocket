@@ -805,7 +805,11 @@ fn int8_depthwise_coefficient_magnitudes_are_preserved() {
             if y + 1 >= IMPULSE && y <= IMPULSE + 1 && x + 1 >= IMPULSE && x <= IMPULSE + 1 {
                 coefficient(channel, IMPULSE + 1 - y, IMPULSE + 1 - x)
             } else {
-                0
+                // This synthetic conversion uses -128 as the quantized
+                // encoding of real zero so that subtracting the depthwise
+                // path's equally-scaled baseline leaves the 108 live
+                // coefficient values directly readable as 1..=108.
+                -128
             }
         },
         1,
