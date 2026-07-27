@@ -578,16 +578,19 @@ impl Shape {
     /// At int8 `Cout` 1 the hardware's output depends on bytes past what
     /// `bs_buffer_bytes(1)` declares: poisoning the tail of that buffer
     /// changes the result, while the same poison at `Cout` 8 -- which
-    /// declares the same single 64-byte block -- changes nothing. It also
-    /// explains a failure that came and went between identical runs, since
-    /// what lies past the declared region is whatever the allocator last
-    /// left there. `Cout` 1 is fine at fp16, so this is specific to the
-    /// int8 BRDMA fetch, which reads a multiplier alongside the bias.
+    /// declares the same single 64-byte block -- changes nothing. `Cout` 1
+    /// is fine at fp16, so this is specific to the int8 BRDMA fetch, which
+    /// reads a multiplier alongside the bias.
     ///
-    /// How far past it reads is not established -- the padded count is an
-    /// upper bound that covers it, not a measurement. Populating the whole
-    /// range with default entries costs a few hundred bytes and makes every
-    /// byte the hardware might fetch a defined one.
+    /// **This does not fix that.** Populating the padded count leaves the
+    /// behaviour unchanged: with 256 bytes written instead of 64, poisoning
+    /// the remainder still moves the answer, so BRDMA reads past the padded
+    /// count as well. `int8_bs_read_extent_probe` measures how far it
+    /// actually reads; until that lands, `Cout` 1 is a known-bad case at
+    /// int8 rather than a solved one.
+    ///
+    /// The padded count is used here because it is defined and cheap, not
+    /// because it is sufficient.
     pub fn bs_buffer_bytes(&self) -> usize {
         bs_buffer_bytes(self.padded_out_channels())
     }

@@ -157,10 +157,21 @@ unsafe fn fill_input(base: *mut u8, size: usize, shape: Shape, surfaces: usize) 
 struct Tails {
     weights: u8,
     bs: u8,
+    /// Channels' worth of BS entries to populate. `None` uses the shape's
+    /// padded count. Anything past this is poisoned with `bs`.
+    bs_channels: Option<u32>,
+    /// BS bytes to allocate, so the poisoned region can be made far larger
+    /// than the populated one. `None` page-rounds the populated size.
+    bs_alloc: Option<usize>,
 }
 
 impl Tails {
-    const NONE: Tails = Tails { weights: 0, bs: 0 };
+    const NONE: Tails = Tails {
+        weights: 0,
+        bs: 0,
+        bs_channels: None,
+        bs_alloc: None,
+    };
 }
 
 struct Failure {
@@ -220,12 +231,14 @@ fn run(
 
         // The BS buffer. Zero bias at unit multiplier -- and emphatically not
         // a zeroed buffer, which would multiply everything by zero.
-        // Sized and filled for the padded channel count: BRDMA reads past
-        // what the true count declares at Cout 1.
-        let bs_bytes = shape.bs_buffer_bytes();
-        let buf_bs = Buffer::new(fd, page_aligned_size(bs_bytes), &file);
+        // Populated for the padded channel count by default. The probe
+        // overrides it to find how far BRDMA actually reads.
+        let bs_channels = tails.bs_channels.unwrap_or(shape.padded_out_channels());
+        let bs_bytes = bs_buffer_bytes(bs_channels);
+        let bs_alloc = tails.bs_alloc.unwrap_or(0).max(page_aligned_size(bs_bytes));
+        let buf_bs = Buffer::new(fd, bs_alloc, &file);
         ptr::write_bytes(buf_bs.host_ptr, 0, buf_bs.size);
-        let entries = vec![BsEntry::default(); shape.padded_out_channels() as usize];
+        let entries = vec![BsEntry::default(); bs_channels as usize];
         write_bs_buffer(
             std::slice::from_raw_parts_mut(buf_bs.host_ptr, buf_bs.size),
             &entries,
@@ -535,15 +548,16 @@ fn int8_single_output_channel_probe() {
             Tails::NONE,
             Tails {
                 weights: 0x7f,
-                bs: 0,
+                ..Tails::NONE
             },
             Tails {
-                weights: 0,
                 bs: 0x7f,
+                ..Tails::NONE
             },
             Tails {
                 weights: 0xff,
                 bs: 0xff,
+                ..Tails::NONE
             },
         ] {
             let shift = shift_for(16, 3);
@@ -592,6 +606,81 @@ fn int8_single_output_channel_probe() {
         int8.padded_out_channels(),
         bs_buffer_bytes(int8.out_channels),
         int8.bs_buffer_bytes(),
+    );
+}
+
+/// Measures how far past its declared BS buffer the hardware reads.
+///
+/// The first probe established that at `Cout` 1 the output depends on bytes
+/// after `bs_buffer_bytes(1)`, and that the coefficients are innocent.
+/// Sizing the buffer to the padded output count did not fix it: with 256
+/// bytes populated instead of 64, poisoning the remainder still moves the
+/// answer. So the padded count is not an upper bound and guessing a larger
+/// one is the same mistake twice.
+///
+/// This walks the populated prefix instead. A 64 KB buffer is allocated
+/// every time; only the first `channels` worth of BS entries are written and
+/// everything past it is poisoned. The smallest prefix at which the poison
+/// stops mattering is how far BRDMA reads.
+///
+/// The repeats matter as much as the prefix. The instability alternates
+/// between two states on consecutive runs rather than scattering, which
+/// looks like the shadow register banks ping-ponging per job rather than
+/// stale memory -- so a prefix is only clean if it is stable across an even
+/// and an odd job.
+///
+/// `Cout` 8 is the control. It never showed the sensitivity, so its rows
+/// should be stable at every prefix, including the shortest.
+#[test]
+#[ignore = "needs /dev/accel/accel0 -- cross-compile for aarch64 and run on the RK3588 board"]
+fn int8_bs_read_extent_probe() {
+    const REPEATS: usize = 4;
+    const ALLOC: usize = 64 * 1024;
+
+    for out_channels in [1u32, 8] {
+        println!("\n  Cout {out_channels}, 64 KB allocated, poison 0x7f past the prefix:");
+        for channels in [8u32, 32, 64, 128, 256, 512, 1024, 2048] {
+            let shift = shift_for(16, 3);
+            let precision = Precision::Int8(Quantization {
+                input_zero_point: 0,
+                output_zero_point: 0,
+                multiplier: Multiplier::for_unit_bs(1.0 / f64::from(1u32 << shift)),
+            });
+            let shape = Shape::with_precision(64, 32, 1, 16, out_channels, precision);
+            let tails = Tails {
+                weights: 0,
+                bs: 0x7f,
+                bs_channels: Some(channels),
+                bs_alloc: Some(ALLOC),
+            };
+            let mut observed = Vec::new();
+            for _ in 0..REPEATS {
+                observed.push(match run(shape, [3, 3], shift, 0, tails) {
+                    Ok(differences) => differences,
+                    Err(failure) => failure.differences,
+                });
+            }
+            let stable = observed.windows(2).all(|pair| pair[0] == pair[1]);
+            let clean = stable && observed[0].iter().all(|difference| difference.abs() <= 1);
+            println!(
+                "    prefix {channels:>5} channels ({:>6} B)  {}  got - want {:?}",
+                bs_buffer_bytes(channels),
+                if clean {
+                    "clean   "
+                } else if stable {
+                    "stable  "
+                } else {
+                    "UNSTABLE"
+                },
+                observed,
+            );
+        }
+    }
+    println!(
+        "\n  the smallest clean prefix is what the BS buffer has to cover; \
+         a Cout 1 convolution declares {} bytes and pads to {}",
+        bs_buffer_bytes(1),
+        bs_buffer_bytes(32),
     );
 }
 
