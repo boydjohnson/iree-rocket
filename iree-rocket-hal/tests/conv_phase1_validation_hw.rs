@@ -488,8 +488,10 @@ fn valid_taps(coordinate: usize, extent: usize) -> usize {
 fn validation_shapes_still_exercise_the_phase1_gaps() {
     assert_eq!(
         Activation::clamped_int8(0.75, 0.5, 0.25),
-        Activation::Clamped { cmp: 6 },
-        "the int8 fixture must encode a nontrivial accumulator-unit ceiling"
+        Activation::Clamped {
+            cmp: 6 << BS_MULTIPLIER_SHIFT
+        },
+        "the int8 fixture must encode its ceiling in the default post-BS domain"
     );
 
     let int8_depthwise =
@@ -515,7 +517,7 @@ fn clamped_int8_activation_register_path_runs_on_npu() {
     // results are therefore 4 at corners, 6 at edges, and 6 in the interior.
     // A bypassed clamp returns 9 in the interior, while treating 0.75 as a
     // raw integer clamps almost everything to zero.
-    let activation = Activation::clamped_int8(0.75, 0.5, 0.25);
+    let activation = Activation::Clamped { cmp: 6 };
     assert_eq!(activation, Activation::Clamped { cmp: 6 });
 
     // `BsEntry::default()` carries multiplier 2^14 and
@@ -571,11 +573,11 @@ fn clamped_int8_activation_register_path_runs_on_npu() {
 ///
 /// The first board run returned zero for every activated output even though
 /// the unactivated int8 suite establishes that this BS/OUT_CVT pair returns
-/// the raw accumulator. Keep this as a correctness test, not an
-/// expected-failure test: the gap is not closed until both the control and
-/// activated halves pass.
+/// the raw accumulator. A second run with the comparator multiplied by the
+/// effective BS gain clamped correctly; `Activation::clamped_int8` now
+/// performs that conversion.
 #[test]
-#[ignore = "needs /dev/accel/accel0 -- currently exposes the int8 BN/BS integration defect"]
+#[ignore = "needs /dev/accel/accel0 -- validates the corrected int8 BN/BS integration"]
 fn clamped_int8_activation_with_default_bs_runs_on_npu() {
     let activation = Activation::clamped_int8(0.75, 0.5, 0.25);
     let plain = Shape::with_precision(32, 32, 1, 1, 8, int8_quantization());
@@ -599,35 +601,6 @@ fn clamped_int8_activation_with_default_bs_runs_on_npu() {
     let (_, output) = execute(shape, KERNEL, &input, &weights, &bias);
     assert_int8_output(
         "clamped int8 activation with default BS",
-        shape,
-        KERNEL,
-        &output,
-        |_, y, x| {
-            (valid_taps(y, shape.height as usize) * valid_taps(x, shape.width as usize)).min(6)
-                as i32
-        },
-        1,
-    );
-}
-
-/// Tests the factor implied by the two activation runs above. The default
-/// unit-BS path needs OUT_CVT to divide by `2^BS_MULTIPLIER_SHIFT`; if BN
-/// sees the value before that division, its ceiling must be in the same
-/// enlarged domain for the final quantized result to clamp at six.
-#[test]
-#[ignore = "needs /dev/accel/accel0 -- diagnoses default-BS activation scaling"]
-fn clamped_int8_default_bs_accepts_a_scaled_ceiling() {
-    let accumulator_ceiling = 6u32 << BS_MULTIPLIER_SHIFT;
-    let plain = Shape::with_precision(32, 32, 1, 1, 8, int8_quantization());
-    let shape = plain.with_activation(Activation::Clamped {
-        cmp: accumulator_ceiling,
-    });
-    let input = fill_int8_input(shape, 1);
-    let weights = vec![1; shape.weight_bytes(KERNEL) as usize];
-    let (_, output) = execute(shape, KERNEL, &input, &weights, &zero_bias(shape));
-
-    assert_int8_output(
-        "clamped int8 activation with scaled default-BS ceiling",
         shape,
         KERNEL,
         &output,
@@ -687,6 +660,79 @@ fn int8_depthwise_layout_reproduces_its_filter() {
                 );
             }
         }
+    }
+}
+
+/// Samples the raw int8 coefficient address space one slot at a time.
+///
+/// The fp16 probe established tap-major order, but the first int8 layout run
+/// showed that one or more live `1` bytes can drive every channel and every
+/// tap. That makes a many-hot bit-plane fixture impossible to interpret.
+/// These landmarks separate:
+///
+/// - adjacent real channels within tap zero (`0`, `1`, `8`, `11`);
+/// - its four padding lanes (`12`, `15`);
+/// - the first two channels of tap one (`16`, `17`);
+/// - the last real and padding lanes of taps seven and eight.
+///
+/// This is diagnostic rather than an assertion about a guessed layout. The
+/// all-zero control is asserted, and each one-hot response is printed as a
+/// count, channel set, and coordinate sample for the next derivation step.
+#[test]
+#[ignore = "needs /dev/accel/accel0 -- prints one-hot int8 depthwise slot responses"]
+fn int8_depthwise_raw_slot_probe() {
+    let shape =
+        Shape::with_precision(32, 32, 1, 12, 12, int8_identity_precision()).with_depthwise();
+    let mut input = vec![0; input_bytes(shape)];
+    for channel in 0..shape.in_channels as usize {
+        input[feature_offset(shape, channel, IMPULSE, IMPULSE)] = 1;
+    }
+    let bias = int8_bias_with_multiplier(shape, identity_bs_multiplier());
+    let weight_bytes = shape.weight_bytes(KERNEL) as usize;
+    assert_eq!(weight_bytes, 9 * 16);
+
+    let (_, zero_output) = execute(shape, KERNEL, &input, &vec![0; weight_bytes], &bias);
+    assert_int8_output(
+        "all-zero int8 depthwise coefficient control",
+        shape,
+        KERNEL,
+        &zero_output,
+        |_, _, _| 0,
+        0,
+    );
+    println!("int8 depthwise raw-slot probe: all-zero control is zero");
+
+    for slot in [
+        0usize, 1, 8, 11, 12, 15, 16, 17, 123, 127, 128, 139, 140, 143,
+    ] {
+        let mut weights = vec![0; weight_bytes];
+        weights[slot] = 1;
+        let (_, output) = execute(shape, KERNEL, &input, &weights, &bias);
+
+        let mut count = 0usize;
+        let mut channels = Vec::new();
+        let mut samples = Vec::new();
+        for channel in 0..shape.out_channels as usize {
+            for y in 0..shape.output_height(KERNEL) as usize {
+                for x in 0..shape.output_width(KERNEL) as usize {
+                    let value = output[output_offset(shape, KERNEL, channel, y, x)] as i8;
+                    if value == 0 {
+                        continue;
+                    }
+                    count += 1;
+                    if !channels.contains(&channel) {
+                        channels.push(channel);
+                    }
+                    if samples.len() < 16 {
+                        samples.push(format!("c{channel}@({y},{x})={value}"));
+                    }
+                }
+            }
+        }
+        println!(
+            "  slot {slot:3}: {count:5} nonzero, channels {channels:?}, samples [{}]",
+            samples.join(", ")
+        );
     }
 }
 

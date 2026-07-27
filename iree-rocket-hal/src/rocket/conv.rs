@@ -478,15 +478,28 @@ impl Activation {
     /// A clamped ReLU for an int8 convolution.
     ///
     /// The int8 accumulator is a scaled integer, so the ceiling is divided
-    /// by the accumulator's unit -- `input_scale * weights_scale` -- and
-    /// rounded. This is why the two scales are taken separately rather than
-    /// as the [`Multiplier`] the output conversion uses: that one has the
-    /// output scale divided into it already and cannot be undone.
+    /// by the accumulator's unit -- `input_scale * weights_scale` -- then
+    /// expressed in the BN stage's post-BS domain. [`BsEntry::default`]
+    /// multiplies by [`BS_UNIT_MULTIPLIER`] and the hardware applies the
+    /// effective shift [`BS_MULTIPLIER_SHIFT`], giving a gain of 128 before
+    /// BN sees the value. [`Multiplier::for_unit_bs`] removes that gain
+    /// later, in `OUT_CVT`, after the clamp has already happened.
+    ///
+    /// This is why the two scales are taken separately rather than as the
+    /// [`Multiplier`] the output conversion uses: that one has the output
+    /// scale divided into it already and cannot be undone.
     ///
     /// Derived by observing that `cmp / ceiling` is constant per model
     /// across all three swept ceilings, then multiplying it by the capture's
     /// own `conv_scale` and landing on exactly 255.0 for the clip-to-1.0
-    /// models.
+    /// models. The additional BS gain was then measured on hardware:
+    /// programming the capture-derived value clamps the final output to
+    /// zero, while multiplying it by 128 clamps at the requested value.
+    ///
+    /// This constructor is paired with [`BsEntry::default`] and
+    /// [`Multiplier::for_unit_bs`]. Callers deliberately using a different
+    /// BS multiplier must construct [`Activation::Clamped`] in that custom
+    /// post-BS domain.
     pub fn clamped_int8(ceiling: f32, input_scale: f32, weights_scale: f32) -> Activation {
         assert!(
             ceiling.is_finite() && ceiling > 0.0,
@@ -497,10 +510,11 @@ impl Activation {
             unit.is_finite() && unit > 0.0,
             "input_scale * weights_scale must be finite and positive, got {unit}"
         );
-        let cmp = (f64::from(ceiling) / unit).round();
+        let bs_gain = f64::from(BS_UNIT_MULTIPLIER >> BS_MULTIPLIER_SHIFT);
+        let cmp = (f64::from(ceiling) / unit * bs_gain).round();
         assert!(
             (0.0..=f64::from(u32::MAX)).contains(&cmp),
-            "activation ceiling {ceiling} is {cmp} accumulator units, outside \
+            "activation ceiling {ceiling} is {cmp} post-BS units, outside \
              the 32-bit BN_RELUX_CMP_VALUE field"
         );
         Activation::Clamped { cmp: cmp as u32 }
@@ -4696,18 +4710,21 @@ mod tests {
     }
 
     #[test]
-    fn int8_clamp_is_the_ceiling_in_accumulator_units() {
-        // cmp = round(ceiling / (input_scale * weights_scale)), which makes
-        // it exactly linear in the ceiling at a fixed pair of scales -- the
-        // property that identified the rule in the first place.
+    fn int8_clamp_is_the_ceiling_in_the_post_bs_domain() {
+        // The capture-derived accumulator-unit ceiling is multiplied by the
+        // effective gain of the default BS plane before BN sees it.
         let (input, weights) = (0.02, 0.003);
         let cmp = |ceiling| match Activation::clamped_int8(ceiling, input, weights) {
             Activation::Clamped { cmp } => cmp,
             other => panic!("expected a clamp, got {other:?}"),
         };
+        let bs_gain = u32::from(
+            u16::try_from(BS_UNIT_MULTIPLIER >> BS_MULTIPLIER_SHIFT)
+                .expect("the unit BS gain must be positive"),
+        );
         assert_eq!(
             cmp(1.0),
-            (1.0 / (f64::from(input) * f64::from(weights))).round() as u32
+            (1.0 / (f64::from(input) * f64::from(weights)) * f64::from(bs_gain)).round() as u32
         );
         // Linear in the ceiling, but only to within the rounding -- which is
         // exactly what the captures show: 6 x 86815 is 520890 against a
