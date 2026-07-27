@@ -423,18 +423,18 @@ fn int8_channel_matrix_tiles_fit_their_data_banks() {
     }
 }
 
+/// The input-channel range, including everything the large-Cin sweep added.
 #[test]
 #[ignore = "needs /dev/accel/accel0 -- cross-compile for aarch64 and run on the RK3588 board"]
-fn int8_convs_run_on_npu() {
+fn int8_input_channel_range_runs_on_npu() {
     let mut failures = Vec::new();
-
     // Both sides of the dense/surface boundary, which int8 does not move,
     // then the range the large-Cin sweep opened. int8 pads to whole 16-lane
     // atoms with no exception anywhere to 512 -- unlike fp16, which bumps
     // every `3 mod 4` atom count -- so 176 and 240 are the values that would
     // have bumped had the fp16 rule applied here, and 175/177 and 239/241
     // straddle them. The CBUF atom charge does round up at those counts in
-    // both precisions, and that is what sizes the tiles below.
+    // both precisions, and that is what sizes the tiles.
     for in_channels in [
         1u32, 3, 4, 8, 16, 17, 32, 64, 112, 128, 175, 176, 177, 224, 239, 240, 256, 384, 512,
     ] {
@@ -442,13 +442,34 @@ fn int8_convs_run_on_npu() {
             attempt(in_channels, 8, 64, kernel, 0, &mut failures);
         }
     }
+    assert_no_failures(failures);
+}
 
-    // Output channels across the 32-wide granule, including values that are
-    // not multiples of it, out to the 512 the corpus covers.
+/// The output-channel range.
+///
+/// Kept separate from the input range so a failure here can be reproduced
+/// without the input sweep running first. `Cout` 1 failed in a full run
+/// while passing every earlier one, and the program it emits is unchanged
+/// from those runs, so whether it survives on its own is the question that
+/// separates an ordering effect from a real sub-granule bug.
+#[test]
+#[ignore = "needs /dev/accel/accel0 -- cross-compile for aarch64 and run on the RK3588 board"]
+fn int8_output_channel_range_runs_on_npu() {
+    let mut failures = Vec::new();
+    // Across the 32-wide granule, including values that are not multiples of
+    // it, out to the 512 the corpus covers. `Cout` 1 is the extreme: one real
+    // kernel against a padded 32.
     for out_channels in [1u32, 8, 16, 20, 32, 40, 64, 128, 256, 320, 512] {
         attempt(16, out_channels, 64, 3, 0, &mut failures);
     }
+    assert_no_failures(failures);
+}
 
+/// Zero points, and the wide shapes that exercise the int8 capacity rule.
+#[test]
+#[ignore = "needs /dev/accel/accel0 -- cross-compile for aarch64 and run on the RK3588 board"]
+fn int8_zero_points_and_wide_shapes_run_on_npu() {
+    let mut failures = Vec::new();
     // A nonzero output zero point, as a constant offset on a case that
     // already passes above.
     attempt(16, 8, 64, 3, -3, &mut failures);
@@ -459,7 +480,10 @@ fn int8_convs_run_on_npu() {
     // capacity bug.
     attempt(32, 8, 256, 3, 0, &mut failures);
     attempt(3, 8, 256, 3, 0, &mut failures);
+    assert_no_failures(failures);
+}
 
+fn assert_no_failures(failures: Vec<String>) {
     assert!(
         failures.is_empty(),
         "{} configuration(s) produced wrong output: {}",
