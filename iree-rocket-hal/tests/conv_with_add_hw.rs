@@ -1,6 +1,6 @@
 //! Hardware-in-the-loop test for `build_conv_with_add_regcmd` -- Mesa's
 //! `add_tensor` element-wise-add fusion, see `AddTensor`'s doc comment in
-//! `regcmd.rs` for the full derivation (TRM's documented `ew_alu_algo`
+//! `elementwise.rs` for the full derivation (TRM's documented `ew_alu_algo`
 //! opcodes, Mesa's `rkt_regcmd.c` source this is ported from, and the
 //! live hardware capture of a standalone `x + y` model that confirmed
 //! the resulting register values bit-exact -- see
@@ -32,11 +32,11 @@
 use std::{fs::OpenOptions, mem, os::unix::io::AsRawFd, ptr};
 
 use iree_rocket_hal::rocket::{
+    activation::Activation,
     device::{Buffer, fini_bo, prep_bo, submit},
-    regcmd::{
-        Activation, AddTensor, ConvBuffers, ConvShape, Precision, build_conv_regcmd,
-        build_conv_with_add_regcmd,
-    },
+    elementwise::{AddTensor, build_conv_with_add_regcmd},
+    mesa_conv::{ConvBuffers, ConvShape, build_conv_regcmd},
+    regcmd::Precision,
 };
 
 const DEVICE_PATH: &str = "/dev/accel/accel0";

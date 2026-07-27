@@ -1,6 +1,6 @@
 //! Hardware-in-the-loop tests for `build_fc_regcmd` -- Phase 2 of the
 //! ukernel roadmap. FC as a 1x1-kernel conv, M mapped onto `input_width`,
-//! height fixed internally at `FC_SAFE_HEIGHT` (see `regcmd.rs`'s FC
+//! height fixed internally at `FC_SAFE_HEIGHT` (see `mesa_conv.rs`'s FC
 //! section doc comment for the full rationale, especially the
 //! `input_height >= 4` underflow risk this sidesteps).
 //!
@@ -46,8 +46,10 @@
 use std::{fs::OpenOptions, mem, os::unix::io::AsRawFd, ptr};
 
 use iree_rocket_hal::rocket::{
+    activation::Activation,
     device::{Buffer, close_bo, fini_bo, prep_bo, submit},
-    regcmd::{Activation, FcBuffers, FcShape, Precision, build_fc_regcmd},
+    mesa_conv::{FcBuffers, FcShape, build_fc_regcmd},
+    regcmd::Precision,
     tensor_layout::{
         nc1hwc2_storage_size, pack_hwcf_to_rocket_weights, pack_nhwc_to_nc1hwc2,
         rocket_weight_storage_size,
@@ -83,7 +85,7 @@ fn small_shape() -> FcShape {
 /// Runs `shape` with the whole input plane filled with `input_fill` and
 /// the whole weight buffer filled with `weight_fill`, returning row 0's
 /// `m` real output pixels (the only row with real, not garbage, input --
-/// see regcmd.rs's FC section doc comment).
+/// see mesa_conv.rs's FC section doc comment).
 ///
 /// Read at stride 16 bytes/pixel, same convention as conv_hw.rs/
 /// pooling_hw.rs -- output_channels padding still lands each pixel at a

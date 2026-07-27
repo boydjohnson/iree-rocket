@@ -41,11 +41,13 @@
 use std::{fs::OpenOptions, mem, os::unix::io::AsRawFd, ptr};
 
 use iree_rocket_hal::rocket::{
+    activation::Activation,
     device::{Buffer, fini_bo, prep_bo, submit},
-    regcmd::{
-        Activation, CONV_OUTPUT_ATOMIC_STRIDE, ConvBuffers, ConvShape, Precision,
-        build_conv_regcmd, build_conv_regcmd_tasks, conv_output_scratch_bytes, plan_conv_tasks,
+    mesa_conv::{
+        CONV_OUTPUT_ATOMIC_STRIDE, ConvBuffers, ConvShape, build_conv_regcmd,
+        build_conv_regcmd_tasks, conv_output_scratch_bytes, plan_conv_tasks,
     },
+    regcmd::Precision,
     tensor_layout::{
         nc1hwc2_storage_size, pack_hwcf_to_rocket_weights, pack_nhwc_to_nc1hwc2,
         rocket_weight_storage_size,

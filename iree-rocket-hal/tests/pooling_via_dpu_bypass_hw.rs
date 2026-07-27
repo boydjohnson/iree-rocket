@@ -1,6 +1,6 @@
 //! Hardware-in-the-loop tests for `build_pooling_via_dpu_bypass_regcmd` --
 //! the real two-kick shape a vendor-compiled model actually emits (see
-//! `regcmd.rs`'s module doc comment above that function, and
+//! `pooling.rs`'s module doc comment above that function, and
 //! rknpu-spelunking/NOTES.md's "Decoding a real regcmd program for a
 //! pooling-only op"), as opposed to `build_pooling_regcmd`'s standalone-only
 //! path (`pooling_hw.rs`) or `build_conv_then_pooling_regcmd`'s on-chip
@@ -25,16 +25,18 @@
 //! combined-blob submission left the bypass stage's intermediate buffer
 //! completely unwritten (sentinel-fill diagnostic showed 128/128 bytes
 //! still at the 0xAA prefill). See `build_pooling_via_dpu_bypass_regcmd`'s
-//! module doc comment in `regcmd.rs` for the full story.
+//! module doc comment in `pooling.rs` for the full story.
 
 use std::{fs::OpenOptions, mem, os::unix::io::AsRawFd, ptr};
 
 use iree_rocket_hal::rocket::{
+    activation::Activation,
     device::{Buffer, close_bo, fini_bo, prep_bo, submit},
-    regcmd::{
-        Activation, ConvShape, PoolingMethod, PoolingShape, PoolingViaBypassBuffers, Precision,
-        build_pooling_via_dpu_bypass_regcmd,
+    mesa_conv::ConvShape,
+    pooling::{
+        PoolingMethod, PoolingShape, PoolingViaBypassBuffers, build_pooling_via_dpu_bypass_regcmd,
     },
+    regcmd::Precision,
 };
 
 const DEVICE_PATH: &str = "/dev/accel/accel0";

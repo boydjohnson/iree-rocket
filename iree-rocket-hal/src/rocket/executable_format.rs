@@ -43,10 +43,13 @@
 //! tag convention -- see that module's doc comment.
 
 #[cfg(test)]
-use crate::rocket::regcmd::plan_conv_tasks;
-use crate::rocket::regcmd::{
-    Activation, ConvShape, Precision, compute_out_shift, compute_task_input_channels,
-    compute_task_output_channels,
+use crate::rocket::mesa_conv::plan_conv_tasks;
+use crate::rocket::{
+    activation::Activation,
+    mesa_conv::{
+        ConvShape, compute_out_shift, compute_task_input_channels, compute_task_output_channels,
+    },
+    regcmd::Precision,
 };
 
 pub const CONV2D_V1_FORMAT_VERSION: u32 = 1;
@@ -253,7 +256,7 @@ pub fn validate_conv_shape(shape: &ConvShape) -> Result<(), &'static str> {
 
     // Input tensors that need 12 or more CBUF banks are accepted here:
     // `build_conv_regcmd_tasks` splits them along height. The exact task
-    // plan is intentionally owned by regcmd.rs rather than duplicated in
+    // plan is intentionally owned by mesa_conv.rs rather than duplicated in
     // wire-format validation.
     if compute_out_shift(shape) < 0 {
         return Err("unsupported output conversion scale: computed out_shift is negative");
@@ -651,7 +654,7 @@ mod tests {
     #[test]
     #[should_panic]
     fn weight_bytes_per_kernel_overflow_shape_actually_panics() {
-        use crate::rocket::regcmd::{ConvBuffers, build_conv_regcmd};
+        use crate::rocket::mesa_conv::{ConvBuffers, build_conv_regcmd};
 
         let shape = ConvShape {
             input_width: 1,

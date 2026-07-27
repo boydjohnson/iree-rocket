@@ -50,10 +50,11 @@ use crate::{
     status,
 };
 use iree_rocket_hal::rocket::{
+    activation::Activation,
     executable_format::{CONV2D_V1_TAG, decode_conv_shape_v1, validate_conv_shape},
-    regcmd::{
-        Activation, ConvShape, FcShape, PoolingMethod, PoolingShape, Precision, fc_as_conv_shape,
-    },
+    mesa_conv::{ConvShape, FcShape, fc_as_conv_shape},
+    pooling::{PoolingMethod, PoolingShape},
+    regcmd::Precision,
 };
 use rocket_schema::rocket as schema;
 

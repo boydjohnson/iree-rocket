@@ -76,10 +76,12 @@ use crate::{
 use iree_rocket_hal::rocket::{
     builders::RegCmd,
     device::Buffer as RocketDeviceBuffer,
-    regcmd::{
-        ConvBuffers, FC_PHYSICAL_HEIGHT, FcBuffers, PoolingBuffers, Precision,
-        build_conv_regcmd_tasks, build_fc_regcmd, build_pooling_regcmd, conv_output_scratch_bytes,
+    mesa_conv::{
+        ConvBuffers, FC_PHYSICAL_HEIGHT, FcBuffers, build_conv_regcmd_tasks, build_fc_regcmd,
+        conv_output_scratch_bytes,
     },
+    pooling::{PoolingBuffers, build_pooling_regcmd},
+    regcmd::Precision,
     tensor_layout::{
         nc1hwc2_storage_size, pack_hwcf_to_rocket_weights, pack_nhwc_to_nc1hwc2_padded,
         rocket_weight_storage_size,
@@ -137,7 +139,7 @@ pub struct WeightPacking {
 
 /// Bridges the RK3588 DPU's atomic-slot output write-back (16-byte-aligned
 /// slots regardless of dtype, `FEATURE_ATOMIC_SIZE=16`) to IREE's densely-
-/// packed ABI output buffer -- see `iree-rocket-hal/src/rocket/regcmd.rs`'s
+/// packed ABI output buffer -- see `iree-rocket-hal/src/rocket/mesa_conv.rs`'s
 /// `conv_output_scratch_bytes` doc comment and the "Conv2d output
 /// compaction" investigation this fixes. `dispatch()` points the regcmd at
 /// a driver-private scratch buffer instead of the real output buffer;

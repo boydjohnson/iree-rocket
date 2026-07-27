@@ -39,8 +39,9 @@
 use std::{fs::OpenOptions, mem, os::unix::io::AsRawFd, ptr};
 
 use iree_rocket_hal::rocket::{
+    activation::Activation,
     device::{Buffer, fini_bo, prep_bo, submit},
-    regcmd::{Activation, PoolingBuffers, PoolingMethod, PoolingShape, build_pooling_regcmd},
+    pooling::{PoolingBuffers, PoolingMethod, PoolingShape, build_pooling_regcmd},
 };
 
 const DEVICE_PATH: &str = "/dev/accel/accel0";

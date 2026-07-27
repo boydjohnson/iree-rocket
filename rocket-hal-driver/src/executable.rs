@@ -1,6 +1,6 @@
 //! `iree_hal_executable_vtable_t`. For this driver an "executable" isn't
 //! compiled machine code -- it's a stored `UkernelShape` (one of this
-//! driver's fixed regcmd-template shapes, see `regcmd.rs`'s module doc
+//! driver's fixed regcmd-template shapes, see `mesa_conv.rs`'s module doc
 //! comment for why the NPU pipeline itself is a small fixed set of these
 //! rather than a general codegen target). No real MLIR codegen target
 //! exists for this hardware yet (see the `custom_dispatch` research this
@@ -22,7 +22,8 @@ use crate::{
 };
 use iree_rocket_hal::rocket::{
     executable_format::validate_conv_shape,
-    regcmd::{ConvShape, FcShape, PoolingShape},
+    mesa_conv::{ConvShape, FcShape},
+    pooling::PoolingShape,
 };
 
 /// A logical Conv2D shape field supplied by one uint32 dispatch push constant.
@@ -165,7 +166,7 @@ impl Conv2dExecutable {
     }
 }
 
-/// One of this driver's fixed regcmd-template shapes -- see `regcmd.rs`'s
+/// One of this driver's fixed regcmd-template shapes -- see `mesa_conv.rs`'s
 /// module doc comment in iree-rocket-hal for why the NPU pipeline itself
 /// is a small, fixed set of these ("ukernels") rather than a general
 /// codegen target. Extend this enum (and `command_buffer::dispatch`'s
@@ -265,7 +266,7 @@ pub static VTABLE: iree_hal_executable_vtable_t = iree_hal_executable_vtable_t {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use iree_rocket_hal::rocket::regcmd::{Activation, Precision};
+    use iree_rocket_hal::rocket::{activation::Activation, regcmd::Precision};
 
     fn dynamic_spatial_executable() -> Conv2dExecutable {
         Conv2dExecutable {

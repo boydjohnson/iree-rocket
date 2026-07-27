@@ -34,8 +34,10 @@
 use std::{fs::OpenOptions, mem, os::unix::io::AsRawFd, ptr};
 
 use iree_rocket_hal::rocket::{
+    activation::Activation,
     device::{Buffer, fini_bo, prep_bo, submit},
-    regcmd::{Activation, ConvBuffers, ConvShape, Precision, build_conv_regcmd},
+    mesa_conv::{ConvBuffers, ConvShape, build_conv_regcmd},
+    regcmd::Precision,
 };
 
 const DEVICE_PATH: &str = "/dev/accel/accel0";

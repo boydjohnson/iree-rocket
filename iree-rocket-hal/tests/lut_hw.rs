@@ -43,8 +43,8 @@
 use std::{fs::OpenOptions, mem, os::unix::io::AsRawFd, ptr};
 
 use iree_rocket_hal::rocket::{
+    activation::{LutBuffers, LutShape, LutTable, build_lut_regcmd},
     device::{Buffer, fini_bo, prep_bo, submit},
-    regcmd::{LutBuffers, LutShape, LutTable, build_lut_regcmd},
 };
 
 const DEVICE_PATH: &str = "/dev/accel/accel0";

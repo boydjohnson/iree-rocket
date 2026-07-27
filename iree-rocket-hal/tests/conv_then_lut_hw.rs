@@ -1,7 +1,7 @@
 //! Hardware-in-the-loop tests for `build_conv_then_lut_regcmd` -- the real
 //! conv->sigmoid/tanh pipeline, as two hardware tasks in one
 //! `device::submit_tasks()` job (see that function's doc comment and
-//! `regcmd.rs`'s `ConvThenLutBuffers` doc comment for why this is a
+//! `activation.rs`'s `ConvThenLutBuffers` doc comment for why this is a
 //! genuinely separate task rather than fused into the conv's own DPU pass,
 //! unlike `Relu`/`Relux` -- confirmed via live bpftrace tracing of the
 //! vendor runtime itself, `rknpu-spelunking/NOTES.md`).
@@ -35,11 +35,10 @@
 use std::{fs::OpenOptions, mem, os::unix::io::AsRawFd, ptr};
 
 use iree_rocket_hal::rocket::{
+    activation::{Activation, ConvThenLutBuffers, LutShape, LutTable, build_conv_then_lut_regcmd},
     device::{Buffer, close_bo, fini_bo, prep_bo, submit_tasks},
-    regcmd::{
-        Activation, ConvShape, ConvThenLutBuffers, LutShape, LutTable, Precision,
-        build_conv_then_lut_regcmd,
-    },
+    mesa_conv::ConvShape,
+    regcmd::Precision,
 };
 
 const DEVICE_PATH: &str = "/dev/accel/accel0";
@@ -231,7 +230,7 @@ fn conv_then_tanh_completes() {
 /// it does NOT validate a real softmax data flow (max-subtraction into
 /// this stage and the reciprocal/normalize step are still unconfirmed,
 /// see `build_max_reduction_tree_regcmd`'s module doc comment in
-/// `regcmd.rs`). `output_zero_point: 0` (not `0x80`) because exp(x) is
+/// `pooling.rs`). `output_zero_point: 0` (not `0x80`) because exp(x) is
 /// never negative, matching `conv_then_sigmoid_completes`'s own choice
 /// for the same reason.
 #[test]
