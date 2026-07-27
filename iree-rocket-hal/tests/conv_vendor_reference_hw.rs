@@ -30,13 +30,7 @@
 use std::{fs::OpenOptions, mem, os::unix::io::AsRawFd, ptr};
 
 use iree_rocket_hal::rocket::{
-    builders::{
-        RegCmd, RegisterMeta,
-        cna::{CnaDcompAddr0, CnaFeatureDataAddr},
-        dpu::DpuDstBaseAddr,
-        dpu_rdma::DpuRdmaBsBaseAddr,
-    },
-    conv::{Kernels, conv_2d},
+    conv::{Buffers, Kernels, conv_2d, relocate},
     device::{Buffer, close_bo, fini_bo, prep_bo, submit},
 };
 
@@ -60,46 +54,6 @@ const FP16_ONE: u16 = 0x3c00;
 
 fn page_aligned_size(byte_len: usize) -> usize {
     byte_len.max(1).next_multiple_of(PAGE_BYTES)
-}
-
-fn decode_identity(command: &RegCmd) -> (u32, u32) {
-    ((command.0 >> 48) as u32, command.0 as u32 & 0xffff)
-}
-
-/// Replaces the one captured zero-valued address command for `R`.
-///
-/// Matching by typed register identity instead of a hardcoded vector index
-/// makes the test fail clearly if the reference sequence is reordered or
-/// unexpectedly gains a second write to the same address register.
-fn relocate<R: RegisterMeta>(commands: &mut [RegCmd], address: u32) {
-    assert_eq!(
-        address & 0xf,
-        0,
-        "NPU DMA address for register {:#x}:{:#x} is not 16-byte aligned",
-        R::DOMAIN,
-        R::OFFSET
-    );
-
-    let matches: Vec<_> = commands
-        .iter()
-        .enumerate()
-        .filter_map(|(index, command)| {
-            (decode_identity(command) == (R::DOMAIN, R::OFFSET)).then_some(index)
-        })
-        .collect();
-    assert_eq!(
-        matches.len(),
-        1,
-        "expected exactly one {:#x}:{:#x} relocation, found {matches:?}",
-        R::DOMAIN,
-        R::OFFSET
-    );
-    // Add rather than overwrite: a tile program already carries its own byte
-    // offset from the tensor base in these registers, exactly as the vendor's
-    // own height-split programs do. For a whole-image program the existing
-    // value is zero and this is an assignment.
-    let tile_offset = (commands[matches[0]].0 >> 16) as u32;
-    commands[matches[0]] = RegCmd::new(R::DOMAIN, R::OFFSET, address + tile_offset);
 }
 
 fn f16_to_f32(bits: u16) -> f32 {
@@ -167,10 +121,15 @@ fn run_vendor_reference_conv(kernels: Kernels) -> Vec<f32> {
         ptr::write_bytes(buf_output.host_ptr, 0, buf_output.size);
 
         let mut commands = conv_2d(kernels);
-        relocate::<CnaFeatureDataAddr>(&mut commands, buf_input.dma_address);
-        relocate::<CnaDcompAddr0>(&mut commands, buf_weights.dma_address);
-        relocate::<DpuRdmaBsBaseAddr>(&mut commands, buf_bias.dma_address);
-        relocate::<DpuDstBaseAddr>(&mut commands, buf_output.dma_address);
+        relocate(
+            &mut commands,
+            Buffers {
+                input: buf_input.dma_address,
+                weights: buf_weights.dma_address,
+                bias: buf_bias.dma_address,
+                output: buf_output.dma_address,
+            },
+        );
 
         let command_bytes = commands.len() * mem::size_of::<u64>();
         let buf_commands = Buffer::new(fd, page_aligned_size(command_bytes), &file);

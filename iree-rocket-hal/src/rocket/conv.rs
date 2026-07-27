@@ -1443,6 +1443,9 @@ impl ConvPlan {
     }
 
     /// Emits one relocatable register program per planned tile.
+    ///
+    /// The programs still carry tile offsets rather than addresses; use
+    /// [`ConvPlan::programs_with_buffers`] to get submission-ready ones.
     pub fn programs(&self) -> Vec<Vec<RegCmd>> {
         self.tiles
             .iter()
@@ -1455,6 +1458,24 @@ impl ConvPlan {
                     self.data_banks,
                     self.weight_banks,
                 )
+            })
+            .collect()
+    }
+
+    /// Emits one submission-ready register program per planned tile, bound to
+    /// `buffers`.
+    ///
+    /// All tiles share the same four buffers: each program's own tile offsets
+    /// are what select its slice of them, so there is no per-tile address
+    /// arithmetic for the caller to do. Submit each program as its own job and
+    /// wait for its fence before the next -- tiles reload their own weights,
+    /// so no CBUF state has to survive between them.
+    pub fn programs_with_buffers(&self, buffers: Buffers) -> Vec<Vec<RegCmd>> {
+        self.programs()
+            .into_iter()
+            .map(|mut commands| {
+                relocate(&mut commands, buffers);
+                commands
             })
             .collect()
     }
@@ -1777,6 +1798,85 @@ pub fn write_bs_buffer(buffer: &mut [u8], entries: &[BsEntry]) {
         let multiplier = base + 48 + lane * 2;
         buffer[multiplier..multiplier + 2].copy_from_slice(&entry.multiplier.to_le_bytes());
     }
+}
+
+/// The four DMA base addresses a conv program reads and writes through.
+///
+/// Programs come out of this module carrying tile *offsets* in their address
+/// registers, not addresses -- see [`conv_2d_tile`]. [`relocate`] binds them
+/// to real memory, which is the last step before submission.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Buffers {
+    /// Feature data, `CNA_FEATURE_DATA_ADDR`.
+    pub input: u32,
+    /// Packed weights, `CNA_DCOMP_ADDR0`. See
+    /// [`crate::rocket::tensor_layout::pack_hwcf_to_rocket_weights`].
+    pub weights: u32,
+    /// Bias, and for int8 the per-channel multiplier alongside it,
+    /// `DPU_RDMA_RDMA_BS_BASE_ADDR`. See [`write_bs_buffer`].
+    pub bias: u32,
+    /// Output feature data, `DPU_DST_BASE_ADDR`.
+    pub output: u32,
+}
+
+fn decode_identity(command: &RegCmd) -> (u32, u32) {
+    ((command.0 >> 48) as u32, command.0 as u32 & 0xffff)
+}
+
+/// Binds one address register to `address`, keeping whatever tile offset the
+/// program already put there.
+///
+/// Matching by typed register identity rather than a hardcoded command index
+/// is what makes this fail loudly if a program is ever reordered or gains a
+/// second write to the same address register, instead of quietly relocating
+/// the wrong word.
+fn relocate_one<R: RegisterMeta>(commands: &mut [RegCmd], address: u32) {
+    assert_eq!(
+        address & 0xf,
+        0,
+        "NPU DMA address for register {:#x}:{:#x} is not 16-byte aligned",
+        R::DOMAIN,
+        R::OFFSET
+    );
+
+    let matches: Vec<_> = commands
+        .iter()
+        .enumerate()
+        .filter_map(|(index, command)| {
+            (decode_identity(command) == (R::DOMAIN, R::OFFSET)).then_some(index)
+        })
+        .collect();
+    assert_eq!(
+        matches.len(),
+        1,
+        "expected exactly one {:#x}:{:#x} relocation, found {matches:?}",
+        R::DOMAIN,
+        R::OFFSET
+    );
+
+    // Add rather than overwrite: a tile program already carries its own byte
+    // offset from the tensor base in these registers, exactly as the vendor's
+    // own height-split programs do. For a whole-image program the existing
+    // value is zero and this is an assignment.
+    let tile_offset = (commands[matches[0]].0 >> 16) as u32;
+    commands[matches[0]] = RegCmd::new(R::DOMAIN, R::OFFSET, address + tile_offset);
+}
+
+/// Binds a program's four address registers to real memory, in place.
+///
+/// Every address must be 16-byte aligned -- the DPU addresses output in
+/// 16-byte feature atoms, and the fetch side reads them the same way, so an
+/// unaligned base silently shears every surface. Panics rather than
+/// truncating.
+///
+/// A program carries exactly one write of each of the four registers, so
+/// relocating twice would double the offsets; this is a one-shot step on a
+/// freshly built program, not something to reapply.
+pub fn relocate(commands: &mut [RegCmd], buffers: Buffers) {
+    relocate_one::<CnaFeatureDataAddr>(commands, buffers.input);
+    relocate_one::<CnaDcompAddr0>(commands, buffers.weights);
+    relocate_one::<DpuRdmaBsBaseAddr>(commands, buffers.bias);
+    relocate_one::<DpuDstBaseAddr>(commands, buffers.output);
 }
 
 /// 2-3 and 4-6 are alternative two- and three-core height-split programs,
@@ -4228,5 +4328,106 @@ mod tests {
                 "{tiles}-tile plan does not partition the output exactly"
             );
         }
+    }
+
+    const RELOCATION: Buffers = Buffers {
+        input: 0x1_0000,
+        weights: 0x2_0000,
+        bias: 0x3_0000,
+        output: 0x4_0000,
+    };
+
+    #[test]
+    fn relocation_assigns_addresses_to_a_whole_image_program() {
+        let mut commands = conv_2d([3, 3]);
+        // A whole-image program starts at both tensors' base, so there is no
+        // offset for the relocation to preserve and it reads as assignment.
+        assert_eq!(value_of::<CnaFeatureDataAddr>(&commands), 0);
+        assert_eq!(value_of::<DpuDstBaseAddr>(&commands), 0);
+
+        relocate(&mut commands, RELOCATION);
+
+        assert_eq!(value_of::<CnaFeatureDataAddr>(&commands), 0x1_0000);
+        assert_eq!(value_of::<CnaDcompAddr0>(&commands), 0x2_0000);
+        assert_eq!(value_of::<DpuRdmaBsBaseAddr>(&commands), 0x3_0000);
+        assert_eq!(value_of::<DpuDstBaseAddr>(&commands), 0x4_0000);
+    }
+
+    #[test]
+    fn relocation_adds_the_tile_offset_rather_than_overwriting_it() {
+        let shape = Shape::CAPTURED;
+        let kernels = [3, 3];
+        let split = Tile::split(shape, kernels, 2);
+        let mut commands = conv_2d_tile(shape, kernels, &split[1]);
+        // The second tile of a two-way split starts partway into the feature
+        // map and partway into the output -- the captured values the
+        // six-group tile test pins independently.
+        assert_eq!(value_of::<CnaFeatureDataAddr>(&commands), 0xb40);
+        assert_eq!(value_of::<DpuDstBaseAddr>(&commands), 0x2000);
+
+        relocate(&mut commands, RELOCATION);
+
+        assert_eq!(value_of::<CnaFeatureDataAddr>(&commands), 0x1_0000 + 0xb40);
+        assert_eq!(value_of::<DpuDstBaseAddr>(&commands), 0x4_0000 + 0x2000);
+        // Weights and bias are whole-tensor: every tile reads all of them, so
+        // these two carry no offset to add.
+        assert_eq!(value_of::<CnaDcompAddr0>(&commands), 0x2_0000);
+        assert_eq!(value_of::<DpuRdmaBsBaseAddr>(&commands), 0x3_0000);
+    }
+
+    #[test]
+    #[should_panic(expected = "not 16-byte aligned")]
+    fn relocation_rejects_a_misaligned_address() {
+        let mut commands = conv_2d([1, 1]);
+        relocate(
+            &mut commands,
+            Buffers {
+                input: 0x1_0008,
+                ..RELOCATION
+            },
+        );
+    }
+
+    #[test]
+    fn plan_programs_with_buffers_relocates_every_tile() {
+        let shape = Shape::with_out_channels(256, 32, 1, 32, 64);
+        let plan = ConvPlan::new(shape, [5, 5]);
+        assert_eq!(plan.tiles().len(), 3);
+
+        let bare = plan.programs();
+        let bound = plan.programs_with_buffers(RELOCATION);
+        assert_eq!(bound.len(), bare.len());
+
+        for (tile, (bare, bound)) in bare.iter().zip(&bound).enumerate() {
+            assert_eq!(
+                value_of::<CnaFeatureDataAddr>(bound),
+                0x1_0000 + value_of::<CnaFeatureDataAddr>(bare),
+                "tile {tile} input"
+            );
+            assert_eq!(
+                value_of::<DpuDstBaseAddr>(bound),
+                0x4_0000 + value_of::<DpuDstBaseAddr>(bare),
+                "tile {tile} output"
+            );
+            // Relocation touches the four address registers and nothing else.
+            let changed = bare
+                .iter()
+                .zip(bound)
+                .filter(|(left, right)| left.0 != right.0)
+                .count();
+            assert_eq!(changed, 4, "tile {tile} changed words");
+        }
+
+        // Distinct tiles really do land at distinct output addresses -- a
+        // relocation that overwrote instead of adding would collapse these.
+        let outputs: Vec<_> = bound
+            .iter()
+            .map(|program| value_of::<DpuDstBaseAddr>(program))
+            .collect();
+        assert_eq!(outputs[0], 0x4_0000);
+        assert!(
+            outputs[0] < outputs[1] && outputs[1] < outputs[2],
+            "tile outputs are not strictly increasing: {outputs:x?}"
+        );
     }
 }

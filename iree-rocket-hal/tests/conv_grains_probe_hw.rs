@@ -47,13 +47,7 @@
 use std::{fs::OpenOptions, mem, os::unix::io::AsRawFd, ptr};
 
 use iree_rocket_hal::rocket::{
-    builders::{
-        RegCmd, RegisterMeta,
-        cna::{CnaDcompAddr0, CnaFeatureDataAddr},
-        dpu::DpuDstBaseAddr,
-        dpu_rdma::DpuRdmaBsBaseAddr,
-    },
-    conv::{Kernels, Shape, Tile, conv_2d_tile_with_grains, feature_grains},
+    conv::{Buffers, Kernels, Shape, Tile, conv_2d_tile_with_grains, feature_grains, relocate},
     device::{Buffer, JobDesc, close_bo, fini_bo, prep_bo, submit_jobs},
 };
 
@@ -77,23 +71,6 @@ const TIMEOUT_NS: u64 = 250_000_000;
 
 fn page_aligned_size(size: usize) -> usize {
     size.div_ceil(PAGE_BYTES) * PAGE_BYTES
-}
-
-fn decode_identity(command: &RegCmd) -> (u32, u32) {
-    ((command.0 >> 48) as u32, command.0 as u32 & 0xffff)
-}
-
-fn relocate<R: RegisterMeta>(commands: &mut [RegCmd], address: u32) {
-    let matches: Vec<_> = commands
-        .iter()
-        .enumerate()
-        .filter_map(|(index, command)| {
-            (decode_identity(command) == (R::DOMAIN, R::OFFSET)).then_some(index)
-        })
-        .collect();
-    assert_eq!(matches.len(), 1, "expected exactly one relocation site");
-    let tile_offset = (commands[matches[0]].0 >> 16) as u32;
-    commands[matches[0]] = RegCmd::new(R::DOMAIN, R::OFFSET, address + tile_offset);
 }
 
 fn f16_to_f32(bits: u16) -> f32 {
@@ -169,10 +146,15 @@ fn probe(kernels: Kernels, tile: &Tile, grains: u32) -> Outcome {
         ptr::write_bytes(buf_output.host_ptr, 0, buf_output.size);
 
         let mut commands = conv_2d_tile_with_grains(Shape::CAPTURED, kernels, tile, grains);
-        relocate::<CnaFeatureDataAddr>(&mut commands, buf_input.dma_address);
-        relocate::<CnaDcompAddr0>(&mut commands, buf_weights.dma_address);
-        relocate::<DpuRdmaBsBaseAddr>(&mut commands, buf_bias.dma_address);
-        relocate::<DpuDstBaseAddr>(&mut commands, buf_output.dma_address);
+        relocate(
+            &mut commands,
+            Buffers {
+                input: buf_input.dma_address,
+                weights: buf_weights.dma_address,
+                bias: buf_bias.dma_address,
+                output: buf_output.dma_address,
+            },
+        );
 
         let command_bytes = commands.len() * mem::size_of::<u64>();
         let buf_commands = Buffer::new(fd, page_aligned_size(command_bytes), &file);
