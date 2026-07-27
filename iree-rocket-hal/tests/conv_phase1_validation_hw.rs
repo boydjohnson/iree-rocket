@@ -41,7 +41,7 @@ const FEATURE_ATOM_BYTES: usize = 16;
 const PAGE_BYTES: usize = 4096;
 const KERNEL: Kernels = [3, 3];
 const IMPULSE: usize = 16;
-const INT8_DEPTHWISE_GAIN_CORRECTION: f64 = 64.0;
+const INT8_DEPTHWISE_GAIN_CORRECTION: f64 = 128.0;
 
 fn page_aligned_size(size: usize) -> usize {
     size.max(1).div_ceil(PAGE_BYTES) * PAGE_BYTES
@@ -152,16 +152,11 @@ fn int8_identity_precision() -> Precision {
 fn int8_depthwise_quantization() -> Precision {
     Precision::Int8(Quantization {
         input_zero_point: 0,
-        output_zero_point: 0,
+        // The int8 depthwise path contributes a one-unit baseline before
+        // requantization. Scale the retained coefficient fraction by 128,
+        // then subtract that equally-scaled baseline.
+        output_zero_point: -128,
         multiplier: Multiplier::for_unit_bs(INT8_DEPTHWISE_GAIN_CORRECTION),
-    })
-}
-
-fn int8_depthwise_identity_precision() -> Precision {
-    Precision::Int8(Quantization {
-        input_zero_point: 0,
-        output_zero_point: 0,
-        multiplier: Multiplier::from_ratio(INT8_DEPTHWISE_GAIN_CORRECTION),
     })
 }
 
@@ -788,9 +783,9 @@ fn int8_depthwise_raw_slot_probe() {
 /// The first board run returned 1 for every positive coefficient from 1
 /// through 108. If the binary test passes and this one fails the tap/channel
 /// placement is sound, but int8 depthwise coefficient magnitude has a
-/// separate encoding or programming requirement still to derive.
+/// separate requantization requirement, now derived from the ×64 probe.
 #[test]
-#[ignore = "needs /dev/accel/accel0 -- currently exposes int8 depthwise magnitude loss"]
+#[ignore = "needs /dev/accel/accel0 -- validates int8 depthwise magnitude requantization"]
 fn int8_depthwise_coefficient_magnitudes_are_preserved() {
     let shape =
         Shape::with_precision(32, 32, 1, 12, 12, int8_depthwise_quantization()).with_depthwise();
@@ -803,38 +798,6 @@ fn int8_depthwise_coefficient_magnitudes_are_preserved() {
 
     assert_int8_output(
         "int8 depthwise coefficient magnitudes",
-        shape,
-        KERNEL,
-        &output,
-        |channel, y, x| {
-            if y + 1 >= IMPULSE && y <= IMPULSE + 1 && x + 1 >= IMPULSE && x <= IMPULSE + 1 {
-                coefficient(channel, IMPULSE + 1 - y, IMPULSE + 1 - x)
-            } else {
-                0
-            }
-        },
-        1,
-    );
-}
-
-/// The same magnitude check with the probe-backed identity BS pair and the
-/// depthwise ×64 output conversion. Running both BS conventions separates
-/// the depthwise correction from the already-established BS gain.
-#[test]
-#[ignore = "needs /dev/accel/accel0 -- diagnoses depthwise BS/CVT scaling"]
-fn int8_depthwise_magnitudes_with_identity_bs_are_preserved() {
-    let shape = Shape::with_precision(32, 32, 1, 12, 12, int8_depthwise_identity_precision())
-        .with_depthwise();
-    let mut input = vec![0; input_bytes(shape)];
-    for channel in 0..shape.in_channels as usize {
-        input[feature_offset(shape, channel, IMPULSE, IMPULSE)] = 1;
-    }
-    let weights = depthwise_weights(shape);
-    let bias = int8_bias_with_multiplier(shape, identity_bs_multiplier());
-    let (_, output) = execute(shape, KERNEL, &input, &weights, &bias);
-
-    assert_int8_output(
-        "int8 depthwise coefficient magnitudes with identity BS",
         shape,
         KERNEL,
         &output,
