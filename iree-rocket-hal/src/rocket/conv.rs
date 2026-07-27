@@ -669,20 +669,18 @@ impl Shape {
     /// Only a channel multiplier of one is captured, so the output channel
     /// count must already equal the input one.
     ///
-    /// # The weight buffer layout is not derived
+    /// # Packing the weight buffer
     ///
-    /// The capture sweep pinned the *register programming* -- mode bits,
-    /// channel padding, and the `CNA_WEIGHT_SIZE0.weight_bytes` footprint --
-    /// but says nothing about how those bytes are arranged. A depthwise
-    /// filter is `[Cin, 1, kh, kw]`, not the `[kh, kw, Cin, Cout]` that
-    /// [`crate::rocket::tensor_layout::pack_hwcf_to_rocket_weights`] packs,
-    /// and no capture in the corpus exposes the packed bytes.
+    /// Use [`crate::rocket::tensor_layout::pack_depthwise_to_rocket_weights`],
+    /// not `pack_hwcf_to_rocket_weights`. A depthwise filter is
+    /// `[Cin][kh][kw]` and the hardware wants it tap-major,
+    /// `(ky * kw + kx) * padded_channels + channel`, which is the transpose
+    /// of how torch and ONNX store it.
     ///
-    /// So a program built from this plans and dispatches correctly, and the
-    /// hardware will read exactly the right number of coefficient bytes --
-    /// but feeding it a densely-packed buffer will produce wrong output.
-    /// Deriving the layout needs either a vendor weight-buffer dump or a
-    /// hardware bisect, and neither has been done.
+    /// The capture sweep could not have shown this -- a capture carries the
+    /// register program, never the buffer it points at. It came from one-hot
+    /// probing every slot of a real weight buffer on hardware
+    /// (`tests/conv_depthwise_probe_hw.rs`).
     pub fn with_depthwise(mut self) -> Shape {
         assert_eq!(
             self.in_channels, self.out_channels,

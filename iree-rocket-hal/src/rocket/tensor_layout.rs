@@ -221,6 +221,80 @@ pub fn pack_hwcf_to_rocket_weights(
     Ok(packed_len)
 }
 
+/// Packs a depthwise filter into the RK3588 CNA coefficient order.
+///
+/// A depthwise filter is `[channels][filter_height][filter_width]` -- one
+/// `kh x kw` kernel per input channel, with no `(input, output)` pairing at
+/// all. The hardware wants it **tap-major**:
+///
+/// `slot = (ky * filter_width + kx) * padded_channels + channel`
+///
+/// i.e. all channels' coefficients for one tap sit contiguously, then all
+/// channels' coefficients for the next. This is the transpose of how torch
+/// and ONNX store it, and it is nothing like
+/// [`pack_hwcf_to_rocket_weights`]'s blocked dense order.
+///
+/// `padded_channels` is the count the register program's
+/// `CNA_WEIGHT_SIZE0.weight_bytes` is sized from -- [`Shape::weight_bytes`]
+/// divided by `kh * kw * element_size` -- not the real channel count. The
+/// two differ whenever the channel count is not a whole CBUF atom group;
+/// padding slots are left zero and contribute nothing.
+///
+/// Derived by one-hot probing every slot of a real weight buffer on
+/// hardware, reading back which output channel responded and which image
+/// borders went zero (`tests/conv_depthwise_probe_hw.rs`). A capture could
+/// never have shown this: it carries the register program, not the buffer.
+///
+/// [`Shape::weight_bytes`]: crate::rocket::conv::Shape::weight_bytes
+pub fn pack_depthwise_to_rocket_weights(
+    dense: &[u8],
+    filter_height: usize,
+    filter_width: usize,
+    channels: usize,
+    padded_channels: usize,
+    element_size: usize,
+    packed: &mut [u8],
+) -> Result<usize, &'static str> {
+    if filter_height == 0
+        || filter_width == 0
+        || channels == 0
+        || element_size == 0
+        || padded_channels < channels
+    {
+        return Err("invalid Rocket depthwise filter shape");
+    }
+
+    let dense_len = filter_height
+        .checked_mul(filter_width)
+        .and_then(|value| value.checked_mul(channels))
+        .and_then(|value| value.checked_mul(element_size))
+        .ok_or("depthwise filter storage size overflows usize")?;
+    if dense.len() < dense_len {
+        return Err("dense depthwise filter is smaller than its declared shape");
+    }
+
+    let packed_len = filter_height
+        .checked_mul(filter_width)
+        .and_then(|value| value.checked_mul(padded_channels))
+        .and_then(|value| value.checked_mul(element_size))
+        .ok_or("packed depthwise filter storage size overflows usize")?;
+    if packed.len() < packed_len {
+        return Err("packed depthwise filter buffer is too small");
+    }
+
+    packed[..packed_len].fill(0);
+    for channel in 0..channels {
+        for ky in 0..filter_height {
+            for kx in 0..filter_width {
+                let from = ((channel * filter_height + ky) * filter_width + kx) * element_size;
+                let to = ((ky * filter_width + kx) * padded_channels + channel) * element_size;
+                packed[to..to + element_size].copy_from_slice(&dense[from..from + element_size]);
+            }
+        }
+    }
+    Ok(packed_len)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -337,6 +411,88 @@ mod tests {
         assert_eq!(
             &values[17 * 32..17 * 32 + 32],
             &(1700u16..1732).collect::<Vec<_>>()
+        );
+    }
+
+    /// The exact slot mapping the hardware probe reported at Cin 8, 3x3:
+    /// channel `c` at tap (0,0) lands at slot `c`, and channel 0's next tap
+    /// (0,1) lands at slot 8 -- one whole channel row later, not adjacent.
+    #[test]
+    fn depthwise_packing_is_tap_major() {
+        // One byte per element keeps the slot index and the byte offset the
+        // same number, so the expectations read as slots.
+        let (channels, kh, kw) = (8usize, 3usize, 3usize);
+        let mut dense = vec![0u8; channels * kh * kw];
+        for channel in 0..channels {
+            for ky in 0..kh {
+                for kx in 0..kw {
+                    // Encode the source coordinate so a misplaced byte names
+                    // where it came from.
+                    dense[(channel * kh + ky) * kw + kx] = (channel * 16 + ky * 4 + kx) as u8;
+                }
+            }
+        }
+
+        let mut packed = vec![0xffu8; kh * kw * channels];
+        let written =
+            pack_depthwise_to_rocket_weights(&dense, kh, kw, channels, channels, 1, &mut packed)
+                .expect("packing failed");
+        assert_eq!(written, 72);
+
+        for channel in 0..channels {
+            for ky in 0..kh {
+                for kx in 0..kw {
+                    let slot = (ky * kw + kx) * channels + channel;
+                    assert_eq!(
+                        packed[slot],
+                        (channel * 16 + ky * 4 + kx) as u8,
+                        "slot {slot} (channel {channel}, tap ({ky}, {kx}))"
+                    );
+                }
+            }
+        }
+        // The probe's own landmarks.
+        assert_eq!(packed[0], 0, "channel 0 tap (0,0)");
+        assert_eq!(packed[1], 16, "channel 1 tap (0,0)");
+        assert_eq!(packed[8], 1, "channel 0 tap (0,1)");
+        // channel 0, tap (2,2) -> 0*16 + 2*4 + 2
+        assert_eq!(packed[64], 10, "channel 0 tap (2,2)");
+    }
+
+    /// Padding slots stay zero and the real channels keep the padded stride,
+    /// which is what a Cin the atom granularity does not divide needs.
+    #[test]
+    fn depthwise_packing_honours_the_padded_stride() {
+        let (channels, padded, kh, kw) = (12usize, 16usize, 3usize, 3usize);
+        let dense = vec![0x5au8; channels * kh * kw];
+        let mut packed = vec![0xffu8; kh * kw * padded];
+        let written =
+            pack_depthwise_to_rocket_weights(&dense, kh, kw, channels, padded, 1, &mut packed)
+                .expect("packing failed");
+        assert_eq!(written, kh * kw * padded);
+
+        for ky in 0..kh {
+            for kx in 0..kw {
+                let base = (ky * kw + kx) * padded;
+                for channel in 0..padded {
+                    let want = if channel < channels { 0x5a } else { 0 };
+                    assert_eq!(
+                        packed[base + channel],
+                        want,
+                        "tap ({ky}, {kx}) channel {channel}"
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn depthwise_packing_rejects_a_short_buffer() {
+        let dense = vec![0u8; 8 * 9];
+        let mut packed = vec![0u8; 8 * 9 - 1];
+        assert!(
+            pack_depthwise_to_rocket_weights(&dense, 3, 3, 8, 8, 1, &mut packed).is_err(),
+            "a packed buffer one byte short must be refused"
         );
     }
 }

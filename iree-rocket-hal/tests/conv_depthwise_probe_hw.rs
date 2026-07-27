@@ -5,8 +5,18 @@
 //! and the `CNA_WEIGHT_SIZE0.weight_bytes` footprint -- but a capture only
 //! contains the register program, never the buffer it points at. A depthwise
 //! filter is `[Cin, 1, kh, kw]`, not the `[kh, kw, Cin, Cout]` that
-//! `tensor_layout::pack_hwcf_to_rocket_weights` produces, so `conv.rs`
-//! currently refuses to claim it can pack one (see `Shape::with_depthwise`).
+//! `tensor_layout::pack_hwcf_to_rocket_weights` produces.
+//!
+//! # Result
+//!
+//! The Cin 8 run mapped all 72 slots with none silent and none ambiguous:
+//! the layout is **tap-major**, `slot = (ky * kw + kx) * stride + channel`.
+//! Its warm-up also peaked at 9 on all eight channels, which is what first
+//! said the depthwise register programming is right on real silicon.
+//!
+//! What that run could not settle is the row `stride`: at Cin 8 the real and
+//! padded channel counts are both 8. `depthwise_weight_layout_probe_with_channel_padding`
+//! is the case that separates them.
 //!
 //! # Method
 //!
@@ -35,11 +45,13 @@
 //! two channels -- not that it takes any particular form. Guessing the
 //! answer in an assertion is what this test exists to avoid.
 //!
-//! # This is also the first hardware run of the depthwise registers at all
+//! # The warm-up
 //!
-//! Nothing has yet dispatched a depthwise program on real silicon. The
-//! all-ones warm-up below is there so that a hang or a dead output is
-//! attributed to the register programming rather than to the layout sweep.
+//! Each probe fires one all-ones job before the sweep, so that a hang or a
+//! dead output is attributed to the register programming rather than to the
+//! layout sweep. This mattered on the first run, when nothing had dispatched
+//! a depthwise program on silicon yet; it stays as the same guard for every
+//! new shape the probe is pointed at.
 
 use std::{collections::BTreeMap, fs::OpenOptions, mem, os::unix::io::AsRawFd, ptr};
 
@@ -305,16 +317,14 @@ impl Drop for Probe {
     }
 }
 
-#[test]
-#[ignore = "requires a real RK3588 NPU at /dev/accel/accel0; run with --nocapture"]
-fn depthwise_weight_layout_probe() {
+fn probe_layout(cin: u32) {
     let shape =
-        Shape::with_out_channels(EXTENT as u32, EXTENT as u32, 1, CIN, CIN).with_depthwise();
+        Shape::with_out_channels(EXTENT as u32, EXTENT as u32, 1, cin, cin).with_depthwise();
 
     unsafe {
         let probe = Probe::new(shape);
         println!(
-            "\ndepthwise probe: {}x{} Cin/Cout {CIN} {KERNEL:?} fp16, \
+            "\ndepthwise probe: {}x{} Cin/Cout {cin} {KERNEL:?} fp16, \
              {} weight slots, {} output surfaces\n",
             EXTENT, EXTENT, probe.weight_slots, probe.out_surfaces
         );
@@ -417,21 +427,40 @@ fn depthwise_weight_layout_probe() {
             println!("  channel {channel:2}: {}", taps.join(" "));
         }
 
-        // Name the two layouts worth recognising, without assuming either.
-        let contiguous = mapping.iter().all(|(slot, (channel, ky, kx))| {
+        // Name the layouts worth recognising, without assuming any of them.
+        //
+        // The two tap-major candidates differ only in the row stride: the
+        // real channel count against the padded one the weight footprint is
+        // sized from. At Cin 8 those coincide, which is why the Cin 12 case
+        // exists -- there the padded count is 16 and the two disagree.
+        let padded = probe.weight_slots / (KERNEL[0] * KERNEL[1]);
+        let channel_major = mapping.iter().all(|(slot, (channel, ky, kx))| {
             *slot == channel * KERNEL[0] * KERNEL[1] + ky * KERNEL[1] + kx
         });
-        let tap_major = mapping.iter().all(|(slot, (channel, ky, kx))| {
-            *slot == (ky * KERNEL[1] + kx) * CIN as usize + channel
+        let tap_major_real = mapping.iter().all(|(slot, (channel, ky, kx))| {
+            *slot == (ky * KERNEL[1] + kx) * cin as usize + channel
         });
+        let tap_major_padded = mapping
+            .iter()
+            .all(|(slot, (channel, ky, kx))| *slot == (ky * KERNEL[1] + kx) * padded + channel);
+        let verdict = |matched: bool| if matched { "MATCHES" } else { "no" };
         println!(
-            "\nchannel-major [Cin][kh][kw]: {}\ntap-major     [kh][kw][Cin]: {}",
-            if contiguous { "MATCHES" } else { "no" },
-            if tap_major { "MATCHES" } else { "no" }
+            "\nchannel-major [Cin][kh][kw]:            {}\n\
+             tap-major     [kh][kw][Cin={cin}]:        {}\n\
+             tap-major     [kh][kw][padded={padded}]:   {}",
+            verdict(channel_major),
+            verdict(tap_major_real),
+            verdict(tap_major_padded)
         );
-        if !contiguous && !tap_major {
+        if cin as usize == padded {
             println!(
-                "neither -- read the per-channel table above; the slot order \
+                "(Cin and the padded count coincide here, so the last two \
+                 cannot be told apart at this shape)"
+            );
+        }
+        if !channel_major && !tap_major_real && !tap_major_padded {
+            println!(
+                "none -- read the per-channel table above; the slot order \
                  within each channel is the packing rule"
             );
         }
@@ -456,4 +485,27 @@ fn depthwise_weight_layout_probe() {
              time the way this probe assumes"
         );
     }
+}
+
+/// The original probe. Cin 8 is one whole fp16 atom, so the buffer holds
+/// exactly 72 slots and every one of them is a real channel.
+#[test]
+#[ignore = "requires a real RK3588 NPU at /dev/accel/accel0; run with --nocapture"]
+fn depthwise_weight_layout_probe() {
+    probe_layout(CIN);
+}
+
+/// The disambiguating probe.
+///
+/// Cin 8 leaves one question open: its real and padded channel counts are
+/// both 8, so a row stride of `Cin` and a row stride of `padded` are the
+/// same number and the first probe cannot separate them. Cin 12 pads to 16,
+/// so the two predict different slots for every tap after the first -- tap
+/// (0,1) starts at slot 12 under one rule and slot 16 under the other.
+///
+/// 144 slots, so this takes twice as long as the Cin 8 run.
+#[test]
+#[ignore = "requires a real RK3588 NPU at /dev/accel/accel0; run with --nocapture"]
+fn depthwise_weight_layout_probe_with_channel_padding() {
+    probe_layout(12);
 }
