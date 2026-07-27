@@ -147,6 +147,22 @@ unsafe fn fill_input(base: *mut u8, size: usize, shape: Shape, surfaces: usize) 
     }
 }
 
+/// Byte written into each buffer *past* the size the builder declares.
+///
+/// The whole allocation is zeroed first, so `NONE` leaves the tail zero and
+/// reproduces the ordinary runs exactly. A nonzero tail is a probe: if the
+/// hardware only reads what the registers declare, the output cannot depend
+/// on these, and if it does depend on them the register count is short.
+#[derive(Clone, Copy)]
+struct Tails {
+    weights: u8,
+    bs: u8,
+}
+
+impl Tails {
+    const NONE: Tails = Tails { weights: 0, bs: 0 };
+}
+
 struct Failure {
     mismatches: usize,
     samples: Vec<String>,
@@ -162,6 +178,7 @@ fn run(
     kernels: Kernels,
     shift: u32,
     output_zero_point: i32,
+    tails: Tails,
 ) -> Result<BTreeSet<i32>, Failure> {
     let width = shape.width as usize;
     let height = shape.height as usize;
@@ -193,6 +210,13 @@ fn run(
         let buf_weights = Buffer::new(fd, page_aligned_size(weight_bytes), &file);
         ptr::write_bytes(buf_weights.host_ptr, 0, buf_weights.size);
         ptr::write_bytes(buf_weights.host_ptr, 1, weight_bytes);
+        if tails.weights != 0 && buf_weights.size > weight_bytes {
+            ptr::write_bytes(
+                buf_weights.host_ptr.add(weight_bytes),
+                tails.weights,
+                buf_weights.size - weight_bytes,
+            );
+        }
 
         // The BS buffer. Zero bias at unit multiplier -- and emphatically not
         // a zeroed buffer, which would multiply everything by zero.
@@ -204,6 +228,13 @@ fn run(
             std::slice::from_raw_parts_mut(buf_bs.host_ptr, buf_bs.size),
             &entries,
         );
+        if tails.bs != 0 && buf_bs.size > bs_bytes {
+            ptr::write_bytes(
+                buf_bs.host_ptr.add(bs_bytes),
+                tails.bs,
+                buf_bs.size - bs_bytes,
+            );
+        }
 
         let buf_output = Buffer::new(fd, page_aligned_size(output_bytes), &file);
         ptr::write_bytes(buf_output.host_ptr, 0, buf_output.size);
@@ -370,7 +401,7 @@ fn attempt(
     let label = format!(
         "Cin {in_channels:>3} Cout {out_channels:>3} {width}x32 {kernels:?} >>{shift} zp {output_zero_point}"
     );
-    match run(shape, kernels, shift, output_zero_point) {
+    match run(shape, kernels, shift, output_zero_point, Tails::NONE) {
         Ok(differences) => println!(
             "  ok   {label}  {:?} padded {}/{}  got - want in {:?}",
             shape.layout(),
@@ -463,6 +494,87 @@ fn int8_output_channel_range_runs_on_npu() {
         attempt(16, out_channels, 64, 3, 0, &mut failures);
     }
     assert_no_failures(failures);
+}
+
+/// Diagnoses the `Cout` 1 failure: is it nondeterministic, and does it read
+/// past what the registers declare?
+///
+/// `Cout` 1 is the only case where the true kernel count sits far below the
+/// padded one -- one real kernel against a padded 32. It has failed twice
+/// with different signatures from identical register programs: 31 mismatches
+/// confined to the left column at `-2`, then 1891 across the whole map at
+/// `+2`. A uniform two-LSB offset is four in the accumulator, which is
+/// bias-shaped, and a signature that changes between runs of the same
+/// program means something is reading memory the test does not control.
+///
+/// Two buffers are sized from the true `Cout` and would be short if the
+/// hardware fetched the padded one: the coefficients (144 bytes at `Cout` 1)
+/// and the BS buffer. Both allocations are page-rounded and fully zeroed, so
+/// a short fetch reads zeros today and its effect depends on what the
+/// allocator last left in the page -- which would explain the varying sign.
+///
+/// This runs each case repeatedly with the tail past the declared size left
+/// zero, then poisoned. Reading the report:
+///
+/// - the same difference set on every repeat means it is deterministic
+///   after all, and the register program is simply wrong for `Cout` 1;
+/// - a difference set that moves with `weights` means the CNA fetches more
+///   coefficients than `weight_bytes` declares;
+/// - one that moves with `bs` means BRDMA fetches more BS entries than
+///   `bs_buffer_bytes` covers, which would make it a bias.
+///
+/// `Cout` 8 is the control: same shape, same code path, a `Cout` that passes.
+#[test]
+#[ignore = "needs /dev/accel/accel0 -- cross-compile for aarch64 and run on the RK3588 board"]
+fn int8_single_output_channel_probe() {
+    const REPEATS: usize = 3;
+    for out_channels in [1u32, 8] {
+        for tails in [
+            Tails::NONE,
+            Tails {
+                weights: 0x7f,
+                bs: 0,
+            },
+            Tails {
+                weights: 0,
+                bs: 0x7f,
+            },
+            Tails {
+                weights: 0xff,
+                bs: 0xff,
+            },
+        ] {
+            let shift = shift_for(16, 3);
+            let precision = Precision::Int8(Quantization {
+                input_zero_point: 0,
+                output_zero_point: 0,
+                multiplier: Multiplier::for_unit_bs(1.0 / f64::from(1u32 << shift)),
+            });
+            let shape = Shape::with_precision(64, 32, 1, 16, out_channels, precision);
+            let mut observed = Vec::new();
+            for _ in 0..REPEATS {
+                let differences = match run(shape, [3, 3], shift, 0, tails) {
+                    Ok(differences) => differences,
+                    Err(failure) => failure.differences,
+                };
+                observed.push(differences);
+            }
+            let stable = observed.windows(2).all(|pair| pair[0] == pair[1]);
+            println!(
+                "  Cout {out_channels:>3}  weight tail 0x{:02x}  bs tail 0x{:02x}  \
+                 {}  got - want {:?}",
+                tails.weights,
+                tails.bs,
+                if stable { "stable  " } else { "UNSTABLE" },
+                observed,
+            );
+        }
+    }
+    println!(
+        "\n  weight_bytes at Cout 1 is {} against a padded {} kernels",
+        Shape::with_out_channels(64, 32, 1, 16, 1).weight_bytes([3, 3]),
+        Shape::with_out_channels(64, 32, 1, 16, 1).padded_out_channels(),
+    );
 }
 
 /// Zero points, and the wide shapes that exercise the int8 capacity rule.
