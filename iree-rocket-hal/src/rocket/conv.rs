@@ -1263,15 +1263,15 @@ impl Tile2D {
 /// and the row split for each column. Programs returned by [`ConvPlan::programs`]
 /// retain tile-relative buffer offsets and still need normal DMA relocation.
 ///
-/// For 1x1 and 3x3 this is the existing demand-based allocator. Even square
-/// kernels use that allocator through the eight-bank demand measured by the
-/// even sweep. The fp16 stride-1 5x5 through 11x11 policies are the
-/// conservative partitions from the focused capture and hardware sweep. The
-/// three shapes that require horizontal tiling retain their hardware-proven
-/// captured boundaries; other surface-layout shapes fall back to the fewest
-/// balanced columns that satisfy the same two-dimensional CBUF capacity
-/// bound. Those fallback partitions are derived rather than
-/// hardware-validated.
+/// For 1x1 and 3x3 this is the existing demand-based allocator. Even kernels
+/// use that allocator too, at stride 1, through the demands the even sweep
+/// measures: eight banks square and six with two even extents. The fp16
+/// stride-1 5x5 through 11x11 policies are the conservative partitions from
+/// the focused capture and hardware sweep. The three shapes that require
+/// horizontal tiling retain their hardware-proven captured boundaries; other
+/// surface-layout shapes fall back to the fewest balanced columns that
+/// satisfy the same two-dimensional CBUF capacity bound. Those fallback
+/// partitions are derived rather than hardware-validated.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct ConvPlan {
     shape: Shape,
@@ -1287,8 +1287,8 @@ impl ConvPlan {
     ///
     /// Panics when the requested operation lies outside the supported policy.
     /// In particular, the capture-specific odd-square policies above 3x3
-    /// require fp16 and stride 1, and NC1HWC2 input is required if horizontal
-    /// tiling is necessary.
+    /// require fp16 and stride 1, every even kernel requires stride 1, and
+    /// NC1HWC2 input is required if horizontal tiling is necessary.
     pub fn new(shape: Shape, kernels: Kernels) -> ConvPlan {
         let kernel = shape.kernel_programming(kernels);
         if kernel.height != kernel.width {
@@ -1484,10 +1484,31 @@ const MAX_NON_SQUARE_DEMAND_BASED_WEIGHT_BANKS: u32 = 5;
 ///
 /// The even sweep reaches eight banks at 8x8 and agrees exactly. A 10x10
 /// pressure shape asks for thirteen and is instead programmed 5/7, so demand
-/// alone no longer chooses the split there.
+/// alone no longer chooses the split there. Nothing measures the demands
+/// between, because no even square extent lands in 9..=12 at the pressure
+/// geometry.
 const MAX_EVEN_SQUARE_DEMAND_BASED_WEIGHT_BANKS: u32 = 8;
 
+/// Largest coefficient demand for which a kernel with two even extents
+/// follows the demand-based CBUF split.
+///
+/// Separate from [`MAX_NON_SQUARE_DEMAND_BASED_WEIGHT_BANKS`] because the odd
+/// corpus and the even one disagree about where demand stops deciding, and
+/// each measures its own parity. The even pressure row runs 4x8/8x4 at four
+/// banks, 4x10/10x4 at five and 6x8/8x6 at six, and every mirrored pair takes
+/// the demand-based split -- where the odd rectangles already disagree with
+/// their mirrors at seven (5x11/11x5) and eight (7x9/9x7).
+///
+/// Six rather than the square path's eight because six is where the even
+/// rectangles stop: no captured even non-square shape lands between seven and
+/// twelve banks at the pressure geometry.
+const MAX_EVEN_NON_SQUARE_DEMAND_BASED_WEIGHT_BANKS: u32 = 6;
+
 fn even_square_cbuf_partition(shape: Shape, kernels: Kernels) -> (u32, u32) {
+    assert_eq!(
+        shape.stride, 1,
+        "even kernels currently have capture backing only at stride 1"
+    );
     let demand = shape.weight_bank_demand(kernels);
     assert!(
         demand <= MAX_EVEN_SQUARE_DEMAND_BASED_WEIGHT_BANKS,
@@ -1519,17 +1540,29 @@ fn even_square_cbuf_partition(shape: Shape, kernels: Kernels) -> (u32, u32) {
 /// 1x1/3x3 allocator is exact in both precisions. Above it this refuses
 /// rather than guesses; `conv_2d_tile_with_cbuf_banks` and
 /// [`ConvPlan::with_cbuf_banks`] take an explicit split.
+///
+/// A kernel with two even extents is bounded by its own corpus instead. The
+/// odd disagreement is not evidence about shapes the even sweep measured
+/// directly, and refusing a captured 6x8 because an uncaptured 5x11 misbehaves
+/// would be reading one parity's policy off the other's.
 fn non_square_cbuf_partition(shape: Shape, kernels: Kernels) -> (u32, u32) {
     assert_eq!(
         shape.stride, 1,
         "non-square kernels currently have capture backing only at stride 1"
     );
+    let kernel = shape.kernel_programming(kernels);
+    let both_even = kernel.height.is_multiple_of(2) && kernel.width.is_multiple_of(2);
+    let (limit, parity) = if both_even {
+        (MAX_EVEN_NON_SQUARE_DEMAND_BASED_WEIGHT_BANKS, "even")
+    } else {
+        (MAX_NON_SQUARE_DEMAND_BASED_WEIGHT_BANKS, "non-square")
+    };
     let demand = shape.weight_bank_demand(kernels);
     assert!(
-        demand <= MAX_NON_SQUARE_DEMAND_BASED_WEIGHT_BANKS,
-        "non-square kernel {kernels:?} needs {demand} coefficient banks, above the \
-         {MAX_NON_SQUARE_DEMAND_BASED_WEIGHT_BANKS} where the captured split stops \
-         following coefficient demand; use an explicit CBUF split"
+        demand <= limit,
+        "{parity} kernel {kernels:?} needs {demand} coefficient banks, above the \
+         {limit} where the captured split stops following coefficient demand; \
+         use an explicit CBUF split"
     );
     shape.demand_based_cbuf_partition(kernels)
 }
@@ -2580,6 +2613,48 @@ mod tests {
                 },
             ]
         );
+    }
+
+    #[test]
+    fn even_non_square_plans_take_the_captured_split_at_every_measured_demand() {
+        // The even sweep's pressure row: 256x32, Cin 32, Cout 64 fp16, where
+        // coefficient demand is `ceil(kh * kw / 8)`. Unlike the odd
+        // rectangles, every mirrored even pair agrees with its twin and with
+        // the demand-based allocator, through six banks.
+        for (kernels, banks) in [
+            ([4usize, 8usize], (8u32, 4u32)),
+            ([8, 4], (8, 4)),
+            ([4, 10], (7, 5)),
+            ([10, 4], (7, 5)),
+            ([6, 8], (6, 6)),
+            ([8, 6], (6, 6)),
+        ] {
+            let shape = Shape::with_out_channels(256, 32, 1, 32, 64);
+            let plan = ConvPlan::new(shape, kernels);
+            assert_eq!(
+                (plan.data_banks(), plan.weight_banks()),
+                banks,
+                "{kernels:?} CBUF split"
+            );
+        }
+    }
+
+    #[test]
+    #[should_panic(expected = "even kernel [6, 10] needs 8")]
+    fn automatic_plan_refuses_even_non_square_demand_the_even_sweep_skips() {
+        // 6x10 asks for eight banks. The even square path reaches eight at
+        // 8x8, but no captured even *rectangle* lands between seven and
+        // twelve, so the square's ceiling is not evidence about this shape.
+        let _ = ConvPlan::new(Shape::with_out_channels(256, 32, 1, 32, 64), [6, 10]);
+    }
+
+    #[test]
+    #[should_panic(expected = "even kernels currently have capture backing only at stride 1")]
+    fn automatic_plan_refuses_even_kernels_above_stride_one() {
+        // Every point in the even grid is stride 1. Nothing says the pad or
+        // grains formulas survive a stride an even kernel has never been
+        // captured at.
+        let _ = ConvPlan::new(Shape::with_stride(32, 32, 2), [4, 4]);
     }
 
     #[test]
