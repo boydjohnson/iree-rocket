@@ -1,4 +1,5 @@
-//! Hardware validation of non-square convolution kernels, in both precisions.
+//! Hardware validation of square and non-square convolution kernels, in both
+//! precisions.
 //!
 //! This test is ignored on the development host because it needs the RK3588
 //! NPU device. Cross-compile it, copy the printed test binary to the board,
@@ -21,6 +22,12 @@
 //! hardware half of that -- it runs kernels the builder has never executed
 //! and checks every output element.
 //!
+//! The even-kernel sweep adds a second ambiguity the odd captures could not
+//! resolve: the extent is programmed verbatim rather than reconstructed as
+//! `2 * pad + 1`, and padding is an independent per-axis input. The even
+//! tests below cover square, rectangular, and mixed-parity kernels with both
+//! the default `kernel / 2` padding and explicit asymmetric per-axis values.
+//!
 //! # Why the shapes come in mirrored pairs
 //!
 //! An axis confusion is exactly the bug this class of change invites, and a
@@ -37,12 +44,13 @@
 //!
 //! # Scope
 //!
-//! Odd extents 1..=11 per axis, stride 1, which is what the captures cover.
-//! Non-square kernels reach the CBUF allocator through [`ConvPlan`], since
-//! `conv_2d_tile`'s automatic split has runtime backing for 1x1 and 3x3
-//! only. The last test covers `ConvPlan::with_cbuf_banks`, the explicit-split
-//! path for the high-demand shapes where the captured allocation stops
-//! following coefficient demand and `ConvPlan::new` declines to guess.
+//! Extents 1..=11 per axis and stride 1, which is what the combined odd and
+//! even captures cover. Non-square kernels reach the CBUF allocator through
+//! [`ConvPlan`], since `conv_2d_tile`'s automatic split has runtime backing
+//! for 1x1 and 3x3 only. The last test covers
+//! `ConvPlan::with_cbuf_banks`, the explicit-split path for the high-demand
+//! shapes where the captured allocation stops following coefficient demand
+//! and `ConvPlan::new` declines to guess.
 //!
 //! Input and weights are 1, with padded lanes zero, so each output is
 //! `Cin * valid_y_taps * valid_x_taps` -- independent of the order the
@@ -61,8 +69,8 @@ use iree_rocket_hal::rocket::{
         dpu_rdma::DpuRdmaBsBaseAddr,
     },
     conv::{
-        BsEntry, ConvPlan, FeatureLayout, Kernels, Multiplier, Precision, Quantization, Shape,
-        write_bs_buffer,
+        BsEntry, ConvPlan, FeatureLayout, Kernels, Multiplier, Padding, Precision, Quantization,
+        Shape, write_bs_buffer,
     },
     device::{Buffer, JobDesc, close_bo, fini_bo, prep_bo, submit_jobs},
 };
@@ -114,11 +122,24 @@ fn f16_to_f32(bits: u16) -> f32 {
     f32::from_bits(f32_bits)
 }
 
-/// Taps of a `kernel`-long axis that land inside an `extent`-long image when
-/// centred on `coordinate`. Called once per axis, with that axis's extent.
-fn valid_taps(coordinate: usize, extent: usize, kernel: usize) -> usize {
-    let radius = kernel / 2;
-    1 + coordinate.min(radius) + (extent - coordinate - 1).min(radius)
+/// Taps of a kernel axis that land inside an image axis at one output
+/// coordinate.
+///
+/// Expressing this as an interval intersection handles even kernels and
+/// explicit padding directly. The old centred-radius formula was equivalent
+/// only when `kernel == 2 * padding + 1`.
+fn valid_taps(
+    output_coordinate: usize,
+    extent: usize,
+    kernel: usize,
+    padding: usize,
+    stride: usize,
+) -> usize {
+    let window_first = (output_coordinate * stride) as isize - padding as isize;
+    let window_last = window_first + kernel as isize;
+    let input_first = window_first.max(0);
+    let input_last = window_last.min(extent as isize);
+    input_last.saturating_sub(input_first) as usize
 }
 
 /// The accumulator an output pixel should hold: `Cin` times the taps inside
@@ -127,9 +148,10 @@ fn valid_taps(coordinate: usize, extent: usize, kernel: usize) -> usize {
 /// these runs exist to catch.
 fn expected_accumulator(shape: Shape, kernels: Kernels, y: usize, x: usize) -> usize {
     let stride = shape.stride as usize;
+    let [pad_top, pad_left] = shape.padding.unwrap_or([kernels[0] / 2, kernels[1] / 2]);
     shape.in_channels as usize
-        * valid_taps(y * stride, shape.height as usize, kernels[0])
-        * valid_taps(x * stride, shape.width as usize, kernels[1])
+        * valid_taps(y, shape.height as usize, kernels[0], pad_top, stride)
+        * valid_taps(x, shape.width as usize, kernels[1], pad_left, stride)
 }
 
 /// Writes the input feature map: every real channel 1, every padding lane 0.
@@ -412,18 +434,21 @@ fn int8_precision(shift: u32) -> Precision {
 fn attempt(plan: &ConvPlan, shift: u32, failures: &mut Vec<String>) {
     let shape = plan.shape();
     let kernels = plan.kernels();
+    let padding = shape.padding.unwrap_or([kernels[0] / 2, kernels[1] / 2]);
     let precision = match shape.precision {
         Precision::Fp16 => "fp16",
         Precision::Int8(_) => "int8",
     };
     let label = format!(
-        "{}x{} Cin {:>2} Cout {:>3} k{}x{} {precision} d{}/w{}",
+        "{}x{} Cin {:>2} Cout {:>3} k{}x{} p{}x{} {precision} d{}/w{}",
         shape.width,
         shape.height,
         shape.in_channels,
         shape.out_channels,
         kernels[0],
         kernels[1],
+        padding[0],
+        padding[1],
         plan.data_banks(),
         plan.weight_banks(),
     );
@@ -474,6 +499,51 @@ const GEOMETRIES: [(u32, u32, u32, u32); 4] = [
 
 /// Kernel shapes, each of which is also run mirrored.
 const KERNEL_SHAPES: [(usize, usize); 5] = [(1, 3), (3, 5), (3, 7), (5, 7), (1, 11)];
+
+/// Even-kernel cases as `(extents, explicit_padding)`.
+///
+/// The square cases cover every measured even extent. The default-padded
+/// rectangular pairs cover both-even and mixed-parity axes in both
+/// orientations. The final pair makes padding independent from the extent:
+/// neither `[0, 2]` nor its mirror can be reconstructed as `kernel / 2`.
+const EVEN_KERNEL_CASES: [(Kernels, Option<Padding>); 15] = [
+    ([2, 2], None),
+    ([4, 4], None),
+    ([6, 6], None),
+    ([8, 8], None),
+    ([10, 10], None),
+    ([2, 4], None),
+    ([4, 2], None),
+    ([6, 10], None),
+    ([10, 6], None),
+    ([3, 4], None),
+    ([4, 3], None),
+    ([5, 8], None),
+    ([8, 5], None),
+    ([4, 6], Some([0, 2])),
+    ([6, 4], Some([2, 0])),
+];
+
+/// A dense square map and a non-square NC1HWC2 map.
+///
+/// The latter makes an axis swap change the output shape for the
+/// explicit-padding cases and exercises the surface-layout DMA path.
+const EVEN_GEOMETRIES: [(u32, u32, u32, u32); 2] = [(32, 32, 3, 8), (40, 24, 16, 16)];
+
+fn even_shape(
+    width: u32,
+    height: u32,
+    in_channels: u32,
+    out_channels: u32,
+    precision: Precision,
+    padding: Option<Padding>,
+) -> Shape {
+    let shape = Shape::with_precision(width, height, 1, in_channels, out_channels, precision);
+    match padding {
+        Some(padding) => shape.with_padding(padding),
+        None => shape,
+    }
+}
 
 /// Shapes `ConvPlan::new` refuses, with the split the vendor captured for
 /// each. Above five banks of coefficient demand the captured allocation stops
@@ -554,6 +624,77 @@ fn non_square_hardware_matrix_is_plannable() {
     );
 }
 
+/// Builds the even-kernel device matrix on the host before the board run.
+#[test]
+fn even_kernel_hardware_matrix_is_plannable() {
+    let mut plans = 0;
+    for (width, height, in_channels, out_channels) in EVEN_GEOMETRIES {
+        for (kernels, explicit_padding) in EVEN_KERNEL_CASES {
+            let padding = explicit_padding.unwrap_or([kernels[0] / 2, kernels[1] / 2]);
+            let shift = shift_for(in_channels, kernels);
+            for precision in [Precision::Fp16, int8_precision(shift)] {
+                let shape = even_shape(
+                    width,
+                    height,
+                    in_channels,
+                    out_channels,
+                    precision,
+                    explicit_padding,
+                );
+                let plan = ConvPlan::new(shape, kernels);
+                assert!(
+                    !plan.tiles().is_empty(),
+                    "{width}x{height} Cin {in_channels} {kernels:?} \
+                     padding {padding:?} planned no tiles"
+                );
+                assert!(
+                    plan.programs().iter().all(|program| program.len() == 136),
+                    "{width}x{height} Cin {in_channels} {kernels:?} \
+                     padding {padding:?} program length"
+                );
+                assert_eq!(
+                    (shape.output_width(kernels), shape.output_height(kernels)),
+                    (
+                        width + 2 * padding[1] as u32 - kernels[1] as u32 + 1,
+                        height + 2 * padding[0] as u32 - kernels[0] as u32 + 1,
+                    ),
+                    "{width}x{height} {kernels:?} padding {padding:?} output extent"
+                );
+                plans += 1;
+            }
+        }
+    }
+
+    assert_eq!(plans, EVEN_GEOMETRIES.len() * EVEN_KERNEL_CASES.len() * 2);
+}
+
+#[test]
+fn even_kernel_cpu_reference_counts_the_exact_window_intersection() {
+    let default_padding = Shape::new(5, 5);
+    assert_eq!(
+        (
+            default_padding.output_width([4, 4]),
+            default_padding.output_height([4, 4]),
+        ),
+        (6, 6)
+    );
+    assert_eq!(expected_accumulator(default_padding, [4, 4], 0, 0), 12);
+    assert_eq!(expected_accumulator(default_padding, [4, 4], 2, 2), 48);
+    assert_eq!(expected_accumulator(default_padding, [4, 4], 5, 5), 12);
+
+    let explicit_padding = Shape::new(5, 5).with_padding([0, 1]);
+    assert_eq!(
+        (
+            explicit_padding.output_width([4, 4]),
+            explicit_padding.output_height([4, 4]),
+        ),
+        (4, 2)
+    );
+    assert_eq!(expected_accumulator(explicit_padding, [4, 4], 0, 0), 36);
+    assert_eq!(expected_accumulator(explicit_padding, [4, 4], 0, 1), 48);
+    assert_eq!(expected_accumulator(explicit_padding, [4, 4], 1, 3), 36);
+}
+
 #[test]
 #[ignore = "needs /dev/accel/accel0 -- cross-compile for aarch64 and run on the RK3588 board"]
 fn fp16_non_square_kernels_run_on_npu() {
@@ -577,6 +718,31 @@ fn fp16_non_square_kernels_run_on_npu() {
     for kernels in [[3usize, 9], [9, 3]] {
         let shape = Shape::with_out_channels(256, 32, 1, 32, 64);
         attempt(&ConvPlan::new(shape, kernels), 0, &mut failures);
+    }
+
+    assert_no_failures(failures);
+}
+
+#[test]
+#[ignore = "needs /dev/accel/accel0 -- cross-compile for aarch64 and run on the RK3588 board"]
+fn fp16_even_square_and_rectangular_kernels_run_on_npu() {
+    let _device_guard = NPU_TEST_LOCK
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    let mut failures = Vec::new();
+
+    for (width, height, in_channels, out_channels) in EVEN_GEOMETRIES {
+        for (kernels, padding) in EVEN_KERNEL_CASES {
+            let shape = even_shape(
+                width,
+                height,
+                in_channels,
+                out_channels,
+                Precision::Fp16,
+                padding,
+            );
+            attempt(&ConvPlan::new(shape, kernels), 0, &mut failures);
+        }
     }
 
     assert_no_failures(failures);
@@ -614,6 +780,32 @@ fn int8_non_square_kernels_run_on_npu() {
         let shift = shift_for(32, kernels);
         let shape = Shape::with_precision(256, 32, 1, 32, 64, int8_precision(shift));
         attempt(&ConvPlan::new(shape, kernels), shift, &mut failures);
+    }
+
+    assert_no_failures(failures);
+}
+
+#[test]
+#[ignore = "needs /dev/accel/accel0 -- cross-compile for aarch64 and run on the RK3588 board"]
+fn int8_even_square_and_rectangular_kernels_run_on_npu() {
+    let _device_guard = NPU_TEST_LOCK
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    let mut failures = Vec::new();
+
+    for (width, height, in_channels, out_channels) in EVEN_GEOMETRIES {
+        for (kernels, padding) in EVEN_KERNEL_CASES {
+            let shift = shift_for(in_channels, kernels);
+            let shape = even_shape(
+                width,
+                height,
+                in_channels,
+                out_channels,
+                int8_precision(shift),
+                padding,
+            );
+            attempt(&ConvPlan::new(shape, kernels), shift, &mut failures);
+        }
     }
 
     assert_no_failures(failures);
