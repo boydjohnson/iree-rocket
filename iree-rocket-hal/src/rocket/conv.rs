@@ -431,6 +431,92 @@ impl Multiplier {
     }
 }
 
+/// Activation fused into the convolution's own DPU pass.
+///
+/// The vendor runs this in the **BN** stage, not BS: across a 30-capture
+/// activation sweep `DPU_BS_CFG` is byte-identical at `0x20150` for every
+/// activation while `DPU_BN_CFG` moves, and `DPU_BN_ALU_CFG`,
+/// `DPU_BN_MUL_CFG` and `DPU_RDMA_RDMA_BN_BASE_ADDR` stay zero throughout.
+/// Turning the stage on costs no operand buffer and no DMA.
+///
+/// Note that [`crate::rocket::mesa_conv`] fuses activation into the BS stage
+/// instead, which is a different port of the same hardware. Nothing has run
+/// that path against a real activated model, so this is not evidence it
+/// computes the wrong thing -- only that it is not what the vendor emits.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Activation {
+    /// `DPU_BN_CFG` = `0x53`. The whole BN stage is bypassed.
+    None,
+    /// Unbounded ReLU, `DPU_BN_CFG` = `0x12`.
+    Relu,
+    /// ReLU clamped at a ceiling (relu6 and friends), `DPU_BN_CFG` = `0x92`.
+    ///
+    /// `cmp` is the ceiling in the *accumulator's* own units, which is where
+    /// BN sits -- before `DPU_OUT_CVT` requantizes. Build it with
+    /// [`Activation::clamped_fp16`] or [`Activation::clamped_int8`] rather
+    /// than by hand; the two precisions encode it completely differently.
+    Clamped { cmp: u32 },
+}
+
+impl Activation {
+    /// A clamped ReLU for an fp16 convolution.
+    ///
+    /// The fp16 accumulator is float, so the ceiling goes in as its raw
+    /// IEEE-754 **binary32** bit pattern -- not fp16, despite the
+    /// surrounding pipeline. Confirmed at three ceilings: 1.0 is
+    /// `0x3F80_0000`, 2.0 `0x4000_0000`, 6.0 `0x40C0_0000`.
+    pub fn clamped_fp16(ceiling: f32) -> Activation {
+        assert!(
+            ceiling.is_finite() && ceiling > 0.0,
+            "activation ceiling must be finite and positive, got {ceiling}"
+        );
+        Activation::Clamped {
+            cmp: ceiling.to_bits(),
+        }
+    }
+
+    /// A clamped ReLU for an int8 convolution.
+    ///
+    /// The int8 accumulator is a scaled integer, so the ceiling is divided
+    /// by the accumulator's unit -- `input_scale * weights_scale` -- and
+    /// rounded. This is why the two scales are taken separately rather than
+    /// as the [`Multiplier`] the output conversion uses: that one has the
+    /// output scale divided into it already and cannot be undone.
+    ///
+    /// Derived by observing that `cmp / ceiling` is constant per model
+    /// across all three swept ceilings, then multiplying it by the capture's
+    /// own `conv_scale` and landing on exactly 255.0 for the clip-to-1.0
+    /// models.
+    pub fn clamped_int8(ceiling: f32, input_scale: f32, weights_scale: f32) -> Activation {
+        assert!(
+            ceiling.is_finite() && ceiling > 0.0,
+            "activation ceiling must be finite and positive, got {ceiling}"
+        );
+        let unit = f64::from(input_scale) * f64::from(weights_scale);
+        assert!(
+            unit.is_finite() && unit > 0.0,
+            "input_scale * weights_scale must be finite and positive, got {unit}"
+        );
+        let cmp = (f64::from(ceiling) / unit).round();
+        assert!(
+            (0.0..=f64::from(u32::MAX)).contains(&cmp),
+            "activation ceiling {ceiling} is {cmp} accumulator units, outside \
+             the 32-bit BN_RELUX_CMP_VALUE field"
+        );
+        Activation::Clamped { cmp: cmp as u32 }
+    }
+
+    /// `(bn_bypass, bn_relu_bypass, bn_relux_en, cmp)`, the four fields the
+    /// activation sweep found moving.
+    fn bn_programming(self) -> (u32, u32, u32, u32) {
+        match self {
+            Activation::None => (1, 1, 0, 0),
+            Activation::Relu => (0, 0, 0, 0),
+            Activation::Clamped { cmp } => (0, 0, 1, cmp),
+        }
+    }
+}
+
 /// Logical geometry of the whole feature map a program operates on.
 ///
 /// Every register formula below is validated against a sweep of 35 vendor
@@ -459,6 +545,14 @@ pub struct Shape {
     /// axis. Keeping the default implicit preserves the original constructors
     /// while allowing padding to vary independently for even kernels.
     pub padding: Option<Padding>,
+    /// Activation fused into this convolution's own DPU pass.
+    pub activation: Activation,
+    /// One filter per input channel rather than one per (input, output)
+    /// pair, `CORE_MISC_CFG.DW_EN`.
+    ///
+    /// The capture corpus covers only a channel multiplier of one, so
+    /// `out_channels` must equal `in_channels`; the builder asserts it.
+    pub depthwise: bool,
 }
 
 /// How the feature map is laid out in memory, which the channel count picks.
@@ -481,6 +575,8 @@ impl Shape {
         out_channels: OUTPUT_CHANNELS,
         precision: Precision::Fp16,
         padding: None,
+        activation: Activation::None,
+        depthwise: false,
     };
 
     pub fn new(width: u32, height: u32) -> Shape {
@@ -544,6 +640,8 @@ impl Shape {
             out_channels,
             precision,
             padding: None,
+            activation: Activation::None,
+            depthwise: false,
         }
     }
 
@@ -558,6 +656,68 @@ impl Shape {
         );
         self.padding = Some(padding);
         self
+    }
+
+    /// Fuses `activation` into this convolution's own DPU pass.
+    pub fn with_activation(mut self, activation: Activation) -> Shape {
+        self.activation = activation;
+        self
+    }
+
+    /// Makes this a depthwise convolution, one filter per input channel.
+    ///
+    /// Only a channel multiplier of one is captured, so the output channel
+    /// count must already equal the input one.
+    ///
+    /// # The weight buffer layout is not derived
+    ///
+    /// The capture sweep pinned the *register programming* -- mode bits,
+    /// channel padding, and the `CNA_WEIGHT_SIZE0.weight_bytes` footprint --
+    /// but says nothing about how those bytes are arranged. A depthwise
+    /// filter is `[Cin, 1, kh, kw]`, not the `[kh, kw, Cin, Cout]` that
+    /// [`crate::rocket::tensor_layout::pack_hwcf_to_rocket_weights`] packs,
+    /// and no capture in the corpus exposes the packed bytes.
+    ///
+    /// So a program built from this plans and dispatches correctly, and the
+    /// hardware will read exactly the right number of coefficient bytes --
+    /// but feeding it a densely-packed buffer will produce wrong output.
+    /// Deriving the layout needs either a vendor weight-buffer dump or a
+    /// hardware bisect, and neither has been done.
+    pub fn with_depthwise(mut self) -> Shape {
+        assert_eq!(
+            self.in_channels, self.out_channels,
+            "depthwise capture backing covers a channel multiplier of one only"
+        );
+        self.depthwise = true;
+        self
+    }
+
+    /// Channel granule the programmed channel count rounds up to.
+    ///
+    /// Depthwise doubles it -- fp16 rounds to 32 where dense rounds to 16,
+    /// int8 to 64 where dense rounds to 32 -- which the nine-point channel
+    /// ladder pins in both precisions.
+    ///
+    /// Mesa's own depthwise path instead doubles the count when it is at
+    /// most 32 and then rounds to a multiple of 64. That disagrees with the
+    /// captures at three of the seven fp16 points (Cout 8 and 32 are
+    /// programmed 32 where Mesa says 64, and 96 is programmed 96 where Mesa
+    /// says 128), agreeing only where the two rules coincide.
+    fn out_channel_granule(&self) -> u32 {
+        let dense = self.precision.out_channel_granule();
+        if self.depthwise { 2 * dense } else { dense }
+    }
+
+    /// `CNA_CONV_CON1`, `DPU_FEATURE_MODE_CFG` and
+    /// `DPU_RDMA_RDMA_FEATURE_MODE_CFG` all carry the same mode, 3 for
+    /// depthwise against 0 for a dense convolution.
+    fn conv_mode(&self) -> u32 {
+        if self.depthwise { 3 } else { 0 }
+    }
+
+    /// `DPU_BS_OW_CFG.SIZE_E_0/1/2`, 3 for depthwise against 1 for dense.
+    fn bs_ow_size_e(&self) -> u32 {
+        if self.depthwise { 3 } else { 1 }
     }
 
     fn kernel_programming(&self, kernels: Kernels) -> KernelProgramming {
@@ -620,7 +780,16 @@ impl Shape {
     /// 1 was exact. The int8 corpus had no capture below `Cout` 8, so
     /// nothing until now said the vendor never programs an odd kernel count
     /// there.
+    /// A depthwise convolution programs a single kernel whatever its channel
+    /// count: there is one filter per input channel rather than a kernel set
+    /// per output channel, and the channel dimension is carried by the cube
+    /// registers instead. All nine depthwise captures program 1 here, in
+    /// both precisions, which is also why `sweep_axis.py` cannot group them
+    /// -- it matches a program to its model partly by `weight_kernels`.
     pub fn programmed_kernels(&self) -> u32 {
+        if self.depthwise {
+            return 1;
+        }
         match self.precision {
             Precision::Fp16 => self.out_channels,
             Precision::Int8(_) => self.out_channels.next_multiple_of(2),
@@ -655,7 +824,7 @@ impl Shape {
     /// which is why the shape-only corpus -- fixed at Cout 8 -- could not
     /// distinguish this from the true count.
     pub fn padded_out_channels(&self) -> u32 {
-        let granule = self.precision.out_channel_granule();
+        let granule = self.out_channel_granule();
         self.out_channels.next_multiple_of(granule).max(granule)
     }
 
@@ -667,8 +836,22 @@ impl Shape {
     /// are taken apart. Note the *padded* input channel count, and
     /// specifically the weight padding rather than the data padding -- at
     /// three atoms the two differ, and it is the weight one that this follows.
+    /// A depthwise convolution drops the `Cout` factor entirely -- one
+    /// filter per input channel -- and pads the channel count to a whole
+    /// CBUF atom group rather than to the weight padding the dense path
+    /// uses. The two differ only at int8: 48 channels is charged as 64 there
+    /// (three atoms round to four), which is what the captured 576 bytes at
+    /// 3x3 says and what the dense `weight_channels` would have read as 432.
+    /// 3x3 at 128 channels costs 2304 bytes fp16 where dense costs 73728.
     pub fn weight_bytes(&self, kernels: Kernels) -> u32 {
         let kernel = self.kernel_programming(kernels);
+        if self.depthwise {
+            return kernel.height
+                * kernel.width
+                * self.cbuf_atoms()
+                * self.precision.channels_per_atom()
+                * self.precision.element_bytes();
+        }
         kernel.height
             * kernel.width
             * self.weight_channels()
@@ -2043,6 +2226,7 @@ fn conv_2d_tile_program(
     // the real kernels. Both appear below, and they differ at every Cout
     // that is not already a multiple of the granule.
     let padded_out_channels = shape.padded_out_channels();
+    let (bn_bypass, bn_relu_bypass, bn_relux_en, bn_relux_cmp) = shape.activation.bn_programming();
 
     // Precision reaches the program in three ways: an enum replicated across
     // eight fields in four blocks, a set of bypasses that the quantized path
@@ -2177,7 +2361,8 @@ fn conv_2d_tile_program(
     }
     conv_con1
         .proc_precision(precision.into())
-        .in_precision(precision.into());
+        .in_precision(precision.into())
+        .conv_mode(Bits::new(shape.conv_mode()));
     commands.push(conv_con1.build());
     commands.push(
         Register::<DpuSPointer>::new()
@@ -2358,6 +2543,7 @@ fn conv_2d_tile_program(
         Register::<CoreMiscCfg>::new()
             .proc_precision(precision.into())
             .qd_en(Bits::new(u32::from(quantization.is_some())))
+            .dw_en(Bits::new(u32::from(shape.depthwise)))
             .build(),
     );
     commands.push(
@@ -2379,6 +2565,7 @@ fn conv_2d_tile_program(
         Register::<DpuFeatureModeCfg>::new()
             .burst_len(BurstLength::Sixteen.into())
             .output_mode(DpuOutputMode::ExternalMemory.into())
+            .conv_mode(Bits::new(shape.conv_mode()))
             .build(),
     );
     commands.push(
@@ -2441,9 +2628,11 @@ fn conv_2d_tile_program(
     commands.push(zero::<DpuBsReluxCmpValue>());
     commands.push(
         Register::<DpuBsOwCfg>::new()
-            .size_e_0(Bits::new(1))
-            .size_e_1(Bits::new(1))
-            .size_e_2(Bits::new(1))
+            // 3 for depthwise against 1 for dense, at every captured channel
+            // count and in both precisions.
+            .size_e_0(Bits::new(shape.bs_ow_size_e()))
+            .size_e_1(Bits::new(shape.bs_ow_size_e()))
+            .size_e_2(Bits::new(shape.bs_ow_size_e()))
             .od_bypass(Bits::new(u32::from(quantization.is_none())))
             .ow_src(Bits::new(u32::from(quantization.is_some())))
             .build(),
@@ -2462,15 +2651,24 @@ fn conv_2d_tile_program(
     );
     commands.push(
         Register::<DpuBnCfg>::new()
-            .bn_relu_bypass(Bits::new(1))
+            .bn_relu_bypass(Bits::new(bn_relu_bypass))
+            .bn_relux_en(Bits::new(bn_relux_en))
+            // The ALU and MUL halves of the BN stage stay bypassed whatever
+            // the activation; only the relu half is ever used.
             .bn_mul_bypass(Bits::new(1))
             .bn_alu_bypass(Bits::new(1))
-            .bn_bypass(Bits::new(1))
+            .bn_bypass(Bits::new(bn_bypass))
             .build(),
     );
+    // Zero in every capture, activated or not: enabling the relu costs no
+    // operand buffer and no DMA (`DPU_RDMA_RDMA_BN_BASE_ADDR` stays zero too).
     commands.push(zero::<DpuBnAluCfg>());
     commands.push(zero::<DpuBnMulCfg>());
-    commands.push(zero::<DpuBnReluxCmpValue>());
+    commands.push(
+        Register::<DpuBnReluxCmpValue>::new()
+            .bn_relux_cmp_dat(Bits::new(bn_relux_cmp))
+            .build(),
+    );
     commands.push(
         Register::<DpuEwCfg>::new()
             .ew_relu_bypass(Bits::new(1))
@@ -2520,8 +2718,13 @@ fn conv_2d_tile_program(
         // Half an output atom per pixel, and *not* precision-dependent:
         // this field is byte-identical across every fp16/int8 capture pair,
         // unlike `weight_bytes_per_kernel` right above, which halves.
+        // Depthwise doubles this. Confirmed as a factor rather than a
+        // constant by the stride-2 capture, whose 16x16 output takes 1024
+        // against the dense 512.
         Register::<DpuSurfaceAdd>::new()
-            .surf_add(Bits::new(full_out_width * out_height * 2))
+            .surf_add(Bits::new(
+                full_out_width * out_height * 2 * if shape.depthwise { 2 } else { 1 },
+            ))
             .build(),
     );
     commands.push(zero::<DpuReserved40c4>());
@@ -2577,6 +2780,7 @@ fn conv_2d_tile_program(
             .mrdma_disable(Bits::new(1))
             .in_precision(precision.into())
             .proc_precision(precision.into())
+            .conv_mode(Bits::new(shape.conv_mode()))
             .build(),
     );
     commands.push(zero::<DpuRdmaSrcDmaCfg>());
@@ -4429,5 +4633,217 @@ mod tests {
             outputs[0] < outputs[1] && outputs[1] < outputs[2],
             "tile outputs are not strictly increasing: {outputs:x?}"
         );
+    }
+
+    /// Whole-register values read off the fp16 activation sweep, at
+    /// `conv-w32-h32-k3-s1-ci32-co32` and its four activated siblings. The
+    /// same three `DPU_BN_CFG` values appear in all fourteen fp16
+    /// comparison groups, across both feature layouts and both kernels.
+    #[test]
+    fn activation_programs_the_captured_bn_registers() {
+        let base = Shape::with_out_channels(32, 32, 1, 32, 32);
+        for (activation, bn_cfg, cmp) in [
+            (Activation::None, 0x53, 0),
+            (Activation::Relu, 0x12, 0),
+            (Activation::clamped_fp16(6.0), 0x92, 0x40C0_0000),
+            (Activation::clamped_fp16(2.0), 0x92, 0x4000_0000),
+            (Activation::clamped_fp16(1.0), 0x92, 0x3F80_0000),
+        ] {
+            let program = conv_2d_tile(
+                base.with_activation(activation),
+                [3, 3],
+                &Tile::whole(base, [3, 3]),
+            );
+            assert_eq!(value_of::<DpuBnCfg>(&program), bn_cfg, "{activation:?}");
+            assert_eq!(
+                value_of::<DpuBnReluxCmpValue>(&program),
+                cmp,
+                "{activation:?} cmp"
+            );
+            // The BN stage needs no operand: these are zero in every
+            // capture, activated or not.
+            assert_eq!(value_of::<DpuBnAluCfg>(&program), 0);
+            assert_eq!(value_of::<DpuBnMulCfg>(&program), 0);
+            assert_eq!(value_of::<DpuRdmaBnBaseAddr>(&program), 0);
+            // The vendor leaves BS alone; only BN moves. `mesa_conv` fuses
+            // activation here instead, which is what this pins against.
+            assert_eq!(
+                value_of::<DpuBsCfg>(&program),
+                0x2_0150,
+                "{activation:?} BS"
+            );
+            assert_eq!(value_of::<DpuBsReluxCmpValue>(&program), 0);
+        }
+    }
+
+    #[test]
+    fn activation_changes_only_the_two_bn_words() {
+        let shape = Shape::with_out_channels(32, 32, 1, 32, 32);
+        let tile = Tile::whole(shape, [3, 3]);
+        let plain = conv_2d_tile(shape, [3, 3], &tile);
+        for (activation, expected) in [
+            // Relu leaves the cmp value at its unactivated zero.
+            (Activation::Relu, 1),
+            (Activation::clamped_fp16(6.0), 2),
+            (Activation::clamped_int8(6.0, 0.02, 0.003), 2),
+        ] {
+            let activated = conv_2d_tile(shape.with_activation(activation), [3, 3], &tile);
+            let changed = plain
+                .iter()
+                .zip(&activated)
+                .filter(|(left, right)| left.0 != right.0)
+                .count();
+            assert_eq!(changed, expected, "{activation:?} changed words");
+        }
+    }
+
+    #[test]
+    fn int8_clamp_is_the_ceiling_in_accumulator_units() {
+        // cmp = round(ceiling / (input_scale * weights_scale)), which makes
+        // it exactly linear in the ceiling at a fixed pair of scales -- the
+        // property that identified the rule in the first place.
+        let (input, weights) = (0.02, 0.003);
+        let cmp = |ceiling| match Activation::clamped_int8(ceiling, input, weights) {
+            Activation::Clamped { cmp } => cmp,
+            other => panic!("expected a clamp, got {other:?}"),
+        };
+        assert_eq!(
+            cmp(1.0),
+            (1.0 / (f64::from(input) * f64::from(weights))).round() as u32
+        );
+        // Linear in the ceiling, but only to within the rounding -- which is
+        // exactly what the captures show: 6 x 86815 is 520890 against a
+        // captured 520891, and 2 x 276086 is 552172 against 552171.
+        for multiple in [2u32, 6] {
+            let scaled = cmp(multiple as f32);
+            let exact = multiple * cmp(1.0);
+            assert!(
+                scaled.abs_diff(exact) <= 2,
+                "x{multiple}: {scaled} is not within rounding of {exact}"
+            );
+        }
+        // Not the fp16 encoding, which is what the two precisions differ on.
+        assert_ne!(cmp(6.0), 6.0f32.to_bits());
+    }
+
+    /// The depthwise channel ladder, both precisions, read off the nine
+    /// captures. `mesa_conv::compute_task_output_channels` would say 64, 64
+    /// and 128 for the fp16 8, 32 and 96 rows.
+    #[test]
+    fn depthwise_pads_channels_to_the_captured_granule() {
+        for (channels, fp16, int8) in [
+            (8u32, 32u32, 64u32),
+            (16, 32, 64),
+            (32, 32, 64),
+            (48, 64, 64),
+            (64, 64, 64),
+            (96, 96, 128),
+            (128, 128, 128),
+        ] {
+            let shape = Shape::with_out_channels(32, 32, 1, channels, channels).with_depthwise();
+            assert_eq!(shape.padded_out_channels(), fp16, "fp16 c{channels}");
+            let quantized = Shape::with_precision(32, 32, 1, channels, channels, captured_int8())
+                .with_depthwise();
+            assert_eq!(quantized.padded_out_channels(), int8, "int8 c{channels}");
+        }
+    }
+
+    /// `CNA_WEIGHT_SIZE0.weight_bytes` across the same ladder: one filter
+    /// per input channel, with the channel count padded to a whole CBUF
+    /// atom group. The int8 48-channel row is the one that separates this
+    /// from the dense weight padding, which would read 432 rather than 576.
+    #[test]
+    fn depthwise_weight_bytes_match_the_captures() {
+        for (channels, fp16, int8) in [
+            (8u32, 144u32, 144u32),
+            (16, 288, 144),
+            (32, 576, 288),
+            (48, 864, 576),
+            (64, 1152, 576),
+            (96, 1728, 864),
+            (128, 2304, 1152),
+        ] {
+            let shape = Shape::with_out_channels(32, 32, 1, channels, channels).with_depthwise();
+            assert_eq!(shape.weight_bytes([3, 3]), fp16, "fp16 c{channels}");
+            let quantized = Shape::with_precision(32, 32, 1, channels, channels, captured_int8())
+                .with_depthwise();
+            assert_eq!(quantized.weight_bytes([3, 3]), int8, "int8 c{channels}");
+        }
+        // The 5x5 point, which says the rule is not 3x3-specific.
+        let five = Shape::with_out_channels(32, 32, 1, 32, 32).with_depthwise();
+        assert_eq!(five.weight_bytes([5, 5]), 1600);
+        assert_eq!(
+            Shape::with_precision(32, 32, 1, 32, 32, captured_int8())
+                .with_depthwise()
+                .weight_bytes([5, 5]),
+            800
+        );
+    }
+
+    /// The ten fields the depthwise diff found moving, at the geometry the
+    /// dense control shares.
+    #[test]
+    fn depthwise_programs_the_captured_registers() {
+        let shape = Shape::with_out_channels(32, 32, 1, 32, 32);
+        let tile = Tile::whole(shape, [3, 3]);
+        let dense = conv_2d_tile(shape, [3, 3], &tile);
+        let depthwise = conv_2d_tile(shape.with_depthwise(), [3, 3], &tile);
+
+        // weight_kernels drops to 1 whatever the channel count.
+        assert_eq!(value_of::<CnaWeightSize2>(&dense) & 0x3fff, 32);
+        assert_eq!(value_of::<CnaWeightSize2>(&depthwise) & 0x3fff, 1);
+        assert_eq!(value_of::<CnaWeightSize0>(&dense), 18432);
+        assert_eq!(value_of::<CnaWeightSize0>(&depthwise), 576);
+        // SURF_ADD doubles. The field sits in register bits 31:4, so the
+        // raw word is sixteen times the logical value the captures report.
+        assert_eq!(value_of::<DpuSurfaceAdd>(&dense) >> 4, 2048);
+        assert_eq!(value_of::<DpuSurfaceAdd>(&depthwise) >> 4, 4096);
+        // DW_EN, and the three conv_mode copies.
+        assert_ne!(
+            value_of::<CoreMiscCfg>(&dense),
+            value_of::<CoreMiscCfg>(&depthwise)
+        );
+        for (name, dense_word, dw_word) in [
+            // Written twice per program, always with the same value.
+            (
+                "cna",
+                first_value_of::<CnaConvCon1>(&dense),
+                first_value_of::<CnaConvCon1>(&depthwise),
+            ),
+            (
+                "dpu",
+                value_of::<DpuFeatureModeCfg>(&dense),
+                value_of::<DpuFeatureModeCfg>(&depthwise),
+            ),
+            (
+                "dpu_rdma",
+                value_of::<DpuRdmaFeatureModeCfg>(&dense),
+                value_of::<DpuRdmaFeatureModeCfg>(&depthwise),
+            ),
+        ] {
+            assert_ne!(dense_word, dw_word, "{name} conv_mode");
+        }
+    }
+
+    #[test]
+    fn depthwise_at_stride_two_still_doubles_the_surface() {
+        // The capture whose output geometry differs, which is what makes
+        // the doubling a factor rather than a constant 4096.
+        let shape = Shape::with_out_channels(32, 32, 2, 32, 32);
+        let tile = Tile::whole(shape, [3, 3]);
+        assert_eq!(
+            value_of::<DpuSurfaceAdd>(&conv_2d_tile(shape, [3, 3], &tile)) >> 4,
+            512
+        );
+        assert_eq!(
+            value_of::<DpuSurfaceAdd>(&conv_2d_tile(shape.with_depthwise(), [3, 3], &tile)) >> 4,
+            1024
+        );
+    }
+
+    #[test]
+    #[should_panic(expected = "channel multiplier of one")]
+    fn depthwise_refuses_a_channel_multiplier_above_one() {
+        let _ = Shape::with_out_channels(32, 32, 1, 32, 64).with_depthwise();
     }
 }
