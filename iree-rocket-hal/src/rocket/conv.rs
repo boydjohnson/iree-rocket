@@ -570,6 +570,28 @@ impl Shape {
         }
     }
 
+    /// Bytes to allocate and populate for this convolution's BS buffer.
+    ///
+    /// Sized from the *padded* output channel count, not the true one, which
+    /// matters only when the two differ enough to cross a BS block.
+    ///
+    /// At int8 `Cout` 1 the hardware's output depends on bytes past what
+    /// `bs_buffer_bytes(1)` declares: poisoning the tail of that buffer
+    /// changes the result, while the same poison at `Cout` 8 -- which
+    /// declares the same single 64-byte block -- changes nothing. It also
+    /// explains a failure that came and went between identical runs, since
+    /// what lies past the declared region is whatever the allocator last
+    /// left there. `Cout` 1 is fine at fp16, so this is specific to the
+    /// int8 BRDMA fetch, which reads a multiplier alongside the bias.
+    ///
+    /// How far past it reads is not established -- the padded count is an
+    /// upper bound that covers it, not a measurement. Populating the whole
+    /// range with default entries costs a few hundred bytes and makes every
+    /// byte the hardware might fetch a defined one.
+    pub fn bs_buffer_bytes(&self) -> usize {
+        bs_buffer_bytes(self.padded_out_channels())
+    }
+
     /// Output channel count the DPU is programmed with, rounded up to a
     /// whole [`OUTPUT_CHANNEL_GRANULE`] and never below one.
     ///
@@ -1542,6 +1564,9 @@ impl Default for BsEntry {
 }
 
 /// Bytes the BS buffer occupies for `out_channels` output channels.
+///
+/// Prefer [`Shape::bs_buffer_bytes`], which passes the padded count. BRDMA
+/// has been observed reading past what the true count declares.
 pub fn bs_buffer_bytes(out_channels: u32) -> usize {
     (out_channels as usize).div_ceil(BS_CHANNELS_PER_BLOCK) * BS_BLOCK_BYTES
 }

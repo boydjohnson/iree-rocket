@@ -62,7 +62,7 @@ use iree_rocket_hal::rocket::{
     },
     conv::{
         BsEntry, ConvPlan, FeatureLayout, Kernels, Multiplier, Precision, Quantization, Shape,
-        bs_buffer_bytes, write_bs_buffer,
+        write_bs_buffer,
     },
     device::{Buffer, JobDesc, close_bo, fini_bo, prep_bo, submit_jobs},
 };
@@ -231,12 +231,12 @@ fn run(plan: &ConvPlan, shift: u32) -> Result<BTreeSet<i32>, Failure> {
         // buffer would multiply the whole tensor by zero.
         let bias_bytes = match shape.precision {
             Precision::Fp16 => PAGE_BYTES,
-            Precision::Int8(_) => page_aligned_size(bs_buffer_bytes(shape.out_channels)),
+            Precision::Int8(_) => page_aligned_size(shape.bs_buffer_bytes()),
         };
         let buf_bias = Buffer::new(fd, bias_bytes, &file);
         ptr::write_bytes(buf_bias.host_ptr, 0, buf_bias.size);
         if matches!(shape.precision, Precision::Int8(_)) {
-            let entries = vec![BsEntry::default(); shape.out_channels as usize];
+            let entries = vec![BsEntry::default(); shape.padded_out_channels() as usize];
             write_bs_buffer(
                 std::slice::from_raw_parts_mut(buf_bias.host_ptr, buf_bias.size),
                 &entries,

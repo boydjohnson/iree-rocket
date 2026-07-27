@@ -30,7 +30,7 @@ use iree_rocket_hal::rocket::{
     },
     conv::{
         BS_UNIT_MULTIPLIER, BsEntry, FeatureLayout, Kernels, Multiplier, Precision, Quantization,
-        Shape, Tile, bs_buffer_bytes, conv_2d_tile, write_bs_buffer,
+        Shape, Tile, conv_2d_tile, write_bs_buffer,
     },
     device::{Buffer, JobDesc, close_bo, fini_bo, prep_bo, submit_jobs},
 };
@@ -149,7 +149,7 @@ fn map_with(
         ptr::write_bytes(buf_weights.host_ptr, 0, buf_weights.size);
         ptr::write_bytes(buf_weights.host_ptr, 1, weight_bytes);
 
-        let bs_bytes = bs_buffer_bytes(out_channels);
+        let bs_bytes = shape.bs_buffer_bytes();
         let buf_bs = Buffer::new(fd, page_aligned_size(bs_bytes), &file);
         ptr::write_bytes(buf_bs.host_ptr, 0, buf_bs.size);
         let entries = vec![
@@ -157,7 +157,7 @@ fn map_with(
                 bias: 0,
                 multiplier: bs_multiplier,
             };
-            out_channels as usize
+            shape.padded_out_channels() as usize
         ];
         write_bs_buffer(
             std::slice::from_raw_parts_mut(buf_bs.host_ptr, buf_bs.size),

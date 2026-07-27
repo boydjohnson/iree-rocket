@@ -220,10 +220,12 @@ fn run(
 
         // The BS buffer. Zero bias at unit multiplier -- and emphatically not
         // a zeroed buffer, which would multiply everything by zero.
-        let bs_bytes = bs_buffer_bytes(shape.out_channels);
+        // Sized and filled for the padded channel count: BRDMA reads past
+        // what the true count declares at Cout 1.
+        let bs_bytes = shape.bs_buffer_bytes();
         let buf_bs = Buffer::new(fd, page_aligned_size(bs_bytes), &file);
         ptr::write_bytes(buf_bs.host_ptr, 0, buf_bs.size);
-        let entries = vec![BsEntry::default(); shape.out_channels as usize];
+        let entries = vec![BsEntry::default(); shape.padded_out_channels() as usize];
         write_bs_buffer(
             std::slice::from_raw_parts_mut(buf_bs.host_ptr, buf_bs.size),
             &entries,
@@ -570,10 +572,26 @@ fn int8_single_output_channel_probe() {
             );
         }
     }
+    let shift = shift_for(16, 3);
+    let int8 = Shape::with_precision(
+        64,
+        32,
+        1,
+        16,
+        1,
+        Precision::Int8(Quantization {
+            input_zero_point: 0,
+            output_zero_point: 0,
+            multiplier: Multiplier::for_unit_bs(1.0 / f64::from(1u32 << shift)),
+        }),
+    );
     println!(
-        "\n  weight_bytes at Cout 1 is {} against a padded {} kernels",
-        Shape::with_out_channels(64, 32, 1, 16, 1).weight_bytes([3, 3]),
-        Shape::with_out_channels(64, 32, 1, 16, 1).padded_out_channels(),
+        "\n  int8 Cout 1: {} weight bytes, padded to {} kernels, \
+         BS buffer {} bytes true / {} padded",
+        int8.weight_bytes([3, 3]),
+        int8.padded_out_channels(),
+        bs_buffer_bytes(int8.out_channels),
+        int8.bs_buffer_bytes(),
     );
 }
 

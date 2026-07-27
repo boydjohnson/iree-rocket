@@ -43,8 +43,8 @@ use iree_rocket_hal::rocket::{
         dpu_rdma::DpuRdmaBsBaseAddr,
     },
     conv::{
-        BsEntry, Kernels, Multiplier, Precision, Quantization, Shape, Tile, bs_buffer_bytes,
-        conv_2d_tile, write_bs_buffer,
+        BsEntry, Kernels, Multiplier, Precision, Quantization, Shape, Tile, conv_2d_tile,
+        write_bs_buffer,
     },
     device::{Buffer, JobDesc, close_bo, fini_bo, prep_bo, submit_jobs},
 };
@@ -114,7 +114,7 @@ fn probe(bs_multiplier: i16, cvt_scale: u32, cvt_shift: u32) -> i32 {
         ptr::write_bytes(buf_weights.host_ptr, 0, buf_weights.size);
         ptr::write_bytes(buf_weights.host_ptr, 1, weight_bytes);
 
-        let bs_bytes = bs_buffer_bytes(OUT_CHANNELS);
+        let bs_bytes = shape.bs_buffer_bytes();
         let buf_bs = Buffer::new(fd, page_aligned_size(bs_bytes), &file);
         ptr::write_bytes(buf_bs.host_ptr, 0, buf_bs.size);
         let entries = vec![
@@ -122,7 +122,7 @@ fn probe(bs_multiplier: i16, cvt_scale: u32, cvt_shift: u32) -> i32 {
                 bias: 0,
                 multiplier: bs_multiplier,
             };
-            OUT_CHANNELS as usize
+            shape.padded_out_channels() as usize
         ];
         write_bs_buffer(
             std::slice::from_raw_parts_mut(buf_bs.host_ptr, buf_bs.size),
