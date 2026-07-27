@@ -41,6 +41,7 @@ const FEATURE_ATOM_BYTES: usize = 16;
 const PAGE_BYTES: usize = 4096;
 const KERNEL: Kernels = [3, 3];
 const IMPULSE: usize = 16;
+const INT8_DEPTHWISE_GAIN_CORRECTION: f64 = 64.0;
 
 fn page_aligned_size(size: usize) -> usize {
     size.max(1).div_ceil(PAGE_BYTES) * PAGE_BYTES
@@ -145,6 +146,22 @@ fn int8_identity_precision() -> Precision {
         input_zero_point: 0,
         output_zero_point: 0,
         multiplier: Multiplier::from_ratio(1.0),
+    })
+}
+
+fn int8_depthwise_quantization() -> Precision {
+    Precision::Int8(Quantization {
+        input_zero_point: 0,
+        output_zero_point: 0,
+        multiplier: Multiplier::for_unit_bs(INT8_DEPTHWISE_GAIN_CORRECTION),
+    })
+}
+
+fn int8_depthwise_identity_precision() -> Precision {
+    Precision::Int8(Quantization {
+        input_zero_point: 0,
+        output_zero_point: 0,
+        multiplier: Multiplier::from_ratio(INT8_DEPTHWISE_GAIN_CORRECTION),
     })
 }
 
@@ -384,11 +401,15 @@ fn depthwise_binary_tap_weights(
         "the binary layout fixture is for int8"
     );
     let channels = shape.in_channels as usize;
-    let mut dense = vec![0; channels * KERNEL[0] * KERNEL[1]];
+    // The int8 depthwise probe establishes 0x80 as the neutral coefficient
+    // byte under this synthetic zero-point-zero program. A live 0x00
+    // produces a one-LSB positive response.
+    let mut dense = vec![0x80; channels * KERNEL[0] * KERNEL[1]];
     for channel in 0..channels {
         // Use channel+1 so channel zero has a nonzero identity code too.
-        dense[(channel * KERNEL[0] + live_ky) * KERNEL[1] + live_kx] =
-            (((channel + 1) >> channel_bit) & 1) as u8;
+        if ((channel + 1) >> channel_bit) & 1 != 0 {
+            dense[(channel * KERNEL[0] + live_ky) * KERNEL[1] + live_kx] = 0;
+        }
     }
     pack_depthwise_weights(shape, &dense)
 }
@@ -771,7 +792,8 @@ fn int8_depthwise_raw_slot_probe() {
 #[test]
 #[ignore = "needs /dev/accel/accel0 -- currently exposes int8 depthwise magnitude loss"]
 fn int8_depthwise_coefficient_magnitudes_are_preserved() {
-    let shape = Shape::with_precision(32, 32, 1, 12, 12, int8_quantization()).with_depthwise();
+    let shape =
+        Shape::with_precision(32, 32, 1, 12, 12, int8_depthwise_quantization()).with_depthwise();
     let mut input = vec![0; input_bytes(shape)];
     for channel in 0..shape.in_channels as usize {
         input[feature_offset(shape, channel, IMPULSE, IMPULSE)] = 1;
@@ -795,14 +817,14 @@ fn int8_depthwise_coefficient_magnitudes_are_preserved() {
     );
 }
 
-/// The same magnitude check with the probe-backed identity BS/CVT pair. If
-/// this passes while the default-BS case above returns one, coefficient DMA
-/// and packing are sound and the remaining defect is downstream scaling.
+/// The same magnitude check with the probe-backed identity BS pair and the
+/// depthwise ×64 output conversion. Running both BS conventions separates
+/// the depthwise correction from the already-established BS gain.
 #[test]
 #[ignore = "needs /dev/accel/accel0 -- diagnoses depthwise BS/CVT scaling"]
 fn int8_depthwise_magnitudes_with_identity_bs_are_preserved() {
-    let shape =
-        Shape::with_precision(32, 32, 1, 12, 12, int8_identity_precision()).with_depthwise();
+    let shape = Shape::with_precision(32, 32, 1, 12, 12, int8_depthwise_identity_precision())
+        .with_depthwise();
     let mut input = vec![0; input_bytes(shape)];
     for channel in 0..shape.in_channels as usize {
         input[feature_offset(shape, channel, IMPULSE, IMPULSE)] = 1;
