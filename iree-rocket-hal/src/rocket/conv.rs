@@ -570,6 +570,30 @@ impl Shape {
         }
     }
 
+    /// Kernel count the coefficient side is programmed with.
+    ///
+    /// At int8 this is `Cout` rounded up to an even number; at fp16 it is
+    /// `Cout` itself. `CNA_WEIGHT_SIZE2.weight_kernels` and the coefficient
+    /// footprint both follow it, while `orig_channel` keeps the true count.
+    ///
+    /// Measured against vendor captures at 32x32, `Cin` 3, 3x3: int8 `Cout`
+    /// 1 programs 2 kernels and 2 x `bytes_per_kernel`, 3 programs 4, 5
+    /// programs 6, and even counts pass through. fp16 programs the true
+    /// count at every value including 1, 9 and 14.
+    ///
+    /// This is what int8 `Cout` 1 was failing on. Programming a single
+    /// kernel put output channel 0 wrong by about two LSB on hardware, with
+    /// a result that alternated between consecutive jobs, while fp16 `Cout`
+    /// 1 was exact. The int8 corpus had no capture below `Cout` 8, so
+    /// nothing until now said the vendor never programs an odd kernel count
+    /// there.
+    pub fn programmed_kernels(&self) -> u32 {
+        match self.precision {
+            Precision::Fp16 => self.out_channels,
+            Precision::Int8(_) => self.out_channels.next_multiple_of(2),
+        }
+    }
+
     /// Bytes to allocate and populate for this convolution's BS buffer.
     ///
     /// Sized from the *padded* output channel count, not the true one, which
@@ -619,7 +643,7 @@ impl Shape {
         kernel.height
             * kernel.width
             * self.weight_channels()
-            * self.out_channels
+            * self.programmed_kernels()
             * self.precision.element_bytes()
     }
 
@@ -1972,7 +1996,7 @@ fn conv_2d_tile_program(
         Register::<CnaWeightSize2>::new()
             .weight_width(Bits::new(kernel.width))
             .weight_height(Bits::new(kernel.height))
-            .weight_kernels(Bits::new(shape.out_channels))
+            .weight_kernels(Bits::new(shape.programmed_kernels()))
             .build(),
     );
     commands.push(cbuf_con0.build());
@@ -3545,6 +3569,36 @@ mod tests {
                 shift: 24,
             },
         })
+    }
+
+    #[test]
+    fn int8_rounds_the_programmed_kernel_count_up_to_even() {
+        // Vendor captures at 32x32, Cin 3, 3x3: the programmed kernel count
+        // and the coefficient footprint, against the true Cout.
+        //
+        // `conv-w32-h32-k3-s1-ci3-co{1,2,3,4,5,12}-i8` and their fp16 twins.
+        // The int8 corpus had nothing below Cout 8 until hardware failed at
+        // Cout 1, which is why this went unnoticed: every int8 Cout ever
+        // captured was already even.
+        const BYTES_PER_KERNEL: u32 = 144; // 3 * 3 * pad(Cin 3) * 1 byte
+
+        for (cout, kernels) in [(1u32, 2u32), (2, 2), (3, 4), (4, 4), (5, 6), (12, 12)] {
+            let shape = Shape::with_precision(32, 32, 1, 3, cout, Precision::Int8(quantization()));
+            assert_eq!(shape.programmed_kernels(), kernels, "int8 Cout {cout}");
+            assert_eq!(
+                shape.weight_bytes([3, 3]),
+                kernels * BYTES_PER_KERNEL,
+                "int8 weight_bytes at Cout {cout}"
+            );
+        }
+
+        // fp16 programs the true count at every value, odd ones included.
+        for cout in [1u32, 2, 6, 9, 14] {
+            let shape = Shape::with_out_channels(32, 32, 1, 3, cout);
+            assert_eq!(shape.programmed_kernels(), cout, "fp16 Cout {cout}");
+            // 16 padded input channels at fp16, two bytes each.
+            assert_eq!(shape.weight_bytes([3, 3]), cout * 9 * 8 * 2);
+        }
     }
 
     #[test]
