@@ -29,8 +29,8 @@ use std::{fs::OpenOptions, mem, os::unix::io::AsRawFd, ptr};
 
 use iree_rocket_hal::rocket::{
     conv::{
-        Activation, BsEntry, Buffers, ConvPlan, FeatureLayout, Kernels, Multiplier, Precision,
-        Quantization, Shape, bs_buffer_bytes, write_bs_buffer,
+        Activation, BS_MULTIPLIER_SHIFT, BsEntry, Buffers, ConvPlan, FeatureLayout, Kernels,
+        Multiplier, Precision, Quantization, Shape, bs_buffer_bytes, write_bs_buffer,
     },
     device::{Buffer, JobDesc, close_bo, fini_bo, prep_bo, submit_jobs},
     tensor_layout::pack_depthwise_to_rocket_weights,
@@ -150,6 +150,26 @@ fn zero_bias(shape: Shape) -> Vec<u8> {
             bytes
         }
     }
+}
+
+fn int8_bias_with_multiplier(shape: Shape, multiplier: i16) -> Vec<u8> {
+    assert!(
+        matches!(shape.precision, Precision::Int8(_)),
+        "an int8 BS buffer requires an int8 shape"
+    );
+    let channels = shape.padded_out_channels();
+    let mut bytes = vec![0; bs_buffer_bytes(channels)];
+    write_bs_buffer(
+        &mut bytes,
+        &vec![
+            BsEntry {
+                bias: 0,
+                multiplier,
+            };
+            channels as usize
+        ],
+    );
+    bytes
 }
 
 /// Executes every program selected by `ConvPlan` as a separate job in one
@@ -338,11 +358,37 @@ fn depthwise_weights(shape: Shape) -> Vec<u8> {
         }
     }
 
+    pack_depthwise_weights(shape, &dense)
+}
+
+fn depthwise_binary_tap_weights(
+    shape: Shape,
+    live_ky: usize,
+    live_kx: usize,
+    channel_bit: usize,
+) -> Vec<u8> {
+    assert!(
+        matches!(shape.precision, Precision::Int8(_)),
+        "the binary layout fixture is for int8"
+    );
+    let channels = shape.in_channels as usize;
+    let mut dense = vec![0; channels * KERNEL[0] * KERNEL[1]];
+    for channel in 0..channels {
+        // Use channel+1 so channel zero has a nonzero identity code too.
+        dense[(channel * KERNEL[0] + live_ky) * KERNEL[1] + live_kx] =
+            (((channel + 1) >> channel_bit) & 1) as u8;
+    }
+    pack_depthwise_weights(shape, &dense)
+}
+
+fn pack_depthwise_weights(shape: Shape, dense: &[u8]) -> Vec<u8> {
+    let channels = shape.in_channels as usize;
+    let bytes_per_element = element_bytes(shape);
     let weight_bytes = shape.weight_bytes(KERNEL) as usize;
     let padded_channels = weight_bytes / (KERNEL[0] * KERNEL[1] * bytes_per_element);
     let mut packed = vec![0; weight_bytes];
     pack_depthwise_to_rocket_weights(
-        &dense,
+        dense,
         KERNEL[0],
         KERNEL[1],
         channels,
@@ -360,6 +406,7 @@ fn assert_int8_output(
     kernels: Kernels,
     output: &[u8],
     expected: impl Fn(usize, usize, usize) -> i32,
+    tolerance: i32,
 ) {
     let mut mismatches = 0;
     let mut samples = Vec::new();
@@ -369,7 +416,7 @@ fn assert_int8_output(
                 let offset = output_offset(shape, kernels, channel, y, x);
                 let got = i32::from(output[offset] as i8);
                 let want = expected(channel, y, x);
-                if (got - want).abs() > 1 {
+                if (got - want).abs() > tolerance {
                     mismatches += 1;
                     if samples.len() < 12 {
                         samples.push(format!("[c{channel}, {y}, {x}] want {want} got {got}"));
@@ -381,7 +428,7 @@ fn assert_int8_output(
     assert_eq!(
         mismatches,
         0,
-        "{label}: {mismatches} values differ by more than one LSB:\n  {}",
+        "{label}: {mismatches} values differ by more than {tolerance} LSB:\n  {}",
         samples.join("\n  ")
     );
 }
@@ -450,7 +497,7 @@ fn validation_shapes_still_exercise_the_phase1_gaps() {
 
 #[test]
 #[ignore = "needs /dev/accel/accel0 -- cross-compile for aarch64 and run on the RK3588 board"]
-fn clamped_int8_activation_runs_on_npu() {
+fn clamped_int8_activation_register_path_runs_on_npu() {
     // The real-valued ceiling is 0.75, but BN sees accumulator units:
     // round(0.75 / (0.5 * 0.25)) == 6. With unit output conversion the raw
     // results are therefore 4 at corners, 6 at edges, and 6 in the interior.
@@ -458,11 +505,43 @@ fn clamped_int8_activation_runs_on_npu() {
     // raw integer clamps almost everything to zero.
     let activation = Activation::clamped_int8(0.75, 0.5, 0.25);
     assert_eq!(activation, Activation::Clamped { cmp: 6 });
-    let shape =
-        Shape::with_precision(32, 32, 1, 1, 8, int8_quantization()).with_activation(activation);
+
+    // `BsEntry::default()` carries multiplier 2^14 and
+    // `Multiplier::for_unit_bs` cancels its measured gain in OUT_CVT. A BN
+    // ceiling as small as 6 sits between those stages and consequently
+    // requantizes to zero -- exactly what the first board run of this test
+    // observed. Use the other identity pair measured by
+    // `conv_int8_probe_hw`: a BS multiplier of 2^7 and a unit OUT_CVT. That
+    // keeps the accumulator unchanged at BN, making both pass-through (4)
+    // and clamped (6) values directly observable.
+    let identity_bs_multiplier = i16::try_from(1u32 << BS_MULTIPLIER_SHIFT).unwrap();
+    let precision = Precision::Int8(Quantization {
+        input_zero_point: 0,
+        output_zero_point: 0,
+        multiplier: Multiplier::from_ratio(1.0),
+    });
+    let plain = Shape::with_precision(32, 32, 1, 1, 8, precision);
+    let shape = plain.with_activation(activation);
     let input = fill_int8_input(shape, 1);
     let weights = vec![1; shape.weight_bytes(KERNEL) as usize];
-    let (tiles, output) = execute(shape, KERNEL, &input, &weights, &zero_bias(shape));
+    let bias = int8_bias_with_multiplier(shape, identity_bs_multiplier);
+
+    // The unactivated control proves that this synthetic identity pair
+    // really returns the accumulator before drawing any conclusion about
+    // activation.
+    let (_, plain_output) = execute(plain, KERNEL, &input, &weights, &bias);
+    assert_int8_output(
+        "int8 identity control",
+        plain,
+        KERNEL,
+        &plain_output,
+        |_, y, x| {
+            (valid_taps(y, plain.height as usize) * valid_taps(x, plain.width as usize)) as i32
+        },
+        1,
+    );
+
+    let (tiles, output) = execute(shape, KERNEL, &input, &weights, &bias);
     assert_eq!(
         tiles, 1,
         "the activation case should isolate one whole tile"
@@ -477,6 +556,51 @@ fn clamped_int8_activation_runs_on_npu() {
             (valid_taps(y, shape.height as usize) * valid_taps(x, shape.width as usize)).min(6)
                 as i32
         },
+        1,
+    );
+}
+
+/// Exercises clamped activation with the same unit-BS convention used by
+/// `conv_int8_hw` and expected by ordinary builder callers.
+///
+/// The first board run returned zero for every activated output even though
+/// the unactivated int8 suite establishes that this BS/OUT_CVT pair returns
+/// the raw accumulator. Keep this as a correctness test, not an
+/// expected-failure test: the gap is not closed until both the control and
+/// activated halves pass.
+#[test]
+#[ignore = "needs /dev/accel/accel0 -- currently exposes the int8 BN/BS integration defect"]
+fn clamped_int8_activation_with_default_bs_runs_on_npu() {
+    let activation = Activation::clamped_int8(0.75, 0.5, 0.25);
+    let plain = Shape::with_precision(32, 32, 1, 1, 8, int8_quantization());
+    let shape = plain.with_activation(activation);
+    let input = fill_int8_input(shape, 1);
+    let weights = vec![1; shape.weight_bytes(KERNEL) as usize];
+    let bias = zero_bias(shape);
+
+    let (_, plain_output) = execute(plain, KERNEL, &input, &weights, &bias);
+    assert_int8_output(
+        "default-BS int8 activation control",
+        plain,
+        KERNEL,
+        &plain_output,
+        |_, y, x| {
+            (valid_taps(y, plain.height as usize) * valid_taps(x, plain.width as usize)) as i32
+        },
+        1,
+    );
+
+    let (_, output) = execute(shape, KERNEL, &input, &weights, &bias);
+    assert_int8_output(
+        "clamped int8 activation with default BS",
+        shape,
+        KERNEL,
+        &output,
+        |_, y, x| {
+            (valid_taps(y, shape.height as usize) * valid_taps(x, shape.width as usize)).min(6)
+                as i32
+        },
+        1,
     );
 }
 
@@ -492,16 +616,62 @@ fn int8_depthwise_layout_reproduces_its_filter() {
     for channel in 0..shape.in_channels as usize {
         input[feature_offset(shape, channel, IMPULSE, IMPULSE)] = 1;
     }
-    let weights = depthwise_weights(shape);
+    let packed_stride = shape.weight_bytes(KERNEL) as usize / (KERNEL[0] * KERNEL[1]);
     assert_eq!(
-        weights.len() / (KERNEL[0] * KERNEL[1]),
-        16,
+        packed_stride, 16,
         "the test must distinguish real Cin 12 from packed stride 16"
     );
+
+    // The first board run used distinct coefficient magnitudes and found
+    // that int8 depthwise returned 1 for every nonzero byte. That result
+    // cannot distinguish coefficient placement from coefficient-value
+    // semantics. Four bit planes give each real channel a unique nonzero
+    // code, and moving those planes through all nine taps covers every one
+    // of the 12 * 9 real coefficient slots while retaining the padded
+    // stride.
+    for live_ky in 0..KERNEL[0] {
+        for live_kx in 0..KERNEL[1] {
+            for channel_bit in 0..4 {
+                let weights = depthwise_binary_tap_weights(shape, live_ky, live_kx, channel_bit);
+                let (_, output) = execute(shape, KERNEL, &input, &weights, &zero_bias(shape));
+                let live_y = IMPULSE + 1 - live_ky;
+                let live_x = IMPULSE + 1 - live_kx;
+                assert_int8_output(
+                    &format!("int8 depthwise layout tap ({live_ky}, {live_kx}) bit {channel_bit}"),
+                    shape,
+                    KERNEL,
+                    &output,
+                    |channel, y, x| {
+                        i32::from(
+                            ((channel + 1) >> channel_bit) & 1 != 0 && (y, x) == (live_y, live_x),
+                        )
+                    },
+                    0,
+                );
+            }
+        }
+    }
+}
+
+/// Checks coefficient values separately from the binary layout test above.
+///
+/// The first board run returned 1 for every positive coefficient from 1
+/// through 108. If the binary test passes and this one fails the tap/channel
+/// placement is sound, but int8 depthwise coefficient magnitude has a
+/// separate encoding or programming requirement still to derive.
+#[test]
+#[ignore = "needs /dev/accel/accel0 -- currently exposes int8 depthwise magnitude loss"]
+fn int8_depthwise_coefficient_magnitudes_are_preserved() {
+    let shape = Shape::with_precision(32, 32, 1, 12, 12, int8_quantization()).with_depthwise();
+    let mut input = vec![0; input_bytes(shape)];
+    for channel in 0..shape.in_channels as usize {
+        input[feature_offset(shape, channel, IMPULSE, IMPULSE)] = 1;
+    }
+    let weights = depthwise_weights(shape);
     let (_, output) = execute(shape, KERNEL, &input, &weights, &zero_bias(shape));
 
     assert_int8_output(
-        "int8 depthwise layout",
+        "int8 depthwise coefficient magnitudes",
         shape,
         KERNEL,
         &output,
@@ -512,6 +682,7 @@ fn int8_depthwise_layout_reproduces_its_filter() {
                 0
             }
         },
+        1,
     );
 }
 
