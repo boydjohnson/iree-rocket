@@ -244,6 +244,9 @@ pub fn pack_hwcf_to_rocket_weights(
 /// hardware, reading back which output channel responded and which image
 /// borders went zero (`tests/conv_depthwise_probe_hw.rs`). A capture could
 /// never have shown this: it carries the register program, not the buffer.
+/// The original exhaustive probe used fp16; the same tap-major order and a
+/// padded stride of 16 were subsequently validated for int8 at Cin 12 by
+/// `tests/conv_phase1_validation_hw.rs`.
 ///
 /// [`Shape::weight_bytes`]: crate::rocket::conv::Shape::weight_bytes
 pub fn pack_depthwise_to_rocket_weights(

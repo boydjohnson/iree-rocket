@@ -9,6 +9,12 @@
 //! - depthwise convolution combined with fused activation; and
 //! - depthwise convolution submitted through `ConvPlan`'s multi-tile path.
 //!
+//! All four pass on RK3588 hardware. The int8 runs additionally established
+//! that the activation comparator must include the default BS gain, and that
+//! depthwise coefficients retain the fp16 tap-major order with a 16-channel
+//! int8 stride. See the individual tests for the value-domain probes needed
+//! to make those rules observable.
+//!
 //! Cross-compile this test, copy the resulting binary to the RK3588 board,
 //! and run the ignored tests there:
 //!
@@ -781,9 +787,10 @@ fn int8_depthwise_raw_slot_probe() {
 /// Checks coefficient values separately from the binary layout test above.
 ///
 /// The first board run returned 1 for every positive coefficient from 1
-/// through 108. If the binary test passes and this one fails the tap/channel
-/// placement is sound, but int8 depthwise coefficient magnitude has a
-/// separate requantization requirement, now derived from the ×64 probe.
+/// through 108. Sweeping the output conversion showed that the default BS
+/// path retains the coefficient fraction behind a one-unit baseline. A
+/// total gain of 128 with output zero point -128 removes that baseline and
+/// reproduces all 108 live coefficient values within one LSB.
 #[test]
 #[ignore = "needs /dev/accel/accel0 -- validates int8 depthwise magnitude requantization"]
 fn int8_depthwise_coefficient_magnitudes_are_preserved() {
