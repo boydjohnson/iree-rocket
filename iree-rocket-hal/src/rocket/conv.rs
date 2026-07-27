@@ -18,6 +18,17 @@
 //! [`ConvPlan`] additionally plans fp16 stride-1 odd square kernels through
 //! 11x11, including horizontal tiling where a full-width row cannot fit.
 //!
+//! Kernels need not be square. A sweep of 53 non-square captures shows the
+//! two extents govern their own axes throughout -- `weight_width` and
+//! `pad_left` follow the kernel's width, `weight_height`, `pad_top` and
+//! `feature_grains` follow its height, and the coefficient footprint is
+//! `kh * kw * pad(Cin) * element_bytes` -- so the direct geometry needed no
+//! new rule, only the removal of the assumption that one `k` served both.
+//! What does *not* carry over is the CBUF split: at equal coefficient
+//! demand, mirrored shapes split differently, so [`ConvPlan`] plans
+//! non-square kernels only up to the demand where the captures still agree
+//! and otherwise requires an explicit split.
+//!
 //! Input channel count picks the memory layout. While a pixel fits in half a
 //! feature atom -- `Cin` up to 4 -- the vendor keeps it dense NHWC and the
 //! CNA pads internally. From `Cin` 5 the map becomes NC1HWC2 surfaces, and
@@ -552,15 +563,16 @@ impl Shape {
 
     /// Bytes of fp16 coefficients the whole kernel set occupies.
     ///
-    /// `weight_channels * k * k * Cout * 2`, which reproduces
-    /// `CNA_WEIGHT_SIZE0.weight_bytes` in all 829 programs of the corpus.
-    /// Note the *padded* input channel count, and specifically the weight
-    /// padding rather than the data padding -- at three atoms the two differ,
-    /// and it is the weight one that this follows.
+    /// `weight_channels * kh * kw * Cout * 2`, which reproduces
+    /// `CNA_WEIGHT_SIZE0.weight_bytes` in all 829 programs of the corpus, and
+    /// in all 633 of the rectangular-kernel sweep once the two kernel extents
+    /// are taken apart. Note the *padded* input channel count, and
+    /// specifically the weight padding rather than the data padding -- at
+    /// three atoms the two differ, and it is the weight one that this follows.
     pub fn weight_bytes(&self, kernels: Kernels) -> u32 {
         let kernel = kernel_programming(kernels);
-        kernel.size
-            * kernel.size
+        kernel.height
+            * kernel.width
             * self.weight_channels()
             * self.out_channels
             * self.precision.element_bytes()
@@ -598,17 +610,18 @@ impl Shape {
         }
     }
 
-    /// Output width, `floor((w + 2 * pad - k) / stride) + 1`. Matches all 150
-    /// stride-2, -3 and -4 programs in the sweep corpus.
+    /// Output width, `floor((w + 2 * pad_left - kw) / stride) + 1`. Matches
+    /// all 150 stride-2, -3 and -4 programs in the sweep corpus. Each extent
+    /// governs its own axis, so a 3x9 and a 9x3 differ here.
     pub fn output_width(&self, kernels: Kernels) -> u32 {
         let kernel = kernel_programming(kernels);
-        (self.width + 2 * kernel.padding - kernel.size) / self.stride + 1
+        (self.width + 2 * kernel.pad_left - kernel.width) / self.stride + 1
     }
 
-    /// Output height, by the same rule.
+    /// Output height, by the same rule on the kernel's height.
     pub fn output_height(&self, kernels: Kernels) -> u32 {
         let kernel = kernel_programming(kernels);
-        (self.height + 2 * kernel.padding - kernel.size) / self.stride + 1
+        (self.height + 2 * kernel.pad_top - kernel.height) / self.stride + 1
     }
 
     /// Byte stride of one input row.
@@ -811,7 +824,9 @@ impl Shape {
         input_width: u32,
         data_banks: u32,
     ) -> u32 {
-        let halo = 2 * kernel_programming(kernels).padding;
+        // Row tiles only ever pay the vertical halo, which the kernel's
+        // height sets.
+        let halo = 2 * kernel_programming(kernels).pad_top;
         let rows = self
             .max_tile_input_rows_for_width_and_data_banks(input_width, data_banks)
             .saturating_sub(halo)
@@ -822,23 +837,40 @@ impl Shape {
     }
 }
 
+/// The kernel's two extents and the SAME padding each one implies.
+///
+/// The extents are kept apart because a non-square kernel moves them apart.
+/// Every kernel capture before the rectangular sweep was square, so the two
+/// were never observed differing and a single `size` sufficed. A sweep of 53
+/// non-square captures (633 convolution programs, 28 rectangular shapes)
+/// separates them: `weight_height` and `weight_width` carry the kernel's own
+/// height and width with no swap, `pad_left` follows the width alone,
+/// `pad_top` and `feature_grains` follow the height alone, and the
+/// coefficient footprint is `kh * kw * pad(Cin) * element_bytes`. All 228
+/// programs outside the high-pressure regime satisfy every one of those.
 #[derive(Clone, Copy)]
 struct KernelProgramming {
-    size: u32,
-    padding: u32,
+    height: u32,
+    width: u32,
+    /// Zero-padded rows above the first output row, `kh / 2`.
+    pad_top: u32,
+    /// Zero-padded columns left of the first output column, `kw / 2`.
+    pad_left: u32,
 }
 
 fn kernel_programming(kernels: Kernels) -> KernelProgramming {
-    match kernels {
-        [height, width] if height == width && (1..=11).contains(&height) && height % 2 == 1 => {
-            KernelProgramming {
-                size: height as u32,
-                padding: (height / 2) as u32,
-            }
-        }
-        _ => panic!(
-            "conv_2d only has vendor reference data for odd square kernels from 1x1 through 11x11"
-        ),
+    let [height, width] = kernels;
+    let backed = |extent: usize| (1..=11).contains(&extent) && extent % 2 == 1;
+    assert!(
+        backed(height) && backed(width),
+        "conv_2d only has vendor reference data for odd kernel extents from 1 through 11, \
+         got {height}x{width}"
+    );
+    KernelProgramming {
+        height: height as u32,
+        width: width as u32,
+        pad_top: (height / 2) as u32,
+        pad_left: (width / 2) as u32,
     }
 }
 
@@ -894,7 +926,7 @@ impl Tile {
             (1..=output_height).contains(&tiles),
             "tile count must be between 1 and the {output_height} output rows"
         );
-        let padding = kernel_programming(kernels).padding;
+        let padding = kernel_programming(kernels).pad_top;
         let stride = shape.stride;
         let base = output_height / tiles;
         let remainder = output_height % tiles;
@@ -978,10 +1010,12 @@ impl ColumnTile {
             "tile output columns {out_first}..{} fall outside the {output_width}-column output",
             out_first + out_cols
         );
+        // The horizontal analogue of `Tile::split`, so the horizontal padding
+        // is the one that applies.
         let kernel = kernel_programming(kernels);
         let projected_first = out_first * shape.stride;
-        let in_first = projected_first.saturating_sub(kernel.padding);
-        let last_tap = (out_first + out_cols - 1) * shape.stride + kernel.padding;
+        let in_first = projected_first.saturating_sub(kernel.pad_left);
+        let last_tap = (out_first + out_cols - 1) * shape.stride + kernel.pad_left;
         let exact = last_tap.min(shape.width - 1) - in_first + 1;
         let in_cols = exact
             .max(out_cols * shape.stride)
@@ -992,7 +1026,7 @@ impl ColumnTile {
             out_cols,
             in_first,
             in_cols,
-            pad_left: kernel.padding.saturating_sub(projected_first),
+            pad_left: kernel.pad_left.saturating_sub(projected_first),
         }
     }
 
@@ -1118,7 +1152,14 @@ impl ConvPlan {
     /// and NC1HWC2 input if horizontal tiling is necessary.
     pub fn new(shape: Shape, kernels: Kernels) -> ConvPlan {
         let kernel = kernel_programming(kernels);
-        let (data_banks, weight_banks) = match kernel.size {
+        if kernel.height != kernel.width {
+            return ConvPlan::new_with_cbuf_partition(
+                shape,
+                kernels,
+                non_square_cbuf_partition(shape, kernels),
+            );
+        }
+        let (data_banks, weight_banks) = match kernel.height {
             1 | 3 => shape.demand_based_cbuf_partition(kernels),
             5 => {
                 assert_large_kernel_plan_case(shape);
@@ -1146,7 +1187,37 @@ impl ConvPlan {
             }
             _ => unreachable!("kernel_programming accepted an unsupported kernel"),
         };
+        ConvPlan::new_with_cbuf_partition(shape, kernels, (data_banks, weight_banks))
+    }
 
+    /// Plans `shape` against an explicit CBUF split.
+    ///
+    /// The split is the one piece of policy the capture corpus does not
+    /// settle uniformly -- `non_square_cbuf_partition` documents where it
+    /// stops following coefficient demand -- so this is the escape hatch for
+    /// the shapes [`ConvPlan::new`] refuses. Everything downstream, row
+    /// splitting and horizontal partitioning both, follows from the split.
+    /// The two bank counts must be nonzero and sum to the RK3588's twelve
+    /// CBUF banks.
+    pub fn with_cbuf_banks(
+        shape: Shape,
+        kernels: Kernels,
+        data_banks: u32,
+        weight_banks: u32,
+    ) -> ConvPlan {
+        assert!(
+            data_banks > 0 && weight_banks > 0 && data_banks + weight_banks == CBUF_BANKS,
+            "explicit CBUF partition must have nonzero data and weight banks summing to \
+             {CBUF_BANKS}; got data={data_banks}, weights={weight_banks}"
+        );
+        ConvPlan::new_with_cbuf_partition(shape, kernels, (data_banks, weight_banks))
+    }
+
+    fn new_with_cbuf_partition(
+        shape: Shape,
+        kernels: Kernels,
+        (data_banks, weight_banks): (u32, u32),
+    ) -> ConvPlan {
         let full_width = vec![shape.output_width(kernels)];
         if let Some(tiles) = plan_grid(shape, kernels, &full_width, data_banks) {
             return ConvPlan {
@@ -1259,6 +1330,48 @@ fn assert_large_kernel_plan_case(shape: Shape) {
     );
 }
 
+/// Largest coefficient demand at which a non-square kernel's CBUF split is
+/// still the demand-based one.
+///
+/// Every non-square capture at or below this takes exactly the partition
+/// [`Shape::demand_based_cbuf_partition`] computes: all 28 rectangular shapes
+/// at `Cin` 3, and the six 256x32 `Cin` 32 `Cout` 64 captures whose demand is
+/// four or five banks. The first disagreement is at seven.
+const MAX_NON_SQUARE_DEMAND_BASED_WEIGHT_BANKS: u32 = 5;
+
+/// CBUF split for a non-square kernel.
+///
+/// The rectangular sweep shows the vendor's split is not a function of
+/// coefficient demand alone. At 256x32, `Cin` 32, `Cout` 64 the mirrored
+/// pairs 5x11/11x5, 7x9/9x7 and 9x11/11x9 each share a demand and each split
+/// differently, with the taller kernel of every pair landing on 8/4 while the
+/// wider one keeps its coefficient claim. Kernel height reaches the policy by
+/// a route no capture in this corpus isolates -- presumably the halo's cost
+/// on the data side, since a tall kernel needs more input rows resident.
+///
+/// Below the disagreement the question does not arise, and there the
+/// 1x1/3x3 allocator is exact. Above it this refuses rather than guesses;
+/// `conv_2d_tile_with_cbuf_banks` and [`ConvPlan::with_cbuf_banks`] take an
+/// explicit split.
+fn non_square_cbuf_partition(shape: Shape, kernels: Kernels) -> (u32, u32) {
+    assert!(
+        matches!(shape.precision, Precision::Fp16),
+        "non-square kernels currently have capture backing only for fp16"
+    );
+    assert_eq!(
+        shape.stride, 1,
+        "non-square kernels currently have capture backing only at stride 1"
+    );
+    let demand = shape.weight_bank_demand(kernels);
+    assert!(
+        demand <= MAX_NON_SQUARE_DEMAND_BASED_WEIGHT_BANKS,
+        "non-square kernel {kernels:?} needs {demand} coefficient banks, above the \
+         {MAX_NON_SQUARE_DEMAND_BASED_WEIGHT_BANKS} where the captured split stops \
+         following coefficient demand; use an explicit CBUF split"
+    );
+    shape.demand_based_cbuf_partition(kernels)
+}
+
 fn captured_column_partition(shape: Shape, kernels: Kernels) -> Option<Vec<u32>> {
     let focused_shape = shape.width == 256
         && shape.height == 32
@@ -1268,10 +1381,13 @@ fn captured_column_partition(shape: Shape, kernels: Kernels) -> Option<Vec<u32>>
     if !focused_shape {
         return None;
     }
-    match (kernels[0], shape.in_channels) {
-        (9, 64) => Some(vec![135, 121]),
-        (11, 48) => Some(vec![137, 119]),
-        (11, 64) => Some(vec![59, 54, 54, 54, 35]),
+    // Keyed on the whole kernel, not just its height: these boundaries were
+    // captured at 9x9 and 11x11, and a 9x3 shares neither their coefficient
+    // footprint nor their halo.
+    match (kernels, shape.in_channels) {
+        ([9, 9], 64) => Some(vec![135, 121]),
+        ([11, 11], 48) => Some(vec![137, 119]),
+        ([11, 11], 64) => Some(vec![59, 54, 54, 54, 35]),
         _ => None,
     }
 }
@@ -1469,8 +1585,11 @@ pub fn conv_2d_tile(shape: Shape, kernels: Kernels, tile: &Tile) -> Vec<RegCmd> 
 /// settings rather than one correct value, and this larger-than-vendor value
 /// is the one the passing hardware tests use. `conv_grains_probe_hw` measures
 /// the range that actually works.
+/// The kernel term is its *height*, which the square corpus could not show:
+/// across the rectangular sweep's 228 low-pressure programs the vendor's
+/// value tracks `kernel_height` and is unchanged by `kernel_width`.
 pub fn feature_grains(kernels: Kernels, tile: &Tile) -> u32 {
-    tile.in_rows + kernel_programming(kernels).size + tile.pad_top
+    tile.in_rows + kernel_programming(kernels).height + tile.pad_top
 }
 
 /// Builds a tile program with an explicit `feature_grains`, for probing which
@@ -1689,7 +1808,7 @@ fn conv_2d_tile_program(
         ),
     };
 
-    let weight_bytes_per_kernel = kernel.size * kernel.size * weight_channels * element_bytes;
+    let weight_bytes_per_kernel = kernel.height * kernel.width * weight_channels * element_bytes;
     let weight_bytes = shape.weight_bytes(kernels);
     let mut commands = Vec::with_capacity(136);
 
@@ -1793,8 +1912,8 @@ fn conv_2d_tile_program(
     );
     commands.push(
         Register::<CnaWeightSize2>::new()
-            .weight_width(Bits::new(kernel.size))
-            .weight_height(Bits::new(kernel.size))
+            .weight_width(Bits::new(kernel.width))
+            .weight_height(Bits::new(kernel.height))
             .weight_kernels(Bits::new(shape.out_channels))
             .build(),
     );
@@ -2316,6 +2435,112 @@ mod tests {
                 "k{kernel} Cin {in_channels} tiles"
             );
         }
+    }
+
+    /// Captured plan-0 words from the rectangular-kernel sweep, one row per
+    /// capture in `rknn-files/sweep-kshape`: `conv-w32-h32-k3x7-s1`, its
+    /// mirror `conv-w32-h32-k7x3-s1`, and `conv-w32-h32-k1x11-s1`.
+    ///
+    /// The mirrored pair is the whole point. `CnaWeightSize2` and
+    /// `CnaPadCon0` swap their halves with the kernel, and `CnaConvCon2`
+    /// moves with the kernel's height alone -- 36 grains at 3x7 against 42 at
+    /// 7x3 -- while the coefficient footprint, which depends on the area,
+    /// stays put across the swap.
+    const CAPTURED_NON_SQUARE: [(Kernels, u32, u32, u32, u32, u32); 3] = [
+        //  kernel     WeightSize2  PadCon0  ConvCon2  WeightSize0  WeightSize1
+        ([3, 7], 0x0703_0008, 0x31, 0x240, 0xa80, 0x150),
+        ([7, 3], 0x0307_0008, 0x13, 0x2a0, 0xa80, 0x150),
+        ([1, 11], 0x0b01_0008, 0x50, 0x210, 0x580, 0x0b0),
+    ];
+
+    #[test]
+    fn non_square_kernels_program_each_extent_on_its_own_axis() {
+        for (kernels, weight_size2, pad_con0, conv_con2, weight_bytes, per_kernel) in
+            CAPTURED_NON_SQUARE
+        {
+            let shape = Shape::CAPTURED;
+            let plan = ConvPlan::new(shape, kernels);
+            assert_eq!(
+                (plan.data_banks(), plan.weight_banks()),
+                (1, 11),
+                "{kernels:?} CBUF split"
+            );
+            assert_eq!(plan.tiles().len(), 1, "{kernels:?} tiles");
+
+            let program = &plan.programs()[0];
+            assert_eq!(
+                value_of::<CnaWeightSize2>(program),
+                weight_size2,
+                "{kernels:?} weight_width/height"
+            );
+            assert_eq!(
+                value_of::<CnaPadCon0>(program),
+                pad_con0,
+                "{kernels:?} pad_left/top"
+            );
+            assert_eq!(
+                value_of::<CnaConvCon2>(program),
+                conv_con2,
+                "{kernels:?} feature_grains"
+            );
+            assert_eq!(
+                value_of::<CnaWeightSize0>(program),
+                weight_bytes,
+                "{kernels:?} weight_bytes"
+            );
+            assert_eq!(
+                value_of::<CnaWeightSize1>(program),
+                per_kernel,
+                "{kernels:?} weight_bytes_per_kernel"
+            );
+            // SAME padding on both axes, so a non-square kernel leaves the
+            // output extent alone.
+            assert_eq!(
+                (shape.output_width(kernels), shape.output_height(kernels)),
+                (32, 32),
+                "{kernels:?} output extent"
+            );
+        }
+    }
+
+    #[test]
+    fn non_square_plans_take_the_captured_split_where_demand_still_decides() {
+        // 256x32, Cin 32, Cout 64: the five captures in this shape whose
+        // coefficient demand is four or five banks, each matching its
+        // capture's plan-0 CBUF split.
+        for (kernels, banks) in [
+            ([3usize, 9usize], (8u32, 4u32)),
+            ([9, 3], (8, 4)),
+            ([3, 11], (7, 5)),
+            ([11, 3], (7, 5)),
+            ([5, 7], (7, 5)),
+        ] {
+            let shape = Shape::with_out_channels(256, 32, 1, 32, 64);
+            let plan = ConvPlan::new(shape, kernels);
+            assert_eq!(
+                (plan.data_banks(), plan.weight_banks()),
+                banks,
+                "{kernels:?} CBUF split"
+            );
+        }
+    }
+
+    #[test]
+    #[should_panic(expected = "stops following coefficient demand")]
+    fn conv_plan_refuses_the_non_square_splits_the_captures_do_not_settle() {
+        // 11x5 and its mirror 5x11 have the same seven-bank coefficient
+        // demand and split differently -- 8/4 against 5/7 -- so demand alone
+        // cannot choose and the planner declines to guess.
+        let _ = ConvPlan::new(Shape::with_out_channels(256, 32, 1, 32, 64), [11, 5]);
+    }
+
+    #[test]
+    fn explicit_banks_plan_a_non_square_kernel_the_allocator_refuses() {
+        let shape = Shape::with_out_channels(256, 32, 1, 32, 64);
+        let plan = ConvPlan::with_cbuf_banks(shape, [11, 5], 8, 4);
+        assert_eq!((plan.data_banks(), plan.weight_banks()), (8, 4));
+        assert!(!plan.tiles().is_empty());
+        assert!(plan.programs().iter().all(|program| program.len() == 136));
     }
 
     /// The six captured groups, in the order they appear in the regcmd blob:
