@@ -15,8 +15,11 @@
 //!
 //! The ordinary tile builder supports fp16 `Cin` 1..=80, int8 `Cin`
 //! 1..=128, `Cout` 1..=512, strides 1..4, and 1x1 or 3x3 kernels.
-//! [`ConvPlan`] additionally plans fp16 stride-1 odd square kernels through
-//! 11x11, including horizontal tiling where a full-width row cannot fit.
+//! [`ConvPlan`] additionally plans kernel extents from 1 through 11,
+//! including even and non-square kernels and horizontal tiling where a
+//! full-width row cannot fit. [`Shape::with_padding`] makes the leading
+//! padding independent of the kernel extent; without it each axis defaults
+//! to `extent / 2`, preserving the historical odd-kernel API.
 //!
 //! Kernels need not be square. A sweep of 53 non-square captures shows the
 //! two extents govern their own axes throughout -- `weight_width` and
@@ -115,6 +118,12 @@ use crate::rocket::builders::{
 
 /// `[kernel_height, kernel_width]`.
 pub type Kernels = [usize; 2];
+
+/// `[pad_top, pad_left]`.
+///
+/// The CNA has no trailing-padding registers. The output extent determines
+/// the implied bottom and right padding.
+pub type Padding = [usize; 2];
 
 /// Height of the originally captured image, in rows.
 pub const IMAGE_HEIGHT: u32 = 32;
@@ -426,8 +435,9 @@ impl Multiplier {
 ///
 /// Every register formula below is validated against a sweep of 35 vendor
 /// captures (212 convolution programs) spanning widths 32..256 and heights
-/// 32..256, restricted to the supported case: `Cin=3`, `Cout=8`, stride 1,
-/// and 1x1 or 3x3 kernels.
+/// 32..256, initially at `Cin=3`, `Cout=8`, stride 1, and 1x1 or 3x3
+/// kernels. The later channel, stride, rectangular, and even-kernel sweeps
+/// extend the individual rules documented on the fields and methods below.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Shape {
     pub width: u32,
@@ -445,6 +455,10 @@ pub struct Shape {
     pub out_channels: u32,
     /// Element precision, and for int8 the quantization parameters with it.
     pub precision: Precision,
+    /// Explicit `[pad_top, pad_left]`, or `None` to use `kernel / 2` on each
+    /// axis. Keeping the default implicit preserves the original constructors
+    /// while allowing padding to vary independently for even kernels.
+    pub padding: Option<Padding>,
 }
 
 /// How the feature map is laid out in memory, which the channel count picks.
@@ -466,6 +480,7 @@ impl Shape {
         in_channels: INPUT_CHANNELS,
         out_channels: OUTPUT_CHANNELS,
         precision: Precision::Fp16,
+        padding: None,
     };
 
     pub fn new(width: u32, height: u32) -> Shape {
@@ -528,7 +543,25 @@ impl Shape {
             in_channels,
             out_channels,
             precision,
+            padding: None,
         }
+    }
+
+    /// Sets the model's leading padding independently on each axis.
+    ///
+    /// The capture corpus covers padding no larger than its kernel extent;
+    /// the exact per-kernel bound is checked when the kernel is supplied.
+    pub fn with_padding(mut self, padding: Padding) -> Shape {
+        assert!(
+            padding.into_iter().all(|pad| pad <= 15),
+            "convolution padding must fit the CNA's 4-bit pad fields"
+        );
+        self.padding = Some(padding);
+        self
+    }
+
+    fn kernel_programming(&self, kernels: Kernels) -> KernelProgramming {
+        kernel_programming(kernels, self.padding)
     }
 
     /// Feature atoms one pixel occupies once padded.
@@ -635,7 +668,7 @@ impl Shape {
     /// specifically the weight padding rather than the data padding -- at
     /// three atoms the two differ, and it is the weight one that this follows.
     pub fn weight_bytes(&self, kernels: Kernels) -> u32 {
-        let kernel = kernel_programming(kernels);
+        let kernel = self.kernel_programming(kernels);
         kernel.height
             * kernel.width
             * self.weight_channels()
@@ -686,14 +719,26 @@ impl Shape {
     /// all 150 stride-2, -3 and -4 programs in the sweep corpus. Each extent
     /// governs its own axis, so a 3x9 and a 9x3 differ here.
     pub fn output_width(&self, kernels: Kernels) -> u32 {
-        let kernel = kernel_programming(kernels);
-        (self.width + 2 * kernel.pad_left - kernel.width) / self.stride + 1
+        let kernel = self.kernel_programming(kernels);
+        let padded = self.width + 2 * kernel.pad_left;
+        assert!(
+            kernel.width <= padded,
+            "kernel width {} exceeds the padded input width {padded}",
+            kernel.width
+        );
+        (padded - kernel.width) / self.stride + 1
     }
 
     /// Output height, by the same rule on the kernel's height.
     pub fn output_height(&self, kernels: Kernels) -> u32 {
-        let kernel = kernel_programming(kernels);
-        (self.height + 2 * kernel.pad_top - kernel.height) / self.stride + 1
+        let kernel = self.kernel_programming(kernels);
+        let padded = self.height + 2 * kernel.pad_top;
+        assert!(
+            kernel.height <= padded,
+            "kernel height {} exceeds the padded input height {padded}",
+            kernel.height
+        );
+        (padded - kernel.height) / self.stride + 1
     }
 
     /// Byte stride of one input row.
@@ -877,9 +922,10 @@ impl Shape {
 
     /// Fewest tiles this shape must be split into to stay encodable.
     ///
-    /// A tile producing `r` output rows reads up to `r + 2 * padding` input
-    /// rows once its halo is counted, so the padding is charged here rather
-    /// than discovered as an overflow inside the builder.
+    /// A stride-1 tile producing `r` output rows reads up to
+    /// `r + kernel_height - 1` input rows once its halo is counted, so the
+    /// tap span is charged here rather than discovered as an overflow inside
+    /// the builder.
     pub fn min_tiles(&self, kernels: Kernels) -> u32 {
         self.min_tiles_for_data_banks(kernels, self.data_banks(kernels))
     }
@@ -896,9 +942,11 @@ impl Shape {
         input_width: u32,
         data_banks: u32,
     ) -> u32 {
-        // Row tiles only ever pay the vertical halo, which the kernel's
-        // height sets.
-        let halo = 2 * kernel_programming(kernels).pad_top;
+        // A tile's un-clipped tap span is `(out_rows - 1) * stride + kh`.
+        // For the old odd SAME-padded case `kh - 1 == 2 * pad_top`; using
+        // the kernel extent is the general form and remains conservative at
+        // image edges for even and explicit-padding kernels.
+        let halo = self.kernel_programming(kernels).height - 1;
         let rows = self
             .max_tile_input_rows_for_width_and_data_banks(input_width, data_banks)
             .saturating_sub(halo)
@@ -909,7 +957,7 @@ impl Shape {
     }
 }
 
-/// The kernel's two extents and the SAME padding each one implies.
+/// The kernel's two extents and the leading padding supplied by the model.
 ///
 /// The extents are kept apart because a non-square kernel moves them apart.
 /// Every kernel capture before the rectangular sweep was square, so the two
@@ -920,6 +968,11 @@ impl Shape {
 /// `pad_top` and `feature_grains` follow the height alone, and the
 /// coefficient footprint is `kh * kw * pad(Cin) * element_bytes`. All 228
 /// programs outside the high-pressure regime satisfy every one of those.
+///
+/// The even-kernel sweep separates the padding from the extent: both extents
+/// are programmed verbatim, while `pad_top` and `pad_left` independently
+/// carry the model's values. They therefore enter this structure rather than
+/// being reconstructed from `kernel / 2`.
 #[derive(Clone, Copy)]
 struct KernelProgramming {
     height: u32,
@@ -930,19 +983,25 @@ struct KernelProgramming {
     pad_left: u32,
 }
 
-fn kernel_programming(kernels: Kernels) -> KernelProgramming {
+fn kernel_programming(kernels: Kernels, padding: Option<Padding>) -> KernelProgramming {
     let [height, width] = kernels;
-    let backed = |extent: usize| (1..=11).contains(&extent) && extent % 2 == 1;
+    let backed = |extent: usize| (1..=11).contains(&extent);
     assert!(
         backed(height) && backed(width),
-        "conv_2d only has vendor reference data for odd kernel extents from 1 through 11, \
+        "conv_2d only has vendor reference data for kernel extents from 1 through 11, \
          got {height}x{width}"
+    );
+    let [pad_top, pad_left] = padding.unwrap_or([height / 2, width / 2]);
+    assert!(
+        pad_top < height && pad_left < width,
+        "padding must be smaller than its kernel extent; got padding \
+         {pad_top}x{pad_left} for kernel {height}x{width}"
     );
     KernelProgramming {
         height: height as u32,
         width: width as u32,
-        pad_top: (height / 2) as u32,
-        pad_left: (width / 2) as u32,
+        pad_top: pad_top as u32,
+        pad_left: pad_left as u32,
     }
 }
 
@@ -998,7 +1057,8 @@ impl Tile {
             (1..=output_height).contains(&tiles),
             "tile count must be between 1 and the {output_height} output rows"
         );
-        let padding = kernel_programming(kernels).pad_top;
+        let kernel = shape.kernel_programming(kernels);
+        let padding = kernel.pad_top;
         let stride = shape.stride;
         let base = output_height / tiles;
         let remainder = output_height % tiles;
@@ -1013,8 +1073,9 @@ impl Tile {
             // would otherwise read above the image. Matches all 150
             // stride-2, -3 and -4 programs in the corpus.
             let in_first = (out_first * stride).saturating_sub(padding);
-            let last_tap = (out_first + out_rows - 1) * stride + padding;
-            let exact = last_tap.min(shape.height - 1) - in_first + 1;
+            let last_tap = (out_first + out_rows - 1) * stride + kernel.height - 1;
+            let in_last = last_tap.saturating_sub(padding).min(shape.height - 1);
+            let exact = in_last - in_first + 1;
 
             // The vendor reads at least a full stride block per output row,
             // which exceeds the exact tap span at stride > 1. Taking the
@@ -1084,11 +1145,14 @@ impl ColumnTile {
         );
         // The horizontal analogue of `Tile::split`, so the horizontal padding
         // is the one that applies.
-        let kernel = kernel_programming(kernels);
+        let kernel = shape.kernel_programming(kernels);
         let projected_first = out_first * shape.stride;
         let in_first = projected_first.saturating_sub(kernel.pad_left);
-        let last_tap = (out_first + out_cols - 1) * shape.stride + kernel.pad_left;
-        let exact = last_tap.min(shape.width - 1) - in_first + 1;
+        let last_tap = (out_first + out_cols - 1) * shape.stride + kernel.width - 1;
+        let in_last = last_tap
+            .saturating_sub(kernel.pad_left)
+            .min(shape.width - 1);
+        let exact = in_last - in_first + 1;
         let in_cols = exact
             .max(out_cols * shape.stride)
             .min(shape.width - in_first);
@@ -1199,13 +1263,15 @@ impl Tile2D {
 /// and the row split for each column. Programs returned by [`ConvPlan::programs`]
 /// retain tile-relative buffer offsets and still need normal DMA relocation.
 ///
-/// For 1x1 and 3x3 this is the existing demand-based allocator. The fp16
-/// stride-1 5x5 through 11x11 policies are the conservative partitions from
-/// the focused capture and hardware sweep. The three shapes that require
-/// horizontal tiling retain their hardware-proven captured boundaries;
-/// other surface-layout shapes fall back to the fewest balanced columns that
-/// satisfy the same two-dimensional CBUF capacity bound. Those fallback
-/// partitions are derived rather than hardware-validated.
+/// For 1x1 and 3x3 this is the existing demand-based allocator. Even square
+/// kernels use that allocator through the eight-bank demand measured by the
+/// even sweep. The fp16 stride-1 5x5 through 11x11 policies are the
+/// conservative partitions from the focused capture and hardware sweep. The
+/// three shapes that require horizontal tiling retain their hardware-proven
+/// captured boundaries; other surface-layout shapes fall back to the fewest
+/// balanced columns that satisfy the same two-dimensional CBUF capacity
+/// bound. Those fallback partitions are derived rather than
+/// hardware-validated.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct ConvPlan {
     shape: Shape,
@@ -1220,10 +1286,11 @@ impl ConvPlan {
     /// Plans all standalone jobs needed to cover `shape` exactly once.
     ///
     /// Panics when the requested operation lies outside the supported policy.
-    /// In particular, kernels above 3x3 currently require fp16, stride 1,
-    /// and NC1HWC2 input if horizontal tiling is necessary.
+    /// In particular, the capture-specific odd-square policies above 3x3
+    /// require fp16 and stride 1, and NC1HWC2 input is required if horizontal
+    /// tiling is necessary.
     pub fn new(shape: Shape, kernels: Kernels) -> ConvPlan {
-        let kernel = kernel_programming(kernels);
+        let kernel = shape.kernel_programming(kernels);
         if kernel.height != kernel.width {
             return ConvPlan::new_with_cbuf_partition(
                 shape,
@@ -1233,6 +1300,7 @@ impl ConvPlan {
         }
         let (data_banks, weight_banks) = match kernel.height {
             1 | 3 => shape.demand_based_cbuf_partition(kernels),
+            2 | 4 | 6 | 8 | 10 => even_square_cbuf_partition(shape, kernels),
             5 => {
                 assert_large_kernel_plan_case(shape);
                 shape.demand_based_cbuf_partition(kernels)
@@ -1411,6 +1479,25 @@ fn assert_large_kernel_plan_case(shape: Shape) {
 /// demand is one to five banks. The first disagreement is at seven.
 const MAX_NON_SQUARE_DEMAND_BASED_WEIGHT_BANKS: u32 = 5;
 
+/// Largest coefficient demand for which the even square captures follow the
+/// demand-based CBUF split.
+///
+/// The even sweep reaches eight banks at 8x8 and agrees exactly. A 10x10
+/// pressure shape asks for thirteen and is instead programmed 5/7, so demand
+/// alone no longer chooses the split there.
+const MAX_EVEN_SQUARE_DEMAND_BASED_WEIGHT_BANKS: u32 = 8;
+
+fn even_square_cbuf_partition(shape: Shape, kernels: Kernels) -> (u32, u32) {
+    let demand = shape.weight_bank_demand(kernels);
+    assert!(
+        demand <= MAX_EVEN_SQUARE_DEMAND_BASED_WEIGHT_BANKS,
+        "even square kernel {kernels:?} needs {demand} coefficient banks, above the \
+         {MAX_EVEN_SQUARE_DEMAND_BASED_WEIGHT_BANKS} where the captured split follows \
+         coefficient demand; use an explicit CBUF split"
+    );
+    shape.demand_based_cbuf_partition(kernels)
+}
+
 /// CBUF split for a non-square kernel.
 ///
 /// The rectangular sweep shows the vendor's split is not a function of
@@ -1452,7 +1539,8 @@ fn captured_column_partition(shape: Shape, kernels: Kernels) -> Option<Vec<u32>>
         && shape.height == 32
         && shape.stride == 1
         && shape.out_channels == 64
-        && matches!(shape.precision, Precision::Fp16);
+        && matches!(shape.precision, Precision::Fp16)
+        && shape.padding.is_none();
     if !focused_shape {
         return None;
     }
@@ -1667,7 +1755,7 @@ pub fn conv_2d_tile(shape: Shape, kernels: Kernels, tile: &Tile) -> Vec<RegCmd> 
 /// across the rectangular sweep's 228 low-pressure programs the vendor's
 /// value tracks `kernel_height` and is unchanged by `kernel_width`.
 pub fn feature_grains(kernels: Kernels, tile: &Tile) -> u32 {
-    tile.in_rows + kernel_programming(kernels).height + tile.pad_top
+    tile.in_rows + kernel_programming(kernels, None).height + tile.pad_top
 }
 
 /// Builds a tile program with an explicit `feature_grains`, for probing which
@@ -1857,7 +1945,7 @@ fn conv_2d_tile_program(
         columns.in_first + columns.in_cols
     );
 
-    let kernel = kernel_programming(kernels);
+    let kernel = shape.kernel_programming(kernels);
 
     // Layout-dependent programming. Dense rows are counted in pixels and the
     // whole tile is resident, so `data_entries` scales with the tile height.
@@ -2421,6 +2509,84 @@ mod tests {
         assert_eq!(decode(&three_by_three[15]).2, 0x0303_0008);
         assert_eq!(decode(&one_by_one[25]).2, 0);
         assert_eq!(decode(&three_by_three[25]).2, 0x0000_0011);
+    }
+
+    #[test]
+    fn even_kernels_program_verbatim_with_independent_padding() {
+        let shape = Shape::CAPTURED.with_padding([0, 1]);
+        let kernels = [4, 6];
+        let plan = ConvPlan::new(shape, kernels);
+
+        assert_eq!(
+            (shape.output_width(kernels), shape.output_height(kernels)),
+            (29, 29)
+        );
+        assert_eq!((plan.data_banks(), plan.weight_banks()), (1, 11));
+        assert_eq!(plan.tiles(), &[Tile2D::whole(shape, kernels)]);
+
+        let program = &plan.programs()[0];
+        assert_eq!(value_of::<CnaWeightSize2>(program), 0x0604_0008);
+        assert_eq!(value_of::<CnaPadCon0>(program), 0x10);
+        assert_eq!(value_of::<CnaConvCon2>(program), 0x240);
+        assert_eq!(value_of::<CnaWeightSize0>(program), 0xc00);
+        assert_eq!(value_of::<CnaWeightSize1>(program), 0x180);
+
+        let int8_shape =
+            Shape::with_precision(32, 32, 1, 3, 8, captured_int8()).with_padding([0, 1]);
+        let int8_programs = ConvPlan::new(int8_shape, kernels).programs();
+        let int8_program = &int8_programs[0];
+        assert_eq!(value_of::<CnaWeightSize2>(int8_program), 0x0604_0008);
+        assert_eq!(value_of::<CnaPadCon0>(int8_program), 0x10);
+        assert_eq!(value_of::<CnaConvCon2>(int8_program), 0x240);
+    }
+
+    #[test]
+    fn even_kernel_default_padding_is_half_the_extent() {
+        let shape = Shape::CAPTURED;
+        for extent in [2usize, 4, 6, 8, 10] {
+            let kernels = [extent, extent];
+            assert_eq!(
+                (shape.output_width(kernels), shape.output_height(kernels)),
+                (33, 33),
+                "k{extent}"
+            );
+            let plan = ConvPlan::new(shape, kernels);
+            assert!(!plan.tiles().is_empty(), "k{extent}");
+            assert!(plan.programs().iter().all(|program| program.len() == 136));
+        }
+    }
+
+    #[test]
+    fn even_kernel_tiles_keep_the_full_tap_halo() {
+        let shape = Shape::new(8, 8).with_padding([0, 0]);
+        let tiles = Tile::split(shape, [4, 4], 2);
+
+        assert_eq!(
+            tiles,
+            [
+                Tile {
+                    out_first: 0,
+                    out_rows: 3,
+                    in_first: 0,
+                    in_rows: 6,
+                    pad_top: 0,
+                },
+                Tile {
+                    out_first: 3,
+                    out_rows: 2,
+                    in_first: 3,
+                    in_rows: 5,
+                    pad_top: 0,
+                },
+            ]
+        );
+    }
+
+    #[test]
+    #[should_panic(expected = "where the captured split follows coefficient demand")]
+    fn automatic_plan_refuses_unsettled_even_kernel_cbuf_pressure() {
+        let shape = Shape::with_out_channels(256, 32, 1, 32, 64);
+        let _ = ConvPlan::new(shape, [10, 10]);
     }
 
     #[test]
