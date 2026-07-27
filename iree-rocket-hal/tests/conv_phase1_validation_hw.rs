@@ -675,9 +675,10 @@ fn int8_depthwise_layout_reproduces_its_filter() {
 /// - the first two channels of tap one (`16`, `17`);
 /// - the last real and padding lanes of taps seven and eight.
 ///
-/// This is diagnostic rather than an assertion about a guessed layout. The
-/// all-zero control is asserted, and each one-hot response is printed as a
-/// count, channel set, and coordinate sample for the next derivation step.
+/// This is diagnostic rather than an assertion about a guessed layout. It
+/// first prints responses to uniform coefficient bytes, then prints each
+/// one-hot response as a count, channel set, and coordinate sample for the
+/// next derivation step.
 #[test]
 #[ignore = "needs /dev/accel/accel0 -- prints one-hot int8 depthwise slot responses"]
 fn int8_depthwise_raw_slot_probe() {
@@ -691,16 +692,37 @@ fn int8_depthwise_raw_slot_probe() {
     let weight_bytes = shape.weight_bytes(KERNEL) as usize;
     assert_eq!(weight_bytes, 9 * 16);
 
-    let (_, zero_output) = execute(shape, KERNEL, &input, &vec![0; weight_bytes], &bias);
-    assert_int8_output(
-        "all-zero int8 depthwise coefficient control",
-        shape,
-        KERNEL,
-        &zero_output,
-        |_, _, _| 0,
-        0,
-    );
-    println!("int8 depthwise raw-slot probe: all-zero control is zero");
+    println!("int8 depthwise uniform-byte responses:");
+    for fill in [0u8, 1, 2, 3, 4, 127, 128, 129, 252, 253, 254, 255] {
+        let (_, output) = execute(shape, KERNEL, &input, &vec![fill; weight_bytes], &bias);
+        let mut nonzero = 0usize;
+        let mut minimum = i8::MAX;
+        let mut maximum = i8::MIN;
+        for channel in 0..shape.out_channels as usize {
+            for y in 0..shape.output_height(KERNEL) as usize {
+                for x in 0..shape.output_width(KERNEL) as usize {
+                    let value = output[output_offset(shape, KERNEL, channel, y, x)] as i8;
+                    if value != 0 {
+                        nonzero += 1;
+                        minimum = minimum.min(value);
+                        maximum = maximum.max(value);
+                    }
+                }
+            }
+        }
+        let mut channel_zero_window = Vec::new();
+        for y in IMPULSE - 1..=IMPULSE + 1 {
+            for x in IMPULSE - 1..=IMPULSE + 1 {
+                channel_zero_window.push(output[output_offset(shape, KERNEL, 0, y, x)] as i8);
+            }
+        }
+        println!(
+            "  fill 0x{fill:02x}: {nonzero:5} nonzero, range \
+             {minimum}..={maximum}, c0 window {channel_zero_window:?}"
+        );
+    }
+
+    println!("int8 depthwise zero-based raw-slot responses:");
 
     for slot in [
         0usize, 1, 8, 11, 12, 15, 16, 17, 123, 127, 128, 139, 140, 143,
