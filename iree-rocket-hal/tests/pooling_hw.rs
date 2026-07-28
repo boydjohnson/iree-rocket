@@ -148,9 +148,7 @@ fn run_uniform_pooling_dynamic(shape: &PoolingShape, input_fill: u8) -> Vec<u8> 
     unsafe {
         let buf_in = Buffer::new(fd, input_bytes.next_multiple_of(4096), &file);
         ptr::write_bytes(buf_in.host_ptr, input_fill, input_bytes);
-        let buf_out = Buffer::new(fd, output_bytes.next_multiple_of(4096), &file);
-        ptr::write_bytes(buf_out.host_ptr, 0, output_bytes.next_multiple_of(4096));
-        run_pooling_plan(&file, fd, shape, &buf_in, &buf_out, output_pixels)
+        run_pooling_plan(&file, fd, shape, &buf_in, output_bytes, output_pixels)
     }
 }
 
@@ -288,35 +286,54 @@ unsafe fn run_pooling(
     }
 }
 
-/// Queues every horizontal tile as an ordered job and waits once for the
-/// shared output BO. This mirrors the multi-tile convolution tests: syncing
-/// and submitting the complete job list at once avoids a CPU cache hand-off
-/// between partial writes to the same output surface.
+/// Queues every horizontal tile as its own independently-fenced job, each
+/// writing to its own dedicated output buffer.
+///
+/// Giving every tile the same shared output BO (as `run_pooling`'s
+/// single-tile path and `PoolingPlan::programs_with_buffers` do) triggers
+/// the kernel's implicit write-after-write GEM dependency
+/// (`drm_sched_job_add_implicit_dependencies`, per-buffer-object, not
+/// per-byte-range): confirmed on real hardware that this silently
+/// serializes what should be independent tiles, and the tile gated behind
+/// another job's fence can come back with its region still at the pre-fill
+/// sentinel if that fence resolves via the timeout/reset path rather than a
+/// real completion. `PoolingPlan::programs_with_separate_output_buffers`
+/// avoids this by giving each tile its own GEM object; see its doc comment
+/// for why each buffer still needs the *whole* image's footprint, not just
+/// this tile's own width.
 unsafe fn run_pooling_plan(
     file: &std::fs::File,
     fd: i32,
     shape: &PoolingShape,
     buf_in: &Buffer,
-    buf_out: &Buffer,
+    output_bytes: usize,
     num_output_pixels: usize,
 ) -> Vec<u8> {
     unsafe {
-        let programs = PoolingPlan::new(*shape).programs_with_buffers(&PoolingBuffers {
-            input_addr: buf_in.dma_address,
-            output_addr: buf_out.dma_address,
-        });
+        let plan = PoolingPlan::new(*shape);
+        let tiles = plan.tiles();
         assert!(
-            !programs.is_empty(),
-            "PoolingPlan::new produced zero tile programs for {shape:?}"
+            !tiles.is_empty(),
+            "PoolingPlan::new produced zero tiles for {shape:?}"
         );
+
+        let output_len = output_bytes.next_multiple_of(4096);
+        let tile_out_buffers: Vec<Buffer> = (0..tiles.len())
+            .map(|_| {
+                let buffer = Buffer::new(fd, output_len, file);
+                ptr::write_bytes(buffer.host_ptr, 0, output_len);
+                buffer
+            })
+            .collect();
+        let tile_output_addrs: Vec<u32> = tile_out_buffers.iter().map(|b| b.dma_address).collect();
+
+        let programs =
+            plan.programs_with_separate_output_buffers(buf_in.dma_address, &tile_output_addrs);
         eprintln!(
-            "run_pooling_plan: shape={shape:?} tile_count={} \
-             buf_in(handle={} dma=0x{:08x}) buf_out(handle={} dma=0x{:08x})",
+            "run_pooling_plan: shape={shape:?} tile_count={} buf_in(handle={} dma=0x{:08x})",
             programs.len(),
             buf_in.handle,
             buf_in.dma_address,
-            buf_out.handle,
-            buf_out.dma_address,
         );
 
         let mut command_buffers = Vec::with_capacity(programs.len());
@@ -333,17 +350,22 @@ unsafe fn run_pooling_plan(
                 *destination = command.0;
             }
             eprintln!(
-                "run_pooling_plan: tile {tile}/{} handle={} dma=0x{:08x} regcmd_count={}",
+                "run_pooling_plan: tile {tile}/{} cmd_handle={} cmd_dma=0x{:08x} \
+                 out_handle={} out_dma=0x{:08x} regcmd_count={}",
                 programs.len(),
                 buffer.handle,
                 buffer.dma_address,
+                tile_out_buffers[tile].handle,
+                tile_out_buffers[tile].dma_address,
                 program.len()
             );
             command_buffers.push((buffer, program.len() as u32));
         }
 
         fini_bo(fd, buf_in.handle).ok();
-        fini_bo(fd, buf_out.handle).ok();
+        for buffer in &tile_out_buffers {
+            fini_bo(fd, buffer.handle).ok();
+        }
         for (buffer, _) in &command_buffers {
             fini_bo(fd, buffer.handle).ok();
         }
@@ -356,14 +378,15 @@ unsafe fn run_pooling_plan(
             .iter()
             .map(|(buffer, _)| [buffer.handle, buf_in.handle])
             .collect();
-        let out_handles = [buf_out.handle];
+        let out_handles: Vec<[u32; 1]> = tile_out_buffers.iter().map(|b| [b.handle]).collect();
         let jobs: Vec<JobDesc<'_>> = tasks
             .iter()
             .zip(&in_handles)
-            .map(|(tasks, in_handles)| JobDesc {
+            .zip(&out_handles)
+            .map(|((tasks, in_handles), out_handles)| JobDesc {
                 tasks,
                 in_handles,
-                out_handles: &out_handles,
+                out_handles,
             })
             .collect();
 
@@ -380,24 +403,35 @@ unsafe fn run_pooling_plan(
             submit_start.elapsed()
         );
 
-        let wait_start = Instant::now();
-        let wait_result = prep_bo(fd, buf_out.handle, 5_000_000_000);
-        let waited = wait_start.elapsed();
-        match wait_result {
-            Ok(()) => eprintln!("run_pooling_plan: PREP_BO completed after {waited:?}"),
-            Err(e) => panic!(
-                "tiled pooling did not complete within timeout (waited {waited:?}, \
-                 prep_bo error: {e}) -- shape={shape:?} tile_count={} buf_out(handle={} dma=0x{:08x})",
-                programs.len(),
-                buf_out.handle,
-                buf_out.dma_address
-            ),
+        for (tile, buffer) in tile_out_buffers.iter().enumerate() {
+            let wait_start = Instant::now();
+            let wait_result = prep_bo(fd, buffer.handle, 5_000_000_000);
+            let waited = wait_start.elapsed();
+            match wait_result {
+                Ok(()) => eprintln!(
+                    "run_pooling_plan: tile {tile}/{} PREP_BO completed after {waited:?}",
+                    tile_out_buffers.len()
+                ),
+                Err(e) => panic!(
+                    "tile {tile}/{} did not complete within timeout (waited {waited:?}, \
+                     prep_bo error: {e}) -- shape={shape:?} out_handle={} dma=0x{:08x})",
+                    tile_out_buffers.len(),
+                    buffer.handle,
+                    buffer.dma_address
+                ),
+            }
         }
 
-        let raw = std::slice::from_raw_parts(buf_out.host_ptr, num_output_pixels * 16 + 16);
-        let pixels: Vec<u8> = (0..num_output_pixels)
-            .map(|index| raw[index * 16])
-            .collect();
+        let mut pixels = vec![0u8; num_output_pixels];
+        for (tile, buffer) in tiles.iter().zip(&tile_out_buffers) {
+            let raw = std::slice::from_raw_parts(buffer.host_ptr, output_len);
+            for row in 0..shape.output_height {
+                for col in 0..tile.output_width {
+                    let index = (row * shape.output_width + tile.output_first + col) as usize;
+                    pixels[index] = raw[index * 16];
+                }
+            }
+        }
         eprintln!("run_pooling_plan: output pixels = {pixels:?}");
         pixels
     }

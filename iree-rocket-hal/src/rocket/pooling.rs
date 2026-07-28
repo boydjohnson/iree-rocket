@@ -379,17 +379,77 @@ impl PoolingPlan {
         &self.tiles
     }
 
-    /// Emits one independently kicked, submission-ready program per tile.
+    /// Emits one independently kicked, submission-ready program per tile,
+    /// all writing into offsets of the *same* output buffer.
+    ///
+    /// Multiple tiles submitted as separate DRM jobs against one shared
+    /// output BO get an implicit write-after-write dependency from the
+    /// kernel's GEM fence tracking (`drm_sched_job_add_implicit_dependencies`,
+    /// per-buffer-object, not per-byte-range) -- later tiles cannot even
+    /// dispatch to hardware until earlier ones signal completion, silently
+    /// serializing what looks like independent parallel work. Confirmed on
+    /// real hardware: `wide_pooling_plan_runs_on_npu` intermittently came
+    /// back with one whole tile's region still at its pre-fill sentinel,
+    /// because that tile's job was gated behind another job's fence rather
+    /// than actually running independently. Use
+    /// `programs_with_separate_output_buffers` instead for genuinely
+    /// independent tiles; this method is kept for callers that specifically
+    /// want one contiguous output buffer and can tolerate serialization.
     pub fn programs_with_buffers(&self, bufs: &PoolingBuffers) -> Vec<Vec<RegCmd>> {
         self.tiles
             .iter()
             .map(|tile| {
-                let mut commands = build_ppu_standalone_flying(
-                    &self.shape,
-                    tile,
-                    bufs.input_addr,
-                    bufs.output_addr,
-                );
+                let output_addr = bufs
+                    .output_addr
+                    .checked_add(tile.output_first * 16)
+                    .expect("pooling tile output address overflows u32");
+                let mut commands =
+                    build_ppu_standalone_flying(&self.shape, tile, bufs.input_addr, output_addr);
+                push_kick(&mut commands, KICK_PPU | KICK_PPU_RDMA);
+                commands
+            })
+            .collect()
+    }
+
+    /// Emits one independently kicked, submission-ready program per tile,
+    /// each writing to its own dedicated output buffer rather than an
+    /// offset within one shared buffer -- so tiles submitted as separate
+    /// DRM jobs have no shared-BO write dependency and can genuinely run
+    /// independently (see `programs_with_buffers`'s doc comment for why
+    /// that matters).
+    ///
+    /// Each tile's `dst_surf_stride`/`notch_addr` are still computed from
+    /// the *whole* shape's `output_width` (a horizontally-tiled row is not
+    /// contiguous in memory -- consecutive rows are `shape.output_width`
+    /// columns apart, not `tile.output_width`), so this does NOT give tiles
+    /// a compact, tile-width-only buffer. Each address in
+    /// `tile_output_base_addrs` must point at a buffer with the same full
+    /// footprint as the combined image (same size/layout `programs_with_
+    /// buffers`'s single shared buffer would need) -- just a physically
+    /// distinct GEM object per tile, so no two tiles share one buffer's
+    /// `dma_resv` and no implicit write-write dependency serializes them.
+    /// Only that tile's own column range within its buffer ever gets
+    /// written; callers reassemble the final image from each tile's slice
+    /// afterward. Must have exactly one entry per `self.tiles()`, in order.
+    pub fn programs_with_separate_output_buffers(
+        &self,
+        input_addr: u32,
+        tile_output_base_addrs: &[u32],
+    ) -> Vec<Vec<RegCmd>> {
+        assert_eq!(
+            tile_output_base_addrs.len(),
+            self.tiles.len(),
+            "programs_with_separate_output_buffers: need exactly one output address per tile"
+        );
+        self.tiles
+            .iter()
+            .zip(tile_output_base_addrs)
+            .map(|(tile, &base_addr)| {
+                let output_addr = base_addr
+                    .checked_add(tile.output_first * 16)
+                    .expect("pooling tile output address overflows u32");
+                let mut commands =
+                    build_ppu_standalone_flying(&self.shape, tile, input_addr, output_addr);
                 push_kick(&mut commands, KICK_PPU | KICK_PPU_RDMA);
                 commands
             })
@@ -439,6 +499,12 @@ pub struct PoolingBuffers {
 /// conv's memory-written output for the two-kick path) and in which kick
 /// mask the caller appends afterwards. Pure extraction -- no behavior
 /// change versus the original single function.
+/// `output_addr` is the exact base address this tile's output starts
+/// writing at -- callers sharing one output buffer across tiles must add
+/// their own `tile.output_first * 16` offset before calling (see
+/// `PoolingPlan::programs_with_buffers`); callers giving each tile its own
+/// dedicated buffer (see `PoolingPlan::programs_with_separate_output_buffers`)
+/// pass that buffer's address unmodified.
 fn build_ppu_standalone_flying(
     shape: &PoolingShape,
     tile: &PoolingTile,
@@ -453,9 +519,6 @@ fn build_ppu_standalone_flying(
     let input_addr = input_addr
         .checked_add(tile.input_first * 16)
         .expect("pooling tile input address overflows u32");
-    let output_addr = output_addr
-        .checked_add(tile.output_first * 16)
-        .expect("pooling tile output address overflows u32");
     assert!(
         output_addr.is_multiple_of(16),
         "build_ppu_standalone_flying: output_addr {output_addr:#x} is not 16-byte aligned -- \
