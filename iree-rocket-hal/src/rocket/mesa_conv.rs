@@ -24,9 +24,11 @@
 //!   and waits for each split as a separate DRM job.
 //! - The serialized shape currently has no padding fields, so convolution
 //!   planning supports zero-padding valid convolutions only.
-//! - Element-wise `add_tensor` fusion lives in
-//!   [`crate::rocket::elementwise`]; this module's core emission threads an
-//!   `Option<&AddTensor>` through for it but owns none of that derivation.
+//! - Element-wise add/subtract is [`crate::rocket::elementwise`]'s
+//!   `build_conv_then_add_regcmd` -- a two-task, `conv::Shape`-based,
+//!   `mesa_conv`-free design (a dedicated sweep found the vendor never
+//!   fuses EW-add into a real producing conv's own task, so this module's
+//!   emission stays untouched by it -- see that module's doc comment).
 //! - The `input_channels_real == 1 && output_channels_real > 1` "wide
 //!   atomic" branch in `fill_task()` isn't implemented either -- no
 //!   current client's shape reaches it, and porting an untested branch
@@ -37,7 +39,6 @@
 use crate::rocket::{
     activation::Activation,
     builders::{Bits, RegCmd, Register, cna::*, core::*, dpu::*, dpu_rdma::*},
-    elementwise::{AddTensor, ew_add_cvt},
     regcmd::{
         KICK_CNA, KICK_CORE, KICK_DPU, KICK_DPU_RDMA, Precision, push_kick,
         push_kick_for_task_count, zero,
@@ -383,18 +384,17 @@ pub fn plan_conv_tasks(shape: &ConvShape) -> Result<Vec<ConvTask>, &'static str>
 /// just doesn't care what's there, but 0 matches this codebase's existing
 /// "safe default when unused" convention.
 ///
-/// `addition`, when `Some`, fuses Mesa's `add_tensor` element-wise-add
-/// path into this same DPU pass instead of the usual fully-bypassed
-/// EW/ERDMA block -- see `AddTensor`'s own doc comment for exactly
-/// what's hardware-confirmed. Every existing caller passes `None`
-/// (unchanged behavior); only `build_conv_with_add_regcmd` passes
-/// `Some`.
+/// The EW/ERDMA block is always fully bypassed by this function -- Mesa's
+/// own `add_tensor` fused-EW-add path (which used to be expressed here via
+/// an `Option<&AddTensor>` parameter) is superseded by
+/// `elementwise::build_conv_then_add_regcmd`'s two-task design; see that
+/// module's doc comment for why (a dedicated sweep found the vendor never
+/// fuses EW-add into a real producing conv's own task).
 pub(crate) fn build_conv_cna_core_dpu_dpu_rdma(
     shape: &ConvShape,
     bufs: &ConvBuffers,
     task: &ConvTask,
     dpu_output_mode: u32,
-    addition: Option<&AddTensor>,
 ) -> Vec<RegCmd> {
     let input_channels_real_is_one = shape.input_channels == 1;
     assert!(
@@ -962,53 +962,25 @@ pub(crate) fn build_conv_cna_core_dpu_dpu_rdma(
     cmds.push(zero::<DpuBnMulCfg>());
     cmds.push(zero::<DpuBnReluxCmpValue>());
 
-    // EW (elementwise): `addition.is_none()` is the original add_tensor==-1
-    // branch (fully bypassed, all five bits), unchanged. `Some` fuses
-    // Mesa's add_tensor path -- ported directly from `rkt_regcmd.c`, see
-    // `AddTensor`'s doc comment for what's hardware-confirmed.
-    if let Some(add) = addition {
-        cmds.push(
-            Register::<DpuEwCfg>::new()
-                .ew_cvt_type(Bits::new(1))
-                .ew_data_mode(Bits::new(1))
-                .edata_size(Bits::new(1))
-                .ew_alu_algo(Bits::new(add.algo)) // see AddTensor::algo's doc comment
-                .ew_relu_bypass(Bits::new(1))
-                .ew_lut_bypass(Bits::new(1))
-                .ew_op_src(Bits::new(1)) // operand from outside (the second tensor)
-                .build(),
-        );
-        cmds.push(
-            Register::<DpuEwCvtOffsetValue>::new()
-                .ew_op_cvt_offset(Bits::new(add.cvt_offset))
-                .build(),
-        );
-        let (ew_scale, ew_shift) = ew_add_cvt(add.scale, shape.input_scale, shape.weights_scale);
-        cmds.push(
-            Register::<DpuEwCvtScaleValue>::new()
-                .ew_op_cvt_scale(Bits::new(ew_scale))
-                .ew_op_cvt_shift(Bits::new(ew_shift))
-                .build(),
-        );
-        cmds.push(zero::<DpuEwReluxCmpValue>());
-    } else {
-        cmds.push(
-            Register::<DpuEwCfg>::new()
-                .ew_relu_bypass(Bits::new(1))
-                .ew_op_cvt_bypass(Bits::new(1))
-                .ew_lut_bypass(Bits::new(1))
-                .ew_op_bypass(Bits::new(1))
-                .ew_bypass(Bits::new(1))
-                .build(),
-        );
-        cmds.push(zero::<DpuEwCvtOffsetValue>());
-        cmds.push(
-            Register::<DpuEwCvtScaleValue>::new()
-                .ew_op_cvt_scale(Bits::new(1))
-                .build(),
-        );
-        cmds.push(zero::<DpuEwReluxCmpValue>());
-    }
+    // EW (elementwise): always fully bypassed here (the original
+    // add_tensor==-1 branch, unchanged) -- see this function's own doc
+    // comment for where the fused EW-add path went.
+    cmds.push(
+        Register::<DpuEwCfg>::new()
+            .ew_relu_bypass(Bits::new(1))
+            .ew_op_cvt_bypass(Bits::new(1))
+            .ew_lut_bypass(Bits::new(1))
+            .ew_op_bypass(Bits::new(1))
+            .ew_bypass(Bits::new(1))
+            .build(),
+    );
+    cmds.push(zero::<DpuEwCvtOffsetValue>());
+    cmds.push(
+        Register::<DpuEwCvtScaleValue>::new()
+            .ew_op_cvt_scale(Bits::new(1))
+            .build(),
+    );
+    cmds.push(zero::<DpuEwReluxCmpValue>());
 
     match shape.precision {
         Precision::Int8 => {
@@ -1096,15 +1068,7 @@ pub(crate) fn build_conv_cna_core_dpu_dpu_rdma(
             .build(),
     );
 
-    if let Some(add) = addition {
-        cmds.push(
-            Register::<DpuRdmaSrcBaseAddr>::new()
-                .src_base_addr(Bits::new(add.src_addr))
-                .build(),
-        );
-    } else {
-        cmds.push(zero::<DpuRdmaSrcBaseAddr>()); // add_tensor == -1
-    }
+    cmds.push(zero::<DpuRdmaSrcBaseAddr>()); // add_tensor == -1
     cmds.push(
         Register::<DpuRdmaBrdmaCfg>::new()
             .brdma_data_use(Bits::new(1))
@@ -1118,34 +1082,13 @@ pub(crate) fn build_conv_cna_core_dpu_dpu_rdma(
     cmds.push(zero::<DpuRdmaNrdmaCfg>());
     cmds.push(zero::<DpuRdmaBnBaseAddr>());
 
-    if let Some(add) = addition {
-        cmds.push(
-            Register::<DpuRdmaErdmaCfg>::new()
-                .erdma_data_mode(Bits::new(1))
-                .erdma_data_size(Bits::new(1))
-                .build(),
-        );
-        cmds.push(
-            Register::<DpuRdmaEwBaseAddr>::new()
-                .ew_base_addr(Bits::new(add.ew_addr))
-                .build(),
-        );
-        // Mesa: `MAX2(operation->output_width * operation->output_height, 12)`.
-        let ew_stride = (shape.output_width * shape.output_height).max(12);
-        cmds.push(
-            Register::<DpuRdmaEwSurfStride>::new()
-                .ew_surf_stride(Bits::new(ew_stride))
-                .build(),
-        );
-    } else {
-        cmds.push(
-            Register::<DpuRdmaErdmaCfg>::new()
-                .erdma_disable(Bits::new(1))
-                .build(),
-        ); // add_tensor == -1
-        cmds.push(zero::<DpuRdmaEwBaseAddr>());
-        cmds.push(zero::<DpuRdmaEwSurfStride>());
-    }
+    cmds.push(
+        Register::<DpuRdmaErdmaCfg>::new()
+            .erdma_disable(Bits::new(1))
+            .build(),
+    ); // add_tensor == -1
+    cmds.push(zero::<DpuRdmaEwBaseAddr>());
+    cmds.push(zero::<DpuRdmaEwSurfStride>());
 
     let mut rdma_feat_mode_builder = Register::<DpuRdmaFeatureModeCfg>::new();
     rdma_feat_mode_builder
@@ -1276,7 +1219,7 @@ pub fn build_conv_regcmd_tasks(
     Ok(tasks
         .iter()
         .map(|task| {
-            let mut cmds = build_conv_cna_core_dpu_dpu_rdma(shape, bufs, task, 2, None);
+            let mut cmds = build_conv_cna_core_dpu_dpu_rdma(shape, bufs, task, 2);
             push_kick_for_task_count(
                 &mut cmds,
                 KICK_CNA | KICK_CORE | KICK_DPU | KICK_DPU_RDMA,
@@ -1292,7 +1235,7 @@ pub fn build_conv_regcmd_tasks(
 /// Shapes that need CBUF splitting must use [`build_conv_regcmd_tasks`].
 pub fn build_conv_regcmd(shape: &ConvShape, bufs: &ConvBuffers) -> Vec<RegCmd> {
     let task = require_single_conv_task(shape);
-    let mut cmds = build_conv_cna_core_dpu_dpu_rdma(shape, bufs, &task, 2, None);
+    let mut cmds = build_conv_cna_core_dpu_dpu_rdma(shape, bufs, &task, 2);
     push_kick(&mut cmds, KICK_CNA | KICK_CORE | KICK_DPU | KICK_DPU_RDMA);
     cmds
 }
