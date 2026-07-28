@@ -5,6 +5,7 @@ pub mod conv;
 pub mod debug;
 pub mod device;
 pub mod executable_format;
+pub mod fc;
 pub mod lut_tables;
 pub mod regcmd;
 

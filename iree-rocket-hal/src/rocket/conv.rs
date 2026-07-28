@@ -2319,7 +2319,17 @@ fn conv_2d_tile_program(
         ),
         (FeatureLayout::Surfaces, false) => (
             full_width * 4,
-            full_width * (height - 4),
+            // This field is a 28-bit signed/bias-style encoding, despite the
+            // register definition exposing it as unsigned. The original
+            // image corpus never went below four rows, so ordinary unsigned
+            // subtraction happened to reproduce it. A 160-model FC sweep
+            // maps M to width and uses height=1; RKNN then writes
+            // `M * (1 - 4)` modulo 2^28 (M=4 is 0x0fff_fff4).
+            //
+            // Keep the arithmetic wrapping here and let the typed register
+            // field mask it to 28 bits below. This is the vendor encoding,
+            // not an attempt to use a negative byte stride in host memory.
+            full_width.wrapping_mul(height.wrapping_sub(4)) & 0x0fff_ffff,
             input_width * shape.cbuf_atoms() / 4,
         ),
         // Every captured width-partitioned task enables grouped-line mode
