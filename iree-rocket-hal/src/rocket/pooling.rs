@@ -37,9 +37,7 @@ use crate::rocket::{
     activation::Activation,
     builders::{Bits, RegCmd, Register, ppu::*, ppu_rdma::*},
     conv::{self, Activation as ConvActivation, ConvPlan, Kernels},
-    regcmd::{
-        KICK_CNA, KICK_CORE, KICK_DPU, KICK_DPU_RDMA, KICK_PPU, KICK_PPU_RDMA, push_kick, zero,
-    },
+    regcmd::{KICK_PPU, KICK_PPU_RDMA, push_kick, zero},
 };
 
 //===========================================================================
@@ -734,23 +732,22 @@ pub fn build_pooling_regcmd(shape: &PoolingShape, bufs: &PoolingBuffers) -> Vec<
 // "Checked against iree-rocket-hal/src/" section), matching NEITHER of the
 // two paths above:
 //
-// 1. A real (but trivial/near-identity) CNA->CORE->DPU task, same sequence
-//    `build_conv_regcmd` already proves on hardware
-//    (`build_conv_cna_core_dpu_dpu_rdma`, `dpu_output_mode=2` i.e. outside/
-//    memory, matching the real capture's `DPU_FEATURE_MODE_CFG.output_mode
-//    =2`), writing its output to a real intermediate buffer
-//    (`bufs.bypass_output_addr`). Kicked `KICK_CNA | KICK_CORE | KICK_DPU |
-//    KICK_DPU_RDMA` -- despite the real capture's kick reading `0x0d` (no
-//    DPU_RDMA bit), real hardware evidence overrides that reading: even
-//    with genuinely separate submit()/prep_bo() calls per task, omitting
-//    DPU_RDMA left the intermediate buffer completely unwritten (see the
-//    kick-fix note further down). `CNA_WEIGHT_SIZE0/1/2`'s tiny values in
-//    the real capture, vs. conv.rknn's real-kernel values, are consistent
-//    with this stage doing a near-identity passthrough rather than real
-//    conv math -- reflected here by `bypass_shape` being caller-supplied
-//    rather than hardcoded, so a 1x1, zero-point=0, scale=1.0 identity-ish
-//    shape can be passed in without this function assuming what "trivial"
-//    means numerically.
+// 1. A real (but trivial/near-identity) CNA->CORE->DPU task, built via
+//    `conv::ConvPlan` (`dpu_output_mode=2` i.e. outside/memory, matching
+//    the real capture's `DPU_FEATURE_MODE_CFG.output_mode=2`), writing its
+//    output to a real intermediate buffer (`bufs.bypass_output_addr`).
+//    Self-kicks via `ConvPlan`'s own PC trailer
+//    (`PCOperationMask::CONVOLUTION` = `CNA|CORE|DPU|DPU_RDMA`) -- no
+//    caller-supplied kick needed or wanted here; see this function's own
+//    body comment for the real hardware history of getting that right
+//    (`PC_OPERATION_ENABLE` is edge-triggered, so a redundant second kick
+//    actively corrupts the result, not just wastes a write).
+//    `CNA_WEIGHT_SIZE0/1/2`'s tiny values in the real capture, vs.
+//    conv.rknn's real-kernel values, are consistent with this stage doing
+//    a near-identity passthrough rather than real conv math -- reflected
+//    here by `bypass_shape` being caller-supplied rather than hardcoded,
+//    so a 1x1, zero-point=0, scale=1.0 identity-ish shape can be passed in
+//    without this function assuming what "trivial" means numerically.
 // 2. A second, separately-kicked task: PPU_RDMA fetches from
 //    `bufs.bypass_output_addr` (the first stage's real memory output, not
 //    an external caller-supplied input) and PPU pools it exactly like
@@ -875,25 +872,23 @@ pub fn build_pooling_via_dpu_bypass_regcmd(
          not supported by this single-task pooling path",
         bypass_tasks.len()
     );
-    let mut bypass_cmds = bypass_tasks.remove(0);
-    // KICK_DPU_RDMA included despite the real vendor capture's kick reading
-    // 0x0d (no DPU_RDMA bit) -- hardware evidence from the two-submit fix
-    // above overrides that reading: even with genuinely separate
-    // submit()/prep_bo() calls, a 0x0d-kicked stage 1 left buf_mid
-    // completely unwritten (sentinel-fill diagnostic, real hardware).
-    // Every other memory-writing conv task in this crate
-    // (`mesa_conv::build_conv_regcmd`, and `activation.rs`'s
-    // `build_conv_then_lut_regcmd`) kicks DPU_RDMA unconditionally --
-    // DPU_RDMA's enable bit is apparently
-    // required for the memory write-back to actually commit, regardless of
-    // dpu_output_mode, contradicting the vendor capture's literal decoded
-    // value (which may reflect something else about how the vendor
-    // compiler's tasks share DPU_RDMA state across the larger multi-tile
-    // program it came from, not a standalone single-task requirement).
-    push_kick(
-        &mut bypass_cmds,
-        KICK_CNA | KICK_CORE | KICK_DPU | KICK_DPU_RDMA,
-    );
+    let bypass_cmds = bypass_tasks.remove(0);
+    // NOT a push_kick() call here, deliberately: ConvPlan::programs_with_buffers
+    // already ends this task with its own PC trailer
+    // (PCTrailer::operation_enable(PCOperationMask::CONVOLUTION), which is
+    // exactly CNA|CORE|DPU|DPU_RDMA -- see conv.rs's tile builder). An
+    // earlier version of this function pushed a second, redundant kick here,
+    // carried over unexamined from the pre-migration mesa_conv-based stage 1
+    // (mesa_conv::build_conv_cna_core_dpu_dpu_rdma never self-kicks, so a
+    // caller-supplied kick there was the ONLY kick, not a second one).
+    // PC_OPERATION_ENABLE is edge-triggered, not passive state: a real RK3588
+    // run showed the second write re-kicks the same blocks immediately after
+    // the first, corrupting the result to an all-zero buf_mid (sentinel-fill
+    // diagnostic caught it -- job completes, no hang, but the data is wrong)
+    // instead of the harmless "last write wins" this was wrongly assumed to
+    // be. The real vendor capture's own kick reading 0x0d (missing the
+    // DPU_RDMA bit) is a fact about mesa_conv's own kick construction, not
+    // evidence this stage's ConvPlan-emitted kick is incomplete.
 
     // Stage 2: standalone-flying PPU, fetching from stage 1's real output.
     let plan = PoolingPlan::new(*pooling_shape);

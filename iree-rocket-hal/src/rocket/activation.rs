@@ -24,7 +24,7 @@
 use crate::rocket::{
     builders::{Bits, DOMAIN_DPU, RegCmd, Register, dpu::*, dpu_rdma::*},
     conv::{self, ConvPlan, Kernels},
-    regcmd::{KICK_CNA, KICK_CORE, KICK_DPU, KICK_DPU_RDMA, push_kick, zero},
+    regcmd::{KICK_DPU, KICK_DPU_RDMA, push_kick, zero},
     registers::REG_DPU_LUT_ACCESS_DATA,
 };
 
@@ -607,17 +607,21 @@ pub fn build_conv_then_lut_regcmd(
          this single-task LUT pipeline",
         conv_tasks.len()
     );
-    let mut conv_cmds = conv_tasks.remove(0);
-    // KICK_DPU_RDMA forced on for the same reason
-    // `build_pooling_via_dpu_bypass_regcmd`'s bypass stage forces it: this
-    // conv writes a real memory round-trip buffer for a downstream task to
-    // read, and every other memory-writing conv task in this crate kicks
-    // DPU_RDMA unconditionally regardless of what a real vendor capture's
-    // kick byte happens to read.
-    push_kick(
-        &mut conv_cmds,
-        KICK_CNA | KICK_CORE | KICK_DPU | KICK_DPU_RDMA,
-    );
+    let conv_cmds = conv_tasks.remove(0);
+    // NOT a push_kick() call here, deliberately: ConvPlan::programs_with_buffers
+    // already ends this task with its own PC trailer
+    // (PCTrailer::operation_enable(PCOperationMask::CONVOLUTION), exactly
+    // CNA|CORE|DPU|DPU_RDMA -- see conv.rs's tile builder). An earlier
+    // version of this function pushed a second, redundant kick here, carried
+    // over unexamined from `build_pooling_via_dpu_bypass_regcmd`'s
+    // pre-migration mesa_conv-based bypass stage (mesa_conv::build_conv_
+    // cna_core_dpu_dpu_rdma never self-kicks, so a caller-supplied kick
+    // there was the ONLY kick, not a second one -- see that function's own
+    // corrected doc comment for the real hardware evidence).
+    // PC_OPERATION_ENABLE is edge-triggered, not passive state: writing it
+    // twice re-kicks the same blocks immediately after the first, which is
+    // what a real RK3588 run of this exact double-kick shape showed --
+    // job completes, no hang, but the result comes back zeroed.
     let lut_cmds = build_lut_regcmd(
         lut_shape,
         &LutBuffers {
