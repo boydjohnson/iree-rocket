@@ -37,7 +37,7 @@
 //!   raw value produced which sorted position -- use that to fix
 //!   `PoolingMethod::bits()` if it disagrees with the current guess.
 
-use std::{fs::OpenOptions, mem, os::unix::io::AsRawFd, ptr};
+use std::{fs::OpenOptions, mem, os::unix::io::AsRawFd, ptr, time::Instant};
 
 use iree_rocket_hal::rocket::{
     activation::Activation,
@@ -200,7 +200,14 @@ unsafe fn run_pooling(
             input_addr: buf_in.dma_address,
             output_addr: buf_out.dma_address,
         };
+        assert_ne!(bufs.input_addr, 0, "input buffer got a zero dma_address");
+        assert_ne!(bufs.output_addr, 0, "output buffer got a zero dma_address");
+
         let cmds = build_pooling_regcmd(shape, &bufs);
+        assert!(
+            !cmds.is_empty(),
+            "build_pooling_regcmd produced zero regcmd words for {shape:?}"
+        );
 
         let cmd_bytes = cmds.len() * mem::size_of::<u64>();
         let cmd_len = cmd_bytes.next_multiple_of(4096);
@@ -209,6 +216,23 @@ unsafe fn run_pooling(
         for (i, c) in cmds.iter().enumerate() {
             cmd_slice[i] = c.0;
         }
+        eprintln!(
+            "run_pooling: shape={shape:?} regcmd_count={} \
+             buf_in(handle={} dma=0x{:08x}) buf_out(handle={} dma=0x{:08x}) buf_cmd(handle={} dma=0x{:08x})",
+            cmds.len(),
+            buf_in.handle,
+            buf_in.dma_address,
+            buf_out.handle,
+            buf_out.dma_address,
+            buf_cmd.handle,
+            buf_cmd.dma_address,
+        );
+        eprintln!(
+            "run_pooling: regcmd words = {:?}",
+            cmds.iter()
+                .map(|c| format!("{:#018x}", c.0))
+                .collect::<Vec<_>>()
+        );
 
         fini_bo(fd, buf_in.handle).ok();
         fini_bo(fd, buf_cmd.handle).ok();
@@ -224,6 +248,7 @@ unsafe fn run_pooling(
         let in_handles = [buf_cmd.handle, buf_in.handle];
         let out_handles = [buf_out.handle];
 
+        let submit_start = Instant::now();
         submit(
             fd,
             buf_cmd.dma_address,
@@ -231,12 +256,33 @@ unsafe fn run_pooling(
             &in_handles,
             &out_handles,
         )
-        .expect("SUBMIT ioctl failed");
+        .unwrap_or_else(|e| {
+            panic!(
+                "SUBMIT ioctl failed after {:?}: {e}",
+                submit_start.elapsed()
+            )
+        });
+        eprintln!(
+            "run_pooling: SUBMIT accepted in {:?}",
+            submit_start.elapsed()
+        );
 
-        prep_bo(fd, buf_out.handle, 2_000_000_000).expect("job did not complete within timeout");
+        let wait_start = Instant::now();
+        let wait_result = prep_bo(fd, buf_out.handle, 2_000_000_000);
+        let waited = wait_start.elapsed();
+        match wait_result {
+            Ok(()) => eprintln!("run_pooling: PREP_BO completed after {waited:?}"),
+            Err(e) => panic!(
+                "job did not complete within timeout (waited {waited:?}, prep_bo error: {e}) \
+                 -- shape={shape:?} buf_out(handle={} dma=0x{:08x})",
+                buf_out.handle, buf_out.dma_address
+            ),
+        }
 
         let raw = std::slice::from_raw_parts(buf_out.host_ptr, num_output_pixels * 16 + 16);
-        (0..num_output_pixels).map(|i| raw[i * 16]).collect()
+        let pixels: Vec<u8> = (0..num_output_pixels).map(|i| raw[i * 16]).collect();
+        eprintln!("run_pooling: output pixels = {pixels:?}");
+        pixels
     }
 }
 
@@ -257,14 +303,40 @@ unsafe fn run_pooling_plan(
             input_addr: buf_in.dma_address,
             output_addr: buf_out.dma_address,
         });
+        assert!(
+            !programs.is_empty(),
+            "PoolingPlan::new produced zero tile programs for {shape:?}"
+        );
+        eprintln!(
+            "run_pooling_plan: shape={shape:?} tile_count={} \
+             buf_in(handle={} dma=0x{:08x}) buf_out(handle={} dma=0x{:08x})",
+            programs.len(),
+            buf_in.handle,
+            buf_in.dma_address,
+            buf_out.handle,
+            buf_out.dma_address,
+        );
+
         let mut command_buffers = Vec::with_capacity(programs.len());
-        for program in &programs {
+        for (tile, program) in programs.iter().enumerate() {
+            assert!(
+                !program.is_empty(),
+                "tile {tile}/{} got zero regcmd words for {shape:?}",
+                programs.len()
+            );
             let cmd_bytes = program.len() * mem::size_of::<u64>();
             let buffer = Buffer::new(fd, cmd_bytes.next_multiple_of(4096), file);
             let words = std::slice::from_raw_parts_mut(buffer.host_ptr as *mut u64, program.len());
             for (destination, command) in words.iter_mut().zip(program) {
                 *destination = command.0;
             }
+            eprintln!(
+                "run_pooling_plan: tile {tile}/{} handle={} dma=0x{:08x} regcmd_count={}",
+                programs.len(),
+                buffer.handle,
+                buffer.dma_address,
+                program.len()
+            );
             command_buffers.push((buffer, program.len() as u32));
         }
 
@@ -292,14 +364,40 @@ unsafe fn run_pooling_plan(
                 out_handles: &out_handles,
             })
             .collect();
-        submit_jobs(fd, &jobs).expect("tiled pooling SUBMIT failed");
-        prep_bo(fd, buf_out.handle, 5_000_000_000)
-            .expect("tiled pooling did not complete within timeout");
+
+        let submit_start = Instant::now();
+        submit_jobs(fd, &jobs).unwrap_or_else(|e| {
+            panic!(
+                "tiled pooling SUBMIT failed after {:?}: {e}",
+                submit_start.elapsed()
+            )
+        });
+        eprintln!(
+            "run_pooling_plan: SUBMIT accepted {} jobs in {:?}",
+            jobs.len(),
+            submit_start.elapsed()
+        );
+
+        let wait_start = Instant::now();
+        let wait_result = prep_bo(fd, buf_out.handle, 5_000_000_000);
+        let waited = wait_start.elapsed();
+        match wait_result {
+            Ok(()) => eprintln!("run_pooling_plan: PREP_BO completed after {waited:?}"),
+            Err(e) => panic!(
+                "tiled pooling did not complete within timeout (waited {waited:?}, \
+                 prep_bo error: {e}) -- shape={shape:?} tile_count={} buf_out(handle={} dma=0x{:08x})",
+                programs.len(),
+                buf_out.handle,
+                buf_out.dma_address
+            ),
+        }
 
         let raw = std::slice::from_raw_parts(buf_out.host_ptr, num_output_pixels * 16 + 16);
-        (0..num_output_pixels)
+        let pixels: Vec<u8> = (0..num_output_pixels)
             .map(|index| raw[index * 16])
-            .collect()
+            .collect();
+        eprintln!("run_pooling_plan: output pixels = {pixels:?}");
+        pixels
     }
 }
 
@@ -308,12 +406,26 @@ macro_rules! completes_and_tracks_input_test {
         #[test]
         #[ignore = "needs the real NPU device -- cross-compile for aarch64, copy to the board, run there"]
         fn $name() {
+            eprintln!(
+                "{}: starting, method={:?} shape={:?}",
+                stringify!($name),
+                $method,
+                tiled_shape($method)
+            );
             let shape = tiled_shape($method);
             // Uniform fill: every 2x2 window sees identical input, so
             // every one of the 4 output pixels should agree regardless of
             // which pooling method this raw encoding actually is.
             for input_fill in [10u8, 118, 200] {
+                eprintln!("{}: input_fill={input_fill}", stringify!($name));
                 let pixels = run_uniform_pooling(&shape, input_fill, 4);
+                assert_eq!(
+                    pixels.len(),
+                    4,
+                    "input_fill={input_fill}: expected 4 output pixels, got {} ({pixels:?})",
+                    pixels.len()
+                );
+                eprintln!("{}: input_fill={input_fill} -> pixels={pixels:?}", stringify!($name));
                 assert!(
                     pixels.iter().all(|&p| p == pixels[0]),
                     "input_fill={input_fill}: expected all 4 output pixels identical \
@@ -324,11 +436,13 @@ macro_rules! completes_and_tracks_input_test {
             // against a hollow "completes but never touches the data" pass.
             let low = run_uniform_pooling(&shape, 10, 4)[0];
             let high = run_uniform_pooling(&shape, 200, 4)[0];
+            eprintln!("{}: low(fill=10)={low} high(fill=200)={high}", stringify!($name));
             assert_ne!(
                 low, high,
                 "output pixel value didn't change between input_fill=10 ({low}) and \
                  input_fill=200 ({high}) -- suggests the op isn't really reading the input"
             );
+            eprintln!("{}: PASSED", stringify!($name));
         }
     };
 }
@@ -397,7 +511,19 @@ fn pooling_method_encoding_discovery() {
             let buf_out = Buffer::new(fd, TENSOR_SIZE, &file);
             ptr::write_bytes(buf_out.host_ptr, 0, TENSOR_SIZE);
 
+            eprintln!(
+                "pooling_method_encoding_discovery: raw={raw} method={method:?} shape={shape:?}"
+            );
             let pixels = run_pooling(&file, fd, &shape, &buf_in, &buf_out, 1);
+            assert_eq!(
+                pixels.len(),
+                1,
+                "raw={raw} method={method:?}: expected exactly 1 output pixel, got {pixels:?}"
+            );
+            eprintln!(
+                "pooling_method_encoding_discovery: raw={raw} method={method:?} -> output byte {}",
+                pixels[0]
+            );
             results.push((raw, pixels[0]));
         }
     }
@@ -492,43 +618,73 @@ fn pooling_dump_full_output_buffer() {
 #[ignore = "needs the real NPU device -- validates capture-derived horizontal tiling"]
 fn wide_pooling_plan_runs_on_npu() {
     let shape = validation_shape(256, 48, 3, 3, 2, 2);
+    eprintln!("wide_pooling_plan_runs_on_npu: shape={shape:?}");
     let pixels = run_uniform_pooling_dynamic(&shape, 73);
+    let bad = pixels.iter().filter(|&&value| value != 73).count();
+    eprintln!(
+        "wide_pooling_plan_runs_on_npu: {}/{} pixels wrong (expected 73)",
+        bad,
+        pixels.len()
+    );
     assert!(
         pixels.iter().all(|&value| value == 73),
-        "{}x{} -> {}x{} tiled max pooling did not preserve a uniform input",
+        "{}x{} -> {}x{} tiled max pooling did not preserve a uniform input: \
+         {bad}/{} pixels wrong, got {pixels:?}",
         shape.input_width,
         shape.input_height,
         shape.output_width,
-        shape.output_height
+        shape.output_height,
+        pixels.len()
     );
+    eprintln!("wide_pooling_plan_runs_on_npu: PASSED");
 }
 
 #[test]
 #[ignore = "needs the real NPU device -- validates the 13-bit height boundary"]
 fn height_8192_pooling_runs_on_npu() {
     let shape = validation_shape(64, 8192, 3, 3, 2, 2);
+    eprintln!("height_8192_pooling_runs_on_npu: shape={shape:?}");
     let pixels = run_uniform_pooling_dynamic(&shape, 73);
+    let bad = pixels.iter().filter(|&&value| value != 73).count();
+    eprintln!(
+        "height_8192_pooling_runs_on_npu: {}/{} pixels wrong (expected 73)",
+        bad,
+        pixels.len()
+    );
     assert!(
         pixels.iter().all(|&value| value == 73),
-        "{}x{} -> {}x{} max pooling did not preserve a uniform input",
+        "{}x{} -> {}x{} max pooling did not preserve a uniform input: \
+         {bad}/{} pixels wrong, got {pixels:?}",
         shape.input_width,
         shape.input_height,
         shape.output_width,
-        shape.output_height
+        shape.output_height,
+        pixels.len()
     );
+    eprintln!("height_8192_pooling_runs_on_npu: PASSED");
 }
 
 #[test]
 #[ignore = "needs the real NPU device -- probes the upper half of the PPU kernel fields"]
 fn large_pooling_windows_run_on_npu() {
     let shape = validation_shape(64, 48, 8, 8, 3, 3);
+    eprintln!("large_pooling_windows_run_on_npu: shape={shape:?}");
     let pixels = run_uniform_pooling_dynamic(&shape, 91);
+    let bad = pixels.iter().filter(|&&value| value != 91).count();
+    eprintln!(
+        "large_pooling_windows_run_on_npu: {}/{} pixels wrong (expected 91)",
+        bad,
+        pixels.len()
+    );
     assert!(
         pixels.iter().all(|&value| value == 91),
-        "{}x{} kernel with {}x{} stride did not preserve a uniform input",
+        "{}x{} kernel with {}x{} stride did not preserve a uniform input: \
+         {bad}/{} pixels wrong, got {pixels:?}",
         shape.kernel_width,
         shape.kernel_height,
         shape.stride_x,
-        shape.stride_y
+        shape.stride_y,
+        pixels.len()
     );
+    eprintln!("large_pooling_windows_run_on_npu: PASSED");
 }
