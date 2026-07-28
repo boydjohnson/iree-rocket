@@ -1,4 +1,4 @@
-//! Pooling on the PPU, in all three shapes this hardware supports.
+//! Pooling on the PPU, in both shapes this crate now builds.
 //!
 //! - **Standalone flying** ([`build_pooling_regcmd`], TRM Ch.36 Fig 36-6):
 //!   PPU_RDMA reads the input straight from memory and feeds PPU directly,
@@ -9,9 +9,19 @@
 //!   two separately-kicked tasks, a near-identity conv followed by a PPU
 //!   pass. This is the shape a real rknn-toolkit2-compiled model actually
 //!   emits, and the one with hardware behind it.
-//! - **Pipelined after a real conv** ([`build_conv_then_pooling_regcmd`]):
-//!   DPU's output routed on-chip into PPU via `dpu_flyin`, no PPU_RDMA
-//!   fetch at all.
+//!
+//! A third shape -- pooling pipelined on-chip directly after a real conv via
+//! `dpu_flyin`, no PPU_RDMA fetch at all -- was implemented and then
+//! retired rather than migrated off `mesa_conv`. A dedicated 53-model
+//! `Conv2d -> Pool` sweep (`iree-rocket-design-spike`'s
+//! `sweep_convpool_generate.py`/`sweep_convpool_diff.py`, see
+//! `DESIGN_NOTES.md`'s "Conv+pool fusion sweep" section) found zero capture
+//! evidence for it across every swept geometry and precision -- the real
+//! vendor toolchain always emits the two-kick bypass shape above instead.
+//! Its own doc comment had already hedged that it was "chosen after the
+//! standalone path hung real hardware," i.e. a fallback tried when the
+//! flying-mode path failed, not something derived from a real compiler
+//! output.
 //!
 //! [`build_max_reduction_tree_regcmd`] chains the bypass shape into the
 //! max-reduction half of a softmax; see its section comment for the two
@@ -20,19 +30,15 @@
 //! Mesa-derived in structure, though there is no Mesa/Teflon reference for
 //! pooling itself (`rkt_ml.c` only ever implements convolution) -- the
 //! fields come from the PPU/PPU_RDMA register layout plus TRM Ch.36 prose.
-//! The eventual capture-derived builder for this op belongs in this same
-//! module.
+//! Both builders here are `mesa_conv`-free, using [`crate::rocket::conv`]'s
+//! capture-derived `ConvPlan` for their conv-coupled stage.
 
 use crate::rocket::{
     activation::Activation,
     builders::{Bits, RegCmd, Register, ppu::*, ppu_rdma::*},
     conv::{self, Activation as ConvActivation, ConvPlan, Kernels},
-    mesa_conv::{
-        ConvBuffers, ConvShape, build_conv_cna_core_dpu_dpu_rdma, require_single_conv_task,
-    },
     regcmd::{
-        KICK_CNA, KICK_CORE, KICK_DPU, KICK_DPU_RDMA, KICK_PPU, KICK_PPU_RDMA,
-        Precision as MesaPrecision, push_kick, zero,
+        KICK_CNA, KICK_CORE, KICK_DPU, KICK_DPU_RDMA, KICK_PPU, KICK_PPU_RDMA, push_kick, zero,
     },
 };
 
@@ -124,13 +130,6 @@ impl PoolingPrecision {
         match self {
             PoolingPrecision::Int8 => 1,
             PoolingPrecision::Fp16 => 2,
-        }
-    }
-
-    fn from_mesa_precision(precision: MesaPrecision) -> PoolingPrecision {
-        match precision {
-            MesaPrecision::Int8 => PoolingPrecision::Int8,
-            MesaPrecision::Fp16 => PoolingPrecision::Fp16,
         }
     }
 }
@@ -859,9 +858,9 @@ pub fn build_pooling_via_dpu_bypass_regcmd(
     // Stage 1: real (near-identity) CNA->CORE->DPU task, output to memory.
     // conv.rs's tile builder always programs DPU_FEATURE_MODE_CFG.output_mode
     // as external-memory (never on-chip dpu_flyin), which matches this
-    // stage's own `2` (outside/memory) exactly -- see build_conv_then_
-    // pooling_regcmd below for the on-chip-routed case conv.rs can't
-    // express, which is why that function stays on mesa_conv.
+    // stage's own `2` (outside/memory) exactly -- and, per the module doc
+    // comment's retirement note, the real vendor toolchain never emits the
+    // on-chip-routed shape for a genuine conv+pool graph anyway.
     let mut bypass_tasks = ConvPlan::new(bypass_shape_with_activation, bypass_kernels)
         .programs_with_buffers(conv::Buffers {
             input: bufs.input_addr,
@@ -883,9 +882,9 @@ pub fn build_pooling_via_dpu_bypass_regcmd(
     // submit()/prep_bo() calls, a 0x0d-kicked stage 1 left buf_mid
     // completely unwritten (sentinel-fill diagnostic, real hardware).
     // Every other memory-writing conv task in this crate
-    // (`mesa_conv::build_conv_regcmd`, and even this module's own
-    // build_conv_then_pooling_regcmd on-chip-routed stage) kicks
-    // DPU_RDMA unconditionally -- DPU_RDMA's enable bit is apparently
+    // (`mesa_conv::build_conv_regcmd`, and `activation.rs`'s
+    // `build_conv_then_lut_regcmd`) kicks DPU_RDMA unconditionally --
+    // DPU_RDMA's enable bit is apparently
     // required for the memory write-back to actually commit, regardless of
     // dpu_output_mode, contradicting the vendor capture's literal decoded
     // value (which may reflect something else about how the vendor
@@ -914,288 +913,6 @@ pub fn build_pooling_via_dpu_bypass_regcmd(
     push_kick(&mut pooling_cmds, KICK_PPU | KICK_PPU_RDMA);
 
     (bypass_cmds, pooling_cmds)
-}
-
-//===========================================================================
-// Pooling, pipelined directly after a real DPU stage (TRM Ch.36 Fig 36-4/
-// 36-5's "do some pipeline surface ops" step, NOT the standalone/flying
-// Fig 36-6 path `build_pooling_regcmd` implements above).
-//
-// Chosen after the standalone path hung real hardware (NPU job timeout +
-// IOMMU "Enable stall request timed out"). Re-reading TRM Fig 36-6 itself
-// ruled out one leading hypothesis for that hang -- the official standalone
-// flow never configures CNA/CORE/DPU/DPU_RDMA at all, so leaving them
-// zeroed (as `build_pooling_regcmd` already does) is not the bug. That left
-// PPU_RDMA's own fetch-stride math (also unconfirmed) or the borrowed
-// all-blocks "kick" as the remaining suspects -- the kick one is now
-// confirmed and fixed (see `build_pooling_regcmd`'s kick-sequence comment
-// and the `KICK_*` constants above `push_kick`); PPU_RDMA's stride math
-// remains unconfirmed since this pipelined path doesn't use PPU_RDMA at
-// all (see below).
-//
-// This path sidesteps the still-open stride-math question rather than
-// resolving it: it runs a real, hardware-validated CNA->CORE->DPU
-// convolution (the exact same sequence `build_conv_regcmd` already proves
-// on hardware, reused via `build_conv_cna_core_dpu_dpu_rdma`) and routes
-// DPU's output on-chip straight into PPU (`DPU_FEATURE_MODE_CFG.output_mode`
-// bit0, `PPU_DATA_FORMAT.dpu_flyin`) instead of through PPU_RDMA. No
-// PPU_RDMA fetch is used at all, so the kick is `KICK_CNA | KICK_CORE |
-// KICK_DPU | KICK_DPU_RDMA | KICK_PPU` -- every block this task actually
-// configures, PPU_RDMA correctly left both unconfigured and unkicked.
-//
-// Still NOT hardware-validated as of writing -- see tests/ for the
-// hardware-in-the-loop test this needs before trusting it.
-//===========================================================================
-
-/// Pooling-specific parameters for the pipelined path. `conv_shape`'s own
-/// `output_width`/`output_height`/`output_channels` become PPU's INPUT
-/// shape (DPU's output, routed on-chip) -- this struct only carries
-/// pooling's own output shape and kernel/pad/method parameters.
-pub struct PipelinedPoolingShape {
-    pub kernel_width: u32,
-    pub kernel_height: u32,
-    pub stride_x: u32,
-    pub stride_y: u32,
-    pub method: PoolingMethod,
-    pub pad_left: u32,
-    pub pad_top: u32,
-    pub pad_right: u32,
-    pub pad_bottom: u32,
-    pub pad_value: u32,
-    pub output_width: u32,
-    pub output_height: u32,
-    pub output_channels: u32,
-    pub precision: PoolingPrecision,
-}
-
-/// DMA addresses for a conv-then-pipelined-pooling op. Unlike
-/// `ConvBuffers`, there is no separate "conv output" address: DPU's output
-/// is routed on-chip directly into PPU (`output_mode` bit0 only, bit1/
-/// "outside" left clear), so it never needs a memory round-trip. Only the
-/// final pooled result needs a real buffer.
-pub struct ConvThenPoolingBuffers {
-    pub input_addr: u32,
-    pub weights_addr: u32,
-    pub bias_addr: u32,
-    pub output_addr: u32,
-}
-
-pub fn build_conv_then_pooling_regcmd(
-    conv_shape: &ConvShape,
-    pooling: &PipelinedPoolingShape,
-    bufs: &ConvThenPoolingBuffers,
-) -> Vec<RegCmd> {
-    validate_pooling_geometry(
-        conv_shape.output_width,
-        conv_shape.output_height,
-        conv_shape.output_channels,
-        pooling.output_width,
-        pooling.output_height,
-        pooling.output_channels,
-        pooling.kernel_width,
-        pooling.kernel_height,
-        pooling.stride_x,
-        pooling.stride_y,
-        pooling.pad_left,
-        pooling.pad_top,
-        pooling.pad_right,
-        pooling.pad_bottom,
-    );
-    validate_direct_kernel(pooling.kernel_width, pooling.kernel_height);
-    assert_eq!(
-        pooling.precision,
-        PoolingPrecision::from_mesa_precision(conv_shape.precision),
-        "pooling precision must match the pipelined DPU output precision"
-    );
-    assert!(
-        bufs.output_addr.is_multiple_of(16),
-        "build_conv_then_pooling_regcmd: output_addr {:#x} is not 16-byte aligned -- \
-         PPU_DST_BASE_ADDR is written as address >> 4 (see build_pooling_regcmd's \
-         PoolingBuffers::output_addr doc comment for why)",
-        bufs.output_addr
-    );
-
-    const FEATURE_ATOMIC_SIZE: u32 = 16;
-    const ATOMIC_K_SIZE: u32 = 16;
-
-    // dpu_output_mode = 1: bit0 only ("to PPU", on-chip) -- bit1
-    // ("outside"/memory) deliberately left clear, see module doc comment.
-    // The conv-stage buffers (input/weights/bias) are real; output_addr
-    // there is irrelevant (never written) since bit1 is clear.
-    let conv_task = require_single_conv_task(conv_shape);
-    let mut cmds = build_conv_cna_core_dpu_dpu_rdma(
-        conv_shape,
-        &ConvBuffers {
-            input_addr: bufs.input_addr,
-            weights_addr: bufs.weights_addr,
-            bias_addr: bufs.bias_addr,
-            output_addr: 0,
-        },
-        &conv_task,
-        1,
-        None,
-    );
-
-    // ========================================================================
-    // PPU -- pipelined directly after DPU (dpu_flyin=1), no PPU_RDMA
-    // involved. TRM Fig 36-4/36-5's "do some pipeline surface ops" step.
-    // ========================================================================
-
-    cmds.push(
-        Register::<PpuSPointer>::new()
-            .pointer_pp_mode(Bits::new(1))
-            .executer_pp_en(Bits::new(1))
-            .pointer_pp_en(Bits::new(1))
-            .build(),
-    );
-
-    cmds.push(
-        Register::<PpuDataCubeInWidth>::new()
-            .cube_in_width(Bits::new(conv_shape.output_width - 1))
-            .build(),
-    );
-    cmds.push(
-        Register::<PpuDataCubeInHeight>::new()
-            .cube_in_height(Bits::new(conv_shape.output_height - 1))
-            .build(),
-    );
-    cmds.push(
-        Register::<PpuDataCubeInChannel>::new()
-            .cube_in_channel(Bits::new(conv_shape.output_channels - 1))
-            .build(),
-    );
-    cmds.push(
-        Register::<PpuDataCubeOutWidth>::new()
-            .cube_out_width(Bits::new(pooling.output_width - 1))
-            .build(),
-    );
-    cmds.push(
-        Register::<PpuDataCubeOutHeight>::new()
-            .cube_out_height(Bits::new(pooling.output_height - 1))
-            .build(),
-    );
-    cmds.push(
-        Register::<PpuDataCubeOutChannel>::new()
-            .cube_out_channel(Bits::new(pooling.output_channels - 1))
-            .build(),
-    );
-
-    cmds.push(
-        Register::<PpuOperationModeCfg>::new()
-            .pooling_method(Bits::new(pooling.method.bits()))
-            .flying_mode(Bits::new(0)) // pipelined after DPU, not standalone
-            .index_en(Bits::new(0))
-            .use_cnt(Bits::new(0))
-            .notch_addr(Bits::new(0))
-            .build(),
-    );
-    cmds.push(
-        Register::<PpuPoolingKernelCfg>::new()
-            .kernel_width(Bits::new(pooling.kernel_width - 1))
-            .kernel_height(Bits::new(pooling.kernel_height - 1))
-            .kernel_stride_width(Bits::new(pooling.stride_x - 1))
-            .kernel_stride_height(Bits::new(pooling.stride_y - 1))
-            .build(),
-    );
-
-    let (recip_kernel_width, recip_kernel_height) = match pooling.method {
-        PoolingMethod::Avg => (
-            ((1u64 << 16) / u64::from(pooling.kernel_width)) as u32,
-            ((1u64 << 16) / u64::from(pooling.kernel_height)) as u32,
-        ),
-        PoolingMethod::Max | PoolingMethod::Min => (0, 0),
-    };
-    let programmed_pad_right = required_trailing_padding(
-        conv_shape.output_width,
-        pooling.output_width,
-        pooling.kernel_width,
-        pooling.stride_x,
-        pooling.pad_left,
-    );
-    let programmed_pad_bottom = required_trailing_padding(
-        conv_shape.output_height,
-        pooling.output_height,
-        pooling.kernel_height,
-        pooling.stride_y,
-        pooling.pad_top,
-    );
-    cmds.push(
-        Register::<PpuRecipKernelWidth>::new()
-            .recip_kernel_width(Bits::new(recip_kernel_width))
-            .build(),
-    );
-    cmds.push(
-        Register::<PpuRecipKernelHeight>::new()
-            .recip_kernel_height(Bits::new(recip_kernel_height))
-            .build(),
-    );
-    cmds.push(
-        Register::<PpuPoolingPaddingCfg>::new()
-            .pad_left(Bits::new(pooling.pad_left))
-            .pad_top(Bits::new(pooling.pad_top))
-            .pad_right(Bits::new(programmed_pad_right))
-            .pad_bottom(Bits::new(programmed_pad_bottom))
-            .build(),
-    );
-    cmds.push(
-        Register::<PpuPaddingValue1Cfg>::new()
-            .pad_value_0(Bits::new(pooling.pad_value))
-            .build(),
-    );
-    cmds.push(zero::<PpuPaddingValue2Cfg>());
-
-    // Tested both this (>>4, by analogy to PC_BASE_ADDRESS's documented
-    // bits[31:4] convention) and the raw address directly against real
-    // hardware with a small (0x3000) buffer address -- both produced
-    // identical zero-effect results, ruling out address encoding as the
-    // actual blocker. Keeping the shifted form since it's still the more
-    // principled default absent evidence either way.
-    cmds.push(
-        Register::<PpuDstBaseAddr>::new()
-            .dst_base_addr(Bits::new(bufs.output_addr >> 4))
-            .build(),
-    );
-    let ppu_dst_surf_stride = ((pooling.output_width * ATOMIC_K_SIZE * pooling.output_height)
-        / FEATURE_ATOMIC_SIZE)
-        .next_multiple_of(4);
-    cmds.push(
-        Register::<PpuDstSurfStride>::new()
-            .dst_surf_stride(Bits::new(ppu_dst_surf_stride))
-            .build(),
-    );
-    cmds.push(
-        Register::<PpuDataFormat>::new()
-            .proc_precision(Bits::new(pooling.precision.ppu_precision()))
-            .dpu_flyin(Bits::new(1)) // source is DPU's on-chip output, not PPU_RDMA
-            .index_add(Bits::new(ppu_dst_surf_stride))
-            .build(),
-    );
-    cmds.push(
-        Register::<PpuMiscCtrl>::new()
-            .burst_len(Bits::new(3))
-            .nonalign(Bits::new(0))
-            .mc_surf_out(Bits::new(0))
-            .surf_len(Bits::new(0))
-            .build(),
-    );
-
-    // Previously added an explicit PPU_OPERATION_ENABLE write here (PPU's
-    // own DOMAIN_PPU-tagged register) because the shared kick's fixed
-    // CNA/CORE/DPU/DPU_RDMA bitmask never set PPU's enable bit, and there
-    // was no evidence either mechanism actually enabled PPU. There's now
-    // real evidence: a real rknn-toolkit2-compiled pooling.rknn capture
-    // (see NOTES.md in rknpu-spelunking, "Decoding a real regcmd program
-    // for a pooling-only op") never writes any per-block *_OPERATION_ENABLE
-    // register for *any* block, including PPU -- only the broadcast PC
-    // kick, with a bitmask scoped to exactly the blocks that task uses.
-    // Dropped the per-block write and folded KICK_PPU into the kick below
-    // instead, matching that real pattern. NOT YET HARDWARE-VALIDATED.
-    push_kick(
-        &mut cmds,
-        KICK_CNA | KICK_CORE | KICK_DPU | KICK_DPU_RDMA | KICK_PPU,
-    );
-
-    cmds
 }
 
 //===========================================================================

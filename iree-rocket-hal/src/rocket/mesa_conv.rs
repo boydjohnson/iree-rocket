@@ -366,8 +366,9 @@ pub fn plan_conv_tasks(shape: &ConvShape) -> Result<Vec<ConvTask>, &'static str>
 }
 
 /// Shared CNA->CORE->DPU->DPU_RDMA emission, factored out of
-/// `build_conv_regcmd` so `build_conv_then_pooling_regcmd` can reuse the
-/// exact same hardware-validated sequence instead of duplicating it. Pure
+/// `build_conv_regcmd` so other builders in this crate (currently
+/// `elementwise::build_conv_with_add_regcmd`) can reuse the exact same
+/// hardware-validated sequence instead of duplicating it. Pure
 /// extraction -- no behavior change versus the original single function
 /// (verified by inspection: every `cmds.push` below is unchanged from
 /// before the split, in the same order).

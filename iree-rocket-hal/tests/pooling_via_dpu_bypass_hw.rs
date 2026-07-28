@@ -3,8 +3,9 @@
 //! `pooling.rs`'s module doc comment above that function, and
 //! rknpu-spelunking/NOTES.md's "Decoding a real regcmd program for a
 //! pooling-only op"), as opposed to `build_pooling_regcmd`'s standalone-only
-//! path (`pooling_hw.rs`) or `build_conv_then_pooling_regcmd`'s on-chip
-//! pipelined path (`conv_then_pooling_hw.rs`).
+//! path (`pooling_hw.rs`). A third, on-chip pipelined shape was tried and
+//! then retired -- see `pooling.rs`'s module doc comment for the sweep that
+//! found no compiler evidence for it.
 //!
 //! Not run by a plain `cargo test` -- see `conv_hw.rs`'s doc comment for the
 //! cross-compile-and-copy-to-the-board workflow; identical here:

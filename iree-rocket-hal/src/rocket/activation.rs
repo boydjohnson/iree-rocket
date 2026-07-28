@@ -15,13 +15,16 @@
 //!   convolution pipeline), and [`build_conv_then_lut_regcmd`] chains a
 //!   conv into it.
 //!
-//! Mesa-derived, like [`crate::rocket::mesa_conv`]. The eventual
-//! capture-derived builder for this op belongs in this same module.
+//! The fused [`Activation`] enum is capture-derived, from
+//! [`crate::rocket::conv`]. [`LutTable`]/[`build_lut_regcmd`] are
+//! Mesa-independent (there is no Mesa/Teflon reference for sigmoid/tanh at
+//! all); [`build_conv_then_lut_regcmd`] chains a [`crate::rocket::conv`]
+//! task into the standalone LUT task.
 
 use crate::rocket::{
     builders::{Bits, DOMAIN_DPU, RegCmd, Register, dpu::*, dpu_rdma::*},
-    mesa_conv::{ConvBuffers, ConvShape, build_conv_regcmd},
-    regcmd::{KICK_DPU, KICK_DPU_RDMA, push_kick, zero},
+    conv::{self, ConvPlan, Kernels},
+    regcmd::{KICK_CNA, KICK_CORE, KICK_DPU, KICK_DPU_RDMA, push_kick, zero},
     registers::REG_DPU_LUT_ACCESS_DATA,
 };
 
@@ -285,7 +288,7 @@ fn lut_out_cvt(output_scale: f32) -> (u32, u32) {
 /// sigmoid/tanh routing (confirmed via live hardware trace of the vendor
 /// runtime itself, see `rknpu-spelunking/NOTES.md`): DPU runs in flying
 /// mode, DPU_RDMA/MRDMA supplies the input tensor directly from memory,
-/// and CNA/CORE are not kicked. Chain a `build_conv_regcmd` task (with
+/// and CNA/CORE are not kicked. Chain a real conv task (with
 /// `Activation::None`) into this via `build_conv_then_lut_regcmd` for a
 /// conv-then-sigmoid/tanh pipeline -- LUT activations are never fused
 /// into the conv's own DPU pass, unlike `Relu`/`Relux`.
@@ -548,12 +551,14 @@ pub fn build_lut_regcmd(shape: &LutShape, bufs: &LutBuffers, table: LutTable) ->
     cmds
 }
 
-/// DMA addresses for a conv-then-LUT-activation pipeline. Unlike
-/// `ConvThenPoolingBuffers` (whose DPU->PPU handoff stays on-chip), `Relu`/
-/// `Relux` fuse into the conv's own DPU pass but sigmoid/tanh never do --
-/// confirmed by live hardware tracing of the vendor runtime itself
+/// DMA addresses for a conv-then-LUT-activation pipeline. `Relu`/`Relux`
+/// fuse into the conv's own DPU pass but sigmoid/tanh never do -- confirmed
+/// by live hardware tracing of the vendor runtime itself
 /// (`rknpu-spelunking/NOTES.md`), which showed a real separate task
-/// reading the conv's output back from memory, not on-chip pipelining.
+/// reading the conv's output back from memory, not on-chip pipelining, and
+/// reproduced across a real 47-point geometry/precision sweep of static
+/// compiles (`iree-rocket-design-spike/DESIGN_NOTES.md`'s "Conv+LUT fusion
+/// sweep" section) -- every capture split into two tasks, none fused.
 /// `intermediate_addr` is that real round-trip buffer: pure inter-task DMA
 /// memory the CPU never touches, so it doesn't need `prep_bo()`/`fini_bo()`
 /// the way a job-boundary buffer would.
@@ -576,24 +581,40 @@ pub struct ConvThenLutBuffers {
 /// completion IRQ fires, so no CPU-side wait on `intermediate_addr` is
 /// needed in between -- see `submit_tasks`'s doc comment).
 pub fn build_conv_then_lut_regcmd(
-    conv_shape: &ConvShape,
+    conv_shape: &conv::Shape,
+    kernels: Kernels,
     lut_shape: &LutShape,
     table: LutTable,
     bufs: &ConvThenLutBuffers,
 ) -> (Vec<RegCmd>, Vec<RegCmd>) {
     assert!(
-        matches!(conv_shape.activation, Activation::None),
+        matches!(conv_shape.activation, conv::Activation::None),
         "build_conv_then_lut_regcmd: conv_shape.activation must be Activation::None -- \
          LUT activations always run as a separate task, never fused into the conv's own DPU pass"
     );
-    let conv_cmds = build_conv_regcmd(
-        conv_shape,
-        &ConvBuffers {
-            input_addr: bufs.input_addr,
-            weights_addr: bufs.weights_addr,
-            bias_addr: bufs.bias_addr,
-            output_addr: bufs.intermediate_addr,
-        },
+    let mut conv_tasks = ConvPlan::new(*conv_shape, kernels).programs_with_buffers(conv::Buffers {
+        input: bufs.input_addr,
+        weights: bufs.weights_addr,
+        bias: bufs.bias_addr,
+        output: bufs.intermediate_addr,
+    });
+    assert_eq!(
+        conv_tasks.len(),
+        1,
+        "build_conv_then_lut_regcmd: conv requires {} CBUF height splits; not supported by \
+         this single-task LUT pipeline",
+        conv_tasks.len()
+    );
+    let mut conv_cmds = conv_tasks.remove(0);
+    // KICK_DPU_RDMA forced on for the same reason
+    // `build_pooling_via_dpu_bypass_regcmd`'s bypass stage forces it: this
+    // conv writes a real memory round-trip buffer for a downstream task to
+    // read, and every other memory-writing conv task in this crate kicks
+    // DPU_RDMA unconditionally regardless of what a real vendor capture's
+    // kick byte happens to read.
+    push_kick(
+        &mut conv_cmds,
+        KICK_CNA | KICK_CORE | KICK_DPU | KICK_DPU_RDMA,
     );
     let lut_cmds = build_lut_regcmd(
         lut_shape,

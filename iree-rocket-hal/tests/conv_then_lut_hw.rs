@@ -35,36 +35,33 @@
 use std::{fs::OpenOptions, mem, os::unix::io::AsRawFd, ptr};
 
 use iree_rocket_hal::rocket::{
-    activation::{Activation, ConvThenLutBuffers, LutShape, LutTable, build_conv_then_lut_regcmd},
+    activation::{ConvThenLutBuffers, LutShape, LutTable, build_conv_then_lut_regcmd},
+    conv::{self, Kernels, Multiplier, Quantization},
     device::{Buffer, close_bo, fini_bo, prep_bo, submit_tasks},
-    mesa_conv::ConvShape,
-    regcmd::Precision,
 };
 
 const DEVICE_PATH: &str = "/dev/accel/accel0";
 const TENSOR_SIZE: usize = 4096;
+const KERNELS: Kernels = [1, 1];
 
-fn conv_shape() -> ConvShape {
-    ConvShape {
-        input_width: 4,
-        input_height: 4,
-        input_channels: 1,
-        output_width: 4,
-        output_height: 4,
-        output_channels: 1,
-        weights_width: 1,
-        weights_height: 1,
+fn conv_shape() -> conv::Shape {
+    conv::Shape {
+        width: 4,
+        height: 4,
         stride: 1,
+        in_channels: 1,
+        out_channels: 1,
+        precision: conv::Precision::Int8(Quantization {
+            // Raw 0x80 decodes to a real zero point of 0 -- "real zero = 0"
+            // on both sides of the task boundary, same convention as
+            // `lut_shape` below.
+            input_zero_point: 0,
+            output_zero_point: 0,
+            multiplier: Multiplier::from_ratio(1.0),
+        }),
+        padding: Some([0, 0]),
+        activation: conv::Activation::None,
         depthwise: false,
-        input_zero_point: 0x80,
-        output_zero_point: 0x80,
-        weights_zero_point: 0x80,
-        input_scale: 1.0,
-        weights_scale: 1.0,
-        output_scale: 1.0,
-        truncate_bits: 0,
-        activation: Activation::None,
-        precision: Precision::Int8,
     }
 }
 
@@ -133,8 +130,13 @@ fn run_uniform_conv_then_lut(
             intermediate_addr: buf_mid.dma_address,
             output_addr: buf_out.dma_address,
         };
-        let (conv_cmds, lut_cmds) =
-            build_conv_then_lut_regcmd(&conv_shape(), &lut_shape(output_zero_point), table, &bufs);
+        let (conv_cmds, lut_cmds) = build_conv_then_lut_regcmd(
+            &conv_shape(),
+            KERNELS,
+            &lut_shape(output_zero_point),
+            table,
+            &bufs,
+        );
 
         let conv_cmd_bytes = conv_cmds.len() * mem::size_of::<u64>();
         let buf_cmd_conv = Buffer::new(fd, conv_cmd_bytes.next_multiple_of(4096), &file);
