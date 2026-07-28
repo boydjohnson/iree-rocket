@@ -200,26 +200,10 @@ unsafe fn run_pooling(
             input_addr: buf_in.dma_address,
             output_addr: buf_out.dma_address,
         };
-        // NOT a hard assert: a zero dma_address is suspicious (CREATE_BO's
-        // IOVA field going unpopulated, or landing exactly on address 0)
-        // but we don't yet know whether PPU_RDMA/PPU actually choke on it.
-        // Warn loudly and let the dispatch proceed to SUBMIT/PREP_BO so the
-        // real hardware behavior (hang vs. silent garbage) tells us, rather
-        // than a test-side panic hiding it again.
-        if bufs.input_addr == 0 {
-            eprintln!(
-                "run_pooling: WARNING buf_in has a zero dma_address (handle={}) -- \
-                 dispatching anyway to see whether PPU_RDMA hangs reading from address 0",
-                buf_in.handle
-            );
-        }
-        if bufs.output_addr == 0 {
-            eprintln!(
-                "run_pooling: WARNING buf_out has a zero dma_address (handle={}) -- \
-                 dispatching anyway to see whether PPU hangs writing to address 0",
-                buf_out.handle
-            );
-        }
+        // dma_address == 0 is NOT a bug: confirmed on real hardware
+        // (2026-07-28) that this driver's GEM allocator legitimately hands
+        // out IOVA 0 as the first BO in a fresh fd, and dispatches against
+        // it read/write correctly. Do not reintroduce a hard assert on this.
 
         let cmds = build_pooling_regcmd(shape, &bufs);
         assert!(
