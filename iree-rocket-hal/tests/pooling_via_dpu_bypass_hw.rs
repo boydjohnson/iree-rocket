@@ -7,15 +7,16 @@
 //! then retired -- see `pooling.rs`'s module doc comment for the sweep that
 //! found no compiler evidence for it.
 //!
-//! Not run by a plain `cargo test` -- see `conv_hw.rs`'s doc comment for the
-//! cross-compile-and-copy-to-the-board workflow; identical here:
+//! Not run by a plain `cargo test` -- see `conv_phase1_validation_hw.rs`'s
+//! doc comment for the cross-compile-and-copy-to-the-board workflow;
+//! identical here:
 //!
 //!   CARGO_TARGET_AARCH64_UNKNOWN_LINUX_GNU_LINKER=aarch64-linux-gnu-gcc \
 //!     cargo test --target aarch64-unknown-linux-gnu --release \
 //!       --test pooling_via_dpu_bypass_hw --no-run
 //!
-//! Same uniform-whole-buffer-fill methodology as `pooling_hw.rs`/`conv_hw.rs`
-//! throughout: the bypass conv stage's exact numeric transform doesn't need
+//! Same uniform-whole-buffer-fill methodology as `pooling_hw.rs` throughout:
+//! the bypass conv stage's exact numeric transform doesn't need
 //! to be a true arithmetic identity for these tests to be meaningful --
 //! only a real, consistent, input-tracking pipeline (uniform input/weight
 //! fill makes per-tap/per-pixel packing order irrelevant either way).
@@ -185,7 +186,7 @@ impl Bufs {
 /// Runs the two-kick bypass-then-pool shape as two genuinely separate
 /// `submit()`/`prep_bo()` round trips (see this file's top doc comment for
 /// why) and returns the real output pixels (same 16-byte-atomic read
-/// stride as `conv_hw.rs`/`pooling_hw.rs`).
+/// stride as `pooling_hw.rs`).
 fn run_uniform_pooling_via_bypass(
     method: PoolingMethod,
     input_fill: u8,
@@ -410,8 +411,8 @@ fn pooling_via_bypass_repeat_dispatch_dump() {
 
 /// Phase 3 of the ukernel roadmap: fused activation on a pooling op that
 /// has a real DPU stage ahead of PPU (this bypass path). Same
-/// domain-independent proof `conv_activation_hw.rs`'s
-/// `conv_3x3_relux_cmp_zero_forces_constant_output` used for conv: `cmp: 0`
+/// domain-independent proof `conv_phase1_validation_hw.rs`'s clamped-
+/// activation test used for conv: `cmp: 0`
 /// clamps to 0 in any numeric scale, so if the bypass stage is really
 /// applying `pooling_shape.activation` (not silently dropping it),
 /// every input_fill should read back as the same constant regardless of

@@ -2,22 +2,23 @@
 //! ("flying mode") PPU path -- TRM Ch.36 Fig 36-6, PPU_RDMA feeding PPU
 //! directly from memory with CNA/CORE/DPU untouched.
 //!
-//! Not run by a plain `cargo test` -- see conv_hw.rs's doc comment for the
-//! cross-compile-and-copy-to-the-board workflow; identical here:
+//! Not run by a plain `cargo test` -- see `conv_phase1_validation_hw.rs`'s
+//! doc comment for the cross-compile-and-copy-to-the-board workflow;
+//! identical here:
 //!
 //!   CARGO_TARGET_AARCH64_UNKNOWN_LINUX_GNU_LINKER=aarch64-linux-gnu-gcc \
 //!     cargo test --target aarch64-unknown-linux-gnu --release \
 //!       --test pooling_hw --no-run
 //!
-//! Unlike conv_hw.rs's conv shapes, there is NO Mesa/Teflon reference
+//! Unlike an ordinary conv shape, there is NO Mesa/Teflon reference
 //! implementation for pooling to cross-check against (`rkt_ml.c` never
 //! implements it) -- see `build_pooling_regcmd`'s module doc comment for
 //! everything that's genuinely unconfirmed here (the pooling_method bit
 //! encoding chief among them). These tests are split accordingly:
 //!
 //! - `pooling_*_completes_and_output_tracks_input`: the load-bearing
-//!   correctness tests. Uniform-fill (same trick as conv_hw.rs, sidesteps
-//!   not knowing the input buffer's real pixel packing order) at two fill
+//!   correctness tests. Uniform-fill (sidesteps not knowing the input
+//!   buffer's real pixel packing order) at two fill
 //!   levels, for each of the three raw `PoolingMethod` encodings
 //!   independently. Proves the whole standalone-PPU-flying dispatch
 //!   completes without hanging and genuinely reads the input, regardless
@@ -106,9 +107,9 @@ fn whole_input_shape(method: PoolingMethod) -> PoolingShape {
 }
 
 /// Runs `shape` against a uniformly-filled input and returns the real
-/// output pixels (same 16-byte-atomic read stride as conv_hw.rs's
-/// `run_uniform_conv` -- output_channels=1 still lands each pixel at a
-/// full atomic slot regardless of real channel count).
+/// output pixels (16-byte-atomic read stride, the same convention every
+/// hardware test in this crate uses -- output_channels=1 still lands each
+/// pixel at a full atomic slot regardless of real channel count).
 fn run_uniform_pooling(shape: &PoolingShape, input_fill: u8, num_output_pixels: usize) -> Vec<u8> {
     let file = OpenOptions::new()
         .read(true)
@@ -216,8 +217,8 @@ unsafe fn run_pooling(
         // dma_sync_sgtable_for_device() hand-off as every other buffer the
         // device touches, or the CPU's dirty cache line for it can race the
         // device's real write and win, silently clobbering the result back
-        // to zero. conv_hw.rs's known-good buf_c handling already does
-        // this; this file previously didn't.
+        // to zero. Every other output buffer in this crate's hardware tests
+        // already does this via fini_bo; this file previously didn't.
         fini_bo(fd, buf_out.handle).ok();
 
         let in_handles = [buf_cmd.handle, buf_in.handle];

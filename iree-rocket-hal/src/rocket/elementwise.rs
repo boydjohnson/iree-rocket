@@ -506,13 +506,12 @@ pub fn build_conv_then_add_regcmd(
     add: &EwAddShape,
     bufs: &ConvThenAddBuffers,
 ) -> (Vec<RegCmd>, Vec<RegCmd>) {
-    let mut conv_tasks =
-        ConvPlan::new(*conv_shape, kernels).programs_with_buffers(conv::Buffers {
-            input: bufs.input_addr,
-            weights: bufs.weights_addr,
-            bias: bufs.bias_addr,
-            output: bufs.intermediate_addr,
-        });
+    let mut conv_tasks = ConvPlan::new(*conv_shape, kernels).programs_with_buffers(conv::Buffers {
+        input: bufs.input_addr,
+        weights: bufs.weights_addr,
+        bias: bufs.bias_addr,
+        output: bufs.intermediate_addr,
+    });
     assert_eq!(
         conv_tasks.len(),
         1,
@@ -526,7 +525,10 @@ pub fn build_conv_then_add_regcmd(
     // already force it: this conv writes a real memory round-trip buffer for
     // a downstream task to read, and every other memory-writing conv task in
     // this crate kicks DPU_RDMA unconditionally.
-    push_kick(&mut conv_cmds, KICK_CNA | KICK_CORE | KICK_DPU | KICK_DPU_RDMA);
+    push_kick(
+        &mut conv_cmds,
+        KICK_CNA | KICK_CORE | KICK_DPU | KICK_DPU_RDMA,
+    );
 
     let add_cmds = build_add_regcmd(
         add,

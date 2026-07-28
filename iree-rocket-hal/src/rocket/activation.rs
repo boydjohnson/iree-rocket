@@ -36,8 +36,10 @@ use crate::rocket::{
 /// core, for conv/FC; only reachable on pooling paths that have a real DPU
 /// stage ahead of PPU).
 ///
-/// Hardware-validated (`iree-rocket-hal/tests/conv_activation_hw.rs`, real
-/// RK3588): BS's ALU-then-RELU-then-MUL bit ordering means this applies as
+/// Hardware-validated on real RK3588 (via a since-retired mesa-lineage-only
+/// test -- `conv.rs`'s own BN-stage fused activation is the production path
+/// now, hardware-validated separately by `conv_phase1_validation_hw.rs`):
+/// BS's ALU-then-RELU-then-MUL bit ordering means this applies as
 /// `relu(bias_add(x))`, the standard fusion order -- confirmed by `Relu`
 /// never decreasing output vs. `None` across a fill sweep, and `Relux`'s
 /// independent upper clamp confirmed by `cmp: 0` forcing constant output

@@ -2,18 +2,19 @@
 // doc comment for why) end-to-end test for the Conv2d ukernel, exercised
 // through the REAL public IREE HAL API, mirroring
 // pooling_dispatch_test.cc's structure. Two things this proves that
-// iree-rocket-hal/tests/conv_hw.rs and tests/conv_activation_hw.rs can't:
-// executable_cache.rs's tag-byte convention actually selects the right
-// conv::Shape (including the newly-added tag=2 for Precision::Fp16, see that
-// module's doc comment), and command_buffer.rs's Conv2d binding convention
-// (0=input, 1=weights, 2=bias, 3=output) wires correctly through the real
-// command-buffer/dispatch/queue_execute path -- iree-rocket-hal's own tests
-// only prove the regcmd+ioctl layer directly, bypassing this driver's HAL
-// vtables entirely.
+// iree-rocket-hal's own hand-rolled hardware tests (e.g.
+// conv_phase1_validation_hw.rs) can't: executable_cache.rs's tag-byte
+// convention actually selects the right conv::Shape (including the
+// newly-added tag=2 for Precision::Fp16, see that module's doc comment),
+// and command_buffer.rs's Conv2d binding convention (0=input, 1=weights,
+// 2=bias, 3=output) wires correctly through the real command-buffer/
+// dispatch/queue_execute path -- iree-rocket-hal's own tests only prove the
+// regcmd+ioctl layer directly, bypassing this driver's HAL vtables entirely.
 //
-// The fp16 exact-product check mirrors iree-rocket-hal's
-// tests/conv_hw.rs::conv_fp16_tracks_exact_product exactly (same
-// hardware-confirmed shape and operand pairs -- see that test and
+// The fp16 exact-product check mirrors iree-rocket-hal's former
+// tests/conv_hw.rs::conv_fp16_tracks_exact_product (since retired as
+// redundant with the crate's broader conv.rs hardware coverage; same
+// hardware-confirmed shape and operand pairs -- see
 // rknpu-spelunking's project_conv_dtype_coverage memory for the underlying
 // hardware investigation) -- the point here is confirming tag=2 threads
 // Precision::Fp16 correctly through this driver's own dispatch path, not
@@ -141,9 +142,9 @@ iree_hal_buffer_t* AllocateAndFill(iree_hal_device_t* device, iree_device_size_t
 }
 
 // Uniform u16-element fill -- the same "uniform fill sidesteps not knowing
-// the real per-pixel packing stride" trick iree-rocket-hal's
-// tests/conv_hw.rs::fill_u16 uses: every 2-byte slot (at whatever the real
-// pixel stride turns out to be) reads back this exact bit pattern, so it
+// the real per-pixel packing stride" trick this crate's hand-rolled hardware
+// tests use throughout: every 2-byte slot (at whatever the real pixel
+// stride turns out to be) reads back this exact bit pattern, so it
 // doesn't matter whether the hardware's real fp16 layout is dense or
 // atomic-padded.
 iree_hal_buffer_t* AllocateAndFillU16(iree_hal_device_t* device, iree_device_size_t size,
@@ -156,10 +157,9 @@ iree_hal_buffer_t* AllocateAndFillU16(iree_hal_device_t* device, iree_device_siz
   return AllocateAndFillBytes(device, size, data);
 }
 
-// Minimal IEEE-754 binary16 <-> f32 conversion, duplicated from
-// iree-rocket-hal's tests/conv_hw.rs rather than shared (same file-local
-// duplication convention that file itself already uses relative to
-// conv_activation_hw.rs).
+// Minimal IEEE-754 binary16 <-> f32 conversion, duplicated rather than
+// shared -- the same file-local duplication convention every one of
+// iree-rocket-hal's own hardware tests uses for this exact helper.
 float F16ToF32(uint16_t bits) {
   uint32_t sign = (bits >> 15) & 0x1;
   uint32_t exp = (bits >> 10) & 0x1f;
@@ -389,10 +389,8 @@ TEST(RocketConvDispatch, Fp16TracksExactProduct) {
     GTEST_SKIP() << "rocket device unavailable: " << error;
   }
 
-  // Same operand pairs as iree-rocket-hal's
-  // tests/conv_hw.rs::conv_fp16_tracks_exact_product -- chosen so both
-  // operands and their product are exactly fp16-representable, so this
-  // asserts exact equality, not a tolerance.
+  // Operand pairs chosen so both operands and their product are exactly
+  // fp16-representable, so this asserts exact equality, not a tolerance.
   struct Case {
     float input_fill;
     float weight_fill;
@@ -422,12 +420,11 @@ TEST(RocketConvDispatch, Int8DefaultShapeCompletes) {
   // nonzero real weights (see rknpu-spelunking's
   // project_conv_dtype_coverage memory -- the identity-weight
   // investigation), and this shape's zero_point=0 raw-encoding convention
-  // hasn't itself been independently confirmed against real hardware the
-  // way conv_with_add_hw.rs's 0x80-convention shape has. This test's only
-  // job is confirming tag=0 still dispatches successfully through the
-  // real HAL path after the Precision field was added to ConvShape --
-  // regcmd.rs's own hardware tests (conv_hw.rs, conv_precision_hw
-  // diagnostics) are where the numeric question itself is tracked.
+  // hasn't itself been independently confirmed against real hardware. This
+  // test's only job is confirming tag=0 still dispatches successfully
+  // through the real HAL path after the Precision field was added to
+  // ConvShape -- iree-rocket-hal's own conv.rs hardware tests are where the
+  // numeric question itself is tracked.
   constexpr iree_device_size_t kSize = 4096;
   iree_hal_buffer_t* input = AllocateAndFill(device, kSize, 200);
   iree_hal_buffer_t* weights = AllocateAndFill(device, kSize, 2);

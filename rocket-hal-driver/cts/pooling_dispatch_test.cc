@@ -6,8 +6,8 @@
 // executable_cache.rs's tag-byte convention, command_buffer.rs's Pooling
 // binding convention (0=input, 1=output), and device.rs's queue_execute
 // real-GEM-handle fix all wire together correctly end to end --
-// conv_hw.rs/pooling_hw.rs only prove the regcmd+ioctl layer in isolation,
-// bypassing this driver's HAL vtables entirely.
+// iree-rocket-hal's own hardware tests only prove the regcmd+ioctl layer in
+// isolation, bypassing this driver's HAL vtables entirely.
 //
 // Deliberately NOT using IREE's generic CTS harness (CtsRegistry /
 // CommandBufferDispatchTest) -- see backends.cc's module doc comment for

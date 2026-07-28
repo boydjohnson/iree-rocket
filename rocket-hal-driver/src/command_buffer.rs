@@ -188,9 +188,10 @@ pub enum RecordedOp {
         /// Previously only the regcmd program's own GEM buffer was listed
         /// there, which happened to let SUBMIT/PREP_BO round-trip (proving
         /// the ioctl plumbing itself worked) but never told the kernel
-        /// about the real input/weight/bias/output BOs at all -- see
-        /// `conv_hw.rs` in iree-rocket-hal for the hand-rolled ioctl call
-        /// that always did this correctly.
+        /// about the real input/weight/bias/output BOs at all -- see any
+        /// hand-rolled hardware test in iree-rocket-hal's `tests/`
+        /// directory (e.g. `conv_phase1_validation_hw.rs`) for the ioctl
+        /// call shape that always did this correctly.
         in_bo_handles: Vec<u32>,
         /// GEM handles of every buffer this dispatch writes.
         out_bo_handles: Vec<u32>,

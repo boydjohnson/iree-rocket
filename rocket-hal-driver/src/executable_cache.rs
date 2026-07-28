@@ -15,8 +15,7 @@
 //! iree-rocket-hal's `build_pooling_regcmd` module doc comment and
 //! `tests/pooling_hw.rs`/`tests/pooling_dispatch.rs`), `2` for
 //! `UkernelShape::Conv2d` again but with `Precision::Fp16` -- same
-//! geometry as tag `0`, matching iree-rocket-hal's `tests/conv_hw.rs`'s
-//! `fp16_shape()`, the shape round 7's hardware fix confirmed produces a
+//! geometry as tag `0`, the shape round 7's hardware fix confirmed produces a
 //! bit-exact-correct fp16 conv (see
 //! rknpu-spelunking's `project_conv_dtype_coverage` memory). Note tag `2`'s
 //! buffers are `u16`-element (2 bytes/pixel) fp16 data, not `u8` int8 --
@@ -392,9 +391,8 @@ unsafe extern "C" fn prepare_executable(
         2 => UkernelShape::Conv2d(Conv2dExecutable::new_static(
             conv::Shape {
                 // Same geometry as tag 0's validated int8 shape, but
-                // Precision::Fp16 -- matches iree-rocket-hal's
-                // tests/conv_hw.rs's fp16_shape(), hardware-confirmed
-                // bit-exact-correct (see module doc comment above).
+                // Precision::Fp16 -- hardware-confirmed bit-exact-correct
+                // (see module doc comment above).
                 width: 4,
                 height: 4,
                 stride: 1,

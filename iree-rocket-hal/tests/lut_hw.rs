@@ -17,15 +17,15 @@
 //! conv-then-LUT-activation pipeline (`build_conv_then_lut_regcmd`,
 //! `device::submit_tasks`'s multi-task job).
 //!
-//! Not run by a plain `cargo test` -- see `conv_hw.rs`'s doc comment for
-//! the cross-compile/copy-to-board workflow (same device, same pattern,
-//! just `--test lut_hw`).
+//! Not run by a plain `cargo test` -- see `conv_phase1_validation_hw.rs`'s
+//! doc comment for the cross-compile/copy-to-board workflow (same device,
+//! same pattern, just `--test lut_hw`).
 //!
 //! Genuinely unconfirmed going in, deliberately not assumed: what real
 //! accumulator range the fixed `x` domain (`[-16384, 16384]`, see
 //! `LutTable`'s doc comment) maps to for a placeholder `scale=1.0` shape
-//! like the one used here -- unlike `conv_activation_hw.rs`'s relu/relux
-//! tests (whose `cmp` clamp behavior is domain-independent at `cmp: 0`),
+//! like the one used here -- unlike fused `Relu`/`Relux`'s `cmp` clamp
+//! behavior (domain-independent at `cmp: 0`, see `conv_phase1_validation_hw.rs`),
 //! there's no equivalent domain-independent trick for a LUT lookup: it
 //! either lands inside the table's dynamic range for a given fill or it
 //! doesn't, so the fill sweep here is a *discovery* test, not a

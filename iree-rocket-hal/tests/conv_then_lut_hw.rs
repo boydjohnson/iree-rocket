@@ -6,8 +6,9 @@
 //! unlike `Relu`/`Relux` -- confirmed via live bpftrace tracing of the
 //! vendor runtime itself, `rknpu-spelunking/NOTES.md`).
 //!
-//! Not run by a plain `cargo test` -- see `conv_hw.rs`'s doc comment for the
-//! cross-compile-and-copy-to-the-board workflow; identical here:
+//! Not run by a plain `cargo test` -- see `conv_phase1_validation_hw.rs`'s
+//! doc comment for the cross-compile-and-copy-to-the-board workflow;
+//! identical here:
 //!
 //!   CARGO_TARGET_AARCH64_UNKNOWN_LINUX_GNU_LINKER=aarch64-linux-gnu-gcc \
 //!     cargo test --target aarch64-unknown-linux-gnu --release \
