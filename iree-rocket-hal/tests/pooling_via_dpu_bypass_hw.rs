@@ -31,45 +31,41 @@ use std::{fs::OpenOptions, mem, os::unix::io::AsRawFd, ptr};
 
 use iree_rocket_hal::rocket::{
     activation::Activation,
+    conv::{self, Kernels, Multiplier, Quantization},
     device::{Buffer, close_bo, fini_bo, prep_bo, submit},
-    mesa_conv::ConvShape,
     pooling::{
         PoolingMethod, PoolingPrecision, PoolingShape, PoolingViaBypassBuffers,
         build_pooling_via_dpu_bypass_regcmd,
     },
-    regcmd::Precision,
 };
 
 const DEVICE_PATH: &str = "/dev/accel/accel0";
 const TENSOR_SIZE: usize = 4096;
 
+/// 1x1 kernel, matching every `bypass_shape()` call in this file.
+const BYPASS_KERNELS: Kernels = [1, 1];
+
 /// Bypass stage: 4x4x1 -> 4x4x1, 1x1 kernel, stride 1 -- a real (if
 /// numerically arbitrary under uniform fill) CNA->CORE->DPU task sized to
 /// match the pooling stage's own 4x4 input, reusing the same safe (>=4)
 /// input_height this module's other hardware-validated conv shapes use
-/// (see `build_conv_cna_core_dpu_dpu_rdma`'s `input_height/4 - 1`
-/// underflow risk, documented in the roadmap plan's Phase 2 notes).
-fn bypass_shape() -> ConvShape {
-    ConvShape {
-        input_width: 4,
-        input_height: 4,
-        input_channels: 1,
-        output_width: 4,
-        output_height: 4,
-        output_channels: 1,
-        weights_width: 1,
-        weights_height: 1,
+/// (see conv.rs's own `input_height/4 - 1`-derived underflow risk,
+/// documented in the roadmap plan's Phase 2 notes).
+fn bypass_shape() -> conv::Shape {
+    conv::Shape {
+        width: 4,
+        height: 4,
         stride: 1,
+        in_channels: 1,
+        out_channels: 1,
+        precision: conv::Precision::Int8(Quantization {
+            input_zero_point: 0,
+            output_zero_point: 0,
+            multiplier: Multiplier::from_ratio(1.0),
+        }),
+        padding: Some([0, 0]),
+        activation: conv::Activation::None,
         depthwise: false,
-        input_zero_point: 0,
-        output_zero_point: 0,
-        weights_zero_point: 0,
-        input_scale: 1.0,
-        weights_scale: 1.0,
-        output_scale: 1.0,
-        truncate_bits: 0,
-        activation: Activation::None,
-        precision: Precision::Int8,
     }
 }
 
@@ -82,9 +78,9 @@ fn pooling_shape(method: PoolingMethod) -> PoolingShape {
 
 /// Same geometry as `pooling_shape`, with an explicit fused activation --
 /// Phase 3 of the ukernel roadmap. `build_pooling_via_dpu_bypass_regcmd`
-/// applies this to the bypass conv stage's BS core (see its own doc
-/// comment); `pooling_shape`'s `activation: Activation::None` above is just
-/// the common case of this with `None`.
+/// applies this to the bypass conv stage's own fused-activation stage (see
+/// its own doc comment); `pooling_shape`'s `activation: Activation::None`
+/// above is just the common case of this with `None`.
 fn pooling_shape_with_activation(method: PoolingMethod, activation: Activation) -> PoolingShape {
     PoolingShape {
         input_width: 4,
@@ -204,8 +200,8 @@ fn run_uniform_pooling_via_bypass(
 
 /// Same as `run_uniform_pooling_via_bypass`, with an explicit fused
 /// activation on the pooling op (Phase 3, applied to the bypass conv
-/// stage's BS core by `build_pooling_via_dpu_bypass_regcmd`) instead of
-/// always `None`.
+/// stage's own fused-activation stage by `build_pooling_via_dpu_bypass_regcmd`)
+/// instead of always `None`.
 fn run_uniform_pooling_via_bypass_with_activation(
     method: PoolingMethod,
     input_fill: u8,
@@ -227,7 +223,7 @@ fn run_uniform_pooling_via_bypass_with_activation(
     pixels
 }
 
-unsafe fn run_two_stage(b: &Bufs, bypass: &ConvShape, pooling: &PoolingShape) {
+unsafe fn run_two_stage(b: &Bufs, bypass: &conv::Shape, pooling: &PoolingShape) {
     unsafe {
         let bufs = PoolingViaBypassBuffers {
             input_addr: b.buf_in.dma_address,
@@ -237,7 +233,7 @@ unsafe fn run_two_stage(b: &Bufs, bypass: &ConvShape, pooling: &PoolingShape) {
             output_addr: b.buf_out.dma_address,
         };
         let (bypass_cmds, pooling_cmds) =
-            build_pooling_via_dpu_bypass_regcmd(bypass, pooling, &bufs);
+            build_pooling_via_dpu_bypass_regcmd(bypass, BYPASS_KERNELS, pooling, &bufs);
 
         // Stage 1: submit and fully wait for the bypass conv to finish
         // writing buf_mid before touching stage 2 at all.
@@ -415,12 +411,21 @@ fn pooling_via_bypass_repeat_dispatch_dump() {
 /// has a real DPU stage ahead of PPU (this bypass path). Same
 /// domain-independent proof `conv_activation_hw.rs`'s
 /// `conv_3x3_relux_cmp_zero_forces_constant_output` used for conv: `cmp: 0`
-/// clamps to 0 in any numeric scale, so if the bypass stage's BS core is
-/// really applying `pooling_shape.activation` (not silently dropping it),
+/// clamps to 0 in any numeric scale, so if the bypass stage is really
+/// applying `pooling_shape.activation` (not silently dropping it),
 /// every input_fill should read back as the same constant regardless of
 /// what the un-clamped value would have been -- proves the fusion wiring
 /// without needing to know this suite's real (placeholder scale=1.0)
 /// numeric domain, same caveat as conv's own `cmp` open question.
+///
+/// The bypass stage's conv now goes through `conv.rs`'s capture-derived
+/// builder rather than `mesa_conv`'s, which fuses activation via the BN
+/// stage instead of BS (see `pooling.rs`'s own doc comment on
+/// `build_pooling_via_dpu_bypass_regcmd`) -- `cmp: 0` clamping to a
+/// constant zero is domain- and stage-invariant, so this specific test
+/// still proves the fusion wiring works, but a real hardware run after
+/// this migration is the first one to exercise BN-stage fusion in this
+/// exact bypass-then-pool composition.
 #[test]
 #[ignore = "needs the real NPU device -- cross-compile for aarch64, copy to the board, run there"]
 fn pooling_via_bypass_relux_cmp_zero_forces_constant_output() {
@@ -443,7 +448,7 @@ fn pooling_via_bypass_relux_cmp_zero_forces_constant_output() {
         outputs.iter().all(|&o| o == outputs[0]),
         "Relux{{cmp: 0}} should force the same constant output regardless of input_fill \
          in any numeric domain, but got {outputs:?} across fills [0,50,100,150,200,255] -- \
-         fused activation on the bypass stage isn't reaching the BS core, or \
-         pooling_shape.activation isn't being applied to it"
+         fused activation on the bypass stage isn't being applied, or \
+         pooling_shape.activation isn't reaching it"
     );
 }

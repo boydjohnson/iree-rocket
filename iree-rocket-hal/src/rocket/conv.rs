@@ -840,6 +840,27 @@ impl Shape {
         self.out_channels.next_multiple_of(granule).max(granule)
     }
 
+    /// Conservative physical output allocation for this convolution, in
+    /// bytes.
+    ///
+    /// The DPU writes output in 16-byte feature-atomic surfaces and programs
+    /// the atomically-rounded [`Shape::padded_out_channels`] count rather
+    /// than the logical one, so this allocates enough complete surfaces for
+    /// that padded count -- mirrors `mesa_conv::conv_output_scratch_bytes`'s
+    /// formula against this capture-derived shape instead. Tiling-agnostic:
+    /// [`ConvPlan`]'s row/column tiles are sub-ranges of this same total
+    /// buffer, addressed via [`relocate`]'s per-tile offsets, so callers need
+    /// only this one size regardless of how many tiles a shape plans into.
+    pub fn output_scratch_bytes(&self, kernels: Kernels) -> usize {
+        let channel_bytes =
+            self.padded_out_channels() as usize * self.precision.element_bytes() as usize;
+        let surface_count = channel_bytes.div_ceil(FEATURE_ATOM_BYTES as usize);
+        self.output_width(kernels) as usize
+            * self.output_height(kernels) as usize
+            * surface_count
+            * FEATURE_ATOM_BYTES as usize
+    }
+
     /// Bytes of fp16 coefficients the whole kernel set occupies.
     ///
     /// `weight_channels * kh * kw * Cout * 2`, which reproduces

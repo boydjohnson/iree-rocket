@@ -26,6 +26,7 @@
 use crate::rocket::{
     activation::Activation,
     builders::{Bits, RegCmd, Register, ppu::*, ppu_rdma::*},
+    conv::{self, Activation as ConvActivation, ConvPlan, Kernels},
     mesa_conv::{
         ConvBuffers, ConvShape, build_conv_cna_core_dpu_dpu_rdma, require_single_conv_task,
     },
@@ -806,14 +807,18 @@ pub struct PoolingViaBypassBuffers {
 /// `bufs.bypass_output_addr`'s buffer) before `submit()`ing stage 2 --
 /// exactly like two ordinary, separately-fenced dispatches.
 pub fn build_pooling_via_dpu_bypass_regcmd(
-    bypass_shape: &ConvShape,
+    bypass_shape: &conv::Shape,
+    bypass_kernels: Kernels,
     pooling_shape: &PoolingShape,
     bufs: &PoolingViaBypassBuffers,
 ) -> (Vec<RegCmd>, Vec<RegCmd>) {
     pooling_shape.validate();
+    let bypass_precision = match bypass_shape.precision {
+        conv::Precision::Fp16 => PoolingPrecision::Fp16,
+        conv::Precision::Int8(_) => PoolingPrecision::Int8,
+    };
     assert_eq!(
-        pooling_shape.precision,
-        PoolingPrecision::from_mesa_precision(bypass_shape.precision),
+        pooling_shape.precision, bypass_precision,
         "pooling precision must match the DPU bypass output precision"
     );
     assert!(
@@ -823,38 +828,55 @@ pub fn build_pooling_via_dpu_bypass_regcmd(
         bufs.bypass_output_addr
     );
     assert!(
-        matches!(bypass_shape.activation, Activation::None),
+        matches!(bypass_shape.activation, ConvActivation::None),
         "build_pooling_via_dpu_bypass_regcmd: bypass_shape.activation must be None -- \
          fused activation for this pooling path is expressed on `pooling_shape.activation` \
          (the op's own logical shape), not on the internal near-identity bypass conv shape, \
          so there's one canonical place a caller/HAL layer needs to set it. This function \
-         applies `pooling_shape.activation` to the bypass stage's BS core itself."
+         applies `pooling_shape.activation` to the bypass stage's own fused-activation stage."
     );
-    // Phase 3: the bypass stage is the only real DPU (BS-core) instance in
-    // this pooling path, so fused activation rides on it exactly like
-    // Phase 1's conv activation -- same enum, same BS-core fusion point,
-    // already hardware-validated for conv. Only the `activation` field is
-    // overridden here; every other geometry/quant field comes from the
-    // caller-supplied `bypass_shape` unchanged.
-    let bypass_shape_with_activation = ConvShape {
-        activation: pooling_shape.activation,
+    // The bypass stage is the only real DPU instance in this pooling path,
+    // so fused activation rides on it, same as Phase 1's conv activation.
+    // Only the `activation` field is overridden here; every other
+    // geometry/quant field comes from the caller-supplied `bypass_shape`
+    // unchanged. `conv::Activation` fuses through the BN stage (see that
+    // type's own doc comment) rather than mesa_conv's BS stage -- a
+    // different port of the same hardware, not yet independently
+    // hardware-validated in this specific bypass-then-pool composition
+    // (only `cmp: 0`, which clamps to a constant zero regardless of which
+    // stage or numeric domain applies it, has real hardware behind it here
+    // -- see `pooling_via_bypass_relux_cmp_zero_forces_constant_output`).
+    let bypass_activation = match pooling_shape.activation {
+        Activation::None => ConvActivation::None,
+        Activation::Relu => ConvActivation::Relu,
+        Activation::Relux { cmp } => ConvActivation::Clamped { cmp },
+    };
+    let bypass_shape_with_activation = conv::Shape {
+        activation: bypass_activation,
         ..*bypass_shape
     };
 
     // Stage 1: real (near-identity) CNA->CORE->DPU task, output to memory.
-    let bypass_task = require_single_conv_task(&bypass_shape_with_activation);
-    let mut bypass_cmds = build_conv_cna_core_dpu_dpu_rdma(
-        &bypass_shape_with_activation,
-        &ConvBuffers {
-            input_addr: bufs.input_addr,
-            weights_addr: bufs.weights_addr,
-            bias_addr: bufs.bias_addr,
-            output_addr: bufs.bypass_output_addr,
-        },
-        &bypass_task,
-        2, // outside/memory, matching the real capture
-        None,
+    // conv.rs's tile builder always programs DPU_FEATURE_MODE_CFG.output_mode
+    // as external-memory (never on-chip dpu_flyin), which matches this
+    // stage's own `2` (outside/memory) exactly -- see build_conv_then_
+    // pooling_regcmd below for the on-chip-routed case conv.rs can't
+    // express, which is why that function stays on mesa_conv.
+    let mut bypass_tasks = ConvPlan::new(bypass_shape_with_activation, bypass_kernels)
+        .programs_with_buffers(conv::Buffers {
+            input: bufs.input_addr,
+            weights: bufs.weights_addr,
+            bias: bufs.bias_addr,
+            output: bufs.bypass_output_addr,
+        });
+    assert_eq!(
+        bypass_tasks.len(),
+        1,
+        "build_pooling_via_dpu_bypass_regcmd: bypass conv requires {} CBUF height splits; \
+         not supported by this single-task pooling path",
+        bypass_tasks.len()
     );
+    let mut bypass_cmds = bypass_tasks.remove(0);
     // KICK_DPU_RDMA included despite the real vendor capture's kick reading
     // 0x0d (no DPU_RDMA bit) -- hardware evidence from the two-submit fix
     // above overrides that reading: even with genuinely separate
@@ -1233,7 +1255,8 @@ pub fn build_conv_then_pooling_regcmd(
 /// confirms the PAIRED-STAGE SHAPE generalizes, not any particular
 /// tiling algorithm (see this section's module doc comment).
 pub struct MaxReductionStage {
-    pub bypass_shape: ConvShape,
+    pub bypass_shape: conv::Shape,
+    pub bypass_kernels: Kernels,
     pub pooling_shape: PoolingShape,
 }
 
@@ -1279,6 +1302,7 @@ pub fn build_max_reduction_tree_regcmd(
         .map(|(stage, buf)| {
             build_pooling_via_dpu_bypass_regcmd(
                 &stage.bypass_shape,
+                stage.bypass_kernels,
                 &stage.pooling_shape,
                 &PoolingViaBypassBuffers {
                     input_addr: buf.bypass_input_addr,

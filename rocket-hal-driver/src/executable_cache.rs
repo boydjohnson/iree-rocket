@@ -29,16 +29,17 @@
 //! **Tag `3` is different: it's the first tag backed by a real, versioned
 //! wire format** (`iree_rocket_hal::rocket::executable_format`, see that
 //! module's own doc comment for the exact byte layout) -- the rest of
-//! `executable_data` after the tag byte is decoded into a real `ConvShape`
-//! via `decode_conv_shape_v1`, then checked via `validate_conv_shape`. This
-//! is real prep for a genuine IREE compiler `TargetBackend` (a separate,
-//! not-yet-written C++ project) to eventually emit: unlike tags `0`-`2`,
-//! this path is fallible -- malformed or unsupported bytes return a real
-//! `IREE_STATUS_INVALID_ARGUMENT`, not a silent fallback to some other
-//! hardcoded shape. Note this validation is deliberately not exhaustive of
-//! every panic reachable from `build_conv_regcmd` -- see
-//! `command_buffer.rs`'s `catch_unwind` wrapper around that call for the
-//! backstop covering whatever gap remains.
+//! `executable_data` after the tag byte is decoded into a real
+//! `conv::Shape` + kernel extent via `decode_conv_shape_v1`, then checked
+//! via `validate_conv_shape`. This is real prep for a genuine IREE compiler
+//! `TargetBackend` (a separate, not-yet-written C++ project) to eventually
+//! emit: unlike tags `0`-`2`, this path is fallible -- malformed or
+//! unsupported bytes return a real `IREE_STATUS_INVALID_ARGUMENT`, not a
+//! silent fallback to some other hardcoded shape. `validate_conv_shape`
+//! shares its construction path with the real dispatch-time builder (see
+//! that function's own doc comment), so `command_buffer.rs`'s
+//! `catch_unwind` wrapper around the real build is now pure defense in
+//! depth rather than a backstop for a known validation gap.
 
 use crate::{
     bindings::{
@@ -50,11 +51,11 @@ use crate::{
     status,
 };
 use iree_rocket_hal::rocket::{
-    activation::Activation,
+    activation::Activation as PoolingActivation,
+    conv::{self, Activation, Kernels, Multiplier, Precision, Quantization},
     executable_format::{CONV2D_V1_TAG, decode_conv_shape_v1, validate_conv_shape},
-    mesa_conv::{ConvShape, FcShape, fc_as_conv_shape},
+    fc,
     pooling::{PoolingMethod, PoolingPrecision, PoolingShape},
-    regcmd::Precision,
 };
 use rocket_schema::rocket as schema;
 
@@ -69,16 +70,39 @@ fn decode_activation(
     match activation {
         schema::Activation::NONE => Ok(Activation::None),
         schema::Activation::RELU => Ok(Activation::Relu),
-        schema::Activation::RELUX => Ok(Activation::Relux {
+        schema::Activation::RELUX => Ok(Activation::Clamped {
             cmp: activation_cmp,
         }),
         _ => Err(()),
     }
 }
 
-fn decode_precision(precision: schema::Precision) -> Result<Precision, ()> {
+/// Builds a [`conv::Precision`] from the schema's tag plus the surrounding
+/// zero-point/scale fields (RKT1's `Conv2DDef`/`FullyConnectedDef` carry
+/// these as separate fields, unlike `conv::Precision::Int8`'s own
+/// `Quantization` payload). `Multiplier::from_ratio` can panic on a ratio
+/// its normalized fixed-point form can't encode -- wrapped in `catch_unwind`
+/// so a malformed but structurally valid FlatBuffer produces a clean decode
+/// error instead of aborting the process at this `extern "C"` boundary.
+fn decode_precision(
+    precision: schema::Precision,
+    input_zero_point: u32,
+    output_zero_point: u32,
+    input_scale: f32,
+    weights_scale: f32,
+    output_scale: f32,
+) -> Result<Precision, ()> {
     match precision {
-        schema::Precision::INT8 => Ok(Precision::Int8),
+        schema::Precision::INT8 => {
+            let ratio = f64::from(input_scale) * f64::from(weights_scale) / f64::from(output_scale);
+            let multiplier =
+                std::panic::catch_unwind(|| Multiplier::from_ratio(ratio)).map_err(|_| ())?;
+            Ok(Precision::Int8(Quantization {
+                input_zero_point: input_zero_point as i32,
+                output_zero_point: output_zero_point as i32,
+                multiplier,
+            }))
+        }
         schema::Precision::FP16 => Ok(Precision::Fp16),
         _ => Err(()),
     }
@@ -112,30 +136,36 @@ fn decode_flatbuffer_shape(data: &[u8]) -> Result<UkernelShape, ()> {
     let export = exports.get(0);
     match export.kernel_type() {
         schema::KernelDef::Conv2DDef => {
-            let conv = export.kernel_as_conv_2ddef().ok_or(())?;
-            let shape_template = ConvShape {
-                input_width: conv.input_width(),
-                input_height: conv.input_height(),
-                input_channels: conv.input_channels(),
-                output_width: conv.output_width(),
-                output_height: conv.output_height(),
-                output_channels: conv.output_channels(),
-                weights_width: conv.weights_width(),
-                weights_height: conv.weights_height(),
-                stride: conv.stride(),
-                depthwise: conv.depthwise(),
-                input_zero_point: conv.input_zero_point(),
-                output_zero_point: conv.output_zero_point(),
-                weights_zero_point: conv.weights_zero_point(),
-                input_scale: conv.input_scale(),
-                weights_scale: conv.weights_scale(),
-                output_scale: conv.output_scale(),
-                truncate_bits: conv.truncate_bits(),
-                activation: decode_activation(conv.activation(), conv.activation_cmp())?,
-                precision: decode_precision(conv.precision())?,
+            let conv_def = export.kernel_as_conv_2ddef().ok_or(())?;
+            let precision = decode_precision(
+                conv_def.precision(),
+                conv_def.input_zero_point(),
+                conv_def.output_zero_point(),
+                conv_def.input_scale(),
+                conv_def.weights_scale(),
+                conv_def.output_scale(),
+            )?;
+            // RKT1 has no padding field -- explicit zero padding preserves
+            // its existing valid-convolution-only semantics exactly (see
+            // executable_format.rs's decode_conv_shape_v1 doc comment for
+            // the same convention on the legacy tag-byte wire format).
+            let shape_template = conv::Shape {
+                width: conv_def.input_width(),
+                height: conv_def.input_height(),
+                stride: conv_def.stride(),
+                in_channels: conv_def.input_channels(),
+                out_channels: conv_def.output_channels(),
+                precision,
+                padding: Some([0, 0]),
+                activation: decode_activation(conv_def.activation(), conv_def.activation_cmp())?,
+                depthwise: conv_def.depthwise(),
             };
+            let kernels: Kernels = [
+                conv_def.weights_height() as usize,
+                conv_def.weights_width() as usize,
+            ];
             let mut runtime_dimensions = Vec::new();
-            if let Some(dimensions) = conv.runtime_dimensions() {
+            if let Some(dimensions) = conv_def.runtime_dimensions() {
                 for index in 0..dimensions.len() {
                     runtime_dimensions.push(match dimensions.get(index) {
                         schema::Conv2DDimension::INPUT_WIDTH => RuntimeConv2dDimension::InputWidth,
@@ -144,12 +174,6 @@ fn decode_flatbuffer_shape(data: &[u8]) -> Result<UkernelShape, ()> {
                         }
                         schema::Conv2DDimension::INPUT_CHANNELS => {
                             RuntimeConv2dDimension::InputChannels
-                        }
-                        schema::Conv2DDimension::OUTPUT_WIDTH => {
-                            RuntimeConv2dDimension::OutputWidth
-                        }
-                        schema::Conv2DDimension::OUTPUT_HEIGHT => {
-                            RuntimeConv2dDimension::OutputHeight
                         }
                         schema::Conv2DDimension::OUTPUT_CHANNELS => {
                             RuntimeConv2dDimension::OutputChannels
@@ -160,37 +184,51 @@ fn decode_flatbuffer_shape(data: &[u8]) -> Result<UkernelShape, ()> {
                         schema::Conv2DDimension::WEIGHTS_HEIGHT => {
                             RuntimeConv2dDimension::WeightsHeight
                         }
+                        // OUTPUT_WIDTH/OUTPUT_HEIGHT are legal RKT1 enum
+                        // values but no longer map to a settable dimension
+                        // -- conv::Shape always derives them from the other
+                        // five plus stride/padding, see
+                        // RuntimeConv2dDimension's own doc comment.
                         _ => return Err(()),
                     });
                 }
             }
             let executable = Conv2dExecutable {
                 shape_template,
+                kernels,
                 runtime_dimensions,
             };
             executable.validate_template().map_err(|_| ())?;
             Ok(UkernelShape::Conv2d(executable))
         }
         schema::KernelDef::FullyConnectedDef => {
-            let fc = export.kernel_as_fully_connected_def().ok_or(())?;
-            if fc.m() == 0 || fc.k() == 0 || fc.n() == 0 {
+            let fc_def = export.kernel_as_fully_connected_def().ok_or(())?;
+            if fc_def.m() == 0 || fc_def.k() == 0 || fc_def.n() == 0 {
                 return Err(());
             }
-            let shape = FcShape {
-                m: fc.m(),
-                k: fc.k(),
-                n: fc.n(),
-                input_zero_point: fc.input_zero_point(),
-                output_zero_point: fc.output_zero_point(),
-                weights_zero_point: fc.weights_zero_point(),
-                input_scale: fc.input_scale(),
-                weights_scale: fc.weights_scale(),
-                output_scale: fc.output_scale(),
-                truncate_bits: fc.truncate_bits(),
-                activation: decode_activation(fc.activation(), fc.activation_cmp())?,
-                precision: decode_precision(fc.precision())?,
-            };
-            validate_conv_shape(&fc_as_conv_shape(&shape)).map_err(|_| ())?;
+            let precision = decode_precision(
+                fc_def.precision(),
+                fc_def.input_zero_point(),
+                fc_def.output_zero_point(),
+                fc_def.input_scale(),
+                fc_def.weights_scale(),
+                fc_def.output_scale(),
+            )?;
+            let activation = decode_activation(fc_def.activation(), fc_def.activation_cmp())?;
+            // fc::Shape::new validates against conv.rs's own capture-backed
+            // bounds internally and panics on an unsupported shape --
+            // caught here for the same reason as decode_precision's
+            // Multiplier::from_ratio above.
+            let shape = std::panic::catch_unwind(|| {
+                fc::Shape::new(fc_def.m(), fc_def.k(), fc_def.n(), precision)
+                    .with_activation(activation)
+            })
+            .map_err(|_| ())?;
+            // fc::Shape::new only re-checks Shape::with_precision's own
+            // constructor bounds -- validate_conv_shape additionally
+            // trial-plans through ConvPlan::new, the same deeper gate the
+            // tag=3 wire format goes through.
+            validate_conv_shape(&shape.as_conv_shape(), fc::KERNELS).map_err(|_| ())?;
             Ok(UkernelShape::FullyConnected(shape))
         }
         _ => Err(()),
@@ -306,22 +344,22 @@ unsafe extern "C" fn prepare_executable(
         } else {
             &[]
         };
-        let shape = match decode_conv_shape_v1(payload) {
-            Ok(shape) => shape,
+        let (shape, kernels) = match decode_conv_shape_v1(payload) {
+            Ok(decoded) => decoded,
             Err(_) => {
                 return status::from_code(
                     crate::bindings::iree_status_code_e_IREE_STATUS_INVALID_ARGUMENT,
                 );
             }
         };
-        if validate_conv_shape(&shape).is_err() {
+        if validate_conv_shape(&shape, kernels).is_err() {
             return status::from_code(
                 crate::bindings::iree_status_code_e_IREE_STATUS_INVALID_ARGUMENT,
             );
         }
         unsafe {
             *out_executable = crate::executable::create(UkernelShape::Conv2d(
-                Conv2dExecutable::new_static(shape),
+                Conv2dExecutable::new_static(shape, kernels),
             ));
         }
         return status::ok();
@@ -349,55 +387,45 @@ unsafe extern "C" fn prepare_executable(
             pad_right: 0,
             pad_bottom: 0,
             pad_value: 0,
-            activation: Activation::None,
+            activation: PoolingActivation::None,
         }),
-        2 => UkernelShape::Conv2d(Conv2dExecutable::new_static(ConvShape {
-            // Same geometry as tag 0's validated int8 shape, but
-            // Precision::Fp16 -- matches iree-rocket-hal's
-            // tests/conv_hw.rs's fp16_shape(), hardware-confirmed
-            // bit-exact-correct (see module doc comment above).
-            input_width: 4,
-            input_height: 4,
-            input_channels: 1,
-            output_width: 4,
-            output_height: 4,
-            output_channels: 1,
-            weights_width: 1,
-            weights_height: 1,
-            stride: 1,
-            depthwise: false,
-            input_zero_point: 0,
-            output_zero_point: 0,
-            weights_zero_point: 0,
-            input_scale: 1.0,
-            weights_scale: 1.0,
-            output_scale: 1.0,
-            truncate_bits: 0,
-            activation: Activation::None,
-            precision: Precision::Fp16,
-        })),
-        _ => UkernelShape::Conv2d(Conv2dExecutable::new_static(ConvShape {
-            // rkt-basic.rs's validated shape (see module doc comment).
-            input_width: 4,
-            input_height: 4,
-            input_channels: 1,
-            output_width: 4,
-            output_height: 4,
-            output_channels: 1,
-            weights_width: 1,
-            weights_height: 1,
-            stride: 1,
-            depthwise: false,
-            input_zero_point: 0,
-            output_zero_point: 0,
-            weights_zero_point: 0,
-            input_scale: 1.0,
-            weights_scale: 1.0,
-            output_scale: 1.0,
-            truncate_bits: 0,
-            activation: Activation::None,
-            precision: Precision::Int8,
-        })),
+        2 => UkernelShape::Conv2d(Conv2dExecutable::new_static(
+            conv::Shape {
+                // Same geometry as tag 0's validated int8 shape, but
+                // Precision::Fp16 -- matches iree-rocket-hal's
+                // tests/conv_hw.rs's fp16_shape(), hardware-confirmed
+                // bit-exact-correct (see module doc comment above).
+                width: 4,
+                height: 4,
+                stride: 1,
+                in_channels: 1,
+                out_channels: 1,
+                precision: Precision::Fp16,
+                padding: Some([0, 0]),
+                activation: Activation::None,
+                depthwise: false,
+            },
+            [1, 1],
+        )),
+        _ => UkernelShape::Conv2d(Conv2dExecutable::new_static(
+            conv::Shape {
+                // rkt-basic.rs's validated shape (see module doc comment).
+                width: 4,
+                height: 4,
+                stride: 1,
+                in_channels: 1,
+                out_channels: 1,
+                precision: Precision::Int8(Quantization {
+                    input_zero_point: 0,
+                    output_zero_point: 0,
+                    multiplier: Multiplier::from_ratio(1.0),
+                }),
+                padding: Some([0, 0]),
+                activation: Activation::None,
+                depthwise: false,
+            },
+            [1, 1],
+        )),
     };
     unsafe {
         *out_executable = crate::executable::create(shape);
@@ -510,16 +538,17 @@ mod tests {
             "/../rocket-schema/testdata/mnv2_conv0.rkt1"
         ));
         let shape = decode_flatbuffer_shape(data).unwrap();
-        let UkernelShape::Conv2d(shape) = shape else {
+        let UkernelShape::Conv2d(executable) = shape else {
             panic!("expected Conv2d");
         };
-        let shape = shape.shape_template;
-        assert_eq!(shape.input_width, 112);
-        assert_eq!(shape.input_height, 112);
-        assert_eq!(shape.input_channels, 32);
-        assert_eq!(shape.output_width, 112);
-        assert_eq!(shape.output_height, 112);
-        assert_eq!(shape.output_channels, 16);
+        let shape = executable.shape_template;
+        let kernels = executable.kernels;
+        assert_eq!(shape.width, 112);
+        assert_eq!(shape.height, 112);
+        assert_eq!(shape.in_channels, 32);
+        assert_eq!(shape.output_width(kernels), 112);
+        assert_eq!(shape.output_height(kernels), 112);
+        assert_eq!(shape.out_channels, 16);
         assert_eq!(shape.precision, Precision::Fp16);
     }
 
@@ -529,21 +558,22 @@ mod tests {
             &[
                 schema::Conv2DDimension::INPUT_HEIGHT,
                 schema::Conv2DDimension::INPUT_WIDTH,
-                schema::Conv2DDimension::OUTPUT_HEIGHT,
-                schema::Conv2DDimension::OUTPUT_WIDTH,
             ],
             0,
         );
         let UkernelShape::Conv2d(executable) = decode_flatbuffer_shape(&data).unwrap() else {
             panic!("expected Conv2d");
         };
-        let constants: Vec<u8> = [112u32, 96, 112, 96]
+        let constants: Vec<u8> = [112u32, 96]
             .into_iter()
             .flat_map(u32::to_ne_bytes)
             .collect();
-        let shape = executable.resolve_shape(&constants).unwrap();
-        assert_eq!((shape.input_width, shape.input_height), (96, 112));
-        assert_eq!((shape.output_width, shape.output_height), (96, 112));
+        let (shape, kernels) = executable.resolve_shape(&constants).unwrap();
+        assert_eq!((shape.width, shape.height), (96, 112));
+        assert_eq!(
+            (shape.output_width(kernels), shape.output_height(kernels)),
+            (96, 112)
+        );
     }
 
     #[test]
@@ -553,8 +583,6 @@ mod tests {
                 schema::Conv2DDimension::INPUT_WIDTH,
                 schema::Conv2DDimension::INPUT_WIDTH,
                 schema::Conv2DDimension::INPUT_HEIGHT,
-                schema::Conv2DDimension::OUTPUT_WIDTH,
-                schema::Conv2DDimension::OUTPUT_HEIGHT,
             ],
             0,
         );
@@ -564,19 +592,28 @@ mod tests {
             &[
                 schema::Conv2DDimension(99),
                 schema::Conv2DDimension::INPUT_HEIGHT,
-                schema::Conv2DDimension::OUTPUT_WIDTH,
-                schema::Conv2DDimension::OUTPUT_HEIGHT,
             ],
             0,
         );
         assert!(decode_flatbuffer_shape(&unknown).is_err());
 
-        let nonzero_template = encode_dynamic_conv_executable(
+        // OUTPUT_WIDTH/OUTPUT_HEIGHT are legal RKT1 enum values but no
+        // longer map to a settable RuntimeConv2dDimension -- conv::Shape
+        // always derives them, see that enum's own doc comment.
+        let unsupported_output_dimension = encode_dynamic_conv_executable(
             &[
                 schema::Conv2DDimension::INPUT_WIDTH,
                 schema::Conv2DDimension::INPUT_HEIGHT,
                 schema::Conv2DDimension::OUTPUT_WIDTH,
-                schema::Conv2DDimension::OUTPUT_HEIGHT,
+            ],
+            0,
+        );
+        assert!(decode_flatbuffer_shape(&unsupported_output_dimension).is_err());
+
+        let nonzero_template = encode_dynamic_conv_executable(
+            &[
+                schema::Conv2DDimension::INPUT_WIDTH,
+                schema::Conv2DDimension::INPUT_HEIGHT,
             ],
             96,
         );
