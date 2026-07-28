@@ -144,10 +144,6 @@ fn decode_flatbuffer_shape(data: &[u8]) -> Result<UkernelShape, ()> {
                 conv_def.weights_scale(),
                 conv_def.output_scale(),
             )?;
-            // RKT1 has no padding field -- explicit zero padding preserves
-            // its existing valid-convolution-only semantics exactly (see
-            // executable_format.rs's decode_conv_shape_v1 doc comment for
-            // the same convention on the legacy tag-byte wire format).
             let shape_template = conv::Shape {
                 width: conv_def.input_width(),
                 height: conv_def.input_height(),
@@ -155,7 +151,7 @@ fn decode_flatbuffer_shape(data: &[u8]) -> Result<UkernelShape, ()> {
                 in_channels: conv_def.input_channels(),
                 out_channels: conv_def.output_channels(),
                 precision,
-                padding: Some([0, 0]),
+                padding: Some([conv_def.pad_top() as usize, conv_def.pad_left() as usize]),
                 activation: decode_activation(conv_def.activation(), conv_def.activation_cmp())?,
                 depthwise: conv_def.depthwise(),
             };
@@ -483,6 +479,7 @@ mod tests {
     fn encode_dynamic_conv_executable(
         dimensions: &[schema::Conv2DDimension],
         input_width: u32,
+        padding: [u32; 2],
     ) -> Vec<u8> {
         let mut builder = flatbuffers::FlatBufferBuilder::new();
         let runtime_dimensions = builder.create_vector(dimensions);
@@ -496,11 +493,13 @@ mod tests {
                 output_width: 0,
                 output_height: 0,
                 output_channels: 16,
-                weights_width: 1,
-                weights_height: 1,
+                weights_width: 5,
+                weights_height: 3,
                 stride: 1,
                 precision: schema::Precision::FP16,
                 runtime_dimensions: Some(runtime_dimensions),
+                pad_top: padding[0],
+                pad_left: padding[1],
                 ..Default::default()
             },
         );
@@ -558,6 +557,7 @@ mod tests {
                 schema::Conv2DDimension::INPUT_WIDTH,
             ],
             0,
+            [0, 1],
         );
         let UkernelShape::Conv2d(executable) = decode_flatbuffer_shape(&data).unwrap() else {
             panic!("expected Conv2d");
@@ -570,8 +570,9 @@ mod tests {
         assert_eq!((shape.width, shape.height), (96, 112));
         assert_eq!(
             (shape.output_width(kernels), shape.output_height(kernels)),
-            (96, 112)
+            (94, 110)
         );
+        assert_eq!(shape.padding, Some([0, 1]));
     }
 
     #[test]
@@ -583,6 +584,7 @@ mod tests {
                 schema::Conv2DDimension::INPUT_HEIGHT,
             ],
             0,
+            [0, 0],
         );
         assert!(decode_flatbuffer_shape(&duplicate).is_err());
 
@@ -592,6 +594,7 @@ mod tests {
                 schema::Conv2DDimension::INPUT_HEIGHT,
             ],
             0,
+            [0, 0],
         );
         assert!(decode_flatbuffer_shape(&unknown).is_err());
 
@@ -605,6 +608,7 @@ mod tests {
                 schema::Conv2DDimension::OUTPUT_WIDTH,
             ],
             0,
+            [0, 0],
         );
         assert!(decode_flatbuffer_shape(&unsupported_output_dimension).is_err());
 
@@ -614,6 +618,7 @@ mod tests {
                 schema::Conv2DDimension::INPUT_HEIGHT,
             ],
             96,
+            [0, 0],
         );
         assert!(decode_flatbuffer_shape(&nonzero_template).is_err());
     }

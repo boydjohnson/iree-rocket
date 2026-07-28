@@ -494,7 +494,7 @@ public:
           convShape->inputScale, convShape->weightsScale,
           convShape->outputScale, convShape->truncateBits,
           convShape->activation, convShape->activationCmp, convShape->precision,
-          runtimeDimensionsRef);
+          runtimeDimensionsRef, /*padTop=*/0, /*padLeft=*/0);
       kernelRef = iree_hal_rocket_KernelDef_as_Conv2DDef(convRef);
     }
     auto exportNameRef = builder.createString(exportOp.getName());

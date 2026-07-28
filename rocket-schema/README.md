@@ -17,7 +17,9 @@ the compiler consumer.
 
 `rocket_executable_def.fbs` defines an `RKT1` FlatBuffer. Its root contains
 exports in IREE executable ordinal order. Each export has a name and a typed
-kernel definition. Version 1 supports standard and depthwise 2-D convolution.
+kernel definition. Version 1 supports standard and depthwise 2-D convolution,
+including parameterized kernel extents, equal-axis stride, and symmetric
+padding carried as leading height/width values.
 
 The convolution fields intentionally mirror the current Rust `ConvShape`.
 FlatBuffers verifies the wire structure. The Rocket runtime must still reject

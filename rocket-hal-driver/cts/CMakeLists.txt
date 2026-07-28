@@ -49,6 +49,23 @@ iree_hal_cts_test_suite(
     rocket
 )
 
+# flatbuffer_c_library() normally runs inside IREE's own source subtree and
+# inherits IREE_ROOT_DIR from its parent directory. This CTS directory is a
+# sibling added by the wrapper host project, so establish the equivalent
+# directory-local value before asking the macro to generate RKT1 bindings.
+set(IREE_ROOT_DIR "${IREE_SOURCE_DIR}")
+flatbuffer_c_library(
+  NAME
+    rocket_executable_def_c_fbs
+  SRCS
+    "${CMAKE_CURRENT_SOURCE_DIR}/../../rocket-schema/schema/rocket_executable_def.fbs"
+  FLATCC_ARGS
+    "--reader"
+    "--builder"
+    "--verifier"
+  TESTONLY
+)
+
 # Hand-written (not iree_hal_cts_test_suite's generic dispatch tests --
 # structurally skipped for "rocket", see backends.cc) end-to-end test for
 # the pooling ukernel, driving the real public IREE HAL API directly. See
@@ -68,6 +85,26 @@ iree_cc_test(
   SRCS
     "pooling_dispatch_test.cc"
   DEPS
+    iree::hal
+    rocket_hal_driver_static
+    gtest
+    gtest_main
+)
+
+# Parameterized RKT1 convolution harness. Unlike conv_dispatch_test.cc's
+# legacy fixed-shape probes, this supplies logical dense NHWC input and HWCF
+# weights, lets the real driver perform every hardware-specific layout
+# transform, and checks dense output against an independent CPU convolution.
+iree_cc_test(
+  NAME
+    conv_schema_harness_test
+  SRCS
+    "conv_schema_harness_test.cc"
+    "conv_test_harness.cc"
+  DEPS
+    ::rocket_executable_def_c_fbs
+    flatcc::runtime
+    iree::async::util::proactor_pool
     iree::hal
     rocket_hal_driver_static
     gtest

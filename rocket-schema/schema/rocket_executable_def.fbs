@@ -79,6 +79,14 @@ table Conv2DDef {
   // semantic validation and register-command construction. Entries must be
   // unique. An absent/empty vector preserves the original fully-static ABI.
   runtime_dimensions:[Conv2DDimension];
+
+  // Symmetric spatial padding. These fields are deliberately appended for
+  // FlatBuffers compatibility: older RKT1 binaries omit them and read as
+  // unpadded. `pad_top` is also applied below the input and `pad_left` is
+  // also applied to its right, matching Rocket ConvShape's current
+  // two-value padding model.
+  pad_top:uint32;
+  pad_left:uint32;
 }
 
 // Describes one row-major [M,K] x [K,N] fully-connected operation.

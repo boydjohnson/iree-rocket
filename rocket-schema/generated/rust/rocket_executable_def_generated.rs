@@ -453,6 +453,8 @@ impl<'a> Conv2DDef<'a> {
   pub const VT_ACTIVATION_CMP: flatbuffers::VOffsetT = 40;
   pub const VT_PRECISION: flatbuffers::VOffsetT = 42;
   pub const VT_RUNTIME_DIMENSIONS: flatbuffers::VOffsetT = 44;
+  pub const VT_PAD_TOP: flatbuffers::VOffsetT = 46;
+  pub const VT_PAD_LEFT: flatbuffers::VOffsetT = 48;
 
   #[inline]
   pub fn init_from_table(table: flatbuffers::Table<'a>) -> Self {
@@ -464,6 +466,8 @@ impl<'a> Conv2DDef<'a> {
     args: &'args Conv2DDefArgs<'args>
   ) -> flatbuffers::WIPOffset<Conv2DDef<'bldr>> {
     let mut builder = Conv2DDefBuilder::new(_fbb);
+    builder.add_pad_left(args.pad_left);
+    builder.add_pad_top(args.pad_top);
     if let Some(x) = args.runtime_dimensions { builder.add_runtime_dimensions(x); }
     builder.add_activation_cmp(args.activation_cmp);
     builder.add_truncate_bits(args.truncate_bits);
@@ -573,6 +577,14 @@ impl<'a> Conv2DDef<'a> {
   pub fn runtime_dimensions(&self) -> Option<flatbuffers::Vector<'a, Conv2DDimension>> {
     self._tab.get::<flatbuffers::ForwardsUOffset<flatbuffers::Vector<'a, Conv2DDimension>>>(Conv2DDef::VT_RUNTIME_DIMENSIONS, None)
   }
+  #[inline]
+  pub fn pad_top(&self) -> u32 {
+    self._tab.get::<u32>(Conv2DDef::VT_PAD_TOP, Some(0)).unwrap()
+  }
+  #[inline]
+  pub fn pad_left(&self) -> u32 {
+    self._tab.get::<u32>(Conv2DDef::VT_PAD_LEFT, Some(0)).unwrap()
+  }
 }
 
 impl flatbuffers::Verifiable for Conv2DDef<'_> {
@@ -603,6 +615,8 @@ impl flatbuffers::Verifiable for Conv2DDef<'_> {
      .visit_field::<u32>("activation_cmp", Self::VT_ACTIVATION_CMP, false)?
      .visit_field::<Precision>("precision", Self::VT_PRECISION, false)?
      .visit_field::<flatbuffers::ForwardsUOffset<flatbuffers::Vector<'_, Conv2DDimension>>>("runtime_dimensions", Self::VT_RUNTIME_DIMENSIONS, false)?
+     .visit_field::<u32>("pad_top", Self::VT_PAD_TOP, false)?
+     .visit_field::<u32>("pad_left", Self::VT_PAD_LEFT, false)?
      .finish();
     Ok(())
   }
@@ -629,6 +643,8 @@ pub struct Conv2DDefArgs<'a> {
     pub activation_cmp: u32,
     pub precision: Precision,
     pub runtime_dimensions: Option<flatbuffers::WIPOffset<flatbuffers::Vector<'a, Conv2DDimension>>>,
+    pub pad_top: u32,
+    pub pad_left: u32,
 }
 impl<'a> Default for Conv2DDefArgs<'a> {
   #[inline]
@@ -655,6 +671,8 @@ impl<'a> Default for Conv2DDefArgs<'a> {
       activation_cmp: 0,
       precision: Precision::INT8,
       runtime_dimensions: None,
+      pad_top: 0,
+      pad_left: 0,
     }
   }
 }
@@ -749,6 +767,14 @@ impl<'a: 'b, 'b> Conv2DDefBuilder<'a, 'b> {
     self.fbb_.push_slot_always::<flatbuffers::WIPOffset<_>>(Conv2DDef::VT_RUNTIME_DIMENSIONS, runtime_dimensions);
   }
   #[inline]
+  pub fn add_pad_top(&mut self, pad_top: u32) {
+    self.fbb_.push_slot::<u32>(Conv2DDef::VT_PAD_TOP, pad_top, 0);
+  }
+  #[inline]
+  pub fn add_pad_left(&mut self, pad_left: u32) {
+    self.fbb_.push_slot::<u32>(Conv2DDef::VT_PAD_LEFT, pad_left, 0);
+  }
+  #[inline]
   pub fn new(_fbb: &'b mut flatbuffers::FlatBufferBuilder<'a>) -> Conv2DDefBuilder<'a, 'b> {
     let start = _fbb.start_table();
     Conv2DDefBuilder {
@@ -787,6 +813,8 @@ impl core::fmt::Debug for Conv2DDef<'_> {
       ds.field("activation_cmp", &self.activation_cmp());
       ds.field("precision", &self.precision());
       ds.field("runtime_dimensions", &self.runtime_dimensions());
+      ds.field("pad_top", &self.pad_top());
+      ds.field("pad_left", &self.pad_left());
       ds.finish()
   }
 }

@@ -29,6 +29,7 @@ fn compiler_fixture_verifies_and_preserves_conv_fields() {
     assert_eq!(conv.weights_width(), 1);
     assert_eq!(conv.weights_height(), 1);
     assert_eq!(conv.stride(), 1);
+    assert_eq!((conv.pad_top(), conv.pad_left()), (0, 0));
     assert!(!conv.depthwise());
     assert_eq!(conv.precision(), rocket::Precision::FP16);
 }
