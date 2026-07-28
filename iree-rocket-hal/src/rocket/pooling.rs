@@ -134,11 +134,13 @@ impl PoolingPrecision {
     }
 }
 
-/// Logical shape of a single standalone pooling operation. Single-task
-/// only, no CBUF-budget splitting to worry about (PPU has no CBUF -- that
-/// concern is CNA/CORE-specific), no `index_en` output wiring yet (that
-/// needs a second output buffer for argmax/argmin positions, not plumbed
-/// here).
+/// Logical shape of a standalone pooling operation. [`PoolingPlan`] splits
+/// wide shapes horizontally to respect the direct PPU width observed in
+/// vendor programs and on RK3588. There is no CBUF-budget splitting to worry
+/// about (PPU has no CBUF -- that concern is CNA/CORE-specific), and no
+/// `index_en` output wiring yet (that needs a second output buffer for
+/// argmax/argmin positions, not plumbed here).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct PoolingShape {
     pub input_width: u32,
     pub input_height: u32,
@@ -174,6 +176,9 @@ pub struct PoolingShape {
 const MAX_PPU_EXTENT: u32 = 8192;
 const MAX_PPU_KERNEL_OR_STRIDE: u32 = 16;
 const MAX_PPU_PADDING: u32 = 7;
+const MAX_DIRECT_KERNEL: u32 = 8;
+const MAX_DIRECT_INPUT_WIDTH: u32 = 129;
+const MAX_DIRECT_OUTPUT_WIDTH: u32 = 64;
 
 fn output_extent(input: u32, kernel: u32, stride: u32, before: u32, after: u32) -> u32 {
     let padded = input
@@ -195,6 +200,14 @@ fn required_trailing_padding(
     leading_padding: u32,
 ) -> u32 {
     ((output - 1) * stride + kernel).saturating_sub(input + leading_padding)
+}
+
+fn validate_direct_kernel(kernel_width: u32, kernel_height: u32) {
+    assert!(
+        kernel_width <= MAX_DIRECT_KERNEL && kernel_height <= MAX_DIRECT_KERNEL,
+        "pooling kernel axes must be 1..={MAX_DIRECT_KERNEL}; RK3588 hardware confirms 8x8 \
+         but rejects a directly programmed 16x16 window"
+    );
 }
 
 fn validate_pooling_geometry(
@@ -288,6 +301,101 @@ impl PoolingShape {
             self.pad_right,
             self.pad_bottom,
         );
+        validate_direct_kernel(self.kernel_width, self.kernel_height);
+    }
+}
+
+/// One independently dispatched horizontal PPU tile.
+///
+/// The vendor caps a direct task at 64 output columns and carries the kernel
+/// overlap in `input_width`. `input_first` and `output_first` are pixel
+/// offsets into the full tensor; the builder converts them to 16-byte feature
+/// atom offsets when relocating the two base-address registers.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct PoolingTile {
+    pub input_first: u32,
+    pub input_width: u32,
+    pub output_first: u32,
+    pub output_width: u32,
+    pub pad_left: u32,
+    pub pad_right: u32,
+}
+
+/// Capture-derived horizontal pooling plan.
+///
+/// Width 129 is the largest whole direct input in the corpus. Larger tensors
+/// split into balanced tiles of at most 64 output columns, assigning any
+/// remainder to the rightmost tiles. This reproduces the observed 63+64
+/// split for an unpadded width-256 3x3/stride-2 pool and 64+64 for its padded
+/// counterpart.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct PoolingPlan {
+    shape: PoolingShape,
+    tiles: Vec<PoolingTile>,
+}
+
+impl PoolingPlan {
+    pub fn new(shape: PoolingShape) -> PoolingPlan {
+        shape.validate();
+        let tile_count = shape.output_width.div_ceil(MAX_DIRECT_OUTPUT_WIDTH);
+        let base_width = shape.output_width / tile_count;
+        let wider_tiles = shape.output_width % tile_count;
+        let first_wider = tile_count - wider_tiles;
+        let mut output_first = 0;
+        let mut tiles = Vec::with_capacity(tile_count as usize);
+
+        for index in 0..tile_count {
+            let output_width = base_width + u32::from(index >= first_wider);
+            let raw_input_first =
+                i64::from(output_first * shape.stride_x) - i64::from(shape.pad_left);
+            let raw_input_end =
+                i64::from((output_first + output_width - 1) * shape.stride_x + shape.kernel_width)
+                    - i64::from(shape.pad_left);
+            let input_first = raw_input_first.max(0) as u32;
+            let input_end = raw_input_end.min(i64::from(shape.input_width)).max(0) as u32;
+            let tile = PoolingTile {
+                input_first,
+                input_width: input_end - input_first,
+                output_first,
+                output_width,
+                pad_left: (-raw_input_first).max(0) as u32,
+                pad_right: (raw_input_end - i64::from(shape.input_width)).max(0) as u32,
+            };
+            assert!(
+                tile.input_width <= MAX_DIRECT_INPUT_WIDTH
+                    && tile.output_width <= MAX_DIRECT_OUTPUT_WIDTH,
+                "pooling tile exceeds the capture-derived direct width limits: {tile:?}"
+            );
+            tiles.push(tile);
+            output_first += output_width;
+        }
+
+        PoolingPlan { shape, tiles }
+    }
+
+    pub fn shape(&self) -> PoolingShape {
+        self.shape
+    }
+
+    pub fn tiles(&self) -> &[PoolingTile] {
+        &self.tiles
+    }
+
+    /// Emits one independently kicked, submission-ready program per tile.
+    pub fn programs_with_buffers(&self, bufs: &PoolingBuffers) -> Vec<Vec<RegCmd>> {
+        self.tiles
+            .iter()
+            .map(|tile| {
+                let mut commands = build_ppu_standalone_flying(
+                    &self.shape,
+                    tile,
+                    bufs.input_addr,
+                    bufs.output_addr,
+                );
+                push_kick(&mut commands, KICK_PPU | KICK_PPU_RDMA);
+                commands
+            })
+            .collect()
     }
 }
 
@@ -335,10 +443,21 @@ pub struct PoolingBuffers {
 /// change versus the original single function.
 fn build_ppu_standalone_flying(
     shape: &PoolingShape,
+    tile: &PoolingTile,
     input_addr: u32,
     output_addr: u32,
 ) -> Vec<RegCmd> {
     shape.validate();
+    assert!(
+        tile.input_width <= MAX_DIRECT_INPUT_WIDTH && tile.output_width <= MAX_DIRECT_OUTPUT_WIDTH,
+        "direct pooling tile exceeds the capture-derived width limits: {tile:?}"
+    );
+    let input_addr = input_addr
+        .checked_add(tile.input_first * 16)
+        .expect("pooling tile input address overflows u32");
+    let output_addr = output_addr
+        .checked_add(tile.output_first * 16)
+        .expect("pooling tile output address overflows u32");
     assert!(
         output_addr.is_multiple_of(16),
         "build_ppu_standalone_flying: output_addr {output_addr:#x} is not 16-byte aligned -- \
@@ -391,13 +510,6 @@ fn build_ppu_standalone_flying(
     // that leaves floor-mode output geometry unchanged; programming it is
     // unnecessary. For 3x3/s2/pad1 this turns [1,1,1,1] into the captured
     // [top=1,left=1,bottom=0,right=0].
-    let programmed_pad_right = required_trailing_padding(
-        shape.input_width,
-        shape.output_width,
-        shape.kernel_width,
-        shape.stride_x,
-        shape.pad_left,
-    );
     let programmed_pad_bottom = required_trailing_padding(
         shape.input_height,
         shape.output_height,
@@ -434,7 +546,7 @@ fn build_ppu_standalone_flying(
 
     cmds.push(
         Register::<PpuRdmaCubeInWidth>::new()
-            .cube_in_width(Bits::new(shape.input_width - 1))
+            .cube_in_width(Bits::new(tile.input_width - 1))
             .build(),
     );
     cmds.push(
@@ -474,7 +586,7 @@ fn build_ppu_standalone_flying(
 
     cmds.push(
         Register::<PpuDataCubeInWidth>::new()
-            .cube_in_width(Bits::new(shape.input_width - 1))
+            .cube_in_width(Bits::new(tile.input_width - 1))
             .build(),
     );
     cmds.push(
@@ -489,7 +601,7 @@ fn build_ppu_standalone_flying(
     );
     cmds.push(
         Register::<PpuDataCubeOutWidth>::new()
-            .cube_out_width(Bits::new(shape.output_width - 1))
+            .cube_out_width(Bits::new(tile.output_width - 1))
             .build(),
     );
     cmds.push(
@@ -509,7 +621,7 @@ fn build_ppu_standalone_flying(
             .flying_mode(Bits::new(1)) // standalone via PPU_RDMA, not pipelined after DPU
             .index_en(Bits::new(0)) // no argmax/argmin output wiring yet
             .use_cnt(Bits::new(0))
-            .notch_addr(Bits::new(0))
+            .notch_addr(Bits::new(shape.output_width - tile.output_width))
             .build(),
     );
     cmds.push(
@@ -532,9 +644,9 @@ fn build_ppu_standalone_flying(
     );
     cmds.push(
         Register::<PpuPoolingPaddingCfg>::new()
-            .pad_left(Bits::new(shape.pad_left))
+            .pad_left(Bits::new(tile.pad_left))
             .pad_top(Bits::new(shape.pad_top))
-            .pad_right(Bits::new(programmed_pad_right))
+            .pad_right(Bits::new(tile.pad_right))
             .pad_bottom(Bits::new(programmed_pad_bottom))
             .build(),
     );
@@ -588,7 +700,9 @@ fn build_ppu_standalone_flying(
 /// real capture, this standalone-only shape isn't actually what the vendor
 /// compiler emits at all; see `build_pooling_via_dpu_bypass_regcmd` below
 /// for that real two-kick shape. Kept for hardware comparison/reference,
-/// not as the recommended default.
+/// not as the recommended default. This convenience entry point accepts
+/// only a one-tile shape; use [`PoolingPlan::programs_with_buffers`] for a
+/// width that requires horizontal splitting.
 pub fn build_pooling_regcmd(shape: &PoolingShape, bufs: &PoolingBuffers) -> Vec<RegCmd> {
     assert!(
         matches!(shape.activation, Activation::None),
@@ -598,7 +712,17 @@ pub fn build_pooling_regcmd(shape: &PoolingShape, bufs: &PoolingBuffers) -> Vec<
          instead if fused activation is needed.",
         shape.activation
     );
-    let mut cmds = build_ppu_standalone_flying(shape, bufs.input_addr, bufs.output_addr);
+    let plan = PoolingPlan::new(*shape);
+    assert_eq!(
+        plan.tiles.len(),
+        1,
+        "build_pooling_regcmd accepts one direct PPU task; width {} needs {} horizontal \
+         tiles, so use PoolingPlan::programs_with_buffers",
+        shape.input_width,
+        plan.tiles.len()
+    );
+    let mut cmds =
+        build_ppu_standalone_flying(shape, &plan.tiles[0], bufs.input_addr, bufs.output_addr);
     push_kick(&mut cmds, KICK_PPU | KICK_PPU_RDMA);
     cmds
 }
@@ -751,8 +875,20 @@ pub fn build_pooling_via_dpu_bypass_regcmd(
     );
 
     // Stage 2: standalone-flying PPU, fetching from stage 1's real output.
-    let mut pooling_cmds =
-        build_ppu_standalone_flying(pooling_shape, bufs.bypass_output_addr, bufs.output_addr);
+    let plan = PoolingPlan::new(*pooling_shape);
+    assert_eq!(
+        plan.tiles.len(),
+        1,
+        "DPU-bypass pooling currently accepts one direct PPU task; use a tiled pooling \
+         stage for width {}",
+        pooling_shape.input_width
+    );
+    let mut pooling_cmds = build_ppu_standalone_flying(
+        pooling_shape,
+        &plan.tiles[0],
+        bufs.bypass_output_addr,
+        bufs.output_addr,
+    );
     push_kick(&mut pooling_cmds, KICK_PPU | KICK_PPU_RDMA);
 
     (bypass_cmds, pooling_cmds)
@@ -843,6 +979,7 @@ pub fn build_conv_then_pooling_regcmd(
         pooling.pad_right,
         pooling.pad_bottom,
     );
+    validate_direct_kernel(pooling.kernel_width, pooling.kernel_height);
     assert_eq!(
         pooling.precision,
         PoolingPrecision::from_mesa_precision(conv_shape.precision),
@@ -1267,8 +1404,8 @@ mod tests {
     }
 
     #[test]
-    fn full_kernel_and_stride_fields_remain_available() {
-        let shape = shape(64, 48, 16, 16, 16, 16, PoolingPrecision::Int8);
+    fn supported_kernel_edge_keeps_the_full_stride_field_available() {
+        let shape = shape(64, 48, 8, 8, 16, 16, PoolingPrecision::Int8);
         let commands = build_pooling_regcmd(
             &shape,
             &PoolingBuffers {
@@ -1278,8 +1415,51 @@ mod tests {
         );
         assert_eq!(
             register_value::<PpuPoolingKernelCfg>(&commands),
-            0x00ff_0f0f
+            0x00ff_0707
         );
+    }
+
+    #[test]
+    fn wide_plan_reproduces_the_unpadded_vendor_tiles() {
+        let shape = shape(256, 48, 3, 3, 2, 2, PoolingPrecision::Fp16);
+        let plan = PoolingPlan::new(shape);
+        assert_eq!(
+            plan.tiles(),
+            &[
+                PoolingTile {
+                    input_first: 0,
+                    input_width: 127,
+                    output_first: 0,
+                    output_width: 63,
+                    pad_left: 0,
+                    pad_right: 0,
+                },
+                PoolingTile {
+                    input_first: 126,
+                    input_width: 129,
+                    output_first: 63,
+                    output_width: 64,
+                    pad_left: 0,
+                    pad_right: 0,
+                },
+            ]
+        );
+        let programs = plan.programs_with_buffers(&PoolingBuffers {
+            input_addr: 0x1000,
+            output_addr: 0x2000,
+        });
+        assert_eq!(programs.len(), 2);
+        assert_eq!(
+            register_value::<PpuOperationModeCfg>(&programs[0]),
+            0x0040_0011
+        );
+        assert_eq!(
+            register_value::<PpuOperationModeCfg>(&programs[1]),
+            0x003f_0011
+        );
+        assert_eq!(register_value::<PpuRdmaSrcBaseAddr>(&programs[1]), 0x17e0);
+        assert_eq!(register_value::<PpuDstBaseAddr>(&programs[1]), 0x23f0);
+        assert_eq!(register_value::<PpuDstSurfStride>(&programs[1]), 2924 << 4);
     }
 
     #[test]
@@ -1319,8 +1499,8 @@ mod tests {
     }
 
     #[test]
-    #[should_panic(expected = "kernel width must be 1..=16")]
-    fn rejects_kernel_beyond_hardware_field() {
-        shape(64, 48, 17, 3, 2, 2, PoolingPrecision::Int8).validate();
+    #[should_panic(expected = "pooling kernel axes must be 1..=8")]
+    fn rejects_kernel_beyond_hardware_backed_direct_limit() {
+        shape(64, 48, 16, 3, 2, 2, PoolingPrecision::Int8).validate();
     }
 }

@@ -40,9 +40,10 @@ use std::{fs::OpenOptions, mem, os::unix::io::AsRawFd, ptr};
 
 use iree_rocket_hal::rocket::{
     activation::Activation,
-    device::{Buffer, fini_bo, prep_bo, submit},
+    device::{Buffer, JobDesc, fini_bo, prep_bo, submit, submit_jobs},
     pooling::{
-        PoolingBuffers, PoolingMethod, PoolingPrecision, PoolingShape, build_pooling_regcmd,
+        PoolingBuffers, PoolingMethod, PoolingPlan, PoolingPrecision, PoolingShape,
+        build_pooling_regcmd,
     },
 };
 
@@ -148,7 +149,7 @@ fn run_uniform_pooling_dynamic(shape: &PoolingShape, input_fill: u8) -> Vec<u8> 
         ptr::write_bytes(buf_in.host_ptr, input_fill, input_bytes);
         let buf_out = Buffer::new(fd, output_bytes.next_multiple_of(4096), &file);
         ptr::write_bytes(buf_out.host_ptr, 0, output_bytes.next_multiple_of(4096));
-        run_pooling(&file, fd, shape, &buf_in, &buf_out, output_pixels)
+        run_pooling_plan(&file, fd, shape, &buf_in, &buf_out, output_pixels)
     }
 }
 
@@ -235,6 +236,69 @@ unsafe fn run_pooling(
 
         let raw = std::slice::from_raw_parts(buf_out.host_ptr, num_output_pixels * 16 + 16);
         (0..num_output_pixels).map(|i| raw[i * 16]).collect()
+    }
+}
+
+/// Queues every horizontal tile as an ordered job and waits once for the
+/// shared output BO. This mirrors the multi-tile convolution tests: syncing
+/// and submitting the complete job list at once avoids a CPU cache hand-off
+/// between partial writes to the same output surface.
+unsafe fn run_pooling_plan(
+    file: &std::fs::File,
+    fd: i32,
+    shape: &PoolingShape,
+    buf_in: &Buffer,
+    buf_out: &Buffer,
+    num_output_pixels: usize,
+) -> Vec<u8> {
+    unsafe {
+        let programs = PoolingPlan::new(*shape).programs_with_buffers(&PoolingBuffers {
+            input_addr: buf_in.dma_address,
+            output_addr: buf_out.dma_address,
+        });
+        let mut command_buffers = Vec::with_capacity(programs.len());
+        for program in &programs {
+            let cmd_bytes = program.len() * mem::size_of::<u64>();
+            let buffer = Buffer::new(fd, cmd_bytes.next_multiple_of(4096), file);
+            let words = std::slice::from_raw_parts_mut(buffer.host_ptr as *mut u64, program.len());
+            for (destination, command) in words.iter_mut().zip(program) {
+                *destination = command.0;
+            }
+            command_buffers.push((buffer, program.len() as u32));
+        }
+
+        fini_bo(fd, buf_in.handle).ok();
+        fini_bo(fd, buf_out.handle).ok();
+        for (buffer, _) in &command_buffers {
+            fini_bo(fd, buffer.handle).ok();
+        }
+
+        let tasks: Vec<[(u32, u32); 1]> = command_buffers
+            .iter()
+            .map(|(buffer, count)| [(buffer.dma_address, *count)])
+            .collect();
+        let in_handles: Vec<[u32; 2]> = command_buffers
+            .iter()
+            .map(|(buffer, _)| [buffer.handle, buf_in.handle])
+            .collect();
+        let out_handles = [buf_out.handle];
+        let jobs: Vec<JobDesc<'_>> = tasks
+            .iter()
+            .zip(&in_handles)
+            .map(|(tasks, in_handles)| JobDesc {
+                tasks,
+                in_handles,
+                out_handles: &out_handles,
+            })
+            .collect();
+        submit_jobs(fd, &jobs).expect("tiled pooling SUBMIT failed");
+        prep_bo(fd, buf_out.handle, 5_000_000_000)
+            .expect("tiled pooling did not complete within timeout");
+
+        let raw = std::slice::from_raw_parts(buf_out.host_ptr, num_output_pixels * 16 + 16);
+        (0..num_output_pixels)
+            .map(|index| raw[index * 16])
+            .collect()
     }
 }
 
@@ -424,39 +488,46 @@ fn pooling_dump_full_output_buffer() {
 }
 
 #[test]
-#[ignore = "needs the real NPU device -- validates capture-derived large-surface programming"]
-fn large_spatial_extents_run_on_npu() {
-    for shape in [
-        validation_shape(256, 48, 3, 3, 2, 2),
-        validation_shape(64, 8192, 3, 3, 2, 2),
-    ] {
-        let pixels = run_uniform_pooling_dynamic(&shape, 73);
-        assert!(
-            pixels.iter().all(|&value| value == 73),
-            "{}x{} -> {}x{} max pooling did not preserve a uniform input",
-            shape.input_width,
-            shape.input_height,
-            shape.output_width,
-            shape.output_height
-        );
-    }
+#[ignore = "needs the real NPU device -- validates capture-derived horizontal tiling"]
+fn wide_pooling_plan_runs_on_npu() {
+    let shape = validation_shape(256, 48, 3, 3, 2, 2);
+    let pixels = run_uniform_pooling_dynamic(&shape, 73);
+    assert!(
+        pixels.iter().all(|&value| value == 73),
+        "{}x{} -> {}x{} tiled max pooling did not preserve a uniform input",
+        shape.input_width,
+        shape.input_height,
+        shape.output_width,
+        shape.output_height
+    );
+}
+
+#[test]
+#[ignore = "needs the real NPU device -- validates the 13-bit height boundary"]
+fn height_8192_pooling_runs_on_npu() {
+    let shape = validation_shape(64, 8192, 3, 3, 2, 2);
+    let pixels = run_uniform_pooling_dynamic(&shape, 73);
+    assert!(
+        pixels.iter().all(|&value| value == 73),
+        "{}x{} -> {}x{} max pooling did not preserve a uniform input",
+        shape.input_width,
+        shape.input_height,
+        shape.output_width,
+        shape.output_height
+    );
 }
 
 #[test]
 #[ignore = "needs the real NPU device -- probes the upper half of the PPU kernel fields"]
 fn large_pooling_windows_run_on_npu() {
-    for shape in [
-        validation_shape(64, 48, 8, 8, 3, 3),
-        validation_shape(64, 48, 16, 16, 16, 16),
-    ] {
-        let pixels = run_uniform_pooling_dynamic(&shape, 91);
-        assert!(
-            pixels.iter().all(|&value| value == 91),
-            "{}x{} kernel with {}x{} stride did not preserve a uniform input",
-            shape.kernel_width,
-            shape.kernel_height,
-            shape.stride_x,
-            shape.stride_y
-        );
-    }
+    let shape = validation_shape(64, 48, 8, 8, 3, 3);
+    let pixels = run_uniform_pooling_dynamic(&shape, 91);
+    assert!(
+        pixels.iter().all(|&value| value == 91),
+        "{}x{} kernel with {}x{} stride did not preserve a uniform input",
+        shape.kernel_width,
+        shape.kernel_height,
+        shape.stride_x,
+        shape.stride_y
+    );
 }
