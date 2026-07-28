@@ -33,7 +33,7 @@ use std::{fs::OpenOptions, mem, os::unix::io::AsRawFd, ptr};
 
 use iree_rocket_hal::rocket::{
     activation::Activation,
-    conv::{self, Kernels, Multiplier, Quantization},
+    conv::{self, BsEntry, Kernels, Multiplier, Quantization, write_bs_buffer},
     device::{Buffer, close_bo, fini_bo, prep_bo, submit},
     pooling::{
         PoolingMethod, PoolingPrecision, PoolingShape, PoolingViaBypassBuffers,
@@ -134,8 +134,21 @@ fn setup(input_fill: u8, weight_fill: u8, out_fill: u8) -> Bufs {
         let buf_w = Buffer::new(fd, TENSOR_SIZE, &file);
         ptr::write_bytes(buf_w.host_ptr, weight_fill, TENSOR_SIZE);
 
+        // A plain zero-fill supplies a zero BS multiplier (not just a zero
+        // bias) for this int8 bypass shape -- conv.rs's write_bs_buffer doc
+        // comment warns about exactly this: "the fp16 tests' habit of
+        // zeroing the bias buffer does not carry over" for int8. A real
+        // RK3588 run confirmed it: buf_mid came back correctly written but
+        // to all-zero regardless of input, not the "unwritten" symptom a
+        // dispatch/kick bug would show. BsEntry::default()'s unit multiplier
+        // is the real "no rescale" value this near-identity bypass conv
+        // needs, paired with bypass_shape()'s own Multiplier::from_ratio(1.0).
         let buf_bias = Buffer::new(fd, TENSOR_SIZE, &file);
         ptr::write_bytes(buf_bias.host_ptr, 0, TENSOR_SIZE);
+        let bs_entries = vec![BsEntry::default(); bypass_shape().padded_out_channels() as usize];
+        let bs_bytes =
+            std::slice::from_raw_parts_mut(buf_bias.host_ptr, bypass_shape().bs_buffer_bytes());
+        write_bs_buffer(bs_bytes, &bs_entries);
 
         let buf_mid = Buffer::new(fd, TENSOR_SIZE, &file);
         ptr::write_bytes(buf_mid.host_ptr, out_fill, TENSOR_SIZE);
