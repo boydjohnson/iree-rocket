@@ -53,7 +53,7 @@ use iree_rocket_hal::rocket::{
     activation::Activation,
     executable_format::{CONV2D_V1_TAG, decode_conv_shape_v1, validate_conv_shape},
     mesa_conv::{ConvShape, FcShape, fc_as_conv_shape},
-    pooling::{PoolingMethod, PoolingShape},
+    pooling::{PoolingMethod, PoolingPrecision, PoolingShape},
     regcmd::Precision,
 };
 use rocket_schema::rocket as schema;
@@ -338,6 +338,7 @@ unsafe extern "C" fn prepare_executable(
             output_width: 2,
             output_height: 2,
             output_channels: 1,
+            precision: PoolingPrecision::Int8,
             kernel_width: 2,
             kernel_height: 2,
             stride_x: 2,
