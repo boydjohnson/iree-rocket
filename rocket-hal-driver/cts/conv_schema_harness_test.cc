@@ -9,6 +9,7 @@
 #include <algorithm>
 #include <cmath>
 #include <cstdint>
+#include <sstream>
 #include <string>
 #include <vector>
 
@@ -95,6 +96,36 @@ std::vector<float> MakeWeights(const Conv2dProblem &problem) {
 
 class ConvSchemaHarnessTest : public ::testing::TestWithParam<Conv2dProblem> {};
 
+std::string
+ConvProblemName(const ::testing::TestParamInfo<Conv2dProblem> &info) {
+  const Conv2dProblem &p = info.param;
+  std::ostringstream name;
+  name << "H" << p.input_height << "W" << p.input_width << "C"
+       << p.input_channels << "F" << p.output_channels << "K" << p.kernel_height
+       << "x" << p.kernel_width << "S" << p.stride << "P" << p.pad_top << "x"
+       << p.pad_left;
+  return name.str();
+}
+
+TEST(ConvSchemaHarnessHostTest, BuildsHeaderPrefixedRkt1Executable) {
+  const Conv2dProblem problem{
+      /*input_height=*/6,   /*input_width=*/7,
+      /*input_channels=*/3, /*output_channels=*/2,
+      /*kernel_height=*/3,  /*kernel_width=*/5,
+      /*stride=*/2,         /*pad_top=*/1,
+      /*pad_left=*/2};
+  const std::vector<uint8_t> executable = BuildFp16Conv2dExecutable(problem);
+  ASSERT_GT(executable.size(), 64u);
+  EXPECT_EQ(std::string(executable.begin(), executable.begin() + 4), "RKT1");
+  EXPECT_EQ(std::string(executable.begin() + 68, executable.begin() + 72),
+            "RKT1");
+  uint64_t content_size = 0;
+  for (int i = 0; i < 8; ++i) {
+    content_size |= static_cast<uint64_t>(executable[8 + i]) << (8 * i);
+  }
+  EXPECT_EQ(content_size, executable.size() - 64);
+}
+
 TEST_P(ConvSchemaHarnessTest, MatchesIndependentDenseReference) {
   iree_hal_driver_t *driver = nullptr;
   iree_hal_device_t *device = nullptr;
@@ -117,15 +148,30 @@ TEST_P(ConvSchemaHarnessTest, MatchesIndependentDenseReference) {
   iree_hal_driver_release(driver);
 
   ASSERT_EQ(result.actual.size(), result.expected.size());
+  size_t mismatch_count = 0;
+  float maximum_error = 0.0f;
+  std::ostringstream samples;
   for (size_t i = 0; i < result.actual.size(); ++i) {
     // Operands and the CPU result are explicitly rounded to f16. A small
     // tolerance still permits hardware's internal accumulation order to
     // differ without hiding packing/indexing failures.
     const float tolerance =
         std::max(0.002f, std::abs(result.expected[i]) * 0.002f);
-    EXPECT_NEAR(result.actual[i], result.expected[i], tolerance)
-        << "dense NHWC output element " << i;
+    const float error = std::abs(result.actual[i] - result.expected[i]);
+    if (error > tolerance) {
+      maximum_error = std::max(maximum_error, error);
+      if (mismatch_count < 8) {
+        samples << "\n  [" << i << "] actual " << result.actual[i]
+                << ", expected " << result.expected[i] << ", tolerance "
+                << tolerance;
+      }
+      ++mismatch_count;
+    }
   }
+  EXPECT_EQ(mismatch_count, 0u)
+      << mismatch_count << "/" << result.actual.size()
+      << " dense NHWC elements differed; maximum error " << maximum_error
+      << "; first mismatches:" << samples.str();
 }
 
 INSTANTIATE_TEST_SUITE_P(
@@ -142,11 +188,16 @@ INSTANTIATE_TEST_SUITE_P(
         Conv2dProblem{/*input_height=*/8, /*input_width=*/9,
                       /*input_channels=*/3, /*output_channels=*/3,
                       /*kernel_height=*/3, /*kernel_width=*/5,
-                      /*stride=*/2, /*pad_top=*/1, /*pad_left=*/2},
+                      /*stride=*/1, /*pad_top=*/1, /*pad_left=*/2},
         Conv2dProblem{/*input_height=*/7, /*input_width=*/8,
                       /*input_channels=*/2, /*output_channels=*/2,
                       /*kernel_height=*/4, /*kernel_width=*/2,
-                      /*stride=*/2, /*pad_top=*/0, /*pad_left=*/1}));
+                      /*stride=*/1, /*pad_top=*/0, /*pad_left=*/1},
+        Conv2dProblem{/*input_height=*/7, /*input_width=*/8,
+                      /*input_channels=*/3, /*output_channels=*/2,
+                      /*kernel_height=*/3, /*kernel_width=*/3,
+                      /*stride=*/2, /*pad_top=*/1, /*pad_left=*/1}),
+    ConvProblemName);
 
 } // namespace
 } // namespace rocket::testing

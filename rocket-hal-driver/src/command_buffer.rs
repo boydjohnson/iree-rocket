@@ -75,7 +75,7 @@ use crate::{
 };
 use iree_rocket_hal::rocket::{
     builders::RegCmd,
-    conv::{Buffers, ConvPlan, Precision},
+    conv::{Buffers, ConvPlan, FeatureLayout, Precision},
     device::Buffer as RocketDeviceBuffer,
     fc,
     pooling::{PoolingBuffers, build_pooling_regcmd},
@@ -860,48 +860,49 @@ unsafe extern "C" fn dispatch(
                 );
             }
 
-            // CNA's multi-channel DMA path consumes 16-byte feature-atomic
-            // NC1HWC2 surfaces. Keep input_channels==1 on its existing
-            // direct path: that register path explicitly enables
-            // nonalign_dma and has separate hardware behavior.
-            let (input_addr, input_handle, input_packing) = if shape.in_channels > 1 {
-                let scratch_bytes =
-                    match nc1hwc2_storage_size(pixel_count, packed_input_bytes_per_pixel) {
-                        Ok(value) => value,
-                        Err(_) => {
-                            return status::from_code(
+            // CNA's surface-layout path consumes 16-byte feature-atomic
+            // NC1HWC2 surfaces. Shapes with 1..=4 channels use the hardware's
+            // dense ARGB modes and must remain dense; packing Cin 2..=4 into
+            // 16-byte slots makes those modes read padding as later pixels.
+            let (input_addr, input_handle, input_packing) =
+                if shape.layout() == FeatureLayout::Surfaces {
+                    let scratch_bytes =
+                        match nc1hwc2_storage_size(pixel_count, packed_input_bytes_per_pixel) {
+                            Ok(value) => value,
+                            Err(_) => {
+                                return status::from_code(
                                 crate::bindings::iree_status_code_e_IREE_STATUS_INVALID_ARGUMENT,
                             );
-                        }
+                            }
+                        };
+                    let scratch = unsafe {
+                        RocketDeviceBuffer::new(
+                            cb.fd,
+                            scratch_bytes.max(1),
+                            BorrowedFd::borrow_raw(cb.fd),
+                        )
                     };
-                let scratch = unsafe {
-                    RocketDeviceBuffer::new(
-                        cb.fd,
-                        scratch_bytes.max(1),
-                        BorrowedFd::borrow_raw(cb.fd),
+                    (
+                        scratch.dma_address,
+                        scratch.handle,
+                        Some(InputPacking {
+                            input_buffer: refs[0].buffer,
+                            input_offset: refs[0].offset,
+                            input_length: refs[0].length,
+                            scratch_ptr: scratch.host_ptr,
+                            scratch_length: scratch_bytes,
+                            scratch_handle: scratch.handle,
+                            source_pixel_count: pixel_count,
+                            packed_pixel_count: pixel_count,
+                            bytes_per_pixel: input_bytes_per_pixel,
+                            packed_bytes_per_pixel: packed_input_bytes_per_pixel,
+                            padding_byte: 0,
+                            layout: InputPackingLayout::Nc1hwc2,
+                        }),
                     )
+                } else {
+                    (addr(&refs[0]), handle(&refs[0]), None)
                 };
-                (
-                    scratch.dma_address,
-                    scratch.handle,
-                    Some(InputPacking {
-                        input_buffer: refs[0].buffer,
-                        input_offset: refs[0].offset,
-                        input_length: refs[0].length,
-                        scratch_ptr: scratch.host_ptr,
-                        scratch_length: scratch_bytes,
-                        scratch_handle: scratch.handle,
-                        source_pixel_count: pixel_count,
-                        packed_pixel_count: pixel_count,
-                        bytes_per_pixel: input_bytes_per_pixel,
-                        packed_bytes_per_pixel: packed_input_bytes_per_pixel,
-                        padding_byte: 0,
-                        layout: InputPackingLayout::Nc1hwc2,
-                    }),
-                )
-            } else {
-                (addr(&refs[0]), handle(&refs[0]), None)
-            };
             // IREE's conv ABI supplies a logical HWCF filter. Regular fp16
             // convolution consumes a blocked coefficient stream instead:
             // output-block, input-group, X, Y, output-lane, input-lane.

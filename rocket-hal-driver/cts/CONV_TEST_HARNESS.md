@@ -38,8 +38,9 @@ the Rocket layouts or register-command builder.
 `conv_schema_harness_test.cc` shows the extension pattern. Add a
 `Conv2dProblem` to `INSTANTIATE_TEST_SUITE_P`; the deterministic tensor
 generators and the CPU route adapt to its geometry. Current cases cover 1x1,
-3x3 SAME padding, a non-square 3x5 stride-2 kernel, and an even 4x2 kernel
-with asymmetric axis padding.
+3x3 SAME padding, a non-square 3x5 kernel, an even 4x2 kernel with asymmetric
+axis padding, and a stride-2 3x3 kernel. Non-square/even cases use stride 1
+because that is the extent of their current capture-backed CBUF policy.
 
 The checked comparison rounds operands and expected results to FP16 and uses a
 small absolute/relative tolerance for accumulation-order differences. Large

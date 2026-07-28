@@ -46,6 +46,11 @@ struct Conv2dResult {
   std::vector<float> expected;
 };
 
+// Builds the header-prefixed `rocket-flatbuffer-v1` executable consumed by
+// the driver. Exposed separately so schema construction can be regression
+// tested on hosts without a Rocket device.
+std::vector<uint8_t> BuildFp16Conv2dExecutable(const Conv2dProblem &problem);
+
 // Runs a regular FP16 Conv2D from an RKT1 executable through the public IREE
 // HAL API. `input` is dense NHWC and `weights` is dense HWCF. The driver,
 // rather than this harness, is responsible for Rocket's NC1HWC2 input

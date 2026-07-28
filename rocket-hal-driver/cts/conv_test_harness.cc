@@ -133,26 +133,56 @@ std::vector<uint8_t> BuildRkt1Executable(const Conv2dProblem &problem) {
   std::vector<uint8_t> result;
   void *flatbuffer = nullptr;
   try {
+    // FlatCC builds tables bottom-up. Child refs are created before the root
+    // buffer is started by ExecutableDef_create_as_root below.
     const auto name = flatbuffers_string_create_str(&builder, "conv_test");
-    const auto conv = iree_hal_rocket_Conv2DDef_create(
-        &builder, problem.input_width, problem.input_height,
-        problem.input_channels, problem.output_width(), problem.output_height(),
-        problem.output_channels, problem.kernel_width, problem.kernel_height,
-        problem.stride, /*depthwise=*/0,
-        /*input_zero_point=*/0, /*output_zero_point=*/0,
-        /*weights_zero_point=*/0,
-        /*input_scale=*/1.0f, /*weights_scale=*/1.0f,
-        /*output_scale=*/1.0f, /*truncate_bits=*/0,
-        iree_hal_rocket_Activation_NONE, /*activation_cmp=*/0,
-        iree_hal_rocket_Precision_FP16, /*runtime_dimensions=*/0,
-        problem.pad_top, problem.pad_left);
+    if (!name) {
+      throw std::runtime_error("failed to build RKT1 export name");
+    }
+    // Do not use Conv2DDef_create with a zero runtime_dimensions ref:
+    // FlatCC's generated convenience function unconditionally tries to add
+    // every vector argument, and adding a null optional-vector ref fails.
+    // The field-wise API lets a fully static executable omit that vector.
+    if (iree_hal_rocket_Conv2DDef_start(&builder) ||
+        iree_hal_rocket_Conv2DDef_input_width_add(&builder,
+                                                  problem.input_width) ||
+        iree_hal_rocket_Conv2DDef_input_height_add(&builder,
+                                                   problem.input_height) ||
+        iree_hal_rocket_Conv2DDef_input_channels_add(&builder,
+                                                     problem.input_channels) ||
+        iree_hal_rocket_Conv2DDef_output_width_add(&builder,
+                                                   problem.output_width()) ||
+        iree_hal_rocket_Conv2DDef_output_height_add(&builder,
+                                                    problem.output_height()) ||
+        iree_hal_rocket_Conv2DDef_output_channels_add(
+            &builder, problem.output_channels) ||
+        iree_hal_rocket_Conv2DDef_weights_width_add(&builder,
+                                                    problem.kernel_width) ||
+        iree_hal_rocket_Conv2DDef_weights_height_add(&builder,
+                                                     problem.kernel_height) ||
+        iree_hal_rocket_Conv2DDef_stride_add(&builder, problem.stride) ||
+        iree_hal_rocket_Conv2DDef_precision_add(
+            &builder, iree_hal_rocket_Precision_FP16) ||
+        iree_hal_rocket_Conv2DDef_pad_top_add(&builder, problem.pad_top) ||
+        iree_hal_rocket_Conv2DDef_pad_left_add(&builder, problem.pad_left)) {
+      throw std::runtime_error("failed to populate RKT1 Conv2DDef");
+    }
+    const auto conv = iree_hal_rocket_Conv2DDef_end(&builder);
+    if (!conv) {
+      throw std::runtime_error("failed to build RKT1 Conv2DDef");
+    }
     const auto export_def = iree_hal_rocket_ExportDef_create(
         &builder, name, iree_hal_rocket_KernelDef_as_Conv2DDef(conv));
+    if (!export_def) {
+      throw std::runtime_error("failed to build RKT1 ExportDef");
+    }
     const auto exports =
         iree_hal_rocket_ExportDef_vec_create(&builder, &export_def, 1);
-    if (!name || !conv || !export_def || !exports ||
-        !iree_hal_rocket_ExecutableDef_create_as_root(&builder, exports)) {
-      throw std::runtime_error("failed to build RKT1 convolution executable");
+    if (!exports) {
+      throw std::runtime_error("failed to build RKT1 exports vector");
+    }
+    if (!iree_hal_rocket_ExecutableDef_create_as_root(&builder, exports)) {
+      throw std::runtime_error("failed to build RKT1 executable root");
     }
 
     size_t flatbuffer_size = 0;
@@ -253,6 +283,10 @@ std::vector<float> ReferenceConv2d(const Conv2dProblem &problem,
 }
 
 } // namespace
+
+std::vector<uint8_t> BuildFp16Conv2dExecutable(const Conv2dProblem &problem) {
+  return BuildRkt1Executable(problem);
+}
 
 uint32_t Conv2dProblem::output_height() const {
   const uint64_t padded = static_cast<uint64_t>(input_height) + 2ull * pad_top;
