@@ -41,7 +41,9 @@ use std::{fs::OpenOptions, mem, os::unix::io::AsRawFd, ptr};
 use iree_rocket_hal::rocket::{
     activation::Activation,
     device::{Buffer, fini_bo, prep_bo, submit},
-    pooling::{PoolingBuffers, PoolingMethod, PoolingShape, build_pooling_regcmd},
+    pooling::{
+        PoolingBuffers, PoolingMethod, PoolingPrecision, PoolingShape, build_pooling_regcmd,
+    },
 };
 
 const DEVICE_PATH: &str = "/dev/accel/accel0";
@@ -59,6 +61,7 @@ fn tiled_shape(method: PoolingMethod) -> PoolingShape {
         output_width: 2,
         output_height: 2,
         output_channels: 1,
+        precision: PoolingPrecision::Int8,
         kernel_width: 2,
         kernel_height: 2,
         stride_x: 2,
@@ -86,6 +89,7 @@ fn whole_input_shape(method: PoolingMethod) -> PoolingShape {
         output_width: 1,
         output_height: 1,
         output_channels: 1,
+        precision: PoolingPrecision::Int8,
         kernel_width: 4,
         kernel_height: 4,
         stride_x: 4,
@@ -120,6 +124,61 @@ fn run_uniform_pooling(shape: &PoolingShape, input_fill: u8, num_output_pixels: 
         ptr::write_bytes(buf_out.host_ptr, 0, TENSOR_SIZE);
 
         run_pooling(&file, fd, shape, &buf_in, &buf_out, num_output_pixels)
+    }
+}
+
+/// Same dispatch as `run_uniform_pooling`, but sizes the BOs from the shape
+/// so the validation cases can cross the old fixed 4 KiB test-buffer limit.
+fn run_uniform_pooling_dynamic(shape: &PoolingShape, input_fill: u8) -> Vec<u8> {
+    assert_eq!(shape.input_channels, 16);
+    assert_eq!(shape.output_channels, 16);
+    assert_eq!(shape.precision, PoolingPrecision::Int8);
+    let input_bytes = (shape.input_width * shape.input_height * 16) as usize;
+    let output_pixels = (shape.output_width * shape.output_height) as usize;
+    let output_bytes = output_pixels.next_multiple_of(4) * 16 + 16;
+    let file = OpenOptions::new()
+        .read(true)
+        .write(true)
+        .open(DEVICE_PATH)
+        .expect("failed to open NPU device");
+    let fd = file.as_raw_fd();
+
+    unsafe {
+        let buf_in = Buffer::new(fd, input_bytes.next_multiple_of(4096), &file);
+        ptr::write_bytes(buf_in.host_ptr, input_fill, input_bytes);
+        let buf_out = Buffer::new(fd, output_bytes.next_multiple_of(4096), &file);
+        ptr::write_bytes(buf_out.host_ptr, 0, output_bytes.next_multiple_of(4096));
+        run_pooling(&file, fd, shape, &buf_in, &buf_out, output_pixels)
+    }
+}
+
+fn validation_shape(
+    width: u32,
+    height: u32,
+    kernel_width: u32,
+    kernel_height: u32,
+    stride_x: u32,
+    stride_y: u32,
+) -> PoolingShape {
+    PoolingShape {
+        input_width: width,
+        input_height: height,
+        input_channels: 16,
+        output_width: (width - kernel_width) / stride_x + 1,
+        output_height: (height - kernel_height) / stride_y + 1,
+        output_channels: 16,
+        precision: PoolingPrecision::Int8,
+        kernel_width,
+        kernel_height,
+        stride_x,
+        stride_y,
+        method: PoolingMethod::Max,
+        pad_left: 0,
+        pad_top: 0,
+        pad_right: 0,
+        pad_bottom: 0,
+        pad_value: 0,
+        activation: Activation::None,
     }
 }
 
@@ -360,6 +419,44 @@ fn pooling_dump_full_output_buffer() {
             "pooling_dump_full_output_buffer: {unchanged_count}/{TENSOR_SIZE} bytes still == 0xAA \
              (if this is TENSOR_SIZE, PPU's write never reached this buffer at all; if less, \
              something did write here -- check what value landed where)"
+        );
+    }
+}
+
+#[test]
+#[ignore = "needs the real NPU device -- validates capture-derived large-surface programming"]
+fn large_spatial_extents_run_on_npu() {
+    for shape in [
+        validation_shape(256, 48, 3, 3, 2, 2),
+        validation_shape(64, 8192, 3, 3, 2, 2),
+    ] {
+        let pixels = run_uniform_pooling_dynamic(&shape, 73);
+        assert!(
+            pixels.iter().all(|&value| value == 73),
+            "{}x{} -> {}x{} max pooling did not preserve a uniform input",
+            shape.input_width,
+            shape.input_height,
+            shape.output_width,
+            shape.output_height
+        );
+    }
+}
+
+#[test]
+#[ignore = "needs the real NPU device -- probes the upper half of the PPU kernel fields"]
+fn large_pooling_windows_run_on_npu() {
+    for shape in [
+        validation_shape(64, 48, 8, 8, 3, 3),
+        validation_shape(64, 48, 16, 16, 16, 16),
+    ] {
+        let pixels = run_uniform_pooling_dynamic(&shape, 91);
+        assert!(
+            pixels.iter().all(|&value| value == 91),
+            "{}x{} kernel with {}x{} stride did not preserve a uniform input",
+            shape.kernel_width,
+            shape.kernel_height,
+            shape.stride_x,
+            shape.stride_y
         );
     }
 }

@@ -15,6 +15,10 @@
 //! [`ConvPlan`]. In particular, it does not enable the CNA zero-skipping
 //! path: that path exists in the TRM, but it is not what this vendor
 //! toolchain emits for any measured Dense/FC shape.
+//!
+//! Hardware validation on an RK3588 confirms this height-one lowering for
+//! both an exact fp16 M=7/K=16/N=32 result and an int8 M=7/K=16/N=33 result.
+//! The latter also exercises the captured odd-N kernel padding.
 
 use crate::rocket::{
     builders::RegCmd,

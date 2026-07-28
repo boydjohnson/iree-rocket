@@ -30,7 +30,8 @@ use crate::rocket::{
         ConvBuffers, ConvShape, build_conv_cna_core_dpu_dpu_rdma, require_single_conv_task,
     },
     regcmd::{
-        KICK_CNA, KICK_CORE, KICK_DPU, KICK_DPU_RDMA, KICK_PPU, KICK_PPU_RDMA, push_kick, zero,
+        KICK_CNA, KICK_CORE, KICK_DPU, KICK_DPU_RDMA, KICK_PPU, KICK_PPU_RDMA,
+        Precision as MesaPrecision, push_kick, zero,
     },
 };
 
@@ -51,12 +52,11 @@ use crate::rocket::{
 // - RESOLVED (hardware-confirmed, real RK3588, via
 //   `pooling_method_encoding_discovery`): `PoolingMethod`'s bit encoding is
 //   Avg=0, Max=1, Min=2 -- see `PoolingMethod::bits()`'s doc comment.
-// - PPU_RDMA's `src_line_stride`/`src_surf_stride` and PPU's
-//   `dst_surf_stride`/`misc_ctrl.surf_len` formulas -- derived by analogy
-//   to CNA's input-side and DPU's output-side stride math in
-//   `build_conv_regcmd`; still not independently confirmed against a
-//   non-uniform/asymmetric shape, but exercised without issue by every
-//   `completes_and_output_tracks_input` test using this path.
+// - RESOLVED by the dedicated 143-capture fp16/int8 pooling sweep:
+//   PPU_RDMA line/surface strides are input width/area; PPU destination
+//   surface stride and `index_add` are output area rounded up to four
+//   pixels; aligned mode leaves `surf_len=0`. The same sweep confirms
+//   spatial extents through 8192 and both precision enums.
 // - RESOLVED (was open when this task hung real hardware, now hardware
 //   re-confirmed working -- all of `pooling_hw.rs`'s tests pass): the kick
 //   used to fire `build_conv_regcmd`'s fixed CNA/CORE/DPU/DPU_RDMA bitmask
@@ -82,7 +82,7 @@ use crate::rocket::{
 /// the real max, raw=2 is the real min, raw=0 sits in between (avg). The
 /// original guess (Max=0, Min=1, Avg=2) had max and min swapped relative to
 /// avg; corrected below.
-#[derive(Clone, Copy)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum PoolingMethod {
     Max,
     Min,
@@ -99,6 +99,41 @@ impl PoolingMethod {
     }
 }
 
+/// Numeric format of the input and output feature maps.
+///
+/// PPU and PPU_RDMA use different enums for the same format. Vendor captures
+/// program `(proc_precision, in_precision)` as `(0, 1)` for int8 and `(2, 2)`
+/// for fp16: PPU's first field is a numeric-domain enum, while PPU_RDMA's is
+/// simply `4/8/16/32-bit = 0/1/2/3`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum PoolingPrecision {
+    Int8,
+    Fp16,
+}
+
+impl PoolingPrecision {
+    fn ppu_precision(self) -> u32 {
+        match self {
+            PoolingPrecision::Int8 => 0,
+            PoolingPrecision::Fp16 => 2,
+        }
+    }
+
+    fn rdma_precision(self) -> u32 {
+        match self {
+            PoolingPrecision::Int8 => 1,
+            PoolingPrecision::Fp16 => 2,
+        }
+    }
+
+    fn from_mesa_precision(precision: MesaPrecision) -> PoolingPrecision {
+        match precision {
+            MesaPrecision::Int8 => PoolingPrecision::Int8,
+            MesaPrecision::Fp16 => PoolingPrecision::Fp16,
+        }
+    }
+}
+
 /// Logical shape of a single standalone pooling operation. Single-task
 /// only, no CBUF-budget splitting to worry about (PPU has no CBUF -- that
 /// concern is CNA/CORE-specific), no `index_en` output wiring yet (that
@@ -111,6 +146,7 @@ pub struct PoolingShape {
     pub output_width: u32,
     pub output_height: u32,
     pub output_channels: u32,
+    pub precision: PoolingPrecision,
     pub kernel_width: u32,
     pub kernel_height: u32,
     pub stride_x: u32,
@@ -133,6 +169,126 @@ pub struct PoolingShape {
     /// DPU at all) cannot honor this and asserts it's `Activation::None`
     /// rather than silently ignoring a non-`None` value.
     pub activation: Activation,
+}
+
+const MAX_PPU_EXTENT: u32 = 8192;
+const MAX_PPU_KERNEL_OR_STRIDE: u32 = 16;
+const MAX_PPU_PADDING: u32 = 7;
+
+fn output_extent(input: u32, kernel: u32, stride: u32, before: u32, after: u32) -> u32 {
+    let padded = input
+        .checked_add(before)
+        .and_then(|value| value.checked_add(after))
+        .expect("pooling padded extent overflows u32");
+    assert!(
+        padded >= kernel,
+        "pooling kernel {kernel} exceeds padded input extent {padded}"
+    );
+    (padded - kernel) / stride + 1
+}
+
+fn required_trailing_padding(
+    input: u32,
+    output: u32,
+    kernel: u32,
+    stride: u32,
+    leading_padding: u32,
+) -> u32 {
+    ((output - 1) * stride + kernel).saturating_sub(input + leading_padding)
+}
+
+fn validate_pooling_geometry(
+    input_width: u32,
+    input_height: u32,
+    input_channels: u32,
+    output_width: u32,
+    output_height: u32,
+    output_channels: u32,
+    kernel_width: u32,
+    kernel_height: u32,
+    stride_x: u32,
+    stride_y: u32,
+    pad_left: u32,
+    pad_top: u32,
+    pad_right: u32,
+    pad_bottom: u32,
+) {
+    for (name, value) in [
+        ("input width", input_width),
+        ("input height", input_height),
+        ("input channels", input_channels),
+        ("output width", output_width),
+        ("output height", output_height),
+        ("output channels", output_channels),
+    ] {
+        assert!(
+            (1..=MAX_PPU_EXTENT).contains(&value),
+            "{name} must be 1..={MAX_PPU_EXTENT}, the PPU's 13-bit N-1 range"
+        );
+    }
+    for (name, value) in [
+        ("kernel width", kernel_width),
+        ("kernel height", kernel_height),
+        ("horizontal stride", stride_x),
+        ("vertical stride", stride_y),
+    ] {
+        assert!(
+            (1..=MAX_PPU_KERNEL_OR_STRIDE).contains(&value),
+            "{name} must be 1..={MAX_PPU_KERNEL_OR_STRIDE}, the PPU's 4-bit N-1 range"
+        );
+    }
+    for (name, value) in [
+        ("left padding", pad_left),
+        ("top padding", pad_top),
+        ("right padding", pad_right),
+        ("bottom padding", pad_bottom),
+    ] {
+        assert!(
+            value <= MAX_PPU_PADDING,
+            "{name} must be 0..={MAX_PPU_PADDING}, the PPU's 3-bit range"
+        );
+    }
+    assert_eq!(
+        input_channels, output_channels,
+        "pooling preserves the channel count"
+    );
+    assert_eq!(
+        output_width,
+        output_extent(input_width, kernel_width, stride_x, pad_left, pad_right),
+        "pooling output width does not match floor-mode geometry"
+    );
+    assert_eq!(
+        output_height,
+        output_extent(input_height, kernel_height, stride_y, pad_top, pad_bottom),
+        "pooling output height does not match floor-mode geometry"
+    );
+}
+
+impl PoolingShape {
+    /// Checks every field-width and logical-geometry invariant before register
+    /// emission. The 8192 spatial boundary is confirmed by the vendor's
+    /// explicit 8193 overflow diagnostic; kernel/stride 1..=16 and padding
+    /// 0..=7 are the exact register ranges. Vendor direct programs cover
+    /// kernels through 8 and strides through 3, while existing RK3588 tests
+    /// independently confirm a 4x4 kernel/stride.
+    pub fn validate(&self) {
+        validate_pooling_geometry(
+            self.input_width,
+            self.input_height,
+            self.input_channels,
+            self.output_width,
+            self.output_height,
+            self.output_channels,
+            self.kernel_width,
+            self.kernel_height,
+            self.stride_x,
+            self.stride_y,
+            self.pad_left,
+            self.pad_top,
+            self.pad_right,
+            self.pad_bottom,
+        );
+    }
 }
 
 /// DMA addresses for the two buffers a standalone pooling op needs.
@@ -182,6 +338,7 @@ fn build_ppu_standalone_flying(
     input_addr: u32,
     output_addr: u32,
 ) -> Vec<RegCmd> {
+    shape.validate();
     assert!(
         output_addr.is_multiple_of(16),
         "build_ppu_standalone_flying: output_addr {output_addr:#x} is not 16-byte aligned -- \
@@ -214,18 +371,40 @@ fn build_ppu_standalone_flying(
     let src_surf_stride =
         (shape.input_width * ATOMIC_K_SIZE * shape.input_height) / FEATURE_ATOMIC_SIZE;
 
-    // UNCONFIRMED, derived by analogy to DPU's output-side stride math in
-    // build_conv_regcmd -- see module doc comment.
-    let dst_surf_stride =
-        (shape.output_width * ATOMIC_K_SIZE * shape.output_height) / FEATURE_ATOMIC_SIZE;
-    let surf_len = shape.output_width * shape.output_height;
-
-    // Average-pooling's divide-as-multiply trick (TRM §4.6): precomputed
-    // reciprocal of the kernel dimension, x2^16. Always computed (not just
-    // under Avg) -- build_conv_regcmd's own precedent is to always fill
-    // every register regardless of which branch is logically active.
-    let recip_kernel_width = ((1u64 << 16) / shape.kernel_width as u64) as u32;
-    let recip_kernel_height = ((1u64 << 16) / shape.kernel_height as u64) as u32;
+    // Capture-derived: destination surfaces are four-pixel aligned. This is
+    // visible on rectangular kernels whose odd output area makes the padding
+    // observable (for example, 31*23=713 is programmed as 716).
+    let dst_surf_stride = ((shape.output_width * ATOMIC_K_SIZE * shape.output_height)
+        / FEATURE_ATOMIC_SIZE)
+        .next_multiple_of(4);
+    // Vendor captures leave these zero for Max. Average pooling consumes
+    // the fixed-point reciprocals; Min, like Max, ignores them.
+    let (recip_kernel_width, recip_kernel_height) = match shape.method {
+        PoolingMethod::Avg => (
+            ((1u64 << 16) / u64::from(shape.kernel_width)) as u32,
+            ((1u64 << 16) / u64::from(shape.kernel_height)) as u32,
+        ),
+        PoolingMethod::Max | PoolingMethod::Min => (0, 0),
+    };
+    // The vendor programs only trailing padding that an emitted output
+    // window actually reaches. ONNX may carry an additional right/bottom pad
+    // that leaves floor-mode output geometry unchanged; programming it is
+    // unnecessary. For 3x3/s2/pad1 this turns [1,1,1,1] into the captured
+    // [top=1,left=1,bottom=0,right=0].
+    let programmed_pad_right = required_trailing_padding(
+        shape.input_width,
+        shape.output_width,
+        shape.kernel_width,
+        shape.stride_x,
+        shape.pad_left,
+    );
+    let programmed_pad_bottom = required_trailing_padding(
+        shape.input_height,
+        shape.output_height,
+        shape.kernel_height,
+        shape.stride_y,
+        shape.pad_top,
+    );
 
     let mut cmds: Vec<RegCmd> = Vec::new();
 
@@ -283,7 +462,11 @@ fn build_ppu_standalone_flying(
             .src_surf_stride(Bits::new(src_surf_stride))
             .build(),
     );
-    cmds.push(zero::<PpuRdmaDataFormat>()); // in_precision = 0 (int8)
+    cmds.push(
+        Register::<PpuRdmaDataFormat>::new()
+            .in_precision(Bits::new(shape.precision.rdma_precision()))
+            .build(),
+    );
 
     // ========================================================================
     // PPU
@@ -351,8 +534,8 @@ fn build_ppu_standalone_flying(
         Register::<PpuPoolingPaddingCfg>::new()
             .pad_left(Bits::new(shape.pad_left))
             .pad_top(Bits::new(shape.pad_top))
-            .pad_right(Bits::new(shape.pad_right))
-            .pad_bottom(Bits::new(shape.pad_bottom))
+            .pad_right(Bits::new(programmed_pad_right))
+            .pad_bottom(Bits::new(programmed_pad_bottom))
             .build(),
     );
     cmds.push(
@@ -372,13 +555,22 @@ fn build_ppu_standalone_flying(
             .dst_surf_stride(Bits::new(dst_surf_stride))
             .build(),
     );
-    cmds.push(zero::<PpuDataFormat>()); // proc_precision=0 (int8), dpu_flyin=0 (standalone)
+    cmds.push(
+        Register::<PpuDataFormat>::new()
+            .proc_precision(Bits::new(shape.precision.ppu_precision()))
+            .dpu_flyin(Bits::new(0))
+            .index_add(Bits::new(dst_surf_stride))
+            .build(),
+    );
     cmds.push(
         Register::<PpuMiscCtrl>::new()
-            .burst_len(Bits::new(15))
+            .burst_len(Bits::new(3))
             .nonalign(Bits::new(0))
             .mc_surf_out(Bits::new(0))
-            .surf_len(Bits::new(surf_len))
+            // Only meaningful in non-aligned mode. Keeping this zero, as
+            // every direct vendor capture does, avoids imposing its 16-bit
+            // field width on otherwise valid large output surfaces.
+            .surf_len(Bits::new(0))
             .build(),
     );
 
@@ -494,6 +686,12 @@ pub fn build_pooling_via_dpu_bypass_regcmd(
     pooling_shape: &PoolingShape,
     bufs: &PoolingViaBypassBuffers,
 ) -> (Vec<RegCmd>, Vec<RegCmd>) {
+    pooling_shape.validate();
+    assert_eq!(
+        pooling_shape.precision,
+        PoolingPrecision::from_mesa_precision(bypass_shape.precision),
+        "pooling precision must match the DPU bypass output precision"
+    );
     assert!(
         bufs.bypass_output_addr.is_multiple_of(16),
         "build_pooling_via_dpu_bypass_regcmd: bypass_output_addr {:#x} is not \
@@ -609,6 +807,7 @@ pub struct PipelinedPoolingShape {
     pub output_width: u32,
     pub output_height: u32,
     pub output_channels: u32,
+    pub precision: PoolingPrecision,
 }
 
 /// DMA addresses for a conv-then-pipelined-pooling op. Unlike
@@ -628,6 +827,27 @@ pub fn build_conv_then_pooling_regcmd(
     pooling: &PipelinedPoolingShape,
     bufs: &ConvThenPoolingBuffers,
 ) -> Vec<RegCmd> {
+    validate_pooling_geometry(
+        conv_shape.output_width,
+        conv_shape.output_height,
+        conv_shape.output_channels,
+        pooling.output_width,
+        pooling.output_height,
+        pooling.output_channels,
+        pooling.kernel_width,
+        pooling.kernel_height,
+        pooling.stride_x,
+        pooling.stride_y,
+        pooling.pad_left,
+        pooling.pad_top,
+        pooling.pad_right,
+        pooling.pad_bottom,
+    );
+    assert_eq!(
+        pooling.precision,
+        PoolingPrecision::from_mesa_precision(conv_shape.precision),
+        "pooling precision must match the pipelined DPU output precision"
+    );
     assert!(
         bufs.output_addr.is_multiple_of(16),
         "build_conv_then_pooling_regcmd: output_addr {:#x} is not 16-byte aligned -- \
@@ -719,8 +939,27 @@ pub fn build_conv_then_pooling_regcmd(
             .build(),
     );
 
-    let recip_kernel_width = ((1u64 << 16) / pooling.kernel_width as u64) as u32;
-    let recip_kernel_height = ((1u64 << 16) / pooling.kernel_height as u64) as u32;
+    let (recip_kernel_width, recip_kernel_height) = match pooling.method {
+        PoolingMethod::Avg => (
+            ((1u64 << 16) / u64::from(pooling.kernel_width)) as u32,
+            ((1u64 << 16) / u64::from(pooling.kernel_height)) as u32,
+        ),
+        PoolingMethod::Max | PoolingMethod::Min => (0, 0),
+    };
+    let programmed_pad_right = required_trailing_padding(
+        conv_shape.output_width,
+        pooling.output_width,
+        pooling.kernel_width,
+        pooling.stride_x,
+        pooling.pad_left,
+    );
+    let programmed_pad_bottom = required_trailing_padding(
+        conv_shape.output_height,
+        pooling.output_height,
+        pooling.kernel_height,
+        pooling.stride_y,
+        pooling.pad_top,
+    );
     cmds.push(
         Register::<PpuRecipKernelWidth>::new()
             .recip_kernel_width(Bits::new(recip_kernel_width))
@@ -735,8 +974,8 @@ pub fn build_conv_then_pooling_regcmd(
         Register::<PpuPoolingPaddingCfg>::new()
             .pad_left(Bits::new(pooling.pad_left))
             .pad_top(Bits::new(pooling.pad_top))
-            .pad_right(Bits::new(pooling.pad_right))
-            .pad_bottom(Bits::new(pooling.pad_bottom))
+            .pad_right(Bits::new(programmed_pad_right))
+            .pad_bottom(Bits::new(programmed_pad_bottom))
             .build(),
     );
     cmds.push(
@@ -757,8 +996,9 @@ pub fn build_conv_then_pooling_regcmd(
             .dst_base_addr(Bits::new(bufs.output_addr >> 4))
             .build(),
     );
-    let ppu_dst_surf_stride =
-        (pooling.output_width * ATOMIC_K_SIZE * pooling.output_height) / FEATURE_ATOMIC_SIZE;
+    let ppu_dst_surf_stride = ((pooling.output_width * ATOMIC_K_SIZE * pooling.output_height)
+        / FEATURE_ATOMIC_SIZE)
+        .next_multiple_of(4);
     cmds.push(
         Register::<PpuDstSurfStride>::new()
             .dst_surf_stride(Bits::new(ppu_dst_surf_stride))
@@ -766,16 +1006,17 @@ pub fn build_conv_then_pooling_regcmd(
     );
     cmds.push(
         Register::<PpuDataFormat>::new()
+            .proc_precision(Bits::new(pooling.precision.ppu_precision()))
             .dpu_flyin(Bits::new(1)) // source is DPU's on-chip output, not PPU_RDMA
+            .index_add(Bits::new(ppu_dst_surf_stride))
             .build(),
     );
-    let surf_len = pooling.output_width * pooling.output_height;
     cmds.push(
         Register::<PpuMiscCtrl>::new()
-            .burst_len(Bits::new(15))
+            .burst_len(Bits::new(3))
             .nonalign(Bits::new(0))
             .mc_surf_out(Bits::new(0))
-            .surf_len(Bits::new(surf_len))
+            .surf_len(Bits::new(0))
             .build(),
     );
 
@@ -912,4 +1153,174 @@ pub fn build_max_reduction_tree_regcmd(
             )
         })
         .collect()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::rocket::builders::RegisterMeta;
+
+    fn shape(
+        width: u32,
+        height: u32,
+        kernel_width: u32,
+        kernel_height: u32,
+        stride_x: u32,
+        stride_y: u32,
+        precision: PoolingPrecision,
+    ) -> PoolingShape {
+        let output_width = (width - kernel_width) / stride_x + 1;
+        let output_height = (height - kernel_height) / stride_y + 1;
+        PoolingShape {
+            input_width: width,
+            input_height: height,
+            input_channels: 16,
+            output_width,
+            output_height,
+            output_channels: 16,
+            precision,
+            kernel_width,
+            kernel_height,
+            stride_x,
+            stride_y,
+            method: PoolingMethod::Max,
+            pad_left: 0,
+            pad_top: 0,
+            pad_right: 0,
+            pad_bottom: 0,
+            pad_value: 0,
+            activation: Activation::None,
+        }
+    }
+
+    fn register_value<R: RegisterMeta>(commands: &[RegCmd]) -> u32 {
+        let command = commands
+            .iter()
+            .find(|command| {
+                ((command.0 >> 48) as u32) == R::DOMAIN && (command.0 as u32 & 0xffff) == R::OFFSET
+            })
+            .expect("register is present");
+        (command.0 >> 16) as u32
+    }
+
+    #[test]
+    fn capture_precision_enums_and_aligned_output_controls_are_programmed() {
+        for (precision, ppu, rdma) in [
+            (PoolingPrecision::Int8, 0, 1),
+            (PoolingPrecision::Fp16, 2, 2),
+        ] {
+            let shape = shape(64, 48, 3, 3, 2, 2, precision);
+            let commands = build_pooling_regcmd(
+                &shape,
+                &PoolingBuffers {
+                    input_addr: 0,
+                    output_addr: 0,
+                },
+            );
+            let output_area = (shape.output_width * shape.output_height).next_multiple_of(4);
+            assert_eq!(
+                register_value::<PpuRdmaDataFormat>(&commands),
+                rdma,
+                "{precision:?} PPU_RDMA precision"
+            );
+            assert_eq!(
+                register_value::<PpuDataFormat>(&commands),
+                output_area << 4 | ppu,
+                "{precision:?} PPU precision and index_add"
+            );
+            assert_eq!(
+                register_value::<PpuDstSurfStride>(&commands),
+                output_area << 4
+            );
+            assert_eq!(register_value::<PpuMiscCtrl>(&commands), 3);
+            assert_eq!(register_value::<PpuRecipKernelWidth>(&commands), 0);
+            assert_eq!(register_value::<PpuRecipKernelHeight>(&commands), 0);
+        }
+    }
+
+    #[test]
+    fn large_spatial_extents_do_not_depend_on_surf_len() {
+        let shape = shape(64, 8192, 3, 3, 2, 2, PoolingPrecision::Fp16);
+        let commands = build_pooling_regcmd(
+            &shape,
+            &PoolingBuffers {
+                input_addr: 0,
+                output_addr: 0,
+            },
+        );
+        let output_area = (31_u32 * 4095).next_multiple_of(4);
+        assert_eq!(register_value::<PpuDataCubeInHeight>(&commands), 8191);
+        assert_eq!(register_value::<PpuDataCubeOutHeight>(&commands), 4094);
+        assert_eq!(
+            register_value::<PpuRdmaSrcSurfStride>(&commands),
+            (64 * 8192) << 4
+        );
+        assert_eq!(
+            register_value::<PpuDstSurfStride>(&commands),
+            output_area << 4
+        );
+        assert_eq!(
+            register_value::<PpuDataFormat>(&commands),
+            output_area << 4 | 2
+        );
+        assert_eq!(register_value::<PpuMiscCtrl>(&commands), 3);
+    }
+
+    #[test]
+    fn full_kernel_and_stride_fields_remain_available() {
+        let shape = shape(64, 48, 16, 16, 16, 16, PoolingPrecision::Int8);
+        let commands = build_pooling_regcmd(
+            &shape,
+            &PoolingBuffers {
+                input_addr: 0,
+                output_addr: 0,
+            },
+        );
+        assert_eq!(
+            register_value::<PpuPoolingKernelCfg>(&commands),
+            0x00ff_0f0f
+        );
+    }
+
+    #[test]
+    fn trailing_padding_is_programmed_only_when_an_output_window_reaches_it() {
+        let mut padded = shape(64, 48, 3, 3, 2, 2, PoolingPrecision::Fp16);
+        padded.pad_left = 1;
+        padded.pad_top = 1;
+        padded.pad_right = 1;
+        padded.pad_bottom = 1;
+        padded.output_width = 32;
+        padded.output_height = 24;
+        let commands = build_pooling_regcmd(
+            &padded,
+            &PoolingBuffers {
+                input_addr: 0,
+                output_addr: 0,
+            },
+        );
+        assert_eq!(register_value::<PpuPoolingPaddingCfg>(&commands), 0x11);
+
+        padded.stride_x = 3;
+        padded.output_width = 22;
+        let commands = build_pooling_regcmd(
+            &padded,
+            &PoolingBuffers {
+                input_addr: 0,
+                output_addr: 0,
+            },
+        );
+        assert_eq!(register_value::<PpuPoolingPaddingCfg>(&commands), 0x111);
+    }
+
+    #[test]
+    #[should_panic(expected = "input width must be 1..=8192")]
+    fn rejects_extent_beyond_vendor_confirmed_field_boundary() {
+        shape(8193, 48, 3, 3, 2, 2, PoolingPrecision::Int8).validate();
+    }
+
+    #[test]
+    #[should_panic(expected = "kernel width must be 1..=16")]
+    fn rejects_kernel_beyond_hardware_field() {
+        shape(64, 48, 17, 3, 2, 2, PoolingPrecision::Int8).validate();
+    }
 }

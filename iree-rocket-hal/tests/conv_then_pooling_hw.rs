@@ -30,7 +30,7 @@ use iree_rocket_hal::rocket::{
     device::{Buffer, fini_bo, prep_bo, submit},
     mesa_conv::ConvShape,
     pooling::{
-        ConvThenPoolingBuffers, PipelinedPoolingShape, PoolingMethod,
+        ConvThenPoolingBuffers, PipelinedPoolingShape, PoolingMethod, PoolingPrecision,
         build_conv_then_pooling_regcmd,
     },
     regcmd::Precision,
@@ -81,6 +81,7 @@ fn pooling_shape(method: PoolingMethod) -> PipelinedPoolingShape {
         output_width: 2,
         output_height: 2,
         output_channels: 1,
+        precision: PoolingPrecision::Int8,
     }
 }
 

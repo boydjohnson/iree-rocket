@@ -34,7 +34,8 @@ use iree_rocket_hal::rocket::{
     device::{Buffer, close_bo, fini_bo, prep_bo, submit},
     mesa_conv::ConvShape,
     pooling::{
-        PoolingMethod, PoolingShape, PoolingViaBypassBuffers, build_pooling_via_dpu_bypass_regcmd,
+        PoolingMethod, PoolingPrecision, PoolingShape, PoolingViaBypassBuffers,
+        build_pooling_via_dpu_bypass_regcmd,
     },
     regcmd::Precision,
 };
@@ -92,6 +93,7 @@ fn pooling_shape_with_activation(method: PoolingMethod, activation: Activation) 
         output_width: 2,
         output_height: 2,
         output_channels: 1,
+        precision: PoolingPrecision::Int8,
         kernel_width: 2,
         kernel_height: 2,
         stride_x: 2,
