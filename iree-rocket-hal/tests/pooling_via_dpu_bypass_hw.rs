@@ -1,5 +1,5 @@
-//! Hardware-in-the-loop tests for `build_pooling_via_dpu_bypass_regcmd` --
-//! the real two-kick shape a vendor-compiled model actually emits (see
+//! Hardware-in-the-loop tests for `build_pooling_via_dpu_bypass_tasks` --
+//! the real multi-task shape a vendor-compiled model actually emits (see
 //! `pooling.rs`'s module doc comment above that function, and
 //! rknpu-spelunking/NOTES.md's "Decoding a real regcmd program for a
 //! pooling-only op"). The standalone-only hardware suite was retired after
@@ -19,25 +19,25 @@
 //! int8 identity, fills every input pixel with a position-dependent value,
 //! and compares every pooling output against a CPU reference. It spans
 //! rectangular inputs, kernels and strides, the direct PPU width boundary,
-//! and the largest directly hardware-backed 8x8 pooling window.
+//! the largest directly hardware-backed 8x8 pooling window, and a tiled
+//! width whose job is `DPU bypass -> PPU tile 0 -> PPU tile 1`.
 //!
-//! First hardware round with these tests found (and this file was rewritten
-//! after) that `build_pooling_via_dpu_bypass_regcmd`'s two kicks genuinely
-//! need two separate `submit()`/`prep_bo()` round trips -- a single
-//! combined-blob submission left the bypass stage's intermediate buffer
-//! completely unwritten (sentinel-fill diagnostic showed 128/128 bytes
-//! still at the 0xAA prefill). See `build_pooling_via_dpu_bypass_regcmd`'s
-//! module doc comment in `pooling.rs` for the full story.
+//! An early hardware round concatenated the bypass and PPU register streams
+//! into one `rocket_task`; its second kick replaced the first before the
+//! bypass ran. That demonstrates that each kick needs a complete task
+//! boundary. It does not require separate jobs: this suite submits all task
+//! programs as the ordered `rocket_task` array of one `rocket_job`, matching
+//! the driver's task-advance mechanism.
 
 use std::{fs::OpenOptions, mem, os::unix::io::AsRawFd, ptr};
 
 use iree_rocket_hal::rocket::{
     activation::Activation,
     conv::{self, BsEntry, Kernels, Multiplier, Quantization, write_bs_buffer},
-    device::{Buffer, close_bo, fini_bo, prep_bo, submit},
+    device::{Buffer, close_bo, fini_bo, prep_bo, submit_tasks},
     pooling::{
-        PoolingMethod, PoolingPrecision, PoolingShape, PoolingViaBypassBuffers,
-        build_pooling_via_dpu_bypass_regcmd,
+        PoolingMethod, PoolingPlan, PoolingPrecision, PoolingShape, PoolingViaBypassBuffers,
+        build_pooling_via_dpu_bypass_tasks,
     },
     tensor_layout::pack_hwcf_to_rocket_weights,
 };
@@ -79,7 +79,7 @@ fn pooling_shape(method: PoolingMethod) -> PoolingShape {
 }
 
 /// Same geometry as `pooling_shape`, with an explicit fused activation --
-/// Phase 3 of the ukernel roadmap. `build_pooling_via_dpu_bypass_regcmd`
+/// Phase 3 of the ukernel roadmap. `build_pooling_via_dpu_bypass_tasks`
 /// applies this to the bypass conv stage's own fused-activation stage (see
 /// its own doc comment); `pooling_shape`'s `activation: Activation::None`
 /// above is just the common case of this with `None`.
@@ -117,7 +117,7 @@ struct Bufs {
 }
 
 /// Allocates and fills every buffer this shape needs, but does NOT submit
-/// anything -- shared setup for both the real test (two submits) and the
+/// anything -- shared setup for both the real multi-task job and the
 /// diagnostic (which also sentinel-fills buf_mid/buf_out differently).
 fn setup(input_fill: u8, weight_fill: u8, out_fill: u8) -> Bufs {
     let file = OpenOptions::new()
@@ -182,7 +182,7 @@ impl Bufs {
     /// leaks for the rest of the process's lifetime. Added after repeated
     /// calls to `run_uniform_pooling_via_bypass` within one test (up to 6x
     /// in `pooling_via_bypass_repeat_dispatch_dump`, each leaking 7 GEM
-    /// handles including `run_two_stage`'s own regcmd buffers) were found
+    /// handles including `run_task_chain`'s own regcmd buffers) were found
     /// to produce corrupted/stale results, while the identical dispatch
     /// run exactly once in a fresh process was clean.
     unsafe fn close(self) {
@@ -196,9 +196,8 @@ impl Bufs {
     }
 }
 
-/// Runs the two-kick bypass-then-pool shape as two genuinely separate
-/// `submit()`/`prep_bo()` round trips (see this file's top doc comment for
-/// why) and returns the real output pixels at their 16-byte atomic stride.
+/// Runs the bypass-then-pool shape as one ordered multi-task job and returns
+/// the real output pixels at their 16-byte atomic stride.
 fn run_uniform_pooling_via_bypass(
     method: PoolingMethod,
     input_fill: u8,
@@ -214,7 +213,7 @@ fn run_uniform_pooling_via_bypass(
 
 /// Same as `run_uniform_pooling_via_bypass`, with an explicit fused
 /// activation on the pooling op (Phase 3, applied to the bypass conv
-/// stage's own fused-activation stage by `build_pooling_via_dpu_bypass_regcmd`)
+/// stage's own fused-activation stage by `build_pooling_via_dpu_bypass_tasks`)
 /// instead of always `None`.
 fn run_uniform_pooling_via_bypass_with_activation(
     method: PoolingMethod,
@@ -224,7 +223,7 @@ fn run_uniform_pooling_via_bypass_with_activation(
 ) -> Vec<u8> {
     let b = setup(input_fill, weight_fill, 0);
     unsafe {
-        run_two_stage(
+        run_task_chain(
             &b,
             &bypass_shape(),
             &pooling_shape_with_activation(method, activation),
@@ -237,7 +236,7 @@ fn run_uniform_pooling_via_bypass_with_activation(
     pixels
 }
 
-unsafe fn run_two_stage(b: &Bufs, bypass: &conv::Shape, pooling: &PoolingShape) {
+unsafe fn run_task_chain(b: &Bufs, bypass: &conv::Shape, pooling: &PoolingShape) {
     unsafe {
         let bufs = PoolingViaBypassBuffers {
             input_addr: b.buf_in.dma_address,
@@ -246,69 +245,44 @@ unsafe fn run_two_stage(b: &Bufs, bypass: &conv::Shape, pooling: &PoolingShape) 
             bypass_output_addr: b.buf_mid.dma_address,
             output_addr: b.buf_out.dma_address,
         };
-        let (bypass_cmds, pooling_cmds) =
-            build_pooling_via_dpu_bypass_regcmd(bypass, BYPASS_KERNELS, pooling, &bufs);
-
-        // Stage 1: submit and fully wait for the bypass conv to finish
-        // writing buf_mid before touching stage 2 at all.
-        let cmd_bytes_1 = bypass_cmds.len() * mem::size_of::<u64>();
-        let cmd_len_1 = cmd_bytes_1.next_multiple_of(4096);
-        let buf_cmd_1 = Buffer::new(b.fd, cmd_len_1, &b.file);
-        let cmd_slice_1 =
-            std::slice::from_raw_parts_mut(buf_cmd_1.host_ptr as *mut u64, bypass_cmds.len());
-        for (i, c) in bypass_cmds.iter().enumerate() {
-            cmd_slice_1[i] = c.0;
+        let programs = build_pooling_via_dpu_bypass_tasks(bypass, BYPASS_KERNELS, pooling, &bufs);
+        let mut command_buffers = Vec::with_capacity(programs.len());
+        for program in &programs {
+            let command_bytes = program.len() * mem::size_of::<u64>();
+            let command_buffer = Buffer::new(b.fd, command_bytes.next_multiple_of(4096), &b.file);
+            let command_slice =
+                std::slice::from_raw_parts_mut(command_buffer.host_ptr as *mut u64, program.len());
+            for (slot, command) in command_slice.iter_mut().zip(program) {
+                *slot = command.0;
+            }
+            fini_bo(b.fd, command_buffer.handle)
+                .expect("failed to sync pooling command BO for the NPU");
+            command_buffers.push(command_buffer);
         }
-        fini_bo(b.fd, buf_cmd_1.handle).ok();
 
-        let in_handles_1 = [
-            buf_cmd_1.handle,
-            b.buf_in.handle,
-            b.buf_w.handle,
-            b.buf_bias.handle,
-        ];
-        let out_handles_1 = [b.buf_mid.handle];
-        submit(
-            b.fd,
-            buf_cmd_1.dma_address,
-            bypass_cmds.len() as u32,
-            &in_handles_1,
-            &out_handles_1,
-        )
-        .expect("stage 1 SUBMIT ioctl failed");
-        prep_bo(b.fd, b.buf_mid.handle, 2_000_000_000)
-            .expect("stage 1 (bypass conv) did not complete within timeout");
-        // Purely local to this stage, never needed again -- close it
-        // immediately rather than leaking it for the rest of the process.
-        close_bo(b.fd, buf_cmd_1.handle).ok();
+        let tasks: Vec<_> = command_buffers
+            .iter()
+            .zip(&programs)
+            .map(|(buffer, program)| (buffer.dma_address, program.len() as u32))
+            .collect();
+        let mut in_handles: Vec<_> = command_buffers.iter().map(|buffer| buffer.handle).collect();
+        in_handles.extend([b.buf_in.handle, b.buf_w.handle, b.buf_bias.handle]);
+        let out_handles = [b.buf_mid.handle, b.buf_out.handle];
 
-        // Stage 2: submit only after stage 1 is fully done.
-        let cmd_bytes_2 = pooling_cmds.len() * mem::size_of::<u64>();
-        let cmd_len_2 = cmd_bytes_2.next_multiple_of(4096);
-        let buf_cmd_2 = Buffer::new(b.fd, cmd_len_2, &b.file);
-        let cmd_slice_2 =
-            std::slice::from_raw_parts_mut(buf_cmd_2.host_ptr as *mut u64, pooling_cmds.len());
-        for (i, c) in pooling_cmds.iter().enumerate() {
-            cmd_slice_2[i] = c.0;
-        }
-        fini_bo(b.fd, buf_cmd_2.handle).ok();
-        // buf_out was CPU-filled during setup() and handed off with fini_bo
-        // there. Keep the ordering in mind: the CPU's dirty sentinel fill
-        // must be visible before the PPU writes this buffer.
+        submit_tasks(b.fd, &tasks, &in_handles, &out_handles)
+            .expect("bypass-plus-pooling multi-task SUBMIT ioctl failed");
 
-        let in_handles_2 = [buf_cmd_2.handle, b.buf_mid.handle];
-        let out_handles_2 = [b.buf_out.handle];
-        submit(
-            b.fd,
-            buf_cmd_2.dma_address,
-            pooling_cmds.len() as u32,
-            &in_handles_2,
-            &out_handles_2,
-        )
-        .expect("stage 2 SUBMIT ioctl failed");
+        // Waiting on either output waits for the one job fence, hence every
+        // task. PREP both only after that wait so both CPU mappings are
+        // synchronized before the numerical checks inspect them.
         prep_bo(b.fd, b.buf_out.handle, 2_000_000_000)
-            .expect("stage 2 (pooling) did not complete within timeout");
-        close_bo(b.fd, buf_cmd_2.handle).ok();
+            .expect("bypass-plus-pooling job did not complete within timeout");
+        prep_bo(b.fd, b.buf_mid.handle, 2_000_000_000)
+            .expect("failed to synchronize bypass intermediate after job completion");
+
+        for command_buffer in command_buffers {
+            close_bo(b.fd, command_buffer.handle).ok();
+        }
     }
 }
 
@@ -323,7 +297,7 @@ struct NumericCase {
     stride_y: u32,
 }
 
-const NUMERIC_CASES: [NumericCase; 6] = [
+const NUMERIC_CASES: [NumericCase; 7] = [
     NumericCase {
         name: "small_square",
         width: 4,
@@ -373,6 +347,15 @@ const NUMERIC_CASES: [NumericCase; 6] = [
         name: "direct_width_boundary",
         width: 129,
         height: 17,
+        kernel_width: 3,
+        kernel_height: 3,
+        stride_x: 2,
+        stride_y: 2,
+    },
+    NumericCase {
+        name: "two_horizontal_tiles",
+        width: 256,
+        height: 9,
         kernel_width: 3,
         kernel_height: 3,
         stride_x: 2,
@@ -532,7 +515,7 @@ fn run_numeric_case(case: NumericCase, method: PoolingMethod) -> (Vec<i8>, Vec<i
             buf_mid,
             buf_out,
         };
-        run_two_stage(&buffers, &bypass, &pooling);
+        run_task_chain(&buffers, &bypass, &pooling);
 
         let intermediate = std::slice::from_raw_parts(buffers.buf_mid.host_ptr, intermediate_bytes);
         for (pixel, &want) in input.iter().enumerate() {
@@ -576,12 +559,12 @@ fn assert_numeric_matrix(method: PoolingMethod, tolerance: i16) {
 }
 
 #[test]
-fn numerical_dimension_matrix_is_single_pair_plannable() {
+fn numerical_dimension_matrix_has_expected_task_chain() {
     for case in NUMERIC_CASES {
         for method in [PoolingMethod::Max, PoolingMethod::Min, PoolingMethod::Avg] {
             let bypass = numeric_bypass_shape(case);
             let pooling = numeric_pooling_shape(case, method);
-            let (bypass_program, pooling_program) = build_pooling_via_dpu_bypass_regcmd(
+            let programs = build_pooling_via_dpu_bypass_tasks(
                 &bypass,
                 BYPASS_KERNELS,
                 &pooling,
@@ -593,10 +576,15 @@ fn numerical_dimension_matrix_is_single_pair_plannable() {
                     output_addr: 0x8000,
                 },
             );
-            assert!(!bypass_program.is_empty(), "{} bypass program", case.name);
+            assert_eq!(
+                programs.len(),
+                1 + PoolingPlan::new(pooling).tiles().len(),
+                "{} {method:?} task count",
+                case.name
+            );
             assert!(
-                !pooling_program.is_empty(),
-                "{} {method:?} pooling program",
+                programs.iter().all(|program| !program.is_empty()),
+                "{} {method:?} emitted an empty task",
                 case.name
             );
             assert_eq!(
@@ -682,7 +670,7 @@ completes_and_tracks_input_test!(
             diagnostic only, not a pass/fail check -- read the printed hex dumps"]
 fn pooling_via_bypass_dump_intermediate_and_output_buffers() {
     let b = setup(200, 2, 0xAA);
-    unsafe { run_two_stage(&b, &bypass_shape(), &pooling_shape(PoolingMethod::Min)) };
+    unsafe { run_task_chain(&b, &bypass_shape(), &pooling_shape(PoolingMethod::Min)) };
 
     unsafe {
         prep_bo(b.fd, b.buf_mid.handle, 2_000_000_000).ok();
@@ -749,7 +737,7 @@ fn pooling_via_bypass_repeat_dispatch_dump() {
 /// The bypass stage's conv now goes through `conv.rs`'s capture-derived
 /// builder, which fuses activation via the BN stage instead of the retired
 /// Mesa-derived builder's BS stage (see `pooling.rs`'s own doc comment on
-/// `build_pooling_via_dpu_bypass_regcmd`) -- `cmp: 0` clamping to a
+/// `build_pooling_via_dpu_bypass_tasks`) -- `cmp: 0` clamping to a
 /// constant zero is domain- and stage-invariant, so this specific test
 /// still proves the fusion wiring works, but a real hardware run after
 /// this migration is the first one to exercise BN-stage fusion in this

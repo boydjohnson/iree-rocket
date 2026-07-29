@@ -18,9 +18,10 @@
 //! things at once: `device::submit_tasks()`'s multi-task job (never run on
 //! real hardware before -- see its own doc comment) and the conv output
 //! buffer's byte layout actually lining up with what `build_lut_regcmd`
-//! expects to read as its own input (never chained before either, unlike
-//! `build_pooling_via_dpu_bypass_regcmd`'s conv->pooling chain, which *has*
-//! been hardware-proven). Both are genuinely new -- if these tests hang or
+//! expects to read as its own input (never chained before either). The
+//! bypass-conv -> pooling dataflow has hardware coverage, but its new
+//! one-job task chain is being validated separately. Both are genuinely new
+//! here -- if these tests hang or
 //! misbehave, check `submit_tasks` in isolation (e.g. resubmit an already-
 //! proven single task twice via one multi-task job) before assuming the
 //! LUT recipe itself is wrong.

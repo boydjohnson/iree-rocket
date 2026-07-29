@@ -5,10 +5,12 @@
 //!   bypassing CNA/CORE/DPU entirely. Kept for reference -- it is not what
 //!   the vendor compiler emits, and its PPU_RDMA stride math remains
 //!   unconfirmed.
-//! - **Via a DPU bypass stage** ([`build_pooling_via_dpu_bypass_regcmd`]):
-//!   two separately-kicked tasks, a near-identity conv followed by a PPU
-//!   pass. This is the shape a real rknn-toolkit2-compiled model actually
-//!   emits, and the one with hardware behind it.
+//! - **Via a DPU bypass stage** ([`build_pooling_via_dpu_bypass_tasks`]):
+//!   one job containing separately-kicked tasks: a near-identity conv
+//!   followed by one PPU pass per horizontal tile. This is the shape a real
+//!   rknn-toolkit2-compiled model actually emits. The single-tile dataflow
+//!   has hardware coverage; the exact one-job multi-task topology and
+//!   multi-tile case are covered below and await a board run.
 //!
 //! A third shape -- pooling pipelined on-chip directly after a real conv via
 //! `dpu_flyin`, no PPU_RDMA fetch at all -- was implemented and then
@@ -92,7 +94,7 @@ fn push_ppu_kick(cmds: &mut Vec<RegCmd>) {
 //   *third* shape (a real CNA/CORE/DPU bypass task, memory round-trip,
 //   *then* a separately-kicked standalone-PPU task) that matches neither
 //   this path nor the pipelined `dpu_flyin` path below. See
-//   `build_pooling_via_dpu_bypass_regcmd` further down, which is the
+//   `build_pooling_via_dpu_bypass_tasks` further down, which is the
 //   recommended default going forward; this function is kept for hardware
 //   comparison/reference.
 //===========================================================================
@@ -196,7 +198,7 @@ pub struct PoolingShape {
     /// doc comment. PPU itself has no ALU/activation capability at all
     /// (confirmed by enumerating every register in `builders/ppu.rs`) --
     /// this field is only meaningful on a pooling path that runs a real DPU
-    /// stage ahead of PPU. `build_pooling_via_dpu_bypass_regcmd` applies it
+    /// stage ahead of PPU. `build_pooling_via_dpu_bypass_tasks` applies it
     /// to that DPU stage's BS core (the same fusion point Phase 1 validated
     /// for conv); `build_pooling_regcmd`'s pure standalone-flying path (no
     /// DPU at all) cannot honor this and asserts it's `Activation::None`
@@ -427,7 +429,9 @@ impl PoolingPlan {
     /// than actually running independently. Use
     /// `programs_with_separate_output_buffers` instead for genuinely
     /// independent tiles; this method is kept for callers that specifically
-    /// want one contiguous output buffer and can tolerate serialization.
+    /// want one contiguous output buffer. The preferred vendor-style
+    /// bypass path puts all programs in one job as ordered tasks, where
+    /// serialization is explicit and no inter-job fence gates a later tile.
     pub fn programs_with_buffers(&self, bufs: &PoolingBuffers) -> Vec<Vec<RegCmd>> {
         self.tiles
             .iter()
@@ -525,7 +529,7 @@ pub struct PoolingBuffers {
 }
 
 /// Standalone-flying PPU_RDMA+PPU register emission, factored out of
-/// `build_pooling_regcmd` so `build_pooling_via_dpu_bypass_regcmd` (the real
+/// `build_pooling_regcmd` so `build_pooling_via_dpu_bypass_tasks` (the real
 /// two-kick vendor shape, see its own doc comment) can reuse the exact same
 /// PPU-stage sequence, differing only in where PPU_RDMA fetches from (a
 /// caller-supplied real input buffer for the standalone path; a bypass
@@ -795,7 +799,7 @@ fn build_ppu_standalone_flying(
 /// which never set PPU's/PPU_RDMA's enable bit at all and is what hung real
 /// hardware. NOT YET RE-VALIDATED ON HARDWARE with this fix -- and per the
 /// real capture, this standalone-only shape isn't actually what the vendor
-/// compiler emits at all; see `build_pooling_via_dpu_bypass_regcmd` below
+/// compiler emits at all; see `build_pooling_via_dpu_bypass_tasks` below
 /// for that real two-kick shape. Kept for hardware comparison/reference,
 /// not as the recommended default. This convenience entry point accepts
 /// only a one-tile shape; use [`PoolingPlan::programs_with_buffers`] for a
@@ -805,7 +809,7 @@ pub fn build_pooling_regcmd(shape: &PoolingShape, bufs: &PoolingBuffers) -> Vec<
         matches!(shape.activation, Activation::None),
         "build_pooling_regcmd: fused activation ({:?}) requested but this standalone-flying \
          path has no DPU stage at all -- PPU has no ALU/activation capability of its own (see \
-         PoolingShape::activation's doc comment). Use build_pooling_via_dpu_bypass_regcmd \
+         PoolingShape::activation's doc comment). Use build_pooling_via_dpu_bypass_tasks \
          instead if fused activation is needed.",
         shape.activation
     );
@@ -825,7 +829,8 @@ pub fn build_pooling_regcmd(shape: &PoolingShape, bufs: &PoolingBuffers) -> Vec<
 }
 
 //===========================================================================
-// Pooling via a real DPU bypass stage, two separately-kicked tasks -- the
+// Pooling via a real DPU bypass stage, one bypass task followed by one or
+// more separately-kicked PPU tasks -- the
 // shape a real rknn-toolkit2-compiled model actually emits (see NOTES.md's
 // "Decoding a real regcmd program for a pooling-only op" and its follow-up
 // "Checked against iree-rocket-hal/src/" section), matching NEITHER of the
@@ -854,25 +859,17 @@ pub fn build_pooling_regcmd(shape: &PoolingShape, bufs: &PoolingBuffers) -> Vec<
 //    `build_ppu_standalone_flying` verbatim. Kicked `KICK_PPU |
 //    KICK_PPU_RDMA`, same as the real capture's `0x60` second kick.
 //
-// RESOLVED (real RK3588, first hardware round): the roadmap plan's Phase 0
-// "one or two submit() calls?" question was originally guessed at "one" --
-// reasoning that the real vendor capture's two kicks live inside one
-// contiguous regcmd dump, and `drm_rocket_job`/`drm_rocket_task` (device.rs)
-// carry a single opaque `regcmd`/`regcmd_count` per task, so nothing
-// *structurally* prevented one combined blob. That guess was wrong: a
-// single-`submit()` version of this (writing `PC_OPERATION_ENABLE=0x0d`
-// then immediately `0x60`, no wait in between) left the bypass stage's
-// intermediate buffer completely untouched (sentinel-fill diagnostic,
-// `tests/pooling_via_dpu_bypass_hw.rs`'s
-// `pooling_via_bypass_dump_intermediate_and_output_buffers`, real
-// hardware) -- i.e. the CNA/CORE/DPU stage never got to actually run
-// before the second write replaced which engines were enabled. The real
-// vendor capture being one contiguous *file dump* doesn't mean the
-// original driver issued it as one *submission* -- that inference doesn't
-// hold. This function now returns two separate task command lists; the
-// caller must `submit()` the first, `prep_bo()`-wait on
-// `bufs.bypass_output_addr`'s buffer, *then* `submit()` the second --
-// exactly like two independent dispatches, not one.
+// RESOLVED (real RK3588, first hardware round): the two engine kicks cannot
+// be concatenated into one `rocket_task` regcmd buffer. Writing the
+// convolution kick and then the PPU kick in one PC program left the bypass
+// intermediate completely untouched: the second kick replaced the first
+// before the convolution ran. That experiment established a task boundary,
+// not a job boundary. Rocket's UAPI explicitly represents one job as an
+// ordered array of complete task programs, and its IRQ handler advances to
+// the next task on the same core. The vendor-style representation is
+// therefore one `rocket_job` containing the bypass task followed by one PPU
+// task per horizontal tile. `build_pooling_via_dpu_bypass_tasks` emits that
+// ordered task list.
 //===========================================================================
 
 /// DMA addresses for the two-kick bypass-then-pool shape. `bypass_output_addr`
@@ -894,19 +891,28 @@ pub struct PoolingViaBypassBuffers {
     pub output_addr: u32,
 }
 
-/// Returns `(stage_1_bypass_cmds, stage_2_pooling_cmds)` -- two independent
-/// tasks, NOT one combined blob (see the module doc comment above for why:
-/// a single-`submit()` version of this left the bypass stage's output
-/// completely unwritten on real hardware). The caller must `submit()` and
-/// fully `prep_bo()`-wait on stage 1 (specifically on
-/// `bufs.bypass_output_addr`'s buffer) before `submit()`ing stage 2 --
-/// exactly like two ordinary, separately-fenced dispatches.
-pub fn build_pooling_via_dpu_bypass_regcmd(
+/// Builds the vendor-style task sequence for a pooling operation:
+///
+/// 1. one complete CNA/CORE/DPU bypass program writing the intermediate;
+/// 2. one complete PPU/PPU_RDMA program per horizontal pooling tile.
+///
+/// The returned programs are intended to be the ordered `rocket_task` array
+/// of one `rocket_job`. Every entry has its own PC trailer and engine kick;
+/// they must not be concatenated into one regcmd buffer. The kernel advances
+/// between entries on completion IRQs and signals the job fence only after
+/// the last tile.
+///
+/// This deliberately exposes drivers that do not route PPU completion IRQs:
+/// such a driver can advance from the DPU bypass to PPU tile 0, but will
+/// watchdog there instead of advancing to PPU tile 1. A successful wide
+/// numerical test therefore validates both the emitted task chain and the
+/// driver's PPU task-completion path.
+pub fn build_pooling_via_dpu_bypass_tasks(
     bypass_shape: &conv::Shape,
     bypass_kernels: Kernels,
     pooling_shape: &PoolingShape,
     bufs: &PoolingViaBypassBuffers,
-) -> (Vec<RegCmd>, Vec<RegCmd>) {
+) -> Vec<Vec<RegCmd>> {
     pooling_shape.validate();
     let bypass_precision = match bypass_shape.precision {
         conv::Precision::Fp16 => PoolingPrecision::Fp16,
@@ -916,15 +922,29 @@ pub fn build_pooling_via_dpu_bypass_regcmd(
         pooling_shape.precision, bypass_precision,
         "pooling precision must match the DPU bypass output precision"
     );
+    assert_eq!(
+        bypass_shape.output_width(bypass_kernels),
+        pooling_shape.input_width,
+        "DPU bypass output width must match pooling input width"
+    );
+    assert_eq!(
+        bypass_shape.output_height(bypass_kernels),
+        pooling_shape.input_height,
+        "DPU bypass output height must match pooling input height"
+    );
+    assert_eq!(
+        bypass_shape.out_channels, pooling_shape.input_channels,
+        "DPU bypass output channels must match pooling input channels"
+    );
     assert!(
         bufs.bypass_output_addr.is_multiple_of(16),
-        "build_pooling_via_dpu_bypass_regcmd: bypass_output_addr {:#x} is not \
+        "build_pooling_via_dpu_bypass_tasks: bypass_output_addr {:#x} is not \
          16-byte aligned",
         bufs.bypass_output_addr
     );
     assert!(
         matches!(bypass_shape.activation, ConvActivation::None),
-        "build_pooling_via_dpu_bypass_regcmd: bypass_shape.activation must be None -- \
+        "build_pooling_via_dpu_bypass_tasks: bypass_shape.activation must be None -- \
          fused activation for this pooling path is expressed on `pooling_shape.activation` \
          (the op's own logical shape), not on the internal near-identity bypass conv shape, \
          so there's one canonical place a caller/HAL layer needs to set it. This function \
@@ -967,8 +987,8 @@ pub fn build_pooling_via_dpu_bypass_regcmd(
     assert_eq!(
         bypass_tasks.len(),
         1,
-        "build_pooling_via_dpu_bypass_regcmd: bypass conv requires {} CBUF height splits; \
-         not supported by this single-task pooling path",
+        "build_pooling_via_dpu_bypass_tasks: bypass conv requires {} CBUF height splits; \
+         the vendor-style pooling path requires exactly one bypass task",
         bypass_tasks.len()
     );
     let bypass_cmds = bypass_tasks.remove(0);
@@ -989,23 +1009,47 @@ pub fn build_pooling_via_dpu_bypass_regcmd(
     // DPU_RDMA bit) is a fact about the retired builder's kick construction,
     // not evidence this stage's ConvPlan-emitted kick is incomplete.
 
-    // Stage 2: standalone-flying PPU, fetching from stage 1's real output.
+    // Remaining tasks: standalone-flying PPU tiles, each fetching its
+    // overlapping input range from stage 1's full memory output and writing
+    // its disjoint output-column range into the shared final output.
     let plan = PoolingPlan::new(*pooling_shape);
-    assert_eq!(
-        plan.tiles.len(),
-        1,
-        "DPU-bypass pooling currently accepts one direct PPU task; use a tiled pooling \
-         stage for width {}",
-        pooling_shape.input_width
-    );
-    let mut pooling_cmds = build_ppu_standalone_flying(
-        pooling_shape,
-        &plan.tiles[0],
-        bufs.bypass_output_addr,
-        bufs.output_addr,
-    );
-    push_ppu_kick(&mut pooling_cmds);
+    let mut tasks = Vec::with_capacity(1 + plan.tiles.len());
+    tasks.push(bypass_cmds);
+    tasks.extend(plan.tiles.iter().map(|tile| {
+        let output_addr = bufs
+            .output_addr
+            .checked_add(tile.output_first * 16)
+            .expect("pooling tile output address overflows u32");
+        let mut commands =
+            build_ppu_standalone_flying(pooling_shape, tile, bufs.bypass_output_addr, output_addr);
+        push_ppu_kick(&mut commands);
+        commands
+    }));
+    tasks
+}
 
+/// Compatibility wrapper for callers that require the original one-tile
+/// tuple. Multi-tile pooling must use
+/// [`build_pooling_via_dpu_bypass_tasks`] and submit all returned programs
+/// as tasks of one job.
+pub fn build_pooling_via_dpu_bypass_regcmd(
+    bypass_shape: &conv::Shape,
+    bypass_kernels: Kernels,
+    pooling_shape: &PoolingShape,
+    bufs: &PoolingViaBypassBuffers,
+) -> (Vec<RegCmd>, Vec<RegCmd>) {
+    let mut tasks =
+        build_pooling_via_dpu_bypass_tasks(bypass_shape, bypass_kernels, pooling_shape, bufs);
+    assert_eq!(
+        tasks.len(),
+        2,
+        "build_pooling_via_dpu_bypass_regcmd accepts one PPU tile; width {} produces {} tiles, \
+         so use build_pooling_via_dpu_bypass_tasks",
+        pooling_shape.input_width,
+        tasks.len() - 1
+    );
+    let pooling_cmds = tasks.pop().unwrap();
+    let bypass_cmds = tasks.pop().unwrap();
     (bypass_cmds, pooling_cmds)
 }
 
@@ -1082,18 +1126,13 @@ pub struct MaxReductionStageBuffers {
     pub output_addr: u32,
 }
 
-/// Builds an `N`-stage max-reduction tree, each stage reusing
-/// `build_pooling_via_dpu_bypass_regcmd` unchanged. Returns one
-/// `(bypass_cmds, pooling_cmds)` pair per stage, in order -- the caller
-/// must `submit()`+`prep_bo()`-wait through EVERY pair sequentially
-/// (bypass stage, then pooling stage, then the next stage's bypass,
-/// ...), exactly like `build_pooling_via_dpu_bypass_regcmd`'s own
-/// single-stage discipline (see its doc comment for why: a combined
-/// single-`submit_tasks()` job silently left one real hardware round
-/// unwritten). Chaining `N>1` stages this way has the same *mechanism*
-/// as the proven `N=1` case, but the specific 5-stage chain itself is
-/// NOT YET independently hardware-validated end-to-end through this
-/// exact function -- only the underlying single-stage building block is.
+/// Builds an `N`-stage max-reduction tree using the compatibility one-tile
+/// wrapper. Returns one `(bypass_cmds, pooling_cmds)` pair per stage, in
+/// order. Each vector is a complete task program; callers may flatten the
+/// pairs in order into one `submit_tasks()` job, or use one ordered job per
+/// pair and wait before submitting the dependent next stage. The specific
+/// multi-stage chain is not yet independently hardware-validated
+/// end-to-end; only the underlying single-stage dataflow is.
 pub fn build_max_reduction_tree_regcmd(
     stages: &[MaxReductionStage],
     bufs: &[MaxReductionStageBuffers],
@@ -1131,7 +1170,10 @@ pub fn build_max_reduction_tree_regcmd(
 mod tests {
     use super::*;
     use crate::rocket::{
-        builders::{DOMAIN_PC, DOMAIN_PPU, DOMAIN_PPU_RDMA, RegisterMeta},
+        builders::{
+            DOMAIN_PC, DOMAIN_PPU, DOMAIN_PPU_RDMA, RegisterMeta,
+            pc::{PCOperationMask, PCTrailer},
+        },
         debug::decode,
     };
 
@@ -1429,6 +1471,64 @@ mod tests {
         assert_eq!(register_value::<PpuRdmaSrcBaseAddr>(&programs[1]), 0x17e0);
         assert_eq!(register_value::<PpuDstBaseAddr>(&programs[1]), 0x23f0);
         assert_eq!(register_value::<PpuDstSurfStride>(&programs[1]), 2924 << 4);
+    }
+
+    #[test]
+    fn vendor_bypass_path_is_one_job_worth_of_three_complete_tasks() {
+        let pooling_shape = shape(256, 9, 3, 3, 2, 2, PoolingPrecision::Int8);
+        let bypass_shape = conv::Shape {
+            width: pooling_shape.input_width,
+            height: pooling_shape.input_height,
+            stride: 1,
+            in_channels: pooling_shape.input_channels,
+            out_channels: pooling_shape.output_channels,
+            precision: conv::Precision::Int8(conv::Quantization {
+                input_zero_point: 0,
+                output_zero_point: 0,
+                multiplier: conv::Multiplier::from_ratio(1.0),
+            }),
+            padding: Some([0, 0]),
+            activation: ConvActivation::None,
+            depthwise: false,
+        };
+        let programs = build_pooling_via_dpu_bypass_tasks(
+            &bypass_shape,
+            [1, 1],
+            &pooling_shape,
+            &PoolingViaBypassBuffers {
+                input_addr: 0x1000,
+                weights_addr: 0x2000,
+                bias_addr: 0x3000,
+                bypass_output_addr: 0x4000,
+                output_addr: 0x8000,
+            },
+        );
+
+        assert_eq!(programs.len(), 3);
+        assert!(programs[0].iter().any(|command| {
+            command.0 == PCTrailer::operation_enable(PCOperationMask::CONVOLUTION).0
+        }));
+        for program in &programs[1..] {
+            assert_eq!(program.len(), 32);
+            assert!(program.iter().any(|command| {
+                command.0
+                    == PCTrailer::operation_enable(PCOperationMask::PPU | PCOperationMask::PPU_RDMA)
+                        .0
+            }));
+        }
+
+        assert_eq!(
+            register_value::<PpuOperationModeCfg>(&programs[1]),
+            0x0040_0011
+        );
+        assert_eq!(
+            register_value::<PpuOperationModeCfg>(&programs[2]),
+            0x003f_0011
+        );
+        assert_eq!(register_value::<PpuRdmaSrcBaseAddr>(&programs[1]), 0x4000);
+        assert_eq!(register_value::<PpuRdmaSrcBaseAddr>(&programs[2]), 0x47e0);
+        assert_eq!(register_value::<PpuDstBaseAddr>(&programs[1]), 0x8000);
+        assert_eq!(register_value::<PpuDstBaseAddr>(&programs[2]), 0x83f0);
     }
 
     #[test]
