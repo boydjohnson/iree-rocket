@@ -402,3 +402,15 @@ fn repeated_pooling_resource_lifetime_matches_cpu_reference() {
         assert_numeric_case(K2_CAPTURE_BOUNDARY, PoolingMethod::Avg, 1);
     }
 }
+
+#[test]
+#[ignore = "needs the real NPU device -- repeats the single-task width-129 PC launch boundary"]
+fn repeated_default_width_boundary_matches_cpu_reference() {
+    let case = NUMERIC_CASES[5];
+
+    for _ in 0..4 {
+        assert_numeric_case(case, PoolingMethod::Avg, 1);
+        assert_numeric_case(case, PoolingMethod::Max, 0);
+        assert_numeric_case(case, PoolingMethod::Min, 0);
+    }
+}
