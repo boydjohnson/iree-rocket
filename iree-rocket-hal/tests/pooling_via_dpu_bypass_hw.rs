@@ -789,21 +789,37 @@ fn pooling_via_bypass_interleaved_methods_dump() {
 /// carries between dispatches. Also runs more rounds and mixes in one bigger
 /// single-tile shape, since the real failing suite issues far more total
 /// dispatches than the small-shape repeat test did.
+///
+/// First run (fixed `[Avg, Min, Max]` order every time) found `Avg` on
+/// `two_horizontal_tiles` timing out 20/20 rounds while `Min`/`Max` on the
+/// same shape were clean -- but that run always dispatched `Avg` *first*
+/// after switching to a new case's tile geometry, since the inner loop order
+/// never varied. That confounds "this method" with "the first dispatch after
+/// this shape switch"; a bug in whatever state carries over between a shape
+/// switch and the next dispatch would look identical to a per-method bug
+/// under that fixed ordering. This version rotates the method order by
+/// `(round + case_index) % 3` so each method takes a turn being first (and
+/// last) across the run, and prints the actual order used each time so a
+/// hang's real correlate -- specific method, or specific position -- is
+/// readable directly from the log instead of inferred.
 #[test]
 #[ignore = "needs the real NPU device -- cross-compile for aarch64, copy to the board, run there; \
             diagnostic only, not a pass/fail check -- if it hangs instead of finishing, that IS \
-            the finding; check the round/case/method it stopped after and cross-reference the \
+            the finding; check whether the round/case/method it stopped after correlates with a \
+            specific method or a specific position in the printed order, and cross-reference the \
             kernel's 'timeout state' dev_err (task index, PC raw_status, CNA_S_STATUS, CORE_S_STATUS)"]
 fn pooling_via_bypass_numeric_interleaved_methods_dump() {
     let cases = [NUMERIC_CASES[0], NUMERIC_CASES[4], TWO_HORIZONTAL_TILES];
-    let methods = [PoolingMethod::Avg, PoolingMethod::Min, PoolingMethod::Max];
+    let base_methods = [PoolingMethod::Avg, PoolingMethod::Min, PoolingMethod::Max];
     for round in 0..20 {
-        for case in cases {
-            for method in methods {
+        for (case_index, case) in cases.iter().enumerate() {
+            let mut methods = base_methods;
+            methods.rotate_left((round + case_index) % base_methods.len());
+            for (position, method) in methods.into_iter().enumerate() {
                 let start = std::time::Instant::now();
-                let (actual, expected) = run_numeric_case(case, method);
+                let (actual, expected) = run_numeric_case(*case, method);
                 eprintln!(
-                    "round {round} {} {method:?}: match={} ({:?})",
+                    "round {round} {} order={methods:?} pos={position} {method:?}: match={} ({:?})",
                     case.name,
                     actual == expected,
                     start.elapsed()
