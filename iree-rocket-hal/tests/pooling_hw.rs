@@ -12,7 +12,7 @@
 //! array of one kernel job, with all tasks writing disjoint columns of one
 //! shared output BO.
 
-use std::{fs::OpenOptions, mem, os::unix::io::AsRawFd, ptr};
+use std::{fs::OpenOptions, mem, os::unix::io::AsRawFd, ptr, time::Instant};
 
 use iree_rocket_hal::rocket::{
     device::{Buffer, close_bo, fini_bo, prep_bo, submit_tasks},
@@ -193,7 +193,7 @@ fn page_aligned(bytes: usize) -> usize {
     bytes.max(1).next_multiple_of(4096)
 }
 
-fn run_numeric_case(case: NumericCase, method: PoolingMethod) -> (Vec<i8>, Vec<i8>) {
+fn run_numeric_case(case: NumericCase, method: PoolingMethod) -> (Vec<i8>, Vec<i8>, u128) {
     let shape = pooling_shape(case, method);
     let input = numeric_input(case);
     let expected = cpu_pool(&input, &shape);
@@ -249,10 +249,12 @@ fn run_numeric_case(case: NumericCase, method: PoolingMethod) -> (Vec<i8>, Vec<i
         in_handles.push(buf_in.handle);
         let out_handles = [buf_out.handle];
 
+        let submitted_at = Instant::now();
         submit_tasks(fd, &tasks, &in_handles, &out_handles)
             .expect("direct pooling multi-task SUBMIT ioctl failed");
         prep_bo(fd, buf_out.handle, 2_000_000_000)
             .expect("direct pooling job did not complete within timeout");
+        let dispatch_ms = submitted_at.elapsed().as_millis();
 
         let raw_output = std::slice::from_raw_parts(buf_out.host_ptr, output_bytes);
         let actual = (0..expected.len())
@@ -264,12 +266,12 @@ fn run_numeric_case(case: NumericCase, method: PoolingMethod) -> (Vec<i8>, Vec<i
         }
         close_bo(fd, buf_in.handle).ok();
         close_bo(fd, buf_out.handle).ok();
-        (actual, expected)
+        (actual, expected, dispatch_ms)
     }
 }
 
 fn assert_numeric_case(case: NumericCase, method: PoolingMethod, tolerance: i16) {
-    let (actual, expected) = run_numeric_case(case, method);
+    let (actual, expected, dispatch_ms) = run_numeric_case(case, method);
     let shape = pooling_shape(case, method);
     let mut mismatches = Vec::new();
     for (index, (&got, &want)) in actual.iter().zip(&expected).enumerate() {
@@ -281,7 +283,8 @@ fn assert_numeric_case(case: NumericCase, method: PoolingMethod, tolerance: i16)
     }
     assert!(
         mismatches.is_empty(),
-        "{} {method:?}: numerical pooling mismatches (tolerance {tolerance}): {}",
+        "{} {method:?}: numerical pooling mismatches after {dispatch_ms} ms \
+         (a duration near the driver's 500 ms watchdog means the scheduler reset the job): {}",
         case.name,
         mismatches.join(", ")
     );
@@ -365,4 +368,22 @@ fn average_pooling_dimension_matrix_matches_cpu_reference() {
 #[ignore = "needs the real NPU device -- focused PPU_RDMA -> PPU tile 0 -> tile 1 job"]
 fn direct_two_task_tiled_pooling_matches_cpu_reference() {
     assert_numeric_case(K2_TWO_TILES, PoolingMethod::Max, 0);
+}
+
+#[test]
+#[ignore = "needs the real NPU device -- isolates the int8 63+65 tile split"]
+fn direct_equal_half_boundary_pooling_matches_cpu_reference() {
+    assert_numeric_case(K2_CAPTURE_BOUNDARY, PoolingMethod::Max, 0);
+}
+
+#[test]
+#[ignore = "needs the real NPU device -- isolates non-square min pooling"]
+fn direct_rectangular_min_pooling_matches_cpu_reference() {
+    assert_numeric_case(NUMERIC_CASES[1], PoolingMethod::Min, 0);
+}
+
+#[test]
+#[ignore = "needs the real NPU device -- distinguishes min method from non-square geometry"]
+fn direct_square_k3_min_pooling_matches_cpu_reference() {
+    assert_numeric_case(NUMERIC_CASES[2], PoolingMethod::Min, 0);
 }

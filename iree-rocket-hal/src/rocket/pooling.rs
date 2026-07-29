@@ -328,8 +328,9 @@ pub struct PoolingTile {
 /// the hardware-proven input-130/output-65 limit: the two-task width-258
 /// probe passes, while a one-task width-257/output-128 probe produced shifted
 /// output. Larger tensors split into balanced tiles, assigning any remainder
-/// to the rightmost tiles. This reproduces the observed 63+64 split for an
-/// unpadded width-256 3x3/stride-2 pool and the 64+65 split for width-258
+/// to the rightmost tiles. The one int8 64+64 result is biased to the adjacent
+/// hardware-proven 63+65 widths. This reproduces the observed 63+64 split for
+/// an unpadded width-256 3x3/stride-2 pool and the 64+65 split for width-258
 /// 2x2/stride-2.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct PoolingPlan {
@@ -345,11 +346,32 @@ impl PoolingPlan {
         let base_width = shape.output_width / tile_count;
         let wider_tiles = shape.output_width % tile_count;
         let first_wider = tile_count - wider_tiles;
+        // The int8 2x2/stride-2 path has two hardware-confirmed adjacent
+        // tile widths (63 and 65), while the width-257/output-128 probe is
+        // the sole case that naturally balances to the failing 64+64 pair.
+        // Move one output column from the first tile to the last so neither
+        // task uses that ambiguous equal-half geometry.
+        let avoid_equal_int8_k2_tiles = shape.precision == PoolingPrecision::Int8
+            && shape.kernel_width == 2
+            && shape.kernel_height == 2
+            && shape.stride_x == 2
+            && shape.stride_y == 2
+            && shape.pad_left == 0
+            && shape.pad_top == 0
+            && shape.pad_right == 0
+            && shape.pad_bottom == 0
+            && tile_count == 2
+            && wider_tiles == 0
+            && base_width == 64;
         let mut output_first = 0;
         let mut tiles = Vec::with_capacity(tile_count as usize);
 
         for index in 0..tile_count {
-            let output_width = base_width + u32::from(index >= first_wider);
+            let output_width = if avoid_equal_int8_k2_tiles {
+                base_width - 1 + 2 * index
+            } else {
+                base_width + u32::from(index >= first_wider)
+            };
             let raw_input_first =
                 i64::from(output_first * shape.stride_x) - i64::from(shape.pad_left);
             let raw_input_end =
@@ -1030,14 +1052,14 @@ mod tests {
     }
 
     #[test]
-    fn k2s2_int8_avoids_the_failing_128_column_task() {
+    fn k2s2_int8_avoids_the_failing_128_column_and_equal_64_column_tasks() {
         let plan = PoolingPlan::new(shape(257, 48, 2, 2, 2, 2, PoolingPrecision::Int8));
         assert_eq!(
             plan.tiles()
                 .iter()
                 .map(|tile| (tile.input_width, tile.output_width))
                 .collect::<Vec<_>>(),
-            [(128, 64), (128, 64)]
+            [(126, 63), (130, 65)]
         );
     }
 
