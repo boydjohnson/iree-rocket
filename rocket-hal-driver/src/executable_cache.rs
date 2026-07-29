@@ -13,7 +13,7 @@
 //! see rknpu-spelunking/NOTES.md), `1` for `UkernelShape::Pooling` (a
 //! 4x4x1, 2x2 kernel/stride shape -- NOT yet hardware-validated, see
 //! iree-rocket-hal's `build_pooling_regcmd` module doc comment and
-//! `tests/pooling_hw.rs`/`tests/pooling_dispatch.rs`), `2` for
+//! the driver's `cts/pooling_dispatch_test.cc`), `2` for
 //! `UkernelShape::Conv2d` again but with `Precision::Fp16` -- same
 //! geometry as tag `0`, the shape round 7's hardware fix confirmed produces a
 //! bit-exact-correct fp16 conv (see
@@ -364,7 +364,7 @@ unsafe extern "C" fn prepare_executable(
         1 => UkernelShape::Pooling(PoolingShape {
             // NOT hardware-validated -- see iree-rocket-hal's
             // build_pooling_regcmd module doc comment and
-            // tests/pooling_hw.rs / tests/pooling_dispatch.rs.
+            // cts/pooling_dispatch_test.cc.
             input_width: 4,
             input_height: 4,
             input_channels: 1,

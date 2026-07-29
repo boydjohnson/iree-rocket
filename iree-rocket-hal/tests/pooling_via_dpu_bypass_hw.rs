@@ -2,10 +2,10 @@
 //! the real two-kick shape a vendor-compiled model actually emits (see
 //! `pooling.rs`'s module doc comment above that function, and
 //! rknpu-spelunking/NOTES.md's "Decoding a real regcmd program for a
-//! pooling-only op"), as opposed to `build_pooling_regcmd`'s standalone-only
-//! path (`pooling_hw.rs`). A third, on-chip pipelined shape was tried and
-//! then retired -- see `pooling.rs`'s module doc comment for the sweep that
-//! found no compiler evidence for it.
+//! pooling-only op"). The standalone-only hardware suite was retired after
+//! its large-window and tiled-width probes failed; a third, on-chip
+//! pipelined shape was tried and then retired after a sweep found no compiler
+//! evidence for it. See `pooling.rs`'s module doc comment for both histories.
 //!
 //! Not run by a plain `cargo test` -- see `conv_phase1_validation_hw.rs`'s
 //! doc comment for the cross-compile-and-copy-to-the-board workflow;
@@ -15,11 +15,11 @@
 //!     cargo test --target aarch64-unknown-linux-gnu --release \
 //!       --test pooling_via_dpu_bypass_hw --no-run
 //!
-//! Same uniform-whole-buffer-fill methodology as `pooling_hw.rs` throughout:
-//! the bypass conv stage's exact numeric transform doesn't need
-//! to be a true arithmetic identity for these tests to be meaningful --
-//! only a real, consistent, input-tracking pipeline (uniform input/weight
-//! fill makes per-tap/per-pixel packing order irrelevant either way).
+//! The numerical matrix in this file makes the bypass convolution an exact
+//! int8 identity, fills every input pixel with a position-dependent value,
+//! and compares every pooling output against a CPU reference. It spans
+//! rectangular inputs, kernels and strides, the direct PPU width boundary,
+//! and the largest directly hardware-backed 8x8 pooling window.
 //!
 //! First hardware round with these tests found (and this file was rewritten
 //! after) that `build_pooling_via_dpu_bypass_regcmd`'s two kicks genuinely
@@ -39,6 +39,7 @@ use iree_rocket_hal::rocket::{
         PoolingMethod, PoolingPrecision, PoolingShape, PoolingViaBypassBuffers,
         build_pooling_via_dpu_bypass_regcmd,
     },
+    tensor_layout::pack_hwcf_to_rocket_weights,
 };
 
 const DEVICE_PATH: &str = "/dev/accel/accel0";
@@ -71,9 +72,8 @@ fn bypass_shape() -> conv::Shape {
     }
 }
 
-/// Pooling stage: same 4x4x1 -> 2x2x1, 2x2 kernel, stride 2 geometry as
-/// `pooling_hw.rs`'s `tiled_shape` -- its "input" is the bypass stage's
-/// real memory output, not an external buffer.
+/// Pooling stage: 4x4x1 -> 2x2x1, 2x2 kernel, stride 2. Its "input" is the
+/// bypass stage's real memory output, not an external buffer.
 fn pooling_shape(method: PoolingMethod) -> PoolingShape {
     pooling_shape_with_activation(method, Activation::None)
 }
@@ -198,8 +198,7 @@ impl Bufs {
 
 /// Runs the two-kick bypass-then-pool shape as two genuinely separate
 /// `submit()`/`prep_bo()` round trips (see this file's top doc comment for
-/// why) and returns the real output pixels (same 16-byte-atomic read
-/// stride as `pooling_hw.rs`).
+/// why) and returns the real output pixels at their 16-byte atomic stride.
 fn run_uniform_pooling_via_bypass(
     method: PoolingMethod,
     input_fill: u8,
@@ -293,10 +292,9 @@ unsafe fn run_two_stage(b: &Bufs, bypass: &conv::Shape, pooling: &PoolingShape) 
             cmd_slice_2[i] = c.0;
         }
         fini_bo(b.fd, buf_cmd_2.handle).ok();
-        // buf_out was CPU-filled during setup(); needs the same dma_sync
-        // hand-off as pooling_hw.rs's run_pooling (fini_bo'd there already,
-        // during setup() -- re-affirmed here as a reminder this ordering
-        // matters, not a second real action).
+        // buf_out was CPU-filled during setup() and handed off with fini_bo
+        // there. Keep the ordering in mind: the CPU's dirty sentinel fill
+        // must be visible before the PPU writes this buffer.
 
         let in_handles_2 = [buf_cmd_2.handle, b.buf_mid.handle];
         let out_handles_2 = [b.buf_out.handle];
@@ -312,6 +310,321 @@ unsafe fn run_two_stage(b: &Bufs, bypass: &conv::Shape, pooling: &PoolingShape) 
             .expect("stage 2 (pooling) did not complete within timeout");
         close_bo(b.fd, buf_cmd_2.handle).ok();
     }
+}
+
+#[derive(Clone, Copy, Debug)]
+struct NumericCase {
+    name: &'static str,
+    width: u32,
+    height: u32,
+    kernel_width: u32,
+    kernel_height: u32,
+    stride_x: u32,
+    stride_y: u32,
+}
+
+const NUMERIC_CASES: [NumericCase; 6] = [
+    NumericCase {
+        name: "small_square",
+        width: 4,
+        height: 4,
+        kernel_width: 2,
+        kernel_height: 2,
+        stride_x: 2,
+        stride_y: 2,
+    },
+    NumericCase {
+        name: "rectangular_kernel",
+        width: 7,
+        height: 5,
+        kernel_width: 3,
+        kernel_height: 2,
+        stride_x: 2,
+        stride_y: 1,
+    },
+    NumericCase {
+        name: "overlapping_windows",
+        width: 13,
+        height: 9,
+        kernel_width: 3,
+        kernel_height: 3,
+        stride_x: 2,
+        stride_y: 2,
+    },
+    NumericCase {
+        name: "asymmetric_stride",
+        width: 17,
+        height: 13,
+        kernel_width: 4,
+        kernel_height: 3,
+        stride_x: 3,
+        stride_y: 2,
+    },
+    NumericCase {
+        name: "largest_direct_window",
+        width: 64,
+        height: 31,
+        kernel_width: 8,
+        kernel_height: 8,
+        stride_x: 3,
+        stride_y: 3,
+    },
+    NumericCase {
+        name: "direct_width_boundary",
+        width: 129,
+        height: 17,
+        kernel_width: 3,
+        kernel_height: 3,
+        stride_x: 2,
+        stride_y: 2,
+    },
+];
+
+fn numeric_bypass_shape(case: NumericCase) -> conv::Shape {
+    conv::Shape {
+        width: case.width,
+        height: case.height,
+        stride: 1,
+        in_channels: 1,
+        out_channels: 1,
+        precision: conv::Precision::Int8(Quantization {
+            input_zero_point: 0,
+            output_zero_point: 0,
+            // BsEntry::default() contributes the unit BS multiplier. Cancel
+            // that stage's measured gain so this 1x1, weight-1 convolution
+            // is an exact identity for the 0..60 values used below.
+            multiplier: Multiplier::for_unit_bs(1.0),
+        }),
+        padding: Some([0, 0]),
+        activation: conv::Activation::None,
+        depthwise: false,
+    }
+}
+
+fn numeric_pooling_shape(case: NumericCase, method: PoolingMethod) -> PoolingShape {
+    PoolingShape {
+        input_width: case.width,
+        input_height: case.height,
+        input_channels: 1,
+        output_width: (case.width - case.kernel_width) / case.stride_x + 1,
+        output_height: (case.height - case.kernel_height) / case.stride_y + 1,
+        output_channels: 1,
+        precision: PoolingPrecision::Int8,
+        kernel_width: case.kernel_width,
+        kernel_height: case.kernel_height,
+        stride_x: case.stride_x,
+        stride_y: case.stride_y,
+        method,
+        pad_left: 0,
+        pad_top: 0,
+        pad_right: 0,
+        pad_bottom: 0,
+        pad_value: 0,
+        activation: Activation::None,
+    }
+}
+
+fn numeric_input(case: NumericCase) -> Vec<i8> {
+    let mut input = Vec::with_capacity((case.width * case.height) as usize);
+    for y in 0..case.height {
+        for x in 0..case.width {
+            // Bounded below the int8 convolution's measured exact-through-64
+            // region, but deliberately non-monotonic so max/min cannot pass
+            // through a fixed corner-selection bug.
+            input.push(((13 * x + 7 * y + 3 * x * y) % 61) as i8);
+        }
+    }
+    input
+}
+
+fn cpu_pool(input: &[i8], shape: &PoolingShape) -> Vec<i8> {
+    let mut output = Vec::with_capacity((shape.output_width * shape.output_height) as usize);
+    for output_y in 0..shape.output_height {
+        for output_x in 0..shape.output_width {
+            let input_y = output_y * shape.stride_y;
+            let input_x = output_x * shape.stride_x;
+            let mut minimum = i8::MAX;
+            let mut maximum = i8::MIN;
+            let mut sum = 0i32;
+            for kernel_y in 0..shape.kernel_height {
+                for kernel_x in 0..shape.kernel_width {
+                    let index =
+                        ((input_y + kernel_y) * shape.input_width + input_x + kernel_x) as usize;
+                    let value = input[index];
+                    minimum = minimum.min(value);
+                    maximum = maximum.max(value);
+                    sum += i32::from(value);
+                }
+            }
+            output.push(match shape.method {
+                PoolingMethod::Max => maximum,
+                PoolingMethod::Min => minimum,
+                PoolingMethod::Avg => {
+                    let count = (shape.kernel_width * shape.kernel_height) as i32;
+                    // Inputs are non-negative. The PPU's fixed-point
+                    // reciprocals can differ from ideal rounding by one LSB;
+                    // the hardware assertion below carries that tolerance.
+                    ((sum + count / 2) / count) as i8
+                }
+            });
+        }
+    }
+    output
+}
+
+fn page_aligned(bytes: usize) -> usize {
+    bytes.max(1).next_multiple_of(4096)
+}
+
+fn run_numeric_case(case: NumericCase, method: PoolingMethod) -> (Vec<i8>, Vec<i8>) {
+    let bypass = numeric_bypass_shape(case);
+    let pooling = numeric_pooling_shape(case, method);
+    let input = numeric_input(case);
+    let expected = cpu_pool(&input, &pooling);
+    let file = OpenOptions::new()
+        .read(true)
+        .write(true)
+        .open(DEVICE_PATH)
+        .expect("failed to open NPU device");
+    let fd = file.as_raw_fd();
+
+    unsafe {
+        let buf_in = Buffer::new(fd, page_aligned(input.len()), &file);
+        ptr::write_bytes(buf_in.host_ptr, 0, buf_in.size);
+        ptr::copy_nonoverlapping(input.as_ptr().cast::<u8>(), buf_in.host_ptr, input.len());
+
+        let weight_bytes = bypass.weight_bytes(BYPASS_KERNELS) as usize;
+        let mut packed_weights = vec![0; weight_bytes];
+        pack_hwcf_to_rocket_weights(&[1], 1, 1, 1, 1, 1, &mut packed_weights)
+            .expect("failed to pack the identity convolution weight");
+        let buf_w = Buffer::new(fd, page_aligned(weight_bytes), &file);
+        ptr::write_bytes(buf_w.host_ptr, 0, buf_w.size);
+        ptr::copy_nonoverlapping(packed_weights.as_ptr(), buf_w.host_ptr, weight_bytes);
+
+        let bias_bytes = bypass.bs_buffer_bytes();
+        let buf_bias = Buffer::new(fd, page_aligned(bias_bytes), &file);
+        ptr::write_bytes(buf_bias.host_ptr, 0, buf_bias.size);
+        let entries = vec![BsEntry::default(); bypass.padded_out_channels() as usize];
+        write_bs_buffer(
+            std::slice::from_raw_parts_mut(buf_bias.host_ptr, bias_bytes),
+            &entries,
+        );
+
+        let intermediate_bytes = bypass.output_scratch_bytes(BYPASS_KERNELS);
+        let buf_mid = Buffer::new(fd, page_aligned(intermediate_bytes), &file);
+        ptr::write_bytes(buf_mid.host_ptr, 0xA5, buf_mid.size);
+
+        let output_bytes =
+            ((pooling.output_width * pooling.output_height).next_multiple_of(4) * 16) as usize;
+        let buf_out = Buffer::new(fd, page_aligned(output_bytes), &file);
+        ptr::write_bytes(buf_out.host_ptr, 0xA5, buf_out.size);
+
+        for buffer in [&buf_in, &buf_w, &buf_bias, &buf_mid, &buf_out] {
+            fini_bo(fd, buffer.handle).expect("failed to sync pooling test BO for the NPU");
+        }
+
+        let buffers = Bufs {
+            file,
+            fd,
+            buf_in,
+            buf_w,
+            buf_bias,
+            buf_mid,
+            buf_out,
+        };
+        run_two_stage(&buffers, &bypass, &pooling);
+
+        let intermediate = std::slice::from_raw_parts(buffers.buf_mid.host_ptr, intermediate_bytes);
+        for (pixel, &want) in input.iter().enumerate() {
+            let got = intermediate[pixel * 16] as i8;
+            assert_eq!(
+                got, want,
+                "{} identity bypass mismatch at pixel {pixel}: expected {want}, got {got}",
+                case.name
+            );
+        }
+
+        let raw_output = std::slice::from_raw_parts(buffers.buf_out.host_ptr, output_bytes);
+        let actual = (0..expected.len())
+            .map(|pixel| raw_output[pixel * 16] as i8)
+            .collect();
+        buffers.close();
+        (actual, expected)
+    }
+}
+
+fn assert_numeric_matrix(method: PoolingMethod, tolerance: i16) {
+    for case in NUMERIC_CASES {
+        let (actual, expected) = run_numeric_case(case, method);
+        assert_eq!(actual.len(), expected.len(), "{} output length", case.name);
+        let mut mismatches = Vec::new();
+        for (index, (&got, &want)) in actual.iter().zip(&expected).enumerate() {
+            if (i16::from(got) - i16::from(want)).abs() > tolerance && mismatches.len() < 8 {
+                let shape = numeric_pooling_shape(case, method);
+                let y = index as u32 / shape.output_width;
+                let x = index as u32 % shape.output_width;
+                mismatches.push(format!("[{y}, {x}] want {want} got {got}"));
+            }
+        }
+        assert!(
+            mismatches.is_empty(),
+            "{} {method:?}: numerical pooling mismatches (tolerance {tolerance}): {}",
+            case.name,
+            mismatches.join(", ")
+        );
+    }
+}
+
+#[test]
+fn numerical_dimension_matrix_is_single_pair_plannable() {
+    for case in NUMERIC_CASES {
+        for method in [PoolingMethod::Max, PoolingMethod::Min, PoolingMethod::Avg] {
+            let bypass = numeric_bypass_shape(case);
+            let pooling = numeric_pooling_shape(case, method);
+            let (bypass_program, pooling_program) = build_pooling_via_dpu_bypass_regcmd(
+                &bypass,
+                BYPASS_KERNELS,
+                &pooling,
+                &PoolingViaBypassBuffers {
+                    input_addr: 0x1000,
+                    weights_addr: 0x2000,
+                    bias_addr: 0x3000,
+                    bypass_output_addr: 0x4000,
+                    output_addr: 0x8000,
+                },
+            );
+            assert!(!bypass_program.is_empty(), "{} bypass program", case.name);
+            assert!(
+                !pooling_program.is_empty(),
+                "{} {method:?} pooling program",
+                case.name
+            );
+            assert_eq!(
+                cpu_pool(&numeric_input(case), &pooling).len(),
+                (pooling.output_width * pooling.output_height) as usize,
+                "{} {method:?} CPU reference extent",
+                case.name
+            );
+        }
+    }
+}
+
+#[test]
+#[ignore = "needs the real NPU device -- validates max pooling numerically across dimensions"]
+fn max_pooling_dimension_matrix_matches_cpu_reference() {
+    assert_numeric_matrix(PoolingMethod::Max, 0);
+}
+
+#[test]
+#[ignore = "needs the real NPU device -- validates min pooling numerically across dimensions"]
+fn min_pooling_dimension_matrix_matches_cpu_reference() {
+    assert_numeric_matrix(PoolingMethod::Min, 0);
+}
+
+#[test]
+#[ignore = "needs the real NPU device -- validates average pooling numerically across dimensions"]
+fn average_pooling_dimension_matrix_matches_cpu_reference() {
+    assert_numeric_matrix(PoolingMethod::Avg, 1);
 }
 
 macro_rules! completes_and_tracks_input_test {

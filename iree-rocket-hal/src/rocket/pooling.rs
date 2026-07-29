@@ -49,21 +49,21 @@ use crate::rocket::{
 // `builders/ppu_rdma.rs` (bindgen'd from Mesa's own `registers.xml`, see
 // builders.rs's DOMAIN_* comment) plus the TRM Ch.36 §4.6/§4.7 prose and
 // `build_conv_regcmd`'s established conventions (N-1 encoding on every
-// *_RDMA/CORE/DPU cube dimension, the same four-entry PC kick tail). NONE
-// of the following has been hardware-validated yet -- see the UNCONFIRMED
-// markers below and iree-rocket-hal/tests/pooling_hw.rs's doc comment for
-// the sweep tests needed before trusting this in production:
+// *_RDMA/CORE/DPU cube dimension, the same four-entry PC kick tail). This
+// standalone shape is retained as a register-level reference, not as the
+// production path. Its hardware suite was retired after the large-window and
+// tiled-width cases failed; the vendor-observed two-stage path below now
+// carries the numerical hardware matrix.
 //
-// - RESOLVED (hardware-confirmed, real RK3588, via
-//   `pooling_method_encoding_discovery`): `PoolingMethod`'s bit encoding is
-//   Avg=0, Max=1, Min=2 -- see `PoolingMethod::bits()`'s doc comment.
+// - RESOLVED (hardware-confirmed by the retired standalone exploration on a
+//   real RK3588): `PoolingMethod`'s bit encoding is Avg=0, Max=1, Min=2 --
+//   see `PoolingMethod::bits()`'s doc comment.
 // - RESOLVED by the dedicated 143-capture fp16/int8 pooling sweep:
 //   PPU_RDMA line/surface strides are input width/area; PPU destination
 //   surface stride and `index_add` are output area rounded up to four
 //   pixels; aligned mode leaves `surf_len=0`. The same sweep confirms
 //   spatial extents through 8192 and both precision enums.
-// - RESOLVED (was open when this task hung real hardware, now hardware
-//   re-confirmed working -- all of `pooling_hw.rs`'s tests pass): the kick
+// - RESOLVED (was open when this task hung real hardware): the kick
 //   used to fire `build_conv_regcmd`'s fixed CNA/CORE/DPU/DPU_RDMA bitmask
 //   unconditionally, which never actually enabled PPU/PPU_RDMA for this
 //   task -- the root cause of the original hang. Now kicks `KICK_PPU |
@@ -80,13 +80,11 @@ use crate::rocket::{
 //   comparison/reference.
 //===========================================================================
 
-/// Hardware-confirmed bit encoding (`iree-rocket-hal/tests/pooling_hw.rs`'s
-/// `pooling_method_encoding_discovery`, real RK3588, via
-/// `build_pooling_regcmd`'s standalone-flying path): a half-10/half-200
-/// input produced raw=0 -> 249, raw=1 -> 250, raw=2 -> 248 -- i.e. raw=1 is
-/// the real max, raw=2 is the real min, raw=0 sits in between (avg). The
-/// original guess (Max=0, Min=1, Avg=2) had max and min swapped relative to
-/// avg; corrected below.
+/// Hardware-confirmed bit encoding from the retired standalone exploration
+/// on a real RK3588: a half-10/half-200 input produced raw=0 -> 249, raw=1
+/// -> 250, raw=2 -> 248 -- i.e. raw=1 is the real max, raw=2 is the real
+/// min, raw=0 sits in between (avg). The original guess (Max=0, Min=1,
+/// Avg=2) had max and min swapped relative to avg; corrected below.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum PoolingMethod {
     Max,
@@ -472,9 +470,9 @@ pub struct PoolingBuffers {
     ///
     /// UPDATE (post first hardware run): this was wrong -- writing the raw
     /// byte address here produced a job that completed (no hang, PREP_BO
-    /// returned) but left the *entire* output buffer at zero (see
-    /// pooling_hw.rs's `pooling_dump_full_output_buffer`, added
-    /// specifically to check this). The 28-bit width is the same
+    /// returned) but left the *entire* output buffer at zero (confirmed by
+    /// the retired standalone suite's sentinel-filled diagnostic). The
+    /// 28-bit width is the same
     /// bits[31:4] convention TRM Ch.36 documents explicitly for
     /// `pc_base_address` ("bits 31:4 regcmd DMA address") -- a 32-bit byte
     /// address shifted right by 4 (assuming 16-byte alignment) always fits
@@ -539,10 +537,10 @@ fn build_ppu_standalone_flying(
     // cancels the same way. The previous version omitted the `/
     // FEATURE_ATOMIC_SIZE` cancellation, writing a byte-stride value 16x
     // too large; row 0 of any pooling window (offset = base + 0*stride)
-    // still read correctly regardless, which is why every hardware test
-    // using this function against a CPU-filled *uniform-whole-buffer* input
-    // (pooling_hw.rs) never caught it -- reading 16x too far still landed on
-    // the same repeated fill byte anywhere within the buffer. It only
+    // still read correctly regardless, which is why the retired standalone
+    // suite's CPU-filled *uniform-whole-buffer* tests never caught it --
+    // reading 16x too far still landed on the same repeated fill byte
+    // anywhere within the buffer. It only
     // surfaced once a real DPU-written (not uniformly-filled) source buffer
     // was read in `pooling_via_dpu_bypass_hw.rs`, where rows beyond row 0
     // jumped past the DPU's actual (small) write footprint into untouched

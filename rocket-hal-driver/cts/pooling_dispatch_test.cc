@@ -1,8 +1,10 @@
 // Hand-written (not IREE's generic CTS harness) end-to-end test for the
-// standalone-PPU pooling ukernel, exercised through the REAL public IREE
-// HAL API (iree_hal_command_buffer_dispatch / iree_hal_device_queue_execute)
-// rather than iree-rocket-hal's raw regcmd+ioctl test
-// (iree-rocket-hal/tests/pooling_hw.rs). This is what actually proves
+// driver's legacy standalone-PPU pooling tag, exercised through the REAL
+// public IREE HAL API (iree_hal_command_buffer_dispatch /
+// iree_hal_device_queue_execute). The HAL crate's hardware suite now tests
+// only the vendor-observed two-stage path
+// (iree-rocket-hal/tests/pooling_via_dpu_bypass_hw.rs), so it deliberately
+// does not validate this legacy driver tag. This test is what proves
 // executable_cache.rs's tag-byte convention, command_buffer.rs's Pooling
 // binding convention (0=input, 1=output), and device.rs's queue_execute
 // real-GEM-handle fix all wire together correctly end to end --
