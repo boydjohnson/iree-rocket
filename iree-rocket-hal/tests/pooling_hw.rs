@@ -327,7 +327,7 @@ fn numerical_dimension_matrix_has_expected_direct_task_counts() {
         PoolingPlan::new(pooling_shape(K2_CAPTURE_BOUNDARY, PoolingMethod::Max))
             .tiles()
             .len(),
-        1
+        2
     );
     assert_eq!(
         PoolingPlan::new(pooling_shape(K2_TWO_TILES, PoolingMethod::Max))

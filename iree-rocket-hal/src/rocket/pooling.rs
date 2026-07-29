@@ -32,10 +32,11 @@ fn push_ppu_kick(cmds: &mut Vec<RegCmd>) {
 }
 
 // The direct register sequence is fixed by the 143-capture fp16/int8
-// pooling sweep: pixel-count source strides, four-pixel-aligned destination
-// surfaces, precision-dependent 16-byte channel atoms, PPU before PPU_RDMA,
-// and a 32-command program ending in a `0x60` kick and two fetch-padding
-// words. RK3588 testing established the Avg=0, Max=1, Min=2 method encoding.
+// pooling sweep: pixel-count line strides, four-pixel-aligned source and
+// destination surfaces, precision-dependent 16-byte channel atoms, PPU before
+// PPU_RDMA, and a 32-command program ending in a `0x60` kick and two
+// fetch-padding words. RK3588 testing established the Avg=0, Max=1, Min=2
+// method encoding.
 
 /// Hardware-confirmed bit encoding from the retired standalone exploration
 /// on a real RK3588: a half-10/half-200 input produced raw=0 -> 249, raw=1
@@ -140,8 +141,10 @@ const MAX_PPU_PADDING: u32 = 7;
 const MAX_DIRECT_KERNEL: u32 = 8;
 const DEFAULT_MAX_DIRECT_INPUT_WIDTH: u32 = 129;
 const DEFAULT_MAX_DIRECT_OUTPUT_WIDTH: u32 = 64;
-const K2S2_MAX_DIRECT_INPUT_WIDTH: u32 = 256;
-const K2S2_MAX_DIRECT_OUTPUT_WIDTH: u32 = 128;
+const K2S2_FP16_MAX_DIRECT_INPUT_WIDTH: u32 = 256;
+const K2S2_FP16_MAX_DIRECT_OUTPUT_WIDTH: u32 = 128;
+const K2S2_INT8_MAX_DIRECT_INPUT_WIDTH: u32 = 130;
+const K2S2_INT8_MAX_DIRECT_OUTPUT_WIDTH: u32 = 65;
 
 fn direct_width_limits(shape: &PoolingShape) -> (u32, u32) {
     if shape.kernel_width == 2
@@ -153,7 +156,19 @@ fn direct_width_limits(shape: &PoolingShape) -> (u32, u32) {
         && shape.pad_right == 0
         && shape.pad_bottom == 0
     {
-        (K2S2_MAX_DIRECT_INPUT_WIDTH, K2S2_MAX_DIRECT_OUTPUT_WIDTH)
+        match shape.precision {
+            PoolingPrecision::Fp16 => (
+                K2S2_FP16_MAX_DIRECT_INPUT_WIDTH,
+                K2S2_FP16_MAX_DIRECT_OUTPUT_WIDTH,
+            ),
+            // A two-task width-258 RK3588 probe validates the 65-column
+            // right tile, while a one-task width-257/output-128 probe shifts
+            // int8 results. Stay at the largest hardware-proven int8 tile.
+            PoolingPrecision::Int8 => (
+                K2S2_INT8_MAX_DIRECT_INPUT_WIDTH,
+                K2S2_INT8_MAX_DIRECT_OUTPUT_WIDTH,
+            ),
+        }
     } else {
         (
             DEFAULT_MAX_DIRECT_INPUT_WIDTH,
@@ -291,7 +306,8 @@ impl PoolingShape {
 ///
 /// A tile carries the kernel overlap in `input_width`. Most captured kernels
 /// use at most 64 output columns per task; the exact unpadded 2x2/stride-2
-/// path is capture-backed through 128 output columns. `input_first` and
+/// fp16 path is capture-backed through 128 output columns. Int8 is
+/// hardware-proven through 65 columns. `input_first` and
 /// `output_first` are pixel offsets into the full tensor; the builder converts
 /// them to 16-byte feature-atom offsets when relocating the base addresses.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -307,11 +323,14 @@ pub struct PoolingTile {
 /// Capture-derived horizontal pooling plan.
 ///
 /// Width 129 is the default largest whole direct input in the corpus, with a
-/// 64-column output cap. The exact unpadded 2x2/stride-2 path has dedicated
-/// captures through input width 256/output width 128. Larger tensors split
-/// into balanced tiles, assigning any remainder to the rightmost tiles. This
-/// reproduces the observed 63+64 split for an unpadded width-256
-/// 3x3/stride-2 pool and the 64+65 split for width-258 2x2/stride-2.
+/// 64-column output cap. The exact unpadded fp16 2x2/stride-2 path has
+/// dedicated captures through input width 256/output width 128. Int8 uses
+/// the hardware-proven input-130/output-65 limit: the two-task width-258
+/// probe passes, while a one-task width-257/output-128 probe produced shifted
+/// output. Larger tensors split into balanced tiles, assigning any remainder
+/// to the rightmost tiles. This reproduces the observed 63+64 split for an
+/// unpadded width-256 3x3/stride-2 pool and the 64+65 split for width-258
+/// 2x2/stride-2.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct PoolingPlan {
     shape: PoolingShape,
@@ -446,8 +465,12 @@ fn build_pooling_tile_task(
     // surfaced once a position-dependent NC1HWC2 source was used: rows beyond
     // row 0 jumped past the real write footprint into untouched contents.
     let src_line_stride = (shape.input_width * ATOMIC_K_SIZE) / FEATURE_ATOMIC_SIZE;
-    let src_surf_stride =
-        (shape.input_width * ATOMIC_K_SIZE * shape.input_height) / FEATURE_ATOMIC_SIZE;
+    // The exact 7x5 vendor controls program 36 rather than the unaligned area
+    // 35 in both fp16 and int8. Earlier sweep points all happened to have
+    // four-pixel-aligned areas, which hid this source-side rule.
+    let src_surf_stride = ((shape.input_width * ATOMIC_K_SIZE * shape.input_height)
+        / FEATURE_ATOMIC_SIZE)
+        .next_multiple_of(4);
 
     // Capture-derived: destination surfaces are four-pixel aligned. This is
     // visible on rectangular kernels whose odd output area makes the padding
@@ -997,13 +1020,39 @@ mod tests {
     }
 
     #[test]
-    fn k2s2_capture_boundary_uses_one_task_through_output_128() {
+    fn k2s2_fp16_capture_boundary_uses_one_task_through_output_128() {
         for input_width in [256, 257] {
             let plan = PoolingPlan::new(shape(input_width, 48, 2, 2, 2, 2, PoolingPrecision::Fp16));
             assert_eq!(plan.tiles().len(), 1);
             assert_eq!(plan.tiles()[0].input_width, 256);
             assert_eq!(plan.tiles()[0].output_width, 128);
         }
+    }
+
+    #[test]
+    fn k2s2_int8_avoids_the_failing_128_column_task() {
+        let plan = PoolingPlan::new(shape(257, 48, 2, 2, 2, 2, PoolingPrecision::Int8));
+        assert_eq!(
+            plan.tiles()
+                .iter()
+                .map(|tile| (tile.input_width, tile.output_width))
+                .collect::<Vec<_>>(),
+            [(128, 64), (128, 64)]
+        );
+    }
+
+    #[test]
+    fn odd_input_area_uses_the_vendor_surface_alignment() {
+        let shape = shape(7, 5, 3, 2, 2, 1, PoolingPrecision::Int8);
+        let commands = single_task(
+            &shape,
+            &PoolingBuffers {
+                input_addr: 0,
+                output_addr: 0,
+            },
+        );
+        assert_eq!(register_value::<PpuRdmaSrcLineStride>(&commands), 7 << 4);
+        assert_eq!(register_value::<PpuRdmaSrcSurfStride>(&commands), 36 << 4);
     }
 
     #[test]
