@@ -439,10 +439,10 @@ impl Multiplier {
 /// `DPU_BN_MUL_CFG` and `DPU_RDMA_RDMA_BN_BASE_ADDR` stay zero throughout.
 /// Turning the stage on costs no operand buffer and no DMA.
 ///
-/// Note that [`crate::rocket::mesa_conv`] fuses activation into the BS stage
-/// instead, which is a different port of the same hardware. Nothing has run
-/// that path against a real activated model, so this is not evidence it
-/// computes the wrong thing -- only that it is not what the vendor emits.
+/// The retired Mesa-derived convolution builder fused activation into the BS
+/// stage instead. Nothing ran that path against a real activated model, so
+/// this is not evidence it computed the wrong thing -- only that it was not
+/// what the vendor emits.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Activation {
     /// `DPU_BN_CFG` = `0x53`. The whole BN stage is bypassed.
@@ -846,8 +846,8 @@ impl Shape {
     /// The DPU writes output in 16-byte feature-atomic surfaces and programs
     /// the atomically-rounded [`Shape::padded_out_channels`] count rather
     /// than the logical one, so this allocates enough complete surfaces for
-    /// that padded count -- mirrors `mesa_conv::conv_output_scratch_bytes`'s
-    /// formula against this capture-derived shape instead. Tiling-agnostic:
+    /// that padded count. This is the capture-derived counterpart of the
+    /// retired Mesa builder's output-allocation formula. Tiling-agnostic:
     /// [`ConvPlan`]'s row/column tiles are sub-ranges of this same total
     /// buffer, addressed via [`relocate`]'s per-tile offsets, so callers need
     /// only this one size regardless of how many tiles a shape plans into.
@@ -4708,8 +4708,9 @@ mod tests {
             assert_eq!(value_of::<DpuBnAluCfg>(&program), 0);
             assert_eq!(value_of::<DpuBnMulCfg>(&program), 0);
             assert_eq!(value_of::<DpuRdmaBnBaseAddr>(&program), 0);
-            // The vendor leaves BS alone; only BN moves. `mesa_conv` fuses
-            // activation here instead, which is what this pins against.
+            // The vendor leaves BS alone; only BN moves. The retired
+            // Mesa-derived builder fused activation here instead, which is
+            // what this pins against.
             assert_eq!(
                 value_of::<DpuBsCfg>(&program),
                 0x2_0150,
@@ -4773,8 +4774,8 @@ mod tests {
     }
 
     /// The depthwise channel ladder, both precisions, read off the nine
-    /// captures. `mesa_conv::compute_task_output_channels` would say 64, 64
-    /// and 128 for the fp16 8, 32 and 96 rows.
+    /// captures. The retired Mesa-derived channel rule would say 64, 64 and
+    /// 128 for the fp16 8, 32 and 96 rows.
     #[test]
     fn depthwise_pads_channels_to_the_captured_granule() {
         for (channels, fp16, int8) in [

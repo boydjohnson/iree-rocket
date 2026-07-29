@@ -6,7 +6,7 @@
 //! project): that backend's `serializeExecutable()` would emit exactly the
 //! bytes `decode_conv_shape_v1` parses here.
 //!
-//! Version 2 replaced version 1's `mesa_conv::ConvShape`-shaped payload with
+//! Version 2 replaced version 1's retired Mesa-derived `ConvShape` payload with
 //! one that mirrors the capture-derived [`conv::Shape`] directly: dropping
 //! `output_width`/`output_height` (now always derived from
 //! input/kernel/stride/padding rather than carried as separate,
@@ -471,9 +471,9 @@ mod tests {
 
     #[test]
     fn validate_rejects_input_channels_outside_capture_backed_range() {
-        // Historical note: under the mesa_conv-era wire format, this exact
+        // Historical note: under the retired Mesa-era wire format, this exact
         // channel count (65520) PASSED validate_conv_shape and only panicked
-        // later inside `build_conv_regcmd`, since mesa_conv's validator only
+        // later inside `build_conv_regcmd`, since the old validator only
         // checked individual register field widths, not conv.rs's own
         // capture-backed channel range. Since validate_conv_shape now
         // rebuilds the shape through `conv::Shape`'s own constructors, this

@@ -35,7 +35,7 @@ use iree_rocket_hal::rocket::{
 /// into this runtime-owned type so command recording never depends on generated
 /// FlatBuffer objects remaining alive.
 ///
-/// Unlike `mesa_conv::ConvShape`, [`conv::Shape`] has no independent
+/// Unlike the retired Mesa-derived shape, [`conv::Shape`] has no independent
 /// `OutputWidth`/`OutputHeight` fields -- they're always
 /// `Shape::output_width(kernels)`/`output_height(kernels)`, derived from the
 /// other five dimensions plus stride/padding, so making them independently

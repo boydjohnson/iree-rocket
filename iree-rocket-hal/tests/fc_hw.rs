@@ -24,7 +24,7 @@
 //! the real signed value directly (no separate weights zero point exists in
 //! this model), which makes an isolation probe like
 //! `fc_packed_weights_select_one_output_channel` below simpler than its old
-//! mesa_conv-era equivalent -- zero really is neutral.
+//! retired Mesa-derived equivalent -- zero really is neutral.
 
 use std::{fs::OpenOptions, mem, os::unix::io::AsRawFd, ptr};
 

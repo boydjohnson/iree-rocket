@@ -12,7 +12,7 @@
 //!
 //! A third shape -- pooling pipelined on-chip directly after a real conv via
 //! `dpu_flyin`, no PPU_RDMA fetch at all -- was implemented and then
-//! retired rather than migrated off `mesa_conv`. A dedicated 53-model
+//! retired rather than migrated off the Mesa-derived convolution builder. A dedicated 53-model
 //! `Conv2d -> Pool` sweep (`iree-rocket-design-spike`'s
 //! `sweep_convpool_generate.py`/`sweep_convpool_diff.py`, see
 //! `DESIGN_NOTES.md`'s "Conv+pool fusion sweep" section) found zero capture
@@ -30,8 +30,8 @@
 //! Mesa-derived in structure, though there is no Mesa/Teflon reference for
 //! pooling itself (`rkt_ml.c` only ever implements convolution) -- the
 //! fields come from the PPU/PPU_RDMA register layout plus TRM Ch.36 prose.
-//! Both builders here are `mesa_conv`-free, using [`crate::rocket::conv`]'s
-//! capture-derived `ConvPlan` for their conv-coupled stage.
+//! Both builders use [`crate::rocket::conv`]'s capture-derived `ConvPlan` for
+//! their conv-coupled stage.
 
 use crate::rocket::{
     activation::Activation,
@@ -899,7 +899,7 @@ pub fn build_pooling_via_dpu_bypass_regcmd(
     // Only the `activation` field is overridden here; every other
     // geometry/quant field comes from the caller-supplied `bypass_shape`
     // unchanged. `conv::Activation` fuses through the BN stage (see that
-    // type's own doc comment) rather than mesa_conv's BS stage -- a
+    // type's own doc comment) rather than the retired Mesa builder's BS stage -- a
     // different port of the same hardware, not yet independently
     // hardware-validated in this specific bypass-then-pool composition
     // (only `cmp: 0`, which clamps to a constant zero regardless of which
@@ -941,8 +941,8 @@ pub fn build_pooling_via_dpu_bypass_regcmd(
     // (PCTrailer::operation_enable(PCOperationMask::CONVOLUTION), which is
     // exactly CNA|CORE|DPU|DPU_RDMA -- see conv.rs's tile builder). An
     // earlier version of this function pushed a second, redundant kick here,
-    // carried over unexamined from the pre-migration mesa_conv-based stage 1
-    // (mesa_conv::build_conv_cna_core_dpu_dpu_rdma never self-kicks, so a
+    // carried over unexamined from the pre-migration Mesa-derived stage 1
+    // (that builder never self-kicked, so a
     // caller-supplied kick there was the ONLY kick, not a second one).
     // PC_OPERATION_ENABLE is edge-triggered, not passive state: a real RK3588
     // run showed the second write re-kicks the same blocks immediately after
@@ -950,8 +950,8 @@ pub fn build_pooling_via_dpu_bypass_regcmd(
     // diagnostic caught it -- job completes, no hang, but the data is wrong)
     // instead of the harmless "last write wins" this was wrongly assumed to
     // be. The real vendor capture's own kick reading 0x0d (missing the
-    // DPU_RDMA bit) is a fact about mesa_conv's own kick construction, not
-    // evidence this stage's ConvPlan-emitted kick is incomplete.
+    // DPU_RDMA bit) is a fact about the retired builder's kick construction,
+    // not evidence this stage's ConvPlan-emitted kick is incomplete.
 
     // Stage 2: standalone-flying PPU, fetching from stage 1's real output.
     let plan = PoolingPlan::new(*pooling_shape);

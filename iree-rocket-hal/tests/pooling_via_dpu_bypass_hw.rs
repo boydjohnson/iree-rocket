@@ -434,8 +434,8 @@ fn pooling_via_bypass_repeat_dispatch_dump() {
 /// numeric domain, same caveat as conv's own `cmp` open question.
 ///
 /// The bypass stage's conv now goes through `conv.rs`'s capture-derived
-/// builder rather than `mesa_conv`'s, which fuses activation via the BN
-/// stage instead of BS (see `pooling.rs`'s own doc comment on
+/// builder, which fuses activation via the BN stage instead of the retired
+/// Mesa-derived builder's BS stage (see `pooling.rs`'s own doc comment on
 /// `build_pooling_via_dpu_bypass_regcmd`) -- `cmp: 0` clamping to a
 /// constant zero is domain- and stage-invariant, so this specific test
 /// still proves the fusion wiring works, but a real hardware run after

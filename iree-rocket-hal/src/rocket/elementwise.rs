@@ -5,7 +5,7 @@
 //! The EW block is otherwise fully bypassed by every other builder in this
 //! crate.
 //!
-//! `mesa_conv`-free -- capture-derived, like [`crate::rocket::activation`]'s
+//! Capture-derived, like [`crate::rocket::activation`]'s
 //! `build_conv_then_lut_regcmd`. A dedicated 47-model `Conv2d(x) +/- w`
 //! sweep (`iree-rocket-design-spike`'s `sweep_convadd_generate.py`/
 //! `sweep_convadd_diff.py`, see `DESIGN_NOTES.md`'s "Conv+add fusion sweep"
@@ -63,11 +63,8 @@ pub struct EwAddShape {
     /// `rknn-toolkit2` compiles route subtraction differently by precision
     /// -- fp16 always used the real `algo=4` (Minus) opcode directly (with
     /// an unnegated `EW_CVT_SCALE_VALUE`); every int8 subtraction instead
-    /// reused `algo=2` (Add) with a negated scale (see
-    /// `iree-rocket-hal/src/rocket/mesa_conv.rs`'s superseded `AddTensor`
-    /// doc comment for the sign-negation mechanics, still accurate for the
-    /// int8 case). Pick `algo` accordingly; this type does not choose for
-    /// the caller.
+    /// reused `algo=2` (Add) with a negated scale. Pick `algo` accordingly;
+    /// this type does not choose for the caller.
     pub algo: u32,
     /// int8 only, ignored for fp16: this task's own real, decoded output
     /// zero point. Also used verbatim (negated) to re-center the primary
@@ -305,8 +302,8 @@ pub fn build_add_regcmd(shape: &EwAddShape, bufs: &EwAddBuffers) -> Vec<RegCmd> 
     cmds.push(zero::<DpuBnReluxCmpValue>());
 
     // ew_cvt_type/edata_size are the one EW_CFG-bit precision split: int8's
-    // values are bit-identical to mesa_conv.rs's superseded fused-path
-    // constants; fp16's are new (that path never emitted fp16).
+    // values are bit-identical to the retired fused-path constants; fp16's
+    // are new (that path never emitted fp16).
     let (ew_cvt_type, edata_size) = if is_fp16 { (0, 2) } else { (1, 1) };
     cmds.push(
         Register::<DpuEwCfg>::new()

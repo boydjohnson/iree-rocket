@@ -614,8 +614,8 @@ pub fn build_conv_then_lut_regcmd(
     // CNA|CORE|DPU|DPU_RDMA -- see conv.rs's tile builder). An earlier
     // version of this function pushed a second, redundant kick here, carried
     // over unexamined from `build_pooling_via_dpu_bypass_regcmd`'s
-    // pre-migration mesa_conv-based bypass stage (mesa_conv::build_conv_
-    // cna_core_dpu_dpu_rdma never self-kicks, so a caller-supplied kick
+    // pre-migration Mesa-derived bypass stage (that builder never self-kicked,
+    // so a caller-supplied kick
     // there was the ONLY kick, not a second one -- see that function's own
     // corrected doc comment for the real hardware evidence).
     // PC_OPERATION_ENABLE is edge-triggered, not passive state: writing it

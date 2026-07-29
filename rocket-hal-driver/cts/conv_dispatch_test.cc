@@ -27,7 +27,7 @@
 // end-to-end dispatch, a malformed-payload rejection at prepare_executable
 // time, and two validate_conv_shape-rejected shapes (also at
 // prepare_executable time) -- one exceeding the capture-backed kernel
-// extent range, and one (a former mesa_conv-era known gap, see
+// extent range, and one (a former Mesa-derived-builder known gap, see
 // Tag3RejectsChannelCountOutsideCaptureBackedRange's own comment) that
 // used to only fail later, inside command_buffer.rs's dispatch()-time
 // catch_unwind backstop, before the conv.rs migration made
@@ -557,12 +557,12 @@ TEST(RocketConvDispatch, Tag3RejectsChannelCountOutsideCaptureBackedRange) {
     GTEST_SKIP() << "rocket device unavailable: " << error;
   }
 
-  // Historical note (mesa_conv era): this exact shape used to PASS
+  // Historical note (retired Mesa-builder era): this exact shape used to PASS
   // validate_conv_shape (every individual field was within the bounds that
   // function checked by hand) and only panic empirically inside
   // build_conv_regcmd, because weights_width * weights_height *
   // task_input_channels overflowed CNA_WEIGHT_SIZE1's 19-bit
-  // weight_bytes_per_kernel field -- a product mesa_conv's validator
+  // weight_bytes_per_kernel field -- a product the old validator
   // deliberately didn't re-derive, relying on command_buffer.rs's
   // catch_unwind backstop to convert that panic into a graceful failing
   // status at dispatch() time instead of prepare_executable() time.

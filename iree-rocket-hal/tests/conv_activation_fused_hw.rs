@@ -2,8 +2,8 @@
 //! path derived from the 30-capture activation sweep (see DESIGN_NOTES.md,
 //! "Fused activation: the vendor uses BN, not BS").
 //!
-//! Distinct from `mesa_conv`'s BS-stage port of the same idea (its own
-//! hardware coverage has since been retired as redundant with this file).
+//! Distinct from the retired Mesa-derived builder's BS-stage port of the same
+//! idea (its own hardware coverage was retired as redundant with this file).
 //! The two program different registers; this file is what says the
 //! capture-derived one computes the right thing.
 //!
