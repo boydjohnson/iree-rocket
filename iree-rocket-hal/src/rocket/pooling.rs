@@ -35,10 +35,24 @@
 
 use crate::rocket::{
     activation::Activation,
-    builders::{Bits, RegCmd, Register, ppu::*, ppu_rdma::*},
+    builders::{Bits, RegCmd, Register, pc::PCTrailer, ppu::*, ppu_rdma::*},
     conv::{self, Activation as ConvActivation, ConvPlan, Kernels},
     regcmd::{KICK_PPU, KICK_PPU_RDMA, push_kick, zero},
 };
+
+/// Appends the captured PPU/PPU_RDMA trailer and its two-word fetch padding.
+///
+/// The direct 26-register vendor PPU programs in the pooling sweep are
+/// followed by the four-word kick trailer and two zero words (32 commands
+/// total). The generic trailer helper only guarantees an even command count,
+/// so preserve the PPU stream's stronger four-command alignment here without
+/// changing other engines' programs.
+fn push_ppu_kick(cmds: &mut Vec<RegCmd>) {
+    push_kick(cmds, KICK_PPU | KICK_PPU_RDMA);
+    while !cmds.len().is_multiple_of(4) {
+        cmds.push(PCTrailer::alignment_padding());
+    }
+}
 
 //===========================================================================
 // Pooling (standalone PPU, "flying mode" -- TRM Ch.36 Fig 36-6): PPU_RDMA
@@ -49,7 +63,7 @@ use crate::rocket::{
 // `builders/ppu_rdma.rs` (bindgen'd from Mesa's own `registers.xml`, see
 // builders.rs's DOMAIN_* comment) plus the TRM Ch.36 §4.6/§4.7 prose and
 // `build_conv_regcmd`'s established conventions (N-1 encoding on every
-// *_RDMA/CORE/DPU cube dimension, the same four-entry PC kick tail). This
+// *_RDMA/CORE/DPU cube dimension). This
 // standalone shape is retained as a register-level reference, not as the
 // production path. Its hardware suite was retired after the large-window and
 // tiled-width cases failed; the vendor-observed two-stage path below now
@@ -61,8 +75,11 @@ use crate::rocket::{
 // - RESOLVED by the dedicated 143-capture fp16/int8 pooling sweep:
 //   PPU_RDMA line/surface strides are input width/area; PPU destination
 //   surface stride and `index_add` are output area rounded up to four
-//   pixels; aligned mode leaves `surf_len=0`. The same sweep confirms
-//   spatial extents through 8192 and both precision enums.
+//   pixels; aligned mode leaves `surf_len=0`; all three channel extents pad
+//   to a 16-byte feature atom (C8 fp16/C16 int8); PPU registers precede the
+//   PPU_RDMA registers; and the kick tail carries two final zero words for
+//   a 32-command direct program. The same sweep confirms spatial extents
+//   through 8192 and both precision enums.
 // - RESOLVED (was open when this task hung real hardware): the kick
 //   used to fire `build_conv_regcmd`'s fixed CNA/CORE/DPU/DPU_RDMA bitmask
 //   unconditionally, which never actually enabled PPU/PPU_RDMA for this
@@ -115,6 +132,19 @@ pub enum PoolingPrecision {
 }
 
 impl PoolingPrecision {
+    /// Logical channels carried by one 16-byte PPU feature atom.
+    ///
+    /// The pooling sweep programs all three channel extents to this
+    /// precision-dependent granularity: fp16 C1..C8 become C8, while int8
+    /// C12 becomes C16. This is the same physical 16-byte atom consumed from
+    /// the preceding DPU output or directly by PPU_RDMA.
+    fn channels_per_atom(self) -> u32 {
+        match self {
+            PoolingPrecision::Int8 => 16,
+            PoolingPrecision::Fp16 => 8,
+        }
+    }
+
     fn ppu_precision(self) -> u32 {
         match self {
             PoolingPrecision::Int8 => 0,
@@ -140,9 +170,14 @@ impl PoolingPrecision {
 pub struct PoolingShape {
     pub input_width: u32,
     pub input_height: u32,
+    /// Logical channel count. Register emission rounds this to one 16-byte
+    /// feature atom (C8 fp16/C16 int8), matching every direct vendor PPU
+    /// program rather than writing a sub-atomic channel extent.
     pub input_channels: u32,
     pub output_width: u32,
     pub output_height: u32,
+    /// Logical channel count, equal to `input_channels`; programmed with the
+    /// same feature-atom rounding.
     pub output_channels: u32,
     pub precision: PoolingPrecision,
     pub kernel_width: u32,
@@ -403,7 +438,7 @@ impl PoolingPlan {
                     .expect("pooling tile output address overflows u32");
                 let mut commands =
                     build_ppu_standalone_flying(&self.shape, tile, bufs.input_addr, output_addr);
-                push_kick(&mut commands, KICK_PPU | KICK_PPU_RDMA);
+                push_ppu_kick(&mut commands);
                 commands
             })
             .collect()
@@ -448,7 +483,7 @@ impl PoolingPlan {
                     .expect("pooling tile output address overflows u32");
                 let mut commands =
                     build_ppu_standalone_flying(&self.shape, tile, input_addr, output_addr);
-                push_kick(&mut commands, KICK_PPU | KICK_PPU_RDMA);
+                push_ppu_kick(&mut commands);
                 commands
             })
             .collect()
@@ -525,6 +560,9 @@ fn build_ppu_standalone_flying(
          loudly, so this must be checked explicitly"
     );
     let dst_base_addr_shifted = output_addr >> 4;
+    let programmed_channels = shape
+        .input_channels
+        .next_multiple_of(shape.precision.channels_per_atom());
 
     const ATOMIC_K_SIZE: u32 = 16;
     const FEATURE_ATOMIC_SIZE: u32 = 16;
@@ -600,47 +638,7 @@ fn build_ppu_standalone_flying(
     );
 
     // ========================================================================
-    // PPU_RDMA -- standalone read side, feeds PPU directly from memory.
-    // ========================================================================
-
-    cmds.push(
-        Register::<PpuRdmaCubeInWidth>::new()
-            .cube_in_width(Bits::new(tile.input_width - 1))
-            .build(),
-    );
-    cmds.push(
-        Register::<PpuRdmaCubeInHeight>::new()
-            .cube_in_height(Bits::new(shape.input_height - 1))
-            .build(),
-    );
-    cmds.push(
-        Register::<PpuRdmaCubeInChannel>::new()
-            .cube_in_channel(Bits::new(shape.input_channels - 1))
-            .build(),
-    );
-    cmds.push(
-        Register::<PpuRdmaSrcBaseAddr>::new()
-            .src_base_addr(Bits::new(input_addr))
-            .build(),
-    );
-    cmds.push(
-        Register::<PpuRdmaSrcLineStride>::new()
-            .src_line_stride(Bits::new(src_line_stride))
-            .build(),
-    );
-    cmds.push(
-        Register::<PpuRdmaSrcSurfStride>::new()
-            .src_surf_stride(Bits::new(src_surf_stride))
-            .build(),
-    );
-    cmds.push(
-        Register::<PpuRdmaDataFormat>::new()
-            .in_precision(Bits::new(shape.precision.rdma_precision()))
-            .build(),
-    );
-
-    // ========================================================================
-    // PPU
+    // PPU -- vendor programs the consumer block before its PPU_RDMA feeder.
     // ========================================================================
 
     cmds.push(
@@ -655,7 +653,7 @@ fn build_ppu_standalone_flying(
     );
     cmds.push(
         Register::<PpuDataCubeInChannel>::new()
-            .cube_in_channel(Bits::new(shape.input_channels - 1))
+            .cube_in_channel(Bits::new(programmed_channels - 1))
             .build(),
     );
     cmds.push(
@@ -670,7 +668,7 @@ fn build_ppu_standalone_flying(
     );
     cmds.push(
         Register::<PpuDataCubeOutChannel>::new()
-            .cube_out_channel(Bits::new(shape.output_channels - 1))
+            .cube_out_channel(Bits::new(programmed_channels - 1))
             .build(),
     );
 
@@ -745,6 +743,46 @@ fn build_ppu_standalone_flying(
             .build(),
     );
 
+    // ========================================================================
+    // PPU_RDMA -- standalone read side, feeds PPU directly from memory.
+    // ========================================================================
+
+    cmds.push(
+        Register::<PpuRdmaCubeInWidth>::new()
+            .cube_in_width(Bits::new(tile.input_width - 1))
+            .build(),
+    );
+    cmds.push(
+        Register::<PpuRdmaCubeInHeight>::new()
+            .cube_in_height(Bits::new(shape.input_height - 1))
+            .build(),
+    );
+    cmds.push(
+        Register::<PpuRdmaCubeInChannel>::new()
+            .cube_in_channel(Bits::new(programmed_channels - 1))
+            .build(),
+    );
+    cmds.push(
+        Register::<PpuRdmaSrcBaseAddr>::new()
+            .src_base_addr(Bits::new(input_addr))
+            .build(),
+    );
+    cmds.push(
+        Register::<PpuRdmaSrcLineStride>::new()
+            .src_line_stride(Bits::new(src_line_stride))
+            .build(),
+    );
+    cmds.push(
+        Register::<PpuRdmaSrcSurfStride>::new()
+            .src_surf_stride(Bits::new(src_surf_stride))
+            .build(),
+    );
+    cmds.push(
+        Register::<PpuRdmaDataFormat>::new()
+            .in_precision(Bits::new(shape.precision.rdma_precision()))
+            .build(),
+    );
+
     cmds
 }
 
@@ -782,7 +820,7 @@ pub fn build_pooling_regcmd(shape: &PoolingShape, bufs: &PoolingBuffers) -> Vec<
     );
     let mut cmds =
         build_ppu_standalone_flying(shape, &plan.tiles[0], bufs.input_addr, bufs.output_addr);
-    push_kick(&mut cmds, KICK_PPU | KICK_PPU_RDMA);
+    push_ppu_kick(&mut cmds);
     cmds
 }
 
@@ -966,7 +1004,7 @@ pub fn build_pooling_via_dpu_bypass_regcmd(
         bufs.bypass_output_addr,
         bufs.output_addr,
     );
-    push_kick(&mut pooling_cmds, KICK_PPU | KICK_PPU_RDMA);
+    push_ppu_kick(&mut pooling_cmds);
 
     (bypass_cmds, pooling_cmds)
 }
@@ -1092,7 +1130,10 @@ pub fn build_max_reduction_tree_regcmd(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::rocket::builders::RegisterMeta;
+    use crate::rocket::{
+        builders::{DOMAIN_PC, DOMAIN_PPU, DOMAIN_PPU_RDMA, RegisterMeta},
+        debug::decode,
+    };
 
     fn shape(
         width: u32,
@@ -1135,6 +1176,137 @@ mod tests {
             })
             .expect("register is present");
         (command.0 >> 16) as u32
+    }
+
+    #[test]
+    fn int8_program_matches_the_direct_vendor_capture_word_for_word() {
+        // The pooling-sweep capture
+        // `pool-max-w64-h48-c12-kw3-kh3-sx2-sy2-p1-1-1-1-i8.rknn` is an
+        // exact direct PPU program. Addresses are zero in the static file
+        // and are therefore also zero here.
+        let shape = PoolingShape {
+            input_width: 64,
+            input_height: 48,
+            input_channels: 12,
+            output_width: 32,
+            output_height: 24,
+            output_channels: 12,
+            precision: PoolingPrecision::Int8,
+            kernel_width: 3,
+            kernel_height: 3,
+            stride_x: 2,
+            stride_y: 2,
+            method: PoolingMethod::Max,
+            pad_left: 1,
+            pad_top: 1,
+            pad_right: 1,
+            pad_bottom: 1,
+            pad_value: 0,
+            activation: Activation::None,
+        };
+        let commands = build_pooling_regcmd(
+            &shape,
+            &PoolingBuffers {
+                input_addr: 0,
+                output_addr: 0,
+            },
+        );
+        let actual: Vec<_> = commands.iter().map(decode).collect();
+        let expected = vec![
+            (DOMAIN_PPU, 0x6004, 0x0000_000e),
+            (DOMAIN_PPU_RDMA, 0x7004, 0x0000_000e),
+            (DOMAIN_PPU, 0x600c, 0x0000_003f),
+            (DOMAIN_PPU, 0x6010, 0x0000_002f),
+            (DOMAIN_PPU, 0x6014, 0x0000_000f),
+            (DOMAIN_PPU, 0x6018, 0x0000_001f),
+            (DOMAIN_PPU, 0x601c, 0x0000_0017),
+            (DOMAIN_PPU, 0x6020, 0x0000_000f),
+            (DOMAIN_PPU, 0x6024, 0x0000_0011),
+            (DOMAIN_PPU, 0x6034, 0x0011_0202),
+            (DOMAIN_PPU, 0x6038, 0),
+            (DOMAIN_PPU, 0x603c, 0),
+            (DOMAIN_PPU, 0x6040, 0x0000_0011),
+            (DOMAIN_PPU, 0x6044, 0),
+            (DOMAIN_PPU, 0x6048, 0),
+            (DOMAIN_PPU, 0x6070, 0),
+            (DOMAIN_PPU, 0x607c, 0x0000_3000),
+            (DOMAIN_PPU, 0x6084, 0x0000_3000),
+            (DOMAIN_PPU, 0x60dc, 0x0000_0003),
+            (DOMAIN_PPU_RDMA, 0x700c, 0x0000_003f),
+            (DOMAIN_PPU_RDMA, 0x7010, 0x0000_002f),
+            (DOMAIN_PPU_RDMA, 0x7014, 0x0000_000f),
+            (DOMAIN_PPU_RDMA, 0x701c, 0),
+            (DOMAIN_PPU_RDMA, 0x7024, 0x0000_0400),
+            (DOMAIN_PPU_RDMA, 0x7028, 0x0000_c000),
+            (DOMAIN_PPU_RDMA, 0x7030, 0x0000_0001),
+            (0, 0, 0),
+            (DOMAIN_PC, 0x0014, 0),
+            (0x0041, 0, 0),
+            (0x0081, 0x0008, 0x0000_0060),
+            (0, 0, 0),
+            (0, 0, 0),
+        ];
+        assert_eq!(actual, expected);
+    }
+
+    #[test]
+    fn channel_extents_follow_the_captured_feature_atom_padding() {
+        for (precision, logical_channels, programmed_minus_one) in [
+            (PoolingPrecision::Fp16, 1, 7),
+            (PoolingPrecision::Fp16, 9, 15),
+            (PoolingPrecision::Int8, 1, 15),
+            (PoolingPrecision::Int8, 17, 31),
+        ] {
+            let shape = PoolingShape {
+                input_channels: logical_channels,
+                output_channels: logical_channels,
+                ..shape(4, 4, 2, 2, 2, 2, precision)
+            };
+            let commands = build_pooling_regcmd(
+                &shape,
+                &PoolingBuffers {
+                    input_addr: 0,
+                    output_addr: 0,
+                },
+            );
+            assert_eq!(
+                register_value::<PpuDataCubeInChannel>(&commands),
+                programmed_minus_one
+            );
+            assert_eq!(
+                register_value::<PpuDataCubeOutChannel>(&commands),
+                programmed_minus_one
+            );
+            assert_eq!(
+                register_value::<PpuRdmaCubeInChannel>(&commands),
+                programmed_minus_one
+            );
+        }
+    }
+
+    #[test]
+    fn int8_average_reciprocals_match_the_convpool_capture() {
+        // convpool-w32-h32-ci16-co16-k3-s1-pk2-ps2-pmavg-i8.rknn
+        // emits an ordinary flying-mode PPU stage after its memory-writing
+        // convolution task.
+        let shape = PoolingShape {
+            method: PoolingMethod::Avg,
+            ..shape(32, 32, 2, 2, 2, 2, PoolingPrecision::Int8)
+        };
+        let commands = build_pooling_regcmd(
+            &shape,
+            &PoolingBuffers {
+                input_addr: 0,
+                output_addr: 0,
+            },
+        );
+        assert_eq!(register_value::<PpuOperationModeCfg>(&commands), 0x10);
+        assert_eq!(
+            register_value::<PpuPoolingKernelCfg>(&commands),
+            0x0011_0101
+        );
+        assert_eq!(register_value::<PpuRecipKernelWidth>(&commands), 0x8000);
+        assert_eq!(register_value::<PpuRecipKernelHeight>(&commands), 0x8000);
     }
 
     #[test]
