@@ -5,11 +5,11 @@
 //! consumers (`rocket-hal-driver`) can use the same primitives instead of
 //! re-deriving them.
 
-use std::num::NonZeroUsize;
+use std::{num::NonZeroUsize, ptr::NonNull};
 
 use nix::{
     ioctl_readwrite, ioctl_write_ptr,
-    sys::mman::{MapFlags, ProtFlags, mmap},
+    sys::mman::{MapFlags, ProtFlags, mmap, munmap},
     time::{ClockId, clock_gettime},
 };
 
@@ -289,11 +289,24 @@ pub unsafe fn prep_bo(fd: i32, handle: u32, relative_timeout_ns: u64) -> nix::Re
 /// dispatch results after several repeated allocations, while the exact
 /// same dispatch run once in a fresh process was clean. Does NOT unmap the
 /// buffer's `host_ptr` -- callers that also `mmap`'d (i.e. everyone using
-/// `Buffer::new()`) should `munmap` separately if the address space itself
-/// needs reclaiming; this only releases the kernel-side GEM object/handle.
+/// `Buffer::new()`) must call [`unmap_bo`] separately to release the VMA's
+/// GEM-object reference; this only releases the file's GEM handle.
 pub unsafe fn close_bo(fd: i32, handle: u32) -> nix::Result<()> {
     unsafe {
         gem_close(fd, &drm_gem_close { handle, pad: 0 })?;
     }
     Ok(())
+}
+
+/// Releases the CPU mapping created by [`Buffer::new`].
+///
+/// This is separate from [`close_bo`]: GEM_CLOSE drops the file's handle,
+/// while `munmap` drops the VMA's independent reference to the GEM object.
+/// Call both once no CPU pointer into the buffer remains. Otherwise the GEM
+/// object, its IOMMU domain reference, and its IOVA allocation remain alive
+/// until process exit even though the handle has been closed.
+pub unsafe fn unmap_bo(buffer: &Buffer) -> nix::Result<()> {
+    let mapping =
+        NonNull::new(buffer.host_ptr.cast()).expect("Buffer::new returned a null mapping");
+    unsafe { munmap(mapping, buffer.size) }
 }

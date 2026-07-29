@@ -15,7 +15,7 @@
 use std::{fs::OpenOptions, mem, os::unix::io::AsRawFd, ptr, time::Instant};
 
 use iree_rocket_hal::rocket::{
-    device::{Buffer, close_bo, fini_bo, prep_bo, submit_tasks},
+    device::{Buffer, close_bo, fini_bo, prep_bo, submit_tasks, unmap_bo},
     pooling::{PoolingBuffers, PoolingMethod, PoolingPlan, PoolingPrecision, PoolingShape},
 };
 
@@ -262,8 +262,11 @@ fn run_numeric_case(case: NumericCase, method: PoolingMethod) -> (Vec<i8>, Vec<i
             .collect();
 
         for command_buffer in command_buffers {
+            unmap_bo(&command_buffer).expect("failed to unmap pooling command BO");
             close_bo(fd, command_buffer.handle).ok();
         }
+        unmap_bo(&buf_in).expect("failed to unmap pooling input BO");
+        unmap_bo(&buf_out).expect("failed to unmap pooling output BO");
         close_bo(fd, buf_in.handle).ok();
         close_bo(fd, buf_out.handle).ok();
         (actual, expected, dispatch_ms)
@@ -386,4 +389,16 @@ fn direct_rectangular_min_pooling_matches_cpu_reference() {
 #[ignore = "needs the real NPU device -- distinguishes min method from non-square geometry"]
 fn direct_square_k3_min_pooling_matches_cpu_reference() {
     assert_numeric_case(NUMERIC_CASES[2], PoolingMethod::Min, 0);
+}
+
+#[test]
+#[ignore = "needs the real NPU device -- checks repeated GEM/VMA/domain teardown"]
+fn repeated_pooling_resource_lifetime_matches_cpu_reference() {
+    for _ in 0..4 {
+        assert_numeric_case(NUMERIC_CASES[0], PoolingMethod::Max, 0);
+        assert_numeric_case(K2_CAPTURE_BOUNDARY, PoolingMethod::Max, 0);
+        assert_numeric_case(NUMERIC_CASES[0], PoolingMethod::Min, 0);
+        assert_numeric_case(NUMERIC_CASES[1], PoolingMethod::Min, 0);
+        assert_numeric_case(K2_CAPTURE_BOUNDARY, PoolingMethod::Avg, 1);
+    }
 }
