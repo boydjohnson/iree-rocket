@@ -772,6 +772,47 @@ fn pooling_via_bypass_interleaved_methods_dump() {
     }
 }
 
+/// Diagnostic, not a correctness check. `pooling_via_bypass_interleaved_methods_dump`
+/// alternated methods but only on the small single-tile 4x4 uniform shape, and
+/// ran clean 18/18 -- it did not reproduce the hang. The kernel's new
+/// timeout-state dev_err (see rocket_job.c's rocket_job_timedout) shows that
+/// when this hangs for real, the stuck task is PPU-only (CNA_S_STATUS and
+/// CORE_S_STATUS both idle -- expected, since a single-tile job's task 1 never
+/// touches those blocks) and PC's raw interrupt status has no completion or
+/// error bit set at all: the PPU genuinely never signals anything, not a
+/// lost/masked interrupt.
+///
+/// This version adds `TWO_HORIZONTAL_TILES`, the one shape in NUMERIC_CASES
+/// whose job is 3 tasks -- DPU bypass, then *two* PPU tiles back-to-back --
+/// since that is the only shape where the PPU itself dispatches twice in
+/// immediate succession, the most direct way to exercise any state the PPU
+/// carries between dispatches. Also runs more rounds and mixes in one bigger
+/// single-tile shape, since the real failing suite issues far more total
+/// dispatches than the small-shape repeat test did.
+#[test]
+#[ignore = "needs the real NPU device -- cross-compile for aarch64, copy to the board, run there; \
+            diagnostic only, not a pass/fail check -- if it hangs instead of finishing, that IS \
+            the finding; check the round/case/method it stopped after and cross-reference the \
+            kernel's 'timeout state' dev_err (task index, PC raw_status, CNA_S_STATUS, CORE_S_STATUS)"]
+fn pooling_via_bypass_numeric_interleaved_methods_dump() {
+    let cases = [NUMERIC_CASES[0], NUMERIC_CASES[4], TWO_HORIZONTAL_TILES];
+    let methods = [PoolingMethod::Avg, PoolingMethod::Min, PoolingMethod::Max];
+    for round in 0..20 {
+        for case in cases {
+            for method in methods {
+                let start = std::time::Instant::now();
+                let (actual, expected) = run_numeric_case(case, method);
+                eprintln!(
+                    "round {round} {} {method:?}: match={} ({:?})",
+                    case.name,
+                    actual == expected,
+                    start.elapsed()
+                );
+            }
+        }
+    }
+}
+
 /// Phase 3 of the ukernel roadmap: fused activation on a pooling op that
 /// has a real DPU stage ahead of PPU (this bypass path). Same
 /// domain-independent proof `conv_phase1_validation_hw.rs`'s clamped-
