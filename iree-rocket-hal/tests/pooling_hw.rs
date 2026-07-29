@@ -414,3 +414,12 @@ fn repeated_default_width_boundary_matches_cpu_reference() {
         assert_numeric_case(case, PoolingMethod::Min, 0);
     }
 }
+
+#[test]
+#[ignore = "needs the real NPU device -- reproduces deferred BO cleanup across file close"]
+fn pooling_file_lifetime_boundary_matches_cpu_reference() {
+    for _ in 0..4 {
+        assert_numeric_case(NUMERIC_CASES[4], PoolingMethod::Max, 0);
+        assert_numeric_case(NUMERIC_CASES[5], PoolingMethod::Max, 0);
+    }
+}
