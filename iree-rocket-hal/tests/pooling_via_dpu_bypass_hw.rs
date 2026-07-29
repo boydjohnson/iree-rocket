@@ -881,6 +881,54 @@ fn pooling_via_bypass_case_order_dump() {
     }
 }
 
+/// Diagnostic, not a correctness check. `pooling_via_bypass_case_order_dump`
+/// rotated both case and method order and found the real correlate: every
+/// failure's case was immediately preceded by `largest_direct_window` (the
+/// largest/longest single-tile PPU dispatch among the tested shapes); when
+/// case rotation put `largest_direct_window` last in a round instead of
+/// leading into another case, that round was 100% clean. Within "immediately
+/// follows `largest_direct_window`", failures landed on the first or second
+/// dispatch after the switch but never the third (of 3 methods) -- i.e.
+/// failures cleared once enough wall-clock time had passed since the switch.
+/// That shape -- clean given time, never clean immediately -- is what a
+/// timing race against `largest_direct_window`'s completion settling would
+/// look like: the driver signals the job's done_fence
+/// (rocket_job.c's rocket_job_handle_irq -> dma_fence_signal) on the
+/// PPU completion IRQ, but if the PPU hardware hasn't actually fully
+/// quiesced yet, a new job's first PPU kick landing too soon after could
+/// stall.
+///
+/// This test makes that delay an explicit, swept variable: dispatch
+/// `largest_direct_window`, sleep a controlled amount, then dispatch
+/// `two_horizontal_tiles` (the shape most reliably confirmed to fail in the
+/// prior run) and record whether it hung. If a delay threshold exists where
+/// failures stop, that's direct confirmation of the race and a measurement
+/// of how large a settle window is actually needed.
+#[test]
+#[ignore = "needs the real NPU device -- cross-compile for aarch64, copy to the board, run there; \
+            diagnostic only, not a pass/fail check -- read the printed sequence for the delay at \
+            which match stops being false; if even the largest delay here still fails, the window \
+            needed is bigger than what's swept and the sweep should be extended"]
+fn pooling_via_bypass_settle_delay_sweep_dump() {
+    let delays_ms = [0u64, 1, 2, 5, 10, 20, 50, 100];
+    for &delay_ms in &delays_ms {
+        for round in 0..5 {
+            let (warmup_actual, warmup_expected) =
+                run_numeric_case(NUMERIC_CASES[4], PoolingMethod::Max);
+            std::thread::sleep(std::time::Duration::from_millis(delay_ms));
+            let start = std::time::Instant::now();
+            let (actual, expected) = run_numeric_case(TWO_HORIZONTAL_TILES, PoolingMethod::Max);
+            eprintln!(
+                "delay={delay_ms}ms round={round} largest_direct_window_match={} \
+                 two_horizontal_tiles_match={} ({:?})",
+                warmup_actual == warmup_expected,
+                actual == expected,
+                start.elapsed()
+            );
+        }
+    }
+}
+
 /// Phase 3 of the ukernel roadmap: fused activation on a pooling op that
 /// has a real DPU stage ahead of PPU (this bypass path). Same
 /// domain-independent proof `conv_phase1_validation_hw.rs`'s clamped-
