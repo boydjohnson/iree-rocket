@@ -829,6 +829,58 @@ fn pooling_via_bypass_numeric_interleaved_methods_dump() {
     }
 }
 
+/// Diagnostic, not a correctness check. `pooling_via_bypass_numeric_interleaved_methods_dump`
+/// rotated *method* order and found the hang tracks dispatch position, not
+/// method: on `two_horizontal_tiles` it is always whichever method landed
+/// first in that shape's rotation that times out (~510-535ms, task 2 of 3 =
+/// PPU tile 0), never position 1 or 2, and every method has failed at
+/// position 0 across enough rounds -- so this is not a per-method bug.
+///
+/// That run still held *case* order fixed (`small_square`,
+/// `largest_direct_window`, `two_horizontal_tiles`, always in that order),
+/// so `two_horizontal_tiles` always immediately followed
+/// `largest_direct_window`. This version rotates case order too (by `round %
+/// 3`), so `two_horizontal_tiles` sometimes comes right after
+/// `small_square` instead, sometimes leads its own round (following
+/// whichever case ended the previous round), and each dispatch logs the
+/// actual preceding case. This should distinguish three possibilities: (a)
+/// arriving at `two_horizontal_tiles`'s multi-tile geometry from *any* other
+/// shape hangs, (b) it's specific to following `largest_direct_window`
+/// (its own large single-tile geometry leaving some state behind), or (c)
+/// something else entirely once case order stops correlating with position.
+#[test]
+#[ignore = "needs the real NPU device -- cross-compile for aarch64, copy to the board, run there; \
+            diagnostic only, not a pass/fail check -- if it hangs instead of finishing, check the \
+            printed 'prev=' case against the one that hung to see whether the hang follows a \
+            specific preceding shape or follows two_horizontal_tiles regardless of what came \
+            before it"]
+fn pooling_via_bypass_case_order_dump() {
+    let base_cases = [NUMERIC_CASES[0], NUMERIC_CASES[4], TWO_HORIZONTAL_TILES];
+    let base_methods = [PoolingMethod::Avg, PoolingMethod::Min, PoolingMethod::Max];
+    let mut prev_case_name = "none (first dispatch)";
+    for round in 0..20 {
+        let mut cases = base_cases;
+        cases.rotate_left(round % base_cases.len());
+        for (case_index, case) in cases.iter().enumerate() {
+            let mut methods = base_methods;
+            methods.rotate_left((round + case_index) % base_methods.len());
+            for (position, method) in methods.into_iter().enumerate() {
+                let start = std::time::Instant::now();
+                let (actual, expected) = run_numeric_case(*case, method);
+                eprintln!(
+                    "round {round} case_order={:?} prev={prev_case_name} {} pos={position} \
+                     {method:?}: match={} ({:?})",
+                    cases.iter().map(|c| c.name).collect::<Vec<_>>(),
+                    case.name,
+                    actual == expected,
+                    start.elapsed()
+                );
+            }
+            prev_case_name = case.name;
+        }
+    }
+}
+
 /// Phase 3 of the ukernel roadmap: fused activation on a pooling op that
 /// has a real DPU stage ahead of PPU (this bypass path). Same
 /// domain-independent proof `conv_phase1_validation_hw.rs`'s clamped-
