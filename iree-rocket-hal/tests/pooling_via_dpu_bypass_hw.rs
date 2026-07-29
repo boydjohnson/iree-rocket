@@ -297,6 +297,16 @@ struct NumericCase {
     stride_y: u32,
 }
 
+const TWO_HORIZONTAL_TILES: NumericCase = NumericCase {
+    name: "two_horizontal_tiles",
+    width: 256,
+    height: 9,
+    kernel_width: 3,
+    kernel_height: 3,
+    stride_x: 2,
+    stride_y: 2,
+};
+
 const NUMERIC_CASES: [NumericCase; 7] = [
     NumericCase {
         name: "small_square",
@@ -352,15 +362,7 @@ const NUMERIC_CASES: [NumericCase; 7] = [
         stride_x: 2,
         stride_y: 2,
     },
-    NumericCase {
-        name: "two_horizontal_tiles",
-        width: 256,
-        height: 9,
-        kernel_width: 3,
-        kernel_height: 3,
-        stride_x: 2,
-        stride_y: 2,
-    },
+    TWO_HORIZONTAL_TILES,
 ];
 
 fn numeric_bypass_shape(case: NumericCase) -> conv::Shape {
@@ -536,25 +538,29 @@ fn run_numeric_case(case: NumericCase, method: PoolingMethod) -> (Vec<i8>, Vec<i
     }
 }
 
+fn assert_numeric_case(case: NumericCase, method: PoolingMethod, tolerance: i16) {
+    let (actual, expected) = run_numeric_case(case, method);
+    assert_eq!(actual.len(), expected.len(), "{} output length", case.name);
+    let mut mismatches = Vec::new();
+    for (index, (&got, &want)) in actual.iter().zip(&expected).enumerate() {
+        if (i16::from(got) - i16::from(want)).abs() > tolerance && mismatches.len() < 8 {
+            let shape = numeric_pooling_shape(case, method);
+            let y = index as u32 / shape.output_width;
+            let x = index as u32 % shape.output_width;
+            mismatches.push(format!("[{y}, {x}] want {want} got {got}"));
+        }
+    }
+    assert!(
+        mismatches.is_empty(),
+        "{} {method:?}: numerical pooling mismatches (tolerance {tolerance}): {}",
+        case.name,
+        mismatches.join(", ")
+    );
+}
+
 fn assert_numeric_matrix(method: PoolingMethod, tolerance: i16) {
     for case in NUMERIC_CASES {
-        let (actual, expected) = run_numeric_case(case, method);
-        assert_eq!(actual.len(), expected.len(), "{} output length", case.name);
-        let mut mismatches = Vec::new();
-        for (index, (&got, &want)) in actual.iter().zip(&expected).enumerate() {
-            if (i16::from(got) - i16::from(want)).abs() > tolerance && mismatches.len() < 8 {
-                let shape = numeric_pooling_shape(case, method);
-                let y = index as u32 / shape.output_width;
-                let x = index as u32 % shape.output_width;
-                mismatches.push(format!("[{y}, {x}] want {want} got {got}"));
-            }
-        }
-        assert!(
-            mismatches.is_empty(),
-            "{} {method:?}: numerical pooling mismatches (tolerance {tolerance}): {}",
-            case.name,
-            mismatches.join(", ")
-        );
+        assert_numeric_case(case, method, tolerance);
     }
 }
 
@@ -613,6 +619,12 @@ fn min_pooling_dimension_matrix_matches_cpu_reference() {
 #[ignore = "needs the real NPU device -- validates average pooling numerically across dimensions"]
 fn average_pooling_dimension_matrix_matches_cpu_reference() {
     assert_numeric_matrix(PoolingMethod::Avg, 1);
+}
+
+#[test]
+#[ignore = "needs the real NPU device -- focused DPU bypass -> PPU tile 0 -> PPU tile 1 job"]
+fn vendor_style_three_task_tiled_pooling_matches_cpu_reference() {
+    assert_numeric_case(TWO_HORIZONTAL_TILES, PoolingMethod::Max, 0);
 }
 
 macro_rules! completes_and_tracks_input_test {
@@ -720,6 +732,43 @@ fn pooling_via_bypass_repeat_dispatch_dump() {
     for i in 0..6 {
         let pixels = run_uniform_pooling_via_bypass(PoolingMethod::Min, 200, 2);
         eprintln!("repeat #{i}: output pixels = {pixels:?}");
+    }
+}
+
+/// Diagnostic, not a correctness check. Extends
+/// `pooling_via_bypass_repeat_dispatch_dump`'s same-process repeat
+/// experiment to *alternating* methods, to mirror the actual failure shape
+/// found running the full ignored suite together on real hardware:
+/// `max_pooling_dimension_matrix_matches_cpu_reference` passed repeatedly
+/// run alone, but hung with a kernel-side "NPU job timed out" (task 2 of 2
+/// never completing) when run in the same process alongside the avg/min
+/// matrix tests. That points at hardware state left over from a *different*
+/// method's dispatch, not a per-method register/opcode bug -- the kernel
+/// driver programs an identical CNA/CORE/PC register sequence regardless of
+/// method, and the PPU itself is configured entirely from the regcmd stream
+/// (the kernel driver never maps PPU registers at all, so nothing on that
+/// side varies by method either).
+///
+/// Uses the same small uniform 4x4 shape as `pooling_via_bypass_repeat_dispatch_dump`
+/// (not the large numeric matrix) so a hang surfaces in seconds, on a
+/// specific (round, method) pair, instead of requiring the multi-minute
+/// full-matrix sweep to reproduce it.
+#[test]
+#[ignore = "needs the real NPU device -- cross-compile for aarch64, copy to the board, run there; \
+            diagnostic only, not a pass/fail check -- if it hangs instead of finishing, that IS \
+            the finding; check the round/method it stopped after and cross-reference the kernel's \
+            'timeout state' dev_err (task index, PC raw_status, CNA_S_STATUS, CORE_S_STATUS)"]
+fn pooling_via_bypass_interleaved_methods_dump() {
+    let methods = [PoolingMethod::Avg, PoolingMethod::Min, PoolingMethod::Max];
+    for round in 0..6 {
+        for &method in &methods {
+            let start = std::time::Instant::now();
+            let pixels = run_uniform_pooling_via_bypass(method, 200, 2);
+            eprintln!(
+                "round {round} {method:?}: output pixels = {pixels:?} ({:?})",
+                start.elapsed()
+            );
+        }
     }
 }
 
