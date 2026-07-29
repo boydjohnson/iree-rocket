@@ -523,8 +523,8 @@ pub fn build_conv_then_add_regcmd(
     // CNA|CORE|DPU|DPU_RDMA -- see conv.rs's tile builder). PC_OPERATION_ENABLE
     // is edge-triggered, not passive state -- a real RK3588 run of an earlier
     // version of this function, which pushed a second kick here (copied from
-    // build_conv_then_lut_regcmd/build_pooling_via_dpu_bypass_regcmd before
-    // their own doc comments were corrected), showed the second write
+    // an early multi-stage builder before its task boundaries were
+    // corrected), showed the second write
     // re-kicks the same blocks immediately after the first: the job
     // completes, no hang, but the result comes back zeroed.
 

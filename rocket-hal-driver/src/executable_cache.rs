@@ -12,7 +12,7 @@
 //! validated 4x4 spatial, 1 channel, 1x1 kernel shape, `Precision::Int8` --
 //! see rknpu-spelunking/NOTES.md), `1` for `UkernelShape::Pooling` (a
 //! 4x4x1, 2x2 kernel/stride shape -- NOT yet hardware-validated, see
-//! iree-rocket-hal's `build_pooling_regcmd` module doc comment and
+//! iree-rocket-hal's `PoolingPlan` module documentation and
 //! the driver's `cts/pooling_dispatch_test.cc`), `2` for
 //! `UkernelShape::Conv2d` again but with `Precision::Fp16` -- same
 //! geometry as tag `0`, the shape round 7's hardware fix confirmed produces a
@@ -50,7 +50,6 @@ use crate::{
     status,
 };
 use iree_rocket_hal::rocket::{
-    activation::Activation as PoolingActivation,
     conv::{self, Activation, Kernels, Multiplier, Precision, Quantization},
     executable_format::{CONV2D_V1_TAG, decode_conv_shape_v1, validate_conv_shape},
     fc,
@@ -363,7 +362,7 @@ unsafe extern "C" fn prepare_executable(
     let shape = match tag {
         1 => UkernelShape::Pooling(PoolingShape {
             // NOT hardware-validated -- see iree-rocket-hal's
-            // build_pooling_regcmd module doc comment and
+            // PoolingPlan module documentation and
             // cts/pooling_dispatch_test.cc.
             input_width: 4,
             input_height: 4,
@@ -382,7 +381,6 @@ unsafe extern "C" fn prepare_executable(
             pad_right: 0,
             pad_bottom: 0,
             pad_value: 0,
-            activation: PoolingActivation::None,
         }),
         2 => UkernelShape::Conv2d(Conv2dExecutable::new_static(
             conv::Shape {

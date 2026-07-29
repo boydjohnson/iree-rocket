@@ -613,11 +613,9 @@ pub fn build_conv_then_lut_regcmd(
     // (PCTrailer::operation_enable(PCOperationMask::CONVOLUTION), exactly
     // CNA|CORE|DPU|DPU_RDMA -- see conv.rs's tile builder). An earlier
     // version of this function pushed a second, redundant kick here, carried
-    // over unexamined from `build_pooling_via_dpu_bypass_regcmd`'s
-    // pre-migration Mesa-derived bypass stage (that builder never self-kicked,
-    // so a caller-supplied kick
-    // there was the ONLY kick, not a second one -- see that function's own
-    // corrected doc comment for the real hardware evidence).
+    // over from an early multi-stage builder whose first stage did not
+    // self-kick. There the caller-supplied kick was the only kick, not a
+    // second one.
     // PC_OPERATION_ENABLE is edge-triggered, not passive state: writing it
     // twice re-kicks the same blocks immediately after the first, which is
     // what a real RK3588 run of this exact double-kick shape showed --

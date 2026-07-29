@@ -78,7 +78,7 @@ use iree_rocket_hal::rocket::{
     conv::{Buffers, ConvPlan, FeatureLayout, Precision},
     device::Buffer as RocketDeviceBuffer,
     fc,
-    pooling::{PoolingBuffers, build_pooling_regcmd},
+    pooling::{PoolingBuffers, PoolingPlan},
     tensor_layout::{
         nc1hwc2_storage_size, pack_hwcf_to_rocket_weights, pack_nhwc_to_nc1hwc2_padded,
         rocket_weight_storage_size,
@@ -1254,14 +1254,14 @@ unsafe extern "C" fn dispatch(
                     crate::bindings::iree_status_code_e_IREE_STATUS_INVALID_ARGUMENT,
                 );
             }
-            // 0=input, 1=output -- no weights/bias for a standalone
-            // pooling op (see iree-rocket-hal's build_pooling_regcmd).
+            // 0=input, 1=output. Every horizontal tile is one direct
+            // PPU/PPU_RDMA task; all tasks belong to this one dispatch/job.
             let bufs = PoolingBuffers {
                 input_addr: addr(&refs[0]),
                 output_addr: addr(&refs[1]),
             };
             cb.ops.push(RecordedOp::Dispatch {
-                regcmd_tasks: vec![build_pooling_regcmd(shape, &bufs)],
+                regcmd_tasks: PoolingPlan::new(*shape).programs_with_buffers(&bufs),
                 in_bo_handles: vec![handle(&refs[0])],
                 out_bo_handles: vec![handle(&refs[1])],
                 input_packing: None,

@@ -233,8 +233,8 @@ fn conv_then_tanh_completes() {
 /// as `conv_then_sigmoid_completes`/`conv_then_tanh_completes` above --
 /// it does NOT validate a real softmax data flow (max-subtraction into
 /// this stage and the reciprocal/normalize step are still unconfirmed,
-/// see `build_max_reduction_tree_regcmd`'s module doc comment in
-/// `pooling.rs`). `output_zero_point: 0` (not `0x80`) because exp(x) is
+/// large multi-stage reductions are outside this suite). `output_zero_point:
+/// 0` (not `0x80`) because exp(x) is
 /// never negative, matching `conv_then_sigmoid_completes`'s own choice
 /// for the same reason.
 #[test]

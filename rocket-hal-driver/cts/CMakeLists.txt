@@ -68,10 +68,9 @@ flatbuffer_c_library(
 
 # Hand-written (not iree_hal_cts_test_suite's generic dispatch tests --
 # structurally skipped for "rocket", see backends.cc) end-to-end test for
-# the driver's legacy standalone pooling tag, driving the real public IREE
-# HAL API directly. The HAL crate's hardware suite now covers only the
-# vendor-observed two-stage path; see pooling_dispatch_test.cc's module
-# comment for why this separate legacy-tag test remains.
+# the driver's direct PPU_RDMA->PPU pooling tag, driving the real public IREE
+# HAL API directly. See pooling_dispatch_test.cc's module comment for why
+# this separate end-to-end driver test remains useful.
 #
 # UNVERIFIED against a real build (no IREE source tree available while
 # writing this): the exact gtest DEPS target name(s) below are a guess by
