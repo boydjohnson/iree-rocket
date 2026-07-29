@@ -35,8 +35,10 @@ fn push_ppu_kick(cmds: &mut Vec<RegCmd>) {
 // pooling sweep: pixel-count line strides, four-pixel-aligned source and
 // destination surfaces, precision-dependent 16-byte channel atoms, PPU before
 // PPU_RDMA, and a 32-command program ending in a `0x60` kick and two
-// fetch-padding words. RK3588 testing established the Avg=0, Max=1, Min=2
-// method encoding.
+// fetch-padding words. Each standalone task also clears both blocks' persistent
+// register/executer pointers while enabling ping-pong; without those W1C bits,
+// an 8x8/stride-3 task can leave the following 129-wide task waiting forever.
+// RK3588 testing established the Avg=0, Max=1, Min=2 method encoding.
 
 /// Hardware-confirmed bit encoding from the retired standalone exploration
 /// on a real RK3588: a half-10/half-200 input produced raw=0 -> 249, raw=1
@@ -525,8 +527,11 @@ fn build_pooling_tile_task(
     let mut cmds: Vec<RegCmd> = Vec::new();
 
     // ========================================================================
-    // Ping-pong pointers -- same pattern/values as build_conv_regcmd's
-    // DPU/DPU_RDMA pair, applied to the two blocks this op actually uses.
+    // Ping-pong pointers. PPU state survives file close and independent DRM
+    // contexts. Reset both persistent pointers to group 0 for every complete,
+    // independently kicked task, then let ping-pong proceed within the task.
+    // The clear fields are W1C pulses, so combining them with the captured
+    // persistent 0x0e configuration leaves the steady-state value unchanged.
     // ========================================================================
 
     cmds.push(
@@ -534,6 +539,8 @@ fn build_pooling_tile_task(
             .pointer_pp_mode(Bits::new(1))
             .executer_pp_en(Bits::new(1))
             .pointer_pp_en(Bits::new(1))
+            .pointer_pp_clear(Bits::new(1))
+            .executer_pp_clear(Bits::new(1))
             .build(),
     );
     cmds.push(
@@ -541,6 +548,8 @@ fn build_pooling_tile_task(
             .pointer_pp_mode(Bits::new(1))
             .executer_pp_en(Bits::new(1))
             .pointer_pp_en(Bits::new(1))
+            .pointer_pp_clear(Bits::new(1))
+            .executer_pp_clear(Bits::new(1))
             .build(),
     );
 
@@ -754,11 +763,14 @@ mod tests {
     }
 
     #[test]
-    fn int8_program_matches_the_direct_vendor_capture_word_for_word() {
+    fn int8_program_matches_the_direct_vendor_capture_with_pointer_resets() {
         // The pooling-sweep capture
         // `pool-max-w64-h48-c12-kw3-kh3-sx2-sy2-p1-1-1-1-i8.rknn` is an
         // exact direct PPU program. Addresses are zero in the static file
-        // and are therefore also zero here.
+        // and are therefore also zero here. The two S_POINTER values add the
+        // W1C pointer/executer reset bits to make independent submissions
+        // independent of persistent hardware state; all other words remain
+        // capture-identical.
         let shape = PoolingShape {
             input_width: 64,
             input_height: 48,
@@ -787,8 +799,8 @@ mod tests {
         );
         let actual: Vec<_> = commands.iter().map(decode).collect();
         let expected = vec![
-            (DOMAIN_PPU, 0x6004, 0x0000_000e),
-            (DOMAIN_PPU_RDMA, 0x7004, 0x0000_000e),
+            (DOMAIN_PPU, 0x6004, 0x0000_003e),
+            (DOMAIN_PPU_RDMA, 0x7004, 0x0000_003e),
             (DOMAIN_PPU, 0x600c, 0x0000_003f),
             (DOMAIN_PPU, 0x6010, 0x0000_002f),
             (DOMAIN_PPU, 0x6014, 0x0000_000f),
