@@ -350,14 +350,23 @@ unsafe fn run_pooling_plan(
                 *destination = command.0;
             }
             eprintln!(
-                "run_pooling_plan: tile {tile}/{} cmd_handle={} cmd_dma=0x{:08x} \
+                "run_pooling_plan: tile {tile}/{} meta={:?} cmd_handle={} cmd_dma=0x{:08x} \
                  out_handle={} out_dma=0x{:08x} regcmd_count={}",
                 programs.len(),
+                tiles[tile],
                 buffer.handle,
                 buffer.dma_address,
                 tile_out_buffers[tile].handle,
                 tile_out_buffers[tile].dma_address,
                 program.len()
+            );
+            eprintln!(
+                "run_pooling_plan: tile {tile}/{} regcmd words = {:?}",
+                programs.len(),
+                program
+                    .iter()
+                    .map(|c| format!("{:#018x}", c.0))
+                    .collect::<Vec<_>>()
             );
             command_buffers.push((buffer, program.len() as u32));
         }
