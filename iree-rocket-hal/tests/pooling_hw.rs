@@ -7,6 +7,10 @@
 //!     cargo test --target aarch64-unknown-linux-gnu --release \
 //!       --test pooling_hw --no-run
 //!
+//! Tests affected by the upstream kernel completion issue are only compiled
+//! with `--features kernel-fix`. They remain ignored and must still be selected
+//! with `--ignored` on the board.
+//!
 //! Each logical int8 pixel occupies channel zero of a 16-byte NC1HWC2 feature
 //! atom. Wide cases submit every independently kicked tile as the ordered task
 //! array of one kernel job, with all tasks writing disjoint columns of one
@@ -316,6 +320,7 @@ fn assert_numeric_case(case: NumericCase, method: PoolingMethod, tolerance: i16)
     assert_numeric_case_on_file(&file, case, method, tolerance);
 }
 
+#[cfg(feature = "kernel-fix")]
 fn assert_numeric_matrix(method: PoolingMethod, tolerance: i16) {
     for case in NUMERIC_CASES {
         assert_numeric_case(case, method, tolerance);
@@ -372,32 +377,37 @@ fn numerical_dimension_matrix_has_expected_direct_task_counts() {
     );
 }
 
+#[cfg(feature = "kernel-fix")]
 #[test]
-#[ignore = "needs the real NPU device -- validates max pooling numerically across dimensions"]
+#[ignore = "needs the real NPU device and the upstream kernel completion fix -- validates max pooling numerically across dimensions"]
 fn max_pooling_dimension_matrix_matches_cpu_reference() {
     assert_numeric_matrix(PoolingMethod::Max, 0);
 }
 
+#[cfg(feature = "kernel-fix")]
 #[test]
-#[ignore = "needs the real NPU device -- validates min pooling numerically across dimensions"]
+#[ignore = "needs the real NPU device and the upstream kernel completion fix -- validates min pooling numerically across dimensions"]
 fn min_pooling_dimension_matrix_matches_cpu_reference() {
     assert_numeric_matrix(PoolingMethod::Min, 0);
 }
 
+#[cfg(feature = "kernel-fix")]
 #[test]
-#[ignore = "needs the real NPU device -- validates average pooling numerically across dimensions"]
+#[ignore = "needs the real NPU device and the upstream kernel completion fix -- validates average pooling numerically across dimensions"]
 fn average_pooling_dimension_matrix_matches_cpu_reference() {
     assert_numeric_matrix(PoolingMethod::Avg, 1);
 }
 
+#[cfg(feature = "kernel-fix")]
 #[test]
-#[ignore = "needs the real NPU device -- focused PPU_RDMA -> PPU tile 0 -> tile 1 job"]
+#[ignore = "needs the real NPU device and the upstream kernel completion fix -- focused PPU_RDMA -> PPU tile 0 -> tile 1 job"]
 fn direct_two_task_tiled_pooling_matches_cpu_reference() {
     assert_numeric_case(K2_TWO_TILES, PoolingMethod::Max, 0);
 }
 
+#[cfg(feature = "kernel-fix")]
 #[test]
-#[ignore = "needs the real NPU device -- isolates the int8 63+65 tile split"]
+#[ignore = "needs the real NPU device and the upstream kernel completion fix -- isolates the int8 63+65 tile split"]
 fn direct_equal_half_boundary_pooling_matches_cpu_reference() {
     assert_numeric_case(K2_CAPTURE_BOUNDARY, PoolingMethod::Max, 0);
 }
@@ -414,8 +424,9 @@ fn direct_square_k3_min_pooling_matches_cpu_reference() {
     assert_numeric_case(NUMERIC_CASES[2], PoolingMethod::Min, 0);
 }
 
+#[cfg(feature = "kernel-fix")]
 #[test]
-#[ignore = "needs the real NPU device -- checks repeated GEM/VMA/domain teardown"]
+#[ignore = "needs the real NPU device and the upstream kernel completion fix -- checks repeated GEM/VMA/domain teardown"]
 fn repeated_pooling_resource_lifetime_matches_cpu_reference() {
     for _ in 0..4 {
         assert_numeric_case(NUMERIC_CASES[0], PoolingMethod::Max, 0);

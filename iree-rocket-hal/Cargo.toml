@@ -3,6 +3,11 @@ name = "iree-rocket-hal"
 version = "0.1.0"
 edition = "2024"
 
+[features]
+# Includes hardware tests that require the upstream kernel completion fix.
+# These tests remain `#[ignore]`, so running them also requires `--ignored`.
+kernel-fix = []
+
 [dependencies]
 nix = { version = "0.30.1", features = ["ioctl", "mman", "time"] }
 
