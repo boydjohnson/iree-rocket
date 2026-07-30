@@ -12,7 +12,13 @@
 //! array of one kernel job, with all tasks writing disjoint columns of one
 //! shared output BO.
 
-use std::{fs::OpenOptions, mem, os::unix::io::AsRawFd, ptr, time::Instant};
+use std::{
+    fs::{File, OpenOptions},
+    mem,
+    os::unix::io::AsRawFd,
+    ptr,
+    time::Instant,
+};
 
 use iree_rocket_hal::rocket::{
     device::{Buffer, close_bo, fini_bo, prep_bo, submit_tasks, unmap_bo},
@@ -193,20 +199,27 @@ fn page_aligned(bytes: usize) -> usize {
     bytes.max(1).next_multiple_of(4096)
 }
 
-fn run_numeric_case(case: NumericCase, method: PoolingMethod) -> (Vec<i8>, Vec<i8>, u128) {
-    let shape = pooling_shape(case, method);
-    let input = numeric_input(case);
-    let expected = cpu_pool(&input, &shape);
-    let file = OpenOptions::new()
+fn open_device() -> File {
+    OpenOptions::new()
         .read(true)
         .write(true)
         .open(DEVICE_PATH)
-        .expect("failed to open NPU device");
+        .expect("failed to open NPU device")
+}
+
+fn run_numeric_case_on_file(
+    file: &File,
+    case: NumericCase,
+    method: PoolingMethod,
+) -> (Vec<i8>, Vec<i8>, u128) {
+    let shape = pooling_shape(case, method);
+    let input = numeric_input(case);
+    let expected = cpu_pool(&input, &shape);
     let fd = file.as_raw_fd();
 
     unsafe {
         let input_bytes = input.len() * FEATURE_ATOM_BYTES;
-        let buf_in = Buffer::new(fd, page_aligned(input_bytes), &file);
+        let buf_in = Buffer::new(fd, page_aligned(input_bytes), file);
         ptr::write_bytes(buf_in.host_ptr, 0, buf_in.size);
         for (pixel, &value) in input.iter().enumerate() {
             *buf_in.host_ptr.add(pixel * FEATURE_ATOM_BYTES) = value as u8;
@@ -214,7 +227,7 @@ fn run_numeric_case(case: NumericCase, method: PoolingMethod) -> (Vec<i8>, Vec<i
 
         let output_atoms = (shape.output_width * shape.output_height).next_multiple_of(4) as usize;
         let output_bytes = output_atoms * FEATURE_ATOM_BYTES;
-        let buf_out = Buffer::new(fd, page_aligned(output_bytes), &file);
+        let buf_out = Buffer::new(fd, page_aligned(output_bytes), file);
         ptr::write_bytes(buf_out.host_ptr, 0xa5, buf_out.size);
 
         fini_bo(fd, buf_in.handle).expect("failed to sync pooling input BO for the NPU");
@@ -227,7 +240,7 @@ fn run_numeric_case(case: NumericCase, method: PoolingMethod) -> (Vec<i8>, Vec<i
         let mut command_buffers = Vec::with_capacity(programs.len());
         for program in &programs {
             let command_bytes = program.len() * mem::size_of::<u64>();
-            let command_buffer = Buffer::new(fd, page_aligned(command_bytes), &file);
+            let command_buffer = Buffer::new(fd, page_aligned(command_bytes), file);
             let command_slice = std::slice::from_raw_parts_mut(
                 command_buffer.host_ptr.cast::<u64>(),
                 program.len(),
@@ -273,8 +286,13 @@ fn run_numeric_case(case: NumericCase, method: PoolingMethod) -> (Vec<i8>, Vec<i
     }
 }
 
-fn assert_numeric_case(case: NumericCase, method: PoolingMethod, tolerance: i16) {
-    let (actual, expected, dispatch_ms) = run_numeric_case(case, method);
+fn assert_numeric_case_on_file(
+    file: &File,
+    case: NumericCase,
+    method: PoolingMethod,
+    tolerance: i16,
+) {
+    let (actual, expected, dispatch_ms) = run_numeric_case_on_file(file, case, method);
     let shape = pooling_shape(case, method);
     let mut mismatches = Vec::new();
     for (index, (&got, &want)) in actual.iter().zip(&expected).enumerate() {
@@ -291,6 +309,11 @@ fn assert_numeric_case(case: NumericCase, method: PoolingMethod, tolerance: i16)
         case.name,
         mismatches.join(", ")
     );
+}
+
+fn assert_numeric_case(case: NumericCase, method: PoolingMethod, tolerance: i16) {
+    let file = open_device();
+    assert_numeric_case_on_file(&file, case, method, tolerance);
 }
 
 fn assert_numeric_matrix(method: PoolingMethod, tolerance: i16) {
@@ -421,5 +444,16 @@ fn pooling_file_lifetime_boundary_matches_cpu_reference() {
     for _ in 0..4 {
         assert_numeric_case(NUMERIC_CASES[4], PoolingMethod::Max, 0);
         assert_numeric_case(NUMERIC_CASES[5], PoolingMethod::Max, 0);
+    }
+}
+
+#[test]
+#[ignore = "needs the real NPU device -- isolates retained engine state within one DRM file"]
+fn same_file_pooling_geometry_transition_matches_cpu_reference() {
+    let file = open_device();
+
+    for _ in 0..4 {
+        assert_numeric_case_on_file(&file, NUMERIC_CASES[4], PoolingMethod::Max, 0);
+        assert_numeric_case_on_file(&file, NUMERIC_CASES[5], PoolingMethod::Max, 0);
     }
 }
