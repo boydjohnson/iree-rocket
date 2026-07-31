@@ -74,7 +74,8 @@ set_target_properties(rocket_hal_driver_static PROPERTIES
   # place iree::hal/iree::async after this target already (e.g. the
   # iree_hal_cts_test_suite()-generated binaries, which pull rocket-cts's
   # `backends` OBJECT library's dependencies in independently) but broke
-  # for cts/pooling_dispatch_test.cc's hand-written iree_cc_test(), whose
+  # for hand-written iree_cc_test() consumers such as the RKT1 convolution
+  # harness, whose
   # DEPS list happened to put iree::hal before rocket_hal_driver_static --
   # ld's single left-to-right archive pass never revisits an already-
   # scanned .a for symbols a later archive turns out to need. Setting this
