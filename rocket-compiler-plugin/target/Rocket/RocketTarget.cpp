@@ -467,7 +467,10 @@ public:
     }
 
     FlatbufferBuilder builder;
-    iree_hal_rocket_ExecutableDef_start_as_root(builder);
+    if (iree_hal_rocket_ExecutableDef_start_as_root(builder)) {
+      return variantOp.emitOpError()
+             << "failed to start Rocket executable FlatBuffer";
+    }
     iree_hal_rocket_KernelDef_union_ref_t kernelRef;
     if (fcShape) {
       auto fcRef = iree_hal_rocket_FullyConnectedDef_create(
@@ -476,6 +479,10 @@ public:
           fcShape->inputScale, fcShape->weightsScale, fcShape->outputScale,
           fcShape->truncateBits, fcShape->activation, fcShape->activationCmp,
           fcShape->precision);
+      if (!fcRef) {
+        return variantOp.emitOpError()
+               << "failed to build Rocket fully-connected definition";
+      }
       kernelRef = iree_hal_rocket_KernelDef_as_FullyConnectedDef(fcRef);
     } else {
       iree_hal_rocket_Conv2DDimension_vec_ref_t runtimeDimensionsRef = 0;
@@ -483,27 +490,87 @@ public:
         runtimeDimensionsRef = iree_hal_rocket_Conv2DDimension_vec_create(
             builder, convShape->runtimeDimensions.data(),
             convShape->runtimeDimensions.size());
+        if (!runtimeDimensionsRef) {
+          return variantOp.emitOpError()
+                 << "failed to build Rocket runtime-dimension vector";
+        }
       }
-      auto convRef = iree_hal_rocket_Conv2DDef_create(
-          builder, convShape->inputWidth, convShape->inputHeight,
-          convShape->inputChannels, convShape->outputWidth,
-          convShape->outputHeight, convShape->outputChannels,
-          convShape->weightsWidth, convShape->weightsHeight, convShape->stride,
-          convShape->depthwise, convShape->inputZeroPoint,
-          convShape->outputZeroPoint, convShape->weightsZeroPoint,
-          convShape->inputScale, convShape->weightsScale,
-          convShape->outputScale, convShape->truncateBits,
-          convShape->activation, convShape->activationCmp, convShape->precision,
-          runtimeDimensionsRef, /*padTop=*/0, /*padLeft=*/0);
+
+      if (iree_hal_rocket_Conv2DDef_start(builder) ||
+          iree_hal_rocket_Conv2DDef_input_width_add(builder,
+                                                    convShape->inputWidth) ||
+          iree_hal_rocket_Conv2DDef_input_height_add(builder,
+                                                     convShape->inputHeight) ||
+          iree_hal_rocket_Conv2DDef_input_channels_add(
+              builder, convShape->inputChannels) ||
+          iree_hal_rocket_Conv2DDef_output_width_add(builder,
+                                                     convShape->outputWidth) ||
+          iree_hal_rocket_Conv2DDef_output_height_add(
+              builder, convShape->outputHeight) ||
+          iree_hal_rocket_Conv2DDef_output_channels_add(
+              builder, convShape->outputChannels) ||
+          iree_hal_rocket_Conv2DDef_weights_width_add(
+              builder, convShape->weightsWidth) ||
+          iree_hal_rocket_Conv2DDef_weights_height_add(
+              builder, convShape->weightsHeight) ||
+          iree_hal_rocket_Conv2DDef_stride_add(builder, convShape->stride) ||
+          iree_hal_rocket_Conv2DDef_depthwise_add(builder,
+                                                  convShape->depthwise) ||
+          iree_hal_rocket_Conv2DDef_input_zero_point_add(
+              builder, convShape->inputZeroPoint) ||
+          iree_hal_rocket_Conv2DDef_output_zero_point_add(
+              builder, convShape->outputZeroPoint) ||
+          iree_hal_rocket_Conv2DDef_weights_zero_point_add(
+              builder, convShape->weightsZeroPoint) ||
+          iree_hal_rocket_Conv2DDef_input_scale_add(builder,
+                                                    convShape->inputScale) ||
+          iree_hal_rocket_Conv2DDef_weights_scale_add(
+              builder, convShape->weightsScale) ||
+          iree_hal_rocket_Conv2DDef_output_scale_add(builder,
+                                                     convShape->outputScale) ||
+          iree_hal_rocket_Conv2DDef_truncate_bits_add(
+              builder, convShape->truncateBits) ||
+          iree_hal_rocket_Conv2DDef_activation_add(builder,
+                                                   convShape->activation) ||
+          iree_hal_rocket_Conv2DDef_activation_cmp_add(
+              builder, convShape->activationCmp) ||
+          iree_hal_rocket_Conv2DDef_precision_add(builder,
+                                                  convShape->precision) ||
+          (runtimeDimensionsRef &&
+           iree_hal_rocket_Conv2DDef_runtime_dimensions_add(
+               builder, runtimeDimensionsRef)) ||
+          iree_hal_rocket_Conv2DDef_pad_top_add(builder, 0) ||
+          iree_hal_rocket_Conv2DDef_pad_left_add(builder, 0)) {
+        return variantOp.emitOpError()
+               << "failed to populate Rocket convolution definition";
+      }
+      auto convRef = iree_hal_rocket_Conv2DDef_end(builder);
+      if (!convRef) {
+        return variantOp.emitOpError()
+               << "failed to finish Rocket convolution definition";
+      }
       kernelRef = iree_hal_rocket_KernelDef_as_Conv2DDef(convRef);
     }
     auto exportNameRef = builder.createString(exportOp.getName());
+    if (!exportNameRef) {
+      return exportOp.emitOpError() << "failed to build Rocket export name";
+    }
     auto exportRef =
         iree_hal_rocket_ExportDef_create(builder, exportNameRef, kernelRef);
+    if (!exportRef) {
+      return exportOp.emitOpError()
+             << "failed to build Rocket export definition";
+    }
     auto exportsRef =
         iree_hal_rocket_ExportDef_vec_create(builder, &exportRef, 1);
-    iree_hal_rocket_ExecutableDef_exports_add(builder, exportsRef);
-    iree_hal_rocket_ExecutableDef_end_as_root(builder);
+    if (!exportsRef) {
+      return variantOp.emitOpError() << "failed to build Rocket exports vector";
+    }
+    if (iree_hal_rocket_ExecutableDef_exports_add(builder, exportsRef) ||
+        !iree_hal_rocket_ExecutableDef_end_as_root(builder)) {
+      return variantOp.emitOpError()
+             << "failed to finish Rocket executable FlatBuffer";
+    }
 
     auto binaryOp = IREE::HAL::ExecutableBinaryOp::create(
         executableBuilder, variantOp.getLoc(), variantOp.getSymName(),
