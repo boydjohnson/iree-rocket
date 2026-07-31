@@ -161,30 +161,29 @@ fn decode_flatbuffer_shape(data: &[u8]) -> Result<UkernelShape, ()> {
             let mut runtime_dimensions = Vec::new();
             if let Some(dimensions) = conv_def.runtime_dimensions() {
                 for index in 0..dimensions.len() {
-                    runtime_dimensions.push(match dimensions.get(index) {
-                        schema::Conv2DDimension::INPUT_WIDTH => RuntimeConv2dDimension::InputWidth,
+                    if let Some(dim) = match dimensions.get(index) {
+                        schema::Conv2DDimension::INPUT_WIDTH => {
+                            Some(RuntimeConv2dDimension::InputWidth)
+                        }
                         schema::Conv2DDimension::INPUT_HEIGHT => {
-                            RuntimeConv2dDimension::InputHeight
+                            Some(RuntimeConv2dDimension::InputHeight)
                         }
                         schema::Conv2DDimension::INPUT_CHANNELS => {
-                            RuntimeConv2dDimension::InputChannels
+                            Some(RuntimeConv2dDimension::InputChannels)
                         }
                         schema::Conv2DDimension::OUTPUT_CHANNELS => {
-                            RuntimeConv2dDimension::OutputChannels
+                            Some(RuntimeConv2dDimension::OutputChannels)
                         }
                         schema::Conv2DDimension::WEIGHTS_WIDTH => {
-                            RuntimeConv2dDimension::WeightsWidth
+                            Some(RuntimeConv2dDimension::WeightsWidth)
                         }
                         schema::Conv2DDimension::WEIGHTS_HEIGHT => {
-                            RuntimeConv2dDimension::WeightsHeight
+                            Some(RuntimeConv2dDimension::WeightsHeight)
                         }
-                        // OUTPUT_WIDTH/OUTPUT_HEIGHT are legal RKT1 enum
-                        // values but no longer map to a settable dimension
-                        // -- conv::Shape always derives them from the other
-                        // five plus stride/padding, see
-                        // RuntimeConv2dDimension's own doc comment.
-                        _ => return Err(()),
-                    });
+                        _ => None,
+                    } {
+                        runtime_dimensions.push(dim);
+                    }
                 }
             }
             let executable = Conv2dExecutable {
