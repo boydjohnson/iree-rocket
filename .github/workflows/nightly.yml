@@ -1,0 +1,48 @@
+name: Nightly artifacts
+
+# Builds the three things this repo exists to produce -- iree-compile with the
+# Rocket target plugin, iree-run-module/iree-benchmark-module for the RK3588
+# board, and the board test binaries -- and attaches them to the run.
+#
+# Both jobs share iree-build.yml. runtime-aarch64 `needs:` compiler-host
+# because configure-runtime-aarch64.sh imports the host tools from that job's
+# build (IREE_HOST_BIN_DIR); see iree-build.yml for how they are handed over.
+
+on:
+  schedule:
+    # 07:00 UTC. GitHub disables scheduled workflows on repos with no activity
+    # for 60 days, and only runs them from the default branch.
+    - cron: "0 7 * * *"
+  workflow_dispatch:
+    inputs:
+      retention-days:
+        description: "How long to keep the artifacts"
+        required: false
+        default: "14"
+        type: string
+
+permissions:
+  contents: read
+
+# A nightly that overlaps the previous one just fights it for the shared
+# ccache; let the newer commit win.
+concurrency:
+  group: nightly-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  compiler-host:
+    uses: ./.github/workflows/iree-build.yml
+    with:
+      target: compiler-host
+      retention-days: ${{ fromJSON(inputs.retention-days || '14') }}
+
+  runtime-aarch64:
+    needs: compiler-host
+    uses: ./.github/workflows/iree-build.yml
+    with:
+      target: runtime-aarch64
+      # No LLVM here -- this is IREE's runtime plus its test suite, so it
+      # finishes in a fraction of the compiler build's time even cold.
+      timeout-minutes: 120
+      retention-days: ${{ fromJSON(inputs.retention-days || '14') }}

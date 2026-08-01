@@ -1,0 +1,453 @@
+name: IREE build (reusable)
+
+# Builds one of the two CMake/Ninja configurations this repo produces:
+#
+#   compiler-host    iree-compile (x86_64) with the Rocket compiler target
+#                    plugin registered -- ../../iree-build/configure-compiler-host.sh.
+#   runtime-aarch64  iree-run-module / iree-benchmark-module cross-compiled for
+#                    the RK3588 board with the Rocket HAL driver statically
+#                    linked -- ../../iree-build/configure-runtime-aarch64.sh --
+#                    plus the rocket HAL CTS binaries and the Rust test
+#                    binaries, all for the board.
+#
+# runtime-aarch64 is downstream of compiler-host: configure-runtime-aarch64.sh
+# points IREE_HOST_BIN_DIR at iree-build/build/tools, and IREE resolves those
+# host tools straight out of that directory at configure time (see
+# iree-src/build_tools/cmake/iree_import_binary.cmake -- it only sets an
+# IMPORTED_LOCATION, it does not copy). So the caller must run compiler-host
+# first (see nightly.yml) and this workflow unpacks that job's iree-host-tools
+# artifact back into iree-build/build/ before configuring.
+
+on:
+  workflow_call:
+    inputs:
+      target:
+        description: "compiler-host or runtime-aarch64"
+        required: true
+        type: string
+      timeout-minutes:
+        description: >-
+          Job timeout. Deliberately under GitHub's 6h ceiling: on a cold ccache
+          this build compiles all of LLVM, and a job killed at the hard ceiling
+          would lose the ccache save step (and with it hours of work) whereas
+          one that hits its own timeout still runs it.
+        required: false
+        default: 330
+        type: number
+      retention-days:
+        description: "Retention for the published artifacts."
+        required: false
+        default: 14
+        type: number
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    name: ${{ inputs.target }}
+    runs-on: ubuntu-latest
+    timeout-minutes: ${{ inputs.timeout-minutes }}
+
+    env:
+      CCACHE_DIR: ${{ github.workspace }}/.ccache
+      # The two targets get separate caches (different compilers entirely --
+      # host g++ vs. aarch64-linux-gnu-g++), and their sum has to stay well
+      # under GitHub's 10 GB per-repo cache budget or the two nightly jobs
+      # evict each other's LLVM objects every run.
+      CCACHE_MAXSIZE: ${{ inputs.target == 'compiler-host' && '3G' || '1G' }}
+      CCACHE_COMPRESS: "1"
+      # Rewrite absolute paths under the workspace to relative ones, so objects
+      # stay reusable if the checkout ever lands somewhere else.
+      CCACHE_BASEDIR: ${{ github.workspace }}
+      # Submodule checkouts get fresh mtimes/ctimes on every run, which would
+      # otherwise miss on every header. Safe here: nothing in IREE's build
+      # depends on __DATE__/__TIME__ for correctness of the cached object.
+      CCACHE_SLOPPINESS: time_macros,include_file_ctime,include_file_mtime,locale
+      CCACHE_COMPILERCHECK: content
+
+    steps:
+      # Every build step below is gated on `if: inputs.target == ...`, so a
+      # typo'd target would otherwise produce a green job that built nothing.
+      - name: Validate target
+        env:
+          TARGET: ${{ inputs.target }}
+        run: |
+          case "$TARGET" in
+            compiler-host|runtime-aarch64) ;;
+            *) echo "::error::unknown target '$TARGET'"; exit 1 ;;
+          esac
+
+      - uses: actions/checkout@v4
+        with:
+          # iree-src pulls in llvm-project and friends; the build needs all of
+          # them, so this cannot be narrowed to the top-level submodule.
+          submodules: recursive
+
+      # Feeds the ccache key below. iree-src's SHA is what actually decides
+      # whether the LLVM objects in the cache are still usable, so it belongs
+      # in the key -- keying on ${{ github.sha }} would throw away the whole
+      # LLVM build on every unrelated Rust-side commit.
+      - name: Record iree-src pin
+        id: pin
+        run: |
+          sha="$(git -C iree-build/iree-src rev-parse HEAD)"
+          echo "iree_sha=${sha}" >> "$GITHUB_OUTPUT"
+          echo "iree_describe=$(git -C iree-build/iree-src describe --tags --always)" >> "$GITHUB_OUTPUT"
+
+      # A full LLVM + IREE build tree is ~4 GB and the ccache another ~3 GB, on
+      # a runner image that ships with only ~21 GB free. These are the largest
+      # preinstalled toolchains none of this build touches.
+      - name: Free disk space
+        run: |
+          sudo rm -rf \
+            /usr/local/lib/android \
+            /usr/share/dotnet \
+            /usr/local/.ghcup \
+            /opt/ghc \
+            /opt/hostedtoolcache/CodeQL \
+            /usr/local/share/powershell \
+            /usr/share/swift
+          sudo docker image prune --all --force >/dev/null 2>&1 || true
+          df -h /
+
+      - name: Install build dependencies
+        run: |
+          sudo apt-get update
+          # patchelf: iree-compile is a thin wrapper that loads
+          # libIREECompiler.so through an absolute RUNPATH baked in at link
+          # time; the packaging step below rewrites it to $ORIGIN/../lib.
+          sudo apt-get install -y --no-install-recommends \
+            ninja-build ccache patchelf
+
+      # Only the aarch64 side involves Rust at all: rocket-hal-driver's
+      # staticlib is built by cargo from within that CMake tree, and the
+      # crates' own test binaries are built below. The compiler-host build is
+      # pure C++ (rocket-compiler-plugin has no cargo step).
+      - name: Install aarch64 cross toolchain
+        if: inputs.target == 'runtime-aarch64'
+        run: |
+          # aarch64_linux_gnu.cmake relies on these packages' built-in sysroot
+          # search paths -- no separate --sysroot configuration.
+          # libclang-dev: iree-rocket-hal and rocket-hal-driver both run
+          # bindgen from build.rs (see ci.yml's own note).
+          sudo apt-get install -y --no-install-recommends \
+            gcc-aarch64-linux-gnu g++-aarch64-linux-gnu libclang-dev
+
+      - name: Install Rust (stable)
+        if: inputs.target == 'runtime-aarch64'
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: aarch64-unknown-linux-gnu
+
+      - uses: Swatinem/rust-cache@v2
+        if: inputs.target == 'runtime-aarch64'
+
+      # Split restore/save rather than actions/cache, so a build that fails or
+      # times out still banks the objects it did manage to compile. On a cold
+      # cache this build is hours long; losing all of it to one bad commit at
+      # the end would make the next run just as slow.
+      - name: Restore ccache
+        id: ccache-restore
+        uses: actions/cache/restore@v4
+        with:
+          path: ${{ env.CCACHE_DIR }}
+          # github.run_id makes every run's key unique, because cache entries
+          # are immutable -- reusing an existing key would silently skip the
+          # save and the cache would never pick up newly compiled objects.
+          key: ccache-${{ inputs.target }}-${{ steps.pin.outputs.iree_sha }}-${{ hashFiles('iree-build/configure-compiler-host.sh', 'iree-build/configure-runtime-aarch64.sh', 'iree-build/aarch64_linux_gnu.cmake', 'iree-build/host-aarch64/CMakeLists.txt') }}-${{ github.run_id }}
+          # Falling back across iree-src SHAs is deliberate: an IREE bump moves
+          # relatively few translation units, so a previous pin's cache still
+          # hits on the vast majority of LLVM.
+          restore-keys: |
+            ccache-${{ inputs.target }}-${{ steps.pin.outputs.iree_sha }}-${{ hashFiles('iree-build/configure-compiler-host.sh', 'iree-build/configure-runtime-aarch64.sh', 'iree-build/aarch64_linux_gnu.cmake', 'iree-build/host-aarch64/CMakeLists.txt') }}-
+            ccache-${{ inputs.target }}-${{ steps.pin.outputs.iree_sha }}-
+            ccache-${{ inputs.target }}-
+
+      - name: Reset ccache stats
+        run: ccache --zero-stats
+
+      # ---------------------------------------------------------------- host
+
+      - name: Configure (compiler-host)
+        if: inputs.target == 'compiler-host'
+        run: |
+          ./iree-build/configure-compiler-host.sh \
+            -DCMAKE_BUILD_TYPE=Release \
+            -DCMAKE_C_COMPILER_LAUNCHER=ccache \
+            -DCMAKE_CXX_COMPILER_LAUNCHER=ccache \
+            -DIREE_BUILD_TESTS=OFF \
+            -DIREE_BUILD_SAMPLES=OFF \
+            -DIREE_BUILD_DOCS=OFF
+        # IREE_BUILD_TESTS=OFF is a large time saving and costs nothing here:
+        # this job exists to produce iree-compile plus the host tools the
+        # aarch64 job imports, and rocket-compiler-plugin's own lit tests are
+        # already gated on IREE_BUILD_TESTS (iree_compiler_plugin.cmake). The
+        # aarch64 job keeps tests ON -- that is what builds the CTS.
+
+      - name: Build (compiler-host)
+        if: inputs.target == 'compiler-host'
+        run: cmake --build iree-build/build
+
+      - name: Package compiler-host artifacts
+        if: inputs.target == 'compiler-host'
+        run: |
+          set -euo pipefail
+          BUILD=iree-build/build
+
+          # iree-compile and the other driver binaries are ~16 KB wrappers
+          # around libIREECompiler.so, found via a RUNPATH holding this
+          # runner's absolute build path. Rewrite it to $ORIGIN/../lib so both
+          # consumers work: the downloadable tarball (unpacked anywhere) and
+          # the aarch64 job (which unpacks to the same layout but must not
+          # depend on the two runners agreeing on workspace paths).
+          for f in "${BUILD}"/tools/*; do
+            [ -f "$f" ] && [ -x "$f" ] || continue
+            # Doubles as the ELF check: patchelf fails on anything else.
+            patchelf --print-rpath "$f" >/dev/null 2>&1 || continue
+            patchelf --set-rpath '$ORIGIN/../lib' "$f"
+          done
+
+          write_version() {
+            cat > "$1" <<EOF
+          repo:     ${{ github.repository }}@${{ github.sha }}
+          iree-src: ${{ steps.pin.outputs.iree_sha }} (${{ steps.pin.outputs.iree_describe }})
+          built:    $(date -u +%Y-%m-%dT%H:%M:%SZ)
+          run:      ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+          EOF
+          }
+
+          # 1. The user-facing compiler: just iree-compile plus the shared
+          #    library it loads.
+          mkdir -p dist/iree-compile-x86_64/bin dist/iree-compile-x86_64/lib
+          cp "${BUILD}/tools/iree-compile" dist/iree-compile-x86_64/bin/
+          cp "${BUILD}/lib/libIREECompiler.so" dist/iree-compile-x86_64/lib/
+          cp "${BUILD}/tools/build_config.txt" dist/iree-compile-x86_64/
+          write_version dist/iree-compile-x86_64/VERSION.txt
+          tar -C dist -czf iree-compile-x86_64.tar.gz iree-compile-x86_64
+
+          # 2. The full tools/ directory, in the exact layout
+          #    IREE_HOST_BIN_DIR expects, for the aarch64 job to restore.
+          #    lib/ rides along because iree-compile is imported from here and
+          #    the check-test modules in the aarch64 tree actually run it.
+          mkdir -p dist/iree-host-tools/tools dist/iree-host-tools/lib
+          find "${BUILD}/tools" -maxdepth 1 -type f -executable \
+            -exec cp {} dist/iree-host-tools/tools/ \;
+          cp "${BUILD}/tools/build_config.txt" dist/iree-host-tools/tools/
+          cp "${BUILD}/lib/libIREECompiler.so" dist/iree-host-tools/lib/
+          write_version dist/iree-host-tools/VERSION.txt
+          tar -C dist -czf iree-host-tools.tar.gz iree-host-tools
+
+          ls -lh ./*.tar.gz
+
+      # Everything is uploaded as a tarball rather than a bare directory:
+      # actions/upload-artifact zips its input and the zip round-trip drops the
+      # executable bit, which would make every one of these downloads useless.
+      # compression-level 0 because the tarballs are already gzipped.
+      - name: Upload iree-compile (x86_64)
+        if: inputs.target == 'compiler-host'
+        uses: actions/upload-artifact@v4
+        with:
+          name: iree-compile-x86_64
+          path: iree-compile-x86_64.tar.gz
+          compression-level: 0
+          retention-days: ${{ inputs.retention-days }}
+
+      - name: Upload host tools
+        if: inputs.target == 'compiler-host'
+        uses: actions/upload-artifact@v4
+        with:
+          name: iree-host-tools
+          path: iree-host-tools.tar.gz
+          compression-level: 0
+          retention-days: ${{ inputs.retention-days }}
+
+      # ------------------------------------------------------------- aarch64
+
+      - name: Download host tools
+        if: inputs.target == 'runtime-aarch64'
+        uses: actions/download-artifact@v4
+        with:
+          name: iree-host-tools
+          path: host-tools-dl
+
+      - name: Restore host tools into iree-build/build
+        if: inputs.target == 'runtime-aarch64'
+        run: |
+          set -euo pipefail
+          mkdir -p iree-build/build
+          tar -xzf host-tools-dl/iree-host-tools.tar.gz -C host-tools-dl
+          # configure-runtime-aarch64.sh hardcodes IREE_HOST_BIN_DIR as
+          # <iree-build>/build/tools, so the layout has to be reproduced
+          # exactly rather than pointed at wherever the download landed.
+          cp -a host-tools-dl/iree-host-tools/tools iree-build/build/tools
+          cp -a host-tools-dl/iree-host-tools/lib   iree-build/build/lib
+          rm -rf host-tools-dl
+          ./iree-build/build/tools/iree-compile --version
+
+      - name: Configure (runtime-aarch64)
+        if: inputs.target == 'runtime-aarch64'
+        run: |
+          ./iree-build/configure-runtime-aarch64.sh \
+            -DCMAKE_BUILD_TYPE=Release \
+            -DCMAKE_C_COMPILER_LAUNCHER=ccache \
+            -DCMAKE_CXX_COMPILER_LAUNCHER=ccache \
+            -DIREE_ENABLE_WERROR_FLAG=OFF
+        # IREE defaults -Werror ON. configure-compiler-host.sh already turns it
+        # off for the same reason it is turned off here: the runner's
+        # aarch64-linux-gnu-g++ is not the one this is developed against, and a
+        # nightly whose job is to produce board binaries should not fail on a
+        # new warning from a compiler bump in the runner image.
+
+      - name: Build (runtime-aarch64)
+        if: inputs.target == 'runtime-aarch64'
+        run: cmake --build iree-build/host-aarch64/build
+
+      # Built separately from the CMake tree: the CMake build links
+      # rocket-hal-driver in as a staticlib, it never builds the crates' own
+      # #[test] binaries. These are the ones that get scp'd to the board.
+      - name: Build Rust test binaries (aarch64)
+        if: inputs.target == 'runtime-aarch64'
+        env:
+          CARGO_TARGET_AARCH64_UNKNOWN_LINUX_GNU_LINKER: aarch64-linux-gnu-gcc
+        run: |
+          set -euo pipefail
+          cargo test --workspace --release \
+            --target aarch64-unknown-linux-gnu --no-run \
+            --message-format=json > cargo-tests.json
+          jq -r 'select(.reason == "compiler-artifact" and .target.test == true and .executable != null) | .executable' \
+            cargo-tests.json > rust-test-binaries.txt
+          echo "Built $(wc -l < rust-test-binaries.txt) test binaries:"
+          cat rust-test-binaries.txt
+
+      - name: Package runtime-aarch64 artifacts
+        if: inputs.target == 'runtime-aarch64'
+        run: |
+          set -euo pipefail
+          BUILD=iree-build/host-aarch64/build
+
+          write_version() {
+            cat > "$1" <<EOF
+          repo:     ${{ github.repository }}@${{ github.sha }}
+          iree-src: ${{ steps.pin.outputs.iree_sha }} (${{ steps.pin.outputs.iree_describe }})
+          target:   aarch64-unknown-linux-gnu (RK3588)
+          built:    $(date -u +%Y-%m-%dT%H:%M:%SZ)
+          run:      ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+          EOF
+          }
+
+          # 1. The board runtime tools.
+          mkdir -p dist/iree-runtime-aarch64/bin
+          cp "${BUILD}/iree/tools/iree-run-module" \
+             "${BUILD}/iree/tools/iree-benchmark-module" \
+             dist/iree-runtime-aarch64/bin/
+          write_version dist/iree-runtime-aarch64/VERSION.txt
+          tar -C dist -czf iree-runtime-aarch64.tar.gz iree-runtime-aarch64
+
+          # 2. The HAL CTS binaries for the rocket driver.
+          mkdir -p dist/rocket-cts-aarch64/bin
+          find "${BUILD}/rocket-cts" -maxdepth 1 -type f -executable \
+            -exec cp {} dist/rocket-cts-aarch64/bin/ \;
+          write_version dist/rocket-cts-aarch64/VERSION.txt
+          cat > dist/rocket-cts-aarch64/RUN.md <<'EOF'
+          # rocket HAL CTS (aarch64 / RK3588)
+
+          Cross-compiled against the real `rocket` HAL driver. Run on the board
+          with the NPU present (`/dev/accel/accel0`):
+
+          ```sh
+          for t in bin/*; do
+            echo "== $t"
+            "./$t" || echo "FAILED: $t"
+          done
+          ```
+
+          Only the non-executable CTS categories are built
+          (buffer/command_buffer/core/file/queue) -- see
+          `rocket-hal-driver/cts/backends.cc` for why.
+          EOF
+          tar -C dist -czf rocket-cts-aarch64.tar.gz rocket-cts-aarch64
+
+          # 3. The Rust test binaries.
+          mkdir -p dist/rocket-rust-tests-aarch64/bin
+          while read -r bin; do
+            [ -n "$bin" ] || continue
+            cp "$bin" dist/rocket-rust-tests-aarch64/bin/
+          done < rust-test-binaries.txt
+          write_version dist/rocket-rust-tests-aarch64/VERSION.txt
+          cat > dist/rocket-rust-tests-aarch64/RUN.md <<'EOF'
+          # Rust test binaries (aarch64 / RK3588)
+
+          `cargo test --workspace --release --target aarch64-unknown-linux-gnu
+          --no-run` output for `rocket-schema`, `iree-rocket-hal` and
+          `rocket-hal-driver`. Each file in `bin/` is a standalone libtest
+          binary; the filename suffix is cargo's build hash.
+
+          The hardware tests -- the ones that actually touch
+          `/dev/accel/accel0` -- are all `#[ignore]`d, so a plain run only
+          covers the host-safe unit tests. On the board, run both:
+
+          ```sh
+          for t in bin/*; do
+            echo "== $t"
+            "./$t"            || echo "FAILED: $t"
+            "./$t" --ignored  || echo "FAILED (hardware): $t"
+          done
+          ```
+          EOF
+          tar -C dist -czf rocket-rust-tests-aarch64.tar.gz rocket-rust-tests-aarch64
+
+          ls -lh ./*.tar.gz
+
+      - name: Upload iree runtime (aarch64)
+        if: inputs.target == 'runtime-aarch64'
+        uses: actions/upload-artifact@v4
+        with:
+          name: iree-runtime-aarch64
+          path: iree-runtime-aarch64.tar.gz
+          compression-level: 0
+          retention-days: ${{ inputs.retention-days }}
+
+      - name: Upload rocket CTS (aarch64)
+        if: inputs.target == 'runtime-aarch64'
+        uses: actions/upload-artifact@v4
+        with:
+          name: rocket-cts-aarch64
+          path: rocket-cts-aarch64.tar.gz
+          compression-level: 0
+          retention-days: ${{ inputs.retention-days }}
+
+      - name: Upload Rust test binaries (aarch64)
+        if: inputs.target == 'runtime-aarch64'
+        uses: actions/upload-artifact@v4
+        with:
+          name: rocket-rust-tests-aarch64
+          path: rocket-rust-tests-aarch64.tar.gz
+          compression-level: 0
+          retention-days: ${{ inputs.retention-days }}
+
+      # ---------------------------------------------------------------- wrap
+
+      - name: ccache stats
+        # Runs on failure too -- a build that died partway still says how much
+        # of the cache it hit, which is the first thing to check when a nightly
+        # unexpectedly takes hours.
+        if: always()
+        run: |
+          command -v ccache >/dev/null || exit 0
+          ccache --show-stats --verbose
+          {
+            echo "### ccache (${{ inputs.target }})"
+            echo '```'
+            ccache --show-stats
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      # Guarded on the restore having run: cache/save errors on an empty key,
+      # which would turn an early failure (bad checkout, say) into two.
+      - name: Save ccache
+        if: always() && steps.ccache-restore.outputs.cache-primary-key != ''
+        uses: actions/cache/save@v4
+        with:
+          path: ${{ env.CCACHE_DIR }}
+          key: ${{ steps.ccache-restore.outputs.cache-primary-key }}
