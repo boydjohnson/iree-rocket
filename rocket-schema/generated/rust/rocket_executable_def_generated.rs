@@ -218,12 +218,10 @@ pub const ENUM_MIN_CONV_2DDIMENSION: u8 = 0;
 pub const ENUM_MAX_CONV_2DDIMENSION: u8 = 7;
 #[deprecated(since = "2.0.0", note = "Use associated constants instead. This will no longer be generated in 2021.")]
 #[allow(non_camel_case_types)]
-pub const ENUM_VALUES_CONV_2DDIMENSION: [Conv2DDimension; 8] = [
+pub const ENUM_VALUES_CONV_2DDIMENSION: [Conv2DDimension; 6] = [
   Conv2DDimension::INPUT_WIDTH,
   Conv2DDimension::INPUT_HEIGHT,
   Conv2DDimension::INPUT_CHANNELS,
-  Conv2DDimension::OUTPUT_WIDTH,
-  Conv2DDimension::OUTPUT_HEIGHT,
   Conv2DDimension::OUTPUT_CHANNELS,
   Conv2DDimension::WEIGHTS_WIDTH,
   Conv2DDimension::WEIGHTS_HEIGHT,
@@ -237,8 +235,6 @@ impl Conv2DDimension {
   pub const INPUT_WIDTH: Self = Self(0);
   pub const INPUT_HEIGHT: Self = Self(1);
   pub const INPUT_CHANNELS: Self = Self(2);
-  pub const OUTPUT_WIDTH: Self = Self(3);
-  pub const OUTPUT_HEIGHT: Self = Self(4);
   pub const OUTPUT_CHANNELS: Self = Self(5);
   pub const WEIGHTS_WIDTH: Self = Self(6);
   pub const WEIGHTS_HEIGHT: Self = Self(7);
@@ -249,8 +245,6 @@ impl Conv2DDimension {
     Self::INPUT_WIDTH,
     Self::INPUT_HEIGHT,
     Self::INPUT_CHANNELS,
-    Self::OUTPUT_WIDTH,
-    Self::OUTPUT_HEIGHT,
     Self::OUTPUT_CHANNELS,
     Self::WEIGHTS_WIDTH,
     Self::WEIGHTS_HEIGHT,
@@ -261,8 +255,6 @@ impl Conv2DDimension {
       Self::INPUT_WIDTH => Some("INPUT_WIDTH"),
       Self::INPUT_HEIGHT => Some("INPUT_HEIGHT"),
       Self::INPUT_CHANNELS => Some("INPUT_CHANNELS"),
-      Self::OUTPUT_WIDTH => Some("OUTPUT_WIDTH"),
-      Self::OUTPUT_HEIGHT => Some("OUTPUT_HEIGHT"),
       Self::OUTPUT_CHANNELS => Some("OUTPUT_CHANNELS"),
       Self::WEIGHTS_WIDTH => Some("WEIGHTS_WIDTH"),
       Self::WEIGHTS_HEIGHT => Some("WEIGHTS_HEIGHT"),

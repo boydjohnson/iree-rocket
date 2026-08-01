@@ -256,10 +256,6 @@ std::optional<RocketConv2dConfig> buildRocketConv2dConfigFromTarget(
         dimension = iree_hal_rocket_Conv2DDimension_INPUT_HEIGHT;
       } else if (name == "input_channels") {
         dimension = iree_hal_rocket_Conv2DDimension_INPUT_CHANNELS;
-      } else if (name == "output_width") {
-        dimension = iree_hal_rocket_Conv2DDimension_OUTPUT_WIDTH;
-      } else if (name == "output_height") {
-        dimension = iree_hal_rocket_Conv2DDimension_OUTPUT_HEIGHT;
       } else if (name == "output_channels") {
         dimension = iree_hal_rocket_Conv2DDimension_OUTPUT_CHANNELS;
       } else if (name == "weights_width") {
@@ -267,6 +263,11 @@ std::optional<RocketConv2dConfig> buildRocketConv2dConfigFromTarget(
       } else if (name == "weights_height") {
         dimension = iree_hal_rocket_Conv2DDimension_WEIGHTS_HEIGHT;
       } else {
+        // Deliberately includes "output_width"/"output_height": the runtime
+        // always derives those from the six settable dimensions plus stride
+        // and padding, so their Conv2DDimension values are retired (see
+        // rocket_executable_def.fbs) and the driver rejects any executable
+        // listing them.
         diagFn() << "rocket backend: unknown runtime Conv2D dimension '" << name
                  << "'";
         return std::nullopt;
@@ -283,24 +284,38 @@ std::optional<RocketConv2dConfig> buildRocketConv2dConfigFromTarget(
     }
   }
 
-  const std::array<std::pair<StringRef, uint32_t>, 8> dimensions = {{
-      {"input_width", shape.inputWidth},
-      {"input_height", shape.inputHeight},
-      {"input_channels", shape.inputChannels},
-      {"output_width", shape.outputWidth},
-      {"output_height", shape.outputHeight},
-      {"output_channels", shape.outputChannels},
-      {"weights_width", shape.weightsWidth},
-      {"weights_height", shape.weightsHeight},
+  // The six dimensions a dispatch may supply. 'output_width'/'output_height'
+  // are deliberately absent: the runtime derives them, so they carry no
+  // template obligation in either direction -- a dynamically-shaped conv has
+  // no compile-time output extent to state, and zero is the expected value
+  // there.
+  struct SettableDimension {
+    iree_hal_rocket_Conv2DDimension_enum_t dimension;
+    StringRef name;
+    uint32_t value;
+  };
+  const std::array<SettableDimension, 6> dimensions = {{
+      {iree_hal_rocket_Conv2DDimension_INPUT_WIDTH, "input_width",
+       shape.inputWidth},
+      {iree_hal_rocket_Conv2DDimension_INPUT_HEIGHT, "input_height",
+       shape.inputHeight},
+      {iree_hal_rocket_Conv2DDimension_INPUT_CHANNELS, "input_channels",
+       shape.inputChannels},
+      {iree_hal_rocket_Conv2DDimension_OUTPUT_CHANNELS, "output_channels",
+       shape.outputChannels},
+      {iree_hal_rocket_Conv2DDimension_WEIGHTS_WIDTH, "weights_width",
+       shape.weightsWidth},
+      {iree_hal_rocket_Conv2DDimension_WEIGHTS_HEIGHT, "weights_height",
+       shape.weightsHeight},
   }};
-  for (size_t i = 0; i < dimensions.size(); ++i) {
-    const auto &[name, value] = dimensions[i];
-    if (isRuntimeDimension[i] && value != 0) {
+  for (const auto &[dimension, name, value] : dimensions) {
+    const bool isRuntime = isRuntimeDimension[static_cast<size_t>(dimension)];
+    if (isRuntime && value != 0) {
       diagFn() << "rocket backend: runtime Conv2D dimension '" << name
                << "' must use 0 as its executable template value";
       return std::nullopt;
     }
-    if (!isRuntimeDimension[i] && value == 0) {
+    if (!isRuntime && value == 0) {
       diagFn() << "rocket backend: zero Conv2D dimension '" << name
                << "' must be listed in 'runtime_dimensions'";
       return std::nullopt;

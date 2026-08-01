@@ -4,6 +4,7 @@ iree_lit_test_suite(
   SRCS
     "rocket_conv_layout.mlir"
     "rocket_runtime_dimensions.mlir"
+    "rocket_runtime_dimensions_invalid.mlir"
   TOOLS
     FileCheck
     iree-compile

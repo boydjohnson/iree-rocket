@@ -90,8 +90,8 @@ fn runtime_conv_dimensions_round_trip_in_push_constant_order() {
     let runtime_dimensions = builder.create_vector(&[
         rocket::Conv2DDimension::INPUT_HEIGHT,
         rocket::Conv2DDimension::INPUT_WIDTH,
-        rocket::Conv2DDimension::OUTPUT_HEIGHT,
-        rocket::Conv2DDimension::OUTPUT_WIDTH,
+        rocket::Conv2DDimension::WEIGHTS_HEIGHT,
+        rocket::Conv2DDimension::WEIGHTS_WIDTH,
     ]);
     let conv = rocket::Conv2DDef::create(
         &mut builder,
@@ -130,6 +130,6 @@ fn runtime_conv_dimensions_round_trip_in_push_constant_order() {
     assert_eq!(dimensions.len(), 4);
     assert_eq!(dimensions.get(0), rocket::Conv2DDimension::INPUT_HEIGHT);
     assert_eq!(dimensions.get(1), rocket::Conv2DDimension::INPUT_WIDTH);
-    assert_eq!(dimensions.get(2), rocket::Conv2DDimension::OUTPUT_HEIGHT);
-    assert_eq!(dimensions.get(3), rocket::Conv2DDimension::OUTPUT_WIDTH);
+    assert_eq!(dimensions.get(2), rocket::Conv2DDimension::WEIGHTS_HEIGHT);
+    assert_eq!(dimensions.get(3), rocket::Conv2DDimension::WEIGHTS_WIDTH);
 }

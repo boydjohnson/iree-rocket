@@ -1,17 +1,17 @@
-// RUN: iree-compile %s --compile-mode=hal-executable -o %t.rkt1
+// RUN: not iree-compile %s --compile-mode=hal-executable -o %t.rkt1 2>&1 | FileCheck %s
 //
-// This exercises the Rocket serializer directly. The ordered runtime dimension
-// list maps the four pipeline constants to input_width, input_height,
-// input_channels, and output_channels. Runtime fields use zero in the
-// executable template; the driver replaces them with nonzero push constants at
-// dispatch. output_width/output_height stay zero here and carry no meaning:
-// the runtime always derives the output extent, which is why they are not
-// listable in 'runtime_dimensions' (see rocket_runtime_dimensions_invalid.mlir).
+// output_width/output_height are always derived by the runtime from the six
+// settable dimensions plus stride and padding, so their Conv2DDimension wire
+// values are retired (see rocket-schema/schema/rocket_executable_def.fbs) and
+// the driver rejects any executable listing them. Reject them here instead of
+// emitting a FlatBuffer no driver will load.
+
+// CHECK: unknown runtime Conv2D dimension 'output_width'
 
 #rocket_target = #hal.executable.target<"rocket", "rocket-flatbuffer-v1", {
   kernel = "conv2d",
-  input_width = 0 : i32, input_height = 0 : i32, input_channels = 0 : i32,
-  output_width = 0 : i32, output_height = 0 : i32, output_channels = 0 : i32,
+  input_width = 0 : i32, input_height = 0 : i32, input_channels = 32 : i32,
+  output_width = 0 : i32, output_height = 0 : i32, output_channels = 16 : i32,
   weights_width = 1 : i32, weights_height = 1 : i32, stride = 1 : i32,
   depthwise = false,
   input_zero_point = 0 : i32, output_zero_point = 0 : i32, weights_zero_point = 0 : i32,
@@ -19,10 +19,10 @@
   truncate_bits = 0 : i32,
   activation = "none", activation_cmp = 0 : i32,
   precision = "fp16",
-  runtime_dimensions = ["input_width", "input_height", "input_channels", "output_channels"]
+  runtime_dimensions = ["input_width", "input_height", "output_width"]
 }>
 
-#pipeline_layout = #hal.pipeline.layout<constants = 4, bindings = [
+#pipeline_layout = #hal.pipeline.layout<constants = 3, bindings = [
   #hal.pipeline.binding<storage_buffer, ReadOnly>,
   #hal.pipeline.binding<storage_buffer, ReadOnly>,
   #hal.pipeline.binding<storage_buffer, ReadOnly>,

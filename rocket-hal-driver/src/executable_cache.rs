@@ -161,29 +161,32 @@ fn decode_flatbuffer_shape(data: &[u8]) -> Result<UkernelShape, ()> {
             let mut runtime_dimensions = Vec::new();
             if let Some(dimensions) = conv_def.runtime_dimensions() {
                 for index in 0..dimensions.len() {
-                    if let Some(dim) = match dimensions.get(index) {
-                        schema::Conv2DDimension::INPUT_WIDTH => {
-                            Some(RuntimeConv2dDimension::InputWidth)
-                        }
+                    runtime_dimensions.push(match dimensions.get(index) {
+                        schema::Conv2DDimension::INPUT_WIDTH => RuntimeConv2dDimension::InputWidth,
                         schema::Conv2DDimension::INPUT_HEIGHT => {
-                            Some(RuntimeConv2dDimension::InputHeight)
+                            RuntimeConv2dDimension::InputHeight
                         }
                         schema::Conv2DDimension::INPUT_CHANNELS => {
-                            Some(RuntimeConv2dDimension::InputChannels)
+                            RuntimeConv2dDimension::InputChannels
                         }
                         schema::Conv2DDimension::OUTPUT_CHANNELS => {
-                            Some(RuntimeConv2dDimension::OutputChannels)
+                            RuntimeConv2dDimension::OutputChannels
                         }
                         schema::Conv2DDimension::WEIGHTS_WIDTH => {
-                            Some(RuntimeConv2dDimension::WeightsWidth)
+                            RuntimeConv2dDimension::WeightsWidth
                         }
                         schema::Conv2DDimension::WEIGHTS_HEIGHT => {
-                            Some(RuntimeConv2dDimension::WeightsHeight)
+                            RuntimeConv2dDimension::WeightsHeight
                         }
-                        _ => None,
-                    } {
-                        runtime_dimensions.push(dim);
-                    }
+                        // Unknown to this runtime: either a value from a
+                        // newer schema or one of the retired 3/4
+                        // (OUTPUT_WIDTH/OUTPUT_HEIGHT, see the .fbs). The
+                        // entry still consumed a push-constant ordinal on the
+                        // producer's side, so skipping it would silently
+                        // shift every later constant onto the wrong field --
+                        // reject the executable instead.
+                        _ => return Err(()),
+                    });
                 }
             }
             let executable = Conv2dExecutable {
@@ -595,14 +598,14 @@ mod tests {
         );
         assert!(decode_flatbuffer_shape(&unknown).is_err());
 
-        // OUTPUT_WIDTH/OUTPUT_HEIGHT are legal RKT1 enum values but no
-        // longer map to a settable RuntimeConv2dDimension -- conv::Shape
-        // always derives them, see that enum's own doc comment.
+        // 3 is the retired OUTPUT_WIDTH: a value an older serializer could
+        // still emit, but one conv::Shape always derives rather than
+        // accepts -- see the .fbs and RuntimeConv2dDimension's doc comment.
         let unsupported_output_dimension = encode_dynamic_conv_executable(
             &[
                 schema::Conv2DDimension::INPUT_WIDTH,
                 schema::Conv2DDimension::INPUT_HEIGHT,
-                schema::Conv2DDimension::OUTPUT_WIDTH,
+                schema::Conv2DDimension(3),
             ],
             0,
             [0, 0],
