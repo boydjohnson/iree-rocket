@@ -41,6 +41,23 @@ struct NumericCase {
     kernel_height: u32,
     stride_x: u32,
     stride_y: u32,
+    /// Whether rknn-toolkit2 compiles this geometry to a bare `PPU | PPU_RDMA`
+    /// (`0x60`) kick, the structure `PoolingPlan` emits, or prefixes it with a
+    /// `CNA | CORE | DPU` (`0x0d`) stage.
+    ///
+    /// Measured, not guessed: `~/projects/rknn-files/sweep-ourshapes` holds a
+    /// vendor model per geometry, classified by the exact kick word
+    /// `(0x0081 << 48) | (mask << 16) | 0x0008`. That prefix stage is a 1x1
+    /// stride-1 convolution which preserves width and height and only repacks
+    /// the channel axis into NC1HWC2 -- a layout pass the toolkit needs because
+    /// its input arrives as graph-level NCHW, and which this crate does not
+    /// need because it owns its own buffer layout.
+    ///
+    /// **This is the c>=2 classification.** At c=1, which is what
+    /// `pooling_shape` actually runs, the toolkit inserts the layout stage for
+    /// every geometry, so a c=1 classification would mark all nine `false` and
+    /// leave nothing to run.
+    vendor_bare: bool,
 }
 
 const K3_TWO_TILES: NumericCase = NumericCase {
@@ -51,6 +68,7 @@ const K3_TWO_TILES: NumericCase = NumericCase {
     kernel_height: 3,
     stride_x: 2,
     stride_y: 2,
+    vendor_bare: true,
 };
 
 const K2_CAPTURE_BOUNDARY: NumericCase = NumericCase {
@@ -61,6 +79,7 @@ const K2_CAPTURE_BOUNDARY: NumericCase = NumericCase {
     kernel_height: 2,
     stride_x: 2,
     stride_y: 2,
+    vendor_bare: true,
 };
 
 const K2_TWO_TILES: NumericCase = NumericCase {
@@ -71,6 +90,7 @@ const K2_TWO_TILES: NumericCase = NumericCase {
     kernel_height: 2,
     stride_x: 2,
     stride_y: 2,
+    vendor_bare: true,
 };
 
 const NUMERIC_CASES: [NumericCase; 9] = [
@@ -82,6 +102,7 @@ const NUMERIC_CASES: [NumericCase; 9] = [
         kernel_height: 2,
         stride_x: 2,
         stride_y: 2,
+        vendor_bare: true,
     },
     NumericCase {
         name: "rectangular_kernel",
@@ -91,6 +112,7 @@ const NUMERIC_CASES: [NumericCase; 9] = [
         kernel_height: 2,
         stride_x: 2,
         stride_y: 1,
+        vendor_bare: false,
     },
     NumericCase {
         name: "overlapping_windows",
@@ -100,6 +122,7 @@ const NUMERIC_CASES: [NumericCase; 9] = [
         kernel_height: 3,
         stride_x: 2,
         stride_y: 2,
+        vendor_bare: false,
     },
     NumericCase {
         name: "asymmetric_stride",
@@ -109,6 +132,7 @@ const NUMERIC_CASES: [NumericCase; 9] = [
         kernel_height: 3,
         stride_x: 3,
         stride_y: 2,
+        vendor_bare: false,
     },
     NumericCase {
         name: "largest_direct_window",
@@ -118,6 +142,7 @@ const NUMERIC_CASES: [NumericCase; 9] = [
         kernel_height: 8,
         stride_x: 3,
         stride_y: 3,
+        vendor_bare: true,
     },
     NumericCase {
         name: "default_width_boundary",
@@ -127,6 +152,7 @@ const NUMERIC_CASES: [NumericCase; 9] = [
         kernel_height: 3,
         stride_x: 2,
         stride_y: 2,
+        vendor_bare: false,
     },
     K3_TWO_TILES,
     K2_CAPTURE_BOUNDARY,
@@ -320,9 +346,19 @@ fn assert_numeric_case(case: NumericCase, method: PoolingMethod, tolerance: i16)
     assert_numeric_case_on_file(&file, case, method, tolerance);
 }
 
+/// Whether a geometry should be exercised on hardware.
+///
+/// Default builds run only the geometries the vendor compiles to a bare
+/// `0x60`, i.e. those whose vendor program is structurally identical to what
+/// `PoolingPlan` emits. `--features vendor-bypass-shapes` restores the rest.
+#[cfg(feature = "kernel-fix")]
+fn enabled(case: NumericCase) -> bool {
+    cfg!(feature = "vendor-bypass-shapes") || case.vendor_bare
+}
+
 #[cfg(feature = "kernel-fix")]
 fn assert_numeric_matrix(method: PoolingMethod, tolerance: i16) {
-    for case in NUMERIC_CASES {
+    for case in NUMERIC_CASES.into_iter().filter(|&case| enabled(case)) {
         assert_numeric_case(case, method, tolerance);
     }
 }
@@ -412,12 +448,14 @@ fn direct_equal_half_boundary_pooling_matches_cpu_reference() {
     assert_numeric_case(K2_CAPTURE_BOUNDARY, PoolingMethod::Max, 0);
 }
 
+#[cfg(feature = "vendor-bypass-shapes")]
 #[test]
 #[ignore = "needs the real NPU device -- isolates non-square min pooling"]
 fn direct_rectangular_min_pooling_matches_cpu_reference() {
     assert_numeric_case(NUMERIC_CASES[1], PoolingMethod::Min, 0);
 }
 
+#[cfg(feature = "vendor-bypass-shapes")]
 #[test]
 #[ignore = "needs the real NPU device -- distinguishes min method from non-square geometry"]
 fn direct_square_k3_min_pooling_matches_cpu_reference() {
@@ -432,11 +470,13 @@ fn repeated_pooling_resource_lifetime_matches_cpu_reference() {
         assert_numeric_case(NUMERIC_CASES[0], PoolingMethod::Max, 0);
         assert_numeric_case(K2_CAPTURE_BOUNDARY, PoolingMethod::Max, 0);
         assert_numeric_case(NUMERIC_CASES[0], PoolingMethod::Min, 0);
+        #[cfg(feature = "vendor-bypass-shapes")]
         assert_numeric_case(NUMERIC_CASES[1], PoolingMethod::Min, 0);
         assert_numeric_case(K2_CAPTURE_BOUNDARY, PoolingMethod::Avg, 1);
     }
 }
 
+#[cfg(feature = "vendor-bypass-shapes")]
 #[test]
 #[ignore = "needs the real NPU device -- repeats the single-task width-129 PC launch boundary"]
 fn repeated_default_width_boundary_matches_cpu_reference() {
@@ -449,6 +489,11 @@ fn repeated_default_width_boundary_matches_cpu_reference() {
     }
 }
 
+// Gated whole rather than filtered: these two exist to exercise the
+// largest_direct_window -> default_width_boundary transition, and the second
+// half of that pair is a vendor-bypass geometry. Dropping it would leave the
+// test repeating one shape and silently stop testing what it is named for.
+#[cfg(feature = "vendor-bypass-shapes")]
 #[test]
 #[ignore = "needs the real NPU device -- reproduces deferred BO cleanup across file close"]
 fn pooling_file_lifetime_boundary_matches_cpu_reference() {
@@ -458,6 +503,7 @@ fn pooling_file_lifetime_boundary_matches_cpu_reference() {
     }
 }
 
+#[cfg(feature = "vendor-bypass-shapes")]
 #[test]
 #[ignore = "needs the real NPU device -- isolates retained engine state within one DRM file"]
 fn same_file_pooling_geometry_transition_matches_cpu_reference() {
