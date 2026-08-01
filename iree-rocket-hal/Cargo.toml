@@ -14,6 +14,12 @@ kernel-fix = []
 # covers only shapes whose vendor program matches ours structurally.
 vendor-bypass-shapes = []
 
+# Diagnostic sweep isolating which property of the 64x31/k8x8/s3x3 geometry
+# leaves the following job hanging. Expected to FAIL while the driver's
+# per-job core reset is disabled -- its value is the table in the panic
+# message, not a green tick. Off by default so it stays out of the suite.
+wedge-sweep = []
+
 [dependencies]
 nix = { version = "0.30.1", features = ["ioctl", "mman", "time"] }
 

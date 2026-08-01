@@ -550,3 +550,126 @@ fn same_file_pooling_geometry_transition_matches_cpu_reference() {
         assert_numeric_case_on_file(&file, NUMERIC_CASES[5], PoolingMethod::Max, 0);
     }
 }
+
+// ============================================================================
+// Wedging-predecessor sweep.
+//
+// `largest_direct_window` (64x31, k8x8, s3x3) is the only geometry that leaves
+// the *next* job hanging, and the next job's own shape is irrelevant: with all
+// shapes enabled the casualty is `default_width_boundary` (129x17), with only
+// vendor-bare shapes it is `k3_two_tiles` (256x9). Both time out around 520 ms
+// with their output BO still holding the 0xa5 poison fill.
+//
+// Three properties of that shape could be responsible, and the matrix tests
+// cannot separate them because they only ever run it in one configuration.
+// These probes move one axis at a time off the baseline, holding the successor
+// fixed at the geometry directly observed hanging after it:
+//
+//   small_kernel   64x31 k3x3 s3x3  same extent and stride, 9 taps not 64
+//   no_overlap     64x31 k8x8 s8x8  same extent and kernel, windows disjoint
+//   short_extent   16x16 k8x8 s3x3  same kernel and overlap, far less work
+//
+// Read the result by which probe stops wedging: `small_kernel` clean implicates
+// kernel area, `no_overlap` clean implicates window overlap, `short_extent`
+// clean implicates dispatch duration (i.e. a quiesce race, not a geometry
+// property). The reported predecessor timings distinguish the last case on
+// their own. All three are vendor-bare at c=16, like the baseline, so none of
+// them reintroduces the `0x0d` layout stage as a confound.
+// ============================================================================
+
+#[cfg(feature = "wedge-sweep")]
+const WEDGE_SMALL_KERNEL: NumericCase = NumericCase {
+    name: "small_kernel",
+    width: 64,
+    height: 31,
+    kernel_width: 3,
+    kernel_height: 3,
+    stride_x: 3,
+    stride_y: 3,
+    vendor_bare: true,
+};
+
+#[cfg(feature = "wedge-sweep")]
+const WEDGE_NO_OVERLAP: NumericCase = NumericCase {
+    name: "no_overlap",
+    width: 64,
+    height: 31,
+    kernel_width: 8,
+    kernel_height: 8,
+    stride_x: 8,
+    stride_y: 8,
+    vendor_bare: true,
+};
+
+#[cfg(feature = "wedge-sweep")]
+const WEDGE_SHORT_EXTENT: NumericCase = NumericCase {
+    name: "short_extent",
+    width: 16,
+    height: 16,
+    kernel_width: 8,
+    kernel_height: 8,
+    stride_x: 3,
+    stride_y: 3,
+    vendor_bare: true,
+};
+
+#[cfg(feature = "wedge-sweep")]
+#[test]
+#[ignore = "needs the real NPU device -- isolates which property of largest_direct_window wedges the following job"]
+fn wedging_predecessor_sweep() {
+    // Held fixed: the geometry observed hanging after largest_direct_window in
+    // the vendor-bare configuration.
+    const SUCCESSOR: NumericCase = K3_TWO_TILES;
+
+    let probes: [(&str, Option<NumericCase>); 6] = [
+        // Controls first: the successor must be clean on its own and after a
+        // geometry known not to wedge, or nothing below means anything.
+        ("(no predecessor)", None),
+        ("benign_small_square", Some(NUMERIC_CASES[0])),
+        // Positive control: this one is expected to wedge.
+        ("baseline_64x31_k8_s3", Some(NUMERIC_CASES[4])),
+        ("small_kernel_k3_s3", Some(WEDGE_SMALL_KERNEL)),
+        ("no_overlap_k8_s8", Some(WEDGE_NO_OVERLAP)),
+        ("short_extent_16x16", Some(WEDGE_SHORT_EXTENT)),
+    ];
+
+    let mut rows = Vec::new();
+    let mut wedged = Vec::new();
+
+    for (label, predecessor) in probes {
+        // A fresh DRM file per dispatch, matching how the matrix tests run --
+        // the hang reproduces across separate files, so this is not a
+        // within-file effect.
+        let predecessor_ms = predecessor.map(|case| {
+            let file = open_device();
+            let (_, _, dispatch_ms) = run_numeric_case_on_file(&file, case, PoolingMethod::Max);
+            dispatch_ms
+        });
+
+        let file = open_device();
+        let (actual, expected, successor_ms) =
+            run_numeric_case_on_file(&file, SUCCESSOR, PoolingMethod::Max);
+        let wrong = actual
+            .iter()
+            .zip(&expected)
+            .filter(|(got, want)| got != want)
+            .count();
+
+        rows.push(format!(
+            "  {label:<22} predecessor {:>5} -> successor {successor_ms:>4} ms, {wrong:>6} of {} wrong",
+            predecessor_ms.map_or("--".to_string(), |ms| format!("{ms} ms")),
+            expected.len(),
+        ));
+        if wrong > 0 {
+            wedged.push(label);
+        }
+    }
+
+    assert!(
+        wedged.is_empty(),
+        "successor {} was wedged by: {}\n{}",
+        SUCCESSOR.name,
+        wedged.join(", "),
+        rows.join("\n"),
+    );
+}
