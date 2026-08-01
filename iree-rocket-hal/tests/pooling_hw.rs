@@ -613,33 +613,17 @@ const WEDGE_SHORT_EXTENT: NumericCase = NumericCase {
     vendor_bare: true,
 };
 
+/// Runs each probe as `predecessor -> successor` and reports which
+/// predecessors left the successor broken.
+///
+/// A fresh DRM file per dispatch, matching how the matrix tests run -- the hang
+/// reproduces across separate files, so this is not a within-file effect.
 #[cfg(feature = "wedge-sweep")]
-#[test]
-#[ignore = "needs the real NPU device -- isolates which property of largest_direct_window wedges the following job"]
-fn wedging_predecessor_sweep() {
-    // Held fixed: the geometry observed hanging after largest_direct_window in
-    // the vendor-bare configuration.
-    const SUCCESSOR: NumericCase = K3_TWO_TILES;
-
-    let probes: [(&str, Option<NumericCase>); 6] = [
-        // Controls first: the successor must be clean on its own and after a
-        // geometry known not to wedge, or nothing below means anything.
-        ("(no predecessor)", None),
-        ("benign_small_square", Some(NUMERIC_CASES[0])),
-        // Positive control: this one is expected to wedge.
-        ("baseline_64x31_k8_s3", Some(NUMERIC_CASES[4])),
-        ("small_kernel_k3_s3", Some(WEDGE_SMALL_KERNEL)),
-        ("no_overlap_k8_s8", Some(WEDGE_NO_OVERLAP)),
-        ("short_extent_16x16", Some(WEDGE_SHORT_EXTENT)),
-    ];
-
+fn run_wedge_probes(successor: NumericCase, probes: &[(&'static str, Option<NumericCase>)]) {
     let mut rows = Vec::new();
     let mut wedged = Vec::new();
 
-    for (label, predecessor) in probes {
-        // A fresh DRM file per dispatch, matching how the matrix tests run --
-        // the hang reproduces across separate files, so this is not a
-        // within-file effect.
+    for &(label, predecessor) in probes {
         let predecessor_ms = predecessor.map(|case| {
             let file = open_device();
             let (_, _, dispatch_ms) = run_numeric_case_on_file(&file, case, PoolingMethod::Max);
@@ -648,7 +632,7 @@ fn wedging_predecessor_sweep() {
 
         let file = open_device();
         let (actual, expected, successor_ms) =
-            run_numeric_case_on_file(&file, SUCCESSOR, PoolingMethod::Max);
+            run_numeric_case_on_file(&file, successor, PoolingMethod::Max);
         let wrong = actual
             .iter()
             .zip(&expected)
@@ -668,8 +652,83 @@ fn wedging_predecessor_sweep() {
     assert!(
         wedged.is_empty(),
         "successor {} was wedged by: {}\n{}",
-        SUCCESSOR.name,
+        successor.name,
         wedged.join(", "),
         rows.join("\n"),
+    );
+}
+
+#[cfg(feature = "wedge-sweep")]
+#[test]
+#[ignore = "needs the real NPU device -- isolates which property of largest_direct_window wedges the following job"]
+fn wedging_predecessor_sweep() {
+    // Held fixed: the geometry observed hanging after largest_direct_window in
+    // the vendor-bare configuration.
+    run_wedge_probes(
+        K3_TWO_TILES,
+        &[
+            // Controls first: the successor must be clean on its own and after
+            // a geometry known not to wedge, or nothing below means anything.
+            ("(no predecessor)", None),
+            ("benign_small_square", Some(NUMERIC_CASES[0])),
+            // Positive control: this one is expected to wedge.
+            ("baseline_64x31_k8_s3", Some(NUMERIC_CASES[4])),
+            ("small_kernel_k3_s3", Some(WEDGE_SMALL_KERNEL)),
+            ("no_overlap_k8_s8", Some(WEDGE_NO_OVERLAP)),
+            ("short_extent_16x16", Some(WEDGE_SHORT_EXTENT)),
+        ],
+    );
+}
+
+/// One predecessor geometry for the stride sweep: 64x31 with a 3x3 kernel, so
+/// every stride below stays inside the input.
+///
+/// `vendor_bare` is measured per combination in `~/projects/rknn-files/
+/// sweep-wedge`: the toolkit inserts its layout stage once stride exceeds the
+/// kernel, so sy=4, sy=5 and sx=8 are bypass and the rest are bare. That has no
+/// bearing on this experiment -- these run as predecessors through our own
+/// `PoolingPlan`, whose structure does not vary with stride -- but the field
+/// should not lie.
+#[cfg(feature = "wedge-sweep")]
+const fn stride_probe(stride_x: u32, stride_y: u32, vendor_bare: bool) -> NumericCase {
+    NumericCase {
+        name: "stride_probe",
+        width: 64,
+        height: 31,
+        kernel_width: 3,
+        kernel_height: 3,
+        stride_x,
+        stride_y,
+        vendor_bare,
+    }
+}
+
+#[cfg(feature = "wedge-sweep")]
+#[test]
+#[ignore = "needs the real NPU device -- confirms the stride_y threshold and that stride_x is irrelevant"]
+fn wedging_stride_y_sweep() {
+    // The predecessor sweep ruled out kernel area, window overlap and dispatch
+    // duration, leaving stride_y >= 3 as the separator across nine points --
+    // but the threshold was inferred from geometries that happened to cluster
+    // there, never swept. Here stride is the only thing that moves.
+    //
+    // Predicted: sy <= 2 clean, sy >= 3 wedges, and both stride_x controls stay
+    // clean however large sx gets. A different sy threshold, or an sx control
+    // that wedges, refutes the vertical-prefetch reading.
+    run_wedge_probes(
+        K3_TWO_TILES,
+        &[
+            ("(no predecessor)", None),
+            ("benign_small_square", Some(NUMERIC_CASES[0])),
+            ("sy1_sx2", Some(stride_probe(2, 1, true))),
+            ("sy2_sx2", Some(stride_probe(2, 2, true))),
+            ("sy3_sx2", Some(stride_probe(2, 3, true))),
+            ("sy4_sx2", Some(stride_probe(2, 4, false))),
+            ("sy5_sx2", Some(stride_probe(2, 5, false))),
+            // Horizontal controls at a known-clean sy: only asymmetric_stride
+            // separated the two axes before, and only at sx=3.
+            ("sx3_sy2", Some(stride_probe(3, 2, true))),
+            ("sx8_sy2", Some(stride_probe(8, 2, false))),
+        ],
     );
 }
