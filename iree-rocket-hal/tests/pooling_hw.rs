@@ -613,47 +613,77 @@ const WEDGE_SHORT_EXTENT: NumericCase = NumericCase {
     vendor_bare: true,
 };
 
+/// Dispatches `case` on its own DRM file and returns how many outputs differ
+/// from the CPU reference, with the dispatch duration.
+///
+/// A fresh file per dispatch, matching how the matrix tests run -- the hang
+/// reproduces across separate files, so this is not a within-file effect.
+#[cfg(feature = "wedge-sweep")]
+fn wedge_dispatch(case: NumericCase) -> (usize, u128) {
+    let file = open_device();
+    let (actual, expected, dispatch_ms) = run_numeric_case_on_file(&file, case, PoolingMethod::Max);
+    let wrong = actual
+        .iter()
+        .zip(&expected)
+        .filter(|(got, want)| got != want)
+        .count();
+    (wrong, dispatch_ms)
+}
+
 /// Runs each probe as `predecessor -> successor` and reports which
 /// predecessors left the successor broken.
 ///
-/// A fresh DRM file per dispatch, matching how the matrix tests run -- the hang
-/// reproduces across separate files, so this is not a within-file effect.
+/// Every probe is preceded by a bare successor dispatch that must come back
+/// clean. Nothing here can reset the core -- only the driver does that, and
+/// under `prejob_policy=0`/`1` it does not -- so once one predecessor wedges,
+/// the core stays wedged and every later probe would report a failure it did
+/// not cause. An earlier version of this sweep had exactly that bug: it read
+/// clean for `sx3_sy2` only because the neighbouring `sy4`/`sy5` probes
+/// self-hung and tripped the driver's *timeout* reset in between, and dropping
+/// those probes turned `sx3_sy2` into a false positive. Bail at the first
+/// contaminated reading instead of reporting fiction.
 #[cfg(feature = "wedge-sweep")]
 fn run_wedge_probes(successor: NumericCase, probes: &[(&'static str, Option<NumericCase>)]) {
     let mut rows = Vec::new();
     let mut wedged = Vec::new();
+    let mut contaminated = None;
 
     for &(label, predecessor) in probes {
-        let predecessor_ms = predecessor.map(|case| {
-            let file = open_device();
-            let (_, _, dispatch_ms) = run_numeric_case_on_file(&file, case, PoolingMethod::Max);
-            dispatch_ms
-        });
+        let (dirty, _) = wedge_dispatch(successor);
+        if dirty > 0 {
+            contaminated = Some(label);
+            break;
+        }
 
-        let file = open_device();
-        let (actual, expected, successor_ms) =
-            run_numeric_case_on_file(&file, successor, PoolingMethod::Max);
-        let wrong = actual
-            .iter()
-            .zip(&expected)
-            .filter(|(got, want)| got != want)
-            .count();
+        let predecessor_ms = predecessor.map(|case| wedge_dispatch(case).1);
+        let (wrong, successor_ms) = wedge_dispatch(successor);
 
         rows.push(format!(
-            "  {label:<22} predecessor {:>5} -> successor {successor_ms:>4} ms, {wrong:>6} of {} wrong",
+            "  {label:<22} predecessor {:>5} -> successor {successor_ms:>4} ms, {wrong:>6} wrong",
             predecessor_ms.map_or("--".to_string(), |ms| format!("{ms} ms")),
-            expected.len(),
         ));
         if wrong > 0 {
             wedged.push(label);
         }
     }
 
+    if let Some(label) = contaminated {
+        rows.push(format!(
+            "  {label:<22} NOT RUN -- core still wedged from the previous probe. \
+             Results below this point would be meaningless; re-run with \
+             prejob_policy=2, or one probe at a time."
+        ));
+    }
+
     assert!(
-        wedged.is_empty(),
+        wedged.is_empty() && contaminated.is_none(),
         "successor {} was wedged by: {}\n{}",
         successor.name,
-        wedged.join(", "),
+        if wedged.is_empty() {
+            "(nothing, but the run was cut short)".to_string()
+        } else {
+            wedged.join(", ")
+        },
         rows.join("\n"),
     );
 }
