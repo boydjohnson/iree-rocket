@@ -22,6 +22,11 @@ Changes that alter existing field meaning, scalar type, enum value, or default
 require a new file identifier such as `RKT2` and a new HAL executable format
 string. Fields and enum values must not be removed or reused.
 
+`Conv2DDef.pad_top` and `pad_left` were added compatibly with a zero default.
+Readers interpret an older `RKT1` executable that omits them as an unpadded
+convolution. Each leading value is applied symmetrically to the trailing side,
+matching the current two-value Rocket `ConvShape` model.
+
 The IREE `iree_flatbuffer_file_header_t` version remains `0`. The FlatBuffer
 file identifier carries the Rocket format version.
 

@@ -5,11 +5,11 @@
 //! consumers (`rocket-hal-driver`) can use the same primitives instead of
 //! re-deriving them.
 
-use std::num::NonZeroUsize;
+use std::{num::NonZeroUsize, ptr::NonNull};
 
 use nix::{
     ioctl_readwrite, ioctl_write_ptr,
-    sys::mman::{MapFlags, ProtFlags, mmap},
+    sys::mman::{MapFlags, ProtFlags, mmap, munmap},
     time::{ClockId, clock_gettime},
 };
 
@@ -145,6 +145,84 @@ pub unsafe fn submit_tasks(
     Ok(())
 }
 
+/// One job in a multi-job submission: its task list plus the GEM handles it
+/// reads from and writes to.
+pub struct JobDesc<'a> {
+    /// `(regcmd_dma_address, regcmd_count)` per task, in order.
+    pub tasks: &'a [(u32, u32)],
+    pub in_handles: &'a [u32],
+    pub out_handles: &'a [u32],
+}
+
+/// Submits several independent jobs in one SUBMIT ioctl.
+///
+/// This is the difference that matters for multi-core execution. Tasks
+/// within one job run sequentially on a single core (see [`submit_tasks`]),
+/// so N tasks buy capacity, not parallelism. N *jobs* are independent work
+/// items the kernel scheduler can place on different cores -- that is the
+/// only lever userspace has, because `drm_rocket_job` has no core field and
+/// core assignment is entirely the kernel's.
+///
+/// Whether the scheduler actually spreads them is not observable from
+/// userspace: a successful submit says nothing about placement. Confirming
+/// it needs the out-of-tree kprobe tracer's per-core operation counts.
+///
+/// Jobs submitted together have no ordering guarantee relative to each
+/// other, so they must not depend on each other's output. For height-tiled
+/// convolution the tiles write disjoint output rows, which satisfies that.
+///
+/// # Safety
+///
+/// `fd` must be an open `/dev/accel/accel0` descriptor, every task's
+/// `regcmd_dma_address` must point at a live GEM buffer holding
+/// `regcmd_count` valid register commands, and every handle listed must
+/// name a live GEM buffer. The hardware reads and writes those buffers
+/// asynchronously, so they must stay alive and untouched by the CPU until
+/// the job completes.
+pub unsafe fn submit_jobs(fd: i32, jobs: &[JobDesc<'_>]) -> nix::Result<()> {
+    assert!(!jobs.is_empty(), "submit_jobs requires at least one job");
+
+    // Each job's `tasks` pointer must stay valid for the ioctl, so the
+    // converted task arrays are kept alive here rather than in a temporary.
+    let raw_tasks: Vec<Vec<drm_rocket_task>> = jobs
+        .iter()
+        .map(|job| {
+            job.tasks
+                .iter()
+                .map(|&(regcmd, regcmd_count)| drm_rocket_task {
+                    regcmd,
+                    regcmd_count,
+                })
+                .collect()
+        })
+        .collect();
+
+    let raw_jobs: Vec<drm_rocket_job> = jobs
+        .iter()
+        .zip(&raw_tasks)
+        .map(|(job, tasks)| drm_rocket_job {
+            tasks: tasks.as_ptr() as u64,
+            in_bo_handles: job.in_handles.as_ptr() as u64,
+            out_bo_handles: job.out_handles.as_ptr() as u64,
+            task_count: tasks.len() as u32,
+            task_struct_size: std::mem::size_of::<drm_rocket_task>() as u32,
+            in_bo_handle_count: job.in_handles.len() as u32,
+            out_bo_handle_count: job.out_handles.len() as u32,
+        })
+        .collect();
+
+    let mut submit = drm_rocket_submit {
+        jobs: raw_jobs.as_ptr() as u64,
+        job_count: raw_jobs.len() as u32,
+        job_struct_size: std::mem::size_of::<drm_rocket_job>() as u32,
+        reserved: 0,
+    };
+    unsafe {
+        rocket_submit(fd, &mut submit)?;
+    }
+    Ok(())
+}
+
 /// Submits a single-task job built from an already-written regcmd GEM
 /// buffer. `in_handles`/`out_handles` are the GEM handles the job reads
 /// from/writes to -- must include the regcmd buffer's own handle in
@@ -211,11 +289,24 @@ pub unsafe fn prep_bo(fd: i32, handle: u32, relative_timeout_ns: u64) -> nix::Re
 /// dispatch results after several repeated allocations, while the exact
 /// same dispatch run once in a fresh process was clean. Does NOT unmap the
 /// buffer's `host_ptr` -- callers that also `mmap`'d (i.e. everyone using
-/// `Buffer::new()`) should `munmap` separately if the address space itself
-/// needs reclaiming; this only releases the kernel-side GEM object/handle.
+/// `Buffer::new()`) must call [`unmap_bo`] separately to release the VMA's
+/// GEM-object reference; this only releases the file's GEM handle.
 pub unsafe fn close_bo(fd: i32, handle: u32) -> nix::Result<()> {
     unsafe {
         gem_close(fd, &drm_gem_close { handle, pad: 0 })?;
     }
     Ok(())
+}
+
+/// Releases the CPU mapping created by [`Buffer::new`].
+///
+/// This is separate from [`close_bo`]: GEM_CLOSE drops the file's handle,
+/// while `munmap` drops the VMA's independent reference to the GEM object.
+/// Call both once no CPU pointer into the buffer remains. Otherwise the GEM
+/// object, its IOMMU domain reference, and its IOVA allocation remain alive
+/// until process exit even though the handle has been closed.
+pub unsafe fn unmap_bo(buffer: &Buffer) -> nix::Result<()> {
+    let mapping =
+        NonNull::new(buffer.host_ptr.cast()).expect("Buffer::new returned a null mapping");
+    unsafe { munmap(mapping, buffer.size) }
 }

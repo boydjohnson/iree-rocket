@@ -1261,9 +1261,9 @@ unsafe extern "C" fn queue_execute(
 
                     // Real input/output GEM handles from the command
                     // buffer's recorded dispatch (command_buffer.rs's
-                    // `RecordedOp::Dispatch`), same convention
-                    // conv_hw.rs's hand-rolled ioctl call already validates
-                    // against real hardware: the regcmd buffer's own
+                    // `RecordedOp::Dispatch`), same convention this crate's
+                    // hand-rolled hardware tests already validate against
+                    // real hardware: the regcmd buffer's own
                     // handle plus every buffer the dispatch reads go in
                     // in_bo_handles, everything it writes goes in
                     // out_bo_handles. Without these the kernel driver's

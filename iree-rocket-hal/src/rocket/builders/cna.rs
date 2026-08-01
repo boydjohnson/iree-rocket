@@ -293,7 +293,9 @@ impl Register<CnaConvCon2> {
     /// Bit width: 10
     /// Range of values: 0x000-0x3FF; TRM suggests setting this to
     /// `y_stride + weight_height + 1`.
-    /// Known limitations: None documented.
+    /// Known limitations: Pass the logical 10-bit field value, not an encoded register
+    /// word. The hardware field begins at bit 4, so `feature_grains(Bits::new(0x21))`
+    /// produces register value `0x210`.
     /// Related registers: `cna_conv_con3.conv_y_stride`, `cna_weight_size2.weight_height`
     /// (used to derive the suggested value).
     pub fn feature_grains(&mut self, feature_grain: Bits<10>) -> &mut Self {
@@ -698,10 +700,12 @@ impl Register<CnaCbufCon0> {
     /// the top bank.
     ///
     /// Bit width: 4
-    /// Range of values: 4'd1: Bank 7 occupied by weight data; 4'd2: Bank 6/7 occupied by
-    /// weight data; ... 4'd7: Bank 1-7 occupied by weight data.
+    /// Range of values: 0-15, matching the complete 4-bit hardware field. The older TRM
+    /// description only enumerates 1-7, but a working RK3588 vendor convolution capture
+    /// programs 11.
     /// Known limitations: Must be allocated so it doesn't overlap the banks claimed by
-    /// `data_bank`; the CBUF is 384KB of internal SRAM total (TRM §1).
+    /// `data_bank`. The exact bank-count/topology interpretation for values above 7 is
+    /// not documented by the older TRM.
     /// Related registers: `data_bank`, `fc_data_bank`, `weight_reuse`.
     pub fn weight_bank(&mut self, weight_bank: Bits<4>) -> &mut Self {
         self.set_field(CNA_CBUF_CON0_WEIGHT_BANK__MASK, unsafe {
@@ -741,14 +745,20 @@ impl Register<CnaCbufCon1> {
     /// Bit width: 13
     /// Range of values: 0x0000-0x1FFF, per the TRM's bit table (bits 12:0; bits 31:13
     /// reserved).
-    /// Known limitations: The compiled register mask (`CNA_CBUF_CON1_DATA_ENTRIES__MASK`,
-    /// from Mesa's `rkt_registers.h`) is actually 0x3fff (14 bits) — one bit wider than
-    /// the TRM's own reserved-bit boundary. `Bits<13>` here is a deliberately tighter
-    /// caller-side assertion matching the TRM table; it can never write a value that the
-    /// wider hardware mask wouldn't also have accepted, so this only forbids the one
-    /// TRM-reserved bit (12 vs 13) without changing what's actually written to hardware.
+    /// Known limitations: the compiled register mask (`CNA_CBUF_CON1_DATA_ENTRIES__MASK`)
+    /// is 0x3fff (14 bits), one bit wider than the TRM's own reserved-bit boundary. This
+    /// was previously narrowed to `Bits<13>` to match the TRM table, on the reasoning that
+    /// the tighter assertion could only forbid a reserved bit. A shape sweep of vendor
+    /// captures disproves that: a `128x128` convolution programs `data_entries = 11264`,
+    /// which needs bit 13. The TRM's boundary is wrong (or the bit is usable in practice),
+    /// the 14-bit mask is real, and narrowing here rejected shapes the vendor itself emits.
+    ///
+    /// The 14-bit ceiling is load-bearing rather than incidental. This field holds
+    /// `tile_input_rows * width`, so 16383 caps a single program at 63 input rows when the
+    /// feature map is 256 wide, and 127 rows at 128 wide. That is the hardware reason tall
+    /// convolutions must be split for capacity; see `conv::Shape::max_tile_input_rows`.
     /// Related registers: `cna_cbuf_con0.data_bank`.
-    pub fn data_entries(&mut self, data_entries: Bits<13>) -> &mut Self {
+    pub fn data_entries(&mut self, data_entries: Bits<14>) -> &mut Self {
         self.set_field(CNA_CBUF_CON1_DATA_ENTRIES__MASK, unsafe {
             CNA_CBUF_CON1_DATA_ENTRIES(data_entries.val())
         })

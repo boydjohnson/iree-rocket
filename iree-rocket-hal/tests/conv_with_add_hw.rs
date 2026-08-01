@@ -1,87 +1,132 @@
-//! Hardware-in-the-loop test for `build_conv_with_add_regcmd` -- Mesa's
-//! `add_tensor` element-wise-add fusion, see `AddTensor`'s doc comment in
-//! `regcmd.rs` for the full derivation (TRM's documented `ew_alu_algo`
-//! opcodes, Mesa's `rkt_regcmd.c` source this is ported from, and the
-//! live hardware capture of a standalone `x + y` model that confirmed
-//! the resulting register values bit-exact -- see
-//! rknpu-spelunking/NOTES.md's "Elementwise tensor-tensor ops" section).
+//! Hardware-in-the-loop tests for `build_conv_then_add_regcmd` -- the real
+//! `Conv2d(x) +/- w` pipeline, as two hardware tasks in one
+//! `device::submit_tasks()` job (see that function's doc comment and
+//! `elementwise.rs`'s `ConvThenAddBuffers` doc comment for why this is a
+//! genuinely separate task rather than fused into the conv's own DPU pass).
 //!
-//! Not run by a plain `cargo test` -- see `conv_hw.rs`'s doc comment for
-//! the cross-compile-and-copy-to-the-board workflow; identical here.
+//! Not run by a plain `cargo test` -- see `conv_phase1_validation_hw.rs`'s
+//! doc comment for the cross-compile-and-copy-to-the-board workflow;
+//! identical here:
 //!
-//! **This is a genuinely first-round, exploratory test**, unlike most
-//! other hardware tests in this repo: `build_conv_with_add_regcmd`'s own
-//! doc comment flags a real, unresolved gap between what this function
-//! assumes (one task, DPU_RDMA's `SRC_BASE_ADDR` and ERDMA's
-//! `EW_BASE_ADDR` both readable directly, no preceding stage needed --
-//! the same single-task shape `build_lut_regcmd` already proved for a
-//! different op) and what the one real hardware capture behind this
-//! code actually showed (a 3-task chain, not a single task). This test
-//! picks the simplest concrete hypothesis it can -- `addition.src_addr ==
-//! addition.ew_addr == buf_y`'s address -- purely to see whether the
-//! job completes at all. A hang or wrong output here should NOT be read
-//! as "the EW_CFG/EW_CVT_SCALE_VALUE recipe is wrong" (that part is
-//! bit-exact confirmed already); suspect the task-count/data-flow gap
-//! first.
+//!   CARGO_TARGET_AARCH64_UNKNOWN_LINUX_GNU_LINKER=aarch64-linux-gnu-gcc \
+//!     cargo test --target aarch64-unknown-linux-gnu --release \
+//!       --test conv_with_add_hw --no-run
 //!
-//! Conv shape mirrors `conv_then_lut_hw.rs`'s own choice: 1x1 kernel,
-//! real (non-offset) zero points, to avoid the accumulator-saturation
-//! problem a 3x3 kernel + offset zero points caused on this repo's first
-//! LUT hardware rounds.
+//! **First hardware round for this exact two-task shape.** Unlike
+//! `conv_then_lut_hw.rs` (whose two-task design was independently confirmed
+//! by a live bpftrace trace of the vendor runtime before ever being coded),
+//! this builder's task structure and register recipe were reconstructed
+//! entirely from a static sweep's decoded captures
+//! (`iree-rocket-design-spike`'s `sweep_convadd_generate.py`/
+//! `sweep_convadd_diff.py`, see `DESIGN_NOTES.md`'s "Conv+add fusion sweep"
+//! section, and `elementwise.rs`'s own doc comments for exactly which
+//! fields are capture-confirmed vs. inferred) -- nothing here has run on
+//! real silicon yet. If these tests hang, suspect the task-structure/
+//! register-skeleton claims first (the confirmed-vs-inferred split in
+//! `build_add_regcmd`'s doc comment is the place to start).
+//!
+//! **fp16 only.** `EwAddShape`'s int8 fields (`w_scale_ratio`/
+//! `output_scale_ratio`) are new and have no independent numeric
+//! confirmation (see their own doc comments) -- keeping this first real
+//! hardware round fp16-only isolates the task-shape/register-skeleton
+//! question (genuinely uncertain) from the int8 ratio-formula question
+//! (deliberately deferred, not blocking this round).
+//!
+//! Conv shape mirrors `conv_then_lut_hw.rs`'s own choice: 1x1 kernel, single
+//! channel, to keep the expected numeric results simple to reason about.
 
 use std::{fs::OpenOptions, mem, os::unix::io::AsRawFd, ptr};
 
 use iree_rocket_hal::rocket::{
-    device::{Buffer, fini_bo, prep_bo, submit},
-    regcmd::{
-        Activation, AddTensor, ConvBuffers, ConvShape, Precision, build_conv_regcmd,
-        build_conv_with_add_regcmd,
-    },
+    conv::{self, Kernels},
+    device::{Buffer, close_bo, fini_bo, prep_bo, submit_tasks},
+    elementwise::{ConvThenAddBuffers, EwAddShape, EwPrecision, build_conv_then_add_regcmd},
 };
 
 const DEVICE_PATH: &str = "/dev/accel/accel0";
 const TENSOR_SIZE: usize = 4096;
+const KERNELS: Kernels = [1, 1];
+const EXTENT: u32 = 4;
 
-fn conv_shape() -> ConvShape {
-    ConvShape {
-        input_width: 4,
-        input_height: 4,
-        input_channels: 1,
-        output_width: 4,
-        output_height: 4,
-        output_channels: 1,
-        weights_width: 1,
-        weights_height: 1,
-        stride: 1,
-        depthwise: false,
-        input_zero_point: 0x80,
-        output_zero_point: 0x80,
-        weights_zero_point: 0x80,
-        input_scale: 1.0,
-        weights_scale: 1.0,
-        output_scale: 1.0,
-        truncate_bits: 0,
-        activation: Activation::None,
-        precision: Precision::Int8,
+fn f32_to_f16(value: f32) -> u16 {
+    let bits = value.to_bits();
+    let sign = ((bits >> 16) & 0x8000) as u16;
+    if value == 0.0 {
+        return sign;
+    }
+    let exponent = ((bits >> 23) & 0xff) as i32 - 127 + 15;
+    let fraction = bits & 0x7f_ffff;
+    assert!(
+        (1..31).contains(&exponent),
+        "{value} is outside the fp16 normal range"
+    );
+    assert_eq!(fraction & 0x1fff, 0, "{value} is not exact in fp16");
+    sign | ((exponent as u16) << 10) | ((fraction >> 13) as u16)
+}
+
+fn f16_to_f32(bits: u16) -> f32 {
+    let sign = ((bits >> 15) & 1) as u32;
+    let exp = ((bits >> 10) & 0x1f) as u32;
+    let frac = (bits & 0x3ff) as u32;
+    let word = match exp {
+        0 if frac == 0 => sign << 31,
+        0x1f => (sign << 31) | 0x7f80_0000 | (frac << 13),
+        0 => {
+            let mut exponent = -1i32;
+            let mut mantissa = frac;
+            while mantissa & 0x400 == 0 {
+                mantissa <<= 1;
+                exponent -= 1;
+            }
+            (sign << 31) | (((exponent + 127 - 15) as u32) << 23) | ((mantissa & 0x3ff) << 13)
+        }
+        _ => (sign << 31) | ((exp + 127 - 15) << 23) | (frac << 13),
+    };
+    f32::from_bits(word)
+}
+
+unsafe fn fill_f16(ptr: *mut u8, byte_len: usize, value: f32) {
+    let word = f32_to_f16(value);
+    unsafe {
+        let slice = std::slice::from_raw_parts_mut(ptr as *mut u16, byte_len / 2);
+        slice.fill(word);
     }
 }
 
-/// Runs `x <algo> scale*y` (where `<algo>` is `EW_CFG`'s raw
-/// `ew_alu_algo` opcode -- `2`=Add, `3`=Div, etc, see `AddTensor::algo`'s
-/// doc comment) with the whole `x` plane filled with `x_fill`, the
-/// whole `y` plane filled with `y_fill`, a 1x1 identity-ish weight
-/// (`weight_fill`), and returns the 16 real output pixels. `algo=2,
-/// scale=1.0` is addition; `algo=2, scale=-1.0` is subtraction (`x - y`)
-/// -- see `AddTensor`'s own doc comment on why a negative `scale` is
-/// the right way to get subtraction out of the SAME `algo=2` rather
-/// than a distinct opcode.
-fn run_uniform_conv_with_add_scaled(
-    x_fill: u8,
-    y_fill: u8,
-    weight_fill: u8,
-    scale: f32,
-    algo: u32,
-) -> Vec<u8> {
+fn conv_shape() -> conv::Shape {
+    conv::Shape {
+        width: EXTENT,
+        height: EXTENT,
+        stride: 1,
+        in_channels: 1,
+        out_channels: 1,
+        precision: conv::Precision::Fp16,
+        padding: Some([0, 0]),
+        activation: conv::Activation::None,
+        depthwise: false,
+    }
+}
+
+fn add_shape(algo: u32) -> EwAddShape {
+    EwAddShape {
+        width: EXTENT,
+        height: EXTENT,
+        channels: 1,
+        precision: EwPrecision::Fp16,
+        algo,
+        // int8-only fields, unused for fp16.
+        output_zero_point: 0,
+        w_cvt_offset: 0,
+        w_scale_ratio: 1.0,
+        output_scale_ratio: 1.0,
+    }
+}
+
+/// Builds and submits the two-task `x <algo> w_fill` (real conv, real
+/// weight `weight_fill`, `x_fill` input) job as one `submit_tasks()` job,
+/// waits once on the final output, and returns the 16 real (decoded fp16)
+/// output pixels.
+fn run_conv_then_add(x_fill: f32, weight_fill: f32, w_fill: f32, algo: u32) -> Vec<f32> {
     let file = OpenOptions::new()
         .read(true)
         .write(true)
@@ -90,401 +135,203 @@ fn run_uniform_conv_with_add_scaled(
     let fd = file.as_raw_fd();
 
     unsafe {
-        let buf_x = Buffer::new(fd, TENSOR_SIZE, &file);
-        ptr::write_bytes(buf_x.host_ptr, x_fill, TENSOR_SIZE);
-
-        let buf_y = Buffer::new(fd, TENSOR_SIZE, &file);
-        ptr::write_bytes(buf_y.host_ptr, y_fill, TENSOR_SIZE);
+        let buf_in = Buffer::new(fd, TENSOR_SIZE, &file);
+        fill_f16(buf_in.host_ptr, TENSOR_SIZE, x_fill);
 
         let buf_w = Buffer::new(fd, TENSOR_SIZE, &file);
-        ptr::write_bytes(buf_w.host_ptr, weight_fill, TENSOR_SIZE);
+        fill_f16(buf_w.host_ptr, TENSOR_SIZE, weight_fill);
 
         let buf_bias = Buffer::new(fd, TENSOR_SIZE, &file);
-        ptr::write_bytes(buf_bias.host_ptr, 0, TENSOR_SIZE);
+        ptr::write_bytes(buf_bias.host_ptr, 0, TENSOR_SIZE); // real 0.0
+
+        let buf_second = Buffer::new(fd, TENSOR_SIZE, &file);
+        fill_f16(buf_second.host_ptr, TENSOR_SIZE, w_fill);
+
+        // Pure inter-task DMA memory -- never read/written by the CPU, see
+        // conv_then_lut_hw.rs's own ConvThenLutBuffers::intermediate_addr
+        // handling for why this needs neither prep_bo/fini_bo nor a spot in
+        // either handle list below.
+        let buf_mid = Buffer::new(fd, TENSOR_SIZE, &file);
 
         let buf_out = Buffer::new(fd, TENSOR_SIZE, &file);
         ptr::write_bytes(buf_out.host_ptr, 0, TENSOR_SIZE);
 
-        let bufs = ConvBuffers {
-            input_addr: buf_x.dma_address,
+        let bufs = ConvThenAddBuffers {
+            input_addr: buf_in.dma_address,
             weights_addr: buf_w.dma_address,
             bias_addr: buf_bias.dma_address,
+            intermediate_addr: buf_mid.dma_address,
+            w_addr: buf_second.dma_address,
             output_addr: buf_out.dma_address,
         };
-        // Simplest hypothesis for the still-unconfirmed src_addr/ew_addr
-        // relationship -- see this file's top doc comment.
-        let addition = AddTensor {
-            src_addr: buf_y.dma_address,
-            ew_addr: buf_y.dma_address,
-            scale,
-            cvt_offset: 0,
-            algo,
-        };
-        let cmds = build_conv_with_add_regcmd(&conv_shape(), &bufs, &addition);
+        let (conv_cmds, add_cmds) =
+            build_conv_then_add_regcmd(&conv_shape(), KERNELS, &add_shape(algo), &bufs);
 
-        let cmd_bytes = cmds.len() * mem::size_of::<u64>();
-        let cmd_len = cmd_bytes.next_multiple_of(4096);
-        let buf_cmd = Buffer::new(fd, cmd_len, &file);
-        let cmd_slice = std::slice::from_raw_parts_mut(buf_cmd.host_ptr as *mut u64, cmds.len());
-        for (i, c) in cmds.iter().enumerate() {
-            cmd_slice[i] = c.0;
+        let conv_cmd_bytes = conv_cmds.len() * mem::size_of::<u64>();
+        let buf_cmd_conv = Buffer::new(fd, conv_cmd_bytes.next_multiple_of(4096), &file);
+        let conv_cmd_slice =
+            std::slice::from_raw_parts_mut(buf_cmd_conv.host_ptr as *mut u64, conv_cmds.len());
+        for (i, c) in conv_cmds.iter().enumerate() {
+            conv_cmd_slice[i] = c.0;
         }
 
-        fini_bo(fd, buf_x.handle).ok();
-        fini_bo(fd, buf_y.handle).ok();
+        let add_cmd_bytes = add_cmds.len() * mem::size_of::<u64>();
+        let buf_cmd_add = Buffer::new(fd, add_cmd_bytes.next_multiple_of(4096), &file);
+        let add_cmd_slice =
+            std::slice::from_raw_parts_mut(buf_cmd_add.host_ptr as *mut u64, add_cmds.len());
+        for (i, c) in add_cmds.iter().enumerate() {
+            add_cmd_slice[i] = c.0;
+        }
+
+        fini_bo(fd, buf_in.handle).ok();
         fini_bo(fd, buf_w.handle).ok();
         fini_bo(fd, buf_bias.handle).ok();
+        fini_bo(fd, buf_second.handle).ok();
         fini_bo(fd, buf_out.handle).ok();
-        fini_bo(fd, buf_cmd.handle).ok();
+        fini_bo(fd, buf_cmd_conv.handle).ok();
+        fini_bo(fd, buf_cmd_add.handle).ok();
 
         let in_handles = [
-            buf_cmd.handle,
-            buf_x.handle,
-            buf_y.handle,
+            buf_cmd_conv.handle,
+            buf_cmd_add.handle,
+            buf_in.handle,
             buf_w.handle,
             buf_bias.handle,
+            buf_second.handle,
         ];
         let out_handles = [buf_out.handle];
 
-        submit(
+        submit_tasks(
             fd,
-            buf_cmd.dma_address,
-            cmds.len() as u32,
+            &[
+                (buf_cmd_conv.dma_address, conv_cmds.len() as u32),
+                (buf_cmd_add.dma_address, add_cmds.len() as u32),
+            ],
             &in_handles,
             &out_handles,
         )
-        .expect("SUBMIT ioctl failed");
+        .expect("multi-task SUBMIT ioctl failed");
 
         prep_bo(fd, buf_out.handle, 2_000_000_000).unwrap_or_else(|e| {
             panic!(
-                "conv-with-add job did not complete within timeout (x_fill={x_fill}, \
-                 y_fill={y_fill}) -- see this file's top doc comment on the unconfirmed \
-                 src_addr/ew_addr data-flow before assuming the EW recipe itself is wrong: {e}"
+                "conv-then-add job did not complete within timeout (x_fill={x_fill}, \
+                 weight_fill={weight_fill}, w_fill={w_fill}) -- see this file's top doc \
+                 comment, this is the first hardware round for this task shape: {e}"
             )
         });
 
-        let raw = std::slice::from_raw_parts(buf_out.host_ptr, 256);
-        (0..16).map(|i| raw[i * 16]).collect()
+        let raw = std::slice::from_raw_parts(buf_out.host_ptr as *const u16, 128);
+        let pixels = raw[..16].iter().map(|&bits| f16_to_f32(bits)).collect();
+
+        close_bo(fd, buf_in.handle).ok();
+        close_bo(fd, buf_w.handle).ok();
+        close_bo(fd, buf_bias.handle).ok();
+        close_bo(fd, buf_second.handle).ok();
+        close_bo(fd, buf_mid.handle).ok();
+        close_bo(fd, buf_out.handle).ok();
+        close_bo(fd, buf_cmd_conv.handle).ok();
+        close_bo(fd, buf_cmd_add.handle).ok();
+
+        pixels
     }
 }
 
-/// Most basic possible check: does this new fused-EW single task even
-/// complete without hanging the NPU? See this file's top doc comment on
-/// what a failure here would/wouldn't tell us.
-///
-/// Confirmed on real hardware (2026-07-22): completes, `output=[128;
-/// 16]` for every pixel (`x_fill=0, y_fill=0, weight_fill=64`). NOT
-/// meaningful as a correctness check on its own -- `weight_fill=64`
-/// (copied from `conv_then_lut_hw.rs`'s amplification-test convention,
-/// not chosen for this test) decodes to a real weight of `64-128=-64`,
-/// not an identity pass-through, so the conv stage here computes
-/// `x_real * -64`, not `x_real` -- the observed constant `128` (real
-/// output `0`) doesn't confirm or refute add semantics either way, just
-/// that the job runs. See `conv_with_add_tracks_x_plus_y` below for an
-/// actual numeric check with a real identity weight.
+/// Most basic possible check: does the new multi-task job even complete
+/// without hanging the NPU? See this file's top doc comment on what a
+/// failure here would/wouldn't tell us.
 #[test]
 #[ignore = "needs the real NPU device -- cross-compile for aarch64, copy to the board, run there"]
-fn conv_with_add_completes() {
-    let out = run_uniform_conv_with_add_scaled(0, 0, 64, 1.0, 2);
-    eprintln!("conv_with_add_completes: output={out:?}");
+fn conv_then_add_completes() {
+    let out = run_conv_then_add(1.0, 1.0, 1.0, 2);
+    eprintln!("conv_then_add_completes: output={out:?}");
 }
 
-/// Real numeric check, unlike `conv_with_add_completes` above:
-/// `weight_fill=0x81` decodes to a real weight of `+1` (`weights_zero_
-/// point=0x80` in `conv_shape()`), so the 1x1-kernel, single-channel
-/// conv stage computes `x_real * 1 = x_real` exactly, not some
-/// arbitrary scaled/negated value -- the only thing left to produce a
-/// non-identity result is the EW add itself. Holds `y_fill` fixed at
-/// `128` (real `0`) and sweeps `x_fill` through moderate values
-/// symmetric around the `128` zero point (avoiding the `-128` extreme
-/// `conv_with_add_completes` used, which saturates/wraps differently)
-/// -- if the EW unit is really adding `y_real` (here `0`) to the conv's
-/// real accumulator (`x_real`), output should track `x_fill` 1:1 and
-/// come out strictly increasing across the sweep.
-///
-/// **FAILS on real hardware, but NOT because of `AddTensor`**: confirmed
-/// via `conv_plain_identity_tracks_x` (same identity weight/sweep,
-/// plain `build_conv_regcmd`, no `AddTensor` at all) that a real-
-/// weight-of-exactly-1 conv accumulator has a pre-existing precision/
-/// rounding bug of its own -- unrelated to element-wise add, and NOT
-/// something this session's changes caused (see that test's own doc
-/// comment and `rknpu-spelunking/NOTES.md`'s "Elementwise tensor-tensor
-/// ops" section). This test is left failing/`#[ignore]`d rather than
-/// deleted or weakened -- it's a real, valid code path (nonzero
-/// accumulator + EW add together) worth revisiting once the conv-side
-/// bug is fixed, just not diagnostic for `AddTensor` on its own.
-/// `conv_with_add_tracks_y_alone` below is the reliable check for that
-/// (holds the accumulator at a clean `0` via `weight_real=0`, sidestepping
-/// this bug entirely) -- it passes bit-exact.
+/// Real numeric check: `weight_fill=1.0` makes the 1x1-kernel,
+/// single-channel conv stage compute `x * 1 = x` exactly, so the only
+/// thing left to produce a non-identity result is the add itself. Holds
+/// `w_fill` (the second tensor) fixed at `0.0` and sweeps `x_fill` -- if
+/// the add really adds `w_real` (here `0`) to the conv's real output
+/// (`x_real`), output should track `x_fill` 1:1 and come out strictly
+/// increasing across the sweep.
 #[test]
 #[ignore = "needs the real NPU device -- cross-compile for aarch64, copy to the board, run there"]
-fn conv_with_add_tracks_x_plus_y() {
-    let fills = [118u8, 121, 124, 127, 128, 129, 132, 135, 138];
-    let mut prev: Option<u8> = None;
+fn conv_then_add_tracks_x_plus_y() {
+    let fills = [-6.0f32, -4.0, -2.0, -1.0, 0.0, 1.0, 2.0, 4.0, 6.0];
+    let mut prev: Option<f32> = None;
 
     for x_fill in fills {
-        let raw = run_uniform_conv_with_add_scaled(x_fill, 128, 0x81, 1.0, 2)[0];
+        let raw = run_conv_then_add(x_fill, 1.0, 0.0, 2)[0];
+        eprintln!("conv_then_add_tracks_x_plus_y: x_fill={x_fill}: output={raw}");
+
+        if let Some(prev_raw) = prev {
+            assert!(
+                raw > prev_raw,
+                "conv-then-add output is not strictly increasing over the x_fill sweep: \
+                 previous={prev_raw}, current={raw}, x_fill={x_fill}"
+            );
+        }
+        prev = Some(raw);
+    }
+}
+
+/// Isolation test: `weight_fill=0.0` holds the conv accumulator at a clean
+/// real `0` regardless of `x_fill` (held constant here), so the add's own
+/// output should track `w_fill` 1:1, independent of the conv stage's own
+/// math -- the fp16 analog of `conv_with_add_hw.rs`'s old
+/// `conv_with_add_tracks_y_alone`, which passed bit-exact for the
+/// (now-retired) single-task int8 shape.
+#[test]
+#[ignore = "needs the real NPU device -- cross-compile for aarch64, copy to the board, run there"]
+fn conv_then_add_tracks_w_alone() {
+    let fills = [-6.0f32, -4.0, -2.0, -1.0, 0.0, 1.0, 2.0, 4.0, 6.0];
+    let mut prev: Option<f32> = None;
+
+    for w_fill in fills {
+        let raw = run_conv_then_add(1.0, 0.0, w_fill, 2)[0];
         eprintln!(
-            "conv_with_add_tracks_x_plus_y: x_fill={x_fill} (real={}) y_fill=128 (real=0): raw={raw} (real={})",
-            x_fill as i32 - 0x80,
-            raw as i32 - 0x80
+            "conv_then_add_tracks_w_alone: w_fill={w_fill} (accumulator held at 0): output={raw}"
         );
 
         if let Some(prev_raw) = prev {
             assert!(
                 raw > prev_raw,
-                "conv-with-add output is not strictly increasing over the x_fill sweep: \
-                 previous_raw={prev_raw}, current_raw={raw}, x_fill={x_fill}"
+                "conv-then-add output is not strictly increasing over the w_fill sweep \
+                 (accumulator held at 0 via weight_fill=0): previous={prev_raw}, current={raw}, \
+                 w_fill={w_fill}"
             );
         }
         prev = Some(raw);
     }
 }
 
-/// Isolation test: same shape, same identity weight (`weight_fill=
-/// 0x81`), same `x_fill` sweep as `conv_with_add_tracks_x_plus_y`
-/// above, but through the plain, already-hardware-validated
-/// `build_conv_regcmd` -- NO `AddTensor` fusion at all. Added after
-/// `conv_with_add_tracks_x_plus_y` FAILED on real hardware (`x_fill=118`
-/// and `x_fill=121`, real accumulator values `-10` and `-7`, both came
-/// back as the same `raw=127`) -- this test's only purpose is figuring
-/// out whether that flatness lives in the shared conv/out_cvt path
-/// every builder in this module reuses, or specifically in the new
-/// EW-add wiring: if a PLAIN conv (no EW fusion) also comes back flat
-/// for these fills, the bug predates this session's changes entirely;
-/// if it correctly tracks `x_fill`, the bug is in `AddTensor`'s own
-/// register wiring.
-fn run_uniform_conv_plain(x_fill: u8, weight_fill: u8) -> Vec<u8> {
-    let file = OpenOptions::new()
-        .read(true)
-        .write(true)
-        .open(DEVICE_PATH)
-        .expect("failed to open NPU device");
-    let fd = file.as_raw_fd();
-
-    unsafe {
-        let buf_x = Buffer::new(fd, TENSOR_SIZE, &file);
-        ptr::write_bytes(buf_x.host_ptr, x_fill, TENSOR_SIZE);
-
-        let buf_w = Buffer::new(fd, TENSOR_SIZE, &file);
-        ptr::write_bytes(buf_w.host_ptr, weight_fill, TENSOR_SIZE);
-
-        let buf_bias = Buffer::new(fd, TENSOR_SIZE, &file);
-        ptr::write_bytes(buf_bias.host_ptr, 0, TENSOR_SIZE);
-
-        let buf_out = Buffer::new(fd, TENSOR_SIZE, &file);
-        ptr::write_bytes(buf_out.host_ptr, 0, TENSOR_SIZE);
-
-        let bufs = ConvBuffers {
-            input_addr: buf_x.dma_address,
-            weights_addr: buf_w.dma_address,
-            bias_addr: buf_bias.dma_address,
-            output_addr: buf_out.dma_address,
-        };
-        let cmds = build_conv_regcmd(&conv_shape(), &bufs);
-
-        let cmd_bytes = cmds.len() * mem::size_of::<u64>();
-        let cmd_len = cmd_bytes.next_multiple_of(4096);
-        let buf_cmd = Buffer::new(fd, cmd_len, &file);
-        let cmd_slice = std::slice::from_raw_parts_mut(buf_cmd.host_ptr as *mut u64, cmds.len());
-        for (i, c) in cmds.iter().enumerate() {
-            cmd_slice[i] = c.0;
-        }
-
-        fini_bo(fd, buf_x.handle).ok();
-        fini_bo(fd, buf_w.handle).ok();
-        fini_bo(fd, buf_bias.handle).ok();
-        fini_bo(fd, buf_out.handle).ok();
-        fini_bo(fd, buf_cmd.handle).ok();
-
-        let in_handles = [buf_cmd.handle, buf_x.handle, buf_w.handle, buf_bias.handle];
-        let out_handles = [buf_out.handle];
-
-        submit(
-            fd,
-            buf_cmd.dma_address,
-            cmds.len() as u32,
-            &in_handles,
-            &out_handles,
-        )
-        .expect("SUBMIT ioctl failed");
-
-        prep_bo(fd, buf_out.handle, 2_000_000_000).unwrap_or_else(|e| {
-            panic!("plain conv job did not complete within timeout (x_fill={x_fill}): {e}")
-        });
-
-        let raw = std::slice::from_raw_parts(buf_out.host_ptr, 256);
-        (0..16).map(|i| raw[i * 16]).collect()
-    }
-}
-
+/// Subtraction, via `algo=4` -- the TRM's real, distinct Minus opcode. The
+/// conv+add sweep found fp16 subtraction always uses this opcode directly
+/// (unlike int8, which reuses `algo=2` with a negated scale -- see
+/// `EwAddShape::algo`'s doc comment), so this is the fp16-correct way to
+/// test subtraction, not a scaled Add. Same weight=0 isolation as
+/// `conv_then_add_tracks_w_alone`: accumulator held at `0`, so output
+/// should track `-w_fill` (`0 - w_real`) as `w_fill` increases --
+/// non-increasing across the sweep.
 #[test]
 #[ignore = "needs the real NPU device -- cross-compile for aarch64, copy to the board, run there"]
-fn conv_plain_identity_tracks_x() {
-    let fills = [118u8, 121, 124, 127, 128, 129, 132, 135, 138];
+fn conv_then_sub_tracks_neg_w() {
+    let fills = [-6.0f32, -4.0, -2.0, -1.0, 0.0, 1.0, 2.0, 4.0, 6.0];
+    let mut prev: Option<f32> = None;
 
-    for x_fill in fills {
-        let raw = run_uniform_conv_plain(x_fill, 0x81)[0];
+    for w_fill in fills {
+        let raw = run_conv_then_add(1.0, 0.0, w_fill, 4)[0];
         eprintln!(
-            "conv_plain_identity_tracks_x: x_fill={x_fill} (real={}): raw={raw} (real={})",
-            x_fill as i32 - 0x80,
-            raw as i32 - 0x80
-        );
-    }
-}
-
-/// Isolates the EW-add path from the (now separately, pre-existingly
-/// broken -- see `conv_plain_identity_tracks_x`'s real hardware result
-/// and this file's top doc comment) conv accumulator/`out_cvt` math
-/// entirely: `weight_fill=0x80` decodes to a REAL weight of exactly
-/// `0` (`weights_zero_point=0x80`), so the conv accumulator is
-/// `x_real * 0 = 0` regardless of `x_fill` -- `x_fill` genuinely
-/// doesn't matter here and is held constant. If the EW unit really
-/// adds `y_real` to a `0` accumulator, output should track `y_fill`
-/// 1:1, independent of whatever precision issue affects nonzero
-/// accumulator values.
-///
-/// **PASSES bit-exact on real hardware** (2026-07-22): `raw == y_fill`
-/// (equivalently `real_output == y_real`) for every point in the sweep
-/// (`y_fill` 118,121,124,127,128,129,132,135,138 -> `raw` identical to
-/// each, i.e. real -10,-7,-4,-1,0,1,4,7,10 reproduced exactly). This is
-/// the confirming numeric result for `AddTensor`/`build_conv_with_add_
-/// regcmd`'s EW-add wiring -- the register recipe (`EW_CFG`, `ERDMA_
-/// CFG`, `EW_BASE_ADDR`, `EW_CVT_OFFSET_VALUE`, `EW_CVT_SCALE_VALUE`)
-/// is correct, not just non-hanging. Combined with `conv_with_add_
-/// completes`, the single-fused-task shape (vs. the 3-task chain the
-/// one captured model used) is now validated end-to-end for this
-/// `weight_real=0` case; the conv-side precision bug affecting nonzero
-/// accumulators remains a separate, open issue (see
-/// `conv_plain_identity_tracks_x`).
-#[test]
-#[ignore = "needs the real NPU device -- cross-compile for aarch64, copy to the board, run there"]
-fn conv_with_add_tracks_y_alone() {
-    let fills = [118u8, 121, 124, 127, 128, 129, 132, 135, 138];
-    let mut prev: Option<u8> = None;
-
-    for y_fill in fills {
-        let raw = run_uniform_conv_with_add_scaled(128, y_fill, 0x80, 1.0, 2)[0];
-        eprintln!(
-            "conv_with_add_tracks_y_alone: x_fill=128 (real=0, weight_real=0) y_fill={y_fill} (real={}): raw={raw} (real={})",
-            y_fill as i32 - 0x80,
-            raw as i32 - 0x80
+            "conv_then_sub_tracks_neg_w: w_fill={w_fill} (accumulator held at 0): output={raw}"
         );
 
         if let Some(prev_raw) = prev {
             assert!(
-                raw > prev_raw,
-                "conv-with-add output is not strictly increasing over the y_fill sweep \
-                 (accumulator held at 0 via weight_real=0): previous_raw={prev_raw}, \
-                 current_raw={raw}, y_fill={y_fill}"
+                raw < prev_raw,
+                "conv-then-sub output is not strictly decreasing over the w_fill sweep \
+                 (accumulator held at 0 via weight_fill=0): previous={prev_raw}, current={raw}, \
+                 w_fill={w_fill}"
             );
         }
         prev = Some(raw);
     }
-}
-
-/// Subtraction, via the same `AddTensor`/`build_conv_with_add_regcmd`
-/// with `scale=-1.0` -- see `AddTensor`'s own doc comment (a static
-/// decode of a standalone `x - y` model showed the real vendor compiler
-/// implements subtract as this exact Add-fusion path with a negated
-/// scale, not a different `ew_alu_algo`). Same weight=0 isolation
-/// trick as `conv_with_add_tracks_y_alone`: accumulator held at a clean
-/// `0` via `weight_fill=0x80` (real weight `0`), so output should track
-/// `-y_real` (i.e. `0 - y_real`) as `y_fill` increases -- non-increasing
-/// (see below for why not strictly), the mirror image of the addition
-/// case.
-///
-/// Confirmed on real hardware (2026-07-22): bit-exact for 6 of 7
-/// nonzero points (`y_fill` 118,121,124,127,129 -> `raw` exactly
-/// `10,7,4,1,-1` in real terms, i.e. exactly `-y_real`) -- but
-/// `y_fill=128` (real `y=0`, expected real output `0`) came back real
-/// `-1` instead, landing on the SAME `raw` as `y_fill=129`'s (real
-/// `-1`) rather than one step above it. A single off-by-one exactly at
-/// the zero crossing, not a broken mechanism -- consistent with an
-/// asymmetric-rounding artifact in the hardware's fixed-point multiply/
-/// shift for a negative scale (unsurprising right at a sign boundary;
-/// `conv_with_add_tracks_y_alone`'s positive-scale case had no such
-/// issue at any point in its sweep, zero included). Loosened this
-/// assertion from strict to non-strict monotonicity for exactly this
-/// reason -- matches this repo's own established convention
-/// (`conv_then_lut_hw.rs`'s sigmoid monotonicity check is non-strict
-/// too), tightened too far in the first version of this test.
-#[test]
-#[ignore = "needs the real NPU device -- cross-compile for aarch64, copy to the board, run there"]
-fn conv_with_sub_tracks_neg_y() {
-    let fills = [118u8, 121, 124, 127, 128, 129, 132, 135, 138];
-    let mut prev: Option<u8> = None;
-
-    for y_fill in fills {
-        let raw = run_uniform_conv_with_add_scaled(128, y_fill, 0x80, -1.0, 2)[0];
-        eprintln!(
-            "conv_with_sub_tracks_neg_y: x_fill=128 (real=0, weight_real=0) y_fill={y_fill} (real={}): raw={raw} (real={})",
-            y_fill as i32 - 0x80,
-            raw as i32 - 0x80
-        );
-
-        if let Some(prev_raw) = prev {
-            assert!(
-                raw <= prev_raw,
-                "conv-with-sub output is not non-increasing over the y_fill sweep \
-                 (accumulator held at 0 via weight_real=0): previous_raw={prev_raw}, \
-                 current_raw={raw}, y_fill={y_fill}"
-            );
-        }
-        prev = Some(raw);
-    }
-}
-
-/// Most basic possible check for Div (`algo=3`): does the EW unit even
-/// accept this opcode without hanging the NPU? Same `weight_fill=64`
-/// convention as `conv_with_add_completes` -- see that test's own doc
-/// comment for why this alone doesn't confirm correctness, only that
-/// the job runs. **No compiled model was ever observed emitting
-/// `ew_alu_algo=3`** -- a standalone `x / y` ONNX export compiled with
-/// no active EW/BN/BS-mul dispatch anywhere in the file at all (see
-/// `AddTensor::algo`'s doc comment and `rknpu-spelunking/NOTES.md`) --
-/// so this is a genuine first hardware experiment driving a TRM-
-/// documented opcode directly, not confirming a real vendor-compiled
-/// recipe the way `algo=2` (Add) was.
-#[test]
-#[ignore = "needs the real NPU device -- cross-compile for aarch64, copy to the board, run there"]
-fn conv_with_div_completes() {
-    let out = run_uniform_conv_with_add_scaled(0, 0, 64, 1.0, 3);
-    eprintln!("conv_with_div_completes: output={out:?}");
-}
-
-/// Numeric check for Div, same `weight_fill=0x80` (real weight `0`,
-/// accumulator held at a clean `0`) isolation trick as `conv_with_add_
-/// tracks_y_alone`/`conv_with_sub_tracks_neg_y`. Originally asserted
-/// `0 / y_real == 0` for every nonzero `y_fill` (if `algo=3` divides
-/// the accumulator BY `y`) -- **that assertion was wrong and panicked
-/// on the very first point** (`y_fill=118`, real `-10`, came back real
-/// `-128` -- saturated at the int8 floor, not `0`). Real `-128` for a
-/// NEGATIVE `y` is exactly what you'd expect from computing `y /
-/// accumulator` = `-10 / 0`, saturating toward negative infinity --
-/// i.e. the operand ORDER may be backwards from what `Add`/`Sub`'s
-/// `src`(primary)/`ew`(fused operand) roles would suggest. Rewritten to
-/// collect and print the WHOLE sweep before drawing any conclusion,
-/// rather than aborting on the first surprising point -- if the `y /
-/// accumulator` hypothesis is right, POSITIVE `y_fill` values should
-/// saturate the OTHER direction (real `127`, the int8 ceiling), and
-/// `y_fill=128` (`y_real=0`, i.e. `0/0`) is the genuine wildcard, left
-/// unasserted either way.
-#[test]
-#[ignore = "needs the real NPU device -- cross-compile for aarch64, copy to the board, run there"]
-fn conv_with_div_zero_over_y() {
-    let fills = [118u8, 121, 124, 127, 128, 129, 132, 135, 138];
-    let mut results = Vec::new();
-
-    for y_fill in fills {
-        let raw = run_uniform_conv_with_add_scaled(128, y_fill, 0x80, 1.0, 3)[0];
-        eprintln!(
-            "conv_with_div_zero_over_y: x_fill=128 (real=0, weight_real=0) y_fill={y_fill} (real={}): raw={raw} (real={})",
-            y_fill as i32 - 0x80,
-            raw as i32 - 0x80
-        );
-        results.push((y_fill, raw));
-    }
-
-    eprintln!("conv_with_div_zero_over_y: full sweep = {results:?}");
 }

@@ -10,6 +10,7 @@ pub mod pc;
 pub mod ppu;
 pub mod ppu_rdma;
 pub mod sdma;
+pub mod values;
 
 // Domain IDs for the 64-bit RegCmd packing (bits 48-63).
 //

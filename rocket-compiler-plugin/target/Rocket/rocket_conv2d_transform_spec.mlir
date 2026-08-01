@@ -2,9 +2,10 @@
 // specialization. The matchers below use ConvolutionOpInterface to inspect
 // element types, dimensions, stride, and dilation without spelling complete
 // tensor types in a DAG. Known static MobileNet shapes retain their dedicated
-// executables. The final 1x1 fallback uses the runtime-dimension ABI and a
-// cast-compatible dynamic helper, allowing input/output spatial and channel
-// dimensions to remain unknown until dispatch. Batch remains statically one.
+// executables. The 1x1 and 3x3 fallbacks use the runtime-dimension ABI and a
+// cast-compatible dynamic helper, allowing input/output spatial dimensions to
+// remain unknown until dispatch. Batch remains statically one, and channel
+// counts must be statically bounded by the hardware's 512 limit.
 
 #rocket_target_0 = #hal.executable.target<"rocket", "rocket-flatbuffer-v1", {
   kernel = "conv2d",
@@ -56,10 +57,13 @@
   truncate_bits = 0 : i32,
   activation = "none", activation_cmp = 0 : i32,
   precision = "fp16",
+  // The six settable dimensions. output_width/output_height are absent
+  // because the runtime always derives them from these plus stride and
+  // padding -- their wire values are retired, see
+  // rocket-schema/schema/rocket_executable_def.fbs.
   runtime_dimensions = [
     "input_width", "input_height", "input_channels",
-    "output_width", "output_height", "output_channels",
-    "weights_width", "weights_height"
+    "output_channels", "weights_width", "weights_height"
   ]
 }>
 
@@ -70,7 +74,7 @@
   #hal.pipeline.binding<storage_buffer>
 ]>
 
-#dynamic_pipeline_layout = #hal.pipeline.layout<constants = 8, bindings = [
+#dynamic_pipeline_layout = #hal.pipeline.layout<constants = 6, bindings = [
   #hal.pipeline.binding<storage_buffer, ReadOnly>,
   #hal.pipeline.binding<storage_buffer, ReadOnly>,
   #hal.pipeline.binding<storage_buffer, ReadOnly>,
@@ -154,11 +158,12 @@ module attributes {transform.with_named_sequence} {
     %output_width = tensor.dim %init, %c2 : tensor<1x?x?x?xf32>
     %output_channels = tensor.dim %init, %c3 : tensor<1x?x?x?xf32>
 
+    // %output_height/%output_width stay index-typed: they still describe the
+    // dispatch result shape, but they are not push constants -- the runtime
+    // derives the output extent itself.
     %input_width_i32 = arith.index_cast %input_width : index to i32
     %input_height_i32 = arith.index_cast %input_height : index to i32
     %input_channels_i32 = arith.index_cast %input_channels : index to i32
-    %output_width_i32 = arith.index_cast %output_width : index to i32
-    %output_height_i32 = arith.index_cast %output_height : index to i32
     %output_channels_i32 = arith.index_cast %output_channels : index to i32
     %weights_width_i32 = arith.index_cast %weights_width : index to i32
     %weights_height_i32 = arith.index_cast %weights_height : index to i32
@@ -171,11 +176,10 @@ module attributes {transform.with_named_sequence} {
     %raw_f16 = flow.dispatch
         @rocket_dynamic_executable::@rocket_dynamic_conv2d_v1::@rocket_dynamic_conv2d(
           %input_width_i32, %input_height_i32, %input_channels_i32,
-          %output_width_i32, %output_height_i32, %output_channels_i32,
-          %weights_width_i32, %weights_height_i32,
+          %output_channels_i32, %weights_width_i32, %weights_height_i32,
           %input, %filter, %zero_bias)
         {stream.affinity = #hal.device.affinity<@rocket_device>}
-        : (i32, i32, i32, i32, i32, i32, i32, i32,
+        : (i32, i32, i32, i32, i32, i32,
            tensor<1x?x?x?xf16>{%input_height, %input_width, %input_channels},
            tensor<?x?x?x?xf16>{%weights_height, %weights_width, %input_channels, %output_channels},
            tensor<?xf16>{%output_channels})
@@ -584,6 +588,58 @@ module attributes {transform.with_named_sequence} {
     transform.iree.match.dims_equal %depth, [] : !transform.param<i64>
     transform.iree.match.dims_equal %strides, [1, 1] : !transform.param<i64>
     transform.iree.match.dims_equal %dilations, [1, 1] : !transform.param<i64>
+
+    // Both channel counts must provably fit the hardware. 512 is
+    // MAX_INPUT_CHANNELS/MAX_OUTPUT_CHANNELS in iree-rocket-hal's conv.rs --
+    // the range the capture corpus covers and the 14-bit weight_kernels
+    // field encodes. conv::Shape enforces the same bound at dispatch, but
+    // there it is a hard INVALID_ARGUMENT with no CPU fallback, so a
+    // convolution that cannot be shown to fit must not be claimed here in
+    // the first place. Channel counts the compiler cannot bound (genuinely
+    // dynamic, not merely non-literal) therefore stay on the CPU. The input
+    // handle's dim 3 is Cin; the filter's dim 3 is Cout.
+    %input_value = transform.get_operand %root[0] : (!transform.any_op) -> !transform.any_value
+    %filter_value = transform.get_operand %root[1] : (!transform.any_op) -> !transform.any_value
+    transform.iree.match.dim_bounds %input_value[3], umin = 1, umax = 512 : !transform.any_value
+    transform.iree.match.dim_bounds %filter_value[3], umin = 1, umax = 512 : !transform.any_value
+    transform.yield %root : !transform.any_op
+  }
+
+  // The same fallback for 3x3, which the hardware handles natively: ConvPlan
+  // routes kernel extents 1 and 3 through the identical demand-based CBUF
+  // partition, with none of the fp16/stride-1 restrictions the odd kernels
+  // above 3x3 carry (see conv.rs's assert_large_kernel_plan_case, which
+  // starts at 5). conv_kernel_shape_hw covers the extent on real hardware in
+  // both precisions.
+  //
+  // Spelled as its own matcher rather than widening the filter check to a
+  // 1..=3 bound: that bound would also silently claim 2x2 and the non-square
+  // combinations, which route through different ConvPlan partitions. The two
+  // claimed extents stay auditable this way.
+  //
+  // Padding needs no handling here. The Rocket executable applies none, and
+  // an ONNX conv with pads lowers to an explicit tensor.pad feeding a valid
+  // convolution, so the input this sees is already padded and the runtime's
+  // derived output extent is the right one.
+  transform.named_sequence @match_dynamic_conv2d_3x3(%root: !transform.any_op {transform.readonly}) -> !transform.any_op {
+    transform.match.operation_name %root ["linalg.conv_2d_nhwc_hwcf"] : !transform.any_op
+    %batch, %out_img, %out_ch, %filter, %in_ch, %depth, %strides, %dilations =
+        transform.iree.match.convolution %root,
+          lhs_type = f16, rhs_type = f16, output_type = f32
+          : !transform.any_op -> !transform.param<i64>
+    transform.iree.match.dims_equal %batch, [1] : !transform.param<i64>
+    transform.iree.match.dims_equal %out_img, [-1, -1] : !transform.param<i64>
+    transform.iree.match.dims_equal %out_ch, [-1] : !transform.param<i64>
+    transform.iree.match.dims_equal %filter, [3, 3] : !transform.param<i64>
+    transform.iree.match.dims_equal %in_ch, [-1] : !transform.param<i64>
+    transform.iree.match.dims_equal %depth, [] : !transform.param<i64>
+    transform.iree.match.dims_equal %strides, [1, 1] : !transform.param<i64>
+    transform.iree.match.dims_equal %dilations, [1, 1] : !transform.param<i64>
+
+    %input_value = transform.get_operand %root[0] : (!transform.any_op) -> !transform.any_value
+    %filter_value = transform.get_operand %root[1] : (!transform.any_op) -> !transform.any_value
+    transform.iree.match.dim_bounds %input_value[3], umin = 1, umax = 512 : !transform.any_value
+    transform.iree.match.dim_bounds %filter_value[3], umin = 1, umax = 512 : !transform.any_value
     transform.yield %root : !transform.any_op
   }
 
@@ -624,7 +680,8 @@ module attributes {transform.with_named_sequence} {
             @match_conv2d_0 -> @cast_and_call_conv2d_0,
             @match_conv2d_1 -> @cast_and_call_conv2d_1,
             @match_conv2d_2 -> @cast_and_call_conv2d_2,
-            @match_dynamic_conv2d -> @cast_and_call_dynamic_conv2d
+            @match_dynamic_conv2d -> @cast_and_call_dynamic_conv2d,
+            @match_dynamic_conv2d_3x3 -> @cast_and_call_dynamic_conv2d
           : (!transform.any_op) -> (!transform.any_op)
     }
     transform.apply_dce to %module : !transform.any_op

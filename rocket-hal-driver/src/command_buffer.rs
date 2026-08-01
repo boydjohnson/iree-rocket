@@ -75,11 +75,10 @@ use crate::{
 };
 use iree_rocket_hal::rocket::{
     builders::RegCmd,
+    conv::{Buffers, ConvPlan, FeatureLayout, Precision},
     device::Buffer as RocketDeviceBuffer,
-    regcmd::{
-        ConvBuffers, FC_PHYSICAL_HEIGHT, FcBuffers, PoolingBuffers, Precision,
-        build_conv_regcmd_tasks, build_fc_regcmd, build_pooling_regcmd, conv_output_scratch_bytes,
-    },
+    fc,
+    pooling::{PoolingBuffers, PoolingPlan},
     tensor_layout::{
         nc1hwc2_storage_size, pack_hwcf_to_rocket_weights, pack_nhwc_to_nc1hwc2_padded,
         rocket_weight_storage_size,
@@ -137,8 +136,8 @@ pub struct WeightPacking {
 
 /// Bridges the RK3588 DPU's atomic-slot output write-back (16-byte-aligned
 /// slots regardless of dtype, `FEATURE_ATOMIC_SIZE=16`) to IREE's densely-
-/// packed ABI output buffer -- see `iree-rocket-hal/src/rocket/regcmd.rs`'s
-/// `conv_output_scratch_bytes` doc comment and the "Conv2d output
+/// packed ABI output buffer -- see `iree-rocket-hal/src/rocket/conv.rs`'s
+/// `Shape::output_scratch_bytes` doc comment and the "Conv2d output
 /// compaction" investigation this fixes. `dispatch()` points the regcmd at
 /// a driver-private scratch buffer instead of the real output buffer;
 /// `queue_execute`, after its existing post-dispatch `prep_bo` wait
@@ -189,9 +188,10 @@ pub enum RecordedOp {
         /// Previously only the regcmd program's own GEM buffer was listed
         /// there, which happened to let SUBMIT/PREP_BO round-trip (proving
         /// the ioctl plumbing itself worked) but never told the kernel
-        /// about the real input/weight/bias/output BOs at all -- see
-        /// `conv_hw.rs` in iree-rocket-hal for the hand-rolled ioctl call
-        /// that always did this correctly.
+        /// about the real input/weight/bias/output BOs at all -- see any
+        /// hand-rolled hardware test in iree-rocket-hal's `tests/`
+        /// directory (e.g. `conv_phase1_validation_hw.rs`) for the ioctl
+        /// call shape that always did this correctly.
         in_bo_handles: Vec<u32>,
         /// GEM handles of every buffer this dispatch writes.
         out_bo_handles: Vec<u32>,
@@ -831,8 +831,8 @@ unsafe extern "C" fn dispatch(
     // placeholder.
     match shape {
         UkernelShape::Conv2d(executable) => {
-            let resolved_shape = match executable.resolve_shape(constants) {
-                Ok(shape) => shape,
+            let (resolved_shape, kernels) = match executable.resolve_shape(constants) {
+                Ok(resolved) => resolved,
                 Err(_) => {
                     return status::from_code(
                         crate::bindings::iree_status_code_e_IREE_STATUS_INVALID_ARGUMENT,
@@ -845,12 +845,12 @@ unsafe extern "C" fn dispatch(
                     crate::bindings::iree_status_code_e_IREE_STATUS_INVALID_ARGUMENT,
                 );
             }
-            let pixel_count = shape.input_width as usize * shape.input_height as usize;
+            let pixel_count = shape.width as usize * shape.height as usize;
             let input_bytes_per_pixel =
-                shape.input_channels as usize * shape.precision.bytes_per_element() as usize;
-            let packed_input_bytes_per_pixel = shape.input_channels.max(16).next_multiple_of(16)
+                shape.in_channels as usize * shape.precision.element_bytes() as usize;
+            let packed_input_bytes_per_pixel = shape.in_channels.max(16).next_multiple_of(16)
                 as usize
-                * shape.precision.bytes_per_element() as usize;
+                * shape.precision.element_bytes() as usize;
             if !matches!(
                 pixel_count.checked_mul(input_bytes_per_pixel),
                 Some(value) if value as u64 <= refs[0].length as u64
@@ -860,61 +860,62 @@ unsafe extern "C" fn dispatch(
                 );
             }
 
-            // CNA's multi-channel DMA path consumes 16-byte feature-atomic
-            // NC1HWC2 surfaces. Keep input_channels==1 on its existing
-            // direct path: that register path explicitly enables
-            // nonalign_dma and has separate hardware behavior.
-            let (input_addr, input_handle, input_packing) = if shape.input_channels > 1 {
-                let scratch_bytes =
-                    match nc1hwc2_storage_size(pixel_count, packed_input_bytes_per_pixel) {
-                        Ok(value) => value,
-                        Err(_) => {
-                            return status::from_code(
+            // CNA's surface-layout path consumes 16-byte feature-atomic
+            // NC1HWC2 surfaces. Shapes with 1..=4 channels use the hardware's
+            // dense ARGB modes and must remain dense; packing Cin 2..=4 into
+            // 16-byte slots makes those modes read padding as later pixels.
+            let (input_addr, input_handle, input_packing) =
+                if shape.layout() == FeatureLayout::Surfaces {
+                    let scratch_bytes =
+                        match nc1hwc2_storage_size(pixel_count, packed_input_bytes_per_pixel) {
+                            Ok(value) => value,
+                            Err(_) => {
+                                return status::from_code(
                                 crate::bindings::iree_status_code_e_IREE_STATUS_INVALID_ARGUMENT,
                             );
-                        }
+                            }
+                        };
+                    let scratch = unsafe {
+                        RocketDeviceBuffer::new(
+                            cb.fd,
+                            scratch_bytes.max(1),
+                            BorrowedFd::borrow_raw(cb.fd),
+                        )
                     };
-                let scratch = unsafe {
-                    RocketDeviceBuffer::new(
-                        cb.fd,
-                        scratch_bytes.max(1),
-                        BorrowedFd::borrow_raw(cb.fd),
+                    (
+                        scratch.dma_address,
+                        scratch.handle,
+                        Some(InputPacking {
+                            input_buffer: refs[0].buffer,
+                            input_offset: refs[0].offset,
+                            input_length: refs[0].length,
+                            scratch_ptr: scratch.host_ptr,
+                            scratch_length: scratch_bytes,
+                            scratch_handle: scratch.handle,
+                            source_pixel_count: pixel_count,
+                            packed_pixel_count: pixel_count,
+                            bytes_per_pixel: input_bytes_per_pixel,
+                            packed_bytes_per_pixel: packed_input_bytes_per_pixel,
+                            padding_byte: 0,
+                            layout: InputPackingLayout::Nc1hwc2,
+                        }),
                     )
+                } else {
+                    (addr(&refs[0]), handle(&refs[0]), None)
                 };
-                (
-                    scratch.dma_address,
-                    scratch.handle,
-                    Some(InputPacking {
-                        input_buffer: refs[0].buffer,
-                        input_offset: refs[0].offset,
-                        input_length: refs[0].length,
-                        scratch_ptr: scratch.host_ptr,
-                        scratch_length: scratch_bytes,
-                        scratch_handle: scratch.handle,
-                        source_pixel_count: pixel_count,
-                        packed_pixel_count: pixel_count,
-                        bytes_per_pixel: input_bytes_per_pixel,
-                        packed_bytes_per_pixel: packed_input_bytes_per_pixel,
-                        padding_byte: 0,
-                        layout: InputPackingLayout::Nc1hwc2,
-                    }),
-                )
-            } else {
-                (addr(&refs[0]), handle(&refs[0]), None)
-            };
             // IREE's conv ABI supplies a logical HWCF filter. Regular fp16
             // convolution consumes a blocked coefficient stream instead:
             // output-block, input-group, X, Y, output-lane, input-lane.
             // This is independently deferred for the same reason as input
             // packing: an earlier recorded operation may populate weights.
-            let element_size = shape.precision.bytes_per_element() as usize;
+            let element_size = shape.precision.element_bytes() as usize;
             let (weights_addr, weights_handle, weight_packing) =
                 if shape.precision == Precision::Fp16 && !shape.depthwise {
                     if !matches!(
-                        (shape.weights_height as usize)
-                        .checked_mul(shape.weights_width as usize)
-                        .and_then(|value| value.checked_mul(shape.input_channels as usize))
-                        .and_then(|value| value.checked_mul(shape.output_channels as usize))
+                        kernels[0]
+                        .checked_mul(kernels[1])
+                        .and_then(|value| value.checked_mul(shape.in_channels as usize))
+                        .and_then(|value| value.checked_mul(shape.out_channels as usize))
                         .and_then(|value| value.checked_mul(element_size)),
                         Some(value) if value as u64 <= refs[1].length as u64
                     ) {
@@ -923,10 +924,10 @@ unsafe extern "C" fn dispatch(
                         );
                     }
                     let scratch_bytes = match rocket_weight_storage_size(
-                        shape.weights_height as usize,
-                        shape.weights_width as usize,
-                        shape.input_channels as usize,
-                        shape.output_channels as usize,
+                        kernels[0],
+                        kernels[1],
+                        shape.in_channels as usize,
+                        shape.out_channels as usize,
                         element_size,
                     ) {
                         Ok(value) => value,
@@ -953,10 +954,10 @@ unsafe extern "C" fn dispatch(
                             scratch_ptr: scratch.host_ptr,
                             scratch_length: scratch_bytes,
                             scratch_handle: scratch.handle,
-                            filter_height: shape.weights_height as usize,
-                            filter_width: shape.weights_width as usize,
-                            input_channels: shape.input_channels as usize,
-                            output_channels: shape.output_channels as usize,
+                            filter_height: kernels[0],
+                            filter_width: kernels[1],
+                            input_channels: shape.in_channels as usize,
+                            output_channels: shape.out_channels as usize,
                             element_size,
                         }),
                     )
@@ -970,28 +971,27 @@ unsafe extern "C" fn dispatch(
             // writes there instead of the real output buffer, and
             // `queue_execute` compacts the real values into the real
             // buffer after the hardware write completes.
-            let scratch_bytes = conv_output_scratch_bytes(shape).max(1);
+            let scratch_bytes = shape.output_scratch_bytes(kernels).max(1);
             let scratch = unsafe {
                 RocketDeviceBuffer::new(cb.fd, scratch_bytes, BorrowedFd::borrow_raw(cb.fd))
             };
-            let bufs = ConvBuffers {
-                input_addr,
-                weights_addr,
-                bias_addr: addr(&refs[2]),
-                output_addr: scratch.dma_address,
+            let bufs = Buffers {
+                input: input_addr,
+                weights: weights_addr,
+                bias: addr(&refs[2]),
+                output: scratch.dma_address,
             };
             // catch_unwind backstop -- see module doc comment for exactly
-            // why. The builder only returns fresh local vectors, so a
-            // panic mid-build leaves no shared state half-mutated.
+            // why. `resolve_shape` already trial-plans this exact shape via
+            // `validate_conv_shape` (which shares this same `ConvPlan::new`
+            // call), so a panic here indicates a genuine internal
+            // inconsistency rather than an ordinary user error. The builder
+            // only returns fresh local vectors, so a panic mid-build leaves
+            // no shared state half-mutated.
             let regcmd_tasks = match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                build_conv_regcmd_tasks(shape, &bufs)
+                ConvPlan::new(*shape, kernels).programs_with_buffers(bufs)
             })) {
-                Ok(Ok(tasks)) => tasks,
-                Ok(Err(_)) => {
-                    return status::from_code(
-                        crate::bindings::iree_status_code_e_IREE_STATUS_INVALID_ARGUMENT,
-                    );
-                }
+                Ok(tasks) => tasks,
                 Err(_) => {
                     return status::from_code(
                         crate::bindings::iree_status_code_e_IREE_STATUS_INTERNAL,
@@ -1008,16 +1008,18 @@ unsafe extern "C" fn dispatch(
                 unsafe { crate::bindings::iree_hal_buffer_retain(refs[1].buffer) };
             }
             unsafe { crate::bindings::iree_hal_buffer_retain(refs[3].buffer) };
+            let output_pixel_count =
+                shape.output_width(kernels) as usize * shape.output_height(kernels) as usize;
             let output_compaction = Some(OutputCompaction {
                 output_buffer: refs[3].buffer,
                 output_offset: refs[3].offset,
                 output_length: refs[3].length,
                 scratch_ptr: scratch.host_ptr,
                 scratch_length: scratch_bytes,
-                source_pixel_count: shape.output_width as usize * shape.output_height as usize,
-                output_pixel_count: shape.output_width as usize * shape.output_height as usize,
-                bytes_per_pixel: shape.output_channels as usize
-                    * shape.precision.bytes_per_element() as usize,
+                source_pixel_count: output_pixel_count,
+                output_pixel_count,
+                bytes_per_pixel: shape.out_channels as usize
+                    * shape.precision.element_bytes() as usize,
             });
             cb.ops.push(RecordedOp::Dispatch {
                 regcmd_tasks,
@@ -1043,15 +1045,15 @@ unsafe extern "C" fn dispatch(
             let m = shape.m as usize;
             let k = shape.k as usize;
             let n = shape.n as usize;
-            let element_size = shape.precision.bytes_per_element() as usize;
-            let physical_pixel_count = match m.checked_mul(FC_PHYSICAL_HEIGHT as usize) {
-                Some(value) => value,
-                None => {
-                    return status::from_code(
-                        crate::bindings::iree_status_code_e_IREE_STATUS_INVALID_ARGUMENT,
-                    );
-                }
+            let element_size = shape.precision.element_bytes() as usize;
+            let input_zero_point = match shape.precision {
+                Precision::Fp16 => 0,
+                Precision::Int8(quantization) => quantization.input_zero_point,
             };
+            // fc.rs's real vendor-confirmed lowering has physical height
+            // exactly one -- no `FC_PHYSICAL_HEIGHT` padding, so the
+            // packed pixel count is just the logical row count `m`.
+            let physical_pixel_count = m;
             let input_bytes_per_pixel = match k.checked_mul(element_size) {
                 Some(value) => value,
                 None => {
@@ -1078,18 +1080,17 @@ unsafe extern "C" fn dispatch(
                 || !matches!(weights_len, Some(value) if value as u64 <= refs[1].length as u64)
                 || !matches!(bias_len, Some(value) if value as u64 <= refs[2].length as u64)
                 || !matches!(output_len, Some(value) if value as u64 <= refs[3].length as u64)
-                || (shape.precision == Precision::Int8 && shape.input_zero_point > u8::MAX as u32)
+                || !(0..=u8::MAX as i32).contains(&input_zero_point)
             {
                 return status::from_code(
                     crate::bindings::iree_status_code_e_IREE_STATUS_INVALID_ARGUMENT,
                 );
             }
 
-            // FC is lowered by build_fc_regcmd to a 1x1 convolution with a
-            // fixed physical height of four. The public input contains only
-            // logical row 0, so materialize the remaining three rows in
-            // driver-private storage before applying the same NC1HWC2
-            // channel blocking used by convolution.
+            // FC is lowered by fc::Plan to a height-one 1x1 convolution
+            // (see fc.rs's module doc comment) -- the public input already
+            // is exactly `m` physical rows, so this only needs the same
+            // NC1HWC2 channel blocking used by convolution, no row padding.
             let packed_input_bytes_per_pixel = k.max(16).next_multiple_of(16) * element_size;
             let (input_scratch_bytes, input_layout) = if k > 1 {
                 match nc1hwc2_storage_size(physical_pixel_count, packed_input_bytes_per_pixel) {
@@ -1133,11 +1134,7 @@ unsafe extern "C" fn dispatch(
                 packed_pixel_count: physical_pixel_count,
                 bytes_per_pixel: input_bytes_per_pixel,
                 packed_bytes_per_pixel: packed_input_bytes_per_pixel,
-                padding_byte: if shape.precision == Precision::Int8 {
-                    shape.input_zero_point as u8
-                } else {
-                    0
-                },
+                padding_byte: input_zero_point as u8,
                 layout: input_layout,
             });
 
@@ -1199,19 +1196,19 @@ unsafe extern "C" fn dispatch(
                     BorrowedFd::borrow_raw(cb.fd),
                 )
             };
-            let bufs = FcBuffers {
-                input_addr: input_scratch.dma_address,
-                weights_addr: weight_scratch.dma_address,
-                bias_addr: addr(&refs[2]),
-                output_addr: output_scratch.dma_address,
+            let bufs = Buffers {
+                input: input_scratch.dma_address,
+                weights: weight_scratch.dma_address,
+                bias: addr(&refs[2]),
+                output: output_scratch.dma_address,
             };
             let regcmd_tasks = match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                build_fc_regcmd(shape, &bufs)
+                fc::Plan::new(*shape).programs_with_buffers(bufs)
             })) {
-                Ok(task) => vec![task],
+                Ok(tasks) => tasks,
                 Err(_) => {
                     return status::from_code(
-                        crate::bindings::iree_status_code_e_IREE_STATUS_INVALID_ARGUMENT,
+                        crate::bindings::iree_status_code_e_IREE_STATUS_INTERNAL,
                     );
                 }
             };
@@ -1237,7 +1234,10 @@ unsafe extern "C" fn dispatch(
                     output_length: refs[3].length,
                     scratch_ptr: output_scratch.host_ptr,
                     scratch_length: output_scratch_bytes,
-                    source_pixel_count: physical_pixel_count,
+                    // No row padding to discard (see physical_pixel_count's
+                    // own comment) -- source and output pixel counts are the
+                    // same real `m`.
+                    source_pixel_count: m,
                     output_pixel_count: m,
                     bytes_per_pixel: output_bytes_per_pixel,
                 }),
@@ -1254,14 +1254,14 @@ unsafe extern "C" fn dispatch(
                     crate::bindings::iree_status_code_e_IREE_STATUS_INVALID_ARGUMENT,
                 );
             }
-            // 0=input, 1=output -- no weights/bias for a standalone
-            // pooling op (see iree-rocket-hal's build_pooling_regcmd).
+            // 0=input, 1=output. Every horizontal tile is one direct
+            // PPU/PPU_RDMA task; all tasks belong to this one dispatch/job.
             let bufs = PoolingBuffers {
                 input_addr: addr(&refs[0]),
                 output_addr: addr(&refs[1]),
             };
             cb.ops.push(RecordedOp::Dispatch {
-                regcmd_tasks: vec![build_pooling_regcmd(shape, &bufs)],
+                regcmd_tasks: PoolingPlan::new(*shape).programs_with_buffers(&bufs),
                 in_bo_handles: vec![handle(&refs[0])],
                 out_bo_handles: vec![handle(&refs[1])],
                 input_packing: None,

@@ -1,5 +1,7 @@
+use std::ops::{BitOr, BitOrAssign};
+
 use crate::rocket::{
-    builders::{Bits, Register, RegisterMeta},
+    builders::{Bits, RegCmd, Register, RegisterMeta},
     registers::*,
 };
 
@@ -20,6 +22,92 @@ impl Register<PCOperationEnable> {
     /// Related registers: pc_base_address (pc_sel mode select, pc_src_address fetch address), pc_register_amounts (pc_data_amount), pc_task_con (task_number).
     pub fn op_enable(&mut self, enable: bool) -> &mut Self {
         self.set_flag(unsafe { PC_OPERATION_ENABLE_OP_EN(1) }, enable)
+    }
+}
+
+/// Per-block operation-enable mask carried by the final PC regcmd word.
+///
+/// This mask is distinct from the AHB-side [`PCOperationEnable`] register
+/// builder above. Each bit starts one engine block configured by the
+/// preceding register program.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct PCOperationMask(u32);
+
+impl PCOperationMask {
+    pub const CNA: Self = Self(1 << 0);
+    // Bit 1 has no corresponding engine target.
+    pub const CORE: Self = Self(1 << 2);
+    pub const DPU: Self = Self(1 << 3);
+    pub const DPU_RDMA: Self = Self(1 << 4);
+    pub const PPU: Self = Self(1 << 5);
+    pub const PPU_RDMA: Self = Self(1 << 6);
+
+    pub const CONVOLUTION: Self = Self(Self::CNA.0 | Self::CORE.0 | Self::DPU.0 | Self::DPU_RDMA.0);
+
+    pub const fn bits(self) -> u32 {
+        self.0
+    }
+}
+
+impl BitOr for PCOperationMask {
+    type Output = Self;
+
+    fn bitor(self, rhs: Self) -> Self::Output {
+        Self(self.0 | rhs.0)
+    }
+}
+
+impl BitOrAssign for PCOperationMask {
+    fn bitor_assign(&mut self, rhs: Self) {
+        self.0 |= rhs.0;
+    }
+}
+
+/// Typed constructors for the non-register instruction words in a PC
+/// regcmd trailer.
+///
+/// These words are part of the PC program protocol rather than ordinary
+/// register writes, so they cannot implement [`RegisterMeta`].
+#[derive(Debug, Clone, Copy)]
+pub struct PCTrailer;
+
+impl PCTrailer {
+    /// Placeholder emitted before the trailer of a single-task program.
+    pub fn single_task_placeholder() -> RegCmd {
+        RegCmd::new_raw(0)
+    }
+
+    /// Marker required immediately before the operation-enable instruction.
+    pub fn required_marker() -> RegCmd {
+        RegCmd::new_raw(0x0041_0000_0000_0000)
+    }
+
+    /// Starts exactly the engine blocks selected by `mask`.
+    pub fn operation_enable(mask: PCOperationMask) -> RegCmd {
+        // Domain 0x81 sets the regcmd operation-enable flag while offset
+        // 0x0008 selects PC_OPERATION_ENABLE.
+        RegCmd::new(0x81, REG_PC_OPERATION_ENABLE, mask.bits())
+    }
+
+    /// Zero word used to align a PC register program.
+    pub fn alignment_padding() -> RegCmd {
+        RegCmd::new_raw(0)
+    }
+}
+
+#[cfg(test)]
+mod trailer_tests {
+    use super::*;
+
+    #[test]
+    fn convolution_trailer_matches_vendor_encoding() {
+        assert_eq!(PCTrailer::single_task_placeholder().0, 0);
+        assert_eq!(PCTrailer::required_marker().0, 0x0041_0000_0000_0000);
+        assert_eq!(
+            PCTrailer::operation_enable(PCOperationMask::CONVOLUTION).0,
+            0x0081_0000_001d_0008
+        );
+        assert_eq!(PCTrailer::alignment_padding().0, 0);
     }
 }
 

@@ -103,9 +103,11 @@ pub fn pack_nhwc_to_nc1hwc2_padded(
 
 /// Returns the storage needed for an uncompressed Rocket convolution filter.
 ///
-/// `input_channels` are padded exactly as the convolution register builder
-/// programs them: at least 16 channels and then to a multiple of 16.
-/// Output kernels are padded only to the hardware's two-kernel granularity.
+/// The padding matches [`crate::rocket::conv::Shape::weight_channels`] and
+/// [`crate::rocket::conv::Shape::programmed_kernels`]. FP16 pads input
+/// channels to 8-channel atoms, with an atom count one short of a multiple of
+/// four rounded up; its output kernel count remains exact. Int8 pads input
+/// channels to 16-channel atoms and output kernels to an even count.
 pub fn rocket_weight_storage_size(
     filter_height: usize,
     filter_width: usize,
@@ -118,17 +120,28 @@ pub fn rocket_weight_storage_size(
         || input_channels == 0
         || output_channels == 0
         || element_size == 0
-        || !WEIGHT_ATOMIC_BYTES.is_multiple_of(element_size)
+        || !matches!(element_size, 1 | 2)
     {
         return Err("invalid Rocket convolution filter shape");
     }
 
-    let padded_input_channels = input_channels.max(16).next_multiple_of(16);
-    let padded_output_channels = output_channels.next_multiple_of(2);
+    let channels_per_atom = FEATURE_ATOMIC_BYTES / element_size;
+    let input_atoms = input_channels.div_ceil(channels_per_atom);
+    let padded_input_atoms = if element_size == 2 && input_atoms % 4 == 3 {
+        input_atoms + 1
+    } else {
+        input_atoms
+    };
+    let padded_input_channels = padded_input_atoms * channels_per_atom;
+    let programmed_output_channels = if element_size == 1 {
+        output_channels.next_multiple_of(2)
+    } else {
+        output_channels
+    };
     filter_height
         .checked_mul(filter_width)
         .and_then(|value| value.checked_mul(padded_input_channels))
-        .and_then(|value| value.checked_mul(padded_output_channels))
+        .and_then(|value| value.checked_mul(programmed_output_channels))
         .and_then(|value| value.checked_mul(element_size))
         .ok_or("Rocket convolution filter storage size overflows usize")
 }
@@ -137,15 +150,15 @@ pub fn rocket_weight_storage_size(
 ///
 /// The physical nesting is:
 ///
-/// `output_block -> input_group -> filter_x -> filter_y ->
+/// `output_block -> input_group -> filter_y -> filter_x ->
 /// output_lane -> input_lane`
 ///
 /// An output block is one 32-byte weight atom: 32 kernels for int8 or 16
 /// kernels for fp16. Input groups remain 32 channels for both precisions,
 /// with a partial final group when the register-programmed input channel
-/// count is not divisible by 32. Input channels are zero-padded to the
-/// register-programmed 16-channel granularity and output kernels to a
-/// multiple of two.
+/// count is not divisible by 32. Input channels and output kernels use the
+/// precision-dependent padding documented by
+/// [`rocket_weight_storage_size`].
 pub fn pack_hwcf_to_rocket_weights(
     dense: &[u8],
     filter_height: usize,
@@ -178,19 +191,30 @@ pub fn pack_hwcf_to_rocket_weights(
     packed[..packed_len].fill(0);
 
     let output_block_channels = WEIGHT_ATOMIC_BYTES / element_size;
-    let padded_input_channels = input_channels.max(16).next_multiple_of(16);
-    let padded_output_channels = output_channels.next_multiple_of(2);
+    let channels_per_atom = FEATURE_ATOMIC_BYTES / element_size;
+    let input_atoms = input_channels.div_ceil(channels_per_atom);
+    let padded_input_atoms = if element_size == 2 && input_atoms % 4 == 3 {
+        input_atoms + 1
+    } else {
+        input_atoms
+    };
+    let padded_input_channels = padded_input_atoms * channels_per_atom;
+    let programmed_output_channels = if element_size == 1 {
+        output_channels.next_multiple_of(2)
+    } else {
+        output_channels
+    };
     let input_groups = padded_input_channels.div_ceil(WEIGHT_INPUT_GROUP_CHANNELS);
-    let output_blocks = padded_output_channels.div_ceil(output_block_channels);
+    let output_blocks = programmed_output_channels.div_ceil(output_block_channels);
     let mut dst_offset = 0;
 
     for output_block in 0..output_blocks {
         for input_group in 0..input_groups {
-            for filter_x in 0..filter_width {
-                for filter_y in 0..filter_height {
+            for filter_y in 0..filter_height {
+                for filter_x in 0..filter_width {
                     for output_lane in 0..output_block_channels {
                         let output_channel = output_block * output_block_channels + output_lane;
-                        if output_channel >= padded_output_channels {
+                        if output_channel >= programmed_output_channels {
                             continue;
                         }
                         for input_lane in 0..WEIGHT_INPUT_GROUP_CHANNELS {
@@ -221,9 +245,87 @@ pub fn pack_hwcf_to_rocket_weights(
     Ok(packed_len)
 }
 
+/// Packs a depthwise filter into the RK3588 CNA coefficient order.
+///
+/// A depthwise filter is `[channels][filter_height][filter_width]` -- one
+/// `kh x kw` kernel per input channel, with no `(input, output)` pairing at
+/// all. The hardware wants it **tap-major**:
+///
+/// `slot = (ky * filter_width + kx) * padded_channels + channel`
+///
+/// i.e. all channels' coefficients for one tap sit contiguously, then all
+/// channels' coefficients for the next. This is the transpose of how torch
+/// and ONNX store it, and it is nothing like
+/// [`pack_hwcf_to_rocket_weights`]'s blocked dense order.
+///
+/// `padded_channels` is the count the register program's
+/// `CNA_WEIGHT_SIZE0.weight_bytes` is sized from -- [`Shape::weight_bytes`]
+/// divided by `kh * kw * element_size` -- not the real channel count. The
+/// two differ whenever the channel count is not a whole CBUF atom group;
+/// padding slots are left zero and contribute nothing.
+///
+/// Derived by one-hot probing every slot of a real weight buffer on
+/// hardware, reading back which output channel responded and which image
+/// borders went zero (`tests/conv_depthwise_probe_hw.rs`). A capture could
+/// never have shown this: it carries the register program, not the buffer.
+/// The original exhaustive probe used fp16; the same tap-major order and a
+/// padded stride of 16 were subsequently validated for int8 at Cin 12 by
+/// `tests/conv_phase1_validation_hw.rs`.
+///
+/// [`Shape::weight_bytes`]: crate::rocket::conv::Shape::weight_bytes
+pub fn pack_depthwise_to_rocket_weights(
+    dense: &[u8],
+    filter_height: usize,
+    filter_width: usize,
+    channels: usize,
+    padded_channels: usize,
+    element_size: usize,
+    packed: &mut [u8],
+) -> Result<usize, &'static str> {
+    if filter_height == 0
+        || filter_width == 0
+        || channels == 0
+        || element_size == 0
+        || padded_channels < channels
+    {
+        return Err("invalid Rocket depthwise filter shape");
+    }
+
+    let dense_len = filter_height
+        .checked_mul(filter_width)
+        .and_then(|value| value.checked_mul(channels))
+        .and_then(|value| value.checked_mul(element_size))
+        .ok_or("depthwise filter storage size overflows usize")?;
+    if dense.len() < dense_len {
+        return Err("dense depthwise filter is smaller than its declared shape");
+    }
+
+    let packed_len = filter_height
+        .checked_mul(filter_width)
+        .and_then(|value| value.checked_mul(padded_channels))
+        .and_then(|value| value.checked_mul(element_size))
+        .ok_or("packed depthwise filter storage size overflows usize")?;
+    if packed.len() < packed_len {
+        return Err("packed depthwise filter buffer is too small");
+    }
+
+    packed[..packed_len].fill(0);
+    for channel in 0..channels {
+        for ky in 0..filter_height {
+            for kx in 0..filter_width {
+                let from = ((channel * filter_height + ky) * filter_width + kx) * element_size;
+                let to = ((ky * filter_width + kx) * padded_channels + channel) * element_size;
+                packed[to..to + element_size].copy_from_slice(&dense[from..from + element_size]);
+            }
+        }
+    }
+    Ok(packed_len)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::rocket::conv::Shape;
 
     #[test]
     fn packs_fp16_c32_as_four_channel_surfaces() {
@@ -337,6 +439,179 @@ mod tests {
         assert_eq!(
             &values[17 * 32..17 * 32 + 32],
             &(1700u16..1732).collect::<Vec<_>>()
+        );
+    }
+
+    #[test]
+    fn fp16_weight_storage_matches_ragged_plan_counts() {
+        const BPE: usize = 2;
+        // One fp16 feature atom is eight channels. Three atoms are the one
+        // exceptional count that rounds to a four-atom coefficient group.
+        assert_eq!(rocket_weight_storage_size(1, 1, 3, 2, BPE), Ok(32));
+        assert_eq!(rocket_weight_storage_size(1, 1, 3, 3, BPE), Ok(48));
+        assert_eq!(rocket_weight_storage_size(1, 1, 17, 3, BPE), Ok(192));
+        // Five atoms pass through rather than rounding to a 16-channel
+        // boundary.
+        assert_eq!(rocket_weight_storage_size(1, 1, 40, 3, BPE), Ok(240));
+    }
+
+    #[test]
+    fn fp16_weight_storage_agrees_with_conv_shape() {
+        for input_channels in [1u32, 3, 8, 9, 17, 24, 25, 32, 40] {
+            for output_channels in [1u32, 2, 3, 8, 17] {
+                for kernels in [[1usize, 1], [3, 3], [3, 5], [4, 2]] {
+                    let shape =
+                        Shape::with_out_channels(32, 32, 1, input_channels, output_channels);
+                    let packed = rocket_weight_storage_size(
+                        kernels[0],
+                        kernels[1],
+                        input_channels as usize,
+                        output_channels as usize,
+                        2,
+                    )
+                    .unwrap();
+                    assert_eq!(
+                        packed,
+                        shape.weight_bytes(kernels) as usize,
+                        "Cin {input_channels}, Cout {output_channels}, kernel {kernels:?}"
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn packs_small_fp16_hwcf_without_phantom_channels_or_kernels() {
+        const C: usize = 3;
+        const F: usize = 3;
+        const BPE: usize = 2;
+        let mut dense = vec![0u8; C * F * BPE];
+        for input_channel in 0..C {
+            for output_channel in 0..F {
+                let value = (10 * output_channel + input_channel + 1) as u16;
+                let offset = (input_channel * F + output_channel) * BPE;
+                dense[offset..offset + BPE].copy_from_slice(&value.to_le_bytes());
+            }
+        }
+        let mut packed = vec![0u8; rocket_weight_storage_size(1, 1, C, F, BPE).unwrap()];
+
+        let written = pack_hwcf_to_rocket_weights(&dense, 1, 1, C, F, BPE, &mut packed).unwrap();
+
+        assert_eq!(written, 3 * 8 * BPE);
+        let values = packed
+            .chunks_exact(BPE)
+            .map(|bytes| u16::from_le_bytes([bytes[0], bytes[1]]))
+            .collect::<Vec<_>>();
+        assert_eq!(&values[0..8], &[1, 2, 3, 0, 0, 0, 0, 0]);
+        assert_eq!(&values[8..16], &[11, 12, 13, 0, 0, 0, 0, 0]);
+        assert_eq!(&values[16..24], &[21, 22, 23, 0, 0, 0, 0, 0]);
+    }
+
+    #[test]
+    fn packs_rectangular_fp16_taps_row_major() {
+        const H: usize = 2;
+        const W: usize = 3;
+        const BPE: usize = 2;
+        let dense = (1u16..=6).flat_map(u16::to_le_bytes).collect::<Vec<_>>();
+        let mut packed = vec![0u8; rocket_weight_storage_size(H, W, 1, 1, BPE).unwrap()];
+
+        pack_hwcf_to_rocket_weights(&dense, H, W, 1, 1, BPE, &mut packed).unwrap();
+
+        let values = packed
+            .chunks_exact(BPE)
+            .map(|bytes| u16::from_le_bytes([bytes[0], bytes[1]]))
+            .collect::<Vec<_>>();
+        for (tap, expected) in (1u16..=6).enumerate() {
+            assert_eq!(values[tap * 8], expected, "row-major tap {tap}");
+            assert_eq!(&values[tap * 8 + 1..tap * 8 + 8], &[0; 7]);
+        }
+    }
+
+    #[test]
+    fn int8_weight_storage_keeps_its_distinct_padding_rules() {
+        assert_eq!(rocket_weight_storage_size(1, 1, 3, 3, 1), Ok(64));
+        assert_eq!(rocket_weight_storage_size(1, 1, 17, 3, 1), Ok(128));
+    }
+
+    /// The exact slot mapping the hardware probe reported at Cin 8, 3x3:
+    /// channel `c` at tap (0,0) lands at slot `c`, and channel 0's next tap
+    /// (0,1) lands at slot 8 -- one whole channel row later, not adjacent.
+    #[test]
+    fn depthwise_packing_is_tap_major() {
+        // One byte per element keeps the slot index and the byte offset the
+        // same number, so the expectations read as slots.
+        let (channels, kh, kw) = (8usize, 3usize, 3usize);
+        let mut dense = vec![0u8; channels * kh * kw];
+        for channel in 0..channels {
+            for ky in 0..kh {
+                for kx in 0..kw {
+                    // Encode the source coordinate so a misplaced byte names
+                    // where it came from.
+                    dense[(channel * kh + ky) * kw + kx] = (channel * 16 + ky * 4 + kx) as u8;
+                }
+            }
+        }
+
+        let mut packed = vec![0xffu8; kh * kw * channels];
+        let written =
+            pack_depthwise_to_rocket_weights(&dense, kh, kw, channels, channels, 1, &mut packed)
+                .expect("packing failed");
+        assert_eq!(written, 72);
+
+        for channel in 0..channels {
+            for ky in 0..kh {
+                for kx in 0..kw {
+                    let slot = (ky * kw + kx) * channels + channel;
+                    assert_eq!(
+                        packed[slot],
+                        (channel * 16 + ky * 4 + kx) as u8,
+                        "slot {slot} (channel {channel}, tap ({ky}, {kx}))"
+                    );
+                }
+            }
+        }
+        // The probe's own landmarks.
+        assert_eq!(packed[0], 0, "channel 0 tap (0,0)");
+        assert_eq!(packed[1], 16, "channel 1 tap (0,0)");
+        assert_eq!(packed[8], 1, "channel 0 tap (0,1)");
+        // channel 0, tap (2,2) -> 0*16 + 2*4 + 2
+        assert_eq!(packed[64], 10, "channel 0 tap (2,2)");
+    }
+
+    /// Padding slots stay zero and the real channels keep the padded stride,
+    /// which is what a Cin the atom granularity does not divide needs.
+    #[test]
+    fn depthwise_packing_honours_the_padded_stride() {
+        let (channels, padded, kh, kw) = (12usize, 16usize, 3usize, 3usize);
+        let dense = vec![0x5au8; channels * kh * kw];
+        let mut packed = vec![0xffu8; kh * kw * padded];
+        let written =
+            pack_depthwise_to_rocket_weights(&dense, kh, kw, channels, padded, 1, &mut packed)
+                .expect("packing failed");
+        assert_eq!(written, kh * kw * padded);
+
+        for ky in 0..kh {
+            for kx in 0..kw {
+                let base = (ky * kw + kx) * padded;
+                for channel in 0..padded {
+                    let want = if channel < channels { 0x5a } else { 0 };
+                    assert_eq!(
+                        packed[base + channel],
+                        want,
+                        "tap ({ky}, {kx}) channel {channel}"
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn depthwise_packing_rejects_a_short_buffer() {
+        let dense = vec![0u8; 8 * 9];
+        let mut packed = vec![0u8; 8 * 9 - 1];
+        assert!(
+            pack_depthwise_to_rocket_weights(&dense, 3, 3, 8, 8, 1, &mut packed).is_err(),
+            "a packed buffer one byte short must be refused"
         );
     }
 }

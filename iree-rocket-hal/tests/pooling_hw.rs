@@ -1,364 +1,470 @@
-//! Hardware-in-the-loop tests for `build_pooling_regcmd`'s standalone
-//! ("flying mode") PPU path -- TRM Ch.36 Fig 36-6, PPU_RDMA feeding PPU
-//! directly from memory with CNA/CORE/DPU untouched.
+//! Hardware-in-the-loop tests for the direct PPU_RDMA -> PPU pooling path.
 //!
-//! Not run by a plain `cargo test` -- see conv_hw.rs's doc comment for the
-//! cross-compile-and-copy-to-the-board workflow; identical here:
+//! A plain `cargo test` runs the planning test only. Cross-compile the ignored
+//! numerical tests and copy the resulting binary to an RK3588 board:
 //!
 //!   CARGO_TARGET_AARCH64_UNKNOWN_LINUX_GNU_LINKER=aarch64-linux-gnu-gcc \
 //!     cargo test --target aarch64-unknown-linux-gnu --release \
 //!       --test pooling_hw --no-run
 //!
-//! Unlike conv_hw.rs's conv shapes, there is NO Mesa/Teflon reference
-//! implementation for pooling to cross-check against (`rkt_ml.c` never
-//! implements it) -- see `build_pooling_regcmd`'s module doc comment for
-//! everything that's genuinely unconfirmed here (the pooling_method bit
-//! encoding chief among them). These tests are split accordingly:
+//! Tests affected by the upstream kernel completion issue are only compiled
+//! with `--features kernel-fix`. They remain ignored and must still be selected
+//! with `--ignored` on the board.
 //!
-//! - `pooling_*_completes_and_output_tracks_input`: the load-bearing
-//!   correctness tests. Uniform-fill (same trick as conv_hw.rs, sidesteps
-//!   not knowing the input buffer's real pixel packing order) at two fill
-//!   levels, for each of the three raw `PoolingMethod` encodings
-//!   independently. Proves the whole standalone-PPU-flying dispatch
-//!   completes without hanging and genuinely reads the input, regardless
-//!   of whether `PoolingMethod::Max`/`Min`/`Avg`'s *labels* are correct.
-//! - `pooling_method_encoding_discovery`: NOT a strict pass/fail
-//!   correctness test -- deliberately exploratory. Fills the whole input
-//!   plane (a single pooling window covers all of it, so real pixel
-//!   packing order can't hide either fill value from the window) half
-//!   with a low byte value and half with a high one, runs all three raw
-//!   encodings, and asserts only the one invariant that must hold
-//!   regardless of which raw value means what: the three outputs, sorted,
-//!   must be low <= mid <= high (i.e. *some* encoding is really min,
-//!   *some* is really max, *some* is really avg-in-between) rather than
-//!   e.g. two of them reading identically (which would mean the
-//!   pooling_method field isn't actually being consulted). Prints which
-//!   raw value produced which sorted position -- use that to fix
-//!   `PoolingMethod::bits()` if it disagrees with the current guess.
+//! Each logical int8 pixel occupies channel zero of a 16-byte NC1HWC2 feature
+//! atom. Wide cases submit every independently kicked tile as the ordered task
+//! array of one kernel job, with all tasks writing disjoint columns of one
+//! shared output BO.
 
-use std::{fs::OpenOptions, mem, os::unix::io::AsRawFd, ptr};
+use std::{
+    fs::{File, OpenOptions},
+    mem,
+    os::unix::io::AsRawFd,
+    ptr,
+    time::Instant,
+};
 
 use iree_rocket_hal::rocket::{
-    device::{Buffer, fini_bo, prep_bo, submit},
-    regcmd::{Activation, PoolingBuffers, PoolingMethod, PoolingShape, build_pooling_regcmd},
+    device::{Buffer, close_bo, fini_bo, prep_bo, submit_tasks, unmap_bo},
+    pooling::{PoolingBuffers, PoolingMethod, PoolingPlan, PoolingPrecision, PoolingShape},
 };
 
 const DEVICE_PATH: &str = "/dev/accel/accel0";
-const TENSOR_SIZE: usize = 4096;
+const FEATURE_ATOM_BYTES: usize = 16;
 
-/// 4x4x1 input, 2x2 kernel, stride 2, no padding -> 2x2x1 output. Small
-/// enough that every output pixel comes from a disjoint, non-overlapping
-/// window, so a uniform-fill input should make every output pixel agree
-/// regardless of pooling method.
-fn tiled_shape(method: PoolingMethod) -> PoolingShape {
-    PoolingShape {
-        input_width: 4,
-        input_height: 4,
-        input_channels: 1,
-        output_width: 2,
-        output_height: 2,
-        output_channels: 1,
+#[derive(Clone, Copy, Debug)]
+struct NumericCase {
+    name: &'static str,
+    width: u32,
+    height: u32,
+    kernel_width: u32,
+    kernel_height: u32,
+    stride_x: u32,
+    stride_y: u32,
+}
+
+const K3_TWO_TILES: NumericCase = NumericCase {
+    name: "k3_two_tiles",
+    width: 256,
+    height: 9,
+    kernel_width: 3,
+    kernel_height: 3,
+    stride_x: 2,
+    stride_y: 2,
+};
+
+const K2_CAPTURE_BOUNDARY: NumericCase = NumericCase {
+    name: "k2_capture_boundary",
+    width: 257,
+    height: 8,
+    kernel_width: 2,
+    kernel_height: 2,
+    stride_x: 2,
+    stride_y: 2,
+};
+
+const K2_TWO_TILES: NumericCase = NumericCase {
+    name: "k2_two_tiles",
+    width: 258,
+    height: 8,
+    kernel_width: 2,
+    kernel_height: 2,
+    stride_x: 2,
+    stride_y: 2,
+};
+
+const NUMERIC_CASES: [NumericCase; 9] = [
+    NumericCase {
+        name: "small_square",
+        width: 4,
+        height: 4,
         kernel_width: 2,
         kernel_height: 2,
         stride_x: 2,
         stride_y: 2,
-        method,
-        pad_left: 0,
-        pad_top: 0,
-        pad_right: 0,
-        pad_bottom: 0,
-        pad_value: 0,
-        activation: Activation::None,
-    }
-}
-
-/// Whole 4x4x1 input as a single pooling window -> 1x1x1 output. Used by
-/// the encoding-discovery test: covering 100% of the input plane means an
-/// unknown internal pixel packing order can't hide either fill value from
-/// the window (unlike a sub-window, which might land entirely within one
-/// packing quirk or another).
-fn whole_input_shape(method: PoolingMethod) -> PoolingShape {
-    PoolingShape {
-        input_width: 4,
-        input_height: 4,
-        input_channels: 1,
-        output_width: 1,
-        output_height: 1,
-        output_channels: 1,
+    },
+    NumericCase {
+        name: "rectangular_kernel",
+        width: 7,
+        height: 5,
+        kernel_width: 3,
+        kernel_height: 2,
+        stride_x: 2,
+        stride_y: 1,
+    },
+    NumericCase {
+        name: "overlapping_windows",
+        width: 13,
+        height: 9,
+        kernel_width: 3,
+        kernel_height: 3,
+        stride_x: 2,
+        stride_y: 2,
+    },
+    NumericCase {
+        name: "asymmetric_stride",
+        width: 17,
+        height: 13,
         kernel_width: 4,
-        kernel_height: 4,
-        stride_x: 4,
-        stride_y: 4,
+        kernel_height: 3,
+        stride_x: 3,
+        stride_y: 2,
+    },
+    NumericCase {
+        name: "largest_direct_window",
+        width: 64,
+        height: 31,
+        kernel_width: 8,
+        kernel_height: 8,
+        stride_x: 3,
+        stride_y: 3,
+    },
+    NumericCase {
+        name: "default_width_boundary",
+        width: 129,
+        height: 17,
+        kernel_width: 3,
+        kernel_height: 3,
+        stride_x: 2,
+        stride_y: 2,
+    },
+    K3_TWO_TILES,
+    K2_CAPTURE_BOUNDARY,
+    K2_TWO_TILES,
+];
+
+fn pooling_shape(case: NumericCase, method: PoolingMethod) -> PoolingShape {
+    PoolingShape {
+        input_width: case.width,
+        input_height: case.height,
+        input_channels: 1,
+        output_width: (case.width - case.kernel_width) / case.stride_x + 1,
+        output_height: (case.height - case.kernel_height) / case.stride_y + 1,
+        output_channels: 1,
+        precision: PoolingPrecision::Int8,
+        kernel_width: case.kernel_width,
+        kernel_height: case.kernel_height,
+        stride_x: case.stride_x,
+        stride_y: case.stride_y,
         method,
         pad_left: 0,
         pad_top: 0,
         pad_right: 0,
         pad_bottom: 0,
         pad_value: 0,
-        activation: Activation::None,
     }
 }
 
-/// Runs `shape` against a uniformly-filled input and returns the real
-/// output pixels (same 16-byte-atomic read stride as conv_hw.rs's
-/// `run_uniform_conv` -- output_channels=1 still lands each pixel at a
-/// full atomic slot regardless of real channel count).
-fn run_uniform_pooling(shape: &PoolingShape, input_fill: u8, num_output_pixels: usize) -> Vec<u8> {
-    let file = OpenOptions::new()
+fn numeric_input(case: NumericCase) -> Vec<i8> {
+    let mut input = Vec::with_capacity((case.width * case.height) as usize);
+    for y in 0..case.height {
+        for x in 0..case.width {
+            // Non-monotonic and non-negative: max/min cannot accidentally
+            // pass through a fixed-corner bug, while int8 ordering is clear.
+            input.push(((13 * x + 7 * y + 3 * x * y) % 61) as i8);
+        }
+    }
+    input
+}
+
+fn cpu_pool(input: &[i8], shape: &PoolingShape) -> Vec<i8> {
+    let mut output = Vec::with_capacity((shape.output_width * shape.output_height) as usize);
+    for output_y in 0..shape.output_height {
+        for output_x in 0..shape.output_width {
+            let input_y = output_y * shape.stride_y;
+            let input_x = output_x * shape.stride_x;
+            let mut minimum = i8::MAX;
+            let mut maximum = i8::MIN;
+            let mut sum = 0i32;
+            for kernel_y in 0..shape.kernel_height {
+                for kernel_x in 0..shape.kernel_width {
+                    let index =
+                        ((input_y + kernel_y) * shape.input_width + input_x + kernel_x) as usize;
+                    let value = input[index];
+                    minimum = minimum.min(value);
+                    maximum = maximum.max(value);
+                    sum += i32::from(value);
+                }
+            }
+            output.push(match shape.method {
+                PoolingMethod::Max => maximum,
+                PoolingMethod::Min => minimum,
+                PoolingMethod::Avg => {
+                    let count = (shape.kernel_width * shape.kernel_height) as i32;
+                    ((sum + count / 2) / count) as i8
+                }
+            });
+        }
+    }
+    output
+}
+
+fn page_aligned(bytes: usize) -> usize {
+    bytes.max(1).next_multiple_of(4096)
+}
+
+fn open_device() -> File {
+    OpenOptions::new()
         .read(true)
         .write(true)
         .open(DEVICE_PATH)
-        .expect("failed to open NPU device");
+        .expect("failed to open NPU device")
+}
+
+fn run_numeric_case_on_file(
+    file: &File,
+    case: NumericCase,
+    method: PoolingMethod,
+) -> (Vec<i8>, Vec<i8>, u128) {
+    let shape = pooling_shape(case, method);
+    let input = numeric_input(case);
+    let expected = cpu_pool(&input, &shape);
     let fd = file.as_raw_fd();
 
     unsafe {
-        let buf_in = Buffer::new(fd, TENSOR_SIZE, &file);
-        ptr::write_bytes(buf_in.host_ptr, input_fill, TENSOR_SIZE);
+        let input_bytes = input.len() * FEATURE_ATOM_BYTES;
+        let buf_in = Buffer::new(fd, page_aligned(input_bytes), file);
+        ptr::write_bytes(buf_in.host_ptr, 0, buf_in.size);
+        for (pixel, &value) in input.iter().enumerate() {
+            *buf_in.host_ptr.add(pixel * FEATURE_ATOM_BYTES) = value as u8;
+        }
 
-        let buf_out = Buffer::new(fd, TENSOR_SIZE, &file);
-        ptr::write_bytes(buf_out.host_ptr, 0, TENSOR_SIZE);
+        let output_atoms = (shape.output_width * shape.output_height).next_multiple_of(4) as usize;
+        let output_bytes = output_atoms * FEATURE_ATOM_BYTES;
+        let buf_out = Buffer::new(fd, page_aligned(output_bytes), file);
+        ptr::write_bytes(buf_out.host_ptr, 0xa5, buf_out.size);
 
-        run_pooling(&file, fd, shape, &buf_in, &buf_out, num_output_pixels)
-    }
-}
+        fini_bo(fd, buf_in.handle).expect("failed to sync pooling input BO for the NPU");
+        fini_bo(fd, buf_out.handle).expect("failed to sync pooling output BO for the NPU");
 
-/// Shared dispatch/readback plumbing -- factored out so the encoding-
-/// discovery test can fill its own two-value split input rather than a
-/// single uniform fill.
-unsafe fn run_pooling(
-    file: &std::fs::File,
-    fd: i32,
-    shape: &PoolingShape,
-    buf_in: &Buffer,
-    buf_out: &Buffer,
-    num_output_pixels: usize,
-) -> Vec<u8> {
-    unsafe {
-        let bufs = PoolingBuffers {
+        let programs = PoolingPlan::new(shape).programs_with_buffers(&PoolingBuffers {
             input_addr: buf_in.dma_address,
             output_addr: buf_out.dma_address,
-        };
-        let cmds = build_pooling_regcmd(shape, &bufs);
-
-        let cmd_bytes = cmds.len() * mem::size_of::<u64>();
-        let cmd_len = cmd_bytes.next_multiple_of(4096);
-        let buf_cmd = Buffer::new(fd, cmd_len, file);
-        let cmd_slice = std::slice::from_raw_parts_mut(buf_cmd.host_ptr as *mut u64, cmds.len());
-        for (i, c) in cmds.iter().enumerate() {
-            cmd_slice[i] = c.0;
+        });
+        let mut command_buffers = Vec::with_capacity(programs.len());
+        for program in &programs {
+            let command_bytes = program.len() * mem::size_of::<u64>();
+            let command_buffer = Buffer::new(fd, page_aligned(command_bytes), file);
+            let command_slice = std::slice::from_raw_parts_mut(
+                command_buffer.host_ptr.cast::<u64>(),
+                program.len(),
+            );
+            for (slot, command) in command_slice.iter_mut().zip(program) {
+                *slot = command.0;
+            }
+            fini_bo(fd, command_buffer.handle)
+                .expect("failed to sync pooling command BO for the NPU");
+            command_buffers.push(command_buffer);
         }
 
-        fini_bo(fd, buf_in.handle).ok();
-        fini_bo(fd, buf_cmd.handle).ok();
-        // buf_out was CPU-zero-filled by the caller (run_uniform_pooling /
-        // pooling_method_encoding_discovery) -- that write needs the same
-        // dma_sync_sgtable_for_device() hand-off as every other buffer the
-        // device touches, or the CPU's dirty cache line for it can race the
-        // device's real write and win, silently clobbering the result back
-        // to zero. conv_hw.rs's known-good buf_c handling already does
-        // this; this file previously didn't.
-        fini_bo(fd, buf_out.handle).ok();
-
-        let in_handles = [buf_cmd.handle, buf_in.handle];
+        let tasks: Vec<_> = command_buffers
+            .iter()
+            .zip(&programs)
+            .map(|(buffer, program)| (buffer.dma_address, program.len() as u32))
+            .collect();
+        let mut in_handles: Vec<_> = command_buffers.iter().map(|buffer| buffer.handle).collect();
+        in_handles.push(buf_in.handle);
         let out_handles = [buf_out.handle];
 
-        submit(
-            fd,
-            buf_cmd.dma_address,
-            cmds.len() as u32,
-            &in_handles,
-            &out_handles,
-        )
-        .expect("SUBMIT ioctl failed");
+        let submitted_at = Instant::now();
+        submit_tasks(fd, &tasks, &in_handles, &out_handles)
+            .expect("direct pooling multi-task SUBMIT ioctl failed");
+        prep_bo(fd, buf_out.handle, 2_000_000_000)
+            .expect("direct pooling job did not complete within timeout");
+        let dispatch_ms = submitted_at.elapsed().as_millis();
 
-        prep_bo(fd, buf_out.handle, 2_000_000_000).expect("job did not complete within timeout");
+        let raw_output = std::slice::from_raw_parts(buf_out.host_ptr, output_bytes);
+        let actual = (0..expected.len())
+            .map(|pixel| raw_output[pixel * FEATURE_ATOM_BYTES] as i8)
+            .collect();
 
-        let raw = std::slice::from_raw_parts(buf_out.host_ptr, num_output_pixels * 16 + 16);
-        (0..num_output_pixels).map(|i| raw[i * 16]).collect()
+        for command_buffer in command_buffers {
+            unmap_bo(&command_buffer).expect("failed to unmap pooling command BO");
+            close_bo(fd, command_buffer.handle).ok();
+        }
+        unmap_bo(&buf_in).expect("failed to unmap pooling input BO");
+        unmap_bo(&buf_out).expect("failed to unmap pooling output BO");
+        close_bo(fd, buf_in.handle).ok();
+        close_bo(fd, buf_out.handle).ok();
+        (actual, expected, dispatch_ms)
     }
 }
 
-macro_rules! completes_and_tracks_input_test {
-    ($name:ident, $method:expr) => {
-        #[test]
-        #[ignore = "needs the real NPU device -- cross-compile for aarch64, copy to the board, run there"]
-        fn $name() {
-            let shape = tiled_shape($method);
-            // Uniform fill: every 2x2 window sees identical input, so
-            // every one of the 4 output pixels should agree regardless of
-            // which pooling method this raw encoding actually is.
-            for input_fill in [10u8, 118, 200] {
-                let pixels = run_uniform_pooling(&shape, input_fill, 4);
-                assert!(
-                    pixels.iter().all(|&p| p == pixels[0]),
-                    "input_fill={input_fill}: expected all 4 output pixels identical \
-                     (uniform input), got {pixels:?}"
-                );
-            }
-            // Liveness: output must actually respond to the input, guards
-            // against a hollow "completes but never touches the data" pass.
-            let low = run_uniform_pooling(&shape, 10, 4)[0];
-            let high = run_uniform_pooling(&shape, 200, 4)[0];
-            assert_ne!(
-                low, high,
-                "output pixel value didn't change between input_fill=10 ({low}) and \
-                 input_fill=200 ({high}) -- suggests the op isn't really reading the input"
-            );
+fn assert_numeric_case_on_file(
+    file: &File,
+    case: NumericCase,
+    method: PoolingMethod,
+    tolerance: i16,
+) {
+    let (actual, expected, dispatch_ms) = run_numeric_case_on_file(file, case, method);
+    let shape = pooling_shape(case, method);
+    let mut mismatches = Vec::new();
+    for (index, (&got, &want)) in actual.iter().zip(&expected).enumerate() {
+        if (i16::from(got) - i16::from(want)).abs() > tolerance && mismatches.len() < 8 {
+            let y = index as u32 / shape.output_width;
+            let x = index as u32 % shape.output_width;
+            mismatches.push(format!("[{y}, {x}] want {want} got {got}"));
         }
-    };
+    }
+    assert!(
+        mismatches.is_empty(),
+        "{} {method:?}: numerical pooling mismatches after {dispatch_ms} ms \
+         (a duration near the driver's 500 ms watchdog means the scheduler reset the job): {}",
+        case.name,
+        mismatches.join(", ")
+    );
 }
 
-completes_and_tracks_input_test!(
-    pooling_max_completes_and_output_tracks_input,
-    PoolingMethod::Max
-);
-completes_and_tracks_input_test!(
-    pooling_min_completes_and_output_tracks_input,
-    PoolingMethod::Min
-);
-completes_and_tracks_input_test!(
-    pooling_avg_completes_and_output_tracks_input,
-    PoolingMethod::Avg
-);
+fn assert_numeric_case(case: NumericCase, method: PoolingMethod, tolerance: i16) {
+    let file = open_device();
+    assert_numeric_case_on_file(&file, case, method, tolerance);
+}
 
-/// See module doc comment -- exploratory, not a strict correctness check
-/// of which raw value means what. Splits the *real image footprint* in
-/// half (first `IMAGE_BYTES/2` bytes low, rest high) so a single
-/// whole-input pooling window is guaranteed to see both values no matter
-/// the real per-pixel packing order, then checks the one invariant that
-/// must hold for any internally-consistent max/min/avg encoding.
-///
-/// UPDATE: previously split the entire `TENSOR_SIZE` (4096-byte) buffer in
-/// half rather than just the real 4x4x1 image (256 bytes = 4 rows * 16
-/// bytes/pixel * 4 pixels/row). That accidentally worked before the
-/// `src_line_stride`/`src_surf_stride` fix (see `build_ppu_standalone_
-/// flying`'s doc comment) because the old, 16x-too-large stride formula
-/// happened to read far enough past the real image to sample both this
-/// test's low and high halves regardless. With the corrected (smaller,
-/// TRM-confirmed) stride, PPU_RDMA's read is now tightly confined to the
-/// real 256-byte image -- which sat entirely inside the old fill's "low"
-/// half, so every method read a genuinely uniform 10 and (correctly)
-/// produced identical output. Splitting within the real image footprint
-/// instead restores a genuinely bimodal window.
+#[cfg(feature = "kernel-fix")]
+fn assert_numeric_matrix(method: PoolingMethod, tolerance: i16) {
+    for case in NUMERIC_CASES {
+        assert_numeric_case(case, method, tolerance);
+    }
+}
+
 #[test]
-#[ignore = "needs the real NPU device -- cross-compile for aarch64, copy to the board, run there; \
-            exploratory -- read the printed mapping and fix PoolingMethod::bits() if needed"]
-fn pooling_method_encoding_discovery() {
-    let file = OpenOptions::new()
-        .read(true)
-        .write(true)
-        .open(DEVICE_PATH)
-        .expect("failed to open NPU device");
-    let fd = file.as_raw_fd();
-
-    // whole_input_shape()'s 4x4x1 image at 16 bytes/pixel.
-    const IMAGE_BYTES: usize = 4 * 4 * 16;
-
-    let mut results: Vec<(u8, u8)> = Vec::new(); // (raw encoding, output byte)
-    for (raw, method) in [
-        (0u8, PoolingMethod::Max),
-        (1, PoolingMethod::Min),
-        (2, PoolingMethod::Avg),
-    ] {
-        let shape = whole_input_shape(method);
-        unsafe {
-            let buf_in = Buffer::new(fd, TENSOR_SIZE, &file);
-            ptr::write_bytes(buf_in.host_ptr, 10u8, IMAGE_BYTES / 2);
-            ptr::write_bytes(
-                buf_in.host_ptr.add(IMAGE_BYTES / 2),
-                200u8,
-                TENSOR_SIZE - IMAGE_BYTES / 2,
+fn numerical_dimension_matrix_has_expected_direct_task_counts() {
+    for case in NUMERIC_CASES {
+        for method in [PoolingMethod::Max, PoolingMethod::Min, PoolingMethod::Avg] {
+            let shape = pooling_shape(case, method);
+            let plan = PoolingPlan::new(shape);
+            let programs = plan.programs_with_buffers(&PoolingBuffers {
+                input_addr: 0x1000,
+                output_addr: 0x8000,
+            });
+            assert_eq!(
+                programs.len(),
+                plan.tiles().len(),
+                "{} {method:?}",
+                case.name
             );
-            let buf_out = Buffer::new(fd, TENSOR_SIZE, &file);
-            ptr::write_bytes(buf_out.host_ptr, 0, TENSOR_SIZE);
-
-            let pixels = run_pooling(&file, fd, &shape, &buf_in, &buf_out, 1);
-            results.push((raw, pixels[0]));
+            assert!(
+                programs.iter().all(|program| !program.is_empty()),
+                "{} {method:?} emitted an empty task",
+                case.name
+            );
+            assert_eq!(
+                cpu_pool(&numeric_input(case), &shape).len(),
+                (shape.output_width * shape.output_height) as usize,
+                "{} {method:?} CPU reference extent",
+                case.name
+            );
         }
     }
 
-    eprintln!("pooling_method_encoding_discovery: raw encoding -> output byte: {results:?}");
-    eprintln!(
-        "  if PoolingMethod::{{Max,Min,Avg}}.bits() (0,1,2) is correct, expect \
-         raw=0 highest, raw=1 lowest, raw=2 in between -- fix bits() if not."
+    assert_eq!(
+        PoolingPlan::new(pooling_shape(K2_CAPTURE_BOUNDARY, PoolingMethod::Max))
+            .tiles()
+            .len(),
+        2
     );
-
-    let mut sorted = results.clone();
-    sorted.sort_by_key(|&(_, v)| v);
-    assert!(
-        sorted[0].1 <= sorted[1].1 && sorted[1].1 <= sorted[2].1,
-        "expected the three raw encodings to produce three orderable outputs \
-         (some min, some max, some in-between) -- got {results:?}, which suggests \
-         pooling_method isn't being consulted at all rather than just being \
-         mislabeled"
+    assert_eq!(
+        PoolingPlan::new(pooling_shape(K2_TWO_TILES, PoolingMethod::Max))
+            .tiles()
+            .len(),
+        2
     );
-    assert!(
-        sorted[0].1 != sorted[2].1,
-        "min and max raw encodings produced identical output ({:?}) -- expected \
-         them to differ given a genuinely bimodal input",
-        results
+    assert_eq!(
+        PoolingPlan::new(pooling_shape(K3_TWO_TILES, PoolingMethod::Max))
+            .tiles()
+            .len(),
+        2
     );
 }
 
-/// Diagnostic, not a correctness check -- added after
-/// `pooling_*_completes_and_output_tracks_input` came back all-zero on
-/// real hardware for every method and every fill level. That specific
-/// failure signature (not just "methods agree with each other" but
-/// literally zero everywhere) rules out a mislabeled-but-working
-/// `pooling_method` and pointed first at `PPU_DST_BASE_ADDR`'s address
-/// convention (fixed to write `output_addr >> 4`, matching TRM's
-/// documented `pc_base_address` bits[31:4] precedent) -- but a full-buffer
-/// dump still came back all zero even after that fix. That's ambiguous on
-/// its own: pre-filling the output buffer with zero means "PPU wrote real
-/// zeros here" and "PPU never touched this buffer at all" look identical.
-///
-/// Pre-fills with a distinctive non-zero sentinel (0xAA) instead, so ANY
-/// write reaching this buffer -- even a wrong/garbage one -- must knock at
-/// least some bytes off 0xAA. Two outcomes:
-/// - Still all 0xAA: PPU's write genuinely never lands in this buffer at
-///   all (address still wrong, or PPU/PPU_RDMA's op_en never really
-///   fired for this dispatch despite PREP_BO completing).
-/// - Anything else: the address is right and PPU is writing here, so the
-///   remaining suspect is the *input* side -- PPU_RDMA's
-///   `src_line_stride`/`src_surf_stride` formulas (flagged UNCONFIRMED in
-///   build_pooling_regcmd's module doc comment), which would make PPU
-///   compute over fetched garbage/zeroed memory rather than the real
-///   input, landing on 0 (or some other wrong-but-real value) regardless
-///   of method.
+#[cfg(feature = "kernel-fix")]
 #[test]
-#[ignore = "needs the real NPU device -- cross-compile for aarch64, copy to the board, run there; \
-            diagnostic only, not a pass/fail check -- read the printed hex dump"]
-fn pooling_dump_full_output_buffer() {
-    let shape = tiled_shape(PoolingMethod::Max);
-    let file = OpenOptions::new()
-        .read(true)
-        .write(true)
-        .open(DEVICE_PATH)
-        .expect("failed to open NPU device");
-    let fd = file.as_raw_fd();
+#[ignore = "needs the real NPU device and the upstream kernel completion fix -- validates max pooling numerically across dimensions"]
+fn max_pooling_dimension_matrix_matches_cpu_reference() {
+    assert_numeric_matrix(PoolingMethod::Max, 0);
+}
 
-    unsafe {
-        let buf_in = Buffer::new(fd, TENSOR_SIZE, &file);
-        ptr::write_bytes(buf_in.host_ptr, 200u8, TENSOR_SIZE);
+#[cfg(feature = "kernel-fix")]
+#[test]
+#[ignore = "needs the real NPU device and the upstream kernel completion fix -- validates min pooling numerically across dimensions"]
+fn min_pooling_dimension_matrix_matches_cpu_reference() {
+    assert_numeric_matrix(PoolingMethod::Min, 0);
+}
 
-        let buf_out = Buffer::new(fd, TENSOR_SIZE, &file);
-        ptr::write_bytes(buf_out.host_ptr, 0xAAu8, TENSOR_SIZE);
+#[cfg(feature = "kernel-fix")]
+#[test]
+#[ignore = "needs the real NPU device and the upstream kernel completion fix -- validates average pooling numerically across dimensions"]
+fn average_pooling_dimension_matrix_matches_cpu_reference() {
+    assert_numeric_matrix(PoolingMethod::Avg, 1);
+}
 
-        run_pooling(&file, fd, &shape, &buf_in, &buf_out, 4);
+#[cfg(feature = "kernel-fix")]
+#[test]
+#[ignore = "needs the real NPU device and the upstream kernel completion fix -- focused PPU_RDMA -> PPU tile 0 -> tile 1 job"]
+fn direct_two_task_tiled_pooling_matches_cpu_reference() {
+    assert_numeric_case(K2_TWO_TILES, PoolingMethod::Max, 0);
+}
 
-        let raw = std::slice::from_raw_parts(buf_out.host_ptr, TENSOR_SIZE);
-        eprintln!(
-            "pooling_dump_full_output_buffer: full {TENSOR_SIZE}-byte output buffer (sentinel-filled 0xAA, input uniformly filled with 200):"
-        );
-        for (row, chunk) in raw.chunks(32).enumerate() {
-            let hex: String = chunk.iter().map(|b| format!("{b:02x} ")).collect();
-            eprintln!("  {:04x}: {hex}", row * 32);
-        }
-        let unchanged_count = raw.iter().filter(|&&b| b == 0xAA).count();
-        eprintln!(
-            "pooling_dump_full_output_buffer: {unchanged_count}/{TENSOR_SIZE} bytes still == 0xAA \
-             (if this is TENSOR_SIZE, PPU's write never reached this buffer at all; if less, \
-             something did write here -- check what value landed where)"
-        );
+#[cfg(feature = "kernel-fix")]
+#[test]
+#[ignore = "needs the real NPU device and the upstream kernel completion fix -- isolates the int8 63+65 tile split"]
+fn direct_equal_half_boundary_pooling_matches_cpu_reference() {
+    assert_numeric_case(K2_CAPTURE_BOUNDARY, PoolingMethod::Max, 0);
+}
+
+#[test]
+#[ignore = "needs the real NPU device -- isolates non-square min pooling"]
+fn direct_rectangular_min_pooling_matches_cpu_reference() {
+    assert_numeric_case(NUMERIC_CASES[1], PoolingMethod::Min, 0);
+}
+
+#[test]
+#[ignore = "needs the real NPU device -- distinguishes min method from non-square geometry"]
+fn direct_square_k3_min_pooling_matches_cpu_reference() {
+    assert_numeric_case(NUMERIC_CASES[2], PoolingMethod::Min, 0);
+}
+
+#[cfg(feature = "kernel-fix")]
+#[test]
+#[ignore = "needs the real NPU device and the upstream kernel completion fix -- checks repeated GEM/VMA/domain teardown"]
+fn repeated_pooling_resource_lifetime_matches_cpu_reference() {
+    for _ in 0..4 {
+        assert_numeric_case(NUMERIC_CASES[0], PoolingMethod::Max, 0);
+        assert_numeric_case(K2_CAPTURE_BOUNDARY, PoolingMethod::Max, 0);
+        assert_numeric_case(NUMERIC_CASES[0], PoolingMethod::Min, 0);
+        assert_numeric_case(NUMERIC_CASES[1], PoolingMethod::Min, 0);
+        assert_numeric_case(K2_CAPTURE_BOUNDARY, PoolingMethod::Avg, 1);
+    }
+}
+
+#[test]
+#[ignore = "needs the real NPU device -- repeats the single-task width-129 PC launch boundary"]
+fn repeated_default_width_boundary_matches_cpu_reference() {
+    let case = NUMERIC_CASES[5];
+
+    for _ in 0..4 {
+        assert_numeric_case(case, PoolingMethod::Avg, 1);
+        assert_numeric_case(case, PoolingMethod::Max, 0);
+        assert_numeric_case(case, PoolingMethod::Min, 0);
+    }
+}
+
+#[test]
+#[ignore = "needs the real NPU device -- reproduces deferred BO cleanup across file close"]
+fn pooling_file_lifetime_boundary_matches_cpu_reference() {
+    for _ in 0..4 {
+        assert_numeric_case(NUMERIC_CASES[4], PoolingMethod::Max, 0);
+        assert_numeric_case(NUMERIC_CASES[5], PoolingMethod::Max, 0);
+    }
+}
+
+#[test]
+#[ignore = "needs the real NPU device -- isolates retained engine state within one DRM file"]
+fn same_file_pooling_geometry_transition_matches_cpu_reference() {
+    let file = open_device();
+
+    for _ in 0..4 {
+        assert_numeric_case_on_file(&file, NUMERIC_CASES[4], PoolingMethod::Max, 0);
+        assert_numeric_case_on_file(&file, NUMERIC_CASES[5], PoolingMethod::Max, 0);
     }
 }

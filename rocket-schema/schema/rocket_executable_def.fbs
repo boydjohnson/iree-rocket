@@ -26,12 +26,17 @@ enum Activation : ubyte {
 
 // Conv2D shape fields that may be supplied by dispatch push constants.
 // Numeric values are wire-format ABI and must not be changed or reused.
+//
+// Values 3 and 4 are retired and must never be reused: they were
+// OUTPUT_WIDTH/OUTPUT_HEIGHT, which the runtime always derives from the
+// six settable dimensions plus stride and padding. Making them
+// independently settable would allow a dispatch to state an output shape
+// inconsistent with the one the register commands are actually built for,
+// so both the serializer and the runtime reject them outright.
 enum Conv2DDimension : ubyte {
   INPUT_WIDTH = 0,
   INPUT_HEIGHT = 1,
   INPUT_CHANNELS = 2,
-  OUTPUT_WIDTH = 3,
-  OUTPUT_HEIGHT = 4,
   OUTPUT_CHANNELS = 5,
   WEIGHTS_WIDTH = 6,
   WEIGHTS_HEIGHT = 7,
@@ -79,6 +84,14 @@ table Conv2DDef {
   // semantic validation and register-command construction. Entries must be
   // unique. An absent/empty vector preserves the original fully-static ABI.
   runtime_dimensions:[Conv2DDimension];
+
+  // Symmetric spatial padding. These fields are deliberately appended for
+  // FlatBuffers compatibility: older RKT1 binaries omit them and read as
+  // unpadded. `pad_top` is also applied below the input and `pad_left` is
+  // also applied to its right, matching Rocket ConvShape's current
+  // two-value padding model.
+  pad_top:uint32;
+  pad_left:uint32;
 }
 
 // Describes one row-major [M,K] x [K,N] fully-connected operation.

@@ -2,13 +2,16 @@
 //
 // This exercises the Rocket serializer directly. The ordered runtime dimension
 // list maps the four pipeline constants to input_width, input_height,
-// output_width, and output_height. Runtime fields use zero in the executable
-// template; the driver replaces them with nonzero push constants at dispatch.
+// input_channels, and output_channels. Runtime fields use zero in the
+// executable template; the driver replaces them with nonzero push constants at
+// dispatch. output_width/output_height stay zero here and carry no meaning:
+// the runtime always derives the output extent, which is why they are not
+// listable in 'runtime_dimensions' (see rocket_runtime_dimensions_invalid.mlir).
 
 #rocket_target = #hal.executable.target<"rocket", "rocket-flatbuffer-v1", {
   kernel = "conv2d",
-  input_width = 0 : i32, input_height = 0 : i32, input_channels = 32 : i32,
-  output_width = 0 : i32, output_height = 0 : i32, output_channels = 16 : i32,
+  input_width = 0 : i32, input_height = 0 : i32, input_channels = 0 : i32,
+  output_width = 0 : i32, output_height = 0 : i32, output_channels = 0 : i32,
   weights_width = 1 : i32, weights_height = 1 : i32, stride = 1 : i32,
   depthwise = false,
   input_zero_point = 0 : i32, output_zero_point = 0 : i32, weights_zero_point = 0 : i32,
@@ -16,7 +19,7 @@
   truncate_bits = 0 : i32,
   activation = "none", activation_cmp = 0 : i32,
   precision = "fp16",
-  runtime_dimensions = ["input_width", "input_height", "output_width", "output_height"]
+  runtime_dimensions = ["input_width", "input_height", "input_channels", "output_channels"]
 }>
 
 #pipeline_layout = #hal.pipeline.layout<constants = 4, bindings = [

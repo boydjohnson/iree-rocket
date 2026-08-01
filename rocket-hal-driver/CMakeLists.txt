@@ -38,6 +38,9 @@ file(GLOB_RECURSE ROCKET_SCHEMA_SOURCES CONFIGURE_DEPENDS
   "${CMAKE_CURRENT_SOURCE_DIR}/../rocket-schema/generated/rust/*.rs"
   "${CMAKE_CURRENT_SOURCE_DIR}/../rocket-schema/schema/*.fbs"
 )
+file(GLOB_RECURSE IREE_ROCKET_HAL_RUST_SOURCES CONFIGURE_DEPENDS
+  "${CMAKE_CURRENT_SOURCE_DIR}/../iree-rocket-hal/src/*.rs"
+)
 
 add_custom_command(
   OUTPUT "${ROCKET_LIB_PATH}"
@@ -50,7 +53,9 @@ add_custom_command(
   DEPENDS
     ${ROCKET_RUST_SOURCES}
     ${ROCKET_SCHEMA_SOURCES}
+    ${IREE_ROCKET_HAL_RUST_SOURCES}
     "${CMAKE_CURRENT_SOURCE_DIR}/Cargo.toml"
+    "${CMAKE_CURRENT_SOURCE_DIR}/../iree-rocket-hal/Cargo.toml"
     "${CMAKE_CURRENT_SOURCE_DIR}/../rocket-schema/Cargo.toml"
   COMMENT "Building rocket-hal-driver (cargo build --release${ROCKET_CARGO_TARGET_ARGS})"
   VERBATIM
@@ -69,7 +74,8 @@ set_target_properties(rocket_hal_driver_static PROPERTIES
   # place iree::hal/iree::async after this target already (e.g. the
   # iree_hal_cts_test_suite()-generated binaries, which pull rocket-cts's
   # `backends` OBJECT library's dependencies in independently) but broke
-  # for cts/pooling_dispatch_test.cc's hand-written iree_cc_test(), whose
+  # for hand-written iree_cc_test() consumers such as the RKT1 convolution
+  # harness, whose
   # DEPS list happened to put iree::hal before rocket_hal_driver_static --
   # ld's single left-to-right archive pass never revisits an already-
   # scanned .a for symbols a later archive turns out to need. Setting this

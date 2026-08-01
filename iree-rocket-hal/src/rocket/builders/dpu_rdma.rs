@@ -500,8 +500,11 @@ impl Register<DpuRdmaEwSurfStride> {
     /// Description: Surface stride of the element-wise (EW) feature map read by ERDMA.
     ///
     /// Bit width: 28 (bits 31:4)
-    /// Range of values: 0 to 2^28-1. Must be set to 1 if `erdma_data_mode` is per-channel.
-    /// Known limitations: Value constrained by `erdma_data_mode` (must be 1 in per-channel mode).
+    /// Range of values: 0 to 2^28-1, in 16-byte units. Pass `stride_bytes / 16`;
+    /// the builder shifts that logical field value into register bits 31:4. Must be set
+    /// to 1 if `erdma_data_mode` is per-channel.
+    /// Known limitations: The byte stride must be 16-byte aligned. Passing the already
+    /// encoded register word would shift it a second time.
     /// Related registers: `erdma_data_mode`/`erdma_surf_mode` (RDMA_ERDMA_CFG), `ew_surf_notch` (RDMA_EW_SURF_NOTCH).
     pub fn ew_surf_stride(&mut self, ew_surf_stride: Bits<28>) -> &mut Self {
         self.set_field(DPU_RDMA_RDMA_EW_SURF_STRIDE_EW_SURF_STRIDE__MASK, unsafe {
