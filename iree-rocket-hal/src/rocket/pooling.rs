@@ -16,6 +16,27 @@ use crate::rocket::{
     builders::{Bits, RegCmd, Register, pc::PCTrailer, ppu::*, ppu_rdma::*},
     regcmd::{KICK_PPU, KICK_PPU_RDMA, push_kick, zero},
 };
+use std::sync::OnceLock;
+
+/// Experiment knob: set `ROCKET_PPU_PINGPONG=0` to program PPU and PPU_RDMA
+/// with register-group ping-pong disabled, so only shadow group 0 is ever
+/// selected for writing or execution.
+///
+/// Background: `OPERATION_ENABLE` "and after this are all shadowed for
+/// ping-pong operation" (TRM 36, RKNN_cna_operation_enable), so every
+/// configuration register this module programs exists twice in hardware.
+/// `S_POINTER.pointer` picks the group writes land in and `S_POINTER.executer`
+/// (RO) picks the group the hardware runs from. A task therefore only ever
+/// writes one of the two groups, leaving the other holding whatever an earlier
+/// job left there -- a candidate for the stale state that currently requires a
+/// per-job AXI reset in the kernel driver to clear.
+///
+/// Disabling ping-pong pins both pointers to group 0, so the untouched group
+/// can never be selected. Default is enabled, matching the vendor captures.
+fn ppu_pingpong_enabled() -> bool {
+    static ENABLED: OnceLock<bool> = OnceLock::new();
+    *ENABLED.get_or_init(|| !matches!(std::env::var("ROCKET_PPU_PINGPONG").as_deref(), Ok("0")))
+}
 
 /// Appends the captured PPU/PPU_RDMA trailer and its two-word fetch padding.
 ///
@@ -534,20 +555,25 @@ fn build_pooling_tile_task(
     // persistent 0x0e configuration leaves the steady-state value unchanged.
     // ========================================================================
 
+    // With ROCKET_PPU_PINGPONG=0 the enables drop out, pinning both pointers
+    // to group 0; the W1C clears still fire, so the starting group is the same
+    // either way. See `ppu_pingpong_enabled`.
+    let pp = u32::from(ppu_pingpong_enabled());
+
     cmds.push(
         Register::<PpuSPointer>::new()
-            .pointer_pp_mode(Bits::new(1))
-            .executer_pp_en(Bits::new(1))
-            .pointer_pp_en(Bits::new(1))
+            .pointer_pp_mode(Bits::new(pp))
+            .executer_pp_en(Bits::new(pp))
+            .pointer_pp_en(Bits::new(pp))
             .pointer_pp_clear(Bits::new(1))
             .executer_pp_clear(Bits::new(1))
             .build(),
     );
     cmds.push(
         Register::<PpuRdmaSPointer>::new()
-            .pointer_pp_mode(Bits::new(1))
-            .executer_pp_en(Bits::new(1))
-            .pointer_pp_en(Bits::new(1))
+            .pointer_pp_mode(Bits::new(pp))
+            .executer_pp_en(Bits::new(pp))
+            .pointer_pp_en(Bits::new(pp))
             .pointer_pp_clear(Bits::new(1))
             .executer_pp_clear(Bits::new(1))
             .build(),
