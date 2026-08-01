@@ -866,6 +866,39 @@ mod tests {
     }
 
     #[test]
+    fn sub_atomic_channel_counts_emit_an_identical_program() {
+        // pooling_hw.rs moved its cases from one channel to a full atom on the
+        // stated grounds that this changes no emitted register, only how much
+        // of each atom carries checked data. Hold that invariant here: any
+        // channel count inside one int8 atom must produce the same commands.
+        let words = |logical_channels| -> Vec<u64> {
+            single_task(
+                &PoolingShape {
+                    input_channels: logical_channels,
+                    output_channels: logical_channels,
+                    ..shape(13, 9, 3, 3, 2, 2, PoolingPrecision::Int8)
+                },
+                &PoolingBuffers {
+                    input_addr: 0x1000,
+                    output_addr: 0x8000,
+                },
+            )
+            .iter()
+            .map(|command| command.0)
+            .collect()
+        };
+
+        let reference = words(16);
+        for logical_channels in [1, 2, 8, 15, 16] {
+            assert_eq!(
+                words(logical_channels),
+                reference,
+                "c={logical_channels} diverged from the full-atom program"
+            );
+        }
+    }
+
+    #[test]
     fn int8_average_reciprocals_match_the_convpool_capture() {
         // convpool-w32-h32-ci16-co16-k3-s1-pk2-ps2-pmavg-i8.rknn
         // emits an ordinary flying-mode PPU stage after its memory-writing

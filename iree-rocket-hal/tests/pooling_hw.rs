@@ -11,10 +11,10 @@
 //! with `--features kernel-fix`. They remain ignored and must still be selected
 //! with `--ignored` on the board.
 //!
-//! Each logical int8 pixel occupies channel zero of a 16-byte NC1HWC2 feature
-//! atom. Wide cases submit every independently kicked tile as the ordered task
-//! array of one kernel job, with all tasks writing disjoint columns of one
-//! shared output BO.
+//! Each logical int8 pixel occupies one full 16-byte NC1HWC2 feature atom, all
+//! `TEST_CHANNELS` of it carrying data that is checked on readback. Wide cases
+//! submit every independently kicked tile as the ordered task array of one
+//! kernel job, with all tasks writing disjoint columns of one shared output BO.
 
 use std::{
     fs::{File, OpenOptions},
@@ -31,6 +31,20 @@ use iree_rocket_hal::rocket::{
 
 const DEVICE_PATH: &str = "/dev/accel/accel0";
 const FEATURE_ATOM_BYTES: usize = 16;
+
+/// Logical channels every numerical case carries: one full int8 NC1HWC2 atom.
+///
+/// These ran at one channel for a long time, which left fifteen of every
+/// sixteen atom bytes zero and unverified. It also made the vendor comparison
+/// meaningless: rknn-toolkit2 prefixes a channel-repacking `0x0d` stage for
+/// *every* geometry at c=1, so no test shape matched the vendor structurally.
+/// At a full atom the toolkit emits a bare `0x60` for the geometries marked
+/// `vendor_bare`, which is exactly what `PoolingPlan` emits.
+///
+/// `PoolingPlan` rounds `input_channels` up to the atom either way, so this
+/// does not change a single emitted register -- only how much of each atom
+/// carries real data and gets checked.
+const TEST_CHANNELS: u32 = 16;
 
 #[derive(Clone, Copy, Debug)]
 struct NumericCase {
@@ -53,10 +67,10 @@ struct NumericCase {
     /// its input arrives as graph-level NCHW, and which this crate does not
     /// need because it owns its own buffer layout.
     ///
-    /// **This is the c>=2 classification.** At c=1, which is what
-    /// `pooling_shape` actually runs, the toolkit inserts the layout stage for
-    /// every geometry, so a c=1 classification would mark all nine `false` and
-    /// leave nothing to run.
+    /// Classified at `TEST_CHANNELS`, which is what these cases run. (At one
+    /// channel the toolkit inserts the layout stage for every geometry, so the
+    /// flag would be `false` everywhere and separate nothing -- that is why
+    /// these tests no longer run at c=1.)
     vendor_bare: bool,
 }
 
@@ -163,10 +177,10 @@ fn pooling_shape(case: NumericCase, method: PoolingMethod) -> PoolingShape {
     PoolingShape {
         input_width: case.width,
         input_height: case.height,
-        input_channels: 1,
+        input_channels: TEST_CHANNELS,
         output_width: (case.width - case.kernel_width) / case.stride_x + 1,
         output_height: (case.height - case.kernel_height) / case.stride_y + 1,
-        output_channels: 1,
+        output_channels: TEST_CHANNELS,
         precision: PoolingPrecision::Int8,
         kernel_width: case.kernel_width,
         kernel_height: case.kernel_height,
@@ -181,45 +195,55 @@ fn pooling_shape(case: NumericCase, method: PoolingMethod) -> PoolingShape {
     }
 }
 
+/// Channel-minor within each pixel, matching the NC1HWC2 atom the hardware
+/// consumes: index `(y * width + x) * TEST_CHANNELS + channel`.
 fn numeric_input(case: NumericCase) -> Vec<i8> {
-    let mut input = Vec::with_capacity((case.width * case.height) as usize);
+    let mut input = Vec::with_capacity((case.width * case.height * TEST_CHANNELS) as usize);
     for y in 0..case.height {
         for x in 0..case.width {
-            // Non-monotonic and non-negative: max/min cannot accidentally
-            // pass through a fixed-corner bug, while int8 ordering is clear.
-            input.push(((13 * x + 7 * y + 3 * x * y) % 61) as i8);
+            for channel in 0..TEST_CHANNELS {
+                // Non-monotonic and non-negative: max/min cannot accidentally
+                // pass through a fixed-corner bug, while int8 ordering is
+                // clear. The channel term is coprime-ish with the rest so no
+                // two channels of a pixel share a value, which is what makes a
+                // cross-channel mix-up visible.
+                input.push(((13 * x + 7 * y + 3 * x * y + 29 * channel) % 61) as i8);
+            }
         }
     }
     input
 }
 
 fn cpu_pool(input: &[i8], shape: &PoolingShape) -> Vec<i8> {
-    let mut output = Vec::with_capacity((shape.output_width * shape.output_height) as usize);
+    let channels = shape.input_channels;
+    let mut output =
+        Vec::with_capacity((shape.output_width * shape.output_height * channels) as usize);
     for output_y in 0..shape.output_height {
         for output_x in 0..shape.output_width {
-            let input_y = output_y * shape.stride_y;
-            let input_x = output_x * shape.stride_x;
-            let mut minimum = i8::MAX;
-            let mut maximum = i8::MIN;
-            let mut sum = 0i32;
-            for kernel_y in 0..shape.kernel_height {
-                for kernel_x in 0..shape.kernel_width {
-                    let index =
-                        ((input_y + kernel_y) * shape.input_width + input_x + kernel_x) as usize;
-                    let value = input[index];
-                    minimum = minimum.min(value);
-                    maximum = maximum.max(value);
-                    sum += i32::from(value);
+            for channel in 0..channels {
+                let input_y = output_y * shape.stride_y;
+                let input_x = output_x * shape.stride_x;
+                let mut minimum = i8::MAX;
+                let mut maximum = i8::MIN;
+                let mut sum = 0i32;
+                for kernel_y in 0..shape.kernel_height {
+                    for kernel_x in 0..shape.kernel_width {
+                        let pixel = (input_y + kernel_y) * shape.input_width + input_x + kernel_x;
+                        let value = input[(pixel * channels + channel) as usize];
+                        minimum = minimum.min(value);
+                        maximum = maximum.max(value);
+                        sum += i32::from(value);
+                    }
                 }
+                output.push(match shape.method {
+                    PoolingMethod::Max => maximum,
+                    PoolingMethod::Min => minimum,
+                    PoolingMethod::Avg => {
+                        let count = (shape.kernel_width * shape.kernel_height) as i32;
+                        ((sum + count / 2) / count) as i8
+                    }
+                });
             }
-            output.push(match shape.method {
-                PoolingMethod::Max => maximum,
-                PoolingMethod::Min => minimum,
-                PoolingMethod::Avg => {
-                    let count = (shape.kernel_width * shape.kernel_height) as i32;
-                    ((sum + count / 2) / count) as i8
-                }
-            });
         }
     }
     output
@@ -248,11 +272,17 @@ fn run_numeric_case_on_file(
     let fd = file.as_raw_fd();
 
     unsafe {
-        let input_bytes = input.len() * FEATURE_ATOM_BYTES;
+        // One atom per pixel; TEST_CHANNELS of its bytes now carry real data.
+        let channels = TEST_CHANNELS as usize;
+        let input_pixels = (case.width * case.height) as usize;
+        let input_bytes = input_pixels * FEATURE_ATOM_BYTES;
         let buf_in = Buffer::new(fd, page_aligned(input_bytes), file);
         ptr::write_bytes(buf_in.host_ptr, 0, buf_in.size);
-        for (pixel, &value) in input.iter().enumerate() {
-            *buf_in.host_ptr.add(pixel * FEATURE_ATOM_BYTES) = value as u8;
+        for pixel in 0..input_pixels {
+            for channel in 0..channels {
+                *buf_in.host_ptr.add(pixel * FEATURE_ATOM_BYTES + channel) =
+                    input[pixel * channels + channel] as u8;
+            }
         }
 
         let output_atoms = (shape.output_width * shape.output_height).next_multiple_of(4) as usize;
@@ -301,7 +331,10 @@ fn run_numeric_case_on_file(
 
         let raw_output = std::slice::from_raw_parts(buf_out.host_ptr, output_bytes);
         let actual = (0..expected.len())
-            .map(|pixel| raw_output[pixel * FEATURE_ATOM_BYTES] as i8)
+            .map(|index| {
+                let (pixel, channel) = (index / channels, index % channels);
+                raw_output[pixel * FEATURE_ATOM_BYTES + channel] as i8
+            })
             .collect();
 
         for command_buffer in command_buffers {
@@ -327,9 +360,12 @@ fn assert_numeric_case_on_file(
     let mut mismatches = Vec::new();
     for (index, (&got, &want)) in actual.iter().zip(&expected).enumerate() {
         if (i16::from(got) - i16::from(want)).abs() > tolerance && mismatches.len() < 8 {
-            let y = index as u32 / shape.output_width;
-            let x = index as u32 % shape.output_width;
-            mismatches.push(format!("[{y}, {x}] want {want} got {got}"));
+            let index = index as u32;
+            let channel = index % shape.output_channels;
+            let pixel = index / shape.output_channels;
+            let y = pixel / shape.output_width;
+            let x = pixel % shape.output_width;
+            mismatches.push(format!("[{y}, {x}, c{channel}] want {want} got {got}"));
         }
     }
     assert!(
@@ -386,7 +422,7 @@ fn numerical_dimension_matrix_has_expected_direct_task_counts() {
             );
             assert_eq!(
                 cpu_pool(&numeric_input(case), &shape).len(),
-                (shape.output_width * shape.output_height) as usize,
+                (shape.output_width * shape.output_height * shape.output_channels) as usize,
                 "{} {method:?} CPU reference extent",
                 case.name
             );
