@@ -264,6 +264,24 @@ fn validate_pooling_geometry(
         input_channels, output_channels,
         "pooling preserves the channel count"
     );
+    // A stride wider than its kernel skips input, and a direct PPU program
+    // for such a shape hangs the NPU: on RK3588 hardware, 64x31 k3x3 at
+    // sy=4, sy=5 and sx=8 each time out on their own dispatch against the
+    // driver's 500 ms watchdog (iree-rocket-hal/tests/pooling_hw.rs,
+    // `wedging_stride_y_sweep`). These are exactly the geometries
+    // rknn-toolkit2 compiles with a CNA|CORE|DPU stage ahead of the PPU
+    // kick, which this crate does not emit. Reject them rather than emit a
+    // program known to wedge the hardware.
+    for (axis, stride, kernel) in [
+        ("horizontal", stride_x, kernel_width),
+        ("vertical", stride_y, kernel_height),
+    ] {
+        assert!(
+            stride <= kernel,
+            "{axis} stride {stride} exceeds kernel {kernel}; the direct PPU path \
+             hangs the NPU for stride-beyond-kernel shapes"
+        );
+    }
     assert_eq!(
         output_width,
         output_extent(input_width, kernel_width, stride_x, pad_left, pad_right),
@@ -987,8 +1005,12 @@ mod tests {
     }
 
     #[test]
-    fn supported_kernel_edge_keeps_the_full_stride_field_available() {
-        let shape = shape(64, 48, 8, 8, 16, 16, PoolingPrecision::Int8);
+    fn largest_dispatchable_stride_encodes_at_the_kernel_edge() {
+        // The stride field is 4 bits (1..=16) but kernels cap at 8, and
+        // stride-beyond-kernel is rejected because it hangs the NPU, so 8 is
+        // the largest stride that can actually reach hardware. Strides 9..=16
+        // still fit the field and are unreachable by construction.
+        let shape = shape(64, 48, 8, 8, 8, 8, PoolingPrecision::Int8);
         let commands = single_task(
             &shape,
             &PoolingBuffers {
@@ -998,7 +1020,7 @@ mod tests {
         );
         assert_eq!(
             register_value::<PpuPoolingKernelCfg>(&commands),
-            0x00ff_0707
+            0x0077_0707
         );
     }
 
@@ -1211,5 +1233,26 @@ mod tests {
     #[should_panic(expected = "pooling kernel axes must be 1..=8")]
     fn rejects_kernel_beyond_hardware_backed_direct_limit() {
         shape(64, 48, 16, 3, 2, 2, PoolingPrecision::Int8).validate();
+    }
+
+    #[test]
+    #[should_panic(expected = "vertical stride 4 exceeds kernel 3")]
+    fn rejects_vertical_stride_beyond_kernel() {
+        shape(64, 31, 3, 3, 2, 4, PoolingPrecision::Int8).validate();
+    }
+
+    #[test]
+    #[should_panic(expected = "horizontal stride 8 exceeds kernel 3")]
+    fn rejects_horizontal_stride_beyond_kernel() {
+        shape(64, 31, 3, 3, 8, 2, PoolingPrecision::Int8).validate();
+    }
+
+    #[test]
+    fn accepts_stride_equal_to_kernel() {
+        // The boundary stays legal: stride == kernel is the disjoint-window
+        // case, and 64x31 k8x8 s8x8 dispatches cleanly on hardware. Only
+        // stride *beyond* kernel is rejected.
+        shape(64, 31, 8, 8, 8, 8, PoolingPrecision::Int8).validate();
+        shape(64, 31, 3, 3, 3, 3, PoolingPrecision::Int8).validate();
     }
 }

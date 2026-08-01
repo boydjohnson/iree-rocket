@@ -708,13 +708,20 @@ const fn stride_probe(stride_x: u32, stride_y: u32, vendor_bare: bool) -> Numeri
 #[ignore = "needs the real NPU device -- confirms the stride_y threshold and that stride_x is irrelevant"]
 fn wedging_stride_y_sweep() {
     // The predecessor sweep ruled out kernel area, window overlap and dispatch
-    // duration, leaving stride_y >= 3 as the separator across nine points --
-    // but the threshold was inferred from geometries that happened to cluster
-    // there, never swept. Here stride is the only thing that moves.
+    // duration, leaving stride_y >= 3 as the separator. Here stride is the only
+    // thing that moves, so the threshold is measured rather than inferred.
     //
-    // Predicted: sy <= 2 clean, sy >= 3 wedges, and both stride_x controls stay
-    // clean however large sx gets. A different sy threshold, or an sx control
-    // that wedges, refutes the vertical-prefetch reading.
+    // Result on hardware: sy1 and sy2 clean, sy3 wedges, sx3 clean. Since
+    // `sx3_sy2` and `sy3_sx2` are the same 64x31 k3x3 geometry with the strides
+    // transposed and only the vertical one wedges, the asymmetry is real and
+    // not an artifact of some other axis.
+    //
+    // The original run also probed sy=4, sy=5 and sx=8. Those did not wedge a
+    // successor -- they timed out on their *own* dispatch (500, 530 and 513 ms)
+    // because a stride wider than the kernel hangs the direct PPU path.
+    // `PoolingShape::validate` now rejects those shapes, so they would panic in
+    // `PoolingPlan::new` before reaching hardware and are no longer probed
+    // here; see the stride-beyond-kernel assertion in pooling.rs.
     run_wedge_probes(
         K3_TWO_TILES,
         &[
@@ -723,12 +730,9 @@ fn wedging_stride_y_sweep() {
             ("sy1_sx2", Some(stride_probe(2, 1, true))),
             ("sy2_sx2", Some(stride_probe(2, 2, true))),
             ("sy3_sx2", Some(stride_probe(2, 3, true))),
-            ("sy4_sx2", Some(stride_probe(2, 4, false))),
-            ("sy5_sx2", Some(stride_probe(2, 5, false))),
-            // Horizontal controls at a known-clean sy: only asymmetric_stride
-            // separated the two axes before, and only at sx=3.
+            // Horizontal control at a known-clean sy. sx must stay <= kernel
+            // now, so 3 is the largest probe available at a 3x3 kernel.
             ("sx3_sy2", Some(stride_probe(3, 2, true))),
-            ("sx8_sy2", Some(stride_probe(8, 2, false))),
         ],
     );
 }
