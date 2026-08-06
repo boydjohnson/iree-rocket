@@ -498,25 +498,26 @@ fn extent_sweep_at_fixed_channels() {
 /// on its own. `weight_banks=1` is a known-broken repeat, included as an
 /// in-test sanity check that this harness path reproduces the earlier
 /// result; the real question is `weight_banks` 2 through 6.
-#[test]
-#[ignore = "needs /dev/accel/accel0 -- cross-compile for aarch64 and run on the RK3588 board"]
-fn weight_bank_floor_probe() {
-    let file = OpenOptions::new()
-        .read(true)
-        .write(true)
-        .open(DEVICE_PATH)
-        .expect("failed to open RK3588 NPU device");
-    let fd = file.as_raw_fd();
-    let kernels = [3, 3];
-    let shape = Shape::with_out_channels(30, 30, 1, 256, 256).with_padding([0, 0]);
-
+/// Shared sweep body for `weight_bank_floor_probe` and
+/// `weight_bank_floor_probe_at_cin_512`: forces `weight_banks` across
+/// `range` at one fixed shape via `ConvPlan::with_cbuf_banks`, prints a
+/// pass-rate summary, and panics listing every weight_banks count that
+/// produced wrong output at least once.
+fn probe_weight_bank_floor(
+    fd: i32,
+    file: &std::fs::File,
+    label: &str,
+    shape: Shape,
+    kernels: Kernels,
+    range: std::ops::RangeInclusive<u32>,
+) {
     let mut summary = Vec::new();
-    for weight_banks in 1..=6u32 {
+    for weight_banks in range {
         let data_banks = 12 - weight_banks;
-        println!("\n=== weight_banks={weight_banks} data_banks={data_banks} (forced) ===");
+        println!("\n=== {label}: weight_banks={weight_banks} data_banks={data_banks} (forced) ===");
         let mut passed = 0;
         for i in 0..REPS {
-            match run(fd, &file, shape, kernels, Some((data_banks, weight_banks))) {
+            match run(fd, file, shape, kernels, Some((data_banks, weight_banks))) {
                 Ok(()) => {
                     println!("  rep {i}: ok");
                     passed += 1;
@@ -535,7 +536,7 @@ fn weight_bank_floor_probe() {
         summary.push((weight_banks, data_banks, passed));
     }
 
-    println!("\n=== summary: forced weight_banks -> pass rate (Cin=Cout=256, 3x3, 30x30) ===");
+    println!("\n=== summary: {label} forced weight_banks -> pass rate ===");
     for (weight_banks, data_banks, passed) in &summary {
         println!("  weight_banks={weight_banks} data_banks={data_banks}  {passed}/{REPS} passed");
     }
@@ -547,9 +548,123 @@ fn weight_bank_floor_probe() {
         .collect();
     assert!(
         broken.is_empty(),
-        "these forced weight_banks counts produced wrong output at least once: {}",
+        "{label}: these forced weight_banks counts produced wrong output at least once: {}",
         broken.join(", ")
     );
+}
+
+#[test]
+#[ignore = "needs /dev/accel/accel0 -- cross-compile for aarch64 and run on the RK3588 board"]
+fn weight_bank_floor_probe() {
+    let file = OpenOptions::new()
+        .read(true)
+        .write(true)
+        .open(DEVICE_PATH)
+        .expect("failed to open RK3588 NPU device");
+    let fd = file.as_raw_fd();
+    let kernels = [3, 3];
+    let shape = Shape::with_out_channels(30, 30, 1, 256, 256).with_padding([0, 0]);
+    probe_weight_bank_floor(fd, &file, "Cin=Cout=256", shape, kernels, 1..=6);
+}
+
+/// `weight_bank_floor_probe` found `weight_banks=3` sufficient at
+/// Cin=Cout=256 -- but `fixed_formula_resolves_features_19_and_21` then
+/// found `WEIGHT_BANKS_FLOOR=3` (a flat constant, applied regardless of
+/// `Cin`) leaves `features.21` (Cin=512, Cout=512) still all-zero at `9/3`,
+/// the exact split the flat floor produces there. `3` was never validated
+/// at Cin=512, only at Cin=256; this was a scope error in the fix, not a
+/// hardware fact holding at both. The vendor's own rknn-convert formula
+/// uses `weight_banks=9` at Cin=512 (`DESIGN_NOTES.md`'s 8x8 cross
+/// product), well above 3 -- this sweeps 3 through 9 explicitly on
+/// `features.21`'s exact shape to find where it actually starts passing,
+/// rather than assuming the vendor's own number is the tight minimum.
+#[test]
+#[ignore = "needs /dev/accel/accel0 -- cross-compile for aarch64 and run on the RK3588 board"]
+fn weight_bank_floor_probe_at_cin_512() {
+    let file = OpenOptions::new()
+        .read(true)
+        .write(true)
+        .open(DEVICE_PATH)
+        .expect("failed to open RK3588 NPU device");
+    let fd = file.as_raw_fd();
+    let kernels = [3, 3];
+    let shape = Shape::with_out_channels(30, 30, 1, 512, 512).with_padding([0, 0]);
+    probe_weight_bank_floor(
+        fd,
+        &file,
+        "Cin=Cout=512 (features.21)",
+        shape,
+        kernels,
+        3..=9,
+    );
+}
+
+/// A third point before trusting a formula fit to two: `weight_bank_floor_probe`
+/// found the minimum safe `weight_banks` is 3 at Cin=256, and
+/// `weight_bank_floor_probe_at_cin_512` found it is 5 at Cin=512. Both fit
+/// `floor = Cin/128 + 1` exactly, but two points define any line -- this is
+/// not yet a formula, just two confirmed shapes that happen to agree with
+/// one. Cin=384 is the natural next check: it sits exactly between the two
+/// confirmed points and the hypothesis predicts `floor=4` there. Sweeping
+/// 2 through 6 brackets that prediction with a point of margin on each
+/// side, in case the true relationship is close to linear but not exactly
+/// `Cin/128 + 1`.
+#[test]
+#[ignore = "needs /dev/accel/accel0 -- cross-compile for aarch64 and run on the RK3588 board"]
+fn weight_bank_floor_probe_at_cin_384() {
+    let file = OpenOptions::new()
+        .read(true)
+        .write(true)
+        .open(DEVICE_PATH)
+        .expect("failed to open RK3588 NPU device");
+    let fd = file.as_raw_fd();
+    let kernels = [3, 3];
+    let shape = Shape::with_out_channels(30, 30, 1, 384, 384).with_padding([0, 0]);
+    probe_weight_bank_floor(fd, &file, "Cin=Cout=384", shape, kernels, 2..=6);
+}
+
+/// The floor is a step, not a slope: 3 at Cin=256, 5 at both Cin=384 and
+/// Cin=512, not the 4 a linear fit through the first two points predicted
+/// at 384. Where the step from 3 to 5 actually happens between 256 and 384
+/// is unknown -- `weight_bank_floor_probe_at_cin_384` only bracketed 384
+/// itself, not the gap below it. Cin=320 bisects the untested 257..384
+/// range; if it needs 5, the step happens at or before 320 and 256 looks
+/// like the outlier rather than 384/512 being a plateau; if 3 or 4 is
+/// enough, the transition is somewhere in 321..384 instead.
+#[test]
+#[ignore = "needs /dev/accel/accel0 -- cross-compile for aarch64 and run on the RK3588 board"]
+fn weight_bank_floor_probe_at_cin_320() {
+    let file = OpenOptions::new()
+        .read(true)
+        .write(true)
+        .open(DEVICE_PATH)
+        .expect("failed to open RK3588 NPU device");
+    let fd = file.as_raw_fd();
+    let kernels = [3, 3];
+    let shape = Shape::with_out_channels(30, 30, 1, 320, 320).with_padding([0, 0]);
+    probe_weight_bank_floor(fd, &file, "Cin=Cout=320", shape, kernels, 2..=6);
+}
+
+/// Four points now: 256->3, 320->4, 384->5, 512->5. 256..384 is a clean
+/// +1-per-64 line -- but 512 breaks that same line (it predicts 7, not 5),
+/// so somewhere in the untested 385..511 gap the rise either plateaus at 5
+/// or does something else the two endpoints alone cannot distinguish.
+/// Cin=448 bisects that gap the same way 320 bisected the last one. If it
+/// needs 6, the line keeps rising past 384 and bends down only close to
+/// 512; if 5 is already enough at 448, the plateau starts at or before
+/// 384's neighborhood and 512 is not a special case.
+#[test]
+#[ignore = "needs /dev/accel/accel0 -- cross-compile for aarch64 and run on the RK3588 board"]
+fn weight_bank_floor_probe_at_cin_448() {
+    let file = OpenOptions::new()
+        .read(true)
+        .write(true)
+        .open(DEVICE_PATH)
+        .expect("failed to open RK3588 NPU device");
+    let fd = file.as_raw_fd();
+    let kernels = [3, 3];
+    let shape = Shape::with_out_channels(30, 30, 1, 448, 448).with_padding([0, 0]);
+    probe_weight_bank_floor(fd, &file, "Cin=Cout=448", shape, kernels, 4..=7);
 }
 
 /// Closes the loop `weight_bank_floor_probe` left open: that test forced

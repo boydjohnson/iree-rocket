@@ -229,20 +229,35 @@ const CBUF_BANKS: u32 = 12;
 /// Bytes one CBUF bank holds: 256 entries of 128 bytes.
 const CBUF_BANK_BYTES: u32 = 256 * 128;
 
-/// Fewer weight banks than this, granted to a coefficient footprint that
-/// actually needs more than it is given, silently produces all-zero output
-/// -- hardware-confirmed exact at `weight_banks` 1 and 2 (both 0/5) against
-/// 3 and above (5/5 each) for one shape (Cin=Cout=256, 3x3, 30x30), and
-/// matching the floor an independent formula (the vendor's own compiler,
-/// rknn-convert) never crosses across 75 shapes swept through it, none
-/// below `weight_banks=3`. See
-/// `iree-rocket-hal/tests/conv_cbuf_split_sweep_hw.rs::weight_bank_floor_probe`
-/// and DESIGN_NOTES.md "The floor is real: hardware-confirmed at exactly
-/// weight_banks=3" in iree-rocket-design-spike. Confirmed at exactly one
-/// `Cin`; not yet re-validated on hardware at others, though the vendor's
-/// own formula never goes below this either at any `Cin` tried (64 through
-/// 512).
-const WEIGHT_BANKS_FLOOR: u32 = 3;
+/// Minimum safe `weight_banks` once a coefficient footprint is being
+/// starved (granted fewer banks than its own uncapped demand -- see
+/// `demand_based_cbuf_partition`), as a function of `weight_channels`
+/// (padded `Cin`). Five hardware points, all via
+/// `iree-rocket-hal/tests/conv_cbuf_split_sweep_hw.rs::weight_bank_floor_probe*`,
+/// each the exact boundary (one value below fails 0/5, the value at or
+/// above passes 5/5):
+///
+///   Cin  256  320  384  448  512
+///   min    3    4    5    5    5
+///
+/// A first guess (`floor = Cin/128 + 1`) fit the 256/512 endpoints exactly
+/// and predicted 4 at 384; the real answer there is 5. The corrected
+/// picture, checked against all five points: **linear at +1 per 64 `Cin`
+/// from 256, plateauing at 5 from 384 on**. Nothing below Cin=256 has been
+/// probed with an explicit low override -- every validated shape down there
+/// (`features.0`'s Cin=3 included) has a real weight demand small enough
+/// that the starved branch never fires for it in the first place, so `3` is
+/// used unconditionally below 256 on the strength of the trend (floor rises
+/// with `Cin`, never falls) rather than a direct measurement. See
+/// DESIGN_NOTES.md "The floor is a slope, then a plateau" in
+/// iree-rocket-design-spike.
+fn weight_banks_floor(weight_channels: u32) -> u32 {
+    if weight_channels <= 256 {
+        3
+    } else {
+        (3 + (weight_channels - 256) / 64).min(5)
+    }
+}
 
 /// Largest value `CNA_CBUF_CON1.data_entries` can encode. The field is 14
 /// bits and holds `tile_input_rows * width`, so it is a hard bound on how
@@ -1050,17 +1065,18 @@ impl Shape {
         let data_banks = granted.clamp(1, CBUF_BANKS - 1);
         let weight_banks = CBUF_BANKS - data_banks;
 
-        // A coefficient footprint that would take WEIGHT_BANKS_FLOOR banks
+        // A coefficient footprint that would take weight_banks_floor's banks
         // or fewer on its own (`weights <= weight_banks`) is not being
         // starved by this grant -- it fits, same as any other capture, and
         // is left alone. One that has been clamped down below the floor
         // despite wanting more (`weights > weight_banks`) is the case
-        // WEIGHT_BANKS_FLOOR's doc comment covers: raise it to the floor
+        // weight_banks_floor's doc comment covers: raise it to the floor
         // and let feature data give up the difference, trading tile count
         // for correctness. `weights` is already known unbounded here, so
         // the floor itself, not `weights`, is always what gets granted.
-        if weight_banks < WEIGHT_BANKS_FLOOR && weights > weight_banks {
-            let weight_banks = WEIGHT_BANKS_FLOOR.min(CBUF_BANKS - 1);
+        let floor = weight_banks_floor(self.weight_channels());
+        if weight_banks < floor && weights > weight_banks {
+            let weight_banks = floor.min(CBUF_BANKS - 1);
             (CBUF_BANKS - weight_banks, weight_banks)
         } else {
             (data_banks, weight_banks)
@@ -4236,35 +4252,46 @@ mod tests {
     }
 
     #[test]
-    fn weight_banks_floor_only_lifts_a_footprint_that_is_actually_starved() {
-        // Cin=Cout=256, 3x3, 30x30 -- hardware-confirmed via
-        // weight_bank_floor_probe: weight_banks 1 and 2 both all-zero, 3
-        // and up correct. Before WEIGHT_BANKS_FLOOR this got the automatic
-        // 11/1 split (weight demand 1,179,648 bytes / CBUF_BANK_BYTES = 36,
-        // clamped to 1 because feature data's own demand is smaller and
-        // takes its full, capped ask). The floor lifts it to 9/3, which
-        // hardware confirms correct.
-        let broken = Shape::with_out_channels(30, 30, 1, 256, 256).with_padding([0, 0]);
-        assert_eq!(broken.data_banks([3, 3]), 9);
-        assert_eq!(broken.weight_banks([3, 3]), 3);
+    fn weight_banks_floor_matches_all_five_hardware_points() {
+        // Cin=Cout=N, 3x3, 30x30, swept explicitly via ConvPlan::with_cbuf_banks
+        // in iree-rocket-hal/tests/conv_cbuf_split_sweep_hw.rs's
+        // weight_bank_floor_probe* family -- each is the exact hardware
+        // boundary (floor-1 fails 0/5, floor passes 5/5). Not a flat
+        // constant: it rises +1 per 64 Cin from 256, then plateaus at 5
+        // from 384 on -- a first guess of `Cin/128 + 1` fit 256 and 512
+        // but predicted 4, not 5, at 384.
+        for (cin, floor) in [(256u32, 3u32), (320, 4), (384, 5), (448, 5), (512, 5)] {
+            let shape = Shape::with_out_channels(30, 30, 1, cin, cin).with_padding([0, 0]);
+            assert_eq!(
+                shape.weight_banks([3, 3]),
+                floor,
+                "Cin={cin} weight_banks floor"
+            );
+            assert_eq!(shape.data_banks([3, 3]), 12 - floor, "Cin={cin} data_banks");
+        }
 
-        // The real VGG-19 shapes this was chasing: features.19 and
-        // features.21, both hardware-proven all-zero at the automatic 11/1.
-        // Not independently hardware-confirmed at 9/3 -- flagged in
-        // DESIGN_NOTES.md as an extrapolation the vendor's own formula
-        // supports (it never goes below weight_banks=3 at these Cin either)
-        // but this specific split has not itself run on the board.
+        // The real VGG-19 shapes this was chasing: features.19 (Cin=256,
+        // Cout=512) and features.21 (Cin=512, Cout=512), both hardware-proven
+        // all-zero at the pre-fix automatic 11/1, and both hardware-confirmed
+        // fixed post-fix -- features.19 at floor=3
+        // (fixed_formula_resolves_features_19_and_21, 5/5) and features.21 at
+        // floor=5, *not* 3 (weight_bank_floor_probe_at_cin_512 found
+        // weight_banks=3 and 4 both still 0/5 at Cin=512; only 5 and up
+        // pass). Cout does not move the floor -- only Cin does, matching the
+        // asymmetry `DESIGN_NOTES.md`'s vendor-formula cross product found.
         let features_19 = Shape::with_out_channels(30, 30, 1, 256, 512).with_padding([0, 0]);
         assert_eq!(features_19.weight_banks([3, 3]), 3);
         let features_21 = Shape::with_out_channels(30, 30, 1, 512, 512).with_padding([0, 0]);
-        assert_eq!(features_21.weight_banks([3, 3]), 3);
+        assert_eq!(features_21.weight_banks([3, 3]), 5);
 
         // features.0's shape: weight_banks=1 here is not a starved
         // footprint, it is the footprint's *entire* real demand (1,728
         // bytes fits in a fraction of one bank) -- hardware-confirmed
         // correct at 11/1 by the original five-shape sweep, and the floor
         // must leave it alone rather than take banks a fully-resident
-        // footprint never needed.
+        // footprint never needed. Below Cin=256 the floor itself is
+        // unvalidated (see weight_banks_floor's doc comment); this only
+        // confirms the starved branch doesn't fire here at all.
         let features_0 = Shape::with_out_channels(226, 226, 1, 3, 64).with_padding([0, 0]);
         assert_eq!(features_0.data_banks([3, 3]), 11);
         assert_eq!(features_0.weight_banks([3, 3]), 1);
