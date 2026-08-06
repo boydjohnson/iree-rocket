@@ -551,3 +551,84 @@ fn weight_bank_floor_probe() {
         broken.join(", ")
     );
 }
+
+/// Closes the loop `weight_bank_floor_probe` left open: that test forced
+/// `weight_banks` explicitly via `ConvPlan::with_cbuf_banks`, so it never
+/// exercised the fixed *automatic* formula (`WEIGHT_BANKS_FLOOR` in
+/// `conv.rs`, applied inside `demand_based_cbuf_partition`) on the two real
+/// shapes that started this whole investigation. Both `features.19`
+/// (Cin=256, Cout=512) and `features.21` (Cin=512, Cout=512) were
+/// hardware-proven all-zero at their old automatic split (`11/1`) earlier in
+/// this file; this checks two things at once with `ConvPlan::new` and no
+/// override: that the fixed formula actually moves them off `11/1` at all,
+/// and that wherever it lands is correct on real hardware, not just
+/// plausible from the vendor's own formula agreeing in spirit.
+///
+/// A local (non-hardware) check found the fixed formula puts *both* shapes
+/// at `9/3` -- not `features.21`'s vendor-preferred `3/9` from
+/// DESIGN_NOTES.md's rknn sweep, since the fix only clamps up to the
+/// hardware-confirmed floor of 3, it does not reproduce the vendor's fuller
+/// `Cin`-dependent curve. `9/3` at `Cin=512` is therefore its own claim, not
+/// an inherited one from the `Cin=Cout=256` probe.
+#[test]
+#[ignore = "needs /dev/accel/accel0 -- cross-compile for aarch64 and run on the RK3588 board"]
+fn fixed_formula_resolves_features_19_and_21() {
+    let file = OpenOptions::new()
+        .read(true)
+        .write(true)
+        .open(DEVICE_PATH)
+        .expect("failed to open RK3588 NPU device");
+    let fd = file.as_raw_fd();
+    let kernels = [3, 3];
+
+    let layers: &[(&str, u32, u32)] = &[("features.19", 256, 512), ("features.21", 512, 512)];
+
+    let mut summary = Vec::new();
+    for (label, cin, cout) in layers {
+        let shape = Shape::with_out_channels(30, 30, 1, *cin, *cout).with_padding([0, 0]);
+        let plan = ConvPlan::new(shape, kernels);
+        let (data_banks, weight_banks) = (plan.data_banks(), plan.weight_banks());
+        println!(
+            "\n=== {label}: Cin={cin} Cout={cout} 30x30, automatic banks {data_banks}/{weight_banks} ==="
+        );
+        assert_ne!(
+            weight_banks, 1,
+            "{label} still lands on the pre-fix weight_banks=1 -- WEIGHT_BANKS_FLOOR did not move it"
+        );
+        let mut passed = 0;
+        for i in 0..REPS {
+            match run(fd, &file, shape, kernels, None) {
+                Ok(()) => {
+                    println!("  rep {i}: ok");
+                    passed += 1;
+                }
+                Err(failure) => {
+                    println!(
+                        "  rep {i}: FAIL ({} mismatches, timed_out={})",
+                        failure.mismatches, failure.timed_out
+                    );
+                    for sample in &failure.samples {
+                        println!("           {sample}");
+                    }
+                }
+            }
+        }
+        summary.push((*label, data_banks, weight_banks, passed));
+    }
+
+    println!("\n=== summary: fixed automatic formula on the real VGG-19 shapes ===");
+    for (label, data_banks, weight_banks, passed) in &summary {
+        println!("  {label:<12} banks {data_banks}/{weight_banks}  {passed}/{REPS} passed");
+    }
+
+    let broken: Vec<_> = summary
+        .iter()
+        .filter(|(_, _, _, passed)| *passed != REPS)
+        .map(|(label, d, w, passed)| format!("{label} ({d}/{w}, {passed}/{REPS})"))
+        .collect();
+    assert!(
+        broken.is_empty(),
+        "the fixed automatic formula still produced wrong output at least once: {}",
+        broken.join(", ")
+    );
+}
