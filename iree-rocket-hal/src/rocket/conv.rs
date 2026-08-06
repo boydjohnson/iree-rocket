@@ -1004,6 +1004,57 @@ impl Shape {
         self.width * self.height * FEATURE_ATOM_BYTES
     }
 
+    /// Whether a dense-layout tile whose feature fetch starts at input row
+    /// `in_first` is safe from `nonalign_dma`'s leading-pixel defect.
+    ///
+    /// Measured on real RK3588 hardware, not derived from documentation
+    /// (`iree-rocket-design-spike`'s `conv_dense_shared_buffer_dispatch_hw.rs`,
+    /// `conv_dense_odd_in_first_probe_hw.rs`,
+    /// `conv_dense_alignment_width_sweep_hw.rs`, and
+    /// `conv_dense_alignment_channel_sweep_hw.rs`/
+    /// `conv_dense_alignment_in_first_growth_hw.rs` -- see DESIGN_NOTES.md
+    /// there, "The dense (Cin<=4) ARGB path silently corrupts multi-row
+    /// dispatches" and its follow-ups, for the full characterization).
+    ///
+    /// `CNA_FEATURE_DATA_ADDR` is `in_first * input_row_stride`, and dense
+    /// mode's `input_row_stride` is not always a multiple of 16 -- so the
+    /// feature base is not always 16-byte aligned. `nonalign_dma` (always
+    /// on for dense mode) compensates for a misalignment up to one dense
+    /// pixel wide, but corrupts `max(0, ceil(offset / pixel_bytes) - 1)`
+    /// leading columns of every row a tile covers once the true offset
+    /// exceeds that. This was measured exactly (fitting all 22 points
+    /// across every `Cin` 1-4 and every offset each one's row stride can
+    /// produce, at fp16): the corrupted count is zero, i.e. safe, if and
+    /// only if `offset <= pixel_bytes`.
+    ///
+    /// `pixel_bytes` here is one dense pixel's *true* width (`Cin *
+    /// element_bytes`), not [`Precision::dense_pixel_bytes`]'s
+    /// capacity-formula width (padded to 4 channels) -- the two coincide
+    /// only at `Cin=4`.
+    ///
+    /// Always `true` outside dense layout: surfaces (`Cin > 4`) use a
+    /// different addressing path this defect has not been shown to reach.
+    /// Not yet measured at int8 -- see the "Open: int8" note on
+    /// [`realign_dense_row_tiles`].
+    pub fn dense_feature_offset_safe(&self, in_first: u32) -> bool {
+        if self.layout() != FeatureLayout::Dense {
+            return true;
+        }
+        let offset = (in_first * self.input_row_stride()) % FEATURE_ATOM_BYTES;
+        let pixel_bytes = self.in_channels * self.precision.element_bytes();
+        offset <= pixel_bytes
+    }
+
+    /// The input row a tile's feature fetch starts at, for an output range
+    /// beginning at `out_first` -- the half of [`Tile::from_bounds`]'s
+    /// formula that determines [`Shape::dense_feature_offset_safe`], broken
+    /// out so a boundary search can probe it without building a whole
+    /// [`Tile`].
+    fn tile_in_first(&self, kernels: Kernels, out_first: u32) -> u32 {
+        let padding = self.kernel_programming(kernels).pad_top;
+        (out_first * self.stride).saturating_sub(padding)
+    }
+
     /// Byte stride of one output row.
     ///
     /// The output is always NC1HWC2 with one 16-byte atom per pixel per
@@ -1320,9 +1371,6 @@ impl Tile {
             (1..=output_height).contains(&tiles),
             "tile count must be between 1 and the {output_height} output rows"
         );
-        let kernel = shape.kernel_programming(kernels);
-        let padding = kernel.pad_top;
-        let stride = shape.stride;
         let base = output_height / tiles;
         let remainder = output_height % tiles;
 
@@ -1330,35 +1378,49 @@ impl Tile {
         let mut out_first: u32 = 0;
         for index in 0..tiles {
             let out_rows = base + u32::from(index < remainder);
-
-            // Halo: the first input row a tile touches is its first output
-            // row projected back through the stride, less the padding it
-            // would otherwise read above the image. Matches all 150
-            // stride-2, -3 and -4 programs in the corpus.
-            let in_first = (out_first * stride).saturating_sub(padding);
-            let last_tap = (out_first + out_rows - 1) * stride + kernel.height - 1;
-            let in_last = last_tap.saturating_sub(padding).min(shape.height - 1);
-            let exact = in_last - in_first + 1;
-
-            // The vendor reads at least a full stride block per output row,
-            // which exceeds the exact tap span at stride > 1. Taking the
-            // larger of the two is safe by construction: it is never below
-            // `exact`, so every tap the tile needs is resident. Where the
-            // corpus disagrees it reads more still, which costs DMA rather
-            // than correctness.
-            let in_rows = exact.max(out_rows * stride).min(shape.height - in_first);
-
-            let projected_first = out_first * stride;
-            out.push(Tile {
-                out_first,
-                out_rows,
-                in_first,
-                in_rows,
-                pad_top: padding.saturating_sub(projected_first),
-            });
+            out.push(Tile::from_bounds(shape, kernels, out_first, out_rows));
             out_first += out_rows;
         }
         out
+    }
+
+    /// Builds one tile from an explicit output-row range, applying the same
+    /// halo/padding formula every tile in a [`Tile::split`] plan uses.
+    ///
+    /// Broken out of `split` so [`realign_dense_row_tiles`] can rebuild an
+    /// individual tile after moving its boundary, without duplicating this
+    /// arithmetic -- the two must stay in exact agreement, since a
+    /// realigned tile has to be bit-identical to what `split` itself would
+    /// have produced had it picked that boundary in the first place.
+    fn from_bounds(shape: Shape, kernels: Kernels, out_first: u32, out_rows: u32) -> Tile {
+        let kernel = shape.kernel_programming(kernels);
+        let padding = kernel.pad_top;
+        let stride = shape.stride;
+
+        // Halo: the first input row a tile touches is its first output row
+        // projected back through the stride, less the padding it would
+        // otherwise read above the image. Matches all 150 stride-2, -3 and
+        // -4 programs in the corpus.
+        let in_first = shape.tile_in_first(kernels, out_first);
+        let last_tap = (out_first + out_rows - 1) * stride + kernel.height - 1;
+        let in_last = last_tap.saturating_sub(padding).min(shape.height - 1);
+        let exact = in_last - in_first + 1;
+
+        // The vendor reads at least a full stride block per output row,
+        // which exceeds the exact tap span at stride > 1. Taking the larger
+        // of the two is safe by construction: it is never below `exact`, so
+        // every tap the tile needs is resident. Where the corpus disagrees
+        // it reads more still, which costs DMA rather than correctness.
+        let in_rows = exact.max(out_rows * stride).min(shape.height - in_first);
+
+        let projected_first = out_first * stride;
+        Tile {
+            out_first,
+            out_rows,
+            in_first,
+            in_rows,
+            pad_top: padding.saturating_sub(projected_first),
+        }
     }
 
     /// The single tile covering the whole image.
@@ -1923,13 +1985,102 @@ fn plan_grid(
             shape.max_tile_input_rows_for_width_and_data_banks(columns.in_cols, data_banks);
         let row_tiles = (1..=shape.output_height(kernels)).find_map(|count| {
             let rows = Tile::split(shape, kernels, count);
-            rows.iter()
-                .all(|tile| tile.in_rows <= max_rows)
-                .then_some(rows)
+            if !rows.iter().all(|tile| tile.in_rows <= max_rows) {
+                return None;
+            }
+            realign_dense_row_tiles(shape, kernels, &rows, max_rows)
         })?;
         tiles.extend(row_tiles.into_iter().map(|rows| Tile2D { rows, columns }));
     }
     Some(tiles)
+}
+
+/// For dense-layout convolutions, nudges `tiles`' interior row boundaries so
+/// every tile's `in_first` is safe against `nonalign_dma`'s leading-pixel
+/// defect ([`Shape::dense_feature_offset_safe`]), re-deriving each affected
+/// tile from its shifted boundary via [`Tile::from_bounds`]. A no-op --
+/// `Some(tiles.to_vec())` -- outside dense layout and for a single-tile
+/// plan (whose only boundary, row 0, is always safe: `in_first` there is
+/// always 0 regardless of padding or stride, and offset 0 trivially passes
+/// [`Shape::dense_feature_offset_safe`]).
+///
+/// Boundaries are searched outward from their original position, closest
+/// first, bounded by how much room the two neighbouring tiles have to give
+/// up (each must keep at least one output row). `max_rows` re-gates
+/// capacity after a shift, since moving a boundary changes both
+/// neighbours' `in_rows`, not just the moved one's.
+///
+/// `None` if some interior boundary has no safe, capacity-respecting
+/// position within that room -- the caller's existing
+/// retry-with-more-tiles loop (`plan_grid`) is what handles that, exactly
+/// as it already does for a plain capacity miss; more tiles means less
+/// room per boundary here, not more, so this is not expected to resolve on
+/// a later retry in general, and a shape that never finds a fit will
+/// surface as [`ConvPlan::new`]'s existing "needs horizontal tiling" panic
+/// for dense layout -- refusing outright rather than emitting a plan with
+/// a known-unsafe tile, matching this file's existing policy for the
+/// `weight_banks < 3` and `Cin <= 4` bugs above it.
+///
+/// Open: measured at fp16 only. Int8's dense `input_row_stride` (`width *
+/// Cin * 1` byte) is not always even the way fp16's is, so it can reach odd
+/// offsets fp16 never can -- untested, and [`Shape::dense_feature_offset_safe`]
+/// has not been validated there. This function still runs for int8 shapes
+/// (nothing here gates on precision), which is conservative in the sense of
+/// still enforcing the fp16-derived rule, but is unconfirmed to be either
+/// sufficient or necessary at int8.
+fn realign_dense_row_tiles(
+    shape: Shape,
+    kernels: Kernels,
+    tiles: &[Tile],
+    max_rows: u32,
+) -> Option<Vec<Tile>> {
+    if shape.layout() != FeatureLayout::Dense || tiles.len() <= 1 {
+        return Some(tiles.to_vec());
+    }
+
+    let output_height = shape.output_height(kernels);
+    let mut boundaries: Vec<u32> = tiles.iter().map(|tile| tile.out_first).collect();
+    boundaries.push(output_height);
+
+    for i in 1..boundaries.len() - 1 {
+        let lower = boundaries[i - 1] + 1;
+        let upper = boundaries[i + 1] - 1;
+        if lower > upper {
+            return None;
+        }
+        let current = boundaries[i];
+        if shape.dense_feature_offset_safe(shape.tile_in_first(kernels, current)) {
+            continue;
+        }
+
+        let max_distance = (current - lower).max(upper - current);
+        let mut best = None;
+        for distance in 1..=max_distance {
+            let candidates = [current.checked_sub(distance), current.checked_add(distance)];
+            for candidate in candidates.into_iter().flatten() {
+                if candidate < lower || candidate > upper {
+                    continue;
+                }
+                if shape.dense_feature_offset_safe(shape.tile_in_first(kernels, candidate)) {
+                    best = Some(candidate);
+                    break;
+                }
+            }
+            if best.is_some() {
+                break;
+            }
+        }
+        boundaries[i] = best?;
+    }
+
+    let realigned: Vec<Tile> = boundaries
+        .windows(2)
+        .map(|window| Tile::from_bounds(shape, kernels, window[0], window[1] - window[0]))
+        .collect();
+    realigned
+        .iter()
+        .all(|tile| tile.in_rows <= max_rows)
+        .then_some(realigned)
 }
 
 fn grid_fits(shape: Shape, tiles: &[Tile2D], data_banks: u32) -> bool {
@@ -4309,6 +4460,143 @@ mod tests {
     #[should_panic(expected = "output channels must be")]
     fn rejects_output_channels_beyond_the_validated_range() {
         let _ = Shape::with_out_channels(32, 32, 1, 3, 513);
+    }
+
+    #[test]
+    fn dense_feature_offset_safe_matches_all_22_hardware_points() {
+        // Every (Cin, offset, corrupted_columns) point
+        // conv_dense_alignment_channel_sweep_hw.rs and
+        // conv_dense_alignment_width_sweep_hw.rs measured on real RK3588
+        // hardware, restated as the safe/unsafe boundary this function
+        // exposes: safe iff `corrupted_columns == 0` iff `offset <=
+        // pixel_bytes`. `in_first` values are chosen to land on the listed
+        // offset given each shape's own `input_row_stride`.
+        let cin1 = Shape::with_out_channels(225, 60, 1, 1, 8).with_padding([0, 0]); // stride mod16=2
+        for (in_first, safe) in [(0, true), (1, true), (2, false), (3, false), (7, false)] {
+            assert_eq!(
+                cin1.dense_feature_offset_safe(in_first),
+                safe,
+                "Cin=1 in_first={in_first}"
+            );
+        }
+        let cin2 = Shape::with_out_channels(225, 60, 1, 2, 8).with_padding([0, 0]); // stride mod16=4
+        for (in_first, safe) in [(0, true), (1, true), (2, false), (3, false)] {
+            assert_eq!(
+                cin2.dense_feature_offset_safe(in_first),
+                safe,
+                "Cin=2 in_first={in_first}"
+            );
+        }
+        let cin3 = Shape::with_out_channels(227, 60, 1, 3, 256).with_padding([0, 0]); // stride mod16=2
+        for (in_first, safe) in [(0, true), (3, true), (4, false), (6, false), (7, false)] {
+            assert_eq!(
+                cin3.dense_feature_offset_safe(in_first),
+                safe,
+                "Cin=3 in_first={in_first}"
+            );
+        }
+        let cin4 = Shape::with_out_channels(225, 60, 1, 4, 256).with_padding([0, 0]); // stride mod16=8
+        for in_first in 0..8 {
+            assert!(
+                cin4.dense_feature_offset_safe(in_first),
+                "Cin=4 in_first={in_first} -- structurally can never exceed its own pixel width"
+            );
+        }
+        // Cout plays no role -- the address formula never references it.
+        let small_cout = Shape::with_out_channels(227, 60, 1, 3, 8).with_padding([0, 0]);
+        assert!(small_cout.dense_feature_offset_safe(0));
+        assert!(!small_cout.dense_feature_offset_safe(4));
+
+        // Surfaces (Cin > 4) are a different addressing path this defect
+        // has not been shown to reach; always reported safe.
+        let surfaces = Shape::with_out_channels(227, 60, 1, 5, 8);
+        for in_first in 0..8 {
+            assert!(surfaces.dense_feature_offset_safe(in_first));
+        }
+    }
+
+    #[test]
+    fn conv_plan_moves_run1_tile_boundary_off_the_hardware_confirmed_break() {
+        // rocket_conv_harness.py's run1 (iree-rocket-design-spike): Cin=3
+        // dense, Cout=256, 3x3, 228x228 physically-padded input. Before this
+        // fix, ConvPlan::new's automatic split put tile 5's out_first/
+        // in_first at 189 (odd -- an 8-byte-misaligned feature base at this
+        // shape's stride), hardware-confirmed to corrupt one leading pixel
+        // of every one of that tile's 37 output rows
+        // (conv_dense_shared_buffer_dispatch_hw.rs).
+        let kernels = [3, 3];
+        let shape = Shape::with_out_channels(228, 228, 1, 3, 256).with_padding([0, 0]);
+        let plan = ConvPlan::new(shape, kernels);
+        assert_eq!(plan.data_banks(), 10);
+        assert_eq!(plan.weight_banks(), 2);
+        assert_eq!(plan.tiles().len(), 6);
+
+        let mut covered = 0u32;
+        for tile in plan.tiles() {
+            assert_eq!(
+                tile.rows.out_first, covered,
+                "row coverage must stay contiguous with no gap or overlap"
+            );
+            covered += tile.rows.out_rows;
+            assert!(
+                shape.dense_feature_offset_safe(tile.rows.in_first),
+                "tile at in_first={} is not alignment-safe",
+                tile.rows.in_first
+            );
+        }
+        assert_eq!(covered, shape.output_height(kernels));
+
+        // The specific boundary that broke: it moved from 189 to the
+        // nearest safe row, 188 (offset 0), by giving tile 4 one fewer row
+        // and tile 5 one more -- not by changing the tile count or any
+        // other boundary.
+        assert_eq!(plan.tiles()[4].rows.out_rows, 36);
+        assert_eq!(plan.tiles()[5].rows.out_first, 188);
+        assert_eq!(plan.tiles()[5].rows.in_first, 188);
+        assert_eq!(plan.tiles()[5].rows.out_rows, 38);
+    }
+
+    #[test]
+    fn dense_row_tiling_stays_gap_free_and_alignment_safe_across_a_shape_sweep() {
+        // Host-side sweep, no hardware needed: dense_feature_offset_safe is
+        // a pure function of the plan ConvPlan::new already produces, so
+        // this checks the fix holds broadly rather than just at run1's one
+        // shape. 4 Cin values x 5 Cout values x 6 widths x 4 heights = 480
+        // shapes; a wider 1000-shape sweep (adding Cout=512 and more
+        // widths/heights) was run manually while developing this fix with
+        // the same result -- kept smaller here to stay fast in the regular
+        // suite.
+        let kernels = [3, 3];
+        for cin in [1u32, 2, 3, 4] {
+            for cout in [1u32, 8, 64, 256] {
+                for width in [30u32, 61, 97, 225, 227, 300] {
+                    for height in [30u32, 61, 226, 300] {
+                        let shape =
+                            Shape::with_out_channels(width, height, 1, cin, cout).with_padding([0, 0]);
+                        let plan = ConvPlan::new(shape, kernels);
+                        let mut covered = 0u32;
+                        for tile in plan.tiles() {
+                            assert_eq!(
+                                tile.rows.out_first, covered,
+                                "cin={cin} cout={cout} w={width} h={height}: gap/overlap"
+                            );
+                            covered += tile.rows.out_rows;
+                            assert!(
+                                shape.dense_feature_offset_safe(tile.rows.in_first),
+                                "cin={cin} cout={cout} w={width} h={height}: unsafe tile at \
+                                 in_first={}",
+                                tile.rows.in_first
+                            );
+                        }
+                        assert_eq!(
+                            covered,
+                            shape.output_height(kernels),
+                            "cin={cin} cout={cout} w={width} h={height}: coverage mismatch"
+                        );
+                    }
+                }
+            }
+        }
     }
 
     /// The quantization of `conv-w32-h32-k3-s1-i8`, read off the capture.
