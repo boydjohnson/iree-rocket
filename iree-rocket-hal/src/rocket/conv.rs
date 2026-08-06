@@ -4571,8 +4571,8 @@ mod tests {
             for cout in [1u32, 8, 64, 256] {
                 for width in [30u32, 61, 97, 225, 227, 300] {
                     for height in [30u32, 61, 226, 300] {
-                        let shape =
-                            Shape::with_out_channels(width, height, 1, cin, cout).with_padding([0, 0]);
+                        let shape = Shape::with_out_channels(width, height, 1, cin, cout)
+                            .with_padding([0, 0]);
                         let plan = ConvPlan::new(shape, kernels);
                         let mut covered = 0u32;
                         for tile in plan.tiles() {
