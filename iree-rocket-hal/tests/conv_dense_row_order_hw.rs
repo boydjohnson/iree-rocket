@@ -19,10 +19,15 @@
 //! spatial *tap* order to reason about -- output row `y` must read input
 //! row `y` exactly, one-to-one, no halo, no padding offset. Each input row
 //! is filled with one of three distinguishable constants cycling by `y %
-//! 3`, at a height (400) that `ConvPlan` splits into 2 tiles. A tile-
+//! 3`, at a height (1200) that `ConvPlan` splits into 2 tiles. A tile-
 //! boundary bug shows up as a row reading back the wrong phase of the
 //! cycle, or a whole tile's rows shifted, rather than an aggregate
 //! magnitude mismatch.
+//!
+//! The original failure was at 32x400 under the old dense CBUF accounting.
+//! Vendor-matching ARGB pixel charging now correctly fits that shape in one
+//! tile, so the primary multi-tile regression uses height=1200. The separate
+//! diagnostic probes below retain the historical 32x400 shape.
 //!
 //!   CARGO_TARGET_AARCH64_UNKNOWN_LINUX_GNU_LINKER=aarch64-linux-gnu-gcc \
 //!     cargo test --target aarch64-unknown-linux-gnu --release \
@@ -52,7 +57,8 @@ const PAGE_BYTES: usize = 4096;
 const ROW_VALUES: [u16; 3] = [0x3c00, 0x4000, 0x4200];
 
 const WIDTH: u32 = 32;
-const HEIGHT: u32 = 400; // ConvPlan::new splits this into 2 tiles at Cin=Cout=1, 1x1.
+const HEIGHT: u32 = 400; // Historical failure shape, now correctly one tile.
+const MULTI_TILE_HEIGHT: u32 = 1200; // ConvPlan::new splits this into 2 tiles.
 const REPS: usize = 3;
 
 fn page_aligned_size(size: usize) -> usize {
@@ -277,7 +283,7 @@ fn dense_row_order_survives_a_multi_tile_1x1_identity_conv() {
 
     let mut passed = 0;
     for i in 0..REPS {
-        match run(fd, &file, WIDTH, HEIGHT, 1, None, 5_000_000_000) {
+        match run(fd, &file, WIDTH, MULTI_TILE_HEIGHT, 1, None, 5_000_000_000) {
             Ok(()) => {
                 println!("rep {i}: ok");
                 passed += 1;
@@ -295,7 +301,7 @@ fn dense_row_order_survives_a_multi_tile_1x1_identity_conv() {
     }
 
     println!("\n=== summary: dense_row_order_survives_a_multi_tile_1x1_identity_conv ===");
-    println!("  {WIDTH}x{HEIGHT}  {passed}/{REPS} passed");
+    println!("  {WIDTH}x{MULTI_TILE_HEIGHT}  {passed}/{REPS} passed");
 
     assert_eq!(
         passed, REPS,
@@ -346,17 +352,17 @@ fn dense_row_order_break_point_scales_with_width() {
 /// file's own Cin=1/Cout=1/32x400) does the *entire* 256-row image in one
 /// program (`feature_grains=256`, no row split at its 1-core plan) -- so a
 /// large single-program row count is not inherently unsafe. But it does so
-/// at `banks 8/4`, not the `11/1` `ConvPlan` picks automatically for this
-/// file's own failing shape. Every prior bug this investigation found
+/// at `banks 8/4`, not the `11/1` the older `ConvPlan` picked automatically
+/// for this file's historical failing shape. Every prior bug this investigation found
 /// (`weight_banks<3` at large `Cin`) was about the *weight* side being
 /// starved; `Cin=Cout=1`'s weight footprint here is 2 bytes, nowhere near
 /// starved, so the mechanism can't be identical -- but an imbalanced split
 /// is an imbalanced split, and this checks the same lever (explicit
 /// `ConvPlan::with_cbuf_banks`, same escape hatch `weight_bank_floor_probe`
 /// used) on the *data* side instead: does forcing a split closer to the
-/// vendor's own (fewer data banks, more weight banks than the automatic
-/// `11/1`) fix the corruption at this exact shape (32x400, break at row 16
-/// under the automatic split)?
+/// vendor's own (fewer data banks, more weight banks than the historical
+/// automatic `11/1`) fix the corruption at this exact shape (32x400, break
+/// at row 16 under that old automatic split)?
 #[test]
 #[ignore = "needs /dev/accel/accel0 -- cross-compile for aarch64 and run on the RK3588 board"]
 fn dense_row_order_break_point_vs_cbuf_split() {

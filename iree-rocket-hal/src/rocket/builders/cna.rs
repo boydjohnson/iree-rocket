@@ -742,26 +742,16 @@ impl RegisterMeta for CnaCbufCon1 {
 impl Register<CnaCbufCon1> {
     /// Description: Number of CBUF bank-spaces needed to store one feature map row.
     ///
-    /// Bit width: 13
-    /// Range of values: 0x0000-0x1FFF, per the TRM's bit table (bits 12:0; bits 31:13
-    /// reserved).
-    /// Known limitations: the compiled register mask (`CNA_CBUF_CON1_DATA_ENTRIES__MASK`)
-    /// is 0x3fff (14 bits), one bit wider than the TRM's own reserved-bit boundary. This
-    /// was previously narrowed to `Bits<13>` to match the TRM table, on the reasoning that
-    /// the tighter assertion could only forbid a reserved bit. A shape sweep of vendor
-    /// captures disproves that: a `128x128` convolution programs `data_entries = 11264`,
-    /// which needs bit 13. The TRM's boundary is wrong (or the bit is usable in practice),
-    /// the 14-bit mask is real, and narrowing here rejected shapes the vendor itself emits.
+    /// Bit width: 15 in observed vendor programs.
     ///
-    /// The 14-bit ceiling is load-bearing rather than incidental. This field holds
-    /// `tile_input_rows * width`, so 16383 caps a single program at 63 input rows when the
-    /// feature map is 256 wide, and 127 rows at 128 wide. That is the hardware reason tall
-    /// convolutions must be split for capacity; see `conv::Shape::max_tile_input_rows`.
+    /// The TRM says 13 and the generated header mask says 14. Successive
+    /// corpora disprove both boundaries: fp16 first used bit 13 at 11,264,
+    /// then the expanded Cin-1 shapes and paired int8 corpus used bit 14 at
+    /// values through 25,600. Bit 15 remains unobserved.
     /// Related registers: `cna_cbuf_con0.data_bank`.
-    pub fn data_entries(&mut self, data_entries: Bits<14>) -> &mut Self {
-        self.set_field(CNA_CBUF_CON1_DATA_ENTRIES__MASK, unsafe {
-            CNA_CBUF_CON1_DATA_ENTRIES(data_entries.val())
-        })
+    pub fn data_entries(&mut self, data_entries: Bits<15>) -> &mut Self {
+        const DATA_ENTRIES_MASK: u32 = 0x0000_7fff;
+        self.set_field(DATA_ENTRIES_MASK, data_entries.val())
     }
 }
 
