@@ -106,8 +106,12 @@ fn run(fd: i32, file: &std::fs::File, width: u32, height: u32) -> Result<(), Fai
     let plan = ConvPlan::new(shape, kernels);
     let pixel_count = width as usize * height as usize;
     let input_bytes = pixel_count * CIN * FP16_BYTES;
-    let out_surfaces = COUT.div_ceil(CHANNELS_PER_ATOM);
-    let output_bytes = out_surfaces * pixel_count * FEATURE_ATOM_BYTES;
+    let output_bytes = shape.output_scratch_bytes(kernels);
+    assert_eq!(
+        output_bytes,
+        pixel_count * FEATURE_ATOM_BYTES * 2,
+        "fp16 Cout=3 must allocate both padded output surfaces"
+    );
 
     unsafe {
         let buf_input = Buffer::new(fd, page_aligned_size(input_bytes), file);

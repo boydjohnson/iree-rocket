@@ -21,9 +21,10 @@
 //! is filled with one of three distinguishable constants cycling by `y %
 //! 3`. The primary diagnostic compares three programs for the vendor-
 //! captured 32x400 shape: ConvPlan's ordinary program, the vendor's one-tile
-//! geometry with `feature_grains=in_rows`, and the vendor's two-tile
-//! 200+200 alternative with the same grains rule. It reports mismatches per
-//! tile and intentionally has no correctness assertion.
+//! geometry with `feature_grains=in_rows`, a standalone two-tile 200+200
+//! control. It also reruns ConvPlan's automatic 32x1200 two-tile plan. Every
+//! case reports mismatches per tile and intentionally has no correctness
+//! assertion.
 //!
 //!   CARGO_TARGET_AARCH64_UNKNOWN_LINUX_GNU_LINKER=aarch64-linux-gnu-gcc \
 //!     cargo test --target aarch64-unknown-linux-gnu --release \
@@ -99,7 +100,7 @@ fn run(
     height: u32,
     cin: u32,
     banks: Option<(u32, u32)>,
-    vendor_tiles: Option<u32>,
+    explicit_tiles: Option<u32>,
     timeout_ns: u64,
 ) -> Result<(), Failure> {
     let kernels: Kernels = [1, 1];
@@ -109,57 +110,26 @@ fn run(
         iree_rocket_hal::rocket::conv::FeatureLayout::Dense
     ));
 
-    let (tile_rows, mut programs) = match vendor_tiles {
-        Some(tile_count) => {
-            assert!(
-                banks.is_none(),
-                "vendor-grains diagnostic uses the automatic vendor-matching bank split"
-            );
-            let tiles = Tile::split(shape, kernels, tile_count);
-            let programs = tiles
-                .iter()
-                .map(|tile| {
-                    let mut commands = conv_2d_tile_with_grains(shape, kernels, tile, tile.in_rows);
-                    // RKNN tags its two- and three-core alternatives in the
-                    // high nibble of CNA_CONV_CON2 (1 for two tiles, 2 for
-                    // three). The generated header labels these bits
-                    // reserved, so keep this capture-specific control local
-                    // to the diagnostic instead of blessing it as a general
-                    // ConvPlan field.
-                    if tile_count > 1 {
-                        for command in &mut commands {
-                            let domain = (command.0 >> 48) & 0xffff;
-                            let offset = command.0 & 0xffff;
-                            if domain == 0x0201 && offset == 0x1010 {
-                                command.0 = (command.0 & !(0xf000_0000u64 << 16))
-                                    | (u64::from(tile_count - 1) << 44);
-                            }
-                        }
-                        // Vendor split alternatives begin at the DPU/DPU-
-                        // RDMA pointer writes and omit ConvPlan's four-write
-                        // CNA preamble. The same registers are written later
-                        // in the payload, so removing this prefix makes the
-                        // accelerator stream ordered-word exact as well as
-                        // final-state exact. Keep ConvPlan's known-working PC
-                        // trailer; the RKNN trailer carries blob-relative PC
-                        // addresses that cannot be transplanted standalone.
-                        commands.drain(..4);
-                    }
-                    commands
-                })
-                .collect();
-            (tiles, programs)
-        }
-        None => {
-            let plan = match banks {
-                Some((data_banks, weight_banks)) => {
-                    ConvPlan::with_cbuf_banks(shape, kernels, data_banks, weight_banks)
-                }
-                None => ConvPlan::new(shape, kernels),
-            };
-            let tiles = plan.tiles().iter().map(|tile| tile.rows).collect();
-            (tiles, plan.programs())
-        }
+    let (tile_rows, mut programs) = if let Some(tile_count) = explicit_tiles {
+        assert!(
+            banks.is_none(),
+            "explicit tile control cannot be combined with an explicit bank split"
+        );
+        let tiles = Tile::split(shape, kernels, tile_count);
+        let programs = tiles
+            .iter()
+            .map(|tile| conv_2d_tile_with_grains(shape, kernels, tile, tile.in_rows))
+            .collect();
+        (tiles, programs)
+    } else {
+        let plan = match banks {
+            Some((data_banks, weight_banks)) => {
+                ConvPlan::with_cbuf_banks(shape, kernels, data_banks, weight_banks)
+            }
+            None => ConvPlan::new(shape, kernels),
+        };
+        let tiles = plan.tiles().iter().map(|tile| tile.rows).collect();
+        (tiles, plan.programs())
     };
     let tiles = tile_rows.len();
     let pixel_count = width as usize * height as usize;
@@ -345,11 +315,14 @@ fn dense_row_order_vendor_plan_diagnostic() {
     let cases = [
         ("ConvPlan default (4/8, one tile, derived grains)", None),
         ("vendor plan 0 (4/8, one tile, grains=400)", Some(1)),
-        ("vendor plan 1 (4/8, 200+200, grains=200 each)", Some(2)),
+        (
+            "standalone 200+200 (4/8, grains=200, no vendor plan tag)",
+            Some(2),
+        ),
     ];
 
     println!("\n=== dense row-order vendor-plan diagnostic: {WIDTH}x{HEIGHT}, Cin=Cout=1, K1 ===");
-    for (label, vendor_tiles) in cases {
+    for (label, explicit_tiles) in cases {
         println!("\n--- {label} ---");
         for rep in 0..REPS {
             match run(
@@ -359,7 +332,7 @@ fn dense_row_order_vendor_plan_diagnostic() {
                 HEIGHT,
                 1,
                 None,
-                vendor_tiles,
+                explicit_tiles,
                 5_000_000_000,
             ) {
                 Ok(()) => println!("rep {rep}: ok"),
@@ -379,12 +352,35 @@ fn dense_row_order_vendor_plan_diagnostic() {
             }
         }
     }
+
+    println!("\n--- ConvPlan automatic multi-tile control: 32x1200 ---");
+    for rep in 0..REPS {
+        match run(fd, &file, WIDTH, 1200, 1, None, None, 5_000_000_000) {
+            Ok(()) => println!("rep {rep}: ok"),
+            Err(failure) => {
+                println!(
+                    "rep {rep}: FAIL ({} mismatches, timed_out={}, tiles={}, tile_mismatches={:?}, first_bad={:?})",
+                    failure.mismatches,
+                    failure.timed_out,
+                    failure.tiles,
+                    failure.tile_mismatches,
+                    failure.first_bad,
+                );
+                for sample in &failure.samples {
+                    println!("         {sample}");
+                }
+            }
+        }
+    }
 }
 
 /// The first run of this file's original multi-tile correctness gate
 /// broke well inside tile 0 (tiles split at row 200; the failure started at
 /// row 16, col 16 -- linear pixel 528), not at the tile boundary this file's
-/// own doc comment was written to test. Diagnostic, not a correctness gate
+/// own doc comment was written to test. That result is now known to be an
+/// undersized-output-BO artifact, not convolution corruption. This historical
+/// sweep is retained as a regression check for the corrected allocation: all
+/// widths should report no break. Diagnostic, not a correctness gate
 /// (no assertion): sweeps `width` at fixed height=400 and reports each
 /// width's first bad `(y, x)` and its row-major linear pixel index, to tell
 /// apart a few hypotheses that all fit the one data point equally well --
@@ -419,6 +415,11 @@ fn dense_row_order_break_point_scales_with_width() {
 }
 
 /// A vendor capture (`~/projects/rknn-files/sweep/conv-w32-h256-k1-s1.rknn`,
+///
+/// Historical note: every earlier failure from this probe used the same
+/// undersized Cout=1 output BO and is invalid. The split sweep remains useful
+/// only as a post-fix negative control; all cases are expected to pass.
+///
 /// Cin=3/Cout=8/32x256, the closest real vendor-compiled shape to this
 /// file's own Cin=1/Cout=1/32x400) does the *entire* 256-row image in one
 /// program (`feature_grains=256`, no row split at its 1-core plan) -- so a
@@ -469,6 +470,11 @@ fn dense_row_order_break_point_vs_cbuf_split() {
 }
 
 /// The direct link back to where this whole investigation started:
+///
+/// Historical note: this simplified Cout=1 probe was also under-allocated on
+/// output, so its old split-dependent break points are not evidence about the
+/// real features.0 failure. It is retained to verify the corrected harness.
+///
 /// `rocket_conv_harness.py` (a real-compiler-path harness in
 /// iree-rocket-design-spike) found `features.0`'s exact shape (Cin=3,
 /// Cout=64, 226x226, 3x3) producing a real, non-zero, deterministic
