@@ -19,15 +19,11 @@
 //! spatial *tap* order to reason about -- output row `y` must read input
 //! row `y` exactly, one-to-one, no halo, no padding offset. Each input row
 //! is filled with one of three distinguishable constants cycling by `y %
-//! 3`, at a height (1200) that `ConvPlan` splits into 2 tiles. A tile-
-//! boundary bug shows up as a row reading back the wrong phase of the
-//! cycle, or a whole tile's rows shifted, rather than an aggregate
-//! magnitude mismatch.
-//!
-//! The original failure was at 32x400 under the old dense CBUF accounting.
-//! Vendor-matching ARGB pixel charging now correctly fits that shape in one
-//! tile, so the primary multi-tile regression uses height=1200. The separate
-//! diagnostic probes below retain the historical 32x400 shape.
+//! 3`. The primary diagnostic compares three programs for the vendor-
+//! captured 32x400 shape: ConvPlan's ordinary program, the vendor's one-tile
+//! geometry with `feature_grains=in_rows`, and the vendor's two-tile
+//! 200+200 alternative with the same grains rule. It reports mismatches per
+//! tile and intentionally has no correctness assertion.
 //!
 //!   CARGO_TARGET_AARCH64_UNKNOWN_LINUX_GNU_LINKER=aarch64-linux-gnu-gcc \
 //!     cargo test --target aarch64-unknown-linux-gnu --release \
@@ -38,17 +34,17 @@
 use std::{fs::OpenOptions, mem, os::unix::io::AsRawFd, ptr};
 
 use iree_rocket_hal::rocket::{
-    conv::{Buffers, ConvPlan, Kernels, Shape},
+    conv::{Buffers, ConvPlan, Kernels, Shape, Tile, conv_2d_tile_with_grains, relocate},
     device::{Buffer, JobDesc, close_bo, fini_bo, prep_bo, submit_jobs},
 };
 
 const DEVICE_PATH: &str = "/dev/accel/accel0";
 const FP16_BYTES: usize = 2;
 // Raw hardware output (before compact_atomic_output, which this test -- like
-// every other hand-rolled hw test -- never invokes) always writes one full
-// 16-byte atomic slot per pixel per 8-channel surface, regardless of how
-// many of the 8 lanes are real. Cout=1 here still costs the whole 16 bytes;
-// only byte offset 0 within each pixel's slot is real data.
+// every other hand-rolled hw test -- never invokes) writes one full 16-byte
+// atomic slot per pixel per 8-channel surface. The DPU rounds fp16 Cout=1 up
+// to 16 programmed channels, so the BO must hold *two* surfaces even though
+// only lane 0 of the first surface is logical output.
 const FEATURE_ATOM_BYTES: usize = 16;
 const PAGE_BYTES: usize = 4096;
 
@@ -57,8 +53,7 @@ const PAGE_BYTES: usize = 4096;
 const ROW_VALUES: [u16; 3] = [0x3c00, 0x4000, 0x4200];
 
 const WIDTH: u32 = 32;
-const HEIGHT: u32 = 400; // Historical failure shape, now correctly one tile.
-const MULTI_TILE_HEIGHT: u32 = 1200; // ConvPlan::new splits this into 2 tiles.
+const HEIGHT: u32 = 400;
 const REPS: usize = 3;
 
 fn page_aligned_size(size: usize) -> usize {
@@ -93,6 +88,8 @@ struct Failure {
     /// the diagnostic signal `dense_row_order_break_point_scales_with_width`
     /// actually wants; `samples` is for humans reading `--nocapture`.
     first_bad: Option<(usize, usize)>,
+    /// Mismatch count in each program's disjoint output-row range.
+    tile_mismatches: Vec<usize>,
 }
 
 fn run(
@@ -102,6 +99,7 @@ fn run(
     height: u32,
     cin: u32,
     banks: Option<(u32, u32)>,
+    vendor_tiles: Option<u32>,
     timeout_ns: u64,
 ) -> Result<(), Failure> {
     let kernels: Kernels = [1, 1];
@@ -111,16 +109,67 @@ fn run(
         iree_rocket_hal::rocket::conv::FeatureLayout::Dense
     ));
 
-    let plan = match banks {
-        Some((data_banks, weight_banks)) => {
-            ConvPlan::with_cbuf_banks(shape, kernels, data_banks, weight_banks)
+    let (tile_rows, mut programs) = match vendor_tiles {
+        Some(tile_count) => {
+            assert!(
+                banks.is_none(),
+                "vendor-grains diagnostic uses the automatic vendor-matching bank split"
+            );
+            let tiles = Tile::split(shape, kernels, tile_count);
+            let programs = tiles
+                .iter()
+                .map(|tile| {
+                    let mut commands = conv_2d_tile_with_grains(shape, kernels, tile, tile.in_rows);
+                    // RKNN tags its two- and three-core alternatives in the
+                    // high nibble of CNA_CONV_CON2 (1 for two tiles, 2 for
+                    // three). The generated header labels these bits
+                    // reserved, so keep this capture-specific control local
+                    // to the diagnostic instead of blessing it as a general
+                    // ConvPlan field.
+                    if tile_count > 1 {
+                        for command in &mut commands {
+                            let domain = (command.0 >> 48) & 0xffff;
+                            let offset = command.0 & 0xffff;
+                            if domain == 0x0201 && offset == 0x1010 {
+                                command.0 = (command.0 & !(0xf000_0000u64 << 16))
+                                    | (u64::from(tile_count - 1) << 44);
+                            }
+                        }
+                        // Vendor split alternatives begin at the DPU/DPU-
+                        // RDMA pointer writes and omit ConvPlan's four-write
+                        // CNA preamble. The same registers are written later
+                        // in the payload, so removing this prefix makes the
+                        // accelerator stream ordered-word exact as well as
+                        // final-state exact. Keep ConvPlan's known-working PC
+                        // trailer; the RKNN trailer carries blob-relative PC
+                        // addresses that cannot be transplanted standalone.
+                        commands.drain(..4);
+                    }
+                    commands
+                })
+                .collect();
+            (tiles, programs)
         }
-        None => ConvPlan::new(shape, kernels),
+        None => {
+            let plan = match banks {
+                Some((data_banks, weight_banks)) => {
+                    ConvPlan::with_cbuf_banks(shape, kernels, data_banks, weight_banks)
+                }
+                None => ConvPlan::new(shape, kernels),
+            };
+            let tiles = plan.tiles().iter().map(|tile| tile.rows).collect();
+            (tiles, plan.programs())
+        }
     };
-    let tiles = plan.tiles().len();
+    let tiles = tile_rows.len();
     let pixel_count = width as usize * height as usize;
     let input_bytes = pixel_count * cin as usize * FP16_BYTES;
-    let output_bytes = pixel_count * FEATURE_ATOM_BYTES; // Cout=1: one surface, but a full atomic slot per pixel regardless.
+    let output_bytes = shape.output_scratch_bytes(kernels);
+    assert_eq!(
+        output_bytes,
+        pixel_count * FEATURE_ATOM_BYTES * 2,
+        "fp16 Cout=1 must allocate both padded output surfaces"
+    );
 
     unsafe {
         let buf_input = Buffer::new(fd, page_aligned_size(input_bytes), file);
@@ -157,12 +206,15 @@ fn run(
         let buf_output = Buffer::new(fd, page_aligned_size(output_bytes), file);
         ptr::write_bytes(buf_output.host_ptr, 0, buf_output.size);
 
-        let programs = plan.programs_with_buffers(Buffers {
+        let buffers = Buffers {
             input: buf_input.dma_address,
             weights: buf_weights.dma_address,
             bias: buf_bias.dma_address,
             output: buf_output.dma_address,
-        });
+        };
+        for commands in &mut programs {
+            relocate(commands, buffers);
+        }
         let mut command_buffers = Vec::with_capacity(programs.len());
         for commands in &programs {
             let command_bytes = commands.len() * mem::size_of::<u64>();
@@ -222,6 +274,7 @@ fn run(
             timed_out: false,
             tiles,
             first_bad: None,
+            tile_mismatches: vec![0; tiles],
         };
 
         if let Err(error) = prep_bo(fd, buf_output.handle, timeout_ns) {
@@ -238,6 +291,14 @@ fn run(
                     let got = f16_to_f32(u16::from_le_bytes([raw[offset], raw[offset + 1]]));
                     if got != want {
                         failure.mismatches += 1;
+                        if let Some((tile_index, _)) =
+                            tile_rows.iter().enumerate().find(|(_, tile)| {
+                                y >= tile.out_first as usize
+                                    && y < (tile.out_first + tile.out_rows) as usize
+                            })
+                        {
+                            failure.tile_mismatches[tile_index] += 1;
+                        }
                         if failure.first_bad.is_none() {
                             failure.first_bad = Some((y, x));
                         }
@@ -272,8 +333,8 @@ fn run(
 }
 
 #[test]
-#[ignore = "needs /dev/accel/accel0 -- cross-compile for aarch64 and run on the RK3588 board"]
-fn dense_row_order_survives_a_multi_tile_1x1_identity_conv() {
+#[ignore = "needs /dev/accel/accel0 -- diagnostic comparison, run with --nocapture"]
+fn dense_row_order_vendor_plan_diagnostic() {
     let file = OpenOptions::new()
         .read(true)
         .write(true)
@@ -281,36 +342,46 @@ fn dense_row_order_survives_a_multi_tile_1x1_identity_conv() {
         .expect("failed to open RK3588 NPU device");
     let fd = file.as_raw_fd();
 
-    let mut passed = 0;
-    for i in 0..REPS {
-        match run(fd, &file, WIDTH, MULTI_TILE_HEIGHT, 1, None, 5_000_000_000) {
-            Ok(()) => {
-                println!("rep {i}: ok");
-                passed += 1;
-            }
-            Err(failure) => {
-                println!(
-                    "rep {i}: FAIL ({} mismatches, timed_out={}, tiles={}, first_bad={:?})",
-                    failure.mismatches, failure.timed_out, failure.tiles, failure.first_bad
-                );
-                for sample in &failure.samples {
-                    println!("         {sample}");
+    let cases = [
+        ("ConvPlan default (4/8, one tile, derived grains)", None),
+        ("vendor plan 0 (4/8, one tile, grains=400)", Some(1)),
+        ("vendor plan 1 (4/8, 200+200, grains=200 each)", Some(2)),
+    ];
+
+    println!("\n=== dense row-order vendor-plan diagnostic: {WIDTH}x{HEIGHT}, Cin=Cout=1, K1 ===");
+    for (label, vendor_tiles) in cases {
+        println!("\n--- {label} ---");
+        for rep in 0..REPS {
+            match run(
+                fd,
+                &file,
+                WIDTH,
+                HEIGHT,
+                1,
+                None,
+                vendor_tiles,
+                5_000_000_000,
+            ) {
+                Ok(()) => println!("rep {rep}: ok"),
+                Err(failure) => {
+                    println!(
+                        "rep {rep}: FAIL ({} mismatches, timed_out={}, tiles={}, tile_mismatches={:?}, first_bad={:?})",
+                        failure.mismatches,
+                        failure.timed_out,
+                        failure.tiles,
+                        failure.tile_mismatches,
+                        failure.first_bad,
+                    );
+                    for sample in &failure.samples {
+                        println!("         {sample}");
+                    }
                 }
             }
         }
     }
-
-    println!("\n=== summary: dense_row_order_survives_a_multi_tile_1x1_identity_conv ===");
-    println!("  {WIDTH}x{MULTI_TILE_HEIGHT}  {passed}/{REPS} passed");
-
-    assert_eq!(
-        passed, REPS,
-        "row order broke across a tile boundary at least once -- see samples above \
-         for which output row read back which input row's value"
-    );
 }
 
-/// The first run of `dense_row_order_survives_a_multi_tile_1x1_identity_conv`
+/// The first run of this file's original multi-tile correctness gate
 /// broke well inside tile 0 (tiles split at row 200; the failure started at
 /// row 16, col 16 -- linear pixel 528), not at the tile boundary this file's
 /// own doc comment was written to test. Diagnostic, not a correctness gate
@@ -334,7 +405,7 @@ fn dense_row_order_break_point_scales_with_width() {
 
     println!("\n=== break point vs width, height={height} fixed ===");
     for width in [8u32, 16, 32, 64, 128] {
-        match run(fd, &file, width, height, 1, None, 5_000_000_000) {
+        match run(fd, &file, width, height, 1, None, None, 5_000_000_000) {
             Ok(()) => println!("width={width:4}  ok (no break)"),
             Err(failure) => {
                 let linear = failure.first_bad.map(|(y, x)| y * width as usize + x);
@@ -382,6 +453,7 @@ fn dense_row_order_break_point_vs_cbuf_split() {
             HEIGHT,
             1,
             Some((data_banks, weight_banks)),
+            None,
             5_000_000_000,
         ) {
             Ok(()) => println!("banks {data_banks:2}/{weight_banks:<2}  ok (no break)"),
@@ -445,7 +517,7 @@ fn dense_row_order_at_features_0_real_shape() {
         ),
     ];
     for (label, banks, timeout_ns) in cases {
-        match run(fd, &file, width, height, cin, banks, timeout_ns) {
+        match run(fd, &file, width, height, cin, banks, None, timeout_ns) {
             Ok(()) => println!("{label}: ok (no break)"),
             Err(failure) => {
                 let linear = failure.first_bad.map(|(y, x)| y * width as usize + x);
