@@ -1,4 +1,4 @@
-//! Width sweep for the `nonalign_dma` leading-pixel defect
+//! Data-rich width sweep for the `nonalign_dma` dense-input alignment defect
 //! `conv_dense_odd_in_first_probe_hw.rs` confirmed: on `run1`'s shape
 //! (Cin=3 dense, width=228, so `input_row_stride = 228*3*2 = 1368`, `mod 16
 //! == 8`), an odd `in_first` -- landing `CNA_FEATURE_DATA_ADDR` 8 bytes off
@@ -40,12 +40,15 @@
 //! `run1`-scale case (only offsets 0 and 8 reachable) for a like-for-like
 //! anchor against the earlier results.
 //!
-//! Same one-hot center-tap weight and per-row-distinguishable input as
-//! `conv_dense_odd_in_first_probe_hw.rs`; every mismatch's column is
-//! reported (not just the first), so a larger offset producing more than
-//! one wrong leading pixel -- plausible once the offset exceeds one dense
-//! pixel's 6 bytes -- would show up as `distinct_x` containing more than
-//! just `{0}`.
+//! The first version of this sweep used the same one-hot center-tap weight
+//! and per-row-distinguishable but x/channel-uniform input as
+//! `conv_dense_odd_in_first_probe_hw.rs`. That was structurally blind to a
+//! sub-pixel or channel displacement: offsets 2/4/6 appeared safe because
+//! the displaced values were identical. The exact VGG-19 `features.0`
+//! regression subsequently found every offset-4 tile about 94% wrong once
+//! x and channel varied. This corrected sweep keeps the one-hot center tap
+//! to isolate feature fetching, but varies input values with x, y, and
+//! channel. Every mismatch's column is still reported.
 //!
 //!   CARGO_TARGET_AARCH64_UNKNOWN_LINUX_GNU_LINKER=aarch64-linux-gnu-gcc \
 //!     cargo test --target aarch64-unknown-linux-gnu --release \
@@ -73,10 +76,25 @@ const OUT_ROWS: u32 = 8;
 const IN_ROWS: u32 = 10; // OUT_ROWS + KERNEL - 1, padding=[0,0].
 const HEIGHT: u32 = 60; // Generous runway past every in_first probed (max 7+10=17) -- flushness already ruled out.
 
-const ROW_VALUES: [u16; 3] = [0x3c00, 0x4000, 0x4200];
-
 fn page_aligned_size(size: usize) -> usize {
     size.div_ceil(PAGE_BYTES) * PAGE_BYTES
+}
+
+fn small_integer_f16_bits(value: i16) -> u16 {
+    match value {
+        -3 => 0xc200,
+        -2 => 0xc000,
+        -1 => 0xbc00,
+        0 => 0x0000,
+        1 => 0x3c00,
+        2 => 0x4000,
+        3 => 0x4200,
+        _ => panic!("test value {value} is outside the exact lookup table"),
+    }
+}
+
+fn input_value(y: usize, x: usize, channel: usize) -> i16 {
+    ((y * 13 + x * 7 + channel * 3 + (y * x) % 5) % 7) as i16 - 3
 }
 
 fn f16_to_f32(bits: u16) -> f32 {
@@ -124,10 +142,10 @@ fn run(fd: i32, file: &std::fs::File, width: u32, in_first: u32) -> Probe {
         let input_words =
             std::slice::from_raw_parts_mut(buf_input.host_ptr as *mut u16, input_bytes / 2);
         for y in 0..HEIGHT as usize {
-            let value = ROW_VALUES[y % ROW_VALUES.len()];
             for x in 0..width as usize {
                 for c in 0..CIN as usize {
-                    input_words[(y * width as usize + x) * CIN as usize + c] = value;
+                    input_words[(y * width as usize + x) * CIN as usize + c] =
+                        small_integer_f16_bits(input_value(y, x, c));
                 }
             }
         }
@@ -220,8 +238,9 @@ fn run(fd: i32, file: &std::fs::File, width: u32, in_first: u32) -> Probe {
         } else {
             let raw = std::slice::from_raw_parts(buf_output.host_ptr, output_bytes);
             for y in tile.out_first as usize..(tile.out_first + tile.out_rows) as usize {
-                let want = f16_to_f32(ROW_VALUES[(y + 1) % ROW_VALUES.len()]);
                 for x in 0..out_width {
+                    // Center tap, input channel 0 -> output channel 0.
+                    let want = f32::from(input_value(y + 1, x + 1, 0));
                     let offset = (y * out_width + x) * FEATURE_ATOM_BYTES;
                     let got = f16_to_f32(u16::from_le_bytes([raw[offset], raw[offset + 1]]));
                     if got != want {
@@ -283,9 +302,12 @@ fn alignment_offset_width_sweep() {
             } else if ok {
                 "ok".to_string()
             } else {
+                let first_x = probe.distinct_x.first().copied();
+                let last_x = probe.distinct_x.last().copied();
                 format!(
-                    "FAIL {} mismatches distinct_x={:?}",
-                    probe.mismatches, probe.distinct_x
+                    "FAIL {} mismatches across {} x positions ({first_x:?}..={last_x:?})",
+                    probe.mismatches,
+                    probe.distinct_x.len()
                 )
             };
             println!("  in_first={in_first} offset={offset:2}  {status}");

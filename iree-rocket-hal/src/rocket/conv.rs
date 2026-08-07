@@ -1040,7 +1040,7 @@ impl Shape {
     }
 
     /// Whether a dense-layout tile whose feature fetch starts at input row
-    /// `in_first` is safe from `nonalign_dma`'s leading-pixel defect.
+    /// `in_first` is safe for general, non-uniform fp16 tensor data.
     ///
     /// Measured on real RK3588 hardware, not derived from documentation
     /// (`iree-rocket-design-spike`'s `conv_dense_shared_buffer_dispatch_hw.rs`,
@@ -1052,31 +1052,35 @@ impl Shape {
     /// dispatches" and its follow-ups, for the full characterization).
     ///
     /// `CNA_FEATURE_DATA_ADDR` is `in_first * input_row_stride`, and dense
-    /// mode's `input_row_stride` is not always a multiple of 16 -- so the
-    /// feature base is not always 16-byte aligned. `nonalign_dma` (always
-    /// on for dense mode) compensates for a misalignment up to one dense
-    /// pixel wide, but corrupts `max(0, ceil(offset / pixel_bytes) - 1)`
-    /// leading columns of every row a tile covers once the true offset
-    /// exceeds that. This was measured exactly (fitting all 22 points
-    /// across every `Cin` 1-4 and every offset each one's row stride can
-    /// produce, at fp16): the corrupted count is zero, i.e. safe, if and
-    /// only if `offset <= pixel_bytes`.
+    /// mode's `input_row_stride` is not always a multiple of 16. Earlier
+    /// hardware probes filled every x position and input channel alike and
+    /// concluded that `nonalign_dma` safely compensates for offsets up to
+    /// one dense pixel wide. That conclusion was an artifact of the data:
+    /// a sub-pixel/channel displacement is invisible when all displaced
+    /// values are equal.
     ///
-    /// `pixel_bytes` here is one dense pixel's *true* host width (`Cin *
-    /// element_bytes`), not the CBUF's 1/2/4/4-channel storage class. Those
-    /// differ at `Cin=3`.
+    /// `conv_features0_exact_hw.rs` uses x-, y-, and channel-varying data
+    /// at VGG-19 `features.0`'s exact lowered shape. Every tile at offset 0
+    /// passed exactly, while all three tiles at offset 4 were about 94%
+    /// wrong across their complete output ranges, deterministically in all
+    /// three repetitions. A subsequent data-rich hardware sweep tested every
+    /// even byte offset: all 14 offset-0 cases passed, while every case at
+    /// offsets 2, 4, 6, 8, 10, 12, and 14 failed. Fp16 dense tiles therefore
+    /// require a fully 16-byte-aligned feature base.
     ///
     /// Always `true` outside dense layout: surfaces (`Cin > 4`) use a
     /// different addressing path this defect has not been shown to reach.
-    /// Not yet measured at int8 -- see the "Open: int8" note on
-    /// [`realign_dense_row_tiles`].
+    /// Int8 is returned as `true` here only because its tiling deliberately
+    /// bypasses this fp16 rule: the vendor int8 path uses a padded physical
+    /// row pitch that the host `Shape` cannot yet express. This is not a
+    /// claim that arbitrary int8 dense offsets have been validated; see
+    /// the "Open: int8" note on [`realign_dense_row_tiles`].
     pub fn dense_feature_offset_safe(&self, in_first: u32) -> bool {
-        if self.layout() != FeatureLayout::Dense {
+        if self.layout() != FeatureLayout::Dense || matches!(self.precision, Precision::Int8(_)) {
             return true;
         }
         let offset = (in_first * self.input_row_stride()) % FEATURE_ATOM_BYTES;
-        let pixel_bytes = self.in_channels * self.precision.element_bytes();
-        offset <= pixel_bytes
+        offset == 0
     }
 
     /// The input row a tile's feature fetch starts at, for an output range
@@ -4656,49 +4660,48 @@ mod tests {
     }
 
     #[test]
-    fn dense_feature_offset_safe_matches_all_22_hardware_points() {
-        // Every (Cin, offset, corrupted_columns) point
-        // conv_dense_alignment_channel_sweep_hw.rs and
-        // conv_dense_alignment_width_sweep_hw.rs measured on real RK3588
-        // hardware, restated as the safe/unsafe boundary this function
-        // exposes: safe iff `corrupted_columns == 0` iff `offset <=
-        // pixel_bytes`. `in_first` values are chosen to land on the listed
-        // offset given each shape's own `input_row_stride`.
+    fn dense_feature_offset_safe_requires_full_fp16_alignment() {
+        // The older width/channel sweeps used uniform values and therefore
+        // could only observe whole-pixel leading-column loss. The exact
+        // features.0 regression uses non-uniform data and shows offset 4 is
+        // already unsafe at Cin=3. Conservatively require offset 0 at every
+        // fp16 dense width until a data-rich sweep proves otherwise.
         let cin1 = Shape::with_out_channels(225, 60, 1, 1, 8).with_padding([0, 0]); // stride mod16=2
-        for (in_first, safe) in [(0, true), (1, true), (2, false), (3, false), (7, false)] {
+        for in_first in 0..8 {
             assert_eq!(
                 cin1.dense_feature_offset_safe(in_first),
-                safe,
+                in_first == 0,
                 "Cin=1 in_first={in_first}"
             );
         }
         let cin2 = Shape::with_out_channels(225, 60, 1, 2, 8).with_padding([0, 0]); // stride mod16=4
-        for (in_first, safe) in [(0, true), (1, true), (2, false), (3, false)] {
+        for in_first in 0..8 {
             assert_eq!(
                 cin2.dense_feature_offset_safe(in_first),
-                safe,
+                matches!(in_first, 0 | 4),
                 "Cin=2 in_first={in_first}"
             );
         }
         let cin3 = Shape::with_out_channels(227, 60, 1, 3, 256).with_padding([0, 0]); // stride mod16=2
-        for (in_first, safe) in [(0, true), (3, true), (4, false), (6, false), (7, false)] {
+        for in_first in 0..8 {
             assert_eq!(
                 cin3.dense_feature_offset_safe(in_first),
-                safe,
+                in_first == 0,
                 "Cin=3 in_first={in_first}"
             );
         }
         let cin4 = Shape::with_out_channels(225, 60, 1, 4, 256).with_padding([0, 0]); // stride mod16=8
         for in_first in 0..8 {
-            assert!(
+            assert_eq!(
                 cin4.dense_feature_offset_safe(in_first),
-                "Cin=4 in_first={in_first} -- structurally can never exceed its own pixel width"
+                in_first % 2 == 0,
+                "Cin=4 in_first={in_first}"
             );
         }
         // Cout plays no role -- the address formula never references it.
         let small_cout = Shape::with_out_channels(227, 60, 1, 3, 8).with_padding([0, 0]);
         assert!(small_cout.dense_feature_offset_safe(0));
-        assert!(!small_cout.dense_feature_offset_safe(4));
+        assert!(!small_cout.dense_feature_offset_safe(2));
 
         // Surfaces (Cin > 4) are a different addressing path this defect
         // has not been shown to reach; always reported safe.
@@ -4754,15 +4757,13 @@ mod tests {
         // Host-side sweep, no hardware needed: dense_feature_offset_safe is
         // a pure function of the plan ConvPlan::new already produces, so
         // this checks the fix holds broadly rather than just at run1's one
-        // shape. 4 Cin values x 5 Cout values x 6 widths x 4 heights = 480
-        // shapes; a wider 1000-shape sweep (adding Cout=512 and more
-        // widths/heights) was run manually while developing this fix with
-        // the same result -- kept smaller here to stay fast in the regular
-        // suite.
+        // shape. 4 Cin values x 4 Cout values x 7 widths x 4 heights = 448
+        // shapes. Width 226 is the newly-found VGG-19 features.0 regression
+        // point and must remain in the ordinary suite.
         let kernels = [3, 3];
         for cin in [1u32, 2, 3, 4] {
             for cout in [1u32, 8, 64, 256] {
-                for width in [30u32, 61, 97, 225, 227, 300] {
+                for width in [30u32, 61, 97, 225, 226, 227, 300] {
                     for height in [30u32, 61, 226, 300] {
                         let shape = Shape::with_out_channels(width, height, 1, cin, cout)
                             .with_padding([0, 0]);
