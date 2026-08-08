@@ -1174,14 +1174,27 @@ impl Shape {
         let weight_banks = CBUF_BANKS - data_banks;
         let streamed_preference =
             streamed_weight_bank_preference(self.weight_channels(), kernels).min(CBUF_BANKS - 1);
+        let floor = weight_banks_floor(self.weight_channels()).max(streamed_preference);
 
         // Total coefficient size can otherwise consume eleven banks and
         // leave only one for feature data, even though CNA streams weights
         // in the bounded working set above. Once data has actually been
         // starved to that single-bank minimum, cap coefficients at the
         // streamed grant and return the unused banks to data.
+        //
+        // The grant is `floor`, not `streamed_preference`, even though the
+        // trigger above compares against `streamed_preference`: hardware
+        // confirmed (`bank_partition_flip_boundary_probe_runs_every_case_before_failing`)
+        // that granting exactly `streamed_preference` here reads back zero
+        // past whatever channel count fit in that many banks -- e.g. Cin 3/4/5
+        // K3 fp16 has `streamed_preference = 1` but needs the same `floor = 3`
+        // every other capture in this Cin range is validated against.
+        // `streamed_preference` staying the trigger is deliberate: below it,
+        // the earlier `granted = data` computation already grants at least
+        // `floor` banks on its own, so there is nothing to correct.
         if data_banks == 1 && weight_banks > streamed_preference && weights > streamed_preference {
-            return (CBUF_BANKS - streamed_preference, streamed_preference);
+            let weight_banks = floor.min(CBUF_BANKS - 1);
+            return (CBUF_BANKS - weight_banks, weight_banks);
         }
 
         // A coefficient footprint that would take weight_banks_floor's banks
@@ -1193,7 +1206,6 @@ impl Shape {
         // and let feature data give up the difference, trading tile count
         // for correctness. `weights` is already known unbounded here, so
         // the floor itself, not `weights`, is always what gets granted.
-        let floor = weight_banks_floor(self.weight_channels()).max(streamed_preference);
         if weight_banks < floor && weights > weight_banks {
             let weight_banks = floor.min(CBUF_BANKS - 1);
             return (CBUF_BANKS - weight_banks, weight_banks);
