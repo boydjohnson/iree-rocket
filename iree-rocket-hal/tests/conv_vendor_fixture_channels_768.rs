@@ -1,58 +1,21 @@
+#[path = "support/vendor_fixture.rs"]
+mod vendor_fixture;
+
 use std::collections::{BTreeMap, BTreeSet};
 
-use iree_rocket_hal::rocket::{
-    builders::{RegCmd, RegisterMeta, cna::CnaCbufCon1},
-    conv::{
-        ConvPlan, Kernels, MAX_INPUT_CHANNELS, MAX_INT8_INPUT_CHANNELS, MAX_OUTPUT_CHANNELS,
-        Multiplier, Precision, Quantization, Shape,
-    },
+use iree_rocket_hal::rocket::conv::{
+    ConvPlan, Kernels, MAX_INPUT_CHANNELS, MAX_INT8_INPUT_CHANNELS, MAX_OUTPUT_CHANNELS,
+    Multiplier, Precision, Quantization, Shape,
 };
-use serde::Deserialize;
+use vendor_fixture::{
+    FixtureFile, Program, complete_row_plan, exact_plan_match, normalize_row_tiles,
+    output_channel_groups, register_value,
+};
+
+use iree_rocket_hal::rocket::builders::cna::CnaCbufCon1;
 
 const FP16_FIXTURES: &str = include_str!("fixtures/conv_vendor_fixtures_channels_768.json");
 const INT8_FIXTURES: &str = include_str!("fixtures/conv_vendor_fixtures_channels_768_i8.json");
-
-#[derive(Deserialize)]
-struct FixtureFile {
-    schema: u32,
-    cases: Vec<Case>,
-}
-
-#[derive(Deserialize)]
-struct Case {
-    model: String,
-    shape: ShapeFixture,
-    vendor_programs: Vec<Program>,
-}
-
-#[derive(Deserialize)]
-struct ShapeFixture {
-    width: u32,
-    height: u32,
-    cin: u32,
-    cout: u32,
-    kernel_h: u32,
-    kernel_w: u32,
-    pad_h: u32,
-    pad_w: u32,
-    stride: u32,
-}
-
-#[derive(Deserialize)]
-struct Program {
-    plan_index: u32,
-    in_width: u32,
-    in_rows: u32,
-    out_width: u32,
-    out_atomics: u32,
-    out_rows: u32,
-    in_offset: u32,
-    out_offset: u32,
-    feature_grains: u32,
-    cbuf_data_banks: u32,
-    cbuf_weight_banks: u32,
-    cbuf_data_entries: u32,
-}
 
 #[derive(Clone, Copy)]
 enum FixturePrecision {
@@ -88,40 +51,13 @@ impl FixturePrecision {
             Self::Int8 => MAX_INT8_INPUT_CHANNELS,
         }
     }
-}
 
-fn output_width(shape: &ShapeFixture) -> u32 {
-    (shape.width + 2 * shape.pad_w - shape.kernel_w) / shape.stride + 1
-}
-
-fn output_height(shape: &ShapeFixture) -> u32 {
-    (shape.height + 2 * shape.pad_h - shape.kernel_h) / shape.stride + 1
-}
-
-fn register_value<R: RegisterMeta>(program: &[RegCmd]) -> Option<u32> {
-    program
-        .iter()
-        .find(|command| command.0 as u32 & 0xffff == R::OFFSET)
-        .map(|command| ((command.0 >> 16) & 0xffff_ffff) as u32)
-}
-
-/// Collapses repeated row geometry emitted once per output-kernel group.
-fn normalize_row_tiles<'a>(programs: &[&'a Program]) -> Vec<&'a Program> {
-    let mut seen = BTreeSet::new();
-    programs
-        .iter()
-        .copied()
-        .filter(|program| {
-            seen.insert((
-                program.in_width,
-                program.in_rows,
-                program.in_offset,
-                program.out_width,
-                program.out_rows,
-                program.feature_grains,
-            ))
-        })
-        .collect()
+    fn elem_bytes(self) -> u32 {
+        match self {
+            Self::Fp16 => 2,
+            Self::Int8 => 1,
+        }
+    }
 }
 
 /// Continuation tasks may encode CBUF_CON0 as 0/0 to mean reuse. Recover the
@@ -135,51 +71,6 @@ fn plan_bank_split(programs: &[&Program]) -> Option<(u32, u32)> {
         })
         .collect::<BTreeSet<_>>();
     (splits.len() == 1).then(|| *splits.first().unwrap())
-}
-
-fn complete_row_plan(programs: &[&Program], shape: &ShapeFixture) -> bool {
-    let out_width = output_width(shape);
-    if programs.is_empty()
-        || programs
-            .iter()
-            .any(|program| program.out_width != out_width || program.in_width != shape.width)
-    {
-        return false;
-    }
-    let mut sorted = programs.to_vec();
-    sorted.sort_by_key(|program| program.out_offset);
-    let mut covered_rows = 0;
-    for program in sorted {
-        if program.out_offset != covered_rows * out_width * 16 {
-            return false;
-        }
-        covered_rows += program.out_rows;
-    }
-    covered_rows == output_height(shape)
-}
-
-fn exact_plan_match(programs: &[&Program], case: &Case, plan: &ConvPlan) -> bool {
-    if programs.len() != plan.tiles().len() {
-        return false;
-    }
-    let out_width = output_width(&case.shape);
-    let mut vendor = programs.to_vec();
-    vendor.sort_by_key(|program| program.out_offset);
-    let generated = plan.programs();
-    vendor
-        .iter()
-        .zip(plan.tiles())
-        .zip(generated.iter())
-        .all(|((program, tile), commands)| {
-            program.in_width == tile.columns.in_cols
-                && program.out_width == tile.columns.out_cols
-                && program.out_rows == tile.rows.out_rows
-                && program.in_rows == tile.rows.in_rows
-                && program.out_offset
-                    == tile.rows.out_first * out_width * 16 + tile.columns.out_first * 16
-                && program.out_atomics == program.out_width * program.out_rows
-                && register_value::<CnaCbufCon1>(commands) == Some(program.cbuf_data_entries)
-        })
 }
 
 fn print_grouped_bank_differences(
@@ -206,8 +97,10 @@ fn run_channel_grid(fixtures: &str, precision: FixturePrecision) {
     let mut exploratory = Vec::new();
     let mut bank_matches = 0;
     let mut exact_matches = 0;
+    let mut multi_group_matches = 0;
     let mut incomplete_row_plans = Vec::new();
     let mut tile_differences = Vec::new();
+    let mut group_differences = Vec::new();
     let mut printed_row_routes = BTreeSet::new();
     let mut missing_plan_zero_split = Vec::new();
     let mut grouped_bank_differences = BTreeMap::<(u32, u32, u32, u32, u32), Vec<u32>>::new();
@@ -276,11 +169,35 @@ fn run_channel_grid(fixtures: &str, precision: FixturePrecision) {
         } else if !banks_match {
             // The bank mismatch is already grouped above. Do not count the
             // same case again as a row-tiling mismatch.
-        } else if complete.iter().any(|(_, programs)| {
-            plan_bank_split(programs) == Some(generated_split)
-                && exact_plan_match(programs, &case, &plan)
+        } else if let Some(&(plan_index, _)) = complete.iter().find(|(plan_index, programs)| {
+            plan_bank_split(by_plan[plan_index].as_slice()) == Some(generated_split)
+                && exact_plan_match(programs, s, &plan)
         }) {
-            exact_matches += 1;
+            // The row-tile representative matches ConvPlan spatially. That
+            // representative is only one program out of however many
+            // `normalize_row_tiles` collapsed away -- one per
+            // output-channel group. ConvPlan does not model that axis yet,
+            // so this is the only place the repeats get checked at all:
+            // every row tile in the winning plan must repeat the same
+            // output-channel groups, summing to the programmed kernel
+            // count, with the right destination stride between groups.
+            let raw = &by_plan[&plan_index];
+            match output_channel_groups(raw, s, shape.programmed_kernels(), precision.elem_bytes())
+            {
+                Ok(groups) => {
+                    exact_matches += 1;
+                    if groups.len() > 1 {
+                        multi_group_matches += 1;
+                    }
+                }
+                Err(error) => {
+                    eprintln!(
+                        "{}: plan {plan_index} matches ConvPlan spatially and on CBUF banks, but its output-channel groups do not check out: {error:?}",
+                        case.model,
+                    );
+                    group_differences.push(case.model.clone());
+                }
+            }
         } else {
             // Cout does not affect row tiling once the bank split is fixed.
             // Print one representative per precision/Cin/split so a large
@@ -346,6 +263,13 @@ fn run_channel_grid(fixtures: &str, precision: FixturePrecision) {
             tile_differences.join(", "),
         );
     }
+    if !group_differences.is_empty() {
+        eprintln!(
+            "\n{} output-channel-group divergences after row plans match: {}",
+            precision.name(),
+            group_differences.join(", "),
+        );
+    }
     let exploratory_cin = exploratory
         .iter()
         .filter_map(|(cin, _)| (*cin > precision.max_input_channels()).then_some(*cin))
@@ -355,11 +279,12 @@ fn run_channel_grid(fixtures: &str, precision: FixturePrecision) {
         .filter_map(|(_, cout)| (*cout > MAX_OUTPUT_CHANNELS).then_some(*cout))
         .collect::<BTreeSet<_>>();
     eprintln!(
-        "\n{} expanded fixture coverage: supported={supported}, exploratory={}, bank_matches={bank_matches}, exact_row_plans={exact_matches}, incomplete_row_plans={}, tile_differences={}, missing_plan_zero_split={}",
+        "\n{} expanded fixture coverage: supported={supported}, exploratory={}, bank_matches={bank_matches}, exact_row_plans={exact_matches} ({multi_group_matches} with validated multi-output-channel-group plans), incomplete_row_plans={}, tile_differences={}, group_differences={}, missing_plan_zero_split={}",
         precision.name(),
         exploratory.len(),
         incomplete_row_plans.len(),
         tile_differences.len(),
+        group_differences.len(),
         missing_plan_zero_split.len(),
     );
     eprintln!(
@@ -382,6 +307,12 @@ fn run_channel_grid(fixtures: &str, precision: FixturePrecision) {
         "{} complete vendor row plans diverged from ConvPlan: {}",
         tile_differences.len(),
         tile_differences.join(", "),
+    );
+    assert!(
+        group_differences.is_empty(),
+        "{} complete vendor row plans had inconsistent output-channel groups: {}",
+        group_differences.len(),
+        group_differences.join(", "),
     );
 }
 

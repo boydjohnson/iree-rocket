@@ -1,151 +1,16 @@
-use std::collections::{BTreeMap, BTreeSet};
+#[path = "support/vendor_fixture.rs"]
+mod vendor_fixture;
 
-use iree_rocket_hal::rocket::{
-    builders::{RegCmd, RegisterMeta, cna::CnaCbufCon1},
-    conv::{ConvPlan, Kernels, Shape},
+use std::collections::BTreeMap;
+
+use iree_rocket_hal::rocket::conv::{ConvPlan, Kernels, Shape};
+use vendor_fixture::{
+    Case, FixtureFile, Program, complete_row_plan, decoded_prefix_matches, exact_plan_match,
+    normalize_row_tiles, output_channel_groups,
 };
-use serde::Deserialize;
 
 const FIXTURES: &str = include_str!("fixtures/conv_vendor_fixtures.json");
-
-#[derive(Deserialize)]
-struct FixtureFile {
-    schema: u32,
-    cases: Vec<Case>,
-}
-
-#[derive(Deserialize)]
-struct Case {
-    model: String,
-    shape: ShapeFixture,
-    vendor_programs: Vec<Program>,
-}
-
-#[derive(Deserialize)]
-struct ShapeFixture {
-    width: u32,
-    height: u32,
-    cin: u32,
-    cout: u32,
-    kernel_h: u32,
-    kernel_w: u32,
-    pad_h: u32,
-    pad_w: u32,
-    stride: u32,
-}
-
-#[derive(Deserialize)]
-struct Program {
-    plan_index: u32,
-    in_width: u32,
-    in_rows: u32,
-    out_width: u32,
-    out_atomics: u32,
-    out_rows: u32,
-    in_offset: u32,
-    out_offset: u32,
-    feature_grains: u32,
-    cbuf_data_banks: u32,
-    cbuf_weight_banks: u32,
-    cbuf_data_entries: u32,
-}
-
-fn output_width(shape: &ShapeFixture) -> u32 {
-    (shape.width + 2 * shape.pad_w - shape.kernel_w) / shape.stride + 1
-}
-
-fn output_height(shape: &ShapeFixture) -> u32 {
-    (shape.height + 2 * shape.pad_h - shape.kernel_h) / shape.stride + 1
-}
-
-fn register_value<R: RegisterMeta>(program: &[RegCmd]) -> Option<u32> {
-    program
-        .iter()
-        .find(|command| command.0 as u32 & 0xffff == R::OFFSET)
-        .map(|command| ((command.0 >> 16) & 0xffff_ffff) as u32)
-}
-
-/// Whether these normalized programs expose one complete, full-width row
-/// plan. Long standalone streams and horizontal grids are useful evidence,
-/// but this fixture format cannot yet compare their hidden/2-D tasks exactly.
-fn complete_row_plan(programs: &[&Program], shape: &ShapeFixture) -> bool {
-    let out_width = output_width(shape);
-    if programs.is_empty()
-        || programs
-            .iter()
-            .any(|program| program.out_width != out_width || program.in_width != shape.width)
-    {
-        return false;
-    }
-    let mut sorted = programs.to_vec();
-    sorted.sort_by_key(|program| program.out_offset);
-    let mut covered_rows = 0;
-    for program in sorted {
-        if program.out_offset != covered_rows * out_width * 16 {
-            return false;
-        }
-        covered_rows += program.out_rows;
-    }
-    covered_rows == output_height(shape)
-}
-
-fn exact_plan_match(programs: &[&Program], case: &Case, plan: &ConvPlan) -> bool {
-    if programs.len() != plan.tiles().len()
-        || programs.iter().any(|program| {
-            program.cbuf_data_banks != plan.data_banks()
-                || program.cbuf_weight_banks != plan.weight_banks()
-        })
-    {
-        return false;
-    }
-    let out_width = output_width(&case.shape);
-    let mut vendor = programs.to_vec();
-    vendor.sort_by_key(|program| program.out_offset);
-    let generated = plan.programs();
-    vendor
-        .iter()
-        .zip(plan.tiles())
-        .zip(generated.iter())
-        .all(|((program, tile), commands)| {
-            program.in_width == tile.columns.in_cols
-                && program.out_width == tile.columns.out_cols
-                && program.out_rows == tile.rows.out_rows
-                && program.in_rows == tile.rows.in_rows
-                && program.out_offset
-                    == tile.rows.out_first * out_width * 16 + tile.columns.out_first * 16
-                && program.out_atomics == program.out_width * program.out_rows
-                && register_value::<CnaCbufCon1>(commands) == Some(program.cbuf_data_entries)
-        })
-}
-
-fn decoded_prefix_matches(programs: &[&Program], case: &Case, plan: &ConvPlan) -> bool {
-    if programs.is_empty()
-        || programs.len() >= plan.tiles().len()
-        || programs.iter().any(|program| {
-            program.cbuf_data_banks != plan.data_banks()
-                || program.cbuf_weight_banks != plan.weight_banks()
-        })
-    {
-        return false;
-    }
-    let out_width = output_width(&case.shape);
-    let mut vendor = programs.to_vec();
-    vendor.sort_by_key(|program| program.out_offset);
-    let generated = plan.programs();
-    vendor
-        .iter()
-        .zip(plan.tiles())
-        .zip(generated.iter())
-        .all(|((program, tile), commands)| {
-            program.in_width == tile.columns.in_cols
-                && program.out_width == tile.columns.out_cols
-                && program.out_rows == tile.rows.out_rows
-                && program.in_rows == tile.rows.in_rows
-                && program.out_offset
-                    == tile.rows.out_first * out_width * 16 + tile.columns.out_first * 16
-                && register_value::<CnaCbufCon1>(commands) == Some(program.cbuf_data_entries)
-        })
-}
+const ELEM_BYTES: u32 = 2;
 
 fn print_difference(
     case: &Case,
@@ -213,28 +78,6 @@ fn print_difference(
     }
 }
 
-/// Vendor programs repeat the same row tile once per output-surface group.
-/// The input geometry and feature-grain programming identify the row tile;
-/// the output offset additionally carries the surface-group base. Collapse
-/// those repetitions before comparing against ConvPlan's row-only tiles.
-fn normalize_row_tiles<'a>(programs: &[&'a Program]) -> Vec<&'a Program> {
-    let mut seen = BTreeSet::new();
-    programs
-        .iter()
-        .copied()
-        .filter(|program| {
-            seen.insert((
-                program.in_width,
-                program.in_rows,
-                program.in_offset,
-                program.out_width,
-                program.out_rows,
-                program.feature_grains,
-            ))
-        })
-        .collect()
-}
-
 #[test]
 fn vendor_fixture_plans_cover_convplan_shapes() {
     let fixtures: FixtureFile = serde_json::from_str(FIXTURES).expect("valid fixture JSON");
@@ -245,6 +88,7 @@ fn vendor_fixture_plans_cover_convplan_shapes() {
         fixtures.cases.len()
     );
     let mut matching_cases = 0;
+    let mut multi_group_cases = 0;
     let mut incomplete_cases = Vec::new();
     let mut layout_cases = Vec::new();
     let mut divergences = Vec::new();
@@ -273,8 +117,8 @@ fn vendor_fixture_plans_cover_convplan_shapes() {
             .collect();
 
         let complete = normalized_by_plan
-            .values()
-            .filter(|programs| complete_row_plan(programs, s))
+            .iter()
+            .filter(|(_, programs)| complete_row_plan(programs, s))
             .collect::<Vec<_>>();
         if complete.is_empty() {
             incomplete_cases.push(case.model.clone());
@@ -283,11 +127,11 @@ fn vendor_fixture_plans_cover_convplan_shapes() {
         let matching = complete
             .iter()
             .copied()
-            .filter(|programs| exact_plan_match(programs, &case, &plan))
+            .filter(|(_, programs)| exact_plan_match(programs, s, &plan))
             .collect::<Vec<_>>();
         if matching.is_empty() {
             if normalized_by_plan.get(&0).is_some_and(|programs| {
-                !complete_row_plan(programs, s) && decoded_prefix_matches(programs, &case, &plan)
+                !complete_row_plan(programs, s) && decoded_prefix_matches(programs, s, &plan)
             }) {
                 incomplete_cases.push(case.model.clone());
                 continue;
@@ -314,13 +158,45 @@ fn vendor_fixture_plans_cover_convplan_shapes() {
             divergences.push(case.model.clone());
             continue;
         }
+
+        // A spatial match against ConvPlan only checks the row-tile
+        // representative that `normalize_row_tiles` kept. ConvPlan does not
+        // model output-channel grouping yet, so this is the only place the
+        // repeats it discarded get checked at all: every row tile in the
+        // winning plan must repeat the same output-channel groups, and
+        // those groups must sum to Cout with the right destination stride.
+        let expected_kernels = shape.programmed_kernels();
+        let group_checked = matching
+            .iter()
+            .filter_map(|&(index, _)| {
+                let raw = &by_plan[index];
+                output_channel_groups(raw, s, expected_kernels, ELEM_BYTES)
+                    .ok()
+                    .map(|groups| (*index, groups))
+            })
+            .collect::<Vec<_>>();
+        let Some((_, groups)) = group_checked.first() else {
+            let (index, _) = matching[0];
+            let error = output_channel_groups(&by_plan[index], s, expected_kernels, ELEM_BYTES)
+                .unwrap_err();
+            eprintln!(
+                "{}: plan {index} matches ConvPlan spatially, but its output-channel groups do not check out: {error:?}",
+                case.model,
+            );
+            divergences.push(case.model.clone());
+            continue;
+        };
         matching_cases += 1;
+        if groups.len() > 1 {
+            multi_group_cases += 1;
+        }
 
         if case.model == "conv-w32-h400-k1-s1-ci1-co1" {
+            let (_, programs) = matching[0];
             assert_eq!(plan.data_banks(), 4);
             assert_eq!(plan.weight_banks(), 8);
-            assert_eq!(matching[0][0].cbuf_data_banks, 4);
-            assert_eq!(matching[0][0].cbuf_weight_banks, 8);
+            assert_eq!(programs[0].cbuf_data_banks, 4);
+            assert_eq!(programs[0].cbuf_weight_banks, 8);
         }
     }
     assert!(
@@ -328,7 +204,7 @@ fn vendor_fixture_plans_cover_convplan_shapes() {
         "no fixture had a comparable vendor plan"
     );
     eprintln!(
-        "fixture coverage: {matching_cases} exact, {} matched decoded plan-0 prefixes, {} dense physical-pitch comparisons deferred",
+        "fixture coverage: {matching_cases} exact ({multi_group_cases} with validated multi-output-channel-group plans), {} matched decoded plan-0 prefixes, {} dense physical-pitch comparisons deferred",
         incomplete_cases.len(),
         layout_cases.len(),
     );
