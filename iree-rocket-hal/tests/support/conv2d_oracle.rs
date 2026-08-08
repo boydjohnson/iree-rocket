@@ -47,6 +47,16 @@ pub enum OraclePattern {
     /// The same all-256-byte K1/Cin1 sweep under the ordinary unit output
     /// conversion and zero output point used by synthetic int8 convolution.
     RawByteSweepUnit,
+    /// Every tap and channel carries a distinct nonzero weight, unlike
+    /// `Counting`'s uniform 1s or `Selectors`'/`SelectorsAffine`'s three
+    /// nonzero taps per output with everything else zero. Weight and input
+    /// magnitudes are kept small enough (verified by hand, not just by
+    /// convention, against the exact shapes it targets) that every fp16
+    /// accumulator this can produce stays exactly representable in fp16 --
+    /// the comparison this oracle does is bit-exact, tolerance 0.0, and a
+    /// dense pattern has no small-term-count shortcut to fall back on if
+    /// that stops holding.
+    Dense { phase: usize },
 }
 
 impl OraclePattern {
@@ -64,6 +74,7 @@ impl OraclePattern {
             } => "onehot-neutral80-signed",
             Self::RawByteSweep => "raw-byte-sweep",
             Self::RawByteSweepUnit => "raw-byte-sweep-unit",
+            Self::Dense { .. } => "dense",
         }
     }
 }
@@ -91,6 +102,7 @@ impl Conv2dCase {
                     | OraclePattern::OneHotNeutral80 { .. }
                     | OraclePattern::RawByteSweep
                     | OraclePattern::RawByteSweepUnit
+                    | OraclePattern::Dense { .. }
             )
         {
             return 0;
@@ -256,7 +268,9 @@ pub fn f16_to_f32(bits: u16) -> f32 {
 fn input_value(case: Conv2dCase, y: usize, x: usize, channel: usize) -> i8 {
     match case.pattern {
         OraclePattern::Counting => 1,
-        OraclePattern::Selectors { phase } | OraclePattern::SelectorsAffine { phase } => {
+        OraclePattern::Selectors { phase }
+        | OraclePattern::SelectorsAffine { phase }
+        | OraclePattern::Dense { phase } => {
             ((y * 13 + x * 7 + channel * 3 + (y * x) % 5 + phase) % 7) as i8 - 3
         }
         OraclePattern::OneHotNeutral80 {
@@ -286,7 +300,8 @@ fn selector_weights(case: Conv2dCase, output_channel: usize) -> [(usize, i8); 3]
         OraclePattern::Counting
         | OraclePattern::OneHotNeutral80 { .. }
         | OraclePattern::RawByteSweep
-        | OraclePattern::RawByteSweepUnit => 0,
+        | OraclePattern::RawByteSweepUnit
+        | OraclePattern::Dense { .. } => 0,
     };
     let first = (output_channel * 17 + phase * 11) % slots;
     let step = (slots / 3).max(1);
@@ -305,7 +320,8 @@ fn one_hot_selector(case: Conv2dCase, output_channel: usize) -> usize {
         | OraclePattern::Selectors { .. }
         | OraclePattern::SelectorsAffine { .. }
         | OraclePattern::RawByteSweep
-        | OraclePattern::RawByteSweepUnit => 0,
+        | OraclePattern::RawByteSweepUnit
+        | OraclePattern::Dense { .. } => 0,
     };
     (output_channel * 17 + phase * 11) % slots
 }
@@ -342,6 +358,16 @@ fn weight_value(
         OraclePattern::RawByteSweep | OraclePattern::RawByteSweepUnit => {
             assert_eq!((case.kernel, case.cin), ([1, 1], 1));
             output_channel as u8 as i8
+        }
+        OraclePattern::Dense { phase } => {
+            // Every tap gets one of four small nonzero values -- dense,
+            // unlike Selectors' near-total sparsity, but kept small so the
+            // accumulator stays exactly representable in fp16 (verified by
+            // hand for the shapes `Dense` targets; see its doc comment).
+            const VALUES: [i8; 4] = [-2, -1, 1, 2];
+            let hash =
+                (ky * 97) ^ (kx * 89) ^ (input_channel * 13) ^ (output_channel * 7) ^ (phase * 3);
+            VALUES[hash % 4]
         }
     }
 }
@@ -422,6 +448,30 @@ pub fn expected_accumulator(
         }
         OraclePattern::RawByteSweep | OraclePattern::RawByteSweepUnit => {
             output_channel as u8 as i8 as i32
+        }
+        OraclePattern::Dense { .. } => {
+            let mut sum = 0i32;
+            for ky in 0..case.kernel[0] {
+                let input_y = input_origin_y + ky as isize;
+                if !(0..case.height as isize).contains(&input_y) {
+                    continue;
+                }
+                for kx in 0..case.kernel[1] {
+                    let input_x = input_origin_x + kx as isize;
+                    if !(0..case.width as isize).contains(&input_x) {
+                        continue;
+                    }
+                    for channel in 0..case.cin as usize {
+                        sum += i32::from(input_value(
+                            case,
+                            input_y as usize,
+                            input_x as usize,
+                            channel,
+                        )) * i32::from(weight_value(case, ky, kx, channel, output_channel));
+                    }
+                }
+            }
+            sum
         }
     }
 }

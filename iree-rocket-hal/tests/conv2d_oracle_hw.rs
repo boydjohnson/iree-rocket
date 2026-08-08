@@ -468,6 +468,54 @@ fn bank_partition_flip_boundary_cases() -> Vec<Conv2dCase> {
     cases
 }
 
+/// A real fp16 VGG-19 run through blocks 4-5 (all four Cin/Cout-512
+/// convolutions) shows severe end-to-end disagreement against CPU -- MAE
+/// roughly 30x worse than the same run capped at Cin/Cout <= 256, only
+/// 20.70% of logits within the 0.05 tolerance that the <= 256 run hit
+/// 100% on. None of these shapes are affected by the CBUF bank-partition
+/// bug fixed above (VGG never asks for small Cin with large Cout, or the
+/// specific high-Cin K1 combinations that bug needed), and the Cartesian
+/// oracle's `Counting`/`Selectors` patterns already pass at exactly these
+/// shapes. The leading hypothesis is that something specific to *dense,
+/// fully-diverse* coefficient data -- every tap and channel nonzero and
+/// distinct, as real trained weights are -- breaks in a way neither of
+/// those patterns exercises (`Counting` is uniform 1s; `Selectors` is
+/// three nonzero taps per output with everything else zero).
+///
+/// This runs `Dense` at the two suspect Cin/Cout-512 shapes (VGG blocks 4
+/// and 5) alongside the same pattern at a known-safe Cin/Cout-256 shape
+/// (VGG block 3) as a control: if block 3 passes and blocks 4/5 fail, that
+/// isolates the effect to Cin/Cout 512 specifically rather than to
+/// something wrong with the `Dense` pattern or harness itself.
+fn dense_coefficient_vgg_block_cases() -> Vec<Conv2dCase> {
+    let mut cases = Vec::new();
+    for (extent, cin, cout) in [
+        // VGG block 3 control -- known-safe, Counting/Selectors already
+        // pass here, and it is well outside the CBUF bank-partition bug's
+        // range.
+        (58u32, 128u32, 256u32),
+        (58, 256, 256),
+        // VGG block 4 -- the two suspect shapes.
+        (30, 256, 512),
+        (30, 512, 512),
+        // VGG block 5 -- the other suspect shape.
+        (16, 512, 512),
+    ] {
+        cases.push(Conv2dCase {
+            width: extent,
+            height: extent,
+            cin,
+            cout,
+            kernel: [3, 3],
+            stride: 1,
+            padding: [0, 0],
+            precision: OraclePrecision::Fp16,
+            pattern: OraclePattern::Dense { phase: 0 },
+        });
+    }
+    cases
+}
+
 fn int8_neutral80_one_hot_four_way_cases() -> Vec<Conv2dCase> {
     let mut cases = Vec::with_capacity(4);
     for signed_input in [false, true] {
@@ -629,6 +677,13 @@ fn bank_partition_flip_boundary_matrix_is_planable_and_gap_free() {
     assert_planable_and_gap_free(cases);
 }
 
+#[test]
+fn dense_coefficient_vgg_block_matrix_is_planable_and_gap_free() {
+    let cases = dense_coefficient_vgg_block_cases();
+    assert_eq!(cases.len(), 5);
+    assert_planable_and_gap_free(cases);
+}
+
 fn run_hardware_case_matrix(title: &str, cases: Vec<Conv2dCase>) {
     let total_cases = cases.len();
     let file = OpenOptions::new()
@@ -713,6 +768,14 @@ fn bank_partition_flip_boundary_probe_runs_every_case_before_failing() {
     let cases = bank_partition_flip_boundary_cases();
     assert_eq!(cases.len(), 16);
     run_hardware_case_matrix("bank-partition flip boundary probe", cases);
+}
+
+#[test]
+#[ignore = "needs /dev/accel/accel0 -- tests whether dense diverse coefficients break at VGG's Cin/Cout-512 blocks"]
+fn dense_coefficient_vgg_block_probe_runs_every_case_before_failing() {
+    let cases = dense_coefficient_vgg_block_cases();
+    assert_eq!(cases.len(), 5);
+    run_hardware_case_matrix("dense-coefficient VGG block probe", cases);
 }
 
 #[test]
