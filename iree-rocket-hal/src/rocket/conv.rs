@@ -946,6 +946,20 @@ impl Shape {
             * self.precision.element_bytes()
     }
 
+    /// Padded channel count [`crate::rocket::tensor_layout::pack_depthwise_to_rocket_weights`]'s
+    /// tap-major stride uses -- a whole CBUF atom *group*, not just a whole
+    /// atom (see [`Shape::weight_channels`]'s doc comment for why that
+    /// differs from [`Shape::padded_channels`] at fp16's 3-mod-4 atom
+    /// counts). [`Shape::weight_bytes`]'s depthwise branch reads the same
+    /// value via [`Shape::cbuf_atoms`]; this just exposes it for callers
+    /// packing the weight buffer instead of only sizing it.
+    ///
+    /// Only meaningful when [`Shape::depthwise`] is set -- callers packing a
+    /// dense filter want [`Shape::weight_channels`] instead.
+    pub fn depthwise_padded_channels(&self) -> u32 {
+        self.cbuf_atoms() * self.precision.channels_per_atom()
+    }
+
     /// Atoms per pixel implied by the weight padding.
     fn weight_atoms(&self) -> u32 {
         self.weight_channels() / self.precision.channels_per_atom()

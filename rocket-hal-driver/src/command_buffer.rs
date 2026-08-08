@@ -80,8 +80,8 @@ use iree_rocket_hal::rocket::{
     fc,
     pooling::{PoolingBuffers, PoolingPlan},
     tensor_layout::{
-        nc1hwc2_storage_size, pack_hwcf_to_rocket_weights, pack_nhwc_to_nc1hwc2_padded,
-        rocket_weight_storage_size,
+        nc1hwc2_storage_size, pack_depthwise_to_rocket_weights, pack_hwcf_to_rocket_weights,
+        pack_nhwc_to_nc1hwc2_padded, rocket_weight_storage_size,
     },
 };
 
@@ -132,6 +132,16 @@ pub struct WeightPacking {
     pub input_channels: usize,
     pub output_channels: usize,
     pub element_size: usize,
+    /// One filter per input channel (no `(input, output)` pairing) packed
+    /// tap-major via [`pack_depthwise_to_rocket_weights`] instead of
+    /// [`pack_hwcf_to_rocket_weights`]'s blocked dense order. `output_channels`
+    /// is unused in this mode -- Cout is always Cin, per
+    /// `iree-rocket-hal`'s `Shape::with_depthwise` -- and `padded_channels`
+    /// is read instead.
+    pub depthwise: bool,
+    /// Tap-major stride, only meaningful when `depthwise` is set. See
+    /// `iree-rocket-hal`'s `Shape::depthwise_padded_channels`.
+    pub padded_channels: usize,
 }
 
 /// Bridges the RK3588 DPU's atomic-slot output write-back (16-byte-aligned
@@ -426,17 +436,29 @@ pub unsafe fn apply_ops(
                     }
                 }
                 if let Some(packing) = weight_packing {
-                    let dense_len = packing
-                        .filter_height
-                        .checked_mul(packing.filter_width)
-                        .and_then(|value| value.checked_mul(packing.input_channels))
-                        .and_then(|value| value.checked_mul(packing.output_channels))
-                        .and_then(|value| value.checked_mul(packing.element_size))
-                        .ok_or_else(|| {
-                            status::from_code(
-                                crate::bindings::iree_status_code_e_IREE_STATUS_INTERNAL,
-                            )
-                        })?;
+                    // Depthwise's dense_len has no Cout factor -- one filter
+                    // per input channel, not a kernel set per output channel
+                    // (packing.output_channels is unused in this mode; see
+                    // WeightPacking's doc comment).
+                    let dense_len = if packing.depthwise {
+                        packing
+                            .filter_height
+                            .checked_mul(packing.filter_width)
+                            .and_then(|value| value.checked_mul(packing.input_channels))
+                            .and_then(|value| value.checked_mul(packing.element_size))
+                    } else {
+                        packing
+                            .filter_height
+                            .checked_mul(packing.filter_width)
+                            .and_then(|value| value.checked_mul(packing.input_channels))
+                            .and_then(|value| value.checked_mul(packing.output_channels))
+                            .and_then(|value| value.checked_mul(packing.element_size))
+                    }
+                    .ok_or_else(|| {
+                        status::from_code(
+                            crate::bindings::iree_status_code_e_IREE_STATUS_INTERNAL,
+                        )
+                    })?;
                     if dense_len as u64 > packing.weight_length as u64 {
                         return Err(status::from_code(
                             crate::bindings::iree_status_code_e_IREE_STATUS_INVALID_ARGUMENT,
@@ -452,17 +474,28 @@ pub unsafe fn apply_ops(
                     let scratch = unsafe {
                         std::slice::from_raw_parts_mut(packing.scratch_ptr, packing.scratch_length)
                     };
-                    if pack_hwcf_to_rocket_weights(
-                        dense,
-                        packing.filter_height,
-                        packing.filter_width,
-                        packing.input_channels,
-                        packing.output_channels,
-                        packing.element_size,
-                        scratch,
-                    )
-                    .is_err()
-                    {
+                    let pack_result = if packing.depthwise {
+                        pack_depthwise_to_rocket_weights(
+                            dense,
+                            packing.filter_height,
+                            packing.filter_width,
+                            packing.input_channels,
+                            packing.padded_channels,
+                            packing.element_size,
+                            scratch,
+                        )
+                    } else {
+                        pack_hwcf_to_rocket_weights(
+                            dense,
+                            packing.filter_height,
+                            packing.filter_width,
+                            packing.input_channels,
+                            packing.output_channels,
+                            packing.element_size,
+                            scratch,
+                        )
+                    };
+                    if pack_result.is_err() {
                         return Err(status::from_code(
                             crate::bindings::iree_status_code_e_IREE_STATUS_INTERNAL,
                         ));
@@ -959,6 +992,54 @@ unsafe extern "C" fn dispatch(
                             input_channels: shape.in_channels as usize,
                             output_channels: shape.out_channels as usize,
                             element_size,
+                            depthwise: false,
+                            padded_channels: 0,
+                        }),
+                    )
+                } else if shape.precision == Precision::Fp16 && shape.depthwise {
+                    // One filter per input channel -- no Cout factor, unlike
+                    // the dense branch above. The compiler-emitted dispatch
+                    // (transform.0.mlir's call_rocket_dynamic_depthwise_conv2d)
+                    // transposes the filter to [Cin][kh][kw] before this
+                    // binding is populated, matching what
+                    // pack_depthwise_to_rocket_weights expects -- see that
+                    // function's doc comment.
+                    if !matches!(
+                        kernels[0]
+                        .checked_mul(kernels[1])
+                        .and_then(|value| value.checked_mul(shape.in_channels as usize))
+                        .and_then(|value| value.checked_mul(element_size)),
+                        Some(value) if value as u64 <= refs[1].length as u64
+                    ) {
+                        return status::from_code(
+                            crate::bindings::iree_status_code_e_IREE_STATUS_INVALID_ARGUMENT,
+                        );
+                    }
+                    let scratch_bytes = shape.weight_bytes(kernels) as usize;
+                    let scratch = unsafe {
+                        RocketDeviceBuffer::new(
+                            cb.fd,
+                            scratch_bytes.max(1),
+                            BorrowedFd::borrow_raw(cb.fd),
+                        )
+                    };
+                    (
+                        scratch.dma_address,
+                        scratch.handle,
+                        Some(WeightPacking {
+                            weight_buffer: refs[1].buffer,
+                            weight_offset: refs[1].offset,
+                            weight_length: refs[1].length,
+                            scratch_ptr: scratch.host_ptr,
+                            scratch_length: scratch_bytes,
+                            scratch_handle: scratch.handle,
+                            filter_height: kernels[0],
+                            filter_width: kernels[1],
+                            input_channels: shape.in_channels as usize,
+                            output_channels: shape.out_channels as usize,
+                            element_size,
+                            depthwise: true,
+                            padded_channels: shape.depthwise_padded_channels() as usize,
                         }),
                     )
                 } else {
@@ -1173,6 +1254,8 @@ unsafe extern "C" fn dispatch(
                 input_channels: k,
                 output_channels: n,
                 element_size,
+                depthwise: false,
+                padded_channels: 0,
             });
 
             let output_scratch_bytes =
