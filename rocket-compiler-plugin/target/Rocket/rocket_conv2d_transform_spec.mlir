@@ -1,50 +1,16 @@
-// Generic convolution recognition is separated from executable
-// specialization. The matchers below use ConvolutionOpInterface to inspect
-// element types, dimensions, stride, and dilation without spelling complete
-// tensor types in a DAG. Known static MobileNet shapes retain their dedicated
-// executables. The 1x1 and 3x3 fallbacks use the runtime-dimension ABI and a
-// cast-compatible dynamic helper, allowing input/output spatial dimensions to
-// remain unknown until dispatch. Batch remains statically one, and channel
-// counts must be statically bounded by the hardware's 512 limit.
-
-#rocket_target_0 = #hal.executable.target<"rocket", "rocket-flatbuffer-v1", {
-  kernel = "conv2d",
-  input_width = 112 : i32, input_height = 112 : i32, input_channels = 32 : i32,
-  output_width = 112 : i32, output_height = 112 : i32, output_channels = 16 : i32,
-  weights_width = 1 : i32, weights_height = 1 : i32, stride = 1 : i32,
-  depthwise = false,
-  input_zero_point = 0 : i32, output_zero_point = 0 : i32, weights_zero_point = 0 : i32,
-  input_scale = 1.0 : f32, weights_scale = 1.0 : f32, output_scale = 1.0 : f32,
-  truncate_bits = 0 : i32,
-  activation = "none", activation_cmp = 0 : i32,
-  precision = "fp16"
-}>
-
-#rocket_target_1 = #hal.executable.target<"rocket", "rocket-flatbuffer-v1", {
-  kernel = "conv2d",
-  input_width = 56 : i32, input_height = 56 : i32, input_channels = 96 : i32,
-  output_width = 56 : i32, output_height = 56 : i32, output_channels = 24 : i32,
-  weights_width = 1 : i32, weights_height = 1 : i32, stride = 1 : i32,
-  depthwise = false,
-  input_zero_point = 0 : i32, output_zero_point = 0 : i32, weights_zero_point = 0 : i32,
-  input_scale = 1.0 : f32, weights_scale = 1.0 : f32, output_scale = 1.0 : f32,
-  truncate_bits = 0 : i32,
-  activation = "none", activation_cmp = 0 : i32,
-  precision = "fp16"
-}>
-
-#rocket_target_2 = #hal.executable.target<"rocket", "rocket-flatbuffer-v1", {
-  kernel = "conv2d",
-  input_width = 56 : i32, input_height = 56 : i32, input_channels = 24 : i32,
-  output_width = 56 : i32, output_height = 56 : i32, output_channels = 144 : i32,
-  weights_width = 1 : i32, weights_height = 1 : i32, stride = 1 : i32,
-  depthwise = false,
-  input_zero_point = 0 : i32, output_zero_point = 0 : i32, weights_zero_point = 0 : i32,
-  input_scale = 1.0 : f32, weights_scale = 1.0 : f32, output_scale = 1.0 : f32,
-  truncate_bits = 0 : i32,
-  activation = "none", activation_cmp = 0 : i32,
-  precision = "fp16"
-}>
+// Rocket conv2d dispatch, generic over runtime shape. Previously this file
+// also carried three fixed-shape per-MobileNet-layer executables
+// (rocket_target_0/1/2, rocket_executable_0/1/2, @match_conv2d_0/1/2) as a
+// literal-shape fast path ahead of the dynamic fallback below. They are
+// retired: the dynamic path (@match_dynamic_conv2d/_3x3 and their depthwise
+// counterparts) claims the same shapes through the identical
+// runtime-dimension ABI, so the fixed-shape specializations added a second
+// code path without adding coverage. Developed and hardware-validated
+// against the RK3588 in iree-rocket-design-spike (see that repo's
+// DESIGN_NOTES.md for the full derivation, including the two
+// rocket-hal-driver bugs the depthwise path exposed: a skipped weight-
+// packing branch and a tap-major layout formula only ever checked inside
+// one 32-channel coefficient group).
 
 #rocket_dynamic_target = #hal.executable.target<"rocket", "rocket-flatbuffer-v1", {
   kernel = "conv2d",
@@ -67,12 +33,34 @@
   ]
 }>
 
-#pipeline_layout = #hal.pipeline.layout<constants = 0, bindings = [
-  #hal.pipeline.binding<storage_buffer, ReadOnly>,
-  #hal.pipeline.binding<storage_buffer, ReadOnly>,
-  #hal.pipeline.binding<storage_buffer, ReadOnly>,
-  #hal.pipeline.binding<storage_buffer>
-]>
+// Same wire format as #rocket_dynamic_target with depthwise = true. Kept as
+// a separate attr (rather than a runtime-settable bool) because it gates a
+// different register program at the driver (CNA_CONV_CON1.CONV_MODE=3,
+// CORE_MISC_CFG.DW_EN=1, etc. -- see DESIGN_NOTES.md "Depthwise: Mesa's
+// channel rule is wrong") and a different weight layout
+// (tensor_layout::pack_depthwise_to_rocket_weights, tap-major with a
+// padded-channel stride, not pack_hwcf_to_rocket_weights). output_channels
+// is still carried on the wire even though the depthwise matchers below only
+// ever bind it equal to input_channels -- Conv2DDef's depthwise field
+// (rocket-schema) already exists for this and the driver
+// (executable_cache.rs) already reads it, so this is genuinely just a
+// dispatch-selection gap, not a runtime one.
+#rocket_dynamic_depthwise_target = #hal.executable.target<"rocket", "rocket-flatbuffer-v1", {
+  kernel = "conv2d",
+  input_width = 0 : i32, input_height = 0 : i32, input_channels = 0 : i32,
+  output_width = 0 : i32, output_height = 0 : i32, output_channels = 0 : i32,
+  weights_width = 0 : i32, weights_height = 0 : i32, stride = 1 : i32,
+  depthwise = true,
+  input_zero_point = 0 : i32, output_zero_point = 0 : i32, weights_zero_point = 0 : i32,
+  input_scale = 1.0 : f32, weights_scale = 1.0 : f32, output_scale = 1.0 : f32,
+  truncate_bits = 0 : i32,
+  activation = "none", activation_cmp = 0 : i32,
+  precision = "fp16",
+  runtime_dimensions = [
+    "input_width", "input_height", "input_channels",
+    "output_channels", "weights_width", "weights_height"
+  ]
+}>
 
 #dynamic_pipeline_layout = #hal.pipeline.layout<constants = 6, bindings = [
   #hal.pipeline.binding<storage_buffer, ReadOnly>,
@@ -81,45 +69,6 @@
   #hal.pipeline.binding<storage_buffer>
 ]>
 
-// IMPORTANT: unlike the CollapseDimensionsPass fix above, `stream.topology`
-// must live on the TARGET module being compiled (standalone_repro.mlir /
-// mnv2_fp16_clean.mlir), not on THIS transform-spec file's own module --
-// they are two separate MLIR modules (the transform interpreter loads this
-// file as a library and applies it to the real target module; top-level
-// attributes on this file never get copied over). It is injected below via
-// `transform.annotate` + `transform.param.constant` inside
-// @cast_and_call_conv2d_0, targeting `%module`
-// (transform.util.get_nearest_symbol_table's result, i.e. the real target
-// module), each time our matcher fires. `transform.annotate` just does a
-// plain `setAttr`, so repeated firings (multiple matched convs) simply
-// overwrite the same value idempotently -- harmless.
-//
-// SECOND real bug found (after the CollapseDimensionsPass attr-drop above):
-// once the rocket dispatch's f16 output is consumed DIRECTLY by another
-// dispatch on a DIFFERENT device within the same computation (a genuine
-// cross-device data dependency, not just "two independent unrelated
-// dispatches on different devices" like the doc-comment example in
-// rocket_conv2d_transform_spec.mlir), Stream correctly forms a
-// `!stream.resource<transient>` allocated `on(#hal.device.optimal<[cpu,
-// rocket]>)` (see --compile-to=stream output) with explicit
-// `stream.cmd.flush` sync between the two device partitions -- this is
-// real, intentional IREE multi-device machinery, not a bug on its own.
-// But lowering it through HAL requires
-// `ResolveTopologyQueriesPass::resolveMemoryPropertiesOp`
-// (Dialect/HAL/Transforms/ResolveTopologyQueries.cpp) to prove the
-// cross-device buffer can actually be shared -- it does this via
-// `tryAddSharedUsageBits`, which needs the module's `stream.topology`
-// attribute (`#hal.device.topology<links = [...]>`) to declare
-// `transparent_access`/`unified_memory` between rocket_device and
-// cpu_device. With NO topology attribute at all (the default, and what
-// design_b_fix_dispatch_region.mlir implicitly had), this silently fails
-// (the pass ignores resolveMemoryPropertiesOp's LogicalResult) and leaves
-// a `hal.allocator.resolve_memory_properties` op with no lowering, which
-// then hard-fails much later at VM conversion with "failed to legalize
-// operation 'hal.allocator.resolve_memory_properties'" -- a confusing
-// error far from its real cause. Declaring the topology below (truthfully
-// -- RK3588's rocket NPU really is unified, host-mmap'd memory, see
-// project memory's RocketAllocator/RocketBuffer notes) fixes it cleanly.
 module attributes {transform.with_named_sequence} {
 
   hal.executable private @rocket_dynamic_executable {
@@ -130,6 +79,20 @@ module attributes {transform.with_named_sequence} {
       }
       builtin.module {
         func.func @rocket_dynamic_conv2d() {
+          return
+        }
+      }
+    }
+  }
+
+  hal.executable private @rocket_dynamic_depthwise_executable {
+    hal.executable.variant public @rocket_dynamic_depthwise_conv2d_v1 target(#rocket_dynamic_depthwise_target) {
+      hal.executable.export public @rocket_dynamic_depthwise_conv2d ordinal(0) layout(#dynamic_pipeline_layout) count(%device: !hal.device, %workload: index) -> (index, index, index) {
+        %c1 = arith.constant 1 : index
+        hal.return %c1, %c1, %c1 : index, index, index
+      }
+      builtin.module {
+        func.func @rocket_dynamic_depthwise_conv2d() {
           return
         }
       }
@@ -267,313 +230,335 @@ module attributes {transform.with_named_sequence} {
     util.return %final : tensor<1x?x?x?xf32>
   }
 
-  hal.executable private @rocket_executable_0 {
-    hal.executable.variant public @rocket_conv2d_v1_0 target(#rocket_target_0) {
-      hal.executable.export public @rocket_conv2d_0 ordinal(0) layout(#pipeline_layout) count(%device: !hal.device, %workload: index) -> (index, index, index) {
-        %c1 = arith.constant 1 : index
-        hal.return %c1, %c1, %c1 : index, index, index
-      }
-      builtin.module {
-        func.func @rocket_conv2d_0() {
-          return
-        }
-      }
-    }
-  }
+  // Depthwise counterpart of call_rocket_dynamic_conv2d. The filter operand
+  // drops its Cout dimension (HWC, not HWCF): Rocket's depthwise mode is
+  // hardware-validated for a channel multiplier of one only
+  // (ConvPlan::with_depthwise asserts this in conv.rs -- "depthwise capture
+  // backing covers a channel multiplier of one only"), so output_channels
+  // is always input_channels here, not an independent quantity. It is still
+  // read off %init and sent as its own push constant, matching the wire
+  // format #rocket_dynamic_depthwise_target declares, but the matchers below
+  // never bind it to anything other than input_channels.
+  util.func private @call_rocket_dynamic_depthwise_conv2d(
+      %input: tensor<1x?x?x?xf16>,
+      %filter: tensor<?x?x?xf16>,
+      %init: tensor<1x?x?x?xf32>) -> tensor<1x?x?x?xf32> {
+    %c0 = arith.constant 0 : index
+    %c1 = arith.constant 1 : index
+    %c2 = arith.constant 2 : index
+    %c3 = arith.constant 3 : index
 
-  // Only the bare conv op is matched/replaced. filter-transpose, bias
-  // extf/broadcast, and everything downstream (expand_shape, truncf,
-  // relu6 clamp) stay exactly as they were in the real graph, untouched --
-  // this dispatch does a ZERO-bias raw conv on the NPU, upcasts to f32,
-  // and adds the real (already-broadcast) bias back in on CPU, matching
-  // the bare conv op's exact original semantics (outs + conv(ins)).
-  util.func private @call_rocket_conv2d_0(%input: tensor<1x112x112x32xf16>, %filter: tensor<1x1x32x16xf16>, %bias_bcast: tensor<1x112x112x16xf32>) -> tensor<1x112x112x16xf32> {
-    %zero_bias_empty = tensor.empty() : tensor<16xf16>
+    %input_height = tensor.dim %input, %c1 : tensor<1x?x?x?xf16>
+    %input_width = tensor.dim %input, %c2 : tensor<1x?x?x?xf16>
+    %input_channels = tensor.dim %input, %c3 : tensor<1x?x?x?xf16>
+    %weights_height = tensor.dim %filter, %c0 : tensor<?x?x?xf16>
+    %weights_width = tensor.dim %filter, %c1 : tensor<?x?x?xf16>
+    %output_height = tensor.dim %init, %c1 : tensor<1x?x?x?xf32>
+    %output_width = tensor.dim %init, %c2 : tensor<1x?x?x?xf32>
+    %output_channels = tensor.dim %init, %c3 : tensor<1x?x?x?xf32>
+
+    %input_width_i32 = arith.index_cast %input_width : index to i32
+    %input_height_i32 = arith.index_cast %input_height : index to i32
+    %input_channels_i32 = arith.index_cast %input_channels : index to i32
+    %output_channels_i32 = arith.index_cast %output_channels : index to i32
+    %weights_width_i32 = arith.index_cast %weights_width : index to i32
+    %weights_height_i32 = arith.index_cast %weights_height : index to i32
+
+    %zero_bias_empty = tensor.empty(%output_channels) : tensor<?xf16>
     %zero_f16 = arith.constant 0.0 : f16
-    %zero_bias = linalg.fill ins(%zero_f16 : f16) outs(%zero_bias_empty : tensor<16xf16>) -> tensor<16xf16>
-    %raw_f16 = flow.dispatch @rocket_executable_0::@rocket_conv2d_v1_0::@rocket_conv2d_0(%input, %filter, %zero_bias)
+    %zero_bias = linalg.fill ins(%zero_f16 : f16)
+        outs(%zero_bias_empty : tensor<?xf16>) -> tensor<?xf16>
+
+    // linalg.depthwise_conv_2d_nhwc_hwc's filter operand is [kh][kw][c] --
+    // required by the op's own semantics, matched by the CPU reference
+    // computation, and NOT what the driver's weight-packing path expects.
+    // rocket-hal-driver's pack_depthwise_to_rocket_weights (the hardware-
+    // derived tap-major packer, see its doc comment) takes a torch/ONNX-
+    // style [c][kh][kw] buffer, matching how a real depthwise filter is
+    // conventionally stored -- this op's HWC layout is a linalg-dialect
+    // convention, not a hardware one. Transposing here, once, keeps that
+    // packer's contract simple instead of teaching it a second input order.
+    %filter_chw_empty = tensor.empty(%input_channels, %weights_height, %weights_width) : tensor<?x?x?xf16>
+    %filter_chw = linalg.transpose
+        ins(%filter : tensor<?x?x?xf16>)
+        outs(%filter_chw_empty : tensor<?x?x?xf16>)
+        permutation = [2, 0, 1]
+
+    %raw_f16 = flow.dispatch
+        @rocket_dynamic_depthwise_executable::@rocket_dynamic_depthwise_conv2d_v1::@rocket_dynamic_depthwise_conv2d(
+          %input_width_i32, %input_height_i32, %input_channels_i32,
+          %output_channels_i32, %weights_width_i32, %weights_height_i32,
+          %input, %filter_chw, %zero_bias)
         {stream.affinity = #hal.device.affinity<@rocket_device>}
-        : (tensor<1x112x112x32xf16>, tensor<1x1x32x16xf16>, tensor<16xf16>) -> tensor<1x112x112x16xf16>
-    // ROOT CAUSE (confirmed by reading IREE source + bisecting IR dumps
-    // stage-by-stage with --mlir-print-ir-after-all, not guessed):
-    //
-    // A hand-authored `flow.dispatch.region ... attributes {stream.affinity
-    // = ...}` (the design_b_fix_dispatch_region.mlir attempt) is NOT
-    // sufficient. It survives Preprocessing and GlobalOptimization intact
-    // (confirmed via --compile-to=global-optimization), but
-    // DispatchCreation's `CollapseDimensionsPass` unconditionally destroys
-    // it. That pass's `hoistTensorReshapesOutOfDispatchRegion()`
-    // (DispatchCreation/CollapseDimensions.cpp) is called via
-    // `funcOp->walk<DispatchRegionOp>` on EVERY `flow.dispatch.region` in
-    // the function -- unconditionally, regardless of whether any reshape
-    // ops are actually present to hoist -- and unconditionally rebuilds the
-    // op via a bare `IREE::Flow::DispatchRegionOp::create(rewriter, loc,
-    // newReturnTypes, newDynamicDims, dispatchOp.getWorkload())` at line
-    // 913, which does NOT call `setDialectAttrs()` (unlike
-    // ConvertRegionToWorkgroups.cpp:167, which does). So our
-    // `stream.affinity` attribute is silently dropped before
-    // ConvertDispatchRegionsToWorkgroupsPass even runs. Confirmed by
-    // diffing --compile-to=dispatch-creation output before/after this exact
-    // pass: attribute present right before CollapseDimensionsPass, gone
-    // right after, on the exact same op. This is a genuine IREE upstream
-    // bug (attribute-preservation oversight in CollapseDimensionsPass), not
-    // a conceptual misunderstanding about affinity/util.call boundaries.
-    //
-    // ALSO confirmed dead-end: setting `stream.affinity` directly as a
-    // linalg.generic's own `attrs = {...}` clause (the very first thing
-    // tried, before any dispatch.region) has no effect for a different
-    // reason -- `wrapOpInDispatchRegion`/`makeEmptyDispatchRegion`
-    // (Flow/Transforms/RegionOpUtils.cpp), which
-    // CloneProducersIntoDispatchRegionsPass uses to auto-wrap any bare
-    // linalg.generic left outside a dispatch, creates a brand new empty
-    // region and never consults the wrapped op's own attributes at all.
-    //
-    // WORKAROUND (this file): skip `flow.dispatch.region` entirely and
-    // hand-author the ALREADY-OUTLINED `flow.dispatch.workgroups` form
-    // directly (with real iree_tensor_ext.dispatch.tensor.load/store
-    // boilerplate, mechanically copied from what
-    // ConvertDispatchRegionsToWorkgroupsPass itself produces for an
-    // equivalent region -- see the dispatch-creation IR dump captured
-    // while root-causing this). CollapseDimensionsPass's walk only matches
-    // `IREE::Flow::DispatchRegionOp`; a `flow.dispatch.workgroups` op is a
-    // different op type (already "isolated from above", already
-    // dispatch-shaped) and is never visited by it, so the attribute we set
-    // here is never at risk of being dropped by that pass. It is also never
-    // touched by FormDispatchRegions/ElementwiseOpFusion/
-    // CloneProducersIntoDispatchRegions (those only cluster ops NOT already
-    // inside a dispatch). It only gets touched once more, by
-    // OutlineDispatchRegions at the `flow` stage, which DOES correctly
-    // preserve dialect attrs (confirmed via source read,
-    // OutlineDispatchRegions.cpp:81,144) -- and empirically confirmed here:
-    // `stream.affinity` is present on the resulting flow.dispatch call
-    // through dispatch-creation, flow, and stream stages, and the module
-    // compiles clean end-to-end (see design_b_fix_v2_workgroups compile log
-    // in project memory / agent report).
-    %final = flow.dispatch.workgroups(%raw_f16, %bias_bcast) : (tensor<1x112x112x16xf16>, tensor<1x112x112x16xf32>) -> tensor<1x112x112x16xf32>
+        : (i32, i32, i32, i32, i32, i32,
+           tensor<1x?x?x?xf16>{%input_height, %input_width, %input_channels},
+           tensor<?x?x?xf16>{%input_channels, %weights_height, %weights_width},
+           tensor<?xf16>{%output_channels})
+        -> tensor<1x?x?x?xf16>{%output_height, %output_width, %output_channels}
+
+    %final = flow.dispatch.workgroups[
+        %output_height, %output_width, %output_channels](
+        %raw_f16, %init, %output_height, %output_width, %output_channels)
+        : (tensor<1x?x?x?xf16>{%output_height, %output_width, %output_channels},
+           tensor<1x?x?x?xf32>{%output_height, %output_width, %output_channels},
+           index, index, index)
+        -> tensor<1x?x?x?xf32>{%output_height, %output_width, %output_channels}
         attributes { stream.affinity = #hal.device.affinity<@cpu_device> } =
-        (%arg3: !iree_tensor_ext.dispatch.tensor<readonly:tensor<1x112x112x16xf16>>, %arg4: !iree_tensor_ext.dispatch.tensor<readonly:tensor<1x112x112x16xf32>>, %arg5: !iree_tensor_ext.dispatch.tensor<writeonly:tensor<1x112x112x16xf32>>) {
-      %raw_f16_ld = iree_tensor_ext.dispatch.tensor.load %arg3, offsets = [0, 0, 0, 0], sizes = [1, 112, 112, 16], strides = [1, 1, 1, 1] : !iree_tensor_ext.dispatch.tensor<readonly:tensor<1x112x112x16xf16>> -> tensor<1x112x112x16xf16>
-      %bias_ld = iree_tensor_ext.dispatch.tensor.load %arg4, offsets = [0, 0, 0, 0], sizes = [1, 112, 112, 16], strides = [1, 1, 1, 1] : !iree_tensor_ext.dispatch.tensor<readonly:tensor<1x112x112x16xf32>> -> tensor<1x112x112x16xf32>
-      %final_empty = tensor.empty() : tensor<1x112x112x16xf32>
-      %final_inner = linalg.generic {indexing_maps = [affine_map<(d0, d1, d2, d3) -> (d0, d1, d2, d3)>, affine_map<(d0, d1, d2, d3) -> (d0, d1, d2, d3)>, affine_map<(d0, d1, d2, d3) -> (d0, d1, d2, d3)>], iterator_types = ["parallel", "parallel", "parallel", "parallel"]} ins(%raw_f16_ld, %bias_ld : tensor<1x112x112x16xf16>, tensor<1x112x112x16xf32>) outs(%final_empty : tensor<1x112x112x16xf32>) {
-      ^bb0(%a: f16, %b: f32, %out: f32):
-        %ae = arith.extf %a : f16 to f32
-        %s = arith.addf %ae, %b : f32
-        linalg.yield %s : f32
-      } -> tensor<1x112x112x16xf32>
-      iree_tensor_ext.dispatch.tensor.store %final_inner, %arg5, offsets = [0, 0, 0, 0], sizes = [1, 112, 112, 16], strides = [1, 1, 1, 1] : tensor<1x112x112x16xf32> -> !iree_tensor_ext.dispatch.tensor<writeonly:tensor<1x112x112x16xf32>>
+        (%raw_binding: !iree_tensor_ext.dispatch.tensor<readonly:tensor<1x?x?x?xf16>>,
+         %init_binding: !iree_tensor_ext.dispatch.tensor<readonly:tensor<1x?x?x?xf32>>,
+         %output_height_arg: index,
+         %output_width_arg: index,
+         %output_channels_arg: index,
+         %final_binding: !iree_tensor_ext.dispatch.tensor<writeonly:tensor<1x?x?x?xf32>>) {
+      %output_height_size = iree_tensor_ext.dispatch.workload.ordinal
+          %output_height_arg, 0 : index
+      %output_width_size = iree_tensor_ext.dispatch.workload.ordinal
+          %output_width_arg, 1 : index
+      %output_channels_size = iree_tensor_ext.dispatch.workload.ordinal
+          %output_channels_arg, 2 : index
+      %raw_shaped = flow.dispatch.tie_shape %raw_binding
+          : !iree_tensor_ext.dispatch.tensor<readonly:tensor<1x?x?x?xf16>>{
+              %output_height_size, %output_width_size, %output_channels_size}
+      %init_shaped = flow.dispatch.tie_shape %init_binding
+          : !iree_tensor_ext.dispatch.tensor<readonly:tensor<1x?x?x?xf32>>{
+              %output_height_size, %output_width_size, %output_channels_size}
+      %final_shaped = flow.dispatch.tie_shape %final_binding
+          : !iree_tensor_ext.dispatch.tensor<writeonly:tensor<1x?x?x?xf32>>{
+              %output_height_size, %output_width_size, %output_channels_size}
+      %raw_loaded = iree_tensor_ext.dispatch.tensor.load %raw_shaped,
+          offsets = [0, 0, 0, 0],
+          sizes = [1, %output_height_size, %output_width_size, %output_channels_size],
+          strides = [1, 1, 1, 1]
+          : !iree_tensor_ext.dispatch.tensor<readonly:tensor<1x?x?x?xf16>>{
+              %output_height_size, %output_width_size, %output_channels_size}
+          -> tensor<1x?x?x?xf16>
+      %init_loaded = iree_tensor_ext.dispatch.tensor.load %init_shaped,
+          offsets = [0, 0, 0, 0],
+          sizes = [1, %output_height_size, %output_width_size, %output_channels_size],
+          strides = [1, 1, 1, 1]
+          : !iree_tensor_ext.dispatch.tensor<readonly:tensor<1x?x?x?xf32>>{
+              %output_height_size, %output_width_size, %output_channels_size}
+          -> tensor<1x?x?x?xf32>
+      %final_empty = tensor.empty(
+          %output_height_size, %output_width_size, %output_channels_size)
+          : tensor<1x?x?x?xf32>
+      %final_inner = linalg.generic {
+          indexing_maps = [
+            affine_map<(d0, d1, d2, d3) -> (d0, d1, d2, d3)>,
+            affine_map<(d0, d1, d2, d3) -> (d0, d1, d2, d3)>,
+            affine_map<(d0, d1, d2, d3) -> (d0, d1, d2, d3)>
+          ],
+          iterator_types = ["parallel", "parallel", "parallel", "parallel"]
+        } ins(%raw_loaded, %init_loaded
+            : tensor<1x?x?x?xf16>, tensor<1x?x?x?xf32>)
+          outs(%final_empty : tensor<1x?x?x?xf32>) {
+        ^bb0(%raw: f16, %initial: f32, %out: f32):
+          %raw_f32 = arith.extf %raw : f16 to f32
+          %sum = arith.addf %raw_f32, %initial : f32
+          linalg.yield %sum : f32
+      } -> tensor<1x?x?x?xf32>
+      iree_tensor_ext.dispatch.tensor.store %final_inner, %final_shaped,
+          offsets = [0, 0, 0, 0],
+          sizes = [1, %output_height_size, %output_width_size, %output_channels_size],
+          strides = [1, 1, 1, 1]
+          : tensor<1x?x?x?xf32>
+          -> !iree_tensor_ext.dispatch.tensor<writeonly:tensor<1x?x?x?xf32>>{
+              %output_height_size, %output_width_size, %output_channels_size}
       flow.return
-    } count() -> (index, index, index) {
-      %x, %y, %z = iree_tensor_ext.dispatch.workgroup_count_from_slice()
+    } count(%output_height_workload: index,
+            %output_width_workload: index,
+            %output_channels_workload: index) -> (index, index, index) {
+      %x, %y, %z = iree_tensor_ext.dispatch.workgroup_count_from_slice(
+          %output_height_workload,
+          %output_width_workload,
+          %output_channels_workload)
       flow.return %x, %y, %z : index, index, index
     }
-    util.return %final : tensor<1x112x112x16xf32>
+
+    util.return %final : tensor<1x?x?x?xf32>
   }
 
-  hal.executable private @rocket_executable_1 {
-    hal.executable.variant public @rocket_conv2d_v1_1 target(#rocket_target_1) {
-      hal.executable.export public @rocket_conv2d_1 ordinal(0) layout(#pipeline_layout) count(%device: !hal.device, %workload: index) -> (index, index, index) {
-        %c1 = arith.constant 1 : index
-        hal.return %c1, %c1, %c1 : index, index, index
-      }
-      builtin.module {
-        func.func @rocket_conv2d_1() {
-          return
-        }
-      }
-    }
-  }
+  // NCHW counterpart of call_rocket_dynamic_depthwise_conv2d. A real model
+  // imported from ONNX (torch-mlir's onnx.Conv legalization) never produces
+  // linalg.depthwise_conv_2d_nhwc_hwc directly: it lowers to
+  // linalg.depthwise_conv_2d_nchw_chw, and IREE's own
+  // iree-preprocessing-convert-conv-to-channels-last pass explicitly
+  // declines to transpose depthwise convs to channels-last
+  // (ConvertConvToChannelsLast.cpp's transposeConvLikeLinalgOp bails
+  // whenever ConvolutionDimensions::depth is non-empty), unlike the dense
+  // path, which that same pass always converts first. So the NHWC-only
+  // matcher above -- correct and hardware-confirmed on its own -- never
+  // sees a real ONNX-imported depthwise conv at all; every one of
+  // MobileNetV2's 17 depthwise layers fell back to CPU confirming this
+  // (iree-dump-module on a real compiled mobilenet.vmfb: zero references to
+  // rocket_dynamic_depthwise_executable).
+  //
+  // Handled here by transposing host-side instead of waiting on an upstream
+  // fix to the shared preprocessing pass: Rocket's hardware ABI is NHWC-
+  // native (every existing matcher in this file agrees), so the input and
+  // output feature maps are transposed NCHW<->NHWC around the same
+  // rocket_dynamic_depthwise_executable dispatch call_rocket_dynamic_depthwise_conv2d
+  // already uses. The filter needs no transpose at all here -- unlike the
+  // NHWC matcher, whose HWC filter has to be transposed to CHW before
+  // dispatch, linalg.depthwise_conv_2d_nchw_chw's filter operand is already
+  // [c][kh][kw] (confirmed against a real onnx-imported MobileNet dump:
+  // `tensor<32x3x3xf16>` for a Cin=32 depthwise layer), exactly what
+  // rocket-hal-driver's pack_depthwise_to_rocket_weights expects.
+  util.func private @call_rocket_dynamic_depthwise_conv2d_nchw(
+      %input: tensor<1x?x?x?xf16>,
+      %filter: tensor<?x?x?xf16>,
+      %init: tensor<1x?x?x?xf32>) -> tensor<1x?x?x?xf32> {
+    %c0 = arith.constant 0 : index
+    %c1 = arith.constant 1 : index
+    %c2 = arith.constant 2 : index
+    %c3 = arith.constant 3 : index
 
-  hal.executable private @rocket_executable_2 {
-    hal.executable.variant public @rocket_conv2d_v1_2 target(#rocket_target_2) {
-      hal.executable.export public @rocket_conv2d_2 ordinal(0) layout(#pipeline_layout) count(%device: !hal.device, %workload: index) -> (index, index, index) {
-        %c1 = arith.constant 1 : index
-        hal.return %c1, %c1, %c1 : index, index, index
-      }
-      builtin.module {
-        func.func @rocket_conv2d_2() {
-          return
-        }
-      }
-    }
-  }
+    // NCHW: dim 1 is channels, dims 2/3 are the spatial extent.
+    %input_channels = tensor.dim %input, %c1 : tensor<1x?x?x?xf16>
+    %input_height = tensor.dim %input, %c2 : tensor<1x?x?x?xf16>
+    %input_width = tensor.dim %input, %c3 : tensor<1x?x?x?xf16>
+    // Filter is [c][kh][kw]: dims 1/2 are the kernel extent.
+    %weights_height = tensor.dim %filter, %c1 : tensor<?x?x?xf16>
+    %weights_width = tensor.dim %filter, %c2 : tensor<?x?x?xf16>
+    %output_channels = tensor.dim %init, %c1 : tensor<1x?x?x?xf32>
+    %output_height = tensor.dim %init, %c2 : tensor<1x?x?x?xf32>
+    %output_width = tensor.dim %init, %c3 : tensor<1x?x?x?xf32>
 
-  // Shape 1: 1x56x56x96 -> 1x56x56x24 (filter 24x96x1x1). Mechanically
-  // identical structure to call_rocket_conv2d_0, just a different static
-  // shape -- proves the fix is shape-generic, not a one-off.
-  util.func private @call_rocket_conv2d_1(%input: tensor<1x56x56x96xf16>, %filter: tensor<1x1x96x24xf16>, %bias_bcast: tensor<1x56x56x24xf32>) -> tensor<1x56x56x24xf32> {
-    %zero_bias_empty = tensor.empty() : tensor<24xf16>
+    %input_width_i32 = arith.index_cast %input_width : index to i32
+    %input_height_i32 = arith.index_cast %input_height : index to i32
+    %input_channels_i32 = arith.index_cast %input_channels : index to i32
+    %output_channels_i32 = arith.index_cast %output_channels : index to i32
+    %weights_width_i32 = arith.index_cast %weights_width : index to i32
+    %weights_height_i32 = arith.index_cast %weights_height : index to i32
+
+    %zero_bias_empty = tensor.empty(%output_channels) : tensor<?xf16>
     %zero_f16 = arith.constant 0.0 : f16
-    %zero_bias = linalg.fill ins(%zero_f16 : f16) outs(%zero_bias_empty : tensor<24xf16>) -> tensor<24xf16>
-    %raw_f16 = flow.dispatch @rocket_executable_1::@rocket_conv2d_v1_1::@rocket_conv2d_1(%input, %filter, %zero_bias)
+    %zero_bias = linalg.fill ins(%zero_f16 : f16)
+        outs(%zero_bias_empty : tensor<?xf16>) -> tensor<?xf16>
+
+    // NCHW [1,C,H,W] -> NHWC [1,H,W,C]: out.shape[i] = in.shape[perm[i]],
+    // so perm = [0, 2, 3, 1].
+    %input_nhwc_empty = tensor.empty(%input_height, %input_width, %input_channels) : tensor<1x?x?x?xf16>
+    %input_nhwc = linalg.transpose
+        ins(%input : tensor<1x?x?x?xf16>)
+        outs(%input_nhwc_empty : tensor<1x?x?x?xf16>)
+        permutation = [0, 2, 3, 1]
+
+    %raw_f16 = flow.dispatch
+        @rocket_dynamic_depthwise_executable::@rocket_dynamic_depthwise_conv2d_v1::@rocket_dynamic_depthwise_conv2d(
+          %input_width_i32, %input_height_i32, %input_channels_i32,
+          %output_channels_i32, %weights_width_i32, %weights_height_i32,
+          %input_nhwc, %filter, %zero_bias)
         {stream.affinity = #hal.device.affinity<@rocket_device>}
-        : (tensor<1x56x56x96xf16>, tensor<1x1x96x24xf16>, tensor<24xf16>) -> tensor<1x56x56x24xf16>
-    %final = flow.dispatch.workgroups(%raw_f16, %bias_bcast) : (tensor<1x56x56x24xf16>, tensor<1x56x56x24xf32>) -> tensor<1x56x56x24xf32>
+        : (i32, i32, i32, i32, i32, i32,
+           tensor<1x?x?x?xf16>{%input_height, %input_width, %input_channels},
+           tensor<?x?x?xf16>{%input_channels, %weights_height, %weights_width},
+           tensor<?xf16>{%output_channels})
+        -> tensor<1x?x?x?xf16>{%output_height, %output_width, %output_channels}
+
+    // %init also arrives NCHW; transpose it to NHWC too so it lines up with
+    // %raw_f16 for the CPU-side accumulate below.
+    %init_nhwc_empty = tensor.empty(%output_height, %output_width, %output_channels) : tensor<1x?x?x?xf32>
+    %init_nhwc = linalg.transpose
+        ins(%init : tensor<1x?x?x?xf32>)
+        outs(%init_nhwc_empty : tensor<1x?x?x?xf32>)
+        permutation = [0, 2, 3, 1]
+
+    %final_nhwc = flow.dispatch.workgroups[
+        %output_height, %output_width, %output_channels](
+        %raw_f16, %init_nhwc, %output_height, %output_width, %output_channels)
+        : (tensor<1x?x?x?xf16>{%output_height, %output_width, %output_channels},
+           tensor<1x?x?x?xf32>{%output_height, %output_width, %output_channels},
+           index, index, index)
+        -> tensor<1x?x?x?xf32>{%output_height, %output_width, %output_channels}
         attributes { stream.affinity = #hal.device.affinity<@cpu_device> } =
-        (%arg3: !iree_tensor_ext.dispatch.tensor<readonly:tensor<1x56x56x24xf16>>, %arg4: !iree_tensor_ext.dispatch.tensor<readonly:tensor<1x56x56x24xf32>>, %arg5: !iree_tensor_ext.dispatch.tensor<writeonly:tensor<1x56x56x24xf32>>) {
-      %raw_f16_ld = iree_tensor_ext.dispatch.tensor.load %arg3, offsets = [0, 0, 0, 0], sizes = [1, 56, 56, 24], strides = [1, 1, 1, 1] : !iree_tensor_ext.dispatch.tensor<readonly:tensor<1x56x56x24xf16>> -> tensor<1x56x56x24xf16>
-      %bias_ld = iree_tensor_ext.dispatch.tensor.load %arg4, offsets = [0, 0, 0, 0], sizes = [1, 56, 56, 24], strides = [1, 1, 1, 1] : !iree_tensor_ext.dispatch.tensor<readonly:tensor<1x56x56x24xf32>> -> tensor<1x56x56x24xf32>
-      %final_empty = tensor.empty() : tensor<1x56x56x24xf32>
-      %final_inner = linalg.generic {indexing_maps = [affine_map<(d0, d1, d2, d3) -> (d0, d1, d2, d3)>, affine_map<(d0, d1, d2, d3) -> (d0, d1, d2, d3)>, affine_map<(d0, d1, d2, d3) -> (d0, d1, d2, d3)>], iterator_types = ["parallel", "parallel", "parallel", "parallel"]} ins(%raw_f16_ld, %bias_ld : tensor<1x56x56x24xf16>, tensor<1x56x56x24xf32>) outs(%final_empty : tensor<1x56x56x24xf32>) {
-      ^bb0(%a: f16, %b: f32, %out: f32):
-        %ae = arith.extf %a : f16 to f32
-        %s = arith.addf %ae, %b : f32
-        linalg.yield %s : f32
-      } -> tensor<1x56x56x24xf32>
-      iree_tensor_ext.dispatch.tensor.store %final_inner, %arg5, offsets = [0, 0, 0, 0], sizes = [1, 56, 56, 24], strides = [1, 1, 1, 1] : tensor<1x56x56x24xf32> -> !iree_tensor_ext.dispatch.tensor<writeonly:tensor<1x56x56x24xf32>>
+        (%raw_binding: !iree_tensor_ext.dispatch.tensor<readonly:tensor<1x?x?x?xf16>>,
+         %init_binding: !iree_tensor_ext.dispatch.tensor<readonly:tensor<1x?x?x?xf32>>,
+         %output_height_arg: index,
+         %output_width_arg: index,
+         %output_channels_arg: index,
+         %final_binding: !iree_tensor_ext.dispatch.tensor<writeonly:tensor<1x?x?x?xf32>>) {
+      %output_height_size = iree_tensor_ext.dispatch.workload.ordinal
+          %output_height_arg, 0 : index
+      %output_width_size = iree_tensor_ext.dispatch.workload.ordinal
+          %output_width_arg, 1 : index
+      %output_channels_size = iree_tensor_ext.dispatch.workload.ordinal
+          %output_channels_arg, 2 : index
+      %raw_shaped = flow.dispatch.tie_shape %raw_binding
+          : !iree_tensor_ext.dispatch.tensor<readonly:tensor<1x?x?x?xf16>>{
+              %output_height_size, %output_width_size, %output_channels_size}
+      %init_shaped = flow.dispatch.tie_shape %init_binding
+          : !iree_tensor_ext.dispatch.tensor<readonly:tensor<1x?x?x?xf32>>{
+              %output_height_size, %output_width_size, %output_channels_size}
+      %final_shaped = flow.dispatch.tie_shape %final_binding
+          : !iree_tensor_ext.dispatch.tensor<writeonly:tensor<1x?x?x?xf32>>{
+              %output_height_size, %output_width_size, %output_channels_size}
+      %raw_loaded = iree_tensor_ext.dispatch.tensor.load %raw_shaped,
+          offsets = [0, 0, 0, 0],
+          sizes = [1, %output_height_size, %output_width_size, %output_channels_size],
+          strides = [1, 1, 1, 1]
+          : !iree_tensor_ext.dispatch.tensor<readonly:tensor<1x?x?x?xf16>>{
+              %output_height_size, %output_width_size, %output_channels_size}
+          -> tensor<1x?x?x?xf16>
+      %init_loaded = iree_tensor_ext.dispatch.tensor.load %init_shaped,
+          offsets = [0, 0, 0, 0],
+          sizes = [1, %output_height_size, %output_width_size, %output_channels_size],
+          strides = [1, 1, 1, 1]
+          : !iree_tensor_ext.dispatch.tensor<readonly:tensor<1x?x?x?xf32>>{
+              %output_height_size, %output_width_size, %output_channels_size}
+          -> tensor<1x?x?x?xf32>
+      %final_empty = tensor.empty(
+          %output_height_size, %output_width_size, %output_channels_size)
+          : tensor<1x?x?x?xf32>
+      %final_inner = linalg.generic {
+          indexing_maps = [
+            affine_map<(d0, d1, d2, d3) -> (d0, d1, d2, d3)>,
+            affine_map<(d0, d1, d2, d3) -> (d0, d1, d2, d3)>,
+            affine_map<(d0, d1, d2, d3) -> (d0, d1, d2, d3)>
+          ],
+          iterator_types = ["parallel", "parallel", "parallel", "parallel"]
+        } ins(%raw_loaded, %init_loaded
+            : tensor<1x?x?x?xf16>, tensor<1x?x?x?xf32>)
+          outs(%final_empty : tensor<1x?x?x?xf32>) {
+        ^bb0(%raw: f16, %initial: f32, %out: f32):
+          %raw_f32 = arith.extf %raw : f16 to f32
+          %sum = arith.addf %raw_f32, %initial : f32
+          linalg.yield %sum : f32
+      } -> tensor<1x?x?x?xf32>
+      iree_tensor_ext.dispatch.tensor.store %final_inner, %final_shaped,
+          offsets = [0, 0, 0, 0],
+          sizes = [1, %output_height_size, %output_width_size, %output_channels_size],
+          strides = [1, 1, 1, 1]
+          : tensor<1x?x?x?xf32>
+          -> !iree_tensor_ext.dispatch.tensor<writeonly:tensor<1x?x?x?xf32>>{
+              %output_height_size, %output_width_size, %output_channels_size}
       flow.return
-    } count() -> (index, index, index) {
-      %x, %y, %z = iree_tensor_ext.dispatch.workgroup_count_from_slice()
+    } count(%output_height_workload: index,
+            %output_width_workload: index,
+            %output_channels_workload: index) -> (index, index, index) {
+      %x, %y, %z = iree_tensor_ext.dispatch.workgroup_count_from_slice(
+          %output_height_workload,
+          %output_width_workload,
+          %output_channels_workload)
       flow.return %x, %y, %z : index, index, index
     }
-    util.return %final : tensor<1x56x56x24xf32>
+
+    // NHWC [1,H,W,C] -> NCHW [1,C,H,W] back again: perm = [0, 3, 1, 2].
+    %final_nchw_empty = tensor.empty(%output_channels, %output_height, %output_width) : tensor<1x?x?x?xf32>
+    %final_nchw = linalg.transpose
+        ins(%final_nhwc : tensor<1x?x?x?xf32>)
+        outs(%final_nchw_empty : tensor<1x?x?x?xf32>)
+        permutation = [0, 3, 1, 2]
+
+    util.return %final_nchw : tensor<1x?x?x?xf32>
   }
 
-  // Shape 2: 1x56x56x24 -> 1x56x56x144 (filter 144x24x1x1).
-  util.func private @call_rocket_conv2d_2(%input: tensor<1x56x56x24xf16>, %filter: tensor<1x1x24x144xf16>, %bias_bcast: tensor<1x56x56x144xf32>) -> tensor<1x56x56x144xf32> {
-    %zero_bias_empty = tensor.empty() : tensor<144xf16>
-    %zero_f16 = arith.constant 0.0 : f16
-    %zero_bias = linalg.fill ins(%zero_f16 : f16) outs(%zero_bias_empty : tensor<144xf16>) -> tensor<144xf16>
-    %raw_f16 = flow.dispatch @rocket_executable_2::@rocket_conv2d_v1_2::@rocket_conv2d_2(%input, %filter, %zero_bias)
-        {stream.affinity = #hal.device.affinity<@rocket_device>}
-        : (tensor<1x56x56x24xf16>, tensor<1x1x24x144xf16>, tensor<144xf16>) -> tensor<1x56x56x144xf16>
-    %final = flow.dispatch.workgroups(%raw_f16, %bias_bcast) : (tensor<1x56x56x144xf16>, tensor<1x56x56x144xf32>) -> tensor<1x56x56x144xf32>
-        attributes { stream.affinity = #hal.device.affinity<@cpu_device> } =
-        (%arg3: !iree_tensor_ext.dispatch.tensor<readonly:tensor<1x56x56x144xf16>>, %arg4: !iree_tensor_ext.dispatch.tensor<readonly:tensor<1x56x56x144xf32>>, %arg5: !iree_tensor_ext.dispatch.tensor<writeonly:tensor<1x56x56x144xf32>>) {
-      %raw_f16_ld = iree_tensor_ext.dispatch.tensor.load %arg3, offsets = [0, 0, 0, 0], sizes = [1, 56, 56, 144], strides = [1, 1, 1, 1] : !iree_tensor_ext.dispatch.tensor<readonly:tensor<1x56x56x144xf16>> -> tensor<1x56x56x144xf16>
-      %bias_ld = iree_tensor_ext.dispatch.tensor.load %arg4, offsets = [0, 0, 0, 0], sizes = [1, 56, 56, 144], strides = [1, 1, 1, 1] : !iree_tensor_ext.dispatch.tensor<readonly:tensor<1x56x56x144xf32>> -> tensor<1x56x56x144xf32>
-      %final_empty = tensor.empty() : tensor<1x56x56x144xf32>
-      %final_inner = linalg.generic {indexing_maps = [affine_map<(d0, d1, d2, d3) -> (d0, d1, d2, d3)>, affine_map<(d0, d1, d2, d3) -> (d0, d1, d2, d3)>, affine_map<(d0, d1, d2, d3) -> (d0, d1, d2, d3)>], iterator_types = ["parallel", "parallel", "parallel", "parallel"]} ins(%raw_f16_ld, %bias_ld : tensor<1x56x56x144xf16>, tensor<1x56x56x144xf32>) outs(%final_empty : tensor<1x56x56x144xf32>) {
-      ^bb0(%a: f16, %b: f32, %out: f32):
-        %ae = arith.extf %a : f16 to f32
-        %s = arith.addf %ae, %b : f32
-        linalg.yield %s : f32
-      } -> tensor<1x56x56x144xf32>
-      iree_tensor_ext.dispatch.tensor.store %final_inner, %arg5, offsets = [0, 0, 0, 0], sizes = [1, 56, 56, 144], strides = [1, 1, 1, 1] : tensor<1x56x56x144xf32> -> !iree_tensor_ext.dispatch.tensor<writeonly:tensor<1x56x56x144xf32>>
-      flow.return
-    } count() -> (index, index, index) {
-      %x, %y, %z = iree_tensor_ext.dispatch.workgroup_count_from_slice()
-      flow.return %x, %y, %z : index, index, index
-    }
-    util.return %final : tensor<1x56x56x144xf32>
-  }
-
-  transform.named_sequence @match_conv2d_0(%root: !transform.any_op {transform.readonly}) -> !transform.any_op {
-    transform.match.operation_name %root ["linalg.conv_2d_nhwc_hwcf"] : !transform.any_op
-    %batch, %out_img, %out_ch, %filter, %in_ch, %depth, %strides, %dilations =
-        transform.iree.match.convolution %root,
-          lhs_type = f16, rhs_type = f16, output_type = f32
-          : !transform.any_op -> !transform.param<i64>
-    transform.iree.match.dims_equal %batch, [1] : !transform.param<i64>
-    transform.iree.match.dims_equal %out_img, [112, 112] : !transform.param<i64>
-    transform.iree.match.dims_equal %out_ch, [16] : !transform.param<i64>
-    transform.iree.match.dims_equal %filter, [1, 1] : !transform.param<i64>
-    transform.iree.match.dims_equal %in_ch, [32] : !transform.param<i64>
-    transform.iree.match.dims_equal %depth, [] : !transform.param<i64>
-    transform.iree.match.dims_equal %strides, [1, 1] : !transform.param<i64>
-    transform.iree.match.dims_equal %dilations, [1, 1] : !transform.param<i64>
-    transform.yield %root : !transform.any_op
-  }
-
-  transform.named_sequence @cast_and_call_conv2d_0(%root: !transform.any_op {transform.readonly}) {
-    %ins = transform.get_operand %root[all] : (!transform.any_op) -> !transform.any_value
-    %out = transform.get_result %root[all] : (!transform.any_op) -> !transform.any_value
-    %module = transform.util.get_nearest_symbol_table %root : (!transform.any_op) -> !transform.any_op
-    // Declare truthfully that rocket_device and cpu_device share unified,
-    // transparently-accessible memory (real RK3588 hardware fact -- see
-    // project memory's RocketAllocator/RocketBuffer notes) so
-    // ResolveTopologyQueriesPass can resolve the `#hal.device.optimal<[cpu,
-    // rocket]>`-affinitized cross-device buffer Stream forms for values
-    // flowing directly from our rocket dispatch into CPU-side compute. Must
-    // be set on the REAL target module (%module), not this transform-spec
-    // file's own module -- see file-level comment above. Idempotent: fires
-    // once per matched conv, each time just overwriting the same value.
-    %topology_attr = transform.param.constant #hal.device.topology<links = [
-        (@rocket_device -> @cpu_device = {transparent_access = true, unified_memory = true}),
-        (@cpu_device -> @rocket_device = {transparent_access = true, unified_memory = true})
-      ]> -> !transform.any_param
-    transform.annotate %module "stream.topology" = %topology_attr : !transform.any_op, !transform.any_param
-    %executable = transform.util.import_symbol @rocket_executable_0 into %module if undefined : (!transform.any_op) -> !transform.any_op
-    %func = transform.util.import_symbol @call_rocket_conv2d_0 into %module if undefined : (!transform.any_op) -> !transform.any_op
-    transform.util.cast_and_call %func(%ins) -> %out after %root {
-          transform.type_conversion.tensor.cast_shape_dynamic_dims
-      } : (!transform.any_op, !transform.any_value, !transform.any_value, !transform.any_op) -> !transform.any_op
-    transform.yield
-  }
-
-  transform.named_sequence @match_conv2d_1(%root: !transform.any_op {transform.readonly}) -> !transform.any_op {
-    transform.match.operation_name %root ["linalg.conv_2d_nhwc_hwcf"] : !transform.any_op
-    %batch, %out_img, %out_ch, %filter, %in_ch, %depth, %strides, %dilations =
-        transform.iree.match.convolution %root,
-          lhs_type = f16, rhs_type = f16, output_type = f32
-          : !transform.any_op -> !transform.param<i64>
-    transform.iree.match.dims_equal %batch, [1] : !transform.param<i64>
-    transform.iree.match.dims_equal %out_img, [56, 56] : !transform.param<i64>
-    transform.iree.match.dims_equal %out_ch, [24] : !transform.param<i64>
-    transform.iree.match.dims_equal %filter, [1, 1] : !transform.param<i64>
-    transform.iree.match.dims_equal %in_ch, [96] : !transform.param<i64>
-    transform.iree.match.dims_equal %depth, [] : !transform.param<i64>
-    transform.iree.match.dims_equal %strides, [1, 1] : !transform.param<i64>
-    transform.iree.match.dims_equal %dilations, [1, 1] : !transform.param<i64>
-    transform.yield %root : !transform.any_op
-  }
-
-  transform.named_sequence @cast_and_call_conv2d_1(%root: !transform.any_op {transform.readonly}) {
-    %ins = transform.get_operand %root[all] : (!transform.any_op) -> !transform.any_value
-    %out = transform.get_result %root[all] : (!transform.any_op) -> !transform.any_value
-    %module = transform.util.get_nearest_symbol_table %root : (!transform.any_op) -> !transform.any_op
-    %topology_attr = transform.param.constant #hal.device.topology<links = [
-        (@rocket_device -> @cpu_device = {transparent_access = true, unified_memory = true}),
-        (@cpu_device -> @rocket_device = {transparent_access = true, unified_memory = true})
-      ]> -> !transform.any_param
-    transform.annotate %module "stream.topology" = %topology_attr : !transform.any_op, !transform.any_param
-    %executable = transform.util.import_symbol @rocket_executable_1 into %module if undefined : (!transform.any_op) -> !transform.any_op
-    %func = transform.util.import_symbol @call_rocket_conv2d_1 into %module if undefined : (!transform.any_op) -> !transform.any_op
-    transform.util.cast_and_call %func(%ins) -> %out after %root {
-          transform.type_conversion.tensor.cast_shape_dynamic_dims
-      } : (!transform.any_op, !transform.any_value, !transform.any_value, !transform.any_op) -> !transform.any_op
-    transform.yield
-  }
-
-  transform.named_sequence @match_conv2d_2(%root: !transform.any_op {transform.readonly}) -> !transform.any_op {
-    transform.match.operation_name %root ["linalg.conv_2d_nhwc_hwcf"] : !transform.any_op
-    %batch, %out_img, %out_ch, %filter, %in_ch, %depth, %strides, %dilations =
-        transform.iree.match.convolution %root,
-          lhs_type = f16, rhs_type = f16, output_type = f32
-          : !transform.any_op -> !transform.param<i64>
-    transform.iree.match.dims_equal %batch, [1] : !transform.param<i64>
-    transform.iree.match.dims_equal %out_img, [56, 56] : !transform.param<i64>
-    transform.iree.match.dims_equal %out_ch, [144] : !transform.param<i64>
-    transform.iree.match.dims_equal %filter, [1, 1] : !transform.param<i64>
-    transform.iree.match.dims_equal %in_ch, [24] : !transform.param<i64>
-    transform.iree.match.dims_equal %depth, [] : !transform.param<i64>
-    transform.iree.match.dims_equal %strides, [1, 1] : !transform.param<i64>
-    transform.iree.match.dims_equal %dilations, [1, 1] : !transform.param<i64>
-    transform.yield %root : !transform.any_op
-  }
-
-  transform.named_sequence @cast_and_call_conv2d_2(%root: !transform.any_op {transform.readonly}) {
-    %ins = transform.get_operand %root[all] : (!transform.any_op) -> !transform.any_value
-    %out = transform.get_result %root[all] : (!transform.any_op) -> !transform.any_value
-    %module = transform.util.get_nearest_symbol_table %root : (!transform.any_op) -> !transform.any_op
-    %topology_attr = transform.param.constant #hal.device.topology<links = [
-        (@rocket_device -> @cpu_device = {transparent_access = true, unified_memory = true}),
-        (@cpu_device -> @rocket_device = {transparent_access = true, unified_memory = true})
-      ]> -> !transform.any_param
-    transform.annotate %module "stream.topology" = %topology_attr : !transform.any_op, !transform.any_param
-    %executable = transform.util.import_symbol @rocket_executable_2 into %module if undefined : (!transform.any_op) -> !transform.any_op
-    %func = transform.util.import_symbol @call_rocket_conv2d_2 into %module if undefined : (!transform.any_op) -> !transform.any_op
-    transform.util.cast_and_call %func(%ins) -> %out after %root {
-          transform.type_conversion.tensor.cast_shape_dynamic_dims
-      } : (!transform.any_op, !transform.any_value, !transform.any_value, !transform.any_op) -> !transform.any_op
-    transform.yield
-  }
-
-  // This fallback accepts regular 1x1 f16/f16->f32 NHWC/HWCF convolutions
-  // whose batch is statically one and whose stride/dilation are one. The
-  // adapter above drops all other static shape information and materializes
-  // it uniformly through runtime dimensions, so it also works when any of
-  // those dimensions are dynamic in the source type.
+  // 1x1 kernel, spatial dims dynamic. Both channel counts must be provably
+  // <= 512 (MAX_INPUT_CHANNELS/MAX_OUTPUT_CHANNELS in iree-rocket-hal's
+  // conv.rs -- the 14-bit weight_kernels field's range): a convolution whose
+  // channel count the compiler cannot bound must not be claimed here, since
+  // the hardware rejects an out-of-range dispatch with no CPU fallback. The
+  // input handle's dim 3 is Cin; the filter's dim 3 is Cout.
   transform.named_sequence @match_dynamic_conv2d(%root: !transform.any_op {transform.readonly}) -> !transform.any_op {
     transform.match.operation_name %root ["linalg.conv_2d_nhwc_hwcf"] : !transform.any_op
     %batch, %out_img, %out_ch, %filter, %in_ch, %depth, %strides, %dilations =
@@ -589,15 +574,52 @@ module attributes {transform.with_named_sequence} {
     transform.iree.match.dims_equal %strides, [1, 1] : !transform.param<i64>
     transform.iree.match.dims_equal %dilations, [1, 1] : !transform.param<i64>
 
-    // Both channel counts must provably fit the hardware. 512 is
-    // MAX_INPUT_CHANNELS/MAX_OUTPUT_CHANNELS in iree-rocket-hal's conv.rs --
-    // the range the capture corpus covers and the 14-bit weight_kernels
-    // field encodes. conv::Shape enforces the same bound at dispatch, but
-    // there it is a hard INVALID_ARGUMENT with no CPU fallback, so a
-    // convolution that cannot be shown to fit must not be claimed here in
-    // the first place. Channel counts the compiler cannot bound (genuinely
-    // dynamic, not merely non-literal) therefore stay on the CPU. The input
-    // handle's dim 3 is Cin; the filter's dim 3 is Cout.
+    // Cout is capped well below MAX_OUTPUT_CHANNELS (512); Cin is not. This
+    // is hardware-verified, not a guess: an isolated correctness probe
+    // (iree-rocket-hal/tests/conv_cbuf_split_sweep_hw.rs and
+    // conv_features19_isolated_hw.rs), run in isolation on real Planck
+    // hardware with a fill-1.0/exact-expected-value check (not just
+    // "did it time out"), found:
+    //
+    //   Cout  64/128/256 (Cin 3, 64, 128, 256; banks 11/1, 9/3, 7/5, 3/9,
+    //         1/11 all covered)          -> correct, 5/5 every rep
+    //   Cout  512 (Cin 256 -- features.19; Cin 512 -- features.21; both
+    //         30x30, banks 11/1)         -> all-zero output, 0/5 every
+    //                                        rep, deterministic
+    //
+    // IMPORTANT CAVEAT, found later by a real-compiler-path harness
+    // (rocket_conv_harness.py in iree-rocket-design-spike) plus a follow-up
+    // extent_sweep_at_fixed_channels sweep in
+    // conv_cbuf_split_sweep_hw.rs: Cout is not actually the discriminator.
+    // Cin=256/Cout=256/3x3 -- comfortably inside this bound -- is ALSO
+    // deterministically all-zero (0/5, every output element wrong) across
+    // every spatial extent from 26x26 to 48x48, because ConvPlan picks the
+    // same 11/1 split there that it picks for the broken Cout=512 shapes
+    // above; extents 20-24 (banks 7/5, 9/3) and 50-58 (banks 1/11) at the
+    // SAME channel counts pass 5/5, and the pass/fail boundary lines up
+    // exactly with ConvPlan's split-flip points, with zero fuzziness. The
+    // real discriminator is an 11/1-style split combined with a large
+    // coefficient footprint: features.0 (Cin=3/Cout=64, footprint
+    // 3*3*3*64 = 1728 elements) also gets an 11/1 split and is fine, while
+    // Cin=256/Cout=256 (footprint 3*3*256*256 = 589824 elements) at that
+    // same split is broken everywhere it occurs. This bound is still safe
+    // for VGG specifically -- none of its real Cout<=256 layers land on an
+    // 11/1 split at a large-footprint channel count -- but that is a
+    // property of VGG's specific shapes, not a guarantee this Cout<=256
+    // rule provides in general. A future model (or a wider matcher) could
+    // reintroduce this exact bug at Cout<=256 with the wrong spatial
+    // extent. See DESIGN_NOTES.md for the full characterization.
+    //
+    // This is the same class of bug DESIGN_NOTES.md documents for 9x9/11x11
+    // -- ConvPlan's demand-based CBUF formula picks a split based on raw
+    // byte demand, but the real vendor coefficient-streaming schedule for
+    // high-pressure shapes isn't decoded, so an unvalidated split doesn't
+    // fail loudly, it silently completes with all-zero output. A live
+    // rocket-npu-trace initially suggested this was a timing/idle-gap
+    // issue (every failure followed an anomalously long idle gap on that
+    // core) -- ruled out by this same isolated probe: the shape fails
+    // identically as a fresh first job, after a sustained warmup burst,
+    // and after a deliberate idle gap. It is the shape, not the timing.
     %input_value = transform.get_operand %root[0] : (!transform.any_op) -> !transform.any_value
     %filter_value = transform.get_operand %root[1] : (!transform.any_op) -> !transform.any_value
     transform.iree.match.dim_bounds %input_value[3], umin = 1, umax = 512 : !transform.any_value
@@ -605,22 +627,11 @@ module attributes {transform.with_named_sequence} {
     transform.yield %root : !transform.any_op
   }
 
-  // The same fallback for 3x3, which the hardware handles natively: ConvPlan
-  // routes kernel extents 1 and 3 through the identical demand-based CBUF
-  // partition, with none of the fp16/stride-1 restrictions the odd kernels
-  // above 3x3 carry (see conv.rs's assert_large_kernel_plan_case, which
-  // starts at 5). conv_kernel_shape_hw covers the extent on real hardware in
-  // both precisions.
-  //
-  // Spelled as its own matcher rather than widening the filter check to a
-  // 1..=3 bound: that bound would also silently claim 2x2 and the non-square
-  // combinations, which route through different ConvPlan partitions. The two
-  // claimed extents stay auditable this way.
-  //
-  // Padding needs no handling here. The Rocket executable applies none, and
-  // an ONNX conv with pads lowers to an explicit tensor.pad feeding a valid
-  // convolution, so the input this sees is already padded and the runtime's
-  // derived output extent is the right one.
+  // Same fallback for 3x3, which the hardware handles natively through the
+  // identical demand-based CBUF partition as 1x1. Spelled as its own
+  // matcher (rather than widening the filter check to 1..=3) so 2x2 and
+  // non-square combinations, which route through different ConvPlan
+  // partitions, are never silently claimed.
   transform.named_sequence @match_dynamic_conv2d_3x3(%root: !transform.any_op {transform.readonly}) -> !transform.any_op {
     transform.match.operation_name %root ["linalg.conv_2d_nhwc_hwcf"] : !transform.any_op
     %batch, %out_img, %out_ch, %filter, %in_ch, %depth, %strides, %dilations =
@@ -636,6 +647,52 @@ module attributes {transform.with_named_sequence} {
     transform.iree.match.dims_equal %strides, [1, 1] : !transform.param<i64>
     transform.iree.match.dims_equal %dilations, [1, 1] : !transform.param<i64>
 
+    // Cout is capped well below MAX_OUTPUT_CHANNELS (512); Cin is not. This
+    // is hardware-verified, not a guess: an isolated correctness probe
+    // (iree-rocket-hal/tests/conv_cbuf_split_sweep_hw.rs and
+    // conv_features19_isolated_hw.rs), run in isolation on real Planck
+    // hardware with a fill-1.0/exact-expected-value check (not just
+    // "did it time out"), found:
+    //
+    //   Cout  64/128/256 (Cin 3, 64, 128, 256; banks 11/1, 9/3, 7/5, 3/9,
+    //         1/11 all covered)          -> correct, 5/5 every rep
+    //   Cout  512 (Cin 256 -- features.19; Cin 512 -- features.21; both
+    //         30x30, banks 11/1)         -> all-zero output, 0/5 every
+    //                                        rep, deterministic
+    //
+    // IMPORTANT CAVEAT, found later by a real-compiler-path harness
+    // (rocket_conv_harness.py in iree-rocket-design-spike) plus a follow-up
+    // extent_sweep_at_fixed_channels sweep in
+    // conv_cbuf_split_sweep_hw.rs: Cout is not actually the discriminator.
+    // Cin=256/Cout=256/3x3 -- comfortably inside this bound -- is ALSO
+    // deterministically all-zero (0/5, every output element wrong) across
+    // every spatial extent from 26x26 to 48x48, because ConvPlan picks the
+    // same 11/1 split there that it picks for the broken Cout=512 shapes
+    // above; extents 20-24 (banks 7/5, 9/3) and 50-58 (banks 1/11) at the
+    // SAME channel counts pass 5/5, and the pass/fail boundary lines up
+    // exactly with ConvPlan's split-flip points, with zero fuzziness. The
+    // real discriminator is an 11/1-style split combined with a large
+    // coefficient footprint: features.0 (Cin=3/Cout=64, footprint
+    // 3*3*3*64 = 1728 elements) also gets an 11/1 split and is fine, while
+    // Cin=256/Cout=256 (footprint 3*3*256*256 = 589824 elements) at that
+    // same split is broken everywhere it occurs. This bound is still safe
+    // for VGG specifically -- none of its real Cout<=256 layers land on an
+    // 11/1 split at a large-footprint channel count -- but that is a
+    // property of VGG's specific shapes, not a guarantee this Cout<=256
+    // rule provides in general. A future model (or a wider matcher) could
+    // reintroduce this exact bug at Cout<=256 with the wrong spatial
+    // extent. See DESIGN_NOTES.md for the full characterization.
+    //
+    // This is the same class of bug DESIGN_NOTES.md documents for 9x9/11x11
+    // -- ConvPlan's demand-based CBUF formula picks a split based on raw
+    // byte demand, but the real vendor coefficient-streaming schedule for
+    // high-pressure shapes isn't decoded, so an unvalidated split doesn't
+    // fail loudly, it silently completes with all-zero output. A live
+    // rocket-npu-trace initially suggested this was a timing/idle-gap
+    // issue (every failure followed an anomalously long idle gap on that
+    // core) -- ruled out by this same isolated probe: the shape fails
+    // identically as a fresh first job, after a sustained warmup burst,
+    // and after a deliberate idle gap. It is the shape, not the timing.
     %input_value = transform.get_operand %root[0] : (!transform.any_op) -> !transform.any_value
     %filter_value = transform.get_operand %root[1] : (!transform.any_op) -> !transform.any_value
     transform.iree.match.dim_bounds %input_value[3], umin = 1, umax = 512 : !transform.any_value
@@ -643,10 +700,180 @@ module attributes {transform.with_named_sequence} {
     transform.yield %root : !transform.any_op
   }
 
+  // Depthwise counterpart of @match_dynamic_conv2d. linalg.depthwise_conv_2d_nhwc_hwc
+  // (not the _hwcm variant) is the only depthwise op family Rocket claims:
+  // ConvPlan::with_depthwise hard-asserts a channel multiplier of one, so a
+  // real channel-multiplier dimension (_hwcm) has never been captured or
+  // validated and must stay on CPU. transform.iree.match.convolution's
+  // dimension inference (LinalgInterfaces.cpp inferConvolutionDimsImpl)
+  // puts the shared input/output channel dim in depth_dims for this op
+  // family, not output_channel_dims/input_channel_dims (both empty here,
+  // unlike the dense matcher above) -- confirmed against
+  // mlir/unittests/Dialect/Linalg/InferConvolutionDimsTest.cpp, which
+  // exercises exactly this op and asserts depth is non-empty. Cout is
+  // therefore never an independent quantity to bound: it is always Cin,
+  // read off %init the same way call_rocket_dynamic_depthwise_conv2d's
+  // %output_channels already is.
+  //
+  // Runtime support (packing, register fields, CBUF allocation) is
+  // hardware-validated -- see DESIGN_NOTES.md "Depthwise: Mesa's channel
+  // rule is wrong" and conv_phase1_validation_hw.rs (8/8 passing, including
+  // the int8 Cin=12 tap-major layout check) -- but that validation never
+  // exceeded one 32-channel coefficient group
+  // (WEIGHT_INPUT_GROUP_CHANNELS), so this matcher originally shipped
+  // capped at 128, not the dense matcher's 512, to avoid the exact mistake
+  // DESIGN_NOTES.md documents for dense conv (a coarse capture ladder
+  // hiding a formula bug between measured points). A boundary probe
+  // (rocket_conv_harness.py, single fixed-shape depthwise dispatches)
+  // through the real compiled dispatch path -- not the isolated hardware
+  // captures above -- found exactly that: `pack_depthwise_to_rocket_weights`
+  // used a single global tap-major stride instead of grouping channels by
+  // 32, invisible below one group. Fixed in `tensor_layout.rs`
+  // (`pack_depthwise_to_rocket_weights`'s doc comment has the full
+  // derivation) and confirmed clean at every ladder point from 128 through
+  // 512, both kernel sizes, so the cap now matches the dense matcher's.
+  transform.named_sequence @match_dynamic_depthwise_conv2d(%root: !transform.any_op {transform.readonly}) -> !transform.any_op {
+    transform.match.operation_name %root ["linalg.depthwise_conv_2d_nhwc_hwc"] : !transform.any_op
+    %batch, %out_img, %out_ch, %filter, %in_ch, %depth, %strides, %dilations =
+        transform.iree.match.convolution %root,
+          lhs_type = f16, rhs_type = f16, output_type = f32
+          : !transform.any_op -> !transform.param<i64>
+    transform.iree.match.dims_equal %batch, [1] : !transform.param<i64>
+    transform.iree.match.dims_equal %out_img, [-1, -1] : !transform.param<i64>
+    transform.iree.match.dims_equal %out_ch, [] : !transform.param<i64>
+    transform.iree.match.dims_equal %filter, [1, 1] : !transform.param<i64>
+    transform.iree.match.dims_equal %in_ch, [] : !transform.param<i64>
+    transform.iree.match.dims_equal %depth, [-1] : !transform.param<i64>
+    transform.iree.match.dims_equal %strides, [1, 1] : !transform.param<i64>
+    transform.iree.match.dims_equal %dilations, [1, 1] : !transform.param<i64>
+
+    // Only one channel count to bound: depthwise Cout is always Cin.
+    %input_value = transform.get_operand %root[0] : (!transform.any_op) -> !transform.any_value
+    transform.iree.match.dim_bounds %input_value[3], umin = 1, umax = 512 : !transform.any_value
+    transform.yield %root : !transform.any_op
+  }
+
+  // Same fallback for 3x3, mirroring @match_dynamic_conv2d_3x3's rationale:
+  // ConvPlan routes depthwise through the identical demand-based CBUF
+  // partition for kernel extents 1 and 3 (conv.rs), and MobileNet-style
+  // depthwise-separable models overwhelmingly use 3x3 for the depthwise
+  // stage, so this is the practically load-bearing case.
+  transform.named_sequence @match_dynamic_depthwise_conv2d_3x3(%root: !transform.any_op {transform.readonly}) -> !transform.any_op {
+    transform.match.operation_name %root ["linalg.depthwise_conv_2d_nhwc_hwc"] : !transform.any_op
+    %batch, %out_img, %out_ch, %filter, %in_ch, %depth, %strides, %dilations =
+        transform.iree.match.convolution %root,
+          lhs_type = f16, rhs_type = f16, output_type = f32
+          : !transform.any_op -> !transform.param<i64>
+    transform.iree.match.dims_equal %batch, [1] : !transform.param<i64>
+    transform.iree.match.dims_equal %out_img, [-1, -1] : !transform.param<i64>
+    transform.iree.match.dims_equal %out_ch, [] : !transform.param<i64>
+    transform.iree.match.dims_equal %filter, [3, 3] : !transform.param<i64>
+    transform.iree.match.dims_equal %in_ch, [] : !transform.param<i64>
+    transform.iree.match.dims_equal %depth, [-1] : !transform.param<i64>
+    transform.iree.match.dims_equal %strides, [1, 1] : !transform.param<i64>
+    transform.iree.match.dims_equal %dilations, [1, 1] : !transform.param<i64>
+
+    %input_value = transform.get_operand %root[0] : (!transform.any_op) -> !transform.any_value
+    transform.iree.match.dim_bounds %input_value[3], umin = 1, umax = 512 : !transform.any_value
+    transform.yield %root : !transform.any_op
+  }
+
+  transform.named_sequence @cast_and_call_dynamic_depthwise_conv2d(%root: !transform.any_op {transform.readonly}) {
+    %ins = transform.get_operand %root[all] : (!transform.any_op) -> !transform.any_value
+    %out = transform.get_result %root[all] : (!transform.any_op) -> !transform.any_value
+    %module = transform.util.get_nearest_symbol_table %root : (!transform.any_op) -> !transform.any_op
+    %topology_attr = transform.param.constant #hal.device.topology<links = [
+        (@rocket_device -> @cpu_device = {transparent_access = true, unified_memory = true}),
+        (@cpu_device -> @rocket_device = {transparent_access = true, unified_memory = true})
+      ]> -> !transform.any_param
+    transform.annotate %module "stream.topology" = %topology_attr : !transform.any_op, !transform.any_param
+    %executable = transform.util.import_symbol @rocket_dynamic_depthwise_executable into %module if undefined : (!transform.any_op) -> !transform.any_op
+    %func = transform.util.import_symbol @call_rocket_dynamic_depthwise_conv2d into %module if undefined : (!transform.any_op) -> !transform.any_op
+    transform.util.cast_and_call %func(%ins) -> %out after %root {
+          transform.type_conversion.tensor.cast_shape_dynamic_dims
+      } : (!transform.any_op, !transform.any_value, !transform.any_value, !transform.any_op) -> !transform.any_op
+    transform.yield
+  }
+
+  // NCHW counterpart of @match_dynamic_depthwise_conv2d -- see
+  // call_rocket_dynamic_depthwise_conv2d_nchw's doc comment for why real
+  // ONNX-imported models need this instead of (not in addition to reaching)
+  // the NHWC matcher above. Same dims_equal shape as the NHWC matcher --
+  // depthwise's dimension inference doesn't depend on operand layout, only
+  // on which axes are batch/channel/spatial -- except the channel dim to
+  // bound is input dim 1 here (NCHW), not dim 3 (NHWC).
+  transform.named_sequence @match_dynamic_depthwise_conv2d_nchw(%root: !transform.any_op {transform.readonly}) -> !transform.any_op {
+    transform.match.operation_name %root ["linalg.depthwise_conv_2d_nchw_chw"] : !transform.any_op
+    %batch, %out_img, %out_ch, %filter, %in_ch, %depth, %strides, %dilations =
+        transform.iree.match.convolution %root,
+          lhs_type = f16, rhs_type = f16, output_type = f32
+          : !transform.any_op -> !transform.param<i64>
+    transform.iree.match.dims_equal %batch, [1] : !transform.param<i64>
+    transform.iree.match.dims_equal %out_img, [-1, -1] : !transform.param<i64>
+    transform.iree.match.dims_equal %out_ch, [] : !transform.param<i64>
+    transform.iree.match.dims_equal %filter, [1, 1] : !transform.param<i64>
+    transform.iree.match.dims_equal %in_ch, [] : !transform.param<i64>
+    transform.iree.match.dims_equal %depth, [-1] : !transform.param<i64>
+    transform.iree.match.dims_equal %strides, [1, 1] : !transform.param<i64>
+    transform.iree.match.dims_equal %dilations, [1, 1] : !transform.param<i64>
+
+    %input_value = transform.get_operand %root[0] : (!transform.any_op) -> !transform.any_value
+    transform.iree.match.dim_bounds %input_value[1], umin = 1, umax = 512 : !transform.any_value
+    transform.yield %root : !transform.any_op
+  }
+
+  // Same fallback for 3x3, mirroring @match_dynamic_depthwise_conv2d_3x3's
+  // rationale -- this is the practically load-bearing case, since a real
+  // ONNX-imported depthwise-separable model's spatial stage is
+  // overwhelmingly 3x3, arriving in exactly this NCHW form.
+  transform.named_sequence @match_dynamic_depthwise_conv2d_nchw_3x3(%root: !transform.any_op {transform.readonly}) -> !transform.any_op {
+    transform.match.operation_name %root ["linalg.depthwise_conv_2d_nchw_chw"] : !transform.any_op
+    %batch, %out_img, %out_ch, %filter, %in_ch, %depth, %strides, %dilations =
+        transform.iree.match.convolution %root,
+          lhs_type = f16, rhs_type = f16, output_type = f32
+          : !transform.any_op -> !transform.param<i64>
+    transform.iree.match.dims_equal %batch, [1] : !transform.param<i64>
+    transform.iree.match.dims_equal %out_img, [-1, -1] : !transform.param<i64>
+    transform.iree.match.dims_equal %out_ch, [] : !transform.param<i64>
+    transform.iree.match.dims_equal %filter, [3, 3] : !transform.param<i64>
+    transform.iree.match.dims_equal %in_ch, [] : !transform.param<i64>
+    transform.iree.match.dims_equal %depth, [-1] : !transform.param<i64>
+    transform.iree.match.dims_equal %strides, [1, 1] : !transform.param<i64>
+    transform.iree.match.dims_equal %dilations, [1, 1] : !transform.param<i64>
+
+    %input_value = transform.get_operand %root[0] : (!transform.any_op) -> !transform.any_value
+    transform.iree.match.dim_bounds %input_value[1], umin = 1, umax = 512 : !transform.any_value
+    transform.yield %root : !transform.any_op
+  }
+
+  transform.named_sequence @cast_and_call_dynamic_depthwise_conv2d_nchw(%root: !transform.any_op {transform.readonly}) {
+    %ins = transform.get_operand %root[all] : (!transform.any_op) -> !transform.any_value
+    %out = transform.get_result %root[all] : (!transform.any_op) -> !transform.any_value
+    %module = transform.util.get_nearest_symbol_table %root : (!transform.any_op) -> !transform.any_op
+    %topology_attr = transform.param.constant #hal.device.topology<links = [
+        (@rocket_device -> @cpu_device = {transparent_access = true, unified_memory = true}),
+        (@cpu_device -> @rocket_device = {transparent_access = true, unified_memory = true})
+      ]> -> !transform.any_param
+    transform.annotate %module "stream.topology" = %topology_attr : !transform.any_op, !transform.any_param
+    %executable = transform.util.import_symbol @rocket_dynamic_depthwise_executable into %module if undefined : (!transform.any_op) -> !transform.any_op
+    %func = transform.util.import_symbol @call_rocket_dynamic_depthwise_conv2d_nchw into %module if undefined : (!transform.any_op) -> !transform.any_op
+    transform.util.cast_and_call %func(%ins) -> %out after %root {
+          transform.type_conversion.tensor.cast_shape_dynamic_dims
+      } : (!transform.any_op, !transform.any_value, !transform.any_value, !transform.any_op) -> !transform.any_op
+    transform.yield
+  }
+
   transform.named_sequence @cast_and_call_dynamic_conv2d(%root: !transform.any_op {transform.readonly}) {
     %ins = transform.get_operand %root[all] : (!transform.any_op) -> !transform.any_value
     %out = transform.get_result %root[all] : (!transform.any_op) -> !transform.any_value
     %module = transform.util.get_nearest_symbol_table %root : (!transform.any_op) -> !transform.any_op
+    // Declare truthfully that rocket_device and cpu_device share unified,
+    // transparently-accessible memory (real RK3588 hardware fact) so
+    // ResolveTopologyQueriesPass can resolve the cross-device buffer Stream
+    // forms for values flowing directly from the rocket dispatch into
+    // CPU-side compute. Must be set on the REAL target module (%module),
+    // not this transform-spec file's own module. Idempotent: fires once per
+    // matched conv, each time just overwriting the same value.
     %topology_attr = transform.param.constant #hal.device.topology<links = [
         (@rocket_device -> @cpu_device = {transparent_access = true, unified_memory = true}),
         (@cpu_device -> @rocket_device = {transparent_access = true, unified_memory = true})
@@ -663,25 +890,37 @@ module attributes {transform.with_named_sequence} {
   transform.named_sequence @__transform_main(%module: !transform.any_op) {
     %funcs = transform.structured.match ops{["util.func"]} in %module : (!transform.any_op) -> !transform.any_op
     // ONNX commonly imports Conv as NCHW/FCHW, while Rocket's logical
-    // convolution ABI and the matchers above use NHWC/HWCF. Run IREE's
-    // semantics-preserving layout conversion before attempting any Rocket
-    // specialization. It inserts the required input/filter/init/output
-    // transposes for regular convolutions. Later canonicalization can fold
-    // adjacent transposes across the graph. Depthwise NCHW conversion remains
-    // separate work; the current Rocket transform has no depthwise matcher.
+    // convolution ABI and the matchers above use NHWC/HWCF. Normalize
+    // before attempting any Rocket specialization: the first pass does the
+    // conversion but leaves the op generalized to linalg.generic, so the
+    // second re-specializes it back to the named op the matchers look for.
     %channels_last_funcs = transform.apply_registered_pass
         "iree-preprocessing-convert-conv-to-channels-last" to %funcs
-        : (!transform.any_op) -> !transform.any_op
-    %canonical_funcs = transform.apply_registered_pass "canonicalize"
-        to %channels_last_funcs : (!transform.any_op) -> !transform.any_op
-    transform.foreach %canonical_funcs : !transform.any_op {
+      : (!transform.any_op) -> !transform.any_op
+    %canonical_funcs = transform.apply_registered_pass
+        "linalg-specialize-generic-ops" to %channels_last_funcs
+      : (!transform.any_op) -> !transform.any_op
+    // Rocket's ABI is f16-in/f32-accumulate (see call_rocket_dynamic_conv2d
+    // above), but models commonly arrive as plain f32 (e.g. ONNX/torch
+    // import, no fp16 casting anywhere). Demote just the conv operands --
+    // not matmuls, which stay on CPU untouched -- to f16, leaving the
+    // accumulator at f32, so @match_dynamic_conv2d's f16/f16/f32 typing
+    // requirement matches these too. A conv already authored in f16 is
+    // left alone: the pass only rewrites all-f32 operand sets.
+    %demoted_funcs = transform.apply_registered_pass
+        "iree-global-opt-demote-contraction-inputs"
+        with options = { "type" = "f16", "operation" = "conv" } to %canonical_funcs
+      : (!transform.any_op) -> !transform.any_op
+
+    transform.foreach %demoted_funcs : !transform.any_op {
       ^bb1(%func: !transform.any_op):
         transform.foreach_match in %func
-            @match_conv2d_0 -> @cast_and_call_conv2d_0,
-            @match_conv2d_1 -> @cast_and_call_conv2d_1,
-            @match_conv2d_2 -> @cast_and_call_conv2d_2,
             @match_dynamic_conv2d -> @cast_and_call_dynamic_conv2d,
-            @match_dynamic_conv2d_3x3 -> @cast_and_call_dynamic_conv2d
+            @match_dynamic_conv2d_3x3 -> @cast_and_call_dynamic_conv2d,
+            @match_dynamic_depthwise_conv2d -> @cast_and_call_dynamic_depthwise_conv2d,
+            @match_dynamic_depthwise_conv2d_3x3 -> @cast_and_call_dynamic_depthwise_conv2d,
+            @match_dynamic_depthwise_conv2d_nchw -> @cast_and_call_dynamic_depthwise_conv2d_nchw,
+            @match_dynamic_depthwise_conv2d_nchw_3x3 -> @cast_and_call_dynamic_depthwise_conv2d_nchw
           : (!transform.any_op) -> (!transform.any_op)
     }
     transform.apply_dce to %module : !transform.any_op

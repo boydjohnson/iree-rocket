@@ -229,13 +229,66 @@ const CBUF_BANKS: u32 = 12;
 /// Bytes one CBUF bank holds: 256 entries of 128 bytes.
 const CBUF_BANK_BYTES: u32 = 256 * 128;
 
-/// Largest value `CNA_CBUF_CON1.data_entries` can encode. The field is 14
-/// bits and holds `tile_input_rows * width`, so it is a hard bound on how
-/// much of a feature map one program may cover -- 63 input rows at 256 wide,
-/// 127 at 128 wide. This is the hardware reason the vendor splits tall
-/// convolutions for capacity: its own `256x256` capture uses 44-row tiles,
-/// comfortably under the 63-row ceiling.
-const MAX_DATA_ENTRIES: u32 = 0x3fff;
+/// Minimum safe `weight_banks` once a coefficient footprint is being
+/// starved (granted fewer banks than its own uncapped demand -- see
+/// `demand_based_cbuf_partition`), as a function of `weight_channels`
+/// (padded `Cin`). Five hardware points, all via
+/// `iree-rocket-hal/tests/conv_cbuf_split_sweep_hw.rs::weight_bank_floor_probe*`,
+/// each the exact boundary (one value below fails 0/5, the value at or
+/// above passes 5/5):
+///
+///   Cin  256  320  384  448  512
+///   min    3    4    5    5    5
+///
+/// A first guess (`floor = Cin/128 + 1`) fit the 256/512 endpoints exactly
+/// and predicted 4 at 384; the real answer there is 5. The corrected
+/// picture, checked against all five points: **linear at +1 per 64 `Cin`
+/// from 256, plateauing at 5 from 384 on**. Nothing below Cin=256 has been
+/// probed with an explicit low override -- every validated shape down there
+/// (`features.0`'s Cin=3 included) has a real weight demand small enough
+/// that the starved branch never fires for it in the first place, so `3` is
+/// used unconditionally below 256 on the strength of the trend (floor rises
+/// with `Cin`, never falls) rather than a direct measurement. See
+/// DESIGN_NOTES.md "The floor is a slope, then a plateau" in
+/// iree-rocket-design-spike.
+fn weight_banks_floor(weight_channels: u32) -> u32 {
+    if weight_channels <= 256 {
+        3
+    } else {
+        (3 + (weight_channels - 256) / 64).min(5)
+    }
+}
+
+/// Vendor-preferred coefficient grant for one streamed output group.
+///
+/// The expanded 28x28/K3 channel grid isolates this from spatial demand:
+/// once the total coefficient tensor is too large to reside, both fp16 and
+/// int8 reserve one 64-byte coefficient group per `(kernel tap, Cin)`.
+/// Dividing that working set by a 32-KiB CBUF bank predicts every observed
+/// high-channel split without depending on `Cout`:
+///
+/// `Cin=192,256,320,384,448,512 -> weight banks=4,5,6,7,8,9`.
+///
+/// This is a preferred allocation, not a new hardware-safety minimum; the
+/// independently measured [`weight_banks_floor`] remains in force below it.
+fn streamed_weight_bank_preference(weight_channels: u32, kernels: Kernels) -> u32 {
+    const STREAMED_BYTES_PER_INPUT_TAP: u32 = 64;
+    (kernels[0] as u32 * kernels[1] as u32 * weight_channels * STREAMED_BYTES_PER_INPUT_TAP)
+        .div_ceil(CBUF_BANK_BYTES)
+        .max(1)
+}
+
+/// Largest `CNA_CBUF_CON1.data_entries` value the expanded corpus shows the
+/// hardware field can encode.
+///
+/// The generated register header exposes only bits 13:0, but both precisions
+/// use bit 14: 128x128/Cin1 fp16 programs 16,384, and 64x400 reaches 25,600
+/// in both fp16 and int8. Bit 15 remains unobserved.
+const MAX_DATA_ENTRIES: u32 = 0x7fff;
+
+/// Largest logical value encodable by the 10-bit
+/// `CNA_CONV_CON2.feature_grains` field.
+const MAX_FEATURE_GRAINS: u32 = 0x03ff;
 
 /// Feature pixels one CBUF bank holds: 256 entries of 128 bytes, at one
 /// 16-byte feature atom per pixel, is 2048 -- but the vendor allocates in
@@ -287,8 +340,9 @@ impl Precision {
         2 * self.channels_per_atom()
     }
 
-    /// Bytes one pixel of a dense ARGB feature map occupies: four channels
-    /// wide whatever the real channel count, so 8 at fp16 and 4 at int8.
+    /// Bytes in the widest, four-channel dense ARGB storage class: 8 at fp16
+    /// and 4 at int8. CBUF planning uses the shape-specific 1/2/4/4-channel
+    /// charge in [`Shape::dense_cbuf_pixel_bytes`] instead.
     pub fn dense_pixel_bytes(&self) -> u32 {
         4 * self.element_bytes()
     }
@@ -892,6 +946,20 @@ impl Shape {
             * self.precision.element_bytes()
     }
 
+    /// Padded channel count [`crate::rocket::tensor_layout::pack_depthwise_to_rocket_weights`]'s
+    /// tap-major stride uses -- a whole CBUF atom *group*, not just a whole
+    /// atom (see [`Shape::weight_channels`]'s doc comment for why that
+    /// differs from [`Shape::padded_channels`] at fp16's 3-mod-4 atom
+    /// counts). [`Shape::weight_bytes`]'s depthwise branch reads the same
+    /// value via [`Shape::cbuf_atoms`]; this just exposes it for callers
+    /// packing the weight buffer instead of only sizing it.
+    ///
+    /// Only meaningful when [`Shape::depthwise`] is set -- callers packing a
+    /// dense filter want [`Shape::weight_channels`] instead.
+    pub fn depthwise_padded_channels(&self) -> u32 {
+        self.cbuf_atoms() * self.precision.channels_per_atom()
+    }
+
     /// Atoms per pixel implied by the weight padding.
     fn weight_atoms(&self) -> u32 {
         self.weight_channels() / self.precision.channels_per_atom()
@@ -974,6 +1042,92 @@ impl Shape {
         self.width * self.height * FEATURE_ATOM_BYTES
     }
 
+    /// Width charged to dense CBUF storage.
+    ///
+    /// Vendor dense tensors keep the logical width in `CNA_DMA_CON1`, but
+    /// round the resident row to one precision-sized feature atom: width 226
+    /// is charged as 232 in fp16 and 240 in int8. `CNA_CBUF_CON1` and the
+    /// captured continuation-tile offsets both expose this padding.
+    fn cbuf_input_width(&self, input_width: u32) -> u32 {
+        match self.layout() {
+            FeatureLayout::Dense => {
+                input_width.next_multiple_of(self.precision.channels_per_atom())
+            }
+            FeatureLayout::Surfaces => input_width,
+        }
+    }
+
+    /// Bytes charged per dense CBUF pixel.
+    ///
+    /// The ARGB modes are 1-, 2- and 4-channel storage classes: Cin 1 and 2
+    /// retain their true widths, while Cin 3 rounds to the same class as Cin
+    /// 4. This is visible in the expanded corpus at tall Cin-1 shapes, where
+    /// charging four channels over-allocates data banks and invents tiles the
+    /// vendor does not need.
+    fn dense_cbuf_pixel_bytes(&self) -> u32 {
+        self.in_channels.next_power_of_two().min(4) * self.precision.element_bytes()
+    }
+
+    fn max_data_entries(&self) -> u32 {
+        MAX_DATA_ENTRIES
+    }
+
+    /// Whether a dense-layout tile whose feature fetch starts at input row
+    /// `in_first` is safe for general, non-uniform tensor data.
+    ///
+    /// Measured on real RK3588 hardware, not derived from documentation
+    /// (`iree-rocket-design-spike`'s `conv_dense_shared_buffer_dispatch_hw.rs`,
+    /// `conv_dense_odd_in_first_probe_hw.rs`,
+    /// `conv_dense_alignment_width_sweep_hw.rs`, and
+    /// `conv_dense_alignment_channel_sweep_hw.rs`/
+    /// `conv_dense_alignment_in_first_growth_hw.rs` -- see DESIGN_NOTES.md
+    /// there, "The dense (Cin<=4) ARGB path silently corrupts multi-row
+    /// dispatches" and its follow-ups, for the full characterization).
+    ///
+    /// `CNA_FEATURE_DATA_ADDR` is `in_first * input_row_stride`, and dense
+    /// mode's `input_row_stride` is not always a multiple of 16. Earlier
+    /// hardware probes filled every x position and input channel alike and
+    /// concluded that `nonalign_dma` safely compensates for offsets up to
+    /// one dense pixel wide. That conclusion was an artifact of the data:
+    /// a sub-pixel/channel displacement is invisible when all displaced
+    /// values are equal.
+    ///
+    /// `conv_features0_exact_hw.rs` uses x-, y-, and channel-varying data
+    /// at VGG-19 `features.0`'s exact lowered shape. Every tile at offset 0
+    /// passed exactly, while all three tiles at offset 4 were about 94%
+    /// wrong across their complete output ranges, deterministically in all
+    /// three repetitions. A subsequent data-rich hardware sweep tested every
+    /// even byte offset: all 14 offset-0 cases passed, while every case at
+    /// offsets 2, 4, 6, 8, 10, 12, and 14 failed. The affine-int8 Cartesian
+    /// oracle subsequently exposed the same defect at offset 2 for VGG-19's
+    /// lowered 226x226/Cin=3 shape: tile 0 passed exactly and corruption began
+    /// at tile 1's first output row. Dense tiles therefore require a fully
+    /// 16-byte-aligned feature base at both precisions.
+    ///
+    /// Always `true` outside dense layout: surfaces (`Cin > 4`) use a
+    /// different addressing path this defect has not been shown to reach.
+    /// RKNN's dense int8 tensors use a padded physical row pitch, making its
+    /// captured boundaries aligned. The host ABI is compact NHWC, so it must
+    /// instead move boundaries according to the compact stride here until
+    /// [`Shape`] can represent an explicit physical input pitch.
+    pub fn dense_feature_offset_safe(&self, in_first: u32) -> bool {
+        if self.layout() != FeatureLayout::Dense {
+            return true;
+        }
+        let offset = (in_first * self.input_row_stride()) % FEATURE_ATOM_BYTES;
+        offset == 0
+    }
+
+    /// The input row a tile's feature fetch starts at, for an output range
+    /// beginning at `out_first` -- the half of [`Tile::from_bounds`]'s
+    /// formula that determines [`Shape::dense_feature_offset_safe`], broken
+    /// out so a boundary search can probe it without building a whole
+    /// [`Tile`].
+    fn tile_in_first(&self, kernels: Kernels, out_first: u32) -> u32 {
+        let padding = self.kernel_programming(kernels).pad_top;
+        (out_first * self.stride).saturating_sub(padding)
+    }
+
     /// Byte stride of one output row.
     ///
     /// The output is always NC1HWC2 with one 16-byte atom per pixel per
@@ -992,15 +1146,13 @@ impl Shape {
     /// that exist is meaningful, because it is what makes the weights the
     /// smaller claim in [`data_banks`].
     fn data_bank_demand(&self) -> u32 {
-        let pixels = self.width * self.height;
         match self.layout() {
-            // The dense demand is expressed in bytes so it carries across
-            // precision: an int8 ARGB pixel is 4 bytes where an fp16 one is
-            // 8, and the int8 captures allocate exactly half the banks for
-            // the same geometry. At fp16 this is the original
-            // `pixels / 1024`.
+            // Dense CBUF rows round the spatial width to one feature atom.
+            // Their pixel charge follows the ARGB storage class: 1, 2, 4,
+            // or 4 channels.
             FeatureLayout::Dense => {
-                (pixels * self.precision.dense_pixel_bytes()).div_ceil(8 * PIXELS_PER_BANK_STEP)
+                (self.cbuf_input_width(self.width) * self.height * self.dense_cbuf_pixel_bytes())
+                    .div_ceil(8 * PIXELS_PER_BANK_STEP)
             }
             // Surfaces charge per atom, at twice the pixels per step. Fits
             // every measured point: at 32x32 fp16 this is `ceil(atoms / 2)`,
@@ -1008,7 +1160,7 @@ impl Shape {
             // Already precision-neutral, because an int8 atom holds twice
             // the channels and so a pixel needs half as many.
             FeatureLayout::Surfaces => {
-                (pixels * self.weight_atoms()).div_ceil(2 * PIXELS_PER_BANK_STEP)
+                (self.width * self.height * self.weight_atoms()).div_ceil(2 * PIXELS_PER_BANK_STEP)
             }
         }
         .max(1)
@@ -1033,7 +1185,68 @@ impl Shape {
             data.min(CBUF_BANKS.saturating_sub(weights))
         };
         let data_banks = granted.clamp(1, CBUF_BANKS - 1);
-        (data_banks, CBUF_BANKS - data_banks)
+        let weight_banks = CBUF_BANKS - data_banks;
+        let streamed_preference =
+            streamed_weight_bank_preference(self.weight_channels(), kernels).min(CBUF_BANKS - 1);
+        let floor = weight_banks_floor(self.weight_channels()).max(streamed_preference);
+
+        // Total coefficient size can otherwise consume eleven banks and
+        // leave only one for feature data, even though CNA streams weights
+        // in the bounded working set above. Once data has actually been
+        // starved to that single-bank minimum, cap coefficients at the
+        // streamed grant and return the unused banks to data.
+        //
+        // The grant is `floor`, not `streamed_preference`, even though the
+        // trigger above compares against `streamed_preference`: hardware
+        // confirmed (`bank_partition_flip_boundary_probe_runs_every_case_before_failing`)
+        // that granting exactly `streamed_preference` here reads back zero
+        // past whatever channel count fit in that many banks -- e.g. Cin 3/4/5
+        // K3 fp16 has `streamed_preference = 1` but needs the same `floor = 3`
+        // every other capture in this Cin range is validated against.
+        // `streamed_preference` staying the trigger is deliberate: below it,
+        // the earlier `granted = data` computation already grants at least
+        // `floor` banks on its own, so there is nothing to correct.
+        if data_banks == 1 && weight_banks > streamed_preference && weights > streamed_preference {
+            let weight_banks = floor.min(CBUF_BANKS - 1);
+            return (CBUF_BANKS - weight_banks, weight_banks);
+        }
+
+        // A coefficient footprint that would take weight_banks_floor's banks
+        // or fewer on its own (`weights <= weight_banks`) is not being
+        // starved by this grant -- it fits, same as any other capture, and
+        // is left alone. One that has been clamped down below the floor
+        // despite wanting more (`weights > weight_banks`) is the case
+        // weight_banks_floor's doc comment covers: raise it to the floor
+        // and let feature data give up the difference, trading tile count
+        // for correctness. `weights` is already known unbounded here, so
+        // the floor itself, not `weights`, is always what gets granted.
+        if weight_banks < floor && weights > weight_banks {
+            let weight_banks = floor.min(CBUF_BANKS - 1);
+            return (CBUF_BANKS - weight_banks, weight_banks);
+        }
+
+        // The 32x32/Cin128/Cout64/3x3 capture is the one measured case where
+        // honoring coefficient demand would force a spatial split, while
+        // starving it by one bank keeps the whole image resident. The vendor
+        // chooses 8/4 instead of the demand-only 7/5. Express that as the
+        // observable policy: preserve a single spatial tile when granting the
+        // whole-map data demand can do so without crossing the validated
+        // coefficient-bank floor.
+        let whole_data_banks = data.min(CBUF_BANKS - 1);
+        let whole_weight_banks = CBUF_BANKS - whole_data_banks;
+        let whole_rows = Tile::whole(*self, kernels).in_rows;
+        let baseline_fits = whole_rows <= self.max_tile_input_rows_for_data_banks(data_banks);
+        let whole_data_fits =
+            whole_rows <= self.max_tile_input_rows_for_data_banks(whole_data_banks);
+        if whole_data_banks > data_banks
+            && whole_weight_banks >= floor
+            && !baseline_fits
+            && whole_data_fits
+        {
+            (whole_data_banks, whole_weight_banks)
+        } else {
+            (data_banks, weight_banks)
+        }
     }
 
     /// CBUF banks the vendor assigns to feature data.
@@ -1092,24 +1305,37 @@ impl Shape {
             "tile input width must be between 1 and the tensor width {}",
             self.width
         );
+        let charged_width = self.cbuf_input_width(input_width);
         let capacity = match self.layout() {
             FeatureLayout::Dense => {
-                data_banks * (CBUF_BANK_BYTES / 4)
-                    / (input_width * self.precision.dense_pixel_bytes())
+                data_banks * (CBUF_BANK_BYTES / 4) / (charged_width * self.dense_cbuf_pixel_bytes())
             }
             FeatureLayout::Surfaces => {
                 data_banks * CBUF_BANK_BYTES
                     / (input_width * self.weight_atoms() * FEATURE_ATOM_BYTES)
             }
         };
-        capacity.min(MAX_DATA_ENTRIES / input_width).max(1)
+        capacity.min(self.max_data_entries() / charged_width).max(1)
+    }
+
+    /// Conservative input-row limit imposed by `feature_grains`.
+    ///
+    /// The first tile carries the full top padding and therefore has the
+    /// largest value: `in_rows + kernel_height + pad_top`. Continuation
+    /// tiles can fit at least as many rows, so using the first-tile bound for
+    /// every tile keeps the planner simple and guarantees encodability.
+    fn max_feature_grain_input_rows(&self, kernels: Kernels) -> u32 {
+        let kernel = self.kernel_programming(kernels);
+        MAX_FEATURE_GRAINS
+            .saturating_sub(kernel.height + kernel.pad_top)
+            .max(1)
     }
 
     /// Most input rows one program may read.
     ///
-    /// Two bounds apply and the CBUF one is the tighter. The hard limit is
-    /// the 14-bit `CNA_CBUF_CON1.data_entries` field, which holds
-    /// `rows * width`; the vendor never approaches it.
+    /// Two bounds apply and the CBUF one is usually tighter. The hard limit
+    /// is the observed 15-bit `CNA_CBUF_CON1.data_entries` field. Dense rows
+    /// charge `rows * atom_aligned_width`; surface rows use their atom count.
     ///
     /// The CBUF bound is the inverse of [`data_bank_demand`]: a bank holds
     /// 1024 dense pixels or 2048 pixel-atoms, so the rows that fit are
@@ -1134,6 +1360,7 @@ impl Shape {
     /// regime it is a correctness requirement.
     pub fn max_tile_input_rows(&self, kernels: Kernels) -> u32 {
         self.max_tile_input_rows_for_data_banks(self.data_banks(kernels))
+            .min(self.max_feature_grain_input_rows(kernels))
     }
 
     /// Fewest tiles this shape must be split into to stay encodable.
@@ -1165,6 +1392,7 @@ impl Shape {
         let halo = self.kernel_programming(kernels).height - 1;
         let rows = self
             .max_tile_input_rows_for_width_and_data_banks(input_width, data_banks)
+            .min(self.max_feature_grain_input_rows(kernels))
             .saturating_sub(halo)
             .max(1);
         // A tile of `r` output rows reads about `r * stride` input rows.
@@ -1273,9 +1501,6 @@ impl Tile {
             (1..=output_height).contains(&tiles),
             "tile count must be between 1 and the {output_height} output rows"
         );
-        let kernel = shape.kernel_programming(kernels);
-        let padding = kernel.pad_top;
-        let stride = shape.stride;
         let base = output_height / tiles;
         let remainder = output_height % tiles;
 
@@ -1283,35 +1508,95 @@ impl Tile {
         let mut out_first: u32 = 0;
         for index in 0..tiles {
             let out_rows = base + u32::from(index < remainder);
-
-            // Halo: the first input row a tile touches is its first output
-            // row projected back through the stride, less the padding it
-            // would otherwise read above the image. Matches all 150
-            // stride-2, -3 and -4 programs in the corpus.
-            let in_first = (out_first * stride).saturating_sub(padding);
-            let last_tap = (out_first + out_rows - 1) * stride + kernel.height - 1;
-            let in_last = last_tap.saturating_sub(padding).min(shape.height - 1);
-            let exact = in_last - in_first + 1;
-
-            // The vendor reads at least a full stride block per output row,
-            // which exceeds the exact tap span at stride > 1. Taking the
-            // larger of the two is safe by construction: it is never below
-            // `exact`, so every tap the tile needs is resident. Where the
-            // corpus disagrees it reads more still, which costs DMA rather
-            // than correctness.
-            let in_rows = exact.max(out_rows * stride).min(shape.height - in_first);
-
-            let projected_first = out_first * stride;
-            out.push(Tile {
-                out_first,
-                out_rows,
-                in_first,
-                in_rows,
-                pad_top: padding.saturating_sub(projected_first),
-            });
+            out.push(Tile::from_bounds(shape, kernels, out_first, out_rows));
             out_first += out_rows;
         }
         out
+    }
+
+    /// Greedily fills each row tile to `max_input_rows`, leaving any short
+    /// remainder in the last tile.
+    ///
+    /// This is the vendor's standalone-plan policy. For example, a 226-row
+    /// fp16 shape with room for 48 input rows becomes output rows
+    /// `47+46+46+46+41`, while an int8 capacity of 93 produces
+    /// `92+91+43`. [`Tile::split`] remains the balanced primitive used when
+    /// an explicit number of parallel-core partitions is requested.
+    fn split_greedy_to_capacity(
+        shape: Shape,
+        kernels: Kernels,
+        max_input_rows: u32,
+    ) -> Option<Vec<Tile>> {
+        let output_height = shape.output_height(kernels);
+        let whole = Tile::from_bounds(shape, kernels, 0, output_height);
+        if whole.in_rows <= max_input_rows {
+            return Some(vec![whole]);
+        }
+
+        let kernel = shape.kernel_programming(kernels);
+        let mut tiles = Vec::new();
+        let mut out_first = 0;
+        while out_first < output_height {
+            let remaining = output_height - out_first;
+            let tile = (1..=remaining).rev().find_map(|out_rows| {
+                let tile = Tile::from_bounds(shape, kernels, out_first, out_rows);
+
+                // Once a map needs more than one task, RKNN fixes each
+                // task's output grain from the full, unclipped kernel span.
+                // In particular it does not use bottom-edge clipping to
+                // merge the final grain into its predecessor: at K3/P1 a
+                // 15-row capacity is 14+13+1, not 14+14, and a 3-row
+                // capacity is 2+1+...+1, not 2+1+...+2. Top padding still
+                // reduces the first grain's fetched span.
+                let in_first = shape.tile_in_first(kernels, out_first);
+                let last_tap = (out_first + out_rows - 1) * shape.stride + kernel.height - 1;
+                let unclipped_in_last = last_tap.saturating_sub(kernel.pad_top);
+                let capacity_rows = (unclipped_in_last - in_first + 1).max(out_rows * shape.stride);
+                (capacity_rows <= max_input_rows).then_some(tile)
+            })?;
+            out_first += tile.out_rows;
+            tiles.push(tile);
+        }
+        Some(tiles)
+    }
+
+    /// Builds one tile from an explicit output-row range, applying the same
+    /// halo/padding formula every tile in a [`Tile::split`] plan uses.
+    ///
+    /// Broken out of `split` so [`realign_dense_row_tiles`] can rebuild an
+    /// individual tile after moving its boundary, without duplicating this
+    /// arithmetic -- the two must stay in exact agreement, since a
+    /// realigned tile has to be bit-identical to what `split` itself would
+    /// have produced had it picked that boundary in the first place.
+    fn from_bounds(shape: Shape, kernels: Kernels, out_first: u32, out_rows: u32) -> Tile {
+        let kernel = shape.kernel_programming(kernels);
+        let padding = kernel.pad_top;
+        let stride = shape.stride;
+
+        // Halo: the first input row a tile touches is its first output row
+        // projected back through the stride, less the padding it would
+        // otherwise read above the image. Matches all 150 stride-2, -3 and
+        // -4 programs in the corpus.
+        let in_first = shape.tile_in_first(kernels, out_first);
+        let last_tap = (out_first + out_rows - 1) * stride + kernel.height - 1;
+        let in_last = last_tap.saturating_sub(padding).min(shape.height - 1);
+        let exact = in_last - in_first + 1;
+
+        // The vendor reads at least a full stride block per output row,
+        // which exceeds the exact tap span at stride > 1. Taking the larger
+        // of the two is safe by construction: it is never below `exact`, so
+        // every tap the tile needs is resident. Where the corpus disagrees
+        // it reads more still, which costs DMA rather than correctness.
+        let in_rows = exact.max(out_rows * stride).min(shape.height - in_first);
+
+        let projected_first = out_first * stride;
+        Tile {
+            out_first,
+            out_rows,
+            in_first,
+            in_rows,
+            pad_top: padding.saturating_sub(projected_first),
+        }
     }
 
     /// The single tile covering the whole image.
@@ -1524,7 +1809,14 @@ impl ConvPlan {
             }
             7 => {
                 assert_large_kernel_plan_case(shape);
-                (8, 4)
+                // The focused sweep follows coefficient demand through seven
+                // banks (1/11, 2/10, 8/4, 7/5 and 5/7 are all observed), then
+                // switches to the streamed 8/4 schedule at demand ten.
+                if shape.weight_bank_demand(kernels) <= 7 {
+                    shape.demand_based_cbuf_partition(kernels)
+                } else {
+                    (8, 4)
+                }
             }
             9 => {
                 assert_large_kernel_plan_case(shape);
@@ -1600,7 +1892,7 @@ impl ConvPlan {
         if let Some(output_column_widths) = captured_column_partition(shape, kernels) {
             let tiles = Tile2D::grid(shape, kernels, &output_column_widths, data_banks);
             assert!(
-                grid_fits(shape, &tiles, data_banks),
+                grid_fits(shape, kernels, &tiles, data_banks),
                 "captured column partition exceeds its measured CBUF capacity"
             );
             return ConvPlan {
@@ -1872,23 +2164,120 @@ fn plan_grid(
     let columns = ColumnTile::split(shape, kernels, output_widths);
     let mut tiles = Vec::new();
     for columns in columns {
-        let max_rows =
-            shape.max_tile_input_rows_for_width_and_data_banks(columns.in_cols, data_banks);
-        let row_tiles = (1..=shape.output_height(kernels)).find_map(|count| {
-            let rows = Tile::split(shape, kernels, count);
-            rows.iter()
-                .all(|tile| tile.in_rows <= max_rows)
-                .then_some(rows)
-        })?;
+        let max_rows = shape
+            .max_tile_input_rows_for_width_and_data_banks(columns.in_cols, data_banks)
+            .min(shape.max_feature_grain_input_rows(kernels));
+        let greedy = Tile::split_greedy_to_capacity(shape, kernels, max_rows)?;
+        let row_tiles =
+            realign_dense_row_tiles(shape, kernels, &greedy, max_rows).or_else(|| {
+                // Compact fp16 dense rows can force a boundary away from the
+                // vendor's physically padded position. Preserve the existing
+                // safe fallback there if the greedy boundary cannot be moved
+                // without overflowing either neighbour.
+                (1..=shape.output_height(kernels)).find_map(|count| {
+                    let rows = Tile::split(shape, kernels, count);
+                    if !rows.iter().all(|tile| tile.in_rows <= max_rows) {
+                        return None;
+                    }
+                    realign_dense_row_tiles(shape, kernels, &rows, max_rows)
+                })
+            })?;
         tiles.extend(row_tiles.into_iter().map(|rows| Tile2D { rows, columns }));
     }
     Some(tiles)
 }
 
-fn grid_fits(shape: Shape, tiles: &[Tile2D], data_banks: u32) -> bool {
+/// For dense-layout convolutions, nudges `tiles`' interior row boundaries so
+/// every tile's `in_first` is safe against `nonalign_dma`'s leading-pixel
+/// defect ([`Shape::dense_feature_offset_safe`]), re-deriving each affected
+/// tile from its shifted boundary via [`Tile::from_bounds`]. A no-op --
+/// `Some(tiles.to_vec())` -- outside dense layout and for a single-tile
+/// plan (whose only boundary, row 0, is always safe: `in_first` there is
+/// always 0 regardless of padding or stride, and offset 0 trivially passes
+/// [`Shape::dense_feature_offset_safe`]).
+///
+/// Boundaries are searched outward from their original position, closest
+/// first, bounded by how much room the two neighbouring tiles have to give
+/// up (each must keep at least one output row). `max_rows` re-gates
+/// capacity after a shift, since moving a boundary changes both
+/// neighbours' `in_rows`, not just the moved one's.
+///
+/// `None` if some interior boundary has no safe, capacity-respecting
+/// position within that room -- the caller's existing
+/// retry-with-more-tiles loop (`plan_grid`) is what handles that, exactly
+/// as it already does for a plain capacity miss; more tiles means less
+/// room per boundary here, not more, so this is not expected to resolve on
+/// a later retry in general, and a shape that never finds a fit will
+/// surface as [`ConvPlan::new`]'s existing "needs horizontal tiling" panic
+/// for dense layout -- refusing outright rather than emitting a plan with
+/// a known-unsafe tile, matching this file's existing policy for the
+/// `weight_banks < 3` and `Cin <= 4` bugs above it.
+///
+/// RKNN's int8 corpus pads dense rows to a precision-sized spatial atom
+/// (226 -> 240), but the host ABI is compact NHWC. The data-rich int8 oracle
+/// confirmed that a compact row at a nonzero offset corrupts exactly like
+/// fp16, so int8 is intentionally realigned here as well. This can differ
+/// from a vendor boundary that is safe only under RKNN's padded row pitch.
+fn realign_dense_row_tiles(
+    shape: Shape,
+    kernels: Kernels,
+    tiles: &[Tile],
+    max_rows: u32,
+) -> Option<Vec<Tile>> {
+    if shape.layout() != FeatureLayout::Dense || tiles.len() <= 1 {
+        return Some(tiles.to_vec());
+    }
+
+    let output_height = shape.output_height(kernels);
+    let mut boundaries: Vec<u32> = tiles.iter().map(|tile| tile.out_first).collect();
+    boundaries.push(output_height);
+
+    for i in 1..boundaries.len() - 1 {
+        let lower = boundaries[i - 1] + 1;
+        let upper = boundaries[i + 1] - 1;
+        if lower > upper {
+            return None;
+        }
+        let current = boundaries[i];
+        if shape.dense_feature_offset_safe(shape.tile_in_first(kernels, current)) {
+            continue;
+        }
+
+        let max_distance = (current - lower).max(upper - current);
+        let mut best = None;
+        for distance in 1..=max_distance {
+            let candidates = [current.checked_sub(distance), current.checked_add(distance)];
+            for candidate in candidates.into_iter().flatten() {
+                if candidate < lower || candidate > upper {
+                    continue;
+                }
+                if shape.dense_feature_offset_safe(shape.tile_in_first(kernels, candidate)) {
+                    best = Some(candidate);
+                    break;
+                }
+            }
+            if best.is_some() {
+                break;
+            }
+        }
+        boundaries[i] = best?;
+    }
+
+    let realigned: Vec<Tile> = boundaries
+        .windows(2)
+        .map(|window| Tile::from_bounds(shape, kernels, window[0], window[1] - window[0]))
+        .collect();
+    realigned
+        .iter()
+        .all(|tile| tile.in_rows <= max_rows)
+        .then_some(realigned)
+}
+
+fn grid_fits(shape: Shape, kernels: Kernels, tiles: &[Tile2D], data_banks: u32) -> bool {
     tiles.iter().all(|tile| {
         tile.rows.in_rows
             <= shape.max_tile_input_rows_for_width_and_data_banks(tile.columns.in_cols, data_banks)
+            && feature_grains(kernels, &tile.rows) <= MAX_FEATURE_GRAINS
     })
 }
 
@@ -1958,6 +2347,10 @@ pub const BS_MULTIPLIER_SHIFT: u32 = 7;
 pub struct BsEntry {
     /// `round(bias / (input_scale * weight_scale[c]))`.
     pub bias: i32,
+    /// Addend applied to each raw coefficient for this output channel.
+    /// Quantized affine weights use `-weight_zero_point[c]` so the hardware
+    /// dot product sees `raw_weight - weight_zero_point[c]`.
+    pub constant: i16,
     /// `round(BS_UNIT_MULTIPLIER * weight_scale[c] / max(weight_scale))`.
     pub multiplier: i16,
 }
@@ -1969,6 +2362,7 @@ impl Default for BsEntry {
     fn default() -> BsEntry {
         BsEntry {
             bias: 0,
+            constant: BS_CONSTANT,
             multiplier: BS_UNIT_MULTIPLIER,
         }
     }
@@ -2010,7 +2404,7 @@ pub fn write_bs_buffer(buffer: &mut [u8], entries: &[BsEntry]) {
         let bias = base + lane * 4;
         buffer[bias..bias + 4].copy_from_slice(&entry.bias.to_le_bytes());
         let constant = base + 32 + lane * 2;
-        buffer[constant..constant + 2].copy_from_slice(&BS_CONSTANT.to_le_bytes());
+        buffer[constant..constant + 2].copy_from_slice(&entry.constant.to_le_bytes());
         let multiplier = base + 48 + lane * 2;
         buffer[multiplier..multiplier + 2].copy_from_slice(&entry.multiplier.to_le_bytes());
     }
@@ -2162,12 +2556,12 @@ pub fn conv_2d_tile_with_grains(
 
 /// Builds a large-kernel program with an explicit CBUF partition.
 ///
-/// The focused kernel sweep shows that 7x7, 9x9, and 11x11 do not follow the
-/// automatic allocator derived from the 1x1/3x3 corpus. This entry point
-/// keeps that unresolved policy out of [`conv_2d_tile`]. Prefer [`ConvPlan`]
-/// when its capture-backed policy covers the operation; this entry point is
-/// the low-level override. The two bank counts must be nonzero and sum to the
-/// RK3588's twelve CBUF banks.
+/// The focused kernel sweep shows that 7x7 switches away from demand once
+/// coefficient demand exceeds seven banks, while 9x9 and 11x11 use their own
+/// streaming schedules. This entry point keeps unresolved policy out of
+/// [`conv_2d_tile`]. Prefer [`ConvPlan`] when its capture-backed policy covers
+/// the operation; this entry point is the low-level override. The two bank
+/// counts must be nonzero and sum to the RK3588's twelve CBUF banks.
 pub fn conv_2d_tile_with_cbuf_banks(
     shape: Shape,
     kernels: Kernels,
@@ -2294,6 +2688,11 @@ fn conv_2d_tile_program(
     let horizontally_tiled = columns.out_first != 0 || out_width != full_out_width;
 
     assert!(
+        feature_grains <= MAX_FEATURE_GRAINS,
+        "tile requires {feature_grains} feature grains; CNA_CONV_CON2.feature_grains encodes at most {MAX_FEATURE_GRAINS}"
+    );
+
+    assert!(
         rows.out_rows > 0 && rows.out_first + rows.out_rows <= out_height,
         "tile output rows {}..{} fall outside the {out_height}-row output",
         rows.out_first,
@@ -2305,12 +2704,15 @@ fn conv_2d_tile_program(
         columns.out_first,
         columns.out_first + columns.out_cols
     );
+    let charged_input_width = shape.cbuf_input_width(input_width);
     assert!(
-        rows.in_rows * input_width <= MAX_DATA_ENTRIES,
-        "tile reads {}x{} pixels; CNA_CBUF_CON1.data_entries is 14 bits and \
-         holds at most {MAX_DATA_ENTRIES}",
-        input_width,
+        rows.in_rows * charged_input_width <= shape.max_data_entries(),
+        "tile reads {}x{} charged pixels; CNA_CBUF_CON1.data_entries holds at most {} \
+         at {:?}",
+        charged_input_width,
         rows.in_rows,
+        shape.max_data_entries(),
+        shape.precision,
     );
     assert!(
         rows.in_rows > 0 && rows.in_first + rows.in_rows <= height,
@@ -2336,7 +2738,7 @@ fn conv_2d_tile_program(
         (FeatureLayout::Dense, _) => (
             full_width,
             full_width * (height - 1),
-            input_width * rows.in_rows,
+            charged_input_width * rows.in_rows,
         ),
         (FeatureLayout::Surfaces, false) => (
             full_width * 4,
@@ -3123,13 +3525,121 @@ mod tests {
     }
 
     #[test]
+    fn conv_plan_reconciles_the_expanded_vendor_fixture_routes() {
+        // Granting the whole-map data demand avoids an otherwise unnecessary
+        // split and still leaves four coefficient banks, above the measured
+        // floor of three.
+        let single = Shape::with_out_channels(32, 32, 1, 128, 64);
+        let plan = ConvPlan::new(single, [3, 3]);
+        assert_eq!((plan.data_banks(), plan.weight_banks()), (8, 4));
+        assert_eq!(plan.tiles().len(), 1);
+
+        // Bit 14 is not int8-specific: expanded fp16 Cin-1 captures use it
+        // too, and keep these shapes in one task.
+        let fp16_wide_entries = Shape::with_out_channels(128, 128, 1, 1, 1);
+        let plan = ConvPlan::new(fp16_wide_entries, [1, 1]);
+        assert_eq!(plan.tiles().len(), 1);
+        assert_eq!(value_of::<CnaCbufCon1>(&plan.programs()[0]), 16_384);
+
+        // Standalone vendor plans fill each tile to capacity rather than
+        // balancing the output height over the minimum tile count.
+        let tall = Shape::with_out_channels(64, 128, 1, 128, 8);
+        let plan = ConvPlan::new(tall, [3, 3]);
+        assert_eq!((plan.data_banks(), plan.weight_banks()), (11, 1));
+        assert_eq!(
+            plan.tiles()
+                .iter()
+                .map(|tile| tile.rows.out_rows)
+                .collect::<Vec<_>>(),
+            vec![21, 20, 20, 20, 20, 20, 7]
+        );
+
+        // Int8 dense CBUF rows charge width 226 as 240, but the host tensor
+        // itself has a compact 226*3-byte row pitch. RKNN's padded-pitch
+        // 92+91+43 route starts compact tiles at unsafe offsets, so retain
+        // three tiles while moving both interior feature bases to 16-byte
+        // boundaries.
+        let int8 = Shape::with_precision(226, 226, 1, 3, 64, Precision::Int8(quantization()));
+        let plan = ConvPlan::new(int8, [3, 3]);
+        assert_eq!((plan.data_banks(), plan.weight_banks()), (11, 1));
+        assert_eq!(
+            plan.tiles()
+                .iter()
+                .map(|tile| (tile.rows.out_rows, tile.rows.in_rows))
+                .collect::<Vec<_>>(),
+            vec![(73, 74), (80, 82), (73, 74)]
+        );
+        assert_eq!(
+            plan.programs()
+                .iter()
+                .map(|program| value_of::<CnaCbufCon1>(program))
+                .collect::<Vec<_>>(),
+            vec![17_760, 19_680, 17_760]
+        );
+
+        // CBUF/data_entries permits 1023 rows here, but feature_grains adds
+        // one for a 1x1 kernel. Keep each task at 1022 rows so the 10-bit
+        // field never receives the unencodable value 1024.
+        let feature_grain_limited = Shape::with_out_channels(32, 1200, 1, 1, 1);
+        let plan = ConvPlan::new(feature_grain_limited, [1, 1]);
+        assert_eq!((plan.data_banks(), plan.weight_banks()), (10, 2));
+        assert_eq!(
+            plan.tiles()
+                .iter()
+                .map(|tile| tile.rows.in_rows)
+                .collect::<Vec<_>>(),
+            vec![1022, 178]
+        );
+        assert!(
+            plan.tiles()
+                .iter()
+                .all(|tile| feature_grains([1, 1], &tile.rows) <= MAX_FEATURE_GRAINS)
+        );
+        assert_eq!(plan.programs().len(), 2);
+
+        // At the exact surface-capacity boundary, standalone RKNN plans do
+        // not let bottom-edge clipping enlarge the final grain. Both
+        // precisions have 24 input atoms here and therefore take the same
+        // 5/7 split and 14+13+1 route.
+        for shape in [
+            Shape::with_out_channels(28, 28, 1, 192, 64).with_padding([1, 1]),
+            Shape::with_precision(28, 28, 1, 384, 64, captured_int8()).with_padding([1, 1]),
+        ] {
+            let plan = ConvPlan::new(shape, [3, 3]);
+            assert_eq!((plan.data_banks(), plan.weight_banks()), (5, 7));
+            assert_eq!(
+                plan.tiles()
+                    .iter()
+                    .map(|tile| tile.rows.out_rows)
+                    .collect::<Vec<_>>(),
+                vec![14, 13, 1]
+            );
+        }
+
+        // The same policy remains visible at a one-row continuation grain:
+        // first produce two rows, then 26 single rows through the bottom.
+        let tiny_grain = Shape::with_out_channels(28, 28, 1, 512, 64).with_padding([1, 1]);
+        let plan = ConvPlan::new(tiny_grain, [3, 3]);
+        assert_eq!((plan.data_banks(), plan.weight_banks()), (3, 9));
+        let mut expected = vec![2];
+        expected.extend(vec![1; 26]);
+        assert_eq!(
+            plan.tiles()
+                .iter()
+                .map(|tile| tile.rows.out_rows)
+                .collect::<Vec<_>>(),
+            expected
+        );
+    }
+
+    #[test]
     fn conv_plan_selects_the_focused_large_kernel_policies() {
         let shape = Shape::with_out_channels(256, 32, 1, 32, 64);
         for (kernel, banks, tiles) in [
             (5usize, (8u32, 4u32), 3usize),
-            (7, (8, 4), 4),
-            (9, (6, 6), 8),
-            (11, (7, 5), 8),
+            (7, (5, 7), 8),
+            (9, (6, 6), 7),
+            (11, (7, 5), 7),
         ] {
             let plan = ConvPlan::new(shape, [kernel, kernel]);
             assert_eq!(
@@ -4205,9 +4715,237 @@ mod tests {
     }
 
     #[test]
+    fn weight_banks_floor_matches_all_five_hardware_points() {
+        // Cin=Cout=N, 3x3, 30x30, swept explicitly via ConvPlan::with_cbuf_banks
+        // in iree-rocket-hal/tests/conv_cbuf_split_sweep_hw.rs's
+        // weight_bank_floor_probe* family -- each is the exact hardware
+        // boundary (floor-1 fails 0/5, floor passes 5/5). Not a flat
+        // constant: it rises +1 per 64 Cin from 256, then plateaus at 5
+        // from 384 on -- a first guess of `Cin/128 + 1` fit 256 and 512
+        // but predicted 4, not 5, at 384.
+        for (cin, floor) in [(256u32, 3u32), (320, 4), (384, 5), (448, 5), (512, 5)] {
+            assert_eq!(
+                weight_banks_floor(cin),
+                floor,
+                "Cin={cin} weight_banks floor"
+            );
+        }
+
+        // The real VGG-19 shapes this was chasing: features.19 (Cin=256,
+        // Cout=512) and features.21 (Cin=512, Cout=512), both hardware-proven
+        // all-zero at the pre-fix automatic 11/1, and both hardware-confirmed
+        // fixed post-fix -- features.19 at floor=3
+        // (fixed_formula_resolves_features_19_and_21, 5/5) and features.21 at
+        // floor=5, *not* 3 (weight_bank_floor_probe_at_cin_512 found
+        // weight_banks=3 and 4 both still 0/5 at Cin=512; only 5 and up
+        // pass). Cout does not move the floor -- only Cin does, matching the
+        // asymmetry `DESIGN_NOTES.md`'s vendor-formula cross product found.
+        assert_eq!(weight_banks_floor(256), 3);
+        assert_eq!(weight_banks_floor(512), 5);
+
+        // This measured floor is a safety lower bound, not the vendor's
+        // preferred allocation. The expanded corpus independently shows a
+        // larger streamed working-set grant at K3; keep the two rules
+        // explicit so a policy change cannot masquerade as a new hardware
+        // minimum.
+        assert_eq!(streamed_weight_bank_preference(256, [3, 3]), 5);
+        assert_eq!(streamed_weight_bank_preference(512, [3, 3]), 9);
+
+        // features.0's shape: weight_banks=1 here is not a starved
+        // footprint, it is the footprint's *entire* real demand (1,728
+        // bytes fits in a fraction of one bank) -- hardware-confirmed
+        // correct at 11/1 by the original five-shape sweep, and the floor
+        // must leave it alone rather than take banks a fully-resident
+        // footprint never needed. Below Cin=256 the floor itself is
+        // unvalidated (see weight_banks_floor's doc comment); this only
+        // confirms the starved branch doesn't fire here at all.
+        let features_0 = Shape::with_out_channels(226, 226, 1, 3, 64).with_padding([0, 0]);
+        assert_eq!(features_0.data_banks([3, 3]), 11);
+        assert_eq!(features_0.weight_banks([3, 3]), 1);
+
+        // Same for the 256x32/Cin32 pair above: weight demand of 1 and 2
+        // banks respectively are each already fully satisfied by what they
+        // are granted, not clamped down from something larger.
+        let narrow = Shape::with_out_channels(256, 32, 1, 32, 16);
+        assert_eq!(narrow.weight_banks([3, 3]), 1);
+        let wide = Shape::with_out_channels(256, 32, 1, 32, 64);
+        assert_eq!(wide.weight_banks([3, 3]), 2);
+    }
+
+    #[test]
     #[should_panic(expected = "output channels must be")]
     fn rejects_output_channels_beyond_the_validated_range() {
         let _ = Shape::with_out_channels(32, 32, 1, 3, 513);
+    }
+
+    #[test]
+    fn dense_feature_offset_safe_requires_full_alignment() {
+        // The older width/channel sweeps used uniform values and therefore
+        // could only observe whole-pixel leading-column loss. The exact
+        // features.0 regression uses non-uniform data and shows offset 4 is
+        // already unsafe at Cin=3. Conservatively require offset 0 at every
+        // fp16 dense width until a data-rich sweep proves otherwise.
+        let cin1 = Shape::with_out_channels(225, 60, 1, 1, 8).with_padding([0, 0]); // stride mod16=2
+        for in_first in 0..8 {
+            assert_eq!(
+                cin1.dense_feature_offset_safe(in_first),
+                in_first == 0,
+                "Cin=1 in_first={in_first}"
+            );
+        }
+        let cin2 = Shape::with_out_channels(225, 60, 1, 2, 8).with_padding([0, 0]); // stride mod16=4
+        for in_first in 0..8 {
+            assert_eq!(
+                cin2.dense_feature_offset_safe(in_first),
+                matches!(in_first, 0 | 4),
+                "Cin=2 in_first={in_first}"
+            );
+        }
+        let cin3 = Shape::with_out_channels(227, 60, 1, 3, 256).with_padding([0, 0]); // stride mod16=2
+        for in_first in 0..8 {
+            assert_eq!(
+                cin3.dense_feature_offset_safe(in_first),
+                in_first == 0,
+                "Cin=3 in_first={in_first}"
+            );
+        }
+        let cin4 = Shape::with_out_channels(225, 60, 1, 4, 256).with_padding([0, 0]); // stride mod16=8
+        for in_first in 0..8 {
+            assert_eq!(
+                cin4.dense_feature_offset_safe(in_first),
+                in_first % 2 == 0,
+                "Cin=4 in_first={in_first}"
+            );
+        }
+        // Cout plays no role -- the address formula never references it.
+        let small_cout = Shape::with_out_channels(227, 60, 1, 3, 8).with_padding([0, 0]);
+        assert!(small_cout.dense_feature_offset_safe(0));
+        assert!(!small_cout.dense_feature_offset_safe(2));
+
+        // The affine-int8 oracle measured the same failure at offset 2 for
+        // this compact VGG input pitch: 226 * 3 = 678 bytes, or 6 mod 16.
+        let int8 = Shape::with_precision(226, 226, 1, 3, 64, captured_int8()).with_padding([0, 0]);
+        assert_eq!(int8.input_row_stride(), 678);
+        for in_first in 0..16 {
+            assert_eq!(
+                int8.dense_feature_offset_safe(in_first),
+                in_first % 8 == 0,
+                "int8 Cin=3 in_first={in_first}",
+            );
+        }
+
+        // Surfaces (Cin > 4) are a different addressing path this defect
+        // has not been shown to reach; always reported safe.
+        let surfaces = Shape::with_out_channels(227, 60, 1, 5, 8);
+        for in_first in 0..8 {
+            assert!(surfaces.dense_feature_offset_safe(in_first));
+        }
+    }
+
+    #[test]
+    fn conv_plan_moves_run1_tile_boundary_off_the_hardware_confirmed_break() {
+        // rocket_conv_harness.py's run1 (iree-rocket-design-spike): Cin=3
+        // dense, Cout=256, 3x3, 228x228 physically-padded input. Before this
+        // fix, ConvPlan::new's automatic split put tile 5's out_first/
+        // in_first at 189 (odd -- an 8-byte-misaligned feature base at this
+        // shape's stride), hardware-confirmed to corrupt one leading pixel
+        // of every one of that tile's 37 output rows
+        // (conv_dense_shared_buffer_dispatch_hw.rs).
+        let kernels = [3, 3];
+        let shape = Shape::with_out_channels(228, 228, 1, 3, 256).with_padding([0, 0]);
+        let plan = ConvPlan::new(shape, kernels);
+        assert_eq!(plan.data_banks(), 10);
+        assert_eq!(plan.weight_banks(), 2);
+        assert_eq!(plan.tiles().len(), 6);
+
+        let mut covered = 0u32;
+        for tile in plan.tiles() {
+            assert_eq!(
+                tile.rows.out_first, covered,
+                "row coverage must stay contiguous with no gap or overlap"
+            );
+            covered += tile.rows.out_rows;
+            assert!(
+                shape.dense_feature_offset_safe(tile.rows.in_first),
+                "tile at in_first={} is not alignment-safe",
+                tile.rows.in_first
+            );
+        }
+        assert_eq!(covered, shape.output_height(kernels));
+
+        // Greedy capacity filling makes every full tile 42 output rows and
+        // leaves a short 16-row tail. All boundaries are even and therefore
+        // safe at this row pitch; in particular the old 189 boundary is no
+        // longer present.
+        assert_eq!(plan.tiles()[4].rows.out_rows, 42);
+        assert_eq!(plan.tiles()[5].rows.out_first, 210);
+        assert_eq!(plan.tiles()[5].rows.in_first, 210);
+        assert_eq!(plan.tiles()[5].rows.out_rows, 16);
+    }
+
+    #[test]
+    fn conv_plan_aligns_the_compact_int8_vgg_boundary() {
+        let kernels = [3, 3];
+        let shape = Shape::with_precision(226, 226, 1, 3, 64, captured_int8()).with_padding([0, 0]);
+        let plan = ConvPlan::new(shape, kernels);
+
+        assert_eq!((plan.data_banks(), plan.weight_banks()), (11, 1));
+        assert_eq!(plan.tiles().len(), 3);
+        assert_eq!(plan.tiles()[0].rows.in_first, 0);
+        assert_ne!(plan.tiles()[1].rows.in_first, 91);
+        let mut covered = 0;
+        for tile in plan.tiles() {
+            assert_eq!(tile.rows.out_first, covered);
+            covered += tile.rows.out_rows;
+            assert!(
+                shape.dense_feature_offset_safe(tile.rows.in_first),
+                "unsafe int8 tile at in_first={} offset={}",
+                tile.rows.in_first,
+                tile.rows.input_offset(shape) % FEATURE_ATOM_BYTES,
+            );
+        }
+        assert_eq!(covered, shape.output_height(kernels));
+    }
+
+    #[test]
+    fn dense_row_tiling_stays_gap_free_and_alignment_safe_across_a_shape_sweep() {
+        // Host-side sweep, no hardware needed: dense_feature_offset_safe is
+        // a pure function of the plan ConvPlan::new already produces, so
+        // this checks the fix holds broadly rather than just at run1's one
+        // shape. 4 Cin values x 4 Cout values x 7 widths x 4 heights = 448
+        // shapes. Width 226 is the newly-found VGG-19 features.0 regression
+        // point and must remain in the ordinary suite.
+        let kernels = [3, 3];
+        for cin in [1u32, 2, 3, 4] {
+            for cout in [1u32, 8, 64, 256] {
+                for width in [30u32, 61, 97, 225, 226, 227, 300] {
+                    for height in [30u32, 61, 226, 300] {
+                        let shape = Shape::with_out_channels(width, height, 1, cin, cout)
+                            .with_padding([0, 0]);
+                        let plan = ConvPlan::new(shape, kernels);
+                        let mut covered = 0u32;
+                        for tile in plan.tiles() {
+                            assert_eq!(
+                                tile.rows.out_first, covered,
+                                "cin={cin} cout={cout} w={width} h={height}: gap/overlap"
+                            );
+                            covered += tile.rows.out_rows;
+                            assert!(
+                                shape.dense_feature_offset_safe(tile.rows.in_first),
+                                "cin={cin} cout={cout} w={width} h={height}: unsafe tile at \
+                                 in_first={}",
+                                tile.rows.in_first
+                            );
+                        }
+                        assert_eq!(
+                            covered,
+                            shape.output_height(kernels),
+                            "cin={cin} cout={cout} w={width} h={height}: coverage mismatch"
+                        );
+                    }
+                }
+            }
+        }
     }
 
     /// The quantization of `conv-w32-h32-k3-s1-i8`, read off the capture.
@@ -4471,6 +5209,7 @@ mod tests {
         let entries: Vec<BsEntry> = (0..16)
             .map(|c| BsEntry {
                 bias: 162675,
+                constant: BS_CONSTANT,
                 multiplier: 1024 * (c + 1),
             })
             .collect();
@@ -4499,18 +5238,22 @@ mod tests {
             &[
                 BsEntry {
                     bias: 162675,
+                    constant: BS_CONSTANT,
                     multiplier: 4096,
                 },
                 BsEntry {
                     bias: 162675,
+                    constant: BS_CONSTANT,
                     multiplier: 8192,
                 },
                 BsEntry {
                     bias: 162675,
+                    constant: BS_CONSTANT,
                     multiplier: 12288,
                 },
                 BsEntry {
                     bias: 162675,
+                    constant: BS_CONSTANT,
                     multiplier: 16384,
                 },
             ],

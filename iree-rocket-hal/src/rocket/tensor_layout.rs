@@ -168,6 +168,62 @@ pub fn pack_hwcf_to_rocket_weights(
     element_size: usize,
     packed: &mut [u8],
 ) -> Result<usize, &'static str> {
+    pack_hwcf_to_rocket_weights_impl(
+        dense,
+        filter_height,
+        filter_width,
+        input_channels,
+        output_channels,
+        element_size,
+        None,
+        packed,
+    )
+}
+
+/// Packs a quantized int8 HWCF filter and fills physical input-channel
+/// padding with each output channel's weight zero point.
+///
+/// The live bytes in `dense` are raw quantized coefficients and are copied
+/// unchanged. A padded input lane participates in the hardware dot product,
+/// so its neutral value is `weight_zero_points[output_channel]`, not
+/// necessarily zero. The matching BS constant is `-weight_zero_point`; see
+/// [`crate::rocket::conv::BsEntry::constant`]. A programmed odd-Cout padding
+/// kernel remains all zero because it has no quantization parameters and is
+/// never exposed as a logical output channel.
+pub fn pack_hwcf_to_rocket_weights_affine_i8(
+    dense: &[u8],
+    filter_height: usize,
+    filter_width: usize,
+    input_channels: usize,
+    output_channels: usize,
+    weight_zero_points: &[i8],
+    packed: &mut [u8],
+) -> Result<usize, &'static str> {
+    if weight_zero_points.len() != output_channels {
+        return Err("int8 weight zero-point count does not match output channels");
+    }
+    pack_hwcf_to_rocket_weights_impl(
+        dense,
+        filter_height,
+        filter_width,
+        input_channels,
+        output_channels,
+        1,
+        Some(weight_zero_points),
+        packed,
+    )
+}
+
+fn pack_hwcf_to_rocket_weights_impl(
+    dense: &[u8],
+    filter_height: usize,
+    filter_width: usize,
+    input_channels: usize,
+    output_channels: usize,
+    element_size: usize,
+    weight_zero_points: Option<&[i8]>,
+    packed: &mut [u8],
+) -> Result<usize, &'static str> {
     let dense_len = filter_height
         .checked_mul(filter_width)
         .and_then(|value| value.checked_mul(input_channels))
@@ -223,15 +279,20 @@ pub fn pack_hwcf_to_rocket_weights(
                             if input_channel >= padded_input_channels {
                                 continue;
                             }
-                            if input_channel < input_channels && output_channel < output_channels {
-                                let src_element = (((filter_y * filter_width + filter_x)
-                                    * input_channels
-                                    + input_channel)
-                                    * output_channels)
-                                    + output_channel;
-                                let src_offset = src_element * element_size;
-                                packed[dst_offset..dst_offset + element_size]
-                                    .copy_from_slice(&dense[src_offset..src_offset + element_size]);
+                            if output_channel < output_channels {
+                                if input_channel < input_channels {
+                                    let src_element = (((filter_y * filter_width + filter_x)
+                                        * input_channels
+                                        + input_channel)
+                                        * output_channels)
+                                        + output_channel;
+                                    let src_offset = src_element * element_size;
+                                    packed[dst_offset..dst_offset + element_size].copy_from_slice(
+                                        &dense[src_offset..src_offset + element_size],
+                                    );
+                                } else if let Some(zero_points) = weight_zero_points {
+                                    packed[dst_offset] = zero_points[output_channel] as u8;
+                                }
                             }
                             dst_offset += element_size;
                         }
@@ -249,28 +310,54 @@ pub fn pack_hwcf_to_rocket_weights(
 ///
 /// A depthwise filter is `[channels][filter_height][filter_width]` -- one
 /// `kh x kw` kernel per input channel, with no `(input, output)` pairing at
-/// all. The hardware wants it **tap-major**:
+/// all. The hardware wants it **tap-major within a channel group**: channels
+/// are chunked into groups of [`WEIGHT_INPUT_GROUP_CHANNELS`] (32 -- the
+/// same fixed grouping [`pack_hwcf_to_rocket_weights`]'s dense path already
+/// uses, for both precisions), and every group's own 9 taps sit contiguously
+/// before the next group starts:
 ///
-/// `slot = (ky * filter_width + kx) * padded_channels + channel`
+/// ```text
+/// slot = group_base(channel)
+///      + (ky * filter_width + kx) * group_width(channel)
+///      + (channel % WEIGHT_INPUT_GROUP_CHANNELS)
+/// ```
 ///
-/// i.e. all channels' coefficients for one tap sit contiguously, then all
-/// channels' coefficients for the next. This is the transpose of how torch
-/// and ONNX store it, and it is nothing like
-/// [`pack_hwcf_to_rocket_weights`]'s blocked dense order.
+/// where `group_base` is the running element offset of that channel's group
+/// (`group * filter_height * filter_width * WEIGHT_INPUT_GROUP_CHANNELS`),
+/// and `group_width` is 32 for every group except a final, shorter one when
+/// `padded_channels` isn't a whole multiple of 32 (then it's the remainder).
+/// This is the transpose of how torch and ONNX store a depthwise filter, and
+/// nothing like `pack_hwcf_to_rocket_weights`'s own blocked dense order.
+///
+/// **This grouping was missed the first time.** The original hardware probe
+/// (`tests/conv_depthwise_probe_hw.rs`, one-hot slot-by-slot at Cin 8 and
+/// 12) never exceeded one 32-channel group, so a single global stride --
+/// `slot = (ky*kw+kx)*padded_channels+channel` -- looked equivalent and
+/// shipped instead; every subsequent depthwise validation
+/// (`tests/conv_phase1_validation_hw.rs`, the nine-point channel-count
+/// ladder in DESIGN_NOTES.md) also stayed at or below 128 channels without
+/// ever probing the packed buffer's own internal layout, only the register
+/// program's declared total byte count, which the group boundary doesn't
+/// change. It was found by routing a real depthwise dispatch through the
+/// actual compiled MLIR/driver path for the first time (transform.0.mlir's
+/// `@match_dynamic_depthwise_conv2d`) at Cin 128, and pinned down exactly by
+/// three follow-up probes -- distinct known values on every tap of one
+/// channel, summed on real hardware -- at Cin 128 (4 exact groups), 256 (8
+/// exact groups), and 144 (4 full groups plus a genuine 16-wide tail group).
+/// All three matched this formula bit-for-bit and none matched the old flat
+/// one. Only fp16 has been checked this way; int8 reuses
+/// [`WEIGHT_INPUT_GROUP_CHANNELS`] on the working assumption that it shares
+/// the dense path's precision-independent grouping (true there), not its
+/// own hardware confirmation.
 ///
 /// `padded_channels` is the count the register program's
 /// `CNA_WEIGHT_SIZE0.weight_bytes` is sized from -- [`Shape::weight_bytes`]
 /// divided by `kh * kw * element_size` -- not the real channel count. The
 /// two differ whenever the channel count is not a whole CBUF atom group;
-/// padding slots are left zero and contribute nothing.
-///
-/// Derived by one-hot probing every slot of a real weight buffer on
-/// hardware, reading back which output channel responded and which image
-/// borders went zero (`tests/conv_depthwise_probe_hw.rs`). A capture could
-/// never have shown this: it carries the register program, not the buffer.
-/// The original exhaustive probe used fp16; the same tap-major order and a
-/// padded stride of 16 were subsequently validated for int8 at Cin 12 by
-/// `tests/conv_phase1_validation_hw.rs`.
+/// padding slots are left zero and contribute nothing. Group boundaries are
+/// computed from this padded count, not the raw channel count, so a
+/// trailing padding slot (if any) stays inside the last real group instead
+/// of opening an all-padding group of its own.
 ///
 /// [`Shape::weight_bytes`]: crate::rocket::conv::Shape::weight_bytes
 pub fn pack_depthwise_to_rocket_weights(
@@ -310,11 +397,24 @@ pub fn pack_depthwise_to_rocket_weights(
     }
 
     packed[..packed_len].fill(0);
+
+    let full_groups = padded_channels / WEIGHT_INPUT_GROUP_CHANNELS;
+    let tail_width = padded_channels - full_groups * WEIGHT_INPUT_GROUP_CHANNELS;
+
     for channel in 0..channels {
+        let group = channel / WEIGHT_INPUT_GROUP_CHANNELS;
+        let channel_in_group = channel % WEIGHT_INPUT_GROUP_CHANNELS;
+        let group_width = if group < full_groups {
+            WEIGHT_INPUT_GROUP_CHANNELS
+        } else {
+            tail_width
+        };
+        let group_base = group * filter_height * filter_width * WEIGHT_INPUT_GROUP_CHANNELS;
         for ky in 0..filter_height {
             for kx in 0..filter_width {
                 let from = ((channel * filter_height + ky) * filter_width + kx) * element_size;
-                let to = ((ky * filter_width + kx) * padded_channels + channel) * element_size;
+                let to = (group_base + (ky * filter_width + kx) * group_width + channel_in_group)
+                    * element_size;
                 packed[to..to + element_size].copy_from_slice(&dense[from..from + element_size]);
             }
         }
@@ -533,6 +633,35 @@ mod tests {
         assert_eq!(rocket_weight_storage_size(1, 1, 17, 3, 1), Ok(128));
     }
 
+    #[test]
+    fn packs_affine_int8_weights_with_per_output_neutral_padding() {
+        // Controlled vendor-style Cin=2/Cout=2 coefficients. Logical rows
+        // are [-1,+1] and [+0.5,-0.5] after their per-output affine decode;
+        // this test pins only the byte-level HWCF transform.
+        let dense = [0x80, 0x7f, 0x7f, 0x80];
+        let zero_points = [42i8, -43];
+        let mut packed = vec![0; rocket_weight_storage_size(1, 1, 2, 2, 1).unwrap()];
+
+        let written =
+            pack_hwcf_to_rocket_weights_affine_i8(&dense, 1, 1, 2, 2, &zero_points, &mut packed)
+                .unwrap();
+
+        assert_eq!(written, 32);
+        assert_eq!(&packed[0..2], &[0x80, 0x7f]);
+        assert!(packed[2..16].iter().all(|&byte| byte == 42));
+        assert_eq!(&packed[16..18], &[0x7f, 0x80]);
+        assert!(packed[18..32].iter().all(|&byte| byte == (-43i8) as u8));
+    }
+
+    #[test]
+    fn affine_int8_packer_rejects_wrong_zero_point_count() {
+        let mut packed = vec![0; 32];
+        assert_eq!(
+            pack_hwcf_to_rocket_weights_affine_i8(&[0; 4], 1, 1, 2, 2, &[0], &mut packed),
+            Err("int8 weight zero-point count does not match output channels")
+        );
+    }
+
     /// The exact slot mapping the hardware probe reported at Cin 8, 3x3:
     /// channel `c` at tap (0,0) lands at slot `c`, and channel 0's next tap
     /// (0,1) lands at slot 8 -- one whole channel row later, not adjacent.
@@ -603,6 +732,70 @@ mod tests {
                 }
             }
         }
+    }
+
+    /// The two tests above never leave a single 32-channel group, so they
+    /// cannot tell a per-group stride from one global stride spanning the
+    /// whole padded channel count -- both formulas agree there. A hardware
+    /// probe through the real compiled dispatch path (not this isolated
+    /// packer), summing distinct known values on every tap of one channel,
+    /// found real coefficients leaking into channels exactly
+    /// `WEIGHT_INPUT_GROUP_CHANNELS` (32) apart at Cin 128 and 256, and
+    /// -- with a genuine short final group -- at Cin 144. This is the
+    /// smallest shape (one full group plus a real tail group) that
+    /// reproduces the 144 probe's structure by hand. Values are 2 bytes so
+    /// `channel * 16 + ky * 4 + kx` stays unique without wrapping past
+    /// channel 15 the way the byte-sized encoding above would.
+    #[test]
+    fn depthwise_packing_groups_channels_past_the_first_thirty_two() {
+        let (channels, padded, kh, kw) = (48usize, 48usize, 3usize, 3usize);
+        let mut dense = vec![0u8; channels * kh * kw * 2];
+        for channel in 0..channels {
+            for ky in 0..kh {
+                for kx in 0..kw {
+                    let value = (channel * 16 + ky * 4 + kx) as u16;
+                    let offset = ((channel * kh + ky) * kw + kx) * 2;
+                    dense[offset..offset + 2].copy_from_slice(&value.to_le_bytes());
+                }
+            }
+        }
+
+        let mut packed = vec![0xffu8; kh * kw * padded * 2];
+        let written =
+            pack_depthwise_to_rocket_weights(&dense, kh, kw, channels, padded, 2, &mut packed)
+                .expect("packing failed");
+        assert_eq!(written, kh * kw * padded * 2);
+
+        // Group 0: channels 0..32, width 32, base 0. Group 1 (tail):
+        // channels 32..48, width 16, base 9*32=288 elements.
+        for channel in 0..channels {
+            let (group_base, group_width) = if channel < 32 { (0, 32) } else { (288, 16) };
+            let channel_in_group = channel % 32;
+            for ky in 0..kh {
+                for kx in 0..kw {
+                    let slot = group_base + (ky * kw + kx) * group_width + channel_in_group;
+                    let want = (channel * 16 + ky * 4 + kx) as u16;
+                    let got = u16::from_le_bytes([packed[slot * 2], packed[slot * 2 + 1]]);
+                    assert_eq!(
+                        got, want,
+                        "slot {slot} (channel {channel}, tap ({ky}, {kx}))"
+                    );
+                }
+            }
+        }
+        // Channel 32 opens the tail group right after group 0's 9*32=288
+        // elements -- not immediately after channel 31's own tap (0,0) the
+        // way a single global stride would place it.
+        let tail_start = u16::from_le_bytes([packed[288 * 2], packed[288 * 2 + 1]]);
+        assert_eq!(
+            tail_start,
+            32 * 16,
+            "channel 32 tap (0,0), start of tail group"
+        );
+        // Channel 47 (last real channel) tap (2,2): the tail group's own
+        // last slot, at 288 + 8*16 + 15 = 431, the buffer's final element.
+        let last = u16::from_le_bytes([packed[431 * 2], packed[431 * 2 + 1]]);
+        assert_eq!(last, 47 * 16 + 2 * 4 + 2, "channel 47 tap (2,2)");
     }
 
     #[test]
