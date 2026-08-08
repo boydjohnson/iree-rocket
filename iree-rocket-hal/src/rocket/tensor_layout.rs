@@ -776,7 +776,10 @@ mod tests {
                     let slot = group_base + (ky * kw + kx) * group_width + channel_in_group;
                     let want = (channel * 16 + ky * 4 + kx) as u16;
                     let got = u16::from_le_bytes([packed[slot * 2], packed[slot * 2 + 1]]);
-                    assert_eq!(got, want, "slot {slot} (channel {channel}, tap ({ky}, {kx}))");
+                    assert_eq!(
+                        got, want,
+                        "slot {slot} (channel {channel}, tap ({ky}, {kx}))"
+                    );
                 }
             }
         }
@@ -784,7 +787,11 @@ mod tests {
         // elements -- not immediately after channel 31's own tap (0,0) the
         // way a single global stride would place it.
         let tail_start = u16::from_le_bytes([packed[288 * 2], packed[288 * 2 + 1]]);
-        assert_eq!(tail_start, 32 * 16, "channel 32 tap (0,0), start of tail group");
+        assert_eq!(
+            tail_start,
+            32 * 16,
+            "channel 32 tap (0,0), start of tail group"
+        );
         // Channel 47 (last real channel) tap (2,2): the tail group's own
         // last slot, at 288 + 8*16 + 15 = 431, the buffer's final element.
         let last = u16::from_le_bytes([packed[431 * 2], packed[431 * 2 + 1]]);

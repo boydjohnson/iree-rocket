@@ -455,9 +455,7 @@ pub unsafe fn apply_ops(
                             .and_then(|value| value.checked_mul(packing.element_size))
                     }
                     .ok_or_else(|| {
-                        status::from_code(
-                            crate::bindings::iree_status_code_e_IREE_STATUS_INTERNAL,
-                        )
+                        status::from_code(crate::bindings::iree_status_code_e_IREE_STATUS_INTERNAL)
                     })?;
                     if dense_len as u64 > packing.weight_length as u64 {
                         return Err(status::from_code(
