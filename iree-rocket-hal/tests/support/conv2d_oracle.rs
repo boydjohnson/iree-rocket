@@ -3,7 +3,10 @@ use iree_rocket_hal::rocket::{
         BsEntry, Kernels, Multiplier, Precision, Quantization, Shape, bs_buffer_bytes,
         write_bs_buffer,
     },
-    tensor_layout::{pack_hwcf_to_rocket_weights, rocket_weight_storage_size},
+    tensor_layout::{
+        pack_hwcf_to_rocket_weights, pack_hwcf_to_rocket_weights_affine_i8,
+        rocket_weight_storage_size,
+    },
 };
 
 pub const FEATURE_ATOM_BYTES: usize = 16;
@@ -31,6 +34,35 @@ pub enum OraclePattern {
     /// Three signed coefficients per output channel select distinct HWCF
     /// positions. Inputs vary in y, x, and channel, exposing permutations.
     Selectors { phase: usize },
+    /// Signed selectors represented as ordinary affine int8 weights.
+    SelectorsAffine { phase: usize },
+    /// The same logical signed selector filter, encoded according to the
+    /// dense 256-byte probe: raw = logical ^ 0x80, neutral padding 0x80,
+    /// and a 128x output gain to recover the logical signed coefficient.
+    SelectorsSigned128 { phase: usize },
+    /// The same XOR-0x80 signed selector encoding, but with the ordinary
+    /// unit output conversion. This tests whether the inferred byte encoding
+    /// already carries logical signed weights without an extra gain.
+    SelectorsOffsetUnit { phase: usize },
+    /// Ordinary signed two's-complement selector coefficients, paired with
+    /// the 128x/-128 conversion that the all-256-byte sweep showed removes
+    /// the BS path's 1/128 scale and fixed +128 baseline.
+    SelectorsDirect128 { phase: usize },
+    /// One positive unit coefficient per output channel. Crossing kernel
+    /// size with positive/signed input values separates channel packing,
+    /// tap packing, and signed arithmetic without mixing those effects.
+    OneHot { phase: usize, signed_input: bool },
+    /// The same logical one-hot filter, but with the raw byte encoding from
+    /// the int8 neutral-coefficient probe: 0x80 background/padding and 0x00
+    /// for the live logical +1. This is a diagnostic, not yet a general ABI.
+    OneHotNeutral80 { phase: usize, signed_input: bool },
+    /// One K1/Cin1 output per possible coefficient byte. Output channel `c`
+    /// receives raw byte `c`, while every padded coefficient is 0x80. A
+    /// magnified output conversion exposes the retained coefficient fraction.
+    RawByteSweep,
+    /// The same all-256-byte K1/Cin1 sweep under the ordinary unit output
+    /// conversion and zero output point used by synthetic int8 convolution.
+    RawByteSweepUnit,
 }
 
 impl OraclePattern {
@@ -38,6 +70,26 @@ impl OraclePattern {
         match self {
             Self::Counting => "counting",
             Self::Selectors { .. } => "selectors",
+            Self::SelectorsAffine { .. } => "selectors-affine",
+            Self::SelectorsSigned128 { .. } => "selectors-signed128",
+            Self::SelectorsOffsetUnit { .. } => "selectors-offset-unit",
+            Self::SelectorsDirect128 { .. } => "selectors-direct128",
+            Self::OneHot {
+                signed_input: false,
+                ..
+            } => "onehot-positive",
+            Self::OneHot {
+                signed_input: true, ..
+            } => "onehot-signed",
+            Self::OneHotNeutral80 {
+                signed_input: false,
+                ..
+            } => "onehot-neutral80-positive",
+            Self::OneHotNeutral80 {
+                signed_input: true, ..
+            } => "onehot-neutral80-signed",
+            Self::RawByteSweep => "raw-byte-sweep",
+            Self::RawByteSweepUnit => "raw-byte-sweep-unit",
         }
     }
 }
@@ -58,7 +110,18 @@ pub struct Conv2dCase {
 impl Conv2dCase {
     pub fn output_shift(self) -> u32 {
         if self.precision == OraclePrecision::Fp16
-            || matches!(self.pattern, OraclePattern::Selectors { .. })
+            || matches!(
+                self.pattern,
+                OraclePattern::Selectors { .. }
+                    | OraclePattern::SelectorsAffine { .. }
+                    | OraclePattern::SelectorsSigned128 { .. }
+                    | OraclePattern::SelectorsOffsetUnit { .. }
+                    | OraclePattern::SelectorsDirect128 { .. }
+                    | OraclePattern::OneHot { .. }
+                    | OraclePattern::OneHotNeutral80 { .. }
+                    | OraclePattern::RawByteSweep
+                    | OraclePattern::RawByteSweepUnit
+            )
         {
             return 0;
         }
@@ -73,11 +136,28 @@ impl Conv2dCase {
     pub fn shape(self) -> Shape {
         let precision = match self.precision {
             OraclePrecision::Fp16 => Precision::Fp16,
-            OraclePrecision::Int8 => Precision::Int8(Quantization {
-                input_zero_point: 0,
-                output_zero_point: 0,
-                multiplier: Multiplier::for_unit_bs(1.0 / f64::from(1u32 << self.output_shift())),
-            }),
+            OraclePrecision::Int8 => {
+                let (output_zero_point, multiplier) = match self.pattern {
+                    OraclePattern::RawByteSweep => (-128, Multiplier::for_unit_bs(128.0)),
+                    OraclePattern::SelectorsSigned128 { .. } => (0, Multiplier::for_unit_bs(128.0)),
+                    OraclePattern::SelectorsDirect128 { .. } => {
+                        (-128, Multiplier::for_unit_bs(128.0))
+                    }
+                    OraclePattern::Counting | OraclePattern::SelectorsAffine { .. } => (
+                        0,
+                        Multiplier::from_ratio(1.0 / f64::from(1u32 << self.output_shift())),
+                    ),
+                    _ => (
+                        0,
+                        Multiplier::for_unit_bs(1.0 / f64::from(1u32 << self.output_shift())),
+                    ),
+                };
+                Precision::Int8(Quantization {
+                    input_zero_point: 0,
+                    output_zero_point,
+                    multiplier,
+                })
+            }
         };
         Shape::with_precision(
             self.width,
@@ -210,9 +290,30 @@ pub fn f16_to_f32(bits: u16) -> f32 {
 fn input_value(case: Conv2dCase, y: usize, x: usize, channel: usize) -> i8 {
     match case.pattern {
         OraclePattern::Counting => 1,
-        OraclePattern::Selectors { phase } => {
+        OraclePattern::Selectors { phase }
+        | OraclePattern::SelectorsAffine { phase }
+        | OraclePattern::SelectorsSigned128 { phase }
+        | OraclePattern::SelectorsOffsetUnit { phase }
+        | OraclePattern::SelectorsDirect128 { phase } => {
             ((y * 13 + x * 7 + channel * 3 + (y * x) % 5 + phase) % 7) as i8 - 3
         }
+        OraclePattern::OneHot {
+            phase,
+            signed_input,
+        }
+        | OraclePattern::OneHotNeutral80 {
+            phase,
+            signed_input,
+        } => {
+            let linear = (y * case.width as usize + x) * case.cin as usize + channel;
+            let magnitude = 1 + ((linear + phase * 17) % 61) as i8;
+            if signed_input && (linear + phase) % 2 != 0 {
+                -magnitude
+            } else {
+                magnitude
+            }
+        }
+        OraclePattern::RawByteSweep | OraclePattern::RawByteSweepUnit => 1,
     }
 }
 
@@ -223,8 +324,16 @@ fn selector_weights(case: Conv2dCase, output_channel: usize) -> [(usize, i8); 3]
         "selector oracle needs at least three HWCF slots"
     );
     let phase = match case.pattern {
-        OraclePattern::Selectors { phase } => phase,
-        OraclePattern::Counting => 0,
+        OraclePattern::Selectors { phase }
+        | OraclePattern::SelectorsAffine { phase }
+        | OraclePattern::SelectorsSigned128 { phase }
+        | OraclePattern::SelectorsOffsetUnit { phase }
+        | OraclePattern::SelectorsDirect128 { phase } => phase,
+        OraclePattern::Counting
+        | OraclePattern::OneHot { .. }
+        | OraclePattern::OneHotNeutral80 { .. }
+        | OraclePattern::RawByteSweep
+        | OraclePattern::RawByteSweepUnit => 0,
     };
     let first = (output_channel * 17 + phase * 11) % slots;
     let step = (slots / 3).max(1);
@@ -233,6 +342,22 @@ fn selector_weights(case: Conv2dCase, output_channel: usize) -> [(usize, i8); 3]
         ((first + step) % slots, -1),
         ((first + 2 * step) % slots, 2),
     ]
+}
+
+fn one_hot_selector(case: Conv2dCase, output_channel: usize) -> usize {
+    let slots = case.kernel[0] * case.kernel[1] * case.cin as usize;
+    let phase = match case.pattern {
+        OraclePattern::OneHot { phase, .. } | OraclePattern::OneHotNeutral80 { phase, .. } => phase,
+        OraclePattern::Counting
+        | OraclePattern::Selectors { .. }
+        | OraclePattern::SelectorsAffine { .. }
+        | OraclePattern::SelectorsSigned128 { .. }
+        | OraclePattern::SelectorsOffsetUnit { .. }
+        | OraclePattern::SelectorsDirect128 { .. }
+        | OraclePattern::RawByteSweep
+        | OraclePattern::RawByteSweepUnit => 0,
+    };
+    (output_channel * 17 + phase * 11) % slots
 }
 
 fn decode_selector(case: Conv2dCase, selector: usize) -> (usize, usize, usize) {
@@ -253,12 +378,24 @@ fn weight_value(
 ) -> i8 {
     match case.pattern {
         OraclePattern::Counting => 1,
-        OraclePattern::Selectors { .. } => {
+        OraclePattern::Selectors { .. }
+        | OraclePattern::SelectorsAffine { .. }
+        | OraclePattern::SelectorsSigned128 { .. }
+        | OraclePattern::SelectorsOffsetUnit { .. }
+        | OraclePattern::SelectorsDirect128 { .. } => {
             let selector = (ky * case.kernel[1] + kx) * case.cin as usize + input_channel;
             selector_weights(case, output_channel)
                 .into_iter()
                 .find_map(|(selected, weight)| (selected == selector).then_some(weight))
                 .unwrap_or(0)
+        }
+        OraclePattern::OneHot { .. } | OraclePattern::OneHotNeutral80 { .. } => {
+            let selector = (ky * case.kernel[1] + kx) * case.cin as usize + input_channel;
+            i8::from(selector == one_hot_selector(case, output_channel))
+        }
+        OraclePattern::RawByteSweep | OraclePattern::RawByteSweepUnit => {
+            assert_eq!((case.kernel, case.cin), ([1, 1], 1));
+            output_channel as u8 as i8
         }
     }
 }
@@ -300,7 +437,11 @@ pub fn expected_accumulator(
             }
             valid_taps * case.cin as i32
         }
-        OraclePattern::Selectors { .. } => selector_weights(case, output_channel)
+        OraclePattern::Selectors { .. }
+        | OraclePattern::SelectorsAffine { .. }
+        | OraclePattern::SelectorsSigned128 { .. }
+        | OraclePattern::SelectorsOffsetUnit { .. }
+        | OraclePattern::SelectorsDirect128 { .. } => selector_weights(case, output_channel)
             .into_iter()
             .filter_map(|(selector, weight)| {
                 let (ky, kx, channel) = decode_selector(case, selector);
@@ -318,6 +459,26 @@ pub fn expected_accumulator(
                 })
             })
             .sum(),
+        OraclePattern::OneHot { .. } | OraclePattern::OneHotNeutral80 { .. } => {
+            let (ky, kx, channel) = decode_selector(case, one_hot_selector(case, output_channel));
+            let input_y = input_origin_y + ky as isize;
+            let input_x = input_origin_x + kx as isize;
+            if (0..case.height as isize).contains(&input_y)
+                && (0..case.width as isize).contains(&input_x)
+            {
+                i32::from(input_value(
+                    case,
+                    input_y as usize,
+                    input_x as usize,
+                    channel,
+                ))
+            } else {
+                0
+            }
+        }
+        OraclePattern::RawByteSweep | OraclePattern::RawByteSweepUnit => {
+            output_channel as u8 as i8 as i32
+        }
     }
 }
 
@@ -416,6 +577,21 @@ fn logical_weights(case: Conv2dCase) -> Vec<i8> {
     weights
 }
 
+fn uses_affine_int8_weights(case: Conv2dCase) -> bool {
+    case.precision == OraclePrecision::Int8
+        && matches!(
+            case.pattern,
+            OraclePattern::Counting | OraclePattern::SelectorsAffine { .. }
+        )
+}
+
+fn affine_weight_zero_points(case: Conv2dCase) -> Vec<i8> {
+    const ZERO_POINTS: [i8; 5] = [-127, -43, 0, 42, 125];
+    (0..case.cout as usize)
+        .map(|channel| ZERO_POINTS[channel % ZERO_POINTS.len()])
+        .collect()
+}
+
 pub fn build_fixture(case: Conv2dCase) -> Result<Conv2dFixture, String> {
     let shape = case.shape();
     let logical_input = logical_input(case);
@@ -440,6 +616,8 @@ pub fn build_fixture(case: Conv2dCase) -> Result<Conv2dFixture, String> {
     }
 
     let logical_weights = logical_weights(case);
+    let weight_zero_points =
+        uses_affine_int8_weights(case).then(|| affine_weight_zero_points(case));
     let element_bytes = element_bytes(shape);
     let mut dense_weight_bytes = Vec::with_capacity(logical_weights.len() * element_bytes);
     match case.precision {
@@ -449,7 +627,21 @@ pub fn build_fixture(case: Conv2dCase) -> Result<Conv2dFixture, String> {
             }
         }
         OraclePrecision::Int8 => {
-            dense_weight_bytes.extend(logical_weights.into_iter().map(|value| value as u8));
+            if let Some(zero_points) = &weight_zero_points {
+                for (index, value) in logical_weights.into_iter().enumerate() {
+                    let output_channel = index % case.cout as usize;
+                    let raw = i16::from(value) + i16::from(zero_points[output_channel]);
+                    let raw = i8::try_from(raw).map_err(|_| {
+                        format!(
+                            "logical weight {value} plus output {output_channel} zero point {} is outside int8",
+                            zero_points[output_channel],
+                        )
+                    })?;
+                    dense_weight_bytes.push(raw as u8);
+                }
+            } else {
+                dense_weight_bytes.extend(logical_weights.into_iter().map(|value| value as u8));
+            }
         }
     }
     let packed_len = rocket_weight_storage_size(
@@ -461,16 +653,88 @@ pub fn build_fixture(case: Conv2dCase) -> Result<Conv2dFixture, String> {
     )
     .map_err(str::to_string)?;
     let mut weights = vec![0; packed_len];
-    pack_hwcf_to_rocket_weights(
-        &dense_weight_bytes,
-        case.kernel[0],
-        case.kernel[1],
-        case.cin as usize,
-        case.cout as usize,
-        element_bytes,
-        &mut weights,
-    )
-    .map_err(str::to_string)?;
+    if let Some(zero_points) = &weight_zero_points {
+        pack_hwcf_to_rocket_weights_affine_i8(
+            &dense_weight_bytes,
+            case.kernel[0],
+            case.kernel[1],
+            case.cin as usize,
+            case.cout as usize,
+            zero_points,
+            &mut weights,
+        )
+        .map_err(str::to_string)?;
+    } else {
+        pack_hwcf_to_rocket_weights(
+            &dense_weight_bytes,
+            case.kernel[0],
+            case.kernel[1],
+            case.cin as usize,
+            case.cout as usize,
+            element_bytes,
+            &mut weights,
+        )
+        .map_err(str::to_string)?;
+    }
+    if case.precision == OraclePrecision::Int8
+        && matches!(
+            case.pattern,
+            OraclePattern::SelectorsSigned128 { .. } | OraclePattern::SelectorsOffsetUnit { .. }
+        )
+    {
+        // The raw-byte sweep established this affine signed encoding across
+        // all 256 values. XOR also maps every packer-generated zero padding
+        // byte to the hardware-neutral 0x80 value.
+        for byte in &mut weights {
+            *byte ^= 0x80;
+        }
+    }
+    if case.precision == OraclePrecision::Int8
+        && matches!(case.pattern, OraclePattern::OneHotNeutral80 { .. })
+    {
+        for byte in &mut weights {
+            *byte = match *byte {
+                // The ordinary packer's logical zero, including every
+                // padded lane, becomes the probed neutral coefficient.
+                0 => 0x80,
+                // Under the current unit-BS diagnostic configuration, raw
+                // zero produced one positive input contribution.
+                1 => 0x00,
+                other => {
+                    return Err(format!(
+                        "neutral80 one-hot fixture produced unexpected packed byte 0x{other:02x}"
+                    ));
+                }
+            };
+        }
+    }
+    if case.precision == OraclePrecision::Int8
+        && matches!(
+            case.pattern,
+            OraclePattern::RawByteSweep | OraclePattern::RawByteSweepUnit
+        )
+    {
+        // Pack a parallel all-live mask through the same production layout
+        // transform. This distinguishes a legitimate live raw 0x00 byte
+        // from zero-filled physical padding without duplicating the layout.
+        let dense_live_mask = vec![1u8; dense_weight_bytes.len()];
+        let mut packed_live_mask = vec![0; packed_len];
+        pack_hwcf_to_rocket_weights(
+            &dense_live_mask,
+            case.kernel[0],
+            case.kernel[1],
+            case.cin as usize,
+            case.cout as usize,
+            element_bytes,
+            &mut packed_live_mask,
+        )
+        .map_err(str::to_string)?;
+        for (byte, live) in weights.iter_mut().zip(packed_live_mask) {
+            if live == 0 {
+                *byte = 0x80;
+            }
+        }
+    }
     if weights.len() != shape.weight_bytes(case.kernel) as usize {
         return Err(format!(
             "packed weight size {} does not match Shape::weight_bytes {}",
@@ -484,7 +748,28 @@ pub fn build_fixture(case: Conv2dCase) -> Result<Conv2dFixture, String> {
         OraclePrecision::Int8 => {
             let channels = shape.padded_out_channels();
             let mut bytes = vec![0; bs_buffer_bytes(channels)];
-            write_bs_buffer(&mut bytes, &vec![BsEntry::default(); channels as usize]);
+            let entries = if let Some(zero_points) = &weight_zero_points {
+                (0..channels as usize)
+                    .map(|channel| {
+                        if channel < zero_points.len() {
+                            BsEntry {
+                                bias: 0,
+                                constant: -i16::from(zero_points[channel]),
+                                multiplier: 1 << 14,
+                            }
+                        } else {
+                            BsEntry {
+                                bias: 0,
+                                constant: 0,
+                                multiplier: 0,
+                            }
+                        }
+                    })
+                    .collect::<Vec<_>>()
+            } else {
+                vec![BsEntry::default(); channels as usize]
+            };
+            write_bs_buffer(&mut bytes, &entries);
             bytes
         }
     };
@@ -530,7 +815,26 @@ mod tests {
 
     #[test]
     fn selector_shortcut_matches_dense_reference() {
-        for precision in [OraclePrecision::Fp16, OraclePrecision::Int8] {
+        for (precision, pattern) in [
+            (OraclePrecision::Fp16, OraclePattern::Selectors { phase: 2 }),
+            (OraclePrecision::Int8, OraclePattern::Selectors { phase: 2 }),
+            (
+                OraclePrecision::Int8,
+                OraclePattern::SelectorsAffine { phase: 2 },
+            ),
+            (
+                OraclePrecision::Int8,
+                OraclePattern::SelectorsSigned128 { phase: 2 },
+            ),
+            (
+                OraclePrecision::Int8,
+                OraclePattern::SelectorsOffsetUnit { phase: 2 },
+            ),
+            (
+                OraclePrecision::Int8,
+                OraclePattern::SelectorsDirect128 { phase: 2 },
+            ),
+        ] {
             let case = Conv2dCase {
                 width: 5,
                 height: 4,
@@ -540,7 +844,7 @@ mod tests {
                 stride: 1,
                 padding: [1, 1],
                 precision,
-                pattern: OraclePattern::Selectors { phase: 2 },
+                pattern,
             };
             let shape = case.shape();
             let (input, weights, bias) = logical_fixture(case);
@@ -554,11 +858,249 @@ mod tests {
                         assert_eq!(
                             expected_accumulator(case, channel, y, x),
                             dense[index],
-                            "{precision:?} [{y}, {x}, {channel}]",
+                            "{precision:?} {pattern:?} [{y}, {x}, {channel}]",
                         );
                     }
                 }
             }
+        }
+    }
+
+    #[test]
+    fn affine_selector_fixture_centers_live_weights_padding_and_bs() {
+        let case = Conv2dCase {
+            width: 5,
+            height: 4,
+            cin: 3,
+            cout: 5,
+            kernel: [1, 1],
+            stride: 1,
+            padding: [0, 0],
+            precision: OraclePrecision::Int8,
+            pattern: OraclePattern::SelectorsAffine { phase: 2 },
+        };
+        let logical = logical_weights(case);
+        let zero_points = affine_weight_zero_points(case);
+        let fixture = build_fixture(case).expect("build affine selector fixture");
+
+        for output_channel in 0..case.cout as usize {
+            let packed = &fixture.weights[output_channel * 16..(output_channel + 1) * 16];
+            for input_channel in 0..case.cin as usize {
+                let logical_index = input_channel * case.cout as usize + output_channel;
+                assert_eq!(
+                    packed[input_channel] as i8,
+                    logical[logical_index] + zero_points[output_channel],
+                    "live weight oc={output_channel} ic={input_channel}",
+                );
+            }
+            assert!(
+                packed[case.cin as usize..]
+                    .iter()
+                    .all(|&byte| byte == zero_points[output_channel] as u8),
+                "neutral padding oc={output_channel}",
+            );
+
+            let lane = output_channel % 8;
+            let constant =
+                i16::from_le_bytes([fixture.bias[32 + lane * 2], fixture.bias[33 + lane * 2]]);
+            let multiplier =
+                i16::from_le_bytes([fixture.bias[48 + lane * 2], fixture.bias[49 + lane * 2]]);
+            assert_eq!(constant, -i16::from(zero_points[output_channel]));
+            assert_eq!(multiplier, 1 << 14);
+        }
+        assert!(
+            fixture.weights[5 * 16..6 * 16]
+                .iter()
+                .all(|&byte| byte == 0)
+        );
+        match fixture.shape.precision {
+            Precision::Int8(quantization) => {
+                assert_eq!(quantization.multiplier, Multiplier::from_ratio(1.0),)
+            }
+            Precision::Fp16 => panic!("affine selector unexpectedly built fp16 shape"),
+        }
+    }
+
+    #[test]
+    fn one_hot_shortcut_matches_dense_reference_for_the_four_way_matrix() {
+        for kernel in [1usize, 3] {
+            for signed_input in [false, true] {
+                for neutral80 in [false, true] {
+                    let pattern = if neutral80 {
+                        OraclePattern::OneHotNeutral80 {
+                            phase: 2,
+                            signed_input,
+                        }
+                    } else {
+                        OraclePattern::OneHot {
+                            phase: 2,
+                            signed_input,
+                        }
+                    };
+                    let case = Conv2dCase {
+                        width: 9,
+                        height: 7,
+                        cin: 3,
+                        cout: 32,
+                        kernel: [kernel, kernel],
+                        stride: 1,
+                        padding: [0, 0],
+                        precision: OraclePrecision::Int8,
+                        pattern,
+                    };
+                    let shape = case.shape();
+                    let (input, weights, bias) = logical_fixture(case);
+                    let dense = dense_reference(case, &input, &weights, &bias);
+                    for y in 0..shape.output_height(case.kernel) as usize {
+                        for x in 0..shape.output_width(case.kernel) as usize {
+                            for channel in 0..case.cout as usize {
+                                let index = (y * shape.output_width(case.kernel) as usize + x)
+                                    * case.cout as usize
+                                    + channel;
+                                assert_eq!(
+                                    expected_accumulator(case, channel, y, x),
+                                    dense[index],
+                                    "K{kernel} signed={signed_input} neutral80={neutral80} \
+                                     [{y}, {x}, {channel}]",
+                                );
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn neutral80_one_hot_fixture_encodes_live_and_padding_bytes() {
+        let case = Conv2dCase {
+            width: 9,
+            height: 7,
+            cin: 3,
+            cout: 32,
+            kernel: [3, 3],
+            stride: 1,
+            padding: [0, 0],
+            precision: OraclePrecision::Int8,
+            pattern: OraclePattern::OneHotNeutral80 {
+                phase: 2,
+                signed_input: false,
+            },
+        };
+        let fixture = build_fixture(case).expect("build neutral80 fixture");
+        assert_eq!(
+            fixture.weights.iter().filter(|&&byte| byte == 0).count(),
+            case.cout as usize,
+        );
+        assert!(fixture.weights.iter().all(|&byte| matches!(byte, 0 | 0x80)));
+    }
+
+    #[test]
+    fn offset_selector_fixtures_xor_weights_and_padding() {
+        for pattern in [
+            OraclePattern::SelectorsSigned128 { phase: 2 },
+            OraclePattern::SelectorsOffsetUnit { phase: 2 },
+        ] {
+            let case = Conv2dCase {
+                width: 9,
+                height: 7,
+                cin: 3,
+                cout: 32,
+                kernel: [3, 3],
+                stride: 1,
+                padding: [0, 0],
+                precision: OraclePrecision::Int8,
+                pattern,
+            };
+            let fixture = build_fixture(case).expect("build offset selector fixture");
+            for (byte, expected_count) in [(0x81, 32), (0x7f, 32), (0x82, 32)] {
+                assert_eq!(
+                    fixture
+                        .weights
+                        .iter()
+                        .filter(|&&candidate| candidate == byte)
+                        .count(),
+                    expected_count,
+                    "{pattern:?} encoded byte 0x{byte:02x}",
+                );
+            }
+            assert!(
+                fixture
+                    .weights
+                    .iter()
+                    .all(|&byte| matches!(byte, 0x80 | 0x81 | 0x7f | 0x82)),
+                "{pattern:?}",
+            );
+        }
+    }
+
+    #[test]
+    fn direct128_selector_fixture_keeps_signed_weights_and_zero_padding() {
+        let case = Conv2dCase {
+            width: 9,
+            height: 7,
+            cin: 3,
+            cout: 32,
+            kernel: [3, 3],
+            stride: 1,
+            padding: [0, 0],
+            precision: OraclePrecision::Int8,
+            pattern: OraclePattern::SelectorsDirect128 { phase: 2 },
+        };
+        let fixture = build_fixture(case).expect("build direct128 selector fixture");
+        for (byte, expected_count) in [(0x01, 32), (0xff, 32), (0x02, 32)] {
+            assert_eq!(
+                fixture
+                    .weights
+                    .iter()
+                    .filter(|&&candidate| candidate == byte)
+                    .count(),
+                expected_count,
+                "direct signed byte 0x{byte:02x}",
+            );
+        }
+        assert!(
+            fixture
+                .weights
+                .iter()
+                .all(|&byte| matches!(byte, 0x00 | 0x01 | 0x02 | 0xff)),
+        );
+        match fixture.shape.precision {
+            Precision::Int8(quantization) => {
+                assert_eq!(quantization.output_zero_point, -128);
+                assert_eq!(quantization.multiplier, Multiplier::for_unit_bs(128.0));
+            }
+            Precision::Fp16 => panic!("direct128 selector unexpectedly built fp16 shape"),
+        }
+    }
+
+    #[test]
+    fn raw_byte_sweep_oracle_and_fixture_cover_all_256_values() {
+        for pattern in [OraclePattern::RawByteSweep, OraclePattern::RawByteSweepUnit] {
+            let case = Conv2dCase {
+                width: 1,
+                height: 1,
+                cin: 1,
+                cout: 256,
+                kernel: [1, 1],
+                stride: 1,
+                padding: [0, 0],
+                precision: OraclePrecision::Int8,
+                pattern,
+            };
+            let (input, weights, bias) = logical_fixture(case);
+            let dense = dense_reference(case, &input, &weights, &bias);
+            let expected = (0u16..=255)
+                .map(|raw| raw as u8 as i8 as i32)
+                .collect::<Vec<_>>();
+            assert_eq!(dense, expected);
+
+            let fixture = build_fixture(case).expect("build raw-byte sweep fixture");
+            assert_eq!(
+                fixture.weights.len(),
+                case.shape().weight_bytes(case.kernel) as usize
+            );
+            assert!(fixture.weights.iter().filter(|&&byte| byte == 0x80).count() > 256);
         }
     }
 

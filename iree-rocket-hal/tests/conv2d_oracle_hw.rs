@@ -90,6 +90,11 @@ struct CaseSuccess {
     tiles: usize,
 }
 
+struct CaseExecution {
+    plan: ConvPlan,
+    output: Vec<u8>,
+}
+
 fn tile_for_output(plan: &ConvPlan, y: usize, x: usize) -> Option<usize> {
     plan.tiles().iter().position(|tile| {
         (tile.rows.out_first as usize..(tile.rows.out_first + tile.rows.out_rows) as usize)
@@ -147,7 +152,10 @@ fn compare_output(fixture: &Conv2dFixture, plan: &ConvPlan, output: &[u8]) -> Mi
     report
 }
 
-fn execute_case(file: &std::fs::File, fixture: &Conv2dFixture) -> Result<CaseSuccess, String> {
+fn execute_case_output(
+    file: &std::fs::File,
+    fixture: &Conv2dFixture,
+) -> Result<CaseExecution, String> {
     let fd = file.as_raw_fd();
     let shape = fixture.shape;
     let kernels = fixture.case.kernel;
@@ -223,24 +231,28 @@ fn execute_case(file: &std::fs::File, fixture: &Conv2dFixture) -> Result<CaseSuc
         prep_bo(fd, output.buffer.handle, PER_CASE_TIMEOUT_NS)
             .map_err(|error| format!("completion wait: {error}"))?;
 
-        let output_bytes = std::slice::from_raw_parts(output.buffer.host_ptr, output_len);
-        let report = compare_output(fixture, &plan, output_bytes);
-        if report.mismatches != 0 {
-            return Err(format!(
-                "{} mismatches, max|diff|={}, tile_mismatches={:?}\n      {}",
-                report.mismatches,
-                report.max_abs_difference,
-                report.tile_mismatches,
-                report.samples.join("\n      "),
-            ));
-        }
-
-        Ok(CaseSuccess {
-            data_banks: plan.data_banks(),
-            weight_banks: plan.weight_banks(),
-            tiles: plan.tiles().len(),
-        })
+        let output = std::slice::from_raw_parts(output.buffer.host_ptr, output_len).to_vec();
+        Ok(CaseExecution { plan, output })
     }
+}
+
+fn execute_case(file: &std::fs::File, fixture: &Conv2dFixture) -> Result<CaseSuccess, String> {
+    let execution = execute_case_output(file, fixture)?;
+    let report = compare_output(fixture, &execution.plan, &execution.output);
+    if report.mismatches != 0 {
+        return Err(format!(
+            "{} mismatches, max|diff|={}, tile_mismatches={:?}\n      {}",
+            report.mismatches,
+            report.max_abs_difference,
+            report.tile_mismatches,
+            report.samples.join("\n      "),
+        ));
+    }
+    Ok(CaseSuccess {
+        data_banks: execution.plan.data_banks(),
+        weight_banks: execution.plan.weight_banks(),
+        tiles: execution.plan.tiles().len(),
+    })
 }
 
 fn cartesian_cases() -> Vec<Conv2dCase> {
@@ -284,7 +296,11 @@ fn cartesian_cases() -> Vec<Conv2dCase> {
                     stride: 1,
                     padding: [1, 1],
                     precision,
-                    pattern: OraclePattern::Selectors { phase: 0 },
+                    pattern: if precision == OraclePrecision::Int8 {
+                        OraclePattern::SelectorsAffine { phase: 0 }
+                    } else {
+                        OraclePattern::Selectors { phase: 0 }
+                    },
                 });
             }
         }
@@ -305,10 +321,16 @@ fn cartesian_cases() -> Vec<Conv2dCase> {
     ];
     for precision in [OraclePrecision::Fp16, OraclePrecision::Int8] {
         for (extent, cin, cout) in vgg {
-            for pattern in [
-                OraclePattern::Counting,
-                OraclePattern::Selectors { phase: 1 },
-            ] {
+            for selector_case in [false, true] {
+                let pattern = if selector_case {
+                    if precision == OraclePrecision::Int8 {
+                        OraclePattern::SelectorsAffine { phase: 1 }
+                    } else {
+                        OraclePattern::Selectors { phase: 1 }
+                    }
+                } else {
+                    OraclePattern::Counting
+                };
                 cases.push(Conv2dCase {
                     width: extent,
                     height: extent,
@@ -324,6 +346,99 @@ fn cartesian_cases() -> Vec<Conv2dCase> {
         }
     }
     cases
+}
+
+fn int8_one_hot_four_way_cases(neutral80: bool) -> Vec<Conv2dCase> {
+    let mut cases = Vec::with_capacity(4);
+    for signed_input in [false, true] {
+        for kernel in [1usize, 3] {
+            cases.push(Conv2dCase {
+                width: 9,
+                height: 7,
+                cin: 3,
+                cout: 32,
+                kernel: [kernel, kernel],
+                stride: 1,
+                // No padding keeps every selected K3 tap in-bounds, making
+                // a tap-order failure distinct from padding semantics.
+                padding: [0, 0],
+                precision: OraclePrecision::Int8,
+                pattern: if neutral80 {
+                    OraclePattern::OneHotNeutral80 {
+                        phase: 2,
+                        signed_input,
+                    }
+                } else {
+                    OraclePattern::OneHot {
+                        phase: 2,
+                        signed_input,
+                    }
+                },
+            });
+        }
+    }
+    cases
+}
+
+fn int8_selector_cases(pattern: fn(usize) -> OraclePattern) -> Vec<Conv2dCase> {
+    let mut cases = Vec::with_capacity(24);
+    for cin in [3u32, 5, 128, 256, 512] {
+        for cout in [64u32, 256, 512] {
+            cases.push(Conv2dCase {
+                width: 28,
+                height: 28,
+                cin,
+                cout,
+                kernel: [3, 3],
+                stride: 1,
+                padding: [1, 1],
+                precision: OraclePrecision::Int8,
+                pattern: pattern(0),
+            });
+        }
+    }
+    for (extent, cin, cout) in [
+        (226, 3, 64),
+        (226, 64, 64),
+        (114, 64, 128),
+        (114, 128, 128),
+        (58, 128, 256),
+        (58, 256, 256),
+        (30, 256, 512),
+        (30, 512, 512),
+        (16, 512, 512),
+    ] {
+        cases.push(Conv2dCase {
+            width: extent,
+            height: extent,
+            cin,
+            cout,
+            kernel: [3, 3],
+            stride: 1,
+            padding: [0, 0],
+            precision: OraclePrecision::Int8,
+            pattern: pattern(1),
+        });
+    }
+    cases
+}
+
+fn int8_raw_coefficient_byte_sweep_case(unit_gain: bool) -> Conv2dCase {
+    Conv2dCase {
+        width: 1,
+        height: 1,
+        cin: 1,
+        cout: 256,
+        kernel: [1, 1],
+        stride: 1,
+        padding: [0, 0],
+        precision: OraclePrecision::Int8,
+        pattern: if unit_gain {
+            OraclePattern::RawByteSweepUnit
+        } else {
+            OraclePattern::RawByteSweep
+        },
+    }
 }
 
 fn panic_message(payload: Box<dyn Any + Send>) -> String {
@@ -358,6 +473,13 @@ fn cartesian_matrix_is_planable_and_gap_free() {
                 tile.rows.in_rows,
                 tile_row_capacity,
             );
+            assert!(
+                shape.dense_feature_offset_safe(tile.rows.in_first),
+                "{}: tile at in_first={} has input byte offset {} mod 16",
+                case.label(),
+                tile.rows.in_first,
+                tile.rows.in_first * shape.input_row_stride() % 16,
+            );
             for y in
                 tile.rows.out_first as usize..(tile.rows.out_first + tile.rows.out_rows) as usize
             {
@@ -374,6 +496,241 @@ fn cartesian_matrix_is_planable_and_gap_free() {
             case.label(),
         );
     }
+}
+
+fn run_hardware_case_matrix(title: &str, cases: Vec<Conv2dCase>) {
+    let total_cases = cases.len();
+    let file = OpenOptions::new()
+        .read(true)
+        .write(true)
+        .open(DEVICE_PATH)
+        .expect("failed to open RK3588 NPU device");
+    let mut failures = Vec::new();
+
+    println!("\n=== {title} ===");
+    for (index, case) in cases.into_iter().enumerate() {
+        let label = case.label();
+        let result = catch_unwind(AssertUnwindSafe(|| {
+            let fixture = build_fixture(case)?;
+            execute_case(&file, &fixture)
+        }));
+        match result {
+            Ok(Ok(success)) => println!(
+                "[{}/{}] ok   {label} banks={}/{} tiles={}",
+                index + 1,
+                total_cases,
+                success.data_banks,
+                success.weight_banks,
+                success.tiles,
+            ),
+            Ok(Err(error)) => {
+                println!(
+                    "[{}/{}] FAIL {label}\n      {error}",
+                    index + 1,
+                    total_cases,
+                );
+                failures.push(format!("{label}: {error}"));
+            }
+            Err(payload) => {
+                let error = panic_message(payload);
+                println!(
+                    "[{}/{}] PANIC {label}\n      {error}",
+                    index + 1,
+                    total_cases,
+                );
+                failures.push(format!("{label}: panic: {error}"));
+            }
+        }
+    }
+
+    println!("\n=== {title} summary ===");
+    println!("  passed: {}", total_cases - failures.len());
+    println!("  failed: {}", failures.len());
+    for (index, failure) in failures.iter().enumerate() {
+        println!("    {}. {failure}", index + 1);
+    }
+    assert!(
+        failures.is_empty(),
+        "{} of {} cases failed in {title}; complete diagnostics are above",
+        failures.len(),
+        total_cases,
+    );
+}
+
+#[test]
+#[ignore = "needs /dev/accel/accel0 -- validates production affine int8 weights and BS constants"]
+fn int8_affine_selector_matrix_runs_every_case_before_failing() {
+    let cases = int8_selector_cases(|phase| OraclePattern::SelectorsAffine { phase });
+    assert_eq!(cases.len(), 24);
+    println!("  raw weight: logical coefficient + per-output zero point");
+    println!("  physical Cin padding: per-output zero point");
+    println!("  BS constant: -per-output zero point; BS multiplier: 0x4000");
+    run_hardware_case_matrix("int8 affine selector matrix", cases);
+}
+
+#[test]
+#[ignore = "needs /dev/accel/accel0 -- diagnoses int8 channel/tap packing and signed input"]
+fn int8_one_hot_four_way_diagnostic_runs_every_case_before_failing() {
+    println!("  K1 positive fail          => channel/lane or coefficient-zero encoding");
+    println!("  K1 pass, K3 positive fail => kernel-tap packing");
+    println!("  positive pass, signed fail => signed int8 input interpretation");
+    run_hardware_case_matrix(
+        "int8 ordinary-zero one-hot four-way diagnostic",
+        int8_one_hot_four_way_cases(false),
+    );
+}
+
+#[test]
+#[ignore = "needs /dev/accel/accel0 -- confirms 0x80 neutral int8 coefficient bytes"]
+fn int8_neutral80_one_hot_four_way_confirmation_runs_every_case_before_failing() {
+    println!("  packed background/padding byte: 0x80");
+    println!("  packed live logical +1 byte:    0x00");
+    run_hardware_case_matrix(
+        "int8 neutral80 one-hot four-way confirmation",
+        int8_one_hot_four_way_cases(true),
+    );
+}
+
+#[test]
+#[ignore = "needs /dev/accel/accel0 -- validates inferred signed dense-int8 weight ABI"]
+fn int8_signed128_selector_matrix_runs_every_case_before_failing() {
+    let cases = int8_selector_cases(|phase| OraclePattern::SelectorsSigned128 { phase });
+    assert_eq!(cases.len(), 24);
+    println!("  logical q -> packed raw byte: q ^ 0x80");
+    println!("  packed zero/padding byte:      0x80");
+    println!("  coefficient gain correction:  128");
+    run_hardware_case_matrix("int8 signed128 selector matrix", cases);
+}
+
+#[test]
+#[ignore = "needs /dev/accel/accel0 -- tests XOR-0x80 weights at ordinary unit gain"]
+fn int8_offset_unit_selector_matrix_runs_every_case_before_failing() {
+    let cases = int8_selector_cases(|phase| OraclePattern::SelectorsOffsetUnit { phase });
+    assert_eq!(cases.len(), 24);
+    println!("  logical q -> packed raw byte: q ^ 0x80");
+    println!("  packed zero/padding byte:      0x80");
+    println!("  coefficient gain correction:  none (ordinary unit conversion)");
+    run_hardware_case_matrix("int8 offset-unit selector matrix", cases);
+}
+
+#[test]
+#[ignore = "needs /dev/accel/accel0 -- validates direct signed weights with measured BS correction"]
+fn int8_direct128_selector_matrix_runs_every_case_before_failing() {
+    let cases = int8_selector_cases(|phase| OraclePattern::SelectorsDirect128 { phase });
+    assert_eq!(cases.len(), 24);
+    println!("  logical q -> packed raw byte: direct signed two's-complement");
+    println!("  packed zero/padding byte:      0x00");
+    println!("  coefficient gain correction:  128");
+    println!("  BS baseline correction:        output zero point -128");
+    run_hardware_case_matrix("int8 direct128 selector matrix", cases);
+}
+
+fn run_raw_coefficient_byte_sweep(unit_gain: bool, title: &str, conversion: &str) -> Vec<i8> {
+    let case = int8_raw_coefficient_byte_sweep_case(unit_gain);
+    let fixture = build_fixture(case).expect("build 256-byte coefficient sweep");
+    let file = OpenOptions::new()
+        .read(true)
+        .write(true)
+        .open(DEVICE_PATH)
+        .expect("failed to open RK3588 NPU device");
+    let execution = execute_case_output(&file, &fixture).expect("execute coefficient-byte sweep");
+    let observed = (0usize..256)
+        .map(|channel| {
+            let offset = output_offset(fixture.shape, case.kernel, channel, 0, 0);
+            execution.output[offset] as i8
+        })
+        .collect::<Vec<_>>();
+
+    println!("\n=== {title} ===");
+    println!("  input: 1, K1/Cin1, output channel c gets raw coefficient byte c");
+    println!("  padding: 0x80, output conversion: {conversion}");
+    println!(
+        "  banks={}/{} tiles={}",
+        execution.plan.data_banks(),
+        execution.plan.weight_banks(),
+        execution.plan.tiles().len(),
+    );
+    for base in (0usize..256).step_by(16) {
+        let values = observed[base..base + 16]
+            .iter()
+            .map(|value| format!("{value:>4}"))
+            .collect::<Vec<_>>()
+            .join(" ");
+        println!("  raw 0x{base:02x}..0x{:02x}: {values}", base + 15);
+    }
+    observed
+}
+
+#[test]
+#[ignore = "needs /dev/accel/accel0 -- maps every dense int8 coefficient byte"]
+fn int8_dense_coefficient_raw_byte_sweep() {
+    let observed = run_raw_coefficient_byte_sweep(
+        false,
+        "dense int8 coefficient raw-byte sweep",
+        "gain 128, zero point -128",
+    );
+    println!("  hypothesis: output(raw) = raw interpreted as signed i8");
+
+    let differences = observed
+        .iter()
+        .enumerate()
+        .map(|(raw, &got)| i32::from(got) - i32::from(raw as u8 as i8))
+        .collect::<Vec<_>>();
+    let exact = differences
+        .iter()
+        .filter(|&&difference| difference == 0)
+        .count();
+    let within_one = differences
+        .iter()
+        .filter(|&&difference| difference.abs() <= 1)
+        .count();
+    let max_difference = differences
+        .iter()
+        .map(|difference| difference.abs())
+        .max()
+        .unwrap_or(0);
+    println!("  exact: {exact}/256");
+    println!("  within one LSB: {within_one}/256");
+    println!("  max |difference|: {max_difference}");
+    for (raw, (&got, &difference)) in observed.iter().zip(&differences).enumerate() {
+        if difference.abs() > 1 {
+            println!(
+                "    raw=0x{raw:02x} signed={} expected={} got={got} difference={difference}",
+                raw as u8 as i8, raw as u8 as i8,
+            );
+        }
+    }
+
+    assert_eq!(
+        within_one, 256,
+        "coefficient-byte mapping differed from signed-byte hypothesis by more than one LSB; \
+         complete map is printed above",
+    );
+}
+
+#[test]
+#[ignore = "needs /dev/accel/accel0 -- maps dense int8 coefficient bytes at unit gain"]
+fn int8_dense_coefficient_raw_byte_unit_gain_sweep() {
+    let observed = run_raw_coefficient_byte_sweep(
+        true,
+        "dense int8 coefficient raw-byte unit-gain sweep",
+        "ordinary unit gain, zero point 0",
+    );
+    let distinct = observed
+        .iter()
+        .copied()
+        .collect::<std::collections::BTreeSet<_>>();
+    println!("  distinct outputs ({}): {distinct:?}", distinct.len());
+    for raw in [0x00usize, 0x01, 0x7f, 0x80, 0x81, 0xff] {
+        println!(
+            "  landmark raw=0x{raw:02x} signed={:>4} -> output={:>4}",
+            raw as u8 as i8, observed[raw],
+        );
+    }
+    assert_eq!(
+        observed[0x80], 0,
+        "raw 0x80 stopped being neutral at ordinary unit gain; complete map is above",
+    );
 }
 
 #[test]

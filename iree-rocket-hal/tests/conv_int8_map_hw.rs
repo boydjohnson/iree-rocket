@@ -133,6 +133,7 @@ fn map_with(
             BsEntry {
                 bias: 0,
                 multiplier: bs_multiplier,
+                ..BsEntry::default()
             };
             shape.padded_out_channels() as usize
         ];

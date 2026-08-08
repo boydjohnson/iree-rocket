@@ -1040,7 +1040,7 @@ impl Shape {
     }
 
     /// Whether a dense-layout tile whose feature fetch starts at input row
-    /// `in_first` is safe for general, non-uniform fp16 tensor data.
+    /// `in_first` is safe for general, non-uniform tensor data.
     ///
     /// Measured on real RK3588 hardware, not derived from documentation
     /// (`iree-rocket-design-spike`'s `conv_dense_shared_buffer_dispatch_hw.rs`,
@@ -1065,18 +1065,20 @@ impl Shape {
     /// wrong across their complete output ranges, deterministically in all
     /// three repetitions. A subsequent data-rich hardware sweep tested every
     /// even byte offset: all 14 offset-0 cases passed, while every case at
-    /// offsets 2, 4, 6, 8, 10, 12, and 14 failed. Fp16 dense tiles therefore
-    /// require a fully 16-byte-aligned feature base.
+    /// offsets 2, 4, 6, 8, 10, 12, and 14 failed. The affine-int8 Cartesian
+    /// oracle subsequently exposed the same defect at offset 2 for VGG-19's
+    /// lowered 226x226/Cin=3 shape: tile 0 passed exactly and corruption began
+    /// at tile 1's first output row. Dense tiles therefore require a fully
+    /// 16-byte-aligned feature base at both precisions.
     ///
     /// Always `true` outside dense layout: surfaces (`Cin > 4`) use a
     /// different addressing path this defect has not been shown to reach.
-    /// Int8 is returned as `true` here only because its tiling deliberately
-    /// bypasses this fp16 rule: the vendor int8 path uses a padded physical
-    /// row pitch that the host `Shape` cannot yet express. This is not a
-    /// claim that arbitrary int8 dense offsets have been validated; see
-    /// the "Open: int8" note on [`realign_dense_row_tiles`].
+    /// RKNN's dense int8 tensors use a padded physical row pitch, making its
+    /// captured boundaries aligned. The host ABI is compact NHWC, so it must
+    /// instead move boundaries according to the compact stride here until
+    /// [`Shape`] can represent an explicit physical input pitch.
     pub fn dense_feature_offset_safe(&self, in_first: u32) -> bool {
-        if self.layout() != FeatureLayout::Dense || matches!(self.precision, Precision::Int8(_)) {
+        if self.layout() != FeatureLayout::Dense {
             return true;
         }
         let offset = (in_first * self.input_row_stride()) % FEATURE_ATOM_BYTES;
@@ -2137,21 +2139,18 @@ fn plan_grid(
 /// a known-unsafe tile, matching this file's existing policy for the
 /// `weight_banks < 3` and `Cin <= 4` bugs above it.
 ///
-/// Int8 is deliberately excluded. The rule is hardware-measured only at
-/// fp16, while the vendor int8 corpus pads dense rows to a precision-sized
-/// spatial atom (226 -> 240) and uses the unshifted greedy boundaries. Until
-/// the host layout grows an explicit physical row pitch, applying the fp16
-/// compact-row rule to int8 invents a fourth tile the vendor does not need.
+/// RKNN's int8 corpus pads dense rows to a precision-sized spatial atom
+/// (226 -> 240), but the host ABI is compact NHWC. The data-rich int8 oracle
+/// confirmed that a compact row at a nonzero offset corrupts exactly like
+/// fp16, so int8 is intentionally realigned here as well. This can differ
+/// from a vendor boundary that is safe only under RKNN's padded row pitch.
 fn realign_dense_row_tiles(
     shape: Shape,
     kernels: Kernels,
     tiles: &[Tile],
     max_rows: u32,
 ) -> Option<Vec<Tile>> {
-    if shape.layout() != FeatureLayout::Dense
-        || matches!(shape.precision, Precision::Int8(_))
-        || tiles.len() <= 1
-    {
+    if shape.layout() != FeatureLayout::Dense || tiles.len() <= 1 {
         return Some(tiles.to_vec());
     }
 
@@ -2274,6 +2273,10 @@ pub const BS_MULTIPLIER_SHIFT: u32 = 7;
 pub struct BsEntry {
     /// `round(bias / (input_scale * weight_scale[c]))`.
     pub bias: i32,
+    /// Addend applied to each raw coefficient for this output channel.
+    /// Quantized affine weights use `-weight_zero_point[c]` so the hardware
+    /// dot product sees `raw_weight - weight_zero_point[c]`.
+    pub constant: i16,
     /// `round(BS_UNIT_MULTIPLIER * weight_scale[c] / max(weight_scale))`.
     pub multiplier: i16,
 }
@@ -2285,6 +2288,7 @@ impl Default for BsEntry {
     fn default() -> BsEntry {
         BsEntry {
             bias: 0,
+            constant: BS_CONSTANT,
             multiplier: BS_UNIT_MULTIPLIER,
         }
     }
@@ -2326,7 +2330,7 @@ pub fn write_bs_buffer(buffer: &mut [u8], entries: &[BsEntry]) {
         let bias = base + lane * 4;
         buffer[bias..bias + 4].copy_from_slice(&entry.bias.to_le_bytes());
         let constant = base + 32 + lane * 2;
-        buffer[constant..constant + 2].copy_from_slice(&BS_CONSTANT.to_le_bytes());
+        buffer[constant..constant + 2].copy_from_slice(&entry.constant.to_le_bytes());
         let multiplier = base + 48 + lane * 2;
         buffer[multiplier..multiplier + 2].copy_from_slice(&entry.multiplier.to_le_bytes());
     }
@@ -4660,7 +4664,7 @@ mod tests {
     }
 
     #[test]
-    fn dense_feature_offset_safe_requires_full_fp16_alignment() {
+    fn dense_feature_offset_safe_requires_full_alignment() {
         // The older width/channel sweeps used uniform values and therefore
         // could only observe whole-pixel leading-column loss. The exact
         // features.0 regression uses non-uniform data and shows offset 4 is
@@ -4702,6 +4706,18 @@ mod tests {
         let small_cout = Shape::with_out_channels(227, 60, 1, 3, 8).with_padding([0, 0]);
         assert!(small_cout.dense_feature_offset_safe(0));
         assert!(!small_cout.dense_feature_offset_safe(2));
+
+        // The affine-int8 oracle measured the same failure at offset 2 for
+        // this compact VGG input pitch: 226 * 3 = 678 bytes, or 6 mod 16.
+        let int8 = Shape::with_precision(226, 226, 1, 3, 64, captured_int8()).with_padding([0, 0]);
+        assert_eq!(int8.input_row_stride(), 678);
+        for in_first in 0..16 {
+            assert_eq!(
+                int8.dense_feature_offset_safe(in_first),
+                in_first % 8 == 0,
+                "int8 Cin=3 in_first={in_first}",
+            );
+        }
 
         // Surfaces (Cin > 4) are a different addressing path this defect
         // has not been shown to reach; always reported safe.
@@ -4750,6 +4766,30 @@ mod tests {
         assert_eq!(plan.tiles()[5].rows.out_first, 210);
         assert_eq!(plan.tiles()[5].rows.in_first, 210);
         assert_eq!(plan.tiles()[5].rows.out_rows, 16);
+    }
+
+    #[test]
+    fn conv_plan_aligns_the_compact_int8_vgg_boundary() {
+        let kernels = [3, 3];
+        let shape = Shape::with_precision(226, 226, 1, 3, 64, captured_int8()).with_padding([0, 0]);
+        let plan = ConvPlan::new(shape, kernels);
+
+        assert_eq!((plan.data_banks(), plan.weight_banks()), (11, 1));
+        assert_eq!(plan.tiles().len(), 3);
+        assert_eq!(plan.tiles()[0].rows.in_first, 0);
+        assert_ne!(plan.tiles()[1].rows.in_first, 91);
+        let mut covered = 0;
+        for tile in plan.tiles() {
+            assert_eq!(tile.rows.out_first, covered);
+            covered += tile.rows.out_rows;
+            assert!(
+                shape.dense_feature_offset_safe(tile.rows.in_first),
+                "unsafe int8 tile at in_first={} offset={}",
+                tile.rows.in_first,
+                tile.rows.input_offset(shape) % FEATURE_ATOM_BYTES,
+            );
+        }
+        assert_eq!(covered, shape.output_height(kernels));
     }
 
     #[test]
@@ -5054,6 +5094,7 @@ mod tests {
         let entries: Vec<BsEntry> = (0..16)
             .map(|c| BsEntry {
                 bias: 162675,
+                constant: BS_CONSTANT,
                 multiplier: 1024 * (c + 1),
             })
             .collect();
@@ -5082,18 +5123,22 @@ mod tests {
             &[
                 BsEntry {
                     bias: 162675,
+                    constant: BS_CONSTANT,
                     multiplier: 4096,
                 },
                 BsEntry {
                     bias: 162675,
+                    constant: BS_CONSTANT,
                     multiplier: 8192,
                 },
                 BsEntry {
                     bias: 162675,
+                    constant: BS_CONSTANT,
                     multiplier: 12288,
                 },
                 BsEntry {
                     bias: 162675,
+                    constant: BS_CONSTANT,
                     multiplier: 16384,
                 },
             ],

@@ -168,6 +168,62 @@ pub fn pack_hwcf_to_rocket_weights(
     element_size: usize,
     packed: &mut [u8],
 ) -> Result<usize, &'static str> {
+    pack_hwcf_to_rocket_weights_impl(
+        dense,
+        filter_height,
+        filter_width,
+        input_channels,
+        output_channels,
+        element_size,
+        None,
+        packed,
+    )
+}
+
+/// Packs a quantized int8 HWCF filter and fills physical input-channel
+/// padding with each output channel's weight zero point.
+///
+/// The live bytes in `dense` are raw quantized coefficients and are copied
+/// unchanged. A padded input lane participates in the hardware dot product,
+/// so its neutral value is `weight_zero_points[output_channel]`, not
+/// necessarily zero. The matching BS constant is `-weight_zero_point`; see
+/// [`crate::rocket::conv::BsEntry::constant`]. A programmed odd-Cout padding
+/// kernel remains all zero because it has no quantization parameters and is
+/// never exposed as a logical output channel.
+pub fn pack_hwcf_to_rocket_weights_affine_i8(
+    dense: &[u8],
+    filter_height: usize,
+    filter_width: usize,
+    input_channels: usize,
+    output_channels: usize,
+    weight_zero_points: &[i8],
+    packed: &mut [u8],
+) -> Result<usize, &'static str> {
+    if weight_zero_points.len() != output_channels {
+        return Err("int8 weight zero-point count does not match output channels");
+    }
+    pack_hwcf_to_rocket_weights_impl(
+        dense,
+        filter_height,
+        filter_width,
+        input_channels,
+        output_channels,
+        1,
+        Some(weight_zero_points),
+        packed,
+    )
+}
+
+fn pack_hwcf_to_rocket_weights_impl(
+    dense: &[u8],
+    filter_height: usize,
+    filter_width: usize,
+    input_channels: usize,
+    output_channels: usize,
+    element_size: usize,
+    weight_zero_points: Option<&[i8]>,
+    packed: &mut [u8],
+) -> Result<usize, &'static str> {
     let dense_len = filter_height
         .checked_mul(filter_width)
         .and_then(|value| value.checked_mul(input_channels))
@@ -223,15 +279,20 @@ pub fn pack_hwcf_to_rocket_weights(
                             if input_channel >= padded_input_channels {
                                 continue;
                             }
-                            if input_channel < input_channels && output_channel < output_channels {
-                                let src_element = (((filter_y * filter_width + filter_x)
-                                    * input_channels
-                                    + input_channel)
-                                    * output_channels)
-                                    + output_channel;
-                                let src_offset = src_element * element_size;
-                                packed[dst_offset..dst_offset + element_size]
-                                    .copy_from_slice(&dense[src_offset..src_offset + element_size]);
+                            if output_channel < output_channels {
+                                if input_channel < input_channels {
+                                    let src_element = (((filter_y * filter_width + filter_x)
+                                        * input_channels
+                                        + input_channel)
+                                        * output_channels)
+                                        + output_channel;
+                                    let src_offset = src_element * element_size;
+                                    packed[dst_offset..dst_offset + element_size].copy_from_slice(
+                                        &dense[src_offset..src_offset + element_size],
+                                    );
+                                } else if let Some(zero_points) = weight_zero_points {
+                                    packed[dst_offset] = zero_points[output_channel] as u8;
+                                }
                             }
                             dst_offset += element_size;
                         }
@@ -531,6 +592,35 @@ mod tests {
     fn int8_weight_storage_keeps_its_distinct_padding_rules() {
         assert_eq!(rocket_weight_storage_size(1, 1, 3, 3, 1), Ok(64));
         assert_eq!(rocket_weight_storage_size(1, 1, 17, 3, 1), Ok(128));
+    }
+
+    #[test]
+    fn packs_affine_int8_weights_with_per_output_neutral_padding() {
+        // Controlled vendor-style Cin=2/Cout=2 coefficients. Logical rows
+        // are [-1,+1] and [+0.5,-0.5] after their per-output affine decode;
+        // this test pins only the byte-level HWCF transform.
+        let dense = [0x80, 0x7f, 0x7f, 0x80];
+        let zero_points = [42i8, -43];
+        let mut packed = vec![0; rocket_weight_storage_size(1, 1, 2, 2, 1).unwrap()];
+
+        let written =
+            pack_hwcf_to_rocket_weights_affine_i8(&dense, 1, 1, 2, 2, &zero_points, &mut packed)
+                .unwrap();
+
+        assert_eq!(written, 32);
+        assert_eq!(&packed[0..2], &[0x80, 0x7f]);
+        assert!(packed[2..16].iter().all(|&byte| byte == 42));
+        assert_eq!(&packed[16..18], &[0x7f, 0x80]);
+        assert!(packed[18..32].iter().all(|&byte| byte == (-43i8) as u8));
+    }
+
+    #[test]
+    fn affine_int8_packer_rejects_wrong_zero_point_count() {
+        let mut packed = vec![0; 32];
+        assert_eq!(
+            pack_hwcf_to_rocket_weights_affine_i8(&[0; 4], 1, 1, 2, 2, &[0], &mut packed),
+            Err("int8 weight zero-point count does not match output channels")
+        );
     }
 
     /// The exact slot mapping the hardware probe reported at Cin 8, 3x3:

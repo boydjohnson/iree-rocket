@@ -195,6 +195,7 @@ fn int8_bias_with_multiplier(shape: Shape, multiplier: i16) -> Vec<u8> {
             BsEntry {
                 bias: 0,
                 multiplier,
+                ..BsEntry::default()
             };
             channels as usize
         ],
