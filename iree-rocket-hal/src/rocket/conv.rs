@@ -259,6 +259,25 @@ fn weight_banks_floor(weight_channels: u32) -> u32 {
     }
 }
 
+/// Vendor-preferred coefficient grant for one streamed output group.
+///
+/// The expanded 28x28/K3 channel grid isolates this from spatial demand:
+/// once the total coefficient tensor is too large to reside, both fp16 and
+/// int8 reserve one 64-byte coefficient group per `(kernel tap, Cin)`.
+/// Dividing that working set by a 32-KiB CBUF bank predicts every observed
+/// high-channel split without depending on `Cout`:
+///
+/// `Cin=192,256,320,384,448,512 -> weight banks=4,5,6,7,8,9`.
+///
+/// This is a preferred allocation, not a new hardware-safety minimum; the
+/// independently measured [`weight_banks_floor`] remains in force below it.
+fn streamed_weight_bank_preference(weight_channels: u32, kernels: Kernels) -> u32 {
+    const STREAMED_BYTES_PER_INPUT_TAP: u32 = 64;
+    (kernels[0] as u32 * kernels[1] as u32 * weight_channels * STREAMED_BYTES_PER_INPUT_TAP)
+        .div_ceil(CBUF_BANK_BYTES)
+        .max(1)
+}
+
 /// Largest `CNA_CBUF_CON1.data_entries` value the expanded corpus shows the
 /// hardware field can encode.
 ///
@@ -1153,6 +1172,17 @@ impl Shape {
         };
         let data_banks = granted.clamp(1, CBUF_BANKS - 1);
         let weight_banks = CBUF_BANKS - data_banks;
+        let streamed_preference =
+            streamed_weight_bank_preference(self.weight_channels(), kernels).min(CBUF_BANKS - 1);
+
+        // Total coefficient size can otherwise consume eleven banks and
+        // leave only one for feature data, even though CNA streams weights
+        // in the bounded working set above. Once data has actually been
+        // starved to that single-bank minimum, cap coefficients at the
+        // streamed grant and return the unused banks to data.
+        if data_banks == 1 && weight_banks > streamed_preference && weights > streamed_preference {
+            return (CBUF_BANKS - streamed_preference, streamed_preference);
+        }
 
         // A coefficient footprint that would take weight_banks_floor's banks
         // or fewer on its own (`weights <= weight_banks`) is not being
@@ -1163,7 +1193,7 @@ impl Shape {
         // and let feature data give up the difference, trading tile count
         // for correctness. `weights` is already known unbounded here, so
         // the floor itself, not `weights`, is always what gets granted.
-        let floor = weight_banks_floor(self.weight_channels());
+        let floor = weight_banks_floor(self.weight_channels()).max(streamed_preference);
         if weight_banks < floor && weights > weight_banks {
             let weight_banks = floor.min(CBUF_BANKS - 1);
             return (CBUF_BANKS - weight_banks, weight_banks);
@@ -1472,13 +1502,31 @@ impl Tile {
         max_input_rows: u32,
     ) -> Option<Vec<Tile>> {
         let output_height = shape.output_height(kernels);
+        let whole = Tile::from_bounds(shape, kernels, 0, output_height);
+        if whole.in_rows <= max_input_rows {
+            return Some(vec![whole]);
+        }
+
+        let kernel = shape.kernel_programming(kernels);
         let mut tiles = Vec::new();
         let mut out_first = 0;
         while out_first < output_height {
             let remaining = output_height - out_first;
             let tile = (1..=remaining).rev().find_map(|out_rows| {
                 let tile = Tile::from_bounds(shape, kernels, out_first, out_rows);
-                (tile.in_rows <= max_input_rows).then_some(tile)
+
+                // Once a map needs more than one task, RKNN fixes each
+                // task's output grain from the full, unclipped kernel span.
+                // In particular it does not use bottom-edge clipping to
+                // merge the final grain into its predecessor: at K3/P1 a
+                // 15-row capacity is 14+13+1, not 14+14, and a 3-row
+                // capacity is 2+1+...+1, not 2+1+...+2. Top padding still
+                // reduces the first grain's fetched span.
+                let in_first = shape.tile_in_first(kernels, out_first);
+                let last_tap = (out_first + out_rows - 1) * shape.stride + kernel.height - 1;
+                let unclipped_in_last = last_tap.saturating_sub(kernel.pad_top);
+                let capacity_rows = (unclipped_in_last - in_first + 1).max(out_rows * shape.stride);
+                (capacity_rows <= max_input_rows).then_some(tile)
             })?;
             out_first += tile.out_rows;
             tiles.push(tile);
@@ -3480,8 +3528,11 @@ mod tests {
             vec![21, 20, 20, 20, 20, 20, 7]
         );
 
-        // Int8 dense CBUF rows charge width 226 as 240 and use bit 14 of
-        // data_entries. That admits the vendor's exact greedy 3-tile plan.
+        // Int8 dense CBUF rows charge width 226 as 240, but the host tensor
+        // itself has a compact 226*3-byte row pitch. RKNN's padded-pitch
+        // 92+91+43 route starts compact tiles at unsafe offsets, so retain
+        // three tiles while moving both interior feature bases to 16-byte
+        // boundaries.
         let int8 = Shape::with_precision(226, 226, 1, 3, 64, Precision::Int8(quantization()));
         let plan = ConvPlan::new(int8, [3, 3]);
         assert_eq!((plan.data_banks(), plan.weight_banks()), (11, 1));
@@ -3490,14 +3541,14 @@ mod tests {
                 .iter()
                 .map(|tile| (tile.rows.out_rows, tile.rows.in_rows))
                 .collect::<Vec<_>>(),
-            vec![(92, 93), (91, 93), (43, 44)]
+            vec![(73, 74), (80, 82), (73, 74)]
         );
         assert_eq!(
             plan.programs()
                 .iter()
                 .map(|program| value_of::<CnaCbufCon1>(program))
                 .collect::<Vec<_>>(),
-            vec![22_320, 22_320, 10_560]
+            vec![17_760, 19_680, 17_760]
         );
 
         // CBUF/data_entries permits 1023 rows here, but feature_grains adds
@@ -3519,6 +3570,40 @@ mod tests {
                 .all(|tile| feature_grains([1, 1], &tile.rows) <= MAX_FEATURE_GRAINS)
         );
         assert_eq!(plan.programs().len(), 2);
+
+        // At the exact surface-capacity boundary, standalone RKNN plans do
+        // not let bottom-edge clipping enlarge the final grain. Both
+        // precisions have 24 input atoms here and therefore take the same
+        // 5/7 split and 14+13+1 route.
+        for shape in [
+            Shape::with_out_channels(28, 28, 1, 192, 64).with_padding([1, 1]),
+            Shape::with_precision(28, 28, 1, 384, 64, captured_int8()).with_padding([1, 1]),
+        ] {
+            let plan = ConvPlan::new(shape, [3, 3]);
+            assert_eq!((plan.data_banks(), plan.weight_banks()), (5, 7));
+            assert_eq!(
+                plan.tiles()
+                    .iter()
+                    .map(|tile| tile.rows.out_rows)
+                    .collect::<Vec<_>>(),
+                vec![14, 13, 1]
+            );
+        }
+
+        // The same policy remains visible at a one-row continuation grain:
+        // first produce two rows, then 26 single rows through the bottom.
+        let tiny_grain = Shape::with_out_channels(28, 28, 1, 512, 64).with_padding([1, 1]);
+        let plan = ConvPlan::new(tiny_grain, [3, 3]);
+        assert_eq!((plan.data_banks(), plan.weight_banks()), (3, 9));
+        let mut expected = vec![2];
+        expected.extend(vec![1; 26]);
+        assert_eq!(
+            plan.tiles()
+                .iter()
+                .map(|tile| tile.rows.out_rows)
+                .collect::<Vec<_>>(),
+            expected
+        );
     }
 
     #[test]
@@ -3526,9 +3611,9 @@ mod tests {
         let shape = Shape::with_out_channels(256, 32, 1, 32, 64);
         for (kernel, banks, tiles) in [
             (5usize, (8u32, 4u32), 3usize),
-            (7, (5, 7), 7),
-            (9, (6, 6), 6),
-            (11, (7, 5), 6),
+            (7, (5, 7), 8),
+            (9, (6, 6), 7),
+            (11, (7, 5), 7),
         ] {
             let plan = ConvPlan::new(shape, [kernel, kernel]);
             assert_eq!(
@@ -4613,13 +4698,11 @@ mod tests {
         // from 384 on -- a first guess of `Cin/128 + 1` fit 256 and 512
         // but predicted 4, not 5, at 384.
         for (cin, floor) in [(256u32, 3u32), (320, 4), (384, 5), (448, 5), (512, 5)] {
-            let shape = Shape::with_out_channels(30, 30, 1, cin, cin).with_padding([0, 0]);
             assert_eq!(
-                shape.weight_banks([3, 3]),
+                weight_banks_floor(cin),
                 floor,
                 "Cin={cin} weight_banks floor"
             );
-            assert_eq!(shape.data_banks([3, 3]), 12 - floor, "Cin={cin} data_banks");
         }
 
         // The real VGG-19 shapes this was chasing: features.19 (Cin=256,
@@ -4631,10 +4714,16 @@ mod tests {
         // weight_banks=3 and 4 both still 0/5 at Cin=512; only 5 and up
         // pass). Cout does not move the floor -- only Cin does, matching the
         // asymmetry `DESIGN_NOTES.md`'s vendor-formula cross product found.
-        let features_19 = Shape::with_out_channels(30, 30, 1, 256, 512).with_padding([0, 0]);
-        assert_eq!(features_19.weight_banks([3, 3]), 3);
-        let features_21 = Shape::with_out_channels(30, 30, 1, 512, 512).with_padding([0, 0]);
-        assert_eq!(features_21.weight_banks([3, 3]), 5);
+        assert_eq!(weight_banks_floor(256), 3);
+        assert_eq!(weight_banks_floor(512), 5);
+
+        // This measured floor is a safety lower bound, not the vendor's
+        // preferred allocation. The expanded corpus independently shows a
+        // larger streamed working-set grant at K3; keep the two rules
+        // explicit so a policy change cannot masquerade as a new hardware
+        // minimum.
+        assert_eq!(streamed_weight_bank_preference(256, [3, 3]), 5);
+        assert_eq!(streamed_weight_bank_preference(512, [3, 3]), 9);
 
         // features.0's shape: weight_banks=1 here is not a starved
         // footprint, it is the footprint's *entire* real demand (1,728

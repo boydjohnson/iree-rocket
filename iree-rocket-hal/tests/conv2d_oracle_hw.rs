@@ -348,7 +348,7 @@ fn cartesian_cases() -> Vec<Conv2dCase> {
     cases
 }
 
-fn int8_one_hot_four_way_cases(neutral80: bool) -> Vec<Conv2dCase> {
+fn int8_neutral80_one_hot_four_way_cases() -> Vec<Conv2dCase> {
     let mut cases = Vec::with_capacity(4);
     for signed_input in [false, true] {
         for kernel in [1usize, 3] {
@@ -363,16 +363,9 @@ fn int8_one_hot_four_way_cases(neutral80: bool) -> Vec<Conv2dCase> {
                 // a tap-order failure distinct from padding semantics.
                 padding: [0, 0],
                 precision: OraclePrecision::Int8,
-                pattern: if neutral80 {
-                    OraclePattern::OneHotNeutral80 {
-                        phase: 2,
-                        signed_input,
-                    }
-                } else {
-                    OraclePattern::OneHot {
-                        phase: 2,
-                        signed_input,
-                    }
+                pattern: OraclePattern::OneHotNeutral80 {
+                    phase: 2,
+                    signed_input,
                 },
             });
         }
@@ -569,60 +562,14 @@ fn int8_affine_selector_matrix_runs_every_case_before_failing() {
 }
 
 #[test]
-#[ignore = "needs /dev/accel/accel0 -- diagnoses int8 channel/tap packing and signed input"]
-fn int8_one_hot_four_way_diagnostic_runs_every_case_before_failing() {
-    println!("  K1 positive fail          => channel/lane or coefficient-zero encoding");
-    println!("  K1 pass, K3 positive fail => kernel-tap packing");
-    println!("  positive pass, signed fail => signed int8 input interpretation");
-    run_hardware_case_matrix(
-        "int8 ordinary-zero one-hot four-way diagnostic",
-        int8_one_hot_four_way_cases(false),
-    );
-}
-
-#[test]
 #[ignore = "needs /dev/accel/accel0 -- confirms 0x80 neutral int8 coefficient bytes"]
 fn int8_neutral80_one_hot_four_way_confirmation_runs_every_case_before_failing() {
     println!("  packed background/padding byte: 0x80");
     println!("  packed live logical +1 byte:    0x00");
     run_hardware_case_matrix(
         "int8 neutral80 one-hot four-way confirmation",
-        int8_one_hot_four_way_cases(true),
+        int8_neutral80_one_hot_four_way_cases(),
     );
-}
-
-#[test]
-#[ignore = "needs /dev/accel/accel0 -- validates inferred signed dense-int8 weight ABI"]
-fn int8_signed128_selector_matrix_runs_every_case_before_failing() {
-    let cases = int8_selector_cases(|phase| OraclePattern::SelectorsSigned128 { phase });
-    assert_eq!(cases.len(), 24);
-    println!("  logical q -> packed raw byte: q ^ 0x80");
-    println!("  packed zero/padding byte:      0x80");
-    println!("  coefficient gain correction:  128");
-    run_hardware_case_matrix("int8 signed128 selector matrix", cases);
-}
-
-#[test]
-#[ignore = "needs /dev/accel/accel0 -- tests XOR-0x80 weights at ordinary unit gain"]
-fn int8_offset_unit_selector_matrix_runs_every_case_before_failing() {
-    let cases = int8_selector_cases(|phase| OraclePattern::SelectorsOffsetUnit { phase });
-    assert_eq!(cases.len(), 24);
-    println!("  logical q -> packed raw byte: q ^ 0x80");
-    println!("  packed zero/padding byte:      0x80");
-    println!("  coefficient gain correction:  none (ordinary unit conversion)");
-    run_hardware_case_matrix("int8 offset-unit selector matrix", cases);
-}
-
-#[test]
-#[ignore = "needs /dev/accel/accel0 -- validates direct signed weights with measured BS correction"]
-fn int8_direct128_selector_matrix_runs_every_case_before_failing() {
-    let cases = int8_selector_cases(|phase| OraclePattern::SelectorsDirect128 { phase });
-    assert_eq!(cases.len(), 24);
-    println!("  logical q -> packed raw byte: direct signed two's-complement");
-    println!("  packed zero/padding byte:      0x00");
-    println!("  coefficient gain correction:  128");
-    println!("  BS baseline correction:        output zero point -128");
-    run_hardware_case_matrix("int8 direct128 selector matrix", cases);
 }
 
 fn run_raw_coefficient_byte_sweep(unit_gain: bool, title: &str, conversion: &str) -> Vec<i8> {

@@ -208,6 +208,7 @@ fn run_channel_grid(fixtures: &str, precision: FixturePrecision) {
     let mut exact_matches = 0;
     let mut incomplete_row_plans = Vec::new();
     let mut tile_differences = Vec::new();
+    let mut printed_row_routes = BTreeSet::new();
     let mut missing_plan_zero_split = Vec::new();
     let mut grouped_bank_differences = BTreeMap::<(u32, u32, u32, u32, u32), Vec<u32>>::new();
 
@@ -263,24 +264,73 @@ fn run_channel_grid(fixtures: &str, precision: FixturePrecision) {
         }
 
         let normalized_by_plan = by_plan
-            .values()
-            .map(|programs| normalize_row_tiles(programs))
+            .iter()
+            .map(|(plan_index, programs)| (*plan_index, normalize_row_tiles(programs)))
             .collect::<Vec<_>>();
         let complete = normalized_by_plan
             .iter()
-            .filter(|programs| complete_row_plan(programs, s))
+            .filter(|(_, programs)| complete_row_plan(programs, s))
             .collect::<Vec<_>>();
         if complete.is_empty() {
             incomplete_row_plans.push(case.model.clone());
         } else if !banks_match {
             // The bank mismatch is already grouped above. Do not count the
             // same case again as a row-tiling mismatch.
-        } else if complete.iter().any(|programs| {
+        } else if complete.iter().any(|(_, programs)| {
             plan_bank_split(programs) == Some(generated_split)
                 && exact_plan_match(programs, &case, &plan)
         }) {
             exact_matches += 1;
         } else {
+            // Cout does not affect row tiling once the bank split is fixed.
+            // Print one representative per precision/Cin/split so a large
+            // channel grid remains readable while retaining every field the
+            // exact matcher compares.
+            if printed_row_routes.insert((s.cin, generated_split.0, generated_split.1)) {
+                let generated_programs = plan.programs();
+                let generated_route = plan
+                    .tiles()
+                    .iter()
+                    .zip(&generated_programs)
+                    .map(|(tile, commands)| {
+                        (
+                            tile.rows.out_first,
+                            tile.rows.out_rows,
+                            tile.rows.in_first,
+                            tile.rows.in_rows,
+                            tile.columns.out_first,
+                            tile.columns.out_cols,
+                            tile.columns.in_first,
+                            tile.columns.in_cols,
+                            register_value::<CnaCbufCon1>(commands),
+                        )
+                    })
+                    .collect::<Vec<_>>();
+                eprintln!(
+                    "\n{} representative row-route divergence: {} generated={generated_route:?}",
+                    precision.name(),
+                    case.model,
+                );
+                for (plan_index, programs) in &complete {
+                    let mut vendor = programs.to_vec();
+                    vendor.sort_by_key(|program| program.out_offset);
+                    let vendor_route = vendor
+                        .iter()
+                        .map(|program| {
+                            (
+                                program.out_offset,
+                                program.out_rows,
+                                program.in_offset,
+                                program.in_rows,
+                                program.out_width,
+                                program.in_width,
+                                program.cbuf_data_entries,
+                            )
+                        })
+                        .collect::<Vec<_>>();
+                    eprintln!("  vendor plan {plan_index}: {vendor_route:?}");
+                }
+            }
             tile_differences.push(case.model.clone());
         }
     }
@@ -336,13 +386,11 @@ fn run_channel_grid(fixtures: &str, precision: FixturePrecision) {
 }
 
 #[test]
-#[ignore = "expanded vendor corpus currently exposes unresolved ConvPlan divergences"]
 fn expanded_fp16_channel_grid_matches_vendor_plans() {
     run_channel_grid(FP16_FIXTURES, FixturePrecision::Fp16);
 }
 
 #[test]
-#[ignore = "expanded vendor corpus currently exposes unresolved ConvPlan divergences"]
 fn expanded_int8_channel_grid_matches_vendor_plans() {
     run_channel_grid(INT8_FIXTURES, FixturePrecision::Int8);
 }
