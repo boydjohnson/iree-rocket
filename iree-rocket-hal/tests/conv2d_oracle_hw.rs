@@ -516,6 +516,47 @@ fn dense_coefficient_vgg_block_cases() -> Vec<Conv2dCase> {
     cases
 }
 
+/// Cin=8/Cout=16, 1x1, 30x30, fp16, dense coefficients -- the exact shape a
+/// real compiled IREE module (iree-rocket-design-spike's two_conv_probe,
+/// two independent Rocket dispatches sharing one command buffer) produced
+/// scattered wrong-pixel corruption at (roughly 0.3-4.5% of output
+/// elements, clustered by whole pixel across all 16 channels at once, not
+/// at any spatial edge). A 50ms sleep between the two hardware submissions
+/// made no difference, and a single, standalone dispatch of this exact
+/// shape reproduced the identical corruption rate -- ruling out both a
+/// scheduling race and the two-dispatches-per-command-buffer change
+/// itself. The Cartesian sweep above never covered Cin=8 or Cout=16 (its
+/// `input_channels`/`output_channels` grids jump 5 -> 64 and start at 64
+/// respectively), so this shape was untested at the ConvPlan/hardware
+/// level before now.
+///
+/// Cin=8 needs NC1HWC2 input padding (`command_buffer.rs`'s
+/// `packed_input_bytes_per_pixel` pads to `in_channels.max(16)` channels,
+/// a threshold that is not itself precision-aware even though fp16's
+/// natural atomic block is 8 channels, not 16 -- untested territory this
+/// case exercises for the first time). Caveat: this oracle fixture
+/// constructs its packed input directly via `feature_offset` (an
+/// independently written formula, not a call through
+/// `pack_nhwc_to_nc1hwc2_padded`, the function the real driver's
+/// `dispatch()` actually uses for a dense NHWC input) -- if this case
+/// passes here but the real compiled-module path still fails, that
+/// narrows the bug specifically to `pack_nhwc_to_nc1hwc2_padded`'s own
+/// implementation rather than ConvPlan/CBUF/hardware execution at this
+/// shape.
+fn small_input_channel_dynamic_dispatch_cases() -> Vec<Conv2dCase> {
+    vec![Conv2dCase {
+        width: 30,
+        height: 30,
+        cin: 8,
+        cout: 16,
+        kernel: [1, 1],
+        stride: 1,
+        padding: [0, 0],
+        precision: OraclePrecision::Fp16,
+        pattern: OraclePattern::Dense { phase: 0 },
+    }]
+}
+
 fn int8_neutral80_one_hot_four_way_cases() -> Vec<Conv2dCase> {
     let mut cases = Vec::with_capacity(4);
     for signed_input in [false, true] {
@@ -684,6 +725,13 @@ fn dense_coefficient_vgg_block_matrix_is_planable_and_gap_free() {
     assert_planable_and_gap_free(cases);
 }
 
+#[test]
+fn small_input_channel_dynamic_dispatch_matrix_is_planable_and_gap_free() {
+    let cases = small_input_channel_dynamic_dispatch_cases();
+    assert_eq!(cases.len(), 1);
+    assert_planable_and_gap_free(cases);
+}
+
 fn run_hardware_case_matrix(title: &str, cases: Vec<Conv2dCase>) {
     let total_cases = cases.len();
     let file = OpenOptions::new()
@@ -776,6 +824,14 @@ fn dense_coefficient_vgg_block_probe_runs_every_case_before_failing() {
     let cases = dense_coefficient_vgg_block_cases();
     assert_eq!(cases.len(), 5);
     run_hardware_case_matrix("dense-coefficient VGG block probe", cases);
+}
+
+#[test]
+#[ignore = "needs /dev/accel/accel0 -- confirms whether Cin=8/Cout=16 1x1 reproduces the scattered-pixel corruption a real compiled module hit"]
+fn small_input_channel_dynamic_dispatch_probe_runs_every_case_before_failing() {
+    let cases = small_input_channel_dynamic_dispatch_cases();
+    assert_eq!(cases.len(), 1);
+    run_hardware_case_matrix("small input-channel dynamic dispatch probe", cases);
 }
 
 #[test]
