@@ -685,21 +685,32 @@ fn resnet50_probe_cases() -> Vec<Conv2dCase> {
 /// DESIGN_NOTES.md, "Planck result: the single Cout=64 1x1 job is the
 /// poison".
 ///
-/// `Counting` keeps both cases bit-exact in fp16 (worst-case accumulator is
-/// 1,152, well under the 2,048 exact-integer ceiling) rather than `Dense`,
-/// because this isolates a CBUF register/state mechanism, not coefficient
-/// content -- the original full-model isolation already showed the
-/// corruption does not depend on what the weights are.
+/// This case first used `OraclePattern::Counting` (uniform 1s for every
+/// activation and weight). That version passed on real hardware after
+/// `f731cc8` (weight-demand CBUF partition fix) and `53dc3b6` (`data_entries`
+/// rounding fix) landed, which was wrongly read as the poison being fixed --
+/// retrying the actual compiled model (`rocket-max128.vmfb`, which offloads
+/// this 1x1 instead of keeping it on CPU) the same day still returned all-NaN
+/// logits, the same signature DESIGN_NOTES.md's own capture-based bisection
+/// had already traced to this exact mechanism. So `Counting` was a false
+/// negative: every real reproduction of this bug used diverse real ResNet
+/// weights/activations or random dense data, never a uniform pattern.
 ///
-/// At the time that isolation was done, this was an open defect and the
-/// compiler workaround kept this 1x1 shape on CPU rather than fixing the
-/// driver/hardware. Run on `planck` after `f731cc8` (weight-demand CBUF
-/// partition fix) and `53dc3b6` (`data_entries` rounding fix), this exact
-/// sequence now passes -- the corruption no longer reproduces, so the
-/// poison this case isolated appears to have been resolved as a side
-/// effect of one or both of those fixes rather than by a dedicated CBUF
-/// reset. The case stays as a permanent regression against that finding
-/// re-appearing.
+/// This now uses `Dense` instead, for coefficient/activation diversity closer
+/// to what actually reproduced the corruption, while staying bit-exact in
+/// fp16 (confirmed by computing `expected_accumulator` over every output
+/// pixel/channel of both shapes: worst case is 12 for the poison shape and 60
+/// for the victim shape, both far under the 2,048 exact-integer ceiling --
+/// `Dense`'s mix of positive and negative unit-ish terms keeps the realized
+/// sums far below the naive per-tap-magnitude bound).
+///
+/// This is still an open defect. The compiler workaround
+/// (`rocket-max128-no64-1x1.vmfb`) keeps this 1x1 shape on CPU. If this case
+/// now fails on real hardware, that is expected and confirms the bug remains
+/// live; if it still passes, that is further evidence the corruption depends
+/// on something even `Dense` doesn't exercise (real weight/activation bit
+/// patterns specifically, not just diversity) and the full compiled-model
+/// path remains the only reliable reproducer.
 fn poison_predecessor_cases() -> Vec<Conv2dCase> {
     vec![
         Conv2dCase {
@@ -711,7 +722,7 @@ fn poison_predecessor_cases() -> Vec<Conv2dCase> {
             stride: 1,
             padding: [0, 0],
             precision: OraclePrecision::Fp16,
-            pattern: OraclePattern::Counting,
+            pattern: OraclePattern::Dense { phase: 0 },
         },
         Conv2dCase {
             width: 66,
@@ -722,7 +733,7 @@ fn poison_predecessor_cases() -> Vec<Conv2dCase> {
             stride: 1,
             padding: [0, 0],
             precision: OraclePrecision::Fp16,
-            pattern: OraclePattern::Counting,
+            pattern: OraclePattern::Dense { phase: 0 },
         },
     ]
 }
@@ -1048,10 +1059,10 @@ fn resnet50_probe_runs_every_case_before_failing() {
 }
 
 #[test]
-#[ignore = "needs /dev/accel/accel0 -- regression for a persistent-CBUF poison sequence (Cout=64 \
-            1x1, banks 11/1, immediately before Cout=128 3x3, banks 3/9) that used to corrupt \
-            the second job's output; passing as of the weight-demand and data_entries CBUF \
-            fixes, see DESIGN_NOTES.md"]
+#[ignore = "needs /dev/accel/accel0 -- open regression for a persistent-CBUF poison sequence \
+            (Cout=64 1x1, banks 11/1, immediately before Cout=128 3x3, banks 3/9) that corrupts \
+            the second job's output in the full compiled model; a prior Counting-pattern version \
+            of this case passed and was a false negative, see DESIGN_NOTES.md"]
 fn poison_predecessor_sequential_regression_runs_every_case_before_failing() {
     let cases = poison_predecessor_cases();
     assert_eq!(cases.len(), 2);
