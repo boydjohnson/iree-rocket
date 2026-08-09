@@ -1204,16 +1204,16 @@ unsafe extern "C" fn queue_execute(
             let d = unsafe { &*cast(device) };
 
             // Replay every recorded fill/update/copy (host-side, no
-            // hardware involved) and pull out the one recorded
-            // `dispatch`'s regcmd, if any. A non-null command buffer with
-            // no recorded `dispatch` (e.g. CTS's EventTest -- just
+            // hardware involved) and pull out every recorded `dispatch`'s
+            // regcmd, in call order. A non-null command buffer with no
+            // recorded `dispatch` (e.g. CTS's EventTest -- just
             // signal_event/reset_event, nothing to actually run on the
             // NPU) is likewise a legitimate empty job, not an error: skip
             // straight to signaling. Matches the coarse per-command-buffer
             // sync granularity documented in event.rs -- there's
             // genuinely nothing to submit to hardware.
             let cmds = if command_buffer.is_null() {
-                None
+                Vec::new()
             } else {
                 match unsafe { crate::command_buffer::apply_ops(command_buffer) } {
                     Ok(cmds) => cmds,
@@ -1224,7 +1224,15 @@ unsafe extern "C" fn queue_execute(
                 }
             };
             let result = 'result: {
-                if let Some(job) = cmds.filter(|j| !j.regcmd_tasks.is_empty()) {
+                // Each recorded dispatch is submitted and fenced as its own
+                // independent hardware job, in call order -- same reasoning
+                // as one dispatch's own CBUF-height-split task list just
+                // below (the mainline driver's inter-task IRQ transition
+                // isn't reliable on RK3588), just at the coarser
+                // dispatch-to-dispatch granularity. Each dispatch reloads
+                // its own weights/CBUF state, so no state needs to survive
+                // between jobs.
+                for job in cmds.iter().filter(|j| !j.regcmd_tasks.is_empty()) {
                     let fd = d.file.as_raw_fd();
                     let regcmd_tasks = job.regcmd_tasks;
                     if regcmd_tasks.iter().any(Vec::is_empty) {
