@@ -557,6 +557,122 @@ fn small_input_channel_dynamic_dispatch_cases() -> Vec<Conv2dCase> {
     }]
 }
 
+/// ResNet-50's distinct convolution shapes (ImageNet, 224x224x3 input),
+/// filtered to what is both new coverage and constructible today.
+///
+/// Every 1x1/3x3 convolution in the stem and all four stages reduces to 23
+/// unique (width, height, Cin, Cout, kernel, stride, pad) tuples once
+/// repeated blocks and shared shapes (a stage's expansion conv is the same
+/// shape whether it is block 1's or a later block's) are collapsed. Two
+/// filters were applied to that list:
+///
+/// - Four stage-2/3 1x1 shapes at width 28, stride 1 exactly match a
+///   `cartesian_cases` main-grid point (Cin/Cout both drawn from its
+///   {3,4,5,64,128,192,256,320,384,448,512} x {64,128,256,512} grid, kernel
+///   1 or 3, stride 1) and are already exercised there under `Counting`.
+///   Dropped rather than duplicated.
+/// - Eleven shapes need Cin or Cout of 1024 or 2048: stage 3's expansion/
+///   downsample (Cout=1024) and reduce (Cin=1024), and all four of stage
+///   4's channel-changing 1x1 convs (up to Cin=2048/Cout=2048).
+///   `MAX_INPUT_CHANNELS`/`MAX_OUTPUT_CHANNELS` cap the builder at 512 --
+///   the vendor-capture-validated range -- so `Shape::with_out_channels`
+///   panics on these before a case could even be constructed. Extending
+///   past 512 needs new vendor captures (the large-Cin sweep that raised
+///   the ceiling from 80/128 to 512 -- see DESIGN_NOTES.md -- stopped
+///   there) and is out of scope here; stage 3 and 4's *spatial* 3x3 convs
+///   (Cin=Cout=256 and Cin=Cout=512, both within range) are still included.
+/// - The 224x224 K7-stride-2 stem is excluded for a sharper reason than
+///   "untested": `ConvPlan::new`'s `assert_large_kernel_plan_case`
+///   (`conv.rs`) explicitly refuses any kernel above 3x3 combined with a
+///   stride other than 1 -- "automatic planning above 3x3 currently has
+///   capture backing only at stride 1" -- so this case cannot be
+///   constructed at all today, not merely omitted from prior coverage.
+///   Every ResNet family's stem uses this exact K7/stride-2 shape, which
+///   makes it worth its own follow-up (a vendor capture at K7/stride-2,
+///   the formula fix, and only then a hardware case here) rather than
+///   folding into this sweep.
+///
+/// The remaining eleven are new: three spatial extents (56, 14, 7) no
+/// existing case touches at all, and the first hardware coverage anywhere
+/// in this file of stride 2 at real ResNet channel counts -- every
+/// existing case (`cartesian_cases` and every other `_cases` function) is
+/// stride 1; `conv_wide_shape_hw.rs` covers stride 2..4 but only at
+/// Cin=3/Cout=8.
+///
+/// `Dense` was chosen for full-coefficient-diversity coverage rather than
+/// `Counting`/`Selectors`, per its doc comment's caveat that per-shape fp16
+/// exactness was "verified by hand" -- confirmed here too, by computing
+/// `expected_accumulator` over every output pixel/channel of all eleven
+/// shapes: worst case is 63, nowhere near the 2048 exact-integer ceiling a
+/// bit-exact (tolerance 0.0) fp16 comparison depends on.
+fn resnet50_probe_cases() -> Vec<Conv2dCase> {
+    let shapes: [(u32, u32, u32, u32, [usize; 2], u32, [usize; 2], &str); 11] = [
+        (56, 56, 64, 64, [1, 1], 1, [0, 0], "stage1 reduce (block 1)"),
+        (56, 56, 64, 64, [3, 3], 1, [1, 1], "stage1 3x3"),
+        (
+            56,
+            56,
+            64,
+            256,
+            [1, 1],
+            1,
+            [0, 0],
+            "stage1 expand / block-1 downsample",
+        ),
+        (
+            56,
+            56,
+            256,
+            64,
+            [1, 1],
+            1,
+            [0, 0],
+            "stage1 reduce (blocks 2-3)",
+        ),
+        (
+            56,
+            56,
+            256,
+            128,
+            [1, 1],
+            1,
+            [0, 0],
+            "stage2 reduce (block 1)",
+        ),
+        (56, 56, 128, 128, [3, 3], 2, [1, 1], "stage2 3x3, stride 2"),
+        (
+            56,
+            56,
+            256,
+            512,
+            [1, 1],
+            2,
+            [0, 0],
+            "stage2 downsample, stride 2",
+        ),
+        (28, 28, 256, 256, [3, 3], 2, [1, 1], "stage3 3x3, stride 2"),
+        (14, 14, 256, 256, [3, 3], 1, [1, 1], "stage3 3x3"),
+        (14, 14, 512, 512, [3, 3], 2, [1, 1], "stage4 3x3, stride 2"),
+        (7, 7, 512, 512, [3, 3], 1, [1, 1], "stage4 3x3"),
+    ];
+    shapes
+        .into_iter()
+        .map(
+            |(width, height, cin, cout, kernel, stride, padding, _label)| Conv2dCase {
+                width,
+                height,
+                cin,
+                cout,
+                kernel,
+                stride,
+                padding,
+                precision: OraclePrecision::Fp16,
+                pattern: OraclePattern::Dense { phase: 0 },
+            },
+        )
+        .collect()
+}
+
 fn int8_neutral80_one_hot_four_way_cases() -> Vec<Conv2dCase> {
     let mut cases = Vec::with_capacity(4);
     for signed_input in [false, true] {
@@ -732,6 +848,13 @@ fn small_input_channel_dynamic_dispatch_matrix_is_planable_and_gap_free() {
     assert_planable_and_gap_free(cases);
 }
 
+#[test]
+fn resnet50_probe_matrix_is_planable_and_gap_free() {
+    let cases = resnet50_probe_cases();
+    assert_eq!(cases.len(), 11);
+    assert_planable_and_gap_free(cases);
+}
+
 fn run_hardware_case_matrix(title: &str, cases: Vec<Conv2dCase>) {
     let total_cases = cases.len();
     let file = OpenOptions::new()
@@ -832,6 +955,14 @@ fn small_input_channel_dynamic_dispatch_probe_runs_every_case_before_failing() {
     let cases = small_input_channel_dynamic_dispatch_cases();
     assert_eq!(cases.len(), 1);
     run_hardware_case_matrix("small input-channel dynamic dispatch probe", cases);
+}
+
+#[test]
+#[ignore = "needs /dev/accel/accel0 -- ResNet-50's shapes not already exercised by the cartesian sweep, at real spatial extents/strides"]
+fn resnet50_probe_runs_every_case_before_failing() {
+    let cases = resnet50_probe_cases();
+    assert_eq!(cases.len(), 11);
+    run_hardware_case_matrix("ResNet-50 shape probe", cases);
 }
 
 #[test]
