@@ -30,13 +30,22 @@
 //! Rust 1.71, uncatchable as an IREE status) instead of failing this one
 //! dispatch gracefully.
 //!
-//! Only supports recording exactly one `dispatch` per command buffer right
-//! now. One dispatch may contain multiple ordered hardware tasks for CBUF
-//! height splitting; a second IREE dispatch call returns
-//! `IREE_STATUS_UNIMPLEMENTED` rather than silently overwriting or
-//! chaining tasks incorrectly. `collective` (multi-device reduce/
-//! broadcast/etc.) isn't applicable to a single discrete NPU and stays
-//! UNIMPLEMENTED indefinitely, not just for now.
+//! Supports recording multiple `dispatch` calls per command buffer --
+//! `apply_ops` returns every recorded dispatch's regcmd program, in call
+//! order, and `device::queue_execute` submits each as its own individually
+//! fenced hardware job (the same "submit, then `prep_bo`-wait before the
+//! next" sequencing already used for one dispatch's own CBUF-height-split
+//! task list, since the mainline driver's inter-task IRQ transition isn't
+//! reliable on RK3588 -- see that function's comment). Originally this
+//! rejected a second recorded dispatch outright: real compiled programs
+//! (a ResNet50 bottleneck block's shortcut projection and its first reduce
+//! conv, both independent 1x1 convs reading the same upstream activation)
+//! route two independent Rocket dispatches into one stream partition/
+//! command buffer whenever nothing forces them apart, so "one only" broke
+//! on the first real model exercising that shape, not just a hypothetical.
+//! `collective` (multi-device reduce/broadcast/etc.) isn't applicable to a
+//! single discrete NPU and stays UNIMPLEMENTED indefinitely, not just for
+//! now.
 //!
 //! `fill_buffer`/`update_buffer`/`copy_buffer` all operate on our own
 //! permanently-host-mapped `RocketBuffer`s (see buffer.rs), so they're
@@ -219,7 +228,7 @@ pub enum RecordedOp {
     },
 }
 
-/// What `apply_ops` hands back for the one recorded `dispatch`, if any --
+/// What `apply_ops` hands back for each recorded `dispatch`, in call order --
 /// the regcmd program plus the real BO handles it touches, so
 /// `device::queue_execute` can build a correct `drm_rocket_job` instead of
 /// submitting with only the regcmd buffer's own handle listed.
@@ -275,13 +284,13 @@ unsafe fn cast(command_buffer: *mut iree_hal_command_buffer_t) -> *mut RocketCom
 /// after its wait-semaphore gate. Applies every recorded fill/update/copy
 /// immediately (host-side, via IREE's generic `iree_hal_buffer_map_*`
 /// helpers -- `buffer::map_range`/`unmap_range` already back those
-/// correctly) and returns the one recorded `dispatch`'s regcmd program, if
-/// any, for the caller to submit to hardware afterward.
+/// correctly) and returns every recorded `dispatch`'s regcmd program, in
+/// call order, for the caller to submit to hardware afterward.
 pub unsafe fn apply_ops(
     command_buffer: *mut iree_hal_command_buffer_t,
-) -> Result<Option<DispatchJob>, iree_status_t> {
+) -> Result<Vec<DispatchJob>, iree_status_t> {
     let cb = unsafe { &*cast(command_buffer) };
-    let mut dispatch_job = None;
+    let mut dispatch_jobs = Vec::new();
     for op in &cb.ops {
         // Indirect bindings (buffer == NULL, real buffer resolved from
         // binding_table.buffer_slot -- see command_buffer.h's own doc
@@ -508,7 +517,7 @@ pub unsafe fn apply_ops(
                         ));
                     }
                 }
-                dispatch_job = Some(DispatchJob {
+                dispatch_jobs.push(DispatchJob {
                     regcmd_tasks: regcmd_tasks.as_slice(),
                     in_bo_handles: in_bo_handles.as_slice(),
                     out_bo_handles: out_bo_handles.as_slice(),
@@ -517,7 +526,7 @@ pub unsafe fn apply_ops(
             }
         }
     }
-    Ok(dispatch_job)
+    Ok(dispatch_jobs)
 }
 
 pub unsafe fn create(
@@ -796,16 +805,6 @@ unsafe extern "C" fn dispatch(
     flags: iree_hal_dispatch_flags_t,
 ) -> iree_status_t {
     let cb = unsafe { &mut *cast(command_buffer) };
-    if cb
-        .ops
-        .iter()
-        .any(|op| matches!(op, RecordedOp::Dispatch { .. }))
-    {
-        // Only one dispatch per command buffer supported -- see module doc
-        // comment.
-        return status::unimplemented();
-    }
-
     let shape = unsafe { &*crate::executable::shape(executable) };
     let constants = if constants.data_length == 0 {
         &[]
