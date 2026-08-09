@@ -485,5 +485,226 @@ TEST(ConvSchemaHarnessRegressionTest,
   CheckPoisonVictimSignature(victim, victim_result);
 }
 
+// Same real-weight sequence as
+// PoisonPredecessorCorruptsFollowingDispatchWithRealWeights, but through
+// RunFp16Conv2dBound instead of RunFp16Conv2d: both dispatches bind
+// nonzero-offset regions of one shared iree_hal_buffer_t, allocated once and
+// never released between them, instead of each getting a fresh,
+// independently-scoped allocation that's fully released before the next
+// begins. This is the one structural difference from the real compiled
+// model that no earlier attempt in this file or in iree-rocket-hal's
+// register-level oracle harness has controlled for: the real model binds
+// poison/victim weights as offsets into one long-lived hoisted constant
+// allocation, with activations flowing through the stream allocator's
+// transient/scratch reuse -- never fresh per-dispatch allocations. See
+// DESIGN_NOTES.md, "Planck result: real weights and activations also fail
+// to reproduce the poison."
+TEST(ConvSchemaHarnessRegressionTest,
+    PoisonPredecessorCorruptsFollowingDispatchWithSharedBuffer) {
+  iree_hal_driver_t *driver = nullptr;
+  iree_hal_device_t *device = nullptr;
+  std::string error;
+  if (!CreateDevice(&driver, &device, &error)) {
+    GTEST_SKIP() << "Rocket device unavailable: " << error;
+  }
+
+  const Conv2dProblem &poison = kPoisonPredecessorProblem;
+  const Conv2dProblem &victim = kPoisonVictimProblem;
+  const std::string fixture_dir = PoisonFixtureDir();
+  std::vector<float> poison_input, poison_weights, victim_input,
+      victim_weights;
+  try {
+    poison_input = LoadNpyFloat(fixture_dir + "/poison_input.npy");
+    poison_weights = LoadNpyFloat(fixture_dir + "/poison_kernel.npy");
+    victim_input = LoadNpyFloat(fixture_dir + "/victim_input.npy");
+    victim_weights = LoadNpyFloat(fixture_dir + "/victim_kernel.npy");
+  } catch (const std::exception &e) {
+    iree_hal_device_release(device);
+    iree_hal_driver_release(driver);
+    GTEST_SKIP() << "real-weight fixtures unavailable in \"" << fixture_dir
+                 << "\": " << e.what()
+                 << " -- set ROCKET_POISON_FIXTURE_DIR to point at them, or "
+                    "run extract_poison_predecessor_capture.py and copy its "
+                    "output next to this binary";
+  }
+  ASSERT_EQ(poison_input.size(), poison.input_element_count());
+  ASSERT_EQ(poison_weights.size(), poison.weight_element_count());
+  ASSERT_EQ(victim_input.size(), victim.input_element_count());
+  ASSERT_EQ(victim_weights.size(), victim.weight_element_count());
+
+  const auto poison_packed = PackConv2dBufferLayout(poison, 0);
+  const Conv2dBufferLayout &poison_layout = poison_packed.first;
+  const auto victim_packed =
+      PackConv2dBufferLayout(victim, poison_packed.second);
+  const Conv2dBufferLayout &victim_layout = victim_packed.first;
+  const iree_device_size_t shared_buffer_bytes = victim_packed.second;
+
+  iree_hal_buffer_t *shared_buffer = nullptr;
+  Conv2dResult victim_result;
+  try {
+    shared_buffer = AllocateBuffer(device, shared_buffer_bytes);
+    // Neither call releases shared_buffer between them -- both the poison
+    // dispatch's own operands and the victim's stay resident in it exactly
+    // like the real model's hoisted constant allocation, for as long as
+    // shared_buffer itself is alive.
+    RunFp16Conv2dBound(device, shared_buffer, poison, poison_layout,
+                       poison_input, poison_weights);
+    victim_result = RunFp16Conv2dBound(
+        device, shared_buffer, victim, victim_layout, victim_input,
+        victim_weights);
+  } catch (...) {
+    if (shared_buffer)
+      iree_hal_buffer_release(shared_buffer);
+    iree_hal_device_release(device);
+    iree_hal_driver_release(driver);
+    throw;
+  }
+  iree_hal_buffer_release(shared_buffer);
+  iree_hal_device_release(device);
+  iree_hal_driver_release(driver);
+
+  CheckPoisonVictimSignature(victim, victim_result);
+}
+
+// Same real weights/activations and shared persistent buffer as
+// PoisonPredecessorCorruptsFollowingDispatchWithSharedBuffer, but through
+// RunFp16Conv2dBatch instead of two RunFp16Conv2dBound calls: both
+// dispatches are now recorded into ONE command buffer (one queue_execute,
+// one semaphore wait for the pair) instead of each getting its own command
+// buffer/queue_execute/semaphore round trip. This is the one remaining
+// structural difference between every prior attempt in this file (all
+// single-dispatch-per-command-buffer, even the shared-buffer variant above)
+// and the real minimal iree-compile'd reproduction in
+// poison_victim_isolation/, whose Stream IR groups both dispatches into one
+// stream.cmd.concurrent region -- see DESIGN_NOTES.md, "Planck result: a
+// minimal two-conv iree-compile module reproduces the poison." It exercises
+// rocket-hal-driver's multi-dispatch-per-command-buffer code path added in
+// `0325b14` ("Modify runtime to allow concurrent dispatch"), which no
+// earlier test in this file had reached at all.
+TEST(ConvSchemaHarnessRegressionTest,
+    PoisonPredecessorCorruptsFollowingDispatchAsOneCommandBufferBatch) {
+  iree_hal_driver_t *driver = nullptr;
+  iree_hal_device_t *device = nullptr;
+  std::string error;
+  if (!CreateDevice(&driver, &device, &error)) {
+    GTEST_SKIP() << "Rocket device unavailable: " << error;
+  }
+
+  const Conv2dProblem &poison = kPoisonPredecessorProblem;
+  const Conv2dProblem &victim = kPoisonVictimProblem;
+  const std::string fixture_dir = PoisonFixtureDir();
+  std::vector<float> poison_input, poison_weights, victim_input,
+      victim_weights;
+  try {
+    poison_input = LoadNpyFloat(fixture_dir + "/poison_input.npy");
+    poison_weights = LoadNpyFloat(fixture_dir + "/poison_kernel.npy");
+    victim_input = LoadNpyFloat(fixture_dir + "/victim_input.npy");
+    victim_weights = LoadNpyFloat(fixture_dir + "/victim_kernel.npy");
+  } catch (const std::exception &e) {
+    iree_hal_device_release(device);
+    iree_hal_driver_release(driver);
+    GTEST_SKIP() << "real-weight fixtures unavailable in \"" << fixture_dir
+                 << "\": " << e.what()
+                 << " -- set ROCKET_POISON_FIXTURE_DIR to point at them, or "
+                    "run extract_poison_predecessor_capture.py and copy its "
+                    "output next to this binary";
+  }
+  ASSERT_EQ(poison_input.size(), poison.input_element_count());
+  ASSERT_EQ(poison_weights.size(), poison.weight_element_count());
+  ASSERT_EQ(victim_input.size(), victim.input_element_count());
+  ASSERT_EQ(victim_weights.size(), victim.weight_element_count());
+
+  const auto poison_packed = PackConv2dBufferLayout(poison, 0);
+  const Conv2dBufferLayout &poison_layout = poison_packed.first;
+  const auto victim_packed =
+      PackConv2dBufferLayout(victim, poison_packed.second);
+  const Conv2dBufferLayout &victim_layout = victim_packed.first;
+  const iree_device_size_t shared_buffer_bytes = victim_packed.second;
+
+  iree_hal_buffer_t *shared_buffer = nullptr;
+  std::vector<Conv2dResult> results;
+  try {
+    shared_buffer = AllocateBuffer(device, shared_buffer_bytes);
+    results = RunFp16Conv2dBatch(
+        device, shared_buffer, {poison, victim},
+        {poison_layout, victim_layout}, {poison_input, victim_input},
+        {poison_weights, victim_weights});
+  } catch (...) {
+    if (shared_buffer)
+      iree_hal_buffer_release(shared_buffer);
+    iree_hal_device_release(device);
+    iree_hal_driver_release(driver);
+    throw;
+  }
+  iree_hal_buffer_release(shared_buffer);
+  iree_hal_device_release(device);
+  iree_hal_driver_release(driver);
+
+  ASSERT_EQ(results.size(), 2u);
+  CheckPoisonVictimSignature(victim, results[1]);
+}
+
+// Same real weights/activations as every other real-weight test above, but
+// through RunFp16Conv2dPairWithAdjacentOutputs: poison's and victim's raw
+// NPU output (and BS) land tightly adjacent in one shared buffer -- no
+// input/weight bytes between them -- exactly matching the real compiled
+// module's Stream IR layout, found by reading poison_victim_isolation/'s
+// generated stream.mlir directly. This is the one buffer-layout property no
+// earlier CTS attempt has matched: RunFp16Conv2dBound/RunFp16Conv2dBatch
+// pack each dispatch's *entire* four-binding block together, so victim's
+// output never sat near poison's own output in any of them. See
+// DESIGN_NOTES.md, "Planck result: the 0325b14 multi-dispatch code path is
+// not the deciding factor either, but its investigation found the real
+// lead."
+TEST(ConvSchemaHarnessRegressionTest,
+    PoisonPredecessorCorruptsFollowingDispatchWithAdjacentOutputs) {
+  iree_hal_driver_t *driver = nullptr;
+  iree_hal_device_t *device = nullptr;
+  std::string error;
+  if (!CreateDevice(&driver, &device, &error)) {
+    GTEST_SKIP() << "Rocket device unavailable: " << error;
+  }
+
+  const Conv2dProblem &poison = kPoisonPredecessorProblem;
+  const Conv2dProblem &victim = kPoisonVictimProblem;
+  const std::string fixture_dir = PoisonFixtureDir();
+  std::vector<float> poison_input, poison_weights, victim_input,
+      victim_weights;
+  try {
+    poison_input = LoadNpyFloat(fixture_dir + "/poison_input.npy");
+    poison_weights = LoadNpyFloat(fixture_dir + "/poison_kernel.npy");
+    victim_input = LoadNpyFloat(fixture_dir + "/victim_input.npy");
+    victim_weights = LoadNpyFloat(fixture_dir + "/victim_kernel.npy");
+  } catch (const std::exception &e) {
+    iree_hal_device_release(device);
+    iree_hal_driver_release(driver);
+    GTEST_SKIP() << "real-weight fixtures unavailable in \"" << fixture_dir
+                 << "\": " << e.what()
+                 << " -- set ROCKET_POISON_FIXTURE_DIR to point at them, or "
+                    "run extract_poison_predecessor_capture.py and copy its "
+                    "output next to this binary";
+  }
+  ASSERT_EQ(poison_input.size(), poison.input_element_count());
+  ASSERT_EQ(poison_weights.size(), poison.weight_element_count());
+  ASSERT_EQ(victim_input.size(), victim.input_element_count());
+  ASSERT_EQ(victim_weights.size(), victim.weight_element_count());
+
+  Conv2dResult victim_result;
+  try {
+    const auto results = RunFp16Conv2dPairWithAdjacentOutputs(
+        device, poison, poison_input, poison_weights, victim, victim_input,
+        victim_weights);
+    victim_result = results.second;
+  } catch (...) {
+    iree_hal_device_release(device);
+    iree_hal_driver_release(driver);
+    throw;
+  }
+  iree_hal_device_release(device);
+  iree_hal_driver_release(driver);
+
+  CheckPoisonVictimSignature(victim, victim_result);
+}
+
 } // namespace
 } // namespace rocket::testing

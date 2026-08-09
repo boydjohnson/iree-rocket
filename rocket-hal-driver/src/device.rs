@@ -47,6 +47,80 @@ use iree_rocket_hal::rocket::{
 const DEVICE_PATH: &str = "/dev/accel/accel0";
 const DISPATCH_COMPLETION_TIMEOUT_NS: u64 = 10_000_000_000;
 
+/// Dumps every submitted regcmd task's raw hardware command words to
+/// `$ROCKET_DUMP_REGCMD_DIR` (unset: no-op, zero overhead) -- one raw
+/// little-endian-u64 binary file per task, plus a manifest line recording
+/// which dispatch/task/DMA-address/word-count each one is, in submission
+/// order. Added to compare actual hardware command bytes between the real
+/// compiled-model path (`iree-run-module`) and a hand-built CTS harness
+/// path (`rocket-hal-driver/cts`) for the persistent-CBUF poison-
+/// predecessor bug -- see DESIGN_NOTES.md (iree-rocket-design-spike),
+/// "Planck result: the 0325b14 multi-dispatch code path is not the
+/// deciding factor either, but its investigation found the real lead" and
+/// its follow-ups. Every difference visible at the IREE Stream-IR/HAL
+/// level (data content, dispatch path, buffer lifetime, command-buffer
+/// grouping, output-buffer adjacency) was ruled out without explaining the
+/// bug; this compares the one layer below all of that -- the exact bytes
+/// the driver hands the NPU.
+mod regcmd_dump {
+    use std::io::Write;
+    use std::path::PathBuf;
+    use std::sync::OnceLock;
+    use std::sync::atomic::{AtomicU64, Ordering};
+
+    use iree_rocket_hal::rocket::builders::RegCmd;
+
+    static DISPATCH_SEQ: AtomicU64 = AtomicU64::new(0);
+    static TASK_SEQ: AtomicU64 = AtomicU64::new(0);
+
+    fn dump_dir() -> Option<&'static PathBuf> {
+        static DIR: OnceLock<Option<PathBuf>> = OnceLock::new();
+        DIR.get_or_init(|| std::env::var_os("ROCKET_DUMP_REGCMD_DIR").map(PathBuf::from))
+            .as_ref()
+    }
+
+    /// One process-lifetime-unique index per recorded dispatch (i.e. per
+    /// `DispatchJob` / one `iree_hal_command_buffer_dispatch` call, not per
+    /// hardware task/tile within it). Call once per `job` in
+    /// `queue_execute`'s dispatch loop, before that job's own task loop, so
+    /// every task dumped from it shares one dispatch index. Always
+    /// increments, even when `dump_dir()` is `None` -- cheap, and keeps the
+    /// counter meaningful if `ROCKET_DUMP_REGCMD_DIR` gets set partway
+    /// through a run.
+    pub fn next_dispatch_index() -> u64 {
+        DISPATCH_SEQ.fetch_add(1, Ordering::Relaxed)
+    }
+
+    /// Writes one task's regcmd words to their own file, named so a plain
+    /// `ls`/`sort` recovers submission order even across multiple
+    /// `queue_execute` calls. No-op unless `ROCKET_DUMP_REGCMD_DIR` is set.
+    pub fn dump_task(dispatch_index: u64, task_index: usize, regcmd_addr: u32, regcmd: &[RegCmd]) {
+        let Some(dir) = dump_dir() else {
+            return;
+        };
+        let seq = TASK_SEQ.fetch_add(1, Ordering::Relaxed);
+        let file_name =
+            format!("seq{seq:06}_dispatch{dispatch_index:04}_task{task_index:03}.regcmd");
+        if let Ok(mut file) = std::fs::File::create(dir.join(&file_name)) {
+            for word in regcmd {
+                let _ = file.write_all(&word.0.to_le_bytes());
+            }
+        }
+        if let Ok(mut manifest) = std::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(dir.join("manifest.txt"))
+        {
+            let _ = writeln!(
+                manifest,
+                "{file_name} dispatch={dispatch_index} task={task_index} \
+                 regcmd_addr=0x{regcmd_addr:x} words={}",
+                regcmd.len()
+            );
+        }
+    }
+}
+
 // nr=0x00 is generic DRM_IOCTL_VERSION, not rocket-specific -- see
 // rkt-test.rs's identical use of this pattern.
 nix::ioctl_readwrite!(drm_get_version, DRM_IOCTL_BASE, 0x00, drm_version);
@@ -926,9 +1000,10 @@ unsafe extern "C" fn queue_write(
     }
 }
 
-// Blocking mode only (IREE_HAL_HOST_CALL_FLAG_NONE) -- deferred/async
-// callbacks (a callback returning IREE_STATUS_DEFERRED and signaling the
-// cloned signal_semaphore_list itself later) aren't implemented. Neither
+// Blocking mode only (IREE_HAL_HOST_CALL_FLAG_NONE) implements deferred/
+// async callbacks (a callback returning IREE_STATUS_DEFERRED and signaling
+// the cloned signal_semaphore_list itself later, e.g. CTS's
+// QueueHostCallTest.AsyncCallback) -- see `is_deferred` below. Neither
 // mode may block on wait_semaphore_list itself (see run_after_wait's doc
 // comment) -- deferred here too, when the wait isn't already satisfied.
 #[allow(unused_variables)]
@@ -1026,6 +1101,18 @@ unsafe extern "C" fn queue_host_call(
             unsafe { (f.into_inner())(user_data.into_inner(), args_buf.as_ptr(), &mut context) };
         if result.is_null() {
             unsafe { signal_all(sig) }
+        } else if status::is_deferred(result) {
+            // The callback (or something it spawned) has taken ownership
+            // of signaling/failing `sig` itself, later -- e.g. CTS's
+            // QueueHostCallTest.AsyncCallback, whose callback hands
+            // `context.signal_semaphore_list` to a background thread and
+            // returns DEFERRED immediately. Treating this like any other
+            // non-OK result (the `fail_all` branch below) used to fail
+            // `sig` right away with the DEFERRED code itself, racing the
+            // callback's own later signal on the same semaphores. Leave
+            // `sig` untouched here; just release the sentinel status.
+            unsafe { crate::bindings::iree_status_ignore(result) };
+            status::ok()
         } else {
             unsafe { fail_all(sig, result) };
             status::ok()
@@ -1233,6 +1320,7 @@ unsafe extern "C" fn queue_execute(
                 // its own weights/CBUF state, so no state needs to survive
                 // between jobs.
                 for job in cmds.iter().filter(|j| !j.regcmd_tasks.is_empty()) {
+                    let dispatch_index = regcmd_dump::next_dispatch_index();
                     let fd = d.file.as_raw_fd();
                     let regcmd_tasks = job.regcmd_tasks;
                     if regcmd_tasks.iter().any(Vec::is_empty) {
@@ -1264,6 +1352,12 @@ unsafe extern "C" fn queue_execute(
                                 iree_status_code_e_IREE_STATUS_UNAVAILABLE,
                             );
                         }
+                        regcmd_dump::dump_task(
+                            dispatch_index,
+                            task_descriptors.len(),
+                            cmd_buf.dma_address,
+                            regcmd,
+                        );
                         task_descriptors.push((cmd_buf.dma_address, regcmd.len() as u32));
                     }
 

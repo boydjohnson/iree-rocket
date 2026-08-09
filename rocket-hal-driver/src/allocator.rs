@@ -286,6 +286,9 @@ unsafe extern "C" fn allocate_buffer(
         );
         *out_buffer = buffer_ptr as *mut iree_hal_buffer_t;
     }
+    if std::env::var_os("ROCKET_TRACE_BUFFER_LIFECYCLE").is_some() {
+        eprintln!("[buffer] allocate {:p} size={}", buffer_ptr, allocation_size);
+    }
     status::ok()
 }
 

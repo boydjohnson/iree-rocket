@@ -86,6 +86,9 @@ unsafe extern "C" fn recycle(buffer: *mut iree_hal_buffer_t) {
 }
 
 unsafe extern "C" fn destroy(buffer: *mut iree_hal_buffer_t) {
+    if std::env::var_os("ROCKET_TRACE_BUFFER_LIFECYCLE").is_some() {
+        eprintln!("[buffer] destroy {:p}", buffer);
+    }
     let buffer = unsafe { Box::from_raw(cast(buffer)) };
     // TODO: no explicit DRM_IOCTL_GEM_CLOSE -- that's a generic DRM ioctl,
     // not part of the 4-ioctl rocket-specific UAPI iree-rocket-hal's
@@ -115,6 +118,12 @@ unsafe extern "C" fn map_range(
     mapping: *mut iree_hal_buffer_mapping_t,
 ) -> iree_status_t {
     let rb = unsafe { &*cast(buffer) };
+    if std::env::var_os("ROCKET_TRACE_BUFFER_LIFECYCLE").is_some() {
+        eprintln!(
+            "[buffer] map_range buffer={:p} offset={} len={} access={:#x}",
+            buffer, local_byte_offset, local_byte_length, memory_access
+        );
+    }
     unsafe {
         (*mapping).contents = iree_byte_span_t {
             data: rb.host_ptr.add(local_byte_offset),
@@ -159,6 +168,12 @@ unsafe extern "C" fn unmap_range(
     // already-cheap FINI_BO ioctl) for the callers that already flush
     // explicitly themselves.
     let allowed_access = unsafe { (*mapping).impl_.allowed_access };
+    if std::env::var_os("ROCKET_TRACE_BUFFER_LIFECYCLE").is_some() {
+        eprintln!(
+            "[buffer] unmap_range buffer={:p} offset={} len={} access={:#x}",
+            buffer, local_byte_offset, local_byte_length, allowed_access
+        );
+    }
     if allowed_access & (iree_hal_memory_access_bits_t_IREE_HAL_MEMORY_ACCESS_WRITE as u16) != 0 {
         let rb = unsafe { &*cast(buffer) };
         if unsafe { device::fini_bo(rb.fd, rb.handle) }.is_err() {
