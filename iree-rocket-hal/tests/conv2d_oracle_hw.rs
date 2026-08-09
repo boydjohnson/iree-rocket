@@ -696,21 +696,31 @@ fn resnet50_probe_cases() -> Vec<Conv2dCase> {
 /// negative: every real reproduction of this bug used diverse real ResNet
 /// weights/activations or random dense data, never a uniform pattern.
 ///
-/// This now uses `Dense` instead, for coefficient/activation diversity closer
-/// to what actually reproduced the corruption, while staying bit-exact in
-/// fp16 (confirmed by computing `expected_accumulator` over every output
+/// This then moved to `Dense`, for coefficient/activation diversity closer to
+/// what actually reproduced the corruption, while staying bit-exact in fp16
+/// (confirmed by computing `expected_accumulator` over every output
 /// pixel/channel of both shapes: worst case is 12 for the poison shape and 60
 /// for the victim shape, both far under the 2,048 exact-integer ceiling --
 /// `Dense`'s mix of positive and negative unit-ish terms keeps the realized
-/// sums far below the naive per-tap-magnitude bound).
+/// sums far below the naive per-tap-magnitude bound). `Dense` also passed on
+/// real hardware (`planck`, 2026-08-09), so "uniform vs. diverse data" is not
+/// the deciding variable either -- see DESIGN_NOTES.md, "Planck result: Dense
+/// also fails to reproduce the poison in isolation".
 ///
-/// This is still an open defect. The compiler workaround
-/// (`rocket-max128-no64-1x1.vmfb`) keeps this 1x1 shape on CPU. If this case
-/// now fails on real hardware, that is expected and confirms the bug remains
-/// live; if it still passes, that is further evidence the corruption depends
-/// on something even `Dense` doesn't exercise (real weight/activation bit
-/// patterns specifically, not just diversity) and the full compiled-model
-/// path remains the only reliable reproducer.
+/// This is still an open defect: the full compiled model
+/// (`rocket-max128.vmfb`, no CPU workaround) still returns all-NaN logits.
+/// Two register-level patterns (`Counting`, `Dense`) have now both failed to
+/// reproduce it in this isolated two-job harness, which shifts suspicion away
+/// from coefficient/activation content in general and toward something
+/// specific to the full compiled-model path: real weight/activation bit
+/// patterns rather than any-diverse-pattern, the `rocket-hal-driver`/IREE
+/// command-buffer dispatch path (which this harness bypasses -- it calls
+/// `iree_rocket_hal::rocket` directly via `submit_jobs`/`prep_bo`, not
+/// through IREE's HAL abstraction), or state from the many Rocket jobs
+/// preceding this pair in the real model that this two-job harness has no
+/// equivalent of. The compiler workaround (`rocket-max128-no64-1x1.vmfb`)
+/// must stay in place. The full compiled-model capture path under
+/// `resnet50_run/` remains the only reliable reproducer.
 fn poison_predecessor_cases() -> Vec<Conv2dCase> {
     vec![
         Conv2dCase {
@@ -1061,8 +1071,8 @@ fn resnet50_probe_runs_every_case_before_failing() {
 #[test]
 #[ignore = "needs /dev/accel/accel0 -- open regression for a persistent-CBUF poison sequence \
             (Cout=64 1x1, banks 11/1, immediately before Cout=128 3x3, banks 3/9) that corrupts \
-            the second job's output in the full compiled model; a prior Counting-pattern version \
-            of this case passed and was a false negative, see DESIGN_NOTES.md"]
+            the second job's output in the full compiled model; both Counting and Dense \
+            register-level patterns pass here (false negatives), see DESIGN_NOTES.md"]
 fn poison_predecessor_sequential_regression_runs_every_case_before_failing() {
     let cases = poison_predecessor_cases();
     assert_eq!(cases.len(), 2);

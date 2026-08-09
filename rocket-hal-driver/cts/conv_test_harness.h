@@ -15,6 +15,13 @@
 
 namespace rocket::testing {
 
+// Bit-exact fp16 <-> fp32 conversions, exposed (not just used internally by
+// RunFp16Conv2d) so other callers -- e.g. a fixture loader interpreting raw
+// .npy fp16 data -- can reuse a single tested implementation instead of a
+// second copy.
+uint16_t F32ToF16(float value);
+float F16ToF32(uint16_t bits);
+
 // Logical convolution geometry accepted by the RKT1 Conv2D ukernel.
 //
 // Input and output tensors use dense NHWC order. Weights use dense HWCF

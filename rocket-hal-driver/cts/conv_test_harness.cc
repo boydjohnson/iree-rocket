@@ -18,25 +18,6 @@
 #include "rocket_executable_def_builder.h"
 
 namespace rocket::testing {
-namespace {
-
-constexpr size_t kIreeFlatbufferHeaderSize = 64;
-
-void ThrowStatus(iree_status_t status, const char *operation) {
-  if (iree_status_is_ok(status))
-    return;
-  char message[2048] = {};
-  iree_host_size_t length = 0;
-  iree_status_format(status, sizeof(message), message, &length);
-  std::string text = operation;
-  text.append(" failed: ");
-  text.append(length == 0
-                  ? std::string("(no message)")
-                  : std::string(message,
-                                std::min<size_t>(length, sizeof(message) - 1)));
-  iree_status_free(status);
-  throw std::runtime_error(text);
-}
 
 uint16_t F32ToF16(float value) {
   uint32_t bits;
@@ -102,6 +83,26 @@ float F16ToF32(uint16_t bits) {
   float value;
   std::memcpy(&value, &f32_bits, sizeof(value));
   return value;
+}
+
+namespace {
+
+constexpr size_t kIreeFlatbufferHeaderSize = 64;
+
+void ThrowStatus(iree_status_t status, const char *operation) {
+  if (iree_status_is_ok(status))
+    return;
+  char message[2048] = {};
+  iree_host_size_t length = 0;
+  iree_status_format(status, sizeof(message), message, &length);
+  std::string text = operation;
+  text.append(" failed: ");
+  text.append(length == 0
+                  ? std::string("(no message)")
+                  : std::string(message,
+                                std::min<size_t>(length, sizeof(message) - 1)));
+  iree_status_free(status);
+  throw std::runtime_error(text);
 }
 
 std::vector<uint16_t> QuantizeToF16(const std::vector<float> &values) {
