@@ -673,6 +673,60 @@ fn resnet50_probe_cases() -> Vec<Conv2dCase> {
         .collect()
 }
 
+/// The exact hardware-job shapes and order that isolated a persistent-CBUF
+/// state bug found while bringing up ResNet-50: a `128x128` Cin=Cout=64 1x1
+/// convolution plans to the extreme CBUF split `data_banks=11,
+/// weight_banks=1`, and when that specific job runs immediately before a
+/// `66x66` Cin=Cout=128 3x3 convolution (banks 3/9), the second job's upper
+/// output-channel half comes back wrong on real hardware (`max|CPU diff| =
+/// 19.0008`, only 5,089 of 262,144 values within tolerance) even though the
+/// same 3x3 convolution is exact both standalone and when preceded instead
+/// by the harmless `130x130` Cin=Cout=64 3x3 predecessor (banks 9/3). See
+/// DESIGN_NOTES.md, "Planck result: the single Cout=64 1x1 job is the
+/// poison".
+///
+/// `Counting` keeps both cases bit-exact in fp16 (worst-case accumulator is
+/// 1,152, well under the 2,048 exact-integer ceiling) rather than `Dense`,
+/// because this isolates a CBUF register/state mechanism, not coefficient
+/// content -- the original full-model isolation already showed the
+/// corruption does not depend on what the weights are.
+///
+/// At the time that isolation was done, this was an open defect and the
+/// compiler workaround kept this 1x1 shape on CPU rather than fixing the
+/// driver/hardware. Run on `planck` after `f731cc8` (weight-demand CBUF
+/// partition fix) and `53dc3b6` (`data_entries` rounding fix), this exact
+/// sequence now passes -- the corruption no longer reproduces, so the
+/// poison this case isolated appears to have been resolved as a side
+/// effect of one or both of those fixes rather than by a dedicated CBUF
+/// reset. The case stays as a permanent regression against that finding
+/// re-appearing.
+fn poison_predecessor_cases() -> Vec<Conv2dCase> {
+    vec![
+        Conv2dCase {
+            width: 128,
+            height: 128,
+            cin: 64,
+            cout: 64,
+            kernel: [1, 1],
+            stride: 1,
+            padding: [0, 0],
+            precision: OraclePrecision::Fp16,
+            pattern: OraclePattern::Counting,
+        },
+        Conv2dCase {
+            width: 66,
+            height: 66,
+            cin: 128,
+            cout: 128,
+            kernel: [3, 3],
+            stride: 1,
+            padding: [0, 0],
+            precision: OraclePrecision::Fp16,
+            pattern: OraclePattern::Counting,
+        },
+    ]
+}
+
 fn int8_neutral80_one_hot_four_way_cases() -> Vec<Conv2dCase> {
     let mut cases = Vec::with_capacity(4);
     for signed_input in [false, true] {
@@ -855,6 +909,34 @@ fn resnet50_probe_matrix_is_planable_and_gap_free() {
     assert_planable_and_gap_free(cases);
 }
 
+#[test]
+fn poison_predecessor_matrix_is_planable_and_gap_free() {
+    let cases = poison_predecessor_cases();
+    assert_eq!(cases.len(), 2);
+    assert_planable_and_gap_free(cases);
+}
+
+/// The poison mechanism is specifically about the 11/1 -> 3/9 bank-split
+/// sequence, not just these two shapes. Lock in the exact split so a future
+/// `ConvPlan` formula change can't silently stop this test from exercising
+/// the bug it exists to catch.
+#[test]
+fn poison_predecessor_matrix_hits_the_isolated_bank_split() {
+    let banks = poison_predecessor_cases()
+        .into_iter()
+        .map(|case| {
+            let plan = ConvPlan::new(case.shape(), case.kernel);
+            (plan.data_banks(), plan.weight_banks())
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(
+        banks,
+        vec![(11, 1), (3, 9)],
+        "poison predecessor cases no longer plan to the isolated 11/1 -> 3/9 bank split; \
+         the DESIGN_NOTES.md mechanism this test targets may no longer apply to these shapes",
+    );
+}
+
 fn run_hardware_case_matrix(title: &str, cases: Vec<Conv2dCase>) {
     let total_cases = cases.len();
     let file = OpenOptions::new()
@@ -963,6 +1045,17 @@ fn resnet50_probe_runs_every_case_before_failing() {
     let cases = resnet50_probe_cases();
     assert_eq!(cases.len(), 11);
     run_hardware_case_matrix("ResNet-50 shape probe", cases);
+}
+
+#[test]
+#[ignore = "needs /dev/accel/accel0 -- regression for a persistent-CBUF poison sequence (Cout=64 \
+            1x1, banks 11/1, immediately before Cout=128 3x3, banks 3/9) that used to corrupt \
+            the second job's output; passing as of the weight-demand and data_entries CBUF \
+            fixes, see DESIGN_NOTES.md"]
+fn poison_predecessor_sequential_regression_runs_every_case_before_failing() {
+    let cases = poison_predecessor_cases();
+    assert_eq!(cases.len(), 2);
+    run_hardware_case_matrix("poison predecessor sequential regression", cases);
 }
 
 #[test]
