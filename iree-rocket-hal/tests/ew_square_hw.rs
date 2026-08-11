@@ -1,19 +1,16 @@
 //! Hardware-in-the-loop, oracle-based test for `square(x) = x*x`, built
-//! via the DPU EW core's MUL mode with its "operand from outside" (ERDMA)
-//! source deliberately aliased to the same address as the primary input
-//! -- see `build_square_regcmd`'s own doc comment for the full mechanism.
-//! No LUT needed if this works: `x*x` is exact given `x` is exact in
-//! fp16, unlike the LUT-approximated transcendentals.
+//! as a standalone DPU LUT (`LutTable::square()`, `activation.rs`) rather
+//! than the DPU EW core's MUL mode -- see `activation.rs`'s
+//! `SQUARE_BN_SCALE_K`/`lut_tables::SQUARE_LE`/`_LO` doc comments for the
+//! generation methodology (self-derived, no vendor capture, `x^2` has no
+//! natural output ceiling so the table's real domain is deliberately
+//! restricted to `x` in `[-1, 1]`).
 //!
-//! **RESULT: `ew_square_matches_oracle` FAILS on real hardware -- output
-//! is all-zero for every input.** `ew_square_completes` passes (the job
-//! runs cleanly, no hang), so this isn't a hang/timeout, it's a real
-//! wrong-computation result. See `build_square_regcmd`'s doc comment
-//! (`elementwise.rs`) for the live hypotheses and why this crate falls
-//! back to a Group 4 LUT-based `square` instead of continuing to guess at
-//! MUL mode from here. Left in the repo, failing, as a record of what was
-//! tried -- same discipline as this project's other documented dead
-//! ends/open findings.
+//! A prior attempt used DPU MUL mode with ERDMA self-aliased to the
+//! primary input address (`build_square_regcmd`, since removed from
+//! `elementwise.rs`) -- hardware-confirmed to produce all-zero output for
+//! every input, root cause not resolved. This LUT-based approach replaces
+//! that attempt entirely rather than keeping both.
 //!
 //! Cross-compile this test, copy the resulting binary to the RK3588 board
 //! (`planck`), and run the ignored tests there:
@@ -26,93 +23,39 @@
 //! ./ew_square_hw-<hash> --ignored --nocapture
 //! ```
 //!
-//! First hardware round for MUL mode and for ERDMA self-aliasing. Neither
-//! has any precedent in this crate: every other EW builder stays in ALU
-//! mode, and ERDMA has only ever been pointed at a genuinely distinct
-//! second tensor (`EwAddShape`/`build_add_regcmd`).
-//!
-//! **`channels=1` only**, same reasoning as `ew_unary_hw.rs`/
-//! `ew_round_hw.rs`: the multi-channel output byte layout for this task
-//! family has never been hardware-confirmed.
+//! First hardware round for `LutTable::square()` -- `ew_op_bypass=1` and
+//! `TOLERANCE_LSB` are both guesses (see `activation.rs`'s doc comment on
+//! `square()`), not confirmed values.
 
 use std::{fs::OpenOptions, mem, os::unix::io::AsRawFd, ptr};
 
 use iree_rocket_hal::rocket::{
+    activation::{LutBuffers, LutShape, LutTable, build_lut_regcmd},
     device::{Buffer, close_bo, fini_bo, prep_bo, submit},
-    elementwise::{EwSquareBuffers, EwSquareShape, build_square_regcmd},
 };
 
 const DEVICE_PATH: &str = "/dev/accel/accel0";
 const TENSOR_SIZE: usize = 4096;
-const WIDTH: u32 = 4;
-const HEIGHT: u32 = 4;
 
-fn f32_to_f16(value: f32) -> u16 {
-    let bits = value.to_bits();
-    let sign = ((bits >> 16) & 0x8000) as u16;
-    if value == 0.0 {
-        return sign;
-    }
-    let exponent = ((bits >> 23) & 0xff) as i32 - 127 + 15;
-    let fraction = bits & 0x7f_ffff;
-    assert!(
-        (1..31).contains(&exponent),
-        "{value} is outside the fp16 normal range"
-    );
-    assert_eq!(fraction & 0x1fff, 0, "{value} is not exact in fp16");
-    sign | ((exponent as u16) << 10) | ((fraction >> 13) as u16)
-}
-
-fn f16_to_f32(bits: u16) -> f32 {
-    let sign = ((bits >> 15) & 1) as u32;
-    let exp = ((bits >> 10) & 0x1f) as u32;
-    let frac = (bits & 0x3ff) as u32;
-    let word = match exp {
-        0 if frac == 0 => sign << 31,
-        0x1f => (sign << 31) | 0x7f80_0000 | (frac << 13),
-        0 => {
-            let mut exponent = -1i32;
-            let mut mantissa = frac;
-            while mantissa & 0x400 == 0 {
-                mantissa <<= 1;
-                exponent -= 1;
-            }
-            (sign << 31) | (((exponent + 127 - 15) as u32) << 23) | ((mantissa & 0x3ff) << 13)
-        }
-        _ => (sign << 31) | ((exp + 127 - 15) << 23) | (frac << 13),
-    };
-    f32::from_bits(word)
-}
-
-unsafe fn fill_f16(ptr: *mut u8, byte_len: usize, value: f32) {
-    let word = f32_to_f16(value);
-    unsafe {
-        let slice = std::slice::from_raw_parts_mut(ptr as *mut u16, byte_len / 2);
-        slice.fill(word);
+/// Real zero point `0` for both input and output (`0x80` raw, matching
+/// `build_lut_regcmd`'s `wrapping_sub(0x80)` decode), `input_scale=
+/// output_scale=1/128` -- covers exactly this table's designed domain
+/// (`SQUARE_BN_SCALE_K`'s doc comment: real `x` in `[-1, 1]`), with
+/// `square(x)` staying within `[0, 1)`, comfortably inside a signed
+/// byte's positive half at this same output scale.
+fn square_shape() -> LutShape {
+    LutShape {
+        width: 4,
+        height: 4,
+        channels: 16,
+        input_zero_point: 0x80,
+        output_zero_point: 0x80,
+        input_scale: 1.0 / 128.0,
+        output_scale: 1.0 / 128.0,
     }
 }
 
-fn assert_matches_oracle(label: &str, got: &[f32], expected: f32, tolerance: f32) {
-    let mut mismatches = 0;
-    let mut samples = Vec::new();
-    for (i, &value) in got.iter().enumerate() {
-        if (value - expected).abs() > tolerance {
-            mismatches += 1;
-            if samples.len() < 4 {
-                samples.push(format!("[{i}] want {expected} got {value}"));
-            }
-        }
-    }
-    assert_eq!(
-        mismatches,
-        0,
-        "{label}: {mismatches}/{} pixels differ from oracle by more than {tolerance}:\n  {}",
-        got.len(),
-        samples.join("\n  ")
-    );
-}
-
-fn run_square(x_fill: f32) -> Vec<f32> {
+fn run_uniform_standalone_lut(shape: &LutShape, table: LutTable, input_fill: u8) -> Vec<u8> {
     let file = OpenOptions::new()
         .read(true)
         .write(true)
@@ -121,22 +64,17 @@ fn run_square(x_fill: f32) -> Vec<f32> {
     let fd = file.as_raw_fd();
 
     unsafe {
-        let buf_in = Buffer::new(fd, TENSOR_SIZE, &file);
-        fill_f16(buf_in.host_ptr, TENSOR_SIZE, x_fill);
+        let buf_a = Buffer::new(fd, TENSOR_SIZE, &file);
+        ptr::write_bytes(buf_a.host_ptr, input_fill, TENSOR_SIZE);
 
-        let buf_out = Buffer::new(fd, TENSOR_SIZE, &file);
-        ptr::write_bytes(buf_out.host_ptr, 0, TENSOR_SIZE);
+        let buf_c = Buffer::new(fd, TENSOR_SIZE, &file);
+        ptr::write_bytes(buf_c.host_ptr, 0, TENSOR_SIZE);
 
-        let shape = EwSquareShape {
-            width: WIDTH,
-            height: HEIGHT,
-            channels: 1,
+        let bufs = LutBuffers {
+            input_addr: buf_a.dma_address,
+            output_addr: buf_c.dma_address,
         };
-        let bufs = EwSquareBuffers {
-            input_addr: buf_in.dma_address,
-            output_addr: buf_out.dma_address,
-        };
-        let cmds = build_square_regcmd(&shape, &bufs);
+        let cmds = build_lut_regcmd(shape, &bufs, table);
 
         let cmd_bytes = cmds.len() * mem::size_of::<u64>();
         let cmd_len = cmd_bytes.next_multiple_of(4096);
@@ -146,12 +84,12 @@ fn run_square(x_fill: f32) -> Vec<f32> {
             cmd_slice[i] = c.0;
         }
 
-        fini_bo(fd, buf_in.handle).ok();
-        fini_bo(fd, buf_out.handle).ok();
+        fini_bo(fd, buf_a.handle).ok();
+        fini_bo(fd, buf_c.handle).ok();
         fini_bo(fd, buf_cmd.handle).ok();
 
-        let in_handles = [buf_cmd.handle, buf_in.handle];
-        let out_handles = [buf_out.handle];
+        let in_handles = [buf_cmd.handle, buf_a.handle];
+        let out_handles = [buf_c.handle];
 
         submit(
             fd,
@@ -162,20 +100,18 @@ fn run_square(x_fill: f32) -> Vec<f32> {
         )
         .expect("SUBMIT ioctl failed");
 
-        prep_bo(fd, buf_out.handle, 2_000_000_000).unwrap_or_else(|e| {
+        prep_bo(fd, buf_c.handle, 2_000_000_000).unwrap_or_else(|e| {
             panic!(
-                "square job did not complete within timeout (x_fill={x_fill}) -- see this \
-                 file's top doc comment, this is the first hardware round for MUL mode and \
-                 ERDMA self-aliasing: {e}"
+                "standalone square LUT job did not complete within timeout (input_fill=\
+                 {input_fill}) -- DPU/MRDMA flying-mode LUT config may have hung the NPU: {e}"
             )
         });
 
-        let raw =
-            std::slice::from_raw_parts(buf_out.host_ptr as *const u16, (WIDTH * HEIGHT) as usize);
-        let pixels = raw.iter().map(|&bits| f16_to_f32(bits)).collect();
+        let raw = std::slice::from_raw_parts(buf_c.host_ptr, 256);
+        let pixels = raw[..16].to_vec();
 
-        close_bo(fd, buf_in.handle).ok();
-        close_bo(fd, buf_out.handle).ok();
+        close_bo(fd, buf_a.handle).ok();
+        close_bo(fd, buf_c.handle).ok();
         close_bo(fd, buf_cmd.handle).ok();
 
         pixels
@@ -185,15 +121,56 @@ fn run_square(x_fill: f32) -> Vec<f32> {
 #[test]
 #[ignore = "needs the real NPU device -- cross-compile for aarch64, copy to the board, run there"]
 fn ew_square_completes() {
-    let out = run_square(-3.0);
+    let shape = square_shape();
+    let out = run_uniform_standalone_lut(&shape, LutTable::square(), 64);
     eprintln!("ew_square_completes: output={out:?}");
 }
 
 #[test]
 #[ignore = "needs the real NPU device -- cross-compile for aarch64, copy to the board, run there"]
 fn ew_square_matches_oracle() {
-    for x in [-6.0f32, -4.5, -2.0, -0.5, 0.0, 0.5, 2.0, 4.5, 6.0] {
-        let got = run_square(x);
-        assert_matches_oracle(&format!("square(x={x})"), &got, x * x, 0.0);
+    let shape = square_shape();
+    const TOLERANCE_LSB: f32 = 2.0;
+    let tolerance = TOLERANCE_LSB * shape.output_scale;
+
+    // Signed int8 fills spanning this table's designed domain (real
+    // x in [-1.0, 0.9921875] at input_scale=1/128).
+    let fills: [u8; 11] = [
+        128, // -128 -> -1.0
+        192, // -64  -> -0.5
+        224, // -32  -> -0.25
+        240, // -16  -> -0.125
+        255, // -1   -> -0.0078125
+        0,   // 0    -> 0.0
+        16,  // 16   -> 0.125
+        32,  // 32   -> 0.25
+        64,  // 64   -> 0.5
+        96,  // 96   -> 0.75
+        127, // 127  -> 0.9921875
+    ];
+
+    for &fill in &fills {
+        let real_input = (fill as i8) as f32 * shape.input_scale;
+        let expected = real_input * real_input;
+
+        let raw = run_uniform_standalone_lut(&shape, LutTable::square(), fill);
+        let mut mismatches = 0;
+        let mut samples = Vec::new();
+        for (i, &byte) in raw.iter().enumerate() {
+            let got = (byte as i8) as f32 * shape.output_scale;
+            if (got - expected).abs() > tolerance {
+                mismatches += 1;
+                if samples.len() < 4 {
+                    samples.push(format!("[ch{i}] want {expected} got {got}"));
+                }
+            }
+        }
+        assert_eq!(
+            mismatches,
+            0,
+            "square(real_input={real_input}, fill={fill}): {mismatches}/16 channels differ from \
+             oracle by more than {tolerance} ({TOLERANCE_LSB} LSB):\n  {}",
+            samples.join("\n  ")
+        );
     }
 }

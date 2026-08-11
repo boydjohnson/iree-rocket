@@ -176,6 +176,31 @@ impl LutTable {
             bn_scale_k: LUT_BN_SCALE_K,
         }
     }
+
+    /// `square(x) = x*x`. The first table in this file with no vendor
+    /// capture behind it at all -- see `lut_tables::SQUARE_LE`/`_LO`'s own
+    /// doc comment for the generation formula and why `bn_scale_k` here
+    /// MUST equal `SQUARE_BN_SCALE_K` (the same constant the table
+    /// generator used, by construction -- not a coincidence to preserve).
+    /// Domain restricted to real `x` in `[-1, 1]` (`SQUARE_BN_SCALE_K`'s
+    /// doc comment): `x^2`'s output has no natural ceiling the way
+    /// sigmoid/tanh/erf's saturating curves do, so unlike those, this
+    /// table is only accurate inside that domain -- flat-clamped
+    /// (`le_slope_uflow_scale/shift=0`) rather than tracking the true
+    /// (quadratically growing) function beyond it. `ew_op_bypass=1`
+    /// matches `tanh()`/`exp()` (2 of 3 real captures use this value) --
+    /// a guess for a table with no capture to copy from, not a confirmed
+    /// choice; see `tests/ew_square_hw.rs` for the oracle-based gate.
+    pub fn square() -> Self {
+        LutTable {
+            le_entries: &crate::rocket::lut_tables::SQUARE_LE,
+            lo_entries: &crate::rocket::lut_tables::SQUARE_LO,
+            ew_op_bypass: 1,
+            le_slope_uflow_scale: 0,
+            le_slope_uflow_shift: 0,
+            bn_scale_k: SQUARE_BN_SCALE_K,
+        }
+    }
 }
 
 /// Writes one LUT table bank via the auto-incrementing `LUT_ACCESS_DATA`
@@ -291,6 +316,22 @@ const LUT_BN_SCALE_K: f32 = 2596.513;
 /// formula exactly -- that discrepancy looks sigmoid-capture-specific,
 /// not a general gap in the ALU formula.
 const TANH_LUT_BN_SCALE_K: f32 = 5425.193;
+
+/// `square()`'s `bn_scale_k`. Unlike `LUT_BN_SCALE_K`/`TANH_LUT_BN_SCALE_K`
+/// (both reverse-engineered from real captures via a calibration sweep,
+/// fit to match hardware that already existed), this constant and
+/// `lut_tables::SQUARE_LE`/`_LO`'s own generation formula were chosen
+/// together, by this crate, with no capture to fit against: `real_x =
+/// x_fixed / SQUARE_BN_SCALE_K` is the domain mapping the table generator
+/// used to compute `x^2`, and `bn_scale_k=SQUARE_BN_SCALE_K` here tells
+/// `lut_bn_mul` to convert a real tensor value into the fixed domain
+/// using that exact same mapping -- so the composition (BN_MUL's
+/// quantization-scale-to-fixed-domain conversion, then the table lookup)
+/// reproduces `x^2` by construction, not by a fitted coincidence. Keep
+/// this equal to whatever `K` the table itself was generated with if
+/// either ever changes -- they are one number, not two that happen to
+/// agree. `16384` puts the real domain edge at `x=+-1.0` (`16384/K`).
+const SQUARE_BN_SCALE_K: f32 = 16384.0;
 
 /// `BN_MUL_OPERAND`/`BN_MUL_SHIFT` for `build_lut_regcmd`:
 /// `multiplier = input_scale * k`, normalized (standard mantissa/exponent

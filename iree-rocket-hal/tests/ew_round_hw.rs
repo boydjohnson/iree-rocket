@@ -306,7 +306,12 @@ fn run_round(x_fill: f32) -> Vec<f32> {
 fn ew_round_add_const_matches_oracle() {
     for x in [-6.0f32, -4.5, -2.0, -0.5, 0.0, 0.5, 2.0, 4.5, 6.0] {
         let got = run_add_const(x, 0.5);
-        assert_matches_oracle(&format!("add_const(x={x}, operand=0.5)"), &got, x + 0.5, 0.0);
+        assert_matches_oracle(
+            &format!("add_const(x={x}, operand=0.5)"),
+            &got,
+            x + 0.5,
+            0.0,
+        );
     }
 }
 
