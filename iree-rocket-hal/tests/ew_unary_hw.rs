@@ -108,6 +108,7 @@ fn unary_shape(algo: EwUnaryAlgo) -> EwUnaryShape {
         height: HEIGHT,
         channels: 1,
         algo,
+        operand: 0,
     }
 }
 
