@@ -95,6 +95,18 @@ pub struct LutTable {
     /// with sigmoid's tail not being fully flat even far from zero).
     pub le_slope_uflow_scale: u16,
     pub le_slope_uflow_shift: u8,
+    /// `lut_bn_mul`'s `K` constant for this specific function -- the real
+    /// input-scale-to-fixed-domain multiplier is NOT function-independent,
+    /// despite the domain/indexing recipe above being compiler-generic.
+    /// `sigmoid()`/`exp()` use the original `LUT_BN_SCALE_K` (fit from
+    /// sigmoid captures only); `tanh()` uses its own independently-fit
+    /// `TANH_LUT_BN_SCALE_K` -- reusing sigmoid's constant for tanh was an
+    /// unverified assumption caught by a real oracle-based hardware test
+    /// (`tests/lut_hw.rs::lut_standalone_tanh_matches_oracle`) that found
+    /// tanh output tracking `tanh(real_input/2)`, i.e. the shared constant
+    /// undershot tanh's real domain scale by roughly 2x. See
+    /// `TANH_LUT_BN_SCALE_K`'s own doc comment for the derivation.
+    pub bn_scale_k: f32,
 }
 
 impl LutTable {
@@ -105,6 +117,7 @@ impl LutTable {
             ew_op_bypass: 0,
             le_slope_uflow_scale: 23107,
             le_slope_uflow_shift: 22,
+            bn_scale_k: LUT_BN_SCALE_K,
         }
     }
 
@@ -115,6 +128,7 @@ impl LutTable {
             ew_op_bypass: 1,
             le_slope_uflow_scale: 0,
             le_slope_uflow_shift: 0,
+            bn_scale_k: TANH_LUT_BN_SCALE_K,
         }
     }
 
@@ -137,13 +151,21 @@ impl LutTable {
     ///   softmax's own max-subtract-then-exp pattern) would get an
     ///   unvalidated constant `1.0` for any `x >= 0` input.
     ///
-    /// One piece of good, independent supporting evidence this recipe
-    /// generalizes correctly: the real captured `BN_MUL_CFG=0x6a660000`
-    /// for this op backs out to `input_scale ~= 10.49` via the *existing*
-    /// `lut_bn_mul()`/`LUT_BN_SCALE_K=2596.513` formula (fit from
-    /// sigmoid/tanh captures, not exp) -- i.e. `build_lut_regcmd`'s
-    /// generic `input_scale`/`input_zero_point` handling doesn't need any
-    /// exp-specific change, only this table.
+    /// One piece of supporting evidence this recipe generalizes correctly:
+    /// the real captured `BN_MUL_CFG=0x6a660000` for this op backs out to
+    /// `input_scale ~= 10.49` via the *existing* `lut_bn_mul()`/
+    /// `LUT_BN_SCALE_K=2596.513` formula. WEAKER evidence than it looked
+    /// when first written, though: that formula's doc comment used to
+    /// claim it was "fit from sigmoid/tanh captures", but `tanh()`'s own
+    /// `bn_scale_k` doc comment above tells the real story -- `tanh` was
+    /// never actually part of that regression, and reusing sigmoid's `K`
+    /// for tanh undershot tanh's real domain scale by ~2x, caught by a
+    /// real oracle-based hardware test. This single exp data point being
+    /// consistent with `LUT_BN_SCALE_K` doesn't rule out exp needing its
+    /// own independently-fit constant the same way tanh did -- one
+    /// capture can't distinguish "the shared K is right" from "the shared
+    /// K happens to be close enough at this one scale". Treat `exp()`'s
+    /// `bn_scale_k` as unconfirmed, same caveat class as `EXP_LO`.
     pub fn exp() -> Self {
         LutTable {
             le_entries: &crate::rocket::lut_tables::EXP_LE,
@@ -151,6 +173,7 @@ impl LutTable {
             ew_op_bypass: 1,
             le_slope_uflow_scale: 0,
             le_slope_uflow_shift: 0,
+            bn_scale_k: LUT_BN_SCALE_K,
         }
     }
 }
@@ -225,21 +248,60 @@ fn push_lut_tables_and_config(cmds: &mut Vec<RegCmd>, table: LutTable) {
 }
 
 /// Empirically-fit constant relating a shape's `input_scale` to DPU BN's
-/// multiply stage in `build_lut_regcmd` -- reverse-engineered from
-/// 5 independent int8-quantized `rknn-toolkit2` sigmoid captures at
-/// different calibration scales (see `lut_bn_mul`'s doc comment and
-/// `rknpu-spelunking/NOTES.md`). Not a documented hardware constant.
+/// multiply stage in `build_lut_regcmd`, for `sigmoid()`/`exp()` --
+/// reverse-engineered from 5 independent int8-quantized `rknn-toolkit2`
+/// SIGMOID captures at different calibration scales (see `lut_bn_mul`'s
+/// doc comment and `rknpu-spelunking/NOTES.md`). Not a documented hardware
+/// constant. `exp()` reuses this on unconfirmed cross-fingers evidence
+/// (see its own doc comment) -- `tanh()` used to as well, until a real
+/// oracle-based hardware test showed that was wrong; see
+/// `TANH_LUT_BN_SCALE_K` for what replaced it there.
 const LUT_BN_SCALE_K: f32 = 2596.513;
 
+/// `tanh()`'s own independently-fit counterpart to `LUT_BN_SCALE_K`.
+/// Derivation, mirroring the original sigmoid sweep exactly (same 5
+/// calibration arrays -- `rknpu-spelunking/build/calib{0,1,2,3,4}.npy`,
+/// reused verbatim since they're just generic `(1,3,32,32)` float32
+/// arrays, model-independent -- new `config.tanh.w8a8.v{1,2,3,4}.toml` +
+/// the pre-existing `config.tanh.w8a8.toml`, built via `rknn-convert`,
+/// decoded with `scripts/decode_regcmd.py`, real `input_scale`/
+/// `zero_point` per point recovered via `RKNN.hybrid_quantization_step1`
+/// on the same 5 datasets):
+///
+/// | scale        | zero_point | BN_MUL_CFG   | operand | shift |
+/// |--------------|------------|--------------|---------|-------|
+/// | 0.0246581620 | -2         | 0x42e30700   | 17123   | 7     |
+/// | 0.0058786308 | 42         | 0x7f920a00   | 32658   | 10    |
+/// | 0.0011761119 | 42         | 0x66170c00   | 26135   | 12    |
+/// | 0.0125490196 | -128       | 0x44150800   | 17429   | 8     |
+/// | 0.0125490196 | 127        | 0x44150800   | 17429   | 8     |
+///
+/// Every `K` in `[5425.132, 5425.254]` bit-exact-reconstructs all 5
+/// `(operand, shift)` pairs through the same normalization `lut_bn_mul`
+/// already uses (`shift = 14 - floor(log2(scale*K))`,
+/// `operand = round(scale*K*2^shift)`) -- as tight and "not approximate
+/// agreement" as `LUT_BN_SCALE_K`'s own sigmoid fit. `5425.193` (the
+/// midpoint) is used here. Notably NOT simply `2 * LUT_BN_SCALE_K`
+/// (`5193.026`) -- close, but tanh really does need its own constant, not
+/// a derived multiple of sigmoid's.
+///
+/// Side finding from the same sweep: unlike sigmoid's documented ~1/16
+/// discrepancy at `zero_point=42` (see `lut_bn_alu`'s doc comment), both
+/// of tanh's `zero_point=42` points above match `lut_bn_alu`'s plain
+/// formula exactly -- that discrepancy looks sigmoid-capture-specific,
+/// not a general gap in the ALU formula.
+const TANH_LUT_BN_SCALE_K: f32 = 5425.193;
+
 /// `BN_MUL_OPERAND`/`BN_MUL_SHIFT` for `build_lut_regcmd`:
-/// `multiplier = input_scale * LUT_BN_SCALE_K`, normalized (standard
-/// mantissa/exponent split) so `operand = round(multiplier * 2^shift)`
-/// lands in `[16384, 32768)` -- reconstructs the captured register values
-/// exactly across all 5 known data points (see the call site's doc
-/// comment for which zero points were used and the caveat on
-/// `lut_bn_alu`).
-fn lut_bn_mul(input_scale: f32) -> (u32, u32) {
-    let multiplier = input_scale * LUT_BN_SCALE_K;
+/// `multiplier = input_scale * k`, normalized (standard mantissa/exponent
+/// split) so `operand = round(multiplier * 2^shift)` lands in
+/// `[16384, 32768)`. `k` is `LutTable::bn_scale_k` -- NOT a single
+/// function-independent constant, see that field's doc comment --
+/// reconstructs the captured register values exactly across all known
+/// data points for a given `k` (see the call site's doc comment for which
+/// zero points were used and the caveat on `lut_bn_alu`).
+fn lut_bn_mul(input_scale: f32, k: f32) -> (u32, u32) {
+    let multiplier = input_scale * k;
     let e = multiplier.log2().floor() as i32;
     let shift = 14 - e;
     let operand = (multiplier * 2f32.powi(shift)).round() as u32;
@@ -247,10 +309,14 @@ fn lut_bn_mul(input_scale: f32) -> (u32, u32) {
 }
 
 /// `BN_ALU_OPERAND` for `build_lut_regcmd`: `-real_zero_point *
-/// bn_mul_operand`. Exact for 3 of 5 known data points; an unresolved ~1/16
-/// discrepancy showed up for the other 2 (both `real_zero_point == 42`) --
-/// see the call site's doc comment. Always exactly right when
-/// `real_zero_point == 0`.
+/// bn_mul_operand`. Exact for 3 of 5 known sigmoid data points; an
+/// unresolved ~1/16 discrepancy showed up for the other 2 (both
+/// `real_zero_point == 42`) -- see the call site's doc comment. Always
+/// exactly right when `real_zero_point == 0`. NOT reproduced by tanh's
+/// own independent 5-point sweep (`TANH_LUT_BN_SCALE_K`'s doc comment) --
+/// both of tanh's `zero_point=42` points matched this plain formula
+/// exactly, so the discrepancy looks specific to the original sigmoid
+/// captures, not a general property of this formula.
 fn lut_bn_alu(real_zero_point: i32, bn_mul_operand: u32) -> u32 {
     let alu = -(real_zero_point as i64) * (bn_mul_operand as i64);
     alu as i32 as u32
@@ -326,7 +392,7 @@ pub fn build_lut_regcmd(shape: &LutShape, bufs: &LutBuffers, table: LutTable) ->
         .next_multiple_of(FEATURE_ATOMIC_SIZE);
     let surface_stride = shape.width * shape.height * task_channels;
     let out_offset = shape.output_zero_point.wrapping_sub(0x80);
-    let (bn_mul_operand, bn_mul_shift) = lut_bn_mul(shape.input_scale);
+    let (bn_mul_operand, bn_mul_shift) = lut_bn_mul(shape.input_scale, table.bn_scale_k);
     let real_zero_point = shape.input_zero_point.wrapping_sub(0x80) as i8 as i32;
     assert!(
         lut_bn_alu_supports_zero_point(real_zero_point),

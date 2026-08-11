@@ -404,3 +404,79 @@ fn lut_standalone_tanh_negative_zero_positive_are_ordered() {
          zero_raw={zero_raw} zero_code={zero}, pos_raw={pos_raw} pos_code={pos}"
     );
 }
+
+/// Real oracle check, not just ordering. Previously FAILED on real
+/// hardware (`LutTable::tanh()`'s output tracked `tanh(real_input / 2)`,
+/// not `tanh(real_input)` -- a systematic ~2x domain-scale error present
+/// at every magnitude, not just the tails). Root cause: `lut_bn_mul`'s
+/// `LUT_BN_SCALE_K=2596.513` was reverse-engineered from 5 SIGMOID-only
+/// int8 captures (`rknpu-spelunking/NOTES.md`'s "Decoding the DPU LUT
+/// block" section) and reused for tanh on an unverified assumption that
+/// the real-input-to-fixed-domain mapping is function-independent. A
+/// parallel sweep against `LutTable::sigmoid()` at the same shape/fills
+/// matched its own oracle to ~1 LSB throughout, confirming the shared
+/// `build_lut_regcmd` plumbing was fine and the gap was specific to
+/// tanh's domain mapping.
+///
+/// Fixed by giving `tanh()` its own independently-fit
+/// `TANH_LUT_BN_SCALE_K=5425.193` (`activation.rs`, `LutTable::bn_scale_k`)
+/// -- derived the same way `LUT_BN_SCALE_K` was, via a real 5-point
+/// calibration sweep (`rknpu-spelunking/config.tanh.w8a8.v{1,2,3,4}.toml`
+/// + the pre-existing base config, reusing the exact same `calib{0..4}
+/// .npy` arrays sigmoid's sweep used -- generic float32 calibration data,
+/// model-independent), bit-exact across all 5 points the same way
+/// sigmoid's constant is. See `TANH_LUT_BN_SCALE_K`'s own doc comment for
+/// the full derivation table. Notably not simply `2 * LUT_BN_SCALE_K` --
+/// tanh genuinely needs its own constant, not a round multiple of
+/// sigmoid's.
+#[test]
+#[ignore = "needs the real NPU device -- cross-compile for aarch64, copy to the board, run there"]
+fn lut_standalone_tanh_matches_oracle() {
+    let shape = standalone_lut_shape_with(0x80, 0x80, 1.0 / 32.0, 1.0 / 128.0);
+    const TOLERANCE_LSB: f32 = 2.0;
+    let tolerance = TOLERANCE_LSB * shape.output_scale;
+
+    let fills: [u8; 15] = [
+        128, // -128 -> -4.0
+        176, // -80  -> -2.5
+        200, // -56  -> -1.75
+        220, // -36  -> -1.125
+        250, // -6   -> -0.1875
+        255, // -1   -> -0.03125
+        0,   // 0    -> 0.0
+        1,   // 1    -> 0.03125
+        6,   // 6    -> 0.1875
+        36,  // 36   -> 1.125
+        56,  // 56   -> 1.75
+        80,  // 80   -> 2.5
+        100, // 100  -> 3.125
+        120, // 120  -> 3.75
+        127, // 127  -> 3.96875
+    ];
+
+    for &fill in &fills {
+        let real_input = (fill as i8) as f32 * shape.input_scale;
+        let expected = real_input.tanh();
+
+        let raw = run_uniform_standalone_lut(&shape, LutTable::tanh(), fill);
+        let mut mismatches = 0;
+        let mut samples = Vec::new();
+        for (i, &byte) in raw.iter().enumerate() {
+            let got = (byte as i8) as f32 * shape.output_scale;
+            if (got - expected).abs() > tolerance {
+                mismatches += 1;
+                if samples.len() < 4 {
+                    samples.push(format!("[ch{i}] want {expected} got {got}"));
+                }
+            }
+        }
+        assert_eq!(
+            mismatches,
+            0,
+            "tanh(real_input={real_input}, fill={fill}): {mismatches}/16 channels differ from \
+             oracle by more than {tolerance} ({TOLERANCE_LSB} LSB) -- see this test's own doc \
+             comment, this is a known open finding (tanh domain-scale), not a new bug:\n  {}",
+            samples.join("\n  ")
+        );
+    }
+}
