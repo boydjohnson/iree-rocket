@@ -229,6 +229,81 @@ impl LutTable {
             bn_scale_k: ERF_BN_SCALE_K,
         }
     }
+
+    /// `sqrt(x)`, `x >= 0` only. Same self-derived methodology as
+    /// `square()`/`erf()` -- see `lut_tables::SQRT_LE`/`_LO`'s own doc
+    /// comment for the generation formula, the domain restriction
+    /// (`SQRT_LE`, `x<0`, is placeholder-only: `sqrt` is undefined there,
+    /// not just inaccurate the way `square`'s beyond-edge region is), and
+    /// why `bn_scale_k` here MUST equal `SQRT_BN_SCALE_K`. Caller must
+    /// guarantee non-negative input; this table cannot enforce that.
+    pub fn sqrt() -> Self {
+        LutTable {
+            le_entries: &crate::rocket::lut_tables::SQRT_LE,
+            lo_entries: &crate::rocket::lut_tables::SQRT_LO,
+            ew_op_bypass: 1,
+            le_slope_uflow_scale: 0,
+            le_slope_uflow_shift: 0,
+            bn_scale_k: SQRT_BN_SCALE_K,
+        }
+    }
+
+    /// `rsqrt(x) = 1/sqrt(x)`. See `lut_tables::RSQRT_LE`/`_LO`'s own doc
+    /// comment for the generation formula and the real, load-bearing
+    /// domain restriction: only accurate for `x` in `[1, 16)` --
+    /// `rsqrt(x) > 1.0` for `x < 1` exceeds this Q15 encoding's ceiling,
+    /// so that region is clamped to `32767` rather than holding real
+    /// values, unlike `square()`/`erf()`/`sqrt()` which are accurate
+    /// across their entire declared domain. `bn_scale_k` here MUST equal
+    /// `RSQRT_BN_SCALE_K`.
+    pub fn rsqrt() -> Self {
+        LutTable {
+            le_entries: &crate::rocket::lut_tables::RSQRT_LE,
+            lo_entries: &crate::rocket::lut_tables::RSQRT_LO,
+            ew_op_bypass: 1,
+            le_slope_uflow_scale: 0,
+            le_slope_uflow_shift: 0,
+            bn_scale_k: RSQRT_BN_SCALE_K,
+        }
+    }
+
+    /// `log(x)` (natural log). See `lut_tables::LOG_LE`/`_LO`'s own doc
+    /// comment for the generation formula and the real, load-bearing
+    /// domain restriction: only accurate for `x` in roughly `[0.02, e)`
+    /// (`e~=2.718`) -- unlike `rsqrt()` (clamped on one side only), `log`
+    /// clamps on BOTH sides (`32767` near the domain's far edge, `-32768`
+    /// near `x=0`) since it is unbounded in both directions. Both clamps
+    /// are at least sign-correct. `bn_scale_k` here MUST equal
+    /// `LOG_BN_SCALE_K`.
+    pub fn log() -> Self {
+        LutTable {
+            le_entries: &crate::rocket::lut_tables::LOG_LE,
+            lo_entries: &crate::rocket::lut_tables::LOG_LO,
+            ew_op_bypass: 1,
+            le_slope_uflow_scale: 0,
+            le_slope_uflow_shift: 0,
+            bn_scale_k: LOG_BN_SCALE_K,
+        }
+    }
+
+    /// `reciprocal(x) = 1/x`. See `lut_tables::RECIPROCAL_LE`/`_LO`'s own
+    /// doc comment for the generation formula and the real, load-bearing
+    /// domain restriction: only accurate for `|x|` in `[1, 16)` -- unlike
+    /// `log()`/`rsqrt()`, `reciprocal` is odd, so both `LE` and `LO` hold
+    /// real (mirror-antisymmetric) data, not a placeholder half; both
+    /// clamp near their own zero-crossing where `|reciprocal(x)| > 1.0`
+    /// would otherwise overflow this Q15 encoding. `bn_scale_k` here MUST
+    /// equal `RECIPROCAL_BN_SCALE_K`.
+    pub fn reciprocal() -> Self {
+        LutTable {
+            le_entries: &crate::rocket::lut_tables::RECIPROCAL_LE,
+            lo_entries: &crate::rocket::lut_tables::RECIPROCAL_LO,
+            ew_op_bypass: 1,
+            le_slope_uflow_scale: 0,
+            le_slope_uflow_shift: 0,
+            bn_scale_k: RECIPROCAL_BN_SCALE_K,
+        }
+    }
 }
 
 /// Writes one LUT table bank via the auto-incrementing `LUT_ACCESS_DATA`
@@ -382,6 +457,30 @@ const SQUARE_BN_SCALE_K: f32 = 16384.0;
 /// constant's own doc comment -- the reasoning is identical here). `4096`
 /// puts the real domain edge at `x=+-4.0`.
 const ERF_BN_SCALE_K: f32 = 4096.0;
+
+/// `sqrt()`'s `bn_scale_k`, same "chosen together with the table
+/// generator" status as `SQUARE_BN_SCALE_K`/`ERF_BN_SCALE_K`. `16384`
+/// puts the real domain edge at `x=1.0`, matching `SQUARE_BN_SCALE_K`
+/// exactly (`sqrt`'s domain choice mirrors `square`'s, inverted).
+const SQRT_BN_SCALE_K: f32 = 16384.0;
+
+/// `rsqrt()`'s `bn_scale_k`, same "chosen together with the table
+/// generator" status as the constants above. `1024` puts the real domain
+/// edge at `x=16.0` (`RSQRT_LE`/`_LO`'s doc comment covers why the domain
+/// choice itself, not just this constant, is the interesting part here).
+const RSQRT_BN_SCALE_K: f32 = 1024.0;
+
+/// `log()`'s `bn_scale_k`, same "chosen together with the table
+/// generator" status as the constants above. `4096` puts the real domain
+/// edge at `x=4.0`, matching `ERF_BN_SCALE_K` (`LOG_LE`/`_LO`'s doc
+/// comment covers why only part of that domain holds real values).
+const LOG_BN_SCALE_K: f32 = 4096.0;
+
+/// `reciprocal()`'s `bn_scale_k`, same "chosen together with the table
+/// generator" status as the constants above. `1024` puts the real domain
+/// edge at `x=+-16.0`, matching `RSQRT_BN_SCALE_K` (`RECIPROCAL_LE`/`_LO`'s
+/// doc comment covers why only `|x|` in `[1, 16)` holds real values).
+const RECIPROCAL_BN_SCALE_K: f32 = 1024.0;
 
 /// `BN_MUL_OPERAND`/`BN_MUL_SHIFT` for `build_lut_regcmd`:
 /// `multiplier = input_scale * k`, normalized (standard mantissa/exponent
