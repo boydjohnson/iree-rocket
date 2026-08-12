@@ -1,9 +1,10 @@
-//! Element-wise (EW) tensor-tensor ops on the DPU's EW/ERDMA block.
+//! Element-wise (EW) tensor ops on the DPU's EW/ERDMA block.
 //!
-//! Currently one shape: add/subtract of a conv's output with a second
-//! tensor ([`EwAddShape`], [`build_add_regcmd`]/[`build_conv_then_add_regcmd`]).
-//! The EW block is otherwise fully bypassed by every other builder in this
-//! crate.
+//! Two shapes: add/subtract of a conv's output with a second tensor
+//! ([`EwAddShape`], [`build_add_regcmd`]/[`build_conv_then_add_regcmd`]),
+//! and single-tensor EW-ALU ops ([`EwUnaryShape`]/[`build_unary_regcmd`]:
+//! abs/negf/floor/ceil). The EW block is otherwise fully bypassed by every
+//! other builder in this crate.
 //!
 //! Capture-derived, like [`crate::rocket::activation`]'s
 //! `build_conv_then_lut_regcmd`. A dedicated 47-model `Conv2d(x) +/- w`
@@ -537,4 +538,365 @@ pub fn build_conv_then_add_regcmd(
         },
     );
     (conv_cmds, add_cmds)
+}
+
+/// Raw `ew_alu_algo` opcode for a single-tensor EW-ALU task. Numeric values
+/// match the TRM's `EW_ALU_ALGO` field (`RKNN_dpu_ew_cfg`, bits 19:16)
+/// exactly -- `0=Max 1=Min 3=Div 4=Minus` are the remaining binary opcodes
+/// [`EwAddShape::algo`] already covers (`2=Add` moved here, see below).
+/// `Abs`/`Neg`/`Floor`/`Ceil` are the ones the TRM documents as genuinely
+/// unary (no second operand needed to define the result); `Add` is
+/// included too, but as a scalar-plus-constant op (`EwUnaryShape::
+/// operand`), not the tensor-plus-tensor shape `EwAddShape`/
+/// `build_add_regcmd` cover -- needed to build `round(x)` as `floor(x +
+/// 0.5)`, two chained [`build_unary_regcmd`] tasks.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum EwUnaryAlgo {
+    Add = 2,
+    Abs = 5,
+    Neg = 6,
+    Floor = 7,
+    Ceil = 8,
+}
+
+/// Logical shape for the standalone unary EW-ALU task: one input tensor,
+/// one output tensor of identical shape, fp16 only. int8 is deliberately
+/// not supported yet -- unlike [`EwAddShape`], there is no existing capture
+/// (vendor or otherwise) to confirm an int8 zero-point/scale recipe against
+/// for this task shape, and this crate's convention is to not ship an
+/// int8 branch with zero hardware evidence behind it (see
+/// [`EwAddShape::w_scale_ratio`]'s doc comment for the standard this
+/// project holds even *inferred* int8 formulas to -- this would be worse,
+/// wholly unconfirmed).
+#[derive(Clone, Copy, Debug)]
+pub struct EwUnaryShape {
+    pub width: u32,
+    pub height: u32,
+    /// Real (unpadded) channel count.
+    pub channels: u32,
+    pub algo: EwUnaryAlgo,
+    /// Scalar operand for `EwUnaryAlgo::Add`, raw `f32::to_bits` -- the
+    /// EW ALU's internal datapath processes fp16 input upconverted to
+    /// fp32 (see `mrdma_fp16tofp32_en`/`fp32tofp16_en` elsewhere in this
+    /// builder), so a plain IEEE754 fp32 encoding is this field's working
+    /// hypothesis for `EW_OP_VALUE_0`'s "from configure register" operand
+    /// -- UNCONFIRMED, there is no existing capture using this operand
+    /// source at all (every other builder here only ever zeroes it or
+    /// feeds it from a real second tensor via ERDMA). See this task's own
+    /// HW test (`tests/ew_round_hw.rs`) for the actual correctness gate.
+    /// Must be `0` for every other algo (asserted in
+    /// [`build_unary_regcmd`]).
+    pub operand: u32,
+}
+
+pub struct EwUnaryBuffers {
+    pub input_addr: u32,
+    pub output_addr: u32,
+}
+
+/// Builds the standalone unary EW-ALU task: DPU flying mode, `DPU_RDMA`
+/// fetches the single input tensor via its ordinary main-fetch path (same
+/// as [`EwAddBuffers::intermediate_addr`]'s), `EW` applies the ALU op with
+/// its operand sourced from the configure-register slot (zero/unused for
+/// `Abs`/`Neg`/`Floor`/`Ceil`, `shape.operand` for `Add`) rather than a
+/// second tensor, output written to real memory.
+///
+/// Structurally mirrors [`build_add_regcmd`]'s fp16 branch exactly (same
+/// task header, `BS`/`BN` fully bypassed, same `EW_CFG` precision bits),
+/// with two differences specific to being genuinely unary rather than
+/// reusing that function with a phantom second tensor:
+/// - `ew_op_src=0` ("from configure register") instead of `1` ("from
+///   outside"). Hardware-confirmed for `Abs`/`Neg`/`Floor`/`Ceil` (zeroed,
+///   unused operand -- `tests/ew_unary_hw.rs`, all green on `planck`).
+///   `Add`'s nonzero `shape.operand` case is NOT yet hardware-confirmed --
+///   no existing capture uses this operand source at all, so both "the
+///   operand register is read the way `Abs`/etc. show" and "a raw fp32
+///   encoding is what it expects" are working hypotheses. See
+///   `tests/ew_round_hw.rs` for that gate.
+/// - `ERDMA` is explicitly disabled (`RDMA_ERDMA_CFG.ERDMA_DISABLE=1`)
+///   rather than left at [`build_add_regcmd`]'s implicit
+///   default-i.e.-enabled, since there is no second tensor for it to fetch
+///   here.
+pub fn build_unary_regcmd(shape: &EwUnaryShape, bufs: &EwUnaryBuffers) -> Vec<RegCmd> {
+    assert!(
+        shape.width > 0 && shape.height > 0 && shape.channels > 0,
+        "build_unary_regcmd: width, height, and channels must be nonzero"
+    );
+    assert!(
+        shape.operand == 0 || matches!(shape.algo, EwUnaryAlgo::Add),
+        "build_unary_regcmd: operand is only meaningful for EwUnaryAlgo::Add, got algo={:?} \
+         operand={:#x}",
+        shape.algo,
+        shape.operand
+    );
+
+    const FEATURE_ATOMIC_SIZE: u32 = 16;
+    let task_channels = shape
+        .channels
+        .max(FEATURE_ATOMIC_SIZE)
+        .next_multiple_of(FEATURE_ATOMIC_SIZE);
+    let output_area = shape.width * shape.height;
+
+    let mut cmds: Vec<RegCmd> = Vec::new();
+
+    cmds.push(
+        Register::<DpuSPointer>::new()
+            .pointer_pp_mode(Bits::new(1))
+            .executer_pp_en(Bits::new(1))
+            .pointer_pp_en(Bits::new(1))
+            .build(),
+    );
+    cmds.push(
+        Register::<DpuRdmaSPointer>::new()
+            .pointer_pp_mode(Bits::new(1))
+            .executer_pp_en(Bits::new(1))
+            .pointer_pp_en(Bits::new(1))
+            .build(),
+    );
+
+    cmds.push(
+        Register::<DpuFeatureModeCfg>::new()
+            .flying_mode(Bits::new(1))
+            .output_mode(Bits::new(2))
+            .burst_len(Bits::new(15))
+            .build(),
+    );
+
+    cmds.push(
+        Register::<DpuDataFormat>::new()
+            .in_precision(Bits::new(2))
+            .out_precision(Bits::new(2))
+            .proc_precision(Bits::new(2))
+            .build(),
+    );
+
+    cmds.push(zero::<DpuOffsetPend>());
+    cmds.push(
+        Register::<DpuDstBaseAddr>::new()
+            .dst_base_addr(Bits::new(bufs.output_addr))
+            .build(),
+    );
+    cmds.push(
+        Register::<DpuDstSurfStride>::new()
+            .dst_surf_stride(Bits::new(output_area))
+            .build(),
+    );
+    cmds.push(
+        Register::<DpuDataCubeWidth>::new()
+            .width(Bits::new(shape.width - 1))
+            .build(),
+    );
+    cmds.push(
+        Register::<DpuDataCubeHeight>::new()
+            .height(Bits::new(shape.height - 1))
+            .build(),
+    );
+    cmds.push(zero::<DpuDataCubeNotchAddr>());
+    cmds.push(
+        Register::<DpuDataCubeChannel>::new()
+            .orig_channel(Bits::new(shape.channels - 1))
+            .channel(Bits::new(task_channels - 1))
+            .build(),
+    );
+
+    cmds.push(
+        Register::<DpuBsCfg>::new()
+            .bs_bypass(Bits::new(1))
+            .bs_alu_bypass(Bits::new(1))
+            .bs_mul_bypass(Bits::new(1))
+            .bs_relu_bypass(Bits::new(1))
+            .build(),
+    );
+    cmds.push(zero::<DpuBsAluCfg>());
+    cmds.push(zero::<DpuBsMulCfg>());
+    cmds.push(zero::<DpuBsReluxCmpValue>());
+    cmds.push(
+        Register::<DpuBsOwCfg>::new()
+            .od_bypass(Bits::new(1))
+            .build(),
+    );
+    cmds.push(zero::<DpuBsOwOp>());
+    cmds.push(
+        Register::<DpuWdmaSize0>::new()
+            .channel_wdma(Bits::new(task_channels - 1))
+            .build(),
+    );
+    cmds.push(
+        Register::<DpuWdmaSize1>::new()
+            .height_wdma(Bits::new(shape.height - 1))
+            .width_wdma(Bits::new(shape.width - 1))
+            .build(),
+    );
+
+    cmds.push(
+        Register::<DpuBnCfg>::new()
+            .bn_bypass(Bits::new(1))
+            .bn_alu_bypass(Bits::new(1))
+            .bn_mul_bypass(Bits::new(1))
+            .bn_relu_bypass(Bits::new(1))
+            .build(),
+    );
+    cmds.push(zero::<DpuBnAluCfg>());
+    cmds.push(zero::<DpuBnMulCfg>());
+    cmds.push(zero::<DpuBnReluxCmpValue>());
+
+    cmds.push(
+        Register::<DpuEwCfg>::new()
+            .ew_cvt_type(Bits::new(0))
+            .ew_data_mode(Bits::new(1))
+            .edata_size(Bits::new(2))
+            .ew_alu_algo(Bits::new(shape.algo as u32))
+            .ew_relu_bypass(Bits::new(1))
+            .ew_lut_bypass(Bits::new(1))
+            .ew_op_src(Bits::new(0)) // operand from configure register (unused, zeroed below)
+            .build(),
+    );
+
+    cmds.push(zero::<DpuEwCvtOffsetValue>());
+    cmds.push(
+        Register::<DpuEwCvtScaleValue>::new()
+            .ew_op_cvt_scale(Bits::new(1))
+            .build(),
+    );
+    cmds.push(zero::<DpuEwReluxCmpValue>());
+
+    cmds.push(zero::<DpuOutCvtOffset>());
+    cmds.push(
+        Register::<DpuOutCvtScale>::new()
+            .fp32tofp16_en(Bits::new(1))
+            .out_cvt_scale(Bits::new(1))
+            .build(),
+    );
+    cmds.push(zero::<DpuOutCvtShift>());
+
+    // All 8 EW_OP_VALUE registers get the same operand, not just slot 0 --
+    // hardware-confirmed necessary: an earlier version writing only
+    // EW_OP_VALUE_0 (leaving 1-7 zeroed) produced a real, reproducible
+    // split on real hardware, channels 0-7 of the 16-wide padded atom
+    // (`FEATURE_ATOMIC_SIZE`) using the configured operand and channels
+    // 8-15 silently reading zero instead -- consistent with each of the
+    // 8 operand registers backing a fixed subset of the 16-channel atom's
+    // lanes rather than all 8 being redundant copies of one logical
+    // scalar. Exactly how the 8 registers map onto 16 channels isn't
+    // characterized (not needed to be, for a real scalar constant: the
+    // same value in every slot is correct under any such mapping).
+    cmds.push(
+        Register::<DpuEwOpValue0>::new()
+            .ew_operand(Bits::new(shape.operand))
+            .build(),
+    );
+    cmds.push(
+        Register::<DpuEwOpValue1>::new()
+            .ew_operand(Bits::new(shape.operand))
+            .build(),
+    );
+    cmds.push(
+        Register::<DpuEwOpValue2>::new()
+            .ew_operand(Bits::new(shape.operand))
+            .build(),
+    );
+    cmds.push(
+        Register::<DpuEwOpValue3>::new()
+            .ew_operand(Bits::new(shape.operand))
+            .build(),
+    );
+    cmds.push(
+        Register::<DpuEwOpValue4>::new()
+            .ew_operand(Bits::new(shape.operand))
+            .build(),
+    );
+    cmds.push(
+        Register::<DpuEwOpValue5>::new()
+            .ew_operand(Bits::new(shape.operand))
+            .build(),
+    );
+    cmds.push(
+        Register::<DpuEwOpValue6>::new()
+            .ew_operand(Bits::new(shape.operand))
+            .build(),
+    );
+    cmds.push(
+        Register::<DpuEwOpValue7>::new()
+            .ew_operand(Bits::new(shape.operand))
+            .build(),
+    );
+    cmds.push(
+        Register::<DpuSurfaceAdd>::new()
+            .surf_add(Bits::new(output_area))
+            .build(),
+    );
+    cmds.push(zero::<DpuReserved40c4>());
+
+    // LUT block unused by this op.
+    cmds.push(zero::<DpuLutAccessCfg>());
+    cmds.push(zero::<DpuLutAccessData>());
+    cmds.push(zero::<DpuLutCfg>());
+    cmds.push(zero::<DpuLutInfo>());
+    cmds.push(zero::<DpuLutLeStart>());
+    cmds.push(zero::<DpuLutLeEnd>());
+    cmds.push(zero::<DpuLutLoStart>());
+    cmds.push(zero::<DpuLutLoEnd>());
+    cmds.push(zero::<DpuLutLeSlopeScale>());
+    cmds.push(zero::<DpuLutLeSlopeShift>());
+    cmds.push(zero::<DpuLutLoSlopeScale>());
+    cmds.push(zero::<DpuLutLoSlopeShift>());
+
+    cmds.push(
+        Register::<DpuRdmaDataCubeWidth>::new()
+            .width(Bits::new(shape.width - 1))
+            .build(),
+    );
+    cmds.push(
+        Register::<DpuRdmaDataCubeHeight>::new()
+            .height(Bits::new(shape.height - 1))
+            .build(),
+    );
+    cmds.push(
+        Register::<DpuRdmaDataCubeChannel>::new()
+            .channel(Bits::new(task_channels - 1))
+            .build(),
+    );
+    cmds.push(
+        Register::<DpuRdmaSrcBaseAddr>::new()
+            .src_base_addr(Bits::new(bufs.input_addr))
+            .build(),
+    );
+    cmds.push(zero::<DpuRdmaBrdmaCfg>());
+    cmds.push(zero::<DpuRdmaBsBaseAddr>());
+    cmds.push(zero::<DpuRdmaNrdmaCfg>());
+    cmds.push(zero::<DpuRdmaBnBaseAddr>());
+    // No second tensor: ERDMA explicitly disabled rather than fed a
+    // phantom source (see this fn's own doc comment).
+    cmds.push(
+        Register::<DpuRdmaErdmaCfg>::new()
+            .erdma_disable(Bits::new(1))
+            .build(),
+    );
+    cmds.push(zero::<DpuRdmaEwBaseAddr>());
+    cmds.push(zero::<DpuRdmaEwSurfStride>());
+
+    cmds.push(
+        Register::<DpuRdmaFeatureModeCfg>::new()
+            .flying_mode(Bits::new(1))
+            .burst_len(Bits::new(15))
+            .in_precision(Bits::new(2))
+            .proc_precision(Bits::new(2))
+            .mrdma_fp16tofp32_en(Bits::new(1))
+            .build(),
+    );
+    cmds.push(zero::<DpuRdmaSrcDmaCfg>());
+    cmds.push(zero::<DpuRdmaSurfNotch>());
+    cmds.push(zero::<DpuRdmaPadCfg>());
+    cmds.push(
+        Register::<DpuRdmaWeight>::new()
+            .e_weight(Bits::new(1))
+            .n_weight(Bits::new(1))
+            .b_weight(Bits::new(1))
+            .m_weight(Bits::new(1))
+            .build(),
+    );
+    cmds.push(zero::<DpuRdmaEwSurfNotch>());
+
+    push_kick(&mut cmds, KICK_DPU | KICK_DPU_RDMA);
+    cmds
 }

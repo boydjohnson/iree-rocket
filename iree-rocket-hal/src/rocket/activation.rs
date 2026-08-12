@@ -95,6 +95,18 @@ pub struct LutTable {
     /// with sigmoid's tail not being fully flat even far from zero).
     pub le_slope_uflow_scale: u16,
     pub le_slope_uflow_shift: u8,
+    /// `lut_bn_mul`'s `K` constant for this specific function -- the real
+    /// input-scale-to-fixed-domain multiplier is NOT function-independent,
+    /// despite the domain/indexing recipe above being compiler-generic.
+    /// `sigmoid()`/`exp()` use the original `LUT_BN_SCALE_K` (fit from
+    /// sigmoid captures only); `tanh()` uses its own independently-fit
+    /// `TANH_LUT_BN_SCALE_K` -- reusing sigmoid's constant for tanh was an
+    /// unverified assumption caught by a real oracle-based hardware test
+    /// (`tests/lut_hw.rs::lut_standalone_tanh_matches_oracle`) that found
+    /// tanh output tracking `tanh(real_input/2)`, i.e. the shared constant
+    /// undershot tanh's real domain scale by roughly 2x. See
+    /// `TANH_LUT_BN_SCALE_K`'s own doc comment for the derivation.
+    pub bn_scale_k: f32,
 }
 
 impl LutTable {
@@ -105,6 +117,7 @@ impl LutTable {
             ew_op_bypass: 0,
             le_slope_uflow_scale: 23107,
             le_slope_uflow_shift: 22,
+            bn_scale_k: LUT_BN_SCALE_K,
         }
     }
 
@@ -115,6 +128,7 @@ impl LutTable {
             ew_op_bypass: 1,
             le_slope_uflow_scale: 0,
             le_slope_uflow_shift: 0,
+            bn_scale_k: TANH_LUT_BN_SCALE_K,
         }
     }
 
@@ -135,15 +149,30 @@ impl LutTable {
     ///   max-subtraction guarantees this half is never legitimately read,
     ///   but a caller building a *different* op around this table (not
     ///   softmax's own max-subtract-then-exp pattern) would get an
-    ///   unvalidated constant `1.0` for any `x >= 0` input.
+    ///   unvalidated constant `1.0` for any `x >= 0` input. Also
+    ///   fundamentally NOT FIXABLE with a real table the way `tanh()`'s
+    ///   domain-scale bug was: `exp(x) > 1` for any `x > 0`, immediately
+    ///   exceeding this Q15 encoding's representable range (`32767` =
+    ///   `~1.0`) at the very first `x` past zero -- there is no `real_x in
+    ///   [0, edge]` window where a plain `round(exp(x)*32768)` table stays
+    ///   in-range the way `SQUARE_LO`/`ERF_LO` do. A real `x > 0` table
+    ///   needs a genuinely different (scaled) encoding, not just the
+    ///   correct-formula treatment `bn_scale_k` below got.
     ///
-    /// One piece of good, independent supporting evidence this recipe
-    /// generalizes correctly: the real captured `BN_MUL_CFG=0x6a660000`
-    /// for this op backs out to `input_scale ~= 10.49` via the *existing*
-    /// `lut_bn_mul()`/`LUT_BN_SCALE_K=2596.513` formula (fit from
-    /// sigmoid/tanh captures, not exp) -- i.e. `build_lut_regcmd`'s
-    /// generic `input_scale`/`input_zero_point` handling doesn't need any
-    /// exp-specific change, only this table.
+    /// `bn_scale_k` is `EXP_LUT_BN_SCALE_K` (`3276.7184`), NOT the shared
+    /// `LUT_BN_SCALE_K` this used to (incorrectly) reuse from `sigmoid()`.
+    /// Corrected the same way `tanh()`'s was, once that bug's existence
+    /// made "borrowed sigmoid constant, never independently checked" a
+    /// pattern to go looking for rather than assume away: `EXP_LUT_BN_SCALE_K`
+    /// is `predict_exp_lut_table.py`'s `K_EXP`, fit directly against the
+    /// real captured `EXP_LE` table content itself (max deviation 2/32768
+    /// across all 513 entries -- see that script's own doc comment), not
+    /// inferred from a single BN_MUL_CFG capture the way the old
+    /// `LUT_BN_SCALE_K` guess was. This is the table's OWN generating
+    /// constant, exactly the "these two numbers must be the same by
+    /// construction" relationship `SQUARE_BN_SCALE_K`'s doc comment
+    /// describes -- here recovered by fitting a real vendor table instead
+    /// of chosen freely, but the role is identical.
     pub fn exp() -> Self {
         LutTable {
             le_entries: &crate::rocket::lut_tables::EXP_LE,
@@ -151,6 +180,128 @@ impl LutTable {
             ew_op_bypass: 1,
             le_slope_uflow_scale: 0,
             le_slope_uflow_shift: 0,
+            bn_scale_k: EXP_LUT_BN_SCALE_K,
+        }
+    }
+
+    /// `square(x) = x*x`. The first table in this file with no vendor
+    /// capture behind it at all -- see `lut_tables::SQUARE_LE`/`_LO`'s own
+    /// doc comment for the generation formula and why `bn_scale_k` here
+    /// MUST equal `SQUARE_BN_SCALE_K` (the same constant the table
+    /// generator used, by construction -- not a coincidence to preserve).
+    /// Domain restricted to real `x` in `[-1, 1]` (`SQUARE_BN_SCALE_K`'s
+    /// doc comment): `x^2`'s output has no natural ceiling the way
+    /// sigmoid/tanh/erf's saturating curves do, so unlike those, this
+    /// table is only accurate inside that domain -- flat-clamped
+    /// (`le_slope_uflow_scale/shift=0`) rather than tracking the true
+    /// (quadratically growing) function beyond it. `ew_op_bypass=1`
+    /// matches `tanh()`/`exp()` (2 of 3 real captures use this value) --
+    /// hardware-confirmed correct for a self-derived table too
+    /// (`tests/ew_square_hw.rs`, green on the first real hardware attempt,
+    /// no tuning needed), so this is the default going forward for new
+    /// self-derived tables, not just a guess anymore.
+    pub fn square() -> Self {
+        LutTable {
+            le_entries: &crate::rocket::lut_tables::SQUARE_LE,
+            lo_entries: &crate::rocket::lut_tables::SQUARE_LO,
+            ew_op_bypass: 1,
+            le_slope_uflow_scale: 0,
+            le_slope_uflow_shift: 0,
+            bn_scale_k: SQUARE_BN_SCALE_K,
+        }
+    }
+
+    /// `erf(x)`. Same self-derived methodology as `square()` -- see
+    /// `lut_tables::ERF_LE`/`_LO`'s own doc comment for the generation
+    /// formula and why `bn_scale_k` here MUST equal `ERF_BN_SCALE_K`.
+    /// Unlike `square()`, no domain-restriction caveat: `erf` saturates
+    /// to `(-1, 1)` well within the table's `x` in `[-4, 4]` domain, so
+    /// the flat clamp beyond the edge (`le_slope_uflow_scale/shift=0`) is
+    /// accurate, not just bounded. `ew_op_bypass=1` per `square()`'s own
+    /// hardware confirmation above.
+    pub fn erf() -> Self {
+        LutTable {
+            le_entries: &crate::rocket::lut_tables::ERF_LE,
+            lo_entries: &crate::rocket::lut_tables::ERF_LO,
+            ew_op_bypass: 1,
+            le_slope_uflow_scale: 0,
+            le_slope_uflow_shift: 0,
+            bn_scale_k: ERF_BN_SCALE_K,
+        }
+    }
+
+    /// `sqrt(x)`, `x >= 0` only. Same self-derived methodology as
+    /// `square()`/`erf()` -- see `lut_tables::SQRT_LE`/`_LO`'s own doc
+    /// comment for the generation formula, the domain restriction
+    /// (`SQRT_LE`, `x<0`, is placeholder-only: `sqrt` is undefined there,
+    /// not just inaccurate the way `square`'s beyond-edge region is), and
+    /// why `bn_scale_k` here MUST equal `SQRT_BN_SCALE_K`. Caller must
+    /// guarantee non-negative input; this table cannot enforce that.
+    pub fn sqrt() -> Self {
+        LutTable {
+            le_entries: &crate::rocket::lut_tables::SQRT_LE,
+            lo_entries: &crate::rocket::lut_tables::SQRT_LO,
+            ew_op_bypass: 1,
+            le_slope_uflow_scale: 0,
+            le_slope_uflow_shift: 0,
+            bn_scale_k: SQRT_BN_SCALE_K,
+        }
+    }
+
+    /// `rsqrt(x) = 1/sqrt(x)`. See `lut_tables::RSQRT_LE`/`_LO`'s own doc
+    /// comment for the generation formula and the real, load-bearing
+    /// domain restriction: only accurate for `x` in `[1, 16)` --
+    /// `rsqrt(x) > 1.0` for `x < 1` exceeds this Q15 encoding's ceiling,
+    /// so that region is clamped to `32767` rather than holding real
+    /// values, unlike `square()`/`erf()`/`sqrt()` which are accurate
+    /// across their entire declared domain. `bn_scale_k` here MUST equal
+    /// `RSQRT_BN_SCALE_K`.
+    pub fn rsqrt() -> Self {
+        LutTable {
+            le_entries: &crate::rocket::lut_tables::RSQRT_LE,
+            lo_entries: &crate::rocket::lut_tables::RSQRT_LO,
+            ew_op_bypass: 1,
+            le_slope_uflow_scale: 0,
+            le_slope_uflow_shift: 0,
+            bn_scale_k: RSQRT_BN_SCALE_K,
+        }
+    }
+
+    /// `log(x)` (natural log). See `lut_tables::LOG_LE`/`_LO`'s own doc
+    /// comment for the generation formula and the real, load-bearing
+    /// domain restriction: only accurate for `x` in roughly `[0.02, e)`
+    /// (`e~=2.718`) -- unlike `rsqrt()` (clamped on one side only), `log`
+    /// clamps on BOTH sides (`32767` near the domain's far edge, `-32768`
+    /// near `x=0`) since it is unbounded in both directions. Both clamps
+    /// are at least sign-correct. `bn_scale_k` here MUST equal
+    /// `LOG_BN_SCALE_K`.
+    pub fn log() -> Self {
+        LutTable {
+            le_entries: &crate::rocket::lut_tables::LOG_LE,
+            lo_entries: &crate::rocket::lut_tables::LOG_LO,
+            ew_op_bypass: 1,
+            le_slope_uflow_scale: 0,
+            le_slope_uflow_shift: 0,
+            bn_scale_k: LOG_BN_SCALE_K,
+        }
+    }
+
+    /// `reciprocal(x) = 1/x`. See `lut_tables::RECIPROCAL_LE`/`_LO`'s own
+    /// doc comment for the generation formula and the real, load-bearing
+    /// domain restriction: only accurate for `|x|` in `[1, 16)` -- unlike
+    /// `log()`/`rsqrt()`, `reciprocal` is odd, so both `LE` and `LO` hold
+    /// real (mirror-antisymmetric) data, not a placeholder half; both
+    /// clamp near their own zero-crossing where `|reciprocal(x)| > 1.0`
+    /// would otherwise overflow this Q15 encoding. `bn_scale_k` here MUST
+    /// equal `RECIPROCAL_BN_SCALE_K`.
+    pub fn reciprocal() -> Self {
+        LutTable {
+            le_entries: &crate::rocket::lut_tables::RECIPROCAL_LE,
+            lo_entries: &crate::rocket::lut_tables::RECIPROCAL_LO,
+            ew_op_bypass: 1,
+            le_slope_uflow_scale: 0,
+            le_slope_uflow_shift: 0,
+            bn_scale_k: RECIPROCAL_BN_SCALE_K,
         }
     }
 }
@@ -225,21 +376,122 @@ fn push_lut_tables_and_config(cmds: &mut Vec<RegCmd>, table: LutTable) {
 }
 
 /// Empirically-fit constant relating a shape's `input_scale` to DPU BN's
-/// multiply stage in `build_lut_regcmd` -- reverse-engineered from
-/// 5 independent int8-quantized `rknn-toolkit2` sigmoid captures at
-/// different calibration scales (see `lut_bn_mul`'s doc comment and
-/// `rknpu-spelunking/NOTES.md`). Not a documented hardware constant.
+/// multiply stage in `build_lut_regcmd`, for `sigmoid()` only now --
+/// reverse-engineered from 5 independent int8-quantized `rknn-toolkit2`
+/// SIGMOID captures at different calibration scales (see `lut_bn_mul`'s
+/// doc comment and `rknpu-spelunking/NOTES.md`). Not a documented hardware
+/// constant. Both `tanh()` and `exp()` used to reuse this on unconfirmed
+/// cross-fingers evidence, until a real oracle-based hardware test showed
+/// that was wrong for `tanh()`; see `TANH_LUT_BN_SCALE_K`/
+/// `EXP_LUT_BN_SCALE_K` for their own independently-fit replacements.
 const LUT_BN_SCALE_K: f32 = 2596.513;
 
+/// `exp()`'s own `bn_scale_k`, replacing the borrowed `LUT_BN_SCALE_K`
+/// above. Unlike `TANH_LUT_BN_SCALE_K`/`SQUARE_BN_SCALE_K` (fit via a
+/// fresh hardware sweep / chosen freely for a self-derived table), this
+/// is `predict_exp_lut_table.py`'s `K_EXP` -- reverse-engineered by
+/// fitting the formula `table[i] = round(exp(x_fixed(i)/K)*32768)`
+/// directly against `EXP_LE`'s own real captured 513-entry content (max
+/// deviation 2/32768 across every entry, see that script's own doc
+/// comment), not against a BN_MUL_CFG register value. Since `EXP_LE`'s
+/// content and the real hardware's BN_MUL stage must agree on the same
+/// domain mapping to compose correctly (`SQUARE_BN_SCALE_K`'s doc comment
+/// explains why `bn_scale_k` and a table's generating `K` are one number,
+/// not two), this is the correct value to feed `lut_bn_mul`, not the
+/// borrowed sigmoid constant that happened to look "close enough" from a
+/// single ambiguous data point.
+const EXP_LUT_BN_SCALE_K: f32 = 3276.7184;
+
+/// `tanh()`'s own independently-fit counterpart to `LUT_BN_SCALE_K`.
+/// Derivation, mirroring the original sigmoid sweep exactly (same 5
+/// calibration arrays -- `rknpu-spelunking/build/calib{0,1,2,3,4}.npy`,
+/// reused verbatim since they're just generic `(1,3,32,32)` float32
+/// arrays, model-independent -- new `config.tanh.w8a8.v{1,2,3,4}.toml` +
+/// the pre-existing `config.tanh.w8a8.toml`, built via `rknn-convert`,
+/// decoded with `scripts/decode_regcmd.py`, real `input_scale`/
+/// `zero_point` per point recovered via `RKNN.hybrid_quantization_step1`
+/// on the same 5 datasets):
+///
+/// | scale        | zero_point | BN_MUL_CFG   | operand | shift |
+/// |--------------|------------|--------------|---------|-------|
+/// | 0.0246581620 | -2         | 0x42e30700   | 17123   | 7     |
+/// | 0.0058786308 | 42         | 0x7f920a00   | 32658   | 10    |
+/// | 0.0011761119 | 42         | 0x66170c00   | 26135   | 12    |
+/// | 0.0125490196 | -128       | 0x44150800   | 17429   | 8     |
+/// | 0.0125490196 | 127        | 0x44150800   | 17429   | 8     |
+///
+/// Every `K` in `[5425.132, 5425.254]` bit-exact-reconstructs all 5
+/// `(operand, shift)` pairs through the same normalization `lut_bn_mul`
+/// already uses (`shift = 14 - floor(log2(scale*K))`,
+/// `operand = round(scale*K*2^shift)`) -- as tight and "not approximate
+/// agreement" as `LUT_BN_SCALE_K`'s own sigmoid fit. `5425.193` (the
+/// midpoint) is used here. Notably NOT simply `2 * LUT_BN_SCALE_K`
+/// (`5193.026`) -- close, but tanh really does need its own constant, not
+/// a derived multiple of sigmoid's.
+///
+/// Side finding from the same sweep: unlike sigmoid's documented ~1/16
+/// discrepancy at `zero_point=42` (see `lut_bn_alu`'s doc comment), both
+/// of tanh's `zero_point=42` points above match `lut_bn_alu`'s plain
+/// formula exactly -- that discrepancy looks sigmoid-capture-specific,
+/// not a general gap in the ALU formula.
+const TANH_LUT_BN_SCALE_K: f32 = 5425.193;
+
+/// `square()`'s `bn_scale_k`. Unlike `LUT_BN_SCALE_K`/`TANH_LUT_BN_SCALE_K`
+/// (both reverse-engineered from real captures via a calibration sweep,
+/// fit to match hardware that already existed), this constant and
+/// `lut_tables::SQUARE_LE`/`_LO`'s own generation formula were chosen
+/// together, by this crate, with no capture to fit against: `real_x =
+/// x_fixed / SQUARE_BN_SCALE_K` is the domain mapping the table generator
+/// used to compute `x^2`, and `bn_scale_k=SQUARE_BN_SCALE_K` here tells
+/// `lut_bn_mul` to convert a real tensor value into the fixed domain
+/// using that exact same mapping -- so the composition (BN_MUL's
+/// quantization-scale-to-fixed-domain conversion, then the table lookup)
+/// reproduces `x^2` by construction, not by a fitted coincidence. Keep
+/// this equal to whatever `K` the table itself was generated with if
+/// either ever changes -- they are one number, not two that happen to
+/// agree. `16384` puts the real domain edge at `x=+-1.0` (`16384/K`).
+const SQUARE_BN_SCALE_K: f32 = 16384.0;
+
+/// `erf()`'s `bn_scale_k`, same "chosen together with the table generator,
+/// not fit against a capture" status as `SQUARE_BN_SCALE_K` (see that
+/// constant's own doc comment -- the reasoning is identical here). `4096`
+/// puts the real domain edge at `x=+-4.0`.
+const ERF_BN_SCALE_K: f32 = 4096.0;
+
+/// `sqrt()`'s `bn_scale_k`, same "chosen together with the table
+/// generator" status as `SQUARE_BN_SCALE_K`/`ERF_BN_SCALE_K`. `16384`
+/// puts the real domain edge at `x=1.0`, matching `SQUARE_BN_SCALE_K`
+/// exactly (`sqrt`'s domain choice mirrors `square`'s, inverted).
+const SQRT_BN_SCALE_K: f32 = 16384.0;
+
+/// `rsqrt()`'s `bn_scale_k`, same "chosen together with the table
+/// generator" status as the constants above. `1024` puts the real domain
+/// edge at `x=16.0` (`RSQRT_LE`/`_LO`'s doc comment covers why the domain
+/// choice itself, not just this constant, is the interesting part here).
+const RSQRT_BN_SCALE_K: f32 = 1024.0;
+
+/// `log()`'s `bn_scale_k`, same "chosen together with the table
+/// generator" status as the constants above. `4096` puts the real domain
+/// edge at `x=4.0`, matching `ERF_BN_SCALE_K` (`LOG_LE`/`_LO`'s doc
+/// comment covers why only part of that domain holds real values).
+const LOG_BN_SCALE_K: f32 = 4096.0;
+
+/// `reciprocal()`'s `bn_scale_k`, same "chosen together with the table
+/// generator" status as the constants above. `1024` puts the real domain
+/// edge at `x=+-16.0`, matching `RSQRT_BN_SCALE_K` (`RECIPROCAL_LE`/`_LO`'s
+/// doc comment covers why only `|x|` in `[1, 16)` holds real values).
+const RECIPROCAL_BN_SCALE_K: f32 = 1024.0;
+
 /// `BN_MUL_OPERAND`/`BN_MUL_SHIFT` for `build_lut_regcmd`:
-/// `multiplier = input_scale * LUT_BN_SCALE_K`, normalized (standard
-/// mantissa/exponent split) so `operand = round(multiplier * 2^shift)`
-/// lands in `[16384, 32768)` -- reconstructs the captured register values
-/// exactly across all 5 known data points (see the call site's doc
-/// comment for which zero points were used and the caveat on
-/// `lut_bn_alu`).
-fn lut_bn_mul(input_scale: f32) -> (u32, u32) {
-    let multiplier = input_scale * LUT_BN_SCALE_K;
+/// `multiplier = input_scale * k`, normalized (standard mantissa/exponent
+/// split) so `operand = round(multiplier * 2^shift)` lands in
+/// `[16384, 32768)`. `k` is `LutTable::bn_scale_k` -- NOT a single
+/// function-independent constant, see that field's doc comment --
+/// reconstructs the captured register values exactly across all known
+/// data points for a given `k` (see the call site's doc comment for which
+/// zero points were used and the caveat on `lut_bn_alu`).
+fn lut_bn_mul(input_scale: f32, k: f32) -> (u32, u32) {
+    let multiplier = input_scale * k;
     let e = multiplier.log2().floor() as i32;
     let shift = 14 - e;
     let operand = (multiplier * 2f32.powi(shift)).round() as u32;
@@ -247,10 +499,14 @@ fn lut_bn_mul(input_scale: f32) -> (u32, u32) {
 }
 
 /// `BN_ALU_OPERAND` for `build_lut_regcmd`: `-real_zero_point *
-/// bn_mul_operand`. Exact for 3 of 5 known data points; an unresolved ~1/16
-/// discrepancy showed up for the other 2 (both `real_zero_point == 42`) --
-/// see the call site's doc comment. Always exactly right when
-/// `real_zero_point == 0`.
+/// bn_mul_operand`. Exact for 3 of 5 known sigmoid data points; an
+/// unresolved ~1/16 discrepancy showed up for the other 2 (both
+/// `real_zero_point == 42`) -- see the call site's doc comment. Always
+/// exactly right when `real_zero_point == 0`. NOT reproduced by tanh's
+/// own independent 5-point sweep (`TANH_LUT_BN_SCALE_K`'s doc comment) --
+/// both of tanh's `zero_point=42` points matched this plain formula
+/// exactly, so the discrepancy looks specific to the original sigmoid
+/// captures, not a general property of this formula.
 fn lut_bn_alu(real_zero_point: i32, bn_mul_operand: u32) -> u32 {
     let alu = -(real_zero_point as i64) * (bn_mul_operand as i64);
     alu as i32 as u32
@@ -326,7 +582,7 @@ pub fn build_lut_regcmd(shape: &LutShape, bufs: &LutBuffers, table: LutTable) ->
         .next_multiple_of(FEATURE_ATOMIC_SIZE);
     let surface_stride = shape.width * shape.height * task_channels;
     let out_offset = shape.output_zero_point.wrapping_sub(0x80);
-    let (bn_mul_operand, bn_mul_shift) = lut_bn_mul(shape.input_scale);
+    let (bn_mul_operand, bn_mul_shift) = lut_bn_mul(shape.input_scale, table.bn_scale_k);
     let real_zero_point = shape.input_zero_point.wrapping_sub(0x80) as i8 as i32;
     assert!(
         lut_bn_alu_supports_zero_point(real_zero_point),
