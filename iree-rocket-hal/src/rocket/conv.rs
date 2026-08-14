@@ -2550,6 +2550,18 @@ pub fn feature_grains(kernels: Kernels, tile: &Tile) -> u32 {
 /// exactly these known-real dispatches changes the full ResNet-50 model's
 /// outcome, not a general closed-form replacement for `feature_grains()`;
 /// see DESIGN_NOTES.md before reusing this for anything beyond that test.
+///
+/// NARROWED 2026-08-14: originally gated on `in_channels <= 128` (cap 6) /
+/// `> 128` (cap 5), which reads as covering that whole range. A follow-up
+/// 13-point sweep (`Cin` 8..128 step 8, DESIGN_NOTES.md "A bounded low-Cin
+/// feature_grains sweep") shows real vendor values are non-monotonic across
+/// that range and the `<= 128` branch is only actually correct at `Cin=64`
+/// (`Cin=56` also happened to match, coincidentally, but was never
+/// captured): `Cin=16` is really 16, `Cin=24..48` are really 9, `Cin=72..112`
+/// are really 8, and `Cin=120`/`128` -- inside the old `<= 128` guard -- are
+/// really 5, not 6. Gating on the exact two captured `Cin` values instead of
+/// a range keeps this exactly as wide as its own evidence, per its doc
+/// comment's original intent.
 fn experimental_capped_feature_grains(
     shape: Shape,
     kernels: Kernels,
@@ -2560,7 +2572,11 @@ fn experimental_capped_feature_grains(
     if kernels != [1, 1] || data_banks < 11 {
         return naive;
     }
-    let cap = if shape.in_channels <= 128 { 6 } else { 5 };
+    let cap = match shape.in_channels {
+        64 => 6,
+        256 => 5,
+        _ => return naive,
+    };
     naive.min(cap)
 }
 
