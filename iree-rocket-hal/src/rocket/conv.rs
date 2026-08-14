@@ -1962,7 +1962,12 @@ impl ConvPlan {
                     self.shape,
                     self.kernels,
                     tile,
-                    feature_grains(self.kernels, &tile.rows),
+                    experimental_capped_feature_grains(
+                        self.shape,
+                        self.kernels,
+                        self.data_banks,
+                        &tile.rows,
+                    ),
                     self.data_banks,
                     self.weight_banks,
                 )
@@ -2529,6 +2534,34 @@ pub fn conv_2d_tile(shape: Shape, kernels: Kernels, tile: &Tile) -> Vec<RegCmd> 
 /// value tracks `kernel_height` and is unchanged by `kernel_width`.
 pub fn feature_grains(kernels: Kernels, tile: &Tile) -> u32 {
     tile.in_rows + kernel_programming(kernels, None).height + tile.pad_top
+}
+
+/// EXPERIMENTAL (iree-rocket-design-spike DESIGN_NOTES.md, "ResNet-50
+/// kernel-size transition" investigation, 2026-08-13): direct vendor
+/// register captures (`rknn-convert`, not this driver) for the three real
+/// ResNet-50 stage1 shapes that saturate `data_banks` at 11 with a 1x1
+/// kernel -- (Cin=64, Cout=64), (Cin=64, Cout=256), (Cin=256, Cout=64), all
+/// 128x128 -- show `feature_grains` far below `feature_grains()`'s naive
+/// value once `in_rows` exceeds a small cap: uniformly 6 at Cin=64
+/// (`in_rows` 18-22, naive 19-23), and an exact `min(naive, 5)` fit at
+/// Cin=256 (`in_rows` 3-5, naive 4-6, vendor 4-5 with no exceptions across
+/// six captured tiles). Only two `Cin` values and one spatial extent were
+/// captured -- this is a hardcoded lookup for testing whether correcting
+/// exactly these known-real dispatches changes the full ResNet-50 model's
+/// outcome, not a general closed-form replacement for `feature_grains()`;
+/// see DESIGN_NOTES.md before reusing this for anything beyond that test.
+fn experimental_capped_feature_grains(
+    shape: Shape,
+    kernels: Kernels,
+    data_banks: u32,
+    tile: &Tile,
+) -> u32 {
+    let naive = feature_grains(kernels, tile);
+    if kernels != [1, 1] || data_banks < 11 {
+        return naive;
+    }
+    let cap = if shape.in_channels <= 128 { 6 } else { 5 };
+    naive.min(cap)
 }
 
 /// Builds a tile program with an explicit `feature_grains`, for probing which
