@@ -143,6 +143,20 @@ pub const INPUT_CHANNELS: u32 = 3;
 /// This bounds the *channel* rules only. Whether a given `(Cin, Cout,
 /// kernel)` fits the twelve CBUF banks is a separate question, and one
 /// [`ConvPlan`] answers on its own.
+///
+/// Tried raising this to 960 (2026-08-28, MobileNetV2's Cin=576/960
+/// depthwise stages) and reverted: `tests/conv_vendor_fixture_channels_768.rs`
+/// -- a vendor-vs-`ConvPlan` regression check that was already sitting in
+/// the suite -- caught real divergence for *dense* (non-depthwise) shapes
+/// in exactly that range (`ConvPlan` predicts a 1/11 CBUF split at
+/// Cin=576/640/704/768, real vendor captures show 6/6, 5/7, 4/8). This
+/// constant is shared between dense and depthwise Shape construction, so
+/// there's no way to raise it for depthwise (which a separate hardware
+/// probe did validate at 576/960) without also silently permitting dense
+/// construction into a range now known to be wrong. See
+/// `iree-rocket-hal/tests/conv_mobilenetv2_depthwise_wide_hw.rs`'s doc
+/// comment for the depthwise-side validation and what raising this again
+/// would need (a depthwise-specific ceiling, not this shared one).
 pub const MAX_INPUT_CHANNELS: u32 = 512;
 
 /// `CNA_DATA_SIZE1.datain_channel_real` counts `Cin - 1` modulo this, even
@@ -202,11 +216,21 @@ pub const OUTPUT_CHANNELS: u32 = 8;
 /// Largest output-channel count this builder will program.
 ///
 /// `CNA_WEIGHT_SIZE2.weight_kernels` is 14 bits, so 16383 is the encodable
-/// ceiling. The corpus reaches 512 in a single unsplit program, and nothing
+/// ceiling. The corpus reached 512 in a single unsplit program, and nothing
 /// in it suggests a limit below the field width -- the vendor never splits
 /// the kernel set for capacity at any point measured. The cap is set at the
 /// measured extent rather than the encodable one, on the same principle as
 /// `MAX_INPUT_CHANNELS`.
+///
+/// Tried raising this to 960 (2026-08-28, MobileNetV2's Cin=Cout={576,960}
+/// depthwise 3x3 stages) and reverted -- see `MAX_INPUT_CHANNELS`'s doc
+/// comment for why: `tests/conv_vendor_fixture_channels_768.rs` caught a
+/// real `ConvPlan`-vs-vendor divergence for *dense* shapes in that same
+/// range, and this constant is shared between dense and depthwise
+/// construction. The depthwise-side validation
+/// (`iree-rocket-hal/tests/conv_mobilenetv2_depthwise_wide_hw.rs`) is still
+/// real and still passes; it just needs a depthwise-specific ceiling to be
+/// wired up safely, not this shared one.
 pub const MAX_OUTPUT_CHANNELS: u32 = 512;
 
 /// `DPU_BS_MUL_CFG.bs_mul_shift_value`, and its negated twin
@@ -2734,6 +2758,13 @@ fn conv_2d_tile_program(
     // Surfaces are counted in atoms and `data_entries` does not depend on the
     // tile at all -- the same field carries different quantities in the two
     // regimes, which is why they are computed apart rather than parameterised.
+    //
+    // The surface `data_entries` charge packs 4 atoms per entry and rounds
+    // *up*: vendor captures at width 13/29/30/31 (Cin=8, one atom/pixel)
+    // program 4/8/8/8 respectively, not the 3/7/7/7 floor division gives.
+    // Every capture before these was at a width a multiple of 4, where floor
+    // and ceiling agree, which is how a real compiled model first exposed
+    // this as scattered-pixel corruption on hardware.
     let (line_stride, surf_stride, data_entries) = match (shape.layout(), horizontally_tiled) {
         (FeatureLayout::Dense, _) => (
             full_width,
@@ -2753,7 +2784,7 @@ fn conv_2d_tile_program(
             // field mask it to 28 bits below. This is the vendor encoding,
             // not an attempt to use a negative byte stride in host memory.
             full_width.wrapping_mul(height.wrapping_sub(4)) & 0x0fff_ffff,
-            input_width * shape.cbuf_atoms() / 4,
+            (input_width * shape.cbuf_atoms()).div_ceil(4),
         ),
         // Every captured width-partitioned task enables grouped-line mode
         // below and switches to these strides. `surf_stride` is the full
@@ -2762,7 +2793,7 @@ fn conv_2d_tile_program(
         (FeatureLayout::Surfaces, true) => (
             full_width,
             full_width * height - input_width,
-            input_width * shape.cbuf_atoms() / 4,
+            (input_width * shape.cbuf_atoms()).div_ceil(4),
         ),
     };
 
@@ -4608,6 +4639,26 @@ mod tests {
     }
 
     #[test]
+    fn surface_data_entries_rounds_up_at_widths_not_a_multiple_of_four() {
+        // Every surface `data_entries` capture before this one used a width
+        // divisible by 4, where floor and ceiling division agree. Vendor
+        // captures at Cin=8 (one atom/pixel) expose the real rule: width
+        // 13/29/30/31 program data_entries 4/8/8/8, not the 3/7/7/7 floor
+        // division used to compute. The 30-wide, Cout=16 case is the shape
+        // a real compiled model hit as scattered-pixel corruption on
+        // hardware.
+        for (width, data_entries) in [(13u32, 4u32), (29, 8), (30, 8), (31, 8)] {
+            let shape = Shape::with_out_channels(width, 16, 1, 8, 16);
+            let program = conv_2d_tile(shape, [1, 1], &Tile::whole(shape, [1, 1]));
+            assert_eq!(
+                value_of::<CnaCbufCon1>(&program),
+                data_entries,
+                "data_entries at width {width}"
+            );
+        }
+    }
+
+    #[test]
     #[should_panic(expected = "input channels must be")]
     fn rejects_channels_beyond_the_validated_range() {
         // 96 was beyond it until the large-Cin sweep; 513 is the first value
@@ -4775,7 +4826,7 @@ mod tests {
     #[test]
     #[should_panic(expected = "output channels must be")]
     fn rejects_output_channels_beyond_the_validated_range() {
-        let _ = Shape::with_out_channels(32, 32, 1, 3, 513);
+        let _ = Shape::with_out_channels(32, 32, 1, 3, MAX_OUTPUT_CHANNELS + 1);
     }
 
     #[test]
