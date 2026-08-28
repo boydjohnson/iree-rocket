@@ -2076,6 +2076,21 @@ module attributes {transform.with_named_sequence} {
   // rationale -- this is the practically load-bearing case, since a real
   // ONNX-imported depthwise-separable model's spatial stage is
   // overwhelmingly 3x3, arriving in exactly this NCHW form.
+  //
+  // Cin bound kept at 512 despite `MAX_INPUT_CHANNELS`/`MAX_OUTPUT_CHANNELS`
+  // in conv.rs being raised to 960: MobileNetV2's Cin=576 (14x14) and
+  // Cin=960 (7x7) depthwise stages are hardware-validated correct at that
+  // width
+  // (iree-rocket-hal/tests/conv_mobilenetv2_depthwise_wide_hw.rs), but
+  // routing them to Rocket measured as a net *regression* end to end
+  // (161-163ms -> 165-170ms on real hardware) -- the layers are spatially
+  // too small (14x14, 7x7) to amortize the per-dispatch NC1HWC2 pack/unpack
+  // tax every Rocket dispatch pays (see
+  // rocket-hal-driver/src/command_buffer.rs; no propagation across chained
+  // dispatches exists). So this stays CPU-routed on purpose. Revisit once
+  // that repack-propagation work exists, or raise this bound again for a
+  // model whose >512-channel depthwise layers are large enough to be worth
+  // it.
   transform.named_sequence @match_dynamic_depthwise_conv2d_nchw_3x3(%root: !transform.any_op {transform.readonly}) -> !transform.any_op {
     transform.match.operation_name %root ["linalg.depthwise_conv_2d_nchw_chw"] : !transform.any_op
     %batch, %out_img, %out_ch, %filter, %in_ch, %depth, %strides, %dilations =
@@ -2126,6 +2141,20 @@ module attributes {transform.with_named_sequence} {
   // `%strides` = [2, 2] instead of [1, 1] -- hardware-confirmed depthwise
   // fp16 at stride 2 by conv_depthwise_stride_hw.rs (see DESIGN_NOTES.md
   // "Depthwise stride hardware confirmation").
+  //
+  // Deliberately NOT raised to 960 alongside @match_dynamic_depthwise_conv2d_nchw_3x3
+  // above. MobileNetV2's Cin=576, 14x14->7x7 stride-2 block is the matcher
+  // this would newly claim, and `ConvPlan::new` hard-panics for it today
+  // ("convolution needs horizontal tiling, which is only capture-backed at
+  // stride 1", conv.rs:~1909) -- at 16-wide input, 576 channels' coefficient
+  // demand forces horizontal (column) tiling, which has never been
+  // implemented for stride > 1. Confirmed with the pure-planning
+  // `dump_conv_plan` example (no hardware involved): 96..512 channels at
+  // this width plan cleanly, 576 panics immediately. Raising this bound
+  // would make the compiler route the shape to Rocket and then hard-crash
+  // the HAL driver at first inference, which is strictly worse than today's
+  // CPU fallback. Needs horizontal-tiling-at-stride>1 support in ConvPlan
+  // before this bound can move; tracked as follow-up, not done here.
   transform.named_sequence @match_dynamic_depthwise_conv2d_nchw_3x3_s2(%root: !transform.any_op {transform.readonly}) -> !transform.any_op {
     transform.match.operation_name %root ["linalg.depthwise_conv_2d_nchw_chw"] : !transform.any_op
     %batch, %out_img, %out_ch, %filter, %in_ch, %depth, %strides, %dilations =

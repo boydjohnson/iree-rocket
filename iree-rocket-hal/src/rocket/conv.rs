@@ -143,6 +143,20 @@ pub const INPUT_CHANNELS: u32 = 3;
 /// This bounds the *channel* rules only. Whether a given `(Cin, Cout,
 /// kernel)` fits the twelve CBUF banks is a separate question, and one
 /// [`ConvPlan`] answers on its own.
+///
+/// Tried raising this to 960 (2026-08-28, MobileNetV2's Cin=576/960
+/// depthwise stages) and reverted: `tests/conv_vendor_fixture_channels_768.rs`
+/// -- a vendor-vs-`ConvPlan` regression check that was already sitting in
+/// the suite -- caught real divergence for *dense* (non-depthwise) shapes
+/// in exactly that range (`ConvPlan` predicts a 1/11 CBUF split at
+/// Cin=576/640/704/768, real vendor captures show 6/6, 5/7, 4/8). This
+/// constant is shared between dense and depthwise Shape construction, so
+/// there's no way to raise it for depthwise (which a separate hardware
+/// probe did validate at 576/960) without also silently permitting dense
+/// construction into a range now known to be wrong. See
+/// `iree-rocket-hal/tests/conv_mobilenetv2_depthwise_wide_hw.rs`'s doc
+/// comment for the depthwise-side validation and what raising this again
+/// would need (a depthwise-specific ceiling, not this shared one).
 pub const MAX_INPUT_CHANNELS: u32 = 512;
 
 /// `CNA_DATA_SIZE1.datain_channel_real` counts `Cin - 1` modulo this, even
@@ -202,11 +216,21 @@ pub const OUTPUT_CHANNELS: u32 = 8;
 /// Largest output-channel count this builder will program.
 ///
 /// `CNA_WEIGHT_SIZE2.weight_kernels` is 14 bits, so 16383 is the encodable
-/// ceiling. The corpus reaches 512 in a single unsplit program, and nothing
+/// ceiling. The corpus reached 512 in a single unsplit program, and nothing
 /// in it suggests a limit below the field width -- the vendor never splits
 /// the kernel set for capacity at any point measured. The cap is set at the
 /// measured extent rather than the encodable one, on the same principle as
 /// `MAX_INPUT_CHANNELS`.
+///
+/// Tried raising this to 960 (2026-08-28, MobileNetV2's Cin=Cout={576,960}
+/// depthwise 3x3 stages) and reverted -- see `MAX_INPUT_CHANNELS`'s doc
+/// comment for why: `tests/conv_vendor_fixture_channels_768.rs` caught a
+/// real `ConvPlan`-vs-vendor divergence for *dense* shapes in that same
+/// range, and this constant is shared between dense and depthwise
+/// construction. The depthwise-side validation
+/// (`iree-rocket-hal/tests/conv_mobilenetv2_depthwise_wide_hw.rs`) is still
+/// real and still passes; it just needs a depthwise-specific ceiling to be
+/// wired up safely, not this shared one.
 pub const MAX_OUTPUT_CHANNELS: u32 = 512;
 
 /// `DPU_BS_MUL_CFG.bs_mul_shift_value`, and its negated twin
@@ -4802,7 +4826,7 @@ mod tests {
     #[test]
     #[should_panic(expected = "output channels must be")]
     fn rejects_output_channels_beyond_the_validated_range() {
-        let _ = Shape::with_out_channels(32, 32, 1, 3, 513);
+        let _ = Shape::with_out_channels(32, 32, 1, 3, MAX_OUTPUT_CHANNELS + 1);
     }
 
     #[test]
