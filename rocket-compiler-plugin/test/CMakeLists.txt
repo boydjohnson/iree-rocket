@@ -2,10 +2,12 @@ iree_lit_test_suite(
   NAME
     rocket_conv_layout
   SRCS
+    "rocket_annotate_placement.mlir"
     "rocket_conv_layout.mlir"
     "rocket_runtime_dimensions.mlir"
     "rocket_runtime_dimensions_invalid.mlir"
   TOOLS
     FileCheck
     iree-compile
+    iree-opt
 )

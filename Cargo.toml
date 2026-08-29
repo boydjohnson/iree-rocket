@@ -3,7 +3,7 @@ resolver = "2"
 members = [
     "rocket-schema",
     "iree-rocket-hal",
-    "rocket-hal-driver",
+    "rocket-hal-driver", "rocket-compiler",
 ]
 
 [profile.release]

@@ -2446,7 +2446,17 @@ module attributes {transform.with_named_sequence} {
         with options = { "type" = "f16", "operation" = "conv" } to %canonical_funcs
       : (!transform.any_op) -> !transform.any_op
 
-    transform.foreach %demoted_funcs : !transform.any_op {
+    // Tags every conv-family linalg op with rocket.origin/rocket.origin_kind
+    // right before the match/rewrite loop below claims (and erases) some of
+    // them -- see RocketAnnotateOriginalPlacementPass.cpp. A
+    // --compile-to=preprocessing dump then shows exactly which conv-shaped
+    // ops fell through to CPU: matched ops lose the tag along with the rest
+    // of the op they were erased from.
+    %annotated_funcs = transform.apply_registered_pass
+        "rocket-annotate-original-placement" to %demoted_funcs
+      : (!transform.any_op) -> !transform.any_op
+
+    transform.foreach %annotated_funcs : !transform.any_op {
       ^bb1(%func: !transform.any_op):
         // @match_dynamic_conv2d_s{2,3,4}/@match_dynamic_conv2d_3x3_s{2,3,4}
         // (defined above, deliberately NOT wired into foreach_match below)

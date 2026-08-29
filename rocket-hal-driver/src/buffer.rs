@@ -99,7 +99,7 @@ unsafe extern "C" fn destroy(buffer: *mut iree_hal_buffer_t) {
         let _ = unsafe {
             nix::sys::mman::munmap(
                 std::ptr::NonNull::new_unchecked(buffer.host_ptr as *mut std::ffi::c_void),
-                buffer.base.allocation_size as usize,
+                buffer.base.allocation_size,
             )
         };
     }

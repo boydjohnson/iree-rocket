@@ -30,16 +30,21 @@ iree_cc_library(
   NAME
     Rocket
   SRCS
+    "RocketAnnotateFinalPlacementPass.cpp"
+    "RocketAnnotateOriginalPlacementPass.cpp"
     "RocketTarget.cpp"
   DEPS
     LLVMSupport
     MLIRIR
+    MLIRLinalgDialect
     MLIRPass
     MLIRSupport
+    iree::compiler::Dialect::HAL::IR
     iree::compiler::Dialect::HAL::Target
     iree::compiler::PluginAPI
     iree::compiler::Utils
     ::RocketExecutableDef
+  ALWAYSLINK
   PUBLIC
 )
 
