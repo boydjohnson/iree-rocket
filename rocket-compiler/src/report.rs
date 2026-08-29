@@ -8,38 +8,79 @@ use std::fmt;
 /// would survive on ops that stay on CPU all the way to the
 /// `executable-targets` phase, giving a single-run "original vs final"
 /// report. Empirically that's not true: something between preprocessing and
-/// executable-targets (most likely dispatch-region formation) drops
-/// unrecognized string attributes -- confirmed by direct inspection of the
-/// annotated IR, not something specific to this FFI path (the subprocess
-/// `iree-compile | iree-opt` pipeline shows the same absence). So this only
-/// reports what `rocket.final` actually tells you: where each dispatch's
-/// executable ended up.
+/// executable-targets (specifically `FoldUnitExtentDimsPass`, traced
+/// pass-by-pass) drops unrecognized string attributes -- confirmed by direct
+/// inspection of the annotated IR, not something specific to this FFI path
+/// (the subprocess `iree-compile | iree-opt` pipeline shows the same
+/// absence). So per-op provenance instead comes from IREE's own
+/// dispatch-region naming convention, which survives for free: each
+/// `hal.executable.export` name already encodes the source function, a
+/// per-function ordinal, op kind, shape, and dtypes (e.g.
+/// `unmatched_5x5_conv_dispatch_0_conv_DxDx16x5x5x32_f16xf16xf32`) -- surfaced
+/// here rather than re-derived. Note this only exists for CPU-routed
+/// dispatches: the Rocket transform spec's hand-authored splice reuses one
+/// of just two executable names (`rocket_dynamic_executable` /
+/// `rocket_dynamic_depthwise_executable`) across every matched shape, so
+/// there is currently no comparable per-op naming signal for Rocket-routed
+/// ops.
+#[derive(Default)]
+pub struct PlacementExecutable {
+    pub name: String,
+    pub exports: Vec<String>,
+}
+
 #[derive(Default)]
 pub struct PlacementReport {
-    pub rocket_executables: Vec<String>,
-    pub cpu_executables: Vec<String>,
+    pub rocket_executables: Vec<PlacementExecutable>,
+    pub cpu_executables: Vec<PlacementExecutable>,
 }
 
 impl PlacementReport {
     pub fn scan(ir_text: &str) -> Self {
         let mut report = PlacementReport::default();
+        // Index into whichever bucket the executable we're currently inside
+        // of belongs to, so nested `hal.executable.export` lines can be
+        // attributed correctly. Always the last element pushed to that
+        // bucket, since exports are only ever encountered nested inside
+        // their own executable's still-open block.
+        let mut current: Option<bool> = None; // Some(true) = rocket, Some(false) = cpu
+
         for line in ir_text.lines() {
             let trimmed = line.trim_start();
-            // "hal.executable " (trailing space) is the per-executable line;
-            // "hal.executable.variant"/"hal.executable.export" also carry a
-            // redundant copy of the same tag and would double-count if matched.
-            if !trimmed.starts_with("hal.executable ") {
-                continue;
-            }
-            let Some(name) = extract_symbol_name(line) else {
-                continue;
-            };
-            match extract_attr(line, "rocket.final").as_deref() {
-                Some("rocket") => report.rocket_executables.push(name),
-                Some("cpu") => report.cpu_executables.push(name),
-                _ => {}
+            if trimmed.starts_with("hal.executable ") {
+                current = None;
+                let Some(name) = extract_symbol_name(line) else {
+                    continue;
+                };
+                let is_rocket = match extract_attr(line, "rocket.final").as_deref() {
+                    Some("rocket") => true,
+                    Some("cpu") => false,
+                    _ => continue,
+                };
+                let bucket = if is_rocket {
+                    &mut report.rocket_executables
+                } else {
+                    &mut report.cpu_executables
+                };
+                bucket.push(PlacementExecutable {
+                    name,
+                    exports: Vec::new(),
+                });
+                current = Some(is_rocket);
+            } else if trimmed.starts_with("hal.executable.export ") {
+                if let (Some(is_rocket), Some(name)) = (current, extract_symbol_name(line)) {
+                    let bucket = if is_rocket {
+                        &mut report.rocket_executables
+                    } else {
+                        &mut report.cpu_executables
+                    };
+                    if let Some(exec) = bucket.last_mut() {
+                        exec.exports.push(name);
+                    }
+                }
             }
         }
+
         report
     }
 }
@@ -55,8 +96,9 @@ fn extract_attr(line: &str, key: &str) -> Option<String> {
 }
 
 /// Pulls the `@symbol_name` off a `hal.executable private @name attributes
-/// {...}` line. Stops at the first character that can't appear in a bare
-/// (unquoted) MLIR symbol name.
+/// {...}` or `hal.executable.export public @name ordinal(...) ...` line.
+/// Stops at the first character that can't appear in a bare (unquoted) MLIR
+/// symbol name.
 fn extract_symbol_name(line: &str) -> Option<String> {
     let start = line.find('@')? + 1;
     let end = line[start..]
@@ -69,22 +111,23 @@ fn extract_symbol_name(line: &str) -> Option<String> {
 impl fmt::Display for PlacementReport {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         writeln!(f, "Placement report:")?;
-        writeln!(
-            f,
-            "  {} executable(s) -> rocket",
-            self.rocket_executables.len()
-        )?;
-        for name in &self.rocket_executables {
-            writeln!(f, "    - {name}")?;
-        }
-        writeln!(
-            f,
-            "  {} executable(s) -> cpu",
-            self.cpu_executables.len()
-        )?;
-        for name in &self.cpu_executables {
-            writeln!(f, "    - {name}")?;
-        }
+        write_bucket(f, "rocket", &self.rocket_executables)?;
+        write_bucket(f, "cpu", &self.cpu_executables)?;
         Ok(())
     }
+}
+
+fn write_bucket(
+    f: &mut fmt::Formatter<'_>,
+    label: &str,
+    executables: &[PlacementExecutable],
+) -> fmt::Result {
+    writeln!(f, "  {} executable(s) -> {label}", executables.len())?;
+    for exec in executables {
+        writeln!(f, "    - {}", exec.name)?;
+        for export in &exec.exports {
+            writeln!(f, "        {export}")?;
+        }
+    }
+    Ok(())
 }
