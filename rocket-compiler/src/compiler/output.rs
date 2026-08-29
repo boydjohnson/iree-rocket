@@ -1,11 +1,12 @@
-use std::ffi::CString;
-use std::os::raw::c_void;
-use std::path::Path;
-use std::ptr;
+use std::{ffi::CString, os::raw::c_void, path::Path, ptr};
 
-use crate::bindings::iree_compiler_output_t;
-use crate::compiler::error::{CompilerError, check};
-use crate::compiler::library::Library;
+use crate::{
+    bindings::iree_compiler_output_t,
+    compiler::{
+        error::{CompilerError, check},
+        library::Library,
+    },
+};
 
 /// Outputs are not bound to a session -- they can outlive it -- so this only
 /// borrows the `Library` that owns the API entry points, not a `Session`.
@@ -19,7 +20,11 @@ impl<'lib> Output<'lib> {
         let c_path = CString::new(path.to_string_lossy().as_bytes())
             .map_err(|_| CompilerError::message("output path must not contain NUL"))?;
         let mut raw: *mut iree_compiler_output_t = ptr::null_mut();
-        let error = unsafe { library.api.ireeCompilerOutputOpenFile(c_path.as_ptr(), &mut raw) };
+        let error = unsafe {
+            library
+                .api
+                .ireeCompilerOutputOpenFile(c_path.as_ptr(), &mut raw)
+        };
         unsafe { check(&library.api, error) }?;
         Ok(Output { library, raw })
     }

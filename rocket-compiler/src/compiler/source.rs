@@ -1,11 +1,13 @@
-use std::ffi::CString;
-use std::path::Path;
-use std::ptr;
+use std::{ffi::CString, path::Path, ptr};
 
-use crate::bindings::iree_compiler_source_t;
-use crate::compiler::error::{CompilerError, check};
-use crate::compiler::library::Library;
-use crate::compiler::session::Session;
+use crate::{
+    bindings::iree_compiler_source_t,
+    compiler::{
+        error::{CompilerError, check},
+        library::Library,
+        session::Session,
+    },
+};
 
 pub struct Source<'lib> {
     library: &'lib Library,

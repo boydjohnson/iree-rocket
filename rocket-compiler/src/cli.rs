@@ -3,7 +3,10 @@ use std::path::PathBuf;
 use clap::{Args, Parser, Subcommand};
 
 #[derive(Parser)]
-#[command(name = "rocket-compiler", about = "Compile and audit Rocket placement for a model")]
+#[command(
+    name = "rocket-compiler",
+    about = "Compile and audit Rocket placement for a model"
+)]
 pub struct Cli {
     #[command(subcommand)]
     pub command: Command,

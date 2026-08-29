@@ -1,5 +1,7 @@
-use std::ffi::{CString, OsStr};
-use std::os::raw::c_char;
+use std::{
+    ffi::{CString, OsStr},
+    os::raw::c_char,
+};
 
 use crate::bindings::IREECompilerApi;
 

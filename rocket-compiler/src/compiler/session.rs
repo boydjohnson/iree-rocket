@@ -1,5 +1,4 @@
-use crate::bindings::iree_compiler_session_t;
-use crate::compiler::library::Library;
+use crate::{bindings::iree_compiler_session_t, compiler::library::Library};
 
 /// Session options are bootstrapped from whatever was passed to
 /// [`Library::setup_global_cl`] -- `ireeCompilerSessionSetFlags` only

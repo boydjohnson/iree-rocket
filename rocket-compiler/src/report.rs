@@ -67,16 +67,16 @@ impl PlacementReport {
                     exports: Vec::new(),
                 });
                 current = Some(is_rocket);
-            } else if trimmed.starts_with("hal.executable.export ") {
-                if let (Some(is_rocket), Some(name)) = (current, extract_symbol_name(line)) {
-                    let bucket = if is_rocket {
-                        &mut report.rocket_executables
-                    } else {
-                        &mut report.cpu_executables
-                    };
-                    if let Some(exec) = bucket.last_mut() {
-                        exec.exports.push(name);
-                    }
+            } else if trimmed.starts_with("hal.executable.export ")
+                && let (Some(is_rocket), Some(name)) = (current, extract_symbol_name(line))
+            {
+                let bucket = if is_rocket {
+                    &mut report.rocket_executables
+                } else {
+                    &mut report.cpu_executables
+                };
+                if let Some(exec) = bucket.last_mut() {
+                    exec.exports.push(name);
                 }
             }
         }

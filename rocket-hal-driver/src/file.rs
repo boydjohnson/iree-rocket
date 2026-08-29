@@ -61,7 +61,7 @@ pub unsafe fn import(
         handle,
         access,
         data: span.data,
-        data_length: span.data_length as usize,
+        data_length: span.data_length,
     });
     unsafe {
         *out_file = Box::into_raw(file) as *mut iree_hal_file_t;

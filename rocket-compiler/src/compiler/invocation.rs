@@ -1,12 +1,14 @@
 use std::ffi::CString;
 
-use crate::bindings::{
-    iree_compiler_invocation_t, iree_compiler_pipeline_t_IREE_COMPILER_PIPELINE_STD,
+use crate::{
+    bindings::{iree_compiler_invocation_t, iree_compiler_pipeline_t_IREE_COMPILER_PIPELINE_STD},
+    compiler::{
+        error::{CompilerError, check},
+        output::Output,
+        session::Session,
+        source::Source,
+    },
 };
-use crate::compiler::error::{CompilerError, check};
-use crate::compiler::output::Output;
-use crate::compiler::session::Session;
-use crate::compiler::source::Source;
 
 pub struct Invocation<'lib> {
     library: &'lib crate::compiler::library::Library,
@@ -23,7 +25,12 @@ pub enum Pipeline {
 
 impl<'lib> Invocation<'lib> {
     pub fn create(session: &Session<'lib>) -> Self {
-        let raw = unsafe { session.library.api.ireeCompilerInvocationCreate(session.raw) };
+        let raw = unsafe {
+            session
+                .library
+                .api
+                .ireeCompilerInvocationCreate(session.raw)
+        };
         Invocation {
             library: session.library,
             raw,

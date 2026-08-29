@@ -1,5 +1,4 @@
-use std::ffi::CStr;
-use std::fmt;
+use std::{ffi::CStr, fmt};
 
 use crate::bindings::{IREECompilerApi, iree_compiler_error_t};
 

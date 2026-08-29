@@ -3,10 +3,12 @@ mod cli;
 mod compiler;
 mod report;
 
-use std::env;
-use std::error::Error;
-use std::path::{Path, PathBuf};
-use std::process::ExitCode;
+use std::{
+    env,
+    error::Error,
+    path::{Path, PathBuf},
+    process::ExitCode,
+};
 
 use clap::Parser;
 
