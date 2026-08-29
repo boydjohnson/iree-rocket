@@ -16,8 +16,8 @@ use std::fmt;
 /// executable ended up.
 #[derive(Default)]
 pub struct PlacementReport {
-    pub rocket_executables: usize,
-    pub cpu_executables: usize,
+    pub rocket_executables: Vec<String>,
+    pub cpu_executables: Vec<String>,
 }
 
 impl PlacementReport {
@@ -27,13 +27,17 @@ impl PlacementReport {
             let trimmed = line.trim_start();
             // "hal.executable " (trailing space) is the per-executable line;
             // "hal.executable.variant"/"hal.executable.export" also carry a
-            // redundant copy of the same tag and would triple-count if matched.
-            if trimmed.starts_with("hal.executable ") {
-                match extract_attr(line, "rocket.final").as_deref() {
-                    Some("rocket") => report.rocket_executables += 1,
-                    Some("cpu") => report.cpu_executables += 1,
-                    _ => {}
-                }
+            // redundant copy of the same tag and would double-count if matched.
+            if !trimmed.starts_with("hal.executable ") {
+                continue;
+            }
+            let Some(name) = extract_symbol_name(line) else {
+                continue;
+            };
+            match extract_attr(line, "rocket.final").as_deref() {
+                Some("rocket") => report.rocket_executables.push(name),
+                Some("cpu") => report.cpu_executables.push(name),
+                _ => {}
             }
         }
         report
@@ -50,11 +54,37 @@ fn extract_attr(line: &str, key: &str) -> Option<String> {
     Some(line[start..end].to_string())
 }
 
+/// Pulls the `@symbol_name` off a `hal.executable private @name attributes
+/// {...}` line. Stops at the first character that can't appear in a bare
+/// (unquoted) MLIR symbol name.
+fn extract_symbol_name(line: &str) -> Option<String> {
+    let start = line.find('@')? + 1;
+    let end = line[start..]
+        .find(|c: char| !(c.is_alphanumeric() || c == '_' || c == '$' || c == '.'))
+        .map(|i| start + i)
+        .unwrap_or(line.len());
+    Some(line[start..end].to_string())
+}
+
 impl fmt::Display for PlacementReport {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         writeln!(f, "Placement report:")?;
-        writeln!(f, "  {} executable(s) -> rocket", self.rocket_executables)?;
-        writeln!(f, "  {} executable(s) -> cpu", self.cpu_executables)?;
+        writeln!(
+            f,
+            "  {} executable(s) -> rocket",
+            self.rocket_executables.len()
+        )?;
+        for name in &self.rocket_executables {
+            writeln!(f, "    - {name}")?;
+        }
+        writeln!(
+            f,
+            "  {} executable(s) -> cpu",
+            self.cpu_executables.len()
+        )?;
+        for name in &self.cpu_executables {
+            writeln!(f, "    - {name}")?;
+        }
         Ok(())
     }
 }
