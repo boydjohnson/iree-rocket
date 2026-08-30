@@ -385,6 +385,7 @@ fn attempt(
     let precision = Precision::Int8(Quantization {
         input_zero_point: 0,
         output_zero_point,
+        weight_zero_point: 0,
         // A negative power of two, so the requantisation divides exactly.
         // `for_unit_bs` cancels the gain the unit BS multiplier carries: the
         // BS stage shifts by 7, not the 14 the register suggests. That ratio
@@ -436,6 +437,7 @@ fn int8_channel_matrix_tiles_fit_their_data_banks() {
             let precision = Precision::Int8(Quantization {
                 input_zero_point: 0,
                 output_zero_point: 0,
+                weight_zero_point: 0,
                 multiplier: Multiplier::for_unit_bs(1.0 / f64::from(1u32 << shift)),
             });
             let shape = Shape::with_precision(64, 32, 1, in_channels, 8, precision);
@@ -546,6 +548,7 @@ fn int8_single_output_channel_probe() {
             let precision = Precision::Int8(Quantization {
                 input_zero_point: 0,
                 output_zero_point: 0,
+                weight_zero_point: 0,
                 multiplier: Multiplier::for_unit_bs(1.0 / f64::from(1u32 << shift)),
             });
             let shape = Shape::with_precision(64, 32, 1, 16, out_channels, precision);
@@ -578,6 +581,7 @@ fn int8_single_output_channel_probe() {
         Precision::Int8(Quantization {
             input_zero_point: 0,
             output_zero_point: 0,
+            weight_zero_point: 0,
             multiplier: Multiplier::for_unit_bs(1.0 / f64::from(1u32 << shift)),
         }),
     );
@@ -626,6 +630,7 @@ fn int8_bs_read_extent_probe() {
             let precision = Precision::Int8(Quantization {
                 input_zero_point: 0,
                 output_zero_point: 0,
+                weight_zero_point: 0,
                 multiplier: Multiplier::for_unit_bs(1.0 / f64::from(1u32 << shift)),
             });
             let shape = Shape::with_precision(64, 32, 1, 16, out_channels, precision);

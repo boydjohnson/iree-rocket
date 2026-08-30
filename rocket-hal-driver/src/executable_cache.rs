@@ -86,6 +86,7 @@ fn decode_precision(
     precision: schema::Precision,
     input_zero_point: u32,
     output_zero_point: u32,
+    weights_zero_point: u32,
     input_scale: f32,
     weights_scale: f32,
     output_scale: f32,
@@ -98,6 +99,7 @@ fn decode_precision(
             Ok(Precision::Int8(Quantization {
                 input_zero_point: input_zero_point as i32,
                 output_zero_point: output_zero_point as i32,
+                weight_zero_point: weights_zero_point as i32,
                 multiplier,
             }))
         }
@@ -139,6 +141,7 @@ fn decode_flatbuffer_shape(data: &[u8]) -> Result<UkernelShape, ()> {
                 conv_def.precision(),
                 conv_def.input_zero_point(),
                 conv_def.output_zero_point(),
+                conv_def.weights_zero_point(),
                 conv_def.input_scale(),
                 conv_def.weights_scale(),
                 conv_def.output_scale(),
@@ -206,6 +209,7 @@ fn decode_flatbuffer_shape(data: &[u8]) -> Result<UkernelShape, ()> {
                 fc_def.precision(),
                 fc_def.input_zero_point(),
                 fc_def.output_zero_point(),
+                fc_def.weights_zero_point(),
                 fc_def.input_scale(),
                 fc_def.weights_scale(),
                 fc_def.output_scale(),
@@ -412,6 +416,7 @@ unsafe extern "C" fn prepare_executable(
                 precision: Precision::Int8(Quantization {
                     input_zero_point: 0,
                     output_zero_point: 0,
+                    weight_zero_point: 0,
                     multiplier: Multiplier::from_ratio(1.0),
                 }),
                 padding: Some([0, 0]),

@@ -143,6 +143,7 @@ fn int8_quantization() -> Precision {
     Precision::Int8(Quantization {
         input_zero_point: 0,
         output_zero_point: 0,
+        weight_zero_point: 0,
         multiplier: Multiplier::for_unit_bs(1.0),
     })
 }
@@ -151,6 +152,7 @@ fn int8_identity_precision() -> Precision {
     Precision::Int8(Quantization {
         input_zero_point: 0,
         output_zero_point: 0,
+        weight_zero_point: 0,
         multiplier: Multiplier::from_ratio(1.0),
     })
 }
@@ -162,6 +164,7 @@ fn int8_depthwise_quantization() -> Precision {
         // requantization. Scale the retained coefficient fraction by 128,
         // then subtract that equally-scaled baseline.
         output_zero_point: -128,
+        weight_zero_point: 0,
         multiplier: Multiplier::for_unit_bs(INT8_DEPTHWISE_GAIN_CORRECTION),
     })
 }

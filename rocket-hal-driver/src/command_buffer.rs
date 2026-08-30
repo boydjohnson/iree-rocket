@@ -90,8 +90,8 @@ use iree_rocket_hal::rocket::{
     pooling::{PoolingBuffers, PoolingPlan},
     tensor_layout::{
         nc1hwc2_storage_size, pack_depthwise_to_rocket_weights, pack_fp16_bias_to_rocket,
-        pack_hwcf_to_rocket_weights, pack_nhwc_to_nc1hwc2_padded, rocket_fp16_bias_storage_size,
-        rocket_weight_storage_size,
+        pack_hwcf_to_rocket_weights, pack_hwcf_to_rocket_weights_affine_i8,
+        pack_nhwc_to_nc1hwc2_padded, rocket_fp16_bias_storage_size, rocket_weight_storage_size,
     },
 };
 
@@ -152,6 +152,7 @@ pub struct WeightPacking {
     /// Tap-major stride, only meaningful when `depthwise` is set. See
     /// `iree-rocket-hal`'s `Shape::depthwise_padded_channels`.
     pub padded_channels: usize,
+    pub weight_zero_point: Option<i8>,
 }
 
 /// Defers logical dense FP16 bias widening and padding until execution.
@@ -170,6 +171,10 @@ pub struct BiasPacking {
     pub scratch_handle: u32,
     pub output_channels: usize,
     pub padded_output_channels: usize,
+    pub int8: bool,
+    pub input_scale: f32,
+    pub weights_scale: f32,
+    pub weight_zero_point: i8,
 }
 
 /// Bridges the RK3588 DPU's atomic-slot output write-back (16-byte-aligned
@@ -540,6 +545,17 @@ pub unsafe fn apply_ops(
                             packing.element_size,
                             scratch,
                         )
+                    } else if let Some(zero_point) = packing.weight_zero_point {
+                        let zero_points = vec![zero_point; packing.output_channels];
+                        pack_hwcf_to_rocket_weights_affine_i8(
+                            dense,
+                            packing.filter_height,
+                            packing.filter_width,
+                            packing.input_channels,
+                            packing.output_channels,
+                            &zero_points,
+                            scratch,
+                        )
                     } else {
                         pack_hwcf_to_rocket_weights(
                             dense,
@@ -567,9 +583,14 @@ pub unsafe fn apply_ops(
                     }
                 }
                 if let Some(packing) = bias_packing {
-                    let dense_len = packing.output_channels.checked_mul(2).ok_or_else(|| {
-                        status::from_code(crate::bindings::iree_status_code_e_IREE_STATUS_INTERNAL)
-                    })?;
+                    let dense_len = packing
+                        .output_channels
+                        .checked_mul(if packing.int8 { 4 } else { 2 })
+                        .ok_or_else(|| {
+                            status::from_code(
+                                crate::bindings::iree_status_code_e_IREE_STATUS_INTERNAL,
+                            )
+                        })?;
                     if dense_len as u64 > packing.bias_length as u64 {
                         return Err(status::from_code(
                             crate::bindings::iree_status_code_e_IREE_STATUS_INVALID_ARGUMENT,
@@ -585,7 +606,23 @@ pub unsafe fn apply_ops(
                     let scratch = unsafe {
                         std::slice::from_raw_parts_mut(packing.scratch_ptr, packing.scratch_length)
                     };
-                    if pack_fp16_bias_to_rocket(
+                    if packing.int8 {
+                        if iree_rocket_hal::rocket::conv::pack_int8_bias_to_bs(
+                            dense,
+                            packing.output_channels,
+                            packing.padded_output_channels,
+                            packing.input_scale,
+                            packing.weights_scale,
+                            packing.weight_zero_point,
+                            scratch,
+                        )
+                        .is_err()
+                        {
+                            return Err(status::from_code(
+                                crate::bindings::iree_status_code_e_IREE_STATUS_INTERNAL,
+                            ));
+                        }
+                    } else if pack_fp16_bias_to_rocket(
                         dense,
                         packing.output_channels,
                         packing.padded_output_channels,
@@ -1022,113 +1059,117 @@ unsafe extern "C" fn dispatch(
             // This is independently deferred for the same reason as input
             // packing: an earlier recorded operation may populate weights.
             let element_size = shape.precision.element_bytes() as usize;
-            let (weights_addr, weights_handle, weight_packing) =
-                if shape.precision == Precision::Fp16 && !shape.depthwise {
-                    if !matches!(
-                        kernels[0]
-                        .checked_mul(kernels[1])
-                        .and_then(|value| value.checked_mul(shape.in_channels as usize))
-                        .and_then(|value| value.checked_mul(shape.out_channels as usize))
-                        .and_then(|value| value.checked_mul(element_size)),
-                        Some(value) if value as u64 <= refs[1].length as u64
-                    ) {
+            let (weights_addr, weights_handle, weight_packing) = if !shape.depthwise {
+                if !matches!(
+                    kernels[0]
+                    .checked_mul(kernels[1])
+                    .and_then(|value| value.checked_mul(shape.in_channels as usize))
+                    .and_then(|value| value.checked_mul(shape.out_channels as usize))
+                    .and_then(|value| value.checked_mul(element_size)),
+                    Some(value) if value as u64 <= refs[1].length as u64
+                ) {
+                    return status::from_code(
+                        crate::bindings::iree_status_code_e_IREE_STATUS_INVALID_ARGUMENT,
+                    );
+                }
+                let scratch_bytes = match rocket_weight_storage_size(
+                    kernels[0],
+                    kernels[1],
+                    shape.in_channels as usize,
+                    shape.out_channels as usize,
+                    element_size,
+                ) {
+                    Ok(value) => value,
+                    Err(_) => {
                         return status::from_code(
                             crate::bindings::iree_status_code_e_IREE_STATUS_INVALID_ARGUMENT,
                         );
                     }
-                    let scratch_bytes = match rocket_weight_storage_size(
-                        kernels[0],
-                        kernels[1],
-                        shape.in_channels as usize,
-                        shape.out_channels as usize,
-                        element_size,
-                    ) {
-                        Ok(value) => value,
-                        Err(_) => {
-                            return status::from_code(
-                                crate::bindings::iree_status_code_e_IREE_STATUS_INVALID_ARGUMENT,
-                            );
-                        }
-                    };
-                    let scratch = unsafe {
-                        RocketOwnedBuffer::new(
-                            cb.fd,
-                            scratch_bytes.max(1),
-                            BorrowedFd::borrow_raw(cb.fd),
-                        )
-                    };
-                    let packed = (
-                        scratch.dma_address,
-                        scratch.handle,
-                        Some(WeightPacking {
-                            weight_buffer: refs[1].buffer,
-                            weight_offset: refs[1].offset,
-                            weight_length: refs[1].length,
-                            scratch_ptr: scratch.host_ptr,
-                            scratch_length: scratch_bytes,
-                            scratch_handle: scratch.handle,
-                            filter_height: kernels[0],
-                            filter_width: kernels[1],
-                            input_channels: shape.in_channels as usize,
-                            output_channels: shape.out_channels as usize,
-                            element_size,
-                            depthwise: false,
-                            padded_channels: 0,
-                        }),
-                    );
-                    scratch_buffers.push(scratch);
-                    packed
-                } else if shape.precision == Precision::Fp16 && shape.depthwise {
-                    // One filter per input channel -- no Cout factor, unlike
-                    // the dense branch above. The compiler-emitted dispatch
-                    // (transform.0.mlir's call_rocket_dynamic_depthwise_conv2d)
-                    // transposes the filter to [Cin][kh][kw] before this
-                    // binding is populated, matching what
-                    // pack_depthwise_to_rocket_weights expects -- see that
-                    // function's doc comment.
-                    if !matches!(
-                        kernels[0]
-                        .checked_mul(kernels[1])
-                        .and_then(|value| value.checked_mul(shape.in_channels as usize))
-                        .and_then(|value| value.checked_mul(element_size)),
-                        Some(value) if value as u64 <= refs[1].length as u64
-                    ) {
-                        return status::from_code(
-                            crate::bindings::iree_status_code_e_IREE_STATUS_INVALID_ARGUMENT,
-                        );
-                    }
-                    let scratch_bytes = shape.weight_bytes(kernels) as usize;
-                    let scratch = unsafe {
-                        RocketOwnedBuffer::new(
-                            cb.fd,
-                            scratch_bytes.max(1),
-                            BorrowedFd::borrow_raw(cb.fd),
-                        )
-                    };
-                    let packed = (
-                        scratch.dma_address,
-                        scratch.handle,
-                        Some(WeightPacking {
-                            weight_buffer: refs[1].buffer,
-                            weight_offset: refs[1].offset,
-                            weight_length: refs[1].length,
-                            scratch_ptr: scratch.host_ptr,
-                            scratch_length: scratch_bytes,
-                            scratch_handle: scratch.handle,
-                            filter_height: kernels[0],
-                            filter_width: kernels[1],
-                            input_channels: shape.in_channels as usize,
-                            output_channels: shape.out_channels as usize,
-                            element_size,
-                            depthwise: true,
-                            padded_channels: shape.depthwise_padded_channels() as usize,
-                        }),
-                    );
-                    scratch_buffers.push(scratch);
-                    packed
-                } else {
-                    (addr(&refs[1]), handle(&refs[1]), None)
                 };
+                let scratch = unsafe {
+                    RocketOwnedBuffer::new(
+                        cb.fd,
+                        scratch_bytes.max(1),
+                        BorrowedFd::borrow_raw(cb.fd),
+                    )
+                };
+                let packed = (
+                    scratch.dma_address,
+                    scratch.handle,
+                    Some(WeightPacking {
+                        weight_buffer: refs[1].buffer,
+                        weight_offset: refs[1].offset,
+                        weight_length: refs[1].length,
+                        scratch_ptr: scratch.host_ptr,
+                        scratch_length: scratch_bytes,
+                        scratch_handle: scratch.handle,
+                        filter_height: kernels[0],
+                        filter_width: kernels[1],
+                        input_channels: shape.in_channels as usize,
+                        output_channels: shape.out_channels as usize,
+                        element_size,
+                        depthwise: false,
+                        padded_channels: 0,
+                        weight_zero_point: match shape.precision {
+                            Precision::Fp16 => None,
+                            Precision::Int8(q) => Some(q.weight_zero_point as i8),
+                        },
+                    }),
+                );
+                scratch_buffers.push(scratch);
+                packed
+            } else if shape.precision == Precision::Fp16 && shape.depthwise {
+                // One filter per input channel -- no Cout factor, unlike
+                // the dense branch above. The compiler-emitted dispatch
+                // (transform.0.mlir's call_rocket_dynamic_depthwise_conv2d)
+                // transposes the filter to [Cin][kh][kw] before this
+                // binding is populated, matching what
+                // pack_depthwise_to_rocket_weights expects -- see that
+                // function's doc comment.
+                if !matches!(
+                    kernels[0]
+                    .checked_mul(kernels[1])
+                    .and_then(|value| value.checked_mul(shape.in_channels as usize))
+                    .and_then(|value| value.checked_mul(element_size)),
+                    Some(value) if value as u64 <= refs[1].length as u64
+                ) {
+                    return status::from_code(
+                        crate::bindings::iree_status_code_e_IREE_STATUS_INVALID_ARGUMENT,
+                    );
+                }
+                let scratch_bytes = shape.weight_bytes(kernels) as usize;
+                let scratch = unsafe {
+                    RocketOwnedBuffer::new(
+                        cb.fd,
+                        scratch_bytes.max(1),
+                        BorrowedFd::borrow_raw(cb.fd),
+                    )
+                };
+                let packed = (
+                    scratch.dma_address,
+                    scratch.handle,
+                    Some(WeightPacking {
+                        weight_buffer: refs[1].buffer,
+                        weight_offset: refs[1].offset,
+                        weight_length: refs[1].length,
+                        scratch_ptr: scratch.host_ptr,
+                        scratch_length: scratch_bytes,
+                        scratch_handle: scratch.handle,
+                        filter_height: kernels[0],
+                        filter_width: kernels[1],
+                        input_channels: shape.in_channels as usize,
+                        output_channels: shape.out_channels as usize,
+                        element_size,
+                        depthwise: true,
+                        padded_channels: shape.depthwise_padded_channels() as usize,
+                        weight_zero_point: None,
+                    }),
+                );
+                scratch_buffers.push(scratch);
+                packed
+            } else {
+                (addr(&refs[1]), handle(&refs[1]), None)
+            };
             let (bias_addr, bias_handle, bias_packing) = if shape.precision == Precision::Fp16 {
                 let output_channels = shape.out_channels as usize;
                 let padded_output_channels = shape.padded_out_channels() as usize;
@@ -1167,6 +1208,49 @@ unsafe extern "C" fn dispatch(
                         scratch_handle: scratch.handle,
                         output_channels,
                         padded_output_channels,
+                        int8: false,
+                        input_scale: 1.0,
+                        weights_scale: 1.0,
+                        weight_zero_point: 0,
+                    }),
+                );
+                scratch_buffers.push(scratch);
+                packed
+            } else if let Precision::Int8(q) = shape.precision {
+                let output_channels = shape.out_channels as usize;
+                let padded_output_channels = shape.padded_out_channels() as usize;
+                if output_channels
+                    .checked_mul(4)
+                    .is_none_or(|value| value as u64 > refs[2].length as u64)
+                {
+                    return status::from_code(
+                        crate::bindings::iree_status_code_e_IREE_STATUS_INVALID_ARGUMENT,
+                    );
+                }
+                let scratch_bytes = shape.bs_buffer_bytes();
+                let scratch = unsafe {
+                    RocketOwnedBuffer::new(
+                        cb.fd,
+                        scratch_bytes.max(1),
+                        BorrowedFd::borrow_raw(cb.fd),
+                    )
+                };
+                let packed = (
+                    scratch.dma_address,
+                    scratch.handle,
+                    Some(BiasPacking {
+                        bias_buffer: refs[2].buffer,
+                        bias_offset: refs[2].offset,
+                        bias_length: refs[2].length,
+                        scratch_ptr: scratch.host_ptr,
+                        scratch_length: scratch_bytes,
+                        scratch_handle: scratch.handle,
+                        output_channels,
+                        padded_output_channels,
+                        int8: true,
+                        input_scale: 1.0,
+                        weights_scale: 1.0,
+                        weight_zero_point: q.weight_zero_point as i8,
                     }),
                 );
                 scratch_buffers.push(scratch);
@@ -1381,6 +1465,7 @@ unsafe extern "C" fn dispatch(
                 element_size,
                 depthwise: false,
                 padded_channels: 0,
+                weight_zero_point: None,
             });
 
             let (bias_addr, bias_handle, bias_packing, bias_scratch) = if shape.precision
@@ -1412,6 +1497,10 @@ unsafe extern "C" fn dispatch(
                     scratch_handle: scratch.handle,
                     output_channels: n,
                     padded_output_channels,
+                    int8: false,
+                    input_scale: 1.0,
+                    weights_scale: 1.0,
+                    weight_zero_point: 0,
                 };
                 (
                     scratch.dma_address,

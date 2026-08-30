@@ -80,6 +80,7 @@ fn map_with(
     let precision = Precision::Int8(Quantization {
         input_zero_point: 0,
         output_zero_point: 0,
+        weight_zero_point: 0,
         multiplier: cvt,
     });
     let shape = Shape::with_precision(WIDTH, HEIGHT, 1, in_channels, out_channels, precision);

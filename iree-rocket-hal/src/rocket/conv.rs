@@ -418,6 +418,7 @@ pub struct Quantization {
     /// Quantized encoding of 0.0 on the output, programmed into
     /// `DPU_OUT_CVT_OFFSET`.
     pub output_zero_point: i32,
+    pub weight_zero_point: i32,
     /// Requantization multiplier, `input_scale * weight_scale / output_scale`.
     pub multiplier: Multiplier,
 }
@@ -5049,6 +5050,7 @@ mod tests {
         Precision::Int8(Quantization {
             input_zero_point: 0,
             output_zero_point: -3,
+            weight_zero_point: 0,
             multiplier: Multiplier {
                 scale: 19636,
                 shift: 24,

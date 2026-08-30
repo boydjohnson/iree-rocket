@@ -37,6 +37,7 @@ impl FixturePrecision {
             Self::Int8 => Precision::Int8(Quantization {
                 input_zero_point: 0,
                 output_zero_point: -3,
+                weight_zero_point: 0,
                 multiplier: Multiplier {
                     scale: 19636,
                     shift: 24,

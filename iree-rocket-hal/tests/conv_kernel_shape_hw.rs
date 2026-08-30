@@ -408,6 +408,7 @@ fn int8_precision(shift: u32) -> Precision {
     Precision::Int8(Quantization {
         input_zero_point: 0,
         output_zero_point: 0,
+        weight_zero_point: 0,
         // A negative power of two, so the requantisation divides exactly.
         multiplier: Multiplier::for_unit_bs(1.0 / f64::from(1u32 << shift)),
     })

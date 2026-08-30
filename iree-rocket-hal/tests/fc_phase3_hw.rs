@@ -213,6 +213,7 @@ fn odd_int8_n_height_one_fc_runs_on_npu() {
         Precision::Int8(Quantization {
             input_zero_point: 0,
             output_zero_point: 0,
+            weight_zero_point: 0,
             multiplier: Multiplier::for_unit_bs(1.0),
         }),
     );

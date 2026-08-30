@@ -112,6 +112,7 @@ fn vendor_fixture_plans_cover_convplan_shapes_i8() {
                 iree_rocket_hal::rocket::conv::Quantization {
                     input_zero_point: 0,
                     output_zero_point: -3,
+                    weight_zero_point: 0,
                     multiplier: iree_rocket_hal::rocket::conv::Multiplier {
                         scale: 19636,
                         shift: 24,

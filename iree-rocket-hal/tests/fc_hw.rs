@@ -49,6 +49,7 @@ fn int8_shape(m: u32, k: u32, n: u32) -> Shape {
         Precision::Int8(Quantization {
             input_zero_point: 0,
             output_zero_point: 0,
+            weight_zero_point: 0,
             multiplier: Multiplier::for_unit_bs(1.0),
         }),
     )

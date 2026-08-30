@@ -133,6 +133,7 @@ impl Conv2dCase {
                 Precision::Int8(Quantization {
                     input_zero_point: 0,
                     output_zero_point,
+                    weight_zero_point: 0,
                     multiplier,
                 })
             }
