@@ -89,8 +89,9 @@ use iree_rocket_hal::rocket::{
     fc,
     pooling::{PoolingBuffers, PoolingPlan},
     tensor_layout::{
-        nc1hwc2_storage_size, pack_depthwise_to_rocket_weights, pack_hwcf_to_rocket_weights,
-        pack_nhwc_to_nc1hwc2_padded, rocket_weight_storage_size,
+        nc1hwc2_storage_size, pack_depthwise_to_rocket_weights, pack_fp16_bias_to_rocket,
+        pack_hwcf_to_rocket_weights, pack_nhwc_to_nc1hwc2_padded, rocket_fp16_bias_storage_size,
+        rocket_weight_storage_size,
     },
 };
 
@@ -151,6 +152,24 @@ pub struct WeightPacking {
     /// Tap-major stride, only meaningful when `depthwise` is set. See
     /// `iree-rocket-hal`'s `Shape::depthwise_padded_channels`.
     pub padded_channels: usize,
+}
+
+/// Defers logical dense FP16 bias widening and padding until execution.
+///
+/// FP16 BRDMA consumes widened 32-bit ALU operands and is programmed for the
+/// atomically padded output-channel count. A private, zero-padded buffer both
+/// performs the FP16-to-FP32 bridge and prevents that physical read width from
+/// escaping an exact-sized binding or observing neighboring suballocations.
+#[derive(Clone, Copy)]
+pub struct BiasPacking {
+    pub bias_buffer: *mut iree_hal_buffer_t,
+    pub bias_offset: iree_device_size_t,
+    pub bias_length: iree_device_size_t,
+    pub scratch_ptr: *mut u8,
+    pub scratch_length: usize,
+    pub scratch_handle: u32,
+    pub output_channels: usize,
+    pub padded_output_channels: usize,
 }
 
 /// Bridges the RK3588 DPU's atomic-slot output write-back (16-byte-aligned
@@ -230,6 +249,10 @@ pub enum RecordedOp {
         /// Set for regular fp16 Conv2d dispatches whose logical HWCF filter
         /// must be packed into the CNA's blocked coefficient order.
         weight_packing: Option<WeightPacking>,
+        /// Set for FP16 Conv2d and FullyConnected dispatches. Logical FP16
+        /// values are widened to BRDMA's FP32 operands and the physical tail
+        /// is zero-padded to the DPU's programmed output-channel count.
+        bias_packing: Option<BiasPacking>,
         /// Set only for `Conv2d` -- see `OutputCompaction`'s own doc comment.
         /// `None` for `Pooling` (unaffected today, flagged as a follow-up
         /// risk -- same DPU write-back stage almost certainly has the same
@@ -394,6 +417,7 @@ pub unsafe fn apply_ops(
                 out_bo_handles,
                 input_packing,
                 weight_packing,
+                bias_packing,
                 output_compaction,
                 ..
             } => {
@@ -528,6 +552,47 @@ pub unsafe fn apply_ops(
                         )
                     };
                     if pack_result.is_err() {
+                        return Err(status::from_code(
+                            crate::bindings::iree_status_code_e_IREE_STATUS_INTERNAL,
+                        ));
+                    }
+                    if unsafe {
+                        iree_rocket_hal::rocket::device::fini_bo(cb.fd, packing.scratch_handle)
+                    }
+                    .is_err()
+                    {
+                        return Err(status::from_code(
+                            crate::bindings::iree_status_code_e_IREE_STATUS_INTERNAL,
+                        ));
+                    }
+                }
+                if let Some(packing) = bias_packing {
+                    let dense_len = packing.output_channels.checked_mul(2).ok_or_else(|| {
+                        status::from_code(crate::bindings::iree_status_code_e_IREE_STATUS_INTERNAL)
+                    })?;
+                    if dense_len as u64 > packing.bias_length as u64 {
+                        return Err(status::from_code(
+                            crate::bindings::iree_status_code_e_IREE_STATUS_INVALID_ARGUMENT,
+                        ));
+                    }
+                    let bias = unsafe { &*(packing.bias_buffer as *const RocketBuffer) };
+                    let dense = unsafe {
+                        std::slice::from_raw_parts(
+                            bias.host_ptr.add(packing.bias_offset),
+                            dense_len,
+                        )
+                    };
+                    let scratch = unsafe {
+                        std::slice::from_raw_parts_mut(packing.scratch_ptr, packing.scratch_length)
+                    };
+                    if pack_fp16_bias_to_rocket(
+                        dense,
+                        packing.output_channels,
+                        packing.padded_output_channels,
+                        scratch,
+                    )
+                    .is_err()
+                    {
                         return Err(status::from_code(
                             crate::bindings::iree_status_code_e_IREE_STATUS_INTERNAL,
                         ));
@@ -904,7 +969,7 @@ unsafe extern "C" fn dispatch(
                     crate::bindings::iree_status_code_e_IREE_STATUS_INVALID_ARGUMENT,
                 );
             }
-            let mut scratch_buffers = Vec::with_capacity(3);
+            let mut scratch_buffers = Vec::with_capacity(4);
 
             // CNA's surface-layout path consumes 16-byte feature-atomic
             // NC1HWC2 surfaces. Shapes with 1..=4 channels use the hardware's
@@ -1064,6 +1129,51 @@ unsafe extern "C" fn dispatch(
                 } else {
                     (addr(&refs[1]), handle(&refs[1]), None)
                 };
+            let (bias_addr, bias_handle, bias_packing) = if shape.precision == Precision::Fp16 {
+                let output_channels = shape.out_channels as usize;
+                let padded_output_channels = shape.padded_out_channels() as usize;
+                if !matches!(
+                    output_channels.checked_mul(element_size),
+                    Some(value) if value as u64 <= refs[2].length as u64
+                ) {
+                    return status::from_code(
+                        crate::bindings::iree_status_code_e_IREE_STATUS_INVALID_ARGUMENT,
+                    );
+                }
+                let scratch_bytes = match rocket_fp16_bias_storage_size(padded_output_channels) {
+                    Ok(value) => value,
+                    Err(_) => {
+                        return status::from_code(
+                            crate::bindings::iree_status_code_e_IREE_STATUS_INVALID_ARGUMENT,
+                        );
+                    }
+                };
+                let scratch = unsafe {
+                    RocketOwnedBuffer::new(
+                        cb.fd,
+                        scratch_bytes.max(1),
+                        BorrowedFd::borrow_raw(cb.fd),
+                    )
+                };
+                let packed = (
+                    scratch.dma_address,
+                    scratch.handle,
+                    Some(BiasPacking {
+                        bias_buffer: refs[2].buffer,
+                        bias_offset: refs[2].offset,
+                        bias_length: refs[2].length,
+                        scratch_ptr: scratch.host_ptr,
+                        scratch_length: scratch_bytes,
+                        scratch_handle: scratch.handle,
+                        output_channels,
+                        padded_output_channels,
+                    }),
+                );
+                scratch_buffers.push(scratch);
+                packed
+            } else {
+                (addr(&refs[2]), handle(&refs[2]), None)
+            };
             // DPU's atomic-slot output write-back (16-byte-aligned slots
             // regardless of dtype) doesn't match IREE's densely-packed ABI
             // output buffer -- see `OutputCompaction`'s own doc comment.
@@ -1078,7 +1188,7 @@ unsafe extern "C" fn dispatch(
             let bufs = Buffers {
                 input: input_addr,
                 weights: weights_addr,
-                bias: addr(&refs[2]),
+                bias: bias_addr,
                 output: scratch.dma_address,
             };
             // catch_unwind backstop -- see module doc comment for exactly
@@ -1118,10 +1228,11 @@ unsafe extern "C" fn dispatch(
                 regcmd_tasks,
                 retained_bindings,
                 scratch_buffers,
-                in_bo_handles: vec![input_handle, weights_handle, handle(&refs[2])],
+                in_bo_handles: vec![input_handle, weights_handle, bias_handle],
                 out_bo_handles: vec![output_handle],
                 input_packing,
                 weight_packing,
+                bias_packing,
                 output_compaction,
             });
         }
@@ -1272,6 +1383,46 @@ unsafe extern "C" fn dispatch(
                 padded_channels: 0,
             });
 
+            let (bias_addr, bias_handle, bias_packing, bias_scratch) = if shape.precision
+                == Precision::Fp16
+            {
+                let padded_output_channels = shape.as_conv_shape().padded_out_channels() as usize;
+                let bias_scratch_bytes = match rocket_fp16_bias_storage_size(padded_output_channels)
+                {
+                    Ok(value) => value,
+                    Err(_) => {
+                        return status::from_code(
+                            crate::bindings::iree_status_code_e_IREE_STATUS_INVALID_ARGUMENT,
+                        );
+                    }
+                };
+                let scratch = unsafe {
+                    RocketOwnedBuffer::new(
+                        cb.fd,
+                        bias_scratch_bytes.max(1),
+                        BorrowedFd::borrow_raw(cb.fd),
+                    )
+                };
+                let packing = BiasPacking {
+                    bias_buffer: refs[2].buffer,
+                    bias_offset: refs[2].offset,
+                    bias_length: refs[2].length,
+                    scratch_ptr: scratch.host_ptr,
+                    scratch_length: bias_scratch_bytes,
+                    scratch_handle: scratch.handle,
+                    output_channels: n,
+                    padded_output_channels,
+                };
+                (
+                    scratch.dma_address,
+                    scratch.handle,
+                    Some(packing),
+                    Some(scratch),
+                )
+            } else {
+                (addr(&refs[2]), handle(&refs[2]), None, None)
+            };
+
             let output_scratch_bytes =
                 match nc1hwc2_storage_size(physical_pixel_count, output_bytes_per_pixel) {
                     Ok(value) => value,
@@ -1296,7 +1447,7 @@ unsafe extern "C" fn dispatch(
             let bufs = Buffers {
                 input: input_scratch.dma_address,
                 weights: weight_scratch.dma_address,
-                bias: addr(&refs[2]),
+                bias: bias_addr,
                 output: output_scratch.dma_address,
             };
             let regcmd_tasks = match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
@@ -1327,18 +1478,19 @@ unsafe extern "C" fn dispatch(
                 bytes_per_pixel: output_bytes_per_pixel,
             });
             let retained_bindings = unsafe { retain_direct_bindings(refs) };
+            let mut scratch_buffers = vec![input_scratch, weight_scratch, output_scratch];
+            if let Some(scratch) = bias_scratch {
+                scratch_buffers.push(scratch);
+            }
             cb.ops.push(RecordedOp::Dispatch {
                 regcmd_tasks,
                 retained_bindings,
-                scratch_buffers: vec![input_scratch, weight_scratch, output_scratch],
-                in_bo_handles: vec![
-                    input_scratch_handle,
-                    weight_scratch_handle,
-                    handle(&refs[2]),
-                ],
+                scratch_buffers,
+                in_bo_handles: vec![input_scratch_handle, weight_scratch_handle, bias_handle],
                 out_bo_handles: vec![output_scratch_handle],
                 input_packing,
                 weight_packing,
+                bias_packing,
                 output_compaction,
             });
         }
@@ -1369,6 +1521,7 @@ unsafe extern "C" fn dispatch(
                 out_bo_handles: vec![handle(&refs[1])],
                 input_packing: None,
                 weight_packing: None,
+                bias_packing: None,
                 output_compaction: None,
             });
         }

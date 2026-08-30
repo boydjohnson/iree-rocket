@@ -31,9 +31,10 @@ The harness accepts a regular FP16 convolution described by:
 Input data is logical dense NHWC and weights are logical dense HWCF. The
 harness does not call Rocket tensor-packing helpers. That is deliberate: the
 test covers the driver's deferred input packing, coefficient packing, actual
-buffer binding order, NPU submission, and dense output compaction. The
-reference path indexes the logical tensors directly and has no dependency on
-the Rocket layouts or register-command builder.
+buffer binding order, FP16-to-FP32 BRDMA bias widening, NPU submission, and
+dense output compaction. The reference path indexes the logical tensors
+directly and has no dependency on the Rocket layouts or register-command
+builder.
 
 The harness releases its input, weight, and bias buffer references after
 recording and before queue submission. Correct execution therefore also checks
@@ -58,9 +59,10 @@ layout, binding, or padding errors remain readily visible.
   coefficient bridge in the driver.
 - Depthwise needs the driver to accept a documented logical depthwise weight
   layout and invoke its existing depthwise packer.
-- Bias is zero. The current FP16 bias binding is still hardware-layout
-  storage, so the harness allocates neutral backing rather than claiming it is
-  a logical dense bias tensor.
+- Bias is a logical dense FP16 tensor. Dedicated exact-sized bindings and a
+  nonzero-offset binding populated by a preceding command-buffer update
+  between poisoned neighboring suballocations verify the driver's deferred
+  widening and zero-padding bridge to BRDMA storage.
 - The host build verifies compilation and skips cleanly without
   `/dev/accel/accel0`. The parameterized cases must be run on an RK3588 board
   for NPU result validation.

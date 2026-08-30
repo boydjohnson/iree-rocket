@@ -22,6 +22,81 @@ pub const WEIGHT_ATOMIC_BYTES: usize = 32;
 /// hardware output kernels.
 pub const WEIGHT_INPUT_GROUP_CHANNELS: usize = 32;
 
+/// Returns the storage needed for an FP16 BRDMA bias operand stream.
+///
+/// FP16 enables only the BS ALU operand (`brdma_data_use = 1`), but that
+/// operand is a 32-bit float at the RK3588 BRDMA boundary. The logical IREE
+/// tensor remains FP16 and is widened by [`pack_fp16_bias_to_rocket`]. The
+/// destination is sized to the DPU's programmed (padded) output-channel count
+/// so BRDMA never reaches an adjacent allocation for the final partial
+/// channel granule.
+pub fn rocket_fp16_bias_storage_size(padded_output_channels: usize) -> Result<usize, &'static str> {
+    if padded_output_channels == 0 {
+        return Err("Rocket FP16 bias channel count must be nonzero");
+    }
+    padded_output_channels
+        .checked_mul(4)
+        .ok_or("Rocket FP16 bias storage size overflows usize")
+}
+
+/// Widens a logical dense FP16 bias vector into BRDMA's FP32 operand stream.
+///
+/// Only `output_channels * 2` bytes are read from `dense`; all physical tail
+/// channels are zero. Public IREE bindings may be exact-sized subranges with
+/// unrelated live data immediately before and after them, while the DPU is
+/// programmed for `padded_output_channels`.
+pub fn pack_fp16_bias_to_rocket(
+    dense: &[u8],
+    output_channels: usize,
+    padded_output_channels: usize,
+    packed: &mut [u8],
+) -> Result<usize, &'static str> {
+    if output_channels == 0 || padded_output_channels < output_channels {
+        return Err("invalid Rocket FP16 bias channel counts");
+    }
+    let dense_len = output_channels
+        .checked_mul(2)
+        .ok_or("dense FP16 bias storage size overflows usize")?;
+    if dense.len() < dense_len {
+        return Err("dense FP16 bias is smaller than its declared shape");
+    }
+    let packed_len = rocket_fp16_bias_storage_size(padded_output_channels)?;
+    if packed.len() < packed_len {
+        return Err("Rocket FP16 bias destination is smaller than its declared shape");
+    }
+    packed[..packed_len].fill(0);
+    for channel in 0..output_channels {
+        let source = channel * 2;
+        let fp16 = u16::from_le_bytes([dense[source], dense[source + 1]]);
+        let destination = channel * 4;
+        packed[destination..destination + 4]
+            .copy_from_slice(&fp16_to_fp32_bits(fp16).to_le_bytes());
+    }
+    Ok(packed_len)
+}
+
+/// Exact IEEE-754 binary16 to binary32 widening, returned as raw bits.
+fn fp16_to_fp32_bits(value: u16) -> u32 {
+    let sign = (u32::from(value) & 0x8000) << 16;
+    let exponent = (value >> 10) & 0x1f;
+    let fraction = value & 0x03ff;
+    match exponent {
+        0 if fraction == 0 => sign,
+        0 => {
+            let mut normalized = u32::from(fraction);
+            let mut unbiased_exponent = -14i32;
+            while normalized & 0x0400 == 0 {
+                normalized <<= 1;
+                unbiased_exponent -= 1;
+            }
+            normalized &= 0x03ff;
+            sign | (((unbiased_exponent + 127) as u32) << 23) | (normalized << 13)
+        }
+        0x1f => sign | 0x7f80_0000 | (u32::from(fraction) << 13),
+        _ => sign | ((u32::from(exponent) + (127 - 15)) << 23) | (u32::from(fraction) << 13),
+    }
+}
+
 /// Returns the NC1HWC2 storage required for `pixel_count` dense pixels.
 ///
 /// `bytes_per_pixel` is the logical channel count times the element size.
@@ -426,6 +501,81 @@ pub fn pack_depthwise_to_rocket_weights(
 mod tests {
     use super::*;
     use crate::rocket::conv::Shape;
+
+    #[test]
+    fn packs_exact_fp16_bias_and_zeroes_programmed_tail() {
+        let dense = [0x3C00u16, 0x4000, 0x4200]
+            .into_iter()
+            .flat_map(u16::to_le_bytes)
+            .collect::<Vec<_>>();
+        let mut packed = vec![0xA5; rocket_fp16_bias_storage_size(16).unwrap()];
+
+        let written = pack_fp16_bias_to_rocket(&dense, 3, 16, &mut packed).unwrap();
+
+        assert_eq!(written, 64);
+        let widened = packed[..12]
+            .chunks_exact(4)
+            .map(|bytes| u32::from_le_bytes(bytes.try_into().unwrap()))
+            .collect::<Vec<_>>();
+        assert_eq!(
+            widened,
+            [1.0f32.to_bits(), 2.0f32.to_bits(), 3.0f32.to_bits()]
+        );
+        assert!(packed[12..written].iter().all(|&byte| byte == 0));
+    }
+
+    #[test]
+    fn fp16_bias_packing_reads_only_the_declared_subrange() {
+        const PREFIX: usize = 11;
+        let mut allocation = vec![0xD3; PREFIX];
+        allocation.extend(
+            [0x4900u16, 0x4980, 0x4A00]
+                .into_iter()
+                .flat_map(u16::to_le_bytes),
+        );
+        allocation.extend([0x7B; 13]);
+        let logical_len = 3 * 2;
+        let dense = &allocation[PREFIX..PREFIX + logical_len];
+        let mut packed = vec![0xFF; 64];
+
+        pack_fp16_bias_to_rocket(dense, 3, 16, &mut packed).unwrap();
+
+        let widened = packed[..12]
+            .chunks_exact(4)
+            .map(|bytes| f32::from_le_bytes(bytes.try_into().unwrap()))
+            .collect::<Vec<_>>();
+        assert_eq!(widened, [10.0, 11.0, 12.0]);
+        assert!(packed[12..].iter().all(|&byte| byte == 0));
+    }
+
+    #[test]
+    fn fp16_bias_packing_rejects_short_and_invalid_buffers() {
+        assert!(pack_fp16_bias_to_rocket(&[0; 5], 3, 16, &mut [0; 64]).is_err());
+        assert!(pack_fp16_bias_to_rocket(&[0; 6], 3, 2, &mut [0; 64]).is_err());
+        assert!(pack_fp16_bias_to_rocket(&[0; 6], 3, 16, &mut [0; 63]).is_err());
+        assert!(rocket_fp16_bias_storage_size(0).is_err());
+        assert!(rocket_fp16_bias_storage_size(usize::MAX).is_err());
+    }
+
+    #[test]
+    fn fp16_bias_widening_handles_ieee_edges() {
+        for (fp16, fp32) in [
+            (0x0000, 0x0000_0000), // positive zero
+            (0x8000, 0x8000_0000), // negative zero
+            (0x0001, 0x3380_0000), // smallest subnormal
+            (0x0400, 0x3880_0000), // smallest normal
+            (0x3C00, 0x3F80_0000), // one
+            (0xC000, 0xC000_0000), // negative two
+            (0x7BFF, 0x477F_E000), // largest finite
+            (0x7C00, 0x7F80_0000), // positive infinity
+            (0xFC00, 0xFF80_0000), // negative infinity
+        ] {
+            assert_eq!(fp16_to_fp32_bits(fp16), fp32, "FP16 bits {fp16:#06x}");
+        }
+        let nan = fp16_to_fp32_bits(0x7E01);
+        assert_eq!(nan & 0x7F80_0000, 0x7F80_0000);
+        assert_ne!(nan & 0x007F_FFFF, 0);
+    }
 
     #[test]
     fn packs_fp16_c32_as_four_channel_surfaces() {
