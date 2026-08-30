@@ -469,9 +469,9 @@ fn bank_partition_flip_boundary_cases() -> Vec<Conv2dCase> {
 }
 
 /// A real fp16 VGG-19 run through blocks 4-5 (all four Cin/Cout-512
-/// convolutions) shows severe end-to-end disagreement against CPU -- MAE
-/// roughly 30x worse than the same run capped at Cin/Cout <= 256, only
-/// 20.70% of logits within the 0.05 tolerance that the <= 256 run hit
+/// convolutions) previously showed severe end-to-end disagreement against
+/// CPU -- MAE roughly 30x worse than the same run capped at Cin/Cout <= 256,
+/// with only 20.70% of logits within the 0.05 tolerance that the <= 256 run hit
 /// 100% on. None of these shapes are affected by the CBUF bank-partition
 /// bug fixed above (VGG never asks for small Cin with large Cout, or the
 /// specific high-Cin K1 combinations that bug needed), and the Cartesian
@@ -487,6 +487,12 @@ fn bank_partition_flip_boundary_cases() -> Vec<Conv2dCase> {
 /// (VGG block 3) as a control: if block 3 passes and blocks 4/5 fail, that
 /// isolates the effect to Cin/Cout 512 specifically rather than to
 /// something wrong with the `Dense` pattern or harness itself.
+///
+/// Status (2026-08-30, `f6843e4`): all five cases pass on RK3588 hardware
+/// after the CBUF partition fixes. Keep this as a regression gate because
+/// the earlier Counting/Selectors coverage passed while a real trained-weight
+/// model did not. `tools/e2e_conv_regression.py` cross-builds and runs this exact
+/// test before checking the compiler -> VMFB -> public-driver path too.
 fn dense_coefficient_vgg_block_cases() -> Vec<Conv2dCase> {
     let mut cases = Vec::new();
     for (extent, cin, cout) in [
@@ -771,8 +777,8 @@ fn bank_partition_flip_boundary_probe_runs_every_case_before_failing() {
 }
 
 #[test]
-#[ignore = "needs /dev/accel/accel0 -- tests whether dense diverse coefficients break at VGG's Cin/Cout-512 blocks"]
-fn dense_coefficient_vgg_block_probe_runs_every_case_before_failing() {
+#[ignore = "needs /dev/accel/accel0 -- guards dense diverse coefficients at VGG's Cin/Cout-512 blocks"]
+fn dense_coefficient_vgg_blocks_match_oracle() {
     let cases = dense_coefficient_vgg_block_cases();
     assert_eq!(cases.len(), 5);
     run_hardware_case_matrix("dense-coefficient VGG block probe", cases);
