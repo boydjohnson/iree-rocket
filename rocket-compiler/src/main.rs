@@ -4,8 +4,10 @@ mod compiler;
 mod report;
 
 use std::{
+    collections::BTreeSet,
     env,
     error::Error,
+    fs,
     path::{Path, PathBuf},
     process::ExitCode,
 };
@@ -44,12 +46,15 @@ fn default_transform_spec_path() -> PathBuf {
         .join("../rocket-compiler-plugin/target/Rocket/rocket_conv2d_transform_spec.mlir")
 }
 
-fn compile_flags(common: &cli::CommonArgs) -> Vec<String> {
-    let transform_spec = common
+fn transform_spec_path(common: &cli::CommonArgs) -> PathBuf {
+    common
         .transform_spec
         .clone()
-        .unwrap_or_else(default_transform_spec_path);
-    vec![
+        .unwrap_or_else(default_transform_spec_path)
+}
+
+fn compile_flags(common: &cli::CommonArgs, transform_spec: &Path) -> Vec<String> {
+    let mut flags = vec![
         format!(
             "--iree-preprocessing-transform-spec-filename={}",
             transform_spec.display()
@@ -63,14 +68,127 @@ fn compile_flags(common: &cli::CommonArgs) -> Vec<String> {
         format!("--iree-llvmcpu-target-cpu={}", common.llvmcpu_target_cpu),
         format!("--iree-hal-default-device={}", common.cpu_device_name),
         "--iree-hal-indirect-command-buffers=false".to_string(),
-    ]
+    ];
+    // Left off entirely when unset so IREE keeps its own host-triple default,
+    // rather than us guessing a spelling for the host here.
+    if let Some(triple) = &common.llvmcpu_target_triple {
+        flags.push(format!("--iree-llvmcpu-target-triple={triple}"));
+    }
+    flags
+}
+
+/// Collects the device globals a transform spec refers to: every `@symbol`
+/// inside a `#hal.device.*` attribute, i.e. `#hal.device.affinity<@d>` and
+/// the endpoints of `#hal.device.topology<links = [(@a -> @b = {...})]>`.
+///
+/// The spec hardcodes these names, but the device globals themselves are
+/// created from `--iree-hal-target-device=<name>=...`, which this CLI derives
+/// from `--rocket-device-name` / `--cpu-device-name`. Renaming either one
+/// leaves the spec's references dangling.
+fn spec_device_symbols(spec: &str) -> BTreeSet<&str> {
+    const MARKER: &str = "#hal.device.";
+    let mut symbols = BTreeSet::new();
+    for (start, _) in spec.match_indices(MARKER) {
+        let rest = &spec[start + MARKER.len()..];
+        // Only step over the attribute's mnemonic (`affinity`, `topology`,
+        // ...); if what follows isn't a `<...>` body this is not an attribute
+        // we can read, and scanning on would run into unrelated text.
+        let Some(open) = rest.find(|c: char| !(c.is_alphanumeric() || c == '_' || c == '.')) else {
+            continue;
+        };
+        if !rest[open..].starts_with('<') {
+            continue;
+        }
+        symbols.extend(scan_symbol_refs(attribute_body(&rest[open + 1..])));
+    }
+    symbols
+}
+
+/// Returns the text up to the `>` closing an already-opened `<`, tracking
+/// nesting. `->` and `=>` are skipped: MLIR spells topology links with an
+/// arrow, whose `>` does not close anything.
+fn attribute_body(body: &str) -> &str {
+    let mut depth = 1usize;
+    let mut previous = ' ';
+    for (i, c) in body.char_indices() {
+        match c {
+            '<' => depth += 1,
+            '>' if previous != '-' && previous != '=' => {
+                depth -= 1;
+                if depth == 0 {
+                    return &body[..i];
+                }
+            }
+            _ => {}
+        }
+        previous = c;
+    }
+    body
+}
+
+/// Yields each bare `@symbol` in `text`, without the leading `@`. Stops a name
+/// at the first character that can't appear in an unquoted MLIR symbol.
+fn scan_symbol_refs(text: &str) -> impl Iterator<Item = &str> {
+    text.match_indices('@').map(|(at, _)| {
+        let start = at + 1;
+        let end = text[start..]
+            .find(|c: char| !(c.is_alphanumeric() || c == '_' || c == '$' || c == '.'))
+            .map(|i| start + i)
+            .unwrap_or(text.len());
+        &text[start..end]
+    })
+}
+
+/// Fails if the transform spec names a device global this invocation won't
+/// create.
+///
+/// Worth checking up front because the failure is otherwise awful: these
+/// references live in attributes, and attributes are not symbol-verified, so
+/// a dangling one survives until a later pass resolves it and dereferences
+/// null -- the compiler segfaults instead of reporting an error.
+fn check_spec_device_names(
+    common: &cli::CommonArgs,
+    transform_spec: &Path,
+) -> Result<(), Box<dyn Error>> {
+    let spec = fs::read_to_string(transform_spec).map_err(|err| {
+        format!(
+            "failed to read transform spec {}: {err}",
+            transform_spec.display()
+        )
+    })?;
+    let declared = [
+        common.rocket_device_name.as_str(),
+        common.cpu_device_name.as_str(),
+    ];
+    let dangling: Vec<&str> = spec_device_symbols(&spec)
+        .into_iter()
+        .filter(|symbol| !declared.contains(symbol))
+        .collect();
+    if dangling.is_empty() {
+        return Ok(());
+    }
+    let named: Vec<String> = dangling.iter().map(|s| format!("@{s}")).collect();
+    Err(format!(
+        "transform spec {spec_path} refers to device global(s) {dangling} that this \
+         invocation does not create: it declares @{rocket} (--rocket-device-name) and \
+         @{cpu} (--cpu-device-name). The spec hardcodes its device names, so those \
+         flags must match it -- the defaults do. Compiling anyway would crash the \
+         compiler rather than report an error.",
+        spec_path = transform_spec.display(),
+        dangling = named.join(", "),
+        rocket = common.rocket_device_name,
+        cpu = common.cpu_device_name,
+    )
+    .into())
 }
 
 fn run_compile(args: &cli::CompileArgs) -> Result<(), Box<dyn Error>> {
     let lib_path = resolve_lib_path(args.common.iree_compiler_lib.as_deref())?;
+    let transform_spec = transform_spec_path(&args.common);
+    check_spec_device_names(&args.common, &transform_spec)?;
     let library = unsafe { Library::load(&lib_path) }?;
 
-    library.setup_global_cl(&compile_flags(&args.common));
+    library.setup_global_cl(&compile_flags(&args.common, &transform_spec));
     let session = Session::create(&library);
 
     let source = Source::open_file(&session, &args.common.input)?;
@@ -89,9 +207,11 @@ fn run_compile(args: &cli::CompileArgs) -> Result<(), Box<dyn Error>> {
 
 fn run_audit(args: &cli::AuditArgs) -> Result<(), Box<dyn Error>> {
     let lib_path = resolve_lib_path(args.common.iree_compiler_lib.as_deref())?;
+    let transform_spec = transform_spec_path(&args.common);
+    check_spec_device_names(&args.common, &transform_spec)?;
     let library = unsafe { Library::load(&lib_path) }?;
 
-    library.setup_global_cl(&compile_flags(&args.common));
+    library.setup_global_cl(&compile_flags(&args.common, &transform_spec));
     let session = Session::create(&library);
 
     let source = Source::open_file(&session, &args.common.input)?;
@@ -118,4 +238,107 @@ fn run_audit(args: &cli::AuditArgs) -> Result<(), Box<dyn Error>> {
     let report = report::PlacementReport::scan(&ir_text);
     print!("{report}");
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn common_args(rocket: &str, cpu: &str, triple: Option<&str>) -> cli::CommonArgs {
+        cli::CommonArgs {
+            iree_compiler_lib: None,
+            input: PathBuf::from("model.mlir"),
+            transform_spec: None,
+            rocket_device_name: rocket.to_string(),
+            cpu_device_name: cpu.to_string(),
+            llvmcpu_target_cpu: "generic".to_string(),
+            llvmcpu_target_triple: triple.map(str::to_string),
+        }
+    }
+
+    #[test]
+    fn target_triple_flag_is_omitted_unless_requested() {
+        let spec = PathBuf::from("spec.mlir");
+        let flags = compile_flags(&common_args("rocket_device", "cpu_device", None), &spec);
+        assert!(
+            !flags
+                .iter()
+                .any(|f| f.starts_with("--iree-llvmcpu-target-triple")),
+            "{flags:?}"
+        );
+
+        let flags = compile_flags(
+            &common_args("rocket_device", "cpu_device", Some("aarch64-linux-gnu")),
+            &spec,
+        );
+        assert!(
+            flags.contains(&"--iree-llvmcpu-target-triple=aarch64-linux-gnu".to_string()),
+            "{flags:?}"
+        );
+    }
+
+    #[test]
+    fn device_symbols_come_from_affinity_and_topology_attributes() {
+        let spec = r#"
+            %0 = transform.param.constant #hal.device.affinity<@rocket_device> -> !transform.any_param
+            %1 = transform.param.constant #hal.device.topology<links = [
+                (@rocket_device -> @cpu_device = {unified_memory = true}),
+                (@cpu_device -> @rocket_device = {unified_memory = true})
+              ]> -> !transform.any_param
+        "#;
+        let symbols = spec_device_symbols(spec);
+        assert_eq!(
+            symbols.into_iter().collect::<Vec<_>>(),
+            vec!["cpu_device", "rocket_device"]
+        );
+    }
+
+    #[test]
+    fn topology_arrow_does_not_end_the_attribute_body() {
+        // The `>` in `->` closes nothing; stopping there would hide every
+        // device named after the first link's arrow.
+        let spec = "#hal.device.topology<links = [(@a -> @b = {}), (@c -> @d = {})]>";
+        let symbols = spec_device_symbols(spec);
+        assert_eq!(
+            symbols.into_iter().collect::<Vec<_>>(),
+            vec!["a", "b", "c", "d"]
+        );
+    }
+
+    #[test]
+    fn symbols_outside_device_attributes_are_ignored() {
+        let spec = r#"
+            %r = flow.dispatch @rocket_executable::@entry::@rocket_conv2d(%x)
+                {stream.affinity = #hal.device.affinity<@rocket_device>} : (tensor<1xf16>) -> tensor<1xf32>
+        "#;
+        let symbols = spec_device_symbols(spec);
+        assert_eq!(
+            symbols.into_iter().collect::<Vec<_>>(),
+            vec!["rocket_device"]
+        );
+    }
+
+    #[test]
+    fn checked_in_spec_matches_the_default_device_names() {
+        let spec = default_transform_spec_path();
+        let args = common_args("rocket_device", "cpu_device", None);
+        check_spec_device_names(&args, &spec).expect("defaults must match the shipped spec");
+    }
+
+    #[test]
+    fn renaming_a_device_is_rejected_rather_than_left_to_segfault() {
+        let spec = default_transform_spec_path();
+
+        // `--cpu-device-name` is the dangerous one: the spec refers to
+        // @cpu_device only from attributes, which are not symbol-verified.
+        let err = check_spec_device_names(&common_args("rocket_device", "local", None), &spec)
+            .expect_err("a renamed CPU device must be rejected");
+        let message = err.to_string();
+        assert!(message.contains("@cpu_device"), "{message}");
+        assert!(!message.contains("@rocket_device,"), "{message}");
+
+        let err = check_spec_device_names(&common_args("npu", "cpu_device", None), &spec)
+            .expect_err("a renamed Rocket device must be rejected");
+        assert!(err.to_string().contains("@rocket_device"), "{err}");
+    }
 }

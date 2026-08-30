@@ -44,6 +44,13 @@ pub struct CommonArgs {
 
     #[arg(long, default_value = "generic")]
     pub llvmcpu_target_cpu: String,
+
+    /// LLVM target triple for the CPU half of the compile, e.g.
+    /// `aarch64-linux-gnu` to build a module that runs on the board. Only
+    /// affects the `llvm-cpu` executables; Rocket executables are serialized
+    /// by the plugin and are target-independent. Defaults to the host triple.
+    #[arg(long)]
+    pub llvmcpu_target_triple: Option<String>,
 }
 
 #[derive(Args)]
