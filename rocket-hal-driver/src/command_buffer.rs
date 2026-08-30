@@ -1112,7 +1112,9 @@ unsafe extern "C" fn dispatch(
                         padded_channels: 0,
                         weight_zero_point: match shape.precision {
                             Precision::Fp16 => None,
-                            Precision::Int8(q) => Some(q.weight_zero_point as i8),
+                            Precision::Int8(q) | Precision::Int8Accumulator(q) => {
+                                Some(q.weight_zero_point as i8)
+                            }
                         },
                     }),
                 );
@@ -1216,7 +1218,7 @@ unsafe extern "C" fn dispatch(
                 );
                 scratch_buffers.push(scratch);
                 packed
-            } else if let Precision::Int8(q) = shape.precision {
+            } else if let Precision::Int8(q) | Precision::Int8Accumulator(q) = shape.precision {
                 let output_channels = shape.out_channels as usize;
                 let padded_output_channels = shape.padded_out_channels() as usize;
                 if output_channels
@@ -1303,7 +1305,7 @@ unsafe extern "C" fn dispatch(
                 source_pixel_count: output_pixel_count,
                 output_pixel_count,
                 bytes_per_pixel: shape.out_channels as usize
-                    * shape.precision.element_bytes() as usize,
+                    * shape.precision.output_element_bytes() as usize,
             });
             let output_handle = scratch.handle;
             scratch_buffers.push(scratch);
@@ -1338,7 +1340,9 @@ unsafe extern "C" fn dispatch(
             let element_size = shape.precision.element_bytes() as usize;
             let input_zero_point = match shape.precision {
                 Precision::Fp16 => 0,
-                Precision::Int8(quantization) => quantization.input_zero_point,
+                Precision::Int8(quantization) | Precision::Int8Accumulator(quantization) => {
+                    quantization.input_zero_point
+                }
             };
             // fc.rs's real vendor-confirmed lowering has physical height
             // exactly one -- no `FC_PHYSICAL_HEIGHT` padding, so the

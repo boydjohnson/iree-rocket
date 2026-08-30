@@ -100,7 +100,7 @@ fn run_fc(shape: Shape, dense_input: &[u8], dense_weights: &[u8]) -> Vec<u8> {
     let output_len = nc1hwc2_storage_size(m, padded_outputs as usize * element_bytes).unwrap();
     let bias_len = match shape.precision {
         Precision::Fp16 => padded_outputs as usize * 4,
-        Precision::Int8(_) => conv_shape.bs_buffer_bytes(),
+        Precision::Int8(_) | Precision::Int8Accumulator(_) => conv_shape.bs_buffer_bytes(),
     };
 
     let file = OpenOptions::new()

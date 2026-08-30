@@ -889,7 +889,9 @@ mod tests {
             Precision::Int8(quantization) => {
                 assert_eq!(quantization.multiplier, Multiplier::from_ratio(1.0),)
             }
-            Precision::Fp16 => panic!("affine selector unexpectedly built fp16 shape"),
+            Precision::Fp16 | Precision::Int8Accumulator(_) => {
+                panic!("affine selector unexpectedly built another precision")
+            }
         }
     }
 

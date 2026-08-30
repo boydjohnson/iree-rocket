@@ -331,15 +331,36 @@ pub enum Precision {
     /// Quantized int8, carrying the parameters that are not derivable from
     /// the shape and must come from the compiler.
     Int8(Quantization),
+    /// Signed int8 inputs and coefficients with the exact signed int32 MAC
+    /// accumulator written to memory. This keeps the validated int8 compute
+    /// configuration but bypasses the DPU's requantization stages.
+    Int8Accumulator(Quantization),
 }
 
 impl Precision {
-    /// Bytes one feature or coefficient element occupies.
+    /// Bytes one input-feature or coefficient element occupies.
+    ///
+    /// Accumulator output does not change the int8 input/weight packing; use
+    /// [`Precision::output_element_bytes`] when sizing the result tensor.
     pub fn element_bytes(&self) -> u32 {
         match self {
             Precision::Fp16 => 2,
-            Precision::Int8(_) => 1,
+            Precision::Int8(_) | Precision::Int8Accumulator(_) => 1,
         }
+    }
+
+    /// Bytes one logical output element occupies.
+    pub fn output_element_bytes(&self) -> u32 {
+        match self {
+            Precision::Fp16 => 2,
+            Precision::Int8(_) => 1,
+            Precision::Int8Accumulator(_) => 4,
+        }
+    }
+
+    /// Whether this mode writes the exact int32 convolution accumulator.
+    pub fn writes_accumulators(&self) -> bool {
+        matches!(self, Precision::Int8Accumulator(_))
     }
 
     /// Channels one 16-byte feature atom carries.
@@ -380,21 +401,23 @@ impl Precision {
     pub fn max_in_channels(&self) -> u32 {
         match self {
             Precision::Fp16 => MAX_INPUT_CHANNELS,
-            Precision::Int8(_) => MAX_INT8_INPUT_CHANNELS,
+            Precision::Int8(_) | Precision::Int8Accumulator(_) => MAX_INT8_INPUT_CHANNELS,
         }
     }
 
     fn data_precision(&self) -> DataPrecision {
         match self {
             Precision::Fp16 => DataPrecision::Fp16,
-            Precision::Int8(_) => DataPrecision::Int8,
+            Precision::Int8(_) | Precision::Int8Accumulator(_) => DataPrecision::Int8,
         }
     }
 
     fn quantization(&self) -> Option<Quantization> {
         match self {
             Precision::Fp16 => None,
-            Precision::Int8(quantization) => Some(*quantization),
+            Precision::Int8(quantization) | Precision::Int8Accumulator(quantization) => {
+                Some(*quantization)
+            }
         }
     }
 }
@@ -733,6 +756,14 @@ impl Shape {
             "output channels must be 1..={MAX_OUTPUT_CHANNELS}, the range the \
              capture corpus covers and the 14-bit weight_kernels field encodes"
         );
+        if let Precision::Int8Accumulator(quantization) = precision {
+            assert!(
+                quantization.input_zero_point == 0
+                    && quantization.output_zero_point == 0
+                    && quantization.weight_zero_point == 0,
+                "int32 accumulator output currently requires zero input, weight, and output zero-points"
+            );
+        }
         Shape {
             width,
             height,
@@ -761,6 +792,10 @@ impl Shape {
 
     /// Fuses `activation` into this convolution's own DPU pass.
     pub fn with_activation(mut self, activation: Activation) -> Shape {
+        assert!(
+            !self.precision.writes_accumulators() || activation == Activation::None,
+            "int32 accumulator output must not fuse an activation"
+        );
         self.activation = activation;
         self
     }
@@ -858,7 +893,7 @@ impl Shape {
             Precision::Fp16 => {
                 quad_atoms(self.feature_atoms()) * self.precision.channels_per_atom()
             }
-            Precision::Int8(_) => self.padded_channels(),
+            Precision::Int8(_) | Precision::Int8Accumulator(_) => self.padded_channels(),
         }
     }
 
@@ -891,7 +926,9 @@ impl Shape {
         }
         match self.precision {
             Precision::Fp16 => self.out_channels,
-            Precision::Int8(_) => self.out_channels.next_multiple_of(2),
+            Precision::Int8(_) | Precision::Int8Accumulator(_) => {
+                self.out_channels.next_multiple_of(2)
+            }
         }
     }
 
@@ -940,7 +977,7 @@ impl Shape {
     /// only this one size regardless of how many tiles a shape plans into.
     pub fn output_scratch_bytes(&self, kernels: Kernels) -> usize {
         let channel_bytes =
-            self.padded_out_channels() as usize * self.precision.element_bytes() as usize;
+            self.padded_out_channels() as usize * self.precision.output_element_bytes() as usize;
         let surface_count = channel_bytes.div_ceil(FEATURE_ATOM_BYTES as usize);
         self.output_width(kernels) as usize
             * self.output_height(kernels) as usize
@@ -2738,6 +2775,12 @@ fn conv_2d_tile_program(
     // clears, and the requantization constants themselves.
     let precision = shape.precision.data_precision();
     let quantization = shape.precision.quantization();
+    let accumulator_output = shape.precision.writes_accumulators();
+    let output_precision = if accumulator_output {
+        Bits::new(4)
+    } else {
+        precision.into()
+    };
     // `BS_MUL_SHIFT_VALUE` and its negated twin in `DPU_DATA_FORMAT` are a
     // constant 14 in every int8 capture and 0 in every fp16 one. Nothing in
     // the corpus varies it, so it is not derived from anything.
@@ -3101,7 +3144,7 @@ fn conv_2d_tile_program(
     commands.push(
         Register::<DpuDataFormat>::new()
             .in_precision(precision.into())
-            .out_precision(precision.into())
+            .out_precision(output_precision)
             .proc_precision(precision.into())
             .bs_mul_shift_value_neg(Bits::new(bs_mul_shift))
             .build(),
@@ -3142,6 +3185,7 @@ fn conv_2d_tile_program(
     );
     commands.push(
         Register::<DpuBsCfg>::new()
+            .bs_bypass(Bits::new(u32::from(accumulator_output)))
             .bs_alu_algo(Bits::new(2))
             .bs_alu_src(Bits::new(1))
             .bs_relu_bypass(Bits::new(1))
@@ -3163,7 +3207,9 @@ fn conv_2d_tile_program(
             .size_e_0(Bits::new(shape.bs_ow_size_e()))
             .size_e_1(Bits::new(shape.bs_ow_size_e()))
             .size_e_2(Bits::new(shape.bs_ow_size_e()))
-            .od_bypass(Bits::new(u32::from(quantization.is_none())))
+            .od_bypass(Bits::new(u32::from(
+                quantization.is_none() || accumulator_output,
+            )))
             .ow_src(Bits::new(u32::from(quantization.is_some())))
             .build(),
     );
@@ -3215,25 +3261,39 @@ fn conv_2d_tile_program(
             .build(),
     );
     commands.push(zero::<DpuEwReluxCmpValue>());
-    // Output conversion. fp16 bypasses requantization entirely and lets
-    // `fp32tofp16_en` do the narrowing; int8 programs the multiplier as a
-    // normalized mantissa/shift pair and the output zero point as an offset.
+    // Output conversion. fp16 lets `fp32tofp16_en` do the narrowing; int8
+    // programs the multiplier as a normalized mantissa/shift pair and the
+    // output zero point as an offset. Exact accumulator output bypasses BS
+    // and CPEND and leaves this final converter at identity.
+    let output_offset = if accumulator_output {
+        0
+    } else {
+        quantization.map_or(0, |q| q.output_zero_point as u32)
+    };
+    let output_scale = if accumulator_output {
+        1
+    } else {
+        quantization.map_or(1, |q| q.multiplier.scale)
+    };
+    let output_shift = if accumulator_output {
+        0
+    } else {
+        quantization.map_or(0, |q| q.multiplier.shift)
+    };
     commands.push(
         Register::<DpuOutCvtOffset>::new()
-            .out_cvt_offset(Bits::new(
-                quantization.map_or(0, |q| q.output_zero_point as u32),
-            ))
+            .out_cvt_offset(Bits::new(output_offset))
             .build(),
     );
     commands.push(
         Register::<DpuOutCvtScale>::new()
             .fp32tofp16_en(Bits::new(u32::from(quantization.is_none())))
-            .out_cvt_scale(Bits::new(quantization.map_or(1, |q| q.multiplier.scale)))
+            .out_cvt_scale(Bits::new(output_scale))
             .build(),
     );
     commands.push(
         Register::<DpuOutCvtShift>::new()
-            .out_cvt_shift(Bits::new(quantization.map_or(0, |q| q.multiplier.shift)))
+            .out_cvt_shift(Bits::new(output_shift))
             .build(),
     );
     commands.push(zero::<DpuEwOpValue0>());
@@ -5154,7 +5214,7 @@ mod tests {
     fn quantization() -> Quantization {
         match captured_int8() {
             Precision::Int8(quantization) => quantization,
-            Precision::Fp16 => unreachable!(),
+            Precision::Fp16 | Precision::Int8Accumulator(_) => unreachable!(),
         }
     }
 
@@ -5216,6 +5276,48 @@ mod tests {
         assert_eq!(value_of::<DpuOutCvtScale>(&program), 19636);
         assert_eq!(value_of::<DpuOutCvtShift>(&program), 24);
         assert_eq!(value_of::<DpuOutCvtOffset>(&program), (-3i32) as u32);
+    }
+
+    #[test]
+    fn int8_accumulator_output_uses_the_hardware_validated_bypasses() {
+        let quantization = Quantization {
+            input_zero_point: 0,
+            output_zero_point: 0,
+            weight_zero_point: 0,
+            ..quantization()
+        };
+        let shape = Shape::with_precision(4, 4, 1, 1, 8, Precision::Int8Accumulator(quantization));
+        let program = conv_2d_tile(shape, [1, 1], &Tile::whole(shape, [1, 1]));
+
+        let data_format = value_of::<DpuDataFormat>(&program);
+        assert_eq!(data_format & 0b111, 0, "DPU processing stays int8");
+        assert_eq!((data_format >> 26) & 0b111, 0, "DPU input stays int8");
+        assert_eq!((data_format >> 29) & 0b111, 4, "DPU output is int32");
+        assert_eq!(value_of::<DpuBsCfg>(&program) & 1, 1, "BS is bypassed");
+        assert_eq!(
+            (value_of::<DpuBsOwCfg>(&program) >> 1) & 1,
+            1,
+            "CPEND is bypassed"
+        );
+        assert_eq!(value_of::<DpuOutCvtOffset>(&program), 0);
+        assert_eq!(value_of::<DpuOutCvtScale>(&program), 1);
+        assert_eq!(value_of::<DpuOutCvtShift>(&program), 0);
+
+        assert_eq!(shape.precision.element_bytes(), 1);
+        assert_eq!(shape.precision.output_element_bytes(), 4);
+        let requantized = Shape::with_precision(4, 4, 1, 1, 8, Precision::Int8(quantization));
+        assert_eq!(
+            shape.output_scratch_bytes([1, 1]),
+            4 * requantized.output_scratch_bytes([1, 1])
+        );
+    }
+
+    #[test]
+    #[should_panic(expected = "currently requires zero input, weight, and output zero-points")]
+    fn int8_accumulator_output_rejects_unvalidated_affine_zero_points() {
+        let mut quantization = quantization();
+        quantization.input_zero_point = 1;
+        let _ = Shape::with_precision(4, 4, 1, 1, 8, Precision::Int8Accumulator(quantization));
     }
 
     #[test]

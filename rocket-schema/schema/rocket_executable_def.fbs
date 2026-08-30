@@ -14,6 +14,9 @@ file_extension "rkt1";
 enum Precision : ubyte {
   INT8 = 0,
   FP16 = 1,
+  // Signed int8 inputs/weights with the exact signed int32 convolution
+  // accumulator written as the output tensor.
+  INT8_ACCUMULATOR = 2,
 }
 
 // Wire-format values. RELUX uses the selected kernel definition's

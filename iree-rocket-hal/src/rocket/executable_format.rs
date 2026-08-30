@@ -42,7 +42,7 @@
 //! bytes 68..72: multiplier_shift: u32      (only meaningful if precision_tag==0)
 //! bytes 72..76: activation_tag: u32        (0=None, 1=Relu, 2=Clamped)
 //! bytes 76..80: activation_cmp: u32        (always present; only meaningful if activation_tag==2)
-//! bytes 80..84: precision_tag: u32         (0=Int8, 1=Fp16 -- a wire-format-owned
+//! bytes 80..84: precision_tag: u32         (0=Int8, 1=Fp16, 2=Int8Accumulator -- a wire-format-owned
 //!                                           tag, NOT Precision's own hardware-
 //!                                           register encoding, which is a
 //!                                           separate, independently-changeable
@@ -128,6 +128,22 @@ pub fn encode_conv_shape_v1(shape: &conv::Shape, kernels: Kernels) -> Vec<u8> {
             multiplier,
         }) => (
             0u32,
+            input_zero_point,
+            output_zero_point,
+            weight_zero_point,
+            input_scale,
+            weights_scale,
+            multiplier,
+        ),
+        Precision::Int8Accumulator(Quantization {
+            input_zero_point,
+            output_zero_point,
+            weight_zero_point,
+            input_scale,
+            weights_scale,
+            multiplier,
+        }) => (
+            2u32,
             input_zero_point,
             output_zero_point,
             weight_zero_point,
@@ -231,6 +247,17 @@ pub fn decode_conv_shape_v1(payload: &[u8]) -> Result<(conv::Shape, Kernels), De
             },
         }),
         1 => Precision::Fp16,
+        2 => Precision::Int8Accumulator(Quantization {
+            input_zero_point,
+            output_zero_point,
+            weight_zero_point,
+            input_scale,
+            weights_scale,
+            multiplier: Multiplier {
+                scale: multiplier_scale,
+                shift: multiplier_shift,
+            },
+        }),
         other => return Err(DecodeError::InvalidPrecisionTag(other)),
     };
 
@@ -350,6 +377,14 @@ mod tests {
                 input_scale: 0.5,
                 weights_scale: 0.25,
                 multiplier: Multiplier::from_ratio(0.25),
+            }),
+            Precision::Int8Accumulator(Quantization {
+                input_zero_point: 0,
+                output_zero_point: 0,
+                weight_zero_point: 0,
+                input_scale: 0.125,
+                weights_scale: 0.75,
+                multiplier: Multiplier::from_ratio(1.0),
             }),
         ] {
             let shape = conv::Shape { precision, ..base };

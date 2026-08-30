@@ -159,7 +159,9 @@ unsafe fn fill_input(base: *mut u8, size: usize, shape: Shape, surfaces: usize) 
                     };
                     match shape.precision {
                         Precision::Fp16 => ptr::write(base.add(offset) as *mut u16, FP16_ONE),
-                        Precision::Int8(_) => ptr::write(base.add(offset), 1u8),
+                        Precision::Int8(_) | Precision::Int8Accumulator(_) => {
+                            ptr::write(base.add(offset), 1u8)
+                        }
                     }
                 }
             }
@@ -222,7 +224,9 @@ fn run(plan: &ConvPlan, shift: u32) -> Result<BTreeSet<i32>, Failure> {
                 std::slice::from_raw_parts_mut(buf_weights.host_ptr as *mut u16, weight_bytes / 2)
                     .fill(FP16_ONE);
             }
-            Precision::Int8(_) => ptr::write_bytes(buf_weights.host_ptr, 1, weight_bytes),
+            Precision::Int8(_) | Precision::Int8Accumulator(_) => {
+                ptr::write_bytes(buf_weights.host_ptr, 1, weight_bytes)
+            }
         }
 
         // At fp16 BRDMA fetches only the bias and a zeroed buffer is right.
@@ -230,11 +234,16 @@ fn run(plan: &ConvPlan, shift: u32) -> Result<BTreeSet<i32>, Failure> {
         // buffer would multiply the whole tensor by zero.
         let bias_bytes = match shape.precision {
             Precision::Fp16 => PAGE_BYTES,
-            Precision::Int8(_) => page_aligned_size(shape.bs_buffer_bytes()),
+            Precision::Int8(_) | Precision::Int8Accumulator(_) => {
+                page_aligned_size(shape.bs_buffer_bytes())
+            }
         };
         let buf_bias = Buffer::new(fd, bias_bytes, &file);
         ptr::write_bytes(buf_bias.host_ptr, 0, buf_bias.size);
-        if matches!(shape.precision, Precision::Int8(_)) {
+        if matches!(
+            shape.precision,
+            Precision::Int8(_) | Precision::Int8Accumulator(_)
+        ) {
             let entries = vec![BsEntry::default(); shape.padded_out_channels() as usize];
             write_bs_buffer(
                 std::slice::from_raw_parts_mut(buf_bias.host_ptr, buf_bias.size),
@@ -324,6 +333,7 @@ fn run(plan: &ConvPlan, shift: u32) -> Result<BTreeSet<i32>, Failure> {
         let tolerance: f32 = match shape.precision {
             Precision::Fp16 => 0.0,
             Precision::Int8(_) => 1.0,
+            Precision::Int8Accumulator(_) => unreachable!("this probe expects narrowed output"),
         };
         for y in 0..out_height {
             for x in 0..out_width {
@@ -339,6 +349,9 @@ fn run(plan: &ConvPlan, shift: u32) -> Result<BTreeSet<i32>, Failure> {
                             (accumulator + (1 << (shift - 1))) >> shift
                         };
                         rounded as i32 + quantization.output_zero_point
+                    }
+                    Precision::Int8Accumulator(_) => {
+                        unreachable!("this probe expects narrowed output")
                     }
                 };
                 // Only the real output channels are checked. What the
@@ -358,6 +371,9 @@ fn run(plan: &ConvPlan, shift: u32) -> Result<BTreeSet<i32>, Failure> {
                             f16_to_f32(u16::from_le_bytes([raw[offset], raw[offset + 1]]))
                         }
                         Precision::Int8(_) => f32::from(raw[offset] as i8),
+                        Precision::Int8Accumulator(_) => {
+                            unreachable!("this probe expects narrowed output")
+                        }
                     };
                     let difference = got - want as f32;
                     failure.differences.insert(difference as i32);
@@ -423,6 +439,7 @@ fn attempt(plan: &ConvPlan, shift: u32, failures: &mut Vec<String>) {
     let precision = match shape.precision {
         Precision::Fp16 => "fp16",
         Precision::Int8(_) => "int8",
+        Precision::Int8Accumulator(_) => "int8-accumulator",
     };
     let label = format!(
         "{}x{} Cin {:>2} Cout {:>3} k{}x{} p{}x{} {precision} d{}/w{}",

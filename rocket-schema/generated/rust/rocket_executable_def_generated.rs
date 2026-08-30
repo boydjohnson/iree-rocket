@@ -37,12 +37,13 @@ pub mod rocket {
 #[deprecated(since = "2.0.0", note = "Use associated constants instead. This will no longer be generated in 2021.")]
 pub const ENUM_MIN_PRECISION: u8 = 0;
 #[deprecated(since = "2.0.0", note = "Use associated constants instead. This will no longer be generated in 2021.")]
-pub const ENUM_MAX_PRECISION: u8 = 1;
+pub const ENUM_MAX_PRECISION: u8 = 2;
 #[deprecated(since = "2.0.0", note = "Use associated constants instead. This will no longer be generated in 2021.")]
 #[allow(non_camel_case_types)]
-pub const ENUM_VALUES_PRECISION: [Precision; 2] = [
+pub const ENUM_VALUES_PRECISION: [Precision; 3] = [
   Precision::INT8,
   Precision::FP16,
+  Precision::INT8_ACCUMULATOR,
 ];
 
 #[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Default)]
@@ -52,18 +53,21 @@ pub struct Precision(pub u8);
 impl Precision {
   pub const INT8: Self = Self(0);
   pub const FP16: Self = Self(1);
+  pub const INT8_ACCUMULATOR: Self = Self(2);
 
   pub const ENUM_MIN: u8 = 0;
-  pub const ENUM_MAX: u8 = 1;
+  pub const ENUM_MAX: u8 = 2;
   pub const ENUM_VALUES: &'static [Self] = &[
     Self::INT8,
     Self::FP16,
+    Self::INT8_ACCUMULATOR,
   ];
   /// Returns the variant's name or "" if unknown.
   pub fn variant_name(self) -> Option<&'static str> {
     match self {
       Self::INT8 => Some("INT8"),
       Self::FP16 => Some("FP16"),
+      Self::INT8_ACCUMULATOR => Some("INT8_ACCUMULATOR"),
       _ => None,
     }
   }

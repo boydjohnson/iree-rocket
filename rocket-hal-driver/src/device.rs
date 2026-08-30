@@ -1135,6 +1135,34 @@ mod compaction_tests {
     }
 
     #[test]
+    fn compacts_int32_accumulator_surfaces_into_dense_nhwc() {
+        const PIXELS: usize = 2;
+        const CHANNELS: usize = 8;
+        const BPP: usize = CHANNELS * size_of::<i32>();
+        const LANES_PER_SURFACE: usize = 16 / size_of::<i32>();
+        let mut scratch = vec![0u8; PIXELS * 2 * 16];
+        for pixel in 0..PIXELS {
+            for channel in 0..CHANNELS {
+                let surface = channel / LANES_PER_SURFACE;
+                let lane = channel % LANES_PER_SURFACE;
+                let offset = surface * PIXELS * 16 + pixel * 16 + lane * size_of::<i32>();
+                let value = -((pixel * CHANNELS + channel + 1) as i32);
+                scratch[offset..offset + 4].copy_from_slice(&value.to_le_bytes());
+            }
+        }
+
+        let mut dst = vec![0u8; PIXELS * BPP];
+        let written = compact_atomic_output(&scratch, PIXELS, PIXELS, BPP, &mut dst);
+        assert_eq!(written, dst.len());
+        for (index, bytes) in dst.chunks_exact(4).enumerate() {
+            assert_eq!(
+                i32::from_le_bytes(bytes.try_into().unwrap()),
+                -(index as i32 + 1)
+            );
+        }
+    }
+
+    #[test]
     fn stops_short_when_dst_too_small() {
         let scratch = vec![0u8; 64];
         let mut dst = vec![0u8; 2];

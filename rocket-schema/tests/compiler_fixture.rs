@@ -1,6 +1,48 @@
 use rocket_schema::rocket;
 
 #[test]
+fn int8_accumulator_precision_round_trips() {
+    let mut builder = flatbuffers::FlatBufferBuilder::new();
+    let conv = rocket::Conv2DDef::create(
+        &mut builder,
+        &rocket::Conv2DDefArgs {
+            input_width: 4,
+            input_height: 4,
+            input_channels: 1,
+            output_width: 4,
+            output_height: 4,
+            output_channels: 8,
+            weights_width: 1,
+            weights_height: 1,
+            stride: 1,
+            precision: rocket::Precision::INT8_ACCUMULATOR,
+            ..Default::default()
+        },
+    );
+    let name = builder.create_string("conv_integer");
+    let export = rocket::ExportDef::create(
+        &mut builder,
+        &rocket::ExportDefArgs {
+            name: Some(name),
+            kernel_type: rocket::KernelDef::Conv2DDef,
+            kernel: Some(conv.as_union_value()),
+        },
+    );
+    let exports = builder.create_vector(&[export]);
+    let executable = rocket::ExecutableDef::create(
+        &mut builder,
+        &rocket::ExecutableDefArgs {
+            exports: Some(exports),
+        },
+    );
+    rocket::finish_executable_def_buffer(&mut builder, executable);
+
+    let root = rocket::root_as_executable_def(builder.finished_data()).unwrap();
+    let conv = root.exports().get(0).kernel_as_conv_2ddef().unwrap();
+    assert_eq!(conv.precision(), rocket::Precision::INT8_ACCUMULATOR);
+}
+
+#[test]
 fn compiler_fixture_verifies_and_preserves_conv_fields() {
     let executable = include_bytes!("../testdata/mnv2_conv0.rkt1");
     assert_eq!(&executable[0..4], b"RKT1");

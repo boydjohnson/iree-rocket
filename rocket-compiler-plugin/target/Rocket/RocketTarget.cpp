@@ -163,9 +163,11 @@ parseActivationAndPrecision(DictionaryAttr config,
     precisionValue = iree_hal_rocket_Precision_INT8;
   } else if (precision == "fp16") {
     precisionValue = iree_hal_rocket_Precision_FP16;
+  } else if (precision == "int8_accumulator") {
+    precisionValue = iree_hal_rocket_Precision_INT8_ACCUMULATOR;
   } else {
     diagFn() << "rocket backend: unrecognized 'precision' config value '"
-             << precision << "' (expected int8/fp16)";
+             << precision << "' (expected int8/fp16/int8_accumulator)";
     return failure();
   }
   return success();
@@ -228,6 +230,19 @@ std::optional<RocketConv2dConfig> buildRocketConv2dConfigFromTarget(
 
   if (failed(parseActivationAndPrecision(config, shape.activation,
                                          shape.precision, diagFn))) {
+    return std::nullopt;
+  }
+  if (shape.precision == iree_hal_rocket_Precision_INT8_ACCUMULATOR &&
+      shape.activation != iree_hal_rocket_Activation_NONE) {
+    diagFn() << "rocket backend: int8_accumulator convolution cannot fuse "
+                "an activation";
+    return std::nullopt;
+  }
+  if (shape.precision == iree_hal_rocket_Precision_INT8_ACCUMULATOR &&
+      (shape.inputZeroPoint != 0 || shape.outputZeroPoint != 0 ||
+       shape.weightsZeroPoint != 0)) {
+    diagFn() << "rocket backend: int8_accumulator convolution currently "
+                "requires zero input, weight, and output zero-points";
     return std::nullopt;
   }
 
@@ -368,6 +383,11 @@ buildRocketFullyConnectedConfigFromTarget(
   shape.activationCmp = getU32("activation_cmp");
   if (failed(parseActivationAndPrecision(config, shape.activation,
                                          shape.precision, diagFn))) {
+    return std::nullopt;
+  }
+  if (shape.precision == iree_hal_rocket_Precision_INT8_ACCUMULATOR) {
+    diagFn() << "rocket fully-connected backend does not support "
+                "int8_accumulator precision";
     return std::nullopt;
   }
   return shape;
