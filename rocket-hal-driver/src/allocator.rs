@@ -90,8 +90,9 @@ unsafe fn cast(allocator: *mut iree_hal_allocator_t) -> *mut RocketAllocator {
 
 unsafe extern "C" fn destroy(allocator: *mut iree_hal_allocator_t) {
     // Dropping the Box drops the embedded File, closing the fd -- the
-    // kernel then cleans up any GEM handles still outstanding (see
-    // buffer::destroy's TODO on explicit GEM_CLOSE).
+    // kernel then cleans up any handles still outstanding as a backstop.
+    // Normal HAL buffers and driver-private owned buffers close their GEM
+    // handles eagerly when their own lifetimes end.
     unsafe {
         drop(Box::from_raw(cast(allocator)));
     }

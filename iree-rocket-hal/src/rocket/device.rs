@@ -5,7 +5,7 @@
 //! consumers (`rocket-hal-driver`) can use the same primitives instead of
 //! re-deriving them.
 
-use std::{num::NonZeroUsize, ptr::NonNull};
+use std::{num::NonZeroUsize, ops::Deref, os::fd::RawFd, ptr::NonNull};
 
 use nix::{
     ioctl_readwrite, ioctl_write_ptr,
@@ -71,21 +71,82 @@ impl Buffer {
             };
             rocket_create_bo(fd, &mut create_params).expect("Failed to create BO");
             let map_len = NonZeroUsize::new(size).unwrap();
-            let map_addr = mmap(
+            let map_addr = match mmap(
                 None,
                 map_len,
                 ProtFlags::PROT_READ | ProtFlags::PROT_WRITE,
                 MapFlags::MAP_SHARED,
                 file,
                 create_params.offset as i64,
-            )
-            .expect("mmap failed");
+            ) {
+                Ok(map_addr) => map_addr,
+                Err(err) => {
+                    // CREATE_BO succeeded, so the GEM handle is live even
+                    // though no VMA was established. Close it before
+                    // preserving Buffer::new's existing panic-on-failure API.
+                    let _ = gem_close(
+                        fd,
+                        &drm_gem_close {
+                            handle: create_params.handle,
+                            pad: 0,
+                        },
+                    );
+                    panic!("mmap failed: {err}");
+                }
+            };
             Buffer {
                 handle: create_params.handle,
                 dma_address: create_params.dma_address as u32,
                 size,
                 host_ptr: map_addr.as_ptr() as *mut u8,
             }
+        }
+    }
+}
+
+/// Owns a [`Buffer`]'s CPU mapping and GEM handle.
+///
+/// Raw [`Buffer`] remains deliberately non-owning because many existing
+/// hardware probes close it manually. New long-lived code should use this
+/// wrapper so every success, early return, and unwind releases both kernel
+/// resources exactly once.
+pub struct OwnedBuffer {
+    fd: RawFd,
+    buffer: Buffer,
+}
+
+impl OwnedBuffer {
+    /// Allocates a GEM buffer and assumes ownership of both its mapping and
+    /// handle.
+    ///
+    /// # Safety
+    ///
+    /// `fd` and `file` must refer to the same live Rocket DRM file
+    /// description, which must outlive this value.
+    pub unsafe fn new(fd: RawFd, size: usize, file: impl std::os::fd::AsFd) -> Self {
+        Self {
+            fd,
+            buffer: unsafe { Buffer::new(fd, size, file) },
+        }
+    }
+}
+
+impl Deref for OwnedBuffer {
+    type Target = Buffer;
+
+    fn deref(&self) -> &Self::Target {
+        &self.buffer
+    }
+}
+
+impl Drop for OwnedBuffer {
+    fn drop(&mut self) {
+        // These cleanup operations are best-effort in Drop: there is no
+        // useful recovery path, and unwinding from a destructor reached via
+        // an extern "C" resource callback would abort the process.
+        unsafe {
+            let _ = unmap_bo(&self.buffer);
+            let _ = close_bo(self.fd, self.buffer.handle);
         }
     }
 }

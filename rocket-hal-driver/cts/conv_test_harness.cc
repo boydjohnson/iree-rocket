@@ -417,6 +417,18 @@ Conv2dResult RunFp16Conv2d(iree_hal_device_t *device,
     ThrowStatus(iree_hal_command_buffer_end(command_buffer),
                 "iree_hal_command_buffer_end");
 
+    // Direct binding buffers only need to be live for the dispatch recording
+    // call: the IREE HAL contract requires the command buffer to retain them
+    // until it is destroyed. Drop the harness's references before submission
+    // so every numerical case also exercises that lifetime contract. Output
+    // stays referenced by the harness because it is read back below.
+    iree_hal_buffer_release(bias_buffer);
+    bias_buffer = nullptr;
+    iree_hal_buffer_release(weight_buffer);
+    weight_buffer = nullptr;
+    iree_hal_buffer_release(input_buffer);
+    input_buffer = nullptr;
+
     ThrowStatus(iree_hal_semaphore_create(device, IREE_HAL_QUEUE_AFFINITY_ANY,
                                           0, IREE_HAL_SEMAPHORE_FLAG_NONE,
                                           &semaphore),
