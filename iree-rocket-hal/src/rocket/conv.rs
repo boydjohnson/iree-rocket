@@ -2434,6 +2434,51 @@ pub fn write_bs_buffer(buffer: &mut [u8], entries: &[BsEntry]) {
     }
 }
 
+/// Converts a logical quantized bias vector into Rocket's physical BS buffer.
+///
+/// The logical ABI is little-endian `i32` bias values in accumulator units.
+/// Rocket's BS bias plane is normalized by the input and weight scales, while
+/// its constant plane supplies the affine weight correction. Weight scales
+/// are currently per-tensor in the executable ABI; per-channel scales can be
+/// added without changing the physical writer.
+pub fn pack_int8_bias_to_bs(
+    dense: &[u8],
+    output_channels: usize,
+    padded_output_channels: usize,
+    input_scale: f32,
+    weights_scale: f32,
+    weight_zero_point: i8,
+    packed: &mut [u8],
+) -> Result<usize, &'static str> {
+    if dense.len() < output_channels.saturating_mul(4) {
+        return Err("int8 bias is smaller than its declared shape");
+    }
+    if padded_output_channels < output_channels {
+        return Err("padded int8 bias channels are smaller than logical channels");
+    }
+    let scale = f64::from(input_scale) * f64::from(weights_scale);
+    if !scale.is_finite() || scale <= 0.0 {
+        return Err("int8 bias scales must be finite and positive");
+    }
+    let needed = bs_buffer_bytes(padded_output_channels as u32);
+    if packed.len() < needed {
+        return Err("Rocket int8 BS destination is smaller than its declared shape");
+    }
+    let mut entries = vec![BsEntry::default(); padded_output_channels];
+    for (channel, entry) in entries.iter_mut().take(output_channels).enumerate() {
+        let offset = channel * 4;
+        let bias = i32::from_le_bytes(dense[offset..offset + 4].try_into().unwrap());
+        let normalized = (f64::from(bias) / scale).round();
+        if normalized < f64::from(i32::MIN) || normalized > f64::from(i32::MAX) {
+            return Err("int8 bias normalization overflows i32");
+        }
+        entry.bias = normalized as i32;
+        entry.constant = -(i16::from(weight_zero_point));
+    }
+    write_bs_buffer(&mut packed[..needed], &entries);
+    Ok(needed)
+}
+
 /// The four DMA base addresses a conv program reads and writes through.
 ///
 /// Programs come out of this module carrying tile *offsets* in their address
@@ -5249,6 +5294,22 @@ mod tests {
         // mantissa of 2^14 at shift 21.
         let unit = Multiplier::for_unit_bs(1.0);
         assert_eq!((unit.scale, unit.shift), (1 << 14, 21));
+    }
+
+    #[test]
+    fn int8_bias_packing_normalizes_and_pads_bs_entries() {
+        let logical = [200i32, -100i32]
+            .into_iter()
+            .flat_map(i32::to_le_bytes)
+            .collect::<Vec<_>>();
+        let mut packed = vec![0xa5; bs_buffer_bytes(8)];
+        let written = pack_int8_bias_to_bs(&logical, 2, 8, 0.5, 0.25, 7, &mut packed).unwrap();
+        assert_eq!(written, bs_buffer_bytes(8));
+        assert_eq!(i32::from_le_bytes(packed[0..4].try_into().unwrap()), 1600);
+        assert_eq!(i32::from_le_bytes(packed[4..8].try_into().unwrap()), -800);
+        assert_eq!(i16::from_le_bytes(packed[32..34].try_into().unwrap()), -7);
+        assert_eq!(i16::from_le_bytes(packed[34..36].try_into().unwrap()), -7);
+        assert!(packed[8..32].iter().all(|&byte| byte == 0));
     }
 
     #[test]
