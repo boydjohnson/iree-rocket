@@ -60,10 +60,11 @@ cargo test --workspace
 
 ## Board convolution regression gate
 
-The dense VGG regression command checks both the low-level ConvPlan/NPU path
-and a compiler-to-VMFB-to-public-driver convolution against an independently
-compiled CPU result. It cross-builds the Rust probe, stages temporary files
-over SSH, runs them on the RK3588, and fails on any numerical mismatch:
+The convolution regression command checks the low-level ConvPlan/NPU path and
+dense plus depthwise compiler-to-VMFB-to-public-driver convolutions against
+independently compiled CPU results. It cross-builds the Rust probe, stages
+temporary files over SSH, runs them on the RK3588, and fails on any numerical
+mismatch:
 
 ```sh
 python3 tools/e2e_conv_regression.py --board "<board name>"
@@ -71,8 +72,9 @@ python3 tools/e2e_conv_regression.py --board "<board name>"
 
 It requires Python with NumPy, `ssh`/`scp` access to the board, the aarch64
 Rust target and cross-linker, and the host/aarch64 IREE builds described above.
-The compiled case is the previously problematic VGG geometry: 30x30,
-Cin=512, Cout=512, 3x3, with fully diverse deterministic coefficients.
+The compiled cases include the previously problematic VGG geometry (30x30,
+Cin=512, Cout=512, 3x3) and a 40-channel 3x3 depthwise convolution that crosses
+the driver's 32-channel weight-packing group boundary.
 
 ## Submodules
 

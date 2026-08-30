@@ -1,10 +1,10 @@
 #!/usr/bin/env python3
-"""Run the dense VGG convolution regression gates on an RK3588 board.
+"""Run dense and depthwise convolution regression gates on an RK3588 board.
 
 This runs two independent checks:
 
 1. iree-rocket-hal's five-case raw ConvPlan/NPU dense-coefficient oracle.
-2. A 30x30, Cin=512, Cout=512, 3x3 convolution compiled twice from MLIR:
+2. Dense and depthwise convolutions compiled twice from MLIR:
    once for the host CPU and once for Rocket. The Rocket VMFB is executed
    through iree-run-module on the board and compared with the CPU VMFB.
 
@@ -38,6 +38,14 @@ func.func @main(%input: tensor<1x32x32x512xf16>, %filter: tensor<3x3x512x512xf16
       ins(%input, %filter : tensor<1x32x32x512xf16>, tensor<3x3x512x512xf16>)
       outs(%init : tensor<1x30x30x512xf32>) -> tensor<1x30x30x512xf32>
   return %0 : tensor<1x30x30x512xf32>
+}
+
+func.func @depthwise(%input: tensor<1x8x8x40xf16>, %filter: tensor<3x3x40xf16>, %init: tensor<1x6x6x40xf32>) -> tensor<1x6x6x40xf32> {
+  %0 = linalg.depthwise_conv_2d_nhwc_hwc
+      {dilations = dense<1> : tensor<2xi64>, strides = dense<1> : tensor<2xi64>}
+      ins(%input, %filter : tensor<1x8x8x40xf16>, tensor<3x3x40xf16>)
+      outs(%init : tensor<1x6x6x40xf32>) -> tensor<1x6x6x40xf32>
+  return %0 : tensor<1x6x6x40xf32>
 }
 """
 
@@ -129,6 +137,12 @@ def write_compiled_fixture(work_dir: Path) -> None:
     np.save(work_dir / "input.npy", input_tensor)
     np.save(work_dir / "init.npy", np.zeros((1, 30, 30, 512), dtype=np.float32))
 
+    depthwise_weights = rng.uniform(-0.5, 0.5, size=(3, 3, 40)).astype(np.float16)
+    depthwise_input = rng.uniform(-0.25, 0.25, size=(1, 8, 8, 40)).astype(np.float16)
+    np.save(work_dir / "depthwise_kernel.npy", depthwise_weights)
+    np.save(work_dir / "depthwise_input.npy", depthwise_input)
+    np.save(work_dir / "depthwise_init.npy", np.zeros((1, 6, 6, 40), dtype=np.float32))
+
 
 def compile_modules(work_dir: Path, compiler: Path, transform_spec: Path) -> None:
     source = work_dir / "conv.mlir"
@@ -163,30 +177,46 @@ def compile_modules(work_dir: Path, compiler: Path, transform_spec: Path) -> Non
         raise SystemExit("compiled module contains no serialized Rocket executable")
 
 
-def run_cpu_reference(work_dir: Path, host_runtime: Path) -> None:
+def run_cpu_reference(
+    work_dir: Path,
+    host_runtime: Path,
+    function: str,
+    input_name: str,
+    kernel_name: str,
+    init_name: str,
+    output_name: str,
+) -> None:
     run(
         [
             str(host_runtime),
             f"--module={work_dir / 'cpu.vmfb'}",
-            "--function=main",
+            f"--function={function}",
             "--device=local-task",
-            f"--input=@{work_dir / 'input.npy'}",
-            f"--input=@{work_dir / 'kernel.npy'}",
-            f"--input=@{work_dir / 'init.npy'}",
-            f"--output=@{work_dir / 'out_cpu.npy'}",
+            f"--input=@{work_dir / input_name}",
+            f"--input=@{work_dir / kernel_name}",
+            f"--input=@{work_dir / init_name}",
+            f"--output=@{work_dir / output_name}",
         ]
     )
 
 
 def run_rocket_module(
-    host: str, remote_dir: str, work_dir: Path, board_runtime: Path
+    host: str,
+    remote_dir: str,
+    work_dir: Path,
+    board_runtime: Path,
+    function: str,
+    input_name: str,
+    kernel_name: str,
+    init_name: str,
+    output_name: str,
 ) -> None:
     staged = [
         board_runtime,
         work_dir / "rocket.vmfb",
-        work_dir / "input.npy",
-        work_dir / "kernel.npy",
-        work_dir / "init.npy",
+        work_dir / input_name,
+        work_dir / kernel_name,
+        work_dir / init_name,
     ]
     run(["scp", *(str(path) for path in staged), f"{host}:{remote_dir}/"])
     runtime_name = board_runtime.name
@@ -198,24 +228,26 @@ def run_rocket_module(
                 [
                     f"./{runtime_name}",
                     "--module=rocket.vmfb",
-                    "--function=main",
+                    f"--function={function}",
                     "--device=rocket",
                     "--device=local-task",
-                    "--input=@input.npy",
-                    "--input=@kernel.npy",
-                    "--input=@init.npy",
-                    "--output=@out_rocket.npy",
+                    f"--input=@{input_name}",
+                    f"--input=@{kernel_name}",
+                    f"--input=@{init_name}",
+                    f"--output=@{output_name}",
                 ]
             ),
         ]
     )
     run(["ssh", host, remote_command])
-    run(["scp", f"{host}:{remote_dir}/out_rocket.npy", str(work_dir / "out_rocket.npy")])
+    run(["scp", f"{host}:{remote_dir}/{output_name}", str(work_dir / output_name)])
 
 
-def compare_outputs(work_dir: Path, atol: float, rtol: float) -> None:
-    cpu = np.load(work_dir / "out_cpu.npy").astype(np.float64)
-    rocket = np.load(work_dir / "out_rocket.npy").astype(np.float64)
+def compare_outputs(
+    work_dir: Path, cpu_name: str, rocket_name: str, atol: float, rtol: float
+) -> None:
+    cpu = np.load(work_dir / cpu_name).astype(np.float64)
+    rocket = np.load(work_dir / rocket_name).astype(np.float64)
     if cpu.shape != rocket.shape:
         raise SystemExit(f"output shape mismatch: CPU {cpu.shape}, Rocket {rocket.shape}")
     absolute_error = np.abs(cpu - rocket)
@@ -223,7 +255,7 @@ def compare_outputs(work_dir: Path, atol: float, rtol: float) -> None:
     mismatches = int(np.count_nonzero(absolute_error > allowed_error))
     max_error = float(absolute_error.max(initial=0.0))
     print(
-        "compiled VMFB differential: "
+        f"compiled VMFB differential ({rocket_name}): "
         f"max|error|={max_error:.8g}, mismatches={mismatches}/{cpu.size}, "
         f"atol={atol}, rtol={rtol}"
     )
@@ -244,9 +276,39 @@ def run_compiled_gate(
 ) -> None:
     write_compiled_fixture(work_dir)
     compile_modules(work_dir, compiler, transform_spec)
-    run_cpu_reference(work_dir, host_runtime)
-    run_rocket_module(host, remote_dir, work_dir, board_runtime)
-    compare_outputs(work_dir, atol, rtol)
+    cases = [
+        ("main", "input.npy", "kernel.npy", "init.npy", "out_rocket.npy"),
+        (
+            "depthwise",
+            "depthwise_input.npy",
+            "depthwise_kernel.npy",
+            "depthwise_init.npy",
+            "depthwise_out_rocket.npy",
+        ),
+    ]
+    for function, input_name, kernel_name, init_name, output_name in cases:
+        cpu_name = f"{function}_cpu.npy"
+        run_cpu_reference(
+            work_dir,
+            host_runtime,
+            function,
+            input_name,
+            kernel_name,
+            init_name,
+            cpu_name,
+        )
+        run_rocket_module(
+            host,
+            remote_dir,
+            work_dir,
+            board_runtime,
+            function,
+            input_name,
+            kernel_name,
+            init_name,
+            output_name,
+        )
+        compare_outputs(work_dir, cpu_name, output_name, atol, rtol)
 
 
 def main() -> None:
