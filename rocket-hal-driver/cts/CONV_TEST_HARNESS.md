@@ -28,7 +28,9 @@ The harness accepts a regular FP16 convolution described by:
 - symmetric height/width padding (`pad_top` is also bottom padding and
   `pad_left` is also right padding).
 
-Input data is logical dense NHWC and weights are logical dense HWCF. The
+Input data is logical dense NHWC and regular weights are logical dense HWCF.
+Depthwise weights use logical CHW (one filter per channel), the ABI consumed by
+the driver's depthwise packer. The
 harness does not call Rocket tensor-packing helpers. That is deliberate: the
 test covers the driver's deferred input packing, coefficient packing, actual
 buffer binding order, FP16-to-FP32 BRDMA bias widening, NPU submission, and
@@ -57,8 +59,8 @@ layout, binding, or padding errors remain readily visible.
 - The helper covers regular FP16 convolution. Int8 needs a reference
   requantization policy matching `Multiplier` and a logical-to-hardware int8
   coefficient bridge in the driver.
-- Depthwise needs the driver to accept a documented logical depthwise weight
-  layout and invoke its existing depthwise packer.
+- The public depthwise case is intentionally a separate hardware regression;
+  regular parameterized cases do not exercise channel-major CHW weights.
 - Bias is a logical dense FP16 tensor. Dedicated exact-sized bindings and a
   nonzero-offset binding populated by a preceding command-buffer update
   between poisoned neighboring suballocations verify the driver's deferred

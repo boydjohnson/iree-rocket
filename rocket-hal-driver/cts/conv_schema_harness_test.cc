@@ -246,6 +246,35 @@ TEST(ConvSchemaBiasTest, DeferredUpdateBetweenPoisonedNeighborsIsIsolated) {
   ExpectMatchesIndependentReference(result);
 }
 
+TEST(ConvSchemaDepthwiseTest, CrossesTheThirtyTwoChannelWeightGroupBoundary) {
+  iree_hal_driver_t *driver = nullptr;
+  iree_hal_device_t *device = nullptr;
+  std::string error;
+  if (!CreateDevice(&driver, &device, &error)) {
+    GTEST_SKIP() << "Rocket device unavailable: " << error;
+  }
+
+  const Conv2dProblem problem{
+      /*input_height=*/5,    /*input_width=*/6,
+      /*input_channels=*/40, /*output_channels=*/40,
+      /*kernel_height=*/3,   /*kernel_width=*/3,
+      /*stride=*/1,          /*pad_top=*/1,
+      /*pad_left=*/1,        /*depthwise=*/true};
+  Conv2dResult result;
+  try {
+    result =
+        RunFp16Conv2d(device, problem, MakeInput(problem), MakeWeights(problem),
+                      MakeBias(problem), BiasBindingMode::kExact);
+  } catch (...) {
+    iree_hal_device_release(device);
+    iree_hal_driver_release(driver);
+    throw;
+  }
+  iree_hal_device_release(device);
+  iree_hal_driver_release(driver);
+  ExpectMatchesIndependentReference(result);
+}
+
 INSTANTIATE_TEST_SUITE_P(
     KernelStrideAndPadding, ConvSchemaHarnessTest,
     ::testing::Values(

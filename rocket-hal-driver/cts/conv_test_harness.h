@@ -17,9 +17,11 @@ namespace rocket::testing {
 
 // Logical convolution geometry accepted by the RKT1 Conv2D ukernel.
 //
-// Input and output tensors use dense NHWC order. Weights use dense HWCF
-// order. Padding is symmetric: pad_top is also the bottom padding and
-// pad_left is also the right padding, matching Rocket's current ConvShape.
+// Input and output tensors use dense NHWC order. Regular weights use dense
+// HWCF order; depthwise weights use Rocket's logical CHW order (one kh x kw
+// filter per channel), matching the driver's depthwise packer. Padding is
+// symmetric: pad_top is also the bottom padding and pad_left is also the
+// right padding, matching Rocket's current ConvShape.
 struct Conv2dProblem {
   uint32_t input_height = 1;
   uint32_t input_width = 1;
@@ -30,6 +32,7 @@ struct Conv2dProblem {
   uint32_t stride = 1;
   uint32_t pad_top = 0;
   uint32_t pad_left = 0;
+  bool depthwise = false;
 
   uint32_t output_height() const;
   uint32_t output_width() const;
@@ -61,7 +64,8 @@ enum class BiasBindingMode {
 std::vector<uint8_t> BuildFp16Conv2dExecutable(const Conv2dProblem &problem);
 
 // Runs a regular FP16 Conv2D from an RKT1 executable through the public IREE
-// HAL API. `input` is dense NHWC and `weights` is dense HWCF. The driver,
+// HAL API. `input` is dense NHWC and `weights` is dense HWCF (or CHW for a
+// depthwise problem). The driver,
 // rather than this harness, is responsible for Rocket's NC1HWC2 input
 // packing, blocked coefficient packing, FP16-to-FP32 BRDMA bias widening,
 // and atomic-slot output compaction.

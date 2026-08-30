@@ -161,6 +161,7 @@ std::vector<uint8_t> BuildRkt1Executable(const Conv2dProblem &problem) {
         iree_hal_rocket_Conv2DDef_weights_height_add(&builder,
                                                      problem.kernel_height) ||
         iree_hal_rocket_Conv2DDef_stride_add(&builder, problem.stride) ||
+        iree_hal_rocket_Conv2DDef_depthwise_add(&builder, problem.depthwise) ||
         iree_hal_rocket_Conv2DDef_precision_add(
             &builder, iree_hal_rocket_Precision_FP16) ||
         iree_hal_rocket_Conv2DDef_pad_top_add(&builder, problem.pad_top) ||
@@ -262,11 +263,19 @@ std::vector<float> ReferenceConv2d(const Conv2dProblem &problem,
                        problem.input_channels +
                    ic);
               const size_t weight_index =
-                  (((static_cast<size_t>(ky) * problem.kernel_width + kx) *
-                        problem.input_channels +
-                    ic) *
-                       problem.output_channels +
-                   oc);
+                  problem.depthwise
+                      ? ((static_cast<size_t>(ic) * problem.kernel_height +
+                          ky) *
+                             problem.kernel_width +
+                         kx)
+                      : (((static_cast<size_t>(ky) * problem.kernel_width +
+                           kx) *
+                              problem.input_channels +
+                          ic) *
+                             problem.output_channels +
+                         oc);
+              if (problem.depthwise && ic != oc)
+                continue;
               sum += F16ToF32(input[input_index]) *
                      F16ToF32(weights[weight_index]);
             }
@@ -311,6 +320,8 @@ size_t Conv2dProblem::input_element_count() const {
 }
 
 size_t Conv2dProblem::weight_element_count() const {
+  if (depthwise)
+    return static_cast<size_t>(kernel_height) * kernel_width * input_channels;
   return static_cast<size_t>(kernel_height) * kernel_width * input_channels *
          output_channels;
 }
@@ -339,6 +350,10 @@ Conv2dResult RunFp16Conv2d(iree_hal_device_t *device,
     throw std::invalid_argument("device must not be null");
   if (problem.input_channels == 0 || problem.output_channels == 0) {
     throw std::invalid_argument("Conv2D channels must be nonzero");
+  }
+  if (problem.depthwise && problem.input_channels != problem.output_channels) {
+    throw std::invalid_argument(
+        "depthwise Conv2D requires output channels equal input channels");
   }
   if (problem.pad_top >= problem.kernel_height ||
       problem.pad_left >= problem.kernel_width) {
