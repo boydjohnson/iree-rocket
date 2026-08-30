@@ -1248,8 +1248,8 @@ unsafe extern "C" fn dispatch(
                         output_channels,
                         padded_output_channels,
                         int8: true,
-                        input_scale: 1.0,
-                        weights_scale: 1.0,
+                        input_scale: q.input_scale,
+                        weights_scale: q.weights_scale,
                         weight_zero_point: q.weight_zero_point as i8,
                     }),
                 );

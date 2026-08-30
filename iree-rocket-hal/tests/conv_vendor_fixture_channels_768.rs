@@ -38,6 +38,8 @@ impl FixturePrecision {
                 input_zero_point: 0,
                 output_zero_point: -3,
                 weight_zero_point: 0,
+                input_scale: 1.0,
+                weights_scale: 1.0,
                 multiplier: Multiplier {
                     scale: 19636,
                     shift: 24,

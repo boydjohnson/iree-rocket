@@ -409,6 +409,8 @@ fn int8_precision(shift: u32) -> Precision {
         input_zero_point: 0,
         output_zero_point: 0,
         weight_zero_point: 0,
+        input_scale: 1.0,
+        weights_scale: 1.0,
         // A negative power of two, so the requantisation divides exactly.
         multiplier: Multiplier::for_unit_bs(1.0 / f64::from(1u32 << shift)),
     })

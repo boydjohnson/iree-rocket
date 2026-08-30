@@ -22,7 +22,7 @@
 //! fixed-size scalar, so there is no variable-length data to encode):
 //!
 //! ```text
-//! bytes 0..4:   format_version: u32        (CONV2D_V1_FORMAT_VERSION == 2)
+//! bytes 0..4:   format_version: u32        (CONV2D_V1_FORMAT_VERSION == 4)
 //! bytes 4..8:   input_width: u32
 //! bytes 8..12:  input_height: u32
 //! bytes 12..16: input_channels: u32
@@ -36,25 +36,27 @@
 //! bytes 44..48: input_zero_point: i32      (only meaningful if precision_tag==0)
 //! bytes 48..52: output_zero_point: i32     (only meaningful if precision_tag==0)
 //! bytes 52..56: weights_zero_point: i32    (only meaningful if precision_tag==0)
-//! bytes 56..60: multiplier_scale: u32      (only meaningful if precision_tag==0)
-//! bytes 60..64: multiplier_shift: u32      (only meaningful if precision_tag==0)
-//! bytes 64..68: activation_tag: u32        (0=None, 1=Relu, 2=Clamped)
-//! bytes 68..72: activation_cmp: u32        (always present; only meaningful if activation_tag==2)
-//! bytes 72..76: precision_tag: u32         (0=Int8, 1=Fp16 -- a wire-format-owned
+//! bytes 56..60: input_scale: f32           (only meaningful if precision_tag==0)
+//! bytes 60..64: weights_scale: f32         (only meaningful if precision_tag==0)
+//! bytes 64..68: multiplier_scale: u32      (only meaningful if precision_tag==0)
+//! bytes 68..72: multiplier_shift: u32      (only meaningful if precision_tag==0)
+//! bytes 72..76: activation_tag: u32        (0=None, 1=Relu, 2=Clamped)
+//! bytes 76..80: activation_cmp: u32        (always present; only meaningful if activation_tag==2)
+//! bytes 80..84: precision_tag: u32         (0=Int8, 1=Fp16 -- a wire-format-owned
 //!                                           tag, NOT Precision's own hardware-
 //!                                           register encoding, which is a
 //!                                           separate, independently-changeable
 //!                                           detail)
 //! ```
 //! Total payload length (excluding whatever outer selector byte the caller
-//! uses -- `rocket-hal-driver`'s tag byte, in practice): 76 bytes.
+//! uses -- `rocket-hal-driver`'s tag byte, in practice): 84 bytes.
 //!
 //! This is `rocket-hal-driver`'s tag value `3` in `executable_cache.rs`'s
 //! tag convention -- see that module's doc comment.
 
 use crate::rocket::conv::{self, Activation, Kernels, Multiplier, Precision, Quantization};
 
-pub const CONV2D_V1_FORMAT_VERSION: u32 = 3;
+pub const CONV2D_V1_FORMAT_VERSION: u32 = 4;
 
 /// `rocket-hal-driver::executable_cache`'s outer tag-byte value meaning "a
 /// real encoded `ConvShape` (this module's format) follows in the rest of
@@ -63,7 +65,7 @@ pub const CONV2D_V1_FORMAT_VERSION: u32 = 3;
 /// matches on it.
 pub const CONV2D_V1_TAG: u8 = 3;
 
-const FIELD_COUNT_U32: usize = 18; // everything below format_version, in order.
+const FIELD_COUNT_U32: usize = 20; // everything below format_version, in order.
 const PAYLOAD_LEN: usize = 4 + FIELD_COUNT_U32 * 4;
 
 #[derive(Debug, PartialEq, Eq)]
@@ -99,22 +101,41 @@ pub fn encode_conv_shape_v1(shape: &conv::Shape, kernels: Kernels) -> Vec<u8> {
         Activation::Relu => (1u32, 0u32),
         Activation::Clamped { cmp } => (2u32, cmp),
     };
-    let (precision_tag, input_zero_point, output_zero_point, weight_zero_point, multiplier) =
-        match precision {
-            Precision::Fp16 => (1u32, 0i32, 0i32, 0i32, Multiplier { scale: 0, shift: 0 }),
-            Precision::Int8(Quantization {
-                input_zero_point,
-                output_zero_point,
-                weight_zero_point,
-                multiplier,
-            }) => (
-                0u32,
-                input_zero_point,
-                output_zero_point,
-                weight_zero_point,
-                multiplier,
-            ),
-        };
+    let (
+        precision_tag,
+        input_zero_point,
+        output_zero_point,
+        weight_zero_point,
+        input_scale,
+        weights_scale,
+        multiplier,
+    ) = match precision {
+        Precision::Fp16 => (
+            1u32,
+            0i32,
+            0i32,
+            0i32,
+            0.0f32,
+            0.0f32,
+            Multiplier { scale: 0, shift: 0 },
+        ),
+        Precision::Int8(Quantization {
+            input_zero_point,
+            output_zero_point,
+            weight_zero_point,
+            input_scale,
+            weights_scale,
+            multiplier,
+        }) => (
+            0u32,
+            input_zero_point,
+            output_zero_point,
+            weight_zero_point,
+            input_scale,
+            weights_scale,
+            multiplier,
+        ),
+    };
 
     let mut out = Vec::with_capacity(PAYLOAD_LEN);
     out.extend_from_slice(&CONV2D_V1_FORMAT_VERSION.to_le_bytes());
@@ -131,6 +152,8 @@ pub fn encode_conv_shape_v1(shape: &conv::Shape, kernels: Kernels) -> Vec<u8> {
     out.extend_from_slice(&input_zero_point.to_le_bytes());
     out.extend_from_slice(&output_zero_point.to_le_bytes());
     out.extend_from_slice(&weight_zero_point.to_le_bytes());
+    out.extend_from_slice(&input_scale.to_bits().to_le_bytes());
+    out.extend_from_slice(&weights_scale.to_bits().to_le_bytes());
     out.extend_from_slice(&multiplier.scale.to_le_bytes());
     out.extend_from_slice(&multiplier.shift.to_le_bytes());
     out.extend_from_slice(&activation_tag.to_le_bytes());
@@ -179,6 +202,8 @@ pub fn decode_conv_shape_v1(payload: &[u8]) -> Result<(conv::Shape, Kernels), De
     let input_zero_point = read_u32() as i32;
     let output_zero_point = read_u32() as i32;
     let weight_zero_point = read_u32() as i32;
+    let input_scale = f32::from_bits(read_u32());
+    let weights_scale = f32::from_bits(read_u32());
     let multiplier_scale = read_u32();
     let multiplier_shift = read_u32();
     let activation_tag = read_u32();
@@ -198,6 +223,8 @@ pub fn decode_conv_shape_v1(payload: &[u8]) -> Result<(conv::Shape, Kernels), De
             input_zero_point,
             output_zero_point,
             weight_zero_point,
+            input_scale,
+            weights_scale,
             multiplier: Multiplier {
                 scale: multiplier_scale,
                 shift: multiplier_shift,
@@ -275,6 +302,8 @@ mod tests {
                     input_zero_point: 0,
                     output_zero_point: 0,
                     weight_zero_point: 0,
+                    input_scale: 1.0,
+                    weights_scale: 1.0,
                     multiplier: Multiplier::from_ratio(1.0),
                 }),
                 padding: Some([0, 0]),
@@ -318,6 +347,8 @@ mod tests {
                 input_zero_point: -7,
                 output_zero_point: 3,
                 weight_zero_point: 0,
+                input_scale: 0.5,
+                weights_scale: 0.25,
                 multiplier: Multiplier::from_ratio(0.25),
             }),
         ] {
@@ -355,10 +386,10 @@ mod tests {
     fn decode_rejects_unsupported_version() {
         let (shape, kernels) = known_good_shape();
         let mut bytes = encode_conv_shape_v1(&shape, kernels);
-        bytes[0..4].copy_from_slice(&4u32.to_le_bytes());
+        bytes[0..4].copy_from_slice(&5u32.to_le_bytes());
         assert_eq!(
             decode_conv_shape_v1(&bytes),
-            Err(DecodeError::UnsupportedVersion(4))
+            Err(DecodeError::UnsupportedVersion(5))
         );
     }
 
@@ -366,9 +397,9 @@ mod tests {
     fn decode_rejects_invalid_activation_tag() {
         let (shape, kernels) = known_good_shape();
         let mut bytes = encode_conv_shape_v1(&shape, kernels);
-        // activation_tag is at bytes 64..68 per this module's byte-layout
+        // activation_tag is at bytes 72..76 per this module's byte-layout
         // doc comment.
-        bytes[64..68].copy_from_slice(&99u32.to_le_bytes());
+        bytes[72..76].copy_from_slice(&99u32.to_le_bytes());
         assert_eq!(
             decode_conv_shape_v1(&bytes),
             Err(DecodeError::InvalidActivationTag(99))
@@ -379,8 +410,7 @@ mod tests {
     fn decode_rejects_invalid_precision_tag() {
         let (shape, kernels) = known_good_shape();
         let mut bytes = encode_conv_shape_v1(&shape, kernels);
-        // precision_tag is the last u32: offset 4 + 18*4 = 76, so the last
-        // 4 bytes of the 76-byte payload.
+        // precision_tag is the last u32 in the 84-byte payload.
         let last = bytes.len() - 4;
         bytes[last..].copy_from_slice(&7u32.to_le_bytes());
         assert_eq!(
@@ -502,6 +532,8 @@ mod tests {
                 input_zero_point: 0,
                 output_zero_point: 0,
                 weight_zero_point: 0,
+                input_scale: 1.0,
+                weights_scale: 1.0,
                 multiplier: Multiplier::from_ratio(1.0),
             }),
             ..base

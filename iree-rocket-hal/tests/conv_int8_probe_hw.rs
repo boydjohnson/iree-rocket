@@ -62,6 +62,8 @@ fn probe(bs_multiplier: i16, cvt_scale: u32, cvt_shift: u32) -> i32 {
         input_zero_point: 0,
         output_zero_point: 0,
         weight_zero_point: 0,
+        input_scale: 1.0,
+        weights_scale: 1.0,
         multiplier: Multiplier {
             scale: cvt_scale,
             shift: cvt_shift,

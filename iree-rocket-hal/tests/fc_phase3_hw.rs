@@ -214,6 +214,8 @@ fn odd_int8_n_height_one_fc_runs_on_npu() {
             input_zero_point: 0,
             output_zero_point: 0,
             weight_zero_point: 0,
+            input_scale: 1.0,
+            weights_scale: 1.0,
             multiplier: Multiplier::for_unit_bs(1.0),
         }),
     );

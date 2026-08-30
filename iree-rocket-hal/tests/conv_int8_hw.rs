@@ -70,7 +70,7 @@ use std::{collections::BTreeSet, fs::OpenOptions, mem, os::unix::io::AsRawFd, pt
 use iree_rocket_hal::rocket::{
     conv::{
         BsEntry, Buffers, FeatureLayout, Kernels, Multiplier, Precision, Quantization, Shape, Tile,
-        bs_buffer_bytes, conv_2d_tile, relocate, write_bs_buffer,
+        bs_buffer_bytes, conv_2d_tile, pack_int8_bias_to_bs, relocate, write_bs_buffer,
     },
     device::{Buffer, JobDesc, close_bo, fini_bo, prep_bo, submit_jobs},
 };
@@ -372,6 +372,17 @@ fn shift_for(in_channels: u32, kernel: usize) -> u32 {
     shift
 }
 
+#[test]
+fn int8_bias_packing_uses_calibration_scales() {
+    let logical = [100i32.to_le_bytes(), (-50i32).to_le_bytes()].concat();
+    let mut packed = vec![0u8; bs_buffer_bytes(2) as usize];
+    pack_int8_bias_to_bs(&logical, 2, 2, 0.5, 0.25, 7, &mut packed)
+        .expect("non-unit calibration scales should pack");
+    assert_eq!(i32::from_le_bytes(packed[0..4].try_into().unwrap()), 800);
+    assert_eq!(i32::from_le_bytes(packed[4..8].try_into().unwrap()), -400);
+    assert_eq!(i16::from_le_bytes(packed[32..34].try_into().unwrap()), -7);
+}
+
 fn attempt(
     in_channels: u32,
     out_channels: u32,
@@ -386,6 +397,8 @@ fn attempt(
         input_zero_point: 0,
         output_zero_point,
         weight_zero_point: 0,
+        input_scale: 1.0,
+        weights_scale: 1.0,
         // A negative power of two, so the requantisation divides exactly.
         // `for_unit_bs` cancels the gain the unit BS multiplier carries: the
         // BS stage shifts by 7, not the 14 the register suggests. That ratio
@@ -438,6 +451,8 @@ fn int8_channel_matrix_tiles_fit_their_data_banks() {
                 input_zero_point: 0,
                 output_zero_point: 0,
                 weight_zero_point: 0,
+                input_scale: 1.0,
+                weights_scale: 1.0,
                 multiplier: Multiplier::for_unit_bs(1.0 / f64::from(1u32 << shift)),
             });
             let shape = Shape::with_precision(64, 32, 1, in_channels, 8, precision);
@@ -549,6 +564,8 @@ fn int8_single_output_channel_probe() {
                 input_zero_point: 0,
                 output_zero_point: 0,
                 weight_zero_point: 0,
+                input_scale: 1.0,
+                weights_scale: 1.0,
                 multiplier: Multiplier::for_unit_bs(1.0 / f64::from(1u32 << shift)),
             });
             let shape = Shape::with_precision(64, 32, 1, 16, out_channels, precision);
@@ -582,6 +599,8 @@ fn int8_single_output_channel_probe() {
             input_zero_point: 0,
             output_zero_point: 0,
             weight_zero_point: 0,
+            input_scale: 1.0,
+            weights_scale: 1.0,
             multiplier: Multiplier::for_unit_bs(1.0 / f64::from(1u32 << shift)),
         }),
     );
@@ -631,6 +650,8 @@ fn int8_bs_read_extent_probe() {
                 input_zero_point: 0,
                 output_zero_point: 0,
                 weight_zero_point: 0,
+                input_scale: 1.0,
+                weights_scale: 1.0,
                 multiplier: Multiplier::for_unit_bs(1.0 / f64::from(1u32 << shift)),
             });
             let shape = Shape::with_precision(64, 32, 1, 16, out_channels, precision);

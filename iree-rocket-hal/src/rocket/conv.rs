@@ -404,7 +404,7 @@ impl Precision {
 /// None of these are derivable from the shape -- they come from calibration,
 /// so the compiler supplies them. What *is* derivable is how they are
 /// encoded, which is what [`Multiplier`] captures.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq)]
 pub struct Quantization {
     /// Quantized encoding of 0.0 on the input, programmed into
     /// `CNA_PAD_CON1.pad_value`.
@@ -419,9 +419,17 @@ pub struct Quantization {
     /// `DPU_OUT_CVT_OFFSET`.
     pub output_zero_point: i32,
     pub weight_zero_point: i32,
+    /// Real-valued input and weight calibration scales used to normalize bias.
+    pub input_scale: f32,
+    pub weights_scale: f32,
     /// Requantization multiplier, `input_scale * weight_scale / output_scale`.
     pub multiplier: Multiplier,
 }
+
+// Calibration data is validated as finite before it reaches the hardware
+// path. Keep the historical `Eq` bound on `Precision`/`Shape` while storing
+// the schema's native f32 values here.
+impl Eq for Quantization {}
 
 /// A requantization multiplier in the hardware's normalized fixed-point form.
 ///
@@ -5051,6 +5059,8 @@ mod tests {
             input_zero_point: 0,
             output_zero_point: -3,
             weight_zero_point: 0,
+            input_scale: 1.0,
+            weights_scale: 1.0,
             multiplier: Multiplier {
                 scale: 19636,
                 shift: 24,

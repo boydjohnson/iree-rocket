@@ -93,6 +93,15 @@ fn decode_precision(
 ) -> Result<Precision, ()> {
     match precision {
         schema::Precision::INT8 => {
+            if !input_scale.is_finite()
+                || !weights_scale.is_finite()
+                || !output_scale.is_finite()
+                || input_scale <= 0.0
+                || weights_scale <= 0.0
+                || output_scale <= 0.0
+            {
+                return Err(());
+            }
             let ratio = f64::from(input_scale) * f64::from(weights_scale) / f64::from(output_scale);
             let multiplier =
                 std::panic::catch_unwind(|| Multiplier::from_ratio(ratio)).map_err(|_| ())?;
@@ -100,6 +109,8 @@ fn decode_precision(
                 input_zero_point: input_zero_point as i32,
                 output_zero_point: output_zero_point as i32,
                 weight_zero_point: weights_zero_point as i32,
+                input_scale,
+                weights_scale,
                 multiplier,
             }))
         }
@@ -417,6 +428,8 @@ unsafe extern "C" fn prepare_executable(
                     input_zero_point: 0,
                     output_zero_point: 0,
                     weight_zero_point: 0,
+                    input_scale: 1.0,
+                    weights_scale: 1.0,
                     multiplier: Multiplier::from_ratio(1.0),
                 }),
                 padding: Some([0, 0]),

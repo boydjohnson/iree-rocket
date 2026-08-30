@@ -60,6 +60,8 @@ fn conv_shape() -> conv::Shape {
             input_zero_point: 0,
             output_zero_point: 0,
             weight_zero_point: 0,
+            input_scale: 1.0,
+            weights_scale: 1.0,
             multiplier: Multiplier::from_ratio(1.0),
         }),
         padding: Some([0, 0]),

@@ -134,6 +134,8 @@ impl Conv2dCase {
                     input_zero_point: 0,
                     output_zero_point,
                     weight_zero_point: 0,
+                    input_scale: 1.0,
+                    weights_scale: 1.0,
                     multiplier,
                 })
             }
