@@ -85,7 +85,7 @@ use crate::{
 use iree_rocket_hal::rocket::{
     builders::RegCmd,
     conv::{Buffers, ConvPlan, FeatureLayout, Precision},
-    device::Buffer as RocketDeviceBuffer,
+    device::OwnedBuffer as RocketOwnedBuffer,
     fc,
     pooling::{PoolingBuffers, PoolingPlan},
     tensor_layout::{
@@ -161,9 +161,9 @@ pub struct WeightPacking {
 /// a driver-private scratch buffer instead of the real output buffer;
 /// `queue_execute`, after its existing post-dispatch `prep_bo` wait
 /// confirms the hardware write is complete, interleaves the 16-byte channel
-/// surfaces into `output_buffer` (the real, dense IREE buffer, retained at
-/// record time via `output_buffer` below so it survives until
-/// `queue_execute` runs).
+/// surfaces into `output_buffer` (the real, dense IREE buffer, retained with
+/// every other direct dispatch binding so it survives until `queue_execute`
+/// runs).
 #[derive(Clone, Copy)]
 pub struct OutputCompaction {
     pub output_buffer: *mut iree_hal_buffer_t,
@@ -200,6 +200,16 @@ pub enum RecordedOp {
     },
     Dispatch {
         regcmd_tasks: Vec<Vec<RegCmd>>,
+        /// Every direct binding supplied to the dispatch, retained exactly
+        /// once at record time as required by the IREE HAL command-buffer
+        /// contract. The command buffer releases them from `destroy()`.
+        retained_bindings: Vec<*mut iree_hal_buffer_t>,
+        /// Driver-private GEM allocations whose DMA addresses and host
+        /// mappings are referenced by the packing/compaction descriptors and
+        /// baked into `regcmd_tasks`. Owning them here keeps them alive until
+        /// the command buffer has finished executing and closes/unmaps them
+        /// on every destruction path.
+        scratch_buffers: Vec<RocketOwnedBuffer>,
         /// GEM handles of every buffer this dispatch reads (bindings other
         /// than the output) -- must be listed in `drm_rocket_job.in_bo_handles`
         /// (device.rs's `queue_execute`) so the kernel driver's implicit
@@ -278,6 +288,20 @@ pub struct RocketCommandBuffer {
 
 unsafe fn cast(command_buffer: *mut iree_hal_command_buffer_t) -> *mut RocketCommandBuffer {
     command_buffer as *mut RocketCommandBuffer
+}
+
+/// Retains every direct dispatch binding once, including bindings that do
+/// not need a packing bridge. IREE permits the caller to release its own
+/// references as soon as `dispatch()` returns, so raw buffer pointers and GEM
+/// handles recorded in the command buffer are only valid if the command
+/// buffer owns corresponding references.
+unsafe fn retain_direct_bindings(refs: &[iree_hal_buffer_ref_t]) -> Vec<*mut iree_hal_buffer_t> {
+    refs.iter()
+        .map(|binding| {
+            unsafe { crate::bindings::iree_hal_buffer_retain(binding.buffer) };
+            binding.buffer
+        })
+        .collect()
 }
 
 /// Not part of the vtable -- `device::queue_execute` calls this directly
@@ -371,6 +395,7 @@ pub unsafe fn apply_ops(
                 input_packing,
                 weight_packing,
                 output_compaction,
+                ..
             } => {
                 if let Some(packing) = input_packing {
                     let dense_len = packing
@@ -571,12 +596,11 @@ unsafe extern "C" fn destroy(command_buffer: *mut iree_hal_command_buffer_t) {
         let cb = Box::from_raw(cast(command_buffer));
         // Release exactly what fill_buffer/update_buffer/copy_buffer/
         // dispatch retained at record time -- see those functions' own
-        // comments. Most of Dispatch's own fields (regcmd, GEM handles)
-        // are plain extracted values, not retained buffer references --
-        // but Conv2d's `output_compaction`, when present, does retain the
-        // real output buffer (see `OutputCompaction`'s own doc comment),
-        // since it must survive until `queue_execute`'s post-dispatch
-        // compaction step long after this recording call returns.
+        // comments. Dispatch retains every direct binding, including buffers
+        // used without a packing bridge, because IREE permits callers to
+        // release their references immediately after recording. Dropping `cb`
+        // after this loop also drops every driver-private `OwnedBuffer`, which
+        // unmaps its VMA and closes its GEM handle.
         for op in &cb.ops {
             match op {
                 RecordedOp::Fill { target, .. } => {
@@ -590,19 +614,10 @@ unsafe extern "C" fn destroy(command_buffer: *mut iree_hal_command_buffer_t) {
                     crate::bindings::iree_hal_buffer_release(target.buffer);
                 }
                 RecordedOp::Dispatch {
-                    input_packing,
-                    weight_packing,
-                    output_compaction,
-                    ..
+                    retained_bindings, ..
                 } => {
-                    if let Some(packing) = input_packing {
-                        crate::bindings::iree_hal_buffer_release(packing.input_buffer);
-                    }
-                    if let Some(packing) = weight_packing {
-                        crate::bindings::iree_hal_buffer_release(packing.weight_buffer);
-                    }
-                    if let Some(oc) = output_compaction {
-                        crate::bindings::iree_hal_buffer_release(oc.output_buffer);
+                    for &buffer in retained_bindings {
+                        crate::bindings::iree_hal_buffer_release(buffer);
                     }
                 }
             }
@@ -889,6 +904,7 @@ unsafe extern "C" fn dispatch(
                     crate::bindings::iree_status_code_e_IREE_STATUS_INVALID_ARGUMENT,
                 );
             }
+            let mut scratch_buffers = Vec::with_capacity(3);
 
             // CNA's surface-layout path consumes 16-byte feature-atomic
             // NC1HWC2 surfaces. Shapes with 1..=4 channels use the hardware's
@@ -906,13 +922,13 @@ unsafe extern "C" fn dispatch(
                             }
                         };
                     let scratch = unsafe {
-                        RocketDeviceBuffer::new(
+                        RocketOwnedBuffer::new(
                             cb.fd,
                             scratch_bytes.max(1),
                             BorrowedFd::borrow_raw(cb.fd),
                         )
                     };
-                    (
+                    let packed = (
                         scratch.dma_address,
                         scratch.handle,
                         Some(InputPacking {
@@ -929,7 +945,9 @@ unsafe extern "C" fn dispatch(
                             padding_byte: 0,
                             layout: InputPackingLayout::Nc1hwc2,
                         }),
-                    )
+                    );
+                    scratch_buffers.push(scratch);
+                    packed
                 } else {
                     (addr(&refs[0]), handle(&refs[0]), None)
                 };
@@ -968,13 +986,13 @@ unsafe extern "C" fn dispatch(
                         }
                     };
                     let scratch = unsafe {
-                        RocketDeviceBuffer::new(
+                        RocketOwnedBuffer::new(
                             cb.fd,
                             scratch_bytes.max(1),
                             BorrowedFd::borrow_raw(cb.fd),
                         )
                     };
-                    (
+                    let packed = (
                         scratch.dma_address,
                         scratch.handle,
                         Some(WeightPacking {
@@ -992,7 +1010,9 @@ unsafe extern "C" fn dispatch(
                             depthwise: false,
                             padded_channels: 0,
                         }),
-                    )
+                    );
+                    scratch_buffers.push(scratch);
+                    packed
                 } else if shape.precision == Precision::Fp16 && shape.depthwise {
                     // One filter per input channel -- no Cout factor, unlike
                     // the dense branch above. The compiler-emitted dispatch
@@ -1014,13 +1034,13 @@ unsafe extern "C" fn dispatch(
                     }
                     let scratch_bytes = shape.weight_bytes(kernels) as usize;
                     let scratch = unsafe {
-                        RocketDeviceBuffer::new(
+                        RocketOwnedBuffer::new(
                             cb.fd,
                             scratch_bytes.max(1),
                             BorrowedFd::borrow_raw(cb.fd),
                         )
                     };
-                    (
+                    let packed = (
                         scratch.dma_address,
                         scratch.handle,
                         Some(WeightPacking {
@@ -1038,7 +1058,9 @@ unsafe extern "C" fn dispatch(
                             depthwise: true,
                             padded_channels: shape.depthwise_padded_channels() as usize,
                         }),
-                    )
+                    );
+                    scratch_buffers.push(scratch);
+                    packed
                 } else {
                     (addr(&refs[1]), handle(&refs[1]), None)
                 };
@@ -1051,7 +1073,7 @@ unsafe extern "C" fn dispatch(
             // buffer after the hardware write completes.
             let scratch_bytes = shape.output_scratch_bytes(kernels).max(1);
             let scratch = unsafe {
-                RocketDeviceBuffer::new(cb.fd, scratch_bytes, BorrowedFd::borrow_raw(cb.fd))
+                RocketOwnedBuffer::new(cb.fd, scratch_bytes, BorrowedFd::borrow_raw(cb.fd))
             };
             let bufs = Buffers {
                 input: input_addr,
@@ -1076,16 +1098,6 @@ unsafe extern "C" fn dispatch(
                     );
                 }
             };
-            // Retained here so the dense input survives until pre-dispatch
-            // packing and the real output survives until post-dispatch
-            // compaction. Both are released by `destroy()`.
-            if input_packing.is_some() {
-                unsafe { crate::bindings::iree_hal_buffer_retain(refs[0].buffer) };
-            }
-            if weight_packing.is_some() {
-                unsafe { crate::bindings::iree_hal_buffer_retain(refs[1].buffer) };
-            }
-            unsafe { crate::bindings::iree_hal_buffer_retain(refs[3].buffer) };
             let output_pixel_count =
                 shape.output_width(kernels) as usize * shape.output_height(kernels) as usize;
             let output_compaction = Some(OutputCompaction {
@@ -1099,10 +1111,15 @@ unsafe extern "C" fn dispatch(
                 bytes_per_pixel: shape.out_channels as usize
                     * shape.precision.element_bytes() as usize,
             });
+            let output_handle = scratch.handle;
+            scratch_buffers.push(scratch);
+            let retained_bindings = unsafe { retain_direct_bindings(refs) };
             cb.ops.push(RecordedOp::Dispatch {
                 regcmd_tasks,
+                retained_bindings,
+                scratch_buffers,
                 in_bo_handles: vec![input_handle, weights_handle, handle(&refs[2])],
-                out_bo_handles: vec![scratch.handle],
+                out_bo_handles: vec![output_handle],
                 input_packing,
                 weight_packing,
                 output_compaction,
@@ -1195,7 +1212,7 @@ unsafe extern "C" fn dispatch(
                 );
             }
             let input_scratch = unsafe {
-                RocketDeviceBuffer::new(
+                RocketOwnedBuffer::new(
                     cb.fd,
                     input_scratch_bytes.max(1),
                     BorrowedFd::borrow_raw(cb.fd),
@@ -1233,7 +1250,7 @@ unsafe extern "C" fn dispatch(
                 );
             }
             let weight_scratch = unsafe {
-                RocketDeviceBuffer::new(
+                RocketOwnedBuffer::new(
                     cb.fd,
                     weight_scratch_bytes.max(1),
                     BorrowedFd::borrow_raw(cb.fd),
@@ -1270,7 +1287,7 @@ unsafe extern "C" fn dispatch(
                 );
             }
             let output_scratch = unsafe {
-                RocketDeviceBuffer::new(
+                RocketOwnedBuffer::new(
                     cb.fd,
                     output_scratch_bytes.max(1),
                     BorrowedFd::borrow_raw(cb.fd),
@@ -1293,34 +1310,36 @@ unsafe extern "C" fn dispatch(
                 }
             };
 
-            unsafe {
-                crate::bindings::iree_hal_buffer_retain(refs[0].buffer);
-                crate::bindings::iree_hal_buffer_retain(refs[1].buffer);
-                crate::bindings::iree_hal_buffer_retain(refs[3].buffer);
-            }
+            let input_scratch_handle = input_scratch.handle;
+            let weight_scratch_handle = weight_scratch.handle;
+            let output_scratch_handle = output_scratch.handle;
+            let output_compaction = Some(OutputCompaction {
+                output_buffer: refs[3].buffer,
+                output_offset: refs[3].offset,
+                output_length: refs[3].length,
+                scratch_ptr: output_scratch.host_ptr,
+                scratch_length: output_scratch_bytes,
+                // No row padding to discard (see physical_pixel_count's
+                // own comment) -- source and output pixel counts are the
+                // same real `m`.
+                source_pixel_count: m,
+                output_pixel_count: m,
+                bytes_per_pixel: output_bytes_per_pixel,
+            });
+            let retained_bindings = unsafe { retain_direct_bindings(refs) };
             cb.ops.push(RecordedOp::Dispatch {
                 regcmd_tasks,
+                retained_bindings,
+                scratch_buffers: vec![input_scratch, weight_scratch, output_scratch],
                 in_bo_handles: vec![
-                    input_scratch.handle,
-                    weight_scratch.handle,
+                    input_scratch_handle,
+                    weight_scratch_handle,
                     handle(&refs[2]),
                 ],
-                out_bo_handles: vec![output_scratch.handle],
+                out_bo_handles: vec![output_scratch_handle],
                 input_packing,
                 weight_packing,
-                output_compaction: Some(OutputCompaction {
-                    output_buffer: refs[3].buffer,
-                    output_offset: refs[3].offset,
-                    output_length: refs[3].length,
-                    scratch_ptr: output_scratch.host_ptr,
-                    scratch_length: output_scratch_bytes,
-                    // No row padding to discard (see physical_pixel_count's
-                    // own comment) -- source and output pixel counts are the
-                    // same real `m`.
-                    source_pixel_count: m,
-                    output_pixel_count: m,
-                    bytes_per_pixel: output_bytes_per_pixel,
-                }),
+                output_compaction,
             });
         }
         UkernelShape::Pooling(shape) => {
@@ -1340,8 +1359,12 @@ unsafe extern "C" fn dispatch(
                 input_addr: addr(&refs[0]),
                 output_addr: addr(&refs[1]),
             };
+            let regcmd_tasks = PoolingPlan::new(*shape).programs_with_buffers(&bufs);
+            let retained_bindings = unsafe { retain_direct_bindings(refs) };
             cb.ops.push(RecordedOp::Dispatch {
-                regcmd_tasks: PoolingPlan::new(*shape).programs_with_buffers(&bufs),
+                regcmd_tasks,
+                retained_bindings,
+                scratch_buffers: Vec::new(),
                 in_bo_handles: vec![handle(&refs[0])],
                 out_bo_handles: vec![handle(&refs[1])],
                 input_packing: None,

@@ -47,9 +47,9 @@ pub struct RocketBuffer {
     pub host_ptr: *mut u8,
     pub fd: RawFd,
     /// Set by `device::queue_dealloca`. The real GEM allocation isn't freed
-    /// eagerly (see `destroy`'s TODO on explicit GEM_CLOSE) -- this is a
-    /// logical marker so further queue ops against an already-dealloca'd
-    /// buffer correctly fail (CTS's `QueueAllocaTest.DeallocaReleasesMemory`)
+    /// until the last retained HAL reference reaches `destroy`; this logical
+    /// marker makes further queue ops against an already-dealloca'd buffer
+    /// fail immediately (CTS's `QueueAllocaTest.DeallocaReleasesMemory`)
     /// instead of silently succeeding against memory the caller has already
     /// been told is gone.
     pub deallocated: std::sync::atomic::AtomicBool,
@@ -87,14 +87,10 @@ unsafe extern "C" fn recycle(buffer: *mut iree_hal_buffer_t) {
 
 unsafe extern "C" fn destroy(buffer: *mut iree_hal_buffer_t) {
     let buffer = unsafe { Box::from_raw(cast(buffer)) };
-    // TODO: no explicit DRM_IOCTL_GEM_CLOSE -- that's a generic DRM ioctl,
-    // not part of the 4-ioctl rocket-specific UAPI iree-rocket-hal's
-    // api.rs currently binds, and every hand-written test client in this
-    // project (rkt-basic.rs et al) also relies on implicit cleanup at
-    // process/fd-close time instead (see the harmless "Memory manager not
-    // clean during takedown" dmesg warning in NOTES.md). Add real
-    // GEM_CLOSE support to iree-rocket-hal if this ever needs to free
-    // buffers mid-process rather than at device teardown.
+    // The permanent CPU mapping and the DRM file's GEM handle hold
+    // independent references to the allocation. Release both; dropping only
+    // one leaves the GEM object, IOMMU mapping, and IOVA live until process or
+    // device teardown.
     if !buffer.host_ptr.is_null() && buffer.base.allocation_size > 0 {
         let _ = unsafe {
             nix::sys::mman::munmap(
@@ -103,6 +99,7 @@ unsafe extern "C" fn destroy(buffer: *mut iree_hal_buffer_t) {
             )
         };
     }
+    let _ = unsafe { device::close_bo(buffer.fd, buffer.handle) };
 }
 
 #[allow(unused_variables)]

@@ -1245,7 +1245,8 @@ unsafe extern "C" fn queue_execute(
                     for regcmd in regcmd_tasks {
                         let cmd_bytes = regcmd.len() * std::mem::size_of::<u64>();
                         let cmd_len = cmd_bytes.next_multiple_of(4096);
-                        cmd_bufs.push(unsafe { rocket_device::Buffer::new(fd, cmd_len, &d.file) });
+                        cmd_bufs
+                            .push(unsafe { rocket_device::OwnedBuffer::new(fd, cmd_len, &d.file) });
                     }
 
                     let mut task_descriptors = Vec::with_capacity(regcmd_tasks.len());

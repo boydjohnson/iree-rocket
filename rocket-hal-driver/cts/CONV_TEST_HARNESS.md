@@ -35,6 +35,11 @@ buffer binding order, NPU submission, and dense output compaction. The
 reference path indexes the logical tensors directly and has no dependency on
 the Rocket layouts or register-command builder.
 
+The harness releases its input, weight, and bias buffer references after
+recording and before queue submission. Correct execution therefore also checks
+the IREE HAL requirement that a command buffer retain every direct dispatch
+binding for its full lifetime.
+
 `conv_schema_harness_test.cc` shows the extension pattern. Add a
 `Conv2dProblem` to `INSTANTIATE_TEST_SUITE_P`; the deterministic tensor
 generators and the CPU route adapt to its geometry. Current cases cover 1x1,
