@@ -1309,7 +1309,7 @@ unsafe extern "C" fn dispatch(
             let planned = match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
                 let plan = ConvPlan::new(*shape, kernels);
                 if shape.precision.writes_accumulators() {
-                    let source_block_bytes = shape.output_channel_block_bytes() as usize;
+                    let source_block_bytes = shape.output_atom_bytes() as usize;
                     let padded_bytes_per_pixel = shape.padded_out_channels() as usize
                         * shape.precision.output_element_bytes() as usize;
                     let blocks_per_pixel = padded_bytes_per_pixel.div_ceil(source_block_bytes);
@@ -1379,7 +1379,7 @@ unsafe extern "C" fn dispatch(
                 output_width: shape.output_width(kernels) as usize,
                 bytes_per_pixel: shape.out_channels as usize
                     * shape.precision.output_element_bytes() as usize,
-                source_block_bytes: shape.output_channel_block_bytes() as usize,
+                source_block_bytes: shape.output_atom_bytes() as usize,
                 source_tiles,
             });
             let output_handle = scratch.handle;

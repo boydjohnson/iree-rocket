@@ -980,7 +980,10 @@ impl Shape {
     pub fn output_scratch_bytes(&self, kernels: Kernels) -> usize {
         let channel_bytes =
             self.padded_out_channels() as usize * self.precision.output_element_bytes() as usize;
-        let block_bytes = self.output_channel_block_bytes() as usize;
+        // The *write* atom, not the programmed block -- depthwise accumulator
+        // output writes 256-byte atoms, so sizing this at 128 left the DPU
+        // writing twice what was allocated. See `output_atom_bytes`.
+        let block_bytes = self.output_atom_bytes() as usize;
         let block_count = channel_bytes.div_ceil(block_bytes);
         self.output_width(kernels) as usize
             * self.output_height(kernels) as usize
@@ -1217,6 +1220,34 @@ impl Shape {
         } else {
             FEATURE_ATOM_BYTES
         }
+    }
+
+    /// Bytes one pixel occupies in one hardware output atom, as the host must
+    /// read the result back.
+    ///
+    /// Deliberately distinct from [`Shape::output_channel_block_bytes`],
+    /// which is what the DPU is *programmed* with. The two agree everywhere
+    /// except depthwise accumulator output, where the write atom is twice the
+    /// programmed block: the depthwise DPU processes 64 int8 channels per
+    /// pass -- the same 64-channel coefficient group
+    /// `pack_depthwise_to_rocket_weights` writes -- and emits all 64 i32
+    /// lanes of a pixel contiguously, so its surface stride advances every
+    /// 256 bytes rather than every 128.
+    ///
+    /// Established on RK3588 with an identity depthwise filter, whose output
+    /// must equal its input: the returned block permutation is reproduced
+    /// exactly, at 32x32x64, 32x32x128 and 17x13x64, by "surface-major over
+    /// 256-byte atoms" and by nothing else. The dense accumulator path was
+    /// measured the same way at the identical shape (32x32, Cin = Cout = 64,
+    /// 1x1, so the *only* difference is `depthwise`) and is exact with the
+    /// 128-byte atom, which is why this is conditioned on `depthwise` rather
+    /// than widened for all accumulator output.
+    pub fn output_atom_bytes(&self) -> u32 {
+        if self.depthwise && self.precision.writes_accumulators() {
+            return 2 * self.precision.out_channel_granule()
+                * self.precision.output_element_bytes();
+        }
+        self.output_channel_block_bytes()
     }
 
     /// CBUF banks the feature data would take if nothing competed for them.

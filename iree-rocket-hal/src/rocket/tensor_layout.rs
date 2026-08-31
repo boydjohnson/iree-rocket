@@ -22,10 +22,21 @@ pub const WEIGHT_ATOMIC_BYTES: usize = 32;
 /// hardware output kernels.
 pub const WEIGHT_INPUT_GROUP_CHANNELS: usize = 32;
 
-/// Depthwise int8 coefficients use half the fp16 input-group width. This is
-/// distinct from the dense coefficient grouping, which remains 32 channels
-/// for int8; it is a depthwise DPU serialization rule.
-const DEPTHWISE_INT8_GROUP_CHANNELS: usize = 16;
+/// Physical byte width of one depthwise coefficient group.
+///
+/// The depthwise DPU serializes coefficients tap-major within a fixed 64-byte
+/// group, so the group holds a precision-dependent number of *channels*: 32
+/// at fp16 and 64 at int8. This is deliberately a byte width rather than a
+/// channel count -- an int8-specific channel constant read naturally but
+/// invited the wrong value, and a wrong one is close to invisible (a
+/// uniform-weight probe cannot see a tap permutation at all).
+///
+/// Confirmed on RK3588 by delta-function probe: with a single nonzero tap,
+/// output channels 0..15, 16..31, 32..47 and 48..63 came back shifted by taps
+/// 0, 2, 4 and 6 respectively under the previous 16-channel rule, which
+/// solves to an address function of `tap * 64 + channel` -- one contiguous
+/// run of all 64 int8 channels per tap.
+const DEPTHWISE_GROUP_BYTES: usize = 64;
 
 /// Returns the storage needed for an FP16 BRDMA bias operand stream.
 ///
@@ -477,11 +488,7 @@ pub fn pack_depthwise_to_rocket_weights(
 
     packed[..packed_len].fill(0);
 
-    let group_channels = if element_size == 1 {
-        DEPTHWISE_INT8_GROUP_CHANNELS
-    } else {
-        WEIGHT_INPUT_GROUP_CHANNELS
-    };
+    let group_channels = DEPTHWISE_GROUP_BYTES / element_size;
     let full_groups = padded_channels / group_channels;
     let tail_width = padded_channels - full_groups * group_channels;
 
@@ -893,30 +900,78 @@ mod tests {
         }
     }
 
+    /// Int8 depthwise groups 64 channels, not 16.
+    ///
+    /// This test previously asserted a 16-channel group, and that was wrong
+    /// on hardware. A delta-function probe on RK3588 (single nonzero tap,
+    /// `Cin` 64, 3x3, `padding = [0, 0]`) came back with output channels
+    /// 0..15, 16..31, 32..47 and 48..63 shifted by taps 0, 2, 4 and 6 -- an
+    /// arithmetic progression that solves for exactly one address function,
+    /// `tap * 64 + channel`. Nothing caught it earlier because the only
+    /// hardware coverage of this path used uniform all-ones weights, which
+    /// cannot observe a tap permutation at all, and because every unit test
+    /// here checked the packer against the same assumed constant rather than
+    /// against the hardware.
+    ///
+    /// `channels = 64` is deliberately one full group, and the case below
+    /// covers a short final group.
     #[test]
-    fn int8_depthwise_packing_uses_sixteen_channel_groups() {
-        let (channels, kh, kw) = (32usize, 3usize, 3usize);
+    fn int8_depthwise_packing_uses_sixty_four_channel_groups() {
+        let (channels, kh, kw) = (64usize, 3usize, 3usize);
         let mut dense = vec![0u8; channels * kh * kw];
         for channel in 0..channels {
             for tap in 0..kh * kw {
-                dense[channel * kh * kw + tap] = if channel < 16 {
-                    (tap + 1) as u8
-                } else {
-                    (100 + tap) as u8
-                };
+                // Distinct per (channel, tap) modulo 256 -- 9 taps and 64
+                // channels fit without aliasing.
+                dense[channel * kh * kw + tap] = (channel * 4 + tap) as u8;
             }
         }
         let mut packed = vec![0xffu8; channels * kh * kw];
-        pack_depthwise_to_rocket_weights(&dense, kh, kw, channels, channels, 1, &mut packed)
-            .expect("packing failed");
+        let written =
+            pack_depthwise_to_rocket_weights(&dense, kh, kw, channels, channels, 1, &mut packed)
+                .expect("packing failed");
+        assert_eq!(written, kh * kw * channels);
 
-        // Int8 depthwise has two 16-channel groups. The second tap of
-        // channel 0 follows the first group's 16-channel row, not channel
-        // 16's first tap as it would under the fp16 grouping.
-        assert_eq!(packed[0], 1);
-        assert_eq!(packed[16], 2);
-        assert_eq!(packed[16 * 9], 100);
-        assert_eq!(packed[16 * 9 + 16], 101);
+        // One contiguous run of all 64 channels per tap.
+        for tap in 0..kh * kw {
+            for channel in 0..channels {
+                assert_eq!(
+                    packed[tap * channels + channel],
+                    (channel * 4 + tap) as u8,
+                    "tap {tap} channel {channel}"
+                );
+            }
+        }
+    }
+
+    /// The int8 tail group, which the 64-channel case above cannot reach:
+    /// `Cin` 48 pads to 48, leaving a single short group of width 48 rather
+    /// than a full 64. Same address function, narrower run.
+    #[test]
+    fn int8_depthwise_packing_handles_a_short_final_group() {
+        let (channels, padded, kh, kw) = (48usize, 48usize, 3usize, 3usize);
+        let mut dense = vec![0u8; channels * kh * kw];
+        for channel in 0..channels {
+            for tap in 0..kh * kw {
+                dense[channel * kh * kw + tap] = (channel * 4 + tap) as u8;
+            }
+        }
+        let mut packed = vec![0xffu8; kh * kw * padded];
+        let written =
+            pack_depthwise_to_rocket_weights(&dense, kh, kw, channels, padded, 1, &mut packed)
+                .expect("packing failed");
+        assert_eq!(written, kh * kw * padded);
+
+        for tap in 0..kh * kw {
+            for channel in 0..padded {
+                let want = if channel < channels {
+                    (channel * 4 + tap) as u8
+                } else {
+                    0
+                };
+                assert_eq!(packed[tap * padded + channel], want, "tap {tap} channel {channel}");
+            }
+        }
     }
 
     /// The two tests above never leave a single 32-channel group, so they

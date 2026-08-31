@@ -2,6 +2,14 @@
 //!
 //! This intentionally bypasses the driver compaction layer. It makes the
 //! channel/tap layout observable before comparing it with the dense ABI.
+//!
+//! It is a probe, not a check, and it is much weaker than it looks: the input
+//! is constant across space and the filter is all ones, so neither a tap
+//! permutation nor a spatial one changes anything it prints. Two real bugs
+//! (see `conv_depthwise_int8_exact_hw.rs`) lived under this probe while it
+//! kept reporting the expected `9 * (c + 1)` per channel. Treat a clean run
+//! here as evidence about channel *ordering* and magnitude only, and put
+//! correctness assertions in `conv_depthwise_int8_exact_hw.rs` instead.
 
 use std::{fs::OpenOptions, mem, os::unix::io::AsRawFd, ptr};
 

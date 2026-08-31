@@ -19,6 +19,7 @@ import argparse
 import json
 import os
 from pathlib import Path
+import re
 import shlex
 import subprocess
 import sys
@@ -250,12 +251,17 @@ def compile_modules(work_dir: Path, compiler: Path, transform_spec: Path) -> Non
     # Without this, a case whose shape quietly stops matching its matcher
     # would still "pass": it would just run entirely on the CPU on both
     # sides of the differential and agree with itself.
+    # Matched with a negative lookahead rather than `in`: the stride-1
+    # depthwise name is a prefix of the stride-2 one, so a plain substring
+    # test for it can never fail -- the stride-2 executable alone satisfies
+    # it. That silently defeated this check, whose whole job is to notice a
+    # case that stopped reaching its matcher.
     for executable in (
         b"rocket_dynamic_int8_executable",
         b"rocket_dynamic_depthwise_int8_executable",
         b"rocket_dynamic_depthwise_int8_executable_s2",
     ):
-        if executable not in rocket_bytes:
+        if not re.search(re.escape(executable) + rb"(?!_s2)", rocket_bytes):
             raise SystemExit(
                 f"compiled module has no {executable.decode()}: the int8 case for it "
                 "no longer reaches a Rocket matcher, so the gate would test nothing"
