@@ -22,6 +22,11 @@ pub const WEIGHT_ATOMIC_BYTES: usize = 32;
 /// hardware output kernels.
 pub const WEIGHT_INPUT_GROUP_CHANNELS: usize = 32;
 
+/// Depthwise int8 coefficients use half the fp16 input-group width. This is
+/// distinct from the dense coefficient grouping, which remains 32 channels
+/// for int8; it is a depthwise DPU serialization rule.
+const DEPTHWISE_INT8_GROUP_CHANNELS: usize = 16;
+
 /// Returns the storage needed for an FP16 BRDMA bias operand stream.
 ///
 /// FP16 enables only the BS ALU operand (`brdma_data_use = 1`), but that
@@ -386,21 +391,20 @@ fn pack_hwcf_to_rocket_weights_impl(
 /// A depthwise filter is `[channels][filter_height][filter_width]` -- one
 /// `kh x kw` kernel per input channel, with no `(input, output)` pairing at
 /// all. The hardware wants it **tap-major within a channel group**: channels
-/// are chunked into groups of [`WEIGHT_INPUT_GROUP_CHANNELS`] (32 -- the
-/// same fixed grouping [`pack_hwcf_to_rocket_weights`]'s dense path already
-/// uses, for both precisions), and every group's own 9 taps sit contiguously
+/// FP16 groups are 32 channels; int8 groups are 16 channels. Every group's
+/// own taps sit contiguously before the next group starts. This differs from
+/// the dense coefficient grouping, which is 32 channels for both precisions.
 /// before the next group starts:
 ///
 /// ```text
 /// slot = group_base(channel)
 ///      + (ky * filter_width + kx) * group_width(channel)
-///      + (channel % WEIGHT_INPUT_GROUP_CHANNELS)
+///      + (channel % group_width)
 /// ```
 ///
-/// where `group_base` is the running element offset of that channel's group
-/// (`group * filter_height * filter_width * WEIGHT_INPUT_GROUP_CHANNELS`),
-/// and `group_width` is 32 for every group except a final, shorter one when
-/// `padded_channels` isn't a whole multiple of 32 (then it's the remainder).
+/// where `group_base` is the running element offset of that channel's group,
+/// and `group_width` is the precision-specific group width except a final,
+/// shorter one when `padded_channels` isn't a whole multiple of it.
 /// This is the transpose of how torch and ONNX store a depthwise filter, and
 /// nothing like `pack_hwcf_to_rocket_weights`'s own blocked dense order.
 ///
@@ -421,9 +425,9 @@ fn pack_hwcf_to_rocket_weights_impl(
 /// exact groups), and 144 (4 full groups plus a genuine 16-wide tail group).
 /// All three matched this formula bit-for-bit and none matched the old flat
 /// one. Only fp16 has been checked this way; int8 reuses
-/// [`WEIGHT_INPUT_GROUP_CHANNELS`] on the working assumption that it shares
-/// the dense path's precision-independent grouping (true there), not its
-/// own hardware confirmation.
+/// The int8 width was confirmed by the raw accumulator probe: packing it as
+/// fp16's 32-channel groups makes channel 0 sum taps 1,1,2,2,...,5 instead of
+/// 1..9. The dense path's grouping remains unchanged.
 ///
 /// `padded_channels` is the count the register program's
 /// `CNA_WEIGHT_SIZE0.weight_bytes` is sized from -- [`Shape::weight_bytes`]
@@ -473,18 +477,23 @@ pub fn pack_depthwise_to_rocket_weights(
 
     packed[..packed_len].fill(0);
 
-    let full_groups = padded_channels / WEIGHT_INPUT_GROUP_CHANNELS;
-    let tail_width = padded_channels - full_groups * WEIGHT_INPUT_GROUP_CHANNELS;
+    let group_channels = if element_size == 1 {
+        DEPTHWISE_INT8_GROUP_CHANNELS
+    } else {
+        WEIGHT_INPUT_GROUP_CHANNELS
+    };
+    let full_groups = padded_channels / group_channels;
+    let tail_width = padded_channels - full_groups * group_channels;
 
     for channel in 0..channels {
-        let group = channel / WEIGHT_INPUT_GROUP_CHANNELS;
-        let channel_in_group = channel % WEIGHT_INPUT_GROUP_CHANNELS;
+        let group = channel / group_channels;
+        let channel_in_group = channel % group_channels;
         let group_width = if group < full_groups {
-            WEIGHT_INPUT_GROUP_CHANNELS
+            group_channels
         } else {
             tail_width
         };
-        let group_base = group * filter_height * filter_width * WEIGHT_INPUT_GROUP_CHANNELS;
+        let group_base = group * filter_height * filter_width * group_channels;
         for ky in 0..filter_height {
             for kx in 0..filter_width {
                 let from = ((channel * filter_height + ky) * filter_width + kx) * element_size;
@@ -882,6 +891,32 @@ mod tests {
                 }
             }
         }
+    }
+
+    #[test]
+    fn int8_depthwise_packing_uses_sixteen_channel_groups() {
+        let (channels, kh, kw) = (32usize, 3usize, 3usize);
+        let mut dense = vec![0u8; channels * kh * kw];
+        for channel in 0..channels {
+            for tap in 0..kh * kw {
+                dense[channel * kh * kw + tap] = if channel < 16 {
+                    (tap + 1) as u8
+                } else {
+                    (100 + tap) as u8
+                };
+            }
+        }
+        let mut packed = vec![0xffu8; channels * kh * kw];
+        pack_depthwise_to_rocket_weights(&dense, kh, kw, channels, channels, 1, &mut packed)
+            .expect("packing failed");
+
+        // Int8 depthwise has two 16-channel groups. The second tap of
+        // channel 0 follows the first group's 16-channel row, not channel
+        // 16's first tap as it would under the fp16 grouping.
+        assert_eq!(packed[0], 1);
+        assert_eq!(packed[16], 2);
+        assert_eq!(packed[16 * 9], 100);
+        assert_eq!(packed[16 * 9 + 16], 101);
     }
 
     /// The two tests above never leave a single 32-channel group, so they

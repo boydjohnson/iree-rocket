@@ -1136,14 +1136,14 @@ unsafe extern "C" fn dispatch(
                 );
                 scratch_buffers.push(scratch);
                 packed
-            } else if shape.precision == Precision::Fp16 && shape.depthwise {
+            } else if shape.depthwise {
                 // One filter per input channel -- no Cout factor, unlike
                 // the dense branch above. The compiler-emitted dispatch
-                // (transform.0.mlir's call_rocket_dynamic_depthwise_conv2d)
-                // transposes the filter to [Cin][kh][kw] before this
-                // binding is populated, matching what
-                // pack_depthwise_to_rocket_weights expects -- see that
-                // function's doc comment.
+                // (transform.0.mlir's depthwise matcher) supplies the
+                // logical [Cin][kh][kw] filter, which must be packed into
+                // the tap-major, grouped-CNA order for both FP16 and int8.
+                // Int8 used to fall through to the un-packed buffer here,
+                // producing hardware-only corruption while FP16 passed.
                 if !matches!(
                     kernels[0]
                     .checked_mul(kernels[1])
@@ -1180,7 +1180,12 @@ unsafe extern "C" fn dispatch(
                         element_size,
                         depthwise: true,
                         padded_channels: shape.depthwise_padded_channels() as usize,
-                        weight_zero_point: None,
+                        weight_zero_point: match shape.precision {
+                            Precision::Fp16 => None,
+                            Precision::Int8(q) | Precision::Int8Accumulator(q) => {
+                                Some(q.weight_zero_point as i8)
+                            }
+                        },
                     }),
                 );
                 scratch_buffers.push(scratch);

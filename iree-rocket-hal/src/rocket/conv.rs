@@ -3344,6 +3344,8 @@ fn conv_2d_tile_program(
         // against the dense 512.
         Register::<DpuSurfaceAdd>::new()
             .surf_add(Bits::new(if accumulator_output {
+                // Accumulator output serializes its 32-lane blocks with the
+                // fixed hardware value 16 in both dense and depthwise mode.
                 16
             } else {
                 full_out_width * out_height * 2 * if shape.depthwise { 2 } else { 1 }
