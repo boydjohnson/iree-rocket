@@ -26,24 +26,54 @@ flatbuffer_c_library(
   PUBLIC
 )
 
+set(_ROCKET_SRCS
+  "RocketAnnotateFinalPlacementPass.cpp"
+  "RocketAnnotateOriginalPlacementPass.cpp"
+  "RocketTarget.cpp"
+  "RocketTransposeQuantizedConvPass.cpp"
+)
+set(_ROCKET_DEPS
+  LLVMSupport
+  MLIRIR
+  MLIRLinalgDialect
+  MLIRPass
+  MLIRSupport
+  MLIRTensorDialect
+  MLIRTransforms
+  iree::compiler::Dialect::HAL::IR
+  iree::compiler::Dialect::HAL::Target
+  iree::compiler::PluginAPI
+  iree::compiler::Utils
+  ::RocketExecutableDef
+)
+set(_ROCKET_DEFINES)
+
+# onnx.ConvInteger has no torch-mlir lowering, so the Rocket plugin supplies
+# its own expansion (RocketExpandOnnxConvIntegerPass.cpp) -- but only when the
+# in-tree Torch input plugin is being built, since that is what provides the
+# torch dialect the pass rewrites. torch-iree_compiler_defs is the Torch
+# plugin's own INTERFACE target, and carries the include root for the
+# tablegen-generated torch op headers alongside torch-mlir's include/ tree.
+if(IREE_INPUT_TORCH)
+  list(APPEND _ROCKET_SRCS "RocketExpandOnnxConvIntegerPass.cpp")
+  list(APPEND _ROCKET_DEPS
+    torch-iree_compiler_defs
+    iree::compiler::plugins::input::Torch::torch-mlir::TorchDialectIR
+  )
+  list(APPEND _ROCKET_DEFINES "ROCKET_ENABLE_ONNX_INPUT")
+endif()
+
 iree_cc_library(
   NAME
     Rocket
+  HDRS
+    "RocketPasses.h"
   SRCS
-    "RocketAnnotateFinalPlacementPass.cpp"
-    "RocketAnnotateOriginalPlacementPass.cpp"
-    "RocketTarget.cpp"
+    ${_ROCKET_SRCS}
   DEPS
-    LLVMSupport
-    MLIRIR
-    MLIRLinalgDialect
-    MLIRPass
-    MLIRSupport
-    iree::compiler::Dialect::HAL::IR
-    iree::compiler::Dialect::HAL::Target
-    iree::compiler::PluginAPI
-    iree::compiler::Utils
-    ::RocketExecutableDef
+    ${_ROCKET_DEPS}
+  DEFINES
+    ${_ROCKET_DEFINES}
   ALWAYSLINK
   PUBLIC
 )

@@ -44,6 +44,9 @@
 #include <utility>
 #include <vector>
 
+#ifdef ROCKET_ENABLE_ONNX_INPUT
+#include "RocketPasses.h"
+#endif // ROCKET_ENABLE_ONNX_INPUT
 #include "iree/compiler/Dialect/HAL/Target/TargetBackend.h"
 #include "iree/compiler/Dialect/HAL/Target/TargetRegistry.h"
 #include "iree/compiler/PluginAPI/Client.h"
@@ -639,6 +642,21 @@ struct RocketSession final
       return std::make_shared<RocketTargetBackend>(options);
     });
   }
+
+#ifdef ROCKET_ENABLE_ONNX_INPUT
+  void extendInputConversionPreprocessingPassPipeline(
+      OpPassManager &passManager,
+      InputDialectOptions::Type inputType) override {
+    // This hook is the only place upstream of the torch plugin's onnx->torch
+    // conversion, which is where onnx.ConvInteger has to be rewritten: by the
+    // time --iree-preprocessing-pass-pipeline runs, the unconverted
+    // torch.operator has already failed to legalize. The enum cannot
+    // distinguish "onnx" from any other plugin-provided input type (they all
+    // arrive as Type::plugin), so the pass is added for every input type and
+    // no-ops when the module holds no onnx.ConvInteger.
+    passManager.addPass(createRocketExpandOnnxConvIntegerPass());
+  }
+#endif // ROCKET_ENABLE_ONNX_INPUT
 };
 
 } // namespace

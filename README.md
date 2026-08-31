@@ -15,6 +15,7 @@ for the Rocket NPU backend (RK3588). This repository produces:
 | [`iree-rocket-hal`](iree-rocket-hal) | Low-level Rust crate: ioctl/mmap access to the RK3588 NPU and register command building. |
 | [`rocket-hal-driver`](rocket-hal-driver) | Rust `staticlib` implementing IREE's HAL driver interface, statically linked into IREE via `iree_register_external_hal_driver()`. Depends on `iree-rocket-hal` and `rocket-schema`. Includes HAL CTS wiring under `cts/`. |
 | [`rocket-compiler-plugin`](rocket-compiler-plugin) | C++ IREE compiler target plugin ("Rocket"), loaded via `IREE_CMAKE_PLUGIN_PATHS`. Serializes executables using `rocket-schema`'s FlatBuffer format. |
+| [`rocket-compiler`](rocket-compiler) | Rust driver over `libIREECompiler.so`. Applies the Rocket transform spec and the device flags it expects, and can audit what ended up on the NPU. |
 | `iree-build/iree-src` | `iree-org/iree` as a pinned git submodule. |
 | `iree-build` | CMake configuration used to build IREE with the Rocket driver/plugin. |
 
@@ -57,6 +58,44 @@ builds above:
 cargo build --workspace
 cargo test --workspace
 ```
+
+## Compiling a model
+
+`rocket-compiler` wraps `libIREECompiler.so` with the Rocket transform spec and
+the device flags that spec hardcodes, so a model does not have to be compiled
+by hand:
+
+```sh
+export IREE_COMPILER_LIB=iree-build/build/lib/libIREECompiler.so
+cargo run -p rocket-compiler -- compile --input model.mlir --output model.vmfb
+
+# What actually ended up on the NPU:
+cargo run -p rocket-compiler -- audit --input model.mlir
+```
+
+`audit` reports both executable and dispatch-site counts. Dispatch sites are
+the number that answers "how much of the model ran on the NPU": the transform
+spec routes every matched convolution through a handful of fixed executables,
+so an executable count alone understates NPU placement badly, while IREE
+deduplicates identical CPU dispatches, which overstates the CPU side.
+
+### ONNX models
+
+Pin the batch dimension before importing. `iree-import-onnx` will happily
+import a model whose batch is a symbolic `dim_param`, but the Rocket ABI fixes
+batch at one and every matcher in the transform spec requires it, so a
+dynamic-batch model compiles cleanly and offloads **nothing**. Clear each
+`dim_param` on the graph inputs and outputs to 1, drop `graph.value_info`, and
+re-run `shape_inference.infer_shapes` before `iree-import-onnx`.
+
+int8 models quantized with ONNX Runtime's `quantize_dynamic` are supported.
+They import as `onnx.ConvInteger`, which upstream torch-mlir cannot lower at
+all -- `RocketExpandOnnxConvIntegerPass` in the compiler plugin supplies the
+expansion, so these models need this repository's `iree-compile`, not a stock
+one. Their convolutions reach the NPU through the `int8_accumulator` precision
+(int8 in, int32 accumulator out, requantization bypassed); the transform spec
+folds the activation zero point into a CPU-side correction first, because that
+hardware mode is only validated for zero zero-points.
 
 ## Board convolution regression gate
 
