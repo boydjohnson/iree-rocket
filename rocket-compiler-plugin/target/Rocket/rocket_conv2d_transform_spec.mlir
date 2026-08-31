@@ -3007,8 +3007,13 @@ module attributes {transform.with_named_sequence} {
   // identically), `feature_grains` (swept 1..40), `data_entries` (matches
   // the vendor capture for this exact shape), and the packed feature width.
   //
-  // The Cout bound is still the inherited 512: every sweep above held
-  // Cout = 64, so Cout is uncharacterized for int8 rather than validated.
+  // The Cout bound remains 512. It is now hardware-validated in isolation by
+  // tools/e2e_conv_regression.py's exact compiled differentials: both 1x1 and
+  // 3x3 at Cin=16, Cout=512, 32x32 output and non-zero input zero points
+  // matched all 524288 i32 accumulators exactly on RK3588 (2026-08-31). This
+  // does not weaken either Cin cap above or claim unmeasured high-Cin/high-Cout
+  // interactions are safe; it establishes that Cout=512 itself is not a
+  // failure trigger at a low, independently safe Cin.
   //
   // The depthwise int8 matchers keep umax = 512 and are correct across it.
   // They briefly were not: Cin whose *atom* count (ceil(Cin/16)) was one

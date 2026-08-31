@@ -89,6 +89,29 @@ func.func @dense_int8_3x3(%input: tensor<1x32x34x34xi8>, %filter: tensor<64x32x3
   return %0 : tensor<1x64x32x32xi32>
 }
 
+// These two cases isolate the matcher's currently accepted Cout=512 edge.
+// Cin stays deliberately small so a failure characterizes the output-channel
+// limit rather than either of the independently measured Cin limits above.
+func.func @dense_int8_cout512_1x1(%input: tensor<1x16x32x32xi8>, %filter: tensor<512x16x1x1xi8>, %init: tensor<1x512x32x32xi32>) -> tensor<1x512x32x32xi32> {
+  %izp = arith.constant 13 : i32
+  %kzp = arith.constant 0 : i32
+  %0 = linalg.conv_2d_nchw_fchw_q
+      {dilations = dense<1> : tensor<2xi64>, strides = dense<1> : tensor<2xi64>}
+      ins(%input, %filter, %izp, %kzp : tensor<1x16x32x32xi8>, tensor<512x16x1x1xi8>, i32, i32)
+      outs(%init : tensor<1x512x32x32xi32>) -> tensor<1x512x32x32xi32>
+  return %0 : tensor<1x512x32x32xi32>
+}
+
+func.func @dense_int8_cout512_3x3(%input: tensor<1x16x34x34xi8>, %filter: tensor<512x16x3x3xi8>, %init: tensor<1x512x32x32xi32>) -> tensor<1x512x32x32xi32> {
+  %izp = arith.constant -9 : i32
+  %kzp = arith.constant 0 : i32
+  %0 = linalg.conv_2d_nchw_fchw_q
+      {dilations = dense<1> : tensor<2xi64>, strides = dense<1> : tensor<2xi64>}
+      ins(%input, %filter, %izp, %kzp : tensor<1x16x34x34xi8>, tensor<512x16x3x3xi8>, i32, i32)
+      outs(%init : tensor<1x512x32x32xi32>) -> tensor<1x512x32x32xi32>
+  return %0 : tensor<1x512x32x32xi32>
+}
+
 func.func @depthwise_int8(%input: tensor<1x34x34x64xi8>, %filter: tensor<3x3x64xi8>, %init: tensor<1x32x32x64xi32>) -> tensor<1x32x32x64xi32> {
   %izp = arith.constant -5 : i32
   %kzp = arith.constant 0 : i32
@@ -223,6 +246,20 @@ def write_compiled_fixture(work_dir: Path) -> None:
         np.zeros((1, 64, 32, 32), dtype=np.int32),
     )
 
+    np.save(work_dir / "dense_int8_cout512_1x1_input.npy", i8(1, 16, 32, 32))
+    np.save(work_dir / "dense_int8_cout512_1x1_kernel.npy", i8(512, 16, 1, 1))
+    np.save(
+        work_dir / "dense_int8_cout512_1x1_init.npy",
+        np.zeros((1, 512, 32, 32), dtype=np.int32),
+    )
+
+    np.save(work_dir / "dense_int8_cout512_3x3_input.npy", i8(1, 16, 34, 34))
+    np.save(work_dir / "dense_int8_cout512_3x3_kernel.npy", i8(512, 16, 3, 3))
+    np.save(
+        work_dir / "dense_int8_cout512_3x3_init.npy",
+        np.zeros((1, 512, 32, 32), dtype=np.int32),
+    )
+
     np.save(work_dir / "depthwise_int8_input.npy", i8(1, 34, 34, 64))
     np.save(work_dir / "depthwise_int8_kernel.npy", i8(3, 3, 64))
     np.save(
@@ -285,19 +322,24 @@ def compile_modules(work_dir: Path, compiler: Path, transform_spec: Path) -> Non
         ]
     )
     preprocessing_text = preprocessing.read_text()
-    dense_3x3 = re.search(
-        r"util\.func public @dense_int8_3x3\b(?P<body>.*?)"
-        r"(?=\n\s*util\.func (?:public|private) @|\Z)",
-        preprocessing_text,
-        re.DOTALL,
-    )
-    if dense_3x3 is None or "util.call @call_rocket_dynamic_conv2d_int8" not in dense_3x3.group(
-        "body"
+    for function in (
+        "dense_int8_3x3",
+        "dense_int8_cout512_1x1",
+        "dense_int8_cout512_3x3",
     ):
-        raise SystemExit(
-            "dense_int8_3x3 no longer reaches its Rocket matcher; refusing to run "
-            "a CPU-versus-CPU differential"
+        match = re.search(
+            rf"util\.func public @{re.escape(function)}\b(?P<body>.*?)"
+            r"(?=\n\s*util\.func (?:public|private) @|\Z)",
+            preprocessing_text,
+            re.DOTALL,
         )
+        if match is None or "util.call @call_rocket_dynamic_conv2d_int8" not in match.group(
+            "body"
+        ):
+            raise SystemExit(
+                f"{function} no longer reaches its Rocket matcher; refusing to run "
+                "a CPU-versus-CPU differential"
+            )
     rocket_bytes = (work_dir / "rocket.vmfb").read_bytes()
     if b"rocket-flatbuffer-v1" not in rocket_bytes or b"RKT1" not in rocket_bytes:
         raise SystemExit("compiled module contains no serialized Rocket executable")
@@ -452,6 +494,24 @@ def run_compiled_gate(
             "dense_int8_3x3_kernel.npy",
             "dense_int8_3x3_init.npy",
             "dense_int8_3x3_out_rocket.npy",
+            0.0,
+            0.0,
+        ),
+        (
+            "dense_int8_cout512_1x1",
+            "dense_int8_cout512_1x1_input.npy",
+            "dense_int8_cout512_1x1_kernel.npy",
+            "dense_int8_cout512_1x1_init.npy",
+            "dense_int8_cout512_1x1_out_rocket.npy",
+            0.0,
+            0.0,
+        ),
+        (
+            "dense_int8_cout512_3x3",
+            "dense_int8_cout512_3x3_input.npy",
+            "dense_int8_cout512_3x3_kernel.npy",
+            "dense_int8_cout512_3x3_init.npy",
+            "dense_int8_cout512_3x3_out_rocket.npy",
             0.0,
             0.0,
         ),
