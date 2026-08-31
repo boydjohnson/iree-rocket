@@ -772,6 +772,27 @@ fn int8_accumulator_k1_cin_boundary_cases() -> Vec<Conv2dCase> {
 /// * odd 9x7 output extents leave the final logical accumulator(s) unwritten;
 /// * several small-Cin shapes corrupt most values at exact 32-lane block
 ///   boundaries.
+/// Re-measured on `planck` 2026-08-31, each case alone in a fresh process
+/// via `ROCKET_PROBE_ONLY` -- the only way to get an uncontaminated verdict,
+/// since a case's result shifts with what ran before it. Counts below are
+/// isolated runs on a healthy device; two entries turned out not to be
+/// limitations at all:
+///
+///   * `Cin=3  Cout=1  1x1` -- fails 12/12. Real.
+///   * `Cin=3  Cout=31 3x3` -- fails 12/12. Real.
+///   * `Cin=3  Cout=32 3x3` -- fails 12/12. Real.
+///   * `Cin=3  Cout=33 3x3` -- **passes 48/54**. Every one of the six
+///     failures landed in a window right after a heavy failing sweep, so
+///     this is device contamination, not a shape limit.
+///   * `Cin=5  Cout=64 1x1` -- **passes 37/37**. Not a limitation; it only
+///     ever failed as the fifth case of a sweep.
+///   * `Cin=5  Cout=65 1x1` -- fails 12/12. Real.
+///
+/// The four real failures and the two passes fit one rule: the accumulator
+/// output path wants exactly two 128-byte output surfaces. Cout 33..=64
+/// gives two and passes; Cout <= 32 gives one and Cout=65 gives three, and
+/// both fail. Untested outside these six points -- it is a hypothesis that
+/// fits them, not a measured law.
 fn int8_accumulator_known_limitation_cases() -> Vec<Conv2dCase> {
     let mut cases = Vec::new();
     for (cin, cout, kernel) in [
@@ -1057,6 +1078,21 @@ fn probe_resume_index() -> usize {
         .unwrap_or(0)
 }
 
+/// Case index to run entirely on its own, for an uncontaminated verdict on a
+/// single shape.
+///
+/// Results in these sweeps are order dependent -- a case can pass when it
+/// runs first and fail from the same sweep a few cases later -- so the only
+/// trustworthy measurement of one shape is that shape running first in a
+/// fresh process. Loop this over the indices, several passes each, rather
+/// than reading one row out of one sweep. Takes precedence over
+/// `ROCKET_PROBE_RESUME_AT`.
+fn probe_only_index() -> Option<usize> {
+    std::env::var("ROCKET_PROBE_ONLY")
+        .ok()
+        .and_then(|value| value.parse().ok())
+}
+
 /// A shape well inside the known-good region, used to prove the device is
 /// still healthy. Dense signed K1 accumulator at Cin=64 passes on any
 /// healthy RK3588, so a failure here is a statement about the *device*
@@ -1121,12 +1157,17 @@ fn run_hardware_case_matrix(title: &str, cases: Vec<Conv2dCase>) {
         .open(DEVICE_PATH)
         .expect("failed to open RK3588 NPU device");
     let resume = probe_resume_index();
+    let only = probe_only_index();
     let mut failures = Vec::new();
     let mut sick_after = None;
+    let mut attempted = 0usize;
+    let mut skipped = 0usize;
 
     println!("\n=== {title} ===");
-    if resume != 0 {
-        println!("  resuming at index {resume} of {total_cases}");
+    match only {
+        Some(index) => println!("  running index {index} of {total_cases} on its own"),
+        None if resume != 0 => println!("  resuming at index {resume} of {total_cases}"),
+        None => {}
     }
 
     if !accumulator_canary_passes(&file) {
@@ -1139,9 +1180,15 @@ fn run_hardware_case_matrix(title: &str, cases: Vec<Conv2dCase>) {
     }
 
     for (index, case) in cases.into_iter().enumerate() {
-        if index < resume {
+        let wanted = match only {
+            Some(only) => index == only,
+            None => index >= resume,
+        };
+        if !wanted {
+            skipped += 1;
             continue;
         }
+        attempted += 1;
         let label = case.label();
         let result = catch_unwind(AssertUnwindSafe(|| {
             let fixture = build_fixture(case)?;
@@ -1185,11 +1232,7 @@ fn run_hardware_case_matrix(title: &str, cases: Vec<Conv2dCase>) {
         }
     }
 
-    let not_run = match sick_after {
-        Some(index) => total_cases - index - 1,
-        None => 0,
-    };
-    let attempted = total_cases - resume.min(total_cases) - not_run;
+    let not_run = total_cases - attempted - skipped;
 
     println!("\n=== {title} summary ===");
     println!(
@@ -1197,8 +1240,8 @@ fn run_hardware_case_matrix(title: &str, cases: Vec<Conv2dCase>) {
         attempted - failures.len()
     );
     println!("  failed: {}", failures.len());
-    if resume != 0 {
-        println!("  skipped before resume: {resume}");
+    if skipped != 0 {
+        println!("  skipped: {skipped}");
     }
     if sick_after.is_some() {
         println!("  not run (device went sick): {not_run}");
