@@ -15,30 +15,30 @@
 // matcher cannot silently route a known-bad convolution to Rocket, and
 // tightening one cannot silently lose the largest measured-good shape.
 
-// CHECK-LABEL: util.func public @dense_1x1_cin_384_matched
+// CHECK-LABEL: util.func public @dense_1x1_cin_352_matched
 // CHECK-NOT: linalg.conv_2d_nhwc_hwcf
 // CHECK: util.call @call_rocket_dynamic_conv2d_int8
-func.func @dense_1x1_cin_384_matched(
-    %input: tensor<1x4x4x384xi8>,
-    %filter: tensor<1x1x384x64xi8>,
+func.func @dense_1x1_cin_352_matched(
+    %input: tensor<1x4x4x352xi8>,
+    %filter: tensor<1x1x352x64xi8>,
     %init: tensor<1x4x4x64xi32>) -> tensor<1x4x4x64xi32> {
   %result = linalg.conv_2d_nhwc_hwcf
       {dilations = dense<1> : vector<2xi64>, strides = dense<1> : vector<2xi64>}
-      ins(%input, %filter : tensor<1x4x4x384xi8>, tensor<1x1x384x64xi8>)
+      ins(%input, %filter : tensor<1x4x4x352xi8>, tensor<1x1x352x64xi8>)
       outs(%init : tensor<1x4x4x64xi32>) -> tensor<1x4x4x64xi32>
   return %result : tensor<1x4x4x64xi32>
 }
 
-// CHECK-LABEL: util.func public @dense_1x1_cin_385_falls_back
+// CHECK-LABEL: util.func public @dense_1x1_cin_353_falls_back
 // CHECK-NOT: util.call @call_rocket_dynamic_conv2d_int8
 // CHECK: linalg.conv_2d_nhwc_hwcf
-func.func @dense_1x1_cin_385_falls_back(
-    %input: tensor<1x4x4x385xi8>,
-    %filter: tensor<1x1x385x64xi8>,
+func.func @dense_1x1_cin_353_falls_back(
+    %input: tensor<1x4x4x353xi8>,
+    %filter: tensor<1x1x353x64xi8>,
     %init: tensor<1x4x4x64xi32>) -> tensor<1x4x4x64xi32> {
   %result = linalg.conv_2d_nhwc_hwcf
       {dilations = dense<1> : vector<2xi64>, strides = dense<1> : vector<2xi64>}
-      ins(%input, %filter : tensor<1x4x4x385xi8>, tensor<1x1x385x64xi8>)
+      ins(%input, %filter : tensor<1x4x4x353xi8>, tensor<1x1x353x64xi8>)
       outs(%init : tensor<1x4x4x64xi32>) -> tensor<1x4x4x64xi32>
   return %result : tensor<1x4x4x64xi32>
 }

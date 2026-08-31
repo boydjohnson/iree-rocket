@@ -2994,10 +2994,17 @@ module attributes {transform.with_named_sequence} {
   // (2026-08-31) through the real compiled path, at 34x34 (3x3) / 32x32
   // (1x1), Cout = 64, sweeping Cin:
   //
-  //   dense 1x1  : exact to Cin 384; wrong from Cin 400 up.
+  //   dense 1x1  : exact to Cin 352; first failure at Cin 353.
   //   dense 3x3  : exact to Cin  32; wrong from Cin  33 up.
   //
-  // So `match_dynamic_conv2d_int8` caps Cin at 384 and
+  // The 1x1 boundary was refined with the raw exact-i32 oracle: every native
+  // 16-channel point through 352 passed, 368 and 384 failed, and an adjacent
+  // probe confirmed 351/352 pass while 353/354/367 fail. At this geometry,
+  // 353 is also where ConvPlan changes from one output tile to two. The 352
+  // cap is conservative containment; the underlying multi-tile accumulator
+  // bug remains open and can affect other geometries.
+  //
+  // So `match_dynamic_conv2d_int8` caps Cin at 352 and
   // `match_dynamic_conv2d_3x3_int8` at 32. Anything above falls back to the
   // CPU, which is slower but correct. Raising either needs a fix in
   // ConvPlan's int8 modelling, not a bound change -- the cause is still
@@ -3043,9 +3050,9 @@ module attributes {transform.with_named_sequence} {
 
     %input_value = transform.get_operand %root[0] : (!transform.any_op) -> !transform.any_value
     %filter_value = transform.get_operand %root[1] : (!transform.any_op) -> !transform.any_value
-    // Cin 400 and above returns near-all-zero output on hardware; 384 is the
-    // largest measured-good value. See this section's doc comment.
-    transform.iree.match.dim_bounds %input_value[3], umin = 1, umax = 384 : !transform.any_value
+    // Cin 353 is the first failing value in the fixed-geometry dense signed
+    // boundary probe. See this section's doc comment.
+    transform.iree.match.dim_bounds %input_value[3], umin = 1, umax = 352 : !transform.any_value
     transform.iree.match.dim_bounds %filter_value[3], umin = 1, umax = 512 : !transform.any_value
     transform.yield %root : !transform.any_op
   }
