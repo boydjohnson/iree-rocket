@@ -47,6 +47,52 @@ func.func @depthwise(%input: tensor<1x8x8x40xf16>, %filter: tensor<3x3x40xf16>, 
       outs(%init : tensor<1x6x6x40xf32>) -> tensor<1x6x6x40xf32>
   return %0 : tensor<1x6x6x40xf32>
 }
+
+// The int8 cases below are written in the *quantized* form an ONNX
+// ConvInteger model arrives in, with a non-zero input zero point and a zero
+// weight zero point (what ORT's quantize_dynamic always produces). That is
+// deliberate: it is the only way to exercise the whole int8 offload chain --
+// rocket-transpose-quantized-conv-to-nhwc, then
+// iree-global-opt-quantized-conv-to-conv folding the zero point into a CPU
+// correction, then the int8_accumulator dispatch. Handing the harness an
+// already-folded plain i8 convolution would skip every part of that.
+//
+// The zero points are constants rather than function arguments only so these
+// keep the (input, filter, init) signature the rest of the harness expects;
+// the fold does not care whether they are constant.
+//
+// Dense arrives NCHW, matching what torch-mlir emits for ConvInteger, so the
+// transpose pass is on the path. Depthwise arrives NHWC, for the same reason.
+
+func.func @dense_int8(%input: tensor<1x64x32x32xi8>, %filter: tensor<128x64x1x1xi8>, %init: tensor<1x128x32x32xi32>) -> tensor<1x128x32x32xi32> {
+  %izp = arith.constant 7 : i32
+  %kzp = arith.constant 0 : i32
+  %0 = linalg.conv_2d_nchw_fchw_q
+      {dilations = dense<1> : tensor<2xi64>, strides = dense<1> : tensor<2xi64>}
+      ins(%input, %filter, %izp, %kzp : tensor<1x64x32x32xi8>, tensor<128x64x1x1xi8>, i32, i32)
+      outs(%init : tensor<1x128x32x32xi32>) -> tensor<1x128x32x32xi32>
+  return %0 : tensor<1x128x32x32xi32>
+}
+
+func.func @depthwise_int8(%input: tensor<1x34x34x64xi8>, %filter: tensor<3x3x64xi8>, %init: tensor<1x32x32x64xi32>) -> tensor<1x32x32x64xi32> {
+  %izp = arith.constant -5 : i32
+  %kzp = arith.constant 0 : i32
+  %0 = linalg.depthwise_conv_2d_nhwc_hwc_q
+      {dilations = dense<1> : tensor<2xi64>, strides = dense<1> : tensor<2xi64>}
+      ins(%input, %filter, %izp, %kzp : tensor<1x34x34x64xi8>, tensor<3x3x64xi8>, i32, i32)
+      outs(%init : tensor<1x32x32x64xi32>) -> tensor<1x32x32x64xi32>
+  return %0 : tensor<1x32x32x64xi32>
+}
+
+func.func @depthwise_int8_s2(%input: tensor<1x33x33x64xi8>, %filter: tensor<3x3x64xi8>, %init: tensor<1x16x16x64xi32>) -> tensor<1x16x16x64xi32> {
+  %izp = arith.constant -5 : i32
+  %kzp = arith.constant 0 : i32
+  %0 = linalg.depthwise_conv_2d_nhwc_hwc_q
+      {dilations = dense<1> : tensor<2xi64>, strides = dense<2> : tensor<2xi64>}
+      ins(%input, %filter, %izp, %kzp : tensor<1x33x33x64xi8>, tensor<3x3x64xi8>, i32, i32)
+      outs(%init : tensor<1x16x16x64xi32>) -> tensor<1x16x16x64xi32>
+  return %0 : tensor<1x16x16x64xi32>
+}
 """
 
 
@@ -143,6 +189,32 @@ def write_compiled_fixture(work_dir: Path) -> None:
     np.save(work_dir / "depthwise_input.npy", depthwise_input)
     np.save(work_dir / "depthwise_init.npy", np.zeros((1, 6, 6, 40), dtype=np.float32))
 
+    # int8 fixtures. The values span the full signed range so a wrong
+    # zero-point fold or a mis-permuted transpose cannot cancel out, and the
+    # accumulators stay far inside i32.
+    def i8(*shape: int) -> np.ndarray:
+        return rng.integers(-128, 128, size=shape, dtype=np.int8)
+
+    np.save(work_dir / "dense_int8_input.npy", i8(1, 64, 32, 32))
+    np.save(work_dir / "dense_int8_kernel.npy", i8(128, 64, 1, 1))
+    np.save(
+        work_dir / "dense_int8_init.npy", np.zeros((1, 128, 32, 32), dtype=np.int32)
+    )
+
+    np.save(work_dir / "depthwise_int8_input.npy", i8(1, 34, 34, 64))
+    np.save(work_dir / "depthwise_int8_kernel.npy", i8(3, 3, 64))
+    np.save(
+        work_dir / "depthwise_int8_init.npy",
+        np.zeros((1, 32, 32, 64), dtype=np.int32),
+    )
+
+    np.save(work_dir / "depthwise_int8_s2_input.npy", i8(1, 33, 33, 64))
+    np.save(work_dir / "depthwise_int8_s2_kernel.npy", i8(3, 3, 64))
+    np.save(
+        work_dir / "depthwise_int8_s2_init.npy",
+        np.zeros((1, 16, 16, 64), dtype=np.int32),
+    )
+
 
 def compile_modules(work_dir: Path, compiler: Path, transform_spec: Path) -> None:
     source = work_dir / "conv.mlir"
@@ -175,6 +247,19 @@ def compile_modules(work_dir: Path, compiler: Path, transform_spec: Path) -> Non
     rocket_bytes = (work_dir / "rocket.vmfb").read_bytes()
     if b"rocket-flatbuffer-v1" not in rocket_bytes or b"RKT1" not in rocket_bytes:
         raise SystemExit("compiled module contains no serialized Rocket executable")
+    # Without this, a case whose shape quietly stops matching its matcher
+    # would still "pass": it would just run entirely on the CPU on both
+    # sides of the differential and agree with itself.
+    for executable in (
+        b"rocket_dynamic_int8_executable",
+        b"rocket_dynamic_depthwise_int8_executable",
+        b"rocket_dynamic_depthwise_int8_executable_s2",
+    ):
+        if executable not in rocket_bytes:
+            raise SystemExit(
+                f"compiled module has no {executable.decode()}: the int8 case for it "
+                "no longer reaches a Rocket matcher, so the gate would test nothing"
+            )
 
 
 def run_cpu_reference(
@@ -276,17 +361,60 @@ def run_compiled_gate(
 ) -> None:
     write_compiled_fixture(work_dir)
     compile_modules(work_dir, compiler, transform_spec)
+    # int8 cases are compared exactly (atol=rtol=0), not with the fp16
+    # tolerances: the whole path is integer arithmetic, so any difference at
+    # all is a bug. That matters more than it sounds -- the failure mode the
+    # CBUF sweeps found is an all-zero output that completes successfully,
+    # and a tolerance wide enough for fp16 rounding would still catch that,
+    # but an exact check also catches a single wrong accumulator lane.
     cases = [
-        ("main", "input.npy", "kernel.npy", "init.npy", "out_rocket.npy"),
+        ("main", "input.npy", "kernel.npy", "init.npy", "out_rocket.npy", atol, rtol),
         (
             "depthwise",
             "depthwise_input.npy",
             "depthwise_kernel.npy",
             "depthwise_init.npy",
             "depthwise_out_rocket.npy",
+            atol,
+            rtol,
+        ),
+        (
+            "dense_int8",
+            "dense_int8_input.npy",
+            "dense_int8_kernel.npy",
+            "dense_int8_init.npy",
+            "dense_int8_out_rocket.npy",
+            0.0,
+            0.0,
+        ),
+        (
+            "depthwise_int8",
+            "depthwise_int8_input.npy",
+            "depthwise_int8_kernel.npy",
+            "depthwise_int8_init.npy",
+            "depthwise_int8_out_rocket.npy",
+            0.0,
+            0.0,
+        ),
+        (
+            "depthwise_int8_s2",
+            "depthwise_int8_s2_input.npy",
+            "depthwise_int8_s2_kernel.npy",
+            "depthwise_int8_s2_init.npy",
+            "depthwise_int8_s2_out_rocket.npy",
+            0.0,
+            0.0,
         ),
     ]
-    for function, input_name, kernel_name, init_name, output_name in cases:
+    for (
+        function,
+        input_name,
+        kernel_name,
+        init_name,
+        output_name,
+        case_atol,
+        case_rtol,
+    ) in cases:
         cpu_name = f"{function}_cpu.npy"
         run_cpu_reference(
             work_dir,
@@ -308,7 +436,7 @@ def run_compiled_gate(
             init_name,
             output_name,
         )
-        compare_outputs(work_dir, cpu_name, output_name, atol, rtol)
+        compare_outputs(work_dir, cpu_name, output_name, case_atol, case_rtol)
 
 
 def main() -> None:
