@@ -3,7 +3,9 @@
 //! Every case executes through `ConvPlan::new`, production HWCF weight
 //! packing, and the RK3588 device. Failures are accumulated: one bad case
 //! never prevents later cases from running, and the test asserts only after
-//! printing the complete summary.
+//! printing the complete summary. The one exception is a *sick device* --
+//! see `run_hardware_case_matrix`, which halts there because past that point
+//! a sweep measures the NPU's health rather than the shapes.
 //!
 //! Cross-compile and run on the board:
 //!
@@ -1046,6 +1048,71 @@ fn int8_accumulator_cbuf_split_probe_matrix_is_planable() {
     }
 }
 
+/// Index to resume a hardware sweep at, for picking one back up after a
+/// reboot has cleared a sick device. Zero, the default, starts at the top.
+fn probe_resume_index() -> usize {
+    std::env::var("ROCKET_PROBE_RESUME_AT")
+        .ok()
+        .and_then(|value| value.parse().ok())
+        .unwrap_or(0)
+}
+
+/// A shape well inside the known-good region, used to prove the device is
+/// still healthy. Dense signed K1 accumulator at Cin=64 passes on any
+/// healthy RK3588, so a failure here is a statement about the *device*
+/// rather than about whatever shape is under test.
+fn accumulator_canary_passes(file: &std::fs::File) -> bool {
+    let case = Conv2dCase {
+        width: 32,
+        height: 32,
+        cin: 64,
+        cout: 64,
+        kernel: [1, 1],
+        stride: 1,
+        padding: [0, 0],
+        precision: OraclePrecision::Int8Accumulator,
+        pattern: OraclePattern::Dense { phase: 1 },
+    };
+    let result = catch_unwind(AssertUnwindSafe(|| {
+        let fixture = build_fixture(case)?;
+        execute_case(file, &fixture)
+    }));
+    matches!(result, Ok(Ok(_)))
+}
+
+/// Runs a case matrix, accumulating shape failures but halting on a sick
+/// device.
+///
+/// Shape failures accumulate exactly as they always did: one bad case never
+/// prevents later cases from running. The one exception is the RK3588's sick
+/// state. After roughly fifteen to twenty failing jobs the NPU starts
+/// returning wrong results for *every* shape, including ones that passed
+/// seconds earlier, and nothing reports it -- `prep_bo` still succeeds well
+/// inside its timeout. Past that point a sweep measures the device rather
+/// than the shapes, so every failure re-checks a known-good canary and the
+/// run stops the moment the canary goes.
+///
+/// The canary is the only reliable discriminator, so do not try to read the
+/// device's health off the values. A `got -1515870800` means the DPU never
+/// wrote those bytes, which is how the dense Cin>384 failures present, but
+/// fully written *wrong* values occur both for genuine shape failures (the
+/// Cout=31/33 partial-block cases in the known-limitations probe report
+/// `max|diff|` of 45 on a perfectly healthy device) and for a sick one.
+///
+/// Only a reboot clears the sick state -- not idle, not a fresh process, not
+/// a reopened fd. Reboot the board, then resume with
+/// `ROCKET_PROBE_RESUME_AT`, which this prints for you.
+///
+/// **The canary is necessary but not sufficient.** Results here are also
+/// order dependent, and at small shapes outright flaky, in ways a Cin=64
+/// canary does not detect. In `int8_accumulator_known_limitations_probe`,
+/// Cin=3 Cout=33 and Cin=5 Cout=64 both *pass* when they run first and fail
+/// mid-sweep, and even in isolation Cin=3 Cout=33 failed once in six
+/// otherwise identical runs. Contamination is per-process: a fresh process
+/// clears it, intervening successful jobs do not, which points at buffer or
+/// DMA-address reuse rather than NPU state. So a verdict on one shape needs
+/// `ROCKET_PROBE_RESUME_AT` to run it *first*, repeated a few times -- never
+/// one row from one sweep.
 fn run_hardware_case_matrix(title: &str, cases: Vec<Conv2dCase>) {
     let total_cases = cases.len();
     let file = OpenOptions::new()
@@ -1053,58 +1120,116 @@ fn run_hardware_case_matrix(title: &str, cases: Vec<Conv2dCase>) {
         .write(true)
         .open(DEVICE_PATH)
         .expect("failed to open RK3588 NPU device");
+    let resume = probe_resume_index();
     let mut failures = Vec::new();
+    let mut sick_after = None;
 
     println!("\n=== {title} ===");
+    if resume != 0 {
+        println!("  resuming at index {resume} of {total_cases}");
+    }
+
+    if !accumulator_canary_passes(&file) {
+        println!(
+            "  CANARY FAILED before any measurement (dense K1 Cin=64, which passes on any\n  \
+             healthy device). The NPU is sick -- reboot the board and re-run. Nothing this\n  \
+             sweep could print below would be trustworthy."
+        );
+        panic!("{title} did not run: the NPU is sick, reboot the board");
+    }
+
     for (index, case) in cases.into_iter().enumerate() {
+        if index < resume {
+            continue;
+        }
         let label = case.label();
         let result = catch_unwind(AssertUnwindSafe(|| {
             let fixture = build_fixture(case)?;
             execute_case(&file, &fixture)
         }));
-        match result {
-            Ok(Ok(success)) => println!(
-                "[{}/{}] ok   {label} banks={}/{} tiles={}",
-                index + 1,
-                total_cases,
-                success.data_banks,
-                success.weight_banks,
-                success.tiles,
-            ),
+        let failure = match result {
+            Ok(Ok(success)) => {
+                println!(
+                    "[{}/{}] ok   {label} banks={}/{} tiles={}",
+                    index + 1,
+                    total_cases,
+                    success.data_banks,
+                    success.weight_banks,
+                    success.tiles,
+                );
+                continue;
+            }
             Ok(Err(error)) => {
                 println!(
                     "[{}/{}] FAIL {label}\n      {error}",
                     index + 1,
-                    total_cases,
+                    total_cases
                 );
-                failures.push(format!("{label}: {error}"));
+                format!("{label}: {error}")
             }
             Err(payload) => {
                 let error = panic_message(payload);
                 println!(
                     "[{}/{}] PANIC {label}\n      {error}",
                     index + 1,
-                    total_cases,
+                    total_cases
                 );
-                failures.push(format!("{label}: panic: {error}"));
+                format!("{label}: panic: {error}")
             }
+        };
+        failures.push(failure);
+
+        if !accumulator_canary_passes(&file) {
+            sick_after = Some(index);
+            break;
         }
     }
 
+    let not_run = match sick_after {
+        Some(index) => total_cases - index - 1,
+        None => 0,
+    };
+    let attempted = total_cases - resume.min(total_cases) - not_run;
+
     println!("\n=== {title} summary ===");
-    println!("  passed: {}", total_cases - failures.len());
+    println!(
+        "  passed: {} of {attempted} attempted",
+        attempted - failures.len()
+    );
     println!("  failed: {}", failures.len());
+    if resume != 0 {
+        println!("  skipped before resume: {resume}");
+    }
+    if sick_after.is_some() {
+        println!("  not run (device went sick): {not_run}");
+    }
     for (index, failure) in failures.iter().enumerate() {
         println!("    {}. {failure}", index + 1);
     }
+
+    if let Some(index) = sick_after {
+        println!(
+            "\n  CANARY FAILED after case {} of {total_cases}. The device is sick from here on,\n  \
+             so that case is the last trustworthy row and the remaining {not_run} were not run.\n  \
+             Reboot the board, then continue with:\n    \
+             ROCKET_PROBE_RESUME_AT={} <this binary> <test name> --ignored --nocapture",
+            index + 1,
+            index + 1,
+        );
+        panic!(
+            "{title} stopped after case {} of {total_cases}: the NPU went sick. Reboot the \
+             board and resume with ROCKET_PROBE_RESUME_AT={}",
+            index + 1,
+            index + 1,
+        );
+    }
+
     assert!(
         failures.is_empty(),
-        "{} of {} cases failed in {title}; complete diagnostics are above",
+        "{} of {attempted} cases failed in {title}; complete diagnostics are above",
         failures.len(),
-        total_cases,
     );
 }
-
 #[test]
 #[ignore = "needs /dev/accel/accel0 -- validates production affine int8 weights and BS constants"]
 fn int8_affine_selector_matrix_runs_every_case_before_failing() {
@@ -1164,29 +1289,6 @@ fn int8_accumulator_k1_cin_boundary_probe() {
     run_hardware_case_matrix("int8 accumulator K1 Cin boundary probe", cases);
 }
 
-/// A shape well inside the known-good region, used to prove the device is
-/// still healthy. Dense signed K1 accumulator at Cin=64 passes on any
-/// healthy RK3588, so a failure here is a statement about the *device*
-/// rather than about whatever shape is under test.
-fn accumulator_canary_passes(file: &std::fs::File) -> bool {
-    let case = Conv2dCase {
-        width: 32,
-        height: 32,
-        cin: 64,
-        cout: 64,
-        kernel: [1, 1],
-        stride: 1,
-        padding: [0, 0],
-        precision: OraclePrecision::Int8Accumulator,
-        pattern: OraclePattern::Dense { phase: 1 },
-    };
-    let result = catch_unwind(AssertUnwindSafe(|| {
-        let fixture = build_fixture(case)?;
-        execute_case(file, &fixture)
-    }));
-    matches!(result, Ok(Ok(_)))
-}
-
 /// Resolves the Cin/CBUF split matrix, guarding every row with a canary.
 ///
 /// The RK3588 NPU can drop into a state where *every* job returns wrong
@@ -1198,12 +1300,11 @@ fn accumulator_canary_passes(file: &std::fs::File) -> bool {
 /// well inside its timeout -- so a long sweep silently stops measuring
 /// shapes and starts measuring the sick device.
 ///
-/// The two failure signatures are distinguishable, and worth reading off
-/// the rows below:
-///
-///   * a *shape* failure leaves most of the output at `OUTPUT_SENTINEL`
-///     (`got -1515870800`), because the DPU never wrote those bytes;
-///   * a *sick device* returns fully written but wrong values.
+/// The canary is the only reliable discriminator; the values themselves are
+/// not. Every failure in this matrix presents as `got -1515870800`, the
+/// sentinel the DPU never overwrote, but elsewhere a healthy device produces
+/// fully written wrong values for genuine shape failures too, so that alone
+/// proves nothing about the device.
 ///
 /// A single bad shape does not cause it: 15 consecutive Cin=385 failures each
 /// left the canary clean, and the whole Cin=384 block still passes 5/5
@@ -1230,10 +1331,7 @@ fn int8_accumulator_k1_cin_cbuf_split_probe() {
         .open(DEVICE_PATH)
         .expect("failed to open RK3588 NPU device");
 
-    let resume: usize = std::env::var("ROCKET_PROBE_RESUME_AT")
-        .ok()
-        .and_then(|value| value.parse().ok())
-        .unwrap_or(0);
+    let resume = probe_resume_index();
 
     println!("\n=== int8 accumulator K1 Cin/CBUF split probe ===");
     println!("  matrix: Cin 384/385/400/512 x weight banks 1..=5, ascending");
