@@ -87,7 +87,7 @@ use crate::{
 };
 use iree_rocket_hal::rocket::{
     builders::RegCmd,
-    conv::{Buffers, ConvPlan, FeatureLayout, Precision},
+    conv::{AccumulatorOutputTile, Buffers, ConvPlan, FeatureLayout, Precision},
     device::OwnedBuffer as RocketOwnedBuffer,
     fc,
     pooling::{PoolingBuffers, PoolingPlan},
@@ -192,15 +192,6 @@ pub struct BiasPacking {
 /// every other direct dispatch binding so it survives until `queue_execute`
 /// runs). Ordinary output uses 16-byte blocks; accumulator output uses the
 /// CORE-native block of 32 i32 lanes (128 bytes).
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub struct OutputTileCompaction {
-    pub scratch_offset: usize,
-    pub output_row: usize,
-    pub output_column: usize,
-    pub output_rows: usize,
-    pub output_columns: usize,
-}
-
 #[derive(Clone)]
 pub struct OutputCompaction {
     pub output_buffer: *mut iree_hal_buffer_t,
@@ -213,7 +204,7 @@ pub struct OutputCompaction {
     pub output_width: usize,
     pub bytes_per_pixel: usize,
     pub source_block_bytes: usize,
-    pub source_tiles: Option<Arc<[OutputTileCompaction]>>,
+    pub source_tiles: Option<Arc<[AccumulatorOutputTile]>>,
 }
 
 /// One recorded command-buffer operation, in call order -- see module doc
@@ -1309,50 +1300,11 @@ unsafe extern "C" fn dispatch(
             let planned = match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
                 let plan = ConvPlan::new(*shape, kernels);
                 if shape.precision.writes_accumulators() {
-                    let source_block_bytes = shape.output_atom_bytes() as usize;
-                    let padded_bytes_per_pixel = shape.padded_out_channels() as usize
-                        * shape.precision.output_element_bytes() as usize;
-                    let blocks_per_pixel = padded_bytes_per_pixel.div_ceil(source_block_bytes);
-                    let mut scratch_offset = 0usize;
-                    let mut tasks = Vec::with_capacity(plan.tiles().len());
-                    let mut output_tiles = Vec::with_capacity(plan.tiles().len());
-                    for (mut program, tile) in plan.programs().into_iter().zip(plan.tiles()) {
-                        let tile_pixels =
-                            tile.rows.out_rows as usize * tile.columns.out_cols as usize;
-                        let tile_bytes = tile_pixels
-                            .checked_mul(blocks_per_pixel)
-                            .and_then(|value| value.checked_mul(source_block_bytes))
-                            .expect("accumulator tile scratch size overflow");
-                        let local_output = scratch
-                            .dma_address
-                            .checked_add(
-                                u32::try_from(scratch_offset)
-                                    .expect("accumulator tile scratch offset exceeds u32"),
-                            )
-                            .expect("accumulator tile DMA address overflow");
-                        iree_rocket_hal::rocket::conv::relocate_with_exact_output(
-                            &mut program,
-                            Buffers {
-                                output: local_output,
-                                ..bufs
-                            },
-                        );
-                        tasks.push(program);
-                        output_tiles.push(OutputTileCompaction {
-                            scratch_offset,
-                            output_row: tile.rows.out_first as usize,
-                            output_column: tile.columns.out_first as usize,
-                            output_rows: tile.rows.out_rows as usize,
-                            output_columns: tile.columns.out_cols as usize,
-                        });
-                        scratch_offset = scratch_offset
-                            .checked_add(tile_bytes)
-                            .expect("accumulator scratch partition overflow");
-                    }
-                    assert_eq!(scratch_offset, scratch_bytes);
+                    let staged = plan.programs_with_staged_accumulator_output(bufs);
+                    assert_eq!(staged.scratch_bytes, scratch_bytes);
                     (
-                        tasks,
-                        Some(Arc::<[OutputTileCompaction]>::from(output_tiles)),
+                        staged.programs,
+                        Some(Arc::<[AccumulatorOutputTile]>::from(staged.tiles)),
                     )
                 } else {
                     (plan.programs_with_buffers(bufs), None)

@@ -84,7 +84,11 @@ fn int8_depthwise_exact_across_two_output_atoms() {
 #[ignore = "needs /dev/accel/accel0 -- cross-compile for aarch64 and run on the RK3588 board"]
 fn int8_depthwise_exact_where_the_cbuf_atom_charge_rounds_up() {
     for channels in [48, 112, 240] {
-        assert_eq!(channels / 16 % 4, 3, "Cin {channels} is not a rounding case");
+        assert_eq!(
+            channels / 16 % 4,
+            3,
+            "Cin {channels} is not a rounding case"
+        );
         check_int8_depthwise(channels);
     }
 }
@@ -221,7 +225,10 @@ fn check_int8_depthwise(channels: usize) {
         prep_bo(fd, output.handle, 5_000_000_000).unwrap();
 
         let raw = std::slice::from_raw_parts(output.host_ptr, output.size);
-        let written = raw.iter().rposition(|&b| b != SENTINEL).map_or(0, |i| i + 1);
+        let written = raw
+            .iter()
+            .rposition(|&b| b != SENTINEL)
+            .map_or(0, |i| i + 1);
         assert!(
             written <= shape.output_scratch_bytes(kernels),
             "DPU wrote {written} bytes past the {} byte allocation",
@@ -234,8 +241,8 @@ fn check_int8_depthwise(channels: usize) {
         let lanes = atom_bytes / mem::size_of::<i32>();
         let pixels = OH * OW;
         let read = |oy: usize, ox: usize, c: usize| -> i32 {
-            let offset =
-                ((c / lanes) * pixels + oy * OW + ox) * atom_bytes + (c % lanes) * mem::size_of::<i32>();
+            let offset = ((c / lanes) * pixels + oy * OW + ox) * atom_bytes
+                + (c % lanes) * mem::size_of::<i32>();
             i32::from_le_bytes(raw[offset..offset + 4].try_into().unwrap())
         };
 

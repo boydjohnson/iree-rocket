@@ -33,7 +33,7 @@ use conv2d_oracle::{
     f16_to_f32, output_offset, output_storage_bytes,
 };
 use iree_rocket_hal::rocket::{
-    conv::{Buffers, ConvPlan},
+    conv::{AccumulatorOutputTile, Buffers, ConvPlan, Shape},
     device::{Buffer, JobDesc, close_bo, fini_bo, prep_bo, submit_jobs, unmap_bo},
 };
 
@@ -94,6 +94,69 @@ struct CaseSuccess {
 struct CaseExecution {
     plan: ConvPlan,
     output: Vec<u8>,
+}
+
+fn assemble_staged_accumulator_output(
+    shape: Shape,
+    kernels: [usize; 2],
+    scratch: &[u8],
+    tiles: &[AccumulatorOutputTile],
+) -> Result<Vec<u8>, String> {
+    let output_width = shape.output_width(kernels) as usize;
+    let output_height = shape.output_height(kernels) as usize;
+    let output_pixels = output_width * output_height;
+    let block_bytes = shape.output_atom_bytes() as usize;
+    let bytes_per_pixel =
+        shape.padded_out_channels() as usize * shape.precision.output_element_bytes() as usize;
+    let blocks_per_pixel = bytes_per_pixel.div_ceil(block_bytes);
+    let mut output = vec![OUTPUT_SENTINEL; output_storage_bytes(shape, kernels)];
+
+    for (index, tile) in tiles.iter().enumerate() {
+        let tile_pixels = tile.output_rows * tile.output_columns;
+        let expected_tile_bytes = tile_pixels * blocks_per_pixel * block_bytes;
+        if tile.scratch_bytes != expected_tile_bytes {
+            return Err(format!(
+                "tile {index} declares {} scratch bytes, expected {expected_tile_bytes}",
+                tile.scratch_bytes
+            ));
+        }
+        let tile_end = tile
+            .scratch_offset
+            .checked_add(tile.scratch_bytes)
+            .ok_or_else(|| format!("tile {index} scratch range overflow"))?;
+        if tile_end > scratch.len() {
+            return Err(format!(
+                "tile {index} scratch range {}..{tile_end} exceeds {} bytes",
+                tile.scratch_offset,
+                scratch.len()
+            ));
+        }
+
+        for surface in 0..blocks_per_pixel {
+            for row in 0..tile.output_rows {
+                for column in 0..tile.output_columns {
+                    let local_pixel = row * tile.output_columns + column;
+                    let output_row = tile.output_row + row;
+                    let output_column = tile.output_column + column;
+                    if output_row >= output_height || output_column >= output_width {
+                        return Err(format!(
+                            "tile {index} output ({output_row}, {output_column}) exceeds \
+                             {output_height}x{output_width}"
+                        ));
+                    }
+                    let source = tile.scratch_offset
+                        + surface * tile_pixels * block_bytes
+                        + local_pixel * block_bytes;
+                    let destination = surface * output_pixels * block_bytes
+                        + (output_row * output_width + output_column) * block_bytes;
+                    output[destination..destination + block_bytes]
+                        .copy_from_slice(&scratch[source..source + block_bytes]);
+                }
+            }
+        }
+    }
+
+    Ok(output)
 }
 
 fn tile_for_output(plan: &ConvPlan, y: usize, x: usize) -> Option<usize> {
@@ -177,12 +240,18 @@ fn execute_case_output(
         // all-zero accumulator.
         ptr::write_bytes(output.buffer.host_ptr, OUTPUT_SENTINEL, output.buffer.size);
 
-        let programs = plan.programs_with_buffers(Buffers {
+        let buffers = Buffers {
             input: input.buffer.dma_address,
             weights: weights.buffer.dma_address,
             bias: bias.buffer.dma_address,
             output: output.buffer.dma_address,
-        });
+        };
+        let (programs, accumulator_tiles) = if shape.precision.writes_accumulators() {
+            let staged = plan.programs_with_staged_accumulator_output(buffers);
+            (staged.programs, Some(staged.tiles))
+        } else {
+            (plan.programs_with_buffers(buffers), None)
+        };
         let mut command_buffers = Vec::with_capacity(programs.len());
         for program in &programs {
             let command_bytes = program.len() * mem::size_of::<u64>();
@@ -239,7 +308,11 @@ fn execute_case_output(
         prep_bo(fd, output.buffer.handle, PER_CASE_TIMEOUT_NS)
             .map_err(|error| format!("completion wait: {error}"))?;
 
-        let output = std::slice::from_raw_parts(output.buffer.host_ptr, output_len).to_vec();
+        let raw_output = std::slice::from_raw_parts(output.buffer.host_ptr, output_len).to_vec();
+        let output = match accumulator_tiles {
+            Some(tiles) => assemble_staged_accumulator_output(shape, kernels, &raw_output, &tiles)?,
+            None => raw_output,
+        };
         Ok(CaseExecution { plan, output })
     }
 }
@@ -532,9 +605,10 @@ fn dense_coefficient_vgg_block_cases() -> Vec<Conv2dCase> {
 
 /// Hardware-confirmed exact i32-accumulator regression cases through the
 /// shared production oracle. Together these cover a partial second output
-/// block, a partial third block at stride 2, the K3 Cin=32 ceiling, and the
-/// K1 Cin=352 single-tile boundary at 32x32 and Cout=512 ceilings with dense
-/// signed data.
+/// block, a partial third block at stride 2, the K3 Cin=32 ceiling, the K1
+/// transition from one tile at Cin=352 to two at Cin=353, the tile-local
+/// contract's current Cin=384 ceiling, a large three-tile image, and Cout=512
+/// ceilings with dense signed data.
 fn int8_accumulator_regression_cases() -> Vec<Conv2dCase> {
     vec![
         Conv2dCase {
@@ -563,6 +637,28 @@ fn int8_accumulator_regression_cases() -> Vec<Conv2dCase> {
             width: 32,
             height: 32,
             cin: 352,
+            cout: 64,
+            kernel: [1, 1],
+            stride: 1,
+            padding: [0, 0],
+            precision: OraclePrecision::Int8Accumulator,
+            pattern: OraclePattern::Dense { phase: 1 },
+        },
+        Conv2dCase {
+            width: 32,
+            height: 32,
+            cin: 353,
+            cout: 64,
+            kernel: [1, 1],
+            stride: 1,
+            padding: [0, 0],
+            precision: OraclePrecision::Int8Accumulator,
+            pattern: OraclePattern::Dense { phase: 1 },
+        },
+        Conv2dCase {
+            width: 32,
+            height: 32,
+            cin: 384,
             cout: 64,
             kernel: [1, 1],
             stride: 1,
@@ -603,15 +699,27 @@ fn int8_accumulator_regression_cases() -> Vec<Conv2dCase> {
             precision: OraclePrecision::Int8Accumulator,
             pattern: OraclePattern::Dense { phase: 5 },
         },
+        Conv2dCase {
+            width: 226,
+            height: 226,
+            cin: 3,
+            cout: 64,
+            kernel: [3, 3],
+            stride: 1,
+            padding: [0, 0],
+            precision: OraclePrecision::Int8Accumulator,
+            pattern: OraclePattern::Selectors { phase: 6 },
+        },
     ]
 }
 
-/// Sweeps every native 16-channel input atom through the K1 matcher range.
-/// On RK3588 (2026-08-31), Cin 16..=352 passed exactly while Cin 368 and 384
-/// failed. Keep the spatial extent, Cout, pattern, and phase fixed so this
-/// transition remains attributable to Cin and its planning consequences.
+/// Sweeps every native 16-channel input atom through and beyond the current
+/// K1 matcher range. With tile-local accumulator destinations, RK3588 passes
+/// Cin 16..=384 exactly, including the transition to two tiles above Cin=352.
+/// Cin 400..=512 still fail with the second 32-channel output block unwritten,
+/// isolating a subsequent CBUF/weight working-set boundary from this fix.
 fn int8_accumulator_k1_cin_atom_sweep_cases() -> Vec<Conv2dCase> {
-    (16..=384)
+    (16..=512)
         .step_by(16)
         .map(|cin| Conv2dCase {
             width: 32,
@@ -627,9 +735,9 @@ fn int8_accumulator_k1_cin_atom_sweep_cases() -> Vec<Conv2dCase> {
         .collect()
 }
 
-/// Resolves the exact logical-Cin transition around the last passing native
-/// atom from `int8_accumulator_k1_cin_atom_sweep_cases`. RK3588 confirmed 351
-/// and 352 pass exactly, while 353, 354, and 367 fail (2026-08-31).
+/// Guards the exact logical-Cin planning transition: Cin 351 and 352 use one
+/// tile, while 353, 354, and 367 use two. All five pass on RK3588 when each
+/// accumulator tile owns its destination geometry (2026-08-31).
 fn int8_accumulator_k1_cin_boundary_cases() -> Vec<Conv2dCase> {
     [351u32, 352, 353, 354, 367]
         .into_iter()
@@ -653,11 +761,7 @@ fn int8_accumulator_k1_cin_boundary_cases() -> Vec<Conv2dCase> {
 ///
 /// * odd 9x7 output extents leave the final logical accumulator(s) unwritten;
 /// * several small-Cin shapes corrupt most values at exact 32-lane block
-///   boundaries;
-/// * dense signed K1 at 32x32 is exact at Cin=352 but fails immediately at
-///   Cin=353, where this geometry first changes from one output tile to two;
-/// * the three-tile Cin=3 selector case corrupts values and leaves later tile
-///   regions unwritten.
+///   boundaries.
 fn int8_accumulator_known_limitation_cases() -> Vec<Conv2dCase> {
     let mut cases = Vec::new();
     for (cin, cout, kernel) in [
@@ -680,28 +784,6 @@ fn int8_accumulator_known_limitation_cases() -> Vec<Conv2dCase> {
             pattern: OraclePattern::Dense { phase: 0 },
         });
     }
-    cases.push(Conv2dCase {
-        width: 32,
-        height: 32,
-        cin: 353,
-        cout: 64,
-        kernel: [1, 1],
-        stride: 1,
-        padding: [0, 0],
-        precision: OraclePrecision::Int8Accumulator,
-        pattern: OraclePattern::Dense { phase: 1 },
-    });
-    cases.push(Conv2dCase {
-        width: 226,
-        height: 226,
-        cin: 3,
-        cout: 64,
-        kernel: [3, 3],
-        stride: 1,
-        padding: [0, 0],
-        precision: OraclePrecision::Int8Accumulator,
-        pattern: OraclePattern::Selectors { phase: 6 },
-    });
     cases
 }
 
@@ -876,27 +958,32 @@ fn dense_coefficient_vgg_block_matrix_is_planable_and_gap_free() {
 #[test]
 fn int8_accumulator_matrices_are_planable_and_gap_free() {
     let regression = int8_accumulator_regression_cases();
-    assert_eq!(regression.len(), 6);
+    assert_eq!(regression.len(), 9);
+    assert_eq!(
+        ConvPlan::new(regression[3].shape(), regression[3].kernel)
+            .tiles()
+            .len(),
+        2
+    );
+    assert_eq!(
+        ConvPlan::new(regression[8].shape(), regression[8].kernel)
+            .tiles()
+            .len(),
+        3
+    );
     assert_planable_and_gap_free(regression);
 
     let limitations = int8_accumulator_known_limitation_cases();
-    assert_eq!(limitations.len(), 8);
-    let tiled = *limitations.last().unwrap();
-    let plan = ConvPlan::new(tiled.shape(), tiled.kernel);
-    assert_eq!(
-        plan.tiles().len(),
-        3,
-        "large selector case must exercise tiling"
-    );
+    assert_eq!(limitations.len(), 6);
     assert_planable_and_gap_free(limitations);
 }
 
 #[test]
 fn int8_accumulator_k1_cin_atom_sweep_is_planable_and_gap_free() {
     let cases = int8_accumulator_k1_cin_atom_sweep_cases();
-    assert_eq!(cases.len(), 24);
+    assert_eq!(cases.len(), 32);
     assert_eq!(cases.first().unwrap().cin, 16);
-    assert_eq!(cases.last().unwrap().cin, 384);
+    assert_eq!(cases.last().unwrap().cin, 512);
     assert!(cases.windows(2).all(|pair| pair[1].cin - pair[0].cin == 16));
     assert_planable_and_gap_free(cases);
 }
@@ -1021,7 +1108,7 @@ fn dense_coefficient_vgg_blocks_match_oracle() {
 #[ignore = "needs /dev/accel/accel0 -- validates exact i32 accumulator values, partial blocks, channel ceilings, and stride"]
 fn int8_accumulator_regression_matrix_matches_oracle() {
     let cases = int8_accumulator_regression_cases();
-    assert_eq!(cases.len(), 6);
+    assert_eq!(cases.len(), 9);
     run_hardware_case_matrix("int8 accumulator regression matrix", cases);
 }
 
@@ -1029,7 +1116,7 @@ fn int8_accumulator_regression_matrix_matches_oracle() {
 #[ignore = "needs /dev/accel/accel0 -- locates the dense signed K1 Int8Accumulator Cin boundary"]
 fn int8_accumulator_k1_cin_atom_sweep() {
     let cases = int8_accumulator_k1_cin_atom_sweep_cases();
-    assert_eq!(cases.len(), 24);
+    assert_eq!(cases.len(), 32);
     run_hardware_case_matrix("int8 accumulator K1 Cin atom sweep", cases);
 }
 
@@ -1042,10 +1129,10 @@ fn int8_accumulator_k1_cin_boundary_probe() {
 }
 
 #[test]
-#[ignore = "known RK3588 failures -- manually characterizes accumulator tails, block boundaries, Cin>352, and tiling"]
+#[ignore = "known RK3588 failures -- manually characterizes accumulator tails and output-block boundaries"]
 fn int8_accumulator_known_limitations_probe() {
     let cases = int8_accumulator_known_limitation_cases();
-    assert_eq!(cases.len(), 8);
+    assert_eq!(cases.len(), 6);
     run_hardware_case_matrix("int8 accumulator known-limitations probe", cases);
 }
 

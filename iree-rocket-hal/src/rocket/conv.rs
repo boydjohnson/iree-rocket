@@ -973,10 +973,10 @@ impl Shape {
     /// [`Shape::padded_out_channels`] count rather than the logical one, so
     /// this allocates enough complete blocks for that padded count. This is
     /// the capture-derived counterpart of the retired Mesa builder's
-    /// output-allocation formula. Tiling-agnostic:
-    /// [`ConvPlan`]'s row/column tiles are sub-ranges of this same total
-    /// buffer, addressed via [`relocate`]'s per-tile offsets, so callers need
-    /// only this one size regardless of how many tiles a shape plans into.
+    /// output-allocation formula. The total is tiling-agnostic: normal tile
+    /// programs address sub-ranges of one shared image, while
+    /// [`ConvPlan::programs_with_staged_accumulator_output`] partitions the
+    /// same byte count into contiguous tile-local ranges.
     pub fn output_scratch_bytes(&self, kernels: Kernels) -> usize {
         let channel_bytes =
             self.padded_out_channels() as usize * self.precision.output_element_bytes() as usize;
@@ -1035,7 +1035,6 @@ impl Shape {
     pub fn depthwise_padded_channels(&self) -> u32 {
         self.cbuf_atoms() * self.precision.channels_per_atom()
     }
-
 
     /// Atoms per pixel the CBUF charges for, which is neither
     /// `feature_atoms` nor the count implied by `weight_channels`.
@@ -1247,7 +1246,8 @@ impl Shape {
     /// than widened for all accumulator output.
     pub fn output_atom_bytes(&self) -> u32 {
         if self.depthwise && self.precision.writes_accumulators() {
-            return 2 * self.precision.out_channel_granule()
+            return 2
+                * self.precision.out_channel_granule()
                 * self.precision.output_element_bytes();
         }
         self.output_channel_block_bytes()
@@ -1913,6 +1913,38 @@ pub struct ConvPlan {
     tiles: Vec<Tile2D>,
 }
 
+/// Logical destination and private-scratch range for one independently
+/// staged accumulator-output tile.
+///
+/// The matching register program writes every channel surface contiguously
+/// inside this range. Callers can therefore compact it into a dense NHWC
+/// tensor without re-deriving the DPU's tile-local surface geometry.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct AccumulatorOutputTile {
+    pub scratch_offset: usize,
+    pub scratch_bytes: usize,
+    pub output_row: usize,
+    pub output_column: usize,
+    pub output_rows: usize,
+    pub output_columns: usize,
+}
+
+/// Submission-ready accumulator programs and the exact scratch layout they
+/// write. `buffers.output` passed to
+/// [`ConvPlan::programs_with_staged_accumulator_output`] must address at
+/// least `scratch_bytes` bytes.
+pub struct StagedAccumulatorOutput {
+    pub programs: Vec<Vec<RegCmd>>,
+    pub tiles: Vec<AccumulatorOutputTile>,
+    pub scratch_bytes: usize,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum OutputPlacement {
+    SharedImage,
+    ContiguousTile,
+}
+
 impl ConvPlan {
     /// Plans all standalone jobs needed to cover `shape` exactly once.
     ///
@@ -2094,6 +2126,7 @@ impl ConvPlan {
                     feature_grains(self.kernels, &tile.rows),
                     self.data_banks,
                     self.weight_banks,
+                    OutputPlacement::SharedImage,
                 )
             })
             .collect()
@@ -2115,6 +2148,88 @@ impl ConvPlan {
                 commands
             })
             .collect()
+    }
+
+    /// Emits accumulator programs whose outputs occupy independent,
+    /// contiguous ranges of one private scratch buffer.
+    ///
+    /// A normal tile program addresses a sub-rectangle of a shared full-image
+    /// surface: its destination surface stride and row notch therefore retain
+    /// the full output geometry. Merely replacing its destination base is not
+    /// enough to stage it independently. This entry point changes all three
+    /// pieces together -- base, surface stride, and notch -- and returns the
+    /// same tile layout the caller must use when compacting scratch into its
+    /// logical output tensor.
+    pub fn programs_with_staged_accumulator_output(
+        &self,
+        buffers: Buffers,
+    ) -> StagedAccumulatorOutput {
+        assert!(
+            self.shape.precision.writes_accumulators(),
+            "staged accumulator output requires Int8Accumulator precision"
+        );
+
+        let source_block_bytes = self.shape.output_atom_bytes() as usize;
+        let padded_bytes_per_pixel = self.shape.padded_out_channels() as usize
+            * self.shape.precision.output_element_bytes() as usize;
+        let blocks_per_pixel = padded_bytes_per_pixel.div_ceil(source_block_bytes);
+        let mut scratch_offset = 0usize;
+        let mut programs = Vec::with_capacity(self.tiles.len());
+        let mut output_tiles = Vec::with_capacity(self.tiles.len());
+
+        for tile in &self.tiles {
+            let tile_pixels = tile.rows.out_rows as usize * tile.columns.out_cols as usize;
+            let scratch_bytes = tile_pixels
+                .checked_mul(blocks_per_pixel)
+                .and_then(|value| value.checked_mul(source_block_bytes))
+                .expect("accumulator tile scratch size overflow");
+            let local_output = buffers
+                .output
+                .checked_add(
+                    u32::try_from(scratch_offset)
+                        .expect("accumulator tile scratch offset exceeds u32"),
+                )
+                .expect("accumulator tile DMA address overflow");
+            let mut program = conv_2d_tile_program(
+                self.shape,
+                self.kernels,
+                tile,
+                feature_grains(self.kernels, &tile.rows),
+                self.data_banks,
+                self.weight_banks,
+                OutputPlacement::ContiguousTile,
+            );
+            relocate_with_exact_output(
+                &mut program,
+                Buffers {
+                    output: local_output,
+                    ..buffers
+                },
+            );
+            programs.push(program);
+            output_tiles.push(AccumulatorOutputTile {
+                scratch_offset,
+                scratch_bytes,
+                output_row: tile.rows.out_first as usize,
+                output_column: tile.columns.out_first as usize,
+                output_rows: tile.rows.out_rows as usize,
+                output_columns: tile.columns.out_cols as usize,
+            });
+            scratch_offset = scratch_offset
+                .checked_add(scratch_bytes)
+                .expect("accumulator scratch partition overflow");
+        }
+
+        assert_eq!(
+            scratch_offset,
+            self.shape.output_scratch_bytes(self.kernels),
+            "staged accumulator tiles must partition the full scratch allocation"
+        );
+        StagedAccumulatorOutput {
+            programs,
+            tiles: output_tiles,
+            scratch_bytes: scratch_offset,
+        }
     }
 }
 
@@ -2740,6 +2855,7 @@ pub fn conv_2d_tile_with_grains(
         feature_grains,
         shape.data_banks(kernels),
         shape.weight_banks(kernels),
+        OutputPlacement::SharedImage,
     )
 }
 
@@ -2780,6 +2896,7 @@ pub fn conv_2d_tile_with_cbuf_banks(
         feature_grains(kernels, &tile.rows),
         data_banks,
         weight_banks,
+        OutputPlacement::SharedImage,
     )
 }
 
@@ -2825,6 +2942,7 @@ pub fn conv_2d_tile_2d_with_cbuf_banks(
         feature_grains(kernels, &tile.rows),
         data_banks,
         weight_banks,
+        OutputPlacement::SharedImage,
     )
 }
 
@@ -2835,6 +2953,7 @@ fn conv_2d_tile_program(
     feature_grains: u32,
     data_banks: u32,
     weight_banks: u32,
+    output_placement: OutputPlacement,
 ) -> Vec<RegCmd> {
     let padded_channels = shape.padded_channels();
     let weight_channels = shape.weight_channels();
@@ -2881,6 +3000,20 @@ fn conv_2d_tile_program(
     let input_width = columns.in_cols;
     let out_width = columns.out_cols;
     let horizontally_tiled = columns.out_first != 0 || out_width != full_out_width;
+    let (output_base_offset, output_surface_pixels, output_notch) = match output_placement {
+        OutputPlacement::SharedImage => (
+            tile.output_offset(shape, kernels),
+            full_out_width * out_height,
+            full_out_width - out_width,
+        ),
+        OutputPlacement::ContiguousTile => {
+            assert!(
+                accumulator_output,
+                "contiguous tile output is only validated for Int8Accumulator precision"
+            );
+            (0, out_width * rows.out_rows, 0)
+        }
+    };
 
     assert!(
         feature_grains <= MAX_FEATURE_GRAINS,
@@ -3227,12 +3360,12 @@ fn conv_2d_tile_program(
     commands.push(zero::<DpuOffsetPend>());
     commands.push(
         Register::<DpuDstBaseAddr>::new()
-            .dst_base_addr(Bits::new(tile.output_offset(shape, kernels)))
+            .dst_base_addr(Bits::new(output_base_offset))
             .build(),
     );
     commands.push(
         Register::<DpuDstSurfStride>::new()
-            .dst_surf_stride(Bits::new(full_out_width * out_height))
+            .dst_surf_stride(Bits::new(output_surface_pixels))
             .build(),
     );
     commands.push(
@@ -3245,11 +3378,10 @@ fn conv_2d_tile_program(
             .height(Bits::new(rows.out_rows - 1))
             .build(),
     );
-    let notch = full_out_width - out_width;
     commands.push(
         Register::<DpuDataCubeNotchAddr>::new()
-            .notch_addr_0(Bits::new(notch))
-            .notch_addr_1(Bits::new(notch))
+            .notch_addr_0(Bits::new(output_notch))
+            .notch_addr_1(Bits::new(output_notch))
             .build(),
     );
     commands.push(
@@ -5429,6 +5561,112 @@ mod tests {
         assert_eq!(plan.tiles().len(), 1);
         assert_eq!(shape.output_channel_block_bytes(), 32 * 4);
         assert_eq!(shape.output_row_stride([1, 1]), 32 * 32 * 4);
+    }
+
+    #[test]
+    fn staged_accumulator_plan_partitions_scratch_and_programs_local_surfaces() {
+        let shape = Shape::with_precision(
+            32,
+            32,
+            1,
+            353,
+            64,
+            Precision::Int8Accumulator(Quantization {
+                input_zero_point: 0,
+                output_zero_point: 0,
+                weight_zero_point: 0,
+                ..quantization()
+            }),
+        );
+        let plan = ConvPlan::new(shape, [1, 1]);
+        assert_eq!(plan.tiles().len(), 2, "this is the first failing Cin plan");
+
+        let staged = plan.programs_with_staged_accumulator_output(RELOCATION);
+        assert_eq!(staged.programs.len(), plan.tiles().len());
+        assert_eq!(staged.tiles.len(), plan.tiles().len());
+        assert_eq!(staged.scratch_bytes, shape.output_scratch_bytes([1, 1]));
+
+        let mut next_offset = 0;
+        for (index, ((tile, output), program)) in plan
+            .tiles()
+            .iter()
+            .zip(&staged.tiles)
+            .zip(&staged.programs)
+            .enumerate()
+        {
+            let tile_pixels = tile.rows.out_rows as usize * tile.columns.out_cols as usize;
+            assert_eq!(output.scratch_offset, next_offset, "tile {index}");
+            assert_eq!(output.scratch_bytes, tile_pixels * 2 * 128, "tile {index}");
+            assert_eq!(output.output_row, tile.rows.out_first as usize);
+            assert_eq!(output.output_column, tile.columns.out_first as usize);
+            assert_eq!(output.output_rows, tile.rows.out_rows as usize);
+            assert_eq!(output.output_columns, tile.columns.out_cols as usize);
+            assert_eq!(
+                value_of::<DpuDstBaseAddr>(program),
+                RELOCATION.output + output.scratch_offset as u32,
+                "tile {index} destination"
+            );
+            assert_eq!(
+                value_of::<DpuDstSurfStride>(program),
+                tile_pixels as u32 * FEATURE_ATOM_BYTES,
+                "tile {index} surface stride"
+            );
+            assert_eq!(
+                value_of::<DpuDataCubeNotchAddr>(program),
+                0,
+                "tile {index} notch"
+            );
+            next_offset += output.scratch_bytes;
+        }
+        assert_eq!(next_offset, staged.scratch_bytes);
+    }
+
+    #[test]
+    fn contiguous_accumulator_column_tile_drops_shared_image_notch() {
+        let shape = Shape::with_precision(
+            32,
+            32,
+            1,
+            64,
+            64,
+            Precision::Int8Accumulator(Quantization {
+                input_zero_point: 0,
+                output_zero_point: 0,
+                weight_zero_point: 0,
+                ..quantization()
+            }),
+        );
+        let tile = Tile2D {
+            rows: Tile::whole(shape, [1, 1]),
+            columns: ColumnTile::from_output_range(shape, [1, 1], 4, 12),
+        };
+        let data_banks = shape.data_banks([1, 1]);
+        let weight_banks = shape.weight_banks([1, 1]);
+        let shared = conv_2d_tile_program(
+            shape,
+            [1, 1],
+            &tile,
+            feature_grains([1, 1], &tile.rows),
+            data_banks,
+            weight_banks,
+            OutputPlacement::SharedImage,
+        );
+        let contiguous = conv_2d_tile_program(
+            shape,
+            [1, 1],
+            &tile,
+            feature_grains([1, 1], &tile.rows),
+            data_banks,
+            weight_banks,
+            OutputPlacement::ContiguousTile,
+        );
+
+        assert_eq!(value_of::<DpuDstBaseAddr>(&shared), 4 * 128);
+        assert_eq!(value_of::<DpuDstSurfStride>(&shared), 32 * 32 * 16);
+        assert_eq!(value_of::<DpuDataCubeNotchAddr>(&shared), 0x14_0014);
+        assert_eq!(value_of::<DpuDstBaseAddr>(&contiguous), 0);
+        assert_eq!(value_of::<DpuDstSurfStride>(&contiguous), 12 * 32 * 16);
+        assert_eq!(value_of::<DpuDataCubeNotchAddr>(&contiguous), 0);
     }
 
     #[test]

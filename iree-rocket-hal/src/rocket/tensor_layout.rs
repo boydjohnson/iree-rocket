@@ -969,7 +969,11 @@ mod tests {
                 } else {
                     0
                 };
-                assert_eq!(packed[tap * padded + channel], want, "tap {tap} channel {channel}");
+                assert_eq!(
+                    packed[tap * padded + channel],
+                    want,
+                    "tap {tap} channel {channel}"
+                );
             }
         }
     }

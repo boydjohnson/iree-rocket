@@ -1103,7 +1103,7 @@ fn compact_atomic_output(
 
 fn compact_tiled_accumulator_output(
     scratch: &[u8],
-    tiles: &[crate::command_buffer::OutputTileCompaction],
+    tiles: &[iree_rocket_hal::rocket::conv::AccumulatorOutputTile],
     output_width: usize,
     bytes_per_pixel: usize,
     source_block_bytes: usize,
@@ -1115,6 +1115,12 @@ fn compact_tiled_accumulator_output(
     let mut written = 0;
     for tile in tiles {
         let tile_pixels = tile.output_rows * tile.output_columns;
+        let Some(tile_end) = tile.scratch_offset.checked_add(tile.scratch_bytes) else {
+            return written;
+        };
+        if tile_end > scratch.len() {
+            return written;
+        }
         for row in 0..tile.output_rows {
             for column in 0..tile.output_columns {
                 let local_pixel = row * tile.output_columns + column;
@@ -1128,7 +1134,7 @@ fn compact_tiled_accumulator_output(
                         + surface * tile_pixels * source_block_bytes
                         + local_pixel * source_block_bytes;
                     let dst_off = output_pixel * bytes_per_pixel + pixel_written;
-                    if src_off + chunk_len > scratch.len() || dst_off + chunk_len > dst.len() {
+                    if src_off + chunk_len > tile_end || dst_off + chunk_len > dst.len() {
                         return written;
                     }
                     dst[dst_off..dst_off + chunk_len]
@@ -1145,7 +1151,7 @@ fn compact_tiled_accumulator_output(
 #[cfg(test)]
 mod compaction_tests {
     use super::{compact_atomic_output, compact_tiled_accumulator_output};
-    use crate::command_buffer::OutputTileCompaction;
+    use iree_rocket_hal::rocket::conv::AccumulatorOutputTile;
 
     #[test]
     fn compacts_16_byte_slots_into_dense_output() {
@@ -1222,15 +1228,17 @@ mod compaction_tests {
         const BPP: usize = CHANNELS * size_of::<i32>();
         const BLOCK_BYTES: usize = BPP;
         let tiles = [
-            OutputTileCompaction {
+            AccumulatorOutputTile {
                 scratch_offset: 0,
+                scratch_bytes: HEIGHT * 2 * BLOCK_BYTES,
                 output_row: 0,
                 output_column: 0,
                 output_rows: HEIGHT,
                 output_columns: 2,
             },
-            OutputTileCompaction {
+            AccumulatorOutputTile {
                 scratch_offset: HEIGHT * 2 * BLOCK_BYTES,
+                scratch_bytes: HEIGHT * 2 * BLOCK_BYTES,
                 output_row: 0,
                 output_column: 2,
                 output_rows: HEIGHT,
@@ -1262,6 +1270,36 @@ mod compaction_tests {
         for (index, bytes) in dst.chunks_exact(4).enumerate() {
             assert_eq!(i32::from_le_bytes(bytes.try_into().unwrap()), index as i32);
         }
+    }
+
+    #[test]
+    fn tiled_compaction_stops_at_the_declared_scratch_range() {
+        const BLOCK_BYTES: usize = 128;
+        let tile = AccumulatorOutputTile {
+            scratch_offset: 0,
+            // Two pixels and two channel blocks require 512 bytes. Deliberately
+            // expose only the first block of each pixel's tile-local surface.
+            scratch_bytes: 2 * BLOCK_BYTES,
+            output_row: 0,
+            output_column: 0,
+            output_rows: 1,
+            output_columns: 2,
+        };
+        let scratch = vec![0x5au8; 4 * BLOCK_BYTES];
+        let mut dst = vec![0xa5u8; 4 * BLOCK_BYTES];
+
+        let written = compact_tiled_accumulator_output(
+            &scratch,
+            &[tile],
+            2,
+            2 * BLOCK_BYTES,
+            BLOCK_BYTES,
+            &mut dst,
+        );
+
+        assert_eq!(written, BLOCK_BYTES);
+        assert!(dst[..BLOCK_BYTES].iter().all(|&byte| byte == 0x5a));
+        assert!(dst[BLOCK_BYTES..].iter().all(|&byte| byte == 0xa5));
     }
 
     #[test]
