@@ -11,6 +11,11 @@
 //!       <width> <height> <stride> <cin> <cout> <kernel> <tile_index> \
 //!       [pad_top] [pad_left]
 //!
+//! `ROCKET_DUMP_PRECISION=int8acc` switches the shape to
+//! `Int8Accumulator` (zero points zeroed, unit multiplier) instead of the
+//! default fp16, which is what the accumulator output-parity work needs --
+//! the parity rule only applies to accumulator output.
+//!
 //! `width`/`height` are the `Shape`'s own extent -- the *padded* input
 //! extent when the caller supplies explicit `pad_top`/`pad_left` (matching
 //! how the real compiler programs a `linalg` op with no implicit-padding
@@ -18,7 +23,7 @@
 //! producing a 64x64 output), or the implicit-SAME-padded extent (input ==
 //! output) when `pad_top`/`pad_left` are omitted.
 
-use iree_rocket_hal::rocket::conv::{ConvPlan, Shape};
+use iree_rocket_hal::rocket::conv::{ConvPlan, Multiplier, Precision, Quantization, Shape};
 
 fn main() {
     let args: Vec<String> = std::env::args().skip(1).collect();
@@ -32,14 +37,18 @@ fn main() {
     let kernel = value(5) as usize;
     let tile_index = value(6) as usize;
 
-    let mut shape = Shape::with_precision(
-        width,
-        height,
-        stride,
-        cin,
-        cout,
-        iree_rocket_hal::rocket::conv::Precision::Fp16,
-    );
+    let precision = match std::env::var("ROCKET_DUMP_PRECISION").as_deref() {
+        Ok("int8acc") => Precision::Int8Accumulator(Quantization {
+            input_zero_point: 0,
+            output_zero_point: 0,
+            weight_zero_point: 0,
+            input_scale: 1.0,
+            weights_scale: 1.0,
+            multiplier: Multiplier { scale: 1, shift: 0 },
+        }),
+        _ => Precision::Fp16,
+    };
+    let mut shape = Shape::with_precision(width, height, stride, cin, cout, precision);
     if args.len() > 7 {
         let pad_top = value(7) as usize;
         let pad_left = value(8) as usize;
@@ -47,6 +56,13 @@ fn main() {
     }
     let kernels = [kernel, kernel];
     let plan = ConvPlan::new(shape, kernels);
+    eprintln!(
+        "shape: padded_out_channels={} output_atom_bytes={} output_scratch_bytes={} tiles={}",
+        shape.padded_out_channels(),
+        shape.output_atom_bytes(),
+        shape.output_scratch_bytes(kernels),
+        plan.tiles().len(),
+    );
     let programs = plan.programs();
     let program = &programs[tile_index];
 

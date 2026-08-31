@@ -1963,15 +1963,36 @@ fn cartesian_conv2d_oracle_sweep_runs_every_case_before_failing() {
 /// "non-zero lane" means *written data or untouched sentinel*. Separate the
 /// two before drawing conclusions from lane counts.
 ///
-/// **Open contradiction, worth resolving before anyone writes a fix.** The
-/// parity rule says raising the accumulator granule to 64 should fix these
-/// shapes: at 9x7 Cout=32 it takes `blocks` from 1 to 2, so
-/// `63 * 2 = 126` is even. Measured on hardware, it changes nothing -- those
-/// shapes still fail. So either the `blocks` the hardware acts on is not
-/// derived from `padded_out_channels`, or the granule never reached the
-/// registers that matter. Until that is settled the parity rule is a
-/// reliable *predictor* without a confirmed *cause*, and constraining the
-/// planner to even parity would be a guess.
+/// **Why the granule change did not help, settled by diffing the programs**
+/// (`--example dump_conv_plan_regcmd`, `ROCKET_DUMP_PRECISION=int8acc`).
+/// `DPU 0x403c` packs two channel fields -- low is the true `out_channels`
+/// minus one, high is the padded count minus one:
+///
+/// ```text
+/// 3x3 Cout=32 stock            0x001f001f   fails
+/// 3x3 Cout=32 + granule 64     0x001f003f   still fails
+/// 3x3 Cout=64 real             0x003f003f   passes
+/// ```
+///
+/// The granule moved only the *padded* half. The DPU still writes
+/// `true_out_channels` worth of data -- one block per pixel for Cout=32 --
+/// so the block count it actually commits never changed and the parity never
+/// changed with it. Padding the allocation was never going to help.
+///
+/// **And there is no misprogrammed register.** The minimal pair, 3x3 Cout=32
+/// against 3x3 Cout=64 -- same spatial shape, parity differing only through
+/// Cout -- differs in exactly six registers, and every one of them is a
+/// channel count or a weight size. Not one addressing, stride or geometry
+/// register differs between a shape that works and a shape that does not.
+/// `DPU_SURFACE_ADD` is the constant 256 in both, while the measured surface
+/// stride at the passing shape is `tile_pixels * 128` = 1152, so it is not
+/// the stride either.
+///
+/// So this is a **hardware constraint, not a driver bug**: the DPU requires
+/// the tile's committed block count to be even, and nothing in the program
+/// tells it otherwise. The lever a fix has is the parity itself -- the
+/// number of blocks actually written (true `Cout`) or `tile_pixels` -- not
+/// any padding or register correction.
 fn accumulator_layout_probe(
     file: &std::fs::File,
     extent: (u32, u32),
