@@ -75,6 +75,20 @@ func.func @dense_int8(%input: tensor<1x64x32x32xi8>, %filter: tensor<128x64x1x1x
   return %0 : tensor<1x128x32x32xi32>
 }
 
+// This sits exactly on the dense 3x3 matcher's measured-good Cin ceiling.
+// Cin=33 is hardware-proven wrong and covered as a CPU-fallback boundary by
+// rocket_int8_match_boundaries.mlir; Cin=32 must remain an exact Rocket
+// differential so the accepted side cannot regress independently.
+func.func @dense_int8_3x3(%input: tensor<1x32x34x34xi8>, %filter: tensor<64x32x3x3xi8>, %init: tensor<1x64x32x32xi32>) -> tensor<1x64x32x32xi32> {
+  %izp = arith.constant 11 : i32
+  %kzp = arith.constant 0 : i32
+  %0 = linalg.conv_2d_nchw_fchw_q
+      {dilations = dense<1> : tensor<2xi64>, strides = dense<1> : tensor<2xi64>}
+      ins(%input, %filter, %izp, %kzp : tensor<1x32x34x34xi8>, tensor<64x32x3x3xi8>, i32, i32)
+      outs(%init : tensor<1x64x32x32xi32>) -> tensor<1x64x32x32xi32>
+  return %0 : tensor<1x64x32x32xi32>
+}
+
 func.func @depthwise_int8(%input: tensor<1x34x34x64xi8>, %filter: tensor<3x3x64xi8>, %init: tensor<1x32x32x64xi32>) -> tensor<1x32x32x64xi32> {
   %izp = arith.constant -5 : i32
   %kzp = arith.constant 0 : i32
@@ -202,6 +216,13 @@ def write_compiled_fixture(work_dir: Path) -> None:
         work_dir / "dense_int8_init.npy", np.zeros((1, 128, 32, 32), dtype=np.int32)
     )
 
+    np.save(work_dir / "dense_int8_3x3_input.npy", i8(1, 32, 34, 34))
+    np.save(work_dir / "dense_int8_3x3_kernel.npy", i8(64, 32, 3, 3))
+    np.save(
+        work_dir / "dense_int8_3x3_init.npy",
+        np.zeros((1, 64, 32, 32), dtype=np.int32),
+    )
+
     np.save(work_dir / "depthwise_int8_input.npy", i8(1, 34, 34, 64))
     np.save(work_dir / "depthwise_int8_kernel.npy", i8(3, 3, 64))
     np.save(
@@ -245,6 +266,38 @@ def compile_modules(work_dir: Path, compiler: Path, transform_spec: Path) -> Non
             "--iree-llvmcpu-target-cpu=generic",
         ]
     )
+    preprocessing = work_dir / "rocket_preprocessing.mlir"
+    run(
+        [
+            str(compiler),
+            str(source),
+            "-o",
+            str(preprocessing),
+            f"--iree-preprocessing-transform-spec-filename={transform_spec}",
+            "--iree-hal-target-device=rocket_device=rocket",
+            "--iree-hal-target-device=cpu_device=local",
+            "--iree-hal-local-target-device-backends=llvm-cpu",
+            "--iree-hal-default-device=cpu_device",
+            "--iree-hal-indirect-command-buffers=false",
+            "--iree-llvmcpu-target-cpu=generic",
+            "--compile-to=preprocessing",
+            "--mlir-print-op-generic=false",
+        ]
+    )
+    preprocessing_text = preprocessing.read_text()
+    dense_3x3 = re.search(
+        r"util\.func public @dense_int8_3x3\b(?P<body>.*?)"
+        r"(?=\n\s*util\.func (?:public|private) @|\Z)",
+        preprocessing_text,
+        re.DOTALL,
+    )
+    if dense_3x3 is None or "util.call @call_rocket_dynamic_conv2d_int8" not in dense_3x3.group(
+        "body"
+    ):
+        raise SystemExit(
+            "dense_int8_3x3 no longer reaches its Rocket matcher; refusing to run "
+            "a CPU-versus-CPU differential"
+        )
     rocket_bytes = (work_dir / "rocket.vmfb").read_bytes()
     if b"rocket-flatbuffer-v1" not in rocket_bytes or b"RKT1" not in rocket_bytes:
         raise SystemExit("compiled module contains no serialized Rocket executable")
@@ -390,6 +443,15 @@ def run_compiled_gate(
             "dense_int8_kernel.npy",
             "dense_int8_init.npy",
             "dense_int8_out_rocket.npy",
+            0.0,
+            0.0,
+        ),
+        (
+            "dense_int8_3x3",
+            "dense_int8_3x3_input.npy",
+            "dense_int8_3x3_kernel.npy",
+            "dense_int8_3x3_init.npy",
+            "dense_int8_3x3_out_rocket.npy",
             0.0,
             0.0,
         ),
