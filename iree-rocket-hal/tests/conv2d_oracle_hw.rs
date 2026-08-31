@@ -223,10 +223,18 @@ fn execute_case_output(
     file: &std::fs::File,
     fixture: &Conv2dFixture,
 ) -> Result<CaseExecution, String> {
+    let plan = ConvPlan::new(fixture.shape, fixture.case.kernel);
+    execute_case_output_with_plan(file, fixture, plan)
+}
+
+fn execute_case_output_with_plan(
+    file: &std::fs::File,
+    fixture: &Conv2dFixture,
+    plan: ConvPlan,
+) -> Result<CaseExecution, String> {
     let fd = file.as_raw_fd();
     let shape = fixture.shape;
     let kernels = fixture.case.kernel;
-    let plan = ConvPlan::new(shape, kernels);
     let output_len = output_storage_bytes(shape, kernels);
 
     unsafe {
@@ -1010,6 +1018,34 @@ fn int8_accumulator_k1_cin_boundary_is_planable_and_gap_free() {
     assert_planable_and_gap_free(cases);
 }
 
+#[test]
+fn int8_accumulator_cbuf_split_probe_matrix_is_planable() {
+    for cin in [384u32, 385, 400, 512] {
+        let case = Conv2dCase {
+            width: 32,
+            height: 32,
+            cin,
+            cout: 64,
+            kernel: [1, 1],
+            stride: 1,
+            padding: [0, 0],
+            precision: OraclePrecision::Int8Accumulator,
+            pattern: OraclePattern::Dense { phase: 1 },
+        };
+        for weight_banks in 1..=5 {
+            let data_banks = 12 - weight_banks;
+            let plan =
+                ConvPlan::with_cbuf_banks(case.shape(), case.kernel, data_banks, weight_banks);
+            assert_eq!(plan.data_banks(), data_banks, "Cin={cin}");
+            assert_eq!(plan.weight_banks(), weight_banks, "Cin={cin}");
+            assert!(
+                !plan.tiles().is_empty(),
+                "Cin={cin}, {data_banks}/{weight_banks}"
+            );
+        }
+    }
+}
+
 fn run_hardware_case_matrix(title: &str, cases: Vec<Conv2dCase>) {
     let total_cases = cases.len();
     let file = OpenOptions::new()
@@ -1126,6 +1162,187 @@ fn int8_accumulator_k1_cin_boundary_probe() {
     let cases = int8_accumulator_k1_cin_boundary_cases();
     assert_eq!(cases.len(), 5);
     run_hardware_case_matrix("int8 accumulator K1 Cin boundary probe", cases);
+}
+
+/// A shape well inside the known-good region, used to prove the device is
+/// still healthy. Dense signed K1 accumulator at Cin=64 passes on any
+/// healthy RK3588, so a failure here is a statement about the *device*
+/// rather than about whatever shape is under test.
+fn accumulator_canary_passes(file: &std::fs::File) -> bool {
+    let case = Conv2dCase {
+        width: 32,
+        height: 32,
+        cin: 64,
+        cout: 64,
+        kernel: [1, 1],
+        stride: 1,
+        padding: [0, 0],
+        precision: OraclePrecision::Int8Accumulator,
+        pattern: OraclePattern::Dense { phase: 1 },
+    };
+    let result = catch_unwind(AssertUnwindSafe(|| {
+        let fixture = build_fixture(case)?;
+        execute_case(file, &fixture)
+    }));
+    matches!(result, Ok(Ok(_)))
+}
+
+/// Resolves the Cin/CBUF split matrix, guarding every row with a canary.
+///
+/// The RK3588 NPU can drop into a state where *every* job returns wrong
+/// results, including shapes that passed seconds earlier. Observed on
+/// `planck` 2026-08-31 during a wide accumulator sweep: from one case
+/// onwards nothing was correct again, `int8_accumulator_k1_cin_boundary_probe`
+/// went 5/5 pass to 5/5 fail, and only rebooting the board restored it.
+/// Nothing reports an error when this happens -- `prep_bo` still succeeds
+/// well inside its timeout -- so a long sweep silently stops measuring
+/// shapes and starts measuring the sick device.
+///
+/// The two failure signatures are distinguishable, and worth reading off
+/// the rows below:
+///
+///   * a *shape* failure leaves most of the output at `OUTPUT_SENTINEL`
+///     (`got -1515870800`), because the DPU never wrote those bytes;
+///   * a *sick device* returns fully written but wrong values.
+///
+/// A single bad shape does not cause it: 15 consecutive Cin=385 failures each
+/// left the canary clean, and the whole Cin=384 block still passes 5/5
+/// immediately after a Cin=385 failure. It takes roughly fifteen to twenty
+/// failing jobs in one process -- one full pass over this matrix is enough,
+/// and did it twice. So passes chain freely and failures are worth
+/// continuing past, but every failure re-checks the canary and the probe
+/// stops the moment the device itself is implicated.
+/// `ROCKET_PROBE_RESUME_AT` then picks the matrix back up, by index, once
+/// the board has been rebooted.
+///
+/// The canary between cases also makes the rows *deterministic*: without it
+/// the failing rows had ragged mismatch counts and a first-bad channel of
+/// 32; with it every failing row is a clean 65536/65536 from c=0.
+#[test]
+#[ignore = "needs /dev/accel/accel0 -- isolates the accumulator Cin>384 CBUF split boundary"]
+fn int8_accumulator_k1_cin_cbuf_split_probe() {
+    const CIN: [u32; 4] = [384, 385, 400, 512];
+    const SPLITS: u32 = 5;
+
+    let file = OpenOptions::new()
+        .read(true)
+        .write(true)
+        .open(DEVICE_PATH)
+        .expect("failed to open RK3588 NPU device");
+
+    let resume: usize = std::env::var("ROCKET_PROBE_RESUME_AT")
+        .ok()
+        .and_then(|value| value.parse().ok())
+        .unwrap_or(0);
+
+    println!("\n=== int8 accumulator K1 Cin/CBUF split probe ===");
+    println!("  matrix: Cin 384/385/400/512 x weight banks 1..=5, ascending");
+    println!(
+        "  every failure re-checks a Cin=64 canary; the probe stops only if the device is sick"
+    );
+    if resume != 0 {
+        println!("  resuming at index {resume}");
+    }
+
+    if !accumulator_canary_passes(&file) {
+        println!(
+            "\n  CANARY FAILED before any measurement (dense K1 Cin=64, which passes on any\n  \
+             healthy device). The NPU is sick -- reboot the board and re-run. Nothing this\n  \
+             probe could print below would be trustworthy."
+        );
+        return;
+    }
+    println!("  canary ok (dense K1 Cin=64): the device is healthy");
+
+    let mut failures = 0usize;
+    for (cin_index, cin) in CIN.into_iter().enumerate() {
+        let base = cin_index * SPLITS as usize;
+        if base + SPLITS as usize <= resume {
+            continue;
+        }
+
+        let case = Conv2dCase {
+            width: 32,
+            height: 32,
+            cin,
+            cout: 64,
+            kernel: [1, 1],
+            stride: 1,
+            padding: [0, 0],
+            precision: OraclePrecision::Int8Accumulator,
+            pattern: OraclePattern::Dense { phase: 1 },
+        };
+        let fixture = build_fixture(case).expect("build focused accumulator fixture");
+        println!("\n  Cin={cin}, coefficient_bytes={}", fixture.weights.len());
+
+        for (split_index, weight_banks) in (1..=SPLITS).enumerate() {
+            let index = base + split_index;
+            let data_banks = 12 - weight_banks;
+            if index < resume {
+                println!("    [{index:2}] skip banks={data_banks}/{weight_banks} (before resume)");
+                continue;
+            }
+
+            let result = catch_unwind(AssertUnwindSafe(|| {
+                let plan = ConvPlan::with_cbuf_banks(
+                    fixture.shape,
+                    fixture.case.kernel,
+                    data_banks,
+                    weight_banks,
+                );
+                let execution = execute_case_output_with_plan(&file, &fixture, plan)?;
+                let report = compare_output(&fixture, &execution.plan, &execution.output);
+                Ok::<_, String>((execution.plan.tiles().len(), report))
+            }));
+
+            let failure = match result {
+                Ok(Ok((tiles, report))) if report.mismatches == 0 => {
+                    println!(
+                        "    [{index:2}] PASS banks={data_banks}/{weight_banks} tiles={tiles}"
+                    );
+                    continue;
+                }
+                Ok(Ok((tiles, report))) => format!(
+                    "FAIL banks={data_banks}/{weight_banks} tiles={tiles} mismatches={} \
+                     tile_mismatches={:?} first={}",
+                    report.mismatches,
+                    report.tile_mismatches,
+                    report.samples.first().map(String::as_str).unwrap_or("none"),
+                ),
+                Ok(Err(error)) => format!("ERROR banks={data_banks}/{weight_banks}: {error}"),
+                Err(payload) => format!(
+                    "PANIC banks={data_banks}/{weight_banks}: {}",
+                    panic_message(payload)
+                ),
+            };
+
+            failures += 1;
+            println!("    [{index:2}] {failure}");
+
+            if accumulator_canary_passes(&file) {
+                println!("         canary still ok: the device is healthy, this row is real");
+                continue;
+            }
+
+            println!(
+                "\n  CANARY FAILED after index {index} (Cin={cin}, banks={data_banks}/{weight_banks}).\n  \
+                 The device is now sick, so this row is the last trustworthy one and every\n  \
+                 later point would measure the device rather than its own shape.\n  \
+                 Reboot the board, then continue with:\n    \
+                 ROCKET_PROBE_RESUME_AT={} <this binary> int8_accumulator_k1_cin_cbuf_split_probe \
+                 --ignored --nocapture",
+                index + 1,
+            );
+            return;
+        }
+    }
+
+    println!("\n=== int8 accumulator K1 Cin/CBUF split probe summary ===");
+    println!(
+        "  covered the whole matrix: {} of {} points failed, device healthy throughout",
+        failures,
+        CIN.len() * SPLITS as usize,
+    );
 }
 
 #[test]
