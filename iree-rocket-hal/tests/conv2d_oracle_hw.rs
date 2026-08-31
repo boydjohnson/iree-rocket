@@ -533,7 +533,8 @@ fn dense_coefficient_vgg_block_cases() -> Vec<Conv2dCase> {
 /// Hardware-confirmed exact i32-accumulator regression cases through the
 /// shared production oracle. Together these cover a partial second output
 /// block, a partial third block at stride 2, the K3 Cin=32 ceiling, and the
-/// Cout=512 ceiling for both kernels with dense signed data.
+/// K1 Cin=352 single-tile boundary at 32x32 and Cout=512 ceilings with dense
+/// signed data.
 fn int8_accumulator_regression_cases() -> Vec<Conv2dCase> {
     vec![
         Conv2dCase {
@@ -557,6 +558,17 @@ fn int8_accumulator_regression_cases() -> Vec<Conv2dCase> {
             padding: [0, 0],
             precision: OraclePrecision::Int8Accumulator,
             pattern: OraclePattern::Dense { phase: 2 },
+        },
+        Conv2dCase {
+            width: 32,
+            height: 32,
+            cin: 352,
+            cout: 64,
+            kernel: [1, 1],
+            stride: 1,
+            padding: [0, 0],
+            precision: OraclePrecision::Int8Accumulator,
+            pattern: OraclePattern::Dense { phase: 1 },
         },
         Conv2dCase {
             width: 32,
@@ -594,6 +606,47 @@ fn int8_accumulator_regression_cases() -> Vec<Conv2dCase> {
     ]
 }
 
+/// Sweeps every native 16-channel input atom through the K1 matcher range.
+/// On RK3588 (2026-08-31), Cin 16..=352 passed exactly while Cin 368 and 384
+/// failed. Keep the spatial extent, Cout, pattern, and phase fixed so this
+/// transition remains attributable to Cin and its planning consequences.
+fn int8_accumulator_k1_cin_atom_sweep_cases() -> Vec<Conv2dCase> {
+    (16..=384)
+        .step_by(16)
+        .map(|cin| Conv2dCase {
+            width: 32,
+            height: 32,
+            cin,
+            cout: 64,
+            kernel: [1, 1],
+            stride: 1,
+            padding: [0, 0],
+            precision: OraclePrecision::Int8Accumulator,
+            pattern: OraclePattern::Dense { phase: 1 },
+        })
+        .collect()
+}
+
+/// Resolves the exact logical-Cin transition around the last passing native
+/// atom from `int8_accumulator_k1_cin_atom_sweep_cases`. RK3588 confirmed 351
+/// and 352 pass exactly, while 353, 354, and 367 fail (2026-08-31).
+fn int8_accumulator_k1_cin_boundary_cases() -> Vec<Conv2dCase> {
+    [351u32, 352, 353, 354, 367]
+        .into_iter()
+        .map(|cin| Conv2dCase {
+            width: 32,
+            height: 32,
+            cin,
+            cout: 64,
+            kernel: [1, 1],
+            stride: 1,
+            padding: [0, 0],
+            precision: OraclePrecision::Int8Accumulator,
+            pattern: OraclePattern::Dense { phase: 1 },
+        })
+        .collect()
+}
+
 /// Shapes the first expanded oracle run (RK3588, 2026-08-31) proved are not
 /// yet safe. Kept separate from the green regression gate so the failures
 /// remain reproducible without making every normal board gate fail:
@@ -601,8 +654,8 @@ fn int8_accumulator_regression_cases() -> Vec<Conv2dCase> {
 /// * odd 9x7 output extents leave the final logical accumulator(s) unwritten;
 /// * several small-Cin shapes corrupt most values at exact 32-lane block
 ///   boundaries;
-/// * K1 Cin=384 is not correct with dense signed coefficients despite being
-///   the earlier sparse/random sweep's largest measured-good value;
+/// * dense signed K1 at 32x32 is exact at Cin=352 but fails immediately at
+///   Cin=353, where this geometry first changes from one output tile to two;
 /// * the three-tile Cin=3 selector case corrupts values and leaves later tile
 ///   regions unwritten.
 fn int8_accumulator_known_limitation_cases() -> Vec<Conv2dCase> {
@@ -630,7 +683,7 @@ fn int8_accumulator_known_limitation_cases() -> Vec<Conv2dCase> {
     cases.push(Conv2dCase {
         width: 32,
         height: 32,
-        cin: 384,
+        cin: 353,
         cout: 64,
         kernel: [1, 1],
         stride: 1,
@@ -823,7 +876,7 @@ fn dense_coefficient_vgg_block_matrix_is_planable_and_gap_free() {
 #[test]
 fn int8_accumulator_matrices_are_planable_and_gap_free() {
     let regression = int8_accumulator_regression_cases();
-    assert_eq!(regression.len(), 5);
+    assert_eq!(regression.len(), 6);
     assert_planable_and_gap_free(regression);
 
     let limitations = int8_accumulator_known_limitation_cases();
@@ -836,6 +889,38 @@ fn int8_accumulator_matrices_are_planable_and_gap_free() {
         "large selector case must exercise tiling"
     );
     assert_planable_and_gap_free(limitations);
+}
+
+#[test]
+fn int8_accumulator_k1_cin_atom_sweep_is_planable_and_gap_free() {
+    let cases = int8_accumulator_k1_cin_atom_sweep_cases();
+    assert_eq!(cases.len(), 24);
+    assert_eq!(cases.first().unwrap().cin, 16);
+    assert_eq!(cases.last().unwrap().cin, 384);
+    assert!(cases.windows(2).all(|pair| pair[1].cin - pair[0].cin == 16));
+    assert_planable_and_gap_free(cases);
+}
+
+#[test]
+fn int8_accumulator_k1_cin_boundary_is_planable_and_gap_free() {
+    let cases = int8_accumulator_k1_cin_boundary_cases();
+    assert_eq!(
+        cases.iter().map(|case| case.cin).collect::<Vec<_>>(),
+        [351, 352, 353, 354, 367]
+    );
+    assert_eq!(
+        ConvPlan::new(cases[1].shape(), cases[1].kernel)
+            .tiles()
+            .len(),
+        1
+    );
+    assert_eq!(
+        ConvPlan::new(cases[2].shape(), cases[2].kernel)
+            .tiles()
+            .len(),
+        2
+    );
+    assert_planable_and_gap_free(cases);
 }
 
 fn run_hardware_case_matrix(title: &str, cases: Vec<Conv2dCase>) {
@@ -936,12 +1021,28 @@ fn dense_coefficient_vgg_blocks_match_oracle() {
 #[ignore = "needs /dev/accel/accel0 -- validates exact i32 accumulator values, partial blocks, channel ceilings, and stride"]
 fn int8_accumulator_regression_matrix_matches_oracle() {
     let cases = int8_accumulator_regression_cases();
-    assert_eq!(cases.len(), 5);
+    assert_eq!(cases.len(), 6);
     run_hardware_case_matrix("int8 accumulator regression matrix", cases);
 }
 
 #[test]
-#[ignore = "known RK3588 failures -- manually characterizes accumulator tails, block boundaries, Cin=384, and tiling"]
+#[ignore = "needs /dev/accel/accel0 -- locates the dense signed K1 Int8Accumulator Cin boundary"]
+fn int8_accumulator_k1_cin_atom_sweep() {
+    let cases = int8_accumulator_k1_cin_atom_sweep_cases();
+    assert_eq!(cases.len(), 24);
+    run_hardware_case_matrix("int8 accumulator K1 Cin atom sweep", cases);
+}
+
+#[test]
+#[ignore = "needs /dev/accel/accel0 -- resolves the exact dense signed K1 Int8Accumulator Cin transition"]
+fn int8_accumulator_k1_cin_boundary_probe() {
+    let cases = int8_accumulator_k1_cin_boundary_cases();
+    assert_eq!(cases.len(), 5);
+    run_hardware_case_matrix("int8 accumulator K1 Cin boundary probe", cases);
+}
+
+#[test]
+#[ignore = "known RK3588 failures -- manually characterizes accumulator tails, block boundaries, Cin>352, and tiling"]
 fn int8_accumulator_known_limitations_probe() {
     let cases = int8_accumulator_known_limitation_cases();
     assert_eq!(cases.len(), 8);
