@@ -101,7 +101,6 @@ struct CaseExecution {
     /// probes read this: the assembled `output` already assumes the answer
     /// they are trying to measure.
     raw: Vec<u8>,
-    tiles: Option<Vec<AccumulatorOutputTile>>,
 }
 
 fn assemble_staged_accumulator_output(
@@ -333,7 +332,6 @@ fn execute_case_output_with_plan(
             plan,
             output,
             raw: raw_output,
-            tiles: accumulator_tiles,
         })
     }
 }
@@ -1928,8 +1926,12 @@ fn cartesian_conv2d_oracle_sweep_runs_every_case_before_failing() {
 /// 128-byte block model matches every lane at every hot pixel, and exactly
 /// `Cout` lanes come back. Where it is violated, two things change at once:
 ///
-///   * the count of nonzero lanes *doubles* -- 64 lanes for Cout=32, 128 for
-///     Cout=96 -- so each value is committed more than once;
+///   * exactly one extra 128-byte block's worth of lanes (32) comes back
+///     non-zero -- 64 for Cout=32, 128 for Cout=96 -- and those are the
+///     `OUTPUT_SENTINEL` still sitting in the **trailing block the DPU never
+///     wrote**. The excess is one block in every odd case and zero in every
+///     even one, so the DPU commits whole 256-byte units and drops the odd
+///     trailing 128-byte block;
 ///   * the pixel stride becomes 256 bytes rather than 128. At 3x3 Cout=32
 ///     with the hot pixel at (0,1), the 128-byte model matches 0/32 lanes
 ///     while the 256-byte model matches 32/32.
@@ -1937,15 +1939,45 @@ fn cartesian_conv2d_oracle_sweep_runs_every_case_before_failing() {
 /// So the DPU commits accumulator output in **256-byte units**, and the
 /// 128-byte block model is not wrong so much as *coincidental*: it agrees
 /// exactly when the total block count is even, which is the parity rule.
-/// Not yet explained: at a violating shape the row stride matches neither
-/// model -- 3x3 Cout=32 with the hot pixel at (1,0) starts at offset 512,
-/// against 384 for the 128-byte model and 768 for the 256-byte one.
+/// `int8_accumulator_output_address_map_probe` sweeps the hot pixel over
+/// every position and settles what the addressing does. The **passing**
+/// shapes come back as exact bijections onto the shipped model -- 4x4
+/// Cout=32 maps pixel `p` to block `p` for all sixteen, and 3x3 Cout=64 maps
+/// `p` to blocks `p` and `p + 9`, surface-major, for all nine -- which is
+/// what validates the method. The **failing** shape does not:
+///
+/// ```text
+/// 3x3 Cout=32, pixel -> block written (correct would be p -> p)
+///   0 -> 0     1 -> 0 and 2   2 -> 3    3 -> 3
+///   4 -> 4     5 -> 6         6 -> 7    7 -> 7    8 -> nothing
+/// ```
+///
+/// Blocks 0, 2, 3, 4, 6, 7 receive data; 1 and 5 receive only zeros; block
+/// 8, the odd trailing one, is never written at all. The map is
+/// *non-injective*: pixels 2 and 3 alias onto one block, so do 6 and 7,
+/// pixel 1 lands twice and pixel 8 vanishes. That is a corrupted address
+/// computation, not a different stride constant.
+///
+/// Note the counting caveat that produced an earlier misreading here: the
+/// staging buffer is poisoned with `OUTPUT_SENTINEL`, which is non-zero, so
+/// "non-zero lane" means *written data or untouched sentinel*. Separate the
+/// two before drawing conclusions from lane counts.
+///
+/// **Open contradiction, worth resolving before anyone writes a fix.** The
+/// parity rule says raising the accumulator granule to 64 should fix these
+/// shapes: at 9x7 Cout=32 it takes `blocks` from 1 to 2, so
+/// `63 * 2 = 126` is even. Measured on hardware, it changes nothing -- those
+/// shapes still fail. So either the `blocks` the hardware acts on is not
+/// derived from `padded_out_channels`, or the granule never reached the
+/// registers that matter. Until that is settled the parity rule is a
+/// reliable *predictor* without a confirmed *cause*, and constraining the
+/// planner to even parity would be a guess.
 fn accumulator_layout_probe(
     file: &std::fs::File,
     extent: (u32, u32),
     cout: u32,
     hot: (usize, usize, usize),
-) -> Result<(Conv2dFixture, Vec<usize>, Vec<AccumulatorOutputTile>), String> {
+) -> Result<Vec<u8>, String> {
     let (hot_y, hot_x, hot_c) = hot;
     let case = Conv2dCase {
         width: extent.0,
@@ -1965,51 +1997,61 @@ fn accumulator_layout_probe(
     fixture.input.iter_mut().for_each(|byte| *byte = 0);
     fixture.input[feature_offset(fixture.shape, hot_c, hot_y, hot_x)] = 1;
 
-    let execution = execute_case_output(file, &fixture)?;
-    let tiles = execution
-        .tiles
-        .clone()
-        .ok_or_else(|| "accumulator output should stage through tiles".to_string())?;
+    Ok(execute_case_output(file, &fixture)?.raw)
+}
 
-    let mut nonzero = Vec::new();
-    let mut offset = 0;
-    while offset + 4 <= execution.raw.len() {
-        let value = i32::from_le_bytes(execution.raw[offset..offset + 4].try_into().unwrap());
-        if value != 0 {
-            nonzero.push(offset);
-        }
-        offset += 4;
-    }
-    Ok((fixture, nonzero, tiles))
+/// One i32 lane of the staging buffer, classified.
+///
+/// The buffer is pre-poisoned with `OUTPUT_SENTINEL`, which is *non-zero*,
+/// so "non-zero" alone cannot separate written data from bytes the DPU never
+/// touched. Conflating the two is what made an earlier reading of this probe
+/// report values written twice, when the excess was an untouched trailing
+/// block.
+#[derive(PartialEq)]
+enum Lane {
+    Sentinel,
+    Zero,
+    Data,
+}
+
+fn classify_lanes(raw: &[u8]) -> Vec<Lane> {
+    let sentinel = i32::from_le_bytes([OUTPUT_SENTINEL; 4]);
+    raw.chunks_exact(4)
+        .map(
+            |chunk| match i32::from_le_bytes(chunk.try_into().unwrap()) {
+                value if value == sentinel => Lane::Sentinel,
+                0 => Lane::Zero,
+                _ => Lane::Data,
+            },
+        )
+        .collect()
 }
 
 #[test]
-#[ignore = "needs /dev/accel/accel0 -- measures the accumulator output atom at odd block counts"]
-fn int8_accumulator_output_layout_probe() {
+#[ignore = "needs /dev/accel/accel0 -- maps where the DPU physically addresses accumulator output"]
+fn int8_accumulator_output_address_map_probe() {
     let file = OpenOptions::new()
         .read(true)
         .write(true)
         .open(DEVICE_PATH)
         .expect("failed to open RK3588 NPU device");
 
-    println!("\n=== accumulator output layout probe ===");
-    if !accumulator_canary_passes(&file) {
-        println!("  CANARY FAILED -- the NPU is sick, reboot the board");
-        return;
-    }
+    println!("\n=== accumulator output address map ===");
 
-    // Cout=64 is two blocks and passes; 96 is three and fails; 32 is one and
-    // fails. The first is the shape the 128-byte block was established on.
-    // (extent, Cout) pairs straddling the parity rule: 4x4 has 16 pixels so
-    // it satisfies it at any Cout, while 3x3's 9 pixels leave the parity to
-    // the block count. The failing rows are the point -- the passing ones
-    // are the contrast that says what a correct layout looks like.
+    // Passing shapes first, deliberately: only failures walk the device
+    // toward the sick state, so the clean control maps are collected while
+    // the device is certainly healthy.
     for (extent, cout) in [
         ((4u32, 4u32), 32u32),
         ((3, 3), 64),
         ((3, 3), 32),
         ((3, 3), 96),
     ] {
+        if !accumulator_canary_passes(&file) {
+            println!("\n  CANARY FAILED -- the NPU is sick, reboot the board");
+            return;
+        }
+
         let control = Conv2dCase {
             width: extent.0,
             height: extent.1,
@@ -2021,80 +2063,80 @@ fn int8_accumulator_output_layout_probe() {
             precision: OraclePrecision::Int8Accumulator,
             pattern: OraclePattern::Dense { phase: 0 },
         };
-        match build_fixture(control).and_then(|fixture| {
+        let shape = control.shape();
+        let width = shape.output_width([1, 1]) as usize;
+        let height = shape.output_height([1, 1]) as usize;
+        let blocks = (shape.padded_out_channels() as usize * 4) / 128;
+        let verdict = match build_fixture(control).and_then(|fixture| {
             let execution = execute_case_output(&file, &fixture)?;
-            let report = compare_output(&fixture, &execution.plan, &execution.output);
-            Ok((report.mismatches, execution.plan.tiles().len()))
+            Ok(compare_output(&fixture, &execution.plan, &execution.output).mismatches)
         }) {
-            Ok((0, tiles)) => {
-                println!(
-                    "\n  {}x{} Cout={cout} pixels={} blocks={}: control PASSES (tiles={tiles})",
-                    extent.0,
-                    extent.1,
-                    extent.0 * extent.1,
-                    (cout.next_multiple_of(32) * 4) / 128,
-                )
-            }
-            Ok((mismatches, tiles)) => println!(
-                "\n  {}x{} Cout={cout} pixels={} blocks={}: control FAILS, {mismatches} mismatches (tiles={tiles})",
-                extent.0,
-                extent.1,
-                extent.0 * extent.1,
-                (cout.next_multiple_of(32) * 4) / 128,
-            ),
-            Err(error) => println!(
-                "\n  {}x{} Cout={cout}: control ERROR {error}",
-                extent.0, extent.1
-            ),
-        }
+            Ok(0) => "PASSES".to_string(),
+            Ok(mismatches) => format!("FAILS ({mismatches} mismatches)"),
+            Err(error) => format!("ERROR {error}"),
+        };
+        println!(
+            "\n  {width}x{height} Cout={cout}: pixels={} blocks/pixel={blocks} product={} -> control {verdict}",
+            width * height,
+            width * height * blocks,
+        );
+        // Surface-major: a pixel's block advances by 128 within a surface,
+        // and each surface is tile_pixels blocks further on. So a
+        // multi-block shape's lanes are legitimately split across surfaces,
+        // and "SPLIT" there is correct rather than a symptom.
+        println!(
+            "    shipped model predicts block index {} for pixel p, surface stride {}",
+            "p",
+            width * height * 128,
+        );
 
-        for hot in [(0usize, 0usize, 0usize), (0, 1, 0), (1, 0, 0)] {
-            let (fixture, nonzero, tiles) = match accumulator_layout_probe(&file, extent, cout, hot)
-            {
-                Ok(result) => result,
-                Err(error) => {
-                    println!("  Cout={cout} hot={hot:?}: ERROR {error}");
-                    continue;
+        let mut sentinel_blocks = Vec::new();
+        let mut total_blocks = 0;
+        for y in 0..height {
+            for x in 0..width {
+                let raw = match accumulator_layout_probe(&file, extent, cout, (y, x, 0)) {
+                    Ok(raw) => raw,
+                    Err(error) => {
+                        println!("    hot=({y},{x}): ERROR {error}");
+                        continue;
+                    }
+                };
+                let lanes = classify_lanes(&raw);
+                let data: Vec<usize> = lanes
+                    .iter()
+                    .enumerate()
+                    .filter(|(_, lane)| **lane == Lane::Data)
+                    .map(|(index, _)| index * 4)
+                    .collect();
+
+                if total_blocks == 0 {
+                    total_blocks = raw.len() / 128;
+                    sentinel_blocks = (0..total_blocks)
+                        .filter(|block| {
+                            (0..32).all(|lane| lanes[block * 32 + lane] == Lane::Sentinel)
+                        })
+                        .collect();
                 }
-            };
-            let shape = fixture.shape;
-            let padded = shape.padded_out_channels() as usize;
-            let blocks = (padded * 4).div_ceil(shape.output_atom_bytes() as usize);
-            let pixels = shape.output_width([1, 1]) as usize * shape.output_height([1, 1]) as usize;
 
-            // Model A: the shipped 128-byte block, surface-major.
-            // Model B: a 256-byte atom holding 64 i32 lanes contiguously.
-            let base = tiles.first().map(|tile| tile.scratch_offset).unwrap_or(0);
-            let local = hot.0 * shape.output_width([1, 1]) as usize + hot.1;
-            let model = |atom: usize| -> Vec<usize> {
-                let lanes = atom / 4;
-                (0..cout as usize)
-                    .map(|c| base + (c / lanes) * pixels * atom + local * atom + (c % lanes) * 4)
-                    .collect::<Vec<_>>()
-            };
-            let a = model(128);
-            let b = model(256);
-            let matches = |predicted: &[usize]| -> String {
-                let hit = predicted.iter().filter(|o| nonzero.contains(o)).count();
-                format!("{hit}/{}", predicted.len())
-            };
-
-            println!(
-                "  Cout={cout:3} blocks/pixel={blocks} hot={hot:?}: {} nonzero lanes; \
-                 128-byte model {} | 256-byte model {}",
-                nonzero.len(),
-                matches(&a),
-                matches(&b),
-            );
-            if nonzero.len() <= 12 {
-                println!("      offsets {nonzero:?}");
-            } else {
-                println!(
-                    "      first 8 offsets {:?} .. last {:?}",
-                    &nonzero[..8],
-                    nonzero.last(),
-                );
+                match (data.first(), data.last()) {
+                    (Some(first), Some(last)) => println!(
+                        "    hot=({y},{x}): {:3} data lanes {first:5}..={last:5}  block {:<3} {}",
+                        data.len(),
+                        first / 128,
+                        if data.len() == (last - first) / 4 + 1 {
+                            "contiguous"
+                        } else {
+                            "SPLIT"
+                        },
+                    ),
+                    _ => println!("    hot=({y},{x}): no data written anywhere"),
+                }
             }
         }
+        println!(
+            "    blocks the DPU never wrote: {sentinel_blocks:?} of {total_blocks} \
+             ({} bytes allocated)",
+            total_blocks * 128,
+        );
     }
 }
