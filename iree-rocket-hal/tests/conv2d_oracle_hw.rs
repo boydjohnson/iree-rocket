@@ -32,7 +32,7 @@ use std::{
 
 use conv2d_oracle::{
     Conv2dCase, Conv2dFixture, OraclePattern, OraclePrecision, build_fixture, expected_output,
-    f16_to_f32, output_offset, output_storage_bytes,
+    f16_to_f32, feature_offset, output_offset, output_storage_bytes,
 };
 use iree_rocket_hal::rocket::{
     conv::{AccumulatorOutputTile, Buffers, ConvPlan, Shape},
@@ -96,6 +96,12 @@ struct CaseSuccess {
 struct CaseExecution {
     plan: ConvPlan,
     output: Vec<u8>,
+    /// The staging buffer exactly as the DPU left it, before
+    /// `assemble_staged_accumulator_output` reinterprets it. The layout
+    /// probes read this: the assembled `output` already assumes the answer
+    /// they are trying to measure.
+    raw: Vec<u8>,
+    tiles: Option<Vec<AccumulatorOutputTile>>,
 }
 
 fn assemble_staged_accumulator_output(
@@ -319,11 +325,16 @@ fn execute_case_output_with_plan(
             .map_err(|error| format!("completion wait: {error}"))?;
 
         let raw_output = std::slice::from_raw_parts(output.buffer.host_ptr, output_len).to_vec();
-        let output = match accumulator_tiles {
-            Some(tiles) => assemble_staged_accumulator_output(shape, kernels, &raw_output, &tiles)?,
-            None => raw_output,
+        let output = match &accumulator_tiles {
+            Some(tiles) => assemble_staged_accumulator_output(shape, kernels, &raw_output, tiles)?,
+            None => raw_output.clone(),
         };
-        Ok(CaseExecution { plan, output })
+        Ok(CaseExecution {
+            plan,
+            output,
+            raw: raw_output,
+            tiles: accumulator_tiles,
+        })
     }
 }
 
@@ -788,11 +799,14 @@ fn int8_accumulator_k1_cin_boundary_cases() -> Vec<Conv2dCase> {
 ///     ever failed as the fifth case of a sweep.
 ///   * `Cin=5  Cout=65 1x1` -- fails 12/12. Real.
 ///
-/// The four real failures and the two passes fit one rule: the accumulator
-/// output path wants exactly two 128-byte output surfaces. Cout 33..=64
-/// gives two and passes; Cout <= 32 gives one and Cout=65 gives three, and
-/// both fail. Untested outside these six points -- it is a hypothesis that
-/// fits them, not a measured law.
+/// All six points are explained by the parity rule in
+/// `int8_accumulator_output_parity_cases`: a dense accumulator conv is
+/// correct exactly when `tile_pixels * blocks_per_pixel` is even. Every case
+/// here is 9x7, which is 63 pixels -- odd -- so parity falls to the block
+/// count. Cout 33 and 64 give two blocks and pass; Cout 1, 31, 32 give one
+/// and Cout 65 gives three, and those fail. Nothing here is specific to Cin
+/// or the kernel, and none of it is specific to Cout either: the same Cout
+/// values all pass at an even pixel count.
 fn int8_accumulator_known_limitation_cases() -> Vec<Conv2dCase> {
     let mut cases = Vec::new();
     for (cin, cout, kernel) in [
@@ -816,6 +830,164 @@ fn int8_accumulator_known_limitation_cases() -> Vec<Conv2dCase> {
         });
     }
     cases
+}
+
+/// Cout swept across the accumulator's 128-byte output-surface boundaries.
+///
+/// `Shape::output_atom_bytes` is 128 for a dense int8 accumulator -- 32 i32
+/// channels per surface -- so this walks Cout over every multiple of 32 and
+/// the values either side of it.
+///
+/// Measured on `planck` 2026-08-31, isolated via `ROCKET_PROBE_ONLY`. At
+/// 9x7 the result is exact at all 21 points in both families: every odd
+/// block count fails and every even one passes.
+///
+/// **That reading was too narrow.** Both families here are 9x7, which is 63
+/// pixels -- odd -- so the block count alone decided the parity of
+/// `pixels * blocks`. At 4x4, 16 pixels, *every* Cout passes including the
+/// odd block counts. The rule this sweep was really measuring is the one in
+/// `int8_accumulator_output_parity_cases`: `tile_pixels * blocks_per_pixel`
+/// must be even. Read the table below as "at 63 pixels", not as a law about
+/// Cout.
+///
+/// | blocks/pixel | Cout range   | result |
+/// |--------------|--------------|--------|
+/// | 1            | 1..=32       | fails  |
+/// | 2            | 33..=64      | passes |
+/// | 3            | 65..=96      | fails  |
+/// | 4            | 97..=128     | passes |
+/// | 5            | 129..=160    | fails  |
+/// | 6, 8         | 161..=192,256| passes |
+///
+/// This subsumes every entry of `int8_accumulator_known_limitation_cases`,
+/// all of which are 9x7.
+///
+/// Raising the accumulator output granule to 64, so the padded count always
+/// lands on an even block boundary, changes nothing on hardware -- so the
+/// rounding in `Shape::padded_out_channels` is not the mechanism. The
+/// mechanism is in `int8_accumulator_output_layout_probe`: the DPU commits
+/// accumulator output in 256-byte units, and the 128-byte block model only
+/// coincides with that when the total block count is even.
+///
+/// Measure with `ROCKET_PROBE_ONLY`, one case per process: a plain sweep
+/// contaminates its own later rows, and even isolated runs are skewed by a
+/// recent history of failures -- Cout 33/40/48 at K1x1 read as failures in a
+/// first pass and pass 12/12 once measured on a rested device.
+fn int8_accumulator_cout_sweep_cases() -> Vec<Conv2dCase> {
+    const COUT: [u32; 21] = [
+        1, 2, 8, 16, 31, 32, 33, 40, 48, 63, 64, 65, 80, 96, 127, 128, 129, 160, 192, 255, 256,
+    ];
+    let mut cases = Vec::new();
+    for (cin, kernel) in [(5u32, 1usize), (3, 3)] {
+        for cout in COUT {
+            cases.push(Conv2dCase {
+                width: 9,
+                height: 7,
+                cin,
+                cout,
+                kernel: [kernel, kernel],
+                stride: 1,
+                padding: [kernel / 2, kernel / 2],
+                precision: OraclePrecision::Int8Accumulator,
+                pattern: OraclePattern::Dense { phase: 0 },
+            });
+        }
+    }
+    cases
+}
+
+/// Does the even-blocks Cout rule actually depend only on Cout?
+///
+/// `int8_accumulator_cout_sweep_cases` established the rule at 9x7 with
+/// Cin=5 and Cin=3, and it held at all 21 Cout values in both. But the
+/// layout probe's own control shape, 4x4 with Cin=8, *passes* at Cout 32 and
+/// 96 -- both odd block counts the rule says must fail. So the rule is not a
+/// property of Cout alone, and this matrix is what separates the spatial
+/// size from Cin.
+///
+/// Ordered Cin-major within each spatial size so a sweep walks one variable
+/// at a time. Measure with `ROCKET_PROBE_ONLY`.
+fn int8_accumulator_cout_shape_interaction_cases() -> Vec<Conv2dCase> {
+    let mut cases = Vec::new();
+    for (width, height) in [(4u32, 4u32), (9, 7)] {
+        for cin in [3u32, 5, 8, 16] {
+            for cout in [32u32, 64, 96] {
+                cases.push(Conv2dCase {
+                    width,
+                    height,
+                    cin,
+                    cout,
+                    kernel: [1, 1],
+                    stride: 1,
+                    padding: [0, 0],
+                    precision: OraclePrecision::Int8Accumulator,
+                    pattern: OraclePattern::Dense { phase: 0 },
+                });
+            }
+        }
+    }
+    cases
+}
+
+/// Tests the unified parity rule the Cout and shape sweeps converge on.
+///
+/// The Cout rule was never about Cout. 4x4 passes at every Cout, including
+/// the odd block counts that fail at 9x7 -- and 4x4 has 16 pixels while 9x7
+/// has 63. What both sweeps were really measuring is
+///
+/// > `tile_pixels * blocks_per_pixel` must be **even**,
+///
+/// i.e. a tile's output must be a whole number of 256-byte units, as if the
+/// DPU commits output two 128-byte blocks at a time. An even pixel count
+/// satisfies it for any Cout, which is why 4x4 never fails; an odd one
+/// leaves the parity to the block count, which is why 9x7 tracks Cout.
+///
+/// These twelve cases are chosen so pixel parity and block parity disagree,
+/// which the earlier sweeps never did -- both held one fixed while moving
+/// the other. Predictions, all at Cin=8 and 1x1:
+///
+/// | shape | pixels | Cout | blocks | product | predicted |
+/// |-------|--------|------|--------|---------|-----------|
+/// | 3x3   | 9 odd  |  32  | 1      |  9 odd  | fails     |
+/// | 3x3   | 9 odd  |  64  | 2      | 18 even | passes    |
+/// | 3x3   | 9 odd  |  96  | 3      | 27 odd  | fails     |
+/// | 4x4   | 16 even|  32  | 1      | 16 even | passes    |
+/// | 4x4   | 16 even|  96  | 3      | 48 even | passes    |
+/// | 5x5   | 25 odd |  64  | 2      | 50 even | passes    |
+/// | 5x5   | 25 odd |  96  | 3      | 75 odd  | fails     |
+/// | 6x6   | 36 even|  32  | 1      | 36 even | passes    |
+/// | 9x7   | 63 odd | 128  | 4      | 252 even| passes    |
+/// | 9x7   | 63 odd | 160  | 5      | 315 odd | fails     |
+/// | 8x8   | 64 even| 160  | 5      | 320 even| passes    |
+/// | 8x8   | 64 even|  32  | 1      | 64 even | passes    |
+fn int8_accumulator_output_parity_cases() -> Vec<Conv2dCase> {
+    [
+        (3u32, 3u32, 32u32),
+        (3, 3, 64),
+        (3, 3, 96),
+        (4, 4, 32),
+        (4, 4, 96),
+        (5, 5, 64),
+        (5, 5, 96),
+        (6, 6, 32),
+        (9, 7, 128),
+        (9, 7, 160),
+        (8, 8, 160),
+        (8, 8, 32),
+    ]
+    .into_iter()
+    .map(|(width, height, cout)| Conv2dCase {
+        width,
+        height,
+        cin: 8,
+        cout,
+        kernel: [1, 1],
+        stride: 1,
+        padding: [0, 0],
+        precision: OraclePrecision::Int8Accumulator,
+        pattern: OraclePattern::Dense { phase: 0 },
+    })
+    .collect()
 }
 
 fn int8_neutral80_one_hot_four_way_cases() -> Vec<Conv2dCase> {
@@ -1487,6 +1659,54 @@ fn int8_accumulator_k1_cin_cbuf_split_probe() {
 }
 
 #[test]
+fn int8_accumulator_cout_sweep_is_planable_and_gap_free() {
+    let cases = int8_accumulator_cout_sweep_cases();
+    assert_eq!(cases.len(), 42);
+    assert_planable_and_gap_free(cases);
+}
+
+#[test]
+#[ignore = "needs /dev/accel/accel0 -- maps the accumulator Cout output-surface rule"]
+fn int8_accumulator_cout_sweep() {
+    run_hardware_case_matrix(
+        "int8 accumulator Cout sweep",
+        int8_accumulator_cout_sweep_cases(),
+    );
+}
+
+#[test]
+fn int8_accumulator_cout_shape_interaction_is_planable_and_gap_free() {
+    let cases = int8_accumulator_cout_shape_interaction_cases();
+    assert_eq!(cases.len(), 24);
+    assert_planable_and_gap_free(cases);
+}
+
+#[test]
+#[ignore = "needs /dev/accel/accel0 -- separates the Cout rule from the shape it was measured at"]
+fn int8_accumulator_cout_shape_interaction() {
+    run_hardware_case_matrix(
+        "int8 accumulator Cout/shape interaction",
+        int8_accumulator_cout_shape_interaction_cases(),
+    );
+}
+
+#[test]
+fn int8_accumulator_output_parity_is_planable_and_gap_free() {
+    let cases = int8_accumulator_output_parity_cases();
+    assert_eq!(cases.len(), 12);
+    assert_planable_and_gap_free(cases);
+}
+
+#[test]
+#[ignore = "needs /dev/accel/accel0 -- tests the tile_pixels * blocks parity rule"]
+fn int8_accumulator_output_parity_probe() {
+    run_hardware_case_matrix(
+        "int8 accumulator output parity",
+        int8_accumulator_output_parity_cases(),
+    );
+}
+
+#[test]
 #[ignore = "known RK3588 failures -- manually characterizes accumulator tails and output-block boundaries"]
 fn int8_accumulator_known_limitations_probe() {
     let cases = int8_accumulator_known_limitation_cases();
@@ -1685,4 +1905,196 @@ fn cartesian_conv2d_oracle_sweep_runs_every_case_before_failing() {
         failures.len(),
         total_cases,
     );
+}
+
+/// Where the DPU physically writes accumulator output, measured rather than
+/// assumed.
+///
+/// `Shape::output_atom_bytes` keeps the 128-byte block for the dense
+/// accumulator path on the strength of one measurement at Cin=Cout=64. That
+/// shape is two blocks per pixel -- an even count -- which is exactly the
+/// case a 128-byte-block model and a 256-byte-atom model cannot be told
+/// apart by, since both put channel `c` at the same address. Every shape
+/// that fails the even-blocks rule has an *odd* count, where the two models
+/// diverge, and none of them had ever been measured.
+///
+/// Method: drive one input element to a nonzero value and zero the rest.
+/// With a 1x1 kernel and the `Dense` pattern -- whose every coefficient is
+/// nonzero -- exactly one output pixel is nonzero, and its whole channel
+/// vector is. The offsets of the nonzero i32 lanes in the untouched staging
+/// buffer are then the layout, with nothing inferred.
+///
+/// **Result, measured 2026-08-31.** Where the parity rule holds the
+/// 128-byte block model matches every lane at every hot pixel, and exactly
+/// `Cout` lanes come back. Where it is violated, two things change at once:
+///
+///   * the count of nonzero lanes *doubles* -- 64 lanes for Cout=32, 128 for
+///     Cout=96 -- so each value is committed more than once;
+///   * the pixel stride becomes 256 bytes rather than 128. At 3x3 Cout=32
+///     with the hot pixel at (0,1), the 128-byte model matches 0/32 lanes
+///     while the 256-byte model matches 32/32.
+///
+/// So the DPU commits accumulator output in **256-byte units**, and the
+/// 128-byte block model is not wrong so much as *coincidental*: it agrees
+/// exactly when the total block count is even, which is the parity rule.
+/// Not yet explained: at a violating shape the row stride matches neither
+/// model -- 3x3 Cout=32 with the hot pixel at (1,0) starts at offset 512,
+/// against 384 for the 128-byte model and 768 for the 256-byte one.
+fn accumulator_layout_probe(
+    file: &std::fs::File,
+    extent: (u32, u32),
+    cout: u32,
+    hot: (usize, usize, usize),
+) -> Result<(Conv2dFixture, Vec<usize>, Vec<AccumulatorOutputTile>), String> {
+    let (hot_y, hot_x, hot_c) = hot;
+    let case = Conv2dCase {
+        width: extent.0,
+        height: extent.1,
+        cin: 8,
+        cout,
+        kernel: [1, 1],
+        stride: 1,
+        padding: [0, 0],
+        precision: OraclePrecision::Int8Accumulator,
+        pattern: OraclePattern::Dense { phase: 0 },
+    };
+    let mut fixture = build_fixture(case)?;
+
+    // One-hot the *input*, keeping the fixture's own coefficients: output
+    // then vanishes everywhere except the single pixel (hot_y, hot_x).
+    fixture.input.iter_mut().for_each(|byte| *byte = 0);
+    fixture.input[feature_offset(fixture.shape, hot_c, hot_y, hot_x)] = 1;
+
+    let execution = execute_case_output(file, &fixture)?;
+    let tiles = execution
+        .tiles
+        .clone()
+        .ok_or_else(|| "accumulator output should stage through tiles".to_string())?;
+
+    let mut nonzero = Vec::new();
+    let mut offset = 0;
+    while offset + 4 <= execution.raw.len() {
+        let value = i32::from_le_bytes(execution.raw[offset..offset + 4].try_into().unwrap());
+        if value != 0 {
+            nonzero.push(offset);
+        }
+        offset += 4;
+    }
+    Ok((fixture, nonzero, tiles))
+}
+
+#[test]
+#[ignore = "needs /dev/accel/accel0 -- measures the accumulator output atom at odd block counts"]
+fn int8_accumulator_output_layout_probe() {
+    let file = OpenOptions::new()
+        .read(true)
+        .write(true)
+        .open(DEVICE_PATH)
+        .expect("failed to open RK3588 NPU device");
+
+    println!("\n=== accumulator output layout probe ===");
+    if !accumulator_canary_passes(&file) {
+        println!("  CANARY FAILED -- the NPU is sick, reboot the board");
+        return;
+    }
+
+    // Cout=64 is two blocks and passes; 96 is three and fails; 32 is one and
+    // fails. The first is the shape the 128-byte block was established on.
+    // (extent, Cout) pairs straddling the parity rule: 4x4 has 16 pixels so
+    // it satisfies it at any Cout, while 3x3's 9 pixels leave the parity to
+    // the block count. The failing rows are the point -- the passing ones
+    // are the contrast that says what a correct layout looks like.
+    for (extent, cout) in [
+        ((4u32, 4u32), 32u32),
+        ((3, 3), 64),
+        ((3, 3), 32),
+        ((3, 3), 96),
+    ] {
+        let control = Conv2dCase {
+            width: extent.0,
+            height: extent.1,
+            cin: 8,
+            cout,
+            kernel: [1, 1],
+            stride: 1,
+            padding: [0, 0],
+            precision: OraclePrecision::Int8Accumulator,
+            pattern: OraclePattern::Dense { phase: 0 },
+        };
+        match build_fixture(control).and_then(|fixture| {
+            let execution = execute_case_output(&file, &fixture)?;
+            let report = compare_output(&fixture, &execution.plan, &execution.output);
+            Ok((report.mismatches, execution.plan.tiles().len()))
+        }) {
+            Ok((0, tiles)) => {
+                println!(
+                    "\n  {}x{} Cout={cout} pixels={} blocks={}: control PASSES (tiles={tiles})",
+                    extent.0,
+                    extent.1,
+                    extent.0 * extent.1,
+                    (cout.next_multiple_of(32) * 4) / 128,
+                )
+            }
+            Ok((mismatches, tiles)) => println!(
+                "\n  {}x{} Cout={cout} pixels={} blocks={}: control FAILS, {mismatches} mismatches (tiles={tiles})",
+                extent.0,
+                extent.1,
+                extent.0 * extent.1,
+                (cout.next_multiple_of(32) * 4) / 128,
+            ),
+            Err(error) => println!(
+                "\n  {}x{} Cout={cout}: control ERROR {error}",
+                extent.0, extent.1
+            ),
+        }
+
+        for hot in [(0usize, 0usize, 0usize), (0, 1, 0), (1, 0, 0)] {
+            let (fixture, nonzero, tiles) = match accumulator_layout_probe(&file, extent, cout, hot)
+            {
+                Ok(result) => result,
+                Err(error) => {
+                    println!("  Cout={cout} hot={hot:?}: ERROR {error}");
+                    continue;
+                }
+            };
+            let shape = fixture.shape;
+            let padded = shape.padded_out_channels() as usize;
+            let blocks = (padded * 4).div_ceil(shape.output_atom_bytes() as usize);
+            let pixels = shape.output_width([1, 1]) as usize * shape.output_height([1, 1]) as usize;
+
+            // Model A: the shipped 128-byte block, surface-major.
+            // Model B: a 256-byte atom holding 64 i32 lanes contiguously.
+            let base = tiles.first().map(|tile| tile.scratch_offset).unwrap_or(0);
+            let local = hot.0 * shape.output_width([1, 1]) as usize + hot.1;
+            let model = |atom: usize| -> Vec<usize> {
+                let lanes = atom / 4;
+                (0..cout as usize)
+                    .map(|c| base + (c / lanes) * pixels * atom + local * atom + (c % lanes) * 4)
+                    .collect::<Vec<_>>()
+            };
+            let a = model(128);
+            let b = model(256);
+            let matches = |predicted: &[usize]| -> String {
+                let hit = predicted.iter().filter(|o| nonzero.contains(o)).count();
+                format!("{hit}/{}", predicted.len())
+            };
+
+            println!(
+                "  Cout={cout:3} blocks/pixel={blocks} hot={hot:?}: {} nonzero lanes; \
+                 128-byte model {} | 256-byte model {}",
+                nonzero.len(),
+                matches(&a),
+                matches(&b),
+            );
+            if nonzero.len() <= 12 {
+                println!("      offsets {nonzero:?}");
+            } else {
+                println!(
+                    "      first 8 offsets {:?} .. last {:?}",
+                    &nonzero[..8],
+                    nonzero.last(),
+                );
+            }
+        }
+    }
 }
