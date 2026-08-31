@@ -1036,20 +1036,16 @@ impl Shape {
         self.cbuf_atoms() * self.precision.channels_per_atom()
     }
 
-    /// Atoms per pixel implied by the weight padding.
-    fn weight_atoms(&self) -> u32 {
-        self.weight_channels() / self.precision.channels_per_atom()
-    }
 
     /// Atoms per pixel the CBUF charges for, which is neither
-    /// `feature_atoms` nor `weight_atoms`.
+    /// `feature_atoms` nor the count implied by `weight_channels`.
     ///
     /// The atom count rounds up to a whole group of four in *both*
     /// precisions -- three charged as four, seven as eight, eleven as
     /// twelve -- while five, six, nine and ten are charged as themselves.
     ///
     /// At fp16 below `Cin` 80 this is invisible, because the weight padding
-    /// bumps the same counts and `weight_atoms` arrives pre-rounded. At int8
+    /// bumps the same counts and `weight_channels` arrives pre-rounded. At int8
     /// the padding is exact and the rounding has to be applied here or
     /// `data_entries` comes out short: `Cin` 33..48 programs 4 atoms' worth
     /// against a padded 48, and 97..112 programs 8 against a padded 112.
@@ -1062,6 +1058,13 @@ impl Shape {
     /// the old ceiling. Charging one atom short there would silently drop a
     /// tile's last input rows, which is how the same class of bug surfaced
     /// in `conv_outchannel_hw` at 256x32.
+    ///
+    /// `data_entries` is not the only consumer: `data_bank_demand` and
+    /// `max_tile_input_rows_for_width_and_data_banks` must bill the same
+    /// rounded count. Both used the exact one until 2026-08-31 and lost a
+    /// tile's last output rows at int8 for precisely the `3 mod 4` counts
+    /// above -- the same failure this comment already predicted, one layer
+    /// out.
     fn cbuf_atoms(&self) -> u32 {
         quad_atoms(self.feature_atoms())
     }
@@ -1468,7 +1471,7 @@ impl Shape {
     /// whatever the banks granted can carry *at this shape's cost per
     /// pixel*. Charging one atom per pixel unconditionally -- which is what
     /// this did while every capture backing it had `Cin = 3` -- is right in
-    /// the dense regime and over-optimistic by a factor of `weight_atoms` in
+    /// the dense regime and over-optimistic by the surface atom count in
     /// the surface one. `conv_outchannel_hw` caught it at 256x32 with
     /// `Cin = 32`, where the old rule allowed 44 rows against a real
     /// capacity of 22 and the tile silently lost its last input rows.
