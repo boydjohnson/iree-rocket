@@ -27,6 +27,10 @@ Readers interpret an older `RKT1` executable that omits them as an unpadded
 convolution. Each leading value is applied symmetrically to the trailing side,
 matching the current two-value Rocket `ConvShape` model.
 
+`Precision.INT8_ACCUMULATOR` was appended as enum value 2. Existing INT8 and
+FP16 values retain their wire encodings; older runtimes reject the unknown
+value rather than interpreting it as a different precision.
+
 The IREE `iree_flatbuffer_file_header_t` version remains `0`. The FlatBuffer
 file identifier carries the Rocket format version.
 

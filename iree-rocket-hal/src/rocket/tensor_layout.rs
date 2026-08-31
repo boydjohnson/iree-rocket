@@ -22,6 +22,97 @@ pub const WEIGHT_ATOMIC_BYTES: usize = 32;
 /// hardware output kernels.
 pub const WEIGHT_INPUT_GROUP_CHANNELS: usize = 32;
 
+/// Physical byte width of one depthwise coefficient group.
+///
+/// The depthwise DPU serializes coefficients tap-major within a fixed 64-byte
+/// group, so the group holds a precision-dependent number of *channels*: 32
+/// at fp16 and 64 at int8. This is deliberately a byte width rather than a
+/// channel count -- an int8-specific channel constant read naturally but
+/// invited the wrong value, and a wrong one is close to invisible (a
+/// uniform-weight probe cannot see a tap permutation at all).
+///
+/// Confirmed on RK3588 by delta-function probe: with a single nonzero tap,
+/// output channels 0..15, 16..31, 32..47 and 48..63 came back shifted by taps
+/// 0, 2, 4 and 6 respectively under the previous 16-channel rule, which
+/// solves to an address function of `tap * 64 + channel` -- one contiguous
+/// run of all 64 int8 channels per tap.
+const DEPTHWISE_GROUP_BYTES: usize = 64;
+
+/// Returns the storage needed for an FP16 BRDMA bias operand stream.
+///
+/// FP16 enables only the BS ALU operand (`brdma_data_use = 1`), but that
+/// operand is a 32-bit float at the RK3588 BRDMA boundary. The logical IREE
+/// tensor remains FP16 and is widened by [`pack_fp16_bias_to_rocket`]. The
+/// destination is sized to the DPU's programmed (padded) output-channel count
+/// so BRDMA never reaches an adjacent allocation for the final partial
+/// channel granule.
+pub fn rocket_fp16_bias_storage_size(padded_output_channels: usize) -> Result<usize, &'static str> {
+    if padded_output_channels == 0 {
+        return Err("Rocket FP16 bias channel count must be nonzero");
+    }
+    padded_output_channels
+        .checked_mul(4)
+        .ok_or("Rocket FP16 bias storage size overflows usize")
+}
+
+/// Widens a logical dense FP16 bias vector into BRDMA's FP32 operand stream.
+///
+/// Only `output_channels * 2` bytes are read from `dense`; all physical tail
+/// channels are zero. Public IREE bindings may be exact-sized subranges with
+/// unrelated live data immediately before and after them, while the DPU is
+/// programmed for `padded_output_channels`.
+pub fn pack_fp16_bias_to_rocket(
+    dense: &[u8],
+    output_channels: usize,
+    padded_output_channels: usize,
+    packed: &mut [u8],
+) -> Result<usize, &'static str> {
+    if output_channels == 0 || padded_output_channels < output_channels {
+        return Err("invalid Rocket FP16 bias channel counts");
+    }
+    let dense_len = output_channels
+        .checked_mul(2)
+        .ok_or("dense FP16 bias storage size overflows usize")?;
+    if dense.len() < dense_len {
+        return Err("dense FP16 bias is smaller than its declared shape");
+    }
+    let packed_len = rocket_fp16_bias_storage_size(padded_output_channels)?;
+    if packed.len() < packed_len {
+        return Err("Rocket FP16 bias destination is smaller than its declared shape");
+    }
+    packed[..packed_len].fill(0);
+    for channel in 0..output_channels {
+        let source = channel * 2;
+        let fp16 = u16::from_le_bytes([dense[source], dense[source + 1]]);
+        let destination = channel * 4;
+        packed[destination..destination + 4]
+            .copy_from_slice(&fp16_to_fp32_bits(fp16).to_le_bytes());
+    }
+    Ok(packed_len)
+}
+
+/// Exact IEEE-754 binary16 to binary32 widening, returned as raw bits.
+fn fp16_to_fp32_bits(value: u16) -> u32 {
+    let sign = (u32::from(value) & 0x8000) << 16;
+    let exponent = (value >> 10) & 0x1f;
+    let fraction = value & 0x03ff;
+    match exponent {
+        0 if fraction == 0 => sign,
+        0 => {
+            let mut normalized = u32::from(fraction);
+            let mut unbiased_exponent = -14i32;
+            while normalized & 0x0400 == 0 {
+                normalized <<= 1;
+                unbiased_exponent -= 1;
+            }
+            normalized &= 0x03ff;
+            sign | (((unbiased_exponent + 127) as u32) << 23) | (normalized << 13)
+        }
+        0x1f => sign | 0x7f80_0000 | (u32::from(fraction) << 13),
+        _ => sign | ((u32::from(exponent) + (127 - 15)) << 23) | (u32::from(fraction) << 13),
+    }
+}
+
 /// Returns the NC1HWC2 storage required for `pixel_count` dense pixels.
 ///
 /// `bytes_per_pixel` is the logical channel count times the element size.
@@ -311,21 +402,20 @@ fn pack_hwcf_to_rocket_weights_impl(
 /// A depthwise filter is `[channels][filter_height][filter_width]` -- one
 /// `kh x kw` kernel per input channel, with no `(input, output)` pairing at
 /// all. The hardware wants it **tap-major within a channel group**: channels
-/// are chunked into groups of [`WEIGHT_INPUT_GROUP_CHANNELS`] (32 -- the
-/// same fixed grouping [`pack_hwcf_to_rocket_weights`]'s dense path already
-/// uses, for both precisions), and every group's own 9 taps sit contiguously
+/// FP16 groups are 32 channels; int8 groups are 16 channels. Every group's
+/// own taps sit contiguously before the next group starts. This differs from
+/// the dense coefficient grouping, which is 32 channels for both precisions.
 /// before the next group starts:
 ///
 /// ```text
 /// slot = group_base(channel)
 ///      + (ky * filter_width + kx) * group_width(channel)
-///      + (channel % WEIGHT_INPUT_GROUP_CHANNELS)
+///      + (channel % group_width)
 /// ```
 ///
-/// where `group_base` is the running element offset of that channel's group
-/// (`group * filter_height * filter_width * WEIGHT_INPUT_GROUP_CHANNELS`),
-/// and `group_width` is 32 for every group except a final, shorter one when
-/// `padded_channels` isn't a whole multiple of 32 (then it's the remainder).
+/// where `group_base` is the running element offset of that channel's group,
+/// and `group_width` is the precision-specific group width except a final,
+/// shorter one when `padded_channels` isn't a whole multiple of it.
 /// This is the transpose of how torch and ONNX store a depthwise filter, and
 /// nothing like `pack_hwcf_to_rocket_weights`'s own blocked dense order.
 ///
@@ -346,9 +436,9 @@ fn pack_hwcf_to_rocket_weights_impl(
 /// exact groups), and 144 (4 full groups plus a genuine 16-wide tail group).
 /// All three matched this formula bit-for-bit and none matched the old flat
 /// one. Only fp16 has been checked this way; int8 reuses
-/// [`WEIGHT_INPUT_GROUP_CHANNELS`] on the working assumption that it shares
-/// the dense path's precision-independent grouping (true there), not its
-/// own hardware confirmation.
+/// The int8 width was confirmed by the raw accumulator probe: packing it as
+/// fp16's 32-channel groups makes channel 0 sum taps 1,1,2,2,...,5 instead of
+/// 1..9. The dense path's grouping remains unchanged.
 ///
 /// `padded_channels` is the count the register program's
 /// `CNA_WEIGHT_SIZE0.weight_bytes` is sized from -- [`Shape::weight_bytes`]
@@ -398,18 +488,19 @@ pub fn pack_depthwise_to_rocket_weights(
 
     packed[..packed_len].fill(0);
 
-    let full_groups = padded_channels / WEIGHT_INPUT_GROUP_CHANNELS;
-    let tail_width = padded_channels - full_groups * WEIGHT_INPUT_GROUP_CHANNELS;
+    let group_channels = DEPTHWISE_GROUP_BYTES / element_size;
+    let full_groups = padded_channels / group_channels;
+    let tail_width = padded_channels - full_groups * group_channels;
 
     for channel in 0..channels {
-        let group = channel / WEIGHT_INPUT_GROUP_CHANNELS;
-        let channel_in_group = channel % WEIGHT_INPUT_GROUP_CHANNELS;
+        let group = channel / group_channels;
+        let channel_in_group = channel % group_channels;
         let group_width = if group < full_groups {
-            WEIGHT_INPUT_GROUP_CHANNELS
+            group_channels
         } else {
             tail_width
         };
-        let group_base = group * filter_height * filter_width * WEIGHT_INPUT_GROUP_CHANNELS;
+        let group_base = group * filter_height * filter_width * group_channels;
         for ky in 0..filter_height {
             for kx in 0..filter_width {
                 let from = ((channel * filter_height + ky) * filter_width + kx) * element_size;
@@ -426,6 +517,81 @@ pub fn pack_depthwise_to_rocket_weights(
 mod tests {
     use super::*;
     use crate::rocket::conv::Shape;
+
+    #[test]
+    fn packs_exact_fp16_bias_and_zeroes_programmed_tail() {
+        let dense = [0x3C00u16, 0x4000, 0x4200]
+            .into_iter()
+            .flat_map(u16::to_le_bytes)
+            .collect::<Vec<_>>();
+        let mut packed = vec![0xA5; rocket_fp16_bias_storage_size(16).unwrap()];
+
+        let written = pack_fp16_bias_to_rocket(&dense, 3, 16, &mut packed).unwrap();
+
+        assert_eq!(written, 64);
+        let widened = packed[..12]
+            .chunks_exact(4)
+            .map(|bytes| u32::from_le_bytes(bytes.try_into().unwrap()))
+            .collect::<Vec<_>>();
+        assert_eq!(
+            widened,
+            [1.0f32.to_bits(), 2.0f32.to_bits(), 3.0f32.to_bits()]
+        );
+        assert!(packed[12..written].iter().all(|&byte| byte == 0));
+    }
+
+    #[test]
+    fn fp16_bias_packing_reads_only_the_declared_subrange() {
+        const PREFIX: usize = 11;
+        let mut allocation = vec![0xD3; PREFIX];
+        allocation.extend(
+            [0x4900u16, 0x4980, 0x4A00]
+                .into_iter()
+                .flat_map(u16::to_le_bytes),
+        );
+        allocation.extend([0x7B; 13]);
+        let logical_len = 3 * 2;
+        let dense = &allocation[PREFIX..PREFIX + logical_len];
+        let mut packed = vec![0xFF; 64];
+
+        pack_fp16_bias_to_rocket(dense, 3, 16, &mut packed).unwrap();
+
+        let widened = packed[..12]
+            .chunks_exact(4)
+            .map(|bytes| f32::from_le_bytes(bytes.try_into().unwrap()))
+            .collect::<Vec<_>>();
+        assert_eq!(widened, [10.0, 11.0, 12.0]);
+        assert!(packed[12..].iter().all(|&byte| byte == 0));
+    }
+
+    #[test]
+    fn fp16_bias_packing_rejects_short_and_invalid_buffers() {
+        assert!(pack_fp16_bias_to_rocket(&[0; 5], 3, 16, &mut [0; 64]).is_err());
+        assert!(pack_fp16_bias_to_rocket(&[0; 6], 3, 2, &mut [0; 64]).is_err());
+        assert!(pack_fp16_bias_to_rocket(&[0; 6], 3, 16, &mut [0; 63]).is_err());
+        assert!(rocket_fp16_bias_storage_size(0).is_err());
+        assert!(rocket_fp16_bias_storage_size(usize::MAX).is_err());
+    }
+
+    #[test]
+    fn fp16_bias_widening_handles_ieee_edges() {
+        for (fp16, fp32) in [
+            (0x0000, 0x0000_0000), // positive zero
+            (0x8000, 0x8000_0000), // negative zero
+            (0x0001, 0x3380_0000), // smallest subnormal
+            (0x0400, 0x3880_0000), // smallest normal
+            (0x3C00, 0x3F80_0000), // one
+            (0xC000, 0xC000_0000), // negative two
+            (0x7BFF, 0x477F_E000), // largest finite
+            (0x7C00, 0x7F80_0000), // positive infinity
+            (0xFC00, 0xFF80_0000), // negative infinity
+        ] {
+            assert_eq!(fp16_to_fp32_bits(fp16), fp32, "FP16 bits {fp16:#06x}");
+        }
+        let nan = fp16_to_fp32_bits(0x7E01);
+        assert_eq!(nan & 0x7F80_0000, 0x7F80_0000);
+        assert_ne!(nan & 0x007F_FFFF, 0);
+    }
 
     #[test]
     fn packs_fp16_c32_as_four_channel_surfaces() {
@@ -730,6 +896,84 @@ mod tests {
                         "tap ({ky}, {kx}) channel {channel}"
                     );
                 }
+            }
+        }
+    }
+
+    /// Int8 depthwise groups 64 channels, not 16.
+    ///
+    /// This test previously asserted a 16-channel group, and that was wrong
+    /// on hardware. A delta-function probe on RK3588 (single nonzero tap,
+    /// `Cin` 64, 3x3, `padding = [0, 0]`) came back with output channels
+    /// 0..15, 16..31, 32..47 and 48..63 shifted by taps 0, 2, 4 and 6 -- an
+    /// arithmetic progression that solves for exactly one address function,
+    /// `tap * 64 + channel`. Nothing caught it earlier because the only
+    /// hardware coverage of this path used uniform all-ones weights, which
+    /// cannot observe a tap permutation at all, and because every unit test
+    /// here checked the packer against the same assumed constant rather than
+    /// against the hardware.
+    ///
+    /// `channels = 64` is deliberately one full group, and the case below
+    /// covers a short final group.
+    #[test]
+    fn int8_depthwise_packing_uses_sixty_four_channel_groups() {
+        let (channels, kh, kw) = (64usize, 3usize, 3usize);
+        let mut dense = vec![0u8; channels * kh * kw];
+        for channel in 0..channels {
+            for tap in 0..kh * kw {
+                // Distinct per (channel, tap) modulo 256 -- 9 taps and 64
+                // channels fit without aliasing.
+                dense[channel * kh * kw + tap] = (channel * 4 + tap) as u8;
+            }
+        }
+        let mut packed = vec![0xffu8; channels * kh * kw];
+        let written =
+            pack_depthwise_to_rocket_weights(&dense, kh, kw, channels, channels, 1, &mut packed)
+                .expect("packing failed");
+        assert_eq!(written, kh * kw * channels);
+
+        // One contiguous run of all 64 channels per tap.
+        for tap in 0..kh * kw {
+            for channel in 0..channels {
+                assert_eq!(
+                    packed[tap * channels + channel],
+                    (channel * 4 + tap) as u8,
+                    "tap {tap} channel {channel}"
+                );
+            }
+        }
+    }
+
+    /// The int8 tail group, which the 64-channel case above cannot reach:
+    /// `Cin` 48 pads to 48, leaving a single short group of width 48 rather
+    /// than a full 64. Same address function, narrower run.
+    #[test]
+    fn int8_depthwise_packing_handles_a_short_final_group() {
+        let (channels, padded, kh, kw) = (48usize, 48usize, 3usize, 3usize);
+        let mut dense = vec![0u8; channels * kh * kw];
+        for channel in 0..channels {
+            for tap in 0..kh * kw {
+                dense[channel * kh * kw + tap] = (channel * 4 + tap) as u8;
+            }
+        }
+        let mut packed = vec![0xffu8; kh * kw * padded];
+        let written =
+            pack_depthwise_to_rocket_weights(&dense, kh, kw, channels, padded, 1, &mut packed)
+                .expect("packing failed");
+        assert_eq!(written, kh * kw * padded);
+
+        for tap in 0..kh * kw {
+            for channel in 0..padded {
+                let want = if channel < channels {
+                    (channel * 4 + tap) as u8
+                } else {
+                    0
+                };
+                assert_eq!(
+                    packed[tap * padded + channel],
+                    want,
+                    "tap {tap} channel {channel}"
+                );
             }
         }
     }

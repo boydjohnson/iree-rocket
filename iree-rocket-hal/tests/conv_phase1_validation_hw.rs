@@ -143,6 +143,9 @@ fn int8_quantization() -> Precision {
     Precision::Int8(Quantization {
         input_zero_point: 0,
         output_zero_point: 0,
+        weight_zero_point: 0,
+        input_scale: 1.0,
+        weights_scale: 1.0,
         multiplier: Multiplier::for_unit_bs(1.0),
     })
 }
@@ -151,6 +154,9 @@ fn int8_identity_precision() -> Precision {
     Precision::Int8(Quantization {
         input_zero_point: 0,
         output_zero_point: 0,
+        weight_zero_point: 0,
+        input_scale: 1.0,
+        weights_scale: 1.0,
         multiplier: Multiplier::from_ratio(1.0),
     })
 }
@@ -162,6 +168,9 @@ fn int8_depthwise_quantization() -> Precision {
         // requantization. Scale the retained coefficient fraction by 128,
         // then subtract that equally-scaled baseline.
         output_zero_point: -128,
+        weight_zero_point: 0,
+        input_scale: 1.0,
+        weights_scale: 1.0,
         multiplier: Multiplier::for_unit_bs(INT8_DEPTHWISE_GAIN_CORRECTION),
     })
 }
@@ -173,7 +182,7 @@ fn identity_bs_multiplier() -> i16 {
 fn zero_bias(shape: Shape) -> Vec<u8> {
     match shape.precision {
         Precision::Fp16 => vec![0; shape.bs_buffer_bytes()],
-        Precision::Int8(_) => {
+        Precision::Int8(_) | Precision::Int8Accumulator(_) => {
             let channels = shape.padded_out_channels();
             let mut bytes = vec![0; bs_buffer_bytes(channels)];
             write_bs_buffer(&mut bytes, &vec![BsEntry::default(); channels as usize]);
@@ -379,7 +388,7 @@ fn depthwise_weights(shape: Shape) -> Vec<u8> {
                             &f32_to_f16(coefficient(channel, ky, kx) as f32).to_le_bytes(),
                         );
                     }
-                    Precision::Int8(_) => {
+                    Precision::Int8(_) | Precision::Int8Accumulator(_) => {
                         dense[offset] = i8::try_from(coefficient(channel, ky, kx))
                             .expect("test coefficient must fit int8")
                             as u8;

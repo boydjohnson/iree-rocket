@@ -20,6 +20,9 @@ fn main() {
         Precision::Int8(Quantization {
             input_zero_point: signed(7),
             output_zero_point: signed(8),
+            weight_zero_point: 0,
+            input_scale: 1.0,
+            weights_scale: 1.0,
             multiplier: Multiplier {
                 scale: value(9),
                 shift: value(10),

@@ -15,6 +15,7 @@ pub const FEATURE_ATOM_BYTES: usize = 16;
 pub enum OraclePrecision {
     Fp16,
     Int8,
+    Int8Accumulator,
 }
 
 impl OraclePrecision {
@@ -22,6 +23,7 @@ impl OraclePrecision {
         match self {
             Self::Fp16 => "fp16",
             Self::Int8 => "int8",
+            Self::Int8Accumulator => "int8-accumulator",
         }
     }
 }
@@ -94,17 +96,18 @@ pub struct Conv2dCase {
 
 impl Conv2dCase {
     pub fn output_shift(self) -> u32 {
-        if self.precision == OraclePrecision::Fp16
-            || matches!(
-                self.pattern,
-                OraclePattern::Selectors { .. }
-                    | OraclePattern::SelectorsAffine { .. }
-                    | OraclePattern::OneHotNeutral80 { .. }
-                    | OraclePattern::RawByteSweep
-                    | OraclePattern::RawByteSweepUnit
-                    | OraclePattern::Dense { .. }
-            )
-        {
+        if matches!(
+            self.precision,
+            OraclePrecision::Fp16 | OraclePrecision::Int8Accumulator
+        ) || matches!(
+            self.pattern,
+            OraclePattern::Selectors { .. }
+                | OraclePattern::SelectorsAffine { .. }
+                | OraclePattern::OneHotNeutral80 { .. }
+                | OraclePattern::RawByteSweep
+                | OraclePattern::RawByteSweepUnit
+                | OraclePattern::Dense { .. }
+        ) {
             return 0;
         }
         let peak = self.cin * (self.kernel[0] * self.kernel[1]) as u32;
@@ -133,9 +136,20 @@ impl Conv2dCase {
                 Precision::Int8(Quantization {
                     input_zero_point: 0,
                     output_zero_point,
+                    weight_zero_point: 0,
+                    input_scale: 1.0,
+                    weights_scale: 1.0,
                     multiplier,
                 })
             }
+            OraclePrecision::Int8Accumulator => Precision::Int8Accumulator(Quantization {
+                input_zero_point: 0,
+                output_zero_point: 0,
+                weight_zero_point: 0,
+                input_scale: 1.0,
+                weights_scale: 1.0,
+                multiplier: Multiplier::from_ratio(1.0),
+            }),
         };
         Shape::with_precision(
             self.width,
@@ -196,11 +210,7 @@ pub fn input_storage_bytes(shape: Shape) -> usize {
 }
 
 pub fn output_storage_bytes(shape: Shape, kernels: Kernels) -> usize {
-    let surfaces = (shape.padded_out_channels() as usize).div_ceil(channels_per_atom(shape));
-    surfaces
-        * shape.output_width(kernels) as usize
-        * shape.output_height(kernels) as usize
-        * FEATURE_ATOM_BYTES
+    shape.output_scratch_bytes(kernels)
 }
 
 pub fn feature_offset(shape: Shape, channel: usize, y: usize, x: usize) -> usize {
@@ -219,13 +229,14 @@ pub fn feature_offset(shape: Shape, channel: usize, y: usize, x: usize) -> usize
 }
 
 pub fn output_offset(shape: Shape, kernels: Kernels, channel: usize, y: usize, x: usize) -> usize {
-    let atom_channels = channels_per_atom(shape);
-    let surface_bytes = shape.output_width(kernels) as usize
-        * shape.output_height(kernels) as usize
-        * FEATURE_ATOM_BYTES;
+    let atom_bytes = shape.output_atom_bytes() as usize;
+    let element_bytes = shape.precision.output_element_bytes() as usize;
+    let atom_channels = atom_bytes / element_bytes;
+    let surface_bytes =
+        shape.output_width(kernels) as usize * shape.output_height(kernels) as usize * atom_bytes;
     (channel / atom_channels) * surface_bytes
-        + (y * shape.output_width(kernels) as usize + x) * FEATURE_ATOM_BYTES
-        + (channel % atom_channels) * element_bytes(shape)
+        + (y * shape.output_width(kernels) as usize + x) * atom_bytes
+        + (channel % atom_channels) * element_bytes
 }
 
 pub fn f32_to_f16(value: f32) -> u16 {
@@ -484,7 +495,7 @@ pub fn expected_output(
 ) -> i32 {
     let accumulator = expected_accumulator(case, output_channel, output_y, output_x);
     match case.precision {
-        OraclePrecision::Fp16 => accumulator,
+        OraclePrecision::Fp16 | OraclePrecision::Int8Accumulator => accumulator,
         OraclePrecision::Int8 => rounded_shift(accumulator, case.output_shift()).clamp(-128, 127),
     }
 }
@@ -601,7 +612,7 @@ pub fn build_fixture(case: Conv2dCase) -> Result<Conv2dFixture, String> {
                             &f32_to_f16(f32::from(logical_input[logical_index])).to_le_bytes(),
                         );
                     }
-                    OraclePrecision::Int8 => {
+                    OraclePrecision::Int8 | OraclePrecision::Int8Accumulator => {
                         input[offset] = logical_input[logical_index] as u8;
                     }
                 }
@@ -620,7 +631,7 @@ pub fn build_fixture(case: Conv2dCase) -> Result<Conv2dFixture, String> {
                 dense_weight_bytes.extend_from_slice(&f32_to_f16(f32::from(value)).to_le_bytes());
             }
         }
-        OraclePrecision::Int8 => {
+        OraclePrecision::Int8 | OraclePrecision::Int8Accumulator => {
             if let Some(zero_points) = &weight_zero_points {
                 for (index, value) in logical_weights.into_iter().enumerate() {
                     let output_channel = index % case.cout as usize;
@@ -725,7 +736,9 @@ pub fn build_fixture(case: Conv2dCase) -> Result<Conv2dFixture, String> {
     }
 
     let bias = match case.precision {
-        OraclePrecision::Fp16 => vec![0; shape.bs_buffer_bytes()],
+        OraclePrecision::Fp16 | OraclePrecision::Int8Accumulator => {
+            vec![0; shape.bs_buffer_bytes()]
+        }
         OraclePrecision::Int8 => {
             let channels = shape.padded_out_channels();
             let mut bytes = vec![0; bs_buffer_bytes(channels)];
@@ -800,6 +813,10 @@ mod tests {
             (OraclePrecision::Fp16, OraclePattern::Selectors { phase: 2 }),
             (OraclePrecision::Int8, OraclePattern::Selectors { phase: 2 }),
             (
+                OraclePrecision::Int8Accumulator,
+                OraclePattern::Selectors { phase: 2 },
+            ),
+            (
                 OraclePrecision::Int8,
                 OraclePattern::SelectorsAffine { phase: 2 },
             ),
@@ -833,6 +850,39 @@ mod tests {
                 }
             }
         }
+    }
+
+    #[test]
+    fn accumulator_output_preserves_i32_values_and_native_block_offsets() {
+        let case = Conv2dCase {
+            width: 2,
+            height: 1,
+            cin: 64,
+            cout: 33,
+            kernel: [1, 1],
+            stride: 1,
+            padding: [0, 0],
+            precision: OraclePrecision::Int8Accumulator,
+            pattern: OraclePattern::Counting,
+        };
+        let shape = case.shape();
+
+        assert_eq!(expected_output(case, 0, 0, 0), 64);
+        assert_eq!(output_offset(shape, case.kernel, 0, 0, 0), 0);
+        assert_eq!(output_offset(shape, case.kernel, 31, 0, 0), 31 * 4);
+        assert_eq!(output_offset(shape, case.kernel, 0, 0, 1), 128);
+        assert_eq!(output_offset(shape, case.kernel, 32, 0, 0), 256);
+        assert_eq!(output_offset(shape, case.kernel, 32, 0, 1), 384);
+        assert_eq!(output_storage_bytes(shape, case.kernel), 512);
+
+        let fixture = build_fixture(case).expect("build accumulator fixture");
+        assert_eq!(fixture.input.len(), input_storage_bytes(shape));
+        assert_eq!(
+            fixture.weights.len(),
+            shape.weight_bytes(case.kernel) as usize
+        );
+        assert_eq!(fixture.bias.len(), shape.bs_buffer_bytes());
+        assert!(matches!(shape.precision, Precision::Int8Accumulator(_)));
     }
 
     #[test]
@@ -886,7 +936,9 @@ mod tests {
             Precision::Int8(quantization) => {
                 assert_eq!(quantization.multiplier, Multiplier::from_ratio(1.0),)
             }
-            Precision::Fp16 => panic!("affine selector unexpectedly built fp16 shape"),
+            Precision::Fp16 | Precision::Int8Accumulator(_) => {
+                panic!("affine selector unexpectedly built another precision")
+            }
         }
     }
 
@@ -985,7 +1037,11 @@ mod tests {
 
     #[test]
     fn fixture_storage_covers_dense_and_surface_layouts() {
-        for precision in [OraclePrecision::Fp16, OraclePrecision::Int8] {
+        for precision in [
+            OraclePrecision::Fp16,
+            OraclePrecision::Int8,
+            OraclePrecision::Int8Accumulator,
+        ] {
             for cin in [3u32, 5, 17] {
                 let case = Conv2dCase {
                     width: 7,

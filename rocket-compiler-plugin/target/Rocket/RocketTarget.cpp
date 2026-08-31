@@ -44,6 +44,9 @@
 #include <utility>
 #include <vector>
 
+#ifdef ROCKET_ENABLE_ONNX_INPUT
+#include "RocketPasses.h"
+#endif // ROCKET_ENABLE_ONNX_INPUT
 #include "iree/compiler/Dialect/HAL/Target/TargetBackend.h"
 #include "iree/compiler/Dialect/HAL/Target/TargetRegistry.h"
 #include "iree/compiler/PluginAPI/Client.h"
@@ -163,9 +166,11 @@ parseActivationAndPrecision(DictionaryAttr config,
     precisionValue = iree_hal_rocket_Precision_INT8;
   } else if (precision == "fp16") {
     precisionValue = iree_hal_rocket_Precision_FP16;
+  } else if (precision == "int8_accumulator") {
+    precisionValue = iree_hal_rocket_Precision_INT8_ACCUMULATOR;
   } else {
     diagFn() << "rocket backend: unrecognized 'precision' config value '"
-             << precision << "' (expected int8/fp16)";
+             << precision << "' (expected int8/fp16/int8_accumulator)";
     return failure();
   }
   return success();
@@ -228,6 +233,19 @@ std::optional<RocketConv2dConfig> buildRocketConv2dConfigFromTarget(
 
   if (failed(parseActivationAndPrecision(config, shape.activation,
                                          shape.precision, diagFn))) {
+    return std::nullopt;
+  }
+  if (shape.precision == iree_hal_rocket_Precision_INT8_ACCUMULATOR &&
+      shape.activation != iree_hal_rocket_Activation_NONE) {
+    diagFn() << "rocket backend: int8_accumulator convolution cannot fuse "
+                "an activation";
+    return std::nullopt;
+  }
+  if (shape.precision == iree_hal_rocket_Precision_INT8_ACCUMULATOR &&
+      (shape.inputZeroPoint != 0 || shape.outputZeroPoint != 0 ||
+       shape.weightsZeroPoint != 0)) {
+    diagFn() << "rocket backend: int8_accumulator convolution currently "
+                "requires zero input, weight, and output zero-points";
     return std::nullopt;
   }
 
@@ -368,6 +386,11 @@ buildRocketFullyConnectedConfigFromTarget(
   shape.activationCmp = getU32("activation_cmp");
   if (failed(parseActivationAndPrecision(config, shape.activation,
                                          shape.precision, diagFn))) {
+    return std::nullopt;
+  }
+  if (shape.precision == iree_hal_rocket_Precision_INT8_ACCUMULATOR) {
+    diagFn() << "rocket fully-connected backend does not support "
+                "int8_accumulator precision";
     return std::nullopt;
   }
   return shape;
@@ -619,6 +642,21 @@ struct RocketSession final
       return std::make_shared<RocketTargetBackend>(options);
     });
   }
+
+#ifdef ROCKET_ENABLE_ONNX_INPUT
+  void extendInputConversionPreprocessingPassPipeline(
+      OpPassManager &passManager,
+      InputDialectOptions::Type inputType) override {
+    // This hook is the only place upstream of the torch plugin's onnx->torch
+    // conversion, which is where onnx.ConvInteger has to be rewritten: by the
+    // time --iree-preprocessing-pass-pipeline runs, the unconverted
+    // torch.operator has already failed to legalize. The enum cannot
+    // distinguish "onnx" from any other plugin-provided input type (they all
+    // arrive as Type::plugin), so the pass is added for every input type and
+    // no-ops when the module holds no onnx.ConvInteger.
+    passManager.addPass(createRocketExpandOnnxConvIntegerPass());
+  }
+#endif // ROCKET_ENABLE_ONNX_INPUT
 };
 
 } // namespace

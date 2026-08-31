@@ -100,7 +100,7 @@ fn run_fc(shape: Shape, dense_input: &[u8], dense_weights: &[u8]) -> Vec<u8> {
     let output_len = nc1hwc2_storage_size(m, padded_outputs as usize * element_bytes).unwrap();
     let bias_len = match shape.precision {
         Precision::Fp16 => padded_outputs as usize * 4,
-        Precision::Int8(_) => conv_shape.bs_buffer_bytes(),
+        Precision::Int8(_) | Precision::Int8Accumulator(_) => conv_shape.bs_buffer_bytes(),
     };
 
     let file = OpenOptions::new()
@@ -213,6 +213,9 @@ fn odd_int8_n_height_one_fc_runs_on_npu() {
         Precision::Int8(Quantization {
             input_zero_point: 0,
             output_zero_point: 0,
+            weight_zero_point: 0,
+            input_scale: 1.0,
+            weights_scale: 1.0,
             multiplier: Multiplier::for_unit_bs(1.0),
         }),
     );

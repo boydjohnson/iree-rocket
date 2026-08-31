@@ -86,20 +86,41 @@ fn decode_precision(
     precision: schema::Precision,
     input_zero_point: u32,
     output_zero_point: u32,
+    weights_zero_point: u32,
     input_scale: f32,
     weights_scale: f32,
     output_scale: f32,
 ) -> Result<Precision, ()> {
     match precision {
-        schema::Precision::INT8 => {
+        schema::Precision::INT8 | schema::Precision::INT8_ACCUMULATOR => {
+            if !input_scale.is_finite()
+                || !weights_scale.is_finite()
+                || !output_scale.is_finite()
+                || input_scale <= 0.0
+                || weights_scale <= 0.0
+                || output_scale <= 0.0
+            {
+                return Err(());
+            }
             let ratio = f64::from(input_scale) * f64::from(weights_scale) / f64::from(output_scale);
             let multiplier =
                 std::panic::catch_unwind(|| Multiplier::from_ratio(ratio)).map_err(|_| ())?;
-            Ok(Precision::Int8(Quantization {
+            let quantization = Quantization {
                 input_zero_point: input_zero_point as i32,
                 output_zero_point: output_zero_point as i32,
+                weight_zero_point: weights_zero_point as i32,
+                input_scale,
+                weights_scale,
                 multiplier,
-            }))
+            };
+            if precision == schema::Precision::INT8_ACCUMULATOR {
+                if input_zero_point != 0 || output_zero_point != 0 || weights_zero_point != 0 {
+                    return Err(());
+                }
+                Ok(Precision::Int8Accumulator(quantization))
+            } else {
+                Ok(Precision::Int8(quantization))
+            }
         }
         schema::Precision::FP16 => Ok(Precision::Fp16),
         _ => Err(()),
@@ -139,6 +160,7 @@ fn decode_flatbuffer_shape(data: &[u8]) -> Result<UkernelShape, ()> {
                 conv_def.precision(),
                 conv_def.input_zero_point(),
                 conv_def.output_zero_point(),
+                conv_def.weights_zero_point(),
                 conv_def.input_scale(),
                 conv_def.weights_scale(),
                 conv_def.output_scale(),
@@ -206,10 +228,16 @@ fn decode_flatbuffer_shape(data: &[u8]) -> Result<UkernelShape, ()> {
                 fc_def.precision(),
                 fc_def.input_zero_point(),
                 fc_def.output_zero_point(),
+                fc_def.weights_zero_point(),
                 fc_def.input_scale(),
                 fc_def.weights_scale(),
                 fc_def.output_scale(),
             )?;
+            if precision.writes_accumulators() {
+                // The exact accumulator path is hardware-validated for
+                // Conv2D only; FullyConnected has separate output packing.
+                return Err(());
+            }
             let activation = decode_activation(fc_def.activation(), fc_def.activation_cmp())?;
             // fc::Shape::new validates against conv.rs's own capture-backed
             // bounds internally and panics on an unsupported shape --
@@ -412,6 +440,9 @@ unsafe extern "C" fn prepare_executable(
                 precision: Precision::Int8(Quantization {
                     input_zero_point: 0,
                     output_zero_point: 0,
+                    weight_zero_point: 0,
+                    input_scale: 1.0,
+                    weights_scale: 1.0,
                     multiplier: Multiplier::from_ratio(1.0),
                 }),
                 padding: Some([0, 0]),
@@ -437,6 +468,54 @@ pub static VTABLE: iree_hal_executable_cache_vtable_t = iree_hal_executable_cach
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn encode_accumulator_conv_executable(input_zero_point: i32) -> Vec<u8> {
+        let mut builder = flatbuffers::FlatBufferBuilder::new();
+        let name = builder.create_string("conv_integer");
+        let conv = schema::Conv2DDef::create(
+            &mut builder,
+            &schema::Conv2DDefArgs {
+                input_width: 4,
+                input_height: 4,
+                input_channels: 1,
+                output_width: 4,
+                output_height: 4,
+                output_channels: 8,
+                weights_width: 1,
+                weights_height: 1,
+                stride: 1,
+                input_zero_point: input_zero_point as u32,
+                input_scale: 0.25,
+                weights_scale: 0.5,
+                output_scale: 1.0,
+                precision: schema::Precision::INT8_ACCUMULATOR,
+                ..Default::default()
+            },
+        );
+        let export = schema::ExportDef::create(
+            &mut builder,
+            &schema::ExportDefArgs {
+                name: Some(name),
+                kernel_type: schema::KernelDef::Conv2DDef,
+                kernel: Some(conv.as_union_value()),
+            },
+        );
+        let exports = builder.create_vector(&[export]);
+        let executable = schema::ExecutableDef::create(
+            &mut builder,
+            &schema::ExecutableDefArgs {
+                exports: Some(exports),
+            },
+        );
+        schema::finish_executable_def_buffer(&mut builder, executable);
+
+        let flatbuffer = builder.finished_data();
+        let mut data = vec![0u8; IREE_FLATBUFFER_HEADER_SIZE];
+        data[0..4].copy_from_slice(b"RKT1");
+        data[8..16].copy_from_slice(&(flatbuffer.len() as u64).to_le_bytes());
+        data.extend_from_slice(flatbuffer);
+        data
+    }
 
     fn encode_fc_executable() -> Vec<u8> {
         let mut builder = flatbuffers::FlatBufferBuilder::new();
@@ -547,6 +626,29 @@ mod tests {
         assert_eq!(shape.output_height(kernels), 112);
         assert_eq!(shape.out_channels, 16);
         assert_eq!(shape.precision, Precision::Fp16);
+    }
+
+    #[test]
+    fn decodes_int8_accumulator_precision() {
+        let UkernelShape::Conv2d(executable) =
+            decode_flatbuffer_shape(&encode_accumulator_conv_executable(0)).unwrap()
+        else {
+            panic!("expected Conv2d");
+        };
+        let Precision::Int8Accumulator(quantization) = executable.shape_template.precision else {
+            panic!("expected int8 accumulator precision");
+        };
+        assert_eq!(quantization.input_scale, 0.25);
+        assert_eq!(quantization.weights_scale, 0.5);
+        assert_eq!(
+            executable.shape_template.precision.output_element_bytes(),
+            4
+        );
+    }
+
+    #[test]
+    fn rejects_unvalidated_accumulator_zero_point() {
+        assert!(decode_flatbuffer_shape(&encode_accumulator_conv_executable(1)).is_err());
     }
 
     #[test]

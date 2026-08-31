@@ -94,6 +94,44 @@ std::vector<float> MakeWeights(const Conv2dProblem &problem) {
   return values;
 }
 
+std::vector<float> MakeBias(const Conv2dProblem &problem) {
+  std::vector<float> values(problem.output_channels);
+  for (size_t i = 0; i < values.size(); ++i) {
+    // Mixed signs and nonuniform channels catch both ignored bias and a
+    // channel-indexing error. All values are exact in FP16.
+    values[i] = static_cast<float>(static_cast<int>(i % 7) - 3) * 0.125f;
+  }
+  return values;
+}
+
+void ExpectMatchesIndependentReference(const Conv2dResult &result) {
+  ASSERT_EQ(result.actual.size(), result.expected.size());
+  size_t mismatch_count = 0;
+  float maximum_error = 0.0f;
+  std::ostringstream samples;
+  for (size_t i = 0; i < result.actual.size(); ++i) {
+    // Operands and the CPU result are explicitly rounded to f16. A small
+    // tolerance still permits hardware's internal accumulation order to
+    // differ without hiding packing/indexing failures.
+    const float tolerance =
+        std::max(0.002f, std::abs(result.expected[i]) * 0.002f);
+    const float error = std::abs(result.actual[i] - result.expected[i]);
+    if (error > tolerance) {
+      maximum_error = std::max(maximum_error, error);
+      if (mismatch_count < 8) {
+        samples << "\n  [" << i << "] actual " << result.actual[i]
+                << ", expected " << result.expected[i] << ", tolerance "
+                << tolerance;
+      }
+      ++mismatch_count;
+    }
+  }
+  EXPECT_EQ(mismatch_count, 0u)
+      << mismatch_count << "/" << result.actual.size()
+      << " dense NHWC elements differed; maximum error " << maximum_error
+      << "; first mismatches:" << samples.str();
+}
+
 class ConvSchemaHarnessTest : public ::testing::TestWithParam<Conv2dProblem> {};
 
 std::string
@@ -147,31 +185,94 @@ TEST_P(ConvSchemaHarnessTest, MatchesIndependentDenseReference) {
   iree_hal_device_release(device);
   iree_hal_driver_release(driver);
 
-  ASSERT_EQ(result.actual.size(), result.expected.size());
-  size_t mismatch_count = 0;
-  float maximum_error = 0.0f;
-  std::ostringstream samples;
-  for (size_t i = 0; i < result.actual.size(); ++i) {
-    // Operands and the CPU result are explicitly rounded to f16. A small
-    // tolerance still permits hardware's internal accumulation order to
-    // differ without hiding packing/indexing failures.
-    const float tolerance =
-        std::max(0.002f, std::abs(result.expected[i]) * 0.002f);
-    const float error = std::abs(result.actual[i] - result.expected[i]);
-    if (error > tolerance) {
-      maximum_error = std::max(maximum_error, error);
-      if (mismatch_count < 8) {
-        samples << "\n  [" << i << "] actual " << result.actual[i]
-                << ", expected " << result.expected[i] << ", tolerance "
-                << tolerance;
-      }
-      ++mismatch_count;
-    }
+  ExpectMatchesIndependentReference(result);
+}
+
+TEST(ConvSchemaBiasTest, NonzeroBiasWithExactLogicalBinding) {
+  iree_hal_driver_t *driver = nullptr;
+  iree_hal_device_t *device = nullptr;
+  std::string error;
+  if (!CreateDevice(&driver, &device, &error)) {
+    GTEST_SKIP() << "Rocket device unavailable: " << error;
   }
-  EXPECT_EQ(mismatch_count, 0u)
-      << mismatch_count << "/" << result.actual.size()
-      << " dense NHWC elements differed; maximum error " << maximum_error
-      << "; first mismatches:" << samples.str();
+
+  const Conv2dProblem problem{
+      /*input_height=*/5,   /*input_width=*/6,
+      /*input_channels=*/3, /*output_channels=*/5,
+      /*kernel_height=*/3,  /*kernel_width=*/3,
+      /*stride=*/1,         /*pad_top=*/1,
+      /*pad_left=*/1};
+  Conv2dResult result;
+  try {
+    result =
+        RunFp16Conv2d(device, problem, MakeInput(problem), MakeWeights(problem),
+                      MakeBias(problem), BiasBindingMode::kExact);
+  } catch (...) {
+    iree_hal_device_release(device);
+    iree_hal_driver_release(driver);
+    throw;
+  }
+  iree_hal_device_release(device);
+  iree_hal_driver_release(driver);
+  ExpectMatchesIndependentReference(result);
+}
+
+TEST(ConvSchemaBiasTest, DeferredUpdateBetweenPoisonedNeighborsIsIsolated) {
+  iree_hal_driver_t *driver = nullptr;
+  iree_hal_device_t *device = nullptr;
+  std::string error;
+  if (!CreateDevice(&driver, &device, &error)) {
+    GTEST_SKIP() << "Rocket device unavailable: " << error;
+  }
+
+  const Conv2dProblem problem{
+      /*input_height=*/5,   /*input_width=*/6,
+      /*input_channels=*/3, /*output_channels=*/5,
+      /*kernel_height=*/3,  /*kernel_width=*/3,
+      /*stride=*/1,         /*pad_top=*/1,
+      /*pad_left=*/1};
+  Conv2dResult result;
+  try {
+    result = RunFp16Conv2d(device, problem, MakeInput(problem),
+                           MakeWeights(problem), MakeBias(problem),
+                           BiasBindingMode::kPoisonedSuballocation);
+  } catch (...) {
+    iree_hal_device_release(device);
+    iree_hal_driver_release(driver);
+    throw;
+  }
+  iree_hal_device_release(device);
+  iree_hal_driver_release(driver);
+  ExpectMatchesIndependentReference(result);
+}
+
+TEST(ConvSchemaDepthwiseTest, CrossesTheThirtyTwoChannelWeightGroupBoundary) {
+  iree_hal_driver_t *driver = nullptr;
+  iree_hal_device_t *device = nullptr;
+  std::string error;
+  if (!CreateDevice(&driver, &device, &error)) {
+    GTEST_SKIP() << "Rocket device unavailable: " << error;
+  }
+
+  const Conv2dProblem problem{
+      /*input_height=*/5,    /*input_width=*/6,
+      /*input_channels=*/40, /*output_channels=*/40,
+      /*kernel_height=*/3,   /*kernel_width=*/3,
+      /*stride=*/1,          /*pad_top=*/1,
+      /*pad_left=*/1,        /*depthwise=*/true};
+  Conv2dResult result;
+  try {
+    result =
+        RunFp16Conv2d(device, problem, MakeInput(problem), MakeWeights(problem),
+                      MakeBias(problem), BiasBindingMode::kExact);
+  } catch (...) {
+    iree_hal_device_release(device);
+    iree_hal_driver_release(driver);
+    throw;
+  }
+  iree_hal_device_release(device);
+  iree_hal_driver_release(driver);
+  ExpectMatchesIndependentReference(result);
 }
 
 INSTANTIATE_TEST_SUITE_P(

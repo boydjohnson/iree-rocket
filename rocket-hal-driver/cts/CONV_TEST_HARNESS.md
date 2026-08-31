@@ -28,12 +28,15 @@ The harness accepts a regular FP16 convolution described by:
 - symmetric height/width padding (`pad_top` is also bottom padding and
   `pad_left` is also right padding).
 
-Input data is logical dense NHWC and weights are logical dense HWCF. The
+Input data is logical dense NHWC and regular weights are logical dense HWCF.
+Depthwise weights use logical CHW (one filter per channel), the ABI consumed by
+the driver's depthwise packer. The
 harness does not call Rocket tensor-packing helpers. That is deliberate: the
 test covers the driver's deferred input packing, coefficient packing, actual
-buffer binding order, NPU submission, and dense output compaction. The
-reference path indexes the logical tensors directly and has no dependency on
-the Rocket layouts or register-command builder.
+buffer binding order, FP16-to-FP32 BRDMA bias widening, NPU submission, and
+dense output compaction. The reference path indexes the logical tensors
+directly and has no dependency on the Rocket layouts or register-command
+builder.
 
 The harness releases its input, weight, and bias buffer references after
 recording and before queue submission. Correct execution therefore also checks
@@ -56,11 +59,12 @@ layout, binding, or padding errors remain readily visible.
 - The helper covers regular FP16 convolution. Int8 needs a reference
   requantization policy matching `Multiplier` and a logical-to-hardware int8
   coefficient bridge in the driver.
-- Depthwise needs the driver to accept a documented logical depthwise weight
-  layout and invoke its existing depthwise packer.
-- Bias is zero. The current FP16 bias binding is still hardware-layout
-  storage, so the harness allocates neutral backing rather than claiming it is
-  a logical dense bias tensor.
+- The public depthwise case is intentionally a separate hardware regression;
+  regular parameterized cases do not exercise channel-major CHW weights.
+- Bias is a logical dense FP16 tensor. Dedicated exact-sized bindings and a
+  nonzero-offset binding populated by a preceding command-buffer update
+  between poisoned neighboring suballocations verify the driver's deferred
+  widening and zero-padding bridge to BRDMA storage.
 - The host build verifies compilation and skips cleanly without
   `/dev/accel/accel0`. The parameterized cases must be run on an RK3588 board
   for NPU result validation.

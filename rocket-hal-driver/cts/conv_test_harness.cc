@@ -161,6 +161,7 @@ std::vector<uint8_t> BuildRkt1Executable(const Conv2dProblem &problem) {
         iree_hal_rocket_Conv2DDef_weights_height_add(&builder,
                                                      problem.kernel_height) ||
         iree_hal_rocket_Conv2DDef_stride_add(&builder, problem.stride) ||
+        iree_hal_rocket_Conv2DDef_depthwise_add(&builder, problem.depthwise) ||
         iree_hal_rocket_Conv2DDef_precision_add(
             &builder, iree_hal_rocket_Precision_FP16) ||
         iree_hal_rocket_Conv2DDef_pad_top_add(&builder, problem.pad_top) ||
@@ -237,7 +238,8 @@ iree_hal_buffer_t *AllocateAndWrite(iree_hal_device_t *device,
 
 std::vector<float> ReferenceConv2d(const Conv2dProblem &problem,
                                    const std::vector<uint16_t> &input,
-                                   const std::vector<uint16_t> &weights) {
+                                   const std::vector<uint16_t> &weights,
+                                   const std::vector<uint16_t> &bias) {
   std::vector<float> output(problem.output_element_count());
   const int32_t input_height = static_cast<int32_t>(problem.input_height);
   const int32_t input_width = static_cast<int32_t>(problem.input_width);
@@ -261,16 +263,25 @@ std::vector<float> ReferenceConv2d(const Conv2dProblem &problem,
                        problem.input_channels +
                    ic);
               const size_t weight_index =
-                  (((static_cast<size_t>(ky) * problem.kernel_width + kx) *
-                        problem.input_channels +
-                    ic) *
-                       problem.output_channels +
-                   oc);
+                  problem.depthwise
+                      ? ((static_cast<size_t>(ic) * problem.kernel_height +
+                          ky) *
+                             problem.kernel_width +
+                         kx)
+                      : (((static_cast<size_t>(ky) * problem.kernel_width +
+                           kx) *
+                              problem.input_channels +
+                          ic) *
+                             problem.output_channels +
+                         oc);
+              if (problem.depthwise && ic != oc)
+                continue;
               sum += F16ToF32(input[input_index]) *
                      F16ToF32(weights[weight_index]);
             }
           }
         }
+        sum += F16ToF32(bias[oc]);
         const size_t output_index =
             ((static_cast<size_t>(oy) * problem.output_width() + ox) *
                  problem.output_channels +
@@ -309,6 +320,8 @@ size_t Conv2dProblem::input_element_count() const {
 }
 
 size_t Conv2dProblem::weight_element_count() const {
+  if (depthwise)
+    return static_cast<size_t>(kernel_height) * kernel_width * input_channels;
   return static_cast<size_t>(kernel_height) * kernel_width * input_channels *
          output_channels;
 }
@@ -322,10 +335,25 @@ Conv2dResult RunFp16Conv2d(iree_hal_device_t *device,
                            const Conv2dProblem &problem,
                            const std::vector<float> &input,
                            const std::vector<float> &weights) {
+  return RunFp16Conv2d(device, problem, input, weights,
+                       std::vector<float>(problem.output_channels, 0.0f),
+                       BiasBindingMode::kExact);
+}
+
+Conv2dResult RunFp16Conv2d(iree_hal_device_t *device,
+                           const Conv2dProblem &problem,
+                           const std::vector<float> &input,
+                           const std::vector<float> &weights,
+                           const std::vector<float> &bias,
+                           BiasBindingMode bias_binding_mode) {
   if (!device)
     throw std::invalid_argument("device must not be null");
   if (problem.input_channels == 0 || problem.output_channels == 0) {
     throw std::invalid_argument("Conv2D channels must be nonzero");
+  }
+  if (problem.depthwise && problem.input_channels != problem.output_channels) {
+    throw std::invalid_argument(
+        "depthwise Conv2D requires output channels equal input channels");
   }
   if (problem.pad_top >= problem.kernel_height ||
       problem.pad_left >= problem.kernel_width) {
@@ -340,14 +368,25 @@ Conv2dResult RunFp16Conv2d(iree_hal_device_t *device,
     throw std::invalid_argument(
         "weight element count does not match Conv2D problem");
   }
+  if (bias.size() != problem.output_channels) {
+    throw std::invalid_argument(
+        "bias element count does not match Conv2D output channels");
+  }
 
   const std::vector<uint16_t> input_f16 = QuantizeToF16(input);
   const std::vector<uint16_t> weights_f16 = QuantizeToF16(weights);
-  // The current FP16 BS/bias binding is hardware-layout storage rather than
-  // a logical dense tensor. This harness deliberately verifies input and
-  // coefficient bindings, so keep bias neutral and generously sized until
-  // the driver grows a logical-bias packing bridge analogous to weights.
-  std::vector<uint8_t> bias_bytes(4096, 0);
+  const std::vector<uint16_t> bias_f16 = QuantizeToF16(bias);
+  const size_t logical_bias_bytes = bias_f16.size() * sizeof(uint16_t);
+  const size_t bias_prefix =
+      bias_binding_mode == BiasBindingMode::kPoisonedSuballocation ? 64 : 0;
+  const size_t bias_suffix =
+      bias_binding_mode == BiasBindingMode::kPoisonedSuballocation ? 64 : 0;
+  std::vector<uint8_t> bias_storage(
+      bias_prefix + logical_bias_bytes + bias_suffix, 0xFF);
+  if (bias_binding_mode == BiasBindingMode::kExact) {
+    std::memcpy(bias_storage.data() + bias_prefix, bias_f16.data(),
+                logical_bias_bytes);
+  }
   std::vector<uint16_t> output_f16(problem.output_element_count(), 0);
   const std::vector<uint8_t> executable_data = BuildRkt1Executable(problem);
 
@@ -365,7 +404,7 @@ Conv2dResult RunFp16Conv2d(iree_hal_device_t *device,
     weight_buffer = AllocateAndWrite(device, weights_f16.data(),
                                      weights_f16.size() * sizeof(uint16_t));
     bias_buffer =
-        AllocateAndWrite(device, bias_bytes.data(), bias_bytes.size());
+        AllocateAndWrite(device, bias_storage.data(), bias_storage.size());
     output_buffer = AllocateAndWrite(device, output_f16.data(),
                                      output_f16.size() * sizeof(uint16_t));
 
@@ -383,9 +422,8 @@ Conv2dResult RunFp16Conv2d(iree_hal_device_t *device,
 
     ThrowStatus(iree_hal_command_buffer_create(
                     device, IREE_HAL_COMMAND_BUFFER_MODE_ONE_SHOT,
-                    IREE_HAL_COMMAND_CATEGORY_DISPATCH,
-                    IREE_HAL_QUEUE_AFFINITY_ANY, /*binding_capacity=*/0,
-                    &command_buffer),
+                    IREE_HAL_COMMAND_CATEGORY_ANY, IREE_HAL_QUEUE_AFFINITY_ANY,
+                    /*binding_capacity=*/0, &command_buffer),
                 "iree_hal_command_buffer_create");
     ThrowStatus(iree_hal_command_buffer_begin(command_buffer),
                 "iree_hal_command_buffer_begin");
@@ -393,13 +431,21 @@ Conv2dResult RunFp16Conv2d(iree_hal_device_t *device,
     const iree_device_size_t input_bytes = input_f16.size() * sizeof(uint16_t);
     const iree_device_size_t weight_bytes =
         weights_f16.size() * sizeof(uint16_t);
-    const iree_device_size_t bias_byte_length = bias_bytes.size();
+    const iree_device_size_t bias_byte_length = logical_bias_bytes;
     const iree_device_size_t output_bytes =
         output_f16.size() * sizeof(uint16_t);
+    if (bias_binding_mode == BiasBindingMode::kPoisonedSuballocation) {
+      ThrowStatus(iree_hal_command_buffer_update_buffer(
+                      command_buffer, bias_f16.data(), /*source_offset=*/0,
+                      iree_hal_make_buffer_ref(bias_buffer, bias_prefix,
+                                               bias_byte_length),
+                      IREE_HAL_UPDATE_FLAG_NONE),
+                  "iree_hal_command_buffer_update_buffer(bias)");
+    }
     iree_hal_buffer_ref_t refs[4] = {
         iree_hal_make_buffer_ref(input_buffer, 0, input_bytes),
         iree_hal_make_buffer_ref(weight_buffer, 0, weight_bytes),
-        iree_hal_make_buffer_ref(bias_buffer, 0, bias_byte_length),
+        iree_hal_make_buffer_ref(bias_buffer, bias_prefix, bias_byte_length),
         iree_hal_make_buffer_ref(output_buffer, 0, output_bytes),
     };
     iree_hal_buffer_ref_list_t bindings = {4, refs};
@@ -492,7 +538,7 @@ Conv2dResult RunFp16Conv2d(iree_hal_device_t *device,
   iree_hal_buffer_release(input_buffer);
 
   Conv2dResult result;
-  result.expected = ReferenceConv2d(problem, input_f16, weights_f16);
+  result.expected = ReferenceConv2d(problem, input_f16, weights_f16, bias_f16);
   result.actual.reserve(output_f16.size());
   for (uint16_t value : output_f16)
     result.actual.push_back(F16ToF32(value));

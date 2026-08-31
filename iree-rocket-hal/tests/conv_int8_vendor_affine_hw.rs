@@ -222,6 +222,9 @@ fn shape_for(case: VendorCase) -> Shape {
         Precision::Int8(Quantization {
             input_zero_point: 0,
             output_zero_point: 0,
+            weight_zero_point: 0,
+            input_scale: 1.0,
+            weights_scale: 1.0,
             multiplier: Multiplier::from_ratio(1.0 / f64::from(case.divisor)),
         }),
     )

@@ -1,0 +1,21 @@
+# The RK3588 NPU is a single shared device (`/dev/accel/accel0`), and nextest
+# runs every test in its own process at host-CPU parallelism -- eight at once
+# on the board. Concurrent job submission corrupts results rather than
+# failing cleanly: `conv2d_oracle_hw`'s sweeps report a handful of their
+# several-hundred cases wrong ("1 of 242 Conv2D oracle cases failed"), and the
+# same binary passes 19/19 under `-j1`. That reads exactly like a real
+# regression, which is expensive to chase.
+#
+# So every `*_hw` binary -- the ones that open the device -- shares a
+# single-threaded group. Non-hardware binaries keep full parallelism. The cost
+# is small: the `iree-rocket-hal` suite goes from ~16s to ~45s.
+#
+# This does not remove the need for `--run-ignored all`: hardware tests are
+# `#[ignore]`d so an ordinary host `cargo test` skips them.
+
+[test-groups]
+npu-device = { max-threads = 1 }
+
+[[profile.default.overrides]]
+filter = 'binary(~_hw)'
+test-group = 'npu-device'
