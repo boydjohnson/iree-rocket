@@ -958,6 +958,29 @@ fn int8_accumulator_cout_shape_interaction_cases() -> Vec<Conv2dCase> {
 /// | 9x7   | 63 odd | 160  | 5      | 315 odd | fails     |
 /// | 8x8   | 64 even| 160  | 5      | 320 even| passes    |
 /// | 8x8   | 64 even|  32  | 1      | 64 even | passes    |
+/// | 3x4   | 12 even|  32  | 1      | 12 even | passes    |
+/// | 4x3   | 12 even|  32  | 1      | 12 even | passes    |
+/// | 9x8   | 72 even|  32  | 1      | 72 even | passes    |
+/// | 5x5   | 25 odd |  32  | 1      | 25 odd  | fails     |
+///
+/// The last four are the padding question, and they **pass on hardware**:
+/// 3x3 and 9x7 fail at Cout=32, while 3x4, 4x3 and 9x8 -- the same shapes
+/// one output row or column larger -- are all correct, with 5x5 staying odd
+/// as the control. Computing one extra output row or column and discarding
+/// it is therefore a real fix lever, not just an arithmetic one.
+///
+/// **Pad the width, not the height.** `tile_pixels` is per *tile*:
+/// `tile.rows.out_rows * tile.columns.out_cols`, a 2D subsection of the
+/// output that `plan_grid` produces by splitting columns and then greedily
+/// splitting rows to CBUF capacity. Every tile has to satisfy the parity
+/// independently. An even `out_cols` makes `rows * out_cols` even for *any*
+/// row split, so padding the width to even is robust against however the
+/// planner tiles. An even output *height* only helps while the shape stays
+/// one tile -- greedy row splitting readily produces odd per-tile row counts
+/// (8 rows becoming 5+3), and each of those tiles would then violate the
+/// parity on its own. The shapes here are all single-tile, so they cannot
+/// distinguish the two; that distinction is untested.
+/// | 8x8   | 64 even|  32  | 1      | 64 even | passes    |
 fn int8_accumulator_output_parity_cases() -> Vec<Conv2dCase> {
     [
         (3u32, 3u32, 32u32),
@@ -972,6 +995,15 @@ fn int8_accumulator_output_parity_cases() -> Vec<Conv2dCase> {
         (9, 7, 160),
         (8, 8, 160),
         (8, 8, 32),
+        // Does *one extra output row or column* rescue a failing shape?
+        // 3x3 Cout=32 fails at 9 pixels; 3x4 and 4x3 are the same shape one
+        // row or one column larger, 12 pixels, even. 9x7 Cout=32 fails at 63;
+        // 9x8 is one row more, 72, even. 5x5 stays odd at 25 as the control
+        // that the extra row is what matters, not the size change.
+        (3, 4, 32),
+        (4, 3, 32),
+        (9, 8, 32),
+        (5, 5, 32),
     ]
     .into_iter()
     .map(|(width, height, cout)| Conv2dCase {
@@ -1691,7 +1723,7 @@ fn int8_accumulator_cout_shape_interaction() {
 #[test]
 fn int8_accumulator_output_parity_is_planable_and_gap_free() {
     let cases = int8_accumulator_output_parity_cases();
-    assert_eq!(cases.len(), 12);
+    assert_eq!(cases.len(), 16);
     assert_planable_and_gap_free(cases);
 }
 
@@ -2158,6 +2190,164 @@ fn int8_accumulator_output_address_map_probe() {
             "    blocks the DPU never wrote: {sentinel_blocks:?} of {total_blocks} \
              ({} bytes allocated)",
             total_blocks * 128,
+        );
+    }
+}
+
+/// Is the parity rule per *tile* or per dispatch?
+///
+/// Every case here has an **even** total output pixel count, so a
+/// whole-dispatch reading of the rule predicts all of them pass. They differ
+/// only in the CBUF bank split, which changes nothing about the convolution
+/// -- same extent, same Cin, same Cout, same coefficients -- and only moves
+/// where `plan_grid` puts its row boundaries. If the rule is per tile, the
+/// splits whose individual tiles are odd must fail while the all-even splits
+/// pass.
+///
+/// **Measured 9/9 on hardware: the rule is per tile.** Every case has an even
+/// total pixel count, so a per-dispatch reading predicts all nine pass. The
+/// all-even splits pass and the odd ones fail, with only the bank split
+/// changing between them.
+///
+/// The width A/B settles the fix, too. `33x8` at banks 3/9 tiles as
+/// `[7, 1]` and **fails**; `34x8` at the same banks tiles as the *identical*
+/// `[7, 1]` and **passes**, because an even width makes both tiles even.
+/// `64x8` split into eight single-row tiles -- every row count odd -- also
+/// passes. So padding the width to even is robust however the planner tiles,
+/// while an even output *height* is not: it survives only while the shape
+/// stays one tile, and greedy row splitting readily produces odd per-tile
+/// row counts.
+///
+/// The row splits below come from `ConvPlan::with_cbuf_banks` and are
+/// asserted in `int8_accumulator_multitile_parity_is_planable`, so a planner
+/// change that invalidates the experiment fails loudly rather than silently
+/// measuring something else.
+///
+/// The last three carry the other half of the argument: an **even width**
+/// should make every tile even no matter how the rows split. 34x8 at banks
+/// 3/9 tiles as `[7, 1]`, the same odd row split that fails at 33x8, and
+/// 64x8 at 1/11 splits into eight single-row tiles -- every row count odd,
+/// every tile still even.
+///
+/// Cin stays at or below 384 throughout: dense int8 1x1 fails above that for
+/// an unrelated reason that would confound this.
+fn int8_accumulator_multitile_parity_cases() -> Vec<(Conv2dCase, u32, u32, &'static [u32])> {
+    [
+        // (width, height, cin, data_banks, weight_banks, expected out_rows)
+        (33u32, 8u32, 384u32, 1u32, 11u32, &[2u32, 2, 2, 2] as &[u32]),
+        (33, 8, 384, 3, 9, &[7, 1]),
+        (63, 8, 384, 5, 7, &[6, 2]),
+        (63, 8, 384, 4, 8, &[5, 3]),
+        (15, 32, 256, 1, 11, &[8, 8, 8, 8]),
+        (15, 32, 256, 3, 9, &[25, 7]),
+        // The width A/B. 34x8 at banks 3/9 tiles as [7, 1] -- the *identical*
+        // odd row split that fails at 33x8 -- but an even width makes both
+        // tiles even anyway. 64x8 at 1/11 is the extreme: eight tiles of one
+        // row each, every row count odd, every tile still even.
+        (34, 8, 384, 3, 9, &[7, 1]),
+        (34, 8, 384, 2, 10, &[5, 3]),
+        (64, 8, 384, 1, 11, &[1, 1, 1, 1, 1, 1, 1, 1]),
+    ]
+    .into_iter()
+    .map(|(width, height, cin, data_banks, weight_banks, rows)| {
+        (
+            Conv2dCase {
+                width,
+                height,
+                cin,
+                cout: 32,
+                kernel: [1, 1],
+                stride: 1,
+                padding: [0, 0],
+                precision: OraclePrecision::Int8Accumulator,
+                pattern: OraclePattern::Dense { phase: 0 },
+            },
+            data_banks,
+            weight_banks,
+            rows,
+        )
+    })
+    .collect()
+}
+
+#[test]
+fn int8_accumulator_multitile_parity_is_planable() {
+    for (case, data_banks, weight_banks, expected_rows) in int8_accumulator_multitile_parity_cases()
+    {
+        let plan = ConvPlan::with_cbuf_banks(case.shape(), case.kernel, data_banks, weight_banks);
+        let rows: Vec<u32> = plan.tiles().iter().map(|tile| tile.rows.out_rows).collect();
+        assert_eq!(
+            rows, expected_rows,
+            "{}x{} Cin={} banks={data_banks}/{weight_banks} no longer tiles as the experiment assumes",
+            case.width, case.height, case.cin,
+        );
+        assert_eq!(
+            (case.width as usize * case.height as usize) % 2,
+            0,
+            "every case must have an even total pixel count, or it cannot discriminate"
+        );
+    }
+}
+
+#[test]
+#[ignore = "needs /dev/accel/accel0 -- shows whether the output parity rule is per tile or per dispatch"]
+fn int8_accumulator_multitile_parity_probe() {
+    let file = OpenOptions::new()
+        .read(true)
+        .write(true)
+        .open(DEVICE_PATH)
+        .expect("failed to open RK3588 NPU device");
+
+    let only = probe_only_index();
+    println!("\n=== accumulator output parity: per tile or per dispatch? ===");
+    if !accumulator_canary_passes(&file) {
+        println!("  CANARY FAILED -- the NPU is sick, reboot the board");
+        return;
+    }
+
+    for (index, (case, data_banks, weight_banks, expected_rows)) in
+        int8_accumulator_multitile_parity_cases()
+            .into_iter()
+            .enumerate()
+    {
+        if only.is_some_and(|only| only != index) {
+            continue;
+        }
+        let fixture = match build_fixture(case) {
+            Ok(fixture) => fixture,
+            Err(error) => {
+                println!("  [{index}] build ERROR {error}");
+                continue;
+            }
+        };
+        let plan =
+            ConvPlan::with_cbuf_banks(fixture.shape, fixture.case.kernel, data_banks, weight_banks);
+        let per_tile: Vec<usize> = expected_rows
+            .iter()
+            .map(|rows| *rows as usize * case.width as usize)
+            .collect();
+        let all_even = per_tile.iter().all(|pixels| pixels % 2 == 0);
+
+        let verdict = match execute_case_output_with_plan(&file, &fixture, plan) {
+            Ok(execution) => {
+                let report = compare_output(&fixture, &execution.plan, &execution.output);
+                if report.mismatches == 0 {
+                    "pass".to_string()
+                } else {
+                    format!("FAIL ({} mismatches)", report.mismatches)
+                }
+            }
+            Err(error) => format!("ERROR {error}"),
+        };
+
+        println!(
+            "  [{index}] {}x{} Cin={} banks={data_banks}/{weight_banks} rows={expected_rows:?} \
+             tile_pixels={per_tile:?} total={} (even) -> per-tile predicts {}, actual {verdict}",
+            case.width,
+            case.height,
+            case.cin,
+            case.width * case.height,
+            if all_even { "pass" } else { "FAIL" },
         );
     }
 }
