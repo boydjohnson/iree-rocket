@@ -1063,26 +1063,31 @@ status_stub!(queue_dispatch(
 #[allow(unused_variables)]
 /// Interleaves DPU feature-atomic output surfaces into dense NHWC pixels.
 ///
-/// Each 16-byte surface stores one channel group for every spatial pixel;
+/// Each hardware surface stores one channel block for every spatial pixel;
 /// `DPU_DST_SURF_STRIDE` advances between those full spatial surfaces.
 /// Dense NHWC instead stores every channel group for one pixel contiguously,
-/// so copy one surface chunk at a time into each destination pixel. The final
-/// logical surface may use fewer than 16 bytes.
+/// so copy one surface chunk at a time into each destination pixel. Ordinary
+/// output blocks are 16 bytes; accumulator blocks are 32 i32 lanes (128
+/// bytes). The final logical surface may be partial.
 fn compact_atomic_output(
     scratch: &[u8],
     source_pixel_count: usize,
     output_pixel_count: usize,
     bytes_per_pixel: usize,
+    source_block_bytes: usize,
     dst: &mut [u8],
 ) -> usize {
-    const ATOMIC_STRIDE: usize = 16;
+    if source_block_bytes == 0 {
+        return 0;
+    }
     let mut written = 0;
     for pixel in 0..output_pixel_count {
         let mut pixel_written = 0;
         while pixel_written < bytes_per_pixel {
-            let surface = pixel_written / ATOMIC_STRIDE;
-            let chunk_len = (bytes_per_pixel - pixel_written).min(ATOMIC_STRIDE);
-            let src_off = surface * source_pixel_count * ATOMIC_STRIDE + pixel * ATOMIC_STRIDE;
+            let surface = pixel_written / source_block_bytes;
+            let chunk_len = (bytes_per_pixel - pixel_written).min(source_block_bytes);
+            let src_off =
+                surface * source_pixel_count * source_block_bytes + pixel * source_block_bytes;
             let dst_off = pixel * bytes_per_pixel + pixel_written;
             if src_off + chunk_len > scratch.len() || dst_off + chunk_len > dst.len() {
                 return written;
@@ -1096,9 +1101,51 @@ fn compact_atomic_output(
     written
 }
 
+fn compact_tiled_accumulator_output(
+    scratch: &[u8],
+    tiles: &[crate::command_buffer::OutputTileCompaction],
+    output_width: usize,
+    bytes_per_pixel: usize,
+    source_block_bytes: usize,
+    dst: &mut [u8],
+) -> usize {
+    if source_block_bytes == 0 || output_width == 0 {
+        return 0;
+    }
+    let mut written = 0;
+    for tile in tiles {
+        let tile_pixels = tile.output_rows * tile.output_columns;
+        for row in 0..tile.output_rows {
+            for column in 0..tile.output_columns {
+                let local_pixel = row * tile.output_columns + column;
+                let output_pixel =
+                    (tile.output_row + row) * output_width + tile.output_column + column;
+                let mut pixel_written = 0;
+                while pixel_written < bytes_per_pixel {
+                    let surface = pixel_written / source_block_bytes;
+                    let chunk_len = (bytes_per_pixel - pixel_written).min(source_block_bytes);
+                    let src_off = tile.scratch_offset
+                        + surface * tile_pixels * source_block_bytes
+                        + local_pixel * source_block_bytes;
+                    let dst_off = output_pixel * bytes_per_pixel + pixel_written;
+                    if src_off + chunk_len > scratch.len() || dst_off + chunk_len > dst.len() {
+                        return written;
+                    }
+                    dst[dst_off..dst_off + chunk_len]
+                        .copy_from_slice(&scratch[src_off..src_off + chunk_len]);
+                    written += chunk_len;
+                    pixel_written += chunk_len;
+                }
+            }
+        }
+    }
+    written
+}
+
 #[cfg(test)]
 mod compaction_tests {
-    use super::compact_atomic_output;
+    use super::{compact_atomic_output, compact_tiled_accumulator_output};
+    use crate::command_buffer::OutputTileCompaction;
 
     #[test]
     fn compacts_16_byte_slots_into_dense_output() {
@@ -1110,7 +1157,7 @@ mod compaction_tests {
             scratch[i * 16 + 1] = 0x10 + i as u8;
         }
         let mut dst = vec![0u8; PIXELS * BPP];
-        let written = compact_atomic_output(&scratch, PIXELS, PIXELS, BPP, &mut dst);
+        let written = compact_atomic_output(&scratch, PIXELS, PIXELS, BPP, 16, &mut dst);
         assert_eq!(written, PIXELS * BPP);
         assert_eq!(dst, vec![0x00, 0x10, 0x01, 0x11, 0x02, 0x12, 0x03, 0x13]);
     }
@@ -1126,7 +1173,7 @@ mod compaction_tests {
         scratch[48..64].copy_from_slice(&[3; 16]);
 
         let mut dst = vec![0u8; PIXELS * BPP];
-        let written = compact_atomic_output(&scratch, PIXELS, PIXELS, BPP, &mut dst);
+        let written = compact_atomic_output(&scratch, PIXELS, PIXELS, BPP, 16, &mut dst);
         assert_eq!(written, PIXELS * BPP);
         assert_eq!(&dst[0..16], &[0; 16]);
         assert_eq!(&dst[16..20], &[2; 4]);
@@ -1135,24 +1182,29 @@ mod compaction_tests {
     }
 
     #[test]
-    fn compacts_int32_accumulator_surfaces_into_dense_nhwc() {
+    fn compacts_int32_accumulator_blocks_into_dense_nhwc() {
         const PIXELS: usize = 2;
         const CHANNELS: usize = 8;
         const BPP: usize = CHANNELS * size_of::<i32>();
-        const LANES_PER_SURFACE: usize = 16 / size_of::<i32>();
-        let mut scratch = vec![0u8; PIXELS * 2 * 16];
+        const ACCUMULATOR_BLOCK_BYTES: usize = 32 * size_of::<i32>();
+        let mut scratch = vec![0u8; PIXELS * ACCUMULATOR_BLOCK_BYTES];
         for pixel in 0..PIXELS {
             for channel in 0..CHANNELS {
-                let surface = channel / LANES_PER_SURFACE;
-                let lane = channel % LANES_PER_SURFACE;
-                let offset = surface * PIXELS * 16 + pixel * 16 + lane * size_of::<i32>();
+                let offset = pixel * ACCUMULATOR_BLOCK_BYTES + channel * size_of::<i32>();
                 let value = -((pixel * CHANNELS + channel + 1) as i32);
                 scratch[offset..offset + 4].copy_from_slice(&value.to_le_bytes());
             }
         }
 
         let mut dst = vec![0u8; PIXELS * BPP];
-        let written = compact_atomic_output(&scratch, PIXELS, PIXELS, BPP, &mut dst);
+        let written = compact_atomic_output(
+            &scratch,
+            PIXELS,
+            PIXELS,
+            BPP,
+            ACCUMULATOR_BLOCK_BYTES,
+            &mut dst,
+        );
         assert_eq!(written, dst.len());
         for (index, bytes) in dst.chunks_exact(4).enumerate() {
             assert_eq!(
@@ -1163,10 +1215,60 @@ mod compaction_tests {
     }
 
     #[test]
+    fn compacts_independently_staged_accumulator_tiles() {
+        const WIDTH: usize = 4;
+        const HEIGHT: usize = 2;
+        const CHANNELS: usize = 32;
+        const BPP: usize = CHANNELS * size_of::<i32>();
+        const BLOCK_BYTES: usize = BPP;
+        let tiles = [
+            OutputTileCompaction {
+                scratch_offset: 0,
+                output_row: 0,
+                output_column: 0,
+                output_rows: HEIGHT,
+                output_columns: 2,
+            },
+            OutputTileCompaction {
+                scratch_offset: HEIGHT * 2 * BLOCK_BYTES,
+                output_row: 0,
+                output_column: 2,
+                output_rows: HEIGHT,
+                output_columns: 2,
+            },
+        ];
+        let mut scratch = vec![0u8; WIDTH * HEIGHT * BPP];
+        for tile in &tiles {
+            for row in 0..tile.output_rows {
+                for column in 0..tile.output_columns {
+                    let local_pixel = row * tile.output_columns + column;
+                    let output_pixel =
+                        (tile.output_row + row) * WIDTH + tile.output_column + column;
+                    for channel in 0..CHANNELS {
+                        let value = (output_pixel * CHANNELS + channel) as i32;
+                        let offset = tile.scratch_offset
+                            + local_pixel * BLOCK_BYTES
+                            + channel * size_of::<i32>();
+                        scratch[offset..offset + 4].copy_from_slice(&value.to_le_bytes());
+                    }
+                }
+            }
+        }
+
+        let mut dst = vec![0u8; WIDTH * HEIGHT * BPP];
+        let written =
+            compact_tiled_accumulator_output(&scratch, &tiles, WIDTH, BPP, BLOCK_BYTES, &mut dst);
+        assert_eq!(written, dst.len());
+        for (index, bytes) in dst.chunks_exact(4).enumerate() {
+            assert_eq!(i32::from_le_bytes(bytes.try_into().unwrap()), index as i32);
+        }
+    }
+
+    #[test]
     fn stops_short_when_dst_too_small() {
         let scratch = vec![0u8; 64];
         let mut dst = vec![0u8; 2];
-        let written = compact_atomic_output(&scratch, 4, 4, 2, &mut dst);
+        let written = compact_atomic_output(&scratch, 4, 4, 2, 16, &mut dst);
         assert_eq!(written, 2);
     }
 
@@ -1174,7 +1276,7 @@ mod compaction_tests {
     fn stops_short_when_scratch_too_small() {
         let scratch = vec![0u8; 16];
         let mut dst = vec![0u8; 8];
-        let written = compact_atomic_output(&scratch, 4, 4, 2, &mut dst);
+        let written = compact_atomic_output(&scratch, 4, 4, 2, 16, &mut dst);
         assert_eq!(written, 2);
     }
 
@@ -1192,7 +1294,7 @@ mod compaction_tests {
 
         let mut dst = vec![0u8; LOGICAL_PIXELS * BPP];
         let written =
-            compact_atomic_output(&scratch, PHYSICAL_PIXELS, LOGICAL_PIXELS, BPP, &mut dst);
+            compact_atomic_output(&scratch, PHYSICAL_PIXELS, LOGICAL_PIXELS, BPP, 16, &mut dst);
         assert_eq!(written, LOGICAL_PIXELS * BPP);
         assert_eq!(&dst[0..16], &[1; 16]);
         assert_eq!(&dst[16..20], &[3; 4]);
@@ -1379,7 +1481,7 @@ unsafe extern "C" fn queue_execute(
                     // not the real IREE-visible output buffer. Compact it
                     // into the real buffer now that prep_bo above confirmed
                     // the write is complete and host-visible.
-                    if let Some(oc) = job.output_compaction {
+                    if let Some(oc) = &job.output_compaction {
                         let expected_bytes = oc.output_pixel_count * oc.bytes_per_pixel;
                         if expected_bytes as u64 > oc.output_length as u64 {
                             break 'result status::from_code(
@@ -1396,13 +1498,30 @@ unsafe extern "C" fn queue_execute(
                                 expected_bytes,
                             )
                         };
-                        compact_atomic_output(
-                            scratch,
-                            oc.source_pixel_count,
-                            oc.output_pixel_count,
-                            oc.bytes_per_pixel,
-                            dst,
-                        );
+                        let written = if let Some(tiles) = &oc.source_tiles {
+                            compact_tiled_accumulator_output(
+                                scratch,
+                                tiles,
+                                oc.output_width,
+                                oc.bytes_per_pixel,
+                                oc.source_block_bytes,
+                                dst,
+                            )
+                        } else {
+                            compact_atomic_output(
+                                scratch,
+                                oc.source_pixel_count,
+                                oc.output_pixel_count,
+                                oc.bytes_per_pixel,
+                                oc.source_block_bytes,
+                                dst,
+                            )
+                        };
+                        if written != expected_bytes {
+                            break 'result status::from_code(
+                                iree_status_code_e_IREE_STATUS_INTERNAL,
+                            );
+                        }
                     }
                 }
                 status::ok()

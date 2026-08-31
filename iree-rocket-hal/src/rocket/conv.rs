@@ -967,22 +967,25 @@ impl Shape {
     /// Conservative physical output allocation for this convolution, in
     /// bytes.
     ///
-    /// The DPU writes output in 16-byte feature-atomic surfaces and programs
-    /// the atomically-rounded [`Shape::padded_out_channels`] count rather
-    /// than the logical one, so this allocates enough complete surfaces for
-    /// that padded count. This is the capture-derived counterpart of the
-    /// retired Mesa builder's output-allocation formula. Tiling-agnostic:
+    /// Requantized output uses 16-byte feature-atomic surfaces. Bypassed i32
+    /// output instead retains CORE's native 32-channel accumulator blocks,
+    /// which occupy 128 bytes. The DPU programs the block-rounded
+    /// [`Shape::padded_out_channels`] count rather than the logical one, so
+    /// this allocates enough complete blocks for that padded count. This is
+    /// the capture-derived counterpart of the retired Mesa builder's
+    /// output-allocation formula. Tiling-agnostic:
     /// [`ConvPlan`]'s row/column tiles are sub-ranges of this same total
     /// buffer, addressed via [`relocate`]'s per-tile offsets, so callers need
     /// only this one size regardless of how many tiles a shape plans into.
     pub fn output_scratch_bytes(&self, kernels: Kernels) -> usize {
         let channel_bytes =
             self.padded_out_channels() as usize * self.precision.output_element_bytes() as usize;
-        let surface_count = channel_bytes.div_ceil(FEATURE_ATOM_BYTES as usize);
+        let block_bytes = self.output_channel_block_bytes() as usize;
+        let block_count = channel_bytes.div_ceil(block_bytes);
         self.output_width(kernels) as usize
             * self.output_height(kernels) as usize
-            * surface_count
-            * FEATURE_ATOM_BYTES as usize
+            * block_count
+            * block_bytes
     }
 
     /// Bytes of fp16 coefficients the whole kernel set occupies.
@@ -1200,13 +1203,20 @@ impl Shape {
 
     /// Byte stride of one output row.
     ///
-    /// The output is always NC1HWC2 with one 16-byte atom per pixel per
-    /// surface, so this does not depend on `Cout` -- the channel count sets
-    /// how many surfaces there are, not how wide a row is. Output geometry,
-    /// not input: at stride greater than one the two differ, and the corpus
-    /// programs the output dimensions in every one of 150 such programs.
+    /// Output geometry, not input: at stride greater than one the two differ.
+    /// Requantized output uses one 16-byte NC1HWC2 atom per pixel; bypassed
+    /// i32 output retains CORE's 32-channel accumulator block (128 bytes).
     pub fn output_row_stride(&self, kernels: Kernels) -> u32 {
-        self.output_width(kernels) * FEATURE_ATOM_BYTES
+        self.output_width(kernels) * self.output_channel_block_bytes()
+    }
+
+    /// Bytes occupied by one pixel in one hardware output-channel block.
+    pub fn output_channel_block_bytes(&self) -> u32 {
+        if self.precision.writes_accumulators() {
+            self.precision.out_channel_granule() * self.precision.output_element_bytes()
+        } else {
+            FEATURE_ATOM_BYTES
+        }
     }
 
     /// CBUF banks the feature data would take if nothing competed for them.
@@ -1776,8 +1786,8 @@ impl ColumnTile {
         }
     }
 
-    fn output_offset(&self) -> u32 {
-        self.out_first * FEATURE_ATOM_BYTES
+    fn output_offset(&self, shape: Shape) -> u32 {
+        self.out_first * shape.output_channel_block_bytes()
     }
 }
 
@@ -1823,7 +1833,7 @@ impl Tile2D {
     }
 
     fn output_offset(&self, shape: Shape, kernels: Kernels) -> u32 {
-        self.rows.output_offset(shape, kernels) + self.columns.output_offset()
+        self.rows.output_offset(shape, kernels) + self.columns.output_offset(shape)
     }
 }
 
@@ -2555,7 +2565,7 @@ fn decode_identity(command: &RegCmd) -> (u32, u32) {
 /// is what makes this fail loudly if a program is ever reordered or gains a
 /// second write to the same address register, instead of quietly relocating
 /// the wrong word.
-fn relocate_one<R: RegisterMeta>(commands: &mut [RegCmd], address: u32) {
+fn relocate_one<R: RegisterMeta>(commands: &mut [RegCmd], address: u32, keep_tile_offset: bool) {
     assert_eq!(
         address & 0xf,
         0,
@@ -2579,11 +2589,13 @@ fn relocate_one<R: RegisterMeta>(commands: &mut [RegCmd], address: u32) {
         R::OFFSET
     );
 
-    // Add rather than overwrite: a tile program already carries its own byte
-    // offset from the tensor base in these registers, exactly as the vendor's
-    // own height-split programs do. For a whole-image program the existing
-    // value is zero and this is an assignment.
-    let tile_offset = (commands[matches[0]].0 >> 16) as u32;
+    // Normally add rather than overwrite: a tile program already carries its
+    // own byte offset from the tensor base in these registers, exactly as the
+    // vendor's own height-split programs do. Independently staged output
+    // tiles are the exception and bind DPU_DST_BASE_ADDR directly.
+    let tile_offset = keep_tile_offset
+        .then(|| (commands[matches[0]].0 >> 16) as u32)
+        .unwrap_or(0);
     commands[matches[0]] = RegCmd::new(R::DOMAIN, R::OFFSET, address + tile_offset);
 }
 
@@ -2598,10 +2610,23 @@ fn relocate_one<R: RegisterMeta>(commands: &mut [RegCmd], address: u32) {
 /// relocating twice would double the offsets; this is a one-shot step on a
 /// freshly built program, not something to reapply.
 pub fn relocate(commands: &mut [RegCmd], buffers: Buffers) {
-    relocate_one::<CnaFeatureDataAddr>(commands, buffers.input);
-    relocate_one::<CnaDcompAddr0>(commands, buffers.weights);
-    relocate_one::<DpuRdmaBsBaseAddr>(commands, buffers.bias);
-    relocate_one::<DpuDstBaseAddr>(commands, buffers.output);
+    relocate_one::<CnaFeatureDataAddr>(commands, buffers.input, true);
+    relocate_one::<CnaDcompAddr0>(commands, buffers.weights, true);
+    relocate_one::<DpuRdmaBsBaseAddr>(commands, buffers.bias, true);
+    relocate_one::<DpuDstBaseAddr>(commands, buffers.output, true);
+}
+
+/// Binds a program while replacing its output tile offset with an exact DMA
+/// address.
+///
+/// This is for callers that stage each output tile in a separate contiguous
+/// scratch range. Input, weight, and bias addresses retain the tile offsets
+/// carried by the program; only `buffers.output` is used verbatim.
+pub fn relocate_with_exact_output(commands: &mut [RegCmd], buffers: Buffers) {
+    relocate_one::<CnaFeatureDataAddr>(commands, buffers.input, true);
+    relocate_one::<CnaDcompAddr0>(commands, buffers.weights, true);
+    relocate_one::<DpuRdmaBsBaseAddr>(commands, buffers.bias, true);
+    relocate_one::<DpuDstBaseAddr>(commands, buffers.output, false);
 }
 
 /// 2-3 and 4-6 are alternative two- and three-core height-split programs,
@@ -3146,6 +3171,7 @@ fn conv_2d_tile_program(
             .in_precision(precision.into())
             .out_precision(output_precision)
             .proc_precision(precision.into())
+            .mc_surf_out(Bits::new(u32::from(accumulator_output)))
             .bs_mul_shift_value_neg(Bits::new(bs_mul_shift))
             .build(),
     );
@@ -3305,16 +3331,23 @@ fn conv_2d_tile_program(
     commands.push(zero::<DpuEwOpValue6>());
     commands.push(zero::<DpuEwOpValue7>());
     commands.push(
-        // Half an output atom per pixel, and *not* precision-dependent:
+        // Accumulator output is hardware-validated with the fixed logical
+        // value 16 together with DPU_DATA_FORMAT.mc_surf_out=1. CNA's
+        // DATA_SIZE3.surf_mode deliberately remains zero: enabling it
+        // changes the convolution results for NC1HWC2 input. Requantized
+        // output uses half an output atom per pixel, and is otherwise not
+        // precision-dependent:
         // this field is byte-identical across every fp16/int8 capture pair,
         // unlike `weight_bytes_per_kernel` right above, which halves.
         // Depthwise doubles this. Confirmed as a factor rather than a
         // constant by the stride-2 capture, whose 16x16 output takes 1024
         // against the dense 512.
         Register::<DpuSurfaceAdd>::new()
-            .surf_add(Bits::new(
-                full_out_width * out_height * 2 * if shape.depthwise { 2 } else { 1 },
-            ))
+            .surf_add(Bits::new(if accumulator_output {
+                16
+            } else {
+                full_out_width * out_height * 2 * if shape.depthwise { 2 } else { 1 }
+            }))
             .build(),
     );
     commands.push(zero::<DpuReserved40c4>());
@@ -5293,6 +5326,17 @@ mod tests {
         assert_eq!(data_format & 0b111, 0, "DPU processing stays int8");
         assert_eq!((data_format >> 26) & 0b111, 0, "DPU input stays int8");
         assert_eq!((data_format >> 29) & 0b111, 4, "DPU output is int32");
+        assert_eq!(
+            (data_format >> 3) & 1,
+            1,
+            "DPU multi-surface output is enabled"
+        );
+        assert_eq!(
+            (value_of::<CnaDataSize3>(&program) >> 22) & 0b11,
+            0,
+            "CNA surface serial mode must remain disabled"
+        );
+        assert_eq!(value_of::<DpuSurfaceAdd>(&program), 16 << 4);
         assert_eq!(value_of::<DpuBsCfg>(&program) & 1, 1, "BS is bypassed");
         assert_eq!(
             (value_of::<DpuBsOwCfg>(&program) >> 1) & 1,
@@ -5305,11 +5349,35 @@ mod tests {
 
         assert_eq!(shape.precision.element_bytes(), 1);
         assert_eq!(shape.precision.output_element_bytes(), 4);
+        assert_eq!(shape.output_channel_block_bytes(), 32 * 4);
         let requantized = Shape::with_precision(4, 4, 1, 1, 8, Precision::Int8(quantization));
         assert_eq!(
             shape.output_scratch_bytes([1, 1]),
             4 * requantized.output_scratch_bytes([1, 1])
         );
+    }
+
+    #[test]
+    fn int8_accumulator_uses_native_channel_blocks_without_forced_tiling() {
+        let shape = Shape::with_precision(
+            32,
+            32,
+            1,
+            64,
+            128,
+            Precision::Int8Accumulator(Quantization {
+                input_zero_point: 0,
+                output_zero_point: 0,
+                weight_zero_point: 0,
+                ..quantization()
+            }),
+        );
+        let plan = ConvPlan::new(shape, [1, 1]);
+
+        assert_eq!(plan.output_column_widths(), &[32]);
+        assert_eq!(plan.tiles().len(), 1);
+        assert_eq!(shape.output_channel_block_bytes(), 32 * 4);
+        assert_eq!(shape.output_row_stride([1, 1]), 32 * 32 * 4);
     }
 
     #[test]
@@ -5589,6 +5657,21 @@ mod tests {
         // these two carry no offset to add.
         assert_eq!(value_of::<CnaDcompAddr0>(&commands), 0x2_0000);
         assert_eq!(value_of::<DpuRdmaBsBaseAddr>(&commands), 0x3_0000);
+    }
+
+    #[test]
+    fn exact_output_relocation_preserves_only_the_input_tile_offset() {
+        let shape = Shape::CAPTURED;
+        let kernels = [3, 3];
+        let split = Tile::split(shape, kernels, 2);
+        let mut commands = conv_2d_tile(shape, kernels, &split[1]);
+
+        relocate_with_exact_output(&mut commands, RELOCATION);
+
+        assert_eq!(value_of::<CnaFeatureDataAddr>(&commands), 0x1_0000 + 0xb40);
+        assert_eq!(value_of::<CnaDcompAddr0>(&commands), 0x2_0000);
+        assert_eq!(value_of::<DpuRdmaBsBaseAddr>(&commands), 0x3_0000);
+        assert_eq!(value_of::<DpuDstBaseAddr>(&commands), 0x4_0000);
     }
 
     #[test]

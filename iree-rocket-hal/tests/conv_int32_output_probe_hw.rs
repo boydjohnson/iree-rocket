@@ -4,8 +4,10 @@
 //! int8 path requantizes to i8. The DPU documents `out_precision = 4` as
 //! int32, but no vendor capture in this repository exercises it. This probe
 //! establishes the required combination: retain int8 input and processing
-//! precision, select int32 output, and bypass the BS and CPEND stages that
-//! otherwise requantize the accumulator.
+//! precision, select int32 output, bypass the BS and CPEND stages that
+//! otherwise requantize the accumulator, and enable DPU multi-surface output.
+//! CNA surface serial mode remains disabled. Accumulator output retains
+//! CORE's 32-channel processing granule.
 //!
 //! Cross-build and run on an RK3588 board:
 //!
@@ -24,19 +26,21 @@ use iree_rocket_hal::rocket::{
         relocate, write_bs_buffer,
     },
     device::{Buffer, JobDesc, close_bo, fini_bo, prep_bo, submit_jobs},
-    tensor_layout::pack_hwcf_to_rocket_weights,
+    tensor_layout::{pack_hwcf_to_rocket_weights, pack_nhwc_to_nc1hwc2},
 };
 
 const DEVICE_PATH: &str = "/dev/accel/accel0";
 const PAGE_BYTES: usize = 4096;
-const WIDTH: u32 = 4;
-const HEIGHT: u32 = 4;
-const OUT_CHANNELS: u32 = 8;
+const WIDTH: u32 = 8;
+const HEIGHT: u32 = 8;
+const IN_CHANNELS: u32 = 64;
+const OUT_CHANNELS: u32 = 128;
 const FEATURE_ATOM_BYTES: usize = 16;
-const I32_CHANNELS_PER_ATOM: usize = FEATURE_ATOM_BYTES / mem::size_of::<i32>();
+const I32_CHANNELS_PER_OUTPUT_BLOCK: usize = 32;
 const OUTPUT_PIXELS: usize = WIDTH as usize * HEIGHT as usize;
-const OUTPUT_SURFACES: usize = (OUT_CHANNELS as usize).div_ceil(I32_CHANNELS_PER_ATOM);
-const EXPECTED_OUTPUT_BYTES: usize = OUTPUT_PIXELS * OUTPUT_SURFACES * FEATURE_ATOM_BYTES;
+const OUTPUT_BLOCKS: usize = (OUT_CHANNELS as usize).div_ceil(I32_CHANNELS_PER_OUTPUT_BLOCK);
+const EXPECTED_OUTPUT_BYTES: usize =
+    OUTPUT_PIXELS * OUTPUT_BLOCKS * I32_CHANNELS_PER_OUTPUT_BLOCK * mem::size_of::<i32>();
 const OUTPUT_BYTES: usize = 64 * 1024;
 const SENTINEL: u8 = 0xa5;
 
@@ -62,9 +66,13 @@ fn int8_convolution_can_write_exact_i32_accumulators() {
         weights_scale: 1.0,
         multiplier: Multiplier::from_ratio(1.0),
     });
-    let shape = Shape::with_precision(WIDTH, HEIGHT, 1, 1, OUT_CHANNELS, precision);
-    let input_values: Vec<u8> = (1..=OUTPUT_PIXELS as u8).collect();
-    let weight_values: [i8; OUT_CHANNELS as usize] = [-1, -2, -3, -4, -5, -6, -7, -8];
+    let shape = Shape::with_precision(WIDTH, HEIGHT, 1, IN_CHANNELS, OUT_CHANNELS, precision);
+    let input_values: Vec<u8> = (1..=OUTPUT_PIXELS as u8)
+        .flat_map(|value| std::iter::repeat_n(value, IN_CHANNELS as usize))
+        .collect();
+    let weight_values: Vec<i8> = (0..OUT_CHANNELS)
+        .map(|channel| -((channel % 8 + 1) as i8))
+        .collect();
 
     let file = OpenOptions::new()
         .read(true)
@@ -74,25 +82,35 @@ fn int8_convolution_can_write_exact_i32_accumulators() {
     let fd = file.as_raw_fd();
 
     let raw_output = unsafe {
-        let input_bytes = (WIDTH * HEIGHT) as usize;
+        let input_bytes = OUTPUT_PIXELS * IN_CHANNELS as usize;
         let buf_input = Buffer::new(fd, page_aligned_size(input_bytes), &file);
         ptr::write_bytes(buf_input.host_ptr, 0, buf_input.size);
+        let mut packed_input = vec![0; input_bytes];
+        pack_nhwc_to_nc1hwc2(
+            &input_values,
+            OUTPUT_PIXELS,
+            IN_CHANNELS as usize,
+            &mut packed_input,
+        )
+        .expect("failed to pack int8 input");
         ptr::copy_nonoverlapping(
-            input_values.as_ptr(),
+            packed_input.as_ptr(),
             buf_input.host_ptr,
-            input_values.len(),
+            packed_input.len(),
         );
 
         let weight_bytes = shape.weight_bytes(kernels) as usize;
         let buf_weights = Buffer::new(fd, page_aligned_size(weight_bytes), &file);
         ptr::write_bytes(buf_weights.host_ptr, 0, buf_weights.size);
-        let dense_weights: Vec<u8> = weight_values.iter().map(|&value| value as u8).collect();
+        let dense_weights: Vec<u8> = (0..IN_CHANNELS)
+            .flat_map(|_| weight_values.iter().map(|&value| value as u8))
+            .collect();
         let mut packed_weights = vec![0; weight_bytes];
         let packed_bytes = pack_hwcf_to_rocket_weights(
             &dense_weights,
             1,
             1,
-            1,
+            IN_CHANNELS as usize,
             OUT_CHANNELS as usize,
             1,
             &mut packed_weights,
@@ -184,24 +202,36 @@ fn int8_convolution_can_write_exact_i32_accumulators() {
         end - first
     );
 
+    if (first, end) != (0, EXPECTED_OUTPUT_BYTES) {
+        let changed_atoms: Vec<_> = raw_output
+            .chunks_exact(FEATURE_ATOM_BYTES)
+            .enumerate()
+            .filter(|(_, atom)| atom.iter().any(|&byte| byte != SENTINEL))
+            .map(|(index, _)| index)
+            .take(256)
+            .collect();
+        println!("first changed 16-byte atoms: {changed_atoms:?}");
+    }
+
     assert_eq!(
         (first, end),
         (0, EXPECTED_OUTPUT_BYTES),
         "unexpected int32 output write extent"
     );
 
-    let surface_stride = OUTPUT_PIXELS * FEATURE_ATOM_BYTES;
     let mut mismatches = Vec::new();
-    for (pixel, &input) in input_values.iter().enumerate() {
+    for pixel in 0..OUTPUT_PIXELS {
+        let input = input_values[pixel * IN_CHANNELS as usize];
         for (channel, &weight) in weight_values.iter().enumerate() {
-            let surface = channel / I32_CHANNELS_PER_ATOM;
-            let lane = channel % I32_CHANNELS_PER_ATOM;
-            let offset = surface * surface_stride
-                + pixel * FEATURE_ATOM_BYTES
-                + lane * mem::size_of::<i32>();
+            let block = channel / I32_CHANNELS_PER_OUTPUT_BLOCK;
+            let lane = channel % I32_CHANNELS_PER_OUTPUT_BLOCK;
+            let offset = (block * OUTPUT_PIXELS * I32_CHANNELS_PER_OUTPUT_BLOCK
+                + pixel * I32_CHANNELS_PER_OUTPUT_BLOCK
+                + lane)
+                * mem::size_of::<i32>();
             let value = i32::from_le_bytes(raw_output[offset..offset + 4].try_into().unwrap());
-            let expected = i32::from(input) * i32::from(weight);
-            if pixel < 2 {
+            let expected = i32::from(input) * i32::from(weight) * IN_CHANNELS as i32;
+            if pixel < 2 && channel < 8 {
                 println!(
                     "  pixel {pixel:02}, channel {channel}: output[{offset:04x}] = {value:4} (expected {expected:4})"
                 );
@@ -213,6 +243,6 @@ fn int8_convolution_can_write_exact_i32_accumulators() {
     }
     assert!(
         mismatches.is_empty(),
-        "int32 output did not preserve exact accumulators in NC1HWC2 surface order; first mismatches: {mismatches:?}"
+        "int32 output did not preserve exact accumulators in 32-channel block order; first mismatches: {mismatches:?}"
     );
 }

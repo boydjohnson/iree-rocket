@@ -63,7 +63,10 @@
 //! the recording call), matching `iree_hal_deferred_command_buffer_t`'s
 //! identical requirement.
 
-use std::os::fd::{AsRawFd, BorrowedFd, RawFd};
+use std::{
+    os::fd::{AsRawFd, BorrowedFd, RawFd},
+    sync::Arc,
+};
 
 use crate::{
     bindings::{
@@ -184,11 +187,21 @@ pub struct BiasPacking {
 /// compaction" investigation this fixes. `dispatch()` points the regcmd at
 /// a driver-private scratch buffer instead of the real output buffer;
 /// `queue_execute`, after its existing post-dispatch `prep_bo` wait
-/// confirms the hardware write is complete, interleaves the 16-byte channel
-/// surfaces into `output_buffer` (the real, dense IREE buffer, retained with
+/// confirms the hardware write is complete, interleaves the hardware channel
+/// blocks into `output_buffer` (the real, dense IREE buffer, retained with
 /// every other direct dispatch binding so it survives until `queue_execute`
-/// runs).
-#[derive(Clone, Copy)]
+/// runs). Ordinary output uses 16-byte blocks; accumulator output uses the
+/// CORE-native block of 32 i32 lanes (128 bytes).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct OutputTileCompaction {
+    pub scratch_offset: usize,
+    pub output_row: usize,
+    pub output_column: usize,
+    pub output_rows: usize,
+    pub output_columns: usize,
+}
+
+#[derive(Clone)]
 pub struct OutputCompaction {
     pub output_buffer: *mut iree_hal_buffer_t,
     pub output_offset: iree_device_size_t,
@@ -197,7 +210,10 @@ pub struct OutputCompaction {
     pub scratch_length: usize,
     pub source_pixel_count: usize,
     pub output_pixel_count: usize,
+    pub output_width: usize,
     pub bytes_per_pixel: usize,
+    pub source_block_bytes: usize,
+    pub source_tiles: Option<Arc<[OutputTileCompaction]>>,
 }
 
 /// One recorded command-buffer operation, in call order -- see module doc
@@ -648,7 +664,7 @@ pub unsafe fn apply_ops(
                     regcmd_tasks: regcmd_tasks.as_slice(),
                     in_bo_handles: in_bo_handles.as_slice(),
                     out_bo_handles: out_bo_handles.as_slice(),
-                    output_compaction: *output_compaction,
+                    output_compaction: output_compaction.clone(),
                 });
             }
         }
@@ -1260,9 +1276,10 @@ unsafe extern "C" fn dispatch(
             } else {
                 (addr(&refs[2]), handle(&refs[2]), None)
             };
-            // DPU's atomic-slot output write-back (16-byte-aligned slots
-            // regardless of dtype) doesn't match IREE's densely-packed ABI
-            // output buffer -- see `OutputCompaction`'s own doc comment.
+            // DPU output write-back (16-byte slots normally, 128-byte native
+            // accumulator blocks for bypassed int32) doesn't match IREE's
+            // densely-packed ABI output buffer -- see `OutputCompaction`'s
+            // own doc comment.
             // Bridge it with a driver-private scratch buffer: the regcmd
             // writes there instead of the real output buffer, and
             // `queue_execute` compacts the real values into the real
@@ -1284,16 +1301,66 @@ unsafe extern "C" fn dispatch(
             // inconsistency rather than an ordinary user error. The builder
             // only returns fresh local vectors, so a panic mid-build leaves
             // no shared state half-mutated.
-            let regcmd_tasks = match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                ConvPlan::new(*shape, kernels).programs_with_buffers(bufs)
+            let planned = match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                let plan = ConvPlan::new(*shape, kernels);
+                if shape.precision.writes_accumulators() {
+                    let source_block_bytes = shape.output_channel_block_bytes() as usize;
+                    let padded_bytes_per_pixel = shape.padded_out_channels() as usize
+                        * shape.precision.output_element_bytes() as usize;
+                    let blocks_per_pixel = padded_bytes_per_pixel.div_ceil(source_block_bytes);
+                    let mut scratch_offset = 0usize;
+                    let mut tasks = Vec::with_capacity(plan.tiles().len());
+                    let mut output_tiles = Vec::with_capacity(plan.tiles().len());
+                    for (mut program, tile) in plan.programs().into_iter().zip(plan.tiles()) {
+                        let tile_pixels =
+                            tile.rows.out_rows as usize * tile.columns.out_cols as usize;
+                        let tile_bytes = tile_pixels
+                            .checked_mul(blocks_per_pixel)
+                            .and_then(|value| value.checked_mul(source_block_bytes))
+                            .expect("accumulator tile scratch size overflow");
+                        let local_output = scratch
+                            .dma_address
+                            .checked_add(
+                                u32::try_from(scratch_offset)
+                                    .expect("accumulator tile scratch offset exceeds u32"),
+                            )
+                            .expect("accumulator tile DMA address overflow");
+                        iree_rocket_hal::rocket::conv::relocate_with_exact_output(
+                            &mut program,
+                            Buffers {
+                                output: local_output,
+                                ..bufs
+                            },
+                        );
+                        tasks.push(program);
+                        output_tiles.push(OutputTileCompaction {
+                            scratch_offset,
+                            output_row: tile.rows.out_first as usize,
+                            output_column: tile.columns.out_first as usize,
+                            output_rows: tile.rows.out_rows as usize,
+                            output_columns: tile.columns.out_cols as usize,
+                        });
+                        scratch_offset = scratch_offset
+                            .checked_add(tile_bytes)
+                            .expect("accumulator scratch partition overflow");
+                    }
+                    assert_eq!(scratch_offset, scratch_bytes);
+                    (
+                        tasks,
+                        Some(Arc::<[OutputTileCompaction]>::from(output_tiles)),
+                    )
+                } else {
+                    (plan.programs_with_buffers(bufs), None)
+                }
             })) {
-                Ok(tasks) => tasks,
+                Ok(planned) => planned,
                 Err(_) => {
                     return status::from_code(
                         crate::bindings::iree_status_code_e_IREE_STATUS_INTERNAL,
                     );
                 }
             };
+            let (regcmd_tasks, source_tiles) = planned;
             let output_pixel_count =
                 shape.output_width(kernels) as usize * shape.output_height(kernels) as usize;
             let output_compaction = Some(OutputCompaction {
@@ -1304,8 +1371,11 @@ unsafe extern "C" fn dispatch(
                 scratch_length: scratch_bytes,
                 source_pixel_count: output_pixel_count,
                 output_pixel_count,
+                output_width: shape.output_width(kernels) as usize,
                 bytes_per_pixel: shape.out_channels as usize
                     * shape.precision.output_element_bytes() as usize,
+                source_block_bytes: shape.output_channel_block_bytes() as usize,
+                source_tiles,
             });
             let output_handle = scratch.handle;
             scratch_buffers.push(scratch);
@@ -1568,7 +1638,10 @@ unsafe extern "C" fn dispatch(
                 // same real `m`.
                 source_pixel_count: m,
                 output_pixel_count: m,
+                output_width: m,
                 bytes_per_pixel: output_bytes_per_pixel,
+                source_block_bytes: shape.as_conv_shape().output_channel_block_bytes() as usize,
+                source_tiles: None,
             });
             let retained_bindings = unsafe { retain_direct_bindings(refs) };
             let mut scratch_buffers = vec![input_scratch, weight_scratch, output_scratch];
