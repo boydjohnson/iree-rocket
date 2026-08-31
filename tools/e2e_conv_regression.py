@@ -3,7 +3,8 @@
 
 This runs two independent checks:
 
-1. iree-rocket-hal's five-case raw ConvPlan/NPU dense-coefficient oracle.
+1. iree-rocket-hal's raw ConvPlan/NPU dense-coefficient and exact int32
+   accumulator oracle matrices.
 2. Dense and depthwise convolutions compiled twice from MLIR:
    once for the host CPU and once for Rocket. The Rocket VMFB is executed
    through iree-run-module on the board and compared with the CPU VMFB.
@@ -29,7 +30,10 @@ import numpy as np
 
 
 ROOT = Path(__file__).resolve().parents[1]
-RAW_TEST = "dense_coefficient_vgg_blocks_match_oracle"
+RAW_TESTS = (
+    "dense_coefficient_vgg_blocks_match_oracle",
+    "int8_accumulator_regression_matrix_matches_oracle",
+)
 REMOTE_PREFIX = "/tmp/iree-rocket-conv-regression."
 
 CONV_MLIR = """\
@@ -200,10 +204,21 @@ def run_raw_gate(host: str, remote_dir: str, linker: str) -> None:
     executable = build_raw_test(linker)
     remote_executable = f"{remote_dir}/conv2d_oracle_hw"
     run(["scp", str(executable), f"{host}:{remote_executable}"])
-    remote_command = (
-        f"chmod +x {shlex.quote(remote_executable)} && "
-        f"{shlex.quote(remote_executable)} --exact {RAW_TEST} "
-        "--ignored --nocapture --test-threads=1"
+    test_commands = [
+        command_text(
+            [
+                remote_executable,
+                "--exact",
+                test,
+                "--ignored",
+                "--nocapture",
+                "--test-threads=1",
+            ]
+        )
+        for test in RAW_TESTS
+    ]
+    remote_command = " && ".join(
+        [f"chmod +x {shlex.quote(remote_executable)}", *test_commands]
     )
     run(["ssh", host, remote_command])
 
@@ -623,7 +638,7 @@ def main() -> None:
 
     try:
         if not args.skip_raw:
-            print("\n== raw dense-coefficient VGG oracle ==")
+            print("\n== raw ConvPlan/NPU oracle matrices ==")
             run_raw_gate(args.board, remote_dir, args.cross_linker)
         if not args.skip_compiled:
             print("\n== compiled VMFB CPU differential ==")
@@ -652,7 +667,7 @@ def main() -> None:
         completed.append("raw oracle")
     if not args.skip_compiled:
         completed.append("compiled VMFB differential")
-    print(f"\nPASS: dense VGG {' and '.join(completed)} regression gate(s)")
+    print(f"\nPASS: ConvPlan/NPU {' and '.join(completed)} regression gate(s)")
 
 
 if __name__ == "__main__":

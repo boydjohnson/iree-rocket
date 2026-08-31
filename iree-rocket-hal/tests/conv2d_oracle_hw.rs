@@ -40,6 +40,7 @@ use iree_rocket_hal::rocket::{
 const DEVICE_PATH: &str = "/dev/accel/accel0";
 const PAGE_BYTES: usize = 4096;
 const PER_CASE_TIMEOUT_NS: u64 = 5_000_000_000;
+const OUTPUT_SENTINEL: u8 = 0xa5;
 
 fn page_aligned_size(size: usize) -> usize {
     size.max(1).div_ceil(PAGE_BYTES) * PAGE_BYTES
@@ -131,6 +132,9 @@ fn compare_output(fixture: &Conv2dFixture, plan: &ConvPlan, output: &[u8]) -> Mi
                         f16_to_f32(u16::from_le_bytes([output[offset], output[offset + 1]]))
                     }
                     OraclePrecision::Int8 => f32::from(output[offset] as i8),
+                    OraclePrecision::Int8Accumulator => {
+                        i32::from_le_bytes(output[offset..offset + 4].try_into().unwrap()) as f32
+                    }
                 };
                 let want = expected_output(case, channel, y, x) as f32;
                 let difference = (got - want).abs();
@@ -167,7 +171,11 @@ fn execute_case_output(
         let weights = OwnedBuffer::from_bytes(fd, &fixture.weights, file);
         let bias = OwnedBuffer::from_bytes(fd, &fixture.bias, file);
         let output = OwnedBuffer::new(fd, output_len, file);
-        ptr::write_bytes(output.buffer.host_ptr, 0, output.buffer.size);
+        // A zero fill can turn an unwritten output lane into a plausible
+        // convolution result. Poison the whole allocation so missing tail
+        // pixels/blocks fail loudly and remain distinguishable from a real
+        // all-zero accumulator.
+        ptr::write_bytes(output.buffer.host_ptr, OUTPUT_SENTINEL, output.buffer.size);
 
         let programs = plan.programs_with_buffers(Buffers {
             input: input.buffer.dma_address,
@@ -522,6 +530,128 @@ fn dense_coefficient_vgg_block_cases() -> Vec<Conv2dCase> {
     cases
 }
 
+/// Hardware-confirmed exact i32-accumulator regression cases through the
+/// shared production oracle. Together these cover a partial second output
+/// block, a partial third block at stride 2, the K3 Cin=32 ceiling, and the
+/// Cout=512 ceiling for both kernels with dense signed data.
+fn int8_accumulator_regression_cases() -> Vec<Conv2dCase> {
+    vec![
+        Conv2dCase {
+            width: 9,
+            height: 7,
+            cin: 5,
+            cout: 63,
+            kernel: [1, 1],
+            stride: 1,
+            padding: [0, 0],
+            precision: OraclePrecision::Int8Accumulator,
+            pattern: OraclePattern::Dense { phase: 0 },
+        },
+        Conv2dCase {
+            width: 34,
+            height: 34,
+            cin: 32,
+            cout: 64,
+            kernel: [3, 3],
+            stride: 1,
+            padding: [0, 0],
+            precision: OraclePrecision::Int8Accumulator,
+            pattern: OraclePattern::Dense { phase: 2 },
+        },
+        Conv2dCase {
+            width: 32,
+            height: 32,
+            cin: 16,
+            cout: 512,
+            kernel: [1, 1],
+            stride: 1,
+            padding: [0, 0],
+            precision: OraclePrecision::Int8Accumulator,
+            pattern: OraclePattern::Dense { phase: 3 },
+        },
+        Conv2dCase {
+            width: 34,
+            height: 34,
+            cin: 16,
+            cout: 512,
+            kernel: [3, 3],
+            stride: 1,
+            padding: [0, 0],
+            precision: OraclePrecision::Int8Accumulator,
+            pattern: OraclePattern::Dense { phase: 4 },
+        },
+        Conv2dCase {
+            width: 33,
+            height: 33,
+            cin: 16,
+            cout: 65,
+            kernel: [3, 3],
+            stride: 2,
+            padding: [0, 0],
+            precision: OraclePrecision::Int8Accumulator,
+            pattern: OraclePattern::Dense { phase: 5 },
+        },
+    ]
+}
+
+/// Shapes the first expanded oracle run (RK3588, 2026-08-31) proved are not
+/// yet safe. Kept separate from the green regression gate so the failures
+/// remain reproducible without making every normal board gate fail:
+///
+/// * odd 9x7 output extents leave the final logical accumulator(s) unwritten;
+/// * several small-Cin shapes corrupt most values at exact 32-lane block
+///   boundaries;
+/// * K1 Cin=384 is not correct with dense signed coefficients despite being
+///   the earlier sparse/random sweep's largest measured-good value;
+/// * the three-tile Cin=3 selector case corrupts values and leaves later tile
+///   regions unwritten.
+fn int8_accumulator_known_limitation_cases() -> Vec<Conv2dCase> {
+    let mut cases = Vec::new();
+    for (cin, cout, kernel) in [
+        (3u32, 1u32, 1usize),
+        (3, 31, 3),
+        (3, 32, 3),
+        (3, 33, 3),
+        (5, 64, 1),
+        (5, 65, 1),
+    ] {
+        cases.push(Conv2dCase {
+            width: 9,
+            height: 7,
+            cin,
+            cout,
+            kernel: [kernel, kernel],
+            stride: 1,
+            padding: [kernel / 2, kernel / 2],
+            precision: OraclePrecision::Int8Accumulator,
+            pattern: OraclePattern::Dense { phase: 0 },
+        });
+    }
+    cases.push(Conv2dCase {
+        width: 32,
+        height: 32,
+        cin: 384,
+        cout: 64,
+        kernel: [1, 1],
+        stride: 1,
+        padding: [0, 0],
+        precision: OraclePrecision::Int8Accumulator,
+        pattern: OraclePattern::Dense { phase: 1 },
+    });
+    cases.push(Conv2dCase {
+        width: 226,
+        height: 226,
+        cin: 3,
+        cout: 64,
+        kernel: [3, 3],
+        stride: 1,
+        padding: [0, 0],
+        precision: OraclePrecision::Int8Accumulator,
+        pattern: OraclePattern::Selectors { phase: 6 },
+    });
+    cases
+}
+
 fn int8_neutral80_one_hot_four_way_cases() -> Vec<Conv2dCase> {
     let mut cases = Vec::with_capacity(4);
     for signed_input in [false, true] {
@@ -690,6 +820,24 @@ fn dense_coefficient_vgg_block_matrix_is_planable_and_gap_free() {
     assert_planable_and_gap_free(cases);
 }
 
+#[test]
+fn int8_accumulator_matrices_are_planable_and_gap_free() {
+    let regression = int8_accumulator_regression_cases();
+    assert_eq!(regression.len(), 5);
+    assert_planable_and_gap_free(regression);
+
+    let limitations = int8_accumulator_known_limitation_cases();
+    assert_eq!(limitations.len(), 8);
+    let tiled = *limitations.last().unwrap();
+    let plan = ConvPlan::new(tiled.shape(), tiled.kernel);
+    assert_eq!(
+        plan.tiles().len(),
+        3,
+        "large selector case must exercise tiling"
+    );
+    assert_planable_and_gap_free(limitations);
+}
+
 fn run_hardware_case_matrix(title: &str, cases: Vec<Conv2dCase>) {
     let total_cases = cases.len();
     let file = OpenOptions::new()
@@ -782,6 +930,22 @@ fn dense_coefficient_vgg_blocks_match_oracle() {
     let cases = dense_coefficient_vgg_block_cases();
     assert_eq!(cases.len(), 5);
     run_hardware_case_matrix("dense-coefficient VGG block probe", cases);
+}
+
+#[test]
+#[ignore = "needs /dev/accel/accel0 -- validates exact i32 accumulator values, partial blocks, channel ceilings, and stride"]
+fn int8_accumulator_regression_matrix_matches_oracle() {
+    let cases = int8_accumulator_regression_cases();
+    assert_eq!(cases.len(), 5);
+    run_hardware_case_matrix("int8 accumulator regression matrix", cases);
+}
+
+#[test]
+#[ignore = "known RK3588 failures -- manually characterizes accumulator tails, block boundaries, Cin=384, and tiling"]
+fn int8_accumulator_known_limitations_probe() {
+    let cases = int8_accumulator_known_limitation_cases();
+    assert_eq!(cases.len(), 8);
+    run_hardware_case_matrix("int8 accumulator known-limitations probe", cases);
 }
 
 #[test]
