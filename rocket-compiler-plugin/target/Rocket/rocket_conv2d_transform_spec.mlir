@@ -2988,14 +2988,37 @@ module attributes {transform.with_named_sequence} {
   // i8 operands with an i32 accumulator, its zero point already folded into
   // a separate CPU-side correction.
   //
-  // One honest gap, deliberately not papered over: the umax = 512 channel
-  // bounds are inherited from the fp16 matchers and have NOT been
-  // characterized separately for int8. int8 halves the per-element CBUF
-  // demand, so ConvPlan picks its bank split at different channel counts
-  // than the fp16 sweeps covered, and the failure mode those sweeps found
-  // (an unvalidated split completing silently with all-zero output) would
-  // look the same here. Treat these bounds as untested-for-int8 until an
-  // int8 sweep of conv_cbuf_split_sweep_hw.rs says otherwise.
+  // The channel bounds below are no longer the fp16 matchers' umax = 512.
+  // That inherited bound was wrong for int8, and the failure was the
+  // predicted one: a silent, near-all-zero result. Measured on RK3588
+  // (2026-08-31) through the real compiled path, at 34x34 (3x3) / 32x32
+  // (1x1), Cout = 64, sweeping Cin:
+  //
+  //   dense 1x1  : exact to Cin 384; wrong from Cin 400 up.
+  //   dense 3x3  : exact to Cin  32; wrong from Cin  33 up.
+  //
+  // So `match_dynamic_conv2d_int8` caps Cin at 384 and
+  // `match_dynamic_conv2d_3x3_int8` at 32. Anything above falls back to the
+  // CPU, which is slower but correct. Raising either needs a fix in
+  // ConvPlan's int8 modelling, not a bound change -- the cause is still
+  // open. Ruled out so far, each on hardware: the coefficient stream order
+  // (the shipped order is the only one of four candidates that produces
+  // correct values), the CBUF bank split (all eleven splits behave
+  // identically), `feature_grains` (swept 1..40), `data_entries` (matches
+  // the vendor capture for this exact shape), and the packed feature width.
+  //
+  // The Cout bound is still the inherited 512: every sweep above held
+  // Cout = 64, so Cout is uncharacterized for int8 rather than validated.
+  //
+  // The depthwise int8 matchers keep umax = 512 and are correct across it.
+  // They briefly were not: Cin whose *atom* count (ceil(Cin/16)) was one
+  // short of a multiple of four -- 33..48, 97..112, 225..240 and every 64
+  // thereafter -- lost its last output rows, because `data_bank_demand`
+  // billed the CBUF with `weight_atoms` instead of `cbuf_atoms`. Fixed in
+  // `conv.rs`; verified at Cin 33, 44..47, 112, 176, 240, 304, 368, 432 and
+  // 496. The dense caps above are a *different* bug and that fix does not
+  // move them, which is consistent with their atom counts already being
+  // whole multiples of four.
   //===--------------------------------------------------------------------===//
 
   transform.named_sequence @match_dynamic_conv2d_int8(%root: !transform.any_op {transform.readonly}) -> !transform.any_op {
@@ -3015,7 +3038,9 @@ module attributes {transform.with_named_sequence} {
 
     %input_value = transform.get_operand %root[0] : (!transform.any_op) -> !transform.any_value
     %filter_value = transform.get_operand %root[1] : (!transform.any_op) -> !transform.any_value
-    transform.iree.match.dim_bounds %input_value[3], umin = 1, umax = 512 : !transform.any_value
+    // Cin 400 and above returns near-all-zero output on hardware; 384 is the
+    // largest measured-good value. See this section's doc comment.
+    transform.iree.match.dim_bounds %input_value[3], umin = 1, umax = 384 : !transform.any_value
     transform.iree.match.dim_bounds %filter_value[3], umin = 1, umax = 512 : !transform.any_value
     transform.yield %root : !transform.any_op
   }
@@ -3037,7 +3062,10 @@ module attributes {transform.with_named_sequence} {
 
     %input_value = transform.get_operand %root[0] : (!transform.any_op) -> !transform.any_value
     %filter_value = transform.get_operand %root[1] : (!transform.any_op) -> !transform.any_value
-    transform.iree.match.dim_bounds %input_value[3], umin = 1, umax = 512 : !transform.any_value
+    // Cin 33 and above returns near-all-zero output on hardware -- the 3x3
+    // int8 dense path is correct only within a single CBUF atom pair.
+    // See this section's doc comment.
+    transform.iree.match.dim_bounds %input_value[3], umin = 1, umax = 32 : !transform.any_value
     transform.iree.match.dim_bounds %filter_value[3], umin = 1, umax = 512 : !transform.any_value
     transform.yield %root : !transform.any_op
   }

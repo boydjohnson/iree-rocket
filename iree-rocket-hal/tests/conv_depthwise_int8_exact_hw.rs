@@ -68,6 +68,27 @@ fn int8_depthwise_exact_across_two_output_atoms() {
     check_int8_depthwise(128);
 }
 
+/// Channel counts whose *atom* count (`ceil(Cin / 16)`) is one short of a
+/// multiple of four, where `Shape::cbuf_atoms` rounds up and everything else
+/// at int8 stays exact.
+///
+/// `data_bank_demand` used to bill the CBUF with `weight_atoms` here, which
+/// is the un-rounded count at int8, and under-granted a data bank. The tile
+/// then read past the resident window and lost its last input rows -- 4 rows
+/// at Cin 48 and 112, 1 row at Cin 240, exactly the shortfall the byte
+/// arithmetic predicts. Nothing else in the suite covers this: fp16 cannot
+/// reach it (its `weight_channels` is already quad-rounded, so the two atom
+/// counts are equal) and every other int8 test happens to sit on a whole
+/// multiple of four atoms.
+#[test]
+#[ignore = "needs /dev/accel/accel0 -- cross-compile for aarch64 and run on the RK3588 board"]
+fn int8_depthwise_exact_where_the_cbuf_atom_charge_rounds_up() {
+    for channels in [48, 112, 240] {
+        assert_eq!(channels / 16 % 4, 3, "Cin {channels} is not a rounding case");
+        check_int8_depthwise(channels);
+    }
+}
+
 fn check_int8_depthwise(channels: usize) {
     let precision = Precision::Int8Accumulator(Quantization {
         input_zero_point: 0,

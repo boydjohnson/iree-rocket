@@ -1268,10 +1268,22 @@ impl Shape {
             // Surfaces charge per atom, at twice the pixels per step. Fits
             // every measured point: at 32x32 fp16 this is `ceil(atoms / 2)`,
             // giving 1,1,2,2,3,3,4,4,5,5 across atom counts 1 through 10.
-            // Already precision-neutral, because an int8 atom holds twice
-            // the channels and so a pixel needs half as many.
+            //
+            // The atom count is `cbuf_atoms`, the count the CBUF actually
+            // bills, not `weight_atoms`. The two agree at fp16 -- there
+            // `weight_channels` is already quad-rounded, so `weight_atoms`
+            // *is* `cbuf_atoms`, which is why using either reproduced every
+            // fp16 capture -- but they part company at int8, whose
+            // `weight_channels` is exact. Billing the exact count there
+            // under-grants a data bank at `Cin` 33..48, 97..112, 225..240
+            // and every 64 thereafter, and the tile then reads past the
+            // resident window: the last input rows are silently dropped and
+            // the corresponding output rows come back wrong. Measured on
+            // RK3588 at Cin 48, 112 and 240, where the byte shortfall
+            // predicts 3.88, 3.88 and 0.12 rows and the hardware loses
+            // exactly 4, 4 and 1.
             FeatureLayout::Surfaces => {
-                (self.width * self.height * self.weight_atoms()).div_ceil(2 * PIXELS_PER_BANK_STEP)
+                (self.width * self.height * self.cbuf_atoms()).div_ceil(2 * PIXELS_PER_BANK_STEP)
             }
         }
         .max(1)
@@ -1421,9 +1433,12 @@ impl Shape {
             FeatureLayout::Dense => {
                 data_banks * (CBUF_BANK_BYTES / 4) / (charged_width * self.dense_cbuf_pixel_bytes())
             }
+            // `cbuf_atoms`, not `weight_atoms`, for the reason spelled out
+            // in `data_bank_demand`: the two differ only at int8, and only
+            // where the exact count is one short of a multiple of four.
             FeatureLayout::Surfaces => {
                 data_banks * CBUF_BANK_BYTES
-                    / (input_width * self.weight_atoms() * FEATURE_ATOM_BYTES)
+                    / (input_width * self.cbuf_atoms() * FEATURE_ATOM_BYTES)
             }
         };
         capacity.min(self.max_data_entries() / charged_width).max(1)
