@@ -2351,3 +2351,191 @@ fn int8_accumulator_multitile_parity_probe() {
         );
     }
 }
+
+/// Does padding `Cout` up to an even block count rescue a failing shape,
+/// with the padding channels carrying zero coefficients?
+///
+/// This is the proposed fix for the output-parity rule. The parity is
+/// `tile_pixels * blocks`, and `blocks = ceil(Cout/32)` is *static*, so
+/// rounding `Cout` up to a multiple of 64 makes the product even however the
+/// planner tiles -- no planner constraint, no matcher rejection, and nothing
+/// added to the per-dispatch activation path, which is debt slated for
+/// removal rather than something to build on.
+///
+/// Every case has an odd output pixel count and fails at its true `Cout`.
+/// The padded form runs the same shape at the next multiple of 64 with the
+/// surplus output channels zeroed, which is what padded weights produce.
+/// Coefficients pack output-block-major in 32-channel blocks
+/// (`WEIGHT_ATOMIC_BYTES`) with every block the same size, so zeroing from
+/// `true_cout / 32` blocks onward zeroes precisely the surplus channels --
+/// and that geometry is kernel- and stride-independent, which is why 3x3 and
+/// stride 2 are here rather than assumed.
+///
+/// Only coefficients need zeroing: `Int8Accumulator` bypasses BS (asserted
+/// by `int8_accumulator_output_uses_the_hardware_validated_bypasses`), so no
+/// bias or per-channel multiplier reaches the padding channels.
+///
+/// Real channels are checked against the oracle for the *padded* case -- a
+/// convolution's output channels are independent, so zeroing the surplus
+/// must not move them -- and the surplus must come back exactly zero.
+///
+/// **Result, measured 2026-08-31, four isolated repeats per case.** Eight of
+/// the nine cases give `real_bad=0 pad_nonzero=0` every time: 1x1 and 3x3,
+/// stride 1 and 2, Cout 32->64 and 96->128. The fix generalizes.
+///
+/// The exception is index 4, 3x3 extent with a 3x3 kernel, where the
+/// *unzeroed* control also fails 576 every time. The padded configuration is
+/// broken there on its own, independent of any zeroing, so the case cannot
+/// evaluate the fix -- and a compiler applying this pad would emit a broken
+/// configuration for that shape. Its cause is not known; nothing else here
+/// is that small relative to its kernel.
+///
+/// Note the trap this probe fell into first. A run over the whole list
+/// reported cases 5-8 as failures, and so did a first pass with one case per
+/// process, because index 4 fails for real and its failures contaminate
+/// *subsequent processes*. Only re-running 5-8 on a rested device showed
+/// them clean. Any sweep containing a genuinely failing case invalidates
+/// everything measured after it, process isolation included.
+#[test]
+#[ignore = "needs /dev/accel/accel0 -- validates padding Cout to an even block count"]
+fn int8_accumulator_cout_padding_probe() {
+    let file = OpenOptions::new()
+        .read(true)
+        .write(true)
+        .open(DEVICE_PATH)
+        .expect("failed to open RK3588 NPU device");
+
+    println!("\n=== padding Cout to an even block count ===");
+    if !accumulator_canary_passes(&file) {
+        println!("  CANARY FAILED -- the NPU is sick, reboot the board");
+        return;
+    }
+
+    let make = |width: u32, height: u32, kernel: usize, stride: u32, cout: u32| Conv2dCase {
+        width,
+        height,
+        cin: 8,
+        cout,
+        kernel: [kernel, kernel],
+        stride,
+        padding: [kernel / 2, kernel / 2],
+        precision: OraclePrecision::Int8Accumulator,
+        pattern: OraclePattern::Dense { phase: 0 },
+    };
+
+    // Three device jobs per case, two of them deliberately failing, so a
+    // whole-list run walks the device into the degraded state and the later
+    // rows measure that rather than the shape. Run one case per process:
+    //   for i in $(seq 0 8); do ROCKET_PROBE_ONLY=$i <bin> ... ; done
+    let only = probe_only_index();
+
+    // (width, height, kernel, stride, true_cout, padded_cout)
+    for (index, (width, height, kernel, stride, true_cout, padded_cout)) in [
+        (3u32, 3u32, 1usize, 1u32, 32u32, 64u32),
+        (5, 5, 1, 1, 32, 64),
+        (9, 7, 1, 1, 32, 64),
+        (5, 5, 1, 1, 96, 128),
+        (3, 3, 3, 1, 32, 64),
+        (5, 5, 3, 1, 32, 64),
+        (9, 7, 3, 1, 32, 64),
+        (5, 5, 3, 1, 96, 128),
+        (9, 9, 1, 2, 32, 64),
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        if only.is_some_and(|only| only != index) {
+            continue;
+        }
+        let case = make(width, height, kernel, stride, padded_cout);
+        let shape = case.shape();
+        let kernels = case.kernel;
+        let pixels = shape.output_width(kernels) as usize * shape.output_height(kernels) as usize;
+
+        // `ROCKET_PADDING_MODE` selects which single variant this process
+        // measures, so each one lands on a device the canary just proved
+        // clean. Running them together silently corrupts whichever comes
+        // after the first failure:
+        //   zeroed   (default) the proposed fix -- Cout padded, surplus
+        //                      channels zeroed
+        //   unzeroed           padded Cout, coefficients untouched: should
+        //                      pass, so a `zeroed` failure is the zeroing
+        //   unpadded           the true Cout: should fail, proving the case
+        //                      is a real one
+        let mode = std::env::var("ROCKET_PADDING_MODE").unwrap_or_else(|_| "zeroed".into());
+        if mode == "unpadded" || mode == "unzeroed" {
+            let probe = if mode == "unpadded" {
+                make(width, height, kernel, stride, true_cout)
+            } else {
+                case
+            };
+            let verdict = match build_fixture(probe).and_then(|fixture| {
+                let execution = execute_case_output(&file, &fixture)?;
+                Ok(compare_output(&fixture, &execution.plan, &execution.output).mismatches)
+            }) {
+                Ok(0) => "ok".to_string(),
+                Ok(mismatches) => format!("FAILS {mismatches}"),
+                Err(error) => format!("ERROR {error}"),
+            };
+            println!(
+                "  [{index}] {width}x{height} k{kernel}x{kernel} s{stride} {pixels}px \
+                 Cout {true_cout}->{padded_cout}: {mode} {verdict}"
+            );
+            continue;
+        }
+
+        let mut fixture = match build_fixture(case) {
+            Ok(fixture) => fixture,
+            Err(error) => {
+                println!("  {width}x{height} k{kernel} s{stride}: build ERROR {error}");
+                continue;
+            }
+        };
+        let blocks = (padded_cout / 32) as usize;
+        assert_eq!(
+            fixture.weights.len() % blocks,
+            0,
+            "packed coefficients should divide evenly into {blocks} output blocks"
+        );
+        let block_bytes = fixture.weights.len() / blocks;
+        fixture.weights[(true_cout as usize / 32) * block_bytes..].fill(0);
+
+        let execution = match execute_case_output(&file, &fixture) {
+            Ok(execution) => execution,
+            Err(error) => {
+                println!("  {width}x{height} k{kernel} s{stride}: padded ERROR {error}");
+                continue;
+            }
+        };
+
+        let (mut real_bad, mut pad_nonzero) = (0usize, 0usize);
+        let mut sample = None;
+        for y in 0..shape.output_height(kernels) as usize {
+            for x in 0..shape.output_width(kernels) as usize {
+                for channel in 0..padded_cout as usize {
+                    let offset = output_offset(shape, kernels, channel, y, x);
+                    let got = i32::from_le_bytes(
+                        execution.output[offset..offset + 4].try_into().unwrap(),
+                    );
+                    if channel < true_cout as usize {
+                        let want = expected_output(case, channel, y, x);
+                        if got != want {
+                            real_bad += 1;
+                            sample.get_or_insert(format!(
+                                "[y={y},x={x},c={channel}] want {want} got {got}"
+                            ));
+                        }
+                    } else if got != 0 {
+                        pad_nonzero += 1;
+                    }
+                }
+            }
+        }
+
+        println!(
+            "  [{index}] {width}x{height} k{kernel}x{kernel} s{stride} {pixels}px \
+             Cout {true_cout}->{padded_cout}: padded real_bad={real_bad} pad_nonzero={pad_nonzero}{}",
+            sample.map(|s| format!("  first {s}")).unwrap_or_default(),
+        );
+    }
+}
