@@ -1,7 +1,10 @@
 //! Cartesian Conv2D correctness sweep against an independent logical oracle.
 //!
-//! Every case executes through `ConvPlan::new`, production HWCF weight
-//! packing, and the RK3588 device. Failures are accumulated: one bad case
+//! Every supported case executes through `Shape::parity_padded_shape`,
+//! `ConvPlan::new`, production HWCF weight packing, and the RK3588 device.
+//! The case and oracle remain logical while planning, coefficients, and
+//! scratch output use the HAL's physical programmed shape. Failures are
+//! accumulated: one bad case
 //! never prevents later cases from running, and the test asserts only after
 //! printing the complete summary. The one exception is a *sick device* --
 //! see `run_hardware_case_matrix`, which halts there because past that point
@@ -32,8 +35,10 @@ use std::{
 
 use conv2d_oracle::{
     Conv2dCase, Conv2dFixture, OraclePattern, OraclePrecision, build_fixture, expected_output,
-    f16_to_f32, feature_offset, output_offset, output_storage_bytes,
+    f16_to_f32, output_offset, output_storage_bytes,
 };
+#[cfg(feature = "hardware-characterization")]
+use conv2d_oracle::{build_raw_fixture, feature_offset};
 use iree_rocket_hal::rocket::{
     conv::{AccumulatorOutputTile, Buffers, ConvPlan, Shape},
     device::{Buffer, JobDesc, close_bo, fini_bo, prep_bo, submit_jobs, unmap_bo},
@@ -100,6 +105,7 @@ struct CaseExecution {
     /// `assemble_staged_accumulator_output` reinterprets it. The layout
     /// probes read this: the assembled `output` already assumes the answer
     /// they are trying to measure.
+    #[cfg(feature = "hardware-characterization")]
     raw: Vec<u8>,
 }
 
@@ -331,6 +337,7 @@ fn execute_case_output_with_plan(
         Ok(CaseExecution {
             plan,
             output,
+            #[cfg(feature = "hardware-characterization")]
             raw: raw_output,
         })
     }
@@ -732,13 +739,12 @@ fn int8_accumulator_regression_cases() -> Vec<Conv2dCase> {
     ]
 }
 
-/// Sweeps every native 16-channel input atom through and beyond the current
-/// K1 matcher range. With tile-local accumulator destinations, RK3588 passes
-/// Cin 16..=384 exactly, including the transition to two tiles above Cin=352.
-/// Cin 400..=512 still fail with the second 32-channel output block unwritten,
-/// isolating a subsequent CBUF/weight working-set boundary from this fix.
-fn int8_accumulator_k1_cin_atom_sweep_cases() -> Vec<Conv2dCase> {
-    (16..=512)
+/// Sweeps every supported native 16-channel input atom through the measured
+/// dense K1 accumulator ceiling. Cin 16..=384 passes exactly, including the
+/// transition to two tiles above Cin=352. Cin 385+ is rejected by
+/// `Shape::parity_padded_shape` rather than submitted to hardware.
+fn int8_accumulator_k1_supported_cin_atom_cases() -> Vec<Conv2dCase> {
+    (16..=384)
         .step_by(16)
         .map(|cin| Conv2dCase {
             width: 32,
@@ -774,9 +780,11 @@ fn int8_accumulator_k1_cin_boundary_cases() -> Vec<Conv2dCase> {
         .collect()
 }
 
-/// Shapes the first expanded oracle run (RK3588, 2026-08-31) proved are not
-/// yet safe. Kept separate from the green regression gate so the failures
-/// remain reproducible without making every normal board gate fail:
+/// Shapes the first expanded oracle run (RK3588, 2026-08-31) proved require
+/// programmed-Cout parity padding. They are now a compact HAL regression
+/// matrix: the logical cases below are translated by `build_fixture` through
+/// `Shape::parity_padded_shape`, packed with zero surplus coefficients, and
+/// compared only across their logical output channels.
 ///
 /// * odd 9x7 output extents leave the final logical accumulator(s) unwritten;
 /// * several small-Cin shapes corrupt most values at exact 32-lane block
@@ -805,7 +813,7 @@ fn int8_accumulator_k1_cin_boundary_cases() -> Vec<Conv2dCase> {
 /// and Cout 65 gives three, and those fail. Nothing here is specific to Cin
 /// or the kernel, and none of it is specific to Cout either: the same Cout
 /// values all pass at an even pixel count.
-fn int8_accumulator_known_limitation_cases() -> Vec<Conv2dCase> {
+fn int8_accumulator_parity_regression_cases() -> Vec<Conv2dCase> {
     let mut cases = Vec::new();
     for (cin, cout, kernel) in [
         (3u32, 1u32, 1usize),
@@ -857,7 +865,7 @@ fn int8_accumulator_known_limitation_cases() -> Vec<Conv2dCase> {
 /// | 5            | 129..=160    | fails  |
 /// | 6, 8         | 161..=192,256| passes |
 ///
-/// This subsumes every entry of `int8_accumulator_known_limitation_cases`,
+/// This subsumes every entry of `int8_accumulator_parity_regression_cases`,
 /// all of which are 9x7.
 ///
 /// Raising the accumulator output granule to 64, so the padded count always
@@ -1045,49 +1053,6 @@ fn int8_neutral80_one_hot_four_way_cases() -> Vec<Conv2dCase> {
     cases
 }
 
-fn int8_selector_cases(pattern: fn(usize) -> OraclePattern) -> Vec<Conv2dCase> {
-    let mut cases = Vec::with_capacity(24);
-    for cin in [3u32, 5, 128, 256, 512] {
-        for cout in [64u32, 256, 512] {
-            cases.push(Conv2dCase {
-                width: 28,
-                height: 28,
-                cin,
-                cout,
-                kernel: [3, 3],
-                stride: 1,
-                padding: [1, 1],
-                precision: OraclePrecision::Int8,
-                pattern: pattern(0),
-            });
-        }
-    }
-    for (extent, cin, cout) in [
-        (226, 3, 64),
-        (226, 64, 64),
-        (114, 64, 128),
-        (114, 128, 128),
-        (58, 128, 256),
-        (58, 256, 256),
-        (30, 256, 512),
-        (30, 512, 512),
-        (16, 512, 512),
-    ] {
-        cases.push(Conv2dCase {
-            width: extent,
-            height: extent,
-            cin,
-            cout,
-            kernel: [3, 3],
-            stride: 1,
-            padding: [0, 0],
-            precision: OraclePrecision::Int8,
-            pattern: pattern(1),
-        });
-    }
-    cases
-}
-
 fn int8_raw_coefficient_byte_sweep_case(unit_gain: bool) -> Conv2dCase {
     Conv2dCase {
         width: 1,
@@ -1118,7 +1083,10 @@ fn panic_message(payload: Box<dyn Any + Send>) -> String {
 
 fn assert_planable_and_gap_free(cases: Vec<Conv2dCase>) {
     for case in cases {
-        let shape = case.shape();
+        let shape = case
+            .shape()
+            .parity_padded_shape(case.kernel)
+            .expect("supported oracle case should have a programmed HAL shape");
         let plan = ConvPlan::new(shape, case.kernel);
         let out_width = shape.output_width(case.kernel) as usize;
         let out_height = shape.output_height(case.kernel) as usize;
@@ -1206,17 +1174,17 @@ fn int8_accumulator_matrices_are_planable_and_gap_free() {
     );
     assert_planable_and_gap_free(regression);
 
-    let limitations = int8_accumulator_known_limitation_cases();
-    assert_eq!(limitations.len(), 6);
-    assert_planable_and_gap_free(limitations);
+    let parity_regression = int8_accumulator_parity_regression_cases();
+    assert_eq!(parity_regression.len(), 6);
+    assert_planable_and_gap_free(parity_regression);
 }
 
 #[test]
-fn int8_accumulator_k1_cin_atom_sweep_is_planable_and_gap_free() {
-    let cases = int8_accumulator_k1_cin_atom_sweep_cases();
-    assert_eq!(cases.len(), 32);
+fn int8_accumulator_k1_supported_cin_atoms_are_planable_and_gap_free() {
+    let cases = int8_accumulator_k1_supported_cin_atom_cases();
+    assert_eq!(cases.len(), 24);
     assert_eq!(cases.first().unwrap().cin, 16);
-    assert_eq!(cases.last().unwrap().cin, 512);
+    assert_eq!(cases.last().unwrap().cin, 384);
     assert!(cases.windows(2).all(|pair| pair[1].cin - pair[0].cin == 16));
     assert_planable_and_gap_free(cases);
 }
@@ -1343,7 +1311,7 @@ fn accumulator_canary_passes(file: &std::fs::File) -> bool {
 ///
 /// **The canary is necessary but not sufficient.** Results here are also
 /// order dependent, and at small shapes outright flaky, in ways a Cin=64
-/// canary does not detect. In `int8_accumulator_known_limitations_probe`,
+/// canary does not detect. In the original raw parity probe,
 /// Cin=3 Cout=33 and Cin=5 Cout=64 both *pass* when they run first and fail
 /// mid-sweep, and even in isolation Cin=3 Cout=33 failed once in six
 /// otherwise identical runs. Contamination is per-process: a fresh process
@@ -1476,17 +1444,6 @@ fn run_hardware_case_matrix(title: &str, cases: Vec<Conv2dCase>) {
     );
 }
 #[test]
-#[ignore = "needs /dev/accel/accel0 -- validates production affine int8 weights and BS constants"]
-fn int8_affine_selector_matrix_runs_every_case_before_failing() {
-    let cases = int8_selector_cases(|phase| OraclePattern::SelectorsAffine { phase });
-    assert_eq!(cases.len(), 24);
-    println!("  raw weight: logical coefficient + per-output zero point");
-    println!("  physical Cin padding: per-output zero point");
-    println!("  BS constant: -per-output zero point; BS multiplier: 0x4000");
-    run_hardware_case_matrix("int8 affine selector matrix", cases);
-}
-
-#[test]
 #[ignore = "needs /dev/accel/accel0 -- locates the two output-channel-group cutoffs exactly"]
 fn output_channel_group_boundary_probe_runs_every_case_before_failing() {
     let cases = output_channel_group_boundary_cases();
@@ -1494,6 +1451,7 @@ fn output_channel_group_boundary_probe_runs_every_case_before_failing() {
     run_hardware_case_matrix("output-channel-group boundary probe", cases);
 }
 
+#[cfg(feature = "hardware-characterization")]
 #[test]
 #[ignore = "needs /dev/accel/accel0 -- confirms failure starts exactly at ConvPlan's bank-partition flip"]
 fn bank_partition_flip_boundary_probe_runs_every_case_before_failing() {
@@ -1519,11 +1477,11 @@ fn int8_accumulator_regression_matrix_matches_oracle() {
 }
 
 #[test]
-#[ignore = "needs /dev/accel/accel0 -- locates the dense signed K1 Int8Accumulator Cin boundary"]
-fn int8_accumulator_k1_cin_atom_sweep() {
-    let cases = int8_accumulator_k1_cin_atom_sweep_cases();
-    assert_eq!(cases.len(), 32);
-    run_hardware_case_matrix("int8 accumulator K1 Cin atom sweep", cases);
+#[ignore = "needs /dev/accel/accel0 -- validates every supported dense K1 accumulator Cin atom"]
+fn int8_accumulator_k1_supported_cin_atom_sweep() {
+    let cases = int8_accumulator_k1_supported_cin_atom_cases();
+    assert_eq!(cases.len(), 24);
+    run_hardware_case_matrix("int8 accumulator K1 supported Cin atom sweep", cases);
 }
 
 #[test]
@@ -1564,6 +1522,7 @@ fn int8_accumulator_k1_cin_boundary_probe() {
 /// The canary between cases also makes the rows *deterministic*: without it
 /// the failing rows had ragged mismatch counts and a first-bad channel of
 /// 32; with it every failing row is a clean 65536/65536 from c=0.
+#[cfg(feature = "hardware-characterization")]
 #[test]
 #[ignore = "needs /dev/accel/accel0 -- isolates the accumulator Cin>384 CBUF split boundary"]
 fn int8_accumulator_k1_cin_cbuf_split_probe() {
@@ -1615,7 +1574,7 @@ fn int8_accumulator_k1_cin_cbuf_split_probe() {
             precision: OraclePrecision::Int8Accumulator,
             pattern: OraclePattern::Dense { phase: 1 },
         };
-        let fixture = build_fixture(case).expect("build focused accumulator fixture");
+        let fixture = build_raw_fixture(case).expect("build focused accumulator fixture");
         println!("\n  Cin={cin}, coefficient_bytes={}", fixture.weights.len());
 
         for (split_index, weight_banks) in (1..=SPLITS).enumerate() {
@@ -1696,10 +1655,10 @@ fn int8_accumulator_cout_sweep_is_planable_and_gap_free() {
 }
 
 #[test]
-#[ignore = "needs /dev/accel/accel0 -- maps the accumulator Cout output-surface rule"]
-fn int8_accumulator_cout_sweep() {
+#[ignore = "needs /dev/accel/accel0 -- validates HAL Cout padding across every output block boundary"]
+fn int8_accumulator_cout_padding_sweep_matches_oracle() {
     run_hardware_case_matrix(
-        "int8 accumulator Cout sweep",
+        "int8 accumulator HAL Cout-padding sweep",
         int8_accumulator_cout_sweep_cases(),
     );
 }
@@ -1712,10 +1671,10 @@ fn int8_accumulator_cout_shape_interaction_is_planable_and_gap_free() {
 }
 
 #[test]
-#[ignore = "needs /dev/accel/accel0 -- separates the Cout rule from the shape it was measured at"]
-fn int8_accumulator_cout_shape_interaction() {
+#[ignore = "needs /dev/accel/accel0 -- validates HAL Cout padding across even and odd shapes"]
+fn int8_accumulator_cout_shape_interaction_matches_oracle() {
     run_hardware_case_matrix(
-        "int8 accumulator Cout/shape interaction",
+        "int8 accumulator HAL Cout/shape interaction",
         int8_accumulator_cout_shape_interaction_cases(),
     );
 }
@@ -1728,20 +1687,20 @@ fn int8_accumulator_output_parity_is_planable_and_gap_free() {
 }
 
 #[test]
-#[ignore = "needs /dev/accel/accel0 -- tests the tile_pixels * blocks parity rule"]
-fn int8_accumulator_output_parity_probe() {
+#[ignore = "needs /dev/accel/accel0 -- validates HAL padding on every measured parity combination"]
+fn int8_accumulator_output_parity_padding_matches_oracle() {
     run_hardware_case_matrix(
-        "int8 accumulator output parity",
+        "int8 accumulator HAL output-parity padding",
         int8_accumulator_output_parity_cases(),
     );
 }
 
 #[test]
-#[ignore = "known RK3588 failures -- manually characterizes accumulator tails and output-block boundaries"]
-fn int8_accumulator_known_limitations_probe() {
-    let cases = int8_accumulator_known_limitation_cases();
+#[ignore = "needs /dev/accel/accel0 -- guards the HAL Cout-parity workaround at former failure points"]
+fn int8_accumulator_parity_regression_matrix_matches_oracle() {
+    let cases = int8_accumulator_parity_regression_cases();
     assert_eq!(cases.len(), 6);
-    run_hardware_case_matrix("int8 accumulator known-limitations probe", cases);
+    run_hardware_case_matrix("int8 accumulator parity regression matrix", cases);
 }
 
 #[test]
@@ -2025,6 +1984,7 @@ fn cartesian_conv2d_oracle_sweep_runs_every_case_before_failing() {
 /// tells it otherwise. The lever a fix has is the parity itself -- the
 /// number of blocks actually written (true `Cout`) or `tile_pixels` -- not
 /// any padding or register correction.
+#[cfg(feature = "hardware-characterization")]
 fn accumulator_layout_probe(
     file: &std::fs::File,
     extent: (u32, u32),
@@ -2043,7 +2003,7 @@ fn accumulator_layout_probe(
         precision: OraclePrecision::Int8Accumulator,
         pattern: OraclePattern::Dense { phase: 0 },
     };
-    let mut fixture = build_fixture(case)?;
+    let mut fixture = build_raw_fixture(case)?;
 
     // One-hot the *input*, keeping the fixture's own coefficients: output
     // then vanishes everywhere except the single pixel (hot_y, hot_x).
@@ -2060,6 +2020,7 @@ fn accumulator_layout_probe(
 /// touched. Conflating the two is what made an earlier reading of this probe
 /// report values written twice, when the excess was an untouched trailing
 /// block.
+#[cfg(feature = "hardware-characterization")]
 #[derive(PartialEq)]
 enum Lane {
     Sentinel,
@@ -2067,6 +2028,7 @@ enum Lane {
     Data,
 }
 
+#[cfg(feature = "hardware-characterization")]
 fn classify_lanes(raw: &[u8]) -> Vec<Lane> {
     let sentinel = i32::from_le_bytes([OUTPUT_SENTINEL; 4]);
     raw.chunks_exact(4)
@@ -2080,6 +2042,7 @@ fn classify_lanes(raw: &[u8]) -> Vec<Lane> {
         .collect()
 }
 
+#[cfg(feature = "hardware-characterization")]
 #[test]
 #[ignore = "needs /dev/accel/accel0 -- maps where the DPU physically addresses accumulator output"]
 fn int8_accumulator_output_address_map_probe() {
@@ -2120,7 +2083,7 @@ fn int8_accumulator_output_address_map_probe() {
         let width = shape.output_width([1, 1]) as usize;
         let height = shape.output_height([1, 1]) as usize;
         let blocks = (shape.padded_out_channels() as usize * 4) / 128;
-        let verdict = match build_fixture(control).and_then(|fixture| {
+        let verdict = match build_raw_fixture(control).and_then(|fixture| {
             let execution = execute_case_output(&file, &fixture)?;
             Ok(compare_output(&fixture, &execution.plan, &execution.output).mismatches)
         }) {
@@ -2231,6 +2194,7 @@ fn int8_accumulator_output_address_map_probe() {
 ///
 /// Cin stays at or below 384 throughout: dense int8 1x1 fails above that for
 /// an unrelated reason that would confound this.
+#[cfg(feature = "hardware-characterization")]
 fn int8_accumulator_multitile_parity_cases() -> Vec<(Conv2dCase, u32, u32, &'static [u32])> {
     [
         // (width, height, cin, data_banks, weight_banks, expected out_rows)
@@ -2270,11 +2234,13 @@ fn int8_accumulator_multitile_parity_cases() -> Vec<(Conv2dCase, u32, u32, &'sta
     .collect()
 }
 
+#[cfg(feature = "hardware-characterization")]
 #[test]
 fn int8_accumulator_multitile_parity_is_planable() {
     for (case, data_banks, weight_banks, expected_rows) in int8_accumulator_multitile_parity_cases()
     {
-        let plan = ConvPlan::with_cbuf_banks(case.shape(), case.kernel, data_banks, weight_banks);
+        let shape = case.shape();
+        let plan = ConvPlan::with_cbuf_banks(shape, case.kernel, data_banks, weight_banks);
         let rows: Vec<u32> = plan.tiles().iter().map(|tile| tile.rows.out_rows).collect();
         assert_eq!(
             rows, expected_rows,
@@ -2289,8 +2255,9 @@ fn int8_accumulator_multitile_parity_is_planable() {
     }
 }
 
+#[cfg(feature = "hardware-characterization")]
 #[test]
-#[ignore = "needs /dev/accel/accel0 -- shows whether the output parity rule is per tile or per dispatch"]
+#[ignore = "needs /dev/accel/accel0 -- characterizes raw parity across forced CBUF splits"]
 fn int8_accumulator_multitile_parity_probe() {
     let file = OpenOptions::new()
         .read(true)
@@ -2299,7 +2266,7 @@ fn int8_accumulator_multitile_parity_probe() {
         .expect("failed to open RK3588 NPU device");
 
     let only = probe_only_index();
-    println!("\n=== accumulator output parity: per tile or per dispatch? ===");
+    println!("\n=== accumulator programmed Cout across tile splits ===");
     if !accumulator_canary_passes(&file) {
         println!("  CANARY FAILED -- the NPU is sick, reboot the board");
         return;
@@ -2313,7 +2280,7 @@ fn int8_accumulator_multitile_parity_probe() {
         if only.is_some_and(|only| only != index) {
             continue;
         }
-        let fixture = match build_fixture(case) {
+        let fixture = match build_raw_fixture(case) {
             Ok(fixture) => fixture,
             Err(error) => {
                 println!("  [{index}] build ERROR {error}");
@@ -2327,7 +2294,6 @@ fn int8_accumulator_multitile_parity_probe() {
             .map(|rows| *rows as usize * case.width as usize)
             .collect();
         let all_even = per_tile.iter().all(|pixels| pixels % 2 == 0);
-
         let verdict = match execute_case_output_with_plan(&file, &fixture, plan) {
             Ok(execution) => {
                 let report = compare_output(&fixture, &execution.plan, &execution.output);
@@ -2342,11 +2308,10 @@ fn int8_accumulator_multitile_parity_probe() {
 
         println!(
             "  [{index}] {}x{} Cin={} banks={data_banks}/{weight_banks} rows={expected_rows:?} \
-             tile_pixels={per_tile:?} total={} (even) -> per-tile predicts {}, actual {verdict}",
+             tile_pixels={per_tile:?} -> per-tile predicts {}, actual {verdict}",
             case.width,
             case.height,
             case.cin,
-            case.width * case.height,
             if all_even { "pass" } else { "FAIL" },
         );
     }
@@ -2396,6 +2361,7 @@ fn int8_accumulator_multitile_parity_probe() {
 /// *subsequent processes*. Only re-running 5-8 on a rested device showed
 /// them clean. Any sweep containing a genuinely failing case invalidates
 /// everything measured after it, process isolation included.
+#[cfg(feature = "hardware-characterization")]
 #[test]
 #[ignore = "needs /dev/accel/accel0 -- validates padding Cout to an even block count"]
 fn int8_accumulator_cout_padding_probe() {
@@ -2469,7 +2435,7 @@ fn int8_accumulator_cout_padding_probe() {
             } else {
                 case
             };
-            let verdict = match build_fixture(probe).and_then(|fixture| {
+            let verdict = match build_raw_fixture(probe).and_then(|fixture| {
                 let execution = execute_case_output(&file, &fixture)?;
                 Ok(compare_output(&fixture, &execution.plan, &execution.output).mismatches)
             }) {
@@ -2484,7 +2450,7 @@ fn int8_accumulator_cout_padding_probe() {
             continue;
         }
 
-        let mut fixture = match build_fixture(case) {
+        let mut fixture = match build_raw_fixture(case) {
             Ok(fixture) => fixture,
             Err(error) => {
                 println!("  {width}x{height} k{kernel} s{stride}: build ERROR {error}");

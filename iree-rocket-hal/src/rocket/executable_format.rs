@@ -492,6 +492,37 @@ mod tests {
     }
 
     #[test]
+    fn validate_rejects_accumulator_k1_above_measured_cin_ceiling() {
+        let quantization = Quantization {
+            input_zero_point: 0,
+            output_zero_point: 0,
+            weight_zero_point: 0,
+            input_scale: 1.0,
+            weights_scale: 1.0,
+            multiplier: Multiplier::from_ratio(1.0),
+        };
+        let cin_384 = conv::Shape::with_precision(
+            32,
+            32,
+            1,
+            384,
+            64,
+            Precision::Int8Accumulator(quantization),
+        );
+        assert_eq!(validate_conv_shape(&cin_384, [1, 1]), Ok(()));
+        assert!(
+            validate_conv_shape(
+                &conv::Shape {
+                    in_channels: 385,
+                    ..cin_384
+                },
+                [1, 1]
+            )
+            .is_err()
+        );
+    }
+
+    #[test]
     fn validate_accepts_shape_that_requires_multiple_tiles() {
         // `conv.rs`'s own `plan_programs_with_buffers_relocates_every_tile`
         // test confirms this exact shape/kernel pair plans into 3 tiles.

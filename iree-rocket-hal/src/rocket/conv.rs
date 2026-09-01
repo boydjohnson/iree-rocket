@@ -1027,6 +1027,11 @@ impl Shape {
     /// parity-padded form failed repeatably on RK3588 even with ordinary,
     /// nonzero surplus coefficients, so zero padding cannot make that
     /// physical configuration safe.
+    ///
+    /// Dense 1x1 accumulator convolution is also limited to 384 input
+    /// channels. The complete 16-channel-atom sweep passes through 384 and
+    /// then leaves accumulator output unwritten at every point from 400
+    /// through 512; focused runs locate the transition at 385.
     pub fn parity_padded_shape(&self, kernels: Kernels) -> Result<Shape, &'static str> {
         if self.precision.writes_accumulators()
             && !self.depthwise
@@ -1036,6 +1041,15 @@ impl Shape {
         {
             return Err(
                 "dense int8 accumulator convolution with 3x3 output and a 3x3 kernel is not supported",
+            );
+        }
+        if self.precision.writes_accumulators()
+            && !self.depthwise
+            && kernels == [1, 1]
+            && self.in_channels > 384
+        {
+            return Err(
+                "dense 1x1 int8 accumulator convolution supports at most 384 input channels",
             );
         }
 
@@ -5278,6 +5292,29 @@ mod tests {
 
         let fp16 = Shape::with_precision(3, 3, 1, 8, 32, Precision::Fp16);
         assert!(fp16.parity_padded_shape([3, 3]).is_ok());
+
+        let cin_384 = Shape::with_precision(
+            32,
+            32,
+            1,
+            384,
+            64,
+            Precision::Int8Accumulator(Quantization {
+                input_zero_point: 0,
+                output_zero_point: 0,
+                weight_zero_point: 0,
+                ..quantization()
+            }),
+        );
+        assert!(cin_384.parity_padded_shape([1, 1]).is_ok());
+        assert!(
+            Shape {
+                in_channels: 385,
+                ..cin_384
+            }
+            .parity_padded_shape([1, 1])
+            .is_err()
+        );
     }
 
     #[test]

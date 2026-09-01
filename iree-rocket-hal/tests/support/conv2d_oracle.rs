@@ -5,7 +5,7 @@ use iree_rocket_hal::rocket::{
     },
     tensor_layout::{
         pack_hwcf_to_rocket_weights, pack_hwcf_to_rocket_weights_affine_i8,
-        rocket_weight_storage_size,
+        pack_hwcf_to_rocket_weights_padded, rocket_weight_storage_size,
     },
 };
 
@@ -598,7 +598,21 @@ fn affine_weight_zero_points(case: Conv2dCase) -> Vec<i8> {
 }
 
 pub fn build_fixture(case: Conv2dCase) -> Result<Conv2dFixture, String> {
-    let shape = case.shape();
+    let logical_shape = case.shape();
+    let shape = logical_shape
+        .parity_padded_shape(case.kernel)
+        .map_err(str::to_string)?;
+    build_fixture_for_shape(case, shape)
+}
+
+/// Builds the logical shape exactly as written, bypassing HAL rejection and
+/// programmed-Cout padding. Only raw hardware-characterization probes should
+/// use this; supported regressions must use [`build_fixture`].
+pub fn build_raw_fixture(case: Conv2dCase) -> Result<Conv2dFixture, String> {
+    build_fixture_for_shape(case, case.shape())
+}
+
+fn build_fixture_for_shape(case: Conv2dCase, shape: Shape) -> Result<Conv2dFixture, String> {
     let logical_input = logical_input(case);
     let mut input = vec![0; input_storage_bytes(shape)];
     for y in 0..case.height as usize {
@@ -653,7 +667,7 @@ pub fn build_fixture(case: Conv2dCase) -> Result<Conv2dFixture, String> {
         case.kernel[0],
         case.kernel[1],
         case.cin as usize,
-        case.cout as usize,
+        shape.out_channels as usize,
         element_bytes,
     )
     .map_err(str::to_string)?;
@@ -666,6 +680,18 @@ pub fn build_fixture(case: Conv2dCase) -> Result<Conv2dFixture, String> {
             case.cin as usize,
             case.cout as usize,
             zero_points,
+            &mut weights,
+        )
+        .map_err(str::to_string)?;
+    } else if shape.out_channels != case.cout {
+        pack_hwcf_to_rocket_weights_padded(
+            &dense_weight_bytes,
+            case.kernel[0],
+            case.kernel[1],
+            case.cin as usize,
+            case.cout as usize,
+            shape.out_channels as usize,
+            element_bytes,
             &mut weights,
         )
         .map_err(str::to_string)?;
@@ -883,6 +909,44 @@ mod tests {
         );
         assert_eq!(fixture.bias.len(), shape.bs_buffer_bytes());
         assert!(matches!(shape.precision, Precision::Int8Accumulator(_)));
+    }
+
+    #[test]
+    fn accumulator_fixture_uses_the_hal_programmed_shape() {
+        let case = Conv2dCase {
+            width: 9,
+            height: 7,
+            cin: 8,
+            cout: 32,
+            kernel: [1, 1],
+            stride: 1,
+            padding: [0, 0],
+            precision: OraclePrecision::Int8Accumulator,
+            pattern: OraclePattern::Dense { phase: 0 },
+        };
+        let fixture = build_fixture(case).expect("build HAL accumulator fixture");
+        assert_eq!(case.shape().out_channels, 32);
+        assert_eq!(fixture.shape.out_channels, 64);
+        assert_eq!(
+            fixture.weights.len(),
+            fixture.shape.weight_bytes(case.kernel) as usize
+        );
+        assert!(
+            fixture.weights[fixture.weights.len() / 2..]
+                .iter()
+                .all(|&byte| byte == 0)
+        );
+        assert_eq!(fixture.bias.len(), fixture.shape.bs_buffer_bytes());
+
+        let rejected = Conv2dCase {
+            width: 3,
+            height: 3,
+            kernel: [3, 3],
+            padding: [1, 1],
+            ..case
+        };
+        assert!(build_fixture(rejected).is_err());
+        assert!(build_raw_fixture(rejected).is_ok());
     }
 
     #[test]
