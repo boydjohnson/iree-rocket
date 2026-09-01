@@ -1878,9 +1878,33 @@ impl ColumnTile {
             .saturating_sub(kernel.pad_left)
             .min(shape.width - 1);
         let exact = in_last - in_first + 1;
-        let in_cols = exact
-            .max(out_cols * shape.stride)
-            .min(shape.width - in_first);
+        // A tile that is the whole row takes the whole row, even when the
+        // taps do not reach the end of it.
+        //
+        // `in_cols` is programmed as `CNA_DATA_SIZE0.datain_width`, and in
+        // dense layout the CNA advances rows by that value rather than by
+        // the separately programmed `line_stride`. At stride > 1 an extent
+        // where `(width - kernel) % stride != 0` leaves a partial trailing
+        // window no output tap consumes, so `exact` (and the vendor's
+        // `out_cols * stride` floor) both land *short* of the real row
+        // pitch -- and every row after the first is then read at the wrong
+        // offset, which corrupts the entire output rather than just its
+        // edge. Hardware-confirmed across 16 stride-2/3/4 geometries in
+        // `dense_geometry_regression_cases`: the failures are exactly the
+        // ones where this used to come out below `shape.width`.
+        //
+        // Only the un-partitioned case is widened. A genuine horizontal
+        // partition programs grouped-line mode and a `surf_stride` that
+        // already accounts for the local width, so its tiles keep the
+        // narrower span they are supposed to have.
+        let spans_full_row = out_first == 0 && out_first + out_cols == output_width;
+        let in_cols = if spans_full_row {
+            shape.width - in_first
+        } else {
+            exact
+                .max(out_cols * shape.stride)
+                .min(shape.width - in_first)
+        };
 
         ColumnTile {
             out_first,

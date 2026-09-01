@@ -113,6 +113,29 @@ Compiling by hand with `iree-compile` in one shot skips the pass. Single
 convolutions (what `tools/e2e_conv_regression.py` compiles) have nothing to
 mis-place and are unaffected, but a whole model can be.
 
+### Convolution shape integrity
+
+`rocket-demote-conv-inputs-to-f16` (in the compiler plugin) demotes all-f32
+named 2-D convolution inputs to f16 for Rocket's f16-in/f32-accumulate ABI. It
+exists because the upstream pass the transform spec used to call for this,
+`iree-global-opt-demote-contraction-inputs`, rebuilds the named op through
+`linalg::getPrunedAttributeList`, which elides the op's own declared attribute
+names -- including `strides` and `dilations`. Every strided or dilated
+convolution it touched silently became a stride-1 one.
+
+That is a correctness bug independent of Rocket: linalg drives a convolution's
+iteration space from its output, so the rewritten op still verifies and still
+lowers, it just computes a different convolution over a corner of its input.
+On MobileNetV2 it turned the stride-2 stem conv into a nominal stride-1 conv,
+which then also matched `@match_dynamic_conv2d_3x3` (which requires stride 1)
+and was dispatched to the NPU with the wrong stride.
+
+`rocket-verify-conv-shapes` is the tripwire for anything like it: it errors if
+a named convolution's output spatial extent disagrees with its own input,
+filter, stride and dilation. It runs immediately before the match/rewrite
+loop, while padding is still explicit and nothing has been tiled, so the
+relation is exact there. It should never fire.
+
 ### ONNX models
 
 Pin the batch dimension before importing. `iree-import-onnx` will happily
