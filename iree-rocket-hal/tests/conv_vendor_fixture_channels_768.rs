@@ -307,6 +307,10 @@ fn run_channel_grid(fixtures: &str, precision: FixturePrecision) {
     // vendor's 6/6, 5/7, 4/8, 4/8 -- see MAX_INPUT_CHANNELS' doc comment.
     assert_eq!(supported, 96);
     assert_eq!(exploratory.len(), 48);
+    // Raising MAX_INPUT_CHANNELS to 768 makes these 144/0 and the bank
+    // comparison then fails on ~10 cases -- the Cout-dependent transition
+    // points documented on that constant. That failure is the point: it is
+    // what stops the cap moving before the rule is exact.
     assert!(
         missing_plan_zero_split.is_empty(),
         "vendor plan 0 had no unique nonzero CBUF split: {missing_plan_zero_split:?}"

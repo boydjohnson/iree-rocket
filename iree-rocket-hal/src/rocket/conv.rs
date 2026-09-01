@@ -148,12 +148,29 @@ pub const INPUT_CHANNELS: u32 = 3;
 /// depthwise stages) and reverted: `tests/conv_vendor_fixture_channels_768.rs`
 /// -- a vendor-vs-`ConvPlan` regression check that was already sitting in
 /// the suite -- caught real divergence for *dense* (non-depthwise) shapes
-/// in exactly that range (`ConvPlan` predicts a 1/11 CBUF split at
-/// Cin=576/640/704/768, real vendor captures show 6/6, 5/7, 4/8). This
-/// constant is shared between dense and depthwise Shape construction, so
-/// there's no way to raise it for depthwise (which a separate hardware
-/// probe did validate at 576/960) without also silently permitting dense
-/// construction into a range now known to be wrong. See
+/// in exactly that range. `ConvPlan` predicted a 1/11 CBUF split at
+/// Cin=576/640/704/768 where real captures show 6/6, 5/7, 4/8, 4/8.
+///
+/// Most of that is now understood and fixed: see
+/// `demand_based_cbuf_partition`'s two-pass coefficient rule, which turns
+/// 96/144 corpus agreement into 134/144 and matches all 13 `Cin` points
+/// from 384 to 768 on the `Cin`-only curve. New corpora built for this
+/// (`build_vendor_fixtures.py --channel-grid-extent 14`, and
+/// `--channel-grid-step 32`) also show the split is geometry-independent
+/// above `Cin` 384 -- 28x28 and 14x14 agree on every point there.
+///
+/// What still blocks raising this: at the *transition* `Cin` values the
+/// grant depends on `Cout` in a way a `Cin`-only preference cannot express
+/// (608 wants 6 banks at `Cout` <= 32 and 7 above; 704 wants 7 at
+/// `Cout` <= 64 and 8 above; 736 flips at 64). Raising this constant with
+/// that unresolved leaves ~10 of 144 corpus cases mis-planned --
+/// `conv_vendor_fixture_channels_768.rs` fails loudly if anyone tries, which
+/// is the intended tripwire.
+///
+/// This constant is shared between dense and depthwise Shape construction,
+/// so there's no way to raise it for depthwise (which a separate hardware
+/// probe did validate at 576/960) without also permitting dense
+/// construction into that range. See
 /// `iree-rocket-hal/tests/conv_mobilenetv2_depthwise_wide_hw.rs`'s doc
 /// comment for the depthwise-side validation and what raising this again
 /// would need (a depthwise-specific ceiling, not this shared one).
@@ -1428,8 +1445,45 @@ impl Shape {
         };
         let data_banks = granted.clamp(1, CBUF_BANKS - 1);
         let weight_banks = CBUF_BANKS - data_banks;
-        let streamed_preference =
-            streamed_weight_bank_preference(self.weight_channels(), kernels).min(CBUF_BANKS - 1);
+        // Above the largest grant that still leaves three data banks, the
+        // vendor stops growing the resident coefficient set and splits the
+        // stream into two passes instead: the working set halves, plus one
+        // bank to double-buffer the next pass. Below that it keeps the whole
+        // set resident and the preference is the demand itself.
+        //
+        // Fits the expanded corpus exactly, 13 of 13 `Cin` points from 384 to
+        // 768 at 32-channel granularity, where the raw preference runs 7..14
+        // and the vendor's grant runs 7,8,8,9,9 then 6,6,6,7,7,7,7,8. It also
+        // explains the discontinuity that made this look unfittable: the
+        // grant *drops* from 9 to 6 between `Cin` 512 and 544 because that is
+        // where the second pass appears.
+        //
+        // Geometry-independent above `Cin` 384, confirmed on two extents
+        // (28x28 and 14x14 agree on every point in that range); below it the
+        // split still follows spatial demand and this preference is not what
+        // decides it.
+        const MAX_SINGLE_PASS_WEIGHT_BANKS: u32 = CBUF_BANKS - 3;
+        let single_pass = streamed_weight_bank_preference(self.weight_channels(), kernels);
+        let streamed_preference = if single_pass <= MAX_SINGLE_PASS_WEIGHT_BANKS {
+            single_pass
+        } else {
+            single_pass / 2 + 1
+        };
+        // A working set that does not fit even split in two is past anything
+        // the corpus covers. Refusing beats clamping: a clamp makes the
+        // correction below test `weight_banks > streamed_preference` as
+        // `11 > 11`, which never fires, and the split degenerates to one data
+        // bank -- roughly one input row per tile.
+        assert!(
+            streamed_preference <= CBUF_BANKS - 1,
+            "coefficient working set wants {streamed_preference} CBUF banks for \
+             {}x{} kernel and {} weight channels even split in two, more than the \
+             {} grantable; not capture-backed (see MAX_INPUT_CHANNELS' doc comment)",
+            kernels[0],
+            kernels[1],
+            self.weight_channels(),
+            CBUF_BANKS - 1,
+        );
         let floor = weight_banks_floor(self.weight_channels()).max(streamed_preference);
 
         // Total coefficient size can otherwise consume eleven banks and
@@ -5372,6 +5426,34 @@ mod tests {
             .parity_padded_shape([1, 1])
             .is_err()
         );
+    }
+
+    #[test]
+    /// The saturating coefficient working set is refused, not silently
+    /// clamped into a one-data-bank split.
+    ///
+    /// A 5x5 kernel at `Cin` 512 is constructible today and wants 25 banks,
+    /// far past the eleven grantable. Before the guard it came back 1/11 --
+    /// about one input row per tile -- from the same clamp interaction the
+    /// expanded corpus exposes at `Cin` >= 576. (7x7 does not reach the
+    /// allocator: above coefficient demand seven it takes its own
+    /// capture-derived 8/4 schedule.)
+    #[test]
+    #[should_panic(expected = "not capture-backed")]
+    fn saturating_coefficient_working_set_is_refused() {
+        let shape = Shape::with_precision(32, 32, 1, 512, 64, Precision::Fp16);
+        let _ = ConvPlan::new(shape, [5, 5]);
+    }
+
+    /// The guard does not disturb the range that is capture-backed: a 3x3
+    /// kernel at the same `Cin` wants nine banks and still plans 3/9, the
+    /// split the expanded corpus records.
+    #[test]
+    fn largest_capture_backed_working_set_still_plans() {
+        let shape =
+            Shape::with_precision(28, 28, 1, 512, 256, Precision::Fp16).with_padding([1, 1]);
+        let plan = ConvPlan::new(shape, [3, 3]);
+        assert_eq!((plan.data_banks(), plan.weight_banks()), (3, 9));
     }
 
     #[test]
