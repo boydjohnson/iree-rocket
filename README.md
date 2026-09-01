@@ -63,7 +63,9 @@ cargo test --workspace
 
 `rocket-compiler` wraps `libIREECompiler.so` with the Rocket transform spec and
 the device flags that spec hardcodes, so a model does not have to be compiled
-by hand:
+by hand. It is also the only way to compile a model correctly: it runs the
+pipeline in two stages so it can pin placement in the middle (see **Placement
+pinning** below), which a single `iree-compile` invocation cannot do.
 
 ```sh
 export IREE_COMPILER_LIB=iree-build/build/lib/libIREECompiler.so
@@ -78,6 +80,38 @@ the number that answers "how much of the model ran on the NPU": the transform
 spec routes every matched convolution through a handful of fixed executables,
 so an executable count alone understates NPU placement badly, while IREE
 deduplicates identical CPU dispatches, which overstates the CPU side.
+
+### Placement pinning
+
+The Rocket backend has no code generator. `serializeExecutable` only knows how
+to read the config dict that `rocket_conv2d_transform_spec.mlir` stamps onto
+the hand-authored executables it splices in, so the NPU can only ever run
+dispatches the spec itself created -- every one of which carries an explicit
+`stream.affinity = #hal.device.affinity<@rocket_device>`.
+
+Dispatches IREE forms on its own carry no affinity, and Stream's affinity
+analysis places them by propagating through consumers. A dispatch whose result
+is used *only* by a Rocket dispatch therefore gets pulled onto the NPU, and
+serialization then fails on something that is not a convolution at all. The
+observed case is the explicit padding for an int8 depthwise convolution, a
+112x112x48 -> 114x114x48 copy dispatch that IREE names `..._slow_memcpy`;
+nothing pulls it back toward the CPU, because its destination is a fresh
+`flow.tensor.splat` and the Rocket consumer is the only constraint the analysis
+can see. `--iree-hal-default-device` does not help: the module-level
+`stream.affinity.default` it sets only applies where the analysis finds
+nothing.
+
+`rocket-pin-unclaimed-dispatches` (in the compiler plugin) makes the placement
+explicit instead, stamping that default onto every `flow.dispatch` that has no
+affinity of its own. It has to run between the `flow` and `stream` phases --
+after dispatch regions are formed and outlined, before the affinities are
+consumed -- and no plugin hook exists that late, so `rocket-compiler` drives it
+by name: `--compile-to=flow`, the pass, then `--compile-from=flow`. Both
+`compile` and `audit` do this, so the report matches what a `.vmfb` would get.
+
+Compiling by hand with `iree-compile` in one shot skips the pass. Single
+convolutions (what `tools/e2e_conv_regression.py` compiles) have nothing to
+mis-place and are unaffected, but a whole model can be.
 
 ### ONNX models
 

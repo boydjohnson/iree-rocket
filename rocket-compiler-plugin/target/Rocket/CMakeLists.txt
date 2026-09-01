@@ -29,6 +29,7 @@ flatbuffer_c_library(
 set(_ROCKET_SRCS
   "RocketAnnotateFinalPlacementPass.cpp"
   "RocketAnnotateOriginalPlacementPass.cpp"
+  "RocketPinUnclaimedDispatchesPass.cpp"
   "RocketTarget.cpp"
   "RocketTransposeQuantizedConvPass.cpp"
 )
@@ -40,8 +41,10 @@ set(_ROCKET_DEPS
   MLIRSupport
   MLIRTensorDialect
   MLIRTransforms
+  iree::compiler::Dialect::Flow::IR
   iree::compiler::Dialect::HAL::IR
   iree::compiler::Dialect::HAL::Target
+  iree::compiler::Dialect::Stream::IR
   iree::compiler::PluginAPI
   iree::compiler::Utils
   ::RocketExecutableDef
