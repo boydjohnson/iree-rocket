@@ -11,6 +11,12 @@
 //!       <width> <height> <stride> <cin> <cout> <kernel> <tile_index> \
 //!       [pad_top] [pad_left]
 //!
+//! `ROCKET_DUMP_DEPTHWISE=1` builds a depthwise shape instead of a dense
+//! one. Useful for diffing which registers a depthwise program sets against
+//! a dense one: a regcmd program is a register *delta*, so a register one
+//! kind of dispatch writes and the other leaves alone is inherited stale
+//! when the two share a command buffer.
+//!
 //! `ROCKET_DUMP_PRECISION=int8acc` switches the shape to
 //! `Int8Accumulator` (zero points zeroed, unit multiplier) instead of the
 //! default fp16, which is what the accumulator output-parity work needs --
@@ -49,6 +55,9 @@ fn main() {
         _ => Precision::Fp16,
     };
     let mut shape = Shape::with_precision(width, height, stride, cin, cout, precision);
+    if std::env::var("ROCKET_DUMP_DEPTHWISE").is_ok() {
+        shape = shape.with_depthwise();
+    }
     if args.len() > 7 {
         let pad_top = value(7) as usize;
         let pad_left = value(8) as usize;
