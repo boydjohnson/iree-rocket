@@ -94,7 +94,8 @@ use iree_rocket_hal::rocket::{
     tensor_layout::{
         nc1hwc2_storage_size, pack_depthwise_to_rocket_weights, pack_fp16_bias_to_rocket,
         pack_hwcf_to_rocket_weights, pack_hwcf_to_rocket_weights_affine_i8,
-        pack_nhwc_to_nc1hwc2_padded, rocket_fp16_bias_storage_size, rocket_weight_storage_size,
+        pack_hwcf_to_rocket_weights_padded, pack_nhwc_to_nc1hwc2_padded,
+        rocket_fp16_bias_storage_size, rocket_weight_storage_size,
     },
 };
 
@@ -143,7 +144,10 @@ pub struct WeightPacking {
     pub filter_height: usize,
     pub filter_width: usize,
     pub input_channels: usize,
+    /// Logical output channels present in the source binding.
     pub output_channels: usize,
+    /// Physical output channels encoded in the regcmd and packed weights.
+    pub programmed_output_channels: usize,
     pub element_size: usize,
     /// One filter per input channel (no `(input, output)` pairing) packed
     /// tap-major via [`pack_depthwise_to_rocket_weights`] instead of
@@ -231,6 +235,11 @@ pub enum RecordedOp {
     },
     Dispatch {
         regcmd_tasks: Vec<Vec<RegCmd>>,
+        /// The DPU execution mode this dispatch programs. `None` denotes a
+        /// non-DPU dispatch such as pooling. Kept with the recorded work so
+        /// `device::queue_execute` can apply hardware transition rules in
+        /// actual submission order.
+        dpu_mode: Option<DpuMode>,
         /// Every direct binding supplied to the dispatch, retained exactly
         /// once at record time as required by the IREE HAL command-buffer
         /// contract. The command buffer releases them from `destroy()`.
@@ -273,12 +282,24 @@ pub enum RecordedOp {
     },
 }
 
+/// DPU state programmed by a dispatch.
+///
+/// Depthwise and dense convolution use distinct DPU write-back modes. The
+/// device queue uses this to quiesce the hardware at the one empirically
+/// unsafe transition, after a depthwise completion and before a dense submit.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum DpuMode {
+    Dense,
+    Depthwise,
+}
+
 /// What `apply_ops` hands back for each recorded `dispatch`, in call order --
 /// the regcmd program plus the real BO handles it touches, so
 /// `device::queue_execute` can build a correct `drm_rocket_job` instead of
 /// submitting with only the regcmd buffer's own handle listed.
 pub struct DispatchJob {
     pub regcmd_tasks: &'static [Vec<RegCmd>],
+    pub dpu_mode: Option<DpuMode>,
     pub in_bo_handles: &'static [u32],
     pub out_bo_handles: &'static [u32],
     pub output_compaction: Option<OutputCompaction>,
@@ -425,6 +446,7 @@ pub unsafe fn apply_ops(
             }
             RecordedOp::Dispatch {
                 regcmd_tasks,
+                dpu_mode,
                 in_bo_handles,
                 out_bo_handles,
                 input_packing,
@@ -553,16 +575,35 @@ pub unsafe fn apply_ops(
                             scratch,
                         )
                     } else if let Some(zero_point) = packing.weight_zero_point {
-                        let zero_points = vec![zero_point; packing.output_channels];
-                        pack_hwcf_to_rocket_weights_affine_i8(
-                            dense,
-                            packing.filter_height,
-                            packing.filter_width,
-                            packing.input_channels,
-                            packing.output_channels,
-                            &zero_points,
-                            scratch,
-                        )
+                        if packing.programmed_output_channels > packing.output_channels {
+                            if zero_point != 0 {
+                                Err(
+                                    "programmed Cout padding requires symmetric accumulator weights",
+                                )
+                            } else {
+                                pack_hwcf_to_rocket_weights_padded(
+                                    dense,
+                                    packing.filter_height,
+                                    packing.filter_width,
+                                    packing.input_channels,
+                                    packing.output_channels,
+                                    packing.programmed_output_channels,
+                                    packing.element_size,
+                                    scratch,
+                                )
+                            }
+                        } else {
+                            let zero_points = vec![zero_point; packing.output_channels];
+                            pack_hwcf_to_rocket_weights_affine_i8(
+                                dense,
+                                packing.filter_height,
+                                packing.filter_width,
+                                packing.input_channels,
+                                packing.output_channels,
+                                &zero_points,
+                                scratch,
+                            )
+                        }
                     } else {
                         pack_hwcf_to_rocket_weights(
                             dense,
@@ -653,6 +694,7 @@ pub unsafe fn apply_ops(
                 }
                 dispatch_jobs.push(DispatchJob {
                     regcmd_tasks: regcmd_tasks.as_slice(),
+                    dpu_mode: *dpu_mode,
                     in_bo_handles: in_bo_handles.as_slice(),
                     out_bo_handles: out_bo_handles.as_slice(),
                     output_compaction: output_compaction.clone(),
@@ -994,6 +1036,14 @@ unsafe extern "C" fn dispatch(
                 }
             };
             let shape = &resolved_shape;
+            let programmed_shape = match shape.parity_padded_shape(kernels) {
+                Ok(programmed_shape) => programmed_shape,
+                Err(_) => {
+                    return status::from_code(
+                        crate::bindings::iree_status_code_e_IREE_STATUS_INVALID_ARGUMENT,
+                    );
+                }
+            };
             if bindings.count < 4 {
                 return status::from_code(
                     crate::bindings::iree_status_code_e_IREE_STATUS_INVALID_ARGUMENT,
@@ -1083,7 +1133,7 @@ unsafe extern "C" fn dispatch(
                     kernels[0],
                     kernels[1],
                     shape.in_channels as usize,
-                    shape.out_channels as usize,
+                    programmed_shape.out_channels as usize,
                     element_size,
                 ) {
                     Ok(value) => value,
@@ -1114,6 +1164,7 @@ unsafe extern "C" fn dispatch(
                         filter_width: kernels[1],
                         input_channels: shape.in_channels as usize,
                         output_channels: shape.out_channels as usize,
+                        programmed_output_channels: programmed_shape.out_channels as usize,
                         element_size,
                         depthwise: false,
                         padded_channels: 0,
@@ -1168,6 +1219,7 @@ unsafe extern "C" fn dispatch(
                         filter_width: kernels[1],
                         input_channels: shape.in_channels as usize,
                         output_channels: shape.out_channels as usize,
+                        programmed_output_channels: shape.out_channels as usize,
                         element_size,
                         depthwise: true,
                         padded_channels: shape.depthwise_padded_channels() as usize,
@@ -1186,7 +1238,7 @@ unsafe extern "C" fn dispatch(
             };
             let (bias_addr, bias_handle, bias_packing) = if shape.precision == Precision::Fp16 {
                 let output_channels = shape.out_channels as usize;
-                let padded_output_channels = shape.padded_out_channels() as usize;
+                let padded_output_channels = programmed_shape.padded_out_channels() as usize;
                 if !matches!(
                     output_channels.checked_mul(element_size),
                     Some(value) if value as u64 <= refs[2].length as u64
@@ -1232,7 +1284,7 @@ unsafe extern "C" fn dispatch(
                 packed
             } else if let Precision::Int8(q) | Precision::Int8Accumulator(q) = shape.precision {
                 let output_channels = shape.out_channels as usize;
-                let padded_output_channels = shape.padded_out_channels() as usize;
+                let padded_output_channels = programmed_shape.padded_out_channels() as usize;
                 if output_channels
                     .checked_mul(4)
                     .is_none_or(|value| value as u64 > refs[2].length as u64)
@@ -1241,7 +1293,7 @@ unsafe extern "C" fn dispatch(
                         crate::bindings::iree_status_code_e_IREE_STATUS_INVALID_ARGUMENT,
                     );
                 }
-                let scratch_bytes = shape.bs_buffer_bytes();
+                let scratch_bytes = programmed_shape.bs_buffer_bytes();
                 let scratch = unsafe {
                     RocketOwnedBuffer::new(
                         cb.fd,
@@ -1280,7 +1332,7 @@ unsafe extern "C" fn dispatch(
             // writes there instead of the real output buffer, and
             // `queue_execute` compacts the real values into the real
             // buffer after the hardware write completes.
-            let scratch_bytes = shape.output_scratch_bytes(kernels).max(1);
+            let scratch_bytes = programmed_shape.output_scratch_bytes(kernels).max(1);
             let scratch = unsafe {
                 RocketOwnedBuffer::new(cb.fd, scratch_bytes, BorrowedFd::borrow_raw(cb.fd))
             };
@@ -1298,8 +1350,8 @@ unsafe extern "C" fn dispatch(
             // only returns fresh local vectors, so a panic mid-build leaves
             // no shared state half-mutated.
             let planned = match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                let plan = ConvPlan::new(*shape, kernels);
-                if shape.precision.writes_accumulators() {
+                let plan = ConvPlan::new(programmed_shape, kernels);
+                if programmed_shape.precision.writes_accumulators() {
                     let staged = plan.programs_with_staged_accumulator_output(bufs);
                     assert_eq!(staged.scratch_bytes, scratch_bytes);
                     (
@@ -1331,7 +1383,7 @@ unsafe extern "C" fn dispatch(
                 output_width: shape.output_width(kernels) as usize,
                 bytes_per_pixel: shape.out_channels as usize
                     * shape.precision.output_element_bytes() as usize,
-                source_block_bytes: shape.output_atom_bytes() as usize,
+                source_block_bytes: programmed_shape.output_atom_bytes() as usize,
                 source_tiles,
             });
             let output_handle = scratch.handle;
@@ -1339,6 +1391,11 @@ unsafe extern "C" fn dispatch(
             let retained_bindings = unsafe { retain_direct_bindings(refs) };
             cb.ops.push(RecordedOp::Dispatch {
                 regcmd_tasks,
+                dpu_mode: Some(if shape.depthwise {
+                    DpuMode::Depthwise
+                } else {
+                    DpuMode::Dense
+                }),
                 retained_bindings,
                 scratch_buffers,
                 in_bo_handles: vec![input_handle, weights_handle, bias_handle],
@@ -1493,6 +1550,7 @@ unsafe extern "C" fn dispatch(
                 filter_width: 1,
                 input_channels: k,
                 output_channels: n,
+                programmed_output_channels: n,
                 element_size,
                 depthwise: false,
                 padded_channels: 0,
@@ -1607,6 +1665,7 @@ unsafe extern "C" fn dispatch(
             }
             cb.ops.push(RecordedOp::Dispatch {
                 regcmd_tasks,
+                dpu_mode: Some(DpuMode::Dense),
                 retained_bindings,
                 scratch_buffers,
                 in_bo_handles: vec![input_scratch_handle, weight_scratch_handle, bias_handle],
@@ -1638,6 +1697,7 @@ unsafe extern "C" fn dispatch(
             let retained_bindings = unsafe { retain_direct_bindings(refs) };
             cb.ops.push(RecordedOp::Dispatch {
                 regcmd_tasks,
+                dpu_mode: None,
                 retained_bindings,
                 scratch_buffers: Vec::new(),
                 in_bo_handles: vec![handle(&refs[0])],

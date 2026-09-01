@@ -1,4 +1,7 @@
-//! Data-rich width sweep for the `nonalign_dma` dense-input alignment defect
+#![cfg(feature = "hardware-characterization")]
+
+//! Hardware characterization: data-rich width sweep for the `nonalign_dma`
+//! dense-input alignment defect
 //! `conv_dense_odd_in_first_probe_hw.rs` confirmed: on `run1`'s shape
 //! (Cin=3 dense, width=228, so `input_row_stride = 228*3*2 = 1368`, `mod 16
 //! == 8`), an odd `in_first` -- landing `CNA_FEATURE_DATA_ADDR` 8 bytes off

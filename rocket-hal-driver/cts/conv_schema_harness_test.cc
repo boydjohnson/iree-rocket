@@ -275,6 +275,55 @@ TEST(ConvSchemaDepthwiseTest, CrossesTheThirtyTwoChannelWeightGroupBoundary) {
   ExpectMatchesIndependentReference(result);
 }
 
+TEST(ConvSchemaTransitionTest,
+     DepthwiseToDenseQuiescesBeforeFeaturesZeroSizedDispatch) {
+  iree_hal_driver_t *driver = nullptr;
+  iree_hal_device_t *device = nullptr;
+  std::string error;
+  if (!CreateDevice(&driver, &device, &error)) {
+    GTEST_SKIP() << "Rocket device unavailable: " << error;
+  }
+
+  // This is the last case in the direct depthwise stride hardware suite.
+  // It leaves the DPU in its depthwise write-back configuration. The dense
+  // dispatch is VGG-19 features.0's physical 226x226 input / 224x224 output
+  // geometry, which exposed the RK3588 transition defect as zeroed c16+ data
+  // in its first output tile when submitted immediately after depthwise.
+  const Conv2dProblem depthwise{
+      /*input_height=*/32,   /*input_width=*/32,
+      /*input_channels=*/12, /*output_channels=*/12,
+      /*kernel_height=*/3,   /*kernel_width=*/3,
+      /*stride=*/4,          /*pad_top=*/1,
+      /*pad_left=*/1,        /*depthwise=*/true};
+  const Conv2dProblem features_zero{
+      /*input_height=*/226, /*input_width=*/226,
+      /*input_channels=*/3, /*output_channels=*/64,
+      /*kernel_height=*/3,  /*kernel_width=*/3,
+      /*stride=*/1,         /*pad_top=*/0,
+      /*pad_left=*/0};
+
+  Conv2dResult depthwise_result;
+  Conv2dResult features_zero_result;
+  try {
+    depthwise_result = RunFp16Conv2d(
+        device, depthwise, MakeInput(depthwise), MakeWeights(depthwise),
+        MakeBias(depthwise), BiasBindingMode::kExact);
+    features_zero_result =
+        RunFp16Conv2d(device, features_zero, MakeInput(features_zero),
+                      MakeWeights(features_zero), MakeBias(features_zero),
+                      BiasBindingMode::kExact);
+  } catch (...) {
+    iree_hal_device_release(device);
+    iree_hal_driver_release(driver);
+    throw;
+  }
+  iree_hal_device_release(device);
+  iree_hal_driver_release(driver);
+
+  ExpectMatchesIndependentReference(depthwise_result);
+  ExpectMatchesIndependentReference(features_zero_result);
+}
+
 INSTANTIATE_TEST_SUITE_P(
     KernelStrideAndPadding, ConvSchemaHarnessTest,
     ::testing::Values(

@@ -1,4 +1,7 @@
-//! Follow-up to `conv_dense_alignment_channel_sweep_hw.rs`, which broke the
+#![cfg(feature = "hardware-characterization")]
+
+//! Hardware characterization. Follow-up to
+//! `conv_dense_alignment_channel_sweep_hw.rs`, which broke the
 //! "byte offset `>= 8` is unsafe" model: `Cin=1` started failing at offset 4
 //! (not 8) with a corrupted-column count that grew *linearly with
 //! `in_first`* (1, 2, 3, 4, 5, 6 columns at `in_first` 2 through 7, no sign

@@ -1,4 +1,7 @@
-//! Follow-up to `conv_dense_shared_buffer_dispatch_hw.rs`, which found a
+#![cfg(feature = "hardware-characterization")]
+
+//! Hardware characterization. Follow-up to
+//! `conv_dense_shared_buffer_dispatch_hw.rs`, which found a
 //! clean, deterministic, 1-row shift on `run1`'s exact shape (Cin=3 dense,
 //! Cout=256, 3x3, 228x228 physically-padded input): every output row of
 //! `ConvPlan`'s sixth and last row tile (`out_first=189`) read back the

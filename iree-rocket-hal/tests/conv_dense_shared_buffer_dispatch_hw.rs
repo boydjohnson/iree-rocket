@@ -1,4 +1,4 @@
-//! Isolated hardware test: does `rocket-hal-driver`'s *actual* multi-tile
+//! HAL hardware regression: does `rocket-hal-driver`'s *actual* multi-tile
 //! dispatch pattern -- not `iree-rocket-hal`'s own `submit_jobs` -- survive
 //! a shape that needs several row tiles?
 //!
@@ -326,27 +326,6 @@ fn run(fd: i32, file: &std::fs::File) -> Result<(), Failure> {
         } else {
             Err(failure)
         }
-    }
-}
-
-/// `ConvPlan`'s tile boundaries for this exact shape, printed once so a
-/// failing row can be checked against them by eye without a separate dump
-/// tool. `run1` broke at exactly `out_first=189`, the start of tile 5 (the
-/// sixth and last).
-#[test]
-#[ignore = "needs /dev/accel/accel0 -- cross-compile for aarch64 and run on the RK3588 board"]
-fn print_tile_plan() {
-    let kernels: Kernels = [KERNEL, KERNEL];
-    let shape = Shape::with_out_channels(PADDED, PADDED, 1, CIN, COUT).with_padding([0, 0]);
-    let plan = ConvPlan::new(shape, kernels);
-    println!(
-        "banks {}/{} tiles={}",
-        plan.data_banks(),
-        plan.weight_banks(),
-        plan.tiles().len()
-    );
-    for (i, tile) in plan.tiles().iter().enumerate() {
-        println!("  tile {i}: {:?}", tile.rows);
     }
 }
 

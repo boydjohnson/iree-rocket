@@ -1,4 +1,7 @@
-//! Generalizes `conv_dense_alignment_width_sweep_hw.rs`'s finding --
+#![cfg(feature = "hardware-characterization")]
+
+//! Hardware characterization. Generalizes
+//! `conv_dense_alignment_width_sweep_hw.rs`'s finding --
 //! `nonalign_dma`'s dense-mode fetch corrupts leading pixels exactly when
 //! `(in_first * input_row_stride) % 16 >= 8`, confirmed at Cin=3/fp16 across
 //! every reachable byte offset -- across the other channel counts dense

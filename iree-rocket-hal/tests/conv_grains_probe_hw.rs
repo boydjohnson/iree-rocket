@@ -1,4 +1,7 @@
-//! Measures which `CNA_CONV_CON2.feature_grains` values the hardware accepts.
+#![cfg(feature = "hardware-characterization")]
+
+//! Hardware characterization: measures which `CNA_CONV_CON2.feature_grains`
+//! values the hardware accepts.
 //!
 //! This test is ignored on the development host because it needs the RK3588
 //! NPU device. Cross-compile it, copy the printed test binary to the board,
