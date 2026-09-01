@@ -123,6 +123,19 @@ func.func @dense_int8_3x3(%input: tensor<1x32x34x34xi8>, %filter: tensor<64x32x3
 // These two cases isolate the matcher's currently accepted Cout=512 edge.
 // Cin stays deliberately small so a failure characterizes the output-channel
 // limit rather than either of the independently measured Cin limits above.
+// Cout above the old 512 cap. 88->528 is a real MobileNetV2 shape (four of
+// them), and 768 is the corpus extent -- both were rejected outright before
+// MAX_OUTPUT_CHANNELS was raised, so this is the guard on that range.
+func.func @dense_int8_cout768_1x1(%input: tensor<1x88x32x32xi8>, %filter: tensor<768x88x1x1xi8>, %init: tensor<1x768x32x32xi32>) -> tensor<1x768x32x32xi32> {
+  %izp = arith.constant 7 : i32
+  %kzp = arith.constant 0 : i32
+  %0 = linalg.conv_2d_nchw_fchw_q
+      {dilations = dense<1> : tensor<2xi64>, strides = dense<1> : tensor<2xi64>}
+      ins(%input, %filter, %izp, %kzp : tensor<1x88x32x32xi8>, tensor<768x88x1x1xi8>, i32, i32)
+      outs(%init : tensor<1x768x32x32xi32>) -> tensor<1x768x32x32xi32>
+  return %0 : tensor<1x768x32x32xi32>
+}
+
 func.func @dense_int8_cout512_1x1(%input: tensor<1x16x32x32xi8>, %filter: tensor<512x16x1x1xi8>, %init: tensor<1x512x32x32xi32>) -> tensor<1x512x32x32xi32> {
   %izp = arith.constant 13 : i32
   %kzp = arith.constant 0 : i32
@@ -386,6 +399,12 @@ def write_compiled_fixture(work_dir: Path) -> None:
         np.zeros((1, 64, 32, 32), dtype=np.int32),
     )
 
+    np.save(work_dir / "dense_int8_cout768_1x1_input.npy", i8(1, 88, 32, 32))
+    np.save(work_dir / "dense_int8_cout768_1x1_kernel.npy", i8(768, 88, 1, 1))
+    np.save(
+        work_dir / "dense_int8_cout768_1x1_init.npy",
+        np.zeros((1, 768, 32, 32), dtype=np.int32),
+    )
     np.save(work_dir / "dense_int8_cout512_1x1_input.npy", i8(1, 16, 32, 32))
     np.save(work_dir / "dense_int8_cout512_1x1_kernel.npy", i8(512, 16, 1, 1))
     np.save(
@@ -680,6 +699,17 @@ def run_compiled_gate(
             "dense_int8_3x3",
             ("dense_int8_3x3_input.npy", "dense_int8_3x3_kernel.npy", "dense_int8_3x3_init.npy"),
             ("dense_int8_3x3_out_rocket.npy",),
+            0.0,
+            0.0,
+        ),
+        Case(
+            "dense_int8_cout768_1x1",
+            (
+                "dense_int8_cout768_1x1_input.npy",
+                "dense_int8_cout768_1x1_kernel.npy",
+                "dense_int8_cout768_1x1_init.npy",
+            ),
+            ("dense_int8_cout768_1x1_out_rocket.npy",),
             0.0,
             0.0,
         ),

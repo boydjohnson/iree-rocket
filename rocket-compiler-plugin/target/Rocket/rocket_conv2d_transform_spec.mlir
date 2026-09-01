@@ -3053,7 +3053,12 @@ module attributes {transform.with_named_sequence} {
     // Cin 353 is the first failing value in the fixed-geometry dense signed
     // boundary probe. See this section's doc comment.
     transform.iree.match.dim_bounds %input_value[3], umin = 1, umax = 352 : !transform.any_value
-    transform.iree.match.dim_bounds %filter_value[3], umin = 1, umax = 512 : !transform.any_value
+    // Cout 768, not 512: the expanded vendor corpus reproduces ConvPlan's
+    // CBUF split for every Cout up to 768 at every Cin this matcher admits
+    // (conv_vendor_fixture_channels_768.rs), and Cout 528/640/768 are
+    // hardware-exact at Cin 88/136/224/352. Cin stays at 352 -- the dense
+    // Cin >= 576 range is where ConvPlan still diverges from the vendor.
+    transform.iree.match.dim_bounds %filter_value[3], umin = 1, umax = 768 : !transform.any_value
     transform.yield %root : !transform.any_op
   }
 

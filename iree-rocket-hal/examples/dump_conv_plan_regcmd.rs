@@ -66,6 +66,12 @@ fn main() {
     let kernels = [kernel, kernel];
     let plan = ConvPlan::new(shape, kernels);
     eprintln!(
+        "shape: in_channels={} out_channels={} parity_padded_out_channels={:?}",
+        shape.in_channels,
+        shape.out_channels,
+        shape.parity_padded_shape(kernels).map(|s| s.out_channels),
+    );
+    eprintln!(
         "shape: padded_out_channels={} output_atom_bytes={} output_scratch_bytes={} tiles={}",
         shape.padded_out_channels(),
         shape.output_atom_bytes(),

@@ -216,22 +216,33 @@ pub const OUTPUT_CHANNELS: u32 = 8;
 /// Largest output-channel count this builder will program.
 ///
 /// `CNA_WEIGHT_SIZE2.weight_kernels` is 14 bits, so 16383 is the encodable
-/// ceiling. The corpus reached 512 in a single unsplit program, and nothing
-/// in it suggests a limit below the field width -- the vendor never splits
-/// the kernel set for capacity at any point measured. The cap is set at the
-/// measured extent rather than the encodable one, on the same principle as
-/// `MAX_INPUT_CHANNELS`.
+/// ceiling. This is set at the *measured* extent instead, on the same
+/// principle as `MAX_INPUT_CHANNELS`.
 ///
-/// Tried raising this to 960 (2026-08-28, MobileNetV2's Cin=Cout={576,960}
-/// depthwise 3x3 stages) and reverted -- see `MAX_INPUT_CHANNELS`'s doc
-/// comment for why: `tests/conv_vendor_fixture_channels_768.rs` caught a
-/// real `ConvPlan`-vs-vendor divergence for *dense* shapes in that same
-/// range, and this constant is shared between dense and depthwise
-/// construction. The depthwise-side validation
-/// (`iree-rocket-hal/tests/conv_mobilenetv2_depthwise_wide_hw.rs`) is still
-/// real and still passes; it just needs a depthwise-specific ceiling to be
-/// wired up safely, not this shared one.
-pub const MAX_OUTPUT_CHANNELS: u32 = 512;
+/// Raised 512 -> 768 (2026-09-01). Both halves of the expanded corpus
+/// reproduce `ConvPlan`'s CBUF split for every `Cout` up to 768 at every
+/// `Cin` at or below 512 -- 96 of 96 cases in
+/// `tests/conv_vendor_fixture_channels_768.rs`, with zero bank, tile or
+/// output-channel-group differences -- and dense int8 1x1 is hardware-exact
+/// at `Cout` 528/640/768 for `Cin` 88/136/224/352.
+///
+/// This is deliberately *not* symmetric with `MAX_INPUT_CHANNELS`, which
+/// stays at 512: the divergence that reverted the earlier 960 attempt is
+/// indexed by `Cin`, not `Cout`. Every `Cin >= 576` case in the corpus still
+/// disagrees (`ConvPlan` predicts 1/11 against the vendor's 6/6, 5/7, 4/8,
+/// 4/8), because `streamed_weight_bank_preference` exceeds the eleven
+/// grantable banks there and clamps, which makes
+/// `demand_based_cbuf_partition`'s "return the unused banks to data"
+/// correction test `weight_banks > streamed_preference` as `11 > 11` and
+/// never fire. The vendor's own split is periodic in `Cin` rather than
+/// monotonic, so it is bounding a resident coefficient working set that this
+/// formula grows without limit. Fixing that is what `Cin > 512` needs.
+///
+/// Depthwise is unaffected by this raise: it constructs with
+/// `out_channels == in_channels`, so `MAX_INPUT_CHANNELS` still binds it at
+/// 512. That is what makes raising this shared constant safe here, where the
+/// 960 attempt was not.
+pub const MAX_OUTPUT_CHANNELS: u32 = 768;
 
 /// `DPU_BS_MUL_CFG.bs_mul_shift_value`, and its negated twin
 /// `DPU_DATA_FORMAT.bs_mul_shift_value_neg`, in every quantized capture.
