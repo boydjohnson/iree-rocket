@@ -30,12 +30,23 @@
 // The set of ops handled here mirrors the replaced pass's `operation=conv`
 // list exactly, so this is a behaviour-preserving swap apart from the
 // attributes: matmuls are not demoted (they stay on the CPU untouched), and
-// neither are the depthwise convs. Demoting depthwise would be a real change
-// rather than a fix -- the depthwise matchers require f16/f16/f32, so f32
-// depthwise convs have always failed them and fallen through to the CPU, and
-// making them match would newly enable an offload path nothing has tested.
-// Anything left alone is safe for the same reason: an op that stays f32 fails
-// the matchers' typing and goes to the CPU.
+// neither are the depthwise convs.
+//
+// Depthwise was tried and reverted 2026-09-01. Demoting it does let three of
+// MobileNetV2's stride-2 depthwise convolutions match (18 -> 21 offloaded
+// dispatch sites), but the resulting model is *wrong*: max|err| 3.5 on the
+// logits with top-1 incorrect on every input measured, against 0.36 for the
+// same f16 demotion run entirely on the CPU. It is not the convolutions --
+// each of the three is exact to f16 epsilon in isolation, with and without a
+// tensor.pad producer, and two of them sharing one dynamic executable is
+// exact too. Bisecting by channel bound, offloading the 144-channel one
+// alone is fine and adding the 192-channel one breaks it, so it is an
+// interaction inside the full model that none of those isolations reproduce.
+// See also the HAL's own depthwise gaps, which predate this.
+//
+// Anything left alone is safe: an op that stays f32 fails the matchers' f16
+// typing and goes to the CPU, and RocketPromoteUnclaimedConvInputsPass gives
+// f32 back to anything demoted that the match loop then declines.
 
 #include "mlir/Dialect/Arith/IR/Arith.h"
 #include "mlir/Dialect/Linalg/IR/Linalg.h"
