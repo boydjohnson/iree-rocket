@@ -253,6 +253,16 @@ const CBUF_BANKS: u32 = 12;
 /// Bytes one CBUF bank holds: 256 entries of 128 bytes.
 const CBUF_BANK_BYTES: u32 = 256 * 128;
 
+/// Feature atoms the CBUF charges per `data_entries` entry.
+///
+/// The surface feature charge is counted in whole entries of four atoms, and
+/// it rounds *up*: a row whose atom count is not a multiple of four still
+/// occupies the whole final entry. `CNA_CBUF_CON1.data_entries` has always
+/// been programmed that way (see its `div_ceil` below); the residency bound
+/// in [`Shape::max_tile_input_rows_for_width_and_data_banks`] has to charge
+/// the same way or it over-commits the CBUF.
+const CBUF_ATOMS_PER_ENTRY: u32 = 4;
+
 /// Minimum safe `weight_banks` once a coefficient footprint is being
 /// starved (granted fewer banks than its own uncapped demand -- see
 /// `demand_based_cbuf_partition`), as a function of `weight_channels`
@@ -1535,8 +1545,20 @@ impl Shape {
             // in `data_bank_demand`: the two differ only at int8, and only
             // where the exact count is one short of a multiple of four.
             FeatureLayout::Surfaces => {
+                // Whole entries, not bare atoms. Charging the unrounded atom
+                // count lets a tile claim more rows than actually fit
+                // whenever a row's atoms are not a multiple of four, and the
+                // overflow lands on the tail of the tile's last input row --
+                // which shows up as the last output row of the tile being
+                // wrong from some column onwards, with every earlier row
+                // exact. Hardware-confirmed on 13 geometries either side of
+                // the boundary, including the two tightest (Cin=16 fp16,
+                // 115x113 fits at 5626 entries and passes, 113x113 wanted
+                // 5643 against the 5632 available and fails).
+                let entries_per_row =
+                    (input_width * self.cbuf_atoms()).div_ceil(CBUF_ATOMS_PER_ENTRY);
                 data_banks * CBUF_BANK_BYTES
-                    / (input_width * self.cbuf_atoms() * FEATURE_ATOM_BYTES)
+                    / (entries_per_row * CBUF_ATOMS_PER_ENTRY * FEATURE_ATOM_BYTES)
             }
         };
         capacity.min(self.max_data_entries() / charged_width).max(1)
@@ -3207,7 +3229,7 @@ fn conv_2d_tile_program(
             // field mask it to 28 bits below. This is the vendor encoding,
             // not an attempt to use a negative byte stride in host memory.
             full_width.wrapping_mul(height.wrapping_sub(4)) & 0x0fff_ffff,
-            (input_width * shape.cbuf_atoms()).div_ceil(4),
+            (input_width * shape.cbuf_atoms()).div_ceil(CBUF_ATOMS_PER_ENTRY),
         ),
         // Every captured width-partitioned task enables grouped-line mode
         // below and switches to these strides. `surf_stride` is the full
@@ -3216,7 +3238,7 @@ fn conv_2d_tile_program(
         (FeatureLayout::Surfaces, true) => (
             full_width,
             full_width * height - input_width,
-            (input_width * shape.cbuf_atoms()).div_ceil(4),
+            (input_width * shape.cbuf_atoms()).div_ceil(CBUF_ATOMS_PER_ENTRY),
         ),
     };
 

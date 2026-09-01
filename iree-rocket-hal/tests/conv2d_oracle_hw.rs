@@ -795,12 +795,66 @@ fn int8_accumulator_k1_cin_boundary_cases() -> Vec<Conv2dCase> {
 /// channels. Cin 1/2/4 do not fill one; 8/16 do. Run at stride 1 so the
 /// window-parity axis above is held fixed.
 ///
+/// # A known flake in this list
+///
+/// `34x34 Cin=8` intermittently fails when the matrix runs in order, and
+/// passes every time under `ROCKET_PROBE_ONLY`. That is the per-process
+/// contamination `run_hardware_case_matrix` documents, not a verdict on the
+/// shape: it flakes identically with the CBUF residency fix reverted, and its
+/// plan (one tile, 34 rows) is unaffected by anything here. Isolate before
+/// believing a failure on this row.
+///
 /// `OraclePattern::Dense` is the point of all of these: every tap and channel
 /// carries a distinct nonzero weight, so a wrong-pixel or wrong-channel read
 /// changes the result instead of cancelling out. Inputs are in [-3, 3] and
 /// weights in {-2, -1, 1, 2}, so the largest accumulator any of these can
 /// produce is `6 * 16 * 9 = 864`, well inside the 2048 where fp16 still
 /// represents every integer exactly and the oracle's zero tolerance holds.
+/// Geometries either side of the CBUF residency boundary.
+///
+/// The surface feature charge is counted in whole `data_entries` entries of
+/// four atoms and rounds *up*, so a row whose atom count is not a multiple of
+/// four still occupies its whole final entry.
+/// `Shape::max_tile_input_rows_for_width_and_data_banks` used to charge bare
+/// atoms instead, letting a tile claim rows that do not fit. The overflow
+/// lands on the tail of the tile's last input row, which surfaces as the last
+/// output row of that tile being wrong from some column onwards while every
+/// earlier row is exact -- a single wrong row in an otherwise perfect result,
+/// which is exactly the shape of failure a coarse tolerance check misses.
+///
+/// At Cin=16 fp16 a row is two atoms per pixel, so odd widths are the ones
+/// that round up. The pairs below sit either side of the bound at three
+/// widths, and the height sweep walks one width across it a row at a time:
+/// 113x113 wanted 5643 entries against the 5632 available, while 115x113
+/// fits at 5626 and has to keep working.
+fn cbuf_residency_boundary_cases() -> Vec<Conv2dCase> {
+    let dense = |width: u32, height: u32| Conv2dCase {
+        width,
+        height,
+        cin: 16,
+        cout: 16,
+        kernel: [3, 3],
+        stride: 2,
+        padding: [0, 0],
+        precision: OraclePrecision::Fp16,
+        pattern: OraclePattern::Dense { phase: 0 },
+    };
+
+    let mut cases = Vec::new();
+    // Widths that round up (odd) against their even neighbours, at a height
+    // that forces a multi-tile split.
+    for width in [109u32, 111, 112, 113, 114, 115, 117, 119] {
+        cases.push(dense(width, 113));
+    }
+    // One width walked across the bound by height alone. Every one of these
+    // is a single tile, which is what rules out tile *splitting* as the
+    // cause: 113x99 is one tile that does not fit.
+    for height in [91u32, 93, 95, 97, 99] {
+        cases.push(dense(113, height));
+    }
+    cases
+}
+
 fn dense_geometry_regression_cases() -> Vec<Conv2dCase> {
     let mut cases = Vec::new();
     let dense = |width: u32, height: u32, cin: u32, kernel: usize, stride: u32| Conv2dCase {
@@ -1724,6 +1778,22 @@ fn dense_geometry_regression_is_planable_and_gap_free() {
     let cases = dense_geometry_regression_cases();
     assert_eq!(cases.len(), 22);
     assert_planable_and_gap_free(cases);
+}
+
+#[test]
+fn cbuf_residency_boundary_is_planable_and_gap_free() {
+    let cases = cbuf_residency_boundary_cases();
+    assert_eq!(cases.len(), 13);
+    assert_planable_and_gap_free(cases);
+}
+
+#[test]
+#[ignore = "needs /dev/accel/accel0 -- CBUF entry-rounding residency boundary"]
+fn cbuf_residency_boundary_matches_oracle() {
+    run_hardware_case_matrix(
+        "CBUF entry-rounding residency boundary",
+        cbuf_residency_boundary_cases(),
+    );
 }
 
 #[test]
