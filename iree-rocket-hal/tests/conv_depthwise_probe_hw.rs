@@ -17,6 +17,8 @@
 //! What that run could not settle is the row `stride`: at Cin 8 the real and
 //! padded channel counts are both 8. `depthwise_weight_layout_probe_with_channel_padding`
 //! is the case that separates them.
+
+#![cfg(feature = "hardware-characterization")]
 //!
 //! # Method
 //!

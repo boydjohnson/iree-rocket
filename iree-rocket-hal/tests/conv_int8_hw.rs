@@ -637,6 +637,7 @@ fn int8_single_output_channel_probe() {
 /// `Cout` 8 is the control. It never showed the sensitivity, so its rows
 /// should be stable at every prefix, including the shortest.
 #[test]
+#[cfg(feature = "hardware-characterization")]
 #[ignore = "needs /dev/accel/accel0 -- cross-compile for aarch64 and run on the RK3588 board"]
 fn int8_bs_read_extent_probe() {
     const REPEATS: usize = 4;
