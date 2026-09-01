@@ -455,66 +455,12 @@ fn cartesian_cases() -> Vec<Conv2dCase> {
     cases
 }
 
-/// Focused boundaries around the two output-channel-group cutoffs found by
-/// the Cartesian sweep, rather than the sweep's coarse 64/128/256/512 steps.
+/// Confirms the mechanism behind an apparent output-channel-group cutoff
+/// observed during the original Cartesian investigation.
 ///
-/// K3/P1 at 28x28 with small Cin fails starting at output channel 224:
-/// channels 0-223 are correct and 224 onward reads zero at both Cout 256 and
-/// 512. Cout 224 itself is untested by the Cartesian grid -- it may be the
-/// largest count one CNA task can cover, with 225 the first count that needs
-/// a second, currently-unprogrammed output-channel-group task. Cout 256 is
-/// repeated here (already covered by the Cartesian grid) so 224/225/256
-/// print together as one boundary rather than requiring a second test run
-/// to line up against.
-///
-/// Separately, fp16 K1/P0 at 28x28 with Cin 384 or 448 fails starting at
-/// output channel 32: channels 0-31 are correct and 32 onward reads zero at
-/// Cout 512. The same question applies at a different cutoff: is 32 the
-/// largest single-task count, with 33 the first that needs a second task?
-/// No int8 K1 case failed, so this side stays fp16-only.
-fn output_channel_group_boundary_cases() -> Vec<Conv2dCase> {
-    let mut cases = Vec::new();
-    for precision in [OraclePrecision::Fp16, OraclePrecision::Int8] {
-        for cin in [3u32, 4, 5] {
-            for cout in [224u32, 225, 256] {
-                cases.push(Conv2dCase {
-                    width: 28,
-                    height: 28,
-                    cin,
-                    cout,
-                    kernel: [3, 3],
-                    stride: 1,
-                    padding: [1, 1],
-                    precision,
-                    pattern: OraclePattern::Counting,
-                });
-            }
-        }
-    }
-    for cin in [384u32, 448] {
-        for cout in [32u32, 33, 512] {
-            cases.push(Conv2dCase {
-                width: 28,
-                height: 28,
-                cin,
-                cout,
-                kernel: [1, 1],
-                stride: 1,
-                padding: [0, 0],
-                precision: OraclePrecision::Fp16,
-                pattern: OraclePattern::Counting,
-            });
-        }
-    }
-    cases
-}
-
-/// Confirms the mechanism behind `output_channel_group_boundary_cases`,
-/// rather than just its location.
-///
-/// That probe found every one of 224/225/32/33 exact -- the cutoff is not a
-/// fixed per-task channel count, and 256/512 failing is not evidence of
-/// missing output-channel-group task splitting after all. Host-side
+/// Focused measurements found every one of 224/225/32/33 exact -- the cutoff
+/// is not a fixed per-task channel count, and 256/512 failing is not evidence
+/// of missing output-channel-group task splitting after all. Host-side
 /// `ConvPlan::data_banks`/`weight_banks` explains it instead:
 /// `demand_based_cbuf_partition`'s starved-to-`streamed_preference` branch
 /// (`conv.rs` around line 1183) returns as soon as coefficient demand
@@ -1136,13 +1082,6 @@ fn cartesian_matrix_is_planable_and_gap_free() {
 }
 
 #[test]
-fn output_channel_group_boundary_matrix_is_planable_and_gap_free() {
-    let cases = output_channel_group_boundary_cases();
-    assert_eq!(cases.len(), 24);
-    assert_planable_and_gap_free(cases);
-}
-
-#[test]
 fn bank_partition_flip_boundary_matrix_is_planable_and_gap_free() {
     let cases = bank_partition_flip_boundary_cases();
     assert_eq!(cases.len(), 16);
@@ -1443,14 +1382,6 @@ fn run_hardware_case_matrix(title: &str, cases: Vec<Conv2dCase>) {
         failures.len(),
     );
 }
-#[test]
-#[ignore = "needs /dev/accel/accel0 -- locates the two output-channel-group cutoffs exactly"]
-fn output_channel_group_boundary_probe_runs_every_case_before_failing() {
-    let cases = output_channel_group_boundary_cases();
-    assert_eq!(cases.len(), 24);
-    run_hardware_case_matrix("output-channel-group boundary probe", cases);
-}
-
 #[cfg(feature = "hardware-characterization")]
 #[test]
 #[ignore = "needs /dev/accel/accel0 -- confirms failure starts exactly at ConvPlan's bank-partition flip"]
