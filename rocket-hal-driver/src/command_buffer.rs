@@ -235,6 +235,11 @@ pub enum RecordedOp {
     },
     Dispatch {
         regcmd_tasks: Vec<Vec<RegCmd>>,
+        /// The DPU execution mode this dispatch programs. `None` denotes a
+        /// non-DPU dispatch such as pooling. Kept with the recorded work so
+        /// `device::queue_execute` can apply hardware transition rules in
+        /// actual submission order.
+        dpu_mode: Option<DpuMode>,
         /// Every direct binding supplied to the dispatch, retained exactly
         /// once at record time as required by the IREE HAL command-buffer
         /// contract. The command buffer releases them from `destroy()`.
@@ -277,12 +282,24 @@ pub enum RecordedOp {
     },
 }
 
+/// DPU state programmed by a dispatch.
+///
+/// Depthwise and dense convolution use distinct DPU write-back modes. The
+/// device queue uses this to quiesce the hardware at the one empirically
+/// unsafe transition, after a depthwise completion and before a dense submit.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum DpuMode {
+    Dense,
+    Depthwise,
+}
+
 /// What `apply_ops` hands back for each recorded `dispatch`, in call order --
 /// the regcmd program plus the real BO handles it touches, so
 /// `device::queue_execute` can build a correct `drm_rocket_job` instead of
 /// submitting with only the regcmd buffer's own handle listed.
 pub struct DispatchJob {
     pub regcmd_tasks: &'static [Vec<RegCmd>],
+    pub dpu_mode: Option<DpuMode>,
     pub in_bo_handles: &'static [u32],
     pub out_bo_handles: &'static [u32],
     pub output_compaction: Option<OutputCompaction>,
@@ -429,6 +446,7 @@ pub unsafe fn apply_ops(
             }
             RecordedOp::Dispatch {
                 regcmd_tasks,
+                dpu_mode,
                 in_bo_handles,
                 out_bo_handles,
                 input_packing,
@@ -676,6 +694,7 @@ pub unsafe fn apply_ops(
                 }
                 dispatch_jobs.push(DispatchJob {
                     regcmd_tasks: regcmd_tasks.as_slice(),
+                    dpu_mode: *dpu_mode,
                     in_bo_handles: in_bo_handles.as_slice(),
                     out_bo_handles: out_bo_handles.as_slice(),
                     output_compaction: output_compaction.clone(),
@@ -1372,6 +1391,11 @@ unsafe extern "C" fn dispatch(
             let retained_bindings = unsafe { retain_direct_bindings(refs) };
             cb.ops.push(RecordedOp::Dispatch {
                 regcmd_tasks,
+                dpu_mode: Some(if shape.depthwise {
+                    DpuMode::Depthwise
+                } else {
+                    DpuMode::Dense
+                }),
                 retained_bindings,
                 scratch_buffers,
                 in_bo_handles: vec![input_handle, weights_handle, bias_handle],
@@ -1641,6 +1665,7 @@ unsafe extern "C" fn dispatch(
             }
             cb.ops.push(RecordedOp::Dispatch {
                 regcmd_tasks,
+                dpu_mode: Some(DpuMode::Dense),
                 retained_bindings,
                 scratch_buffers,
                 in_bo_handles: vec![input_scratch_handle, weight_scratch_handle, bias_handle],
@@ -1672,6 +1697,7 @@ unsafe extern "C" fn dispatch(
             let retained_bindings = unsafe { retain_direct_bindings(refs) };
             cb.ops.push(RecordedOp::Dispatch {
                 regcmd_tasks,
+                dpu_mode: None,
                 retained_bindings,
                 scratch_buffers: Vec::new(),
                 in_bo_handles: vec![handle(&refs[0])],

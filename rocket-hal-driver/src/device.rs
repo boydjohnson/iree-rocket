@@ -8,7 +8,7 @@
 //! as the right model for a driver whose only completion signal is a
 //! blocking ioctl rather than a native timeline/fence primitive.
 
-use std::os::fd::AsRawFd;
+use std::{os::fd::AsRawFd, sync::Mutex, time::Duration};
 
 use crate::{
     bindings::{
@@ -112,6 +112,30 @@ pub struct RocketDevice {
     /// driver today needs cross-device causal tracking. Revisit if/when
     /// multi-device topologies or real frontier-based sync matter.
     pub topology_info: crate::bindings::iree_hal_device_topology_info_t,
+    /// Last DPU mode that completed on this physical device. This is guarded
+    /// across queue executions because the hardware is shared even when IREE
+    /// invokes queue callbacks from different proactor threads.
+    last_dpu_mode: Mutex<Option<crate::command_buffer::DpuMode>>,
+}
+
+// `PREP_BO` observes the output fence, but the RK3588 DPU can still retain
+// depthwise write-back state briefly after that fence has signaled. An
+// immediately following dense job then intermittently writes only its first
+// 16 channels. A 1 ms dwell is hardware-validated; it is deliberately
+// restricted to this mode transition rather than added to all dispatches.
+const DEPTHWISE_TO_DENSE_QUIESCENCE: Duration = Duration::from_millis(1);
+
+fn needs_depthwise_to_dense_quiescence(
+    last: Option<crate::command_buffer::DpuMode>,
+    next: Option<crate::command_buffer::DpuMode>,
+) -> bool {
+    matches!(
+        (last, next),
+        (
+            Some(crate::command_buffer::DpuMode::Depthwise),
+            Some(crate::command_buffer::DpuMode::Dense)
+        )
+    )
 }
 
 unsafe fn cast(device: *mut iree_hal_device_t) -> *mut RocketDevice {
@@ -348,6 +372,7 @@ pub unsafe fn create(
         proactor_pool,
         proactor,
         topology_info: unsafe { std::mem::zeroed() },
+        last_dpu_mode: Mutex::new(None),
     });
     let device_ptr = Box::into_raw(device) as *mut iree_hal_device_t;
     // Chicken-and-egg: the allocator needs to know its owning device (see
@@ -1149,9 +1174,33 @@ fn compact_tiled_accumulator_output(
 }
 
 #[cfg(test)]
-mod compaction_tests {
-    use super::{compact_atomic_output, compact_tiled_accumulator_output};
+mod device_tests {
+    use super::{
+        compact_atomic_output, compact_tiled_accumulator_output,
+        needs_depthwise_to_dense_quiescence,
+    };
+    use crate::command_buffer::DpuMode;
     use iree_rocket_hal::rocket::conv::AccumulatorOutputTile;
+
+    #[test]
+    fn quiesces_only_the_completed_depthwise_to_dense_transition() {
+        assert!(needs_depthwise_to_dense_quiescence(
+            Some(DpuMode::Depthwise),
+            Some(DpuMode::Dense),
+        ));
+        assert!(!needs_depthwise_to_dense_quiescence(
+            None,
+            Some(DpuMode::Dense),
+        ));
+        assert!(!needs_depthwise_to_dense_quiescence(
+            Some(DpuMode::Dense),
+            Some(DpuMode::Depthwise),
+        ));
+        assert!(!needs_depthwise_to_dense_quiescence(
+            Some(DpuMode::Depthwise),
+            None,
+        ));
+    }
 
     #[test]
     fn compacts_16_byte_slots_into_dense_output() {
@@ -1425,6 +1474,14 @@ unsafe extern "C" fn queue_execute(
                 }
             };
             let result = 'result: {
+                // The device has one DPU even if IREE calls this callback
+                // concurrently. Keep its mode history and the corresponding
+                // hardware submissions serialized as one critical section.
+                let mut last_dpu_mode = d
+                    .last_dpu_mode
+                    .lock()
+                    .unwrap_or_else(|poisoned| poisoned.into_inner());
+
                 // Each recorded dispatch is submitted and fenced as its own
                 // independent hardware job, in call order -- same reasoning
                 // as one dispatch's own CBUF-height-split task list just
@@ -1434,6 +1491,9 @@ unsafe extern "C" fn queue_execute(
                 // its own weights/CBUF state, so no state needs to survive
                 // between jobs.
                 for job in cmds.iter().filter(|j| !j.regcmd_tasks.is_empty()) {
+                    if needs_depthwise_to_dense_quiescence(*last_dpu_mode, job.dpu_mode) {
+                        std::thread::sleep(DEPTHWISE_TO_DENSE_QUIESCENCE);
+                    }
                     let fd = d.file.as_raw_fd();
                     let regcmd_tasks = job.regcmd_tasks;
                     if regcmd_tasks.iter().any(Vec::is_empty) {
@@ -1544,6 +1604,14 @@ unsafe extern "C" fn queue_execute(
                                 );
                             }
                         }
+                    }
+
+                    // `PREP_BO` above confirmed that every split completed;
+                    // only now is this DPU mode the state a later dispatch
+                    // must transition away from. Pooling is not a DPU mode
+                    // and intentionally leaves the last DPU state intact.
+                    if let Some(mode) = job.dpu_mode {
+                        *last_dpu_mode = Some(mode);
                     }
 
                     // Conv2d only (see `command_buffer::OutputCompaction`'s
