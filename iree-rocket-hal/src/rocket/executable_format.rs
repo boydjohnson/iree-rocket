@@ -282,10 +282,10 @@ pub fn decode_conv_shape_v1(payload: &[u8]) -> Result<(conv::Shape, Kernels), De
 /// padding fitting the CNA's 4-bit fields, CBUF/kernel-plan capacity, ...),
 /// this rebuilds the shape through the exact same constructor chain a real
 /// caller would use (`Shape::with_precision`/`with_padding`/`with_depthwise`)
-/// and trial-plans it, catching whatever that chain's own `assert!`s reject.
-/// This is a single source of truth for those bounds -- there is exactly
-/// one place each one lives, in `conv.rs` itself -- rather than two copies
-/// that can drift.
+/// derives its physical accumulator shape, and trial-plans that shape,
+/// catching whatever that chain's own `assert!`s reject. This is a single
+/// source of truth for those bounds -- there is exactly one place each one
+/// lives, in `conv.rs` itself -- rather than two copies that can drift.
 pub fn validate_conv_shape(shape: &conv::Shape, kernels: Kernels) -> Result<(), &'static str> {
     std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
         let mut rebuilt = conv::Shape::with_precision(
@@ -303,7 +303,10 @@ pub fn validate_conv_shape(shape: &conv::Shape, kernels: Kernels) -> Result<(), 
         if shape.depthwise {
             rebuilt = rebuilt.with_depthwise();
         }
-        let _ = conv::ConvPlan::new(rebuilt, kernels);
+        let programmed = rebuilt
+            .parity_padded_shape(kernels)
+            .expect("unsupported accumulator output geometry");
+        let _ = conv::ConvPlan::new(programmed, kernels);
     }))
     .map_err(|_| "convolution shape is not supported by the capture-derived planner")
 }
@@ -458,6 +461,34 @@ mod tests {
     fn validate_accepts_known_good_shape() {
         let (shape, kernels) = known_good_shape();
         assert_eq!(validate_conv_shape(&shape, kernels), Ok(()));
+    }
+
+    #[test]
+    fn validate_rejects_measured_bad_accumulator_k3_extent() {
+        let quantization = Quantization {
+            input_zero_point: 0,
+            output_zero_point: 0,
+            weight_zero_point: 0,
+            input_scale: 1.0,
+            weights_scale: 1.0,
+            multiplier: Multiplier::from_ratio(1.0),
+        };
+        let bad =
+            conv::Shape::with_precision(3, 3, 1, 8, 32, Precision::Int8Accumulator(quantization));
+        assert!(validate_conv_shape(&bad, [3, 3]).is_err());
+
+        let cropped =
+            conv::Shape::with_precision(5, 5, 1, 8, 32, Precision::Int8Accumulator(quantization))
+                .with_padding([0, 0]);
+        assert_eq!(
+            (cropped.output_width([3, 3]), cropped.output_height([3, 3])),
+            (3, 3)
+        );
+        assert!(validate_conv_shape(&cropped, [3, 3]).is_err());
+
+        let control =
+            conv::Shape::with_precision(5, 5, 1, 8, 32, Precision::Int8Accumulator(quantization));
+        assert_eq!(validate_conv_shape(&control, [3, 3]), Ok(()));
     }
 
     #[test]

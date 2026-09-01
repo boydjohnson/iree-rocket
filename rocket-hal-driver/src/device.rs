@@ -1221,6 +1221,39 @@ mod compaction_tests {
     }
 
     #[test]
+    fn accumulator_compaction_discards_programmed_parity_channels() {
+        const PIXELS: usize = 2;
+        const BLOCK_BYTES: usize = 32 * size_of::<i32>();
+        const LOGICAL_BYTES_PER_PIXEL: usize = BLOCK_BYTES;
+
+        // Programmed Cout=64 has two surfaces. Logical Cout=32 exposes only
+        // the first; the second is the zero-coefficient parity surface.
+        let mut scratch = vec![0xeeu8; PIXELS * 2 * BLOCK_BYTES];
+        scratch[..PIXELS * BLOCK_BYTES].fill(0x5a);
+        let tile = AccumulatorOutputTile {
+            scratch_offset: 0,
+            scratch_bytes: scratch.len(),
+            output_row: 0,
+            output_column: 0,
+            output_rows: 1,
+            output_columns: PIXELS,
+        };
+        let mut dst = vec![0u8; PIXELS * LOGICAL_BYTES_PER_PIXEL];
+
+        let written = compact_tiled_accumulator_output(
+            &scratch,
+            &[tile],
+            PIXELS,
+            LOGICAL_BYTES_PER_PIXEL,
+            BLOCK_BYTES,
+            &mut dst,
+        );
+
+        assert_eq!(written, dst.len());
+        assert!(dst.iter().all(|&byte| byte == 0x5a));
+    }
+
+    #[test]
     fn compacts_independently_staged_accumulator_tiles() {
         const WIDTH: usize = 4;
         const HEIGHT: usize = 2;

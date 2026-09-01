@@ -272,16 +272,6 @@ pub fn pack_hwcf_to_rocket_weights(
     )
 }
 
-/// Packs a quantized int8 HWCF filter and fills physical input-channel
-/// padding with each output channel's weight zero point.
-///
-/// The live bytes in `dense` are raw quantized coefficients and are copied
-/// unchanged. A padded input lane participates in the hardware dot product,
-/// so its neutral value is `weight_zero_points[output_channel]`, not
-/// necessarily zero. The matching BS constant is `-weight_zero_point`; see
-/// [`crate::rocket::conv::BsEntry::constant`]. A programmed odd-Cout padding
-/// kernel remains all zero because it has no quantization parameters and is
-/// never exposed as a logical output channel.
 /// Packs HWCF coefficients for a *wider* programmed output-channel count
 /// than the filter logically has, zero-filling the surplus channels.
 ///
@@ -317,6 +307,14 @@ pub fn pack_hwcf_to_rocket_weights_padded(
     )
 }
 
+/// Packs a quantized int8 HWCF filter and fills physical input-channel
+/// padding with each output channel's weight zero point.
+///
+/// The live bytes in `dense` are raw quantized coefficients and are copied
+/// unchanged. A padded input lane participates in the hardware dot product,
+/// so its neutral value is `weight_zero_points[output_channel]`, not
+/// necessarily zero. The matching BS constant is `-weight_zero_point`; see
+/// [`crate::rocket::conv::BsEntry::constant`].
 pub fn pack_hwcf_to_rocket_weights_affine_i8(
     dense: &[u8],
     filter_height: usize,
@@ -388,9 +386,9 @@ fn pack_hwcf_to_rocket_weights_impl(
     };
     let padded_input_channels = padded_input_atoms * channels_per_atom;
     let programmed_output_channels = if element_size == 1 {
-        output_channels.next_multiple_of(2)
+        padded_output_channels.next_multiple_of(2)
     } else {
-        output_channels
+        padded_output_channels
     };
     let input_groups = padded_input_channels.div_ceil(WEIGHT_INPUT_GROUP_CHANNELS);
     let output_blocks = programmed_output_channels.div_ceil(output_block_channels);

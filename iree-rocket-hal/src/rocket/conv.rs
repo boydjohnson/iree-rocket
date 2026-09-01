@@ -657,11 +657,13 @@ pub struct Shape {
     pub stride: u32,
     /// Real input channels, before any padding.
     pub in_channels: u32,
-    /// Real output channels, before any padding. Programmed directly into
-    /// `CNA_WEIGHT_SIZE2.weight_kernels` and
+    /// Real output channels, before any padding. Normally programmed directly
+    /// into `CNA_WEIGHT_SIZE2.weight_kernels` and
     /// `DPU_DATA_CUBE_CHANNEL.orig_channel` with no rounding at all: the
     /// corpus confirms 23 distinct values from 1 to 512, including 9, 14,
-    /// 20, 28, 40, 56 and 72.
+    /// 20, 28, 40, 56 and 72. The driver plans a copied, physically widened
+    /// shape for the accumulator parity workaround; this logical shape and
+    /// its ABI buffer sizes do not change.
     pub out_channels: u32,
     /// Element precision, and for int8 the quantization parameters with it.
     pub precision: Precision,
@@ -1011,6 +1013,36 @@ impl Shape {
     /// Whether [`Shape::parity_padded_out_channels`] widens this shape.
     pub fn needs_output_parity_padding(&self, kernels: Kernels) -> bool {
         self.parity_padded_out_channels(kernels) != self.out_channels
+    }
+
+    /// Returns the physical shape that should be handed to the planner.
+    ///
+    /// `self` remains the logical ABI shape. Dense accumulator convolutions
+    /// may need a wider programmed `Cout` to satisfy the DPU's even committed
+    /// block rule; all other fields are preserved. The driver packs zero
+    /// coefficients for the surplus channels and discards those channels
+    /// while compacting the result back to the logical output buffer.
+    ///
+    /// A 3x3 accumulator output extent with a 3x3 kernel is refused. Its
+    /// parity-padded form failed repeatably on RK3588 even with ordinary,
+    /// nonzero surplus coefficients, so zero padding cannot make that
+    /// physical configuration safe.
+    pub fn parity_padded_shape(&self, kernels: Kernels) -> Result<Shape, &'static str> {
+        if self.precision.writes_accumulators()
+            && !self.depthwise
+            && kernels == [3, 3]
+            && self.output_width(kernels) == 3
+            && self.output_height(kernels) == 3
+        {
+            return Err(
+                "dense int8 accumulator convolution with 3x3 output and a 3x3 kernel is not supported",
+            );
+        }
+
+        Ok(Shape {
+            out_channels: self.parity_padded_out_channels(kernels),
+            ..*self
+        })
     }
 
     /// Conservative physical output allocation for this convolution, in
@@ -5207,6 +5239,45 @@ mod tests {
 
         let fp16 = Shape::with_precision(3, 3, 1, 8, 32, Precision::Fp16);
         assert_eq!(fp16.parity_padded_out_channels([1, 1]), 32);
+    }
+
+    #[test]
+    fn parity_padded_shape_is_physical_only_and_rejects_the_bad_k3_extent() {
+        let accumulator = |width: u32, height: u32| {
+            Shape::with_precision(
+                width,
+                height,
+                1,
+                8,
+                32,
+                Precision::Int8Accumulator(Quantization {
+                    input_zero_point: 0,
+                    output_zero_point: 0,
+                    weight_zero_point: 0,
+                    ..quantization()
+                }),
+            )
+        };
+
+        let logical = accumulator(9, 7);
+        let programmed = logical.parity_padded_shape([1, 1]).unwrap();
+        assert_eq!(logical.out_channels, 32);
+        assert_eq!(programmed.out_channels, 64);
+        assert_eq!(programmed.width, logical.width);
+        assert_eq!(programmed.height, logical.height);
+        assert_eq!(programmed.in_channels, logical.in_channels);
+
+        assert!(accumulator(3, 3).parity_padded_shape([3, 3]).is_err());
+        assert!(accumulator(5, 5).parity_padded_shape([3, 3]).is_ok());
+        assert!(
+            accumulator(5, 5)
+                .with_padding([0, 0])
+                .parity_padded_shape([3, 3])
+                .is_err()
+        );
+
+        let fp16 = Shape::with_precision(3, 3, 1, 8, 32, Precision::Fp16);
+        assert!(fp16.parity_padded_shape([3, 3]).is_ok());
     }
 
     #[test]
