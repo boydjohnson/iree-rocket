@@ -45,6 +45,26 @@ func.func @main(%input: tensor<1x32x32x512xf16>, %filter: tensor<3x3x512x512xf16
   return %0 : tensor<1x30x30x512xf32>
 }
 
+// Cin=3 exercises the dense (Cin<=4) ARGB feature path -- the only one that
+// hands an IREE buffer to the NPU directly instead of staging it through
+// driver-owned scratch, and so the only one needing its own
+// sync-for-device before the dispatch reads it.
+//
+// Deliberately written as f32 NCHW, unlike the f16 NHWC cases above. The
+// spec's channels-last and f16-demotion passes then put a CPU dispatch
+// immediately before the Rocket one, so the feature buffer the NPU reads was
+// just written by the CPU and is still dirty in cache. That producer edge is
+// the trigger: the same convolution taking its input straight from an entry
+// point argument passes either way, because IREE's upload path syncs it. It
+// is also the real network-stem shape.
+func.func @dense_cin3(%input: tensor<1x3x34x34xf32>, %filter: tensor<16x3x3x3xf32>, %init: tensor<1x16x32x32xf32>) -> tensor<1x16x32x32xf32> {
+  %0 = linalg.conv_2d_nchw_fchw
+      {dilations = dense<1> : tensor<2xi64>, strides = dense<1> : tensor<2xi64>}
+      ins(%input, %filter : tensor<1x3x34x34xf32>, tensor<16x3x3x3xf32>)
+      outs(%init : tensor<1x16x32x32xf32>) -> tensor<1x16x32x32xf32>
+  return %0 : tensor<1x16x32x32xf32>
+}
+
 func.func @depthwise(%input: tensor<1x8x8x40xf16>, %filter: tensor<3x3x40xf16>, %init: tensor<1x6x6x40xf32>) -> tensor<1x6x6x40xf32> {
   %0 = linalg.depthwise_conv_2d_nhwc_hwc
       {dilations = dense<1> : tensor<2xi64>, strides = dense<1> : tensor<2xi64>}
@@ -235,6 +255,21 @@ def write_compiled_fixture(work_dir: Path) -> None:
     ).astype(np.float16)
     np.save(work_dir / "input.npy", input_tensor)
     np.save(work_dir / "init.npy", np.zeros((1, 30, 30, 512), dtype=np.float32))
+
+    # Non-uniform across x, y *and* channel: a dense-path addressing or
+    # staleness fault displaces values rather than changing their count, so
+    # uniform data cannot see it.
+    np.save(
+        work_dir / "dense_cin3_kernel.npy",
+        rng.uniform(-0.5, 0.5, size=(16, 3, 3, 3)).astype(np.float32),
+    )
+    np.save(
+        work_dir / "dense_cin3_input.npy",
+        rng.uniform(-0.25, 0.25, size=(1, 3, 34, 34)).astype(np.float32),
+    )
+    np.save(
+        work_dir / "dense_cin3_init.npy", np.zeros((1, 16, 32, 32), dtype=np.float32)
+    )
 
     depthwise_weights = rng.uniform(-0.5, 0.5, size=(3, 3, 40)).astype(np.float16)
     depthwise_input = rng.uniform(-0.25, 0.25, size=(1, 8, 8, 40)).astype(np.float16)
@@ -502,6 +537,15 @@ def run_compiled_gate(
             "dense_int8_out_rocket.npy",
             0.0,
             0.0,
+        ),
+        (
+            "dense_cin3",
+            "dense_cin3_input.npy",
+            "dense_cin3_kernel.npy",
+            "dense_cin3_init.npy",
+            "dense_cin3_out_rocket.npy",
+            1e-2,
+            1e-2,
         ),
         (
             "dense_int8_3x3",

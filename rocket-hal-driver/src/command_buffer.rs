@@ -88,7 +88,7 @@ use crate::{
 use iree_rocket_hal::rocket::{
     builders::RegCmd,
     conv::{AccumulatorOutputTile, Buffers, ConvPlan, FeatureLayout, Precision},
-    device::OwnedBuffer as RocketOwnedBuffer,
+    device::{OwnedBuffer as RocketOwnedBuffer, fini_bo},
     fc,
     pooling::{PoolingBuffers, PoolingPlan},
     tensor_layout::{
@@ -687,6 +687,36 @@ pub unsafe fn apply_ops(
                     }
                     .is_err()
                     {
+                        return Err(status::from_code(
+                            crate::bindings::iree_status_code_e_IREE_STATUS_INTERNAL,
+                        ));
+                    }
+                }
+                // Sync every buffer the NPU is about to read for device access.
+                //
+                // The packing paths above each `fini_bo` the scratch they
+                // just wrote, so anything staged through them was already
+                // covered. A buffer handed to the hardware *directly* was
+                // not, and IREE's own buffers reach us that way: the CPU
+                // writes them (an upload, or a preceding CPU dispatch) and
+                // the NPU then DMAs stale memory.
+                //
+                // Only convolution's dense feature path (`Cin <= 4`, the
+                // ARGB modes) consumes an IREE buffer directly today --
+                // every other input is staged -- which is why this showed up
+                // as "sub-atom Cin is wrong" and looked like a packing or
+                // alignment defect. It is neither: hardware-measured, the
+                // bases involved are already 16-byte aligned, and staging
+                // the same bytes through scratch fixed it only because
+                // staging carries this sync along with it.
+                //
+                // Syncing every input handle rather than just the
+                // un-staged ones keeps the rule simple and removes the same
+                // hazard for any buffer passed directly in future. A
+                // redundant sync on an already-synced scratch BO is a cache
+                // operation with no effect on correctness.
+                for &input_handle in in_bo_handles.iter() {
+                    if unsafe { fini_bo(cb.fd, input_handle) }.is_err() {
                         return Err(status::from_code(
                             crate::bindings::iree_status_code_e_IREE_STATUS_INTERNAL,
                         ));
