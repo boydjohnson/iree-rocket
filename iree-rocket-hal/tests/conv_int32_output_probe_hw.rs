@@ -1,4 +1,7 @@
-//! Hardware probe for the DPU's documented int32 convolution output mode.
+#![cfg(feature = "hardware-characterization")]
+
+//! Hardware characterization for the DPU's documented int32 convolution
+//! output mode.
 //!
 //! `ConvInteger` needs an exact i32 accumulator, while Rocket's validated
 //! int8 path requantizes to i8. The DPU documents `out_precision = 4` as

@@ -1,4 +1,6 @@
-//! Isolated hardware probe for the exact shape (`Cin=256, Cout=512`, padded
+#![cfg(feature = "hardware-characterization")]
+
+//! Isolated hardware characterization for the exact shape (`Cin=256, Cout=512`, padded
 //! 30x30, 3x3, fp16) that a live rocket-npu-trace showed wedging the NPU
 //! after 714 prior clean jobs -- always as job #715, always right after an
 //! anomalously long (20-52ms) idle gap on the failing core, vs. sub-1ms

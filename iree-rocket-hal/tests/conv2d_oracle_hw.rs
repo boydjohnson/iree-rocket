@@ -31,6 +31,7 @@ use std::{
     os::unix::io::AsRawFd,
     panic::{AssertUnwindSafe, catch_unwind},
     ptr,
+    sync::Mutex,
 };
 
 use conv2d_oracle::{
@@ -48,6 +49,11 @@ const DEVICE_PATH: &str = "/dev/accel/accel0";
 const PAGE_BYTES: usize = 4096;
 const PER_CASE_TIMEOUT_NS: u64 = 5_000_000_000;
 const OUTPUT_SENTINEL: u8 = 0xa5;
+// `nextest -j1` serializes test *processes*, but Rust's harness still runs
+// ignored tests in this binary concurrently. The RK3588 NPU is a single
+// shared device, so concurrent jobs turn independent oracle failures into
+// cross-test contamination.
+static NPU_TEST_LOCK: Mutex<()> = Mutex::new(());
 
 fn page_aligned_size(size: usize) -> usize {
     size.max(1).div_ceil(PAGE_BYTES) * PAGE_BYTES
@@ -974,6 +980,7 @@ fn int8_accumulator_output_parity_cases() -> Vec<Conv2dCase> {
     .collect()
 }
 
+#[cfg(feature = "hardware-characterization")]
 fn int8_neutral80_one_hot_four_way_cases() -> Vec<Conv2dCase> {
     let mut cases = Vec::with_capacity(4);
     for signed_input in [false, true] {
@@ -999,6 +1006,7 @@ fn int8_neutral80_one_hot_four_way_cases() -> Vec<Conv2dCase> {
     cases
 }
 
+#[cfg(feature = "hardware-characterization")]
 fn int8_raw_coefficient_byte_sweep_case(unit_gain: bool) -> Conv2dCase {
     Conv2dCase {
         width: 1,
@@ -1150,8 +1158,9 @@ fn int8_accumulator_k1_cin_boundary_is_planable_and_gap_free() {
     assert_planable_and_gap_free(cases);
 }
 
+#[cfg(feature = "hardware-characterization")]
 #[test]
-fn int8_accumulator_cbuf_split_probe_matrix_is_planable() {
+fn int8_accumulator_cbuf_split_characterization_matrix_is_planable() {
     for cin in [384u32, 385, 400, 512] {
         let case = Conv2dCase {
             width: 32,
@@ -1259,6 +1268,9 @@ fn accumulator_canary_passes(file: &std::fs::File) -> bool {
 /// `ROCKET_PROBE_RESUME_AT` to run it *first*, repeated a few times -- never
 /// one row from one sweep.
 fn run_hardware_case_matrix(title: &str, cases: Vec<Conv2dCase>) {
+    let _device_guard = NPU_TEST_LOCK
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
     let total_cases = cases.len();
     let file = OpenOptions::new()
         .read(true)
@@ -1396,7 +1408,7 @@ fn bank_partition_flip_boundary_probe_runs_every_case_before_failing() {
 fn dense_coefficient_vgg_blocks_match_oracle() {
     let cases = dense_coefficient_vgg_block_cases();
     assert_eq!(cases.len(), 5);
-    run_hardware_case_matrix("dense-coefficient VGG block probe", cases);
+    run_hardware_case_matrix("dense-coefficient VGG block regression", cases);
 }
 
 #[test]
@@ -1417,10 +1429,10 @@ fn int8_accumulator_k1_supported_cin_atom_sweep() {
 
 #[test]
 #[ignore = "needs /dev/accel/accel0 -- resolves the exact dense signed K1 Int8Accumulator Cin transition"]
-fn int8_accumulator_k1_cin_boundary_probe() {
+fn int8_accumulator_k1_cin_boundary_matches_oracle() {
     let cases = int8_accumulator_k1_cin_boundary_cases();
     assert_eq!(cases.len(), 5);
-    run_hardware_case_matrix("int8 accumulator K1 Cin boundary probe", cases);
+    run_hardware_case_matrix("int8 accumulator K1 Cin boundary regression", cases);
 }
 
 /// Resolves the Cin/CBUF split matrix, guarding every row with a canary.
@@ -1428,7 +1440,7 @@ fn int8_accumulator_k1_cin_boundary_probe() {
 /// The RK3588 NPU can drop into a state where *every* job returns wrong
 /// results, including shapes that passed seconds earlier. Observed on
 /// `planck` 2026-08-31 during a wide accumulator sweep: from one case
-/// onwards nothing was correct again, `int8_accumulator_k1_cin_boundary_probe`
+/// onwards nothing was correct again, `int8_accumulator_k1_cin_boundary_matches_oracle`
 /// went 5/5 pass to 5/5 fail, and only rebooting the board restored it.
 /// Nothing reports an error when this happens -- `prep_bo` still succeeds
 /// well inside its timeout -- so a long sweep silently stops measuring
@@ -1634,9 +1646,10 @@ fn int8_accumulator_parity_regression_matrix_matches_oracle() {
     run_hardware_case_matrix("int8 accumulator parity regression matrix", cases);
 }
 
+#[cfg(feature = "hardware-characterization")]
 #[test]
-#[ignore = "needs /dev/accel/accel0 -- confirms 0x80 neutral int8 coefficient bytes"]
-fn int8_neutral80_one_hot_four_way_confirmation_runs_every_case_before_failing() {
+#[ignore = "needs /dev/accel/accel0 -- characterizes 0x80 neutral int8 coefficient bytes"]
+fn int8_neutral80_one_hot_four_way_confirmation_matches_oracle() {
     println!("  packed background/padding byte: 0x80");
     println!("  packed live logical +1 byte:    0x00");
     run_hardware_case_matrix(
@@ -1645,7 +1658,11 @@ fn int8_neutral80_one_hot_four_way_confirmation_runs_every_case_before_failing()
     );
 }
 
+#[cfg(feature = "hardware-characterization")]
 fn run_raw_coefficient_byte_sweep(unit_gain: bool, title: &str, conversion: &str) -> Vec<i8> {
+    let _device_guard = NPU_TEST_LOCK
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
     let case = int8_raw_coefficient_byte_sweep_case(unit_gain);
     let fixture = build_fixture(case).expect("build 256-byte coefficient sweep");
     let file = OpenOptions::new()
@@ -1681,6 +1698,7 @@ fn run_raw_coefficient_byte_sweep(unit_gain: bool, title: &str, conversion: &str
     observed
 }
 
+#[cfg(feature = "hardware-characterization")]
 #[test]
 #[ignore = "needs /dev/accel/accel0 -- maps every dense int8 coefficient byte"]
 fn int8_dense_coefficient_raw_byte_sweep() {
@@ -1728,6 +1746,7 @@ fn int8_dense_coefficient_raw_byte_sweep() {
     );
 }
 
+#[cfg(feature = "hardware-characterization")]
 #[test]
 #[ignore = "needs /dev/accel/accel0 -- maps dense int8 coefficient bytes at unit gain"]
 fn int8_dense_coefficient_raw_byte_unit_gain_sweep() {
@@ -1755,7 +1774,10 @@ fn int8_dense_coefficient_raw_byte_unit_gain_sweep() {
 
 #[test]
 #[ignore = "needs /dev/accel/accel0 -- cross-compile for aarch64 and run on the RK3588 board"]
-fn cartesian_conv2d_oracle_sweep_runs_every_case_before_failing() {
+fn cartesian_conv2d_oracle_sweep_matches_oracle() {
+    let _device_guard = NPU_TEST_LOCK
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
     let cases = cartesian_cases();
     let total_cases = cases.len();
     let file = OpenOptions::new()

@@ -1,4 +1,7 @@
-//! Measures the int8 requantisation gain instead of assuming it.
+#![cfg(feature = "hardware-characterization")]
+
+//! Hardware characterization: measures the int8 requantisation gain instead
+//! of assuming it.
 //!
 //!   CARGO_TARGET_AARCH64_UNKNOWN_LINUX_GNU_LINKER=aarch64-linux-gnu-gcc \
 //!     cargo test --target aarch64-unknown-linux-gnu --release \

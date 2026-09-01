@@ -1,4 +1,7 @@
-//! Follow-up to `conv_dense_last_tile_grains_probe_hw.rs`, which ruled out
+#![cfg(feature = "hardware-characterization")]
+
+//! Hardware characterization. Follow-up to
+//! `conv_dense_last_tile_grains_probe_hw.rs`, which ruled out
 //! `feature_grains` as the cause of the defect
 //! `conv_dense_shared_buffer_dispatch_hw.rs` found on `run1`'s shape (Cin=3
 //! dense, Cout=256, 3x3): every value from below `in_rows` to well above

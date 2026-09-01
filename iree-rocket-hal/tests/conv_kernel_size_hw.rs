@@ -1,4 +1,4 @@
-//! Hardware probe for 7x7, 9x9, and 11x11 convolution kernels.
+//! HAL hardware regression coverage for 7x7, 9x9, and 11x11 convolution kernels.
 //!
 //! This test is ignored on the development host because it needs the RK3588
 //! NPU device. Cross-compile it, copy the printed test binary to the board,
@@ -317,7 +317,7 @@ fn assert_no_failures(failures: Vec<String>) {
     );
 }
 
-fn run_rectangular_probe(kernel: usize, in_channels: u32) {
+fn run_rectangular_regression(kernel: usize, in_channels: u32) {
     let _device_guard = NPU_TEST_LOCK
         .lock()
         .unwrap_or_else(|poisoned| poisoned.into_inner());
@@ -380,17 +380,17 @@ fn large_kernel_cbuf_partitions_run_on_npu() {
 #[test]
 #[ignore = "needs /dev/accel/accel0 -- cross-compile for aarch64 and run on the RK3588 board"]
 fn k9_ci64_rectangular_tiles_run_on_npu() {
-    run_rectangular_probe(9, 64);
+    run_rectangular_regression(9, 64);
 }
 
 #[test]
 #[ignore = "needs /dev/accel/accel0 -- cross-compile for aarch64 and run on the RK3588 board"]
 fn k11_ci48_rectangular_tiles_run_on_npu() {
-    run_rectangular_probe(11, 48);
+    run_rectangular_regression(11, 48);
 }
 
 #[test]
 #[ignore = "needs /dev/accel/accel0 -- cross-compile for aarch64 and run on the RK3588 board"]
 fn k11_ci64_rectangular_tiles_run_on_npu() {
-    run_rectangular_probe(11, 64);
+    run_rectangular_regression(11, 64);
 }
