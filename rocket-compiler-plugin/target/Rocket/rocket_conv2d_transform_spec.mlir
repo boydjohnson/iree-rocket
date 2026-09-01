@@ -3259,9 +3259,26 @@ module attributes {transform.with_named_sequence} {
     // accumulator at f32, so @match_dynamic_conv2d's f16/f16/f32 typing
     // requirement matches these too. A conv already authored in f16 is
     // left alone: the pass only rewrites all-f32 operand sets.
+    //
+    // This is the plugin's own pass, not upstream's
+    // "iree-global-opt-demote-contraction-inputs" that it used to call:
+    // that one rebuilds the named op through
+    // linalg::getPrunedAttributeList, which erases `strides` and
+    // `dilations`, silently turning every strided convolution into a
+    // stride-1 one. See RocketDemoteConvInputsPass.cpp -- it handles exactly
+    // the same op set, so this is a behaviour-preserving swap apart from
+    // keeping those two attributes.
     %demoted_funcs = transform.apply_registered_pass
-        "iree-global-opt-demote-contraction-inputs"
-        with options = { "type" = "f16", "operation" = "conv" } to %canonical_funcs
+        "rocket-demote-conv-inputs-to-f16" to %canonical_funcs
+      : (!transform.any_op) -> !transform.any_op
+
+    // Tripwire for the above and anything like it: errors if any named
+    // convolution's output extent disagrees with its own input/filter/
+    // stride/dilation. Runs while padding is still explicit and nothing has
+    // been tiled, so the relation is exact here. Never fires on a healthy
+    // compile.
+    %verified_funcs = transform.apply_registered_pass
+        "rocket-verify-conv-shapes" to %demoted_funcs
       : (!transform.any_op) -> !transform.any_op
 
     // Tags every conv-family linalg op with rocket.origin/rocket.origin_kind
@@ -3271,7 +3288,7 @@ module attributes {transform.with_named_sequence} {
     // ops fell through to CPU: matched ops lose the tag along with the rest
     // of the op they were erased from.
     %annotated_funcs = transform.apply_registered_pass
-        "rocket-annotate-original-placement" to %demoted_funcs
+        "rocket-annotate-original-placement" to %verified_funcs
       : (!transform.any_op) -> !transform.any_op
 
     transform.foreach %annotated_funcs : !transform.any_op {

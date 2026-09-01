@@ -29,14 +29,18 @@ flatbuffer_c_library(
 set(_ROCKET_SRCS
   "RocketAnnotateFinalPlacementPass.cpp"
   "RocketAnnotateOriginalPlacementPass.cpp"
+  "RocketDemoteConvInputsPass.cpp"
   "RocketPinUnclaimedDispatchesPass.cpp"
   "RocketTarget.cpp"
   "RocketTransposeQuantizedConvPass.cpp"
+  "RocketVerifyConvShapesPass.cpp"
 )
 set(_ROCKET_DEPS
   LLVMSupport
   MLIRIR
+  MLIRArithDialect
   MLIRLinalgDialect
+  MLIRLinalgUtils
   MLIRPass
   MLIRSupport
   MLIRTensorDialect
