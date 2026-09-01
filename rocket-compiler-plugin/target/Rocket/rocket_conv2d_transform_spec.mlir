@@ -3346,7 +3346,25 @@ module attributes {transform.with_named_sequence} {
             @match_dynamic_depthwise_conv2d_3x3_int8_s2 -> @cast_and_call_dynamic_depthwise_conv2d_int8_s2
           : (!transform.any_op) -> (!transform.any_op)
     }
-    transform.apply_dce to %module : !transform.any_op
+
+    // Every convolution still standing here is one the loop above declined,
+    // so the f16 demotion it was given for matching bought it nothing --
+    // put its f32 inputs back rather than make the CPU run it in half
+    // precision. Only this project's own demotion is reverted; see
+    // RocketPromoteUnclaimedConvInputsPass.cpp. On MobileNetV2 this is the
+    // stride-2 stem, worth 0.349 max|err| on the final logits.
+    //
+    // The dead truncf generics this leaves behind are what apply_dce below
+    // is already there to remove.
+    // Applied to the module, not to %annotated_funcs: the foreach above
+    // consumes that handle, and re-matching just to hand the pass a
+    // function-shaped handle would buy nothing -- the pass walks whatever it
+    // is given.
+    %promoted_module = transform.apply_registered_pass
+        "rocket-promote-unclaimed-conv-inputs" to %module
+      : (!transform.any_op) -> !transform.any_op
+
+    transform.apply_dce to %promoted_module : !transform.any_op
     transform.yield
   }
 }

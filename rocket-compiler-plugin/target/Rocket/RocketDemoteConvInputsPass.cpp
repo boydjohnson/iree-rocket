@@ -57,6 +57,12 @@ namespace {
 constexpr std::array<StringRef, 2> kShapeDefiningAttrNames = {"strides",
                                                               "dilations"};
 
+// Marks what this pass rewrote, so RocketPromoteUnclaimedConvInputsPass can
+// undo exactly its own work on the convolutions the matchers then decline --
+// and nothing else. A convolution a model authored in f16 itself, or any
+// truncf a model wrote by hand, carries no tag and is left alone.
+constexpr StringLiteral kDemotedAttrName = "rocket.f16_demoted";
+
 // Elementwise truncf of a whole tensor, as a linalg.generic -- the same shape
 // of rewrite the upstream pass emits, so dispatch formation folds it into the
 // producer exactly as before.
@@ -81,6 +87,11 @@ Value truncateToF16(PatternRewriter &rewriter, Location loc, Value input) {
       ->getResult(0);
 }
 
+// Tags an op this pass created or rewrote. See kDemotedAttrName.
+void markDemoted(Operation *op, PatternRewriter &rewriter) {
+  op->setAttr(kDemotedAttrName, rewriter.getUnitAttr());
+}
+
 template <typename ConvOpTy>
 struct DemoteConvInputsToF16 : OpRewritePattern<ConvOpTy> {
   using OpRewritePattern<ConvOpTy>::OpRewritePattern;
@@ -89,6 +100,9 @@ struct DemoteConvInputsToF16 : OpRewritePattern<ConvOpTy> {
                                 PatternRewriter &rewriter) const override {
     // Only all-f32 operand sets, matching the pass this replaces: a conv
     // already authored in f16 (or any mixed-precision one) is left alone.
+    if (convOp->hasAttr(kDemotedAttrName)) {
+      return failure();
+    }
     Type f32 = rewriter.getF32Type();
     if (!llvm::all_of(convOp->getOperands(), [&](Value operand) {
           auto type = dyn_cast<RankedTensorType>(operand.getType());
@@ -111,11 +125,13 @@ struct DemoteConvInputsToF16 : OpRewritePattern<ConvOpTy> {
     Location loc = convOp.getLoc();
     SmallVector<Value> demotedInputs;
     for (OpOperand *inputOperand : convOp.getDpsInputOperands()) {
-      demotedInputs.push_back(
-          truncateToF16(rewriter, loc, inputOperand->get()));
+      Value demoted = truncateToF16(rewriter, loc, inputOperand->get());
+      markDemoted(demoted.getDefiningOp(), rewriter);
+      demotedInputs.push_back(demoted);
     }
-    rewriter.replaceOpWithNewOp<ConvOpTy>(convOp, demotedInputs,
-                                          convOp.getDpsInits(), attributes);
+    auto demotedOp = rewriter.replaceOpWithNewOp<ConvOpTy>(
+        convOp, demotedInputs, convOp.getDpsInits(), attributes);
+    markDemoted(demotedOp, rewriter);
     return success();
   }
 };

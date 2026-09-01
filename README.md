@@ -130,6 +130,19 @@ On MobileNetV2 it turned the stride-2 stem conv into a nominal stride-1 conv,
 which then also matched `@match_dynamic_conv2d_3x3` (which requires stride 1)
 and was dispatched to the NPU with the wrong stride.
 
+Demotion has to precede the match loop, because the matchers require
+f16/f16/f32 typing -- but it cannot know which convolutions the loop will
+claim, and deciding that up front would mean re-implementing the matchers'
+eligibility predicates in C++ and keeping the two in sync. So the spec demotes
+every all-f32 named convolution, matches, and then
+`rocket-promote-unclaimed-conv-inputs` restores f32 on whatever is left:
+anything still holding a `linalg.conv_2d_*` after `foreach_match` is by
+definition unclaimed. Without it an unclaimed convolution runs on the CPU in
+half precision when f32 was free -- on MobileNetV2 that is the stride-2 stem,
+worth 0.349 max|err| on the final logits. Only the plugin's own demotion is
+reverted: both passes agree on a `rocket.f16_demoted` tag, so a model that
+authored its own f16 convolution is untouched.
+
 `rocket-verify-conv-shapes` is the tripwire for anything like it: it errors if
 a named convolution's output spatial extent disagrees with its own input,
 filter, stride and dilation. It runs immediately before the match/rewrite
