@@ -10,6 +10,11 @@ This runs two independent checks:
    through iree-run-module on the board and compared with the CPU VMFB.
 
 The command exits nonzero if building, board execution, or comparison fails.
+Some cases put two Rocket dispatches in one function so they share a command
+buffer, which is what a real model does. One of those, `mixed_int8_then_depthwise`,
+is a `known_failure`: it is run and reported but does not fail the gate, and
+*does* fail it if it ever starts passing, so the entry cannot quietly go stale.
+
 It requires Python numpy, ssh/scp access to the board, the aarch64 Rust target,
 and built host/aarch64 IREE tools in their normal repository locations.
 """
@@ -27,6 +32,8 @@ import sys
 import tempfile
 
 import numpy as np
+
+from typing import NamedTuple, Sequence
 
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -144,6 +151,64 @@ func.func @depthwise_int8(%input: tensor<1x34x34x64xi8>, %filter: tensor<3x3x64x
       ins(%input, %filter, %izp, %kzp : tensor<1x34x34x64xi8>, tensor<3x3x64xi8>, i32, i32)
       outs(%init : tensor<1x32x32x64xi32>) -> tensor<1x32x32x64xi32>
   return %0 : tensor<1x32x32x64xi32>
+}
+
+// The three functions below put *two* Rocket dispatches in one function, so
+// they share a command buffer -- what a real model does and what no other
+// case here covers. Each convolution is independent (no data flows between
+// them), so a difference cannot be explained by one feeding the other.
+//
+// The depthwise ones are authored directly in f16 rather than f32: the
+// matchers require f16/f16/f32 typing, and rocket-demote-conv-inputs-to-f16
+// deliberately does not demote depthwise (see its scope comment), so writing
+// f32 here would leave the depthwise on the CPU and test nothing.
+//
+// `mixed_int8_then_depthwise` is a known failure -- see KNOWN_FAILURES.
+func.func @mixed_int8_then_depthwise(%qi: tensor<1x64x32x32xi8>, %qf: tensor<128x64x1x1xi8>, %qo: tensor<1x128x32x32xi32>, %di: tensor<1x144x113x113xf16>, %df: tensor<144x3x3xf16>, %do: tensor<1x144x56x56xf32>) -> (tensor<1x128x32x32xi32>, tensor<1x144x56x56xf32>) {
+  %izp = arith.constant 7 : i32
+  %kzp = arith.constant 0 : i32
+  %0 = linalg.conv_2d_nchw_fchw_q
+      {dilations = dense<1> : tensor<2xi64>, strides = dense<1> : tensor<2xi64>}
+      ins(%qi, %qf, %izp, %kzp : tensor<1x64x32x32xi8>, tensor<128x64x1x1xi8>, i32, i32)
+      outs(%qo : tensor<1x128x32x32xi32>) -> tensor<1x128x32x32xi32>
+  %1 = linalg.depthwise_conv_2d_nchw_chw
+      {dilations = dense<1> : tensor<2xi64>, strides = dense<2> : tensor<2xi64>}
+      ins(%di, %df : tensor<1x144x113x113xf16>, tensor<144x3x3xf16>)
+      outs(%do : tensor<1x144x56x56xf32>) -> tensor<1x144x56x56xf32>
+  return %0, %1 : tensor<1x128x32x32xi32>, tensor<1x144x56x56xf32>
+}
+
+// The same two convolutions with the depthwise submitted first. Passes,
+// which is what makes the failure above an ordering property rather than a
+// property of either convolution.
+func.func @mixed_depthwise_then_int8(%qi: tensor<1x64x32x32xi8>, %qf: tensor<128x64x1x1xi8>, %qo: tensor<1x128x32x32xi32>, %di: tensor<1x144x113x113xf16>, %df: tensor<144x3x3xf16>, %do: tensor<1x144x56x56xf32>) -> (tensor<1x128x32x32xi32>, tensor<1x144x56x56xf32>) {
+  %izp = arith.constant 7 : i32
+  %kzp = arith.constant 0 : i32
+  %1 = linalg.depthwise_conv_2d_nchw_chw
+      {dilations = dense<1> : tensor<2xi64>, strides = dense<2> : tensor<2xi64>}
+      ins(%di, %df : tensor<1x144x113x113xf16>, tensor<144x3x3xf16>)
+      outs(%do : tensor<1x144x56x56xf32>) -> tensor<1x144x56x56xf32>
+  %0 = linalg.conv_2d_nchw_fchw_q
+      {dilations = dense<1> : tensor<2xi64>, strides = dense<1> : tensor<2xi64>}
+      ins(%qi, %qf, %izp, %kzp : tensor<1x64x32x32xi8>, tensor<128x64x1x1xi8>, i32, i32)
+      outs(%qo : tensor<1x128x32x32xi32>) -> tensor<1x128x32x32xi32>
+  return %0, %1 : tensor<1x128x32x32xi32>, tensor<1x144x56x56xf32>
+}
+
+// Dense-then-depthwise again, but both fp16, so the *only* difference from
+// `mixed_int8_then_depthwise` is the first dispatch's precision. Passes,
+// which is what makes the failure a precision-mix property rather than a
+// "two dispatches in one command buffer" one.
+func.func @mixed_fp16_then_depthwise(%qi: tensor<1x64x32x32xf16>, %qf: tensor<128x64x1x1xf16>, %qo: tensor<1x128x32x32xf32>, %di: tensor<1x144x113x113xf16>, %df: tensor<144x3x3xf16>, %do: tensor<1x144x56x56xf32>) -> (tensor<1x128x32x32xf32>, tensor<1x144x56x56xf32>) {
+  %0 = linalg.conv_2d_nchw_fchw
+      {dilations = dense<1> : tensor<2xi64>, strides = dense<1> : tensor<2xi64>}
+      ins(%qi, %qf : tensor<1x64x32x32xf16>, tensor<128x64x1x1xf16>)
+      outs(%qo : tensor<1x128x32x32xf32>) -> tensor<1x128x32x32xf32>
+  %1 = linalg.depthwise_conv_2d_nchw_chw
+      {dilations = dense<1> : tensor<2xi64>, strides = dense<2> : tensor<2xi64>}
+      ins(%di, %df : tensor<1x144x113x113xf16>, tensor<144x3x3xf16>)
+      outs(%do : tensor<1x144x56x56xf32>) -> tensor<1x144x56x56xf32>
+  return %0, %1 : tensor<1x128x32x32xf32>, tensor<1x144x56x56xf32>
 }
 
 func.func @depthwise_int8_s2(%input: tensor<1x33x33x64xi8>, %filter: tensor<3x3x64xi8>, %init: tensor<1x16x16x64xi32>) -> tensor<1x16x16x64xi32> {
@@ -270,6 +335,31 @@ def write_compiled_fixture(work_dir: Path) -> None:
     np.save(
         work_dir / "dense_cin3_init.npy", np.zeros((1, 16, 32, 32), dtype=np.float32)
     )
+
+    # Shared operands for the three mixed-precision two-dispatch cases. The
+    # int8 and fp16 dense halves are separate arrays because the two
+    # functions take different element types for the same argument slot.
+    np.save(work_dir / "mixed_qi_i8.npy", rng.integers(-128, 128, (1, 64, 32, 32), dtype=np.int8))
+    np.save(work_dir / "mixed_qf_i8.npy", rng.integers(-128, 128, (128, 64, 1, 1), dtype=np.int8))
+    np.save(work_dir / "mixed_qo_i32.npy", np.zeros((1, 128, 32, 32), dtype=np.int32))
+    np.save(
+        work_dir / "mixed_qi_f16.npy",
+        rng.uniform(-0.5, 0.5, size=(1, 64, 32, 32)).astype(np.float16),
+    )
+    np.save(
+        work_dir / "mixed_qf_f16.npy",
+        rng.uniform(-0.5, 0.5, size=(128, 64, 1, 1)).astype(np.float16),
+    )
+    np.save(work_dir / "mixed_qo_f32.npy", np.zeros((1, 128, 32, 32), dtype=np.float32))
+    np.save(
+        work_dir / "mixed_di.npy",
+        rng.uniform(-0.5, 0.5, size=(1, 144, 113, 113)).astype(np.float16),
+    )
+    np.save(
+        work_dir / "mixed_df.npy",
+        rng.uniform(-0.5, 0.5, size=(144, 3, 3)).astype(np.float16),
+    )
+    np.save(work_dir / "mixed_do.npy", np.zeros((1, 144, 56, 56), dtype=np.float32))
 
     depthwise_weights = rng.uniform(-0.5, 0.5, size=(3, 3, 40)).astype(np.float16)
     depthwise_input = rng.uniform(-0.25, 0.25, size=(1, 8, 8, 40)).astype(np.float16)
@@ -405,6 +495,9 @@ def compile_modules(work_dir: Path, compiler: Path, transform_spec: Path) -> Non
         b"rocket_dynamic_int8_executable",
         b"rocket_dynamic_depthwise_int8_executable",
         b"rocket_dynamic_depthwise_int8_executable_s2",
+        # The fp16 pair the mixed two-dispatch cases need.
+        b"rocket_dynamic_executable",
+        b"rocket_dynamic_depthwise_executable_s2",
     ):
         if not re.search(re.escape(executable) + rb"(?!_s2)", rocket_bytes):
             raise SystemExit(
@@ -417,10 +510,8 @@ def run_cpu_reference(
     work_dir: Path,
     host_runtime: Path,
     function: str,
-    input_name: str,
-    kernel_name: str,
-    init_name: str,
-    output_name: str,
+    input_names: Sequence[str],
+    output_names: Sequence[str],
 ) -> None:
     run(
         [
@@ -428,10 +519,8 @@ def run_cpu_reference(
             f"--module={work_dir / 'cpu.vmfb'}",
             f"--function={function}",
             "--device=local-task",
-            f"--input=@{work_dir / input_name}",
-            f"--input=@{work_dir / kernel_name}",
-            f"--input=@{work_dir / init_name}",
-            f"--output=@{work_dir / output_name}",
+            *(f"--input=@{work_dir / name}" for name in input_names),
+            *(f"--output=@{work_dir / name}" for name in output_names),
         ]
     )
 
@@ -442,18 +531,11 @@ def run_rocket_module(
     work_dir: Path,
     board_runtime: Path,
     function: str,
-    input_name: str,
-    kernel_name: str,
-    init_name: str,
-    output_name: str,
+    input_names: Sequence[str],
+    output_names: Sequence[str],
 ) -> None:
-    staged = [
-        board_runtime,
-        work_dir / "rocket.vmfb",
-        work_dir / input_name,
-        work_dir / kernel_name,
-        work_dir / init_name,
-    ]
+    staged = [board_runtime, work_dir / "rocket.vmfb"]
+    staged += [work_dir / name for name in input_names]
     run(["scp", *(str(path) for path in staged), f"{host}:{remote_dir}/"])
     runtime_name = board_runtime.name
     remote_command = " && ".join(
@@ -467,21 +549,25 @@ def run_rocket_module(
                     f"--function={function}",
                     "--device=rocket",
                     "--device=local-task",
-                    f"--input=@{input_name}",
-                    f"--input=@{kernel_name}",
-                    f"--input=@{init_name}",
-                    f"--output=@{output_name}",
+                    *(f"--input=@{name}" for name in input_names),
+                    *(f"--output=@{name}" for name in output_names),
                 ]
             ),
         ]
     )
     run(["ssh", host, remote_command])
-    run(["scp", f"{host}:{remote_dir}/{output_name}", str(work_dir / output_name)])
+    for name in output_names:
+        run(["scp", f"{host}:{remote_dir}/{name}", str(work_dir / name)])
 
 
 def compare_outputs(
     work_dir: Path, cpu_name: str, rocket_name: str, atol: float, rtol: float
-) -> None:
+) -> bool:
+    """Prints the differential and returns whether it matched.
+
+    Returns rather than exiting so a known failure can be reported without
+    taking the gate down with it; the caller decides what a mismatch means.
+    """
     cpu = np.load(work_dir / cpu_name).astype(np.float64)
     rocket = np.load(work_dir / rocket_name).astype(np.float64)
     if cpu.shape != rocket.shape:
@@ -495,8 +581,51 @@ def compare_outputs(
         f"max|error|={max_error:.8g}, mismatches={mismatches}/{cpu.size}, "
         f"atol={atol}, rtol={rtol}"
     )
-    if mismatches:
-        raise SystemExit("compiled Rocket convolution differs from the CPU reference")
+    return mismatches == 0
+
+
+class Case(NamedTuple):
+    """One compiled differential case.
+
+    `known_failure`, when set, is the reason this case is expected to differ
+    from the CPU reference. Such a case is run and reported but does not fail
+    the gate -- and fails it if it ever *passes*, so the list cannot rot.
+    """
+
+    function: str
+    inputs: tuple[str, ...]
+    outputs: tuple[str, ...]
+    # Scalar, or one entry per output. A two-dispatch case needs the latter:
+    # its int8 half is exact integer arithmetic while its fp16 half is not,
+    # and a tolerance loose enough for the fp16 output would hide a real
+    # error of tens of thousands in an i32 accumulator.
+    atol: float | tuple[float, ...]
+    rtol: float | tuple[float, ...]
+    known_failure: str | None = None
+
+    def tolerances(self, index: int) -> tuple[float, float]:
+        atol = self.atol[index] if isinstance(self.atol, tuple) else self.atol
+        rtol = self.rtol[index] if isinstance(self.rtol, tuple) else self.rtol
+        return atol, rtol
+
+
+MIXED_INT8_INPUTS = (
+    "mixed_qi_i8.npy",
+    "mixed_qf_i8.npy",
+    "mixed_qo_i32.npy",
+    "mixed_di.npy",
+    "mixed_df.npy",
+    "mixed_do.npy",
+)
+
+MIXED_FP16_INPUTS = (
+    "mixed_qi_f16.npy",
+    "mixed_qf_f16.npy",
+    "mixed_qo_f32.npy",
+    "mixed_di.npy",
+    "mixed_df.npy",
+    "mixed_do.npy",
+)
 
 
 def run_compiled_gate(
@@ -519,111 +648,144 @@ def run_compiled_gate(
     # and a tolerance wide enough for fp16 rounding would still catch that,
     # but an exact check also catches a single wrong accumulator lane.
     cases = [
-        ("main", "input.npy", "kernel.npy", "init.npy", "out_rocket.npy", atol, rtol),
-        (
-            "depthwise",
-            "depthwise_input.npy",
-            "depthwise_kernel.npy",
-            "depthwise_init.npy",
-            "depthwise_out_rocket.npy",
+        Case(
+            "main",
+            ("input.npy", "kernel.npy", "init.npy"),
+            ("out_rocket.npy",),
             atol,
             rtol,
         ),
-        (
+        Case(
+            "depthwise",
+            ("depthwise_input.npy", "depthwise_kernel.npy", "depthwise_init.npy"),
+            ("depthwise_out_rocket.npy",),
+            atol,
+            rtol,
+        ),
+        Case(
             "dense_int8",
-            "dense_int8_input.npy",
-            "dense_int8_kernel.npy",
-            "dense_int8_init.npy",
-            "dense_int8_out_rocket.npy",
+            ("dense_int8_input.npy", "dense_int8_kernel.npy", "dense_int8_init.npy"),
+            ("dense_int8_out_rocket.npy",),
             0.0,
             0.0,
         ),
-        (
+        Case(
             "dense_cin3",
-            "dense_cin3_input.npy",
-            "dense_cin3_kernel.npy",
-            "dense_cin3_init.npy",
-            "dense_cin3_out_rocket.npy",
+            ("dense_cin3_input.npy", "dense_cin3_kernel.npy", "dense_cin3_init.npy"),
+            ("dense_cin3_out_rocket.npy",),
             1e-2,
             1e-2,
         ),
-        (
+        Case(
             "dense_int8_3x3",
-            "dense_int8_3x3_input.npy",
-            "dense_int8_3x3_kernel.npy",
-            "dense_int8_3x3_init.npy",
-            "dense_int8_3x3_out_rocket.npy",
+            ("dense_int8_3x3_input.npy", "dense_int8_3x3_kernel.npy", "dense_int8_3x3_init.npy"),
+            ("dense_int8_3x3_out_rocket.npy",),
             0.0,
             0.0,
         ),
-        (
+        Case(
             "dense_int8_cout512_1x1",
-            "dense_int8_cout512_1x1_input.npy",
-            "dense_int8_cout512_1x1_kernel.npy",
-            "dense_int8_cout512_1x1_init.npy",
-            "dense_int8_cout512_1x1_out_rocket.npy",
+            ("dense_int8_cout512_1x1_input.npy", "dense_int8_cout512_1x1_kernel.npy", "dense_int8_cout512_1x1_init.npy"),
+            ("dense_int8_cout512_1x1_out_rocket.npy",),
             0.0,
             0.0,
         ),
-        (
+        Case(
             "dense_int8_cout512_3x3",
-            "dense_int8_cout512_3x3_input.npy",
-            "dense_int8_cout512_3x3_kernel.npy",
-            "dense_int8_cout512_3x3_init.npy",
-            "dense_int8_cout512_3x3_out_rocket.npy",
+            ("dense_int8_cout512_3x3_input.npy", "dense_int8_cout512_3x3_kernel.npy", "dense_int8_cout512_3x3_init.npy"),
+            ("dense_int8_cout512_3x3_out_rocket.npy",),
             0.0,
             0.0,
         ),
-        (
+        Case(
             "depthwise_int8",
-            "depthwise_int8_input.npy",
-            "depthwise_int8_kernel.npy",
-            "depthwise_int8_init.npy",
-            "depthwise_int8_out_rocket.npy",
+            ("depthwise_int8_input.npy", "depthwise_int8_kernel.npy", "depthwise_int8_init.npy"),
+            ("depthwise_int8_out_rocket.npy",),
             0.0,
             0.0,
         ),
-        (
+        Case(
             "depthwise_int8_s2",
-            "depthwise_int8_s2_input.npy",
-            "depthwise_int8_s2_kernel.npy",
-            "depthwise_int8_s2_init.npy",
-            "depthwise_int8_s2_out_rocket.npy",
+            ("depthwise_int8_s2_input.npy", "depthwise_int8_s2_kernel.npy", "depthwise_int8_s2_init.npy"),
+            ("depthwise_int8_s2_out_rocket.npy",),
             0.0,
             0.0,
+        ),
+        # Two Rocket dispatches sharing a command buffer. Tolerances are
+        # per output: the int8 half is exact, the fp16 depthwise half is not.
+        Case(
+            "mixed_fp16_then_depthwise",
+            MIXED_FP16_INPUTS,
+            ("mixed_fp16_then_depthwise_dense.npy", "mixed_fp16_then_depthwise_dw.npy"),
+            1e-2,
+            1e-2,
+        ),
+        Case(
+            "mixed_depthwise_then_int8",
+            MIXED_INT8_INPUTS,
+            ("mixed_depthwise_then_int8_dense.npy", "mixed_depthwise_then_int8_dw.npy"),
+            (0.0, 1e-2),
+            (0.0, 1e-2),
+        ),
+        Case(
+            "mixed_int8_then_depthwise",
+            MIXED_INT8_INPUTS,
+            ("mixed_int8_then_depthwise_dense.npy", "mixed_int8_then_depthwise_dw.npy"),
+            (0.0, 1e-2),
+            (0.0, 1e-2),
+            known_failure=(
+                "an int8 dispatch corrupts a *following* fp16 depthwise one in the "
+                "same command buffer: the depthwise output is wrong in a single "
+                "tile-sized band of rows. Reversing the order "
+                "(mixed_depthwise_then_int8) and making both halves fp16 "
+                "(mixed_fp16_then_depthwise) both pass, so it is the precision mix "
+                "and the order, not either convolution. Ruled out: a stale register "
+                "delta (both programs write the same 126 registers) and DPU "
+                "mode-transition timing (the quiescence dwell widened to any "
+                "transition fails at 1ms and 50ms alike)"
+            ),
         ),
     ]
-    for (
-        function,
-        input_name,
-        kernel_name,
-        init_name,
-        output_name,
-        case_atol,
-        case_rtol,
-    ) in cases:
-        cpu_name = f"{function}_cpu.npy"
-        run_cpu_reference(
-            work_dir,
-            host_runtime,
-            function,
-            input_name,
-            kernel_name,
-            init_name,
-            cpu_name,
+    unexpected_passes = []
+    for case in cases:
+        cpu_names = tuple(
+            f"{case.function}_cpu_{index}.npy" for index in range(len(case.outputs))
         )
+        run_cpu_reference(work_dir, host_runtime, case.function, case.inputs, cpu_names)
         run_rocket_module(
             host,
             remote_dir,
             work_dir,
             board_runtime,
-            function,
-            input_name,
-            kernel_name,
-            init_name,
-            output_name,
+            case.function,
+            case.inputs,
+            case.outputs,
         )
-        compare_outputs(work_dir, cpu_name, output_name, case_atol, case_rtol)
+        # `all()` over a generator would stop at the first mismatch; a list
+        # keeps every output's numbers on screen, which is the whole point of
+        # a two-dispatch case.
+        results = [
+            compare_outputs(work_dir, cpu_name, rocket_name, *case.tolerances(index))
+            for index, (cpu_name, rocket_name) in enumerate(zip(cpu_names, case.outputs))
+        ]
+        matched = all(results)
+        if case.known_failure:
+            if matched:
+                unexpected_passes.append(case.function)
+                print(f"  {case.function}: UNEXPECTEDLY PASSED -- see below")
+            else:
+                print(f"  {case.function}: known failure, not gating. {case.known_failure}")
+        elif not matched:
+            raise SystemExit("compiled Rocket convolution differs from the CPU reference")
+
+    # A known failure that starts passing is itself a gate failure: the entry
+    # is now a lie, and the bug it documents deserves a real assertion rather
+    # than a comment nobody re-checks.
+    if unexpected_passes:
+        raise SystemExit(
+            "known-failure case(s) now pass and must be promoted to real gate "
+            f"cases: {', '.join(unexpected_passes)}"
+        )
 
 
 def main() -> None:
