@@ -11,6 +11,8 @@
 //! here as evidence about channel *ordering* and magnitude only, and put
 //! correctness assertions in `conv_depthwise_int8_exact_hw.rs` instead.
 
+#![cfg(feature = "hardware-characterization")]
+
 use std::{fs::OpenOptions, mem, os::unix::io::AsRawFd, ptr};
 
 use iree_rocket_hal::rocket::{
