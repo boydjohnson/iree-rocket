@@ -3293,41 +3293,43 @@ module attributes {transform.with_named_sequence} {
 
     transform.foreach %annotated_funcs : !transform.any_op {
       ^bb1(%func: !transform.any_op):
-        // @match_dynamic_conv2d_s{2,3,4}/@match_dynamic_conv2d_3x3_s{2,3,4}
-        // (defined above, deliberately NOT wired into foreach_match below)
-        // are structurally correct and fire on the right shapes -- verified
-        // with a synthetic probe module compiled through
-        // --compile-to=preprocessing, each stride routing to its own
-        // call_rocket_dynamic_conv2d_sN -- but wiring them in breaks a real
-        // compile: on a real MobileNetV2 module they additionally claim the
-        // network's stem conv (the only dense conv MobileNetV2 runs at
-        // stride > 1), and iree-compile then fails at HAL executable
-        // serialization ("failed to serialize executables") on
-        // main_graph$async_dispatch_0 -- the model's own input f32->f16
-        // cast+layout-transpose, which has nothing to do with Rocket.
-        // Once the stem conv (dispatch_0's sole consumer) becomes
-        // rocket-affinitized, IREE's HAL target-variant materialization
-        // additionally generates an empty "rocket_flatbuffer_v1" variant for
-        // dispatch_0 itself, which RocketTarget.cpp's
-        // buildRocketConv2dConfigFromTarget correctly refuses (see that
-        // function's own doc comment: "guarding against some OTHER op ever
-        // getting silently routed to 'rocket'"). This is NOT simply "any CPU
-        // producer feeding a newly-rocket op breaks" -- VGG-19's stem
-        // (stride 1, already claimed and hardware-confirmed end to end
-        // before this change) and every interior CPU->rocket edge already in
-        // the working MobileNetV2 build are fine; the distinguishing factor
-        // isolated so far is that dispatch_0 is a real, independent dispatch
-        // region reading the function's own external argument directly (an
-        // ONNX-authored `onnx.Cast`, not a compiler-inserted demotion VGG
-        // relies on instead), not an ordinary intermediate value. Root cause
-        // not fully isolated; see DESIGN_NOTES.md "Depthwise stride hardware
-        // confirmation..." for the isolation steps taken (confirmed by
-        // disabling just these six matchers: the real MobileNetV2 module
-        // then compiles clean with the depthwise stride matchers below still
-        // active). Re-enable once this is understood and fixed.
+        // The stride-2 dense matchers below were disabled for a long time
+        // because wiring them in broke the compile: they claim MobileNetV2's
+        // stem conv (the only dense conv it runs at stride > 1), and
+        // iree-compile then failed to serialize main_graph$async_dispatch_0,
+        // the model's own input cast+transpose, because IREE's affinity
+        // analysis pulled that CPU dispatch onto @rocket_device along with
+        // its only consumer. That is fixed generally, not specially:
+        // rocket-pin-unclaimed-dispatches pins every dispatch this spec did
+        // not claim to the CPU (see RocketPinUnclaimedDispatchesPass.cpp).
+        //
+        // Turning them back on then exposed three real defects that the
+        // disabling had been hiding, all since fixed and all now covered by
+        // hardware regressions in conv2d_oracle_hw.rs:
+        //
+        //   * strides were being erased outright before matching, so a
+        //     stride-2 conv was dispatched as stride 1 (see
+        //     RocketDemoteConvInputsPass.cpp);
+        //   * dense conv at stride > 1 was wrong whenever
+        //     `(extent - kernel) % stride != 0` (ColumnTile::from_output_range);
+        //   * the stem's Cin=3 feature buffer was never synced for device
+        //     (rocket-hal-driver's command_buffer.rs).
+        //
+        // What is left is a genuine precision tradeoff, not a bug. Rocket's
+        // ABI is f16-in/f32-accumulate, so a conv on the NPU runs its inputs
+        // at half precision. For MobileNetV2's f32 stem that costs about
+        // 0.35 max|err| on the final logits -- the stem feeds an int8
+        // quantization step, and f16-level noise there crosses quantization
+        // boundaries and propagates. Keeping the stem on the CPU instead
+        // costs one offloaded dispatch out of 18 and buys back exact f32
+        // (7.2e-07 against a plain f32 build). The isolated stem convolution
+        // itself is correct on hardware to f16 epsilon, so this is the cost
+        // of f16, not of the NPU being wrong.
         transform.foreach_match in %func
             @match_dynamic_conv2d -> @cast_and_call_dynamic_conv2d,
             @match_dynamic_conv2d_3x3 -> @cast_and_call_dynamic_conv2d,
+            @match_dynamic_conv2d_s2 -> @cast_and_call_dynamic_conv2d_s2,
+            @match_dynamic_conv2d_3x3_s2 -> @cast_and_call_dynamic_conv2d_s2,
             @match_dynamic_depthwise_conv2d -> @cast_and_call_dynamic_depthwise_conv2d,
             @match_dynamic_depthwise_conv2d_3x3 -> @cast_and_call_dynamic_depthwise_conv2d,
             @match_dynamic_depthwise_conv2d_nchw -> @cast_and_call_dynamic_depthwise_conv2d_nchw,

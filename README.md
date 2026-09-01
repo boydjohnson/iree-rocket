@@ -113,6 +113,29 @@ Compiling by hand with `iree-compile` in one shot skips the pass. Single
 convolutions (what `tools/e2e_conv_regression.py` compiles) have nothing to
 mis-place and are unaffected, but a whole model can be.
 
+### Stride-2 dense convolution
+
+The stride-2 dense matchers are enabled, so MobileNetV2's stem convolution
+runs on the NPU (18 offloaded dispatch sites rather than 17). They were
+disabled for a long time behind a compile failure that
+`rocket-pin-unclaimed-dispatches` now fixes; turning them on then exposed
+three genuine defects, all since fixed and covered by hardware regressions.
+
+What remains is a precision tradeoff worth knowing about. Rocket's ABI is
+f16-in/f32-accumulate, so an offloaded convolution runs its inputs at half
+precision. MobileNetV2's stem is f32 and feeds an int8 quantization step, so
+f16-level noise there crosses quantization boundaries and propagates: the
+model lands about 0.35-0.42 max|err| on its final logits against a plain f32
+build, where keeping the stem on the CPU is exact (7e-07). Top-1 is stable
+across inputs except on near-ties -- on one measured input whose top-2 gap was
+0.07, well inside that perturbation, the top two classes swapped.
+
+This is the cost of f16, not of the NPU being wrong: the isolated stem
+convolution matches a CPU reference computing the same f16 arithmetic to f16
+epsilon. To trade the dispatch back for exactness, drop
+`@match_dynamic_conv2d_s2` and `@match_dynamic_conv2d_3x3_s2` from the
+`foreach_match` list in the transform spec.
+
 ### Convolution shape integrity
 
 `rocket-demote-conv-inputs-to-f16` (in the compiler plugin) demotes all-f32
