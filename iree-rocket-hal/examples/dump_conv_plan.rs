@@ -5,7 +5,13 @@
 //! before spending hardware time on the poison-predecessor bug.
 //!
 //!   cargo run -p iree-rocket-hal --example dump_conv_plan -- \
-//!       <width> <height> <stride> <cin> <cout> <kernel>
+//!       <width> <height> <stride> <cin> <cout> <kernel> [pad]
+//!
+//! `pad` is optional and defaults to `kernel / 2` -- which is what
+//! `Shape`'s `padding: None` means, *not* zero. Pass `0` explicitly for the
+//! unpadded shapes a compiled model actually dispatches: IREE materializes
+//! padding as a separate `tensor.pad`, so the convolution the NPU sees has
+//! none, and the two give different tile geometry entirely.
 
 use iree_rocket_hal::rocket::conv::{ConvPlan, Shape, feature_grains};
 
@@ -19,6 +25,7 @@ fn main() {
     let cin = value(3);
     let cout = value(4);
     let kernel = value(5) as usize;
+    let padding = args.get(6).map(|_| value(6) as usize);
 
     let shape = Shape::with_precision(
         width,
@@ -28,11 +35,18 @@ fn main() {
         cout,
         iree_rocket_hal::rocket::conv::Precision::Fp16,
     );
+    let shape = match padding {
+        Some(pad) => shape.with_padding([pad, pad]),
+        None => shape,
+    };
     let kernels = [kernel, kernel];
     let plan = ConvPlan::new(shape, kernels);
 
     println!(
-        "{width}x{height} cin={cin} cout={cout} k={kernel}  data_banks={} weight_banks={} tiles={}",
+        "{width}x{height} cin={cin} cout={cout} k={kernel} pad={}  out={}x{} data_banks={} weight_banks={} tiles={}",
+        padding.map_or(kernel / 2, |pad| pad),
+        shape.output_width(kernels),
+        shape.output_height(kernels),
         plan.data_banks(),
         plan.weight_banks(),
         plan.tiles().len(),

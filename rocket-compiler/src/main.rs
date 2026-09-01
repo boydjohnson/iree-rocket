@@ -182,6 +182,38 @@ fn check_spec_device_names(
     .into())
 }
 
+/// The phase the Rocket placement pin runs at. `flow` is the last point where
+/// every dispatch in the program is still a `flow.dispatch` carrying a plain
+/// `stream.affinity` attribute: dispatch regions have been formed and
+/// outlined, and Stream's affinity analysis -- which is what pulls an
+/// IREE-formed dispatch onto the NPU when its only consumer is a Rocket one
+/// -- has not run yet.
+const PIN_PHASE: &str = "flow";
+
+/// Registered by the compiler plugin; see RocketPinUnclaimedDispatchesPass.cpp.
+const PIN_PASS: &str = "rocket-pin-unclaimed-dispatches";
+
+/// Runs `Pipeline::Std` up to and including the `flow` phase and pins every
+/// dispatch the Rocket transform spec did not explicitly claim to the
+/// default (CPU) device, then leaves the invocation set to resume from
+/// `flow`. The caller sets its own compile-to phase and runs the pipeline
+/// again to continue.
+///
+/// This is split out of a single `Pipeline::Std` run because the Rocket
+/// backend has no codegen at all -- `serializeExecutable` only knows how to
+/// read the config dict the transform spec stamps onto its hand-authored
+/// executables. Anything else that reaches it (an auto-formed pad copy, say)
+/// fails to serialize, so "Rocket runs only what the spec put there" has to
+/// be enforced rather than hoped for, and the only hook a plugin gets --
+/// `extendPreprocessingPassPipeline` -- runs long before dispatches exist.
+fn pin_unclaimed_dispatches(invocation: &Invocation) -> Result<(), Box<dyn Error>> {
+    invocation.set_compile_to_phase(PIN_PHASE);
+    invocation.run_pipeline(Pipeline::Std)?;
+    invocation.run_pass_pipeline(PIN_PASS)?;
+    invocation.set_compile_from_phase(PIN_PHASE);
+    Ok(())
+}
+
 fn run_compile(args: &cli::CompileArgs) -> Result<(), Box<dyn Error>> {
     let lib_path = resolve_lib_path(args.common.iree_compiler_lib.as_deref())?;
     let transform_spec = transform_spec_path(&args.common);
@@ -195,6 +227,8 @@ fn run_compile(args: &cli::CompileArgs) -> Result<(), Box<dyn Error>> {
     let invocation = Invocation::create(&session);
     invocation.enable_console_diagnostics();
     invocation.parse_source(&source)?;
+    pin_unclaimed_dispatches(&invocation)?;
+    invocation.set_compile_to_phase("end");
     invocation.run_pipeline(Pipeline::Std)?;
 
     let output = Output::open_file(&library, &args.output)?;
@@ -217,8 +251,11 @@ fn run_audit(args: &cli::AuditArgs) -> Result<(), Box<dyn Error>> {
     let source = Source::open_file(&session, &args.common.input)?;
     let invocation = Invocation::create(&session);
     invocation.enable_console_diagnostics();
-    invocation.set_compile_to_phase("executable-targets");
     invocation.parse_source(&source)?;
+    // Same staging as `compile`, so the report describes the placement a
+    // .vmfb from this input would actually get.
+    pin_unclaimed_dispatches(&invocation)?;
+    invocation.set_compile_to_phase("executable-targets");
     invocation.run_pipeline(Pipeline::Std)?;
     // Bare pass name, not "builtin.module(rocket-annotate-final-placement)":
     // the invocation's PassManager (unlike iree-opt's generic tool machinery)

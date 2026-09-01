@@ -63,7 +63,9 @@ cargo test --workspace
 
 `rocket-compiler` wraps `libIREECompiler.so` with the Rocket transform spec and
 the device flags that spec hardcodes, so a model does not have to be compiled
-by hand:
+by hand. It is also the only way to compile a model correctly: it runs the
+pipeline in two stages so it can pin placement in the middle (see **Placement
+pinning** below), which a single `iree-compile` invocation cannot do.
 
 ```sh
 export IREE_COMPILER_LIB=iree-build/build/lib/libIREECompiler.so
@@ -78,6 +80,97 @@ the number that answers "how much of the model ran on the NPU": the transform
 spec routes every matched convolution through a handful of fixed executables,
 so an executable count alone understates NPU placement badly, while IREE
 deduplicates identical CPU dispatches, which overstates the CPU side.
+
+### Placement pinning
+
+The Rocket backend has no code generator. `serializeExecutable` only knows how
+to read the config dict that `rocket_conv2d_transform_spec.mlir` stamps onto
+the hand-authored executables it splices in, so the NPU can only ever run
+dispatches the spec itself created -- every one of which carries an explicit
+`stream.affinity = #hal.device.affinity<@rocket_device>`.
+
+Dispatches IREE forms on its own carry no affinity, and Stream's affinity
+analysis places them by propagating through consumers. A dispatch whose result
+is used *only* by a Rocket dispatch therefore gets pulled onto the NPU, and
+serialization then fails on something that is not a convolution at all. The
+observed case is the explicit padding for an int8 depthwise convolution, a
+112x112x48 -> 114x114x48 copy dispatch that IREE names `..._slow_memcpy`;
+nothing pulls it back toward the CPU, because its destination is a fresh
+`flow.tensor.splat` and the Rocket consumer is the only constraint the analysis
+can see. `--iree-hal-default-device` does not help: the module-level
+`stream.affinity.default` it sets only applies where the analysis finds
+nothing.
+
+`rocket-pin-unclaimed-dispatches` (in the compiler plugin) makes the placement
+explicit instead, stamping that default onto every `flow.dispatch` that has no
+affinity of its own. It has to run between the `flow` and `stream` phases --
+after dispatch regions are formed and outlined, before the affinities are
+consumed -- and no plugin hook exists that late, so `rocket-compiler` drives it
+by name: `--compile-to=flow`, the pass, then `--compile-from=flow`. Both
+`compile` and `audit` do this, so the report matches what a `.vmfb` would get.
+
+Compiling by hand with `iree-compile` in one shot skips the pass. Single
+convolutions (what `tools/e2e_conv_regression.py` compiles) have nothing to
+mis-place and are unaffected, but a whole model can be.
+
+### Stride-2 dense convolution
+
+The stride-2 dense matchers are enabled, so MobileNetV2's stem convolution
+runs on the NPU (18 offloaded dispatch sites rather than 17). They were
+disabled for a long time behind a compile failure that
+`rocket-pin-unclaimed-dispatches` now fixes; turning them on then exposed
+three genuine defects, all since fixed and covered by hardware regressions.
+
+What remains is a precision tradeoff worth knowing about. Rocket's ABI is
+f16-in/f32-accumulate, so an offloaded convolution runs its inputs at half
+precision. MobileNetV2's stem is f32 and feeds an int8 quantization step, so
+f16-level noise there crosses quantization boundaries and propagates: the
+model lands about 0.35-0.42 max|err| on its final logits against a plain f32
+build, where keeping the stem on the CPU is exact (7e-07). Top-1 is stable
+across inputs except on near-ties -- on one measured input whose top-2 gap was
+0.07, well inside that perturbation, the top two classes swapped.
+
+This is the cost of f16, not of the NPU being wrong: the isolated stem
+convolution matches a CPU reference computing the same f16 arithmetic to f16
+epsilon. To trade the dispatch back for exactness, drop
+`@match_dynamic_conv2d_s2` and `@match_dynamic_conv2d_3x3_s2` from the
+`foreach_match` list in the transform spec.
+
+### Convolution shape integrity
+
+`rocket-demote-conv-inputs-to-f16` (in the compiler plugin) demotes all-f32
+named 2-D convolution inputs to f16 for Rocket's f16-in/f32-accumulate ABI. It
+exists because the upstream pass the transform spec used to call for this,
+`iree-global-opt-demote-contraction-inputs`, rebuilds the named op through
+`linalg::getPrunedAttributeList`, which elides the op's own declared attribute
+names -- including `strides` and `dilations`. Every strided or dilated
+convolution it touched silently became a stride-1 one.
+
+That is a correctness bug independent of Rocket: linalg drives a convolution's
+iteration space from its output, so the rewritten op still verifies and still
+lowers, it just computes a different convolution over a corner of its input.
+On MobileNetV2 it turned the stride-2 stem conv into a nominal stride-1 conv,
+which then also matched `@match_dynamic_conv2d_3x3` (which requires stride 1)
+and was dispatched to the NPU with the wrong stride.
+
+Demotion has to precede the match loop, because the matchers require
+f16/f16/f32 typing -- but it cannot know which convolutions the loop will
+claim, and deciding that up front would mean re-implementing the matchers'
+eligibility predicates in C++ and keeping the two in sync. So the spec demotes
+every all-f32 named convolution, matches, and then
+`rocket-promote-unclaimed-conv-inputs` restores f32 on whatever is left:
+anything still holding a `linalg.conv_2d_*` after `foreach_match` is by
+definition unclaimed. Without it an unclaimed convolution runs on the CPU in
+half precision when f32 was free -- on MobileNetV2 that is the stride-2 stem,
+worth 0.349 max|err| on the final logits. Only the plugin's own demotion is
+reverted: both passes agree on a `rocket.f16_demoted` tag, so a model that
+authored its own f16 convolution is untouched.
+
+`rocket-verify-conv-shapes` is the tripwire for anything like it: it errors if
+a named convolution's output spatial extent disagrees with its own input,
+filter, stride and dilation. It runs immediately before the match/rewrite
+loop, while padding is still explicit and nothing has been tiled, so the
+relation is exact there. It should never fire.
 
 ### ONNX models
 

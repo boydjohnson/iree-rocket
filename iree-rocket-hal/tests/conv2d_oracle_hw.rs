@@ -765,6 +765,133 @@ fn int8_accumulator_k1_cin_boundary_cases() -> Vec<Conv2dCase> {
 /// and Cout 65 gives three, and those fail. Nothing here is specific to Cin
 /// or the kernel, and none of it is specific to Cout either: the same Cout
 /// values all pass at an even pixel count.
+/// Dense fp16 geometries that the existing stride coverage misses.
+///
+/// Before this list, dense convolution above stride 1 was checked in exactly
+/// two places, and neither could see the two defects below:
+///
+///   * `conv_wide_shape_hw.rs` runs Cin=3, Cout=8, 1x1 and 3x3 at strides 1
+///     to 4 -- but with uniform 1.0 inputs *and* weights, so every output is
+///     just a count of valid taps. That is blind to which input pixels were
+///     read, as long as the right number of them were.
+///   * `cartesian_cases` covers Cin 3/4/5 densely, but only at stride 1.
+///
+/// The one stride-2 dense case anywhere (33x33, Cin=16, Cout=65, in
+/// `int8_accumulator_phase_cases`) happens to use an extent where
+/// `(width - kernel)` divides by the stride exactly, which is precisely the
+/// case that works.
+///
+/// # What these cover
+///
+/// *Window parity.* At stride > 1 an input extent where
+/// `(extent - kernel) % stride != 0` leaves a partial trailing window that no
+/// output tap consumes. `ColumnTile::from_output_range` then derives an
+/// `in_cols` *smaller* than the row it sits in, and that value is programmed
+/// as `CNA_DATA_SIZE0.datain_width` while `line_stride` keeps the full row
+/// pitch. The pairs below straddle that boundary at three sizes: 33/35/65
+/// divide exactly, 34/36/66 do not.
+///
+/// *Sub-atom input channels.* One 16-byte feature atom holds 8 fp16
+/// channels. Cin 1/2/4 do not fill one; 8/16 do. Run at stride 1 so the
+/// window-parity axis above is held fixed.
+///
+/// # A known flake in this list
+///
+/// `34x34 Cin=8` intermittently fails when the matrix runs in order, and
+/// passes every time under `ROCKET_PROBE_ONLY`. That is the per-process
+/// contamination `run_hardware_case_matrix` documents, not a verdict on the
+/// shape: it flakes identically with the CBUF residency fix reverted, and its
+/// plan (one tile, 34 rows) is unaffected by anything here. Isolate before
+/// believing a failure on this row.
+///
+/// `OraclePattern::Dense` is the point of all of these: every tap and channel
+/// carries a distinct nonzero weight, so a wrong-pixel or wrong-channel read
+/// changes the result instead of cancelling out. Inputs are in [-3, 3] and
+/// weights in {-2, -1, 1, 2}, so the largest accumulator any of these can
+/// produce is `6 * 16 * 9 = 864`, well inside the 2048 where fp16 still
+/// represents every integer exactly and the oracle's zero tolerance holds.
+/// Geometries either side of the CBUF residency boundary.
+///
+/// The surface feature charge is counted in whole `data_entries` entries of
+/// four atoms and rounds *up*, so a row whose atom count is not a multiple of
+/// four still occupies its whole final entry.
+/// `Shape::max_tile_input_rows_for_width_and_data_banks` used to charge bare
+/// atoms instead, letting a tile claim rows that do not fit. The overflow
+/// lands on the tail of the tile's last input row, which surfaces as the last
+/// output row of that tile being wrong from some column onwards while every
+/// earlier row is exact -- a single wrong row in an otherwise perfect result,
+/// which is exactly the shape of failure a coarse tolerance check misses.
+///
+/// At Cin=16 fp16 a row is two atoms per pixel, so odd widths are the ones
+/// that round up. The pairs below sit either side of the bound at three
+/// widths, and the height sweep walks one width across it a row at a time:
+/// 113x113 wanted 5643 entries against the 5632 available, while 115x113
+/// fits at 5626 and has to keep working.
+fn cbuf_residency_boundary_cases() -> Vec<Conv2dCase> {
+    let dense = |width: u32, height: u32| Conv2dCase {
+        width,
+        height,
+        cin: 16,
+        cout: 16,
+        kernel: [3, 3],
+        stride: 2,
+        padding: [0, 0],
+        precision: OraclePrecision::Fp16,
+        pattern: OraclePattern::Dense { phase: 0 },
+    };
+
+    let mut cases = Vec::new();
+    // Widths that round up (odd) against their even neighbours, at a height
+    // that forces a multi-tile split.
+    for width in [109u32, 111, 112, 113, 114, 115, 117, 119] {
+        cases.push(dense(width, 113));
+    }
+    // One width walked across the bound by height alone. Every one of these
+    // is a single tile, which is what rules out tile *splitting* as the
+    // cause: 113x99 is one tile that does not fit.
+    for height in [91u32, 93, 95, 97, 99] {
+        cases.push(dense(113, height));
+    }
+    cases
+}
+
+fn dense_geometry_regression_cases() -> Vec<Conv2dCase> {
+    let mut cases = Vec::new();
+    let dense = |width: u32, height: u32, cin: u32, kernel: usize, stride: u32| Conv2dCase {
+        width,
+        height,
+        cin,
+        cout: 16,
+        kernel: [kernel, kernel],
+        stride,
+        padding: [0, 0],
+        precision: OraclePrecision::Fp16,
+        pattern: OraclePattern::Dense { phase: 0 },
+    };
+
+    // Window parity at stride 2: exact / leftover / exact / leftover / ...
+    for extent in [33u32, 34, 35, 36, 65, 66] {
+        cases.push(dense(extent, extent, 16, 3, 2));
+    }
+    // The same boundary at stride 3 and 4. `(extent - 3) % stride`: 33 and 36
+    // divide at stride 3, 35 divides at stride 4, the others do not.
+    for extent in [33u32, 34, 35, 36] {
+        cases.push(dense(extent, extent, 16, 3, 3));
+        cases.push(dense(extent, extent, 16, 3, 4));
+    }
+    // A 1x1 control: at kernel 1 the derived `in_cols` always reaches the end
+    // of the row, so these should pass at every extent and pin that down.
+    for extent in [32u32, 33] {
+        cases.push(dense(extent, extent, 16, 1, 2));
+    }
+    // Sub-atom input-channel counts, stride 1 so only Cin varies. 8 fp16
+    // channels fill one 16-byte feature atom; 1/2/4 do not.
+    for cin in [1u32, 2, 4, 8, 16, 32] {
+        cases.push(dense(34, 34, cin, 3, 1));
+    }
+    cases
+}
+
 fn int8_accumulator_parity_regression_cases() -> Vec<Conv2dCase> {
     let mut cases = Vec::new();
     for (cin, cout, kernel) in [
@@ -1644,6 +1771,38 @@ fn int8_accumulator_parity_regression_matrix_matches_oracle() {
     let cases = int8_accumulator_parity_regression_cases();
     assert_eq!(cases.len(), 6);
     run_hardware_case_matrix("int8 accumulator parity regression matrix", cases);
+}
+
+#[test]
+fn dense_geometry_regression_is_planable_and_gap_free() {
+    let cases = dense_geometry_regression_cases();
+    assert_eq!(cases.len(), 22);
+    assert_planable_and_gap_free(cases);
+}
+
+#[test]
+fn cbuf_residency_boundary_is_planable_and_gap_free() {
+    let cases = cbuf_residency_boundary_cases();
+    assert_eq!(cases.len(), 13);
+    assert_planable_and_gap_free(cases);
+}
+
+#[test]
+#[ignore = "needs /dev/accel/accel0 -- CBUF entry-rounding residency boundary"]
+fn cbuf_residency_boundary_matches_oracle() {
+    run_hardware_case_matrix(
+        "CBUF entry-rounding residency boundary",
+        cbuf_residency_boundary_cases(),
+    );
+}
+
+#[test]
+#[ignore = "needs /dev/accel/accel0 -- dense stride/window-parity and sub-atom Cin geometries"]
+fn dense_geometry_regression_matches_oracle() {
+    run_hardware_case_matrix(
+        "dense fp16 stride/window-parity and sub-atom Cin geometries",
+        dense_geometry_regression_cases(),
+    );
 }
 
 #[cfg(feature = "hardware-characterization")]

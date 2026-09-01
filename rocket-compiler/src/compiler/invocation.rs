@@ -59,6 +59,23 @@ impl<'lib> Invocation<'lib> {
         };
     }
 
+    /// Mnemonic IREEVMPipelinePhase name to resume compilation *after* (the
+    /// CLI's `--compile-from=<phase>`). Default is `"start"`.
+    ///
+    /// Paired with `set_compile_to_phase`, this is what makes a staged
+    /// compile possible: `run_pipeline` builds a fresh pass manager on each
+    /// call and rewrites the invocation's module in place, so running to a
+    /// phase, applying a pass of our own, and then resuming from that same
+    /// phase is a supported sequence rather than a re-parse.
+    pub fn set_compile_from_phase(&self, phase: &str) {
+        let c_phase = CString::new(phase).expect("phase name must not contain NUL");
+        unsafe {
+            self.library
+                .api
+                .ireeCompilerInvocationSetCompileFromPhase(self.raw, c_phase.as_ptr())
+        };
+    }
+
     pub fn parse_source(&self, source: &Source<'lib>) -> Result<(), CompilerError> {
         let ok = unsafe {
             self.library
