@@ -265,6 +265,7 @@ pub fn pack_hwcf_to_rocket_weights(
         filter_width,
         input_channels,
         output_channels,
+        output_channels,
         element_size,
         None,
         packed,
@@ -281,6 +282,41 @@ pub fn pack_hwcf_to_rocket_weights(
 /// [`crate::rocket::conv::BsEntry::constant`]. A programmed odd-Cout padding
 /// kernel remains all zero because it has no quantization parameters and is
 /// never exposed as a logical output channel.
+/// Packs HWCF coefficients for a *wider* programmed output-channel count
+/// than the filter logically has, zero-filling the surplus channels.
+///
+/// This is the coefficient half of
+/// [`crate::rocket::conv::Shape::parity_padded_out_channels`]: the RK3588
+/// DPU only commits accumulator output in whole 256-byte units, so a shape
+/// whose output width and block count are both odd has to be programmed with
+/// more output channels than it needs. The surplus channels must compute
+/// zero, and their results are then discarded on the way back out.
+///
+/// `padded_output_channels` must be at least `output_channels`. Passing them
+/// equal is exactly [`pack_hwcf_to_rocket_weights`].
+pub fn pack_hwcf_to_rocket_weights_padded(
+    dense: &[u8],
+    filter_height: usize,
+    filter_width: usize,
+    input_channels: usize,
+    output_channels: usize,
+    padded_output_channels: usize,
+    element_size: usize,
+    packed: &mut [u8],
+) -> Result<usize, &'static str> {
+    pack_hwcf_to_rocket_weights_impl(
+        dense,
+        filter_height,
+        filter_width,
+        input_channels,
+        output_channels,
+        padded_output_channels,
+        element_size,
+        None,
+        packed,
+    )
+}
+
 pub fn pack_hwcf_to_rocket_weights_affine_i8(
     dense: &[u8],
     filter_height: usize,
@@ -299,6 +335,7 @@ pub fn pack_hwcf_to_rocket_weights_affine_i8(
         filter_width,
         input_channels,
         output_channels,
+        output_channels,
         1,
         Some(weight_zero_points),
         packed,
@@ -311,10 +348,14 @@ fn pack_hwcf_to_rocket_weights_impl(
     filter_width: usize,
     input_channels: usize,
     output_channels: usize,
+    padded_output_channels: usize,
     element_size: usize,
     weight_zero_points: Option<&[i8]>,
     packed: &mut [u8],
 ) -> Result<usize, &'static str> {
+    if padded_output_channels < output_channels {
+        return Err("padded output channel count is smaller than the logical one");
+    }
     let dense_len = filter_height
         .checked_mul(filter_width)
         .and_then(|value| value.checked_mul(input_channels))
@@ -329,7 +370,7 @@ fn pack_hwcf_to_rocket_weights_impl(
         filter_height,
         filter_width,
         input_channels,
-        output_channels,
+        padded_output_channels,
         element_size,
     )?;
     if packed.len() < packed_len {
@@ -1049,6 +1090,69 @@ mod tests {
         assert!(
             pack_depthwise_to_rocket_weights(&dense, 3, 3, 8, 8, 1, &mut packed).is_err(),
             "a packed buffer one byte short must be refused"
+        );
+    }
+}
+
+#[cfg(test)]
+mod parity_padding_tests {
+    use super::*;
+
+    /// The surplus channels a parity pad introduces must pack to literal
+    /// zero coefficients, and the real channels must land exactly where an
+    /// unpadded pack would put them.
+    ///
+    /// Both halves matter: zeros are what make the padding channels compute
+    /// nothing, and the real channels moving would corrupt the actual
+    /// convolution. Verified against hardware by
+    /// `int8_accumulator_cout_padding_probe`.
+    #[test]
+    fn padded_pack_zero_fills_surplus_and_preserves_real_channels() {
+        for kernel in [1usize, 3] {
+            let (cin, cout, padded) = (8usize, 32usize, 64usize);
+            let dense: Vec<u8> = (0..kernel * kernel * cin * cout)
+                .map(|index| ((index % 7) as i8 - 3) as u8)
+                .collect();
+
+            let unpadded_len = rocket_weight_storage_size(kernel, kernel, cin, cout, 1).unwrap();
+            let mut unpadded = vec![0xffu8; unpadded_len];
+            pack_hwcf_to_rocket_weights(&dense, kernel, kernel, cin, cout, 1, &mut unpadded)
+                .unwrap();
+
+            let padded_len = rocket_weight_storage_size(kernel, kernel, cin, padded, 1).unwrap();
+            let mut packed = vec![0xffu8; padded_len];
+            let written = pack_hwcf_to_rocket_weights_padded(
+                &dense,
+                kernel,
+                kernel,
+                cin,
+                cout,
+                padded,
+                1,
+                &mut packed,
+            )
+            .unwrap();
+
+            assert_eq!(written, padded_len);
+            assert_eq!(padded_len, 2 * unpadded_len, "k{kernel} should double");
+            assert_eq!(
+                &packed[..unpadded_len],
+                &unpadded[..],
+                "k{kernel}: real channels must pack identically to the unpadded filter"
+            );
+            assert!(
+                packed[unpadded_len..].iter().all(|byte| *byte == 0),
+                "k{kernel}: surplus channels must pack to zero coefficients"
+            );
+        }
+    }
+
+    #[test]
+    fn padded_pack_rejects_a_narrower_padded_count() {
+        let dense = vec![0u8; 8 * 32];
+        let mut packed = vec![0u8; 4096];
+        assert!(
+            pack_hwcf_to_rocket_weights_padded(&dense, 1, 1, 8, 32, 16, 1, &mut packed).is_err()
         );
     }
 }

@@ -964,6 +964,55 @@ impl Shape {
         self.out_channels.next_multiple_of(granule).max(granule)
     }
 
+    /// Output blocks per pixel the DPU commits, the quantity the output
+    /// parity rule counts.
+    pub fn output_blocks_per_pixel(&self) -> u32 {
+        (self.padded_out_channels() * self.precision.output_element_bytes())
+            .div_ceil(self.output_atom_bytes())
+    }
+
+    /// Output-channel count this convolution must be *programmed* with for
+    /// its accumulator output to come back correct.
+    ///
+    /// The RK3588 DPU only commits accumulator output in whole 256-byte
+    /// units, so a tile is correct exactly when
+    /// `tile_pixels * output_blocks_per_pixel` is even; an odd product
+    /// leaves a trailing 128-byte block unwritten and corrupts the tile's
+    /// addressing. `tile_pixels` is `out_rows * out_cols` **per tile**, and
+    /// the planner chooses `out_rows` from CBUF capacity, so the row count
+    /// cannot be relied on: measured on RK3588, a 33x8 shape passes when it
+    /// tiles `[2,2,2,2]` and fails when the same shape tiles `[7,1]`.
+    ///
+    /// Two factors are stable enough to key on. An even `out_cols` makes
+    /// every tile even whatever the row split, and an even block count does
+    /// the same. So padding is needed only when **both** the output width
+    /// and the block count are odd, and rounding the programmed channel
+    /// count up to a multiple of 64 makes the block count even.
+    ///
+    /// The padding channels must carry zero coefficients, which
+    /// [`crate::rocket::tensor_layout::pack_hwcf_to_rocket_weights_padded`]
+    /// produces; their output is then discarded. `Int8Accumulator` bypasses
+    /// BS, so no bias or per-channel multiplier reaches them.
+    ///
+    /// Only dense accumulator output is covered. Depthwise writes 256-byte
+    /// atoms and was never measured against this rule, and requantized
+    /// output does not use the accumulator write path at all.
+    pub fn parity_padded_out_channels(&self, kernels: Kernels) -> u32 {
+        if !self.precision.writes_accumulators() || self.depthwise {
+            return self.out_channels;
+        }
+        if self.output_width(kernels) % 2 == 0 || self.output_blocks_per_pixel() % 2 == 0 {
+            return self.out_channels;
+        }
+        self.out_channels
+            .next_multiple_of(2 * self.out_channel_granule())
+    }
+
+    /// Whether [`Shape::parity_padded_out_channels`] widens this shape.
+    pub fn needs_output_parity_padding(&self, kernels: Kernels) -> bool {
+        self.parity_padded_out_channels(kernels) != self.out_channels
+    }
+
     /// Conservative physical output allocation for this convolution, in
     /// bytes.
     ///
@@ -5093,6 +5142,71 @@ mod tests {
         assert_eq!(huge.weight_bytes([3, 3]), 589_824);
         assert_eq!(huge.data_banks([3, 3]), 4);
         assert_eq!(huge.weight_banks([3, 3]), 8);
+    }
+
+    /// Pins `parity_padded_out_channels` to what was measured on RK3588.
+    ///
+    /// The expectations are the hardware results, not a restatement of the
+    /// implementation: shapes in the left column were run on the board and
+    /// either passed or failed, and the padding is required exactly where
+    /// they failed. See `int8_accumulator_output_parity_cases` and
+    /// `int8_accumulator_multitile_parity_cases` in
+    /// `tests/conv2d_oracle_hw.rs`.
+    #[test]
+    fn parity_padding_matches_the_measured_output_parity_rule() {
+        let accumulator = |width: u32, height: u32, cout: u32| {
+            Shape::with_precision(
+                width,
+                height,
+                1,
+                8,
+                cout,
+                Precision::Int8Accumulator(Quantization {
+                    input_zero_point: 0,
+                    output_zero_point: 0,
+                    weight_zero_point: 0,
+                    ..quantization()
+                }),
+            )
+        };
+
+        // (width, height, Cout, expected programmed Cout)
+        for (width, height, cout, expected) in [
+            // Odd width and an odd block count: the failing combination, and
+            // the only one that pads. Cout 32 is one block, 96 is three.
+            (3u32, 3u32, 32u32, 64u32),
+            (9, 7, 32, 64),
+            (5, 5, 96, 128),
+            (33, 8, 32, 64),
+            // Even block count already: 64 is two blocks, 128 is four.
+            (3, 3, 64, 64),
+            (9, 7, 128, 128),
+            // Even width makes every row split even, whatever Cout does.
+            (4, 4, 32, 32),
+            (8, 8, 160, 160),
+            (34, 8, 32, 32),
+        ] {
+            let shape = accumulator(width, height, cout);
+            assert_eq!(
+                shape.parity_padded_out_channels([1, 1]),
+                expected,
+                "{width}x{height} Cout={cout}: blocks={}, width parity {}",
+                shape.output_blocks_per_pixel(),
+                width % 2,
+            );
+        }
+    }
+
+    /// Requantized and depthwise output do not use the dense accumulator
+    /// write path the parity rule was measured on, so neither is padded.
+    #[test]
+    fn parity_padding_leaves_non_accumulator_output_alone() {
+        let requantized = Shape::with_precision(3, 3, 1, 8, 32, Precision::Int8(quantization()));
+        assert_eq!(requantized.parity_padded_out_channels([1, 1]), 32);
+        assert!(!requantized.needs_output_parity_padding([1, 1]));
+
+        let fp16 = Shape::with_precision(3, 3, 1, 8, 32, Precision::Fp16);
+        assert_eq!(fp16.parity_padded_out_channels([1, 1]), 32);
     }
 
     #[test]
