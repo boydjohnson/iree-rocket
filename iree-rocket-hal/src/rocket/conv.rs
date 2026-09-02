@@ -1171,6 +1171,7 @@ impl Shape {
             && !self.depthwise
             && kernels == [1, 1]
             && self.in_channels > 384
+            && !known_bad_shapes_allowed()
         {
             return Err(
                 "dense 1x1 int8 accumulator convolution supports at most 384 input channels",
@@ -2404,7 +2405,7 @@ impl ConvPlan {
                     self.shape,
                     self.kernels,
                     tile,
-                    feature_grains(self.kernels, &tile.rows),
+                    feature_grains_planned(self.shape, self.kernels, &tile.rows),
                     self.data_banks,
                     self.weight_banks,
                     OutputPlacement::SharedImage,
@@ -2475,7 +2476,7 @@ impl ConvPlan {
                 self.shape,
                 self.kernels,
                 tile,
-                feature_grains(self.kernels, &tile.rows),
+                feature_grains_planned(self.shape, self.kernels, &tile.rows),
                 self.data_banks,
                 self.weight_banks,
                 OutputPlacement::ContiguousTile,
@@ -3114,6 +3115,70 @@ pub fn conv_2d_tile(shape: Shape, kernels: Kernels, tile: &Tile) -> Vec<RegCmd> 
 /// value tracks `kernel_height` and is unchanged by `kernel_width`.
 pub fn feature_grains(kernels: Kernels, tile: &Tile) -> u32 {
     tile.in_rows + kernel_programming(kernels, None).height + tile.pad_top
+}
+
+/// [`feature_grains`], with the characterization override applied.
+///
+/// Only `ConvPlan` uses this. The override is gated on `Cin` so a probe can
+/// change the shapes under study without disturbing the health canary the
+/// hardware harness runs first -- forcing a global value breaks known-good
+/// shapes, which is itself evidence that the prefetch is not a free parameter.
+fn feature_grains_planned(shape: Shape, kernels: Kernels, tile: &Tile) -> u32 {
+    let programmed = feature_grains(kernels, tile);
+    if shape.in_channels < grains_override_min_channels() {
+        return programmed;
+    }
+    match grains_override() {
+        Some(GrainsOverride::Exact(value)) => value,
+        Some(GrainsOverride::Cap(cap)) => programmed.min(cap),
+        None => programmed,
+    }
+}
+
+/// Lowest `Cin` the grains override applies to (`ROCKET_FEATURE_GRAINS_MIN_CIN`,
+/// default 0).
+fn grains_override_min_channels() -> u32 {
+    std::env::var("ROCKET_FEATURE_GRAINS_MIN_CIN")
+        .ok()
+        .and_then(|value| value.parse().ok())
+        .unwrap_or(0)
+}
+
+/// Test-only override of the programmed prefetch. See [`grains_override`].
+enum GrainsOverride {
+    Exact(u32),
+    Cap(u32),
+}
+
+/// Lets a hardware probe drive `feature_grains` through the *whole* ConvPlan
+/// path rather than hand-building one tile, which is what
+/// `conv_2d_tile_with_grains` already allows for a single tile.
+///
+/// This exists because our value and the vendor's disagree systematically --
+/// ours is rows-driven and stays near 33, while the vendor drives it down with
+/// channel pressure (33, 16, 9, ... 6) -- and no gate test compares the field.
+/// `ROCKET_FEATURE_GRAINS=<n>` pins it; `ROCKET_FEATURE_GRAINS_MAX=<n>` clamps
+/// it. Nothing on the compiled path sets either.
+fn grains_override() -> Option<GrainsOverride> {
+    if let Ok(value) = std::env::var("ROCKET_FEATURE_GRAINS") {
+        if let Ok(parsed) = value.parse() {
+            return Some(GrainsOverride::Exact(parsed));
+        }
+    }
+    if let Ok(value) = std::env::var("ROCKET_FEATURE_GRAINS_MAX") {
+        if let Ok(parsed) = value.parse() {
+            return Some(GrainsOverride::Cap(parsed));
+        }
+    }
+    None
+}
+
+/// Whether shapes the HAL knows are miscomputed on this hardware may still be
+/// planned. Only a characterization probe should set this: the guards exist
+/// because the device returns wrong data, and the point of lifting them is to
+/// study that. Nothing on the compiled path sets it.
+fn known_bad_shapes_allowed() -> bool {
+    std::env::var_os("ROCKET_ALLOW_KNOWN_BAD_SHAPES").is_some()
 }
 
 /// Builds a tile program with an explicit `feature_grains`, for probing which

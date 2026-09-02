@@ -2791,3 +2791,50 @@ fn group_division_high_channel_splits_match_oracle() {
         group_division_split_cases(),
     );
 }
+
+/// Dense int8 **accumulator** 1x1 across the `Cin` cliff, for the grains
+/// experiment.
+///
+/// This is the shape family that is exact to `Cin` 384 and wrong from 400 up
+/// with exactly one output row correct. The vendor capture diff
+/// (`k1_residency_diff`) showed our tile count, bank split, `in_rows` and
+/// `cbuf_data_entries` match the vendor *exactly* across the cliff, so the CBUF
+/// residency arithmetic is not the cause. The one field that differs is
+/// `feature_grains`, which no gate test checks: ours is rows-driven and sits
+/// near 33 while the vendor drives it down with channel pressure to 9 and then
+/// 6.
+///
+/// Drive the arms with `ROCKET_FEATURE_GRAINS=<n>` or
+/// `ROCKET_FEATURE_GRAINS_MAX=<n>`; `Cin > 384` needs
+/// `ROCKET_ALLOW_KNOWN_BAD_SHAPES=1`. `Cin` 384 is the control and must stay
+/// exact in every arm -- if it breaks, the arm is invalid, not informative.
+fn accumulator_grains_cases() -> Vec<Conv2dCase> {
+    [384u32, 400, 448, 512]
+        .into_iter()
+        .map(|cin| Conv2dCase {
+            width: 32,
+            height: 32,
+            cin,
+            cout: 64,
+            kernel: [1, 1],
+            stride: 1,
+            padding: [0, 0],
+            precision: OraclePrecision::Int8Accumulator,
+            pattern: OraclePattern::Counting,
+        })
+        .collect()
+}
+
+#[test]
+#[ignore = "requires the RK3588 NPU"]
+fn accumulator_high_channel_grains_probe() {
+    unsafe { std::env::set_var("ROCKET_ALLOW_KNOWN_BAD_SHAPES", "1") };
+    unsafe { std::env::set_var("ROCKET_ALLOW_UNBACKED_CHANNELS", "1") };
+    let grains = std::env::var("ROCKET_FEATURE_GRAINS")
+        .or_else(|_| std::env::var("ROCKET_FEATURE_GRAINS_MAX"))
+        .unwrap_or_else(|_| "default".to_string());
+    run_hardware_case_matrix(
+        &format!("int8 accumulator 1x1 Cin cliff, grains={grains}"),
+        accumulator_grains_cases(),
+    );
+}
