@@ -904,6 +904,37 @@ fn cbuf_residency_boundary_cases() -> Vec<Conv2dCase> {
     cases
 }
 
+/// The first dense MobileNetV2 shape excluded only by the fp16 `Cout <= 512`
+/// matcher bound: four 14x14 1x1 convolutions expand 88 channels to 528.
+///
+/// `MAX_OUTPUT_CHANNELS` now admits 768, but the fp16 matcher deliberately
+/// remains narrower because large-footprint 3x3 shapes can produce all-zero
+/// output with the same family of CBUF partitions. This exact 1x1 shape has
+/// a far smaller coefficient footprint, so measure it independently before
+/// widening the matcher. `Counting` verifies complete accumulation, while
+/// `Selectors` and `Dense` catch coefficient-layout and ordinary-value errors.
+#[cfg(feature = "hardware-characterization")]
+fn fp16_mobilenetv2_cout_528_candidate_cases() -> Vec<Conv2dCase> {
+    [
+        OraclePattern::Counting,
+        OraclePattern::Selectors { phase: 0 },
+        OraclePattern::Dense { phase: 1 },
+    ]
+    .into_iter()
+    .map(|pattern| Conv2dCase {
+        width: 14,
+        height: 14,
+        cin: 88,
+        cout: 528,
+        kernel: [1, 1],
+        stride: 1,
+        padding: [0, 0],
+        precision: OraclePrecision::Fp16,
+        pattern,
+    })
+    .collect()
+}
+
 fn dense_geometry_regression_cases() -> Vec<Conv2dCase> {
     let mut cases = Vec::new();
     let dense = |width: u32, height: u32, cin: u32, kernel: usize, stride: u32| Conv2dCase {
@@ -1836,6 +1867,14 @@ fn cbuf_residency_boundary_is_planable_and_gap_free() {
     assert_planable_and_gap_free(cases);
 }
 
+#[cfg(feature = "hardware-characterization")]
+#[test]
+fn fp16_mobilenetv2_cout_528_candidate_is_planable_and_gap_free() {
+    let cases = fp16_mobilenetv2_cout_528_candidate_cases();
+    assert_eq!(cases.len(), 3);
+    assert_planable_and_gap_free(cases);
+}
+
 #[test]
 #[ignore = "needs /dev/accel/accel0 -- CBUF entry-rounding residency boundary"]
 fn cbuf_residency_boundary_matches_oracle() {
@@ -1851,6 +1890,16 @@ fn dense_geometry_regression_matches_oracle() {
     run_hardware_case_matrix(
         "dense fp16 stride/window-parity and sub-atom Cin geometries",
         dense_geometry_regression_cases(),
+    );
+}
+
+#[cfg(feature = "hardware-characterization")]
+#[test]
+#[ignore = "needs /dev/accel/accel0 -- characterizes MobileNetV2's 14x14 fp16 88-to-528 1x1 candidate"]
+fn fp16_mobilenetv2_cout_528_candidate_matches_oracle() {
+    run_hardware_case_matrix(
+        "MobileNetV2 fp16 14x14 88-to-528 1x1 matcher candidate",
+        fp16_mobilenetv2_cout_528_candidate_cases(),
     );
 }
 
