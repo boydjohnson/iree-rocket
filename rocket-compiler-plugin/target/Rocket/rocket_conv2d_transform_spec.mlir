@@ -2203,7 +2203,8 @@ module attributes {transform.with_named_sequence} {
     transform.iree.match.dims_equal %strides, [1, 1] : !transform.param<i64>
     transform.iree.match.dims_equal %dilations, [1, 1] : !transform.param<i64>
 
-    // Cout is capped well below MAX_OUTPUT_CHANNELS (512); Cin is not. This
+    // Cin remains capped at 512 and Cout is capped well below
+    // MAX_OUTPUT_CHANNELS (528). This is hardware-verified, not a guess: an
     // is hardware-verified, not a guess: an isolated correctness probe
     // (iree-rocket-hal/tests/conv_cbuf_split_sweep_hw.rs and
     // conv_features19_isolated_hw.rs), run in isolation on real Planck
@@ -2252,7 +2253,11 @@ module attributes {transform.with_named_sequence} {
     %input_value = transform.get_operand %root[0] : (!transform.any_op) -> !transform.any_value
     %filter_value = transform.get_operand %root[1] : (!transform.any_op) -> !transform.any_value
     transform.iree.match.dim_bounds %input_value[3], umin = 1, umax = 512 : !transform.any_value
-    transform.iree.match.dim_bounds %filter_value[3], umin = 1, umax = 512 : !transform.any_value
+    // MobileNetV2's four 14x14, Cin=88, Cout=528 pointwise convolutions
+    // pass the three hardware-oracle patterns with a 2/10 CBUF split. Keep
+    // this narrow expansion local to the stride-1 1x1 matcher; the 3x3 and
+    // strided matchers retain their separately characterized 512 limit.
+    transform.iree.match.dim_bounds %filter_value[3], umin = 1, umax = 528 : !transform.any_value
     transform.yield %root : !transform.any_op
   }
 
