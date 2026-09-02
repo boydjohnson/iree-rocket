@@ -31,7 +31,7 @@ use std::{
     os::unix::io::AsRawFd,
     panic::{AssertUnwindSafe, catch_unwind},
     ptr,
-    sync::Mutex,
+    sync::{Mutex, OnceLock},
 };
 
 use conv2d_oracle::{
@@ -65,11 +65,10 @@ struct OwnedBuffer {
 }
 
 impl OwnedBuffer {
-    unsafe fn new(fd: i32, size: usize, file: &std::fs::File) -> Self {
-        Self {
-            fd,
-            buffer: unsafe { Buffer::new(fd, page_aligned_size(size), file) },
-        }
+    unsafe fn new(fd: i32, size: usize, file: &std::fs::File, role: &'static str) -> Self {
+        let buffer = unsafe { Buffer::new(fd, page_aligned_size(size), file) };
+        ledger_record_alloc(role, &buffer);
+        Self { fd, buffer }
     }
 
     /// Extra mapped bytes to append to a named input buffer.
@@ -101,8 +100,13 @@ impl OwnedBuffer {
             .unwrap_or(0)
     }
 
-    unsafe fn from_bytes_padded(fd: i32, bytes: &[u8], which: &str, file: &std::fs::File) -> Self {
-        let buffer = unsafe { Self::new(fd, bytes.len() + Self::pad_bytes(which), file) };
+    unsafe fn from_bytes_padded(
+        fd: i32,
+        bytes: &[u8],
+        which: &'static str,
+        file: &std::fs::File,
+    ) -> Self {
+        let buffer = unsafe { Self::new(fd, bytes.len() + Self::pad_bytes(which), file, which) };
         unsafe {
             ptr::write_bytes(buffer.buffer.host_ptr, 0, buffer.buffer.size);
             ptr::copy_nonoverlapping(bytes.as_ptr(), buffer.buffer.host_ptr, bytes.len());
@@ -122,7 +126,7 @@ impl OwnedBuffer {
 
     #[allow(dead_code)]
     unsafe fn from_bytes(fd: i32, bytes: &[u8], file: &std::fs::File) -> Self {
-        let buffer = unsafe { Self::new(fd, bytes.len(), file) };
+        let buffer = unsafe { Self::new(fd, bytes.len(), file, "SCRATCH") };
         unsafe {
             ptr::write_bytes(buffer.buffer.host_ptr, 0, buffer.buffer.size);
             ptr::copy_nonoverlapping(bytes.as_ptr(), buffer.buffer.host_ptr, bytes.len());
@@ -133,10 +137,322 @@ impl OwnedBuffer {
 
 impl Drop for OwnedBuffer {
     fn drop(&mut self) {
+        ledger_record_free(self.buffer.handle);
         unsafe {
             let _ = unmap_bo(&self.buffer);
             let _ = close_bo(self.fd, self.buffer.handle);
         }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// IOVA ledger -- `ROCKET_IOVA_LEDGER=1`
+//
+// Instrumentation for the buffer/DMA-address-reuse theory of this file's
+// per-process contamination. Every case allocates five GEM buffers and frees
+// them again, so the IOVAs `CREATE_BO` hands back are recycled continuously,
+// and the RK3588 NPU sits behind the Rockchip IOMMU (three cores, each with
+// `iommus` in the device tree). If a freed IOVA is reissued while a stale
+// translation survives, the DPU reads and writes the *previous* case's
+// physical pages -- which is exactly the symptom set this sweep shows:
+// sentinel-valued output (the DPU wrote somewhere else), fully written wrong
+// values (it read someone else's weights), contamination that only a fresh
+// process clears (IOVA allocation is per `drm_file`), and order dependence.
+//
+// This tests that theory without a kernel patch, because `CREATE_BO` already
+// returns the IOVA and `Buffer` keeps it in `dma_address`. The ledger records
+// every lease, flags any overlap between simultaneously live buffers,
+// attributes each new lease to the freed one whose address it recycles, and
+// after each dispatch re-reads the buffers the DPU was only supposed to read
+// to see whether it wrote outside its output.
+//
+// Deliberately opt-in, and it allocates no GEM buffers and submits no jobs of
+// its own -- `run_hardware_case_matrix`'s doc comment records what happened
+// the last time this loop grew work on its failure path. The scan's `PREP_BO`
+// calls are cache maintenance on buffers the job has already finished with,
+// not new work for the DPU, but they are still a change to the sequence. The
+// ledger's own output is therefore only trustworthy when the run's failure
+// set matches a run with the knob off. Check that first, every time.
+// ---------------------------------------------------------------------------
+
+/// One GEM buffer's IOVA lease, exactly as `CREATE_BO` handed it out.
+#[derive(Clone)]
+struct BoLease {
+    seq: u64,
+    case: usize,
+    role: &'static str,
+    dma: u32,
+    size: usize,
+    handle: u32,
+}
+
+impl BoLease {
+    fn end(&self) -> u64 {
+        u64::from(self.dma) + self.size as u64
+    }
+
+    fn overlaps(&self, other: &BoLease) -> bool {
+        u64::from(self.dma) < other.end() && u64::from(other.dma) < self.end()
+    }
+
+    fn range(&self) -> String {
+        format!("{:#x}+{:#x}", self.dma, self.size)
+    }
+}
+
+struct IovaLedger {
+    /// Leases the kernel currently considers outstanding.
+    live: Vec<BoLease>,
+    /// Every released lease, oldest first -- the recycling history.
+    freed: Vec<BoLease>,
+    /// Leases taken by the case being measured right now.
+    case_leases: Vec<BoLease>,
+    notes: Vec<String>,
+    seq: u64,
+    case: usize,
+}
+
+impl IovaLedger {
+    const fn new() -> Self {
+        Self {
+            live: Vec::new(),
+            freed: Vec::new(),
+            case_leases: Vec::new(),
+            notes: Vec::new(),
+            seq: 0,
+            case: 0,
+        }
+    }
+}
+
+static IOVA_LEDGER: Mutex<IovaLedger> = Mutex::new(IovaLedger::new());
+
+fn ledger_enabled() -> bool {
+    static ENABLED: OnceLock<bool> = OnceLock::new();
+    *ENABLED.get_or_init(|| std::env::var_os("ROCKET_IOVA_LEDGER").is_some())
+}
+
+fn lock_ledger() -> std::sync::MutexGuard<'static, IovaLedger> {
+    IOVA_LEDGER
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+}
+
+/// Opens a fresh page for `case`. `freed` deliberately survives: the whole
+/// point is what an address held *before* this case got it.
+fn ledger_begin_case(case: usize) {
+    if !ledger_enabled() {
+        return;
+    }
+    let mut ledger = lock_ledger();
+    ledger.case = case;
+    ledger.case_leases.clear();
+    ledger.notes.clear();
+}
+
+fn ledger_note(note: String) {
+    if !ledger_enabled() {
+        return;
+    }
+    lock_ledger().notes.push(note);
+}
+
+fn ledger_record_alloc(role: &'static str, buffer: &Buffer) {
+    if !ledger_enabled() {
+        return;
+    }
+    let mut ledger = lock_ledger();
+    ledger.seq += 1;
+    let lease = BoLease {
+        seq: ledger.seq,
+        case: ledger.case,
+        role,
+        dma: buffer.dma_address,
+        size: buffer.size,
+        handle: buffer.handle,
+    };
+
+    let mut notes = Vec::new();
+    // Two simultaneously live buffers sharing an address would be a kernel
+    // allocator bug outright, and would explain every symptom on its own.
+    for other in &ledger.live {
+        if lease.overlaps(other) {
+            notes.push(format!(
+                "OVERLAP {} {} with live case {} {} {}",
+                lease.role,
+                lease.range(),
+                other.case,
+                other.role,
+                other.range(),
+            ));
+        }
+    }
+    // Whose address this used to be. Reuse is expected and benign by itself;
+    // it only means something next to a failure, which is why it is recorded
+    // per case rather than asserted on.
+    if let Some(previous) = ledger
+        .freed
+        .iter()
+        .rev()
+        .find(|freed| freed.overlaps(&lease))
+    {
+        notes.push(format!(
+            "{} {} recycles case {} {} {} (seq {})",
+            lease.role,
+            lease.range(),
+            previous.case,
+            previous.role,
+            previous.range(),
+            previous.seq,
+        ));
+    }
+    ledger.notes.extend(notes);
+    ledger.case_leases.push(lease.clone());
+    ledger.live.push(lease);
+}
+
+fn ledger_record_free(handle: u32) {
+    if !ledger_enabled() {
+        return;
+    }
+    let mut ledger = lock_ledger();
+    // GEM handles are recycled too, but only one live buffer holds a given
+    // handle at a time, so this is unambiguous.
+    if let Some(position) = ledger.live.iter().position(|lease| lease.handle == handle) {
+        let lease = ledger.live.remove(position);
+        ledger.freed.push(lease);
+    }
+}
+
+/// The measured case's buffer table plus whatever the scan flagged, ready to
+/// print under the case's own result line. `None` when the ledger is off.
+fn ledger_case_report() -> Option<String> {
+    if !ledger_enabled() {
+        return None;
+    }
+    let ledger = lock_ledger();
+    let map = ledger
+        .case_leases
+        .iter()
+        .map(|lease| format!("{}={}", lease.role, lease.range()))
+        .collect::<Vec<_>>()
+        .join(" ");
+    let mut lines = vec![format!("      iova: {map}")];
+    lines.extend(
+        ledger
+            .notes
+            .iter()
+            .map(|note| format!("      iova: {note}")),
+    );
+    Some(lines.join("\n"))
+}
+
+/// Re-reads a buffer the DPU was only supposed to read and reports any byte
+/// that changed.
+///
+/// `PREP_BO` first, or the CPU's own clean lines from before `FINI_BO` would
+/// hide a device write to the same address. `written` is what this process
+/// put there; bytes past it are `from_bytes_padded`'s `fill`, which is zero
+/// unless `ROCKET_POISON_*` asked for something else.
+unsafe fn ledger_scan_readonly_bo(
+    fd: i32,
+    buffer: &OwnedBuffer,
+    written: &[u8],
+    fill: u8,
+    role: &str,
+) {
+    if !ledger_enabled() {
+        return;
+    }
+    if let Err(error) = unsafe { prep_bo(fd, buffer.buffer.handle, PER_CASE_TIMEOUT_NS) } {
+        ledger_note(format!(
+            "{role}: PREP_BO for read-back scan failed: {error}"
+        ));
+        return;
+    }
+    let mapped = unsafe { std::slice::from_raw_parts(buffer.buffer.host_ptr, buffer.buffer.size) };
+    let intact = |offset: usize, byte: u8| byte == written.get(offset).copied().unwrap_or(fill);
+    let Some((offset, &byte)) = mapped
+        .iter()
+        .enumerate()
+        .find(|(offset, byte)| !intact(*offset, **byte))
+    else {
+        return;
+    };
+    let changed = mapped
+        .iter()
+        .enumerate()
+        .filter(|(offset, byte)| !intact(*offset, **byte))
+        .count();
+    ledger_note(format!(
+        "STRAY WRITE into {role} {:#x}+{:#x}: {changed} bytes changed, first at +{offset:#x} \
+         (wrote {:#04x}, read back {byte:#04x})",
+        buffer.buffer.dma_address,
+        buffer.buffer.size,
+        written.get(offset).copied().unwrap_or(fill),
+    ));
+}
+
+/// Re-reads the output after the read-only scan, to separate "the DPU never
+/// wrote these bytes" from "it had not written them *yet*".
+///
+/// `rocket-hal-driver`'s `DEPTHWISE_TO_DENSE_QUIESCENCE` records the same
+/// hazard from the production side, hardware-validated: `PREP_BO` observes
+/// the output fence, but the RK3588 DPU can still retain write-back state
+/// briefly after that fence has signaled. If a case's missing tail turns up
+/// here, this sweep raced the drain rather than measuring the shape.
+unsafe fn ledger_recheck_output_drain(fd: i32, output: &OwnedBuffer, first_read: &[u8]) {
+    if !ledger_enabled() {
+        return;
+    }
+    std::thread::sleep(std::time::Duration::from_millis(2));
+    if let Err(error) = unsafe { prep_bo(fd, output.buffer.handle, PER_CASE_TIMEOUT_NS) } {
+        ledger_note(format!("output drain re-check: PREP_BO failed: {error}"));
+        return;
+    }
+    let mapped = unsafe { std::slice::from_raw_parts(output.buffer.host_ptr, first_read.len()) };
+    let settled = mapped
+        .iter()
+        .zip(first_read)
+        .filter(|(now, before)| now != before)
+        .count();
+    if settled == 0 {
+        return;
+    }
+    let still_sentinel = mapped
+        .iter()
+        .filter(|&&byte| byte == OUTPUT_SENTINEL)
+        .count();
+    ledger_note(format!(
+        "LATE WRITE-BACK into output {:#x}: {settled} bytes changed after the completion fence, \
+         {still_sentinel} of {} still sentinel",
+        output.buffer.dma_address,
+        first_read.len(),
+    ));
+}
+
+/// How much of the output buffer the DPU actually touched. An output left
+/// entirely at the sentinel is the signature the address-reuse theory
+/// predicts: the job completed, and its writes landed somewhere else.
+fn ledger_note_output_coverage(raw: &[u8], buffer: &Buffer) {
+    if !ledger_enabled() {
+        return;
+    }
+    let untouched = raw.iter().filter(|&&byte| byte == OUTPUT_SENTINEL).count();
+    if untouched == raw.len() {
+        ledger_note(format!(
+            "OUTPUT UNTOUCHED {:#x}+{:#x}: all {} bytes still sentinel",
+            buffer.dma_address,
+            buffer.size,
+            raw.len(),
+        ));
+    } else if untouched != 0 {
+        ledger_note(format!(
+            "output {:#x}+{:#x}: {untouched} of {} bytes still sentinel",
+            buffer.dma_address,
+            buffer.size,
+            raw.len(),
+        ));
     }
 }
 
@@ -309,7 +625,7 @@ fn execute_case_output_with_plan(
         let input = OwnedBuffer::from_bytes_padded(fd, &fixture.input, "INPUT", file);
         let weights = OwnedBuffer::from_bytes_padded(fd, &fixture.weights, "WEIGHTS", file);
         let bias = OwnedBuffer::from_bytes_padded(fd, &fixture.bias, "BIAS", file);
-        let output = OwnedBuffer::new(fd, output_len, file);
+        let output = OwnedBuffer::new(fd, output_len, file, "OUTPUT");
         // A zero fill can turn an unwritten output lane into a plausible
         // convolution result. Poison the whole allocation so missing tail
         // pixels/blocks fail loudly and remain distinguishable from a real
@@ -331,7 +647,7 @@ fn execute_case_output_with_plan(
         let mut command_buffers = Vec::with_capacity(programs.len());
         for program in &programs {
             let command_bytes = program.len() * mem::size_of::<u64>();
-            let buffer = OwnedBuffer::new(fd, command_bytes, file);
+            let buffer = OwnedBuffer::new(fd, command_bytes, file, "REGCMD");
             ptr::write_bytes(buffer.buffer.host_ptr, 0, buffer.buffer.size);
             let words =
                 std::slice::from_raw_parts_mut(buffer.buffer.host_ptr as *mut u64, program.len());
@@ -385,6 +701,44 @@ fn execute_case_output_with_plan(
             .map_err(|error| format!("completion wait: {error}"))?;
 
         let raw_output = std::slice::from_raw_parts(output.buffer.host_ptr, output_len).to_vec();
+
+        // Everything below is off unless ROCKET_IOVA_LEDGER is set, and adds
+        // no GEM buffers and no jobs. It runs here because this is the only
+        // point where the dispatch is complete and every buffer it named is
+        // still mapped.
+        ledger_note_output_coverage(&raw_output, &output.buffer);
+        ledger_scan_readonly_bo(
+            fd,
+            &input,
+            &fixture.input,
+            OwnedBuffer::poison_byte("INPUT"),
+            "INPUT",
+        );
+        ledger_scan_readonly_bo(
+            fd,
+            &weights,
+            &fixture.weights,
+            OwnedBuffer::poison_byte("WEIGHTS"),
+            "WEIGHTS",
+        );
+        ledger_scan_readonly_bo(
+            fd,
+            &bias,
+            &fixture.bias,
+            OwnedBuffer::poison_byte("BIAS"),
+            "BIAS",
+        );
+        if ledger_enabled() {
+            for ((buffer, _), program) in command_buffers.iter().zip(&programs) {
+                let bytes = program
+                    .iter()
+                    .flat_map(|command| command.0.to_le_bytes())
+                    .collect::<Vec<u8>>();
+                ledger_scan_readonly_bo(fd, buffer, &bytes, 0, "REGCMD");
+            }
+        }
+        ledger_recheck_output_drain(fd, &output, &raw_output);
+
         let output = match &accumulator_tiles {
             Some(tiles) => assemble_staged_accumulator_output(shape, kernels, &raw_output, tiles)?,
             None => raw_output.clone(),
@@ -1495,10 +1849,34 @@ fn accumulator_canary_passes(file: &std::fs::File) -> bool {
 /// Cin=3 Cout=33 and Cin=5 Cout=64 both *pass* when they run first and fail
 /// mid-sweep, and even in isolation Cin=3 Cout=33 failed once in six
 /// otherwise identical runs. Contamination is per-process: a fresh process
-/// clears it, intervening successful jobs do not, which points at buffer or
-/// DMA-address reuse rather than NPU state. So a verdict on one shape needs
-/// `ROCKET_PROBE_RESUME_AT` to run it *first*, repeated a few times -- never
-/// one row from one sweep.
+/// clears it, intervening successful jobs do not. So a verdict on one shape
+/// needs `ROCKET_PROBE_RESUME_AT` to run it *first*, repeated a few times --
+/// never one row from one sweep.
+///
+/// **It is not DMA-address reuse**, which this comment used to claim on the
+/// strength of the per-process part alone. Measured with `ROCKET_IOVA_LEDGER`
+/// on 2026-09-02, using this test's own 34x34 Cin=8 Cout=16 K3 dense case
+/// (index 19), which fails about 40% of the time here and never in isolation:
+/// the IOVA allocator is first-fit from 0 and resets every case, so the
+/// layout for that case is byte-identical -- INPUT=0x0+0x5000,
+/// WEIGHTS=0x5000+0x1000, BIAS=0x6000+0x1000, OUTPUT=0x7000+0x8000,
+/// REGCMD=0xf000+0x1000 -- in the runs where it passes, the runs where it
+/// fails, and the isolated runs where it never fails. Same shape, same plan
+/// (banks 1/11), same program, same addresses; only the preceding jobs
+/// differ. No pair of simultaneously live buffers ever overlapped, and the
+/// input, weight, bias and regcmd buffers all read back byte-intact after
+/// every failing job, so the DPU is not writing into another live buffer.
+///
+/// What it actually looks like is a *quantized truncation*: the failing case
+/// leaves exactly 3584 of 32768 output bytes at the sentinel, every time it
+/// fails -- the last 112 of 1024 pixels, never written, with everything
+/// before them correct. Not a drain race either: a 2 ms dwell and a second
+/// `PREP_BO` never recovered a byte, so those writes are not late, they never
+/// happen. That leaves device state carried across jobs within a process,
+/// which is the same hazard class `rocket-hal-driver`'s
+/// `DEPTHWISE_TO_DENSE_QUIESCENCE` already documents from the production
+/// side. The open question is whether the DPU or the IOMMU reports anything
+/// when it happens, and that one does need kernel-side visibility.
 ///
 /// So the summary tells you to settle every failure per-process rather than
 /// implying the sweep already did. On 2026-09-02 all three failures in the
@@ -1563,6 +1941,7 @@ fn run_hardware_case_matrix(title: &str, cases: Vec<Conv2dCase>) {
             continue;
         }
         attempted += 1;
+        ledger_begin_case(index);
         let label = case.label();
         let result = catch_unwind(AssertUnwindSafe(|| {
             let fixture = build_fixture(case)?;
@@ -1578,6 +1957,9 @@ fn run_hardware_case_matrix(title: &str, cases: Vec<Conv2dCase>) {
                     success.weight_banks,
                     success.tiles,
                 );
+                if let Some(report) = ledger_case_report() {
+                    println!("{report}");
+                }
                 continue;
             }
             Ok(Err(error)) => {
@@ -1586,6 +1968,9 @@ fn run_hardware_case_matrix(title: &str, cases: Vec<Conv2dCase>) {
                     index + 1,
                     total_cases
                 );
+                if let Some(report) = ledger_case_report() {
+                    println!("{report}");
+                }
                 format!("{label}: {error}")
             }
             Err(payload) => {
@@ -1595,6 +1980,9 @@ fn run_hardware_case_matrix(title: &str, cases: Vec<Conv2dCase>) {
                     index + 1,
                     total_cases
                 );
+                if let Some(report) = ledger_case_report() {
+                    println!("{report}");
+                }
                 format!("{label}: panic: {error}")
             }
         };
