@@ -7,6 +7,7 @@ iree_lit_test_suite(
     "rocket_expand_onnx_conv_integer.mlir"
     "rocket_int8_accumulator.mlir"
     "rocket_int8_match_boundaries.mlir"
+    "rocket_fp16_match_boundaries.mlir"
     "rocket_int8_offload.mlir"
     "rocket_runtime_dimensions.mlir"
     "rocket_runtime_dimensions_invalid.mlir"

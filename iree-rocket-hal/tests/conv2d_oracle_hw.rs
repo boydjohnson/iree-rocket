@@ -72,6 +72,55 @@ impl OwnedBuffer {
         }
     }
 
+    /// Extra mapped bytes to append to a named input buffer.
+    ///
+    /// The accumulator failure raises a DMA **read** error, so the question is
+    /// which buffer the NPU reads past. Padding one at a time separates them:
+    /// if a shape becomes exact only when a particular buffer is grown, that
+    /// buffer is the one being over-read. The padding is zero-filled, so it is
+    /// inert as data -- it only makes the pages mapped.
+    fn pad_bytes(which: &str) -> usize {
+        std::env::var(format!("ROCKET_PAD_{which}"))
+            .ok()
+            .and_then(|value| value.parse().ok())
+            .unwrap_or(0)
+    }
+
+    /// Byte the padding region is filled with (`ROCKET_POISON_<WHICH>`).
+    ///
+    /// Zero padding proves *that* the NPU reads outside the buffer but says
+    /// nothing about *which* buffer, because a zero contributes nothing to the
+    /// sum. A nonzero fill does: under the `Counting` pattern every real input
+    /// and coefficient is 1, so the accumulator is a plain count, and any
+    /// over-read of a region filled with `p` shifts the result by a multiple
+    /// of `p`. Poisoning one buffer at a time therefore names the source.
+    fn poison_byte(which: &str) -> u8 {
+        std::env::var(format!("ROCKET_POISON_{which}"))
+            .ok()
+            .and_then(|value| value.parse().ok())
+            .unwrap_or(0)
+    }
+
+    unsafe fn from_bytes_padded(fd: i32, bytes: &[u8], which: &str, file: &std::fs::File) -> Self {
+        let buffer = unsafe { Self::new(fd, bytes.len() + Self::pad_bytes(which), file) };
+        unsafe {
+            ptr::write_bytes(buffer.buffer.host_ptr, 0, buffer.buffer.size);
+            ptr::copy_nonoverlapping(bytes.as_ptr(), buffer.buffer.host_ptr, bytes.len());
+            // Everything past the logical data is padding; poison it so an
+            // over-read shows up in the arithmetic.
+            let poison = Self::poison_byte(which);
+            if poison != 0 && buffer.buffer.size > bytes.len() {
+                ptr::write_bytes(
+                    buffer.buffer.host_ptr.add(bytes.len()),
+                    poison,
+                    buffer.buffer.size - bytes.len(),
+                );
+            }
+        }
+        buffer
+    }
+
+    #[allow(dead_code)]
     unsafe fn from_bytes(fd: i32, bytes: &[u8], file: &std::fs::File) -> Self {
         let buffer = unsafe { Self::new(fd, bytes.len(), file) };
         unsafe {
@@ -257,9 +306,9 @@ fn execute_case_output_with_plan(
     let output_len = output_storage_bytes(shape, kernels);
 
     unsafe {
-        let input = OwnedBuffer::from_bytes(fd, &fixture.input, file);
-        let weights = OwnedBuffer::from_bytes(fd, &fixture.weights, file);
-        let bias = OwnedBuffer::from_bytes(fd, &fixture.bias, file);
+        let input = OwnedBuffer::from_bytes_padded(fd, &fixture.input, "INPUT", file);
+        let weights = OwnedBuffer::from_bytes_padded(fd, &fixture.weights, "WEIGHTS", file);
+        let bias = OwnedBuffer::from_bytes_padded(fd, &fixture.bias, "BIAS", file);
         let output = OwnedBuffer::new(fd, output_len, file);
         // A zero fill can turn an unwritten output lane into a plausible
         // convolution result. Poison the whole allocation so missing tail
@@ -853,6 +902,37 @@ fn cbuf_residency_boundary_cases() -> Vec<Conv2dCase> {
         cases.push(dense(113, height));
     }
     cases
+}
+
+/// The first dense MobileNetV2 shape excluded only by the fp16 `Cout <= 512`
+/// matcher bound: four 14x14 1x1 convolutions expand 88 channels to 528.
+///
+/// `MAX_OUTPUT_CHANNELS` now admits 768, but the fp16 matcher deliberately
+/// remains narrower because large-footprint 3x3 shapes can produce all-zero
+/// output with the same family of CBUF partitions. This exact 1x1 shape has
+/// a far smaller coefficient footprint, so measure it independently before
+/// widening the matcher. `Counting` verifies complete accumulation, while
+/// `Selectors` and `Dense` catch coefficient-layout and ordinary-value errors.
+#[cfg(feature = "hardware-characterization")]
+fn fp16_mobilenetv2_cout_528_candidate_cases() -> Vec<Conv2dCase> {
+    [
+        OraclePattern::Counting,
+        OraclePattern::Selectors { phase: 0 },
+        OraclePattern::Dense { phase: 1 },
+    ]
+    .into_iter()
+    .map(|pattern| Conv2dCase {
+        width: 14,
+        height: 14,
+        cin: 88,
+        cout: 528,
+        kernel: [1, 1],
+        stride: 1,
+        padding: [0, 0],
+        precision: OraclePrecision::Fp16,
+        pattern,
+    })
+    .collect()
 }
 
 fn dense_geometry_regression_cases() -> Vec<Conv2dCase> {
@@ -1787,6 +1867,14 @@ fn cbuf_residency_boundary_is_planable_and_gap_free() {
     assert_planable_and_gap_free(cases);
 }
 
+#[cfg(feature = "hardware-characterization")]
+#[test]
+fn fp16_mobilenetv2_cout_528_candidate_is_planable_and_gap_free() {
+    let cases = fp16_mobilenetv2_cout_528_candidate_cases();
+    assert_eq!(cases.len(), 3);
+    assert_planable_and_gap_free(cases);
+}
+
 #[test]
 #[ignore = "needs /dev/accel/accel0 -- CBUF entry-rounding residency boundary"]
 fn cbuf_residency_boundary_matches_oracle() {
@@ -1802,6 +1890,16 @@ fn dense_geometry_regression_matches_oracle() {
     run_hardware_case_matrix(
         "dense fp16 stride/window-parity and sub-atom Cin geometries",
         dense_geometry_regression_cases(),
+    );
+}
+
+#[cfg(feature = "hardware-characterization")]
+#[test]
+#[ignore = "needs /dev/accel/accel0 -- characterizes MobileNetV2's 14x14 fp16 88-to-528 1x1 candidate"]
+fn fp16_mobilenetv2_cout_528_candidate_matches_oracle() {
+    run_hardware_case_matrix(
+        "MobileNetV2 fp16 14x14 88-to-528 1x1 matcher candidate",
+        fp16_mobilenetv2_cout_528_candidate_cases(),
     );
 }
 
@@ -2614,6 +2712,612 @@ fn int8_accumulator_cout_padding_probe() {
             "  [{index}] {width}x{height} k{kernel}x{kernel} s{stride} {pixels}px \
              Cout {true_cout}->{padded_cout}: padded real_bad={real_bad} pad_nonzero={pad_nonzero}{}",
             sample.map(|s| format!("  first {s}")).unwrap_or_default(),
+        );
+    }
+}
+
+/// The high-`Cin` shapes whose CBUF split comes from dividing the streamed
+/// output-channel group.
+///
+/// A first attempt at this was reverted on 2026-09-02: it gated the division
+/// on whether the *feature map* still fit, which is spatial, and drove 56x56
+/// `Cin` 640 to five weight banks against the vendor's seven -- wrong values
+/// on hardware, and a hang at `Cin` 768. The spatial corpus
+/// (`conv_vendor_fixtures_spatial*.json`, six extents) showed the divisor is
+/// only ever one or two and is decided by the coefficient working set alone,
+/// so the gate is now "does the undivided grant leave at least two data
+/// banks", with no spatial term. All four 56x56 shapes now plan the vendor's
+/// 6/7/8/8.
+///
+/// Run one case per process -- this sweep contaminates itself, and a case can
+/// fail in the batch while passing alone:
+///
+/// ```text
+/// for i in $(seq 0 N); do ROCKET_PROBE_ONLY=$i ./conv2d_oracle_hw \
+///     group_division_high_channel_splits_match_oracle --ignored --nocapture; done
+/// ```
+#[cfg(feature = "hardware-characterization")]
+fn group_division_split_cases() -> Vec<Conv2dCase> {
+    let mut cases = Vec::new();
+    for precision in [OraclePrecision::Fp16, OraclePrecision::Int8] {
+        // 512 is the last undivided grant and is already capture-backed --
+        // it is here as the control that must keep passing.
+        for cin in [512u32, 576, 640, 704, 768] {
+            let mut patterns = vec![
+                // Uniform 1s: the accumulator is exactly `Cin * valid taps`,
+                // so a split that reads short of the resident window shows up
+                // directly as a low sum. It cannot see a *reordering*, which
+                // is why it is not the only pattern here -- uniform data has
+                // hidden real layout bugs in this HAL before.
+                OraclePattern::Counting,
+                // Three signed taps per output at distinct HWCF positions,
+                // with inputs varying in y, x and channel: this is the one
+                // that catches a permutation. Its term count is tiny, so the
+                // fp16 comparison stays exact at every Cin here.
+                //
+                // int8 must use the *affine* encoding of the same logical
+                // filter -- raw `Selectors` is a signed coefficient form that
+                // is not the ordinary int8 ABI, and mismatches under it say
+                // nothing about the device. The Cartesian sweep above makes
+                // the same split for the same reason.
+                if precision == OraclePrecision::Int8 {
+                    OraclePattern::SelectorsAffine { phase: 0 }
+                } else {
+                    OraclePattern::Selectors { phase: 0 }
+                },
+            ];
+            // `Dense` is deliberately not used here. At fp16 its exactness
+            // argument does not survive this term count -- inputs reach +-3
+            // and coefficients +-2 over `Cin * 9` taps, so Cin 768 admits
+            // accumulators near 41k, far past the 2048 below which fp16 still
+            // represents every integer -- and the rest of the suite only
+            // exercises it at Fp16 and Int8Accumulator, never plain Int8.
+            let _ = &mut patterns;
+            for pattern in patterns {
+                cases.push(Conv2dCase {
+                    width: 28,
+                    height: 28,
+                    cin,
+                    cout: 256,
+                    kernel: [3, 3],
+                    stride: 1,
+                    padding: [1, 1],
+                    precision,
+                    pattern,
+                });
+            }
+        }
+    }
+    // 28x28/Cout 256 is the geometry the vendor channel grid captures, so it
+    // is where a split disagreement is attributable. It is a single point in
+    // (spatial, Cout) though, and the grant is a function of both -- the
+    // division threshold depends on how many data banks the feature map needs.
+    // Vary each around a divided-group Cin so the region is covered rather
+    // than one cell of it.
+    for precision in [OraclePrecision::Fp16, OraclePrecision::Int8] {
+        let permuting = if precision == OraclePrecision::Int8 {
+            OraclePattern::SelectorsAffine { phase: 1 }
+        } else {
+            OraclePattern::Selectors { phase: 1 }
+        };
+        for (width, height, cout) in [
+            (14u32, 14u32, 256u32),
+            (56, 56, 256),
+            (112, 112, 256),
+            (28, 28, 64),
+            (28, 28, 768),
+            (14, 14, 768),
+        ] {
+            for cin in [640u32, 768] {
+                for pattern in [OraclePattern::Counting, permuting] {
+                    cases.push(Conv2dCase {
+                        width,
+                        height,
+                        cin,
+                        cout,
+                        kernel: [3, 3],
+                        stride: 1,
+                        padding: [1, 1],
+                        precision,
+                        pattern,
+                    });
+                }
+            }
+        }
+    }
+    cases
+}
+
+/// Re-measures the dense 3x3 `Cin` cap in **both** int8 output modes.
+///
+/// The transform spec caps dense int8 3x3 at `Cin` 32 on the strength of
+/// "exact to 32, wrong from 33 up". That measurement was made through the
+/// accumulator dispatch, and the 1x1 cliff turned out to be a property of the
+/// accumulator *output* path rather than of int8 convolution -- plain int8 is
+/// exact at every `Cin` where the accumulator is wrong. If the same holds at
+/// 3x3, the cap is an artifact of the output mode and far more of MobileNetV2
+/// could be offloaded than the spec currently allows.
+///
+/// Both patterns matter here: `Counting` is uniform 1s and catches a short
+/// read, `SelectorsAffine` is the int8 permutation probe (raw `Selectors` is a
+/// signed coefficient form that is not the ordinary int8 ABI and says nothing
+/// about the device).
+///
+/// Run one case per process; this sweep contaminates itself.
+#[cfg(feature = "hardware-characterization")]
+#[test]
+#[ignore = "requires the RK3588 NPU"]
+fn dense_int8_3x3_channel_cap_control() {
+    let mut cases = Vec::new();
+    for precision in [OraclePrecision::Int8, OraclePrecision::Int8Accumulator] {
+        for cin in [16u32, 32, 33, 64, 128, 256, 512] {
+            for pattern in [
+                OraclePattern::Counting,
+                OraclePattern::SelectorsAffine { phase: 0 },
+            ] {
+                cases.push(Conv2dCase {
+                    width: 28,
+                    height: 28,
+                    cin,
+                    cout: 256,
+                    kernel: [3, 3],
+                    stride: 1,
+                    padding: [1, 1],
+                    precision,
+                    pattern,
+                });
+            }
+        }
+    }
+    run_hardware_case_matrix("dense int8 3x3 cap, both output modes", cases);
+}
+
+#[cfg(feature = "hardware-characterization")]
+#[test]
+#[ignore = "requires the RK3588 NPU"]
+fn group_division_high_channel_splits_match_oracle() {
+    // NOTE: this sweep contaminates itself -- a case can fail in the batch and
+    // pass in isolation (fp16 Cin 512 selectors does exactly that). For a
+    // verdict, drive it one case per process with `ROCKET_PROBE_ONLY=<index>`.
+    // The planner's channel cap is what this run exists to justify raising, so
+    // the shapes have to be reachable before the cap moves.
+    unsafe { std::env::set_var("ROCKET_ALLOW_UNBACKED_CHANNELS", "1") };
+    run_hardware_case_matrix(
+        "group-division high-channel CBUF splits",
+        group_division_split_cases(),
+    );
+}
+
+/// Dense int8 **accumulator** 1x1 across the `Cin` cliff, for the grains
+/// experiment.
+///
+/// This is the shape family that is exact to `Cin` 384 and wrong from 400 up
+/// with exactly one output row correct. The vendor capture diff
+/// (`k1_residency_diff`) showed our tile count, bank split, `in_rows` and
+/// `cbuf_data_entries` match the vendor *exactly* across the cliff, so the CBUF
+/// residency arithmetic is not the cause. The one field that differs is
+/// `feature_grains`, which no gate test checks: ours is rows-driven and sits
+/// near 33 while the vendor drives it down with channel pressure to 9 and then
+/// 6.
+///
+/// Drive the arms with `ROCKET_FEATURE_GRAINS=<n>` or
+/// `ROCKET_FEATURE_GRAINS_MAX=<n>`; `Cin > 384` needs
+/// `ROCKET_ALLOW_KNOWN_BAD_SHAPES=1`. `Cin` 384 is the control and must stay
+/// exact in every arm -- if it breaks, the arm is invalid, not informative.
+/// Locates the accumulator boundary for several kernels at *one* geometry.
+///
+/// The two boundaries measured so far come from shapes that differ in three
+/// ways at once -- k=3 fails above `Cin` 32 at 28x28 Cout 256, k=1 is exact to
+/// `Cin` 384 at 32x32 Cout 64 -- so nothing can be concluded about what the
+/// boundary is a function of. This holds 32x32 and Cout 64 fixed and sweeps
+/// `Cin` finely for k=1, 3 and 5, so the three boundaries are directly
+/// comparable.
+///
+/// `Cin > 384` at k=1 needs `ROCKET_ALLOW_KNOWN_BAD_SHAPES=1`, which the test
+/// sets. Run one case per process.
+/// Tests the coefficient-footprint hypothesis by varying **Cout** at fixed
+/// `Cin`, kernel and geometry.
+///
+/// Both boundaries in `accumulator_boundary_sweep` bracket the same total
+/// coefficient size (`padded_Cin * taps * Cout`): k=3 `Cin` 32 is 18432 bytes
+/// and passes, k=1 `Cin` 384 is 24576 and passes, k=1 `Cin` 400 is 25600 and
+/// fails, k=3 `Cin` 33 pads to 48 for 27648 and fails. If the accumulator is
+/// correct iff that footprint stays under roughly 24-25 KiB, then at k=3
+/// `Cin` 48 -- which fails at Cout 64 -- **shrinking Cout alone must fix it**,
+/// with the boundary between Cout 56 (24192 bytes) and Cout 64 (27648).
+/// Pins the accumulator threshold in coefficient bytes **per output channel**.
+///
+/// Total coefficient size is ruled out: at k=3 `Cin` 48 every Cout from 8 to
+/// 64 fails, including Cout 8 at 3456 bytes. Normalising per output channel
+/// fits every point instead -- `padded_Cin * taps` is 288 and 384 where the
+/// device is exact, 400 and 432 where it is wrong. This walks k=1 across
+/// 384 -> 400 one atom at a time, where `padded_Cin * taps` is just the padded
+/// channel count, to place the edge exactly. 384 is 6 whole 64-byte
+/// coefficient groups.
+/// Discriminating test for the per-output-channel coefficient limit.
+///
+/// k=1 places the edge exactly between `Cin` 384 (exact) and 385 (wrong), and
+/// k=3 between padded `Cin` 32 (288 bytes) and 48 (432). Both fit
+/// "correct iff `padded_Cin * taps <= 384`", but they cannot separate that
+/// from a plain `Cin` limit that happens to coincide.
+///
+/// A **1x3** kernel does separate them: taps is 3, so the rule predicts the
+/// edge at padded `Cin` 128 (384 bytes) -- nowhere near 384 channels. `Cin` 112
+/// (336) and 128 (384) must be exact; `Cin` 129 pads to 144 (432) and must
+/// fail. A plain channel limit predicts all four exact.
+#[cfg(feature = "hardware-characterization")]
+fn accumulator_rectangular_kernel_cases() -> Vec<Conv2dCase> {
+    [96u32, 112, 128, 129]
+        .into_iter()
+        .map(|cin| Conv2dCase {
+            width: 32,
+            height: 32,
+            cin,
+            cout: 64,
+            kernel: [1, 3],
+            stride: 1,
+            padding: [0, 1],
+            precision: OraclePrecision::Int8Accumulator,
+            pattern: OraclePattern::Counting,
+        })
+        .collect()
+}
+
+#[cfg(feature = "hardware-characterization")]
+#[test]
+#[ignore = "requires the RK3588 NPU"]
+fn accumulator_rectangular_kernel_probe() {
+    unsafe { std::env::set_var("ROCKET_ALLOW_KNOWN_BAD_SHAPES", "1") };
+    unsafe { std::env::set_var("ROCKET_ALLOW_UNBACKED_CHANNELS", "1") };
+    run_hardware_case_matrix(
+        "int8 accumulator 1x3 kernel, per-channel coefficient limit",
+        accumulator_rectangular_kernel_cases(),
+    );
+}
+
+/// What is the number of *written* output lanes a function of?
+///
+/// Past the coefficient limit the DPU leaves most lanes untouched
+/// (`OUTPUT_SENTINEL`) rather than writing wrong values. With all three
+/// `ROCKET_PAD_*` set the job no longer faults, so the written count is stable
+/// run to run and the device never wedges -- which makes this sweepable.
+///
+/// Three axes, each varied with the others held fixed: `Cin` past the limit,
+/// `Cout` (which sets `blocks_per_pixel`), and the spatial extent (which sets
+/// pixels and tile count).
+#[cfg(feature = "hardware-characterization")]
+fn accumulator_written_lanes_cases() -> Vec<Conv2dCase> {
+    let base = |width, height, cin, cout, kernel: usize| Conv2dCase {
+        width,
+        height,
+        cin,
+        cout,
+        kernel: [kernel, kernel],
+        stride: 1,
+        padding: [kernel / 2, kernel / 2],
+        precision: OraclePrecision::Int8Accumulator,
+        pattern: OraclePattern::Counting,
+    };
+    let mut cases = Vec::new();
+    // Cin axis: 32x32, Cout 64, k=1.
+    for cin in [385u32, 400, 448, 512] {
+        cases.push(base(32, 32, cin, 64, 1));
+    }
+    // Cout axis: 32x32, Cin 400, k=1.
+    for cout in [32u32, 128, 256] {
+        cases.push(base(32, 32, 400, cout, 1));
+    }
+    // Spatial axis: Cin 400, Cout 64, k=1.
+    for extent in [16u32, 64] {
+        cases.push(base(extent, extent, 400, 64, 1));
+    }
+    // k=3 cross-check, just past its own limit.
+    cases.push(base(32, 32, 33, 64, 3));
+    cases.push(base(32, 32, 64, 64, 3));
+    cases
+}
+
+#[cfg(feature = "hardware-characterization")]
+#[test]
+#[ignore = "requires the RK3588 NPU"]
+fn accumulator_written_lanes_probe() {
+    unsafe { std::env::set_var("ROCKET_ALLOW_KNOWN_BAD_SHAPES", "1") };
+    unsafe { std::env::set_var("ROCKET_ALLOW_UNBACKED_CHANNELS", "1") };
+    run_hardware_case_matrix(
+        "int8 accumulator written-lane count",
+        accumulator_written_lanes_cases(),
+    );
+}
+
+#[cfg(feature = "hardware-characterization")]
+fn accumulator_per_channel_threshold_cases() -> Vec<Conv2dCase> {
+    [352u32, 368, 384, 385, 392, 400, 416]
+        .into_iter()
+        .map(|cin| Conv2dCase {
+            width: 32,
+            height: 32,
+            cin,
+            cout: 64,
+            kernel: [1, 1],
+            stride: 1,
+            padding: [0, 0],
+            precision: OraclePrecision::Int8Accumulator,
+            pattern: OraclePattern::Counting,
+        })
+        .collect()
+}
+
+#[cfg(feature = "hardware-characterization")]
+#[test]
+#[ignore = "requires the RK3588 NPU"]
+fn accumulator_per_channel_threshold_probe() {
+    unsafe { std::env::set_var("ROCKET_ALLOW_KNOWN_BAD_SHAPES", "1") };
+    unsafe { std::env::set_var("ROCKET_ALLOW_UNBACKED_CHANNELS", "1") };
+    run_hardware_case_matrix(
+        "int8 accumulator per-output-channel coefficient threshold",
+        accumulator_per_channel_threshold_cases(),
+    );
+}
+
+#[cfg(feature = "hardware-characterization")]
+fn accumulator_coefficient_footprint_cases() -> Vec<Conv2dCase> {
+    [8u32, 16, 32, 48, 56, 64]
+        .into_iter()
+        .map(|cout| Conv2dCase {
+            width: 32,
+            height: 32,
+            cin: 48,
+            cout,
+            kernel: [3, 3],
+            stride: 1,
+            padding: [1, 1],
+            precision: OraclePrecision::Int8Accumulator,
+            pattern: OraclePattern::Counting,
+        })
+        .collect()
+}
+
+#[cfg(feature = "hardware-characterization")]
+#[test]
+#[ignore = "requires the RK3588 NPU"]
+fn accumulator_coefficient_footprint_probe() {
+    unsafe { std::env::set_var("ROCKET_ALLOW_KNOWN_BAD_SHAPES", "1") };
+    run_hardware_case_matrix(
+        "int8 accumulator coefficient footprint, k=3 Cin 48",
+        accumulator_coefficient_footprint_cases(),
+    );
+}
+
+#[cfg(feature = "hardware-characterization")]
+fn accumulator_boundary_sweep_cases() -> Vec<Conv2dCase> {
+    let mut cases = Vec::new();
+    for kernel in [1usize, 3, 5] {
+        for cin in [
+            16u32, 24, 32, 33, 40, 48, 64, 96, 128, 192, 256, 320, 352, 384, 400, 448, 512,
+        ] {
+            cases.push(Conv2dCase {
+                width: 32,
+                height: 32,
+                cin,
+                cout: 64,
+                kernel: [kernel, kernel],
+                stride: 1,
+                padding: [kernel / 2, kernel / 2],
+                precision: OraclePrecision::Int8Accumulator,
+                pattern: OraclePattern::Counting,
+            });
+        }
+    }
+    cases
+}
+
+#[cfg(feature = "hardware-characterization")]
+#[test]
+#[ignore = "requires the RK3588 NPU"]
+fn accumulator_boundary_sweep() {
+    unsafe { std::env::set_var("ROCKET_ALLOW_KNOWN_BAD_SHAPES", "1") };
+    unsafe { std::env::set_var("ROCKET_ALLOW_UNBACKED_CHANNELS", "1") };
+    run_hardware_case_matrix(
+        "int8 accumulator boundary, 32x32 Cout 64, k=1/3/5",
+        accumulator_boundary_sweep_cases(),
+    );
+}
+
+/// Does the accumulator failure track `Cin`, or output-channel coverage?
+///
+/// At 3x3 `Cin` 33 Cout 256 the device writes exactly one 128-byte output
+/// block -- channels 0..31 are right and the rest is untouched `OUTPUT_SENTINEL`
+/// -- so the symptom is *coverage*, not corruption. `blocks_per_pixel` is
+/// `padded_out_channels * 4 / 128`, i.e. 1, 2, 4 and 8 at Cout 32, 64, 128 and
+/// 256. If only the multi-block Couts fail, the cap is a Cout property that
+/// `Cin` merely correlates with.
+#[cfg(feature = "hardware-characterization")]
+fn accumulator_cout_coverage_cases() -> Vec<Conv2dCase> {
+    let mut cases = Vec::new();
+    for cin in [32u32, 33, 64] {
+        for cout in [32u32, 64, 128, 256] {
+            cases.push(Conv2dCase {
+                width: 28,
+                height: 28,
+                cin,
+                cout,
+                kernel: [3, 3],
+                stride: 1,
+                padding: [1, 1],
+                precision: OraclePrecision::Int8Accumulator,
+                pattern: OraclePattern::Counting,
+            });
+        }
+    }
+    cases
+}
+
+#[cfg(feature = "hardware-characterization")]
+#[test]
+#[ignore = "requires the RK3588 NPU"]
+fn accumulator_cout_coverage_probe() {
+    run_hardware_case_matrix(
+        "int8 accumulator output-block coverage",
+        accumulator_cout_coverage_cases(),
+    );
+}
+
+#[cfg(feature = "hardware-characterization")]
+fn accumulator_grains_cases() -> Vec<Conv2dCase> {
+    // Both precisions at the same shapes. The register diff showed our conv
+    // programming is bit-identical to the vendor's across the cliff for every
+    // register both sides write, so the remaining suspects are the accumulator
+    // *output* path (which the vendor never exercises, so no capture can
+    // adjudicate it) and buffer packing. Plain int8 shares the packing and the
+    // whole input side but takes the ordinary requantized output, so it
+    // separates the two: if plain int8 is exact where the accumulator is
+    // wrong, the fault is downstream of the DPU accumulate.
+    [OraclePrecision::Int8Accumulator, OraclePrecision::Int8]
+        .into_iter()
+        .flat_map(|precision| {
+            [384u32, 400, 448, 512]
+                .into_iter()
+                .map(move |cin| (precision, cin))
+        })
+        .map(|(precision, cin)| Conv2dCase {
+            width: 32,
+            height: 32,
+            cin,
+            cout: 64,
+            kernel: [1, 1],
+            stride: 1,
+            padding: [0, 0],
+            precision,
+            pattern: OraclePattern::Counting,
+        })
+        .collect()
+}
+
+#[cfg(feature = "hardware-characterization")]
+#[test]
+#[ignore = "requires the RK3588 NPU"]
+fn accumulator_high_channel_grains_probe() {
+    unsafe { std::env::set_var("ROCKET_ALLOW_KNOWN_BAD_SHAPES", "1") };
+    unsafe { std::env::set_var("ROCKET_ALLOW_UNBACKED_CHANNELS", "1") };
+    let grains = std::env::var("ROCKET_FEATURE_GRAINS")
+        .or_else(|_| std::env::var("ROCKET_FEATURE_GRAINS_MAX"))
+        .unwrap_or_else(|_| "default".to_string());
+    run_hardware_case_matrix(
+        &format!("int8 accumulator 1x1 Cin cliff, grains={grains}"),
+        accumulator_grains_cases(),
+    );
+}
+
+/// Maps *which* bytes of the accumulator staging buffer the DPU actually
+/// wrote, past the per-output-channel coefficient limit.
+///
+/// The written-lane counts are deterministic under padding but do not fit a
+/// clean function of `Cin`, `Cout` or extent, and some are not even pixel
+/// aligned. Counting lanes cannot distinguish a prefix from a stride from a
+/// scattered pattern, so this reads the staging buffer byte by byte and prints
+/// the run structure instead. `OUTPUT_SENTINEL` marks untouched bytes.
+///
+/// Worth noting up front: bad lanes read `0xA5A5A5B0`, i.e. only the *low*
+/// byte of a 4-byte accumulator lane was disturbed, and 0xB0 is not the low
+/// byte of the expected 385 (0x181) either. So the write granularity may be
+/// finer than a lane.
+#[cfg(feature = "hardware-characterization")]
+#[test]
+#[ignore = "requires the RK3588 NPU"]
+fn accumulator_written_region_map() {
+    unsafe { std::env::set_var("ROCKET_ALLOW_KNOWN_BAD_SHAPES", "1") };
+    unsafe { std::env::set_var("ROCKET_ALLOW_UNBACKED_CHANNELS", "1") };
+    let _guard = NPU_TEST_LOCK
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    let file = OpenOptions::new()
+        .read(true)
+        .write(true)
+        .open(DEVICE_PATH)
+        .expect("failed to open RK3588 NPU device");
+
+    // One axis varied at a time. Tile 0's prefix stopped at exactly 24 pixels
+    // for both Cin 385 and 400, so the question is what that 24 is a function
+    // of -- and tile 1 differed (63 vs 2 px), so the tiles must be read apart.
+    let mut cases: Vec<(u32, u32, u32, usize)> = Vec::new();
+    for cin in [385u32, 392, 400, 416, 448, 512] {
+        cases.push((32, cin, 64, 1));
+    }
+    for cout in [32u32, 128, 256] {
+        cases.push((32, 400, cout, 1));
+    }
+    for extent in [16u32, 64, 128] {
+        cases.push((extent, 400, 64, 1));
+    }
+    for cin in [33u32, 48, 64] {
+        cases.push((32, cin, 64, 3));
+    }
+
+    for (extent, cin, cout, kernel) in cases {
+        let case = Conv2dCase {
+            width: extent,
+            height: extent,
+            cin,
+            cout,
+            kernel: [kernel, kernel],
+            stride: 1,
+            padding: [kernel / 2, kernel / 2],
+            precision: OraclePrecision::Int8Accumulator,
+            pattern: OraclePattern::Counting,
+        };
+        let fixture = match build_fixture(case) {
+            Ok(fixture) => fixture,
+            Err(error) => {
+                println!("  {extent}^2 Cin={cin} Cout={cout} k={kernel}: fixture failed: {error}");
+                continue;
+            }
+        };
+        let execution = match execute_case_output(&file, &fixture) {
+            Ok(execution) => execution,
+            Err(error) => {
+                println!("  {extent}^2 Cin={cin} Cout={cout} k={kernel}: execute failed: {error}");
+                continue;
+            }
+        };
+        let raw = execution.raw;
+        let pixel_bytes = fixture.shape.padded_out_channels() as usize
+            * fixture.shape.precision.output_element_bytes() as usize;
+
+        // Written runs with their offsets: the tile partition shows up as the
+        // gaps between them, and a prefix per tile as a run at each tile base.
+        let mut runs: Vec<(usize, usize)> = Vec::new();
+        let mut offset = 0usize;
+        while offset < raw.len() {
+            if raw[offset] != OUTPUT_SENTINEL {
+                let start = offset;
+                while offset < raw.len() && raw[offset] != OUTPUT_SENTINEL {
+                    offset += 1;
+                }
+                runs.push((start, offset - start));
+            } else {
+                offset += 1;
+            }
+        }
+        let total: usize = runs.iter().map(|(_, len)| len).sum();
+        let described: Vec<String> = runs
+            .iter()
+            .take(6)
+            .map(|(start, len)| {
+                format!(
+                    "@{start}+{len}({}px)",
+                    if pixel_bytes > 0 {
+                        len / pixel_bytes
+                    } else {
+                        0
+                    }
+                )
+            })
+            .collect();
+        println!(
+            "  {extent}^2 Cin={cin:<4} Cout={cout:<4} k={kernel}  staging={:<7} written={total:<7} tiles={}  runs: {}",
+            raw.len(),
+            execution.plan.tiles().len(),
+            described.join(" ")
         );
     }
 }

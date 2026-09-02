@@ -143,6 +143,12 @@ fn run_channel_grid(fixtures: &str, precision: FixturePrecision) {
         };
 
         let generated_split = (plan.data_banks(), plan.weight_banks());
+        if std::env::var("DUMP_SPLITS").is_ok() {
+            println!(
+                "SPLIT cin={} cout={} vendor={}/{} plan={}/{}",
+                s.cin, s.cout, vendor_data, vendor_weight, generated_split.0, generated_split.1
+            );
+        }
         let banks_match = generated_split == (vendor_data, vendor_weight);
         if banks_match {
             bank_matches += 1;
@@ -294,8 +300,17 @@ fn run_channel_grid(fixtures: &str, precision: FixturePrecision) {
         "  exploratory values: Cin={exploratory_cin:?}, Cout={exploratory_cout:?} (any pair containing one is outside current ConvPlan limits)"
     );
 
-    assert_eq!(supported, 64);
-    assert_eq!(exploratory.len(), 80);
+    // 96/48, not 64/80: `MAX_OUTPUT_CHANNELS` was raised 512 -> 768, which
+    // brings every Cout in this corpus into range at the Cin values ConvPlan
+    // already reproduces. The 48 still exploratory are exactly the Cin >= 576
+    // dense cases, where ConvPlan predicts a 1/11 CBUF split against the
+    // vendor's 6/6, 5/7, 4/8, 4/8 -- see MAX_INPUT_CHANNELS' doc comment.
+    assert_eq!(supported, 96);
+    assert_eq!(exploratory.len(), 48);
+    // Raising MAX_INPUT_CHANNELS to 768 makes these 144/0 and the bank
+    // comparison then fails on ~10 cases -- the Cout-dependent transition
+    // points documented on that constant. That failure is the point: it is
+    // what stops the cap moving before the rule is exact.
     assert!(
         missing_plan_zero_split.is_empty(),
         "vendor plan 0 had no unique nonzero CBUF split: {missing_plan_zero_split:?}"

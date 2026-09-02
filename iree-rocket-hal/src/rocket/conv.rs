@@ -148,12 +148,36 @@ pub const INPUT_CHANNELS: u32 = 3;
 /// depthwise stages) and reverted: `tests/conv_vendor_fixture_channels_768.rs`
 /// -- a vendor-vs-`ConvPlan` regression check that was already sitting in
 /// the suite -- caught real divergence for *dense* (non-depthwise) shapes
-/// in exactly that range (`ConvPlan` predicts a 1/11 CBUF split at
-/// Cin=576/640/704/768, real vendor captures show 6/6, 5/7, 4/8). This
-/// constant is shared between dense and depthwise Shape construction, so
-/// there's no way to raise it for depthwise (which a separate hardware
-/// probe did validate at 576/960) without also silently permitting dense
-/// construction into a range now known to be wrong. See
+/// in exactly that range. `ConvPlan` predicted a 1/11 CBUF split at
+/// Cin=576/640/704/768 where real captures show 6/6, 5/7, 4/8, 4/8.
+///
+/// New corpora built for this (`build_vendor_fixtures.py`, which runs
+/// locally -- `rknn-convert` is on PATH, no board needed) narrow it a lot:
+///
+///   * The split is **geometry-independent above `Cin` 384** -- 28x28 and
+///     14x14 agree on every point there -- so it is a coefficient working-set
+///     rule in that range, not spatial demand.
+///   * At 32-channel granularity the k=3 curve is 6,6,7,7,7,8,8,8 weight
+///     banks over `Cin` 544..768, and `Cout` only matters at `Cout <= 96`.
+///   * `ceil(Cin / 96)` fits all eight of those points, and a two-pass
+///     reading (`streamed / 2 + 1`) fits all 13 from 384 up.
+///
+/// Both were tried and **rejected**: a k=5 sweep over the same range shows a
+/// multi-pass sawtooth resetting twice (10,8,7,7,8,10 then 7,7,8,9,10,11 then
+/// 6,6,7,7,8,8,9,9,10,10,10,11), where the vendor uses 1/11 and 2/10 freely.
+/// So a one-data-bank split is not inherently wrong, the "leaves three data
+/// banks" threshold does not survive a second kernel size, and the k=3 fit
+/// mis-plans k=5 `Cin` 192 as 6/6 against the vendor's 2/10
+/// (`large_kernel_high_channel_split_matches_vendor` guards that).
+///
+/// What a real fix needs is the sawtooth's reset rule -- how many passes the
+/// vendor uses and what each one costs -- fitted across kernel sizes, not a
+/// curve through one. The corpora to do it with are in the spike repo.
+///
+/// This constant is shared between dense and depthwise Shape construction,
+/// so there's no way to raise it for depthwise (which a separate hardware
+/// probe did validate at 576/960) without also permitting dense
+/// construction into that range. See
 /// `iree-rocket-hal/tests/conv_mobilenetv2_depthwise_wide_hw.rs`'s doc
 /// comment for the depthwise-side validation and what raising this again
 /// would need (a depthwise-specific ceiling, not this shared one).
@@ -216,22 +240,33 @@ pub const OUTPUT_CHANNELS: u32 = 8;
 /// Largest output-channel count this builder will program.
 ///
 /// `CNA_WEIGHT_SIZE2.weight_kernels` is 14 bits, so 16383 is the encodable
-/// ceiling. The corpus reached 512 in a single unsplit program, and nothing
-/// in it suggests a limit below the field width -- the vendor never splits
-/// the kernel set for capacity at any point measured. The cap is set at the
-/// measured extent rather than the encodable one, on the same principle as
-/// `MAX_INPUT_CHANNELS`.
+/// ceiling. This is set at the *measured* extent instead, on the same
+/// principle as `MAX_INPUT_CHANNELS`.
 ///
-/// Tried raising this to 960 (2026-08-28, MobileNetV2's Cin=Cout={576,960}
-/// depthwise 3x3 stages) and reverted -- see `MAX_INPUT_CHANNELS`'s doc
-/// comment for why: `tests/conv_vendor_fixture_channels_768.rs` caught a
-/// real `ConvPlan`-vs-vendor divergence for *dense* shapes in that same
-/// range, and this constant is shared between dense and depthwise
-/// construction. The depthwise-side validation
-/// (`iree-rocket-hal/tests/conv_mobilenetv2_depthwise_wide_hw.rs`) is still
-/// real and still passes; it just needs a depthwise-specific ceiling to be
-/// wired up safely, not this shared one.
-pub const MAX_OUTPUT_CHANNELS: u32 = 512;
+/// Raised 512 -> 768 (2026-09-01). Both halves of the expanded corpus
+/// reproduce `ConvPlan`'s CBUF split for every `Cout` up to 768 at every
+/// `Cin` at or below 512 -- 96 of 96 cases in
+/// `tests/conv_vendor_fixture_channels_768.rs`, with zero bank, tile or
+/// output-channel-group differences -- and dense int8 1x1 is hardware-exact
+/// at `Cout` 528/640/768 for `Cin` 88/136/224/352.
+///
+/// This is deliberately *not* symmetric with `MAX_INPUT_CHANNELS`, which
+/// stays at 512: the divergence that reverted the earlier 960 attempt is
+/// indexed by `Cin`, not `Cout`. Every `Cin >= 576` case in the corpus still
+/// disagrees (`ConvPlan` predicts 1/11 against the vendor's 6/6, 5/7, 4/8,
+/// 4/8), because `streamed_weight_bank_preference` exceeds the eleven
+/// grantable banks there and clamps, which makes
+/// `demand_based_cbuf_partition`'s "return the unused banks to data"
+/// correction test `weight_banks > streamed_preference` as `11 > 11` and
+/// never fire. The vendor's own split is periodic in `Cin` rather than
+/// monotonic, so it is bounding a resident coefficient working set that this
+/// formula grows without limit. Fixing that is what `Cin > 512` needs.
+///
+/// Depthwise is unaffected by this raise: it constructs with
+/// `out_channels == in_channels`, so `MAX_INPUT_CHANNELS` still binds it at
+/// 512. That is what makes raising this shared constant safe here, where the
+/// 960 attempt was not.
+pub const MAX_OUTPUT_CHANNELS: u32 = 768;
 
 /// `DPU_BS_MUL_CFG.bs_mul_shift_value`, and its negated twin
 /// `DPU_DATA_FORMAT.bs_mul_shift_value_neg`, in every quantized capture.
@@ -261,6 +296,19 @@ const CBUF_BANK_BYTES: u32 = 256 * 128;
 /// been programmed that way (see its `div_ceil` below); the residency bound
 /// in [`Shape::max_tile_input_rows_for_width_and_data_banks`] has to charge
 /// the same way or it over-commits the CBUF.
+/// Whether `Shape` may be built with more input channels than the capture
+/// corpus backs.
+///
+/// This exists so the CBUF-split scoring harness
+/// (`tests/cbuf_split_score.rs`) and the high-channel hardware probes can
+/// reach past the cap; without it `Shape` refuses to build and the most
+/// interesting part of the vendor corpus is invisible. `parity_padded_shape`
+/// still refuses the shapes known wrong on hardware, and nothing on the
+/// compiled path sets this.
+fn unbacked_channels_allowed() -> bool {
+    std::env::var_os("ROCKET_ALLOW_UNBACKED_CHANNELS").is_some()
+}
+
 const CBUF_ATOMS_PER_ENTRY: u32 = 4;
 
 /// Minimum safe `weight_banks` once a coefficient footprint is being
@@ -306,10 +354,73 @@ fn weight_banks_floor(weight_channels: u32) -> u32 {
 /// This is a preferred allocation, not a new hardware-safety minimum; the
 /// independently measured [`weight_banks_floor`] remains in force below it.
 fn streamed_weight_bank_preference(weight_channels: u32, kernels: Kernels) -> u32 {
+    let undivided = streamed_weight_bank_preference_for_group(weight_channels, kernels, 1);
+    if undivided <= MAX_UNDIVIDED_WEIGHT_BANKS {
+        return undivided;
+    }
+    // Deliberately unclamped: a working set that still saturates after the
+    // division is refused by `demand_based_cbuf_partition`, not quietly turned
+    // into a one-data-bank split. 5x5 `Cin` 512 wants 13 banks even divided,
+    // and no capture covers it.
+    streamed_weight_bank_preference_for_group(weight_channels, kernels, 2)
+}
+
+/// Largest coefficient grant the vendor will take without dividing the
+/// streamed output-channel group -- i.e. it always leaves at least two banks
+/// for feature data.
+///
+/// Measured, not chosen: the spatial corpus shows the group divided at every
+/// `Cin` whose undivided grant reaches eleven (k=3 `Cin` >= 576) and undivided
+/// at ten (5x5 `Cin` 192 keeps the vendor's 2/10).
+const MAX_UNDIVIDED_WEIGHT_BANKS: u32 = CBUF_BANKS - 2;
+
+/// Bytes one CBUF entry holds, and entries one bank holds. The multi-pass
+/// correction below depends on the remainder within a bank, so the two have to
+/// be visible separately even though their product is [`CBUF_BANK_BYTES`].
+const CBUF_ENTRY_BYTES: u32 = 128;
+const CBUF_ENTRIES_PER_BANK: u32 = CBUF_BANK_BYTES / CBUF_ENTRY_BYTES;
+
+/// Coefficient grant when the streamed output-channel group is divided by
+/// `group_divisor`.
+///
+/// `group_divisor == 1` reproduces the single-pass formula exactly: the
+/// vendor's working set is `Cin * kh * g * kw_q` bytes for a group of `g`
+/// output channels, which at the 64-bytes-per-tap calibration point is the
+/// same product as `kh * kw * Cin * 64`.
+///
+/// Two details come from the vendor's routine (`librknnc.so`, file offset
+/// 0x190ce70) rather than from fitting: a divided group is streamed in more
+/// than one pass, which costs **one extra bank** unless the coefficient tail
+/// divides a bank evenly, and never fewer than two.
+///
+/// The corpus never shows a divisor beyond two. An earlier attempt let the
+/// search keep halving until the *feature map* fit, which drove 56x56 `Cin`
+/// 640 to five banks against the vendor's seven and computed wrong values on
+/// hardware; the division threshold is a property of the coefficient working
+/// set alone, not of the spatial extent.
+fn streamed_weight_bank_preference_for_group(
+    weight_channels: u32,
+    kernels: Kernels,
+    group_divisor: u32,
+) -> u32 {
     const STREAMED_BYTES_PER_INPUT_TAP: u32 = 64;
-    (kernels[0] as u32 * kernels[1] as u32 * weight_channels * STREAMED_BYTES_PER_INPUT_TAP)
-        .div_ceil(CBUF_BANK_BYTES)
-        .max(1)
+    let working_set =
+        kernels[0] as u32 * kernels[1] as u32 * weight_channels * STREAMED_BYTES_PER_INPUT_TAP
+            / group_divisor;
+    let entries = working_set.div_ceil(CBUF_ENTRY_BYTES);
+    let banks = entries.div_ceil(CBUF_ENTRIES_PER_BANK).max(1);
+    if group_divisor == 1 {
+        return banks;
+    }
+    if banks < 2 {
+        return 2;
+    }
+    let remainder = entries % CBUF_ENTRIES_PER_BANK;
+    if remainder != 0 && !CBUF_ENTRIES_PER_BANK.is_multiple_of(remainder) {
+        banks + 1
+    } else {
+        banks
+    }
 }
 
 /// Largest `CNA_CBUF_CON1.data_entries` value the expanded corpus shows the
@@ -758,7 +869,7 @@ impl Shape {
         );
         assert!(stride > 0, "convolution stride must be nonzero");
         assert!(
-            (1..=precision.max_in_channels()).contains(&in_channels),
+            (1..=precision.max_in_channels()).contains(&in_channels) || unbacked_channels_allowed(),
             "input channels must be 1..={}; beyond that the channel padding \
              has no capture backing at this precision",
             precision.max_in_channels()
@@ -1043,6 +1154,20 @@ impl Shape {
     /// then leaves accumulator output unwritten at every point from 400
     /// through 512; focused runs locate the transition at 385.
     pub fn parity_padded_shape(&self, kernels: Kernels) -> Result<Shape, &'static str> {
+        self.validate_accumulator_output_shape(kernels)?;
+
+        Ok(Shape {
+            out_channels: self.parity_padded_out_channels(kernels),
+            ..*self
+        })
+    }
+
+    /// Rejects accumulator-output shapes with known hardware failures.
+    ///
+    /// This is separate from [`Shape::parity_padded_shape`] because callers
+    /// may construct a [`ConvPlan`] directly. Every planning entry point must
+    /// apply the same safety boundary before it emits a register program.
+    fn validate_accumulator_output_shape(&self, kernels: Kernels) -> Result<(), &'static str> {
         if self.precision.writes_accumulators()
             && !self.depthwise
             && kernels == [3, 3]
@@ -1055,18 +1180,16 @@ impl Shape {
         }
         if self.precision.writes_accumulators()
             && !self.depthwise
-            && kernels == [1, 1]
-            && self.in_channels > 384
+            && self.accumulator_coefficient_bytes_per_channel(kernels)
+                > MAX_ACCUMULATOR_COEFFICIENT_BYTES_PER_CHANNEL
+            && !known_bad_shapes_allowed()
         {
             return Err(
-                "dense 1x1 int8 accumulator convolution supports at most 384 input channels",
+                "dense int8 accumulator convolution exceeds the coefficient working set the \
+                 output path can hold: at most 384 coefficient bytes per output channel",
             );
         }
-
-        Ok(Shape {
-            out_channels: self.parity_padded_out_channels(kernels),
-            ..*self
-        })
+        Ok(())
     }
 
     /// Conservative physical output allocation for this convolution, in
@@ -1171,6 +1294,14 @@ impl Shape {
     /// out.
     fn cbuf_atoms(&self) -> u32 {
         quad_atoms(self.feature_atoms())
+    }
+
+    /// Coefficient bytes one output channel carries, the quantity the
+    /// accumulator output path bounds. See
+    /// [`MAX_ACCUMULATOR_COEFFICIENT_BYTES_PER_CHANNEL`].
+    fn accumulator_coefficient_bytes_per_channel(&self, kernels: Kernels) -> u32 {
+        let taps = kernels[0] as u32 * kernels[1] as u32;
+        self.weight_channels() * taps * self.precision.element_bytes()
     }
 
     /// Whether the feature map is dense NHWC or NC1HWC2 surfaces.
@@ -1417,8 +1548,34 @@ impl Shape {
         };
         let data_banks = granted.clamp(1, CBUF_BANKS - 1);
         let weight_banks = CBUF_BANKS - data_banks;
-        let streamed_preference =
-            streamed_weight_bank_preference(self.weight_channels(), kernels).min(CBUF_BANKS - 1);
+        // Not clamped to the grantable count. A clamp makes the correction
+        // below test `weight_banks > streamed_preference` as `11 > 11`, which
+        // never fires, and the split degenerates to a single data bank --
+        // roughly one input row per tile. Refusing is the honest answer for a
+        // region no capture covers.
+        //
+        // A two-pass reading of the k=3 curve (`streamed / 2 + 1` above the
+        // grant that still leaves three data banks) fits all 13 `Cin` points
+        // from 384 to 768 and was tried here. It is wrong: a k=5 sweep over
+        // the same `Cin` range shows a multi-pass sawtooth that resets twice
+        // (weight banks run 10,8,7,7,8,10 then 7,7,8,9,10,11 then
+        // 6,6,7,7,8,8,9,9,10,10,10,11), and the vendor uses 1/11 and 2/10
+        // freely there -- so a single-data-bank split is not inherently wrong
+        // and the "leaves three data banks" threshold does not survive a
+        // second kernel size. The k=3 fit would have mis-planned k=5 `Cin` 192
+        // as 6/6 against the vendor's 2/10.
+        let streamed_preference = streamed_weight_bank_preference(self.weight_channels(), kernels);
+        assert!(
+            streamed_preference <= CBUF_BANKS - 1,
+            "coefficient working set wants {streamed_preference} CBUF banks for \
+             {}x{} kernel and {} weight channels, more than the {} grantable; the \
+             CBUF partition above that point is not capture-backed (see \
+             MAX_INPUT_CHANNELS' doc comment)",
+            kernels[0],
+            kernels[1],
+            self.weight_channels(),
+            CBUF_BANKS - 1,
+        );
         let floor = weight_banks_floor(self.weight_channels()).max(streamed_preference);
 
         // Total coefficient size can otherwise consume eleven banks and
@@ -2169,6 +2326,9 @@ impl ConvPlan {
         kernels: Kernels,
         (data_banks, weight_banks): (u32, u32),
     ) -> ConvPlan {
+        shape
+            .validate_accumulator_output_shape(kernels)
+            .expect("unsupported accumulator output geometry");
         let full_width = vec![shape.output_width(kernels)];
         if let Some(tiles) = plan_grid(shape, kernels, &full_width, data_banks) {
             return ConvPlan {
@@ -2264,7 +2424,7 @@ impl ConvPlan {
                     self.shape,
                     self.kernels,
                     tile,
-                    feature_grains(self.kernels, &tile.rows),
+                    feature_grains_planned(self.shape, self.kernels, &tile.rows),
                     self.data_banks,
                     self.weight_banks,
                     OutputPlacement::SharedImage,
@@ -2335,7 +2495,7 @@ impl ConvPlan {
                 self.shape,
                 self.kernels,
                 tile,
-                feature_grains(self.kernels, &tile.rows),
+                feature_grains_planned(self.shape, self.kernels, &tile.rows),
                 self.data_banks,
                 self.weight_banks,
                 OutputPlacement::ContiguousTile,
@@ -2974,6 +3134,120 @@ pub fn conv_2d_tile(shape: Shape, kernels: Kernels, tile: &Tile) -> Vec<RegCmd> 
 /// value tracks `kernel_height` and is unchanged by `kernel_width`.
 pub fn feature_grains(kernels: Kernels, tile: &Tile) -> u32 {
     tile.in_rows + kernel_programming(kernels, None).height + tile.pad_top
+}
+
+/// [`feature_grains`], with the characterization override applied.
+///
+/// Only `ConvPlan` uses this. The override is gated on `Cin` so a probe can
+/// change the shapes under study without disturbing the health canary the
+/// hardware harness runs first -- forcing a global value breaks known-good
+/// shapes, which is itself evidence that the prefetch is not a free parameter.
+fn feature_grains_planned(shape: Shape, kernels: Kernels, tile: &Tile) -> u32 {
+    let programmed = feature_grains(kernels, tile);
+    if shape.in_channels < grains_override_min_channels() {
+        return programmed;
+    }
+    match grains_override() {
+        Some(GrainsOverride::Exact(value)) => value,
+        Some(GrainsOverride::Cap(cap)) => programmed.min(cap),
+        None => programmed,
+    }
+}
+
+/// Lowest `Cin` the grains override applies to (`ROCKET_FEATURE_GRAINS_MIN_CIN`,
+/// default 0).
+fn grains_override_min_channels() -> u32 {
+    std::env::var("ROCKET_FEATURE_GRAINS_MIN_CIN")
+        .ok()
+        .and_then(|value| value.parse().ok())
+        .unwrap_or(0)
+}
+
+/// Test-only override of the programmed prefetch. See [`grains_override`].
+enum GrainsOverride {
+    Exact(u32),
+    Cap(u32),
+}
+
+/// Lets a hardware probe drive `feature_grains` through the *whole* ConvPlan
+/// path rather than hand-building one tile, which is what
+/// `conv_2d_tile_with_grains` already allows for a single tile.
+///
+/// This exists because our value and the vendor's disagree systematically --
+/// ours is rows-driven and stays near 33, while the vendor drives it down with
+/// channel pressure (33, 16, 9, ... 6) -- and no gate test compares the field.
+/// `ROCKET_FEATURE_GRAINS=<n>` pins it; `ROCKET_FEATURE_GRAINS_MAX=<n>` clamps
+/// it. Nothing on the compiled path sets either.
+fn grains_override() -> Option<GrainsOverride> {
+    if let Ok(value) = std::env::var("ROCKET_FEATURE_GRAINS") {
+        if let Ok(parsed) = value.parse() {
+            return Some(GrainsOverride::Exact(parsed));
+        }
+    }
+    if let Ok(value) = std::env::var("ROCKET_FEATURE_GRAINS_MAX") {
+        if let Ok(parsed) = value.parse() {
+            return Some(GrainsOverride::Cap(parsed));
+        }
+    }
+    None
+}
+
+/// Most coefficient bytes per output channel a dense int8 **accumulator**
+/// convolution may carry.
+///
+/// Measured on hardware 2026-09-02 at a controlled 32x32 / Cout 64, each case
+/// guarded by a health check either side (a wedged NPU returns all-fail and
+/// looks exactly like data). The device is exact at or below this and wrong
+/// above it, with the edge landing on adjacent values:
+///
+/// | kernel | last exact                | first wrong               |
+/// |--------|---------------------------|---------------------------|
+/// | 1x1    | `Cin` 384 -> 384 bytes    | `Cin` 385 -> 385 bytes    |
+/// | 1x3    | `Cin` 128 -> 384 bytes    | `Cin` 129 (pads 144) 432  |
+/// | 3x3    | `Cin` 32  -> 288 bytes    | `Cin` 33 (pads 48) -> 432 |
+///
+/// The 1x3 row is what makes this a *per-channel coefficient* limit rather
+/// than a channel count that happens to sit near 384: a plain `Cin` limit
+/// predicts `Cin` 129 exact, and it is not. Cout is independent -- at 3x3
+/// `Cin` 48 every Cout from 8 to 64 fails, including Cout 8 -- so the total
+/// coefficient footprint is not what binds.
+///
+/// 384 bytes is six whole 64-byte coefficient groups, which is the shape of
+/// the underlying limit; the root cause in the accumulator output path is not
+/// yet found. Plain int8 has no such limit and is exact at every `Cin`
+/// measured, so this guards the output mode, not the convolution.
+const MAX_ACCUMULATOR_COEFFICIENT_BYTES_PER_CHANNEL: u32 = 384;
+
+/// Characterization override for the accumulator `DPU_SURFACE_ADD.surf_add`.
+///
+/// Exceeding the per-channel coefficient limit raises a DMA **read** error and
+/// stalls the rk_iommu, and the accumulator output registers are the only part
+/// of the program with no vendor capture behind them. Nothing on the compiled
+/// path sets this.
+///
+/// Gated by `ROCKET_ACC_SURF_ADD_MIN_CIN` because the hardware harness runs a
+/// low-`Cin` accumulator canary first: overriding globally breaks that canary
+/// and the run aborts as "device sick" rather than measuring anything. That
+/// the canary breaks at all is itself the finding that 16 is load-bearing.
+fn accumulator_surf_add_override(in_channels: u32) -> Option<u32> {
+    let min_channels: u32 = std::env::var("ROCKET_ACC_SURF_ADD_MIN_CIN")
+        .ok()
+        .and_then(|value| value.parse().ok())
+        .unwrap_or(0);
+    if in_channels < min_channels {
+        return None;
+    }
+    std::env::var("ROCKET_ACC_SURF_ADD")
+        .ok()
+        .and_then(|value| value.parse().ok())
+}
+
+/// Whether shapes the HAL knows are miscomputed on this hardware may still be
+/// planned. Only a characterization probe should set this: the guards exist
+/// because the device returns wrong data, and the point of lifting them is to
+/// study that. Nothing on the compiled path sets it.
+fn known_bad_shapes_allowed() -> bool {
+    std::env::var_os("ROCKET_ALLOW_KNOWN_BAD_SHAPES").is_some()
 }
 
 /// Builds a tile program with an explicit `feature_grains`, for probing which
@@ -3668,7 +3942,11 @@ fn conv_2d_tile_program(
             .surf_add(Bits::new(if accumulator_output {
                 // Accumulator output serializes its 32-lane blocks with the
                 // fixed hardware value 16 in both dense and depthwise mode.
-                16
+                // `ROCKET_ACC_SURF_ADD` overrides it for characterization:
+                // this value is one of only four DPU registers that differ
+                // from the (exact) plain-int8 program, and the accumulator
+                // mode has no vendor capture to validate it against.
+                accumulator_surf_add_override(shape.in_channels).unwrap_or(16)
             } else {
                 full_out_width * out_height * 2 * if shape.depthwise { 2 } else { 1 }
             }))
@@ -5361,6 +5639,88 @@ mod tests {
             .parity_padded_shape([1, 1])
             .is_err()
         );
+    }
+
+    /// The saturating coefficient working set is refused, not silently
+    /// clamped into a one-data-bank split.
+    ///
+    /// A 5x5 kernel at `Cin` 512 is constructible today and wants 25 banks,
+    /// far past the eleven grantable. Before the guard it came back 1/11 --
+    /// about one input row per tile -- from the same clamp interaction the
+    /// expanded corpus exposes at `Cin` >= 576. (7x7 does not reach the
+    /// allocator: above coefficient demand seven it takes its own
+    /// capture-derived 8/4 schedule.)
+    #[test]
+    #[should_panic(expected = "not capture-backed")]
+    fn saturating_coefficient_working_set_is_refused() {
+        let shape = Shape::with_precision(32, 32, 1, 512, 64, Precision::Fp16);
+        let _ = ConvPlan::new(shape, [5, 5]);
+    }
+
+    /// The accumulator coefficient limit refuses exactly the shapes the device
+    /// gets wrong, at every kernel measured.
+    ///
+    /// Each pair is adjacent on hardware: the first is exact, the second is
+    /// wrong. The 1x3 row is the one that makes this a per-channel coefficient
+    /// bound rather than a channel count -- `Cin` 129 is far below the 1x1
+    /// edge of 384 channels and still fails.
+    #[test]
+    fn accumulator_coefficient_limit_matches_measured_edges() {
+        let quantization = Quantization {
+            input_zero_point: 0,
+            output_zero_point: 0,
+            weight_zero_point: 0,
+            input_scale: 1.0,
+            weights_scale: 1.0,
+            multiplier: Multiplier { scale: 1, shift: 0 },
+        };
+        for (kernels, exact, wrong) in [
+            ([1usize, 1], 384u32, 385u32),
+            ([1, 3], 128, 129),
+            ([3, 3], 32, 33),
+        ] {
+            let shape = |cin| {
+                Shape::with_precision(32, 32, 1, cin, 64, Precision::Int8Accumulator(quantization))
+            };
+            assert!(
+                shape(exact).parity_padded_shape(kernels).is_ok(),
+                "{kernels:?} Cin {exact} is exact on hardware and must be allowed"
+            );
+            assert!(
+                shape(wrong).parity_padded_shape(kernels).is_err(),
+                "{kernels:?} Cin {wrong} is wrong on hardware and must be refused"
+            );
+            assert!(
+                std::panic::catch_unwind(|| ConvPlan::new(shape(wrong), kernels)).is_err(),
+                "{kernels:?} Cin {wrong} must also be refused by direct ConvPlan construction"
+            );
+        }
+    }
+
+    /// A 5x5 kernel at `Cin` 192 plans 2/10, the split the vendor uses.
+    ///
+    /// This is the shape that catches a `Cin`-curve fit being extrapolated
+    /// across kernel sizes: a two-pass rule derived from k=3 (which fits all
+    /// 13 k=3 points from `Cin` 384 to 768) plans 6/6 here. Nothing else in
+    /// the suite reaches it -- the base corpus has k=5 only at `Cin` 3, where
+    /// the coefficient preference is 1.
+    #[test]
+    fn large_kernel_high_channel_split_matches_vendor() {
+        let shape =
+            Shape::with_precision(28, 28, 1, 192, 256, Precision::Fp16).with_padding([2, 2]);
+        let plan = ConvPlan::new(shape, [5, 5]);
+        assert_eq!((plan.data_banks(), plan.weight_banks()), (2, 10));
+    }
+
+    /// The guard does not disturb the range that is capture-backed: a 3x3
+    /// kernel at the same `Cin` wants nine banks and still plans 3/9, the
+    /// split the expanded corpus records.
+    #[test]
+    fn largest_capture_backed_working_set_still_plans() {
+        let shape =
+            Shape::with_precision(28, 28, 1, 512, 256, Precision::Fp16).with_padding([1, 1]);
+        let plan = ConvPlan::new(shape, [3, 3]);
+        assert_eq!((plan.data_banks(), plan.weight_banks()), (3, 9));
     }
 
     #[test]

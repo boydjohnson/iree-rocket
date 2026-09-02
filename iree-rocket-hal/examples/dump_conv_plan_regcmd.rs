@@ -11,6 +11,12 @@
 //!       <width> <height> <stride> <cin> <cout> <kernel> <tile_index> \
 //!       [pad_top] [pad_left]
 //!
+//! `ROCKET_DUMP_DEPTHWISE=1` builds a depthwise shape instead of a dense
+//! one. Useful for diffing which registers a depthwise program sets against
+//! a dense one: a regcmd program is a register *delta*, so a register one
+//! kind of dispatch writes and the other leaves alone is inherited stale
+//! when the two share a command buffer.
+//!
 //! `ROCKET_DUMP_PRECISION=int8acc` switches the shape to
 //! `Int8Accumulator` (zero points zeroed, unit multiplier) instead of the
 //! default fp16, which is what the accumulator output-parity work needs --
@@ -46,9 +52,20 @@ fn main() {
             weights_scale: 1.0,
             multiplier: Multiplier { scale: 1, shift: 0 },
         }),
+        Ok("int8") => Precision::Int8(Quantization {
+            input_zero_point: 0,
+            output_zero_point: 0,
+            weight_zero_point: 0,
+            input_scale: 1.0,
+            weights_scale: 1.0,
+            multiplier: Multiplier { scale: 1, shift: 0 },
+        }),
         _ => Precision::Fp16,
     };
     let mut shape = Shape::with_precision(width, height, stride, cin, cout, precision);
+    if std::env::var("ROCKET_DUMP_DEPTHWISE").is_ok() {
+        shape = shape.with_depthwise();
+    }
     if args.len() > 7 {
         let pad_top = value(7) as usize;
         let pad_left = value(8) as usize;
@@ -56,6 +73,12 @@ fn main() {
     }
     let kernels = [kernel, kernel];
     let plan = ConvPlan::new(shape, kernels);
+    eprintln!(
+        "shape: in_channels={} out_channels={} parity_padded_out_channels={:?}",
+        shape.in_channels,
+        shape.out_channels,
+        shape.parity_padded_shape(kernels).map(|s| s.out_channels),
+    );
     eprintln!(
         "shape: padded_out_channels={} output_atom_bytes={} output_scratch_bytes={} tiles={}",
         shape.padded_out_channels(),
