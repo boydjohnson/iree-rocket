@@ -2729,52 +2729,47 @@ fn group_division_split_cases() -> Vec<Conv2dCase> {
     cases
 }
 
-/// Control for `group_division_high_channel_splits_match_oracle`: dense int8
-/// 3x3 across `Cin`, at splits that predate the group-division change.
+/// Re-measures the dense 3x3 `Cin` cap in **both** int8 output modes.
 ///
-/// The matchers cap dense int8 3x3 at `Cin` 32 because it is known wrong above
-/// that, root cause not found. This pins where the break actually is, so an
-/// int8 failure in the group-division test can be attributed to that standing
-/// bug rather than to the new split.
+/// The transform spec caps dense int8 3x3 at `Cin` 32 on the strength of
+/// "exact to 32, wrong from 33 up". That measurement was made through the
+/// accumulator dispatch, and the 1x1 cliff turned out to be a property of the
+/// accumulator *output* path rather than of int8 convolution -- plain int8 is
+/// exact at every `Cin` where the accumulator is wrong. If the same holds at
+/// 3x3, the cap is an artifact of the output mode and far more of MobileNetV2
+/// could be offloaded than the spec currently allows.
+///
+/// Both patterns matter here: `Counting` is uniform 1s and catches a short
+/// read, `SelectorsAffine` is the int8 permutation probe (raw `Selectors` is a
+/// signed coefficient form that is not the ordinary int8 ABI and says nothing
+/// about the device).
+///
+/// Run one case per process; this sweep contaminates itself.
 #[test]
 #[ignore = "requires the RK3588 NPU"]
 fn dense_int8_3x3_channel_cap_control() {
-    unsafe { std::env::set_var("ROCKET_ALLOW_UNBACKED_CHANNELS", "1") };
     let mut cases = Vec::new();
-    // 56x56 across Cin: the large-feature-map control. Cin <= 512 here is a
-    // shipping shape that predates the group-division change, so a failure at
-    // 512 says the break belongs to the spatial size, not the new split.
-    for cin in [128u32, 256, 512] {
-        for pattern in [OraclePattern::Counting, OraclePattern::SelectorsAffine { phase: 0 }] {
-            cases.push(Conv2dCase {
-                width: 56,
-                height: 56,
-                cin,
-                cout: 256,
-                kernel: [3, 3],
-                stride: 1,
-                padding: [1, 1],
-                precision: OraclePrecision::Fp16,
-                pattern,
-            });
+    for precision in [OraclePrecision::Int8, OraclePrecision::Int8Accumulator] {
+        for cin in [16u32, 32, 33, 64, 128, 256, 512] {
+            for pattern in [
+                OraclePattern::Counting,
+                OraclePattern::SelectorsAffine { phase: 0 },
+            ] {
+                cases.push(Conv2dCase {
+                    width: 28,
+                    height: 28,
+                    cin,
+                    cout: 256,
+                    kernel: [3, 3],
+                    stride: 1,
+                    padding: [1, 1],
+                    precision,
+                    pattern,
+                });
+            }
         }
     }
-    for cin in [16u32, 32, 33, 64, 128, 256, 512] {
-        for pattern in [OraclePattern::Counting, OraclePattern::SelectorsAffine { phase: 0 }] {
-            cases.push(Conv2dCase {
-                width: 28,
-                height: 28,
-                cin,
-                cout: 256,
-                kernel: [3, 3],
-                stride: 1,
-                padding: [1, 1],
-                precision: OraclePrecision::Int8,
-                pattern,
-            });
-        }
-    }
-    run_hardware_case_matrix("dense int8 3x3 channel-cap control", cases);
+    run_hardware_case_matrix("dense int8 3x3 cap, both output modes", cases);
 }
 
 #[test]
@@ -2809,9 +2804,22 @@ fn group_division_high_channel_splits_match_oracle() {
 /// `ROCKET_ALLOW_KNOWN_BAD_SHAPES=1`. `Cin` 384 is the control and must stay
 /// exact in every arm -- if it breaks, the arm is invalid, not informative.
 fn accumulator_grains_cases() -> Vec<Conv2dCase> {
-    [384u32, 400, 448, 512]
+    // Both precisions at the same shapes. The register diff showed our conv
+    // programming is bit-identical to the vendor's across the cliff for every
+    // register both sides write, so the remaining suspects are the accumulator
+    // *output* path (which the vendor never exercises, so no capture can
+    // adjudicate it) and buffer packing. Plain int8 shares the packing and the
+    // whole input side but takes the ordinary requantized output, so it
+    // separates the two: if plain int8 is exact where the accumulator is
+    // wrong, the fault is downstream of the DPU accumulate.
+    [OraclePrecision::Int8Accumulator, OraclePrecision::Int8]
         .into_iter()
-        .map(|cin| Conv2dCase {
+        .flat_map(|precision| {
+            [384u32, 400, 448, 512]
+                .into_iter()
+                .map(move |cin| (precision, cin))
+        })
+        .map(|(precision, cin)| Conv2dCase {
             width: 32,
             height: 32,
             cin,
@@ -2819,7 +2827,7 @@ fn accumulator_grains_cases() -> Vec<Conv2dCase> {
             kernel: [1, 1],
             stride: 1,
             padding: [0, 0],
-            precision: OraclePrecision::Int8Accumulator,
+            precision,
             pattern: OraclePattern::Counting,
         })
         .collect()
