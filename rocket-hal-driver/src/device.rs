@@ -32,7 +32,8 @@ use crate::{
         iree_hal_semaphore_compatibility_t, iree_hal_semaphore_flags_t, iree_hal_semaphore_list_t,
         iree_hal_semaphore_t, iree_hal_topology_edge_t, iree_hal_update_flags_t,
         iree_hal_write_flags_t, iree_host_size_t, iree_io_file_handle_t,
-        iree_status_code_e_IREE_STATUS_INTERNAL, iree_status_code_e_IREE_STATUS_INVALID_ARGUMENT,
+        iree_status_code_e_IREE_STATUS_DEADLINE_EXCEEDED, iree_status_code_e_IREE_STATUS_INTERNAL,
+        iree_status_code_e_IREE_STATUS_INVALID_ARGUMENT,
         iree_status_code_e_IREE_STATUS_UNAVAILABLE, iree_status_t, iree_string_view_t,
         iree_timeout_t, iree_timeout_type_e_IREE_TIMEOUT_ABSOLUTE,
     },
@@ -124,6 +125,35 @@ pub struct RocketDevice {
 // 16 channels. A 1 ms dwell is hardware-validated; it is deliberately
 // restricted to this mode transition rather than added to all dispatches.
 const DEPTHWISE_TO_DENSE_QUIESCENCE: Duration = Duration::from_millis(1);
+
+// A hung NPU job is invisible to this driver unless it is timed, and the
+// result of one is a silently half-written output buffer.
+//
+// When the NPU stalls, `rocket_job.c`'s watchdog resets the core and signals
+// the job's fence with an error. But `PREP_BO` waits on the `dma_resv` fence,
+// and a fence signaled *with an error* is still signaled -- so it returns
+// success, `DISPATCH_COMPLETION_TIMEOUT_NS` never expires, and the dispatch
+// looks complete while part of the output was never written. The kernel does
+// say so (`rocket ...npu: NPU job timed out`, plus a line giving `PC
+// raw_status`, `CNA_S_STATUS` and `CORE_S_STATUS`), but nothing in that path
+// reaches userspace.
+//
+// The round trip is the only tell available here. Measured on `planck`
+// 2026-09-02 against `iree-rocket-hal`'s oracle sweep: healthy dispatches run
+// in **under 3.4 ms**, including the largest shapes that crate exercises
+// (7x7 Cin=1792), while a job the watchdog kills costs its full timeout at
+// **507-534 ms**. This floor sits roughly 70x above the healthy ceiling and
+// comfortably under the watchdog, so it cannot be reached by a dispatch that
+// is merely large -- and production splits each dispatch into individually
+// fenced tasks, which are smaller still than the shapes that ceiling was
+// measured on. Raise it if a legitimately slow dispatch ever trips it; do not
+// remove it, because the alternative is returning wrong results as if they
+// were right.
+const HUNG_JOB_DISPATCH_FLOOR: Duration = Duration::from_millis(250);
+
+fn is_hung_dispatch(elapsed: Duration) -> bool {
+    elapsed >= HUNG_JOB_DISPATCH_FLOOR
+}
 
 fn needs_depthwise_to_dense_quiescence(
     last: Option<crate::command_buffer::DpuMode>,
@@ -1176,11 +1206,21 @@ fn compact_tiled_accumulator_output(
 #[cfg(test)]
 mod device_tests {
     use super::{
-        compact_atomic_output, compact_tiled_accumulator_output,
-        needs_depthwise_to_dense_quiescence,
+        HUNG_JOB_DISPATCH_FLOOR, compact_atomic_output, compact_tiled_accumulator_output,
+        is_hung_dispatch, needs_depthwise_to_dense_quiescence,
     };
     use crate::command_buffer::DpuMode;
     use iree_rocket_hal::rocket::conv::AccumulatorOutputTile;
+    use std::time::Duration;
+
+    #[test]
+    fn separates_a_healthy_dispatch_from_a_watchdog_reset() {
+        // Both bounds are measured, not chosen: see HUNG_JOB_DISPATCH_FLOOR.
+        assert!(!is_hung_dispatch(Duration::from_micros(3_400)));
+        assert!(!is_hung_dispatch(Duration::from_millis(100)));
+        assert!(is_hung_dispatch(Duration::from_millis(507)));
+        assert!(is_hung_dispatch(HUNG_JOB_DISPATCH_FLOOR));
+    }
 
     #[test]
     fn quiesces_only_the_completed_depthwise_to_dense_transition() {
@@ -1569,6 +1609,7 @@ unsafe extern "C" fn queue_execute(
                     // split reloads its weights, so no CBUF state must survive
                     // between jobs.
                     for &(regcmd_addr, regcmd_count) in &task_descriptors {
+                        let dispatch_started = std::time::Instant::now();
                         if unsafe {
                             rocket_device::submit(
                                 fd,
@@ -1603,6 +1644,23 @@ unsafe extern "C" fn queue_execute(
                                     iree_status_code_e_IREE_STATUS_UNAVAILABLE,
                                 );
                             }
+                        }
+
+                        // Every ioctl above succeeded, which proves nothing:
+                        // see HUNG_JOB_DISPATCH_FLOOR. Fail loudly rather than
+                        // hand back a partially written buffer as a result.
+                        let elapsed = dispatch_started.elapsed();
+                        if is_hung_dispatch(elapsed) {
+                            eprintln!(
+                                "rocket: NPU job hung -- dispatch took {} ms, so the watchdog \
+                                 reset the core mid-job and this output buffer is a partial \
+                                 write. `sudo dmesg | grep -A1 'NPU job timed out'` has the \
+                                 hardware's account.",
+                                elapsed.as_millis(),
+                            );
+                            break 'result status::from_code(
+                                iree_status_code_e_IREE_STATUS_DEADLINE_EXCEEDED,
+                            );
                         }
                     }
 
