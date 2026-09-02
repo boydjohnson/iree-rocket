@@ -151,21 +151,28 @@ pub const INPUT_CHANNELS: u32 = 3;
 /// in exactly that range. `ConvPlan` predicted a 1/11 CBUF split at
 /// Cin=576/640/704/768 where real captures show 6/6, 5/7, 4/8, 4/8.
 ///
-/// Most of that is now understood and fixed: see
-/// `demand_based_cbuf_partition`'s two-pass coefficient rule, which turns
-/// 96/144 corpus agreement into 134/144 and matches all 13 `Cin` points
-/// from 384 to 768 on the `Cin`-only curve. New corpora built for this
-/// (`build_vendor_fixtures.py --channel-grid-extent 14`, and
-/// `--channel-grid-step 32`) also show the split is geometry-independent
-/// above `Cin` 384 -- 28x28 and 14x14 agree on every point there.
+/// New corpora built for this (`build_vendor_fixtures.py`, which runs
+/// locally -- `rknn-convert` is on PATH, no board needed) narrow it a lot:
 ///
-/// What still blocks raising this: at the *transition* `Cin` values the
-/// grant depends on `Cout` in a way a `Cin`-only preference cannot express
-/// (608 wants 6 banks at `Cout` <= 32 and 7 above; 704 wants 7 at
-/// `Cout` <= 64 and 8 above; 736 flips at 64). Raising this constant with
-/// that unresolved leaves ~10 of 144 corpus cases mis-planned --
-/// `conv_vendor_fixture_channels_768.rs` fails loudly if anyone tries, which
-/// is the intended tripwire.
+///   * The split is **geometry-independent above `Cin` 384** -- 28x28 and
+///     14x14 agree on every point there -- so it is a coefficient working-set
+///     rule in that range, not spatial demand.
+///   * At 32-channel granularity the k=3 curve is 6,6,7,7,7,8,8,8 weight
+///     banks over `Cin` 544..768, and `Cout` only matters at `Cout <= 96`.
+///   * `ceil(Cin / 96)` fits all eight of those points, and a two-pass
+///     reading (`streamed / 2 + 1`) fits all 13 from 384 up.
+///
+/// Both were tried and **rejected**: a k=5 sweep over the same range shows a
+/// multi-pass sawtooth resetting twice (10,8,7,7,8,10 then 7,7,8,9,10,11 then
+/// 6,6,7,7,8,8,9,9,10,10,10,11), where the vendor uses 1/11 and 2/10 freely.
+/// So a one-data-bank split is not inherently wrong, the "leaves three data
+/// banks" threshold does not survive a second kernel size, and the k=3 fit
+/// mis-plans k=5 `Cin` 192 as 6/6 against the vendor's 2/10
+/// (`large_kernel_high_channel_split_matches_vendor` guards that).
+///
+/// What a real fix needs is the sawtooth's reset rule -- how many passes the
+/// vendor uses and what each one costs -- fitted across kernel sizes, not a
+/// curve through one. The corpora to do it with are in the spike repo.
 ///
 /// This constant is shared between dense and depthwise Shape construction,
 /// so there's no way to raise it for depthwise (which a separate hardware
@@ -1445,40 +1452,29 @@ impl Shape {
         };
         let data_banks = granted.clamp(1, CBUF_BANKS - 1);
         let weight_banks = CBUF_BANKS - data_banks;
-        // Above the largest grant that still leaves three data banks, the
-        // vendor stops growing the resident coefficient set and splits the
-        // stream into two passes instead: the working set halves, plus one
-        // bank to double-buffer the next pass. Below that it keeps the whole
-        // set resident and the preference is the demand itself.
+        // Not clamped to the grantable count. A clamp makes the correction
+        // below test `weight_banks > streamed_preference` as `11 > 11`, which
+        // never fires, and the split degenerates to a single data bank --
+        // roughly one input row per tile. Refusing is the honest answer for a
+        // region no capture covers.
         //
-        // Fits the expanded corpus exactly, 13 of 13 `Cin` points from 384 to
-        // 768 at 32-channel granularity, where the raw preference runs 7..14
-        // and the vendor's grant runs 7,8,8,9,9 then 6,6,6,7,7,7,7,8. It also
-        // explains the discontinuity that made this look unfittable: the
-        // grant *drops* from 9 to 6 between `Cin` 512 and 544 because that is
-        // where the second pass appears.
-        //
-        // Geometry-independent above `Cin` 384, confirmed on two extents
-        // (28x28 and 14x14 agree on every point in that range); below it the
-        // split still follows spatial demand and this preference is not what
-        // decides it.
-        const MAX_SINGLE_PASS_WEIGHT_BANKS: u32 = CBUF_BANKS - 3;
-        let single_pass = streamed_weight_bank_preference(self.weight_channels(), kernels);
-        let streamed_preference = if single_pass <= MAX_SINGLE_PASS_WEIGHT_BANKS {
-            single_pass
-        } else {
-            single_pass / 2 + 1
-        };
-        // A working set that does not fit even split in two is past anything
-        // the corpus covers. Refusing beats clamping: a clamp makes the
-        // correction below test `weight_banks > streamed_preference` as
-        // `11 > 11`, which never fires, and the split degenerates to one data
-        // bank -- roughly one input row per tile.
+        // A two-pass reading of the k=3 curve (`streamed / 2 + 1` above the
+        // grant that still leaves three data banks) fits all 13 `Cin` points
+        // from 384 to 768 and was tried here. It is wrong: a k=5 sweep over
+        // the same `Cin` range shows a multi-pass sawtooth that resets twice
+        // (weight banks run 10,8,7,7,8,10 then 7,7,8,9,10,11 then
+        // 6,6,7,7,8,8,9,9,10,10,10,11), and the vendor uses 1/11 and 2/10
+        // freely there -- so a single-data-bank split is not inherently wrong
+        // and the "leaves three data banks" threshold does not survive a
+        // second kernel size. The k=3 fit would have mis-planned k=5 `Cin` 192
+        // as 6/6 against the vendor's 2/10.
+        let streamed_preference = streamed_weight_bank_preference(self.weight_channels(), kernels);
         assert!(
             streamed_preference <= CBUF_BANKS - 1,
             "coefficient working set wants {streamed_preference} CBUF banks for \
-             {}x{} kernel and {} weight channels even split in two, more than the \
-             {} grantable; not capture-backed (see MAX_INPUT_CHANNELS' doc comment)",
+             {}x{} kernel and {} weight channels, more than the {} grantable; the \
+             CBUF partition above that point is not capture-backed (see \
+             MAX_INPUT_CHANNELS' doc comment)",
             kernels[0],
             kernels[1],
             self.weight_channels(),
@@ -5443,6 +5439,21 @@ mod tests {
     fn saturating_coefficient_working_set_is_refused() {
         let shape = Shape::with_precision(32, 32, 1, 512, 64, Precision::Fp16);
         let _ = ConvPlan::new(shape, [5, 5]);
+    }
+
+    /// A 5x5 kernel at `Cin` 192 plans 2/10, the split the vendor uses.
+    ///
+    /// This is the shape that catches a `Cin`-curve fit being extrapolated
+    /// across kernel sizes: a two-pass rule derived from k=3 (which fits all
+    /// 13 k=3 points from `Cin` 384 to 768) plans 6/6 here. Nothing else in
+    /// the suite reaches it -- the base corpus has k=5 only at `Cin` 3, where
+    /// the coefficient preference is 1.
+    #[test]
+    fn large_kernel_high_channel_split_matches_vendor() {
+        let shape =
+            Shape::with_precision(28, 28, 1, 192, 256, Precision::Fp16).with_padding([2, 2]);
+        let plan = ConvPlan::new(shape, [5, 5]);
+        assert_eq!((plan.data_banks(), plan.weight_banks()), (2, 10));
     }
 
     /// The guard does not disturb the range that is capture-backed: a 3x3
