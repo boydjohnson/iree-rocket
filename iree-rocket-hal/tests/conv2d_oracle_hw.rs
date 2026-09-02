@@ -86,6 +86,21 @@ impl OwnedBuffer {
             .unwrap_or(0)
     }
 
+    /// Byte the padding region is filled with (`ROCKET_POISON_<WHICH>`).
+    ///
+    /// Zero padding proves *that* the NPU reads outside the buffer but says
+    /// nothing about *which* buffer, because a zero contributes nothing to the
+    /// sum. A nonzero fill does: under the `Counting` pattern every real input
+    /// and coefficient is 1, so the accumulator is a plain count, and any
+    /// over-read of a region filled with `p` shifts the result by a multiple
+    /// of `p`. Poisoning one buffer at a time therefore names the source.
+    fn poison_byte(which: &str) -> u8 {
+        std::env::var(format!("ROCKET_POISON_{which}"))
+            .ok()
+            .and_then(|value| value.parse().ok())
+            .unwrap_or(0)
+    }
+
     unsafe fn from_bytes_padded(
         fd: i32,
         bytes: &[u8],
@@ -96,6 +111,16 @@ impl OwnedBuffer {
         unsafe {
             ptr::write_bytes(buffer.buffer.host_ptr, 0, buffer.buffer.size);
             ptr::copy_nonoverlapping(bytes.as_ptr(), buffer.buffer.host_ptr, bytes.len());
+            // Everything past the logical data is padding; poison it so an
+            // over-read shows up in the arithmetic.
+            let poison = Self::poison_byte(which);
+            if poison != 0 && buffer.buffer.size > bytes.len() {
+                ptr::write_bytes(
+                    buffer.buffer.host_ptr.add(bytes.len()),
+                    poison,
+                    buffer.buffer.size - bytes.len(),
+                );
+            }
         }
         buffer
     }
@@ -2901,6 +2926,58 @@ fn accumulator_rectangular_kernel_probe() {
     );
 }
 
+/// What is the number of *written* output lanes a function of?
+///
+/// Past the coefficient limit the DPU leaves most lanes untouched
+/// (`OUTPUT_SENTINEL`) rather than writing wrong values. With all three
+/// `ROCKET_PAD_*` set the job no longer faults, so the written count is stable
+/// run to run and the device never wedges -- which makes this sweepable.
+///
+/// Three axes, each varied with the others held fixed: `Cin` past the limit,
+/// `Cout` (which sets `blocks_per_pixel`), and the spatial extent (which sets
+/// pixels and tile count).
+fn accumulator_written_lanes_cases() -> Vec<Conv2dCase> {
+    let base = |width, height, cin, cout, kernel: usize| Conv2dCase {
+        width,
+        height,
+        cin,
+        cout,
+        kernel: [kernel, kernel],
+        stride: 1,
+        padding: [kernel / 2, kernel / 2],
+        precision: OraclePrecision::Int8Accumulator,
+        pattern: OraclePattern::Counting,
+    };
+    let mut cases = Vec::new();
+    // Cin axis: 32x32, Cout 64, k=1.
+    for cin in [385u32, 400, 448, 512] {
+        cases.push(base(32, 32, cin, 64, 1));
+    }
+    // Cout axis: 32x32, Cin 400, k=1.
+    for cout in [32u32, 128, 256] {
+        cases.push(base(32, 32, 400, cout, 1));
+    }
+    // Spatial axis: Cin 400, Cout 64, k=1.
+    for extent in [16u32, 64] {
+        cases.push(base(extent, extent, 400, 64, 1));
+    }
+    // k=3 cross-check, just past its own limit.
+    cases.push(base(32, 32, 33, 64, 3));
+    cases.push(base(32, 32, 64, 64, 3));
+    cases
+}
+
+#[test]
+#[ignore = "requires the RK3588 NPU"]
+fn accumulator_written_lanes_probe() {
+    unsafe { std::env::set_var("ROCKET_ALLOW_KNOWN_BAD_SHAPES", "1") };
+    unsafe { std::env::set_var("ROCKET_ALLOW_UNBACKED_CHANNELS", "1") };
+    run_hardware_case_matrix(
+        "int8 accumulator written-lane count",
+        accumulator_written_lanes_cases(),
+    );
+}
+
 fn accumulator_per_channel_threshold_cases() -> Vec<Conv2dCase> {
     [352u32, 368, 384, 385, 392, 400, 416]
         .into_iter()
@@ -3068,4 +3145,114 @@ fn accumulator_high_channel_grains_probe() {
         &format!("int8 accumulator 1x1 Cin cliff, grains={grains}"),
         accumulator_grains_cases(),
     );
+}
+
+/// Maps *which* bytes of the accumulator staging buffer the DPU actually
+/// wrote, past the per-output-channel coefficient limit.
+///
+/// The written-lane counts are deterministic under padding but do not fit a
+/// clean function of `Cin`, `Cout` or extent, and some are not even pixel
+/// aligned. Counting lanes cannot distinguish a prefix from a stride from a
+/// scattered pattern, so this reads the staging buffer byte by byte and prints
+/// the run structure instead. `OUTPUT_SENTINEL` marks untouched bytes.
+///
+/// Worth noting up front: bad lanes read `0xA5A5A5B0`, i.e. only the *low*
+/// byte of a 4-byte accumulator lane was disturbed, and 0xB0 is not the low
+/// byte of the expected 385 (0x181) either. So the write granularity may be
+/// finer than a lane.
+#[cfg(feature = "hardware-characterization")]
+#[test]
+#[ignore = "requires the RK3588 NPU"]
+fn accumulator_written_region_map() {
+    unsafe { std::env::set_var("ROCKET_ALLOW_KNOWN_BAD_SHAPES", "1") };
+    unsafe { std::env::set_var("ROCKET_ALLOW_UNBACKED_CHANNELS", "1") };
+    let _guard = NPU_TEST_LOCK
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    let file = OpenOptions::new()
+        .read(true)
+        .write(true)
+        .open(DEVICE_PATH)
+        .expect("failed to open RK3588 NPU device");
+
+    // One axis varied at a time. Tile 0's prefix stopped at exactly 24 pixels
+    // for both Cin 385 and 400, so the question is what that 24 is a function
+    // of -- and tile 1 differed (63 vs 2 px), so the tiles must be read apart.
+    let mut cases: Vec<(u32, u32, u32, usize)> = Vec::new();
+    for cin in [385u32, 392, 400, 416, 448, 512] {
+        cases.push((32, cin, 64, 1));
+    }
+    for cout in [32u32, 128, 256] {
+        cases.push((32, 400, cout, 1));
+    }
+    for extent in [16u32, 64, 128] {
+        cases.push((extent, 400, 64, 1));
+    }
+    for cin in [33u32, 48, 64] {
+        cases.push((32, cin, 64, 3));
+    }
+
+    for (extent, cin, cout, kernel) in cases {
+        let case = Conv2dCase {
+            width: extent,
+            height: extent,
+            cin,
+            cout,
+            kernel: [kernel, kernel],
+            stride: 1,
+            padding: [kernel / 2, kernel / 2],
+            precision: OraclePrecision::Int8Accumulator,
+            pattern: OraclePattern::Counting,
+        };
+        let fixture = match build_fixture(case) {
+            Ok(fixture) => fixture,
+            Err(error) => {
+                println!("  {extent}^2 Cin={cin} Cout={cout} k={kernel}: fixture failed: {error}");
+                continue;
+            }
+        };
+        let execution = match execute_case_output(&file, &fixture) {
+            Ok(execution) => execution,
+            Err(error) => {
+                println!("  {extent}^2 Cin={cin} Cout={cout} k={kernel}: execute failed: {error}");
+                continue;
+            }
+        };
+        let raw = execution.raw;
+        let pixel_bytes = fixture.shape.padded_out_channels() as usize
+            * fixture.shape.precision.output_element_bytes() as usize;
+
+        // Written runs with their offsets: the tile partition shows up as the
+        // gaps between them, and a prefix per tile as a run at each tile base.
+        let mut runs: Vec<(usize, usize)> = Vec::new();
+        let mut offset = 0usize;
+        while offset < raw.len() {
+            if raw[offset] != OUTPUT_SENTINEL {
+                let start = offset;
+                while offset < raw.len() && raw[offset] != OUTPUT_SENTINEL {
+                    offset += 1;
+                }
+                runs.push((start, offset - start));
+            } else {
+                offset += 1;
+            }
+        }
+        let total: usize = runs.iter().map(|(_, len)| len).sum();
+        let described: Vec<String> = runs
+            .iter()
+            .take(6)
+            .map(|(start, len)| {
+                format!(
+                    "@{start}+{len}({}px)",
+                    if pixel_bytes > 0 { len / pixel_bytes } else { 0 }
+                )
+            })
+            .collect();
+        println!(
+            "  {extent}^2 Cin={cin:<4} Cout={cout:<4} k={kernel}  staging={:<7} written={total:<7} tiles={}  runs: {}",
+            raw.len(),
+            execution.plan.tiles().len(),
+            described.join(" ")
+        );
+    }
 }
