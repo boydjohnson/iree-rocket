@@ -2687,6 +2687,7 @@ fn int8_accumulator_cout_padding_probe() {
 /// for i in $(seq 0 N); do ROCKET_PROBE_ONLY=$i ./conv2d_oracle_hw \
 ///     group_division_high_channel_splits_match_oracle --ignored --nocapture; done
 /// ```
+#[cfg(feature = "hardware-characterization")]
 fn group_division_split_cases() -> Vec<Conv2dCase> {
     let mut cases = Vec::new();
     for precision in [OraclePrecision::Fp16, OraclePrecision::Int8] {
@@ -2794,6 +2795,7 @@ fn group_division_split_cases() -> Vec<Conv2dCase> {
 /// about the device).
 ///
 /// Run one case per process; this sweep contaminates itself.
+#[cfg(feature = "hardware-characterization")]
 #[test]
 #[ignore = "requires the RK3588 NPU"]
 fn dense_int8_3x3_channel_cap_control() {
@@ -2821,6 +2823,7 @@ fn dense_int8_3x3_channel_cap_control() {
     run_hardware_case_matrix("dense int8 3x3 cap, both output modes", cases);
 }
 
+#[cfg(feature = "hardware-characterization")]
 #[test]
 #[ignore = "requires the RK3588 NPU"]
 fn group_division_high_channel_splits_match_oracle() {
@@ -2893,6 +2896,7 @@ fn group_division_high_channel_splits_match_oracle() {
 /// edge at padded `Cin` 128 (384 bytes) -- nowhere near 384 channels. `Cin` 112
 /// (336) and 128 (384) must be exact; `Cin` 129 pads to 144 (432) and must
 /// fail. A plain channel limit predicts all four exact.
+#[cfg(feature = "hardware-characterization")]
 fn accumulator_rectangular_kernel_cases() -> Vec<Conv2dCase> {
     [96u32, 112, 128, 129]
         .into_iter()
@@ -2910,6 +2914,7 @@ fn accumulator_rectangular_kernel_cases() -> Vec<Conv2dCase> {
         .collect()
 }
 
+#[cfg(feature = "hardware-characterization")]
 #[test]
 #[ignore = "requires the RK3588 NPU"]
 fn accumulator_rectangular_kernel_probe() {
@@ -2931,6 +2936,7 @@ fn accumulator_rectangular_kernel_probe() {
 /// Three axes, each varied with the others held fixed: `Cin` past the limit,
 /// `Cout` (which sets `blocks_per_pixel`), and the spatial extent (which sets
 /// pixels and tile count).
+#[cfg(feature = "hardware-characterization")]
 fn accumulator_written_lanes_cases() -> Vec<Conv2dCase> {
     let base = |width, height, cin, cout, kernel: usize| Conv2dCase {
         width,
@@ -2962,6 +2968,7 @@ fn accumulator_written_lanes_cases() -> Vec<Conv2dCase> {
     cases
 }
 
+#[cfg(feature = "hardware-characterization")]
 #[test]
 #[ignore = "requires the RK3588 NPU"]
 fn accumulator_written_lanes_probe() {
@@ -2973,6 +2980,7 @@ fn accumulator_written_lanes_probe() {
     );
 }
 
+#[cfg(feature = "hardware-characterization")]
 fn accumulator_per_channel_threshold_cases() -> Vec<Conv2dCase> {
     [352u32, 368, 384, 385, 392, 400, 416]
         .into_iter()
@@ -2990,6 +2998,7 @@ fn accumulator_per_channel_threshold_cases() -> Vec<Conv2dCase> {
         .collect()
 }
 
+#[cfg(feature = "hardware-characterization")]
 #[test]
 #[ignore = "requires the RK3588 NPU"]
 fn accumulator_per_channel_threshold_probe() {
@@ -3001,6 +3010,7 @@ fn accumulator_per_channel_threshold_probe() {
     );
 }
 
+#[cfg(feature = "hardware-characterization")]
 fn accumulator_coefficient_footprint_cases() -> Vec<Conv2dCase> {
     [8u32, 16, 32, 48, 56, 64]
         .into_iter()
@@ -3018,6 +3028,7 @@ fn accumulator_coefficient_footprint_cases() -> Vec<Conv2dCase> {
         .collect()
 }
 
+#[cfg(feature = "hardware-characterization")]
 #[test]
 #[ignore = "requires the RK3588 NPU"]
 fn accumulator_coefficient_footprint_probe() {
@@ -3028,6 +3039,7 @@ fn accumulator_coefficient_footprint_probe() {
     );
 }
 
+#[cfg(feature = "hardware-characterization")]
 fn accumulator_boundary_sweep_cases() -> Vec<Conv2dCase> {
     let mut cases = Vec::new();
     for kernel in [1usize, 3, 5] {
@@ -3050,6 +3062,7 @@ fn accumulator_boundary_sweep_cases() -> Vec<Conv2dCase> {
     cases
 }
 
+#[cfg(feature = "hardware-characterization")]
 #[test]
 #[ignore = "requires the RK3588 NPU"]
 fn accumulator_boundary_sweep() {
@@ -3069,6 +3082,7 @@ fn accumulator_boundary_sweep() {
 /// `padded_out_channels * 4 / 128`, i.e. 1, 2, 4 and 8 at Cout 32, 64, 128 and
 /// 256. If only the multi-block Couts fail, the cap is a Cout property that
 /// `Cin` merely correlates with.
+#[cfg(feature = "hardware-characterization")]
 fn accumulator_cout_coverage_cases() -> Vec<Conv2dCase> {
     let mut cases = Vec::new();
     for cin in [32u32, 33, 64] {
@@ -3089,6 +3103,7 @@ fn accumulator_cout_coverage_cases() -> Vec<Conv2dCase> {
     cases
 }
 
+#[cfg(feature = "hardware-characterization")]
 #[test]
 #[ignore = "requires the RK3588 NPU"]
 fn accumulator_cout_coverage_probe() {
@@ -3098,6 +3113,7 @@ fn accumulator_cout_coverage_probe() {
     );
 }
 
+#[cfg(feature = "hardware-characterization")]
 fn accumulator_grains_cases() -> Vec<Conv2dCase> {
     // Both precisions at the same shapes. The register diff showed our conv
     // programming is bit-identical to the vendor's across the cliff for every
@@ -3128,6 +3144,7 @@ fn accumulator_grains_cases() -> Vec<Conv2dCase> {
         .collect()
 }
 
+#[cfg(feature = "hardware-characterization")]
 #[test]
 #[ignore = "requires the RK3588 NPU"]
 fn accumulator_high_channel_grains_probe() {
