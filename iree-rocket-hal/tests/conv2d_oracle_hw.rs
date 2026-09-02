@@ -175,6 +175,41 @@ impl Drop for OwnedBuffer {
 // set matches a run with the knob off. Check that first, every time.
 // ---------------------------------------------------------------------------
 
+/// Wall-clock time of the most recent `SUBMIT` -> `PREP_BO` round trip.
+///
+/// This is how a hung job becomes visible to userspace. When the NPU stalls,
+/// `rocket_job.c`'s watchdog resets the core and signals the job's fence with
+/// an error -- but `PREP_BO` waits on the `dma_resv` fence, and a fence
+/// signaled with an error is still *signaled*, so it returns success and the
+/// sweep reads a half-written output buffer. The round trip is the only thing
+/// that changes: normal dispatches here run in single-digit milliseconds, a
+/// timed-out one costs the scheduler's full timeout.
+static LAST_DISPATCH: Mutex<Option<std::time::Duration>> = Mutex::new(None);
+
+/// Round trip above which a case is a hung job rather than a slow shape.
+///
+/// Measured on `planck` 2026-09-02: with `dense_geometry_regression`, clean
+/// runs of all 22 cases take 220-317 ms end to end and every run with one
+/// failure takes 694-875 ms -- about 450 ms of extra wait per failure, and
+/// each one has a matching `rocket ...npu: NPU job timed out` in `dmesg`. No
+/// single healthy dispatch in this file comes near this bound; see
+/// `dispatch_ms` in the ledger output for the distribution.
+const DISPATCH_TIMEOUT_FLOOR: std::time::Duration = std::time::Duration::from_millis(150);
+
+fn record_dispatch_duration(elapsed: std::time::Duration) {
+    *LAST_DISPATCH
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner()) = Some(elapsed);
+}
+
+/// The last dispatch's round trip, if it was long enough to be a hung job.
+fn last_dispatch_if_timed_out() -> Option<std::time::Duration> {
+    (*LAST_DISPATCH
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner()))
+    .filter(|elapsed| *elapsed >= DISPATCH_TIMEOUT_FLOOR)
+}
+
 /// One GEM buffer's IOVA lease, exactly as `CREATE_BO` handed it out.
 #[derive(Clone)]
 struct BoLease {
@@ -337,7 +372,13 @@ fn ledger_case_report() -> Option<String> {
         .map(|lease| format!("{}={}", lease.role, lease.range()))
         .collect::<Vec<_>>()
         .join(" ");
-    let mut lines = vec![format!("      iova: {map}")];
+    let dispatch = *LAST_DISPATCH
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    let mut lines = vec![format!(
+        "      iova: {map} dispatch_ms={:.1}",
+        dispatch.unwrap_or_default().as_secs_f64() * 1000.0,
+    )];
     lines.extend(
         ledger
             .notes
@@ -696,9 +737,11 @@ fn execute_case_output_with_plan(
             })
             .collect::<Vec<_>>();
 
+        let dispatch_started = std::time::Instant::now();
         submit_jobs(fd, &jobs).map_err(|error| format!("submit: {error}"))?;
         prep_bo(fd, output.buffer.handle, PER_CASE_TIMEOUT_NS)
             .map_err(|error| format!("completion wait: {error}"))?;
+        record_dispatch_duration(dispatch_started.elapsed());
 
         let raw_output = std::slice::from_raw_parts(output.buffer.host_ptr, output_len).to_vec();
 
@@ -1832,12 +1875,29 @@ fn accumulator_canary_passes(file: &std::fs::File) -> bool {
 /// than the shapes, so every failure re-checks a known-good canary and the
 /// run stops the moment the canary goes.
 ///
-/// The canary is the only reliable discriminator, so do not try to read the
-/// device's health off the values. A `got -1515870800` means the DPU never
-/// wrote those bytes, which is how the dense Cin>384 failures present, but
-/// fully written *wrong* values occur both for genuine shape failures (the
-/// Cout=31/33 partial-block cases in the known-limitations probe report
-/// `max|diff|` of 45 on a perfectly healthy device) and for a sick one.
+/// The canary is the only reliable discriminator *among the values*, so do
+/// not try to read the device's health off them. A `got -1515870800` means
+/// the DPU never wrote those bytes, which is how the dense Cin>384 failures
+/// present, but fully written *wrong* values occur both for genuine shape
+/// failures (the Cout=31/33 partial-block cases in the known-limitations
+/// probe report `max|diff|` of 45 on a perfectly healthy device) and for a
+/// sick one.
+///
+/// The clock, however, is decisive, and it is why this loop times every
+/// dispatch. A hung job leaves exactly the same sentinel bytes as a shape
+/// that computes nothing, because `rocket_job.c`'s watchdog resets the core
+/// and signals the fence with an error, and `PREP_BO` -- which waits on the
+/// `dma_resv` fence -- returns success on a fence that is signaled at all.
+/// The round trip is the tell: healthy dispatches in this file run under
+/// 3.4 ms including the Cin=1792 shapes, and a hung one costs the scheduler's
+/// full timeout, measured at 534 ms. See `DISPATCH_TIMEOUT_FLOOR`. The kernel
+/// does log it -- `rocket ...npu: NPU job timed out`, with a follow-up line
+/// giving `PC raw_status`, `CNA_S_STATUS` and `CORE_S_STATUS` -- but reading
+/// dmesg needs root on `planck`, so the timer is what this sweep can act on.
+/// In every sample decoded so far the CNA had signaled its feature and weight
+/// loads for the live ping-pong group, CORE and DPU never signaled
+/// completion, that executer sat in `operating`, and both `DMA_READ_ERROR`
+/// and `DMA_WRITE_ERROR` were clear.
 ///
 /// Only a reboot clears the sick state -- not idle, not a fresh process, not
 /// a reopened fd. Reboot the board, then resume with
@@ -1912,6 +1972,7 @@ fn run_hardware_case_matrix(title: &str, cases: Vec<Conv2dCase>) {
     let only = probe_only_index();
     let mut failures = Vec::new();
     let mut sick_after = None;
+    let mut timeouts = 0usize;
     let mut attempted = 0usize;
     let mut skipped = 0usize;
 
@@ -1986,6 +2047,23 @@ fn run_hardware_case_matrix(title: &str, cases: Vec<Conv2dCase>) {
                 format!("{label}: panic: {error}")
             }
         };
+        // A hung job and a wrong answer are indistinguishable in the output
+        // buffer -- both leave sentinel bytes -- but not on the clock.
+        let failure = match last_dispatch_if_timed_out() {
+            Some(elapsed) => {
+                timeouts += 1;
+                println!(
+                    "      DEVICE TIMEOUT: that dispatch took {:.0} ms against a {} ms healthy\n      \
+                     ceiling, so the NPU hung and the driver reset it mid-job. The output is a\n      \
+                     partial write, not this shape's answer. Expect a matching \"NPU job timed\n      \
+                     out\" in dmesg at this moment.",
+                    elapsed.as_secs_f64() * 1000.0,
+                    DISPATCH_TIMEOUT_FLOOR.as_millis(),
+                );
+                format!("{failure} [DEVICE TIMEOUT, not a shape result]")
+            }
+            None => failure,
+        };
         failures.push(failure);
 
         if !accumulator_canary_passes(&file) {
@@ -2002,6 +2080,9 @@ fn run_hardware_case_matrix(title: &str, cases: Vec<Conv2dCase>) {
         attempted - failures.len()
     );
     println!("  failed: {}", failures.len());
+    if timeouts != 0 {
+        println!("  of those, device timeouts (no shape verdict): {timeouts}");
+    }
     if skipped != 0 {
         println!("  skipped: {skipped}");
     }
@@ -2010,6 +2091,19 @@ fn run_hardware_case_matrix(title: &str, cases: Vec<Conv2dCase>) {
     }
     for (index, failure) in failures.iter().enumerate() {
         println!("    {}. {failure}", index + 1);
+    }
+
+    if timeouts != 0 {
+        println!(
+            "\n  {timeouts} of these were hung jobs, not measurements. The NPU stalled with one\n  \
+             CNA executer still `operating` and no CORE/DPU completion, the driver's watchdog\n  \
+             reset it, and PREP_BO returned success anyway -- a fence signaled with an error is\n  \
+             still signaled, which is why this sweep has always seen a silent half-written\n  \
+             buffer. Confirm against the kernel's own account, which needs root:\n    \
+             sudo dmesg | grep -A1 'NPU job timed out'\n  \
+             Both DMA error bits were clear in every sample so far, so these are not\n  \
+             out-of-range accesses. Do not record any of them as a shape limit."
+        );
     }
 
     if !failures.is_empty() && sick_after.is_none() {
