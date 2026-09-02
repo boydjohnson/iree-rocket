@@ -404,11 +404,9 @@ fn streamed_weight_bank_preference_for_group(
     group_divisor: u32,
 ) -> u32 {
     const STREAMED_BYTES_PER_INPUT_TAP: u32 = 64;
-    let working_set = kernels[0] as u32
-        * kernels[1] as u32
-        * weight_channels
-        * STREAMED_BYTES_PER_INPUT_TAP
-        / group_divisor;
+    let working_set =
+        kernels[0] as u32 * kernels[1] as u32 * weight_channels * STREAMED_BYTES_PER_INPUT_TAP
+            / group_divisor;
     let entries = working_set.div_ceil(CBUF_ENTRY_BYTES);
     let banks = entries.div_ceil(CBUF_ENTRIES_PER_BANK).max(1);
     if group_divisor == 1 {
@@ -871,8 +869,7 @@ impl Shape {
         );
         assert!(stride > 0, "convolution stride must be nonzero");
         assert!(
-            (1..=precision.max_in_channels()).contains(&in_channels)
-                || unbacked_channels_allowed(),
+            (1..=precision.max_in_channels()).contains(&in_channels) || unbacked_channels_allowed(),
             "input channels must be 1..={}; beyond that the channel padding \
              has no capture backing at this precision",
             precision.max_in_channels()
@@ -1157,6 +1154,20 @@ impl Shape {
     /// then leaves accumulator output unwritten at every point from 400
     /// through 512; focused runs locate the transition at 385.
     pub fn parity_padded_shape(&self, kernels: Kernels) -> Result<Shape, &'static str> {
+        self.validate_accumulator_output_shape(kernels)?;
+
+        Ok(Shape {
+            out_channels: self.parity_padded_out_channels(kernels),
+            ..*self
+        })
+    }
+
+    /// Rejects accumulator-output shapes with known hardware failures.
+    ///
+    /// This is separate from [`Shape::parity_padded_shape`] because callers
+    /// may construct a [`ConvPlan`] directly. Every planning entry point must
+    /// apply the same safety boundary before it emits a register program.
+    fn validate_accumulator_output_shape(&self, kernels: Kernels) -> Result<(), &'static str> {
         if self.precision.writes_accumulators()
             && !self.depthwise
             && kernels == [3, 3]
@@ -1178,11 +1189,7 @@ impl Shape {
                  output path can hold: at most 384 coefficient bytes per output channel",
             );
         }
-
-        Ok(Shape {
-            out_channels: self.parity_padded_out_channels(kernels),
-            ..*self
-        })
+        Ok(())
     }
 
     /// Conservative physical output allocation for this convolution, in
@@ -1288,7 +1295,6 @@ impl Shape {
     fn cbuf_atoms(&self) -> u32 {
         quad_atoms(self.feature_atoms())
     }
-
 
     /// Coefficient bytes one output channel carries, the quantity the
     /// accumulator output path bounds. See
@@ -2320,6 +2326,9 @@ impl ConvPlan {
         kernels: Kernels,
         (data_banks, weight_banks): (u32, u32),
     ) -> ConvPlan {
+        shape
+            .validate_accumulator_output_shape(kernels)
+            .expect("unsupported accumulator output geometry");
         let full_width = vec![shape.output_width(kernels)];
         if let Some(tiles) = plan_grid(shape, kernels, &full_width, data_banks) {
             return ConvPlan {
@@ -5632,7 +5641,6 @@ mod tests {
         );
     }
 
-    #[test]
     /// The saturating coefficient working set is refused, not silently
     /// clamped into a one-data-bank split.
     ///
@@ -5672,14 +5680,7 @@ mod tests {
             ([3, 3], 32, 33),
         ] {
             let shape = |cin| {
-                Shape::with_precision(
-                    32,
-                    32,
-                    1,
-                    cin,
-                    64,
-                    Precision::Int8Accumulator(quantization),
-                )
+                Shape::with_precision(32, 32, 1, cin, 64, Precision::Int8Accumulator(quantization))
             };
             assert!(
                 shape(exact).parity_padded_shape(kernels).is_ok(),
@@ -5688,6 +5689,10 @@ mod tests {
             assert!(
                 shape(wrong).parity_padded_shape(kernels).is_err(),
                 "{kernels:?} Cin {wrong} is wrong on hardware and must be refused"
+            );
+            assert!(
+                std::panic::catch_unwind(|| ConvPlan::new(shape(wrong), kernels)).is_err(),
+                "{kernels:?} Cin {wrong} must also be refused by direct ConvPlan construction"
             );
         }
     }

@@ -101,12 +101,7 @@ impl OwnedBuffer {
             .unwrap_or(0)
     }
 
-    unsafe fn from_bytes_padded(
-        fd: i32,
-        bytes: &[u8],
-        which: &str,
-        file: &std::fs::File,
-    ) -> Self {
+    unsafe fn from_bytes_padded(fd: i32, bytes: &[u8], which: &str, file: &std::fs::File) -> Self {
         let buffer = unsafe { Self::new(fd, bytes.len() + Self::pad_bytes(which), file) };
         unsafe {
             ptr::write_bytes(buffer.buffer.host_ptr, 0, buffer.buffer.size);
@@ -3244,7 +3239,11 @@ fn accumulator_written_region_map() {
             .map(|(start, len)| {
                 format!(
                     "@{start}+{len}({}px)",
-                    if pixel_bytes > 0 { len / pixel_bytes } else { 0 }
+                    if pixel_bytes > 0 {
+                        len / pixel_bytes
+                    } else {
+                        0
+                    }
                 )
             })
             .collect();

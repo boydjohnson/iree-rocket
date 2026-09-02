@@ -14,10 +14,12 @@ mod vendor_fixture;
 
 use std::collections::BTreeMap;
 
-use iree_rocket_hal::rocket::builders::RegCmd;
-use iree_rocket_hal::rocket::builders::cna::{CnaCbufCon1, CnaConvCon2};
-use iree_rocket_hal::rocket::conv::{
-    ConvPlan, Kernels, Multiplier, Precision, Quantization, Shape,
+use iree_rocket_hal::rocket::{
+    builders::{
+        RegCmd,
+        cna::{CnaCbufCon1, CnaConvCon2},
+    },
+    conv::{ConvPlan, Kernels, Multiplier, Precision, Quantization, Shape},
 };
 use vendor_fixture::{FixtureFile, Program, register_value};
 

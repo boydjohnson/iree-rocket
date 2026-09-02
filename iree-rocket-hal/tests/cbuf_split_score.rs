@@ -136,8 +136,16 @@ fn score(fixtures: &str, precision: Precision, label: &str) {
 #[ignore = "scoring harness, not a gate; run with --ignored --nocapture"]
 fn score_cbuf_split_against_corpus() {
     score(FP16_FIXTURES, Precision::Fp16, "fp16 12x12 channel grid");
-    score(BASE_FP16_FIXTURES, Precision::Fp16, "fp16 base corpus (k=1,3,5,7)");
-    score(SPATIAL_FP16_FIXTURES, Precision::Fp16, "fp16 spatial sweep (6 extents)");
+    score(
+        BASE_FP16_FIXTURES,
+        Precision::Fp16,
+        "fp16 base corpus (k=1,3,5,7)",
+    );
+    score(
+        SPATIAL_FP16_FIXTURES,
+        Precision::Fp16,
+        "fp16 spatial sweep (6 extents)",
+    );
     // The quantization parameters do not affect the bank split; these mirror
     // the ones the gate test uses so the two are comparing like with like.
     let int8 = Precision::Int8(Quantization {
@@ -153,5 +161,9 @@ fn score_cbuf_split_against_corpus() {
     });
     score(INT8_FIXTURES, int8, "int8 12x12 channel grid");
     score(BASE_INT8_FIXTURES, int8, "int8 base corpus (k=1,3,5,7)");
-    score(SPATIAL_INT8_FIXTURES, int8, "int8 spatial sweep (6 extents)");
+    score(
+        SPATIAL_INT8_FIXTURES,
+        int8,
+        "int8 spatial sweep (6 extents)",
+    );
 }
