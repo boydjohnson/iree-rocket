@@ -296,6 +296,19 @@ const CBUF_BANK_BYTES: u32 = 256 * 128;
 /// been programmed that way (see its `div_ceil` below); the residency bound
 /// in [`Shape::max_tile_input_rows_for_width_and_data_banks`] has to charge
 /// the same way or it over-commits the CBUF.
+/// Whether `Shape` may be built with more input channels than the capture
+/// corpus backs.
+///
+/// This exists so the CBUF-split scoring harness
+/// (`tests/cbuf_split_score.rs`) and the high-channel hardware probes can
+/// reach past the cap; without it `Shape` refuses to build and the most
+/// interesting part of the vendor corpus is invisible. `parity_padded_shape`
+/// still refuses the shapes known wrong on hardware, and nothing on the
+/// compiled path sets this.
+fn unbacked_channels_allowed() -> bool {
+    std::env::var_os("ROCKET_ALLOW_UNBACKED_CHANNELS").is_some()
+}
+
 const CBUF_ATOMS_PER_ENTRY: u32 = 4;
 
 /// Minimum safe `weight_banks` once a coefficient footprint is being
@@ -341,10 +354,75 @@ fn weight_banks_floor(weight_channels: u32) -> u32 {
 /// This is a preferred allocation, not a new hardware-safety minimum; the
 /// independently measured [`weight_banks_floor`] remains in force below it.
 fn streamed_weight_bank_preference(weight_channels: u32, kernels: Kernels) -> u32 {
+    let undivided = streamed_weight_bank_preference_for_group(weight_channels, kernels, 1);
+    if undivided <= MAX_UNDIVIDED_WEIGHT_BANKS {
+        return undivided;
+    }
+    // Deliberately unclamped: a working set that still saturates after the
+    // division is refused by `demand_based_cbuf_partition`, not quietly turned
+    // into a one-data-bank split. 5x5 `Cin` 512 wants 13 banks even divided,
+    // and no capture covers it.
+    streamed_weight_bank_preference_for_group(weight_channels, kernels, 2)
+}
+
+/// Largest coefficient grant the vendor will take without dividing the
+/// streamed output-channel group -- i.e. it always leaves at least two banks
+/// for feature data.
+///
+/// Measured, not chosen: the spatial corpus shows the group divided at every
+/// `Cin` whose undivided grant reaches eleven (k=3 `Cin` >= 576) and undivided
+/// at ten (5x5 `Cin` 192 keeps the vendor's 2/10).
+const MAX_UNDIVIDED_WEIGHT_BANKS: u32 = CBUF_BANKS - 2;
+
+/// Bytes one CBUF entry holds, and entries one bank holds. The multi-pass
+/// correction below depends on the remainder within a bank, so the two have to
+/// be visible separately even though their product is [`CBUF_BANK_BYTES`].
+const CBUF_ENTRY_BYTES: u32 = 128;
+const CBUF_ENTRIES_PER_BANK: u32 = CBUF_BANK_BYTES / CBUF_ENTRY_BYTES;
+
+/// Coefficient grant when the streamed output-channel group is divided by
+/// `group_divisor`.
+///
+/// `group_divisor == 1` reproduces the single-pass formula exactly: the
+/// vendor's working set is `Cin * kh * g * kw_q` bytes for a group of `g`
+/// output channels, which at the 64-bytes-per-tap calibration point is the
+/// same product as `kh * kw * Cin * 64`.
+///
+/// Two details come from the vendor's routine (`librknnc.so`, file offset
+/// 0x190ce70) rather than from fitting: a divided group is streamed in more
+/// than one pass, which costs **one extra bank** unless the coefficient tail
+/// divides a bank evenly, and never fewer than two.
+///
+/// The corpus never shows a divisor beyond two. An earlier attempt let the
+/// search keep halving until the *feature map* fit, which drove 56x56 `Cin`
+/// 640 to five banks against the vendor's seven and computed wrong values on
+/// hardware; the division threshold is a property of the coefficient working
+/// set alone, not of the spatial extent.
+fn streamed_weight_bank_preference_for_group(
+    weight_channels: u32,
+    kernels: Kernels,
+    group_divisor: u32,
+) -> u32 {
     const STREAMED_BYTES_PER_INPUT_TAP: u32 = 64;
-    (kernels[0] as u32 * kernels[1] as u32 * weight_channels * STREAMED_BYTES_PER_INPUT_TAP)
-        .div_ceil(CBUF_BANK_BYTES)
-        .max(1)
+    let working_set = kernels[0] as u32
+        * kernels[1] as u32
+        * weight_channels
+        * STREAMED_BYTES_PER_INPUT_TAP
+        / group_divisor;
+    let entries = working_set.div_ceil(CBUF_ENTRY_BYTES);
+    let banks = entries.div_ceil(CBUF_ENTRIES_PER_BANK).max(1);
+    if group_divisor == 1 {
+        return banks;
+    }
+    if banks < 2 {
+        return 2;
+    }
+    let remainder = entries % CBUF_ENTRIES_PER_BANK;
+    if remainder != 0 && !CBUF_ENTRIES_PER_BANK.is_multiple_of(remainder) {
+        banks + 1
+    } else {
+        banks
+    }
 }
 
 /// Largest `CNA_CBUF_CON1.data_entries` value the expanded corpus shows the
@@ -793,7 +871,8 @@ impl Shape {
         );
         assert!(stride > 0, "convolution stride must be nonzero");
         assert!(
-            (1..=precision.max_in_channels()).contains(&in_channels),
+            (1..=precision.max_in_channels()).contains(&in_channels)
+                || unbacked_channels_allowed(),
             "input channels must be 1..={}; beyond that the channel padding \
              has no capture backing at this precision",
             precision.max_in_channels()

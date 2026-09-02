@@ -2617,3 +2617,177 @@ fn int8_accumulator_cout_padding_probe() {
         );
     }
 }
+
+/// The high-`Cin` shapes whose CBUF split comes from dividing the streamed
+/// output-channel group.
+///
+/// A first attempt at this was reverted on 2026-09-02: it gated the division
+/// on whether the *feature map* still fit, which is spatial, and drove 56x56
+/// `Cin` 640 to five weight banks against the vendor's seven -- wrong values
+/// on hardware, and a hang at `Cin` 768. The spatial corpus
+/// (`conv_vendor_fixtures_spatial*.json`, six extents) showed the divisor is
+/// only ever one or two and is decided by the coefficient working set alone,
+/// so the gate is now "does the undivided grant leave at least two data
+/// banks", with no spatial term. All four 56x56 shapes now plan the vendor's
+/// 6/7/8/8.
+///
+/// Run one case per process -- this sweep contaminates itself, and a case can
+/// fail in the batch while passing alone:
+///
+/// ```text
+/// for i in $(seq 0 N); do ROCKET_PROBE_ONLY=$i ./conv2d_oracle_hw \
+///     group_division_high_channel_splits_match_oracle --ignored --nocapture; done
+/// ```
+fn group_division_split_cases() -> Vec<Conv2dCase> {
+    let mut cases = Vec::new();
+    for precision in [OraclePrecision::Fp16, OraclePrecision::Int8] {
+        // 512 is the last undivided grant and is already capture-backed --
+        // it is here as the control that must keep passing.
+        for cin in [512u32, 576, 640, 704, 768] {
+            let mut patterns = vec![
+                // Uniform 1s: the accumulator is exactly `Cin * valid taps`,
+                // so a split that reads short of the resident window shows up
+                // directly as a low sum. It cannot see a *reordering*, which
+                // is why it is not the only pattern here -- uniform data has
+                // hidden real layout bugs in this HAL before.
+                OraclePattern::Counting,
+                // Three signed taps per output at distinct HWCF positions,
+                // with inputs varying in y, x and channel: this is the one
+                // that catches a permutation. Its term count is tiny, so the
+                // fp16 comparison stays exact at every Cin here.
+                //
+                // int8 must use the *affine* encoding of the same logical
+                // filter -- raw `Selectors` is a signed coefficient form that
+                // is not the ordinary int8 ABI, and mismatches under it say
+                // nothing about the device. The Cartesian sweep above makes
+                // the same split for the same reason.
+                if precision == OraclePrecision::Int8 {
+                    OraclePattern::SelectorsAffine { phase: 0 }
+                } else {
+                    OraclePattern::Selectors { phase: 0 }
+                },
+            ];
+            // `Dense` is deliberately not used here. At fp16 its exactness
+            // argument does not survive this term count -- inputs reach +-3
+            // and coefficients +-2 over `Cin * 9` taps, so Cin 768 admits
+            // accumulators near 41k, far past the 2048 below which fp16 still
+            // represents every integer -- and the rest of the suite only
+            // exercises it at Fp16 and Int8Accumulator, never plain Int8.
+            let _ = &mut patterns;
+            for pattern in patterns {
+                cases.push(Conv2dCase {
+                    width: 28,
+                    height: 28,
+                    cin,
+                    cout: 256,
+                    kernel: [3, 3],
+                    stride: 1,
+                    padding: [1, 1],
+                    precision,
+                    pattern,
+                });
+            }
+        }
+    }
+    // 28x28/Cout 256 is the geometry the vendor channel grid captures, so it
+    // is where a split disagreement is attributable. It is a single point in
+    // (spatial, Cout) though, and the grant is a function of both -- the
+    // division threshold depends on how many data banks the feature map needs.
+    // Vary each around a divided-group Cin so the region is covered rather
+    // than one cell of it.
+    for precision in [OraclePrecision::Fp16, OraclePrecision::Int8] {
+        let permuting = if precision == OraclePrecision::Int8 {
+            OraclePattern::SelectorsAffine { phase: 1 }
+        } else {
+            OraclePattern::Selectors { phase: 1 }
+        };
+        for (width, height, cout) in [
+            (14u32, 14u32, 256u32),
+            (56, 56, 256),
+            (112, 112, 256),
+            (28, 28, 64),
+            (28, 28, 768),
+            (14, 14, 768),
+        ] {
+            for cin in [640u32, 768] {
+                for pattern in [OraclePattern::Counting, permuting] {
+                    cases.push(Conv2dCase {
+                        width,
+                        height,
+                        cin,
+                        cout,
+                        kernel: [3, 3],
+                        stride: 1,
+                        padding: [1, 1],
+                        precision,
+                        pattern,
+                    });
+                }
+            }
+        }
+    }
+    cases
+}
+
+/// Control for `group_division_high_channel_splits_match_oracle`: dense int8
+/// 3x3 across `Cin`, at splits that predate the group-division change.
+///
+/// The matchers cap dense int8 3x3 at `Cin` 32 because it is known wrong above
+/// that, root cause not found. This pins where the break actually is, so an
+/// int8 failure in the group-division test can be attributed to that standing
+/// bug rather than to the new split.
+#[test]
+#[ignore = "requires the RK3588 NPU"]
+fn dense_int8_3x3_channel_cap_control() {
+    unsafe { std::env::set_var("ROCKET_ALLOW_UNBACKED_CHANNELS", "1") };
+    let mut cases = Vec::new();
+    // 56x56 across Cin: the large-feature-map control. Cin <= 512 here is a
+    // shipping shape that predates the group-division change, so a failure at
+    // 512 says the break belongs to the spatial size, not the new split.
+    for cin in [128u32, 256, 512] {
+        for pattern in [OraclePattern::Counting, OraclePattern::SelectorsAffine { phase: 0 }] {
+            cases.push(Conv2dCase {
+                width: 56,
+                height: 56,
+                cin,
+                cout: 256,
+                kernel: [3, 3],
+                stride: 1,
+                padding: [1, 1],
+                precision: OraclePrecision::Fp16,
+                pattern,
+            });
+        }
+    }
+    for cin in [16u32, 32, 33, 64, 128, 256, 512] {
+        for pattern in [OraclePattern::Counting, OraclePattern::SelectorsAffine { phase: 0 }] {
+            cases.push(Conv2dCase {
+                width: 28,
+                height: 28,
+                cin,
+                cout: 256,
+                kernel: [3, 3],
+                stride: 1,
+                padding: [1, 1],
+                precision: OraclePrecision::Int8,
+                pattern,
+            });
+        }
+    }
+    run_hardware_case_matrix("dense int8 3x3 channel-cap control", cases);
+}
+
+#[test]
+#[ignore = "requires the RK3588 NPU"]
+fn group_division_high_channel_splits_match_oracle() {
+    // NOTE: this sweep contaminates itself -- a case can fail in the batch and
+    // pass in isolation (fp16 Cin 512 selectors does exactly that). For a
+    // verdict, drive it one case per process with `ROCKET_PROBE_ONLY=<index>`.
+    // The planner's channel cap is what this run exists to justify raising, so
+    // the shapes have to be reachable before the cap moves.
+    unsafe { std::env::set_var("ROCKET_ALLOW_UNBACKED_CHANNELS", "1") };
+    run_hardware_case_matrix(
+        "group-division high-channel CBUF splits",
+        group_division_split_cases(),
+    );
+}
