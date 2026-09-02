@@ -373,12 +373,31 @@ fn weight_value(
         OraclePattern::Dense { phase } => {
             // Every tap gets one of four small nonzero values -- dense,
             // unlike Selectors' near-total sparsity, but kept small so the
-            // accumulator stays exactly representable in fp16 (verified by
-            // hand for the shapes `Dense` targets; see its doc comment).
+            // accumulator stays exactly representable in fp16 (see its doc
+            // comment, and `expected_output_carries_signal` for the check
+            // that keeps that claim honest across every case in the suite).
+            //
+            // The index avalanches the hash rather than reading its low two
+            // bits directly. `hash % 4` reads only bits 0 and 1, and those
+            // bits of `input_channel * 13` are exactly 4-periodic in
+            // `input_channel` -- so the whole coefficient sequence was, at
+            // every fixed (tap, output channel). `input_value` is 7-periodic
+            // in the same index, so their product had period 28 and summed
+            // to exactly zero over it: every `Cin` divisible by 28 produced
+            // an identically zero expected output at *every* output element.
+            // Seven cases in this suite were in that state, four of them the
+            // MobileNetV2 pointwise signatures at `Cin` 224/448/1344, where
+            // an all-zero expectation is precisely the silent failure mode
+            // the dense matchers exist to detect. Multiplying by a large odd
+            // constant first spreads the channel index across the whole word,
+            // which leaves no short period for the input pattern to resonate
+            // with. `wrapping_mul` because this is a hash, not arithmetic --
+            // the product is meant to overflow.
             const VALUES: [i8; 4] = [-2, -1, 1, 2];
+            const AVALANCHE: usize = 2_654_435_761;
             let hash =
                 (ky * 97) ^ (kx * 89) ^ (input_channel * 13) ^ (output_channel * 7) ^ (phase * 3);
-            VALUES[hash % 4]
+            VALUES[(hash.wrapping_mul(AVALANCHE) >> 13) % 4]
         }
     }
 }
@@ -500,6 +519,50 @@ pub fn expected_output(
     }
 }
 
+/// Refuses a case whose expected output is identically zero.
+///
+/// An all-zero expectation cannot distinguish a correct dispatch from the
+/// all-zero output an unvalidated CBUF split silently returns -- which is
+/// not a hypothetical failure but the one the dense matchers in
+/// `rocket_conv2d_transform_spec.mlir` are bounded to avoid, and the one
+/// this suite exists to catch. Such a case is not weak evidence, it is
+/// none: it reports `ok` against a device that computed nothing. That is a
+/// defect in the case rather than a measurement, so it is refused on the
+/// host, before any board time is spent on it.
+///
+/// This has bitten already. `Dense`'s coefficients were indexed by the low
+/// two bits of its hash, making them 4-periodic in the input channel
+/// against a 7-periodic input pattern, so every `Cin` divisible by 28
+/// cancelled to exactly zero. Seven cases were in that state -- the four
+/// MobileNetV2 pointwise signatures at `Cin` 224/448/1344, and three int8
+/// accumulator `Cin` atom-boundary cases (112, 224, 336) that had been
+/// passing on hardware while asserting nothing. `weight_value` no longer
+/// produces that resonance; this is what keeps it from coming back by some
+/// other route, for any pattern.
+///
+/// Cheap on a healthy case: it stops at the first nonzero element.
+pub fn expected_output_carries_signal(case: Conv2dCase) -> Result<(), String> {
+    let shape = case.shape();
+    let out_height = shape.output_height(case.kernel) as usize;
+    let out_width = shape.output_width(case.kernel) as usize;
+    for y in 0..out_height {
+        for x in 0..out_width {
+            for channel in 0..case.cout as usize {
+                if expected_output(case, channel, y, x) != 0 {
+                    return Ok(());
+                }
+            }
+        }
+    }
+    Err(format!(
+        "{}: expected output is identically zero across all {} elements, so this case \
+         cannot distinguish a correct dispatch from the all-zero result a bad CBUF \
+         split returns -- fix the case, do not measure it",
+        case.label(),
+        out_height * out_width * case.cout as usize,
+    ))
+}
+
 pub fn dense_reference(case: Conv2dCase, input: &[i8], weights: &[i8], bias: &[i32]) -> Vec<i32> {
     let shape = case.shape();
     let out_height = shape.output_height(case.kernel) as usize;
@@ -613,6 +676,10 @@ pub fn build_raw_fixture(case: Conv2dCase) -> Result<Conv2dFixture, String> {
 }
 
 fn build_fixture_for_shape(case: Conv2dCase, shape: Shape) -> Result<Conv2dFixture, String> {
+    // Before any hardware sees it: a case whose expectation is all zero
+    // would otherwise be reported `ok` by the matrix runner no matter what
+    // the device returned.
+    expected_output_carries_signal(case)?;
     let logical_input = logical_input(case);
     let mut input = vec![0; input_storage_bytes(shape)];
     for y in 0..case.height as usize {

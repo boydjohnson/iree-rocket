@@ -36,7 +36,7 @@ use std::{
 
 use conv2d_oracle::{
     Conv2dCase, Conv2dFixture, OraclePattern, OraclePrecision, build_fixture, expected_output,
-    f16_to_f32, output_offset, output_storage_bytes,
+    expected_output_carries_signal, f16_to_f32, output_offset, output_storage_bytes,
 };
 #[cfg(feature = "hardware-characterization")]
 use conv2d_oracle::{build_raw_fixture, feature_offset};
@@ -1263,6 +1263,12 @@ fn panic_message(payload: Box<dyn Any + Send>) -> String {
 
 fn assert_planable_and_gap_free(cases: Vec<Conv2dCase>) {
     for case in cases {
+        // Checked here rather than only in `build_fixture` so a vacuous case
+        // fails in the default host run, not on the board: every case set in
+        // this file that has a hardware test also has one of these.
+        if let Err(error) = expected_output_carries_signal(case) {
+            panic!("{error}");
+        }
         let shape = case
             .shape()
             .parity_padded_shape(case.kernel)
