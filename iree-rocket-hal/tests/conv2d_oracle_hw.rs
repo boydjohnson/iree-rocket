@@ -1499,6 +1499,27 @@ fn accumulator_canary_passes(file: &std::fs::File) -> bool {
 /// DMA-address reuse rather than NPU state. So a verdict on one shape needs
 /// `ROCKET_PROBE_RESUME_AT` to run it *first*, repeated a few times -- never
 /// one row from one sweep.
+///
+/// So the summary tells you to settle every failure per-process rather than
+/// implying the sweep already did. On 2026-09-02 all three failures in the
+/// full `--include-ignored` gate (`dense_geometry_regression`, two of the
+/// MobileNetV2 pointwise cases, and `conv_features0_exact_hw`) left the
+/// canary passing, and every one of them passed alone under
+/// `ROCKET_PROBE_ONLY`.
+///
+/// **Replaying a witness here was tried and rejected**, on the theory that a
+/// case this run already saw pass would stop passing once the process was
+/// contaminated, catching what the fixed Cin=64 canary is too small to see.
+/// It does not work, and it is actively harmful. Measured on `planck`, the
+/// MobileNetV2 pointwise sweep without the replay fails the same two cases
+/// three runs out of three; with a witness replayed after each failure it
+/// failed three, four and three cases, and the extra failures were the
+/// neighbours of the first one. The replay is itself dispatches, and
+/// dispatches issued after a failure spread the corruption -- so the
+/// instrument changed what it was measuring, and traded a deterministic
+/// result for a drifting one. Anything that adds work to this loop on the
+/// failure path has the same problem. Diagnose with a fresh process, which
+/// is the one thing known to clear it, not with more work inside this one.
 fn run_hardware_case_matrix(title: &str, cases: Vec<Conv2dCase>) {
     let _device_guard = NPU_TEST_LOCK
         .lock()
@@ -1601,6 +1622,16 @@ fn run_hardware_case_matrix(title: &str, cases: Vec<Conv2dCase>) {
     }
     for (index, failure) in failures.iter().enumerate() {
         println!("    {}. {failure}", index + 1);
+    }
+
+    if !failures.is_empty() && sick_after.is_none() {
+        println!(
+            "\n  The canary still passes, so the device is not sick -- but that does not make\n  \
+             these failures real. This process can corrupt its own later cases while the\n  \
+             canary stays clean, and every failure investigated that way so far has passed\n  \
+             when run on its own. Settle each one before recording it as a shape limit:\n    \
+             ROCKET_PROBE_ONLY=<index-1> <this binary> <test name> --ignored --nocapture"
+        );
     }
 
     if let Some(index) = sick_after {
