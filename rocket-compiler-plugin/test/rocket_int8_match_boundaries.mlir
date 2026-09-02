@@ -71,32 +71,32 @@ func.func @dense_3x3_cin_33_falls_back(
   return %result : tensor<1x4x4x64xi32>
 }
 
-// CHECK-LABEL: util.func public @dense_1x1_cout_512_matched
+// CHECK-LABEL: util.func public @dense_1x1_cout_768_matched
 // CHECK-NOT: linalg.conv_2d_nhwc_hwcf
 // CHECK: util.call @call_rocket_dynamic_conv2d_int8
-func.func @dense_1x1_cout_512_matched(
+func.func @dense_1x1_cout_768_matched(
     %input: tensor<1x4x4x16xi8>,
-    %filter: tensor<1x1x16x512xi8>,
-    %init: tensor<1x4x4x512xi32>) -> tensor<1x4x4x512xi32> {
+    %filter: tensor<1x1x16x768xi8>,
+    %init: tensor<1x4x4x768xi32>) -> tensor<1x4x4x768xi32> {
   %result = linalg.conv_2d_nhwc_hwcf
       {dilations = dense<1> : vector<2xi64>, strides = dense<1> : vector<2xi64>}
-      ins(%input, %filter : tensor<1x4x4x16xi8>, tensor<1x1x16x512xi8>)
-      outs(%init : tensor<1x4x4x512xi32>) -> tensor<1x4x4x512xi32>
-  return %result : tensor<1x4x4x512xi32>
+      ins(%input, %filter : tensor<1x4x4x16xi8>, tensor<1x1x16x768xi8>)
+      outs(%init : tensor<1x4x4x768xi32>) -> tensor<1x4x4x768xi32>
+  return %result : tensor<1x4x4x768xi32>
 }
 
-// CHECK-LABEL: util.func public @dense_1x1_cout_513_falls_back
+// CHECK-LABEL: util.func public @dense_1x1_cout_769_falls_back
 // CHECK-NOT: util.call @call_rocket_dynamic_conv2d_int8
 // CHECK: linalg.conv_2d_nhwc_hwcf
-func.func @dense_1x1_cout_513_falls_back(
+func.func @dense_1x1_cout_769_falls_back(
     %input: tensor<1x4x4x16xi8>,
-    %filter: tensor<1x1x16x513xi8>,
-    %init: tensor<1x4x4x513xi32>) -> tensor<1x4x4x513xi32> {
+    %filter: tensor<1x1x16x769xi8>,
+    %init: tensor<1x4x4x769xi32>) -> tensor<1x4x4x769xi32> {
   %result = linalg.conv_2d_nhwc_hwcf
       {dilations = dense<1> : vector<2xi64>, strides = dense<1> : vector<2xi64>}
-      ins(%input, %filter : tensor<1x4x4x16xi8>, tensor<1x1x16x513xi8>)
-      outs(%init : tensor<1x4x4x513xi32>) -> tensor<1x4x4x513xi32>
-  return %result : tensor<1x4x4x513xi32>
+      ins(%input, %filter : tensor<1x4x4x16xi8>, tensor<1x1x16x769xi8>)
+      outs(%init : tensor<1x4x4x769xi32>) -> tensor<1x4x4x769xi32>
+  return %result : tensor<1x4x4x769xi32>
 }
 
 // CHECK-LABEL: util.func public @dense_3x3_cout_512_matched

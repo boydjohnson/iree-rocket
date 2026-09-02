@@ -32,9 +32,8 @@
 //! group -- the int8 bug that motivated the int8 test was exactly a
 //! mis-grouping at its own 64-channel boundary. Feature atoms hold 8 fp16
 //! channels, so channel counts that are not a multiple of 8 exercise the
-//! padding. And `padding = [0, 0]` throughout, which is what
-//! rocket-hal-driver programs from a compiled .vmfb -- not the SAME padding
-//! `Shape`'s default gives.
+//! padding. The original probes use `padding = [0, 0]`; the MobileNetV2
+//! cases below use its real 3x3 SAME geometry, `padding = [1, 1]`.
 
 use std::{fs::OpenOptions, mem, os::unix::io::AsRawFd, ptr};
 
@@ -164,7 +163,56 @@ fn fp16_depthwise_exact_at_stride_two() {
     }
 }
 
+// These ten signatures account for every one of MobileNetV2's 17 depthwise
+// placements that currently stay on CPU. Repeated model placements have the
+// same isolated hardware signature, so each is measured once here. Unlike the
+// older no-padding probes above, these use the model's 3x3 SAME geometry:
+// logical input extent and a leading one-pixel hardware pad.
+//
+// The wide cases deliberately opt into Shape's characterization-only escape
+// hatch. No compiled path sets it. A passing isolated case stays an ignored
+// board regression until the model-level interaction is understood. The one
+// failure below is behind `hardware-characterization`: C1344 needs 13 CBUF
+// weight banks for a 3x3 kernel, above the 11-bank hardware ceiling.
+macro_rules! mobilenetv2_depthwise_case {
+    ($name:ident, $channels:expr, $extent:expr, $stride:expr) => {
+        #[test]
+        #[ignore = "needs /dev/accel/accel0 -- characterizes a CPU-routed fp16 MobileNetV2 depthwise shape"]
+        fn $name() {
+            unsafe { std::env::set_var("ROCKET_ALLOW_UNBACKED_CHANNELS", "1") };
+            check_fp16_depthwise_with_padding($channels, $extent, $extent, $stride, [1, 1]);
+        }
+    };
+}
+
+// 112x112: one stride-1 C48 and one stride-2 C144 placement.
+mobilenetv2_depthwise_case!(fp16_mobilenetv2_depthwise_112_c48_s1, 48, 112, 1);
+mobilenetv2_depthwise_case!(fp16_mobilenetv2_depthwise_112_c144_s2, 144, 112, 2);
+// 56x56: one stride-1 and one stride-2 C192 placement.
+mobilenetv2_depthwise_case!(fp16_mobilenetv2_depthwise_56_c192_s1, 192, 56, 1);
+mobilenetv2_depthwise_case!(fp16_mobilenetv2_depthwise_56_c192_s2, 192, 56, 2);
+// 28x28: two stride-1 and one stride-2 C288 placements.
+mobilenetv2_depthwise_case!(fp16_mobilenetv2_depthwise_28_c288_s1, 288, 28, 1);
+mobilenetv2_depthwise_case!(fp16_mobilenetv2_depthwise_28_c288_s2, 288, 28, 2);
+// 14x14: six stride-1 (C528 x4, C816 x2) and one stride-2 C816 placement.
+mobilenetv2_depthwise_case!(fp16_mobilenetv2_depthwise_14_c528_s1, 528, 14, 1);
+mobilenetv2_depthwise_case!(fp16_mobilenetv2_depthwise_14_c816_s1, 816, 14, 1);
+mobilenetv2_depthwise_case!(fp16_mobilenetv2_depthwise_14_c816_s2, 816, 14, 2);
+// 7x7: three stride-1 C1344 placements.
+#[cfg(feature = "hardware-characterization")]
+mobilenetv2_depthwise_case!(fp16_mobilenetv2_depthwise_7_c1344_s1, 1344, 7, 1);
+
 fn check_fp16_depthwise(channels: usize, width: usize, height: usize, stride: u32) {
+    check_fp16_depthwise_with_padding(channels, width, height, stride, [0, 0]);
+}
+
+fn check_fp16_depthwise_with_padding(
+    channels: usize,
+    width: usize,
+    height: usize,
+    stride: u32,
+    padding: [usize; 2],
+) {
     let shape = Shape::with_out_channels(
         width as u32,
         height as u32,
@@ -172,7 +220,7 @@ fn check_fp16_depthwise(channels: usize, width: usize, height: usize, stride: u3
         channels as u32,
         channels as u32,
     )
-    .with_padding([0, 0])
+    .with_padding(padding)
     .with_depthwise();
     let (kh, kw) = (KERNEL[0], KERNEL[1]);
     let ow = shape.output_width(KERNEL) as usize;
@@ -182,7 +230,10 @@ fn check_fp16_depthwise(channels: usize, width: usize, height: usize, stride: u3
     let padded_channels = weight_bytes / (kh * kw * FP16_BYTES);
     let in_surfaces = (shape.weight_channels() as usize).div_ceil(CHANNELS_PER_ATOM);
     let out_surfaces = (shape.padded_out_channels() as usize).div_ceil(CHANNELS_PER_ATOM);
-    let label = format!("Cin {channels}, {width}x{height}, stride {stride}");
+    let label = format!(
+        "Cin {channels}, {width}x{height}, stride {stride}, padding {}x{}",
+        padding[0], padding[1]
+    );
 
     let file = OpenOptions::new()
         .read(true)
@@ -329,9 +380,15 @@ fn check_fp16_depthwise(channels: usize, width: usize, height: usize, stride: u3
                     let mut expected = 0.0f32;
                     for ky in 0..kh {
                         for kx in 0..kw {
-                            expected +=
-                                input_at(oy * stride as usize + ky, ox * stride as usize + kx, c)
-                                    * weight_at(ky, kx, c);
+                            let iy = oy * stride as usize + ky;
+                            let ix = ox * stride as usize + kx;
+                            if let (Some(iy), Some(ix)) =
+                                (iy.checked_sub(padding[0]), ix.checked_sub(padding[1]))
+                                && iy < height
+                                && ix < width
+                            {
+                                expected += input_at(iy, ix, c) * weight_at(ky, kx, c);
+                            }
                         }
                     }
                     let actual = read(oy, ox, c);
@@ -357,8 +414,15 @@ fn check_fp16_depthwise(channels: usize, width: usize, height: usize, stride: u3
                 let mut sum = 0.0f32;
                 for ky in 0..kh {
                     for kx in 0..kw {
-                        sum += input_at(oy * stride as usize + ky, ox * stride as usize + kx, cc)
-                            * weight_at(ky, kx, cc);
+                        let iy = oy * stride as usize + ky;
+                        let ix = ox * stride as usize + kx;
+                        if let (Some(iy), Some(ix)) =
+                            (iy.checked_sub(padding[0]), ix.checked_sub(padding[1]))
+                            && iy < height
+                            && ix < width
+                        {
+                            sum += input_at(iy, ix, cc) * weight_at(ky, kx, cc);
+                        }
                     }
                 }
                 sum

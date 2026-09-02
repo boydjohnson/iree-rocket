@@ -177,10 +177,10 @@ pub const INPUT_CHANNELS: u32 = 3;
 /// This constant is shared between dense and depthwise Shape construction,
 /// so there's no way to raise it for depthwise (which a separate hardware
 /// probe did validate at 576/960) without also permitting dense
-/// construction into that range. See
-/// `iree-rocket-hal/tests/conv_mobilenetv2_depthwise_wide_hw.rs`'s doc
-/// comment for the depthwise-side validation and what raising this again
-/// would need (a depthwise-specific ceiling, not this shared one).
+/// construction into that range. See the MobileNetV2 cases in
+/// `iree-rocket-hal/tests/conv_depthwise_fp16_exact_hw.rs` for the
+/// depthwise-side characterization and what raising this again would need
+/// (a depthwise-specific ceiling, not this shared one).
 pub const MAX_INPUT_CHANNELS: u32 = 512;
 
 /// `CNA_DATA_SIZE1.datain_channel_real` counts `Cin - 1` modulo this, even
@@ -296,8 +296,8 @@ const CBUF_BANK_BYTES: u32 = 256 * 128;
 /// been programmed that way (see its `div_ceil` below); the residency bound
 /// in [`Shape::max_tile_input_rows_for_width_and_data_banks`] has to charge
 /// the same way or it over-commits the CBUF.
-/// Whether `Shape` may be built with more input channels than the capture
-/// corpus backs.
+/// Whether `Shape` may be built with more channels than the capture corpus
+/// backs.
 ///
 /// This exists so the CBUF-split scoring harness
 /// (`tests/cbuf_split_score.rs`) and the high-channel hardware probes can
@@ -875,9 +875,10 @@ impl Shape {
             precision.max_in_channels()
         );
         assert!(
-            (1..=MAX_OUTPUT_CHANNELS).contains(&out_channels),
-            "output channels must be 1..={MAX_OUTPUT_CHANNELS}, the range the \
-             capture corpus covers and the 14-bit weight_kernels field encodes"
+            (1..=MAX_OUTPUT_CHANNELS).contains(&out_channels) || unbacked_channels_allowed(),
+            "output channels must be 1..={MAX_OUTPUT_CHANNELS}; beyond that \
+             the channel range has no capture backing (the 14-bit \
+             weight_kernels field itself encodes a wider range)"
         );
         if let Precision::Int8Accumulator(quantization) = precision {
             assert!(

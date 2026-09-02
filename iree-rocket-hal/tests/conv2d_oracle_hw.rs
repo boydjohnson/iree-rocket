@@ -904,33 +904,52 @@ fn cbuf_residency_boundary_cases() -> Vec<Conv2dCase> {
     cases
 }
 
-/// The first dense MobileNetV2 shape excluded only by the fp16 `Cout <= 512`
-/// matcher bound: four 14x14 1x1 convolutions expand 88 channels to 528.
+/// Every distinct CPU-routed fp16 pointwise MobileNetV2 shape.
 ///
-/// `MAX_OUTPUT_CHANNELS` now admits 768, but the fp16 matcher deliberately
-/// remains narrower because large-footprint 3x3 shapes can produce all-zero
-/// output with the same family of CBUF partitions. This exact 1x1 shape has
-/// a far smaller coefficient footprint, so measure it independently before
-/// widening the matcher. `Counting` verifies complete accumulation, while
-/// `Selectors` and `Dense` catch coefficient-layout and ordinary-value errors.
-#[cfg(feature = "hardware-characterization")]
-fn fp16_mobilenetv2_cout_528_candidate_cases() -> Vec<Conv2dCase> {
+/// These are the nine signatures behind the model's 17 remaining pointwise
+/// placements. They are deliberately isolated from the model: a passing case
+/// remains an ordinary ignored board test, while a failing case is evidence to
+/// keep (or add) a compiler feature gate rather than widen the matcher.
+///
+/// `ROCKET_ALLOW_UNBACKED_CHANNELS` is set by the two callers below. It is a
+/// characterization-only escape hatch for the capture-backed Cin/Cout limits;
+/// the production compiler never sets it. Each signature is checked with
+/// `Counting`, `Selectors`, and varied `Dense` values, covering complete
+/// accumulation, production weight layout, and ordinary arithmetic at every
+/// output lane.
+fn fp16_mobilenetv2_remaining_pointwise_cases() -> Vec<Conv2dCase> {
     [
-        OraclePattern::Counting,
-        OraclePattern::Selectors { phase: 0 },
-        OraclePattern::Dense { phase: 1 },
+        // 14x14: 3 + 1 + 3 + 2 = 9 model placements.
+        (14, 528, 88),
+        (14, 528, 136),
+        (14, 136, 816),
+        (14, 816, 136),
+        // 7x7: 1 + 3 + 2 + 1 + 1 = 8 model placements.
+        (7, 816, 224),
+        (7, 224, 1344),
+        (7, 1344, 224),
+        (7, 1344, 448),
+        (7, 448, 1792),
     ]
     .into_iter()
-    .map(|pattern| Conv2dCase {
-        width: 14,
-        height: 14,
-        cin: 88,
-        cout: 528,
-        kernel: [1, 1],
-        stride: 1,
-        padding: [0, 0],
-        precision: OraclePrecision::Fp16,
-        pattern,
+    .flat_map(|(width, cin, cout)| {
+        [
+            OraclePattern::Counting,
+            OraclePattern::Selectors { phase: 0 },
+            OraclePattern::Dense { phase: 0 },
+        ]
+        .into_iter()
+        .map(move |pattern| Conv2dCase {
+            width,
+            height: width,
+            cin,
+            cout,
+            kernel: [1, 1],
+            stride: 1,
+            padding: [0, 0],
+            precision: OraclePrecision::Fp16,
+            pattern,
+        })
     })
     .collect()
 }
@@ -1867,11 +1886,11 @@ fn cbuf_residency_boundary_is_planable_and_gap_free() {
     assert_planable_and_gap_free(cases);
 }
 
-#[cfg(feature = "hardware-characterization")]
 #[test]
-fn fp16_mobilenetv2_cout_528_candidate_is_planable_and_gap_free() {
-    let cases = fp16_mobilenetv2_cout_528_candidate_cases();
-    assert_eq!(cases.len(), 3);
+fn fp16_mobilenetv2_remaining_pointwise_is_planable_and_gap_free() {
+    unsafe { std::env::set_var("ROCKET_ALLOW_UNBACKED_CHANNELS", "1") };
+    let cases = fp16_mobilenetv2_remaining_pointwise_cases();
+    assert_eq!(cases.len(), 27);
     assert_planable_and_gap_free(cases);
 }
 
@@ -1893,13 +1912,13 @@ fn dense_geometry_regression_matches_oracle() {
     );
 }
 
-#[cfg(feature = "hardware-characterization")]
 #[test]
-#[ignore = "needs /dev/accel/accel0 -- characterizes MobileNetV2's 14x14 fp16 88-to-528 1x1 candidate"]
-fn fp16_mobilenetv2_cout_528_candidate_matches_oracle() {
+#[ignore = "needs /dev/accel/accel0 -- characterizes the 9 CPU-routed fp16 MobileNetV2 pointwise shapes"]
+fn fp16_mobilenetv2_remaining_pointwise_matches_oracle() {
+    unsafe { std::env::set_var("ROCKET_ALLOW_UNBACKED_CHANNELS", "1") };
     run_hardware_case_matrix(
-        "MobileNetV2 fp16 14x14 88-to-528 1x1 matcher candidate",
-        fp16_mobilenetv2_cout_528_candidate_cases(),
+        "MobileNetV2 fp16 CPU-routed pointwise shapes",
+        fp16_mobilenetv2_remaining_pointwise_cases(),
     );
 }
 
