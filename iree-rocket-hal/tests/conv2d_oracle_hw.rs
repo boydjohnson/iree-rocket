@@ -72,6 +72,35 @@ impl OwnedBuffer {
         }
     }
 
+    /// Extra mapped bytes to append to a named input buffer.
+    ///
+    /// The accumulator failure raises a DMA **read** error, so the question is
+    /// which buffer the NPU reads past. Padding one at a time separates them:
+    /// if a shape becomes exact only when a particular buffer is grown, that
+    /// buffer is the one being over-read. The padding is zero-filled, so it is
+    /// inert as data -- it only makes the pages mapped.
+    fn pad_bytes(which: &str) -> usize {
+        std::env::var(format!("ROCKET_PAD_{which}"))
+            .ok()
+            .and_then(|value| value.parse().ok())
+            .unwrap_or(0)
+    }
+
+    unsafe fn from_bytes_padded(
+        fd: i32,
+        bytes: &[u8],
+        which: &str,
+        file: &std::fs::File,
+    ) -> Self {
+        let buffer = unsafe { Self::new(fd, bytes.len() + Self::pad_bytes(which), file) };
+        unsafe {
+            ptr::write_bytes(buffer.buffer.host_ptr, 0, buffer.buffer.size);
+            ptr::copy_nonoverlapping(bytes.as_ptr(), buffer.buffer.host_ptr, bytes.len());
+        }
+        buffer
+    }
+
+    #[allow(dead_code)]
     unsafe fn from_bytes(fd: i32, bytes: &[u8], file: &std::fs::File) -> Self {
         let buffer = unsafe { Self::new(fd, bytes.len(), file) };
         unsafe {
@@ -257,9 +286,9 @@ fn execute_case_output_with_plan(
     let output_len = output_storage_bytes(shape, kernels);
 
     unsafe {
-        let input = OwnedBuffer::from_bytes(fd, &fixture.input, file);
-        let weights = OwnedBuffer::from_bytes(fd, &fixture.weights, file);
-        let bias = OwnedBuffer::from_bytes(fd, &fixture.bias, file);
+        let input = OwnedBuffer::from_bytes_padded(fd, &fixture.input, "INPUT", file);
+        let weights = OwnedBuffer::from_bytes_padded(fd, &fixture.weights, "WEIGHTS", file);
+        let bias = OwnedBuffer::from_bytes_padded(fd, &fixture.bias, "BIAS", file);
         let output = OwnedBuffer::new(fd, output_len, file);
         // A zero fill can turn an unwritten output lane into a plausible
         // convolution result. Poison the whole allocation so missing tail
@@ -2803,6 +2832,200 @@ fn group_division_high_channel_splits_match_oracle() {
 /// `ROCKET_FEATURE_GRAINS_MAX=<n>`; `Cin > 384` needs
 /// `ROCKET_ALLOW_KNOWN_BAD_SHAPES=1`. `Cin` 384 is the control and must stay
 /// exact in every arm -- if it breaks, the arm is invalid, not informative.
+/// Locates the accumulator boundary for several kernels at *one* geometry.
+///
+/// The two boundaries measured so far come from shapes that differ in three
+/// ways at once -- k=3 fails above `Cin` 32 at 28x28 Cout 256, k=1 is exact to
+/// `Cin` 384 at 32x32 Cout 64 -- so nothing can be concluded about what the
+/// boundary is a function of. This holds 32x32 and Cout 64 fixed and sweeps
+/// `Cin` finely for k=1, 3 and 5, so the three boundaries are directly
+/// comparable.
+///
+/// `Cin > 384` at k=1 needs `ROCKET_ALLOW_KNOWN_BAD_SHAPES=1`, which the test
+/// sets. Run one case per process.
+/// Tests the coefficient-footprint hypothesis by varying **Cout** at fixed
+/// `Cin`, kernel and geometry.
+///
+/// Both boundaries in `accumulator_boundary_sweep` bracket the same total
+/// coefficient size (`padded_Cin * taps * Cout`): k=3 `Cin` 32 is 18432 bytes
+/// and passes, k=1 `Cin` 384 is 24576 and passes, k=1 `Cin` 400 is 25600 and
+/// fails, k=3 `Cin` 33 pads to 48 for 27648 and fails. If the accumulator is
+/// correct iff that footprint stays under roughly 24-25 KiB, then at k=3
+/// `Cin` 48 -- which fails at Cout 64 -- **shrinking Cout alone must fix it**,
+/// with the boundary between Cout 56 (24192 bytes) and Cout 64 (27648).
+/// Pins the accumulator threshold in coefficient bytes **per output channel**.
+///
+/// Total coefficient size is ruled out: at k=3 `Cin` 48 every Cout from 8 to
+/// 64 fails, including Cout 8 at 3456 bytes. Normalising per output channel
+/// fits every point instead -- `padded_Cin * taps` is 288 and 384 where the
+/// device is exact, 400 and 432 where it is wrong. This walks k=1 across
+/// 384 -> 400 one atom at a time, where `padded_Cin * taps` is just the padded
+/// channel count, to place the edge exactly. 384 is 6 whole 64-byte
+/// coefficient groups.
+/// Discriminating test for the per-output-channel coefficient limit.
+///
+/// k=1 places the edge exactly between `Cin` 384 (exact) and 385 (wrong), and
+/// k=3 between padded `Cin` 32 (288 bytes) and 48 (432). Both fit
+/// "correct iff `padded_Cin * taps <= 384`", but they cannot separate that
+/// from a plain `Cin` limit that happens to coincide.
+///
+/// A **1x3** kernel does separate them: taps is 3, so the rule predicts the
+/// edge at padded `Cin` 128 (384 bytes) -- nowhere near 384 channels. `Cin` 112
+/// (336) and 128 (384) must be exact; `Cin` 129 pads to 144 (432) and must
+/// fail. A plain channel limit predicts all four exact.
+fn accumulator_rectangular_kernel_cases() -> Vec<Conv2dCase> {
+    [96u32, 112, 128, 129]
+        .into_iter()
+        .map(|cin| Conv2dCase {
+            width: 32,
+            height: 32,
+            cin,
+            cout: 64,
+            kernel: [1, 3],
+            stride: 1,
+            padding: [0, 1],
+            precision: OraclePrecision::Int8Accumulator,
+            pattern: OraclePattern::Counting,
+        })
+        .collect()
+}
+
+#[test]
+#[ignore = "requires the RK3588 NPU"]
+fn accumulator_rectangular_kernel_probe() {
+    unsafe { std::env::set_var("ROCKET_ALLOW_KNOWN_BAD_SHAPES", "1") };
+    unsafe { std::env::set_var("ROCKET_ALLOW_UNBACKED_CHANNELS", "1") };
+    run_hardware_case_matrix(
+        "int8 accumulator 1x3 kernel, per-channel coefficient limit",
+        accumulator_rectangular_kernel_cases(),
+    );
+}
+
+fn accumulator_per_channel_threshold_cases() -> Vec<Conv2dCase> {
+    [352u32, 368, 384, 385, 392, 400, 416]
+        .into_iter()
+        .map(|cin| Conv2dCase {
+            width: 32,
+            height: 32,
+            cin,
+            cout: 64,
+            kernel: [1, 1],
+            stride: 1,
+            padding: [0, 0],
+            precision: OraclePrecision::Int8Accumulator,
+            pattern: OraclePattern::Counting,
+        })
+        .collect()
+}
+
+#[test]
+#[ignore = "requires the RK3588 NPU"]
+fn accumulator_per_channel_threshold_probe() {
+    unsafe { std::env::set_var("ROCKET_ALLOW_KNOWN_BAD_SHAPES", "1") };
+    unsafe { std::env::set_var("ROCKET_ALLOW_UNBACKED_CHANNELS", "1") };
+    run_hardware_case_matrix(
+        "int8 accumulator per-output-channel coefficient threshold",
+        accumulator_per_channel_threshold_cases(),
+    );
+}
+
+fn accumulator_coefficient_footprint_cases() -> Vec<Conv2dCase> {
+    [8u32, 16, 32, 48, 56, 64]
+        .into_iter()
+        .map(|cout| Conv2dCase {
+            width: 32,
+            height: 32,
+            cin: 48,
+            cout,
+            kernel: [3, 3],
+            stride: 1,
+            padding: [1, 1],
+            precision: OraclePrecision::Int8Accumulator,
+            pattern: OraclePattern::Counting,
+        })
+        .collect()
+}
+
+#[test]
+#[ignore = "requires the RK3588 NPU"]
+fn accumulator_coefficient_footprint_probe() {
+    unsafe { std::env::set_var("ROCKET_ALLOW_KNOWN_BAD_SHAPES", "1") };
+    run_hardware_case_matrix(
+        "int8 accumulator coefficient footprint, k=3 Cin 48",
+        accumulator_coefficient_footprint_cases(),
+    );
+}
+
+fn accumulator_boundary_sweep_cases() -> Vec<Conv2dCase> {
+    let mut cases = Vec::new();
+    for kernel in [1usize, 3, 5] {
+        for cin in [
+            16u32, 24, 32, 33, 40, 48, 64, 96, 128, 192, 256, 320, 352, 384, 400, 448, 512,
+        ] {
+            cases.push(Conv2dCase {
+                width: 32,
+                height: 32,
+                cin,
+                cout: 64,
+                kernel: [kernel, kernel],
+                stride: 1,
+                padding: [kernel / 2, kernel / 2],
+                precision: OraclePrecision::Int8Accumulator,
+                pattern: OraclePattern::Counting,
+            });
+        }
+    }
+    cases
+}
+
+#[test]
+#[ignore = "requires the RK3588 NPU"]
+fn accumulator_boundary_sweep() {
+    unsafe { std::env::set_var("ROCKET_ALLOW_KNOWN_BAD_SHAPES", "1") };
+    unsafe { std::env::set_var("ROCKET_ALLOW_UNBACKED_CHANNELS", "1") };
+    run_hardware_case_matrix(
+        "int8 accumulator boundary, 32x32 Cout 64, k=1/3/5",
+        accumulator_boundary_sweep_cases(),
+    );
+}
+
+/// Does the accumulator failure track `Cin`, or output-channel coverage?
+///
+/// At 3x3 `Cin` 33 Cout 256 the device writes exactly one 128-byte output
+/// block -- channels 0..31 are right and the rest is untouched `OUTPUT_SENTINEL`
+/// -- so the symptom is *coverage*, not corruption. `blocks_per_pixel` is
+/// `padded_out_channels * 4 / 128`, i.e. 1, 2, 4 and 8 at Cout 32, 64, 128 and
+/// 256. If only the multi-block Couts fail, the cap is a Cout property that
+/// `Cin` merely correlates with.
+fn accumulator_cout_coverage_cases() -> Vec<Conv2dCase> {
+    let mut cases = Vec::new();
+    for cin in [32u32, 33, 64] {
+        for cout in [32u32, 64, 128, 256] {
+            cases.push(Conv2dCase {
+                width: 28,
+                height: 28,
+                cin,
+                cout,
+                kernel: [3, 3],
+                stride: 1,
+                padding: [1, 1],
+                precision: OraclePrecision::Int8Accumulator,
+                pattern: OraclePattern::Counting,
+            });
+        }
+    }
+    cases
+}
+
+#[test]
+#[ignore = "requires the RK3588 NPU"]
+fn accumulator_cout_coverage_probe() {
+    run_hardware_case_matrix(
+        "int8 accumulator output-block coverage",
+        accumulator_cout_coverage_cases(),
+    );
+}
+
 fn accumulator_grains_cases() -> Vec<Conv2dCase> {
     // Both precisions at the same shapes. The register diff showed our conv
     // programming is bit-identical to the vendor's across the cliff for every

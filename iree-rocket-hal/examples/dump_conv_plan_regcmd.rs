@@ -52,6 +52,14 @@ fn main() {
             weights_scale: 1.0,
             multiplier: Multiplier { scale: 1, shift: 0 },
         }),
+        Ok("int8") => Precision::Int8(Quantization {
+            input_zero_point: 0,
+            output_zero_point: 0,
+            weight_zero_point: 0,
+            input_scale: 1.0,
+            weights_scale: 1.0,
+            multiplier: Multiplier { scale: 1, shift: 0 },
+        }),
         _ => Precision::Fp16,
     };
     let mut shape = Shape::with_precision(width, height, stride, cin, cout, precision);

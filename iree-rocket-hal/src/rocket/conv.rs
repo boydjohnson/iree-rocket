@@ -1169,12 +1169,13 @@ impl Shape {
         }
         if self.precision.writes_accumulators()
             && !self.depthwise
-            && kernels == [1, 1]
-            && self.in_channels > 384
+            && self.accumulator_coefficient_bytes_per_channel(kernels)
+                > MAX_ACCUMULATOR_COEFFICIENT_BYTES_PER_CHANNEL
             && !known_bad_shapes_allowed()
         {
             return Err(
-                "dense 1x1 int8 accumulator convolution supports at most 384 input channels",
+                "dense int8 accumulator convolution exceeds the coefficient working set the \
+                 output path can hold: at most 384 coefficient bytes per output channel",
             );
         }
 
@@ -1286,6 +1287,15 @@ impl Shape {
     /// out.
     fn cbuf_atoms(&self) -> u32 {
         quad_atoms(self.feature_atoms())
+    }
+
+
+    /// Coefficient bytes one output channel carries, the quantity the
+    /// accumulator output path bounds. See
+    /// [`MAX_ACCUMULATOR_COEFFICIENT_BYTES_PER_CHANNEL`].
+    fn accumulator_coefficient_bytes_per_channel(&self, kernels: Kernels) -> u32 {
+        let taps = kernels[0] as u32 * kernels[1] as u32;
+        self.weight_channels() * taps * self.precision.element_bytes()
     }
 
     /// Whether the feature map is dense NHWC or NC1HWC2 surfaces.
@@ -3173,6 +3183,56 @@ fn grains_override() -> Option<GrainsOverride> {
     None
 }
 
+/// Most coefficient bytes per output channel a dense int8 **accumulator**
+/// convolution may carry.
+///
+/// Measured on hardware 2026-09-02 at a controlled 32x32 / Cout 64, each case
+/// guarded by a health check either side (a wedged NPU returns all-fail and
+/// looks exactly like data). The device is exact at or below this and wrong
+/// above it, with the edge landing on adjacent values:
+///
+/// | kernel | last exact                | first wrong               |
+/// |--------|---------------------------|---------------------------|
+/// | 1x1    | `Cin` 384 -> 384 bytes    | `Cin` 385 -> 385 bytes    |
+/// | 1x3    | `Cin` 128 -> 384 bytes    | `Cin` 129 (pads 144) 432  |
+/// | 3x3    | `Cin` 32  -> 288 bytes    | `Cin` 33 (pads 48) -> 432 |
+///
+/// The 1x3 row is what makes this a *per-channel coefficient* limit rather
+/// than a channel count that happens to sit near 384: a plain `Cin` limit
+/// predicts `Cin` 129 exact, and it is not. Cout is independent -- at 3x3
+/// `Cin` 48 every Cout from 8 to 64 fails, including Cout 8 -- so the total
+/// coefficient footprint is not what binds.
+///
+/// 384 bytes is six whole 64-byte coefficient groups, which is the shape of
+/// the underlying limit; the root cause in the accumulator output path is not
+/// yet found. Plain int8 has no such limit and is exact at every `Cin`
+/// measured, so this guards the output mode, not the convolution.
+const MAX_ACCUMULATOR_COEFFICIENT_BYTES_PER_CHANNEL: u32 = 384;
+
+/// Characterization override for the accumulator `DPU_SURFACE_ADD.surf_add`.
+///
+/// Exceeding the per-channel coefficient limit raises a DMA **read** error and
+/// stalls the rk_iommu, and the accumulator output registers are the only part
+/// of the program with no vendor capture behind them. Nothing on the compiled
+/// path sets this.
+///
+/// Gated by `ROCKET_ACC_SURF_ADD_MIN_CIN` because the hardware harness runs a
+/// low-`Cin` accumulator canary first: overriding globally breaks that canary
+/// and the run aborts as "device sick" rather than measuring anything. That
+/// the canary breaks at all is itself the finding that 16 is load-bearing.
+fn accumulator_surf_add_override(in_channels: u32) -> Option<u32> {
+    let min_channels: u32 = std::env::var("ROCKET_ACC_SURF_ADD_MIN_CIN")
+        .ok()
+        .and_then(|value| value.parse().ok())
+        .unwrap_or(0);
+    if in_channels < min_channels {
+        return None;
+    }
+    std::env::var("ROCKET_ACC_SURF_ADD")
+        .ok()
+        .and_then(|value| value.parse().ok())
+}
+
 /// Whether shapes the HAL knows are miscomputed on this hardware may still be
 /// planned. Only a characterization probe should set this: the guards exist
 /// because the device returns wrong data, and the point of lifting them is to
@@ -3873,7 +3933,11 @@ fn conv_2d_tile_program(
             .surf_add(Bits::new(if accumulator_output {
                 // Accumulator output serializes its 32-lane blocks with the
                 // fixed hardware value 16 in both dense and depthwise mode.
-                16
+                // `ROCKET_ACC_SURF_ADD` overrides it for characterization:
+                // this value is one of only four DPU registers that differ
+                // from the (exact) plain-int8 program, and the accumulator
+                // mode has no vendor capture to validate it against.
+                accumulator_surf_add_override(shape.in_channels).unwrap_or(16)
             } else {
                 full_out_width * out_height * 2 * if shape.depthwise { 2 } else { 1 }
             }))
@@ -5583,6 +5647,49 @@ mod tests {
     fn saturating_coefficient_working_set_is_refused() {
         let shape = Shape::with_precision(32, 32, 1, 512, 64, Precision::Fp16);
         let _ = ConvPlan::new(shape, [5, 5]);
+    }
+
+    /// The accumulator coefficient limit refuses exactly the shapes the device
+    /// gets wrong, at every kernel measured.
+    ///
+    /// Each pair is adjacent on hardware: the first is exact, the second is
+    /// wrong. The 1x3 row is the one that makes this a per-channel coefficient
+    /// bound rather than a channel count -- `Cin` 129 is far below the 1x1
+    /// edge of 384 channels and still fails.
+    #[test]
+    fn accumulator_coefficient_limit_matches_measured_edges() {
+        let quantization = Quantization {
+            input_zero_point: 0,
+            output_zero_point: 0,
+            weight_zero_point: 0,
+            input_scale: 1.0,
+            weights_scale: 1.0,
+            multiplier: Multiplier { scale: 1, shift: 0 },
+        };
+        for (kernels, exact, wrong) in [
+            ([1usize, 1], 384u32, 385u32),
+            ([1, 3], 128, 129),
+            ([3, 3], 32, 33),
+        ] {
+            let shape = |cin| {
+                Shape::with_precision(
+                    32,
+                    32,
+                    1,
+                    cin,
+                    64,
+                    Precision::Int8Accumulator(quantization),
+                )
+            };
+            assert!(
+                shape(exact).parity_padded_shape(kernels).is_ok(),
+                "{kernels:?} Cin {exact} is exact on hardware and must be allowed"
+            );
+            assert!(
+                shape(wrong).parity_padded_shape(kernels).is_err(),
+                "{kernels:?} Cin {wrong} is wrong on hardware and must be refused"
+            );
+        }
     }
 
     /// A 5x5 kernel at `Cin` 192 plans 2/10, the split the vendor uses.
