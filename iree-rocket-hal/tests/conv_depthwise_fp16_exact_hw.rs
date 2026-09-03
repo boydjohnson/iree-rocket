@@ -38,7 +38,7 @@
 use std::{fs::OpenOptions, mem, os::unix::io::AsRawFd, ptr};
 
 use iree_rocket_hal::rocket::{
-    conv::{Buffers, ConvPlan, Kernels, Shape},
+    conv::{Buffers, ConvPlan, Kernels, Precision, Shape},
     device::{Buffer, JobDesc, close_bo, fini_bo, prep_bo, submit_jobs},
     tensor_layout::pack_depthwise_to_rocket_weights,
 };
@@ -169,17 +169,24 @@ fn fp16_depthwise_exact_at_stride_two() {
 // older no-padding probes above, these use the model's 3x3 SAME geometry:
 // logical input extent and a leading one-pixel hardware pad.
 //
-// The wide cases deliberately opt into Shape's characterization-only escape
-// hatch. No compiled path sets it. A passing isolated case stays an ignored
-// board regression until the model-level interaction is understood. The one
-// failure below is behind `hardware-characterization`: C1344 needs 13 CBUF
-// weight banks for a 3x3 kernel, above the 11-bank hardware ceiling.
+// These no longer need Shape's characterization escape hatch: every channel
+// count here is inside `MAX_DEPTHWISE_CHANNELS` now that the depthwise
+// ceiling is its own constant, so they exercise the real bound. A passing
+// isolated case stays an ignored board regression until the model-level
+// interaction is understood.
+//
+// C1344 used to be gated behind `hardware-characterization` as a known
+// failure -- "needs 13 CBUF weight banks for a 3x3 kernel, above the 11
+// grantable". That was never a hardware ceiling, it was
+// `streamed_weight_bank_preference` costing depthwise coefficients with the
+// *dense* streamed working set. Depthwise carries one filter per channel and
+// its real footprint at C1344 is 24192 bytes, under a single bank; with the
+// coefficient model made depthwise-aware the shape plans and passes.
 macro_rules! mobilenetv2_depthwise_case {
     ($name:ident, $channels:expr, $extent:expr, $stride:expr) => {
         #[test]
         #[ignore = "needs /dev/accel/accel0 -- characterizes a CPU-routed fp16 MobileNetV2 depthwise shape"]
         fn $name() {
-            unsafe { std::env::set_var("ROCKET_ALLOW_UNBACKED_CHANNELS", "1") };
             check_fp16_depthwise_with_padding($channels, $extent, $extent, $stride, [1, 1]);
         }
     };
@@ -199,8 +206,69 @@ mobilenetv2_depthwise_case!(fp16_mobilenetv2_depthwise_14_c528_s1, 528, 14, 1);
 mobilenetv2_depthwise_case!(fp16_mobilenetv2_depthwise_14_c816_s1, 816, 14, 1);
 mobilenetv2_depthwise_case!(fp16_mobilenetv2_depthwise_14_c816_s2, 816, 14, 2);
 // 7x7: three stride-1 C1344 placements.
-#[cfg(feature = "hardware-characterization")]
 mobilenetv2_depthwise_case!(fp16_mobilenetv2_depthwise_7_c1344_s1, 1344, 7, 1);
+
+/// Walks the depthwise channel range that opened when `MAX_DEPTHWISE_CHANNELS`
+/// was split out of the dense `MAX_INPUT_CHANNELS`.
+///
+/// The two ceilings used to be one constant, so nothing above 512 could be
+/// built at all and this whole range was unmeasured. `(512, 1400]` is chosen
+/// to cover every depthwise stage MobileNetV2 actually has -- 528, 816 and
+/// 1344 -- with the surrounding grid needed to tell a channel-count rule
+/// from a coincidence at those three points.
+///
+/// The step is 64, the depthwise int8 coefficient group, and the sweep adds
+/// deliberate non-multiples of the fp16 32-channel group and of the 8-channel
+/// feature atom (600, 700, 900, 1000, 1300) so the padding path is exercised
+/// rather than only the aligned case. Both depthwise packing bugs found so
+/// far were at a group boundary, and a sweep that only samples multiples of
+/// the group cannot see them.
+///
+/// Values above `MAX_DEPTHWISE_CHANNELS` need the characterization escape
+/// hatch; that is the point -- the constant is meant to be raised to whatever
+/// this measures and no further. Nothing on the compiled path sets it.
+///
+/// One case per process. These are large allocations and the sweep is long:
+///
+/// ```text
+/// for i in $(seq 0 N); do ROCKET_DEPTHWISE_SWEEP_ONLY=$i ./conv_depthwise_fp16_exact_hw \
+///     fp16_depthwise_exact_above_the_dense_ceiling --ignored --nocapture; done
+/// ```
+#[test]
+#[ignore = "needs /dev/accel/accel0 -- sweeps the depthwise channel range above the dense ceiling"]
+fn fp16_depthwise_exact_above_the_dense_ceiling() {
+    unsafe { std::env::set_var("ROCKET_ALLOW_UNBACKED_CHANNELS", "1") };
+
+    let mut channels: Vec<usize> = (576..=1400).step_by(64).collect();
+    // MobileNetV2's own depthwise channel counts, and non-group-aligned
+    // points between them.
+    channels.extend([528, 816, 1344, 600, 700, 900, 1000, 1300, 1400]);
+    // Two points past the top of the range, so the ceiling this sets is a
+    // measured boundary rather than wherever the sweep happened to stop.
+    channels.extend([1408, 1536]);
+    channels.sort_unstable();
+    channels.dedup();
+
+    // 14x14 is MobileNetV2's geometry up to C816 and 7x7 is its C1344 one;
+    // keeping the extent tied to the channel count keeps the allocations and
+    // the tile counts in the range the model actually dispatches.
+    let cases: Vec<(usize, usize)> = channels
+        .into_iter()
+        .map(|c| (c, if c > 900 { 7 } else { 14 }))
+        .collect();
+
+    let only = std::env::var("ROCKET_DEPTHWISE_SWEEP_ONLY")
+        .ok()
+        .and_then(|value| value.parse::<usize>().ok());
+    eprintln!("depthwise channel sweep: {} case(s)", cases.len());
+    for (index, (channels, extent)) in cases.into_iter().enumerate() {
+        if only.is_some_and(|wanted| wanted != index) {
+            continue;
+        }
+        eprintln!("[{index}] Cin {channels} at {extent}x{extent} stride 1");
+        check_fp16_depthwise_with_padding(channels, extent, extent, 1, [1, 1]);
+    }
+}
 
 fn check_fp16_depthwise(channels: usize, width: usize, height: usize, stride: u32) {
     check_fp16_depthwise_with_padding(channels, width, height, stride, [0, 0]);
@@ -213,15 +281,17 @@ fn check_fp16_depthwise_with_padding(
     stride: u32,
     padding: [usize; 2],
 ) {
-    let shape = Shape::with_out_channels(
+    // `depthwise_with_precision`, not `with_out_channels().with_depthwise()`:
+    // the latter runs the dense channel bound first, so it cannot build the
+    // wide MobileNetV2 shapes this file exists to characterize.
+    let shape = Shape::depthwise_with_precision(
         width as u32,
         height as u32,
         stride,
         channels as u32,
-        channels as u32,
+        Precision::Fp16,
     )
-    .with_padding(padding)
-    .with_depthwise();
+    .with_padding(padding);
     let (kh, kw) = (KERNEL[0], KERNEL[1]);
     let ow = shape.output_width(KERNEL) as usize;
     let oh = shape.output_height(KERNEL) as usize;

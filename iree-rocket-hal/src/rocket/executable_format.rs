@@ -288,21 +288,42 @@ pub fn decode_conv_shape_v1(payload: &[u8]) -> Result<(conv::Shape, Kernels), De
 /// lives, in `conv.rs` itself -- rather than two copies that can drift.
 pub fn validate_conv_shape(shape: &conv::Shape, kernels: Kernels) -> Result<(), &'static str> {
     std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-        let mut rebuilt = conv::Shape::with_precision(
-            shape.width,
-            shape.height,
-            shape.stride,
-            shape.in_channels,
-            shape.out_channels,
-            shape.precision,
-        );
+        // Depthwise has to be rebuilt through its own constructor, not
+        // through `with_depthwise()`: the flag-flipping spelling runs the
+        // *dense* channel bound first, so a depthwise shape above
+        // `MAX_INPUT_CHANNELS` would be rejected here for a limit that does
+        // not apply to it. Both spellings still funnel into `Shape::build`,
+        // so this stays a single source of truth for the bounds.
+        let mut rebuilt = if shape.depthwise {
+            // `depthwise_with_precision` takes one channel count, so the
+            // mismatch `with_depthwise()` used to catch has to be checked
+            // here or a `Cin != Cout` depthwise shape would be silently
+            // rebuilt as a valid one.
+            assert_eq!(
+                shape.in_channels, shape.out_channels,
+                "depthwise capture backing covers a channel multiplier of one only"
+            );
+            conv::Shape::depthwise_with_precision(
+                shape.width,
+                shape.height,
+                shape.stride,
+                shape.in_channels,
+                shape.precision,
+            )
+        } else {
+            conv::Shape::with_precision(
+                shape.width,
+                shape.height,
+                shape.stride,
+                shape.in_channels,
+                shape.out_channels,
+                shape.precision,
+            )
+        };
         if let Some(padding) = shape.padding {
             rebuilt = rebuilt.with_padding(padding);
         }
         rebuilt = rebuilt.with_activation(shape.activation);
-        if shape.depthwise {
-            rebuilt = rebuilt.with_depthwise();
-        }
         let programmed = rebuilt
             .parity_padded_shape(kernels)
             .expect("unsupported accumulator output geometry");

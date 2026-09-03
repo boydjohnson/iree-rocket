@@ -25,8 +25,8 @@ use std::{fs::OpenOptions, mem, os::unix::io::AsRawFd, ptr};
 
 use iree_rocket_hal::rocket::{
     conv::{
-        BsEntry, Buffers, Multiplier, Precision, Quantization, Shape, Tile, conv_2d_tile, relocate,
-        write_bs_buffer,
+        BsEntry, Buffers, ConvPlan, Multiplier, Precision, Quantization, Shape, Tile, conv_2d_tile,
+        relocate, write_bs_buffer,
     },
     device::{Buffer, JobDesc, close_bo, fini_bo, prep_bo, submit_jobs},
     tensor_layout::{pack_depthwise_to_rocket_weights, pack_nhwc_to_nc1hwc2},
@@ -34,10 +34,10 @@ use iree_rocket_hal::rocket::{
 
 const DEVICE_PATH: &str = "/dev/accel/accel0";
 const PAGE_BYTES: usize = 4096;
-const W: usize = 34;
-const H: usize = 34;
-const OW: usize = 32;
-const OH: usize = 32;
+/// The historical single-tile geometry every pre-sweep case in this file
+/// uses. `check_int8_depthwise_at` takes an explicit extent instead.
+const DEFAULT_W: usize = 34;
+const DEFAULT_H: usize = 34;
 const KERNEL: usize = 3;
 const SENTINEL: u8 = 0xa5;
 
@@ -93,7 +93,121 @@ fn int8_depthwise_exact_where_the_cbuf_atom_charge_rounds_up() {
     }
 }
 
+/// The int8 counterpart of
+/// `conv_depthwise_fp16_exact_hw.rs::fp16_depthwise_exact_above_the_dense_ceiling`,
+/// walking the channel range that opened when `MAX_DEPTHWISE_CHANNELS` was
+/// split out of the dense ceiling.
+///
+/// `MAX_INT8_DEPTHWISE_CHANNELS` is deliberately still 512 -- lower than the
+/// fp16 bound -- because the int8 depthwise sweep stopped there, not because
+/// anything above it was known to fail. This is the sweep that settles it.
+///
+/// The geometry is fixed at this file's 34x34 -> 32x32 and only the channel
+/// count moves, which is the right axis: the bound is a channel bound, and
+/// int8 depthwise packs coefficients in **64-channel** groups (twice fp16's
+/// 32), so the step is 128 with deliberate non-multiples of 64 and of the
+/// 16-channel int8 feature atom -- both of this path's known bugs were at a
+/// group boundary, and a sweep sampling only aligned counts saw neither.
+///
+/// One case per process; these allocate several MB each.
+///
+/// ```text
+/// for i in $(seq 0 N); do ROCKET_DEPTHWISE_SWEEP_ONLY=$i ./conv_depthwise_int8_exact_hw \
+///     int8_depthwise_exact_above_the_dense_ceiling --ignored --nocapture; done
+/// ```
+#[test]
+#[ignore = "needs /dev/accel/accel0 -- sweeps the int8 depthwise channel range above the dense ceiling"]
+fn int8_depthwise_exact_above_the_dense_ceiling() {
+    unsafe { std::env::set_var("ROCKET_ALLOW_UNBACKED_CHANNELS", "1") };
+
+    let mut channels: Vec<usize> = (640..=1400).step_by(128).collect();
+    // MobileNetV2's own int8 depthwise channel counts.
+    channels.extend([528, 816, 1344]);
+    // Controls at and below `MAX_INT8_DEPTHWISE_CHANNELS`, so a failure above
+    // it is attributable to the channel count rather than to this harness.
+    channels.extend([256, 272, 288, 320, 352, 384, 448, 496, 512]);
+    // Two points past the range so the ceiling lands on a measured boundary.
+    channels.extend([1408, 1536]);
+    // Non-multiples of the 16-channel int8 feature atom are NOT swept here:
+    // this harness sizes its packed input buffer at the dense byte count, so
+    // `pack_nhwc_to_nc1hwc2` fails on them before any hardware runs. That is
+    // a harness limit, not a device one -- see the fp16 sweep, which does
+    // cover unaligned counts because its buffer is sized from the shape.
+    channels.sort_unstable();
+    channels.dedup();
+
+    let only = std::env::var("ROCKET_DEPTHWISE_SWEEP_ONLY")
+        .ok()
+        .and_then(|value| value.parse::<usize>().ok());
+    eprintln!("int8 depthwise channel sweep: {} case(s)", channels.len());
+    for (index, channels) in channels.into_iter().enumerate() {
+        if only.is_some_and(|wanted| wanted != index) {
+            continue;
+        }
+        eprintln!("[{index}] Cin {channels} at {DEFAULT_W}x{DEFAULT_H}");
+        check_int8_depthwise(channels);
+    }
+}
+
+/// Isolates the variable behind the int8 depthwise channel cliff.
+///
+/// The channel sweep above is exact to `Cin` 288 and wrong from 320 -- and
+/// 288 is the last count whose plan fits **one** row tile at 34x34, while
+/// 320 is the first that needs two. Every int8 depthwise test that existed
+/// before the sweep (`Cin` 48, 64, 112, 128, 240) is single-tile, which is
+/// why none of them saw this.
+///
+/// So the suspect is the tile count, not the channel count. This holds the
+/// channel count at a value the sweep proved exact and shrinks the extent
+/// until the planner splits the image: if a low-`Cin` multi-tile case is
+/// also wrong, the cliff is a row-tiling bug and a channel ceiling is the
+/// wrong guard for it entirely.
+///
+/// The fp16 depthwise path is *not* affected -- its own sweep passes at
+/// 112x112 with four row tiles -- so this is specific to int8 depthwise.
+///
+/// Run one case per process.
+#[test]
+#[ignore = "needs /dev/accel/accel0 -- isolates the int8 depthwise multi-tile cliff"]
+fn int8_depthwise_multi_tile_is_wrong() {
+    unsafe { std::env::set_var("ROCKET_ALLOW_UNBACKED_CHANNELS", "1") };
+    // (channels, extent). 34 is the file's single-tile control at each
+    // channel count; the taller extents force the planner to split rows
+    // while holding the channel count fixed.
+    let cases = [
+        (64usize, 34usize),
+        (64, 130),
+        (64, 260),
+        (240, 34),
+        (240, 70),
+        (240, 140),
+    ];
+    let only = std::env::var("ROCKET_DEPTHWISE_SWEEP_ONLY")
+        .ok()
+        .and_then(|value| value.parse::<usize>().ok());
+    eprintln!("multi-tile isolation: {} case(s)", cases.len());
+    for (index, (channels, extent)) in cases.into_iter().enumerate() {
+        if only.is_some_and(|wanted| wanted != index) {
+            continue;
+        }
+        eprintln!("[{index}] Cin {channels} at {extent}x{extent}");
+        check_int8_depthwise_at(channels, extent, extent);
+    }
+}
+
 fn check_int8_depthwise(channels: usize) {
+    check_int8_depthwise_at(channels, DEFAULT_W, DEFAULT_H);
+}
+
+/// `check_int8_depthwise` at an explicit input extent.
+///
+/// The extent is what decides how many row tiles `ConvPlan` needs, and the
+/// tile count turned out to matter far more than the channel count -- see
+/// `int8_depthwise_multi_tile_is_wrong`.
+#[allow(non_snake_case)]
+fn check_int8_depthwise_at(channels: usize, w: usize, h: usize) {
+    let (W, H) = (w, h);
+    let (OW, OH) = (w - (KERNEL - 1), h - (KERNEL - 1));
     let precision = Precision::Int8Accumulator(Quantization {
         input_zero_point: 0,
         output_zero_point: 0,
@@ -102,19 +216,16 @@ fn check_int8_depthwise(channels: usize) {
         weights_scale: 1.0,
         multiplier: Multiplier::from_ratio(1.0),
     });
-    let shape = Shape::with_precision(
-        W as u32,
-        H as u32,
-        1,
-        channels as u32,
-        channels as u32,
-        precision,
-    )
-    .with_padding([0, 0])
-    .with_depthwise();
+    // `depthwise_with_precision`, not `with_precision().with_depthwise()`:
+    // the latter runs the *dense* channel bound first and cannot build the
+    // wide shapes the sweep below characterizes.
+    let shape = Shape::depthwise_with_precision(W as u32, H as u32, 1, channels as u32, precision)
+        .with_padding([0, 0]);
     let kernels = [KERNEL, KERNEL];
     assert_eq!(shape.output_width(kernels) as usize, OW);
     assert_eq!(shape.output_height(kernels) as usize, OH);
+    let tiles = ConvPlan::new(shape, kernels).tiles().len();
+    eprintln!("  Cin {channels} at {W}x{H}: {tiles} tile(s)");
 
     let file = OpenOptions::new()
         .read(true)

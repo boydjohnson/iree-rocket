@@ -174,14 +174,65 @@ pub const INPUT_CHANNELS: u32 = 3;
 /// vendor uses and what each one costs -- fitted across kernel sizes, not a
 /// curve through one. The corpora to do it with are in the spike repo.
 ///
-/// This constant is shared between dense and depthwise Shape construction,
-/// so there's no way to raise it for depthwise (which a separate hardware
-/// probe did validate at 576/960) without also permitting dense
-/// construction into that range. See the MobileNetV2 cases in
-/// `iree-rocket-hal/tests/conv_depthwise_fp16_exact_hw.rs` for the
-/// depthwise-side characterization and what raising this again would need
-/// (a depthwise-specific ceiling, not this shared one).
+/// **Dense only** since the depthwise ceiling was split out; see
+/// [`MAX_DEPTHWISE_CHANNELS`]. This constant used to be shared between the
+/// two, which is why raising it for depthwise (validated at 576 and 960 on
+/// hardware) was impossible without also opening dense construction into a
+/// range where `ConvPlan` was known to disagree with the vendor.
 pub const MAX_INPUT_CHANNELS: u32 = 512;
+
+/// Most channels a **depthwise** fp16 convolution may carry.
+///
+/// Depthwise is a different regime from dense and deserves its own bound.
+/// It carries one filter per channel rather than `Cin * Cout` of them, so
+/// the coefficient footprint that drives the dense CBUF split -- the thing
+/// that pinned [`MAX_INPUT_CHANNELS`] at 512 -- grows linearly instead of
+/// quadratically and never reaches the split's disputed region. Depthwise
+/// also rounds channels to a doubled granule (see
+/// [`Shape::out_channel_granule`]), so the two do not even share a padding
+/// rule.
+///
+/// 1536 is where the evidence stops, not where the hardware does --
+/// `conv_depthwise_fp16_exact_hw.rs::fp16_depthwise_exact_above_the_dense_ceiling`
+/// swept 528..1536 on RK3588 on 2026-09-02 and **all 23 points are exact**,
+/// per element, with no failure found anywhere in the range. The sweep is a
+/// 64-step grid to 1344 (MobileNetV2's widest depthwise stage) plus
+/// deliberate non-multiples of both the 32-channel fp16 coefficient group
+/// and the 8-channel feature atom -- 600, 700, 900, 1000, 1300 -- because
+/// both depthwise packing bugs found so far were at a group boundary. Above
+/// 1344 the grid thins to three points: 1400, 1408 and 1536.
+///
+/// The earlier 2026-08-28 attempt raised the *shared* constant to 960 and was
+/// reverted for **performance**, not correctness -- the per-dispatch repack
+/// tax, not the arithmetic -- and reverting it lost the dense/depthwise
+/// distinction too. Splitting the constant restores the distinction without
+/// re-asserting the performance claim: the planner will build these shapes,
+/// and the transform spec decides separately whether offloading one pays.
+pub const MAX_DEPTHWISE_CHANNELS: u32 = 1536;
+
+/// Most channels a **depthwise** int8 convolution may carry.
+///
+/// Left at the dense 512 on purpose, and **this bound does not make int8
+/// depthwise correct** -- a channel ceiling is the wrong shape of guard for
+/// what actually limits that path.
+///
+/// Sweeping it on 2026-09-02 (`conv_depthwise_int8_exact_hw.rs`) found a
+/// cliff at 34x34: exact to `Cin` 288, wrong from 320. But the channel count
+/// is a proxy. 288 is the last count whose plan fits **one** row tile at
+/// that extent and 320 is the first needing two, and
+/// `int8_depthwise_multi_tile_is_wrong` separates them: `Cin` 64 is exact at
+/// 34x34 (1 tile) and **wrong at 130x130 (4 tiles)**, `Cin` 240 exact at
+/// 34x34 and wrong at 70x70. So int8 depthwise is wrong whenever the
+/// planner splits rows, at any channel count, and every int8 depthwise test
+/// that predates the sweep (`Cin` 48, 64, 112, 128, 240 at 34x34) is
+/// single-tile, which is why none of them saw it.
+///
+/// fp16 depthwise is unaffected -- its own sweep is exact at 112x112 with
+/// four row tiles -- so this is specific to the int8 path.
+///
+/// Raising this constant would be beside the point; the fix is the row
+/// tiling, and until it lands the real precondition is "one tile".
+pub const MAX_INT8_DEPTHWISE_CHANNELS: u32 = 512;
 
 /// `CNA_DATA_SIZE1.datain_channel_real` counts `Cin - 1` modulo this, even
 /// though the field is 14 bits wide and could hold far more.
@@ -525,9 +576,22 @@ impl Precision {
     /// rule rather than a table, so the limit is the extent of the evidence
     /// rather than the extent of the arithmetic.
     pub fn max_in_channels(&self) -> u32 {
-        match self {
-            Precision::Fp16 => MAX_INPUT_CHANNELS,
-            Precision::Int8(_) | Precision::Int8Accumulator(_) => MAX_INT8_INPUT_CHANNELS,
+        self.max_channels(false)
+    }
+
+    /// Most channels this builder will program, dense or depthwise.
+    ///
+    /// The two regimes have separate ceilings for the reasons in
+    /// [`MAX_DEPTHWISE_CHANNELS`]: depthwise carries one filter per channel,
+    /// so it never reaches the coefficient pressure that bounds dense.
+    pub fn max_channels(&self, depthwise: bool) -> u32 {
+        match (self, depthwise) {
+            (Precision::Fp16, false) => MAX_INPUT_CHANNELS,
+            (Precision::Fp16, true) => MAX_DEPTHWISE_CHANNELS,
+            (Precision::Int8(_) | Precision::Int8Accumulator(_), false) => MAX_INT8_INPUT_CHANNELS,
+            (Precision::Int8(_) | Precision::Int8Accumulator(_), true) => {
+                MAX_INT8_DEPTHWISE_CHANNELS
+            }
         }
     }
 
@@ -868,20 +932,74 @@ impl Shape {
         out_channels: u32,
         precision: Precision,
     ) -> Shape {
+        Shape::build(
+            width,
+            height,
+            stride,
+            in_channels,
+            out_channels,
+            precision,
+            false,
+        )
+    }
+
+    /// Builds a depthwise convolution against the **depthwise** channel
+    /// ceiling.
+    ///
+    /// [`Shape::with_depthwise`] cannot do this. It flips the flag on an
+    /// already-constructed shape, so the dense bound in
+    /// [`Shape::with_precision`] has already fired by the time it runs --
+    /// which is exactly why the depthwise ceiling used to be stuck at the
+    /// dense one. Anything above [`MAX_INPUT_CHANNELS`] has to be built
+    /// here; below it either spelling works and `with_depthwise` stays the
+    /// idiom.
+    ///
+    /// Depthwise carries one filter per channel, so `Cin == Cout` and there
+    /// is one channel count rather than two.
+    pub fn depthwise_with_precision(
+        width: u32,
+        height: u32,
+        stride: u32,
+        channels: u32,
+        precision: Precision,
+    ) -> Shape {
+        let mut shape = Shape::build(width, height, stride, channels, channels, precision, true);
+        shape.depthwise = true;
+        shape
+    }
+
+    fn build(
+        width: u32,
+        height: u32,
+        stride: u32,
+        in_channels: u32,
+        out_channels: u32,
+        precision: Precision,
+        depthwise: bool,
+    ) -> Shape {
         assert!(
             width > 0 && height > 0,
             "convolution extents must be nonzero"
         );
         assert!(stride > 0, "convolution stride must be nonzero");
+        let max_in = precision.max_channels(depthwise);
         assert!(
-            (1..=precision.max_in_channels()).contains(&in_channels) || unbacked_channels_allowed(),
-            "input channels must be 1..={}; beyond that the channel padding \
-             has no capture backing at this precision",
-            precision.max_in_channels()
+            (1..=max_in).contains(&in_channels) || unbacked_channels_allowed(),
+            "input channels must be 1..={max_in}; beyond that the channel padding \
+             has no capture backing at this precision"
         );
+        // Depthwise pins `Cout == Cin`, so the input ceiling already bounds
+        // the output one and `MAX_OUTPUT_CHANNELS` -- a dense
+        // `weight_kernels` limit -- would only re-impose the dense cap the
+        // depthwise ceiling exists to escape.
+        let max_out = if depthwise {
+            max_in
+        } else {
+            MAX_OUTPUT_CHANNELS
+        };
         assert!(
-            (1..=MAX_OUTPUT_CHANNELS).contains(&out_channels) || unbacked_channels_allowed(),
-            "output channels must be 1..={MAX_OUTPUT_CHANNELS}; beyond that \
+            (1..=max_out).contains(&out_channels) || unbacked_channels_allowed(),
+            "output channels must be 1..={max_out}; beyond that \
              the channel range has no capture backing (the 14-bit \
              weight_kernels field itself encodes a wider range)"
         );
@@ -1616,6 +1734,26 @@ impl Shape {
     /// grant -- the same direction that produced wrong values and an NPU
     /// hang when a spatial gate was tried and reverted on 2026-09-02.
     fn streamed_weight_bank_grant(&self, kernels: Kernels) -> u32 {
+        // Depthwise has no streamed output-channel group to size, so the
+        // dense working set does not describe it. That formula reserves one
+        // 64-byte coefficient group per `(kernel tap, Cin)` because a dense
+        // convolution streams `Cin * Cout` filters past a resident window;
+        // depthwise carries exactly one `kh x kw` filter per channel and
+        // `weight_bytes` already reports it. At `Cin` 1344, 3x3, fp16 the
+        // real footprint is 24192 bytes -- under a single 32-KiB bank --
+        // while the dense model demands 13, above the eleven grantable, so
+        // the planner refused the shape outright.
+        //
+        // Strictly additive: across every MobileNetV2 depthwise signature
+        // and a 544..1400 sweep, **no shape that already planned changes its
+        // split** (19 of 19 identical) and five that were refused now plan.
+        // Below the refusal the dense value never reached an output anyway
+        // -- the demand branch decides these shapes and the corrections do
+        // not fire -- so this only removes a bound that was measuring the
+        // wrong thing.
+        if self.depthwise {
+            return self.weight_bank_demand(kernels);
+        }
         let weight_channels = self.weight_channels();
         let undivided = streamed_weight_bank_preference(weight_channels, kernels);
         if undivided > MAX_UNDIVIDED_WEIGHT_BANKS {
@@ -4992,6 +5130,39 @@ mod tests {
                 .collect::<Vec<_>>(),
             [5, 4, 3, 2, 1, 0, 0]
         );
+    }
+
+    #[test]
+    fn depthwise_channels_have_their_own_ceiling() {
+        // The point of splitting the constant: a depthwise shape above the
+        // dense bound builds, and a dense one at the same channel count
+        // still does not.
+        let channels = MAX_INPUT_CHANNELS + 64;
+        assert!(channels <= MAX_DEPTHWISE_CHANNELS);
+        let depthwise = Shape::depthwise_with_precision(14, 14, 1, channels, Precision::Fp16);
+        assert!(depthwise.depthwise);
+        assert_eq!(depthwise.in_channels, channels);
+        assert_eq!(depthwise.out_channels, channels);
+
+        // Both spellings agree below the dense bound, so `with_depthwise`
+        // stays the idiom there and every existing call site is unaffected.
+        assert_eq!(
+            Shape::depthwise_with_precision(32, 32, 1, 64, Precision::Fp16),
+            Shape::with_out_channels(32, 32, 1, 64, 64).with_depthwise(),
+        );
+    }
+
+    #[test]
+    #[should_panic(expected = "input channels must be 1..=512")]
+    fn dense_channels_stay_at_the_dense_ceiling() {
+        let _ = Shape::with_channels(32, 32, 1, MAX_INPUT_CHANNELS + 64);
+    }
+
+    #[test]
+    #[should_panic(expected = "input channels must be 1..=1536")]
+    fn depthwise_channels_still_have_a_ceiling() {
+        let _ =
+            Shape::depthwise_with_precision(7, 7, 1, MAX_DEPTHWISE_CHANNELS + 64, Precision::Fp16);
     }
 
     #[test]
