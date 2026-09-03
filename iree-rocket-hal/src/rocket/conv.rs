@@ -1595,7 +1595,31 @@ impl Shape {
         // `streamed_preference` staying the trigger is deliberate: below it,
         // the earlier `granted = data` computation already grants at least
         // `floor` banks on its own, so there is nothing to correct.
-        if data_banks == 1 && weight_banks > streamed_preference && weights > streamed_preference {
+        //
+        // `data > data_banks` is what makes "starved" mean starved. A single
+        // data bank arises two ways -- the grant was clamped down to it by
+        // the weights (`data.min(CBUF_BANKS - weights)`), or the feature map
+        // only ever wanted one -- and only the first is this correction's
+        // case. Testing `data_banks == 1` alone conflated them and rewrote
+        // every small-extent plan: a 7x7 or 14x14 map needs one bank at any
+        // `Cin` in the corpus, so it took the starved branch and was
+        // programmed 9/3 or 8/4 where the vendor programs 1/11. Adding the
+        // guard moves 18 spatial-sweep cases onto the vendor value (fp16
+        // 58/72 -> 64/72, int8 54/72 -> 66/72) and changes nothing in the
+        // base or 12x12 channel corpora, which never sit on this branch.
+        // No case in the 748-shape corpus gains a tile: the affected maps
+        // fit one bank with room to spare, which is why they asked for one.
+        // These are the MobileNetV2 and ResNet tail extents.
+        //
+        // Corpus-derived only -- unlike the `floor` rule above, this guard
+        // has no hardware probe behind it yet. It relaxes rather than
+        // tightens (weights end up with more banks than `floor`, never
+        // fewer), so it cannot violate the measured coefficient floor.
+        if data > data_banks
+            && data_banks == 1
+            && weight_banks > streamed_preference
+            && weights > streamed_preference
+        {
             let weight_banks = floor.min(CBUF_BANKS - 1);
             return (CBUF_BANKS - weight_banks, weight_banks);
         }

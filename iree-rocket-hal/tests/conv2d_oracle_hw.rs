@@ -3366,6 +3366,64 @@ fn group_division_split_cases() -> Vec<Conv2dCase> {
     cases
 }
 
+/// The small-extent shapes whose CBUF split changed when
+/// `demand_based_cbuf_partition`'s starvation correction learned to tell
+/// "clamped down to one data bank" from "only ever wanted one".
+///
+/// At 7x7 and 14x14 the feature map fits a single CBUF bank at every `Cin` in
+/// the corpus, so the old `data_banks == 1` trigger fired on shapes that were
+/// never starved and rewrote them from the vendor's 1/11 to 9/3 or 8/4. These
+/// are the extents the MobileNetV2 and ResNet tails run at, so the split is
+/// on the compiled path, not just in the corpus.
+///
+/// What this has to establish is that the *new* value is right on silicon --
+/// one data bank really does hold these maps -- since the host fixtures only
+/// show it is what the vendor programs. `Counting` catches a split that reads
+/// short of the resident window (the accumulator comes back low); the
+/// selector patterns catch a permutation, which uniform data cannot see.
+///
+/// Run one case per process; this sweep contaminates itself like the others.
+#[cfg(feature = "hardware-characterization")]
+#[test]
+#[ignore = "requires the RK3588 NPU"]
+fn single_data_bank_small_extent_splits_match_oracle() {
+    let mut cases = Vec::new();
+    for precision in [OraclePrecision::Fp16, OraclePrecision::Int8] {
+        let permuting = if precision == OraclePrecision::Int8 {
+            OraclePattern::SelectorsAffine { phase: 0 }
+        } else {
+            OraclePattern::Selectors { phase: 0 }
+        };
+        // 7x7 moves at every one of these; 14x14 moves at 64 and 128 only,
+        // and is here at 256 as the control that must not move.
+        for (extent, cin) in [
+            (7u32, 64u32),
+            (7, 128),
+            (7, 256),
+            (7, 320),
+            (7, 512),
+            (14, 64),
+            (14, 128),
+            (14, 256),
+        ] {
+            for pattern in [OraclePattern::Counting, permuting] {
+                cases.push(Conv2dCase {
+                    width: extent,
+                    height: extent,
+                    cin,
+                    cout: 256,
+                    kernel: [3, 3],
+                    stride: 1,
+                    padding: [1, 1],
+                    precision,
+                    pattern,
+                });
+            }
+        }
+    }
+    run_hardware_case_matrix("single-data-bank small extents", cases);
+}
+
 /// Re-measures the dense 3x3 `Cin` cap in **both** int8 output modes.
 ///
 /// The transform spec caps dense int8 3x3 at `Cin` 32 on the strength of
