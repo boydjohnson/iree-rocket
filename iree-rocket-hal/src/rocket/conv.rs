@@ -973,7 +973,32 @@ impl Shape {
     }
 
     /// `DPU_BS_OW_CFG.SIZE_E_0/1/2`, 3 for depthwise against 1 for dense.
+    ///
+    /// **This field belongs to the BS/OW stage, so it is live exactly when
+    /// that stage is not bypassed** [HW sweep, planck 2026-09-03,
+    /// `accumulator_size_e_probe`]. Measured at 32x32 Cin=384 Cout=64 k1:
+    ///
+    /// | path | `OD_BYPASS` | `size_e` 0 / 1 / 3 / 7 |
+    /// |---|---|---|
+    /// | requantized int8 | 0 | 1 is bit-exact; **3 and 7 write 1024 of 65536 bytes and hang the job** (~525 ms/tile, watchdog) |
+    /// | int32 accumulator | 1 | **all four byte-identical and bit-exact** -- the field is inert |
+    ///
+    /// Two consequences. The accumulator path's `1` is harmless whatever the
+    /// output width, because `od_bypass` is set there and nothing reads this.
+    /// And on the requantized path this value is *load-bearing*: it is one of
+    /// the few registers where a wrong value hangs the NPU rather than
+    /// returning wrong data.
+    ///
+    /// This is also why `rockchip-npu-notes/encodings/size-e-quirk.md`'s
+    /// "integer outputs stride as `size_e = 7`" does **not** transfer here:
+    /// that result is from a path that leaves the OW stage engaged. Setting 7
+    /// on the accumulator path was tried on the theory that it explained the
+    /// truncation in [`MAX_ACCUMULATOR_COEFFICIENT_BYTES_PER_CHANNEL`]; it
+    /// changed nothing, byte for byte. See [`bs_ow_size_e_override`].
     fn bs_ow_size_e(&self) -> u32 {
+        if let Some(size_e) = bs_ow_size_e_override(self.in_channels) {
+            return size_e;
+        }
         if self.depthwise { 3 } else { 1 }
     }
 
@@ -3242,6 +3267,92 @@ fn accumulator_surf_add_override(in_channels: u32) -> Option<u32> {
         .and_then(|value| value.parse().ok())
 }
 
+/// Characterization override for `DPU_BS_OW_CFG.SIZE_E_0/1/2`
+/// (`ROCKET_ACC_SIZE_E`, gated by `ROCKET_ACC_SIZE_E_MIN_CIN`).
+///
+/// Kept, like [`accumulator_surf_add_override`], because it carries a settled
+/// negative result rather than an open question. Nothing on the compiled path
+/// sets it. The `_MIN_CIN` gate exists so the harness's low-`Cin` accumulator
+/// canary stays on the shipped program; without it a sweep aborts as "device
+/// sick" instead of measuring anything.
+///
+/// **What it settled** [HW sweep, planck 2026-09-03]. `size_e` is a BS/OW-stage
+/// field and the int32-accumulator path bypasses that stage, so the override is
+/// inert there: 0, 1, 3 and 7 all produce a byte-identical, bit-exact result at
+/// 32x32 Cin=384, and all four produce the identical 6144+512-byte truncation at
+/// Cin=385. It is emphatically *not* inert on the requantized int8 path, which
+/// leaves `OD_BYPASS` clear -- 3 and 7 there write 1024 of 65536 bytes and hang
+/// the job. See [`Shape::bs_ow_size_e`] for the table.
+///
+/// So `rockchip-npu-notes/encodings/size-e-quirk.md`'s "integer outputs stride
+/// as `size_e = 7` regardless of byte width" is a fact about a path that keeps
+/// the OW stage engaged, and does not carry to this one. The accumulator
+/// truncation in [`MAX_ACCUMULATOR_COEFFICIENT_BYTES_PER_CHANNEL`] is still
+/// unexplained, and this is one more register eliminated: with `size_e` inert
+/// and `surf_add` swept, the output-side register archaeology is exhausted.
+fn bs_ow_size_e_override(in_channels: u32) -> Option<u32> {
+    let min_channels: u32 = std::env::var("ROCKET_ACC_SIZE_E_MIN_CIN")
+        .ok()
+        .and_then(|value| value.parse().ok())
+        .unwrap_or(0);
+    if in_channels < min_channels {
+        return None;
+    }
+    std::env::var("ROCKET_ACC_SIZE_E")
+        .ok()
+        .and_then(|value| value.parse().ok())
+}
+
+/// Characterization override selecting rocket-userspace's `surf_add` *rule*
+/// rather than a constant (`ROCKET_ACC_SURF_MULT`, gated by
+/// `ROCKET_ACC_SIZE_E_MIN_CIN`).
+///
+/// `gen_matmul_int8` sets `surf_add = dst_surf_stride * 8` with
+/// `dst_surf_stride = dataout_height * dataout_width` **of the task**. On a
+/// height-tiled plan every tile has a different `out_rows`, so no single
+/// `ROCKET_ACC_SURF_ADD` constant can reproduce it -- which is why the constant
+/// sweep recorded in `accumulator-per-channel-coefficient-limit` could not have
+/// found this even in principle. This applies the rule per tile.
+fn accumulator_surf_mult_override(in_channels: u32) -> Option<u32> {
+    let min_channels: u32 = std::env::var("ROCKET_ACC_SIZE_E_MIN_CIN")
+        .ok()
+        .and_then(|value| value.parse().ok())
+        .unwrap_or(0);
+    if in_channels < min_channels {
+        return None;
+    }
+    std::env::var("ROCKET_ACC_SURF_MULT")
+        .ok()
+        .and_then(|value| value.parse().ok())
+}
+
+/// Characterization override for `DPU_DATA_FORMAT.mc_surf_out`
+/// (`ROCKET_ACC_MC_SURF_OUT`, gated by `ROCKET_ACC_SIZE_E_MIN_CIN`).
+///
+/// The third knob of the accumulator output writer, and the one that makes the
+/// other two readable. `rocket-userspace/include/npu_dpu.h` documents the field
+/// as `0 = 16B/pixel one surface, 1 = 2/4 surf serial`, and its HW-validated
+/// int8 -> int32 matmul (`gen_matmul_int8`) leaves it **0** while using
+/// `size_e = 7` and `surf_add = dst_surf_stride * 8`. This crate's accumulator
+/// mode instead sets it to **1** with `size_e = 1` and `surf_add = 16`, which is
+/// a different writer, not a variant of the same one.
+///
+/// That is why sweeping `surf_add` alone and `size_e` alone both read as "no
+/// effect / no value helps": in the serial writer there is no surface stride for
+/// either field to describe. The three move together or not at all.
+fn accumulator_mc_surf_out_override(in_channels: u32) -> Option<u32> {
+    let min_channels: u32 = std::env::var("ROCKET_ACC_SIZE_E_MIN_CIN")
+        .ok()
+        .and_then(|value| value.parse().ok())
+        .unwrap_or(0);
+    if in_channels < min_channels {
+        return None;
+    }
+    std::env::var("ROCKET_ACC_MC_SURF_OUT")
+        .ok()
+        .and_then(|value| value.parse().ok())
+}
+
 /// Whether shapes the HAL knows are miscomputed on this hardware may still be
 /// planned. Only a characterization probe should set this: the guards exist
 /// because the device returns wrong data, and the point of lifting them is to
@@ -3768,7 +3879,10 @@ fn conv_2d_tile_program(
             .in_precision(precision.into())
             .out_precision(output_precision)
             .proc_precision(precision.into())
-            .mc_surf_out(Bits::new(u32::from(accumulator_output)))
+            .mc_surf_out(Bits::new(
+                accumulator_mc_surf_out_override(shape.in_channels)
+                    .unwrap_or(u32::from(accumulator_output)),
+            ))
             .bs_mul_shift_value_neg(Bits::new(bs_mul_shift))
             .build(),
     );
@@ -3946,7 +4060,17 @@ fn conv_2d_tile_program(
                 // this value is one of only four DPU registers that differ
                 // from the (exact) plain-int8 program, and the accumulator
                 // mode has no vendor capture to validate it against.
-                accumulator_surf_add_override(shape.in_channels).unwrap_or(16)
+                // `ROCKET_ACC_SURF_MULT` selects rocket-userspace's rule for
+                // the same writer instead: `dst_surf_stride * mult`, where
+                // `dst_surf_stride` is the *task's* `dataout_height *
+                // dataout_width`, not the whole image's. Its validated int8 ->
+                // int32 matmul uses mult 8. That per-task derivation is why a
+                // fixed override cannot express it on a tiled plan: each tile
+                // has its own out_rows.
+                accumulator_surf_mult_override(shape.in_channels)
+                    .map(|mult| full_out_width * rows.out_rows * mult)
+                    .or_else(|| accumulator_surf_add_override(shape.in_channels))
+                    .unwrap_or(16)
             } else {
                 full_out_width * out_height * 2 * if shape.depthwise { 2 } else { 1 }
             }))
