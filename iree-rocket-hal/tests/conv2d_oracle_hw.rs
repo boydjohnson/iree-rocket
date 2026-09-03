@@ -519,6 +519,14 @@ struct CaseExecution {
     /// they are trying to measure.
     #[cfg(feature = "hardware-characterization")]
     raw: Vec<u8>,
+    /// Non-sentinel bytes found beyond `output_len` in the output allocation,
+    /// i.e. writes past the end of the declared output. Only meaningful with
+    /// `ROCKET_PAD_OUTPUT` set, which is what makes those pages exist.
+    #[cfg(feature = "hardware-characterization")]
+    output_pad_written: usize,
+    /// The `SUBMIT` -> `PREP_BO` round trip for this case.
+    #[cfg(feature = "hardware-characterization")]
+    dispatch: std::time::Duration,
 }
 
 fn assemble_staged_accumulator_output(
@@ -666,7 +674,17 @@ fn execute_case_output_with_plan(
         let input = OwnedBuffer::from_bytes_padded(fd, &fixture.input, "INPUT", file);
         let weights = OwnedBuffer::from_bytes_padded(fd, &fixture.weights, "WEIGHTS", file);
         let bias = OwnedBuffer::from_bytes_padded(fd, &fixture.bias, "BIAS", file);
-        let output = OwnedBuffer::new(fd, output_len, file, "OUTPUT");
+        // `ROCKET_PAD_OUTPUT` is the one buffer the over-allocation test never
+        // covered: input, weights and bias were each grown and none of them
+        // changed the truncated write. The padding is still poisoned with the
+        // sentinel, so bytes the DPU writes *past* the intended output are
+        // countable rather than invisible.
+        let output = OwnedBuffer::new(
+            fd,
+            output_len + OwnedBuffer::pad_bytes("OUTPUT"),
+            file,
+            "OUTPUT",
+        );
         // A zero fill can turn an unwritten output lane into a plausible
         // convolution result. Poison the whole allocation so missing tail
         // pixels/blocks fail loudly and remain distinguishable from a real
@@ -679,12 +697,23 @@ fn execute_case_output_with_plan(
             bias: bias.buffer.dma_address,
             output: output.buffer.dma_address,
         };
-        let (programs, accumulator_tiles) = if shape.precision.writes_accumulators() {
+        let (mut programs, accumulator_tiles) = if shape.precision.writes_accumulators() {
             let staged = plan.programs_with_staged_accumulator_output(buffers);
             (staged.programs, Some(staged.tiles))
         } else {
             (plan.programs_with_buffers(buffers), None)
         };
+        // `ROCKET_TILE_LIMIT` submits only the first N tile programs. Every
+        // tile of a failing accumulator shape comes back truncated, but a
+        // multi-tile plan is several jobs in one submit, so tile 0's own
+        // prefix could be its own truncation or fallout from a later job's
+        // fault. Dropping the rest separates those.
+        if let Some(limit) = std::env::var("ROCKET_TILE_LIMIT")
+            .ok()
+            .and_then(|value| value.parse::<usize>().ok())
+        {
+            programs.truncate(limit.max(1));
+        }
         let mut command_buffers = Vec::with_capacity(programs.len());
         for program in &programs {
             let command_bytes = program.len() * mem::size_of::<u64>();
@@ -741,9 +770,21 @@ fn execute_case_output_with_plan(
         submit_jobs(fd, &jobs).map_err(|error| format!("submit: {error}"))?;
         prep_bo(fd, output.buffer.handle, PER_CASE_TIMEOUT_NS)
             .map_err(|error| format!("completion wait: {error}"))?;
-        record_dispatch_duration(dispatch_started.elapsed());
+        let dispatch = dispatch_started.elapsed();
+        record_dispatch_duration(dispatch);
 
         let raw_output = std::slice::from_raw_parts(output.buffer.host_ptr, output_len).to_vec();
+        // Bytes the DPU wrote past the output the plan declared. Zero on every
+        // healthy shape; nonzero would mean the write runs off the end rather
+        // than stopping short of it.
+        #[cfg(feature = "hardware-characterization")]
+        let output_pad_written = std::slice::from_raw_parts(
+            output.buffer.host_ptr.add(output_len),
+            output.buffer.size - output_len,
+        )
+        .iter()
+        .filter(|byte| **byte != OUTPUT_SENTINEL)
+        .count();
 
         // Everything below is off unless ROCKET_IOVA_LEDGER is set, and adds
         // no GEM buffers and no jobs. It runs here because this is the only
@@ -791,6 +832,10 @@ fn execute_case_output_with_plan(
             output,
             #[cfg(feature = "hardware-characterization")]
             raw: raw_output,
+            #[cfg(feature = "hardware-characterization")]
+            output_pad_written,
+            #[cfg(feature = "hardware-characterization")]
+            dispatch,
         })
     }
 }
@@ -4046,5 +4091,344 @@ fn accumulator_written_region_map() {
             execution.plan.tiles().len(),
             described.join(" ")
         );
+    }
+}
+
+/// Shapes for [`accumulator_truncation_anatomy`], read from
+/// `ROCKET_ANATOMY_SHAPES` as comma-separated `extent[xheight]/cin/cout/k[:kw]`
+/// entries.
+///
+/// Driving the sweep from the environment rather than a compiled-in list is
+/// deliberate: every rebuild of this binary is a cross-compile plus an scp to
+/// the board, and the open question here needs many one-axis sweeps rather
+/// than one big matrix.
+#[cfg(feature = "hardware-characterization")]
+fn anatomy_cases() -> Vec<Conv2dCase> {
+    let spec = std::env::var("ROCKET_ANATOMY_SHAPES")
+        .unwrap_or_else(|_| "32/384/64/1,32/385/64/1,32/400/64/1,32/33/64/3".to_string());
+    let precision = match std::env::var("ROCKET_ANATOMY_PRECISION").as_deref() {
+        Ok("int8") => OraclePrecision::Int8,
+        _ => OraclePrecision::Int8Accumulator,
+    };
+    spec.split(',')
+        .map(str::trim)
+        .filter(|entry| !entry.is_empty())
+        .map(|entry| {
+            let fields: Vec<&str> = entry.split('/').collect();
+            assert_eq!(
+                fields.len(),
+                4,
+                "shape spec is extent[xheight]/cin/cout/kernel[:kw], got {entry}"
+            );
+            let parse = |value: &str| -> u32 { value.parse().expect("numeric shape field") };
+            let (width, height) = match fields[0].split_once('x') {
+                Some((width, height)) => (parse(width), parse(height)),
+                None => (parse(fields[0]), parse(fields[0])),
+            };
+            let (kernel_h, kernel_w) = match fields[3].split_once(':') {
+                Some((height, width)) => (parse(height) as usize, parse(width) as usize),
+                None => (parse(fields[3]) as usize, parse(fields[3]) as usize),
+            };
+            Conv2dCase {
+                width,
+                height,
+                cin: parse(fields[1]),
+                cout: parse(fields[2]),
+                kernel: [kernel_h, kernel_w],
+                stride: 1,
+                padding: [kernel_h / 2, kernel_w / 2],
+                precision,
+                pattern: OraclePattern::Counting,
+            }
+        })
+        .collect()
+}
+
+/// One block of accumulator staging, classified.
+#[cfg(feature = "hardware-characterization")]
+struct BlockVerdict {
+    written_bytes: usize,
+    wrong_lanes: usize,
+    lanes: usize,
+}
+
+/// Reads a tile's scratch range block by block.
+///
+/// The staging layout is surface-major within a tile -- every pixel of
+/// channels 0..31, then every pixel of 32..63 -- so counting *pixels* off a
+/// byte offset, as the first region map did, mislabels a prefix of surface 0
+/// as a prefix of whole pixels. This walks 128-byte blocks and names each one
+/// by its surface and pixel instead.
+#[cfg(feature = "hardware-characterization")]
+fn classify_tile_blocks(
+    fixture: &Conv2dFixture,
+    tile: &AccumulatorOutputTile,
+    raw: &[u8],
+) -> Vec<BlockVerdict> {
+    let shape = fixture.shape;
+    let block_bytes = shape.output_atom_bytes() as usize;
+    let lane_bytes = shape.precision.output_element_bytes() as usize;
+    let lanes_per_block = block_bytes / lane_bytes;
+    let tile_pixels = tile.output_rows * tile.output_columns;
+    let blocks = tile.scratch_bytes / block_bytes;
+
+    (0..blocks)
+        .map(|block| {
+            let surface = block / tile_pixels;
+            let local_pixel = block % tile_pixels;
+            let row = tile.output_row + local_pixel / tile.output_columns;
+            let column = tile.output_column + local_pixel % tile.output_columns;
+            let start = tile.scratch_offset + block * block_bytes;
+            let bytes = &raw[start..start + block_bytes];
+            let written_bytes = bytes
+                .iter()
+                .filter(|byte| **byte != OUTPUT_SENTINEL)
+                .count();
+            let mut wrong_lanes = 0;
+            let mut lanes = 0;
+            for lane in 0..lanes_per_block {
+                let channel = surface * lanes_per_block + lane;
+                if channel >= fixture.case.cout as usize {
+                    continue;
+                }
+                lanes += 1;
+                let offset = lane * lane_bytes;
+                let got = i32::from_le_bytes(
+                    bytes[offset..offset + lane_bytes]
+                        .try_into()
+                        .expect("4-byte accumulator lane"),
+                );
+                let want = expected_output(fixture.case, channel, row, column);
+                if got != want {
+                    wrong_lanes += 1;
+                }
+            }
+            BlockVerdict {
+                written_bytes,
+                wrong_lanes,
+                lanes,
+            }
+        })
+        .collect()
+}
+
+/// Where the accumulator write stops, block by block, and whether what it did
+/// write is right.
+///
+/// The standing result is that past the per-output-channel coefficient limit
+/// each tile's staging holds a written *prefix* and then untouched
+/// `OUTPUT_SENTINEL`, with the extent varying run to run while the structure
+/// does not ([[accumulator-per-channel-coefficient-limit]]). Three things that
+/// account leaves open, and this probe measures all three at once:
+///
+///   * **Is the truncation a hung job?** A watchdog reset signals the fence
+///     with an error and `PREP_BO` returns success anyway, which is exactly
+///     what a half-written buffer looks like. The round trip separates them:
+///     healthy dispatches here run under 3.4 ms, a hung one costs ~500 ms.
+///   * **Is the prefix correct as far as it goes?** Counting sentinel bytes
+///     cannot tell "computed, then stopped" from "wrote nonsense".
+///   * **Where does it stop?** In blocks and surfaces, not in pixels-off-an-
+///     offset, which is the reading that produced the un-fittable numbers.
+///
+/// Environment: `ROCKET_ANATOMY_SHAPES` (the sweep), `ROCKET_ANATOMY_REPEATS`
+/// (default 1), `ROCKET_ANATOMY_PRECISION=int8` (the plain-int8 control),
+/// `ROCKET_TILE_LIMIT` (submit only the first N tiles) and `ROCKET_PAD_OUTPUT`
+/// (mapped pages past the output, so writes off the end are countable).
+/// Set the three `ROCKET_PAD_*` input pads to keep the device from wedging.
+#[cfg(feature = "hardware-characterization")]
+#[test]
+#[ignore = "requires the RK3588 NPU"]
+fn accumulator_truncation_anatomy() {
+    unsafe { std::env::set_var("ROCKET_ALLOW_KNOWN_BAD_SHAPES", "1") };
+    unsafe { std::env::set_var("ROCKET_ALLOW_UNBACKED_CHANNELS", "1") };
+    let _guard = NPU_TEST_LOCK
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    let file = OpenOptions::new()
+        .read(true)
+        .write(true)
+        .open(DEVICE_PATH)
+        .expect("failed to open RK3588 NPU device");
+
+    let repeats: usize = std::env::var("ROCKET_ANATOMY_REPEATS")
+        .ok()
+        .and_then(|value| value.parse().ok())
+        .unwrap_or(1);
+    let canary_enabled = std::env::var("ROCKET_ANATOMY_CANARY").as_deref() != Ok("0");
+    let cases = anatomy_cases();
+
+    println!("\n=== accumulator truncation anatomy ===");
+    if canary_enabled && !accumulator_canary_passes(&file) {
+        panic!("the NPU is sick before any measurement -- reboot the board");
+    }
+
+    for case in cases {
+        println!("\n{}", case.label());
+        let fixture = match build_fixture(case) {
+            Ok(fixture) => fixture,
+            Err(error) => {
+                println!("  fixture failed: {error}");
+                continue;
+            }
+        };
+        // `ROCKET_ANATOMY_BANKS=data/weight` forces the CBUF partition. It
+        // moves the tile row split and the weight residency together, which is
+        // the only lever that changes how the coefficient stream is staged
+        // without changing the coefficients themselves.
+        let plan = match std::env::var("ROCKET_ANATOMY_BANKS")
+            .ok()
+            .and_then(|value| {
+                let (data, weight) = value.split_once('/')?;
+                Some((data.parse::<u32>().ok()?, weight.parse::<u32>().ok()?))
+            }) {
+            Some((data_banks, weight_banks)) => {
+                ConvPlan::with_cbuf_banks(fixture.shape, case.kernel, data_banks, weight_banks)
+            }
+            None => ConvPlan::new(fixture.shape, case.kernel),
+        };
+        let staged_tiles = if fixture.shape.precision.writes_accumulators() {
+            plan.programs_with_staged_accumulator_output(Buffers {
+                input: 0,
+                weights: 0,
+                bias: 0,
+                output: 0,
+            })
+            .tiles
+        } else {
+            Vec::new()
+        };
+        let block_bytes = fixture.shape.output_atom_bytes() as usize;
+        println!(
+            "  plan: {} tiles, banks {}/{}, block={block_bytes}B, staging={}B, \
+             coefficient bytes/channel={}",
+            plan.tiles().len(),
+            plan.data_banks(),
+            plan.weight_banks(),
+            output_storage_bytes(fixture.shape, case.kernel),
+            fixture.shape.weight_channels() as usize * case.kernel[0] * case.kernel[1],
+        );
+        for (index, tile) in plan.tiles().iter().enumerate() {
+            println!(
+                "    plan tile {index}: out rows {}..{} in rows {}..{} cols {}..{}",
+                tile.rows.out_first,
+                tile.rows.out_first + tile.rows.out_rows,
+                tile.rows.in_first,
+                tile.rows.in_first + tile.rows.in_rows,
+                tile.columns.out_first,
+                tile.columns.out_first + tile.columns.out_cols,
+            );
+        }
+
+        for repeat in 0..repeats {
+            ledger_begin_case(repeat);
+            let execution = match execute_case_output(&file, &fixture) {
+                Ok(execution) => execution,
+                Err(error) => {
+                    println!("  run {repeat}: execute failed: {error}");
+                    continue;
+                }
+            };
+            if let Some(report) = ledger_case_report() {
+                println!("{report}");
+            }
+            let dispatch_ms = execution.dispatch.as_secs_f64() * 1000.0;
+            let hung = execution.dispatch >= DISPATCH_TIMEOUT_FLOOR;
+            println!(
+                "  run {repeat}: dispatch {dispatch_ms:.1} ms{}{}",
+                if hung {
+                    "  DEVICE TIMEOUT (hung job, not a shape result)"
+                } else {
+                    ""
+                },
+                if execution.output_pad_written != 0 {
+                    format!(
+                        "  wrote {} bytes PAST the output buffer",
+                        execution.output_pad_written
+                    )
+                } else {
+                    String::new()
+                },
+            );
+
+            for (index, tile) in staged_tiles.iter().enumerate() {
+                let blocks = classify_tile_blocks(&fixture, tile, &execution.raw);
+                let total_blocks = blocks.len();
+                let written: Vec<usize> = blocks
+                    .iter()
+                    .enumerate()
+                    .filter(|(_, block)| block.written_bytes != 0)
+                    .map(|(index, _)| index)
+                    .collect();
+                let tile_pixels = tile.output_rows * tile.output_columns;
+                if written.is_empty() {
+                    println!(
+                        "    tile {index}: {}x{} ({tile_pixels}px) blocks=0/{total_blocks} written",
+                        tile.output_rows, tile.output_columns
+                    );
+                    continue;
+                }
+                // Runs of consecutive written blocks. A prefix is one run
+                // starting at 0; anything else is a different structure and
+                // has to be visible rather than averaged away.
+                let mut runs: Vec<(usize, usize)> = Vec::new();
+                for block in &written {
+                    match runs.last_mut() {
+                        Some((start, length)) if *start + *length == *block => *length += 1,
+                        _ => runs.push((*block, 1)),
+                    }
+                }
+                let partial: Vec<String> = blocks
+                    .iter()
+                    .enumerate()
+                    .filter(|(_, block)| {
+                        block.written_bytes != 0 && block.written_bytes != block_bytes
+                    })
+                    .map(|(index, block)| format!("{index}({}B)", block.written_bytes))
+                    .take(4)
+                    .collect();
+                let wrong: usize = blocks.iter().map(|block| block.wrong_lanes).sum();
+                let written_lanes: usize = blocks
+                    .iter()
+                    .filter(|block| block.written_bytes != 0)
+                    .map(|block| block.lanes)
+                    .sum();
+                let wrong_written: usize = blocks
+                    .iter()
+                    .filter(|block| block.written_bytes != 0)
+                    .map(|block| block.wrong_lanes)
+                    .sum();
+                let last = *written.last().expect("nonempty");
+                let last_surface = last / tile_pixels;
+                let last_pixel = last % tile_pixels;
+                let described: Vec<String> = runs
+                    .iter()
+                    .take(4)
+                    .map(|(start, length)| format!("{start}..{}", start + length))
+                    .collect();
+                println!(
+                    "    tile {index}: {}x{} ({tile_pixels}px) scratch @{}+{}  \
+                     written {}/{total_blocks} blocks  runs[{}] {}  \
+                     last=surface {last_surface} pixel {last_pixel}  \
+                     wrong lanes {wrong_written}/{written_lanes} written, {wrong} total{}",
+                    tile.output_rows,
+                    tile.output_columns,
+                    tile.scratch_offset,
+                    tile.scratch_bytes,
+                    written.len(),
+                    runs.len(),
+                    described.join(","),
+                    if partial.is_empty() {
+                        String::new()
+                    } else {
+                        format!("  partial blocks: {}", partial.join(","))
+                    },
+                );
+            }
+
+            if canary_enabled && !accumulator_canary_passes(&file) {
+                println!("  CANARY FAILED after this run -- every row above is suspect, reboot");
+                return;
+            }
+        }
     }
 }

@@ -122,6 +122,7 @@ struct RocketConv2dConfig {
   uint32_t activationCmp = 0;
   iree_hal_rocket_Precision_enum_t precision = iree_hal_rocket_Precision_INT8;
   std::vector<iree_hal_rocket_Conv2DDimension_enum_t> runtimeDimensions;
+  std::vector<iree_hal_rocket_Conv2DQuantParam_enum_t> runtimeQuantization;
 };
 
 struct RocketFullyConnectedConfig {
@@ -340,6 +341,109 @@ std::optional<RocketConv2dConfig> buildRocketConv2dConfigFromTarget(
     }
   }
 
+  // Quantization parameters a dispatch may supply, listed separately from the
+  // dimensions above. A convolution's scale and zero points are
+  // per-convolution calibration data while an executable target is shared by
+  // every dispatch that imports it, so a requantized int8 conv can only be
+  // served by one executable if these arrive as push constants.
+  //
+  // The payload is a bit pattern rather than a number, because the schema
+  // fields are uint32 and neither value fits that unsigned reading: the scale
+  // is an IEEE-754 binary32 and a zero point is a signed int32. See
+  // Conv2DQuantParam in rocket_executable_def.fbs, which is the one statement
+  // of that convention; this serializer and rocket-hal-driver's
+  // RuntimeConv2dQuantParam are its two implementations.
+  std::array<bool, 3> isRuntimeQuantParam = {};
+  if (Attribute runtimeQuantizationAttr = config.get("runtime_quantization")) {
+    auto runtimeQuantization =
+        llvm::dyn_cast<ArrayAttr>(runtimeQuantizationAttr);
+    if (!runtimeQuantization) {
+      diagFn() << "rocket backend: optional 'runtime_quantization' config "
+                  "value must be an array of strings";
+      return std::nullopt;
+    }
+    if (!runtimeQuantization.empty() &&
+        shape.precision != iree_hal_rocket_Precision_INT8) {
+      diagFn() << "rocket backend: 'runtime_quantization' is only meaningful "
+                  "for requantized int8 convolution -- fp16 does not "
+                  "requantize, and int8_accumulator bypasses the stage that "
+                  "would consume these";
+      return std::nullopt;
+    }
+
+    for (Attribute paramAttr : runtimeQuantization) {
+      auto paramName = llvm::dyn_cast<StringAttr>(paramAttr);
+      if (!paramName) {
+        diagFn() << "rocket backend: every 'runtime_quantization' entry must "
+                    "be a string";
+        return std::nullopt;
+      }
+
+      std::optional<iree_hal_rocket_Conv2DQuantParam_enum_t> param;
+      StringRef name = paramName.getValue();
+      if (name == "output_scale") {
+        param = iree_hal_rocket_Conv2DQuantParam_OUTPUT_SCALE;
+      } else if (name == "input_zero_point") {
+        param = iree_hal_rocket_Conv2DQuantParam_INPUT_ZERO_POINT;
+      } else if (name == "output_zero_point") {
+        param = iree_hal_rocket_Conv2DQuantParam_OUTPUT_ZERO_POINT;
+      } else {
+        // 'input_scale'/'weights_scale' are deliberately absent. They reach
+        // the hardware only through pack_int8_bias_to_bs's bias
+        // normalization and through their product with the output scale, and
+        // the requantized int8 target keeps both at 1.0 so the single runtime
+        // output scale carries the whole requantization ratio.
+        diagFn() << "rocket backend: unknown runtime Conv2D quantization "
+                    "parameter '"
+                 << name << "'";
+        return std::nullopt;
+      }
+
+      size_t paramIndex = static_cast<size_t>(*param);
+      if (isRuntimeQuantParam[paramIndex]) {
+        diagFn() << "rocket backend: duplicate runtime Conv2D quantization "
+                    "parameter '"
+                 << name << "'";
+        return std::nullopt;
+      }
+      isRuntimeQuantParam[paramIndex] = true;
+      shape.runtimeQuantization.push_back(*param);
+    }
+  }
+
+  // The same template obligation the dimensions carry: a field a dispatch
+  // supplies must be zero here, so a missing push constant cannot be mistaken
+  // for calibration data. Zero is not a legal output scale, which is what
+  // makes it usable as that field's sentinel -- unlike the zero points, where
+  // zero is an ordinary value and only the list says who owns it.
+  struct SettableQuantParam {
+    iree_hal_rocket_Conv2DQuantParam_enum_t param;
+    StringRef name;
+    bool isZero;
+  };
+  const std::array<SettableQuantParam, 3> quantParams = {{
+      {iree_hal_rocket_Conv2DQuantParam_OUTPUT_SCALE, "output_scale",
+       shape.outputScale == 0.0f},
+      {iree_hal_rocket_Conv2DQuantParam_INPUT_ZERO_POINT, "input_zero_point",
+       shape.inputZeroPoint == 0},
+      {iree_hal_rocket_Conv2DQuantParam_OUTPUT_ZERO_POINT, "output_zero_point",
+       shape.outputZeroPoint == 0},
+  }};
+  for (const auto &[param, name, isZero] : quantParams) {
+    const bool isRuntime = isRuntimeQuantParam[static_cast<size_t>(param)];
+    if (isRuntime && !isZero) {
+      diagFn() << "rocket backend: runtime Conv2D quantization parameter '"
+               << name << "' must use 0 as its executable template value";
+      return std::nullopt;
+    }
+    if (!isRuntime && param == iree_hal_rocket_Conv2DQuantParam_OUTPUT_SCALE &&
+        isZero) {
+      diagFn() << "rocket backend: 'output_scale' is zero and not listed in "
+                  "'runtime_quantization'";
+      return std::nullopt;
+    }
+  }
+
   return shape;
 }
 
@@ -497,11 +601,19 @@ public:
     int64_t pipelineConstantCount = exportOp.getLayoutAttr().getConstants();
     size_t runtimeDimensionCount =
         convShape ? convShape->runtimeDimensions.size() : 0;
-    if (pipelineConstantCount != static_cast<int64_t>(runtimeDimensionCount)) {
+    size_t runtimeQuantizationCount =
+        convShape ? convShape->runtimeQuantization.size() : 0;
+    // Dimensions first, then quantization parameters -- one flat push-constant
+    // sequence in that order, which is the order rocket-hal-driver's
+    // `Conv2dExecutable::resolve_shape` consumes them in.
+    size_t runtimeConstantCount =
+        runtimeDimensionCount + runtimeQuantizationCount;
+    if (pipelineConstantCount != static_cast<int64_t>(runtimeConstantCount)) {
       return exportOp.emitOpError()
              << "Rocket pipeline layout declares " << pipelineConstantCount
              << " push constants, but the executable target declares "
-             << runtimeDimensionCount << " runtime dimensions";
+             << runtimeDimensionCount << " runtime dimensions and "
+             << runtimeQuantizationCount << " runtime quantization parameters";
     }
 
     FlatbufferBuilder builder;
@@ -531,6 +643,16 @@ public:
         if (!runtimeDimensionsRef) {
           return variantOp.emitOpError()
                  << "failed to build Rocket runtime-dimension vector";
+        }
+      }
+      iree_hal_rocket_Conv2DQuantParam_vec_ref_t runtimeQuantizationRef = 0;
+      if (!convShape->runtimeQuantization.empty()) {
+        runtimeQuantizationRef = iree_hal_rocket_Conv2DQuantParam_vec_create(
+            builder, convShape->runtimeQuantization.data(),
+            convShape->runtimeQuantization.size());
+        if (!runtimeQuantizationRef) {
+          return variantOp.emitOpError()
+                 << "failed to build Rocket runtime-quantization vector";
         }
       }
 
@@ -578,7 +700,10 @@ public:
            iree_hal_rocket_Conv2DDef_runtime_dimensions_add(
                builder, runtimeDimensionsRef)) ||
           iree_hal_rocket_Conv2DDef_pad_top_add(builder, 0) ||
-          iree_hal_rocket_Conv2DDef_pad_left_add(builder, 0)) {
+          iree_hal_rocket_Conv2DDef_pad_left_add(builder, 0) ||
+          (runtimeQuantizationRef &&
+           iree_hal_rocket_Conv2DDef_runtime_quantization_add(
+               builder, runtimeQuantizationRef))) {
         return variantOp.emitOpError()
                << "failed to populate Rocket convolution definition";
       }

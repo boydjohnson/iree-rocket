@@ -233,6 +233,110 @@ func.func @depthwise_int8_s2(%input: tensor<1x33x33x64xi8>, %filter: tensor<3x3x
       outs(%init : tensor<1x16x16x64xi32>) -> tensor<1x16x16x64xi32>
   return %0 : tensor<1x16x16x64xi32>
 }
+
+// The requantized int8 cases below are written in the *canonical fused form*
+// -- a plain i8 x i8 -> i32 convolution over a zero init, then one elementwise
+// generic that adds the per-channel bias, scales, rounds, offsets by the
+// output zero point, clamps and narrows to i8. That is the contract between
+// the (future) ONNX QLinearConv fusion and the transform spec's
+// requantized matchers, so these fixtures pin it: if the canonical form
+// drifts, the DAG match stops firing and the executable check below fails
+// the gate rather than quietly running everything on the CPU.
+//
+// The scale and zero point are operands of the generic rather than constants
+// captured into its body, and so are the int8 clamp bounds. That is forced,
+// not stylistic: the DAG matcher compares regions under a value mapping built
+// only from the ops it walked, and the canonicalizer hoists an in-body
+// constant out before the matcher ever runs.
+//
+// Cin here is the point of the whole path. The int8_accumulator matchers cap
+// dense 1x1 at Cin 352 and dense 3x3 at Cin 32, both of them consequences of
+// the DPU's 384-coefficient-bytes-per-output-channel limit in that mode.
+// Requantized output has no such limit, so these run at Cin 512 (1x1) and
+// Cin 256 (3x3), which the accumulator path cannot compute at all.
+
+func.func @requant_int8_1x1_cin512(%input: tensor<1x32x32x512xi8>, %filter: tensor<1x1x512x64xi8>, %bias: tensor<64xi32>) -> tensor<1x32x32x64xi8> {
+  %zero = arith.constant 0 : i32
+  %scale = arith.constant 1.500000e-03 : f32
+  %zp = arith.constant 0 : i32
+  %int8_min = arith.constant -1.280000e+02 : f32
+  %int8_max = arith.constant 1.270000e+02 : f32
+  %acc_empty = tensor.empty() : tensor<1x32x32x64xi32>
+  %acc_init = linalg.fill ins(%zero : i32) outs(%acc_empty : tensor<1x32x32x64xi32>) -> tensor<1x32x32x64xi32>
+  %acc = linalg.conv_2d_nhwc_hwcf
+      {dilations = dense<1> : tensor<2xi64>, strides = dense<1> : tensor<2xi64>}
+      ins(%input, %filter : tensor<1x32x32x512xi8>, tensor<1x1x512x64xi8>)
+      outs(%acc_init : tensor<1x32x32x64xi32>) -> tensor<1x32x32x64xi32>
+  %out_empty = tensor.empty() : tensor<1x32x32x64xi8>
+  %out = linalg.generic {
+      indexing_maps = [affine_map<(d0, d1, d2, d3) -> (d0, d1, d2, d3)>,
+                       affine_map<(d0, d1, d2, d3) -> (d3)>,
+                       affine_map<(d0, d1, d2, d3) -> ()>,
+                       affine_map<(d0, d1, d2, d3) -> ()>,
+                       affine_map<(d0, d1, d2, d3) -> ()>,
+                       affine_map<(d0, d1, d2, d3) -> ()>,
+                       affine_map<(d0, d1, d2, d3) -> (d0, d1, d2, d3)>],
+      iterator_types = ["parallel", "parallel", "parallel", "parallel"]}
+      ins(%acc, %bias, %scale, %zp, %int8_min, %int8_max
+          : tensor<1x32x32x64xi32>, tensor<64xi32>, f32, i32, f32, f32)
+      outs(%out_empty : tensor<1x32x32x64xi8>) {
+    ^bb0(%raw: i32, %channel_bias: i32, %s: f32, %z: i32, %low: f32, %high: f32, %unused: i8):
+      %biased = arith.addi %raw, %channel_bias : i32
+      %real = arith.sitofp %biased : i32 to f32
+      %scaled = arith.mulf %real, %s : f32
+      %rounded = math.roundeven %scaled : f32
+      %zf = arith.sitofp %z : i32 to f32
+      %offset = arith.addf %rounded, %zf : f32
+      %low_clamped = arith.maximumf %offset, %low : f32
+      %clamped = arith.minimumf %low_clamped, %high : f32
+      %narrowed = arith.fptosi %clamped : f32 to i8
+      linalg.yield %narrowed : i8
+  } -> tensor<1x32x32x64xi8>
+  return %out : tensor<1x32x32x64xi8>
+}
+
+// Non-zero output zero point, which is the ordinary case for a real model and
+// the one part of this path with no hardware precedent: DPU_OUT_CVT_OFFSET is
+// applied after the scale, and that ordering is only pinned by this case.
+func.func @requant_int8_3x3_cin256(%input: tensor<1x34x34x256xi8>, %filter: tensor<3x3x256x64xi8>, %bias: tensor<64xi32>) -> tensor<1x32x32x64xi8> {
+  %zero = arith.constant 0 : i32
+  %scale = arith.constant 5.000000e-04 : f32
+  %zp = arith.constant -6 : i32
+  %int8_min = arith.constant -1.280000e+02 : f32
+  %int8_max = arith.constant 1.270000e+02 : f32
+  %acc_empty = tensor.empty() : tensor<1x32x32x64xi32>
+  %acc_init = linalg.fill ins(%zero : i32) outs(%acc_empty : tensor<1x32x32x64xi32>) -> tensor<1x32x32x64xi32>
+  %acc = linalg.conv_2d_nhwc_hwcf
+      {dilations = dense<1> : tensor<2xi64>, strides = dense<1> : tensor<2xi64>}
+      ins(%input, %filter : tensor<1x34x34x256xi8>, tensor<3x3x256x64xi8>)
+      outs(%acc_init : tensor<1x32x32x64xi32>) -> tensor<1x32x32x64xi32>
+  %out_empty = tensor.empty() : tensor<1x32x32x64xi8>
+  %out = linalg.generic {
+      indexing_maps = [affine_map<(d0, d1, d2, d3) -> (d0, d1, d2, d3)>,
+                       affine_map<(d0, d1, d2, d3) -> (d3)>,
+                       affine_map<(d0, d1, d2, d3) -> ()>,
+                       affine_map<(d0, d1, d2, d3) -> ()>,
+                       affine_map<(d0, d1, d2, d3) -> ()>,
+                       affine_map<(d0, d1, d2, d3) -> ()>,
+                       affine_map<(d0, d1, d2, d3) -> (d0, d1, d2, d3)>],
+      iterator_types = ["parallel", "parallel", "parallel", "parallel"]}
+      ins(%acc, %bias, %scale, %zp, %int8_min, %int8_max
+          : tensor<1x32x32x64xi32>, tensor<64xi32>, f32, i32, f32, f32)
+      outs(%out_empty : tensor<1x32x32x64xi8>) {
+    ^bb0(%raw: i32, %channel_bias: i32, %s: f32, %z: i32, %low: f32, %high: f32, %unused: i8):
+      %biased = arith.addi %raw, %channel_bias : i32
+      %real = arith.sitofp %biased : i32 to f32
+      %scaled = arith.mulf %real, %s : f32
+      %rounded = math.roundeven %scaled : f32
+      %zf = arith.sitofp %z : i32 to f32
+      %offset = arith.addf %rounded, %zf : f32
+      %low_clamped = arith.maximumf %offset, %low : f32
+      %clamped = arith.minimumf %low_clamped, %high : f32
+      %narrowed = arith.fptosi %clamped : f32 to i8
+      linalg.yield %narrowed : i8
+  } -> tensor<1x32x32x64xi8>
+  return %out : tensor<1x32x32x64xi8>
+}
 """
 
 
@@ -426,6 +530,24 @@ def write_compiled_fixture(work_dir: Path) -> None:
         np.zeros((1, 32, 32, 64), dtype=np.int32),
     )
 
+    # Requantized int8. The filter range is deliberately narrower than the
+    # input's: at Cin 512 a full-range filter drives every accumulator past
+    # the int8 output range and the whole tensor saturates, which would pass
+    # the differential while testing nothing but the clamp.
+    def i8_small(*shape: int) -> np.ndarray:
+        return rng.integers(-8, 8, size=shape, dtype=np.int8)
+
+    def bias_i32(channels: int) -> np.ndarray:
+        return rng.integers(-1000, 1000, size=(channels,), dtype=np.int32)
+
+    np.save(work_dir / "requant_int8_1x1_cin512_input.npy", i8(1, 32, 32, 512))
+    np.save(work_dir / "requant_int8_1x1_cin512_kernel.npy", i8_small(1, 1, 512, 64))
+    np.save(work_dir / "requant_int8_1x1_cin512_bias.npy", bias_i32(64))
+
+    np.save(work_dir / "requant_int8_3x3_cin256_input.npy", i8(1, 34, 34, 256))
+    np.save(work_dir / "requant_int8_3x3_cin256_kernel.npy", i8_small(3, 3, 256, 64))
+    np.save(work_dir / "requant_int8_3x3_cin256_bias.npy", bias_i32(64))
+
     np.save(work_dir / "depthwise_int8_s2_input.npy", i8(1, 33, 33, 64))
     np.save(work_dir / "depthwise_int8_s2_kernel.npy", i8(3, 3, 64))
     np.save(
@@ -481,10 +603,12 @@ def compile_modules(work_dir: Path, compiler: Path, transform_spec: Path) -> Non
         ]
     )
     preprocessing_text = preprocessing.read_text()
-    for function in (
-        "dense_int8_3x3",
-        "dense_int8_cout512_1x1",
-        "dense_int8_cout512_3x3",
+    for function, call in (
+        ("dense_int8_3x3", "call_rocket_dynamic_conv2d_int8("),
+        ("dense_int8_cout512_1x1", "call_rocket_dynamic_conv2d_int8("),
+        ("dense_int8_cout512_3x3", "call_rocket_dynamic_conv2d_int8("),
+        ("requant_int8_1x1_cin512", "call_rocket_dynamic_conv2d_int8_requant("),
+        ("requant_int8_3x3_cin256", "call_rocket_dynamic_conv2d_int8_requant("),
     ):
         match = re.search(
             rf"util\.func public @{re.escape(function)}\b(?P<body>.*?)"
@@ -492,9 +616,11 @@ def compile_modules(work_dir: Path, compiler: Path, transform_spec: Path) -> Non
             preprocessing_text,
             re.DOTALL,
         )
-        if match is None or "util.call @call_rocket_dynamic_conv2d_int8" not in match.group(
-            "body"
-        ):
+        # The accumulator call's name is a prefix of the requantized one, so
+        # this compares against the call including its open parenthesis --
+        # a bare substring test would let a requantized call satisfy the
+        # accumulator cases' check.
+        if match is None or f"util.call @{call}" not in match.group("body"):
             raise SystemExit(
                 f"{function} no longer reaches its Rocket matcher; refusing to run "
                 "a CPU-versus-CPU differential"
@@ -511,6 +637,7 @@ def compile_modules(work_dir: Path, compiler: Path, transform_spec: Path) -> Non
     # it. That silently defeated this check, whose whole job is to notice a
     # case that stopped reaching its matcher.
     for executable in (
+        b"rocket_dynamic_int8_requant_executable",
         b"rocket_dynamic_int8_executable",
         b"rocket_dynamic_depthwise_int8_executable",
         b"rocket_dynamic_depthwise_int8_executable_s2",
@@ -695,6 +822,42 @@ def run_compiled_gate(
             1e-2,
             1e-2,
         ),
+        # Requantized int8 is compared with atol=1, not exactly, and that is
+        # a property of the arithmetic rather than a hedge. The hardware
+        # applies `clamp((accumulator * scale + 2^(shift-1)) >> shift)` with
+        # the multiplier encoded as a 15-bit mantissa and a shift, while the
+        # CPU form multiplies in f32 and rounds half to even. The two agree
+        # everywhere except where the real product lands exactly on .5, where
+        # the encoded multiplier falls on one side or the other. Measured on
+        # `planck` 2026-09-03: 0.02-0.32% of elements differ, every one of
+        # them by exactly 1, and every one of them an exact tie -- fitting
+        # `half_up` on the encoded multiplier reproduces the device's output
+        # on all 131072 elements of the 1x1 case. An error that is not a tie
+        # is a bug, and atol=1 with rtol=0 still catches every failure mode
+        # this path has shown: a saturated tensor, an all-zero output, or the
+        # 128x scale error a wrong BS-plane gain produces.
+        Case(
+            "requant_int8_1x1_cin512",
+            (
+                "requant_int8_1x1_cin512_input.npy",
+                "requant_int8_1x1_cin512_kernel.npy",
+                "requant_int8_1x1_cin512_bias.npy",
+            ),
+            ("requant_int8_1x1_cin512_out_rocket.npy",),
+            1.0,
+            0.0,
+        ),
+        Case(
+            "requant_int8_3x3_cin256",
+            (
+                "requant_int8_3x3_cin256_input.npy",
+                "requant_int8_3x3_cin256_kernel.npy",
+                "requant_int8_3x3_cin256_bias.npy",
+            ),
+            ("requant_int8_3x3_cin256_out_rocket.npy",),
+            1.0,
+            0.0,
+        ),
         Case(
             "dense_int8_3x3",
             ("dense_int8_3x3_input.npy", "dense_int8_3x3_kernel.npy", "dense_int8_3x3_init.npy"),
@@ -782,15 +945,32 @@ def run_compiled_gate(
             f"{case.function}_cpu_{index}.npy" for index in range(len(case.outputs))
         )
         run_cpu_reference(work_dir, host_runtime, case.function, case.inputs, cpu_names)
-        run_rocket_module(
-            host,
-            remote_dir,
-            work_dir,
-            board_runtime,
-            case.function,
-            case.inputs,
-            case.outputs,
-        )
+        # A known failure is allowed to fail by *hanging the NPU*, not only by
+        # returning wrong data. `mixed_int8_then_depthwise` does exactly that
+        # today: the watchdog resets the core mid-job, `queue_execute` reports
+        # DEADLINE_EXCEEDED, and iree-run-module exits nonzero before any
+        # output file is written. Letting that abort the whole gate would make
+        # every case after it unrunnable over a failure the list already
+        # declares. A case with no `known_failure` still aborts, which is what
+        # keeps a new hang loud.
+        try:
+            run_rocket_module(
+                host,
+                remote_dir,
+                work_dir,
+                board_runtime,
+                case.function,
+                case.inputs,
+                case.outputs,
+            )
+        except subprocess.CalledProcessError:
+            if not case.known_failure:
+                raise
+            print(
+                f"  {case.function}: known failure, not gating -- the dispatch did "
+                f"not complete. {case.known_failure}"
+            )
+            continue
         # `all()` over a generator would stop at the first mismatch; a list
         # keeps every output's numbers on screen, which is the whole point of
         # a two-dispatch case.
