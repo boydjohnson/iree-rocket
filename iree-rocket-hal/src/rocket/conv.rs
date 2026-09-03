@@ -212,27 +212,19 @@ pub const MAX_DEPTHWISE_CHANNELS: u32 = 1536;
 
 /// Most channels a **depthwise** int8 convolution may carry.
 ///
-/// Left at the dense 512 on purpose, and **this bound does not make int8
-/// depthwise correct** -- a channel ceiling is the wrong shape of guard for
-/// what actually limits that path.
+/// Same 1536 as the fp16 [`MAX_DEPTHWISE_CHANNELS`] and measured the same
+/// way: `conv_depthwise_int8_exact_hw.rs::int8_depthwise_exact_above_the_dense_ceiling`
+/// walks 256..1536 per element on RK3588 and is exact throughout.
 ///
-/// Sweeping it on 2026-09-02 (`conv_depthwise_int8_exact_hw.rs`) found a
-/// cliff at 34x34: exact to `Cin` 288, wrong from 320. But the channel count
-/// is a proxy. 288 is the last count whose plan fits **one** row tile at
-/// that extent and 320 is the first needing two, and
-/// `int8_depthwise_multi_tile_is_wrong` separates them: `Cin` 64 is exact at
-/// 34x34 (1 tile) and **wrong at 130x130 (4 tiles)**, `Cin` 240 exact at
-/// 34x34 and wrong at 70x70. So int8 depthwise is wrong whenever the
-/// planner splits rows, at any channel count, and every int8 depthwise test
-/// that predates the sweep (`Cin` 48, 64, 112, 128, 240 at 34x34) is
-/// single-tile, which is why none of them saw it.
-///
-/// fp16 depthwise is unaffected -- its own sweep is exact at 112x112 with
-/// four row tiles -- so this is specific to the int8 path.
-///
-/// Raising this constant would be beside the point; the fix is the row
-/// tiling, and until it lands the real precondition is "one tile".
-pub const MAX_INT8_DEPTHWISE_CHANNELS: u32 = 512;
+/// This bound was 512 for a day, on the strength of a sweep that appeared to
+/// show a cliff at `Cin` 320. That cliff was an artifact of the harness, not
+/// the device -- see
+/// [`ConvPlan::programs_with_buffers`] and
+/// [`ConvPlan::programs_with_staged_accumulator_output`] for the two ways a
+/// depthwise accumulator dispatch can be assembled wrongly and still look
+/// like a hardware channel limit. The int8 depthwise path is exact at every
+/// channel count and every tile count measured.
+pub const MAX_INT8_DEPTHWISE_CHANNELS: u32 = 1536;
 
 /// `CNA_DATA_SIZE1.datain_channel_real` counts `Cin - 1` modulo this, even
 /// though the field is 14 bits wide and could hold far more.
@@ -1571,6 +1563,12 @@ impl Shape {
     /// Output geometry, not input: at stride greater than one the two differ.
     /// Requantized output uses one 16-byte NC1HWC2 atom per pixel; bypassed
     /// i32 output retains CORE's 32-channel accumulator block (128 bytes).
+    ///
+    /// This is [`Shape::output_channel_block_bytes`], what the DPU is
+    /// *programmed* with, and not [`Shape::output_atom_bytes`], the write
+    /// atom -- the two differ only for depthwise accumulator output. Shared
+    /// image placement is not the path for that case at all; see
+    /// [`ConvPlan::programs_with_staged_accumulator_output`].
     pub fn output_row_stride(&self, kernels: Kernels) -> u32 {
         self.output_width(kernels) * self.output_channel_block_bytes()
     }
@@ -2707,6 +2705,20 @@ impl ConvPlan {
     /// arithmetic for the caller to do. Submit each program as its own job and
     /// wait for its fence before the next -- tiles reload their own weights,
     /// so no CBUF state has to survive between them.
+    /// **Not for accumulator output.** These programs place every tile into
+    /// a shared full-image surface, which
+    /// [`ConvPlan::programs_with_staged_accumulator_output`] explains is not
+    /// a placement an accumulator tile can use: it keeps the full output
+    /// geometry in its destination surface stride and row notch, so base,
+    /// stride and notch have to move together. `rocket-hal-driver` picks the
+    /// staged entry point for `Int8Accumulator` for exactly this reason.
+    ///
+    /// Using this one anyway is not a loud failure -- a single-tile plan
+    /// multiplies every offset by zero and looks perfectly correct, and a
+    /// multi-tile one returns plausible wrong numbers. A test harness that
+    /// made this substitution produced a clean, reproducible, and entirely
+    /// spurious correlation between "the planner split rows" and "the device
+    /// is wrong".
     pub fn programs_with_buffers(&self, buffers: Buffers) -> Vec<Vec<RegCmd>> {
         self.programs()
             .into_iter()
