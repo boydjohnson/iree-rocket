@@ -62,6 +62,11 @@ pub struct ShapeFixture {
     pub pad_h: u32,
     pub pad_w: u32,
     pub stride: u32,
+    /// Absent from every corpus built before `build_vendor_fixtures.py`
+    /// grew `--depthwise`, hence the default rather than a re-generation of
+    /// the dense fixtures.
+    #[serde(default)]
+    pub depthwise: bool,
 }
 
 #[derive(Deserialize)]
