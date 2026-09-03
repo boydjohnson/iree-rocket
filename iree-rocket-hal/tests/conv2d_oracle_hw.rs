@@ -3366,6 +3366,71 @@ fn group_division_split_cases() -> Vec<Conv2dCase> {
     cases
 }
 
+/// The horizontally tiled shapes whose column partition moved when
+/// `dispatch_optimal_column_widths` replaced an even division.
+///
+/// A column tile's row capacity is a floor function of its width, so two
+/// equal columns can both land just under the same capacity step and waste
+/// the slack. Dividing unevenly pushes one of them over the step and buys it
+/// a whole extra row per tile. Across the corpora this is -14.6% dispatches
+/// with no case getting worse and no case changing its column *count*.
+///
+/// The column count is what governs how much kernel halo gets re-read, and
+/// it is unchanged here -- so unlike the CBUF split work, this moves only
+/// the tile geometry, not the CBUF programming. What still has to be proved
+/// on silicon is that these uneven partitions are *correct*: every column
+/// tile programs its own `datain_width`, `surf_stride` and grouped-line
+/// mode, and an off-by-one in a partition the planner never emitted before
+/// would show up as a corrupt column seam.
+///
+/// `Counting` catches a tile reading short of its window; the selector
+/// patterns catch a column landing at the wrong offset, which uniform data
+/// cannot see. The spread covers 2-, 3-, 4- and 5-column partitions in both
+/// precisions. Shapes above ~450 dispatches are left to the fixture corpus.
+///
+/// Run one case per process.
+#[cfg(feature = "hardware-characterization")]
+#[test]
+#[ignore = "requires the RK3588 NPU"]
+fn column_partition_widths_match_oracle() {
+    let mut cases = Vec::new();
+    for (extent, cin, int8) in [
+        (112u32, 384u32, false),
+        (112, 448, false),
+        (160, 320, false),
+        (128, 448, false),
+        (160, 512, true),
+        (224, 384, true),
+        (224, 448, true),
+        (192, 512, true),
+    ] {
+        let precision = if int8 {
+            OraclePrecision::Int8
+        } else {
+            OraclePrecision::Fp16
+        };
+        let permuting = if int8 {
+            OraclePattern::SelectorsAffine { phase: 0 }
+        } else {
+            OraclePattern::Selectors { phase: 0 }
+        };
+        for pattern in [OraclePattern::Counting, permuting] {
+            cases.push(Conv2dCase {
+                width: extent,
+                height: extent,
+                cin,
+                cout: 256,
+                kernel: [3, 3],
+                stride: 1,
+                padding: [1, 1],
+                precision,
+                pattern,
+            });
+        }
+    }
+    run_hardware_case_matrix("uneven column partitions", cases);
+}
+
 /// The shapes whose CBUF split moved when `streamed_weight_bank_grant`
 /// learned the vendor's kernel-window residency gate.
 ///

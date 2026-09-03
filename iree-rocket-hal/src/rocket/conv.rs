@@ -2486,16 +2486,27 @@ impl ConvPlan {
 
         let output_width = shape.output_width(kernels);
         for column_count in 2..=output_width {
-            let output_column_widths = balanced_column_widths(output_width, column_count);
-            if let Some(tiles) = plan_grid(shape, kernels, &output_column_widths, data_banks) {
-                return ConvPlan {
-                    shape,
-                    kernels,
-                    data_banks,
-                    weight_banks,
-                    output_column_widths,
-                    tiles,
-                };
+            // Fewest columns wins, as before -- every extra column re-reads a
+            // kernel halo, and the vendor's own count is reproduced by this
+            // search at all 58 width-tiled cases in the spatial corpora. What
+            // changed is how the width is *divided* between them; see
+            // `dispatch_optimal_column_widths`. `balanced_column_widths` stays
+            // as the fallback for the shapes the search below declines.
+            let candidates = [
+                dispatch_optimal_column_widths(shape, kernels, column_count, data_banks),
+                Some(balanced_column_widths(output_width, column_count)),
+            ];
+            for output_column_widths in candidates.into_iter().flatten() {
+                if let Some(tiles) = plan_grid(shape, kernels, &output_column_widths, data_banks) {
+                    return ConvPlan {
+                        shape,
+                        kernels,
+                        data_banks,
+                        weight_banks,
+                        output_column_widths,
+                        tiles,
+                    };
+                }
             }
         }
 
@@ -2807,6 +2818,110 @@ fn captured_column_partition(shape: Shape, kernels: Kernels) -> Option<Vec<u32>>
         ([11, 11], 64) => Some(vec![59, 54, 54, 54, 35]),
         _ => None,
     }
+}
+
+/// Largest output width this planner will run the column-width search over.
+///
+/// The search is `O(width^2 * columns)`; at this bound that is a few million
+/// cheap integer operations once per compiled convolution. Anything wider
+/// falls back to an even division, which is what the planner did everywhere
+/// before the search existed.
+const MAX_COLUMN_SEARCH_WIDTH: u32 = 1024;
+
+/// Column widths for exactly `column_count` tiles that minimise the total
+/// dispatch count.
+///
+/// Dividing the row **evenly** is the obvious choice and it is a bad one,
+/// because a column tile's row capacity is a *floor* function of its width:
+/// `data_banks * 32768 / row_bytes`. Two equal columns can both land just
+/// under the same capacity step and waste the slack, where one narrower and
+/// one wider column push the narrow one over the step and buy it a whole
+/// extra row per tile. The vendor exploits this and we did not -- at 128x128
+/// `Cin` 512 fp16 it splits the 128 output columns **73/55**, not 64/64, and
+/// the 55-wide tile then holds 4 input rows against 3.
+///
+/// Measured over the 58 width-tiled cases in the spatial corpora (six
+/// extents plus 128/160/192, both precisions), counting dispatches with the
+/// residency model that reproduces the vendor's own `datain_height` 144/144:
+///
+/// ```text
+///   even division (what this replaces)   30974 dispatches
+///   the vendor's own partitions          27267
+///   this search                          26213
+/// ```
+///
+/// Never worse than an even division (40 better, 18 equal) and never worse
+/// than the vendor either (15 better, 43 equal). It reproduces the vendor's
+/// exact widths only once, which is fine: the goal is dispatch count, not
+/// byte-identical partitions, and the column *count* -- the term that decides
+/// how much halo gets re-read -- is unchanged and already matches the vendor
+/// everywhere.
+///
+/// Deliberately **not** letting the column count float. Minimising dispatches
+/// over partitions of every size prefers many narrow columns (it halves the
+/// count again), but each column re-reads a `kernel_width - 1` halo, so that
+/// trades DMA traffic for dispatches with no measurement behind it. Holding
+/// the count fixed keeps this change to the one axis the corpus can settle.
+fn dispatch_optimal_column_widths(
+    shape: Shape,
+    kernels: Kernels,
+    column_count: u32,
+    data_banks: u32,
+) -> Option<Vec<u32>> {
+    let output_width = shape.output_width(kernels);
+    if column_count < 2 || column_count > output_width || output_width > MAX_COLUMN_SEARCH_WIDTH {
+        return None;
+    }
+    let halo = shape.kernel_programming(kernels).height - 1;
+    let row_tiles = |out_first: u32, out_cols: u32| -> Option<u32> {
+        let column = ColumnTile::from_output_range(shape, kernels, out_first, out_cols);
+        let rows = shape
+            .max_tile_input_rows_for_width_and_data_banks(column.in_cols, data_banks)
+            .min(shape.max_feature_grain_input_rows(kernels));
+        // A column that cannot hold a whole kernel window produces no output
+        // row at all; `min_tiles_for_width_and_data_banks` clamps that to one
+        // row rather than reporting it, so screen for it here.
+        (rows > halo)
+            .then(|| shape.min_tiles_for_width_and_data_banks(kernels, column.in_cols, data_banks))
+    };
+
+    let width = output_width as usize;
+    let columns = column_count as usize;
+    // best[pos][used]: fewest dispatches covering output columns pos.. using
+    // exactly `used` more column tiles. choice[pos][used] is the width taken.
+    let mut best = vec![vec![u32::MAX; columns + 1]; width + 1];
+    let mut choice = vec![vec![0u32; columns + 1]; width + 1];
+    best[width][0] = 0;
+    for pos in (0..width).rev() {
+        for out_cols in 1..=(width - pos) {
+            let Some(tiles) = row_tiles(pos as u32, out_cols as u32) else {
+                continue;
+            };
+            for used in 1..=columns {
+                let rest = best[pos + out_cols][used - 1];
+                if rest == u32::MAX {
+                    continue;
+                }
+                let total = tiles.saturating_add(rest);
+                if total < best[pos][used] {
+                    best[pos][used] = total;
+                    choice[pos][used] = out_cols as u32;
+                }
+            }
+        }
+    }
+    if best[0][columns] == u32::MAX {
+        return None;
+    }
+    let mut widths = Vec::with_capacity(columns);
+    let (mut pos, mut used) = (0usize, columns);
+    while used > 0 {
+        let out_cols = choice[pos][used];
+        widths.push(out_cols);
+        pos += out_cols as usize;
+        used -= 1;
+    }
+    Some(widths)
 }
 
 fn balanced_column_widths(output_width: u32, columns: u32) -> Vec<u32> {
@@ -4877,6 +4992,52 @@ mod tests {
                 .collect::<Vec<_>>(),
             [5, 4, 3, 2, 1, 0, 0]
         );
+    }
+
+    #[test]
+    fn uneven_column_widths_beat_an_even_division() {
+        // A column tile's row capacity is a floor function of its width, so
+        // two equal columns can both land just under the same capacity step
+        // and waste the slack. The vendor exploits this -- at 128x128 Cin 512
+        // fp16 it splits 128 output columns 73/55 rather than 64/64 and the
+        // narrow half then holds 4 input rows against 3.
+        //
+        // 112x112 Cin 384 is the shape pinned here because it is one where
+        // our CBUF split already agrees with the vendor's (5/7), so the
+        // column partition is the only thing under test.
+        let shape =
+            Shape::with_precision(112, 112, 1, 384, 256, Precision::Fp16).with_padding([1, 1]);
+        let kernels: Kernels = [3, 3];
+        let plan = ConvPlan::new(shape, kernels);
+        let widths = plan.output_column_widths();
+        let output_width = shape.output_width(kernels);
+
+        // Same column count as an even division, and as the vendor. Only the
+        // distribution moves, so the kernel halo re-read cost is unchanged.
+        assert_eq!(plan.data_banks(), 5);
+        assert_eq!(widths.len(), 2, "column count must not change: {widths:?}");
+        assert_eq!(
+            widths.iter().sum::<u32>(),
+            output_width,
+            "column widths must cover the output exactly: {widths:?}"
+        );
+        assert_ne!(
+            widths,
+            balanced_column_widths(output_width, 2),
+            "an even division is what this search exists to beat"
+        );
+
+        // Pinning both counts rather than an inequality, so a regression in
+        // the row-capacity model shows up here too.
+        assert_eq!(plan.tiles().len(), 167);
+        let even = plan_grid(
+            shape,
+            kernels,
+            &balanced_column_widths(output_width, 2),
+            plan.data_banks(),
+        )
+        .expect("the even division is still a valid partition");
+        assert_eq!(even.len(), 222, "even-division baseline moved");
     }
 
     #[test]
