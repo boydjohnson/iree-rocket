@@ -353,6 +353,11 @@ fn weight_banks_floor(weight_channels: u32) -> u32 {
 ///
 /// This is a preferred allocation, not a new hardware-safety minimum; the
 /// independently measured [`weight_banks_floor`] remains in force below it.
+///
+/// Size alone is not the whole gate -- see
+/// [`Shape::streamed_weight_bank_grant`], which additionally divides when
+/// the undivided grant cannot hold a kernel window. This function is the
+/// spatially-blind half, kept separate so the two rules stay legible.
 fn streamed_weight_bank_preference(weight_channels: u32, kernels: Kernels) -> u32 {
     let undivided = streamed_weight_bank_preference_for_group(weight_channels, kernels, 1);
     if undivided <= MAX_UNDIVIDED_WEIGHT_BANKS {
@@ -1539,6 +1544,93 @@ impl Shape {
         self.weight_bytes(kernels).div_ceil(CBUF_BANK_BYTES).max(1)
     }
 
+    /// Whether a coefficient grant of `weight_banks` still leaves enough
+    /// feature banks to hold one full kernel window of full-width rows.
+    ///
+    /// This is RKNN's own CBUF feasibility predicate, read out of
+    /// `librknnc.so` (file 0x1911a80):
+    ///
+    /// ```text
+    /// fits  <=>  ((total_banks - weight_banks) * bank_bytes) / row_bytes
+    ///                >= dilation_h * (kernel_h - 1) + 1
+    /// ```
+    ///
+    /// with no dilation modelled here, so the right-hand side is the kernel
+    /// height. The row charge is the same one
+    /// [`Shape::max_tile_input_rows_for_width_and_data_banks`] bills, which
+    /// is not an assumption: taking each vendor plan's own bank grant and
+    /// `CNA_CBUF_CON1.data_entries` and dividing reproduces that plan's own
+    /// `datain_height` for **144 of 144** programs across the six-extent
+    /// spatial sweep, in both precisions. That also settles the reading of
+    /// `cna_cbuf_con0.data_bank`: the field is the bank *count*, not the
+    /// count minus one, or every tight case would over-predict by a row.
+    ///
+    /// Surfaces only. The dense regime charges rows through
+    /// `dense_cbuf_pixel_bytes` on a different axis, and the spatial corpus
+    /// that establishes this is entirely `Cin >= 64`.
+    fn kernel_window_resident(&self, kernels: Kernels, weight_banks: u32) -> bool {
+        if self.layout() != FeatureLayout::Surfaces {
+            return true;
+        }
+        let Some(data_banks) = CBUF_BANKS
+            .checked_sub(weight_banks)
+            .filter(|banks| *banks >= 1)
+        else {
+            return false;
+        };
+        let row_bytes = self.width * self.cbuf_atoms() * FEATURE_ATOM_BYTES;
+        (data_banks * CBUF_BANK_BYTES) / row_bytes >= self.kernel_programming(kernels).height
+    }
+
+    /// The coefficient grant the vendor takes, size gate and residency gate
+    /// together.
+    ///
+    /// [`streamed_weight_bank_preference`] divides the streamed
+    /// output-channel group when the working set alone is too big. That is
+    /// necessary but not sufficient: the vendor also divides when the
+    /// *undivided* grant would leave too few feature banks to hold a kernel
+    /// window, which is a spatial condition and the reason `Cin` 448/512 at
+    /// extents from 56 up take 7/5 where the size gate alone says 4/8 and
+    /// 3/9.
+    ///
+    /// **The residency gate only fires when dividing actually fixes the
+    /// problem.** Where neither grant can hold a window at full width the
+    /// vendor keeps the undivided one and solves residency by horizontal
+    /// tiling instead. Cross-tabulating the 103 corpus cases where this gate
+    /// decides the answer shows why the qualifier is not optional:
+    ///
+    /// ```text
+    ///   window fits undivided?   vendor width-tiles?   divided  undivided
+    ///   yes                      no                          0         69
+    ///   no                       no                         14          0
+    ///   no                       yes                        12          8
+    /// ```
+    ///
+    /// The first two rows are exceptionless; all the ambiguity is in the
+    /// third, where the vendor's horizontal-tiling choice -- which
+    /// `ConvPlan` makes differently -- decides it. Requiring the division to
+    /// restore residency keeps this rule inside the exceptionless region:
+    /// it moves 14 corpus cases, every one onto the vendor's value, and
+    /// regresses none. Dropping the qualifier scores two better overall but
+    /// mis-plans eight width-tiled cases *below* the vendor's coefficient
+    /// grant -- the same direction that produced wrong values and an NPU
+    /// hang when a spatial gate was tried and reverted on 2026-09-02.
+    fn streamed_weight_bank_grant(&self, kernels: Kernels) -> u32 {
+        let weight_channels = self.weight_channels();
+        let undivided = streamed_weight_bank_preference(weight_channels, kernels);
+        if undivided > MAX_UNDIVIDED_WEIGHT_BANKS {
+            // Already divided by the size gate; nothing further to decide.
+            return undivided;
+        }
+        let divided = streamed_weight_bank_preference_for_group(weight_channels, kernels, 2);
+        if !self.kernel_window_resident(kernels, undivided)
+            && self.kernel_window_resident(kernels, divided)
+        {
+            return divided;
+        }
+        undivided
+    }
+
     fn demand_based_cbuf_partition(&self, kernels: Kernels) -> (u32, u32) {
         let data = self.data_bank_demand();
         let weights = self.weight_bank_demand(kernels);
@@ -1565,7 +1657,7 @@ impl Shape {
         // and the "leaves three data banks" threshold does not survive a
         // second kernel size. The k=3 fit would have mis-planned k=5 `Cin` 192
         // as 6/6 against the vendor's 2/10.
-        let streamed_preference = streamed_weight_bank_preference(self.weight_channels(), kernels);
+        let streamed_preference = self.streamed_weight_bank_grant(kernels);
         assert!(
             streamed_preference <= CBUF_BANKS - 1,
             "coefficient working set wants {streamed_preference} CBUF banks for \

@@ -33,6 +33,21 @@ const BASE_INT8_FIXTURES: &str = include_str!("fixtures/conv_vendor_fixtures_i8.
 /// is the axis that gap was hiding in.
 const SPATIAL_FP16_FIXTURES: &str = include_str!("fixtures/conv_vendor_fixtures_spatial.json");
 const SPATIAL_INT8_FIXTURES: &str = include_str!("fixtures/conv_vendor_fixtures_spatial_i8.json");
+/// Three more extents (128, 160, 192) at Cout 256, k=3, Cin 64..768.
+///
+/// The six-extent sweep above jumps 112 -> 224, and the CBUF residency gate in
+/// `Shape::streamed_weight_bank_grant` turns over inside that gap: at 112 the
+/// vendor divides the streamed group at `Cin` 320, at 160 and 192 it does not.
+/// Without these the gap is wide enough to admit two different rules that both
+/// score the same, which is how a spatial gate was over-fitted and reverted
+/// once already. Captured with `build_vendor_fixtures.py --channel-grid-only
+/// --channel-grid-extent {128,160,192} --channel-grid-cout 256
+/// --channel-grid-step 64`, then truncated to one program per distinct tile
+/// shape like the sweep above.
+const SPATIAL_MID_FP16_FIXTURES: &str =
+    include_str!("fixtures/conv_vendor_fixtures_spatial_mid.json");
+const SPATIAL_MID_INT8_FIXTURES: &str =
+    include_str!("fixtures/conv_vendor_fixtures_spatial_mid_i8.json");
 
 fn plan_bank_split(programs: &[&Program]) -> Option<(u32, u32)> {
     let splits = programs
@@ -146,6 +161,11 @@ fn score_cbuf_split_against_corpus() {
         Precision::Fp16,
         "fp16 spatial sweep (6 extents)",
     );
+    score(
+        SPATIAL_MID_FP16_FIXTURES,
+        Precision::Fp16,
+        "fp16 spatial sweep (128/160/192)",
+    );
     // The quantization parameters do not affect the bank split; these mirror
     // the ones the gate test uses so the two are comparing like with like.
     let int8 = Precision::Int8(Quantization {
@@ -165,5 +185,10 @@ fn score_cbuf_split_against_corpus() {
         SPATIAL_INT8_FIXTURES,
         int8,
         "int8 spatial sweep (6 extents)",
+    );
+    score(
+        SPATIAL_MID_INT8_FIXTURES,
+        int8,
+        "int8 spatial sweep (128/160/192)",
     );
 }

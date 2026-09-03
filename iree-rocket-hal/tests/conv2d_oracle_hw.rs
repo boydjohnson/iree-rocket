@@ -3366,6 +3366,72 @@ fn group_division_split_cases() -> Vec<Conv2dCase> {
     cases
 }
 
+/// The shapes whose CBUF split moved when `streamed_weight_bank_grant`
+/// learned the vendor's kernel-window residency gate.
+///
+/// The size gate alone (`streamed_weight_bank_preference`) divides the
+/// streamed output-channel group only when the coefficient working set is
+/// too big on its own. The vendor also divides when the undivided grant
+/// would leave too few feature banks to hold one kernel window -- which is
+/// why `Cin` 448/512 from extent 56 up are programmed 7/5 rather than the
+/// 4/8 and 3/9 the size gate predicts.
+///
+/// Every case here moves the grant **down** (fewer weight banks, more data
+/// banks) onto the vendor's own value. Down is the direction that produced
+/// wrong values and an NPU hang when a spatial gate was tried and reverted
+/// on 2026-09-02, so it is the direction that has to be re-measured rather
+/// than argued from the corpus -- even though the corpus now agrees with the
+/// vendor exactly at each of these points.
+///
+/// Extents stop at 160. The rule also moves 192^2 and 224^2 cases, but those
+/// plan into the low hundreds of dispatches each and the sweep already
+/// contaminates itself; they are covered by the fixture corpus only.
+///
+/// Run one case per process.
+#[cfg(feature = "hardware-characterization")]
+#[test]
+#[ignore = "requires the RK3588 NPU"]
+fn kernel_window_residency_splits_match_oracle() {
+    let mut cases = Vec::new();
+    // (extent, Cin, precision) -- exactly the moved cases at extents <= 160.
+    for (extent, cin, int8) in [
+        (56u32, 448u32, false),
+        (56, 512, false),
+        (112, 320, false),
+        (112, 448, true),
+        (112, 512, true),
+        (128, 320, false),
+        (128, 448, true),
+        (128, 512, true),
+        (160, 256, false),
+    ] {
+        let precision = if int8 {
+            OraclePrecision::Int8
+        } else {
+            OraclePrecision::Fp16
+        };
+        let permuting = if int8 {
+            OraclePattern::SelectorsAffine { phase: 0 }
+        } else {
+            OraclePattern::Selectors { phase: 0 }
+        };
+        for pattern in [OraclePattern::Counting, permuting] {
+            cases.push(Conv2dCase {
+                width: extent,
+                height: extent,
+                cin,
+                cout: 256,
+                kernel: [3, 3],
+                stride: 1,
+                padding: [1, 1],
+                precision,
+                pattern,
+            });
+        }
+    }
+    run_hardware_case_matrix("kernel-window residency splits", cases);
+}
+
 /// The small-extent shapes whose CBUF split changed when
 /// `demand_based_cbuf_partition`'s starvation correction learned to tell
 /// "clamped down to one data bank" from "only ever wanted one".
