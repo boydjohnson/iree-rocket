@@ -3578,8 +3578,23 @@ module attributes {transform.with_named_sequence} {
     // zero-point correction (conv_q(x, w, xz, 0) == conv(x, w) - xz*sum(w),
     // an exact i32 identity), which is the form the int8 matchers below
     // claim. A fp32 model is unaffected: neither pass matches anything.
+    // A *statically* quantized ONNX model (ORT QOperator -> onnx.QLinearConv)
+    // arrives with its requantization spelled out next to the convolution: a
+    // dequantize generic and a quantize generic, which the passes below would
+    // leave on the CPU while the convolution went to the NPU as a raw i32
+    // accumulator. This fuses the three into the canonical requantized form
+    // instead, so the DPU's own BS and out-convert stages do that work and the
+    // dispatch returns i8 -- which is also the only int8 path without the
+    // accumulator mode's 384-coefficient-bytes-per-output-channel cap. It runs
+    // first because it wants torch-mlir's output before anything reshapes it,
+    // and it emits NHWC itself. A convolution it does not recognize is left
+    // exactly as it was, for the passes below.
+    %fused_funcs = transform.apply_registered_pass
+        "rocket-fuse-qlinear-conv" to %funcs
+      : (!transform.any_op) -> !transform.any_op
+
     %nhwc_quantized_funcs = transform.apply_registered_pass
-        "rocket-transpose-quantized-conv-to-nhwc" to %funcs
+        "rocket-transpose-quantized-conv-to-nhwc" to %fused_funcs
       : (!transform.any_op) -> !transform.any_op
     %dequantized_funcs = transform.apply_registered_pass
         "iree-global-opt-quantized-conv-to-conv" to %nhwc_quantized_funcs

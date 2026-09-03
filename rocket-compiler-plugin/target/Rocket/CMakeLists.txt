@@ -30,6 +30,7 @@ set(_ROCKET_SRCS
   "RocketAnnotateFinalPlacementPass.cpp"
   "RocketAnnotateOriginalPlacementPass.cpp"
   "RocketDemoteConvInputsPass.cpp"
+  "RocketFuseQLinearConvPass.cpp"
   "RocketPinUnclaimedDispatchesPass.cpp"
   "RocketPromoteUnclaimedConvInputsPass.cpp"
   "RocketTarget.cpp"
@@ -42,6 +43,7 @@ set(_ROCKET_DEPS
   MLIRArithDialect
   MLIRLinalgDialect
   MLIRLinalgUtils
+  MLIRMathDialect
   MLIRPass
   MLIRSupport
   MLIRTensorDialect
