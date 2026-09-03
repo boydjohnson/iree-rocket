@@ -195,6 +195,41 @@ fn int8_depthwise_multi_tile_is_wrong() {
     }
 }
 
+/// The int8 counterpart of `fp16_depthwise_corpus_shapes_are_exact`: the
+/// depthwise vendor corpus's 40 (extent, `Cin`) pairs, on hardware.
+///
+/// Geometry note: the corpus captures 3x3 SAME (pad 1) because that is what
+/// the vendor's ONNX has, while this harness convolves **valid** (pad 0),
+/// which is what `rocket-hal-driver` actually programs from a compiled
+/// `.vmfb` -- IREE materializes padding as a separate `tensor.pad`. So these
+/// are the corpus's extents and channel counts with the runtime's padding;
+/// the output extent is two smaller and the tile structure is otherwise the
+/// same. Each case prints its own tile count.
+///
+/// Run one case per process.
+#[test]
+#[ignore = "needs /dev/accel/accel0 -- runs the depthwise vendor corpus shapes"]
+fn int8_depthwise_corpus_shapes_are_exact() {
+    unsafe { std::env::set_var("ROCKET_ALLOW_UNBACKED_CHANNELS", "1") };
+    let mut cases = Vec::new();
+    for extent in [34usize, 56, 70, 112, 130] {
+        for channels in (48usize..=384).step_by(48) {
+            cases.push((channels, extent));
+        }
+    }
+    let only = std::env::var("ROCKET_DEPTHWISE_SWEEP_ONLY")
+        .ok()
+        .and_then(|value| value.parse::<usize>().ok());
+    eprintln!("int8 depthwise corpus: {} case(s)", cases.len());
+    for (index, (channels, extent)) in cases.into_iter().enumerate() {
+        if only.is_some_and(|wanted| wanted != index) {
+            continue;
+        }
+        eprintln!("[{index}] Cin {channels} at {extent}x{extent} pad 0");
+        check_int8_depthwise_at(channels, extent, extent);
+    }
+}
+
 fn check_int8_depthwise(channels: usize) {
     check_int8_depthwise_at(channels, DEFAULT_W, DEFAULT_H);
 }

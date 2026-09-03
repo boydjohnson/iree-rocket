@@ -270,6 +270,48 @@ fn fp16_depthwise_exact_above_the_dense_ceiling() {
     }
 }
 
+/// Runs every shape in the depthwise vendor corpus
+/// (`conv_vendor_fixtures_depthwise.json`) on hardware.
+///
+/// `conv_vendor_fixture_depthwise.rs` shows our CBUF split matches a
+/// complete vendor plan at all 40 of these, and that 17 of them end in a
+/// **greedy sliver** -- a final row tile far shorter than its siblings,
+/// where the vendor spreads the remainder instead. That is a host-side
+/// observation about dispatch count. This is the other half: whether the
+/// slivered plans are *correct* on silicon.
+///
+/// Five extents x `Cin` 48..384, matching the corpus exactly, at its 3x3
+/// SAME geometry. Ordered by cost so a truncated run still covers the small
+/// extents.
+///
+/// Run one case per process; the wide cases allocate tens of MB:
+///
+/// ```text
+/// for i in $(seq 0 39); do ROCKET_DEPTHWISE_SWEEP_ONLY=$i ./conv_depthwise_fp16_exact_hw \
+///     fp16_depthwise_corpus_shapes_are_exact --ignored --nocapture; done
+/// ```
+#[test]
+#[ignore = "needs /dev/accel/accel0 -- runs the depthwise vendor corpus shapes"]
+fn fp16_depthwise_corpus_shapes_are_exact() {
+    let mut cases = Vec::new();
+    for extent in [34usize, 56, 70, 112, 130] {
+        for channels in (48usize..=384).step_by(48) {
+            cases.push((channels, extent));
+        }
+    }
+    let only = std::env::var("ROCKET_DEPTHWISE_SWEEP_ONLY")
+        .ok()
+        .and_then(|value| value.parse::<usize>().ok());
+    eprintln!("fp16 depthwise corpus: {} case(s)", cases.len());
+    for (index, (channels, extent)) in cases.into_iter().enumerate() {
+        if only.is_some_and(|wanted| wanted != index) {
+            continue;
+        }
+        eprintln!("[{index}] Cin {channels} at {extent}x{extent} pad 1");
+        check_fp16_depthwise_with_padding(channels, extent, extent, 1, [1, 1]);
+    }
+}
+
 fn check_fp16_depthwise(channels: usize, width: usize, height: usize, stride: u32) {
     check_fp16_depthwise_with_padding(channels, width, height, stride, [0, 0]);
 }
