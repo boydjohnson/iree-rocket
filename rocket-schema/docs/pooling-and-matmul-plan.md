@@ -126,18 +126,36 @@ all -- only a wire format and a matcher.
 matmul is `K = 1792`:
 
 ```
-K  = 1792  ->  Cin  1792  >  MAX_INPUT_CHANNELS = 1344   (fp16)   BLOCKED
+K  = 1792  ->  Cin  1792  >  MAX_INPUT_CHANNELS = 1344   (fp16)   was BLOCKED
 N  = 1001  ->  Cout 1001  <= MAX_OUTPUT_CHANNELS = 1792            ok
 M  = 1     ->  conv width 1, height 1                              ok, but degenerate
 ```
 
-The measurement to lift it **already exists**: `MAX_INPUT_CHANNELS`' own doc
-records fp16 k=1 exact at `Cin` 256..**1792** (14x14, Cout 64), and the int8
-constant records k=1 exact to 2048. 1344 is where MobileNetV2's *convolutions*
-stopped needing more, not where the hardware stopped. What is **not** covered
-is this geometry: a 1x1 spatial "image" with Cin 1792, which is what an
-M=1 matmul degenerates to. That is one ladder case, not a research project --
-see the phasing below.
+**RESOLVED 2026-09-04 -- this is Phase 5, and it is done.** The partial
+measurement already existed (`MAX_INPUT_CHANNELS`' own doc records fp16 k=1
+exact at `Cin` 256..1792 at 14x14), but not at *this* geometry: a 1x1 spatial
+"image", which is what an M=1 matmul degenerates to and which no conv ladder
+had ever run. Measured on `planck`, 23 exploratory points then a 20-case
+ladder, **0 mismatches and 0 device timeouts** at every one:
+
+* `K` at M=1, N=64: 512, 1024, 1344, 1792, **2048** -- under `Selectors` and
+  again under `Counting`;
+* `N` at M=1, K=1792: 64, 512, **1001**, 1792, 2048;
+* `M` at K=1792, N=64: 1, 2, 7, 16, 32, across the CBUF split changing
+  7/5 -> 2/10 -> 4/8 with nothing else about the shape moving;
+* the classifier itself, `M=1 K=1792 N=1001`, under both patterns and again
+  with the fp32 accumulator kept.
+
+`MAX_INPUT_CHANNELS` is now **1792** (not the 2048 also measured -- 1792 is
+what a real model needs). `fc_matmul_geometry_matches_oracle` is the
+regression, and `fc_matmul_ladder_matches_the_fc_lowering` checks the
+ladder's cases field-for-field against `fc::Shape::as_conv_shape`, so a
+ladder that drifted from the production lowering fails on the host rather
+than passing while measuring its own geometry.
+
+**So the matmul matcher's `dim_bounds` are `K <= 1792`, `N <= 1792`.** The
+`M` bound is the open one: 32 is the widest measured, and nothing says the
+next value fails -- it is simply where the ladder stops.
 
 ## Schema changes
 
@@ -413,13 +431,11 @@ fp16 conv offload already uses.
 | 2 | `RocketTarget.cpp` config builders and serialization for both kernels | new lit tests under `rocket-compiler-plugin/test/` |
 | 3 | transform-spec executables, dispatch helpers and matchers (avg-pool first, matmul second) | lit tests mirroring `rocket_fp16_match_boundaries.mlir` |
 | 4 | e2e on both MobileNetV2 models: pool and matmul each offloaded once | `tools/e2e_conv_regression.py`, top-1/top-5 + max\|err\| |
-| 5 | raise `MAX_INPUT_CHANNELS` for the k=1 FC geometry (K=1792), then unblock the matmul matcher | a `conv2d_oracle_hw` ladder case at 1x1 extent, Cin 1792, Cout 1001 |
+| 5 | **DONE** -- `MAX_INPUT_CHANNELS` 1344 -> 1792 on the FC geometry | `fc_matmul_geometry_matches_oracle`, 20/20 on `planck` |
 
-Phase 5 is the one that needs the board before the compiler work is worth
-anything, and it is a single ladder row: the measurement at `Cin` 1792 exists
-at 14x14, and what is untested is the degenerate 1x1 spatial extent an M=1
-matmul produces. Worth running *before* Phase 3's matmul matcher, so the
-matcher's `dim_bounds` can be written once at the right number.
+Phase 5 was the one that needed the board before the compiler work was worth
+anything, and it ran first for that reason: the matcher's `dim_bounds` are
+now written once, at a number that was measured rather than inferred.
 
 ## Open decisions
 

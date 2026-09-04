@@ -49,8 +49,9 @@ use conv2d_oracle::{build_raw_fixture, feature_offset};
 // than one per file.
 use dispatch::DISPATCH_TIMEOUT_FLOOR;
 use iree_rocket_hal::rocket::{
-    conv::{AccumulatorOutputTile, Buffers, ConvPlan, Shape},
+    conv::{AccumulatorOutputTile, Buffers, ConvPlan, Precision, Shape},
     device::{Buffer, JobDesc, close_bo, fini_bo, prep_bo, submit_jobs, unmap_bo},
+    fc,
 };
 
 const DEVICE_PATH: &str = "/dev/accel/accel0";
@@ -1784,7 +1785,10 @@ fn dense_coefficient_vgg_blocks_match_oracle() {
 ///
 /// The spec is `precision/axis/extent/kernel/fixed/values`: `axis` is `cin`
 /// or `cout`, `fixed` is whichever of the two the axis does not sweep, and
-/// `values` is the sweep. Every case runs `Selectors`, which varies with y,
+/// `values` is the sweep. `extent` is `N` for an `N x N` image or `WxH` for
+/// a rectangular one -- the fully-connected lowering makes a matmul a
+/// convolution of height *one*, so `1x1` and `7x1` are shapes worth
+/// sweeping and a square extent cannot express them. Every case runs `Selectors`, which varies with y,
 /// x and channel; append `,counting` style patterns by re-running with
 /// `ROCKET_DTYPE_SWEEP_PATTERN=counting`.
 ///
@@ -1821,7 +1825,16 @@ fn dtype_boundary_probe() {
         "int8acc" => OraclePrecision::Int8Accumulator,
         other => panic!("unknown precision {other}"),
     };
-    let extent: u32 = fields[2].parse().expect("extent");
+    let (width, height) = match fields[2].split_once('x') {
+        Some((width, height)) => (
+            width.parse().expect("extent width"),
+            height.parse().expect("extent height"),
+        ),
+        None => {
+            let extent: u32 = fields[2].parse().expect("extent");
+            (extent, extent)
+        }
+    };
     let kernel: usize = fields[3].parse().expect("kernel");
     let fixed: u32 = fields[4].parse().expect("fixed channel count");
     let pattern = match std::env::var("ROCKET_DTYPE_SWEEP_PATTERN").as_deref() {
@@ -1839,8 +1852,8 @@ fn dtype_boundary_probe() {
                 other => panic!("axis must be cin or cout, not {other}"),
             };
             Conv2dCase {
-                width: extent,
-                height: extent,
+                width,
+                height,
                 cin,
                 cout,
                 kernel: [kernel, kernel],
@@ -2110,7 +2123,7 @@ fn bf16_regression_cases() -> Vec<Conv2dCase> {
     cases.extend(scale_cases(
         OraclePrecision::Bf16,
         ScaleLadder {
-            cin_k1: &[512, 1024, 1344],
+            cin_k1: &[512, 1024, 1344, 1792],
             cin_k3: &[512, 1024],
             cout: &[512, 1024, 1792],
             unaligned_cin: &[33, 65, 129],
@@ -2199,7 +2212,7 @@ fn int16_regression_cases() -> Vec<Conv2dCase> {
     cases.extend(scale_cases(
         OraclePrecision::Int16,
         ScaleLadder {
-            cin_k1: &[512, 1024, 1344],
+            cin_k1: &[512, 1024, 1344, 1792],
             cin_k3: &[512, 1024],
             cout: &[512, 1024, 1792],
             unaligned_cin: &[33, 65, 129],
@@ -2536,7 +2549,7 @@ fn fp16_accumulator_regression_cases() -> Vec<Conv2dCase> {
     cases.extend(scale_cases(
         OraclePrecision::Fp16Accumulator,
         ScaleLadder {
-            cin_k1: &[512, 1024, 1344],
+            cin_k1: &[512, 1024, 1344, 1792],
             cin_k3: &[512, 1024],
             cout: &[512, 1024, 1792],
             unaligned_cin: &[33, 65, 129],
@@ -2572,7 +2585,7 @@ fn fp16_accumulator_regression_cases() -> Vec<Conv2dCase> {
 #[test]
 fn fp16_accumulator_matrix_is_planable_and_gap_free() {
     let cases = fp16_accumulator_regression_cases();
-    assert_eq!(cases.len(), 52);
+    assert_eq!(cases.len(), 54);
     assert_planable_and_gap_free(cases);
 }
 
@@ -2605,7 +2618,7 @@ fn fp16_accumulator_ladder_leaves_the_fp16_grid() {
 #[ignore = "needs /dev/accel/accel0 -- establishes the fp32 result writer on the fp16 datapath"]
 fn fp16_accumulator_matrix_matches_oracle() {
     let cases = fp16_accumulator_regression_cases();
-    assert_eq!(cases.len(), 52);
+    assert_eq!(cases.len(), 54);
     run_hardware_case_matrix("fp16 fp32-result matrix", cases);
 }
 
@@ -2739,10 +2752,166 @@ fn wide_operand_cases_exceed_the_narrower_datatype() {
     );
 }
 
+/// The geometry a matmul reaches this hardware through.
+///
+/// There is no matmul engine and no fully-connected engine: `fc::Shape`
+/// lowers `[M,K] x [K,N]` to a **1x1 convolution of height one**, with `M`
+/// the convolution width, `K` the input channels and `N` the output
+/// channels. That mapping is not a guess -- 160 ONNX `Linear` models were
+/// swept to establish that it is what the vendor toolchain itself emits --
+/// but every conv ladder in this file runs a square image at least 7 on a
+/// side, so the *degenerate* shape a matmul makes had never been run at all.
+/// MobileNetV2's classifier is `[1,1792] x [1792,1001]`: a one-pixel image
+/// with 1792 input channels.
+///
+/// Three axes, because they fail differently. `K` is the channel-padding and
+/// CBUF-residency axis and is what `MAX_INPUT_CHANNELS` bounds; `N` is the
+/// output writer's; `M` is the one that moves the CBUF split (7/5 at widths
+/// 1-7, 2/10 at 16, 4/8 at 32) while nothing else about the shape changes,
+/// which is exactly the kind of thing that reads correct at one width and
+/// wrong at the next.
+///
+/// `Counting` and `Selectors` both run on the `K` axis for the usual reason:
+/// `Counting` makes every one of the 1792 input lanes contribute, so a
+/// channel-padding error changes the count, while `Selectors` is what sees
+/// an addressing error. At a one-pixel image `Counting` cannot see anything
+/// spatial -- there is nothing spatial to see -- so here the two are closer
+/// in power than usual, and the `M` axis is what carries spatial coverage.
+fn fc_matmul_geometry_cases() -> Vec<Conv2dCase> {
+    let mut cases = Vec::new();
+    let mut push = |m: u32, k: u32, n: u32, precision, pattern| {
+        cases.push(Conv2dCase {
+            width: m,
+            height: 1,
+            cin: k,
+            cout: n,
+            kernel: [1, 1],
+            stride: 1,
+            padding: [0, 0],
+            precision,
+            pattern,
+        });
+    };
+
+    // K, to the ceiling this ladder raised.
+    for k in [512u32, 1024, 1344, 1792] {
+        push(1, k, 64, OraclePrecision::Fp16, OraclePattern::Counting);
+        push(
+            1,
+            k,
+            64,
+            OraclePrecision::Fp16,
+            OraclePattern::Selectors { phase: 0 },
+        );
+    }
+    // N at MobileNetV2's K, including its own 1001 -- which is neither a
+    // whole output granule nor a power of two.
+    for n in [64u32, 512, 1001, 1792] {
+        push(
+            1,
+            1792,
+            n,
+            OraclePrecision::Fp16,
+            OraclePattern::Selectors { phase: 1 },
+        );
+    }
+    // M, the width axis, across the two CBUF-split changes it causes.
+    for m in [1u32, 2, 7, 16, 32] {
+        push(
+            m,
+            1792,
+            64,
+            OraclePrecision::Fp16,
+            OraclePattern::Selectors { phase: 2 },
+        );
+    }
+    // The classifier itself, under both patterns, and once more with the
+    // fp32 accumulator kept -- a 1001-way logit vector is exactly where
+    // narrowing to fp16 on the way out is worth being able to skip.
+    push(
+        1,
+        1792,
+        1001,
+        OraclePrecision::Fp16,
+        OraclePattern::Counting,
+    );
+    push(
+        1,
+        1792,
+        1001,
+        OraclePrecision::Fp16,
+        OraclePattern::Selectors { phase: 3 },
+    );
+    push(
+        1,
+        1792,
+        1001,
+        OraclePrecision::Fp16Accumulator,
+        OraclePattern::Selectors { phase: 3 },
+    );
+    cases
+}
+
+#[test]
+fn fc_matmul_geometry_is_planable_and_gap_free() {
+    let cases = fc_matmul_geometry_cases();
+    assert_eq!(cases.len(), 20);
+    assert_planable_and_gap_free(cases);
+}
+
+/// The ladder has to be running the *production* lowering, not a shape that
+/// merely looks like it.
+///
+/// `fc::Shape::as_conv_shape` is what a dispatch actually builds. If this
+/// ladder's cases drifted from it -- a padding mode, a stride, a height --
+/// every row above would still pass and would be measuring the wrong
+/// geometry. So each case is checked field-for-field against the shape
+/// `fc::Shape::new(M, K, N)` produces.
+#[test]
+fn fc_matmul_ladder_matches_the_fc_lowering() {
+    for case in fc_matmul_geometry_cases() {
+        // The accumulator rung has no fc::Shape counterpart yet (fc::Shape
+        // takes a conv::Precision, and the runtime refuses accumulator
+        // output on the FC path), so it is checked for geometry alone.
+        let precision = match case.precision {
+            OraclePrecision::Fp16 | OraclePrecision::Fp16Accumulator => Precision::Fp16,
+            other => panic!("{other:?} has no fc::Shape mapping in this ladder"),
+        };
+        let lowered = fc::Shape::new(case.width, case.cin, case.cout, precision).as_conv_shape();
+        let ladder = Conv2dCase {
+            precision: OraclePrecision::Fp16,
+            ..case
+        }
+        .shape();
+        assert_eq!(
+            (ladder.width, ladder.height, ladder.stride),
+            (lowered.width, lowered.height, lowered.stride),
+            "{} does not match the fc lowering's extents",
+            case.label(),
+        );
+        assert_eq!(
+            (ladder.in_channels, ladder.out_channels),
+            (lowered.in_channels, lowered.out_channels),
+            "{} does not match the fc lowering's channels",
+            case.label(),
+        );
+        assert_eq!(case.kernel, fc::KERNELS, "{} is not a 1x1", case.label());
+        assert_eq!(case.padding, [0, 0], "{} is padded", case.label());
+    }
+}
+
+#[test]
+#[ignore = "needs /dev/accel/accel0 -- the height-one geometry a matmul lowers to"]
+fn fc_matmul_geometry_matches_oracle() {
+    let cases = fc_matmul_geometry_cases();
+    assert_eq!(cases.len(), 20);
+    run_hardware_case_matrix("fc/matmul geometry ladder", cases);
+}
+
 #[test]
 fn bf16_regression_matrix_is_planable_and_gap_free() {
     let cases = bf16_regression_cases();
-    assert_eq!(cases.len(), 58);
+    assert_eq!(cases.len(), 60);
     assert_planable_and_gap_free(cases);
 }
 
@@ -2750,14 +2919,14 @@ fn bf16_regression_matrix_is_planable_and_gap_free() {
 #[ignore = "needs /dev/accel/accel0 -- establishes bf16 (precision field 3) on the convolution datapath"]
 fn bf16_regression_matrix_matches_oracle() {
     let cases = bf16_regression_cases();
-    assert_eq!(cases.len(), 58);
+    assert_eq!(cases.len(), 60);
     run_hardware_case_matrix("bf16 regression matrix", cases);
 }
 
 #[test]
 fn int16_regression_matrix_is_planable_and_gap_free() {
     let cases = int16_regression_cases();
-    assert_eq!(cases.len(), 37);
+    assert_eq!(cases.len(), 39);
     assert_planable_and_gap_free(cases);
 }
 
@@ -2790,7 +2959,7 @@ fn int16_cases_stay_inside_the_int16_result() {
 #[ignore = "needs /dev/accel/accel0 -- establishes int16 (precision field 1) convolution output"]
 fn int16_regression_matrix_matches_oracle() {
     let cases = int16_regression_cases();
-    assert_eq!(cases.len(), 37);
+    assert_eq!(cases.len(), 39);
     run_hardware_case_matrix("int16 regression matrix", cases);
 }
 
