@@ -210,6 +210,15 @@ pub const INPUT_CHANNELS: u32 = 3;
 /// [`ConvPlan`] answers on its own -- at k=3 it is the binding one well
 /// before this, refusing `Cin >= 1216` outright.
 ///
+/// **The other 2-byte rungs now have their own evidence at this value**
+/// (2026-09-04), rather than only inheriting it: `bf16_regression_matrix`
+/// (58/58) and `int16_regression_matrix` (37/37) both run `Cin` 512, 1024
+/// and 1344 at k=1 and 512/1024 at k=3, `Cout` to 1792, the ragged 33/65/129
+/// and 40/72/129, 56x56 and 112x112 multi-tile, 5x5 and 7x7, and stride 2.
+/// `fp16_accumulator_matrix` (52/52) runs the same battery on the
+/// fp32-result writer. So the sharing is measured at all four widths of the
+/// family, not argued from the element width alone.
+///
 /// Shared between dense and depthwise `Shape` construction. That sharing is
 /// what made the 960 attempt unsafe; it is not a problem here, because the
 /// depthwise half now has its own corpus
@@ -270,17 +279,46 @@ pub const MAX_INT8_OUTPUT_CHANNELS: u32 = 1792;
 /// rather than to what the arithmetic would allow.
 ///
 /// int4 packs four times as densely as fp16, so nothing in the CBUF model
-/// stops these from being much higher; they are low because the evidence
-/// stops here. Raise them with the measurement, not ahead of it.
-pub const MAX_INT4_INPUT_CHANNELS: u32 = 512;
-pub const MAX_INT4_OUTPUT_CHANNELS: u32 = 512;
+/// stops these from being much higher; they were low because the evidence
+/// stopped there. Raise them with the measurement, not ahead of it.
+///
+/// Raised 512 -> 1344 / 512 -> 1792 on 2026-09-04, to where the 2-byte
+/// rungs sit. `int4_regression_matrix_matches_oracle` is 51/51 on `planck`,
+/// with these among them: `Cin` 512/1024/1344 at k=1 and 512/1024 at k=3
+/// (`ConvPlan` refuses k=3 past 1152), `Cout` 512/1024/1792, the ragged 96
+/// and 160 against int4's 64-channel output granule, 56x56 and 112x112
+/// multi-tile, 5x5 and 7x7, and stride 2 at both k=1 and k=3.
+///
+/// `Cin` is always a whole 32-channel feature atom here -- `with_precision`
+/// refuses a partial one -- so unlike the 2-byte rungs there is no ragged
+/// input-channel case to bound.
+pub const MAX_INT4_INPUT_CHANNELS: u32 = 1344;
+pub const MAX_INT4_OUTPUT_CHANNELS: u32 = 1792;
 
 /// Channel ceilings for tf32, again the extent of the measurement rather
 /// than of the arithmetic. A 4-byte element charges four times fp16's CBUF
 /// residency per channel, so these will always sit lower than the 2-byte
-/// rungs'.
-pub const MAX_TF32_INPUT_CHANNELS: u32 = 256;
-pub const MAX_TF32_OUTPUT_CHANNELS: u32 = 512;
+/// rungs' on the `Cin` side, where residency is what binds.
+///
+/// Raised 256 -> 1024 / 512 -> 1792 on 2026-09-04.
+/// `tf32_regression_matrix_matches_oracle` is 50/50 on `planck`: `Cin` 512
+/// and 1024 at k=1, 384/512/576 at k=3 (straddling the split change at 544,
+/// where the plan goes 3/9 two tiles -> 1/11 fourteen), `Cout` 512/1024/1792,
+/// the ragged 34/66/130 and 12/20/68, 56x56 and 112x112 multi-tile, 5x5 at
+/// `Cin` 64 and 7x7 at 32, and stride 2.
+///
+/// `Cout` does not charge feature residency, which is why it reaches the
+/// same 1792 as the 2-byte rungs while `Cin` stops at 1024 -- past that
+/// `ConvPlan` refuses at k=3, and it is the coefficient working set rather
+/// than this constant that binds there.
+///
+/// Two hardware faults were found and fixed getting here, both tf32-only
+/// and both of them hangs rather than wrong data:
+/// [`Precision::out_channel_granule`] (a padded `Cout` at 8 modulo 16) and
+/// `streamed_weight_bank_preference_for_group`'s coefficient working set,
+/// which was calibrated at two bytes and starved the 4-byte stream.
+pub const MAX_TF32_INPUT_CHANNELS: u32 = 1024;
+pub const MAX_TF32_OUTPUT_CHANNELS: u32 = 1792;
 
 /// Widest input pixel the vendor keeps in dense NHWC, in bytes.
 ///
@@ -432,8 +470,13 @@ fn weight_banks_floor(weight_channels: u32) -> u32 {
 ///
 /// This is a preferred allocation, not a new hardware-safety minimum; the
 /// independently measured [`weight_banks_floor`] remains in force below it.
-fn streamed_weight_bank_preference(weight_channels: u32, kernels: Kernels) -> u32 {
-    let undivided = streamed_weight_bank_preference_for_group(weight_channels, kernels, 1);
+fn streamed_weight_bank_preference(
+    weight_channels: u32,
+    kernels: Kernels,
+    element_bits: u32,
+) -> u32 {
+    let undivided =
+        streamed_weight_bank_preference_for_group(weight_channels, kernels, 1, element_bits);
     if undivided <= MAX_UNDIVIDED_WEIGHT_BANKS {
         return undivided;
     }
@@ -441,7 +484,7 @@ fn streamed_weight_bank_preference(weight_channels: u32, kernels: Kernels) -> u3
     // division is refused by `demand_based_cbuf_partition`, not quietly turned
     // into a one-data-bank split. 5x5 `Cin` 512 wants 13 banks even divided,
     // and no capture covers it.
-    streamed_weight_bank_preference_for_group(weight_channels, kernels, 2)
+    streamed_weight_bank_preference_for_group(weight_channels, kernels, 2, element_bits)
 }
 
 /// Largest coefficient grant the vendor will take without dividing the
@@ -481,11 +524,30 @@ fn streamed_weight_bank_preference_for_group(
     weight_channels: u32,
     kernels: Kernels,
     group_divisor: u32,
+    element_bits: u32,
 ) -> u32 {
     const STREAMED_BYTES_PER_INPUT_TAP: u32 = 64;
-    let working_set =
-        kernels[0] as u32 * kernels[1] as u32 * weight_channels * STREAMED_BYTES_PER_INPUT_TAP
-            / group_divisor;
+    // 64 bytes is what one streamed output-channel group costs per (tap,
+    // Cin) at 16 bits and below -- the corpus measures the *same* 64 at
+    // fp16 and int8, so the group is a fixed number of channels and 64
+    // bytes is what they occupy at two bytes or fewer.
+    //
+    // At four bytes those same channels occupy twice as much, and taking
+    // the calibrated 64 there does not merely mis-predict a split: it
+    // grants a starved coefficient stream and **hangs the NPU**. Measured
+    // on `planck` 2026-09-04, tf32 8x8 k=3 `Cout` 64: `Cin` 512 plans 3/9
+    // and is exact, 576 through 896 plan 5/7 or 4/8 and every one is a
+    // watchdog kill at ~500 ms. fp16 at the identical *coefficient
+    // footprint* -- `Cin` 1152, the same 1327104 bytes -- plans 1/11 and is
+    // exact, which is what says the fault is the grant rather than the
+    // size. With the scaling below tf32 `Cin` 576 asks for 11 banks like
+    // its fp16 twin.
+    //
+    // Deliberately `max(1, ..)` rather than a ratio: the corpus pins 1- and
+    // 2-byte widths at 64 and this must not move them.
+    let group_bytes_per_tap = STREAMED_BYTES_PER_INPUT_TAP * (element_bits / 16).max(1);
+    let working_set = kernels[0] as u32 * kernels[1] as u32 * weight_channels * group_bytes_per_tap
+        / group_divisor;
     let entries = working_set.div_ceil(CBUF_ENTRY_BYTES);
     let banks = entries.div_ceil(CBUF_ENTRIES_PER_BANK).max(1);
     if group_divisor == 1 {
@@ -715,13 +777,40 @@ impl Precision {
     /// `DPU_WDMA_SIZE_0.channel_wdma` -- carry the padded count while
     /// `weight_kernels` and `orig_channel` carry the true one.
     ///
-    /// Twice the atom width in both precisions: 16 for fp16 and 32 for int8.
-    /// A clean rule with no table and no exceptions in either -- verified at
-    /// every fp16 Cout in the corpus, including the awkward 20, 24, 28, 40,
-    /// 56 and 72 where the *input* padding needed special cases, and at 10
-    /// int8 values from 8 to 112.
+    /// Twice the atom width in both captured precisions: 16 for fp16 and 32
+    /// for int8. A clean rule with no table and no exceptions in either --
+    /// verified at every fp16 Cout in the corpus, including the awkward 20,
+    /// 24, 28, 40, 56 and 72 where the *input* padding needed special cases,
+    /// and at 10 int8 values from 8 to 112.
+    ///
+    /// **tf32 is the one rung where twice the atom width is not enough, and
+    /// getting it wrong hangs the NPU rather than returning wrong data.** A
+    /// 4-byte element makes `channels_per_atom` 4, so the rule above gives
+    /// 8 -- the only value in the menu that is not a multiple of 16. Every
+    /// tf32 shape whose padded `Cout` lands at 8 modulo 16 wedges the core
+    /// until the watchdog kills the job at ~500 ms; every one at 0 modulo 16
+    /// is exact. Measured on `planck` 2026-09-04 with `dtype_boundary_probe`,
+    /// three geometries and 23 points:
+    ///
+    ///   16x16 k3: hangs at Cout 8, 20, 24, 36, 40; exact at 12, 16, 28,
+    ///     32, 44
+    ///   7x7 k1: hangs at 8, 20, 24, 40; exact at 16, 32
+    ///   8x8 k1: hangs at 8, 20, 24, 40; exact at 48 -- three runs, identical
+    ///
+    /// Padded, those hanging counts are 8, 24, 24, 40, 40 and the exact ones
+    /// 16, 16, 32, 32, 48: every hang is `8 (mod 16)`, every pass `0`.
+    ///
+    /// Padding those same shapes to 16 instead clears every one of them --
+    /// all 15 re-measured cases pass. The mechanism is not established
+    /// beyond the modulus, and no other rung can reach the condition,
+    /// because every other granule in the menu -- 16 at
+    /// fp16/bf16/int16/fp16-f32out, 32 at int8, 64 at int4 -- is already a
+    /// multiple of 16.
     pub fn out_channel_granule(&self) -> u32 {
-        2 * self.channels_per_atom()
+        match self {
+            Precision::Tf32 => 16,
+            _ => 2 * self.channels_per_atom(),
+        }
     }
 
     /// Bytes in the widest, four-channel dense ARGB storage class: 8 at fp16
@@ -1910,8 +1999,11 @@ impl Shape {
         // and the "leaves three data banks" threshold does not survive a
         // second kernel size. The k=3 fit would have mis-planned k=5 `Cin` 192
         // as 6/6 against the vendor's 2/10.
-        let streamed_preference =
-            streamed_weight_bank_preference(self.streamed_contraction_channels(), kernels);
+        let streamed_preference = streamed_weight_bank_preference(
+            self.streamed_contraction_channels(),
+            kernels,
+            self.precision.element_bits(),
+        );
         assert!(
             streamed_preference <= CBUF_BANKS - 1,
             "coefficient working set wants {streamed_preference} CBUF banks for \
@@ -2610,11 +2702,11 @@ impl ConvPlan {
             1 | 3 => shape.demand_based_cbuf_partition(kernels),
             2 | 4 | 6 | 8 | 10 => even_square_cbuf_partition(shape, kernels),
             5 => {
-                assert_large_kernel_plan_case(shape);
+                assert_large_kernel_plan_case(shape, 5, true);
                 shape.demand_based_cbuf_partition(kernels)
             }
             7 => {
-                assert_large_kernel_plan_case(shape);
+                assert_large_kernel_plan_case(shape, 7, true);
                 // The focused sweep follows coefficient demand through seven
                 // banks (1/11, 2/10, 8/4, 7/5 and 5/7 are all observed), then
                 // switches to the streamed 8/4 schedule at demand ten.
@@ -2625,7 +2717,7 @@ impl ConvPlan {
                 }
             }
             9 => {
-                assert_large_kernel_plan_case(shape);
+                assert_large_kernel_plan_case(shape, 9, false);
                 if (33..=48).contains(&shape.in_channels) {
                     (7, 5)
                 } else {
@@ -2633,7 +2725,7 @@ impl ConvPlan {
                 }
             }
             11 => {
-                assert_large_kernel_plan_case(shape);
+                assert_large_kernel_plan_case(shape, 11, false);
                 match shape.in_channels {
                     1..=32 => (7, 5),
                     33..=48 => (5, 7),
@@ -2882,15 +2974,99 @@ impl ConvPlan {
     }
 }
 
-fn assert_large_kernel_plan_case(shape: Shape) {
+/// Guards the above-3x3 plan policies, which came from an fp16 capture
+/// sweep.
+///
+/// `precision_neutral` says whether the policy this kernel takes is stated
+/// in *bytes* or in *channels*, which is what decides whether the fp16
+/// sweep's CBUF split carries over to the other rungs:
+///
+///   * 5x5 takes [`Shape::demand_based_cbuf_partition`] -- the same
+///     function 1x1 and 3x3 use at every precision, whose demand comes from
+///     [`Shape::weight_bytes`] and [`Shape::data_bank_demand`]. There is no
+///     fp16-specific number anywhere in that path, so refusing the other
+///     rungs was a gate on the sweep's precision rather than on anything
+///     the policy does. Same for 7x7, whose one threshold is a
+///     `weight_bank_demand` in banks of bytes.
+///   * 9x9 and 11x11 instead key on `in_channels`, a channel *count* whose
+///     byte footprint is four times larger at tf32 than at int4. Those
+///     tables cannot be reinterpreted at another width without measuring,
+///     so they stay fp16.
+///
+/// Stride stays 1 everywhere above 3x3: the sweep has no strided capture at
+/// any kernel size, and that gap is precision-independent.
+///
+/// The `Cin` ceiling is [`large_kernel_max_in_channels`], which is where
+/// the hardware measurement lives.
+fn assert_large_kernel_plan_case(shape: Shape, kernel: usize, precision_neutral: bool) {
     assert!(
-        matches!(shape.precision, Precision::Fp16),
-        "automatic planning above 3x3 currently has capture backing only for fp16"
+        precision_neutral || matches!(shape.precision, Precision::Fp16),
+        "automatic planning at this kernel size currently has capture backing \
+         only for fp16"
     );
     assert_eq!(
         shape.stride, 1,
         "automatic planning above 3x3 currently has capture backing only at stride 1"
     );
+    let ceiling = large_kernel_max_in_channels(shape.precision, kernel).unwrap_or_else(|| {
+        panic!(
+            "{:?} convolution above 3x3 computes wrong values on RK3588; see \
+             large_kernel_max_in_channels",
+            shape.precision
+        )
+    });
+    assert!(
+        shape.in_channels <= ceiling,
+        "{kernel}x{kernel} {:?} is measured correct only to Cin {ceiling}, not \
+         {}; above it the NPU hangs and the watchdog kills the job",
+        shape.precision,
+        shape.in_channels,
+    );
+}
+
+/// Largest `Cin` a kernel above 3x3 is measured correct at, per precision --
+/// or `None` where the rung computes wrong values at *every* `Cin` and the
+/// kernel is refused outright.
+///
+/// Measured on `planck` 2026-09-04 with `dtype_boundary_probe`, `Selectors`,
+/// one shape per case, extents 8x8 / 16x16 / 32x32 (the boundary does not
+/// move with extent, and `Cout` does not move it either -- 7x7 fp16 at
+/// `Cin` 32 is exact at `Cout` 64, 128, 160, 192 and 256):
+///
+///   7x7   fp16  Cin 64 exact, 72/80/88/96/128/192 hang
+///   9x9   fp16  Cin 64 exact, 96 hangs
+///   11x11 fp16  Cin 64 exact, 96 hangs
+///   7x7   tf32  Cin 32 exact, 48/64/96 hang
+///   7x7   int4  Cin 128 exact, 160/192/224/256/288/384 hang
+///   7x7   bf16/int16  Cin 64 exact (the dtype ladders)
+///   5x5   fp16/bf16 to Cin 320, tf32 to 192, int4/int16 at 64: all exact
+///
+/// The four ceilings do not reduce to one quantity. `Cin * element_bytes`
+/// fits fp16 (128 bytes) and tf32 (128) and misses int4, which stops at 64;
+/// feature atoms fit fp16 and tf32 at 8 and miss int4 at 4. So this is a
+/// table of what was measured rather than a rule, and 5x5 is deliberately
+/// not in it -- nothing at 5x5 has failed yet, at any width.
+///
+/// **int8 is refused above 3x3 outright.** It is not a ceiling: at 5x5 and
+/// 7x7, `Cin` 16, 32 and 64 alike come back with every output channel
+/// holding the *same* value at a given pixel (`want 2 got -13`, ~14600 of
+/// 16384 elements wrong, max|diff| 30-43). That is the signature of the
+/// coefficients not reaching their channels at all, not of a starved
+/// stream, and no int8 capture above 3x3 exists to say what the program
+/// should be. The requantized and accumulator rungs share the packing, so
+/// both are refused.
+fn large_kernel_max_in_channels(precision: Precision, kernel: usize) -> Option<u32> {
+    match precision {
+        Precision::Int8(_) | Precision::Int8Accumulator(_) => None,
+        // 5x5 has no measured ceiling at any width; the CBUF planner's own
+        // refusal is what bounds it.
+        _ if kernel <= 5 => Some(u32::MAX),
+        Precision::Tf32 => Some(32),
+        Precision::Int4 => Some(128),
+        Precision::Fp16 | Precision::Fp16Accumulator | Precision::Bf16 | Precision::Int16 => {
+            Some(64)
+        }
+    }
 }
 
 /// Largest coefficient demand at which a non-square kernel's CBUF split is
@@ -6410,8 +6586,14 @@ mod tests {
         // larger streamed working-set grant at K3; keep the two rules
         // explicit so a policy change cannot masquerade as a new hardware
         // minimum.
-        assert_eq!(streamed_weight_bank_preference(256, [3, 3]), 5);
-        assert_eq!(streamed_weight_bank_preference(512, [3, 3]), 9);
+        assert_eq!(streamed_weight_bank_preference(256, [3, 3], 16), 5);
+        assert_eq!(streamed_weight_bank_preference(512, [3, 3], 16), 9);
+        // int8 and int4 share the fp16 calibration; only tf32's four bytes
+        // move the working set.
+        assert_eq!(streamed_weight_bank_preference(512, [3, 3], 8), 9);
+        assert_eq!(streamed_weight_bank_preference(512, [3, 3], 4), 9);
+        assert_eq!(streamed_weight_bank_preference(576, [3, 3], 16), 6);
+        assert_eq!(streamed_weight_bank_preference(576, [3, 3], 32), 11);
 
         // features.0's shape: weight_banks=1 here is not a starved
         // footprint, it is the footprint's *entire* real demand (1,728

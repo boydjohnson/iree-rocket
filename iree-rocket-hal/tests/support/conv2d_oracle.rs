@@ -106,6 +106,14 @@ pub enum OraclePattern {
 /// int16 wants a value past int8 and inside int16. bf16 wants one past
 /// fp16's 65504 ceiling and exactly representable in bf16, which is what an
 /// eight-bit mantissa times a power of two gives.
+///
+/// int4 is the exception: nothing is narrower than a nibble for it to be
+/// mistaken for, so its wide cases test the nibble's own *endpoints*
+/// instead. Every other pattern here stays inside [-3, 3], which leaves a
+/// nibble's top bit -- and its asymmetric minimum -- unexercised, so a
+/// sign-extension error in the packers or in the CORE would not show. The
+/// caller negates on the same parity this switches on, so the two values
+/// that reach hardware are exactly +7 and -8.
 fn wide_magnitude(precision: OraclePrecision, index: usize, phase: usize) -> i32 {
     let step = ((index + phase * 7) % 13) as i32;
     match precision {
@@ -114,6 +122,13 @@ fn wide_magnitude(precision: OraclePrecision, index: usize, phase: usize) -> i32
         // therefore also in tf32's wider ten-bit mantissa, while sitting an
         // order of magnitude past fp16's 65504 ceiling.
         OraclePrecision::Bf16 | OraclePrecision::Tf32 => (128 + 9 * step) << 12,
+        OraclePrecision::Int4 => {
+            if (index + phase) % 2 == 0 {
+                7
+            } else {
+                8
+            }
+        }
         other => panic!("{other:?} has no wide-operand magnitude"),
     }
 }

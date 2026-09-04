@@ -19,6 +19,9 @@ by rockchip-npu-notes with its own HW evidence, not re-measured here;
 Severity: **S1** wrong results reach a user, **S2** wrong results reach a
 developer or a measurement, **S3** performance, **S4** hygiene.
 
+Updated 2026-09-04 with C8 and M4, both found while re-running the offload
+A/Bs under the pinned governor and relocated IRQs that M1 and M3 asked for.
+
 ---
 
 ## C1 (S1) — RESOLVED 2026-09-03: there is no coefficient-per-channel limit at any kernel size. The accumulator writes the wrong output cube, and the readback models the wrong one to match.
@@ -705,6 +708,288 @@ the memories that made load-bearing claims.
 
 ---
 
+## C8 (S2) — the int8 offload path hangs the NPU after ~2 consecutive inferences, and every int8 timing ever recorded absorbed those hangs
+
+Found 2026-09-04 while re-running the offload A/Bs, and found only because C3's
+guard now exists to refuse the result.
+
+Both int8 builds — 22 NPU sites and 48 — abort under `iree-benchmark-module`
+with `HUNG_JOB_DISPATCH_FLOOR` firing at **505–532 ms** [verified]. Both fp16
+builds run the identical harness with **zero** hangs across 34 and 19
+iterations. Single `iree-run-module` invocations of the same int8 module are
+**8/8 clean**. The discriminator is *repeated invocation in one process*, not
+the shapes:
+
+| `--benchmark_min_time` | iterations | hangs |
+|---|---|---|
+| 0.001s / 0.05s | 1 | 0 |
+| 0.5s | 2 | 0 (sometimes aborts) |
+| >= 1s | aborts, or 4 iterations with 1 hang | 1 |
+
+Stochastic past ~2 inferences, matching the order-dependence in
+`npu-wedges-after-failed-job`. **The wedge crosses process boundaries**: a
+single-shot `fp16.prerise` run that had just completed 34 clean benchmark
+iterations hung immediately after the int8 arms hung.
+
+**This retroactively invalidates the int8 performance numbers.** They were taken
+before C3's guard existed, so hung dispatches were absorbed silently. Against a
+CPU-only int8 build measured at 131–133 ms:
+
+    22 sites  1.42 items/s =  704 ms/iter   ~= baseline + one ~510 ms hang
+    48 sites  0.90 items/s = 1111 ms/iter   ~= baseline + two
+
+So **"more offload is worse" plausibly measured more hangs, not more offload
+cost.** Consistent-with, not proven — the old CPU arm was also an NCHW build
+(M4). Correctness is unaffected: the int8 path remains bit-exact.
+
+The first two inferences are always right, which points at **state not reset
+between inferences** rather than a shape or layout bug. Probably the same defect
+as `fp16-depthwise-int8-mix-corrupts`, also a ~510 ms deterministic hang.
+
+### Localised 2026-09-04: it is the `Int8Accumulator` -> `Fp16` transition, and it is not the program
+
+Ablation, same model and pipeline, varying only which matchers may fire
+(3 trials each, `--benchmark_min_time=2s`, canary run after every trial):
+
+| arm | NPU sites | result |
+|---|---|---|
+| `int8.stemonly` (f16 stem only) | 1 | clean, 21 iterations |
+| `int8.dw` (int8 depthwise only) | 4 | clean, 17–18 iterations |
+| `int8.dense` (int8 dense only) | 17 | clean, 10–11 iterations |
+| `int8.nostem` (dense + depthwise, **no** f16 stem) | 21 | **clean, 8–9 iterations** |
+| `int8.stem_dw` (stem + depthwise) | 5 | clean, 15–18 iterations |
+| `int8.stem_dense` (stem + dense) | 18 | **hangs 3/3** |
+| `int8.prerise` (everything) | 22 | **hangs 3/3** |
+
+So neither precision hangs alone, depthwise is not involved, and the minimal
+mix is **one f16 dense conv plus the int8 dense convs**.
+
+**Which dispatch hangs.** `ROCKET_DISPATCH_TIMES=1` with a precision tag: the
+model is 28 tasks per inference — 6 tasks of the f16 stem, then 22 int8
+accumulator tasks. Inference 1 completes all 28 at 0.15–5.21 ms. The hang is
+always the **first f16 job after the int8 run**, within its first three tasks
+(task 3 in 4/5 runs, task 1 in 1/5), at 519–530 ms. The reverse transition is
+safe: every int8 job that follows the f16 stem inside inference 1 is fine, so
+**the asymmetry is `int8acc -> fp16`, not a mix per se.**
+
+An f16-only build is clean 9/9 in isolation, but it is *not* immune once the
+device has been wedged: one f16 trial run immediately after a hanging int8 arm
+logged a hang of its own. Measure f16 from a quiet device or the rate is
+meaningless.
+
+**It is not the program.** An FNV-1a hash over every task's program words is
+byte-identical across all executions (`0xc310e9aa0aced33a`), with identical
+regcmd IOVAs (`0x37d000..0x382000`) and identical in/out BO handles. The same
+program that hung ran six times cleanly minutes earlier. The only variable is
+device state left by the intervening int8 jobs.
+
+**Three hypotheses eliminated**, each with a direct experiment:
+
+- **Settling time.** Forcing the existing `DEPTHWISE_TO_DENSE_QUIESCENCE` 1 ms
+  dwell before *every* dispatch does not help (still 3/3 hangs). The knob was
+  confirmed live by its cost: 280 -> 301 ms on a clean arm, ~1.2 ms x 17
+  dispatches.
+- **GEM handle / IOVA recycling.** Leaking every per-tile regcmd BO, so no
+  handle or IOVA is ever recycled, does not help (still 3/3).
+- **A register the f16 program fails to re-initialise.** Both programs write
+  **exactly the same 126 registers** — the set difference is empty in both
+  directions.
+
+So the stale state is not reachable through the registers either program
+writes. The remaining candidates are hardware state the regcmd does not cover:
+the accumulator path's write-back FSM, or CBUF/CACC state. Next step is to diff
+the precision transition against `../rocket-userspace`, the known-good C
+emitter, rather than sweep registers — the lesson from C1's method note.
+
+Diagnostics used are committed (precision tag threaded into `DispatchJob`,
+program hash, register-set dump with values, and the two probe knobs), rather
+than left in a working tree the way C7's were.
+
+
+### The `../rocket-userspace` diff, 2026-09-04: the conv register program is exonerated
+
+Done as C1's method note prescribes -- diff the whole program against the
+known-good emitter rather than sweep. Result is a **definite negative**, which
+is worth as much as a hit: it removes the conv regcmd from suspicion entirely.
+
+**1. The register *sets* are identical.** Extracting every `NPUOP(..., REG)` in
+`gen_conv2d_task` (npu_regcmd.c:2220-2523) and resolving the names through
+`npu_hw.h` gives **124** distinct registers. This repo's conv program writes
+**124** plus the PC trailer. The set difference is **empty in both directions**
+-- so is the difference between this repo's own fp16 and int8 programs
+(126 vs 126, verified with `ROCKET_DUMP_REGSET`).
+
+**2. The one value divergence is load-bearing here, and is not a defect.**
+`DPU_RDMA_FEATURE_MODE_CFG` (0x5044) differs on two fields:
+
+| field | this repo (fp16) | this repo (int8) | `gen_conv2d_task` |
+|---|---|---|---|
+| BURST_LEN [14:11] | 15 | 15 | 15 |
+| MRDMA_DISABLE bit4 | 1 | 1 | 1 |
+| MRDMA_FP16TOFP32 bit3 | 0 | 0 | `fp32tofp16_en` |
+| IN_PRECISION [17:15] | 2 (fp16) | 0 | 0 |
+| PROC_PRECISION [7:5] | 2 (fp16) | 0 | 0 |
+
+The reference's header says those precision fields are *"Left at 0 (=int8) for
+the plain-conv path because the whole RDMA block is off there"*, and this repo
+arms neither MRDMA nor ERDMA -- so adopting the reference's spelling looked
+obvious. **It is wrong here.** Clearing `in_precision`/`proc_precision` makes
+this repo's *fp16* path hang on its own, 3/3, with no int8 in the model at all;
+restoring them restores a clean 3/3. Adding the missing `mrdma_fp16tofp32_en`
+on top of the existing fields is harmless (fp16 stays clean 3/3) but does not
+fix the mix. So the two stacks genuinely diverge on this register and this
+repo's spelling is the one its own fp16 path requires. Recorded, not "fixed".
+
+**3. The only registers this repo never writes are the PPU block** -- 26 of
+them, 0x6xxx/0x7xxx, written in the reference only by `gen_pool_fp16`. Nothing
+here routes to pooling (P5), so neither precision touches them and they cannot
+be what differentiates the two.
+
+**What the diff did yield is the mechanism's precondition.**
+`tests/regcmd_persist_rocket.c` establishes, deterministically on RK3588:
+
+> the NPU register file is **NOT cleared between jobs/processes** ... the
+> register file persists globally (not reset on job/process boundaries).
+
+and the npu_regcmd.c header documents the exact failure signature being chased,
+for a different cause:
+
+> the DPU read-DMA engine stays armed waiting for a main-RDMA feed that never
+> arrives: **the DPU never raises completion, and the job watchdog reports "NPU
+> job timed out" with the output left untouched.**
+
+Global register persistence is what makes a hang conditional on what ran
+before, and it is why the same program hashes identically and still fails. But
+since both programs write the same 124 registers with self-consistent values,
+**the carried-over state is not in the registers either program writes.** That
+leaves hardware state the regcmd does not address at all -- CBUF contents, CACC,
+or the DPU write-back FSM -- and those are the next place to look, not the
+program.
+
+
+
+### CBUF and the rest of the program, 2026-09-04: also clean
+
+Following the register diff, the remaining parts of the program were checked
+with `ROCKET_DUMP_REGSET` (values) against both `../rocket-userspace` and this
+repo's own two precisions. Nothing here is wrong either.
+
+**The PC trailer and enable mask are identical.** Both precisions emit
+`0x41:0x0000=0x0` then `0x81:0x0008=0x1d`. `gen_conv2d_task`
+(npu_regcmd.c:2521) emits `NPUOP(OP_ENABLE, 0x1D, PC_OPERATION_ENABLE)` -- the
+same word. The trailer cannot be the differentiator.
+
+**CBUF bank programming is correct and is not precision-specific.**
+`CNA_CBUF_CON0` decodes as the reference's
+`(weight_bank << 4) | data_bank | reuse bits`:
+
+| program | weight_bank | data_bank | reuse | fc_data_bank |
+|---|---|---|---|---|
+| fp16 stem | 1 | 11 | 0 | 0 |
+| int8, 6 distinct splits | 3, 10, 5, 7, **1**, 8 | 9, 2, 7, 5, **11**, 4 | 0 | 0 |
+
+The int8-only arm uses **six different bank splits within one inference**,
+including `0x001b` -- weight 1 / data 11, byte-identical to the split the fp16
+stem uses -- and runs clean 10-12 iterations, 3/3. So re-partitioning the CBUF
+between jobs is demonstrably safe, and the fp16 stem's split is not even
+distinctive. Reuse bits are 0 in every program (P4 is still un-attempted, as
+recorded), and `FC_DATA_BANK[10:8]` is 0 everywhere, which is what P4's warning
+requires.
+
+**`CNA_CBUF_CON1` is a documented width divergence, not a defect.** The fp16
+stem programs `data_entries = 9512` against the int8 convs' 21-168. The
+reference masks this field to 13 bits (`& 0x1FFF`), which would truncate 9512
+to 1320 -- but this repo's field is 15 bits on the strength of vendor corpora
+that used bit 13 at 11,264 and bit 14 through 25,600 (`cna.rs` `data_entries`).
+9512 is inside the observed vendor range, so it is in-family; the reference
+simply never emitted a feature map big enough to find the wider field.
+
+**Of the 40 registers whose values differ between the two precisions**, every
+one is accounted for by shape (cube extents, strides, DMA sizes) or by
+precision (`DPU_DATA_FORMAT`, `BS_MUL_CFG`, `OUT_CVT_SCALE`, the RDMA precision
+fields above). None is a mode bit left set by one path and unread by the other.
+
+**Net: the regcmd is exonerated end to end** -- coverage, values, CBUF
+partitioning, and the enable trailer. Combined with the byte-identical program
+hash across the working and hanging executions, no part of what this repo sends
+the device explains the hang. What is left is state the regcmd does not
+address, and finding it needs a different class of tool than program diffing:
+hardware read-back between jobs, or a core reset inserted at the
+`int8acc -> fp16` boundary to see whether it clears.
+
+**One limit worth stating.** MobileNetV2 gives exactly one fp16 conv in the
+int8 model (the stem), so "the *first* fp16 job after int8 hangs" and "*this
+shape* hangs after int8" are not separated by any experiment run here. A model
+with several fp16 convs among int8 ones would separate them, and is the cheapest
+next probe.
+
+
+---
+
+## C9 (S2) — above 3x3 the conv path has two faults the fp16 capture sweep could not have seen: a `Cin` cliff that hangs at every width, and an int8 program that computes wrong values at every shape
+
+Found 2026-09-04 while extending the datatype ladders past their first-light
+shapes (bf16, int16, int4, tf32, fp16-f32out). Both are **guarded now** rather
+than fixed: `large_kernel_max_in_channels` refuses what hardware does not do,
+so a program that used to hang is a loud panic instead. Neither is reachable
+from the compiler, whose matchers stop at 3x3.
+
+The same sweep found two tf32 faults that *are* fixed, both also hangs rather
+than wrong data, and both now board-validated over the whole ladder:
+`Precision::out_channel_granule` (tf32 was the one rung whose granule was not
+a multiple of 16, and every padded `Cout` at `8 (mod 16)` hung) and
+`streamed_weight_bank_preference_for_group` (its coefficient working set was
+calibrated at 1- and 2-byte widths and starved the 4-byte stream, so tf32 k=3
+`Cin` 576-896 planned 5/7 and hung where the same *footprint* at fp16 plans
+1/11 and is exact). Neither is in the table below.
+
+### The `Cin` cliff [verified]
+
+At 7x7, 9x9 and 11x11, a convolution is exact up to a per-width `Cin` and
+**hangs the NPU above it** -- a watchdog kill at ~500 ms, `prep_bo` returning
+success over an error-signalled fence, i.e. the C3 signature. Measured with
+`dtype_boundary_probe`, `Selectors`, one shape per case:
+
+| kernel | precision | exact | hangs |
+|---|---|---|---|
+| 7x7 | fp16 | `Cin` 64 | 72, 80, 88, 96, 128, 192 |
+| 9x9 | fp16 | 64 | 96 |
+| 11x11 | fp16 | 64 | 96 |
+| 7x7 | tf32 | 32 | 48, 64, 96 |
+| 7x7 | int4 | 128 | 160, 192, 224, 256, 288, 384 |
+| 7x7 | bf16, int16 | 64 | — (ladder stops at the fp16 ceiling) |
+
+Three things it is **not**: extent-dependent (the fp16 cliff sits between 64
+and 72 at 8x8, 16x16 and 32x32 alike), `Cout`-dependent (7x7 fp16 at `Cin` 32
+is exact at `Cout` 64, 128, 160, 192 and 256, up to a *larger* coefficient
+footprint than the hanging shapes), or a CBUF-split artifact (9x9 `Cin` 64
+takes 6/6 and 11x11 takes 3/9, and both hang one step later). The ceilings do
+not reduce to one quantity either: `Cin * element_bytes` fits fp16 and tf32 at
+128 bytes and misses int4 at 64; feature atoms fit those two at 8 and miss
+int4 at 4.
+
+**Why it was invisible:** `conv_kernel_size_hw.rs`, the only above-3x3
+coverage, sweeps `Cin` 16, 24, 32, 48 and 64 -- it stops exactly at the last
+value that works. 5x5 is unaffected at every width tried (fp16 and bf16 to
+`Cin` 320, tf32 to 192).
+
+### int8 above 3x3 [verified]
+
+At 5x5 and 7x7, int8 returns **the same value in every output channel of a
+pixel** -- `want 2 got -13`, ~14,600 of 16,384 elements wrong, max|diff| 30-43
+-- at `Cin` 16, 32 and 64 alike, on a healthy device with a passing canary.
+That is coefficients not reaching their channels, not a starved stream. No
+int8 capture above 3x3 exists to say what the program should be, so both int8
+rungs are refused there rather than guessed at.
+
+The gate that used to hide all of this refused *every* non-fp16 precision above
+3x3, on the grounds that the capture sweep was fp16. Half of that was
+over-broad -- 5x5 and 7x7 take `demand_based_cbuf_partition`, which is stated
+in bytes and shared with 1x1 and 3x3 at every precision -- and the other half
+was masking a fault fp16 has too.
+
+---
+
 ## M1 (S2) — `planck` runs `ondemand` with a 408 MHz A76 floor, which is the worst case the notes measured
 
 Read off the board [verified, 2026-09-03]:
@@ -795,6 +1080,58 @@ dispatch (`device.rs:1570`), so this term scales with tile count, and a
 multi-tile MobileNetV2 layer pays it many times over.
 
 Free to test: `echo 6 > /proc/irq/{82,83,84}/smp_affinity_list`, no code change.
+
+---
+
+## M4 (S2) — every NPU-vs-CPU comparison in this repo used an NCHW CPU baseline that is 2.8x slower than the rocket pipeline's own CPU code
+
+Measured on `planck` 2026-09-04 [verified], governor pinned to `performance`,
+NPU IRQs on cpu6, app on cpu4-5, three interleaved passes, MobileNetV2
+(`mnv2.fp16.mlir`), 224x224 input:
+
+    fp16.cpu.nchw    3.93  3.93  3.95 items/s   <- the historical "CPU-only" baseline
+    fp16.cpu        10.90 10.91 10.88           <- like-for-like CPU-only
+    fp16.prerise     4.28  4.34  4.22           <- 18 NPU sites
+    fp16.raised      2.71  2.68  2.82           <- 35 NPU sites
+
+`rocket_conv2d_transform_spec.mlir` applies
+`iree-preprocessing-convert-conv-to-channels-last` followed by
+`linalg-specialize-generic-ops` **before** the matcher loop, so the whole model
+is NHWC whether or not anything offloads. A CPU-only build made with plain
+`iree-compile` never gets that and stays NCHW, and IREE's CPU backend is 2.8x
+slower on NCHW MobileNetV2.
+
+Isolated by bisection: deleting only those two `apply_registered_pass` lines
+from the spec takes the rocket-pipeline CPU build from **10.94 to 3.94
+items/s**, reproducing the historical baseline exactly. The dispatch names are
+the tell — `matmul_like_528x14x14x88_f32` (NCHW) against
+`matmul_like_14x14x528x88_f32` (NHWC), same 55 dispatches either way.
+
+Passing `--iree-preprocessing-pass-pipeline='builtin.module(iree-preprocessing-convert-conv-to-channels-last)'`
+to plain `iree-compile` does **not** reproduce it (still 3.96 items/s): at that
+point the model is still torch-level and there are no linalg convs to
+transpose. The spec gets it because it runs as a transform spec after linalg
+conversion.
+
+**Consequence.** The `fp16-channel-caps-raised` headline is retracted. The
+18-site fp16 build is **2.5x slower** than CPU-only, not 6% faster, and no
+configuration in this repo has ever beaten a like-for-like CPU build. The
+correctness of the arms is not in question — both NPU arms agree with the NHWC
+CPU arm to 0.025 max|err| with identical top-5, which they could not do if the
+baseline were miscomputing.
+
+**And M1/M3 turned out not to bind.** With the governor pinned *and* the IRQs
+moved to cpu6, both fp16 NPU arms land within noise of their pre-fix values
+(18 sites 4.22–4.34 against 4.16–4.27; 35 sites 2.68–2.82 against 2.67–2.69).
+The notes' 3.2x needs idle gaps between invocations, which a benchmark loop
+never provides. Pin them anyway — they are free and they remove the argument —
+but the confound that actually mattered was the baseline's conv layout.
+
+**Action.** Build the CPU-only arm with the *same* rocket-compiler pipeline and
+a transform spec whose matchers cannot fire: rewrite every
+`transform.iree.match.dim_bounds ... umin = N, umax = M` to
+`umin = 999999, umax = 999999` (34 of them; verified to yield zero offload).
+Never compare against a plain `iree-compile` build.
 
 ---
 
@@ -1019,12 +1356,27 @@ so they must disagree somewhere.
 
 ## Suggested order
 
-1. **C1** — resolved and now the biggest item: the int8 accumulator has **no** coefficient cap at any kernel size once the writer and readback are the matching pair (`mc_surf_out=0` + C2=4). Land the writer + readback change, drop three guards, raise both transform-spec int8 Cin caps, re-audit MobileNetV2.
-2. **C3** — a live silent-wrong-results path in production, and the smallest fix here. C1 measured its argument twice over: a 30x wall-clock separation between a watchdog-killed job and a healthy one, with `PREP_BO` returning success either way.
-3. **M1 + M2 + M3** — free or nearly free, and they change what every subsequent measurement means. Do these before re-running any A/B.
+Revised 2026-09-04. C1 and C3 are landed and verified in the tree. M1 and M3
+were applied on the board and turned out **not** to bind (see M4), which
+demotes them; M2 is the only platform item with an open case. The re-audit they
+were meant to enable found two larger things, and both are now at the top.
+
+1. **C8** — the int8 offload path cannot complete a benchmark loop, and the
+   first two inferences are always right. That is a state-reset bug, not a
+   shape bug, and it currently blocks every int8 performance question. Likely
+   the same defect as `fp16-depthwise-int8-mix-corrupts`.
+2. **M4** — already established; what remains is to stop using the NCHW
+   baseline. Cheap, and it is the precondition for any offload decision being
+   meaningful.
+3. **P3 → C4 → P4 → P1** — the dispatch-path cost stack, roughly in increasing
+   order of work. This is where the offload deficit actually lives: a
+   like-for-like CPU build is 2.5x faster than the best NPU configuration, so
+   the per-dispatch and per-tile taxes are the whole game.
 4. **C2** — small fix, plus a probe that settles a question the notes leave open.
-5. **P3 → C4 → P4 → P1** — the dispatch-path cost stack, roughly in increasing order of work.
-6. **P2** — the big structural one; measure the regime first, under a pinned governor.
+5. **M2** — ~1.43x on the device half, but it needs a driver-side
+   `clk_set_rate` and both shortcuts hang the box.
+6. **P2** — the big structural one; measure the regime first.
+7. **C5, C6, C7, D1, D2** — hygiene and reconciliation.
 
 ## Method note
 
