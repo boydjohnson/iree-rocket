@@ -47,6 +47,7 @@
 //! | [`Precision::Int8Accumulator`] | 0 | 1 B | 16 ch | 32 / 32 | int32 |
 //! | [`Precision::Int16`] | 1 | 2 B | 8 ch | 16 / 32 | int16 |
 //! | [`Precision::Fp16`] | 2 | 2 B | 8 ch | 16 / 32 | fp16 |
+//! | [`Precision::Fp16Accumulator`] | 2 | 2 B | 8 ch | 16 / 32 | fp32 |
 //! | [`Precision::Bf16`] | 3 | 2 B | 8 ch | 16 / 32 | bf16 |
 //! | [`Precision::Tf32`] | 7 | 4 B | 4 ch | 16 / **16** | fp32 |
 //!
@@ -60,6 +61,11 @@
 //!   every width; below four bytes the K-group is pinned at 32 and the
 //!   N-group absorbs the width, but at four bytes the N-group stays 16 and
 //!   the K-group halves. A uniform-coefficient test cannot see this at all.
+//! - **fp16's narrowing is a bit, not a precision.** An fp16 convolution
+//!   already accumulates in fp32; `fp32tofp16_en` is what narrows the
+//!   result on the way out. Keeping the accumulator is that bit cleared
+//!   plus the float writer's 4-byte geometry, and moves no register on the
+//!   input side at all.
 //! - **int4's write-out.** Its int16 result is written by the integer path,
 //!   which strides as if each element were eight bytes (`size_e = 7`) with
 //!   an 8x surface multiplier, not the float path's natural 1 and 2x. With
@@ -548,6 +554,26 @@ pub enum Precision {
     /// (`encodings/output-transpose-int16.md`), so this variant exists to be
     /// characterized on hardware before anything depends on it.
     Int16,
+    /// fp16 inputs and coefficients with the **fp32 accumulator** written
+    /// to memory instead of narrowed back to fp16.
+    ///
+    /// Byte-for-byte the [`Precision::Fp16`] program on the input side --
+    /// same 2-byte element, same feature atom, same coefficient padding --
+    /// with the DPU's output stage switched from the fp16 narrowing writer
+    /// to the fp32 one: `out_precision = 5`, `size_e = 3`, a 4x surface
+    /// multiplier, and `fp32tofp16_en` cleared. That last bit is what
+    /// actually does the narrowing on the ordinary fp16 path, so leaving it
+    /// set with an fp32 output precision would be self-contradictory.
+    ///
+    /// What it buys is the output rounding, not the arithmetic: an fp16
+    /// convolution already accumulates in fp32 and only loses precision on
+    /// the way out. It costs twice the output bandwidth and twice the
+    /// result allocation.
+    ///
+    /// The 4-byte result means a 4-lane output cube (`C2 = 16 bytes / 4`),
+    /// the same cube int8's int32 accumulator and tf32's fp32 result write;
+    /// the *input* cube is unchanged at 8 fp16 channels.
+    Fp16Accumulator,
     /// tf32: an fp32 container holding a 10-bit mantissa with fp32 range,
     /// accumulating into fp32.
     ///
@@ -610,7 +636,7 @@ impl Precision {
     pub fn element_bits(&self) -> u32 {
         match self {
             Precision::Tf32 => 32,
-            Precision::Fp16 | Precision::Bf16 | Precision::Int16 => 16,
+            Precision::Fp16 | Precision::Fp16Accumulator | Precision::Bf16 | Precision::Int16 => 16,
             Precision::Int8(_) | Precision::Int8Accumulator(_) => 8,
             Precision::Int4 => 4,
         }
@@ -650,13 +676,30 @@ impl Precision {
             // requantization.
             Precision::Fp16 | Precision::Bf16 | Precision::Int16 | Precision::Int4 => 2,
             Precision::Int8(_) => 1,
-            Precision::Int8Accumulator(_) | Precision::Tf32 => 4,
+            Precision::Int8Accumulator(_) | Precision::Tf32 | Precision::Fp16Accumulator => 4,
         }
     }
 
     /// Whether this mode writes the exact int32 convolution accumulator.
+    ///
+    /// Deliberately int8-only: it gates the *integer* accumulator writer --
+    /// `size_e = 7`, the 8x surface multiplier, the staged contiguous-tile
+    /// output placement and the BS/CPEND bypasses. The fp32-result rungs
+    /// keep the float writer and are asked about with
+    /// [`Precision::writes_fp32_result`] instead.
     pub fn writes_accumulators(&self) -> bool {
         matches!(self, Precision::Int8Accumulator(_))
+    }
+
+    /// Whether the DPU writes a 4-byte fp32 result.
+    ///
+    /// Two rungs do: tf32, whose accumulator has no narrower container, and
+    /// fp16 with its accumulator kept. Both take the float writer's natural
+    /// geometry for a 4-byte element -- `size_e = 3` and a 4x surface
+    /// multiplier -- which is what the notes' proven fp32-out matmul writer
+    /// uses, and not the integer path's `size_e = 7` / 8x.
+    pub fn writes_fp32_result(&self) -> bool {
+        matches!(self, Precision::Tf32 | Precision::Fp16Accumulator)
     }
 
     /// Channels one 16-byte feature atom carries.
@@ -696,7 +739,9 @@ impl Precision {
     /// rather than the extent of the arithmetic.
     pub fn max_in_channels(&self) -> u32 {
         match self {
-            Precision::Fp16 | Precision::Bf16 | Precision::Int16 => MAX_INPUT_CHANNELS,
+            Precision::Fp16 | Precision::Fp16Accumulator | Precision::Bf16 | Precision::Int16 => {
+                MAX_INPUT_CHANNELS
+            }
             Precision::Int8(_) | Precision::Int8Accumulator(_) => MAX_INT8_INPUT_CHANNELS,
             Precision::Int4 => MAX_INT4_INPUT_CHANNELS,
             Precision::Tf32 => MAX_TF32_INPUT_CHANNELS,
@@ -708,7 +753,9 @@ impl Precision {
     /// [`MAX_INT8_OUTPUT_CHANNELS`].
     pub fn max_out_channels(&self) -> u32 {
         match self {
-            Precision::Fp16 | Precision::Bf16 | Precision::Int16 => MAX_OUTPUT_CHANNELS,
+            Precision::Fp16 | Precision::Fp16Accumulator | Precision::Bf16 | Precision::Int16 => {
+                MAX_OUTPUT_CHANNELS
+            }
             Precision::Int8(_) | Precision::Int8Accumulator(_) => MAX_INT8_OUTPUT_CHANNELS,
             Precision::Int4 => MAX_INT4_OUTPUT_CHANNELS,
             Precision::Tf32 => MAX_TF32_OUTPUT_CHANNELS,
@@ -719,7 +766,7 @@ impl Precision {
     /// CORE processing and DPU stages.
     fn data_precision(&self) -> DataPrecision {
         match self {
-            Precision::Fp16 => DataPrecision::Fp16,
+            Precision::Fp16 | Precision::Fp16Accumulator => DataPrecision::Fp16,
             Precision::Bf16 => DataPrecision::Bf16,
             Precision::Int16 => DataPrecision::Int16,
             Precision::Int4 => DataPrecision::Int4,
@@ -737,7 +784,7 @@ impl Precision {
     fn dpu_data_precision(&self) -> OutputPrecision {
         match self {
             Precision::Tf32 => OutputPrecision::Fp32,
-            Precision::Fp16 => OutputPrecision::Fp16,
+            Precision::Fp16 | Precision::Fp16Accumulator => OutputPrecision::Fp16,
             Precision::Bf16 => OutputPrecision::Bf16,
             Precision::Int16 => OutputPrecision::Int16,
             Precision::Int4 => OutputPrecision::Int4,
@@ -762,7 +809,9 @@ impl Precision {
             Precision::Int16 => OutputPrecision::Int16,
             Precision::Int4 => OutputPrecision::Int16,
             // The DPU has no tf32 code at all; the stage runs at fp32.
-            Precision::Tf32 => OutputPrecision::Fp32,
+            // fp16-with-accumulator asks for the same writer from the other
+            // direction: its stages stay fp16 and only the result widens.
+            Precision::Tf32 | Precision::Fp16Accumulator => OutputPrecision::Fp32,
             Precision::Int8(_) => OutputPrecision::Int8,
             Precision::Int8Accumulator(_) => OutputPrecision::Int32,
         }
@@ -774,6 +823,7 @@ impl Precision {
     pub fn quantization(&self) -> Option<Quantization> {
         match self {
             Precision::Fp16
+            | Precision::Fp16Accumulator
             | Precision::Bf16
             | Precision::Int16
             | Precision::Int4
@@ -1201,6 +1251,15 @@ impl Shape {
             self.in_channels, self.out_channels,
             "depthwise capture backing covers a channel multiplier of one only"
         );
+        // Depthwise has its own output writer -- a 256-byte write atom on
+        // the serial path -- which the fp32-result geometry has never been
+        // measured against. Refuse rather than guess; the dense ladders say
+        // nothing about it.
+        assert!(
+            !self.precision.writes_fp32_result(),
+            "{:?} depthwise output is unmeasured",
+            self.precision
+        );
         self.depthwise = true;
         self
     }
@@ -1260,7 +1319,7 @@ impl Shape {
         }
         if self.depthwise {
             3
-        } else if self.precision == Precision::Tf32 {
+        } else if self.precision.writes_fp32_result() {
             // The float rule, `size_e = output bytes - 1`: a 4-byte fp32
             // result is 3, which is what the notes' fp32-out writer uses.
             3
@@ -4284,7 +4343,12 @@ fn conv_2d_tile_program(
     );
     commands.push(
         Register::<DpuOutCvtScale>::new()
-            .fp32tofp16_en(Bits::new(u32::from(quantization.is_none())))
+            // The bit that does the narrowing on the ordinary fp16 path.
+            // A rung whose result *is* the fp32 accumulator clears it; the
+            // quantized paths never set it.
+            .fp32tofp16_en(Bits::new(u32::from(
+                quantization.is_none() && !shape.precision.writes_fp32_result(),
+            )))
             .out_cvt_scale(Bits::new(output_scale))
             .build(),
     );
@@ -4338,9 +4402,9 @@ fn conv_2d_tile_program(
                 }
             } else if let Some(surf_add) = int4_override(shape.precision, "SURF_ADD") {
                 surf_add
-            } else if shape.precision == Precision::Tf32 {
+            } else if shape.precision.writes_fp32_result() {
                 // The float path's surface multiplier is the output element
-                // width: 2 for a 2-byte result, 4 for tf32's fp32 one.
+                // width: 2 for a 2-byte result, 4 for an fp32 one.
                 full_out_width * out_height * 4
             } else if shape.precision == Precision::Int4 {
                 // The integer write path's surface multiplier is 8, not the
@@ -4565,6 +4629,79 @@ mod tests {
     /// footprint are all consequences of the half-byte element, and they
     /// match what `../rockchip-npu-notes/encodings/tile-layouts.md` records
     /// for int4.
+    /// Keeping the fp16 accumulator moves the output writer and nothing
+    /// else.
+    ///
+    /// fp16 already accumulates in fp32 and only loses precision on the way
+    /// out, so this rung must not disturb the input side at all: same
+    /// coefficient buffer, same feature geometry, same CNA and CORE
+    /// programming. What it does move is exactly the four registers that
+    /// describe the result -- and `fp32tofp16_en` in particular, which is
+    /// what performs the narrowing that this rung exists to avoid.
+    #[test]
+    fn fp16_accumulator_moves_only_the_output_writer() {
+        let kernels: Kernels = [3, 3];
+        let narrowed = Shape::with_precision(8, 8, 1, 64, 64, Precision::Fp16);
+        let kept = Shape::with_precision(8, 8, 1, 64, 64, Precision::Fp16Accumulator);
+
+        assert_eq!(
+            narrowed.weight_bytes(kernels),
+            kept.weight_bytes(kernels),
+            "the coefficient buffer must be untouched"
+        );
+        assert_eq!(narrowed.padded_channels(), kept.padded_channels());
+        assert_eq!(narrowed.padded_out_channels(), kept.padded_out_channels());
+        assert_eq!(
+            narrowed.output_scratch_bytes(kernels) * 2,
+            kept.output_scratch_bytes(kernels),
+            "a 4-byte result doubles the allocation"
+        );
+        // The 4-byte result writes a 4-lane output cube, where the fp16 one
+        // writes 8 -- `C2 = 16 bytes / out element`, the same cube int8's
+        // int32 accumulator and tf32's fp32 result use.
+        assert_eq!(
+            kept.output_atom_bytes() / kept.precision.output_element_bytes(),
+            4
+        );
+        assert_eq!(
+            narrowed.output_atom_bytes() / narrowed.precision.output_element_bytes(),
+            8
+        );
+
+        let moved: Vec<(u32, u32)> =
+            conv_2d_tile(narrowed, kernels, &Tile::whole(narrowed, kernels))
+                .iter()
+                .zip(&conv_2d_tile(kept, kernels, &Tile::whole(kept, kernels)))
+                .filter_map(|(before, after)| {
+                    let (domain, offset, before_value) = decode(before);
+                    let (_, _, after_value) = decode(after);
+                    (before_value != after_value).then_some((domain, offset))
+                })
+                .collect();
+        assert_eq!(
+            moved,
+            vec![
+                (
+                    <DpuDataFormat as RegisterMeta>::DOMAIN,
+                    <DpuDataFormat as RegisterMeta>::OFFSET
+                ),
+                (
+                    <DpuBsOwCfg as RegisterMeta>::DOMAIN,
+                    <DpuBsOwCfg as RegisterMeta>::OFFSET
+                ),
+                (
+                    <DpuOutCvtScale as RegisterMeta>::DOMAIN,
+                    <DpuOutCvtScale as RegisterMeta>::OFFSET
+                ),
+                (
+                    <DpuSurfaceAdd as RegisterMeta>::DOMAIN,
+                    <DpuSurfaceAdd as RegisterMeta>::OFFSET
+                ),
+            ],
+            "only the DPU output writer may move"
+        );
+    }
+
     #[test]
     fn int4_geometry_follows_the_half_byte_element() {
         let kernels: Kernels = [3, 3];

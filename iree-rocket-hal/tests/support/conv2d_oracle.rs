@@ -15,6 +15,9 @@ pub const FEATURE_ATOM_BYTES: usize = 16;
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum OraclePrecision {
     Fp16,
+    /// fp16 inputs and coefficients with the fp32 accumulator kept, rather
+    /// than narrowed back to fp16 on the way out.
+    Fp16Accumulator,
     /// Signed 4-bit integers, two to a byte, accumulating into int16.
     Int4,
     /// tf32: fp16's mantissa with fp32's range, in a 4-byte container,
@@ -33,6 +36,7 @@ impl OraclePrecision {
     pub fn name(self) -> &'static str {
         match self {
             Self::Fp16 => "fp16",
+            Self::Fp16Accumulator => "fp16-f32out",
             Self::Int4 => "int4",
             Self::Tf32 => "tf32",
             Self::Bf16 => "bf16",
@@ -179,6 +183,7 @@ impl Conv2dCase {
     pub fn shape(self) -> Shape {
         let precision = match self.precision {
             OraclePrecision::Fp16 => Precision::Fp16,
+            OraclePrecision::Fp16Accumulator => Precision::Fp16Accumulator,
             OraclePrecision::Int4 => Precision::Int4,
             OraclePrecision::Tf32 => Precision::Tf32,
             OraclePrecision::Bf16 => Precision::Bf16,
@@ -359,6 +364,21 @@ pub fn bf16_ulp(value: f32) -> f32 {
     let exponent_bits = value.abs().to_bits() & 0x7f80_0000;
     // Eight explicit mantissa bits, so the step is 2^-8 of the binade.
     f32::from_bits(exponent_bits) / 256.0
+}
+
+/// Whether an integer is exactly representable in fp16.
+///
+/// The predicate the fp32-result ladder turns on: fp16 carries an 11-bit
+/// significand, so it holds every integer to 2048 and then starts skipping.
+/// A case whose accumulator fails this is one the ordinary fp16 output
+/// could not have returned exactly, which is the whole reason to keep the
+/// accumulator.
+pub fn is_exact_in_fp16(value: i32) -> bool {
+    let magnitude = value.unsigned_abs();
+    if magnitude == 0 {
+        return true;
+    }
+    magnitude <= 65504 && (32 - magnitude.leading_zeros()) <= 11
 }
 
 pub fn f16_to_f32(bits: u16) -> f32 {
@@ -758,7 +778,9 @@ fn affine_weight_zero_points(case: Conv2dCase) -> Vec<i8> {
 /// fixture bug from arriving on the board looking like a hardware result.
 fn encode_element(precision: OraclePrecision, value: i32) -> Result<Vec<u8>, String> {
     match precision {
-        OraclePrecision::Fp16 => {
+        // The operands are fp16 on both, so the exactness bound is fp16's
+        // whichever container the result lands in.
+        OraclePrecision::Fp16 | OraclePrecision::Fp16Accumulator => {
             let exact = i32::from(i16::try_from(value).unwrap_or(i16::MAX)) == value
                 && (value as f32) as i32 == value
                 && value.abs() <= 2048;
@@ -901,7 +923,8 @@ fn build_fixture_for_shape(case: Conv2dCase, shape: Shape) -> Result<Conv2dFixtu
         | OraclePrecision::Bf16
         | OraclePrecision::Int16
         | OraclePrecision::Int4
-        | OraclePrecision::Tf32 => {
+        | OraclePrecision::Tf32
+        | OraclePrecision::Fp16Accumulator => {
             for value in logical_weights {
                 dense_weight_bytes.extend_from_slice(&encode_element(case.precision, value)?);
             }
@@ -1032,6 +1055,7 @@ fn build_fixture_for_shape(case: Conv2dCase, shape: Shape) -> Result<Conv2dFixtu
         | OraclePrecision::Int16
         | OraclePrecision::Int4
         | OraclePrecision::Tf32
+        | OraclePrecision::Fp16Accumulator
         | OraclePrecision::Int8Accumulator => {
             vec![0; shape.bs_buffer_bytes()]
         }

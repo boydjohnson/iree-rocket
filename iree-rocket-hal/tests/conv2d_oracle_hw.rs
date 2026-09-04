@@ -36,7 +36,7 @@ use std::{
 
 use conv2d_oracle::{
     Conv2dCase, Conv2dFixture, OraclePattern, OraclePrecision, bf16_to_f32, bf16_ulp,
-    build_fixture, expected_output, f16_to_f32, is_exact_in_bf16, output_offset,
+    build_fixture, expected_output, f16_to_f32, is_exact_in_bf16, is_exact_in_fp16, output_offset,
     output_storage_bytes,
 };
 #[cfg(feature = "hardware-characterization")]
@@ -292,7 +292,7 @@ fn compare_output(fixture: &Conv2dFixture, plan: &ConvPlan, output: &[u8]) -> Mi
                         f32::from(i16::from_le_bytes([output[offset], output[offset + 1]]))
                     }
                     OraclePrecision::Int8 => f32::from(output[offset] as i8),
-                    OraclePrecision::Tf32 => {
+                    OraclePrecision::Tf32 | OraclePrecision::Fp16Accumulator => {
                         f32::from_le_bytes(output[offset..offset + 4].try_into().unwrap())
                     }
                     OraclePrecision::Int8Accumulator => {
@@ -1999,6 +1999,128 @@ fn tf32_regression_cases() -> Vec<Conv2dCase> {
     cases
 }
 
+/// The fp16-with-fp32-result ladder.
+///
+/// An fp16 convolution already accumulates in fp32; the ordinary path
+/// narrows on the way out, and this one does not. So the claim under test
+/// is not about arithmetic but about the writer, and the cases that carry
+/// it are the ones whose accumulator fp16 *cannot* hold: `Counting` at an
+/// odd `Cin`, where the result is `Cin` times the tap count and lands past
+/// 2048 with more than eleven significant bits. Those cases fail on the
+/// ordinary fp16 path by construction.
+///
+/// The rest of the ladder is the ordinary layout coverage, since a changed
+/// output cube (4 lanes rather than 8) is exactly the kind of thing that
+/// reads correct at one channel and wrong at the next.
+fn fp16_accumulator_regression_cases() -> Vec<Conv2dCase> {
+    let mut cases = Vec::new();
+    for cin in [3u32, 64, 256] {
+        for cout in [64u32, 256] {
+            for kernel in [1usize, 3] {
+                cases.push(Conv2dCase {
+                    width: 8,
+                    height: 8,
+                    cin,
+                    cout,
+                    kernel: [kernel, kernel],
+                    stride: 1,
+                    padding: [kernel / 2, kernel / 2],
+                    precision: OraclePrecision::Fp16Accumulator,
+                    pattern: OraclePattern::Counting,
+                });
+            }
+        }
+    }
+    for cin in [64u32, 256] {
+        for cout in [64u32, 256] {
+            for pattern in [
+                OraclePattern::Selectors { phase: 0 },
+                OraclePattern::Dense { phase: 0 },
+            ] {
+                cases.push(Conv2dCase {
+                    width: 8,
+                    height: 8,
+                    cin,
+                    cout,
+                    kernel: [3, 3],
+                    stride: 1,
+                    padding: [1, 1],
+                    precision: OraclePrecision::Fp16Accumulator,
+                    pattern,
+                });
+            }
+        }
+    }
+    // The discriminating cases. 515 * 9 = 4635 and 1027 * 9 = 9243, both
+    // past 2048 and both needing more than eleven significant bits, as do
+    // the reduced tap counts at the image edges.
+    for cin in [515u32, 1027] {
+        cases.push(Conv2dCase {
+            width: 8,
+            height: 8,
+            cin,
+            cout: 64,
+            kernel: [3, 3],
+            stride: 1,
+            padding: [1, 1],
+            precision: OraclePrecision::Fp16Accumulator,
+            pattern: OraclePattern::Counting,
+        });
+    }
+    cases.push(Conv2dCase {
+        width: 16,
+        height: 16,
+        cin: 256,
+        cout: 128,
+        kernel: [3, 3],
+        stride: 2,
+        padding: [1, 1],
+        precision: OraclePrecision::Fp16Accumulator,
+        pattern: OraclePattern::Dense { phase: 1 },
+    });
+    cases
+}
+
+#[test]
+fn fp16_accumulator_matrix_is_planable_and_gap_free() {
+    let cases = fp16_accumulator_regression_cases();
+    assert_eq!(cases.len(), 23);
+    assert_planable_and_gap_free(cases);
+}
+
+/// The ladder has to contain results the ordinary fp16 output could not
+/// return, or keeping the accumulator proves nothing.
+#[test]
+fn fp16_accumulator_ladder_leaves_the_fp16_grid() {
+    let mut beyond = 0;
+    for case in fp16_accumulator_regression_cases() {
+        let fixture = build_fixture(case).expect("fp16-f32out fixture must build");
+        let out_height = fixture.shape.output_height(case.kernel) as usize;
+        let out_width = fixture.shape.output_width(case.kernel) as usize;
+        for y in 0..out_height {
+            for x in 0..out_width {
+                for channel in 0..case.cout as usize {
+                    if !is_exact_in_fp16(expected_output(case, channel, y, x)) {
+                        beyond += 1;
+                    }
+                }
+            }
+        }
+    }
+    assert!(
+        beyond > 0,
+        "no case in the ladder produces a result fp16 cannot hold"
+    );
+}
+
+#[test]
+#[ignore = "needs /dev/accel/accel0 -- establishes the fp32 result writer on the fp16 datapath"]
+fn fp16_accumulator_matrix_matches_oracle() {
+    let cases = fp16_accumulator_regression_cases();
+    assert_eq!(cases.len(), 23);
+    run_hardware_case_matrix("fp16 fp32-result matrix", cases);
+}
+
 #[test]
 fn tf32_regression_matrix_is_planable_and_gap_free() {
     let cases = tf32_regression_cases();
@@ -3675,7 +3797,9 @@ fn int4_output_write_map_probe() {
                         f32::from(i16::from_le_bytes([bytes[0], bytes[1]]))
                     }
                     OraclePrecision::Int8 => f32::from(bytes[0] as i8),
-                    OraclePrecision::Tf32 => f32::from_le_bytes(bytes.try_into().unwrap()),
+                    OraclePrecision::Tf32 | OraclePrecision::Fp16Accumulator => {
+                        f32::from_le_bytes(bytes.try_into().unwrap())
+                    }
                     OraclePrecision::Int8Accumulator => {
                         i32::from_le_bytes(bytes.try_into().unwrap()) as f32
                     }
