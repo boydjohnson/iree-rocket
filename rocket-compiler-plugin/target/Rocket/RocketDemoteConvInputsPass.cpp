@@ -4,10 +4,14 @@
 // See https://llvm.org/LICENSE.txt for license information.
 // SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
 //
-// Demotes the input operands of an all-f32 named 2-D convolution to f16,
-// leaving the accumulator at f32 -- Rocket's ABI is f16-in/f32-accumulate
+// Demotes the input operands of an all-f32 named 2-D convolution or matmul to
+// f16, leaving the accumulator at f32 -- Rocket's ABI is f16-in/f32-accumulate
 // (see call_rocket_dynamic_conv2d in the transform spec), while models
 // commonly arrive as plain f32 from ONNX/torch import.
+//
+// The registered name still says "conv" because it is what the spec, the
+// tests and the docs all reference; the matmul case was added later and the
+// mechanism is identical.
 //
 // This replaces `iree-global-opt-demote-contraction-inputs
 // {type=f16 operation=conv}`, which this spec used to call and which is
@@ -27,10 +31,29 @@
 // the wrong stride. Upstream's test only covers `strides = dense<1>`, where
 // the loss is invisible.
 //
-// The set of ops handled here mirrors the replaced pass's `operation=conv`
-// list exactly, so this is a behaviour-preserving swap apart from the
-// attributes: matmuls are not demoted (they stay on the CPU untouched), and
-// neither are the depthwise convs.
+// The convolutions handled here mirror the replaced pass's `operation=conv`
+// list exactly, so that part is a behaviour-preserving swap apart from the
+// attributes. Depthwise convs are still not demoted (see below).
+//
+// `linalg.matmul` was added 2026-09-04, and not for matching -- the spec's
+// matcher already claimed f32 matmuls, because @call_rocket_matmul narrowed
+// both operands to f16 itself. That narrowing is the problem: it lives inside
+// a `util.func` that is never inlined (every dispatch it forms is named
+// `call_rocket_matmul_dispatch_N`), so the constant weights are invisible to
+// const-expr hoisting and the truncf runs as a CPU dispatch on **every
+// inference** -- 1.79M elements for MobileNetV2's classifier, into a fresh
+// transient buffer, which then defeats the runtime's packed-coefficient cache
+// as well (all misses, all `miss (new)`; see ISSUES.md P6). Demoting here
+// instead puts the truncf in the caller, next to the constant, where
+// hoist-into-globals and const-eval fold it into an initializer exactly as
+// they already do for every convolution's weights.
+//
+// `indexing_maps` and `cast` join `strides`/`dilations` in the carried-over
+// list for the same reason those two are there: `getPrunedAttributeList`
+// elides every inherent attribute name, and for `linalg.matmul` the indexing
+// maps are precisely what distinguishes a plain matmul from a transposed or
+// broadcasting one. Dropping them would rebuild a transposed matmul as an
+// untransposed one -- the same silent miscompile the strides bug was.
 //
 // Depthwise was tried and reverted 2026-09-01. Demoting it does let three of
 // MobileNetV2's stride-2 depthwise convolutions match (18 -> 21 offloaded
@@ -62,11 +85,13 @@
 namespace mlir::iree_compiler::IREE::HAL {
 namespace {
 
-// The named-op attributes `getPrunedAttributeList` drops on the floor. Both
-// are optional on the op, so a missing one means "already the default" and is
-// simply not carried over.
-constexpr std::array<StringRef, 2> kShapeDefiningAttrNames = {"strides",
-                                                              "dilations"};
+// The named-op attributes `getPrunedAttributeList` drops on the floor. Each is
+// optional on the op, so a missing one means "already the default" and is
+// simply not carried over -- which is also why naming an attribute an op does
+// not have (`strides` on a matmul, `indexing_maps` on a convolution) costs
+// nothing.
+constexpr std::array<StringRef, 4> kShapeDefiningAttrNames = {
+    "strides", "dilations", "indexing_maps", "cast"};
 
 // Marks what this pass rewrote, so RocketPromoteUnclaimedConvInputsPass can
 // undo exactly its own work on the convolutions the matchers then decline --
@@ -103,13 +128,13 @@ void markDemoted(Operation *op, PatternRewriter &rewriter) {
   op->setAttr(kDemotedAttrName, rewriter.getUnitAttr());
 }
 
-template <typename ConvOpTy>
-struct DemoteConvInputsToF16 : OpRewritePattern<ConvOpTy> {
-  using OpRewritePattern<ConvOpTy>::OpRewritePattern;
+template <typename ContractionOpTy>
+struct DemoteInputsToF16 : OpRewritePattern<ContractionOpTy> {
+  using OpRewritePattern<ContractionOpTy>::OpRewritePattern;
 
-  LogicalResult matchAndRewrite(ConvOpTy convOp,
+  LogicalResult matchAndRewrite(ContractionOpTy convOp,
                                 PatternRewriter &rewriter) const override {
-    // Only all-f32 operand sets, matching the pass this replaces: a conv
+    // Only all-f32 operand sets, matching the pass this replaces: an op
     // already authored in f16 (or any mixed-precision one) is left alone.
     if (convOp->hasAttr(kDemotedAttrName)) {
       return failure();
@@ -140,7 +165,7 @@ struct DemoteConvInputsToF16 : OpRewritePattern<ConvOpTy> {
       markDemoted(demoted.getDefiningOp(), rewriter);
       demotedInputs.push_back(demoted);
     }
-    auto demotedOp = rewriter.replaceOpWithNewOp<ConvOpTy>(
+    auto demotedOp = rewriter.replaceOpWithNewOp<ContractionOpTy>(
         convOp, demotedInputs, convOp.getDpsInits(), attributes);
     markDemoted(demotedOp, rewriter);
     return success();
@@ -155,8 +180,9 @@ struct RocketDemoteConvInputsPass
     return "rocket-demote-conv-inputs-to-f16";
   }
   StringRef getDescription() const final {
-    return "Demotes all-f32 named 2-D convolution inputs to f16, keeping the "
-           "f32 accumulator and preserving strides/dilations.";
+    return "Demotes all-f32 named 2-D convolution and matmul inputs to f16, "
+           "keeping the f32 accumulator and preserving the shape-defining "
+           "attributes getPrunedAttributeList elides.";
   }
 
   void getDependentDialects(DialectRegistry &registry) const final {
@@ -167,12 +193,13 @@ struct RocketDemoteConvInputsPass
   void runOnOperation() final {
     MLIRContext *context = &getContext();
     RewritePatternSet patterns(context);
-    patterns.add<DemoteConvInputsToF16<linalg::Conv2DOp>,
-                 DemoteConvInputsToF16<linalg::Conv2DNchwFchwOp>,
-                 DemoteConvInputsToF16<linalg::Conv2DNhwcHwcfOp>,
-                 DemoteConvInputsToF16<linalg::Conv2DNhwcFhwcOp>,
-                 DemoteConvInputsToF16<linalg::Conv2DNgchwFgchwOp>,
-                 DemoteConvInputsToF16<linalg::Conv2DNgchwGfchwOp>>(context);
+    patterns.add<DemoteInputsToF16<linalg::Conv2DOp>,
+                 DemoteInputsToF16<linalg::Conv2DNchwFchwOp>,
+                 DemoteInputsToF16<linalg::Conv2DNhwcHwcfOp>,
+                 DemoteInputsToF16<linalg::Conv2DNhwcFhwcOp>,
+                 DemoteInputsToF16<linalg::Conv2DNgchwFgchwOp>,
+                 DemoteInputsToF16<linalg::Conv2DNgchwGfchwOp>,
+                 DemoteInputsToF16<linalg::MatmulOp>>(context);
     if (failed(applyPatternsGreedily(getOperation(), std::move(patterns)))) {
       return signalPassFailure();
     }

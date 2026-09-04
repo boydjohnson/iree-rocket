@@ -17,9 +17,18 @@
 
 // MobileNetV2's classifier, and exactly the shape the ceilings were measured
 // at: K = 1792 is MAX_INPUT_CHANNELS.
+//
+// Both narrowings must land *here*, in the caller, not inside
+// @call_rocket_matmul -- that function is never inlined, so a truncf inside
+// it is invisible to const-expr hoisting and re-narrows the constant weights
+// on every inference (ISSUES.md P6). The f16 call operands are what says the
+// demotion happened before the match rather than after it.
 // CHECK-LABEL: util.func public @classifier_matches
 // CHECK-NOT: linalg.matmul
+// CHECK: arith.truncf
+// CHECK: arith.truncf
 // CHECK: util.call @call_rocket_matmul
+// CHECK-SAME: (tensor<?x?xf16>, tensor<?x?xf16>, tensor<?x?xf32>) -> tensor<?x?xf32>
 util.func public @classifier_matches(
     %lhs: tensor<1x1792xf32>,
     %rhs: tensor<1792x1001xf32>,
@@ -31,9 +40,12 @@ util.func public @classifier_matches(
 }
 
 // One channel past it, and the whole matmul stays on the CPU rather than
-// reaching a driver that would refuse it.
+// reaching a driver that would refuse it -- in f32, because
+// rocket-promote-unclaimed-conv-inputs gives back what the demotion took.
+// Running an unclaimed matmul in f16 would be pure loss.
 // CHECK-LABEL: util.func public @k_past_the_ceiling_falls_back
 // CHECK: linalg.matmul
+// CHECK-SAME: ins(%{{.*}}, %{{.*}} : tensor<1x1793xf32>, tensor<1793x64xf32>)
 util.func public @k_past_the_ceiling_falls_back(
     %lhs: tensor<1x1793xf32>,
     %rhs: tensor<1793x64xf32>,
@@ -88,8 +100,16 @@ util.func public @m_33_falls_back(
 // transposed operand by overriding its indexing maps rather than by being a
 // different op, and a transposed B is a memory layout the height-one
 // convolution lowering cannot pack. Same shapes as the classifier otherwise.
+//
+// This is also the case that proves the demotion carries `indexing_maps`
+// across its rebuild: `getPrunedAttributeList` elides every inherent
+// attribute, and a matmul rebuilt without its maps is an *untransposed* one
+// -- which would then match, and be packed with the operand transposed. The
+// maps below are checked on the way out for exactly that reason.
 // CHECK-LABEL: util.func public @transposed_rhs_falls_back
 // CHECK: linalg.matmul
+// CHECK-SAME: indexing_maps = [affine_map<(d0, d1, d2) -> (d0, d2)>, affine_map<(d0, d1, d2) -> (d1, d2)>, affine_map<(d0, d1, d2) -> (d0, d1)>]
+// CHECK-SAME: ins(%{{.*}}, %{{.*}} : tensor<1x1792xf32>, tensor<1001x1792xf32>)
 util.func public @transposed_rhs_falls_back(
     %lhs: tensor<1x1792xf32>,
     %rhs: tensor<1001x1792xf32>,

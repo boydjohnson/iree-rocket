@@ -5,17 +5,17 @@
 // SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
 //
 // Puts back the f32 inputs that RocketDemoteConvInputsPass took away from
-// convolutions the match loop then declined to claim.
+// convolutions and matmuls the match loop then declined to claim.
 //
 // The demotion has to run *before* matching, because the matchers require
 // f16/f16/f32 typing -- but it cannot know which convolutions will be
 // claimed, and deciding that up front would mean re-implementing the
 // matchers' eligibility predicates in C++ and keeping the two in sync
-// forever. So the spec demotes every all-f32 named convolution, matches, and
-// then this pass undoes the demotion wherever the NPU did not take the op.
-// Anything still holding a `linalg.conv_2d_*` after `foreach_match` is by
-// definition unclaimed: a claimed one was erased along with the region
-// `transform.iree.cast_and_call` replaced.
+// forever. So the spec demotes every all-f32 named convolution and matmul,
+// matches, and then this pass undoes the demotion wherever the NPU did not
+// take the op. Anything still holding a `linalg.conv_2d_*` or `linalg.matmul`
+// after `foreach_match` is by definition unclaimed: a claimed one was erased
+// along with the region `transform.iree.cast_and_call` replaced.
 //
 // Without this, an unclaimed convolution runs on the CPU in f16 when f32 was
 // available and free. On MobileNetV2 that is the stride-2 stem: measured at
@@ -52,10 +52,13 @@ constexpr StringLiteral kDemotedAttrName = "rocket.f16_demoted";
 
 // Kept identical to RocketDemoteConvInputsPass's list: these are the named-op
 // attributes `getPrunedAttributeList` drops, and losing them here would
-// silently change the convolution exactly the way the upstream demotion pass
-// used to.
-constexpr std::array<StringRef, 2> kShapeDefiningAttrNames = {"strides",
-                                                              "dilations"};
+// silently change the operation exactly the way the upstream demotion pass
+// used to -- `strides`/`dilations` for a convolution, `indexing_maps`/`cast`
+// for a matmul.
+constexpr std::array<StringRef, 4> kShapeDefiningAttrNames = {"strides",
+                                                              "dilations",
+                                                              "indexing_maps",
+                                                              "cast"};
 
 // The f32 value `demoted` was truncated from, when it is one of this
 // project's own inserted truncf generics. Nullptr otherwise.
@@ -75,11 +78,11 @@ Value originalF32Source(Value demoted) {
   return source;
 }
 
-template <typename ConvOpTy>
-struct PromoteConvInputsToF32 : OpRewritePattern<ConvOpTy> {
-  using OpRewritePattern<ConvOpTy>::OpRewritePattern;
+template <typename ContractionOpTy>
+struct PromoteInputsToF32 : OpRewritePattern<ContractionOpTy> {
+  using OpRewritePattern<ContractionOpTy>::OpRewritePattern;
 
-  LogicalResult matchAndRewrite(ConvOpTy convOp,
+  LogicalResult matchAndRewrite(ContractionOpTy convOp,
                                 PatternRewriter &rewriter) const override {
     if (!convOp->hasAttr(kDemotedAttrName)) {
       return failure();
@@ -90,7 +93,7 @@ struct PromoteConvInputsToF32 : OpRewritePattern<ConvOpTy> {
       Value source = originalF32Source(inputOperand->get());
       if (!source) {
         // A demoted input whose truncf is gone or was rewritten. Leave the
-        // whole convolution alone rather than promote it halfway.
+        // whole operation alone rather than promote it halfway.
         return failure();
       }
       promotedInputs.push_back(source);
@@ -104,7 +107,7 @@ struct PromoteConvInputsToF32 : OpRewritePattern<ConvOpTy> {
       }
     }
 
-    auto promotedOp = rewriter.replaceOpWithNewOp<ConvOpTy>(
+    auto promotedOp = rewriter.replaceOpWithNewOp<ContractionOpTy>(
         convOp, promotedInputs, convOp.getDpsInits(), attributes);
     // The tag is this pass's own work list; a promoted op is done.
     promotedOp->removeAttr(kDemotedAttrName);
@@ -122,8 +125,9 @@ struct RocketPromoteUnclaimedConvInputsPass
     return "rocket-promote-unclaimed-conv-inputs";
   }
   StringRef getDescription() const final {
-    return "Restores the f32 inputs of convolutions that were demoted to f16 "
-           "for matching but not claimed by the Rocket match loop.";
+    return "Restores the f32 inputs of convolutions and matmuls that were "
+           "demoted to f16 for matching but not claimed by the Rocket match "
+           "loop.";
   }
 
   void getDependentDialects(DialectRegistry &registry) const final {
@@ -133,12 +137,13 @@ struct RocketPromoteUnclaimedConvInputsPass
   void runOnOperation() final {
     MLIRContext *context = &getContext();
     RewritePatternSet patterns(context);
-    patterns.add<PromoteConvInputsToF32<linalg::Conv2DOp>,
-                 PromoteConvInputsToF32<linalg::Conv2DNchwFchwOp>,
-                 PromoteConvInputsToF32<linalg::Conv2DNhwcHwcfOp>,
-                 PromoteConvInputsToF32<linalg::Conv2DNhwcFhwcOp>,
-                 PromoteConvInputsToF32<linalg::Conv2DNgchwFgchwOp>,
-                 PromoteConvInputsToF32<linalg::Conv2DNgchwGfchwOp>>(context);
+    patterns.add<PromoteInputsToF32<linalg::Conv2DOp>,
+                 PromoteInputsToF32<linalg::Conv2DNchwFchwOp>,
+                 PromoteInputsToF32<linalg::Conv2DNhwcHwcfOp>,
+                 PromoteInputsToF32<linalg::Conv2DNhwcFhwcOp>,
+                 PromoteInputsToF32<linalg::Conv2DNgchwFgchwOp>,
+                 PromoteInputsToF32<linalg::Conv2DNgchwGfchwOp>,
+                 PromoteInputsToF32<linalg::MatmulOp>>(context);
     if (failed(applyPatternsGreedily(getOperation(), std::move(patterns)))) {
       return signalPassFailure();
     }

@@ -1307,7 +1307,7 @@ list as untested.
 
 ---
 
-## P6 (S2, item 1 DONE) — measured: MobileNetV2 fp16 spent 8% of its time on the NPU and 30% repacking constant weights
+## P6 (S2, items 1-2 DONE) — measured: MobileNetV2 fp16 spent 8% of its time on the NPU and 30% repacking constant weights
 
 `ROCKET_PROFILE=1` (`rocket-hal-driver/src/profile.rs`) times every phase of a
 dispatch's life separately and prints per-phase and per-op tables at exit.
@@ -1413,20 +1413,68 @@ mismatch. `ROCKET_WEIGHT_CACHE=0` restores the old behaviour for A/B.
   wait.npu      24 ms      9.7% of wall
 ```
 
-**The classifier matmul misses the cache every single inference**, and it is
-now the largest remaining pack cost: 278 ms of `pack.weights` across 10
-iterations, 27.8 ms each. The counters say why — 45 misses, *all* of them
+**The classifier matmul missed the cache every single inference**, and it was
+the largest remaining pack cost: 278 ms of `pack.weights` across 10
+iterations, 27.8 ms each. The counters said why — 45 misses, *all* of them
 `miss (new)` and none `miss (rewritten)`. A rewritten constant would show as
 stale; a brand-new key every inference means the binding is a **different
-buffer** each time, i.e. IREE materializes the `[1792, 1001]` classifier
-weights fresh per inference rather than handing over the constant. That is a
-compiler-side cost (it is also CPU work inside `outside`), not a cache that is
-failing. Two ways out: get the transposed constant folded so the binding is a
-real constant, or give the cache a content-hash fallback for bindings whose
-identity is not stable. The first is strictly better if it is available.
+buffer** each time. See the next item.
 
-With that one dispatch fixed, `compact` becomes the largest host item and the
-NC1HWC2 round trip (P2) is the whole remaining story.
+### Item 2 DONE 2026-09-04: the classifier's weights were re-narrowed every inference
+
+The transform spec's `@call_rocket_matmul` narrowed both matrix operands from
+f32 to f16 itself, with a comment noting that nothing demoted a matmul the way
+`RocketDemoteConvInputsPass` demotes a convolution. That looked equivalent to
+the convolution path and was not: **the function is never inlined**. Every
+dispatch formed inside it is named `call_rocket_matmul_dispatch_N`, which is
+the tell — a truncf in there is invisible to const-expr hoisting, so it never
+became an initializer and instead ran as a CPU dispatch on every inference:
+
+```text
+  call_rocket_matmul_dispatch_1_elementwise_1793792_f32xf16
+    ro %arg4[...] : !stream.resource<constant>{...}      the f32 weights
+    wo %arg5[...] : !stream.resource<transient>{...}     a fresh buffer, per inference
+```
+
+1.79M elements of CPU work, into a transient buffer whose *identity* changes
+every inference — which is exactly why every miss was `miss (new)`. The
+driver's cache was working correctly on a binding that genuinely was a
+different buffer each time.
+
+The fix is in the compiler, not the driver: `RocketDemoteConvInputsPass` now
+demotes `linalg.matmul` alongside the convolutions, so the truncf lands in the
+caller next to the constant and const-eval folds it into an initializer;
+`@match_rocket_matmul` matches f16/f16/f32 like every convolution matcher;
+`@call_rocket_matmul` takes the operands already narrowed; and
+`RocketPromoteUnclaimedConvInputsPass` gives f32 back to a matmul the matcher
+declines. Both passes also carry `indexing_maps` and `cast` across their
+rebuild, joining `strides`/`dilations` — `getPrunedAttributeList` elides every
+inherent attribute name, and for `linalg.matmul` the indexing maps are what
+distinguishes a plain matmul from a transposed one. Dropping them would turn a
+transposed matmul into an untransposed one that then *matches*, which is the
+same silent miscompile the strides bug was; `@transposed_rhs_falls_back` in
+`rocket_matmul_match_boundaries.mlir` now checks the maps on the way out.
+
+After: the weights are `!stream.resource<constant>` at the matmul's own
+binding, the per-inference CPU dispatch is gone, and the cache reaches
+**324 hits / 36 misses over 10 inferences** — one miss per binding, all on the
+first. Logits are bit-identical on both the fp16 and the int8 model (the int8
+model checked against a rebuild of the pre-change compiler, not against a
+stale board artifact). The `.vmfb` also shrinks 16.1 MB -> 12.5 MB: the
+classifier constant is stored f16 now instead of f32.
+
+```text
+  before   216 ms   215 ms   per inference
+  after    202 ms   194 ms
+```
+
+Together with item 1, MobileNetV2 fp16 goes from ~316 ms to ~198 ms, 1.6x.
+
+`compact` is now the largest host item at ~37 ms per inference, and the
+NC1HWC2 round trip (P2) is the whole remaining story. The unregistered lit
+tests found on the way (`rocket_matmul*.mlir` and `rocket_pooling*.mlir` were
+in the tree but not in `test/CMakeLists.txt`, so `ctest` never ran them) are
+registered now.
 
 ---
 
@@ -1496,8 +1544,9 @@ were meant to enable found two larger things, and both are now at the top.
    a like-for-like CPU build is 2.5x faster than the best NPU configuration, so
    the per-dispatch and per-tile taxes are the whole game. P6 now measures that
    stack rather than reasoning about it; its packed-coefficient cache is landed
-   and worth 1.47x end to end, and what it leaves behind is the classifier
-   matmul's per-inference re-materialization and then the NC1HWC2 round trip.
+   and worth 1.47x end to end; with the classifier matmul's per-inference
+   re-narrowing fixed too the model is 1.6x, and what it leaves behind is the
+   NC1HWC2 round trip.
 4. **C2** — small fix, plus a probe that settles a question the notes leave open.
 5. **M2** — ~1.43x on the device half, but it needs a driver-side
    `clk_set_rate` and both shortcuts hang the box.
