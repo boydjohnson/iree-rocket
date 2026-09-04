@@ -32,6 +32,7 @@ use std::{
     panic::{AssertUnwindSafe, catch_unwind},
     ptr,
     sync::Mutex,
+    time::{Duration, Instant},
 };
 
 use conv2d_oracle::{
@@ -49,6 +50,36 @@ use iree_rocket_hal::rocket::{
 const DEVICE_PATH: &str = "/dev/accel/accel0";
 const PAGE_BYTES: usize = 4096;
 const PER_CASE_TIMEOUT_NS: u64 = 5_000_000_000;
+
+/// Dispatch wall time above which a failure is a killed job, not a result.
+///
+/// The RK3588 kernel driver's watchdog gives up on a hung NPU job at
+/// `JOB_TIMEOUT_MS` (500) plus a scheduler tick, resets the core, and
+/// signals the job fence **with an error**. `PREP_BO` waits on that fence
+/// and a fence signalled with an error is still signalled, so the ioctl
+/// returns success and the sweep reads a partly or wholly unwritten output
+/// buffer. Every "silent wrong result" of that kind is this.
+///
+/// The two regimes are nowhere near each other, which is what makes a wall
+/// clock a discriminator rather than a guess. Measured on planck
+/// 2026-09-03 across every ladder in this file, worst healthy case first:
+///
+/// ```text
+///   58.5 ms   28 tiles   the 226x226 VGG dense-coefficient blocks
+///   44.4 ms  112 tiles   the widest multi-tile sweep case
+///   ~500 ms   any        a job the watchdog killed
+/// ```
+///
+/// So the floor sits 2.6x above the worst healthy dispatch observed and
+/// 3.4x below the watchdog, and the time is not proportional to tile count
+/// -- 28 large tiles cost more than 112 small ones -- which is why this is
+/// a flat floor rather than a per-tile budget. A shape family bigger than
+/// anything here should re-measure with `ROCKET_DISPATCH_TIMES=1` rather
+/// than assume the headroom survived.
+///
+/// Set `ROCKET_DISPATCH_TIMES=1` to print every case's dispatch time, which
+/// is how the headroom above should be re-measured rather than assumed.
+const DISPATCH_TIMEOUT_FLOOR: Duration = Duration::from_millis(150);
 const OUTPUT_SENTINEL: u8 = 0xa5;
 // `nextest -j1` serializes test *processes*, but Rust's harness still runs
 // ignored tests in this binary concurrently. The RK3588 NPU is a single
@@ -157,6 +188,16 @@ struct CaseSuccess {
 struct CaseExecution {
     plan: ConvPlan,
     output: Vec<u8>,
+    /// Wall time from `SUBMIT` to `PREP_BO` returning.
+    ///
+    /// The only thing that separates a shape result from a job the kernel's
+    /// watchdog killed. `PREP_BO` waits on the output BO's `dma_resv`
+    /// fence, and a fence signalled *with an error* is still signalled, so
+    /// the ioctl returns success either way and the buffer looks plausible
+    /// while being half -- or entirely -- unwritten. The two regimes are
+    /// two orders of magnitude apart, so this is a discriminator rather
+    /// than a heuristic; see [`DISPATCH_TIMEOUT_FLOOR`].
+    dispatch: Duration,
     /// The staging buffer exactly as the DPU left it, before
     /// `assemble_staged_accumulator_output` reinterprets it. The layout
     /// probes read this: the assembled `output` already assumes the answer
@@ -414,9 +455,11 @@ fn execute_case_output_with_plan(
             })
             .collect::<Vec<_>>();
 
+        let started = Instant::now();
         submit_jobs(fd, &jobs).map_err(|error| format!("submit: {error}"))?;
         prep_bo(fd, output.buffer.handle, PER_CASE_TIMEOUT_NS)
             .map_err(|error| format!("completion wait: {error}"))?;
+        let dispatch = started.elapsed();
 
         let raw_output = std::slice::from_raw_parts(output.buffer.host_ptr, output_len).to_vec();
         #[cfg(feature = "hardware-characterization")]
@@ -434,6 +477,7 @@ fn execute_case_output_with_plan(
         Ok(CaseExecution {
             plan,
             output,
+            dispatch,
             #[cfg(feature = "hardware-characterization")]
             raw: raw_output,
             #[cfg(feature = "hardware-characterization")]
@@ -442,22 +486,44 @@ fn execute_case_output_with_plan(
     }
 }
 
-fn execute_case(file: &std::fs::File, fixture: &Conv2dFixture) -> Result<CaseSuccess, String> {
+/// One case's verdict, with the dispatch time that says whether the verdict
+/// is about the shape at all.
+struct CaseReport {
+    dispatch: Duration,
+    verdict: Result<CaseSuccess, String>,
+}
+
+impl CaseReport {
+    /// Whether this case's dispatch ran long enough to be a killed job
+    /// rather than a result.
+    fn timed_out(&self) -> bool {
+        self.verdict.is_err() && self.dispatch >= DISPATCH_TIMEOUT_FLOOR
+    }
+}
+
+fn execute_case(file: &std::fs::File, fixture: &Conv2dFixture) -> Result<CaseReport, String> {
     let execution = execute_case_output(file, fixture)?;
+    let dispatch = execution.dispatch;
     let report = compare_output(fixture, &execution.plan, &execution.output);
     if report.mismatches != 0 {
-        return Err(format!(
-            "{} mismatches, max|diff|={}, tile_mismatches={:?}\n      {}",
-            report.mismatches,
-            report.max_abs_difference,
-            report.tile_mismatches,
-            report.samples.join("\n      "),
-        ));
+        return Ok(CaseReport {
+            dispatch,
+            verdict: Err(format!(
+                "{} mismatches, max|diff|={}, tile_mismatches={:?}\n      {}",
+                report.mismatches,
+                report.max_abs_difference,
+                report.tile_mismatches,
+                report.samples.join("\n      "),
+            )),
+        });
     }
-    Ok(CaseSuccess {
-        data_banks: execution.plan.data_banks(),
-        weight_banks: execution.plan.weight_banks(),
-        tiles: execution.plan.tiles().len(),
+    Ok(CaseReport {
+        dispatch,
+        verdict: Ok(CaseSuccess {
+            data_banks: execution.plan.data_banks(),
+            weight_banks: execution.plan.weight_banks(),
+            tiles: execution.plan.tiles().len(),
+        }),
     })
 }
 
@@ -1531,6 +1597,7 @@ fn run_hardware_case_matrix(title: &str, cases: Vec<Conv2dCase>) {
     let resume = probe_resume_index();
     let only = probe_only_index();
     let mut failures = Vec::new();
+    let mut device_timeouts: Vec<String> = Vec::new();
     let mut sick_after = None;
     let mut attempted = 0usize;
     let mut skipped = 0usize;
@@ -1567,16 +1634,51 @@ fn run_hardware_case_matrix(title: &str, cases: Vec<Conv2dCase>) {
             execute_case(&file, &fixture)
         }));
         let failure = match result {
-            Ok(Ok(success)) => {
-                println!(
-                    "[{}/{}] ok   {label} banks={}/{} tiles={}",
-                    index + 1,
-                    total_cases,
-                    success.data_banks,
-                    success.weight_banks,
-                    success.tiles,
-                );
-                continue;
+            Ok(Ok(report)) => {
+                let dispatch = report.dispatch;
+                let timed_out = report.timed_out();
+                match report.verdict {
+                    Ok(success) => {
+                        println!(
+                            "[{}/{}] ok   {label} banks={}/{} tiles={}{}",
+                            index + 1,
+                            total_cases,
+                            success.data_banks,
+                            success.weight_banks,
+                            success.tiles,
+                            dispatch_note(dispatch),
+                        );
+                        continue;
+                    }
+                    // A dispatch this long did not produce a result to
+                    // disagree with: the watchdog killed the job and
+                    // `PREP_BO` returned success over an error-signalled
+                    // fence. Recording it as a shape failure is how a device
+                    // event gets written down as a hardware limit, which has
+                    // happened here before.
+                    Err(error) if timed_out => {
+                        println!(
+                            "[{}/{}] DEVICE TIMEOUT, not a shape result: {label}\n      \
+                             dispatch took {:.0} ms (healthy is milliseconds); the job was \
+                             killed by the watchdog and the output is partly unwritten\n      \
+                             {error}",
+                            index + 1,
+                            total_cases,
+                            dispatch.as_secs_f64() * 1e3,
+                        );
+                        device_timeouts.push(label.clone());
+                        continue;
+                    }
+                    Err(error) => {
+                        println!(
+                            "[{}/{}] FAIL {label}{}\n      {error}",
+                            index + 1,
+                            total_cases,
+                            dispatch_note(dispatch),
+                        );
+                        format!("{label}: {error}")
+                    }
+                }
             }
             Ok(Err(error)) => {
                 println!(
@@ -1612,6 +1714,12 @@ fn run_hardware_case_matrix(title: &str, cases: Vec<Conv2dCase>) {
         attempted - failures.len()
     );
     println!("  failed: {}", failures.len());
+    if !device_timeouts.is_empty() {
+        println!(
+            "  device timeouts (not measured): {}",
+            device_timeouts.len()
+        );
+    }
     if skipped != 0 {
         println!("  skipped: {skipped}");
     }
@@ -1639,11 +1747,53 @@ fn run_hardware_case_matrix(title: &str, cases: Vec<Conv2dCase>) {
         );
     }
 
+    if !device_timeouts.is_empty() {
+        println!(
+            "\n  {} case(s) were NOT MEASURED because the NPU job was killed mid-dispatch:",
+            device_timeouts.len()
+        );
+        for (index, label) in device_timeouts.iter().enumerate() {
+            println!("    {}. {label}", index + 1);
+        }
+        println!(
+            "  These are device events, not shape results, and are excluded from the verdict\n               above. Confirm with `sudo dmesg | grep -i npu` -- a killed job logs `NPU job timed\n               out` with a `CNA_S_STATUS 0x10008` signature. They cluster when the machine was\n               busy in the preceding second, which is why `cargo nextest` provokes them (it runs\n               cargo immediately before the test) and a one-second idle gap almost never does.\n               To measure one properly: ROCKET_PROBE_ONLY=<index>, after a short idle.\n               Set ROCKET_STRICT_DISPATCH=1 to make these fail the run instead."
+        );
+    }
+
     assert!(
         failures.is_empty(),
         "{} of {attempted} cases failed in {title}; complete diagnostics are above",
         failures.len(),
     );
+    assert!(
+        device_timeouts.is_empty() || !strict_dispatch(),
+        "{} of {attempted} cases in {title} were killed mid-dispatch and \
+         ROCKET_STRICT_DISPATCH is set",
+        device_timeouts.len(),
+    );
+}
+
+/// Whether a killed dispatch should fail the run.
+///
+/// Off by default. A killed job is a device event with no bearing on the
+/// code under test, and failing on it turns the gate into noise that stops
+/// being read -- which is worse than the alternative, because the summary
+/// block above is loud and counted. On for a run that must be clean.
+fn strict_dispatch() -> bool {
+    std::env::var("ROCKET_STRICT_DISPATCH").is_ok_and(|value| value != "0")
+}
+
+/// The per-case dispatch time, printed only when asked for.
+///
+/// This is how the headroom under [`DISPATCH_TIMEOUT_FLOOR`] gets
+/// re-measured on a new board or a new shape family, instead of the floor
+/// being carried forward on faith.
+fn dispatch_note(dispatch: Duration) -> String {
+    if std::env::var("ROCKET_DISPATCH_TIMES").is_ok() {
+        format!(" dispatch={:.1}ms", dispatch.as_secs_f64() * 1e3)
+    } else {
+        String::new()
+    }
 }
 #[cfg(feature = "hardware-characterization")]
 #[test]
@@ -2663,6 +2813,7 @@ fn cartesian_conv2d_oracle_sweep_matches_oracle() {
         .open(DEVICE_PATH)
         .expect("failed to open RK3588 NPU device");
     let mut failures = Vec::new();
+    let mut device_timeouts: Vec<String> = Vec::new();
     let mut passed_by_kind = BTreeMap::<(&str, &str), usize>::new();
 
     println!(
@@ -2676,18 +2827,45 @@ fn cartesian_conv2d_oracle_sweep_matches_oracle() {
             execute_case(&file, &fixture)
         }));
         match result {
-            Ok(Ok(success)) => {
-                println!(
-                    "[{}/{}] ok   {label} banks={}/{} tiles={}",
-                    index + 1,
-                    total_cases,
-                    success.data_banks,
-                    success.weight_banks,
-                    success.tiles,
-                );
-                *passed_by_kind
-                    .entry((case.precision.name(), case.pattern.name()))
-                    .or_default() += 1;
+            Ok(Ok(report)) => {
+                let timed_out = report.timed_out();
+                let dispatch = report.dispatch;
+                match report.verdict {
+                    Ok(success) => {
+                        println!(
+                            "[{}/{}] ok   {label} banks={}/{} tiles={}{}",
+                            index + 1,
+                            total_cases,
+                            success.data_banks,
+                            success.weight_banks,
+                            success.tiles,
+                            dispatch_note(dispatch),
+                        );
+                        *passed_by_kind
+                            .entry((case.precision.name(), case.pattern.name()))
+                            .or_default() += 1;
+                    }
+                    Err(error) if timed_out => {
+                        println!(
+                            "[{}/{}] DEVICE TIMEOUT, not a shape result: {label}\n      \
+                             dispatch took {:.0} ms; the job was killed by the watchdog\n      \
+                             {error}",
+                            index + 1,
+                            total_cases,
+                            dispatch.as_secs_f64() * 1e3,
+                        );
+                        device_timeouts.push(label.clone());
+                    }
+                    Err(error) => {
+                        println!(
+                            "[{}/{}] FAIL {label}{}\n      {error}",
+                            index + 1,
+                            total_cases,
+                            dispatch_note(dispatch),
+                        );
+                        failures.push(format!("{label}: {error}"));
+                    }
+                }
             }
             Ok(Err(error)) => {
                 println!(

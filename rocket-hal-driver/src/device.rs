@@ -8,7 +8,11 @@
 //! as the right model for a driver whose only completion signal is a
 //! blocking ioctl rather than a native timeline/fence primitive.
 
-use std::{os::fd::AsRawFd, sync::Mutex, time::Duration};
+use std::{
+    os::fd::AsRawFd,
+    sync::Mutex,
+    time::{Duration, Instant},
+};
 
 use crate::{
     bindings::{
@@ -32,7 +36,8 @@ use crate::{
         iree_hal_semaphore_compatibility_t, iree_hal_semaphore_flags_t, iree_hal_semaphore_list_t,
         iree_hal_semaphore_t, iree_hal_topology_edge_t, iree_hal_update_flags_t,
         iree_hal_write_flags_t, iree_host_size_t, iree_io_file_handle_t,
-        iree_status_code_e_IREE_STATUS_INTERNAL, iree_status_code_e_IREE_STATUS_INVALID_ARGUMENT,
+        iree_status_code_e_IREE_STATUS_DEADLINE_EXCEEDED, iree_status_code_e_IREE_STATUS_INTERNAL,
+        iree_status_code_e_IREE_STATUS_INVALID_ARGUMENT,
         iree_status_code_e_IREE_STATUS_UNAVAILABLE, iree_status_t, iree_string_view_t,
         iree_timeout_t, iree_timeout_type_e_IREE_TIMEOUT_ABSOLUTE,
     },
@@ -46,6 +51,53 @@ use iree_rocket_hal::rocket::{
 
 const DEVICE_PATH: &str = "/dev/accel/accel0";
 const DISPATCH_COMPLETION_TIMEOUT_NS: u64 = 10_000_000_000;
+
+/// Wall time above which a completed dispatch is treated as a job the
+/// kernel's watchdog killed, and the result refused.
+///
+/// `PREP_BO` is not a completion check. It waits on the output BO's
+/// `dma_resv` fence, and when the RK3588 watchdog gives up on a hung NPU
+/// job it resets the core and signals that fence **with an error** -- which
+/// is still signalled. So the ioctl returns success, `DISPATCH_COMPLETION_
+/// TIMEOUT_NS` is never approached, and the caller receives an output
+/// buffer the DPU wrote part of, or none of, with nothing to distinguish it
+/// from a real result. Before this check, a hung job during a real
+/// inference silently produced wrong logits.
+///
+/// A wall clock is the only thing that separates the two, and it separates
+/// them by two orders of magnitude. The watchdog fires at the driver's
+/// 500 ms `JOB_TIMEOUT_MS` plus a scheduler tick. Healthy dispatches,
+/// measured on planck 2026-09-03:
+///
+/// ```text
+///   3.13 ms   slowest of MobileNetV2 fp16's 54 real dispatches
+///   58.5 ms   slowest in this repo's hardware ladders (226x226, 28 tiles)
+///   ~500 ms   a job the watchdog killed
+/// ```
+///
+/// The floor is higher than the test harness's 150 ms because production
+/// shapes are less bounded than a ladder's, and because the costs are
+/// asymmetric: too low turns a slow-but-correct dispatch into a spurious
+/// inference failure, too high lets a killed job return wrong results. At
+/// 250 ms it keeps an 80x margin over real model dispatches and 4x over
+/// the worst ladder shape, and still lands at half the watchdog.
+///
+/// Verified free of false positives over 12 consecutive `iree-run-module`
+/// runs of `mnv2.fp16.vmfb`. Re-check the margin on a new model with
+/// `ROCKET_DISPATCH_TIMES=1` rather than assuming it carried over.
+const HUNG_JOB_DISPATCH_FLOOR: Duration = Duration::from_millis(250);
+
+/// Whether to print every dispatch's wall time (`ROCKET_DISPATCH_TIMES=1`).
+///
+/// The margin under [`HUNG_JOB_DISPATCH_FLOOR`] is only as good as the
+/// shapes it was measured against, and a real model's are not this repo's
+/// ladders. This is how to check the margin on a new model rather than
+/// trust it, and it is read once because a per-dispatch `getenv` would sit
+/// in the inference loop.
+fn dispatch_times_enabled() -> bool {
+    static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ENABLED.get_or_init(|| std::env::var("ROCKET_DISPATCH_TIMES").is_ok_and(|value| value != "0"))
+}
 
 // nr=0x00 is generic DRM_IOCTL_VERSION, not rocket-specific -- see
 // rkt-test.rs's identical use of this pattern.
@@ -1569,6 +1621,7 @@ unsafe extern "C" fn queue_execute(
                     // split reloads its weights, so no CBUF state must survive
                     // between jobs.
                     for &(regcmd_addr, regcmd_count) in &task_descriptors {
+                        let started = Instant::now();
                         if unsafe {
                             rocket_device::submit(
                                 fd,
@@ -1603,6 +1656,32 @@ unsafe extern "C" fn queue_execute(
                                     iree_status_code_e_IREE_STATUS_UNAVAILABLE,
                                 );
                             }
+                        }
+
+                        // The task is now "complete" as far as the fence is
+                        // concerned. Whether it actually ran is a separate
+                        // question, and only the clock can answer it; see
+                        // `HUNG_JOB_DISPATCH_FLOOR`. Refusing the result is
+                        // the point -- returning it would be indistinguishable
+                        // from a correct inference.
+                        let elapsed = started.elapsed();
+                        if dispatch_times_enabled() {
+                            eprintln!("rocket: dispatch {:.2} ms", elapsed.as_secs_f64() * 1e3);
+                        }
+                        if elapsed >= HUNG_JOB_DISPATCH_FLOOR {
+                            eprintln!(
+                                "rocket: NPU dispatch took {:.0} ms, at or past the {:.0} ms \
+                                 hung-job floor. The kernel watchdog kills a hung job and \
+                                 signals its fence with an error, which PREP_BO reports as \
+                                 success, so this output buffer is probably partly unwritten \
+                                 and is being refused rather than returned. Check \
+                                 `dmesg | grep -i npu` for `NPU job timed out`.",
+                                elapsed.as_secs_f64() * 1e3,
+                                HUNG_JOB_DISPATCH_FLOOR.as_secs_f64() * 1e3,
+                            );
+                            break 'result status::from_code(
+                                iree_status_code_e_IREE_STATUS_DEADLINE_EXCEEDED,
+                            );
                         }
                     }
 
