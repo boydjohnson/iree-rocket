@@ -1209,6 +1209,16 @@ building. Which regime MobileNetV2's back-to-back 1x1 convs sit in is the thing
 to measure first — and measure it under a pinned governor (M1), because the term
 being removed is exactly the host-side term the governor penalizes.
 
+**Resized 2026-09-04.** The round trip was 53 ms per inference when this was
+written; P6 item 3 found that most of that was the transforms running on the
+little cluster plus a redundant zero pass, and it is now 26 ms (`compact` 18,
+`pack.input` 8.4) against a 146 ms model. Still the largest thing in the
+driver, and still worth doing — but the "measure the regime first" advice
+above now has a second half: measure it *after* P6 item 3, or the case for
+chaining will look twice as strong as it is. MobileNetV2 fp16 does have
+adjacent NPU dispatch pairs (roughly 15 of 37 dispatches follow another NPU
+dispatch immediately), so the mechanism has somewhere to apply here.
+
 ---
 
 ## P3 (S3) — the full output BO is cache-synced once per tile, and a regcmd BO is allocated and mapped per tile
@@ -1307,7 +1317,7 @@ list as untested.
 
 ---
 
-## P6 (S2, items 1-2 DONE) — measured: MobileNetV2 fp16 spent 8% of its time on the NPU and 30% repacking constant weights
+## P6 (S2, items 1-3 DONE) — measured: MobileNetV2 fp16 spent 8% of its time on the NPU and 30% repacking constant weights
 
 `ROCKET_PROFILE=1` (`rocket-hal-driver/src/profile.rs`) times every phase of a
 dispatch's life separately and prints per-phase and per-op tables at exit.
@@ -1470,11 +1480,78 @@ classifier constant is stored f16 now instead of f32.
 
 Together with item 1, MobileNetV2 fp16 goes from ~316 ms to ~198 ms, 1.6x.
 
-`compact` is now the largest host item at ~37 ms per inference, and the
-NC1HWC2 round trip (P2) is the whole remaining story. The unregistered lit
-tests found on the way (`rocket_matmul*.mlir` and `rocket_pooling*.mlir` were
-in the tree but not in `test/CMakeLists.txt`, so `ctest` never ran them) are
-registered now.
+`compact` is now the largest host item at ~37 ms per inference. The
+unregistered lit tests found on the way (`rocket_matmul*.mlir` and
+`rocket_pooling*.mlir` were in the tree but not in `test/CMakeLists.txt`, so
+`ctest` never ran them) are registered now.
+
+### Item 3 DONE 2026-09-04: the round trip was not slow for the reason it looked slow
+
+Going after `compact` + `pack.input` (37 + 16 ms) as a layout problem — P2's
+cross-op chaining — the first step was to measure the transforms in isolation.
+`iree-rocket-hal/examples/layout_bench` runs both over every shape MobileNetV2
+fp16 presents, on plain memory. **The whole model's transforms took 10.4 ms**,
+against 53 ms measured inside the driver. Three candidate explanations, all
+falsified in turn:
+
+- *Cold caches.* Adding a 16 MiB eviction walk before every timed pass took it
+  to 17.0 ms. Real, but a fifth of the gap.
+- *The GEM mapping.* Every buffer either transform touches is a
+  `DRM_ROCKET_CREATE_BO` + `mmap`, and a write-combining mapping would read at
+  DRAM latency with no prefetch — exactly the shape of the discrepancy.
+  `examples/gem_bandwidth` measured a GEM BO at **9.8 GB/s read against the
+  heap's 9.5**. The mapping is cached and it is not the problem.
+- *The core.* Same benchmark, same data, `taskset`:
+
+```text
+  A76 (cpu4-7)   pack  4.1 ms   compact  9.7 ms    13.8 ms
+  A55 (cpu0-3)   pack 12.2 ms   compact 40.2 ms    52.4 ms
+```
+
+52.4 ms. That is the driver's number, to within noise. So `ROCKET_PROFILE`
+grew a `host time by cpu` line, and it said the driver was spending **59% of
+its host time on cpu0-3** — RK3588's little cluster. Pinning the whole process
+to the big cluster ran the model at 129 ms against 208 ms.
+
+Two fixes, neither of them about layout:
+
+1. **`rocket-hal-driver/src/cpu_affinity.rs`.** `queue_execute` asks the
+   scheduler for the highest-`cpu_capacity` CPUs for the duration of the
+   submission and gives the thread's original affinity back afterwards.
+   Asking rather than keeping matters: on the fast path that work runs on
+   IREE's own calling thread, and permanently narrowing a thread this driver
+   does not own would change scheduling for work that has nothing to do with
+   Rocket. "Big" comes from `cpu_capacity`, the scheduler's own normalized
+   figure, so a uniform machine finds nothing to prefer and the whole thing
+   becomes a no-op. `ROCKET_HOST_CPUS=off` disables it; a list overrides it.
+2. **`pack_nhwc_to_nc1hwc2_padded` stopped zeroing what it is about to
+   overwrite.** It opened with `packed.fill(0)` — a second full write pass
+   over the destination. For a channel count that is a whole number of
+   16-byte atoms, which is *every* convolution in this model, the copy
+   overwrites all of it. Only the channel padding needs zeroing: the tail of
+   a partial last atom, filled per pixel inside the copy loop where the line
+   is already hot, and any whole surface that exists only because the
+   programmed pixel is wider than the logical one.
+
+```text
+  ~198 ms   before
+  ~184 ms   + no redundant zero pass
+   146 ms   + host work on the big cluster    (and run-to-run spread collapses)
+```
+
+Per inference after: `pack.input` 8.4 ms at 1023 MB/s (was 16 ms at 538),
+`compact` 18 ms at 694 MB/s (was 38 ms at 330), `record` 15 ms, `outside`
+88 ms, NPU 22 ms — 13.7% of wall. Logits bit-identical on both models, board
+gate green.
+
+**P2 is still open and still worth what it was**, but it is now worth 26 ms
+per inference rather than 53, and the next person should read M1 and this item
+before quoting either number. The `record` phase's 15 ms is also still on a
+little core: it runs at command-buffer record time, outside `queue_execute`'s
+guard, and a guard per `dispatch` call measured as noise because 37
+back-to-back set/restore pairs migrate the thread off the big cluster between
+every one of them. One guard held across a whole command buffer's recording
+is the way to get it.
 
 ---
 

@@ -5,6 +5,8 @@
 //! elements: C2 is 16 for int8 and 8 for fp16. Each C1 surface contains
 //! every HxW pixel before the next channel block begins.
 
+use crate::rocket::conv::AccumulatorOutputTile;
+
 /// Physical byte width of one NC1HWC2 inner-channel block.
 pub const FEATURE_ATOMIC_BYTES: usize = 16;
 
@@ -196,7 +198,21 @@ pub fn pack_nhwc_to_nc1hwc2_padded(
     if packed.len() < packed_len {
         return Err("NC1HWC2 destination is smaller than its declared shape");
     }
-    packed[..packed_len].fill(0);
+
+    // Only the bytes the copy below will not reach are zeroed, not the whole
+    // destination. Zeroing everything first is a second full write pass over
+    // the packed buffer, and for a channel count that is a whole number of
+    // atoms -- every convolution in MobileNetV2 fp16 -- it is *entirely*
+    // wasted: the copy overwrites every byte of it. What genuinely needs
+    // zeroing is the channel padding: the tail of a partial last atom (filled
+    // per pixel in the loop, where the line is already hot) and any whole
+    // surface that exists only because `packed_bytes_per_pixel` is wider than
+    // the logical pixel.
+    let written_surfaces = bytes_per_pixel.div_ceil(FEATURE_ATOMIC_BYTES);
+    let padding_surfaces_start = written_surfaces * pixel_count * FEATURE_ATOMIC_BYTES;
+    if padding_surfaces_start < packed_len {
+        packed[padding_surfaces_start..packed_len].fill(0);
+    }
 
     for pixel in 0..pixel_count {
         let dense_pixel = pixel * bytes_per_pixel;
@@ -209,11 +225,107 @@ pub fn pack_nhwc_to_nc1hwc2_padded(
                 surface * pixel_count * FEATURE_ATOMIC_BYTES + pixel * FEATURE_ATOMIC_BYTES;
             packed[dst_offset..dst_offset + chunk_len]
                 .copy_from_slice(&dense[src_offset..src_offset + chunk_len]);
+            if chunk_len < FEATURE_ATOMIC_BYTES {
+                packed[dst_offset + chunk_len..dst_offset + FEATURE_ATOMIC_BYTES].fill(0);
+            }
             copied += chunk_len;
         }
     }
 
     Ok(packed_len)
+}
+
+// The inverse direction: DPU output surfaces back to dense NHWC. Kept next to
+// the packing above because the two are a pair -- every Rocket dispatch pays
+// both, once each, and any change to how one walks memory has to be made to
+// the other (see ISSUES.md P6, where together they are the largest host cost
+// left in the driver).
+
+/// Interleaves DPU feature-atomic output surfaces into dense NHWC pixels.
+///
+/// Each hardware surface stores one channel block for every spatial pixel;
+/// `DPU_DST_SURF_STRIDE` advances between those full spatial surfaces.
+/// Dense NHWC instead stores every channel group for one pixel contiguously,
+/// so copy one surface chunk at a time into each destination pixel. Ordinary
+/// output blocks are 16 bytes; accumulator blocks are 32 i32 lanes (128
+/// bytes). The final logical surface may be partial.
+pub fn compact_atomic_output(
+    scratch: &[u8],
+    source_pixel_count: usize,
+    output_pixel_count: usize,
+    bytes_per_pixel: usize,
+    source_block_bytes: usize,
+    dst: &mut [u8],
+) -> usize {
+    if source_block_bytes == 0 {
+        return 0;
+    }
+    let mut written = 0;
+    for pixel in 0..output_pixel_count {
+        let mut pixel_written = 0;
+        while pixel_written < bytes_per_pixel {
+            let surface = pixel_written / source_block_bytes;
+            let chunk_len = (bytes_per_pixel - pixel_written).min(source_block_bytes);
+            let src_off =
+                surface * source_pixel_count * source_block_bytes + pixel * source_block_bytes;
+            let dst_off = pixel * bytes_per_pixel + pixel_written;
+            if src_off + chunk_len > scratch.len() || dst_off + chunk_len > dst.len() {
+                return written;
+            }
+            dst[dst_off..dst_off + chunk_len]
+                .copy_from_slice(&scratch[src_off..src_off + chunk_len]);
+            written += chunk_len;
+            pixel_written += chunk_len;
+        }
+    }
+    written
+}
+
+pub fn compact_tiled_accumulator_output(
+    scratch: &[u8],
+    tiles: &[AccumulatorOutputTile],
+    output_width: usize,
+    bytes_per_pixel: usize,
+    source_block_bytes: usize,
+    dst: &mut [u8],
+) -> usize {
+    if source_block_bytes == 0 || output_width == 0 {
+        return 0;
+    }
+    let mut written = 0;
+    for tile in tiles {
+        let tile_pixels = tile.output_rows * tile.output_columns;
+        let Some(tile_end) = tile.scratch_offset.checked_add(tile.scratch_bytes) else {
+            return written;
+        };
+        if tile_end > scratch.len() {
+            return written;
+        }
+        for row in 0..tile.output_rows {
+            for column in 0..tile.output_columns {
+                let local_pixel = row * tile.output_columns + column;
+                let output_pixel =
+                    (tile.output_row + row) * output_width + tile.output_column + column;
+                let mut pixel_written = 0;
+                while pixel_written < bytes_per_pixel {
+                    let surface = pixel_written / source_block_bytes;
+                    let chunk_len = (bytes_per_pixel - pixel_written).min(source_block_bytes);
+                    let src_off = tile.scratch_offset
+                        + surface * tile_pixels * source_block_bytes
+                        + local_pixel * source_block_bytes;
+                    let dst_off = output_pixel * bytes_per_pixel + pixel_written;
+                    if src_off + chunk_len > tile_end || dst_off + chunk_len > dst.len() {
+                        return written;
+                    }
+                    dst[dst_off..dst_off + chunk_len]
+                        .copy_from_slice(&scratch[src_off..src_off + chunk_len]);
+                    written += chunk_len;
+                    pixel_written += chunk_len;
+                }
+            }
+        }
+    }
+    written
 }
 
 /// Returns the storage needed for an uncompressed Rocket convolution filter.
@@ -976,6 +1088,47 @@ mod tests {
             }
         }
         assert_eq!(&packed[PIXELS * 3 * FEATURE_ATOMIC_BYTES..], &[0; 32]);
+    }
+
+    /// A partial last atom *and* whole padding surfaces above it, which the
+    /// packer zeroes by two different paths -- the per-pixel tail inside the
+    /// copy loop, and one fill for the surfaces the copy never reaches. The
+    /// two other padding tests each exercise only one of them.
+    #[test]
+    fn zero_pads_a_partial_atom_under_padding_surfaces() {
+        const PIXELS: usize = 3;
+        // 10 channels of fp16: one full atom plus 4 bytes of a second.
+        const BYTES_PER_PIXEL: usize = 10 * 2;
+        // Programmed as 32 channels, so two whole surfaces of padding above.
+        const PACKED_BYTES_PER_PIXEL: usize = 32 * 2;
+        let dense: Vec<_> = (0..PIXELS * BYTES_PER_PIXEL)
+            .map(|value| value as u8 + 1)
+            .collect();
+        let mut packed = vec![0xFF; nc1hwc2_storage_size(PIXELS, PACKED_BYTES_PER_PIXEL).unwrap()];
+
+        pack_nhwc_to_nc1hwc2_padded(
+            &dense,
+            PIXELS,
+            BYTES_PER_PIXEL,
+            PACKED_BYTES_PER_PIXEL,
+            &mut packed,
+        )
+        .unwrap();
+
+        for pixel in 0..PIXELS {
+            let first = pixel * FEATURE_ATOMIC_BYTES;
+            assert_eq!(
+                &packed[first..first + 16],
+                &dense[pixel * 20..pixel * 20 + 16]
+            );
+            let second = (PIXELS + pixel) * FEATURE_ATOMIC_BYTES;
+            assert_eq!(
+                &packed[second..second + 4],
+                &dense[pixel * 20 + 16..pixel * 20 + 20]
+            );
+            assert_eq!(&packed[second + 4..second + 16], &[0; 12]);
+        }
+        assert_eq!(&packed[2 * PIXELS * FEATURE_ATOMIC_BYTES..], &[0; 96]);
     }
 
     #[test]

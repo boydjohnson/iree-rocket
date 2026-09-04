@@ -255,6 +255,10 @@ impl PhaseStat {
     }
 }
 
+/// How many CPUs the per-CPU histogram tracks. Past this the sample is
+/// dropped rather than grown into: it is a diagnostic, and RK3588 has eight.
+const MAX_TRACKED_CPUS: usize = 64;
+
 #[derive(Default)]
 struct Registry {
     /// Label insertion order, so the report reads in first-seen (i.e. model)
@@ -262,12 +266,33 @@ struct Registry {
     order: Vec<String>,
     ops: HashMap<String, [PhaseStat; PHASE_COUNT]>,
     totals: [PhaseStat; PHASE_COUNT],
+    /// Host nanoseconds attributed to the CPU the phase finished on.
+    ///
+    /// The driver's host-side work is memory-bound, and on a big.LITTLE part
+    /// it matters enormously which cluster runs it: the same transforms
+    /// measured 13.8 ms on RK3588's A76s and 52.4 ms on its A55s. The thread
+    /// that runs `queue_execute` blocks in `PREP_BO` waiting for an NPU
+    /// completion IRQ, and Linux wakes it near whichever CPU serviced that
+    /// IRQ -- which, per ISSUES.md M3, is cpu0. This is how to see whether
+    /// that is what is happening rather than assume it.
+    cpu_nanos: Vec<u128>,
     last_execute_end: Option<Instant>,
 }
 
 impl Registry {
     fn add(&mut self, phase: Phase, label: &str, elapsed: Duration, bytes: usize) {
         self.totals[phase as usize].add(elapsed, bytes);
+        // `Execute` contains the other submit-time phases, so counting it too
+        // would double every nanosecond it already covers.
+        if phase != Phase::Execute {
+            let cpu = unsafe { nix::libc::sched_getcpu() };
+            if (0..MAX_TRACKED_CPUS as i32).contains(&cpu) {
+                if self.cpu_nanos.is_empty() {
+                    self.cpu_nanos = vec![0; MAX_TRACKED_CPUS];
+                }
+                self.cpu_nanos[cpu as usize] += elapsed.as_nanos();
+            }
+        }
         if label == NO_OP {
             return;
         }
@@ -385,6 +410,31 @@ pub fn report() {
             npu as f64 / (host + npu) as f64 * 100.0
         },
     );
+
+    // Which CPUs the host half actually ran on. A driver whose transforms all
+    // land on cpu0 is not a driver with slow transforms; see `cpu_nanos`.
+    let total_cpu_nanos: u128 = registry.cpu_nanos.iter().sum();
+    if total_cpu_nanos > 0 {
+        let mut busiest: Vec<(usize, u128)> = registry
+            .cpu_nanos
+            .iter()
+            .copied()
+            .enumerate()
+            .filter(|(_, nanos)| *nanos > 0)
+            .collect();
+        busiest.sort_by_key(|(_, nanos)| std::cmp::Reverse(*nanos));
+        let shares: Vec<String> = busiest
+            .iter()
+            .take(8)
+            .map(|(cpu, nanos)| {
+                format!(
+                    "cpu{cpu} {:.0}%",
+                    *nanos as f64 / total_cpu_nanos as f64 * 100.0
+                )
+            })
+            .collect();
+        eprintln!("  host time by cpu: {}", shares.join(", "));
+    }
 
     // How much of `pack.weights` above was avoided rather than paid. A run
     // with no hits is the first inference of a process (there is no

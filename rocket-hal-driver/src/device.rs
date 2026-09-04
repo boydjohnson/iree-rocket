@@ -47,6 +47,7 @@ use crate::{
 use iree_rocket_hal::rocket::{
     api::{DRM_IOCTL_BASE, drm_version},
     device as rocket_device,
+    tensor_layout::{compact_atomic_output, compact_tiled_accumulator_output},
 };
 
 const DEVICE_PATH: &str = "/dev/accel/accel0";
@@ -1213,101 +1214,14 @@ status_stub!(queue_dispatch(
 ) -> iree_status_t);
 
 #[allow(unused_variables)]
-/// Interleaves DPU feature-atomic output surfaces into dense NHWC pixels.
-///
-/// Each hardware surface stores one channel block for every spatial pixel;
-/// `DPU_DST_SURF_STRIDE` advances between those full spatial surfaces.
-/// Dense NHWC instead stores every channel group for one pixel contiguously,
-/// so copy one surface chunk at a time into each destination pixel. Ordinary
-/// output blocks are 16 bytes; accumulator blocks are 32 i32 lanes (128
-/// bytes). The final logical surface may be partial.
-fn compact_atomic_output(
-    scratch: &[u8],
-    source_pixel_count: usize,
-    output_pixel_count: usize,
-    bytes_per_pixel: usize,
-    source_block_bytes: usize,
-    dst: &mut [u8],
-) -> usize {
-    if source_block_bytes == 0 {
-        return 0;
-    }
-    let mut written = 0;
-    for pixel in 0..output_pixel_count {
-        let mut pixel_written = 0;
-        while pixel_written < bytes_per_pixel {
-            let surface = pixel_written / source_block_bytes;
-            let chunk_len = (bytes_per_pixel - pixel_written).min(source_block_bytes);
-            let src_off =
-                surface * source_pixel_count * source_block_bytes + pixel * source_block_bytes;
-            let dst_off = pixel * bytes_per_pixel + pixel_written;
-            if src_off + chunk_len > scratch.len() || dst_off + chunk_len > dst.len() {
-                return written;
-            }
-            dst[dst_off..dst_off + chunk_len]
-                .copy_from_slice(&scratch[src_off..src_off + chunk_len]);
-            written += chunk_len;
-            pixel_written += chunk_len;
-        }
-    }
-    written
-}
-
-fn compact_tiled_accumulator_output(
-    scratch: &[u8],
-    tiles: &[iree_rocket_hal::rocket::conv::AccumulatorOutputTile],
-    output_width: usize,
-    bytes_per_pixel: usize,
-    source_block_bytes: usize,
-    dst: &mut [u8],
-) -> usize {
-    if source_block_bytes == 0 || output_width == 0 {
-        return 0;
-    }
-    let mut written = 0;
-    for tile in tiles {
-        let tile_pixels = tile.output_rows * tile.output_columns;
-        let Some(tile_end) = tile.scratch_offset.checked_add(tile.scratch_bytes) else {
-            return written;
-        };
-        if tile_end > scratch.len() {
-            return written;
-        }
-        for row in 0..tile.output_rows {
-            for column in 0..tile.output_columns {
-                let local_pixel = row * tile.output_columns + column;
-                let output_pixel =
-                    (tile.output_row + row) * output_width + tile.output_column + column;
-                let mut pixel_written = 0;
-                while pixel_written < bytes_per_pixel {
-                    let surface = pixel_written / source_block_bytes;
-                    let chunk_len = (bytes_per_pixel - pixel_written).min(source_block_bytes);
-                    let src_off = tile.scratch_offset
-                        + surface * tile_pixels * source_block_bytes
-                        + local_pixel * source_block_bytes;
-                    let dst_off = output_pixel * bytes_per_pixel + pixel_written;
-                    if src_off + chunk_len > tile_end || dst_off + chunk_len > dst.len() {
-                        return written;
-                    }
-                    dst[dst_off..dst_off + chunk_len]
-                        .copy_from_slice(&scratch[src_off..src_off + chunk_len]);
-                    written += chunk_len;
-                    pixel_written += chunk_len;
-                }
-            }
-        }
-    }
-    written
-}
-
 #[cfg(test)]
 mod device_tests {
-    use super::{
-        compact_atomic_output, compact_tiled_accumulator_output,
-        needs_depthwise_to_dense_quiescence,
-    };
+    use super::needs_depthwise_to_dense_quiescence;
     use crate::command_buffer::DpuMode;
-    use iree_rocket_hal::rocket::conv::AccumulatorOutputTile;
+    use iree_rocket_hal::rocket::{
+        conv::AccumulatorOutputTile,
+        tensor_layout::{compact_atomic_output, compact_tiled_accumulator_output},
+    };
 
     #[test]
     fn quiesces_only_the_completed_depthwise_to_dense_transition() {
@@ -1594,6 +1508,12 @@ unsafe extern "C" fn queue_execute(
             // how much of an inference is not this driver at all, which is
             // the first thing to know before optimizing anything inside it.
             crate::profile::mark_outside_start();
+            // Held for the whole submission: everything below it is either
+            // memory-bound layout work or a syscall, and on a big.LITTLE part
+            // the first is 3.8x slower on the little cluster. See
+            // `cpu_affinity`, and `ROCKET_PROFILE`'s `host time by cpu` line
+            // for where it was actually landing.
+            let _fast_cpus = crate::cpu_affinity::prefer_fast_cpus();
             let execute_timer = crate::profile::start();
             let cmds = if command_buffer.is_null() {
                 Vec::new()

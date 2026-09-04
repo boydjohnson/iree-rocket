@@ -38,6 +38,7 @@ pub mod status;
 pub mod allocator;
 pub mod buffer;
 pub mod command_buffer;
+pub mod cpu_affinity;
 pub mod device;
 pub mod driver;
 pub mod event;

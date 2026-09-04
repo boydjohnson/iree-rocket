@@ -232,6 +232,31 @@ safe. Three knobs:
 | `ROCKET_WEIGHT_CACHE=verify` | Pack anyway on a hit and compare against the cached bytes the regcmd reads, failing loudly on any difference. |
 | `ROCKET_WEIGHT_CACHE_MB=N` | Byte budget, default 256 MiB. |
 
+The driver's host-side work is memory-bound, so on a big.LITTLE part it runs
+several times slower on the little cluster -- 52.4 ms against 13.8 ms for
+MobileNetV2 fp16's layout transforms on RK3588. `queue_execute` therefore asks
+the scheduler for the highest-`cpu_capacity` CPUs while it runs and restores
+the thread's original affinity afterwards; the profile's `host time by cpu`
+line shows where it actually landed. On a machine whose cores are all the same
+this finds nothing to prefer and does nothing.
+
+| Variable | Effect |
+|---|---|
+| `ROCKET_HOST_CPUS=off` | Never change affinity. |
+| `ROCKET_HOST_CPUS=0-3,7` | Use this CPU list instead of the highest-capacity one. |
+
+`iree-rocket-hal`'s `layout_bench` and `gem_bandwidth` examples measure the
+transforms and the GEM mapping directly, which is a much faster way to test a
+hypothesis about either than a model run:
+
+```sh
+CARGO_TARGET_AARCH64_UNKNOWN_LINUX_GNU_LINKER=aarch64-linux-gnu-gcc \
+  cargo build -p iree-rocket-hal --release \
+  --target aarch64-unknown-linux-gnu --example layout_bench
+scp target/aarch64-unknown-linux-gnu/release/examples/layout_bench planck:/tmp/
+ssh planck '/tmp/layout_bench 20 cold'
+```
+
 ## Board convolution regression gate
 
 The convolution regression command checks the low-level ConvPlan/NPU path and
