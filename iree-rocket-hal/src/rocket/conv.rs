@@ -4068,7 +4068,7 @@ fn conv_2d_tile_program(
                 // fixed override cannot express it on a tiled plan: each tile
                 // has its own out_rows.
                 accumulator_surf_mult_override(shape.in_channels)
-                    .map(|mult| full_out_width * rows.out_rows * mult)
+                    .map(|mult| out_width * rows.out_rows * mult)
                     .or_else(|| accumulator_surf_add_override(shape.in_channels))
                     .unwrap_or(16)
             } else {

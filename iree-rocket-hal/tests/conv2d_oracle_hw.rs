@@ -3419,8 +3419,9 @@ fn accumulator_size_e_probe() {
 
     let size_e = std::env::var("ROCKET_ACC_SIZE_E").unwrap_or_else(|_| "default(1)".into());
     let surf_add = std::env::var("ROCKET_ACC_SURF_ADD").unwrap_or_else(|_| "default(16)".into());
+    let pattern = std::env::var("ROCKET_ACC_PROBE_PATTERN").unwrap_or_else(|_| "dense".into());
     println!(
-        "\n  shape {extent}^2 Cin={cin} Cout={cout} k={kernel}  size_e={size_e} surf_add={surf_add}"
+        "\n  shape {extent}^2 Cin={cin} Cout={cout} k={kernel}  size_e={size_e} surf_add={surf_add} pattern={pattern}"
     );
 
     // The canary is a Cin=64 shape, so it stays on the shipped program as long
@@ -3452,7 +3453,16 @@ fn accumulator_size_e_probe() {
             Ok("fp16") => OraclePrecision::Fp16,
             _ => OraclePrecision::Int8Accumulator,
         },
-        pattern: OraclePattern::Counting,
+        // `Counting` sets every input and coefficient to 1, so at a 1x1 kernel
+        // with no padding EVERY output lane is the same constant and any
+        // permutation of the output is invisible -- it can only detect
+        // unwritten lanes. `Dense` varies by y, x and channel and is the
+        // pattern that actually tests addressing. Default to it.
+        pattern: match std::env::var("ROCKET_ACC_PROBE_PATTERN").as_deref() {
+            Ok("counting") => OraclePattern::Counting,
+            Ok("selectors") => OraclePattern::Selectors { phase: 1 },
+            _ => OraclePattern::Dense { phase: 1 },
+        },
     };
     let fixture = build_fixture(case).expect("fixture");
     let started = std::time::Instant::now();
@@ -3487,19 +3497,132 @@ fn accumulator_size_e_probe() {
         .collect();
 
     let report = compare_output(&fixture, &execution.plan, &execution.output);
+    // The plan structure, so a k=1/k=3 comparison can be reasoned about rather
+    // than guessed: the CBUF split and the per-tile output-row counts are what
+    // differ between kernel sizes at the same logical shape.
+    let tile_rows: Vec<String> = execution
+        .plan
+        .tiles()
+        .iter()
+        .map(|tile| format!("{}x{}", tile.rows.out_rows, tile.columns.out_cols))
+        .collect();
     println!(
-        "  staging={} written={written} ({:.1}%) past_end={} tiles={} elapsed={:.1}ms",
+        "  staging={} written={written} ({:.1}%) past_end={} elapsed={:.1}ms",
         raw.len(),
         100.0 * written as f64 / raw.len().max(1) as f64,
         execution.pad_written,
-        execution.plan.tiles().len(),
         elapsed.as_secs_f64() * 1000.0,
     );
+    println!(
+        "  plan: tiles={} banks={}d/{}w out_tiles=[{}] blocks_per_px={} coef_bytes_per_ch={}",
+        execution.plan.tiles().len(),
+        execution.plan.data_banks(),
+        execution.plan.weight_banks(),
+        tile_rows.join(","),
+        fixture.shape.output_blocks_per_pixel(),
+        fixture.shape.padded_channels() * (kernel * kernel) as u32,
+    );
     println!("  runs: {}", described.join(" "));
+    // Which lanes are wrong matters more than how many: a whole-pixel pattern
+    // says addressing, a channel-partial one says surface sequencing.
+    for sample in report.samples.iter().take(6) {
+        println!("    {sample}");
+    }
     println!(
         "  oracle (layout-dependent, informational): {} mismatches, max|diff|={}",
         report.mismatches, report.max_abs_difference
     );
+
+    // Layout scan. The reference writer covers the whole buffer where the
+    // shipped one truncates, but lands the lanes somewhere else, so the open
+    // question is *which* cube it writes -- not which register to move next.
+    // Score candidate address maps against the oracle and name the winner.
+    // Single-tile only: a multi-tile plan partitions the staging per tile and
+    // the offsets below assume one contiguous image.
+    if std::env::var_os("ROCKET_ACC_LAYOUT_SCAN").is_some() {
+        let shape = fixture.shape;
+        let kernels = fixture.case.kernel;
+        let out_h = shape.output_height(kernels) as usize;
+        let out_w = shape.output_width(kernels) as usize;
+        let cpad = shape.padded_out_channels() as usize;
+        let cout = case.cout as usize;
+
+        let read = |offset: usize| -> Option<i32> {
+            raw.get(offset..offset + 4)
+                .map(|bytes| i32::from_le_bytes(bytes.try_into().unwrap()))
+        };
+
+        // Each tile writes its own contiguous scratch range, so a lane's
+        // address is (tile base) + (offset within that tile's own image).
+        // Recover the partition the same way the shipped assembler does.
+        let staged = execution
+            .plan
+            .programs_with_staged_accumulator_output(Buffers {
+                input: 0,
+                weights: 0,
+                bias: 0,
+                output: 0,
+            })
+            .tiles;
+        let locate = |oy: usize, ox: usize| -> Option<(usize, usize, usize, usize, usize)> {
+            staged.iter().find_map(|tile| {
+                let within_rows = oy >= tile.output_row && oy < tile.output_row + tile.output_rows;
+                let within_cols =
+                    ox >= tile.output_column && ox < tile.output_column + tile.output_columns;
+                (within_rows && within_cols).then(|| {
+                    (
+                        tile.scratch_offset,
+                        oy - tile.output_row,
+                        ox - tile.output_column,
+                        tile.output_rows,
+                        tile.output_columns,
+                    )
+                })
+            })
+        };
+
+        // (name, c2, surface-major?) -- surface stride is derived as
+        // pixels * c2 * 4 for the surface-major forms, which is the only
+        // stride that tiles the buffer exactly.
+        let candidates: [(&str, usize, bool); 6] = [
+            ("blocks32-surface-major (shipped model)", 32, true),
+            ("C2=4  surface-major", 4, true),
+            ("C2=8  surface-major", 8, true),
+            ("C2=16 surface-major", 16, true),
+            ("C2=4  pixel-major", 4, false),
+            ("C2=32 pixel-major", 32, false),
+        ];
+        for (name, c2, surface_major) in candidates {
+            let mut matched = 0usize;
+            let mut total = 0usize;
+            for oy in 0..out_h {
+                for ox in 0..out_w {
+                    let Some((base, ty, tx, trows, tcols)) = locate(oy, ox) else {
+                        continue;
+                    };
+                    let tile_pixels = trows * tcols;
+                    for oc in 0..cout {
+                        let offset = base
+                            + if surface_major {
+                                (oc / c2) * tile_pixels * c2 * 4
+                                    + (ty * tcols + tx) * c2 * 4
+                                    + (oc % c2) * 4
+                            } else {
+                                (ty * tcols + tx) * cpad * 4 + oc * 4
+                            };
+                        total += 1;
+                        if read(offset) == Some(expected_output(case, oc, oy, ox)) {
+                            matched += 1;
+                        }
+                    }
+                }
+            }
+            println!(
+                "    layout {name:<38} {matched}/{total} ({:.1}%)",
+                100.0 * matched as f64 / total.max(1) as f64
+            );
+        }
+    }
     println!(
         "  canary after:  {}",
         if accumulator_canary_passes(&file) {

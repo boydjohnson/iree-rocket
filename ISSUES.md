@@ -21,129 +21,147 @@ developer or a measurement, **S3** performance, **S4** hygiene.
 
 ---
 
-## C1 (S1) — CONFIRMED 2026-09-03 (second pass, against `../rocket-userspace`): the accumulator uses the wrong output writer, and the "384 coefficient-bytes-per-channel hardware limit" is an artifact of it
+## C1 (S1) — RESOLVED 2026-09-03: there is no coefficient-per-channel limit at any kernel size. The accumulator writes the wrong output cube, and the readback models the wrong one to match.
 
-**Retracting my first-pass refutation.** I swept `size_e` alone, found it inert,
-and closed this. That was the exact mistake
-`rockchip-npu-notes/encodings/k-accumulation.md` warns about — *"Three registers
-must be right at once... no single-knob sweep can converge"* — and the repo's
-earlier `ROCKET_ACC_SURF_ADD` sweep fell into it independently. The two sweeps
-were each moving one knob of a three-knob geometry.
+Settled by diffing against `../rocket-userspace`, the C library the notes were
+written from. Two earlier attempts got this wrong; both are corrected below.
 
-### The diff, from the reference implementation
+### The two writers
 
 `rocket-userspace/src/npu_regcmd.c`'s `gen_matmul_int8` is a HW-validated,
 bit-exact int8 x int8 -> **int32** program. Its DPU output writer against this
-repo's `Int8Accumulator`, at 32x32 Cin=384 Cout=64 k1 (offsets confirmed
-identical against `rocket-userspace/include/npu_hw.h`):
+repo's `Int8Accumulator` (offsets verified identical against
+`rocket-userspace/include/npu_hw.h`; **every other DPU register matches**):
 
-| field | register | rocket-userspace | this repo | same? |
-|---|---|---|---|---|
-| `burst_len`/`conv_mode`/`output_mode`/`flying_mode` | `DPU_FEATURE_MODE_CFG` 0x400C | `0xf`/0/2/0 | `0x1e4` = same | yes |
-| `out`/`in`/`proc_precision` | `DPU_DATA_FORMAT` 0x4010 | int32/int8/int8 | same | yes |
-| **`mc_surf_out`** | `DPU_DATA_FORMAT` bit 3 | **0** | **1** | **no** |
-| **`size_e_{0,1,2}`** | `DPU_BS_OW_CFG` 0x4050 | **7** | **1** | **no** |
-| **`surf_add`** | `DPU_SURFACE_ADD` 0x40C0 | **`dataout_h*dataout_w * 8`** | **16** | **no** |
-| `od_bypass`, BS/BN/EW bypasses, OUT_CVT identity | — | all bypassed | same | yes |
+| field | register | rocket-userspace | this repo |
+|---|---|---|---|
+| **`mc_surf_out`** | `DPU_DATA_FORMAT` 0x4010 bit 3 | **0** | **1** |
+| **`size_e_{0,1,2}`** | `DPU_BS_OW_CFG` 0x4050 | **7** | **1** |
+| **`surf_add`** | `DPU_SURFACE_ADD` 0x40C0 | **`dataout_h*dataout_w * 8`, per task** | **16** |
 
-`rocket-userspace/include/npu_dpu.h:120` documents the field that makes the
-other two readable:
+`rocket-userspace/include/npu_dpu.h:120`:
 
 > `mc_surf_out   DPU_DATA_FORMAT bit3   0=16B/pixel one surface, 1=2/4 surf serial`
 
-So these are **two different writers**, not two tunings of one. This repo is in
-the serial mode, which is why `size_e` and `surf_add` read as inert or unhelpful
-there — in the serial writer there is no surface stride for either to describe.
-`gen_matmul_int8` carries the warning verbatim: `size_e=3`/`surf*4` *"halves the
-surface stride, leaving every output column past the first few surfaces as the
-`0xAA` sentinel"* — this path's exact signature.
+These are **two different writers**. This repo is in the serial one, which is
+why `size_e` and `surf_add` read as inert/unhelpful there — in the serial writer
+there is no surface stride for either to describe. `surf_add` is also derived
+per **task**, so no constant could have expressed it on a tiled plan.
 
-Note also that `surf_add` is derived from the **task's** `dataout_h * dataout_w`,
-not the image's. On a height-tiled plan every tile has its own `out_rows`, so
-**no constant `ROCKET_ACC_SURF_ADD` could ever have reproduced it**, jointly or
-otherwise. That is why the earlier constant sweep was not merely underpowered
-but structurally unable to find this.
+### What each writer does
 
-### Result on hardware
+Measured on `planck`, one shape per process, `ROCKET_PAD_*` set, device HEALTHY
+throughout, with a **layout scanner** that scores candidate address maps against
+the oracle (validated: it returns 100% on the shipped model for the shipped
+writer).
 
-`planck`, one shape per process, `ROCKET_PAD_*` set, device HEALTHY before and
-after (verified with a no-override run — an early "SICK" reading was my own
-canary running under the override, not the device):
-
-**1x1 kernel — the reference writer is a strict improvement, with no cap:**
-
-| shape | shipped writer | reference writer |
+| | shipped (`mc_surf_out=1`) | reference (`mc_surf_out=0`, `size_e=7`, `surf_add=dataout*8`) |
 |---|---|---|
-| 32² Cin 8 / 32 / 64 / 128, Cout 64 | 100%, 0 mismatches | 100%, **0 mismatches** |
-| 32² Cin **385**, Cout 64 | 2.5–8.5% written, 59974–63884 mism. | 100%, **0 mismatches** |
-| 32² Cin **512**, Cout 64 | truncated | 100%, **0 mismatches** |
-| 32² Cin **704**, Cout 64 | 2.3% written, 64000 mism. | 100%, **0 mismatches** |
-| 32² Cin 385, Cout **128** | 2.4% written, 127884 mism. | 100%, **0 mismatches** |
-| 32² Cin 385, Cout **256** | 2.3% written, 256070 mism. | 100%, **0 mismatches** |
+| output cube | 32-channel blocks, surface-major (128-byte atoms) | **C2=4 surface-major** (16-byte atoms, 4 int32 lanes) |
+| coverage | **truncates** past ~384 coefficient bytes/channel | **100% at every shape tested** |
+| correctness | exact where it writes | exact everywhere, *once read back as C2=4* |
 
-The surface-multiplier sweep confirms 8 is the value and behaves as the
-reference documents: at Cin 384, mult 8 → 100%/0, mult 4 → 75%/16384 mism.,
-mult 2 → 62.5%/24576, mult 1 → 56.2%/28672.
+C2=4 is exactly the int32 output cube
+`rockchip-npu-notes/encodings/tile-layouts.md` documents (`int8xint8 | int32 |
+4 B | output cube C2 = 4`). The scanner puts it at **100.0%** and every other
+candidate (C2=8/16/32, pixel-major) in the 32–38% noise band.
 
-**So `MAX_ACCUMULATOR_COEFFICIENT_BYTES_PER_CHANNEL = 384` is not a hardware
-limit at 1x1.** It is a description of where the serial writer runs out of
-surfaces. `accumulator-per-channel-coefficient-limit`'s central conclusion is
-wrong, and its supporting observations were all consistent with this all along:
-fully-accumulated written pixels, truncation that is a clean prefix per tile,
-small single-surface shapes passing, and `DPU_SURFACE_ADD` driving the write
-pattern exactly.
+### There is no channel cap, at either kernel size
 
-**3x3 kernel — the reference writer regresses, and this is unresolved.** It
-writes 100% but 12128 lanes are wrong, with the *identical* count at Cin 16, 32,
-33 and 256 (max|diff| 80 / 160 / 165 / 1280, scaling with Cin — computed-wrong
-values, not sentinel), including at shapes the shipped writer computes exactly.
-Sweeping the multiplier does not recover it (mult 4 → 25480, mult 16 → 38832,
-mult 8 → 12128 is the best), and `size_e=3` collapses every arm to sentinel.
-Something else in the k≥3 geometry is tied to the writer mode. So this is **not
-a drop-in replacement**: k=1 wants the reference writer, k≥3 currently wants the
-shipped one.
+Reference writer, C2=4 readback, `Dense` pattern, all **100.0% of lanes exact**:
 
-### Why this matters
+| shape | tiles | CBUF split | coef bytes/channel |
+|---|---|---|---|
+| 32² Cin 32 Cout 64 k1 | 1 | 1d/11w | 32 |
+| 32² Cin 385 Cout 64 k1 | 2 | 11d/1w | 400 |
+| 32² Cin 512 Cout 64 k1 | 2 | 11d/1w | 512 |
+| 32² Cin 704 Cout 64 k1 | 3 | 10d/2w | **704** |
+| 8² Cin 1024 Cout 64 k1 | 1 | 2d/10w | **1024** |
+| 32² Cin 385 Cout **256** k1 | 2 | 8d/4w | 400 |
+| 33² Cin 128 Cout 64 k1 (odd extent) | 1 | 5d/7w | 128 |
+| 32² Cin 33 Cout 64 **k3** | 1 | 2d/10w | 432 |
+| 32² Cin 256 Cout 64 **k3** | 2 | 7d/5w | **2304** |
+| 16² Cin 256 Cout 64 **k3** | 1 | 2d/10w | 2304 |
 
-The transform spec caps `@match_dynamic_conv2d_int8` at **Cin ≤ 352** and
-`@match_dynamic_conv2d_3x3_int8` at **Cin ≤ 32**, and
-`int8-dense-conv-caps` calls those the biggest offload lever open. MobileNetV2
-is overwhelmingly **1x1 pointwise** convolutions — exactly the kernel where this
-is now measured bit-exact to at least Cin 704 at Cout up to 256. Lifting the 1x1
-cap no longer needs the `ConvInteger`-requantization-fusion work to land first.
+**So `MAX_ACCUMULATOR_COEFFICIENT_BYTES_PER_CHANNEL = 384` describes where the
+serial writer runs out of surfaces, not a hardware limit.** Every supporting
+observation in `accumulator-per-channel-coefficient-limit` is consistent with
+this: fully-accumulated written pixels, a clean prefix per tile, small
+single-surface shapes passing, and `DPU_SURFACE_ADD` driving the write pattern
+exactly.
 
-### Suggested next steps
+### Does k=3 differ from k=1?
 
-1. Make the writer selectable per kernel size: reference writer (`mc_surf_out=0`,
-   `size_e=7`, `surf_add = out_rows*out_cols*8` **per tile**) for 1x1, shipped
-   writer for k≥3, until the k≥3 case is understood. Both are now expressible.
-2. Re-derive `output_atom_bytes` / `output_row_stride` / the staging partition
-   for the reference writer. Note the existing assembler already reproduces it
-   bit-exactly at 1x1, so the 128-byte block model and the reference layout
-   coincide there — do not assume that holds at k≥3.
-3. Then raise the 1x1 int8 cap in the transform spec and re-audit MobileNetV2.
-4. Re-test the output-parity rule under the reference writer. My parity shapes
-   (3² and 9² at Cout 32) passed under *both* writers, so I did not reproduce
-   the failure and cannot say whether it survives; use the memory's `ROCKET_PROBE_ONLY`
-   one-hot protocol rather than my `Counting` pattern.
+The question that produced the answer. **Tiling differs; the channel ceiling does
+not.**
+
+- **Tiling genuinely differs.** k=3 costs 9x the coefficient bytes per output
+  channel, so the CBUF split swings toward weight banks (32² Cin 32: **1d/11w**
+  at k=3 against a data-heavy split at k=1), and the halo makes
+  `in_rows = out_rows + 2`. Same logical shape, different tile count and
+  different rows per tile.
+- **The channel ceiling does not differ, because there isn't one.** k=3 at
+  C=2304 is exact; k=1 at C=1024 is exact. C is not the variable — it never was.
+- A k=1/k=3 register diff at the same shape shows **only CNA registers move**
+  (`0x1010`, `0x1030`, `0x1034`, `0x1038`, `0x1068` — weight sizes, kernel dims,
+  padding). The DPU program is byte-identical. So nothing about the writer is
+  kernel-dependent, which is why one readback fix covers both.
+
+### Two corrections to my own earlier reports
+
+1. **"`size_e` is inert, hypothesis refuted"** — wrong. I swept one register of a
+   three-register geometry. In the serial writer that null was guaranteed and
+   meant nothing. The repo's earlier `ROCKET_ACC_SURF_ADD` sweep failed the same
+   way, independently.
+2. **"the reference writer is bit-exact at k=1, regresses at k=3"** — also wrong,
+   in both halves. Both used `OraclePattern::Counting`, which sets every input
+   and coefficient to 1; at a 1x1 kernel with no padding that makes **every
+   output lane the same constant**, so any permutation is invisible and
+   "0 mismatches" only proved coverage. Re-run with `Dense` (varies in y, x and
+   channel), k=1 under the reference writer scores 42232 mismatches on the
+   shipped readback model and 100% on C2=4. The k=3 "regression" was the same
+   layout mismatch, visible there only because padding makes k=3 vary spatially.
+   **`Counting` cannot validate addressing on any shape whose output is
+   constant** — that is a trap in the oracle harness worth a comment.
+
+### What to change
+
+1. Switch `Int8Accumulator` to the reference writer: `mc_surf_out = 0`,
+   `size_e = 7`, `surf_add = out_cols * out_rows * 8` **per tile**.
+2. Change the readback to C2=4 surface-major: `output_atom_bytes` 128 -> 16,
+   `output_blocks_per_pixel` accordingly, and
+   `assemble_staged_accumulator_output` / `compact_tiled_accumulator_output` in
+   the HAL driver to match. Per-tile scratch ranges are unchanged.
+3. Delete `MAX_ACCUMULATOR_COEFFICIENT_BYTES_PER_CHANNEL` and its guard, the
+   `kernels == [3,3] && 3x3 output` refusal, and re-test
+   `parity_padded_out_channels` — the parity rule was fitted to the serial
+   writer and may well go too. (I did not reproduce a parity failure: my 3² and
+   9² Cout 32 shapes passed under both writers, so use the memory's
+   `ROCKET_PROBE_ONLY` one-hot protocol rather than treating it as gone.)
+4. Then raise the transform spec's int8 caps — `@match_dynamic_conv2d_int8`
+   `Cin <= 352` and `@match_dynamic_conv2d_3x3_int8` `Cin <= 32` — and re-audit
+   MobileNetV2. `int8-dense-conv-caps` calls this the biggest offload lever open,
+   and it is no longer blocked behind the `ConvInteger` requantization-fusion
+   work.
 
 ### What landed
 
-- `ROCKET_ACC_SIZE_E` / `ROCKET_ACC_MC_SURF_OUT` / `ROCKET_ACC_SURF_MULT`
-  sentinels (all gated by `ROCKET_ACC_SIZE_E_MIN_CIN`), which together express
-  the reference writer; `ROCKET_ACC_SURF_MULT` applies the per-task rule rather
-  than a constant.
+- `ROCKET_ACC_MC_SURF_OUT` / `ROCKET_ACC_SIZE_E` / `ROCKET_ACC_SURF_MULT`
+  sentinels (gated by `ROCKET_ACC_SIZE_E_MIN_CIN`), which together express
+  either writer; `ROCKET_ACC_SURF_MULT` applies the per-task rule.
 - `ROCKET_PAD_OUTPUT` + a `pad_written` count in the oracle harness.
-- `accumulator_size_e_probe`: env-driven, one shape per process, canary either
-  side, prints elapsed so a hang is not misread as a shape result.
-- Compiled path verified byte-identical with no env set (`0x4010`/`0x4050`/`0x40c0`
-  unchanged); 159 host unit tests pass; no new clippy warnings.
+- `accumulator_size_e_probe`: env-driven shape/pattern, one shape per process,
+  canary either side, prints the plan (tiles, CBUF split, per-tile out extents,
+  coefficient bytes/channel), the written-run map, mismatch samples, and elapsed
+  time. `ROCKET_ACC_LAYOUT_SCAN=1` adds the multi-tile-aware layout scorer.
+- Compiled path verified byte-identical with no env set; 159 host unit tests
+  pass; clippy unchanged at 4 warnings.
 
-**Method note worth keeping.** A wrong `size_e` on the *requantized* int8 path
-(where `OD_BYPASS` is clear) hangs the NPU rather than returning wrong data:
-1050/1102 ms dispatches against 30–41 ms healthy, `PREP_BO` returning success
-either way. That is C3's argument measured, and it is also how I know the
-shipped `size_e=1` is load-bearing on that path.
+**Method note.** A wrong `size_e` on the *requantized* int8 path (where
+`OD_BYPASS` is clear) hangs the NPU rather than returning wrong data:
+1050/1102 ms dispatches against 30–41 ms healthy, `PREP_BO` succeeding either
+way. That is C3's argument measured, and it is how I know the shipped `size_e=1`
+is load-bearing there.
 
 ## C2 (S2) — the requant oracle rounds half-away-from-zero; the hardware rounds half-to-even, and this repo's multiplier encoding makes ties reachable
 
@@ -710,7 +728,7 @@ so they must disagree somewhere.
 
 ## Suggested order
 
-1. **C1** — confirmed and now the biggest item: the 1x1 int8 accumulator has no coefficient cap once the output writer matches `rocket-userspace`'s. Land the per-kernel writer selection, then raise the transform spec's 1x1 Cin cap and re-audit MobileNetV2. The k>=3 regression is the open sub-problem.
+1. **C1** — resolved and now the biggest item: the int8 accumulator has **no** coefficient cap at any kernel size once the writer and readback are the matching pair (`mc_surf_out=0` + C2=4). Land the writer + readback change, drop three guards, raise both transform-spec int8 Cin caps, re-audit MobileNetV2.
 2. **C3** — a live silent-wrong-results path in production, and the smallest fix here. C1 measured its argument twice over: a 30x wall-clock separation between a watchdog-killed job and a healthy one, with `PREP_BO` returning success either way.
 3. **M1 + M2 + M3** — free or nearly free, and they change what every subsequent measurement means. Do these before re-running any A/B.
 4. **C2** — small fix, plus a probe that settles a question the notes leave open.
@@ -719,11 +737,20 @@ so they must disagree somewhere.
 
 ## Method note
 
-Two independent sweeps missed C1 the same way — the repo's `ROCKET_ACC_SURF_ADD`
-sweep and my `ROCKET_ACC_SIZE_E` sweep — because each moved one register of a
-three-register geometry and read "no effect" as "eliminated". The reference
-implementation is what broke it open, not more sweeping. When a subsystem has a
-mode bit (`mc_surf_out`) that reinterprets the meaning of its other fields, no
-single-knob sweep of those fields can converge, and a null result from one says
-nothing. Prefer diffing against a known-good emitter over sweeping, wherever a
-known-good emitter exists.
+Two things went wrong here repeatedly, and both are cheap to avoid.
+
+**Single-knob sweeps of a multi-register geometry.** Three attempts missed C1
+this way: the repo's `ROCKET_ACC_SURF_ADD` sweep, my `ROCKET_ACC_SIZE_E` sweep,
+and the `surf_add` half of my first joint attempt. When a mode bit
+(`mc_surf_out`) reinterprets what its neighbours mean, a null result from moving
+one of them says nothing at all. Diffing against a known-good emitter is what
+broke it open; no amount of further sweeping would have.
+
+**Degenerate test patterns.** `OraclePattern::Counting` sets every input and
+coefficient to 1, so any shape whose output is constant across pixels and
+channels — every 1x1 kernel without padding — cannot detect a permuted layout,
+only unwritten lanes. It reported "0 mismatches" for a writer that was putting
+every lane in the wrong place. Use `Dense` (varies in y, x, channel) for
+anything that tests addressing, and treat a 100%-pass on `Counting` at k=1 as
+evidence of coverage only. Better still, score the layout explicitly:
+`ROCKET_ACC_LAYOUT_SCAN=1` names the cube instead of leaving "wrong somehow".
