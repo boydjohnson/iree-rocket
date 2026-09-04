@@ -190,17 +190,190 @@ member of that flaky set.
 Host side: 156 lib tests + all workspace tests pass; clippy delta measured by
 stash/pop is **zero**.
 
-### Still to do (item 4, deliberately deferred)
+### Item 4 DONE 2026-09-03: caps raised, MobileNetV2 re-audited — and the caps were not what was blocking it
 
-Raise `@match_dynamic_conv2d_int8`'s `Cin <= 352` and
-`@match_dynamic_conv2d_3x3_int8`'s `Cin <= 32` in the transform spec, and
-re-audit MobileNetV2. Nothing in the HAL blocks it now. Re-run the audit under a
-pinned CPU governor (M1) — the offload/no-offload comparison is exactly the kind
-of measurement the 408 MHz floor distorts.
+**The caps.** Both dense int8 Cin bounds raised to the HAL's
+`MAX_INT8_INPUT_CHANNELS`: `@match_dynamic_conv2d_int8` 352 -> **512**,
+`@match_dynamic_conv2d_3x3_int8` 32 -> **512**. Cout bounds unchanged (768 for
+1x1, 512 for 3x3). 512 is the ceiling because above it the *channel padding*
+rules are unmeasured and ConvPlan's CBUF split is known to diverge from vendor
+captures for dense shapes above Cin 384 — both planning questions, unrelated to
+the writer. `rocket_int8_match_boundaries.mlir` updated to 512-matched /
+513-falls-back at both kernels and **passes**, which is the proof the bounds are
+live. It also had a **stale case** unrelated to this work:
+`dense_1x1_cout_513_falls_back` asserted a fallback that stopped happening when
+the 1x1 Cout bound was raised to 768; it fails identically at HEAD. Corrected to
+768-matched / 769-falls-back.
 
-Also open: **depthwise accumulator output is still on the serial writer** and
-therefore may still carry a coefficient ceiling of its own. It was never
-measured against one, and this change deliberately did not touch it.
+**The re-audit: 22 dispatch sites -> rocket, before and after. The cap raise
+gains nothing on this model.** Not a disappointment to explain away — the shape
+table says so directly. MobileNetV2-static-int8's 52 convolutions have dense 1x1
+Cin values 24, 32, 48, 88, 136, 144, 192, 224, 288, then a jump to 448, 528, 816,
+1344. Only **448** lands in the newly-opened 353..512 window, and its Cout is
+1792, so `Cout <= 768` still refuses it. The 26 convolutions still on the CPU
+are blocked by two *HAL* ceilings, not by matcher caps:
+
+| blocked by | sites | shapes |
+|---|---|---|
+| `MAX_INT8_INPUT_CHANNELS = 512` | 16 dense 1x1 | Cin 528, 816, 1344 |
+| `MAX_OUTPUT_CHANNELS = 768` | 1 dense 1x1 | Cin 448 -> Cout 1792 |
+| depthwise matcher `umax = 512` (HAL ceiling is the same 512) | 9 depthwise 3x3 | C 528, 816, 1344 |
+
+The only dense 3x3 in the model is the Cin 3 stem, and it is stride 2, which the
+int8 3x3 matcher does not admit anyway — so raising that bound from 32 to 512
+also gains zero here. Both raises are still correct and will matter on models
+whose channel counts land in the window.
+
+**Correctness end-to-end, and this is the real result.** On the board, against a
+CPU-only aarch64 build of the same MLIR on identical input:
+
+| build | max\|err\| vs CPU | top-1 |
+|---|---|---|
+| rocket, as shipped | 2.596e-01 | match |
+| rocket, stride-2 stem kept on CPU | **0.000e+00** | match |
+
+**Bit-identical.** All 21 int8 sites (17 dense + 4 depthwise) are exact against
+the CPU reference end-to-end; the entire 0.26 is the one offloaded f32 stride-2
+stem running at f16, exactly as this README documents (0.35-0.42 expected). That
+is the strongest evidence yet that the C1 writer/readback change is right: not a
+probe, a whole model.
+
+**Performance, and the honest number: the NPU path is ~3x slower than CPU-only
+on this model.** `iree-benchmark-module`, app pinned to cpu4-5 in every arm,
+three interleaved passes, items/s:
+
+| arm | pass 1 | pass 2 | pass 3 |
+|---|---|---|---|
+| rocket, governor idle | 1.33 | 1.49 | 1.64 |
+| rocket, A76 held ramped | 1.41 | 1.66 | 1.51 |
+| CPU-only, governor idle | 4.48 | 4.48 | 4.49 |
+| CPU-only, A76 held ramped | 4.48 | 4.47 | 4.48 |
+
+Two things worth reading off it. The CPU arm is **flat to two decimal places**
+across governor state, exactly as `cpu-governor-and-offload.md` predicts for a
+multi-threaded CPU inference. And the governor effect on the *rocket* arm is
+only ~3% here, far short of the notes' 3.2x — because a continuously-fed
+benchmark loop never lets the cluster idle (cpu4 read 408 MHz only on the very
+first cold measurement, 2400 MHz thereafter). M1 remains real, but it bites
+workloads with idle gaps between invocations, not a tight benchmark loop. Do not
+quote the 3.2x for this shape of measurement.
+
+The ~3x deficit is fully accounted for by things already in this file and not by
+anything the cap raise touches: 22 of 153 dispatch sites on the NPU with the 26
+heaviest int8 convolutions ineligible, the NPU at 200 MHz (**M2**), a NC1HWC2
+pack/unpack per dispatch (**P2**), and one submit plus one blocking `PREP_BO`
+per *tile* with the completion IRQ on an A55 (**M3**, **P3**).
+
+### What would actually move MobileNetV2
+
+In rough order of leverage, none of which is a matcher bound:
+
+1. **Raise `MAX_INT8_INPUT_CHANNELS` past 512 and `MAX_OUTPUT_CHANNELS` past
+   768.** Worth 17 dense sites. **This does not need CBUF-split work** — see the
+   correction below; it needs corpus extension and board validation.
+2. **A depthwise coefficient model.** Worth 9 sites, and the one item here that
+   does need a code change: with the ceilings lifted, depthwise C=1344 at k=3 is
+   refused by `streamed_weight_bank_preference` ("wants 13 CBUF banks"), which is
+   the *dense* coefficient formula applied to a depthwise shape whose real weight
+   footprint is `C · kh · kw` bytes total. Depthwise at C=528 and 816 plans fine.
+3. **P2 (cross-op chaining) and P3 (per-tile submit/sync)**, which attack the
+   per-dispatch tax rather than the dispatch count. At 22 sites the tax is
+   currently paid 22 times for 22 convolutions.
+4. **M2**, the 200 MHz clock, which is a straight ~1.43x on the device half.
+
+### Items 1-4 DONE 2026-09-03: ceilings raised, every int8 convolution in MobileNetV2 now offloads
+
+The four things a lift needed, all completed. (My earlier claim that it needed
+CBUF-split work was wrong; see the correction folded into item 1 below.)
+
+**1. Vendor corpus extended past 768.** Built with `build_vendor_fixtures.py`
+(spike repo, `rknn-convert` on PATH, no board). Two new checked-in corpora and
+a test, `conv_vendor_fixture_wide.rs`:
+
+| corpus | cases | content |
+|---|---|---|
+| `conv_vendor_fixtures_wide.json` | 86 | dense: Cin sweeps to 1792 at Cout 64/448/1792; a coarse Cin×Cout grid; MobileNetV2's own widest 1x1 convs at their real 14x14 and 7x7 extents |
+| `conv_vendor_fixtures_depthwise.json` | 63 | **first committed depthwise corpus**: C 64..1344 at extents 7, 14, 28 |
+
+Results: **dense 83 agree, 2 differ, 1 refusal edge; depthwise 63 agree, 0
+differ, 0 refusals.** Both differences are hardware-validated as correct —
+28x28 Cin 704 Cout 64 k3 (ConvPlan 4/8 vs vendor 5/7) and 14x14 Cin 816 Cout 136
+k1 (5/7 vs 10/2, one of MobileNetV2's own). Both give the weights at least as
+many banks as the vendor, the safe direction, and both are 0 mismatches on the
+board. **The CBUF split was never the blocker**: the four points
+`MAX_OUTPUT_CHANNELS`' doc names as divergent now reproduce the vendor exactly,
+because that doc predates the 2026-09-02 group-division fix.
+
+**2. Board validation.** `accumulator_size_e_probe`, `Dense` pattern, one shape
+per process, **0 mismatches everywhere**:
+
+- k=1, 14x14, Cout 64: Cin 512, 576, 640, 704, 768, 896, 1024, 1152, 1280, 1344,
+  1408, 1536, 1792, **2048** — single- and multi-tile.
+- k=3, 28x28, Cout 64/448: Cin to **1152**, including the 1/11 splits at 1088
+  and 1152, and the vendor-divergent 704 at Cout 64/128/256.
+- Cout, 7x7 Cin 448: 768, 1024, 1280, 1536, 1792, **2048** — split flat at 7d/5w
+  throughout, confirming the divergence is indexed by Cin, not Cout.
+- All seven of MobileNetV2's blocked dense 1x1 shapes at their real extents.
+
+**3. The ceilings and the assertion.** `MAX_INT8_INPUT_CHANNELS` 512 → **1344**;
+`MAX_INT8_OUTPUT_CHANNELS` **split out at 1792** rather than raising the shared
+`MAX_OUTPUT_CHANNELS`, because the evidence is int8-only — fp16 keeps 768 and
+512, mirroring the existing `max_in_channels` split. `Precision::max_out_channels`
+added alongside it. `conv_vendor_fixture_channels_768`'s hardcoded
+`supported == 96` is now per-precision (fp16 96/48, int8 144/0) with the Cin 704
+divergence as an explicit hardware-validated allowlist entry, so a *new*
+divergence still fails.
+
+Matcher caps: 1x1 int8 Cin **1344** / Cout **1792**; 3x3 int8 Cin **1152** — not
+1344, because at k=3 the coefficient working set binds first and `ConvPlan`
+*refuses* Cin ≥ 1216, which would reach the driver and panic rather than fall
+back. Depthwise int8 **1344**.
+
+**4. The depthwise coefficient model.** The streamed working set used the dense
+product `kh · kw · Cin · 64`, which scales with C: depthwise C=1344 at k=3 asked
+for 13 of the eleven grantable banks and was refused. A depthwise output channel
+accumulates over exactly **one** input channel, so the contraction depth is 1
+and the working set does not scale with C at all —
+`Shape::streamed_contraction_channels`. Purely additive: a 128-case sweep
+(k=3 and k=5, extents 7/14/28/56, C 32..512) gives byte-identical plans before
+and after, and the new depthwise corpus agrees with the vendor 63/63.
+
+### The re-audit, and the result that matters
+
+| build | rocket dispatch sites | dense | depthwise | stem |
+|---|---|---|---|---|
+| before | 22 | 17 | 4 | 1 |
+| caps raised | 39 | 34 | 4 | 1 |
+| + depthwise model | **48** | 34 | 13 | 1 |
+
+**Zero int8 convolutions remain on the CPU.** And it is correct: against a
+CPU-only aarch64 build on identical input, the 48-site build is **bit-identical**
+(max\|err\| 0.000e+00) once the f32 stride-2 stem is kept on the CPU; as shipped
+it is 2.596e-01, entirely that stem's f16 rounding, unchanged from the 22-site
+build. All 47 int8 convolutions are exact end to end.
+
+**But it is slower, and that is the finding.** `iree-benchmark-module`, app
+pinned to cpu4-5, three interleaved passes, items/s:
+
+| build | pass 1 | pass 2 | pass 3 |
+|---|---|---|---|
+| 22 sites | 1.42 | 1.50 | 1.22 |
+| **48 sites** | **0.90** | **0.85** | **0.92** |
+| CPU-only | 4.51 | 4.50 | 4.49 |
+
+Offloading 26 more convolutions made the model **~35% slower**, and the reason
+is in the audit: CPU dispatch sites went **131 → 209**. Those +78 are the
+NC1HWC2 pack/unpack wrapper ops — one pair per newly-offloaded convolution. At
+7x7 and 14x14 extents the convolutions are far too small to amortize a
+per-dispatch host repack, which is exactly what `rocket-layout-repack-per-dispatch`
+predicts and what the 512→960 depthwise experiment measured once before.
+
+So the caps were worth raising — they are correct, validated, and they remove a
+whole class of "can't offload this" — but **dispatch count is not the lever on
+this model. P2 (cross-op chaining) and P3 (per-tile submit/sync) are**, and they
+are now the only things between this and a net win. Until one of them lands, the
+22-site configuration is the faster one to ship, which is a decision for whoever
+owns the default, not something to bury.
 
 ## C2 (S2) — the requant oracle rounds half-away-from-zero; the hardware rounds half-to-even, and this repo's multiplier encoding makes ties reachable
 

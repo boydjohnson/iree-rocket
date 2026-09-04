@@ -300,24 +300,55 @@ fn run_channel_grid(fixtures: &str, precision: FixturePrecision) {
         "  exploratory values: Cin={exploratory_cin:?}, Cout={exploratory_cout:?} (any pair containing one is outside current ConvPlan limits)"
     );
 
-    // 96/48, not 64/80: `MAX_OUTPUT_CHANNELS` was raised 512 -> 768, which
-    // brings every Cout in this corpus into range at the Cin values ConvPlan
-    // already reproduces. The 48 still exploratory are exactly the Cin >= 576
-    // dense cases, where ConvPlan predicts a 1/11 CBUF split against the
-    // vendor's 6/6, 5/7, 4/8, 4/8 -- see MAX_INPUT_CHANNELS' doc comment.
-    assert_eq!(supported, 96);
-    assert_eq!(exploratory.len(), 48);
-    // Raising MAX_INPUT_CHANNELS to 768 makes these 144/0 and the bank
-    // comparison then fails on ~10 cases -- the Cout-dependent transition
-    // points documented on that constant. That failure is the point: it is
-    // what stops the cap moving before the rule is exact.
+    // Per precision, because the two no longer share a channel ceiling.
+    //
+    // **int8 is 144/0**: `MAX_INT8_INPUT_CHANNELS` went 512 -> 1344 and
+    // `MAX_INT8_OUTPUT_CHANNELS` was split out at 1792 (2026-09-03), so the
+    // whole Cin/Cout 64..768 corpus is in range. **fp16 stays 96/48**: its
+    // ceilings are untouched, because the hardware evidence behind the raise
+    // is int8 only.
+    //
+    // The old comment here predicted "raising MAX_INPUT_CHANNELS to 768 makes
+    // these 144/0 and the bank comparison then fails on ~10 cases". It fails
+    // on exactly **one** Cin, listed below: that prediction predates the
+    // group-division fix (`MAX_UNDIVIDED_WEIGHT_BANKS`), after which ConvPlan
+    // reproduces the vendor at 576, 640, 704-at-large-Cout and 768.
+    let (expected_supported, expected_exploratory) = match precision {
+        FixturePrecision::Fp16 => (96, 48),
+        FixturePrecision::Int8 => (144, 0),
+    };
+    assert_eq!(supported, expected_supported);
+    assert_eq!(exploratory.len(), expected_exploratory);
     assert!(
         missing_plan_zero_split.is_empty(),
         "vendor plan 0 had no unique nonzero CBUF split: {missing_plan_zero_split:?}"
     );
+
+    // One documented divergence, and it is **hardware-validated as correct**.
+    //
+    // At Cin 704, k=3, 28x28, ConvPlan splits 4/8 where the vendor splits 5/7,
+    // and only at small Cout (64 and 128; at Cout >= 192 the two agree). The
+    // difference grants the *weights* one bank more than the vendor rather
+    // than fewer, which is the safe direction -- and it is not left as
+    // reasoning: `accumulator_size_e_probe` ran 28x28 Cin 704 at Cout 64, 128
+    // and 256 on RK3588 and every one is 0 mismatches against the oracle.
+    //
+    // Kept as an allowlist rather than a relaxed assertion so a *new*
+    // divergence still fails, and so this one cannot quietly widen: the exact
+    // splits and the exact Cout list are pinned.
+    let known_hardware_validated: &[((u32, u32, u32, u32, u32), &[u32])] =
+        &[((704, 4, 8, 5, 7), &[64, 128])];
+    let unexpected: Vec<_> = grouped_bank_differences
+        .iter()
+        .filter(|(key, couts)| {
+            !known_hardware_validated
+                .iter()
+                .any(|(k, c)| k == *key && c == &couts.as_slice())
+        })
+        .collect();
     assert!(
-        grouped_bank_differences.is_empty(),
-        "{} supported channel cases have grouped ConvPlan/vendor CBUF divergences above",
+        unexpected.is_empty(),
+        "{} supported channel cases have undocumented ConvPlan/vendor CBUF divergences: {unexpected:?}",
         supported - bank_matches,
     );
     assert!(

@@ -192,7 +192,43 @@ pub const MAX_INPUT_CHANNELS: u32 = 512;
 const CHANNEL_REAL_MODULUS: u32 = 64;
 
 /// Largest input-channel count the int8 sweep measures.
-pub const MAX_INT8_INPUT_CHANNELS: u32 = 512;
+///
+/// Raised 512 -> 1344 (2026-09-03) on hardware evidence, after the DPU output
+/// writer fix removed the failure the old 512 was containing. Measured on
+/// RK3588 with `accumulator_size_e_probe`, `Dense` pattern, one shape per
+/// process, **every point 0 mismatches**:
+///
+/// * **k=1**, 14x14 Cout 64: `Cin` 512, 576, 640, 704, 768, 896, 1024, 1152,
+///   1280, 1344, 1408, 1536, 1792, **2048** -- exact throughout, single- and
+///   multi-tile.
+/// * **k=3**, 28x28 Cout 64/448: `Cin` up to **1152**, including the 1/11
+///   splits at 1088 and 1152. `ConvPlan` refuses `Cin >= 1216` at k=3 outright
+///   (the coefficient working set exceeds the eleven grantable banks), so that
+///   range is loud rather than silent.
+/// * MobileNetV2's own widest dense 1x1 convolutions, at their real extents:
+///   14x14 `Cin` 528->88/136 and 816->136; 7x7 816->224, 1344->224, 1344->448,
+///   and 448->**1792**.
+///
+/// 1344 rather than 2048 because 1344 is what MobileNetV2 needs and what the
+/// vendor corpus reaches; the k=1 points above it are measured but not
+/// corpus-backed. This bounds the *channel padding* rules only -- whether a
+/// given `(Cin, Cout, kernel)` fits the twelve CBUF banks stays `ConvPlan`'s
+/// separate question, and at k=3 it is the binding one well before this.
+pub const MAX_INT8_INPUT_CHANNELS: u32 = 1344;
+
+/// Largest output-channel count the int8 sweep measures.
+///
+/// Split from [`MAX_OUTPUT_CHANNELS`] (2026-09-03) rather than raising the
+/// shared constant, mirroring [`MAX_INT8_INPUT_CHANNELS`] against
+/// [`MAX_INPUT_CHANNELS`]: the hardware evidence below is int8 only, and fp16
+/// has none above 768.
+///
+/// Measured exact at 7x7 `Cin` 448 with `Cout` 768, 1024, 1280, 1536, 1792 and
+/// **2048** -- the CBUF split does not move across that range (7d/5w
+/// throughout), which is consistent with `MAX_OUTPUT_CHANNELS`' own note that
+/// the high-channel divergence is indexed by `Cin`, not `Cout`. Set at 1792,
+/// MobileNetV2's widest, rather than the 2048 that was also measured.
+pub const MAX_INT8_OUTPUT_CHANNELS: u32 = 1792;
 
 /// Widest input pixel the vendor keeps in dense NHWC, in bytes.
 ///
@@ -302,9 +338,14 @@ const CBUF_BANK_BYTES: u32 = 256 * 128;
 /// This exists so the CBUF-split scoring harness
 /// (`tests/cbuf_split_score.rs`) and the high-channel hardware probes can
 /// reach past the cap; without it `Shape` refuses to build and the most
-/// interesting part of the vendor corpus is invisible. `parity_padded_shape`
-/// still refuses the shapes known wrong on hardware, and nothing on the
-/// compiled path sets this.
+/// interesting part of the vendor corpus is invisible. Nothing on the compiled
+/// path sets this.
+///
+/// It lifts **both** channel ceilings. It used to lift only the input one,
+/// which made a whole class of shape unreachable for characterization:
+/// MobileNetV2's widest dense 1x1 is `Cin` 448 -> `Cout` 1792, and no probe
+/// could construct it to find out whether the `Cout` ceiling was a real limit
+/// or just the extent of the measurement. It was the latter.
 fn unbacked_channels_allowed() -> bool {
     std::env::var_os("ROCKET_ALLOW_UNBACKED_CHANNELS").is_some()
 }
@@ -523,6 +564,16 @@ impl Precision {
         match self {
             Precision::Fp16 => MAX_INPUT_CHANNELS,
             Precision::Int8(_) | Precision::Int8Accumulator(_) => MAX_INT8_INPUT_CHANNELS,
+        }
+    }
+
+    /// Largest output-channel count this precision has capture or hardware
+    /// backing for. The int8 side reaches further; see
+    /// [`MAX_INT8_OUTPUT_CHANNELS`].
+    pub fn max_out_channels(&self) -> u32 {
+        match self {
+            Precision::Fp16 => MAX_OUTPUT_CHANNELS,
+            Precision::Int8(_) | Precision::Int8Accumulator(_) => MAX_INT8_OUTPUT_CHANNELS,
         }
     }
 
@@ -875,9 +926,11 @@ impl Shape {
             precision.max_in_channels()
         );
         assert!(
-            (1..=MAX_OUTPUT_CHANNELS).contains(&out_channels),
-            "output channels must be 1..={MAX_OUTPUT_CHANNELS}, the range the \
-             capture corpus covers and the 14-bit weight_kernels field encodes"
+            (1..=precision.max_out_channels()).contains(&out_channels)
+                || unbacked_channels_allowed(),
+            "output channels must be 1..={}; beyond that the capture corpus \
+             does not reach and the measurement has not been made",
+            precision.max_out_channels()
         );
         if let Precision::Int8Accumulator(quantization) = precision {
             assert!(
@@ -1460,6 +1513,32 @@ impl Shape {
         self.output_channel_block_bytes()
     }
 
+    /// Contraction depth one output channel accumulates over, which is what
+    /// the streamed coefficient working set scales with.
+    ///
+    /// `Cin` for a dense convolution: every output channel's filter spans all
+    /// input channels, so a streamed group of output channels reserves one
+    /// 64-byte coefficient group per `(kernel tap, Cin)` -- the model in
+    /// [`streamed_weight_bank_preference_for_group`].
+    ///
+    /// **One for depthwise**, and that is the whole of the difference. A
+    /// depthwise output channel accumulates over exactly one input channel, so
+    /// its filter is `kh * kw` values rather than `kh * kw * Cin`, and the
+    /// whole weight tensor is `C * kh * kw` bytes -- at most a bank, which is
+    /// what `rockchip-npu-notes/encodings/cbuf-bank-slack.md` means by "its
+    /// weight is one per-channel `KH*KW*G`-byte cube (<= 1 bank)". Feeding the
+    /// dense product here instead made the working set scale with `C` and
+    /// refused wide depthwise outright: at C=1344, k=3 it asked for 13 of the
+    /// eleven grantable banks, which is what kept MobileNetV2's 528/816/1344
+    /// depthwise stages on the CPU.
+    fn streamed_contraction_channels(&self) -> u32 {
+        if self.depthwise {
+            1
+        } else {
+            self.weight_channels()
+        }
+    }
+
     /// CBUF banks the feature data would take if nothing competed for them.
     ///
     /// Derived from 134 captured programs across 11 distinct `(width,
@@ -1535,7 +1614,8 @@ impl Shape {
         // and the "leaves three data banks" threshold does not survive a
         // second kernel size. The k=3 fit would have mis-planned k=5 `Cin` 192
         // as 6/6 against the vendor's 2/10.
-        let streamed_preference = streamed_weight_bank_preference(self.weight_channels(), kernels);
+        let streamed_preference =
+            streamed_weight_bank_preference(self.streamed_contraction_channels(), kernels);
         assert!(
             streamed_preference <= CBUF_BANKS - 1,
             "coefficient working set wants {streamed_preference} CBUF banks for \

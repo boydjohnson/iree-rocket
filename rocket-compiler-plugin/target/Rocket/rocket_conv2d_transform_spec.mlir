@@ -2993,31 +2993,41 @@ module attributes {transform.with_named_sequence} {
   // i8 operands with an i32 accumulator, its zero point already folded into
   // a separate CPU-side correction.
   //
-  // The channel bounds below are no longer the fp16 matchers' umax = 512.
-  // That inherited bound was wrong for int8, and the failure was the
-  // predicted one: a silent, near-all-zero result. Measured on RK3588
-  // (2026-08-31) through the real compiled path, at 34x34 (3x3) / 32x32
-  // (1x1), Cout = 64, sweeping Cin:
+  // The dense int8 Cin bounds were 352 (1x1) and 32 (3x3), containment for a
+  // silent near-all-zero result first measured on 2026-08-31. **That cause is
+  // found and fixed (2026-09-03), and both bounds are now the HAL's own
+  // `MAX_INT8_INPUT_CHANNELS` of 512.**
   //
-  //   dense 1x1  : exact to Cin 352; first failure at Cin 353.
-  //   dense 3x3  : exact to Cin  32; wrong from Cin  33 up.
+  // The cause was never ConvPlan's int8 modelling, which is why every
+  // candidate ruled out at the time -- coefficient stream order, the CBUF
+  // bank split across all eleven splits, `feature_grains` swept 1..40,
+  // `data_entries`, the packed feature width -- came back clean. It was the
+  // DPU *output writer*: the dense int8 accumulator drove `mc_surf_out = 1`,
+  // the "2/4 surface serial" writer, which stops emitting once it runs out of
+  // surfaces, and the host read it back as 32-channel 128-byte blocks to
+  // match. Both are now the geometry `rocket-userspace`'s validated
+  // int8 -> int32 program uses: `mc_surf_out = 0`, `size_e = 7`,
+  // `surf_add = dataout_w * dataout_h * 8` per tile, read back as the C2=4
+  // cube (16-byte atoms of four int32 lanes). See `Shape::bs_ow_size_e` and
+  // `Shape::output_channel_block_bytes` in `iree-rocket-hal`.
   //
-  // The 1x1 boundary was refined with the raw exact-i32 oracle: every native
-  // 16-channel point through 352 passed, 368 and 384 failed, and an adjacent
-  // probe confirmed 351/352 pass while 353/354/367 fail. At this geometry,
-  // 353 is also where ConvPlan changes from one output tile to two. The 352
-  // cap is conservative containment; the underlying multi-tile accumulator
-  // bug remains open and can affect other geometries.
+  // The old 352 boundary is explained exactly by that: "353 is also where
+  // ConvPlan changes from one output tile to two" -- one tile fits inside the
+  // surfaces the serial writer manages, two do not.
   //
-  // So `match_dynamic_conv2d_int8` caps Cin at 352 and
-  // `match_dynamic_conv2d_3x3_int8` at 32. Anything above falls back to the
-  // CPU, which is slower but correct. Raising either needs a fix in
-  // ConvPlan's int8 modelling, not a bound change -- the cause is still
-  // open. Ruled out so far, each on hardware: the coefficient stream order
-  // (the shipped order is the only one of four candidates that produces
-  // correct values), the CBUF bank split (all eleven splits behave
-  // identically), `feature_grains` (swept 1..40), `data_entries` (matches
-  // the vendor capture for this exact shape), and the packed feature width.
+  // Hardware after the fix, shipped path, `Dense` (non-degenerate) pattern,
+  // 0 mismatches at every point: 1x1 at Cin 385, 512 (and 704 with the HAL
+  // ceiling lifted), Cout 64 and 256, odd extents, one to three tiles; 3x3 at
+  // Cin 33 and 256 (2304 coefficient bytes per output channel); and a 3x3
+  // output extent with a 3x3 kernel, which used to be refused outright.
+  // There is no coefficient-per-channel ceiling left to contain.
+  //
+  // 512 is the ceiling because `MAX_INT8_INPUT_CHANNELS` is 512 -- above it
+  // the *channel padding* rules are unmeasured, and separately ConvPlan's
+  // CBUF split is known to diverge from vendor captures for dense shapes
+  // above Cin 384. Both are questions about planning, not about this writer.
+  // Raising past 512 needs that split's sawtooth reset rule; see
+  // `MAX_INPUT_CHANNELS`' doc comment in `conv.rs`.
   //
   // The Cout bound remains 512. It is now hardware-validated in isolation by
   // tools/e2e_conv_regression.py's exact compiled differentials: both 1x1 and
@@ -3055,15 +3065,16 @@ module attributes {transform.with_named_sequence} {
 
     %input_value = transform.get_operand %root[0] : (!transform.any_op) -> !transform.any_value
     %filter_value = transform.get_operand %root[1] : (!transform.any_op) -> !transform.any_value
-    // Cin 353 is the first failing value in the fixed-geometry dense signed
-    // boundary probe. See this section's doc comment.
-    transform.iree.match.dim_bounds %input_value[3], umin = 1, umax = 352 : !transform.any_value
-    // Cout 768, not 512: the expanded vendor corpus reproduces ConvPlan's
-    // CBUF split for every Cout up to 768 at every Cin this matcher admits
-    // (conv_vendor_fixture_channels_768.rs), and Cout 528/640/768 are
-    // hardware-exact at Cin 88/136/224/352. Cin stays at 352 -- the dense
-    // Cin >= 576 range is where ConvPlan still diverges from the vendor.
-    transform.iree.match.dim_bounds %filter_value[3], umin = 1, umax = 768 : !transform.any_value
+    // The HAL's `MAX_INT8_INPUT_CHANNELS`, raised 512 -> 1344 on hardware
+    // evidence. k=1 is measured exact to Cin 2048; 1344 is MobileNetV2's
+    // widest and the extent the vendor corpus reaches.
+    transform.iree.match.dim_bounds %input_value[3], umin = 1, umax = 1344 : !transform.any_value
+    // The HAL's `MAX_INT8_OUTPUT_CHANNELS`, split out from the shared
+    // `MAX_OUTPUT_CHANNELS` at 1792. Measured exact at 7x7 Cin 448 for Cout
+    // 768, 1024, 1280, 1536, 1792 and 2048, with the CBUF split flat (7d/5w)
+    // across the whole range -- the high-channel divergence is indexed by
+    // `Cin`, not `Cout`. fp16 keeps 768; the evidence here is int8 only.
+    transform.iree.match.dim_bounds %filter_value[3], umin = 1, umax = 1792 : !transform.any_value
     transform.yield %root : !transform.any_op
   }
 
@@ -3084,10 +3095,15 @@ module attributes {transform.with_named_sequence} {
 
     %input_value = transform.get_operand %root[0] : (!transform.any_op) -> !transform.any_value
     %filter_value = transform.get_operand %root[1] : (!transform.any_op) -> !transform.any_value
-    // Cin 33 and above returns near-all-zero output on hardware -- the 3x3
-    // int8 dense path is correct only within a single CBUF atom pair.
-    // See this section's doc comment.
-    transform.iree.match.dim_bounds %input_value[3], umin = 1, umax = 32 : !transform.any_value
+    // 1152, not `MAX_INT8_INPUT_CHANNELS` (1344): at a 3x3 kernel the binding
+    // limit is the coefficient working set, not the channel-padding rules.
+    // `ConvPlan` plans and agrees with the vendor to Cin 1152 and **refuses**
+    // Cin >= 1216 outright (the working set exceeds the eleven grantable CBUF
+    // banks), so admitting past 1152 would reach the driver and panic rather
+    // than fall back. 1152 is hardware-exact at Cout 64 and 448, including the
+    // 1/11 splits at 1088 and 1152. The Cout bound stays 512: the corpus
+    // backing above it was established against the 1x1 matcher, not this one.
+    transform.iree.match.dim_bounds %input_value[3], umin = 1, umax = 1152 : !transform.any_value
     transform.iree.match.dim_bounds %filter_value[3], umin = 1, umax = 512 : !transform.any_value
     transform.yield %root : !transform.any_op
   }
@@ -3109,7 +3125,13 @@ module attributes {transform.with_named_sequence} {
 
     // Only one channel count to bound: depthwise Cout is always Cin.
     %input_value = transform.get_operand %root[0] : (!transform.any_op) -> !transform.any_value
-    transform.iree.match.dim_bounds %input_value[3], umin = 1, umax = 512 : !transform.any_value
+    // Raised 512 -> 1344 (2026-09-03) with the depthwise coefficient model
+    // fix: the streamed working set was using the *dense* product
+    // `kh*kw*Cin*64`, which scales with C and asked for 13 of eleven
+    // grantable CBUF banks at C=1344. A depthwise output channel
+    // accumulates over one input channel, so the contraction depth is 1.
+    // See `Shape::streamed_contraction_channels`.
+    transform.iree.match.dim_bounds %input_value[3], umin = 1, umax = 1344 : !transform.any_value
     transform.yield %root : !transform.any_op
   }
 
@@ -3130,7 +3152,13 @@ module attributes {transform.with_named_sequence} {
 
     // Only one channel count to bound: depthwise Cout is always Cin.
     %input_value = transform.get_operand %root[0] : (!transform.any_op) -> !transform.any_value
-    transform.iree.match.dim_bounds %input_value[3], umin = 1, umax = 512 : !transform.any_value
+    // Raised 512 -> 1344 (2026-09-03) with the depthwise coefficient model
+    // fix: the streamed working set was using the *dense* product
+    // `kh*kw*Cin*64`, which scales with C and asked for 13 of eleven
+    // grantable CBUF banks at C=1344. A depthwise output channel
+    // accumulates over one input channel, so the contraction depth is 1.
+    // See `Shape::streamed_contraction_channels`.
+    transform.iree.match.dim_bounds %input_value[3], umin = 1, umax = 1344 : !transform.any_value
     transform.yield %root : !transform.any_op
   }
 
@@ -3151,7 +3179,13 @@ module attributes {transform.with_named_sequence} {
 
     // Only one channel count to bound: depthwise Cout is always Cin.
     %input_value = transform.get_operand %root[0] : (!transform.any_op) -> !transform.any_value
-    transform.iree.match.dim_bounds %input_value[3], umin = 1, umax = 512 : !transform.any_value
+    // Raised 512 -> 1344 (2026-09-03) with the depthwise coefficient model
+    // fix: the streamed working set was using the *dense* product
+    // `kh*kw*Cin*64`, which scales with C and asked for 13 of eleven
+    // grantable CBUF banks at C=1344. A depthwise output channel
+    // accumulates over one input channel, so the contraction depth is 1.
+    // See `Shape::streamed_contraction_channels`.
+    transform.iree.match.dim_bounds %input_value[3], umin = 1, umax = 1344 : !transform.any_value
     transform.yield %root : !transform.any_op
   }
 
@@ -3172,7 +3206,13 @@ module attributes {transform.with_named_sequence} {
 
     // Only one channel count to bound: depthwise Cout is always Cin.
     %input_value = transform.get_operand %root[0] : (!transform.any_op) -> !transform.any_value
-    transform.iree.match.dim_bounds %input_value[3], umin = 1, umax = 512 : !transform.any_value
+    // Raised 512 -> 1344 (2026-09-03) with the depthwise coefficient model
+    // fix: the streamed working set was using the *dense* product
+    // `kh*kw*Cin*64`, which scales with C and asked for 13 of eleven
+    // grantable CBUF banks at C=1344. A depthwise output channel
+    // accumulates over one input channel, so the contraction depth is 1.
+    // See `Shape::streamed_contraction_channels`.
+    transform.iree.match.dim_bounds %input_value[3], umin = 1, umax = 1344 : !transform.any_value
     transform.yield %root : !transform.any_op
   }
 
