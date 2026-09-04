@@ -708,7 +708,7 @@ the memories that made load-bearing claims.
 
 ---
 
-## C8 (S2) — the int8 offload path hangs the NPU after ~2 consecutive inferences, and every int8 timing ever recorded absorbed those hangs
+## C8 (S2) — an int8 dispatch makes a following fp16 dispatch hang once that fp16 job's output exceeds ~256 KiB; every int8 timing ever recorded absorbed those hangs
 
 Found 2026-09-04 while re-running the offload A/Bs, and found only because C3's
 guard now exists to refuse the result.
@@ -922,6 +922,111 @@ int8 model (the stem), so "the *first* fp16 job after int8 hangs" and "*this
 shape* hangs after int8" are not separated by any experiment run here. A model
 with several fp16 convs among int8 ones would separate them, and is the cheapest
 next probe.
+
+
+### Separated, 2026-09-04: it is shape, not position, and the shape variable is the fp16 job's output size
+
+The probe the limit above asked for is `tools/c8_precision_transition_probe.py`:
+one module, several distinct fp16 dense victims, the int8 convolutions placed
+*first inside the same function* so the transition happens between two
+dispatches of one command buffer. Every convolution in it is verified to reach
+a Rocket matcher before anything runs, each case runs in its own process after
+a quiet gap, and a known-good fp16 canary runs after any failure.
+
+**The repro is now single-shot.** `iree-run-module --function=int8_then_stem`
+hangs at 522 ms on the fp16 dispatch immediately after three int8 ones. No
+benchmark loop, no second inference, no model. C8 needed repeated invocation
+only because MobileNetV2 runs its one fp16 conv *first*, so `int8acc -> fp16`
+is not reached until inference 2.
+
+**Position is ruled out.** `int8_then_k3_then_k1` hangs **3/3**, and it hangs on
+the `k1`, not the `k3` -- an fp16 job that survives the transition does not
+consume whatever the int8 run left behind. "The first fp16 job after int8" was
+an artifact of MobileNetV2 having exactly one.
+
+**Shape is confirmed, and the variable is the output.** Same three int8
+aggressors, victim varied:
+
+| fp16 victim | shape (NHWC) | input | output | result |
+|---|---|---|---|---|
+| `argb_s1` | 34x34x3 -> 32x32x16, 3x3 s1 | 7 KiB | 64 KiB | ok |
+| `wide253` | 45x45x16 -> 45x45x32, 1x1 | 23 KiB | 253 KiB | ok 2/2 |
+| `k3` | 34x34x32 -> 32x32x64, 3x3 s1 | 72 KiB | **256 KiB** | ok |
+| `bigin` | 32x32x64 -> 32x32x64, 1x1 | 128 KiB | **256 KiB** | ok 3/3 |
+| `px33` | 33x33x16 -> 33x33x64, 1x1 | 17 KiB | **272 KiB** | **hung 2/2** |
+| `px34` | 34x34x16 -> 34x34x64, 1x1 | 18 KiB | 289 KiB | **hung 2/2** |
+| `out320` | 32x32x16 -> 32x32x80, 1x1 | 32 KiB | 320 KiB | **hung 2/2** |
+| `px36` | 36x36x16 -> 36x36x64, 1x1 | 20 KiB | 324 KiB | **hung 2/2** |
+| `out384` | 32x32x16 -> 32x32x96, 1x1 | 32 KiB | 384 KiB | **hung 2/2** |
+| `out448` | 32x32x16 -> 32x32x112, 1x1 | 32 KiB | 448 KiB | **hung 2/2** |
+| `wide506` | 45x45x16 -> 45x45x64, 1x1 | 23 KiB | 506 KiB | **hung 2/2** |
+| `k1` | 32x32x64 -> 32x32x128, 1x1 | 128 KiB | 512 KiB | **hung** |
+| `k3s2` | 113x113x32 -> 56x56x64, 3x3 s2 | 798 KiB | 784 KiB | **hung** |
+| `bigout` | 32x32x16 -> 32x32x256, 1x1 | 32 KiB | 1 MiB | **hung 3/3** |
+| `stem` | 225x225x3 -> 112x112x32, 3x3 s2 | 297 KiB | 1.5 MiB | **hung** |
+
+Every one of these runs clean with no int8 in front, including `f16_all`, which
+puts all five original victims in one function.
+
+The table separates the candidates outright:
+
+* **Not the input.** `bigin` carries `k1`'s exact 128 KiB input with a 256 KiB
+  output and is clean 3/3; `bigout` carries a 32 KiB input with a 1 MiB output
+  and hangs 3/3. The pair was built to be exactly this 2x2.
+* **Not `Cout`, not the extent, not the kernel, not the stride.** `k3` and
+  `k3s2` share `Cin`, `Cout` and filter and land on opposite sides; `wide253`
+  and `wide506` reach the same two sizes through a wide-and-shallow geometry
+  instead of a narrow-and-deep one and land on the same sides as their
+  byte-equal counterparts; `k1` is 1x1 stride 1 and hangs while `argb_s1` is
+  3x3 and does not.
+* **Not the driver's tiling.** `k1` (hangs) and `k3` (clean) are both a single
+  one-task dispatch; `wide253` (clean) and `wide506` (hang) are both two tasks.
+
+**The boundary is bracketed at 256 KiB < X <= 272 KiB**, from the two
+single-dispatch cases either side of it: 32x32x64xf32 = 262,144 bytes is clean
+and 33x33x64xf32 = 278,784 bytes hangs, 2/2 each. `Cout` is padded to
+16-channel atoms at fp16, so the extent -- not the channel count -- is what
+resolves this finely. 256 KiB is the round number inside that interval, but the
+probe does not prove it to the byte.
+
+**The int8 side is a dose, not a switch.** The threshold above is the one for
+*this* aggressor; a lighter one moves it:
+
+| aggressor | fp16 victim | result |
+|---|---|---|
+| `qs` (8x8x16 -> 4 KiB out) | `k1`, `k3` | ok 2/2 each |
+| `q_bigin` (32x32x256 -> 64 KiB out) | `k1` | ok 2/2 |
+| `q_bigout` (32x32x16 -> 512 KiB out) | `k1` | ok 2/2 |
+| `q1` alone (32x32x64 -> 512 KiB out) | `k1` | ok 3/3 |
+| `q1` alone | `stem` | **hung**, on the 4th of the stem's 6 submissions |
+| `q_bigout` alone | `stem` | **hung 3/3**, also on the 4th submission |
+| all three | `k1` | **hung** |
+| all three | `stem` | **hung**, on the 1st submission |
+
+So one int8 convolution is enough for a large enough fp16 job and not enough
+for a smaller one, and with a single aggressor the stem survives three
+submissions before the fourth hangs. A fixed per-dispatch size threshold cannot
+produce that; the amount of int8 work that ran moves the boundary. Whatever the
+resource is, both sides spend it, and neither an intervening fp16 job nor the
+end of a command buffer gives it back.
+
+**What this rules in.** A quantity that scales with output bytes and is shared
+between the two precisions -- the DPU write-back path or the driver-owned,
+atomic-slot-strided scratch each conv2d dispatch stages its output through --
+rather than anything in the register program, which the two diffs above already
+exonerated. Note that the `ROCKET_LEAK_REGCMD` probe leaked *regcmd* BOs only:
+scratch-buffer reuse was never eliminated, and
+`fp16-depthwise-int8-mix-corrupts` left "the BO handles are disjoint but the DMA
+*addresses* were never checked" as its own last untested hypothesis. Those are
+the same suspicion arrived at from two directions.
+
+**Next.** Log each dispatch's scratch BO `dma_address` and size next to the
+handles `ROCKET_DISPATCH_TIMES` already prints, and check whether the fp16
+job's scratch overlaps the address range the int8 job wrote. That is a driver
+change plus an aarch64 rebuild, and it either finds a real overlap -- which
+would explain the size dependence on both sides and the survival across command
+buffers -- or eliminates the last driver-side candidate and leaves the DPU
+write-back FSM alone.
 
 
 ---
@@ -1701,10 +1806,13 @@ were applied on the board and turned out **not** to bind (see M4), which
 demotes them; M2 is the only platform item with an open case. The re-audit they
 were meant to enable found two larger things, and both are now at the top.
 
-1. **C8** — the int8 offload path cannot complete a benchmark loop, and the
-   first two inferences are always right. That is a state-reset bug, not a
-   shape bug, and it currently blocks every int8 performance question. Likely
-   the same defect as `fp16-depthwise-int8-mix-corrupts`.
+1. **C8** — an int8 dispatch makes a following fp16 dispatch hang once that
+   fp16 job's output passes ~256 KiB, which blocks every int8 performance
+   question. Now reproducible in a single `iree-run-module` run rather than a
+   benchmark loop, and characterized on both sides: see the 2026-09-04
+   separation. The open step is the scratch-buffer address check, the last
+   driver-side candidate and the same one `fp16-depthwise-int8-mix-corrupts`
+   left untested.
 2. **M4** — already established; what remains is to stop using the NCHW
    baseline. Cheap, and it is the precondition for any offload decision being
    meaningful.
