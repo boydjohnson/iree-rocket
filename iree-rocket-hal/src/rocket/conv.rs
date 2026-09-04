@@ -134,54 +134,45 @@ pub const IMAGE_WIDTH: u32 = 32;
 /// Default input channels: the C3 dense NHWC case of the original captures.
 pub const INPUT_CHANNELS: u32 = 3;
 
-/// Largest input channel count with capture backing.
+/// Largest input channel count with capture backing, fp16.
 ///
-/// The large-`Cin` sweep walks both precisions to 512 -- 66 distinct fp16
-/// channel counts and 44 int8 -- and finds the padding and the CBUF atom
-/// charge regular the whole way. Above 512 nothing is measured.
+/// Raised 512 -> 1344 (2026-09-03), on the same evidence and at the same time
+/// as [`MAX_INT8_INPUT_CHANNELS`]. Board, `accumulator_size_e_probe` with
+/// `ROCKET_ACC_PROBE_PRECISION=fp16`, `Dense` pattern, one shape per process,
+/// **0 mismatches at every point**:
+///
+/// * k=1, 14x14 Cout 64: `Cin` 256, 512, 576, 640, 704, 768, 896, 960, 1024,
+///   1152, 1280, 1344, 1536, **1792**, across one to five tiles.
+/// * k=3, 28x28 Cout 64: `Cin` to **1152**, including the 1/11 split at 1152.
+/// * Cout, 7x7 `Cin` 448: 528, 640, 768, 1024, 1344, 1792, **2048**, with the
+///   split flat at 2d/10w throughout.
+///
+/// Vendor agreement above the old ceiling is
+/// `tests/conv_vendor_fixture_wide.rs`, whose corpus is fp16-generated: 83
+/// agree, 2 documented and hardware-validated divergences, one refusal edge.
+///
+/// **The earlier 960 attempt (2026-08-28) failed for a reason that no longer
+/// holds.** It was reverted because `conv_vendor_fixture_channels_768.rs`
+/// caught real ConvPlan/vendor divergence for dense shapes at `Cin`
+/// 576/640/704/768 -- ConvPlan predicted 1/11 against the vendor's 6/6, 5/7,
+/// 4/8, 4/8. The 2026-09-02 group-division fix
+/// ([`MAX_UNDIVIDED_WEIGHT_BANKS`]) reproduces all four exactly; the only
+/// residual in that corpus is `Cin` 704 at small `Cout`, which is
+/// hardware-exact.
 ///
 /// This bounds the *channel* rules only. Whether a given `(Cin, Cout,
 /// kernel)` fits the twelve CBUF banks is a separate question, and one
-/// [`ConvPlan`] answers on its own.
+/// [`ConvPlan`] answers on its own -- at k=3 it is the binding one well
+/// before this, refusing `Cin >= 1216` outright.
 ///
-/// Tried raising this to 960 (2026-08-28, MobileNetV2's Cin=576/960
-/// depthwise stages) and reverted: `tests/conv_vendor_fixture_channels_768.rs`
-/// -- a vendor-vs-`ConvPlan` regression check that was already sitting in
-/// the suite -- caught real divergence for *dense* (non-depthwise) shapes
-/// in exactly that range. `ConvPlan` predicted a 1/11 CBUF split at
-/// Cin=576/640/704/768 where real captures show 6/6, 5/7, 4/8, 4/8.
-///
-/// New corpora built for this (`build_vendor_fixtures.py`, which runs
-/// locally -- `rknn-convert` is on PATH, no board needed) narrow it a lot:
-///
-///   * The split is **geometry-independent above `Cin` 384** -- 28x28 and
-///     14x14 agree on every point there -- so it is a coefficient working-set
-///     rule in that range, not spatial demand.
-///   * At 32-channel granularity the k=3 curve is 6,6,7,7,7,8,8,8 weight
-///     banks over `Cin` 544..768, and `Cout` only matters at `Cout <= 96`.
-///   * `ceil(Cin / 96)` fits all eight of those points, and a two-pass
-///     reading (`streamed / 2 + 1`) fits all 13 from 384 up.
-///
-/// Both were tried and **rejected**: a k=5 sweep over the same range shows a
-/// multi-pass sawtooth resetting twice (10,8,7,7,8,10 then 7,7,8,9,10,11 then
-/// 6,6,7,7,8,8,9,9,10,10,10,11), where the vendor uses 1/11 and 2/10 freely.
-/// So a one-data-bank split is not inherently wrong, the "leaves three data
-/// banks" threshold does not survive a second kernel size, and the k=3 fit
-/// mis-plans k=5 `Cin` 192 as 6/6 against the vendor's 2/10
-/// (`large_kernel_high_channel_split_matches_vendor` guards that).
-///
-/// What a real fix needs is the sawtooth's reset rule -- how many passes the
-/// vendor uses and what each one costs -- fitted across kernel sizes, not a
-/// curve through one. The corpora to do it with are in the spike repo.
-///
-/// This constant is shared between dense and depthwise Shape construction,
-/// so there's no way to raise it for depthwise (which a separate hardware
-/// probe did validate at 576/960) without also permitting dense
-/// construction into that range. See
-/// `iree-rocket-hal/tests/conv_mobilenetv2_depthwise_wide_hw.rs`'s doc
-/// comment for the depthwise-side validation and what raising this again
-/// would need (a depthwise-specific ceiling, not this shared one).
-pub const MAX_INPUT_CHANNELS: u32 = 512;
+/// Shared between dense and depthwise `Shape` construction. That sharing is
+/// what made the 960 attempt unsafe; it is not a problem here, because the
+/// depthwise half now has its own corpus
+/// (`conv_vendor_fixtures_depthwise.json`, 63/63 agreement to C=1344) and
+/// because fp16 depthwise cannot reach a compiled dispatch at all -- the
+/// demote pass deliberately excludes it (see
+/// `RocketDemoteConvInputsPass.cpp`, reverted 2026-09-01).
+pub const MAX_INPUT_CHANNELS: u32 = 1344;
 
 /// `CNA_DATA_SIZE1.datain_channel_real` counts `Cin - 1` modulo this, even
 /// though the field is 14 bits wide and could hold far more.
@@ -192,7 +183,43 @@ pub const MAX_INPUT_CHANNELS: u32 = 512;
 const CHANNEL_REAL_MODULUS: u32 = 64;
 
 /// Largest input-channel count the int8 sweep measures.
-pub const MAX_INT8_INPUT_CHANNELS: u32 = 512;
+///
+/// Raised 512 -> 1344 (2026-09-03) on hardware evidence, after the DPU output
+/// writer fix removed the failure the old 512 was containing. Measured on
+/// RK3588 with `accumulator_size_e_probe`, `Dense` pattern, one shape per
+/// process, **every point 0 mismatches**:
+///
+/// * **k=1**, 14x14 Cout 64: `Cin` 512, 576, 640, 704, 768, 896, 1024, 1152,
+///   1280, 1344, 1408, 1536, 1792, **2048** -- exact throughout, single- and
+///   multi-tile.
+/// * **k=3**, 28x28 Cout 64/448: `Cin` up to **1152**, including the 1/11
+///   splits at 1088 and 1152. `ConvPlan` refuses `Cin >= 1216` at k=3 outright
+///   (the coefficient working set exceeds the eleven grantable banks), so that
+///   range is loud rather than silent.
+/// * MobileNetV2's own widest dense 1x1 convolutions, at their real extents:
+///   14x14 `Cin` 528->88/136 and 816->136; 7x7 816->224, 1344->224, 1344->448,
+///   and 448->**1792**.
+///
+/// 1344 rather than 2048 because 1344 is what MobileNetV2 needs and what the
+/// vendor corpus reaches; the k=1 points above it are measured but not
+/// corpus-backed. This bounds the *channel padding* rules only -- whether a
+/// given `(Cin, Cout, kernel)` fits the twelve CBUF banks stays `ConvPlan`'s
+/// separate question, and at k=3 it is the binding one well before this.
+pub const MAX_INT8_INPUT_CHANNELS: u32 = 1344;
+
+/// Largest output-channel count the int8 sweep measures.
+///
+/// Split from [`MAX_OUTPUT_CHANNELS`] (2026-09-03) rather than raising the
+/// shared constant, mirroring [`MAX_INT8_INPUT_CHANNELS`] against
+/// [`MAX_INPUT_CHANNELS`]: the hardware evidence below is int8 only, and fp16
+/// has none above 768.
+///
+/// Measured exact at 7x7 `Cin` 448 with `Cout` 768, 1024, 1280, 1536, 1792 and
+/// **2048** -- the CBUF split does not move across that range (7d/5w
+/// throughout), which is consistent with `MAX_OUTPUT_CHANNELS`' own note that
+/// the high-channel divergence is indexed by `Cin`, not `Cout`. Set at 1792,
+/// MobileNetV2's widest, rather than the 2048 that was also measured.
+pub const MAX_INT8_OUTPUT_CHANNELS: u32 = 1792;
 
 /// Widest input pixel the vendor keeps in dense NHWC, in bytes.
 ///
@@ -237,36 +264,22 @@ fn quad_atoms(atoms: u32) -> u32 {
 /// Output channels of the captured reference convolution.
 pub const OUTPUT_CHANNELS: u32 = 8;
 
-/// Largest output-channel count this builder will program.
+/// Largest output-channel count this builder will program, fp16.
 ///
 /// `CNA_WEIGHT_SIZE2.weight_kernels` is 14 bits, so 16383 is the encodable
 /// ceiling. This is set at the *measured* extent instead, on the same
-/// principle as `MAX_INPUT_CHANNELS`.
+/// principle as [`MAX_INPUT_CHANNELS`].
 ///
-/// Raised 512 -> 768 (2026-09-01). Both halves of the expanded corpus
-/// reproduce `ConvPlan`'s CBUF split for every `Cout` up to 768 at every
-/// `Cin` at or below 512 -- 96 of 96 cases in
-/// `tests/conv_vendor_fixture_channels_768.rs`, with zero bank, tile or
-/// output-channel-group differences -- and dense int8 1x1 is hardware-exact
-/// at `Cout` 528/640/768 for `Cin` 88/136/224/352.
+/// Raised 512 -> 768 (2026-09-01) on the expanded vendor corpus, then
+/// 768 -> 1792 (2026-09-03) on hardware: 7x7 `Cin` 448 is exact at `Cout`
+/// 528, 640, 768, 1024, 1344, 1792 and 2048, with the CBUF split flat at
+/// 2d/10w across the whole range. The high-channel divergence this constant's
+/// previous note worried about is indexed by `Cin`, not `Cout`, and that note
+/// is superseded: it described the pre-2026-09-02 split model.
 ///
-/// This is deliberately *not* symmetric with `MAX_INPUT_CHANNELS`, which
-/// stays at 512: the divergence that reverted the earlier 960 attempt is
-/// indexed by `Cin`, not `Cout`. Every `Cin >= 576` case in the corpus still
-/// disagrees (`ConvPlan` predicts 1/11 against the vendor's 6/6, 5/7, 4/8,
-/// 4/8), because `streamed_weight_bank_preference` exceeds the eleven
-/// grantable banks there and clamps, which makes
-/// `demand_based_cbuf_partition`'s "return the unused banks to data"
-/// correction test `weight_banks > streamed_preference` as `11 > 11` and
-/// never fire. The vendor's own split is periodic in `Cin` rather than
-/// monotonic, so it is bounding a resident coefficient working set that this
-/// formula grows without limit. Fixing that is what `Cin > 512` needs.
-///
-/// Depthwise is unaffected by this raise: it constructs with
-/// `out_channels == in_channels`, so `MAX_INPUT_CHANNELS` still binds it at
-/// 512. That is what makes raising this shared constant safe here, where the
-/// 960 attempt was not.
-pub const MAX_OUTPUT_CHANNELS: u32 = 768;
+/// Depthwise constructs with `out_channels == in_channels`, so
+/// [`MAX_INPUT_CHANNELS`] binds it rather than this.
+pub const MAX_OUTPUT_CHANNELS: u32 = 1792;
 
 /// `DPU_BS_MUL_CFG.bs_mul_shift_value`, and its negated twin
 /// `DPU_DATA_FORMAT.bs_mul_shift_value_neg`, in every quantized capture.
@@ -302,9 +315,14 @@ const CBUF_BANK_BYTES: u32 = 256 * 128;
 /// This exists so the CBUF-split scoring harness
 /// (`tests/cbuf_split_score.rs`) and the high-channel hardware probes can
 /// reach past the cap; without it `Shape` refuses to build and the most
-/// interesting part of the vendor corpus is invisible. `parity_padded_shape`
-/// still refuses the shapes known wrong on hardware, and nothing on the
-/// compiled path sets this.
+/// interesting part of the vendor corpus is invisible. Nothing on the compiled
+/// path sets this.
+///
+/// It lifts **both** channel ceilings. It used to lift only the input one,
+/// which made a whole class of shape unreachable for characterization:
+/// MobileNetV2's widest dense 1x1 is `Cin` 448 -> `Cout` 1792, and no probe
+/// could construct it to find out whether the `Cout` ceiling was a real limit
+/// or just the extent of the measurement. It was the latter.
 fn unbacked_channels_allowed() -> bool {
     std::env::var_os("ROCKET_ALLOW_UNBACKED_CHANNELS").is_some()
 }
@@ -523,6 +541,16 @@ impl Precision {
         match self {
             Precision::Fp16 => MAX_INPUT_CHANNELS,
             Precision::Int8(_) | Precision::Int8Accumulator(_) => MAX_INT8_INPUT_CHANNELS,
+        }
+    }
+
+    /// Largest output-channel count this precision has capture or hardware
+    /// backing for. The int8 side reaches further; see
+    /// [`MAX_INT8_OUTPUT_CHANNELS`].
+    pub fn max_out_channels(&self) -> u32 {
+        match self {
+            Precision::Fp16 => MAX_OUTPUT_CHANNELS,
+            Precision::Int8(_) | Precision::Int8Accumulator(_) => MAX_INT8_OUTPUT_CHANNELS,
         }
     }
 
@@ -875,9 +903,11 @@ impl Shape {
             precision.max_in_channels()
         );
         assert!(
-            (1..=MAX_OUTPUT_CHANNELS).contains(&out_channels),
-            "output channels must be 1..={MAX_OUTPUT_CHANNELS}, the range the \
-             capture corpus covers and the 14-bit weight_kernels field encodes"
+            (1..=precision.max_out_channels()).contains(&out_channels)
+                || unbacked_channels_allowed(),
+            "output channels must be 1..={}; beyond that the capture corpus \
+             does not reach and the measurement has not been made",
+            precision.max_out_channels()
         );
         if let Precision::Int8Accumulator(quantization) = precision {
             assert!(
@@ -972,9 +1002,40 @@ impl Shape {
         if self.depthwise { 3 } else { 0 }
     }
 
-    /// `DPU_BS_OW_CFG.SIZE_E_0/1/2`, 3 for depthwise against 1 for dense.
+    /// `DPU_BS_OW_CFG.SIZE_E_0/1/2`: 3 for depthwise, **7 for dense
+    /// accumulator output**, 1 for everything else.
+    ///
+    /// The 7 is the integer-output stride quirk
+    /// (`rockchip-npu-notes/encodings/size-e-quirk.md`,
+    /// `rocket-userspace`'s `gen_matmul_int8`): an integer conv output strides
+    /// as if each element were 8 bytes, regardless of its actual width. It
+    /// looks wrong against the float rule (`size_e = bytes - 1`, so 3 for a
+    /// 4-byte int32) and it is not; do not "fix" it to 3.
+    ///
+    /// It is only meaningful together with `mc_surf_out = 0` and
+    /// `surf_add = dataout_w * dataout_h * 8` -- the three are one geometry,
+    /// and moving any one alone reads as inert. See
+    /// [`DENSE_ACCUMULATOR_SURF_MULT`] and [`bs_ow_size_e_override`].
+    ///
+    /// **On the requantized path this value is load-bearing in a sharper
+    /// way**: it is one of the few registers where a wrong value *hangs the
+    /// NPU* rather than returning wrong data. Measured at 32x32 Cin=384
+    /// Cout=64 k1 [HW sweep, planck 2026-09-03, `accumulator_size_e_probe`]:
+    /// requantized int8 (which leaves `OD_BYPASS` clear) is bit-exact at
+    /// `size_e = 1` in ~30 ms, and at 3 or 7 writes 1024 of 65536 bytes and
+    /// takes ~525 ms per tile -- the watchdog killing the job, with `PREP_BO`
+    /// still returning success.
     fn bs_ow_size_e(&self) -> u32 {
-        if self.depthwise { 3 } else { 1 }
+        if let Some(size_e) = bs_ow_size_e_override(self.in_channels) {
+            return size_e;
+        }
+        if self.depthwise {
+            3
+        } else if self.precision.writes_accumulators() {
+            7
+        } else {
+            1
+        }
     }
 
     fn kernel_programming(&self, kernels: Kernels) -> KernelProgramming {
@@ -1094,102 +1155,28 @@ impl Shape {
             .div_ceil(self.output_atom_bytes())
     }
 
-    /// Output-channel count this convolution must be *programmed* with for
-    /// its accumulator output to come back correct.
-    ///
-    /// The RK3588 DPU only commits accumulator output in whole 256-byte
-    /// units, so a tile is correct exactly when
-    /// `tile_pixels * output_blocks_per_pixel` is even; an odd product
-    /// leaves a trailing 128-byte block unwritten and corrupts the tile's
-    /// addressing. `tile_pixels` is `out_rows * out_cols` **per tile**, and
-    /// the planner chooses `out_rows` from CBUF capacity, so the row count
-    /// cannot be relied on: measured on RK3588, a 33x8 shape passes when it
-    /// tiles `[2,2,2,2]` and fails when the same shape tiles `[7,1]`.
-    ///
-    /// Two factors are stable enough to key on. An even `out_cols` makes
-    /// every tile even whatever the row split, and an even block count does
-    /// the same. So padding is needed only when **both** the output width
-    /// and the block count are odd, and rounding the programmed channel
-    /// count up to a multiple of 64 makes the block count even.
-    ///
-    /// The padding channels must carry zero coefficients, which
-    /// [`crate::rocket::tensor_layout::pack_hwcf_to_rocket_weights_padded`]
-    /// produces; their output is then discarded. `Int8Accumulator` bypasses
-    /// BS, so no bias or per-channel multiplier reaches them.
-    ///
-    /// Only dense accumulator output is covered. Depthwise writes 256-byte
-    /// atoms and was never measured against this rule, and requantized
-    /// output does not use the accumulator write path at all.
-    pub fn parity_padded_out_channels(&self, kernels: Kernels) -> u32 {
-        if !self.precision.writes_accumulators() || self.depthwise {
-            return self.out_channels;
-        }
-        if self.output_width(kernels) % 2 == 0 || self.output_blocks_per_pixel() % 2 == 0 {
-            return self.out_channels;
-        }
-        self.out_channels
-            .next_multiple_of(2 * self.out_channel_granule())
-    }
-
-    /// Whether [`Shape::parity_padded_out_channels`] widens this shape.
-    pub fn needs_output_parity_padding(&self, kernels: Kernels) -> bool {
-        self.parity_padded_out_channels(kernels) != self.out_channels
-    }
-
     /// Returns the physical shape that should be handed to the planner.
     ///
-    /// `self` remains the logical ABI shape. Dense accumulator convolutions
-    /// may need a wider programmed `Cout` to satisfy the DPU's even committed
-    /// block rule; all other fields are preserved. The driver packs zero
-    /// coefficients for the surplus channels and discards those channels
-    /// while compacting the result back to the logical output buffer.
+    /// `self` remains the logical ABI shape; this is where a physical/logical
+    /// divergence would live. **There is currently none** -- it is the
+    /// identity -- and it is kept as the hook because the driver, the
+    /// executable format and the oracle harness are all already routed
+    /// through it.
     ///
-    /// A 3x3 accumulator output extent with a 3x3 kernel is refused. Its
-    /// parity-padded form failed repeatably on RK3588 even with ordinary,
-    /// nonzero surplus coefficients, so zero padding cannot make that
-    /// physical configuration safe.
-    ///
-    /// Dense 1x1 accumulator convolution is also limited to 384 input
-    /// channels. The complete 16-channel-atom sweep passes through 384 and
-    /// then leaves accumulator output unwritten at every point from 400
-    /// through 512; focused runs locate the transition at 385.
-    pub fn parity_padded_shape(&self, kernels: Kernels) -> Result<Shape, &'static str> {
-        self.validate_accumulator_output_shape(kernels)?;
-
-        Ok(Shape {
-            out_channels: self.parity_padded_out_channels(kernels),
-            ..*self
-        })
-    }
-
-    /// Rejects accumulator-output shapes with known hardware failures.
-    ///
-    /// This is separate from [`Shape::parity_padded_shape`] because callers
-    /// may construct a [`ConvPlan`] directly. Every planning entry point must
-    /// apply the same safety boundary before it emits a register program.
-    fn validate_accumulator_output_shape(&self, kernels: Kernels) -> Result<(), &'static str> {
-        if self.precision.writes_accumulators()
-            && !self.depthwise
-            && kernels == [3, 3]
-            && self.output_width(kernels) == 3
-            && self.output_height(kernels) == 3
-        {
-            return Err(
-                "dense int8 accumulator convolution with 3x3 output and a 3x3 kernel is not supported",
-            );
-        }
-        if self.precision.writes_accumulators()
-            && !self.depthwise
-            && self.accumulator_coefficient_bytes_per_channel(kernels)
-                > MAX_ACCUMULATOR_COEFFICIENT_BYTES_PER_CHANNEL
-            && !known_bad_shapes_allowed()
-        {
-            return Err(
-                "dense int8 accumulator convolution exceeds the coefficient working set the \
-                 output path can hold: at most 384 coefficient bytes per output channel",
-            );
-        }
-        Ok(())
+    /// It used to widen `Cout` to satisfy an "even committed block count"
+    /// rule, and to refuse two families of shape outright: a 3x3 accumulator
+    /// output extent with a 3x3 kernel, and anything past 384 coefficient
+    /// bytes per output channel. All three were consequences of the dense
+    /// accumulator driving the DPU's *serial* writer (`mc_surf_out = 1`),
+    /// which stops emitting once it runs out of surfaces. With the writer
+    /// corrected to `mc_surf_out = 0` / `size_e = 7` /
+    /// `surf_add = dataout * 8`, and the readback to the C2=4 cube that writer
+    /// produces, none of the three has anything left to describe: coefficient
+    /// footprints of 1024 bytes/channel at 1x1 and 2304 at 3x3 are bit-exact,
+    /// single- and multi-tile [HW sweep, planck 2026-09-03; see
+    /// `Shape::output_channel_block_bytes`].
+    pub fn parity_padded_shape(&self, _kernels: Kernels) -> Result<Shape, &'static str> {
+        Ok(*self)
     }
 
     /// Conservative physical output allocation for this convolution, in
@@ -1294,14 +1281,6 @@ impl Shape {
     /// out.
     fn cbuf_atoms(&self) -> u32 {
         quad_atoms(self.feature_atoms())
-    }
-
-    /// Coefficient bytes one output channel carries, the quantity the
-    /// accumulator output path bounds. See
-    /// [`MAX_ACCUMULATOR_COEFFICIENT_BYTES_PER_CHANNEL`].
-    fn accumulator_coefficient_bytes_per_channel(&self, kernels: Kernels) -> u32 {
-        let taps = kernels[0] as u32 * kernels[1] as u32;
-        self.weight_channels() * taps * self.precision.element_bytes()
     }
 
     /// Whether the feature map is dense NHWC or NC1HWC2 surfaces.
@@ -1445,15 +1424,37 @@ impl Shape {
     /// Byte stride of one output row.
     ///
     /// Output geometry, not input: at stride greater than one the two differ.
-    /// Requantized output uses one 16-byte NC1HWC2 atom per pixel; bypassed
-    /// i32 output retains CORE's 32-channel accumulator block (128 bytes).
+    /// Every output cube here is 16-byte NC1HWC2 atoms except depthwise
+    /// accumulator output; see [`Shape::output_channel_block_bytes`].
     pub fn output_row_stride(&self, kernels: Kernels) -> u32 {
         self.output_width(kernels) * self.output_channel_block_bytes()
     }
 
     /// Bytes occupied by one pixel in one hardware output-channel block.
+    ///
+    /// **16 bytes for dense accumulator output, i.e. an ordinary NC1HWC2
+    /// atom holding C2 = 4 int32 lanes** -- the same cube
+    /// `rockchip-npu-notes/encodings/tile-layouts.md` documents for an int32
+    /// output (`C2 = 16 bytes / out-element bytes`), and the cube
+    /// `rocket-userspace`'s `gen_matmul_int8` writes.
+    ///
+    /// This was 128 (CORE's 32-channel accumulator block) for as long as the
+    /// dense accumulator drove the DPU's *serial* writer, `mc_surf_out = 1`.
+    /// That writer is the one that truncates past ~384 coefficient bytes per
+    /// output channel, and the 128-byte block was the readback model that made
+    /// its output decodable. Both are gone together: the writer is now
+    /// `mc_surf_out = 0` / `size_e = 7` / `surf_add = dataout * 8`, and this is
+    /// the cube it produces [HW sweep, planck 2026-09-03,
+    /// `accumulator_size_e_probe` with `ROCKET_ACC_LAYOUT_SCAN=1`, which scores
+    /// C2=4 surface-major at 100.0% of lanes and every other candidate at
+    /// 32-38%].
+    ///
+    /// Depthwise accumulator output keeps the serial writer and its 128-byte
+    /// programmed block (256-byte write atom, see
+    /// [`Shape::output_atom_bytes`]): the change above is measured on dense
+    /// shapes only.
     pub fn output_channel_block_bytes(&self) -> u32 {
-        if self.precision.writes_accumulators() {
+        if self.precision.writes_accumulators() && self.depthwise {
             self.precision.out_channel_granule() * self.precision.output_element_bytes()
         } else {
             FEATURE_ATOM_BYTES
@@ -1487,6 +1488,32 @@ impl Shape {
                 * self.precision.output_element_bytes();
         }
         self.output_channel_block_bytes()
+    }
+
+    /// Contraction depth one output channel accumulates over, which is what
+    /// the streamed coefficient working set scales with.
+    ///
+    /// `Cin` for a dense convolution: every output channel's filter spans all
+    /// input channels, so a streamed group of output channels reserves one
+    /// 64-byte coefficient group per `(kernel tap, Cin)` -- the model in
+    /// [`streamed_weight_bank_preference_for_group`].
+    ///
+    /// **One for depthwise**, and that is the whole of the difference. A
+    /// depthwise output channel accumulates over exactly one input channel, so
+    /// its filter is `kh * kw` values rather than `kh * kw * Cin`, and the
+    /// whole weight tensor is `C * kh * kw` bytes -- at most a bank, which is
+    /// what `rockchip-npu-notes/encodings/cbuf-bank-slack.md` means by "its
+    /// weight is one per-channel `KH*KW*G`-byte cube (<= 1 bank)". Feeding the
+    /// dense product here instead made the working set scale with `C` and
+    /// refused wide depthwise outright: at C=1344, k=3 it asked for 13 of the
+    /// eleven grantable banks, which is what kept MobileNetV2's 528/816/1344
+    /// depthwise stages on the CPU.
+    fn streamed_contraction_channels(&self) -> u32 {
+        if self.depthwise {
+            1
+        } else {
+            self.weight_channels()
+        }
     }
 
     /// CBUF banks the feature data would take if nothing competed for them.
@@ -1564,7 +1591,8 @@ impl Shape {
         // and the "leaves three data banks" threshold does not survive a
         // second kernel size. The k=3 fit would have mis-planned k=5 `Cin` 192
         // as 6/6 against the vendor's 2/10.
-        let streamed_preference = streamed_weight_bank_preference(self.weight_channels(), kernels);
+        let streamed_preference =
+            streamed_weight_bank_preference(self.streamed_contraction_channels(), kernels);
         assert!(
             streamed_preference <= CBUF_BANKS - 1,
             "coefficient working set wants {streamed_preference} CBUF banks for \
@@ -2327,7 +2355,8 @@ impl ConvPlan {
         (data_banks, weight_banks): (u32, u32),
     ) -> ConvPlan {
         shape
-            .validate_accumulator_output_shape(kernels)
+            .parity_padded_shape(kernels)
+            .map(|_| ())
             .expect("unsupported accumulator output geometry");
         let full_width = vec![shape.output_width(kernels)];
         if let Some(tiles) = plan_grid(shape, kernels, &full_width, data_banks) {
@@ -3192,32 +3221,6 @@ fn grains_override() -> Option<GrainsOverride> {
     None
 }
 
-/// Most coefficient bytes per output channel a dense int8 **accumulator**
-/// convolution may carry.
-///
-/// Measured on hardware 2026-09-02 at a controlled 32x32 / Cout 64, each case
-/// guarded by a health check either side (a wedged NPU returns all-fail and
-/// looks exactly like data). The device is exact at or below this and wrong
-/// above it, with the edge landing on adjacent values:
-///
-/// | kernel | last exact                | first wrong               |
-/// |--------|---------------------------|---------------------------|
-/// | 1x1    | `Cin` 384 -> 384 bytes    | `Cin` 385 -> 385 bytes    |
-/// | 1x3    | `Cin` 128 -> 384 bytes    | `Cin` 129 (pads 144) 432  |
-/// | 3x3    | `Cin` 32  -> 288 bytes    | `Cin` 33 (pads 48) -> 432 |
-///
-/// The 1x3 row is what makes this a *per-channel coefficient* limit rather
-/// than a channel count that happens to sit near 384: a plain `Cin` limit
-/// predicts `Cin` 129 exact, and it is not. Cout is independent -- at 3x3
-/// `Cin` 48 every Cout from 8 to 64 fails, including Cout 8 -- so the total
-/// coefficient footprint is not what binds.
-///
-/// 384 bytes is six whole 64-byte coefficient groups, which is the shape of
-/// the underlying limit; the root cause in the accumulator output path is not
-/// yet found. Plain int8 has no such limit and is exact at every `Cin`
-/// measured, so this guards the output mode, not the convolution.
-const MAX_ACCUMULATOR_COEFFICIENT_BYTES_PER_CHANNEL: u32 = 384;
-
 /// Characterization override for the accumulator `DPU_SURFACE_ADD.surf_add`.
 ///
 /// Exceeding the per-channel coefficient limit raises a DMA **read** error and
@@ -3242,12 +3245,103 @@ fn accumulator_surf_add_override(in_channels: u32) -> Option<u32> {
         .and_then(|value| value.parse().ok())
 }
 
-/// Whether shapes the HAL knows are miscomputed on this hardware may still be
-/// planned. Only a characterization probe should set this: the guards exist
-/// because the device returns wrong data, and the point of lifting them is to
-/// study that. Nothing on the compiled path sets it.
-fn known_bad_shapes_allowed() -> bool {
-    std::env::var_os("ROCKET_ALLOW_KNOWN_BAD_SHAPES").is_some()
+/// Characterization override for `DPU_BS_OW_CFG.SIZE_E_0/1/2`
+/// (`ROCKET_ACC_SIZE_E`, gated by `ROCKET_ACC_SIZE_E_MIN_CIN`).
+///
+/// Kept, like [`accumulator_surf_add_override`], because it carries a settled
+/// negative result rather than an open question. Nothing on the compiled path
+/// sets it. The `_MIN_CIN` gate exists so the harness's low-`Cin` accumulator
+/// canary stays on the shipped program; without it a sweep aborts as "device
+/// sick" instead of measuring anything.
+///
+/// **What it settled** [HW sweep, planck 2026-09-03]. `size_e` is a BS/OW-stage
+/// field and the int32-accumulator path bypasses that stage, so the override is
+/// inert there: 0, 1, 3 and 7 all produce a byte-identical, bit-exact result at
+/// 32x32 Cin=384, and all four produce the identical 6144+512-byte truncation at
+/// Cin=385. It is emphatically *not* inert on the requantized int8 path, which
+/// leaves `OD_BYPASS` clear -- 3 and 7 there write 1024 of 65536 bytes and hang
+/// the job. See [`Shape::bs_ow_size_e`] for the table.
+///
+/// So `rockchip-npu-notes/encodings/size-e-quirk.md`'s "integer outputs stride
+/// as `size_e = 7` regardless of byte width" is a fact about a path that keeps
+/// the OW stage engaged, and does not carry to this one. The accumulator
+/// truncation in [`MAX_ACCUMULATOR_COEFFICIENT_BYTES_PER_CHANNEL`] is still
+/// unexplained, and this is one more register eliminated: with `size_e` inert
+/// and `surf_add` swept, the output-side register archaeology is exhausted.
+fn bs_ow_size_e_override(in_channels: u32) -> Option<u32> {
+    let min_channels: u32 = std::env::var("ROCKET_ACC_SIZE_E_MIN_CIN")
+        .ok()
+        .and_then(|value| value.parse().ok())
+        .unwrap_or(0);
+    if in_channels < min_channels {
+        return None;
+    }
+    std::env::var("ROCKET_ACC_SIZE_E")
+        .ok()
+        .and_then(|value| value.parse().ok())
+}
+
+/// Characterization override selecting rocket-userspace's `surf_add` *rule*
+/// rather than a constant (`ROCKET_ACC_SURF_MULT`, gated by
+/// `ROCKET_ACC_SIZE_E_MIN_CIN`).
+///
+/// `gen_matmul_int8` sets `surf_add = dst_surf_stride * 8` with
+/// `dst_surf_stride = dataout_height * dataout_width` **of the task**. On a
+/// height-tiled plan every tile has a different `out_rows`, so no single
+/// `ROCKET_ACC_SURF_ADD` constant can reproduce it -- which is why the constant
+/// sweep recorded in `accumulator-per-channel-coefficient-limit` could not have
+/// found this even in principle. This applies the rule per tile.
+fn accumulator_surf_mult_override(in_channels: u32) -> Option<u32> {
+    let min_channels: u32 = std::env::var("ROCKET_ACC_SIZE_E_MIN_CIN")
+        .ok()
+        .and_then(|value| value.parse().ok())
+        .unwrap_or(0);
+    if in_channels < min_channels {
+        return None;
+    }
+    std::env::var("ROCKET_ACC_SURF_MULT")
+        .ok()
+        .and_then(|value| value.parse().ok())
+}
+
+/// Surface multiplier for dense int32-accumulator output: `surf_add =
+/// dataout_width * dataout_height * 8`, per task.
+///
+/// The 8 is the integer-output stride quirk, the same one behind
+/// [`Shape::bs_ow_size_e`]'s 7: the writer strides as if each output element
+/// were 8 bytes even though an int32 is 4. HW-validated here at 32x32 Cin 384
+/// [planck 2026-09-03] -- mult 8 writes 100% of the buffer bit-exactly, and
+/// 4 / 2 / 1 write 75% / 62.5% / 56.2%, leaving the rest at the poison
+/// sentinel, exactly as `rocket-userspace`'s `gen_matmul_int8` header warns
+/// ("halves the surface stride, leaving every output column past the first few
+/// surfaces as the `0xAA` sentinel").
+const DENSE_ACCUMULATOR_SURF_MULT: u32 = 8;
+
+/// Characterization override for `DPU_DATA_FORMAT.mc_surf_out`
+/// (`ROCKET_ACC_MC_SURF_OUT`, gated by `ROCKET_ACC_SIZE_E_MIN_CIN`).
+///
+/// The third knob of the accumulator output writer, and the one that makes the
+/// other two readable. `rocket-userspace/include/npu_dpu.h` documents the field
+/// as `0 = 16B/pixel one surface, 1 = 2/4 surf serial`, and its HW-validated
+/// int8 -> int32 matmul (`gen_matmul_int8`) leaves it **0** while using
+/// `size_e = 7` and `surf_add = dst_surf_stride * 8`. This crate's accumulator
+/// mode instead sets it to **1** with `size_e = 1` and `surf_add = 16`, which is
+/// a different writer, not a variant of the same one.
+///
+/// That is why sweeping `surf_add` alone and `size_e` alone both read as "no
+/// effect / no value helps": in the serial writer there is no surface stride for
+/// either field to describe. The three move together or not at all.
+fn accumulator_mc_surf_out_override(in_channels: u32) -> Option<u32> {
+    let min_channels: u32 = std::env::var("ROCKET_ACC_SIZE_E_MIN_CIN")
+        .ok()
+        .and_then(|value| value.parse().ok())
+        .unwrap_or(0);
+    if in_channels < min_channels {
+        return None;
+    }
+    std::env::var("ROCKET_ACC_MC_SURF_OUT")
+        .ok()
+        .and_then(|value| value.parse().ok())
 }
 
 /// Builds a tile program with an explicit `feature_grains`, for probing which
@@ -3768,7 +3862,16 @@ fn conv_2d_tile_program(
             .in_precision(precision.into())
             .out_precision(output_precision)
             .proc_precision(precision.into())
-            .mc_surf_out(Bits::new(u32::from(accumulator_output)))
+            // 0 selects the "16 B/pixel, one surface" writer, 1 the "2/4
+            // surface serial" one. Dense accumulator output uses 0, matching
+            // `rocket-userspace`'s validated int8 -> int32 program; only
+            // depthwise accumulator output is still on the serial writer,
+            // which is the configuration its 256-byte write atom was measured
+            // under. Every non-accumulator path has always used 0.
+            .mc_surf_out(Bits::new(
+                accumulator_mc_surf_out_override(shape.in_channels)
+                    .unwrap_or(u32::from(accumulator_output && shape.depthwise)),
+            ))
             .bs_mul_shift_value_neg(Bits::new(bs_mul_shift))
             .build(),
     );
@@ -3940,13 +4043,27 @@ fn conv_2d_tile_program(
         // against the dense 512.
         Register::<DpuSurfaceAdd>::new()
             .surf_add(Bits::new(if accumulator_output {
-                // Accumulator output serializes its 32-lane blocks with the
-                // fixed hardware value 16 in both dense and depthwise mode.
-                // `ROCKET_ACC_SURF_ADD` overrides it for characterization:
-                // this value is one of only four DPU registers that differ
-                // from the (exact) plain-int8 program, and the accumulator
-                // mode has no vendor capture to validate it against.
-                accumulator_surf_add_override(shape.in_channels).unwrap_or(16)
+                let mult = accumulator_surf_mult_override(shape.in_channels)
+                    .unwrap_or(DENSE_ACCUMULATOR_SURF_MULT);
+                if shape.depthwise {
+                    // Depthwise accumulator output stays on the serial writer,
+                    // which serializes its 32-lane blocks with the fixed
+                    // hardware value 16. `ROCKET_ACC_SURF_ADD` overrides it.
+                    accumulator_surf_add_override(shape.in_channels).unwrap_or(16)
+                } else {
+                    // `rocket-userspace`'s rule: `dst_surf_stride * 8`, where
+                    // `dst_surf_stride` is the *task's* `dataout_height *
+                    // dataout_width`, not the whole image's. Per-task is
+                    // load-bearing and is why a constant `ROCKET_ACC_SURF_ADD`
+                    // could never express this on a tiled plan -- every tile
+                    // has its own `out_rows`. Legal here because
+                    // `programs_with_staged_accumulator_output` gives each tile
+                    // its own contiguous scratch range, so a tile really is a
+                    // standalone image; the non-accumulator branch below uses
+                    // whole-image dims precisely because its tiles share one.
+                    accumulator_surf_add_override(shape.in_channels)
+                        .unwrap_or(out_width * rows.out_rows * mult)
+                }
             } else {
                 full_out_width * out_height * 2 * if shape.depthwise { 2 } else { 1 }
             }))
@@ -5514,20 +5631,30 @@ mod tests {
         assert_eq!(huge.weight_banks([3, 3]), 8);
     }
 
-    /// Pins `parity_padded_out_channels` to what was measured on RK3588.
+    /// The output-parity rule and both accumulator refusals are gone, and
+    /// this pins *why* rather than merely asserting the absence.
     ///
-    /// The expectations are the hardware results, not a restatement of the
-    /// implementation: shapes in the left column were run on the board and
-    /// either passed or failed, and the padding is required exactly where
-    /// they failed. See `int8_accumulator_output_parity_cases` and
-    /// `int8_accumulator_multitile_parity_cases` in
-    /// `tests/conv2d_oracle_hw.rs`.
+    /// The rule was: a dense accumulator tile is correct only when
+    /// `tile_pixels * blocks_per_pixel` is even, because the DPU commits
+    /// output in whole 256-byte units. That was a property of the **serial**
+    /// writer (`mc_surf_out = 1`) the dense accumulator used to drive, whose
+    /// blocks are 128 bytes -- so an odd block count left a trailing half-unit
+    /// unwritten.
+    ///
+    /// The writer is now `mc_surf_out = 0` / `size_e = 7` /
+    /// `surf_add = dataout * 8`, whose cube is 16-byte atoms of C2 = 4 int32
+    /// lanes. `blocks_per_pixel` is then `padded_out_channels / 4`, and
+    /// `padded_out_channels` is always a multiple of the 32-channel granule,
+    /// so the block count is always a multiple of 8 -- **even by
+    /// construction, at every shape**. The rule cannot fire, which is the
+    /// arithmetic reason the padding is unreachable rather than merely
+    /// untriggered by the cases tried.
     #[test]
-    fn parity_padding_matches_the_measured_output_parity_rule() {
-        let accumulator = |width: u32, height: u32, cout: u32| {
-            Shape::with_precision(
-                width,
-                height,
+    fn accumulator_block_count_is_even_by_construction_so_parity_cannot_bind() {
+        for cout in [1u32, 8, 31, 32, 33, 64, 96, 136, 256, 353, 768] {
+            let shape = Shape::with_precision(
+                9,
+                7,
                 1,
                 8,
                 cout,
@@ -5537,92 +5664,31 @@ mod tests {
                     weight_zero_point: 0,
                     ..quantization()
                 }),
-            )
-        };
-
-        // (width, height, Cout, expected programmed Cout)
-        for (width, height, cout, expected) in [
-            // Odd width and an odd block count: the failing combination, and
-            // the only one that pads. Cout 32 is one block, 96 is three.
-            (3u32, 3u32, 32u32, 64u32),
-            (9, 7, 32, 64),
-            (5, 5, 96, 128),
-            (33, 8, 32, 64),
-            // Even block count already: 64 is two blocks, 128 is four.
-            (3, 3, 64, 64),
-            (9, 7, 128, 128),
-            // Even width makes every row split even, whatever Cout does.
-            (4, 4, 32, 32),
-            (8, 8, 160, 160),
-            (34, 8, 32, 32),
-        ] {
-            let shape = accumulator(width, height, cout);
+            );
+            let blocks = shape.output_blocks_per_pixel();
             assert_eq!(
-                shape.parity_padded_out_channels([1, 1]),
-                expected,
-                "{width}x{height} Cout={cout}: blocks={}, width parity {}",
-                shape.output_blocks_per_pixel(),
-                width % 2,
+                blocks,
+                shape.padded_out_channels() / 4,
+                "Cout={cout}: the accumulator cube is C2=4"
+            );
+            assert!(
+                blocks.is_multiple_of(2),
+                "Cout={cout}: blocks={blocks} must be even by construction"
+            );
+            // And the hook is now the identity at every one of them, including
+            // the 3x3-output/3x3-kernel case that used to be refused outright.
+            assert_eq!(
+                shape.parity_padded_shape([1, 1]).unwrap().out_channels,
+                cout
             );
         }
-    }
 
-    /// Requantized and depthwise output do not use the dense accumulator
-    /// write path the parity rule was measured on, so neither is padded.
-    #[test]
-    fn parity_padding_leaves_non_accumulator_output_alone() {
-        let requantized = Shape::with_precision(3, 3, 1, 8, 32, Precision::Int8(quantization()));
-        assert_eq!(requantized.parity_padded_out_channels([1, 1]), 32);
-        assert!(!requantized.needs_output_parity_padding([1, 1]));
-
-        let fp16 = Shape::with_precision(3, 3, 1, 8, 32, Precision::Fp16);
-        assert_eq!(fp16.parity_padded_out_channels([1, 1]), 32);
-    }
-
-    #[test]
-    fn parity_padded_shape_is_physical_only_and_rejects_the_bad_k3_extent() {
-        let accumulator = |width: u32, height: u32| {
-            Shape::with_precision(
-                width,
-                height,
-                1,
-                8,
-                32,
-                Precision::Int8Accumulator(Quantization {
-                    input_zero_point: 0,
-                    output_zero_point: 0,
-                    weight_zero_point: 0,
-                    ..quantization()
-                }),
-            )
-        };
-
-        let logical = accumulator(9, 7);
-        let programmed = logical.parity_padded_shape([1, 1]).unwrap();
-        assert_eq!(logical.out_channels, 32);
-        assert_eq!(programmed.out_channels, 64);
-        assert_eq!(programmed.width, logical.width);
-        assert_eq!(programmed.height, logical.height);
-        assert_eq!(programmed.in_channels, logical.in_channels);
-
-        assert!(accumulator(3, 3).parity_padded_shape([3, 3]).is_err());
-        assert!(accumulator(5, 5).parity_padded_shape([3, 3]).is_ok());
-        assert!(
-            accumulator(5, 5)
-                .with_padding([0, 0])
-                .parity_padded_shape([3, 3])
-                .is_err()
-        );
-
-        let fp16 = Shape::with_precision(3, 3, 1, 8, 32, Precision::Fp16);
-        assert!(fp16.parity_padded_shape([3, 3]).is_ok());
-
-        let cin_384 = Shape::with_precision(
-            32,
-            32,
+        let refused = Shape::with_precision(
+            3,
+            3,
             1,
-            384,
-            64,
+            8,
+            32,
             Precision::Int8Accumulator(Quantization {
                 input_zero_point: 0,
                 output_zero_point: 0,
@@ -5630,14 +5696,9 @@ mod tests {
                 ..quantization()
             }),
         );
-        assert!(cin_384.parity_padded_shape([1, 1]).is_ok());
         assert!(
-            Shape {
-                in_channels: 385,
-                ..cin_384
-            }
-            .parity_padded_shape([1, 1])
-            .is_err()
+            refused.parity_padded_shape([3, 3]).is_ok(),
+            "the 3x3-output/3x3-kernel refusal is gone with the serial writer"
         );
     }
 
@@ -5655,46 +5716,6 @@ mod tests {
     fn saturating_coefficient_working_set_is_refused() {
         let shape = Shape::with_precision(32, 32, 1, 512, 64, Precision::Fp16);
         let _ = ConvPlan::new(shape, [5, 5]);
-    }
-
-    /// The accumulator coefficient limit refuses exactly the shapes the device
-    /// gets wrong, at every kernel measured.
-    ///
-    /// Each pair is adjacent on hardware: the first is exact, the second is
-    /// wrong. The 1x3 row is the one that makes this a per-channel coefficient
-    /// bound rather than a channel count -- `Cin` 129 is far below the 1x1
-    /// edge of 384 channels and still fails.
-    #[test]
-    fn accumulator_coefficient_limit_matches_measured_edges() {
-        let quantization = Quantization {
-            input_zero_point: 0,
-            output_zero_point: 0,
-            weight_zero_point: 0,
-            input_scale: 1.0,
-            weights_scale: 1.0,
-            multiplier: Multiplier { scale: 1, shift: 0 },
-        };
-        for (kernels, exact, wrong) in [
-            ([1usize, 1], 384u32, 385u32),
-            ([1, 3], 128, 129),
-            ([3, 3], 32, 33),
-        ] {
-            let shape = |cin| {
-                Shape::with_precision(32, 32, 1, cin, 64, Precision::Int8Accumulator(quantization))
-            };
-            assert!(
-                shape(exact).parity_padded_shape(kernels).is_ok(),
-                "{kernels:?} Cin {exact} is exact on hardware and must be allowed"
-            );
-            assert!(
-                shape(wrong).parity_padded_shape(kernels).is_err(),
-                "{kernels:?} Cin {wrong} is wrong on hardware and must be refused"
-            );
-            assert!(
-                std::panic::catch_unwind(|| ConvPlan::new(shape(wrong), kernels)).is_err(),
-                "{kernels:?} Cin {wrong} must also be refused by direct ConvPlan construction"
-            );
-        }
     }
 
     /// A 5x5 kernel at `Cin` 192 plans 2/10, the split the vendor uses.
@@ -6139,15 +6160,15 @@ mod tests {
         assert_eq!((data_format >> 29) & 0b111, 4, "DPU output is int32");
         assert_eq!(
             (data_format >> 3) & 1,
-            1,
-            "DPU multi-surface output is enabled"
+            0,
+            "dense accumulator output uses the one-surface writer, not the serial one"
         );
         assert_eq!(
             (value_of::<CnaDataSize3>(&program) >> 22) & 0b11,
             0,
             "CNA surface serial mode must remain disabled"
         );
-        assert_eq!(value_of::<DpuSurfaceAdd>(&program), 16 << 4);
+        assert_eq!(value_of::<DpuSurfaceAdd>(&program), (4 * 4 * 8) << 4);
         assert_eq!(value_of::<DpuBsCfg>(&program) & 1, 1, "BS is bypassed");
         assert_eq!(
             (value_of::<DpuBsOwCfg>(&program) >> 1) & 1,
@@ -6160,7 +6181,7 @@ mod tests {
 
         assert_eq!(shape.precision.element_bytes(), 1);
         assert_eq!(shape.precision.output_element_bytes(), 4);
-        assert_eq!(shape.output_channel_block_bytes(), 32 * 4);
+        assert_eq!(shape.output_channel_block_bytes(), FEATURE_ATOM_BYTES);
         let requantized = Shape::with_precision(4, 4, 1, 1, 8, Precision::Int8(quantization));
         assert_eq!(
             shape.output_scratch_bytes([1, 1]),
@@ -6169,7 +6190,7 @@ mod tests {
     }
 
     #[test]
-    fn int8_accumulator_uses_native_channel_blocks_without_forced_tiling() {
+    fn int8_accumulator_uses_the_c2_4_output_cube_without_forced_tiling() {
         let shape = Shape::with_precision(
             32,
             32,
@@ -6187,8 +6208,12 @@ mod tests {
 
         assert_eq!(plan.output_column_widths(), &[32]);
         assert_eq!(plan.tiles().len(), 1);
-        assert_eq!(shape.output_channel_block_bytes(), 32 * 4);
-        assert_eq!(shape.output_row_stride([1, 1]), 32 * 32 * 4);
+        assert_eq!(
+            shape.output_channel_block_bytes(),
+            FEATURE_ATOM_BYTES,
+            "the dense accumulator cube is 16-byte atoms of C2=4 int32 lanes"
+        );
+        assert_eq!(shape.output_row_stride([1, 1]), 32 * FEATURE_ATOM_BYTES);
     }
 
     #[test]
@@ -6289,7 +6314,7 @@ mod tests {
             OutputPlacement::ContiguousTile,
         );
 
-        assert_eq!(value_of::<DpuDstBaseAddr>(&shared), 4 * 128);
+        assert_eq!(value_of::<DpuDstBaseAddr>(&shared), 4 * 16);
         assert_eq!(value_of::<DpuDstSurfStride>(&shared), 32 * 32 * 16);
         assert_eq!(value_of::<DpuDataCubeNotchAddr>(&shared), 0x14_0014);
         assert_eq!(value_of::<DpuDstBaseAddr>(&contiguous), 0);

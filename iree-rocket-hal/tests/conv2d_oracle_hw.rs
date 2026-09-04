@@ -162,6 +162,16 @@ struct CaseExecution {
     /// they are trying to measure.
     #[cfg(feature = "hardware-characterization")]
     raw: Vec<u8>,
+    /// Bytes the DPU wrote *past* the declared staging length, into the
+    /// `ROCKET_PAD_OUTPUT` slack. Zero when no pad was requested.
+    ///
+    /// A geometry override that widens the output stride can push the write
+    /// past the allocation, which faults and wedges the rk_iommu. Padding
+    /// turns that into a mapped write this can count, which is both the safe
+    /// way to sweep `size_e` and the measurement that says whether a wider
+    /// stride is being honoured at all.
+    #[cfg(feature = "hardware-characterization")]
+    pad_written: usize,
 }
 
 fn assemble_staged_accumulator_output(
@@ -309,11 +319,13 @@ fn execute_case_output_with_plan(
         let input = OwnedBuffer::from_bytes_padded(fd, &fixture.input, "INPUT", file);
         let weights = OwnedBuffer::from_bytes_padded(fd, &fixture.weights, "WEIGHTS", file);
         let bias = OwnedBuffer::from_bytes_padded(fd, &fixture.bias, "BIAS", file);
-        let output = OwnedBuffer::new(fd, output_len, file);
+        let output = OwnedBuffer::new(fd, output_len + OwnedBuffer::pad_bytes("OUTPUT"), file);
         // A zero fill can turn an unwritten output lane into a plausible
         // convolution result. Poison the whole allocation so missing tail
         // pixels/blocks fail loudly and remain distinguishable from a real
-        // all-zero accumulator.
+        // all-zero accumulator. The poison also covers the `ROCKET_PAD_OUTPUT`
+        // slack, so a write past the declared length is countable rather than
+        // a fault.
         ptr::write_bytes(output.buffer.host_ptr, OUTPUT_SENTINEL, output.buffer.size);
 
         let buffers = Buffers {
@@ -385,6 +397,14 @@ fn execute_case_output_with_plan(
             .map_err(|error| format!("completion wait: {error}"))?;
 
         let raw_output = std::slice::from_raw_parts(output.buffer.host_ptr, output_len).to_vec();
+        #[cfg(feature = "hardware-characterization")]
+        let pad_written = std::slice::from_raw_parts(
+            output.buffer.host_ptr.add(output_len),
+            output.buffer.size - output_len,
+        )
+        .iter()
+        .filter(|byte| **byte != OUTPUT_SENTINEL)
+        .count();
         let output = match &accumulator_tiles {
             Some(tiles) => assemble_staged_accumulator_output(shape, kernels, &raw_output, tiles)?,
             None => raw_output.clone(),
@@ -394,6 +414,8 @@ fn execute_case_output_with_plan(
             output,
             #[cfg(feature = "hardware-characterization")]
             raw: raw_output,
+            #[cfg(feature = "hardware-characterization")]
+            pad_written,
         })
     }
 }
@@ -3320,4 +3342,293 @@ fn accumulator_written_region_map() {
             described.join(" ")
         );
     }
+}
+
+/// Sweeps `DPU_BS_OW_CFG.SIZE_E` on one shape per process, and records the
+/// negative result that closed `ISSUES.md` C1.
+///
+/// **`SIZE_E` is a BS/OW-stage field: live when that stage runs, inert when it
+/// is bypassed.** Measured on planck 2026-09-03, 32x32 Cout=64 k1, one case per
+/// process, canary either side, every arm HEALTHY:
+///
+/// ```text
+/// accumulator (OD_BYPASS=1), Cin 384   size_e 0/1/3/7 -> 262144/262144 written, 0 mismatches   (identical)
+/// accumulator (OD_BYPASS=1), Cin 385   size_e 1 and 7 -> 6656/262144 written, 63884 mismatches (identical)
+///     runs @0+6144 @229376+512 both times -- byte for byte, not merely the same totals
+/// requant int8 (OD_BYPASS=0), Cin 384  size_e 1 -> 65536/65536, 0 mismatches, ~30 ms
+///                                      size_e 3 -> 1024/65536, 64512 mismatches, 1050 ms  (job hung)
+///                                      size_e 7 -> 1024/65536, 64512 mismatches, 1102 ms  (job hung)
+/// ```
+///
+/// The hypothesis this was built to test came from
+/// `rockchip-npu-notes/encodings/size-e-quirk.md`, which measured on the same
+/// silicon that an *integer* conv output strides as `size_e = 7` with a surface
+/// multiplier of 8 regardless of byte width, and that a too-small value "leaves
+/// every output column past the first surface as the sentinel" -- which is the
+/// accumulator truncation's exact signature. It is **refuted for this path**:
+/// the accumulator bypasses the OW stage, so nothing reads the field. The
+/// notes' result is real, just about a path that keeps that stage engaged.
+///
+/// Two things worth keeping from it. On the *requantized* path this register is
+/// load-bearing and a wrong value **hangs the NPU** rather than returning wrong
+/// data -- the ~1.05 s arms above are two watchdog kills at ~525 ms per tile,
+/// cleanly separated from the ~30-40 ms healthy dispatches by nothing more than
+/// a wall clock, which is the argument for the dispatch-time guard `ISSUES.md`
+/// C3 asks for. And the accumulator truncation is now one more register down:
+/// with `size_e` inert and `surf_add` already swept, the output side is
+/// exhausted.
+///
+/// The instrument is the raw staging map, not the oracle compare: an override
+/// changes the physical layout, so `assemble_staged_accumulator_output` is
+/// wrong by construction under one and its mismatch count is informational.
+///
+/// Always set `ROCKET_PAD_OUTPUT`. A wider stride can push the write past the
+/// allocation, which faults, stalls the rk_iommu and wedges the board until a
+/// reboot; the pad turns that into a mapped write `pad_written` counts.
+///
+///     ROCKET_ACC_PROBE=32/385/64/1 ROCKET_ACC_SIZE_E=7 \
+///     ROCKET_ACC_SIZE_E_MIN_CIN=384 ROCKET_ACC_PROBE_PRECISION=int8acc \
+///     ROCKET_PAD_OUTPUT=8388608 \
+///     ./conv2d_oracle_hw accumulator_size_e_probe --ignored --nocapture
+#[cfg(feature = "hardware-characterization")]
+#[test]
+#[ignore = "requires the RK3588 NPU"]
+fn accumulator_size_e_probe() {
+    unsafe { std::env::set_var("ROCKET_ALLOW_KNOWN_BAD_SHAPES", "1") };
+    unsafe { std::env::set_var("ROCKET_ALLOW_UNBACKED_CHANNELS", "1") };
+    let _guard = NPU_TEST_LOCK
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    let file = OpenOptions::new()
+        .read(true)
+        .write(true)
+        .open(DEVICE_PATH)
+        .expect("failed to open RK3588 NPU device");
+
+    let spec = std::env::var("ROCKET_ACC_PROBE").unwrap_or_else(|_| "32/385/64/1".to_string());
+    let fields: Vec<u32> = spec
+        .split('/')
+        .map(|field| {
+            field
+                .parse()
+                .expect("ROCKET_ACC_PROBE=extent/cin/cout/kernel")
+        })
+        .collect();
+    assert_eq!(fields.len(), 4, "ROCKET_ACC_PROBE=extent/cin/cout/kernel");
+    let (extent, cin, cout, kernel) = (fields[0], fields[1], fields[2], fields[3] as usize);
+
+    let size_e = std::env::var("ROCKET_ACC_SIZE_E").unwrap_or_else(|_| "default(1)".into());
+    let surf_add = std::env::var("ROCKET_ACC_SURF_ADD").unwrap_or_else(|_| "default(16)".into());
+    let pattern = std::env::var("ROCKET_ACC_PROBE_PATTERN").unwrap_or_else(|_| "dense".into());
+    println!(
+        "\n  shape {extent}^2 Cin={cin} Cout={cout} k={kernel}  size_e={size_e} surf_add={surf_add} pattern={pattern}"
+    );
+
+    // The canary is a Cin=64 shape, so it stays on the shipped program as long
+    // as the caller gates the overrides with the `_MIN_CIN` knobs. Checking it
+    // first separates "this geometry is wrong" from "the board is already
+    // sick", which is the only distinction that matters here.
+    println!(
+        "  canary before: {}",
+        if accumulator_canary_passes(&file) {
+            "HEALTHY"
+        } else {
+            "SICK -- reboot before believing anything below"
+        }
+    );
+
+    let case = Conv2dCase {
+        width: extent,
+        height: extent,
+        cin,
+        cout,
+        kernel: [kernel, kernel],
+        stride: 1,
+        padding: [kernel / 2, kernel / 2],
+        precision: match std::env::var("ROCKET_ACC_PROBE_PRECISION").as_deref() {
+            // The requantized int8 path leaves `OD_BYPASS` clear, so if
+            // `SIZE_E` is a BS/OW-stage field it should be live here and dead
+            // in accumulator mode. That is the mechanism check.
+            Ok("int8") => OraclePrecision::Int8,
+            Ok("fp16") => OraclePrecision::Fp16,
+            _ => OraclePrecision::Int8Accumulator,
+        },
+        // `Counting` sets every input and coefficient to 1, so at a 1x1 kernel
+        // with no padding EVERY output lane is the same constant and any
+        // permutation of the output is invisible -- it can only detect
+        // unwritten lanes. `Dense` varies by y, x and channel and is the
+        // pattern that actually tests addressing. Default to it.
+        pattern: match std::env::var("ROCKET_ACC_PROBE_PATTERN").as_deref() {
+            Ok("counting") => OraclePattern::Counting,
+            Ok("selectors") => OraclePattern::Selectors { phase: 1 },
+            _ => OraclePattern::Dense { phase: 1 },
+        },
+    };
+    let fixture = build_fixture(case).expect("fixture");
+    let started = std::time::Instant::now();
+    let execution = match execute_case_output(&file, &fixture) {
+        Ok(execution) => execution,
+        Err(error) => {
+            println!("  execute failed: {error}");
+            return;
+        }
+    };
+    let elapsed = started.elapsed();
+
+    let raw = &execution.raw;
+    let mut runs: Vec<(usize, usize)> = Vec::new();
+    let mut offset = 0usize;
+    while offset < raw.len() {
+        if raw[offset] != OUTPUT_SENTINEL {
+            let start = offset;
+            while offset < raw.len() && raw[offset] != OUTPUT_SENTINEL {
+                offset += 1;
+            }
+            runs.push((start, offset - start));
+        } else {
+            offset += 1;
+        }
+    }
+    let written: usize = runs.iter().map(|(_, len)| len).sum();
+    let described: Vec<String> = runs
+        .iter()
+        .take(8)
+        .map(|(start, len)| format!("@{start}+{len}"))
+        .collect();
+
+    let report = compare_output(&fixture, &execution.plan, &execution.output);
+    // The plan structure, so a k=1/k=3 comparison can be reasoned about rather
+    // than guessed: the CBUF split and the per-tile output-row counts are what
+    // differ between kernel sizes at the same logical shape.
+    let tile_rows: Vec<String> = execution
+        .plan
+        .tiles()
+        .iter()
+        .map(|tile| format!("{}x{}", tile.rows.out_rows, tile.columns.out_cols))
+        .collect();
+    println!(
+        "  staging={} written={written} ({:.1}%) past_end={} elapsed={:.1}ms",
+        raw.len(),
+        100.0 * written as f64 / raw.len().max(1) as f64,
+        execution.pad_written,
+        elapsed.as_secs_f64() * 1000.0,
+    );
+    println!(
+        "  plan: tiles={} banks={}d/{}w out_tiles=[{}] blocks_per_px={} coef_bytes_per_ch={}",
+        execution.plan.tiles().len(),
+        execution.plan.data_banks(),
+        execution.plan.weight_banks(),
+        tile_rows.join(","),
+        fixture.shape.output_blocks_per_pixel(),
+        fixture.shape.padded_channels() * (kernel * kernel) as u32,
+    );
+    println!("  runs: {}", described.join(" "));
+    // Which lanes are wrong matters more than how many: a whole-pixel pattern
+    // says addressing, a channel-partial one says surface sequencing.
+    for sample in report.samples.iter().take(6) {
+        println!("    {sample}");
+    }
+    println!(
+        "  oracle (layout-dependent, informational): {} mismatches, max|diff|={}",
+        report.mismatches, report.max_abs_difference
+    );
+
+    // Layout scan. The reference writer covers the whole buffer where the
+    // shipped one truncates, but lands the lanes somewhere else, so the open
+    // question is *which* cube it writes -- not which register to move next.
+    // Score candidate address maps against the oracle and name the winner.
+    // Single-tile only: a multi-tile plan partitions the staging per tile and
+    // the offsets below assume one contiguous image.
+    if std::env::var_os("ROCKET_ACC_LAYOUT_SCAN").is_some() {
+        let shape = fixture.shape;
+        let kernels = fixture.case.kernel;
+        let out_h = shape.output_height(kernels) as usize;
+        let out_w = shape.output_width(kernels) as usize;
+        let cpad = shape.padded_out_channels() as usize;
+        let cout = case.cout as usize;
+
+        let read = |offset: usize| -> Option<i32> {
+            raw.get(offset..offset + 4)
+                .map(|bytes| i32::from_le_bytes(bytes.try_into().unwrap()))
+        };
+
+        // Each tile writes its own contiguous scratch range, so a lane's
+        // address is (tile base) + (offset within that tile's own image).
+        // Recover the partition the same way the shipped assembler does.
+        let staged = execution
+            .plan
+            .programs_with_staged_accumulator_output(Buffers {
+                input: 0,
+                weights: 0,
+                bias: 0,
+                output: 0,
+            })
+            .tiles;
+        let locate = |oy: usize, ox: usize| -> Option<(usize, usize, usize, usize, usize)> {
+            staged.iter().find_map(|tile| {
+                let within_rows = oy >= tile.output_row && oy < tile.output_row + tile.output_rows;
+                let within_cols =
+                    ox >= tile.output_column && ox < tile.output_column + tile.output_columns;
+                (within_rows && within_cols).then(|| {
+                    (
+                        tile.scratch_offset,
+                        oy - tile.output_row,
+                        ox - tile.output_column,
+                        tile.output_rows,
+                        tile.output_columns,
+                    )
+                })
+            })
+        };
+
+        // (name, c2, surface-major?) -- surface stride is derived as
+        // pixels * c2 * 4 for the surface-major forms, which is the only
+        // stride that tiles the buffer exactly.
+        let candidates: [(&str, usize, bool); 6] = [
+            ("blocks32-surface-major (shipped model)", 32, true),
+            ("C2=4  surface-major", 4, true),
+            ("C2=8  surface-major", 8, true),
+            ("C2=16 surface-major", 16, true),
+            ("C2=4  pixel-major", 4, false),
+            ("C2=32 pixel-major", 32, false),
+        ];
+        for (name, c2, surface_major) in candidates {
+            let mut matched = 0usize;
+            let mut total = 0usize;
+            for oy in 0..out_h {
+                for ox in 0..out_w {
+                    let Some((base, ty, tx, trows, tcols)) = locate(oy, ox) else {
+                        continue;
+                    };
+                    let tile_pixels = trows * tcols;
+                    for oc in 0..cout {
+                        let offset = base
+                            + if surface_major {
+                                (oc / c2) * tile_pixels * c2 * 4
+                                    + (ty * tcols + tx) * c2 * 4
+                                    + (oc % c2) * 4
+                            } else {
+                                (ty * tcols + tx) * cpad * 4 + oc * 4
+                            };
+                        total += 1;
+                        if read(offset) == Some(expected_output(case, oc, oy, ox)) {
+                            matched += 1;
+                        }
+                    }
+                }
+            }
+            println!(
+                "    layout {name:<38} {matched}/{total} ({:.1}%)",
+                100.0 * matched as f64 / total.max(1) as f64
+            );
+        }
+    }
+    println!(
+        "  canary after:  {}",
+        if accumulator_canary_passes(&file) {
+            "HEALTHY"
+        } else {
+            "SICK -- reboot before the next case"
+        }
+    );
 }

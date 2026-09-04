@@ -893,12 +893,17 @@ mod tests {
         };
         let shape = case.shape();
 
+        // 2x1 output, Cout 33 -> padded 64, so 16 surfaces of C2=4 int32
+        // lanes over 2 pixels: surface stride 2*16 = 32 bytes.
         assert_eq!(expected_output(case, 0, 0, 0), 64);
         assert_eq!(output_offset(shape, case.kernel, 0, 0, 0), 0);
-        assert_eq!(output_offset(shape, case.kernel, 31, 0, 0), 31 * 4);
-        assert_eq!(output_offset(shape, case.kernel, 0, 0, 1), 128);
-        assert_eq!(output_offset(shape, case.kernel, 32, 0, 0), 256);
-        assert_eq!(output_offset(shape, case.kernel, 32, 0, 1), 384);
+        assert_eq!(output_offset(shape, case.kernel, 3, 0, 0), 3 * 4);
+        assert_eq!(output_offset(shape, case.kernel, 0, 0, 1), 16);
+        assert_eq!(output_offset(shape, case.kernel, 4, 0, 0), 32);
+        assert_eq!(output_offset(shape, case.kernel, 31, 0, 0), 7 * 32 + 3 * 4);
+        assert_eq!(output_offset(shape, case.kernel, 32, 0, 0), 8 * 32);
+        assert_eq!(output_offset(shape, case.kernel, 32, 0, 1), 8 * 32 + 16);
+        // Unchanged: the same bytes, differently arranged.
         assert_eq!(output_storage_bytes(shape, case.kernel), 512);
 
         let fixture = build_fixture(case).expect("build accumulator fixture");
@@ -911,6 +916,13 @@ mod tests {
         assert!(matches!(shape.precision, Precision::Int8Accumulator(_)));
     }
 
+    /// The programmed shape is now the logical one: no parity padding.
+    ///
+    /// 9x7 Cout 32 used to be widened to Cout 64, because the serial output
+    /// writer needed `tile_pixels * blocks_per_pixel` even (63 pixels is odd,
+    /// and Cout 32 was one 128-byte block). The corrected writer's C2=4 cube
+    /// makes the block count even by construction, so nothing is padded and
+    /// the surplus-coefficient machinery is unused here.
     #[test]
     fn accumulator_fixture_uses_the_hal_programmed_shape() {
         let case = Conv2dCase {
@@ -926,27 +938,26 @@ mod tests {
         };
         let fixture = build_fixture(case).expect("build HAL accumulator fixture");
         assert_eq!(case.shape().out_channels, 32);
-        assert_eq!(fixture.shape.out_channels, 64);
+        assert_eq!(
+            fixture.shape.out_channels, 32,
+            "the programmed shape is the logical one; parity padding is gone"
+        );
         assert_eq!(
             fixture.weights.len(),
             fixture.shape.weight_bytes(case.kernel) as usize
         );
-        assert!(
-            fixture.weights[fixture.weights.len() / 2..]
-                .iter()
-                .all(|&byte| byte == 0)
-        );
         assert_eq!(fixture.bias.len(), fixture.shape.bs_buffer_bytes());
 
-        let rejected = Conv2dCase {
+        // Formerly rejected outright (3x3 output extent, 3x3 kernel).
+        let formerly_rejected = Conv2dCase {
             width: 3,
             height: 3,
             kernel: [3, 3],
             padding: [1, 1],
             ..case
         };
-        assert!(build_fixture(rejected).is_err());
-        assert!(build_raw_fixture(rejected).is_ok());
+        assert!(build_fixture(formerly_rejected).is_ok());
+        assert!(build_raw_fixture(formerly_rejected).is_ok());
     }
 
     #[test]
