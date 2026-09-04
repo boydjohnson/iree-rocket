@@ -463,8 +463,15 @@ mod tests {
         assert_eq!(validate_conv_shape(&shape, kernels), Ok(()));
     }
 
+    /// The 3x3-output/3x3-kernel accumulator refusal is gone.
+    ///
+    /// It described the serial output writer (`mc_surf_out = 1`), which the
+    /// dense accumulator no longer drives; both spellings of that extent --
+    /// a 3x3 shape with SAME padding, and a 5x5 shape cropped to a 3x3 output
+    /// -- validate now. Kept as a regression so the refusal is not
+    /// reintroduced without new hardware evidence.
     #[test]
-    fn validate_rejects_measured_bad_accumulator_k3_extent() {
+    fn accumulator_k3_extent_refusal_is_gone() {
         let quantization = Quantization {
             input_zero_point: 0,
             output_zero_point: 0,
@@ -473,9 +480,12 @@ mod tests {
             weights_scale: 1.0,
             multiplier: Multiplier::from_ratio(1.0),
         };
-        let bad =
+        // Formerly refused: a 3x3 accumulator output extent with a 3x3
+        // kernel. That refusal described the serial output writer, which the
+        // dense accumulator no longer uses; the shape is accepted now.
+        let formerly_bad =
             conv::Shape::with_precision(3, 3, 1, 8, 32, Precision::Int8Accumulator(quantization));
-        assert!(validate_conv_shape(&bad, [3, 3]).is_err());
+        assert_eq!(validate_conv_shape(&formerly_bad, [3, 3]), Ok(()));
 
         let cropped =
             conv::Shape::with_precision(5, 5, 1, 8, 32, Precision::Int8Accumulator(quantization))
@@ -484,15 +494,19 @@ mod tests {
             (cropped.output_width([3, 3]), cropped.output_height([3, 3])),
             (3, 3)
         );
-        assert!(validate_conv_shape(&cropped, [3, 3]).is_err());
+        assert_eq!(validate_conv_shape(&cropped, [3, 3]), Ok(()));
 
         let control =
             conv::Shape::with_precision(5, 5, 1, 8, 32, Precision::Int8Accumulator(quantization));
         assert_eq!(validate_conv_shape(&control, [3, 3]), Ok(()));
     }
 
+    /// The 384-coefficient-bytes-per-channel accumulator ceiling is gone.
+    ///
+    /// Same cause as the extent refusal above: the serial writer running out
+    /// of surfaces, not a hardware limit. Kept so the cap is not reintroduced.
     #[test]
-    fn validate_rejects_accumulator_k1_above_measured_cin_ceiling() {
+    fn accumulator_k1_cin_ceiling_is_gone() {
         let quantization = Quantization {
             input_zero_point: 0,
             output_zero_point: 0,
@@ -510,15 +524,19 @@ mod tests {
             Precision::Int8Accumulator(quantization),
         );
         assert_eq!(validate_conv_shape(&cin_384, [1, 1]), Ok(()));
-        assert!(
+        // Formerly refused at 385: the 384-coefficient-bytes-per-channel cap
+        // was the serial writer running out of surfaces, not a hardware limit.
+        // 1x1 is bit-exact to at least 1024 bytes/channel on the corrected
+        // writer, so the ceiling is now just `Precision::max_in_channels`.
+        assert_eq!(
             validate_conv_shape(
                 &conv::Shape {
                     in_channels: 385,
                     ..cin_384
                 },
                 [1, 1]
-            )
-            .is_err()
+            ),
+            Ok(())
         );
     }
 

@@ -124,44 +124,83 @@ not.**
    **`Counting` cannot validate addressing on any shape whose output is
    constant** — that is a trap in the oracle harness worth a comment.
 
-### What to change
+### DONE 2026-09-03 (items 1-3; the transform-spec cap raise is deliberately not done)
 
-1. Switch `Int8Accumulator` to the reference writer: `mc_surf_out = 0`,
-   `size_e = 7`, `surf_add = out_cols * out_rows * 8` **per tile**.
-2. Change the readback to C2=4 surface-major: `output_atom_bytes` 128 -> 16,
-   `output_blocks_per_pixel` accordingly, and
-   `assemble_staged_accumulator_output` / `compact_tiled_accumulator_output` in
-   the HAL driver to match. Per-tile scratch ranges are unchanged.
-3. Delete `MAX_ACCUMULATOR_COEFFICIENT_BYTES_PER_CHANNEL` and its guard, the
-   `kernels == [3,3] && 3x3 output` refusal, and re-test
-   `parity_padded_out_channels` — the parity rule was fitted to the serial
-   writer and may well go too. (I did not reproduce a parity failure: my 3² and
-   9² Cout 32 shapes passed under both writers, so use the memory's
-   `ROCKET_PROBE_ONLY` one-hot protocol rather than treating it as gone.)
-4. Then raise the transform spec's int8 caps — `@match_dynamic_conv2d_int8`
-   `Cin <= 352` and `@match_dynamic_conv2d_3x3_int8` `Cin <= 32` — and re-audit
-   MobileNetV2. `int8-dense-conv-caps` calls this the biggest offload lever open,
-   and it is no longer blocked behind the `ConvInteger` requantization-fusion
-   work.
+**1. The writer.** Dense `Int8Accumulator` now programs `mc_surf_out = 0`,
+`size_e = 7`, `surf_add = out_cols * out_rows * DENSE_ACCUMULATOR_SURF_MULT (8)`
+**per tile** — legal because `programs_with_staged_accumulator_output` gives each
+tile its own contiguous scratch range, so a tile really is a standalone image.
+Depthwise accumulator output is untouched and stays on the serial writer with
+its 256-byte write atom: the change is measured on dense shapes only.
 
-### What landed
+**2. The readback.** `Shape::output_channel_block_bytes` returns 16 for dense
+accumulator output instead of 128. Nothing else needed changing — both
+assemblers (`assemble_staged_accumulator_output` and the driver's
+`compact_tiled_accumulator_output`) were already generic over `block_bytes` and
+already implemented surface-major-within-tile, which *is* the C2=4 model at
+16-byte atoms. `output_scratch_bytes`, `output_row_stride` and the driver's
+`source_block_bytes` all derive from it.
 
-- `ROCKET_ACC_MC_SURF_OUT` / `ROCKET_ACC_SIZE_E` / `ROCKET_ACC_SURF_MULT`
-  sentinels (gated by `ROCKET_ACC_SIZE_E_MIN_CIN`), which together express
-  either writer; `ROCKET_ACC_SURF_MULT` applies the per-task rule.
-- `ROCKET_PAD_OUTPUT` + a `pad_written` count in the oracle harness.
-- `accumulator_size_e_probe`: env-driven shape/pattern, one shape per process,
-  canary either side, prints the plan (tiles, CBUF split, per-tile out extents,
-  coefficient bytes/channel), the written-run map, mismatch samples, and elapsed
-  time. `ROCKET_ACC_LAYOUT_SCAN=1` adds the multi-tile-aware layout scorer.
-- Compiled path verified byte-identical with no env set; 159 host unit tests
-  pass; clippy unchanged at 4 warnings.
+**3. The guards.** Deleted `MAX_ACCUMULATOR_COEFFICIENT_BYTES_PER_CHANNEL`, its
+doc block, `accumulator_coefficient_bytes_per_channel`, the 3x3-output/3x3-kernel
+refusal, `validate_accumulator_output_shape`, `parity_padded_out_channels`,
+`needs_output_parity_padding`, and the now-unused `known_bad_shapes_allowed`
+escape hatch. `parity_padded_shape` survives as the identity, kept because the
+driver, the executable format and the oracle harness are all routed through it
+and it is the right place for any future physical/logical divergence.
 
-**Method note.** A wrong `size_e` on the *requantized* int8 path (where
-`OD_BYPASS` is clear) hangs the NPU rather than returning wrong data:
-1050/1102 ms dispatches against 30–41 ms healthy, `PREP_BO` succeeding either
-way. That is C3's argument measured, and it is how I know the shipped `size_e=1`
-is load-bearing there.
+The parity rule was **re-tested, not assumed**: under the C2=4 cube
+`blocks_per_pixel = padded_out_channels / 4` and `padded_out_channels` is always
+a multiple of the 32-channel granule, so the block count is a multiple of 8 —
+even by construction, at every shape. That is pinned by
+`accumulator_block_count_is_even_by_construction_so_parity_cannot_bind`, and
+confirmed on hardware at the shapes the rule was originally fitted to.
+
+**Hardware validation, shipped path, no env overrides, `Dense` pattern.** Every
+shape 100% written, **0 mismatches**:
+
+| shape | tiles | CBUF | coef bytes/ch | note |
+|---|---|---|---|---|
+| 32² Cin 32 / 128 Cout 64 k1 | 1 | 1d/11w, 4d/8w | 32, 128 | always worked |
+| 32² Cin 385 Cout 64 k1 | 2 | 11d/1w | 400 | **was refused** |
+| 32² Cin 512 Cout 64 k1 | 2 | 11d/1w | 512 | **was refused** |
+| 32² Cin 704 Cout 64 k1 | 3 | 10d/2w | 704 | **was refused** |
+| 32² Cin 385 Cout 256 k1 | 2 | 8d/4w | 400 | **was refused** |
+| 33² Cin 128 Cout 64 k1 | 1 | 5d/7w | 128 | odd extent |
+| 32² Cin 33 Cout 64 k3 | 1 | 2d/10w | 432 | **was refused** |
+| 32² Cin 256 Cout 64 k3 | 2 | 7d/5w | 2304 | **was refused** |
+| **3² Cin 64 Cout 32 k3** | 1 | 1d/11w | 576 | **was refused outright** |
+| 9² and 33² Cout 32 k1 | 1 | | 64 | old parity shapes |
+
+Existing accumulator gates on the board, all green: regression matrix 9/9,
+k1 Cin boundary 5/5, Cout padding sweep 42/42, Cout shape interaction 24/24,
+k1 supported Cin atoms 24/24. Non-accumulator gates unaffected: the cartesian
+sweep and `cbuf_residency_boundary` pass, and the fp16/requantized register
+programs are byte-identical (`0x4010`/`0x4050`/`0x40c0` unchanged at both).
+
+Two gates failed on the first back-to-back pass and are **the documented
+per-process flakiness, not this change**: `dense_geometry_regression_matches_oracle`
+(1 of 22 — the 34x34 Cin 8 Cout 16 K3 fp16 case `npu-wedges-after-failed-job`
+already names) went 22/22 twice with a 2 s idle gap, and
+`int8_neutral80_one_hot_four_way_confirmation_matches_oracle` went 4/4, 4/4, 3/4
+isolated. The latter is on the **requantized** path, whose register program this
+change leaves byte-identical. Worth recording that `neutral80` is a fourth
+member of that flaky set.
+
+Host side: 156 lib tests + all workspace tests pass; clippy delta measured by
+stash/pop is **zero**.
+
+### Still to do (item 4, deliberately deferred)
+
+Raise `@match_dynamic_conv2d_int8`'s `Cin <= 352` and
+`@match_dynamic_conv2d_3x3_int8`'s `Cin <= 32` in the transform spec, and
+re-audit MobileNetV2. Nothing in the HAL blocks it now. Re-run the audit under a
+pinned CPU governor (M1) — the offload/no-offload comparison is exactly the kind
+of measurement the 408 MHz floor distorts.
+
+Also open: **depthwise accumulator output is still on the serial writer** and
+therefore may still carry a coefficient ceiling of its own. It was never
+measured against one, and this change deliberately did not touch it.
 
 ## C2 (S2) — the requant oracle rounds half-away-from-zero; the hardware rounds half-to-even, and this repo's multiplier encoding makes ties reachable
 
