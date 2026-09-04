@@ -32,6 +32,45 @@
 //! non-square kernels only up to the demand where the captures still agree
 //! and otherwise requires an explicit split.
 //!
+//! # Datatypes
+//!
+//! The datatype is a **3-bit precision field** set per pipeline stage, not
+//! a separate datapath, so a rung is "the right field value plus the right
+//! layout for the element width". Every layout rule below keys off the
+//! element *width* rather than the numeric interpretation, which is what
+//! makes the table short:
+//!
+//! | rung | field | element | feature atom | coeff. N/K group | result |
+//! |---|---:|---:|---:|---:|---|
+//! | [`Precision::Int4`] | 6 | 4 bit | 32 ch | 64 / 32 | int16 |
+//! | [`Precision::Int8`] | 0 | 1 B | 16 ch | 32 / 32 | int8 (requantized) |
+//! | [`Precision::Int8Accumulator`] | 0 | 1 B | 16 ch | 32 / 32 | int32 |
+//! | [`Precision::Int16`] | 1 | 2 B | 8 ch | 16 / 32 | int16 |
+//! | [`Precision::Fp16`] | 2 | 2 B | 8 ch | 16 / 32 | fp16 |
+//! | [`Precision::Bf16`] | 3 | 2 B | 8 ch | 16 / 32 | bf16 |
+//! | [`Precision::Tf32`] | 7 | 4 B | 4 ch | 16 / **16** | fp32 |
+//!
+//! Three things in that table do not follow from the width and are the
+//! places a new rung goes wrong:
+//!
+//! - **tf32's field is front-of-pipe only.** The DPU's precision enum has
+//!   no tf32 code and writes nothing if given one, so its stages run at
+//!   fp32 instead. Every other rung programs one value everywhere.
+//! - **tf32's coefficient tile.** The tile is a constant 1024 bytes at
+//!   every width; below four bytes the K-group is pinned at 32 and the
+//!   N-group absorbs the width, but at four bytes the N-group stays 16 and
+//!   the K-group halves. A uniform-coefficient test cannot see this at all.
+//! - **int4's write-out.** Its int16 result is written by the integer path,
+//!   which strides as if each element were eight bytes (`size_e = 7`) with
+//!   an 8x surface multiplier, not the float path's natural 1 and 2x. With
+//!   the natural values the DPU writes 512 bytes and stops.
+//!
+//! Each rung is validated against `tests/conv2d_oracle_hw.rs`'s oracle on
+//! an RK3588 board, with the addressing-sensitive `Selectors` and `Dense`
+//! patterns rather than `Counting` alone, and -- for the rungs that have a
+//! narrower neighbour sharing their layout -- with `WideOperands` cases
+//! whose values a narrower datatype could not hold.
+//!
 //! All of that holds in both precisions. A matching int8 sweep of 60
 //! captures reproduces every kernel-geometry formula unchanged, and the
 //! paired fp16/int8 diff moves only the fields precision already moved --
