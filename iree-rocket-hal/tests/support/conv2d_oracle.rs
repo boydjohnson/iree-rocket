@@ -5,7 +5,8 @@ use iree_rocket_hal::rocket::{
     },
     tensor_layout::{
         pack_hwcf_to_rocket_weights, pack_hwcf_to_rocket_weights_affine_i8,
-        pack_hwcf_to_rocket_weights_padded, rocket_weight_storage_size,
+        pack_hwcf_to_rocket_weights_int4_padded, pack_hwcf_to_rocket_weights_padded,
+        pack_nhwc_to_nc1hwc2_int4, rocket_weight_storage_size, rocket_weight_storage_size_bits,
     },
 };
 
@@ -14,6 +15,8 @@ pub const FEATURE_ATOM_BYTES: usize = 16;
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum OraclePrecision {
     Fp16,
+    /// Signed 4-bit integers, two to a byte, accumulating into int16.
+    Int4,
     /// bfloat16, the 2-byte float with fp32 range and an 8-bit mantissa.
     /// Shares every layout with fp16, so the same fixtures drive it.
     Bf16,
@@ -27,6 +30,7 @@ impl OraclePrecision {
     pub fn name(self) -> &'static str {
         match self {
             Self::Fp16 => "fp16",
+            Self::Int4 => "int4",
             Self::Bf16 => "bf16",
             Self::Int16 => "int16",
             Self::Int8 => "int8",
@@ -168,6 +172,7 @@ impl Conv2dCase {
     pub fn shape(self) -> Shape {
         let precision = match self.precision {
             OraclePrecision::Fp16 => Precision::Fp16,
+            OraclePrecision::Int4 => Precision::Int4,
             OraclePrecision::Bf16 => Precision::Bf16,
             OraclePrecision::Int16 => Precision::Int16,
             OraclePrecision::Int8 => {
@@ -770,7 +775,77 @@ fn encode_element(precision: OraclePrecision, value: i32) -> Result<Vec<u8>, Str
                 .map_err(|_| format!("logical value {value} is outside int8"))?;
             Ok(vec![value as u8])
         }
+        // int4 is not byte-addressable, so it never reaches this path: its
+        // fixtures go through the nibble packers instead.
+        OraclePrecision::Int4 => Err("int4 elements are packed as nibbles".to_string()),
     }
+}
+
+/// The int4 fixture, built through the nibble packers.
+///
+/// Kept separate rather than threaded through the byte path: at half a byte
+/// an element has no address of its own, so the per-element
+/// `feature_offset`/`encode_element` route cannot express it. Everything
+/// else -- the logical values, the reference, the comparison -- is shared,
+/// so an int4 case is the same case as its int8 twin apart from the storage.
+fn build_int4_fixture(case: Conv2dCase, shape: Shape) -> Result<Conv2dFixture, String> {
+    let to_int4 = |values: Vec<i32>, what: &str| -> Result<Vec<i8>, String> {
+        values
+            .into_iter()
+            .map(|value| {
+                i8::try_from(value)
+                    .ok()
+                    .filter(|value| (-8..=7).contains(value))
+                    .ok_or_else(|| format!("logical {what} {value} is outside int4"))
+            })
+            .collect()
+    };
+
+    let dense_input = to_int4(logical_input(case), "input")?;
+    let mut input = vec![0; input_storage_bytes(shape)];
+    pack_nhwc_to_nc1hwc2_int4(
+        &dense_input,
+        case.height as usize * case.width as usize,
+        case.cin as usize,
+        &mut input,
+    )
+    .map_err(str::to_string)?;
+
+    let dense_weights = to_int4(logical_weights(case), "weight")?;
+    let packed_len = rocket_weight_storage_size_bits(
+        case.kernel[0],
+        case.kernel[1],
+        case.cin as usize,
+        shape.out_channels as usize,
+        4,
+    )
+    .map_err(str::to_string)?;
+    let mut weights = vec![0; packed_len];
+    pack_hwcf_to_rocket_weights_int4_padded(
+        &dense_weights,
+        case.kernel[0],
+        case.kernel[1],
+        case.cin as usize,
+        case.cout as usize,
+        shape.out_channels as usize,
+        &mut weights,
+    )
+    .map_err(str::to_string)?;
+    if weights.len() != shape.weight_bytes(case.kernel) as usize {
+        return Err(format!(
+            "packed int4 weight size {} does not match Shape::weight_bytes {}",
+            weights.len(),
+            shape.weight_bytes(case.kernel),
+        ));
+    }
+
+    Ok(Conv2dFixture {
+        case,
+        shape,
+        input,
+        weights,
+        bias: vec![0; shape.bs_buffer_bytes()],
+    })
 }
 
 pub fn build_fixture(case: Conv2dCase) -> Result<Conv2dFixture, String> {
@@ -789,6 +864,9 @@ pub fn build_raw_fixture(case: Conv2dCase) -> Result<Conv2dFixture, String> {
 }
 
 fn build_fixture_for_shape(case: Conv2dCase, shape: Shape) -> Result<Conv2dFixture, String> {
+    if case.precision == OraclePrecision::Int4 {
+        return build_int4_fixture(case, shape);
+    }
     let logical_input = logical_input(case);
     let mut input = vec![0; input_storage_bytes(shape)];
     for y in 0..case.height as usize {
@@ -808,7 +886,11 @@ fn build_fixture_for_shape(case: Conv2dCase, shape: Shape) -> Result<Conv2dFixtu
     let element_bytes = element_bytes(shape);
     let mut dense_weight_bytes = Vec::with_capacity(logical_weights.len() * element_bytes);
     match case.precision {
-        OraclePrecision::Fp16 | OraclePrecision::Bf16 | OraclePrecision::Int16 => {
+        // int4 never reaches here -- `build_int4_fixture` returns earlier.
+        OraclePrecision::Fp16
+        | OraclePrecision::Bf16
+        | OraclePrecision::Int16
+        | OraclePrecision::Int4 => {
             for value in logical_weights {
                 dense_weight_bytes.extend_from_slice(&encode_element(case.precision, value)?);
             }
@@ -937,6 +1019,7 @@ fn build_fixture_for_shape(case: Conv2dCase, shape: Shape) -> Result<Conv2dFixtu
         OraclePrecision::Fp16
         | OraclePrecision::Bf16
         | OraclePrecision::Int16
+        | OraclePrecision::Int4
         | OraclePrecision::Int8Accumulator => {
             vec![0; shape.bs_buffer_bytes()]
         }

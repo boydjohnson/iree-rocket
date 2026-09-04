@@ -113,7 +113,7 @@ use crate::rocket::builders::{
         DpuRdmaWeight,
     },
     pc::{PCOperationMask, PCRegisterAmounts, PCTrailer},
-    values::{ArgbInputMode, BurstLength, DataPrecision, DpuOutputMode},
+    values::{ArgbInputMode, BurstLength, DataPrecision, DpuOutputMode, OutputPrecision},
 };
 
 /// `[kernel_height, kernel_width]`.
@@ -220,6 +220,15 @@ pub const MAX_INT8_INPUT_CHANNELS: u32 = 1344;
 /// the high-channel divergence is indexed by `Cin`, not `Cout`. Set at 1792,
 /// MobileNetV2's widest, rather than the 2048 that was also measured.
 pub const MAX_INT8_OUTPUT_CHANNELS: u32 = 1792;
+
+/// Channel ceilings for int4, set to what the hardware ladder measures
+/// rather than to what the arithmetic would allow.
+///
+/// int4 packs four times as densely as fp16, so nothing in the CBUF model
+/// stops these from being much higher; they are low because the evidence
+/// stops here. Raise them with the measurement, not ahead of it.
+pub const MAX_INT4_INPUT_CHANNELS: u32 = 512;
+pub const MAX_INT4_OUTPUT_CHANNELS: u32 = 512;
 
 /// Widest input pixel the vendor keeps in dense NHWC, in bytes.
 ///
@@ -493,6 +502,20 @@ pub enum Precision {
     /// (`encodings/output-transpose-int16.md`), so this variant exists to be
     /// characterized on hardware before anything depends on it.
     Int16,
+    /// int4 inputs and coefficients with an int16 result.
+    ///
+    /// The half-byte element is the reason this module measures element
+    /// *bits*: at 4 bits the 16-byte feature atom holds 32 channels and the
+    /// 32-byte coefficient atom holds 64 kernels, both of which fall out of
+    /// the shared atom widths rather than needing a table.
+    ///
+    /// Products of two int4 values reach 64 and accumulate in int16, which
+    /// is the pairing `../rockchip-npu-notes/datatypes.md` records
+    /// (`int4 -> int16`, as against `int8 -> int32` and `fp16 -> fp32`).
+    /// There is no requantization on this path: the DPU writes the
+    /// accumulator, so a shape whose accumulator can leave int16 is the
+    /// caller's problem.
+    Int4,
     /// Quantized int8, carrying the parameters that are not derivable from
     /// the shape and must come from the compiler.
     Int8(Quantization),
@@ -508,10 +531,39 @@ impl Precision {
     /// Accumulator output does not change the int8 input/weight packing; use
     /// [`Precision::output_element_bytes`] when sizing the result tensor.
     pub fn element_bytes(&self) -> u32 {
+        let bits = self.element_bits();
+        assert!(
+            bits.is_multiple_of(8),
+            "{self:?} elements are sub-byte; use element_bits or bytes_for"
+        );
+        bits / 8
+    }
+
+    /// Bits one input-feature or coefficient element occupies.
+    ///
+    /// int4 is why the width is measured in bits: every atom, padding and
+    /// footprint rule in this module is `atom bytes * 8 / element bits`, and
+    /// stating it in bytes cannot express a half.
+    pub fn element_bits(&self) -> u32 {
         match self {
-            Precision::Fp16 | Precision::Bf16 | Precision::Int16 => 2,
-            Precision::Int8(_) | Precision::Int8Accumulator(_) => 1,
+            Precision::Fp16 | Precision::Bf16 | Precision::Int16 => 16,
+            Precision::Int8(_) | Precision::Int8Accumulator(_) => 8,
+            Precision::Int4 => 4,
         }
+    }
+
+    /// Bytes `elements` input-feature or coefficient elements occupy.
+    ///
+    /// Panics on a count that would end mid-byte. Every quantity this is
+    /// asked for is a padded whole atom, so a half byte here means a padding
+    /// rule went wrong rather than that a caller wanted a ragged buffer.
+    pub fn bytes_for(&self, elements: u32) -> u32 {
+        let bits = elements * self.element_bits();
+        assert!(
+            bits.is_multiple_of(8),
+            "{elements} {self:?} elements are {bits} bits, not a whole number of bytes"
+        );
+        bits / 8
     }
 
     /// Whether this precision shares the fp16 *layout* family.
@@ -523,13 +575,16 @@ impl Precision {
     /// has vendor captures, so anything gated on capture backing says so in
     /// its own comment.
     pub fn shares_fp16_layout(&self) -> bool {
-        self.element_bytes() == 2
+        self.element_bits() == 16
     }
 
     /// Bytes one logical output element occupies.
     pub fn output_element_bytes(&self) -> u32 {
         match self {
-            Precision::Fp16 | Precision::Bf16 | Precision::Int16 => 2,
+            // int4 accumulates into int16, so its result is wider than its
+            // operands -- the one rung where the two differ by more than a
+            // requantization.
+            Precision::Fp16 | Precision::Bf16 | Precision::Int16 | Precision::Int4 => 2,
             Precision::Int8(_) => 1,
             Precision::Int8Accumulator(_) => 4,
         }
@@ -542,7 +597,7 @@ impl Precision {
 
     /// Channels one 16-byte feature atom carries.
     pub fn channels_per_atom(&self) -> u32 {
-        FEATURE_ATOM_BYTES / self.element_bytes()
+        FEATURE_ATOM_BYTES * 8 / self.element_bits()
     }
 
     /// Granularity the DPU's output-channel count rounds up to.
@@ -579,6 +634,7 @@ impl Precision {
         match self {
             Precision::Fp16 | Precision::Bf16 | Precision::Int16 => MAX_INPUT_CHANNELS,
             Precision::Int8(_) | Precision::Int8Accumulator(_) => MAX_INT8_INPUT_CHANNELS,
+            Precision::Int4 => MAX_INT4_INPUT_CHANNELS,
         }
     }
 
@@ -589,6 +645,7 @@ impl Precision {
         match self {
             Precision::Fp16 | Precision::Bf16 | Precision::Int16 => MAX_OUTPUT_CHANNELS,
             Precision::Int8(_) | Precision::Int8Accumulator(_) => MAX_INT8_OUTPUT_CHANNELS,
+            Precision::Int4 => MAX_INT4_OUTPUT_CHANNELS,
         }
     }
 
@@ -599,7 +656,29 @@ impl Precision {
             Precision::Fp16 => DataPrecision::Fp16,
             Precision::Bf16 => DataPrecision::Bf16,
             Precision::Int16 => DataPrecision::Int16,
+            Precision::Int4 => DataPrecision::Int4,
             Precision::Int8(_) | Precision::Int8Accumulator(_) => DataPrecision::Int8,
+        }
+    }
+
+    /// The precision field the DPU output stage programs.
+    ///
+    /// Not simply [`Precision::data_precision`]: two rungs write a result
+    /// wider than their operands. int8 accumulator output writes int32, and
+    /// int4 writes the int16 its MACs accumulate into -- the
+    /// `int4 -> int16` / `int8 -> int32` / `fp16 -> fp32` pairing from
+    /// `../rockchip-npu-notes/datatypes.md`, with fp16's fp32 accumulator
+    /// converted down on the way out where int4's int16 one is not.
+    ///
+    /// The DPU's enum is also not the CNA/CORE one; see [`OutputPrecision`].
+    fn output_data_precision(&self) -> OutputPrecision {
+        match self {
+            Precision::Fp16 => OutputPrecision::Fp16,
+            Precision::Bf16 => OutputPrecision::Bf16,
+            Precision::Int16 => OutputPrecision::Int16,
+            Precision::Int4 => OutputPrecision::Int16,
+            Precision::Int8(_) => OutputPrecision::Int8,
+            Precision::Int8Accumulator(_) => OutputPrecision::Int32,
         }
     }
 
@@ -608,7 +687,7 @@ impl Precision {
     /// its BS/CVT bypasses off.
     pub fn quantization(&self) -> Option<Quantization> {
         match self {
-            Precision::Fp16 | Precision::Bf16 | Precision::Int16 => None,
+            Precision::Fp16 | Precision::Bf16 | Precision::Int16 | Precision::Int4 => None,
             Precision::Int8(quantization) | Precision::Int8Accumulator(quantization) => {
                 Some(*quantization)
             }
@@ -954,6 +1033,18 @@ impl Shape {
              does not reach and the measurement has not been made",
             precision.max_out_channels()
         );
+        if precision == Precision::Int4 {
+            // A partial int4 feature atom has no measurement behind it, and
+            // the ARGB dense path below `MAX_DENSE_CHANNELS` cannot address
+            // a nibble at all. Whole atoms are also what every useful int4
+            // shape has, so this refuses rather than guesses.
+            assert!(
+                in_channels.is_multiple_of(FEATURE_ATOM_BYTES * 2),
+                "int4 input channels must be a whole {}-channel feature atom; \
+                 partial int4 atoms are unmeasured",
+                FEATURE_ATOM_BYTES * 2,
+            );
+        }
         if let Precision::Int8Accumulator(quantization) = precision {
             assert!(
                 quantization.input_zero_point == 0
@@ -1074,9 +1165,20 @@ impl Shape {
         if let Some(size_e) = bs_ow_size_e_override(self.in_channels) {
             return size_e;
         }
+        if let Some(size_e) = int4_override(self.precision, "SIZE_E") {
+            return size_e;
+        }
         if self.depthwise {
             3
-        } else if self.precision.writes_accumulators() {
+        } else if self.precision.writes_accumulators() || self.precision == Precision::Int4 {
+            // int4 is the integer-output quirk
+            // `../rockchip-npu-notes/encodings/size-e-quirk.md` describes:
+            // its result is a 2-byte int16, whose natural `size_e` would be
+            // 1, but the integer write path strides as if each element were
+            // eight bytes. Measured directly here [HW sweep, planck
+            // 2026-09-03, `int4_output_write_map_probe`]: at 8x8 Cin 64
+            // Cout 64, `size_e` 0/1/2/3 write 0/2/3/4 of the eight output
+            // surfaces and stop, and only 7 writes all 8192 bytes.
             7
         } else {
             1
@@ -1273,15 +1375,15 @@ impl Shape {
         if self.depthwise {
             return kernel.height
                 * kernel.width
-                * self.cbuf_atoms()
-                * self.precision.channels_per_atom()
-                * self.precision.element_bytes();
+                * self
+                    .precision
+                    .bytes_for(self.cbuf_atoms() * self.precision.channels_per_atom());
         }
         kernel.height
             * kernel.width
-            * self.weight_channels()
-            * self.programmed_kernels()
-            * self.precision.element_bytes()
+            * self
+                .precision
+                .bytes_for(self.weight_channels() * self.programmed_kernels())
     }
 
     /// Padded channel count [`crate::rocket::tensor_layout::pack_depthwise_to_rocket_weights`]'s
@@ -3292,6 +3394,26 @@ fn accumulator_surf_add_override(in_channels: u32) -> Option<u32> {
         .and_then(|value| value.parse().ok())
 }
 
+/// Characterization overrides scoped to [`Precision::Int4`].
+///
+/// int4's compute is exact on hardware but its write-out stops after two
+/// 256-byte atoms, which is a writer-geometry question -- the same class the
+/// int8 accumulator's `mc_surf_out` / `size_e` / `surf_add` triple turned
+/// out to be. Scoping these to int4 keeps every other precision, including
+/// the hardware harness's health canary, on the shipped program, so a sweep
+/// measures int4 rather than breaking the instrument.
+///
+/// `ROCKET_INT4_{OUT_PRECISION,MC_SURF_OUT,SIZE_E,SURF_ADD}`. Nothing on the
+/// compiled path sets any of them.
+fn int4_override(precision: Precision, name: &str) -> Option<u32> {
+    if precision != Precision::Int4 {
+        return None;
+    }
+    std::env::var(format!("ROCKET_INT4_{name}"))
+        .ok()
+        .and_then(|value| value.parse().ok())
+}
+
 /// Characterization override for `DPU_BS_OW_CFG.SIZE_E_0/1/2`
 /// (`ROCKET_ACC_SIZE_E`, gated by `ROCKET_ACC_SIZE_E_MIN_CIN`).
 ///
@@ -3525,10 +3647,9 @@ fn conv_2d_tile_program(
     let precision = shape.precision.data_precision();
     let quantization = shape.precision.quantization();
     let accumulator_output = shape.precision.writes_accumulators();
-    let output_precision = if accumulator_output {
-        Bits::new(4)
-    } else {
-        precision.into()
+    let output_precision: Bits<3> = match int4_override(shape.precision, "OUT_PRECISION") {
+        Some(value) => Bits::new(value),
+        None => shape.precision.output_data_precision().into(),
     };
     // `BS_MUL_SHIFT_VALUE` and its negated twin in `DPU_DATA_FORMAT` are a
     // constant 14 in every int8 capture and 0 in every fp16 one. Nothing in
@@ -3545,7 +3666,9 @@ fn conv_2d_tile_program(
     } else {
         BRDMA_DATA_USE_BIAS
     };
-    let element_bytes = shape.precision.element_bytes();
+    // Bits, not bytes: a half-byte element cannot express a per-kernel
+    // footprint as a byte count times a channel count.
+    let element_bits = shape.precision.element_bits();
 
     let rows = &tile.rows;
     let columns = &tile.columns;
@@ -3657,7 +3780,7 @@ fn conv_2d_tile_program(
         ),
     };
 
-    let weight_bytes_per_kernel = kernel.height * kernel.width * weight_channels * element_bytes;
+    let weight_bytes_per_kernel = kernel.height * kernel.width * weight_channels * element_bits / 8;
     let weight_bytes = shape.weight_bytes(kernels);
     let mut commands = Vec::with_capacity(136);
 
@@ -3916,7 +4039,8 @@ fn conv_2d_tile_program(
             // which is the configuration its 256-byte write atom was measured
             // under. Every non-accumulator path has always used 0.
             .mc_surf_out(Bits::new(
-                accumulator_mc_surf_out_override(shape.in_channels)
+                int4_override(shape.precision, "MC_SURF_OUT")
+                    .or_else(|| accumulator_mc_surf_out_override(shape.in_channels))
                     .unwrap_or(u32::from(accumulator_output && shape.depthwise)),
             ))
             .bs_mul_shift_value_neg(Bits::new(bs_mul_shift))
@@ -4111,6 +4235,14 @@ fn conv_2d_tile_program(
                     accumulator_surf_add_override(shape.in_channels)
                         .unwrap_or(out_width * rows.out_rows * mult)
                 }
+            } else if let Some(surf_add) = int4_override(shape.precision, "SURF_ADD") {
+                surf_add
+            } else if shape.precision == Precision::Int4 {
+                // The integer write path's surface multiplier is 8, not the
+                // float path's 2 -- the other half of the `size_e` quirk.
+                // At Cout 128 the 2x value stops after 10 of 16 surfaces
+                // and the 8x one writes all 16384 bytes.
+                full_out_width * out_height * DENSE_ACCUMULATOR_SURF_MULT
             } else {
                 full_out_width * out_height * 2 * if shape.depthwise { 2 } else { 1 }
             }))
@@ -4318,6 +4450,76 @@ mod tests {
                 );
             }
         }
+    }
+
+    /// int4's geometry falls out of the shared atom widths.
+    ///
+    /// Every number here is `atom bytes * 8 / element bits` rather than a
+    /// table entry, which is the claim worth pinning: the 32-channel feature
+    /// atom, the 64-kernel coefficient atom and the halved coefficient
+    /// footprint are all consequences of the half-byte element, and they
+    /// match what `../rockchip-npu-notes/encodings/tile-layouts.md` records
+    /// for int4.
+    #[test]
+    fn int4_geometry_follows_the_half_byte_element() {
+        let kernels: Kernels = [3, 3];
+        let int4 = Shape::with_precision(16, 16, 1, 64, 64, Precision::Int4);
+        assert_eq!(int4.precision.element_bits(), 4);
+        assert_eq!(int4.precision.channels_per_atom(), 32);
+        assert_eq!(int4.precision.out_channel_granule(), 64);
+        assert_eq!(int4.feature_atoms(), 2);
+        assert_eq!(int4.padded_channels(), 64);
+        // int4 accumulates to int16, so the result is four times as wide as
+        // an operand.
+        assert_eq!(int4.precision.output_element_bytes(), 2);
+
+        // Half of int8's coefficient footprint at the same shape, and a
+        // quarter of fp16's -- the whole point of the rung.
+        let int8 = Shape::with_precision(
+            16,
+            16,
+            1,
+            64,
+            64,
+            Precision::Int8(Quantization {
+                input_zero_point: 0,
+                output_zero_point: 0,
+                weight_zero_point: 0,
+                input_scale: 1.0,
+                weights_scale: 1.0,
+                multiplier: Multiplier::from_ratio(1.0),
+            }),
+        );
+        let fp16 = Shape::with_precision(16, 16, 1, 64, 64, Precision::Fp16);
+        assert_eq!(int4.weight_bytes(kernels) * 2, int8.weight_bytes(kernels));
+        assert_eq!(int4.weight_bytes(kernels) * 4, fp16.weight_bytes(kernels));
+
+        // The precision field reaches the program as 6, and the DPU writes
+        // an int16 result (field 1) rather than an int4 one.
+        let tile = Tile::whole(int4, kernels);
+        let program = conv_2d_tile(int4, kernels, &tile);
+        let data_format = program
+            .iter()
+            .map(decode)
+            .find(|(domain, offset, _)| {
+                (*domain, *offset)
+                    == (
+                        <DpuDataFormat as RegisterMeta>::DOMAIN,
+                        <DpuDataFormat as RegisterMeta>::OFFSET,
+                    )
+            })
+            .expect("program must configure DPU_DATA_FORMAT")
+            .2;
+        // `DPU_DATA_FORMAT` is out[31:29], in[28:26], proc[2:0].
+        assert_eq!((data_format >> 29) & 0x7, OutputPrecision::Int16 as u32);
+        assert_eq!((data_format >> 26) & 0x7, DataPrecision::Int4 as u32);
+        assert_eq!(data_format & 0x7, DataPrecision::Int4 as u32);
+    }
+
+    #[test]
+    #[should_panic(expected = "whole 32-channel feature atom")]
+    fn int4_refuses_a_partial_feature_atom() {
+        let _ = Shape::with_precision(16, 16, 1, 48, 64, Precision::Int4);
     }
 
     #[test]

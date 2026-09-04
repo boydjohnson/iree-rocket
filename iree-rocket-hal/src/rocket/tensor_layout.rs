@@ -206,35 +206,139 @@ pub fn rocket_weight_storage_size(
     output_channels: usize,
     element_size: usize,
 ) -> Result<usize, &'static str> {
-    if filter_height == 0
-        || filter_width == 0
-        || input_channels == 0
-        || output_channels == 0
-        || element_size == 0
-        || !matches!(element_size, 1 | 2)
-    {
+    if !matches!(element_size, 1 | 2) {
         return Err("invalid Rocket convolution filter shape");
     }
+    rocket_weight_storage_size_bits(
+        filter_height,
+        filter_width,
+        input_channels,
+        output_channels,
+        element_size * 8,
+    )
+}
 
-    let channels_per_atom = FEATURE_ATOMIC_BYTES / element_size;
-    let input_atoms = input_channels.div_ceil(channels_per_atom);
-    let padded_input_atoms = if element_size == 2 && input_atoms % 4 == 3 {
-        input_atoms + 1
-    } else {
-        input_atoms
-    };
-    let padded_input_channels = padded_input_atoms * channels_per_atom;
-    let programmed_output_channels = if element_size == 1 {
-        output_channels.next_multiple_of(2)
-    } else {
-        output_channels
-    };
+/// [`rocket_weight_storage_size`] in element *bits*, which is what int4
+/// needs: half a byte per coefficient, two per byte.
+///
+/// Every rule here follows the element width. The quad-atom input bump is
+/// the 2-byte family's 16-kernel weight group (fp16, bf16, int16); the
+/// even-kernel rounding is what the narrower groups take.
+pub fn rocket_weight_storage_size_bits(
+    filter_height: usize,
+    filter_width: usize,
+    input_channels: usize,
+    output_channels: usize,
+    element_bits: usize,
+) -> Result<usize, &'static str> {
+    let layout = WeightLayout::new(input_channels, output_channels, element_bits)?;
+    if filter_height == 0 || filter_width == 0 {
+        return Err("invalid Rocket convolution filter shape");
+    }
     filter_height
         .checked_mul(filter_width)
-        .and_then(|value| value.checked_mul(padded_input_channels))
-        .and_then(|value| value.checked_mul(programmed_output_channels))
-        .and_then(|value| value.checked_mul(element_size))
+        .and_then(|value| value.checked_mul(layout.padded_input_channels))
+        .and_then(|value| value.checked_mul(layout.programmed_output_channels))
+        .and_then(|value| value.checked_mul(element_bits))
+        .map(|bits| bits / 8)
         .ok_or("Rocket convolution filter storage size overflows usize")
+}
+
+/// The blocked coefficient order's dimensions, shared by every element
+/// width.
+///
+/// Splitting this out is what lets the nibble packer reuse the byte
+/// packer's loop nest instead of restating it: the *order* is identical
+/// across widths and only the store differs.
+struct WeightLayout {
+    output_block_channels: usize,
+    padded_input_channels: usize,
+    programmed_output_channels: usize,
+    input_groups: usize,
+    output_blocks: usize,
+}
+
+impl WeightLayout {
+    fn new(
+        input_channels: usize,
+        output_channels: usize,
+        element_bits: usize,
+    ) -> Result<WeightLayout, &'static str> {
+        if input_channels == 0 || output_channels == 0 || !matches!(element_bits, 4 | 8 | 16) {
+            return Err("invalid Rocket convolution filter shape");
+        }
+        let channels_per_atom = FEATURE_ATOMIC_BYTES * 8 / element_bits;
+        let input_atoms = input_channels.div_ceil(channels_per_atom);
+        // The 3-mod-4 atom bump belongs to the 2-byte family alone; see
+        // `conv::Shape::weight_channels`.
+        let padded_input_atoms = if element_bits == 16 && input_atoms % 4 == 3 {
+            input_atoms + 1
+        } else {
+            input_atoms
+        };
+        let padded_input_channels = padded_input_atoms * channels_per_atom;
+        let programmed_output_channels = if element_bits < 16 {
+            output_channels.next_multiple_of(2)
+        } else {
+            output_channels
+        };
+        let output_block_channels = WEIGHT_ATOMIC_BYTES * 8 / element_bits;
+        Ok(WeightLayout {
+            output_block_channels,
+            padded_input_channels,
+            programmed_output_channels,
+            input_groups: padded_input_channels.div_ceil(WEIGHT_INPUT_GROUP_CHANNELS),
+            output_blocks: programmed_output_channels.div_ceil(output_block_channels),
+        })
+    }
+
+    /// Visits every destination coefficient slot in physical order, with the
+    /// logical HWCF element it carries.
+    ///
+    /// `source` is `None` for a lane the filter does not reach -- input
+    /// channel padding, or an output kernel past the logical count.
+    fn visit_slots(
+        &self,
+        filter_height: usize,
+        filter_width: usize,
+        input_channels: usize,
+        output_channels: usize,
+        mut visit: impl FnMut(usize, Option<usize>, usize),
+    ) {
+        let mut slot = 0;
+        for output_block in 0..self.output_blocks {
+            for input_group in 0..self.input_groups {
+                for filter_y in 0..filter_height {
+                    for filter_x in 0..filter_width {
+                        for output_lane in 0..self.output_block_channels {
+                            let output_channel =
+                                output_block * self.output_block_channels + output_lane;
+                            if output_channel >= self.programmed_output_channels {
+                                continue;
+                            }
+                            for input_lane in 0..WEIGHT_INPUT_GROUP_CHANNELS {
+                                let input_channel =
+                                    input_group * WEIGHT_INPUT_GROUP_CHANNELS + input_lane;
+                                if input_channel >= self.padded_input_channels {
+                                    continue;
+                                }
+                                let source = (output_channel < output_channels
+                                    && input_channel < input_channels)
+                                    .then(|| {
+                                        (((filter_y * filter_width + filter_x) * input_channels
+                                            + input_channel)
+                                            * output_channels)
+                                            + output_channel
+                                    });
+                                visit(slot, source, output_channel);
+                                slot += 1;
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
 }
 
 /// Packs a logical HWCF filter into the RK3588 CNA coefficient order.
@@ -307,6 +411,154 @@ pub fn pack_hwcf_to_rocket_weights_padded(
     )
 }
 
+/// Packs an int4 HWCF filter into the CNA coefficient order, two
+/// coefficients to a byte.
+///
+/// `dense` carries one logical coefficient per `i8`, each in `-8..=7`, in
+/// the same HWCF order [`pack_hwcf_to_rocket_weights`] takes. The physical
+/// order is identical to every other width -- the same
+/// output_block/input_group/tap/lane nesting -- so only the store changes:
+/// consecutive coefficient slots share a byte, the even slot in the low
+/// nibble.
+///
+/// The nibble order is *not* a free choice and is not swapped:
+/// `../rockchip-npu-notes/encodings/tile-layouts.md` records int4 as packed
+/// low-nibble-first with `HILO = 0`.
+///
+/// The N-group falls out of the shared 32-byte coefficient atom rather than
+/// being a special case: at half a byte per element it holds **64** kernels
+/// against int8's 32 and fp16's 16. That is the int4 trap the notes call
+/// out -- an int4 filter packed with int8's 32-kernel group coincides with
+/// the correct one at a single input group and diverges past it -- so a
+/// meaningful test needs `Cin` above 32.
+pub fn pack_hwcf_to_rocket_weights_int4(
+    dense: &[i8],
+    filter_height: usize,
+    filter_width: usize,
+    input_channels: usize,
+    output_channels: usize,
+    packed: &mut [u8],
+) -> Result<usize, &'static str> {
+    pack_hwcf_to_rocket_weights_int4_padded(
+        dense,
+        filter_height,
+        filter_width,
+        input_channels,
+        output_channels,
+        output_channels,
+        packed,
+    )
+}
+
+/// [`pack_hwcf_to_rocket_weights_int4`] with a wider programmed output
+/// channel count than the filter logically has, zero-filling the surplus.
+pub fn pack_hwcf_to_rocket_weights_int4_padded(
+    dense: &[i8],
+    filter_height: usize,
+    filter_width: usize,
+    input_channels: usize,
+    output_channels: usize,
+    padded_output_channels: usize,
+    packed: &mut [u8],
+) -> Result<usize, &'static str> {
+    if padded_output_channels < output_channels {
+        return Err("padded output channel count is smaller than the logical one");
+    }
+    let dense_len = filter_height
+        .checked_mul(filter_width)
+        .and_then(|value| value.checked_mul(input_channels))
+        .and_then(|value| value.checked_mul(output_channels))
+        .ok_or("dense HWCF storage size overflows usize")?;
+    if dense.len() < dense_len {
+        return Err("dense HWCF filter is smaller than its declared shape");
+    }
+    if dense[..dense_len]
+        .iter()
+        .any(|&value| !(-8..=7).contains(&value))
+    {
+        return Err("int4 coefficient is outside -8..=7");
+    }
+    let packed_len = rocket_weight_storage_size_bits(
+        filter_height,
+        filter_width,
+        input_channels,
+        padded_output_channels,
+        4,
+    )?;
+    if packed.len() < packed_len {
+        return Err("Rocket weight destination is smaller than its declared shape");
+    }
+    packed[..packed_len].fill(0);
+
+    let layout = WeightLayout::new(input_channels, padded_output_channels, 4)?;
+    layout.visit_slots(
+        filter_height,
+        filter_width,
+        input_channels,
+        output_channels,
+        |slot, source, _| {
+            let Some(source) = source else { return };
+            let nibble = (dense[source] as u8) & 0xf;
+            if slot.is_multiple_of(2) {
+                packed[slot / 2] = (packed[slot / 2] & 0xf0) | nibble;
+            } else {
+                packed[slot / 2] = (packed[slot / 2] & 0x0f) | (nibble << 4);
+            }
+        },
+    );
+    Ok(packed_len)
+}
+
+/// Packs a dense NHWC int4 feature map into NC1HWC2, two channels a byte.
+///
+/// `dense` carries one logical value per `i8`, each in `-8..=7`, in NHWC
+/// order. The 16-byte feature atom holds **32** int4 channels, so a pixel
+/// occupies `ceil(Cin / 32)` atoms exactly as it does at every other width.
+///
+/// `input_channels` must be a whole multiple of two: a surface boundary in
+/// the middle of a byte has no meaning, and every int4 channel count the
+/// convolution builder programs is a whole atom anyway.
+pub fn pack_nhwc_to_nc1hwc2_int4(
+    dense: &[i8],
+    pixel_count: usize,
+    input_channels: usize,
+    packed: &mut [u8],
+) -> Result<usize, &'static str> {
+    const CHANNELS_PER_ATOM: usize = FEATURE_ATOMIC_BYTES * 2;
+    if input_channels == 0 || !input_channels.is_multiple_of(2) {
+        return Err("int4 channel count must be a nonzero multiple of two");
+    }
+    if dense.len() < pixel_count * input_channels {
+        return Err("dense NHWC feature map is smaller than its declared shape");
+    }
+    if dense[..pixel_count * input_channels]
+        .iter()
+        .any(|&value| !(-8..=7).contains(&value))
+    {
+        return Err("int4 feature value is outside -8..=7");
+    }
+    let surfaces = input_channels.div_ceil(CHANNELS_PER_ATOM);
+    let written = surfaces * pixel_count * FEATURE_ATOMIC_BYTES;
+    if packed.len() < written {
+        return Err("NC1HWC2 destination is smaller than its declared shape");
+    }
+    packed[..written].fill(0);
+    for pixel in 0..pixel_count {
+        for channel in 0..input_channels {
+            let surface = channel / CHANNELS_PER_ATOM;
+            let lane = channel % CHANNELS_PER_ATOM;
+            let offset = (surface * pixel_count + pixel) * FEATURE_ATOMIC_BYTES + lane / 2;
+            let nibble = (dense[pixel * input_channels + channel] as u8) & 0xf;
+            if lane.is_multiple_of(2) {
+                packed[offset] = (packed[offset] & 0xf0) | nibble;
+            } else {
+                packed[offset] = (packed[offset] & 0x0f) | (nibble << 4);
+            }
+        }
+    }
+    Ok(written)
+}
+
 /// Packs a quantized int8 HWCF filter and fills physical input-channel
 /// padding with each output channel's weight zero point.
 ///
@@ -376,63 +628,31 @@ fn pack_hwcf_to_rocket_weights_impl(
     }
     packed[..packed_len].fill(0);
 
-    let output_block_channels = WEIGHT_ATOMIC_BYTES / element_size;
-    let channels_per_atom = FEATURE_ATOMIC_BYTES / element_size;
-    let input_atoms = input_channels.div_ceil(channels_per_atom);
-    let padded_input_atoms = if element_size == 2 && input_atoms % 4 == 3 {
-        input_atoms + 1
-    } else {
-        input_atoms
-    };
-    let padded_input_channels = padded_input_atoms * channels_per_atom;
-    let programmed_output_channels = if element_size == 1 {
-        padded_output_channels.next_multiple_of(2)
-    } else {
-        padded_output_channels
-    };
-    let input_groups = padded_input_channels.div_ceil(WEIGHT_INPUT_GROUP_CHANNELS);
-    let output_blocks = programmed_output_channels.div_ceil(output_block_channels);
-    let mut dst_offset = 0;
-
-    for output_block in 0..output_blocks {
-        for input_group in 0..input_groups {
-            for filter_y in 0..filter_height {
-                for filter_x in 0..filter_width {
-                    for output_lane in 0..output_block_channels {
-                        let output_channel = output_block * output_block_channels + output_lane;
-                        if output_channel >= programmed_output_channels {
-                            continue;
-                        }
-                        for input_lane in 0..WEIGHT_INPUT_GROUP_CHANNELS {
-                            let input_channel =
-                                input_group * WEIGHT_INPUT_GROUP_CHANNELS + input_lane;
-                            if input_channel >= padded_input_channels {
-                                continue;
-                            }
-                            if output_channel < output_channels {
-                                if input_channel < input_channels {
-                                    let src_element = (((filter_y * filter_width + filter_x)
-                                        * input_channels
-                                        + input_channel)
-                                        * output_channels)
-                                        + output_channel;
-                                    let src_offset = src_element * element_size;
-                                    packed[dst_offset..dst_offset + element_size].copy_from_slice(
-                                        &dense[src_offset..src_offset + element_size],
-                                    );
-                                } else if let Some(zero_points) = weight_zero_points {
-                                    packed[dst_offset] = zero_points[output_channel] as u8;
-                                }
-                            }
-                            dst_offset += element_size;
-                        }
+    let layout = WeightLayout::new(input_channels, padded_output_channels, element_size * 8)?;
+    layout.visit_slots(
+        filter_height,
+        filter_width,
+        input_channels,
+        output_channels,
+        |slot, source, output_channel| {
+            let dst_offset = slot * element_size;
+            match source {
+                Some(source) => {
+                    let src_offset = source * element_size;
+                    packed[dst_offset..dst_offset + element_size]
+                        .copy_from_slice(&dense[src_offset..src_offset + element_size]);
+                }
+                None => {
+                    if let Some(zero_points) = weight_zero_points
+                        && output_channel < output_channels
+                    {
+                        packed[dst_offset] = zero_points[output_channel] as u8;
                     }
                 }
             }
-        }
-    }
+        },
+    );
 
-    debug_assert_eq!(dst_offset, packed_len);
     Ok(packed_len)
 }
 
