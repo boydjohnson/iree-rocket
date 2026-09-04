@@ -520,6 +520,7 @@ def run_case_on_board(
     names: Sequence[str],
     outputs: Sequence[str],
     idle_seconds: float,
+    board_env: Sequence[str] = (),
 ) -> Outcome:
     """Runs one case in its own process, after an idle gap.
 
@@ -535,6 +536,7 @@ def run_case_on_board(
                 [
                     "env",
                     "ROCKET_DISPATCH_TIMES=1",
+                    *board_env,
                     f"./{runtime_name}",
                     "--module=rocket.vmfb",
                     f"--function={case}",
@@ -624,6 +626,14 @@ def main() -> None:
         help="only ask whether each case completes, not whether it was right",
     )
     parser.add_argument("--keep-remote", action="store_true")
+    parser.add_argument(
+        "--board-env",
+        action="append",
+        default=[],
+        metavar="KEY=VALUE",
+        help="extra environment for the board's iree-run-module, e.g. "
+        "ROCKET_PM_DWELL=suspend (repeatable)",
+    )
     args = parser.parse_args()
 
     selected = [
@@ -681,7 +691,14 @@ def main() -> None:
                     )
                 for trial in range(args.repeat):
                     outcome = run_case_on_board(
-                        args.board, remote_dir, runtime_name, case, names, outputs, args.idle_seconds
+                        args.board,
+                        remote_dir,
+                        runtime_name,
+                        case,
+                        names,
+                        outputs,
+                        args.idle_seconds,
+                        args.board_env,
                     )
                     if outcome.ran and outputs:
                         run(

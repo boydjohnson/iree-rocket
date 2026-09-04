@@ -1029,6 +1029,89 @@ buffers -- or eliminates the last driver-side candidate and leaves the DPU
 write-back FSM alone.
 
 
+### Mechanism found, 2026-09-04: it is the runtime-PM power domain, and a dwell at the boundary clears it
+
+`../rockchip-npu-notes` records the same hazard on the RK3576
+(`chips/rk3576.md` §"The poisoning is one hazard, and its cost is a system
+setting"; `chips/rk3576-regcmd.md` §"An i32out job poisons the next submit"),
+established deterministically there [notes]: any program whose DPU output
+element is wider than one byte -- the int32 writer above all -- leaves
+NPU-internal state that no register write clears (writing every register the
+next job does not touch leaves it poisoned), that no sacrificial submit
+absorbs (6 after 1, 0/6), and that **only the driver's runtime-PM autosuspend
+collapsing the NPU power domain resets**: with `power/control=on` no gap of
+any length clears it, and the working gap tracks `power/autosuspend_delay_ms`
+one for one. They localise the int32 trigger to `DPU_DATA_FORMAT` with
+`out_precision` 4 or 5, which is exactly what `Int8Accumulator` programs, and
+they found that a per-job `rocket_core_reset()` is *not* a fix (it takes the
+IOMMU down). Their state is an NPU-internal memory array; this repo's two
+register diffs above were looking in the right place and finding nothing for
+the right reason.
+
+Every earlier C8 observation fits: state outside the 124 written registers,
+survival across command buffers and processes, the int8 dose, the wide-victim
+threshold ("one output byte never carries it, wider always does" there), and
+the canary that reads SICK and then runs clean seconds later. And the 1 ms
+`ROCKET_QUIESCE_ALL` dwell that "ruled out settling time" was two orders of
+magnitude short of the ~100 ms a 50 ms autosuspend needs.
+
+**Tested on planck** [verified], all three cores at `autosuspend_delay_ms=50`,
+`control=auto`. `rocket-hal-driver` grew a diagnostic dwell before a dispatch:
+`ROCKET_PM_DWELL_MS=<n>` sleeps, `ROCKET_PM_DWELL=suspend` polls every core's
+`power/runtime_status` until all read `suspended` (no root needed), and
+`ROCKET_PM_DWELL_AT=transition` restricts either to an `Int8Accumulator ->
+other` boundary. `tools/c8_precision_transition_probe.py --board-env` passes
+them through. Same binary, same `int8_then_stem` single-shot repro:
+
+| dwell before dispatches | result |
+|---|---|
+| none | **hung 2/2** on the fp16 job's first task |
+| 30 ms sleep (under the 50 ms autosuspend) | **hung 3/3**, now on the fp16 job's *4th* task |
+| 150 ms sleep | ok 3/3 |
+| poll until all cores `suspended` (took 45-62 ms) | ok 3/3 |
+| poll, **only at the int8acc -> fp16 boundary** | ok 3/3; fires exactly once |
+| same, on `int8_then_k1`, `int8_then_bigout`, `int8_then_k3_then_k1` | ok 2/2 each |
+
+A sub-autosuspend dwell moving the hang later without clearing it, against a
+poll that returns the moment the domain has cycled, separates "elapsed time"
+from "power cycle" without touching sysfs. One cycle clears it for the rest of
+the run (`k3` then `k1` both clean after a single dwell).
+
+**The model completes a benchmark loop.** `bench.sh`, governor pinned, IRQs on
+cpu6, `--benchmark_min_time=5s`, two interleaved passes with the boundary dwell:
+
+    int8.prerise (22 sites)   2.82  2.84 items/s   354 ms   hangs=0
+    int8.raised  (48 sites)   1.80  1.81           553 ms   hangs=0
+    int8.cpu                  7.65  7.56           131 ms   hangs=0
+    int8.prerise, no dwell    ABORTED                        hangs=1   (control)
+
+Logits are bit-identical with and without the dwell (single-shot, where both
+complete), and top-5 matches `int8.cpu`. So the first trustworthy int8 offload
+numbers in this repo are **2.7x and 4.2x slower than the like-for-like CPU
+build**, which puts int8 in the same place as fp16 (M4): the offload deficit
+is the dispatch path, not hangs. About 50 ms of each iteration is the dwell
+itself (the stem is the model's only fp16 conv, so one boundary per
+inference).
+
+**What a real fix looks like.** The dwell is a diagnostic and costs an
+autosuspend period per boundary. The options, in the order to try them:
+
+1. **Drive the cycle instead of waiting for it** (rocket-userspace's
+   `rocket_rk3576_power_idle()`, `src/rocket_matmul_rk3576.c`): write
+   `autosuspend_delay_ms=0`, poll to `suspended`, restore. Costs one real
+   suspend/resume (~ms) rather than 50 ms, but needs write access to the
+   sysfs file (a udev rule; root-only on planck today).
+2. **Remove the boundary.** Reorder or group dispatches so int8-accumulator
+   work does not precede a wide fp16 job in the same active window, or route
+   int8 through the requantized int8-out path (`requantized-int8-conv-path`),
+   whose one-byte output on the RK3576 poisons nothing.
+3. **Kernel-side reset of the DPU at job start** is the fix both stacks name
+   and neither has built; the notes warn the bare core reset kills the IOMMU.
+
+Also worth revisiting now: the depthwise mix case
+(`fp16-depthwise-int8-mix-corrupts`, `mixed_int8_then_depthwise` in the e2e
+gate) is the same boundary and should clear under the same dwell.
+
 ---
 
 ## C9 (S2) — above 3x3 the conv path has two faults the fp16 capture sweep could not have seen: a `Cin` cliff that hangs at every width, and an int8 program that computes wrong values at every shape
@@ -1420,6 +1503,44 @@ the PPU-completion patch, or the pool is encoded DPU-fed
 (`FLYING_MODE=1` + `DPU_FLYIN=1`) so a DPU completion arrives — which the notes
 list as untested.
 
+### Resolved on planck, 2026-09-04: the PPU interrupts are unmasked in the loaded module, and a pool dispatch takes 2.6-3.9 ms
+
+The premise above was wrong for this board. `planck`'s `rocket.ko` is not
+stock: it loads from `/lib/modules/7.1.0-edge-rockchip64/updates/rocket.ko`,
+an out-of-tree build of `../linux`'s `drivers/accel/rocket` with an
+uncommitted patch to `rocket_job.c` that unmasks and clears `PPU_0/PPU_1`
+alongside `DPU_0/DPU_1` at submit and accepts those bits in the IRQ handler
+(the notes' `DRM_ROCKET_JOB_PPU_DONE` fix, done unconditionally rather than
+as a job flag, which is safe while every job here is single-task). The
+July 29 module in `updates/` already carried the unmask -- the first-light
+pooling commit of 2026-09-04 (`b2cb6ef`) wrote "healthy pools run in
+single-digit milliseconds" against it -- and the version reloaded today adds
+only the diagnostic messages (`NPU job timed out on core N
+(INTERRUPT_STATUS=.. RAW_STATUS=..)`, which is how to tell it apart).
+
+Measured after the reload [verified], `pooling_oracle_hw` with
+`ROCKET_DISPATCH_TIMES=1`:
+
+    max 2x2s2 32x32 C32 Fp16        dispatch 2.6 ms
+    max 2x2s2 32x32 C32 Int8        dispatch 3.4 ms
+    max partial atom 16x16 C20      dispatch 3.3 ms
+    max 3x3s2 pad1 32x32 C16        dispatch 3.9 ms
+    6 tests, all cases exact, zero `NPU job timed out` lines in the journal
+
+The 19 s wall of the full pooling suite is the harness's 1.2 s `SETTLE`
+between cases, not the device. So the pooling path is not blocked on the
+kernel here; wiring a pooling matcher (GlobalAvgPool is MobileNetV2's) is
+a compiler question only. What P5 keeps: any *other* board running the
+distribution module still pays the deadline, so a matcher should stay off by
+default until the driver can tell (interface version, or a probe pool timed
+against the 150 ms floor).
+
+Build recipe, on the board: `rsync` the driver directory to
+`planck:~/rocket-ko/src/`, then `make -C /lib/modules/$(uname -r)/build
+M=$PWD modules`; headers, gcc 14 and `Module.symvers` are all present, and
+`CONFIG_MODVERSIONS` is off. The stock module is kept at
+`kernel/drivers/accel/rocket/rocket.ko` for fallback.
+
 ---
 
 ## P6 (S2, items 1-3 DONE) — measured: MobileNetV2 fp16 spent 8% of its time on the NPU and 30% repacking constant weights
@@ -1806,13 +1927,13 @@ were applied on the board and turned out **not** to bind (see M4), which
 demotes them; M2 is the only platform item with an open case. The re-audit they
 were meant to enable found two larger things, and both are now at the top.
 
-1. **C8** — an int8 dispatch makes a following fp16 dispatch hang once that
-   fp16 job's output passes ~256 KiB, which blocks every int8 performance
-   question. Now reproducible in a single `iree-run-module` run rather than a
-   benchmark loop, and characterized on both sides: see the 2026-09-04
-   separation. The open step is the scratch-buffer address check, the last
-   driver-side candidate and the same one `fp16-depthwise-int8-mix-corrupts`
-   left untested.
+1. **C8** — mechanism found and board-confirmed 2026-09-04: the
+   int8-accumulator job leaves NPU-internal state that only a runtime-PM
+   power-domain cycle clears (the notes' RK3576 "wide-output poisoning"). A
+   dwell at the `Int8Accumulator -> fp16` boundary makes every repro and the
+   full int8 benchmark loop clean, bit-identical. What remains is turning the
+   diagnostic dwell into a fix that costs less than an autosuspend period
+   (see the C8 options list), then re-taking the int8 numbers.
 2. **M4** — already established; what remains is to stop using the NCHW
    baseline. Cheap, and it is the precondition for any offload decision being
    meaningful.
@@ -1825,7 +1946,8 @@ were meant to enable found two larger things, and both are now at the top.
    re-narrowing fixed too the model is 1.6x, and what it leaves behind is the
    NC1HWC2 round trip.
 4. **C2** — small fix, plus a probe that settles a question the notes leave open.
-5. **M2** — ~1.43x on the device half, but it needs a driver-side
+5. **M2** — ~1.43x on the device half (P5 is closed on planck; the PPU
+   unmask has been in the loaded module since July, see its resolution), but it needs a driver-side
    `clk_set_rate` and both shortcuts hang the box.
 6. **P2** — the big structural one; measure the regime first. P7 is the case
    that most needs it: MobileNetV2 fp16's depthwise convolutions are correct
