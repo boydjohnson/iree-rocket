@@ -60,6 +60,47 @@ impl PoolingMethod {
             PoolingMethod::Min => 2,
         }
     }
+
+    /// The value the PPU should fill padded taps with, as the raw bit
+    /// pattern `PPU_PADDING_VALUE_1_CFG.pad_value_0` takes -- or `None`
+    /// where no measurement says what it is.
+    ///
+    /// This is the reduction's identity element, so it follows from the
+    /// method and the element format rather than being a caller's choice.
+    /// [`PoolingShape::pad_value`] exists because the register does; a
+    /// caller that could pick it independently could hand a max pool a fill
+    /// of zero and quietly change its answer at the border, which is why
+    /// the executable wire format does not carry one and consumers derive
+    /// it here instead.
+    ///
+    /// What is backed by evidence, and what is not:
+    ///
+    /// * **Avg, either format: 0.** Every vendor average capture programs
+    ///   zero, and it is the right answer twice over -- the PPU divides by
+    ///   `kh * kw` whether or not a tap was padding (count-include-pad), so
+    ///   a zero tap contributes nothing to the sum and still counts in the
+    ///   divisor.
+    /// * **Max at fp16: `0xFC00`, -inf.** The vendor's own padded max
+    ///   captures program it (`../rockchip-npu-notes/encodings/ppu-pooling.md`).
+    /// * **Everything else: unmeasured.** Min at either format, and max at
+    ///   int8, have no capture and no hardware run behind them. The obvious
+    ///   guesses -- `0x7C00` for fp16 min, `0x80`/`0x7F` for int8 -- are
+    ///   only guesses, and an int8 pool's operands may carry a zero point,
+    ///   which moves what "most negative" even means. Callers must refuse a
+    ///   *padded* pool here rather than fill in something plausible; an
+    ///   unpadded one never reads the field and can pass zero.
+    ///
+    /// Lifting this is one probe: a padded pool whose border window is
+    /// entirely padding, checked against the identity element, per method
+    /// and format.
+    pub fn pad_fill_value(self, precision: PoolingPrecision) -> Option<u32> {
+        match (self, precision) {
+            (PoolingMethod::Avg, _) => Some(0),
+            (PoolingMethod::Max, PoolingPrecision::Fp16) => Some(0xFC00),
+            (PoolingMethod::Max, PoolingPrecision::Int8) => None,
+            (PoolingMethod::Min, _) => None,
+        }
+    }
 }
 
 /// Numeric format of the input and output feature maps.
@@ -75,13 +116,18 @@ pub enum PoolingPrecision {
 }
 
 impl PoolingPrecision {
+    /// Bytes one input or output element occupies.
+    pub fn element_bytes(self) -> u32 {
+        FEATURE_ATOM_BYTES / self.channels_per_atom()
+    }
+
     /// Logical channels carried by one 16-byte PPU feature atom.
     ///
     /// The pooling sweep programs all three channel extents to this
     /// precision-dependent granularity: fp16 C1..C8 become C8, while int8
     /// C12 becomes C16. This is the same physical 16-byte atom consumed from
     /// the preceding DPU output or directly by PPU_RDMA.
-    fn channels_per_atom(self) -> u32 {
+    pub fn channels_per_atom(self) -> u32 {
         match self {
             PoolingPrecision::Int8 => 16,
             PoolingPrecision::Fp16 => 8,
@@ -136,6 +182,10 @@ pub struct PoolingShape {
     /// caller's responsibility to pick something sane for `method`).
     pub pad_value: u32,
 }
+
+/// Physical width of one PPU feature atom, the same 16 bytes the CNA's
+/// NC1HWC2 surfaces use.
+const FEATURE_ATOM_BYTES: u32 = 16;
 
 const MAX_PPU_EXTENT: u32 = 8192;
 const MAX_PPU_KERNEL_OR_STRIDE: u32 = 16;
@@ -301,6 +351,36 @@ impl PoolingShape {
             self.pad_bottom,
         );
         validate_direct_kernel(self.kernel_width, self.kernel_height);
+    }
+}
+
+impl PoolingShape {
+    /// Channel count the PPU actually programs: the logical count rounded
+    /// up to one whole 16-byte feature atom, which is 8 channels at fp16
+    /// and 16 at int8.
+    ///
+    /// Every direct vendor program does this rather than writing a
+    /// sub-atomic channel extent -- fp16 C1..C8 are all programmed C8, and
+    /// int8 C12 is programmed C16 -- and `build_pooling_tile_task` derives
+    /// its cube extents and strides from it. It is public because a caller
+    /// packing an input buffer has to agree with it exactly, and deriving
+    /// the rule twice is how the two come to disagree.
+    pub fn programmed_channels(&self) -> u32 {
+        self.input_channels
+            .next_multiple_of(self.precision.channels_per_atom())
+    }
+
+    /// Bytes one packed NC1HWC2 pixel occupies: one 16-byte atom per
+    /// channel surface.
+    pub fn packed_bytes_per_pixel(&self) -> u32 {
+        self.programmed_channels() * self.precision.element_bytes()
+    }
+
+    /// Bytes one *logical* NHWC pixel occupies in the caller's own buffer,
+    /// before packing. Equal to [`PoolingShape::packed_bytes_per_pixel`]
+    /// only when the channel count already fills whole atoms.
+    pub fn logical_bytes_per_pixel(&self) -> u32 {
+        self.input_channels * self.precision.element_bytes()
     }
 }
 

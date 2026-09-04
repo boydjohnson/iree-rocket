@@ -10,10 +10,11 @@
 //! `0` (or an empty/missing `executable_data`, preserving every existing
 //! caller's behavior) for `UkernelShape::Conv2d` (matching `rkt-basic.rs`'s
 //! validated 4x4 spatial, 1 channel, 1x1 kernel shape, `Precision::Int8` --
-//! see rknpu-spelunking/NOTES.md), `1` for `UkernelShape::Pooling` (a
-//! 4x4x1, 2x2 kernel/stride shape -- NOT yet hardware-validated, see
-//! iree-rocket-hal's `PoolingPlan` module documentation and
-//! the driver's `cts/pooling_dispatch_test.cc`), `2` for
+//! see rknpu-spelunking/NOTES.md). `1` is **retired**: it was a hardcoded
+//! 4x4 pooling shape that was never hardware-validated, and the CTS test it
+//! existed for is gone. `PoolingDef` in the RKT1 schema is how a pool is
+//! described now, so tag 1 is rejected rather than falling through to the
+//! convolution default and silently handing back the wrong kernel. `2` is
 //! `UkernelShape::Conv2d` again but with `Precision::Fp16` -- same
 //! geometry as tag `0`, the shape round 7's hardware fix confirmed produces a
 //! bit-exact-correct fp16 conv (see
@@ -46,7 +47,10 @@ use crate::{
         iree_hal_executable_caching_mode_t, iree_hal_executable_params_t, iree_hal_executable_t,
         iree_hal_resource_t, iree_host_size_t, iree_status_t, iree_string_view_t,
     },
-    executable::{Conv2dExecutable, RuntimeConv2dDimension, UkernelShape},
+    executable::{
+        Conv2dExecutable, MatmulExecutable, PoolingExecutable, RuntimeConv2dDimension,
+        RuntimeMatmulDimension, RuntimePoolingDimension, UkernelShape,
+    },
     status,
 };
 use iree_rocket_hal::rocket::{
@@ -219,12 +223,16 @@ fn decode_flatbuffer_shape(data: &[u8]) -> Result<UkernelShape, ()> {
             executable.validate_template().map_err(|_| ())?;
             Ok(UkernelShape::Conv2d(executable))
         }
+        // Deprecated, and decoded only because an older executable may
+        // still carry one. It describes the same operation MatmulDef does,
+        // so it produces the same runtime shape; what it cannot do is carry
+        // runtime dimensions, which is one of the reasons it was replaced.
         schema::KernelDef::FullyConnectedDef => {
             let fc_def = export.kernel_as_fully_connected_def().ok_or(())?;
-            if fc_def.m() == 0 || fc_def.k() == 0 || fc_def.n() == 0 {
-                return Err(());
-            }
-            let precision = decode_precision(
+            let shape = decode_matmul_shape(
+                fc_def.m(),
+                fc_def.k(),
+                fc_def.n(),
                 fc_def.precision(),
                 fc_def.input_zero_point(),
                 fc_def.output_zero_point(),
@@ -232,31 +240,174 @@ fn decode_flatbuffer_shape(data: &[u8]) -> Result<UkernelShape, ()> {
                 fc_def.input_scale(),
                 fc_def.weights_scale(),
                 fc_def.output_scale(),
+                fc_def.activation(),
+                fc_def.activation_cmp(),
             )?;
-            if precision.writes_accumulators() {
-                // The exact accumulator path is hardware-validated for
-                // Conv2D only; FullyConnected has separate output packing.
-                return Err(());
+            let executable = MatmulExecutable::new_static(shape);
+            executable.validate_template().map_err(|_| ())?;
+            Ok(UkernelShape::Matmul(executable))
+        }
+        schema::KernelDef::MatmulDef => {
+            let matmul_def = export.kernel_as_matmul_def().ok_or(())?;
+            let shape = decode_matmul_shape(
+                matmul_def.m(),
+                matmul_def.k(),
+                matmul_def.n(),
+                matmul_def.precision(),
+                matmul_def.input_zero_point(),
+                matmul_def.output_zero_point(),
+                matmul_def.weights_zero_point(),
+                matmul_def.input_scale(),
+                matmul_def.weights_scale(),
+                matmul_def.output_scale(),
+                matmul_def.activation(),
+                matmul_def.activation_cmp(),
+            )?;
+            let mut runtime_dimensions = Vec::new();
+            if let Some(dimensions) = matmul_def.runtime_dimensions() {
+                for dimension in dimensions.iter() {
+                    runtime_dimensions.push(match dimension {
+                        schema::MatmulDimension::M => RuntimeMatmulDimension::M,
+                        schema::MatmulDimension::K => RuntimeMatmulDimension::K,
+                        schema::MatmulDimension::N => RuntimeMatmulDimension::N,
+                        _ => return Err(()),
+                    });
+                }
             }
-            let activation = decode_activation(fc_def.activation(), fc_def.activation_cmp())?;
-            // fc::Shape::new validates against conv.rs's own capture-backed
-            // bounds internally and panics on an unsupported shape --
-            // caught here for the same reason as decode_precision's
-            // Multiplier::from_ratio above.
-            let shape = std::panic::catch_unwind(|| {
-                fc::Shape::new(fc_def.m(), fc_def.k(), fc_def.n(), precision)
-                    .with_activation(activation)
-            })
-            .map_err(|_| ())?;
-            // fc::Shape::new only re-checks Shape::with_precision's own
-            // constructor bounds -- validate_conv_shape additionally
-            // trial-plans through ConvPlan::new, the same deeper gate the
-            // tag=3 wire format goes through.
-            validate_conv_shape(&shape.as_conv_shape(), fc::KERNELS).map_err(|_| ())?;
-            Ok(UkernelShape::FullyConnected(shape))
+            let executable = MatmulExecutable {
+                shape_template: shape,
+                runtime_dimensions,
+            };
+            executable.validate_template().map_err(|_| ())?;
+            Ok(UkernelShape::Matmul(executable))
+        }
+        schema::KernelDef::PoolingDef => {
+            let pooling_def = export.kernel_as_pooling_def().ok_or(())?;
+            let method = match pooling_def.method() {
+                schema::PoolingMethod::AVG => PoolingMethod::Avg,
+                schema::PoolingMethod::MAX => PoolingMethod::Max,
+                schema::PoolingMethod::MIN => PoolingMethod::Min,
+                _ => return Err(()),
+            };
+            let precision = match pooling_def.precision() {
+                schema::Precision::INT8 => PoolingPrecision::Int8,
+                schema::Precision::FP16 => PoolingPrecision::Fp16,
+                // A pool has no weights and no requantization, so the
+                // accumulator precision has nothing to mean here.
+                _ => return Err(()),
+            };
+            let padded = pooling_def.pad_left()
+                | pooling_def.pad_top()
+                | pooling_def.pad_right()
+                | pooling_def.pad_bottom()
+                != 0;
+            // The fill value is derived, never carried -- and where no
+            // measurement says what it should be, a *padded* pool is
+            // refused rather than filled with a plausible guess. An
+            // unpadded pool never reads the field.
+            let pad_value = match (method.pad_fill_value(precision), padded) {
+                (Some(value), _) => value,
+                (None, false) => 0,
+                (None, true) => return Err(()),
+            };
+            let shape_template = PoolingShape {
+                input_width: pooling_def.input_width(),
+                input_height: pooling_def.input_height(),
+                input_channels: pooling_def.channels(),
+                output_width: pooling_def.output_width(),
+                output_height: pooling_def.output_height(),
+                output_channels: pooling_def.channels(),
+                precision,
+                kernel_width: pooling_def.kernel_width(),
+                kernel_height: pooling_def.kernel_height(),
+                stride_x: pooling_def.stride_x(),
+                stride_y: pooling_def.stride_y(),
+                method,
+                pad_left: pooling_def.pad_left(),
+                pad_top: pooling_def.pad_top(),
+                pad_right: pooling_def.pad_right(),
+                pad_bottom: pooling_def.pad_bottom(),
+                pad_value,
+            };
+            let mut runtime_dimensions = Vec::new();
+            if let Some(dimensions) = pooling_def.runtime_dimensions() {
+                for dimension in dimensions.iter() {
+                    runtime_dimensions.push(match dimension {
+                        schema::PoolingDimension::INPUT_WIDTH => {
+                            RuntimePoolingDimension::InputWidth
+                        }
+                        schema::PoolingDimension::INPUT_HEIGHT => {
+                            RuntimePoolingDimension::InputHeight
+                        }
+                        schema::PoolingDimension::CHANNELS => RuntimePoolingDimension::Channels,
+                        schema::PoolingDimension::KERNEL_WIDTH => {
+                            RuntimePoolingDimension::KernelWidth
+                        }
+                        schema::PoolingDimension::KERNEL_HEIGHT => {
+                            RuntimePoolingDimension::KernelHeight
+                        }
+                        schema::PoolingDimension::STRIDE_X => RuntimePoolingDimension::StrideX,
+                        schema::PoolingDimension::STRIDE_Y => RuntimePoolingDimension::StrideY,
+                        _ => return Err(()),
+                    });
+                }
+            }
+            let executable = PoolingExecutable {
+                shape_template,
+                runtime_dimensions,
+            };
+            executable.validate_template().map_err(|_| ())?;
+            Ok(UkernelShape::Pooling(executable))
         }
         _ => Err(()),
     }
+}
+
+/// Shared by `MatmulDef` and the deprecated `FullyConnectedDef`, which carry
+/// identical fields.
+#[allow(clippy::too_many_arguments)]
+fn decode_matmul_shape(
+    m: u32,
+    k: u32,
+    n: u32,
+    precision: schema::Precision,
+    input_zero_point: u32,
+    output_zero_point: u32,
+    weights_zero_point: u32,
+    input_scale: f32,
+    weights_scale: f32,
+    output_scale: f32,
+    activation: schema::Activation,
+    activation_cmp: u32,
+) -> Result<fc::Shape, ()> {
+    let precision = decode_precision(
+        precision,
+        input_zero_point,
+        output_zero_point,
+        weights_zero_point,
+        input_scale,
+        weights_scale,
+        output_scale,
+    )?;
+    if precision.writes_accumulators() {
+        // The exact accumulator path is hardware-validated for Conv2D only;
+        // this lowering has separate output packing.
+        return Err(());
+    }
+    let activation = decode_activation(activation, activation_cmp)?;
+    // A dynamic executable states zeros here and fills them from push
+    // constants, so an all-zero template is legal at this point;
+    // `MatmulExecutable::validate_template` is what decides whether the
+    // zeros were declared. `fc::Shape` is built as a literal rather than
+    // through `fc::Shape::new` for that reason -- the constructor validates
+    // eagerly, which a template cannot satisfy.
+    Ok(fc::Shape {
+        m,
+        k,
+        n,
+        precision,
+        activation,
+    })
 }
 
 /// What every `iree_hal_executable_cache_t*` this driver hands out
@@ -389,29 +540,17 @@ unsafe extern "C" fn prepare_executable(
         return status::ok();
     }
 
+    // Tag 1 was a hardcoded 4x4 pooling shape, and the only thing that had
+    // ever built a `UkernelShape::Pooling`. It was never hardware-validated
+    // -- its own comment said so -- and the CTS test it existed for
+    // (`cts/pooling_dispatch_test.cc`) is gone. `PoolingDef` in the RKT1
+    // schema replaces it, so this refuses rather than falling through to the
+    // conv default below and silently handing back a convolution.
+    if tag == 1 {
+        return status::from_code(crate::bindings::iree_status_code_e_IREE_STATUS_INVALID_ARGUMENT);
+    }
+
     let shape = match tag {
-        1 => UkernelShape::Pooling(PoolingShape {
-            // NOT hardware-validated -- see iree-rocket-hal's
-            // PoolingPlan module documentation and
-            // cts/pooling_dispatch_test.cc.
-            input_width: 4,
-            input_height: 4,
-            input_channels: 1,
-            output_width: 2,
-            output_height: 2,
-            output_channels: 1,
-            precision: PoolingPrecision::Int8,
-            kernel_width: 2,
-            kernel_height: 2,
-            stride_x: 2,
-            stride_y: 2,
-            method: PoolingMethod::Max,
-            pad_left: 0,
-            pad_top: 0,
-            pad_right: 0,
-            pad_bottom: 0,
-            pad_value: 0,
-        }),
         2 => UkernelShape::Conv2d(Conv2dExecutable::new_static(
             conv::Shape {
                 // Same geometry as tag 0's validated int8 shape, but
@@ -734,13 +873,414 @@ mod tests {
         assert!(decode_flatbuffer_shape(&data[..data.len() - 1]).is_err());
     }
 
+    fn wrap_executable(builder: flatbuffers::FlatBufferBuilder) -> Vec<u8> {
+        let flatbuffer = builder.finished_data();
+        let mut data = vec![0u8; IREE_FLATBUFFER_HEADER_SIZE];
+        data[0..4].copy_from_slice(b"RKT1");
+        data[8..16].copy_from_slice(&(flatbuffer.len() as u64).to_le_bytes());
+        data.extend_from_slice(flatbuffer);
+        data
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn encode_pooling_executable(
+        method: schema::PoolingMethod,
+        precision: schema::Precision,
+        input: (u32, u32),
+        channels: u32,
+        output: (u32, u32),
+        kernel: (u32, u32),
+        stride: (u32, u32),
+        pad: [u32; 4],
+        dimensions: &[schema::PoolingDimension],
+    ) -> Vec<u8> {
+        let mut builder = flatbuffers::FlatBufferBuilder::new();
+        let runtime_dimensions =
+            (!dimensions.is_empty()).then(|| builder.create_vector(dimensions));
+        let name = builder.create_string("rocket_pooling_0");
+        let pooling = schema::PoolingDef::create(
+            &mut builder,
+            &schema::PoolingDefArgs {
+                input_width: input.0,
+                input_height: input.1,
+                channels,
+                output_width: output.0,
+                output_height: output.1,
+                kernel_width: kernel.0,
+                kernel_height: kernel.1,
+                stride_x: stride.0,
+                stride_y: stride.1,
+                pad_left: pad[0],
+                pad_top: pad[1],
+                pad_right: pad[2],
+                pad_bottom: pad[3],
+                method,
+                precision,
+                runtime_dimensions,
+            },
+        );
+        let export = schema::ExportDef::create(
+            &mut builder,
+            &schema::ExportDefArgs {
+                name: Some(name),
+                kernel_type: schema::KernelDef::PoolingDef,
+                kernel: Some(pooling.as_union_value()),
+            },
+        );
+        let exports = builder.create_vector(&[export]);
+        let executable = schema::ExecutableDef::create(
+            &mut builder,
+            &schema::ExecutableDefArgs {
+                exports: Some(exports),
+            },
+        );
+        schema::finish_executable_def_buffer(&mut builder, executable);
+        wrap_executable(builder)
+    }
+
+    fn encode_matmul_executable(
+        m: u32,
+        k: u32,
+        n: u32,
+        dimensions: &[schema::MatmulDimension],
+    ) -> Vec<u8> {
+        let mut builder = flatbuffers::FlatBufferBuilder::new();
+        let runtime_dimensions =
+            (!dimensions.is_empty()).then(|| builder.create_vector(dimensions));
+        let name = builder.create_string("rocket_matmul_0");
+        let matmul = schema::MatmulDef::create(
+            &mut builder,
+            &schema::MatmulDefArgs {
+                m,
+                k,
+                n,
+                precision: schema::Precision::FP16,
+                runtime_dimensions,
+                ..Default::default()
+            },
+        );
+        let export = schema::ExportDef::create(
+            &mut builder,
+            &schema::ExportDefArgs {
+                name: Some(name),
+                kernel_type: schema::KernelDef::MatmulDef,
+                kernel: Some(matmul.as_union_value()),
+            },
+        );
+        let exports = builder.create_vector(&[export]);
+        let executable = schema::ExecutableDef::create(
+            &mut builder,
+            &schema::ExecutableDefArgs {
+                exports: Some(exports),
+            },
+        );
+        schema::finish_executable_def_buffer(&mut builder, executable);
+        wrap_executable(builder)
+    }
+
+    fn pooling_of(data: &[u8]) -> PoolingExecutable {
+        match decode_flatbuffer_shape(data).expect("pooling executable must decode") {
+            UkernelShape::Pooling(executable) => executable,
+            _ => panic!("expected Pooling"),
+        }
+    }
+
+    /// MobileNetV2's global average pool, the shape this table was added for.
+    /// The cross-language gate `rocket-schema/docs/compatibility.md` asks
+    /// for: a fixture the **C++ compiler actually produced**, read by the
+    /// Rust runtime. Hand-built FlatBuffers above prove this decoder is
+    /// self-consistent; only a producer artifact proves the two ends agree.
+    ///
+    /// Regenerate with:
+    ///
+    ///     iree-compile rocket-compiler-plugin/test/rocket_pooling.mlir \
+    ///       --compile-mode=hal-executable -o rocket-schema/testdata/mnv2_pooling.rkt1
+    #[test]
+    fn decodes_the_compiler_produced_pooling_fixture() {
+        let data = include_bytes!(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/../rocket-schema/testdata/mnv2_pooling.rkt1"
+        ));
+        let UkernelShape::Pooling(executable) = decode_flatbuffer_shape(data).unwrap() else {
+            panic!("expected Pooling");
+        };
+        let shape = executable.shape_template;
+        assert_eq!((shape.input_width, shape.input_height), (7, 7));
+        assert_eq!(shape.input_channels, 1792);
+        assert_eq!((shape.kernel_width, shape.kernel_height), (7, 7));
+        assert_eq!(shape.method, PoolingMethod::Avg);
+        assert_eq!(shape.precision, PoolingPrecision::Fp16);
+        assert_eq!(shape.pad_value, 0);
+        assert!(executable.runtime_dimensions.is_empty());
+    }
+
+    /// The same, for the classifier matmul -- and it doubles as the check
+    /// that `MAX_INPUT_CHANNELS` really did reach 1792, since a K of 1792
+    /// goes through `validate_conv_shape` on the way in.
+    ///
+    ///     iree-compile rocket-compiler-plugin/test/rocket_matmul.mlir \
+    ///       --compile-mode=hal-executable -o rocket-schema/testdata/mnv2_matmul.rkt1
+    #[test]
+    fn decodes_the_compiler_produced_matmul_fixture() {
+        let data = include_bytes!(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/../rocket-schema/testdata/mnv2_matmul.rkt1"
+        ));
+        let UkernelShape::Matmul(executable) = decode_flatbuffer_shape(data).unwrap() else {
+            panic!("expected Matmul");
+        };
+        let shape = executable.shape_template;
+        assert_eq!((shape.m, shape.k, shape.n), (1, 1792, 1001));
+        assert_eq!(shape.precision, Precision::Fp16);
+        assert!(executable.runtime_dimensions.is_empty());
+    }
+
+    #[test]
+    fn decodes_pooling_flatbuffer() {
+        let executable = pooling_of(&encode_pooling_executable(
+            schema::PoolingMethod::AVG,
+            schema::Precision::FP16,
+            (7, 7),
+            1792,
+            (1, 1),
+            (7, 7),
+            (1, 1),
+            [0; 4],
+            &[],
+        ));
+        let shape = executable.shape_template;
+        assert_eq!((shape.input_width, shape.input_height), (7, 7));
+        assert_eq!(shape.input_channels, 1792);
+        assert_eq!(shape.output_channels, shape.input_channels);
+        assert_eq!((shape.output_width, shape.output_height), (1, 1));
+        assert_eq!(shape.method, PoolingMethod::Avg);
+        assert_eq!(shape.precision, PoolingPrecision::Fp16);
+        assert_eq!(shape.pad_value, 0);
+    }
+
+    /// The fill value is derived, never carried: a padded fp16 max pool gets
+    /// -inf without the producer having any say in it.
+    #[test]
+    fn derives_the_padded_max_pool_fill_value() {
+        let executable = pooling_of(&encode_pooling_executable(
+            schema::PoolingMethod::MAX,
+            schema::Precision::FP16,
+            (8, 8),
+            32,
+            (4, 4),
+            (3, 3),
+            (2, 2),
+            [1, 1, 1, 1],
+            &[],
+        ));
+        assert_eq!(executable.shape_template.pad_value, 0xFC00);
+    }
+
+    /// And where no measurement says what the fill should be, a padded pool
+    /// is refused rather than filled with a plausible guess. Unpadded is
+    /// fine: nothing reads the field.
+    #[test]
+    fn refuses_padded_pooling_with_an_unmeasured_fill_value() {
+        let padded_int8_max = encode_pooling_executable(
+            schema::PoolingMethod::MAX,
+            schema::Precision::INT8,
+            (8, 8),
+            32,
+            (4, 4),
+            (3, 3),
+            (2, 2),
+            [1, 1, 1, 1],
+            &[],
+        );
+        assert!(decode_flatbuffer_shape(&padded_int8_max).is_err());
+
+        let padded_min = encode_pooling_executable(
+            schema::PoolingMethod::MIN,
+            schema::Precision::FP16,
+            (8, 8),
+            32,
+            (4, 4),
+            (3, 3),
+            (2, 2),
+            [1, 1, 1, 1],
+            &[],
+        );
+        assert!(decode_flatbuffer_shape(&padded_min).is_err());
+
+        let unpadded_min = encode_pooling_executable(
+            schema::PoolingMethod::MIN,
+            schema::Precision::FP16,
+            (8, 8),
+            32,
+            (4, 4),
+            (2, 2),
+            (2, 2),
+            [0; 4],
+            &[],
+        );
+        assert_eq!(pooling_of(&unpadded_min).shape_template.pad_value, 0);
+    }
+
+    /// A static executable states its own output extents. They are not what
+    /// the runtime uses -- it derives them -- but a disagreement means the
+    /// two ends do not share a geometry model.
+    #[test]
+    fn refuses_pooling_whose_output_extent_disagrees() {
+        let wrong = encode_pooling_executable(
+            schema::PoolingMethod::AVG,
+            schema::Precision::FP16,
+            (7, 7),
+            32,
+            (2, 2),
+            (7, 7),
+            (1, 1),
+            [0; 4],
+            &[],
+        );
+        assert!(decode_flatbuffer_shape(&wrong).is_err());
+    }
+
+    #[test]
+    fn resolves_pooling_runtime_dimensions() {
+        let executable = pooling_of(&encode_pooling_executable(
+            schema::PoolingMethod::AVG,
+            schema::Precision::FP16,
+            (0, 0),
+            0,
+            (0, 0),
+            (0, 0),
+            (1, 1),
+            [0; 4],
+            &[
+                schema::PoolingDimension::INPUT_WIDTH,
+                schema::PoolingDimension::INPUT_HEIGHT,
+                schema::PoolingDimension::CHANNELS,
+                schema::PoolingDimension::KERNEL_WIDTH,
+                schema::PoolingDimension::KERNEL_HEIGHT,
+            ],
+        ));
+        let mut constants = Vec::new();
+        for value in [7u32, 7, 1792, 7, 7] {
+            constants.extend_from_slice(&value.to_ne_bytes());
+        }
+        let shape = executable.resolve_shape(&constants).expect("resolves");
+        assert_eq!((shape.input_width, shape.input_height), (7, 7));
+        // One wire field sets both, because pooling preserves channels.
+        assert_eq!(shape.input_channels, 1792);
+        assert_eq!(shape.output_channels, 1792);
+        // Derived, not carried.
+        assert_eq!((shape.output_width, shape.output_height), (1, 1));
+
+        assert!(executable.resolve_shape(&constants[..4]).is_err());
+        let mut zeroed = constants.clone();
+        zeroed[0..4].copy_from_slice(&0u32.to_ne_bytes());
+        assert!(executable.resolve_shape(&zeroed).is_err());
+    }
+
+    /// A dimension listed in the vector has to be zero in the table, and one
+    /// that is not listed has to be nonzero -- the same contract Conv2DDef
+    /// has, checked here because a pooling template can now break it.
+    #[test]
+    fn refuses_inconsistent_pooling_templates() {
+        let nonzero_runtime_field = encode_pooling_executable(
+            schema::PoolingMethod::AVG,
+            schema::Precision::FP16,
+            (7, 0),
+            0,
+            (0, 0),
+            (0, 0),
+            (1, 1),
+            [0; 4],
+            &[
+                schema::PoolingDimension::INPUT_WIDTH,
+                schema::PoolingDimension::INPUT_HEIGHT,
+                schema::PoolingDimension::CHANNELS,
+                schema::PoolingDimension::KERNEL_WIDTH,
+                schema::PoolingDimension::KERNEL_HEIGHT,
+            ],
+        );
+        assert!(decode_flatbuffer_shape(&nonzero_runtime_field).is_err());
+
+        let duplicate = encode_pooling_executable(
+            schema::PoolingMethod::AVG,
+            schema::Precision::FP16,
+            (0, 0),
+            32,
+            (0, 0),
+            (2, 2),
+            (2, 2),
+            [0; 4],
+            &[
+                schema::PoolingDimension::INPUT_WIDTH,
+                schema::PoolingDimension::INPUT_WIDTH,
+            ],
+        );
+        assert!(decode_flatbuffer_shape(&duplicate).is_err());
+    }
+
+    #[test]
+    fn decodes_matmul_flatbuffer() {
+        let shape = decode_flatbuffer_shape(&encode_matmul_executable(4, 32, 16, &[])).unwrap();
+        let UkernelShape::Matmul(executable) = shape else {
+            panic!("expected Matmul");
+        };
+        assert_eq!(
+            (
+                executable.shape_template.m,
+                executable.shape_template.k,
+                executable.shape_template.n
+            ),
+            (4, 32, 16)
+        );
+    }
+
+    #[test]
+    fn resolves_matmul_runtime_dimensions() {
+        let shape = decode_flatbuffer_shape(&encode_matmul_executable(
+            0,
+            0,
+            0,
+            &[
+                schema::MatmulDimension::M,
+                schema::MatmulDimension::K,
+                schema::MatmulDimension::N,
+            ],
+        ))
+        .unwrap();
+        let UkernelShape::Matmul(executable) = shape else {
+            panic!("expected Matmul");
+        };
+        let mut constants = Vec::new();
+        for value in [1u32, 1792, 1001] {
+            constants.extend_from_slice(&value.to_ne_bytes());
+        }
+        let resolved = executable.resolve_shape(&constants).expect("resolves");
+        assert_eq!((resolved.m, resolved.k, resolved.n), (1, 1792, 1001));
+
+        assert!(executable.resolve_shape(&constants[..8]).is_err());
+    }
+
+    /// The channel ceilings are runtime semantics, not wire format: the
+    /// schema round-trips a K the hardware cannot do, and this is what
+    /// refuses it.
+    #[test]
+    fn refuses_a_matmul_past_the_channel_ceiling() {
+        let too_wide = encode_matmul_executable(1, 4096, 64, &[]);
+        assert!(decode_flatbuffer_shape(&too_wide).is_err());
+    }
+
+    /// The deprecated table still decodes, and lands on the same runtime
+    /// shape `MatmulDef` does -- which is the whole reason there is one
+    /// variant rather than two.
     #[test]
     fn decodes_fully_connected_flatbuffer() {
         let shape = decode_flatbuffer_shape(&encode_fc_executable()).unwrap();
-        let UkernelShape::FullyConnected(shape) = shape else {
-            panic!("expected FullyConnected");
+        let UkernelShape::Matmul(executable) = shape else {
+            panic!("expected Matmul");
         };
+        let shape = executable.shape_template;
         assert_eq!((shape.m, shape.k, shape.n), (4, 32, 16));
         assert_eq!(shape.precision, Precision::Fp16);
+        assert!(executable.runtime_dimensions.is_empty());
     }
 }

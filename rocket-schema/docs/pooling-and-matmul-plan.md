@@ -426,9 +426,9 @@ fp16 conv offload already uses.
 
 | phase | content | gate |
 | --- | --- | --- |
-| 0 | `.fbs` additions, regenerate `rocket_executable_def_generated.rs`, extend `rocket-schema/tests/compiler_fixture.rs` round-trips | host tests; no behaviour change |
-| 1 | runtime decode arms + `pad_value` derivation + `UkernelShape::Matmul`; retire legacy tag 1 | `cts/`, driver unit tests |
-| 2 | `RocketTarget.cpp` config builders and serialization for both kernels | new lit tests under `rocket-compiler-plugin/test/` |
+| 0 | **DONE** -- `.fbs` additions, regenerated bindings, round-trip tests | 11 schema tests |
+| 1 | **DONE** -- runtime decode arms, derived pad fill, `UkernelShape::Matmul`, `PoolingExecutable`/`MatmulExecutable` with push constants, NC1HWC2 repack on both ends of a pool; legacy tag 1 retired | 32 driver tests |
+| 2 | **DONE** -- `RocketTarget.cpp` config builders and serialization for both kernels | 6 lit tests, plus two compiler-produced fixtures decoded by the Rust runtime |
 | 3 | transform-spec executables, dispatch helpers and matchers (avg-pool first, matmul second) | lit tests mirroring `rocket_fp16_match_boundaries.mlir` |
 | 4 | e2e on both MobileNetV2 models: pool and matmul each offloaded once | `tools/e2e_conv_regression.py`, top-1/top-5 + max\|err\| |
 | 5 | **DONE** -- `MAX_INPUT_CHANNELS` 1344 -> 1792 on the FC geometry | `fc_matmul_geometry_matches_oracle`, 20/20 on `planck` |
@@ -437,19 +437,34 @@ Phase 5 was the one that needed the board before the compiler work was worth
 anything, and it ran first for that reason: the matcher's `dim_bounds` are
 now written once, at a number that was measured rather than inferred.
 
-## Open decisions
+## Decisions taken
 
-1. **Dynamic or static pooling executables.** `runtime_dimensions` mirrors
-   the conv path and keeps the executable count at one per
-   `(method, precision)`; static executables are simpler but need a spec
-   edit per new pool geometry. Recommendation: dynamic, with kernel and
-   stride as push constants, padding staying an executable property (it is
-   0..=7 and interacts with method semantics).
-2. **Match the sum+div pair, or offload the sum-pool as AVG and leave a
-   compensating multiply on the CPU.** Recommendation: ship the second,
-   measure, then fuse.
-3. **Does `MatmulDef` carry a bias binding?** The conv path binds a
-   zero-filled bias today and MobileNetV2's bias add is a separate
-   `linalg.generic`. Folding it costs a fourth binding and a matcher that
-   claims two ops; leaving it costs one elementwise pass over 1001 floats.
-   Recommendation: leave it, revisit with the pool's `divf`.
+1. **Dynamic executables, both kernels** (2026-09-04). `runtime_dimensions`
+   mirrors the conv path, so one executable serves many shapes rather than
+   one per geometry. Padding stays an executable property: it is 0..=7, its
+   meaning depends on the method, and no measured model varies it per
+   dispatch. Output extents are *derived* by the runtime, never carried --
+   a dynamic pool has none to state and a static one is checked against its
+   own claim.
+2. **No bias binding on `MatmulDef`** (2026-09-04). The lowering binds a
+   zero-filled bias as the conv path already does, and MobileNetV2's `addf`
+   stays on the CPU: one elementwise pass over 1001 floats, against a fourth
+   binding and a matcher that would have to claim two ops from the start.
+   Revisit together with the pool's `divf`.
+
+## Still open
+
+**Match the sum+div pair, or offload the sum-pool as AVG and leave a
+compensating multiply on the CPU.** Unchanged recommendation: ship the
+second, measure, then fuse. This is a Phase 3 decision and nothing in the
+schema or the runtime forecloses either.
+
+**Pooling has no hardware test in this repo.** `pooling.rs` is
+capture-derived with unit tests against those captures, and its own module
+doc points at a standalone hardware suite that was retired; the only thing
+that ever built a `UkernelShape::Pooling` was the legacy tag this branch
+removed, whose shape was explicitly *not* hardware-validated. So the PPU
+path is now reachable end to end and still unproven on silicon. A
+`pooling_hw.rs` oracle -- max/avg/min against a CPU reference, at a handful
+of shapes including MobileNetV2's 7x7 -- belongs before Phase 4 and
+arguably before Phase 3.
