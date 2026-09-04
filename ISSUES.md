@@ -1112,6 +1112,61 @@ Also worth revisiting now: the depthwise mix case
 (`fp16-depthwise-int8-mix-corrupts`, `mixed_int8_then_depthwise` in the e2e
 gate) is the same boundary and should clear under the same dwell.
 
+### Reproduced at the HAL level, 2026-09-04: the state is per core, and it is the int32 writer
+
+`iree-rocket-hal/tests/c8_precision_transition_hw.rs` is the raw-plan
+reproduction the memories said had failed. It prepares, packs and
+cache-syncs every job before an arm starts, submits aggressors and victim
+back to back with the gap under its control, records every core's
+`runtime_status` right before the victim submit, and attributes each job to
+a core from the `/proc/interrupts` deltas. All verdicts are computed after
+the victim's fence. Every arm below ran 2-3 trials on planck and was
+consistent [verified]:
+
+| arm | victim landed on | result |
+|---|---|---|
+| three `Int8Accumulator` aggressors (c0, c1, c0), then `k1` | c0 or c1 | **hung 3/3** |
+| same, victim `px33` / `bigout` | | **hung** |
+| same, victim `bigin` (128 KiB fp16 out) | c1 | clean 3/3 |
+| same, 30 ms sleep first (cores still `active`) | | **hung 2/2** |
+| same, 150 ms sleep first (cores read `suspended`) | | clean 2/2 |
+| same, poll until every core `suspended` (took ~61 ms) | | clean 2/2 |
+| **one** aggressor on c0, then `k1` submitted four times | c1, then **c0** | clean, then **hung** on the c0 repeat, 3/3 |
+| one aggressor on c0, then the stem three times | c1, then **c0** | clean, then **hung**, 3/3 |
+| same three shapes as requantized `Int8` (one-byte out), then `k1` x4 | c0 and c1 both | clean 2/2 |
+| same three shapes as `Fp16`, then `k1` x4 | c0 and c1 both | clean 2/2 |
+| `k1` alone | | clean |
+
+So:
+
+* **The "dose" was placement.** `drm_sched` alternates an idle entity
+  between cores. One int32-output job poisons *the core it ran on*; a wide
+  fp16 job hangs when, and only when, it lands there. "One aggressor is not
+  enough for `k1`" and "the stem hangs on its 4th submission" in the IREE
+  probe were the victim being scheduled onto the clean core first.
+* **It is the int32 output writer specifically.** The same shapes with a
+  one-byte output (`Precision::Int8`) or as fp16 poison nothing on either
+  core. On RK3588 the fp16 writer is not a poisoner, unlike the RK3576.
+* **The victim size threshold is real and independent** of placement.
+* **The core's runtime suspend is what clears it**, consistent with the
+  notes: with the cores still active nothing clears it, and once they read
+  `suspended` the same job is clean.
+
+**What this does to the fix.** The requantized int8 path is a complete
+structural fix: a model whose int8 convolutions emit one-byte output never
+creates the state. Where the int32 accumulator is wanted (bit-exact
+dequant on the host), the driver has to make sure no core that ran an
+`Int8Accumulator` job since its last suspend receives a wide fp16 job --
+and it cannot choose the core, so that reduces to "every core suspended
+before the first wide fp16 dispatch after an int32 one", which is what
+`ROCKET_PM_DWELL=suspend ROCKET_PM_DWELL_AT=transition` already does. The
+cheaper version is to drive the suspend (write `autosuspend_delay_ms=0`,
+poll, restore), which needs write access to the sysfs file.
+
+The test asserts the predictions above, so a change in the hardware's
+behaviour, or a driver that stops needing the dwell, shows up as a failed
+expectation rather than a silent improvement.
+
 ---
 
 ## C9 (S2) — above 3x3 the conv path has two faults the fp16 capture sweep could not have seen: a `Cin` cliff that hangs at every width, and an int8 program that computes wrong values at every shape
@@ -1933,7 +1988,9 @@ were meant to enable found two larger things, and both are now at the top.
    dwell at the `Int8Accumulator -> fp16` boundary makes every repro and the
    full int8 benchmark loop clean, bit-identical. What remains is turning the
    diagnostic dwell into a fix that costs less than an autosuspend period
-   (see the C8 options list), then re-taking the int8 numbers.
+   (see the C8 options list), then re-taking the int8 numbers. The HAL-level
+   test then showed the state is per core and that the requantized int8-out
+   path never creates it, which makes that path the structural fix.
 2. **M4** — already established; what remains is to stop using the NCHW
    baseline. Cheap, and it is the precondition for any offload decision being
    meaningful.
