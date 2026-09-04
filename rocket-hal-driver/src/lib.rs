@@ -46,6 +46,7 @@ pub mod executable_cache;
 pub mod file;
 pub mod profile;
 pub mod semaphore;
+pub mod weight_cache;
 
 /// Mirrors `iree_hal_null_driver_module_register()`'s C ABI signature
 /// exactly -- the name a CMake `IREE_EXTERNAL_ROCKET_HAL_DRIVER_REGISTER`

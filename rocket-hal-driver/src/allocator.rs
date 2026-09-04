@@ -242,6 +242,7 @@ unsafe extern "C" fn allocate_buffer(
         host_ptr: raw.host_ptr,
         fd: alloc.file.as_raw_fd(),
         deallocated: std::sync::atomic::AtomicBool::new(false),
+        generation: crate::weight_cache::Generation::default(),
     });
     let buffer_ptr = Box::into_raw(buffer);
 

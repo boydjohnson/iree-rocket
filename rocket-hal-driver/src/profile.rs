@@ -386,6 +386,24 @@ pub fn report() {
         },
     );
 
+    // How much of `pack.weights` above was avoided rather than paid. A run
+    // with no hits is the first inference of a process (there is no
+    // within-inference reuse: every dispatch has different filters); a later
+    // one with misses still in it has had something write a weight binding.
+    let cache = crate::weight_cache::stats();
+    if cache.hits + cache.misses_absent + cache.misses_stale > 0 {
+        eprintln!(
+            "  weight cache: {} hit, {} miss (new), {} miss (rewritten), {} refused (recorded \
+             writer), {} refused (budget), {:.1} MiB peak",
+            cache.hits,
+            cache.misses_absent,
+            cache.misses_stale,
+            cache.recorded_writers,
+            cache.over_budget,
+            cache.peak_bytes as f64 / (1024.0 * 1024.0),
+        );
+    }
+
     // Per-op: which dispatch shapes the time is in, and for each, how it
     // splits between hardware and the host-side layout bridging around it.
     let columns: Vec<Phase> = Phase::ALL

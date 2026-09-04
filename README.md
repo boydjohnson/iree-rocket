@@ -209,6 +209,18 @@ The `outside` row is time spent outside this driver entirely (the CPU
 dispatches), so the two halves of a mixed model can be compared directly.
 See ISSUES.md's P6 for the MobileNetV2 fp16 numbers and what they say.
 
+Packed coefficients are cached across inferences (once per weight binding and
+geometry rather than once per dispatch), which is worth 1.47x on MobileNetV2
+fp16 in `iree-benchmark-module`. The report's `weight cache` line says how well
+it is working; `rocket-hal-driver/src/weight_cache.rs` documents why a reuse is
+safe. Three knobs:
+
+| Variable | Effect |
+|---|---|
+| `ROCKET_WEIGHT_CACHE=0` | Disable; pack on every dispatch, as before. |
+| `ROCKET_WEIGHT_CACHE=verify` | Pack anyway on a hit and compare against the cached bytes the regcmd reads, failing loudly on any difference. |
+| `ROCKET_WEIGHT_CACHE_MB=N` | Byte budget, default 256 MiB. |
+
 ## Board convolution regression gate
 
 The convolution regression command checks the low-level ConvPlan/NPU path and

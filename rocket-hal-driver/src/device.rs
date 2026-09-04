@@ -511,6 +511,9 @@ unsafe extern "C" fn destroy(device: *mut iree_hal_device_t) {
     // and also runs from an `atexit` hook, for the hosts that never destroy
     // their device.
     crate::profile::report();
+    // Cached packings hold a copy of this device's DRM fd -- see
+    // `weight_cache::clear`.
+    crate::weight_cache::clear();
     unsafe {
         let d = &*cast(device);
         crate::bindings::iree_hal_allocator_release(d.device_allocator);
@@ -1919,6 +1922,10 @@ unsafe extern "C" fn queue_execute(
                                 iree_status_code_e_IREE_STATUS_INTERNAL,
                             );
                         }
+                        // The one write to an IREE buffer that does not go
+                        // through a mapping, so the one the packed-coefficient
+                        // cache's generation has to be told about explicitly.
+                        unsafe { crate::buffer::note_write(oc.output_buffer) };
                         crate::profile::stop(
                             compact_timer,
                             crate::profile::Phase::Compact,

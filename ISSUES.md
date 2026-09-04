@@ -1307,7 +1307,7 @@ list as untested.
 
 ---
 
-## P6 (S2) — measured: MobileNetV2 fp16 spends 8% of its time on the NPU and 30% repacking constant weights
+## P6 (S2, item 1 DONE) — measured: MobileNetV2 fp16 spent 8% of its time on the NPU and 30% repacking constant weights
 
 `ROCKET_PROFILE=1` (`rocket-hal-driver/src/profile.rs`) times every phase of a
 dispatch's life separately and prints per-phase and per-op tables at exit.
@@ -1363,6 +1363,70 @@ lives), this says which part of the dispatch path:
 Run-to-run spread is large (`pack.weights` measured 99 and 165 ms in two
 consecutive runs) — planck is `ondemand` with a 408 MHz A76 floor, see M1.
 Compare totals within one run, and do not quote a single run's absolute number.
+
+### Item 1 DONE 2026-09-04: packed coefficients are cached, 1.47x end to end
+
+`rocket-hal-driver/src/weight_cache.rs` caches the packed GEM buffer per
+(weight binding, geometry), so the coefficient transform runs once instead of
+once per dispatch per inference. There is no within-inference reuse to be had —
+MobileNetV2's 36 weight-bearing dispatches all have different filters — so the
+win is from the second inference onward, which is what a benchmark loop or a
+served model does. `iree-benchmark-module`, `mnv2.fp16.vmfb`, 20 iterations,
+two runs each:
+
+```text
+  ROCKET_WEIGHT_CACHE=0    326 ms    307 ms   per inference
+  ROCKET_WEIGHT_CACHE=1    208 ms    222 ms
+```
+
+1.47x, and the logits are bit-identical between the two modes on both the fp16
+and the int8 model. The full `tools/e2e_conv_regression.py --board planck` gate
+passes, with C8's known non-gating failure unchanged.
+
+Three things establish that a hit is safe, and `weight_cache`'s module comment
+carries the argument in full: the key names the source `iree_hal_buffer_t*` and
+`buffer::destroy` forgets its entries, so no recycled address inherits them; a
+generation counter on `RocketBuffer` is bumped by every write this driver can
+observe (`buffer::unmap_range` for every host write — every `queue_*` op,
+command-buffer op and `iree_hal_file_read` reduces to one — plus the output
+compaction, which writes `host_ptr` directly), and an entry only hits at the
+generation it was packed at; and a hit is refused outright if the same command
+buffer already records a write to the weight binding, which is the case
+deferred packing exists for and the one the generation counter cannot see yet.
+
+`ROCKET_WEIGHT_CACHE=verify` re-packs on every hit into a private buffer and
+compares it against the buffer the regcmd actually points at, so a missed
+generation bump or an under-specified key fails loudly instead of quietly
+changing results. 20 iterations x 36 dispatches = 720 verified packings, no
+mismatch. `ROCKET_WEIGHT_CACHE=0` restores the old behaviour for A/B.
+
+### What is left, measured after the fix
+
+10 iterations with the cache on, per inference:
+
+```text
+  outside      102 ms      the CPU half (the 17 depthwise convs)
+  compact       40 ms      DPU atomic slots -> dense IREE buffer
+  pack.weights  50 ms      almost entirely the classifier matmul, see below
+  pack.input    17 ms
+  record        15 ms
+  wait.npu      24 ms      9.7% of wall
+```
+
+**The classifier matmul misses the cache every single inference**, and it is
+now the largest remaining pack cost: 278 ms of `pack.weights` across 10
+iterations, 27.8 ms each. The counters say why — 45 misses, *all* of them
+`miss (new)` and none `miss (rewritten)`. A rewritten constant would show as
+stale; a brand-new key every inference means the binding is a **different
+buffer** each time, i.e. IREE materializes the `[1792, 1001]` classifier
+weights fresh per inference rather than handing over the constant. That is a
+compiler-side cost (it is also CPU work inside `outside`), not a cache that is
+failing. Two ways out: get the transposed constant folded so the binding is a
+real constant, or give the cache a content-hash fallback for bindings whose
+identity is not stable. The first is strictly better if it is available.
+
+With that one dispatch fixed, `compact` becomes the largest host item and the
+NC1HWC2 round trip (P2) is the whole remaining story.
 
 ---
 
@@ -1431,8 +1495,9 @@ were meant to enable found two larger things, and both are now at the top.
    increasing order of work. This is where the offload deficit actually lives:
    a like-for-like CPU build is 2.5x faster than the best NPU configuration, so
    the per-dispatch and per-tile taxes are the whole game. P6 now measures that
-   stack rather than reasoning about it, and puts a cached packed-weight
-   scratch first: 34% of host time, for data that never changes.
+   stack rather than reasoning about it; its packed-coefficient cache is landed
+   and worth 1.47x end to end, and what it leaves behind is the classifier
+   matmul's per-inference re-materialization and then the NC1HWC2 round trip.
 4. **C2** — small fix, plus a probe that settles a question the notes leave open.
 5. **M2** — ~1.43x on the device half, but it needs a driver-side
    `clk_set_rate` and both shortcuts hang the box.

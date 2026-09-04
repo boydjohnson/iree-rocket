@@ -53,6 +53,11 @@ pub struct RocketBuffer {
     /// instead of silently succeeding against memory the caller has already
     /// been told is gone.
     pub deallocated: std::sync::atomic::AtomicBool,
+    /// Bumped on every write this driver can observe -- see
+    /// `weight_cache`'s "Why a hit is safe". The packed-coefficient cache
+    /// keys reuse on it, so a write that does not bump it is a correctness
+    /// bug in that cache, not just a stale statistic.
+    pub generation: crate::weight_cache::Generation,
 }
 
 unsafe fn cast(buffer: *mut iree_hal_buffer_t) -> *mut RocketBuffer {
@@ -68,6 +73,21 @@ pub unsafe fn is_deallocated(buffer: *mut iree_hal_buffer_t) -> bool {
             .deallocated
             .load(std::sync::atomic::Ordering::Acquire)
     }
+}
+
+/// The buffer's current write generation, for `weight_cache` keys.
+pub unsafe fn generation(buffer: *mut iree_hal_buffer_t) -> u64 {
+    unsafe { (*cast(buffer)).generation.current() }
+}
+
+/// Records that the buffer's contents have changed.
+///
+/// Called from `unmap_range` for every host write, and directly from
+/// `device::queue_execute`'s output compaction, which writes `host_ptr`
+/// without going through a mapping. Those are the only two ways bytes in an
+/// IREE buffer change; a third would need a call here too.
+pub unsafe fn note_write(buffer: *mut iree_hal_buffer_t) {
+    unsafe { (*cast(buffer)).generation.bump() }
 }
 
 pub unsafe fn mark_deallocated(buffer: *mut iree_hal_buffer_t) {
@@ -86,6 +106,9 @@ unsafe extern "C" fn recycle(buffer: *mut iree_hal_buffer_t) {
 }
 
 unsafe extern "C" fn destroy(buffer: *mut iree_hal_buffer_t) {
+    // Before the allocation goes away, so no later buffer landing on this
+    // address can inherit its packed coefficients -- see `weight_cache`.
+    crate::weight_cache::forget(buffer);
     let buffer = unsafe { Box::from_raw(cast(buffer)) };
     // The permanent CPU mapping and the DRM file's GEM handle hold
     // independent references to the allocation. Release both; dropping only
@@ -155,8 +178,16 @@ unsafe extern "C" fn unmap_range(
     // every caller, not just this one -- and is a no-op (one extra
     // already-cheap FINI_BO ioctl) for the callers that already flush
     // explicitly themselves.
+    //
+    // This is also the one place every host write to an IREE buffer passes
+    // through -- `iree_hal_buffer_map_fill`/`_write`/`_copy`, and therefore
+    // the command-buffer ops, the device `queue_*` ops and
+    // `iree_hal_file_read`, all reduce to a write mapping ending here -- so
+    // it is where the packed-coefficient cache's generation is bumped. Same
+    // condition, same reason: bytes changed.
     let allowed_access = unsafe { (*mapping).impl_.allowed_access };
     if allowed_access & (iree_hal_memory_access_bits_t_IREE_HAL_MEMORY_ACCESS_WRITE as u16) != 0 {
+        unsafe { note_write(buffer) };
         let rb = unsafe { &*cast(buffer) };
         if unsafe { device::fini_bo(rb.fd, rb.handle) }.is_err() {
             return status::from_code(crate::bindings::iree_status_code_e_IREE_STATUS_INTERNAL);
