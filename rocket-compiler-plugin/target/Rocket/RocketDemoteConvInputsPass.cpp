@@ -55,17 +55,26 @@
 // broadcasting one. Dropping them would rebuild a transposed matmul as an
 // untransposed one -- the same silent miscompile the strides bug was.
 //
-// Depthwise was tried and reverted 2026-09-01. Demoting it does let three of
-// MobileNetV2's stride-2 depthwise convolutions match (18 -> 21 offloaded
-// dispatch sites), but the resulting model is *wrong*: max|err| 3.5 on the
-// logits with top-1 incorrect on every input measured, against 0.36 for the
-// same f16 demotion run entirely on the CPU. It is not the convolutions --
-// each of the three is exact to f16 epsilon in isolation, with and without a
-// tensor.pad producer, and two of them sharing one dynamic executable is
-// exact too. Bisecting by channel bound, offloading the 144-channel one
-// alone is fine and adding the 192-channel one breaks it, so it is an
-// interaction inside the full model that none of those isolations reproduce.
-// See also the HAL's own depthwise gaps, which predate this.
+// Depthwise was tried and reverted 2026-09-01, and the reason has since been
+// narrowed twice. Demoting it does let three of MobileNetV2 **static-int8**'s
+// stride-2 depthwise convolutions match (18 -> 21 offloaded dispatch sites),
+// and that model is then *wrong*: max|err| 3.5 on the logits with top-1
+// incorrect on every input measured, against 0.36 for the same f16 demotion
+// run entirely on the CPU. It is not the convolutions -- each of the three is
+// exact to f16 epsilon in isolation, with and without a tensor.pad producer,
+// and two of them sharing one dynamic executable is exact too. Bisecting by
+// channel bound, offloading the 144-channel one alone is fine and adding the
+// 192-channel one breaks it. That is a command buffer mixing fp16 depthwise
+// with int8 dispatches, which is ISSUES.md C8, not a property of depthwise.
+//
+// On the plain fp16 model it is correct: 44 sites against 37, max|err| 0.0500
+// vs 0.0192 on a CPU f32 reference, top-1 and top-5 stable, byte-identical
+// over five consecutive runs (measured 2026-09-04). It is simply *slower* --
+// 186 ms against 148 -- because a depthwise convolution is the cheapest op in
+// the model per byte moved and loses to the per-dispatch layout round trip.
+// ISSUES.md P7 has the full accounting and what would change it. So this is
+// still the right default, but for a performance reason on one model and a
+// correctness reason on the other; do not read it as "depthwise is broken".
 //
 // Anything left alone is safe: an op that stays f32 fails the matchers' f16
 // typing and goes to the CPU, and RocketPromoteUnclaimedConvInputsPass gives

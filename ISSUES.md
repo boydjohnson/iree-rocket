@@ -403,8 +403,8 @@ because ConvPlan predicted 1/11 against the vendor's 6/6, 5/7, 4/8, 4/8 at Cin
 **Audit: 18 → 35 sites, zero dense convolutions left on the CPU.** The
 depthwise ones stay, and *not* because of a channel cap: `RocketDemoteConvInputsPass`
 deliberately excludes depthwise (reverted 2026-09-01, max\|err\| 3.5), so fp16
-depthwise never reaches Rocket at all. That is a separate open bug, untouched
-here. The fp16 depthwise matcher caps were therefore left at 512 rather than
+depthwise never reaches Rocket at all. That is P7 — and the 3.5 turns out to
+have been the static-int8 model, not this one. The fp16 depthwise matcher caps were therefore left at 512 rather than
 raised into a path nothing can reach.
 
 **Accuracy is fine.** Against a CPU-only aarch64 build: 18 sites max\|err\|
@@ -1360,9 +1360,8 @@ lives), this says which part of the dispatch path:
    lever, and unlike the weights it needs the cross-dispatch layout
    propagation P2 is about.
 4. **`outside` 107 ms (33%)** is everything that is not this driver — the CPU
-   dispatches, dominated by the 17 depthwise convolutions
-   (`depthwise-hal-gap`). Offloading more of the model attacks this number and
-   nothing above it.
+   dispatches, dominated by the 17 depthwise convolutions (P7). Offloading
+   more of the model attacks this number and nothing above it.
 5. **`wait.npu` 27 ms is 8.8% of wall.** Every conclusion about NPU speed on
    this model is a conclusion about 8.8% of its runtime. M2 (the 200 MHz
    clock) would move ~1.4x of that 8.8%.
@@ -1415,7 +1414,7 @@ mismatch. `ROCKET_WEIGHT_CACHE=0` restores the old behaviour for A/B.
 10 iterations with the cache on, per inference:
 
 ```text
-  outside      102 ms      the CPU half (the 17 depthwise convs)
+  outside      102 ms      the CPU half (the 17 depthwise convs, P7)
   compact       40 ms      DPU atomic slots -> dense IREE buffer
   pack.weights  50 ms      almost entirely the classifier matmul, see below
   pack.input    17 ms
@@ -1555,6 +1554,99 @@ is the way to get it.
 
 ---
 
+## P7 (S2) — MobileNetV2 fp16's 17 depthwise convolutions stay on the CPU, and offloading them today makes the model 26% slower
+
+They are the whole of P6's `outside` term: ten executables over 17 dispatch
+sites, `112x112x48` down to `7x7x1344`, all `linalg.depthwise_conv_2d_nhwc_hwc`
+at f32. They stay on the CPU for one reason —
+`RocketDemoteConvInputsPass` deliberately excludes depthwise, so an f32
+depthwise never becomes the f16/f16/f32 the matchers require and no depthwise
+matcher can ever fire.
+
+### The recorded reason for that exclusion does not apply to this model
+
+The pass's scope comment, and `depthwise-f16-demote-breaks-model`, say
+demoting depthwise makes MobileNetV2 wrong: max|err| 3.5 on the logits, top-1
+incorrect on every input, with every isolation passing. That was measured on
+**static-int8** — a command buffer mixing fp16 depthwise with int8 dispatches,
+which is C8's territory, not a statement about depthwise.
+
+Measured on the plain fp16 model, 2026-09-04, against a CPU-only aarch64 f32
+build of the same MLIR:
+
+```text
+  37 sites (today)          max|err| 0.0192   top-1 and top-5 stable
+  44 sites (+7 depthwise)   max|err| 0.0500   top-1 and top-5 stable
+```
+
+against a top-2 logit gap of 0.257, and byte-identical across five consecutive
+single-shot runs with no hang. **Correctness is not the blocker for fp16.**
+
+### It is slower
+
+```text
+  147/149 ms   37 sites
+  185/188 ms   44 sites
+```
+
+Only 7 of the 17 match at all: the fp16 depthwise matchers cap at `Cin <= 512`
+and ten of these are 528, 816 or 1344 (the HAL itself is exact to 1536, see
+`depthwise-channel-ceiling-split`). Those seven cost 32.7 ms of driver time per
+inference, of which 9.6 ms is the NPU:
+
+```text
+  op                                     total   rec  pk.in   npu  cmpct
+  113x113x144->144 k3x3 s2 dw            10.13  2.46   3.19  2.85   1.22
+  114x114x48->48   k3x3 s1 dw             6.12  1.76   1.26  2.04   0.90
+  58x58x192->192   k3x3 s1 dw             6.10  1.37   1.11  1.71   1.72
+  30x30x288->288   k3x3 s1 dw (x2)        5.08  1.13   0.97  1.52   1.19
+  57x57x192->192   k3x3 s2 dw             3.70  0.86   1.11  1.03   0.51
+  29x29x288->288   k3x3 s2 dw             1.54  0.38   0.44  0.45   0.15
+```
+
+Two costs on top of that, both of which only exist because these are the ops
+being moved:
+
+- **`quiesce` 7.4 ms per inference**, 1.06 ms x 7. That is
+  `DEPTHWISE_TO_DENSE_QUIESCENCE`, the dwell after a depthwise completion and
+  before a dense submit. A model whose depthwise and dense convolutions
+  alternate pays it at every boundary.
+- **`outside` *rises* 88 -> 118 ms.** Offloading these does not remove CPU
+  work, it adds some: the matched depthwise needs explicit padding
+  (`112x112 -> 114x114`), which IREE forms as its own CPU dispatch. The
+  padding is why the shapes above read 113/114/58/30 rather than
+  112/56/28.
+
+So the arithmetic is: 9.6 ms of NPU work bought with 23 ms of driver host
+time, 7.4 ms of hardware dwell and 30 ms of extra CPU padding. The
+depthwise convolutions are the cheapest ops in the model per byte moved —
+one filter per channel, no Cout reduction — which is exactly the profile that
+loses to a per-dispatch layout round trip.
+
+### What would change the verdict, in order
+
+1. **P2's cross-op chaining.** These are the widest spatial extents in the
+   model, so their round trip is the most expensive one there is: `pack.input`
+   plus `compact` is 12.3 of the 32.7 ms. A depthwise sitting between two
+   Rocket 1x1 convolutions is also the ideal chaining shape — producer and
+   consumer both on the NPU.
+2. **The pad.** Folding it into the dispatch (the driver already pads on the
+   input packing path) removes the added CPU dispatch and its buffer.
+3. **The quiesce dwell.** 7.4 ms is pure empirical caution; it is C8's
+   neighbour and should be re-derived rather than kept at a millisecond.
+4. **The `Cin <= 512` matcher cap**, last, because raising it only adds more
+   of a currently-losing trade until the three above land. The HAL is exact
+   to 1536.
+
+To reproduce the 44-site build: add
+`DemoteInputsToF16<linalg::DepthwiseConv2DNhwcHwcOp>` and
+`...<linalg::DepthwiseConv2DNchwChwOp>` to `RocketDemoteConvInputsPass`, and
+the `PromoteInputsToF32` counterparts to the promote pass. Two lines each, and
+nothing else in the tree needs to change — the matchers, the executables, the
+weight packing and the HAL are all already there and all already correct.
+
+---
+
 ## D1 (S4) — the FC lowering here and in the notes use opposite geometries, and this one may be better
 
 `iree-rocket-hal/src/rocket/fc.rs` maps, from a sweep of 160 RKNN-compiled ONNX
@@ -1627,7 +1719,10 @@ were meant to enable found two larger things, and both are now at the top.
 4. **C2** — small fix, plus a probe that settles a question the notes leave open.
 5. **M2** — ~1.43x on the device half, but it needs a driver-side
    `clk_set_rate` and both shortcuts hang the box.
-6. **P2** — the big structural one; measure the regime first.
+6. **P2** — the big structural one; measure the regime first. P7 is the case
+   that most needs it: MobileNetV2 fp16's depthwise convolutions are correct
+   on the NPU and lose anyway, and their round trip is the largest single
+   reason.
 7. **C5, C6, C7, D1, D2** — hygiene and reconciliation.
 
 ## Method note
