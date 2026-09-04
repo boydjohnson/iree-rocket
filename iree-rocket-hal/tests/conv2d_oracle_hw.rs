@@ -292,6 +292,9 @@ fn compare_output(fixture: &Conv2dFixture, plan: &ConvPlan, output: &[u8]) -> Mi
                         f32::from(i16::from_le_bytes([output[offset], output[offset + 1]]))
                     }
                     OraclePrecision::Int8 => f32::from(output[offset] as i8),
+                    OraclePrecision::Tf32 => {
+                        f32::from_le_bytes(output[offset..offset + 4].try_into().unwrap())
+                    }
                     OraclePrecision::Int8Accumulator => {
                         i32::from_le_bytes(output[offset..offset + 4].try_into().unwrap()) as f32
                     }
@@ -1911,6 +1914,106 @@ fn int4_regression_cases() -> Vec<Conv2dCase> {
     cases
 }
 
+/// The tf32 ladder.
+///
+/// tf32 is the only 4-byte input rung and the only one whose precision
+/// field is not uniform across stages, so two things are on trial: that
+/// field 7 at the CNA/CORE with fp32 (5) at the DPU really is tf32 for a
+/// convolution, and that the coefficient input group halves to 16 channels
+/// at four bytes.
+///
+/// The second is why `Cin` starts at 32. The notes make this rule twice,
+/// for int4 and again for tf32: at a shape with a single coefficient input
+/// group, the 16- and 32-channel groupings produce byte-identical buffers,
+/// so a `Cin` at or below the candidate group cannot tell them apart.
+fn tf32_regression_cases() -> Vec<Conv2dCase> {
+    let mut cases = Vec::new();
+    for cin in [32u32, 64, 128] {
+        for cout in [32u32, 64] {
+            for kernel in [1usize, 3] {
+                cases.push(Conv2dCase {
+                    width: 8,
+                    height: 8,
+                    cin,
+                    cout,
+                    kernel: [kernel, kernel],
+                    stride: 1,
+                    padding: [kernel / 2, kernel / 2],
+                    precision: OraclePrecision::Tf32,
+                    pattern: OraclePattern::Counting,
+                });
+            }
+        }
+    }
+    for cin in [32u32, 64] {
+        for cout in [32u32, 64] {
+            for pattern in [
+                OraclePattern::Selectors { phase: 0 },
+                OraclePattern::Dense { phase: 0 },
+            ] {
+                cases.push(Conv2dCase {
+                    width: 8,
+                    height: 8,
+                    cin,
+                    cout,
+                    kernel: [3, 3],
+                    stride: 1,
+                    padding: [1, 1],
+                    precision: OraclePrecision::Tf32,
+                    pattern,
+                });
+            }
+        }
+    }
+    cases.push(Conv2dCase {
+        width: 16,
+        height: 16,
+        cin: 64,
+        cout: 128,
+        kernel: [3, 3],
+        stride: 2,
+        padding: [1, 1],
+        precision: OraclePrecision::Tf32,
+        pattern: OraclePattern::Dense { phase: 1 },
+    });
+    // fp32 range is half of what tf32 buys over fp16 (the other half is the
+    // ten-bit mantissa, which the small-value cases above already exercise
+    // at tolerance 0.0). These products sit an order of magnitude past
+    // fp16's 65504.
+    for wide_input in [true, false] {
+        cases.push(Conv2dCase {
+            width: 8,
+            height: 8,
+            cin: 64,
+            cout: 64,
+            kernel: [3, 3],
+            stride: 1,
+            padding: [1, 1],
+            precision: OraclePrecision::Tf32,
+            pattern: OraclePattern::WideOperands {
+                phase: 0,
+                wide_input,
+            },
+        });
+    }
+    cases
+}
+
+#[test]
+fn tf32_regression_matrix_is_planable_and_gap_free() {
+    let cases = tf32_regression_cases();
+    assert_eq!(cases.len(), 23);
+    assert_planable_and_gap_free(cases);
+}
+
+#[test]
+#[ignore = "needs /dev/accel/accel0 -- establishes tf32 (CNA/CORE field 7, DPU fp32) on the convolution datapath"]
+fn tf32_regression_matrix_matches_oracle() {
+    let cases = tf32_regression_cases();
+    assert_eq!(cases.len(), 23);
+    run_hardware_case_matrix("tf32 regression matrix", cases);
+}
+
 #[test]
 fn int4_regression_matrix_is_planable_and_gap_free() {
     let cases = int4_regression_cases();
@@ -1955,6 +2058,7 @@ fn wide_operand_cases_exceed_the_narrower_datatype() {
     for case in bf16_regression_cases()
         .into_iter()
         .chain(int16_probe_cases())
+        .chain(tf32_regression_cases())
     {
         let fixture = build_fixture(case).expect("wide-operand fixture must build");
         if !matches!(case.pattern, OraclePattern::WideOperands { .. }) {
@@ -1973,7 +2077,7 @@ fn wide_operand_cases_exceed_the_narrower_datatype() {
             }
         }
         let floor = match case.precision {
-            OraclePrecision::Bf16 => 65504,
+            OraclePrecision::Bf16 | OraclePrecision::Tf32 => 65504,
             OraclePrecision::Int16 => 127,
             other => panic!("{other:?} has no wide-operand ladder"),
         };
@@ -1983,7 +2087,10 @@ fn wide_operand_cases_exceed_the_narrower_datatype() {
             case.label(),
         );
     }
-    assert_eq!(checked, 8, "both ladders must contribute wide cases");
+    assert_eq!(
+        checked, 10,
+        "every wide-capable ladder must contribute cases"
+    );
 }
 
 #[test]
@@ -3568,6 +3675,7 @@ fn int4_output_write_map_probe() {
                         f32::from(i16::from_le_bytes([bytes[0], bytes[1]]))
                     }
                     OraclePrecision::Int8 => f32::from(bytes[0] as i8),
+                    OraclePrecision::Tf32 => f32::from_le_bytes(bytes.try_into().unwrap()),
                     OraclePrecision::Int8Accumulator => {
                         i32::from_le_bytes(bytes.try_into().unwrap()) as f32
                     }

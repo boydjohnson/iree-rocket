@@ -22,6 +22,30 @@ pub const WEIGHT_ATOMIC_BYTES: usize = 32;
 /// hardware output kernels.
 pub const WEIGHT_INPUT_GROUP_CHANNELS: usize = 32;
 
+/// Input channels in one coefficient group for a **4-byte** element.
+///
+/// The group is 32 channels at every width from int4 to int16, and halves
+/// at four bytes -- the one exception, recorded for the matmul weight tile
+/// in `../rockchip-npu-notes/encodings/tile-layouts.md` (`tf32` is
+/// `(N/16, K/16, 16, 16)` against fp16's `(N/16, K/32, 16, 32)`), which
+/// keeps the group a constant 1024 bytes rather than a constant channel
+/// count.
+///
+/// This is exactly the trap the notes warn about twice: at a shape with one
+/// input group the two groupings produce identical bytes, so a `Cin` at or
+/// below the candidate group cannot test it. tf32 coefficient tests need
+/// `Cin >= 32`.
+pub const TF32_WEIGHT_INPUT_GROUP_CHANNELS: usize = 16;
+
+/// Output kernels in one coefficient block for a **4-byte** element.
+///
+/// The 32-byte coefficient atom holds 16 kernels at fp16, 32 at int8 and 64
+/// at int4 -- the element width, straight through. At four bytes it does
+/// *not* halve again to 8: the N-group stays 16 and the K-group halves
+/// instead, keeping the 1024-byte tile
+/// (`../rockchip-npu-notes/encodings/tile-layouts.md`).
+pub const TF32_WEIGHT_OUTPUT_BLOCK_CHANNELS: usize = 16;
+
 /// Physical byte width of one depthwise coefficient group.
 ///
 /// The depthwise DPU serializes coefficients tap-major within a fixed 64-byte
@@ -206,7 +230,7 @@ pub fn rocket_weight_storage_size(
     output_channels: usize,
     element_size: usize,
 ) -> Result<usize, &'static str> {
-    if !matches!(element_size, 1 | 2) {
+    if !matches!(element_size, 1 | 2 | 4) {
         return Err("invalid Rocket convolution filter shape");
     }
     rocket_weight_storage_size_bits(
@@ -252,6 +276,7 @@ pub fn rocket_weight_storage_size_bits(
 /// across widths and only the store differs.
 struct WeightLayout {
     output_block_channels: usize,
+    input_group_channels: usize,
     padded_input_channels: usize,
     programmed_output_channels: usize,
     input_groups: usize,
@@ -264,7 +289,7 @@ impl WeightLayout {
         output_channels: usize,
         element_bits: usize,
     ) -> Result<WeightLayout, &'static str> {
-        if input_channels == 0 || output_channels == 0 || !matches!(element_bits, 4 | 8 | 16) {
+        if input_channels == 0 || output_channels == 0 || !matches!(element_bits, 4 | 8 | 16 | 32) {
             return Err("invalid Rocket convolution filter shape");
         }
         let channels_per_atom = FEATURE_ATOMIC_BYTES * 8 / element_bits;
@@ -282,12 +307,35 @@ impl WeightLayout {
         } else {
             output_channels
         };
-        let output_block_channels = WEIGHT_ATOMIC_BYTES * 8 / element_bits;
+        // The coefficient *tile* is a constant 1024 bytes at every width --
+        // `(N-group) * (K-group) * element bytes` -- which is what fixes
+        // both groups. Below four bytes the K-group is pinned at 32
+        // channels and the N-group absorbs the width, so the N-group is
+        // `WEIGHT_ATOMIC_BYTES * 8 / element_bits`: 16 kernels at fp16, 32
+        // at int8, 64 at int4. At four bytes that formula would give 8, and
+        // the hardware instead keeps the N-group at 16 and halves the
+        // K-group to 16. Both halves are from
+        // `../rockchip-npu-notes/encodings/tile-layouts.md` and both are
+        // needed: with only the K-group halved, tf32 computes correct
+        // values under a uniform-coefficient pattern and wrong ones under
+        // any pattern that varies with the output channel.
+        let (output_block_channels, input_group_channels) = if element_bits == 32 {
+            (
+                TF32_WEIGHT_OUTPUT_BLOCK_CHANNELS,
+                TF32_WEIGHT_INPUT_GROUP_CHANNELS,
+            )
+        } else {
+            (
+                WEIGHT_ATOMIC_BYTES * 8 / element_bits,
+                WEIGHT_INPUT_GROUP_CHANNELS,
+            )
+        };
         Ok(WeightLayout {
             output_block_channels,
+            input_group_channels,
             padded_input_channels,
             programmed_output_channels,
-            input_groups: padded_input_channels.div_ceil(WEIGHT_INPUT_GROUP_CHANNELS),
+            input_groups: padded_input_channels.div_ceil(input_group_channels),
             output_blocks: programmed_output_channels.div_ceil(output_block_channels),
         })
     }
@@ -316,9 +364,9 @@ impl WeightLayout {
                             if output_channel >= self.programmed_output_channels {
                                 continue;
                             }
-                            for input_lane in 0..WEIGHT_INPUT_GROUP_CHANNELS {
+                            for input_lane in 0..self.input_group_channels {
                                 let input_channel =
-                                    input_group * WEIGHT_INPUT_GROUP_CHANNELS + input_lane;
+                                    input_group * self.input_group_channels + input_lane;
                                 if input_channel >= self.padded_input_channels {
                                     continue;
                                 }

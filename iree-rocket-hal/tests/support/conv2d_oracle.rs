@@ -17,6 +17,9 @@ pub enum OraclePrecision {
     Fp16,
     /// Signed 4-bit integers, two to a byte, accumulating into int16.
     Int4,
+    /// tf32: fp16's mantissa with fp32's range, in a 4-byte container,
+    /// accumulating into fp32.
+    Tf32,
     /// bfloat16, the 2-byte float with fp32 range and an 8-bit mantissa.
     /// Shares every layout with fp16, so the same fixtures drive it.
     Bf16,
@@ -31,6 +34,7 @@ impl OraclePrecision {
         match self {
             Self::Fp16 => "fp16",
             Self::Int4 => "int4",
+            Self::Tf32 => "tf32",
             Self::Bf16 => "bf16",
             Self::Int16 => "int16",
             Self::Int8 => "int8",
@@ -102,7 +106,10 @@ fn wide_magnitude(precision: OraclePrecision, index: usize, phase: usize) -> i32
     let step = ((index + phase * 7) % 13) as i32;
     match precision {
         OraclePrecision::Int16 => 3000 + 137 * step,
-        OraclePrecision::Bf16 => (128 + 9 * step) << 12,
+        // Eight significant bits times a power of two: exact in bf16, and
+        // therefore also in tf32's wider ten-bit mantissa, while sitting an
+        // order of magnitude past fp16's 65504 ceiling.
+        OraclePrecision::Bf16 | OraclePrecision::Tf32 => (128 + 9 * step) << 12,
         other => panic!("{other:?} has no wide-operand magnitude"),
     }
 }
@@ -173,6 +180,7 @@ impl Conv2dCase {
         let precision = match self.precision {
             OraclePrecision::Fp16 => Precision::Fp16,
             OraclePrecision::Int4 => Precision::Int4,
+            OraclePrecision::Tf32 => Precision::Tf32,
             OraclePrecision::Bf16 => Precision::Bf16,
             OraclePrecision::Int16 => Precision::Int16,
             OraclePrecision::Int8 => {
@@ -775,6 +783,8 @@ fn encode_element(precision: OraclePrecision, value: i32) -> Result<Vec<u8>, Str
                 .map_err(|_| format!("logical value {value} is outside int8"))?;
             Ok(vec![value as u8])
         }
+        // tf32 is fed as raw fp32; the hardware rounds the mantissa.
+        OraclePrecision::Tf32 => Ok((value as f32).to_le_bytes().to_vec()),
         // int4 is not byte-addressable, so it never reaches this path: its
         // fixtures go through the nibble packers instead.
         OraclePrecision::Int4 => Err("int4 elements are packed as nibbles".to_string()),
@@ -890,7 +900,8 @@ fn build_fixture_for_shape(case: Conv2dCase, shape: Shape) -> Result<Conv2dFixtu
         OraclePrecision::Fp16
         | OraclePrecision::Bf16
         | OraclePrecision::Int16
-        | OraclePrecision::Int4 => {
+        | OraclePrecision::Int4
+        | OraclePrecision::Tf32 => {
             for value in logical_weights {
                 dense_weight_bytes.extend_from_slice(&encode_element(case.precision, value)?);
             }
@@ -1020,6 +1031,7 @@ fn build_fixture_for_shape(case: Conv2dCase, shape: Shape) -> Result<Conv2dFixtu
         | OraclePrecision::Bf16
         | OraclePrecision::Int16
         | OraclePrecision::Int4
+        | OraclePrecision::Tf32
         | OraclePrecision::Int8Accumulator => {
             vec![0; shape.bs_buffer_bytes()]
         }

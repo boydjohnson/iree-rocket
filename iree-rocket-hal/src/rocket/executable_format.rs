@@ -130,6 +130,15 @@ pub fn encode_conv_shape_v1(shape: &conv::Shape, kernels: Kernels) -> Vec<u8> {
             0.0f32,
             Multiplier { scale: 0, shift: 0 },
         ),
+        Precision::Tf32 => (
+            6u32,
+            0i32,
+            0i32,
+            0i32,
+            0.0f32,
+            0.0f32,
+            Multiplier { scale: 0, shift: 0 },
+        ),
         Precision::Int4 => (
             5u32,
             0i32,
@@ -279,6 +288,7 @@ pub fn decode_conv_shape_v1(payload: &[u8]) -> Result<(conv::Shape, Kernels), De
         3 => Precision::Bf16,
         4 => Precision::Int16,
         5 => Precision::Int4,
+        6 => Precision::Tf32,
         2 => Precision::Int8Accumulator(Quantization {
             input_zero_point,
             output_zero_point,

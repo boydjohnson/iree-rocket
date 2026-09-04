@@ -20,6 +20,13 @@ pub enum DataPrecision {
     Fp16 = 2,
     Bf16 = 3,
     Int4 = 6,
+    /// 10-bit mantissa with fp32 range in a 4-byte container.
+    ///
+    /// **CNA and CORE only.** The DPU output stage's enum has no tf32 code
+    /// -- setting its stages to 7 writes nothing -- so a tf32 convolution
+    /// runs its DPU stages at fp32 ([`OutputPrecision::Fp32`]) instead. See
+    /// `../rockchip-npu-notes/encodings/precision-field.md`.
+    Tf32 = 7,
 }
 
 impl From<DataPrecision> for Bits<3> {
