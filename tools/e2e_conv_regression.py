@@ -245,6 +245,12 @@ def run(command: list[str], *, env: dict[str, str] | None = None) -> None:
     subprocess.run(command, check=True, env=env)
 
 
+def run_allowing_failure(command: list[str]) -> bool:
+    """Runs `command`, returning whether it succeeded instead of raising."""
+    print(f"+ {command_text(command)}", flush=True)
+    return subprocess.run(command, check=False).returncode == 0
+
+
 def capture(command: list[str]) -> str:
     print(f"+ {command_text(command)}", flush=True)
     return subprocess.check_output(command, text=True).strip()
@@ -552,7 +558,18 @@ def run_rocket_module(
     function: str,
     input_names: Sequence[str],
     output_names: Sequence[str],
-) -> None:
+    tolerate_failure: bool = False,
+) -> bool:
+    """Runs one function on the board, returning whether it executed.
+
+    `tolerate_failure` is for a `known_failure` case, which may fail by not
+    running at all rather than by computing the wrong numbers. Since the
+    driver grew a hung-job deadline, `mixed_int8_then_depthwise` does
+    exactly that: it hangs the NPU, the watchdog kills the job at ~500 ms,
+    and `iree-run-module` now correctly refuses the result instead of
+    handing back a half-written buffer. Raising there would abort the whole
+    gate over a failure it is meant to tolerate.
+    """
     staged = [board_runtime, work_dir / "rocket.vmfb"]
     staged += [work_dir / name for name in input_names]
     run(["scp", *(str(path) for path in staged), f"{host}:{remote_dir}/"])
@@ -574,9 +591,17 @@ def run_rocket_module(
             ),
         ]
     )
-    run(["ssh", host, remote_command])
+    if tolerate_failure:
+        if not run_allowing_failure(["ssh", host, remote_command]):
+            return False
+    else:
+        run(["ssh", host, remote_command])
+    # Only reached when the module actually ran, so there are outputs to
+    # fetch. A case that did not execute wrote none, and the caller must not
+    # go on to compare them.
     for name in output_names:
         run(["scp", f"{host}:{remote_dir}/{name}", str(work_dir / name)])
+    return True
 
 
 def compare_outputs(
@@ -764,9 +789,15 @@ def run_compiled_gate(
             (0.0, 1e-2),
             (0.0, 1e-2),
             known_failure=(
-                "an int8 dispatch corrupts a *following* fp16 depthwise one in the "
-                "same command buffer: the depthwise output is wrong in a single "
-                "tile-sized band of rows. Reversing the order "
+                "an int8 dispatch HANGS a *following* fp16 depthwise one in the "
+                "same command buffer. Measured 2026-09-03, 8 of 8 runs with an "
+                "idle gap: the job runs 502-534 ms and is killed by the kernel "
+                "watchdog, and the driver's hung-job deadline now refuses the "
+                "result rather than returning a half-written buffer -- so this "
+                "case fails by not executing. It was recorded as corruption "
+                "(\"wrong in a single tile-sized band of rows\") back when a "
+                "killed job still returned its partial buffer silently, which is "
+                "what those wrong rows were. Reversing the order "
                 "(mixed_depthwise_then_int8) and making both halves fp16 "
                 "(mixed_fp16_then_depthwise) both pass, so it is the precision mix "
                 "and the order, not either convolution. Ruled out: a stale register "
@@ -782,7 +813,7 @@ def run_compiled_gate(
             f"{case.function}_cpu_{index}.npy" for index in range(len(case.outputs))
         )
         run_cpu_reference(work_dir, host_runtime, case.function, case.inputs, cpu_names)
-        run_rocket_module(
+        executed = run_rocket_module(
             host,
             remote_dir,
             work_dir,
@@ -790,15 +821,26 @@ def run_compiled_gate(
             case.function,
             case.inputs,
             case.outputs,
+            tolerate_failure=case.known_failure is not None,
         )
-        # `all()` over a generator would stop at the first mismatch; a list
-        # keeps every output's numbers on screen, which is the whole point of
-        # a two-dispatch case.
-        results = [
-            compare_outputs(work_dir, cpu_name, rocket_name, *case.tolerances(index))
-            for index, (cpu_name, rocket_name) in enumerate(zip(cpu_names, case.outputs))
-        ]
-        matched = all(results)
+        if not executed:
+            # Only reachable for a known failure -- every other case still
+            # raises inside `run`. Not executing is a way of not matching,
+            # and which way it failed is worth printing: if this case ever
+            # goes back to returning numbers, the entry needs re-reading.
+            matched = False
+            print(f"  {case.function}: did not execute (see the error above)")
+        else:
+            # `all()` over a generator would stop at the first mismatch; a
+            # list keeps every output's numbers on screen, which is the whole
+            # point of a two-dispatch case.
+            results = [
+                compare_outputs(work_dir, cpu_name, rocket_name, *case.tolerances(index))
+                for index, (cpu_name, rocket_name) in enumerate(
+                    zip(cpu_names, case.outputs)
+                )
+            ]
+            matched = all(results)
         if case.known_failure:
             if matched:
                 unexpected_passes.append(case.function)
