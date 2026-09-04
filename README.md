@@ -275,6 +275,31 @@ The compiled cases include the previously problematic VGG geometry (30x30,
 Cin=512, Cout=512, 3x3) and a 40-channel 3x3 depthwise convolution that crosses
 the driver's 32-channel weight-packing group boundary.
 
+## Precision-transition probe
+
+`tools/c8_precision_transition_probe.py` isolates ISSUES.md's C8: an int8
+dispatch makes a following fp16 dispatch hang, and this says which fp16 jobs
+are affected. It builds one module per invocation holding only the selected
+cases, each a `func.func` whose Rocket dispatches run in the order listed, and
+runs each case in its own process on the board with a quiet gap and a canary.
+
+```sh
+python3 tools/c8_precision_transition_probe.py --board planck
+python3 tools/c8_precision_transition_probe.py --board planck --repeat 3 \
+    --only int8_then_k1 --only int8_then_k3
+```
+
+`--only` names cases from `CASES`; `--repeat` runs each several times, which is
+what tells a real result from the device's order-dependent flake. Every
+convolution is checked to reach a Rocket matcher before anything runs, so a
+case that quietly fell through to the CPU fails loudly instead of reporting a
+clean row. Outputs are compared against a CPU build unless
+`--skip-differential`.
+
+Adding a case is two lines: an entry in `INT8` or `F16` for the shape, and one
+in `CASES` for the sequence. The MLIR, the fixtures and the argument plumbing
+are generated from those.
+
 ## Submodules
 
 After cloning, initialize `iree-src` (and its own third-party submodules):

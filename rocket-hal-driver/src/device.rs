@@ -113,6 +113,106 @@ fn quiesce_all_enabled() -> bool {
     *ENABLED.get_or_init(|| std::env::var("ROCKET_QUIESCE_ALL").is_ok_and(|value| value != "0"))
 }
 
+/// How to dwell before every dispatch, for ISSUES.md C8's runtime-PM test.
+///
+/// `ROCKET_PM_DWELL_MS=<n>` sleeps `n` ms before every dispatch;
+/// `ROCKET_PM_DWELL=suspend` instead polls every NPU core's
+/// `power/runtime_status` until all read `suspended` (budget 2 s), i.e. waits
+/// for the driver's autosuspend to cycle the power domain rather than for a
+/// clock. The rockchip-npu-notes RK3576 work found a "wide-output poisoning"
+/// state that no register write clears and only that power cycle resets; the
+/// 1 ms [`DEPTHWISE_TO_DENSE_QUIESCENCE`] dwell could never have reached it
+/// (planck's autosuspend delay is 50 ms). A dwell shorter than the autosuspend
+/// delay that still hangs, against a suspend-poll that does not, separates
+/// "elapsed time" from "power cycle" without root on the board.
+#[derive(Clone, Copy, Debug)]
+enum PmDwell {
+    Off,
+    Sleep(Duration),
+    UntilSuspended,
+}
+
+fn pm_dwell() -> PmDwell {
+    static MODE: std::sync::OnceLock<PmDwell> = std::sync::OnceLock::new();
+    *MODE.get_or_init(|| {
+        if std::env::var("ROCKET_PM_DWELL").is_ok_and(|value| value == "suspend") {
+            return PmDwell::UntilSuspended;
+        }
+        match std::env::var("ROCKET_PM_DWELL_MS")
+            .ok()
+            .and_then(|value| value.parse::<u64>().ok())
+        {
+            Some(ms) if ms > 0 => PmDwell::Sleep(Duration::from_millis(ms)),
+            _ => PmDwell::Off,
+        }
+    })
+}
+
+/// `ROCKET_PM_DWELL_AT=transition` restricts the dwell to an
+/// `Int8Accumulator` -> anything-else boundary, the only transition ISSUES.md
+/// C8 implicates, so a dwell that clears the hang there proves the fix needs
+/// no more than that one boundary.
+fn pm_dwell_at_transition_only() -> bool {
+    static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ENABLED.get_or_init(|| {
+        std::env::var("ROCKET_PM_DWELL_AT").is_ok_and(|value| value == "transition")
+    })
+}
+
+fn is_int8_accumulator(precision: Option<iree_rocket_hal::rocket::conv::Precision>) -> bool {
+    matches!(
+        precision,
+        Some(iree_rocket_hal::rocket::conv::Precision::Int8Accumulator(_))
+    )
+}
+
+/// Every NPU core's `power/runtime_status` sysfs file.
+fn npu_runtime_status_paths() -> &'static [std::path::PathBuf] {
+    static PATHS: std::sync::OnceLock<Vec<std::path::PathBuf>> = std::sync::OnceLock::new();
+    PATHS.get_or_init(|| {
+        let mut paths: Vec<_> = std::fs::read_dir("/sys/devices/platform")
+            .into_iter()
+            .flatten()
+            .flatten()
+            .map(|entry| entry.path())
+            .filter(|path| path.to_string_lossy().ends_with(".npu"))
+            .map(|path| path.join("power/runtime_status"))
+            .collect();
+        paths.sort();
+        paths
+    })
+}
+
+/// Runs the configured dwell; returns how long it took and, for the poll,
+/// whether every core actually reported `suspended` inside the budget.
+fn run_pm_dwell(mode: PmDwell) -> (Duration, bool) {
+    let started = Instant::now();
+    match mode {
+        PmDwell::Off => (Duration::ZERO, true),
+        PmDwell::Sleep(duration) => {
+            std::thread::sleep(duration);
+            (started.elapsed(), true)
+        }
+        PmDwell::UntilSuspended => {
+            let paths = npu_runtime_status_paths();
+            let budget = Duration::from_secs(2);
+            loop {
+                let all_suspended = !paths.is_empty()
+                    && paths.iter().all(|path| {
+                        std::fs::read_to_string(path).is_ok_and(|s| s.trim() == "suspended")
+                    });
+                if all_suspended {
+                    return (started.elapsed(), true);
+                }
+                if started.elapsed() > budget {
+                    return (started.elapsed(), false);
+                }
+                std::thread::sleep(Duration::from_micros(500));
+            }
+        }
+    }
+}
+
 /// Whether to leak every per-tile regcmd BO rather than closing it
 /// (`ROCKET_LEAK_REGCMD=1`).
 ///
@@ -236,6 +336,9 @@ pub struct RocketDevice {
     /// across queue executions because the hardware is shared even when IREE
     /// invokes queue callbacks from different proactor threads.
     last_dpu_mode: Mutex<Option<crate::command_buffer::DpuMode>>,
+    /// Diagnostic only, for `ROCKET_PM_DWELL_AT=transition`: the precision of
+    /// the last completed dispatch, kept beside the DPU mode history.
+    last_precision_tag: Mutex<Option<iree_rocket_hal::rocket::conv::Precision>>,
 }
 
 // `PREP_BO` observes the output fence, but the RK3588 DPU can still retain
@@ -493,6 +596,7 @@ pub unsafe fn create(
         proactor,
         topology_info: unsafe { std::mem::zeroed() },
         last_dpu_mode: Mutex::new(None),
+        last_precision_tag: Mutex::new(None),
     });
     let device_ptr = Box::into_raw(device) as *mut iree_hal_device_t;
     // Chicken-and-egg: the allocator needs to know its owning device (see
@@ -1534,6 +1638,10 @@ unsafe extern "C" fn queue_execute(
                     .last_dpu_mode
                     .lock()
                     .unwrap_or_else(|poisoned| poisoned.into_inner());
+                let mut last_precision_tag = d
+                    .last_precision_tag
+                    .lock()
+                    .unwrap_or_else(|poisoned| poisoned.into_inner());
 
                 // Each recorded dispatch is submitted and fenced as its own
                 // independent hardware job, in call order -- same reasoning
@@ -1544,6 +1652,22 @@ unsafe extern "C" fn queue_execute(
                 // its own weights/CBUF state, so no state needs to survive
                 // between jobs.
                 for job in cmds.iter().filter(|j| !j.regcmd_tasks.is_empty()) {
+                    let dwell_mode = pm_dwell();
+                    let at_boundary = is_int8_accumulator(*last_precision_tag)
+                        && !is_int8_accumulator(job.precision_tag);
+                    if !matches!(dwell_mode, PmDwell::Off)
+                        && (!pm_dwell_at_transition_only() || at_boundary)
+                    {
+                        let (took, suspended) = run_pm_dwell(dwell_mode);
+                        if dispatch_times_enabled() {
+                            eprintln!(
+                                "rocket: pm-dwell {:?} took {:.1} ms, all cores suspended: {}",
+                                dwell_mode,
+                                took.as_secs_f64() * 1e3,
+                                suspended
+                            );
+                        }
+                    }
                     if quiesce_all_enabled()
                         || needs_depthwise_to_dense_quiescence(*last_dpu_mode, job.dpu_mode)
                     {
@@ -1793,6 +1917,7 @@ unsafe extern "C" fn queue_execute(
                     if let Some(mode) = job.dpu_mode {
                         *last_dpu_mode = Some(mode);
                     }
+                    *last_precision_tag = job.precision_tag;
 
                     // Conv2d only (see `command_buffer::OutputCompaction`'s
                     // doc comment): the hardware write above landed in a
