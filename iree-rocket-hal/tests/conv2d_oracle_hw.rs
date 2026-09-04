@@ -44,6 +44,10 @@ use conv2d_oracle::{
 };
 #[cfg(feature = "hardware-characterization")]
 use conv2d_oracle::{build_raw_fixture, feature_offset};
+// The dispatch clock lives in `support/dispatch.rs`, shared with every other
+// hardware test that submits its own job, so the floor is one number rather
+// than one per file.
+use dispatch::DISPATCH_TIMEOUT_FLOOR;
 use iree_rocket_hal::rocket::{
     conv::{AccumulatorOutputTile, Buffers, ConvPlan, Shape},
     device::{Buffer, JobDesc, close_bo, fini_bo, prep_bo, submit_jobs, unmap_bo},
@@ -53,10 +57,6 @@ const DEVICE_PATH: &str = "/dev/accel/accel0";
 const PAGE_BYTES: usize = 4096;
 const PER_CASE_TIMEOUT_NS: u64 = 5_000_000_000;
 
-/// The dispatch clock lives in `support/dispatch.rs`, shared with every
-/// other hardware test that submits its own job, so the floor is one number
-/// rather than one per file.
-use dispatch::DISPATCH_TIMEOUT_FLOOR;
 const OUTPUT_SENTINEL: u8 = 0xa5;
 // `nextest -j1` serializes test *processes*, but Rust's harness still runs
 // ignored tests in this binary concurrently. The RK3588 NPU is a single
