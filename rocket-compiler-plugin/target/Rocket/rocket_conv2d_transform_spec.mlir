@@ -240,6 +240,79 @@
   ]
 }>
 
+// The indexing maps of an untransposed row-major matmul: A[m,k], B[k,n],
+// C[m,n]. `linalg.matmul` expresses a transpose or a broadcast by overriding
+// these rather than by being a different op, so pinning them is what keeps
+// @match_rocket_matmul from claiming an operand layout the lowering cannot
+// pack.
+#rocket_matmul_lhs = affine_map<(d0, d1, d2) -> (d0, d2)>
+#rocket_matmul_rhs = affine_map<(d0, d1, d2) -> (d2, d1)>
+#rocket_matmul_out = affine_map<(d0, d1, d2) -> (d0, d1)>
+
+// The PPU pooling engine, driven per dispatch. MLIR's linalg dialect has no
+// average pool: an ONNX AveragePool or GlobalAveragePool arrives as
+// linalg.pooling_*_sum followed by a separate divide, and the PPU has no sum
+// mode of its own (its average is a multiply by fp16(65536/k), which cannot
+// encode a divisor of one). So the hardware computes the *average* and
+// @call_rocket_pooling_avg_nchw multiplies it back up by kh*kw, leaving the
+// model's own divide to do what it was already going to do. That is one
+// elementwise pass over the pooled result -- 1792 values on MobileNetV2 --
+// and it costs nothing to keep the matcher a single-op match rather than a
+// two-op DAG.
+//
+// Stride and padding are baked: every measured model pools with stride 1 or
+// with stride equal to the kernel, and the PPU's padding is a 3-bit field
+// whose meaning depends on the method. Kernel extent, channels and the input
+// extent arrive as push constants.
+#rocket_pooling_avg_target = #hal.executable.target<"rocket", "rocket-flatbuffer-v1", {
+  kernel = "pooling",
+  input_width = 0 : i32, input_height = 0 : i32, channels = 0 : i32,
+  output_width = 0 : i32, output_height = 0 : i32,
+  kernel_width = 0 : i32, kernel_height = 0 : i32,
+  stride_x = 1 : i32, stride_y = 1 : i32,
+  pad_left = 0 : i32, pad_top = 0 : i32, pad_right = 0 : i32, pad_bottom = 0 : i32,
+  method = "avg",
+  precision = "fp16",
+  runtime_dimensions = ["input_width", "input_height", "channels",
+                        "kernel_width", "kernel_height"]
+}>
+
+// The matmul engine. There is no matmul *hardware*: `fc::Shape` lowers
+// [M,K] x [K,N] to a height-one 1x1 convolution, with M the convolution
+// width, K the input channels and N the output channels -- a mapping
+// established over 160 captured ONNX `Linear` models. What is new is that
+// the wire format now names the operation the input dialect actually has.
+// "Fully connected" is not an op in linalg, which is why FullyConnectedDef
+// sat unused since the day it was written.
+//
+// M, K and N all arrive as push constants, so one executable serves every
+// matmul shape inside the channel ceilings.
+#rocket_matmul_target = #hal.executable.target<"rocket", "rocket-flatbuffer-v1", {
+  kernel = "matmul",
+  m = 0 : i32, k = 0 : i32, n = 0 : i32,
+  input_zero_point = 0 : i32, output_zero_point = 0 : i32, weights_zero_point = 0 : i32,
+  input_scale = 1.0 : f32, weights_scale = 1.0 : f32, output_scale = 1.0 : f32,
+  truncate_bits = 0 : i32,
+  activation = "none", activation_cmp = 0 : i32,
+  precision = "fp16",
+  runtime_dimensions = ["m", "k", "n"]
+}>
+
+// Input, weights, bias, output -- the convolution binding convention, since
+// that is what this lowers to. The bias is zero-filled by the caller.
+#matmul_pipeline_layout = #hal.pipeline.layout<constants = 3, bindings = [
+  #hal.pipeline.binding<storage_buffer, ReadOnly>,
+  #hal.pipeline.binding<storage_buffer, ReadOnly>,
+  #hal.pipeline.binding<storage_buffer, ReadOnly>,
+  #hal.pipeline.binding<storage_buffer>
+]>
+
+// A pool has no weights and no bias: input and output only.
+#pooling_pipeline_layout = #hal.pipeline.layout<constants = 5, bindings = [
+  #hal.pipeline.binding<storage_buffer, ReadOnly>,
+  #hal.pipeline.binding<storage_buffer>
+]>
+
 #dynamic_pipeline_layout = #hal.pipeline.layout<constants = 6, bindings = [
   #hal.pipeline.binding<storage_buffer, ReadOnly>,
   #hal.pipeline.binding<storage_buffer, ReadOnly>,
@@ -257,6 +330,34 @@ module attributes {transform.with_named_sequence} {
       }
       builtin.module {
         func.func @rocket_dynamic_conv2d() {
+          return
+        }
+      }
+    }
+  }
+
+  hal.executable private @rocket_matmul_executable {
+    hal.executable.variant public @rocket_matmul_v1 target(#rocket_matmul_target) {
+      hal.executable.export public @rocket_matmul ordinal(0) layout(#matmul_pipeline_layout) count(%device: !hal.device, %workload: index) -> (index, index, index) {
+        %c1 = arith.constant 1 : index
+        hal.return %c1, %c1, %c1 : index, index, index
+      }
+      builtin.module {
+        func.func @rocket_matmul() {
+          return
+        }
+      }
+    }
+  }
+
+  hal.executable private @rocket_pooling_executable {
+    hal.executable.variant public @rocket_pooling_avg_v1 target(#rocket_pooling_avg_target) {
+      hal.executable.export public @rocket_pooling_avg ordinal(0) layout(#pooling_pipeline_layout) count(%device: !hal.device, %workload: index) -> (index, index, index) {
+        %c1 = arith.constant 1 : index
+        hal.return %c1, %c1, %c1 : index, index, index
+      }
+      builtin.module {
+        func.func @rocket_pooling_avg() {
           return
         }
       }
@@ -404,6 +505,323 @@ module attributes {transform.with_named_sequence} {
     }
   }
 
+
+  // The replacement for a matched linalg.matmul.
+  //
+  // No reshaping: the dispatch's operands are the 2-D matrices as they
+  // stand. The tensor types here only fix each binding's size, and the
+  // runtime derives the geometry from the M/K/N push constants -- it is
+  // `fc::Shape` that knows M is a convolution width and K its input
+  // channels, not this file. A is [M,K] row-major and B is [K,N], which is
+  // already a 1x1 HWCF filter; the matcher pins the indexing maps so a
+  // transposed operand cannot arrive here claiming to be one.
+  //
+  // The bias binding is zero-filled. MobileNetV2's bias add is a separate
+  // linalg.generic and stays on the CPU: folding it would cost a matcher
+  // that claims two ops for one elementwise pass over 1001 floats.
+  util.func private @call_rocket_matmul(
+      %lhs: tensor<?x?xf32>,
+      %rhs: tensor<?x?xf32>,
+      %init: tensor<?x?xf32>) -> tensor<?x?xf32> {
+    %c0 = arith.constant 0 : index
+    %c1 = arith.constant 1 : index
+
+    %m = tensor.dim %lhs, %c0 : tensor<?x?xf32>
+    %k = tensor.dim %lhs, %c1 : tensor<?x?xf32>
+    %n = tensor.dim %rhs, %c1 : tensor<?x?xf32>
+
+    %m_i32 = arith.index_cast %m : index to i32
+    %k_i32 = arith.index_cast %k : index to i32
+    %n_i32 = arith.index_cast %n : index to i32
+
+    // Nothing demotes a matmul the way RocketDemoteConvInputsPass demotes a
+    // convolution, so both operands are narrowed here.
+    %lhs_f16_empty = tensor.empty(%m, %k) : tensor<?x?xf16>
+    %lhs_f16 = linalg.generic {
+        indexing_maps = [
+          affine_map<(d0, d1) -> (d0, d1)>,
+          affine_map<(d0, d1) -> (d0, d1)>
+        ],
+        iterator_types = ["parallel", "parallel"]
+      } ins(%lhs : tensor<?x?xf32>)
+        outs(%lhs_f16_empty : tensor<?x?xf16>) {
+      ^bb0(%value: f32, %out: f16):
+        %narrowed = arith.truncf %value : f32 to f16
+        linalg.yield %narrowed : f16
+    } -> tensor<?x?xf16>
+
+    %rhs_f16_empty = tensor.empty(%k, %n) : tensor<?x?xf16>
+    %rhs_f16 = linalg.generic {
+        indexing_maps = [
+          affine_map<(d0, d1) -> (d0, d1)>,
+          affine_map<(d0, d1) -> (d0, d1)>
+        ],
+        iterator_types = ["parallel", "parallel"]
+      } ins(%rhs : tensor<?x?xf32>)
+        outs(%rhs_f16_empty : tensor<?x?xf16>) {
+      ^bb0(%value: f32, %out: f16):
+        %narrowed = arith.truncf %value : f32 to f16
+        linalg.yield %narrowed : f16
+    } -> tensor<?x?xf16>
+
+    %zero_bias_empty = tensor.empty(%n) : tensor<?xf16>
+    %zero_f16 = arith.constant 0.0 : f16
+    %zero_bias = linalg.fill ins(%zero_f16 : f16)
+        outs(%zero_bias_empty : tensor<?xf16>) -> tensor<?xf16>
+
+    %raw_f16 = flow.dispatch
+        @rocket_matmul_executable::@rocket_matmul_v1::@rocket_matmul(
+          %m_i32, %k_i32, %n_i32,
+          %lhs_f16, %rhs_f16, %zero_bias)
+        {stream.affinity = #hal.device.affinity<@rocket_device>}
+        : (i32, i32, i32,
+           tensor<?x?xf16>{%m, %k},
+           tensor<?x?xf16>{%k, %n},
+           tensor<?xf16>{%n})
+        -> tensor<?x?xf16>{%m, %n}
+
+    // Widen and accumulate on the CPU, explicitly -- an op consuming the
+    // Rocket result otherwise inherits its affinity and is formed into an
+    // executable for a device with no config to serialize.
+    %final = flow.dispatch.workgroups[%m, %n](%raw_f16, %init, %m, %n)
+        : (tensor<?x?xf16>{%m, %n}, tensor<?x?xf32>{%m, %n}, index, index)
+        -> tensor<?x?xf32>{%m, %n}
+        attributes { stream.affinity = #hal.device.affinity<@cpu_device> } =
+        (%raw_binding: !iree_tensor_ext.dispatch.tensor<readonly:tensor<?x?xf16>>,
+         %init_binding: !iree_tensor_ext.dispatch.tensor<readonly:tensor<?x?xf32>>,
+         %m_arg: index,
+         %n_arg: index,
+         %final_binding: !iree_tensor_ext.dispatch.tensor<writeonly:tensor<?x?xf32>>) {
+      %m_size = iree_tensor_ext.dispatch.workload.ordinal %m_arg, 0 : index
+      %n_size = iree_tensor_ext.dispatch.workload.ordinal %n_arg, 1 : index
+      %raw_shaped = flow.dispatch.tie_shape %raw_binding
+          : !iree_tensor_ext.dispatch.tensor<readonly:tensor<?x?xf16>>{%m_size, %n_size}
+      %init_shaped = flow.dispatch.tie_shape %init_binding
+          : !iree_tensor_ext.dispatch.tensor<readonly:tensor<?x?xf32>>{%m_size, %n_size}
+      %final_shaped = flow.dispatch.tie_shape %final_binding
+          : !iree_tensor_ext.dispatch.tensor<writeonly:tensor<?x?xf32>>{%m_size, %n_size}
+      %raw_loaded = iree_tensor_ext.dispatch.tensor.load %raw_shaped,
+          offsets = [0, 0], sizes = [%m_size, %n_size], strides = [1, 1]
+          : !iree_tensor_ext.dispatch.tensor<readonly:tensor<?x?xf16>>{%m_size, %n_size}
+          -> tensor<?x?xf16>
+      %init_loaded = iree_tensor_ext.dispatch.tensor.load %init_shaped,
+          offsets = [0, 0], sizes = [%m_size, %n_size], strides = [1, 1]
+          : !iree_tensor_ext.dispatch.tensor<readonly:tensor<?x?xf32>>{%m_size, %n_size}
+          -> tensor<?x?xf32>
+      %final_empty = tensor.empty(%m_size, %n_size) : tensor<?x?xf32>
+      %final_inner = linalg.generic {
+          indexing_maps = [
+            affine_map<(d0, d1) -> (d0, d1)>,
+            affine_map<(d0, d1) -> (d0, d1)>,
+            affine_map<(d0, d1) -> (d0, d1)>
+          ],
+          iterator_types = ["parallel", "parallel"]
+        } ins(%raw_loaded, %init_loaded : tensor<?x?xf16>, tensor<?x?xf32>)
+          outs(%final_empty : tensor<?x?xf32>) {
+        ^bb0(%raw: f16, %initial: f32, %out: f32):
+          %raw_f32 = arith.extf %raw : f16 to f32
+          %sum = arith.addf %raw_f32, %initial : f32
+          linalg.yield %sum : f32
+      } -> tensor<?x?xf32>
+      iree_tensor_ext.dispatch.tensor.store %final_inner, %final_shaped,
+          offsets = [0, 0], sizes = [%m_size, %n_size], strides = [1, 1]
+          : tensor<?x?xf32>
+          -> !iree_tensor_ext.dispatch.tensor<writeonly:tensor<?x?xf32>>{%m_size, %n_size}
+      flow.return
+    } count(%m_workload: index, %n_workload: index) -> (index, index, index) {
+      %x, %y, %z = iree_tensor_ext.dispatch.workgroup_count_from_slice(
+          %m_workload, %n_workload)
+      flow.return %x, %y, %z : index, index, index
+    }
+
+    util.return %final : tensor<?x?xf32>
+  }
+
+  // The replacement for a matched linalg.pooling_nchw_sum.
+  //
+  // Three things happen around the dispatch, and each is here because the
+  // hardware and the input dialect disagree about something:
+  //
+  //   * NCHW -> NHWC and back. The PPU reads and writes NC1HWC2 cubes built
+  //     from NHWC, and pooling arrives NCHW because that is what
+  //     torch-mlir emits and, unlike dense convolution, nothing upstream
+  //     converts it (the same reason the depthwise NCHW shim above exists).
+  //   * f32 -> f16 and back. Nothing demotes pooling inputs the way
+  //     RocketDemoteConvInputsPass demotes convolution ones, so the
+  //     truncation is explicit here.
+  //   * a multiply by kh*kw. The op is a *sum* pool and the hardware
+  //     computes an *average*, so the result is scaled back up to the sum
+  //     the consumer expects. The model's own divide then produces the
+  //     average it was always going to.
+  //
+  // The `outs` operand is an accumulator initialiser, so it is added rather
+  // than ignored -- the same contract the convolution shims honour.
+  util.func private @call_rocket_pooling_avg_nchw(
+      %input: tensor<1x?x?x?xf32>,
+      %window: tensor<?x?xf32>,
+      %init: tensor<1x?x?x?xf32>) -> tensor<1x?x?x?xf32> {
+    %c0 = arith.constant 0 : index
+    %c1 = arith.constant 1 : index
+    %c2 = arith.constant 2 : index
+    %c3 = arith.constant 3 : index
+
+    // NCHW: dim 1 is channels, dims 2/3 are the spatial extent.
+    %channels = tensor.dim %input, %c1 : tensor<1x?x?x?xf32>
+    %input_height = tensor.dim %input, %c2 : tensor<1x?x?x?xf32>
+    %input_width = tensor.dim %input, %c3 : tensor<1x?x?x?xf32>
+    // The window operand carries no values, only [kh, kw].
+    %kernel_height = tensor.dim %window, %c0 : tensor<?x?xf32>
+    %kernel_width = tensor.dim %window, %c1 : tensor<?x?xf32>
+    %output_height = tensor.dim %init, %c2 : tensor<1x?x?x?xf32>
+    %output_width = tensor.dim %init, %c3 : tensor<1x?x?x?xf32>
+
+    %input_width_i32 = arith.index_cast %input_width : index to i32
+    %input_height_i32 = arith.index_cast %input_height : index to i32
+    %channels_i32 = arith.index_cast %channels : index to i32
+    %kernel_width_i32 = arith.index_cast %kernel_width : index to i32
+    %kernel_height_i32 = arith.index_cast %kernel_height : index to i32
+
+    // NCHW [1,C,H,W] -> NHWC [1,H,W,C]: out.shape[i] = in.shape[perm[i]].
+    %input_nhwc_empty = tensor.empty(%input_height, %input_width, %channels) : tensor<1x?x?x?xf32>
+    %input_nhwc = linalg.transpose
+        ins(%input : tensor<1x?x?x?xf32>)
+        outs(%input_nhwc_empty : tensor<1x?x?x?xf32>)
+        permutation = [0, 2, 3, 1]
+
+    %input_f16_empty = tensor.empty(%input_height, %input_width, %channels) : tensor<1x?x?x?xf16>
+    %input_f16 = linalg.generic {
+        indexing_maps = [
+          affine_map<(d0, d1, d2, d3) -> (d0, d1, d2, d3)>,
+          affine_map<(d0, d1, d2, d3) -> (d0, d1, d2, d3)>
+        ],
+        iterator_types = ["parallel", "parallel", "parallel", "parallel"]
+      } ins(%input_nhwc : tensor<1x?x?x?xf32>)
+        outs(%input_f16_empty : tensor<1x?x?x?xf16>) {
+      ^bb0(%value: f32, %out: f16):
+        %narrowed = arith.truncf %value : f32 to f16
+        linalg.yield %narrowed : f16
+    } -> tensor<1x?x?x?xf16>
+
+    %averaged = flow.dispatch
+        @rocket_pooling_executable::@rocket_pooling_avg_v1::@rocket_pooling_avg(
+          %input_width_i32, %input_height_i32, %channels_i32,
+          %kernel_width_i32, %kernel_height_i32,
+          %input_f16)
+        {stream.affinity = #hal.device.affinity<@rocket_device>}
+        : (i32, i32, i32, i32, i32,
+           tensor<1x?x?x?xf16>{%input_height, %input_width, %channels})
+        -> tensor<1x?x?x?xf16>{%output_height, %output_width, %channels}
+
+    // %init arrives NCHW too; line it up with the NHWC result.
+    %init_nhwc_empty = tensor.empty(%output_height, %output_width, %channels) : tensor<1x?x?x?xf32>
+    %init_nhwc = linalg.transpose
+        ins(%init : tensor<1x?x?x?xf32>)
+        outs(%init_nhwc_empty : tensor<1x?x?x?xf32>)
+        permutation = [0, 2, 3, 1]
+
+    // Undo the hardware's divide -- the matched op is a sum pool -- widen
+    // back to f32, and add the accumulator initialiser.
+    //
+    // Explicitly a CPU dispatch, like the convolution shims' accumulate and
+    // for the same reason: an op that consumes the Rocket result inherits
+    // its affinity, gets formed into an executable for the rocket device,
+    // and that executable has no conv2d config to serialize. The failure is
+    // a serialization error naming a missing `input_width`, which is a long
+    // way from the cause.
+    %taps = arith.muli %kernel_height, %kernel_width : index
+
+    %final_nhwc = flow.dispatch.workgroups[
+        %output_height, %output_width, %channels](
+        %averaged, %init_nhwc, %taps, %output_height, %output_width, %channels)
+        : (tensor<1x?x?x?xf16>{%output_height, %output_width, %channels},
+           tensor<1x?x?x?xf32>{%output_height, %output_width, %channels},
+           index, index, index, index)
+        -> tensor<1x?x?x?xf32>{%output_height, %output_width, %channels}
+        attributes { stream.affinity = #hal.device.affinity<@cpu_device> } =
+        (%averaged_binding: !iree_tensor_ext.dispatch.tensor<readonly:tensor<1x?x?x?xf16>>,
+         %init_binding: !iree_tensor_ext.dispatch.tensor<readonly:tensor<1x?x?x?xf32>>,
+         %taps_arg: index,
+         %output_height_arg: index,
+         %output_width_arg: index,
+         %channels_arg: index,
+         %final_binding: !iree_tensor_ext.dispatch.tensor<writeonly:tensor<1x?x?x?xf32>>) {
+      %output_height_size = iree_tensor_ext.dispatch.workload.ordinal
+          %output_height_arg, 0 : index
+      %output_width_size = iree_tensor_ext.dispatch.workload.ordinal
+          %output_width_arg, 1 : index
+      %channels_size = iree_tensor_ext.dispatch.workload.ordinal
+          %channels_arg, 2 : index
+      %averaged_shaped = flow.dispatch.tie_shape %averaged_binding
+          : !iree_tensor_ext.dispatch.tensor<readonly:tensor<1x?x?x?xf16>>{
+              %output_height_size, %output_width_size, %channels_size}
+      %init_shaped = flow.dispatch.tie_shape %init_binding
+          : !iree_tensor_ext.dispatch.tensor<readonly:tensor<1x?x?x?xf32>>{
+              %output_height_size, %output_width_size, %channels_size}
+      %final_shaped = flow.dispatch.tie_shape %final_binding
+          : !iree_tensor_ext.dispatch.tensor<writeonly:tensor<1x?x?x?xf32>>{
+              %output_height_size, %output_width_size, %channels_size}
+      %averaged_loaded = iree_tensor_ext.dispatch.tensor.load %averaged_shaped,
+          offsets = [0, 0, 0, 0],
+          sizes = [1, %output_height_size, %output_width_size, %channels_size],
+          strides = [1, 1, 1, 1]
+          : !iree_tensor_ext.dispatch.tensor<readonly:tensor<1x?x?x?xf16>>{
+              %output_height_size, %output_width_size, %channels_size}
+          -> tensor<1x?x?x?xf16>
+      %init_loaded = iree_tensor_ext.dispatch.tensor.load %init_shaped,
+          offsets = [0, 0, 0, 0],
+          sizes = [1, %output_height_size, %output_width_size, %channels_size],
+          strides = [1, 1, 1, 1]
+          : !iree_tensor_ext.dispatch.tensor<readonly:tensor<1x?x?x?xf32>>{
+              %output_height_size, %output_width_size, %channels_size}
+          -> tensor<1x?x?x?xf32>
+      %taps_i32 = arith.index_cast %taps_arg : index to i32
+      %taps_f32 = arith.sitofp %taps_i32 : i32 to f32
+      %final_empty = tensor.empty(
+          %output_height_size, %output_width_size, %channels_size)
+          : tensor<1x?x?x?xf32>
+      %final_inner = linalg.generic {
+          indexing_maps = [
+            affine_map<(d0, d1, d2, d3) -> (d0, d1, d2, d3)>,
+            affine_map<(d0, d1, d2, d3) -> (d0, d1, d2, d3)>,
+            affine_map<(d0, d1, d2, d3) -> (d0, d1, d2, d3)>
+          ],
+          iterator_types = ["parallel", "parallel", "parallel", "parallel"]
+        } ins(%averaged_loaded, %init_loaded
+            : tensor<1x?x?x?xf16>, tensor<1x?x?x?xf32>)
+          outs(%final_empty : tensor<1x?x?x?xf32>) {
+        ^bb0(%average: f16, %initial: f32, %out: f32):
+          %average_f32 = arith.extf %average : f16 to f32
+          %sum = arith.mulf %average_f32, %taps_f32 : f32
+          %accumulated = arith.addf %sum, %initial : f32
+          linalg.yield %accumulated : f32
+      } -> tensor<1x?x?x?xf32>
+      iree_tensor_ext.dispatch.tensor.store %final_inner, %final_shaped,
+          offsets = [0, 0, 0, 0],
+          sizes = [1, %output_height_size, %output_width_size, %channels_size],
+          strides = [1, 1, 1, 1]
+          : tensor<1x?x?x?xf32>
+          -> !iree_tensor_ext.dispatch.tensor<writeonly:tensor<1x?x?x?xf32>>{
+              %output_height_size, %output_width_size, %channels_size}
+      flow.return
+    } count(%output_height_workload: index,
+            %output_width_workload: index,
+            %channels_workload: index) -> (index, index, index) {
+      %x, %y, %z = iree_tensor_ext.dispatch.workgroup_count_from_slice(
+          %output_height_workload,
+          %output_width_workload,
+          %channels_workload)
+      flow.return %x, %y, %z : index, index, index
+    }
+
+    // NHWC [1,H,W,C] -> NCHW [1,C,H,W].
+    %final_nchw_empty = tensor.empty(%channels, %output_height, %output_width) : tensor<1x?x?x?xf32>
+    %final_nchw = linalg.transpose
+        ins(%final_nhwc : tensor<1x?x?x?xf32>)
+        outs(%final_nchw_empty : tensor<1x?x?x?xf32>)
+        permutation = [0, 3, 1, 2]
+
+    util.return %final_nchw : tensor<1x?x?x?xf32>
+  }
 
   // Generic runtime-shape adapter. Batch remains statically one because it is
   // fixed by the Rocket Conv ABI. Every other logical Conv dimension is read
@@ -2188,6 +2606,88 @@ module attributes {transform.with_named_sequence} {
     util.return %final : tensor<1x?x?x?xi32>
   }
 
+  // The matmul matcher.
+  //
+  // `transform.iree.match.contraction` is the op that can check indexing
+  // maps, which is the whole difficulty here: `linalg.matmul` carries a
+  // transpose or a broadcast as an attribute rather than as a different op
+  // name, and a transposed B is a different memory layout that the
+  // height-one convolution lowering cannot pack. Pinning the three maps
+  // declines those without having to enumerate them.
+  //
+  // The bounds are the HAL's, and they are the reason Phase 5 of the plan
+  // ran before this matcher was written: K becomes the convolution's input
+  // channels and N its output channels, so `MAX_INPUT_CHANNELS` and
+  // `MAX_OUTPUT_CHANNELS` bound them at 1792 -- exactly MobileNetV2's
+  // classifier, measured at that shape rather than inferred from the 14x14
+  // sweep that already reached 1792 at a different geometry. M becomes the
+  // convolution *width*, which no constant bounds; 32 is where the ladder
+  // stops, so it is where this stops.
+  transform.named_sequence @match_rocket_matmul(%root: !transform.any_op {transform.readonly}) -> !transform.any_op {
+    transform.match.operation_name %root ["linalg.matmul"] : !transform.any_op
+    %batch, %m, %n, %k = transform.iree.match.contraction %root,
+        lhs_type = f32, rhs_type = f32, output_type = f32,
+        indexing_maps = [#rocket_matmul_lhs, #rocket_matmul_rhs, #rocket_matmul_out]
+        : !transform.any_op -> !transform.param<i64>
+    transform.iree.match.dims_equal %batch, [] : !transform.param<i64>
+
+    %lhs_value = transform.get_operand %root[0] : (!transform.any_op) -> !transform.any_value
+    %rhs_value = transform.get_operand %root[1] : (!transform.any_op) -> !transform.any_value
+    transform.iree.match.dim_bounds %lhs_value[0], umin = 1, umax = 32 : !transform.any_value
+    transform.iree.match.dim_bounds %lhs_value[1], umin = 1, umax = 1792 : !transform.any_value
+    transform.iree.match.dim_bounds %rhs_value[1], umin = 1, umax = 1792 : !transform.any_value
+    transform.yield %root : !transform.any_op
+  }
+
+  // The average-pool matcher.
+  //
+  // `transform.iree.match.convolution` works on a pooling op -- they
+  // implement `LinalgConvolutionOpInterface` too -- but it reports their
+  // dimensions differently from a convolution, and guessing wrong is a
+  // silent decline. Measured against a real `linalg.pooling_nchw_sum` with
+  // `iree-opt` before this was written:
+  //
+  //   batch    [1, C]   the channel is a pure parallel dim, so it lands here
+  //   out_img  [oh, ow]
+  //   out_ch   []       a pool has no output-channel dimension at all
+  //   in_ch    []
+  //   depth    []       and no depth dimension either, unlike a depthwise conv
+  //   filter   [kh, kw] from the shape-only window operand
+  //
+  // Bounds. The kernel must be 2..=8: 8 is `MAX_DIRECT_KERNEL`, which the
+  // hardware confirms and a 16x16 window is rejected at, and 2 is the floor
+  // because an fp16 average's reciprocal is `fp16(65536/k)` and `k = 1`
+  // needs 65536, past fp16's ceiling. Extents and channels stop at the PPU's
+  // 13-bit 8192. Stride is 1 because that is what the executable bakes.
+  //
+  // Wider images are not excluded: `PoolingPlan` splits them into tiles the
+  // hardware is measured to run, including the narrow ones an overlapping
+  // window needs (see `overlapping_window_width_limits`).
+  transform.named_sequence @match_pooling_nchw_sum_avg(%root: !transform.any_op {transform.readonly}) -> !transform.any_op {
+    transform.match.operation_name %root ["linalg.pooling_nchw_sum"] : !transform.any_op
+    %batch, %out_img, %out_ch, %filter, %in_ch, %depth, %strides, %dilations =
+        transform.iree.match.convolution %root,
+          lhs_type = f32, rhs_type = f32, output_type = f32
+          : !transform.any_op -> !transform.param<i64>
+    transform.iree.match.dims_equal %batch, [1, -1] : !transform.param<i64>
+    transform.iree.match.dims_equal %out_img, [-1, -1] : !transform.param<i64>
+    transform.iree.match.dims_equal %out_ch, [] : !transform.param<i64>
+    transform.iree.match.dims_equal %in_ch, [] : !transform.param<i64>
+    transform.iree.match.dims_equal %depth, [] : !transform.param<i64>
+    transform.iree.match.dims_equal %filter, [-1, -1] : !transform.param<i64>
+    transform.iree.match.dims_equal %strides, [1, 1] : !transform.param<i64>
+    transform.iree.match.dims_equal %dilations, [1, 1] : !transform.param<i64>
+
+    %input_value = transform.get_operand %root[0] : (!transform.any_op) -> !transform.any_value
+    %window_value = transform.get_operand %root[1] : (!transform.any_op) -> !transform.any_value
+    transform.iree.match.dim_bounds %input_value[1], umin = 1, umax = 8192 : !transform.any_value
+    transform.iree.match.dim_bounds %input_value[2], umin = 1, umax = 8192 : !transform.any_value
+    transform.iree.match.dim_bounds %input_value[3], umin = 1, umax = 8192 : !transform.any_value
+    transform.iree.match.dim_bounds %window_value[0], umin = 2, umax = 8 : !transform.any_value
+    transform.iree.match.dim_bounds %window_value[1], umin = 2, umax = 8 : !transform.any_value
+    transform.yield %root : !transform.any_op
+  }
+
   transform.named_sequence @match_dynamic_conv2d(%root: !transform.any_op {transform.readonly}) -> !transform.any_op {
     transform.match.operation_name %root ["linalg.conv_2d_nhwc_hwcf"] : !transform.any_op
     %batch, %out_img, %out_ch, %filter, %in_ch, %depth, %strides, %dilations =
@@ -2851,6 +3351,40 @@ module attributes {transform.with_named_sequence} {
   }
 
 
+  transform.named_sequence @cast_and_call_rocket_matmul(%root: !transform.any_op {transform.readonly}) {
+    %ins = transform.get_operand %root[all] : (!transform.any_op) -> !transform.any_value
+    %out = transform.get_result %root[all] : (!transform.any_op) -> !transform.any_value
+    %module = transform.util.get_nearest_symbol_table %root : (!transform.any_op) -> !transform.any_op
+    %topology_attr = transform.param.constant #hal.device.topology<links = [
+        (@rocket_device -> @cpu_device = {transparent_access = true, unified_memory = true}),
+        (@cpu_device -> @rocket_device = {transparent_access = true, unified_memory = true})
+      ]> -> !transform.any_param
+    transform.annotate %module "stream.topology" = %topology_attr : !transform.any_op, !transform.any_param
+    %executable = transform.util.import_symbol @rocket_matmul_executable into %module if undefined : (!transform.any_op) -> !transform.any_op
+    %func = transform.util.import_symbol @call_rocket_matmul into %module if undefined : (!transform.any_op) -> !transform.any_op
+    transform.util.cast_and_call %func(%ins) -> %out after %root {
+          transform.type_conversion.tensor.cast_shape_dynamic_dims
+      } : (!transform.any_op, !transform.any_value, !transform.any_value, !transform.any_op) -> !transform.any_op
+    transform.yield
+  }
+
+  transform.named_sequence @cast_and_call_pooling_avg_nchw(%root: !transform.any_op {transform.readonly}) {
+    %ins = transform.get_operand %root[all] : (!transform.any_op) -> !transform.any_value
+    %out = transform.get_result %root[all] : (!transform.any_op) -> !transform.any_value
+    %module = transform.util.get_nearest_symbol_table %root : (!transform.any_op) -> !transform.any_op
+    %topology_attr = transform.param.constant #hal.device.topology<links = [
+        (@rocket_device -> @cpu_device = {transparent_access = true, unified_memory = true}),
+        (@cpu_device -> @rocket_device = {transparent_access = true, unified_memory = true})
+      ]> -> !transform.any_param
+    transform.annotate %module "stream.topology" = %topology_attr : !transform.any_op, !transform.any_param
+    %executable = transform.util.import_symbol @rocket_pooling_executable into %module if undefined : (!transform.any_op) -> !transform.any_op
+    %func = transform.util.import_symbol @call_rocket_pooling_avg_nchw into %module if undefined : (!transform.any_op) -> !transform.any_op
+    transform.util.cast_and_call %func(%ins) -> %out after %root {
+          transform.type_conversion.tensor.cast_shape_dynamic_dims
+      } : (!transform.any_op, !transform.any_value, !transform.any_value, !transform.any_op) -> !transform.any_op
+    transform.yield
+  }
+
   transform.named_sequence @cast_and_call_dynamic_depthwise_conv2d_nchw(%root: !transform.any_op {transform.readonly}) {
     %ins = transform.get_operand %root[all] : (!transform.any_op) -> !transform.any_value
     %out = transform.get_result %root[all] : (!transform.any_op) -> !transform.any_value
@@ -3392,6 +3926,8 @@ module attributes {transform.with_named_sequence} {
         // itself is correct on hardware to f16 epsilon, so this is the cost
         // of f16, not of the NPU being wrong.
         transform.foreach_match in %func
+            @match_pooling_nchw_sum_avg -> @cast_and_call_pooling_avg_nchw,
+            @match_rocket_matmul -> @cast_and_call_rocket_matmul,
             @match_dynamic_conv2d -> @cast_and_call_dynamic_conv2d,
             @match_dynamic_conv2d_3x3 -> @cast_and_call_dynamic_conv2d,
             @match_dynamic_conv2d_s2 -> @cast_and_call_dynamic_conv2d_s2,

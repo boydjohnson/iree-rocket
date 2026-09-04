@@ -429,8 +429,8 @@ fp16 conv offload already uses.
 | 0 | **DONE** -- `.fbs` additions, regenerated bindings, round-trip tests | 11 schema tests |
 | 1 | **DONE** -- runtime decode arms, derived pad fill, `UkernelShape::Matmul`, `PoolingExecutable`/`MatmulExecutable` with push constants, NC1HWC2 repack on both ends of a pool; legacy tag 1 retired | 32 driver tests |
 | 2 | **DONE** -- `RocketTarget.cpp` config builders and serialization for both kernels | 6 lit tests, plus two compiler-produced fixtures decoded by the Rust runtime |
-| 3 | transform-spec executables, dispatch helpers and matchers (avg-pool first, matmul second) | lit tests mirroring `rocket_fp16_match_boundaries.mlir` |
-| 4 | e2e on both MobileNetV2 models: pool and matmul each offloaded once | `tools/e2e_conv_regression.py`, top-1/top-5 + max\|err\| |
+| 3 | **DONE** -- executables, dispatch helpers and matchers for both kernels | 2 boundary lit tests, 17/17 suite |
+| 4 | **DONE** -- both models compile with the pool and the matmul offloaded, and both run on `planck` | top-1/top-5 + max\|err\| against a CPU-only build |
 | 5 | **DONE** -- `MAX_INPUT_CHANNELS` 1344 -> 1792 on the FC geometry | `fc_matmul_geometry_matches_oracle`, 20/20 on `planck` |
 
 Phase 5 was the one that needed the board before the compiler work was worth
@@ -452,12 +452,50 @@ now written once, at a number that was measured rather than inferred.
    binding and a matcher that would have to claim two ops from the start.
    Revisit together with the pool's `divf`.
 
-## Still open
+## What Phase 3 settled
 
-**Match the sum+div pair, or offload the sum-pool as AVG and leave a
-compensating multiply on the CPU.** Unchanged recommendation: ship the
-second, measure, then fuse. This is a Phase 3 decision and nothing in the
-schema or the runtime forecloses either.
+**The sum-pool is offloaded as an AVG with a compensating multiply**, as
+recommended, and the multiply lives in the *replacement* rather than in the
+model: the hardware computes `sum/(kh*kw)`, `@call_rocket_pooling_avg_nchw`
+multiplies it back up, and the model's own divide then produces the average
+it was always going to. The matcher stays a single-op match, no DAG pairing.
+It costs one elementwise pass over the pooled result -- 1792 values on
+MobileNetV2.
+
+**Both matchers needed a fact that had to be measured, not guessed.**
+`transform.iree.match.convolution` does accept a `linalg.pooling_nchw_sum`
+(pooling ops implement `LinalgConvolutionOpInterface` too), but it reports
+their dimensions differently -- the channel lands in `batch`, and `out_ch`,
+`in_ch` and `depth` are all empty. Guessing wrong is a silent decline, so
+each param was pinned with `iree-opt` against a real op first; the matcher's
+own comment carries the table. For matmul the difficulty is different:
+`linalg.matmul` expresses a transpose by overriding its `indexing_maps`
+rather than by being a different op, so `transform.iree.match.contraction`
+-- which can check maps -- is what declines a transposed operand the
+height-one convolution lowering cannot pack.
+
+**One trap worth writing down.** An op that consumes the Rocket dispatch
+result inherits its affinity and is formed into an executable for the rocket
+device, which has no conv2d config to serialize. It surfaces as
+`executable target config is missing required key 'input_width'` -- a long
+way from the cause. Both replacements pin their post-dispatch work to the
+CPU with an explicit `flow.dispatch.workgroups`, which is why the
+convolution shims already did.
+
+## Measured end to end
+
+Both models, on `planck`, against a CPU-only build of the same model:
+
+    mnv2.fp16              max|err| 0.0147   top-1 and top-5 identical
+    mobilenetv2.static-int8 max|err| 0.0028   top-1 and top-5 identical
+
+The fp16 figure is inside the 0.0127-0.0172 band the conv offload already
+had, so the pool and the matmul did not move it. The int8 model reaches
+these matchers through `rocket-compiler`'s two-stage flow; a bare
+`iree-compile` cannot compile it, which is pre-existing and unrelated (see
+the pin-unclaimed-dispatches pass).
+
+## Still open
 
 **Pooling now has a hardware oracle** (`pooling_oracle_hw.rs`, 2026-09-04),
 and running it the first time found two real faults in a path that had never
