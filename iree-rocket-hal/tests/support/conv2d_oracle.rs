@@ -5,7 +5,8 @@ use iree_rocket_hal::rocket::{
     },
     tensor_layout::{
         pack_hwcf_to_rocket_weights, pack_hwcf_to_rocket_weights_affine_i8,
-        pack_hwcf_to_rocket_weights_padded, rocket_weight_storage_size,
+        pack_hwcf_to_rocket_weights_int4_padded, pack_hwcf_to_rocket_weights_padded,
+        pack_nhwc_to_nc1hwc2_int4, rocket_weight_storage_size, rocket_weight_storage_size_bits,
     },
 };
 
@@ -14,6 +15,19 @@ pub const FEATURE_ATOM_BYTES: usize = 16;
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum OraclePrecision {
     Fp16,
+    /// fp16 inputs and coefficients with the fp32 accumulator kept, rather
+    /// than narrowed back to fp16 on the way out.
+    Fp16Accumulator,
+    /// Signed 4-bit integers, two to a byte, accumulating into int16.
+    Int4,
+    /// tf32: fp16's mantissa with fp32's range, in a 4-byte container,
+    /// accumulating into fp32.
+    Tf32,
+    /// bfloat16, the 2-byte float with fp32 range and an 8-bit mantissa.
+    /// Shares every layout with fp16, so the same fixtures drive it.
+    Bf16,
+    /// Signed 16-bit integer inputs and coefficients, on the fp16 layout.
+    Int16,
     Int8,
     Int8Accumulator,
 }
@@ -22,9 +36,20 @@ impl OraclePrecision {
     pub fn name(self) -> &'static str {
         match self {
             Self::Fp16 => "fp16",
+            Self::Fp16Accumulator => "fp16-f32out",
+            Self::Int4 => "int4",
+            Self::Tf32 => "tf32",
+            Self::Bf16 => "bf16",
+            Self::Int16 => "int16",
             Self::Int8 => "int8",
             Self::Int8Accumulator => "int8-accumulator",
         }
+    }
+
+    /// Whether the precision requantizes, which is what decides whether the
+    /// case needs an output shift and a populated BS buffer.
+    pub fn is_quantized(self) -> bool {
+        matches!(self, Self::Int8)
     }
 }
 
@@ -59,6 +84,38 @@ pub enum OraclePattern {
     /// dense pattern has no small-term-count shortcut to fall back on if
     /// that stops holding.
     Dense { phase: usize },
+    /// One nonzero coefficient per output channel, with a deliberately
+    /// **wide** magnitude on one side of the product.
+    ///
+    /// This is the pattern that tells a datatype apart from a narrower one
+    /// sharing its layout. Every other pattern here keeps its operands
+    /// inside int8 and its accumulators inside fp16, so an int16 convolution
+    /// that was really reading bytes, or a bf16 one that was really reading
+    /// fp16, would still pass them. A single live tap keeps the accumulator
+    /// equal to one product, so the magnitude can be pushed to the edge of
+    /// the datatype without overflowing the output container.
+    ///
+    /// `wide_input` puts the wide magnitude on the feature side and holds
+    /// the coefficient at one; clearing it swaps the two, which is what
+    /// separates a wide feature path from a wide coefficient path.
+    WideOperands { phase: usize, wide_input: bool },
+}
+
+/// The wide magnitude [`OraclePattern::WideOperands`] uses, per precision.
+///
+/// int16 wants a value past int8 and inside int16. bf16 wants one past
+/// fp16's 65504 ceiling and exactly representable in bf16, which is what an
+/// eight-bit mantissa times a power of two gives.
+fn wide_magnitude(precision: OraclePrecision, index: usize, phase: usize) -> i32 {
+    let step = ((index + phase * 7) % 13) as i32;
+    match precision {
+        OraclePrecision::Int16 => 3000 + 137 * step,
+        // Eight significant bits times a power of two: exact in bf16, and
+        // therefore also in tf32's wider ten-bit mantissa, while sitting an
+        // order of magnitude past fp16's 65504 ceiling.
+        OraclePrecision::Bf16 | OraclePrecision::Tf32 => (128 + 9 * step) << 12,
+        other => panic!("{other:?} has no wide-operand magnitude"),
+    }
 }
 
 impl OraclePattern {
@@ -77,6 +134,12 @@ impl OraclePattern {
             Self::RawByteSweep => "raw-byte-sweep",
             Self::RawByteSweepUnit => "raw-byte-sweep-unit",
             Self::Dense { .. } => "dense",
+            Self::WideOperands {
+                wide_input: true, ..
+            } => "wide-input",
+            Self::WideOperands {
+                wide_input: false, ..
+            } => "wide-weight",
         }
     }
 }
@@ -96,18 +159,17 @@ pub struct Conv2dCase {
 
 impl Conv2dCase {
     pub fn output_shift(self) -> u32 {
-        if matches!(
-            self.precision,
-            OraclePrecision::Fp16 | OraclePrecision::Int8Accumulator
-        ) || matches!(
-            self.pattern,
-            OraclePattern::Selectors { .. }
-                | OraclePattern::SelectorsAffine { .. }
-                | OraclePattern::OneHotNeutral80 { .. }
-                | OraclePattern::RawByteSweep
-                | OraclePattern::RawByteSweepUnit
-                | OraclePattern::Dense { .. }
-        ) {
+        if !self.precision.is_quantized()
+            || matches!(
+                self.pattern,
+                OraclePattern::Selectors { .. }
+                    | OraclePattern::SelectorsAffine { .. }
+                    | OraclePattern::OneHotNeutral80 { .. }
+                    | OraclePattern::RawByteSweep
+                    | OraclePattern::RawByteSweepUnit
+                    | OraclePattern::Dense { .. }
+            )
+        {
             return 0;
         }
         let peak = self.cin * (self.kernel[0] * self.kernel[1]) as u32;
@@ -121,6 +183,11 @@ impl Conv2dCase {
     pub fn shape(self) -> Shape {
         let precision = match self.precision {
             OraclePrecision::Fp16 => Precision::Fp16,
+            OraclePrecision::Fp16Accumulator => Precision::Fp16Accumulator,
+            OraclePrecision::Int4 => Precision::Int4,
+            OraclePrecision::Tf32 => Precision::Tf32,
+            OraclePrecision::Bf16 => Precision::Bf16,
+            OraclePrecision::Int16 => Precision::Int16,
             OraclePrecision::Int8 => {
                 let (output_zero_point, multiplier) = match self.pattern {
                     OraclePattern::RawByteSweep => (-128, Multiplier::for_unit_bs(128.0)),
@@ -255,6 +322,65 @@ pub fn f32_to_f16(value: f32) -> u16 {
     sign | ((exponent as u16) << 10) | ((fraction >> 13) as u16)
 }
 
+/// Encodes a value that must be exactly representable in bf16.
+///
+/// bf16 is the top 16 bits of an fp32, so the encoding is a truncation and
+/// the exactness check is that the discarded 16 bits are zero -- the same
+/// shape of assertion [`f32_to_f16`] makes, one mantissa width over. Keeping
+/// it an assertion rather than a rounding is what lets the hardware
+/// comparison run at tolerance 0.0: an inexact fixture fails on the host
+/// instead of arriving on the board as an ambiguous near-miss.
+pub fn f32_to_bf16(value: f32) -> u16 {
+    let bits = value.to_bits();
+    assert_eq!(bits & 0xffff, 0, "{value} is not exact in bf16");
+    (bits >> 16) as u16
+}
+
+pub fn bf16_to_f32(bits: u16) -> f32 {
+    f32::from_bits(u32::from(bits) << 16)
+}
+
+/// Whether an integer accumulator survives a round trip through bf16.
+///
+/// bf16 carries nine significant bits, so this is the predicate a bf16
+/// hardware case has to satisfy for a tolerance-0.0 comparison to be fair.
+pub fn is_exact_in_bf16(value: i32) -> bool {
+    (value as f32).to_bits() & 0xffff == 0 && value as f32 as i32 == value
+}
+
+/// One bf16 ulp at `value` -- the spacing between adjacent bf16 numbers of
+/// that magnitude.
+///
+/// This is the tolerance a bf16 comparison needs when the exact accumulator
+/// has more than nine significant bits: the hardware converts an fp32
+/// accumulator on the way out, and which way it breaks a tie is not
+/// established, so a case that cannot be exact is held to one ulp rather
+/// than to a guessed rounding mode. Any layout, addressing or coverage
+/// error is orders of magnitude larger than this.
+pub fn bf16_ulp(value: f32) -> f32 {
+    if value == 0.0 {
+        return f32::from_bits(1 << 16);
+    }
+    let exponent_bits = value.abs().to_bits() & 0x7f80_0000;
+    // Eight explicit mantissa bits, so the step is 2^-8 of the binade.
+    f32::from_bits(exponent_bits) / 256.0
+}
+
+/// Whether an integer is exactly representable in fp16.
+///
+/// The predicate the fp32-result ladder turns on: fp16 carries an 11-bit
+/// significand, so it holds every integer to 2048 and then starts skipping.
+/// A case whose accumulator fails this is one the ordinary fp16 output
+/// could not have returned exactly, which is the whole reason to keep the
+/// accumulator.
+pub fn is_exact_in_fp16(value: i32) -> bool {
+    let magnitude = value.unsigned_abs();
+    if magnitude == 0 {
+        return true;
+    }
+    magnitude <= 65504 && (32 - magnitude.leading_zeros()) <= 11
+}
+
 pub fn f16_to_f32(bits: u16) -> f32 {
     let sign = ((bits >> 15) & 1) as u32;
     let exp = ((bits >> 10) & 0x1f) as u32;
@@ -276,20 +402,26 @@ pub fn f16_to_f32(bits: u16) -> f32 {
     f32::from_bits(word)
 }
 
-fn input_value(case: Conv2dCase, y: usize, x: usize, channel: usize) -> i8 {
+/// A logical input element.
+///
+/// Logical values are `i32` rather than `i8` so a pattern can exercise an
+/// operand wider than a byte. Every pattern that predates the wider
+/// datatypes stays inside int8 -- `logical_values_fit_the_precision` checks
+/// that, so an int8 case cannot silently truncate.
+fn input_value(case: Conv2dCase, y: usize, x: usize, channel: usize) -> i32 {
     match case.pattern {
         OraclePattern::Counting => 1,
         OraclePattern::Selectors { phase }
         | OraclePattern::SelectorsAffine { phase }
         | OraclePattern::Dense { phase } => {
-            ((y * 13 + x * 7 + channel * 3 + (y * x) % 5 + phase) % 7) as i8 - 3
+            ((y * 13 + x * 7 + channel * 3 + (y * x) % 5 + phase) % 7) as i32 - 3
         }
         OraclePattern::OneHotNeutral80 {
             phase,
             signed_input,
         } => {
             let linear = (y * case.width as usize + x) * case.cin as usize + channel;
-            let magnitude = 1 + ((linear + phase * 17) % 61) as i8;
+            let magnitude = 1 + ((linear + phase * 17) % 61) as i32;
             if signed_input && (linear + phase) % 2 != 0 {
                 -magnitude
             } else {
@@ -297,10 +429,24 @@ fn input_value(case: Conv2dCase, y: usize, x: usize, channel: usize) -> i8 {
             }
         }
         OraclePattern::RawByteSweep | OraclePattern::RawByteSweepUnit => 1,
+        OraclePattern::WideOperands { phase, wide_input } => {
+            if !wide_input {
+                // The narrow side alternates sign so a sign-extension bug on
+                // the wide coefficient still shows up.
+                return 1 - 2 * ((y + x + channel) % 2) as i32;
+            }
+            let linear = (y * case.width as usize + x) * case.cin as usize + channel;
+            let magnitude = wide_magnitude(case.precision, linear, phase);
+            if (linear + phase) % 2 == 0 {
+                magnitude
+            } else {
+                -magnitude
+            }
+        }
     }
 }
 
-fn selector_weights(case: Conv2dCase, output_channel: usize) -> [(usize, i8); 3] {
+fn selector_weights(case: Conv2dCase, output_channel: usize) -> [(usize, i32); 3] {
     let slots = case.kernel[0] * case.kernel[1] * case.cin as usize;
     assert!(
         slots >= 3,
@@ -312,7 +458,8 @@ fn selector_weights(case: Conv2dCase, output_channel: usize) -> [(usize, i8); 3]
         | OraclePattern::OneHotNeutral80 { .. }
         | OraclePattern::RawByteSweep
         | OraclePattern::RawByteSweepUnit
-        | OraclePattern::Dense { .. } => 0,
+        | OraclePattern::Dense { .. }
+        | OraclePattern::WideOperands { .. } => 0,
     };
     let first = (output_channel * 17 + phase * 11) % slots;
     let step = (slots / 3).max(1);
@@ -326,7 +473,8 @@ fn selector_weights(case: Conv2dCase, output_channel: usize) -> [(usize, i8); 3]
 fn one_hot_selector(case: Conv2dCase, output_channel: usize) -> usize {
     let slots = case.kernel[0] * case.kernel[1] * case.cin as usize;
     let phase = match case.pattern {
-        OraclePattern::OneHotNeutral80 { phase, .. } => phase,
+        OraclePattern::OneHotNeutral80 { phase, .. }
+        | OraclePattern::WideOperands { phase, .. } => phase,
         OraclePattern::Counting
         | OraclePattern::Selectors { .. }
         | OraclePattern::SelectorsAffine { .. }
@@ -352,7 +500,7 @@ fn weight_value(
     kx: usize,
     input_channel: usize,
     output_channel: usize,
-) -> i8 {
+) -> i32 {
     match case.pattern {
         OraclePattern::Counting => 1,
         OraclePattern::Selectors { .. } | OraclePattern::SelectorsAffine { .. } => {
@@ -364,18 +512,34 @@ fn weight_value(
         }
         OraclePattern::OneHotNeutral80 { .. } => {
             let selector = (ky * case.kernel[1] + kx) * case.cin as usize + input_channel;
-            i8::from(selector == one_hot_selector(case, output_channel))
+            i32::from(selector == one_hot_selector(case, output_channel))
         }
         OraclePattern::RawByteSweep | OraclePattern::RawByteSweepUnit => {
             assert_eq!((case.kernel, case.cin), ([1, 1], 1));
-            output_channel as u8 as i8
+            i32::from(output_channel as u8 as i8)
+        }
+        OraclePattern::WideOperands { phase, wide_input } => {
+            let selector = (ky * case.kernel[1] + kx) * case.cin as usize + input_channel;
+            if selector != one_hot_selector(case, output_channel) {
+                return 0;
+            }
+            if wide_input {
+                1
+            } else {
+                let magnitude = wide_magnitude(case.precision, output_channel, phase);
+                if (output_channel + phase) % 2 == 0 {
+                    magnitude
+                } else {
+                    -magnitude
+                }
+            }
         }
         OraclePattern::Dense { phase } => {
             // Every tap gets one of four small nonzero values -- dense,
             // unlike Selectors' near-total sparsity, but kept small so the
             // accumulator stays exactly representable in fp16 (verified by
             // hand for the shapes `Dense` targets; see its doc comment).
-            const VALUES: [i8; 4] = [-2, -1, 1, 2];
+            const VALUES: [i32; 4] = [-2, -1, 1, 2];
             let hash =
                 (ky * 97) ^ (kx * 89) ^ (input_channel * 13) ^ (output_channel * 7) ^ (phase * 3);
             VALUES[hash % 4]
@@ -440,6 +604,19 @@ pub fn expected_accumulator(
                 })
                 .sum()
         }
+        OraclePattern::WideOperands { .. } => {
+            let (ky, kx, channel) = decode_selector(case, one_hot_selector(case, output_channel));
+            let input_y = input_origin_y + ky as isize;
+            let input_x = input_origin_x + kx as isize;
+            if (0..case.height as isize).contains(&input_y)
+                && (0..case.width as isize).contains(&input_x)
+            {
+                input_value(case, input_y as usize, input_x as usize, channel)
+                    * weight_value(case, ky, kx, channel, output_channel)
+            } else {
+                0
+            }
+        }
         OraclePattern::OneHotNeutral80 { .. } => {
             let (ky, kx, channel) = decode_selector(case, one_hot_selector(case, output_channel));
             let input_y = input_origin_y + ky as isize;
@@ -447,18 +624,13 @@ pub fn expected_accumulator(
             if (0..case.height as isize).contains(&input_y)
                 && (0..case.width as isize).contains(&input_x)
             {
-                i32::from(input_value(
-                    case,
-                    input_y as usize,
-                    input_x as usize,
-                    channel,
-                ))
+                input_value(case, input_y as usize, input_x as usize, channel)
             } else {
                 0
             }
         }
         OraclePattern::RawByteSweep | OraclePattern::RawByteSweepUnit => {
-            output_channel as u8 as i8 as i32
+            i32::from(output_channel as u8 as i8)
         }
         OraclePattern::Dense { .. } => {
             let mut sum = 0i32;
@@ -494,13 +666,14 @@ pub fn expected_output(
     output_x: usize,
 ) -> i32 {
     let accumulator = expected_accumulator(case, output_channel, output_y, output_x);
-    match case.precision {
-        OraclePrecision::Fp16 | OraclePrecision::Int8Accumulator => accumulator,
-        OraclePrecision::Int8 => rounded_shift(accumulator, case.output_shift()).clamp(-128, 127),
+    if case.precision.is_quantized() {
+        rounded_shift(accumulator, case.output_shift()).clamp(-128, 127)
+    } else {
+        accumulator
     }
 }
 
-pub fn dense_reference(case: Conv2dCase, input: &[i8], weights: &[i8], bias: &[i32]) -> Vec<i32> {
+pub fn dense_reference(case: Conv2dCase, input: &[i32], weights: &[i32], bias: &[i32]) -> Vec<i32> {
     let shape = case.shape();
     let out_height = shape.output_height(case.kernel) as usize;
     let out_width = shape.output_width(case.kernel) as usize;
@@ -539,8 +712,7 @@ pub fn dense_reference(case: Conv2dCase, input: &[i8], weights: &[i8], bias: &[i
                                 + ic)
                                 * case.cout as usize)
                                 + oc;
-                            accumulator +=
-                                i32::from(input[input_index]) * i32::from(weights[weight_index]);
+                            accumulator += input[input_index] * weights[weight_index];
                         }
                     }
                 }
@@ -551,7 +723,7 @@ pub fn dense_reference(case: Conv2dCase, input: &[i8], weights: &[i8], bias: &[i
     output
 }
 
-fn logical_input(case: Conv2dCase) -> Vec<i8> {
+fn logical_input(case: Conv2dCase) -> Vec<i32> {
     let mut input = vec![0; case.height as usize * case.width as usize * case.cin as usize];
     for y in 0..case.height as usize {
         for x in 0..case.width as usize {
@@ -564,7 +736,7 @@ fn logical_input(case: Conv2dCase) -> Vec<i8> {
     input
 }
 
-fn logical_weights(case: Conv2dCase) -> Vec<i8> {
+fn logical_weights(case: Conv2dCase) -> Vec<i32> {
     let mut weights =
         vec![0; case.kernel[0] * case.kernel[1] * case.cin as usize * case.cout as usize];
     for ky in 0..case.kernel[0] {
@@ -597,6 +769,117 @@ fn affine_weight_zero_points(case: Conv2dCase) -> Vec<i8> {
         .collect()
 }
 
+/// Encodes one logical value in the storage form its precision uses.
+///
+/// The single place a logical `i32` becomes hardware bytes, so each
+/// datatype's representable range is checked once rather than separately for
+/// the feature and the coefficient buffer. A value the datatype cannot hold
+/// is an error rather than a silent truncation -- that is what keeps a
+/// fixture bug from arriving on the board looking like a hardware result.
+fn encode_element(precision: OraclePrecision, value: i32) -> Result<Vec<u8>, String> {
+    match precision {
+        // The operands are fp16 on both, so the exactness bound is fp16's
+        // whichever container the result lands in.
+        OraclePrecision::Fp16 | OraclePrecision::Fp16Accumulator => {
+            let exact = i32::from(i16::try_from(value).unwrap_or(i16::MAX)) == value
+                && (value as f32) as i32 == value
+                && value.abs() <= 2048;
+            if !exact {
+                return Err(format!("logical value {value} is not exact in fp16"));
+            }
+            Ok(f32_to_f16(value as f32).to_le_bytes().to_vec())
+        }
+        OraclePrecision::Bf16 => {
+            if !is_exact_in_bf16(value) {
+                return Err(format!("logical value {value} is not exact in bf16"));
+            }
+            Ok(f32_to_bf16(value as f32).to_le_bytes().to_vec())
+        }
+        OraclePrecision::Int16 => {
+            let value = i16::try_from(value)
+                .map_err(|_| format!("logical value {value} is outside int16"))?;
+            Ok(value.to_le_bytes().to_vec())
+        }
+        OraclePrecision::Int8 | OraclePrecision::Int8Accumulator => {
+            let value = i8::try_from(value)
+                .map_err(|_| format!("logical value {value} is outside int8"))?;
+            Ok(vec![value as u8])
+        }
+        // tf32 is fed as raw fp32; the hardware rounds the mantissa.
+        OraclePrecision::Tf32 => Ok((value as f32).to_le_bytes().to_vec()),
+        // int4 is not byte-addressable, so it never reaches this path: its
+        // fixtures go through the nibble packers instead.
+        OraclePrecision::Int4 => Err("int4 elements are packed as nibbles".to_string()),
+    }
+}
+
+/// The int4 fixture, built through the nibble packers.
+///
+/// Kept separate rather than threaded through the byte path: at half a byte
+/// an element has no address of its own, so the per-element
+/// `feature_offset`/`encode_element` route cannot express it. Everything
+/// else -- the logical values, the reference, the comparison -- is shared,
+/// so an int4 case is the same case as its int8 twin apart from the storage.
+fn build_int4_fixture(case: Conv2dCase, shape: Shape) -> Result<Conv2dFixture, String> {
+    let to_int4 = |values: Vec<i32>, what: &str| -> Result<Vec<i8>, String> {
+        values
+            .into_iter()
+            .map(|value| {
+                i8::try_from(value)
+                    .ok()
+                    .filter(|value| (-8..=7).contains(value))
+                    .ok_or_else(|| format!("logical {what} {value} is outside int4"))
+            })
+            .collect()
+    };
+
+    let dense_input = to_int4(logical_input(case), "input")?;
+    let mut input = vec![0; input_storage_bytes(shape)];
+    pack_nhwc_to_nc1hwc2_int4(
+        &dense_input,
+        case.height as usize * case.width as usize,
+        case.cin as usize,
+        &mut input,
+    )
+    .map_err(str::to_string)?;
+
+    let dense_weights = to_int4(logical_weights(case), "weight")?;
+    let packed_len = rocket_weight_storage_size_bits(
+        case.kernel[0],
+        case.kernel[1],
+        case.cin as usize,
+        shape.out_channels as usize,
+        4,
+    )
+    .map_err(str::to_string)?;
+    let mut weights = vec![0; packed_len];
+    pack_hwcf_to_rocket_weights_int4_padded(
+        &dense_weights,
+        case.kernel[0],
+        case.kernel[1],
+        case.cin as usize,
+        case.cout as usize,
+        shape.out_channels as usize,
+        &mut weights,
+    )
+    .map_err(str::to_string)?;
+    if weights.len() != shape.weight_bytes(case.kernel) as usize {
+        return Err(format!(
+            "packed int4 weight size {} does not match Shape::weight_bytes {}",
+            weights.len(),
+            shape.weight_bytes(case.kernel),
+        ));
+    }
+
+    Ok(Conv2dFixture {
+        case,
+        shape,
+        input,
+        weights,
+        bias: vec![0; shape.bs_buffer_bytes()],
+    })
+}
+
 pub fn build_fixture(case: Conv2dCase) -> Result<Conv2dFixture, String> {
     let logical_shape = case.shape();
     let shape = logical_shape
@@ -613,6 +896,9 @@ pub fn build_raw_fixture(case: Conv2dCase) -> Result<Conv2dFixture, String> {
 }
 
 fn build_fixture_for_shape(case: Conv2dCase, shape: Shape) -> Result<Conv2dFixture, String> {
+    if case.precision == OraclePrecision::Int4 {
+        return build_int4_fixture(case, shape);
+    }
     let logical_input = logical_input(case);
     let mut input = vec![0; input_storage_bytes(shape)];
     for y in 0..case.height as usize {
@@ -620,16 +906,8 @@ fn build_fixture_for_shape(case: Conv2dCase, shape: Shape) -> Result<Conv2dFixtu
             for channel in 0..case.cin as usize {
                 let logical_index = (y * case.width as usize + x) * case.cin as usize + channel;
                 let offset = feature_offset(shape, channel, y, x);
-                match case.precision {
-                    OraclePrecision::Fp16 => {
-                        input[offset..offset + 2].copy_from_slice(
-                            &f32_to_f16(f32::from(logical_input[logical_index])).to_le_bytes(),
-                        );
-                    }
-                    OraclePrecision::Int8 | OraclePrecision::Int8Accumulator => {
-                        input[offset] = logical_input[logical_index] as u8;
-                    }
-                }
+                let encoded = encode_element(case.precision, logical_input[logical_index])?;
+                input[offset..offset + encoded.len()].copy_from_slice(&encoded);
             }
         }
     }
@@ -640,16 +918,22 @@ fn build_fixture_for_shape(case: Conv2dCase, shape: Shape) -> Result<Conv2dFixtu
     let element_bytes = element_bytes(shape);
     let mut dense_weight_bytes = Vec::with_capacity(logical_weights.len() * element_bytes);
     match case.precision {
-        OraclePrecision::Fp16 => {
+        // int4 never reaches here -- `build_int4_fixture` returns earlier.
+        OraclePrecision::Fp16
+        | OraclePrecision::Bf16
+        | OraclePrecision::Int16
+        | OraclePrecision::Int4
+        | OraclePrecision::Tf32
+        | OraclePrecision::Fp16Accumulator => {
             for value in logical_weights {
-                dense_weight_bytes.extend_from_slice(&f32_to_f16(f32::from(value)).to_le_bytes());
+                dense_weight_bytes.extend_from_slice(&encode_element(case.precision, value)?);
             }
         }
         OraclePrecision::Int8 | OraclePrecision::Int8Accumulator => {
             if let Some(zero_points) = &weight_zero_points {
                 for (index, value) in logical_weights.into_iter().enumerate() {
                     let output_channel = index % case.cout as usize;
-                    let raw = i16::from(value) + i16::from(zero_points[output_channel]);
+                    let raw = value + i32::from(zero_points[output_channel]);
                     let raw = i8::try_from(raw).map_err(|_| {
                         format!(
                             "logical weight {value} plus output {output_channel} zero point {} is outside int8",
@@ -659,7 +943,9 @@ fn build_fixture_for_shape(case: Conv2dCase, shape: Shape) -> Result<Conv2dFixtu
                     dense_weight_bytes.push(raw as u8);
                 }
             } else {
-                dense_weight_bytes.extend(logical_weights.into_iter().map(|value| value as u8));
+                for value in logical_weights {
+                    dense_weight_bytes.extend_from_slice(&encode_element(case.precision, value)?);
+                }
             }
         }
     }
@@ -762,7 +1048,15 @@ fn build_fixture_for_shape(case: Conv2dCase, shape: Shape) -> Result<Conv2dFixtu
     }
 
     let bias = match case.precision {
-        OraclePrecision::Fp16 | OraclePrecision::Int8Accumulator => {
+        // Every unrequantized rung wants an all-zero BS buffer, which is
+        // zero in each of their encodings.
+        OraclePrecision::Fp16
+        | OraclePrecision::Bf16
+        | OraclePrecision::Int16
+        | OraclePrecision::Int4
+        | OraclePrecision::Tf32
+        | OraclePrecision::Fp16Accumulator
+        | OraclePrecision::Int8Accumulator => {
             vec![0; shape.bs_buffer_bytes()]
         }
         OraclePrecision::Int8 => {
@@ -807,7 +1101,7 @@ fn build_fixture_for_shape(case: Conv2dCase, shape: Shape) -> Result<Conv2dFixtu
 mod tests {
     use super::*;
 
-    fn logical_fixture(case: Conv2dCase) -> (Vec<i8>, Vec<i8>, Vec<i32>) {
+    fn logical_fixture(case: Conv2dCase) -> (Vec<i32>, Vec<i32>, Vec<i32>) {
         (
             logical_input(case),
             logical_weights(case),
@@ -982,8 +1276,8 @@ mod tests {
             for input_channel in 0..case.cin as usize {
                 let logical_index = input_channel * case.cout as usize + output_channel;
                 assert_eq!(
-                    packed[input_channel] as i8,
-                    logical[logical_index] + zero_points[output_channel],
+                    i32::from(packed[input_channel] as i8),
+                    logical[logical_index] + i32::from(zero_points[output_channel]),
                     "live weight oc={output_channel} ic={input_channel}",
                 );
             }
@@ -1011,9 +1305,7 @@ mod tests {
             Precision::Int8(quantization) => {
                 assert_eq!(quantization.multiplier, Multiplier::from_ratio(1.0),)
             }
-            Precision::Fp16 | Precision::Int8Accumulator(_) => {
-                panic!("affine selector unexpectedly built another precision")
-            }
+            other => panic!("affine selector unexpectedly built {other:?}"),
         }
     }
 

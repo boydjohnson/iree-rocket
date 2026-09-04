@@ -1198,12 +1198,10 @@ unsafe extern "C" fn dispatch(
                         element_size,
                         depthwise: false,
                         padded_channels: 0,
-                        weight_zero_point: match shape.precision {
-                            Precision::Fp16 => None,
-                            Precision::Int8(q) | Precision::Int8Accumulator(q) => {
-                                Some(q.weight_zero_point as i8)
-                            }
-                        },
+                        weight_zero_point: shape
+                            .precision
+                            .quantization()
+                            .map(|q| q.weight_zero_point as i8),
                     }),
                 );
                 scratch_buffers.push(scratch);
@@ -1253,12 +1251,10 @@ unsafe extern "C" fn dispatch(
                         element_size,
                         depthwise: true,
                         padded_channels: shape.depthwise_padded_channels() as usize,
-                        weight_zero_point: match shape.precision {
-                            Precision::Fp16 => None,
-                            Precision::Int8(q) | Precision::Int8Accumulator(q) => {
-                                Some(q.weight_zero_point as i8)
-                            }
-                        },
+                        weight_zero_point: shape
+                            .precision
+                            .quantization()
+                            .map(|q| q.weight_zero_point as i8),
                     }),
                 );
                 scratch_buffers.push(scratch);
@@ -1452,12 +1448,10 @@ unsafe extern "C" fn dispatch(
             let k = shape.k as usize;
             let n = shape.n as usize;
             let element_size = shape.precision.element_bytes() as usize;
-            let input_zero_point = match shape.precision {
-                Precision::Fp16 => 0,
-                Precision::Int8(quantization) | Precision::Int8Accumulator(quantization) => {
-                    quantization.input_zero_point
-                }
-            };
+            let input_zero_point = shape
+                .precision
+                .quantization()
+                .map_or(0, |quantization| quantization.input_zero_point);
             // fc.rs's real vendor-confirmed lowering has physical height
             // exactly one -- no `FC_PHYSICAL_HEIGHT` padding, so the
             // packed pixel count is just the logical row count `m`.

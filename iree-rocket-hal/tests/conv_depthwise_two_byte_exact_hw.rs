@@ -1,7 +1,15 @@
-//! Exact fp16 depthwise convolution check on real RK3588 hardware.
+//! Exact 2-byte depthwise convolution check on real RK3588 hardware.
 //!
-//! The fp16 depthwise path has never had a test that could fail on ordinary
-//! data. What exists is:
+//! Covers every 2-byte rung -- fp16, bf16 and int16 -- because the depthwise
+//! coefficient grouping is stated in *bytes*
+//! (`DEPTHWISE_GROUP_BYTES` = 64, so 32 channels at any 2-byte width) and
+//! the feature atom holds 8 channels at all three. If the depthwise path
+//! follows the element width the way the dense path does, one fixture drives
+//! all three with only the value encoding changed; this is the test that
+//! says whether it does, rather than assuming it.
+//!
+//! The fp16 depthwise path had no test that could fail on ordinary
+//! data. What existed was:
 //!
 //!   * `conv_depthwise_hw.rs` -- an impulse: one 1.0 per channel, so only the
 //!     window around it is nonzero and the result is the filter itself. It
@@ -39,10 +47,96 @@
 use std::{fs::OpenOptions, mem, os::unix::io::AsRawFd, ptr};
 
 use iree_rocket_hal::rocket::{
-    conv::{Buffers, ConvPlan, Kernels, Shape},
+    conv::{Buffers, ConvPlan, Kernels, Precision, Shape},
     device::{Buffer, JobDesc, close_bo, fini_bo, prep_bo, submit_jobs},
     tensor_layout::pack_depthwise_to_rocket_weights,
 };
+
+/// A 2-byte rung, and the value range whose accumulators it holds exactly.
+///
+/// The ranges differ because the exactness bound does: fp16 and int16 carry
+/// every integer to 2048 and 32767, but bf16's eight-bit significand stops
+/// at 256, so its fixture is scaled down until nine taps cannot leave the
+/// exact grid. The comparison stays tolerance-zero on all three -- a
+/// depthwise layout test has no business allowing rounding slack, since
+/// every error it hunts is a permutation rather than a rounding.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum TwoByte {
+    Fp16,
+    Bf16,
+    Int16,
+}
+
+impl TwoByte {
+    fn name(self) -> &'static str {
+        match self {
+            Self::Fp16 => "fp16",
+            Self::Bf16 => "bf16",
+            Self::Int16 => "int16",
+        }
+    }
+
+    fn precision(self) -> Precision {
+        match self {
+            Self::Fp16 => Precision::Fp16,
+            Self::Bf16 => Precision::Bf16,
+            Self::Int16 => Precision::Int16,
+        }
+    }
+
+    /// `(modulus, offset)` for the input generator: values land in
+    /// `-offset ..= modulus - 1 - offset`.
+    fn input_range(self) -> (usize, i32) {
+        match self {
+            Self::Fp16 | Self::Int16 => (31, 15),
+            Self::Bf16 => (15, 7),
+        }
+    }
+
+    /// The modulus must be coprime with the generator's tap stride of 5, or
+    /// the tap term vanishes and the fixture stops varying across taps
+    /// entirely -- a test that cannot see a tap permutation, which is one of
+    /// the two things it exists to catch.
+    /// `weight_generator_varies_across_every_axis` enforces it.
+    fn weight_range(self) -> (usize, i32) {
+        match self {
+            Self::Fp16 | Self::Int16 => (11, 5),
+            Self::Bf16 => (7, 3),
+        }
+    }
+
+    /// Largest accumulator the ranges above can produce over nine taps,
+    /// which must stay on the rung's exact integer grid.
+    fn peak_accumulator(self) -> i32 {
+        let (modulus, offset) = self.input_range();
+        let (weight_modulus, weight_offset) = self.weight_range();
+        let input = offset.max(modulus as i32 - 1 - offset);
+        let weight = weight_offset.max(weight_modulus as i32 - 1 - weight_offset);
+        (KERNEL[0] * KERNEL[1]) as i32 * input * weight
+    }
+
+    fn encode(self, value: f32) -> u16 {
+        match self {
+            Self::Fp16 => f32_to_f16(value),
+            Self::Bf16 => f32_to_bf16(value),
+            Self::Int16 => (value as i16) as u16,
+        }
+    }
+
+    fn decode(self, bits: u16) -> f32 {
+        match self {
+            Self::Fp16 => f16_to_f32(bits),
+            Self::Bf16 => f32::from_bits(u32::from(bits) << 16),
+            Self::Int16 => f32::from(bits as i16),
+        }
+    }
+}
+
+fn f32_to_bf16(value: f32) -> u16 {
+    let bits = value.to_bits();
+    assert_eq!(bits & 0xffff, 0, "{value} is not exact in bf16");
+    (bits >> 16) as u16
+}
 
 const DEVICE_PATH: &str = "/dev/accel/accel0";
 const PAGE_BYTES: usize = 4096;
@@ -94,14 +188,93 @@ fn f32_to_f16(value: f32) -> u16 {
 }
 
 /// Varies in all three axes, so a spatial or channel permutation shows up.
-fn input_at(y: usize, x: usize, c: usize) -> f32 {
-    (((y * 31 + x * 13 + c * 7) % 31) as i32 - 15) as f32
+///
+/// The `y` stride is 17, not 31. It was 31 while the modulus was also 31,
+/// which made `(y * 31) % 31` zero at every row: the fp16 fixture this file
+/// shipped with did not vary with `y` at all, and could not have seen a row
+/// permutation. Found by `weight_generator_varies_across_every_axis` rather
+/// than by a failing hardware run, which is the point of having it.
+fn input_at(precision: TwoByte, y: usize, x: usize, c: usize) -> f32 {
+    let (modulus, offset) = precision.input_range();
+    (((y * 17 + x * 13 + c * 7) % modulus) as i32 - offset) as f32
 }
 
 /// Distinct per (tap, channel) in both axes, so a tap permutation and a
 /// channel permutation each show up.
-fn weight_at(ky: usize, kx: usize, c: usize) -> f32 {
-    (((ky * KERNEL[1] + kx) * 5 + c * 2) % 11) as i32 as f32 - 5.0
+fn weight_at(precision: TwoByte, ky: usize, kx: usize, c: usize) -> f32 {
+    let (modulus, offset) = precision.weight_range();
+    (((ky * KERNEL[1] + kx) * 5 + c * 2) % modulus) as i32 as f32 - offset as f32
+}
+
+/// The generators have to vary along every axis they claim to.
+///
+/// Caught two real defects, one of them shipped. The `y` stride and the
+/// input modulus were both 31, so the fp16 fixture was constant down every
+/// column and blind to a row permutation. And bf16's scaled-down weight modulus was first chosen
+/// as 5, and the generator multiplies the tap index by 5 before taking the
+/// modulus, so `(tap * 5) % 5` is zero for every tap. Every coefficient in a
+/// channel became identical, and the bf16 arm passed on hardware while being
+/// structurally blind to a tap permutation -- the exact failure this whole
+/// file was written to stop being blind to.
+#[test]
+fn weight_generator_varies_across_every_axis() {
+    for precision in [TwoByte::Fp16, TwoByte::Bf16, TwoByte::Int16] {
+        let name = precision.name();
+        let taps: Vec<f32> = (0..KERNEL[0])
+            .flat_map(|ky| (0..KERNEL[1]).map(move |kx| (ky, kx)))
+            .map(|(ky, kx)| weight_at(precision, ky, kx, 0))
+            .collect();
+        assert!(
+            taps.iter().any(|value| *value != taps[0]),
+            "{name}: coefficients do not vary across taps"
+        );
+        let channels: Vec<f32> = (0..8).map(|c| weight_at(precision, 1, 1, c)).collect();
+        assert!(
+            channels.iter().any(|value| *value != channels[0]),
+            "{name}: coefficients do not vary across channels"
+        );
+        for (axis, values) in [
+            (
+                "y",
+                (0..8)
+                    .map(|y| input_at(precision, y, 0, 0))
+                    .collect::<Vec<_>>(),
+            ),
+            ("x", (0..8).map(|x| input_at(precision, 0, x, 0)).collect()),
+            ("c", (0..8).map(|c| input_at(precision, 0, 0, c)).collect()),
+        ] {
+            assert!(
+                values.iter().any(|value| *value != values[0]),
+                "{name}: inputs do not vary across {axis}"
+            );
+        }
+    }
+}
+
+/// Every fixture value, and every accumulator it can produce, must round-trip
+/// through its rung exactly -- otherwise a tolerance-zero comparison is
+/// measuring the encoding rather than the hardware.
+#[test]
+fn fixture_values_are_exact_in_every_two_byte_rung() {
+    for precision in [TwoByte::Fp16, TwoByte::Bf16, TwoByte::Int16] {
+        let peak = precision.peak_accumulator();
+        let significant = 32 - (peak as u32).leading_zeros();
+        let limit = match precision {
+            // Eleven- and eight-bit significands, and int16's whole range.
+            TwoByte::Fp16 => 11,
+            TwoByte::Bf16 => 9,
+            TwoByte::Int16 => 15,
+        };
+        assert!(
+            significant <= limit,
+            "{}: peak accumulator {peak} needs {significant} significant bits, past {limit}",
+            precision.name(),
+        );
+        // Round-trip the extremes of both generators through the encoding.
+        for value in [-8.0f32, -1.0, 0.0, 1.0, 5.0, 15.0] {
+            assert_eq!(precision.decode(precision.encode(value)), value);
+        }
+    }
 }
 
 /// Host-side: the coefficient grouping each tested channel count produces.
@@ -112,12 +285,13 @@ fn weight_at(ky: usize, kx: usize, c: usize) -> f32 {
 /// one *full* group. Everything below 32 is tail-only, which is a different
 /// code path in the same function.
 #[test]
-fn fp16_depthwise_coefficient_grouping() {
+fn two_byte_depthwise_coefficient_grouping() {
     const GROUP_CHANNELS: usize = 32; // DEPTHWISE_GROUP_BYTES / FP16_BYTES
     for channels in [8usize, 12, 20, 24, 32, 40, 64, 96, 144, 192, 288] {
-        let shape = Shape::with_out_channels(34, 34, 1, channels as u32, channels as u32)
-            .with_padding([0, 0])
-            .with_depthwise();
+        let shape =
+            Shape::with_precision(34, 34, 1, channels as u32, channels as u32, Precision::Fp16)
+                .with_padding([0, 0])
+                .with_depthwise();
         let padded = shape.weight_bytes(KERNEL) as usize / (KERNEL[0] * KERNEL[1] * FP16_BYTES);
         let full = padded / GROUP_CHANNELS;
         let tail = padded - full * GROUP_CHANNELS;
@@ -131,7 +305,7 @@ fn fp16_depthwise_coefficient_grouping() {
 #[ignore = "needs /dev/accel/accel0 -- cross-compile for aarch64 and run on the RK3588 board"]
 fn fp16_depthwise_exact_within_one_coefficient_group() {
     for channels in [8, 24] {
-        check_fp16_depthwise(channels, 34, 34, 1);
+        check_depthwise(TwoByte::Fp16, channels, 34, 34, 1);
     }
 }
 
@@ -141,7 +315,7 @@ fn fp16_depthwise_exact_across_coefficient_groups() {
     // 32 fp16 channels fill one 64-byte coefficient group; these span two,
     // three and four of them.
     for channels in [32, 40, 64, 96] {
-        check_fp16_depthwise(channels, 34, 34, 1);
+        check_depthwise(TwoByte::Fp16, channels, 34, 34, 1);
     }
 }
 
@@ -150,7 +324,7 @@ fn fp16_depthwise_exact_across_coefficient_groups() {
 fn fp16_depthwise_exact_at_partial_channel_atoms() {
     // Not multiples of 8, so the last feature atom is partly padding.
     for channels in [12, 20, 36] {
-        check_fp16_depthwise(channels, 34, 34, 1);
+        check_depthwise(TwoByte::Fp16, channels, 34, 34, 1);
     }
 }
 
@@ -160,17 +334,46 @@ fn fp16_depthwise_exact_at_stride_two() {
     // MobileNetV2's own stride-2 depthwise geometries, the ones a compiled
     // model dispatches.
     for (channels, extent) in [(144, 113), (192, 57), (288, 29)] {
-        check_fp16_depthwise(channels, extent, extent, 2);
+        check_depthwise(TwoByte::Fp16, channels, extent, extent, 2);
     }
 }
 
-fn check_fp16_depthwise(channels: usize, width: usize, height: usize, stride: u32) {
-    let shape = Shape::with_out_channels(
+/// The other two 2-byte rungs, on a representative slice of the fp16 ladder
+/// above: inside one coefficient group, across two and four of them, at a
+/// partial feature atom, and at a real stride-2 MobileNetV2 geometry.
+///
+/// The claim is that the depthwise path follows the element *width*, exactly
+/// as the dense path does, so bf16 and int16 inherit fp16's 32-channel
+/// coefficient group and 8-channel feature atom rather than needing their
+/// own. A narrower slice than fp16's because that claim is structural: if it
+/// holds at all it holds at every channel count, and if it fails it fails at
+/// the first group boundary.
+#[test]
+#[ignore = "needs /dev/accel/accel0 -- cross-compile for aarch64 and run on the RK3588 board"]
+fn bf16_depthwise_exact() {
+    for channels in [24, 32, 64, 20] {
+        check_depthwise(TwoByte::Bf16, channels, 34, 34, 1);
+    }
+    check_depthwise(TwoByte::Bf16, 144, 113, 113, 2);
+}
+
+#[test]
+#[ignore = "needs /dev/accel/accel0 -- cross-compile for aarch64 and run on the RK3588 board"]
+fn int16_depthwise_exact() {
+    for channels in [24, 32, 64, 20] {
+        check_depthwise(TwoByte::Int16, channels, 34, 34, 1);
+    }
+    check_depthwise(TwoByte::Int16, 144, 113, 113, 2);
+}
+
+fn check_depthwise(precision: TwoByte, channels: usize, width: usize, height: usize, stride: u32) {
+    let shape = Shape::with_precision(
         width as u32,
         height as u32,
         stride,
         channels as u32,
         channels as u32,
+        precision.precision(),
     )
     .with_padding([0, 0])
     .with_depthwise();
@@ -182,7 +385,10 @@ fn check_fp16_depthwise(channels: usize, width: usize, height: usize, stride: u3
     let padded_channels = weight_bytes / (kh * kw * FP16_BYTES);
     let in_surfaces = (shape.weight_channels() as usize).div_ceil(CHANNELS_PER_ATOM);
     let out_surfaces = (shape.padded_out_channels() as usize).div_ceil(CHANNELS_PER_ATOM);
-    let label = format!("Cin {channels}, {width}x{height}, stride {stride}");
+    let label = format!(
+        "{} Cin {channels}, {width}x{height}, stride {stride}",
+        precision.name()
+    );
 
     let file = OpenOptions::new()
         .read(true)
@@ -206,7 +412,7 @@ fn check_fp16_depthwise(channels: usize, width: usize, height: usize, stride: u3
                         + (c % CHANNELS_PER_ATOM) * FP16_BYTES;
                     ptr::write(
                         input.host_ptr.add(offset) as *mut u16,
-                        f32_to_f16(input_at(y, x, c)),
+                        precision.encode(input_at(precision, y, x, c)),
                     );
                 }
             }
@@ -219,7 +425,7 @@ fn check_fp16_depthwise(channels: usize, width: usize, height: usize, stride: u3
             for ky in 0..kh {
                 for kx in 0..kw {
                     let index = ((c * kh + ky) * kw + kx) * FP16_BYTES;
-                    let bits = f32_to_f16(weight_at(ky, kx, c));
+                    let bits = precision.encode(weight_at(precision, ky, kx, c));
                     dense[index..index + FP16_BYTES].copy_from_slice(&bits.to_le_bytes());
                 }
             }
@@ -318,7 +524,7 @@ fn check_fp16_depthwise(channels: usize, width: usize, height: usize, stride: u3
             let offset = (c / CHANNELS_PER_ATOM) * ow * oh * FEATURE_ATOM_BYTES
                 + (oy * ow + ox) * FEATURE_ATOM_BYTES
                 + (c % CHANNELS_PER_ATOM) * FP16_BYTES;
-            f16_to_f32(u16::from_le_bytes([raw[offset], raw[offset + 1]]))
+            precision.decode(u16::from_le_bytes([raw[offset], raw[offset + 1]]))
         };
 
         let mut mismatches = 0usize;
@@ -329,9 +535,12 @@ fn check_fp16_depthwise(channels: usize, width: usize, height: usize, stride: u3
                     let mut expected = 0.0f32;
                     for ky in 0..kh {
                         for kx in 0..kw {
-                            expected +=
-                                input_at(oy * stride as usize + ky, ox * stride as usize + kx, c)
-                                    * weight_at(ky, kx, c);
+                            expected += input_at(
+                                precision,
+                                oy * stride as usize + ky,
+                                ox * stride as usize + kx,
+                                c,
+                            ) * weight_at(precision, ky, kx, c);
                         }
                     }
                     let actual = read(oy, ox, c);
@@ -357,8 +566,12 @@ fn check_fp16_depthwise(channels: usize, width: usize, height: usize, stride: u3
                 let mut sum = 0.0f32;
                 for ky in 0..kh {
                     for kx in 0..kw {
-                        sum += input_at(oy * stride as usize + ky, ox * stride as usize + kx, cc)
-                            * weight_at(ky, kx, cc);
+                        sum += input_at(
+                            precision,
+                            oy * stride as usize + ky,
+                            ox * stride as usize + kx,
+                            cc,
+                        ) * weight_at(precision, ky, kx, cc);
                     }
                 }
                 sum
@@ -376,7 +589,7 @@ fn check_fp16_depthwise(channels: usize, width: usize, height: usize, stride: u3
                 }
             }
             panic!(
-                "fp16 depthwise at {label}: {mismatches} of {} elements wrong; \
+                "depthwise at {label}: {mismatches} of {} elements wrong; \
                  first at (y {oy}, x {ox}, c {c}): expected {expected}, got {actual}\n  \
                  at that pixel, wrong channels (dst<-src): {}",
                 oh * ow * channels,

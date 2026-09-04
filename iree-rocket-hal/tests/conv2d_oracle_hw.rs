@@ -32,11 +32,13 @@ use std::{
     panic::{AssertUnwindSafe, catch_unwind},
     ptr,
     sync::Mutex,
+    time::{Duration, Instant},
 };
 
 use conv2d_oracle::{
-    Conv2dCase, Conv2dFixture, OraclePattern, OraclePrecision, build_fixture, expected_output,
-    f16_to_f32, output_offset, output_storage_bytes,
+    Conv2dCase, Conv2dFixture, OraclePattern, OraclePrecision, bf16_to_f32, bf16_ulp,
+    build_fixture, expected_output, f16_to_f32, is_exact_in_bf16, is_exact_in_fp16, output_offset,
+    output_storage_bytes,
 };
 #[cfg(feature = "hardware-characterization")]
 use conv2d_oracle::{build_raw_fixture, feature_offset};
@@ -48,6 +50,36 @@ use iree_rocket_hal::rocket::{
 const DEVICE_PATH: &str = "/dev/accel/accel0";
 const PAGE_BYTES: usize = 4096;
 const PER_CASE_TIMEOUT_NS: u64 = 5_000_000_000;
+
+/// Dispatch wall time above which a failure is a killed job, not a result.
+///
+/// The RK3588 kernel driver's watchdog gives up on a hung NPU job at
+/// `JOB_TIMEOUT_MS` (500) plus a scheduler tick, resets the core, and
+/// signals the job fence **with an error**. `PREP_BO` waits on that fence
+/// and a fence signalled with an error is still signalled, so the ioctl
+/// returns success and the sweep reads a partly or wholly unwritten output
+/// buffer. Every "silent wrong result" of that kind is this.
+///
+/// The two regimes are nowhere near each other, which is what makes a wall
+/// clock a discriminator rather than a guess. Measured on planck
+/// 2026-09-03 across every ladder in this file, worst healthy case first:
+///
+/// ```text
+///   58.5 ms   28 tiles   the 226x226 VGG dense-coefficient blocks
+///   44.4 ms  112 tiles   the widest multi-tile sweep case
+///   ~500 ms   any        a job the watchdog killed
+/// ```
+///
+/// So the floor sits 2.6x above the worst healthy dispatch observed and
+/// 3.4x below the watchdog, and the time is not proportional to tile count
+/// -- 28 large tiles cost more than 112 small ones -- which is why this is
+/// a flat floor rather than a per-tile budget. A shape family bigger than
+/// anything here should re-measure with `ROCKET_DISPATCH_TIMES=1` rather
+/// than assume the headroom survived.
+///
+/// Set `ROCKET_DISPATCH_TIMES=1` to print every case's dispatch time, which
+/// is how the headroom above should be re-measured rather than assumed.
+const DISPATCH_TIMEOUT_FLOOR: Duration = Duration::from_millis(150);
 const OUTPUT_SENTINEL: u8 = 0xa5;
 // `nextest -j1` serializes test *processes*, but Rust's harness still runs
 // ignored tests in this binary concurrently. The RK3588 NPU is a single
@@ -156,6 +188,16 @@ struct CaseSuccess {
 struct CaseExecution {
     plan: ConvPlan,
     output: Vec<u8>,
+    /// Wall time from `SUBMIT` to `PREP_BO` returning.
+    ///
+    /// The only thing that separates a shape result from a job the kernel's
+    /// watchdog killed. `PREP_BO` waits on the output BO's `dma_resv`
+    /// fence, and a fence signalled *with an error* is still signalled, so
+    /// the ioctl returns success either way and the buffer looks plausible
+    /// while being half -- or entirely -- unwritten. The two regimes are
+    /// two orders of magnitude apart, so this is a discriminator rather
+    /// than a heuristic; see [`DISPATCH_TIMEOUT_FLOOR`].
+    dispatch: Duration,
     /// The staging buffer exactly as the DPU left it, before
     /// `assemble_staged_accumulator_output` reinterprets it. The layout
     /// probes read this: the assembled `output` already assumes the answer
@@ -257,6 +299,17 @@ fn compare_output(fixture: &Conv2dFixture, plan: &ConvPlan, output: &[u8]) -> Mi
     } else {
         0.0
     };
+    // bf16 carries nine significant bits, so an exact integer accumulator
+    // wider than that cannot be compared at tolerance 0.0 no matter how the
+    // hardware converts. `bf16_tolerance` is 0.0 for every value bf16 holds
+    // exactly and one ulp otherwise; see `bf16_ulp`.
+    let bf16_tolerance = |want: f32| {
+        if case.precision == OraclePrecision::Bf16 && !is_exact_in_bf16(want as i32) {
+            bf16_ulp(want)
+        } else {
+            tolerance
+        }
+    };
     let mut report = MismatchReport {
         mismatches: 0,
         max_abs_difference: 0.0,
@@ -272,7 +325,17 @@ fn compare_output(fixture: &Conv2dFixture, plan: &ConvPlan, output: &[u8]) -> Mi
                     OraclePrecision::Fp16 => {
                         f16_to_f32(u16::from_le_bytes([output[offset], output[offset + 1]]))
                     }
+                    OraclePrecision::Bf16 => {
+                        bf16_to_f32(u16::from_le_bytes([output[offset], output[offset + 1]]))
+                    }
+                    // int4 accumulates into int16 and is read back as one.
+                    OraclePrecision::Int16 | OraclePrecision::Int4 => {
+                        f32::from(i16::from_le_bytes([output[offset], output[offset + 1]]))
+                    }
                     OraclePrecision::Int8 => f32::from(output[offset] as i8),
+                    OraclePrecision::Tf32 | OraclePrecision::Fp16Accumulator => {
+                        f32::from_le_bytes(output[offset..offset + 4].try_into().unwrap())
+                    }
                     OraclePrecision::Int8Accumulator => {
                         i32::from_le_bytes(output[offset..offset + 4].try_into().unwrap()) as f32
                     }
@@ -280,7 +343,7 @@ fn compare_output(fixture: &Conv2dFixture, plan: &ConvPlan, output: &[u8]) -> Mi
                 let want = expected_output(case, channel, y, x) as f32;
                 let difference = (got - want).abs();
                 report.max_abs_difference = report.max_abs_difference.max(difference);
-                if !got.is_finite() || difference > tolerance {
+                if !got.is_finite() || difference > bf16_tolerance(want) {
                     report.mismatches += 1;
                     if let Some(tile) = tile_for_output(plan, y, x) {
                         report.tile_mismatches[tile] += 1;
@@ -392,9 +455,11 @@ fn execute_case_output_with_plan(
             })
             .collect::<Vec<_>>();
 
+        let started = Instant::now();
         submit_jobs(fd, &jobs).map_err(|error| format!("submit: {error}"))?;
         prep_bo(fd, output.buffer.handle, PER_CASE_TIMEOUT_NS)
             .map_err(|error| format!("completion wait: {error}"))?;
+        let dispatch = started.elapsed();
 
         let raw_output = std::slice::from_raw_parts(output.buffer.host_ptr, output_len).to_vec();
         #[cfg(feature = "hardware-characterization")]
@@ -412,6 +477,7 @@ fn execute_case_output_with_plan(
         Ok(CaseExecution {
             plan,
             output,
+            dispatch,
             #[cfg(feature = "hardware-characterization")]
             raw: raw_output,
             #[cfg(feature = "hardware-characterization")]
@@ -420,22 +486,44 @@ fn execute_case_output_with_plan(
     }
 }
 
-fn execute_case(file: &std::fs::File, fixture: &Conv2dFixture) -> Result<CaseSuccess, String> {
+/// One case's verdict, with the dispatch time that says whether the verdict
+/// is about the shape at all.
+struct CaseReport {
+    dispatch: Duration,
+    verdict: Result<CaseSuccess, String>,
+}
+
+impl CaseReport {
+    /// Whether this case's dispatch ran long enough to be a killed job
+    /// rather than a result.
+    fn timed_out(&self) -> bool {
+        self.verdict.is_err() && self.dispatch >= DISPATCH_TIMEOUT_FLOOR
+    }
+}
+
+fn execute_case(file: &std::fs::File, fixture: &Conv2dFixture) -> Result<CaseReport, String> {
     let execution = execute_case_output(file, fixture)?;
+    let dispatch = execution.dispatch;
     let report = compare_output(fixture, &execution.plan, &execution.output);
     if report.mismatches != 0 {
-        return Err(format!(
-            "{} mismatches, max|diff|={}, tile_mismatches={:?}\n      {}",
-            report.mismatches,
-            report.max_abs_difference,
-            report.tile_mismatches,
-            report.samples.join("\n      "),
-        ));
+        return Ok(CaseReport {
+            dispatch,
+            verdict: Err(format!(
+                "{} mismatches, max|diff|={}, tile_mismatches={:?}\n      {}",
+                report.mismatches,
+                report.max_abs_difference,
+                report.tile_mismatches,
+                report.samples.join("\n      "),
+            )),
+        });
     }
-    Ok(CaseSuccess {
-        data_banks: execution.plan.data_banks(),
-        weight_banks: execution.plan.weight_banks(),
-        tiles: execution.plan.tiles().len(),
+    Ok(CaseReport {
+        dispatch,
+        verdict: Ok(CaseSuccess {
+            data_banks: execution.plan.data_banks(),
+            weight_banks: execution.plan.weight_banks(),
+            tiles: execution.plan.tiles().len(),
+        }),
     })
 }
 
@@ -1509,6 +1597,7 @@ fn run_hardware_case_matrix(title: &str, cases: Vec<Conv2dCase>) {
     let resume = probe_resume_index();
     let only = probe_only_index();
     let mut failures = Vec::new();
+    let mut device_timeouts: Vec<String> = Vec::new();
     let mut sick_after = None;
     let mut attempted = 0usize;
     let mut skipped = 0usize;
@@ -1545,16 +1634,51 @@ fn run_hardware_case_matrix(title: &str, cases: Vec<Conv2dCase>) {
             execute_case(&file, &fixture)
         }));
         let failure = match result {
-            Ok(Ok(success)) => {
-                println!(
-                    "[{}/{}] ok   {label} banks={}/{} tiles={}",
-                    index + 1,
-                    total_cases,
-                    success.data_banks,
-                    success.weight_banks,
-                    success.tiles,
-                );
-                continue;
+            Ok(Ok(report)) => {
+                let dispatch = report.dispatch;
+                let timed_out = report.timed_out();
+                match report.verdict {
+                    Ok(success) => {
+                        println!(
+                            "[{}/{}] ok   {label} banks={}/{} tiles={}{}",
+                            index + 1,
+                            total_cases,
+                            success.data_banks,
+                            success.weight_banks,
+                            success.tiles,
+                            dispatch_note(dispatch),
+                        );
+                        continue;
+                    }
+                    // A dispatch this long did not produce a result to
+                    // disagree with: the watchdog killed the job and
+                    // `PREP_BO` returned success over an error-signalled
+                    // fence. Recording it as a shape failure is how a device
+                    // event gets written down as a hardware limit, which has
+                    // happened here before.
+                    Err(error) if timed_out => {
+                        println!(
+                            "[{}/{}] DEVICE TIMEOUT, not a shape result: {label}\n      \
+                             dispatch took {:.0} ms (healthy is milliseconds); the job was \
+                             killed by the watchdog and the output is partly unwritten\n      \
+                             {error}",
+                            index + 1,
+                            total_cases,
+                            dispatch.as_secs_f64() * 1e3,
+                        );
+                        device_timeouts.push(label.clone());
+                        continue;
+                    }
+                    Err(error) => {
+                        println!(
+                            "[{}/{}] FAIL {label}{}\n      {error}",
+                            index + 1,
+                            total_cases,
+                            dispatch_note(dispatch),
+                        );
+                        format!("{label}: {error}")
+                    }
+                }
             }
             Ok(Err(error)) => {
                 println!(
@@ -1590,6 +1714,12 @@ fn run_hardware_case_matrix(title: &str, cases: Vec<Conv2dCase>) {
         attempted - failures.len()
     );
     println!("  failed: {}", failures.len());
+    if !device_timeouts.is_empty() {
+        println!(
+            "  device timeouts (not measured): {}",
+            device_timeouts.len()
+        );
+    }
     if skipped != 0 {
         println!("  skipped: {skipped}");
     }
@@ -1617,11 +1747,53 @@ fn run_hardware_case_matrix(title: &str, cases: Vec<Conv2dCase>) {
         );
     }
 
+    if !device_timeouts.is_empty() {
+        println!(
+            "\n  {} case(s) were NOT MEASURED because the NPU job was killed mid-dispatch:",
+            device_timeouts.len()
+        );
+        for (index, label) in device_timeouts.iter().enumerate() {
+            println!("    {}. {label}", index + 1);
+        }
+        println!(
+            "  These are device events, not shape results, and are excluded from the verdict\n               above. Confirm with `sudo dmesg | grep -i npu` -- a killed job logs `NPU job timed\n               out` with a `CNA_S_STATUS 0x10008` signature. They cluster when the machine was\n               busy in the preceding second, which is why `cargo nextest` provokes them (it runs\n               cargo immediately before the test) and a one-second idle gap almost never does.\n               To measure one properly: ROCKET_PROBE_ONLY=<index>, after a short idle.\n               Set ROCKET_STRICT_DISPATCH=1 to make these fail the run instead."
+        );
+    }
+
     assert!(
         failures.is_empty(),
         "{} of {attempted} cases failed in {title}; complete diagnostics are above",
         failures.len(),
     );
+    assert!(
+        device_timeouts.is_empty() || !strict_dispatch(),
+        "{} of {attempted} cases in {title} were killed mid-dispatch and \
+         ROCKET_STRICT_DISPATCH is set",
+        device_timeouts.len(),
+    );
+}
+
+/// Whether a killed dispatch should fail the run.
+///
+/// Off by default. A killed job is a device event with no bearing on the
+/// code under test, and failing on it turns the gate into noise that stops
+/// being read -- which is worse than the alternative, because the summary
+/// block above is loud and counted. On for a run that must be clean.
+fn strict_dispatch() -> bool {
+    std::env::var("ROCKET_STRICT_DISPATCH").is_ok_and(|value| value != "0")
+}
+
+/// The per-case dispatch time, printed only when asked for.
+///
+/// This is how the headroom under [`DISPATCH_TIMEOUT_FLOOR`] gets
+/// re-measured on a new board or a new shape family, instead of the floor
+/// being carried forward on faith.
+fn dispatch_note(dispatch: Duration) -> String {
+    if std::env::var("ROCKET_DISPATCH_TIMES").is_ok() {
+        format!(" dispatch={:.1}ms", dispatch.as_secs_f64() * 1e3)
+    } else {
+        String::new()
+    }
 }
 #[cfg(feature = "hardware-characterization")]
 #[test]
@@ -1638,6 +1810,582 @@ fn dense_coefficient_vgg_blocks_match_oracle() {
     let cases = dense_coefficient_vgg_block_cases();
     assert_eq!(cases.len(), 5);
     run_hardware_case_matrix("dense-coefficient VGG block regression", cases);
+}
+
+/// The first hardware ladder for a datatype beyond fp16/int8.
+///
+/// bf16 is the cheapest rung to add -- a 2-byte element on the fp16 layout,
+/// so the only thing that moves in the register program is the precision
+/// field (asserted in `conv.rs`'s
+/// `two_byte_precisions_differ_from_fp16_only_in_the_precision_registers`).
+/// That makes this ladder a test of one claim: that field value 3 really is
+/// bf16 for the *convolution* datapath, not only for the matmul one the
+/// notes established it on.
+///
+/// The patterns are chosen for what each can prove. `Counting` covers every
+/// Cin lane but produces a spatially constant output, so it cannot catch an
+/// addressing bug at all; `Selectors` and `Dense` are what test layout. All
+/// three run at both kernel sizes and across the dense/surface feature
+/// layout boundary (Cin 3 is ARGB-dense, Cin >= 8 is surfaces).
+fn bf16_regression_cases() -> Vec<Conv2dCase> {
+    let mut cases = Vec::new();
+    for cin in [3u32, 64, 256] {
+        for cout in [64u32, 256] {
+            for kernel in [1usize, 3] {
+                cases.push(Conv2dCase {
+                    width: 28,
+                    height: 28,
+                    cin,
+                    cout,
+                    kernel: [kernel, kernel],
+                    stride: 1,
+                    padding: [kernel / 2, kernel / 2],
+                    precision: OraclePrecision::Bf16,
+                    pattern: OraclePattern::Counting,
+                });
+            }
+        }
+    }
+    for cin in [3u32, 64, 256] {
+        for cout in [64u32, 256] {
+            cases.push(Conv2dCase {
+                width: 28,
+                height: 28,
+                cin,
+                cout,
+                kernel: [3, 3],
+                stride: 1,
+                padding: [1, 1],
+                precision: OraclePrecision::Bf16,
+                pattern: OraclePattern::Selectors { phase: 0 },
+            });
+        }
+    }
+    // Small extents keep the dense accumulator inside bf16's nine
+    // significant bits, so these compare at tolerance 0.0 rather than at an
+    // ulp.
+    for cin in [8u32, 64] {
+        for cout in [16u32, 64] {
+            for kernel in [1usize, 3] {
+                cases.push(Conv2dCase {
+                    width: 8,
+                    height: 8,
+                    cin,
+                    cout,
+                    kernel: [kernel, kernel],
+                    stride: 1,
+                    padding: [kernel / 2, kernel / 2],
+                    precision: OraclePrecision::Bf16,
+                    pattern: OraclePattern::Dense { phase: 0 },
+                });
+            }
+        }
+    }
+    // Stride is programmed by the CNA, ahead of the precision stage, but a
+    // datatype that changed the feature pitch would show up here first.
+    cases.push(Conv2dCase {
+        width: 28,
+        height: 28,
+        cin: 64,
+        cout: 64,
+        kernel: [3, 3],
+        stride: 2,
+        padding: [1, 1],
+        precision: OraclePrecision::Bf16,
+        pattern: OraclePattern::Selectors { phase: 1 },
+    });
+    // The rest of this ladder keeps every value inside fp16's range, so it
+    // would pass just as well on hardware that had ignored the precision
+    // field and read fp16. These do not: each product is past fp16's 65504
+    // ceiling, which only bf16's fp32 exponent range can carry.
+    for wide_input in [true, false] {
+        for cin in [8u32, 64] {
+            cases.push(Conv2dCase {
+                width: 8,
+                height: 8,
+                cin,
+                cout: 64,
+                kernel: [3, 3],
+                stride: 1,
+                padding: [1, 1],
+                precision: OraclePrecision::Bf16,
+                pattern: OraclePattern::WideOperands {
+                    phase: 0,
+                    wide_input,
+                },
+            });
+        }
+    }
+    cases
+}
+
+/// The int16 counterpart, deliberately small.
+///
+/// int16 is the rung the notes flag as doubtful: the compute side is sound
+/// (precision field 1, established by hardware sweep) but their matmul work
+/// found no output writer that iterates a full result --
+/// `encodings/output-transpose-int16.md`. If that is a property of the DPU
+/// rather than of their matmul geometry, this ladder fails with a partially
+/// written output, which is a result worth having recorded.
+fn int16_probe_cases() -> Vec<Conv2dCase> {
+    let mut cases = Vec::new();
+    for cin in [3u32, 64] {
+        for kernel in [1usize, 3] {
+            cases.push(Conv2dCase {
+                width: 8,
+                height: 8,
+                cin,
+                cout: 64,
+                kernel: [kernel, kernel],
+                stride: 1,
+                padding: [kernel / 2, kernel / 2],
+                precision: OraclePrecision::Int16,
+                pattern: OraclePattern::Counting,
+            });
+        }
+    }
+    for cin in [3u32, 64] {
+        cases.push(Conv2dCase {
+            width: 8,
+            height: 8,
+            cin,
+            cout: 64,
+            kernel: [3, 3],
+            stride: 1,
+            padding: [1, 1],
+            precision: OraclePrecision::Int16,
+            pattern: OraclePattern::Selectors { phase: 0 },
+        });
+    }
+    // The cases above stay inside int8 on both operands, so they cannot tell
+    // a 16-bit element apart from a byte one. These put a value past int8 on
+    // one side of the product at a time.
+    for wide_input in [true, false] {
+        for cin in [8u32, 64] {
+            cases.push(Conv2dCase {
+                width: 8,
+                height: 8,
+                cin,
+                cout: 64,
+                kernel: [3, 3],
+                stride: 1,
+                padding: [1, 1],
+                precision: OraclePrecision::Int16,
+                pattern: OraclePattern::WideOperands {
+                    phase: 0,
+                    wide_input,
+                },
+            });
+        }
+    }
+    cases
+}
+
+/// The wide-operand cases must actually be wide, or the ladders they anchor
+/// prove nothing about the element width.
+///
+/// A datatype ladder built out of small values passes on hardware that
+/// ignored the precision field entirely, so this checks the premise on the
+/// host: every wide bf16 case carries a value past fp16's 65504 ceiling, and
+/// every wide int16 case one past int8's 127. It also builds each fixture,
+/// which is where `encode_element`'s per-datatype range checks run.
+/// The int4 ladder.
+///
+/// The trap the notes name for int4 is the coefficient N-group: at half a
+/// byte the 32-byte coefficient atom holds **64** kernels, and a filter
+/// packed with int8's 32 coincides with the correct order only inside a
+/// single input group. So `Cin` above 32 is not optional here -- 32 alone
+/// would pass under the wrong packing. Every case runs at `Cin` 64 or more,
+/// and the `Cout` ladder crosses the 64-kernel block boundary.
+///
+/// Patterns are the layout-sensitive ones. `Counting` is included for
+/// coverage of every lane but proves nothing about addressing; `Selectors`
+/// and `Dense` are what would catch a wrong nibble order or a wrong group.
+fn int4_regression_cases() -> Vec<Conv2dCase> {
+    let mut cases = Vec::new();
+    for cin in [32u32, 64, 128] {
+        for cout in [64u32, 128] {
+            for kernel in [1usize, 3] {
+                cases.push(Conv2dCase {
+                    width: 8,
+                    height: 8,
+                    cin,
+                    cout,
+                    kernel: [kernel, kernel],
+                    stride: 1,
+                    padding: [kernel / 2, kernel / 2],
+                    precision: OraclePrecision::Int4,
+                    pattern: OraclePattern::Counting,
+                });
+            }
+        }
+    }
+    for cin in [64u32, 128] {
+        for cout in [64u32, 128] {
+            for pattern in [
+                OraclePattern::Selectors { phase: 0 },
+                OraclePattern::Dense { phase: 0 },
+            ] {
+                cases.push(Conv2dCase {
+                    width: 8,
+                    height: 8,
+                    cin,
+                    cout,
+                    kernel: [3, 3],
+                    stride: 1,
+                    padding: [1, 1],
+                    precision: OraclePrecision::Int4,
+                    pattern,
+                });
+            }
+        }
+    }
+    // Wider extents, a stride, and a Cout past the 64-kernel coefficient
+    // block, which is where the write-out geometry stopped before `size_e`
+    // and the surface multiplier were corrected.
+    for (width, height, cin, cout, kernel, stride) in [
+        (16u32, 16u32, 64u32, 256u32, 3usize, 1u32),
+        (28, 28, 128, 128, 3, 1),
+        (28, 28, 64, 64, 3, 2),
+        (28, 28, 256, 64, 1, 1),
+    ] {
+        cases.push(Conv2dCase {
+            width,
+            height,
+            cin,
+            cout,
+            kernel: [kernel, kernel],
+            stride,
+            padding: [kernel / 2, kernel / 2],
+            precision: OraclePrecision::Int4,
+            pattern: OraclePattern::Dense { phase: 1 },
+        });
+    }
+    cases
+}
+
+/// The tf32 ladder.
+///
+/// tf32 is the only 4-byte input rung and the only one whose precision
+/// field is not uniform across stages, so two things are on trial: that
+/// field 7 at the CNA/CORE with fp32 (5) at the DPU really is tf32 for a
+/// convolution, and that the coefficient input group halves to 16 channels
+/// at four bytes.
+///
+/// The second is why `Cin` starts at 32. The notes make this rule twice,
+/// for int4 and again for tf32: at a shape with a single coefficient input
+/// group, the 16- and 32-channel groupings produce byte-identical buffers,
+/// so a `Cin` at or below the candidate group cannot tell them apart.
+fn tf32_regression_cases() -> Vec<Conv2dCase> {
+    let mut cases = Vec::new();
+    for cin in [32u32, 64, 128] {
+        for cout in [32u32, 64] {
+            for kernel in [1usize, 3] {
+                cases.push(Conv2dCase {
+                    width: 8,
+                    height: 8,
+                    cin,
+                    cout,
+                    kernel: [kernel, kernel],
+                    stride: 1,
+                    padding: [kernel / 2, kernel / 2],
+                    precision: OraclePrecision::Tf32,
+                    pattern: OraclePattern::Counting,
+                });
+            }
+        }
+    }
+    for cin in [32u32, 64] {
+        for cout in [32u32, 64] {
+            for pattern in [
+                OraclePattern::Selectors { phase: 0 },
+                OraclePattern::Dense { phase: 0 },
+            ] {
+                cases.push(Conv2dCase {
+                    width: 8,
+                    height: 8,
+                    cin,
+                    cout,
+                    kernel: [3, 3],
+                    stride: 1,
+                    padding: [1, 1],
+                    precision: OraclePrecision::Tf32,
+                    pattern,
+                });
+            }
+        }
+    }
+    cases.push(Conv2dCase {
+        width: 16,
+        height: 16,
+        cin: 64,
+        cout: 128,
+        kernel: [3, 3],
+        stride: 2,
+        padding: [1, 1],
+        precision: OraclePrecision::Tf32,
+        pattern: OraclePattern::Dense { phase: 1 },
+    });
+    // fp32 range is half of what tf32 buys over fp16 (the other half is the
+    // ten-bit mantissa, which the small-value cases above already exercise
+    // at tolerance 0.0). These products sit an order of magnitude past
+    // fp16's 65504.
+    for wide_input in [true, false] {
+        cases.push(Conv2dCase {
+            width: 8,
+            height: 8,
+            cin: 64,
+            cout: 64,
+            kernel: [3, 3],
+            stride: 1,
+            padding: [1, 1],
+            precision: OraclePrecision::Tf32,
+            pattern: OraclePattern::WideOperands {
+                phase: 0,
+                wide_input,
+            },
+        });
+    }
+    cases
+}
+
+/// The fp16-with-fp32-result ladder.
+///
+/// An fp16 convolution already accumulates in fp32; the ordinary path
+/// narrows on the way out, and this one does not. So the claim under test
+/// is not about arithmetic but about the writer, and the cases that carry
+/// it are the ones whose accumulator fp16 *cannot* hold: `Counting` at an
+/// odd `Cin`, where the result is `Cin` times the tap count and lands past
+/// 2048 with more than eleven significant bits. Those cases fail on the
+/// ordinary fp16 path by construction.
+///
+/// The rest of the ladder is the ordinary layout coverage, since a changed
+/// output cube (4 lanes rather than 8) is exactly the kind of thing that
+/// reads correct at one channel and wrong at the next.
+fn fp16_accumulator_regression_cases() -> Vec<Conv2dCase> {
+    let mut cases = Vec::new();
+    for cin in [3u32, 64, 256] {
+        for cout in [64u32, 256] {
+            for kernel in [1usize, 3] {
+                cases.push(Conv2dCase {
+                    width: 8,
+                    height: 8,
+                    cin,
+                    cout,
+                    kernel: [kernel, kernel],
+                    stride: 1,
+                    padding: [kernel / 2, kernel / 2],
+                    precision: OraclePrecision::Fp16Accumulator,
+                    pattern: OraclePattern::Counting,
+                });
+            }
+        }
+    }
+    for cin in [64u32, 256] {
+        for cout in [64u32, 256] {
+            for pattern in [
+                OraclePattern::Selectors { phase: 0 },
+                OraclePattern::Dense { phase: 0 },
+            ] {
+                cases.push(Conv2dCase {
+                    width: 8,
+                    height: 8,
+                    cin,
+                    cout,
+                    kernel: [3, 3],
+                    stride: 1,
+                    padding: [1, 1],
+                    precision: OraclePrecision::Fp16Accumulator,
+                    pattern,
+                });
+            }
+        }
+    }
+    // The discriminating cases. 515 * 9 = 4635 and 1027 * 9 = 9243, both
+    // past 2048 and both needing more than eleven significant bits, as do
+    // the reduced tap counts at the image edges.
+    for cin in [515u32, 1027] {
+        cases.push(Conv2dCase {
+            width: 8,
+            height: 8,
+            cin,
+            cout: 64,
+            kernel: [3, 3],
+            stride: 1,
+            padding: [1, 1],
+            precision: OraclePrecision::Fp16Accumulator,
+            pattern: OraclePattern::Counting,
+        });
+    }
+    cases.push(Conv2dCase {
+        width: 16,
+        height: 16,
+        cin: 256,
+        cout: 128,
+        kernel: [3, 3],
+        stride: 2,
+        padding: [1, 1],
+        precision: OraclePrecision::Fp16Accumulator,
+        pattern: OraclePattern::Dense { phase: 1 },
+    });
+    cases
+}
+
+#[test]
+fn fp16_accumulator_matrix_is_planable_and_gap_free() {
+    let cases = fp16_accumulator_regression_cases();
+    assert_eq!(cases.len(), 23);
+    assert_planable_and_gap_free(cases);
+}
+
+/// The ladder has to contain results the ordinary fp16 output could not
+/// return, or keeping the accumulator proves nothing.
+#[test]
+fn fp16_accumulator_ladder_leaves_the_fp16_grid() {
+    let mut beyond = 0;
+    for case in fp16_accumulator_regression_cases() {
+        let fixture = build_fixture(case).expect("fp16-f32out fixture must build");
+        let out_height = fixture.shape.output_height(case.kernel) as usize;
+        let out_width = fixture.shape.output_width(case.kernel) as usize;
+        for y in 0..out_height {
+            for x in 0..out_width {
+                for channel in 0..case.cout as usize {
+                    if !is_exact_in_fp16(expected_output(case, channel, y, x)) {
+                        beyond += 1;
+                    }
+                }
+            }
+        }
+    }
+    assert!(
+        beyond > 0,
+        "no case in the ladder produces a result fp16 cannot hold"
+    );
+}
+
+#[test]
+#[ignore = "needs /dev/accel/accel0 -- establishes the fp32 result writer on the fp16 datapath"]
+fn fp16_accumulator_matrix_matches_oracle() {
+    let cases = fp16_accumulator_regression_cases();
+    assert_eq!(cases.len(), 23);
+    run_hardware_case_matrix("fp16 fp32-result matrix", cases);
+}
+
+#[test]
+fn tf32_regression_matrix_is_planable_and_gap_free() {
+    let cases = tf32_regression_cases();
+    assert_eq!(cases.len(), 23);
+    assert_planable_and_gap_free(cases);
+}
+
+#[test]
+#[ignore = "needs /dev/accel/accel0 -- establishes tf32 (CNA/CORE field 7, DPU fp32) on the convolution datapath"]
+fn tf32_regression_matrix_matches_oracle() {
+    let cases = tf32_regression_cases();
+    assert_eq!(cases.len(), 23);
+    run_hardware_case_matrix("tf32 regression matrix", cases);
+}
+
+#[test]
+fn int4_regression_matrix_is_planable_and_gap_free() {
+    let cases = int4_regression_cases();
+    assert_eq!(cases.len(), 24);
+    assert_planable_and_gap_free(cases);
+}
+
+/// The int4 accumulator has to stay inside the int16 it is written to, and
+/// the operands inside a nibble -- both premises the ladder rests on.
+#[test]
+fn int4_cases_stay_inside_the_nibble_and_the_int16_result() {
+    for case in int4_regression_cases() {
+        let fixture = build_fixture(case).expect("int4 fixture must build");
+        let out_height = fixture.shape.output_height(case.kernel) as usize;
+        let out_width = fixture.shape.output_width(case.kernel) as usize;
+        for y in 0..out_height {
+            for x in 0..out_width {
+                for channel in 0..case.cout as usize {
+                    let want = expected_output(case, channel, y, x);
+                    assert!(
+                        i16::try_from(want).is_ok(),
+                        "{} accumulator {want} leaves int16",
+                        case.label(),
+                    );
+                }
+            }
+        }
+    }
+}
+
+#[test]
+#[ignore = "needs /dev/accel/accel0 -- establishes int4 (precision field 6) with its int16 result"]
+fn int4_regression_matrix_matches_oracle() {
+    let cases = int4_regression_cases();
+    assert_eq!(cases.len(), 24);
+    run_hardware_case_matrix("int4 regression matrix", cases);
+}
+
+#[test]
+fn wide_operand_cases_exceed_the_narrower_datatype() {
+    let mut checked = 0;
+    for case in bf16_regression_cases()
+        .into_iter()
+        .chain(int16_probe_cases())
+        .chain(tf32_regression_cases())
+    {
+        let fixture = build_fixture(case).expect("wide-operand fixture must build");
+        if !matches!(case.pattern, OraclePattern::WideOperands { .. }) {
+            continue;
+        }
+        checked += 1;
+        let shape = fixture.shape;
+        let out_height = shape.output_height(case.kernel) as usize;
+        let out_width = shape.output_width(case.kernel) as usize;
+        let mut peak = 0i32;
+        for y in 0..out_height {
+            for x in 0..out_width {
+                for channel in 0..case.cout as usize {
+                    peak = peak.max(expected_output(case, channel, y, x).abs());
+                }
+            }
+        }
+        let floor = match case.precision {
+            OraclePrecision::Bf16 | OraclePrecision::Tf32 => 65504,
+            OraclePrecision::Int16 => 127,
+            other => panic!("{other:?} has no wide-operand ladder"),
+        };
+        assert!(
+            peak > floor,
+            "{} peaks at {peak}, inside the narrower datatype's {floor}",
+            case.label(),
+        );
+    }
+    assert_eq!(
+        checked, 10,
+        "every wide-capable ladder must contribute cases"
+    );
+}
+
+#[test]
+fn bf16_regression_matrix_is_planable_and_gap_free() {
+    let cases = bf16_regression_cases();
+    assert_eq!(cases.len(), 31);
+    assert_planable_and_gap_free(cases);
+}
+
+#[test]
+#[ignore = "needs /dev/accel/accel0 -- establishes bf16 (precision field 3) on the convolution datapath"]
+fn bf16_regression_matrix_matches_oracle() {
+    let cases = bf16_regression_cases();
+    assert_eq!(cases.len(), 31);
+    run_hardware_case_matrix("bf16 regression matrix", cases);
+}
+
+#[test]
+#[ignore = "needs /dev/accel/accel0 -- characterizes int16 (precision field 1) convolution output"]
+fn int16_probe_matches_oracle() {
+    let cases = int16_probe_cases();
+    assert_eq!(cases.len(), 10);
+    run_hardware_case_matrix("int16 output characterization", cases);
 }
 
 #[test]
@@ -2065,6 +2813,7 @@ fn cartesian_conv2d_oracle_sweep_matches_oracle() {
         .open(DEVICE_PATH)
         .expect("failed to open RK3588 NPU device");
     let mut failures = Vec::new();
+    let mut device_timeouts: Vec<String> = Vec::new();
     let mut passed_by_kind = BTreeMap::<(&str, &str), usize>::new();
 
     println!(
@@ -2078,18 +2827,45 @@ fn cartesian_conv2d_oracle_sweep_matches_oracle() {
             execute_case(&file, &fixture)
         }));
         match result {
-            Ok(Ok(success)) => {
-                println!(
-                    "[{}/{}] ok   {label} banks={}/{} tiles={}",
-                    index + 1,
-                    total_cases,
-                    success.data_banks,
-                    success.weight_banks,
-                    success.tiles,
-                );
-                *passed_by_kind
-                    .entry((case.precision.name(), case.pattern.name()))
-                    .or_default() += 1;
+            Ok(Ok(report)) => {
+                let timed_out = report.timed_out();
+                let dispatch = report.dispatch;
+                match report.verdict {
+                    Ok(success) => {
+                        println!(
+                            "[{}/{}] ok   {label} banks={}/{} tiles={}{}",
+                            index + 1,
+                            total_cases,
+                            success.data_banks,
+                            success.weight_banks,
+                            success.tiles,
+                            dispatch_note(dispatch),
+                        );
+                        *passed_by_kind
+                            .entry((case.precision.name(), case.pattern.name()))
+                            .or_default() += 1;
+                    }
+                    Err(error) if timed_out => {
+                        println!(
+                            "[{}/{}] DEVICE TIMEOUT, not a shape result: {label}\n      \
+                             dispatch took {:.0} ms; the job was killed by the watchdog\n      \
+                             {error}",
+                            index + 1,
+                            total_cases,
+                            dispatch.as_secs_f64() * 1e3,
+                        );
+                        device_timeouts.push(label.clone());
+                    }
+                    Err(error) => {
+                        println!(
+                            "[{}/{}] FAIL {label}{}\n      {error}",
+                            index + 1,
+                            total_cases,
+                            dispatch_note(dispatch),
+                        );
+                        failures.push(format!("{label}: {error}"));
+                    }
+                }
             }
             Ok(Err(error)) => {
                 println!(
@@ -3049,6 +3825,175 @@ fn accumulator_written_lanes_probe() {
         "int8 accumulator written-lane count",
         accumulator_written_lanes_cases(),
     );
+}
+
+/// Prints the shape of what the DPU actually wrote for one case.
+///
+/// The int4 ladder failed with the output sentinel past channel 15, which is
+/// a write-out geometry question, not a compute one -- so the useful first
+/// measurement is *where* the bytes landed rather than what they were. This
+/// reports the contiguous written runs, and the per-surface hit map against
+/// the address model `output_offset` assumes.
+///
+/// `ROCKET_WRITE_MAP_CIN` / `_COUT` / `_K` pick the shape.
+#[cfg(feature = "hardware-characterization")]
+#[test]
+#[ignore = "requires the RK3588 NPU"]
+fn int4_output_write_map_probe() {
+    fn env(name: &str, fallback: u32) -> u32 {
+        std::env::var(name)
+            .ok()
+            .and_then(|value| value.parse().ok())
+            .unwrap_or(fallback)
+    }
+    let kernel = env("ROCKET_WRITE_MAP_K", 1) as usize;
+    // The control arm matters more than the int4 arm: the same map for a
+    // precision that is known good says whether a run-of-256 write pattern
+    // is int4-specific or just what this writer always does.
+    let precision = match std::env::var("ROCKET_WRITE_MAP_PRECISION").as_deref() {
+        Ok("int8") => OraclePrecision::Int8,
+        Ok("int16") => OraclePrecision::Int16,
+        Ok("fp16") => OraclePrecision::Fp16,
+        Ok("bf16") => OraclePrecision::Bf16,
+        _ => OraclePrecision::Int4,
+    };
+    let case = Conv2dCase {
+        width: env("ROCKET_WRITE_MAP_W", 8),
+        height: env("ROCKET_WRITE_MAP_H", 8),
+        cin: env("ROCKET_WRITE_MAP_CIN", 32),
+        cout: env("ROCKET_WRITE_MAP_COUT", 64),
+        kernel: [kernel, kernel],
+        stride: 1,
+        padding: [kernel / 2, kernel / 2],
+        precision,
+        // `Counting` is deliberately not the default: its output is
+        // constant, so every address model scores the same and the map
+        // cannot tell one from another. `Dense` gives every (pixel,
+        // channel) a distinct value.
+        pattern: match std::env::var("ROCKET_WRITE_MAP_PATTERN").as_deref() {
+            Ok("counting") => OraclePattern::Counting,
+            _ => OraclePattern::Dense { phase: 0 },
+        },
+    };
+    let _device_guard = NPU_TEST_LOCK
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    let file = OpenOptions::new()
+        .read(true)
+        .write(true)
+        .open(DEVICE_PATH)
+        .expect("failed to open RK3588 NPU device");
+    let fixture = build_fixture(case).expect("int4 fixture must build");
+    let execution = execute_case_output(&file, &fixture).expect("dispatch must complete");
+    let output = &execution.output;
+
+    println!("\n=== {} ===", case.label());
+    println!(
+        "  declared output bytes {} ({} surfaces of {} bytes)",
+        output.len(),
+        fixture.shape.output_blocks_per_pixel(),
+        fixture.shape.output_atom_bytes(),
+    );
+    let mut runs = Vec::new();
+    let mut start = None;
+    for (index, &byte) in output.iter().enumerate() {
+        match (byte != OUTPUT_SENTINEL, start) {
+            (true, None) => start = Some(index),
+            (false, Some(begin)) => {
+                runs.push((begin, index));
+                start = None;
+            }
+            _ => {}
+        }
+    }
+    if let Some(begin) = start {
+        runs.push((begin, output.len()));
+    }
+    println!("  written runs ({}):", runs.len());
+    for (begin, end) in runs.iter().take(24) {
+        println!("    @{begin} +{}", end - begin);
+    }
+
+    let out_height = fixture.shape.output_height(case.kernel) as usize;
+    let out_width = fixture.shape.output_width(case.kernel) as usize;
+    // Which logical (channel, y, x) does each written slot actually hold?
+    // Scoring the buffer against the whole expected set, rather than only
+    // against the address model, is what separates "the DPU stopped early"
+    // from "the DPU wrote somewhere else".
+    let mut expected = std::collections::HashMap::new();
+    for y in 0..out_height {
+        for x in 0..out_width {
+            for channel in 0..case.cout as usize {
+                expected
+                    .entry(expected_output(case, channel, y, x))
+                    .or_insert_with(Vec::new)
+                    .push((channel, y, x));
+            }
+        }
+    }
+    let element = fixture.shape.precision.output_element_bytes() as usize;
+    println!("  written slots, decoded (byte offset -> candidate logical positions):");
+    let mut shown = 0;
+    for (begin, end) in &runs {
+        for offset in (*begin..*end).step_by(element) {
+            if shown >= 16 {
+                break;
+            }
+            let value = i32::from(i16::from_le_bytes([output[offset], output[offset + 1]]));
+            let candidates = expected.get(&value).map_or(0, Vec::len);
+            let model = (0..case.cout as usize)
+                .flat_map(|c| {
+                    (0..out_height).flat_map(move |y| (0..out_width).map(move |x| (c, y, x)))
+                })
+                .find(|&(c, y, x)| output_offset(fixture.shape, case.kernel, c, y, x) == offset);
+            println!(
+                "    @{offset:<6} value {value:<8} model says {model:?}, {candidates} logical positions hold it"
+            );
+            shown += 1;
+        }
+        if shown >= 16 {
+            break;
+        }
+    }
+
+    println!("  per-channel verdict (channel: correct/written/total pixels):");
+    for channel in 0..case.cout as usize {
+        let mut correct = 0;
+        let mut written = 0;
+        for y in 0..out_height {
+            for x in 0..out_width {
+                let offset = output_offset(fixture.shape, case.kernel, channel, y, x);
+                let element = fixture.shape.precision.output_element_bytes() as usize;
+                let bytes = &output[offset..offset + element];
+                if bytes.iter().any(|&byte| byte != OUTPUT_SENTINEL) {
+                    written += 1;
+                }
+                let got = match case.precision {
+                    OraclePrecision::Fp16 => f16_to_f32(u16::from_le_bytes([bytes[0], bytes[1]])),
+                    OraclePrecision::Bf16 => bf16_to_f32(u16::from_le_bytes([bytes[0], bytes[1]])),
+                    OraclePrecision::Int16 | OraclePrecision::Int4 => {
+                        f32::from(i16::from_le_bytes([bytes[0], bytes[1]]))
+                    }
+                    OraclePrecision::Int8 => f32::from(bytes[0] as i8),
+                    OraclePrecision::Tf32 | OraclePrecision::Fp16Accumulator => {
+                        f32::from_le_bytes(bytes.try_into().unwrap())
+                    }
+                    OraclePrecision::Int8Accumulator => {
+                        i32::from_le_bytes(bytes.try_into().unwrap()) as f32
+                    }
+                };
+                if got == expected_output(case, channel, y, x) as f32 {
+                    correct += 1;
+                }
+            }
+        }
+        if channel < 20 || correct != 0 || written != 0 {
+            println!(
+                "    c={channel:<4} {correct}/{written}/{}",
+                out_height * out_width
+            );
+        }
+    }
 }
 
 #[cfg(feature = "hardware-characterization")]

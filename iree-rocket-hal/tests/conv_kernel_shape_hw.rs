@@ -162,6 +162,7 @@ unsafe fn fill_input(base: *mut u8, size: usize, shape: Shape, surfaces: usize) 
                         Precision::Int8(_) | Precision::Int8Accumulator(_) => {
                             ptr::write(base.add(offset), 1u8)
                         }
+                        other => unimplemented!("{other:?} is outside this fp16/int8 harness"),
                     }
                 }
             }
@@ -227,6 +228,7 @@ fn run(plan: &ConvPlan, shift: u32) -> Result<BTreeSet<i32>, Failure> {
             Precision::Int8(_) | Precision::Int8Accumulator(_) => {
                 ptr::write_bytes(buf_weights.host_ptr, 1, weight_bytes)
             }
+            other => unimplemented!("{other:?} is outside this fp16/int8 harness"),
         }
 
         // At fp16 BRDMA fetches only the bias and a zeroed buffer is right.
@@ -237,6 +239,7 @@ fn run(plan: &ConvPlan, shift: u32) -> Result<BTreeSet<i32>, Failure> {
             Precision::Int8(_) | Precision::Int8Accumulator(_) => {
                 page_aligned_size(shape.bs_buffer_bytes())
             }
+            other => unimplemented!("{other:?} is outside this fp16/int8 harness"),
         };
         let buf_bias = Buffer::new(fd, bias_bytes, &file);
         ptr::write_bytes(buf_bias.host_ptr, 0, buf_bias.size);
@@ -334,6 +337,7 @@ fn run(plan: &ConvPlan, shift: u32) -> Result<BTreeSet<i32>, Failure> {
             Precision::Fp16 => 0.0,
             Precision::Int8(_) => 1.0,
             Precision::Int8Accumulator(_) => unreachable!("this probe expects narrowed output"),
+            other => unimplemented!("{other:?} is outside this fp16/int8 harness"),
         };
         for y in 0..out_height {
             for x in 0..out_width {
@@ -353,6 +357,7 @@ fn run(plan: &ConvPlan, shift: u32) -> Result<BTreeSet<i32>, Failure> {
                     Precision::Int8Accumulator(_) => {
                         unreachable!("this probe expects narrowed output")
                     }
+                    other => unimplemented!("{other:?} is outside this fp16/int8 harness"),
                 };
                 // Only the real output channels are checked. What the
                 // hardware leaves in the padding lanes of the last granule is
@@ -374,6 +379,7 @@ fn run(plan: &ConvPlan, shift: u32) -> Result<BTreeSet<i32>, Failure> {
                         Precision::Int8Accumulator(_) => {
                             unreachable!("this probe expects narrowed output")
                         }
+                        other => unimplemented!("{other:?} is outside this fp16/int8 harness"),
                     };
                     let difference = got - want as f32;
                     failure.differences.insert(difference as i32);
@@ -440,6 +446,7 @@ fn attempt(plan: &ConvPlan, shift: u32, failures: &mut Vec<String>) {
         Precision::Fp16 => "fp16",
         Precision::Int8(_) => "int8",
         Precision::Int8Accumulator(_) => "int8-accumulator",
+        other => unimplemented!("{other:?} is outside this fp16/int8 harness"),
     };
     let label = format!(
         "{}x{} Cin {:>2} Cout {:>3} k{}x{} p{}x{} {precision} d{}/w{}",

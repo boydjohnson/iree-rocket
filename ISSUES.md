@@ -485,7 +485,7 @@ and the model and the hardware disagree on half of them.
 
 ---
 
-## C3 (S1) — the hung-job dispatch guard the memory says is shipped is not in the tree
+## C3 (S1) — RESOLVED 2026-09-03: the hung-job dispatch guard is now in the tree, in both places
 
 `npu-wedges-after-failed-job` states, as settled:
 
@@ -520,6 +520,32 @@ watchdog-killed one 507–534 ms (this repo's own measurement), and
 
 See also C7 — this is one of several instruments the memories describe that were
 never committed.
+
+### Resolution
+
+Both halves are implemented and measured, prompted by a real instance:
+`fp16_accumulator_matrix_matches_oracle` failed 3/3 under
+`cargo nextest run --release -j1 -- --include-ignored` while the other 361
+tests passed, and it was this hazard rather than a shape result.
+
+* `run_hardware_case_matrix` (`tests/conv2d_oracle_hw.rs`) times each
+  `SUBMIT` → `PREP_BO` round trip and labels a failure past
+  `DISPATCH_TIMEOUT_FLOOR` (150 ms) as `DEVICE TIMEOUT, not a shape result`,
+  counted and named in the summary but excluded from the verdict.
+  `ROCKET_STRICT_DISPATCH=1` makes them fail instead;
+  `ROCKET_DISPATCH_TIMES=1` prints every dispatch so the floor can be
+  re-measured rather than trusted.
+* `queue_execute` (`rocket-hal-driver/src/device.rs`) times each fenced task
+  and returns `IREE_STATUS_DEADLINE_EXCEEDED` past `HUNG_JOB_DISPATCH_FLOOR`
+  (250 ms) with one stderr line pointing at dmesg, so a killed job stops
+  reaching the caller as a plausible-looking output buffer.
+
+Floors chosen from measurement, not carried over: healthy dispatches are
+3.13 ms at worst across MobileNetV2 fp16's 54 real dispatches and 58.5 ms at
+worst across every hardware ladder in this repo (226x226, 28 tiles), against
+~500 ms for a killed job. Verified: 12 consecutive clean `iree-run-module`
+runs with no false positive, and 10 back-to-back harness runs where the hang
+struck 5 times, was labelled every time, and left the gate green.
 
 ---
 

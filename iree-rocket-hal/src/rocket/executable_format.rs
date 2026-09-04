@@ -119,6 +119,53 @@ pub fn encode_conv_shape_v1(shape: &conv::Shape, kernels: Kernels) -> Vec<u8> {
             0.0f32,
             Multiplier { scale: 0, shift: 0 },
         ),
+        // The unquantized rungs added alongside fp16 carry no calibration,
+        // so they encode exactly as fp16 does apart from the tag.
+        Precision::Bf16 => (
+            3u32,
+            0i32,
+            0i32,
+            0i32,
+            0.0f32,
+            0.0f32,
+            Multiplier { scale: 0, shift: 0 },
+        ),
+        Precision::Fp16Accumulator => (
+            7u32,
+            0i32,
+            0i32,
+            0i32,
+            0.0f32,
+            0.0f32,
+            Multiplier { scale: 0, shift: 0 },
+        ),
+        Precision::Tf32 => (
+            6u32,
+            0i32,
+            0i32,
+            0i32,
+            0.0f32,
+            0.0f32,
+            Multiplier { scale: 0, shift: 0 },
+        ),
+        Precision::Int4 => (
+            5u32,
+            0i32,
+            0i32,
+            0i32,
+            0.0f32,
+            0.0f32,
+            Multiplier { scale: 0, shift: 0 },
+        ),
+        Precision::Int16 => (
+            4u32,
+            0i32,
+            0i32,
+            0i32,
+            0.0f32,
+            0.0f32,
+            Multiplier { scale: 0, shift: 0 },
+        ),
         Precision::Int8(Quantization {
             input_zero_point,
             output_zero_point,
@@ -247,6 +294,11 @@ pub fn decode_conv_shape_v1(payload: &[u8]) -> Result<(conv::Shape, Kernels), De
             },
         }),
         1 => Precision::Fp16,
+        3 => Precision::Bf16,
+        4 => Precision::Int16,
+        5 => Precision::Int4,
+        6 => Precision::Tf32,
+        7 => Precision::Fp16Accumulator,
         2 => Precision::Int8Accumulator(Quantization {
             input_zero_point,
             output_zero_point,
@@ -373,6 +425,11 @@ mod tests {
         let (base, kernels) = known_good_shape();
         for precision in [
             Precision::Fp16,
+            Precision::Fp16Accumulator,
+            Precision::Bf16,
+            Precision::Int16,
+            Precision::Int4,
+            Precision::Tf32,
             Precision::Int8(Quantization {
                 input_zero_point: -7,
                 output_zero_point: 3,
@@ -448,12 +505,14 @@ mod tests {
     fn decode_rejects_invalid_precision_tag() {
         let (shape, kernels) = known_good_shape();
         let mut bytes = encode_conv_shape_v1(&shape, kernels);
-        // precision_tag is the last u32 in the 84-byte payload.
+        // precision_tag is the last u32 in the 84-byte payload. Pick a
+        // value past every assigned tag rather than a fixed one, so adding
+        // a rung moves this instead of silently making it test nothing.
         let last = bytes.len() - 4;
-        bytes[last..].copy_from_slice(&7u32.to_le_bytes());
+        bytes[last..].copy_from_slice(&99u32.to_le_bytes());
         assert_eq!(
             decode_conv_shape_v1(&bytes),
-            Err(DecodeError::InvalidPrecisionTag(7))
+            Err(DecodeError::InvalidPrecisionTag(99))
         );
     }
 
