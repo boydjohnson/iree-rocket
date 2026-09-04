@@ -1653,6 +1653,29 @@ unsafe extern "C" fn queue_execute(
                             .collect();
                         regs.sort();
                         regs.dedup();
+                        // The PC trailer is order-sensitive and would be
+                        // destroyed by the sort above, so print the tail
+                        // verbatim: it carries the enable mask that says which
+                        // hardware blocks participate in this job.
+                        let tail: Vec<String> = first
+                            .iter()
+                            .rev()
+                            .take(8)
+                            .rev()
+                            .map(|c| {
+                                format!(
+                                    "{:#04x}:{:#06x}={:#010x}",
+                                    (c.0 >> 48) & 0xff,
+                                    (c.0 & 0xffff) as u16,
+                                    ((c.0 >> 16) & 0xffff_ffff) as u32,
+                                )
+                            })
+                            .collect();
+                        eprintln!(
+                            "rocket: trailer prec={} {}",
+                            precision_label(job.precision_tag),
+                            tail.join(" ")
+                        );
                         eprintln!(
                             "rocket: regset prec={} n={} {}",
                             precision_label(job.precision_tag),

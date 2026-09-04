@@ -867,6 +867,63 @@ or the DPU write-back FSM -- and those are the next place to look, not the
 program.
 
 
+
+### CBUF and the rest of the program, 2026-09-04: also clean
+
+Following the register diff, the remaining parts of the program were checked
+with `ROCKET_DUMP_REGSET` (values) against both `../rocket-userspace` and this
+repo's own two precisions. Nothing here is wrong either.
+
+**The PC trailer and enable mask are identical.** Both precisions emit
+`0x41:0x0000=0x0` then `0x81:0x0008=0x1d`. `gen_conv2d_task`
+(npu_regcmd.c:2521) emits `NPUOP(OP_ENABLE, 0x1D, PC_OPERATION_ENABLE)` -- the
+same word. The trailer cannot be the differentiator.
+
+**CBUF bank programming is correct and is not precision-specific.**
+`CNA_CBUF_CON0` decodes as the reference's
+`(weight_bank << 4) | data_bank | reuse bits`:
+
+| program | weight_bank | data_bank | reuse | fc_data_bank |
+|---|---|---|---|---|
+| fp16 stem | 1 | 11 | 0 | 0 |
+| int8, 6 distinct splits | 3, 10, 5, 7, **1**, 8 | 9, 2, 7, 5, **11**, 4 | 0 | 0 |
+
+The int8-only arm uses **six different bank splits within one inference**,
+including `0x001b` -- weight 1 / data 11, byte-identical to the split the fp16
+stem uses -- and runs clean 10-12 iterations, 3/3. So re-partitioning the CBUF
+between jobs is demonstrably safe, and the fp16 stem's split is not even
+distinctive. Reuse bits are 0 in every program (P4 is still un-attempted, as
+recorded), and `FC_DATA_BANK[10:8]` is 0 everywhere, which is what P4's warning
+requires.
+
+**`CNA_CBUF_CON1` is a documented width divergence, not a defect.** The fp16
+stem programs `data_entries = 9512` against the int8 convs' 21-168. The
+reference masks this field to 13 bits (`& 0x1FFF`), which would truncate 9512
+to 1320 -- but this repo's field is 15 bits on the strength of vendor corpora
+that used bit 13 at 11,264 and bit 14 through 25,600 (`cna.rs` `data_entries`).
+9512 is inside the observed vendor range, so it is in-family; the reference
+simply never emitted a feature map big enough to find the wider field.
+
+**Of the 40 registers whose values differ between the two precisions**, every
+one is accounted for by shape (cube extents, strides, DMA sizes) or by
+precision (`DPU_DATA_FORMAT`, `BS_MUL_CFG`, `OUT_CVT_SCALE`, the RDMA precision
+fields above). None is a mode bit left set by one path and unread by the other.
+
+**Net: the regcmd is exonerated end to end** -- coverage, values, CBUF
+partitioning, and the enable trailer. Combined with the byte-identical program
+hash across the working and hanging executions, no part of what this repo sends
+the device explains the hang. What is left is state the regcmd does not
+address, and finding it needs a different class of tool than program diffing:
+hardware read-back between jobs, or a core reset inserted at the
+`int8acc -> fp16` boundary to see whether it clears.
+
+**One limit worth stating.** MobileNetV2 gives exactly one fp16 conv in the
+int8 model (the stem), so "the *first* fp16 job after int8 hangs" and "*this
+shape* hangs after int8" are not separated by any experiment run here. A model
+with several fp16 convs among int8 ones would separate them, and is the cheapest
+next probe.
+
+
 ---
 
 ## M1 (S2) — `planck` runs `ondemand` with a 408 MHz A76 floor, which is the worst case the notes measured
