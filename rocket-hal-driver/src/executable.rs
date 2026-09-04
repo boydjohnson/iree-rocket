@@ -168,6 +168,339 @@ impl Conv2dExecutable {
     }
 }
 
+/// A logical pooling shape field supplied by one uint32 dispatch push
+/// constant.
+///
+/// The same contract as [`RuntimeConv2dDimension`]: ordering is carried by
+/// [`PoolingExecutable::runtime_dimensions`] rather than by this enum's
+/// numeric values, and the schema decoder maps the wire enum into this
+/// runtime-owned type so recording never depends on a FlatBuffer object
+/// outliving it.
+///
+/// Output extents are absent for the reason they are absent from
+/// `Conv2DDimension`: `PoolingShape::validate` derives them from the input,
+/// kernel, stride and padding, so a settable output could state a shape the
+/// register program was not built for. Padding is absent too, but for a
+/// different reason -- it is 0..=7, it means different things per method,
+/// and no measured model varies it per dispatch.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum RuntimePoolingDimension {
+    InputWidth,
+    InputHeight,
+    Channels,
+    KernelWidth,
+    KernelHeight,
+    StrideX,
+    StrideY,
+}
+
+impl RuntimePoolingDimension {
+    fn index(self) -> usize {
+        match self {
+            Self::InputWidth => 0,
+            Self::InputHeight => 1,
+            Self::Channels => 2,
+            Self::KernelWidth => 3,
+            Self::KernelHeight => 4,
+            Self::StrideX => 5,
+            Self::StrideY => 6,
+        }
+    }
+
+    fn get(self, shape: &PoolingShape) -> u32 {
+        match self {
+            Self::InputWidth => shape.input_width,
+            Self::InputHeight => shape.input_height,
+            Self::Channels => shape.input_channels,
+            Self::KernelWidth => shape.kernel_width,
+            Self::KernelHeight => shape.kernel_height,
+            Self::StrideX => shape.stride_x,
+            Self::StrideY => shape.stride_y,
+        }
+    }
+
+    fn set(self, shape: &mut PoolingShape, value: u32) {
+        match self {
+            Self::InputWidth => shape.input_width = value,
+            Self::InputHeight => shape.input_height = value,
+            Self::Channels => {
+                // Pooling preserves the channel count; the wire format
+                // carries one field and `PoolingShape` carries two, so this
+                // is where they are kept equal.
+                shape.input_channels = value;
+                shape.output_channels = value;
+            }
+            Self::KernelWidth => shape.kernel_width = value,
+            Self::KernelHeight => shape.kernel_height = value,
+            Self::StrideX => shape.stride_x = value,
+            Self::StrideY => shape.stride_y = value,
+        }
+    }
+}
+
+/// Pooling executable metadata before per-dispatch runtime dimensions
+/// resolve.
+///
+/// `shape_template`'s output extents are whatever the executable declared;
+/// [`PoolingExecutable::resolve_shape`] recomputes them from the resolved
+/// input geometry, so a dynamic pool does not need the compiler to predict
+/// them and a static one is checked against its own claim.
+#[derive(Clone, Debug, PartialEq)]
+pub struct PoolingExecutable {
+    pub shape_template: PoolingShape,
+    pub runtime_dimensions: Vec<RuntimePoolingDimension>,
+}
+
+impl PoolingExecutable {
+    pub fn new_static(shape: PoolingShape) -> Self {
+        Self {
+            shape_template: shape,
+            runtime_dimensions: Vec::new(),
+        }
+    }
+
+    /// Validates the schema-level dynamic mapping independently of runtime
+    /// values, exactly as `Conv2dExecutable::validate_template` does.
+    pub fn validate_template(&self) -> Result<(), &'static str> {
+        let mut seen = [false; 7];
+        for dimension in &self.runtime_dimensions {
+            let index = dimension.index();
+            if seen[index] {
+                return Err("runtime pooling dimensions must be unique");
+            }
+            seen[index] = true;
+            if dimension.get(&self.shape_template) != 0 {
+                return Err("runtime pooling dimensions must be zero in the executable template");
+            }
+        }
+
+        let all_dimensions = [
+            RuntimePoolingDimension::InputWidth,
+            RuntimePoolingDimension::InputHeight,
+            RuntimePoolingDimension::Channels,
+            RuntimePoolingDimension::KernelWidth,
+            RuntimePoolingDimension::KernelHeight,
+            RuntimePoolingDimension::StrideX,
+            RuntimePoolingDimension::StrideY,
+        ];
+        for dimension in all_dimensions {
+            if !seen[dimension.index()] && dimension.get(&self.shape_template) == 0 {
+                return Err("static pooling dimensions must be nonzero in the executable template");
+            }
+        }
+
+        if self.runtime_dimensions.is_empty() {
+            self.resolve_shape(&[])?;
+        }
+        Ok(())
+    }
+
+    /// Resolves runtime dimensions from native-endian uint32 push constants,
+    /// then runs the same authoritative validation a static executable gets.
+    ///
+    /// The output extents are *derived* here rather than trusted: a dynamic
+    /// pool cannot carry them (the compiler would have to predict them per
+    /// dispatch) and a static one has already stated them, so this recomputes
+    /// floor-mode geometry and rejects a template that disagreed.
+    pub fn resolve_shape(&self, constants: &[u8]) -> Result<PoolingShape, &'static str> {
+        let expected_bytes = self
+            .runtime_dimensions
+            .len()
+            .checked_mul(std::mem::size_of::<u32>())
+            .ok_or("runtime pooling push-constant byte count overflow")?;
+        if constants.len() != expected_bytes {
+            return Err("runtime pooling push-constant byte count does not match the executable");
+        }
+
+        let mut shape = self.shape_template;
+        let declared_output = (shape.output_width, shape.output_height);
+        for (dimension, bytes) in self
+            .runtime_dimensions
+            .iter()
+            .zip(constants.chunks_exact(std::mem::size_of::<u32>()))
+        {
+            let value = u32::from_ne_bytes(bytes.try_into().unwrap());
+            if value == 0 {
+                return Err("runtime pooling dimensions must be nonzero");
+            }
+            dimension.set(&mut shape, value);
+        }
+
+        shape.output_width = floor_output_extent(
+            shape.input_width,
+            shape.kernel_width,
+            shape.stride_x,
+            shape.pad_left,
+            shape.pad_right,
+        )?;
+        shape.output_height = floor_output_extent(
+            shape.input_height,
+            shape.kernel_height,
+            shape.stride_y,
+            shape.pad_top,
+            shape.pad_bottom,
+        )?;
+        if self.runtime_dimensions.is_empty() && declared_output != (0, 0) {
+            // A static executable stated its own output extents. They are
+            // not load-bearing -- the derivation above is -- but a
+            // disagreement means the producer and the runtime do not share
+            // a geometry model, which is worth failing on rather than
+            // quietly overriding.
+            if declared_output != (shape.output_width, shape.output_height) {
+                return Err("pooling output extents disagree with floor-mode geometry");
+            }
+        }
+
+        // `PoolingShape::validate` panics rather than returning, because
+        // every other caller builds a shape in-process. Here the shape came
+        // off a wire, so the panic is converted to an error at this
+        // boundary the same way `fc::Shape::new` is in the executable cache.
+        std::panic::catch_unwind(|| shape.validate())
+            .map_err(|_| "pooling shape is outside what the PPU can program")?;
+        Ok(shape)
+    }
+}
+
+/// Floor-mode output extent, matching `PoolingShape::validate`'s own rule.
+/// Returned as an error rather than a panic because the inputs come from a
+/// dispatch.
+fn floor_output_extent(
+    input: u32,
+    kernel: u32,
+    stride: u32,
+    before: u32,
+    after: u32,
+) -> Result<u32, &'static str> {
+    if kernel == 0 || stride == 0 {
+        return Err("pooling kernel and stride must be nonzero");
+    }
+    let padded = input
+        .checked_add(before)
+        .and_then(|value| value.checked_add(after))
+        .ok_or("pooling padded extent overflows")?;
+    if padded < kernel {
+        return Err("pooling kernel exceeds its padded input extent");
+    }
+    Ok((padded - kernel) / stride + 1)
+}
+
+/// A logical matmul shape field supplied by one uint32 dispatch push
+/// constant.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum RuntimeMatmulDimension {
+    M,
+    K,
+    N,
+}
+
+impl RuntimeMatmulDimension {
+    fn index(self) -> usize {
+        match self {
+            Self::M => 0,
+            Self::K => 1,
+            Self::N => 2,
+        }
+    }
+
+    fn get(self, shape: &fc::Shape) -> u32 {
+        match self {
+            Self::M => shape.m,
+            Self::K => shape.k,
+            Self::N => shape.n,
+        }
+    }
+
+    fn set(self, shape: &mut fc::Shape, value: u32) {
+        match self {
+            Self::M => shape.m = value,
+            Self::K => shape.k = value,
+            Self::N => shape.n = value,
+        }
+    }
+}
+
+/// Matmul executable metadata before per-dispatch runtime dimensions
+/// resolve.
+///
+/// The shape is an [`fc::Shape`] because the *lowering* is the vendor's
+/// fully-connected one -- a height-one 1x1 convolution, established over 160
+/// captured ONNX `Linear` models, and the registers are literally named
+/// `CNA_FC_CON*`. The *operation* is a matmul, which is what the input
+/// dialect has and what the wire format now names. Both remain true.
+#[derive(Clone, Debug, PartialEq)]
+pub struct MatmulExecutable {
+    pub shape_template: fc::Shape,
+    pub runtime_dimensions: Vec<RuntimeMatmulDimension>,
+}
+
+impl MatmulExecutable {
+    pub fn new_static(shape: fc::Shape) -> Self {
+        Self {
+            shape_template: shape,
+            runtime_dimensions: Vec::new(),
+        }
+    }
+
+    pub fn validate_template(&self) -> Result<(), &'static str> {
+        let mut seen = [false; 3];
+        for dimension in &self.runtime_dimensions {
+            let index = dimension.index();
+            if seen[index] {
+                return Err("runtime matmul dimensions must be unique");
+            }
+            seen[index] = true;
+            if dimension.get(&self.shape_template) != 0 {
+                return Err("runtime matmul dimensions must be zero in the executable template");
+            }
+        }
+        for dimension in [
+            RuntimeMatmulDimension::M,
+            RuntimeMatmulDimension::K,
+            RuntimeMatmulDimension::N,
+        ] {
+            if !seen[dimension.index()] && dimension.get(&self.shape_template) == 0 {
+                return Err("static matmul dimensions must be nonzero in the executable template");
+            }
+        }
+        if self.runtime_dimensions.is_empty() {
+            self.resolve_shape(&[])?;
+        }
+        Ok(())
+    }
+
+    /// Resolves runtime dimensions, then validates through the same
+    /// convolution gate a Conv2D executable goes through -- `fc::Shape`'s
+    /// own constructor only re-checks the channel-count bounds, while
+    /// `validate_conv_shape` trial-plans the shape it will actually build.
+    pub fn resolve_shape(&self, constants: &[u8]) -> Result<fc::Shape, &'static str> {
+        let expected_bytes = self
+            .runtime_dimensions
+            .len()
+            .checked_mul(std::mem::size_of::<u32>())
+            .ok_or("runtime matmul push-constant byte count overflow")?;
+        if constants.len() != expected_bytes {
+            return Err("runtime matmul push-constant byte count does not match the executable");
+        }
+
+        let mut shape = self.shape_template;
+        for (dimension, bytes) in self
+            .runtime_dimensions
+            .iter()
+            .zip(constants.chunks_exact(std::mem::size_of::<u32>()))
+        {
+            let value = u32::from_ne_bytes(bytes.try_into().unwrap());
+            if value == 0 {
+                return Err("runtime matmul dimensions must be nonzero");
+            }
+            dimension.set(&mut shape, value);
+        }
+        let conv = std::panic::catch_unwind(|| shape.as_conv_shape())
+            .map_err(|_| "matmul shape is outside the convolution builder's bounds")?;
+        validate_conv_shape(&conv, fc::KERNELS)?;
+        Ok(shape)
+    }
+}
+
 /// One of this driver's fixed regcmd-template shapes -- see this crate's
 /// `iree-rocket-hal::rocket::conv`/`fc` module doc comments for why the NPU
 /// pipeline itself is a small, fixed set of these ("ukernels") rather than a
@@ -176,8 +509,11 @@ impl Conv2dExecutable {
 /// gain HAL-level wiring.
 pub enum UkernelShape {
     Conv2d(Conv2dExecutable),
-    FullyConnected(fc::Shape),
-    Pooling(PoolingShape),
+    /// Both `MatmulDef` and the deprecated `FullyConnectedDef` decode into
+    /// this: they describe the same operation and the runtime executes them
+    /// identically, so there is nothing for a second variant to distinguish.
+    Matmul(MatmulExecutable),
+    Pooling(PoolingExecutable),
 }
 
 /// What every `iree_hal_executable_t*` this driver hands out actually

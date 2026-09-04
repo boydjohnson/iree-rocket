@@ -99,6 +99,36 @@ constexpr std::array<const char *, 13> kRequiredFcConfigKeys = {
     "precision",
 };
 
+// Pooling carries no weights, no bias and no requantization, so its key
+// set is geometry plus the two things that are not geometry: which
+// reduction, and what the elements are. The pad *fill* is deliberately
+// absent -- it follows from those two (see PoolingMethod::pad_fill_value in
+// iree-rocket-hal) and the runtime derives it.
+constexpr std::array<const char *, 15> kRequiredPoolingConfigKeys = {
+    "input_width", "input_height",  "channels",      "output_width",
+    "output_height", "kernel_width", "kernel_height", "stride_x",
+    "stride_y",    "pad_left",      "pad_top",       "pad_right",
+    "pad_bottom",  "method",        "precision",
+};
+
+// Identical to the fully-connected set, because the operation is the same
+// one under a name that exists in the input dialect.
+constexpr std::array<const char *, 13> kRequiredMatmulConfigKeys = {
+    "m",
+    "k",
+    "n",
+    "input_zero_point",
+    "output_zero_point",
+    "weights_zero_point",
+    "input_scale",
+    "weights_scale",
+    "output_scale",
+    "truncate_bits",
+    "activation",
+    "activation_cmp",
+    "precision",
+};
+
 struct RocketConv2dConfig {
   uint32_t inputWidth = 0;
   uint32_t inputHeight = 0;
@@ -139,6 +169,44 @@ struct RocketFullyConnectedConfig {
       iree_hal_rocket_Activation_NONE;
   uint32_t activationCmp = 0;
   iree_hal_rocket_Precision_enum_t precision = iree_hal_rocket_Precision_INT8;
+};
+
+struct RocketPoolingConfig {
+  uint32_t inputWidth = 0;
+  uint32_t inputHeight = 0;
+  uint32_t channels = 0;
+  uint32_t outputWidth = 0;
+  uint32_t outputHeight = 0;
+  uint32_t kernelWidth = 0;
+  uint32_t kernelHeight = 0;
+  uint32_t strideX = 0;
+  uint32_t strideY = 0;
+  uint32_t padLeft = 0;
+  uint32_t padTop = 0;
+  uint32_t padRight = 0;
+  uint32_t padBottom = 0;
+  iree_hal_rocket_PoolingMethod_enum_t method =
+      iree_hal_rocket_PoolingMethod_MAX;
+  iree_hal_rocket_Precision_enum_t precision = iree_hal_rocket_Precision_INT8;
+  std::vector<iree_hal_rocket_PoolingDimension_enum_t> runtimeDimensions;
+};
+
+struct RocketMatmulConfig {
+  uint32_t m = 0;
+  uint32_t k = 0;
+  uint32_t n = 0;
+  uint32_t inputZeroPoint = 0;
+  uint32_t outputZeroPoint = 0;
+  uint32_t weightsZeroPoint = 0;
+  float inputScale = 1.0f;
+  float weightsScale = 1.0f;
+  float outputScale = 1.0f;
+  uint32_t truncateBits = 0;
+  iree_hal_rocket_Activation_enum_t activation =
+      iree_hal_rocket_Activation_NONE;
+  uint32_t activationCmp = 0;
+  iree_hal_rocket_Precision_enum_t precision = iree_hal_rocket_Precision_INT8;
+  std::vector<iree_hal_rocket_MatmulDimension_enum_t> runtimeDimensions;
 };
 
 LogicalResult
@@ -396,6 +464,288 @@ buildRocketFullyConnectedConfigFromTarget(
   return shape;
 }
 
+std::optional<RocketPoolingConfig> buildRocketPoolingConfigFromTarget(
+    DictionaryAttr config, llvm::function_ref<InFlightDiagnostic()> diagFn) {
+  if (!config) {
+    diagFn() << "rocket pooling backend requires a non-empty executable "
+                "target config dict";
+    return std::nullopt;
+  }
+  for (const char *key : kRequiredPoolingConfigKeys) {
+    if (!config.get(key)) {
+      diagFn() << "rocket pooling executable target config is missing "
+                  "required key '"
+               << key << "'";
+      return std::nullopt;
+    }
+  }
+
+  auto getU32 = [&](StringRef key) -> uint32_t {
+    return static_cast<uint32_t>(
+        llvm::cast<IntegerAttr>(config.get(key)).getInt());
+  };
+
+  RocketPoolingConfig shape;
+  shape.inputWidth = getU32("input_width");
+  shape.inputHeight = getU32("input_height");
+  shape.channels = getU32("channels");
+  shape.outputWidth = getU32("output_width");
+  shape.outputHeight = getU32("output_height");
+  shape.kernelWidth = getU32("kernel_width");
+  shape.kernelHeight = getU32("kernel_height");
+  shape.strideX = getU32("stride_x");
+  shape.strideY = getU32("stride_y");
+  shape.padLeft = getU32("pad_left");
+  shape.padTop = getU32("pad_top");
+  shape.padRight = getU32("pad_right");
+  shape.padBottom = getU32("pad_bottom");
+
+  StringRef method = llvm::cast<StringAttr>(config.get("method")).getValue();
+  if (method == "avg") {
+    shape.method = iree_hal_rocket_PoolingMethod_AVG;
+  } else if (method == "max") {
+    shape.method = iree_hal_rocket_PoolingMethod_MAX;
+  } else if (method == "min") {
+    shape.method = iree_hal_rocket_PoolingMethod_MIN;
+  } else {
+    // Deliberately no "sum": the PPU has no sum mode, and linalg's
+    // pooling_*_sum plus its divide is what a compiler turns into "avg"
+    // before it gets here. See rocket_executable_def.fbs.
+    diagFn() << "rocket backend: unrecognized pooling 'method' config value '"
+             << method << "' (expected avg/max/min)";
+    return std::nullopt;
+  }
+
+  StringRef precision =
+      llvm::cast<StringAttr>(config.get("precision")).getValue();
+  if (precision == "int8") {
+    shape.precision = iree_hal_rocket_Precision_INT8;
+  } else if (precision == "fp16") {
+    shape.precision = iree_hal_rocket_Precision_FP16;
+  } else {
+    // int8_accumulator has nothing to mean for a reduction that carries its
+    // operand format straight through.
+    diagFn() << "rocket backend: unrecognized pooling 'precision' config "
+                "value '"
+             << precision << "' (expected int8/fp16)";
+    return std::nullopt;
+  }
+
+  std::array<bool, 7> isRuntimeDimension = {};
+  if (Attribute runtimeDimensionsAttr = config.get("runtime_dimensions")) {
+    auto runtimeDimensions = llvm::dyn_cast<ArrayAttr>(runtimeDimensionsAttr);
+    if (!runtimeDimensions) {
+      diagFn() << "rocket backend: optional 'runtime_dimensions' config "
+                  "value must be an array of strings";
+      return std::nullopt;
+    }
+    for (Attribute dimensionAttr : runtimeDimensions) {
+      auto dimensionName = llvm::dyn_cast<StringAttr>(dimensionAttr);
+      if (!dimensionName) {
+        diagFn() << "rocket backend: every 'runtime_dimensions' entry must "
+                    "be a string";
+        return std::nullopt;
+      }
+      std::optional<iree_hal_rocket_PoolingDimension_enum_t> dimension;
+      StringRef name = dimensionName.getValue();
+      if (name == "input_width") {
+        dimension = iree_hal_rocket_PoolingDimension_INPUT_WIDTH;
+      } else if (name == "input_height") {
+        dimension = iree_hal_rocket_PoolingDimension_INPUT_HEIGHT;
+      } else if (name == "channels") {
+        dimension = iree_hal_rocket_PoolingDimension_CHANNELS;
+      } else if (name == "kernel_width") {
+        dimension = iree_hal_rocket_PoolingDimension_KERNEL_WIDTH;
+      } else if (name == "kernel_height") {
+        dimension = iree_hal_rocket_PoolingDimension_KERNEL_HEIGHT;
+      } else if (name == "stride_x") {
+        dimension = iree_hal_rocket_PoolingDimension_STRIDE_X;
+      } else if (name == "stride_y") {
+        dimension = iree_hal_rocket_PoolingDimension_STRIDE_Y;
+      } else {
+        // Padding is deliberately not settable per dispatch, and the output
+        // extents are derived by the runtime rather than stated.
+        diagFn() << "rocket backend: unknown runtime pooling dimension '"
+                 << name << "'";
+        return std::nullopt;
+      }
+      size_t dimensionIndex = static_cast<size_t>(*dimension);
+      if (isRuntimeDimension[dimensionIndex]) {
+        diagFn() << "rocket backend: duplicate runtime pooling dimension '"
+                 << name << "'";
+        return std::nullopt;
+      }
+      isRuntimeDimension[dimensionIndex] = true;
+      shape.runtimeDimensions.push_back(*dimension);
+    }
+  }
+
+  struct SettableDimension {
+    iree_hal_rocket_PoolingDimension_enum_t dimension;
+    StringRef name;
+    uint32_t value;
+  };
+  const std::array<SettableDimension, 7> dimensions = {{
+      {iree_hal_rocket_PoolingDimension_INPUT_WIDTH, "input_width",
+       shape.inputWidth},
+      {iree_hal_rocket_PoolingDimension_INPUT_HEIGHT, "input_height",
+       shape.inputHeight},
+      {iree_hal_rocket_PoolingDimension_CHANNELS, "channels", shape.channels},
+      {iree_hal_rocket_PoolingDimension_KERNEL_WIDTH, "kernel_width",
+       shape.kernelWidth},
+      {iree_hal_rocket_PoolingDimension_KERNEL_HEIGHT, "kernel_height",
+       shape.kernelHeight},
+      {iree_hal_rocket_PoolingDimension_STRIDE_X, "stride_x", shape.strideX},
+      {iree_hal_rocket_PoolingDimension_STRIDE_Y, "stride_y", shape.strideY},
+  }};
+  for (const auto &[dimension, name, value] : dimensions) {
+    const bool isRuntime = isRuntimeDimension[static_cast<size_t>(dimension)];
+    if (isRuntime && value != 0) {
+      diagFn() << "rocket backend: runtime pooling dimension '" << name
+               << "' must use 0 as its executable template value";
+      return std::nullopt;
+    }
+    if (!isRuntime && value == 0) {
+      diagFn() << "rocket backend: zero pooling dimension '" << name
+               << "' must be listed in 'runtime_dimensions'";
+      return std::nullopt;
+    }
+  }
+
+  // The output extents follow from the input geometry, so a dynamic pool
+  // has none to state and a static one must state the right ones. The
+  // runtime derives them either way and rejects a static disagreement; this
+  // catches the compile-time half of the same contract.
+  const bool isDynamic = !shape.runtimeDimensions.empty();
+  if (isDynamic && (shape.outputWidth != 0 || shape.outputHeight != 0)) {
+    diagFn() << "rocket backend: a pooling executable with runtime "
+                "dimensions must use 0 for output_width/output_height, "
+                "which the runtime derives";
+    return std::nullopt;
+  }
+  if (!isDynamic && (shape.outputWidth == 0 || shape.outputHeight == 0)) {
+    diagFn() << "rocket backend: a static pooling executable must state "
+                "nonzero output_width/output_height";
+    return std::nullopt;
+  }
+
+  return shape;
+}
+
+std::optional<RocketMatmulConfig> buildRocketMatmulConfigFromTarget(
+    DictionaryAttr config, llvm::function_ref<InFlightDiagnostic()> diagFn) {
+  if (!config) {
+    diagFn() << "rocket matmul backend requires a non-empty executable "
+                "target config dict";
+    return std::nullopt;
+  }
+  for (const char *key : kRequiredMatmulConfigKeys) {
+    if (!config.get(key)) {
+      diagFn() << "rocket matmul executable target config is missing "
+                  "required key '"
+               << key << "'";
+      return std::nullopt;
+    }
+  }
+
+  auto getU32 = [&](StringRef key) -> uint32_t {
+    return static_cast<uint32_t>(
+        llvm::cast<IntegerAttr>(config.get(key)).getInt());
+  };
+  auto getF32 = [&](StringRef key) -> float {
+    return llvm::cast<FloatAttr>(config.get(key)).getValueAsDouble();
+  };
+
+  RocketMatmulConfig shape;
+  shape.m = getU32("m");
+  shape.k = getU32("k");
+  shape.n = getU32("n");
+  shape.inputZeroPoint = getU32("input_zero_point");
+  shape.outputZeroPoint = getU32("output_zero_point");
+  shape.weightsZeroPoint = getU32("weights_zero_point");
+  shape.inputScale = getF32("input_scale");
+  shape.weightsScale = getF32("weights_scale");
+  shape.outputScale = getF32("output_scale");
+  shape.truncateBits = getU32("truncate_bits");
+  shape.activationCmp = getU32("activation_cmp");
+  if (failed(parseActivationAndPrecision(config, shape.activation,
+                                         shape.precision, diagFn))) {
+    return std::nullopt;
+  }
+  if (shape.precision == iree_hal_rocket_Precision_INT8_ACCUMULATOR) {
+    // The exact accumulator writer is validated for Conv2D only; this
+    // lowering has its own output packing.
+    diagFn() << "rocket matmul backend does not support int8_accumulator "
+                "precision";
+    return std::nullopt;
+  }
+
+  std::array<bool, 3> isRuntimeDimension = {};
+  if (Attribute runtimeDimensionsAttr = config.get("runtime_dimensions")) {
+    auto runtimeDimensions = llvm::dyn_cast<ArrayAttr>(runtimeDimensionsAttr);
+    if (!runtimeDimensions) {
+      diagFn() << "rocket backend: optional 'runtime_dimensions' config "
+                  "value must be an array of strings";
+      return std::nullopt;
+    }
+    for (Attribute dimensionAttr : runtimeDimensions) {
+      auto dimensionName = llvm::dyn_cast<StringAttr>(dimensionAttr);
+      if (!dimensionName) {
+        diagFn() << "rocket backend: every 'runtime_dimensions' entry must "
+                    "be a string";
+        return std::nullopt;
+      }
+      std::optional<iree_hal_rocket_MatmulDimension_enum_t> dimension;
+      StringRef name = dimensionName.getValue();
+      if (name == "m") {
+        dimension = iree_hal_rocket_MatmulDimension_M;
+      } else if (name == "k") {
+        dimension = iree_hal_rocket_MatmulDimension_K;
+      } else if (name == "n") {
+        dimension = iree_hal_rocket_MatmulDimension_N;
+      } else {
+        diagFn() << "rocket backend: unknown runtime matmul dimension '"
+                 << name << "'";
+        return std::nullopt;
+      }
+      size_t dimensionIndex = static_cast<size_t>(*dimension);
+      if (isRuntimeDimension[dimensionIndex]) {
+        diagFn() << "rocket backend: duplicate runtime matmul dimension '"
+                 << name << "'";
+        return std::nullopt;
+      }
+      isRuntimeDimension[dimensionIndex] = true;
+      shape.runtimeDimensions.push_back(*dimension);
+    }
+  }
+
+  struct SettableDimension {
+    iree_hal_rocket_MatmulDimension_enum_t dimension;
+    StringRef name;
+    uint32_t value;
+  };
+  const std::array<SettableDimension, 3> dimensions = {{
+      {iree_hal_rocket_MatmulDimension_M, "m", shape.m},
+      {iree_hal_rocket_MatmulDimension_K, "k", shape.k},
+      {iree_hal_rocket_MatmulDimension_N, "n", shape.n},
+  }};
+  for (const auto &[dimension, name, value] : dimensions) {
+    const bool isRuntime = isRuntimeDimension[static_cast<size_t>(dimension)];
+    if (isRuntime && value != 0) {
+      diagFn() << "rocket backend: runtime matmul dimension '" << name
+               << "' must use 0 as its executable template value";
+      return std::nullopt;
+    }
+    if (!isRuntime && value == 0) {
+      diagFn() << "rocket backend: zero matmul dimension '" << name
+               << "' must be listed in 'runtime_dimensions'";
+      return std::nullopt;
+    }
+  }
+
+  return shape;
+}
+
 class RocketTargetDevice final : public TargetDevice {
 public:
   RocketTargetDevice(const RocketOptions & /*options*/) {}
@@ -463,20 +813,32 @@ public:
       }
       kernel = kernelString.getValue();
     }
-    if (kernel != "conv2d" && kernel != "fully_connected") {
+    if (kernel != "conv2d" && kernel != "fully_connected" &&
+        kernel != "pooling" && kernel != "matmul") {
       return variantOp.emitOpError()
              << "unsupported Rocket kernel '" << kernel
-             << "'; expected 'conv2d' or 'fully_connected'";
+             << "'; expected 'conv2d', 'pooling', 'matmul' or the "
+                "deprecated 'fully_connected'";
     }
 
     std::optional<RocketConv2dConfig> convShape;
+    // Deprecated: nothing emits this any more. "Fully connected" is not an
+    // operation in the linalg dialect, so no matcher can produce one;
+    // `matmul` is the same lowering under the name the input dialect uses.
+    // Kept because an existing hand-authored spec may still say it.
     std::optional<RocketFullyConnectedConfig> fcShape;
+    std::optional<RocketPoolingConfig> poolingShape;
+    std::optional<RocketMatmulConfig> matmulShape;
     if (kernel == "fully_connected") {
       fcShape = buildRocketFullyConnectedConfigFromTarget(config, diagFn);
+    } else if (kernel == "pooling") {
+      poolingShape = buildRocketPoolingConfigFromTarget(config, diagFn);
+    } else if (kernel == "matmul") {
+      matmulShape = buildRocketMatmulConfigFromTarget(config, diagFn);
     } else {
       convShape = buildRocketConv2dConfigFromTarget(config, diagFn);
     }
-    if (!convShape && !fcShape) {
+    if (!convShape && !fcShape && !poolingShape && !matmulShape) {
       return failure();
     }
 
@@ -495,8 +857,14 @@ public:
                 "ordinal 0";
     }
     int64_t pipelineConstantCount = exportOp.getLayoutAttr().getConstants();
-    size_t runtimeDimensionCount =
-        convShape ? convShape->runtimeDimensions.size() : 0;
+    size_t runtimeDimensionCount = 0;
+    if (convShape) {
+      runtimeDimensionCount = convShape->runtimeDimensions.size();
+    } else if (poolingShape) {
+      runtimeDimensionCount = poolingShape->runtimeDimensions.size();
+    } else if (matmulShape) {
+      runtimeDimensionCount = matmulShape->runtimeDimensions.size();
+    }
     if (pipelineConstantCount != static_cast<int64_t>(runtimeDimensionCount)) {
       return exportOp.emitOpError()
              << "Rocket pipeline layout declares " << pipelineConstantCount
@@ -522,6 +890,107 @@ public:
                << "failed to build Rocket fully-connected definition";
       }
       kernelRef = iree_hal_rocket_KernelDef_as_FullyConnectedDef(fcRef);
+    } else if (poolingShape) {
+      iree_hal_rocket_PoolingDimension_vec_ref_t runtimeDimensionsRef = 0;
+      if (!poolingShape->runtimeDimensions.empty()) {
+        runtimeDimensionsRef = iree_hal_rocket_PoolingDimension_vec_create(
+            builder, poolingShape->runtimeDimensions.data(),
+            poolingShape->runtimeDimensions.size());
+        if (!runtimeDimensionsRef) {
+          return variantOp.emitOpError()
+                 << "failed to build Rocket pooling runtime-dimension vector";
+        }
+      }
+      if (iree_hal_rocket_PoolingDef_start(builder) ||
+          iree_hal_rocket_PoolingDef_input_width_add(builder,
+                                                     poolingShape->inputWidth) ||
+          iree_hal_rocket_PoolingDef_input_height_add(
+              builder, poolingShape->inputHeight) ||
+          iree_hal_rocket_PoolingDef_channels_add(builder,
+                                                  poolingShape->channels) ||
+          iree_hal_rocket_PoolingDef_output_width_add(
+              builder, poolingShape->outputWidth) ||
+          iree_hal_rocket_PoolingDef_output_height_add(
+              builder, poolingShape->outputHeight) ||
+          iree_hal_rocket_PoolingDef_kernel_width_add(
+              builder, poolingShape->kernelWidth) ||
+          iree_hal_rocket_PoolingDef_kernel_height_add(
+              builder, poolingShape->kernelHeight) ||
+          iree_hal_rocket_PoolingDef_stride_x_add(builder,
+                                                  poolingShape->strideX) ||
+          iree_hal_rocket_PoolingDef_stride_y_add(builder,
+                                                  poolingShape->strideY) ||
+          iree_hal_rocket_PoolingDef_pad_left_add(builder,
+                                                  poolingShape->padLeft) ||
+          iree_hal_rocket_PoolingDef_pad_top_add(builder,
+                                                 poolingShape->padTop) ||
+          iree_hal_rocket_PoolingDef_pad_right_add(builder,
+                                                   poolingShape->padRight) ||
+          iree_hal_rocket_PoolingDef_pad_bottom_add(builder,
+                                                    poolingShape->padBottom) ||
+          iree_hal_rocket_PoolingDef_method_add(builder,
+                                                poolingShape->method) ||
+          iree_hal_rocket_PoolingDef_precision_add(builder,
+                                                   poolingShape->precision) ||
+          (runtimeDimensionsRef &&
+           iree_hal_rocket_PoolingDef_runtime_dimensions_add(
+               builder, runtimeDimensionsRef))) {
+        return variantOp.emitOpError()
+               << "failed to build Rocket pooling definition";
+      }
+      auto poolingRef = iree_hal_rocket_PoolingDef_end(builder);
+      if (!poolingRef) {
+        return variantOp.emitOpError()
+               << "failed to finish Rocket pooling definition";
+      }
+      kernelRef = iree_hal_rocket_KernelDef_as_PoolingDef(poolingRef);
+    } else if (matmulShape) {
+      iree_hal_rocket_MatmulDimension_vec_ref_t runtimeDimensionsRef = 0;
+      if (!matmulShape->runtimeDimensions.empty()) {
+        runtimeDimensionsRef = iree_hal_rocket_MatmulDimension_vec_create(
+            builder, matmulShape->runtimeDimensions.data(),
+            matmulShape->runtimeDimensions.size());
+        if (!runtimeDimensionsRef) {
+          return variantOp.emitOpError()
+                 << "failed to build Rocket matmul runtime-dimension vector";
+        }
+      }
+      if (iree_hal_rocket_MatmulDef_start(builder) ||
+          iree_hal_rocket_MatmulDef_m_add(builder, matmulShape->m) ||
+          iree_hal_rocket_MatmulDef_k_add(builder, matmulShape->k) ||
+          iree_hal_rocket_MatmulDef_n_add(builder, matmulShape->n) ||
+          iree_hal_rocket_MatmulDef_input_zero_point_add(
+              builder, matmulShape->inputZeroPoint) ||
+          iree_hal_rocket_MatmulDef_output_zero_point_add(
+              builder, matmulShape->outputZeroPoint) ||
+          iree_hal_rocket_MatmulDef_weights_zero_point_add(
+              builder, matmulShape->weightsZeroPoint) ||
+          iree_hal_rocket_MatmulDef_input_scale_add(builder,
+                                                    matmulShape->inputScale) ||
+          iree_hal_rocket_MatmulDef_weights_scale_add(
+              builder, matmulShape->weightsScale) ||
+          iree_hal_rocket_MatmulDef_output_scale_add(
+              builder, matmulShape->outputScale) ||
+          iree_hal_rocket_MatmulDef_truncate_bits_add(
+              builder, matmulShape->truncateBits) ||
+          iree_hal_rocket_MatmulDef_activation_add(builder,
+                                                   matmulShape->activation) ||
+          iree_hal_rocket_MatmulDef_activation_cmp_add(
+              builder, matmulShape->activationCmp) ||
+          iree_hal_rocket_MatmulDef_precision_add(builder,
+                                                  matmulShape->precision) ||
+          (runtimeDimensionsRef &&
+           iree_hal_rocket_MatmulDef_runtime_dimensions_add(
+               builder, runtimeDimensionsRef))) {
+        return variantOp.emitOpError()
+               << "failed to build Rocket matmul definition";
+      }
+      auto matmulRef = iree_hal_rocket_MatmulDef_end(builder);
+      if (!matmulRef) {
+        return variantOp.emitOpError()
+               << "failed to finish Rocket matmul definition";
+      }
+      kernelRef = iree_hal_rocket_KernelDef_as_MatmulDef(matmulRef);
     } else {
       iree_hal_rocket_Conv2DDimension_vec_ref_t runtimeDimensionsRef = 0;
       if (!convShape->runtimeDimensions.empty()) {

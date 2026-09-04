@@ -210,6 +210,31 @@ pub const INPUT_CHANNELS: u32 = 3;
 /// [`ConvPlan`] answers on its own -- at k=3 it is the binding one well
 /// before this, refusing `Cin >= 1216` outright.
 ///
+/// **Raised 1344 -> 1792 on 2026-09-04, for the matmul lowering.** A matmul
+/// reaches this hardware as a convolution of height *one* with `K` as `Cin`
+/// (`fc::Shape`), and MobileNetV2's classifier is `[1,1792] x [1792,1001]`
+/// -- so `K = 1792` was over the old ceiling, and the geometry that carries
+/// it, a 1x1 spatial "image", is not one any conv sweep had run. Measured on
+/// `planck` with `dtype_boundary_probe`, 23 points, **0 mismatches and 0
+/// device timeouts**:
+///
+///   K at M=1, N=64: 512, 1024, 1344, 1792, 2048 -- under `Selectors` and
+///     again under `Counting`, which makes every input lane contribute
+///   N at M=1, K=1792: 64, 512, 1001, 1792, 2048
+///   M at K=1792, N=64: 1, 2, 7, 16, 32 (widths at height one; the CBUF
+///     split moves 7/5 -> 2/10 -> 4/8 across that range and every one is
+///     exact)
+///   the classifier itself, `M=1 K=1792 N=1001`, under both patterns and
+///     again with the fp32 accumulator kept (`Fp16Accumulator`)
+///
+/// 1792 rather than the 2048 that was also measured, on this file's usual
+/// principle: 1792 is what a real model needs and what the earlier 14x14
+/// sweep already reached. `fc_matmul_geometry_matches_oracle` is the
+/// regression, and `fc_matmul_ladder_matches_the_fc_lowering` is what keeps
+/// its cases identical to what `fc::Shape::as_conv_shape` actually builds --
+/// a ladder that only *resembled* the production lowering would be measuring
+/// its own geometry.
+///
 /// **The other 2-byte rungs now have their own evidence at this value**
 /// (2026-09-04), rather than only inheriting it: `bf16_regression_matrix`
 /// (58/58) and `int16_regression_matrix` (37/37) both run `Cin` 512, 1024
@@ -226,7 +251,7 @@ pub const INPUT_CHANNELS: u32 = 3;
 /// because fp16 depthwise cannot reach a compiled dispatch at all -- the
 /// demote pass deliberately excludes it (see
 /// `RocketDemoteConvInputsPass.cpp`, reverted 2026-09-01).
-pub const MAX_INPUT_CHANNELS: u32 = 1344;
+pub const MAX_INPUT_CHANNELS: u32 = 1792;
 
 /// `CNA_DATA_SIZE1.datain_channel_real` counts `Cin - 1` modulo this, even
 /// though the field is 14 bits wide and could hold far more.

@@ -45,6 +45,45 @@ enum Conv2DDimension : ubyte {
   WEIGHTS_HEIGHT = 7,
 }
 
+// Wire-format values, independent of the PPU's register encoding.
+//
+// There is deliberately no SUM. The PPU has no sum mode: its average is a
+// multiply by a per-axis reciprocal held as fp16(65536/k), so a divisor of
+// one would need 65536, past fp16's 65504 ceiling. MLIR's linalg dialect has
+// no average pool at all -- an ONNX AveragePool arrives as
+// linalg.pooling_*_sum followed by a separate divide -- so recognizing that
+// pair as an average is the compiler's job. A SUM value here would be a wire
+// state the runtime could not execute.
+enum PoolingMethod : ubyte {
+  AVG = 0,
+  MAX = 1,
+  MIN = 2,
+}
+
+// Pooling shape fields that may be supplied by dispatch push constants.
+// Numeric values are wire-format ABI and must not be changed or reused.
+//
+// Padding is deliberately absent: it is 0..=7 on this hardware, its meaning
+// depends on the pooling method, and no measured model varies it per
+// dispatch. It stays an executable property.
+enum PoolingDimension : ubyte {
+  INPUT_WIDTH = 0,
+  INPUT_HEIGHT = 1,
+  CHANNELS = 2,
+  KERNEL_WIDTH = 3,
+  KERNEL_HEIGHT = 4,
+  STRIDE_X = 5,
+  STRIDE_Y = 6,
+}
+
+// Matmul shape fields that may be supplied by dispatch push constants.
+// Numeric values are wire-format ABI and must not be changed or reused.
+enum MatmulDimension : ubyte {
+  M = 0,
+  K = 1,
+  N = 2,
+}
+
 // Describes one NHWC/HWCF 2-D convolution.
 //
 // Version 1 has one stride because the current Rocket ConvShape and register
@@ -97,6 +136,15 @@ table Conv2DDef {
   pad_left:uint32;
 }
 
+// DEPRECATED: superseded by MatmulDef. Retained because union tags are
+// wire-format ABI and must not be reused, and because a runtime may still
+// meet an older executable that carries one.
+//
+// No compiler has ever emitted this table. "Fully connected" is not an
+// operation in MLIR's linalg dialect, which is what IREE hands this backend;
+// what actually arrives is linalg.matmul. MatmulDef is that operation, with
+// the runtime_dimensions support this table never had.
+//
 // Describes one row-major [M,K] x [K,N] fully-connected operation.
 //
 // The runtime lowers this to the NPU's 1x1-convolution path. The fixed
@@ -124,11 +172,97 @@ table FullyConnectedDef {
   precision:Precision = INT8;
 }
 
+// Describes one standalone PPU pooling operation.
+//
+// A pool is a self-contained PPU + PPU_RDMA job: it reads the NC1HWC2 input
+// cube, reduces each window per channel, and writes the output cube in the
+// same layout. No convolution block participates, so there are no weights,
+// no bias, and no quantization parameters -- the reduction carries its
+// operand format through unchanged.
+//
+// The pad fill value is deliberately not on the wire. It is the reduction's
+// identity element, which follows from `method` and `precision` alone, and a
+// producer that could state it independently could silently change a max
+// pool's answer at the border by sending zero.
+table PoolingDef {
+  input_width:uint32;
+  input_height:uint32;
+
+  // Pooling preserves the channel count, so this is one field rather than
+  // an input/output pair that could disagree with itself.
+  channels:uint32;
+
+  // Carried and re-derived by the runtime, matching Conv2DDef. An executable
+  // whose stated output does not match floor-mode geometry is rejected.
+  output_width:uint32;
+  output_height:uint32;
+
+  kernel_width:uint32;
+  kernel_height:uint32;
+  stride_x:uint32;
+  stride_y:uint32;
+
+  pad_left:uint32;
+  pad_top:uint32;
+  pad_right:uint32;
+  pad_bottom:uint32;
+
+  method:PoolingMethod = MAX;
+  precision:Precision = INT8;
+
+  // Ordered list mapping dispatch push-constant ordinal to a shape field,
+  // with the same contract as Conv2DDef.runtime_dimensions: each entry
+  // consumes one uint32 push constant, the listed field must be zero in this
+  // table, entries must be unique, and an absent vector preserves a fully
+  // static ABI.
+  runtime_dimensions:[PoolingDimension];
+}
+
+// Describes one row-major [M,K] x [K,N] -> [M,N] matmul.
+//
+// This is the operation IREE actually delivers (linalg.matmul); it replaces
+// FullyConnectedDef, which named something the linalg dialect does not have.
+// The runtime lowers it to the NPU's 1x1-convolution path, where M is the
+// convolution width at height one, K is the input channel count and N the
+// output channel count.
+//
+// Operands are row-major and untransposed: A is [M,K] and B is [K,N]. A
+// linalg.matmul carrying non-default indexing_maps expresses a transpose or
+// broadcast, which is a different memory layout, and the compiler must
+// decline it rather than encode it here.
+table MatmulDef {
+  m:uint32;
+  k:uint32;
+  n:uint32;
+
+  input_zero_point:uint32;
+  output_zero_point:uint32;
+  weights_zero_point:uint32;
+
+  input_scale:float = 1.0;
+  weights_scale:float = 1.0;
+  output_scale:float = 1.0;
+
+  truncate_bits:uint32;
+  activation:Activation = NONE;
+
+  // Only meaningful when activation is RELUX.
+  activation_cmp:uint32;
+
+  precision:Precision = INT8;
+
+  // Same contract as Conv2DDef.runtime_dimensions.
+  runtime_dimensions:[MatmulDimension];
+}
+
 // Add future Rocket kernel kinds here. Existing numeric values must not be
-// changed or reused.
+// changed or reused -- a union tag is wire-format ABI, which is why the
+// deprecated FullyConnectedDef keeps its place.
 union KernelDef {
   Conv2DDef,
   FullyConnectedDef,
+  PoolingDef,
+  MatmulDef,
 }
 
 // Information about one exported kernel.

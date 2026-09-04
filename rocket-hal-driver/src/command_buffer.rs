@@ -1439,12 +1439,16 @@ unsafe extern "C" fn dispatch(
                 output_compaction,
             });
         }
-        UkernelShape::FullyConnected(shape) => {
-            if !constants.is_empty() {
-                return status::from_code(
-                    crate::bindings::iree_status_code_e_IREE_STATUS_INVALID_ARGUMENT,
-                );
-            }
+        UkernelShape::Matmul(executable) => {
+            let resolved = match executable.resolve_shape(constants) {
+                Ok(resolved) => resolved,
+                Err(_) => {
+                    return status::from_code(
+                        crate::bindings::iree_status_code_e_IREE_STATUS_INVALID_ARGUMENT,
+                    );
+                }
+            };
+            let shape = &resolved;
             if bindings.count < 4 {
                 return status::from_code(
                     crate::bindings::iree_status_code_e_IREE_STATUS_INVALID_ARGUMENT,
@@ -1708,37 +1712,167 @@ unsafe extern "C" fn dispatch(
                 output_compaction,
             });
         }
-        UkernelShape::Pooling(shape) => {
-            if !constants.is_empty() {
-                return status::from_code(
-                    crate::bindings::iree_status_code_e_IREE_STATUS_INVALID_ARGUMENT,
-                );
-            }
+        UkernelShape::Pooling(executable) => {
+            let shape = match executable.resolve_shape(constants) {
+                Ok(shape) => shape,
+                Err(_) => {
+                    return status::from_code(
+                        crate::bindings::iree_status_code_e_IREE_STATUS_INVALID_ARGUMENT,
+                    );
+                }
+            };
+            // 0=input, 1=output. Every horizontal tile is one direct
+            // PPU/PPU_RDMA task; all tasks belong to this one dispatch/job.
             if bindings.count < 2 {
                 return status::from_code(
                     crate::bindings::iree_status_code_e_IREE_STATUS_INVALID_ARGUMENT,
                 );
             }
-            // 0=input, 1=output. Every horizontal tile is one direct
-            // PPU/PPU_RDMA task; all tasks belong to this one dispatch/job.
-            let bufs = PoolingBuffers {
-                input_addr: addr(&refs[0]),
-                output_addr: addr(&refs[1]),
+
+            // The PPU reads and writes NC1HWC2 cubes; IREE's bindings are
+            // dense NHWC. Both ends are repacked on the host, exactly as the
+            // convolution arm does, and for the same reason -- nothing in
+            // the compiler produces the hardware layout. A pool that
+            // consumed its producer's already-packed output would need
+            // neither repack, which is the cross-op chaining ISSUES.md P2
+            // describes and this is deliberately not that.
+            let element_bytes = shape.precision.element_bytes() as usize;
+            let logical_bytes_per_pixel = shape.logical_bytes_per_pixel() as usize;
+            let packed_bytes_per_pixel = shape.packed_bytes_per_pixel() as usize;
+            let input_pixels =
+                match (shape.input_width as usize).checked_mul(shape.input_height as usize) {
+                    Some(value) => value,
+                    None => {
+                        return status::from_code(
+                            crate::bindings::iree_status_code_e_IREE_STATUS_INVALID_ARGUMENT,
+                        );
+                    }
+                };
+            let output_pixels =
+                match (shape.output_width as usize).checked_mul(shape.output_height as usize) {
+                    Some(value) => value,
+                    None => {
+                        return status::from_code(
+                            crate::bindings::iree_status_code_e_IREE_STATUS_INVALID_ARGUMENT,
+                        );
+                    }
+                };
+            // `build_pooling_tile_task` programs both surface strides
+            // rounded up to four pixels (the vendor's 7x5 controls program
+            // 36 for an area of 35), so the packed cubes must be strided the
+            // same way or every surface past the first is read, and written,
+            // at the wrong offset.
+            let packed_input_pixels = input_pixels.next_multiple_of(4);
+            let packed_output_pixels = output_pixels.next_multiple_of(4);
+            let dense_input_bytes = input_pixels.checked_mul(logical_bytes_per_pixel);
+            let dense_output_bytes = output_pixels.checked_mul(logical_bytes_per_pixel);
+            if !matches!(dense_input_bytes, Some(value) if value as u64 <= refs[0].length as u64)
+                || !matches!(dense_output_bytes, Some(value) if value as u64 <= refs[1].length as u64)
+                || element_bytes == 0
+            {
+                return status::from_code(
+                    crate::bindings::iree_status_code_e_IREE_STATUS_INVALID_ARGUMENT,
+                );
+            }
+
+            let input_scratch_bytes =
+                match nc1hwc2_storage_size(packed_input_pixels, packed_bytes_per_pixel) {
+                    Ok(value) => value,
+                    Err(_) => {
+                        return status::from_code(
+                            crate::bindings::iree_status_code_e_IREE_STATUS_INVALID_ARGUMENT,
+                        );
+                    }
+                };
+            let output_scratch_bytes =
+                match nc1hwc2_storage_size(packed_output_pixels, packed_bytes_per_pixel) {
+                    Ok(value) => value,
+                    Err(_) => {
+                        return status::from_code(
+                            crate::bindings::iree_status_code_e_IREE_STATUS_INVALID_ARGUMENT,
+                        );
+                    }
+                };
+            if input_scratch_bytes > u32::MAX as usize || output_scratch_bytes > u32::MAX as usize {
+                return status::from_code(
+                    crate::bindings::iree_status_code_e_IREE_STATUS_INVALID_ARGUMENT,
+                );
+            }
+
+            let input_scratch = unsafe {
+                RocketOwnedBuffer::new(
+                    cb.fd,
+                    input_scratch_bytes.max(1),
+                    BorrowedFd::borrow_raw(cb.fd),
+                )
             };
-            let regcmd_tasks = PoolingPlan::new(*shape).programs_with_buffers(&bufs);
+            let output_scratch = unsafe {
+                RocketOwnedBuffer::new(
+                    cb.fd,
+                    output_scratch_bytes.max(1),
+                    BorrowedFd::borrow_raw(cb.fd),
+                )
+            };
+            let input_packing = Some(InputPacking {
+                input_buffer: refs[0].buffer,
+                input_offset: refs[0].offset,
+                input_length: refs[0].length,
+                scratch_ptr: input_scratch.host_ptr,
+                scratch_length: input_scratch_bytes,
+                scratch_handle: input_scratch.handle,
+                source_pixel_count: input_pixels,
+                packed_pixel_count: packed_input_pixels,
+                bytes_per_pixel: logical_bytes_per_pixel,
+                packed_bytes_per_pixel,
+                // The pixels between the image and the four-pixel surface
+                // boundary are never addressed by the PPU -- the line stride
+                // walks rows of `input_width` -- so their contents cannot
+                // reach a result and zero is as good as anything. This is
+                // *not* the pooling pad fill, which is a register
+                // (`PoolingMethod::pad_fill_value`) rather than buffer
+                // contents.
+                padding_byte: 0,
+                layout: InputPackingLayout::Nc1hwc2,
+            });
+            let output_compaction = Some(OutputCompaction {
+                output_buffer: refs[1].buffer,
+                output_offset: refs[1].offset,
+                output_length: refs[1].length,
+                scratch_ptr: output_scratch.host_ptr,
+                scratch_length: output_scratch_bytes,
+                // Surfaces are strided by the padded count and only the real
+                // pixels are copied back out, which is the same split the
+                // convolution arm uses to discard its row padding.
+                source_pixel_count: packed_output_pixels,
+                output_pixel_count: output_pixels,
+                output_width: shape.output_width as usize,
+                bytes_per_pixel: logical_bytes_per_pixel,
+                // One 16-byte feature atom per pixel per surface, which is
+                // what the PPU's cube strides are counted in.
+                source_block_bytes: 16,
+                source_tiles: None,
+            });
+
+            let bufs = PoolingBuffers {
+                input_addr: input_scratch.dma_address,
+                output_addr: output_scratch.dma_address,
+            };
+            let regcmd_tasks = PoolingPlan::new(shape).programs_with_buffers(&bufs);
+            let in_bo_handles = vec![input_scratch.handle];
+            let out_bo_handles = vec![output_scratch.handle];
             let retained_bindings = unsafe { retain_direct_bindings(refs) };
             cb.ops.push(RecordedOp::Dispatch {
                 regcmd_tasks,
                 dpu_mode: None,
                 precision_tag: None,
                 retained_bindings,
-                scratch_buffers: Vec::new(),
-                in_bo_handles: vec![handle(&refs[0])],
-                out_bo_handles: vec![handle(&refs[1])],
-                input_packing: None,
+                scratch_buffers: vec![input_scratch, output_scratch],
+                in_bo_handles,
+                out_bo_handles,
+                input_packing,
                 weight_packing: None,
                 bias_packing: None,
-                output_compaction: None,
+                output_compaction,
             });
         }
     }

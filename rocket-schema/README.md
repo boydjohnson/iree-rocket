@@ -17,9 +17,22 @@ the compiler consumer.
 
 `rocket_executable_def.fbs` defines an `RKT1` FlatBuffer. Its root contains
 exports in IREE executable ordinal order. Each export has a name and a typed
-kernel definition. Version 1 supports standard and depthwise 2-D convolution,
-including parameterized kernel extents, equal-axis stride, and symmetric
-padding carried as leading height/width values.
+kernel definition. Version 1 supports:
+
+- **`Conv2DDef`** -- standard and depthwise 2-D convolution, including
+  parameterized kernel extents, equal-axis stride, and symmetric padding
+  carried as leading height/width values.
+- **`PoolingDef`** -- a standalone PPU pooling job: average, max or min, with
+  independent per-axis kernel, stride and padding. There is no sum mode; see
+  `docs/compatibility.md`.
+- **`MatmulDef`** -- a row-major `[M,K] x [K,N]` matmul, which the runtime
+  lowers to the 1x1-convolution path. This is what `linalg.matmul` becomes.
+- **`FullyConnectedDef`** -- deprecated, never emitted, retained so union
+  tags do not move.
+
+All three kernel kinds support `runtime_dimensions`, the optional mapping
+from dispatch push constants to shape fields that lets one executable serve
+many shapes.
 
 The convolution fields intentionally mirror the current Rust `ConvShape`.
 FlatBuffers verifies the wire structure. The Rocket runtime must still reject
