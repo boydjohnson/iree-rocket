@@ -70,17 +70,16 @@ util.func public @unmatched_5x5_conv(
   util.return %result : tensor<1x?x?x16xf32>
 }
 
-// @match_dynamic_conv2d_s2 is structurally correct for this exact shape but
-// deliberately not wired into @__transform_main's foreach_match (it
-// regresses a real MobileNetV2 compile -- see the comment above that
-// foreach_match). rocket.origin_kind makes that audit-able straight from the
-// IR: this op is tagged as a Rocket-shaped candidate, but --stays-- on CPU.
+// Stride 2 is claimed, through its own matcher and its own executable. This
+// case used to assert the opposite: @match_dynamic_conv2d_s2 was written but
+// deliberately left out of @__transform_main's foreach_match, and this
+// function was named for that. It has since been wired in, and the stride-3
+// case below is what carries the disabled-matcher story now.
 
-// ORIGINAL-LABEL: util.func public @stride2_dense_conv_disabled_matcher
-// ORIGINAL: linalg.conv_2d_nhwc_hwcf
-// ORIGINAL-SAME: rocket.origin = "candidate"
-// ORIGINAL-SAME: rocket.origin_kind = "dense_conv2d_1x1_s2"
-util.func public @stride2_dense_conv_disabled_matcher(
+// ORIGINAL-LABEL: util.func public @matched_stride2_dense_conv
+// ORIGINAL-NOT: rocket.origin
+// ORIGINAL: util.call @call_rocket_dynamic_conv2d_s2
+util.func public @matched_stride2_dense_conv(
     %input: tensor<1x?x?x32xf16>,
     %filter: tensor<1x1x32x16xf16>,
     %init: tensor<1x?x?x16xf32>) -> tensor<1x?x?x16xf32> {
@@ -94,19 +93,54 @@ util.func public @stride2_dense_conv_disabled_matcher(
   util.return %result : tensor<1x?x?x16xf32>
 }
 
+// @match_dynamic_conv2d_s3 is structurally correct for this exact shape but
+// deliberately not wired into @__transform_main's foreach_match, along with
+// @match_dynamic_conv2d_s4 and both of their 3x3 counterparts.
+// rocket.origin_kind makes that audit-able straight from the IR: this op is
+// tagged as a Rocket-shaped candidate, and --stays-- on CPU.
+//
+// This is the check that catches a matcher being enabled without anyone
+// updating the placement expectations -- which is exactly what happened to
+// the stride-2 case above.
+
+// ORIGINAL-LABEL: util.func public @stride3_dense_conv_disabled_matcher
+// ORIGINAL: linalg.conv_2d_nhwc_hwcf
+// ORIGINAL-SAME: rocket.origin = "candidate"
+// ORIGINAL-SAME: rocket.origin_kind = "dense_conv2d_1x1_s3"
+util.func public @stride3_dense_conv_disabled_matcher(
+    %input: tensor<1x?x?x32xf16>,
+    %filter: tensor<1x1x32x16xf16>,
+    %init: tensor<1x?x?x16xf32>) -> tensor<1x?x?x16xf32> {
+  %result = linalg.conv_2d_nhwc_hwcf {
+      dilations = dense<1> : vector<2xi64>,
+      strides = dense<3> : vector<2xi64>
+    } ins(%input, %filter
+      : tensor<1x?x?x32xf16>, tensor<1x1x32x16xf16>)
+      outs(%init : tensor<1x?x?x16xf32>)
+      -> tensor<1x?x?x16xf32>
+  util.return %result : tensor<1x?x?x16xf32>
+}
+
 // RocketAnnotateFinalPlacementPass runs separately, over the
 // --compile-to=executable-targets dump (one phase before --compile-to=hal,
 // which already serializes each hal.executable.variant into an opaque
 // hal.executable.binary and discards #hal.executable.target along with it).
-// It reads the resolved backend straight off each variant: the matched op
-// above produced @rocket_dynamic_executable, targeting "rocket"; every CPU
-// fallback -- both unmatched ops above and the elementwise accumulate
-// dispatch @matched_dynamic_conv's own Rocket call still needs on the CPU
-// side -- targets "llvm-cpu" and is tagged "cpu".
+// It reads the resolved backend straight off each variant: the two matched
+// ops above produced Rocket executables; every CPU fallback -- the unmatched
+// ops, and the elementwise accumulate dispatch each Rocket call still needs
+// on the CPU side -- targets "llvm-cpu" and is tagged "cpu".
+//
+// There is one accumulate dispatch rather than two: the stride-1 and
+// stride-2 calls need the identical f16-to-f32 body, and IREE deduplicates
+// identical executables, so it is named after whichever call survived.
 
-// FINAL: hal.executable private @call_rocket_dynamic_conv2d_dispatch_0 attributes {rocket.final = "cpu"}
+// FINAL: hal.executable private @call_rocket_dynamic_conv2d_s2_dispatch_0 attributes {rocket.final = "cpu"}
 // FINAL: hal.executable.variant public @embedded_elf_x86_64
 // FINAL-SAME: attributes {rocket.final = "cpu"}
+
+// FINAL: hal.executable private @rocket_dynamic_executable_s2 attributes {rocket.final = "rocket"}
+// FINAL: hal.executable.variant public @rocket_dynamic_conv2d_v1
+// FINAL-SAME: attributes {rocket.final = "rocket"}
 
 // FINAL: hal.executable private @rocket_dynamic_executable attributes {rocket.final = "rocket"}
 // FINAL: hal.executable.variant public @rocket_dynamic_conv2d_v1
@@ -116,6 +150,6 @@ util.func public @stride2_dense_conv_disabled_matcher(
 // FINAL: hal.executable.variant public @embedded_elf_x86_64
 // FINAL-SAME: attributes {rocket.final = "cpu"}
 
-// FINAL: hal.executable private @stride2_dense_conv_disabled_matcher_dispatch_0 attributes {rocket.final = "cpu"}
+// FINAL: hal.executable private @stride3_dense_conv_disabled_matcher_dispatch_0 attributes {rocket.final = "cpu"}
 // FINAL: hal.executable.variant public @embedded_elf_x86_64
 // FINAL-SAME: attributes {rocket.final = "cpu"}

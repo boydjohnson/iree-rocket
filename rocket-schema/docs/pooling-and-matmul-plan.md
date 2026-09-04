@@ -459,12 +459,32 @@ compensating multiply on the CPU.** Unchanged recommendation: ship the
 second, measure, then fuse. This is a Phase 3 decision and nothing in the
 schema or the runtime forecloses either.
 
-**Pooling has no hardware test in this repo.** `pooling.rs` is
-capture-derived with unit tests against those captures, and its own module
-doc points at a standalone hardware suite that was retired; the only thing
-that ever built a `UkernelShape::Pooling` was the legacy tag this branch
-removed, whose shape was explicitly *not* hardware-validated. So the PPU
-path is now reachable end to end and still unproven on silicon. A
-`pooling_hw.rs` oracle -- max/avg/min against a CPU reference, at a handful
-of shapes including MobileNetV2's 7x7 -- belongs before Phase 4 and
-arguably before Phase 3.
+**Pooling now has a hardware oracle** (`pooling_oracle_hw.rs`, 2026-09-04),
+and running it the first time found two real faults in a path that had never
+executed on silicon in this repo:
+
+* **fp16 average pooling programmed the wrong reciprocal encoding.** The
+  PPU has no divider and multiplies by `65536/k` per axis; int8 takes that as
+  a fixed-point integer and **fp16 takes its fp16 bit pattern**. This module
+  programmed the int8 form at both widths, so every fp16 average was wrong --
+  k=3's `0x5555` read as fp16 is 85.3, which turned a real average of -0.889
+  into -3.4e-6. Fixed, and the two encodings now have unit tests from the
+  vendor's own verified values. The corpus could not have caught it: its only
+  average capture is int8, and it agreed with what the code did.
+* **A reproducible hang whose region is now bounded and refused.** With a
+  window three or more rows tall and overlapping rows, past a measured width
+  the PPU never completes and the watchdog kills the job at ~510 ms (3x3
+  stride 1: exact to 34 columns, hangs from 35; 5x5: exact to 20, hangs from
+  24). Not tiling, not image height, not output width alone.
+  `overlapping_window_width_limits` narrows the planner's tiles to what is
+  measured to run, so a 200-wide 3x3 pool that used to hang now splits into
+  seven tiles and is exact. **This is containment, not a fix**: the corpus
+  has 129-wide direct captures at 3x3, our register *set* matches
+  `rocket-userspace`'s `gen_pool_fp16` exactly, and the two width-sensitive
+  values agree with it -- so some other value differs, and finding it needs a
+  register diff against a wide vendor capture at stride 1.
+
+Everything else is exact, including MobileNetV2's own 7x7 global average
+(max|err| 5.3e-4, which is the reciprocal's documented quantization), max and
+min at both widths, padded max, partial channel atoms, non-square kernels and
+strides, and tiled images.

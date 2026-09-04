@@ -305,10 +305,8 @@ fn decode_flatbuffer_shape(data: &[u8]) -> Result<UkernelShape, ()> {
             // measurement says what it should be, a *padded* pool is
             // refused rather than filled with a plausible guess. An
             // unpadded pool never reads the field.
-            let pad_value = match (method.pad_fill_value(precision), padded) {
-                (Some(value), _) => value,
-                (None, false) => 0,
-                (None, true) => return Err(()),
+            let Some(pad_value) = method.required_pad_fill(precision, padded) else {
+                return Err(());
             };
             let shape_template = PoolingShape {
                 input_width: pooling_def.input_width(),

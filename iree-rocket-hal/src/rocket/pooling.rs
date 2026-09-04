@@ -101,6 +101,22 @@ impl PoolingMethod {
             (PoolingMethod::Min, _) => None,
         }
     }
+
+    /// The fill a shape must actually program, or `None` when the
+    /// combination is unmeasured *and* the shape pads.
+    ///
+    /// An unpadded pool never reads the field, so an unmeasured combination
+    /// is perfectly runnable there -- which is most of them, and is why this
+    /// exists separately from [`PoolingMethod::pad_fill_value`]. Every
+    /// consumer needs both halves of that rule, and stating it twice is how
+    /// two consumers come to disagree about which pools they will run.
+    pub fn required_pad_fill(self, precision: PoolingPrecision, padded: bool) -> Option<u32> {
+        match (self.pad_fill_value(precision), padded) {
+            (Some(value), _) => Some(value),
+            (None, false) => Some(0),
+            (None, true) => None,
+        }
+    }
 }
 
 /// Numeric format of the input and output feature maps.
@@ -198,6 +214,66 @@ const K2S2_FP16_MAX_DIRECT_OUTPUT_WIDTH: u32 = 128;
 const K2S2_INT8_MAX_DIRECT_INPUT_WIDTH: u32 = 130;
 const K2S2_INT8_MAX_DIRECT_OUTPUT_WIDTH: u32 = 65;
 
+/// Direct width limits for a window that spans three or more input rows.
+///
+/// **Measured on `planck` 2026-09-04 with `pooling_width_probe`, and this is
+/// a hang, not wrong data**: past these widths the PPU never completes and
+/// the watchdog kills the job at ~510 ms, with `prep_bo` returning success
+/// over the error-signalled fence. fp16 max, C8, deterministic -- 3/3 in
+/// isolation, and the boundary does not move with image height (51 wide
+/// hangs at heights 8, 16 and 32) or with tiling (a single 51-wide task
+/// hangs exactly as the 51-wide tile of a 200-wide image does).
+///
+///   kernel  widest input that completes   first width that hangs
+///     3x3            34                          35
+///     4x4            34                          36
+///     5x5            20                          24
+///     8x8            20                          24
+///
+/// A 2x2 window is unaffected: 40 wide at stride 1 and the 258-wide 2x2/s2
+/// tiled case are both exact, which is why this only narrows `kernel_height
+/// >= 3`.
+///
+/// **This is a containment, not an explanation.** The corpus has direct
+/// 129-wide captures, so the hardware can run widths this refuses; our
+/// register *set* is identical to `rocket-userspace`'s `gen_pool_fp16` and
+/// the two width-sensitive values (`PPU_MISC_CTRL` burst length,
+/// `PPU_DATA_FORMAT`'s mirrored surface stride) agree with it, so what
+/// differs is a value neither of those. Finding it needs a register diff
+/// against a wide vendor capture at this kernel and stride, which is the
+/// next step and is not this one. Until then the planner splits into tiles
+/// the hardware is measured to run, which is slower than necessary and
+/// correct.
+///
+/// **Vertical stride is part of the rule, and the corpus is why.** The
+/// vendor's own captured split for a 256-wide 3x3 pool is two 127/129-column tiles --
+/// at stride 2, which is exact here (38 columns out at 3x3/s2 passes, as does
+/// 37 at 4x4/s2). Narrowing that would contradict a capture this module is
+/// derived from, and `wide_plan_reproduces_the_unpadded_vendor_tiles` says so
+/// immediately. So 3x3 and 4x4 are narrowed only at `stride_y == 1`, which is
+/// where every one of their measured hangs lives.
+///
+/// 5x5 and wider are narrowed whenever their windows overlap at all (5x5 at
+/// stride 2 hangs too, 36 columns out). A window that does not overlap is
+/// left alone: the corpus contains an 8x8 pool at stride 16, and it is
+/// nothing like the failing shapes.
+///
+/// Two measured points are narrowed despite passing -- 4x4 at stride 2 (37
+/// columns) and 5x5 at stride 2x2 (18 columns). The rule could be cut finer
+/// to admit them, but every attempt at a *law* here fails: 3x3 at stride 1
+/// hangs 35 columns wide while 4x4 at stride 2 is fine at 40, with the same
+/// two-row overlap. Until the register that actually differs is found, this
+/// stays a table of what was measured, biased towards extra tiles.
+fn overlapping_window_width_limits(kernel_height: u32, stride_y: u32) -> Option<(u32, u32)> {
+    match kernel_height {
+        0..=2 => None,
+        3 | 4 if stride_y == 1 => Some((34, 31)),
+        3 | 4 => None,
+        _ if stride_y < kernel_height => Some((20, 13)),
+        _ => None,
+    }
+}
+
 fn direct_width_limits(shape: &PoolingShape) -> (u32, u32) {
     if shape.kernel_width == 2
         && shape.kernel_height == 2
@@ -221,6 +297,10 @@ fn direct_width_limits(shape: &PoolingShape) -> (u32, u32) {
                 K2S2_INT8_MAX_DIRECT_OUTPUT_WIDTH,
             ),
         }
+    } else if let Some(limits) =
+        overlapping_window_width_limits(shape.kernel_height, shape.stride_y)
+    {
+        limits
     } else {
         (
             DEFAULT_MAX_DIRECT_INPUT_WIDTH,
@@ -519,6 +599,69 @@ pub struct PoolingBuffers {
     pub output_addr: u32,
 }
 
+/// The per-axis reciprocal an average pool multiplies its window sum by.
+///
+/// The PPU has no divider: `avg = sum * recip_w * recip_h * 2^-32`, so each
+/// axis contributes `65536 / k`. **How that number is encoded depends on the
+/// element format**, which is the part that cost a wrong answer on hardware:
+///
+/// * **int8: the plain fixed-point integer.** `65536 / k`, so k=2 programs
+///   `0x8000`. That is what the vendor's own int8 convpool capture emits
+///   (`int8_average_reciprocals_match_the_convpool_capture`).
+/// * **fp16: the fp16 *bit pattern* of the same value.** k=2 programs
+///   `0x7800` and k=3 `0x7555`, both verified against
+///   `../rockchip-npu-notes/encodings/ppu-pooling.md` and matching
+///   `rocket-userspace`'s `ppu_recip_kernel_fp16`.
+///
+/// This module programmed the int8 form at both widths until 2026-09-04,
+/// when `pooling_oracle_hw.rs` ran an average pool on the device for the
+/// first time. int8 was exact and **every fp16 average was wrong**, in the
+/// way reading a fixed-point integer as an fp16 predicts: k=3's `0x5555` is
+/// the fp16 number 85.3, so the product came out at 1.7e-6 and a real
+/// average of -0.889 read back as -3.4e-6. The unit tests could not have
+/// caught it -- the only average capture in the corpus is int8, and it
+/// agrees with what this used to do.
+///
+/// Panics for fp16 at `k = 1`: `65536` is past fp16's 65504 ceiling, so the
+/// identity average has no encoding. int8 has no such limit.
+fn average_reciprocal(kernel: u32, precision: PoolingPrecision) -> u32 {
+    assert!(kernel >= 1, "pooling kernel must be nonzero");
+    let fixed_point = (1u64 << 16) / u64::from(kernel);
+    match precision {
+        PoolingPrecision::Int8 => fixed_point as u32,
+        PoolingPrecision::Fp16 => {
+            assert!(
+                kernel >= 2,
+                "an fp16 average pool cannot encode a kernel of 1: its reciprocal is \
+                 65536, past fp16's 65504 ceiling"
+            );
+            u32::from(fp16_bits(fixed_point as f32))
+        }
+    }
+}
+
+/// The fp16 bit pattern nearest `value`, round-to-nearest-even.
+///
+/// Only ever asked for `65536 / k`, which is positive, finite and well
+/// inside fp16's normal range for every kernel the PPU accepts.
+fn fp16_bits(value: f32) -> u16 {
+    let bits = value.to_bits();
+    let sign = ((bits >> 16) & 0x8000) as u16;
+    let exponent = ((bits >> 23) & 0xff) as i32 - 127 + 15;
+    assert!(
+        (1..=30).contains(&exponent),
+        "{value} is outside fp16's normal range"
+    );
+    let mantissa = bits & 0x7f_ffff;
+    let mut half = sign | ((exponent as u16) << 10) | ((mantissa >> 13) as u16);
+    // Round to nearest, ties to even, on the 13 bits being discarded.
+    let remainder = mantissa & 0x1fff;
+    if remainder > 0x1000 || (remainder == 0x1000 && half & 1 == 1) {
+        half += 1;
+    }
+    half
+}
+
 /// Builds one complete PPU_RDMA -> PPU tile task.
 /// `output_addr` is the exact base address this tile's output starts
 /// writing at; [`PoolingPlan::programs_with_buffers`] applies the tile's
@@ -583,11 +726,11 @@ fn build_pooling_tile_task(
         / FEATURE_ATOMIC_SIZE)
         .next_multiple_of(4);
     // Vendor captures leave these zero for Max. Average pooling consumes
-    // the fixed-point reciprocals; Min, like Max, ignores them.
+    // them; Min, like Max, ignores them.
     let (recip_kernel_width, recip_kernel_height) = match shape.method {
         PoolingMethod::Avg => (
-            ((1u64 << 16) / u64::from(shape.kernel_width)) as u32,
-            ((1u64 << 16) / u64::from(shape.kernel_height)) as u32,
+            average_reciprocal(shape.kernel_width, shape.precision),
+            average_reciprocal(shape.kernel_height, shape.precision),
         ),
         PoolingMethod::Max | PoolingMethod::Min => (0, 0),
     };
@@ -948,6 +1091,35 @@ mod tests {
                 programmed_minus_one
             );
         }
+    }
+
+    /// The two fp16 reciprocals `../rockchip-npu-notes` verified against the
+    /// vendor's own fp16 pool, which is a different encoding from the int8
+    /// capture below -- see `average_reciprocal`.
+    #[test]
+    fn fp16_average_reciprocals_match_the_notes() {
+        assert_eq!(average_reciprocal(2, PoolingPrecision::Fp16), 0x7800);
+        assert_eq!(average_reciprocal(3, PoolingPrecision::Fp16), 0x7555);
+        // int8 keeps the fixed-point form at the same kernels.
+        assert_eq!(average_reciprocal(2, PoolingPrecision::Int8), 0x8000);
+        assert_eq!(average_reciprocal(3, PoolingPrecision::Int8), 21845);
+    }
+
+    /// MobileNetV2's global average pool divides by 49, which is where the
+    /// reciprocal's own precision shows up: fp16 cannot hold 65536/7
+    /// exactly.
+    #[test]
+    fn the_fp16_reciprocal_rounds_rather_than_truncates() {
+        let bits = average_reciprocal(7, PoolingPrecision::Fp16) as u16;
+        let exponent = ((bits >> 10) & 0x1f) as i32 - 15;
+        let value = (1.0 + f32::from(bits & 0x3ff) / 1024.0) * 2f32.powi(exponent);
+        let exact = 65536.0 / 7.0;
+        // One fp16 ulp at this magnitude is 8; truncating would land 4.28
+        // below, rounding lands within half an ulp.
+        assert!(
+            (value - exact).abs() <= 4.0,
+            "{value} is not the nearest fp16 to {exact}"
+        );
     }
 
     #[test]
