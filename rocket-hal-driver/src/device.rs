@@ -99,6 +99,73 @@ fn dispatch_times_enabled() -> bool {
     *ENABLED.get_or_init(|| std::env::var("ROCKET_DISPATCH_TIMES").is_ok_and(|value| value != "0"))
 }
 
+/// Whether to dwell before *every* dispatch, not just the one transition
+/// [`needs_depthwise_to_dense_quiescence`] covers (`ROCKET_QUIESCE_ALL=1`).
+///
+/// A falsification probe for "the hardware needs longer to settle between
+/// dispatches of different kinds". Used to rule that out as the cause of the
+/// `Int8Accumulator` -> `Fp16` hang (ISSUES.md C8): forcing the dwell
+/// everywhere changed nothing, while costing a measurable ~1.2 ms per
+/// dispatch, which is how the knob was confirmed live rather than assumed.
+fn quiesce_all_enabled() -> bool {
+    static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ENABLED.get_or_init(|| std::env::var("ROCKET_QUIESCE_ALL").is_ok_and(|value| value != "0"))
+}
+
+/// Whether to leak every per-tile regcmd BO rather than closing it
+/// (`ROCKET_LEAK_REGCMD=1`).
+///
+/// The other falsification probe for C8: a leaked BO's GEM handle and IOVA are
+/// never recycled, so if a dispatch hangs because it references memory some
+/// later allocation reclaimed, leaking makes the hang go away. It did not.
+/// Diagnostic only -- this leaks for the life of the process.
+fn leak_regcmd_enabled() -> bool {
+    static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ENABLED.get_or_init(|| std::env::var("ROCKET_LEAK_REGCMD").is_ok_and(|value| value != "0"))
+}
+
+/// Whether to print the set of registers each dispatch programs
+/// (`ROCKET_DUMP_REGSET=1`).
+///
+/// Answers "does the shorter program leave something the longer one set?"
+/// without reading either emitter: diff the printed sets. For C8 both the fp16
+/// and the int8-accumulator program turned out to write exactly the same 126
+/// registers, which is what moved the search off the regcmd entirely.
+fn dump_regset_enabled() -> bool {
+    static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ENABLED.get_or_init(|| std::env::var("ROCKET_DUMP_REGSET").is_ok_and(|value| value != "0"))
+}
+
+/// Short label for a dispatch's precision, for the diagnostic prints above.
+fn precision_label(precision: Option<iree_rocket_hal::rocket::conv::Precision>) -> &'static str {
+    use iree_rocket_hal::rocket::conv::Precision;
+    match precision {
+        Some(Precision::Fp16) => "fp16",
+        Some(Precision::Int8Accumulator(_)) => "int8acc",
+        Some(_) => "other",
+        None => "none",
+    }
+}
+
+/// FNV-1a over every task's program words.
+///
+/// Two executions with the same hash ran the same program, which is what
+/// separates "the emitter produced something different this time" from "the
+/// device was left in a different state". C8 is the latter: the hash is
+/// identical across the execution that works and the one that hangs.
+fn program_hash(tasks: &[Vec<iree_rocket_hal::rocket::builders::RegCmd>]) -> u64 {
+    let mut hash: u64 = 0xcbf2_9ce4_8422_2325;
+    for task in tasks {
+        for cmd in task {
+            for byte in cmd.0.to_le_bytes() {
+                hash ^= u64::from(byte);
+                hash = hash.wrapping_mul(0x0000_0100_0000_01b3);
+            }
+        }
+    }
+    hash
+}
+
 // nr=0x00 is generic DRM_IOCTL_VERSION, not rocket-specific -- see
 // rkt-test.rs's identical use of this pattern.
 nix::ioctl_readwrite!(drm_get_version, DRM_IOCTL_BASE, 0x00, drm_version);
@@ -1543,7 +1610,9 @@ unsafe extern "C" fn queue_execute(
                 // its own weights/CBUF state, so no state needs to survive
                 // between jobs.
                 for job in cmds.iter().filter(|j| !j.regcmd_tasks.is_empty()) {
-                    if needs_depthwise_to_dense_quiescence(*last_dpu_mode, job.dpu_mode) {
+                    if quiesce_all_enabled()
+                        || needs_depthwise_to_dense_quiescence(*last_dpu_mode, job.dpu_mode)
+                    {
                         std::thread::sleep(DEPTHWISE_TO_DENSE_QUIESCENCE);
                     }
                     let fd = d.file.as_raw_fd();
@@ -1560,6 +1629,27 @@ unsafe extern "C" fn queue_execute(
                         let cmd_len = cmd_bytes.next_multiple_of(4096);
                         cmd_bufs
                             .push(unsafe { rocket_device::OwnedBuffer::new(fd, cmd_len, &d.file) });
+                    }
+
+                    // The registers this dispatch's first task programs, as
+                    // `domain:offset` pairs -- see `dump_regset_enabled`.
+                    if dump_regset_enabled()
+                        && let Some(first) = regcmd_tasks.first()
+                    {
+                        let mut regs: Vec<String> = first
+                            .iter()
+                            .map(|c| {
+                                format!("{}:{:#06x}", (c.0 >> 48) & 0xff, (c.0 & 0xffff) as u16)
+                            })
+                            .collect();
+                        regs.sort();
+                        regs.dedup();
+                        eprintln!(
+                            "rocket: regset prec={} n={} {}",
+                            precision_label(job.precision_tag),
+                            regs.len(),
+                            regs.join(",")
+                        );
                     }
 
                     let mut task_descriptors = Vec::with_capacity(regcmd_tasks.len());
@@ -1666,7 +1756,21 @@ unsafe extern "C" fn queue_execute(
                         // from a correct inference.
                         let elapsed = started.elapsed();
                         if dispatch_times_enabled() {
-                            eprintln!("rocket: dispatch {:.2} ms", elapsed.as_secs_f64() * 1e3);
+                            eprintln!(
+                                "rocket: dispatch {:.2} ms  prec={} mode={:?} tasks={} \
+                                 prog={:#018x} regcmd_iova={:?} in={:?} out={:?}",
+                                elapsed.as_secs_f64() * 1e3,
+                                precision_label(job.precision_tag),
+                                job.dpu_mode,
+                                regcmd_tasks.len(),
+                                program_hash(regcmd_tasks),
+                                cmd_bufs
+                                    .iter()
+                                    .map(|b| format!("{:#x}", b.dma_address))
+                                    .collect::<Vec<_>>(),
+                                job.in_bo_handles,
+                                job.out_bo_handles,
+                            );
                         }
                         if elapsed >= HUNG_JOB_DISPATCH_FLOOR {
                             eprintln!(
@@ -1740,6 +1844,11 @@ unsafe extern "C" fn queue_execute(
                                 iree_status_code_e_IREE_STATUS_INTERNAL,
                             );
                         }
+                    }
+
+                    // Diagnostic only -- see `leak_regcmd_enabled`.
+                    if leak_regcmd_enabled() {
+                        std::mem::forget(std::mem::take(&mut cmd_bufs));
                     }
                 }
                 status::ok()
