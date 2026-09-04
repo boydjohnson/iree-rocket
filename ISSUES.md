@@ -403,8 +403,8 @@ because ConvPlan predicted 1/11 against the vendor's 6/6, 5/7, 4/8, 4/8 at Cin
 **Audit: 18 → 35 sites, zero dense convolutions left on the CPU.** The
 depthwise ones stay, and *not* because of a channel cap: `RocketDemoteConvInputsPass`
 deliberately excludes depthwise (reverted 2026-09-01, max\|err\| 3.5), so fp16
-depthwise never reaches Rocket at all. That is a separate open bug, untouched
-here. The fp16 depthwise matcher caps were therefore left at 512 rather than
+depthwise never reaches Rocket at all. That is P7 — and the 3.5 turns out to
+have been the static-int8 model, not this one. The fp16 depthwise matcher caps were therefore left at 512 rather than
 raised into a path nothing can reach.
 
 **Accuracy is fine.** Against a CPU-only aarch64 build: 18 sites max\|err\|
@@ -1209,6 +1209,16 @@ building. Which regime MobileNetV2's back-to-back 1x1 convs sit in is the thing
 to measure first — and measure it under a pinned governor (M1), because the term
 being removed is exactly the host-side term the governor penalizes.
 
+**Resized 2026-09-04.** The round trip was 53 ms per inference when this was
+written; P6 item 3 found that most of that was the transforms running on the
+little cluster plus a redundant zero pass, and it is now 26 ms (`compact` 18,
+`pack.input` 8.4) against a 146 ms model. Still the largest thing in the
+driver, and still worth doing — but the "measure the regime first" advice
+above now has a second half: measure it *after* P6 item 3, or the case for
+chaining will look twice as strong as it is. MobileNetV2 fp16 does have
+adjacent NPU dispatch pairs (roughly 15 of 37 dispatches follow another NPU
+dispatch immediately), so the mechanism has somewhere to apply here.
+
 ---
 
 ## P3 (S3) — the full output BO is cache-synced once per tile, and a regcmd BO is allocated and mapped per tile
@@ -1307,6 +1317,336 @@ list as untested.
 
 ---
 
+## P6 (S2, items 1-3 DONE) — measured: MobileNetV2 fp16 spent 8% of its time on the NPU and 30% repacking constant weights
+
+`ROCKET_PROFILE=1` (`rocket-hal-driver/src/profile.rs`) times every phase of a
+dispatch's life separately and prints per-phase and per-op tables at exit.
+`mnv2.fp16.vmfb`, one inference on planck, 2026-09-04 (37 NPU dispatches, 56
+hardware jobs — several dispatches CBUF-split):
+
+```text
+  phase          calls    total ms    avg ms    max ms       MB/s
+  outside           37     107.566     2.907    21.174          -
+  record            37      17.227     0.466     1.919          -
+  pack.input        36      16.505     0.458     2.833        522
+  pack.weights      36      99.025     2.751    20.530        121
+  pack.bias         36       0.416     0.012     0.029        144
+  sync.inputs       37       0.629     0.017     0.055          -
+  regcmd            37       3.311     0.089     0.319         18
+  submit            56       1.053     0.019     0.042          -
+  wait.npu          56      27.125     0.484     2.668          -
+  compact           37      45.043     1.217    21.502        279
+  execute           38     196.507     5.171    27.528          -
+  wall                     321.300
+  host 293.122 ms, npu 28.178 ms, npu share 8.8%
+```
+
+Read against M4 (the offload deficit is real and the dispatch path is where it
+lives), this says which part of the dispatch path:
+
+1. **`pack.weights`, 99 ms — 34% of host time, the single largest item.** The
+   weights are *constant*. Nothing about a `.vmfb`'s filter data changes
+   between inferences, or between two dispatches of the same executable, yet
+   `apply_ops` re-runs `pack_hwcf_to_rocket_weights` on every dispatch of every
+   inference. The whole cost is avoidable by caching the packed scratch keyed
+   by the weight buffer's identity plus the geometry that determines the
+   packing. Worst single op is the classifier matmul at 20.5 ms for 3.6 MB.
+2. **It is also slow per byte.** 121 MB/s, against 522 MB/s for `pack.input`
+   and 279 MB/s for `compact` on the same cores. The coefficient transform is
+   a per-element scatter; even the dispatches that genuinely must repack would
+   get several times this.
+3. **`compact` 45 ms + `pack.input` 16.5 ms = 19% of host time** is the
+   NC1HWC2 round trip P2 describes, now with a price on it. It is the second
+   lever, and unlike the weights it needs the cross-dispatch layout
+   propagation P2 is about.
+4. **`outside` 107 ms (33%)** is everything that is not this driver — the CPU
+   dispatches, dominated by the 17 depthwise convolutions (P7). Offloading
+   more of the model attacks this number and nothing above it.
+5. **`wait.npu` 27 ms is 8.8% of wall.** Every conclusion about NPU speed on
+   this model is a conclusion about 8.8% of its runtime. M2 (the 200 MHz
+   clock) would move ~1.4x of that 8.8%.
+6. **`record` 17 ms** is regcmd construction, which is P3's second half: the
+   program is rebuilt from scratch per dispatch per inference and is
+   address-only-different between runs.
+
+Run-to-run spread is large (`pack.weights` measured 99 and 165 ms in two
+consecutive runs) — planck is `ondemand` with a 408 MHz A76 floor, see M1.
+Compare totals within one run, and do not quote a single run's absolute number.
+
+### Item 1 DONE 2026-09-04: packed coefficients are cached, 1.47x end to end
+
+`rocket-hal-driver/src/weight_cache.rs` caches the packed GEM buffer per
+(weight binding, geometry), so the coefficient transform runs once instead of
+once per dispatch per inference. There is no within-inference reuse to be had —
+MobileNetV2's 36 weight-bearing dispatches all have different filters — so the
+win is from the second inference onward, which is what a benchmark loop or a
+served model does. `iree-benchmark-module`, `mnv2.fp16.vmfb`, 20 iterations,
+two runs each:
+
+```text
+  ROCKET_WEIGHT_CACHE=0    326 ms    307 ms   per inference
+  ROCKET_WEIGHT_CACHE=1    208 ms    222 ms
+```
+
+1.47x, and the logits are bit-identical between the two modes on both the fp16
+and the int8 model. The full `tools/e2e_conv_regression.py --board planck` gate
+passes, with C8's known non-gating failure unchanged.
+
+Three things establish that a hit is safe, and `weight_cache`'s module comment
+carries the argument in full: the key names the source `iree_hal_buffer_t*` and
+`buffer::destroy` forgets its entries, so no recycled address inherits them; a
+generation counter on `RocketBuffer` is bumped by every write this driver can
+observe (`buffer::unmap_range` for every host write — every `queue_*` op,
+command-buffer op and `iree_hal_file_read` reduces to one — plus the output
+compaction, which writes `host_ptr` directly), and an entry only hits at the
+generation it was packed at; and a hit is refused outright if the same command
+buffer already records a write to the weight binding, which is the case
+deferred packing exists for and the one the generation counter cannot see yet.
+
+`ROCKET_WEIGHT_CACHE=verify` re-packs on every hit into a private buffer and
+compares it against the buffer the regcmd actually points at, so a missed
+generation bump or an under-specified key fails loudly instead of quietly
+changing results. 20 iterations x 36 dispatches = 720 verified packings, no
+mismatch. `ROCKET_WEIGHT_CACHE=0` restores the old behaviour for A/B.
+
+### What is left, measured after the fix
+
+10 iterations with the cache on, per inference:
+
+```text
+  outside      102 ms      the CPU half (the 17 depthwise convs, P7)
+  compact       40 ms      DPU atomic slots -> dense IREE buffer
+  pack.weights  50 ms      almost entirely the classifier matmul, see below
+  pack.input    17 ms
+  record        15 ms
+  wait.npu      24 ms      9.7% of wall
+```
+
+**The classifier matmul missed the cache every single inference**, and it was
+the largest remaining pack cost: 278 ms of `pack.weights` across 10
+iterations, 27.8 ms each. The counters said why — 45 misses, *all* of them
+`miss (new)` and none `miss (rewritten)`. A rewritten constant would show as
+stale; a brand-new key every inference means the binding is a **different
+buffer** each time. See the next item.
+
+### Item 2 DONE 2026-09-04: the classifier's weights were re-narrowed every inference
+
+The transform spec's `@call_rocket_matmul` narrowed both matrix operands from
+f32 to f16 itself, with a comment noting that nothing demoted a matmul the way
+`RocketDemoteConvInputsPass` demotes a convolution. That looked equivalent to
+the convolution path and was not: **the function is never inlined**. Every
+dispatch formed inside it is named `call_rocket_matmul_dispatch_N`, which is
+the tell — a truncf in there is invisible to const-expr hoisting, so it never
+became an initializer and instead ran as a CPU dispatch on every inference:
+
+```text
+  call_rocket_matmul_dispatch_1_elementwise_1793792_f32xf16
+    ro %arg4[...] : !stream.resource<constant>{...}      the f32 weights
+    wo %arg5[...] : !stream.resource<transient>{...}     a fresh buffer, per inference
+```
+
+1.79M elements of CPU work, into a transient buffer whose *identity* changes
+every inference — which is exactly why every miss was `miss (new)`. The
+driver's cache was working correctly on a binding that genuinely was a
+different buffer each time.
+
+The fix is in the compiler, not the driver: `RocketDemoteConvInputsPass` now
+demotes `linalg.matmul` alongside the convolutions, so the truncf lands in the
+caller next to the constant and const-eval folds it into an initializer;
+`@match_rocket_matmul` matches f16/f16/f32 like every convolution matcher;
+`@call_rocket_matmul` takes the operands already narrowed; and
+`RocketPromoteUnclaimedConvInputsPass` gives f32 back to a matmul the matcher
+declines. Both passes also carry `indexing_maps` and `cast` across their
+rebuild, joining `strides`/`dilations` — `getPrunedAttributeList` elides every
+inherent attribute name, and for `linalg.matmul` the indexing maps are what
+distinguishes a plain matmul from a transposed one. Dropping them would turn a
+transposed matmul into an untransposed one that then *matches*, which is the
+same silent miscompile the strides bug was; `@transposed_rhs_falls_back` in
+`rocket_matmul_match_boundaries.mlir` now checks the maps on the way out.
+
+After: the weights are `!stream.resource<constant>` at the matmul's own
+binding, the per-inference CPU dispatch is gone, and the cache reaches
+**324 hits / 36 misses over 10 inferences** — one miss per binding, all on the
+first. Logits are bit-identical on both the fp16 and the int8 model (the int8
+model checked against a rebuild of the pre-change compiler, not against a
+stale board artifact). The `.vmfb` also shrinks 16.1 MB -> 12.5 MB: the
+classifier constant is stored f16 now instead of f32.
+
+```text
+  before   216 ms   215 ms   per inference
+  after    202 ms   194 ms
+```
+
+Together with item 1, MobileNetV2 fp16 goes from ~316 ms to ~198 ms, 1.6x.
+
+`compact` is now the largest host item at ~37 ms per inference. The
+unregistered lit tests found on the way (`rocket_matmul*.mlir` and
+`rocket_pooling*.mlir` were in the tree but not in `test/CMakeLists.txt`, so
+`ctest` never ran them) are registered now.
+
+### Item 3 DONE 2026-09-04: the round trip was not slow for the reason it looked slow
+
+Going after `compact` + `pack.input` (37 + 16 ms) as a layout problem — P2's
+cross-op chaining — the first step was to measure the transforms in isolation.
+`iree-rocket-hal/examples/layout_bench` runs both over every shape MobileNetV2
+fp16 presents, on plain memory. **The whole model's transforms took 10.4 ms**,
+against 53 ms measured inside the driver. Three candidate explanations, all
+falsified in turn:
+
+- *Cold caches.* Adding a 16 MiB eviction walk before every timed pass took it
+  to 17.0 ms. Real, but a fifth of the gap.
+- *The GEM mapping.* Every buffer either transform touches is a
+  `DRM_ROCKET_CREATE_BO` + `mmap`, and a write-combining mapping would read at
+  DRAM latency with no prefetch — exactly the shape of the discrepancy.
+  `examples/gem_bandwidth` measured a GEM BO at **9.8 GB/s read against the
+  heap's 9.5**. The mapping is cached and it is not the problem.
+- *The core.* Same benchmark, same data, `taskset`:
+
+```text
+  A76 (cpu4-7)   pack  4.1 ms   compact  9.7 ms    13.8 ms
+  A55 (cpu0-3)   pack 12.2 ms   compact 40.2 ms    52.4 ms
+```
+
+52.4 ms. That is the driver's number, to within noise. So `ROCKET_PROFILE`
+grew a `host time by cpu` line, and it said the driver was spending **59% of
+its host time on cpu0-3** — RK3588's little cluster. Pinning the whole process
+to the big cluster ran the model at 129 ms against 208 ms.
+
+Two fixes, neither of them about layout:
+
+1. **`rocket-hal-driver/src/cpu_affinity.rs`.** `queue_execute` asks the
+   scheduler for the highest-`cpu_capacity` CPUs for the duration of the
+   submission and gives the thread's original affinity back afterwards.
+   Asking rather than keeping matters: on the fast path that work runs on
+   IREE's own calling thread, and permanently narrowing a thread this driver
+   does not own would change scheduling for work that has nothing to do with
+   Rocket. "Big" comes from `cpu_capacity`, the scheduler's own normalized
+   figure, so a uniform machine finds nothing to prefer and the whole thing
+   becomes a no-op. `ROCKET_HOST_CPUS=off` disables it; a list overrides it.
+2. **`pack_nhwc_to_nc1hwc2_padded` stopped zeroing what it is about to
+   overwrite.** It opened with `packed.fill(0)` — a second full write pass
+   over the destination. For a channel count that is a whole number of
+   16-byte atoms, which is *every* convolution in this model, the copy
+   overwrites all of it. Only the channel padding needs zeroing: the tail of
+   a partial last atom, filled per pixel inside the copy loop where the line
+   is already hot, and any whole surface that exists only because the
+   programmed pixel is wider than the logical one.
+
+```text
+  ~198 ms   before
+  ~184 ms   + no redundant zero pass
+   146 ms   + host work on the big cluster    (and run-to-run spread collapses)
+```
+
+Per inference after: `pack.input` 8.4 ms at 1023 MB/s (was 16 ms at 538),
+`compact` 18 ms at 694 MB/s (was 38 ms at 330), `record` 15 ms, `outside`
+88 ms, NPU 22 ms — 13.7% of wall. Logits bit-identical on both models, board
+gate green.
+
+**P2 is still open and still worth what it was**, but it is now worth 26 ms
+per inference rather than 53, and the next person should read M1 and this item
+before quoting either number. The `record` phase's 15 ms is also still on a
+little core: it runs at command-buffer record time, outside `queue_execute`'s
+guard, and a guard per `dispatch` call measured as noise because 37
+back-to-back set/restore pairs migrate the thread off the big cluster between
+every one of them. One guard held across a whole command buffer's recording
+is the way to get it.
+
+---
+
+## P7 (S2) — MobileNetV2 fp16's 17 depthwise convolutions stay on the CPU, and offloading them today makes the model 26% slower
+
+They are the whole of P6's `outside` term: ten executables over 17 dispatch
+sites, `112x112x48` down to `7x7x1344`, all `linalg.depthwise_conv_2d_nhwc_hwc`
+at f32. They stay on the CPU for one reason —
+`RocketDemoteConvInputsPass` deliberately excludes depthwise, so an f32
+depthwise never becomes the f16/f16/f32 the matchers require and no depthwise
+matcher can ever fire.
+
+### The recorded reason for that exclusion does not apply to this model
+
+The pass's scope comment, and `depthwise-f16-demote-breaks-model`, say
+demoting depthwise makes MobileNetV2 wrong: max|err| 3.5 on the logits, top-1
+incorrect on every input, with every isolation passing. That was measured on
+**static-int8** — a command buffer mixing fp16 depthwise with int8 dispatches,
+which is C8's territory, not a statement about depthwise.
+
+Measured on the plain fp16 model, 2026-09-04, against a CPU-only aarch64 f32
+build of the same MLIR:
+
+```text
+  37 sites (today)          max|err| 0.0192   top-1 and top-5 stable
+  44 sites (+7 depthwise)   max|err| 0.0500   top-1 and top-5 stable
+```
+
+against a top-2 logit gap of 0.257, and byte-identical across five consecutive
+single-shot runs with no hang. **Correctness is not the blocker for fp16.**
+
+### It is slower
+
+```text
+  147/149 ms   37 sites
+  185/188 ms   44 sites
+```
+
+Only 7 of the 17 match at all: the fp16 depthwise matchers cap at `Cin <= 512`
+and ten of these are 528, 816 or 1344 (the HAL itself is exact to 1536, see
+`depthwise-channel-ceiling-split`). Those seven cost 32.7 ms of driver time per
+inference, of which 9.6 ms is the NPU:
+
+```text
+  op                                     total   rec  pk.in   npu  cmpct
+  113x113x144->144 k3x3 s2 dw            10.13  2.46   3.19  2.85   1.22
+  114x114x48->48   k3x3 s1 dw             6.12  1.76   1.26  2.04   0.90
+  58x58x192->192   k3x3 s1 dw             6.10  1.37   1.11  1.71   1.72
+  30x30x288->288   k3x3 s1 dw (x2)        5.08  1.13   0.97  1.52   1.19
+  57x57x192->192   k3x3 s2 dw             3.70  0.86   1.11  1.03   0.51
+  29x29x288->288   k3x3 s2 dw             1.54  0.38   0.44  0.45   0.15
+```
+
+Two costs on top of that, both of which only exist because these are the ops
+being moved:
+
+- **`quiesce` 7.4 ms per inference**, 1.06 ms x 7. That is
+  `DEPTHWISE_TO_DENSE_QUIESCENCE`, the dwell after a depthwise completion and
+  before a dense submit. A model whose depthwise and dense convolutions
+  alternate pays it at every boundary.
+- **`outside` *rises* 88 -> 118 ms.** Offloading these does not remove CPU
+  work, it adds some: the matched depthwise needs explicit padding
+  (`112x112 -> 114x114`), which IREE forms as its own CPU dispatch. The
+  padding is why the shapes above read 113/114/58/30 rather than
+  112/56/28.
+
+So the arithmetic is: 9.6 ms of NPU work bought with 23 ms of driver host
+time, 7.4 ms of hardware dwell and 30 ms of extra CPU padding. The
+depthwise convolutions are the cheapest ops in the model per byte moved —
+one filter per channel, no Cout reduction — which is exactly the profile that
+loses to a per-dispatch layout round trip.
+
+### What would change the verdict, in order
+
+1. **P2's cross-op chaining.** These are the widest spatial extents in the
+   model, so their round trip is the most expensive one there is: `pack.input`
+   plus `compact` is 12.3 of the 32.7 ms. A depthwise sitting between two
+   Rocket 1x1 convolutions is also the ideal chaining shape — producer and
+   consumer both on the NPU.
+2. **The pad.** Folding it into the dispatch (the driver already pads on the
+   input packing path) removes the added CPU dispatch and its buffer.
+3. **The quiesce dwell.** 7.4 ms is pure empirical caution; it is C8's
+   neighbour and should be re-derived rather than kept at a millisecond.
+4. **The `Cin <= 512` matcher cap**, last, because raising it only adds more
+   of a currently-losing trade until the three above land. The HAL is exact
+   to 1536.
+
+To reproduce the 44-site build: add
+`DemoteInputsToF16<linalg::DepthwiseConv2DNhwcHwcOp>` and
+`...<linalg::DepthwiseConv2DNchwChwOp>` to `RocketDemoteConvInputsPass`, and
+the `PromoteInputsToF32` counterparts to the promote pass. Two lines each, and
+nothing else in the tree needs to change — the matchers, the executables, the
+weight packing and the HAL are all already there and all already correct.
+
+---
+
 ## D1 (S4) — the FC lowering here and in the notes use opposite geometries, and this one may be better
 
 `iree-rocket-hal/src/rocket/fc.rs` maps, from a sweep of 160 RKNN-compiled ONNX
@@ -1368,14 +1708,21 @@ were meant to enable found two larger things, and both are now at the top.
 2. **M4** — already established; what remains is to stop using the NCHW
    baseline. Cheap, and it is the precondition for any offload decision being
    meaningful.
-3. **P3 → C4 → P4 → P1** — the dispatch-path cost stack, roughly in increasing
-   order of work. This is where the offload deficit actually lives: a
-   like-for-like CPU build is 2.5x faster than the best NPU configuration, so
-   the per-dispatch and per-tile taxes are the whole game.
+3. **P6 → P3 → C4 → P4 → P1** — the dispatch-path cost stack, roughly in
+   increasing order of work. This is where the offload deficit actually lives:
+   a like-for-like CPU build is 2.5x faster than the best NPU configuration, so
+   the per-dispatch and per-tile taxes are the whole game. P6 now measures that
+   stack rather than reasoning about it; its packed-coefficient cache is landed
+   and worth 1.47x end to end; with the classifier matmul's per-inference
+   re-narrowing fixed too the model is 1.6x, and what it leaves behind is the
+   NC1HWC2 round trip.
 4. **C2** — small fix, plus a probe that settles a question the notes leave open.
 5. **M2** — ~1.43x on the device half, but it needs a driver-side
    `clk_set_rate` and both shortcuts hang the box.
-6. **P2** — the big structural one; measure the regime first.
+6. **P2** — the big structural one; measure the regime first. P7 is the case
+   that most needs it: MobileNetV2 fp16's depthwise convolutions are correct
+   on the NPU and lose anyway, and their round trip is the largest single
+   reason.
 7. **C5, C6, C7, D1, D2** — hygiene and reconciliation.
 
 ## Method note

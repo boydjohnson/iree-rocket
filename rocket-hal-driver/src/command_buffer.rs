@@ -83,7 +83,7 @@ use crate::{
     },
     buffer::RocketBuffer,
     executable::UkernelShape,
-    status,
+    profile, status, weight_cache,
 };
 use iree_rocket_hal::rocket::{
     builders::RegCmd,
@@ -160,6 +160,168 @@ pub struct WeightPacking {
     /// `iree-rocket-hal`'s `Shape::depthwise_padded_channels`.
     pub padded_channels: usize,
     pub weight_zero_point: Option<i8>,
+    /// Set only under `ROCKET_WEIGHT_CACHE=verify`: the cached buffer the
+    /// regcmd actually points at. The packing above then runs into a private
+    /// probe buffer instead, and `apply_ops` compares the two -- so a stale
+    /// entry, a missed generation bump or a key that fails to separate two
+    /// different packings fails loudly instead of quietly changing results.
+    pub verify_against: Option<*const u8>,
+}
+
+/// What `apply_ops` needs to make a freshly packed buffer reusable.
+///
+/// The generation is deliberately not carried from record time: it is read
+/// again immediately *before* packing, so a concurrent write to the weight
+/// binding lands on a higher generation than the entry is published under
+/// and can never be mistaken for the bytes that were packed.
+#[derive(Clone, Copy)]
+pub struct WeightPublish {
+    pub key: weight_cache::Key,
+    pub bytes: usize,
+}
+
+/// Where a dispatch's packed coefficients came from, and what has to happen
+/// to them -- see `weight_cache`.
+struct StagedWeights {
+    /// DMA address the regcmd's coefficient read is pointed at.
+    addr: u32,
+    /// GEM handle for the job's `in_bo_handles`.
+    handle: u32,
+    /// `None` on a cache hit: the coefficients are already packed.
+    packing: Option<WeightPacking>,
+    /// The packed buffer, held so it outlives this command buffer's
+    /// execution whether the cache or this dispatch created it.
+    scratch: Option<Arc<weight_cache::SharedBuffer>>,
+    /// Set when this dispatch packed its own: publish it once that succeeds.
+    publish: Option<WeightPublish>,
+    /// Verify mode only: the private buffer the re-pack lands in.
+    probe: Option<RocketOwnedBuffer>,
+}
+
+impl StagedWeights {
+    /// Coefficients the hardware reads straight out of the IREE binding,
+    /// with no packing and nothing to cache (the depthwise-free int8 path).
+    fn direct(addr: u32, handle: u32) -> StagedWeights {
+        StagedWeights {
+            addr,
+            handle,
+            packing: None,
+            scratch: None,
+            publish: None,
+            probe: None,
+        }
+    }
+}
+
+/// The buffer a recorded operation writes, if it writes one.
+///
+/// `weight_cache` refuses a hit when an operation already recorded on this
+/// command buffer targets the weight binding: that write has not been
+/// applied yet, so the generation counter cannot see it, and reusing a
+/// buffer packed from the pre-write bytes would silently use stale weights.
+fn recorded_write_target(op: &RecordedOp) -> Option<*mut iree_hal_buffer_t> {
+    match op {
+        RecordedOp::Fill { target, .. } | RecordedOp::Update { target, .. } => Some(target.buffer),
+        RecordedOp::Copy { target, .. } => Some(target.buffer),
+        RecordedOp::Dispatch {
+            output_compaction, ..
+        } => output_compaction.as_ref().map(|oc| oc.output_buffer),
+    }
+}
+
+/// Points a dispatch at its packed coefficients, reusing a cached packing
+/// when one is valid for this binding at this geometry.
+///
+/// # Safety
+///
+/// `weight_ref.buffer` must be a live `RocketBuffer` and `cb.fd` a live
+/// Rocket DRM file description.
+unsafe fn stage_weights(
+    cb: &RocketCommandBuffer,
+    weight_ref: &iree_hal_buffer_ref_t,
+    geometry: weight_cache::Geometry,
+) -> StagedWeights {
+    let key = weight_cache::Key {
+        buffer: weight_ref.buffer as usize,
+        offset: weight_ref.offset as u64,
+        length: weight_ref.length as u64,
+        geometry,
+    };
+    let generation = unsafe { crate::buffer::generation(weight_ref.buffer) };
+    let pending_writer = cb
+        .ops
+        .iter()
+        .filter_map(recorded_write_target)
+        .any(|target| target == weight_ref.buffer);
+    if pending_writer {
+        weight_cache::note_recorded_writer();
+    }
+    let mut packing = |scratch_ptr: *mut u8, scratch_handle: u32, verify_against| WeightPacking {
+        weight_buffer: weight_ref.buffer,
+        weight_offset: weight_ref.offset,
+        weight_length: weight_ref.length,
+        scratch_ptr,
+        scratch_length: geometry.scratch_length,
+        scratch_handle,
+        filter_height: geometry.filter_height,
+        filter_width: geometry.filter_width,
+        input_channels: geometry.input_channels,
+        output_channels: geometry.output_channels,
+        programmed_output_channels: geometry.programmed_output_channels,
+        element_size: geometry.element_size,
+        depthwise: geometry.depthwise,
+        padded_channels: geometry.padded_channels,
+        weight_zero_point: geometry.weight_zero_point,
+        verify_against,
+    };
+
+    let cached = if pending_writer {
+        None
+    } else {
+        weight_cache::lookup(&key, generation)
+    };
+    if let Some(cached) = cached {
+        // Verify mode re-packs into a throwaway buffer and hands `apply_ops`
+        // the cached bytes to check it against; the regcmd still reads the
+        // cached buffer, so the comparison covers what the hardware sees.
+        let probe = weight_cache::verifying().then(|| unsafe {
+            RocketOwnedBuffer::new(
+                cb.fd,
+                geometry.scratch_length.max(1),
+                BorrowedFd::borrow_raw(cb.fd),
+            )
+        });
+        let verify_packing = probe
+            .as_ref()
+            .map(|probe| packing(probe.host_ptr, probe.handle, Some(cached.host_ptr)));
+        return StagedWeights {
+            addr: cached.dma_address,
+            handle: cached.handle,
+            packing: verify_packing,
+            scratch: Some(cached),
+            publish: None,
+            probe,
+        };
+    }
+
+    let scratch = weight_cache::SharedBuffer::new(unsafe {
+        RocketOwnedBuffer::new(
+            cb.fd,
+            geometry.scratch_length.max(1),
+            BorrowedFd::borrow_raw(cb.fd),
+        )
+    });
+    StagedWeights {
+        addr: scratch.dma_address,
+        handle: scratch.handle,
+        packing: Some(packing(scratch.host_ptr, scratch.handle, None)),
+        publish: Some(WeightPublish {
+            key,
+            bytes: geometry.scratch_length,
+        }),
+        scratch: Some(scratch),
+        probe: None,
+    }
 }
 
 /// Defers logical dense FP16 bias widening and padding until execution.
@@ -282,6 +444,23 @@ pub enum RecordedOp {
         /// risk -- same DPU write-back stage almost certainly has the same
         /// atomic-slot mismatch, just not fixed here).
         output_compaction: Option<OutputCompaction>,
+        /// Human-readable shape of this dispatch, the key `ROCKET_PROFILE`
+        /// groups its per-op timings under. Empty unless profiling is on --
+        /// building it costs a `format!` per recorded dispatch, which is
+        /// exactly the kind of thing that has no business in the inference
+        /// loop by default.
+        profile_label: String,
+        /// The packed coefficients the regcmd reads, shared with
+        /// `weight_cache`. Held here so the allocation outlives this command
+        /// buffer's execution whether it was reused or built by this
+        /// dispatch; `scratch_buffers` cannot own it because the cache may
+        /// still be handing it to later command buffers.
+        weight_scratch: Option<Arc<weight_cache::SharedBuffer>>,
+        /// Set when this dispatch packed its own coefficients: `apply_ops`
+        /// publishes them once the packing has actually succeeded, never at
+        /// record time, so no other command buffer can reach a buffer that
+        /// has not been filled yet.
+        weight_publish: Option<WeightPublish>,
     },
 }
 
@@ -307,6 +486,10 @@ pub struct DispatchJob {
     pub in_bo_handles: &'static [u32],
     pub out_bo_handles: &'static [u32],
     pub output_compaction: Option<OutputCompaction>,
+    /// See `RecordedOp::Dispatch::profile_label`. Borrowed from the recorded
+    /// op, which outlives the job (the command buffer is retained across
+    /// `queue_execute`).
+    pub profile_label: &'static str,
 }
 
 /// What every `iree_hal_command_buffer_t*` this driver hands out actually
@@ -458,9 +641,13 @@ pub unsafe fn apply_ops(
                 weight_packing,
                 bias_packing,
                 output_compaction,
+                profile_label,
+                weight_scratch,
+                weight_publish,
                 ..
             } => {
                 if let Some(packing) = input_packing {
+                    let timer = profile::start();
                     let dense_len = packing
                         .source_pixel_count
                         .checked_mul(packing.bytes_per_pixel)
@@ -531,8 +718,20 @@ pub unsafe fn apply_ops(
                             crate::bindings::iree_status_code_e_IREE_STATUS_INTERNAL,
                         ));
                     }
+                    profile::stop(
+                        timer,
+                        profile::Phase::PackInput,
+                        profile_label,
+                        packing.scratch_length,
+                    );
                 }
                 if let Some(packing) = weight_packing {
+                    let timer = profile::start();
+                    // Read before packing, not after: a concurrent write to
+                    // the binding then lands on a higher generation than the
+                    // entry is published under, so it can never be mistaken
+                    // for the bytes this pack actually read.
+                    let generation = unsafe { crate::buffer::generation(packing.weight_buffer) };
                     // Depthwise's dense_len has no Cout factor -- one filter
                     // per input channel, not a kernel set per output channel
                     // (packing.output_channels is unused in this mode; see
@@ -634,8 +833,47 @@ pub unsafe fn apply_ops(
                             crate::bindings::iree_status_code_e_IREE_STATUS_INTERNAL,
                         ));
                     }
+                    profile::stop(
+                        timer,
+                        profile::Phase::PackWeights,
+                        profile_label,
+                        packing.scratch_length,
+                    );
+                    // Verify mode: the regcmd reads the cached buffer, so
+                    // comparing it against what a fresh pack produces checks
+                    // exactly what the hardware will see. A mismatch means a
+                    // write the generation counter missed, a key that fails
+                    // to separate two different packings, or a stale entry --
+                    // all of which would otherwise be silent wrong numbers.
+                    if let Some(expected) = packing.verify_against {
+                        let packed = unsafe {
+                            std::slice::from_raw_parts(packing.scratch_ptr, packing.scratch_length)
+                        };
+                        let cached =
+                            unsafe { std::slice::from_raw_parts(expected, packing.scratch_length) };
+                        if let Some(index) = packed.iter().zip(cached).position(|(a, b)| a != b) {
+                            eprintln!(
+                                "rocket: ROCKET_WEIGHT_CACHE=verify mismatch at byte {index} of                                  {} for `{profile_label}`: cached {:#04x}, freshly packed {:#04x}.                                  The cached coefficients do not match this dispatch's weights;                                  run with ROCKET_WEIGHT_CACHE=0 to confirm, then look for a write                                  to the weight binding that does not reach `buffer::note_write`.",
+                                packing.scratch_length, cached[index], packed[index],
+                            );
+                            return Err(status::from_code(
+                                crate::bindings::iree_status_code_e_IREE_STATUS_DATA_LOSS,
+                            ));
+                        }
+                    }
+                    // Only now, with the buffer actually filled and flushed,
+                    // is it safe for another command buffer to point at it.
+                    if let (Some(publish), Some(scratch)) = (weight_publish, weight_scratch) {
+                        weight_cache::publish(
+                            publish.key,
+                            generation,
+                            Arc::clone(scratch),
+                            publish.bytes,
+                        );
+                    }
                 }
                 if let Some(packing) = bias_packing {
+                    let timer = profile::start();
                     let dense_len = packing
                         .output_channels
                         .checked_mul(if packing.int8 { 4 } else { 2 })
@@ -696,6 +934,12 @@ pub unsafe fn apply_ops(
                             crate::bindings::iree_status_code_e_IREE_STATUS_INTERNAL,
                         ));
                     }
+                    profile::stop(
+                        timer,
+                        profile::Phase::PackBias,
+                        profile_label,
+                        packing.scratch_length,
+                    );
                 }
                 // Sync every buffer the NPU is about to read for device access.
                 //
@@ -720,6 +964,7 @@ pub unsafe fn apply_ops(
                 // hazard for any buffer passed directly in future. A
                 // redundant sync on an already-synced scratch BO is a cache
                 // operation with no effect on correctness.
+                let timer = profile::start();
                 for &input_handle in in_bo_handles.iter() {
                     if unsafe { fini_bo(cb.fd, input_handle) }.is_err() {
                         return Err(status::from_code(
@@ -727,6 +972,7 @@ pub unsafe fn apply_ops(
                         ));
                     }
                 }
+                profile::stop(timer, profile::Phase::SyncInputs, profile_label, 0);
                 dispatch_jobs.push(DispatchJob {
                     regcmd_tasks: regcmd_tasks.as_slice(),
                     dpu_mode: *dpu_mode,
@@ -734,6 +980,7 @@ pub unsafe fn apply_ops(
                     in_bo_handles: in_bo_handles.as_slice(),
                     out_bo_handles: out_bo_handles.as_slice(),
                     output_compaction: output_compaction.clone(),
+                    profile_label: profile_label.as_str(),
                 });
             }
         }
@@ -997,6 +1244,14 @@ status_stub!(collective(
 ) -> iree_status_t);
 
 #[allow(unused_variables)]
+/// Times `dispatch_impl` as `ROCKET_PROFILE`'s record phase.
+///
+/// Everything a dispatch costs before the hardware ever sees it -- planning
+/// the convolution, allocating scratch, emitting the regcmd -- happens here,
+/// at record time, not at submit time, and none of it shows up in a
+/// per-job timer. The label is read back off the op that was just recorded
+/// rather than threaded out of `dispatch_impl`, which keeps that function's
+/// forty-odd early returns untouched.
 unsafe extern "C" fn dispatch(
     command_buffer: *mut iree_hal_command_buffer_t,
     executable: *mut iree_hal_executable_t,
@@ -1005,6 +1260,38 @@ unsafe extern "C" fn dispatch(
     constants: iree_const_byte_span_t,
     bindings: iree_hal_buffer_ref_list_t,
     flags: iree_hal_dispatch_flags_t,
+) -> iree_status_t {
+    let timer = profile::start();
+    let status = unsafe {
+        dispatch_impl(
+            command_buffer,
+            executable,
+            function,
+            config,
+            constants,
+            bindings,
+            flags,
+        )
+    };
+    if timer.is_some() {
+        let cb = unsafe { &*cast(command_buffer) };
+        let label = match cb.ops.last() {
+            Some(RecordedOp::Dispatch { profile_label, .. }) => profile_label.as_str(),
+            _ => profile::NO_OP,
+        };
+        profile::stop(timer, profile::Phase::Record, label, 0);
+    }
+    status
+}
+
+unsafe extern "C" fn dispatch_impl(
+    command_buffer: *mut iree_hal_command_buffer_t,
+    executable: *mut iree_hal_executable_t,
+    _function: iree_hal_executable_function_t,
+    _config: iree_hal_dispatch_config_t,
+    constants: iree_const_byte_span_t,
+    bindings: iree_hal_buffer_ref_list_t,
+    _flags: iree_hal_dispatch_flags_t,
 ) -> iree_status_t {
     let cb = unsafe { &mut *cast(command_buffer) };
     let shape = unsafe { &*crate::executable::shape(executable) };
@@ -1152,7 +1439,7 @@ unsafe extern "C" fn dispatch(
             // This is independently deferred for the same reason as input
             // packing: an earlier recorded operation may populate weights.
             let element_size = shape.precision.element_bytes() as usize;
-            let (weights_addr, weights_handle, weight_packing) = if !shape.depthwise {
+            let staged_weights = if !shape.depthwise {
                 if !matches!(
                     kernels[0]
                     .checked_mul(kernels[1])
@@ -1179,39 +1466,27 @@ unsafe extern "C" fn dispatch(
                         );
                     }
                 };
-                let scratch = unsafe {
-                    RocketOwnedBuffer::new(
-                        cb.fd,
-                        scratch_bytes.max(1),
-                        BorrowedFd::borrow_raw(cb.fd),
+                unsafe {
+                    stage_weights(
+                        cb,
+                        &refs[1],
+                        weight_cache::Geometry {
+                            filter_height: kernels[0],
+                            filter_width: kernels[1],
+                            input_channels: shape.in_channels as usize,
+                            output_channels: shape.out_channels as usize,
+                            programmed_output_channels: programmed_shape.out_channels as usize,
+                            element_size,
+                            depthwise: false,
+                            padded_channels: 0,
+                            weight_zero_point: shape
+                                .precision
+                                .quantization()
+                                .map(|q| q.weight_zero_point as i8),
+                            scratch_length: scratch_bytes,
+                        },
                     )
-                };
-                let packed = (
-                    scratch.dma_address,
-                    scratch.handle,
-                    Some(WeightPacking {
-                        weight_buffer: refs[1].buffer,
-                        weight_offset: refs[1].offset,
-                        weight_length: refs[1].length,
-                        scratch_ptr: scratch.host_ptr,
-                        scratch_length: scratch_bytes,
-                        scratch_handle: scratch.handle,
-                        filter_height: kernels[0],
-                        filter_width: kernels[1],
-                        input_channels: shape.in_channels as usize,
-                        output_channels: shape.out_channels as usize,
-                        programmed_output_channels: programmed_shape.out_channels as usize,
-                        element_size,
-                        depthwise: false,
-                        padded_channels: 0,
-                        weight_zero_point: shape
-                            .precision
-                            .quantization()
-                            .map(|q| q.weight_zero_point as i8),
-                    }),
-                );
-                scratch_buffers.push(scratch);
-                packed
+                }
             } else if shape.depthwise {
                 // One filter per input channel -- no Cout factor, unlike
                 // the dense branch above. The compiler-emitted dispatch
@@ -1232,42 +1507,41 @@ unsafe extern "C" fn dispatch(
                     );
                 }
                 let scratch_bytes = shape.weight_bytes(kernels) as usize;
-                let scratch = unsafe {
-                    RocketOwnedBuffer::new(
-                        cb.fd,
-                        scratch_bytes.max(1),
-                        BorrowedFd::borrow_raw(cb.fd),
+                unsafe {
+                    stage_weights(
+                        cb,
+                        &refs[1],
+                        weight_cache::Geometry {
+                            filter_height: kernels[0],
+                            filter_width: kernels[1],
+                            input_channels: shape.in_channels as usize,
+                            output_channels: shape.out_channels as usize,
+                            programmed_output_channels: shape.out_channels as usize,
+                            element_size,
+                            depthwise: true,
+                            padded_channels: shape.depthwise_padded_channels() as usize,
+                            weight_zero_point: shape
+                                .precision
+                                .quantization()
+                                .map(|q| q.weight_zero_point as i8),
+                            scratch_length: scratch_bytes,
+                        },
                     )
-                };
-                let packed = (
-                    scratch.dma_address,
-                    scratch.handle,
-                    Some(WeightPacking {
-                        weight_buffer: refs[1].buffer,
-                        weight_offset: refs[1].offset,
-                        weight_length: refs[1].length,
-                        scratch_ptr: scratch.host_ptr,
-                        scratch_length: scratch_bytes,
-                        scratch_handle: scratch.handle,
-                        filter_height: kernels[0],
-                        filter_width: kernels[1],
-                        input_channels: shape.in_channels as usize,
-                        output_channels: shape.out_channels as usize,
-                        programmed_output_channels: shape.out_channels as usize,
-                        element_size,
-                        depthwise: true,
-                        padded_channels: shape.depthwise_padded_channels() as usize,
-                        weight_zero_point: shape
-                            .precision
-                            .quantization()
-                            .map(|q| q.weight_zero_point as i8),
-                    }),
-                );
-                scratch_buffers.push(scratch);
-                packed
+                }
             } else {
-                (addr(&refs[1]), handle(&refs[1]), None)
+                StagedWeights::direct(addr(&refs[1]), handle(&refs[1]))
             };
+            let StagedWeights {
+                addr: weights_addr,
+                handle: weights_handle,
+                packing: weight_packing,
+                scratch: weight_scratch,
+                publish: weight_publish,
+                probe: weight_probe,
+            } = staged_weights;
+            if let Some(probe) = weight_probe {
+                scratch_buffers.push(probe);
+            }
             let (bias_addr, bias_handle, bias_packing) = if shape.precision == Precision::Fp16 {
                 let output_channels = shape.out_channels as usize;
                 let padded_output_channels = programmed_shape.padded_out_channels() as usize;
@@ -1421,6 +1695,20 @@ unsafe extern "C" fn dispatch(
             let output_handle = scratch.handle;
             scratch_buffers.push(scratch);
             let retained_bindings = unsafe { retain_direct_bindings(refs) };
+            let profile_label = profile::label(|| {
+                format!(
+                    "conv {} {}x{}x{}->{} k{}x{} s{}{}",
+                    profile::precision_name(shape.precision),
+                    shape.height,
+                    shape.width,
+                    shape.in_channels,
+                    shape.out_channels,
+                    kernels[0],
+                    kernels[1],
+                    shape.stride,
+                    if shape.depthwise { " dw" } else { "" },
+                )
+            });
             cb.ops.push(RecordedOp::Dispatch {
                 regcmd_tasks,
                 dpu_mode: Some(if shape.depthwise {
@@ -1437,6 +1725,9 @@ unsafe extern "C" fn dispatch(
                 weight_packing,
                 bias_packing,
                 output_compaction,
+                profile_label,
+                weight_scratch,
+                weight_publish,
             });
         }
         UkernelShape::Matmul(executable) => {
@@ -1567,30 +1858,31 @@ unsafe extern "C" fn dispatch(
                     crate::bindings::iree_status_code_e_IREE_STATUS_INVALID_ARGUMENT,
                 );
             }
-            let weight_scratch = unsafe {
-                RocketOwnedBuffer::new(
-                    cb.fd,
-                    weight_scratch_bytes.max(1),
-                    BorrowedFd::borrow_raw(cb.fd),
+            let StagedWeights {
+                addr: weights_addr,
+                handle: weights_handle,
+                packing: weight_packing,
+                scratch: weight_scratch,
+                publish: weight_publish,
+                probe: weight_probe,
+            } = unsafe {
+                stage_weights(
+                    cb,
+                    &refs[1],
+                    weight_cache::Geometry {
+                        filter_height: 1,
+                        filter_width: 1,
+                        input_channels: k,
+                        output_channels: n,
+                        programmed_output_channels: n,
+                        element_size,
+                        depthwise: false,
+                        padded_channels: 0,
+                        weight_zero_point: None,
+                        scratch_length: weight_scratch_bytes,
+                    },
                 )
             };
-            let weight_packing = Some(WeightPacking {
-                weight_buffer: refs[1].buffer,
-                weight_offset: refs[1].offset,
-                weight_length: refs[1].length,
-                scratch_ptr: weight_scratch.host_ptr,
-                scratch_length: weight_scratch_bytes,
-                scratch_handle: weight_scratch.handle,
-                filter_height: 1,
-                filter_width: 1,
-                input_channels: k,
-                output_channels: n,
-                programmed_output_channels: n,
-                element_size,
-                depthwise: false,
-                padded_channels: 0,
-                weight_zero_point: None,
-            });
 
             let (bias_addr, bias_handle, bias_packing, bias_scratch) = if shape.precision
                 == Precision::Fp16
@@ -1659,7 +1951,7 @@ unsafe extern "C" fn dispatch(
             };
             let bufs = Buffers {
                 input: input_scratch.dma_address,
-                weights: weight_scratch.dma_address,
+                weights: weights_addr,
                 bias: bias_addr,
                 output: output_scratch.dma_address,
             };
@@ -1675,7 +1967,7 @@ unsafe extern "C" fn dispatch(
             };
 
             let input_scratch_handle = input_scratch.handle;
-            let weight_scratch_handle = weight_scratch.handle;
+            let weight_scratch_handle = weights_handle;
             let output_scratch_handle = output_scratch.handle;
             let output_compaction = Some(OutputCompaction {
                 output_buffer: refs[3].buffer,
@@ -1694,7 +1986,19 @@ unsafe extern "C" fn dispatch(
                 source_tiles: None,
             });
             let retained_bindings = unsafe { retain_direct_bindings(refs) };
-            let mut scratch_buffers = vec![input_scratch, weight_scratch, output_scratch];
+            let profile_label = profile::label(|| {
+                format!(
+                    "matmul {} {}x{}x{}",
+                    profile::precision_name(shape.precision),
+                    m,
+                    k,
+                    n,
+                )
+            });
+            let mut scratch_buffers = vec![input_scratch, output_scratch];
+            if let Some(probe) = weight_probe {
+                scratch_buffers.push(probe);
+            }
             if let Some(scratch) = bias_scratch {
                 scratch_buffers.push(scratch);
             }
@@ -1710,6 +2014,9 @@ unsafe extern "C" fn dispatch(
                 weight_packing,
                 bias_packing,
                 output_compaction,
+                profile_label,
+                weight_scratch,
+                weight_publish,
             });
         }
         UkernelShape::Pooling(executable) => {
@@ -1861,6 +2168,19 @@ unsafe extern "C" fn dispatch(
             let in_bo_handles = vec![input_scratch.handle];
             let out_bo_handles = vec![output_scratch.handle];
             let retained_bindings = unsafe { retain_direct_bindings(refs) };
+            let profile_label = profile::label(|| {
+                format!(
+                    "pool {:?} {}x{}x{} k{}x{} s{}x{}",
+                    shape.method,
+                    shape.input_height,
+                    shape.input_width,
+                    shape.input_channels,
+                    shape.kernel_height,
+                    shape.kernel_width,
+                    shape.stride_y,
+                    shape.stride_x,
+                )
+            });
             cb.ops.push(RecordedOp::Dispatch {
                 regcmd_tasks,
                 dpu_mode: None,
@@ -1873,6 +2193,9 @@ unsafe extern "C" fn dispatch(
                 weight_packing: None,
                 bias_packing: None,
                 output_compaction,
+                profile_label,
+                weight_scratch: None,
+                weight_publish: None,
             });
         }
     }

@@ -38,13 +38,16 @@ pub mod status;
 pub mod allocator;
 pub mod buffer;
 pub mod command_buffer;
+pub mod cpu_affinity;
 pub mod device;
 pub mod driver;
 pub mod event;
 pub mod executable;
 pub mod executable_cache;
 pub mod file;
+pub mod profile;
 pub mod semaphore;
+pub mod weight_cache;
 
 /// Mirrors `iree_hal_null_driver_module_register()`'s C ABI signature
 /// exactly -- the name a CMake `IREE_EXTERNAL_ROCKET_HAL_DRIVER_REGISTER`

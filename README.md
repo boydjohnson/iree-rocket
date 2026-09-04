@@ -153,14 +153,25 @@ On MobileNetV2 it turned the stride-2 stem conv into a nominal stride-1 conv,
 which then also matched `@match_dynamic_conv2d_3x3` (which requires stride 1)
 and was dispatched to the NPU with the wrong stride.
 
+`linalg.matmul` is demoted by the same pass, for a different reason. The
+transform spec's `@call_rocket_matmul` used to narrow its own operands, which
+looks equivalent and is not: that function is never inlined, so the truncf is
+invisible to const-expr hoisting and re-narrows the *constant* classifier
+weights on every inference -- 1.79M elements of CPU work into a fresh
+transient buffer, which then misses the runtime's packed-coefficient cache
+every time as well. Demoted in the caller instead, const-eval folds it into an
+initializer. Both passes carry `indexing_maps` and `cast` across the rebuild
+alongside `strides`/`dilations`, since for a matmul the indexing maps are what
+distinguishes a plain matmul from a transposed one.
+
 Demotion has to precede the match loop, because the matchers require
-f16/f16/f32 typing -- but it cannot know which convolutions the loop will
+f16/f16/f32 typing -- but it cannot know which operations the loop will
 claim, and deciding that up front would mean re-implementing the matchers'
 eligibility predicates in C++ and keeping the two in sync. So the spec demotes
-every all-f32 named convolution, matches, and then
+every all-f32 named convolution and matmul, matches, and then
 `rocket-promote-unclaimed-conv-inputs` restores f32 on whatever is left:
-anything still holding a `linalg.conv_2d_*` after `foreach_match` is by
-definition unclaimed. Without it an unclaimed convolution runs on the CPU in
+anything still holding a `linalg.conv_2d_*` or `linalg.matmul` after
+`foreach_match` is by definition unclaimed. Without it an unclaimed convolution runs on the CPU in
 half precision when f32 was free -- on MobileNetV2 that is the stride-2 stem,
 worth 0.349 max|err| on the final logits. Only the plugin's own demotion is
 reverted: both passes agree on a `rocket.f16_demoted` tag, so a model that
@@ -189,6 +200,62 @@ one. Their convolutions reach the NPU through the `int8_accumulator` precision
 (int8 in, int32 accumulator out, requantization bypassed); the transform spec
 folds the activation zero point into a CPU-side correction first, because that
 hardware mode is only validated for zero zero-points.
+
+## Profiling a run
+
+The driver pays a host-side cost per dispatch that no per-job timer sees: the
+input is repacked NHWC -> NC1HWC2, the weights are repacked into the CNA's
+blocked coefficient order, and the DPU's atomic-slot output is compacted back
+into IREE's dense buffer -- once per dispatch, on every inference.
+`ROCKET_PROFILE` times each of those phases separately and prints a per-phase
+table plus a per-op breakdown at exit:
+
+```sh
+ROCKET_PROFILE=1 ./iree-run-module --module=model.vmfb --function=main_graph \
+  --device=rocket --device=local-task --input=1x3x224x224xf32=0.1
+```
+
+`ROCKET_PROFILE=trace` additionally prints a line per phase as it happens.
+The `outside` row is time spent outside this driver entirely (the CPU
+dispatches), so the two halves of a mixed model can be compared directly.
+See ISSUES.md's P6 for the MobileNetV2 fp16 numbers and what they say.
+
+Packed coefficients are cached across inferences (once per weight binding and
+geometry rather than once per dispatch), which is worth 1.47x on MobileNetV2
+fp16 in `iree-benchmark-module`. The report's `weight cache` line says how well
+it is working; `rocket-hal-driver/src/weight_cache.rs` documents why a reuse is
+safe. Three knobs:
+
+| Variable | Effect |
+|---|---|
+| `ROCKET_WEIGHT_CACHE=0` | Disable; pack on every dispatch, as before. |
+| `ROCKET_WEIGHT_CACHE=verify` | Pack anyway on a hit and compare against the cached bytes the regcmd reads, failing loudly on any difference. |
+| `ROCKET_WEIGHT_CACHE_MB=N` | Byte budget, default 256 MiB. |
+
+The driver's host-side work is memory-bound, so on a big.LITTLE part it runs
+several times slower on the little cluster -- 52.4 ms against 13.8 ms for
+MobileNetV2 fp16's layout transforms on RK3588. `queue_execute` therefore asks
+the scheduler for the highest-`cpu_capacity` CPUs while it runs and restores
+the thread's original affinity afterwards; the profile's `host time by cpu`
+line shows where it actually landed. On a machine whose cores are all the same
+this finds nothing to prefer and does nothing.
+
+| Variable | Effect |
+|---|---|
+| `ROCKET_HOST_CPUS=off` | Never change affinity. |
+| `ROCKET_HOST_CPUS=0-3,7` | Use this CPU list instead of the highest-capacity one. |
+
+`iree-rocket-hal`'s `layout_bench` and `gem_bandwidth` examples measure the
+transforms and the GEM mapping directly, which is a much faster way to test a
+hypothesis about either than a model run:
+
+```sh
+CARGO_TARGET_AARCH64_UNKNOWN_LINUX_GNU_LINKER=aarch64-linux-gnu-gcc \
+  cargo build -p iree-rocket-hal --release \
+  --target aarch64-unknown-linux-gnu --example layout_bench
+scp target/aarch64-unknown-linux-gnu/release/examples/layout_bench planck:/tmp/
+ssh planck '/tmp/layout_bench 20 cold'
+```
 
 ## Board convolution regression gate
 

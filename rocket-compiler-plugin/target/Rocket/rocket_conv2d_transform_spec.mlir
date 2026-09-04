@@ -519,50 +519,32 @@ module attributes {transform.with_named_sequence} {
   // The bias binding is zero-filled. MobileNetV2's bias add is a separate
   // linalg.generic and stays on the CPU: folding it would cost a matcher
   // that claims two ops for one elementwise pass over 1001 floats.
+  //
+  // Both matrix operands arrive already f16: RocketDemoteConvInputsPass
+  // narrows a matmul exactly as it narrows a convolution, and
+  // @match_rocket_matmul requires the result. This function used to do the
+  // narrowing itself, which looked equivalent and was not -- it is never
+  // inlined (every dispatch formed inside it is named
+  // `call_rocket_matmul_dispatch_N`), so a truncf here is invisible to
+  // const-expr hoisting and re-narrows the *constant* classifier weights on
+  // every inference: 1.79M elements of CPU work into a fresh transient
+  // buffer, which then misses the runtime's packed-coefficient cache every
+  // time as well. Demoted in the caller instead, const-eval folds it into an
+  // initializer, as it already did for every convolution's weights.
   util.func private @call_rocket_matmul(
-      %lhs: tensor<?x?xf32>,
-      %rhs: tensor<?x?xf32>,
+      %lhs: tensor<?x?xf16>,
+      %rhs: tensor<?x?xf16>,
       %init: tensor<?x?xf32>) -> tensor<?x?xf32> {
     %c0 = arith.constant 0 : index
     %c1 = arith.constant 1 : index
 
-    %m = tensor.dim %lhs, %c0 : tensor<?x?xf32>
-    %k = tensor.dim %lhs, %c1 : tensor<?x?xf32>
-    %n = tensor.dim %rhs, %c1 : tensor<?x?xf32>
+    %m = tensor.dim %lhs, %c0 : tensor<?x?xf16>
+    %k = tensor.dim %lhs, %c1 : tensor<?x?xf16>
+    %n = tensor.dim %rhs, %c1 : tensor<?x?xf16>
 
     %m_i32 = arith.index_cast %m : index to i32
     %k_i32 = arith.index_cast %k : index to i32
     %n_i32 = arith.index_cast %n : index to i32
-
-    // Nothing demotes a matmul the way RocketDemoteConvInputsPass demotes a
-    // convolution, so both operands are narrowed here.
-    %lhs_f16_empty = tensor.empty(%m, %k) : tensor<?x?xf16>
-    %lhs_f16 = linalg.generic {
-        indexing_maps = [
-          affine_map<(d0, d1) -> (d0, d1)>,
-          affine_map<(d0, d1) -> (d0, d1)>
-        ],
-        iterator_types = ["parallel", "parallel"]
-      } ins(%lhs : tensor<?x?xf32>)
-        outs(%lhs_f16_empty : tensor<?x?xf16>) {
-      ^bb0(%value: f32, %out: f16):
-        %narrowed = arith.truncf %value : f32 to f16
-        linalg.yield %narrowed : f16
-    } -> tensor<?x?xf16>
-
-    %rhs_f16_empty = tensor.empty(%k, %n) : tensor<?x?xf16>
-    %rhs_f16 = linalg.generic {
-        indexing_maps = [
-          affine_map<(d0, d1) -> (d0, d1)>,
-          affine_map<(d0, d1) -> (d0, d1)>
-        ],
-        iterator_types = ["parallel", "parallel"]
-      } ins(%rhs : tensor<?x?xf32>)
-        outs(%rhs_f16_empty : tensor<?x?xf16>) {
-      ^bb0(%value: f32, %out: f16):
-        %narrowed = arith.truncf %value : f32 to f16
-        linalg.yield %narrowed : f16
-    } -> tensor<?x?xf16>
 
     %zero_bias_empty = tensor.empty(%n) : tensor<?xf16>
     %zero_f16 = arith.constant 0.0 : f16
@@ -572,7 +554,7 @@ module attributes {transform.with_named_sequence} {
     %raw_f16 = flow.dispatch
         @rocket_matmul_executable::@rocket_matmul_v1::@rocket_matmul(
           %m_i32, %k_i32, %n_i32,
-          %lhs_f16, %rhs_f16, %zero_bias)
+          %lhs, %rhs, %zero_bias)
         {stream.affinity = #hal.device.affinity<@rocket_device>}
         : (i32, i32, i32,
            tensor<?x?xf16>{%m, %k},
@@ -647,7 +629,7 @@ module attributes {transform.with_named_sequence} {
   //     torch-mlir emits and, unlike dense convolution, nothing upstream
   //     converts it (the same reason the depthwise NCHW shim above exists).
   //   * f32 -> f16 and back. Nothing demotes pooling inputs the way
-  //     RocketDemoteConvInputsPass demotes convolution ones, so the
+  //     RocketDemoteConvInputsPass demotes convolution and matmul ones, so the
   //     truncation is explicit here.
   //   * a multiply by kh*kw. The op is a *sum* pool and the hardware
   //     computes an *average*, so the result is scaled back up to the sum
@@ -2608,6 +2590,12 @@ module attributes {transform.with_named_sequence} {
 
   // The matmul matcher.
   //
+  // f16/f16/f32, like every convolution matcher here: a matmul reaches this
+  // point already demoted by RocketDemoteConvInputsPass, and
+  // RocketPromoteUnclaimedConvInputsPass gives f32 back to whatever this
+  // declines. It used to match f32 and narrow inside @call_rocket_matmul --
+  // see that function for why that was quietly expensive.
+  //
   // `transform.iree.match.contraction` is the op that can check indexing
   // maps, which is the whole difficulty here: `linalg.matmul` carries a
   // transpose or a broadcast as an attribute rather than as a different op
@@ -2626,7 +2614,7 @@ module attributes {transform.with_named_sequence} {
   transform.named_sequence @match_rocket_matmul(%root: !transform.any_op {transform.readonly}) -> !transform.any_op {
     transform.match.operation_name %root ["linalg.matmul"] : !transform.any_op
     %batch, %m, %n, %k = transform.iree.match.contraction %root,
-        lhs_type = f32, rhs_type = f32, output_type = f32,
+        lhs_type = f16, rhs_type = f16, output_type = f32,
         indexing_maps = [#rocket_matmul_lhs, #rocket_matmul_rhs, #rocket_matmul_out]
         : !transform.any_op -> !transform.param<i64>
     transform.iree.match.dims_equal %batch, [] : !transform.param<i64>
