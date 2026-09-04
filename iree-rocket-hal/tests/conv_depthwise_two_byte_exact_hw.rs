@@ -343,7 +343,8 @@ fn fp16_depthwise_exact_at_stride_two() {
 
 /// The other two 2-byte rungs, on a representative slice of the fp16 ladder
 /// above: inside one coefficient group, across two and four of them, at a
-/// partial feature atom, and at a real stride-2 MobileNetV2 geometry.
+/// partial feature atom, at a real stride-2 MobileNetV2 geometry, and --
+/// added 2026-09-04 -- wide, at nine and sixteen coefficient groups.
 ///
 /// The claim is that the depthwise path follows the element *width*, exactly
 /// as the dense path does, so bf16 and int16 inherit fp16's 32-channel
@@ -351,10 +352,16 @@ fn fp16_depthwise_exact_at_stride_two() {
 /// own. A narrower slice than fp16's because that claim is structural: if it
 /// holds at all it holds at every channel count, and if it fails it fails at
 /// the first group boundary.
+///
+/// The wide points are here because "structural" is an argument, not a
+/// measurement, and the dense side of these same rungs turned out to have a
+/// real width-dependent fault at high channel counts once someone looked
+/// (`streamed_weight_bank_preference_for_group`). 288 and 512 are what the
+/// dense ladders reach on the depthwise axis.
 #[test]
 #[ignore = "needs /dev/accel/accel0 -- cross-compile for aarch64 and run on the RK3588 board"]
 fn bf16_depthwise_exact() {
-    for channels in [24, 32, 64, 20] {
+    for channels in [24, 32, 64, 20, 288, 512] {
         check_depthwise(TwoByte::Bf16, channels, 34, 34, 1);
     }
     check_depthwise(TwoByte::Bf16, 144, 113, 113, 2);
@@ -363,7 +370,7 @@ fn bf16_depthwise_exact() {
 #[test]
 #[ignore = "needs /dev/accel/accel0 -- cross-compile for aarch64 and run on the RK3588 board"]
 fn int16_depthwise_exact() {
-    for channels in [24, 32, 64, 20] {
+    for channels in [24, 32, 64, 20, 288, 512] {
         check_depthwise(TwoByte::Int16, channels, 34, 34, 1);
     }
     check_depthwise(TwoByte::Int16, 144, 113, 113, 2);

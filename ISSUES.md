@@ -926,6 +926,70 @@ next probe.
 
 ---
 
+## C9 (S2) — above 3x3 the conv path has two faults the fp16 capture sweep could not have seen: a `Cin` cliff that hangs at every width, and an int8 program that computes wrong values at every shape
+
+Found 2026-09-04 while extending the datatype ladders past their first-light
+shapes (bf16, int16, int4, tf32, fp16-f32out). Both are **guarded now** rather
+than fixed: `large_kernel_max_in_channels` refuses what hardware does not do,
+so a program that used to hang is a loud panic instead. Neither is reachable
+from the compiler, whose matchers stop at 3x3.
+
+The same sweep found two tf32 faults that *are* fixed, both also hangs rather
+than wrong data, and both now board-validated over the whole ladder:
+`Precision::out_channel_granule` (tf32 was the one rung whose granule was not
+a multiple of 16, and every padded `Cout` at `8 (mod 16)` hung) and
+`streamed_weight_bank_preference_for_group` (its coefficient working set was
+calibrated at 1- and 2-byte widths and starved the 4-byte stream, so tf32 k=3
+`Cin` 576-896 planned 5/7 and hung where the same *footprint* at fp16 plans
+1/11 and is exact). Neither is in the table below.
+
+### The `Cin` cliff [verified]
+
+At 7x7, 9x9 and 11x11, a convolution is exact up to a per-width `Cin` and
+**hangs the NPU above it** -- a watchdog kill at ~500 ms, `prep_bo` returning
+success over an error-signalled fence, i.e. the C3 signature. Measured with
+`dtype_boundary_probe`, `Selectors`, one shape per case:
+
+| kernel | precision | exact | hangs |
+|---|---|---|---|
+| 7x7 | fp16 | `Cin` 64 | 72, 80, 88, 96, 128, 192 |
+| 9x9 | fp16 | 64 | 96 |
+| 11x11 | fp16 | 64 | 96 |
+| 7x7 | tf32 | 32 | 48, 64, 96 |
+| 7x7 | int4 | 128 | 160, 192, 224, 256, 288, 384 |
+| 7x7 | bf16, int16 | 64 | — (ladder stops at the fp16 ceiling) |
+
+Three things it is **not**: extent-dependent (the fp16 cliff sits between 64
+and 72 at 8x8, 16x16 and 32x32 alike), `Cout`-dependent (7x7 fp16 at `Cin` 32
+is exact at `Cout` 64, 128, 160, 192 and 256, up to a *larger* coefficient
+footprint than the hanging shapes), or a CBUF-split artifact (9x9 `Cin` 64
+takes 6/6 and 11x11 takes 3/9, and both hang one step later). The ceilings do
+not reduce to one quantity either: `Cin * element_bytes` fits fp16 and tf32 at
+128 bytes and misses int4 at 64; feature atoms fit those two at 8 and miss
+int4 at 4.
+
+**Why it was invisible:** `conv_kernel_size_hw.rs`, the only above-3x3
+coverage, sweeps `Cin` 16, 24, 32, 48 and 64 -- it stops exactly at the last
+value that works. 5x5 is unaffected at every width tried (fp16 and bf16 to
+`Cin` 320, tf32 to 192).
+
+### int8 above 3x3 [verified]
+
+At 5x5 and 7x7, int8 returns **the same value in every output channel of a
+pixel** -- `want 2 got -13`, ~14,600 of 16,384 elements wrong, max|diff| 30-43
+-- at `Cin` 16, 32 and 64 alike, on a healthy device with a passing canary.
+That is coefficients not reaching their channels, not a starved stream. No
+int8 capture above 3x3 exists to say what the program should be, so both int8
+rungs are refused there rather than guessed at.
+
+The gate that used to hide all of this refused *every* non-fp16 precision above
+3x3, on the grounds that the capture sweep was fp16. Half of that was
+over-broad -- 5x5 and 7x7 take `demand_based_cbuf_partition`, which is stated
+in bytes and shared with 1x1 and 3x3 at every precision -- and the other half
+was masking a fault fp16 has too.
+
+---
+
 ## M1 (S2) — `planck` runs `ondemand` with a 408 MHz A76 floor, which is the worst case the notes measured
 
 Read off the board [verified, 2026-09-03]:

@@ -1767,7 +1767,243 @@ fn dense_coefficient_vgg_blocks_match_oracle() {
     run_hardware_case_matrix("dense-coefficient VGG block regression", cases);
 }
 
-/// The first hardware ladder for a datatype beyond fp16/int8.
+/// An env-driven single-datatype sweep, for bisecting a boundary a ladder
+/// has found.
+///
+/// The dtype ladders answer "does this shape work"; when one of them turns
+/// up a shape that does *not*, the next question is always the same -- where
+/// exactly does it start, and is the neighbouring rung affected too. Doing
+/// that by editing a ladder and re-cross-compiling costs a round trip per
+/// question, and the answers are not worth committing as tests. This runs
+/// the sweep from the command line instead, through the same
+/// `run_hardware_case_matrix` the ladders use, so a watchdog kill is
+/// labelled `DEVICE TIMEOUT` rather than being read as a shape result.
+///
+///     ROCKET_DTYPE_SWEEP=tf32/cout/16/3/64/12,16,20,24 \
+///       ./conv2d_oracle_hw dtype_boundary_probe --ignored --nocapture
+///
+/// The spec is `precision/axis/extent/kernel/fixed/values`: `axis` is `cin`
+/// or `cout`, `fixed` is whichever of the two the axis does not sweep, and
+/// `values` is the sweep. Every case runs `Selectors`, which varies with y,
+/// x and channel; append `,counting` style patterns by re-running with
+/// `ROCKET_DTYPE_SWEEP_PATTERN=counting`.
+///
+/// Channel ceilings are lifted for the duration, so a sweep can walk past a
+/// precision's constant to find out whether the constant is where the
+/// hardware stops.
+#[cfg(feature = "hardware-characterization")]
+#[test]
+#[ignore = "needs /dev/accel/accel0 -- env-driven, see the doc comment"]
+fn dtype_boundary_probe() {
+    unsafe { std::env::set_var("ROCKET_ALLOW_UNBACKED_CHANNELS", "1") };
+    // Nothing to sweep unless the caller says what to sweep. Returning
+    // rather than failing keeps a whole-binary `--include-ignored` run
+    // green: this is an instrument, not a regression.
+    let Ok(spec) = std::env::var("ROCKET_DTYPE_SWEEP") else {
+        println!("\n  dtype_boundary_probe: set ROCKET_DTYPE_SWEEP to run it, e.g.");
+        println!("    ROCKET_DTYPE_SWEEP=tf32/cout/16/3/64/12,16,20,24");
+        return;
+    };
+    let fields: Vec<&str> = spec.split('/').collect();
+    assert_eq!(
+        fields.len(),
+        6,
+        "ROCKET_DTYPE_SWEEP=precision/axis/extent/kernel/fixed/values"
+    );
+    let precision = match fields[0] {
+        "fp16" => OraclePrecision::Fp16,
+        "fp16acc" => OraclePrecision::Fp16Accumulator,
+        "bf16" => OraclePrecision::Bf16,
+        "int16" => OraclePrecision::Int16,
+        "int4" => OraclePrecision::Int4,
+        "tf32" => OraclePrecision::Tf32,
+        "int8" => OraclePrecision::Int8,
+        "int8acc" => OraclePrecision::Int8Accumulator,
+        other => panic!("unknown precision {other}"),
+    };
+    let extent: u32 = fields[2].parse().expect("extent");
+    let kernel: usize = fields[3].parse().expect("kernel");
+    let fixed: u32 = fields[4].parse().expect("fixed channel count");
+    let pattern = match std::env::var("ROCKET_DTYPE_SWEEP_PATTERN").as_deref() {
+        Ok("counting") => OraclePattern::Counting,
+        Ok("dense") => OraclePattern::Dense { phase: 1 },
+        _ => OraclePattern::Selectors { phase: 0 },
+    };
+    let cases: Vec<Conv2dCase> = fields[5]
+        .split(',')
+        .map(|value| {
+            let value: u32 = value.parse().expect("sweep value");
+            let (cin, cout) = match fields[1] {
+                "cin" => (value, fixed),
+                "cout" => (fixed, value),
+                other => panic!("axis must be cin or cout, not {other}"),
+            };
+            Conv2dCase {
+                width: extent,
+                height: extent,
+                cin,
+                cout,
+                kernel: [kernel, kernel],
+                stride: 1,
+                padding: [kernel / 2, kernel / 2],
+                precision,
+                pattern,
+            }
+        })
+        .collect();
+    run_hardware_case_matrix(&format!("dtype boundary probe {spec}"), cases);
+}
+
+/// The coverage every datatype ladder needs once its basic layout holds.
+///
+/// The first ladder for a new rung answers "is this datatype wired up at
+/// all", and the shapes that answer it are small: one or two channel
+/// counts, one extent, one tile. What that leaves untested is everything
+/// the *geometry* does -- channel padding at the ceiling, row tiling across
+/// several tiles, a partial feature atom, a kernel past 3x3, a stride --
+/// and none of that is inherited from fp16, because each rung reaches it
+/// through its own element width.
+///
+/// So this is the same battery at every rung, parameterised only by the
+/// numbers that genuinely differ (a feature atom holds 4 tf32 channels and
+/// 32 int4 ones, and the ceilings differ by a factor of five). Sharing it
+/// is the point: a shape that catches a bug at one width should be run at
+/// all of them, rather than each rung getting a bespoke set nobody can
+/// compare.
+///
+/// Two patterns carry the channel ladder, because they fail differently.
+/// `Counting` makes every input lane contribute, so a channel-padding error
+/// changes the count and shows up -- but its output is spatially constant,
+/// so it cannot see an addressing bug at all.
+/// `Selectors` picks three live taps per output channel out of the whole
+/// `kh * kw * Cin` space, so a permuted channel, tap or row moves the
+/// answer. Neither alone is enough.
+struct ScaleLadder {
+    /// `Cin` values at k=1, where the coefficient working set is smallest
+    /// and the channel rules are what bind.
+    cin_k1: &'static [u32],
+    /// `Cin` at k=3. `ConvPlan` refuses a coefficient working set past
+    /// eleven banks, which at k=3 arrives well below every rung's channel
+    /// ceiling, so this list stops earlier than `cin_k1` on purpose.
+    cin_k3: &'static [u32],
+    /// `Cout` values, at k=1 with `Selectors` so each output channel
+    /// carries a different result and a write-out that skipped or doubled a
+    /// channel block cannot come back looking right.
+    cout: &'static [u32],
+    /// Channel counts that are not a whole feature atom (`cin`) or a whole
+    /// output granule (`cout`), so the padding path runs rather than the
+    /// aligned fast case. Empty where the rung refuses them -- int4 takes
+    /// whole 32-channel atoms only.
+    unaligned_cin: &'static [u32],
+    unaligned_cout: &'static [u32],
+    /// `(extent, channels)` pairs big enough that `ConvPlan` splits the
+    /// image into several row tiles. Channels come down as the extent goes
+    /// up to keep the host oracle's work bounded.
+    extents: &'static [(u32, u32)],
+    /// `(kernel, Cin)` past 3x3, run at 32x32. `Counting`'s tap count varies
+    /// over the border here, which is what makes a wrong window visible.
+    /// `Cin` is per rung because `large_kernel_max_in_channels` is: 7x7 is
+    /// measured correct to 64 channels at fp16 and its layout family, 128 at
+    /// int4 and 32 at tf32, and above that the NPU hangs.
+    wide_kernels: &'static [(usize, u32)],
+    /// `Cin`/`Cout` for the stride cases, kept modest: stride is programmed
+    /// by the CNA ahead of the precision stage, so this is a regression
+    /// guard rather than a search.
+    stride_channels: (u32, u32),
+}
+
+fn scale_cases(precision: OraclePrecision, ladder: ScaleLadder) -> Vec<Conv2dCase> {
+    let mut cases = Vec::new();
+    let mut push = |width, height, cin, cout, kernel: usize, stride, pattern| {
+        cases.push(Conv2dCase {
+            width,
+            height,
+            cin,
+            cout,
+            kernel: [kernel, kernel],
+            stride,
+            padding: [kernel / 2, kernel / 2],
+            precision,
+            pattern,
+        });
+    };
+
+    for (kernel, cins) in [(1usize, ladder.cin_k1), (3, ladder.cin_k3)] {
+        for &cin in cins {
+            push(8, 8, cin, 64, kernel, 1, OraclePattern::Counting);
+            push(
+                8,
+                8,
+                cin,
+                64,
+                kernel,
+                1,
+                OraclePattern::Selectors { phase: 0 },
+            );
+        }
+    }
+    for &cout in ladder.cout {
+        push(8, 8, 64, cout, 1, 1, OraclePattern::Selectors { phase: 1 });
+    }
+    for &cin in ladder.unaligned_cin {
+        push(16, 16, cin, 64, 3, 1, OraclePattern::Selectors { phase: 2 });
+    }
+    for &cout in ladder.unaligned_cout {
+        push(
+            16,
+            16,
+            64,
+            cout,
+            3,
+            1,
+            OraclePattern::Selectors { phase: 3 },
+        );
+    }
+    for &(extent, channels) in ladder.extents {
+        push(
+            extent,
+            extent,
+            channels,
+            channels,
+            3,
+            1,
+            OraclePattern::Selectors { phase: 4 },
+        );
+    }
+    for &(kernel, cin) in ladder.wide_kernels {
+        push(32, 32, cin, 64, kernel, 1, OraclePattern::Counting);
+        push(
+            32,
+            32,
+            cin,
+            64,
+            kernel,
+            1,
+            OraclePattern::Selectors { phase: 5 },
+        );
+    }
+    let (cin, cout) = ladder.stride_channels;
+    push(32, 32, cin, cout, 1, 2, OraclePattern::Dense { phase: 1 });
+    push(
+        32,
+        32,
+        cin,
+        cout,
+        3,
+        2,
+        OraclePattern::Selectors { phase: 6 },
+    );
+    cases
+}
+
+/// The bf16 ladder.
+///
+/// This was the first hardware ladder for a datatype beyond fp16/int8, and
+/// its original half (below) is a first-light test: does the datatype work
+/// at all, at a handful of shapes. `scale_cases` at the end is what makes it
+/// a regression ladder -- the channel ceilings, multi-tile extents, ragged
+/// channel counts, 5x5/7x7 and stride that the geometry actually turns on.
+/// 58/58 on `planck` 2026-09-04.
 ///
 /// bf16 is the cheapest rung to add -- a 2-byte element on the fp16 layout,
 /// so the only thing that moves in the register program is the precision
@@ -1871,10 +2107,24 @@ fn bf16_regression_cases() -> Vec<Conv2dCase> {
             });
         }
     }
+    cases.extend(scale_cases(
+        OraclePrecision::Bf16,
+        ScaleLadder {
+            cin_k1: &[512, 1024, 1344],
+            cin_k3: &[512, 1024],
+            cout: &[512, 1024, 1792],
+            unaligned_cin: &[33, 65, 129],
+            unaligned_cout: &[40, 72, 129],
+            extents: &[(56, 64), (112, 32)],
+            wide_kernels: &[(5, 64), (7, 64)],
+            stride_channels: (64, 64),
+        },
+    ));
+
     cases
 }
 
-/// The int16 counterpart, deliberately small.
+/// The int16 counterpart.
 ///
 /// int16 is the rung the notes flag as doubtful: the compute side is sound
 /// (precision field 1, established by hardware sweep) but their matmul work
@@ -1882,7 +2132,14 @@ fn bf16_regression_cases() -> Vec<Conv2dCase> {
 /// `encodings/output-transpose-int16.md`. If that is a property of the DPU
 /// rather than of their matmul geometry, this ladder fails with a partially
 /// written output, which is a result worth having recorded.
-fn int16_probe_cases() -> Vec<Conv2dCase> {
+///
+/// It began as a deliberately small probe of that one question. It is a
+/// regression ladder now: the answer was "the conv writer does iterate the
+/// whole result", so the shapes that matter are the same geometry battery
+/// every other rung runs -- and the shared one is what makes an int16
+/// result comparable to its bf16 twin, since the two differ only in how the
+/// same 16 bits are read.
+fn int16_regression_cases() -> Vec<Conv2dCase> {
     let mut cases = Vec::new();
     for cin in [3u32, 64] {
         for kernel in [1usize, 3] {
@@ -1933,6 +2190,26 @@ fn int16_probe_cases() -> Vec<Conv2dCase> {
             });
         }
     }
+    // The same battery as bf16, and deliberately the same numbers: the two
+    // rungs differ only in how the 16 bits are read, so a divergence
+    // between their results is the whole signal. int16's accumulator is the
+    // one extra constraint -- `Counting` at Cin 1344 and nine taps is
+    // 12096, inside int16's 32767, which
+    // `int16_cases_stay_inside_the_int16_result` checks rather than assumes.
+    cases.extend(scale_cases(
+        OraclePrecision::Int16,
+        ScaleLadder {
+            cin_k1: &[512, 1024, 1344],
+            cin_k3: &[512, 1024],
+            cout: &[512, 1024, 1792],
+            unaligned_cin: &[33, 65, 129],
+            unaligned_cout: &[40, 72, 129],
+            extents: &[(56, 64), (112, 32)],
+            wide_kernels: &[(5, 64), (7, 64)],
+            stride_channels: (64, 64),
+        },
+    ));
+
     cases
 }
 
@@ -1956,6 +2233,10 @@ fn int16_probe_cases() -> Vec<Conv2dCase> {
 /// Patterns are the layout-sensitive ones. `Counting` is included for
 /// coverage of every lane but proves nothing about addressing; `Selectors`
 /// and `Dense` are what would catch a wrong nibble order or a wrong group.
+///
+/// The shared `scale_cases` battery and the nibble-endpoint cases follow.
+/// 51/51 on `planck` 2026-09-04, including `Cin` 1344, `Cout` 1792 and 7x7
+/// at `Cin` 128 -- int4 reaches further at 7x7 than any other rung.
 fn int4_regression_cases() -> Vec<Conv2dCase> {
     let mut cases = Vec::new();
     for cin in [32u32, 64, 128] {
@@ -2016,6 +2297,46 @@ fn int4_regression_cases() -> Vec<Conv2dCase> {
             pattern: OraclePattern::Dense { phase: 1 },
         });
     }
+    // int4's own numbers. `unaligned_cin` is empty because `Shape` refuses
+    // a partial int4 feature atom outright (32 channels at half a byte), so
+    // there is no ragged input-channel case to run; `Cout` 96 and 160 are
+    // the ragged ones it does admit, against a 64-channel output granule.
+    cases.extend(scale_cases(
+        OraclePrecision::Int4,
+        ScaleLadder {
+            cin_k1: &[512, 1024, 1344],
+            cin_k3: &[512, 1024],
+            cout: &[512, 1024, 1792],
+            unaligned_cin: &[],
+            unaligned_cout: &[96, 160],
+            extents: &[(56, 64), (112, 32)],
+            wide_kernels: &[(5, 64), (7, 128)],
+            stride_channels: (64, 64),
+        },
+    ));
+    // The nibble endpoints. Every case above stays inside [-3, 3], so the
+    // top bit of a nibble and its asymmetric minimum are untested until
+    // here; `WideOperands` at this rung puts +7 and -8 on one side of the
+    // product at a time (see `wide_magnitude`).
+    for wide_input in [true, false] {
+        for cin in [64u32, 512] {
+            cases.push(Conv2dCase {
+                width: 8,
+                height: 8,
+                cin,
+                cout: 64,
+                kernel: [3, 3],
+                stride: 1,
+                padding: [1, 1],
+                precision: OraclePrecision::Int4,
+                pattern: OraclePattern::WideOperands {
+                    phase: 0,
+                    wide_input,
+                },
+            });
+        }
+    }
+
     cases
 }
 
@@ -2031,6 +2352,12 @@ fn int4_regression_cases() -> Vec<Conv2dCase> {
 /// for int4 and again for tf32: at a shape with a single coefficient input
 /// group, the 16- and 32-channel groupings produce byte-identical buffers,
 /// so a `Cin` at or below the candidate group cannot tell them apart.
+///
+/// **This ladder is the one that paid.** Extending it past first light found
+/// two tf32-only hardware faults, both hangs rather than wrong values:
+/// `Precision::out_channel_granule` and the streamed coefficient model's
+/// width scaling. Both are fixed and the ladder is 50/50 on `planck`
+/// 2026-09-04; the constants' doc comments carry the measurements.
 fn tf32_regression_cases() -> Vec<Conv2dCase> {
     let mut cases = Vec::new();
     for cin in [32u32, 64, 128] {
@@ -2101,6 +2428,28 @@ fn tf32_regression_cases() -> Vec<Conv2dCase> {
             },
         });
     }
+    // tf32's battery stops lower than the 2-byte rungs' because a 4-byte
+    // element charges four times their CBUF residency per channel: at k=3
+    // `ConvPlan` refuses past 576 once the streamed coefficient model is
+    // told about the width, and the extents carry fewer channels to keep
+    // the input buffers comparable in bytes rather than in channels. The
+    // k=3 list straddles the split change at 544, where the plan goes from
+    // 3/9 with two tiles to 1/11 with fourteen -- the shapes that hung
+    // before the model was width-scaled.
+    cases.extend(scale_cases(
+        OraclePrecision::Tf32,
+        ScaleLadder {
+            cin_k1: &[512, 1024],
+            cin_k3: &[384, 512, 576],
+            cout: &[512, 1024, 1792],
+            unaligned_cin: &[34, 66, 130],
+            unaligned_cout: &[12, 20, 68],
+            extents: &[(56, 32), (112, 16)],
+            wide_kernels: &[(5, 64), (7, 32)],
+            stride_channels: (64, 64),
+        },
+    ));
+
     cases
 }
 
@@ -2116,7 +2465,8 @@ fn tf32_regression_cases() -> Vec<Conv2dCase> {
 ///
 /// The rest of the ladder is the ordinary layout coverage, since a changed
 /// output cube (4 lanes rather than 8) is exactly the kind of thing that
-/// reads correct at one channel and wrong at the next.
+/// reads correct at one channel and wrong at the next. 52/52 on `planck`
+/// 2026-09-04.
 fn fp16_accumulator_regression_cases() -> Vec<Conv2dCase> {
     let mut cases = Vec::new();
     for cin in [3u32, 64, 256] {
@@ -2183,13 +2533,46 @@ fn fp16_accumulator_regression_cases() -> Vec<Conv2dCase> {
         precision: OraclePrecision::Fp16Accumulator,
         pattern: OraclePattern::Dense { phase: 1 },
     });
+    cases.extend(scale_cases(
+        OraclePrecision::Fp16Accumulator,
+        ScaleLadder {
+            cin_k1: &[512, 1024, 1344],
+            cin_k3: &[512, 1024],
+            cout: &[512, 1024, 1792],
+            unaligned_cin: &[33, 65, 129],
+            unaligned_cout: &[40, 72, 129],
+            extents: &[(56, 64), (112, 32)],
+            wide_kernels: &[(5, 64), (7, 64)],
+            stride_channels: (64, 64),
+        },
+    ));
+    // `Counting` at an odd Cin is the rung's discriminator, so the channel
+    // ladder above carries one at each of the tile counts it reaches:
+    // 1023 * 9 = 9207 and 1151 * 9 = 10359 are both past 2048 with more
+    // than eleven significant bits, which the ordinary fp16 output could
+    // not return. 1151 rather than 1343 because at k=3 the coefficient
+    // working set binds first -- `ConvPlan` refuses 1344 outright.
+    for cin in [1023u32, 1151] {
+        cases.push(Conv2dCase {
+            width: 8,
+            height: 8,
+            cin,
+            cout: 64,
+            kernel: [3, 3],
+            stride: 1,
+            padding: [1, 1],
+            precision: OraclePrecision::Fp16Accumulator,
+            pattern: OraclePattern::Counting,
+        });
+    }
+
     cases
 }
 
 #[test]
 fn fp16_accumulator_matrix_is_planable_and_gap_free() {
     let cases = fp16_accumulator_regression_cases();
-    assert_eq!(cases.len(), 23);
+    assert_eq!(cases.len(), 52);
     assert_planable_and_gap_free(cases);
 }
 
@@ -2222,14 +2605,14 @@ fn fp16_accumulator_ladder_leaves_the_fp16_grid() {
 #[ignore = "needs /dev/accel/accel0 -- establishes the fp32 result writer on the fp16 datapath"]
 fn fp16_accumulator_matrix_matches_oracle() {
     let cases = fp16_accumulator_regression_cases();
-    assert_eq!(cases.len(), 23);
+    assert_eq!(cases.len(), 52);
     run_hardware_case_matrix("fp16 fp32-result matrix", cases);
 }
 
 #[test]
 fn tf32_regression_matrix_is_planable_and_gap_free() {
     let cases = tf32_regression_cases();
-    assert_eq!(cases.len(), 23);
+    assert_eq!(cases.len(), 50);
     assert_planable_and_gap_free(cases);
 }
 
@@ -2237,14 +2620,14 @@ fn tf32_regression_matrix_is_planable_and_gap_free() {
 #[ignore = "needs /dev/accel/accel0 -- establishes tf32 (CNA/CORE field 7, DPU fp32) on the convolution datapath"]
 fn tf32_regression_matrix_matches_oracle() {
     let cases = tf32_regression_cases();
-    assert_eq!(cases.len(), 23);
+    assert_eq!(cases.len(), 50);
     run_hardware_case_matrix("tf32 regression matrix", cases);
 }
 
 #[test]
 fn int4_regression_matrix_is_planable_and_gap_free() {
     let cases = int4_regression_cases();
-    assert_eq!(cases.len(), 24);
+    assert_eq!(cases.len(), 51);
     assert_planable_and_gap_free(cases);
 }
 
@@ -2271,11 +2654,47 @@ fn int4_cases_stay_inside_the_nibble_and_the_int16_result() {
     }
 }
 
+/// The int4 wide cases have to reach the nibble's endpoints, or they are
+/// just another small-value pattern under a different name.
+///
+/// The narrow side of a `WideOperands` product is +-1, so each live output
+/// is the wide operand itself. Seeing both 7 and 8 in the magnitudes is
+/// therefore the proof that +7 and -8 -- the largest positive nibble and
+/// the asymmetric minimum, the two values a sign-extension bug would get
+/// wrong -- both reached the hardware.
+#[test]
+fn int4_wide_cases_reach_both_nibble_extremes() {
+    let mut checked = 0;
+    for case in int4_regression_cases() {
+        if !matches!(case.pattern, OraclePattern::WideOperands { .. }) {
+            continue;
+        }
+        checked += 1;
+        let fixture = build_fixture(case).expect("int4 wide fixture must build");
+        let out_height = fixture.shape.output_height(case.kernel) as usize;
+        let out_width = fixture.shape.output_width(case.kernel) as usize;
+        let mut magnitudes = std::collections::BTreeSet::new();
+        for y in 0..out_height {
+            for x in 0..out_width {
+                for channel in 0..case.cout as usize {
+                    magnitudes.insert(expected_output(case, channel, y, x).abs());
+                }
+            }
+        }
+        assert!(
+            magnitudes.contains(&7) && magnitudes.contains(&8),
+            "{} produces magnitudes {magnitudes:?}, missing a nibble endpoint",
+            case.label(),
+        );
+    }
+    assert_eq!(checked, 4, "the int4 ladder must carry wide-operand cases");
+}
+
 #[test]
 #[ignore = "needs /dev/accel/accel0 -- establishes int4 (precision field 6) with its int16 result"]
 fn int4_regression_matrix_matches_oracle() {
     let cases = int4_regression_cases();
-    assert_eq!(cases.len(), 24);
+    assert_eq!(cases.len(), 51);
     run_hardware_case_matrix("int4 regression matrix", cases);
 }
 
@@ -2284,7 +2703,7 @@ fn wide_operand_cases_exceed_the_narrower_datatype() {
     let mut checked = 0;
     for case in bf16_regression_cases()
         .into_iter()
-        .chain(int16_probe_cases())
+        .chain(int16_regression_cases())
         .chain(tf32_regression_cases())
     {
         let fixture = build_fixture(case).expect("wide-operand fixture must build");
@@ -2323,7 +2742,7 @@ fn wide_operand_cases_exceed_the_narrower_datatype() {
 #[test]
 fn bf16_regression_matrix_is_planable_and_gap_free() {
     let cases = bf16_regression_cases();
-    assert_eq!(cases.len(), 31);
+    assert_eq!(cases.len(), 58);
     assert_planable_and_gap_free(cases);
 }
 
@@ -2331,16 +2750,48 @@ fn bf16_regression_matrix_is_planable_and_gap_free() {
 #[ignore = "needs /dev/accel/accel0 -- establishes bf16 (precision field 3) on the convolution datapath"]
 fn bf16_regression_matrix_matches_oracle() {
     let cases = bf16_regression_cases();
-    assert_eq!(cases.len(), 31);
+    assert_eq!(cases.len(), 58);
     run_hardware_case_matrix("bf16 regression matrix", cases);
 }
 
 #[test]
-#[ignore = "needs /dev/accel/accel0 -- characterizes int16 (precision field 1) convolution output"]
-fn int16_probe_matches_oracle() {
-    let cases = int16_probe_cases();
-    assert_eq!(cases.len(), 10);
-    run_hardware_case_matrix("int16 output characterization", cases);
+fn int16_regression_matrix_is_planable_and_gap_free() {
+    let cases = int16_regression_cases();
+    assert_eq!(cases.len(), 37);
+    assert_planable_and_gap_free(cases);
+}
+
+/// int16's result container is the same width as its operands, so unlike
+/// every float rung the ladder can overflow what the DPU writes back. The
+/// widest `Counting` case is `Cin` 1344 with nine taps -- 12096, inside
+/// 32767 -- and this is what says so rather than the comment claiming it.
+#[test]
+fn int16_cases_stay_inside_the_int16_result() {
+    for case in int16_regression_cases() {
+        let fixture = build_fixture(case).expect("int16 fixture must build");
+        let out_height = fixture.shape.output_height(case.kernel) as usize;
+        let out_width = fixture.shape.output_width(case.kernel) as usize;
+        for y in 0..out_height {
+            for x in 0..out_width {
+                for channel in 0..case.cout as usize {
+                    let want = expected_output(case, channel, y, x);
+                    assert!(
+                        i16::try_from(want).is_ok(),
+                        "{} result {want} leaves int16",
+                        case.label(),
+                    );
+                }
+            }
+        }
+    }
+}
+
+#[test]
+#[ignore = "needs /dev/accel/accel0 -- establishes int16 (precision field 1) convolution output"]
+fn int16_regression_matrix_matches_oracle() {
+    let cases = int16_regression_cases();
+    assert_eq!(cases.len(), 37);
+    run_hardware_case_matrix("int16 regression matrix", cases);
 }
 
 #[test]
