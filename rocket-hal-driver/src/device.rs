@@ -1632,14 +1632,23 @@ unsafe extern "C" fn queue_execute(
                     }
 
                     // The registers this dispatch's first task programs, as
-                    // `domain:offset` pairs -- see `dump_regset_enabled`.
+                    // `domain:offset=value` triples -- see `dump_regset_enabled`.
+                    // Values matter as much as coverage: against
+                    // ../rocket-userspace's `gen_conv2d_task` the *set* this
+                    // repo writes is identical, so a divergence can only be a
+                    // value.
                     if dump_regset_enabled()
                         && let Some(first) = regcmd_tasks.first()
                     {
                         let mut regs: Vec<String> = first
                             .iter()
                             .map(|c| {
-                                format!("{}:{:#06x}", (c.0 >> 48) & 0xff, (c.0 & 0xffff) as u16)
+                                format!(
+                                    "{}:{:#06x}={:#010x}",
+                                    (c.0 >> 48) & 0xff,
+                                    (c.0 & 0xffff) as u16,
+                                    ((c.0 >> 16) & 0xffff_ffff) as u32,
+                                )
                             })
                             .collect();
                         regs.sort();

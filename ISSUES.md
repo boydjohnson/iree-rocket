@@ -801,10 +801,71 @@ the accumulator path's write-back FSM, or CBUF/CACC state. Next step is to diff
 the precision transition against `../rocket-userspace`, the known-good C
 emitter, rather than sweep registers — the lesson from C1's method note.
 
-Diagnostics used are saved as `c8-diagnostics.patch` (precision tag threaded
-into `DispatchJob`, program hash, register-set dump, and the two probe knobs);
-they are **not** committed, which is exactly the C7 hazard, so commit them
-before the next session needs them.
+Diagnostics used are committed (precision tag threaded into `DispatchJob`,
+program hash, register-set dump with values, and the two probe knobs), rather
+than left in a working tree the way C7's were.
+
+
+### The `../rocket-userspace` diff, 2026-09-04: the conv register program is exonerated
+
+Done as C1's method note prescribes -- diff the whole program against the
+known-good emitter rather than sweep. Result is a **definite negative**, which
+is worth as much as a hit: it removes the conv regcmd from suspicion entirely.
+
+**1. The register *sets* are identical.** Extracting every `NPUOP(..., REG)` in
+`gen_conv2d_task` (npu_regcmd.c:2220-2523) and resolving the names through
+`npu_hw.h` gives **124** distinct registers. This repo's conv program writes
+**124** plus the PC trailer. The set difference is **empty in both directions**
+-- so is the difference between this repo's own fp16 and int8 programs
+(126 vs 126, verified with `ROCKET_DUMP_REGSET`).
+
+**2. The one value divergence is load-bearing here, and is not a defect.**
+`DPU_RDMA_FEATURE_MODE_CFG` (0x5044) differs on two fields:
+
+| field | this repo (fp16) | this repo (int8) | `gen_conv2d_task` |
+|---|---|---|---|
+| BURST_LEN [14:11] | 15 | 15 | 15 |
+| MRDMA_DISABLE bit4 | 1 | 1 | 1 |
+| MRDMA_FP16TOFP32 bit3 | 0 | 0 | `fp32tofp16_en` |
+| IN_PRECISION [17:15] | 2 (fp16) | 0 | 0 |
+| PROC_PRECISION [7:5] | 2 (fp16) | 0 | 0 |
+
+The reference's header says those precision fields are *"Left at 0 (=int8) for
+the plain-conv path because the whole RDMA block is off there"*, and this repo
+arms neither MRDMA nor ERDMA -- so adopting the reference's spelling looked
+obvious. **It is wrong here.** Clearing `in_precision`/`proc_precision` makes
+this repo's *fp16* path hang on its own, 3/3, with no int8 in the model at all;
+restoring them restores a clean 3/3. Adding the missing `mrdma_fp16tofp32_en`
+on top of the existing fields is harmless (fp16 stays clean 3/3) but does not
+fix the mix. So the two stacks genuinely diverge on this register and this
+repo's spelling is the one its own fp16 path requires. Recorded, not "fixed".
+
+**3. The only registers this repo never writes are the PPU block** -- 26 of
+them, 0x6xxx/0x7xxx, written in the reference only by `gen_pool_fp16`. Nothing
+here routes to pooling (P5), so neither precision touches them and they cannot
+be what differentiates the two.
+
+**What the diff did yield is the mechanism's precondition.**
+`tests/regcmd_persist_rocket.c` establishes, deterministically on RK3588:
+
+> the NPU register file is **NOT cleared between jobs/processes** ... the
+> register file persists globally (not reset on job/process boundaries).
+
+and the npu_regcmd.c header documents the exact failure signature being chased,
+for a different cause:
+
+> the DPU read-DMA engine stays armed waiting for a main-RDMA feed that never
+> arrives: **the DPU never raises completion, and the job watchdog reports "NPU
+> job timed out" with the output left untouched.**
+
+Global register persistence is what makes a hang conditional on what ran
+before, and it is why the same program hashes identically and still fails. But
+since both programs write the same 124 registers with self-consistent values,
+**the carried-over state is not in the registers either program writes.** That
+leaves hardware state the regcmd does not address at all -- CBUF contents, CACC,
+or the DPU write-back FSM -- and those are the next place to look, not the
+program.
+
 
 ---
 
