@@ -22,6 +22,8 @@
 
 #[path = "support/conv2d_oracle.rs"]
 mod conv2d_oracle;
+#[path = "support/dispatch.rs"]
+mod dispatch;
 
 use std::{
     any::Any,
@@ -42,6 +44,10 @@ use conv2d_oracle::{
 };
 #[cfg(feature = "hardware-characterization")]
 use conv2d_oracle::{build_raw_fixture, feature_offset};
+// The dispatch clock lives in `support/dispatch.rs`, shared with every other
+// hardware test that submits its own job, so the floor is one number rather
+// than one per file.
+use dispatch::DISPATCH_TIMEOUT_FLOOR;
 use iree_rocket_hal::rocket::{
     conv::{AccumulatorOutputTile, Buffers, ConvPlan, Shape},
     device::{Buffer, JobDesc, close_bo, fini_bo, prep_bo, submit_jobs, unmap_bo},
@@ -51,35 +57,6 @@ const DEVICE_PATH: &str = "/dev/accel/accel0";
 const PAGE_BYTES: usize = 4096;
 const PER_CASE_TIMEOUT_NS: u64 = 5_000_000_000;
 
-/// Dispatch wall time above which a failure is a killed job, not a result.
-///
-/// The RK3588 kernel driver's watchdog gives up on a hung NPU job at
-/// `JOB_TIMEOUT_MS` (500) plus a scheduler tick, resets the core, and
-/// signals the job fence **with an error**. `PREP_BO` waits on that fence
-/// and a fence signalled with an error is still signalled, so the ioctl
-/// returns success and the sweep reads a partly or wholly unwritten output
-/// buffer. Every "silent wrong result" of that kind is this.
-///
-/// The two regimes are nowhere near each other, which is what makes a wall
-/// clock a discriminator rather than a guess. Measured on planck
-/// 2026-09-03 across every ladder in this file, worst healthy case first:
-///
-/// ```text
-///   58.5 ms   28 tiles   the 226x226 VGG dense-coefficient blocks
-///   44.4 ms  112 tiles   the widest multi-tile sweep case
-///   ~500 ms   any        a job the watchdog killed
-/// ```
-///
-/// So the floor sits 2.6x above the worst healthy dispatch observed and
-/// 3.4x below the watchdog, and the time is not proportional to tile count
-/// -- 28 large tiles cost more than 112 small ones -- which is why this is
-/// a flat floor rather than a per-tile budget. A shape family bigger than
-/// anything here should re-measure with `ROCKET_DISPATCH_TIMES=1` rather
-/// than assume the headroom survived.
-///
-/// Set `ROCKET_DISPATCH_TIMES=1` to print every case's dispatch time, which
-/// is how the headroom above should be re-measured rather than assumed.
-const DISPATCH_TIMEOUT_FLOOR: Duration = Duration::from_millis(150);
 const OUTPUT_SENTINEL: u8 = 0xa5;
 // `nextest -j1` serializes test *processes*, but Rust's harness still runs
 // ignored tests in this binary concurrently. The RK3588 NPU is a single
@@ -1646,7 +1623,7 @@ fn run_hardware_case_matrix(title: &str, cases: Vec<Conv2dCase>) {
                             success.data_banks,
                             success.weight_banks,
                             success.tiles,
-                            dispatch_note(dispatch),
+                            dispatch::note(dispatch),
                         );
                         continue;
                     }
@@ -1674,7 +1651,7 @@ fn run_hardware_case_matrix(title: &str, cases: Vec<Conv2dCase>) {
                             "[{}/{}] FAIL {label}{}\n      {error}",
                             index + 1,
                             total_cases,
-                            dispatch_note(dispatch),
+                            dispatch::note(dispatch),
                         );
                         format!("{label}: {error}")
                     }
@@ -1766,35 +1743,13 @@ fn run_hardware_case_matrix(title: &str, cases: Vec<Conv2dCase>) {
         failures.len(),
     );
     assert!(
-        device_timeouts.is_empty() || !strict_dispatch(),
+        device_timeouts.is_empty() || !dispatch::strict(),
         "{} of {attempted} cases in {title} were killed mid-dispatch and \
          ROCKET_STRICT_DISPATCH is set",
         device_timeouts.len(),
     );
 }
 
-/// Whether a killed dispatch should fail the run.
-///
-/// Off by default. A killed job is a device event with no bearing on the
-/// code under test, and failing on it turns the gate into noise that stops
-/// being read -- which is worse than the alternative, because the summary
-/// block above is loud and counted. On for a run that must be clean.
-fn strict_dispatch() -> bool {
-    std::env::var("ROCKET_STRICT_DISPATCH").is_ok_and(|value| value != "0")
-}
-
-/// The per-case dispatch time, printed only when asked for.
-///
-/// This is how the headroom under [`DISPATCH_TIMEOUT_FLOOR`] gets
-/// re-measured on a new board or a new shape family, instead of the floor
-/// being carried forward on faith.
-fn dispatch_note(dispatch: Duration) -> String {
-    if std::env::var("ROCKET_DISPATCH_TIMES").is_ok() {
-        format!(" dispatch={:.1}ms", dispatch.as_secs_f64() * 1e3)
-    } else {
-        String::new()
-    }
-}
 #[cfg(feature = "hardware-characterization")]
 #[test]
 #[ignore = "needs /dev/accel/accel0 -- confirms failure starts exactly at ConvPlan's bank-partition flip"]
@@ -2839,7 +2794,7 @@ fn cartesian_conv2d_oracle_sweep_matches_oracle() {
                             success.data_banks,
                             success.weight_banks,
                             success.tiles,
-                            dispatch_note(dispatch),
+                            dispatch::note(dispatch),
                         );
                         *passed_by_kind
                             .entry((case.precision.name(), case.pattern.name()))
@@ -2861,7 +2816,7 @@ fn cartesian_conv2d_oracle_sweep_matches_oracle() {
                             "[{}/{}] FAIL {label}{}\n      {error}",
                             index + 1,
                             total_cases,
-                            dispatch_note(dispatch),
+                            dispatch::note(dispatch),
                         );
                         failures.push(format!("{label}: {error}"));
                     }

@@ -13,3 +13,4 @@
 # lit test run artifacts
 .lit_test_times.txt
 /rocket-compiler-plugin/test/Output/
+__pycache__/

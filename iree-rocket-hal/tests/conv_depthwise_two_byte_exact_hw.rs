@@ -44,7 +44,10 @@
 //! rocket-hal-driver programs from a compiled .vmfb -- not the SAME padding
 //! `Shape`'s default gives.
 
-use std::{fs::OpenOptions, mem, os::unix::io::AsRawFd, ptr};
+use std::{fs::OpenOptions, mem, os::unix::io::AsRawFd, ptr, time::Instant};
+
+#[path = "support/dispatch.rs"]
+mod dispatch;
 
 use iree_rocket_hal::rocket::{
     conv::{Buffers, ConvPlan, Kernels, Precision, Shape},
@@ -513,11 +516,15 @@ fn check_depthwise(precision: TwoByte, channels: usize, width: usize, height: us
                 out_handles: &out_handles,
             })
             .collect();
+        let started = Instant::now();
         submit_jobs(fd, &jobs).unwrap_or_else(|error| {
             panic!("{label} ({} tile(s)): SUBMIT failed: {error}", jobs.len())
         });
         prep_bo(fd, output.handle, 5_000_000_000)
             .unwrap_or_else(|error| panic!("{label}: did not complete: {error}"));
+        let elapsed = started.elapsed();
+        print!("  {label}: ok{}", dispatch::note(elapsed));
+        println!();
 
         let raw = std::slice::from_raw_parts(output.host_ptr, output.size);
         let read = |oy: usize, ox: usize, c: usize| -> f32 {
@@ -556,6 +563,19 @@ fn check_depthwise(precision: TwoByte, channels: usize, width: usize, height: us
         }
         for (buffer, _) in &command_buffers {
             let _ = close_bo(fd, buffer.handle);
+        }
+        // A dispatch this long did not produce a result to disagree with:
+        // the watchdog killed the job and `PREP_BO` returned success over an
+        // error-signalled fence, so the whole buffer is the sentinel. Every
+        // element being wrong is what that looks like, and it is exactly what
+        // a catastrophic layout bug looks like too -- the clock is the only
+        // thing that tells them apart.
+        if mismatches != 0 && dispatch::is_device_timeout(elapsed) {
+            assert!(
+                !dispatch::report(&label, elapsed),
+                "{label} was killed mid-dispatch and ROCKET_STRICT_DISPATCH is set"
+            );
+            return;
         }
         if let Some((oy, ox, c, expected, actual)) = first {
             // A depthwise channel only ever mixes with itself, so a wrong
