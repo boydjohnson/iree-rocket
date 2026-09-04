@@ -2252,12 +2252,23 @@ module attributes {transform.with_named_sequence} {
     // and after a deliberate idle gap. It is the shape, not the timing.
     %input_value = transform.get_operand %root[0] : (!transform.any_op) -> !transform.any_value
     %filter_value = transform.get_operand %root[1] : (!transform.any_op) -> !transform.any_value
-    transform.iree.match.dim_bounds %input_value[3], umin = 1, umax = 512 : !transform.any_value
+    // The HAL's `MAX_INPUT_CHANNELS`, raised 512 -> 1344 (2026-09-03) on
+    // hardware: fp16 k=1 is exact at 14x14 Cout 64 for Cin 256..1792 across
+    // one to five tiles, and the fp16 vendor corpus above the old ceiling
+    // agrees (conv_vendor_fixture_wide.rs). The 2026-08-28 attempt at 960 was
+    // reverted for a CBUF-split divergence that the 2026-09-02 group-division
+    // fix removed; see MAX_INPUT_CHANNELS' doc comment.
+    transform.iree.match.dim_bounds %input_value[3], umin = 1, umax = 1344 : !transform.any_value
     // MobileNetV2's four 14x14, Cin=88, Cout=528 pointwise convolutions
     // pass the three hardware-oracle patterns with a 2/10 CBUF split. Keep
     // this narrow expansion local to the stride-1 1x1 matcher; the 3x3 and
     // strided matchers retain their separately characterized 512 limit.
-    transform.iree.match.dim_bounds %filter_value[3], umin = 1, umax = 528 : !transform.any_value
+    // The HAL's `MAX_OUTPUT_CHANNELS`, raised 528 -> 1792. Measured exact at
+    // 7x7 Cin 448 for Cout 528, 640, 768, 1024, 1344, 1792 and 2048, with the
+    // CBUF split flat at 2d/10w -- the high-channel divergence is indexed by
+    // `Cin`, not `Cout`. The old 528 was a narrow expansion for MobileNetV2's
+    // Cin=88/Cout=528 pointwise convolutions.
+    transform.iree.match.dim_bounds %filter_value[3], umin = 1, umax = 1792 : !transform.any_value
     transform.yield %root : !transform.any_op
   }
 
@@ -2329,8 +2340,13 @@ module attributes {transform.with_named_sequence} {
     // and after a deliberate idle gap. It is the shape, not the timing.
     %input_value = transform.get_operand %root[0] : (!transform.any_op) -> !transform.any_value
     %filter_value = transform.get_operand %root[1] : (!transform.any_op) -> !transform.any_value
-    transform.iree.match.dim_bounds %input_value[3], umin = 1, umax = 512 : !transform.any_value
-    transform.iree.match.dim_bounds %filter_value[3], umin = 1, umax = 512 : !transform.any_value
+    // 1152, not `MAX_INPUT_CHANNELS` (1344): at a 3x3 kernel the coefficient
+    // working set binds first and `ConvPlan` refuses Cin >= 1216 outright,
+    // which would reach the driver and panic rather than fall back. fp16 k=3
+    // is exact at 28x28 Cout 64 for Cin 512..1152, including the 1/11 split
+    // at 1152. Same reasoning as `@match_dynamic_conv2d_3x3_int8`.
+    transform.iree.match.dim_bounds %input_value[3], umin = 1, umax = 1152 : !transform.any_value
+    transform.iree.match.dim_bounds %filter_value[3], umin = 1, umax = 1792 : !transform.any_value
     transform.yield %root : !transform.any_op
   }
 

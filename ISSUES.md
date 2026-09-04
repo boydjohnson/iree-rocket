@@ -375,6 +375,59 @@ are now the only things between this and a net win. Until one of them lands, the
 22-site configuration is the faster one to ship, which is a decision for whoever
 owns the default, not something to bury.
 
+### fp16 ceilings raised too, 2026-09-03 — and fp16 is the case where the NPU actually wins
+
+Same treatment as int8, and one piece was already done: the wide and depthwise
+corpora were **fp16-generated**, so the vendor evidence above 768 was fp16 all
+along.
+
+**Ceilings.** `MAX_INPUT_CHANNELS` 512 → **1344**, `MAX_OUTPUT_CHANNELS`
+768 → **1792**. Matcher caps: 1x1 Cin 512→**1344** and Cout 528→**1792**;
+3x3 Cin 512→**1152** (at k=3 the coefficient working set binds first and
+`ConvPlan` refuses Cin ≥ 1216). `rocket_fp16_match_boundaries.mlir` rewritten
+from a single Cout 528/529 pair to three matched/falls-back pairs and passes.
+Both precisions are now 144/0 in `conv_vendor_fixture_channels_768`, with the
+Cin 704 divergence allowlisted per precision (fp16 Cout [64], int8 [64, 128]).
+
+**The 2026-08-28 "960 attempt" objection is gone.** That raise was reverted
+because ConvPlan predicted 1/11 against the vendor's 6/6, 5/7, 4/8, 4/8 at Cin
+576–768. The 2026-09-02 group-division fix reproduces all four exactly.
+
+**Board, `ROCKET_ACC_PROBE_PRECISION=fp16`, 0 mismatches at every point:** k=1
+14x14 Cout 64 at Cin 256…**1792** (one to five tiles); k=3 28x28 Cout 64 at Cin
+512…**1152**; Cout at 7x7 Cin 448 for 528…**2048**, split flat at 2d/10w.
+
+**Audit: 18 → 35 sites, zero dense convolutions left on the CPU.** The
+depthwise ones stay, and *not* because of a channel cap: `RocketDemoteConvInputsPass`
+deliberately excludes depthwise (reverted 2026-09-01, max\|err\| 3.5), so fp16
+depthwise never reaches Rocket at all. That is a separate open bug, untouched
+here. The fp16 depthwise matcher caps were therefore left at 512 rather than
+raised into a path nothing can reach.
+
+**Accuracy is fine.** Against a CPU-only aarch64 build: 18 sites max\|err\|
+0.0127, 35 sites **0.0172**, top-1 and top-5 stable, against a top-2 logit gap
+of 1.26. Two orders of magnitude below the int8 model's 0.26, because this model
+has no quantization boundaries for f16 noise to cross.
+
+**And here the NPU actually wins — at 18 sites, not 35:**
+
+| build | pass 1 | pass 2 | pass 3 |
+|---|---|---|---|
+| **18 sites (pre-raise)** | **4.16** | **4.27** | **4.18** |
+| 35 sites (raised) | 2.67 | 2.69 | 2.69 |
+| CPU-only | 3.97 | 3.95 | 3.94 |
+
+The 18-site fp16 configuration is **~6% faster than CPU-only** — the first
+configuration in this repo that is a net win. Raising the caps then costs 36%,
+and the mechanism is the same as int8's: CPU dispatch sites went **103 → 142**,
++39 pack/unpack wrappers for +17 convolutions.
+
+So both cap raises are correct, validated, and currently **anti-optimizations**.
+They are the right preparation for the layout-repack compiler pass — once a
+Rocket/CPU split removes the per-dispatch repack, the wider caps are what let
+the bigger convolutions ride it. Until then the fastest shipping configurations
+are 22 sites (int8) and 18 sites (fp16).
+
 ## C2 (S2) — the requant oracle rounds half-away-from-zero; the hardware rounds half-to-even, and this repo's multiplier encoding makes ties reachable
 
 **Two halves, both in this tree.**

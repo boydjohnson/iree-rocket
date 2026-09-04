@@ -134,54 +134,45 @@ pub const IMAGE_WIDTH: u32 = 32;
 /// Default input channels: the C3 dense NHWC case of the original captures.
 pub const INPUT_CHANNELS: u32 = 3;
 
-/// Largest input channel count with capture backing.
+/// Largest input channel count with capture backing, fp16.
 ///
-/// The large-`Cin` sweep walks both precisions to 512 -- 66 distinct fp16
-/// channel counts and 44 int8 -- and finds the padding and the CBUF atom
-/// charge regular the whole way. Above 512 nothing is measured.
+/// Raised 512 -> 1344 (2026-09-03), on the same evidence and at the same time
+/// as [`MAX_INT8_INPUT_CHANNELS`]. Board, `accumulator_size_e_probe` with
+/// `ROCKET_ACC_PROBE_PRECISION=fp16`, `Dense` pattern, one shape per process,
+/// **0 mismatches at every point**:
+///
+/// * k=1, 14x14 Cout 64: `Cin` 256, 512, 576, 640, 704, 768, 896, 960, 1024,
+///   1152, 1280, 1344, 1536, **1792**, across one to five tiles.
+/// * k=3, 28x28 Cout 64: `Cin` to **1152**, including the 1/11 split at 1152.
+/// * Cout, 7x7 `Cin` 448: 528, 640, 768, 1024, 1344, 1792, **2048**, with the
+///   split flat at 2d/10w throughout.
+///
+/// Vendor agreement above the old ceiling is
+/// `tests/conv_vendor_fixture_wide.rs`, whose corpus is fp16-generated: 83
+/// agree, 2 documented and hardware-validated divergences, one refusal edge.
+///
+/// **The earlier 960 attempt (2026-08-28) failed for a reason that no longer
+/// holds.** It was reverted because `conv_vendor_fixture_channels_768.rs`
+/// caught real ConvPlan/vendor divergence for dense shapes at `Cin`
+/// 576/640/704/768 -- ConvPlan predicted 1/11 against the vendor's 6/6, 5/7,
+/// 4/8, 4/8. The 2026-09-02 group-division fix
+/// ([`MAX_UNDIVIDED_WEIGHT_BANKS`]) reproduces all four exactly; the only
+/// residual in that corpus is `Cin` 704 at small `Cout`, which is
+/// hardware-exact.
 ///
 /// This bounds the *channel* rules only. Whether a given `(Cin, Cout,
 /// kernel)` fits the twelve CBUF banks is a separate question, and one
-/// [`ConvPlan`] answers on its own.
+/// [`ConvPlan`] answers on its own -- at k=3 it is the binding one well
+/// before this, refusing `Cin >= 1216` outright.
 ///
-/// Tried raising this to 960 (2026-08-28, MobileNetV2's Cin=576/960
-/// depthwise stages) and reverted: `tests/conv_vendor_fixture_channels_768.rs`
-/// -- a vendor-vs-`ConvPlan` regression check that was already sitting in
-/// the suite -- caught real divergence for *dense* (non-depthwise) shapes
-/// in exactly that range. `ConvPlan` predicted a 1/11 CBUF split at
-/// Cin=576/640/704/768 where real captures show 6/6, 5/7, 4/8, 4/8.
-///
-/// New corpora built for this (`build_vendor_fixtures.py`, which runs
-/// locally -- `rknn-convert` is on PATH, no board needed) narrow it a lot:
-///
-///   * The split is **geometry-independent above `Cin` 384** -- 28x28 and
-///     14x14 agree on every point there -- so it is a coefficient working-set
-///     rule in that range, not spatial demand.
-///   * At 32-channel granularity the k=3 curve is 6,6,7,7,7,8,8,8 weight
-///     banks over `Cin` 544..768, and `Cout` only matters at `Cout <= 96`.
-///   * `ceil(Cin / 96)` fits all eight of those points, and a two-pass
-///     reading (`streamed / 2 + 1`) fits all 13 from 384 up.
-///
-/// Both were tried and **rejected**: a k=5 sweep over the same range shows a
-/// multi-pass sawtooth resetting twice (10,8,7,7,8,10 then 7,7,8,9,10,11 then
-/// 6,6,7,7,8,8,9,9,10,10,10,11), where the vendor uses 1/11 and 2/10 freely.
-/// So a one-data-bank split is not inherently wrong, the "leaves three data
-/// banks" threshold does not survive a second kernel size, and the k=3 fit
-/// mis-plans k=5 `Cin` 192 as 6/6 against the vendor's 2/10
-/// (`large_kernel_high_channel_split_matches_vendor` guards that).
-///
-/// What a real fix needs is the sawtooth's reset rule -- how many passes the
-/// vendor uses and what each one costs -- fitted across kernel sizes, not a
-/// curve through one. The corpora to do it with are in the spike repo.
-///
-/// This constant is shared between dense and depthwise Shape construction,
-/// so there's no way to raise it for depthwise (which a separate hardware
-/// probe did validate at 576/960) without also permitting dense
-/// construction into that range. See
-/// `iree-rocket-hal/tests/conv_mobilenetv2_depthwise_wide_hw.rs`'s doc
-/// comment for the depthwise-side validation and what raising this again
-/// would need (a depthwise-specific ceiling, not this shared one).
-pub const MAX_INPUT_CHANNELS: u32 = 512;
+/// Shared between dense and depthwise `Shape` construction. That sharing is
+/// what made the 960 attempt unsafe; it is not a problem here, because the
+/// depthwise half now has its own corpus
+/// (`conv_vendor_fixtures_depthwise.json`, 63/63 agreement to C=1344) and
+/// because fp16 depthwise cannot reach a compiled dispatch at all -- the
+/// demote pass deliberately excludes it (see
+/// `RocketDemoteConvInputsPass.cpp`, reverted 2026-09-01).
+pub const MAX_INPUT_CHANNELS: u32 = 1344;
 
 /// `CNA_DATA_SIZE1.datain_channel_real` counts `Cin - 1` modulo this, even
 /// though the field is 14 bits wide and could hold far more.
@@ -273,36 +264,22 @@ fn quad_atoms(atoms: u32) -> u32 {
 /// Output channels of the captured reference convolution.
 pub const OUTPUT_CHANNELS: u32 = 8;
 
-/// Largest output-channel count this builder will program.
+/// Largest output-channel count this builder will program, fp16.
 ///
 /// `CNA_WEIGHT_SIZE2.weight_kernels` is 14 bits, so 16383 is the encodable
 /// ceiling. This is set at the *measured* extent instead, on the same
-/// principle as `MAX_INPUT_CHANNELS`.
+/// principle as [`MAX_INPUT_CHANNELS`].
 ///
-/// Raised 512 -> 768 (2026-09-01). Both halves of the expanded corpus
-/// reproduce `ConvPlan`'s CBUF split for every `Cout` up to 768 at every
-/// `Cin` at or below 512 -- 96 of 96 cases in
-/// `tests/conv_vendor_fixture_channels_768.rs`, with zero bank, tile or
-/// output-channel-group differences -- and dense int8 1x1 is hardware-exact
-/// at `Cout` 528/640/768 for `Cin` 88/136/224/352.
+/// Raised 512 -> 768 (2026-09-01) on the expanded vendor corpus, then
+/// 768 -> 1792 (2026-09-03) on hardware: 7x7 `Cin` 448 is exact at `Cout`
+/// 528, 640, 768, 1024, 1344, 1792 and 2048, with the CBUF split flat at
+/// 2d/10w across the whole range. The high-channel divergence this constant's
+/// previous note worried about is indexed by `Cin`, not `Cout`, and that note
+/// is superseded: it described the pre-2026-09-02 split model.
 ///
-/// This is deliberately *not* symmetric with `MAX_INPUT_CHANNELS`, which
-/// stays at 512: the divergence that reverted the earlier 960 attempt is
-/// indexed by `Cin`, not `Cout`. Every `Cin >= 576` case in the corpus still
-/// disagrees (`ConvPlan` predicts 1/11 against the vendor's 6/6, 5/7, 4/8,
-/// 4/8), because `streamed_weight_bank_preference` exceeds the eleven
-/// grantable banks there and clamps, which makes
-/// `demand_based_cbuf_partition`'s "return the unused banks to data"
-/// correction test `weight_banks > streamed_preference` as `11 > 11` and
-/// never fire. The vendor's own split is periodic in `Cin` rather than
-/// monotonic, so it is bounding a resident coefficient working set that this
-/// formula grows without limit. Fixing that is what `Cin > 512` needs.
-///
-/// Depthwise is unaffected by this raise: it constructs with
-/// `out_channels == in_channels`, so `MAX_INPUT_CHANNELS` still binds it at
-/// 512. That is what makes raising this shared constant safe here, where the
-/// 960 attempt was not.
-pub const MAX_OUTPUT_CHANNELS: u32 = 768;
+/// Depthwise constructs with `out_channels == in_channels`, so
+/// [`MAX_INPUT_CHANNELS`] binds it rather than this.
+pub const MAX_OUTPUT_CHANNELS: u32 = 1792;
 
 /// `DPU_BS_MUL_CFG.bs_mul_shift_value`, and its negated twin
 /// `DPU_DATA_FORMAT.bs_mul_shift_value_neg`, in every quantized capture.

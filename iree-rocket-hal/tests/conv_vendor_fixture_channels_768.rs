@@ -302,11 +302,11 @@ fn run_channel_grid(fixtures: &str, precision: FixturePrecision) {
 
     // Per precision, because the two no longer share a channel ceiling.
     //
-    // **int8 is 144/0**: `MAX_INT8_INPUT_CHANNELS` went 512 -> 1344 and
-    // `MAX_INT8_OUTPUT_CHANNELS` was split out at 1792 (2026-09-03), so the
-    // whole Cin/Cout 64..768 corpus is in range. **fp16 stays 96/48**: its
-    // ceilings are untouched, because the hardware evidence behind the raise
-    // is int8 only.
+    // Both precisions are 144/0: the whole Cin/Cout 64..768 corpus is now in
+    // range. int8 went first (`MAX_INT8_INPUT_CHANNELS` 512 -> 1344,
+    // `MAX_INT8_OUTPUT_CHANNELS` split out at 1792), then fp16 on its own
+    // hardware evidence (`MAX_INPUT_CHANNELS` 512 -> 1344,
+    // `MAX_OUTPUT_CHANNELS` 768 -> 1792), both on 2026-09-03.
     //
     // The old comment here predicted "raising MAX_INPUT_CHANNELS to 768 makes
     // these 144/0 and the bank comparison then fails on ~10 cases". It fails
@@ -314,8 +314,7 @@ fn run_channel_grid(fixtures: &str, precision: FixturePrecision) {
     // group-division fix (`MAX_UNDIVIDED_WEIGHT_BANKS`), after which ConvPlan
     // reproduces the vendor at 576, 640, 704-at-large-Cout and 768.
     let (expected_supported, expected_exploratory) = match precision {
-        FixturePrecision::Fp16 => (96, 48),
-        FixturePrecision::Int8 => (144, 0),
+        FixturePrecision::Fp16 | FixturePrecision::Int8 => (144, 0),
     };
     assert_eq!(supported, expected_supported);
     assert_eq!(exploratory.len(), expected_exploratory);
@@ -327,7 +326,7 @@ fn run_channel_grid(fixtures: &str, precision: FixturePrecision) {
     // One documented divergence, and it is **hardware-validated as correct**.
     //
     // At Cin 704, k=3, 28x28, ConvPlan splits 4/8 where the vendor splits 5/7,
-    // and only at small Cout (64 and 128; at Cout >= 192 the two agree). The
+    // and only at small Cout (64, and 128 at int8; at larger Cout they agree). The
     // difference grants the *weights* one bank more than the vendor rather
     // than fewer, which is the safe direction -- and it is not left as
     // reasoning: `accumulator_size_e_probe` ran 28x28 Cin 704 at Cout 64, 128
@@ -336,8 +335,12 @@ fn run_channel_grid(fixtures: &str, precision: FixturePrecision) {
     // Kept as an allowlist rather than a relaxed assertion so a *new*
     // divergence still fails, and so this one cannot quietly widen: the exact
     // splits and the exact Cout list are pinned.
-    let known_hardware_validated: &[((u32, u32, u32, u32, u32), &[u32])] =
-        &[((704, 4, 8, 5, 7), &[64, 128])];
+    // fp16 diverges at Cout 64 only; int8 also at 128. Both are the same
+    // point and the same 4/8-against-5/7, and both were run on the board.
+    let known_hardware_validated: &[((u32, u32, u32, u32, u32), &[u32])] = match precision {
+        FixturePrecision::Fp16 => &[((704, 4, 8, 5, 7), &[64])],
+        FixturePrecision::Int8 => &[((704, 4, 8, 5, 7), &[64, 128])],
+    };
     let unexpected: Vec<_> = grouped_bank_differences
         .iter()
         .filter(|(key, couts)| {
