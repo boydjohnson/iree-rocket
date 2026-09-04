@@ -31,10 +31,37 @@ matching the current two-value Rocket `ConvShape` model.
 FP16 values retain their wire encodings; older runtimes reject the unknown
 value rather than interpreting it as a different precision.
 
+`PoolingDef` and `MatmulDef` were appended to `KernelDef` as union tags 3 and
+4. `Conv2DDef` keeps tag 1 and `FullyConnectedDef` keeps tag 2. A union tag
+is wire-format ABI -- an executable built by an older compiler names its
+kernel by that number -- so the members must never be reordered, and
+`kernel_union_tags_are_stable` in `tests/compiler_fixture.rs` is what says so.
+
+`FullyConnectedDef` is **deprecated but retained**. No compiler ever emitted
+it: "fully connected" is not an operation in MLIR's `linalg` dialect, which
+is what IREE hands this backend, and what arrives is `linalg.matmul`.
+`MatmulDef` is that operation. Producers must stop emitting
+`FullyConnectedDef`; consumers should keep decoding it until no old vmfb
+artifacts remain, and must not reuse its tag when they stop.
+
+`PoolingMethod` has no `SUM`. The PPU has no sum mode -- its average is a
+multiply by a per-axis reciprocal held as `fp16(65536/k)`, and a divisor of
+one would need 65536, past fp16's 65504 ceiling. Since `linalg` has no
+average pool either (an ONNX `AveragePool` arrives as `linalg.pooling_*_sum`
+plus a separate divide), recognizing that pair as an average is the
+compiler's job. Adding `SUM` here would create a wire state no runtime can
+execute.
+
+`PoolingDef` deliberately omits the pad fill value that `PoolingShape`
+carries. It is the reduction's identity element and follows from `method`
+and `precision`, so the runtime derives it; a wire field would let a
+producer send a max pool a fill of zero and silently change its answer at
+the border.
+
 The IREE `iree_flatbuffer_file_header_t` version remains `0`. The FlatBuffer
 file identifier carries the Rocket format version.
 
-## Runtime Conv2D dimensions
+## Runtime dimensions
 
 `Conv2DDef.runtime_dimensions` is an optional ordered mapping from dispatch
 push-constant ordinals to logical shape fields. Existing executables omit the
@@ -48,6 +75,17 @@ runtime must reject missing, extra, zero, or hardware-invalid values.
 The vector supports input/output width, height, channels, and filter width and
 height. Batch remains fixed at one; stride, dilation, depthwise mode, numeric
 parameters, and precision remain executable properties.
+
+`PoolingDef.runtime_dimensions` and `MatmulDef.runtime_dimensions` follow the
+same contract with their own enums. `PoolingDimension` covers input width and
+height, channels, kernel width and height, and both strides -- but **not
+padding**, which is 0..=7 on this hardware, means different things per pooling
+method, and is not varied per dispatch by any measured model.
+`MatmulDimension` covers `M`, `K` and `N`.
+
+The three enums are separate types on purpose. They index different tables and
+their numeric values are independent; nothing may assume, for example, that
+`INPUT_WIDTH` is 0 in more than one of them because it happens to be so today.
 
 ## Export ordinals
 

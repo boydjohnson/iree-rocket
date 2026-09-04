@@ -320,15 +320,306 @@ impl<'a> flatbuffers::Verifiable for Conv2DDimension {
 
 impl flatbuffers::SimpleToVerifyInSlice for Conv2DDimension {}
 #[deprecated(since = "2.0.0", note = "Use associated constants instead. This will no longer be generated in 2021.")]
-pub const ENUM_MIN_KERNEL_DEF: u8 = 0;
+pub const ENUM_MIN_POOLING_METHOD: u8 = 0;
 #[deprecated(since = "2.0.0", note = "Use associated constants instead. This will no longer be generated in 2021.")]
-pub const ENUM_MAX_KERNEL_DEF: u8 = 2;
+pub const ENUM_MAX_POOLING_METHOD: u8 = 2;
 #[deprecated(since = "2.0.0", note = "Use associated constants instead. This will no longer be generated in 2021.")]
 #[allow(non_camel_case_types)]
-pub const ENUM_VALUES_KERNEL_DEF: [KernelDef; 3] = [
+pub const ENUM_VALUES_POOLING_METHOD: [PoolingMethod; 3] = [
+  PoolingMethod::AVG,
+  PoolingMethod::MAX,
+  PoolingMethod::MIN,
+];
+
+#[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Default)]
+#[repr(transparent)]
+pub struct PoolingMethod(pub u8);
+#[allow(non_upper_case_globals)]
+impl PoolingMethod {
+  pub const AVG: Self = Self(0);
+  pub const MAX: Self = Self(1);
+  pub const MIN: Self = Self(2);
+
+  pub const ENUM_MIN: u8 = 0;
+  pub const ENUM_MAX: u8 = 2;
+  pub const ENUM_VALUES: &'static [Self] = &[
+    Self::AVG,
+    Self::MAX,
+    Self::MIN,
+  ];
+  /// Returns the variant's name or "" if unknown.
+  pub fn variant_name(self) -> Option<&'static str> {
+    match self {
+      Self::AVG => Some("AVG"),
+      Self::MAX => Some("MAX"),
+      Self::MIN => Some("MIN"),
+      _ => None,
+    }
+  }
+}
+impl core::fmt::Debug for PoolingMethod {
+  fn fmt(&self, f: &mut core::fmt::Formatter) -> core::fmt::Result {
+    if let Some(name) = self.variant_name() {
+      f.write_str(name)
+    } else {
+      f.write_fmt(format_args!("<UNKNOWN {:?}>", self.0))
+    }
+  }
+}
+impl<'a> flatbuffers::Follow<'a> for PoolingMethod {
+  type Inner = Self;
+  #[inline]
+  fn follow(buf: &'a [u8], loc: usize) -> Self::Inner {
+    let b = unsafe {
+      flatbuffers::read_scalar_at::<u8>(buf, loc)
+    };
+    Self(b)
+  }
+}
+
+impl flatbuffers::Push for PoolingMethod {
+    type Output = PoolingMethod;
+    #[inline]
+    fn push(&self, dst: &mut [u8], _rest: &[u8]) {
+        unsafe { flatbuffers::emplace_scalar::<u8>(dst, self.0); }
+    }
+}
+
+impl flatbuffers::EndianScalar for PoolingMethod {
+  #[inline]
+  fn to_little_endian(self) -> Self {
+    let b = u8::to_le(self.0);
+    Self(b)
+  }
+  #[inline]
+  #[allow(clippy::wrong_self_convention)]
+  fn from_little_endian(self) -> Self {
+    let b = u8::from_le(self.0);
+    Self(b)
+  }
+}
+
+impl<'a> flatbuffers::Verifiable for PoolingMethod {
+  #[inline]
+  fn run_verifier(
+    v: &mut flatbuffers::Verifier, pos: usize
+  ) -> Result<(), flatbuffers::InvalidFlatbuffer> {
+    use self::flatbuffers::Verifiable;
+    u8::run_verifier(v, pos)
+  }
+}
+
+impl flatbuffers::SimpleToVerifyInSlice for PoolingMethod {}
+#[deprecated(since = "2.0.0", note = "Use associated constants instead. This will no longer be generated in 2021.")]
+pub const ENUM_MIN_POOLING_DIMENSION: u8 = 0;
+#[deprecated(since = "2.0.0", note = "Use associated constants instead. This will no longer be generated in 2021.")]
+pub const ENUM_MAX_POOLING_DIMENSION: u8 = 6;
+#[deprecated(since = "2.0.0", note = "Use associated constants instead. This will no longer be generated in 2021.")]
+#[allow(non_camel_case_types)]
+pub const ENUM_VALUES_POOLING_DIMENSION: [PoolingDimension; 7] = [
+  PoolingDimension::INPUT_WIDTH,
+  PoolingDimension::INPUT_HEIGHT,
+  PoolingDimension::CHANNELS,
+  PoolingDimension::KERNEL_WIDTH,
+  PoolingDimension::KERNEL_HEIGHT,
+  PoolingDimension::STRIDE_X,
+  PoolingDimension::STRIDE_Y,
+];
+
+#[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Default)]
+#[repr(transparent)]
+pub struct PoolingDimension(pub u8);
+#[allow(non_upper_case_globals)]
+impl PoolingDimension {
+  pub const INPUT_WIDTH: Self = Self(0);
+  pub const INPUT_HEIGHT: Self = Self(1);
+  pub const CHANNELS: Self = Self(2);
+  pub const KERNEL_WIDTH: Self = Self(3);
+  pub const KERNEL_HEIGHT: Self = Self(4);
+  pub const STRIDE_X: Self = Self(5);
+  pub const STRIDE_Y: Self = Self(6);
+
+  pub const ENUM_MIN: u8 = 0;
+  pub const ENUM_MAX: u8 = 6;
+  pub const ENUM_VALUES: &'static [Self] = &[
+    Self::INPUT_WIDTH,
+    Self::INPUT_HEIGHT,
+    Self::CHANNELS,
+    Self::KERNEL_WIDTH,
+    Self::KERNEL_HEIGHT,
+    Self::STRIDE_X,
+    Self::STRIDE_Y,
+  ];
+  /// Returns the variant's name or "" if unknown.
+  pub fn variant_name(self) -> Option<&'static str> {
+    match self {
+      Self::INPUT_WIDTH => Some("INPUT_WIDTH"),
+      Self::INPUT_HEIGHT => Some("INPUT_HEIGHT"),
+      Self::CHANNELS => Some("CHANNELS"),
+      Self::KERNEL_WIDTH => Some("KERNEL_WIDTH"),
+      Self::KERNEL_HEIGHT => Some("KERNEL_HEIGHT"),
+      Self::STRIDE_X => Some("STRIDE_X"),
+      Self::STRIDE_Y => Some("STRIDE_Y"),
+      _ => None,
+    }
+  }
+}
+impl core::fmt::Debug for PoolingDimension {
+  fn fmt(&self, f: &mut core::fmt::Formatter) -> core::fmt::Result {
+    if let Some(name) = self.variant_name() {
+      f.write_str(name)
+    } else {
+      f.write_fmt(format_args!("<UNKNOWN {:?}>", self.0))
+    }
+  }
+}
+impl<'a> flatbuffers::Follow<'a> for PoolingDimension {
+  type Inner = Self;
+  #[inline]
+  fn follow(buf: &'a [u8], loc: usize) -> Self::Inner {
+    let b = unsafe {
+      flatbuffers::read_scalar_at::<u8>(buf, loc)
+    };
+    Self(b)
+  }
+}
+
+impl flatbuffers::Push for PoolingDimension {
+    type Output = PoolingDimension;
+    #[inline]
+    fn push(&self, dst: &mut [u8], _rest: &[u8]) {
+        unsafe { flatbuffers::emplace_scalar::<u8>(dst, self.0); }
+    }
+}
+
+impl flatbuffers::EndianScalar for PoolingDimension {
+  #[inline]
+  fn to_little_endian(self) -> Self {
+    let b = u8::to_le(self.0);
+    Self(b)
+  }
+  #[inline]
+  #[allow(clippy::wrong_self_convention)]
+  fn from_little_endian(self) -> Self {
+    let b = u8::from_le(self.0);
+    Self(b)
+  }
+}
+
+impl<'a> flatbuffers::Verifiable for PoolingDimension {
+  #[inline]
+  fn run_verifier(
+    v: &mut flatbuffers::Verifier, pos: usize
+  ) -> Result<(), flatbuffers::InvalidFlatbuffer> {
+    use self::flatbuffers::Verifiable;
+    u8::run_verifier(v, pos)
+  }
+}
+
+impl flatbuffers::SimpleToVerifyInSlice for PoolingDimension {}
+#[deprecated(since = "2.0.0", note = "Use associated constants instead. This will no longer be generated in 2021.")]
+pub const ENUM_MIN_MATMUL_DIMENSION: u8 = 0;
+#[deprecated(since = "2.0.0", note = "Use associated constants instead. This will no longer be generated in 2021.")]
+pub const ENUM_MAX_MATMUL_DIMENSION: u8 = 2;
+#[deprecated(since = "2.0.0", note = "Use associated constants instead. This will no longer be generated in 2021.")]
+#[allow(non_camel_case_types)]
+pub const ENUM_VALUES_MATMUL_DIMENSION: [MatmulDimension; 3] = [
+  MatmulDimension::M,
+  MatmulDimension::K,
+  MatmulDimension::N,
+];
+
+#[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Default)]
+#[repr(transparent)]
+pub struct MatmulDimension(pub u8);
+#[allow(non_upper_case_globals)]
+impl MatmulDimension {
+  pub const M: Self = Self(0);
+  pub const K: Self = Self(1);
+  pub const N: Self = Self(2);
+
+  pub const ENUM_MIN: u8 = 0;
+  pub const ENUM_MAX: u8 = 2;
+  pub const ENUM_VALUES: &'static [Self] = &[
+    Self::M,
+    Self::K,
+    Self::N,
+  ];
+  /// Returns the variant's name or "" if unknown.
+  pub fn variant_name(self) -> Option<&'static str> {
+    match self {
+      Self::M => Some("M"),
+      Self::K => Some("K"),
+      Self::N => Some("N"),
+      _ => None,
+    }
+  }
+}
+impl core::fmt::Debug for MatmulDimension {
+  fn fmt(&self, f: &mut core::fmt::Formatter) -> core::fmt::Result {
+    if let Some(name) = self.variant_name() {
+      f.write_str(name)
+    } else {
+      f.write_fmt(format_args!("<UNKNOWN {:?}>", self.0))
+    }
+  }
+}
+impl<'a> flatbuffers::Follow<'a> for MatmulDimension {
+  type Inner = Self;
+  #[inline]
+  fn follow(buf: &'a [u8], loc: usize) -> Self::Inner {
+    let b = unsafe {
+      flatbuffers::read_scalar_at::<u8>(buf, loc)
+    };
+    Self(b)
+  }
+}
+
+impl flatbuffers::Push for MatmulDimension {
+    type Output = MatmulDimension;
+    #[inline]
+    fn push(&self, dst: &mut [u8], _rest: &[u8]) {
+        unsafe { flatbuffers::emplace_scalar::<u8>(dst, self.0); }
+    }
+}
+
+impl flatbuffers::EndianScalar for MatmulDimension {
+  #[inline]
+  fn to_little_endian(self) -> Self {
+    let b = u8::to_le(self.0);
+    Self(b)
+  }
+  #[inline]
+  #[allow(clippy::wrong_self_convention)]
+  fn from_little_endian(self) -> Self {
+    let b = u8::from_le(self.0);
+    Self(b)
+  }
+}
+
+impl<'a> flatbuffers::Verifiable for MatmulDimension {
+  #[inline]
+  fn run_verifier(
+    v: &mut flatbuffers::Verifier, pos: usize
+  ) -> Result<(), flatbuffers::InvalidFlatbuffer> {
+    use self::flatbuffers::Verifiable;
+    u8::run_verifier(v, pos)
+  }
+}
+
+impl flatbuffers::SimpleToVerifyInSlice for MatmulDimension {}
+#[deprecated(since = "2.0.0", note = "Use associated constants instead. This will no longer be generated in 2021.")]
+pub const ENUM_MIN_KERNEL_DEF: u8 = 0;
+#[deprecated(since = "2.0.0", note = "Use associated constants instead. This will no longer be generated in 2021.")]
+pub const ENUM_MAX_KERNEL_DEF: u8 = 4;
+#[deprecated(since = "2.0.0", note = "Use associated constants instead. This will no longer be generated in 2021.")]
+#[allow(non_camel_case_types)]
+pub const ENUM_VALUES_KERNEL_DEF: [KernelDef; 5] = [
   KernelDef::NONE,
   KernelDef::Conv2DDef,
   KernelDef::FullyConnectedDef,
+  KernelDef::PoolingDef,
+  KernelDef::MatmulDef,
 ];
 
 #[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Default)]
@@ -339,13 +630,17 @@ impl KernelDef {
   pub const NONE: Self = Self(0);
   pub const Conv2DDef: Self = Self(1);
   pub const FullyConnectedDef: Self = Self(2);
+  pub const PoolingDef: Self = Self(3);
+  pub const MatmulDef: Self = Self(4);
 
   pub const ENUM_MIN: u8 = 0;
-  pub const ENUM_MAX: u8 = 2;
+  pub const ENUM_MAX: u8 = 4;
   pub const ENUM_VALUES: &'static [Self] = &[
     Self::NONE,
     Self::Conv2DDef,
     Self::FullyConnectedDef,
+    Self::PoolingDef,
+    Self::MatmulDef,
   ];
   /// Returns the variant's name or "" if unknown.
   pub fn variant_name(self) -> Option<&'static str> {
@@ -353,6 +648,8 @@ impl KernelDef {
       Self::NONE => Some("NONE"),
       Self::Conv2DDef => Some("Conv2DDef"),
       Self::FullyConnectedDef => Some("FullyConnectedDef"),
+      Self::PoolingDef => Some("PoolingDef"),
+      Self::MatmulDef => Some("MatmulDef"),
       _ => None,
     }
   }
@@ -1076,6 +1373,586 @@ impl core::fmt::Debug for FullyConnectedDef<'_> {
       ds.finish()
   }
 }
+pub enum PoolingDefOffset {}
+#[derive(Copy, Clone, PartialEq)]
+
+pub struct PoolingDef<'a> {
+  pub _tab: flatbuffers::Table<'a>,
+}
+
+impl<'a> flatbuffers::Follow<'a> for PoolingDef<'a> {
+  type Inner = PoolingDef<'a>;
+  #[inline]
+  fn follow(buf: &'a [u8], loc: usize) -> Self::Inner {
+    Self { _tab: flatbuffers::Table { buf, loc } }
+  }
+}
+
+impl<'a> PoolingDef<'a> {
+  pub const VT_INPUT_WIDTH: flatbuffers::VOffsetT = 4;
+  pub const VT_INPUT_HEIGHT: flatbuffers::VOffsetT = 6;
+  pub const VT_CHANNELS: flatbuffers::VOffsetT = 8;
+  pub const VT_OUTPUT_WIDTH: flatbuffers::VOffsetT = 10;
+  pub const VT_OUTPUT_HEIGHT: flatbuffers::VOffsetT = 12;
+  pub const VT_KERNEL_WIDTH: flatbuffers::VOffsetT = 14;
+  pub const VT_KERNEL_HEIGHT: flatbuffers::VOffsetT = 16;
+  pub const VT_STRIDE_X: flatbuffers::VOffsetT = 18;
+  pub const VT_STRIDE_Y: flatbuffers::VOffsetT = 20;
+  pub const VT_PAD_LEFT: flatbuffers::VOffsetT = 22;
+  pub const VT_PAD_TOP: flatbuffers::VOffsetT = 24;
+  pub const VT_PAD_RIGHT: flatbuffers::VOffsetT = 26;
+  pub const VT_PAD_BOTTOM: flatbuffers::VOffsetT = 28;
+  pub const VT_METHOD: flatbuffers::VOffsetT = 30;
+  pub const VT_PRECISION: flatbuffers::VOffsetT = 32;
+  pub const VT_RUNTIME_DIMENSIONS: flatbuffers::VOffsetT = 34;
+
+  #[inline]
+  pub fn init_from_table(table: flatbuffers::Table<'a>) -> Self {
+    PoolingDef { _tab: table }
+  }
+  #[allow(unused_mut)]
+  pub fn create<'bldr: 'args, 'args: 'mut_bldr, 'mut_bldr>(
+    _fbb: &'mut_bldr mut flatbuffers::FlatBufferBuilder<'bldr>,
+    args: &'args PoolingDefArgs<'args>
+  ) -> flatbuffers::WIPOffset<PoolingDef<'bldr>> {
+    let mut builder = PoolingDefBuilder::new(_fbb);
+    if let Some(x) = args.runtime_dimensions { builder.add_runtime_dimensions(x); }
+    builder.add_pad_bottom(args.pad_bottom);
+    builder.add_pad_right(args.pad_right);
+    builder.add_pad_top(args.pad_top);
+    builder.add_pad_left(args.pad_left);
+    builder.add_stride_y(args.stride_y);
+    builder.add_stride_x(args.stride_x);
+    builder.add_kernel_height(args.kernel_height);
+    builder.add_kernel_width(args.kernel_width);
+    builder.add_output_height(args.output_height);
+    builder.add_output_width(args.output_width);
+    builder.add_channels(args.channels);
+    builder.add_input_height(args.input_height);
+    builder.add_input_width(args.input_width);
+    builder.add_precision(args.precision);
+    builder.add_method(args.method);
+    builder.finish()
+  }
+
+
+  #[inline]
+  pub fn input_width(&self) -> u32 {
+    self._tab.get::<u32>(PoolingDef::VT_INPUT_WIDTH, Some(0)).unwrap()
+  }
+  #[inline]
+  pub fn input_height(&self) -> u32 {
+    self._tab.get::<u32>(PoolingDef::VT_INPUT_HEIGHT, Some(0)).unwrap()
+  }
+  #[inline]
+  pub fn channels(&self) -> u32 {
+    self._tab.get::<u32>(PoolingDef::VT_CHANNELS, Some(0)).unwrap()
+  }
+  #[inline]
+  pub fn output_width(&self) -> u32 {
+    self._tab.get::<u32>(PoolingDef::VT_OUTPUT_WIDTH, Some(0)).unwrap()
+  }
+  #[inline]
+  pub fn output_height(&self) -> u32 {
+    self._tab.get::<u32>(PoolingDef::VT_OUTPUT_HEIGHT, Some(0)).unwrap()
+  }
+  #[inline]
+  pub fn kernel_width(&self) -> u32 {
+    self._tab.get::<u32>(PoolingDef::VT_KERNEL_WIDTH, Some(0)).unwrap()
+  }
+  #[inline]
+  pub fn kernel_height(&self) -> u32 {
+    self._tab.get::<u32>(PoolingDef::VT_KERNEL_HEIGHT, Some(0)).unwrap()
+  }
+  #[inline]
+  pub fn stride_x(&self) -> u32 {
+    self._tab.get::<u32>(PoolingDef::VT_STRIDE_X, Some(0)).unwrap()
+  }
+  #[inline]
+  pub fn stride_y(&self) -> u32 {
+    self._tab.get::<u32>(PoolingDef::VT_STRIDE_Y, Some(0)).unwrap()
+  }
+  #[inline]
+  pub fn pad_left(&self) -> u32 {
+    self._tab.get::<u32>(PoolingDef::VT_PAD_LEFT, Some(0)).unwrap()
+  }
+  #[inline]
+  pub fn pad_top(&self) -> u32 {
+    self._tab.get::<u32>(PoolingDef::VT_PAD_TOP, Some(0)).unwrap()
+  }
+  #[inline]
+  pub fn pad_right(&self) -> u32 {
+    self._tab.get::<u32>(PoolingDef::VT_PAD_RIGHT, Some(0)).unwrap()
+  }
+  #[inline]
+  pub fn pad_bottom(&self) -> u32 {
+    self._tab.get::<u32>(PoolingDef::VT_PAD_BOTTOM, Some(0)).unwrap()
+  }
+  #[inline]
+  pub fn method(&self) -> PoolingMethod {
+    self._tab.get::<PoolingMethod>(PoolingDef::VT_METHOD, Some(PoolingMethod::MAX)).unwrap()
+  }
+  #[inline]
+  pub fn precision(&self) -> Precision {
+    self._tab.get::<Precision>(PoolingDef::VT_PRECISION, Some(Precision::INT8)).unwrap()
+  }
+  #[inline]
+  pub fn runtime_dimensions(&self) -> Option<flatbuffers::Vector<'a, PoolingDimension>> {
+    self._tab.get::<flatbuffers::ForwardsUOffset<flatbuffers::Vector<'a, PoolingDimension>>>(PoolingDef::VT_RUNTIME_DIMENSIONS, None)
+  }
+}
+
+impl flatbuffers::Verifiable for PoolingDef<'_> {
+  #[inline]
+  fn run_verifier(
+    v: &mut flatbuffers::Verifier, pos: usize
+  ) -> Result<(), flatbuffers::InvalidFlatbuffer> {
+    use self::flatbuffers::Verifiable;
+    v.visit_table(pos)?
+     .visit_field::<u32>("input_width", Self::VT_INPUT_WIDTH, false)?
+     .visit_field::<u32>("input_height", Self::VT_INPUT_HEIGHT, false)?
+     .visit_field::<u32>("channels", Self::VT_CHANNELS, false)?
+     .visit_field::<u32>("output_width", Self::VT_OUTPUT_WIDTH, false)?
+     .visit_field::<u32>("output_height", Self::VT_OUTPUT_HEIGHT, false)?
+     .visit_field::<u32>("kernel_width", Self::VT_KERNEL_WIDTH, false)?
+     .visit_field::<u32>("kernel_height", Self::VT_KERNEL_HEIGHT, false)?
+     .visit_field::<u32>("stride_x", Self::VT_STRIDE_X, false)?
+     .visit_field::<u32>("stride_y", Self::VT_STRIDE_Y, false)?
+     .visit_field::<u32>("pad_left", Self::VT_PAD_LEFT, false)?
+     .visit_field::<u32>("pad_top", Self::VT_PAD_TOP, false)?
+     .visit_field::<u32>("pad_right", Self::VT_PAD_RIGHT, false)?
+     .visit_field::<u32>("pad_bottom", Self::VT_PAD_BOTTOM, false)?
+     .visit_field::<PoolingMethod>("method", Self::VT_METHOD, false)?
+     .visit_field::<Precision>("precision", Self::VT_PRECISION, false)?
+     .visit_field::<flatbuffers::ForwardsUOffset<flatbuffers::Vector<'_, PoolingDimension>>>("runtime_dimensions", Self::VT_RUNTIME_DIMENSIONS, false)?
+     .finish();
+    Ok(())
+  }
+}
+pub struct PoolingDefArgs<'a> {
+    pub input_width: u32,
+    pub input_height: u32,
+    pub channels: u32,
+    pub output_width: u32,
+    pub output_height: u32,
+    pub kernel_width: u32,
+    pub kernel_height: u32,
+    pub stride_x: u32,
+    pub stride_y: u32,
+    pub pad_left: u32,
+    pub pad_top: u32,
+    pub pad_right: u32,
+    pub pad_bottom: u32,
+    pub method: PoolingMethod,
+    pub precision: Precision,
+    pub runtime_dimensions: Option<flatbuffers::WIPOffset<flatbuffers::Vector<'a, PoolingDimension>>>,
+}
+impl<'a> Default for PoolingDefArgs<'a> {
+  #[inline]
+  fn default() -> Self {
+    PoolingDefArgs {
+      input_width: 0,
+      input_height: 0,
+      channels: 0,
+      output_width: 0,
+      output_height: 0,
+      kernel_width: 0,
+      kernel_height: 0,
+      stride_x: 0,
+      stride_y: 0,
+      pad_left: 0,
+      pad_top: 0,
+      pad_right: 0,
+      pad_bottom: 0,
+      method: PoolingMethod::MAX,
+      precision: Precision::INT8,
+      runtime_dimensions: None,
+    }
+  }
+}
+
+pub struct PoolingDefBuilder<'a: 'b, 'b> {
+  fbb_: &'b mut flatbuffers::FlatBufferBuilder<'a>,
+  start_: flatbuffers::WIPOffset<flatbuffers::TableUnfinishedWIPOffset>,
+}
+impl<'a: 'b, 'b> PoolingDefBuilder<'a, 'b> {
+  #[inline]
+  pub fn add_input_width(&mut self, input_width: u32) {
+    self.fbb_.push_slot::<u32>(PoolingDef::VT_INPUT_WIDTH, input_width, 0);
+  }
+  #[inline]
+  pub fn add_input_height(&mut self, input_height: u32) {
+    self.fbb_.push_slot::<u32>(PoolingDef::VT_INPUT_HEIGHT, input_height, 0);
+  }
+  #[inline]
+  pub fn add_channels(&mut self, channels: u32) {
+    self.fbb_.push_slot::<u32>(PoolingDef::VT_CHANNELS, channels, 0);
+  }
+  #[inline]
+  pub fn add_output_width(&mut self, output_width: u32) {
+    self.fbb_.push_slot::<u32>(PoolingDef::VT_OUTPUT_WIDTH, output_width, 0);
+  }
+  #[inline]
+  pub fn add_output_height(&mut self, output_height: u32) {
+    self.fbb_.push_slot::<u32>(PoolingDef::VT_OUTPUT_HEIGHT, output_height, 0);
+  }
+  #[inline]
+  pub fn add_kernel_width(&mut self, kernel_width: u32) {
+    self.fbb_.push_slot::<u32>(PoolingDef::VT_KERNEL_WIDTH, kernel_width, 0);
+  }
+  #[inline]
+  pub fn add_kernel_height(&mut self, kernel_height: u32) {
+    self.fbb_.push_slot::<u32>(PoolingDef::VT_KERNEL_HEIGHT, kernel_height, 0);
+  }
+  #[inline]
+  pub fn add_stride_x(&mut self, stride_x: u32) {
+    self.fbb_.push_slot::<u32>(PoolingDef::VT_STRIDE_X, stride_x, 0);
+  }
+  #[inline]
+  pub fn add_stride_y(&mut self, stride_y: u32) {
+    self.fbb_.push_slot::<u32>(PoolingDef::VT_STRIDE_Y, stride_y, 0);
+  }
+  #[inline]
+  pub fn add_pad_left(&mut self, pad_left: u32) {
+    self.fbb_.push_slot::<u32>(PoolingDef::VT_PAD_LEFT, pad_left, 0);
+  }
+  #[inline]
+  pub fn add_pad_top(&mut self, pad_top: u32) {
+    self.fbb_.push_slot::<u32>(PoolingDef::VT_PAD_TOP, pad_top, 0);
+  }
+  #[inline]
+  pub fn add_pad_right(&mut self, pad_right: u32) {
+    self.fbb_.push_slot::<u32>(PoolingDef::VT_PAD_RIGHT, pad_right, 0);
+  }
+  #[inline]
+  pub fn add_pad_bottom(&mut self, pad_bottom: u32) {
+    self.fbb_.push_slot::<u32>(PoolingDef::VT_PAD_BOTTOM, pad_bottom, 0);
+  }
+  #[inline]
+  pub fn add_method(&mut self, method: PoolingMethod) {
+    self.fbb_.push_slot::<PoolingMethod>(PoolingDef::VT_METHOD, method, PoolingMethod::MAX);
+  }
+  #[inline]
+  pub fn add_precision(&mut self, precision: Precision) {
+    self.fbb_.push_slot::<Precision>(PoolingDef::VT_PRECISION, precision, Precision::INT8);
+  }
+  #[inline]
+  pub fn add_runtime_dimensions(&mut self, runtime_dimensions: flatbuffers::WIPOffset<flatbuffers::Vector<'b , PoolingDimension>>) {
+    self.fbb_.push_slot_always::<flatbuffers::WIPOffset<_>>(PoolingDef::VT_RUNTIME_DIMENSIONS, runtime_dimensions);
+  }
+  #[inline]
+  pub fn new(_fbb: &'b mut flatbuffers::FlatBufferBuilder<'a>) -> PoolingDefBuilder<'a, 'b> {
+    let start = _fbb.start_table();
+    PoolingDefBuilder {
+      fbb_: _fbb,
+      start_: start,
+    }
+  }
+  #[inline]
+  pub fn finish(self) -> flatbuffers::WIPOffset<PoolingDef<'a>> {
+    let o = self.fbb_.end_table(self.start_);
+    flatbuffers::WIPOffset::new(o.value())
+  }
+}
+
+impl core::fmt::Debug for PoolingDef<'_> {
+  fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+    let mut ds = f.debug_struct("PoolingDef");
+      ds.field("input_width", &self.input_width());
+      ds.field("input_height", &self.input_height());
+      ds.field("channels", &self.channels());
+      ds.field("output_width", &self.output_width());
+      ds.field("output_height", &self.output_height());
+      ds.field("kernel_width", &self.kernel_width());
+      ds.field("kernel_height", &self.kernel_height());
+      ds.field("stride_x", &self.stride_x());
+      ds.field("stride_y", &self.stride_y());
+      ds.field("pad_left", &self.pad_left());
+      ds.field("pad_top", &self.pad_top());
+      ds.field("pad_right", &self.pad_right());
+      ds.field("pad_bottom", &self.pad_bottom());
+      ds.field("method", &self.method());
+      ds.field("precision", &self.precision());
+      ds.field("runtime_dimensions", &self.runtime_dimensions());
+      ds.finish()
+  }
+}
+pub enum MatmulDefOffset {}
+#[derive(Copy, Clone, PartialEq)]
+
+pub struct MatmulDef<'a> {
+  pub _tab: flatbuffers::Table<'a>,
+}
+
+impl<'a> flatbuffers::Follow<'a> for MatmulDef<'a> {
+  type Inner = MatmulDef<'a>;
+  #[inline]
+  fn follow(buf: &'a [u8], loc: usize) -> Self::Inner {
+    Self { _tab: flatbuffers::Table { buf, loc } }
+  }
+}
+
+impl<'a> MatmulDef<'a> {
+  pub const VT_M: flatbuffers::VOffsetT = 4;
+  pub const VT_K: flatbuffers::VOffsetT = 6;
+  pub const VT_N: flatbuffers::VOffsetT = 8;
+  pub const VT_INPUT_ZERO_POINT: flatbuffers::VOffsetT = 10;
+  pub const VT_OUTPUT_ZERO_POINT: flatbuffers::VOffsetT = 12;
+  pub const VT_WEIGHTS_ZERO_POINT: flatbuffers::VOffsetT = 14;
+  pub const VT_INPUT_SCALE: flatbuffers::VOffsetT = 16;
+  pub const VT_WEIGHTS_SCALE: flatbuffers::VOffsetT = 18;
+  pub const VT_OUTPUT_SCALE: flatbuffers::VOffsetT = 20;
+  pub const VT_TRUNCATE_BITS: flatbuffers::VOffsetT = 22;
+  pub const VT_ACTIVATION: flatbuffers::VOffsetT = 24;
+  pub const VT_ACTIVATION_CMP: flatbuffers::VOffsetT = 26;
+  pub const VT_PRECISION: flatbuffers::VOffsetT = 28;
+  pub const VT_RUNTIME_DIMENSIONS: flatbuffers::VOffsetT = 30;
+
+  #[inline]
+  pub fn init_from_table(table: flatbuffers::Table<'a>) -> Self {
+    MatmulDef { _tab: table }
+  }
+  #[allow(unused_mut)]
+  pub fn create<'bldr: 'args, 'args: 'mut_bldr, 'mut_bldr>(
+    _fbb: &'mut_bldr mut flatbuffers::FlatBufferBuilder<'bldr>,
+    args: &'args MatmulDefArgs<'args>
+  ) -> flatbuffers::WIPOffset<MatmulDef<'bldr>> {
+    let mut builder = MatmulDefBuilder::new(_fbb);
+    if let Some(x) = args.runtime_dimensions { builder.add_runtime_dimensions(x); }
+    builder.add_activation_cmp(args.activation_cmp);
+    builder.add_truncate_bits(args.truncate_bits);
+    builder.add_output_scale(args.output_scale);
+    builder.add_weights_scale(args.weights_scale);
+    builder.add_input_scale(args.input_scale);
+    builder.add_weights_zero_point(args.weights_zero_point);
+    builder.add_output_zero_point(args.output_zero_point);
+    builder.add_input_zero_point(args.input_zero_point);
+    builder.add_n(args.n);
+    builder.add_k(args.k);
+    builder.add_m(args.m);
+    builder.add_precision(args.precision);
+    builder.add_activation(args.activation);
+    builder.finish()
+  }
+
+
+  #[inline]
+  pub fn m(&self) -> u32 {
+    self._tab.get::<u32>(MatmulDef::VT_M, Some(0)).unwrap()
+  }
+  #[inline]
+  pub fn k(&self) -> u32 {
+    self._tab.get::<u32>(MatmulDef::VT_K, Some(0)).unwrap()
+  }
+  #[inline]
+  pub fn n(&self) -> u32 {
+    self._tab.get::<u32>(MatmulDef::VT_N, Some(0)).unwrap()
+  }
+  #[inline]
+  pub fn input_zero_point(&self) -> u32 {
+    self._tab.get::<u32>(MatmulDef::VT_INPUT_ZERO_POINT, Some(0)).unwrap()
+  }
+  #[inline]
+  pub fn output_zero_point(&self) -> u32 {
+    self._tab.get::<u32>(MatmulDef::VT_OUTPUT_ZERO_POINT, Some(0)).unwrap()
+  }
+  #[inline]
+  pub fn weights_zero_point(&self) -> u32 {
+    self._tab.get::<u32>(MatmulDef::VT_WEIGHTS_ZERO_POINT, Some(0)).unwrap()
+  }
+  #[inline]
+  pub fn input_scale(&self) -> f32 {
+    self._tab.get::<f32>(MatmulDef::VT_INPUT_SCALE, Some(1.0)).unwrap()
+  }
+  #[inline]
+  pub fn weights_scale(&self) -> f32 {
+    self._tab.get::<f32>(MatmulDef::VT_WEIGHTS_SCALE, Some(1.0)).unwrap()
+  }
+  #[inline]
+  pub fn output_scale(&self) -> f32 {
+    self._tab.get::<f32>(MatmulDef::VT_OUTPUT_SCALE, Some(1.0)).unwrap()
+  }
+  #[inline]
+  pub fn truncate_bits(&self) -> u32 {
+    self._tab.get::<u32>(MatmulDef::VT_TRUNCATE_BITS, Some(0)).unwrap()
+  }
+  #[inline]
+  pub fn activation(&self) -> Activation {
+    self._tab.get::<Activation>(MatmulDef::VT_ACTIVATION, Some(Activation::NONE)).unwrap()
+  }
+  #[inline]
+  pub fn activation_cmp(&self) -> u32 {
+    self._tab.get::<u32>(MatmulDef::VT_ACTIVATION_CMP, Some(0)).unwrap()
+  }
+  #[inline]
+  pub fn precision(&self) -> Precision {
+    self._tab.get::<Precision>(MatmulDef::VT_PRECISION, Some(Precision::INT8)).unwrap()
+  }
+  #[inline]
+  pub fn runtime_dimensions(&self) -> Option<flatbuffers::Vector<'a, MatmulDimension>> {
+    self._tab.get::<flatbuffers::ForwardsUOffset<flatbuffers::Vector<'a, MatmulDimension>>>(MatmulDef::VT_RUNTIME_DIMENSIONS, None)
+  }
+}
+
+impl flatbuffers::Verifiable for MatmulDef<'_> {
+  #[inline]
+  fn run_verifier(
+    v: &mut flatbuffers::Verifier, pos: usize
+  ) -> Result<(), flatbuffers::InvalidFlatbuffer> {
+    use self::flatbuffers::Verifiable;
+    v.visit_table(pos)?
+     .visit_field::<u32>("m", Self::VT_M, false)?
+     .visit_field::<u32>("k", Self::VT_K, false)?
+     .visit_field::<u32>("n", Self::VT_N, false)?
+     .visit_field::<u32>("input_zero_point", Self::VT_INPUT_ZERO_POINT, false)?
+     .visit_field::<u32>("output_zero_point", Self::VT_OUTPUT_ZERO_POINT, false)?
+     .visit_field::<u32>("weights_zero_point", Self::VT_WEIGHTS_ZERO_POINT, false)?
+     .visit_field::<f32>("input_scale", Self::VT_INPUT_SCALE, false)?
+     .visit_field::<f32>("weights_scale", Self::VT_WEIGHTS_SCALE, false)?
+     .visit_field::<f32>("output_scale", Self::VT_OUTPUT_SCALE, false)?
+     .visit_field::<u32>("truncate_bits", Self::VT_TRUNCATE_BITS, false)?
+     .visit_field::<Activation>("activation", Self::VT_ACTIVATION, false)?
+     .visit_field::<u32>("activation_cmp", Self::VT_ACTIVATION_CMP, false)?
+     .visit_field::<Precision>("precision", Self::VT_PRECISION, false)?
+     .visit_field::<flatbuffers::ForwardsUOffset<flatbuffers::Vector<'_, MatmulDimension>>>("runtime_dimensions", Self::VT_RUNTIME_DIMENSIONS, false)?
+     .finish();
+    Ok(())
+  }
+}
+pub struct MatmulDefArgs<'a> {
+    pub m: u32,
+    pub k: u32,
+    pub n: u32,
+    pub input_zero_point: u32,
+    pub output_zero_point: u32,
+    pub weights_zero_point: u32,
+    pub input_scale: f32,
+    pub weights_scale: f32,
+    pub output_scale: f32,
+    pub truncate_bits: u32,
+    pub activation: Activation,
+    pub activation_cmp: u32,
+    pub precision: Precision,
+    pub runtime_dimensions: Option<flatbuffers::WIPOffset<flatbuffers::Vector<'a, MatmulDimension>>>,
+}
+impl<'a> Default for MatmulDefArgs<'a> {
+  #[inline]
+  fn default() -> Self {
+    MatmulDefArgs {
+      m: 0,
+      k: 0,
+      n: 0,
+      input_zero_point: 0,
+      output_zero_point: 0,
+      weights_zero_point: 0,
+      input_scale: 1.0,
+      weights_scale: 1.0,
+      output_scale: 1.0,
+      truncate_bits: 0,
+      activation: Activation::NONE,
+      activation_cmp: 0,
+      precision: Precision::INT8,
+      runtime_dimensions: None,
+    }
+  }
+}
+
+pub struct MatmulDefBuilder<'a: 'b, 'b> {
+  fbb_: &'b mut flatbuffers::FlatBufferBuilder<'a>,
+  start_: flatbuffers::WIPOffset<flatbuffers::TableUnfinishedWIPOffset>,
+}
+impl<'a: 'b, 'b> MatmulDefBuilder<'a, 'b> {
+  #[inline]
+  pub fn add_m(&mut self, m: u32) {
+    self.fbb_.push_slot::<u32>(MatmulDef::VT_M, m, 0);
+  }
+  #[inline]
+  pub fn add_k(&mut self, k: u32) {
+    self.fbb_.push_slot::<u32>(MatmulDef::VT_K, k, 0);
+  }
+  #[inline]
+  pub fn add_n(&mut self, n: u32) {
+    self.fbb_.push_slot::<u32>(MatmulDef::VT_N, n, 0);
+  }
+  #[inline]
+  pub fn add_input_zero_point(&mut self, input_zero_point: u32) {
+    self.fbb_.push_slot::<u32>(MatmulDef::VT_INPUT_ZERO_POINT, input_zero_point, 0);
+  }
+  #[inline]
+  pub fn add_output_zero_point(&mut self, output_zero_point: u32) {
+    self.fbb_.push_slot::<u32>(MatmulDef::VT_OUTPUT_ZERO_POINT, output_zero_point, 0);
+  }
+  #[inline]
+  pub fn add_weights_zero_point(&mut self, weights_zero_point: u32) {
+    self.fbb_.push_slot::<u32>(MatmulDef::VT_WEIGHTS_ZERO_POINT, weights_zero_point, 0);
+  }
+  #[inline]
+  pub fn add_input_scale(&mut self, input_scale: f32) {
+    self.fbb_.push_slot::<f32>(MatmulDef::VT_INPUT_SCALE, input_scale, 1.0);
+  }
+  #[inline]
+  pub fn add_weights_scale(&mut self, weights_scale: f32) {
+    self.fbb_.push_slot::<f32>(MatmulDef::VT_WEIGHTS_SCALE, weights_scale, 1.0);
+  }
+  #[inline]
+  pub fn add_output_scale(&mut self, output_scale: f32) {
+    self.fbb_.push_slot::<f32>(MatmulDef::VT_OUTPUT_SCALE, output_scale, 1.0);
+  }
+  #[inline]
+  pub fn add_truncate_bits(&mut self, truncate_bits: u32) {
+    self.fbb_.push_slot::<u32>(MatmulDef::VT_TRUNCATE_BITS, truncate_bits, 0);
+  }
+  #[inline]
+  pub fn add_activation(&mut self, activation: Activation) {
+    self.fbb_.push_slot::<Activation>(MatmulDef::VT_ACTIVATION, activation, Activation::NONE);
+  }
+  #[inline]
+  pub fn add_activation_cmp(&mut self, activation_cmp: u32) {
+    self.fbb_.push_slot::<u32>(MatmulDef::VT_ACTIVATION_CMP, activation_cmp, 0);
+  }
+  #[inline]
+  pub fn add_precision(&mut self, precision: Precision) {
+    self.fbb_.push_slot::<Precision>(MatmulDef::VT_PRECISION, precision, Precision::INT8);
+  }
+  #[inline]
+  pub fn add_runtime_dimensions(&mut self, runtime_dimensions: flatbuffers::WIPOffset<flatbuffers::Vector<'b , MatmulDimension>>) {
+    self.fbb_.push_slot_always::<flatbuffers::WIPOffset<_>>(MatmulDef::VT_RUNTIME_DIMENSIONS, runtime_dimensions);
+  }
+  #[inline]
+  pub fn new(_fbb: &'b mut flatbuffers::FlatBufferBuilder<'a>) -> MatmulDefBuilder<'a, 'b> {
+    let start = _fbb.start_table();
+    MatmulDefBuilder {
+      fbb_: _fbb,
+      start_: start,
+    }
+  }
+  #[inline]
+  pub fn finish(self) -> flatbuffers::WIPOffset<MatmulDef<'a>> {
+    let o = self.fbb_.end_table(self.start_);
+    flatbuffers::WIPOffset::new(o.value())
+  }
+}
+
+impl core::fmt::Debug for MatmulDef<'_> {
+  fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+    let mut ds = f.debug_struct("MatmulDef");
+      ds.field("m", &self.m());
+      ds.field("k", &self.k());
+      ds.field("n", &self.n());
+      ds.field("input_zero_point", &self.input_zero_point());
+      ds.field("output_zero_point", &self.output_zero_point());
+      ds.field("weights_zero_point", &self.weights_zero_point());
+      ds.field("input_scale", &self.input_scale());
+      ds.field("weights_scale", &self.weights_scale());
+      ds.field("output_scale", &self.output_scale());
+      ds.field("truncate_bits", &self.truncate_bits());
+      ds.field("activation", &self.activation());
+      ds.field("activation_cmp", &self.activation_cmp());
+      ds.field("precision", &self.precision());
+      ds.field("runtime_dimensions", &self.runtime_dimensions());
+      ds.finish()
+  }
+}
 pub enum ExportDefOffset {}
 #[derive(Copy, Clone, PartialEq)]
 
@@ -1147,6 +2024,28 @@ impl<'a> ExportDef<'a> {
     }
   }
 
+  #[inline]
+  #[allow(non_snake_case)]
+  pub fn kernel_as_pooling_def(&self) -> Option<PoolingDef<'a>> {
+    if self.kernel_type() == KernelDef::PoolingDef {
+      let u = self.kernel();
+      Some(PoolingDef::init_from_table(u))
+    } else {
+      None
+    }
+  }
+
+  #[inline]
+  #[allow(non_snake_case)]
+  pub fn kernel_as_matmul_def(&self) -> Option<MatmulDef<'a>> {
+    if self.kernel_type() == KernelDef::MatmulDef {
+      let u = self.kernel();
+      Some(MatmulDef::init_from_table(u))
+    } else {
+      None
+    }
+  }
+
 }
 
 impl flatbuffers::Verifiable for ExportDef<'_> {
@@ -1161,6 +2060,8 @@ impl flatbuffers::Verifiable for ExportDef<'_> {
         match key {
           KernelDef::Conv2DDef => v.verify_union_variant::<flatbuffers::ForwardsUOffset<Conv2DDef>>("KernelDef::Conv2DDef", pos),
           KernelDef::FullyConnectedDef => v.verify_union_variant::<flatbuffers::ForwardsUOffset<FullyConnectedDef>>("KernelDef::FullyConnectedDef", pos),
+          KernelDef::PoolingDef => v.verify_union_variant::<flatbuffers::ForwardsUOffset<PoolingDef>>("KernelDef::PoolingDef", pos),
+          KernelDef::MatmulDef => v.verify_union_variant::<flatbuffers::ForwardsUOffset<MatmulDef>>("KernelDef::MatmulDef", pos),
           _ => Ok(()),
         }
      })?
@@ -1233,6 +2134,20 @@ impl core::fmt::Debug for ExportDef<'_> {
         },
         KernelDef::FullyConnectedDef => {
           if let Some(x) = self.kernel_as_fully_connected_def() {
+            ds.field("kernel", &x)
+          } else {
+            ds.field("kernel", &"InvalidFlatbuffer: Union discriminant does not match value.")
+          }
+        },
+        KernelDef::PoolingDef => {
+          if let Some(x) = self.kernel_as_pooling_def() {
+            ds.field("kernel", &x)
+          } else {
+            ds.field("kernel", &"InvalidFlatbuffer: Union discriminant does not match value.")
+          }
+        },
+        KernelDef::MatmulDef => {
+          if let Some(x) = self.kernel_as_matmul_def() {
             ds.field("kernel", &x)
           } else {
             ds.field("kernel", &"InvalidFlatbuffer: Union discriminant does not match value.")
