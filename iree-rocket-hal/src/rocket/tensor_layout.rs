@@ -769,8 +769,14 @@ pub fn pack_depthwise_to_rocket_weights(
     if filter_height == 0
         || filter_width == 0
         || channels == 0
-        || element_size == 0
         || padded_channels < channels
+        // The group is a byte width divided by the element size, so a
+        // sub-byte element cannot be expressed here at all: int4 would want
+        // 128 channels per group and this signature can only say 64. A
+        // 4-byte element is expressible but unmeasured. Both are refused
+        // rather than silently mis-grouped -- the int8 bug this grouping was
+        // written to fix stayed invisible under a uniform-weight probe.
+        || !matches!(element_size, 1 | 2)
     {
         return Err("invalid Rocket depthwise filter shape");
     }

@@ -1251,13 +1251,26 @@ impl Shape {
             self.in_channels, self.out_channels,
             "depthwise capture backing covers a channel multiplier of one only"
         );
-        // Depthwise has its own output writer -- a 256-byte write atom on
-        // the serial path -- which the fp32-result geometry has never been
-        // measured against. Refuse rather than guess; the dense ladders say
-        // nothing about it.
+        // Depthwise is *not* automatically inherited by a new datatype the
+        // way the dense path is. Two things stop it:
+        //
+        //   * the coefficient grouping is a 64-byte run
+        //     (`tensor_layout::pack_depthwise_to_rocket_weights`), so it is
+        //     a channel count only once an element width is fixed -- 32 at
+        //     two bytes, 64 at one, and *128* at int4's half byte, which
+        //     that function's byte-valued `element_size` cannot express;
+        //   * depthwise keeps its own output writer, with a 256-byte write
+        //     atom on the serial path, which no fp32-result measurement
+        //     covers.
+        //
+        // So the widths with hardware behind them are the 1- and 2-byte
+        // ones, and everything else is refused rather than guessed at. The
+        // int8 grouping bug this grouping was written to fix was invisible
+        // to a uniform-weight probe, which is exactly what a speculative
+        // depthwise rung would get tested with first.
         assert!(
-            !self.precision.writes_fp32_result(),
-            "{:?} depthwise output is unmeasured",
+            matches!(self.precision.element_bits(), 8 | 16) && !self.precision.writes_fp32_result(),
+            "{:?} depthwise is unmeasured; see Shape::with_depthwise",
             self.precision
         );
         self.depthwise = true;
@@ -4756,6 +4769,32 @@ mod tests {
         assert_eq!((data_format >> 29) & 0x7, OutputPrecision::Int16 as u32);
         assert_eq!((data_format >> 26) & 0x7, DataPrecision::Int4 as u32);
         assert_eq!(data_format & 0x7, DataPrecision::Int4 as u32);
+    }
+
+    /// Depthwise is opt-in per width, not inherited by every new rung.
+    #[test]
+    fn depthwise_accepts_only_the_measured_element_widths() {
+        for precision in [Precision::Fp16, Precision::Bf16, Precision::Int16] {
+            let _ = Shape::with_precision(34, 34, 1, 32, 32, precision).with_depthwise();
+        }
+        let quantization = Quantization {
+            input_zero_point: 0,
+            output_zero_point: 0,
+            weight_zero_point: 0,
+            input_scale: 1.0,
+            weights_scale: 1.0,
+            multiplier: Multiplier::from_ratio(1.0),
+        };
+        let _ = Shape::with_precision(34, 34, 1, 32, 32, Precision::Int8(quantization))
+            .with_depthwise();
+
+        for precision in [Precision::Int4, Precision::Tf32, Precision::Fp16Accumulator] {
+            let shape = Shape::with_precision(34, 34, 1, 32, 32, precision);
+            assert!(
+                std::panic::catch_unwind(move || shape.with_depthwise()).is_err(),
+                "{precision:?} depthwise must be refused until it is measured"
+            );
+        }
     }
 
     #[test]
