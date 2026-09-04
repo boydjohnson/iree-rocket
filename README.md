@@ -190,6 +190,25 @@ one. Their convolutions reach the NPU through the `int8_accumulator` precision
 folds the activation zero point into a CPU-side correction first, because that
 hardware mode is only validated for zero zero-points.
 
+## Profiling a run
+
+The driver pays a host-side cost per dispatch that no per-job timer sees: the
+input is repacked NHWC -> NC1HWC2, the weights are repacked into the CNA's
+blocked coefficient order, and the DPU's atomic-slot output is compacted back
+into IREE's dense buffer -- once per dispatch, on every inference.
+`ROCKET_PROFILE` times each of those phases separately and prints a per-phase
+table plus a per-op breakdown at exit:
+
+```sh
+ROCKET_PROFILE=1 ./iree-run-module --module=model.vmfb --function=main_graph \
+  --device=rocket --device=local-task --input=1x3x224x224xf32=0.1
+```
+
+`ROCKET_PROFILE=trace` additionally prints a line per phase as it happens.
+The `outside` row is time spent outside this driver entirely (the CPU
+dispatches), so the two halves of a mixed model can be compared directly.
+See ISSUES.md's P6 for the MobileNetV2 fp16 numbers and what they say.
+
 ## Board convolution regression gate
 
 The convolution regression command checks the low-level ConvPlan/NPU path and

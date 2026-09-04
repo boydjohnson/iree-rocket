@@ -506,6 +506,11 @@ pub unsafe fn create(
 }
 
 unsafe extern "C" fn destroy(device: *mut iree_hal_device_t) {
+    // The natural end of an inference run, and the point at which
+    // `ROCKET_PROFILE`'s tables are worth printing. `report` is idempotent
+    // and also runs from an `atexit` hook, for the hosts that never destroy
+    // their device.
+    crate::profile::report();
     unsafe {
         let d = &*cast(device);
         crate::bindings::iree_hal_allocator_release(d.device_allocator);
@@ -1581,6 +1586,12 @@ unsafe extern "C" fn queue_execute(
             // straight to signaling. Matches the coarse per-command-buffer
             // sync granularity documented in event.rs -- there's
             // genuinely nothing to submit to hardware.
+            // Time the whole callback, and the gap since the previous one
+            // returned -- see profile.rs. `Outside` is the only measure of
+            // how much of an inference is not this driver at all, which is
+            // the first thing to know before optimizing anything inside it.
+            crate::profile::mark_outside_start();
+            let execute_timer = crate::profile::start();
             let cmds = if command_buffer.is_null() {
                 Vec::new()
             } else {
@@ -1613,7 +1624,14 @@ unsafe extern "C" fn queue_execute(
                     if quiesce_all_enabled()
                         || needs_depthwise_to_dense_quiescence(*last_dpu_mode, job.dpu_mode)
                     {
+                        let timer = crate::profile::start();
                         std::thread::sleep(DEPTHWISE_TO_DENSE_QUIESCENCE);
+                        crate::profile::stop(
+                            timer,
+                            crate::profile::Phase::Quiesce,
+                            job.profile_label,
+                            0,
+                        );
                     }
                     let fd = d.file.as_raw_fd();
                     let regcmd_tasks = job.regcmd_tasks;
@@ -1623,6 +1641,7 @@ unsafe extern "C" fn queue_execute(
 
                     // Allocate every split before submission so all command
                     // buffers remain alive until the dispatch is complete.
+                    let regcmd_timer = crate::profile::start();
                     let mut cmd_bufs = Vec::with_capacity(regcmd_tasks.len());
                     for regcmd in regcmd_tasks {
                         let cmd_bytes = regcmd.len() * std::mem::size_of::<u64>();
@@ -1702,6 +1721,15 @@ unsafe extern "C" fn queue_execute(
                         }
                         task_descriptors.push((cmd_buf.dma_address, regcmd.len() as u32));
                     }
+                    crate::profile::stop(
+                        regcmd_timer,
+                        crate::profile::Phase::Regcmd,
+                        job.profile_label,
+                        regcmd_tasks
+                            .iter()
+                            .map(|task| task.len() * std::mem::size_of::<u64>())
+                            .sum(),
+                    );
 
                     // Real input/output GEM handles from the command
                     // buffer's recorded dispatch (command_buffer.rs's
@@ -1744,6 +1772,7 @@ unsafe extern "C" fn queue_execute(
                     // between jobs.
                     for &(regcmd_addr, regcmd_count) in &task_descriptors {
                         let started = Instant::now();
+                        let submit_timer = crate::profile::start();
                         if unsafe {
                             rocket_device::submit(
                                 fd,
@@ -1759,11 +1788,18 @@ unsafe extern "C" fn queue_execute(
                                 iree_status_code_e_IREE_STATUS_UNAVAILABLE,
                             );
                         }
+                        crate::profile::stop(
+                            submit_timer,
+                            crate::profile::Phase::Submit,
+                            job.profile_label,
+                            0,
+                        );
 
                         // PREP_BO waits on DMA_RESV_USAGE_WRITE fences for the
                         // specific output handle. Besides making results
                         // host-visible, waiting here prevents the next split
                         // from entering the kernel until this one has completed.
+                        let wait_timer = crate::profile::start();
                         for &out_handle in job.out_bo_handles {
                             if unsafe {
                                 rocket_device::prep_bo(
@@ -1779,6 +1815,12 @@ unsafe extern "C" fn queue_execute(
                                 );
                             }
                         }
+                        crate::profile::stop(
+                            wait_timer,
+                            crate::profile::Phase::Wait,
+                            job.profile_label,
+                            0,
+                        );
 
                         // The task is now "complete" as far as the fence is
                         // concerned. Whether it actually ran is a separate
@@ -1836,6 +1878,7 @@ unsafe extern "C" fn queue_execute(
                     // into the real buffer now that prep_bo above confirmed
                     // the write is complete and host-visible.
                     if let Some(oc) = &job.output_compaction {
+                        let compact_timer = crate::profile::start();
                         let expected_bytes = oc.output_pixel_count * oc.bytes_per_pixel;
                         if expected_bytes as u64 > oc.output_length as u64 {
                             break 'result status::from_code(
@@ -1876,6 +1919,12 @@ unsafe extern "C" fn queue_execute(
                                 iree_status_code_e_IREE_STATUS_INTERNAL,
                             );
                         }
+                        crate::profile::stop(
+                            compact_timer,
+                            crate::profile::Phase::Compact,
+                            job.profile_label,
+                            written,
+                        );
                     }
 
                     // Diagnostic only -- see `leak_regcmd_enabled`.
@@ -1885,6 +1934,13 @@ unsafe extern "C" fn queue_execute(
                 }
                 status::ok()
             };
+            crate::profile::stop(
+                execute_timer,
+                crate::profile::Phase::Execute,
+                crate::profile::NO_OP,
+                0,
+            );
+            crate::profile::mark_outside_end();
             if !command_buffer.is_null() {
                 unsafe { crate::bindings::iree_hal_command_buffer_release(command_buffer) };
             }

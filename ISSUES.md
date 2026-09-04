@@ -1307,6 +1307,65 @@ list as untested.
 
 ---
 
+## P6 (S2) — measured: MobileNetV2 fp16 spends 8% of its time on the NPU and 30% repacking constant weights
+
+`ROCKET_PROFILE=1` (`rocket-hal-driver/src/profile.rs`) times every phase of a
+dispatch's life separately and prints per-phase and per-op tables at exit.
+`mnv2.fp16.vmfb`, one inference on planck, 2026-09-04 (37 NPU dispatches, 56
+hardware jobs — several dispatches CBUF-split):
+
+```text
+  phase          calls    total ms    avg ms    max ms       MB/s
+  outside           37     107.566     2.907    21.174          -
+  record            37      17.227     0.466     1.919          -
+  pack.input        36      16.505     0.458     2.833        522
+  pack.weights      36      99.025     2.751    20.530        121
+  pack.bias         36       0.416     0.012     0.029        144
+  sync.inputs       37       0.629     0.017     0.055          -
+  regcmd            37       3.311     0.089     0.319         18
+  submit            56       1.053     0.019     0.042          -
+  wait.npu          56      27.125     0.484     2.668          -
+  compact           37      45.043     1.217    21.502        279
+  execute           38     196.507     5.171    27.528          -
+  wall                     321.300
+  host 293.122 ms, npu 28.178 ms, npu share 8.8%
+```
+
+Read against M4 (the offload deficit is real and the dispatch path is where it
+lives), this says which part of the dispatch path:
+
+1. **`pack.weights`, 99 ms — 34% of host time, the single largest item.** The
+   weights are *constant*. Nothing about a `.vmfb`'s filter data changes
+   between inferences, or between two dispatches of the same executable, yet
+   `apply_ops` re-runs `pack_hwcf_to_rocket_weights` on every dispatch of every
+   inference. The whole cost is avoidable by caching the packed scratch keyed
+   by the weight buffer's identity plus the geometry that determines the
+   packing. Worst single op is the classifier matmul at 20.5 ms for 3.6 MB.
+2. **It is also slow per byte.** 121 MB/s, against 522 MB/s for `pack.input`
+   and 279 MB/s for `compact` on the same cores. The coefficient transform is
+   a per-element scatter; even the dispatches that genuinely must repack would
+   get several times this.
+3. **`compact` 45 ms + `pack.input` 16.5 ms = 19% of host time** is the
+   NC1HWC2 round trip P2 describes, now with a price on it. It is the second
+   lever, and unlike the weights it needs the cross-dispatch layout
+   propagation P2 is about.
+4. **`outside` 107 ms (33%)** is everything that is not this driver — the CPU
+   dispatches, dominated by the 17 depthwise convolutions
+   (`depthwise-hal-gap`). Offloading more of the model attacks this number and
+   nothing above it.
+5. **`wait.npu` 27 ms is 8.8% of wall.** Every conclusion about NPU speed on
+   this model is a conclusion about 8.8% of its runtime. M2 (the 200 MHz
+   clock) would move ~1.4x of that 8.8%.
+6. **`record` 17 ms** is regcmd construction, which is P3's second half: the
+   program is rebuilt from scratch per dispatch per inference and is
+   address-only-different between runs.
+
+Run-to-run spread is large (`pack.weights` measured 99 and 165 ms in two
+consecutive runs) — planck is `ondemand` with a 408 MHz A76 floor, see M1.
+Compare totals within one run, and do not quote a single run's absolute number.
+
+---
+
 ## D1 (S4) — the FC lowering here and in the notes use opposite geometries, and this one may be better
 
 `iree-rocket-hal/src/rocket/fc.rs` maps, from a sweep of 160 RKNN-compiled ONNX
@@ -1368,10 +1427,12 @@ were meant to enable found two larger things, and both are now at the top.
 2. **M4** — already established; what remains is to stop using the NCHW
    baseline. Cheap, and it is the precondition for any offload decision being
    meaningful.
-3. **P3 → C4 → P4 → P1** — the dispatch-path cost stack, roughly in increasing
-   order of work. This is where the offload deficit actually lives: a
-   like-for-like CPU build is 2.5x faster than the best NPU configuration, so
-   the per-dispatch and per-tile taxes are the whole game.
+3. **P6 → P3 → C4 → P4 → P1** — the dispatch-path cost stack, roughly in
+   increasing order of work. This is where the offload deficit actually lives:
+   a like-for-like CPU build is 2.5x faster than the best NPU configuration, so
+   the per-dispatch and per-tile taxes are the whole game. P6 now measures that
+   stack rather than reasoning about it, and puts a cached packed-weight
+   scratch first: 34% of host time, for data that never changes.
 4. **C2** — small fix, plus a probe that settles a question the notes leave open.
 5. **M2** — ~1.43x on the device half, but it needs a driver-side
    `clk_set_rate` and both shortcuts hang the box.

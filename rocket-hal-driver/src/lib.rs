@@ -44,6 +44,7 @@ pub mod event;
 pub mod executable;
 pub mod executable_cache;
 pub mod file;
+pub mod profile;
 pub mod semaphore;
 
 /// Mirrors `iree_hal_null_driver_module_register()`'s C ABI signature

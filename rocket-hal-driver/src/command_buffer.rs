@@ -83,7 +83,7 @@ use crate::{
     },
     buffer::RocketBuffer,
     executable::UkernelShape,
-    status,
+    profile, status,
 };
 use iree_rocket_hal::rocket::{
     builders::RegCmd,
@@ -282,6 +282,12 @@ pub enum RecordedOp {
         /// risk -- same DPU write-back stage almost certainly has the same
         /// atomic-slot mismatch, just not fixed here).
         output_compaction: Option<OutputCompaction>,
+        /// Human-readable shape of this dispatch, the key `ROCKET_PROFILE`
+        /// groups its per-op timings under. Empty unless profiling is on --
+        /// building it costs a `format!` per recorded dispatch, which is
+        /// exactly the kind of thing that has no business in the inference
+        /// loop by default.
+        profile_label: String,
     },
 }
 
@@ -307,6 +313,10 @@ pub struct DispatchJob {
     pub in_bo_handles: &'static [u32],
     pub out_bo_handles: &'static [u32],
     pub output_compaction: Option<OutputCompaction>,
+    /// See `RecordedOp::Dispatch::profile_label`. Borrowed from the recorded
+    /// op, which outlives the job (the command buffer is retained across
+    /// `queue_execute`).
+    pub profile_label: &'static str,
 }
 
 /// What every `iree_hal_command_buffer_t*` this driver hands out actually
@@ -458,9 +468,11 @@ pub unsafe fn apply_ops(
                 weight_packing,
                 bias_packing,
                 output_compaction,
+                profile_label,
                 ..
             } => {
                 if let Some(packing) = input_packing {
+                    let timer = profile::start();
                     let dense_len = packing
                         .source_pixel_count
                         .checked_mul(packing.bytes_per_pixel)
@@ -531,8 +543,15 @@ pub unsafe fn apply_ops(
                             crate::bindings::iree_status_code_e_IREE_STATUS_INTERNAL,
                         ));
                     }
+                    profile::stop(
+                        timer,
+                        profile::Phase::PackInput,
+                        profile_label,
+                        packing.scratch_length,
+                    );
                 }
                 if let Some(packing) = weight_packing {
+                    let timer = profile::start();
                     // Depthwise's dense_len has no Cout factor -- one filter
                     // per input channel, not a kernel set per output channel
                     // (packing.output_channels is unused in this mode; see
@@ -634,8 +653,15 @@ pub unsafe fn apply_ops(
                             crate::bindings::iree_status_code_e_IREE_STATUS_INTERNAL,
                         ));
                     }
+                    profile::stop(
+                        timer,
+                        profile::Phase::PackWeights,
+                        profile_label,
+                        packing.scratch_length,
+                    );
                 }
                 if let Some(packing) = bias_packing {
+                    let timer = profile::start();
                     let dense_len = packing
                         .output_channels
                         .checked_mul(if packing.int8 { 4 } else { 2 })
@@ -696,6 +722,12 @@ pub unsafe fn apply_ops(
                             crate::bindings::iree_status_code_e_IREE_STATUS_INTERNAL,
                         ));
                     }
+                    profile::stop(
+                        timer,
+                        profile::Phase::PackBias,
+                        profile_label,
+                        packing.scratch_length,
+                    );
                 }
                 // Sync every buffer the NPU is about to read for device access.
                 //
@@ -720,6 +752,7 @@ pub unsafe fn apply_ops(
                 // hazard for any buffer passed directly in future. A
                 // redundant sync on an already-synced scratch BO is a cache
                 // operation with no effect on correctness.
+                let timer = profile::start();
                 for &input_handle in in_bo_handles.iter() {
                     if unsafe { fini_bo(cb.fd, input_handle) }.is_err() {
                         return Err(status::from_code(
@@ -727,6 +760,7 @@ pub unsafe fn apply_ops(
                         ));
                     }
                 }
+                profile::stop(timer, profile::Phase::SyncInputs, profile_label, 0);
                 dispatch_jobs.push(DispatchJob {
                     regcmd_tasks: regcmd_tasks.as_slice(),
                     dpu_mode: *dpu_mode,
@@ -734,6 +768,7 @@ pub unsafe fn apply_ops(
                     in_bo_handles: in_bo_handles.as_slice(),
                     out_bo_handles: out_bo_handles.as_slice(),
                     output_compaction: output_compaction.clone(),
+                    profile_label: profile_label.as_str(),
                 });
             }
         }
@@ -997,6 +1032,14 @@ status_stub!(collective(
 ) -> iree_status_t);
 
 #[allow(unused_variables)]
+/// Times `dispatch_impl` as `ROCKET_PROFILE`'s record phase.
+///
+/// Everything a dispatch costs before the hardware ever sees it -- planning
+/// the convolution, allocating scratch, emitting the regcmd -- happens here,
+/// at record time, not at submit time, and none of it shows up in a
+/// per-job timer. The label is read back off the op that was just recorded
+/// rather than threaded out of `dispatch_impl`, which keeps that function's
+/// forty-odd early returns untouched.
 unsafe extern "C" fn dispatch(
     command_buffer: *mut iree_hal_command_buffer_t,
     executable: *mut iree_hal_executable_t,
@@ -1005,6 +1048,38 @@ unsafe extern "C" fn dispatch(
     constants: iree_const_byte_span_t,
     bindings: iree_hal_buffer_ref_list_t,
     flags: iree_hal_dispatch_flags_t,
+) -> iree_status_t {
+    let timer = profile::start();
+    let status = unsafe {
+        dispatch_impl(
+            command_buffer,
+            executable,
+            function,
+            config,
+            constants,
+            bindings,
+            flags,
+        )
+    };
+    if timer.is_some() {
+        let cb = unsafe { &*cast(command_buffer) };
+        let label = match cb.ops.last() {
+            Some(RecordedOp::Dispatch { profile_label, .. }) => profile_label.as_str(),
+            _ => profile::NO_OP,
+        };
+        profile::stop(timer, profile::Phase::Record, label, 0);
+    }
+    status
+}
+
+unsafe extern "C" fn dispatch_impl(
+    command_buffer: *mut iree_hal_command_buffer_t,
+    executable: *mut iree_hal_executable_t,
+    _function: iree_hal_executable_function_t,
+    _config: iree_hal_dispatch_config_t,
+    constants: iree_const_byte_span_t,
+    bindings: iree_hal_buffer_ref_list_t,
+    _flags: iree_hal_dispatch_flags_t,
 ) -> iree_status_t {
     let cb = unsafe { &mut *cast(command_buffer) };
     let shape = unsafe { &*crate::executable::shape(executable) };
@@ -1421,6 +1496,20 @@ unsafe extern "C" fn dispatch(
             let output_handle = scratch.handle;
             scratch_buffers.push(scratch);
             let retained_bindings = unsafe { retain_direct_bindings(refs) };
+            let profile_label = profile::label(|| {
+                format!(
+                    "conv {} {}x{}x{}->{} k{}x{} s{}{}",
+                    profile::precision_name(shape.precision),
+                    shape.height,
+                    shape.width,
+                    shape.in_channels,
+                    shape.out_channels,
+                    kernels[0],
+                    kernels[1],
+                    shape.stride,
+                    if shape.depthwise { " dw" } else { "" },
+                )
+            });
             cb.ops.push(RecordedOp::Dispatch {
                 regcmd_tasks,
                 dpu_mode: Some(if shape.depthwise {
@@ -1437,6 +1526,7 @@ unsafe extern "C" fn dispatch(
                 weight_packing,
                 bias_packing,
                 output_compaction,
+                profile_label,
             });
         }
         UkernelShape::Matmul(executable) => {
@@ -1694,6 +1784,15 @@ unsafe extern "C" fn dispatch(
                 source_tiles: None,
             });
             let retained_bindings = unsafe { retain_direct_bindings(refs) };
+            let profile_label = profile::label(|| {
+                format!(
+                    "matmul {} {}x{}x{}",
+                    profile::precision_name(shape.precision),
+                    m,
+                    k,
+                    n,
+                )
+            });
             let mut scratch_buffers = vec![input_scratch, weight_scratch, output_scratch];
             if let Some(scratch) = bias_scratch {
                 scratch_buffers.push(scratch);
@@ -1710,6 +1809,7 @@ unsafe extern "C" fn dispatch(
                 weight_packing,
                 bias_packing,
                 output_compaction,
+                profile_label,
             });
         }
         UkernelShape::Pooling(executable) => {
@@ -1861,6 +1961,19 @@ unsafe extern "C" fn dispatch(
             let in_bo_handles = vec![input_scratch.handle];
             let out_bo_handles = vec![output_scratch.handle];
             let retained_bindings = unsafe { retain_direct_bindings(refs) };
+            let profile_label = profile::label(|| {
+                format!(
+                    "pool {:?} {}x{}x{} k{}x{} s{}x{}",
+                    shape.method,
+                    shape.input_height,
+                    shape.input_width,
+                    shape.input_channels,
+                    shape.kernel_height,
+                    shape.kernel_width,
+                    shape.stride_y,
+                    shape.stride_x,
+                )
+            });
             cb.ops.push(RecordedOp::Dispatch {
                 regcmd_tasks,
                 dpu_mode: None,
@@ -1873,6 +1986,7 @@ unsafe extern "C" fn dispatch(
                 weight_packing: None,
                 bias_packing: None,
                 output_compaction,
+                profile_label,
             });
         }
     }
