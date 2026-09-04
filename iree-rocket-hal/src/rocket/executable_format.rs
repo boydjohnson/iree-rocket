@@ -119,6 +119,26 @@ pub fn encode_conv_shape_v1(shape: &conv::Shape, kernels: Kernels) -> Vec<u8> {
             0.0f32,
             Multiplier { scale: 0, shift: 0 },
         ),
+        // The unquantized rungs added alongside fp16 carry no calibration,
+        // so they encode exactly as fp16 does apart from the tag.
+        Precision::Bf16 => (
+            3u32,
+            0i32,
+            0i32,
+            0i32,
+            0.0f32,
+            0.0f32,
+            Multiplier { scale: 0, shift: 0 },
+        ),
+        Precision::Int16 => (
+            4u32,
+            0i32,
+            0i32,
+            0i32,
+            0.0f32,
+            0.0f32,
+            Multiplier { scale: 0, shift: 0 },
+        ),
         Precision::Int8(Quantization {
             input_zero_point,
             output_zero_point,
@@ -247,6 +267,8 @@ pub fn decode_conv_shape_v1(payload: &[u8]) -> Result<(conv::Shape, Kernels), De
             },
         }),
         1 => Precision::Fp16,
+        3 => Precision::Bf16,
+        4 => Precision::Int16,
         2 => Precision::Int8Accumulator(Quantization {
             input_zero_point,
             output_zero_point,

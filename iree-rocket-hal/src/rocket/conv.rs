@@ -464,9 +464,35 @@ const PIXELS_PER_BANK_STEP: u32 = 1024;
 /// fp16 geometries, so every int8 capture is one half of a two-point diff in
 /// which precision is the only thing that moved. Across 21 such pairs
 /// exactly 33 register fields differ.
+///
+/// The datatype menu beyond fp16/int8 is a **3-bit precision field**, set
+/// independently for the CNA/CORE input and processing stages and for the
+/// DPU output stage, rather than a separate datapath. Adding a rung is
+/// therefore "pick the field value, then get the element width's layout
+/// right"; every layout rule in this module keys off the element *width*,
+/// not the numeric interpretation, which is why the 2-byte rungs share the
+/// fp16 geometry exactly. The field values are
+/// `int8 = 0, int16 = 1, fp16 = 2, bf16 = 3, int32 = 4, fp32 = 5, int4 = 6`
+/// (`tf32 = 7`, CNA/CORE only), each established by hardware sweep; see
+/// `../rockchip-npu-notes/encodings/precision-field.md`.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Precision {
     Fp16,
+    /// bfloat16: the same 2-byte operand and MAC rate as fp16 with fp32
+    /// dynamic range, at the cost of three mantissa bits. Byte-for-byte the
+    /// fp16 geometry -- feature atom of 8 channels, 16-kernel weight group,
+    /// the same coefficient padding -- so the only thing that moves against
+    /// [`Precision::Fp16`] is the precision field, 2 -> 3, in the CNA, CORE
+    /// and DPU stages.
+    Bf16,
+    /// Signed 16-bit integer inputs and coefficients. Also a 2-byte element
+    /// on the fp16 geometry, precision field 1.
+    ///
+    /// The compute side is sound, but the notes' matmul work found no
+    /// full-iteration integer *output* writer for int16
+    /// (`encodings/output-transpose-int16.md`), so this variant exists to be
+    /// characterized on hardware before anything depends on it.
+    Int16,
     /// Quantized int8, carrying the parameters that are not derivable from
     /// the shape and must come from the compiler.
     Int8(Quantization),
@@ -483,15 +509,27 @@ impl Precision {
     /// [`Precision::output_element_bytes`] when sizing the result tensor.
     pub fn element_bytes(&self) -> u32 {
         match self {
-            Precision::Fp16 => 2,
+            Precision::Fp16 | Precision::Bf16 | Precision::Int16 => 2,
             Precision::Int8(_) | Precision::Int8Accumulator(_) => 1,
         }
+    }
+
+    /// Whether this precision shares the fp16 *layout* family.
+    ///
+    /// Every coefficient-padding, weight-group and CBUF rule in this module
+    /// follows the element width rather than the numeric interpretation, so
+    /// bf16 and int16 inherit the fp16 geometry exactly rather than needing
+    /// their own corpus. What they do not inherit is *evidence*: only fp16
+    /// has vendor captures, so anything gated on capture backing says so in
+    /// its own comment.
+    pub fn shares_fp16_layout(&self) -> bool {
+        self.element_bytes() == 2
     }
 
     /// Bytes one logical output element occupies.
     pub fn output_element_bytes(&self) -> u32 {
         match self {
-            Precision::Fp16 => 2,
+            Precision::Fp16 | Precision::Bf16 | Precision::Int16 => 2,
             Precision::Int8(_) => 1,
             Precision::Int8Accumulator(_) => 4,
         }
@@ -539,7 +577,7 @@ impl Precision {
     /// rather than the extent of the arithmetic.
     pub fn max_in_channels(&self) -> u32 {
         match self {
-            Precision::Fp16 => MAX_INPUT_CHANNELS,
+            Precision::Fp16 | Precision::Bf16 | Precision::Int16 => MAX_INPUT_CHANNELS,
             Precision::Int8(_) | Precision::Int8Accumulator(_) => MAX_INT8_INPUT_CHANNELS,
         }
     }
@@ -549,21 +587,28 @@ impl Precision {
     /// [`MAX_INT8_OUTPUT_CHANNELS`].
     pub fn max_out_channels(&self) -> u32 {
         match self {
-            Precision::Fp16 => MAX_OUTPUT_CHANNELS,
+            Precision::Fp16 | Precision::Bf16 | Precision::Int16 => MAX_OUTPUT_CHANNELS,
             Precision::Int8(_) | Precision::Int8Accumulator(_) => MAX_INT8_OUTPUT_CHANNELS,
         }
     }
 
+    /// The 3-bit precision field this datatype programs into the CNA input,
+    /// CORE processing and DPU stages.
     fn data_precision(&self) -> DataPrecision {
         match self {
             Precision::Fp16 => DataPrecision::Fp16,
+            Precision::Bf16 => DataPrecision::Bf16,
+            Precision::Int16 => DataPrecision::Int16,
             Precision::Int8(_) | Precision::Int8Accumulator(_) => DataPrecision::Int8,
         }
     }
 
-    fn quantization(&self) -> Option<Quantization> {
+    /// Calibration parameters, for the precisions that requantize. `None`
+    /// is also the "unquantized rung" predicate the register program keys
+    /// its BS/CVT bypasses off.
+    pub fn quantization(&self) -> Option<Quantization> {
         match self {
-            Precision::Fp16 => None,
+            Precision::Fp16 | Precision::Bf16 | Precision::Int16 => None,
             Precision::Int8(quantization) | Precision::Int8Accumulator(quantization) => {
                 Some(*quantization)
             }
@@ -1072,12 +1117,15 @@ impl Shape {
     ///
     /// The asymmetry is the fp16 weight layout: the TRM has fp16 loading 16
     /// kernels per group against int8's 32.
+    /// bf16 and int16 take the fp16 branch: the quad-atom bump is a property
+    /// of the 16-kernel weight group a 2-byte element loads with, which
+    /// `../rockchip-npu-notes/encodings/tile-layouts.md` records as shared
+    /// (`weight_int16` == `weight_fp16`, and bf16 reuses the same tile).
     pub fn weight_channels(&self) -> u32 {
-        match self.precision {
-            Precision::Fp16 => {
-                quad_atoms(self.feature_atoms()) * self.precision.channels_per_atom()
-            }
-            Precision::Int8(_) | Precision::Int8Accumulator(_) => self.padded_channels(),
+        if self.precision.shares_fp16_layout() {
+            quad_atoms(self.feature_atoms()) * self.precision.channels_per_atom()
+        } else {
+            self.padded_channels()
         }
     }
 
@@ -1108,11 +1156,10 @@ impl Shape {
         if self.depthwise {
             return 1;
         }
-        match self.precision {
-            Precision::Fp16 => self.out_channels,
-            Precision::Int8(_) | Precision::Int8Accumulator(_) => {
-                self.out_channels.next_multiple_of(2)
-            }
+        if self.precision.shares_fp16_layout() {
+            self.out_channels
+        } else {
+            self.out_channels.next_multiple_of(2)
         }
     }
 
@@ -4171,6 +4218,108 @@ mod tests {
             })
     }
 
+    /// Registers that carry a precision field, and nothing else that a
+    /// datatype change is allowed to move.
+    fn precision_register_identities() -> Vec<(u32, u32)> {
+        vec![
+            (
+                <CnaConvCon1 as RegisterMeta>::DOMAIN,
+                <CnaConvCon1 as RegisterMeta>::OFFSET,
+            ),
+            (
+                <CoreMiscCfg as RegisterMeta>::DOMAIN,
+                <CoreMiscCfg as RegisterMeta>::OFFSET,
+            ),
+            (
+                <DpuDataFormat as RegisterMeta>::DOMAIN,
+                <DpuDataFormat as RegisterMeta>::OFFSET,
+            ),
+            (
+                <DpuRdmaFeatureModeCfg as RegisterMeta>::DOMAIN,
+                <DpuRdmaFeatureModeCfg as RegisterMeta>::OFFSET,
+            ),
+        ]
+    }
+
+    /// The 2-byte rungs are the fp16 program with the precision field
+    /// changed, and nothing else.
+    ///
+    /// This is the same diff `rockchip-npu-notes` records for the matmul
+    /// path -- `gen_matmul_bf16` == `gen_matmul_fp16` with only the
+    /// precision words moved -- asserted here for the convolution program,
+    /// which has four such registers rather than three (the DPU_RDMA stage
+    /// carries a pair as well). It is what makes "bf16 is fp16 with a
+    /// different field value" a checked claim rather than a hope: any future
+    /// geometry rule that keys off `Precision::Fp16` by name instead of by
+    /// element width will fail here.
+    #[test]
+    fn two_byte_precisions_differ_from_fp16_only_in_the_precision_registers() {
+        let kernels: Kernels = [3, 3];
+        for (precision, field) in [
+            (Precision::Bf16, u32::from(DataPrecision::Bf16 as u32)),
+            (Precision::Int16, u32::from(DataPrecision::Int16 as u32)),
+        ] {
+            let fp16 = Shape::with_precision(32, 32, 1, 64, 32, Precision::Fp16);
+            let other = Shape::with_precision(32, 32, 1, 64, 32, precision);
+            assert_eq!(
+                fp16.weight_bytes(kernels),
+                other.weight_bytes(kernels),
+                "{precision:?} coefficient footprint must match fp16"
+            );
+            assert_eq!(
+                fp16.output_scratch_bytes(kernels),
+                other.output_scratch_bytes(kernels),
+                "{precision:?} output allocation must match fp16"
+            );
+
+            let tile = Tile::whole(fp16, kernels);
+            let baseline = conv_2d_tile(fp16, kernels, &tile);
+            let candidate = conv_2d_tile(other, kernels, &tile);
+            assert_eq!(baseline.len(), candidate.len());
+
+            let expected = precision_register_identities();
+            let mut moved = Vec::new();
+            for (before, after) in baseline.iter().zip(&candidate) {
+                let (domain, offset, before_value) = decode(before);
+                let (after_domain, after_offset, after_value) = decode(after);
+                assert_eq!((domain, offset), (after_domain, after_offset));
+                if before_value != after_value {
+                    moved.push((domain, offset, before_value, after_value));
+                }
+            }
+            // `CNA_CONV_CON1` is written twice by the program, so compare
+            // the distinct identities rather than the raw sequence.
+            let mut identities: Vec<(u32, u32)> = moved
+                .iter()
+                .map(|(domain, offset, _, _)| (*domain, *offset))
+                .collect();
+            identities.dedup();
+            assert_eq!(
+                identities, expected,
+                "{precision:?} moved unexpected registers: {moved:x?}"
+            );
+            // Every moved word must differ only where a 3-bit precision
+            // field sits: xor the two and the result has to be a set of
+            // 3-bit-aligned nibbles, never a stray geometry bit.
+            for (domain, offset, before_value, after_value) in moved {
+                let fp16_field = DataPrecision::Fp16 as u32;
+                let mut rebuilt = before_value;
+                for shift in 0..30 {
+                    if (before_value >> shift) & 0x7 == fp16_field
+                        && (after_value >> shift) & 0x7 == field
+                    {
+                        rebuilt = (rebuilt & !(0x7 << shift)) | (field << shift);
+                    }
+                }
+                assert_eq!(
+                    rebuilt, after_value,
+                    "{precision:?} changed {domain:#x}:{offset:#x} outside its \
+                     precision fields: {before_value:#010x} -> {after_value:#010x}"
+                );
+            }
+        }
+    }
+
     #[test]
     fn vendor_reference_program_has_expected_layout() {
         let commands = conv_2d([1, 1]);
@@ -6079,7 +6228,7 @@ mod tests {
     fn quantization() -> Quantization {
         match captured_int8() {
             Precision::Int8(quantization) => quantization,
-            Precision::Fp16 | Precision::Int8Accumulator(_) => unreachable!(),
+            _ => unreachable!(),
         }
     }
 

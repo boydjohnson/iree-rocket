@@ -188,6 +188,7 @@ fn zero_bias(shape: Shape) -> Vec<u8> {
             write_bs_buffer(&mut bytes, &vec![BsEntry::default(); channels as usize]);
             bytes
         }
+        other => unimplemented!("{other:?} is outside this fp16/int8 harness"),
     }
 }
 
@@ -393,6 +394,7 @@ fn depthwise_weights(shape: Shape) -> Vec<u8> {
                             .expect("test coefficient must fit int8")
                             as u8;
                     }
+                    other => unimplemented!("{other:?} is outside this fp16/int8 harness"),
                 }
             }
         }

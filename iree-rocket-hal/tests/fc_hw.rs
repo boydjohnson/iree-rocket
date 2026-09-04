@@ -135,6 +135,7 @@ fn run_fc(shape: Shape, dense_input: &[u8], dense_weights: &[u8]) -> Vec<u8> {
     let bias_len = match shape.precision {
         Precision::Fp16 => padded_outputs as usize * 4,
         Precision::Int8(_) | Precision::Int8Accumulator(_) => conv_shape.bs_buffer_bytes(),
+        other => unimplemented!("{other:?} is outside this fp16/int8 harness"),
     };
 
     let file = OpenOptions::new()

@@ -35,8 +35,9 @@ use std::{
 };
 
 use conv2d_oracle::{
-    Conv2dCase, Conv2dFixture, OraclePattern, OraclePrecision, build_fixture, expected_output,
-    f16_to_f32, output_offset, output_storage_bytes,
+    Conv2dCase, Conv2dFixture, OraclePattern, OraclePrecision, bf16_to_f32, bf16_ulp,
+    build_fixture, expected_output, f16_to_f32, is_exact_in_bf16, output_offset,
+    output_storage_bytes,
 };
 #[cfg(feature = "hardware-characterization")]
 use conv2d_oracle::{build_raw_fixture, feature_offset};
@@ -257,6 +258,17 @@ fn compare_output(fixture: &Conv2dFixture, plan: &ConvPlan, output: &[u8]) -> Mi
     } else {
         0.0
     };
+    // bf16 carries nine significant bits, so an exact integer accumulator
+    // wider than that cannot be compared at tolerance 0.0 no matter how the
+    // hardware converts. `bf16_tolerance` is 0.0 for every value bf16 holds
+    // exactly and one ulp otherwise; see `bf16_ulp`.
+    let bf16_tolerance = |want: f32| {
+        if case.precision == OraclePrecision::Bf16 && !is_exact_in_bf16(want as i32) {
+            bf16_ulp(want)
+        } else {
+            tolerance
+        }
+    };
     let mut report = MismatchReport {
         mismatches: 0,
         max_abs_difference: 0.0,
@@ -272,6 +284,12 @@ fn compare_output(fixture: &Conv2dFixture, plan: &ConvPlan, output: &[u8]) -> Mi
                     OraclePrecision::Fp16 => {
                         f16_to_f32(u16::from_le_bytes([output[offset], output[offset + 1]]))
                     }
+                    OraclePrecision::Bf16 => {
+                        bf16_to_f32(u16::from_le_bytes([output[offset], output[offset + 1]]))
+                    }
+                    OraclePrecision::Int16 => {
+                        f32::from(i16::from_le_bytes([output[offset], output[offset + 1]]))
+                    }
                     OraclePrecision::Int8 => f32::from(output[offset] as i8),
                     OraclePrecision::Int8Accumulator => {
                         i32::from_le_bytes(output[offset..offset + 4].try_into().unwrap()) as f32
@@ -280,7 +298,7 @@ fn compare_output(fixture: &Conv2dFixture, plan: &ConvPlan, output: &[u8]) -> Mi
                 let want = expected_output(case, channel, y, x) as f32;
                 let difference = (got - want).abs();
                 report.max_abs_difference = report.max_abs_difference.max(difference);
-                if !got.is_finite() || difference > tolerance {
+                if !got.is_finite() || difference > bf16_tolerance(want) {
                     report.mismatches += 1;
                     if let Some(tile) = tile_for_output(plan, y, x) {
                         report.tile_mismatches[tile] += 1;
@@ -1638,6 +1656,243 @@ fn dense_coefficient_vgg_blocks_match_oracle() {
     let cases = dense_coefficient_vgg_block_cases();
     assert_eq!(cases.len(), 5);
     run_hardware_case_matrix("dense-coefficient VGG block regression", cases);
+}
+
+/// The first hardware ladder for a datatype beyond fp16/int8.
+///
+/// bf16 is the cheapest rung to add -- a 2-byte element on the fp16 layout,
+/// so the only thing that moves in the register program is the precision
+/// field (asserted in `conv.rs`'s
+/// `two_byte_precisions_differ_from_fp16_only_in_the_precision_registers`).
+/// That makes this ladder a test of one claim: that field value 3 really is
+/// bf16 for the *convolution* datapath, not only for the matmul one the
+/// notes established it on.
+///
+/// The patterns are chosen for what each can prove. `Counting` covers every
+/// Cin lane but produces a spatially constant output, so it cannot catch an
+/// addressing bug at all; `Selectors` and `Dense` are what test layout. All
+/// three run at both kernel sizes and across the dense/surface feature
+/// layout boundary (Cin 3 is ARGB-dense, Cin >= 8 is surfaces).
+fn bf16_regression_cases() -> Vec<Conv2dCase> {
+    let mut cases = Vec::new();
+    for cin in [3u32, 64, 256] {
+        for cout in [64u32, 256] {
+            for kernel in [1usize, 3] {
+                cases.push(Conv2dCase {
+                    width: 28,
+                    height: 28,
+                    cin,
+                    cout,
+                    kernel: [kernel, kernel],
+                    stride: 1,
+                    padding: [kernel / 2, kernel / 2],
+                    precision: OraclePrecision::Bf16,
+                    pattern: OraclePattern::Counting,
+                });
+            }
+        }
+    }
+    for cin in [3u32, 64, 256] {
+        for cout in [64u32, 256] {
+            cases.push(Conv2dCase {
+                width: 28,
+                height: 28,
+                cin,
+                cout,
+                kernel: [3, 3],
+                stride: 1,
+                padding: [1, 1],
+                precision: OraclePrecision::Bf16,
+                pattern: OraclePattern::Selectors { phase: 0 },
+            });
+        }
+    }
+    // Small extents keep the dense accumulator inside bf16's nine
+    // significant bits, so these compare at tolerance 0.0 rather than at an
+    // ulp.
+    for cin in [8u32, 64] {
+        for cout in [16u32, 64] {
+            for kernel in [1usize, 3] {
+                cases.push(Conv2dCase {
+                    width: 8,
+                    height: 8,
+                    cin,
+                    cout,
+                    kernel: [kernel, kernel],
+                    stride: 1,
+                    padding: [kernel / 2, kernel / 2],
+                    precision: OraclePrecision::Bf16,
+                    pattern: OraclePattern::Dense { phase: 0 },
+                });
+            }
+        }
+    }
+    // Stride is programmed by the CNA, ahead of the precision stage, but a
+    // datatype that changed the feature pitch would show up here first.
+    cases.push(Conv2dCase {
+        width: 28,
+        height: 28,
+        cin: 64,
+        cout: 64,
+        kernel: [3, 3],
+        stride: 2,
+        padding: [1, 1],
+        precision: OraclePrecision::Bf16,
+        pattern: OraclePattern::Selectors { phase: 1 },
+    });
+    // The rest of this ladder keeps every value inside fp16's range, so it
+    // would pass just as well on hardware that had ignored the precision
+    // field and read fp16. These do not: each product is past fp16's 65504
+    // ceiling, which only bf16's fp32 exponent range can carry.
+    for wide_input in [true, false] {
+        for cin in [8u32, 64] {
+            cases.push(Conv2dCase {
+                width: 8,
+                height: 8,
+                cin,
+                cout: 64,
+                kernel: [3, 3],
+                stride: 1,
+                padding: [1, 1],
+                precision: OraclePrecision::Bf16,
+                pattern: OraclePattern::WideOperands {
+                    phase: 0,
+                    wide_input,
+                },
+            });
+        }
+    }
+    cases
+}
+
+/// The int16 counterpart, deliberately small.
+///
+/// int16 is the rung the notes flag as doubtful: the compute side is sound
+/// (precision field 1, established by hardware sweep) but their matmul work
+/// found no output writer that iterates a full result --
+/// `encodings/output-transpose-int16.md`. If that is a property of the DPU
+/// rather than of their matmul geometry, this ladder fails with a partially
+/// written output, which is a result worth having recorded.
+fn int16_probe_cases() -> Vec<Conv2dCase> {
+    let mut cases = Vec::new();
+    for cin in [3u32, 64] {
+        for kernel in [1usize, 3] {
+            cases.push(Conv2dCase {
+                width: 8,
+                height: 8,
+                cin,
+                cout: 64,
+                kernel: [kernel, kernel],
+                stride: 1,
+                padding: [kernel / 2, kernel / 2],
+                precision: OraclePrecision::Int16,
+                pattern: OraclePattern::Counting,
+            });
+        }
+    }
+    for cin in [3u32, 64] {
+        cases.push(Conv2dCase {
+            width: 8,
+            height: 8,
+            cin,
+            cout: 64,
+            kernel: [3, 3],
+            stride: 1,
+            padding: [1, 1],
+            precision: OraclePrecision::Int16,
+            pattern: OraclePattern::Selectors { phase: 0 },
+        });
+    }
+    // The cases above stay inside int8 on both operands, so they cannot tell
+    // a 16-bit element apart from a byte one. These put a value past int8 on
+    // one side of the product at a time.
+    for wide_input in [true, false] {
+        for cin in [8u32, 64] {
+            cases.push(Conv2dCase {
+                width: 8,
+                height: 8,
+                cin,
+                cout: 64,
+                kernel: [3, 3],
+                stride: 1,
+                padding: [1, 1],
+                precision: OraclePrecision::Int16,
+                pattern: OraclePattern::WideOperands {
+                    phase: 0,
+                    wide_input,
+                },
+            });
+        }
+    }
+    cases
+}
+
+/// The wide-operand cases must actually be wide, or the ladders they anchor
+/// prove nothing about the element width.
+///
+/// A datatype ladder built out of small values passes on hardware that
+/// ignored the precision field entirely, so this checks the premise on the
+/// host: every wide bf16 case carries a value past fp16's 65504 ceiling, and
+/// every wide int16 case one past int8's 127. It also builds each fixture,
+/// which is where `encode_element`'s per-datatype range checks run.
+#[test]
+fn wide_operand_cases_exceed_the_narrower_datatype() {
+    let mut checked = 0;
+    for case in bf16_regression_cases()
+        .into_iter()
+        .chain(int16_probe_cases())
+    {
+        let fixture = build_fixture(case).expect("wide-operand fixture must build");
+        if !matches!(case.pattern, OraclePattern::WideOperands { .. }) {
+            continue;
+        }
+        checked += 1;
+        let shape = fixture.shape;
+        let out_height = shape.output_height(case.kernel) as usize;
+        let out_width = shape.output_width(case.kernel) as usize;
+        let mut peak = 0i32;
+        for y in 0..out_height {
+            for x in 0..out_width {
+                for channel in 0..case.cout as usize {
+                    peak = peak.max(expected_output(case, channel, y, x).abs());
+                }
+            }
+        }
+        let floor = match case.precision {
+            OraclePrecision::Bf16 => 65504,
+            OraclePrecision::Int16 => 127,
+            other => panic!("{other:?} has no wide-operand ladder"),
+        };
+        assert!(
+            peak > floor,
+            "{} peaks at {peak}, inside the narrower datatype's {floor}",
+            case.label(),
+        );
+    }
+    assert_eq!(checked, 8, "both ladders must contribute wide cases");
+}
+
+#[test]
+fn bf16_regression_matrix_is_planable_and_gap_free() {
+    let cases = bf16_regression_cases();
+    assert_eq!(cases.len(), 31);
+    assert_planable_and_gap_free(cases);
+}
+
+#[test]
+#[ignore = "needs /dev/accel/accel0 -- establishes bf16 (precision field 3) on the convolution datapath"]
+fn bf16_regression_matrix_matches_oracle() {
+    let cases = bf16_regression_cases();
+    assert_eq!(cases.len(), 31);
+    run_hardware_case_matrix("bf16 regression matrix", cases);
+}
+
+#[test]
+#[ignore = "needs /dev/accel/accel0 -- characterizes int16 (precision field 1) convolution output"]
+fn int16_probe_matches_oracle() {
+    let cases = int16_probe_cases();
+    assert_eq!(cases.len(), 10);
+    run_hardware_case_matrix("int16 output characterization", cases);
 }
 
 #[test]
