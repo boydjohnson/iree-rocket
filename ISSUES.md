@@ -1794,6 +1794,67 @@ What this does *not* do is stop a comparison from being wrong for P8's reason.
 Core allocation is still on the person measuring: same allocation for both
 arms, and not `taskset -c 4,5`.
 
+The flag was validated against the hand-edited builds it replaces rather than
+only against its own tests: `--no-offload` and the offload arm, for both
+`mnv2.int8.mlir` and `mnv2.fp16.mlir`, reproduce the four `.vmfb`s on the board
+**bit for bit** (md5 `3719195b`, `fa37f922`, `77123238`, `05578d80`).
+
+### Re-measured 2026-09-05: both precisions, both arms, three core allocations
+
+Every arm built by the flag, `planck`, governor `performance` on both A76
+clusters, NPU IRQs on cpu6, post-C8 board binary (`62e3ca3d`), every run gated
+on all three NPU cores reading `suspended`, three interleaved passes at
+`--benchmark_min_time=5s` (two at `0-7`). **Zero hangs in 32 runs.** Medians:
+
+| arm | sites (rocket / cpu) | `4,5` | `4-7` | `0-7` |
+|---|---|---:|---:|---:|
+| `int8.cpu` (`--no-offload`) | 0 / 64 | 132 ms | 132 ms | 156 ms |
+| `int8` offload | 50 / 95 | 482 ms | 282 ms | 240 ms |
+| **int8 deficit** | | **3.65x** | **2.14x** | **1.53x** |
+| `fp16.cpu` (`--no-offload`) | 0 / 55 | 91.9 ms | 91.4 ms | 82.0 ms |
+| `fp16` offload | 37 / 145 | 313 ms | 168 ms | 140-169 ms |
+| **fp16 deficit** | | **3.41x** | **1.84x** | **1.71x** |
+
+Three things fall out, none of which the old numbers could have shown.
+
+**The deficit is a property of the measurement as much as of the offload.**
+Same four binaries, same board, same minute: int8 is 3.65x slower or 1.53x
+slower depending only on which cores the process may use. Any single figure
+quoted without its allocation is arbitrary within a 2.4x band. The standing
+"3.7x" was the worst cell in this table.
+
+**The CPU baselines do not scale and the NPU arms do.** Going from two A76s to
+four moves `int8.cpu` 132 -> 132 ms and `fp16.cpu` 91.9 -> 91.4 ms -- nothing --
+while the offload arms move 482 -> 282 and 313 -> 168. The extra cores are not
+speeding up the model; they are absorbing the offload's own overhead. That is
+P8's "the cost parallelises" seen from the other side, and it is why
+`taskset -c 4,5` inflates the deficit: it starves the overhead, not the work.
+
+**The flat per-site tax holds across precisions, and its constant is set by
+the core allocation.** P8 established `132 + 7.4 x sites` within int8 alone.
+Dividing (offload - baseline) by offloaded sites here:
+
+| allocation | int8 (50 sites) | fp16 (37 sites) |
+|---|---:|---:|
+| `4,5` | 7.00 ms | 5.98 ms |
+| `4-7` | 3.00 ms | 2.07 ms |
+| `0-7` | 1.67 ms | 1.57 ms |
+
+The two precisions agree to within 15% at every allocation and to within 6% at
+`0-7`, so the tax is indifferent to precision as well as to shape. And the
+constant itself falls **4.4x** between the narrowest and widest allocation.
+P8's 7.4 ms is not a hardware or driver constant; it is the two-A76 value of
+one.
+
+**What is still true.** No configuration beats the like-for-like CPU build, at
+either precision, at any allocation -- the best cell in the table is still 1.5x
+slower. M4's conclusion is unchanged; only its magnitude was wrong, and it was
+wrong in the pessimistic direction by up to 2.4x.
+
+**Rule, restated.** Quote the allocation next to the number, run both arms at
+the same one, and prefer `0-7` or `4-7` -- `4,5` measures a starved machine.
+`~/bench/m4sweep.sh` on planck takes the whole table.
+
 ---
 
 ## P1 (S3) — one fd is one scheduler entity is one core
@@ -2542,8 +2603,10 @@ epilogue still carries a genuine `f16 -> f32` widen and was left alone.
    the bias on the BS plane and no CPU epilogue at all, which removes the
    `i32` tensor rather than fusing passes over it. What landed above is the
    cheap half of the same idea.
-2. **Re-take every offload number at a realistic core allocation.** M4's
-   action item stands, plus: do not use `taskset -c 4,5`.
+2. ~~**Re-take every offload number at a realistic core allocation.**~~ Done
+   2026-09-05; see M4's re-measurement table. It confirms this issue's law
+   across a second precision and shows the 7.4 ms constant is the `4,5` value
+   of one that falls to 1.6 ms at `0-7`.
 3. **P2 (the driver-level NC1HWC2 round trip) is still open** and is the one
    part of M4's lever 1 this did not test. Size it against `compact`'s 1.10 ms
    average out of ~10 ms per convolution before building it -- but note the
@@ -2610,12 +2673,14 @@ demotes them; M2 is the only platform item with an open case.
 
 1. ~~**C8**~~ — RESOLVED 2026-09-05, and not by runtime-PM: the cause was
    `brdma_data_use` left set on the int32-accumulator path. See C8.
-2. **M4** — the NCHW-baseline rule is established, and as of 2026-09-05 it is
-   enforced by a flag: `rocket-compiler --no-offload` builds the like-for-like
-   CPU arm and refuses to emit a spec that would offload anyway. What remains
-   is to re-take the numbers that were measured the old way. P8 adds a second
-   half to the same rule, which no flag can enforce: state the core
-   allocation, and do not measure at `taskset -c 4,5`.
+2. ~~**M4**~~ — DONE 2026-09-05. The rule is enforced by a flag
+   (`rocket-compiler --no-offload`, which refuses to emit a spec that would
+   offload anyway) and the numbers are re-taken for both precisions at three
+   core allocations. The headline changed: the offload deficit is **1.5x
+   (int8) / 1.7x (fp16)** on a full machine, not the 3.7x that was quoted --
+   that figure was the two-A76 cell of a table spanning 2.4x. Still no
+   configuration that beats CPU. P8's per-site tax is confirmed across
+   precisions and its constant pinned to the allocation.
 3. **P8** — read this before doing any of the below. It measures three things
    the list above assumed were the cost (compiler-level transposes, dispatch
    count, thread churn) and finds all three worth ~nothing, lands the epilogue
