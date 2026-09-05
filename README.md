@@ -19,6 +19,11 @@ for the Rocket NPU backend (RK3588). This repository produces:
 | `iree-build/iree-src` | `iree-org/iree` as a pinned git submodule. |
 | `iree-build` | CMake configuration used to build IREE with the Rocket driver/plugin. |
 
+Two documents sit alongside this one: [LIMITS.md](LIMITS.md) is what the stack
+is *measured* to do -- the channel, kernel, stride and precision bounds, and
+which of them each layer enforces -- and [ISSUES.md](ISSUES.md) is what is
+still open.
+
 ## Building
 
 Each of the three artifacts has its own build directory under `iree-build/`,
@@ -163,7 +168,8 @@ replicate its `--compile-to=flow` / `iree-opt
 ### Stride-2 dense convolution
 
 The stride-2 dense matchers are enabled, so MobileNetV2's stem convolution
-runs on the NPU (18 offloaded dispatch sites rather than 17). They were
+runs on the NPU: one more offloaded convolution, 35 rather than 34 on
+`mnv2.fp16.mlir`. They were
 disabled for a long time behind a compile failure that
 `rocket-pin-unclaimed-dispatches` now fixes; turning them on then exposed
 three genuine defects, all since fixed and covered by hardware regressions.

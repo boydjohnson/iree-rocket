@@ -19,6 +19,9 @@ by rockchip-npu-notes with its own HW evidence, not re-measured here;
 Severity: **S1** wrong results reach a user, **S2** wrong results reach a
 developer or a measurement, **S3** performance, **S4** hygiene.
 
+This file is what is still open. [LIMITS.md](LIMITS.md) is the complement:
+what the stack is measured to do, and which layer enforces each bound.
+
 Trimmed 2026-09-05: issues that are settled were cut down to one entry each
 in **Resolved** at the end, which keeps their IDs resolvable without keeping
 their narratives. Everything above that section is open. Evidence a resolved
