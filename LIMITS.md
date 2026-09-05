@@ -11,6 +11,9 @@ measurement, never ahead of one.
 Read this alongside [ISSUES.md](ISSUES.md), which carries the open defects.
 A limit here says "this was tested and works"; it does not say "everything
 inside it is safe" -- see [Hazards inside the limits](#hazards-inside-the-limits).
+A limit here also does not say the op is reachable at all: which *operations*
+the compiler can claim, as opposed to which shapes of them, is
+[ROADMAP.md](ROADMAP.md).
 
 Nothing here is a performance statement. Throughput, the CPU baseline the
 offload has to beat, and where the time actually goes are ISSUES.md P7/P8 and

@@ -21,6 +21,10 @@ developer or a measurement, **S3** performance, **S4** hygiene.
 
 This file is what is still open. [LIMITS.md](LIMITS.md) is the complement:
 what the stack is measured to do, and which layer enforces each bound.
+[ROADMAP.md](ROADMAP.md) is the third: which MLIR operations the hardware could
+run but no compiled model can reach yet. Two of its phases are gated on issues
+here by name -- C5 blocks the LUT path in a compiled model, and P8's measured
+per-dispatch cost is why its coverage matchers land behind a flag.
 
 Trimmed 2026-09-05: issues that are settled were cut down to one entry each
 in **Resolved** at the end, which keeps their IDs resolvable without keeping

@@ -19,10 +19,11 @@ for the Rocket NPU backend (RK3588). This repository produces:
 | `iree-build/iree-src` | `iree-org/iree` as a pinned git submodule. |
 | `iree-build` | CMake configuration used to build IREE with the Rocket driver/plugin. |
 
-Two documents sit alongside this one: [LIMITS.md](LIMITS.md) is what the stack
-is *measured* to do -- the channel, kernel, stride and precision bounds, and
-which of them each layer enforces -- and [ISSUES.md](ISSUES.md) is what is
-still open.
+Three documents sit alongside this one: [LIMITS.md](LIMITS.md) is what the
+stack is *measured* to do -- the channel, kernel, stride and precision bounds,
+and which of them each layer enforces -- [ISSUES.md](ISSUES.md) is what is
+still open, and [ROADMAP.md](ROADMAP.md) is which MLIR operations the hardware
+could run but the compiler cannot yet reach.
 
 ## Building
 
