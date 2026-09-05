@@ -158,12 +158,15 @@ util.func public @max_dilated_rejected(
   util.return %result : tensor<1x8x8x64xf32>
 }
 
-// Min pooling has no matcher: `PoolingMethod::pad_fill_value` has no measured
-// identity for min at any precision. An unpadded min pool would in fact be
-// runnable, but nothing claims it yet -- ROADMAP.md Phase 0.
-// CHECK-LABEL: util.func public @min_pool_falls_back
-// CHECK: linalg.pooling_nhwc_min
-util.func public @min_pool_falls_back(
+// Min pooling is a different reduction, and these matchers must not claim it:
+// their executables bake method = "max", which would return the wrong end of
+// every window. Since @match_pooling_nhwc_min landed, a min pool is claimed --
+// but by its own executable, and asserting *which* is the point.
+// rocket_pooling_min_match_boundaries.mlir carries min's own bounds.
+// CHECK-LABEL: util.func public @min_pool_uses_the_min_executable
+// CHECK-NOT: @rocket_pooling_max_executable
+// CHECK: flow.dispatch @rocket_pooling_min_executable
+util.func public @min_pool_uses_the_min_executable(
     %input: tensor<1x8x8x64xf32>,
     %init: tensor<1x4x4x64xf32>) -> tensor<1x4x4x64xf32> {
   %window = tensor.empty() : tensor<2x2xf32>

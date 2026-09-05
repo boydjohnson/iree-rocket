@@ -86,9 +86,9 @@ with the per-precision pad-fill identities already worked out
 (`pad_fill_value`: max/fp16 is `0xFC00`, min and int8-max take the
 "no fill" path). The compiler simply never asked for them.
 
-**Max was closed on 2026-09-05** -- four matchers and four shims, no change
-below the compiler, which is the evidence that this diagnosis was right.
-**Min remains open**, and is now the cheapest uncovered op in the repo.
+**Both were closed on 2026-09-05** -- six matchers and six shims, no change
+below the compiler at all, which is the evidence that this diagnosis was
+right. All three PPU reductions are now reachable from a compiled model.
 
 ---
 
@@ -186,9 +186,13 @@ blocked solely by a missing matcher.
    six compiled max cases are **bit-exact** against the CPU (max|error| 0),
    both layouts, both strides, the 8x8 kernel ceiling, a width that forces
    `PoolingPlan` to tile, and two pools sharing a command buffer.
-   **Min pooling is still open** and is the cheaper half of what remains:
-   `pad_fill_value` has no measured identity for min at any precision, so it
-   is unpadded-only -- which every matched executable already is.
+   ~~**Min pooling.**~~ **Landed 2026-09-05** too, and board-validated the
+   same way: two matchers (NHWC only -- linalg has no `pooling_nchw_min`),
+   two executables, two shims, all three compiled cases bit-exact plus a
+   min-then-max command buffer. `pad_fill_value` has no measured identity for
+   min at any precision, which makes it unpadded-only -- and every matched
+   executable already is, with `padded` derived from the executable's own
+   baked fields so tiling cannot reintroduce it.
 2. **NHWC average pool** -- the `linalg.pooling_nhwc_sum` counterpart of the
    NCHW form already matched.
 3. **`linalg.matvec` / `vecmat` / `dot`** → `MatmulDef` at `M = 1` or `N = 1`.

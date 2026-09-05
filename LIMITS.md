@@ -183,7 +183,8 @@ caveats; it is one input and one core allocation.
 | Kernel or stride, register range | 1..=16 |
 | Padding | 0..=7, the PPU's 3-bit range. Every matched executable bakes 0: model-level padding arrives as a separate `tensor.pad` the CPU runs |
 | Stride, matched from a model | avg 1; max 1 and 2 -- the executable bakes it, one per value. Stride 2 is measured against the oracle in `pooling_oracle_hw.rs`; nothing above 2 is |
-| Method, matched from a model | avg and max. **Min has no matcher**: `PoolingMethod::pad_fill_value` has no measured identity for min at any precision, and none for max at int8. An *unpadded* pool never reads that field, so min is runnable and simply unclaimed -- ROADMAP.md Phase 0 |
+| Method, matched from a model | avg, max and min -- all three the PPU has. `PoolingMethod::pad_fill_value` has no measured identity for min at any precision, and none for max at int8, but an *unpadded* pool never reads that field and every matched executable bakes zero padding. The driver derives `padded` from those baked fields alone, so tiling cannot reintroduce it |
+| Layouts, matched from a model | avg NCHW; max NHWC and NCHW; **min NHWC only** -- linalg defines `pooling_nchw_max` but no `pooling_nchw_min`, so there is no NCHW min op to claim. `pooling_*_unsigned` is unclaimed at every method: it is the unsigned-integer reduction and this path is f32 in, fp16 on the hardware |
 
 Pooling has a second, narrower limit: **direct tile width**, which is a hang
 rather than wrong data past the boundary. Measured on `planck` 2026-09-04 with
@@ -240,6 +241,7 @@ CPU today. Everything else falls back silently and correctly.
 | avg pool | NCHW sum | f32 | 2x2..=8x8 | 1 | H/W/C 1..=8192 | -- |
 | max pool | NHWC | f32 | 2x2..=8x8 | 1, 2 | H/W/C 1..=8192 | -- |
 | max pool | NCHW | f32 | 2x2..=8x8 | 1, 2 | H/W/C 1..=8192 | -- |
+| min pool | NHWC | f32 | 2x2..=8x8 | 1, 2 | H/W/C 1..=8192 | -- |
 
 All of these additionally require batch 1 and dilation 1.
 
@@ -251,17 +253,21 @@ Every accepted bound in that table has an immediately-adjacent rejected shape
 asserted in a lit test -- `rocket_int8_match_boundaries.mlir`,
 `rocket_fp16_match_boundaries.mlir`, `rocket_matmul_match_boundaries.mlir`,
 `rocket_pooling_match_boundaries.mlir`,
-`rocket_pooling_max_match_boundaries.mlir` -- so widening a matcher cannot silently
+`rocket_pooling_max_match_boundaries.mlir`,
+`rocket_pooling_min_match_boundaries.mlir` -- so widening a matcher cannot silently
 route a known-bad shape to the NPU, and tightening one cannot silently lose the
 largest measured-good shape.
 
 The pooling rows additionally have an end-to-end differential behind them:
-`tools/e2e_pooling_regression.py` compiles both methods twice and compares on
-the board. Max is compared **exactly** and measured exact on `planck`
-2026-09-05 (max|error| 0 across both layouts, both strides, the 8x8 ceiling
-and a tiled width); the average carries genuine f16 error, 0.0057 worst case
-at 49 taps, because the PPU's average is a multiply by `fp16(65536/k)` that
-the shim multiplies back out.
+`tools/e2e_pooling_regression.py` compiles all three methods twice and
+compares on the board -- fourteen cases, all passing on `planck` 2026-09-05.
+Max and min are compared **exactly** and measure exact (max|error| 0 across
+both layouts where they exist, both strides, the 8x8 ceiling, a tiled width,
+and pools sharing a command buffer including a min-then-max transition),
+because a max or min pool returns one of its inputs unchanged and the
+fixtures are f16-exact. The average carries genuine f16 error, 0.0057 worst
+case at 49 taps, because the PPU's average is a multiply by `fp16(65536/k)`
+that the shim multiplies back out.
 
 What that adds up to on a real model, from `rocket-compiler audit` (2026-09-05):
 

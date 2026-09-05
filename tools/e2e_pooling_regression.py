@@ -44,11 +44,16 @@ hardware's f16 accumulation order is not numpy's. The 2x2 agrees closely
 accumulation where the model drifts, which is exactly where a tightened
 tolerance would start failing for no reason.
 
-**Min pooling appears only in the raw gate.** It has no compiler matcher:
-`PoolingMethod::pad_fill_value` has no measured identity for min at any
-precision. An unpadded min pool is perfectly runnable, and every matched
-pooling executable *is* unpadded, so this is a gap in coverage rather than in
-the hardware -- see ROADMAP.md Phase 0.
+**Min pooling is compared exactly too**, by the same argument as max -- a min
+pool also returns one of its inputs unchanged. It is NHWC-only because linalg
+defines `pooling_nchw_max` but no `pooling_nchw_min`, so the layout has no op
+for a matcher to claim.
+
+`min_pool_wide` earns its place: min is the method with *no* measured
+pad-fill identity at any precision, so `required_pad_fill` refuses a padded
+min outright. The executables bake zero padding and the driver derives
+`padded` from those fields alone, which means tiling cannot reintroduce it --
+and that case is what says so on hardware rather than on inspection.
 
 Unlike the convolution harness, the window operand is a `tensor.empty()`
 inside each function rather than a fixture: a pool's second operand carries no
@@ -201,6 +206,43 @@ func.func @max_pool_wide(%input: tensor<1x64x64x32xf32>, %init: tensor<1x32x32x3
   return %0 : tensor<1x32x32x32xf32>
 }
 
+// Min pool, NHWC, both strides. There is no NCHW pair: linalg defines
+// pooling_nchw_max but no pooling_nchw_min, so the layout simply has no op.
+//
+// Exact for the same reason max is -- a min pool also returns one of its
+// inputs unchanged -- so the f16-exact fixtures make the whole path lossless.
+func.func @min_pool_nhwc_s2(%input: tensor<1x14x14x64xf32>, %init: tensor<1x7x7x64xf32>) -> tensor<1x7x7x64xf32> {
+  %window = tensor.empty() : tensor<2x2xf32>
+  %0 = linalg.pooling_nhwc_min
+      {dilations = dense<1> : tensor<2xi64>, strides = dense<2> : tensor<2xi64>}
+      ins(%input, %window : tensor<1x14x14x64xf32>, tensor<2x2xf32>)
+      outs(%init : tensor<1x7x7x64xf32>) -> tensor<1x7x7x64xf32>
+  return %0 : tensor<1x7x7x64xf32>
+}
+
+func.func @min_pool_nhwc_s1(%input: tensor<1x8x8x64xf32>, %init: tensor<1x7x7x64xf32>) -> tensor<1x7x7x64xf32> {
+  %window = tensor.empty() : tensor<2x2xf32>
+  %0 = linalg.pooling_nhwc_min
+      {dilations = dense<1> : tensor<2xi64>, strides = dense<1> : tensor<2xi64>}
+      ins(%input, %window : tensor<1x8x8x64xf32>, tensor<2x2xf32>)
+      outs(%init : tensor<1x7x7x64xf32>) -> tensor<1x7x7x64xf32>
+  return %0 : tensor<1x7x7x64xf32>
+}
+
+// A min pool wide enough to force PoolingPlan to tile. This matters more for
+// min than for max: min is the method with no measured pad-fill identity at
+// any precision, so if tiling ever introduced padding of its own the driver
+// would have to refuse it. It does not -- `padded` is derived from the
+// executable's own baked pad fields -- and this is the case that says so.
+func.func @min_pool_wide(%input: tensor<1x64x64x32xf32>, %init: tensor<1x32x32x32xf32>) -> tensor<1x32x32x32xf32> {
+  %window = tensor.empty() : tensor<2x2xf32>
+  %0 = linalg.pooling_nhwc_min
+      {dilations = dense<1> : tensor<2xi64>, strides = dense<2> : tensor<2xi64>}
+      ins(%input, %window : tensor<1x64x64x32xf32>, tensor<2x2xf32>)
+      outs(%init : tensor<1x32x32x32xf32>) -> tensor<1x32x32x32xf32>
+  return %0 : tensor<1x32x32x32xf32>
+}
+
 // The two functions below put *two* Rocket dispatches in one function, so they
 // share a command buffer -- what a real model does, and what no single-pool
 // case here covers. The pools are independent (no data flows between them),
@@ -239,6 +281,24 @@ func.func @mixed_avg_then_max(%a: tensor<1x64x16x16xf32>, %ai: tensor<1x64x15x15
       ins(%b, %wb : tensor<1x14x14x64xf32>, tensor<2x2xf32>)
       outs(%bi : tensor<1x7x7x64xf32>) -> tensor<1x7x7x64xf32>
   return %0, %1 : tensor<1x64x15x15xf32>, tensor<1x7x7x64xf32>
+}
+
+// Min and max in one command buffer -- the two reductions that sit at
+// opposite ends of the same window, and the pair most likely to expose a PPU
+// register left set across the transition. Both halves are exact, so this
+// case cannot be explained away by tolerance.
+func.func @mixed_min_then_max(%a: tensor<1x14x14x64xf32>, %ai: tensor<1x7x7x64xf32>, %b: tensor<1x8x8x64xf32>, %bi: tensor<1x7x7x64xf32>) -> (tensor<1x7x7x64xf32>, tensor<1x7x7x64xf32>) {
+  %wa = tensor.empty() : tensor<2x2xf32>
+  %wb = tensor.empty() : tensor<2x2xf32>
+  %0 = linalg.pooling_nhwc_min
+      {dilations = dense<1> : tensor<2xi64>, strides = dense<2> : tensor<2xi64>}
+      ins(%a, %wa : tensor<1x14x14x64xf32>, tensor<2x2xf32>)
+      outs(%ai : tensor<1x7x7x64xf32>) -> tensor<1x7x7x64xf32>
+  %1 = linalg.pooling_nhwc_max
+      {dilations = dense<1> : tensor<2xi64>, strides = dense<1> : tensor<2xi64>}
+      ins(%b, %wb : tensor<1x8x8x64xf32>, tensor<2x2xf32>)
+      outs(%bi : tensor<1x7x7x64xf32>) -> tensor<1x7x7x64xf32>
+  return %0, %1 : tensor<1x7x7x64xf32>, tensor<1x7x7x64xf32>
 }
 """
 
@@ -353,6 +413,9 @@ def f16_exact(rng: np.random.Generator, *shape: int) -> np.ndarray:
 # destination buffer.
 MAX_POOL_INIT = -1.0e30
 
+# The identity for a min reduction, by the same argument.
+MIN_POOL_INIT = 1.0e30
+
 
 def write_compiled_fixture(work_dir: Path) -> None:
     (work_dir / "pooling.mlir").write_text(POOLING_MLIR)
@@ -399,6 +462,24 @@ def write_compiled_fixture(work_dir: Path) -> None:
     np.save(work_dir / "max_wide_input.npy", f16_exact(rng, 1, 64, 64, 32))
     np.save(work_dir / "max_wide_init.npy", max_init(1, 32, 32, 32))
 
+    # Min fixtures. f16-exact for the same reason the max ones are: a min pool
+    # also returns one of its inputs unchanged, so the whole path is lossless
+    # and the comparison can be exact.
+    def min_init(*shape: int) -> np.ndarray:
+        return np.full(shape, MIN_POOL_INIT, dtype=np.float32)
+
+    np.save(work_dir / "min_nhwc_s2_input.npy", f16_exact(rng, 1, 14, 14, 64))
+    np.save(work_dir / "min_nhwc_s2_init.npy", min_init(1, 7, 7, 64))
+
+    np.save(work_dir / "min_nhwc_s1_input.npy", f16_exact(rng, 1, 8, 8, 64))
+    np.save(work_dir / "min_nhwc_s1_init.npy", min_init(1, 7, 7, 64))
+
+    np.save(work_dir / "min_wide_input.npy", f16_exact(rng, 1, 64, 64, 32))
+    np.save(work_dir / "min_wide_init.npy", min_init(1, 32, 32, 32))
+
+    np.save(work_dir / "mixed_min_a.npy", f16_exact(rng, 1, 14, 14, 64))
+    np.save(work_dir / "mixed_min_ai.npy", min_init(1, 7, 7, 64))
+
     # Shared operands for the two-dispatch cases.
     np.save(work_dir / "mixed_max_a.npy", f16_exact(rng, 1, 14, 14, 64))
     np.save(work_dir / "mixed_max_ai.npy", max_init(1, 7, 7, 64))
@@ -436,8 +517,12 @@ EXPECTED_EXECUTABLE = {
     "max_pool_nchw_s1": "rocket_pooling_max_executable",
     "max_pool_kernel_8x8": "rocket_pooling_max_executable",
     "max_pool_wide": "rocket_pooling_max_executable_s2",
+    "min_pool_nhwc_s2": "rocket_pooling_min_executable_s2",
+    "min_pool_nhwc_s1": "rocket_pooling_min_executable",
+    "min_pool_wide": "rocket_pooling_min_executable_s2",
     "mixed_max_then_max": "rocket_pooling_max_executable",
     "mixed_avg_then_max": "rocket_pooling_executable",
+    "mixed_min_then_max": "rocket_pooling_min_executable_s2",
 }
 
 
@@ -766,6 +851,27 @@ def build_cases(atol: float, rtol: float) -> list[Case]:
             0.0,
             0.0,
         ),
+        Case(
+            "min_pool_nhwc_s2",
+            ("min_nhwc_s2_input.npy", "min_nhwc_s2_init.npy"),
+            ("min_pool_nhwc_s2_out.npy",),
+            0.0,
+            0.0,
+        ),
+        Case(
+            "min_pool_nhwc_s1",
+            ("min_nhwc_s1_input.npy", "min_nhwc_s1_init.npy"),
+            ("min_pool_nhwc_s1_out.npy",),
+            0.0,
+            0.0,
+        ),
+        Case(
+            "min_pool_wide",
+            ("min_wide_input.npy", "min_wide_init.npy"),
+            ("min_pool_wide_out.npy",),
+            0.0,
+            0.0,
+        ),
         # Two Rocket dispatches sharing a command buffer.
         Case(
             "mixed_max_then_max",
@@ -782,6 +888,13 @@ def build_cases(atol: float, rtol: float) -> list[Case]:
             ("mixed_avg_then_max_0.npy", "mixed_avg_then_max_1.npy"),
             (atol, 0.0),
             (rtol, 0.0),
+        ),
+        Case(
+            "mixed_min_then_max",
+            ("mixed_min_a.npy", "mixed_min_ai.npy", "mixed_max_b.npy", "mixed_max_bi.npy"),
+            ("mixed_min_then_max_0.npy", "mixed_min_then_max_1.npy"),
+            0.0,
+            0.0,
         ),
     ]
 
