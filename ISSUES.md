@@ -1641,6 +1641,12 @@ So the lever is layout propagation between chained NPU dispatches, not clock,
 not IRQ affinity, and not more offload sites -- more sites at this cost make it
 worse, which is what the 17-site build against 0-site's 3.7x is already saying.
 
+**Corrected 2026-09-05 (P8).** "More sites make it worse" holds and is now
+quantified: a flat 7.4 ms per offloaded convolution, whichever convolution it
+is. "The lever is layout propagation" does not: it was built and measures 0%.
+The 3.7x is also configuration-dependent — it is 2.0x when the process is not
+confined to two CPUs.
+
 ### What the 64% `outside` actually is: fusion the offload destroys
 
 `outside` is IREE's own dispatches, and the question it raises is whether the
@@ -1681,12 +1687,18 @@ dispatch and another pack/compact round trip, and at the measured 17.7 ms of
 compaction against a 7 ms convolution an elementwise op would be almost pure
 overhead.
 
-**The ranked lever list this supports:**
+**The ranked lever list this supports** — item 1 was built and measured on
+2026-09-05 and is **refuted**; see P8, which replaces this list:
 
-1. **Layout propagation between chained dispatches.** Removes the 172
+1. ~~**Layout propagation between chained dispatches.** Removes the 172
    transposes and the 39 memcpys at their source *and* the driver's 820 ms of
    compaction. This is the whole game; see
-   `rocket-layout-repack-per-dispatch`.
+   `rocket-layout-repack-per-dispatch`.~~ The mechanism works — the transposes
+   really do disappear — and it is worth **0%**. Cutting 120 of 265 dispatch
+   sites is worth 4%. The cost is a flat 7.4 ms per *offloaded convolution*
+   that scales with available CPUs, not with dispatches (P8). Only the
+   compiler-level half of this item was tested; the driver-level NC1HWC2 round
+   trip (P2) is still open, and the profile bounds it at ~10%.
 2. **Epilogue fusion into the Rocket dispatch.** The requantized int8 path
    already does this for requantization -- that is why it returns i8 with no
    CPU epilogue -- and `build_conv_then_add_regcmd` is the same idea for a
@@ -2300,6 +2312,215 @@ weight packing and the HAL are all already there and all already correct.
 
 ---
 
+## P8 (S2) — the offload's cost is a flat per-dispatch tax that *parallelises*; the dispatches the offload adds are not it, and `taskset -c 4,5` doubles the deficit it reports
+
+Measured on `planck` 2026-09-05 [verified], one MobileNetV2 int8 model
+(`mnv2.int8.mlir`) through the rocket-compiler pipeline, governor
+`performance`, NPU IRQs on cpu6, the post-C8 board binary, and every arm gated
+on all three NPU cores reading `suspended` before it starts. This was started
+as M4's lever 1 ("layout propagation ... this is the whole game") and it
+refutes it.
+
+### The law: cost is linear in offloaded convolutions and flat per convolution
+
+Same model, same pipeline, only the matcher list changed, app on cpu4-5:
+
+| arm | NPU sites | ms/inference | over CPU-only | per NPU site |
+|---|---:|---:|---:|---:|
+| `int8.cpu` (M4's like-for-like build) | 0 | 132 | — | — |
+| `int8.dwonly` (depthwise matchers only) | 13 | 211 | 79 | **6.1 ms** |
+| `int8.denseonly` (dense int8 matchers only) | 34 | 398 | 266 | **7.8 ms** |
+| `int8.base` (everything) | 50 | 500 | 368 | **7.4 ms** |
+
+`132 + 7.4 x sites` fits all four. The tax does not care *which* convolution:
+a 7x7x1344 depthwise costs what a 112x112x144 1x1 dense costs. It also matches
+`ROCKET_PROFILE`'s own `outside` figure exactly -- 7.46 ms averaged over 549
+dispatches.
+
+### Three things that should have removed it, and did not
+
+Each is a real, working mechanism, verified in the IR; each is worth close to
+nothing on the clock.
+
+| change | dispatch sites | ms/inference (cpu4-5) |
+|---|---:|---:|
+| `int8.base` | 265 | 501–514 |
+| + transpose propagation before the matcher loop | 263 | 498–501 |
+| + `inline` on the `@call_rocket_*` wrappers | 249 | 478–495 |
+| + int8 epilogue as `linalg.generic`, fused | **145** | 479–487 |
+| epilogue **deleted outright** (wrong results, an upper bound) | 171 | 467–483 |
+
+**Scope, stated precisely.** M4's lever 1 bundles two different mechanisms
+under one name: the *compiler*-level NCHW/NHWC transposes stranded around each
+opaque Rocket call (its "172 transposes and 39 memcpys"), and the *driver*-level
+NC1HWC2 round trip between chained NPU dispatches (its "820 ms of compaction",
+which is P2's cube aliasing). **Only the first is tested here.** The second is
+untouched and still open — but the profile now bounds it: `compact` is 1.03 ms
+of the ~10 ms an offloaded convolution costs, so P2 cannot be more than about a
+tenth of the deficit even if it removes the round trip entirely.
+
+1. **The transposes are free.** `iree-global-opt-propagate-linalg-transpose`,
+   run inside the transform spec *before* the matcher loop claims the convs,
+   really does make the whole activation chain NHWC:
+   `broadcast -> transpose -> conv -> transpose -> requant(NCHW)` becomes
+   `conv -> requant(NHWC)`, and `elementwise_transpose_144x12544_i32xi32xi8`
+   becomes `elementwise_12544x144_i32xi32xi8`. M4 counted 172 of those. Removing
+   them is worth **0%**, because a transpose fused into an elementwise op that
+   has to run anyway moves the same bytes in a different order. (It also costs
+   the classifier matmul its offload: propagation folds the constant RHS
+   transpose into the matmul's indexing maps, giving the N-K form that
+   `@match_rocket_matmul` correctly declines. So it is not landed.)
+2. **The dispatch count is not the cost.** Cutting 120 of 265 sites buys 4%.
+3. **Neither is the epilogue.** Deleting the `%raw + %init` add and the
+   full-size `linalg.broadcast` that feeds it -- the ceiling on any fusion or
+   hardware-bias fix for it -- buys 7%.
+
+So "17 offloaded convolutions cost +112 net dispatches, and that is what the
+5079 ms of `outside` is" (M4) is **wrong** — `outside` contains no driver
+compaction at all, and the dispatches it does contain are not what costs. The dispatch count and the cost
+happen to correlate because both scale with the number of offloaded
+convolutions; ablating one without the other separates them.
+
+### What does move it: CPU slots
+
+| | cpu4,5 | cpu4-7 | cpu0-7 |
+|---|---:|---:|---:|
+| `int8.base` | 501 / 509 ms | 321 / 318 ms | 262 / 265 ms |
+| `int8.cpu` | 130–132 ms | 130–131 ms | — |
+
+**The CPU-only arm does not care how many cores it gets and the offloaded arm
+nearly halves.** `ROCKET_PROFILE` says where: per NPU dispatch, `outside` goes
+7.46 -> 3.36 -> 2.83 ms across the three, while every phase the driver owns is
+flat (`compact` 1.03 / 1.06 / 0.88, `record` 0.72 / 0.81 / 0.48, `wait.npu`
+0.71 / 0.75 / 0.55). None of the win is in this driver.
+
+The reading that fits: the CPU-only build is a serial chain of large fused
+kernels with few workgroups each, so it is latency-bound and two A76s are
+already enough; the offloaded build's extra work is unfused per-element passes
+over `i32` tensors, which is embarrassingly parallel and starves on two cores.
+The offload is losing to *unfused epilogue work*, not to dispatch overhead --
+and every offload number this repo has ever quoted was taken at `taskset -c
+4,5`, which is the configuration that punishes it most. **The deficit is 3.9x
+at two cores and 2.0x at eight.** Quote both, or quote the core count.
+
+### 284 threads per inference, and pooling them is a wash
+
+`strace -f -c` over one inference counts **284 `clone3`** against 50 NPU
+dispatches: `device::run_after_wait` does a `std::thread::spawn` for every
+`queue_*` operation whose wait is not already satisfied, and `queue_alloca` /
+`queue_dealloca` / barriers vastly outnumber `queue_execute`. Each carries a
+stack `mmap`, an `mprotect`, `set_robust_list`/`rseq`, and a `munmap`.
+
+Replacing the spawn with a condvar worker pool (same blocking semantics -- a
+new worker whenever every existing one is busy, so nothing serializes) cut it
+to **282 threads for a whole 11-inference run** instead of ~3200, and measured
+**-3% at cpu4-5 and +3% at cpu4-7**, consistently, three passes each. Not
+landed. The likely reason it does not help is that a freshly spawned thread
+starts runnable on the waker's own CPU while a parked one has to be woken and
+possibly migrated; the creation cost it saves was never the problem. Recorded
+so the idea does not get re-derived.
+
+### What landed
+
+The int8 epilogue is a plain `linalg.generic` instead of a hand-written
+`flow.dispatch.workgroups`, and `@__transform_main` runs `inline` on the
+`@call_rocket_*` wrappers. Both halves are needed: a pre-formed dispatch is
+opaque to dispatch-region formation, and a `linalg.generic` left inside a
+never-inlined `util.func` just becomes its own dispatch (P6 item 2's trap).
+Together IREE fuses the epilogue with the zero-point correction and
+requantization that follow it, const-eval hoists the depthwise HWC->CHW filter
+transpose that had been running as 13 CPU dispatches per inference over
+constant weights, and MobileNetV2 int8 goes **265 -> 145 dispatch sites**.
+
+Measured 2026-09-05 with each arm run **first** in half the passes, because
+the original A/B always ran `landed` second and this board drifts within a
+sequence. Six runs of each arm at each core count, medians:
+
+```text
+                    cpu4-5                          cpu4-7
+  int8.base     498 506 509 506 506 507  -> 506   318 316 315 319 318 313  -> 317
+  int8.landed   446 488 480 475 500 476  -> 478   285 291 292 286 281 288  -> 287
+                        -5.5%                            -9.5%
+```
+
+The sign is the same in both orders (base-first: 506 vs 480 and 317 vs 289;
+landed-first: 506 vs 476 and 317 vs 285), and at cpu4-7 the two distributions
+do not overlap at all. `int8.base` is the tighter of the two, 313-319 ms across
+six runs.
+
+**Where the difference is, per NPU dispatch, at cpu4-7:**
+
+```text
+  phase          int8.base   int8.landed
+  outside          3.512        2.970      <- all of it
+  execute          2.802        2.775
+    record         0.871        0.842
+    compact        1.101        1.117
+    wait.npu       0.745        0.736
+    pack.input     0.214        0.215
+    quiesce        1.062        1.061
+```
+
+Exactly as the change predicts: it removes CPU dispatches and touches nothing
+the driver does, so the gain is entirely in `outside` and every driver phase is
+flat. The weight cache is the independent confirmation that the inlining
+worked -- **478 misses over 34 inferences becomes 49 over 35**, one per binding
+on the first inference only. Those 429 recurring misses were the depthwise
+filter transposes: each inference produced a fresh transient buffer for the
+transposed filter, so the packed-coefficient cache could never hit it.
+
+**The per-op table is unchanged**, as it should be: it only covers phases the
+driver owns, and this change touches none of them. It does refine P2's bound,
+though, because compaction is *concentrated* rather than spread. Worst op,
+`int8.base` at cpu4-7, 35 calls:
+
+```text
+  conv int8acc 112x112x24->144 k1x1 s1   31.5 ms/call   npu 6.9   compact 18.1
+```
+
+18.1 ms of compaction on one op against a 1.10 ms average over all 1700
+dispatches -- this single convolution is a third of the model's entire
+`compact` total. So "P2 caps at ~10%" is right for the model and wrong for the
+op: a cube-aliasing fix would be worth little on the 7x7 tail and most of
+`112x112x24->144`. Pick the shapes before building it. (These figures are
+within noise of the ones M4 recorded at cpu4-5 -- 32 ms/call, 7 ms NPU, 17.7 ms
+compaction -- which is itself the point: nothing about this phase moved.)
+
+**Instrument warning.** `ROCKET_PROFILE=1` is not safe for an A/B at cpu4-5. It
+makes `int8.base` *faster* (478 ms median profiled against 506 unprofiled) and
+erases the whole difference (base 476/478/480 against landed 479/480/485,
+three interleaved passes). That is consistent with the rest of this issue --
+two CPUs is a scheduling-starved configuration, so an instrument that adds a
+mutex and a yield per phase changes the thing it is measuring. At cpu4-7 the
+profile and the un-profiled A/B agree. Use `ROCKET_PROFILE` for composition,
+and a plain interleaved run for totals.
+
+Logits are **bit-identical** to the pre-change build (all 1001, max|diff| 0.0)
+— the change is purely structural. fp16 is unaffected in placement (37
+NPU sites either way, 148 -> 145 CPU sites from the inline alone); its own
+epilogue still carries a genuine `f16 -> f32` widen and was left alone.
+
+### The ranked levers this leaves
+
+1. **Stop materializing `i32` activations and stop leaving their epilogues
+   unfused.** This is the whole 7.4 ms. The structural version is the
+   requantized int8 path (`requantized-int8-conv-path`): it returns `i8` with
+   the bias on the BS plane and no CPU epilogue at all, which removes the
+   `i32` tensor rather than fusing passes over it. What landed above is the
+   cheap half of the same idea.
+2. **Re-take every offload number at a realistic core allocation.** M4's
+   action item stands, plus: do not use `taskset -c 4,5`.
+3. **P2 (the driver-level NC1HWC2 round trip) is still open** and is the one
+   part of M4's lever 1 this did not test. Size it against `compact`'s 1.10 ms
+   average out of ~10 ms per convolution before building it -- but note the
+   cost is concentrated, not spread: one convolution
+   (`112x112x24->144 k1x1`) carries 18.1 ms of compaction per call and a third
+   of the model's total, so the lever is shape-selective.
+4. Compiler-level transposes, dispatch counts, and thread churn are all
+   measured and all worth ~nothing. Do not spend on them again.
+
+---
+
 ## D1 (S4) — the FC lowering here and in the notes use opposite geometries, and this one may be better
 
 `iree-rocket-hal/src/rocket/fc.rs` maps, from a sweep of 160 RKNN-compiled ONNX
@@ -2349,24 +2570,24 @@ so they must disagree somewhere.
 
 ## Suggested order
 
-Revised 2026-09-04. C1 and C3 are landed and verified in the tree. M1 and M3
-were applied on the board and turned out **not** to bind (see M4), which
-demotes them; M2 is the only platform item with an open case. The re-audit they
-were meant to enable found two larger things, and both are now at the top.
+Revised 2026-09-05. C1, C3 and C8 are landed and verified in the tree. M1 and
+M3 were applied on the board and turned out **not** to bind (see M4), which
+demotes them; M2 is the only platform item with an open case.
 
-1. **C8** — mechanism found and board-confirmed 2026-09-04: the
-   int8-accumulator job leaves NPU-internal state that only a runtime-PM
-   power-domain cycle clears (the notes' RK3576 "wide-output poisoning"). A
-   dwell at the `Int8Accumulator -> fp16` boundary makes every repro and the
-   full int8 benchmark loop clean, bit-identical. What remains is turning the
-   diagnostic dwell into a fix that costs less than an autosuspend period
-   (see the C8 options list), then re-taking the int8 numbers. The HAL-level
-   test then showed the state is per core and that the requantized int8-out
-   path never creates it, which makes that path the structural fix.
-2. **M4** — already established; what remains is to stop using the NCHW
-   baseline. Cheap, and it is the precondition for any offload decision being
-   meaningful.
-3. **P6 → P3 → C4 → P4 → P1** — the dispatch-path cost stack, roughly in
+1. ~~**C8**~~ — RESOLVED 2026-09-05, and not by runtime-PM: the cause was
+   `brdma_data_use` left set on the int32-accumulator path. See C8.
+2. **M4** — the NCHW-baseline rule is established and applied; what remains is
+   to stop using the NCHW baseline everywhere else. Cheap, and it is the
+   precondition for any offload decision being meaningful. P8 adds a second
+   half to the same rule: state the core allocation, and do not measure at
+   `taskset -c 4,5`.
+3. **P8** — read this before doing any of the below. It measures three things
+   the list above assumed were the cost (compiler-level transposes, dispatch
+   count, thread churn) and finds all three worth ~nothing, lands the epilogue
+   fusion half of the fix, and points at the requantized int8 path as the
+   structural one. It does *not* test P2's driver-level round trip, and bounds
+   that at ~10%.
+4. **P6 → P3 → C4 → P4 → P1** — the dispatch-path cost stack, roughly in
    increasing order of work. This is where the offload deficit actually lives:
    a like-for-like CPU build is 2.5x faster than the best NPU configuration, so
    the per-dispatch and per-tile taxes are the whole game. P6 now measures that
@@ -2374,15 +2595,15 @@ were meant to enable found two larger things, and both are now at the top.
    and worth 1.47x end to end; with the classifier matmul's per-inference
    re-narrowing fixed too the model is 1.6x, and what it leaves behind is the
    NC1HWC2 round trip.
-4. **C2** — small fix, plus a probe that settles a question the notes leave open.
-5. **M2** — ~1.43x on the device half (P5 is closed on planck; the PPU
+5. **C2** — small fix, plus a probe that settles a question the notes leave open.
+6. **M2** — ~1.43x on the device half (P5 is closed on planck; the PPU
    unmask has been in the loaded module since July, see its resolution), but it needs a driver-side
    `clk_set_rate` and both shortcuts hang the box.
-6. **P2** — the big structural one; measure the regime first. P7 is the case
+7. **P2** — the big structural one; measure the regime first. P7 is the case
    that most needs it: MobileNetV2 fp16's depthwise convolutions are correct
    on the NPU and lose anyway, and their round trip is the largest single
    reason.
-7. **C5, C6, C7, D1, D2** — hygiene and reconciliation.
+8. **C5, C6, C7, D1, D2** — hygiene and reconciliation.
 
 ## Method note
 

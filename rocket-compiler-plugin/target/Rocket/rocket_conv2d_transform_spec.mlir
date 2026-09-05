@@ -2208,85 +2208,36 @@ module attributes {transform.with_named_sequence} {
            tensor<?xi32>{%output_channels})
         -> tensor<1x?x?x?xi32>{%output_height, %output_width, %output_channels}
 
-    %final = flow.dispatch.workgroups[
-        %output_height, %output_width, %output_channels](
-        %raw_i32, %init, %output_height, %output_width, %output_channels)
-        : (tensor<1x?x?x?xi32>{%output_height, %output_width, %output_channels},
-           tensor<1x?x?x?xi32>{%output_height, %output_width, %output_channels},
-           index, index, index)
-        -> tensor<1x?x?x?xi32>{%output_height, %output_width, %output_channels}
-        attributes { stream.affinity = #hal.device.affinity<@cpu_device> } =
-        (%raw_binding: !iree_tensor_ext.dispatch.tensor<readonly:tensor<1x?x?x?xi32>>,
-         %init_binding: !iree_tensor_ext.dispatch.tensor<readonly:tensor<1x?x?x?xi32>>,
-         %output_height_arg: index,
-         %output_width_arg: index,
-         %output_channels_arg: index,
-         %final_binding: !iree_tensor_ext.dispatch.tensor<writeonly:tensor<1x?x?x?xi32>>) {
-      %output_height_size = iree_tensor_ext.dispatch.workload.ordinal
-          %output_height_arg, 0 : index
-      %output_width_size = iree_tensor_ext.dispatch.workload.ordinal
-          %output_width_arg, 1 : index
-      %output_channels_size = iree_tensor_ext.dispatch.workload.ordinal
-          %output_channels_arg, 2 : index
-      %raw_shaped = flow.dispatch.tie_shape %raw_binding
-          : !iree_tensor_ext.dispatch.tensor<readonly:tensor<1x?x?x?xi32>>{
-              %output_height_size, %output_width_size, %output_channels_size}
-      %init_shaped = flow.dispatch.tie_shape %init_binding
-          : !iree_tensor_ext.dispatch.tensor<readonly:tensor<1x?x?x?xi32>>{
-              %output_height_size, %output_width_size, %output_channels_size}
-      %final_shaped = flow.dispatch.tie_shape %final_binding
-          : !iree_tensor_ext.dispatch.tensor<writeonly:tensor<1x?x?x?xi32>>{
-              %output_height_size, %output_width_size, %output_channels_size}
-      %raw_loaded = iree_tensor_ext.dispatch.tensor.load %raw_shaped,
-          offsets = [0, 0, 0, 0],
-          sizes = [1, %output_height_size, %output_width_size, %output_channels_size],
-          strides = [1, 1, 1, 1]
-          : !iree_tensor_ext.dispatch.tensor<readonly:tensor<1x?x?x?xi32>>{
-              %output_height_size, %output_width_size, %output_channels_size}
-          -> tensor<1x?x?x?xi32>
-      %init_loaded = iree_tensor_ext.dispatch.tensor.load %init_shaped,
-          offsets = [0, 0, 0, 0],
-          sizes = [1, %output_height_size, %output_width_size, %output_channels_size],
-          strides = [1, 1, 1, 1]
-          : !iree_tensor_ext.dispatch.tensor<readonly:tensor<1x?x?x?xi32>>{
-              %output_height_size, %output_width_size, %output_channels_size}
-          -> tensor<1x?x?x?xi32>
-      %final_empty = tensor.empty(
-          %output_height_size, %output_width_size, %output_channels_size)
-          : tensor<1x?x?x?xi32>
-      %final_inner = linalg.generic {
-          indexing_maps = [
-            affine_map<(d0, d1, d2, d3) -> (d0, d1, d2, d3)>,
-            affine_map<(d0, d1, d2, d3) -> (d0, d1, d2, d3)>,
-            affine_map<(d0, d1, d2, d3) -> (d0, d1, d2, d3)>
-          ],
-          iterator_types = ["parallel", "parallel", "parallel", "parallel"]
-        } ins(%raw_loaded, %init_loaded
-            : tensor<1x?x?x?xi32>, tensor<1x?x?x?xi32>)
-          outs(%final_empty : tensor<1x?x?x?xi32>) {
-        ^bb0(%raw: i32, %initial: i32, %out: i32):
-          // No extend, unlike the fp16 epilogue: int8_accumulator mode
-          // already hands back a full i32 accumulator.
-          %sum = arith.addi %raw, %initial : i32
-          linalg.yield %sum : i32
-      } -> tensor<1x?x?x?xi32>
-      iree_tensor_ext.dispatch.tensor.store %final_inner, %final_shaped,
-          offsets = [0, 0, 0, 0],
-          sizes = [1, %output_height_size, %output_width_size, %output_channels_size],
-          strides = [1, 1, 1, 1]
-          : tensor<1x?x?x?xi32>
-          -> !iree_tensor_ext.dispatch.tensor<writeonly:tensor<1x?x?x?xi32>>{
-              %output_height_size, %output_width_size, %output_channels_size}
-      flow.return
-    } count(%output_height_workload: index,
-            %output_width_workload: index,
-            %output_channels_workload: index) -> (index, index, index) {
-      %x, %y, %z = iree_tensor_ext.dispatch.workgroup_count_from_slice(
-          %output_height_workload,
-          %output_width_workload,
-          %output_channels_workload)
-      flow.return %x, %y, %z : index, index, index
-    }
+    // The epilogue is a plain `linalg.generic`, not a hand-written
+    // `flow.dispatch.workgroups`, and the `inline` pass at the end of
+    // @__transform_main puts it in the caller. Both halves matter, and only
+    // together: a pre-formed dispatch is opaque to dispatch-region formation,
+    // so nothing downstream can fuse into it, and a `linalg.generic` left
+    // inside a `util.func private` that is never inlined just becomes its own
+    // dispatch anyway (the trap ISSUES.md P6 item 2 records for the
+    // classifier matmul's truncf). Inlined and generic, IREE fuses this add
+    // with the zero-point correction and requantization that follow it in
+    // main_graph -- on MobileNetV2 int8 that is 265 dispatch sites down to
+    // 145. It needs no `stream.affinity`: rocket-pin-unclaimed-dispatches
+    // stamps the CPU default onto every dispatch this spec did not claim,
+    // which is what the explicit @cpu_device annotation here used to be for.
+    %final_empty_outer = tensor.empty(
+        %output_height, %output_width, %output_channels) : tensor<1x?x?x?xi32>
+    %final = linalg.generic {
+        indexing_maps = [
+          affine_map<(d0, d1, d2, d3) -> (d0, d1, d2, d3)>,
+          affine_map<(d0, d1, d2, d3) -> (d0, d1, d2, d3)>,
+          affine_map<(d0, d1, d2, d3) -> (d0, d1, d2, d3)>
+        ],
+        iterator_types = ["parallel", "parallel", "parallel", "parallel"]
+      } ins(%raw_i32, %init : tensor<1x?x?x?xi32>, tensor<1x?x?x?xi32>)
+        outs(%final_empty_outer : tensor<1x?x?x?xi32>) {
+      ^bb0(%raw: i32, %initial: i32, %out: i32):
+        // No extend, unlike the fp16 epilogue: int8_accumulator mode
+        // already hands back a full i32 accumulator.
+        %sum = arith.addi %raw, %initial : i32
+        linalg.yield %sum : i32
+    } -> tensor<1x?x?x?xi32>
 
     util.return %final : tensor<1x?x?x?xi32>
   }
@@ -2352,85 +2303,36 @@ module attributes {transform.with_named_sequence} {
            tensor<?xi32>{%output_channels})
         -> tensor<1x?x?x?xi32>{%output_height, %output_width, %output_channels}
 
-    %final = flow.dispatch.workgroups[
-        %output_height, %output_width, %output_channels](
-        %raw_i32, %init, %output_height, %output_width, %output_channels)
-        : (tensor<1x?x?x?xi32>{%output_height, %output_width, %output_channels},
-           tensor<1x?x?x?xi32>{%output_height, %output_width, %output_channels},
-           index, index, index)
-        -> tensor<1x?x?x?xi32>{%output_height, %output_width, %output_channels}
-        attributes { stream.affinity = #hal.device.affinity<@cpu_device> } =
-        (%raw_binding: !iree_tensor_ext.dispatch.tensor<readonly:tensor<1x?x?x?xi32>>,
-         %init_binding: !iree_tensor_ext.dispatch.tensor<readonly:tensor<1x?x?x?xi32>>,
-         %output_height_arg: index,
-         %output_width_arg: index,
-         %output_channels_arg: index,
-         %final_binding: !iree_tensor_ext.dispatch.tensor<writeonly:tensor<1x?x?x?xi32>>) {
-      %output_height_size = iree_tensor_ext.dispatch.workload.ordinal
-          %output_height_arg, 0 : index
-      %output_width_size = iree_tensor_ext.dispatch.workload.ordinal
-          %output_width_arg, 1 : index
-      %output_channels_size = iree_tensor_ext.dispatch.workload.ordinal
-          %output_channels_arg, 2 : index
-      %raw_shaped = flow.dispatch.tie_shape %raw_binding
-          : !iree_tensor_ext.dispatch.tensor<readonly:tensor<1x?x?x?xi32>>{
-              %output_height_size, %output_width_size, %output_channels_size}
-      %init_shaped = flow.dispatch.tie_shape %init_binding
-          : !iree_tensor_ext.dispatch.tensor<readonly:tensor<1x?x?x?xi32>>{
-              %output_height_size, %output_width_size, %output_channels_size}
-      %final_shaped = flow.dispatch.tie_shape %final_binding
-          : !iree_tensor_ext.dispatch.tensor<writeonly:tensor<1x?x?x?xi32>>{
-              %output_height_size, %output_width_size, %output_channels_size}
-      %raw_loaded = iree_tensor_ext.dispatch.tensor.load %raw_shaped,
-          offsets = [0, 0, 0, 0],
-          sizes = [1, %output_height_size, %output_width_size, %output_channels_size],
-          strides = [1, 1, 1, 1]
-          : !iree_tensor_ext.dispatch.tensor<readonly:tensor<1x?x?x?xi32>>{
-              %output_height_size, %output_width_size, %output_channels_size}
-          -> tensor<1x?x?x?xi32>
-      %init_loaded = iree_tensor_ext.dispatch.tensor.load %init_shaped,
-          offsets = [0, 0, 0, 0],
-          sizes = [1, %output_height_size, %output_width_size, %output_channels_size],
-          strides = [1, 1, 1, 1]
-          : !iree_tensor_ext.dispatch.tensor<readonly:tensor<1x?x?x?xi32>>{
-              %output_height_size, %output_width_size, %output_channels_size}
-          -> tensor<1x?x?x?xi32>
-      %final_empty = tensor.empty(
-          %output_height_size, %output_width_size, %output_channels_size)
-          : tensor<1x?x?x?xi32>
-      %final_inner = linalg.generic {
-          indexing_maps = [
-            affine_map<(d0, d1, d2, d3) -> (d0, d1, d2, d3)>,
-            affine_map<(d0, d1, d2, d3) -> (d0, d1, d2, d3)>,
-            affine_map<(d0, d1, d2, d3) -> (d0, d1, d2, d3)>
-          ],
-          iterator_types = ["parallel", "parallel", "parallel", "parallel"]
-        } ins(%raw_loaded, %init_loaded
-            : tensor<1x?x?x?xi32>, tensor<1x?x?x?xi32>)
-          outs(%final_empty : tensor<1x?x?x?xi32>) {
-        ^bb0(%raw: i32, %initial: i32, %out: i32):
-          // No extend, unlike the fp16 epilogue: int8_accumulator mode
-          // already hands back a full i32 accumulator.
-          %sum = arith.addi %raw, %initial : i32
-          linalg.yield %sum : i32
-      } -> tensor<1x?x?x?xi32>
-      iree_tensor_ext.dispatch.tensor.store %final_inner, %final_shaped,
-          offsets = [0, 0, 0, 0],
-          sizes = [1, %output_height_size, %output_width_size, %output_channels_size],
-          strides = [1, 1, 1, 1]
-          : tensor<1x?x?x?xi32>
-          -> !iree_tensor_ext.dispatch.tensor<writeonly:tensor<1x?x?x?xi32>>{
-              %output_height_size, %output_width_size, %output_channels_size}
-      flow.return
-    } count(%output_height_workload: index,
-            %output_width_workload: index,
-            %output_channels_workload: index) -> (index, index, index) {
-      %x, %y, %z = iree_tensor_ext.dispatch.workgroup_count_from_slice(
-          %output_height_workload,
-          %output_width_workload,
-          %output_channels_workload)
-      flow.return %x, %y, %z : index, index, index
-    }
+    // The epilogue is a plain `linalg.generic`, not a hand-written
+    // `flow.dispatch.workgroups`, and the `inline` pass at the end of
+    // @__transform_main puts it in the caller. Both halves matter, and only
+    // together: a pre-formed dispatch is opaque to dispatch-region formation,
+    // so nothing downstream can fuse into it, and a `linalg.generic` left
+    // inside a `util.func private` that is never inlined just becomes its own
+    // dispatch anyway (the trap ISSUES.md P6 item 2 records for the
+    // classifier matmul's truncf). Inlined and generic, IREE fuses this add
+    // with the zero-point correction and requantization that follow it in
+    // main_graph -- on MobileNetV2 int8 that is 265 dispatch sites down to
+    // 145. It needs no `stream.affinity`: rocket-pin-unclaimed-dispatches
+    // stamps the CPU default onto every dispatch this spec did not claim,
+    // which is what the explicit @cpu_device annotation here used to be for.
+    %final_empty_outer = tensor.empty(
+        %output_height, %output_width, %output_channels) : tensor<1x?x?x?xi32>
+    %final = linalg.generic {
+        indexing_maps = [
+          affine_map<(d0, d1, d2, d3) -> (d0, d1, d2, d3)>,
+          affine_map<(d0, d1, d2, d3) -> (d0, d1, d2, d3)>,
+          affine_map<(d0, d1, d2, d3) -> (d0, d1, d2, d3)>
+        ],
+        iterator_types = ["parallel", "parallel", "parallel", "parallel"]
+      } ins(%raw_i32, %init : tensor<1x?x?x?xi32>, tensor<1x?x?x?xi32>)
+        outs(%final_empty_outer : tensor<1x?x?x?xi32>) {
+      ^bb0(%raw: i32, %initial: i32, %out: i32):
+        // No extend, unlike the fp16 epilogue: int8_accumulator mode
+        // already hands back a full i32 accumulator.
+        %sum = arith.addi %raw, %initial : i32
+        linalg.yield %sum : i32
+    } -> tensor<1x?x?x?xi32>
 
     util.return %final : tensor<1x?x?x?xi32>
   }
@@ -2505,85 +2407,36 @@ module attributes {transform.with_named_sequence} {
            tensor<?xi32>{%output_channels})
         -> tensor<1x?x?x?xi32>{%output_height, %output_width, %output_channels}
 
-    %final = flow.dispatch.workgroups[
-        %output_height, %output_width, %output_channels](
-        %raw_i32, %init, %output_height, %output_width, %output_channels)
-        : (tensor<1x?x?x?xi32>{%output_height, %output_width, %output_channels},
-           tensor<1x?x?x?xi32>{%output_height, %output_width, %output_channels},
-           index, index, index)
-        -> tensor<1x?x?x?xi32>{%output_height, %output_width, %output_channels}
-        attributes { stream.affinity = #hal.device.affinity<@cpu_device> } =
-        (%raw_binding: !iree_tensor_ext.dispatch.tensor<readonly:tensor<1x?x?x?xi32>>,
-         %init_binding: !iree_tensor_ext.dispatch.tensor<readonly:tensor<1x?x?x?xi32>>,
-         %output_height_arg: index,
-         %output_width_arg: index,
-         %output_channels_arg: index,
-         %final_binding: !iree_tensor_ext.dispatch.tensor<writeonly:tensor<1x?x?x?xi32>>) {
-      %output_height_size = iree_tensor_ext.dispatch.workload.ordinal
-          %output_height_arg, 0 : index
-      %output_width_size = iree_tensor_ext.dispatch.workload.ordinal
-          %output_width_arg, 1 : index
-      %output_channels_size = iree_tensor_ext.dispatch.workload.ordinal
-          %output_channels_arg, 2 : index
-      %raw_shaped = flow.dispatch.tie_shape %raw_binding
-          : !iree_tensor_ext.dispatch.tensor<readonly:tensor<1x?x?x?xi32>>{
-              %output_height_size, %output_width_size, %output_channels_size}
-      %init_shaped = flow.dispatch.tie_shape %init_binding
-          : !iree_tensor_ext.dispatch.tensor<readonly:tensor<1x?x?x?xi32>>{
-              %output_height_size, %output_width_size, %output_channels_size}
-      %final_shaped = flow.dispatch.tie_shape %final_binding
-          : !iree_tensor_ext.dispatch.tensor<writeonly:tensor<1x?x?x?xi32>>{
-              %output_height_size, %output_width_size, %output_channels_size}
-      %raw_loaded = iree_tensor_ext.dispatch.tensor.load %raw_shaped,
-          offsets = [0, 0, 0, 0],
-          sizes = [1, %output_height_size, %output_width_size, %output_channels_size],
-          strides = [1, 1, 1, 1]
-          : !iree_tensor_ext.dispatch.tensor<readonly:tensor<1x?x?x?xi32>>{
-              %output_height_size, %output_width_size, %output_channels_size}
-          -> tensor<1x?x?x?xi32>
-      %init_loaded = iree_tensor_ext.dispatch.tensor.load %init_shaped,
-          offsets = [0, 0, 0, 0],
-          sizes = [1, %output_height_size, %output_width_size, %output_channels_size],
-          strides = [1, 1, 1, 1]
-          : !iree_tensor_ext.dispatch.tensor<readonly:tensor<1x?x?x?xi32>>{
-              %output_height_size, %output_width_size, %output_channels_size}
-          -> tensor<1x?x?x?xi32>
-      %final_empty = tensor.empty(
-          %output_height_size, %output_width_size, %output_channels_size)
-          : tensor<1x?x?x?xi32>
-      %final_inner = linalg.generic {
-          indexing_maps = [
-            affine_map<(d0, d1, d2, d3) -> (d0, d1, d2, d3)>,
-            affine_map<(d0, d1, d2, d3) -> (d0, d1, d2, d3)>,
-            affine_map<(d0, d1, d2, d3) -> (d0, d1, d2, d3)>
-          ],
-          iterator_types = ["parallel", "parallel", "parallel", "parallel"]
-        } ins(%raw_loaded, %init_loaded
-            : tensor<1x?x?x?xi32>, tensor<1x?x?x?xi32>)
-          outs(%final_empty : tensor<1x?x?x?xi32>) {
-        ^bb0(%raw: i32, %initial: i32, %out: i32):
-          // No extend, unlike the fp16 epilogue: int8_accumulator mode
-          // already hands back a full i32 accumulator.
-          %sum = arith.addi %raw, %initial : i32
-          linalg.yield %sum : i32
-      } -> tensor<1x?x?x?xi32>
-      iree_tensor_ext.dispatch.tensor.store %final_inner, %final_shaped,
-          offsets = [0, 0, 0, 0],
-          sizes = [1, %output_height_size, %output_width_size, %output_channels_size],
-          strides = [1, 1, 1, 1]
-          : tensor<1x?x?x?xi32>
-          -> !iree_tensor_ext.dispatch.tensor<writeonly:tensor<1x?x?x?xi32>>{
-              %output_height_size, %output_width_size, %output_channels_size}
-      flow.return
-    } count(%output_height_workload: index,
-            %output_width_workload: index,
-            %output_channels_workload: index) -> (index, index, index) {
-      %x, %y, %z = iree_tensor_ext.dispatch.workgroup_count_from_slice(
-          %output_height_workload,
-          %output_width_workload,
-          %output_channels_workload)
-      flow.return %x, %y, %z : index, index, index
-    }
+    // The epilogue is a plain `linalg.generic`, not a hand-written
+    // `flow.dispatch.workgroups`, and the `inline` pass at the end of
+    // @__transform_main puts it in the caller. Both halves matter, and only
+    // together: a pre-formed dispatch is opaque to dispatch-region formation,
+    // so nothing downstream can fuse into it, and a `linalg.generic` left
+    // inside a `util.func private` that is never inlined just becomes its own
+    // dispatch anyway (the trap ISSUES.md P6 item 2 records for the
+    // classifier matmul's truncf). Inlined and generic, IREE fuses this add
+    // with the zero-point correction and requantization that follow it in
+    // main_graph -- on MobileNetV2 int8 that is 265 dispatch sites down to
+    // 145. It needs no `stream.affinity`: rocket-pin-unclaimed-dispatches
+    // stamps the CPU default onto every dispatch this spec did not claim,
+    // which is what the explicit @cpu_device annotation here used to be for.
+    %final_empty_outer = tensor.empty(
+        %output_height, %output_width, %output_channels) : tensor<1x?x?x?xi32>
+    %final = linalg.generic {
+        indexing_maps = [
+          affine_map<(d0, d1, d2, d3) -> (d0, d1, d2, d3)>,
+          affine_map<(d0, d1, d2, d3) -> (d0, d1, d2, d3)>,
+          affine_map<(d0, d1, d2, d3) -> (d0, d1, d2, d3)>
+        ],
+        iterator_types = ["parallel", "parallel", "parallel", "parallel"]
+      } ins(%raw_i32, %init : tensor<1x?x?x?xi32>, tensor<1x?x?x?xi32>)
+        outs(%final_empty_outer : tensor<1x?x?x?xi32>) {
+      ^bb0(%raw: i32, %initial: i32, %out: i32):
+        // No extend, unlike the fp16 epilogue: int8_accumulator mode
+        // already hands back a full i32 accumulator.
+        %sum = arith.addi %raw, %initial : i32
+        linalg.yield %sum : i32
+    } -> tensor<1x?x?x?xi32>
 
     util.return %final : tensor<1x?x?x?xi32>
   }
@@ -3956,7 +3809,24 @@ module attributes {transform.with_named_sequence} {
         "rocket-promote-unclaimed-conv-inputs" to %module
       : (!transform.any_op) -> !transform.any_op
 
-    transform.apply_dce to %promoted_module : !transform.any_op
+    // Inline the @call_rocket_* wrappers into their callers.
+    //
+    // `transform.util.cast_and_call` leaves a call, and IREE never inlines
+    // these functions on its own -- ISSUES.md P6 item 2 found that the hard
+    // way, when a `truncf` written inside @call_rocket_matmul ran as a
+    // per-inference CPU dispatch instead of folding into an initializer.
+    // Everything a wrapper does around its `flow.dispatch` has that problem:
+    // the int8 epilogue add above, the HWC->CHW depthwise filter transpose
+    // (13 dispatches per inference on MobileNetV2 int8, over constant
+    // weights), and the zero-bias fills. Inlined, const-eval hoists the
+    // constant ones into initializers and dispatch-region formation fuses
+    // the rest into the neighbouring elementwise chain; the `flow.dispatch`
+    // itself is unaffected, it keeps its @rocket_device affinity.
+    %inlined_module = transform.apply_registered_pass
+        "inline" to %promoted_module
+      : (!transform.any_op) -> !transform.any_op
+
+    transform.apply_dce to %inlined_module : !transform.any_op
     transform.yield
   }
 }

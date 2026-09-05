@@ -109,9 +109,16 @@ consumed -- and no plugin hook exists that late, so `rocket-compiler` drives it
 by name: `--compile-to=flow`, the pass, then `--compile-from=flow`. Both
 `compile` and `audit` do this, so the report matches what a `.vmfb` would get.
 
-Compiling by hand with `iree-compile` in one shot skips the pass. Single
-convolutions (what `tools/e2e_conv_regression.py` compiles) have nothing to
-mis-place and are unaffected, but a whole model can be.
+Compiling by hand with `iree-compile` in one shot skips the pass, and since
+the transform spec's int8 epilogue became a fusible `linalg.generic` (see
+ISSUES.md P8) that now breaks a **single convolution** too, not just a whole
+model: the epilogue dispatch's only producer is the Rocket dispatch, so
+Stream's affinity analysis places it on `@rocket_device` and serialization
+fails on an op that is not a convolution. `tools/e2e_conv_regression.py` runs
+the three-stage build for exactly this reason; use `rocket-compiler`, or
+replicate its `--compile-to=flow` / `iree-opt
+--pass-pipeline=builtin.module(rocket-pin-unclaimed-dispatches)` /
+`--compile-from=flow` sequence.
 
 ### Stride-2 dense convolution
 

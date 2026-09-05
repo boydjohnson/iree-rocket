@@ -22,7 +22,7 @@
 // MobileNetV2's global average pool: 7x7 over 1792 channels, stride 1.
 // CHECK-LABEL: util.func public @global_avg_pool_7x7
 // CHECK-NOT: linalg.pooling_nchw_sum
-// CHECK: util.call @call_rocket_pooling_avg_nchw
+// CHECK: flow.dispatch @rocket_pooling_executable
 util.func public @global_avg_pool_7x7(
     %input: tensor<1x1792x7x7xf32>,
     %init: tensor<1x1792x1x1xf32>) -> tensor<1x1792x1x1xf32> {
@@ -38,7 +38,7 @@ util.func public @global_avg_pool_7x7(
 // An 8x8 window is the largest the PPU programs directly -- MAX_DIRECT_KERNEL,
 // hardware-confirmed, with a 16x16 window rejected outright.
 // CHECK-LABEL: util.func public @avg_pool_8x8_matches
-// CHECK: util.call @call_rocket_pooling_avg_nchw
+// CHECK: flow.dispatch @rocket_pooling_executable
 util.func public @avg_pool_8x8_matches(
     %input: tensor<1x64x8x8xf32>,
     %init: tensor<1x64x1x1xf32>) -> tensor<1x64x1x1xf32> {
