@@ -2464,17 +2464,16 @@ module attributes {transform.with_named_sequence} {
   // sweep that already reached 1792 at a different geometry. M becomes the
   // convolution *width*, which no constant bounds.
   //
-  // 32 is where the vendor FC ladder stopped, and for a while it was also
-  // holding a hardware fault at bay: a single input row wider than
-  // `(K/32 - 1) * M <= 2047` CBUF entries read its last 32 channels from the
-  // wrong place (ISSUES.md C10, resolved 2026-09-05). The planner now bounds
-  // the row itself (`Shape::max_tile_input_width`) and splits a wider matmul
-  // into column tiles, board-validated at M 90, 128, 197 and 296. So this
-  // bound is once again the extent of the measurement, not a correctness
-  // limit: raising it is a matter of validating the compiled path at the M a
-  // model wants (ViT-B/16 wants 197 at K 768, which plans as three columns)
-  // and deciding whether the tall `1 x M` geometry the notes use is the
-  // better lowering there -- see ISSUES.md D1.
+  // M was bounded at 32 -- where the vendor FC ladder stopped -- until
+  // 2026-09-05, and for a while that was holding a hardware fault at bay: a
+  // single input row wider than `(K/32 - 1) * M <= 2047` CBUF entries read
+  // its last 32 channels from the wrong place (ISSUES.md C10). The planner
+  // now bounds the row itself (`Shape::max_tile_input_width`) and splits a
+  // wider matmul into column tiles, board-validated at M 90, 128, 197 and
+  // 296 (K 768 and 256), 1035 (K 96) and 2000 (K 32). What bounds M now is
+  // `CNA_DATA_SIZE0.datain_width`, an 11-bit field: 2047. ViT-B/16's M 197
+  // at K 768 plans as three columns. Whether the tall `1 x M` geometry the
+  // notes use is the better lowering above 32 is ISSUES.md D1.
   transform.named_sequence @match_rocket_matmul(%root: !transform.any_op {transform.readonly}) -> !transform.any_op {
     transform.match.operation_name %root ["linalg.matmul"] : !transform.any_op
     %batch, %m, %n, %k = transform.iree.match.contraction %root,
@@ -2485,7 +2484,7 @@ module attributes {transform.with_named_sequence} {
 
     %lhs_value = transform.get_operand %root[0] : (!transform.any_op) -> !transform.any_value
     %rhs_value = transform.get_operand %root[1] : (!transform.any_op) -> !transform.any_value
-    transform.iree.match.dim_bounds %lhs_value[0], umin = 1, umax = 32 : !transform.any_value
+    transform.iree.match.dim_bounds %lhs_value[0], umin = 1, umax = 2047 : !transform.any_value
     transform.iree.match.dim_bounds %lhs_value[1], umin = 1, umax = 1792 : !transform.any_value
     transform.iree.match.dim_bounds %rhs_value[1], umin = 1, umax = 1792 : !transform.any_value
     transform.yield %root : !transform.any_op
@@ -3701,8 +3700,33 @@ module attributes {transform.with_named_sequence} {
     %channels_last_funcs = transform.apply_registered_pass
         "iree-preprocessing-convert-conv-to-channels-last" to %dequantized_funcs
       : (!transform.any_op) -> !transform.any_op
-    %canonical_funcs = transform.apply_registered_pass
+    %specialized_funcs = transform.apply_registered_pass
         "linalg-specialize-generic-ops" to %channels_last_funcs
+      : (!transform.any_op) -> !transform.any_op
+
+    // A transformer's projections import as `linalg.batch_matmul` with a
+    // unit batch -- ONNX MatMul over a `[1, tokens, features]` activation --
+    // and @match_rocket_matmul only sees `linalg.matmul`. Nothing upstream
+    // drops that batch on a *named* contraction (`linalg-fold-unit-extent-dims`
+    // and IREE's dispatch-creation variant both leave it alone), so:
+    // generalize just the batch matmuls, fold their unit dims through
+    // reshapes, and re-specialize, which turns `1x197x768 x 1x768x768` into a
+    // `197x768 x 768x768` `linalg.matmul` wrapped in collapse/expand shapes.
+    // Convolutions are already named ops again by this point, so the fold
+    // patterns do not touch their unit batch; the elementwise generics they
+    // do reach lose unit dims IREE would have folded later anyway.
+    transform.foreach %specialized_funcs : !transform.any_op {
+      ^bb0(%func_with_batch_matmuls: !transform.any_op):
+        %batch_matmuls = transform.structured.match ops{["linalg.batch_matmul"]}
+            in %func_with_batch_matmuls : (!transform.any_op) -> !transform.any_op
+        %generalized_batch_matmuls = transform.structured.generalize %batch_matmuls
+          : (!transform.any_op) -> !transform.any_op
+        transform.apply_patterns to %func_with_batch_matmuls {
+          transform.apply_patterns.linalg.fold_unit_extent_dims_via_reshapes
+        } : !transform.any_op
+    }
+    %canonical_funcs = transform.apply_registered_pass
+        "linalg-specialize-generic-ops" to %specialized_funcs
       : (!transform.any_op) -> !transform.any_op
     // Rocket's ABI is f16-in/f32-accumulate (see call_rocket_dynamic_conv2d
     // above), but models commonly arrive as plain f32 (e.g. ONNX/torch

@@ -1022,9 +1022,12 @@ above M 32 is a performance question, not a correctness one, and the tall form
 has fewer tiles. `whisper-encoder.md` records the notes hitting exactly this
 wall with a width-on-time 1D conv and transposing to time-on-height.
 
-`fc.rs` itself is still validated at M=7/K=16/N=32-33 through the compiled
-path; the M 90..296 points above are the HAL's conv planner under the FC
-geometry. If FC is going to carry real shapes, sweep the compiled path.
+The compiled path now carries a real shape: with the matcher bound raised to
+2047 and ONNX's unit-batch `batch_matmul` collapsed in the spec, ViT-B/16's
+twelve `197x768x768` out-projections offload as three-column plans, max|err|
+0.0014 against the `--no-offload` arm and 5% faster than it (LIMITS.md,
+Matmul). Whether the tall geometry would be faster still at those twelve
+sites is the open half of this issue.
 
 ---
 

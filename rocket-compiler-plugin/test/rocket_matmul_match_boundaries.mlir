@@ -73,30 +73,46 @@ util.func public @n_past_the_ceiling_falls_back(
   util.return %result : tensor<1x1793xf32>
 }
 
-// M becomes the convolution's width. 32 is where the hardware ladder stops,
-// so it is where the matcher stops.
-// CHECK-LABEL: util.func public @m_32_matches
+// M becomes the convolution's width, and what bounds it is the 11-bit
+// `CNA_DATA_SIZE0.datain_width`. It was 32 -- the vendor FC ladder's extent
+// -- until ISSUES.md C10 was resolved on 2026-09-05: above
+// `(K/32 - 1) * M <= 2047` CBUF entries a single row read its last 32
+// channels from the wrong place, and the planner now splits such a row into
+// column tiles instead. ViT-B/16's M 197 at K 768 is the shape that matters.
+// CHECK-LABEL: util.func public @m_197_matches
 // CHECK: flow.dispatch @rocket_matmul_executable
-util.func public @m_32_matches(
-    %lhs: tensor<32x64xf32>,
-    %rhs: tensor<64x64xf32>,
-    %init: tensor<32x64xf32>) -> tensor<32x64xf32> {
+util.func public @m_197_matches(
+    %lhs: tensor<197x768xf32>,
+    %rhs: tensor<768x768xf32>,
+    %init: tensor<197x768xf32>) -> tensor<197x768xf32> {
   %result = linalg.matmul
-      ins(%lhs, %rhs : tensor<32x64xf32>, tensor<64x64xf32>)
-      outs(%init : tensor<32x64xf32>) -> tensor<32x64xf32>
-  util.return %result : tensor<32x64xf32>
+      ins(%lhs, %rhs : tensor<197x768xf32>, tensor<768x768xf32>)
+      outs(%init : tensor<197x768xf32>) -> tensor<197x768xf32>
+  util.return %result : tensor<197x768xf32>
 }
 
-// CHECK-LABEL: util.func public @m_33_falls_back
-// CHECK: linalg.matmul
-util.func public @m_33_falls_back(
-    %lhs: tensor<33x64xf32>,
+// CHECK-LABEL: util.func public @m_2047_matches
+// CHECK: flow.dispatch @rocket_matmul_executable
+util.func public @m_2047_matches(
+    %lhs: tensor<2047x64xf32>,
     %rhs: tensor<64x64xf32>,
-    %init: tensor<33x64xf32>) -> tensor<33x64xf32> {
+    %init: tensor<2047x64xf32>) -> tensor<2047x64xf32> {
   %result = linalg.matmul
-      ins(%lhs, %rhs : tensor<33x64xf32>, tensor<64x64xf32>)
-      outs(%init : tensor<33x64xf32>) -> tensor<33x64xf32>
-  util.return %result : tensor<33x64xf32>
+      ins(%lhs, %rhs : tensor<2047x64xf32>, tensor<64x64xf32>)
+      outs(%init : tensor<2047x64xf32>) -> tensor<2047x64xf32>
+  util.return %result : tensor<2047x64xf32>
+}
+
+// CHECK-LABEL: util.func public @m_2048_falls_back
+// CHECK: linalg.matmul
+util.func public @m_2048_falls_back(
+    %lhs: tensor<2048x64xf32>,
+    %rhs: tensor<64x64xf32>,
+    %init: tensor<2048x64xf32>) -> tensor<2048x64xf32> {
+  %result = linalg.matmul
+      ins(%lhs, %rhs : tensor<2048x64xf32>, tensor<64x64xf32>)
+      outs(%init : tensor<2048x64xf32>) -> tensor<2048x64xf32>
+  util.return %result : tensor<2048x64xf32>
 }
 
 // The case a name-only matcher would get wrong. `linalg.matmul` expresses a
@@ -138,4 +154,22 @@ util.func public @batch_matmul_falls_back(
       ins(%lhs, %rhs : tensor<4x8x64xf32>, tensor<4x64x64xf32>)
       outs(%init : tensor<4x8x64xf32>) -> tensor<4x8x64xf32>
   util.return %result : tensor<4x8x64xf32>
+}
+
+// Except when that batch is one. ONNX MatMul over a `[1, tokens, features]`
+// activation imports as exactly this, and it is every projection in a
+// transformer; @__transform_main collapses the unit batch (generalize, fold
+// unit dims through reshapes, re-specialize) before the match loop, so it
+// reaches the matcher as the `linalg.matmul` above and dispatches.
+// CHECK-LABEL: util.func public @unit_batch_matmul_matches
+// CHECK-NOT: linalg.batch_matmul
+// CHECK: flow.dispatch @rocket_matmul_executable
+util.func public @unit_batch_matmul_matches(
+    %lhs: tensor<1x197x768xf32>,
+    %rhs: tensor<1x768x768xf32>,
+    %init: tensor<1x197x768xf32>) -> tensor<1x197x768xf32> {
+  %result = linalg.batch_matmul
+      ins(%lhs, %rhs : tensor<1x197x768xf32>, tensor<1x768x768xf32>)
+      outs(%init : tensor<1x197x768xf32>) -> tensor<1x197x768xf32>
+  util.return %result : tensor<1x197x768xf32>
 }

@@ -136,7 +136,7 @@ timeouts**, under both the `Selectors` and `Counting` oracle patterns:
 
 | Dimension | Tested range | Bound by |
 |---|---|---|
-| `M` (conv width at height one) | 1..=32 in the compiled path; 1..=296 measured in the HAL | The transform spec's matcher bound is the vendor FC sweep's extent (1, 2, 7, 16, 32, crossing three CBUF splits). Above it the planner splits column tiles at the row-width limit above -- see below |
+| `M` (conv width at height one) | 1..=2047 in the compiled path; 1..=296 measured in the HAL, 197 end to end | `CNA_DATA_SIZE0.datain_width` is 11 bits. The vendor FC sweep covers 1, 2, 7, 16, 32 (three CBUF splits); above the row-width limit above the planner splits column tiles -- see below |
 | `K` (conv `Cin`) | 1..=1792 | `MAX_INPUT_CHANNELS`; measured 512, 1024, 1344, 1792, 2048 |
 | `N` (conv `Cout`) | 1..=1792 | `MAX_OUTPUT_CHANNELS`; measured 64, 512, 1001, 1792, 2048 |
 
@@ -157,8 +157,18 @@ tiles past it, measured exact on `planck` with `dtype_boundary_probe` at `M`
 90, 128 and 197 (`K` 768, two and three columns), 296 (`K` 256), 38 (`K`
 1792), at bf16, int16, tf32 and both int8 paths, and under the `onehot` read
 map at 197 and 296. The transposed `1 x M` geometry row-tiles instead and is
-exact at the same points with fewer tiles (ISSUES.md D1). Raising the matcher
-bound is therefore a compiled-path validation, not a hardware question.
+exact at the same points with fewer tiles (ISSUES.md D1).
+
+**End to end, ViT-B/16 (2026-09-05).** With the matcher bound raised to the
+register's 2047 and the spec collapsing ONNX's unit-batch `batch_matmul` to
+`linalg.matmul`, `rocket-compiler` offloads the twelve `197x768x768` attention
+out-projections (12 of 272 dispatch sites; QKV at N 2304 and the MLP at N/K
+3072 exceed the 1792 channel caps). Against the `--no-offload` build on
+`planck`, same input: max|err| 0.0014 on logits of magnitude 6.8, top-5
+identical, **3.87 s vs 4.06 s per inference** (`iree-benchmark-module`, 3
+repetitions each) -- the first configuration in this repo faster than its
+like-for-like CPU arm, by 5%. Read with [[planck-measurement-environment]]'s
+caveats; it is one input and one core allocation.
 
 ## Pooling
 
