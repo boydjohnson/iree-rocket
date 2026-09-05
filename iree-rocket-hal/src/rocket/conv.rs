@@ -2246,11 +2246,9 @@ impl Shape {
             FeatureLayout::Dense => 0,
             FeatureLayout::Surfaces => self.cbuf_atoms().div_ceil(CBUF_ATOMS_PER_ENTRY) - 1,
         };
-        if extra_slabs == 0 {
-            self.width
-        } else {
-            (MAX_ENTRY_SLAB_BASE / extra_slabs).min(self.width)
-        }
+        MAX_ENTRY_SLAB_BASE
+            .checked_div(extra_slabs)
+            .map_or(self.width, |bound| bound.min(self.width))
     }
 
     /// Conservative input-row limit imposed by `feature_grains`.
