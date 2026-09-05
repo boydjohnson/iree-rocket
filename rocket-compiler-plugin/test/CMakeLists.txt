@@ -17,6 +17,7 @@ iree_lit_test_suite(
     "rocket_pooling_dynamic_output_invalid.mlir"
     "rocket_pooling_invalid.mlir"
     "rocket_pooling_match_boundaries.mlir"
+    "rocket_pooling_max_match_boundaries.mlir"
     "rocket_runtime_dimensions.mlir"
     "rocket_runtime_dimensions_invalid.mlir"
   TOOLS

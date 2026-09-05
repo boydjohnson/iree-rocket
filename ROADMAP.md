@@ -84,8 +84,11 @@ the wire schema, the decode arm in
 `PoolingMethod::{Max,Min}` in [`pooling.rs`](iree-rocket-hal/src/rocket/pooling.rs)
 with the per-precision pad-fill identities already worked out
 (`pad_fill_value`: max/fp16 is `0xFC00`, min and int8-max take the
-"no fill" path). The compiler simply never asks for them. This is the cheapest
-uncovered op in the repo.
+"no fill" path). The compiler simply never asked for them.
+
+**Max was closed on 2026-09-05** -- four matchers and four shims, no change
+below the compiler, which is the evidence that this diagnosis was right.
+**Min remains open**, and is now the cheapest uncovered op in the repo.
 
 ---
 
@@ -172,13 +175,18 @@ breadth work rather than after.
 No schema, driver or HAL change. Every item is already plumbed end to end and
 blocked solely by a missing matcher.
 
-1. **Min and max pooling.** Matchers for `linalg.pooling_nhwc_max`,
-   `pooling_nchw_max`, `pooling_nhwc_min`, `pooling_nhwc_max_unsigned`,
-   `pooling_nhwc_min_unsigned`. Reuse `@match_pooling_nchw_sum_avg`'s dimension
-   layout -- its doc comment already records the non-obvious part, that
-   `transform.iree.match.convolution` reports a pool as `batch = [1, C]`,
-   `out_ch = []`, `filter = [kh, kw]`, and that guessing wrong is a silent
-   decline.
+1. ~~**Max pooling.**~~ **Landed 2026-09-05.** Four matchers
+   (`linalg.pooling_nhwc_max` and `pooling_nchw_max`, strides 1 and 2), two
+   executables, four shims. Nothing below the compiler changed: the schema,
+   `executable_cache.rs`'s decode arm and `pooling.rs` already carried
+   `PoolingMethod::Max`. Padding stays baked at zero, which is what makes the
+   method safe -- `pad_fill_value` has a measured identity for max only at
+   fp16, and an unpadded pool never reads the field. **Not yet run on the
+   board**: `pooling_oracle_hw.rs` covers max at the HAL level, but no
+   compiled max-pool `.vmfb` has executed on `planck`.
+   **Min pooling is still open** and is the cheaper half of what remains:
+   `pad_fill_value` has no measured identity for min at any precision, so it
+   is unpadded-only -- which every matched executable already is.
 2. **NHWC average pool** -- the `linalg.pooling_nhwc_sum` counterpart of the
    NCHW form already matched.
 3. **`linalg.matvec` / `vecmat` / `dot`** → `MatmulDef` at `M = 1` or `N = 1`.

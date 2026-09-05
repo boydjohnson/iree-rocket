@@ -277,6 +277,51 @@
                         "kernel_width", "kernel_height"]
 }>
 
+// Max pooling: the same PPU engine, a different reduction. Everything the
+// average above has to correct for, this does not -- the hardware computes
+// the maximum directly, so the shim only widens f16 back to f32 and folds in
+// the accumulator initialiser, which linalg defines into the reduction
+// itself (`O = max(O, I)`, confirmed by generalizing the named op).
+//
+// Padding stays baked at zero, and for max that is what makes the method
+// safe rather than merely conventional. `PoolingMethod::pad_fill_value`
+// (pooling.rs) has a measured pad fill for max only at fp16 (0xFC00), none
+// at int8, and none for min at any precision; an *unpadded* pool never reads
+// the field, which is why an unmeasured combination is still runnable there.
+// Model-level padding arrives as a separate tensor.pad the CPU runs, so the
+// executable never sees a padded window.
+//
+// Stride is baked, one executable per value, matching the convolution
+// variants. Both exist here because -- unlike the average pool, where every
+// measured model pools with stride 1 -- a max pool is overwhelmingly stride
+// 2. Stride 2 is measured against the oracle in `pooling_oracle_hw.rs`.
+// Nothing above 2 is, so there is deliberately no s3/s4 target.
+#rocket_pooling_max_target = #hal.executable.target<"rocket", "rocket-flatbuffer-v1", {
+  kernel = "pooling",
+  input_width = 0 : i32, input_height = 0 : i32, channels = 0 : i32,
+  output_width = 0 : i32, output_height = 0 : i32,
+  kernel_width = 0 : i32, kernel_height = 0 : i32,
+  stride_x = 1 : i32, stride_y = 1 : i32,
+  pad_left = 0 : i32, pad_top = 0 : i32, pad_right = 0 : i32, pad_bottom = 0 : i32,
+  method = "max",
+  precision = "fp16",
+  runtime_dimensions = ["input_width", "input_height", "channels",
+                        "kernel_width", "kernel_height"]
+}>
+
+#rocket_pooling_max_target_s2 = #hal.executable.target<"rocket", "rocket-flatbuffer-v1", {
+  kernel = "pooling",
+  input_width = 0 : i32, input_height = 0 : i32, channels = 0 : i32,
+  output_width = 0 : i32, output_height = 0 : i32,
+  kernel_width = 0 : i32, kernel_height = 0 : i32,
+  stride_x = 2 : i32, stride_y = 2 : i32,
+  pad_left = 0 : i32, pad_top = 0 : i32, pad_right = 0 : i32, pad_bottom = 0 : i32,
+  method = "max",
+  precision = "fp16",
+  runtime_dimensions = ["input_width", "input_height", "channels",
+                        "kernel_width", "kernel_height"]
+}>
+
 // The matmul engine. There is no matmul *hardware*: `fc::Shape` lowers
 // [M,K] x [K,N] to a height-one 1x1 convolution, with M the convolution
 // width, K the input channels and N the output channels -- a mapping
@@ -358,6 +403,34 @@ module attributes {transform.with_named_sequence} {
       }
       builtin.module {
         func.func @rocket_pooling_avg() {
+          return
+        }
+      }
+    }
+  }
+
+  hal.executable private @rocket_pooling_max_executable {
+    hal.executable.variant public @rocket_pooling_max_v1 target(#rocket_pooling_max_target) {
+      hal.executable.export public @rocket_pooling_max ordinal(0) layout(#pooling_pipeline_layout) count(%device: !hal.device, %workload: index) -> (index, index, index) {
+        %c1 = arith.constant 1 : index
+        hal.return %c1, %c1, %c1 : index, index, index
+      }
+      builtin.module {
+        func.func @rocket_pooling_max() {
+          return
+        }
+      }
+    }
+  }
+
+  hal.executable private @rocket_pooling_max_executable_s2 {
+    hal.executable.variant public @rocket_pooling_max_v1 target(#rocket_pooling_max_target_s2) {
+      hal.executable.export public @rocket_pooling_max ordinal(0) layout(#pooling_pipeline_layout) count(%device: !hal.device, %workload: index) -> (index, index, index) {
+        %c1 = arith.constant 1 : index
+        hal.return %c1, %c1, %c1 : index, index, index
+      }
+      builtin.module {
+        func.func @rocket_pooling_max() {
           return
         }
       }
@@ -775,6 +848,635 @@ module attributes {transform.with_named_sequence} {
           %average_f32 = arith.extf %average : f16 to f32
           %sum = arith.mulf %average_f32, %taps_f32 : f32
           %accumulated = arith.addf %sum, %initial : f32
+          linalg.yield %accumulated : f32
+      } -> tensor<1x?x?x?xf32>
+      iree_tensor_ext.dispatch.tensor.store %final_inner, %final_shaped,
+          offsets = [0, 0, 0, 0],
+          sizes = [1, %output_height_size, %output_width_size, %channels_size],
+          strides = [1, 1, 1, 1]
+          : tensor<1x?x?x?xf32>
+          -> !iree_tensor_ext.dispatch.tensor<writeonly:tensor<1x?x?x?xf32>>{
+              %output_height_size, %output_width_size, %channels_size}
+      flow.return
+    } count(%output_height_workload: index,
+            %output_width_workload: index,
+            %channels_workload: index) -> (index, index, index) {
+      %x, %y, %z = iree_tensor_ext.dispatch.workgroup_count_from_slice(
+          %output_height_workload,
+          %output_width_workload,
+          %channels_workload)
+      flow.return %x, %y, %z : index, index, index
+    }
+
+    // NHWC [1,H,W,C] -> NCHW [1,C,H,W].
+    %final_nchw_empty = tensor.empty(%channels, %output_height, %output_width) : tensor<1x?x?x?xf32>
+    %final_nchw = linalg.transpose
+        ins(%final_nhwc : tensor<1x?x?x?xf32>)
+        outs(%final_nchw_empty : tensor<1x?x?x?xf32>)
+        permutation = [0, 3, 1, 2]
+
+    util.return %final_nchw : tensor<1x?x?x?xf32>
+  }
+
+  // Max pool, NHWC, stride 1. NHWC is the hardware's own layout, so unlike the
+  // average pool's NCHW shim there is nothing to transpose on either side.
+  util.func private @call_rocket_pooling_max_nhwc(
+      %input: tensor<1x?x?x?xf32>,
+      %window: tensor<?x?xf32>,
+      %init: tensor<1x?x?x?xf32>) -> tensor<1x?x?x?xf32> {
+    %c0 = arith.constant 0 : index
+    %c1 = arith.constant 1 : index
+    %c2 = arith.constant 2 : index
+    %c3 = arith.constant 3 : index
+
+    // NHWC: dims 1 and 2 are the spatial extent, dim 3 is channels.
+    %input_height = tensor.dim %input, %c1 : tensor<1x?x?x?xf32>
+    %input_width = tensor.dim %input, %c2 : tensor<1x?x?x?xf32>
+    %channels = tensor.dim %input, %c3 : tensor<1x?x?x?xf32>
+    // The window operand carries no values, only [kh, kw].
+    %kernel_height = tensor.dim %window, %c0 : tensor<?x?xf32>
+    %kernel_width = tensor.dim %window, %c1 : tensor<?x?xf32>
+    %output_height = tensor.dim %init, %c1 : tensor<1x?x?x?xf32>
+    %output_width = tensor.dim %init, %c2 : tensor<1x?x?x?xf32>
+
+    %input_width_i32 = arith.index_cast %input_width : index to i32
+    %input_height_i32 = arith.index_cast %input_height : index to i32
+    %channels_i32 = arith.index_cast %channels : index to i32
+    %kernel_width_i32 = arith.index_cast %kernel_width : index to i32
+    %kernel_height_i32 = arith.index_cast %kernel_height : index to i32
+
+    // The PPU pools in fp16; the model's tensor is f32.
+    %input_f16_empty = tensor.empty(%input_height, %input_width, %channels) : tensor<1x?x?x?xf16>
+    %input_f16 = linalg.generic {
+        indexing_maps = [
+          affine_map<(d0, d1, d2, d3) -> (d0, d1, d2, d3)>,
+          affine_map<(d0, d1, d2, d3) -> (d0, d1, d2, d3)>
+        ],
+        iterator_types = ["parallel", "parallel", "parallel", "parallel"]
+      } ins(%input : tensor<1x?x?x?xf32>)
+        outs(%input_f16_empty : tensor<1x?x?x?xf16>) {
+      ^bb0(%value: f32, %out: f16):
+        %narrowed = arith.truncf %value : f32 to f16
+        linalg.yield %narrowed : f16
+    } -> tensor<1x?x?x?xf16>
+
+    %pooled = flow.dispatch
+        @rocket_pooling_max_executable::@rocket_pooling_max_v1::@rocket_pooling_max(
+          %input_width_i32, %input_height_i32, %channels_i32,
+          %kernel_width_i32, %kernel_height_i32,
+          %input_f16)
+        {stream.affinity = #hal.device.affinity<@rocket_device>}
+        : (i32, i32, i32, i32, i32,
+           tensor<1x?x?x?xf16>{%input_height, %input_width, %channels})
+        -> tensor<1x?x?x?xf16>{%output_height, %output_width, %channels}
+
+    // Widen back to f32 and fold in the accumulator initialiser. linalg
+    // defines a max pool as `O = max(O, I)`, so the init is part of the
+    // reduction rather than merely a destination, and dropping it would
+    // silently change the answer for any model that seeds it with something
+    // other than -inf.
+    //
+    // Explicitly a CPU dispatch, for the reason @call_rocket_pooling_avg_nchw
+    // records: an op that consumes the Rocket result inherits its affinity,
+    // gets formed into an executable for the rocket device, and that
+    // executable has no pooling config to serialize. The failure is a
+    // serialization error naming a missing `input_width`, a long way from
+    // the cause.
+    %final_nhwc = flow.dispatch.workgroups[
+        %output_height, %output_width, %channels](
+        %pooled, %init, %output_height, %output_width, %channels)
+        : (tensor<1x?x?x?xf16>{%output_height, %output_width, %channels},
+           tensor<1x?x?x?xf32>{%output_height, %output_width, %channels},
+           index, index, index)
+        -> tensor<1x?x?x?xf32>{%output_height, %output_width, %channels}
+        attributes { stream.affinity = #hal.device.affinity<@cpu_device> } =
+        (%pooled_binding: !iree_tensor_ext.dispatch.tensor<readonly:tensor<1x?x?x?xf16>>,
+         %init_binding: !iree_tensor_ext.dispatch.tensor<readonly:tensor<1x?x?x?xf32>>,
+         %output_height_arg: index,
+         %output_width_arg: index,
+         %channels_arg: index,
+         %final_binding: !iree_tensor_ext.dispatch.tensor<writeonly:tensor<1x?x?x?xf32>>) {
+      %output_height_size = iree_tensor_ext.dispatch.workload.ordinal
+          %output_height_arg, 0 : index
+      %output_width_size = iree_tensor_ext.dispatch.workload.ordinal
+          %output_width_arg, 1 : index
+      %channels_size = iree_tensor_ext.dispatch.workload.ordinal
+          %channels_arg, 2 : index
+      %pooled_shaped = flow.dispatch.tie_shape %pooled_binding
+          : !iree_tensor_ext.dispatch.tensor<readonly:tensor<1x?x?x?xf16>>{
+              %output_height_size, %output_width_size, %channels_size}
+      %init_shaped = flow.dispatch.tie_shape %init_binding
+          : !iree_tensor_ext.dispatch.tensor<readonly:tensor<1x?x?x?xf32>>{
+              %output_height_size, %output_width_size, %channels_size}
+      %final_shaped = flow.dispatch.tie_shape %final_binding
+          : !iree_tensor_ext.dispatch.tensor<writeonly:tensor<1x?x?x?xf32>>{
+              %output_height_size, %output_width_size, %channels_size}
+      %pooled_loaded = iree_tensor_ext.dispatch.tensor.load %pooled_shaped,
+          offsets = [0, 0, 0, 0],
+          sizes = [1, %output_height_size, %output_width_size, %channels_size],
+          strides = [1, 1, 1, 1]
+          : !iree_tensor_ext.dispatch.tensor<readonly:tensor<1x?x?x?xf16>>{
+              %output_height_size, %output_width_size, %channels_size}
+          -> tensor<1x?x?x?xf16>
+      %init_loaded = iree_tensor_ext.dispatch.tensor.load %init_shaped,
+          offsets = [0, 0, 0, 0],
+          sizes = [1, %output_height_size, %output_width_size, %channels_size],
+          strides = [1, 1, 1, 1]
+          : !iree_tensor_ext.dispatch.tensor<readonly:tensor<1x?x?x?xf32>>{
+              %output_height_size, %output_width_size, %channels_size}
+          -> tensor<1x?x?x?xf32>
+      %final_empty = tensor.empty(
+          %output_height_size, %output_width_size, %channels_size)
+          : tensor<1x?x?x?xf32>
+      %final_inner = linalg.generic {
+          indexing_maps = [
+            affine_map<(d0, d1, d2, d3) -> (d0, d1, d2, d3)>,
+            affine_map<(d0, d1, d2, d3) -> (d0, d1, d2, d3)>,
+            affine_map<(d0, d1, d2, d3) -> (d0, d1, d2, d3)>
+          ],
+          iterator_types = ["parallel", "parallel", "parallel", "parallel"]
+        } ins(%pooled_loaded, %init_loaded
+            : tensor<1x?x?x?xf16>, tensor<1x?x?x?xf32>)
+          outs(%final_empty : tensor<1x?x?x?xf32>) {
+        ^bb0(%pooled_value: f16, %initial: f32, %out: f32):
+          %pooled_f32 = arith.extf %pooled_value : f16 to f32
+          %accumulated = arith.maximumf %pooled_f32, %initial : f32
+          linalg.yield %accumulated : f32
+      } -> tensor<1x?x?x?xf32>
+      iree_tensor_ext.dispatch.tensor.store %final_inner, %final_shaped,
+          offsets = [0, 0, 0, 0],
+          sizes = [1, %output_height_size, %output_width_size, %channels_size],
+          strides = [1, 1, 1, 1]
+          : tensor<1x?x?x?xf32>
+          -> !iree_tensor_ext.dispatch.tensor<writeonly:tensor<1x?x?x?xf32>>{
+              %output_height_size, %output_width_size, %channels_size}
+      flow.return
+    } count(%output_height_workload: index,
+            %output_width_workload: index,
+            %channels_workload: index) -> (index, index, index) {
+      %x, %y, %z = iree_tensor_ext.dispatch.workgroup_count_from_slice(
+          %output_height_workload,
+          %output_width_workload,
+          %channels_workload)
+      flow.return %x, %y, %z : index, index, index
+    }
+
+    util.return %final_nhwc : tensor<1x?x?x?xf32>
+  }
+
+  // Max pool, NHWC, stride 2 -- the shape a real model actually has. Identical
+  // to the stride-1 shim but for the executable it dispatches to; stride is
+  // baked per executable, matching the convolution variants.
+  util.func private @call_rocket_pooling_max_nhwc_s2(
+      %input: tensor<1x?x?x?xf32>,
+      %window: tensor<?x?xf32>,
+      %init: tensor<1x?x?x?xf32>) -> tensor<1x?x?x?xf32> {
+    %c0 = arith.constant 0 : index
+    %c1 = arith.constant 1 : index
+    %c2 = arith.constant 2 : index
+    %c3 = arith.constant 3 : index
+
+    // NHWC: dims 1 and 2 are the spatial extent, dim 3 is channels.
+    %input_height = tensor.dim %input, %c1 : tensor<1x?x?x?xf32>
+    %input_width = tensor.dim %input, %c2 : tensor<1x?x?x?xf32>
+    %channels = tensor.dim %input, %c3 : tensor<1x?x?x?xf32>
+    // The window operand carries no values, only [kh, kw].
+    %kernel_height = tensor.dim %window, %c0 : tensor<?x?xf32>
+    %kernel_width = tensor.dim %window, %c1 : tensor<?x?xf32>
+    %output_height = tensor.dim %init, %c1 : tensor<1x?x?x?xf32>
+    %output_width = tensor.dim %init, %c2 : tensor<1x?x?x?xf32>
+
+    %input_width_i32 = arith.index_cast %input_width : index to i32
+    %input_height_i32 = arith.index_cast %input_height : index to i32
+    %channels_i32 = arith.index_cast %channels : index to i32
+    %kernel_width_i32 = arith.index_cast %kernel_width : index to i32
+    %kernel_height_i32 = arith.index_cast %kernel_height : index to i32
+
+    // The PPU pools in fp16; the model's tensor is f32.
+    %input_f16_empty = tensor.empty(%input_height, %input_width, %channels) : tensor<1x?x?x?xf16>
+    %input_f16 = linalg.generic {
+        indexing_maps = [
+          affine_map<(d0, d1, d2, d3) -> (d0, d1, d2, d3)>,
+          affine_map<(d0, d1, d2, d3) -> (d0, d1, d2, d3)>
+        ],
+        iterator_types = ["parallel", "parallel", "parallel", "parallel"]
+      } ins(%input : tensor<1x?x?x?xf32>)
+        outs(%input_f16_empty : tensor<1x?x?x?xf16>) {
+      ^bb0(%value: f32, %out: f16):
+        %narrowed = arith.truncf %value : f32 to f16
+        linalg.yield %narrowed : f16
+    } -> tensor<1x?x?x?xf16>
+
+    %pooled = flow.dispatch
+        @rocket_pooling_max_executable_s2::@rocket_pooling_max_v1::@rocket_pooling_max(
+          %input_width_i32, %input_height_i32, %channels_i32,
+          %kernel_width_i32, %kernel_height_i32,
+          %input_f16)
+        {stream.affinity = #hal.device.affinity<@rocket_device>}
+        : (i32, i32, i32, i32, i32,
+           tensor<1x?x?x?xf16>{%input_height, %input_width, %channels})
+        -> tensor<1x?x?x?xf16>{%output_height, %output_width, %channels}
+
+    // Widen back to f32 and fold in the accumulator initialiser. linalg
+    // defines a max pool as `O = max(O, I)`, so the init is part of the
+    // reduction rather than merely a destination, and dropping it would
+    // silently change the answer for any model that seeds it with something
+    // other than -inf.
+    //
+    // Explicitly a CPU dispatch, for the reason @call_rocket_pooling_avg_nchw
+    // records: an op that consumes the Rocket result inherits its affinity,
+    // gets formed into an executable for the rocket device, and that
+    // executable has no pooling config to serialize. The failure is a
+    // serialization error naming a missing `input_width`, a long way from
+    // the cause.
+    %final_nhwc = flow.dispatch.workgroups[
+        %output_height, %output_width, %channels](
+        %pooled, %init, %output_height, %output_width, %channels)
+        : (tensor<1x?x?x?xf16>{%output_height, %output_width, %channels},
+           tensor<1x?x?x?xf32>{%output_height, %output_width, %channels},
+           index, index, index)
+        -> tensor<1x?x?x?xf32>{%output_height, %output_width, %channels}
+        attributes { stream.affinity = #hal.device.affinity<@cpu_device> } =
+        (%pooled_binding: !iree_tensor_ext.dispatch.tensor<readonly:tensor<1x?x?x?xf16>>,
+         %init_binding: !iree_tensor_ext.dispatch.tensor<readonly:tensor<1x?x?x?xf32>>,
+         %output_height_arg: index,
+         %output_width_arg: index,
+         %channels_arg: index,
+         %final_binding: !iree_tensor_ext.dispatch.tensor<writeonly:tensor<1x?x?x?xf32>>) {
+      %output_height_size = iree_tensor_ext.dispatch.workload.ordinal
+          %output_height_arg, 0 : index
+      %output_width_size = iree_tensor_ext.dispatch.workload.ordinal
+          %output_width_arg, 1 : index
+      %channels_size = iree_tensor_ext.dispatch.workload.ordinal
+          %channels_arg, 2 : index
+      %pooled_shaped = flow.dispatch.tie_shape %pooled_binding
+          : !iree_tensor_ext.dispatch.tensor<readonly:tensor<1x?x?x?xf16>>{
+              %output_height_size, %output_width_size, %channels_size}
+      %init_shaped = flow.dispatch.tie_shape %init_binding
+          : !iree_tensor_ext.dispatch.tensor<readonly:tensor<1x?x?x?xf32>>{
+              %output_height_size, %output_width_size, %channels_size}
+      %final_shaped = flow.dispatch.tie_shape %final_binding
+          : !iree_tensor_ext.dispatch.tensor<writeonly:tensor<1x?x?x?xf32>>{
+              %output_height_size, %output_width_size, %channels_size}
+      %pooled_loaded = iree_tensor_ext.dispatch.tensor.load %pooled_shaped,
+          offsets = [0, 0, 0, 0],
+          sizes = [1, %output_height_size, %output_width_size, %channels_size],
+          strides = [1, 1, 1, 1]
+          : !iree_tensor_ext.dispatch.tensor<readonly:tensor<1x?x?x?xf16>>{
+              %output_height_size, %output_width_size, %channels_size}
+          -> tensor<1x?x?x?xf16>
+      %init_loaded = iree_tensor_ext.dispatch.tensor.load %init_shaped,
+          offsets = [0, 0, 0, 0],
+          sizes = [1, %output_height_size, %output_width_size, %channels_size],
+          strides = [1, 1, 1, 1]
+          : !iree_tensor_ext.dispatch.tensor<readonly:tensor<1x?x?x?xf32>>{
+              %output_height_size, %output_width_size, %channels_size}
+          -> tensor<1x?x?x?xf32>
+      %final_empty = tensor.empty(
+          %output_height_size, %output_width_size, %channels_size)
+          : tensor<1x?x?x?xf32>
+      %final_inner = linalg.generic {
+          indexing_maps = [
+            affine_map<(d0, d1, d2, d3) -> (d0, d1, d2, d3)>,
+            affine_map<(d0, d1, d2, d3) -> (d0, d1, d2, d3)>,
+            affine_map<(d0, d1, d2, d3) -> (d0, d1, d2, d3)>
+          ],
+          iterator_types = ["parallel", "parallel", "parallel", "parallel"]
+        } ins(%pooled_loaded, %init_loaded
+            : tensor<1x?x?x?xf16>, tensor<1x?x?x?xf32>)
+          outs(%final_empty : tensor<1x?x?x?xf32>) {
+        ^bb0(%pooled_value: f16, %initial: f32, %out: f32):
+          %pooled_f32 = arith.extf %pooled_value : f16 to f32
+          %accumulated = arith.maximumf %pooled_f32, %initial : f32
+          linalg.yield %accumulated : f32
+      } -> tensor<1x?x?x?xf32>
+      iree_tensor_ext.dispatch.tensor.store %final_inner, %final_shaped,
+          offsets = [0, 0, 0, 0],
+          sizes = [1, %output_height_size, %output_width_size, %channels_size],
+          strides = [1, 1, 1, 1]
+          : tensor<1x?x?x?xf32>
+          -> !iree_tensor_ext.dispatch.tensor<writeonly:tensor<1x?x?x?xf32>>{
+              %output_height_size, %output_width_size, %channels_size}
+      flow.return
+    } count(%output_height_workload: index,
+            %output_width_workload: index,
+            %channels_workload: index) -> (index, index, index) {
+      %x, %y, %z = iree_tensor_ext.dispatch.workgroup_count_from_slice(
+          %output_height_workload,
+          %output_width_workload,
+          %channels_workload)
+      flow.return %x, %y, %z : index, index, index
+    }
+
+    util.return %final_nhwc : tensor<1x?x?x?xf32>
+  }
+
+  // Max pool, NCHW, stride 1. ONNX imports max pools NCHW, and
+  // iree-preprocessing-convert-conv-to-channels-last does not touch pooling
+  // ops -- verified here: a linalg.pooling_nchw_max survives the spec's
+  // preprocessing unchanged. So this layout needs its own shim rather than
+  // being normalized into the NHWC one above.
+  util.func private @call_rocket_pooling_max_nchw(
+      %input: tensor<1x?x?x?xf32>,
+      %window: tensor<?x?xf32>,
+      %init: tensor<1x?x?x?xf32>) -> tensor<1x?x?x?xf32> {
+    %c0 = arith.constant 0 : index
+    %c1 = arith.constant 1 : index
+    %c2 = arith.constant 2 : index
+    %c3 = arith.constant 3 : index
+
+    // NCHW: dim 1 is channels, dims 2 and 3 are the spatial extent.
+    %channels = tensor.dim %input, %c1 : tensor<1x?x?x?xf32>
+    %input_height = tensor.dim %input, %c2 : tensor<1x?x?x?xf32>
+    %input_width = tensor.dim %input, %c3 : tensor<1x?x?x?xf32>
+    // The window operand carries no values, only [kh, kw].
+    %kernel_height = tensor.dim %window, %c0 : tensor<?x?xf32>
+    %kernel_width = tensor.dim %window, %c1 : tensor<?x?xf32>
+    %output_height = tensor.dim %init, %c2 : tensor<1x?x?x?xf32>
+    %output_width = tensor.dim %init, %c3 : tensor<1x?x?x?xf32>
+
+    %input_width_i32 = arith.index_cast %input_width : index to i32
+    %input_height_i32 = arith.index_cast %input_height : index to i32
+    %channels_i32 = arith.index_cast %channels : index to i32
+    %kernel_width_i32 = arith.index_cast %kernel_width : index to i32
+    %kernel_height_i32 = arith.index_cast %kernel_height : index to i32
+
+    // NCHW [1,C,H,W] -> NHWC [1,H,W,C]: out.shape[i] = in.shape[perm[i]].
+    %input_nhwc_empty = tensor.empty(%input_height, %input_width, %channels) : tensor<1x?x?x?xf32>
+    %input_nhwc = linalg.transpose
+        ins(%input : tensor<1x?x?x?xf32>)
+        outs(%input_nhwc_empty : tensor<1x?x?x?xf32>)
+        permutation = [0, 2, 3, 1]
+
+    // The PPU pools in fp16; the model's tensor is f32.
+    %input_f16_empty = tensor.empty(%input_height, %input_width, %channels) : tensor<1x?x?x?xf16>
+    %input_f16 = linalg.generic {
+        indexing_maps = [
+          affine_map<(d0, d1, d2, d3) -> (d0, d1, d2, d3)>,
+          affine_map<(d0, d1, d2, d3) -> (d0, d1, d2, d3)>
+        ],
+        iterator_types = ["parallel", "parallel", "parallel", "parallel"]
+      } ins(%input_nhwc : tensor<1x?x?x?xf32>)
+        outs(%input_f16_empty : tensor<1x?x?x?xf16>) {
+      ^bb0(%value: f32, %out: f16):
+        %narrowed = arith.truncf %value : f32 to f16
+        linalg.yield %narrowed : f16
+    } -> tensor<1x?x?x?xf16>
+
+    %pooled = flow.dispatch
+        @rocket_pooling_max_executable::@rocket_pooling_max_v1::@rocket_pooling_max(
+          %input_width_i32, %input_height_i32, %channels_i32,
+          %kernel_width_i32, %kernel_height_i32,
+          %input_f16)
+        {stream.affinity = #hal.device.affinity<@rocket_device>}
+        : (i32, i32, i32, i32, i32,
+           tensor<1x?x?x?xf16>{%input_height, %input_width, %channels})
+        -> tensor<1x?x?x?xf16>{%output_height, %output_width, %channels}
+
+    // %init arrives NCHW too; line it up with the NHWC result.
+    %init_nhwc_empty = tensor.empty(%output_height, %output_width, %channels) : tensor<1x?x?x?xf32>
+    %init_nhwc = linalg.transpose
+        ins(%init : tensor<1x?x?x?xf32>)
+        outs(%init_nhwc_empty : tensor<1x?x?x?xf32>)
+        permutation = [0, 2, 3, 1]
+
+    // Widen back to f32 and fold in the accumulator initialiser. linalg
+    // defines a max pool as `O = max(O, I)`, so the init is part of the
+    // reduction rather than merely a destination, and dropping it would
+    // silently change the answer for any model that seeds it with something
+    // other than -inf.
+    //
+    // Explicitly a CPU dispatch, for the reason @call_rocket_pooling_avg_nchw
+    // records: an op that consumes the Rocket result inherits its affinity,
+    // gets formed into an executable for the rocket device, and that
+    // executable has no pooling config to serialize. The failure is a
+    // serialization error naming a missing `input_width`, a long way from
+    // the cause.
+    %final_nhwc = flow.dispatch.workgroups[
+        %output_height, %output_width, %channels](
+        %pooled, %init_nhwc, %output_height, %output_width, %channels)
+        : (tensor<1x?x?x?xf16>{%output_height, %output_width, %channels},
+           tensor<1x?x?x?xf32>{%output_height, %output_width, %channels},
+           index, index, index)
+        -> tensor<1x?x?x?xf32>{%output_height, %output_width, %channels}
+        attributes { stream.affinity = #hal.device.affinity<@cpu_device> } =
+        (%pooled_binding: !iree_tensor_ext.dispatch.tensor<readonly:tensor<1x?x?x?xf16>>,
+         %init_binding: !iree_tensor_ext.dispatch.tensor<readonly:tensor<1x?x?x?xf32>>,
+         %output_height_arg: index,
+         %output_width_arg: index,
+         %channels_arg: index,
+         %final_binding: !iree_tensor_ext.dispatch.tensor<writeonly:tensor<1x?x?x?xf32>>) {
+      %output_height_size = iree_tensor_ext.dispatch.workload.ordinal
+          %output_height_arg, 0 : index
+      %output_width_size = iree_tensor_ext.dispatch.workload.ordinal
+          %output_width_arg, 1 : index
+      %channels_size = iree_tensor_ext.dispatch.workload.ordinal
+          %channels_arg, 2 : index
+      %pooled_shaped = flow.dispatch.tie_shape %pooled_binding
+          : !iree_tensor_ext.dispatch.tensor<readonly:tensor<1x?x?x?xf16>>{
+              %output_height_size, %output_width_size, %channels_size}
+      %init_shaped = flow.dispatch.tie_shape %init_binding
+          : !iree_tensor_ext.dispatch.tensor<readonly:tensor<1x?x?x?xf32>>{
+              %output_height_size, %output_width_size, %channels_size}
+      %final_shaped = flow.dispatch.tie_shape %final_binding
+          : !iree_tensor_ext.dispatch.tensor<writeonly:tensor<1x?x?x?xf32>>{
+              %output_height_size, %output_width_size, %channels_size}
+      %pooled_loaded = iree_tensor_ext.dispatch.tensor.load %pooled_shaped,
+          offsets = [0, 0, 0, 0],
+          sizes = [1, %output_height_size, %output_width_size, %channels_size],
+          strides = [1, 1, 1, 1]
+          : !iree_tensor_ext.dispatch.tensor<readonly:tensor<1x?x?x?xf16>>{
+              %output_height_size, %output_width_size, %channels_size}
+          -> tensor<1x?x?x?xf16>
+      %init_loaded = iree_tensor_ext.dispatch.tensor.load %init_shaped,
+          offsets = [0, 0, 0, 0],
+          sizes = [1, %output_height_size, %output_width_size, %channels_size],
+          strides = [1, 1, 1, 1]
+          : !iree_tensor_ext.dispatch.tensor<readonly:tensor<1x?x?x?xf32>>{
+              %output_height_size, %output_width_size, %channels_size}
+          -> tensor<1x?x?x?xf32>
+      %final_empty = tensor.empty(
+          %output_height_size, %output_width_size, %channels_size)
+          : tensor<1x?x?x?xf32>
+      %final_inner = linalg.generic {
+          indexing_maps = [
+            affine_map<(d0, d1, d2, d3) -> (d0, d1, d2, d3)>,
+            affine_map<(d0, d1, d2, d3) -> (d0, d1, d2, d3)>,
+            affine_map<(d0, d1, d2, d3) -> (d0, d1, d2, d3)>
+          ],
+          iterator_types = ["parallel", "parallel", "parallel", "parallel"]
+        } ins(%pooled_loaded, %init_loaded
+            : tensor<1x?x?x?xf16>, tensor<1x?x?x?xf32>)
+          outs(%final_empty : tensor<1x?x?x?xf32>) {
+        ^bb0(%pooled_value: f16, %initial: f32, %out: f32):
+          %pooled_f32 = arith.extf %pooled_value : f16 to f32
+          %accumulated = arith.maximumf %pooled_f32, %initial : f32
+          linalg.yield %accumulated : f32
+      } -> tensor<1x?x?x?xf32>
+      iree_tensor_ext.dispatch.tensor.store %final_inner, %final_shaped,
+          offsets = [0, 0, 0, 0],
+          sizes = [1, %output_height_size, %output_width_size, %channels_size],
+          strides = [1, 1, 1, 1]
+          : tensor<1x?x?x?xf32>
+          -> !iree_tensor_ext.dispatch.tensor<writeonly:tensor<1x?x?x?xf32>>{
+              %output_height_size, %output_width_size, %channels_size}
+      flow.return
+    } count(%output_height_workload: index,
+            %output_width_workload: index,
+            %channels_workload: index) -> (index, index, index) {
+      %x, %y, %z = iree_tensor_ext.dispatch.workgroup_count_from_slice(
+          %output_height_workload,
+          %output_width_workload,
+          %channels_workload)
+      flow.return %x, %y, %z : index, index, index
+    }
+
+    // NHWC [1,H,W,C] -> NCHW [1,C,H,W].
+    %final_nchw_empty = tensor.empty(%channels, %output_height, %output_width) : tensor<1x?x?x?xf32>
+    %final_nchw = linalg.transpose
+        ins(%final_nhwc : tensor<1x?x?x?xf32>)
+        outs(%final_nchw_empty : tensor<1x?x?x?xf32>)
+        permutation = [0, 3, 1, 2]
+
+    util.return %final_nchw : tensor<1x?x?x?xf32>
+  }
+
+  // Max pool, NCHW, stride 2.
+  util.func private @call_rocket_pooling_max_nchw_s2(
+      %input: tensor<1x?x?x?xf32>,
+      %window: tensor<?x?xf32>,
+      %init: tensor<1x?x?x?xf32>) -> tensor<1x?x?x?xf32> {
+    %c0 = arith.constant 0 : index
+    %c1 = arith.constant 1 : index
+    %c2 = arith.constant 2 : index
+    %c3 = arith.constant 3 : index
+
+    // NCHW: dim 1 is channels, dims 2 and 3 are the spatial extent.
+    %channels = tensor.dim %input, %c1 : tensor<1x?x?x?xf32>
+    %input_height = tensor.dim %input, %c2 : tensor<1x?x?x?xf32>
+    %input_width = tensor.dim %input, %c3 : tensor<1x?x?x?xf32>
+    // The window operand carries no values, only [kh, kw].
+    %kernel_height = tensor.dim %window, %c0 : tensor<?x?xf32>
+    %kernel_width = tensor.dim %window, %c1 : tensor<?x?xf32>
+    %output_height = tensor.dim %init, %c2 : tensor<1x?x?x?xf32>
+    %output_width = tensor.dim %init, %c3 : tensor<1x?x?x?xf32>
+
+    %input_width_i32 = arith.index_cast %input_width : index to i32
+    %input_height_i32 = arith.index_cast %input_height : index to i32
+    %channels_i32 = arith.index_cast %channels : index to i32
+    %kernel_width_i32 = arith.index_cast %kernel_width : index to i32
+    %kernel_height_i32 = arith.index_cast %kernel_height : index to i32
+
+    // NCHW [1,C,H,W] -> NHWC [1,H,W,C]: out.shape[i] = in.shape[perm[i]].
+    %input_nhwc_empty = tensor.empty(%input_height, %input_width, %channels) : tensor<1x?x?x?xf32>
+    %input_nhwc = linalg.transpose
+        ins(%input : tensor<1x?x?x?xf32>)
+        outs(%input_nhwc_empty : tensor<1x?x?x?xf32>)
+        permutation = [0, 2, 3, 1]
+
+    // The PPU pools in fp16; the model's tensor is f32.
+    %input_f16_empty = tensor.empty(%input_height, %input_width, %channels) : tensor<1x?x?x?xf16>
+    %input_f16 = linalg.generic {
+        indexing_maps = [
+          affine_map<(d0, d1, d2, d3) -> (d0, d1, d2, d3)>,
+          affine_map<(d0, d1, d2, d3) -> (d0, d1, d2, d3)>
+        ],
+        iterator_types = ["parallel", "parallel", "parallel", "parallel"]
+      } ins(%input_nhwc : tensor<1x?x?x?xf32>)
+        outs(%input_f16_empty : tensor<1x?x?x?xf16>) {
+      ^bb0(%value: f32, %out: f16):
+        %narrowed = arith.truncf %value : f32 to f16
+        linalg.yield %narrowed : f16
+    } -> tensor<1x?x?x?xf16>
+
+    %pooled = flow.dispatch
+        @rocket_pooling_max_executable_s2::@rocket_pooling_max_v1::@rocket_pooling_max(
+          %input_width_i32, %input_height_i32, %channels_i32,
+          %kernel_width_i32, %kernel_height_i32,
+          %input_f16)
+        {stream.affinity = #hal.device.affinity<@rocket_device>}
+        : (i32, i32, i32, i32, i32,
+           tensor<1x?x?x?xf16>{%input_height, %input_width, %channels})
+        -> tensor<1x?x?x?xf16>{%output_height, %output_width, %channels}
+
+    // %init arrives NCHW too; line it up with the NHWC result.
+    %init_nhwc_empty = tensor.empty(%output_height, %output_width, %channels) : tensor<1x?x?x?xf32>
+    %init_nhwc = linalg.transpose
+        ins(%init : tensor<1x?x?x?xf32>)
+        outs(%init_nhwc_empty : tensor<1x?x?x?xf32>)
+        permutation = [0, 2, 3, 1]
+
+    // Widen back to f32 and fold in the accumulator initialiser. linalg
+    // defines a max pool as `O = max(O, I)`, so the init is part of the
+    // reduction rather than merely a destination, and dropping it would
+    // silently change the answer for any model that seeds it with something
+    // other than -inf.
+    //
+    // Explicitly a CPU dispatch, for the reason @call_rocket_pooling_avg_nchw
+    // records: an op that consumes the Rocket result inherits its affinity,
+    // gets formed into an executable for the rocket device, and that
+    // executable has no pooling config to serialize. The failure is a
+    // serialization error naming a missing `input_width`, a long way from
+    // the cause.
+    %final_nhwc = flow.dispatch.workgroups[
+        %output_height, %output_width, %channels](
+        %pooled, %init_nhwc, %output_height, %output_width, %channels)
+        : (tensor<1x?x?x?xf16>{%output_height, %output_width, %channels},
+           tensor<1x?x?x?xf32>{%output_height, %output_width, %channels},
+           index, index, index)
+        -> tensor<1x?x?x?xf32>{%output_height, %output_width, %channels}
+        attributes { stream.affinity = #hal.device.affinity<@cpu_device> } =
+        (%pooled_binding: !iree_tensor_ext.dispatch.tensor<readonly:tensor<1x?x?x?xf16>>,
+         %init_binding: !iree_tensor_ext.dispatch.tensor<readonly:tensor<1x?x?x?xf32>>,
+         %output_height_arg: index,
+         %output_width_arg: index,
+         %channels_arg: index,
+         %final_binding: !iree_tensor_ext.dispatch.tensor<writeonly:tensor<1x?x?x?xf32>>) {
+      %output_height_size = iree_tensor_ext.dispatch.workload.ordinal
+          %output_height_arg, 0 : index
+      %output_width_size = iree_tensor_ext.dispatch.workload.ordinal
+          %output_width_arg, 1 : index
+      %channels_size = iree_tensor_ext.dispatch.workload.ordinal
+          %channels_arg, 2 : index
+      %pooled_shaped = flow.dispatch.tie_shape %pooled_binding
+          : !iree_tensor_ext.dispatch.tensor<readonly:tensor<1x?x?x?xf16>>{
+              %output_height_size, %output_width_size, %channels_size}
+      %init_shaped = flow.dispatch.tie_shape %init_binding
+          : !iree_tensor_ext.dispatch.tensor<readonly:tensor<1x?x?x?xf32>>{
+              %output_height_size, %output_width_size, %channels_size}
+      %final_shaped = flow.dispatch.tie_shape %final_binding
+          : !iree_tensor_ext.dispatch.tensor<writeonly:tensor<1x?x?x?xf32>>{
+              %output_height_size, %output_width_size, %channels_size}
+      %pooled_loaded = iree_tensor_ext.dispatch.tensor.load %pooled_shaped,
+          offsets = [0, 0, 0, 0],
+          sizes = [1, %output_height_size, %output_width_size, %channels_size],
+          strides = [1, 1, 1, 1]
+          : !iree_tensor_ext.dispatch.tensor<readonly:tensor<1x?x?x?xf16>>{
+              %output_height_size, %output_width_size, %channels_size}
+          -> tensor<1x?x?x?xf16>
+      %init_loaded = iree_tensor_ext.dispatch.tensor.load %init_shaped,
+          offsets = [0, 0, 0, 0],
+          sizes = [1, %output_height_size, %output_width_size, %channels_size],
+          strides = [1, 1, 1, 1]
+          : !iree_tensor_ext.dispatch.tensor<readonly:tensor<1x?x?x?xf32>>{
+              %output_height_size, %output_width_size, %channels_size}
+          -> tensor<1x?x?x?xf32>
+      %final_empty = tensor.empty(
+          %output_height_size, %output_width_size, %channels_size)
+          : tensor<1x?x?x?xf32>
+      %final_inner = linalg.generic {
+          indexing_maps = [
+            affine_map<(d0, d1, d2, d3) -> (d0, d1, d2, d3)>,
+            affine_map<(d0, d1, d2, d3) -> (d0, d1, d2, d3)>,
+            affine_map<(d0, d1, d2, d3) -> (d0, d1, d2, d3)>
+          ],
+          iterator_types = ["parallel", "parallel", "parallel", "parallel"]
+        } ins(%pooled_loaded, %init_loaded
+            : tensor<1x?x?x?xf16>, tensor<1x?x?x?xf32>)
+          outs(%final_empty : tensor<1x?x?x?xf32>) {
+        ^bb0(%pooled_value: f16, %initial: f32, %out: f32):
+          %pooled_f32 = arith.extf %pooled_value : f16 to f32
+          %accumulated = arith.maximumf %pooled_f32, %initial : f32
           linalg.yield %accumulated : f32
       } -> tensor<1x?x?x?xf32>
       iree_tensor_ext.dispatch.tensor.store %final_inner, %final_shaped,
@@ -2514,6 +3216,125 @@ module attributes {transform.with_named_sequence} {
   // Wider images are not excluded: `PoolingPlan` splits them into tiles the
   // hardware is measured to run, including the narrow ones an overlapping
   // window needs (see `overlapping_window_width_limits`).
+
+  // The max-pool matchers.
+  //
+  // Dimension buckets are @match_pooling_nchw_sum_avg's, unchanged: a pool's
+  // channel is a pure parallel dimension, so it joins the *batch* group in
+  // both layouts rather than becoming an out_ch, and `out_ch`/`in_ch`/`depth`
+  // are all empty. That is a property of the reduction's shape, not of the
+  // data layout, which is why NHWC and NCHW read identically here.
+  //
+  // The bounds are the average pool's too, including the kernel floor of 2.
+  // For the average that floor is forced -- its reciprocal is fp16(65536/k)
+  // and k=1 needs 65536, past fp16's 65504. A max pool computes no
+  // reciprocal, so 1 would be programmable; it is excluded anyway because a
+  // 1x1 stride-1 max pool is an identity, and claiming one would spend a
+  // whole NPU dispatch, a pack and a compaction to copy a tensor.
+  //
+  // Stride 1 and 2 only: 2 is measured against the oracle in
+  // `pooling_oracle_hw.rs`, and nothing above it is.
+
+  transform.named_sequence @match_pooling_nhwc_max(%root: !transform.any_op {transform.readonly}) -> !transform.any_op {
+    transform.match.operation_name %root ["linalg.pooling_nhwc_max"] : !transform.any_op
+    %batch, %out_img, %out_ch, %filter, %in_ch, %depth, %strides, %dilations =
+        transform.iree.match.convolution %root,
+          lhs_type = f32, rhs_type = f32, output_type = f32
+          : !transform.any_op -> !transform.param<i64>
+    transform.iree.match.dims_equal %batch, [1, -1] : !transform.param<i64>
+    transform.iree.match.dims_equal %out_img, [-1, -1] : !transform.param<i64>
+    transform.iree.match.dims_equal %out_ch, [] : !transform.param<i64>
+    transform.iree.match.dims_equal %in_ch, [] : !transform.param<i64>
+    transform.iree.match.dims_equal %depth, [] : !transform.param<i64>
+    transform.iree.match.dims_equal %filter, [-1, -1] : !transform.param<i64>
+    transform.iree.match.dims_equal %strides, [1, 1] : !transform.param<i64>
+    transform.iree.match.dims_equal %dilations, [1, 1] : !transform.param<i64>
+
+    %input_value = transform.get_operand %root[0] : (!transform.any_op) -> !transform.any_value
+    %window_value = transform.get_operand %root[1] : (!transform.any_op) -> !transform.any_value
+    transform.iree.match.dim_bounds %input_value[1], umin = 1, umax = 8192 : !transform.any_value
+    transform.iree.match.dim_bounds %input_value[2], umin = 1, umax = 8192 : !transform.any_value
+    transform.iree.match.dim_bounds %input_value[3], umin = 1, umax = 8192 : !transform.any_value
+    transform.iree.match.dim_bounds %window_value[0], umin = 2, umax = 8 : !transform.any_value
+    transform.iree.match.dim_bounds %window_value[1], umin = 2, umax = 8 : !transform.any_value
+    transform.yield %root : !transform.any_op
+  }
+
+  transform.named_sequence @match_pooling_nhwc_max_s2(%root: !transform.any_op {transform.readonly}) -> !transform.any_op {
+    transform.match.operation_name %root ["linalg.pooling_nhwc_max"] : !transform.any_op
+    %batch, %out_img, %out_ch, %filter, %in_ch, %depth, %strides, %dilations =
+        transform.iree.match.convolution %root,
+          lhs_type = f32, rhs_type = f32, output_type = f32
+          : !transform.any_op -> !transform.param<i64>
+    transform.iree.match.dims_equal %batch, [1, -1] : !transform.param<i64>
+    transform.iree.match.dims_equal %out_img, [-1, -1] : !transform.param<i64>
+    transform.iree.match.dims_equal %out_ch, [] : !transform.param<i64>
+    transform.iree.match.dims_equal %in_ch, [] : !transform.param<i64>
+    transform.iree.match.dims_equal %depth, [] : !transform.param<i64>
+    transform.iree.match.dims_equal %filter, [-1, -1] : !transform.param<i64>
+    transform.iree.match.dims_equal %strides, [2, 2] : !transform.param<i64>
+    transform.iree.match.dims_equal %dilations, [1, 1] : !transform.param<i64>
+
+    %input_value = transform.get_operand %root[0] : (!transform.any_op) -> !transform.any_value
+    %window_value = transform.get_operand %root[1] : (!transform.any_op) -> !transform.any_value
+    transform.iree.match.dim_bounds %input_value[1], umin = 1, umax = 8192 : !transform.any_value
+    transform.iree.match.dim_bounds %input_value[2], umin = 1, umax = 8192 : !transform.any_value
+    transform.iree.match.dim_bounds %input_value[3], umin = 1, umax = 8192 : !transform.any_value
+    transform.iree.match.dim_bounds %window_value[0], umin = 2, umax = 8 : !transform.any_value
+    transform.iree.match.dim_bounds %window_value[1], umin = 2, umax = 8 : !transform.any_value
+    transform.yield %root : !transform.any_op
+  }
+
+  transform.named_sequence @match_pooling_nchw_max(%root: !transform.any_op {transform.readonly}) -> !transform.any_op {
+    transform.match.operation_name %root ["linalg.pooling_nchw_max"] : !transform.any_op
+    %batch, %out_img, %out_ch, %filter, %in_ch, %depth, %strides, %dilations =
+        transform.iree.match.convolution %root,
+          lhs_type = f32, rhs_type = f32, output_type = f32
+          : !transform.any_op -> !transform.param<i64>
+    transform.iree.match.dims_equal %batch, [1, -1] : !transform.param<i64>
+    transform.iree.match.dims_equal %out_img, [-1, -1] : !transform.param<i64>
+    transform.iree.match.dims_equal %out_ch, [] : !transform.param<i64>
+    transform.iree.match.dims_equal %in_ch, [] : !transform.param<i64>
+    transform.iree.match.dims_equal %depth, [] : !transform.param<i64>
+    transform.iree.match.dims_equal %filter, [-1, -1] : !transform.param<i64>
+    transform.iree.match.dims_equal %strides, [1, 1] : !transform.param<i64>
+    transform.iree.match.dims_equal %dilations, [1, 1] : !transform.param<i64>
+
+    %input_value = transform.get_operand %root[0] : (!transform.any_op) -> !transform.any_value
+    %window_value = transform.get_operand %root[1] : (!transform.any_op) -> !transform.any_value
+    transform.iree.match.dim_bounds %input_value[1], umin = 1, umax = 8192 : !transform.any_value
+    transform.iree.match.dim_bounds %input_value[2], umin = 1, umax = 8192 : !transform.any_value
+    transform.iree.match.dim_bounds %input_value[3], umin = 1, umax = 8192 : !transform.any_value
+    transform.iree.match.dim_bounds %window_value[0], umin = 2, umax = 8 : !transform.any_value
+    transform.iree.match.dim_bounds %window_value[1], umin = 2, umax = 8 : !transform.any_value
+    transform.yield %root : !transform.any_op
+  }
+
+  transform.named_sequence @match_pooling_nchw_max_s2(%root: !transform.any_op {transform.readonly}) -> !transform.any_op {
+    transform.match.operation_name %root ["linalg.pooling_nchw_max"] : !transform.any_op
+    %batch, %out_img, %out_ch, %filter, %in_ch, %depth, %strides, %dilations =
+        transform.iree.match.convolution %root,
+          lhs_type = f32, rhs_type = f32, output_type = f32
+          : !transform.any_op -> !transform.param<i64>
+    transform.iree.match.dims_equal %batch, [1, -1] : !transform.param<i64>
+    transform.iree.match.dims_equal %out_img, [-1, -1] : !transform.param<i64>
+    transform.iree.match.dims_equal %out_ch, [] : !transform.param<i64>
+    transform.iree.match.dims_equal %in_ch, [] : !transform.param<i64>
+    transform.iree.match.dims_equal %depth, [] : !transform.param<i64>
+    transform.iree.match.dims_equal %filter, [-1, -1] : !transform.param<i64>
+    transform.iree.match.dims_equal %strides, [2, 2] : !transform.param<i64>
+    transform.iree.match.dims_equal %dilations, [1, 1] : !transform.param<i64>
+
+    %input_value = transform.get_operand %root[0] : (!transform.any_op) -> !transform.any_value
+    %window_value = transform.get_operand %root[1] : (!transform.any_op) -> !transform.any_value
+    transform.iree.match.dim_bounds %input_value[1], umin = 1, umax = 8192 : !transform.any_value
+    transform.iree.match.dim_bounds %input_value[2], umin = 1, umax = 8192 : !transform.any_value
+    transform.iree.match.dim_bounds %input_value[3], umin = 1, umax = 8192 : !transform.any_value
+    transform.iree.match.dim_bounds %window_value[0], umin = 2, umax = 8 : !transform.any_value
+    transform.iree.match.dim_bounds %window_value[1], umin = 2, umax = 8 : !transform.any_value
+    transform.yield %root : !transform.any_op
+  }
+
   transform.named_sequence @match_pooling_nchw_sum_avg(%root: !transform.any_op {transform.readonly}) -> !transform.any_op {
     transform.match.operation_name %root ["linalg.pooling_nchw_sum"] : !transform.any_op
     %batch, %out_img, %out_ch, %filter, %in_ch, %depth, %strides, %dilations =
@@ -3219,6 +4040,75 @@ module attributes {transform.with_named_sequence} {
     transform.yield
   }
 
+
+  transform.named_sequence @cast_and_call_pooling_max_nhwc(%root: !transform.any_op {transform.readonly}) {
+    %ins = transform.get_operand %root[all] : (!transform.any_op) -> !transform.any_value
+    %out = transform.get_result %root[all] : (!transform.any_op) -> !transform.any_value
+    %module = transform.util.get_nearest_symbol_table %root : (!transform.any_op) -> !transform.any_op
+    %topology_attr = transform.param.constant #hal.device.topology<links = [
+        (@rocket_device -> @cpu_device = {transparent_access = true, unified_memory = true}),
+        (@cpu_device -> @rocket_device = {transparent_access = true, unified_memory = true})
+      ]> -> !transform.any_param
+    transform.annotate %module "stream.topology" = %topology_attr : !transform.any_op, !transform.any_param
+    %executable = transform.util.import_symbol @rocket_pooling_max_executable into %module if undefined : (!transform.any_op) -> !transform.any_op
+    %func = transform.util.import_symbol @call_rocket_pooling_max_nhwc into %module if undefined : (!transform.any_op) -> !transform.any_op
+    transform.util.cast_and_call %func(%ins) -> %out after %root {
+          transform.type_conversion.tensor.cast_shape_dynamic_dims
+      } : (!transform.any_op, !transform.any_value, !transform.any_value, !transform.any_op) -> !transform.any_op
+    transform.yield
+  }
+
+  transform.named_sequence @cast_and_call_pooling_max_nhwc_s2(%root: !transform.any_op {transform.readonly}) {
+    %ins = transform.get_operand %root[all] : (!transform.any_op) -> !transform.any_value
+    %out = transform.get_result %root[all] : (!transform.any_op) -> !transform.any_value
+    %module = transform.util.get_nearest_symbol_table %root : (!transform.any_op) -> !transform.any_op
+    %topology_attr = transform.param.constant #hal.device.topology<links = [
+        (@rocket_device -> @cpu_device = {transparent_access = true, unified_memory = true}),
+        (@cpu_device -> @rocket_device = {transparent_access = true, unified_memory = true})
+      ]> -> !transform.any_param
+    transform.annotate %module "stream.topology" = %topology_attr : !transform.any_op, !transform.any_param
+    %executable = transform.util.import_symbol @rocket_pooling_max_executable_s2 into %module if undefined : (!transform.any_op) -> !transform.any_op
+    %func = transform.util.import_symbol @call_rocket_pooling_max_nhwc_s2 into %module if undefined : (!transform.any_op) -> !transform.any_op
+    transform.util.cast_and_call %func(%ins) -> %out after %root {
+          transform.type_conversion.tensor.cast_shape_dynamic_dims
+      } : (!transform.any_op, !transform.any_value, !transform.any_value, !transform.any_op) -> !transform.any_op
+    transform.yield
+  }
+
+  transform.named_sequence @cast_and_call_pooling_max_nchw(%root: !transform.any_op {transform.readonly}) {
+    %ins = transform.get_operand %root[all] : (!transform.any_op) -> !transform.any_value
+    %out = transform.get_result %root[all] : (!transform.any_op) -> !transform.any_value
+    %module = transform.util.get_nearest_symbol_table %root : (!transform.any_op) -> !transform.any_op
+    %topology_attr = transform.param.constant #hal.device.topology<links = [
+        (@rocket_device -> @cpu_device = {transparent_access = true, unified_memory = true}),
+        (@cpu_device -> @rocket_device = {transparent_access = true, unified_memory = true})
+      ]> -> !transform.any_param
+    transform.annotate %module "stream.topology" = %topology_attr : !transform.any_op, !transform.any_param
+    %executable = transform.util.import_symbol @rocket_pooling_max_executable into %module if undefined : (!transform.any_op) -> !transform.any_op
+    %func = transform.util.import_symbol @call_rocket_pooling_max_nchw into %module if undefined : (!transform.any_op) -> !transform.any_op
+    transform.util.cast_and_call %func(%ins) -> %out after %root {
+          transform.type_conversion.tensor.cast_shape_dynamic_dims
+      } : (!transform.any_op, !transform.any_value, !transform.any_value, !transform.any_op) -> !transform.any_op
+    transform.yield
+  }
+
+  transform.named_sequence @cast_and_call_pooling_max_nchw_s2(%root: !transform.any_op {transform.readonly}) {
+    %ins = transform.get_operand %root[all] : (!transform.any_op) -> !transform.any_value
+    %out = transform.get_result %root[all] : (!transform.any_op) -> !transform.any_value
+    %module = transform.util.get_nearest_symbol_table %root : (!transform.any_op) -> !transform.any_op
+    %topology_attr = transform.param.constant #hal.device.topology<links = [
+        (@rocket_device -> @cpu_device = {transparent_access = true, unified_memory = true}),
+        (@cpu_device -> @rocket_device = {transparent_access = true, unified_memory = true})
+      ]> -> !transform.any_param
+    transform.annotate %module "stream.topology" = %topology_attr : !transform.any_op, !transform.any_param
+    %executable = transform.util.import_symbol @rocket_pooling_max_executable_s2 into %module if undefined : (!transform.any_op) -> !transform.any_op
+    %func = transform.util.import_symbol @call_rocket_pooling_max_nchw_s2 into %module if undefined : (!transform.any_op) -> !transform.any_op
+    transform.util.cast_and_call %func(%ins) -> %out after %root {
+          transform.type_conversion.tensor.cast_shape_dynamic_dims
+      } : (!transform.any_op, !transform.any_value, !transform.any_value, !transform.any_op) -> !transform.any_op
+    transform.yield
+  }
+
   transform.named_sequence @cast_and_call_pooling_avg_nchw(%root: !transform.any_op {transform.readonly}) {
     %ins = transform.get_operand %root[all] : (!transform.any_op) -> !transform.any_value
     %out = transform.get_result %root[all] : (!transform.any_op) -> !transform.any_value
@@ -3803,6 +4693,10 @@ module attributes {transform.with_named_sequence} {
         // of f16, not of the NPU being wrong.
         transform.foreach_match in %func
             @match_pooling_nchw_sum_avg -> @cast_and_call_pooling_avg_nchw,
+            @match_pooling_nhwc_max -> @cast_and_call_pooling_max_nhwc,
+            @match_pooling_nhwc_max_s2 -> @cast_and_call_pooling_max_nhwc_s2,
+            @match_pooling_nchw_max -> @cast_and_call_pooling_max_nchw,
+            @match_pooling_nchw_max_s2 -> @cast_and_call_pooling_max_nchw_s2,
             @match_rocket_matmul -> @cast_and_call_rocket_matmul,
             @match_dynamic_conv2d -> @cast_and_call_dynamic_conv2d,
             @match_dynamic_conv2d_3x3 -> @cast_and_call_dynamic_conv2d,

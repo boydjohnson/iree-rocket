@@ -99,11 +99,18 @@ util.func public @avg_pool_stride2_falls_back(
   util.return %result : tensor<1x64x7x7xf32>
 }
 
-// Max pooling is a different op and this matcher must not claim it: the
-// executable it would dispatch to bakes method = "avg".
-// CHECK-LABEL: util.func public @max_pool_falls_back
-// CHECK: linalg.pooling_nchw_max
-util.func public @max_pool_falls_back(
+// Max pooling is a different op, and this matcher must not claim it: the
+// executable it dispatches to bakes method = "avg", which would silently
+// average a tensor the model asked to reduce by maximum.
+//
+// Since @match_pooling_nchw_max landed, a max pool is claimed -- but by its
+// own executable. Asserting *which* one is the point: a matcher that started
+// routing max pools into @rocket_pooling_executable would still be "claimed"
+// and still be wrong.
+// CHECK-LABEL: util.func public @max_pool_uses_the_max_executable
+// CHECK-NOT: @rocket_pooling_executable
+// CHECK: flow.dispatch @rocket_pooling_max_executable
+util.func public @max_pool_uses_the_max_executable(
     %input: tensor<1x64x8x8xf32>,
     %init: tensor<1x64x4x4xf32>) -> tensor<1x64x4x4xf32> {
   %window = tensor.empty() : tensor<2x2xf32>
