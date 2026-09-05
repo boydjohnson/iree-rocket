@@ -27,7 +27,7 @@
 
 // CHECK-LABEL: util.func public @dense_1x1_cin_1344_matched
 // CHECK-NOT: linalg.conv_2d_nhwc_hwcf
-// CHECK: util.call @call_rocket_dynamic_conv2d_int8
+// CHECK: flow.dispatch @rocket_dynamic_int8_executable
 func.func @dense_1x1_cin_1344_matched(
     %input: tensor<1x4x4x1344xi8>,
     %filter: tensor<1x1x1344x64xi8>,
@@ -40,7 +40,7 @@ func.func @dense_1x1_cin_1344_matched(
 }
 
 // CHECK-LABEL: util.func public @dense_1x1_cin_1345_falls_back
-// CHECK-NOT: util.call @call_rocket_dynamic_conv2d_int8
+// CHECK-NOT: flow.dispatch @rocket_dynamic_int8_executable
 // CHECK: linalg.conv_2d_nhwc_hwcf
 func.func @dense_1x1_cin_1345_falls_back(
     %input: tensor<1x4x4x1345xi8>,
@@ -55,7 +55,7 @@ func.func @dense_1x1_cin_1345_falls_back(
 
 // CHECK-LABEL: util.func public @dense_3x3_cin_1152_matched
 // CHECK-NOT: linalg.conv_2d_nhwc_hwcf
-// CHECK: util.call @call_rocket_dynamic_conv2d_int8
+// CHECK: flow.dispatch @rocket_dynamic_int8_executable
 func.func @dense_3x3_cin_1152_matched(
     %input: tensor<1x6x6x1152xi8>,
     %filter: tensor<3x3x1152x64xi8>,
@@ -68,7 +68,7 @@ func.func @dense_3x3_cin_1152_matched(
 }
 
 // CHECK-LABEL: util.func public @dense_3x3_cin_1153_falls_back
-// CHECK-NOT: util.call @call_rocket_dynamic_conv2d_int8
+// CHECK-NOT: flow.dispatch @rocket_dynamic_int8_executable
 // CHECK: linalg.conv_2d_nhwc_hwcf
 func.func @dense_3x3_cin_1153_falls_back(
     %input: tensor<1x6x6x1153xi8>,
@@ -83,7 +83,7 @@ func.func @dense_3x3_cin_1153_falls_back(
 
 // CHECK-LABEL: util.func public @dense_1x1_cout_512_matched
 // CHECK-NOT: linalg.conv_2d_nhwc_hwcf
-// CHECK: util.call @call_rocket_dynamic_conv2d_int8
+// CHECK: flow.dispatch @rocket_dynamic_int8_executable
 func.func @dense_1x1_cout_512_matched(
     %input: tensor<1x4x4x16xi8>,
     %filter: tensor<1x1x16x512xi8>,
@@ -103,7 +103,7 @@ func.func @dense_1x1_cout_512_matched(
 
 // CHECK-LABEL: util.func public @dense_1x1_cout_1792_matched
 // CHECK-NOT: linalg.conv_2d_nhwc_hwcf
-// CHECK: util.call @call_rocket_dynamic_conv2d_int8
+// CHECK: flow.dispatch @rocket_dynamic_int8_executable
 func.func @dense_1x1_cout_1792_matched(
     %input: tensor<1x4x4x16xi8>,
     %filter: tensor<1x1x16x1792xi8>,
@@ -116,7 +116,7 @@ func.func @dense_1x1_cout_1792_matched(
 }
 
 // CHECK-LABEL: util.func public @dense_1x1_cout_1793_falls_back
-// CHECK-NOT: util.call @call_rocket_dynamic_conv2d_int8
+// CHECK-NOT: flow.dispatch @rocket_dynamic_int8_executable
 // CHECK: linalg.conv_2d_nhwc_hwcf
 func.func @dense_1x1_cout_1793_falls_back(
     %input: tensor<1x4x4x16xi8>,
@@ -131,7 +131,7 @@ func.func @dense_1x1_cout_1793_falls_back(
 
 // CHECK-LABEL: util.func public @dense_3x3_cout_512_matched
 // CHECK-NOT: linalg.conv_2d_nhwc_hwcf
-// CHECK: util.call @call_rocket_dynamic_conv2d_int8
+// CHECK: flow.dispatch @rocket_dynamic_int8_executable
 func.func @dense_3x3_cout_512_matched(
     %input: tensor<1x6x6x16xi8>,
     %filter: tensor<3x3x16x512xi8>,
@@ -144,7 +144,7 @@ func.func @dense_3x3_cout_512_matched(
 }
 
 // CHECK-LABEL: util.func public @dense_3x3_cout_513_falls_back
-// CHECK-NOT: util.call @call_rocket_dynamic_conv2d_int8
+// CHECK-NOT: flow.dispatch @rocket_dynamic_int8_executable
 // CHECK: linalg.conv_2d_nhwc_hwcf
 func.func @dense_3x3_cout_513_falls_back(
     %input: tensor<1x6x6x16xi8>,
@@ -161,7 +161,7 @@ func.func @dense_3x3_cout_513_falls_back(
 
 // CHECK-LABEL: util.func public @depthwise_3x3_channels_1344_matched
 // CHECK-NOT: linalg.depthwise_conv_2d_nhwc_hwc
-// CHECK: util.call @call_rocket_dynamic_depthwise_conv2d_int8
+// CHECK: flow.dispatch @rocket_dynamic_depthwise_int8_executable
 func.func @depthwise_3x3_channels_1344_matched(
     %input: tensor<1x6x6x1344xi8>,
     %filter: tensor<3x3x1344xi8>,
@@ -174,7 +174,7 @@ func.func @depthwise_3x3_channels_1344_matched(
 }
 
 // CHECK-LABEL: util.func public @depthwise_3x3_channels_1345_falls_back
-// CHECK-NOT: util.call @call_rocket_dynamic_depthwise_conv2d_int8
+// CHECK-NOT: flow.dispatch @rocket_dynamic_depthwise_int8_executable
 // CHECK: linalg.depthwise_conv_2d_nhwc_hwc
 func.func @depthwise_3x3_channels_1345_falls_back(
     %input: tensor<1x6x6x1345xi8>,

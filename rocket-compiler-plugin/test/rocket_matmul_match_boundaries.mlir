@@ -18,17 +18,20 @@
 // MobileNetV2's classifier, and exactly the shape the ceilings were measured
 // at: K = 1792 is MAX_INPUT_CHANNELS.
 //
-// Both narrowings must land *here*, in the caller, not inside
-// @call_rocket_matmul -- that function is never inlined, so a truncf inside
-// it is invisible to const-expr hoisting and re-narrows the constant weights
-// on every inference (ISSUES.md P6). The f16 call operands are what says the
-// demotion happened before the match rather than after it.
+// Both narrowings must land *here*, in the caller, not in the operands the
+// wrapper builds for itself: a truncf that reaches the dispatch from inside
+// @call_rocket_matmul would re-narrow the constant weights on every inference
+// (ISSUES.md P6 item 2). @__transform_main now inlines the wrappers, so the
+// two truncf ops and the dispatch land in the same function and only their
+// *order* distinguishes the two cases -- truncf before the dispatch, on the
+// dispatch's f16 tensor operands, is what says the demotion happened before
+// the match rather than after it.
 // CHECK-LABEL: util.func public @classifier_matches
 // CHECK-NOT: linalg.matmul
 // CHECK: arith.truncf
 // CHECK: arith.truncf
-// CHECK: util.call @call_rocket_matmul
-// CHECK-SAME: (tensor<?x?xf16>, tensor<?x?xf16>, tensor<?x?xf32>) -> tensor<?x?xf32>
+// CHECK: flow.dispatch @rocket_matmul_executable
+// CHECK-SAME: tensor<?x?xf16>{{.*}}tensor<?x?xf16>
 util.func public @classifier_matches(
     %lhs: tensor<1x1792xf32>,
     %rhs: tensor<1792x1001xf32>,
@@ -73,7 +76,7 @@ util.func public @n_past_the_ceiling_falls_back(
 // M becomes the convolution's width. 32 is where the hardware ladder stops,
 // so it is where the matcher stops.
 // CHECK-LABEL: util.func public @m_32_matches
-// CHECK: util.call @call_rocket_matmul
+// CHECK: flow.dispatch @rocket_matmul_executable
 util.func public @m_32_matches(
     %lhs: tensor<32x64xf32>,
     %rhs: tensor<64x64xf32>,

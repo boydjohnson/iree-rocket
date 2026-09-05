@@ -24,7 +24,7 @@
 
 // CHECK-LABEL: util.func public @dense_1x1_cin_1344_matched
 // CHECK-NOT: linalg.conv_2d_nhwc_hwcf
-// CHECK: util.call @call_rocket_dynamic_conv2d
+// CHECK: flow.dispatch @rocket_dynamic_executable
 func.func @dense_1x1_cin_1344_matched(
     %input: tensor<1x?x?x1344xf16>,
     %filter: tensor<1x1x1344x64xf16>,
@@ -37,7 +37,7 @@ func.func @dense_1x1_cin_1344_matched(
 }
 
 // CHECK-LABEL: util.func public @dense_1x1_cin_1345_falls_back
-// CHECK-NOT: util.call @call_rocket_dynamic_conv2d
+// CHECK-NOT: flow.dispatch @rocket_dynamic_executable
 // CHECK: linalg.conv_2d_nhwc_hwcf
 func.func @dense_1x1_cin_1345_falls_back(
     %input: tensor<1x?x?x1345xf16>,
@@ -52,7 +52,7 @@ func.func @dense_1x1_cin_1345_falls_back(
 
 // CHECK-LABEL: util.func public @dense_1x1_cout_1792_matched
 // CHECK-NOT: linalg.conv_2d_nhwc_hwcf
-// CHECK: util.call @call_rocket_dynamic_conv2d
+// CHECK: flow.dispatch @rocket_dynamic_executable
 func.func @dense_1x1_cout_1792_matched(
     %input: tensor<1x?x?x448xf16>,
     %filter: tensor<1x1x448x1792xf16>,
@@ -65,7 +65,7 @@ func.func @dense_1x1_cout_1792_matched(
 }
 
 // CHECK-LABEL: util.func public @dense_1x1_cout_1793_falls_back
-// CHECK-NOT: util.call @call_rocket_dynamic_conv2d
+// CHECK-NOT: flow.dispatch @rocket_dynamic_executable
 // CHECK: linalg.conv_2d_nhwc_hwcf
 func.func @dense_1x1_cout_1793_falls_back(
     %input: tensor<1x?x?x448xf16>,
@@ -80,7 +80,7 @@ func.func @dense_1x1_cout_1793_falls_back(
 
 // CHECK-LABEL: util.func public @dense_3x3_cin_1152_matched
 // CHECK-NOT: linalg.conv_2d_nhwc_hwcf
-// CHECK: util.call @call_rocket_dynamic_conv2d
+// CHECK: flow.dispatch @rocket_dynamic_executable
 func.func @dense_3x3_cin_1152_matched(
     %input: tensor<1x?x?x1152xf16>,
     %filter: tensor<3x3x1152x64xf16>,
@@ -93,7 +93,7 @@ func.func @dense_3x3_cin_1152_matched(
 }
 
 // CHECK-LABEL: util.func public @dense_3x3_cin_1153_falls_back
-// CHECK-NOT: util.call @call_rocket_dynamic_conv2d
+// CHECK-NOT: flow.dispatch @rocket_dynamic_executable
 // CHECK: linalg.conv_2d_nhwc_hwcf
 func.func @dense_3x3_cin_1153_falls_back(
     %input: tensor<1x?x?x1153xf16>,

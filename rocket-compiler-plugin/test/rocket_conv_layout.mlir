@@ -19,16 +19,6 @@
 // RUN:   --iree-hal-indirect-command-buffers=false \
 // RUN:   -o %t.vmfb
 
-// CHECK-LABEL: util.func private @call_rocket_dynamic_conv2d(
-// CHECK: tensor.dim
-// CHECK: arith.index_cast
-// CHECK: flow.dispatch @rocket_dynamic_executable::@rocket_dynamic_conv2d_v1::@rocket_dynamic_conv2d(
-// One i32 push constant per settable Conv2D dimension. Six, not eight: the
-// runtime derives output_width/output_height rather than accepting them.
-// CHECK-SAME: : (i32, i32, i32, i32, i32, i32,
-// CHECK: flow.dispatch.workgroups
-// CHECK-SAME: stream.affinity = #hal.device.affinity<@cpu_device>
-
 // This shape intentionally does not match a current Rocket hardware
 // specialization. It isolates the layout-normalization stage that runs before
 // dispatch selection. The kernel is 5x5 rather than 3x3 precisely because
@@ -62,10 +52,20 @@ util.func public @regular_conv(
 // and replaces it with the Rocket dispatch, then transposes the result back
 // to NCHW to match this function's own declared return type.
 
+// The adapter's own shape is checked here rather than on a
+// `util.func private @call_rocket_dynamic_conv2d`: @__transform_main inlines
+// the wrappers, so everything the adapter builds -- the tensor.dim/index_cast
+// push constants and the CPU-side accumulate epilogue -- now lands in the
+// function that used to call it.
 // CHECK-LABEL: util.func public @supported_nchw_conv
 // CHECK-NOT: linalg.conv_2d_nchw_fchw
 // CHECK-NOT: linalg.conv_2d_nhwc_hwcf
-// CHECK: util.call @call_rocket_dynamic_conv2d
+// CHECK: flow.dispatch @rocket_dynamic_executable::@rocket_dynamic_conv2d_v1::@rocket_dynamic_conv2d(
+// One i32 push constant per settable Conv2D dimension. Six, not eight: the
+// runtime derives output_width/output_height rather than accepting them.
+// CHECK-SAME: : (i32, i32, i32, i32, i32, i32,
+// CHECK: flow.dispatch.workgroups
+// CHECK-SAME: stream.affinity = #hal.device.affinity<@cpu_device>
 // CHECK: linalg.transpose
 // CHECK-SAME: permutation = [0, 3, 1, 2]
 util.func public @supported_nchw_conv(
@@ -88,7 +88,7 @@ util.func public @supported_nchw_conv(
 
 // CHECK-LABEL: util.func public @dynamic_nhwc_conv
 // CHECK-NOT: linalg.conv_2d_nhwc_hwcf
-// CHECK: util.call @call_rocket_dynamic_conv2d
+// CHECK: flow.dispatch @rocket_dynamic_executable
 util.func public @dynamic_nhwc_conv(
     %input: tensor<1x?x?x32xf16>,
     %filter: tensor<1x1x32x16xf16>,
@@ -110,7 +110,7 @@ util.func public @dynamic_nhwc_conv(
 // CPU.
 
 // CHECK-LABEL: util.func public @fully_dynamic_nhwc_conv
-// CHECK-NOT: util.call @call_rocket_dynamic_conv2d
+// CHECK-NOT: flow.dispatch @rocket_dynamic_executable
 // CHECK: linalg.conv_2d_nhwc_hwcf
 util.func public @fully_dynamic_nhwc_conv(
     %input: tensor<1x?x?x?xf16>,
@@ -132,7 +132,7 @@ util.func public @fully_dynamic_nhwc_conv(
 
 // CHECK-LABEL: util.func public @dynamic_3x3_nhwc_conv
 // CHECK-NOT: linalg.conv_2d_nhwc_hwcf
-// CHECK: util.call @call_rocket_dynamic_conv2d
+// CHECK: flow.dispatch @rocket_dynamic_executable
 util.func public @dynamic_3x3_nhwc_conv(
     %input: tensor<1x?x?x32xf16>,
     %filter: tensor<3x3x32x16xf16>,
@@ -152,7 +152,7 @@ util.func public @dynamic_3x3_nhwc_conv(
 // and no fallback executable states them.
 
 // CHECK-LABEL: util.func public @dynamic_5x5_nhwc_conv
-// CHECK-NOT: util.call @call_rocket_dynamic_conv2d
+// CHECK-NOT: flow.dispatch @rocket_dynamic_executable
 // CHECK: linalg.conv_2d_nhwc_hwcf
 util.func public @dynamic_5x5_nhwc_conv(
     %input: tensor<1x?x?x32xf16>,
@@ -175,7 +175,7 @@ util.func public @dynamic_5x5_nhwc_conv(
 
 // CHECK-LABEL: util.func public @dynamic_nhwc_depthwise_conv
 // CHECK-NOT: linalg.depthwise_conv_2d_nhwc_hwc
-// CHECK: util.call @call_rocket_dynamic_depthwise_conv2d
+// CHECK: flow.dispatch @rocket_dynamic_depthwise_executable
 util.func public @dynamic_nhwc_depthwise_conv(
     %input: tensor<1x?x?x32xf16>,
     %filter: tensor<1x1x32xf16>,
@@ -194,7 +194,7 @@ util.func public @dynamic_nhwc_depthwise_conv(
 
 // CHECK-LABEL: util.func public @dynamic_3x3_nhwc_depthwise_conv
 // CHECK-NOT: linalg.depthwise_conv_2d_nhwc_hwc
-// CHECK: util.call @call_rocket_dynamic_depthwise_conv2d
+// CHECK: flow.dispatch @rocket_dynamic_depthwise_executable
 util.func public @dynamic_3x3_nhwc_depthwise_conv(
     %input: tensor<1x?x?x32xf16>,
     %filter: tensor<3x3x32xf16>,
@@ -220,7 +220,10 @@ util.func public @dynamic_3x3_nhwc_depthwise_conv(
 
 // CHECK-LABEL: util.func public @dynamic_nchw_depthwise_conv
 // CHECK-NOT: linalg.depthwise_conv_2d_nchw_chw
-// CHECK: util.call @call_rocket_dynamic_depthwise_conv2d_nchw
+// The NCHW matcher reuses the NHWC executable; only the transposes around it
+// differ, which is why the marker below is the same one @dynamic_nhwc_
+// depthwise_conv checks.
+// CHECK: flow.dispatch @rocket_dynamic_depthwise_executable
 util.func public @dynamic_nchw_depthwise_conv(
     %input: tensor<1x32x?x?xf16>,
     %filter: tensor<32x3x3xf16>,
@@ -237,7 +240,7 @@ util.func public @dynamic_nchw_depthwise_conv(
 // no fallback executable states the extra conditions this extent would need.
 
 // CHECK-LABEL: util.func public @dynamic_5x5_nhwc_depthwise_conv
-// CHECK-NOT: util.call @call_rocket_dynamic_depthwise_conv2d
+// CHECK-NOT: flow.dispatch @rocket_dynamic_depthwise_executable
 // CHECK: linalg.depthwise_conv_2d_nhwc_hwc
 util.func public @dynamic_5x5_nhwc_depthwise_conv(
     %input: tensor<1x?x?x32xf16>,
@@ -257,7 +260,7 @@ util.func public @dynamic_5x5_nhwc_depthwise_conv(
 // applies to it.
 
 // CHECK-LABEL: util.func public @fully_dynamic_nhwc_depthwise_conv
-// CHECK-NOT: util.call @call_rocket_dynamic_depthwise_conv2d
+// CHECK-NOT: flow.dispatch @rocket_dynamic_depthwise_executable
 // CHECK: linalg.depthwise_conv_2d_nhwc_hwc
 util.func public @fully_dynamic_nhwc_depthwise_conv(
     %input: tensor<1x?x?x?xf16>,
@@ -278,7 +281,7 @@ util.func public @fully_dynamic_nhwc_depthwise_conv(
 // must stay on CPU regardless of how small or dynamic the shape is.
 
 // CHECK-LABEL: util.func public @depthwise_channel_multiplier_conv
-// CHECK-NOT: util.call @call_rocket_dynamic_depthwise_conv2d
+// CHECK-NOT: flow.dispatch @rocket_dynamic_depthwise_executable
 // CHECK: linalg.depthwise_conv_2d_nhwc_hwcm
 util.func public @depthwise_channel_multiplier_conv(
     %input: tensor<1x10x10x8xf16>,

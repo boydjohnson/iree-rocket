@@ -33,7 +33,7 @@
 
 // ORIGINAL-LABEL: util.func public @matched_dynamic_conv
 // ORIGINAL-NOT: rocket.origin
-// ORIGINAL: util.call @call_rocket_dynamic_conv2d
+// ORIGINAL: flow.dispatch @rocket_dynamic_executable
 util.func public @matched_dynamic_conv(
     %input: tensor<1x?x?x32xf16>,
     %filter: tensor<1x1x32x16xf16>,
@@ -78,7 +78,7 @@ util.func public @unmatched_5x5_conv(
 
 // ORIGINAL-LABEL: util.func public @matched_stride2_dense_conv
 // ORIGINAL-NOT: rocket.origin
-// ORIGINAL: util.call @call_rocket_dynamic_conv2d_s2
+// ORIGINAL: flow.dispatch @rocket_dynamic_executable_s2
 util.func public @matched_stride2_dense_conv(
     %input: tensor<1x?x?x32xf16>,
     %filter: tensor<1x1x32x16xf16>,
@@ -132,11 +132,9 @@ util.func public @stride3_dense_conv_disabled_matcher(
 //
 // There is one accumulate dispatch rather than two: the stride-1 and
 // stride-2 calls need the identical f16-to-f32 body, and IREE deduplicates
-// identical executables, so it is named after whichever call survived.
-
-// FINAL: hal.executable private @call_rocket_dynamic_conv2d_s2_dispatch_0 attributes {rocket.final = "cpu"}
-// FINAL: hal.executable.variant public @embedded_elf_x86_64
-// FINAL-SAME: attributes {rocket.final = "cpu"}
+// identical executables. Since @__transform_main inlines the wrappers it is
+// now named after the *caller* that survived deduplication rather than after
+// the @call_rocket_* function the body came from.
 
 // FINAL: hal.executable private @rocket_dynamic_executable_s2 attributes {rocket.final = "rocket"}
 // FINAL: hal.executable.variant public @rocket_dynamic_conv2d_v1
@@ -145,6 +143,10 @@ util.func public @stride3_dense_conv_disabled_matcher(
 // FINAL: hal.executable private @rocket_dynamic_executable attributes {rocket.final = "rocket"}
 // FINAL: hal.executable.variant public @rocket_dynamic_conv2d_v1
 // FINAL-SAME: attributes {rocket.final = "rocket"}
+
+// FINAL: hal.executable private @matched_dynamic_conv_dispatch_0 attributes {rocket.final = "cpu"}
+// FINAL: hal.executable.variant public @embedded_elf_x86_64
+// FINAL-SAME: attributes {rocket.final = "cpu"}
 
 // FINAL: hal.executable private @unmatched_5x5_conv_dispatch_0 attributes {rocket.final = "cpu"}
 // FINAL: hal.executable.variant public @embedded_elf_x86_64

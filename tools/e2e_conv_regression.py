@@ -449,7 +449,22 @@ def write_compiled_fixture(work_dir: Path) -> None:
     )
 
 
-def compile_modules(work_dir: Path, compiler: Path, transform_spec: Path) -> None:
+# The device flags the transform spec hardcodes, shared by every Rocket
+# compile below. Kept in one place so the three-stage build and the
+# preprocessing dump cannot drift apart.
+ROCKET_DEVICE_FLAGS = [
+    "--iree-hal-target-device=rocket_device=rocket",
+    "--iree-hal-target-device=cpu_device=local",
+    "--iree-hal-local-target-device-backends=llvm-cpu",
+    "--iree-hal-default-device=cpu_device",
+    "--iree-hal-indirect-command-buffers=false",
+    "--iree-llvmcpu-target-cpu=generic",
+]
+
+
+def compile_modules(
+    work_dir: Path, compiler: Path, opt: Path, transform_spec: Path
+) -> None:
     source = work_dir / "conv.mlir"
     run(
         [
@@ -461,20 +476,50 @@ def compile_modules(work_dir: Path, compiler: Path, transform_spec: Path) -> Non
             "--iree-llvmcpu-target-cpu=generic",
         ]
     )
+
+    # Three stages, not one, because `rocket-pin-unclaimed-dispatches` has to
+    # run between the flow and stream phases and no plugin hook exists that
+    # late -- exactly what `rocket-compiler` does for a model (see README,
+    # "Placement pinning"). A single `iree-compile` skips it, and since the
+    # transform spec's int8 epilogue became a fusible `linalg.generic` that is
+    # no longer safe even for one convolution: the epilogue dispatch's only
+    # producer is the Rocket dispatch, so Stream's affinity analysis places it
+    # on @rocket_device and serialization dies on an op that is not a
+    # convolution. Compiling here the way the product compiles also means this
+    # gate stops testing a pipeline nothing ships.
+    flow = work_dir / "rocket_flow.mlir"
+    pinned = work_dir / "rocket_flow_pinned.mlir"
     run(
         [
             str(compiler),
             str(source),
             "-o",
+            str(flow),
+            f"--iree-preprocessing-transform-spec-filename={transform_spec}",
+            "--iree-llvmcpu-target-triple=aarch64-linux-gnu",
+            *ROCKET_DEVICE_FLAGS,
+            "--compile-to=flow",
+        ]
+    )
+    run(
+        [
+            str(opt),
+            str(flow),
+            "-o",
+            str(pinned),
+            "--pass-pipeline=builtin.module(rocket-pin-unclaimed-dispatches)",
+        ]
+    )
+    run(
+        [
+            str(compiler),
+            str(pinned),
+            "-o",
             str(work_dir / "rocket.vmfb"),
             f"--iree-preprocessing-transform-spec-filename={transform_spec}",
             "--iree-llvmcpu-target-triple=aarch64-linux-gnu",
-            "--iree-hal-target-device=rocket_device=rocket",
-            "--iree-hal-target-device=cpu_device=local",
-            "--iree-hal-local-target-device-backends=llvm-cpu",
-            "--iree-hal-default-device=cpu_device",
-            "--iree-hal-indirect-command-buffers=false",
-            "--iree-llvmcpu-target-cpu=generic",
+            *ROCKET_DEVICE_FLAGS,
+            "--compile-from=flow",
         ]
     )
     preprocessing = work_dir / "rocket_preprocessing.mlir"
@@ -485,12 +530,7 @@ def compile_modules(work_dir: Path, compiler: Path, transform_spec: Path) -> Non
             "-o",
             str(preprocessing),
             f"--iree-preprocessing-transform-spec-filename={transform_spec}",
-            "--iree-hal-target-device=rocket_device=rocket",
-            "--iree-hal-target-device=cpu_device=local",
-            "--iree-hal-local-target-device-backends=llvm-cpu",
-            "--iree-hal-default-device=cpu_device",
-            "--iree-hal-indirect-command-buffers=false",
-            "--iree-llvmcpu-target-cpu=generic",
+            *ROCKET_DEVICE_FLAGS,
             "--compile-to=preprocessing",
             "--mlir-print-op-generic=false",
         ]
@@ -507,8 +547,12 @@ def compile_modules(work_dir: Path, compiler: Path, transform_spec: Path) -> Non
             preprocessing_text,
             re.DOTALL,
         )
-        if match is None or "util.call @call_rocket_dynamic_conv2d_int8" not in match.group(
-            "body"
+        # The marker is the dispatch, not the call: @__transform_main inlines
+        # the @call_rocket_* wrappers, so `util.call` no longer survives to
+        # preprocessing. The dispatch is the better check anyway -- it is the
+        # thing that actually reaches the NPU.
+        if match is None or (
+            "flow.dispatch @rocket_dynamic_int8_executable" not in match.group("body")
         ):
             raise SystemExit(
                 f"{function} no longer reaches its Rocket matcher; refusing to run "
@@ -730,6 +774,7 @@ def run_compiled_gate(
     remote_dir: str,
     work_dir: Path,
     compiler: Path,
+    opt: Path,
     host_runtime: Path,
     board_runtime: Path,
     transform_spec: Path,
@@ -738,7 +783,7 @@ def run_compiled_gate(
     only: list[str] | None = None,
 ) -> None:
     write_compiled_fixture(work_dir)
-    compile_modules(work_dir, compiler, transform_spec)
+    compile_modules(work_dir, compiler, opt, transform_spec)
     wait_for_quiet_npu(host)
     # int8 cases are compared exactly (atol=rtol=0), not with the fp16
     # tolerances: the whole path is integer arithmetic, so any difference at
@@ -917,6 +962,14 @@ def main() -> None:
         default=ROOT / "iree-build/build/tools/iree-compile",
     )
     parser.add_argument(
+        "--opt",
+        type=Path,
+        default=ROOT / "iree-build/build/tools/iree-opt",
+        help="iree-opt with the Rocket plugin registered; runs "
+        "rocket-pin-unclaimed-dispatches between the flow and stream phases, "
+        "which a single iree-compile invocation cannot do",
+    )
+    parser.add_argument(
         "--host-runtime",
         type=Path,
         default=ROOT / "iree-build/build/tools/iree-run-module",
@@ -956,6 +1009,7 @@ def main() -> None:
         raise SystemExit("both gates were skipped")
     if not args.skip_compiled:
         require_file(args.compiler, "iree-compile")
+        require_file(args.opt, "iree-opt")
         require_file(args.host_runtime, "host iree-run-module")
         require_file(args.board_runtime, "aarch64 iree-run-module")
         require_file(args.transform_spec, "Rocket transform spec")
@@ -981,6 +1035,7 @@ def main() -> None:
                     remote_dir,
                     Path(temporary),
                     args.compiler,
+                    args.opt,
                     args.host_runtime,
                     args.board_runtime,
                     args.transform_spec,

@@ -32,41 +32,39 @@
 // conv on i8 with an i32 accumulator. Nothing here may reach the fp16
 // executables.
 
-// Adapters are emitted in the order the transform spec imports them, which
-// is the reverse of the order the functions below are matched in.
-
-// CHECK-LABEL: util.func private @call_rocket_dynamic_depthwise_conv2d_int8_s2(
-// CHECK: flow.dispatch @rocket_dynamic_depthwise_int8_executable_s2::
-
-// CHECK-LABEL: util.func private @call_rocket_dynamic_depthwise_conv2d_int8(
-// The HWC -> CHW filter transpose the depthwise weight packer requires.
-// CHECK: linalg.transpose {{.*}} permutation = [2, 0, 1]
-// CHECK: flow.dispatch @rocket_dynamic_depthwise_int8_executable::
-
-// The bias binding is i32, not i8: rocket-hal-driver reads it as
-// output_channels * i32 for both int8 precisions.
-// CHECK-LABEL: util.func private @call_rocket_dynamic_conv2d_int8(
-// CHECK: linalg.fill ins(%{{.+}} : i32) outs(%{{.+}} : tensor<?xi32>)
-// CHECK: flow.dispatch @rocket_dynamic_int8_executable::@rocket_dynamic_conv2d_v1::@rocket_dynamic_conv2d(
-// One i32 push constant per settable Conv2D dimension, as in the fp16 path.
-// CHECK-SAME: : (i32, i32, i32, i32, i32, i32,
-// CHECK: flow.dispatch.workgroups
-// CHECK-SAME: stream.affinity = #hal.device.affinity<@cpu_device>
-// int8_accumulator already hands back i32, so the epilogue only adds the
-// convolution's init operand -- no widening step like the fp16 path's extf.
-// CHECK: arith.addi
-// CHECK-NOT: arith.extf
+// @__transform_main inlines the @call_rocket_* wrappers, so what each adapter
+// builds is checked inside the function that used to call it rather than in a
+// `util.func private` of its own.
 
 // Each conv is claimed, and the dense one reaches its matcher only because
 // rocket-transpose-quantized-conv-to-nhwc moved it out of NCHW first.
 // CHECK-LABEL: util.func public @dense_1x1
 // CHECK: linalg.transpose {{.*}} permutation = [0, 2, 3, 1]
 // CHECK: linalg.transpose {{.*}} permutation = [2, 3, 1, 0]
-// CHECK: util.call @call_rocket_dynamic_conv2d_int8
+// The bias binding is i32, not i8: rocket-hal-driver reads it as
+// output_channels * i32 for both int8 precisions.
+// CHECK: linalg.fill ins(%{{.+}} : i32) outs(%{{.+}} : tensor<24xi32>)
+// CHECK: flow.dispatch @rocket_dynamic_int8_executable::@rocket_dynamic_conv2d_v1::@rocket_dynamic_conv2d(
+// One i32 push constant per settable Conv2D dimension, as in the fp16 path.
+// CHECK-SAME: : (i32, i32, i32, i32, i32, i32,
+// int8_accumulator already hands back i32, so the epilogue only adds the
+// convolution's init operand -- no widening step like the fp16 path's extf.
+// It is a plain linalg.generic, not a flow.dispatch.workgroups, so that
+// dispatch-region formation can fuse it with the requantization that follows
+// (ISSUES.md P8).
+// CHECK: arith.addi
+// CHECK-NOT: arith.extf
+
 // CHECK-LABEL: util.func public @depthwise_3x3_s1
-// CHECK: util.call @call_rocket_dynamic_depthwise_conv2d_int8
+// The HWC -> CHW filter transpose the depthwise weight packer requires. It is
+// on a constant here, which is the point of inlining: in the caller const-eval
+// hoists it into an initializer instead of running it every inference.
+// CHECK: linalg.transpose {{.*}} permutation = [2, 0, 1]
+// CHECK: flow.dispatch @rocket_dynamic_depthwise_int8_executable::
+
 // CHECK-LABEL: util.func public @depthwise_3x3_s2
-// CHECK: util.call @call_rocket_dynamic_depthwise_conv2d_int8_s2
+// CHECK: linalg.transpose {{.*}} permutation = [2, 0, 1]
+// CHECK: flow.dispatch @rocket_dynamic_depthwise_int8_executable_s2::
 
 // No quantized conv survives anywhere: every one was either folded and
 // claimed, or would have broken the compile outright.
