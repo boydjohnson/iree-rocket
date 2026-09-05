@@ -113,6 +113,45 @@ fn quiesce_all_enabled() -> bool {
     *ENABLED.get_or_init(|| std::env::var("ROCKET_QUIESCE_ALL").is_ok_and(|value| value != "0"))
 }
 
+/// Whether to skip [`DEPTHWISE_TO_DENSE_QUIESCENCE`] entirely
+/// (`ROCKET_QUIESCE_OFF=1`).
+///
+/// The dwell predates ISSUES.md C8's fix, and its symptom -- a dense job after
+/// a depthwise one intermittently writing only its first 16 channels -- is the
+/// same family as the poisoning that turned out to be BRDMA left fetching on a
+/// path with no consumer. This is the knob that says whether the dwell is
+/// still buying anything. It costs 1.06 ms per transition, 207 ms of a 7.9 s
+/// MobileNetV2 int8 benchmark.
+///
+/// The original failure was **intermittent**, so a handful of clean runs here
+/// proves nothing; removing the dwell needs repetition on the shapes that
+/// caught it.
+///
+/// **Measured 2026-09-05, and the dwell stays.** With `ROCKET_QUIESCE_OFF=1`,
+/// on `planck`, output compared bitwise against a golden every run:
+///
+/// ```text
+///   240 runs  e2e mixed_depthwise_then_int8 (fp16 depthwise -> int8 dense,
+///             128 output channels, so a 16-channel truncation is unmissable)
+///    40 runs  MobileNetV2 int8 end to end, ~14 transitions per inference
+///   ---
+///     0 wrong, 0 failed, with the dwell on or off
+/// ```
+///
+/// That is not enough to remove it. No failure *rate* was ever recorded for
+/// the original -- only the word "intermittently" -- so 0 of 240 bounds it at
+/// roughly 1.5% and no lower, while the dwell costs 207 ms of a 7902 ms
+/// MobileNetV2 int8 benchmark (2.6%, `ROCKET_PROFILE=1`). Trading a 2.6%
+/// speedup for a re-run of silent wrong data at an unbounded rate is a bad
+/// deal, and the offload's problem is 3.7x, not 3%.
+///
+/// Revisit if the cost ever matters, or if someone reproduces the original
+/// failure and can quote a rate to test against.
+fn quiesce_off() -> bool {
+    static OFF: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *OFF.get_or_init(|| std::env::var("ROCKET_QUIESCE_OFF").is_ok_and(|value| value != "0"))
+}
+
 /// Whether to leak every per-tile regcmd BO rather than closing it
 /// (`ROCKET_LEAK_REGCMD=1`).
 ///
@@ -1544,8 +1583,9 @@ unsafe extern "C" fn queue_execute(
                 // its own weights/CBUF state, so no state needs to survive
                 // between jobs.
                 for job in cmds.iter().filter(|j| !j.regcmd_tasks.is_empty()) {
-                    if quiesce_all_enabled()
-                        || needs_depthwise_to_dense_quiescence(*last_dpu_mode, job.dpu_mode)
+                    if !quiesce_off()
+                        && (quiesce_all_enabled()
+                            || needs_depthwise_to_dense_quiescence(*last_dpu_mode, job.dpu_mode))
                     {
                         let timer = crate::profile::start();
                         std::thread::sleep(DEPTHWISE_TO_DENSE_QUIESCENCE);
