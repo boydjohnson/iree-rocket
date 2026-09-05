@@ -1293,6 +1293,72 @@ precision-independent: `CORE_DATAOUT_SIZE_1`, `DPU_DATA_CUBE_CHANNEL` (both
 `orig_channel` and the padded `channel`), `DPU_WDMA_SIZE_0.channel_wdma` and
 `DPU_RDMA_DATA_CUBE_CHANNEL`.
 
+### ROOT CAUSE, 2026-09-05: we leave BRDMA fetching on the int32-accumulator path
+
+**C8 is our register program, not the silicon.** `rocket-userspace`'s own
+emitter runs the identical shapes with no poisoning at all.
+
+Built its two conv tests for aarch64 and wrote a harness against
+`rocket_conv2d_int8` / `rocket_conv2d_fp16` -- same shapes as the `q1`/`k1`
+arm (int8 32x32 Cin 64 Cout 128 k1, 512 KiB int32 out, then fp16 32x32 Cin 64
+Cout 128 k1, 256 KiB out), one process, no gap:
+
+    3 aggressors, 4 victims:  aggressors 6.1 / 5.5 / 5.3 ms
+                              victims    4.8 / 4.5 / 4.5 / 4.5 ms   no hang
+
+Ours hangs 3/3 on those shapes. So the hardware will run int8 -> int32 then a
+wide fp16 back to back; something in our program is what poisons the core.
+
+**The diff.** A host-only dumper over `gen_conv2d_int8` in the format
+`dump_conv_plan_regcmd` prints gives the two emitters' programs side by side.
+Same 126 registers, and only **ten** differing values -- three of them DMA
+addresses:
+
+| reg | ours | vendor |
+|---|---|---|
+| `CNA_CBUF_CON0` | `0x000000a2` | `0x00000093` (bank split) |
+| `CORE_MISC_CFG` | `0x00000001` (`qd_en=1`) | `0x00000000` |
+| `DPU_DATA_FORMAT` | `0x800000e0` | `0x80000000` (`bs_mul_shift_value_neg` 14 vs 0) |
+| `DPU_BS_CFG` | `0x00020141` | `0x00000053` (every sub-stage bypassed) |
+| `DPU_BS_MUL_CFG` | `0x00000e01` | `0x00000000` |
+| `DPU_BS_OW_CFG` | `0x000007ff` | `0x000007fe` (`ow_src`) |
+| `DPU_RDMA_BRDMA_CFG` | `0x0000000e` | `0x00000000` |
+
+We turn the **requantization datapath on while writing the raw int32
+accumulator**, a combination the vendor never emits -- its own header states
+the rule: "int8_out=0 (default) keeps the validated int32-raw datapath
+(qd_en=0, size_e=7/surf*8, int32 output, host requant); int8_out=1 switches to
+Mesa's int8-output writer: QD_EN=1 ...".
+
+**Bisected to one register.** `ROCKET_ACC_VENDOR=<qd|brdma|bs|owsrc|all>`
+matches the vendor field by field. At `q1_then_k1x4_gap0`, 3 trials each:
+
+    all      clean 3/3        qd      HUNG 3/3
+    brdma    clean 3/3        bs      HUNG 3/3
+    qd,brdma clean 3/3        owsrc   HUNG 3/3
+
+It is **`DPU_RDMA_BRDMA_CFG` alone**. We set `brdma_data_use = 7` -- BRDMA
+fetching the bias/scale/shift triple -- on a path where the BS plane that
+would consume it is bypassed. An enabled BRDMA reader with no consumer is what
+leaves the state, and the vendor leaves the register at 0.
+
+With `brdma` alone every C8 arm goes clean with every output exact:
+`int8acc_then_k1_gap0`, `q1_then_k1x4_gap0`, `q1_then_stemx3_gap0` and
+`int8acc_then_bigout_gap0`, 3 trials each, victims landing on both cores. The
+hardware test now fails *because it asserts the poisoned behaviour*.
+
+**No regressions** with it on: `conv_int8_hw` 4/4, `conv_int8_map_hw` 6/6,
+`conv_int8_vendor_affine_hw` 1/1, `conv_depthwise_int8_exact_hw` 3/3,
+`conv_int8_probe_hw` 1/1 -- identical to shipped.
+
+**What this retires.** The runtime-PM dwell, the per-core placement story and
+the victim-size threshold are all descriptions of the *symptom*. They stay
+true and stay recorded, but the fix is one register, not a power cycle: drop
+BRDMA on the accumulator path. Everything below this line predates the root
+cause and should be read as symptom characterisation.
+
+---
+
 ### `ow_src` diverges from the vendor emitter on purpose, 2026-09-05
 
 `rocket-userspace` and the Mesa program it was diffed against never set

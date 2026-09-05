@@ -3944,6 +3944,9 @@ fn od_engage() -> bool {
 ///
 /// Nothing on the compiled path sets it.
 fn ow_src_override() -> Option<u32> {
+    if acc_vendor_part("owsrc") {
+        return Some(0);
+    }
     if cpend_from_configuration() {
         return Some(0);
     }
@@ -3996,6 +3999,34 @@ fn bs_ow_op_value(quantization: Option<&Quantization>) -> u32 {
         return (0x80i64 - i64::from(weight_zero_point)) as u32 & 0xffff;
     }
     0
+}
+
+/// `ROCKET_ACC_VENDOR=<parts>` makes the int32-accumulator program match
+/// `rocket-userspace`'s `gen_conv2d_int8` field by field, for ISSUES.md C8.
+///
+/// A register diff of the two emitters at 32x32 Cin 64 Cout 128 k1 found the
+/// same 126 registers and only ten differing values, three of them DMA
+/// addresses. Of the rest, this crate turns the **requantization datapath on**
+/// while writing the raw int32 accumulator -- `qd_en = 1`, BRDMA fetching the
+/// bias/scale/shift triple, a BS MUL shift of 14 and the BS sub-stages left
+/// un-bypassed -- and the vendor never emits that combination. Its own header
+/// states the rule: "int8_out=0 (default) keeps the validated int32-raw
+/// datapath (qd_en=0, size_e=7/surf*8, int32 output, host requant); int8_out=1
+/// switches to Mesa's int8-output writer: QD_EN=1 ...".
+///
+/// Parts are comma-separated so the difference can be bisected: `qd`, `brdma`,
+/// `bs`, `owsrc`, or `all`. Nothing on the compiled path sets it.
+fn acc_vendor_part(part: &str) -> bool {
+    static PARTS: std::sync::OnceLock<Vec<String>> = std::sync::OnceLock::new();
+    let parts = PARTS.get_or_init(|| {
+        std::env::var("ROCKET_ACC_VENDOR")
+            .unwrap_or_default()
+            .split(',')
+            .map(|value| value.trim().to_ascii_lowercase())
+            .filter(|value| !value.is_empty())
+            .collect()
+    });
+    parts.iter().any(|value| value == part || value == "all")
 }
 
 static ACCUMULATOR_OD_ENGAGE: std::sync::atomic::AtomicBool =
@@ -4223,6 +4254,7 @@ fn conv_2d_tile_program(
     };
     // See [`accumulator_bs_engage`]: the C8 probe's BS pass-through.
     let bs_passthrough = accumulator_output && accumulator_bs_engage();
+    let bs_vendor = accumulator_output && acc_vendor_part("bs");
     // `BS_MUL_SHIFT_VALUE` and its negated twin in `DPU_DATA_FORMAT` are a
     // constant 14 in every int8 capture and 0 in every fp16 one. Nothing in
     // the corpus varies it, so it is not derived from anything.
@@ -4231,14 +4263,21 @@ fn conv_2d_tile_program(
     // and not the shift that follows it, so a BS plane engaged with the
     // shipped 14 right-shifts every accumulator by 14 -- measured, and it is
     // what made the first pass-through arm return an all-zero buffer.
-    let bs_mul_shift = if quantization.is_some() && !bs_passthrough {
+    let bs_mul_shift = if quantization.is_some()
+        && !bs_passthrough
+        && !(accumulator_output && acc_vendor_part("bs"))
+    {
         BS_MUL_SHIFT_VALUE
     } else {
         0
     };
     // BRDMA carries bias alone at fp16 and the full bias/scale/shift triple
     // once requantization is active.
-    let brdma_data_use = if quantization.is_some() {
+    let brdma_data_use = if accumulator_output && acc_vendor_part("brdma") {
+        // The vendor's int32-raw path leaves DPU_RDMA_BRDMA_CFG at 0: with the
+        // BS plane bypassed there is nothing for BRDMA's triple to feed.
+        0
+    } else if quantization.is_some() {
         BRDMA_DATA_USE_QUANTIZED
     } else {
         BRDMA_DATA_USE_BIAS
@@ -4578,7 +4617,9 @@ fn conv_2d_tile_program(
     commands.push(
         Register::<CoreMiscCfg>::new()
             .proc_precision(precision.into())
-            .qd_en(Bits::new(u32::from(quantization.is_some())))
+            .qd_en(Bits::new(u32::from(
+                quantization.is_some() && !(accumulator_output && acc_vendor_part("qd")),
+            )))
             .dw_en(Bits::new(u32::from(shape.depthwise)))
             .build(),
     );
@@ -4663,12 +4704,14 @@ fn conv_2d_tile_program(
     commands.push(
         Register::<DpuBsCfg>::new()
             .bs_bypass(Bits::new(u32::from(accumulator_output && !bs_passthrough)))
-            .bs_alu_algo(Bits::new(2))
-            .bs_alu_src(Bits::new(1))
+            // The vendor's int32-raw word is 0x53: every sub-stage bypassed and
+            // no ALU algo/source, against this crate's 0x20141.
+            .bs_alu_algo(Bits::new(if bs_vendor { 0 } else { 2 }))
+            .bs_alu_src(Bits::new(if bs_vendor { 0 } else { 1 }))
             .bs_relu_bypass(Bits::new(1))
-            .bs_alu_bypass(Bits::new(u32::from(bs_passthrough)))
+            .bs_alu_bypass(Bits::new(u32::from(bs_passthrough || bs_vendor)))
             .bs_mul_bypass(Bits::new(u32::from(
-                quantization.is_none() || bs_passthrough,
+                quantization.is_none() || bs_passthrough || bs_vendor,
             )))
             .build(),
     );
@@ -4676,7 +4719,7 @@ fn conv_2d_tile_program(
     commands.push(
         Register::<DpuBsMulCfg>::new()
             .bs_mul_shift_value(Bits::new(bs_mul_shift))
-            .bs_mul_src(Bits::new(u32::from(quantization.is_some())))
+            .bs_mul_src(Bits::new(u32::from(quantization.is_some() && !bs_vendor)))
             .build(),
     );
     commands.push(zero::<DpuBsReluxCmpValue>());
