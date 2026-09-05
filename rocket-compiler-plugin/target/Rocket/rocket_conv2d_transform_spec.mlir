@@ -5273,13 +5273,33 @@ module attributes {transform.with_named_sequence} {
     %canonical_funcs = transform.apply_registered_pass
         "linalg-specialize-generic-ops" to %specialized_funcs
       : (!transform.any_op) -> !transform.any_op
+    // A GEMV is a matmul with one extent pinned to 1, and everything below
+    // this point already handles a matmul with a unit extent -- the demotion
+    // right after, @match_rocket_matmul (whose dim_bounds start at umin = 1),
+    // @call_rocket_matmul and #rocket_matmul_target. So raise
+    // linalg.matvec/vecmat into linalg.matmul rather than teaching each of
+    // those about two more ops: the vector operand and the accumulator each
+    // gain a unit dimension via tensor.expand_shape, and a collapse_shape
+    // puts the result back to rank one. Both are pure metadata.
+    //
+    // This is the same move the batch-matmul fold above makes, run backwards:
+    // there a degenerate dimension is removed so the matmul matcher can see
+    // what is really there, here one is added for the same reason.
+    //
+    // linalg.dot is deliberately untouched -- see the pass -- because it
+    // reduces to a scalar, and a dispatch plus a weight pack plus an output
+    // compaction to produce one number is not a trade worth making.
+    %gemv_funcs = transform.apply_registered_pass
+        "rocket-expand-gemv-to-matmul" to %canonical_funcs
+      : (!transform.any_op) -> !transform.any_op
+
     // Rocket's ABI is f16-in/f32-accumulate (see call_rocket_dynamic_conv2d
     // above), but models commonly arrive as plain f32 (e.g. ONNX/torch
-    // import, no fp16 casting anywhere). Demote just the conv operands --
-    // not matmuls, which stay on CPU untouched -- to f16, leaving the
-    // accumulator at f32, so @match_dynamic_conv2d's f16/f16/f32 typing
-    // requirement matches these too. A conv already authored in f16 is
-    // left alone: the pass only rewrites all-f32 operand sets.
+    // import, no fp16 casting anywhere). Demote the conv and matmul operands
+    // to f16, leaving the accumulator at f32, so @match_dynamic_conv2d's
+    // f16/f16/f32 typing requirement matches these too. An op already
+    // authored in f16 is left alone: the pass only rewrites all-f32 operand
+    // sets.
     //
     // This is the plugin's own pass, not upstream's
     // "iree-global-opt-demote-contraction-inputs" that it used to call:
@@ -5287,10 +5307,11 @@ module attributes {transform.with_named_sequence} {
     // linalg::getPrunedAttributeList, which erases `strides` and
     // `dilations`, silently turning every strided convolution into a
     // stride-1 one. See RocketDemoteConvInputsPass.cpp -- it handles exactly
-    // the same op set, so this is a behaviour-preserving swap apart from
-    // keeping those two attributes.
+    // the same convolution set, so that part is a behaviour-preserving swap
+    // apart from keeping those two attributes. linalg.matmul was added to it
+    // on 2026-09-04 and has no counterpart upstream.
     %demoted_funcs = transform.apply_registered_pass
-        "rocket-demote-conv-inputs-to-f16" to %canonical_funcs
+        "rocket-demote-conv-inputs-to-f16" to %gemv_funcs
       : (!transform.any_op) -> !transform.any_op
 
     // Tripwire for the above and anything like it: errors if any named

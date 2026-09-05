@@ -170,10 +170,14 @@ breadth work rather than after.
 
 ## Phases
 
-### Phase 0 -- free coverage: compiler only
+### Phase 0 -- free coverage: compiler only -- COMPLETE 2026-09-05
 
-No schema, driver or HAL change. Every item is already plumbed end to end and
-blocked solely by a missing matcher.
+No schema, driver or HAL change. Every item was already plumbed end to end and
+blocked solely by the compiler.
+
+All three items landed and are board-validated. The diagnosis held: not one
+line below the compiler changed for any of them. The one correction is item
+3, which needed a new pass rather than only spec edits.
 
 1. ~~**Max pooling.**~~ **Landed 2026-09-05.** Four matchers
    (`linalg.pooling_nhwc_max` and `pooling_nchw_max`, strides 1 and 2), two
@@ -203,8 +207,27 @@ blocked solely by a missing matcher.
    against the oracle in `pooling_oracle_hw.rs`, so that is a missing
    executable rather than a missing measurement, and it is the cheapest
    pooling work left.
-3. **`linalg.matvec` / `vecmat` / `dot`** → `MatmulDef` at `M = 1` or `N = 1`.
-   New matchers only; the executable path is unchanged.
+3. ~~**`linalg.matvec` / `vecmat` / `dot`.**~~ **Landed 2026-09-05**, but not
+   the way this item proposed. Rather than three matchers and three shims,
+   one new pass -- `rocket-expand-gemv-to-matmul` -- raises `matvec` and
+   `vecmat` into `linalg.matmul` with a unit extent, and everything
+   downstream claims them unchanged: the f16 demotion, `@match_rocket_matmul`
+   (whose `dim_bounds` already start at `umin = 1`), `@call_rocket_matmul`
+   and `#rocket_matmul_target`. It is the batch-matmul unit-dim fold the spec
+   already performs, run backwards.
+
+   That is the one place Phase 0's "compiler only, no C++" framing was wrong:
+   the item is still compiler-only, but it needed a pass rather than spec
+   edits, because nothing upstream raises rank.
+
+   `linalg.dot` is deliberately excluded: it reduces two vectors to a scalar,
+   so a dispatch plus a weight pack plus an output compaction would produce
+   one number a CPU computes in a few hundred multiply-adds -- the same
+   reasoning that keeps a 1x1 stride-1 pool off the NPU.
+
+   Board-validated on `planck`: matvec max|error| 5.2e-04, vecmat 8.2e-04 at
+   K = 768, both consistent with f16 demotion of that contraction and nothing
+   else.
 
 Each needs a boundary lit test on the existing pattern -- one accepted shape and
 its immediately-adjacent rejected neighbour, as in

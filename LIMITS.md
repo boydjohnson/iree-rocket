@@ -237,7 +237,9 @@ CPU today. Everything else falls back silently and correctly.
 | depthwise | NHWC HWC | f16/f16/f32 | 1x1, 3x3 | 1 | 1..=512 | = `Cin` |
 | depthwise | NCHW CHW | f16/f16/f32 | 1x1, 3x3 | 1, 2, 3, 4 | 1..=512 | = `Cin` |
 | depthwise | NHWC HWC | i8/i8/i32 | 1x1, 3x3 | 1, 2 | 1..=1344 | = `Cin` |
-| matmul | -- | f16/f16/f32 | -- | -- | `M` 1..=32, `K` 1..=1792 | `N` 1..=1792 |
+| matmul | -- | f16/f16/f32 | -- | -- | `M` 1..=2047, `K` 1..=1792 | `N` 1..=1792 |
+| matvec | -- | f16/f16/f32 | -- | -- | `M` 1..=2047, `K` 1..=1792 | `N` = 1 |
+| vecmat | -- | f16/f16/f32 | -- | -- | `M` = 1, `K` 1..=1792 | `N` 1..=1792 |
 | avg pool | NCHW sum | f32 | 2x2..=8x8 | 1 | H/W/C 1..=8192 | -- |
 | avg pool | NHWC sum | f32 | 2x2..=8x8 | 1 | H/W/C 1..=8192 | -- |
 | max pool | NHWC | f32 | 2x2..=8x8 | 1, 2 | H/W/C 1..=8192 | -- |
@@ -245,6 +247,13 @@ CPU today. Everything else falls back silently and correctly.
 | min pool | NHWC | f32 | 2x2..=8x8 | 1, 2 | H/W/C 1..=8192 | -- |
 
 All of these additionally require batch 1 and dilation 1.
+
+`matvec` and `vecmat` have no matcher of their own: `rocket-expand-gemv-to-matmul`
+raises them into `linalg.matmul` with a unit extent before the match loop, so
+the matmul matcher, shim and executable claim them unchanged. `linalg.dot` is
+deliberately not raised -- it reduces to a scalar, and a dispatch plus a weight
+pack plus an output compaction to produce one number is not a trade worth
+making.
 
 Stride-3 and stride-4 *dense* fp16 matchers exist in the spec but are **not** in
 the `foreach_match` list. Depthwise NCHW carries strides 3 and 4; depthwise NHWC

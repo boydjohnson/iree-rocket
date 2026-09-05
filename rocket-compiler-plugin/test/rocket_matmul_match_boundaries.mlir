@@ -173,3 +173,67 @@ util.func public @unit_batch_matmul_matches(
       outs(%init : tensor<1x197x768xf32>) -> tensor<1x197x768xf32>
   util.return %result : tensor<1x197x768xf32>
 }
+
+// ------------------------------------------------------------------- GEMV
+
+// linalg.matvec and linalg.vecmat reach this same matcher, because
+// rocket-expand-gemv-to-matmul raises them into linalg.matmul with a unit
+// extent before the match loop runs. Nothing here knows they were ever
+// anything else -- which is the point of raising rather than adding matchers.
+
+// matvec pins N = 1.
+// CHECK-LABEL: util.func public @matvec_reaches_the_matmul_matcher
+// CHECK-NOT: linalg.matvec
+// CHECK: flow.dispatch @rocket_matmul_executable
+util.func public @matvec_reaches_the_matmul_matcher(
+    %a: tensor<197x768xf32>,
+    %y: tensor<768xf32>,
+    %init: tensor<197xf32>) -> tensor<197xf32> {
+  %result = linalg.matvec
+      ins(%a, %y : tensor<197x768xf32>, tensor<768xf32>)
+      outs(%init : tensor<197xf32>) -> tensor<197xf32>
+  util.return %result : tensor<197xf32>
+}
+
+// vecmat pins M = 1.
+// CHECK-LABEL: util.func public @vecmat_reaches_the_matmul_matcher
+// CHECK-NOT: linalg.vecmat
+// CHECK: flow.dispatch @rocket_matmul_executable
+util.func public @vecmat_reaches_the_matmul_matcher(
+    %y: tensor<768xf32>,
+    %a: tensor<768x1000xf32>,
+    %init: tensor<1000xf32>) -> tensor<1000xf32> {
+  %result = linalg.vecmat
+      ins(%y, %a : tensor<768xf32>, tensor<768x1000xf32>)
+      outs(%init : tensor<1000xf32>) -> tensor<1000xf32>
+  util.return %result : tensor<1000xf32>
+}
+
+// A raised GEMV is still bound by K: this one is one past the 1792 ceiling
+// and must fall back like any other oversized matmul.
+// CHECK-LABEL: util.func public @matvec_k_1793_rejected
+// CHECK: linalg.matmul
+util.func public @matvec_k_1793_rejected(
+    %a: tensor<197x1793xf32>,
+    %y: tensor<1793xf32>,
+    %init: tensor<197xf32>) -> tensor<197xf32> {
+  %result = linalg.matvec
+      ins(%a, %y : tensor<197x1793xf32>, tensor<1793xf32>)
+      outs(%init : tensor<197xf32>) -> tensor<197xf32>
+  util.return %result : tensor<197xf32>
+}
+
+// linalg.dot is not raised, so it never reaches the matcher at all: it
+// reduces to a scalar, and a dispatch plus a weight pack plus an output
+// compaction to produce one number is not a trade worth making.
+// CHECK-LABEL: util.func public @dot_falls_back
+// CHECK: linalg.dot
+util.func public @dot_falls_back(
+    %x: tensor<768xf32>,
+    %y: tensor<768xf32>,
+    %init: tensor<f32>) -> tensor<f32> {
+  %result = linalg.dot
+      ins(%x, %y : tensor<768xf32>, tensor<768xf32>)
+      outs(%init : tensor<f32>) -> tensor<f32>
+  util.return %result : tensor<f32>
+}
