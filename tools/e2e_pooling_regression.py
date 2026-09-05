@@ -21,8 +21,14 @@ round trip is lossless and the hardware must return the identical element the
 CPU picked. Any difference at all is then a real fault, and the failure mode
 worth catching is a *displaced* value rather than a slightly wrong one.
 
-That is not a hope about the hardware: every max case here returned max|error|
-exactly 0 on `planck` on 2026-09-05, the tiled 64x64 one included.
+That is not a hope about the hardware: every f16-exact max case here returned
+max|error| exactly 0 on `planck` on 2026-09-05, the tiled 64x64 one included.
+
+What exactness cannot show is the cost it hides. On arbitrary f32 activations
+the demotion *does* round, so an offloaded max pool returns `f16(x)` rather
+than `x` -- worth 0.077 max|error| on VGG's logits, measured on the board.
+`max_pool_nhwc_dense` is that case, and it is here because nothing f16-exact
+would ever have surfaced it.
 
 **Average pooling cannot be exact**, and not because of the demotion. The PPU
 has no sum mode: its average is a multiply by fp16(65536/k), and the shim
@@ -218,6 +224,21 @@ func.func @avg_pool_nhwc(%input: tensor<1x7x7x1792xf32>, %init: tensor<1x1x1x179
       ins(%input, %window : tensor<1x7x7x1792xf32>, tensor<7x7xf32>)
       outs(%init : tensor<1x1x1x1792xf32>) -> tensor<1x1x1x1792xf32>
   return %0 : tensor<1x1x1x1792xf32>
+}
+
+// The same max pool with realistic magnitudes instead of f16-exact ones, and
+// the only inexact max case here. It exists because the exact cases cannot
+// see the cost they hide: a max pool returns an input element, but the shim
+// demotes to f16 first, so on arbitrary f32 activations it returns f16(x)
+// rather than x. VGG measures that at 0.077 max|error| on its logits, and no
+// f16-exact case would ever have shown it.
+func.func @max_pool_nhwc_dense(%input: tensor<1x14x14x64xf32>, %init: tensor<1x7x7x64xf32>) -> tensor<1x7x7x64xf32> {
+  %window = tensor.empty() : tensor<2x2xf32>
+  %0 = linalg.pooling_nhwc_max
+      {dilations = dense<1> : tensor<2xi64>, strides = dense<2> : tensor<2xi64>}
+      ins(%input, %window : tensor<1x14x14x64xf32>, tensor<2x2xf32>)
+      outs(%init : tensor<1x7x7x64xf32>) -> tensor<1x7x7x64xf32>
+  return %0 : tensor<1x7x7x64xf32>
 }
 
 // Min pool, NHWC, both strides. There is no NCHW pair: linalg defines
@@ -485,6 +506,16 @@ def write_compiled_fixture(work_dir: Path) -> None:
     )
     np.save(work_dir / "avg_nhwc_init.npy", np.zeros((1, 1, 1, 1792), dtype=np.float32))
 
+    # The one max fixture that is NOT f16-exact: arbitrary f32 activations,
+    # which is what a real model has. The demotion then loses bits and the
+    # pool returns f16(x) rather than x -- the precision cost every exact case
+    # here is blind to by construction.
+    np.save(
+        work_dir / "max_dense_input.npy",
+        rng.uniform(-1.0, 1.0, size=(1, 14, 14, 64)).astype(np.float32),
+    )
+    np.save(work_dir / "max_dense_init.npy", max_init(1, 7, 7, 64))
+
     # Min fixtures. f16-exact for the same reason the max ones are: a min pool
     # also returns one of its inputs unchanged, so the whole path is lossless
     # and the comparison can be exact.
@@ -541,6 +572,7 @@ EXPECTED_EXECUTABLE = {
     "max_pool_nchw_s1": "rocket_pooling_max_executable",
     "max_pool_kernel_8x8": "rocket_pooling_max_executable",
     "max_pool_wide": "rocket_pooling_max_executable_s2",
+    "max_pool_nhwc_dense": "rocket_pooling_max_executable_s2",
     "min_pool_nhwc_s2": "rocket_pooling_min_executable_s2",
     "min_pool_nhwc_s1": "rocket_pooling_min_executable",
     "min_pool_wide": "rocket_pooling_min_executable_s2",
@@ -881,6 +913,15 @@ def build_cases(atol: float, rtol: float) -> list[Case]:
             ("max_pool_wide_out.npy",),
             0.0,
             0.0,
+        ),
+        # The only inexact max case: realistic magnitudes, so the f16
+        # demotion actually rounds. Takes the --atol/--rtol tolerances.
+        Case(
+            "max_pool_nhwc_dense",
+            ("max_dense_input.npy", "max_dense_init.npy"),
+            ("max_pool_nhwc_dense_out.npy",),
+            atol,
+            rtol,
         ),
         Case(
             "min_pool_nhwc_s2",

@@ -276,6 +276,13 @@ asserted in a lit test -- `rocket_int8_match_boundaries.mlir`,
 route a known-bad shape to the NPU, and tightening one cannot silently lose the
 largest measured-good shape.
 
+**An offloaded max or min pool is exact only up to f16.** The shim demotes to
+f16 before the hardware sees the tensor, so on arbitrary f32 activations the
+pool returns `f16(x)` rather than `x`. On VGG that is worth **0.077 max|error|
+on the logits** (top-1 unchanged), against 0 for the same model's int8
+convolutions, which are bit-exact. The gate's `max_pool_nhwc_dense` case is
+the isolated version of that cost, at 0.00024 on a 2x2 window.
+
 The pooling rows additionally have an end-to-end differential behind them:
 `tools/e2e_pooling_regression.py` compiles all three methods twice and
 compares on the board -- fourteen cases, all passing on `planck` 2026-09-05.

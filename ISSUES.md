@@ -992,6 +992,45 @@ the same one, and prefer `0-7` or `4-7` -- `4,5` measures a starved machine.
 
 ---
 
+## C11 (S2) — VGG int8 aborts under a repeated benchmark loop, on `main` as well as with the pooling matchers
+
+Found 2026-09-05 while benchmarking VGG for the Phase 0 pooling work. **Not
+introduced by that work**: the arm built from `main`'s own transform spec,
+with no pooling offloaded at all, hangs identically.
+
+`iree-benchmark-module` on `bench-vgg/vgg.int8.mlir`, `taskset -c 4-7`,
+governors `performance`:
+
+| `--benchmark_min_time` | main arm | branch arm |
+|---|---|---|
+| 0.001s | 982 ms, clean | 792 ms, clean |
+| 0.5s | 997 ms, clean | 799 ms, clean |
+| 2s | **abort**, hung-job floor | **abort**, hung-job floor |
+| 5s | **abort**, hung-job floor | **abort**, hung-job floor |
+
+Single `iree-run-module` invocations are clean and produce correct logits, so
+the discriminator is repeated invocation in one process -- the same shape as
+C8, but **not the same cause**: C8's `ROCKET_PM_DWELL=suspend
+ROCKET_PM_DWELL_AT=transition` workaround does not clear this (still 1 hang,
+both arms), and C8 itself is resolved.
+
+VGG's int8 convolutions reach the NPU through the same `int8_accumulator`
+path MobileNetV2 uses, and MobileNetV2's int8 arm no longer hangs, so
+whatever this is either scales with something VGG has more of, or is a
+different mechanism wearing the same symptom.
+
+**What this blocks.** VGG can only be timed one iteration per process, which
+means every VGG number in this file and in LIMITS.md includes a cold weight
+cache. The comparisons are still valid -- every arm pays it equally -- but the
+absolute numbers are pessimistic for the NPU arms and should not be quoted
+against a steady-state figure from another model.
+
+Next step: `ROCKET_DISPATCH_TIMES` to name which dispatch hits the floor and
+at which iteration, then whether it is the int8 path alone (build a VGG arm
+with only the conv matchers, no pooling) or the mix.
+
+---
+
 ## D1 (S4) — the FC lowering here and in the notes use opposite geometries, and this one may be better
 
 `iree-rocket-hal/src/rocket/fc.rs` maps, from a sweep of 160 RKNN-compiled ONNX

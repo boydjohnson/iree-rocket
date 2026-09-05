@@ -358,9 +358,24 @@ service the existing "two menus" section performs for precisions.
 
 Phase 0 is done and board-validated; the rest stands.
 
+**Phase 0 produced the first counter-example to the warning above, and it is
+worth reading before Phases 1 and 2.** P8's law -- cost is flat per offloaded
+dispatch, so more sites make a model slower -- was measured on MobileNetV2,
+where the added sites are small convolutions whose pack-and-compact overhead
+rivals their arithmetic. VGG's five max pools are the opposite: large windows
+over large images, each saving far more CPU work than the ~7 ms dispatch tax
+costs. Offloading them is worth 212 ms of 1018, about 42 ms per site.
+
+So the law is not "more sites are worse". It is "a site is worth offloading
+when the op does more work than the dispatch tax", and MobileNetV2's
+convolutions happen to sit on the wrong side of that line while VGG's pools
+sit firmly on the right one. Phases 1 and 2 should be judged per op against
+that bar rather than blocked by a blanket rule -- an element-wise op is
+back on the wrong side, which is what P8 lever #3 was really saying.
+
 | Step | Why here |
 |---|---|
-| ~~Phase 0~~ | Done 2026-09-05. Free coverage, no hardware risk, no new wire format. One caveat it did not honour: its own text said to gate the matchers behind a flag and measure both arms, and they went into `foreach_match` unflagged. MobileNetV2 and ViT are unaffected (dispatch-site counts identical), but VGG's five `onnx.MaxPool` sites now offload and that has not been benchmarked |
+| ~~Phase 0~~ | Done 2026-09-05, and **measured**. MobileNetV2 and ViT are unaffected (dispatch-site counts identical). VGG's five `onnx.MaxPool` sites now offload and it is **1.26x faster** for it -- 1018 ms to 806 ms median, five interleaved passes. See below: this is the first counter-example to P8's law |
 | `mulf` | Highest-leverage single unblock; bounded (one untried ERDMA configuration), and its answer changes the scope of everything after it |
 | Phase 3 | The only phase with a positive throughput story, and it needs no new schema breadth |
 | C5 | Blocks both remaining phases by its own stated action item |
