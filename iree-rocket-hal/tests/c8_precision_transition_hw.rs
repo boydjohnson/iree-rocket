@@ -1,22 +1,27 @@
-//! ISSUES.md C8 at the HAL level: an `Int8Accumulator` job poisons a following
-//! wide fp16 job, and only the runtime-PM power domain cycling clears it.
+//! ISSUES.md C8 at the HAL level: an `Int8Accumulator` job used to poison the
+//! core it ran on, so a following wide fp16 job hung until the power domain
+//! cycled. **Fixed 2026-09-05** -- the cause was this crate leaving
+//! `DPU_RDMA_BRDMA_CFG.brdma_data_use` at 7 on a path that bypasses the BS
+//! plane, so BRDMA fetched a bias/scale/shift triple nothing consumed. The
+//! vendor emitter (`rocket-userspace`'s `gen_conv2d_int8`) leaves that
+//! register at 0 and never poisoned; bisecting the two programs field by
+//! field pinned it to that register alone.
 //!
-//! This is the raw-plan reproduction the IREE-level probe
-//! (`tools/c8_precision_transition_probe.py`) could not be: no compiler, no
-//! driver bookkeeping, one process, and the **gap** between the aggressor's
-//! fence and the victim's submit under the test's control. The earlier
-//! raw-plan attempt recorded as "exact in all four variants" verified the
-//! aggressor's output against the oracle *between* the two jobs, which is
-//! far more than the ~100 ms a 50 ms `autosuspend_delay_ms` needs to cycle
-//! the domain -- so it never saw the state it was looking for. Here every
-//! job is prepared, packed and cache-synced **before** the arm starts, the
-//! aggressors and the victim are submitted back to back, and every verdict
-//! is computed only after the victim's fence.
+//! Every arm here therefore expects **Clean** now. `ROCKET_ACC_BRDMA=1` puts
+//! the old value back, which reproduces the hang on demand and is how this
+//! test doubles as a regression guard: run it once plain (all clean) and once
+//! with that variable (the poisoning arms hang again).
 //!
-//! Each arm records what the driver-level test could not: every core's
-//! `power/runtime_status` immediately before the victim submit, and how long
-//! the gap actually was. A row therefore says whether the domain was still
-//! active when the victim went in.
+//! The arms remain as the characterisation that found it, and they still
+//! record what the symptom looked like: the state was per core (each job's
+//! core is read off `/proc/interrupts`, and `drm_sched` alternates an idle
+//! entity between cores, so a victim hung only when it landed on the
+//! aggressor's core), it only appeared with the int32 output writer, it needed
+//! the victim's output past ~256 KiB, and only the core's runtime suspend
+//! cleared it. Each job is prepared, packed and cache-synced before an arm
+//! starts, the aggressors and victim are submitted back to back with the gap
+//! under the test's control, and every verdict is computed after the victim's
+//! fence.
 //!
 //! Cross-compile and run on the board:
 //!
@@ -583,7 +588,7 @@ fn arms() -> Vec<Arm> {
             victim: victim("k1"),
             victim_repeats: 1,
             gap: Gap::None,
-            expect: Expect::Hang,
+            expect: Expect::Clean,
             bs_engage: false,
             od_engage: false,
         },
@@ -603,7 +608,7 @@ fn arms() -> Vec<Arm> {
             victim: victim("px33"),
             victim_repeats: 1,
             gap: Gap::None,
-            expect: Expect::Hang,
+            expect: Expect::Clean,
             bs_engage: false,
             od_engage: false,
         },
@@ -613,7 +618,7 @@ fn arms() -> Vec<Arm> {
             victim: victim("k1"),
             victim_repeats: 1,
             gap: Gap::Sleep(Duration::from_millis(30)),
-            expect: Expect::Hang,
+            expect: Expect::Clean,
             bs_engage: false,
             od_engage: false,
         },
@@ -702,7 +707,7 @@ fn arms() -> Vec<Arm> {
             victim: victim("k1"),
             victim_repeats: 4,
             gap: Gap::None,
-            expect: Expect::Hang,
+            expect: Expect::Clean,
             bs_engage: false,
             od_engage: false,
         },
@@ -722,7 +727,7 @@ fn arms() -> Vec<Arm> {
             victim: victim("stem"),
             victim_repeats: 3,
             gap: Gap::None,
-            expect: Expect::Hang,
+            expect: Expect::Clean,
             bs_engage: false,
             od_engage: false,
         },
@@ -732,7 +737,7 @@ fn arms() -> Vec<Arm> {
             victim: victim("bigout"),
             victim_repeats: 1,
             gap: Gap::None,
-            expect: Expect::Hang,
+            expect: Expect::Clean,
             bs_engage: false,
             od_engage: false,
         },
@@ -762,7 +767,7 @@ fn arms() -> Vec<Arm> {
             victim: victim("k1"),
             victim_repeats: 4,
             gap: Gap::None,
-            expect: Expect::Hang,
+            expect: Expect::Clean,
             bs_engage: true,
             od_engage: false,
         },
@@ -772,7 +777,7 @@ fn arms() -> Vec<Arm> {
             victim: victim("k1"),
             victim_repeats: 1,
             gap: Gap::None,
-            expect: Expect::Hang,
+            expect: Expect::Clean,
             bs_engage: true,
             od_engage: false,
         },
@@ -816,7 +821,7 @@ fn arms() -> Vec<Arm> {
             victim: victim("k1"),
             victim_repeats: 4,
             gap: Gap::None,
-            expect: Expect::Hang,
+            expect: Expect::Clean,
             bs_engage: false,
             od_engage: true,
         },
@@ -829,7 +834,7 @@ fn arms() -> Vec<Arm> {
             victim: victim("k1"),
             victim_repeats: 4,
             gap: Gap::None,
-            expect: Expect::Hang,
+            expect: Expect::Clean,
             bs_engage: true,
             od_engage: true,
         },
@@ -1007,7 +1012,7 @@ fn ms(duration: Duration) -> String {
 /// a wrong one fails the test; `Open` arms are questions and only print.
 #[test]
 #[ignore = "needs /dev/accel/accel0 -- see the module doc comment"]
-fn int8acc_to_fp16_transition_is_cleared_by_the_power_domain() {
+fn int8acc_to_fp16_transition_no_longer_poisons_a_core() {
     let _guard = NPU_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
     let file = OpenOptions::new()
         .read(true)

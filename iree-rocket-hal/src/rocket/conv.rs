@@ -409,6 +409,11 @@ pub const MAX_OUTPUT_CHANNELS: u32 = 1792;
 /// `DPU_DATA_FORMAT.bs_mul_shift_value_neg`, in every quantized capture.
 const BS_MUL_SHIFT_VALUE: u32 = 14;
 
+/// `DPU_RDMA_RDMA_BRDMA_CFG.brdma_data_use` when nothing consumes BRDMA, which
+/// is every path that bypasses the BS plane. See ISSUES.md C8: a fetch left
+/// enabled with no consumer poisons the core.
+const BRDMA_DATA_USE_NONE: u32 = 0;
+
 /// `DPU_RDMA_RDMA_BRDMA_CFG.brdma_data_use` when BRDMA supplies bias only.
 const BRDMA_DATA_USE_BIAS: u32 = 1;
 
@@ -4016,6 +4021,12 @@ fn bs_ow_op_value(quantization: Option<&Quantization>) -> u32 {
 ///
 /// Parts are comma-separated so the difference can be bisected: `qd`, `brdma`,
 /// `bs`, `owsrc`, or `all`. Nothing on the compiled path sets it.
+/// `ROCKET_ACC_BRDMA=1` puts the accumulator path's `brdma_data_use` back to
+/// the pre-C8-fix value, so the hardware test can still reproduce the hang.
+fn acc_brdma_restore() -> bool {
+    std::env::var("ROCKET_ACC_BRDMA").is_ok_and(|value| value == "1")
+}
+
 fn acc_vendor_part(part: &str) -> bool {
     static PARTS: std::sync::OnceLock<Vec<String>> = std::sync::OnceLock::new();
     let parts = PARTS.get_or_init(|| {
@@ -4273,10 +4284,17 @@ fn conv_2d_tile_program(
     };
     // BRDMA carries bias alone at fp16 and the full bias/scale/shift triple
     // once requantization is active.
-    let brdma_data_use = if accumulator_output && acc_vendor_part("brdma") {
-        // The vendor's int32-raw path leaves DPU_RDMA_BRDMA_CFG at 0: with the
-        // BS plane bypassed there is nothing for BRDMA's triple to feed.
-        0
+    // **ISSUES.md C8's root cause.** The int32-accumulator path bypasses the BS
+    // plane, so the bias/scale/shift triple BRDMA would fetch has no consumer --
+    // and leaving the fetch enabled anyway is what poisons the NPU core, making
+    // a following wide fp16 job hang until the power domain cycles. Bisected
+    // against `rocket-userspace`'s `gen_conv2d_int8`, which leaves
+    // `DPU_RDMA_BRDMA_CFG` at 0 here and does not poison: of the seven
+    // non-address fields the two emitters disagree on, this one alone accounts
+    // for it. `ROCKET_ACC_BRDMA=1` restores the old value, which is how the
+    // hardware test still reproduces the hang on demand.
+    let brdma_data_use = if accumulator_output && !acc_brdma_restore() {
+        BRDMA_DATA_USE_NONE
     } else if quantization.is_some() {
         BRDMA_DATA_USE_QUANTIZED
     } else {
