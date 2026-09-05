@@ -1241,31 +1241,57 @@ standing.
 
 ### What `size_e` actually encodes, 2026-09-05
 
-With the OW stage engaged (`ROCKET_ACC_OD_ENGAGE=1`), exactly one `size_e`
-works per output type and every other value stalls the writer into a ~530 ms
-watchdog kill. Swept 0..7 at 32x32 Cin 128 k1, canary healthy throughout and
-`past_end` 0 everywhere [HW sweep, planck]:
+With the OW stage engaged (`ROCKET_ACC_OD_ENGAGE=1`) exactly one `size_e` works
+per writer and every other value stalls it into a ~530 ms watchdog kill. Swept
+0..7 at 32x32 Cin 128 k1, canary healthy throughout and `past_end` 0
+everywhere, plus a depthwise arm through `conv_depthwise_hw` [HW sweep,
+planck]:
 
-| output | bytes | required `size_e` | `size_e + 1` | wrong values write |
-|---|---|---|---|---|
-| fp16 | 2 | **1** | 2 = bytes | 256-512 B of 131072 |
-| fp32 | 4 | **3** | 4 = bytes | 256-1024 B of 262144 |
-| int8 (requantized) | 1 | **1** | 2 = 2 x bytes | 1024 B of 65536 (earlier sweep) |
-| int32 (accumulator) | 4 | **7** | 8 = 2 x bytes | 256 x (`size_e`+1) B |
+| output | bytes | required `size_e` | wrong values write |
+|---|---|---|---|
+| dense fp16 | 2 | **1** | 256-512 B of 131072 |
+| dense fp32 | 4 | **3** | 256-1024 B of 262144 |
+| dense int8, requantized | 1 | **1** | 1024 B of 65536 (earlier sweep) |
+| dense int32, accumulator | 4 | **7** | 256 x (`size_e`+1) B |
+| int16 from int4 operands | 2 | **7** | 256 x (`size_e`+1) B |
+| depthwise fp16 | 2 | **3** | test fails |
 
-**Floats stride at their element width, integers at twice it.** That is the
-notes' quirk stated without the constant 8, and it is Cout-independent: Cout 16
-still requires 7, where `Cout/8 - 1` would be 1 and 1 writes 512 of 131072
-bytes. Since every earlier measurement of the quirk used Cout 64 -- where
-`Cout/8 - 1` is also 7 -- the two readings had never been separated. The vendor
-register doc's "number of 8-channel groups in a row, minus 1" is **not** what
-the field does on the conv write path.
+**Every value the HAL ships is confirmed correct**, including the two that had
+looked like exceptions. So the earlier framing of int4's 7 and depthwise's 3 as
+"unexplained, and measured where the field might not even be live" was wrong on
+both counts: the field is live for them and they are right.
 
-Two shipped values do not fit and are both from probes at `od_bypass = 1`,
-where the field's liveness is not guaranteed either way: int4's 7 (its 2-byte
-int16 output would predict 3) and depthwise's 3 (an fp16 output would predict
-1). Neither is known to be wrong -- they are measured -- but neither has been
-re-measured with the stage engaged.
+**This also retracts "floats stride at their element width, integers at twice
+it"**, committed earlier the same day. int16 from int4 is a 2-byte integer
+output and needs 7, not 3. There is no single arithmetic rule. The value is a
+property of the writer, in four groups:
+
+* **Float output**: `bytes - 1`.
+* **The raw integer accumulator writer**: a fixed **7** whatever the output
+  width -- 4-byte int32 and 2-byte int16 alike. That is the notes' quirk and
+  its mental model (the DPU casts its wide accumulator and writes it with one
+  fixed integer geometry) confirmed with the stage live rather than inferred
+  from a bypassed one.
+* **Requantized int8**: 1 -- neither the float rule's 0 nor the accumulator's 7.
+* **Depthwise**: 3 at fp16 where dense fp16 is 1; its own geometry.
+
+What the sweep does refute is the vendor register doc's "number of 8-channel
+groups in a row, minus 1": the value is **Cout-independent**. Cout 16 still
+requires 7 on the accumulator path, where `Cout/8 - 1` would be 1 and 1 writes
+512 of 131072 bytes. Every earlier measurement of the quirk used Cout 64, where
+`Cout/8 - 1` is also 7, so the two readings had never been separated.
+
+Two related facts from the same reading, worth keeping because they were
+mis-stated earlier in this section: `OD` is **not** output dimensions. The
+register docs call `od_bypass` a bypass of the **CPEND** stage and `ow_src` the
+selector for "the CPEND (output-width regroup) operand", and `size_e`'s
+documented relatives are `feature_mode_cfg.rgp_type` (regroup cut width) and
+`bs_ow_cfg.rgp_cnter`. We program `rgp_type = 0` and `rgp_cnter = 0` in every
+dispatch, so the regroup is otherwise unconfigured while `size_e` is still
+load-bearing. And the output channel count lives in five other registers, all
+precision-independent: `CORE_DATAOUT_SIZE_1`, `DPU_DATA_CUBE_CHANNEL` (both
+`orig_channel` and the padded `channel`), `DPU_WDMA_SIZE_0.channel_wdma` and
+`DPU_RDMA_DATA_CUBE_CHANNEL`.
 
 None of this changes C8: the int32 writer poisons at its correct `size_e` of 7,
 with the OW stage bypassed or engaged. `od_bypass = 1` appears in two clean paths (fp16, fp16-f32out).

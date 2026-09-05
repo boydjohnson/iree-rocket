@@ -3816,26 +3816,38 @@ fn int4_override(precision: Precision, name: &str) -> Option<u32> {
 /// With the stage live, one value works and every other one stalls the writer
 /// into a ~530 ms watchdog kill. Swept 0..7 at 32x32 Cin 128 k1
 /// (`accumulator_size_e_probe`, `ROCKET_ACC_OD_ENGAGE=1`, canary healthy
-/// throughout, `past_end` 0 everywhere) [HW sweep, planck 2026-09-05]:
+/// throughout, `past_end` 0 everywhere) plus a depthwise arm through
+/// `conv_depthwise_hw` [HW sweep, planck 2026-09-05]:
 ///
-/// | output | bytes | required `size_e` | `size_e + 1` |
-/// |---|---|---|---|
-/// | fp16 | 2 | 1 | 2 = bytes |
-/// | fp32 | 4 | 3 | 4 = bytes |
-/// | int8 (requantized) | 1 | 1 | 2 = 2 x bytes |
-/// | int32 (accumulator) | 4 | 7 | 8 = 2 x bytes |
+/// | output | bytes | required `size_e` |
+/// |---|---|---|
+/// | dense fp16 | 2 | 1 |
+/// | dense fp32 | 4 | 3 |
+/// | dense int8, requantized | 1 | 1 |
+/// | dense int32, accumulator | 4 | **7** |
+/// | int16 from int4 operands | 2 | **7** |
+/// | depthwise fp16 | 2 | 3 |
 ///
-/// So **floats stride at their element width and integers at twice it**, which
-/// is the quirk stated in a form that does not depend on the value 8. The
-/// notes' 7 was measured only at Cout 64, where `Cout/8 - 1` is also 7; this
-/// sweep separates them, because Cout 16 still requires 7 (`Cout/8 - 1` would
-/// be 1, and 1 writes 512 of 131072 bytes). The vendor register doc's
-/// "8-channel groups in a row, minus 1" reading is therefore not what the
-/// field does on the conv write path.
+/// **Every value this function returns is confirmed correct**, including the
+/// two that looked like exceptions. There is no single arithmetic rule; the
+/// value is a property of the writer, in four groups:
 ///
-/// Two values here do not fit that rule and are both from other probes at
-/// `od_bypass = 1`: int4's 7 (its int16 output would predict 3) and
-/// depthwise's 3 (an fp16 output would predict 1). The accumulator
+/// * **Float output**: `bytes - 1`, the natural stride.
+/// * **The raw integer accumulator writer**: a fixed **7** whatever the output
+///   width -- 4-byte int32 and 2-byte int16 both. This is exactly the notes'
+///   quirk and its mental model (the DPU casts its wide accumulator and writes
+///   it with one fixed integer geometry), now confirmed with the stage live
+///   rather than inferred.
+/// * **Requantized int8**: 1, which is neither the float rule (0) nor the
+///   accumulator's 7.
+/// * **Depthwise**: 3 at fp16, where dense fp16 is 1 -- its own geometry.
+///
+/// What the sweep *does* refute is the vendor register doc's "number of
+/// 8-channel groups in a row, minus 1" reading: the value is Cout-independent.
+/// Cout 16 still requires 7 on the accumulator path, where `Cout/8 - 1` would
+/// be 1 and 1 writes 512 of 131072 bytes. Every earlier measurement used Cout
+/// 64, where `Cout/8 - 1` is also 7, so the two readings had never been
+/// separated. The accumulator
 /// truncation in [`MAX_ACCUMULATOR_COEFFICIENT_BYTES_PER_CHANNEL`] is still
 /// unexplained, and this is one more register eliminated: with `size_e` inert
 /// and `surf_add` swept, the output-side register archaeology is exhausted.

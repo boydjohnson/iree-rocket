@@ -4975,6 +4975,10 @@ fn accumulator_size_e_probe() {
             // whether `size_e` 7 is "integer" or "wide". No oracle readback,
             // so read `written=` and not the mismatch count.
             Ok("fp16acc") => OraclePrecision::Fp16Accumulator,
+            // int16 output from int4 operands: the other value the `size_e`
+            // rule does not explain, and the second of the two shipped
+            // outliers measured at `od_bypass = 1`.
+            Ok("int4") => OraclePrecision::Int4,
             _ => OraclePrecision::Int8Accumulator,
         },
         // `Counting` sets every input and coefficient to 1, so at a 1x1 kernel
