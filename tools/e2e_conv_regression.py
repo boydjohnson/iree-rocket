@@ -681,6 +681,50 @@ MIXED_FP16_INPUTS = (
 )
 
 
+def wait_for_quiet_npu(host: str, budget_seconds: float = 20.0) -> None:
+    """Blocks until every NPU core's runtime-PM state reads `suspended`.
+
+    A hung job leaves the device sick for seconds, and the state crosses
+    processes -- so a gate started right after one (a deliberate repro, an
+    aborted run, another session) can have its *first* case fail for reasons
+    that have nothing to do with it. That happened on 2026-09-05: the compiled
+    gate aborted on case 0, a pure fp16 512-channel 3x3, which then passed 3 of
+    3 in isolation and passes in the full gate from a quiet device. Waiting
+    here turns "the first case hangs" into either a clean start or an explicit
+    complaint about the board.
+
+    Cores read `suspended` once the driver's autosuspend has cycled the power
+    domain, which is also what clears the wide-output poisoning ISSUES.md C8
+    describes. A board that never settles is reported and not waited on
+    forever: the gate still runs, because a missing sysfs path should not stop
+    a developer's run, but the warning says what to suspect.
+    """
+    probe = (
+        "for i in $(seq 1 %d); do "
+        "s=$(cat /sys/devices/platform/*.npu/power/runtime_status 2>/dev/null); "
+        '[ -n "$s" ] || { echo missing; exit 0; }; '
+        'case "$s" in *active*) sleep 1;; *) echo quiet; exit 0;; esac; '
+        "done; echo busy"
+    ) % int(budget_seconds)
+    state = capture(["ssh", host, probe]).splitlines()[-1].strip()
+    if state == "quiet":
+        return
+    if state == "missing":
+        print(
+            "  note: no NPU runtime_status on the board; skipping the quiet-device "
+            "check",
+            flush=True,
+        )
+        return
+    print(
+        f"  WARNING: the NPU was still active after {budget_seconds:.0f}s. A job "
+        "hung recently and the device may still be sick, which shows up as the "
+        "FIRST case failing for no reason of its own. Re-run from a quiet board "
+        "before believing a failure below.",
+        flush=True,
+    )
+
+
 def run_compiled_gate(
     host: str,
     remote_dir: str,
@@ -695,6 +739,7 @@ def run_compiled_gate(
 ) -> None:
     write_compiled_fixture(work_dir)
     compile_modules(work_dir, compiler, transform_spec)
+    wait_for_quiet_npu(host)
     # int8 cases are compared exactly (atol=rtol=0), not with the fp16
     # tolerances: the whole path is integer arithmetic, so any difference at
     # all is a bug. That matters more than it sounds -- the failure mode the
