@@ -409,6 +409,11 @@ pub const MAX_OUTPUT_CHANNELS: u32 = 1792;
 /// `DPU_DATA_FORMAT.bs_mul_shift_value_neg`, in every quantized capture.
 const BS_MUL_SHIFT_VALUE: u32 = 14;
 
+/// `DPU_RDMA_RDMA_BRDMA_CFG.brdma_data_use` when nothing consumes BRDMA, which
+/// is every path that bypasses the BS plane. See ISSUES.md C8: a fetch left
+/// enabled with no consumer poisons the core.
+const BRDMA_DATA_USE_NONE: u32 = 0;
+
 /// `DPU_RDMA_RDMA_BRDMA_CFG.brdma_data_use` when BRDMA supplies bias only.
 const BRDMA_DATA_USE_BIAS: u32 = 1;
 
@@ -3804,7 +3809,50 @@ fn int4_override(precision: Precision, name: &str) -> Option<u32> {
 ///
 /// So `rockchip-npu-notes/encodings/size-e-quirk.md`'s "integer outputs stride
 /// as `size_e = 7` regardless of byte width" is a fact about a path that keeps
-/// the OW stage engaged, and does not carry to this one. The accumulator
+/// the OW stage engaged, and does not carry to this one.
+///
+/// **Refined 2026-09-05** by [`od_engage`], which engages that stage on any
+/// path that bypasses it. Clearing `od_bypass` always makes `size_e` live;
+/// `bs_bypass` has nothing to do with it (with the BS plane clocked and
+/// `od_bypass` still 1, `size_e = 7` is still inert, bit-exact at 32x32 Cin 64
+/// Cout 128 k1). The converse does **not** hold -- `od_bypass = 1` does not
+/// imply inert, see [`Precision::Int4`] below, which is load-bearing there.
+///
+/// With the stage live, one value works and every other one stalls the writer
+/// into a ~530 ms watchdog kill. Swept 0..7 at 32x32 Cin 128 k1
+/// (`accumulator_size_e_probe`, `ROCKET_ACC_OD_ENGAGE=1`, canary healthy
+/// throughout, `past_end` 0 everywhere) plus a depthwise arm through
+/// `conv_depthwise_hw` [HW sweep, planck 2026-09-05]:
+///
+/// | output | bytes | required `size_e` |
+/// |---|---|---|
+/// | dense fp16 | 2 | 1 |
+/// | dense fp32 | 4 | 3 |
+/// | dense int8, requantized | 1 | 1 |
+/// | dense int32, accumulator | 4 | **7** |
+/// | int16 from int4 operands | 2 | **7** |
+/// | depthwise fp16 | 2 | 3 |
+///
+/// **Every value this function returns is confirmed correct**, including the
+/// two that looked like exceptions. There is no single arithmetic rule; the
+/// value is a property of the writer, in four groups:
+///
+/// * **Float output**: `bytes - 1`, the natural stride.
+/// * **The raw integer accumulator writer**: a fixed **7** whatever the output
+///   width -- 4-byte int32 and 2-byte int16 both. This is exactly the notes'
+///   quirk and its mental model (the DPU casts its wide accumulator and writes
+///   it with one fixed integer geometry), now confirmed with the stage live
+///   rather than inferred.
+/// * **Requantized int8**: 1, which is neither the float rule (0) nor the
+///   accumulator's 7.
+/// * **Depthwise**: 3 at fp16, where dense fp16 is 1 -- its own geometry.
+///
+/// What the sweep *does* refute is the vendor register doc's "number of
+/// 8-channel groups in a row, minus 1" reading: the value is Cout-independent.
+/// Cout 16 still requires 7 on the accumulator path, where `Cout/8 - 1` would
+/// be 1 and 1 writes 512 of 131072 bytes. Every earlier measurement used Cout
+/// 64, where `Cout/8 - 1` is also 7, so the two readings had never been
+/// separated. The accumulator
 /// truncation in [`MAX_ACCUMULATOR_COEFFICIENT_BYTES_PER_CHANNEL`] is still
 /// unexplained, and this is one more register eliminated: with `size_e` inert
 /// and `surf_add` swept, the output-side register archaeology is exhausted.
@@ -3819,6 +3867,196 @@ fn bs_ow_size_e_override(in_channels: u32) -> Option<u32> {
     std::env::var("ROCKET_ACC_SIZE_E")
         .ok()
         .and_then(|value| value.parse().ok())
+}
+
+/// Characterization override for `DPU_BS_CFG.BS_BYPASS` on the int32
+/// accumulator path (`ROCKET_ACC_BS_ENGAGE=1`, or
+/// [`set_accumulator_bs_engage`] for in-process arms).
+///
+/// **What it is for.** ISSUES.md C8: an `Int8Accumulator` job poisons the core
+/// it ran on and a following wide fp16 job hangs, while the same shapes as
+/// requantized [`Precision::Int8`] or [`Precision::Fp16`] poison nothing. A
+/// register-program diff of one shape at all three precisions (32x32 Cin 64
+/// Cout 128 1x1, `examples/dump_conv_plan_regcmd.rs`) found the three
+/// precisions write the *identical* register set -- so nothing is inherited
+/// stale -- and exactly four registers carry a value unique to the poisoner:
+/// `DATA_FORMAT.out_precision` (4 = int32), this `BS_CFG.bs_bypass`,
+/// `BS_OW_CFG` (`size_e`, already shown inert here by
+/// [`bs_ow_size_e_override`], and `od_bypass`) and `SURFACE_ADD`.
+///
+/// `out_precision` and `bs_bypass` are confounded, because accumulator mode
+/// sets both. This separates them: with the override on, the BS plane is
+/// *engaged* but both of its arithmetic sub-stages are bypassed, so the stage
+/// is clocked and drained while the result is bit-for-bit what it was. A run
+/// that still poisons indicts the int32 writer itself; one that stops
+/// poisoning indicts the bypassed plane, and makes the fix a one-bit change
+/// instead of a compiler path.
+///
+/// Nothing on the compiled path sets it.
+fn accumulator_bs_engage() -> bool {
+    ACCUMULATOR_BS_ENGAGE.load(std::sync::atomic::Ordering::Relaxed)
+        || std::env::var("ROCKET_ACC_BS_ENGAGE").is_ok_and(|value| value != "0")
+}
+
+/// Characterization override for `DPU_BS_OW_CFG.OD_BYPASS`: engages the output
+/// converter on any path that would bypass it -- the int32 accumulator, and
+/// fp16/fp32, whose `size_e` is otherwise untestable
+/// (`ROCKET_ACC_OD_ENGAGE=1`, or [`set_od_engage`]).
+///
+/// The companion to [`accumulator_bs_engage`], and the one combination C8 had
+/// not reached: `out_precision = 4` with the **OW stage engaged**. The
+/// accumulator path is the only poisoner and it runs `od_bypass = 1`, but so
+/// do two clean paths (fp16, fp16-f32out), so the field is already eliminated
+/// as a *discriminator*; this asks the different question of whether the int32
+/// writer still poisons when the output converter is in the path.
+///
+/// **Hazard.** `od_bypass = 0` is what makes `size_e` live -- on the
+/// requantized path a `size_e` of 3 or 7 there writes 1024 of 65536 bytes and
+/// hangs the job. The accumulator path's own `size_e` is 7, so pair this with
+/// `ROCKET_ACC_SIZE_E` and always run it behind `ROCKET_PAD_OUTPUT`: a wider
+/// stride can push the write past the allocation, fault, stall the rk_iommu
+/// and wedge the board until a reboot.
+///
+/// Nothing on the compiled path sets it.
+fn od_engage() -> bool {
+    ACCUMULATOR_OD_ENGAGE.load(std::sync::atomic::Ordering::Relaxed)
+        || std::env::var("ROCKET_ACC_OD_ENGAGE").is_ok_and(|value| value != "0")
+}
+
+/// Characterization override for `DPU_BS_OW_CFG.OW_SRC` (`ROCKET_OW_SRC=0|1`).
+///
+/// The field selects where the CPEND stage's operand comes from: 0 = the
+/// `DPU_BS_OW_OP` configuration register, 1 = "from outside". This crate sets
+/// it to 1 whenever a quantization is present, but neither `rocket-userspace`
+/// nor the Mesa program it was diffed against ever sets bit 0 -- both emit
+/// `BS_OW_CFG` as `tp_org_en | size_e_2 | size_e_1 | size_e_0 | od_bypass`
+/// with no `ow_src` term.
+///
+/// **Checked on hardware 2026-09-05, and our 1 is required.** `conv_int8_hw`
+/// passes 4/4 at the shipped value and fails **3 of 4** at `ROCKET_OW_SRC=0`.
+/// The two stacks feed the CPEND operand from different places and each is
+/// self-consistent: `rocket-userspace` leaves `ow_src` at 0 and supplies the
+/// operand in the `DPU_BS_OW_OP` configuration register (`0x80 - weight_zp`
+/// on its depthwise branch), while this crate writes `DPU_BS_OW_OP = 0` and
+/// takes it from BRDMA, which the requantized path already loads with the
+/// bias/scale/shift triple (`BRDMA_DATA_USE_QUANTIZED`). So the divergence is
+/// a design choice, not a defect, and the two settings are not
+/// interchangeable.
+///
+/// On the accumulator path CPEND is bypassed and the field is inert (0
+/// mismatches either way at 32x32 Cin 128 Cout 64 k1), so the `1` it gets
+/// there is merely unused.
+///
+/// Nothing on the compiled path sets it.
+fn ow_src_override() -> Option<u32> {
+    if acc_vendor_part("owsrc") {
+        return Some(0);
+    }
+    if cpend_from_configuration() {
+        return Some(0);
+    }
+    std::env::var("ROCKET_OW_SRC")
+        .ok()
+        .and_then(|value| value.parse().ok())
+}
+
+/// `ROCKET_CPEND=mesa` adopts the vendor stack's CPEND wiring wholesale:
+/// `ow_src = 0` plus the operand in `DPU_BS_OW_OP` as `0x80 - weight_zero_point`.
+///
+/// The two halves have to move together -- see [`ow_src_override`] -- so this
+/// exists rather than making a caller set both knobs consistently. Note that
+/// Mesa only ever engages CPEND on its **depthwise** path; its direct-conv
+/// programs all set `od_bypass = 1`, so on a dense shape this is an adoption
+/// experiment with no vendor ground truth behind it.
+///
+/// **Tried on hardware 2026-09-05 and rejected.** Moving both fields together
+/// does work where moving `ow_src` alone did not -- `conv_int8_hw` 4/4,
+/// `conv_int8_map_hw` 6/6, `conv_depthwise_int8_exact_hw` 3/3, and depthwise
+/// fp16 with or without `od_bypass` cleared. The operand is genuinely
+/// load-bearing (sweeping `ROCKET_BS_OW_OP` with `ow_src = 0`: 127 and 128
+/// pass 4/4, 129 passes 3/4, and 0, 64, 192, 255 pass 1/4).
+///
+/// It fails on **affine int8**, and structurally rather than by a value:
+/// `conv_int8_vendor_affine_hw` cycles a per-output-channel weight zero point
+/// of `[-127, -43, 0, 42, 125]`, so `0x80 - weight_zp` is `[255, 171, 128, 86,
+/// 3]` -- five different operands where `DPU_BS_OW_OP` is one 16-bit scalar.
+/// No value of it passes (swept 0, 3, 85, 128, 171, 253, 255: 0/1 every time).
+/// BRDMA can carry a per-channel operand and a configuration register cannot,
+/// so this crate's wiring is strictly the more general of the two and Mesa's
+/// is the uniform-zero-point special case. Keep `ow_src = 1`.
+fn cpend_from_configuration() -> bool {
+    std::env::var("ROCKET_CPEND").is_ok_and(|value| value == "mesa")
+}
+
+/// Characterization override for `DPU_BS_OW_OP.ow_op`, the CPEND operand when
+/// `ow_src = 0` (`ROCKET_BS_OW_OP=<value>`; `ROCKET_CPEND=mesa` supplies the
+/// vendor's `0x80 - weight_zero_point` instead). This crate ships 0 because it
+/// feeds the operand from BRDMA.
+fn bs_ow_op_value(quantization: Option<&Quantization>) -> u32 {
+    if let Some(value) = std::env::var("ROCKET_BS_OW_OP")
+        .ok()
+        .and_then(|value| value.parse::<u32>().ok())
+    {
+        return value & 0xffff;
+    }
+    if cpend_from_configuration() {
+        let weight_zero_point = quantization.map_or(0, |q| q.weight_zero_point);
+        return (0x80i64 - i64::from(weight_zero_point)) as u32 & 0xffff;
+    }
+    0
+}
+
+/// `ROCKET_ACC_VENDOR=<parts>` makes the int32-accumulator program match
+/// `rocket-userspace`'s `gen_conv2d_int8` field by field, for ISSUES.md C8.
+///
+/// A register diff of the two emitters at 32x32 Cin 64 Cout 128 k1 found the
+/// same 126 registers and only ten differing values, three of them DMA
+/// addresses. Of the rest, this crate turns the **requantization datapath on**
+/// while writing the raw int32 accumulator -- `qd_en = 1`, BRDMA fetching the
+/// bias/scale/shift triple, a BS MUL shift of 14 and the BS sub-stages left
+/// un-bypassed -- and the vendor never emits that combination. Its own header
+/// states the rule: "int8_out=0 (default) keeps the validated int32-raw
+/// datapath (qd_en=0, size_e=7/surf*8, int32 output, host requant); int8_out=1
+/// switches to Mesa's int8-output writer: QD_EN=1 ...".
+///
+/// Parts are comma-separated so the difference can be bisected: `qd`, `brdma`,
+/// `bs`, `owsrc`, or `all`. Nothing on the compiled path sets it.
+/// `ROCKET_ACC_BRDMA=1` puts the accumulator path's `brdma_data_use` back to
+/// the pre-C8-fix value, so the hardware test can still reproduce the hang.
+fn acc_brdma_restore() -> bool {
+    std::env::var("ROCKET_ACC_BRDMA").is_ok_and(|value| value == "1")
+}
+
+fn acc_vendor_part(part: &str) -> bool {
+    static PARTS: std::sync::OnceLock<Vec<String>> = std::sync::OnceLock::new();
+    let parts = PARTS.get_or_init(|| {
+        std::env::var("ROCKET_ACC_VENDOR")
+            .unwrap_or_default()
+            .split(',')
+            .map(|value| value.trim().to_ascii_lowercase())
+            .filter(|value| !value.is_empty())
+            .collect()
+    });
+    parts.iter().any(|value| value == part || value == "all")
+}
+
+static ACCUMULATOR_OD_ENGAGE: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+
+/// Turns [`od_engage`] on or off for this process; see
+/// [`set_accumulator_bs_engage`].
+pub fn set_od_engage(engaged: bool) {
+    ACCUMULATOR_OD_ENGAGE.store(engaged, std::sync::atomic::Ordering::Relaxed);
+}
+
+static ACCUMULATOR_BS_ENGAGE: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+
+/// Turns [`accumulator_bs_engage`] on or off for this process, for a test that
+/// needs to alternate it between arms (edition 2024 makes `set_var` unsafe, and
+/// the hardware arms run in one process on purpose).
+pub fn set_accumulator_bs_engage(engaged: bool) {
+    ACCUMULATOR_BS_ENGAGE.store(engaged, std::sync::atomic::Ordering::Relaxed);
 }
 
 /// Characterization override selecting rocket-userspace's `surf_add` *rule*
@@ -4025,17 +4263,39 @@ fn conv_2d_tile_program(
         Some(value) => Bits::new(value),
         None => shape.precision.output_data_precision().into(),
     };
+    // See [`accumulator_bs_engage`]: the C8 probe's BS pass-through.
+    let bs_passthrough = accumulator_output && accumulator_bs_engage();
+    let bs_vendor = accumulator_output && acc_vendor_part("bs");
     // `BS_MUL_SHIFT_VALUE` and its negated twin in `DPU_DATA_FORMAT` are a
     // constant 14 in every int8 capture and 0 in every fp16 one. Nothing in
     // the corpus varies it, so it is not derived from anything.
-    let bs_mul_shift = if quantization.is_some() {
+    //
+    // The pass-through has to zero it. `bs_mul_bypass` bypasses the *multiply*
+    // and not the shift that follows it, so a BS plane engaged with the
+    // shipped 14 right-shifts every accumulator by 14 -- measured, and it is
+    // what made the first pass-through arm return an all-zero buffer.
+    let bs_mul_shift = if quantization.is_some()
+        && !bs_passthrough
+        && !(accumulator_output && acc_vendor_part("bs"))
+    {
         BS_MUL_SHIFT_VALUE
     } else {
         0
     };
     // BRDMA carries bias alone at fp16 and the full bias/scale/shift triple
     // once requantization is active.
-    let brdma_data_use = if quantization.is_some() {
+    // **ISSUES.md C8's root cause.** The int32-accumulator path bypasses the BS
+    // plane, so the bias/scale/shift triple BRDMA would fetch has no consumer --
+    // and leaving the fetch enabled anyway is what poisons the NPU core, making
+    // a following wide fp16 job hang until the power domain cycles. Bisected
+    // against `rocket-userspace`'s `gen_conv2d_int8`, which leaves
+    // `DPU_RDMA_BRDMA_CFG` at 0 here and does not poison: of the seven
+    // non-address fields the two emitters disagree on, this one alone accounts
+    // for it. `ROCKET_ACC_BRDMA=1` restores the old value, which is how the
+    // hardware test still reproduces the hang on demand.
+    let brdma_data_use = if accumulator_output && !acc_brdma_restore() {
+        BRDMA_DATA_USE_NONE
+    } else if quantization.is_some() {
         BRDMA_DATA_USE_QUANTIZED
     } else {
         BRDMA_DATA_USE_BIAS
@@ -4375,7 +4635,9 @@ fn conv_2d_tile_program(
     commands.push(
         Register::<CoreMiscCfg>::new()
             .proc_precision(precision.into())
-            .qd_en(Bits::new(u32::from(quantization.is_some())))
+            .qd_en(Bits::new(u32::from(
+                quantization.is_some() && !(accumulator_output && acc_vendor_part("qd")),
+            )))
             .dw_en(Bits::new(u32::from(shape.depthwise)))
             .build(),
     );
@@ -4453,20 +4715,29 @@ fn conv_2d_tile_program(
             .channel(Bits::new(padded_out_channels - 1))
             .build(),
     );
+    // With the override on, the accumulator path engages the BS plane as a
+    // pass-through -- the stage is clocked, both arithmetic sub-stages are
+    // bypassed and the shift above is zeroed, so the output is unchanged --
+    // which separates C8's `bs_bypass` from its `out_precision`.
     commands.push(
         Register::<DpuBsCfg>::new()
-            .bs_bypass(Bits::new(u32::from(accumulator_output)))
-            .bs_alu_algo(Bits::new(2))
-            .bs_alu_src(Bits::new(1))
+            .bs_bypass(Bits::new(u32::from(accumulator_output && !bs_passthrough)))
+            // The vendor's int32-raw word is 0x53: every sub-stage bypassed and
+            // no ALU algo/source, against this crate's 0x20141.
+            .bs_alu_algo(Bits::new(if bs_vendor { 0 } else { 2 }))
+            .bs_alu_src(Bits::new(if bs_vendor { 0 } else { 1 }))
             .bs_relu_bypass(Bits::new(1))
-            .bs_mul_bypass(Bits::new(u32::from(quantization.is_none())))
+            .bs_alu_bypass(Bits::new(u32::from(bs_passthrough || bs_vendor)))
+            .bs_mul_bypass(Bits::new(u32::from(
+                quantization.is_none() || bs_passthrough || bs_vendor,
+            )))
             .build(),
     );
     commands.push(zero::<DpuBsAluCfg>());
     commands.push(
         Register::<DpuBsMulCfg>::new()
             .bs_mul_shift_value(Bits::new(bs_mul_shift))
-            .bs_mul_src(Bits::new(u32::from(quantization.is_some())))
+            .bs_mul_src(Bits::new(u32::from(quantization.is_some() && !bs_vendor)))
             .build(),
     );
     commands.push(zero::<DpuBsReluxCmpValue>());
@@ -4478,12 +4749,18 @@ fn conv_2d_tile_program(
             .size_e_1(Bits::new(shape.bs_ow_size_e()))
             .size_e_2(Bits::new(shape.bs_ow_size_e()))
             .od_bypass(Bits::new(u32::from(
-                quantization.is_none() || accumulator_output,
+                (quantization.is_none() || accumulator_output) && !od_engage(),
             )))
-            .ow_src(Bits::new(u32::from(quantization.is_some())))
+            .ow_src(Bits::new(
+                ow_src_override().unwrap_or(u32::from(quantization.is_some())),
+            ))
             .build(),
     );
-    commands.push(zero::<DpuBsOwOp>());
+    commands.push(
+        Register::<DpuBsOwOp>::new()
+            .ow_op(Bits::new(bs_ow_op_value(quantization.as_ref())))
+            .build(),
+    );
     commands.push(
         Register::<DpuWdmaSize0>::new()
             .channel_wdma(Bits::new(padded_out_channels - 1))

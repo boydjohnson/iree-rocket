@@ -12,8 +12,15 @@ This runs two independent checks:
 The command exits nonzero if building, board execution, or comparison fails.
 Some cases put two Rocket dispatches in one function so they share a command
 buffer, which is what a real model does. One of those, `mixed_int8_then_depthwise`,
-is a `known_failure`: it is run and reported but does not fail the gate, and
-*does* fail it if it ever starts passing, so the entry cannot quietly go stale.
+was a `known_failure` until 2026-09-05 -- it hung the NPU, 8 of 8 runs -- and is
+now an ordinary gating case: ISSUES.md C8's fix (BRDMA left fetching on the
+int32-accumulator path) was its cause too, and it has been exact 3 of 3 since.
+A `known_failure` entry is still run and reported without failing the gate, and
+the gate *does* fail if one starts passing, so such an entry cannot go stale.
+
+`--only FUNCTION` (repeatable) runs a subset. The NPU's state is order-dependent
+enough that one case can leave the device sick for the next, so a filter is how
+a single case gets a clean verdict.
 
 It requires Python numpy, ssh/scp access to the board, the aarch64 Rust target,
 and built host/aarch64 IREE tools in their normal repository locations.
@@ -176,7 +183,9 @@ func.func @depthwise_int8(%input: tensor<1x34x34x64xi8>, %filter: tensor<3x3x64x
 // deliberately does not demote depthwise (see its scope comment), so writing
 // f32 here would leave the depthwise on the CPU and test nothing.
 //
-// `mixed_int8_then_depthwise` is a known failure -- see KNOWN_FAILURES.
+// `mixed_int8_then_depthwise` used to hang the NPU here (8/8). Its cause was
+// ISSUES.md C8 -- BRDMA left fetching on the int32-accumulator path -- and it
+// gates normally since that was fixed on 2026-09-05.
 func.func @mixed_int8_then_depthwise(%qi: tensor<1x64x32x32xi8>, %qf: tensor<128x64x1x1xi8>, %qo: tensor<1x128x32x32xi32>, %di: tensor<1x144x113x113xf16>, %df: tensor<144x3x3xf16>, %do: tensor<1x144x56x56xf32>) -> (tensor<1x128x32x32xi32>, tensor<1x144x56x56xf32>) {
   %izp = arith.constant 7 : i32
   %kzp = arith.constant 0 : i32
@@ -682,6 +691,7 @@ def run_compiled_gate(
     transform_spec: Path,
     atol: float,
     rtol: float,
+    only: list[str] | None = None,
 ) -> None:
     write_compiled_fixture(work_dir)
     compile_modules(work_dir, compiler, transform_spec)
@@ -788,25 +798,14 @@ def run_compiled_gate(
             ("mixed_int8_then_depthwise_dense.npy", "mixed_int8_then_depthwise_dw.npy"),
             (0.0, 1e-2),
             (0.0, 1e-2),
-            known_failure=(
-                "an int8 dispatch HANGS a *following* fp16 depthwise one in the "
-                "same command buffer. Measured 2026-09-03, 8 of 8 runs with an "
-                "idle gap: the job runs 502-534 ms and is killed by the kernel "
-                "watchdog, and the driver's hung-job deadline now refuses the "
-                "result rather than returning a half-written buffer -- so this "
-                "case fails by not executing. It was recorded as corruption "
-                "(\"wrong in a single tile-sized band of rows\") back when a "
-                "killed job still returned its partial buffer silently, which is "
-                "what those wrong rows were. Reversing the order "
-                "(mixed_depthwise_then_int8) and making both halves fp16 "
-                "(mixed_fp16_then_depthwise) both pass, so it is the precision mix "
-                "and the order, not either convolution. Ruled out: a stale register "
-                "delta (both programs write the same 126 registers) and DPU "
-                "mode-transition timing (the quiescence dwell widened to any "
-                "transition fails at 1ms and 50ms alike)"
-            ),
         ),
     ]
+    if only:
+        wanted = set(only)
+        unknown = wanted - {case.function for case in cases}
+        if unknown:
+            raise SystemExit(f"--only matched no case: {sorted(unknown)}")
+        cases = [case for case in cases if case.function in wanted]
     unexpected_passes = []
     for case in cases:
         cpu_names = tuple(
@@ -890,6 +889,15 @@ def main() -> None:
     parser.add_argument("--cross-linker", default="aarch64-linux-gnu-gcc")
     parser.add_argument("--atol", type=float, default=0.05)
     parser.add_argument("--rtol", type=float, default=0.02)
+    parser.add_argument(
+        "--only",
+        action="append",
+        metavar="FUNCTION",
+        help="run only these compiled cases, by function name; repeatable. "
+        "The NPU's state is order-dependent enough that one case can leave "
+        "the device sick for the next, so a filter is how a single case gets "
+        "a clean verdict (see ISSUES.md and npu-wedges-after-failed-job).",
+    )
     parser.add_argument("--skip-raw", action="store_true")
     parser.add_argument("--skip-compiled", action="store_true")
     parser.add_argument(
@@ -933,6 +941,7 @@ def main() -> None:
                     args.transform_spec,
                     args.atol,
                     args.rtol,
+                    args.only,
                 )
     finally:
         if args.keep_remote:

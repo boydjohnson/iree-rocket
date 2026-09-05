@@ -708,7 +708,23 @@ the memories that made load-bearing claims.
 
 ---
 
-## C8 (S2) — an int8 dispatch makes a following fp16 dispatch hang once that fp16 job's output exceeds ~256 KiB; every int8 timing ever recorded absorbed those hangs
+## C8 (RESOLVED 2026-09-05) — an int8 dispatch made a following fp16 dispatch hang, because we left BRDMA fetching on a path that bypasses the BS plane
+
+**Fixed.** `DPU_RDMA_BRDMA_CFG.brdma_data_use` is now 0 on the int32-accumulator
+path, matching the vendor emitter. `c8_precision_transition_hw` passes all 16
+arms, and `ROCKET_ACC_BRDMA=1` puts the old value back so the hang still
+reproduces on demand. On MobileNetV2's int8 build `iree-benchmark-module` now
+completes a full loop -- 7 iterations, 1077 ms, no hangs, **no dwell** -- where
+the same binary with `ROCKET_ACC_BRDMA=1` dies on the first inference with
+`NPU dispatch took 524 ms`. Those absolute times are not comparable with the
+354 / 131 ms recorded on 2026-09-04: that session's arms used vmfbs and a CPU
+baseline this board no longer carries. The driver's `ROCKET_PM_DWELL`
+diagnostic is removed -- a power cycle cleared the symptom and was never the
+fix.
+
+Everything below is the investigation, kept because it is how the cause was
+found and because the symptom characterisation (per core, int32-writer only,
+victim output past ~256 KiB) is still accurate.
 
 Found 2026-09-04 while re-running the offload A/Bs, and found only because C3's
 guard now exists to refuse the result.
@@ -1166,6 +1182,260 @@ poll, restore), which needs write access to the sysfs file.
 The test asserts the predictions above, so a change in the hardware's
 behaviour, or a driver that stops needing the dwell, shows up as a failed
 expectation rather than a silent improvement.
+
+### Narrowed to one register field, 2026-09-05: `DATA_FORMAT.out_precision = 4`
+
+`examples/dump_conv_plan_regcmd.rs` prints the real dispatch path's register
+program and already takes `ROCKET_DUMP_PRECISION`, so the aggressor `q1` and
+the victim `k1` -- the same geometry, 32x32 Cin 64 Cout 128 1x1 -- can be
+diffed directly. The headline is a negative:
+
+**No register is left at default.** `Int8Accumulator`, requantized `Int8` and
+`Fp16` emit **136 writes each, to the identical (domain, offset) set, with
+identical per-register counts**. The victim rewrites every register the
+aggressor touched, so nothing is inherited stale, and the state is downstream
+of the register file -- consistent with the notes' "no register write clears
+it".
+
+Since fp16 *and* requantized int8 are both clean, the suspects are the
+registers whose value differs from **both**. There are exactly four, all DPU
+(0x1001), and they are the same on the 3x3 `q2` shape:
+
+| reg | int8acc | fp16 | int8 | fp16-f32out | decode |
+|---|---|---|---|---|---|
+| `0x4010 DATA_FORMAT` | `0x800000e0` | `0x48000002` | `0x000000e0` | `0xa8000002` | `out_precision` **4** vs 2 vs 0 vs 5 |
+| `0x4040 BS_CFG` | `0x00020141` | `0x00020150` | `0x00020140` | `0x00020150` | **`bs_bypass=1`**, only here |
+| `0x4050 BS_OW_CFG` | `0x000007ff` | `0x00000126` | `0x00000125` | `0x0000036e` | `size_e` 7/1/1/3; `od_bypass` 1/1/0/1 |
+| `0x40c0 SURFACE_ADD` | `0x20000` | `0x8000` | `0x8000` | `0x10000` | 4x / 1x / 1x / 2x |
+
+Two arms in `c8_precision_transition_hw.rs` cut that down [verified, planck,
+3 trials then 2 more against hardened expectations]:
+
+* **`bs_bypass` is not it.** `conv::set_accumulator_bs_engage` (also
+  `ROCKET_ACC_BS_ENGAGE=1`) engages the BS plane on the accumulator path as a
+  pass-through. `q1_bsengage_then_k1x4_gap0` and
+  `int8acc_bsengage_then_k1_gap0` **hang 3/3 with every aggressor exact**, so
+  clocking the plane does not clear the state.
+
+  The first version of the pass-through was *not* neutral -- it returned an
+  all-zero buffer, 103296/131072 lanes wrong with `max|diff|` 12 and every
+  non-zero want reading back 0 -- and that turned out to be a real programming
+  fact rather than noise: **`bs_mul_bypass` bypasses the multiply and not the
+  shift that follows it**, so the shipped `BS_MUL_SHIFT_VALUE` of 14 was still
+  right-shifting each accumulator, and 14 bits is more than a `Dense` pattern
+  has. Zeroing the shift in both `BS_MUL_CFG.bs_mul_shift_value` and
+  `DATA_FORMAT.bs_mul_shift_value_neg` under the pass-through makes it
+  bit-exact (`accumulator_size_e_probe`, 32x32 Cin 64 Cout 128 k1: 0
+  mismatches, 100% of the buffer written, `past_end` 0, both with and
+  without). Worth remembering for any future attempt to run the BS plane at
+  unit gain: the shift is a third knob, not implied by the two bypasses.
+* **It is not output width.** `fp16acc_then_k1x4_gap0` runs the same three
+  shapes as `Fp16Accumulator` (fp16 in, **fp32 out**): a 4-byte output writer,
+  `SURFACE_ADD` 2x, `size_e` 3, `od_bypass` 1, `bs_bypass` **0**. **Clean
+  3/3**, with the victim landing on both c0 and c1 across its four submits, so
+  it is not the scheduler dodging a poisoned core. This also eliminates
+  `bs_bypass` a second and cleaner way, from the *clean* side, which is what
+  makes the arm above safe to read despite its confound.
+
+* **The int32 writer poisons with the OW stage engaged too.**
+  `ROCKET_ACC_OD_ENGAGE=1` clears `BS_OW_CFG.od_bypass` on the accumulator
+  path -- the one combination no arm had reached. Characterized first behind
+  `ROCKET_PAD_OUTPUT`: exact and fully in bounds at the accumulator's own
+  `size_e` of 7, alone (17.0 ms) and together with `bs_engage` (17.3 ms).
+  `q1_odengage_then_k1x4_gap0` and `q1_odbsengage_then_k1x4_gap0` then
+  **hang 3/3 with every aggressor exact**. So `out_precision = 4` poisons
+  whatever the BS and OW stages are doing.
+
+  A by-product worth keeping: **clearing `od_bypass` is what makes `size_e`
+  live** -- `bs_bypass` has nothing to do with it. (The converse does not hold:
+  int4 runs `od_bypass = 1` and `size_e` is load-bearing there.) That made the
+  field sweepable for the first time on paths that normally bypass the stage;
+  see the next section.
+
+That leaves **`out_precision = 4`** as the only one of the four still
+standing.
+
+### What `size_e` actually encodes, 2026-09-05
+
+With the OW stage engaged (`ROCKET_ACC_OD_ENGAGE=1`) exactly one `size_e` works
+per writer and every other value stalls it into a ~530 ms watchdog kill. Swept
+0..7 at 32x32 Cin 128 k1, canary healthy throughout and `past_end` 0
+everywhere, plus a depthwise arm through `conv_depthwise_hw` [HW sweep,
+planck]:
+
+| output | bytes | required `size_e` | wrong values write |
+|---|---|---|---|
+| dense fp16 | 2 | **1** | 256-512 B of 131072 |
+| dense fp32 | 4 | **3** | 256-1024 B of 262144 |
+| dense int8, requantized | 1 | **1** | 1024 B of 65536 (earlier sweep) |
+| dense int32, accumulator | 4 | **7** | 256 x (`size_e`+1) B |
+| int16 from int4 operands | 2 | **7** | 256 x (`size_e`+1) B |
+| depthwise fp16 | 2 | **3** | test fails |
+
+**Every value the HAL ships is confirmed correct**, including the two that had
+looked like exceptions. So the earlier framing of int4's 7 and depthwise's 3 as
+"unexplained, and measured where the field might not even be live" was wrong on
+both counts: the field is live for them and they are right.
+
+**This also retracts "floats stride at their element width, integers at twice
+it"**, committed earlier the same day. int16 from int4 is a 2-byte integer
+output and needs 7, not 3. There is no single arithmetic rule. The value is a
+property of the writer, in four groups:
+
+* **Float output**: `bytes - 1`.
+* **The raw integer accumulator writer**: a fixed **7** whatever the output
+  width -- 4-byte int32 and 2-byte int16 alike. That is the notes' quirk and
+  its mental model (the DPU casts its wide accumulator and writes it with one
+  fixed integer geometry) confirmed with the stage live rather than inferred
+  from a bypassed one.
+* **Requantized int8**: 1 -- neither the float rule's 0 nor the accumulator's 7.
+* **Depthwise**: 3 at fp16 where dense fp16 is 1; its own geometry.
+
+What the sweep does refute is the vendor register doc's "number of 8-channel
+groups in a row, minus 1": the value is **Cout-independent**. Cout 16 still
+requires 7 on the accumulator path, where `Cout/8 - 1` would be 1 and 1 writes
+512 of 131072 bytes. Every earlier measurement of the quirk used Cout 64, where
+`Cout/8 - 1` is also 7, so the two readings had never been separated.
+
+Two related facts from the same reading, worth keeping because they were
+mis-stated earlier in this section: `OD` is **not** output dimensions. The
+register docs call `od_bypass` a bypass of the **CPEND** stage and `ow_src` the
+selector for "the CPEND (output-width regroup) operand", and `size_e`'s
+documented relatives are `feature_mode_cfg.rgp_type` (regroup cut width) and
+`bs_ow_cfg.rgp_cnter`. We program `rgp_type = 0` and `rgp_cnter = 0` in every
+dispatch, so the regroup is otherwise unconfigured while `size_e` is still
+load-bearing. And the output channel count lives in five other registers, all
+precision-independent: `CORE_DATAOUT_SIZE_1`, `DPU_DATA_CUBE_CHANNEL` (both
+`orig_channel` and the padded `channel`), `DPU_WDMA_SIZE_0.channel_wdma` and
+`DPU_RDMA_DATA_CUBE_CHANNEL`.
+
+### ROOT CAUSE, 2026-09-05: we leave BRDMA fetching on the int32-accumulator path
+
+**C8 is our register program, not the silicon.** `rocket-userspace`'s own
+emitter runs the identical shapes with no poisoning at all.
+
+Built its two conv tests for aarch64 and wrote a harness against
+`rocket_conv2d_int8` / `rocket_conv2d_fp16` -- same shapes as the `q1`/`k1`
+arm (int8 32x32 Cin 64 Cout 128 k1, 512 KiB int32 out, then fp16 32x32 Cin 64
+Cout 128 k1, 256 KiB out), one process, no gap:
+
+    3 aggressors, 4 victims:  aggressors 6.1 / 5.5 / 5.3 ms
+                              victims    4.8 / 4.5 / 4.5 / 4.5 ms   no hang
+
+Ours hangs 3/3 on those shapes. So the hardware will run int8 -> int32 then a
+wide fp16 back to back; something in our program is what poisons the core.
+
+**The diff.** A host-only dumper over `gen_conv2d_int8` in the format
+`dump_conv_plan_regcmd` prints gives the two emitters' programs side by side.
+Same 126 registers, and only **ten** differing values -- three of them DMA
+addresses:
+
+| reg | ours | vendor |
+|---|---|---|
+| `CNA_CBUF_CON0` | `0x000000a2` | `0x00000093` (bank split) |
+| `CORE_MISC_CFG` | `0x00000001` (`qd_en=1`) | `0x00000000` |
+| `DPU_DATA_FORMAT` | `0x800000e0` | `0x80000000` (`bs_mul_shift_value_neg` 14 vs 0) |
+| `DPU_BS_CFG` | `0x00020141` | `0x00000053` (every sub-stage bypassed) |
+| `DPU_BS_MUL_CFG` | `0x00000e01` | `0x00000000` |
+| `DPU_BS_OW_CFG` | `0x000007ff` | `0x000007fe` (`ow_src`) |
+| `DPU_RDMA_BRDMA_CFG` | `0x0000000e` | `0x00000000` |
+
+We turn the **requantization datapath on while writing the raw int32
+accumulator**, a combination the vendor never emits -- its own header states
+the rule: "int8_out=0 (default) keeps the validated int32-raw datapath
+(qd_en=0, size_e=7/surf*8, int32 output, host requant); int8_out=1 switches to
+Mesa's int8-output writer: QD_EN=1 ...".
+
+**Bisected to one register.** `ROCKET_ACC_VENDOR=<qd|brdma|bs|owsrc|all>`
+matches the vendor field by field. At `q1_then_k1x4_gap0`, 3 trials each:
+
+    all      clean 3/3        qd      HUNG 3/3
+    brdma    clean 3/3        bs      HUNG 3/3
+    qd,brdma clean 3/3        owsrc   HUNG 3/3
+
+It is **`DPU_RDMA_BRDMA_CFG` alone**. We set `brdma_data_use = 7` -- BRDMA
+fetching the bias/scale/shift triple -- on a path where the BS plane that
+would consume it is bypassed. An enabled BRDMA reader with no consumer is what
+leaves the state, and the vendor leaves the register at 0.
+
+With `brdma` alone every C8 arm goes clean with every output exact:
+`int8acc_then_k1_gap0`, `q1_then_k1x4_gap0`, `q1_then_stemx3_gap0` and
+`int8acc_then_bigout_gap0`, 3 trials each, victims landing on both cores. The
+hardware test now fails *because it asserts the poisoned behaviour*.
+
+**No regressions** with it on: `conv_int8_hw` 4/4, `conv_int8_map_hw` 6/6,
+`conv_int8_vendor_affine_hw` 1/1, `conv_depthwise_int8_exact_hw` 3/3,
+`conv_int8_probe_hw` 1/1 -- identical to shipped.
+
+**What this retires.** The runtime-PM dwell, the per-core placement story and
+the victim-size threshold are all descriptions of the *symptom*. They stay
+true and stay recorded, but the fix is one register, not a power cycle: drop
+BRDMA on the accumulator path. Everything below this line predates the root
+cause and should be read as symptom characterisation.
+
+---
+
+### `ow_src` diverges from the vendor emitter on purpose, 2026-09-05
+
+`rocket-userspace` and the Mesa program it was diffed against never set
+`BS_OW_CFG` bit 0 -- both emit the word as
+`tp_org_en | size_e_2 | size_e_1 | size_e_0 | od_bypass`, with no `ow_src`
+term -- while this crate sets `ow_src = 1` whenever a quantization is present.
+That looked like a stray bit. It is not: `conv_int8_hw` passes 4/4 at the
+shipped value and fails **3 of 4** at `ROCKET_OW_SRC=0` [verified, planck].
+
+The field selects where the CPEND stage takes its operand: 0 = the
+`DPU_BS_OW_OP` configuration register, 1 = from outside. The two stacks make
+opposite, self-consistent choices. `rocket-userspace` keeps `ow_src = 0` and
+puts the operand in `DPU_BS_OW_OP` (`0x80 - weight_zp` on its depthwise
+branch); this crate writes `DPU_BS_OW_OP = 0` and takes the operand from
+BRDMA, which the requantized path already loads with the bias/scale/shift
+triple (`BRDMA_DATA_USE_QUANTIZED`). Neither is wrong and they are not
+interchangeable, which is exactly the kind of difference a register-by-register
+diff against the vendor emitter will keep flagging.
+
+On the accumulator path CPEND is bypassed and the field is inert -- 0
+mismatches either way at 32x32 Cin 128 Cout 64 k1 -- so the `1` it gets there
+is unused rather than wrong.
+
+**Adopting the vendor wiring was tried and rejected, 2026-09-05.**
+`ROCKET_CPEND=mesa` moves both fields together (`ow_src = 0` plus
+`DPU_BS_OW_OP = 0x80 - weight_zero_point`), and on symmetric weights it works
+everywhere: `conv_int8_hw` 4/4, `conv_int8_map_hw` 6/6,
+`conv_depthwise_int8_exact_hw` 3/3, depthwise fp16 with and without
+`od_bypass` cleared. The operand is load-bearing rather than ignored --
+sweeping `ROCKET_BS_OW_OP` at `ow_src = 0` gives 4/4 at 127 and 128, 3/4 at
+129, and 1/4 at 0, 64, 192 and 255.
+
+It fails on **affine int8**, structurally.
+`conv_int8_vendor_affine_hw` cycles a per-output-channel weight zero point of
+`[-127, -43, 0, 42, 125]`, so the vendor formula wants `[255, 171, 128, 86, 3]`
+-- five operands, where `DPU_BS_OW_OP` is a single 16-bit scalar. **No value
+of it passes** (swept 0, 3, 85, 128, 171, 253, 255: 0/1 every time). BRDMA can
+carry a per-channel operand and a configuration register cannot.
+
+So the two wirings are not peers: this crate's is strictly more general and
+Mesa's is the uniform-zero-point special case, which is all Mesa ever emits.
+`ow_src = 1` stays. The knobs stay as characterization-only; the shipped
+register programs are byte-identical with them unset, verified by
+`dump_conv_plan_regcmd` at fp16, int8 and int8acc.
+
+None of this changes C8: the int32 writer poisons at its correct `size_e` of 7,
+with the OW stage bypassed or engaged. `od_bypass = 1` appears in two clean paths (fp16, fp16-f32out).
+`size_e` was already measured inert on the accumulator path (it is a BS/OW
+field and that stage is bypassed -- see `bs_ow_size_e_override`), and
+`surf_add` was swept by `accumulator_surf_add_override`. So C8 is the **int32
+output writer specifically**, not a wide writer and not the bypassed BS plane.
+
+Caveat on the fp32 arm: the oracle has no readback for fp32 output, so it
+asserts the aggressors ran (1.6-3.7 ms dispatches, in line with the int32
+ones) and poisoned nothing -- not that their values were right.
+
+**What this does to the fix.** It narrows what a kernel-side reset would have
+to touch, and it strengthens option 2: the requantized int8 path is not merely
+"one byte out and therefore under some threshold", it avoids the one
+`out_precision` code that creates the state. It also says option 3's DPU reset
+only has to clear the int32 writer's state, not the whole output path.
 
 ---
 
