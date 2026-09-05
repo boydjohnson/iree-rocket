@@ -354,11 +354,13 @@ service the existing "two menus" section performs for precisions.
 
 ## Recommended order
 
-**Phase 0 → `mulf` investigation → Phase 3 → C5 → Phase 1 → Phase 2.**
+**~~Phase 0~~ → `mulf` investigation → Phase 3 → C5 → Phase 1 → Phase 2.**
+
+Phase 0 is done and board-validated; the rest stands.
 
 | Step | Why here |
 |---|---|
-| Phase 0 | Free coverage, no hardware risk, no new wire format |
+| ~~Phase 0~~ | Done 2026-09-05. Free coverage, no hardware risk, no new wire format. One caveat it did not honour: its own text said to gate the matchers behind a flag and measure both arms, and they went into `foreach_match` unflagged. MobileNetV2 and ViT are unaffected (dispatch-site counts identical), but VGG's five `onnx.MaxPool` sites now offload and that has not been benchmarked |
 | `mulf` | Highest-leverage single unblock; bounded (one untried ERDMA configuration), and its answer changes the scope of everything after it |
 | Phase 3 | The only phase with a positive throughput story, and it needs no new schema breadth |
 | C5 | Blocks both remaining phases by its own stated action item |
