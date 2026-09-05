@@ -708,7 +708,23 @@ the memories that made load-bearing claims.
 
 ---
 
-## C8 (S2) — an int8 dispatch makes a following fp16 dispatch hang once that fp16 job's output exceeds ~256 KiB; every int8 timing ever recorded absorbed those hangs
+## C8 (RESOLVED 2026-09-05) — an int8 dispatch made a following fp16 dispatch hang, because we left BRDMA fetching on a path that bypasses the BS plane
+
+**Fixed.** `DPU_RDMA_BRDMA_CFG.brdma_data_use` is now 0 on the int32-accumulator
+path, matching the vendor emitter. `c8_precision_transition_hw` passes all 16
+arms, and `ROCKET_ACC_BRDMA=1` puts the old value back so the hang still
+reproduces on demand. On MobileNetV2's int8 build `iree-benchmark-module` now
+completes a full loop -- 7 iterations, 1077 ms, no hangs, **no dwell** -- where
+the same binary with `ROCKET_ACC_BRDMA=1` dies on the first inference with
+`NPU dispatch took 524 ms`. Those absolute times are not comparable with the
+354 / 131 ms recorded on 2026-09-04: that session's arms used vmfbs and a CPU
+baseline this board no longer carries. The driver's `ROCKET_PM_DWELL`
+diagnostic is removed -- a power cycle cleared the symptom and was never the
+fix.
+
+Everything below is the investigation, kept because it is how the cause was
+found and because the symptom characterisation (per core, int32-writer only,
+victim output past ~256 KiB) is still accurate.
 
 Found 2026-09-04 while re-running the offload A/Bs, and found only because C3's
 guard now exists to refuse the result.
