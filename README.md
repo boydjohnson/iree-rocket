@@ -19,6 +19,11 @@ for the Rocket NPU backend (RK3588). This repository produces:
 | `iree-build/iree-src` | `iree-org/iree` as a pinned git submodule. |
 | `iree-build` | CMake configuration used to build IREE with the Rocket driver/plugin. |
 
+Two documents sit alongside this one: [LIMITS.md](LIMITS.md) is what the stack
+is *measured* to do -- the channel, kernel, stride and precision bounds, and
+which of them each layer enforces -- and [ISSUES.md](ISSUES.md) is what is
+still open.
+
 ## Building
 
 Each of the three artifacts has its own build directory under `iree-build/`,
@@ -81,6 +86,46 @@ spec routes every matched convolution through a handful of fixed executables,
 so an executable count alone understates NPU placement badly, while IREE
 deduplicates identical CPU dispatches, which overstates the CPU side.
 
+### The CPU-only baseline: `--no-offload`
+
+An NPU-vs-CPU comparison needs a CPU arm built by the *same* pipeline. A
+module compiled with plain `iree-compile` is not one: `@__transform_main` runs
+`iree-preprocessing-convert-conv-to-channels-last` and
+`linalg-specialize-generic-ops` before its match loop, so anything through
+`rocket-compiler` is NHWC whether or not a single convolution offloads, and
+IREE's CPU backend is **2.8x slower** on NCHW MobileNetV2. Every NPU-vs-CPU
+number this repo quoted before 2026-09-04 was measured against that slower
+build; see ISSUES.md M4 for the bisection.
+
+`--no-offload` builds the baseline correctly. It rewrites every matcher's
+`transform.iree.match.dim_bounds` to `umin = umax = 999999` -- a bound no real
+dimension meets -- so the match loop declines everything, while the passes
+around it, the device topology and the placement pin stay exactly as the
+offload arm sees them:
+
+```sh
+# The arm under test, and its like-for-like baseline.
+cargo run -p rocket-compiler -- compile --input mnv2.int8.mlir \
+    --output mnv2.int8.npu.vmfb --llvmcpu-target-triple aarch64-linux-gnu
+cargo run -p rocket-compiler -- compile --input mnv2.int8.mlir --no-offload \
+    --output mnv2.int8.cpu.vmfb --llvmcpu-target-triple aarch64-linux-gnu
+```
+
+On `mnv2.int8.mlir` that is 50 Rocket dispatch sites against 0, and 95 CPU
+sites against 64 -- the offload's own overhead, visible in `audit` before
+anything runs. Confirm it with `audit --no-offload`, which must report
+`0 dispatch site(s) -> rocket`.
+
+The flag refuses to produce a spec it cannot vouch for: if a matcher in the
+`foreach_match` list constrains no dimension, rewriting the bounds would not
+stop it, so the build fails rather than hand back a "baseline" that quietly
+offloads part of the model.
+
+Two things this does not fix, both of which still invalidate a comparison:
+run both arms at the same core allocation, and do not use `taskset -c 4,5` --
+the offload deficit it reports is roughly double the one a full machine sees
+(ISSUES.md P8).
+
 ### Placement pinning
 
 The Rocket backend has no code generator. `serializeExecutable` only knows how
@@ -123,7 +168,8 @@ replicate its `--compile-to=flow` / `iree-opt
 ### Stride-2 dense convolution
 
 The stride-2 dense matchers are enabled, so MobileNetV2's stem convolution
-runs on the NPU (18 offloaded dispatch sites rather than 17). They were
+runs on the NPU: one more offloaded convolution, 35 rather than 34 on
+`mnv2.fp16.mlir`. They were
 disabled for a long time behind a compile failure that
 `rocket-pin-unclaimed-dispatches` now fixes; turning them on then exposed
 three genuine defects, all since fixed and covered by hardware regressions.

@@ -19,6 +19,16 @@
 //! Hardware validation on an RK3588 confirms this height-one lowering for
 //! both an exact fp16 M=7/K=16/N=32 result and an int8 M=7/K=16/N=33 result.
 //! The latter also exercises the captured odd-N kernel padding.
+//!
+//! The sweep's widest M is 32, and past it the geometry has a hardware
+//! bound the corpus could not show: an input row is held in the CBUF in
+//! 32-channel slabs whose base offset is 11 bits, so `(K/32 - 1) * M` must
+//! stay at or below 2047 or the last slab is read from the front of the
+//! line. [`ConvPlan`] enforces that through `Shape::max_tile_input_width`
+//! and splits a wider M into column tiles; measured exact at M 90, 128, 197
+//! and 296 on `planck` 2026-09-05 (ISSUES.md C10). The transposed `1 x M`
+//! geometry `rockchip-npu-notes` uses row-tiles instead and was exact at the
+//! same points; which of the two is the better lowering above 32 is open.
 
 use crate::rocket::{
     builders::RegCmd,

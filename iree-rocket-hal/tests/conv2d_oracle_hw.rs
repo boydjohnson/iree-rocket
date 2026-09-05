@@ -326,7 +326,7 @@ fn compare_output(fixture: &Conv2dFixture, plan: &ConvPlan, output: &[u8]) -> Mi
                     if let Some(tile) = tile_for_output(plan, y, x) {
                         report.tile_mismatches[tile] += 1;
                     }
-                    if report.samples.len() < 12 {
+                    if report.samples.len() < mismatch_sample_limit() {
                         report
                             .samples
                             .push(format!("[y={y}, x={x}, c={channel}] want {want} got {got}"));
@@ -342,8 +342,27 @@ fn execute_case_output(
     file: &std::fs::File,
     fixture: &Conv2dFixture,
 ) -> Result<CaseExecution, String> {
-    let plan = ConvPlan::new(fixture.shape, fixture.case.kernel);
+    let plan = match explicit_cbuf_split() {
+        Some((data_banks, weight_banks)) => {
+            ConvPlan::with_cbuf_banks(fixture.shape, fixture.case.kernel, data_banks, weight_banks)
+        }
+        None => ConvPlan::new(fixture.shape, fixture.case.kernel),
+    };
     execute_case_output_with_plan(file, fixture, plan)
+}
+
+/// `ROCKET_CBUF_SPLIT=<data>/<weight>` forces every case's CBUF partition,
+/// for asking whether a failing shape is short of feature banks or wrong for
+/// some other reason. The two must sum to twelve.
+fn explicit_cbuf_split() -> Option<(u32, u32)> {
+    let spec = std::env::var("ROCKET_CBUF_SPLIT").ok()?;
+    let (data, weight) = spec
+        .split_once('/')
+        .expect("ROCKET_CBUF_SPLIT=<data_banks>/<weight_banks>");
+    Some((
+        data.parse().expect("ROCKET_CBUF_SPLIT data banks"),
+        weight.parse().expect("ROCKET_CBUF_SPLIT weight banks"),
+    ))
 }
 
 fn execute_case_output_with_plan(
@@ -1562,6 +1581,16 @@ fn accumulator_canary_passes(file: &std::fs::File) -> bool {
 /// DMA-address reuse rather than NPU state. So a verdict on one shape needs
 /// `ROCKET_PROBE_RESUME_AT` to run it *first*, repeated a few times -- never
 /// one row from one sweep.
+/// How many mismatches a failure report quotes. Twelve is enough to read a
+/// signature; `ROCKET_MISMATCH_SAMPLES` raises it when the whole map is the
+/// measurement.
+fn mismatch_sample_limit() -> usize {
+    std::env::var("ROCKET_MISMATCH_SAMPLES")
+        .ok()
+        .and_then(|value| value.parse().ok())
+        .unwrap_or(12)
+}
+
 fn run_hardware_case_matrix(title: &str, cases: Vec<Conv2dCase>) {
     let _device_guard = NPU_TEST_LOCK
         .lock()
@@ -1788,9 +1817,24 @@ fn dense_coefficient_vgg_blocks_match_oracle() {
 /// `values` is the sweep. `extent` is `N` for an `N x N` image or `WxH` for
 /// a rectangular one -- the fully-connected lowering makes a matmul a
 /// convolution of height *one*, so `1x1` and `7x1` are shapes worth
-/// sweeping and a square extent cannot express them. Every case runs `Selectors`, which varies with y,
-/// x and channel; append `,counting` style patterns by re-running with
-/// `ROCKET_DTYPE_SWEEP_PATTERN=counting`.
+/// sweeping and a square extent cannot express them. Every case runs
+/// `Selectors` (`SelectorsAffine` at int8), which varies with y, x and
+/// channel; `ROCKET_DTYPE_SWEEP_PATTERN=counting|dense|onehot` picks another.
+///
+/// **On a height-one image `Selectors` and `Dense` cannot see a pixel
+/// shift.** Their input is `((y*13 + x*7 + c*3 + (y*x)%5 + phase) % 7) - 3`,
+/// and at y = 0 the `x*7` term vanishes modulo 7, so every pixel of a
+/// channel carries the same value. That is how C10's wide-row fault first
+/// read as "some channels wrong" rather than "the last slab read from the
+/// wrong pixel". `onehot` is the instrument for that question: with
+/// `Cout == Cin` every output channel copies one input channel, the input
+/// value encodes its own NHWC linear index modulo 61, and a wrong value
+/// says where the read came from. `ROCKET_MISMATCH_SAMPLES=<n>` raises the
+/// twelve-sample cap on the failure report so the whole map is printed.
+///
+/// `ROCKET_CBUF_SPLIT=<data>/<weight>` forces the CBUF partition, which is
+/// how to tell a shape short of feature banks from one wrong for another
+/// reason: C10's rows failed at 9/3 exactly as at 5/7.
 ///
 /// Channel ceilings are lifted for the duration, so a sweep can walk past a
 /// precision's constant to find out whether the constant is where the
@@ -1840,6 +1884,19 @@ fn dtype_boundary_probe() {
     let pattern = match std::env::var("ROCKET_DTYPE_SWEEP_PATTERN").as_deref() {
         Ok("counting") => OraclePattern::Counting,
         Ok("dense") => OraclePattern::Dense { phase: 1 },
+        // A read map: with `Cout == Cin` every output channel copies one
+        // input channel, and the input encodes its own NHWC linear index,
+        // so a wrong value says *where* the CNA read from. The only pattern
+        // here whose input varies with x on a height-one image: the others'
+        // `x * 7` term vanishes modulo 7 at y = 0.
+        Ok("onehot") => OraclePattern::OneHotNeutral80 {
+            phase: 0,
+            signed_input: false,
+        },
+        // The requantized int8 path cannot carry `Selectors`' signed
+        // coefficients; the ladders give it the affine encoding, and so does
+        // this, or every int8 case fails before the hardware is asked.
+        _ if precision == OraclePrecision::Int8 => OraclePattern::SelectorsAffine { phase: 0 },
         _ => OraclePattern::Selectors { phase: 0 },
     };
     let cases: Vec<Conv2dCase> = fields[5]

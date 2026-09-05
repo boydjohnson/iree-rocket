@@ -1,0 +1,291 @@
+//! Rewrites the Rocket transform spec into one whose matchers cannot fire.
+//!
+//! This exists for measurement, not for compilation. ISSUES.md M4 found that
+//! every NPU-vs-CPU number this repo had ever quoted was measured against a
+//! CPU-only module built with plain `iree-compile`, which is 2.8x slower than
+//! it needs to be: `@__transform_main` runs
+//! `iree-preprocessing-convert-conv-to-channels-last` and
+//! `linalg-specialize-generic-ops` *before* the match loop, so a model
+//! compiled through this pipeline is NHWC whether or not anything offloads,
+//! and IREE's CPU backend is 2.8x slower on NCHW MobileNetV2. A baseline that
+//! never saw the spec is therefore not a baseline for the offload -- it is a
+//! measurement of the conv layout.
+//!
+//! The fix is to build the CPU arm with the *same* pipeline and only the
+//! match loop defeated. Every matcher constrains at least one dimension with
+//! `transform.iree.match.dim_bounds`, so rewriting every bound to
+//! `umin = umax = 999999` -- larger than any dimension a real model has --
+//! makes all of them decline, while leaving the passes around the loop, the
+//! device topology and the placement pin exactly as the offload arm sees
+//! them.
+
+use std::{collections::BTreeSet, error::Error};
+
+/// The sentinel every `dim_bounds` bound is rewritten to. Both ends are set,
+/// so the interval is a single value no real dimension can take.
+const NO_OFFLOAD_BOUND: &str = "999999";
+
+const DIM_BOUNDS_OP: &str = "transform.iree.match.dim_bounds";
+
+/// Result of neutering a spec, kept together so the caller can report what it
+/// did rather than trusting it silently.
+#[derive(Debug)]
+pub struct NeutralizedSpec {
+    pub text: String,
+    /// How many `dim_bounds` bounds pairs were rewritten.
+    pub rewritten: usize,
+    /// The matcher names taken from the `foreach_match` list.
+    pub matchers: usize,
+}
+
+/// Returns `spec` with every `dim_bounds` interval replaced by the sentinel.
+///
+/// Fails if any matcher in the `foreach_match` list has no `dim_bounds` at
+/// all: that matcher would still fire, and the caller would get a "CPU-only"
+/// baseline that quietly offloads part of the model -- exactly the class of
+/// error this whole path exists to prevent. It is checked rather than assumed
+/// because the spec grows matchers over time and nothing else would notice.
+pub fn neutralize(spec: &str) -> Result<NeutralizedSpec, Box<dyn Error>> {
+    let matchers = foreach_match_matchers(spec);
+    if matchers.is_empty() {
+        return Err(format!(
+            "found no `{DIM_BOUNDS_OP}`-constrained matchers in the transform spec: its \
+             `transform.foreach_match` list could not be read, so a no-offload spec cannot \
+             be derived from it"
+        )
+        .into());
+    }
+
+    let unconstrained: Vec<&str> = matchers
+        .iter()
+        .copied()
+        .filter(|name| !sequence_has_dim_bounds(spec, name))
+        .collect();
+    if !unconstrained.is_empty() {
+        return Err(format!(
+            "cannot build a no-offload spec: matcher(s) {} constrain no dimension with \
+             `{DIM_BOUNDS_OP}`, so rewriting the bounds would not stop them from claiming \
+             convolutions. The baseline would silently offload. Give each one a dim_bounds \
+             (every other matcher has at least one), or defeat it another way.",
+            unconstrained
+                .iter()
+                .map(|name| format!("@{name}"))
+                .collect::<Vec<_>>()
+                .join(", "),
+        )
+        .into());
+    }
+
+    let mut text = String::with_capacity(spec.len());
+    let mut rewritten = 0usize;
+    for line in spec.split_inclusive('\n') {
+        if !line.contains(DIM_BOUNDS_OP) {
+            text.push_str(line);
+            continue;
+        }
+        let mut rewrite = line.to_string();
+        let min = replace_bound(&mut rewrite, "umin");
+        let max = replace_bound(&mut rewrite, "umax");
+        if min && max {
+            rewritten += 1;
+        } else {
+            return Err(format!(
+                "unrecognised `{DIM_BOUNDS_OP}` spelling, expected `umin = N, umax = M`: {}",
+                line.trim()
+            )
+            .into());
+        }
+        text.push_str(&rewrite);
+    }
+
+    if rewritten == 0 {
+        return Err(format!("transform spec contains no `{DIM_BOUNDS_OP}` to rewrite").into());
+    }
+
+    Ok(NeutralizedSpec {
+        text,
+        rewritten,
+        matchers: matchers.len(),
+    })
+}
+
+/// Replaces the integer after `<key> = ` with the sentinel, in place.
+fn replace_bound(line: &mut String, key: &str) -> bool {
+    let Some(at) = line.find(key) else {
+        return false;
+    };
+    let after = at + key.len();
+    let rest = &line[after..];
+    // Tolerate `umin = 1` and `umin=1` alike; the spec uses the former.
+    let digits_at = after + rest.len() - rest.trim_start_matches([' ', '=']).len();
+    let end = digits_at
+        + line[digits_at..]
+            .find(|c: char| !c.is_ascii_digit())
+            .unwrap_or(line.len() - digits_at);
+    if end == digits_at {
+        return false;
+    }
+    line.replace_range(digits_at..end, NO_OFFLOAD_BOUND);
+    true
+}
+
+/// The matcher half of every `@matcher -> @action` pair in the spec's
+/// `transform.foreach_match` list.
+///
+/// Read from the list rather than from the `@match_*` naming convention: the
+/// spec defines matchers that the list does not use (the s3/s4 dense ones),
+/// and a matcher that is never invoked cannot offload anything, so demanding
+/// bounds of it would fail the build for no reason.
+fn foreach_match_matchers(spec: &str) -> BTreeSet<&str> {
+    let mut matchers = BTreeSet::new();
+    let Some(start) = spec.find("transform.foreach_match") else {
+        return matchers;
+    };
+    // The list ends at the op's type signature; everything before it is the
+    // `in %handle @a -> @b, ...` clause.
+    let body = &spec[start..];
+    let end = body.find(" : (").unwrap_or(body.len());
+    for pair in body[..end].split(',') {
+        let Some((lhs, _)) = pair.split_once("->") else {
+            continue;
+        };
+        if let Some(name) = symbol_after_last_at(lhs) {
+            matchers.insert(name);
+        }
+    }
+    matchers
+}
+
+fn symbol_after_last_at(text: &str) -> Option<&str> {
+    let at = text.rfind('@')?;
+    let name = &text[at + 1..];
+    let end = name
+        .find(|c: char| !(c.is_alphanumeric() || c == '_' || c == '$' || c == '.'))
+        .unwrap_or(name.len());
+    (end > 0).then(|| &name[..end])
+}
+
+/// Whether `@name`'s `transform.named_sequence` body contains a `dim_bounds`.
+///
+/// Delimited by the next `transform.named_sequence` declaration rather than by
+/// brace matching: the spec's sequences are top-level and consecutive, and
+/// brace counting would have to understand MLIR's string and attribute
+/// literals to be correct.
+fn sequence_has_dim_bounds(spec: &str, name: &str) -> bool {
+    const DECL: &str = "transform.named_sequence @";
+    let mut search = 0usize;
+    while let Some(offset) = spec[search..].find(DECL) {
+        let start = search + offset + DECL.len();
+        let end = spec[start..]
+            .find(|c: char| !(c.is_alphanumeric() || c == '_' || c == '$' || c == '.'))
+            .map(|i| start + i)
+            .unwrap_or(spec.len());
+        if &spec[start..end] == name {
+            let body_end = spec[end..]
+                .find(DECL)
+                .map(|i| end + i)
+                .unwrap_or(spec.len());
+            return spec[end..body_end].contains(DIM_BOUNDS_OP);
+        }
+        search = start;
+    }
+    false
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    const SPEC: &str = r#"
+  transform.named_sequence @match_a(%arg: !transform.any_op) {
+    transform.iree.match.dim_bounds %input_value[3], umin = 1, umax = 512 : !transform.any_value
+    transform.yield %arg : !transform.any_op
+  }
+  transform.named_sequence @match_b(%arg: !transform.any_op) {
+    transform.iree.match.dim_bounds %lhs_value[0], umin = 1, umax = 32 : !transform.any_value
+    transform.iree.match.dim_bounds %lhs_value[1], umin = 2, umax = 1792 : !transform.any_value
+    transform.yield %arg : !transform.any_op
+  }
+  transform.named_sequence @cast_and_call_a(%arg: !transform.any_op) {
+    transform.yield
+  }
+  transform.named_sequence @__transform_main(%module: !transform.any_op) {
+    transform.foreach_match in %func
+        @match_a -> @cast_and_call_a,
+        @match_b -> @cast_and_call_a
+      : (!transform.any_op) -> (!transform.any_op)
+  }
+"#;
+
+    #[test]
+    fn every_bound_becomes_the_sentinel() {
+        let out = neutralize(SPEC).expect("spec is well formed");
+        assert_eq!(out.rewritten, 3);
+        assert_eq!(out.matchers, 2);
+        assert!(!out.text.contains("umax = 512"), "{}", out.text);
+        assert!(!out.text.contains("umin = 2"), "{}", out.text);
+        assert_eq!(out.text.matches("umin = 999999, umax = 999999").count(), 3);
+    }
+
+    #[test]
+    fn nothing_but_the_bounds_changes() {
+        let out = neutralize(SPEC).expect("spec is well formed");
+        // Same line count, same everything outside the bounds themselves.
+        assert_eq!(out.text.lines().count(), SPEC.lines().count());
+        assert!(out.text.contains("transform.foreach_match in %func"));
+        assert!(out.text.contains("%input_value[3]"));
+    }
+
+    #[test]
+    fn only_matchers_in_the_foreach_list_are_read() {
+        // @match_unused has no dim_bounds, but nothing invokes it, so it
+        // cannot offload and must not fail the build.
+        let spec = SPEC.replace(
+            "  transform.named_sequence @cast_and_call_a",
+            "  transform.named_sequence @match_unused(%arg: !transform.any_op) {\n    \
+             transform.yield %arg : !transform.any_op\n  }\n  \
+             transform.named_sequence @cast_and_call_a",
+        );
+        let out = neutralize(&spec).expect("an uninvoked matcher is not a problem");
+        assert_eq!(out.matchers, 2);
+    }
+
+    #[test]
+    fn an_invoked_matcher_without_bounds_is_refused() {
+        // The failure this guards: a matcher added to the loop that constrains
+        // no dimension would still fire, and the "CPU-only" baseline would
+        // quietly offload.
+        let spec = SPEC.replace(
+            "        @match_b -> @cast_and_call_a\n",
+            "        @match_b -> @cast_and_call_a,\n        @match_c -> @cast_and_call_a\n",
+        );
+        let spec = spec.replace(
+            "  transform.named_sequence @cast_and_call_a",
+            "  transform.named_sequence @match_c(%arg: !transform.any_op) {\n    \
+             transform.yield %arg : !transform.any_op\n  }\n  \
+             transform.named_sequence @cast_and_call_a",
+        );
+        let err = neutralize(&spec).expect_err("an unconstrained matcher must be refused");
+        let message = err.to_string();
+        assert!(message.contains("@match_c"), "{message}");
+        assert!(!message.contains("@match_a"), "{message}");
+    }
+
+    #[test]
+    fn the_shipped_spec_can_be_neutralized() {
+        let spec = std::fs::read_to_string(crate::default_transform_spec_path())
+            .expect("the shipped spec must be readable");
+        let out = neutralize(&spec).expect("the shipped spec must yield a no-offload spec");
+        assert_eq!(out.rewritten, spec.matches(DIM_BOUNDS_OP).count());
+        assert!(out.matchers >= 20, "{} matchers", out.matchers);
+        // Every surviving bound is the sentinel. Checked over the op's own
+        // lines rather than the whole text: the spec's prose mentions bounds
+        // too, and comments are not what decides an offload.
+        for line in out.text.lines().filter(|l| l.contains(DIM_BOUNDS_OP)) {
+            assert!(
+                line.contains("umin = 999999, umax = 999999"),
+                "left a live bound: {line}"
+            );
+        }
+    }
+}
