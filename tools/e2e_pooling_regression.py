@@ -21,6 +21,9 @@ round trip is lossless and the hardware must return the identical element the
 CPU picked. Any difference at all is then a real fault, and the failure mode
 worth catching is a *displaced* value rather than a slightly wrong one.
 
+That is not a hope about the hardware: every max case here returned max|error|
+exactly 0 on `planck` on 2026-09-05, the tiled 64x64 one included.
+
 **Average pooling cannot be exact**, and not because of the demotion. The PPU
 has no sum mode: its average is a multiply by fp16(65536/k), and the shim
 multiplies that back up by k to recover the sum `linalg.pooling_nchw_sum`
@@ -28,12 +31,18 @@ asks for. That reciprocal round trip carries genuine f16 error, and it scales
 with k -- which is why the 7x7 global pool is the loosest case here and takes
 the --atol/--rtol defaults.
 
-Those defaults have room. Simulating the whole average path against the
-fixtures this file generates -- demote, sum in f16, scale by fp16(65536/k),
-multiply back by k in f32 -- puts the worst error at 0.0027 for the 49-tap
-global pool and 0.00049 for the 2x2, against an allowance of about 0.095. So
-the tolerance is roughly 35x the expected error rather than sized to just
-admit it, and a real fault has to be small indeed to hide under it.
+Those defaults have room. Measured on `planck`, 2026-09-05: the 49-tap global
+pool comes back at max|error| 0.0057 and the 2x2 at 0.00051, against an
+allowance of about 0.095. So the tolerance sits roughly 17x above the error
+the hardware actually produces rather than being sized to just admit it.
+
+Do not tighten it from a simulation. Modelling this path in numpy -- demote,
+sum in f16, scale by fp16(65536/k), multiply back by k in f32 -- predicts
+0.0027 for the global pool, about half what the board returns, because the
+hardware's f16 accumulation order is not numpy's. The 2x2 agrees closely
+(0.00049 predicted against 0.00051 measured); it is the deep 49-tap
+accumulation where the model drifts, which is exactly where a tightened
+tolerance would start failing for no reason.
 
 **Min pooling appears only in the raw gate.** It has no compiler matcher:
 `PoolingMethod::pad_fill_value` has no measured identity for min at any

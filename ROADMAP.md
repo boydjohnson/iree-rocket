@@ -181,9 +181,11 @@ blocked solely by a missing matcher.
    `executable_cache.rs`'s decode arm and `pooling.rs` already carried
    `PoolingMethod::Max`. Padding stays baked at zero, which is what makes the
    method safe -- `pad_fill_value` has a measured identity for max only at
-   fp16, and an unpadded pool never reads the field. **Not yet run on the
-   board**: `pooling_oracle_hw.rs` covers max at the HAL level, but no
-   compiled max-pool `.vmfb` has executed on `planck`.
+   fp16, and an unpadded pool never reads the field.
+   **Board-validated 2026-09-05** by `tools/e2e_pooling_regression.py`: all
+   six compiled max cases are **bit-exact** against the CPU (max|error| 0),
+   both layouts, both strides, the 8x8 kernel ceiling, a width that forces
+   `PoolingPlan` to tile, and two pools sharing a command buffer.
    **Min pooling is still open** and is the cheaper half of what remains:
    `pad_fill_value` has no measured identity for min at any precision, so it
    is unpadded-only -- which every matched executable already is.

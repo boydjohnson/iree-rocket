@@ -255,6 +255,14 @@ asserted in a lit test -- `rocket_int8_match_boundaries.mlir`,
 route a known-bad shape to the NPU, and tightening one cannot silently lose the
 largest measured-good shape.
 
+The pooling rows additionally have an end-to-end differential behind them:
+`tools/e2e_pooling_regression.py` compiles both methods twice and compares on
+the board. Max is compared **exactly** and measured exact on `planck`
+2026-09-05 (max|error| 0 across both layouts, both strides, the 8x8 ceiling
+and a tiled width); the average carries genuine f16 error, 0.0057 worst case
+at 49 taps, because the PPU's average is a multiply by `fp16(65536/k)` that
+the shim multiplies back out.
+
 What that adds up to on a real model, from `rocket-compiler audit` (2026-09-05):
 
 | Model | Rocket dispatch sites | Of which convolutions | CPU dispatch sites |
