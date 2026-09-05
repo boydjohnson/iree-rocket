@@ -1760,6 +1760,40 @@ a transform spec whose matchers cannot fire: rewrite every
 `umin = 999999, umax = 999999` (34 of them; verified to yield zero offload).
 Never compare against a plain `iree-compile` build.
 
+### Landed 2026-09-05: `rocket-compiler --no-offload`
+
+The rewrite above is no longer a manual edit. `--no-offload` (on both
+`compile` and `audit`) derives the neutered spec in memory from whatever spec
+the invocation would otherwise use, writes it to a temp file because IREE takes
+the spec by filename, and compiles with it. Everything else -- the
+channels-last and specialize passes, the f16 demotion, the device topology,
+`rocket-pin-unclaimed-dispatches` -- is untouched, which is the whole point:
+the two arms differ only in whether the match loop claims anything.
+
+Verified on `mnv2.int8.mlir` against the current spec (42 `dim_bounds` now, not
+34; the spec grew matchers):
+
+    audit                 5 executables, 50 dispatch sites -> rocket, 95 -> cpu
+    audit --no-offload    0 executables,  0 dispatch sites -> rocket, 64 -> cpu
+
+The 64 reproduces the `int8.cpu` arm above exactly, and the 50/95 reproduces
+P8's `int8.base`. The baseline's convolutions are named
+`conv_112x112x48x3x3x3_f32` -- NHWC extents, so it did get the channels-last
+pass that a plain `iree-compile` build never sees.
+
+It refuses rather than guesses. Every matcher named in the spec's
+`foreach_match` list must constrain at least one dimension; a matcher that
+constrains none would survive the rewrite and offload into the "baseline"
+silently, so the build fails and names it instead. Matchers the spec defines
+but never invokes (the s3/s4 dense ones) are exempt, since they cannot claim
+anything either way. `rocket-compiler/src/spec.rs` carries the logic and the
+tests, including one that neuters the shipped spec and asserts every surviving
+bound is the sentinel.
+
+What this does *not* do is stop a comparison from being wrong for P8's reason.
+Core allocation is still on the person measuring: same allocation for both
+arms, and not `taskset -c 4,5`.
+
 ---
 
 ## P1 (S3) — one fd is one scheduler entity is one core
@@ -2576,11 +2610,12 @@ demotes them; M2 is the only platform item with an open case.
 
 1. ~~**C8**~~ — RESOLVED 2026-09-05, and not by runtime-PM: the cause was
    `brdma_data_use` left set on the int32-accumulator path. See C8.
-2. **M4** — the NCHW-baseline rule is established and applied; what remains is
-   to stop using the NCHW baseline everywhere else. Cheap, and it is the
-   precondition for any offload decision being meaningful. P8 adds a second
-   half to the same rule: state the core allocation, and do not measure at
-   `taskset -c 4,5`.
+2. **M4** — the NCHW-baseline rule is established, and as of 2026-09-05 it is
+   enforced by a flag: `rocket-compiler --no-offload` builds the like-for-like
+   CPU arm and refuses to emit a spec that would offload anyway. What remains
+   is to re-take the numbers that were measured the old way. P8 adds a second
+   half to the same rule, which no flag can enforce: state the core
+   allocation, and do not measure at `taskset -c 4,5`.
 3. **P8** — read this before doing any of the below. It measures three things
    the list above assumed were the cost (compiler-level transposes, dispatch
    count, thread churn) and finds all three worth ~nothing, lands the epilogue

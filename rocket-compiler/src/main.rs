@@ -2,6 +2,7 @@ mod bindings;
 mod cli;
 mod compiler;
 mod report;
+mod spec;
 
 use std::{
     collections::BTreeSet,
@@ -51,6 +52,65 @@ fn transform_spec_path(common: &cli::CommonArgs) -> PathBuf {
         .transform_spec
         .clone()
         .unwrap_or_else(default_transform_spec_path)
+}
+
+/// The transform spec an invocation will actually be given, plus ownership of
+/// it when `--no-offload` had to derive one.
+struct SpecFile {
+    path: PathBuf,
+    temporary: bool,
+}
+
+impl SpecFile {
+    fn path(&self) -> &Path {
+        &self.path
+    }
+}
+
+impl Drop for SpecFile {
+    fn drop(&mut self) {
+        if self.temporary {
+            let _ = fs::remove_file(&self.path);
+        }
+    }
+}
+
+/// Resolves the spec to compile with, deriving the no-offload variant when
+/// asked. The derived spec goes to a file because IREE takes it by filename
+/// (`--iree-preprocessing-transform-spec-filename`); it is removed when the
+/// returned handle drops.
+fn resolve_transform_spec(common: &cli::CommonArgs) -> Result<SpecFile, Box<dyn Error>> {
+    let source = transform_spec_path(common);
+    if !common.no_offload {
+        return Ok(SpecFile {
+            path: source,
+            temporary: false,
+        });
+    }
+
+    let text = fs::read_to_string(&source)
+        .map_err(|err| format!("failed to read transform spec {}: {err}", source.display()))?;
+    let neutralized = spec::neutralize(&text)?;
+    let path = env::temp_dir().join(format!(
+        "rocket-compiler-no-offload-{}.mlir",
+        std::process::id()
+    ));
+    fs::write(&path, &neutralized.text)
+        .map_err(|err| format!("failed to write {}: {err}", path.display()))?;
+
+    // Said out loud because a baseline that silently stopped being a baseline
+    // is the failure this mode exists to prevent (ISSUES.md M4).
+    eprintln!(
+        "--no-offload: {} matchers defeated, {} dim_bounds rewritten in {}",
+        neutralized.matchers,
+        neutralized.rewritten,
+        source.display()
+    );
+
+    Ok(SpecFile {
+        path,
+        temporary: true,
+    })
 }
 
 fn compile_flags(common: &cli::CommonArgs, transform_spec: &Path) -> Vec<String> {
@@ -216,11 +276,11 @@ fn pin_unclaimed_dispatches(invocation: &Invocation) -> Result<(), Box<dyn Error
 
 fn run_compile(args: &cli::CompileArgs) -> Result<(), Box<dyn Error>> {
     let lib_path = resolve_lib_path(args.common.iree_compiler_lib.as_deref())?;
-    let transform_spec = transform_spec_path(&args.common);
-    check_spec_device_names(&args.common, &transform_spec)?;
+    let transform_spec = resolve_transform_spec(&args.common)?;
+    check_spec_device_names(&args.common, transform_spec.path())?;
     let library = unsafe { Library::load(&lib_path) }?;
 
-    library.setup_global_cl(&compile_flags(&args.common, &transform_spec));
+    library.setup_global_cl(&compile_flags(&args.common, transform_spec.path()));
     let session = Session::create(&library);
 
     let source = Source::open_file(&session, &args.common.input)?;
@@ -241,11 +301,11 @@ fn run_compile(args: &cli::CompileArgs) -> Result<(), Box<dyn Error>> {
 
 fn run_audit(args: &cli::AuditArgs) -> Result<(), Box<dyn Error>> {
     let lib_path = resolve_lib_path(args.common.iree_compiler_lib.as_deref())?;
-    let transform_spec = transform_spec_path(&args.common);
-    check_spec_device_names(&args.common, &transform_spec)?;
+    let transform_spec = resolve_transform_spec(&args.common)?;
+    check_spec_device_names(&args.common, transform_spec.path())?;
     let library = unsafe { Library::load(&lib_path) }?;
 
-    library.setup_global_cl(&compile_flags(&args.common, &transform_spec));
+    library.setup_global_cl(&compile_flags(&args.common, transform_spec.path()));
     let session = Session::create(&library);
 
     let source = Source::open_file(&session, &args.common.input)?;
@@ -286,6 +346,7 @@ mod tests {
             iree_compiler_lib: None,
             input: PathBuf::from("model.mlir"),
             transform_spec: None,
+            no_offload: false,
             rocket_device_name: rocket.to_string(),
             cpu_device_name: cpu.to_string(),
             llvmcpu_target_cpu: "generic".to_string(),

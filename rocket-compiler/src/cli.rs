@@ -36,6 +36,17 @@ pub struct CommonArgs {
     #[arg(long)]
     pub transform_spec: Option<PathBuf>,
 
+    /// Build the like-for-like CPU-only baseline: same pipeline, same device
+    /// topology, same placement pin, but every matcher's `dim_bounds` is
+    /// rewritten so none of them can claim a convolution and nothing reaches
+    /// the NPU.
+    ///
+    /// This is the only correct CPU arm for an NPU-vs-CPU comparison. A module
+    /// built with plain `iree-compile` never runs the spec's channels-last
+    /// conversion and is 2.8x slower for that reason alone -- see ISSUES.md M4.
+    #[arg(long)]
+    pub no_offload: bool,
+
     #[arg(long, default_value = "rocket_device")]
     pub rocket_device_name: String,
 
