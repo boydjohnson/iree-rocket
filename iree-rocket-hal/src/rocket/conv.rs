@@ -3806,13 +3806,36 @@ fn int4_override(precision: Precision, name: &str) -> Option<u32> {
 /// as `size_e = 7` regardless of byte width" is a fact about a path that keeps
 /// the OW stage engaged, and does not carry to this one.
 ///
-/// **Refined 2026-09-05** by [`accumulator_od_engage`], which can engage that
-/// stage here: the gate is `od_bypass`, not `bs_bypass`. With the BS plane
-/// clocked but `od_bypass` still 1, `size_e = 7` stays inert (bit-exact at
-/// 32x32 Cin 64 Cout 128 k1). Clear `od_bypass` and it goes live *and the
-/// quirk applies to this path too*: `size_e = 7` is then the correct value
-/// (bit-exact, 100% written), while forcing 3 -- the float rule for a 4-byte
-/// element -- writes 1024 of 524288 bytes and takes a watchdog kill. The accumulator
+/// **Refined 2026-09-05** by [`od_engage`], which engages that stage on any
+/// path that bypasses it. Clearing `od_bypass` always makes `size_e` live;
+/// `bs_bypass` has nothing to do with it (with the BS plane clocked and
+/// `od_bypass` still 1, `size_e = 7` is still inert, bit-exact at 32x32 Cin 64
+/// Cout 128 k1). The converse does **not** hold -- `od_bypass = 1` does not
+/// imply inert, see [`Precision::Int4`] below, which is load-bearing there.
+///
+/// With the stage live, one value works and every other one stalls the writer
+/// into a ~530 ms watchdog kill. Swept 0..7 at 32x32 Cin 128 k1
+/// (`accumulator_size_e_probe`, `ROCKET_ACC_OD_ENGAGE=1`, canary healthy
+/// throughout, `past_end` 0 everywhere) [HW sweep, planck 2026-09-05]:
+///
+/// | output | bytes | required `size_e` | `size_e + 1` |
+/// |---|---|---|---|
+/// | fp16 | 2 | 1 | 2 = bytes |
+/// | fp32 | 4 | 3 | 4 = bytes |
+/// | int8 (requantized) | 1 | 1 | 2 = 2 x bytes |
+/// | int32 (accumulator) | 4 | 7 | 8 = 2 x bytes |
+///
+/// So **floats stride at their element width and integers at twice it**, which
+/// is the quirk stated in a form that does not depend on the value 8. The
+/// notes' 7 was measured only at Cout 64, where `Cout/8 - 1` is also 7; this
+/// sweep separates them, because Cout 16 still requires 7 (`Cout/8 - 1` would
+/// be 1, and 1 writes 512 of 131072 bytes). The vendor register doc's
+/// "8-channel groups in a row, minus 1" reading is therefore not what the
+/// field does on the conv write path.
+///
+/// Two values here do not fit that rule and are both from other probes at
+/// `od_bypass = 1`: int4's 7 (its int16 output would predict 3) and
+/// depthwise's 3 (an fp16 output would predict 1). The accumulator
 /// truncation in [`MAX_ACCUMULATOR_COEFFICIENT_BYTES_PER_CHANNEL`] is still
 /// unexplained, and this is one more register eliminated: with `size_e` inert
 /// and `surf_add` swept, the output-side register archaeology is exhausted.
@@ -3858,9 +3881,10 @@ fn accumulator_bs_engage() -> bool {
         || std::env::var("ROCKET_ACC_BS_ENGAGE").is_ok_and(|value| value != "0")
 }
 
-/// Characterization override for `DPU_BS_OW_CFG.OD_BYPASS` on the int32
-/// accumulator path (`ROCKET_ACC_OD_ENGAGE=1`, or
-/// [`set_accumulator_od_engage`]).
+/// Characterization override for `DPU_BS_OW_CFG.OD_BYPASS`: engages the output
+/// converter on any path that would bypass it -- the int32 accumulator, and
+/// fp16/fp32, whose `size_e` is otherwise untestable
+/// (`ROCKET_ACC_OD_ENGAGE=1`, or [`set_od_engage`]).
 ///
 /// The companion to [`accumulator_bs_engage`], and the one combination C8 had
 /// not reached: `out_precision = 4` with the **OW stage engaged**. The
@@ -3877,7 +3901,7 @@ fn accumulator_bs_engage() -> bool {
 /// and wedge the board until a reboot.
 ///
 /// Nothing on the compiled path sets it.
-fn accumulator_od_engage() -> bool {
+fn od_engage() -> bool {
     ACCUMULATOR_OD_ENGAGE.load(std::sync::atomic::Ordering::Relaxed)
         || std::env::var("ROCKET_ACC_OD_ENGAGE").is_ok_and(|value| value != "0")
 }
@@ -3885,9 +3909,9 @@ fn accumulator_od_engage() -> bool {
 static ACCUMULATOR_OD_ENGAGE: std::sync::atomic::AtomicBool =
     std::sync::atomic::AtomicBool::new(false);
 
-/// Turns [`accumulator_od_engage`] on or off for this process; see
+/// Turns [`od_engage`] on or off for this process; see
 /// [`set_accumulator_bs_engage`].
-pub fn set_accumulator_od_engage(engaged: bool) {
+pub fn set_od_engage(engaged: bool) {
     ACCUMULATOR_OD_ENGAGE.store(engaged, std::sync::atomic::Ordering::Relaxed);
 }
 
@@ -4572,8 +4596,7 @@ fn conv_2d_tile_program(
             .size_e_1(Bits::new(shape.bs_ow_size_e()))
             .size_e_2(Bits::new(shape.bs_ow_size_e()))
             .od_bypass(Bits::new(u32::from(
-                (quantization.is_none() || accumulator_output)
-                    && !(accumulator_output && accumulator_od_engage()),
+                (quantization.is_none() || accumulator_output) && !od_engage(),
             )))
             .ow_src(Bits::new(u32::from(quantization.is_some())))
             .build(),

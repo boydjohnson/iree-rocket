@@ -567,7 +567,7 @@ struct Arm {
     /// poisoner; see those arms' comment.
     bs_engage: bool,
     /// Clear `BS_OW_CFG.od_bypass` on the `Int8Accumulator` aggressors
-    /// (`conv::set_accumulator_od_engage`), putting the output converter in
+    /// (`conv::set_od_engage`), putting the output converter in
     /// the path. Safe only at the accumulator's own `size_e` of 7; see the
     /// arms that use it.
     od_engage: bool,
@@ -880,7 +880,7 @@ fn run_arm(
     let fd = file.as_raw_fd();
     // Before `prepare`, which is what builds the register program.
     iree_rocket_hal::rocket::conv::set_accumulator_bs_engage(arm.bs_engage);
-    iree_rocket_hal::rocket::conv::set_accumulator_od_engage(arm.od_engage);
+    iree_rocket_hal::rocket::conv::set_od_engage(arm.od_engage);
     // Everything that costs host time happens here, before the clock matters.
     let aggressors = arm
         .aggressors

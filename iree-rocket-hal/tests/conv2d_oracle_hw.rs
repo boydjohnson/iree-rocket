@@ -4971,6 +4971,10 @@ fn accumulator_size_e_probe() {
             // in accumulator mode. That is the mechanism check.
             Ok("int8") => OraclePrecision::Int8,
             Ok("fp16") => OraclePrecision::Fp16,
+            // fp32 output: the other 4-byte writer, and the case that says
+            // whether `size_e` 7 is "integer" or "wide". No oracle readback,
+            // so read `written=` and not the mismatch count.
+            Ok("fp16acc") => OraclePrecision::Fp16Accumulator,
             _ => OraclePrecision::Int8Accumulator,
         },
         // `Counting` sets every input and coefficient to 1, so at a 1x1 kernel

@@ -1230,17 +1230,45 @@ Two arms in `c8_precision_transition_hw.rs` cut that down [verified, planck,
   **hang 3/3 with every aggressor exact**. So `out_precision = 4` poisons
   whatever the BS and OW stages are doing.
 
-  A by-product worth keeping: **`size_e` is gated by `od_bypass`, not
-  `bs_bypass`.** It stays inert with BS clocked and `od_bypass` still 1, and
-  goes live the moment `od_bypass` clears -- where the accumulator's `size_e`
-  of 7 is *correct* (bit-exact, 100% written) and forcing 3, the float rule
-  for a 4-byte element, writes 1024 of 524288 bytes and takes a 540 ms
-  watchdog kill. The notes' "integer outputs stride as `size_e = 7` regardless
-  of byte width" therefore does describe this path; it was simply unobservable
-  while the stage was bypassed.
+  A by-product worth keeping: **clearing `od_bypass` is what makes `size_e`
+  live** -- `bs_bypass` has nothing to do with it. (The converse does not hold:
+  int4 runs `od_bypass = 1` and `size_e` is load-bearing there.) That made the
+  field sweepable for the first time on paths that normally bypass the stage;
+  see the next section.
 
 That leaves **`out_precision = 4`** as the only one of the four still
-standing. `od_bypass = 1` appears in two clean paths (fp16, fp16-f32out).
+standing.
+
+### What `size_e` actually encodes, 2026-09-05
+
+With the OW stage engaged (`ROCKET_ACC_OD_ENGAGE=1`), exactly one `size_e`
+works per output type and every other value stalls the writer into a ~530 ms
+watchdog kill. Swept 0..7 at 32x32 Cin 128 k1, canary healthy throughout and
+`past_end` 0 everywhere [HW sweep, planck]:
+
+| output | bytes | required `size_e` | `size_e + 1` | wrong values write |
+|---|---|---|---|---|
+| fp16 | 2 | **1** | 2 = bytes | 256-512 B of 131072 |
+| fp32 | 4 | **3** | 4 = bytes | 256-1024 B of 262144 |
+| int8 (requantized) | 1 | **1** | 2 = 2 x bytes | 1024 B of 65536 (earlier sweep) |
+| int32 (accumulator) | 4 | **7** | 8 = 2 x bytes | 256 x (`size_e`+1) B |
+
+**Floats stride at their element width, integers at twice it.** That is the
+notes' quirk stated without the constant 8, and it is Cout-independent: Cout 16
+still requires 7, where `Cout/8 - 1` would be 1 and 1 writes 512 of 131072
+bytes. Since every earlier measurement of the quirk used Cout 64 -- where
+`Cout/8 - 1` is also 7 -- the two readings had never been separated. The vendor
+register doc's "number of 8-channel groups in a row, minus 1" is **not** what
+the field does on the conv write path.
+
+Two shipped values do not fit and are both from probes at `od_bypass = 1`,
+where the field's liveness is not guaranteed either way: int4's 7 (its 2-byte
+int16 output would predict 3) and depthwise's 3 (an fp16 output would predict
+1). Neither is known to be wrong -- they are measured -- but neither has been
+re-measured with the stage engaged.
+
+None of this changes C8: the int32 writer poisons at its correct `size_e` of 7,
+with the OW stage bypassed or engaged. `od_bypass = 1` appears in two clean paths (fp16, fp16-f32out).
 `size_e` was already measured inert on the accumulator path (it is a BS/OW
 field and that stage is bypassed -- see `bs_ow_size_e_override`), and
 `surf_add` was swept by `accumulator_surf_add_override`. So C8 is the **int32

@@ -65,6 +65,7 @@ fn main() {
             multiplier: Multiplier { scale: 1, shift: 0 },
         }),
         Ok("fp16acc") => Precision::Fp16Accumulator,
+        Ok("int4") => Precision::Int4,
         _ => Precision::Fp16,
     };
     let mut shape = Shape::with_precision(width, height, stride, cin, cout, precision);
