@@ -2430,14 +2430,70 @@ never-inlined `util.func` just becomes its own dispatch (P6 item 2's trap).
 Together IREE fuses the epilogue with the zero-point correction and
 requantization that follow it, const-eval hoists the depthwise HWC->CHW filter
 transpose that had been running as 13 CPU dispatches per inference over
-constant weights, and MobileNetV2 int8 goes **265 -> 145 dispatch sites**:
+constant weights, and MobileNetV2 int8 goes **265 -> 145 dispatch sites**.
+
+Measured 2026-09-05 with each arm run **first** in half the passes, because
+the original A/B always ran `landed` second and this board drifts within a
+sequence. Six runs of each arm at each core count, medians:
 
 ```text
-                 cpu4-5                cpu4-7
-  int8.base      512  492  512 ms      321  314  312 ms
-  int8.landed    469  486  478 ms      279  287  292 ms
-                 -6.6% on medians      -8.6% on medians
+                    cpu4-5                          cpu4-7
+  int8.base     498 506 509 506 506 507  -> 506   318 316 315 319 318 313  -> 317
+  int8.landed   446 488 480 475 500 476  -> 478   285 291 292 286 281 288  -> 287
+                        -5.5%                            -9.5%
 ```
+
+The sign is the same in both orders (base-first: 506 vs 480 and 317 vs 289;
+landed-first: 506 vs 476 and 317 vs 285), and at cpu4-7 the two distributions
+do not overlap at all. `int8.base` is the tighter of the two, 313-319 ms across
+six runs.
+
+**Where the difference is, per NPU dispatch, at cpu4-7:**
+
+```text
+  phase          int8.base   int8.landed
+  outside          3.512        2.970      <- all of it
+  execute          2.802        2.775
+    record         0.871        0.842
+    compact        1.101        1.117
+    wait.npu       0.745        0.736
+    pack.input     0.214        0.215
+    quiesce        1.062        1.061
+```
+
+Exactly as the change predicts: it removes CPU dispatches and touches nothing
+the driver does, so the gain is entirely in `outside` and every driver phase is
+flat. The weight cache is the independent confirmation that the inlining
+worked -- **478 misses over 34 inferences becomes 49 over 35**, one per binding
+on the first inference only. Those 429 recurring misses were the depthwise
+filter transposes: each inference produced a fresh transient buffer for the
+transposed filter, so the packed-coefficient cache could never hit it.
+
+**The per-op table is unchanged**, as it should be: it only covers phases the
+driver owns, and this change touches none of them. It does refine P2's bound,
+though, because compaction is *concentrated* rather than spread. Worst op,
+`int8.base` at cpu4-7, 35 calls:
+
+```text
+  conv int8acc 112x112x24->144 k1x1 s1   31.5 ms/call   npu 6.9   compact 18.1
+```
+
+18.1 ms of compaction on one op against a 1.10 ms average over all 1700
+dispatches -- this single convolution is a third of the model's entire
+`compact` total. So "P2 caps at ~10%" is right for the model and wrong for the
+op: a cube-aliasing fix would be worth little on the 7x7 tail and most of
+`112x112x24->144`. Pick the shapes before building it. (These figures are
+within noise of the ones M4 recorded at cpu4-5 -- 32 ms/call, 7 ms NPU, 17.7 ms
+compaction -- which is itself the point: nothing about this phase moved.)
+
+**Instrument warning.** `ROCKET_PROFILE=1` is not safe for an A/B at cpu4-5. It
+makes `int8.base` *faster* (478 ms median profiled against 506 unprofiled) and
+erases the whole difference (base 476/478/480 against landed 479/480/485,
+three interleaved passes). That is consistent with the rest of this issue --
+two CPUs is a scheduling-starved configuration, so an instrument that adds a
+mutex and a yield per phase changes the thing it is measuring. At cpu4-7 the
+profile and the un-profiled A/B agree. Use `ROCKET_PROFILE` for composition,
+and a plain interleaved run for totals.
 
 Logits are **bit-identical** to the pre-change build (all 1001, max|diff| 0.0)
 — the change is purely structural. fp16 is unaffected in placement (37
@@ -2455,8 +2511,11 @@ epilogue still carries a genuine `f16 -> f32` widen and was left alone.
 2. **Re-take every offload number at a realistic core allocation.** M4's
    action item stands, plus: do not use `taskset -c 4,5`.
 3. **P2 (the driver-level NC1HWC2 round trip) is still open** and is the one
-   part of M4's lever 1 this did not test. Size it against `compact`'s
-   1.03 ms out of ~10 ms per convolution before building it.
+   part of M4's lever 1 this did not test. Size it against `compact`'s 1.10 ms
+   average out of ~10 ms per convolution before building it -- but note the
+   cost is concentrated, not spread: one convolution
+   (`112x112x24->144 k1x1`) carries 18.1 ms of compaction per call and a third
+   of the model's total, so the lever is shape-selective.
 4. Compiler-level transposes, dispatch counts, and thread churn are all
    measured and all worth ~nothing. Do not spend on them again.
 
