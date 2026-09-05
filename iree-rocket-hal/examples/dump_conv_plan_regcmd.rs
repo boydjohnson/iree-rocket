@@ -17,6 +17,10 @@
 //! kind of dispatch writes and the other leaves alone is inherited stale
 //! when the two share a command buffer.
 //!
+//! `ROCKET_DUMP_PRECISION=fp16acc` selects fp16 in / fp32 out, the other
+//! 4-byte output writer, which is what ISSUES.md C8's "is it int32 or is it
+//! any wide output?" arm compares against.
+//!
 //! `ROCKET_DUMP_PRECISION=int8acc` switches the shape to
 //! `Int8Accumulator` (zero points zeroed, unit multiplier) instead of the
 //! default fp16, which is what the accumulator output-parity work needs --
@@ -60,6 +64,7 @@ fn main() {
             weights_scale: 1.0,
             multiplier: Multiplier { scale: 1, shift: 0 },
         }),
+        Ok("fp16acc") => Precision::Fp16Accumulator,
         _ => Precision::Fp16,
     };
     let mut shape = Shape::with_precision(width, height, stride, cin, cout, precision);

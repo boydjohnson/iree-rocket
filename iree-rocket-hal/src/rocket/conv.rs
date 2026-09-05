@@ -3821,6 +3821,45 @@ fn bs_ow_size_e_override(in_channels: u32) -> Option<u32> {
         .and_then(|value| value.parse().ok())
 }
 
+/// Characterization override for `DPU_BS_CFG.BS_BYPASS` on the int32
+/// accumulator path (`ROCKET_ACC_BS_ENGAGE=1`, or
+/// [`set_accumulator_bs_engage`] for in-process arms).
+///
+/// **What it is for.** ISSUES.md C8: an `Int8Accumulator` job poisons the core
+/// it ran on and a following wide fp16 job hangs, while the same shapes as
+/// requantized [`Precision::Int8`] or [`Precision::Fp16`] poison nothing. A
+/// register-program diff of one shape at all three precisions (32x32 Cin 64
+/// Cout 128 1x1, `examples/dump_conv_plan_regcmd.rs`) found the three
+/// precisions write the *identical* register set -- so nothing is inherited
+/// stale -- and exactly four registers carry a value unique to the poisoner:
+/// `DATA_FORMAT.out_precision` (4 = int32), this `BS_CFG.bs_bypass`,
+/// `BS_OW_CFG` (`size_e`, already shown inert here by
+/// [`bs_ow_size_e_override`], and `od_bypass`) and `SURFACE_ADD`.
+///
+/// `out_precision` and `bs_bypass` are confounded, because accumulator mode
+/// sets both. This separates them: with the override on, the BS plane is
+/// *engaged* but both of its arithmetic sub-stages are bypassed, so the stage
+/// is clocked and drained while the result is bit-for-bit what it was. A run
+/// that still poisons indicts the int32 writer itself; one that stops
+/// poisoning indicts the bypassed plane, and makes the fix a one-bit change
+/// instead of a compiler path.
+///
+/// Nothing on the compiled path sets it.
+fn accumulator_bs_engage() -> bool {
+    ACCUMULATOR_BS_ENGAGE.load(std::sync::atomic::Ordering::Relaxed)
+        || std::env::var("ROCKET_ACC_BS_ENGAGE").is_ok_and(|value| value != "0")
+}
+
+static ACCUMULATOR_BS_ENGAGE: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+
+/// Turns [`accumulator_bs_engage`] on or off for this process, for a test that
+/// needs to alternate it between arms (edition 2024 makes `set_var` unsafe, and
+/// the hardware arms run in one process on purpose).
+pub fn set_accumulator_bs_engage(engaged: bool) {
+    ACCUMULATOR_BS_ENGAGE.store(engaged, std::sync::atomic::Ordering::Relaxed);
+}
+
 /// Characterization override selecting rocket-userspace's `surf_add` *rule*
 /// rather than a constant (`ROCKET_ACC_SURF_MULT`, gated by
 /// `ROCKET_ACC_SIZE_E_MIN_CIN`).
@@ -4453,13 +4492,21 @@ fn conv_2d_tile_program(
             .channel(Bits::new(padded_out_channels - 1))
             .build(),
     );
+    // See [`accumulator_bs_engage`]: with the override on, the accumulator
+    // path engages the BS plane as a pass-through -- the stage is clocked,
+    // both arithmetic sub-stages are bypassed, so the output is unchanged --
+    // which separates C8's `bs_bypass` from its `out_precision`.
+    let bs_passthrough = accumulator_output && accumulator_bs_engage();
     commands.push(
         Register::<DpuBsCfg>::new()
-            .bs_bypass(Bits::new(u32::from(accumulator_output)))
+            .bs_bypass(Bits::new(u32::from(accumulator_output && !bs_passthrough)))
             .bs_alu_algo(Bits::new(2))
             .bs_alu_src(Bits::new(1))
             .bs_relu_bypass(Bits::new(1))
-            .bs_mul_bypass(Bits::new(u32::from(quantization.is_none())))
+            .bs_alu_bypass(Bits::new(u32::from(bs_passthrough)))
+            .bs_mul_bypass(Bits::new(u32::from(
+                quantization.is_none() || bs_passthrough,
+            )))
             .build(),
     );
     commands.push(zero::<DpuBsAluCfg>());

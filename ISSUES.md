@@ -1167,6 +1167,66 @@ The test asserts the predictions above, so a change in the hardware's
 behaviour, or a driver that stops needing the dwell, shows up as a failed
 expectation rather than a silent improvement.
 
+### Narrowed to one register field, 2026-09-05: `DATA_FORMAT.out_precision = 4`
+
+`examples/dump_conv_plan_regcmd.rs` prints the real dispatch path's register
+program and already takes `ROCKET_DUMP_PRECISION`, so the aggressor `q1` and
+the victim `k1` -- the same geometry, 32x32 Cin 64 Cout 128 1x1 -- can be
+diffed directly. The headline is a negative:
+
+**No register is left at default.** `Int8Accumulator`, requantized `Int8` and
+`Fp16` emit **136 writes each, to the identical (domain, offset) set, with
+identical per-register counts**. The victim rewrites every register the
+aggressor touched, so nothing is inherited stale, and the state is downstream
+of the register file -- consistent with the notes' "no register write clears
+it".
+
+Since fp16 *and* requantized int8 are both clean, the suspects are the
+registers whose value differs from **both**. There are exactly four, all DPU
+(0x1001), and they are the same on the 3x3 `q2` shape:
+
+| reg | int8acc | fp16 | int8 | fp16-f32out | decode |
+|---|---|---|---|---|---|
+| `0x4010 DATA_FORMAT` | `0x800000e0` | `0x48000002` | `0x000000e0` | `0xa8000002` | `out_precision` **4** vs 2 vs 0 vs 5 |
+| `0x4040 BS_CFG` | `0x00020141` | `0x00020150` | `0x00020140` | `0x00020150` | **`bs_bypass=1`**, only here |
+| `0x4050 BS_OW_CFG` | `0x000007ff` | `0x00000126` | `0x00000125` | `0x0000036e` | `size_e` 7/1/1/3; `od_bypass` 1/1/0/1 |
+| `0x40c0 SURFACE_ADD` | `0x20000` | `0x8000` | `0x8000` | `0x10000` | 4x / 1x / 1x / 2x |
+
+Two arms in `c8_precision_transition_hw.rs` cut that down [verified, planck,
+3 trials then 2 more against hardened expectations]:
+
+* **`bs_bypass` is not it.** `conv::set_accumulator_bs_engage` (also
+  `ROCKET_ACC_BS_ENGAGE=1`) engages the BS plane on the accumulator path with
+  both arithmetic sub-stages bypassed, changing `BS_CFG` alone, 0x141 ->
+  0x152. `q1_bsengage_then_k1x4_gap0` and `int8acc_bsengage_then_k1_gap0`
+  **hang 3/3**. The pass-through is *not* arithmetically neutral -- the
+  aggressors come back 103296/131072 wrong -- so on its own this arm proves
+  only that clocking the plane does not clear the state.
+* **It is not output width.** `fp16acc_then_k1x4_gap0` runs the same three
+  shapes as `Fp16Accumulator` (fp16 in, **fp32 out**): a 4-byte output writer,
+  `SURFACE_ADD` 2x, `size_e` 3, `od_bypass` 1, `bs_bypass` **0**. **Clean
+  3/3**, with the victim landing on both c0 and c1 across its four submits, so
+  it is not the scheduler dodging a poisoned core. This also eliminates
+  `bs_bypass` a second and cleaner way, from the *clean* side, which is what
+  makes the arm above safe to read despite its confound.
+
+That leaves **`out_precision = 4`** as the only one of the four still
+standing. `od_bypass = 1` appears in two clean paths (fp16, fp16-f32out).
+`size_e` was already measured inert on the accumulator path (it is a BS/OW
+field and that stage is bypassed -- see `bs_ow_size_e_override`), and
+`surf_add` was swept by `accumulator_surf_add_override`. So C8 is the **int32
+output writer specifically**, not a wide writer and not the bypassed BS plane.
+
+Caveat on the fp32 arm: the oracle has no readback for fp32 output, so it
+asserts the aggressors ran (1.6-3.7 ms dispatches, in line with the int32
+ones) and poisoned nothing -- not that their values were right.
+
+**What this does to the fix.** It narrows what a kernel-side reset would have
+to touch, and it strengthens option 2: the requantized int8 path is not merely
+"one byte out and therefore under some threshold", it avoids the one
+`out_precision` code that creates the state. It also says option 3's DPU reset
+only has to clear the int32 writer's state, not the whole output path.
+
 ---
 
 ## C9 (S2) — above 3x3 the conv path has two faults the fp16 capture sweep could not have seen: a `Cin` cliff that hangs at every width, and an int8 program that computes wrong values at every shape
