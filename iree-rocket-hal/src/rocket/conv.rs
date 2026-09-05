@@ -4064,10 +4064,17 @@ fn conv_2d_tile_program(
         Some(value) => Bits::new(value),
         None => shape.precision.output_data_precision().into(),
     };
+    // See [`accumulator_bs_engage`]: the C8 probe's BS pass-through.
+    let bs_passthrough = accumulator_output && accumulator_bs_engage();
     // `BS_MUL_SHIFT_VALUE` and its negated twin in `DPU_DATA_FORMAT` are a
     // constant 14 in every int8 capture and 0 in every fp16 one. Nothing in
     // the corpus varies it, so it is not derived from anything.
-    let bs_mul_shift = if quantization.is_some() {
+    //
+    // The pass-through has to zero it. `bs_mul_bypass` bypasses the *multiply*
+    // and not the shift that follows it, so a BS plane engaged with the
+    // shipped 14 right-shifts every accumulator by 14 -- measured, and it is
+    // what made the first pass-through arm return an all-zero buffer.
+    let bs_mul_shift = if quantization.is_some() && !bs_passthrough {
         BS_MUL_SHIFT_VALUE
     } else {
         0
@@ -4492,11 +4499,10 @@ fn conv_2d_tile_program(
             .channel(Bits::new(padded_out_channels - 1))
             .build(),
     );
-    // See [`accumulator_bs_engage`]: with the override on, the accumulator
-    // path engages the BS plane as a pass-through -- the stage is clocked,
-    // both arithmetic sub-stages are bypassed, so the output is unchanged --
+    // With the override on, the accumulator path engages the BS plane as a
+    // pass-through -- the stage is clocked, both arithmetic sub-stages are
+    // bypassed and the shift above is zeroed, so the output is unchanged --
     // which separates C8's `bs_bypass` from its `out_precision`.
-    let bs_passthrough = accumulator_output && accumulator_bs_engage();
     commands.push(
         Register::<DpuBsCfg>::new()
             .bs_bypass(Bits::new(u32::from(accumulator_output && !bs_passthrough)))

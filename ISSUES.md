@@ -1196,12 +1196,23 @@ Two arms in `c8_precision_transition_hw.rs` cut that down [verified, planck,
 3 trials then 2 more against hardened expectations]:
 
 * **`bs_bypass` is not it.** `conv::set_accumulator_bs_engage` (also
-  `ROCKET_ACC_BS_ENGAGE=1`) engages the BS plane on the accumulator path with
-  both arithmetic sub-stages bypassed, changing `BS_CFG` alone, 0x141 ->
-  0x152. `q1_bsengage_then_k1x4_gap0` and `int8acc_bsengage_then_k1_gap0`
-  **hang 3/3**. The pass-through is *not* arithmetically neutral -- the
-  aggressors come back 103296/131072 wrong -- so on its own this arm proves
-  only that clocking the plane does not clear the state.
+  `ROCKET_ACC_BS_ENGAGE=1`) engages the BS plane on the accumulator path as a
+  pass-through. `q1_bsengage_then_k1x4_gap0` and
+  `int8acc_bsengage_then_k1_gap0` **hang 3/3 with every aggressor exact**, so
+  clocking the plane does not clear the state.
+
+  The first version of the pass-through was *not* neutral -- it returned an
+  all-zero buffer, 103296/131072 lanes wrong with `max|diff|` 12 and every
+  non-zero want reading back 0 -- and that turned out to be a real programming
+  fact rather than noise: **`bs_mul_bypass` bypasses the multiply and not the
+  shift that follows it**, so the shipped `BS_MUL_SHIFT_VALUE` of 14 was still
+  right-shifting each accumulator, and 14 bits is more than a `Dense` pattern
+  has. Zeroing the shift in both `BS_MUL_CFG.bs_mul_shift_value` and
+  `DATA_FORMAT.bs_mul_shift_value_neg` under the pass-through makes it
+  bit-exact (`accumulator_size_e_probe`, 32x32 Cin 64 Cout 128 k1: 0
+  mismatches, 100% of the buffer written, `past_end` 0, both with and
+  without). Worth remembering for any future attempt to run the BS plane at
+  unit gain: the shift is a third knob, not implied by the two bypasses.
 * **It is not output width.** `fp16acc_then_k1x4_gap0` runs the same three
   shapes as `Fp16Accumulator` (fp16 in, **fp32 out**): a 4-byte output writer,
   `SURFACE_ADD` 2x, `size_e` 3, `od_bypass` 1, `bs_bypass` **0**. **Clean

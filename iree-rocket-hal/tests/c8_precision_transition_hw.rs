@@ -38,8 +38,8 @@
 //! (`examples/dump_conv_plan_regcmd.rs`) found all precisions write the same
 //! register set -- nothing is inherited stale -- and only four registers carry
 //! a value unique to the poisoner. `bs_engage` clears `DPU_BS_CFG.bs_bypass`
-//! and still hangs; `Fp16Accumulator` aggressors (fp32 out, the other 4-byte
-//! writer) are clean. So it is `DATA_FORMAT.out_precision = 4`, the int32
+//! and still hangs with exact output; `Fp16Accumulator` aggressors (fp32 out,
+//! the other 4-byte writer) are clean. So it is `DATA_FORMAT.out_precision = 4`, the int32
 //! writer, and not output width or the bypassed BS plane. See ISSUES.md C8.
 //!
 //! What it established on planck, 2026-09-04 (every arm 2-3 trials, all
@@ -723,13 +723,18 @@ fn arms() -> Vec<Arm> {
         // (`conv::set_accumulator_bs_engage`), which changes `BS_CFG` alone,
         // 0x141 -> 0x152.
         //
-        // Answered 2026-09-05, both **hang 3/3**: clocking the BS plane does
-        // not clear the state, so `bs_bypass` is not the cause.
-        // `fp16acc_then_k1x4_gap0` below eliminates it a second, cleaner way
-        // (a *clean* path that also runs with `bs_bypass = 0`), which matters
-        // because the pass-through turned out not to be arithmetically
-        // neutral: the aggressors come back 103296/131072 elements wrong, so
-        // these two arms carry a hang verdict and no exactness claim.
+        // Answered 2026-09-05, both **hang 3/3 with every aggressor exact**:
+        // clocking the BS plane does not clear the state, so `bs_bypass` is
+        // not the cause. `fp16acc_then_k1x4_gap0` below eliminates it a second
+        // way, from the clean side.
+        //
+        // The first version of this arm returned an all-zero buffer
+        // (103296/131072 wrong, every non-zero lane zeroed). That was our bug,
+        // not the hardware's: `bs_mul_bypass` bypasses the *multiply* and not
+        // the shift after it, so the shipped `BS_MUL_SHIFT_VALUE` of 14 was
+        // still right-shifting each accumulator into zero. The pass-through
+        // zeroes the shift in both `BS_MUL_CFG` and
+        // `DATA_FORMAT.bs_mul_shift_value_neg`, and the aggressors are exact.
         Arm {
             name: "q1_bsengage_then_k1x4_gap0",
             aggressors: vec![aggressors(acc)[0]],
