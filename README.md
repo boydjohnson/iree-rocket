@@ -329,6 +329,23 @@ The compiled cases include the previously problematic VGG geometry (30x30,
 Cin=512, Cout=512, 3x3) and a 40-channel 3x3 depthwise convolution that crosses
 the driver's 32-channel weight-packing group boundary.
 
+`tools/e2e_pooling_regression.py` is the same gate for pooling, with the same
+flags:
+
+```sh
+python3 tools/e2e_pooling_regression.py --board "<board name>"
+```
+
+Its raw half runs the PPU oracle tests (max, padded max, min, average, tiled);
+its compiled half covers the average pool in NCHW and max pooling in both
+layouts at both strides, plus a tiled width and two pools sharing one command
+buffer. **Max pools are compared exactly.** A max pool returns one of its
+inputs unchanged, so fixtures generated in f16 and widened to f32 survive the
+shim's demote-and-widen round trip bit for bit, and any difference at all is a
+real fault. Averages cannot be exact -- the PPU's average is a multiply by
+`fp16(65536/k)` that the shim multiplies back out -- and take the `--atol`
+/`--rtol` defaults.
+
 ## Precision-transition probe
 
 `tools/c8_precision_transition_probe.py` isolates ISSUES.md's C8: an int8
