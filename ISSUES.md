@@ -1641,6 +1641,64 @@ So the lever is layout propagation between chained NPU dispatches, not clock,
 not IRQ affinity, and not more offload sites -- more sites at this cost make it
 worse, which is what the 17-site build against 0-site's 3.7x is already saying.
 
+### What the 64% `outside` actually is: fusion the offload destroys
+
+`outside` is IREE's own dispatches, and the question it raises is whether the
+answer is more HAL coverage. Counting dispatch entry points by family in the
+two arms -- the same two modules, `strings`ed for
+`main_graph$async_dispatch_N_<family>` -- says no:
+
+| family | NPU build | CPU-only | delta |
+|---|---:|---:|---:|
+| `elementwise_transpose` | 172 | 0 | **+172** |
+| `matmul_like` | 0 | 136 | **-136** |
+| `elementwise` | 96 | 36 | +60 |
+| `conv` | 16 | 72 | -56 |
+| `slow_memcpy` | 39 | 0 | **+39** |
+| `transpose` | 24 | 4 | +20 |
+| `elementwise_broadcast` | 20 | 0 | +20 |
+| `matmul` / `reduction` | 0 | 8 | -8 |
+| **total** | **368** | **256** | **+112** |
+
+**These are not ops we failed to offload. They are ops offloading created.**
+The CPU-only build fuses conv + bias + dequant/requant + activation into 136
+`matmul_like` kernels; the NPU build has none, because nothing fuses across a
+Rocket dispatch boundary. Every epilogue becomes its own dispatch, and 172 of
+them carry a transpose because the NPU wants a different layout than its
+neighbours. `slow_memcpy` x39 is IREE's own name for the unfused fallback copy:
+39 dispatches that exist only to move bytes, none of which the CPU build needs.
+
+So 17 offloaded convolutions cost **+112 net dispatches**, and that is what the
+5079 ms of `outside` is.
+
+**Does the HAL already support these?** Partly, and it does not help. The HAL
+has `build_add_regcmd`, `build_unary_regcmd` and `build_conv_then_add_regcmd`
+(`iree-rocket-hal/src/rocket/elementwise.rs`), but the transform spec matches
+none of them -- every `@match_*` is a convolution except
+`@match_pooling_nchw_sum_avg` and `@match_rocket_matmul`. Adding an elementwise
+or transpose matcher would treat the symptom: each one is another Rocket
+dispatch and another pack/compact round trip, and at the measured 17.7 ms of
+compaction against a 7 ms convolution an elementwise op would be almost pure
+overhead.
+
+**The ranked lever list this supports:**
+
+1. **Layout propagation between chained dispatches.** Removes the 172
+   transposes and the 39 memcpys at their source *and* the driver's 820 ms of
+   compaction. This is the whole game; see
+   `rocket-layout-repack-per-dispatch`.
+2. **Epilogue fusion into the Rocket dispatch.** The requantized int8 path
+   already does this for requantization -- that is why it returns i8 with no
+   CPU epilogue -- and `build_conv_then_add_regcmd` is the same idea for a
+   residual add. It recovers part of the `matmul_like` fusion the offload lost.
+3. Standalone elementwise/transpose matchers, **not before (1)**: each adds a
+   boundary rather than removing one.
+
+Stated plainly, because every past instinct in this repo has been the
+opposite: at the current per-dispatch cost, **more offload sites make the model
+slower**. The 17-site build losing to the 0-site build by 3.7x is not a
+coincidence, it is +112 dispatches.
+
 
 Measured on `planck` 2026-09-04 [verified], governor pinned to `performance`,
 NPU IRQs on cpu6, app on cpu4-5, three interleaved passes, MobileNetV2
