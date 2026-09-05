@@ -1221,6 +1221,24 @@ Two arms in `c8_precision_transition_hw.rs` cut that down [verified, planck,
   `bs_bypass` a second and cleaner way, from the *clean* side, which is what
   makes the arm above safe to read despite its confound.
 
+* **The int32 writer poisons with the OW stage engaged too.**
+  `ROCKET_ACC_OD_ENGAGE=1` clears `BS_OW_CFG.od_bypass` on the accumulator
+  path -- the one combination no arm had reached. Characterized first behind
+  `ROCKET_PAD_OUTPUT`: exact and fully in bounds at the accumulator's own
+  `size_e` of 7, alone (17.0 ms) and together with `bs_engage` (17.3 ms).
+  `q1_odengage_then_k1x4_gap0` and `q1_odbsengage_then_k1x4_gap0` then
+  **hang 3/3 with every aggressor exact**. So `out_precision = 4` poisons
+  whatever the BS and OW stages are doing.
+
+  A by-product worth keeping: **`size_e` is gated by `od_bypass`, not
+  `bs_bypass`.** It stays inert with BS clocked and `od_bypass` still 1, and
+  goes live the moment `od_bypass` clears -- where the accumulator's `size_e`
+  of 7 is *correct* (bit-exact, 100% written) and forcing 3, the float rule
+  for a 4-byte element, writes 1024 of 524288 bytes and takes a 540 ms
+  watchdog kill. The notes' "integer outputs stride as `size_e = 7` regardless
+  of byte width" therefore does describe this path; it was simply unobservable
+  while the stage was bypassed.
+
 That leaves **`out_precision = 4`** as the only one of the four still
 standing. `od_bypass = 1` appears in two clean paths (fp16, fp16-f32out).
 `size_e` was already measured inert on the accumulator path (it is a BS/OW

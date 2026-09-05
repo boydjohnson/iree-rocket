@@ -3804,7 +3804,15 @@ fn int4_override(precision: Precision, name: &str) -> Option<u32> {
 ///
 /// So `rockchip-npu-notes/encodings/size-e-quirk.md`'s "integer outputs stride
 /// as `size_e = 7` regardless of byte width" is a fact about a path that keeps
-/// the OW stage engaged, and does not carry to this one. The accumulator
+/// the OW stage engaged, and does not carry to this one.
+///
+/// **Refined 2026-09-05** by [`accumulator_od_engage`], which can engage that
+/// stage here: the gate is `od_bypass`, not `bs_bypass`. With the BS plane
+/// clocked but `od_bypass` still 1, `size_e = 7` stays inert (bit-exact at
+/// 32x32 Cin 64 Cout 128 k1). Clear `od_bypass` and it goes live *and the
+/// quirk applies to this path too*: `size_e = 7` is then the correct value
+/// (bit-exact, 100% written), while forcing 3 -- the float rule for a 4-byte
+/// element -- writes 1024 of 524288 bytes and takes a watchdog kill. The accumulator
 /// truncation in [`MAX_ACCUMULATOR_COEFFICIENT_BYTES_PER_CHANNEL`] is still
 /// unexplained, and this is one more register eliminated: with `size_e` inert
 /// and `surf_add` swept, the output-side register archaeology is exhausted.
@@ -3848,6 +3856,39 @@ fn bs_ow_size_e_override(in_channels: u32) -> Option<u32> {
 fn accumulator_bs_engage() -> bool {
     ACCUMULATOR_BS_ENGAGE.load(std::sync::atomic::Ordering::Relaxed)
         || std::env::var("ROCKET_ACC_BS_ENGAGE").is_ok_and(|value| value != "0")
+}
+
+/// Characterization override for `DPU_BS_OW_CFG.OD_BYPASS` on the int32
+/// accumulator path (`ROCKET_ACC_OD_ENGAGE=1`, or
+/// [`set_accumulator_od_engage`]).
+///
+/// The companion to [`accumulator_bs_engage`], and the one combination C8 had
+/// not reached: `out_precision = 4` with the **OW stage engaged**. The
+/// accumulator path is the only poisoner and it runs `od_bypass = 1`, but so
+/// do two clean paths (fp16, fp16-f32out), so the field is already eliminated
+/// as a *discriminator*; this asks the different question of whether the int32
+/// writer still poisons when the output converter is in the path.
+///
+/// **Hazard.** `od_bypass = 0` is what makes `size_e` live -- on the
+/// requantized path a `size_e` of 3 or 7 there writes 1024 of 65536 bytes and
+/// hangs the job. The accumulator path's own `size_e` is 7, so pair this with
+/// `ROCKET_ACC_SIZE_E` and always run it behind `ROCKET_PAD_OUTPUT`: a wider
+/// stride can push the write past the allocation, fault, stall the rk_iommu
+/// and wedge the board until a reboot.
+///
+/// Nothing on the compiled path sets it.
+fn accumulator_od_engage() -> bool {
+    ACCUMULATOR_OD_ENGAGE.load(std::sync::atomic::Ordering::Relaxed)
+        || std::env::var("ROCKET_ACC_OD_ENGAGE").is_ok_and(|value| value != "0")
+}
+
+static ACCUMULATOR_OD_ENGAGE: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+
+/// Turns [`accumulator_od_engage`] on or off for this process; see
+/// [`set_accumulator_bs_engage`].
+pub fn set_accumulator_od_engage(engaged: bool) {
+    ACCUMULATOR_OD_ENGAGE.store(engaged, std::sync::atomic::Ordering::Relaxed);
 }
 
 static ACCUMULATOR_BS_ENGAGE: std::sync::atomic::AtomicBool =
@@ -4531,7 +4572,8 @@ fn conv_2d_tile_program(
             .size_e_1(Bits::new(shape.bs_ow_size_e()))
             .size_e_2(Bits::new(shape.bs_ow_size_e()))
             .od_bypass(Bits::new(u32::from(
-                quantization.is_none() || accumulator_output,
+                (quantization.is_none() || accumulator_output)
+                    && !(accumulator_output && accumulator_od_engage()),
             )))
             .ow_src(Bits::new(u32::from(quantization.is_some())))
             .build(),

@@ -38,8 +38,9 @@
 //! (`examples/dump_conv_plan_regcmd.rs`) found all precisions write the same
 //! register set -- nothing is inherited stale -- and only four registers carry
 //! a value unique to the poisoner. `bs_engage` clears `DPU_BS_CFG.bs_bypass`
-//! and still hangs with exact output; `Fp16Accumulator` aggressors (fp32 out,
-//! the other 4-byte writer) are clean. So it is `DATA_FORMAT.out_precision = 4`, the int32
+//! and still hangs with exact output, as does `od_engage` clearing
+//! `BS_OW_CFG.od_bypass`, alone or with it; `Fp16Accumulator` aggressors
+//! (fp32 out, the other 4-byte writer) are clean. So it is `DATA_FORMAT.out_precision = 4`, the int32
 //! writer, and not output width or the bypassed BS plane. See ISSUES.md C8.
 //!
 //! What it established on planck, 2026-09-04 (every arm 2-3 trials, all
@@ -565,6 +566,11 @@ struct Arm {
     /// the two arms that ask whether `bs_bypass` or `out_precision` is the
     /// poisoner; see those arms' comment.
     bs_engage: bool,
+    /// Clear `BS_OW_CFG.od_bypass` on the `Int8Accumulator` aggressors
+    /// (`conv::set_accumulator_od_engage`), putting the output converter in
+    /// the path. Safe only at the accumulator's own `size_e` of 7; see the
+    /// arms that use it.
+    od_engage: bool,
 }
 
 fn arms() -> Vec<Arm> {
@@ -579,6 +585,7 @@ fn arms() -> Vec<Arm> {
             gap: Gap::None,
             expect: Expect::Hang,
             bs_engage: false,
+            od_engage: false,
         },
         Arm {
             name: "int8acc_then_bigin_gap0",
@@ -588,6 +595,7 @@ fn arms() -> Vec<Arm> {
             gap: Gap::None,
             expect: Expect::Clean,
             bs_engage: false,
+            od_engage: false,
         },
         Arm {
             name: "int8acc_then_px33_gap0",
@@ -597,6 +605,7 @@ fn arms() -> Vec<Arm> {
             gap: Gap::None,
             expect: Expect::Hang,
             bs_engage: false,
+            od_engage: false,
         },
         Arm {
             name: "int8acc_then_k1_sleep30",
@@ -606,6 +615,7 @@ fn arms() -> Vec<Arm> {
             gap: Gap::Sleep(Duration::from_millis(30)),
             expect: Expect::Hang,
             bs_engage: false,
+            od_engage: false,
         },
         Arm {
             name: "int8acc_then_k1_sleep150",
@@ -615,6 +625,7 @@ fn arms() -> Vec<Arm> {
             gap: Gap::Sleep(Duration::from_millis(150)),
             expect: Expect::Clean,
             bs_engage: false,
+            od_engage: false,
         },
         Arm {
             name: "int8acc_then_k1_suspend",
@@ -624,6 +635,7 @@ fn arms() -> Vec<Arm> {
             gap: Gap::UntilSuspended,
             expect: Expect::Clean,
             bs_engage: false,
+            od_engage: false,
         },
         Arm {
             name: "k1_alone",
@@ -633,6 +645,7 @@ fn arms() -> Vec<Arm> {
             gap: Gap::None,
             expect: Expect::Clean,
             bs_engage: false,
+            od_engage: false,
         },
         // The questions the fix design depended on, now answered (see the
         // module doc); kept with their expectations so a regression shows.
@@ -648,6 +661,7 @@ fn arms() -> Vec<Arm> {
             gap: Gap::None,
             expect: Expect::Clean,
             bs_engage: false,
+            od_engage: false,
         },
         Arm {
             name: "fp16_then_k1x4_gap0",
@@ -657,6 +671,7 @@ fn arms() -> Vec<Arm> {
             gap: Gap::None,
             expect: Expect::Clean,
             bs_engage: false,
+            od_engage: false,
         },
         Arm {
             name: "q1_then_k1_gap0",
@@ -666,6 +681,7 @@ fn arms() -> Vec<Arm> {
             gap: Gap::None,
             expect: Expect::Open,
             bs_engage: false,
+            od_engage: false,
         },
         Arm {
             name: "q1_then_stem_gap0",
@@ -675,6 +691,7 @@ fn arms() -> Vec<Arm> {
             gap: Gap::None,
             expect: Expect::Open,
             bs_engage: false,
+            od_engage: false,
         },
         // Dose or core? One aggressor on one core, then the victim four
         // times as four submits. A later repeat hangs where the first was
@@ -687,6 +704,7 @@ fn arms() -> Vec<Arm> {
             gap: Gap::None,
             expect: Expect::Hang,
             bs_engage: false,
+            od_engage: false,
         },
         Arm {
             name: "q1_then_bigout_gap0",
@@ -696,6 +714,7 @@ fn arms() -> Vec<Arm> {
             gap: Gap::None,
             expect: Expect::Open,
             bs_engage: false,
+            od_engage: false,
         },
         Arm {
             name: "q1_then_stemx3_gap0",
@@ -705,6 +724,7 @@ fn arms() -> Vec<Arm> {
             gap: Gap::None,
             expect: Expect::Hang,
             bs_engage: false,
+            od_engage: false,
         },
         Arm {
             name: "int8acc_then_bigout_gap0",
@@ -714,6 +734,7 @@ fn arms() -> Vec<Arm> {
             gap: Gap::None,
             expect: Expect::Hang,
             bs_engage: false,
+            od_engage: false,
         },
         // `bs_bypass` or `out_precision`? Accumulator mode is the only path
         // that sets `DPU_BS_CFG.bs_bypass`, and the only one that poisons, but
@@ -743,6 +764,7 @@ fn arms() -> Vec<Arm> {
             gap: Gap::None,
             expect: Expect::Hang,
             bs_engage: true,
+            od_engage: false,
         },
         Arm {
             name: "int8acc_bsengage_then_k1_gap0",
@@ -752,6 +774,7 @@ fn arms() -> Vec<Arm> {
             gap: Gap::None,
             expect: Expect::Hang,
             bs_engage: true,
+            od_engage: false,
         },
         // int32 specifically, or any output element wider than the fp16 the
         // victim writes? `Fp16Accumulator` is fp16 in / fp32 out: a 4-byte
@@ -770,6 +793,46 @@ fn arms() -> Vec<Arm> {
         // The oracle has no readback for fp32 output, so this arm asserts that
         // the aggressors *ran* (1.6-3.7 ms dispatches) and did not poison, not
         // that their output was right.
+        // The last untested combination: `out_precision = 4` with the output
+        // converter **in the path**. `od_bypass` was already eliminated as a
+        // discriminator (it is 1 in the poisoner and in two clean paths), but
+        // no arm had run the int32 writer with the OW stage engaged.
+        //
+        // Safe only at the accumulator's own `size_e` of 7. Characterized
+        // first with `accumulator_size_e_probe` behind `ROCKET_PAD_OUTPUT`
+        // (32x32 Cin 64 Cout 128 k1): `od_engage` alone and `od_engage` with
+        // `bs_engage` are both 0 mismatches, 100% written, `past_end` 0, 17
+        // ms. Forcing `size_e = 3` there instead writes 1024 of 524288 bytes
+        // and takes a 540 ms watchdog kill -- so `size_e` is gated by
+        // `od_bypass`, not `bs_bypass`, and the notes' "integer outputs stride
+        // as `size_e = 7`" quirk is exactly what the engaged OW stage wants.
+        //
+        // Answered 2026-09-05: both **hang 3/3, every aggressor exact**. The
+        // int32 writer poisons whatever the BS and OW stages are doing, so
+        // `out_precision = 4` is the cause on its own.
+        Arm {
+            name: "q1_odengage_then_k1x4_gap0",
+            aggressors: vec![aggressors(acc)[0]],
+            victim: victim("k1"),
+            victim_repeats: 4,
+            gap: Gap::None,
+            expect: Expect::Hang,
+            bs_engage: false,
+            od_engage: true,
+        },
+        // Both stages engaged: the closest an int32-output program gets to the
+        // structure of the clean requantized one, differing in
+        // `out_precision`, `size_e` and `surf_add`.
+        Arm {
+            name: "q1_odbsengage_then_k1x4_gap0",
+            aggressors: vec![aggressors(acc)[0]],
+            victim: victim("k1"),
+            victim_repeats: 4,
+            gap: Gap::None,
+            expect: Expect::Hang,
+            bs_engage: true,
+            od_engage: true,
+        },
         Arm {
             name: "fp16acc_then_k1x4_gap0",
             aggressors: aggressors(OraclePrecision::Fp16Accumulator),
@@ -778,6 +841,7 @@ fn arms() -> Vec<Arm> {
             gap: Gap::None,
             expect: Expect::Clean,
             bs_engage: false,
+            od_engage: false,
         },
     ]
 }
@@ -816,6 +880,7 @@ fn run_arm(
     let fd = file.as_raw_fd();
     // Before `prepare`, which is what builds the register program.
     iree_rocket_hal::rocket::conv::set_accumulator_bs_engage(arm.bs_engage);
+    iree_rocket_hal::rocket::conv::set_accumulator_od_engage(arm.od_engage);
     // Everything that costs host time happens here, before the clock matters.
     let aggressors = arm
         .aggressors
