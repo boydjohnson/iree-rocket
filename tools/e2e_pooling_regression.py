@@ -206,6 +206,20 @@ func.func @max_pool_wide(%input: tensor<1x64x64x32xf32>, %init: tensor<1x32x32x3
   return %0 : tensor<1x32x32x32xf32>
 }
 
+// The NHWC average, sharing @rocket_pooling_executable with the NCHW shim
+// above -- the executable takes NC1HWC2 cubes and knows nothing about the
+// layout its caller started from, so only the shim differs. Running both
+// layouts of the same pool is how a transpose-permutation error shows up as a
+// difference between two cases rather than as a uniformly wrong gate.
+func.func @avg_pool_nhwc(%input: tensor<1x7x7x1792xf32>, %init: tensor<1x1x1x1792xf32>) -> tensor<1x1x1x1792xf32> {
+  %window = tensor.empty() : tensor<7x7xf32>
+  %0 = linalg.pooling_nhwc_sum
+      {dilations = dense<1> : tensor<2xi64>, strides = dense<1> : tensor<2xi64>}
+      ins(%input, %window : tensor<1x7x7x1792xf32>, tensor<7x7xf32>)
+      outs(%init : tensor<1x1x1x1792xf32>) -> tensor<1x1x1x1792xf32>
+  return %0 : tensor<1x1x1x1792xf32>
+}
+
 // Min pool, NHWC, both strides. There is no NCHW pair: linalg defines
 // pooling_nchw_max but no pooling_nchw_min, so the layout simply has no op.
 //
@@ -462,6 +476,15 @@ def write_compiled_fixture(work_dir: Path) -> None:
     np.save(work_dir / "max_wide_input.npy", f16_exact(rng, 1, 64, 64, 32))
     np.save(work_dir / "max_wide_init.npy", max_init(1, 32, 32, 32))
 
+    # The NHWC average uses the same value distribution as the NCHW one, but
+    # its own array: the two functions take the same logical tensor in
+    # different layouts, so one fixture cannot serve both.
+    np.save(
+        work_dir / "avg_nhwc_input.npy",
+        rng.uniform(-0.25, 0.25, size=(1, 7, 7, 1792)).astype(np.float32),
+    )
+    np.save(work_dir / "avg_nhwc_init.npy", np.zeros((1, 1, 1, 1792), dtype=np.float32))
+
     # Min fixtures. f16-exact for the same reason the max ones are: a min pool
     # also returns one of its inputs unchanged, so the whole path is lossless
     # and the comparison can be exact.
@@ -511,6 +534,7 @@ ROCKET_DEVICE_FLAGS = [
 EXPECTED_EXECUTABLE = {
     "avg_pool_global": "rocket_pooling_executable",
     "avg_pool_2x2": "rocket_pooling_executable",
+    "avg_pool_nhwc": "rocket_pooling_executable",
     "max_pool_nhwc_s2": "rocket_pooling_max_executable_s2",
     "max_pool_nchw_s2": "rocket_pooling_max_executable_s2",
     "max_pool_nhwc_s1": "rocket_pooling_max_executable",
@@ -806,6 +830,13 @@ def build_cases(atol: float, rtol: float) -> list[Case]:
             "avg_pool_2x2",
             ("avg_2x2_input.npy", "avg_2x2_init.npy"),
             ("avg_pool_2x2_out.npy",),
+            atol,
+            rtol,
+        ),
+        Case(
+            "avg_pool_nhwc",
+            ("avg_nhwc_input.npy", "avg_nhwc_init.npy"),
+            ("avg_pool_nhwc_out.npy",),
             atol,
             rtol,
         ),

@@ -193,8 +193,16 @@ blocked solely by a missing matcher.
    min at any precision, which makes it unpadded-only -- and every matched
    executable already is, with `padded` derived from the executable's own
    baked fields so tiling cannot reintroduce it.
-2. **NHWC average pool** -- the `linalg.pooling_nhwc_sum` counterpart of the
-   NCHW form already matched.
+2. ~~**NHWC average pool.**~~ **Landed 2026-09-05.** One matcher, one shim,
+   no new executable -- it shares `@rocket_pooling_executable` with the NCHW
+   form, since the executable takes NC1HWC2 cubes and knows nothing about the
+   layout its caller started from. Board-validated at max|error| 0.0053, in
+   line with the NCHW shim's 0.0057 on the same shape.
+   This leaves **one asymmetry** in the pooling matchers: max and min carry
+   strides 1 and 2, the average only stride 1. `avg 2x2s2` is measured
+   against the oracle in `pooling_oracle_hw.rs`, so that is a missing
+   executable rather than a missing measurement, and it is the cheapest
+   pooling work left.
 3. **`linalg.matvec` / `vecmat` / `dot`** → `MatmulDef` at `M = 1` or `N = 1`.
    New matchers only; the executable path is unchanged.
 

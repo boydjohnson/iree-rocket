@@ -182,9 +182,9 @@ caveats; it is one input and one core allocation.
 | Kernel, matched from a model | 2..=8 for both methods. For the average the floor is forced -- its reciprocal is `fp16(65536/k)` and `k=1` needs 65536, past fp16's 65504 ceiling. For max `k=1` is programmable and excluded anyway: a 1x1 stride-1 max pool is an identity, and claiming it would spend a dispatch, a pack and a compaction to copy a tensor |
 | Kernel or stride, register range | 1..=16 |
 | Padding | 0..=7, the PPU's 3-bit range. Every matched executable bakes 0: model-level padding arrives as a separate `tensor.pad` the CPU runs |
-| Stride, matched from a model | avg 1; max 1 and 2 -- the executable bakes it, one per value. Stride 2 is measured against the oracle in `pooling_oracle_hw.rs`; nothing above 2 is |
+| Stride, matched from a model | avg 1; max and min 1 and 2 -- the executable bakes it, one per value. Stride 2 is measured against the oracle in `pooling_oracle_hw.rs`, for the average too (`avg 2x2s2`), so the average's stride-1 ceiling is a missing executable rather than a missing measurement -- the one remaining asymmetry in these matchers. Nothing above 2 is measured at any method |
 | Method, matched from a model | avg, max and min -- all three the PPU has. `PoolingMethod::pad_fill_value` has no measured identity for min at any precision, and none for max at int8, but an *unpadded* pool never reads that field and every matched executable bakes zero padding. The driver derives `padded` from those baked fields alone, so tiling cannot reintroduce it |
-| Layouts, matched from a model | avg NCHW; max NHWC and NCHW; **min NHWC only** -- linalg defines `pooling_nchw_max` but no `pooling_nchw_min`, so there is no NCHW min op to claim. `pooling_*_unsigned` is unclaimed at every method: it is the unsigned-integer reduction and this path is f32 in, fp16 on the hardware |
+| Layouts, matched from a model | avg NHWC and NCHW; max NHWC and NCHW; **min NHWC only** -- linalg defines `pooling_nchw_max` but no `pooling_nchw_min`, so there is no NCHW min op to claim. `pooling_*_unsigned` is unclaimed at every method: it is the unsigned-integer reduction and this path is f32 in, fp16 on the hardware |
 
 Pooling has a second, narrower limit: **direct tile width**, which is a hang
 rather than wrong data past the boundary. Measured on `planck` 2026-09-04 with
@@ -239,6 +239,7 @@ CPU today. Everything else falls back silently and correctly.
 | depthwise | NHWC HWC | i8/i8/i32 | 1x1, 3x3 | 1, 2 | 1..=1344 | = `Cin` |
 | matmul | -- | f16/f16/f32 | -- | -- | `M` 1..=32, `K` 1..=1792 | `N` 1..=1792 |
 | avg pool | NCHW sum | f32 | 2x2..=8x8 | 1 | H/W/C 1..=8192 | -- |
+| avg pool | NHWC sum | f32 | 2x2..=8x8 | 1 | H/W/C 1..=8192 | -- |
 | max pool | NHWC | f32 | 2x2..=8x8 | 1, 2 | H/W/C 1..=8192 | -- |
 | max pool | NCHW | f32 | 2x2..=8x8 | 1, 2 | H/W/C 1..=8192 | -- |
 | min pool | NHWC | f32 | 2x2..=8x8 | 1, 2 | H/W/C 1..=8192 | -- |
