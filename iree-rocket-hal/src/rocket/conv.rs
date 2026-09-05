@@ -3944,9 +3944,58 @@ fn od_engage() -> bool {
 ///
 /// Nothing on the compiled path sets it.
 fn ow_src_override() -> Option<u32> {
+    if cpend_from_configuration() {
+        return Some(0);
+    }
     std::env::var("ROCKET_OW_SRC")
         .ok()
         .and_then(|value| value.parse().ok())
+}
+
+/// `ROCKET_CPEND=mesa` adopts the vendor stack's CPEND wiring wholesale:
+/// `ow_src = 0` plus the operand in `DPU_BS_OW_OP` as `0x80 - weight_zero_point`.
+///
+/// The two halves have to move together -- see [`ow_src_override`] -- so this
+/// exists rather than making a caller set both knobs consistently. Note that
+/// Mesa only ever engages CPEND on its **depthwise** path; its direct-conv
+/// programs all set `od_bypass = 1`, so on a dense shape this is an adoption
+/// experiment with no vendor ground truth behind it.
+///
+/// **Tried on hardware 2026-09-05 and rejected.** Moving both fields together
+/// does work where moving `ow_src` alone did not -- `conv_int8_hw` 4/4,
+/// `conv_int8_map_hw` 6/6, `conv_depthwise_int8_exact_hw` 3/3, and depthwise
+/// fp16 with or without `od_bypass` cleared. The operand is genuinely
+/// load-bearing (sweeping `ROCKET_BS_OW_OP` with `ow_src = 0`: 127 and 128
+/// pass 4/4, 129 passes 3/4, and 0, 64, 192, 255 pass 1/4).
+///
+/// It fails on **affine int8**, and structurally rather than by a value:
+/// `conv_int8_vendor_affine_hw` cycles a per-output-channel weight zero point
+/// of `[-127, -43, 0, 42, 125]`, so `0x80 - weight_zp` is `[255, 171, 128, 86,
+/// 3]` -- five different operands where `DPU_BS_OW_OP` is one 16-bit scalar.
+/// No value of it passes (swept 0, 3, 85, 128, 171, 253, 255: 0/1 every time).
+/// BRDMA can carry a per-channel operand and a configuration register cannot,
+/// so this crate's wiring is strictly the more general of the two and Mesa's
+/// is the uniform-zero-point special case. Keep `ow_src = 1`.
+fn cpend_from_configuration() -> bool {
+    std::env::var("ROCKET_CPEND").is_ok_and(|value| value == "mesa")
+}
+
+/// Characterization override for `DPU_BS_OW_OP.ow_op`, the CPEND operand when
+/// `ow_src = 0` (`ROCKET_BS_OW_OP=<value>`; `ROCKET_CPEND=mesa` supplies the
+/// vendor's `0x80 - weight_zero_point` instead). This crate ships 0 because it
+/// feeds the operand from BRDMA.
+fn bs_ow_op_value(quantization: Option<&Quantization>) -> u32 {
+    if let Some(value) = std::env::var("ROCKET_BS_OW_OP")
+        .ok()
+        .and_then(|value| value.parse::<u32>().ok())
+    {
+        return value & 0xffff;
+    }
+    if cpend_from_configuration() {
+        let weight_zero_point = quantization.map_or(0, |q| q.weight_zero_point);
+        return (0x80i64 - i64::from(weight_zero_point)) as u32 & 0xffff;
+    }
+    0
 }
 
 static ACCUMULATOR_OD_ENGAGE: std::sync::atomic::AtomicBool =
@@ -4646,7 +4695,11 @@ fn conv_2d_tile_program(
             ))
             .build(),
     );
-    commands.push(zero::<DpuBsOwOp>());
+    commands.push(
+        Register::<DpuBsOwOp>::new()
+            .ow_op(Bits::new(bs_ow_op_value(quantization.as_ref())))
+            .build(),
+    );
     commands.push(
         Register::<DpuWdmaSize0>::new()
             .channel_wdma(Bits::new(padded_out_channels - 1))

@@ -1316,6 +1316,28 @@ On the accumulator path CPEND is bypassed and the field is inert -- 0
 mismatches either way at 32x32 Cin 128 Cout 64 k1 -- so the `1` it gets there
 is unused rather than wrong.
 
+**Adopting the vendor wiring was tried and rejected, 2026-09-05.**
+`ROCKET_CPEND=mesa` moves both fields together (`ow_src = 0` plus
+`DPU_BS_OW_OP = 0x80 - weight_zero_point`), and on symmetric weights it works
+everywhere: `conv_int8_hw` 4/4, `conv_int8_map_hw` 6/6,
+`conv_depthwise_int8_exact_hw` 3/3, depthwise fp16 with and without
+`od_bypass` cleared. The operand is load-bearing rather than ignored --
+sweeping `ROCKET_BS_OW_OP` at `ow_src = 0` gives 4/4 at 127 and 128, 3/4 at
+129, and 1/4 at 0, 64, 192 and 255.
+
+It fails on **affine int8**, structurally.
+`conv_int8_vendor_affine_hw` cycles a per-output-channel weight zero point of
+`[-127, -43, 0, 42, 125]`, so the vendor formula wants `[255, 171, 128, 86, 3]`
+-- five operands, where `DPU_BS_OW_OP` is a single 16-bit scalar. **No value
+of it passes** (swept 0, 3, 85, 128, 171, 253, 255: 0/1 every time). BRDMA can
+carry a per-channel operand and a configuration register cannot.
+
+So the two wirings are not peers: this crate's is strictly more general and
+Mesa's is the uniform-zero-point special case, which is all Mesa ever emits.
+`ow_src = 1` stays. The knobs stay as characterization-only; the shipped
+register programs are byte-identical with them unset, verified by
+`dump_conv_plan_regcmd` at fp16, int8 and int8acc.
+
 None of this changes C8: the int32 writer poisons at its correct `size_e` of 7,
 with the OW stage bypassed or engaged. `od_bypass = 1` appears in two clean paths (fp16, fp16-f32out).
 `size_e` was already measured inert on the accumulator path (it is a BS/OW
