@@ -329,6 +329,24 @@ The compiled cases include the previously problematic VGG geometry (30x30,
 Cin=512, Cout=512, 3x3) and a 40-channel 3x3 depthwise convolution that crosses
 the driver's 32-channel weight-packing group boundary.
 
+`tools/e2e_matmul_regression.py` is the same gate for matmul, with the same
+flags:
+
+```sh
+python3 tools/e2e_matmul_regression.py --board "<board name>"
+```
+
+Its raw half runs the FC oracle tests from both `fc_hw` and `fc_phase3_hw`;
+its compiled half covers the ViT projection shape, MobileNetV2's classifier,
+the `K`/`N` channel ceilings, `M` at the matcher's 2047, `linalg.matvec` and
+`vecmat` through the GEMV raising, and two matmuls sharing a command buffer.
+**Seven of its eight cases are compared exactly.** A contraction can be gated
+exactly if its fixtures are ternary -- entries from `{-1, 0, 1}` are exact in
+f16, every product is, and the sums stay far inside f16's integer-exact range
+(measured |C|max 79 at `K` 768, 118 at 1792, against a ceiling of 2048). The
+eighth case is the same shape with realistic magnitudes and a tolerance, since
+ternary data never rounds and so cannot see a precision fault.
+
 `tools/e2e_pooling_regression.py` is the same gate for pooling, with the same
 flags:
 

@@ -139,7 +139,7 @@ timeouts**, under both the `Selectors` and `Counting` oracle patterns:
 
 | Dimension | Tested range | Bound by |
 |---|---|---|
-| `M` (conv width at height one) | 1..=2047 in the compiled path; 1..=296 measured in the HAL, 197 end to end | `CNA_DATA_SIZE0.datain_width` is 11 bits. The vendor FC sweep covers 1, 2, 7, 16, 32 (three CBUF splits); above the row-width limit above the planner splits column tiles -- see below |
+| `M` (conv width at height one) | 1..=2047, measured end to end at 2047 by `tools/e2e_matmul_regression.py` (exact) as well as in the compiled matcher; 1..=296 measured in the HAL | `CNA_DATA_SIZE0.datain_width` is 11 bits. The vendor FC sweep covers 1, 2, 7, 16, 32 (three CBUF splits); above the row-width limit above the planner splits column tiles -- see below |
 | `K` (conv `Cin`) | 1..=1792 | `MAX_INPUT_CHANNELS`; measured 512, 1024, 1344, 1792, 2048 |
 | `N` (conv `Cout`) | 1..=1792 | `MAX_OUTPUT_CHANNELS`; measured 64, 512, 1001, 1792, 2048 |
 
@@ -247,6 +247,14 @@ CPU today. Everything else falls back silently and correctly.
 | min pool | NHWC | f32 | 2x2..=8x8 | 1, 2 | H/W/C 1..=8192 | -- |
 
 All of these additionally require batch 1 and dilation 1.
+
+All three matmul rows have an end-to-end differential behind them:
+`tools/e2e_matmul_regression.py`, eight cases, all passing on `planck`
+2026-09-05. Seven are compared **exactly** using ternary fixtures -- `{-1, 0,
+1}` entries are exact in f16 and the sums stay inside its integer-exact range
+-- which is what lets a contraction be gated bit for bit rather than under a
+tolerance. The eighth is the ViT shape with realistic magnitudes, at
+max|error| 0.0011.
 
 `matvec` and `vecmat` have no matcher of their own: `rocket-expand-gemv-to-matmul`
 raises them into `linalg.matmul` with a unit extent before the match loop, so
