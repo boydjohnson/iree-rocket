@@ -308,6 +308,71 @@ was masking a fault fp16 has too.
 
 ---
 
+## C10 (S2) — a height-one convolution is never tiled along its width, and past a `K`-dependent width the matmul lowering returns silently wrong data
+
+**[verified]** on `planck` 2026-09-05 with `dtype_boundary_probe`, which runs
+exactly `fc::Shape::as_conv_shape`'s geometry (width `M`, height 1, k=1,
+pad 0). One shape per process, `Selectors`.
+
+The matmul matcher caps `M` at 32, and the transform spec explains that cap as
+bookkeeping: "M becomes the convolution *width*, which no constant bounds; 32
+is where the ladder stops, so it is where this stops." That reads as an
+invitation to raise it. It is not one -- above 32 the hardware returns wrong
+values, and the boundary moves with `K`:
+
+| `K` | last `M` exact | first `M` wrong |
+|---|---|---|
+| 1792 | 37 | 38 |
+| 768 | 88 | 90 |
+| 256 | 288 | 296 |
+| 64 | 384 (no failure found) | -- |
+
+`M x K` at the last passing point is 66,304 / 67,584 / 73,728 -- roughly
+constant, which is the signature of a single feature row that stops fitting
+the granted CBUF data banks.
+
+These are **wrong values, never a timeout**, and the corruption grows with `M`:
+at `K` 768 the first failures are 8 output channels wrong at every `x`
+(`M` 90, 720 of 5,760 elements, several reading 0 where a coefficient should
+have landed), and by `M` 128 every element of every channel is wrong. At
+`K` 256 `M` 296 the first column is still exact and the corruption starts
+further along the row. `Counting` cannot see any of it -- its output is
+spatially constant -- which is why the ladder's own pattern choice matters
+here; `Selectors` and `Dense` both catch it, and disagree on which shapes
+above the boundary survive (`Dense` passes `M` 197 where `Selectors` fails it),
+so neither alone bounds the fault.
+
+**Why the planner does not stop it.** `ConvPlan` plans a height-one shape as
+`tiles=1, in_rows=1` at every width tried, up to `M` 512. Row tiling has no
+freedom at height one, and column tiling is not reachable:
+`captured_column_partition` returns `Some` only for three hard-coded vendor
+captures -- width exactly 256, height exactly 32, `Cout` exactly 64, fp16,
+unpadded, at 9x9 or 11x11. Every other shape gets `None`. So nothing bounds a
+matmul's feature footprint, and past the point where its single row stops
+fitting, the program is emitted anyway.
+
+**The capacity model does not predict the boundary either.** At the last
+passing point the charged footprint is 81-90% of the granted data banks, so
+`max_tile_input_rows_for_width_and_data_banks` believes every one of these
+shapes fits, and its trailing `.max(1)` would force one row through even if it
+did not. Whatever the missing overhead is, it is not in that formula. The bank
+split is also non-monotonic in `M` at fixed `K` (`K` 768 takes 7 data banks at
+`M` 16, 2 at `M` 32, 9 at `M` 197), which is worth understanding before
+trusting any threshold derived from it.
+
+**Not reachable from a compiled model today** -- the `M <= 32` matcher bound
+contains it, which is why this is S2 and not S1. What it blocks is transformer
+offload: ViT-B/16 wants `M` 197 at `K` 768, four times past that `K`'s
+boundary. Raising the matmul `M` bound before this is fixed would route known-
+wrong shapes to the NPU.
+
+**What would fix it:** width tiling at height one. The machinery exists --
+`plan_grid`, `balanced_column_widths`, and the `horizontally_tiled` register
+path are all written and board-validated -- it is only the gate that is
+hard-coded to three captures.
+
+---
+
 ## M2 (S3) — the NPU is running at 200 MHz
 
 `perf/clock.md` [notes]: the RK3588 compute clock `scmi_clk_npu` boots pinned at

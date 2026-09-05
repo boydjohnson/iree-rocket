@@ -2462,8 +2462,16 @@ module attributes {transform.with_named_sequence} {
   // `MAX_OUTPUT_CHANNELS` bound them at 1792 -- exactly MobileNetV2's
   // classifier, measured at that shape rather than inferred from the 14x14
   // sweep that already reached 1792 at a different geometry. M becomes the
-  // convolution *width*, which no constant bounds; 32 is where the ladder
-  // stops, so it is where this stops.
+  // convolution *width*, which no constant bounds.
+  //
+  // 32 was originally just where the ladder stopped. It is now known to be a
+  // correctness bound: measured past it on `planck` 2026-09-05, the lowering
+  // returns silently wrong values above a K-dependent width -- M 37 exact and
+  // 38 wrong at K 1792, 88 and 90 at K 768, 288 and 296 at K 256. A height-one
+  // shape is planned as a single tile at every width and column tiling is
+  // gated to three hard-coded vendor captures, so nothing bounds a matmul's
+  // feature footprint. See ISSUES.md C10. Do not raise this without fixing
+  // that; it is what blocks transformer offload, which wants M 197.
   transform.named_sequence @match_rocket_matmul(%root: !transform.any_op {transform.readonly}) -> !transform.any_op {
     transform.match.operation_name %root ["linalg.matmul"] : !transform.any_op
     %batch, %m, %n, %k = transform.iree.match.contraction %root,

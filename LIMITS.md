@@ -135,7 +135,7 @@ timeouts**, under both the `Selectors` and `Counting` oracle patterns:
 
 | Dimension | Tested range | Bound by |
 |---|---|---|
-| `M` (conv width at height one) | 1..=32 | The vendor FC sweep; measured at 1, 2, 7, 16, 32, crossing three different CBUF splits |
+| `M` (conv width at height one) | 1..=32 | The vendor FC sweep; measured at 1, 2, 7, 16, 32, crossing three different CBUF splits. **This one is load-bearing** -- see below |
 | `K` (conv `Cin`) | 1..=1792 | `MAX_INPUT_CHANNELS`; measured 512, 1024, 1344, 1792, 2048 |
 | `N` (conv `Cout`) | 1..=1792 | `MAX_OUTPUT_CHANNELS`; measured 64, 512, 1001, 1792, 2048 |
 
@@ -146,6 +146,17 @@ raised from 1344 on 2026-09-04: the geometry that carries it -- a 1x1 spatial
 `fc_matmul_ladder_matches_the_fc_lowering` keeps the regression's cases
 identical to what `fc::Shape::as_conv_shape` actually builds, so the ladder
 cannot drift into measuring its own geometry.
+
+**`M <= 32` is a correctness bound, not just where the ladder stopped.**
+Measured past it on `planck` 2026-09-05 with `dtype_boundary_probe`: above a
+`K`-dependent width the lowering returns silently wrong values -- `M` 37 exact
+and 38 wrong at `K` 1792, 88 and 90 at `K` 768, 288 and 296 at `K` 256. The
+transform spec's own comment on this matcher still reads "32 is where the
+ladder stops, so it is where this stops", which understates it; ISSUES.md C10
+has the mechanism. A height-one shape is planned as a single tile at every
+width, and column tiling is gated to three hard-coded vendor captures, so
+nothing bounds a matmul's feature footprint. Do not raise this bound without
+fixing that first.
 
 ## Pooling
 
