@@ -1293,6 +1293,29 @@ precision-independent: `CORE_DATAOUT_SIZE_1`, `DPU_DATA_CUBE_CHANNEL` (both
 `orig_channel` and the padded `channel`), `DPU_WDMA_SIZE_0.channel_wdma` and
 `DPU_RDMA_DATA_CUBE_CHANNEL`.
 
+### `ow_src` diverges from the vendor emitter on purpose, 2026-09-05
+
+`rocket-userspace` and the Mesa program it was diffed against never set
+`BS_OW_CFG` bit 0 -- both emit the word as
+`tp_org_en | size_e_2 | size_e_1 | size_e_0 | od_bypass`, with no `ow_src`
+term -- while this crate sets `ow_src = 1` whenever a quantization is present.
+That looked like a stray bit. It is not: `conv_int8_hw` passes 4/4 at the
+shipped value and fails **3 of 4** at `ROCKET_OW_SRC=0` [verified, planck].
+
+The field selects where the CPEND stage takes its operand: 0 = the
+`DPU_BS_OW_OP` configuration register, 1 = from outside. The two stacks make
+opposite, self-consistent choices. `rocket-userspace` keeps `ow_src = 0` and
+puts the operand in `DPU_BS_OW_OP` (`0x80 - weight_zp` on its depthwise
+branch); this crate writes `DPU_BS_OW_OP = 0` and takes the operand from
+BRDMA, which the requantized path already loads with the bias/scale/shift
+triple (`BRDMA_DATA_USE_QUANTIZED`). Neither is wrong and they are not
+interchangeable, which is exactly the kind of difference a register-by-register
+diff against the vendor emitter will keep flagging.
+
+On the accumulator path CPEND is bypassed and the field is inert -- 0
+mismatches either way at 32x32 Cin 128 Cout 64 k1 -- so the `1` it gets there
+is unused rather than wrong.
+
 None of this changes C8: the int32 writer poisons at its correct `size_e` of 7,
 with the OW stage bypassed or engaged. `od_bypass = 1` appears in two clean paths (fp16, fp16-f32out).
 `size_e` was already measured inert on the accumulator path (it is a BS/OW

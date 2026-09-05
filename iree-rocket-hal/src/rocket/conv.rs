@@ -3918,6 +3918,37 @@ fn od_engage() -> bool {
         || std::env::var("ROCKET_ACC_OD_ENGAGE").is_ok_and(|value| value != "0")
 }
 
+/// Characterization override for `DPU_BS_OW_CFG.OW_SRC` (`ROCKET_OW_SRC=0|1`).
+///
+/// The field selects where the CPEND stage's operand comes from: 0 = the
+/// `DPU_BS_OW_OP` configuration register, 1 = "from outside". This crate sets
+/// it to 1 whenever a quantization is present, but neither `rocket-userspace`
+/// nor the Mesa program it was diffed against ever sets bit 0 -- both emit
+/// `BS_OW_CFG` as `tp_org_en | size_e_2 | size_e_1 | size_e_0 | od_bypass`
+/// with no `ow_src` term.
+///
+/// **Checked on hardware 2026-09-05, and our 1 is required.** `conv_int8_hw`
+/// passes 4/4 at the shipped value and fails **3 of 4** at `ROCKET_OW_SRC=0`.
+/// The two stacks feed the CPEND operand from different places and each is
+/// self-consistent: `rocket-userspace` leaves `ow_src` at 0 and supplies the
+/// operand in the `DPU_BS_OW_OP` configuration register (`0x80 - weight_zp`
+/// on its depthwise branch), while this crate writes `DPU_BS_OW_OP = 0` and
+/// takes it from BRDMA, which the requantized path already loads with the
+/// bias/scale/shift triple (`BRDMA_DATA_USE_QUANTIZED`). So the divergence is
+/// a design choice, not a defect, and the two settings are not
+/// interchangeable.
+///
+/// On the accumulator path CPEND is bypassed and the field is inert (0
+/// mismatches either way at 32x32 Cin 128 Cout 64 k1), so the `1` it gets
+/// there is merely unused.
+///
+/// Nothing on the compiled path sets it.
+fn ow_src_override() -> Option<u32> {
+    std::env::var("ROCKET_OW_SRC")
+        .ok()
+        .and_then(|value| value.parse().ok())
+}
+
 static ACCUMULATOR_OD_ENGAGE: std::sync::atomic::AtomicBool =
     std::sync::atomic::AtomicBool::new(false);
 
@@ -4610,7 +4641,9 @@ fn conv_2d_tile_program(
             .od_bypass(Bits::new(u32::from(
                 (quantization.is_none() || accumulator_output) && !od_engage(),
             )))
-            .ow_src(Bits::new(u32::from(quantization.is_some())))
+            .ow_src(Bits::new(
+                ow_src_override().unwrap_or(u32::from(quantization.is_some())),
+            ))
             .build(),
     );
     commands.push(zero::<DpuBsOwOp>());
