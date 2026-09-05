@@ -100,6 +100,7 @@ off. It is a probe hatch for extending the measurement, not a supported mode.
 | Dilation | 1 | No dilation support in the builder at all |
 | Leading padding | 0..=15, and `pad < kernel extent` | The CNA's 4-bit pad fields. There are no *trailing* padding registers; the output extent implies bottom and right |
 | Input rows per program | `CNA_CBUF_CON1.data_entries` <= 0x7fff, `feature_grains` <= 0x3ff | Usually the CBUF bank grant binds first; the planner tiles |
+| Input row width per program | `(ceil(atoms/4) - 1) * in_cols <= 2047` for NC1HWC2 input (89 at fp16 `Cin` 768, 292 at 256, 37 at 1792; unbounded at one slab, `Cin` <= 32) | The CBUF's 11-bit entry-slab base, `MAX_ENTRY_SLAB_BASE`; measured exact at 2048 across fp16/bf16/int16/tf32/int8. `Shape::max_tile_input_width` bounds it and the planner splits columns. A row that does not fit its data grant is refused too (capacity 0), no longer forced through |
 
 ### Above 3x3, `Cin` is the cliff
 
@@ -135,7 +136,7 @@ timeouts**, under both the `Selectors` and `Counting` oracle patterns:
 
 | Dimension | Tested range | Bound by |
 |---|---|---|
-| `M` (conv width at height one) | 1..=32 | The vendor FC sweep; measured at 1, 2, 7, 16, 32, crossing three different CBUF splits. **This one is load-bearing** -- see below |
+| `M` (conv width at height one) | 1..=32 in the compiled path; 1..=296 measured in the HAL | The transform spec's matcher bound is the vendor FC sweep's extent (1, 2, 7, 16, 32, crossing three CBUF splits). Above it the planner splits column tiles at the row-width limit above -- see below |
 | `K` (conv `Cin`) | 1..=1792 | `MAX_INPUT_CHANNELS`; measured 512, 1024, 1344, 1792, 2048 |
 | `N` (conv `Cout`) | 1..=1792 | `MAX_OUTPUT_CHANNELS`; measured 64, 512, 1001, 1792, 2048 |
 
@@ -147,16 +148,17 @@ raised from 1344 on 2026-09-04: the geometry that carries it -- a 1x1 spatial
 identical to what `fc::Shape::as_conv_shape` actually builds, so the ladder
 cannot drift into measuring its own geometry.
 
-**`M <= 32` is a correctness bound, not just where the ladder stopped.**
-Measured past it on `planck` 2026-09-05 with `dtype_boundary_probe`: above a
-`K`-dependent width the lowering returns silently wrong values -- `M` 37 exact
-and 38 wrong at `K` 1792, 88 and 90 at `K` 768, 288 and 296 at `K` 256. The
-transform spec's own comment on this matcher still reads "32 is where the
-ladder stops, so it is where this stops", which understates it; ISSUES.md C10
-has the mechanism. A height-one shape is planned as a single tile at every
-width, and column tiling is gated to three hard-coded vendor captures, so
-nothing bounds a matmul's feature footprint. Do not raise this bound without
-fixing that first.
+**Above `M` 32 the row splits, and the split is measured.** A single input
+row wider than `(K/32 - 1) * M <= 2047` CBUF entries reads its last 32
+channels from the wrong place (ISSUES.md C10, resolved 2026-09-05); until that
+day the `M <= 32` matcher bound was what kept it out of compiled models. The
+planner now bounds the row (`Shape::max_tile_input_width`) and plans column
+tiles past it, measured exact on `planck` with `dtype_boundary_probe` at `M`
+90, 128 and 197 (`K` 768, two and three columns), 296 (`K` 256), 38 (`K`
+1792), at bf16, int16, tf32 and both int8 paths, and under the `onehot` read
+map at 197 and 296. The transposed `1 x M` geometry row-tiles instead and is
+exact at the same points with fewer tiles (ISSUES.md D1). Raising the matcher
+bound is therefore a compiled-path validation, not a hardware question.
 
 ## Pooling
 

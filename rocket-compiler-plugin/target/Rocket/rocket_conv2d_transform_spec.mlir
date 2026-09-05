@@ -2464,14 +2464,17 @@ module attributes {transform.with_named_sequence} {
   // sweep that already reached 1792 at a different geometry. M becomes the
   // convolution *width*, which no constant bounds.
   //
-  // 32 was originally just where the ladder stopped. It is now known to be a
-  // correctness bound: measured past it on `planck` 2026-09-05, the lowering
-  // returns silently wrong values above a K-dependent width -- M 37 exact and
-  // 38 wrong at K 1792, 88 and 90 at K 768, 288 and 296 at K 256. A height-one
-  // shape is planned as a single tile at every width and column tiling is
-  // gated to three hard-coded vendor captures, so nothing bounds a matmul's
-  // feature footprint. See ISSUES.md C10. Do not raise this without fixing
-  // that; it is what blocks transformer offload, which wants M 197.
+  // 32 is where the vendor FC ladder stopped, and for a while it was also
+  // holding a hardware fault at bay: a single input row wider than
+  // `(K/32 - 1) * M <= 2047` CBUF entries read its last 32 channels from the
+  // wrong place (ISSUES.md C10, resolved 2026-09-05). The planner now bounds
+  // the row itself (`Shape::max_tile_input_width`) and splits a wider matmul
+  // into column tiles, board-validated at M 90, 128, 197 and 296. So this
+  // bound is once again the extent of the measurement, not a correctness
+  // limit: raising it is a matter of validating the compiled path at the M a
+  // model wants (ViT-B/16 wants 197 at K 768, which plans as three columns)
+  // and deciding whether the tall `1 x M` geometry the notes use is the
+  // better lowering there -- see ISSUES.md D1.
   transform.named_sequence @match_rocket_matmul(%root: !transform.any_op {transform.readonly}) -> !transform.any_op {
     transform.match.operation_name %root ["linalg.matmul"] : !transform.any_op
     %batch, %m, %n, %k = transform.iree.match.contraction %root,

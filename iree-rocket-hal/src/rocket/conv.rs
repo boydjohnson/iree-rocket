@@ -602,6 +602,41 @@ fn streamed_weight_bank_preference_for_group(
 /// in both fp16 and int8. Bit 15 remains unobserved.
 const MAX_DATA_ENTRIES: u32 = 0x7fff;
 
+/// Largest CBUF entry offset an input line's entry slab may begin at.
+///
+/// A surface-layout line is held in the CBUF slab-major: every pixel's
+/// first entry (its first four feature atoms), then every pixel's second,
+/// and so on, so slab `s` begins `s * in_cols` entries into the line. That
+/// base is an 11-bit quantity. Past 2047 it wraps, and the slab is read
+/// from the front of the line instead -- slab 0's pixels from `base - 2048`
+/// on, then slab 1's -- which presents as the last 32 fp16 channels (16
+/// tf32, 64 int8) of *every* pixel being wrong while everything below them
+/// is exact, and as more slabs the further past the bound the line goes.
+///
+/// Measured on `planck` 2026-09-05 with `dtype_boundary_probe`, one shape
+/// per process, and its `onehot` read map. The boundary sits at exactly
+/// `(slabs - 1) * in_cols == 2048` at every depth tried on a 1x1 kernel --
+/// fp16 K 96, 128, 256, 512, 768, 1024 and 1792; K 72 and 40, where a
+/// partial slab counts as one; bf16 and int16 at K 768; tf32 at K 384,
+/// where the same atom count is half the channels; the int8 accumulator
+/// path at K 512 -- and K 32, a single slab, is exact at width 2000. The
+/// wrap decodes exactly under the `onehot` map at K 256, 768 and 1024. It
+/// is a property of the line, not the tile: 90x2 and 90x4 at K 768 fail
+/// like 90x1, while 89x4 is exact. And it is not capacity: 90x1 K 768
+/// fails at 9/3 and 6/6 as it does at 5/7, while 88x1 loses rows at 4/8.
+/// The vendor FC corpus never reaches it because its widest shape is 32.
+///
+/// A 3x3 kernel at height one fails *earlier* than this bound (86x1 at K 768
+/// against 89x1 for 1x1), but that is a different fault with the same
+/// signature: the coefficient floor leaves it 4 data banks, its one line
+/// does not fit them, and the capacity formula used to force a row through
+/// anyway. That is fixed alongside this; see
+/// [`Shape::max_tile_input_rows_for_width_and_data_banks`]. With both in
+/// place every measured shape is exact: 1x1 at M 90, 128, 197 and 296, and
+/// 3x3 at 86..89x1 K 768, 100..134x1 K 512, 62..65x1 K 1024, all as column
+/// tiles. See ISSUES.md C10.
+const MAX_ENTRY_SLAB_BASE: u32 = 0x7ff;
+
 /// Largest logical value encodable by the 10-bit
 /// `CNA_CONV_CON2.feature_grains` field.
 const MAX_FEATURE_GRAINS: u32 = 0x03ff;
@@ -2147,6 +2182,16 @@ impl Shape {
     /// changing the tensor's memory strides. The three large-kernel captures
     /// that require it sit exactly on this product bound:
     /// `input_width * input_rows * atoms * 16 <= data_banks * 32768`.
+    ///
+    /// **Zero when not even one row fits.** This used to end in `.max(1)`,
+    /// which forced a single row through whatever the arithmetic said, and
+    /// the hardware then read the line's tail from the wrong place: a 3x3 at
+    /// 86x1 `Cin` 768 fp16 is granted 4 data banks by the coefficient floor,
+    /// its one line is 2064 entries against the 2048 they hold, and it
+    /// computed wrong values on `planck` 2026-09-05 while 85x1 (2040
+    /// entries) was exact and the same 86x1 at 6/6 was exact. Returning zero
+    /// lets `plan_grid` decline the width, which is what sends the plan to
+    /// column tiles. See ISSUES.md C10.
     pub fn max_tile_input_rows_for_width_and_data_banks(
         &self,
         input_width: u32,
@@ -2187,7 +2232,25 @@ impl Shape {
                     / (entries_per_row * CBUF_ATOMS_PER_ENTRY * FEATURE_ATOM_BYTES)
             }
         };
-        capacity.min(self.max_data_entries() / charged_width).max(1)
+        capacity.min(self.max_data_entries() / charged_width)
+    }
+
+    /// Widest input row one task may read at this depth.
+    ///
+    /// The last entry slab's base, `(slabs - 1) * in_cols`, has to fit
+    /// [`MAX_ENTRY_SLAB_BASE`]. Dense rows and a depth of one slab are
+    /// unbounded here and take the tensor width; the row count does not
+    /// enter, because the base is an offset within a line.
+    pub fn max_tile_input_width(&self) -> u32 {
+        let extra_slabs = match self.layout() {
+            FeatureLayout::Dense => 0,
+            FeatureLayout::Surfaces => self.cbuf_atoms().div_ceil(CBUF_ATOMS_PER_ENTRY) - 1,
+        };
+        if extra_slabs == 0 {
+            self.width
+        } else {
+            (MAX_ENTRY_SLAB_BASE / extra_slabs).min(self.width)
+        }
     }
 
     /// Conservative input-row limit imposed by `feature_grains`.
@@ -3263,6 +3326,11 @@ fn plan_grid(
     let columns = ColumnTile::split(shape, kernels, output_widths);
     let mut tiles = Vec::new();
     for columns in columns {
+        // A column too wide for its slab base has no row split that saves
+        // it; declining here is what sends the caller to a finer partition.
+        if columns.in_cols > shape.max_tile_input_width() {
+            return None;
+        }
         let max_rows = shape
             .max_tile_input_rows_for_width_and_data_banks(columns.in_cols, data_banks)
             .min(shape.max_feature_grain_input_rows(kernels));
@@ -3374,8 +3442,10 @@ fn realign_dense_row_tiles(
 
 fn grid_fits(shape: Shape, kernels: Kernels, tiles: &[Tile2D], data_banks: u32) -> bool {
     tiles.iter().all(|tile| {
-        tile.rows.in_rows
-            <= shape.max_tile_input_rows_for_width_and_data_banks(tile.columns.in_cols, data_banks)
+        tile.columns.in_cols <= shape.max_tile_input_width()
+            && tile.rows.in_rows
+                <= shape
+                    .max_tile_input_rows_for_width_and_data_banks(tile.columns.in_cols, data_banks)
             && feature_grains(kernels, &tile.rows) <= MAX_FEATURE_GRAINS
     })
 }
@@ -4312,6 +4382,14 @@ fn conv_2d_tile_program(
     let out_height = shape.output_height(kernels);
     let input_width = columns.in_cols;
     let out_width = columns.out_cols;
+    assert!(
+        input_width <= shape.max_tile_input_width(),
+        "tile reads {input_width} input columns at {} feature atoms per pixel; the last entry \
+         slab would begin at entry {}, past the {MAX_ENTRY_SLAB_BASE} the CBUF can address, \
+         and the hardware reads it from the front of the line instead (ISSUES.md C10)",
+        shape.cbuf_atoms(),
+        (shape.cbuf_atoms().div_ceil(CBUF_ATOMS_PER_ENTRY) - 1) * input_width,
+    );
     let horizontally_tiled = columns.out_first != 0 || out_width != full_out_width;
     let (output_base_offset, output_surface_pixels, output_notch) = match output_placement {
         OutputPlacement::SharedImage => (
@@ -6632,6 +6710,122 @@ mod tests {
                 "data_entries at width {width}"
             );
         }
+    }
+
+    #[test]
+    fn entry_slab_base_bounds_the_input_width() {
+        // Every point is a measured pass/fail pair on `planck` 2026-09-05:
+        // the last width that is exact and the first that is not, at 1x1.
+        let unpadded = |width, cin, precision| {
+            Shape::with_precision(width, 1, 1, cin, 64, precision).with_padding([0, 0])
+        };
+        for (cin, precision, last_exact) in [
+            (1792u32, Precision::Fp16, 37u32),
+            (1024, Precision::Fp16, 66),
+            (768, Precision::Fp16, 89),
+            (512, Precision::Fp16, 136),
+            (256, Precision::Fp16, 292),
+            (128, Precision::Fp16, 682),
+            (96, Precision::Fp16, 1023),
+            // Nine atoms is three slabs, the third of them partial.
+            (72, Precision::Fp16, 1023),
+            (768, Precision::Bf16, 89),
+            (768, Precision::Int16, 89),
+            // Half the channels per atom, so K 384 is the same 24 slabs.
+            (384, Precision::Tf32, 89),
+        ] {
+            let wide = unpadded(2047, cin, precision);
+            assert_eq!(
+                wide.max_tile_input_width(),
+                last_exact,
+                "Cin {cin} {precision:?}"
+            );
+            let bounded = unpadded(last_exact, cin, precision);
+            assert_eq!(bounded.max_tile_input_width(), last_exact);
+        }
+        // One slab (Cin <= 32 at fp16) and dense rows have no base to
+        // overflow: 2000 wide at K 32 is measured exact.
+        assert_eq!(
+            unpadded(2000, 32, Precision::Fp16).max_tile_input_width(),
+            2000
+        );
+        assert_eq!(
+            unpadded(2000, 40, Precision::Fp16).max_tile_input_width(),
+            2000
+        );
+        assert_eq!(
+            unpadded(2000, 3, Precision::Fp16).max_tile_input_width(),
+            2000
+        );
+    }
+
+    #[test]
+    fn wide_lines_plan_column_tiles_inside_the_slab_bound() {
+        // 89x1 at K 768 is the last full-width line the hardware reads
+        // correctly; 90 has to split, and the split has to keep every
+        // column inside the bound. Rows do not buy anything: 90x4 splits
+        // the same way.
+        let shape = |width, height| {
+            Shape::with_precision(width, height, 1, 768, 64, Precision::Fp16).with_padding([0, 0])
+        };
+        let whole = ConvPlan::new(shape(89, 1), [1, 1]);
+        assert_eq!(whole.output_column_widths(), &[89]);
+
+        for (width, height, columns) in [(90u32, 1u32, 2usize), (90, 4, 2), (197, 1, 3)] {
+            let plan = ConvPlan::new(shape(width, height), [1, 1]);
+            assert_eq!(
+                plan.output_column_widths().len(),
+                columns,
+                "{width}x{height} column count"
+            );
+            assert!(
+                plan.tiles().iter().all(|tile| tile.columns.in_cols <= 89),
+                "{width}x{height} column widths {:?}",
+                plan.output_column_widths()
+            );
+            // Every program emits, which is where the emitter's own guard
+            // would otherwise fire.
+            assert_eq!(plan.programs().len(), plan.tiles().len());
+        }
+    }
+
+    #[test]
+    fn a_line_that_does_not_fit_its_data_banks_is_not_forced_through() {
+        // Measured pairs on `planck` 2026-09-05, 3x3 pad 1 at height one:
+        // the coefficient floor leaves 4 data banks at Cin 768 and 3 at
+        // Cin 512/1024, and the single line either fits them or does not.
+        let shape = |width, cin| Shape::with_precision(width, 1, 1, cin, 64, Precision::Fp16);
+        for (width, cin, banks, fits) in [
+            (85u32, 768u32, 4u32, true),
+            (86, 768, 4, false),
+            (89, 512, 3, true),
+            (100, 512, 3, false),
+            (128, 512, 3, false),
+            (62, 1024, 3, false),
+        ] {
+            let capacity = shape(width, cin).max_tile_input_rows_for_data_banks(banks);
+            assert_eq!(
+                capacity >= 1,
+                fits,
+                "{width}x1 Cin {cin} at {banks} data banks"
+            );
+            let plan = ConvPlan::new(shape(width, cin), [3, 3]);
+            assert_eq!(plan.data_banks(), banks, "{width}x1 Cin {cin} split");
+            assert_eq!(
+                plan.output_column_widths().len() == 1,
+                fits,
+                "{width}x1 Cin {cin} columns {:?}",
+                plan.output_column_widths()
+            );
+            assert_eq!(plan.programs().len(), plan.tiles().len());
+        }
+    }
+
+    #[test]
+    #[should_panic(expected = "past the 2047 the CBUF can address")]
+    fn emitter_refuses_a_line_past_the_slab_bound() {
+        let shape = Shape::with_precision(90, 1, 1, 768, 64, Precision::Fp16).with_padding([0, 0]);
+        let _ = conv_2d_tile(shape, [1, 1], &Tile::whole(shape, [1, 1]));
     }
 
     #[test]

@@ -308,71 +308,6 @@ was masking a fault fp16 has too.
 
 ---
 
-## C10 (S2) — a height-one convolution is never tiled along its width, and past a `K`-dependent width the matmul lowering returns silently wrong data
-
-**[verified]** on `planck` 2026-09-05 with `dtype_boundary_probe`, which runs
-exactly `fc::Shape::as_conv_shape`'s geometry (width `M`, height 1, k=1,
-pad 0). One shape per process, `Selectors`.
-
-The matmul matcher caps `M` at 32, and the transform spec explains that cap as
-bookkeeping: "M becomes the convolution *width*, which no constant bounds; 32
-is where the ladder stops, so it is where this stops." That reads as an
-invitation to raise it. It is not one -- above 32 the hardware returns wrong
-values, and the boundary moves with `K`:
-
-| `K` | last `M` exact | first `M` wrong |
-|---|---|---|
-| 1792 | 37 | 38 |
-| 768 | 88 | 90 |
-| 256 | 288 | 296 |
-| 64 | 384 (no failure found) | -- |
-
-`M x K` at the last passing point is 66,304 / 67,584 / 73,728 -- roughly
-constant, which is the signature of a single feature row that stops fitting
-the granted CBUF data banks.
-
-These are **wrong values, never a timeout**, and the corruption grows with `M`:
-at `K` 768 the first failures are 8 output channels wrong at every `x`
-(`M` 90, 720 of 5,760 elements, several reading 0 where a coefficient should
-have landed), and by `M` 128 every element of every channel is wrong. At
-`K` 256 `M` 296 the first column is still exact and the corruption starts
-further along the row. `Counting` cannot see any of it -- its output is
-spatially constant -- which is why the ladder's own pattern choice matters
-here; `Selectors` and `Dense` both catch it, and disagree on which shapes
-above the boundary survive (`Dense` passes `M` 197 where `Selectors` fails it),
-so neither alone bounds the fault.
-
-**Why the planner does not stop it.** `ConvPlan` plans a height-one shape as
-`tiles=1, in_rows=1` at every width tried, up to `M` 512. Row tiling has no
-freedom at height one, and column tiling is not reachable:
-`captured_column_partition` returns `Some` only for three hard-coded vendor
-captures -- width exactly 256, height exactly 32, `Cout` exactly 64, fp16,
-unpadded, at 9x9 or 11x11. Every other shape gets `None`. So nothing bounds a
-matmul's feature footprint, and past the point where its single row stops
-fitting, the program is emitted anyway.
-
-**The capacity model does not predict the boundary either.** At the last
-passing point the charged footprint is 81-90% of the granted data banks, so
-`max_tile_input_rows_for_width_and_data_banks` believes every one of these
-shapes fits, and its trailing `.max(1)` would force one row through even if it
-did not. Whatever the missing overhead is, it is not in that formula. The bank
-split is also non-monotonic in `M` at fixed `K` (`K` 768 takes 7 data banks at
-`M` 16, 2 at `M` 32, 9 at `M` 197), which is worth understanding before
-trusting any threshold derived from it.
-
-**Not reachable from a compiled model today** -- the `M <= 32` matcher bound
-contains it, which is why this is S2 and not S1. What it blocks is transformer
-offload: ViT-B/16 wants `M` 197 at `K` 768, four times past that `K`'s
-boundary. Raising the matmul `M` bound before this is fixed would route known-
-wrong shapes to the NPU.
-
-**What would fix it:** width tiling at height one. The machinery exists --
-`plan_grid`, `balanced_column_widths`, and the `horizontally_tiled` register
-path are all written and board-validated -- it is only the gate that is
-hard-coded to three captures.
-
----
-
 ## M2 (S3) — the NPU is running at 200 MHz
 
 `perf/clock.md` [notes]: the RK3588 compute clock `scmi_clk_npu` boots pinned at
@@ -1076,8 +1011,20 @@ looks like a genuine advantage of the capture-derived mapping, and it is worth
 feeding back to the notes — their M%4 padding may be avoidable by transposing
 the mapping.
 
-Caveat before claiming it: `fc.rs` is validated at M=7/K=16/N=32-33, a single
-small point. If FC is going to carry real shapes, sweep it.
+It has a cost of its own, found while closing C10: a wide row hits the CBUF's
+11-bit slab base at `(K/32 - 1) * M > 2047` (M 89 at K 768), and past that the
+planner splits it into column tiles — three of them for ViT-B/16's M 197 at
+K 768. The notes' `1 x M` geometry has no wide row and row-tiles instead: two
+tiles at the same shape here, since row capacity is 192 at 9 banks. Both
+geometries are now measured exact on `planck` 2026-09-05 at M 90 and 197
+(`dtype_boundary_probe` at `90x1`/`197x1` and `1x90`/`1x197`), so the choice
+above M 32 is a performance question, not a correctness one, and the tall form
+has fewer tiles. `whisper-encoder.md` records the notes hitting exactly this
+wall with a width-on-time 1D conv and transposing to time-on-height.
+
+`fc.rs` itself is still validated at M=7/K=16/N=32-33 through the compiled
+path; the M 90..296 points above are the HAL's conv planner under the FC
+geometry. If FC is going to carry real shapes, sweep the compiled path.
 
 ---
 
@@ -1105,6 +1052,29 @@ so they must disagree somewhere.
 What was settled and how, newest first, in place of the narratives — those are
 in this file's git history (`git log -p ISSUES.md`). Everything cited below is
 something that still exists: a commit, a file, or a memory.
+
+**C10 (S2) — 2026-09-05. A wide input row returned silently wrong data, and
+the planner never split it.** Two faults, both in `conv.rs`, neither in the
+CBUF capacity arithmetic the issue first blamed. (1) A surface-layout line is
+held in the CBUF in 32-channel slabs (one 64-byte entry of four atoms per
+pixel) laid slab-major, and each slab's base offset is **11 bits**:
+`(ceil(atoms/4) - 1) * in_cols` past 2047 wraps to the front of the line, so
+the last slab of every pixel is read from slab 0. Boundary exact at 2048 at
+every depth tried (fp16 K 96..1792, K 72/40, bf16, int16, tf32, int8
+accumulator), per line not per tile (90x2 fails like 90x1), and independent of
+the bank grant (fails at 9/3 as at 5/7); the `onehot` read map decodes the wrap
+exactly. `Shape::max_tile_input_width` now bounds `in_cols`, `plan_grid`
+declines a wider column, and the emitter refuses one. (2)
+`max_tile_input_rows_for_width_and_data_banks` ended in `.max(1)`, forcing a
+row through a grant it did not fit — what a 3x3 at height one hit, because the
+coefficient floor leaves it 3-4 data banks (86x1 K 768: 2064 entries against
+2048, wrong; 85x1 exact; the same 86x1 at 6/6 exact). It returns zero now.
+Both fixes engage the existing column tiling, which is now board-validated at
+1x1 and 3x3: M 90, 128, 197, 296 and every 3x3 point above, plus two clean
+read maps through the split path. The matmul `M <= 32` matcher bound is no
+longer load-bearing for correctness; see D1 for the geometry question that
+remains. Memory `cbuf-entry-slab-base-limit` has the rule and the three
+harness traps found on the way.
 
 **M4 (S2) — 2026-09-05. Every NPU-vs-CPU number before 2026-09-04 was measured
 against the wrong CPU baseline.** The spec runs
