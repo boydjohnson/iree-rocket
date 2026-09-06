@@ -479,10 +479,10 @@ service the existing "two menus" section performs for precisions.
 
 ## Recommended order
 
-**~~Phase 0~~ → ~~`mulf` investigation~~ → Phase 3 → C5 → Phase 1 → Phase 2.**
+**~~Phase 0~~ → ~~`mulf` investigation~~ → ~~Phase 3~~ → C5 → Phase 1 → Phase 2.**
 
-Phase 0 and the `mulf` investigation are done and board-validated; the rest
-stands.
+Phase 0, the `mulf` investigation and Phase 3 are done and board-validated;
+the rest stands.
 
 **Phase 0 produced the first counter-example to the warning above, and it is
 worth reading before Phases 1 and 2.** P8's law -- cost is flat per offloaded
@@ -503,7 +503,7 @@ back on the wrong side, which is what P8 lever #3 was really saying.
 |---|---|
 | ~~Phase 0~~ | Done 2026-09-05, and **measured**. MobileNetV2 and ViT are unaffected (dispatch-site counts identical). VGG's five `onnx.MaxPool` sites now offload and it is **1.26x faster** for it -- 1018 ms to 806 ms median, five interleaved passes. See below: this is the first counter-example to P8's law |
 | ~~`mulf`~~ | Done 2026-09-06. It was bounded, and it was one register field: `EwBinaryOp::Mul` is bit-exact on `planck`, as are `Max` and `Min`. It changes the scope of Phases 1 and 2 by *removing* their only hardware unknown -- what is left there is matcher and wire-format work, not RE |
-| Phase 3 | The only phase with a positive throughput story, and it needs no new schema breadth |
+| ~~Phase 3~~ | Done 2026-09-06 (#26), and it delivered the throughput story it was ranked for: MobileNetV2-static-int8 is **1.80x faster** than a like-for-like CPU build on a full machine and level with it at two cores, from 1.5x slower. The one prediction here that was wrong is "needs no new schema breadth" -- carrying per-convolution calibration to a shared executable took a new `Conv2DQuantParam` enum and a `runtime_quantization` vector on `Conv2DDef` |
 | C5 | Blocks both remaining phases by its own stated action item |
 | Phase 1 | Breadth: makes the validated HAL capability expressible |
 | Phase 2 | Breadth: new curves, the most additive and least urgent work here |
@@ -512,6 +512,13 @@ Phases 1 and 2 land their matchers **behind a flag**, with the `--no-offload`
 arm measured alongside on every model. P8's measurement stands until something
 displaces it: at the current per-dispatch cost, switching them on by default
 would make MobileNetV2 slower.
+
+Phase 3 moved that reference point and did not remove it. The int8 dispatch
+tax is much lower than it was -- the model beats the CPU now -- but what
+Phase 3 removed was `i32` activation traffic and unfused epilogues, which is
+not a cost a standalone element-wise matcher has in the first place. An
+element-wise op still does less work than its own dispatch costs, so the flag
+stands and the per-op bar above is still how to judge one.
 
 ## What this roadmap does not propose
 
