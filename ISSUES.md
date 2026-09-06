@@ -844,6 +844,70 @@ activation traffic and unfused epilogues, and removing them removes it.
 is untouched by this work -- it is the next thing to look at, and the weight
 cache reports 0 hits over 49 misses, which is worth a look on its own.
 
+### Where the remaining time is, and two levers measured to be worth nothing
+
+Measured 2026-09-06 on the requantized build, after it started beating the CPU.
+
+**`pack.weights` is a cold-start cost, not a steady-state one.** The single-run
+profile shows 65.8 ms and reads like the largest driver phase; over 35
+inferences it runs **49 times in total**, once per weight binding, with the
+weight cache reporting **1666 hits, 49 misses**. It is doing exactly what
+`weight_cache.rs` says it does. The visible effect is on the first inference
+only:
+
+    1 iteration    262 ms
+    3 iterations   214 ms
+    50 iterations  176 ms
+
+So packing the coefficients at compile time -- expressing the blocked layout
+as MLIR on the constant filter and letting const-eval fold it, with a
+`Conv2DDef` flag telling the driver to skip its packer -- would buy about 68
+of the ~86 ms cold-start penalty and 7.5 MiB of driver cache, and **nothing at
+all in steady state**. Worth doing for first-inference latency; not a
+throughput lever. Weigh it against carrying a second implementation of the
+blocked coefficient layout, which is the kind of duplication that produced the
+depthwise tap-major bug.
+
+**Transpose propagation is still worth nothing, re-measured under conditions
+that had changed.** P8 measured `iree-global-opt-propagate-linalg-transpose`
+at 0% when every transpose fused into an `i32` epilogue that had to run
+anyway. Those epilogues are now gone for 29 convolutions, so the premise
+looked different and it was re-run. It is not:
+
+| placement | 4-7 | 0-7 |
+|---|---:|---:|
+| shipped (29 requant / 5 accumulator) | 198.0 ms | 172.0 ms |
+| + propagation, after the fusion pass | 196.0 ms | 175.5 ms |
+
+-1.0% and **+2.0%**, six interleaved passes each, and it costs the classifier
+matmul its offload exactly as P8 recorded (propagation folds the constant RHS
+transpose into the matmul's indexing maps). Running it *before* the fusion
+pass is worse still: it rearranges the epilogue chain enough that
+`rocket-fuse-int8-requant-epilogue` declines, and placement inverts to 5
+requantized / 29 accumulator. The transposes remain fused into elementwise
+passes that run regardless. **Do not spend on this a third time.**
+
+**What the CPU is actually doing**, 93 dispatch sites in the shipped build,
+by kind:
+
+| count | kind |
+|---:|---|
+| 13 | `elementwise_i32xi32xi32xi8` |
+| 12 | `elementwise_transpose_i8` |
+| 10 | `slow_memcpy` |
+| 9 | `elementwise_i8` |
+| 5 | `transpose_i8` |
+
+The largest category is **one `i32` epilogue per depthwise convolution**. All
+13 depthwise convolutions are still on the `int8_accumulator` path, so each
+one materializes an `i32` activation tensor and requantizes it on the CPU --
+the exact cost the dense path just shed for a 28% win. That is the next lever,
+and the HAL already accepts `Precision::Int8` for depthwise
+(`depthwise_accepts_only_the_measured_element_widths`), so the missing pieces
+are a hardware probe, a requantized depthwise executable target and matcher,
+and extending the fusion pass to `linalg.depthwise_conv_2d_nhwc_hwc`. No
+depthwise knob exists in `dtype_boundary_probe` yet, so the probe is new code.
+
 ### Cin 1344 is exact in every isolated test and wrong inside the model
 
 Open, 2026-09-06. Raising the requantized matchers' `Cin` bound from 512 to
