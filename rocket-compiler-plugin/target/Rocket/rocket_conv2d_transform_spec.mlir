@@ -449,6 +449,42 @@
   runtime_quantization = ["output_scale", "output_zero_point"]
 }>
 
+// Requantized int8 depthwise: the same trade the dense requantized target
+// makes, for the op that needs it most. All 13 of MobileNetV2's offloaded
+// depthwise convolutions were on `int8_accumulator`, so each returned `i32`
+// and had its requantization run as a CPU pass over a full activation tensor
+// -- one `elementwise_i32xi32xi32xi8` per layer, the largest single category
+// of CPU dispatch left in the model after the dense path was converted.
+//
+// Hardware-validated before any of this was written
+// (`conv_depthwise_requant_hw.rs`): bit-exact at Cin 64 and 128 and at
+// MobileNetV2's own 48, 144, 192 and 288, 884736 elements with none wrong.
+// That test also settles the output layout question -- a requantized
+// depthwise writes 16-byte atoms, not the 256-byte ones the accumulator
+// path's depthwise uses.
+//
+// Stride 1 only, deliberately. That is what the 13 offloaded depthwise
+// convolutions use; the model's stride-2 depthwise layers do not reach a
+// Rocket matcher today at all, so a stride-2 requantized target would be
+// dead weight until they do.
+#rocket_dynamic_depthwise_int8_requant_target = #hal.executable.target<"rocket", "rocket-flatbuffer-v1", {
+  kernel = "conv2d",
+  input_width = 0 : i32, input_height = 0 : i32, input_channels = 0 : i32,
+  output_width = 0 : i32, output_height = 0 : i32, output_channels = 0 : i32,
+  weights_width = 0 : i32, weights_height = 0 : i32, stride = 1 : i32,
+  depthwise = true,
+  input_zero_point = 0 : i32, output_zero_point = 0 : i32, weights_zero_point = 0 : i32,
+  input_scale = 1.0 : f32, weights_scale = 1.0 : f32, output_scale = 0.0 : f32,
+  truncate_bits = 0 : i32,
+  activation = "none", activation_cmp = 0 : i32,
+  precision = "int8",
+  runtime_dimensions = [
+    "input_width", "input_height", "input_channels",
+    "output_channels", "weights_width", "weights_height"
+  ],
+  runtime_quantization = ["output_scale", "output_zero_point"]
+}>
+
 #dynamic_pipeline_layout = #hal.pipeline.layout<constants = 6, bindings = [
   #hal.pipeline.binding<storage_buffer, ReadOnly>,
   #hal.pipeline.binding<storage_buffer, ReadOnly>,
@@ -687,6 +723,20 @@ module attributes {transform.with_named_sequence} {
       }
       builtin.module {
         func.func @rocket_dynamic_conv2d() {
+          return
+        }
+      }
+    }
+  }
+
+  hal.executable private @rocket_dynamic_depthwise_int8_requant_executable {
+    hal.executable.variant public @rocket_dynamic_depthwise_conv2d_v1 target(#rocket_dynamic_depthwise_int8_requant_target) {
+      hal.executable.export public @rocket_dynamic_depthwise_conv2d ordinal(0) layout(#dynamic_requant_pipeline_layout) count(%device: !hal.device, %workload: index) -> (index, index, index) {
+        %c1 = arith.constant 1 : index
+        hal.return %c1, %c1, %c1 : index, index, index
+      }
+      builtin.module {
+        func.func @rocket_dynamic_depthwise_conv2d() {
           return
         }
       }
@@ -3606,6 +3656,77 @@ module attributes {transform.with_named_sequence} {
     util.return %quantized : tensor<1x?x?x?xi8>
   }
 
+  // Requantized depthwise. Unlike @call_rocket_dynamic_depthwise_conv2d_int8
+  // there is no epilogue at all below the dispatch: the DPU's BS plane adds
+  // the per-channel bias and its out-convert stage applies the multiplier and
+  // output zero point, so what comes back is the final `i8` tensor. That
+  // missing epilogue is the whole point -- it is one full-size `i32` pass per
+  // depthwise layer that stops existing.
+  //
+  // The HWC -> CHW filter transpose stays, because it is the layout
+  // `pack_depthwise_to_rocket_weights` reads and it const-evals away over a
+  // constant filter.
+  util.func private @call_rocket_dynamic_depthwise_conv2d_int8_requant(
+      %input: tensor<1x?x?x?xi8>,
+      %filter: tensor<?x?x?xi8>,
+      %acc_init: tensor<1x?x?x?xi32>,
+      %bias: tensor<?xi32>,
+      %output_scale: f32,
+      %output_zero_point: i32,
+      %int8_min: f32,
+      %int8_max: f32,
+      %init: tensor<1x?x?x?xi8>) -> tensor<1x?x?x?xi8> {
+    %c0 = arith.constant 0 : index
+    %c1 = arith.constant 1 : index
+    %c2 = arith.constant 2 : index
+    %c3 = arith.constant 3 : index
+
+    %input_height = tensor.dim %input, %c1 : tensor<1x?x?x?xi8>
+    %input_width = tensor.dim %input, %c2 : tensor<1x?x?x?xi8>
+    %input_channels = tensor.dim %input, %c3 : tensor<1x?x?x?xi8>
+    %weights_height = tensor.dim %filter, %c0 : tensor<?x?x?xi8>
+    %weights_width = tensor.dim %filter, %c1 : tensor<?x?x?xi8>
+    %output_height = tensor.dim %init, %c1 : tensor<1x?x?x?xi8>
+    %output_width = tensor.dim %init, %c2 : tensor<1x?x?x?xi8>
+    %output_channels = tensor.dim %init, %c3 : tensor<1x?x?x?xi8>
+
+    %input_width_i32 = arith.index_cast %input_width : index to i32
+    %input_height_i32 = arith.index_cast %input_height : index to i32
+    %input_channels_i32 = arith.index_cast %input_channels : index to i32
+    %output_channels_i32 = arith.index_cast %output_channels : index to i32
+    %weights_width_i32 = arith.index_cast %weights_width : index to i32
+    %weights_height_i32 = arith.index_cast %weights_height : index to i32
+
+    // Same reciprocal convention as the dense requantized shim: the IR keeps
+    // the multiplier a reader of the convolution would write, and the schema
+    // field is the output scale the driver divides into `input_scale *
+    // weights_scale`, both held at 1.0 by the target.
+    %one = arith.constant 1.000000e+00 : f32
+    %schema_output_scale = arith.divf %one, %output_scale : f32
+    %output_scale_i32 = arith.bitcast %schema_output_scale : f32 to i32
+
+    %filter_chw_empty = tensor.empty(%input_channels, %weights_height, %weights_width) : tensor<?x?x?xi8>
+    %filter_chw = linalg.transpose
+        ins(%filter : tensor<?x?x?xi8>)
+        outs(%filter_chw_empty : tensor<?x?x?xi8>)
+        permutation = [2, 0, 1]
+
+    %quantized = flow.dispatch
+        @rocket_dynamic_depthwise_int8_requant_executable::@rocket_dynamic_depthwise_conv2d_v1::@rocket_dynamic_depthwise_conv2d(
+          %input_width_i32, %input_height_i32, %input_channels_i32,
+          %output_channels_i32, %weights_width_i32, %weights_height_i32,
+          %output_scale_i32, %output_zero_point,
+          %input, %filter_chw, %bias)
+        {stream.affinity = #hal.device.affinity<@rocket_device>}
+        : (i32, i32, i32, i32, i32, i32, i32, i32,
+           tensor<1x?x?x?xi8>{%input_height, %input_width, %input_channels},
+           tensor<?x?x?xi8>{%input_channels, %weights_height, %weights_width},
+           tensor<?xi32>{%output_channels})
+        -> tensor<1x?x?x?xi8>{%output_height, %output_width, %output_channels}
+
+    util.return %quantized : tensor<1x?x?x?xi8>
+  }
+
   // int8 counterpart of call_rocket_dynamic_depthwise_conv2d.
   util.func private @call_rocket_dynamic_depthwise_conv2d_int8(
       %input: tensor<1x?x?x?xi8>,
@@ -5521,6 +5642,178 @@ module attributes {transform.with_named_sequence} {
     transform.yield %ins, %outs : !transform.any_value, !transform.any_value
   }
 
+  // The depthwise twin of @match_dynamic_conv2d_int8_requant. Same epilogue,
+  // same canonical form, a different convolution op and a rank-3 filter.
+  //
+  // `Cout` carries no lower bound here, unlike the dense requantized
+  // matchers. That bound exists because dense `Cout` 24 is wrong on hardware;
+  // a depthwise convolution's `Cout` is its `Cin`, and
+  // `conv_depthwise_requant_hw.rs` measures 48 exact, which is the narrowest
+  // MobileNetV2 asks for. The upper bound is the depthwise coefficient
+  // model's own 1344, shared with the accumulator depthwise matchers.
+  transform.named_sequence @match_dynamic_depthwise_conv2d_int8_requant(
+      %root: !transform.any_op {transform.readonly})
+      -> (!transform.any_value, !transform.any_value) {
+    transform.match.operation_name %root ["linalg.generic"] : !transform.any_op
+    %conv = transform.get_producer_of_operand %root[0]
+        : (!transform.any_op) -> !transform.any_op
+    transform.match.operation_name %conv ["linalg.depthwise_conv_2d_nhwc_hwc"] : !transform.any_op
+    %batch, %out_img, %out_ch, %filter, %in_ch, %depth, %strides, %dilations =
+        transform.iree.match.convolution %conv,
+          lhs_type = i8, rhs_type = i8, output_type = i32
+          : !transform.any_op -> !transform.param<i64>
+    transform.iree.match.dims_equal %batch, [1] : !transform.param<i64>
+    transform.iree.match.dims_equal %out_img, [-1, -1] : !transform.param<i64>
+    transform.iree.match.dims_equal %out_ch, [] : !transform.param<i64>
+    transform.iree.match.dims_equal %filter, [1, 1] : !transform.param<i64>
+    transform.iree.match.dims_equal %in_ch, [] : !transform.param<i64>
+    transform.iree.match.dims_equal %depth, [-1] : !transform.param<i64>
+    transform.iree.match.dims_equal %strides, [1, 1] : !transform.param<i64>
+    transform.iree.match.dims_equal %dilations, [1, 1] : !transform.param<i64>
+
+    %input_value = transform.get_operand %conv[0] : (!transform.any_op) -> !transform.any_value
+    transform.iree.match.dim_bounds %input_value[3], umin = 1, umax = 1344 : !transform.any_value
+
+    %ins, %outs = transform.iree.match.cast_compatible_dag_from_root %root {
+      ^bb0(%input: tensor<1x?x?x?xi8>, %weights: tensor<?x?x?xi8>,
+           %acc_init: tensor<1x?x?x?xi32>, %bias: tensor<?xi32>,
+           %output_scale: f32, %output_zero_point: i32,
+           %int8_min: f32, %int8_max: f32,
+           %out_init: tensor<1x?x?x?xi8>):
+        %accumulator = linalg.depthwise_conv_2d_nhwc_hwc
+            {dilations = dense<1> : tensor<2xi64>, strides = dense<1> : tensor<2xi64>}
+            ins(%input, %weights : tensor<1x?x?x?xi8>, tensor<?x?x?xi8>)
+            outs(%acc_init : tensor<1x?x?x?xi32>) -> tensor<1x?x?x?xi32>
+        %quantized = linalg.generic {
+            indexing_maps = [affine_map<(d0, d1, d2, d3) -> (d0, d1, d2, d3)>,
+                             affine_map<(d0, d1, d2, d3) -> (d3)>,
+                             affine_map<(d0, d1, d2, d3) -> ()>,
+                             affine_map<(d0, d1, d2, d3) -> ()>,
+                             affine_map<(d0, d1, d2, d3) -> ()>,
+                             affine_map<(d0, d1, d2, d3) -> ()>,
+                             affine_map<(d0, d1, d2, d3) -> (d0, d1, d2, d3)>],
+            iterator_types = ["parallel", "parallel", "parallel", "parallel"]}
+            ins(%accumulator, %bias, %output_scale, %output_zero_point,
+                %int8_min, %int8_max
+                : tensor<1x?x?x?xi32>, tensor<?xi32>, f32, i32, f32, f32)
+            outs(%out_init : tensor<1x?x?x?xi8>) {
+          ^bb1(%raw: i32, %channel_bias: i32, %scale: f32, %zero_point: i32,
+               %low: f32, %high: f32, %unused: i8):
+            %biased = arith.addi %raw, %channel_bias : i32
+            %real = arith.sitofp %biased : i32 to f32
+            %scaled = arith.mulf %real, %scale : f32
+            %rounded = math.roundeven %scaled : f32
+            %zero_point_f32 = arith.sitofp %zero_point : i32 to f32
+            %offset = arith.addf %rounded, %zero_point_f32 : f32
+            %low_clamped = arith.maximumf %offset, %low : f32
+            %clamped = arith.minimumf %low_clamped, %high : f32
+            %narrowed = arith.fptosi %clamped : f32 to i8
+            linalg.yield %narrowed : i8
+        } -> tensor<1x?x?x?xi8>
+    } : (!transform.any_op) -> (!transform.any_value, !transform.any_value)
+    transform.yield %ins, %outs : !transform.any_value, !transform.any_value
+  }
+
+  // 3x3 counterpart, spelled out as its own matcher rather than widening the
+  // kernel check to 1..=3, matching how every other kernel variant in this
+  // file is written -- 2x2 and non-square combinations route through
+  // different ConvPlan partitions and must never be claimed by accident.
+  //
+  // This is the one that matters for a real model: every depthwise
+  // convolution in MobileNetV2 is 3x3. Writing only the 1x1 variant first was
+  // a silent no-op -- the matcher declined every convolution in the model and
+  // the accumulator matchers picked them up again, which looks exactly like
+  // the matcher not existing.
+  //
+  // `Cout` carries no lower bound here, unlike the dense requantized
+  // matchers. That bound exists because dense `Cout` 24 is wrong on hardware;
+  // a depthwise convolution's `Cout` is its `Cin`, and
+  // `conv_depthwise_requant_hw.rs` measures 48 exact, which is the narrowest
+  // MobileNetV2 asks for. The upper bound is the depthwise coefficient
+  // model's own 1344, shared with the accumulator depthwise matchers.
+  transform.named_sequence @match_dynamic_depthwise_conv2d_3x3_int8_requant(
+      %root: !transform.any_op {transform.readonly})
+      -> (!transform.any_value, !transform.any_value) {
+    transform.match.operation_name %root ["linalg.generic"] : !transform.any_op
+    %conv = transform.get_producer_of_operand %root[0]
+        : (!transform.any_op) -> !transform.any_op
+    transform.match.operation_name %conv ["linalg.depthwise_conv_2d_nhwc_hwc"] : !transform.any_op
+    %batch, %out_img, %out_ch, %filter, %in_ch, %depth, %strides, %dilations =
+        transform.iree.match.convolution %conv,
+          lhs_type = i8, rhs_type = i8, output_type = i32
+          : !transform.any_op -> !transform.param<i64>
+    transform.iree.match.dims_equal %batch, [1] : !transform.param<i64>
+    transform.iree.match.dims_equal %out_img, [-1, -1] : !transform.param<i64>
+    transform.iree.match.dims_equal %out_ch, [] : !transform.param<i64>
+    transform.iree.match.dims_equal %filter, [3, 3] : !transform.param<i64>
+    transform.iree.match.dims_equal %in_ch, [] : !transform.param<i64>
+    transform.iree.match.dims_equal %depth, [-1] : !transform.param<i64>
+    transform.iree.match.dims_equal %strides, [1, 1] : !transform.param<i64>
+    transform.iree.match.dims_equal %dilations, [1, 1] : !transform.param<i64>
+
+    %input_value = transform.get_operand %conv[0] : (!transform.any_op) -> !transform.any_value
+    transform.iree.match.dim_bounds %input_value[3], umin = 1, umax = 1344 : !transform.any_value
+
+    %ins, %outs = transform.iree.match.cast_compatible_dag_from_root %root {
+      ^bb0(%input: tensor<1x?x?x?xi8>, %weights: tensor<?x?x?xi8>,
+           %acc_init: tensor<1x?x?x?xi32>, %bias: tensor<?xi32>,
+           %output_scale: f32, %output_zero_point: i32,
+           %int8_min: f32, %int8_max: f32,
+           %out_init: tensor<1x?x?x?xi8>):
+        %accumulator = linalg.depthwise_conv_2d_nhwc_hwc
+            {dilations = dense<1> : tensor<2xi64>, strides = dense<1> : tensor<2xi64>}
+            ins(%input, %weights : tensor<1x?x?x?xi8>, tensor<?x?x?xi8>)
+            outs(%acc_init : tensor<1x?x?x?xi32>) -> tensor<1x?x?x?xi32>
+        %quantized = linalg.generic {
+            indexing_maps = [affine_map<(d0, d1, d2, d3) -> (d0, d1, d2, d3)>,
+                             affine_map<(d0, d1, d2, d3) -> (d3)>,
+                             affine_map<(d0, d1, d2, d3) -> ()>,
+                             affine_map<(d0, d1, d2, d3) -> ()>,
+                             affine_map<(d0, d1, d2, d3) -> ()>,
+                             affine_map<(d0, d1, d2, d3) -> ()>,
+                             affine_map<(d0, d1, d2, d3) -> (d0, d1, d2, d3)>],
+            iterator_types = ["parallel", "parallel", "parallel", "parallel"]}
+            ins(%accumulator, %bias, %output_scale, %output_zero_point,
+                %int8_min, %int8_max
+                : tensor<1x?x?x?xi32>, tensor<?xi32>, f32, i32, f32, f32)
+            outs(%out_init : tensor<1x?x?x?xi8>) {
+          ^bb1(%raw: i32, %channel_bias: i32, %scale: f32, %zero_point: i32,
+               %low: f32, %high: f32, %unused: i8):
+            %biased = arith.addi %raw, %channel_bias : i32
+            %real = arith.sitofp %biased : i32 to f32
+            %scaled = arith.mulf %real, %scale : f32
+            %rounded = math.roundeven %scaled : f32
+            %zero_point_f32 = arith.sitofp %zero_point : i32 to f32
+            %offset = arith.addf %rounded, %zero_point_f32 : f32
+            %low_clamped = arith.maximumf %offset, %low : f32
+            %clamped = arith.minimumf %low_clamped, %high : f32
+            %narrowed = arith.fptosi %clamped : f32 to i8
+            linalg.yield %narrowed : i8
+        } -> tensor<1x?x?x?xi8>
+    } : (!transform.any_op) -> (!transform.any_value, !transform.any_value)
+    transform.yield %ins, %outs : !transform.any_value, !transform.any_value
+  }
+
+  // The depthwise rewriter. Same shape as the dense one, importing the
+  // depthwise executable and shim instead.
+  transform.named_sequence @cast_and_call_dynamic_depthwise_conv2d_int8_requant(
+      %ins: !transform.any_value {transform.readonly},
+      %out: !transform.any_value {transform.readonly}) {
+    %root = transform.get_defining_op %out : (!transform.any_value) -> !transform.any_op
+    %module = transform.util.get_nearest_symbol_table %root : (!transform.any_op) -> !transform.any_op
+    %topology_attr = transform.param.constant #hal.device.topology<links = [
+        (@rocket_device -> @cpu_device = {transparent_access = true, unified_memory = true}),
+        (@cpu_device -> @rocket_device = {transparent_access = true, unified_memory = true})
+      ]> -> !transform.any_param
+    transform.annotate %module "stream.topology" = %topology_attr : !transform.any_op, !transform.any_param
+    %executable = transform.util.import_symbol @rocket_dynamic_depthwise_int8_requant_executable into %module if undefined : (!transform.any_op) -> !transform.any_op
+    %func = transform.util.import_symbol @call_rocket_dynamic_depthwise_conv2d_int8_requant into %module if undefined : (!transform.any_op) -> !transform.any_op
+    transform.util.cast_and_call %func(%ins) -> %out after %root {
+          transform.type_conversion.tensor.cast_shape_dynamic_dims
+      } : (!transform.any_op, !transform.any_value, !transform.any_value, !transform.any_op) -> !transform.any_op
+    transform.yield
+  }
+
   // Shared by both requantized matchers. Unlike the other rewriters here it
   // takes the matched DAG's inputs and output rather than the root op: the
   // call replaces a two-op subgraph, so the values are what identify it.
@@ -5758,7 +6051,9 @@ module attributes {transform.with_named_sequence} {
       ^bb0(%requant_func: !transform.any_op):
         %matched_func = transform.foreach_match in %requant_func
             @match_dynamic_conv2d_int8_requant -> @cast_and_call_dynamic_conv2d_int8_requant,
-            @match_dynamic_conv2d_3x3_int8_requant -> @cast_and_call_dynamic_conv2d_int8_requant
+            @match_dynamic_conv2d_3x3_int8_requant -> @cast_and_call_dynamic_conv2d_int8_requant,
+            @match_dynamic_depthwise_conv2d_int8_requant -> @cast_and_call_dynamic_depthwise_conv2d_int8_requant,
+            @match_dynamic_depthwise_conv2d_3x3_int8_requant -> @cast_and_call_dynamic_depthwise_conv2d_int8_requant
           : (!transform.any_op) -> (!transform.any_op)
         // `cast_and_call` rewires uses; it does not erase what it replaced.
         // Without this the convolution and its epilogue are still standing

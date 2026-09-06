@@ -317,8 +317,8 @@ static Value matchWeightSum(Value candidate, Value convFilter) {
 
 /// Walks a convolution's consumers and recovers the epilogue, or returns
 /// nullopt at the first thing that does not fit.
-static std::optional<RequantEpilogue>
-matchEpilogue(linalg::Conv2DNhwcHwcfOp convOp) {
+template <typename ConvOp>
+static std::optional<RequantEpilogue> matchEpilogue(ConvOp convOp) {
   RequantEpilogue found;
 
   // The init carries the bias, or is a plain zero fill.
@@ -474,11 +474,21 @@ static Value buildFoldedBias(PatternRewriter &rewriter, Location loc,
 }
 
 /// Rewrites one convolution and its epilogue into the canonical form.
-struct FuseInt8RequantEpilogue
-    : public OpRewritePattern<linalg::Conv2DNhwcHwcfOp> {
-  using OpRewritePattern::OpRewritePattern;
+/// Rewrites one convolution and its epilogue into the canonical form.
+///
+/// Templated over the convolution op because dense and depthwise differ in
+/// nothing this rewrite touches: both take (input, filter) with the filter
+/// second, both accumulate `i32` into a single init, both produce NHWC, and
+/// `quantized-conv-to-conv` gives both the identical five-op epilogue. The
+/// depthwise filter reduction is over `[kh, kw]` rather than `[kh, kw, cin]`,
+/// which changes the reduction's indexing maps and not its body, and
+/// `matchWeightSum` checks the body and the operand identity rather than the
+/// maps.
+template <typename ConvOp>
+struct FuseInt8RequantEpilogue : public OpRewritePattern<ConvOp> {
+  using OpRewritePattern<ConvOp>::OpRewritePattern;
 
-  LogicalResult matchAndRewrite(linalg::Conv2DNhwcHwcfOp convOp,
+  LogicalResult matchAndRewrite(ConvOp convOp,
                                 PatternRewriter &rewriter) const override {
     auto accType = dyn_cast<RankedTensorType>(convOp.getResult(0).getType());
     if (!accType || !accType.getElementType().isSignlessInteger(32)) {
@@ -527,10 +537,10 @@ struct FuseInt8RequantEpilogue
     // which reaches the matcher with `tensor` and matches, while the model
     // reached it with `vector` and did not.
     auto attrType = RankedTensorType::get({2}, rewriter.getIntegerType(64));
-    SmallVector<int64_t> strideValues(convOp.getStrides().getValues<int64_t>());
+    SmallVector<int64_t> strideValues(convOp.getStrides().template getValues<int64_t>());
     SmallVector<int64_t> dilationValues(
-        convOp.getDilations().getValues<int64_t>());
-    auto fusedConv = linalg::Conv2DNhwcHwcfOp::create(
+        convOp.getDilations().template getValues<int64_t>());
+    auto fusedConv = ConvOp::create(
         rewriter, loc, TypeRange{accType}, convOp.getDpsInputs(),
         ValueRange{accInit},
         DenseIntElementsAttr::get(attrType, strideValues),
@@ -654,7 +664,9 @@ struct RocketFuseInt8RequantEpiloguePass
   void runOnOperation() final {
     MLIRContext *context = &getContext();
     RewritePatternSet patterns(context);
-    patterns.add<FuseInt8RequantEpilogue>(context);
+    patterns.add<FuseInt8RequantEpilogue<linalg::Conv2DNhwcHwcfOp>,
+                 FuseInt8RequantEpilogue<linalg::DepthwiseConv2DNhwcHwcOp>>(
+        context);
     if (failed(applyPatternsGreedily(getOperation(), std::move(patterns)))) {
       return signalPassFailure();
     }
