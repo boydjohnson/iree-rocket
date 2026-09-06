@@ -59,7 +59,7 @@ operations that no compiled `.vmfb` can reach:
 | Capability | Builder | Hardware test |
 |---|---|---|
 | 9 LUT curves: sigmoid, tanh, exp, square, erf, sqrt, rsqrt, log, reciprocal | [`activation.rs`](iree-rocket-hal/src/rocket/activation.rs) `build_lut_regcmd` | `lut_hw`, `lut_exp_hw`, `lut_erf_hw`, `lut_sqrt_hw`, `lut_rsqrt_hw`, `lut_log_hw`, `lut_reciprocal_hw`, `ew_square_hw` |
-| EW binary add / subtract | [`elementwise.rs`](iree-rocket-hal/src/rocket/elementwise.rs) `build_add_regcmd` | `conv_with_add_hw` |
+| EW binary add / subtract / **multiply** / max / min, standalone or chained | [`elementwise.rs`](iree-rocket-hal/src/rocket/elementwise.rs) `build_add_regcmd`, `EwBinaryOp` | `ew_binary_hw` (all five, bit-exact), `conv_with_add_hw` |
 | EW unary abs / neg / floor / ceil, and add-with-scalar | `elementwise.rs` `build_unary_regcmd` | `ew_unary_hw`, `ew_round_hw` |
 | conv → LUT as two tasks in one job | `activation.rs` `build_conv_then_lut_regcmd` | `conv_then_lut_hw` |
 | conv → EW add as two tasks in one job | `elementwise.rs` `build_conv_then_add_regcmd` | `conv_with_add_hw` |
@@ -110,7 +110,7 @@ hardware oracle test.
 | New LUT, low risk -- monotone, bounded on a restricted domain, same self-derivation as `square`/`erf` | `exp2` `log2` `log10` `log1p` `expm1` `erfc` `cbrt` `atan` `asin` `acos` `atanh` | One table + one hw test each |
 | New LUT, harder -- needs range reduction, or has no output ceiling to bound the table against | `sin` `cos` `tan` `sinh` `cosh` `asinh` `acosh` | Domain design first |
 | Composable | `clampf` (the existing RELUX activation, or EW max → min), `trunc` (sign-aware, needs a select), `sincos` (two tables, two results) | Case by case |
-| **Blocked on `mulf`** | `powf` `fpowi` `ipowi` `fma` `atan2` | See below |
+| Unblocked 2026-09-06 by `mulf` -- now composable rather than blocked | `powf` (`exp(b*log(a))`, two LUTs and a MUL) `fpowi` `ipowi` `fma` `atan2` | Composition + one hw test each |
 | No hardware path -- integer, bit-manipulation, or predicate-returning | `absi` `copysign` `ctlz` `cttz` `ctpop` `isfinite` `isinf` `isnan` `isnormal` | Refuse; document |
 
 ### `arith` -- roughly 11 of 55 reachable
@@ -122,7 +122,8 @@ The honest framing: `arith` ops are not tensor ops. They arrive inside
 | Class | Ops | Notes |
 |---|---|---|
 | EW ALU, hardware-confirmed opcodes | `addf` (algo 2), `subf` (4), `negf` (6) | `2` and `4` confirmed both precisions by the 47-model conv+add sweep; `5`/`6`/`7`/`8` confirmed by `ew_unary_hw`'s CPU-oracle tests |
-| EW ALU, TRM-documented but **untested in this repo** | `maximumf`/`maxnumf` (algo 0), `minimumf`/`minnumf` (1), `divf` (3) | Needs a hardware oracle test before anything depends on it, same bar the unary opcodes cleared |
+| EW ALU, hardware-confirmed 2026-09-06 | `maximumf`/`maxnumf` (algo 0), `minimumf`/`minnumf` (1), `mulf` (the MUL sub-unit, not the ALU) | `tests/ew_binary_hw.rs`, fp16, bit-exact over non-uniform operands |
+| EW ALU, TRM-documented but **untested in this repo** | `divf` (algo 3) | Needs a hardware oracle test before anything depends on it, same bar the other opcodes cleared |
 | Already handled elsewhere | `constant` → `RecordedOp::Fill`; `extf`/`truncf` → the packer's job, fold into an adjacent dispatch rather than offload | No new work |
 | No hardware path | ~35 integer and predicate ops: `andi` `ori` `xori` `shli` `shrsi` `shrui` `divsi` `divui` `remsi` `remui` `cmpi` `cmpf` `select` `extui` `extsi` `sitofp` `fptosi` `index_cast` `bitcast` … | Refuse; document |
 
@@ -134,8 +135,10 @@ menu.**
 
 - **Reachable**: `copy` `exp` `log` `abs` `ceil` `floor` `negf` `reciprocal`
   `round` `sqrt` `rsqrt` `square` `tanh` `erf` `add` `sub` `div` `max` `min`
-- **Blocked**: `mul` (see below), `powf` (needs `mul`), `select` (needs a
-  predicate), `div_unsigned` (integer)
+  `mul` (unblocked 2026-09-06, see below)
+- **Blocked**: `select` (needs a predicate), `div_unsigned` (integer).
+  `powf` is no longer blocked, but it is a composition (`exp(b*log(a))`),
+  not a single hardware op
 
 Matchers must cover `linalg.elementwise` (the unified `ElementwiseKind` op) and
 `linalg.map` alongside the named ops, because upstream canonicalization moves
@@ -146,25 +149,77 @@ where `linalg-specialize-generic-ops` has to be re-run after
 Beyond element-wise, `linalg` also offers three things reachable with no HAL
 work at all -- see Phase 0.
 
-### `arith.mulf` is the single biggest blocker
+### ~~`arith.mulf` is the single biggest blocker~~ -- RESOLVED 2026-09-06
 
-Unblocking it opens `powf`, `fma`, `atan2`, `linalg.mul` and softmax scaling in
-one move. It is currently blocked by a **known, unresolved hardware failure**
-recorded in
-[`ew_square_hw.rs`](iree-rocket-hal/tests/ew_square_hw.rs):
+**`mulf` works. It was one register field, and the recorded failure was a
+red herring.**
 
-> A prior attempt used DPU MUL mode with ERDMA self-aliased to the primary input
-> address (`build_square_regcmd`, since removed from `elementwise.rs`) --
-> hardware-confirmed to produce all-zero output for every input, root cause not
-> resolved.
+The claim this section used to make was that `arith.mulf` is blocked by a
+known, unresolved hardware failure recorded in
+[`ew_square_hw.rs`](iree-rocket-hal/tests/ew_square_hw.rs): a prior
+`build_square_regcmd` used DPU MUL mode with ERDMA self-aliased to the
+primary input address and produced all-zero output for every input. That
+note also said the failing configuration was specifically the *self-aliased*
+one and that a genuine two-tensor MUL through ERDMA's ordinary path had
+never been tried.
 
-`square` was shipped as a LUT instead, which was the right call for that op and
-leaves the general case untouched. Note the failing configuration is
-specifically the *self-aliased* one; a genuine two-tensor MUL through ERDMA's
-ordinary path -- the configuration `build_add_regcmd` already uses successfully
-for algo 2 and 4 -- has never been tried. That makes this a bounded
-investigation, not open-ended reverse engineering, and it should run before the
-breadth work rather than after.
+It has now been tried, and it works. `EwBinaryOp::Mul` in
+[`elementwise.rs`](iree-rocket-hal/src/rocket/elementwise.rs) selects the EW
+core's MUL sub-unit instead of its ALU -- `ew_op_type=1`, `ew_alu_algo`
+cleared, `ew_op_cvt_bypass=1`, everything else byte-identical to the
+already-shipping add -- and
+[`ew_binary_hw.rs`](iree-rocket-hal/tests/ew_binary_hw.rs) measures it on
+`planck` as **bit-exact against a host oracle**, over operands that are
+distinct at every element, across four cube shapes (4x4x16, 3x3x16 -- below
+the builder's own `EW_SURF_STRIDE` floor of 12 -- 7x5x24, and 14x14x64, an
+8-surface cube of 12544 elements). No tolerance: `==`.
+
+The same round confirmed four other things worth recording, because each one
+was carrying an "untested"/"unconfirmed" label somewhere in this repo:
+
+| Claim | Status before | Status now |
+|---|---|---|
+| `EwBinaryOp::Mul` (`ew_op_type=1`) | Believed hardware-dead | Bit-exact, 4 geometries |
+| `Max`/`Min` (`ew_alu_algo` 0/1) | TRM-documented, untested | Bit-exact |
+| `build_add_regcmd` standalone, no producing conv | "Would reuse ... directly", never run | Bit-exact, all five ops |
+| `build_add_regcmd`/`build_conv_then_add_regcmd` on silicon at all | "NOT YET RUN ON REAL HARDWARE" | Both files green on `planck` |
+
+**Two lessons about the evidence, both worth more than the result.**
+
+*The recorded failure never applied.* `build_square_regcmd` aliased ERDMA to
+the input, so the MUL's two operands were the same buffer -- there was never
+a second tensor. That is one configuration of one op; it says nothing about
+MUL as such, and this section read it as a hardware limit for months.
+
+*The independent reference stack is wrong here, and following it would have
+cost the whole investigation.* `../rocket-userspace` states plainly, in
+`rocket_activation.c`, `API.md` and `tests/ew_mul_rocket.c`, that this NPU's
+EW unit reads its second operand *only* combined with a conv/CACC main feed
+(ERDMA `EW_BASE` + MRDMA `SRC_BASE` + `COMB_USE(5)`), and that "a pure
+flying-MRDMA-main + ERDMA-operand pair reads the operand as 0". Its whole
+element-wise runtime is built around that belief: every binary op goes
+through an **identity matmul** to manufacture a conv main feed. On the
+register program in this repo that is simply not so -- `COMB_USE` is 0 here,
+`SURF_NOTCH`/`EW_SURF_NOTCH` are 0, the main feed is a plain flying MRDMA
+read from memory, and the operand is fetched correctly for every position of
+an 8-surface cube. Taking the reference at its word would have meant
+building an identity-matmul path and never testing the one-field change that
+actually works. The standing advice to diff against that
+emitter still holds; this is the counter-example that says diff, do not
+obey.
+
+**What this unblocks, and what it does not.** `linalg.mul`, `powf` (as
+`exp(b*log(a))`, two existing LUTs and a MUL), `fma`, `atan2` and softmax
+scaling are all now expressible. None of that is free throughput: an
+element-wise MUL is exactly the kind of op P8's law puts on the wrong side
+of the dispatch-tax line, so its matcher belongs behind a flag like the rest
+of Phase 1/2, and the fusion story (Phase 3) is still where the performance
+is.
+
+**What is still open.** int8 MUL is a loud refusal in the builder, not a
+measurement -- the EW/OUT `_CVT` scale semantics for a multiply are not in
+any capture this repo has. `divf` (`ew_alu_algo=3`) remains the one
+TRM-documented binary opcode with no hardware evidence.
 
 ---
 
@@ -424,9 +479,10 @@ service the existing "two menus" section performs for precisions.
 
 ## Recommended order
 
-**~~Phase 0~~ → `mulf` investigation → Phase 3 → C5 → Phase 1 → Phase 2.**
+**~~Phase 0~~ → ~~`mulf` investigation~~ → ~~Phase 3~~ → C5 → Phase 1 → Phase 2.**
 
-Phase 0 is done and board-validated; the rest stands.
+Phase 0, the `mulf` investigation and Phase 3 are done and board-validated;
+the rest stands.
 
 **Phase 0 produced the first counter-example to the warning above, and it is
 worth reading before Phases 1 and 2.** P8's law -- cost is flat per offloaded
@@ -446,8 +502,8 @@ back on the wrong side, which is what P8 lever #3 was really saying.
 | Step | Why here |
 |---|---|
 | ~~Phase 0~~ | Done 2026-09-05, and **measured**. MobileNetV2 and ViT are unaffected (dispatch-site counts identical). VGG's five `onnx.MaxPool` sites now offload and it is **1.26x faster** for it -- 1018 ms to 806 ms median, five interleaved passes. See below: this is the first counter-example to P8's law |
-| `mulf` | Highest-leverage single unblock; bounded (one untried ERDMA configuration), and its answer changes the scope of everything after it |
-| Phase 3 | The only phase with a positive throughput story, and it needs no new schema breadth |
+| ~~`mulf`~~ | Done 2026-09-06. It was bounded, and it was one register field: `EwBinaryOp::Mul` is bit-exact on `planck`, as are `Max` and `Min`. It changes the scope of Phases 1 and 2 by *removing* their only hardware unknown -- what is left there is matcher and wire-format work, not RE |
+| ~~Phase 3~~ | Done 2026-09-06 (#26), and it delivered the throughput story it was ranked for: MobileNetV2-static-int8 is **1.80x faster** than a like-for-like CPU build on a full machine and level with it at two cores, from 1.5x slower. The one prediction here that was wrong is "needs no new schema breadth" -- carrying per-convolution calibration to a shared executable took a new `Conv2DQuantParam` enum and a `runtime_quantization` vector on `Conv2DDef` |
 | C5 | Blocks both remaining phases by its own stated action item |
 | Phase 1 | Breadth: makes the validated HAL capability expressible |
 | Phase 2 | Breadth: new curves, the most additive and least urgent work here |
@@ -456,6 +512,13 @@ Phases 1 and 2 land their matchers **behind a flag**, with the `--no-offload`
 arm measured alongside on every model. P8's measurement stands until something
 displaces it: at the current per-dispatch cost, switching them on by default
 would make MobileNetV2 slower.
+
+Phase 3 moved that reference point and did not remove it. The int8 dispatch
+tax is much lower than it was -- the model beats the CPU now -- but what
+Phase 3 removed was `i32` activation traffic and unfused epilogues, which is
+not a cost a standalone element-wise matcher has in the first place. An
+element-wise op still does less work than its own dispatch costs, so the flag
+stands and the per-op bar above is still how to judge one.
 
 ## What this roadmap does not propose
 
