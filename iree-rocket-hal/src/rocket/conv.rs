@@ -1048,12 +1048,23 @@ impl Multiplier {
     ///
     /// Panics rather than saturating on a multiplier the form cannot carry:
     /// a silently clamped requantization scale is a whole-tensor error that
-    /// would be very hard to attribute later.
+    /// would be very hard to attribute later. Callers that receive a ratio
+    /// from outside the process -- a compiler-produced executable, a
+    /// dispatch's push constants -- want [`Multiplier::try_from_ratio`]
+    /// instead, so a bad one becomes a rejected dispatch rather than an
+    /// unwind across an `extern "C"` boundary.
     pub fn from_ratio(ratio: f64) -> Multiplier {
-        assert!(
-            ratio.is_finite() && ratio > 0.0,
-            "requantization multiplier must be finite and positive, got {ratio}"
-        );
+        match Multiplier::try_from_ratio(ratio) {
+            Ok(multiplier) => multiplier,
+            Err(reason) => panic!("{reason}: {ratio}"),
+        }
+    }
+
+    /// [`Multiplier::from_ratio`]'s fallible form.
+    pub fn try_from_ratio(ratio: f64) -> Result<Multiplier, &'static str> {
+        if !ratio.is_finite() || ratio <= 0.0 {
+            return Err("requantization multiplier must be finite and positive");
+        }
         // `scaled` is `ratio * 2^shift` throughout, driven into the mantissa
         // range. The exponent is signed while it is being searched for: a
         // multiplier above 1 normalizes to a shift below 14, and only the
@@ -1063,11 +1074,10 @@ impl Multiplier {
         while scaled < f64::from(MANTISSA_FLOOR) {
             scaled *= 2.0;
             shift += 1;
-            assert!(
-                shift <= MAX_CVT_SHIFT as i32,
-                "requantization multiplier {ratio} is too small to encode; \
-                 DPU_OUT_CVT_SHIFT tops out at {MAX_CVT_SHIFT}"
-            );
+            if shift > MAX_CVT_SHIFT as i32 {
+                return Err("requantization multiplier is too small to encode; \
+                     DPU_OUT_CVT_SHIFT tops out at 63");
+            }
         }
         while scaled >= f64::from(2 * MANTISSA_FLOOR) {
             scaled /= 2.0;
@@ -1079,15 +1089,14 @@ impl Multiplier {
             scale /= 2;
             shift -= 1;
         }
-        assert!(
-            shift >= 0,
-            "requantization multiplier {ratio} is too large to encode; \
-             DPU_OUT_CVT_SHIFT cannot be negative"
-        );
-        Multiplier {
+        if shift < 0 {
+            return Err("requantization multiplier is too large to encode; \
+                 DPU_OUT_CVT_SHIFT cannot be negative");
+        }
+        Ok(Multiplier {
             scale,
             shift: shift as u32,
-        }
+        })
     }
 
     /// Encodes the per-tensor half of a requantisation whose per-channel BS
@@ -1098,8 +1107,17 @@ impl Multiplier {
     /// contributes a gain of `2^(14 - 7)` that has to come back out here.
     /// Measured on hardware; see [`BS_MULTIPLIER_SHIFT`].
     pub fn for_unit_bs(total_ratio: f64) -> Multiplier {
+        match Multiplier::try_for_unit_bs(total_ratio) {
+            Ok(multiplier) => multiplier,
+            Err(reason) => panic!("{reason}: {total_ratio}"),
+        }
+    }
+
+    /// [`Multiplier::for_unit_bs`]'s fallible form, for a ratio that arrives
+    /// from outside the process.
+    pub fn try_for_unit_bs(total_ratio: f64) -> Result<Multiplier, &'static str> {
         let bs_gain = f64::from(BS_UNIT_MULTIPLIER >> BS_MULTIPLIER_SHIFT);
-        Multiplier::from_ratio(total_ratio / bs_gain)
+        Multiplier::try_from_ratio(total_ratio / bs_gain)
     }
 
     /// The real multiplier this pair encodes.

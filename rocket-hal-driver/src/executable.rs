@@ -21,7 +21,7 @@ use crate::{
     status,
 };
 use iree_rocket_hal::rocket::{
-    conv::{self, Kernels},
+    conv::{self, Kernels, Multiplier, Precision},
     executable_format::validate_conv_shape,
     fc,
     pooling::PoolingShape,
@@ -86,12 +86,72 @@ impl RuntimeConv2dDimension {
     }
 }
 
+/// A quantization parameter supplied by one uint32 dispatch push constant.
+///
+/// Separate from [`RuntimeConv2dDimension`] because the two have opposite
+/// rules about zero. No extent of a real convolution is zero, so a zero
+/// dimension constant means the adapter failed to push one and is rejected;
+/// zero is an ordinary zero point, so nothing about the *value* can say
+/// whether it was supplied. Only the list says who owns each field.
+///
+/// The push-constant payload is a bit pattern, not a number, because the
+/// schema fields are `uint32` and neither value fits that unsigned reading:
+/// `OutputScale` carries an IEEE-754 binary32 and the zero points carry
+/// two's-complement `i32`s. `Conv2DQuantParam` in
+/// `rocket_executable_def.fbs` is the statement of that convention;
+/// `RocketTarget.cpp`'s serializer is its other implementation.
+///
+/// There is no `InputScale`/`WeightsScale` here. The requantized int8 target
+/// holds both at 1.0 so `pack_int8_bias_to_bs` passes an already-accumulator-
+/// unit bias through untouched, which leaves `OutputScale` carrying the whole
+/// requantization ratio `output_scale / (input_scale * weights_scale)`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum RuntimeConv2dQuantParam {
+    OutputScale,
+    InputZeroPoint,
+    OutputZeroPoint,
+}
+
+impl RuntimeConv2dQuantParam {
+    fn index(self) -> usize {
+        match self {
+            Self::OutputScale => 0,
+            Self::InputZeroPoint => 1,
+            Self::OutputZeroPoint => 2,
+        }
+    }
+
+    /// The template value a listed parameter must hold, so an unsupplied
+    /// constant cannot pass for calibration data.
+    fn is_unset(self, quantization: &conv::Quantization) -> bool {
+        match self {
+            // The scale never survives decode as a sentinel -- `decode_precision`
+            // substitutes 1.0 for it to build a placeholder multiplier -- so
+            // the zero check lives in the serializer and there is nothing to
+            // re-check here.
+            Self::OutputScale => true,
+            Self::InputZeroPoint => quantization.input_zero_point == 0,
+            Self::OutputZeroPoint => quantization.output_zero_point == 0,
+        }
+    }
+
+    fn name(self) -> &'static str {
+        match self {
+            Self::OutputScale => "output_scale",
+            Self::InputZeroPoint => "input_zero_point",
+            Self::OutputZeroPoint => "output_zero_point",
+        }
+    }
+}
+
 /// Conv2D executable metadata before per-dispatch runtime dimensions resolve.
 #[derive(Clone, Debug, PartialEq)]
 pub struct Conv2dExecutable {
     pub shape_template: conv::Shape,
     pub kernels: Kernels,
     pub runtime_dimensions: Vec<RuntimeConv2dDimension>,
+    /// Consumed after every `runtime_dimensions` constant, in order.
+    pub runtime_quantization: Vec<RuntimeConv2dQuantParam>,
 }
 
 impl Conv2dExecutable {
@@ -100,6 +160,7 @@ impl Conv2dExecutable {
             shape_template: shape,
             kernels,
             runtime_dimensions: Vec::new(),
+            runtime_quantization: Vec::new(),
         }
     }
 
@@ -132,19 +193,51 @@ impl Conv2dExecutable {
             }
         }
 
-        if self.runtime_dimensions.is_empty() {
+        let mut seen_quantization = [false; 3];
+        for param in &self.runtime_quantization {
+            let index = param.index();
+            if seen_quantization[index] {
+                return Err("runtime Conv2D quantization parameters must be unique");
+            }
+            seen_quantization[index] = true;
+            match self.shape_template.precision {
+                // Only the requantized path has a stage to consume these:
+                // fp16 does not requantize, and the accumulator mode bypasses
+                // BS/CPEND/out-convert entirely and already demands zero zero
+                // points.
+                Precision::Int8(quantization) => {
+                    if !param.is_unset(&quantization) {
+                        return Err(
+                            "runtime Conv2D quantization parameters must be zero in the \
+                             executable template",
+                        );
+                    }
+                }
+                _ => {
+                    return Err("runtime Conv2D quantization parameters require int8 precision");
+                }
+            }
+        }
+
+        if self.runtime_dimensions.is_empty() && self.runtime_quantization.is_empty() {
             validate_conv_shape(&self.shape_template, self.kernels)?;
         }
         Ok(())
     }
 
-    /// Resolves runtime dimensions from native-endian uint32 push constants,
-    /// then performs the same authoritative validation as static executables.
+    /// Resolves runtime dimensions and quantization from native-endian uint32
+    /// push constants, then performs the same authoritative validation as
+    /// static executables.
+    ///
+    /// Dimensions come first and quantization parameters after, matching the
+    /// order `RocketTarget.cpp` counts them in when it checks a pipeline
+    /// layout's constant count against the target.
     pub fn resolve_shape(&self, constants: &[u8]) -> Result<(conv::Shape, Kernels), &'static str> {
         let expected_bytes = self
             .runtime_dimensions
             .len()
-            .checked_mul(std::mem::size_of::<u32>())
+            .checked_add(self.runtime_quantization.len())
+            .and_then(|count| count.checked_mul(std::mem::size_of::<u32>()))
             .ok_or("runtime Conv2D push-constant byte count overflow")?;
         if constants.len() != expected_bytes {
             return Err("runtime Conv2D push-constant byte count does not match the executable");
@@ -152,17 +245,63 @@ impl Conv2dExecutable {
 
         let mut shape = self.shape_template;
         let mut kernels = self.kernels;
-        for (dimension, bytes) in self
-            .runtime_dimensions
-            .iter()
-            .zip(constants.chunks_exact(std::mem::size_of::<u32>()))
-        {
+        let mut words = constants.chunks_exact(std::mem::size_of::<u32>());
+        for dimension in &self.runtime_dimensions {
+            let bytes = words
+                .next()
+                .ok_or("runtime Conv2D push constants ran out")?;
             let value = u32::from_ne_bytes(bytes.try_into().unwrap());
             if value == 0 {
                 return Err("runtime Conv2D dimensions must be nonzero");
             }
             dimension.set(&mut shape, &mut kernels, value);
         }
+
+        if !self.runtime_quantization.is_empty() {
+            let Precision::Int8(mut quantization) = shape.precision else {
+                return Err("runtime Conv2D quantization parameters require int8 precision");
+            };
+            // The template's multiplier is a placeholder built from a
+            // substituted unit output scale (see `decode_precision`), so the
+            // real one is derived here from whatever this dispatch supplied.
+            // `input_scale`/`weights_scale` stay static, which is what lets a
+            // single output scale carry the whole ratio.
+            let mut output_scale = None;
+            for param in &self.runtime_quantization {
+                let bytes = words
+                    .next()
+                    .ok_or("runtime Conv2D push constants ran out")?;
+                let value = u32::from_ne_bytes(bytes.try_into().unwrap());
+                match param {
+                    RuntimeConv2dQuantParam::OutputScale => {
+                        output_scale = Some(f32::from_bits(value));
+                    }
+                    RuntimeConv2dQuantParam::InputZeroPoint => {
+                        quantization.input_zero_point = value as i32;
+                    }
+                    RuntimeConv2dQuantParam::OutputZeroPoint => {
+                        quantization.output_zero_point = value as i32;
+                    }
+                }
+            }
+
+            // A target may list only zero points and keep a static scale; in
+            // that case the template's own multiplier is already the real one.
+            if let Some(output_scale) = output_scale {
+                if !output_scale.is_finite() || output_scale <= 0.0 {
+                    return Err("runtime Conv2D output scale must be finite and positive");
+                }
+                let ratio = f64::from(quantization.input_scale)
+                    * f64::from(quantization.weights_scale)
+                    / f64::from(output_scale);
+                // Plain `try_from_ratio`; the BS plane's gain is 1 here. See
+                // the measurement recorded in
+                // `executable_cache::decode_precision`.
+                quantization.multiplier = Multiplier::try_from_ratio(ratio)?;
+            }
+            shape.precision = Precision::Int8(quantization);
+        }
+
         validate_conv_shape(&shape, kernels)?;
         Ok((shape, kernels))
     }
@@ -628,6 +767,7 @@ mod tests {
                 RuntimeConv2dDimension::InputHeight,
                 RuntimeConv2dDimension::InputWidth,
             ],
+            runtime_quantization: Vec::new(),
         }
     }
 
@@ -689,6 +829,7 @@ mod tests {
                 RuntimeConv2dDimension::WeightsHeight,
                 RuntimeConv2dDimension::WeightsWidth,
             ],
+            runtime_quantization: Vec::new(),
         };
         assert!(executable.resolve_shape(&constants(&[99, 99])).is_err());
     }

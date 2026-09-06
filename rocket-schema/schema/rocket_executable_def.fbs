@@ -84,6 +84,29 @@ enum MatmulDimension : ubyte {
   N = 2,
 }
 
+// Conv2D quantization fields that may be supplied by dispatch push constants.
+// Numeric values are wire-format ABI and must not be changed or reused.
+//
+// These are deliberately a separate list from Conv2DDimension. A runtime
+// *dimension* is rejected when a dispatch supplies zero, because no extent of
+// a real convolution is zero and a zero there means the adapter failed to
+// push it. Zero is a perfectly ordinary quantization value -- a symmetric
+// tensor has zero point zero -- so these need the opposite rule, and mixing
+// them into one list would have to weaken the dimension check.
+//
+// Each entry consumes one uint32 push constant, ordered after every
+// runtime_dimensions constant. The payload is a bit pattern, not a number:
+// OUTPUT_SCALE carries the IEEE-754 binary32 encoding of the scale and the
+// zero points carry the two's-complement encoding of an int32, so a negative
+// zero point survives the uint32 field. Both sides read the convention from
+// this comment; rocket-hal-driver's `RuntimeConv2dQuantParam` and
+// RocketTarget.cpp's serializer are the two implementations of it.
+enum Conv2DQuantParam : ubyte {
+  OUTPUT_SCALE = 0,
+  INPUT_ZERO_POINT = 1,
+  OUTPUT_ZERO_POINT = 2,
+}
+
 // Describes one NHWC/HWCF 2-D convolution.
 //
 // Version 1 has one stride because the current Rocket ConvShape and register
@@ -134,6 +157,15 @@ table Conv2DDef {
   // two-value padding model.
   pad_top:uint32;
   pad_left:uint32;
+
+  // Ordered list mapping dispatch push-constant ordinal to a quantization
+  // field, continuing the push-constant sequence after runtime_dimensions.
+  // A listed field must hold its default in this table and is replaced by the
+  // dispatch value -- including zero -- before the multiplier is derived.
+  // Entries must be unique. Appended last, like pad_top/pad_left above and
+  // for the same reason: a field added mid-table would shift every later
+  // field's vtable slot.
+  runtime_quantization:[Conv2DQuantParam];
 }
 
 // DEPRECATED: superseded by MatmulDef. Retained because union tags are

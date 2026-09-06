@@ -609,6 +609,97 @@ impl<'a> flatbuffers::Verifiable for MatmulDimension {
 
 impl flatbuffers::SimpleToVerifyInSlice for MatmulDimension {}
 #[deprecated(since = "2.0.0", note = "Use associated constants instead. This will no longer be generated in 2021.")]
+pub const ENUM_MIN_CONV_2DQUANT_PARAM: u8 = 0;
+#[deprecated(since = "2.0.0", note = "Use associated constants instead. This will no longer be generated in 2021.")]
+pub const ENUM_MAX_CONV_2DQUANT_PARAM: u8 = 2;
+#[deprecated(since = "2.0.0", note = "Use associated constants instead. This will no longer be generated in 2021.")]
+#[allow(non_camel_case_types)]
+pub const ENUM_VALUES_CONV_2DQUANT_PARAM: [Conv2DQuantParam; 3] = [
+  Conv2DQuantParam::OUTPUT_SCALE,
+  Conv2DQuantParam::INPUT_ZERO_POINT,
+  Conv2DQuantParam::OUTPUT_ZERO_POINT,
+];
+
+#[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Default)]
+#[repr(transparent)]
+pub struct Conv2DQuantParam(pub u8);
+#[allow(non_upper_case_globals)]
+impl Conv2DQuantParam {
+  pub const OUTPUT_SCALE: Self = Self(0);
+  pub const INPUT_ZERO_POINT: Self = Self(1);
+  pub const OUTPUT_ZERO_POINT: Self = Self(2);
+
+  pub const ENUM_MIN: u8 = 0;
+  pub const ENUM_MAX: u8 = 2;
+  pub const ENUM_VALUES: &'static [Self] = &[
+    Self::OUTPUT_SCALE,
+    Self::INPUT_ZERO_POINT,
+    Self::OUTPUT_ZERO_POINT,
+  ];
+  /// Returns the variant's name or "" if unknown.
+  pub fn variant_name(self) -> Option<&'static str> {
+    match self {
+      Self::OUTPUT_SCALE => Some("OUTPUT_SCALE"),
+      Self::INPUT_ZERO_POINT => Some("INPUT_ZERO_POINT"),
+      Self::OUTPUT_ZERO_POINT => Some("OUTPUT_ZERO_POINT"),
+      _ => None,
+    }
+  }
+}
+impl core::fmt::Debug for Conv2DQuantParam {
+  fn fmt(&self, f: &mut core::fmt::Formatter) -> core::fmt::Result {
+    if let Some(name) = self.variant_name() {
+      f.write_str(name)
+    } else {
+      f.write_fmt(format_args!("<UNKNOWN {:?}>", self.0))
+    }
+  }
+}
+impl<'a> flatbuffers::Follow<'a> for Conv2DQuantParam {
+  type Inner = Self;
+  #[inline]
+  fn follow(buf: &'a [u8], loc: usize) -> Self::Inner {
+    let b = unsafe {
+      flatbuffers::read_scalar_at::<u8>(buf, loc)
+    };
+    Self(b)
+  }
+}
+
+impl flatbuffers::Push for Conv2DQuantParam {
+    type Output = Conv2DQuantParam;
+    #[inline]
+    fn push(&self, dst: &mut [u8], _rest: &[u8]) {
+        unsafe { flatbuffers::emplace_scalar::<u8>(dst, self.0); }
+    }
+}
+
+impl flatbuffers::EndianScalar for Conv2DQuantParam {
+  #[inline]
+  fn to_little_endian(self) -> Self {
+    let b = u8::to_le(self.0);
+    Self(b)
+  }
+  #[inline]
+  #[allow(clippy::wrong_self_convention)]
+  fn from_little_endian(self) -> Self {
+    let b = u8::from_le(self.0);
+    Self(b)
+  }
+}
+
+impl<'a> flatbuffers::Verifiable for Conv2DQuantParam {
+  #[inline]
+  fn run_verifier(
+    v: &mut flatbuffers::Verifier, pos: usize
+  ) -> Result<(), flatbuffers::InvalidFlatbuffer> {
+    use self::flatbuffers::Verifiable;
+    u8::run_verifier(v, pos)
+  }
+}
+
+impl flatbuffers::SimpleToVerifyInSlice for Conv2DQuantParam {}
+#[deprecated(since = "2.0.0", note = "Use associated constants instead. This will no longer be generated in 2021.")]
 pub const ENUM_MIN_KERNEL_DEF: u8 = 0;
 #[deprecated(since = "2.0.0", note = "Use associated constants instead. This will no longer be generated in 2021.")]
 pub const ENUM_MAX_KERNEL_DEF: u8 = 4;
@@ -748,6 +839,7 @@ impl<'a> Conv2DDef<'a> {
   pub const VT_RUNTIME_DIMENSIONS: flatbuffers::VOffsetT = 44;
   pub const VT_PAD_TOP: flatbuffers::VOffsetT = 46;
   pub const VT_PAD_LEFT: flatbuffers::VOffsetT = 48;
+  pub const VT_RUNTIME_QUANTIZATION: flatbuffers::VOffsetT = 50;
 
   #[inline]
   pub fn init_from_table(table: flatbuffers::Table<'a>) -> Self {
@@ -759,6 +851,7 @@ impl<'a> Conv2DDef<'a> {
     args: &'args Conv2DDefArgs<'args>
   ) -> flatbuffers::WIPOffset<Conv2DDef<'bldr>> {
     let mut builder = Conv2DDefBuilder::new(_fbb);
+    if let Some(x) = args.runtime_quantization { builder.add_runtime_quantization(x); }
     builder.add_pad_left(args.pad_left);
     builder.add_pad_top(args.pad_top);
     if let Some(x) = args.runtime_dimensions { builder.add_runtime_dimensions(x); }
@@ -878,6 +971,10 @@ impl<'a> Conv2DDef<'a> {
   pub fn pad_left(&self) -> u32 {
     self._tab.get::<u32>(Conv2DDef::VT_PAD_LEFT, Some(0)).unwrap()
   }
+  #[inline]
+  pub fn runtime_quantization(&self) -> Option<flatbuffers::Vector<'a, Conv2DQuantParam>> {
+    self._tab.get::<flatbuffers::ForwardsUOffset<flatbuffers::Vector<'a, Conv2DQuantParam>>>(Conv2DDef::VT_RUNTIME_QUANTIZATION, None)
+  }
 }
 
 impl flatbuffers::Verifiable for Conv2DDef<'_> {
@@ -910,6 +1007,7 @@ impl flatbuffers::Verifiable for Conv2DDef<'_> {
      .visit_field::<flatbuffers::ForwardsUOffset<flatbuffers::Vector<'_, Conv2DDimension>>>("runtime_dimensions", Self::VT_RUNTIME_DIMENSIONS, false)?
      .visit_field::<u32>("pad_top", Self::VT_PAD_TOP, false)?
      .visit_field::<u32>("pad_left", Self::VT_PAD_LEFT, false)?
+     .visit_field::<flatbuffers::ForwardsUOffset<flatbuffers::Vector<'_, Conv2DQuantParam>>>("runtime_quantization", Self::VT_RUNTIME_QUANTIZATION, false)?
      .finish();
     Ok(())
   }
@@ -938,6 +1036,7 @@ pub struct Conv2DDefArgs<'a> {
     pub runtime_dimensions: Option<flatbuffers::WIPOffset<flatbuffers::Vector<'a, Conv2DDimension>>>,
     pub pad_top: u32,
     pub pad_left: u32,
+    pub runtime_quantization: Option<flatbuffers::WIPOffset<flatbuffers::Vector<'a, Conv2DQuantParam>>>,
 }
 impl<'a> Default for Conv2DDefArgs<'a> {
   #[inline]
@@ -966,6 +1065,7 @@ impl<'a> Default for Conv2DDefArgs<'a> {
       runtime_dimensions: None,
       pad_top: 0,
       pad_left: 0,
+      runtime_quantization: None,
     }
   }
 }
@@ -1068,6 +1168,10 @@ impl<'a: 'b, 'b> Conv2DDefBuilder<'a, 'b> {
     self.fbb_.push_slot::<u32>(Conv2DDef::VT_PAD_LEFT, pad_left, 0);
   }
   #[inline]
+  pub fn add_runtime_quantization(&mut self, runtime_quantization: flatbuffers::WIPOffset<flatbuffers::Vector<'b , Conv2DQuantParam>>) {
+    self.fbb_.push_slot_always::<flatbuffers::WIPOffset<_>>(Conv2DDef::VT_RUNTIME_QUANTIZATION, runtime_quantization);
+  }
+  #[inline]
   pub fn new(_fbb: &'b mut flatbuffers::FlatBufferBuilder<'a>) -> Conv2DDefBuilder<'a, 'b> {
     let start = _fbb.start_table();
     Conv2DDefBuilder {
@@ -1108,6 +1212,7 @@ impl core::fmt::Debug for Conv2DDef<'_> {
       ds.field("runtime_dimensions", &self.runtime_dimensions());
       ds.field("pad_top", &self.pad_top());
       ds.field("pad_left", &self.pad_left());
+      ds.field("runtime_quantization", &self.runtime_quantization());
       ds.finish()
   }
 }
