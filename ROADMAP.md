@@ -384,7 +384,10 @@ accuracy (max|diff| 0.336, argmax and top-5 unchanged).
 been.** Measured on `planck` over six interleaved passes: **1.54x faster than
 a like-for-like CPU build on a full machine** (173.5 ms against 267.0),
 1.40x faster on four A76s, and 23-30% faster than the accumulator build it
-replaces at every core allocation. The accumulator build was 1.5x *slower*
+replaces at every core allocation. **Extending the same treatment to the 13
+depthwise convolutions took it to 1.80x faster (148.5 ms) and to parity at
+two cores**, the allocation that had punished the offload in every earlier
+measurement. The accumulator build was 1.5x *slower*
 than the same CPU arm. `ROCKET_PROFILE` puts the largest single term in
 compaction, more than halved, which is the mechanism doing exactly what it
 was supposed to: `i8` output instead of `i32` is a quarter of the bytes to

@@ -908,6 +908,39 @@ are a hardware probe, a requantized depthwise executable target and matcher,
 and extending the fusion pass to `linalg.depthwise_conv_2d_nhwc_hwc`. No
 depthwise knob exists in `dtype_boundary_probe` yet, so the probe is new code.
 
+### Requantized depthwise, 2026-09-06: 1.80x faster than the CPU
+
+The follow-through on the section above. All 13 of MobileNetV2's offloaded
+depthwise convolutions moved from `int8_accumulator` to the requantized path,
+so the `elementwise_i32xi32xi32xi8` per layer -- the largest remaining CPU
+dispatch category -- is gone. 42 of the model's 47 convolution dispatches are
+now requantized.
+
+| cpus | cpu-only | dense requant | + depthwise | vs cpu |
+|---|---:|---:|---:|---:|
+| `4,5` | 277.5 ms | 375.0 ms | 279.0 ms | **1.01x -- parity** |
+| `4-7` | 277.0 ms | 196.5 ms | 158.5 ms | **1.75x faster** |
+| `0-7` | 267.0 ms | 171.5 ms | 148.5 ms | **1.80x faster** |
+
+Same protocol as the dense measurement. -13% to -26% against the dense-only
+build. The two-core column is the one to notice: this configuration has
+punished the offload in every measurement this repo has ever taken -- 3.9x
+slower at its worst, 1.34x after the dense conversion -- and it is now level.
+Accuracy is unchanged (max|diff| 0.3298, same argmax and top-5).
+
+The hardware was measured first (`conv_depthwise_requant_hw.rs`, bit-exact at
+six widths including all four MobileNetV2 asks for), so nothing here was built
+on hope.
+
+**A failure mode worth naming, because it is silent.** The first depthwise
+matcher checked for a 1x1 kernel, copied from the dense 1x1 variant, and every
+depthwise convolution in this model is 3x3. It declined everything and the
+accumulator matchers claimed the convolutions straight back: no error, no test
+failure, placement simply unchanged -- exactly what "the matcher does not
+exist" looks like. The only instrument that catches it is a matched-case test
+asserting the dispatch reaches the *specific* executable, which
+`rocket_int8_requant_match.mlir` now carries for both dense and depthwise.
+
 ### Cin 1344 is exact in every isolated test and wrong inside the model
 
 Open, 2026-09-06. Raising the requantized matchers' `Cin` bound from 512 to
