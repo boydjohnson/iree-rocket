@@ -518,6 +518,410 @@ impl<'a> flatbuffers::Verifiable for PoolingDimension {
 
 impl flatbuffers::SimpleToVerifyInSlice for PoolingDimension {}
 #[deprecated(since = "2.0.0", note = "Use associated constants instead. This will no longer be generated in 2021.")]
+pub const ENUM_MIN_EW_UNARY_OP: u8 = 0;
+#[deprecated(since = "2.0.0", note = "Use associated constants instead. This will no longer be generated in 2021.")]
+pub const ENUM_MAX_EW_UNARY_OP: u8 = 4;
+#[deprecated(since = "2.0.0", note = "Use associated constants instead. This will no longer be generated in 2021.")]
+#[allow(non_camel_case_types)]
+pub const ENUM_VALUES_EW_UNARY_OP: [EwUnaryOp; 5] = [
+  EwUnaryOp::ABS,
+  EwUnaryOp::NEG,
+  EwUnaryOp::FLOOR,
+  EwUnaryOp::CEIL,
+  EwUnaryOp::ADD_SCALAR,
+];
+
+#[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Default)]
+#[repr(transparent)]
+pub struct EwUnaryOp(pub u8);
+#[allow(non_upper_case_globals)]
+impl EwUnaryOp {
+  pub const ABS: Self = Self(0);
+  pub const NEG: Self = Self(1);
+  pub const FLOOR: Self = Self(2);
+  pub const CEIL: Self = Self(3);
+  pub const ADD_SCALAR: Self = Self(4);
+
+  pub const ENUM_MIN: u8 = 0;
+  pub const ENUM_MAX: u8 = 4;
+  pub const ENUM_VALUES: &'static [Self] = &[
+    Self::ABS,
+    Self::NEG,
+    Self::FLOOR,
+    Self::CEIL,
+    Self::ADD_SCALAR,
+  ];
+  /// Returns the variant's name or "" if unknown.
+  pub fn variant_name(self) -> Option<&'static str> {
+    match self {
+      Self::ABS => Some("ABS"),
+      Self::NEG => Some("NEG"),
+      Self::FLOOR => Some("FLOOR"),
+      Self::CEIL => Some("CEIL"),
+      Self::ADD_SCALAR => Some("ADD_SCALAR"),
+      _ => None,
+    }
+  }
+}
+impl core::fmt::Debug for EwUnaryOp {
+  fn fmt(&self, f: &mut core::fmt::Formatter) -> core::fmt::Result {
+    if let Some(name) = self.variant_name() {
+      f.write_str(name)
+    } else {
+      f.write_fmt(format_args!("<UNKNOWN {:?}>", self.0))
+    }
+  }
+}
+impl<'a> flatbuffers::Follow<'a> for EwUnaryOp {
+  type Inner = Self;
+  #[inline]
+  fn follow(buf: &'a [u8], loc: usize) -> Self::Inner {
+    let b = unsafe {
+      flatbuffers::read_scalar_at::<u8>(buf, loc)
+    };
+    Self(b)
+  }
+}
+
+impl flatbuffers::Push for EwUnaryOp {
+    type Output = EwUnaryOp;
+    #[inline]
+    fn push(&self, dst: &mut [u8], _rest: &[u8]) {
+        unsafe { flatbuffers::emplace_scalar::<u8>(dst, self.0); }
+    }
+}
+
+impl flatbuffers::EndianScalar for EwUnaryOp {
+  #[inline]
+  fn to_little_endian(self) -> Self {
+    let b = u8::to_le(self.0);
+    Self(b)
+  }
+  #[inline]
+  #[allow(clippy::wrong_self_convention)]
+  fn from_little_endian(self) -> Self {
+    let b = u8::from_le(self.0);
+    Self(b)
+  }
+}
+
+impl<'a> flatbuffers::Verifiable for EwUnaryOp {
+  #[inline]
+  fn run_verifier(
+    v: &mut flatbuffers::Verifier, pos: usize
+  ) -> Result<(), flatbuffers::InvalidFlatbuffer> {
+    use self::flatbuffers::Verifiable;
+    u8::run_verifier(v, pos)
+  }
+}
+
+impl flatbuffers::SimpleToVerifyInSlice for EwUnaryOp {}
+#[deprecated(since = "2.0.0", note = "Use associated constants instead. This will no longer be generated in 2021.")]
+pub const ENUM_MIN_EW_BINARY_OP: u8 = 0;
+#[deprecated(since = "2.0.0", note = "Use associated constants instead. This will no longer be generated in 2021.")]
+pub const ENUM_MAX_EW_BINARY_OP: u8 = 4;
+#[deprecated(since = "2.0.0", note = "Use associated constants instead. This will no longer be generated in 2021.")]
+#[allow(non_camel_case_types)]
+pub const ENUM_VALUES_EW_BINARY_OP: [EwBinaryOp; 5] = [
+  EwBinaryOp::ADD,
+  EwBinaryOp::SUB,
+  EwBinaryOp::MUL,
+  EwBinaryOp::MAX,
+  EwBinaryOp::MIN,
+];
+
+#[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Default)]
+#[repr(transparent)]
+pub struct EwBinaryOp(pub u8);
+#[allow(non_upper_case_globals)]
+impl EwBinaryOp {
+  pub const ADD: Self = Self(0);
+  pub const SUB: Self = Self(1);
+  pub const MUL: Self = Self(2);
+  pub const MAX: Self = Self(3);
+  pub const MIN: Self = Self(4);
+
+  pub const ENUM_MIN: u8 = 0;
+  pub const ENUM_MAX: u8 = 4;
+  pub const ENUM_VALUES: &'static [Self] = &[
+    Self::ADD,
+    Self::SUB,
+    Self::MUL,
+    Self::MAX,
+    Self::MIN,
+  ];
+  /// Returns the variant's name or "" if unknown.
+  pub fn variant_name(self) -> Option<&'static str> {
+    match self {
+      Self::ADD => Some("ADD"),
+      Self::SUB => Some("SUB"),
+      Self::MUL => Some("MUL"),
+      Self::MAX => Some("MAX"),
+      Self::MIN => Some("MIN"),
+      _ => None,
+    }
+  }
+}
+impl core::fmt::Debug for EwBinaryOp {
+  fn fmt(&self, f: &mut core::fmt::Formatter) -> core::fmt::Result {
+    if let Some(name) = self.variant_name() {
+      f.write_str(name)
+    } else {
+      f.write_fmt(format_args!("<UNKNOWN {:?}>", self.0))
+    }
+  }
+}
+impl<'a> flatbuffers::Follow<'a> for EwBinaryOp {
+  type Inner = Self;
+  #[inline]
+  fn follow(buf: &'a [u8], loc: usize) -> Self::Inner {
+    let b = unsafe {
+      flatbuffers::read_scalar_at::<u8>(buf, loc)
+    };
+    Self(b)
+  }
+}
+
+impl flatbuffers::Push for EwBinaryOp {
+    type Output = EwBinaryOp;
+    #[inline]
+    fn push(&self, dst: &mut [u8], _rest: &[u8]) {
+        unsafe { flatbuffers::emplace_scalar::<u8>(dst, self.0); }
+    }
+}
+
+impl flatbuffers::EndianScalar for EwBinaryOp {
+  #[inline]
+  fn to_little_endian(self) -> Self {
+    let b = u8::to_le(self.0);
+    Self(b)
+  }
+  #[inline]
+  #[allow(clippy::wrong_self_convention)]
+  fn from_little_endian(self) -> Self {
+    let b = u8::from_le(self.0);
+    Self(b)
+  }
+}
+
+impl<'a> flatbuffers::Verifiable for EwBinaryOp {
+  #[inline]
+  fn run_verifier(
+    v: &mut flatbuffers::Verifier, pos: usize
+  ) -> Result<(), flatbuffers::InvalidFlatbuffer> {
+    use self::flatbuffers::Verifiable;
+    u8::run_verifier(v, pos)
+  }
+}
+
+impl flatbuffers::SimpleToVerifyInSlice for EwBinaryOp {}
+#[deprecated(since = "2.0.0", note = "Use associated constants instead. This will no longer be generated in 2021.")]
+pub const ENUM_MIN_LUT_FN: u8 = 0;
+#[deprecated(since = "2.0.0", note = "Use associated constants instead. This will no longer be generated in 2021.")]
+pub const ENUM_MAX_LUT_FN: u8 = 8;
+#[deprecated(since = "2.0.0", note = "Use associated constants instead. This will no longer be generated in 2021.")]
+#[allow(non_camel_case_types)]
+pub const ENUM_VALUES_LUT_FN: [LutFn; 9] = [
+  LutFn::SIGMOID,
+  LutFn::TANH,
+  LutFn::EXP,
+  LutFn::SQUARE,
+  LutFn::ERF,
+  LutFn::SQRT,
+  LutFn::RSQRT,
+  LutFn::LOG,
+  LutFn::RECIPROCAL,
+];
+
+#[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Default)]
+#[repr(transparent)]
+pub struct LutFn(pub u8);
+#[allow(non_upper_case_globals)]
+impl LutFn {
+  pub const SIGMOID: Self = Self(0);
+  pub const TANH: Self = Self(1);
+  pub const EXP: Self = Self(2);
+  pub const SQUARE: Self = Self(3);
+  pub const ERF: Self = Self(4);
+  pub const SQRT: Self = Self(5);
+  pub const RSQRT: Self = Self(6);
+  pub const LOG: Self = Self(7);
+  pub const RECIPROCAL: Self = Self(8);
+
+  pub const ENUM_MIN: u8 = 0;
+  pub const ENUM_MAX: u8 = 8;
+  pub const ENUM_VALUES: &'static [Self] = &[
+    Self::SIGMOID,
+    Self::TANH,
+    Self::EXP,
+    Self::SQUARE,
+    Self::ERF,
+    Self::SQRT,
+    Self::RSQRT,
+    Self::LOG,
+    Self::RECIPROCAL,
+  ];
+  /// Returns the variant's name or "" if unknown.
+  pub fn variant_name(self) -> Option<&'static str> {
+    match self {
+      Self::SIGMOID => Some("SIGMOID"),
+      Self::TANH => Some("TANH"),
+      Self::EXP => Some("EXP"),
+      Self::SQUARE => Some("SQUARE"),
+      Self::ERF => Some("ERF"),
+      Self::SQRT => Some("SQRT"),
+      Self::RSQRT => Some("RSQRT"),
+      Self::LOG => Some("LOG"),
+      Self::RECIPROCAL => Some("RECIPROCAL"),
+      _ => None,
+    }
+  }
+}
+impl core::fmt::Debug for LutFn {
+  fn fmt(&self, f: &mut core::fmt::Formatter) -> core::fmt::Result {
+    if let Some(name) = self.variant_name() {
+      f.write_str(name)
+    } else {
+      f.write_fmt(format_args!("<UNKNOWN {:?}>", self.0))
+    }
+  }
+}
+impl<'a> flatbuffers::Follow<'a> for LutFn {
+  type Inner = Self;
+  #[inline]
+  fn follow(buf: &'a [u8], loc: usize) -> Self::Inner {
+    let b = unsafe {
+      flatbuffers::read_scalar_at::<u8>(buf, loc)
+    };
+    Self(b)
+  }
+}
+
+impl flatbuffers::Push for LutFn {
+    type Output = LutFn;
+    #[inline]
+    fn push(&self, dst: &mut [u8], _rest: &[u8]) {
+        unsafe { flatbuffers::emplace_scalar::<u8>(dst, self.0); }
+    }
+}
+
+impl flatbuffers::EndianScalar for LutFn {
+  #[inline]
+  fn to_little_endian(self) -> Self {
+    let b = u8::to_le(self.0);
+    Self(b)
+  }
+  #[inline]
+  #[allow(clippy::wrong_self_convention)]
+  fn from_little_endian(self) -> Self {
+    let b = u8::from_le(self.0);
+    Self(b)
+  }
+}
+
+impl<'a> flatbuffers::Verifiable for LutFn {
+  #[inline]
+  fn run_verifier(
+    v: &mut flatbuffers::Verifier, pos: usize
+  ) -> Result<(), flatbuffers::InvalidFlatbuffer> {
+    use self::flatbuffers::Verifiable;
+    u8::run_verifier(v, pos)
+  }
+}
+
+impl flatbuffers::SimpleToVerifyInSlice for LutFn {}
+#[deprecated(since = "2.0.0", note = "Use associated constants instead. This will no longer be generated in 2021.")]
+pub const ENUM_MIN_ELEMENTWISE_DIMENSION: u8 = 0;
+#[deprecated(since = "2.0.0", note = "Use associated constants instead. This will no longer be generated in 2021.")]
+pub const ENUM_MAX_ELEMENTWISE_DIMENSION: u8 = 2;
+#[deprecated(since = "2.0.0", note = "Use associated constants instead. This will no longer be generated in 2021.")]
+#[allow(non_camel_case_types)]
+pub const ENUM_VALUES_ELEMENTWISE_DIMENSION: [ElementwiseDimension; 3] = [
+  ElementwiseDimension::WIDTH,
+  ElementwiseDimension::HEIGHT,
+  ElementwiseDimension::CHANNELS,
+];
+
+#[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Default)]
+#[repr(transparent)]
+pub struct ElementwiseDimension(pub u8);
+#[allow(non_upper_case_globals)]
+impl ElementwiseDimension {
+  pub const WIDTH: Self = Self(0);
+  pub const HEIGHT: Self = Self(1);
+  pub const CHANNELS: Self = Self(2);
+
+  pub const ENUM_MIN: u8 = 0;
+  pub const ENUM_MAX: u8 = 2;
+  pub const ENUM_VALUES: &'static [Self] = &[
+    Self::WIDTH,
+    Self::HEIGHT,
+    Self::CHANNELS,
+  ];
+  /// Returns the variant's name or "" if unknown.
+  pub fn variant_name(self) -> Option<&'static str> {
+    match self {
+      Self::WIDTH => Some("WIDTH"),
+      Self::HEIGHT => Some("HEIGHT"),
+      Self::CHANNELS => Some("CHANNELS"),
+      _ => None,
+    }
+  }
+}
+impl core::fmt::Debug for ElementwiseDimension {
+  fn fmt(&self, f: &mut core::fmt::Formatter) -> core::fmt::Result {
+    if let Some(name) = self.variant_name() {
+      f.write_str(name)
+    } else {
+      f.write_fmt(format_args!("<UNKNOWN {:?}>", self.0))
+    }
+  }
+}
+impl<'a> flatbuffers::Follow<'a> for ElementwiseDimension {
+  type Inner = Self;
+  #[inline]
+  fn follow(buf: &'a [u8], loc: usize) -> Self::Inner {
+    let b = unsafe {
+      flatbuffers::read_scalar_at::<u8>(buf, loc)
+    };
+    Self(b)
+  }
+}
+
+impl flatbuffers::Push for ElementwiseDimension {
+    type Output = ElementwiseDimension;
+    #[inline]
+    fn push(&self, dst: &mut [u8], _rest: &[u8]) {
+        unsafe { flatbuffers::emplace_scalar::<u8>(dst, self.0); }
+    }
+}
+
+impl flatbuffers::EndianScalar for ElementwiseDimension {
+  #[inline]
+  fn to_little_endian(self) -> Self {
+    let b = u8::to_le(self.0);
+    Self(b)
+  }
+  #[inline]
+  #[allow(clippy::wrong_self_convention)]
+  fn from_little_endian(self) -> Self {
+    let b = u8::from_le(self.0);
+    Self(b)
+  }
+}
+
+impl<'a> flatbuffers::Verifiable for ElementwiseDimension {
+  #[inline]
+  fn run_verifier(
+    v: &mut flatbuffers::Verifier, pos: usize
+  ) -> Result<(), flatbuffers::InvalidFlatbuffer> {
+    use self::flatbuffers::Verifiable;
+    u8::run_verifier(v, pos)
+  }
+}
+
+impl flatbuffers::SimpleToVerifyInSlice for ElementwiseDimension {}
+#[deprecated(since = "2.0.0", note = "Use associated constants instead. This will no longer be generated in 2021.")]
 pub const ENUM_MIN_MATMUL_DIMENSION: u8 = 0;
 #[deprecated(since = "2.0.0", note = "Use associated constants instead. This will no longer be generated in 2021.")]
 pub const ENUM_MAX_MATMUL_DIMENSION: u8 = 2;
@@ -702,15 +1106,17 @@ impl flatbuffers::SimpleToVerifyInSlice for Conv2DQuantParam {}
 #[deprecated(since = "2.0.0", note = "Use associated constants instead. This will no longer be generated in 2021.")]
 pub const ENUM_MIN_KERNEL_DEF: u8 = 0;
 #[deprecated(since = "2.0.0", note = "Use associated constants instead. This will no longer be generated in 2021.")]
-pub const ENUM_MAX_KERNEL_DEF: u8 = 4;
+pub const ENUM_MAX_KERNEL_DEF: u8 = 6;
 #[deprecated(since = "2.0.0", note = "Use associated constants instead. This will no longer be generated in 2021.")]
 #[allow(non_camel_case_types)]
-pub const ENUM_VALUES_KERNEL_DEF: [KernelDef; 5] = [
+pub const ENUM_VALUES_KERNEL_DEF: [KernelDef; 7] = [
   KernelDef::NONE,
   KernelDef::Conv2DDef,
   KernelDef::FullyConnectedDef,
   KernelDef::PoolingDef,
   KernelDef::MatmulDef,
+  KernelDef::ElementwiseUnaryDef,
+  KernelDef::ElementwiseLutDef,
 ];
 
 #[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Default)]
@@ -723,15 +1129,19 @@ impl KernelDef {
   pub const FullyConnectedDef: Self = Self(2);
   pub const PoolingDef: Self = Self(3);
   pub const MatmulDef: Self = Self(4);
+  pub const ElementwiseUnaryDef: Self = Self(5);
+  pub const ElementwiseLutDef: Self = Self(6);
 
   pub const ENUM_MIN: u8 = 0;
-  pub const ENUM_MAX: u8 = 4;
+  pub const ENUM_MAX: u8 = 6;
   pub const ENUM_VALUES: &'static [Self] = &[
     Self::NONE,
     Self::Conv2DDef,
     Self::FullyConnectedDef,
     Self::PoolingDef,
     Self::MatmulDef,
+    Self::ElementwiseUnaryDef,
+    Self::ElementwiseLutDef,
   ];
   /// Returns the variant's name or "" if unknown.
   pub fn variant_name(self) -> Option<&'static str> {
@@ -741,6 +1151,8 @@ impl KernelDef {
       Self::FullyConnectedDef => Some("FullyConnectedDef"),
       Self::PoolingDef => Some("PoolingDef"),
       Self::MatmulDef => Some("MatmulDef"),
+      Self::ElementwiseUnaryDef => Some("ElementwiseUnaryDef"),
+      Self::ElementwiseLutDef => Some("ElementwiseLutDef"),
       _ => None,
     }
   }
@@ -2058,6 +2470,376 @@ impl core::fmt::Debug for MatmulDef<'_> {
       ds.finish()
   }
 }
+pub enum ElementwiseUnaryDefOffset {}
+#[derive(Copy, Clone, PartialEq)]
+
+pub struct ElementwiseUnaryDef<'a> {
+  pub _tab: flatbuffers::Table<'a>,
+}
+
+impl<'a> flatbuffers::Follow<'a> for ElementwiseUnaryDef<'a> {
+  type Inner = ElementwiseUnaryDef<'a>;
+  #[inline]
+  fn follow(buf: &'a [u8], loc: usize) -> Self::Inner {
+    Self { _tab: flatbuffers::Table { buf, loc } }
+  }
+}
+
+impl<'a> ElementwiseUnaryDef<'a> {
+  pub const VT_WIDTH: flatbuffers::VOffsetT = 4;
+  pub const VT_HEIGHT: flatbuffers::VOffsetT = 6;
+  pub const VT_CHANNELS: flatbuffers::VOffsetT = 8;
+  pub const VT_OP: flatbuffers::VOffsetT = 10;
+  pub const VT_OPERAND: flatbuffers::VOffsetT = 12;
+  pub const VT_RUNTIME_DIMENSIONS: flatbuffers::VOffsetT = 14;
+
+  #[inline]
+  pub fn init_from_table(table: flatbuffers::Table<'a>) -> Self {
+    ElementwiseUnaryDef { _tab: table }
+  }
+  #[allow(unused_mut)]
+  pub fn create<'bldr: 'args, 'args: 'mut_bldr, 'mut_bldr>(
+    _fbb: &'mut_bldr mut flatbuffers::FlatBufferBuilder<'bldr>,
+    args: &'args ElementwiseUnaryDefArgs<'args>
+  ) -> flatbuffers::WIPOffset<ElementwiseUnaryDef<'bldr>> {
+    let mut builder = ElementwiseUnaryDefBuilder::new(_fbb);
+    if let Some(x) = args.runtime_dimensions { builder.add_runtime_dimensions(x); }
+    builder.add_operand(args.operand);
+    builder.add_channels(args.channels);
+    builder.add_height(args.height);
+    builder.add_width(args.width);
+    builder.add_op(args.op);
+    builder.finish()
+  }
+
+
+  #[inline]
+  pub fn width(&self) -> u32 {
+    self._tab.get::<u32>(ElementwiseUnaryDef::VT_WIDTH, Some(0)).unwrap()
+  }
+  #[inline]
+  pub fn height(&self) -> u32 {
+    self._tab.get::<u32>(ElementwiseUnaryDef::VT_HEIGHT, Some(0)).unwrap()
+  }
+  #[inline]
+  pub fn channels(&self) -> u32 {
+    self._tab.get::<u32>(ElementwiseUnaryDef::VT_CHANNELS, Some(0)).unwrap()
+  }
+  #[inline]
+  pub fn op(&self) -> EwUnaryOp {
+    self._tab.get::<EwUnaryOp>(ElementwiseUnaryDef::VT_OP, Some(EwUnaryOp::ABS)).unwrap()
+  }
+  #[inline]
+  pub fn operand(&self) -> u32 {
+    self._tab.get::<u32>(ElementwiseUnaryDef::VT_OPERAND, Some(0)).unwrap()
+  }
+  #[inline]
+  pub fn runtime_dimensions(&self) -> Option<flatbuffers::Vector<'a, ElementwiseDimension>> {
+    self._tab.get::<flatbuffers::ForwardsUOffset<flatbuffers::Vector<'a, ElementwiseDimension>>>(ElementwiseUnaryDef::VT_RUNTIME_DIMENSIONS, None)
+  }
+}
+
+impl flatbuffers::Verifiable for ElementwiseUnaryDef<'_> {
+  #[inline]
+  fn run_verifier(
+    v: &mut flatbuffers::Verifier, pos: usize
+  ) -> Result<(), flatbuffers::InvalidFlatbuffer> {
+    use self::flatbuffers::Verifiable;
+    v.visit_table(pos)?
+     .visit_field::<u32>("width", Self::VT_WIDTH, false)?
+     .visit_field::<u32>("height", Self::VT_HEIGHT, false)?
+     .visit_field::<u32>("channels", Self::VT_CHANNELS, false)?
+     .visit_field::<EwUnaryOp>("op", Self::VT_OP, false)?
+     .visit_field::<u32>("operand", Self::VT_OPERAND, false)?
+     .visit_field::<flatbuffers::ForwardsUOffset<flatbuffers::Vector<'_, ElementwiseDimension>>>("runtime_dimensions", Self::VT_RUNTIME_DIMENSIONS, false)?
+     .finish();
+    Ok(())
+  }
+}
+pub struct ElementwiseUnaryDefArgs<'a> {
+    pub width: u32,
+    pub height: u32,
+    pub channels: u32,
+    pub op: EwUnaryOp,
+    pub operand: u32,
+    pub runtime_dimensions: Option<flatbuffers::WIPOffset<flatbuffers::Vector<'a, ElementwiseDimension>>>,
+}
+impl<'a> Default for ElementwiseUnaryDefArgs<'a> {
+  #[inline]
+  fn default() -> Self {
+    ElementwiseUnaryDefArgs {
+      width: 0,
+      height: 0,
+      channels: 0,
+      op: EwUnaryOp::ABS,
+      operand: 0,
+      runtime_dimensions: None,
+    }
+  }
+}
+
+pub struct ElementwiseUnaryDefBuilder<'a: 'b, 'b> {
+  fbb_: &'b mut flatbuffers::FlatBufferBuilder<'a>,
+  start_: flatbuffers::WIPOffset<flatbuffers::TableUnfinishedWIPOffset>,
+}
+impl<'a: 'b, 'b> ElementwiseUnaryDefBuilder<'a, 'b> {
+  #[inline]
+  pub fn add_width(&mut self, width: u32) {
+    self.fbb_.push_slot::<u32>(ElementwiseUnaryDef::VT_WIDTH, width, 0);
+  }
+  #[inline]
+  pub fn add_height(&mut self, height: u32) {
+    self.fbb_.push_slot::<u32>(ElementwiseUnaryDef::VT_HEIGHT, height, 0);
+  }
+  #[inline]
+  pub fn add_channels(&mut self, channels: u32) {
+    self.fbb_.push_slot::<u32>(ElementwiseUnaryDef::VT_CHANNELS, channels, 0);
+  }
+  #[inline]
+  pub fn add_op(&mut self, op: EwUnaryOp) {
+    self.fbb_.push_slot::<EwUnaryOp>(ElementwiseUnaryDef::VT_OP, op, EwUnaryOp::ABS);
+  }
+  #[inline]
+  pub fn add_operand(&mut self, operand: u32) {
+    self.fbb_.push_slot::<u32>(ElementwiseUnaryDef::VT_OPERAND, operand, 0);
+  }
+  #[inline]
+  pub fn add_runtime_dimensions(&mut self, runtime_dimensions: flatbuffers::WIPOffset<flatbuffers::Vector<'b , ElementwiseDimension>>) {
+    self.fbb_.push_slot_always::<flatbuffers::WIPOffset<_>>(ElementwiseUnaryDef::VT_RUNTIME_DIMENSIONS, runtime_dimensions);
+  }
+  #[inline]
+  pub fn new(_fbb: &'b mut flatbuffers::FlatBufferBuilder<'a>) -> ElementwiseUnaryDefBuilder<'a, 'b> {
+    let start = _fbb.start_table();
+    ElementwiseUnaryDefBuilder {
+      fbb_: _fbb,
+      start_: start,
+    }
+  }
+  #[inline]
+  pub fn finish(self) -> flatbuffers::WIPOffset<ElementwiseUnaryDef<'a>> {
+    let o = self.fbb_.end_table(self.start_);
+    flatbuffers::WIPOffset::new(o.value())
+  }
+}
+
+impl core::fmt::Debug for ElementwiseUnaryDef<'_> {
+  fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+    let mut ds = f.debug_struct("ElementwiseUnaryDef");
+      ds.field("width", &self.width());
+      ds.field("height", &self.height());
+      ds.field("channels", &self.channels());
+      ds.field("op", &self.op());
+      ds.field("operand", &self.operand());
+      ds.field("runtime_dimensions", &self.runtime_dimensions());
+      ds.finish()
+  }
+}
+pub enum ElementwiseLutDefOffset {}
+#[derive(Copy, Clone, PartialEq)]
+
+pub struct ElementwiseLutDef<'a> {
+  pub _tab: flatbuffers::Table<'a>,
+}
+
+impl<'a> flatbuffers::Follow<'a> for ElementwiseLutDef<'a> {
+  type Inner = ElementwiseLutDef<'a>;
+  #[inline]
+  fn follow(buf: &'a [u8], loc: usize) -> Self::Inner {
+    Self { _tab: flatbuffers::Table { buf, loc } }
+  }
+}
+
+impl<'a> ElementwiseLutDef<'a> {
+  pub const VT_WIDTH: flatbuffers::VOffsetT = 4;
+  pub const VT_HEIGHT: flatbuffers::VOffsetT = 6;
+  pub const VT_CHANNELS: flatbuffers::VOffsetT = 8;
+  pub const VT_FN_: flatbuffers::VOffsetT = 10;
+  pub const VT_INPUT_ZERO_POINT: flatbuffers::VOffsetT = 12;
+  pub const VT_OUTPUT_ZERO_POINT: flatbuffers::VOffsetT = 14;
+  pub const VT_INPUT_SCALE: flatbuffers::VOffsetT = 16;
+  pub const VT_OUTPUT_SCALE: flatbuffers::VOffsetT = 18;
+  pub const VT_RUNTIME_DIMENSIONS: flatbuffers::VOffsetT = 20;
+
+  #[inline]
+  pub fn init_from_table(table: flatbuffers::Table<'a>) -> Self {
+    ElementwiseLutDef { _tab: table }
+  }
+  #[allow(unused_mut)]
+  pub fn create<'bldr: 'args, 'args: 'mut_bldr, 'mut_bldr>(
+    _fbb: &'mut_bldr mut flatbuffers::FlatBufferBuilder<'bldr>,
+    args: &'args ElementwiseLutDefArgs<'args>
+  ) -> flatbuffers::WIPOffset<ElementwiseLutDef<'bldr>> {
+    let mut builder = ElementwiseLutDefBuilder::new(_fbb);
+    if let Some(x) = args.runtime_dimensions { builder.add_runtime_dimensions(x); }
+    builder.add_output_scale(args.output_scale);
+    builder.add_input_scale(args.input_scale);
+    builder.add_output_zero_point(args.output_zero_point);
+    builder.add_input_zero_point(args.input_zero_point);
+    builder.add_channels(args.channels);
+    builder.add_height(args.height);
+    builder.add_width(args.width);
+    builder.add_fn_(args.fn_);
+    builder.finish()
+  }
+
+
+  #[inline]
+  pub fn width(&self) -> u32 {
+    self._tab.get::<u32>(ElementwiseLutDef::VT_WIDTH, Some(0)).unwrap()
+  }
+  #[inline]
+  pub fn height(&self) -> u32 {
+    self._tab.get::<u32>(ElementwiseLutDef::VT_HEIGHT, Some(0)).unwrap()
+  }
+  #[inline]
+  pub fn channels(&self) -> u32 {
+    self._tab.get::<u32>(ElementwiseLutDef::VT_CHANNELS, Some(0)).unwrap()
+  }
+  #[inline]
+  pub fn fn_(&self) -> LutFn {
+    self._tab.get::<LutFn>(ElementwiseLutDef::VT_FN_, Some(LutFn::SIGMOID)).unwrap()
+  }
+  #[inline]
+  pub fn input_zero_point(&self) -> u32 {
+    self._tab.get::<u32>(ElementwiseLutDef::VT_INPUT_ZERO_POINT, Some(0)).unwrap()
+  }
+  #[inline]
+  pub fn output_zero_point(&self) -> u32 {
+    self._tab.get::<u32>(ElementwiseLutDef::VT_OUTPUT_ZERO_POINT, Some(0)).unwrap()
+  }
+  #[inline]
+  pub fn input_scale(&self) -> f32 {
+    self._tab.get::<f32>(ElementwiseLutDef::VT_INPUT_SCALE, Some(1.0)).unwrap()
+  }
+  #[inline]
+  pub fn output_scale(&self) -> f32 {
+    self._tab.get::<f32>(ElementwiseLutDef::VT_OUTPUT_SCALE, Some(1.0)).unwrap()
+  }
+  #[inline]
+  pub fn runtime_dimensions(&self) -> Option<flatbuffers::Vector<'a, ElementwiseDimension>> {
+    self._tab.get::<flatbuffers::ForwardsUOffset<flatbuffers::Vector<'a, ElementwiseDimension>>>(ElementwiseLutDef::VT_RUNTIME_DIMENSIONS, None)
+  }
+}
+
+impl flatbuffers::Verifiable for ElementwiseLutDef<'_> {
+  #[inline]
+  fn run_verifier(
+    v: &mut flatbuffers::Verifier, pos: usize
+  ) -> Result<(), flatbuffers::InvalidFlatbuffer> {
+    use self::flatbuffers::Verifiable;
+    v.visit_table(pos)?
+     .visit_field::<u32>("width", Self::VT_WIDTH, false)?
+     .visit_field::<u32>("height", Self::VT_HEIGHT, false)?
+     .visit_field::<u32>("channels", Self::VT_CHANNELS, false)?
+     .visit_field::<LutFn>("fn_", Self::VT_FN_, false)?
+     .visit_field::<u32>("input_zero_point", Self::VT_INPUT_ZERO_POINT, false)?
+     .visit_field::<u32>("output_zero_point", Self::VT_OUTPUT_ZERO_POINT, false)?
+     .visit_field::<f32>("input_scale", Self::VT_INPUT_SCALE, false)?
+     .visit_field::<f32>("output_scale", Self::VT_OUTPUT_SCALE, false)?
+     .visit_field::<flatbuffers::ForwardsUOffset<flatbuffers::Vector<'_, ElementwiseDimension>>>("runtime_dimensions", Self::VT_RUNTIME_DIMENSIONS, false)?
+     .finish();
+    Ok(())
+  }
+}
+pub struct ElementwiseLutDefArgs<'a> {
+    pub width: u32,
+    pub height: u32,
+    pub channels: u32,
+    pub fn_: LutFn,
+    pub input_zero_point: u32,
+    pub output_zero_point: u32,
+    pub input_scale: f32,
+    pub output_scale: f32,
+    pub runtime_dimensions: Option<flatbuffers::WIPOffset<flatbuffers::Vector<'a, ElementwiseDimension>>>,
+}
+impl<'a> Default for ElementwiseLutDefArgs<'a> {
+  #[inline]
+  fn default() -> Self {
+    ElementwiseLutDefArgs {
+      width: 0,
+      height: 0,
+      channels: 0,
+      fn_: LutFn::SIGMOID,
+      input_zero_point: 0,
+      output_zero_point: 0,
+      input_scale: 1.0,
+      output_scale: 1.0,
+      runtime_dimensions: None,
+    }
+  }
+}
+
+pub struct ElementwiseLutDefBuilder<'a: 'b, 'b> {
+  fbb_: &'b mut flatbuffers::FlatBufferBuilder<'a>,
+  start_: flatbuffers::WIPOffset<flatbuffers::TableUnfinishedWIPOffset>,
+}
+impl<'a: 'b, 'b> ElementwiseLutDefBuilder<'a, 'b> {
+  #[inline]
+  pub fn add_width(&mut self, width: u32) {
+    self.fbb_.push_slot::<u32>(ElementwiseLutDef::VT_WIDTH, width, 0);
+  }
+  #[inline]
+  pub fn add_height(&mut self, height: u32) {
+    self.fbb_.push_slot::<u32>(ElementwiseLutDef::VT_HEIGHT, height, 0);
+  }
+  #[inline]
+  pub fn add_channels(&mut self, channels: u32) {
+    self.fbb_.push_slot::<u32>(ElementwiseLutDef::VT_CHANNELS, channels, 0);
+  }
+  #[inline]
+  pub fn add_fn_(&mut self, fn_: LutFn) {
+    self.fbb_.push_slot::<LutFn>(ElementwiseLutDef::VT_FN_, fn_, LutFn::SIGMOID);
+  }
+  #[inline]
+  pub fn add_input_zero_point(&mut self, input_zero_point: u32) {
+    self.fbb_.push_slot::<u32>(ElementwiseLutDef::VT_INPUT_ZERO_POINT, input_zero_point, 0);
+  }
+  #[inline]
+  pub fn add_output_zero_point(&mut self, output_zero_point: u32) {
+    self.fbb_.push_slot::<u32>(ElementwiseLutDef::VT_OUTPUT_ZERO_POINT, output_zero_point, 0);
+  }
+  #[inline]
+  pub fn add_input_scale(&mut self, input_scale: f32) {
+    self.fbb_.push_slot::<f32>(ElementwiseLutDef::VT_INPUT_SCALE, input_scale, 1.0);
+  }
+  #[inline]
+  pub fn add_output_scale(&mut self, output_scale: f32) {
+    self.fbb_.push_slot::<f32>(ElementwiseLutDef::VT_OUTPUT_SCALE, output_scale, 1.0);
+  }
+  #[inline]
+  pub fn add_runtime_dimensions(&mut self, runtime_dimensions: flatbuffers::WIPOffset<flatbuffers::Vector<'b , ElementwiseDimension>>) {
+    self.fbb_.push_slot_always::<flatbuffers::WIPOffset<_>>(ElementwiseLutDef::VT_RUNTIME_DIMENSIONS, runtime_dimensions);
+  }
+  #[inline]
+  pub fn new(_fbb: &'b mut flatbuffers::FlatBufferBuilder<'a>) -> ElementwiseLutDefBuilder<'a, 'b> {
+    let start = _fbb.start_table();
+    ElementwiseLutDefBuilder {
+      fbb_: _fbb,
+      start_: start,
+    }
+  }
+  #[inline]
+  pub fn finish(self) -> flatbuffers::WIPOffset<ElementwiseLutDef<'a>> {
+    let o = self.fbb_.end_table(self.start_);
+    flatbuffers::WIPOffset::new(o.value())
+  }
+}
+
+impl core::fmt::Debug for ElementwiseLutDef<'_> {
+  fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+    let mut ds = f.debug_struct("ElementwiseLutDef");
+      ds.field("width", &self.width());
+      ds.field("height", &self.height());
+      ds.field("channels", &self.channels());
+      ds.field("fn_", &self.fn_());
+      ds.field("input_zero_point", &self.input_zero_point());
+      ds.field("output_zero_point", &self.output_zero_point());
+      ds.field("input_scale", &self.input_scale());
+      ds.field("output_scale", &self.output_scale());
+      ds.field("runtime_dimensions", &self.runtime_dimensions());
+      ds.finish()
+  }
+}
 pub enum ExportDefOffset {}
 #[derive(Copy, Clone, PartialEq)]
 
@@ -2151,6 +2933,28 @@ impl<'a> ExportDef<'a> {
     }
   }
 
+  #[inline]
+  #[allow(non_snake_case)]
+  pub fn kernel_as_elementwise_unary_def(&self) -> Option<ElementwiseUnaryDef<'a>> {
+    if self.kernel_type() == KernelDef::ElementwiseUnaryDef {
+      let u = self.kernel();
+      Some(ElementwiseUnaryDef::init_from_table(u))
+    } else {
+      None
+    }
+  }
+
+  #[inline]
+  #[allow(non_snake_case)]
+  pub fn kernel_as_elementwise_lut_def(&self) -> Option<ElementwiseLutDef<'a>> {
+    if self.kernel_type() == KernelDef::ElementwiseLutDef {
+      let u = self.kernel();
+      Some(ElementwiseLutDef::init_from_table(u))
+    } else {
+      None
+    }
+  }
+
 }
 
 impl flatbuffers::Verifiable for ExportDef<'_> {
@@ -2167,6 +2971,8 @@ impl flatbuffers::Verifiable for ExportDef<'_> {
           KernelDef::FullyConnectedDef => v.verify_union_variant::<flatbuffers::ForwardsUOffset<FullyConnectedDef>>("KernelDef::FullyConnectedDef", pos),
           KernelDef::PoolingDef => v.verify_union_variant::<flatbuffers::ForwardsUOffset<PoolingDef>>("KernelDef::PoolingDef", pos),
           KernelDef::MatmulDef => v.verify_union_variant::<flatbuffers::ForwardsUOffset<MatmulDef>>("KernelDef::MatmulDef", pos),
+          KernelDef::ElementwiseUnaryDef => v.verify_union_variant::<flatbuffers::ForwardsUOffset<ElementwiseUnaryDef>>("KernelDef::ElementwiseUnaryDef", pos),
+          KernelDef::ElementwiseLutDef => v.verify_union_variant::<flatbuffers::ForwardsUOffset<ElementwiseLutDef>>("KernelDef::ElementwiseLutDef", pos),
           _ => Ok(()),
         }
      })?
@@ -2253,6 +3059,20 @@ impl core::fmt::Debug for ExportDef<'_> {
         },
         KernelDef::MatmulDef => {
           if let Some(x) = self.kernel_as_matmul_def() {
+            ds.field("kernel", &x)
+          } else {
+            ds.field("kernel", &"InvalidFlatbuffer: Union discriminant does not match value.")
+          }
+        },
+        KernelDef::ElementwiseUnaryDef => {
+          if let Some(x) = self.kernel_as_elementwise_unary_def() {
+            ds.field("kernel", &x)
+          } else {
+            ds.field("kernel", &"InvalidFlatbuffer: Union discriminant does not match value.")
+          }
+        },
+        KernelDef::ElementwiseLutDef => {
+          if let Some(x) = self.kernel_as_elementwise_lut_def() {
             ds.field("kernel", &x)
           } else {
             ds.field("kernel", &"InvalidFlatbuffer: Union discriminant does not match value.")
