@@ -19,10 +19,11 @@ for the Rocket NPU backend (RK3588). This repository produces:
 | `iree-build/iree-src` | `iree-org/iree` as a pinned git submodule. |
 | `iree-build` | CMake configuration used to build IREE with the Rocket driver/plugin. |
 
-Two documents sit alongside this one: [LIMITS.md](LIMITS.md) is what the stack
-is *measured* to do -- the channel, kernel, stride and precision bounds, and
-which of them each layer enforces -- and [ISSUES.md](ISSUES.md) is what is
-still open.
+Three documents sit alongside this one: [LIMITS.md](LIMITS.md) is what the
+stack is *measured* to do -- the channel, kernel, stride and precision bounds,
+and which of them each layer enforces -- [ISSUES.md](ISSUES.md) is what is
+still open, and [ROADMAP.md](ROADMAP.md) is which MLIR operations the hardware
+could run but the compiler cannot yet reach.
 
 ## Building
 
@@ -327,6 +328,41 @@ Rust target and cross-linker, and the host/aarch64 IREE builds described above.
 The compiled cases include the previously problematic VGG geometry (30x30,
 Cin=512, Cout=512, 3x3) and a 40-channel 3x3 depthwise convolution that crosses
 the driver's 32-channel weight-packing group boundary.
+
+`tools/e2e_matmul_regression.py` is the same gate for matmul, with the same
+flags:
+
+```sh
+python3 tools/e2e_matmul_regression.py --board "<board name>"
+```
+
+Its raw half runs the FC oracle tests from both `fc_hw` and `fc_phase3_hw`;
+its compiled half covers the ViT projection shape, MobileNetV2's classifier,
+the `K`/`N` channel ceilings, `M` at the matcher's 2047, `linalg.matvec` and
+`vecmat` through the GEMV raising, and two matmuls sharing a command buffer.
+**Seven of its eight cases are compared exactly.** A contraction can be gated
+exactly if its fixtures are ternary -- entries from `{-1, 0, 1}` are exact in
+f16, every product is, and the sums stay far inside f16's integer-exact range
+(measured |C|max 79 at `K` 768, 118 at 1792, against a ceiling of 2048). The
+eighth case is the same shape with realistic magnitudes and a tolerance, since
+ternary data never rounds and so cannot see a precision fault.
+
+`tools/e2e_pooling_regression.py` is the same gate for pooling, with the same
+flags:
+
+```sh
+python3 tools/e2e_pooling_regression.py --board "<board name>"
+```
+
+Its raw half runs the PPU oracle tests (max, padded max, min, average, tiled);
+its compiled half covers the average pool in NCHW and max pooling in both
+layouts at both strides, plus a tiled width and two pools sharing one command
+buffer. **Max pools are compared exactly.** A max pool returns one of its
+inputs unchanged, so fixtures generated in f16 and widened to f32 survive the
+shim's demote-and-widen round trip bit for bit, and any difference at all is a
+real fault. Averages cannot be exact -- the PPU's average is a multiply by
+`fp16(65536/k)` that the shim multiplies back out -- and take the `--atol`
+/`--rtol` defaults.
 
 ## Precision-transition probe
 

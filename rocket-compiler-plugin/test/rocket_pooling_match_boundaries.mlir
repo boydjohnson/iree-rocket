@@ -99,11 +99,18 @@ util.func public @avg_pool_stride2_falls_back(
   util.return %result : tensor<1x64x7x7xf32>
 }
 
-// Max pooling is a different op and this matcher must not claim it: the
-// executable it would dispatch to bakes method = "avg".
-// CHECK-LABEL: util.func public @max_pool_falls_back
-// CHECK: linalg.pooling_nchw_max
-util.func public @max_pool_falls_back(
+// Max pooling is a different op, and this matcher must not claim it: the
+// executable it dispatches to bakes method = "avg", which would silently
+// average a tensor the model asked to reduce by maximum.
+//
+// Since @match_pooling_nchw_max landed, a max pool is claimed -- but by its
+// own executable. Asserting *which* one is the point: a matcher that started
+// routing max pools into @rocket_pooling_executable would still be "claimed"
+// and still be wrong.
+// CHECK-LABEL: util.func public @max_pool_uses_the_max_executable
+// CHECK-NOT: @rocket_pooling_executable
+// CHECK: flow.dispatch @rocket_pooling_max_executable
+util.func public @max_pool_uses_the_max_executable(
     %input: tensor<1x64x8x8xf32>,
     %init: tensor<1x64x4x4xf32>) -> tensor<1x64x4x4xf32> {
   %window = tensor.empty() : tensor<2x2xf32>
@@ -113,4 +120,44 @@ util.func public @max_pool_falls_back(
     } ins(%input, %window : tensor<1x64x8x8xf32>, tensor<2x2xf32>)
       outs(%init : tensor<1x64x4x4xf32>) -> tensor<1x64x4x4xf32>
   util.return %result : tensor<1x64x4x4xf32>
+}
+
+// ------------------------------------------------------------------- NHWC
+
+// The NHWC counterpart, claimed by @match_pooling_nhwc_sum_avg since
+// 2026-09-05. It shares @rocket_pooling_executable with the NCHW shim -- the
+// executable takes NC1HWC2 cubes and knows nothing about the logical layout
+// its caller started from -- so only the shim differs, and it is the cheaper
+// one: NHWC is the hardware's own layout, so it transposes nothing.
+// CHECK-LABEL: util.func public @avg_pool_nhwc_matches
+// CHECK-NOT: linalg.pooling_nhwc_sum
+// CHECK: flow.dispatch @rocket_pooling_executable
+util.func public @avg_pool_nhwc_matches(
+    %input: tensor<1x7x7x1792xf32>,
+    %init: tensor<1x1x1x1792xf32>) -> tensor<1x1x1x1792xf32> {
+  %window = tensor.empty() : tensor<7x7xf32>
+  %result = linalg.pooling_nhwc_sum {
+      dilations = dense<1> : vector<2xi64>,
+      strides = dense<1> : vector<2xi64>
+    } ins(%input, %window : tensor<1x7x7x1792xf32>, tensor<7x7xf32>)
+      outs(%init : tensor<1x1x1x1792xf32>) -> tensor<1x1x1x1792xf32>
+  util.return %result : tensor<1x1x1x1792xf32>
+}
+
+// Stride 2 is rejected for the average in *both* layouts, and this is the one
+// remaining asymmetry in the pooling matchers: max and min both carry stride
+// 2, and `avg 2x2s2` is measured against the oracle in pooling_oracle_hw.rs,
+// so this is a missing executable rather than a missing measurement.
+// CHECK-LABEL: util.func public @avg_pool_nhwc_s2_rejected
+// CHECK: linalg.pooling_nhwc_sum
+util.func public @avg_pool_nhwc_s2_rejected(
+    %input: tensor<1x8x8x64xf32>,
+    %init: tensor<1x4x4x64xf32>) -> tensor<1x4x4x64xf32> {
+  %window = tensor.empty() : tensor<2x2xf32>
+  %result = linalg.pooling_nhwc_sum {
+      dilations = dense<1> : vector<2xi64>,
+      strides = dense<2> : vector<2xi64>
+    } ins(%input, %window : tensor<1x8x8x64xf32>, tensor<2x2xf32>)
+      outs(%init : tensor<1x4x4x64xf32>) -> tensor<1x4x4x64xf32>
+  util.return %result : tensor<1x4x4x64xf32>
 }

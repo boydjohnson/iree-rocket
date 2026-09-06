@@ -11,6 +11,9 @@ measurement, never ahead of one.
 Read this alongside [ISSUES.md](ISSUES.md), which carries the open defects.
 A limit here says "this was tested and works"; it does not say "everything
 inside it is safe" -- see [Hazards inside the limits](#hazards-inside-the-limits).
+A limit here also does not say the op is reachable at all: which *operations*
+the compiler can claim, as opposed to which shapes of them, is
+[ROADMAP.md](ROADMAP.md).
 
 Nothing here is a performance statement. Throughput, the CPU baseline the
 offload has to beat, and where the time actually goes are ISSUES.md P7/P8 and
@@ -136,7 +139,7 @@ timeouts**, under both the `Selectors` and `Counting` oracle patterns:
 
 | Dimension | Tested range | Bound by |
 |---|---|---|
-| `M` (conv width at height one) | 1..=2047 in the compiled path; 1..=296 measured in the HAL, 197 end to end | `CNA_DATA_SIZE0.datain_width` is 11 bits. The vendor FC sweep covers 1, 2, 7, 16, 32 (three CBUF splits); above the row-width limit above the planner splits column tiles -- see below |
+| `M` (conv width at height one) | 1..=2047, measured end to end at 2047 by `tools/e2e_matmul_regression.py` (exact) as well as in the compiled matcher; 1..=296 measured in the HAL | `CNA_DATA_SIZE0.datain_width` is 11 bits. The vendor FC sweep covers 1, 2, 7, 16, 32 (three CBUF splits); above the row-width limit above the planner splits column tiles -- see below |
 | `K` (conv `Cin`) | 1..=1792 | `MAX_INPUT_CHANNELS`; measured 512, 1024, 1344, 1792, 2048 |
 | `N` (conv `Cout`) | 1..=1792 | `MAX_OUTPUT_CHANNELS`; measured 64, 512, 1001, 1792, 2048 |
 
@@ -176,10 +179,12 @@ caveats; it is one input and one core allocation.
 |---|---|
 | Extents (H, W, C) | 1..=8192, the PPU's 13-bit N-1 range |
 | Kernel, directly programmed | 1..=8 per axis (`MAX_DIRECT_KERNEL`); a 16x16 window is rejected by the hardware |
-| Kernel, matched from a model | 2..=8 -- an fp16 average's reciprocal is `fp16(65536/k)`, and `k=1` needs 65536, past fp16's 65504 ceiling |
+| Kernel, matched from a model | 2..=8 for both methods. For the average the floor is forced -- its reciprocal is `fp16(65536/k)` and `k=1` needs 65536, past fp16's 65504 ceiling. For max `k=1` is programmable and excluded anyway: a 1x1 stride-1 max pool is an identity, and claiming it would spend a dispatch, a pack and a compaction to copy a tensor |
 | Kernel or stride, register range | 1..=16 |
-| Padding | 0..=7, the PPU's 3-bit range |
-| Stride, matched from a model | 1 only -- the executable bakes it |
+| Padding | 0..=7, the PPU's 3-bit range. Every matched executable bakes 0: model-level padding arrives as a separate `tensor.pad` the CPU runs |
+| Stride, matched from a model | avg 1; max and min 1 and 2 -- the executable bakes it, one per value. Stride 2 is measured against the oracle in `pooling_oracle_hw.rs`, for the average too (`avg 2x2s2`), so the average's stride-1 ceiling is a missing executable rather than a missing measurement -- the one remaining asymmetry in these matchers. Nothing above 2 is measured at any method |
+| Method, matched from a model | avg, max and min -- all three the PPU has. `PoolingMethod::pad_fill_value` has no measured identity for min at any precision, and none for max at int8, but an *unpadded* pool never reads that field and every matched executable bakes zero padding. The driver derives `padded` from those baked fields alone, so tiling cannot reintroduce it |
+| Layouts, matched from a model | avg NHWC and NCHW; max NHWC and NCHW; **min NHWC only** -- linalg defines `pooling_nchw_max` but no `pooling_nchw_min`, so there is no NCHW min op to claim. `pooling_*_unsigned` is unclaimed at every method: it is the unsigned-integer reduction and this path is f32 in, fp16 on the hardware |
 
 Pooling has a second, narrower limit: **direct tile width**, which is a hang
 rather than wrong data past the boundary. Measured on `planck` 2026-09-04 with
@@ -232,10 +237,31 @@ CPU today. Everything else falls back silently and correctly.
 | depthwise | NHWC HWC | f16/f16/f32 | 1x1, 3x3 | 1 | 1..=512 | = `Cin` |
 | depthwise | NCHW CHW | f16/f16/f32 | 1x1, 3x3 | 1, 2, 3, 4 | 1..=512 | = `Cin` |
 | depthwise | NHWC HWC | i8/i8/i32 | 1x1, 3x3 | 1, 2 | 1..=1344 | = `Cin` |
-| matmul | -- | f16/f16/f32 | -- | -- | `M` 1..=32, `K` 1..=1792 | `N` 1..=1792 |
+| matmul | -- | f16/f16/f32 | -- | -- | `M` 1..=2047, `K` 1..=1792 | `N` 1..=1792 |
+| matvec | -- | f16/f16/f32 | -- | -- | `M` 1..=2047, `K` 1..=1792 | `N` = 1 |
+| vecmat | -- | f16/f16/f32 | -- | -- | `M` = 1, `K` 1..=1792 | `N` 1..=1792 |
 | avg pool | NCHW sum | f32 | 2x2..=8x8 | 1 | H/W/C 1..=8192 | -- |
+| avg pool | NHWC sum | f32 | 2x2..=8x8 | 1 | H/W/C 1..=8192 | -- |
+| max pool | NHWC | f32 | 2x2..=8x8 | 1, 2 | H/W/C 1..=8192 | -- |
+| max pool | NCHW | f32 | 2x2..=8x8 | 1, 2 | H/W/C 1..=8192 | -- |
+| min pool | NHWC | f32 | 2x2..=8x8 | 1, 2 | H/W/C 1..=8192 | -- |
 
 All of these additionally require batch 1 and dilation 1.
+
+All three matmul rows have an end-to-end differential behind them:
+`tools/e2e_matmul_regression.py`, eight cases, all passing on `planck`
+2026-09-05. Seven are compared **exactly** using ternary fixtures -- `{-1, 0,
+1}` entries are exact in f16 and the sums stay inside its integer-exact range
+-- which is what lets a contraction be gated bit for bit rather than under a
+tolerance. The eighth is the ViT shape with realistic magnitudes, at
+max|error| 0.0011.
+
+`matvec` and `vecmat` have no matcher of their own: `rocket-expand-gemv-to-matmul`
+raises them into `linalg.matmul` with a unit extent before the match loop, so
+the matmul matcher, shim and executable claim them unchanged. `linalg.dot` is
+deliberately not raised -- it reduces to a scalar, and a dispatch plus a weight
+pack plus an output compaction to produce one number is not a trade worth
+making.
 
 Stride-3 and stride-4 *dense* fp16 matchers exist in the spec but are **not** in
 the `foreach_match` list. Depthwise NCHW carries strides 3 and 4; depthwise NHWC
@@ -244,9 +270,29 @@ fp16 has no strided matcher at all.
 Every accepted bound in that table has an immediately-adjacent rejected shape
 asserted in a lit test -- `rocket_int8_match_boundaries.mlir`,
 `rocket_fp16_match_boundaries.mlir`, `rocket_matmul_match_boundaries.mlir`,
-`rocket_pooling_match_boundaries.mlir` -- so widening a matcher cannot silently
+`rocket_pooling_match_boundaries.mlir`,
+`rocket_pooling_max_match_boundaries.mlir`,
+`rocket_pooling_min_match_boundaries.mlir` -- so widening a matcher cannot silently
 route a known-bad shape to the NPU, and tightening one cannot silently lose the
 largest measured-good shape.
+
+**An offloaded max or min pool is exact only up to f16.** The shim demotes to
+f16 before the hardware sees the tensor, so on arbitrary f32 activations the
+pool returns `f16(x)` rather than `x`. On VGG that is worth **0.077 max|error|
+on the logits** (top-1 unchanged), against 0 for the same model's int8
+convolutions, which are bit-exact. The gate's `max_pool_nhwc_dense` case is
+the isolated version of that cost, at 0.00024 on a 2x2 window.
+
+The pooling rows additionally have an end-to-end differential behind them:
+`tools/e2e_pooling_regression.py` compiles all three methods twice and
+compares on the board -- fourteen cases, all passing on `planck` 2026-09-05.
+Max and min are compared **exactly** and measure exact (max|error| 0 across
+both layouts where they exist, both strides, the 8x8 ceiling, a tiled width,
+and pools sharing a command buffer including a min-then-max transition),
+because a max or min pool returns one of its inputs unchanged and the
+fixtures are f16-exact. The average carries genuine f16 error, 0.0057 worst
+case at 49 taps, because the PPU's average is a multiply by `fp16(65536/k)`
+that the shim multiplies back out.
 
 What that adds up to on a real model, from `rocket-compiler audit` (2026-09-05):
 

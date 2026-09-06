@@ -4,6 +4,7 @@ iree_lit_test_suite(
   SRCS
     "rocket_annotate_placement.mlir"
     "rocket_conv_layout.mlir"
+    "rocket_expand_gemv_to_matmul.mlir"
     "rocket_expand_onnx_conv_integer.mlir"
     "rocket_int8_accumulator.mlir"
     "rocket_int8_match_boundaries.mlir"
@@ -17,6 +18,8 @@ iree_lit_test_suite(
     "rocket_pooling_dynamic_output_invalid.mlir"
     "rocket_pooling_invalid.mlir"
     "rocket_pooling_match_boundaries.mlir"
+    "rocket_pooling_max_match_boundaries.mlir"
+    "rocket_pooling_min_match_boundaries.mlir"
     "rocket_runtime_dimensions.mlir"
     "rocket_runtime_dimensions_invalid.mlir"
   TOOLS

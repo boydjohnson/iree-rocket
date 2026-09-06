@@ -30,6 +30,7 @@ set(_ROCKET_SRCS
   "RocketAnnotateFinalPlacementPass.cpp"
   "RocketAnnotateOriginalPlacementPass.cpp"
   "RocketDemoteConvInputsPass.cpp"
+  "RocketExpandGemvToMatmulPass.cpp"
   "RocketPinUnclaimedDispatchesPass.cpp"
   "RocketPromoteUnclaimedConvInputsPass.cpp"
   "RocketTarget.cpp"
