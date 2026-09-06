@@ -64,10 +64,19 @@ operations that no compiled `.vmfb` can reach:
 | conv → LUT as two tasks in one job | `activation.rs` `build_conv_then_lut_regcmd` | `conv_then_lut_hw` |
 | conv → EW add as two tasks in one job | `elementwise.rs` `build_conv_then_add_regcmd` | `conv_with_add_hw` |
 
-[`rocket_executable_def.fbs`](rocket-schema/schema/rocket_executable_def.fbs)
+~~[`rocket_executable_def.fbs`](rocket-schema/schema/rocket_executable_def.fbs)
 has four `KernelDef` union members -- `Conv2DDef`, `FullyConnectedDef`
 (deprecated, never emitted by any compiler), `PoolingDef`, `MatmulDef`. **None
-of the element-wise or LUT work above is expressible.**
+of the element-wise or LUT work above is expressible.**~~
+
+**Closed 2026-09-06 by Phase 1.** Three union members were appended --
+`ElementwiseUnaryDef` (5), `ElementwiseLutDef` (6) and
+`ElementwiseBinaryDef` (7) -- with decode and dispatch arms in
+`rocket-hal-driver` and serializer arms in `RocketTarget.cpp`. The two-tensor
+form is reachable from a compiled model behind `--elementwise`; the other two
+are expressible but no measured model contains an op that would use them (see
+Phase 1's op census). Chained conv->LUT and conv->EW as one job remain
+unexpressible: the wire format has no way to say "two tasks, one job".
 
 ### Gap 2 -- matchers
 
@@ -300,7 +309,66 @@ its immediately-adjacent rejected neighbour, as in
 **Buys**: real op coverage, no new hardware risk. **Costs**: per P8, possibly
 throughput. Gate behind a flag and measure both arms.
 
-### Phase 1 -- a wire format for what the HAL already validated
+### Phase 1 -- a wire format for what the HAL already validated -- LANDED 2026-09-06
+
+All four layers are in and the two-tensor path is board-validated end to end.
+What follows is the original plan; the corrections it needed are marked
+inline.
+
+**Landed:**
+
+| Kernel | Wire tag | Driver | Serializer | Matcher |
+|---|---|---|---|---|
+| `ElementwiseUnaryDef` (abs/neg/floor/ceil/add_scalar, fp16) | 5 | yes | yes | none -- no model uses these ops |
+| `ElementwiseLutDef` (9 curves, int8) | 6 | yes | yes | none -- the crate's LUT path is int8 and ViT's 61 `sqrt` are f32 |
+| `ElementwiseBinaryDef` (add/sub/mul/max/min, fp16) | 7 | yes | yes | `linalg.add`/`mul`/`sub` rank 3, behind `--elementwise` |
+
+**Two things the plan got wrong, both found by checking rather than
+assuming.**
+
+1. *"`iree-rocket-hal` -- no new work."* `build_lut_regcmd`'s
+   `DPU_DST_SURF_STRIDE`/`DPU_SURFACE_ADD` were `width * height *
+   task_channels`; those registers count 16-byte feature atoms, so the
+   channel factor made the stride 16x too large and every cube past one
+   surface came back with only its first surface written. Every LUT test in
+   the crate used `channels <= 16`, which is the one channel count that
+   cannot see it. Fixed, and gated by `lut_multi_surface_hw.rs`;
+   `build_unary_regcmd` had the same blind spot (`channels: 1`, uniform
+   fill) but not the bug, now gated by `ew_unary_multi_surface_hw.rs`.
+2. *"matchers for the `linalg` named element-wise ops, plus
+   `linalg.elementwise` and `linalg.map`."* An ONNX `Add` arrives as a
+   `linalg.generic` with an `arith.addf` body, and
+   `linalg-specialize-generic-ops` -- which `@__transform_main` runs twice
+   before the match loop -- turns it into the named `linalg.add`. So the
+   named op is right, but for a reason the plan did not state, and a matcher
+   written against `linalg.elementwise` or against the generic form matches
+   nothing silently. Established with a torch-onnx probe compiled through
+   this spec.
+
+**A third correction, to the ordering rather than the content.** The plan put
+`ElementwiseBinaryDef` last. An op census says it is the only one of the three
+with a target in a compiled model:
+
+  ViT              Add 123  Mul 74  Sqrt 61  Div 49  Sub 25  Pow 25
+  MobileNetV2 fp16 Conv 52  Clip 35  Add 10
+  MobileNetV2 int8 QLinearConv 47  Clip 35  Add 10
+
+`abs`/`neg`/`floor`/`ceil` appear in none of them. The unary and LUT wire
+formats are in and tested, but nothing compiles to them yet, and the honest
+next step for the LUT half is an fp16 LUT in the HAL (see Phase 2).
+
+**Measured, not claimed.** On `planck`, a three-op probe at ViT's
+`1x197x768` is `max|err| 0.0214` on a range of `[-7.4, 23.7]` against a
+`--no-offload` build -- f16 rounding across three chained ops and nothing
+else. ViT's audit goes from 12 offloaded sites to 184 (123 add, 49 mul, 12
+matmul) with the flag, and its CPU sites go from 260 to 553, because every
+offloaded op adds a `truncf`/`extf` pair. That growth is P8's law showing up
+exactly where it was predicted, and is why `--elementwise` is off by default.
+**No throughput claim is made; both arms still need timing on a real model.**
+
+---
+
+### Phase 1 -- the original plan
 
 **[`rocket-schema`](rocket-schema/schema/rocket_executable_def.fbs)**
 
@@ -340,12 +408,22 @@ throughput. Gate behind a flag and measure both arms.
   covers these (they pack, submit, wait and compact like anything else), but
   the op labels need extending so a mixed model's per-op table stays readable.
 
-**[`iree-rocket-hal`](iree-rocket-hal/)** -- no new work. Wire the existing
-`build_unary_regcmd` / `build_add_regcmd` / `build_lut_regcmd`.
+**[`iree-rocket-hal`](iree-rocket-hal/)** -- ~~no new work~~. This was wrong;
+see correction 1 above. `build_lut_regcmd` had a real surface-stride bug that
+only a multi-surface cube could see, and both unary builders needed a
+multi-surface gate before anything could rely on them.
 
 **[`rocket-compiler-plugin`](rocket-compiler-plugin/)** -- matchers for the
-`linalg` named element-wise ops, plus `linalg.elementwise` and `linalg.map`,
-behind the Phase 0 flag.
+`linalg` named element-wise ops, ~~plus `linalg.elementwise` and
+`linalg.map`~~, behind a flag. See correction 2: the named ops are what
+arrives, but only because `linalg-specialize-generic-ops` runs first, and
+`linalg.elementwise` is not produced by this pipeline at all.
+
+There was no "Phase 0 flag" to put them behind -- Phase 0 introduced none --
+so `--elementwise` is it. The entries ship commented out in the spec with a
+`//@ROCKET_ELEMENTWISE@` marker that `spec::enable_elementwise` uncomments,
+which keeps the conservative list in force for anything that reads the spec
+without going through `rocket-compiler`.
 
 > **Precision.** EW unary is fp16-only by design and must stay that way.
 > `EwUnaryShape`'s doc comment states the standard: there is no capture
@@ -495,10 +573,10 @@ service the existing "two menus" section performs for precisions.
 
 ## Recommended order
 
-**~~Phase 0~~ → ~~`mulf` investigation~~ → ~~Phase 3~~ → ~~C5~~ → Phase 1 → Phase 2.**
+**~~Phase 0~~ → ~~`mulf` investigation~~ → ~~Phase 3~~ → ~~C5~~ → ~~Phase 1~~ → Phase 2.**
 
-Phase 0, the `mulf` investigation, Phase 3 and C5 are done and
-board-validated; the rest stands.
+Phase 0, the `mulf` investigation, Phase 3, C5 and Phase 1 are done and
+board-validated; only Phase 2 stands.
 
 **Phase 0 produced the first counter-example to the warning above, and it is
 worth reading before Phases 1 and 2.** P8's law -- cost is flat per offloaded
@@ -521,7 +599,7 @@ back on the wrong side, which is what P8 lever #3 was really saying.
 | ~~`mulf`~~ | Done 2026-09-06. It was bounded, and it was one register field: `EwBinaryOp::Mul` is bit-exact on `planck`, as are `Max` and `Min`. It changes the scope of Phases 1 and 2 by *removing* their only hardware unknown -- what is left there is matcher and wire-format work, not RE |
 | ~~Phase 3~~ | Done 2026-09-06 (#26), and it delivered the throughput story it was ranked for: MobileNetV2-static-int8 is **1.80x faster** than a like-for-like CPU build on a full machine and level with it at two cores, from 1.5x slower. The one prediction here that was wrong is "needs no new schema breadth" -- carrying per-convolution calibration to a shared executable took a new `Conv2DQuantParam` enum and a `runtime_quantization` vector on `Conv2DDef` |
 | ~~C5~~ | Done 2026-09-06. It blocked both remaining phases by its own stated action item; `lut_zero_join_hw.rs` discharges it and both LUT quirks are shown not to reach this stack. It cost the phases nothing -- no table or register changed. Its one real finding was a wrong domain in `LutTable::log`'s doc comment, which is a standard Phase 2 should hold itself to |
-| Phase 1 | Breadth: makes the validated HAL capability expressible |
+| ~~Phase 1~~ | Done 2026-09-06. All four layers, three kernel kinds, and `linalg.add`/`mul`/`sub` reachable from a compiled model behind `--elementwise`. It cost two HAL fixes the plan said would not be needed and one wrong assumption about the op form -- see the phase for both. ViT goes 12 -> 184 offloaded sites with the flag; the throughput question is open and is why the flag exists |
 | Phase 2 | Breadth: new curves, the most additive and least urgent work here |
 
 Phases 1 and 2 land their matchers **behind a flag**, with the `--no-offload`
