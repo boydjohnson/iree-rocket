@@ -5368,7 +5368,19 @@ module attributes {transform.with_named_sequence} {
     %input_value = transform.get_operand %conv[0] : (!transform.any_op) -> !transform.any_value
     %filter_value = transform.get_operand %conv[1] : (!transform.any_op) -> !transform.any_value
     transform.iree.match.dim_bounds %input_value[3], umin = 1, umax = 512 : !transform.any_value
-    transform.iree.match.dim_bounds %filter_value[3], umin = 1, umax = 768 : !transform.any_value
+    // Cout has a *lower* bound of 32, and it is a measurement, not a
+    // convention. MobileNetV2's `112x112 Cin 48 -> Cout 24` pointwise
+    // convolution is wrong on this path: admitting it alone moves the
+    // model's logits from max|diff| 0.40 against a CPU reference to 4.71,
+    // with the mean rising from 0.07 to 0.99 against a logit standard
+    // deviation of 1.17 -- the output stops being a classification. Every
+    // other Cout the model asks for is exact, including 88, which is not a
+    // multiple of the 16-channel atom either, so the rule is not "whole
+    // atoms": 24 is simply below the smallest Cout measured correct (32).
+    // Bisected on `planck` 2026-09-06 by admitting convolutions in Cin
+    // order and then excluding this one shape, which restored the baseline
+    // exactly. 25..31 are untested and excluded with it.
+    transform.iree.match.dim_bounds %filter_value[3], umin = 32, umax = 768 : !transform.any_value
 
     %ins, %outs = transform.iree.match.cast_compatible_dag_from_root %root {
       ^bb0(%input: tensor<1x?x?x?xi8>, %weights: tensor<?x?x?x?xi8>,
@@ -5433,7 +5445,19 @@ module attributes {transform.with_named_sequence} {
     %input_value = transform.get_operand %conv[0] : (!transform.any_op) -> !transform.any_value
     %filter_value = transform.get_operand %conv[1] : (!transform.any_op) -> !transform.any_value
     transform.iree.match.dim_bounds %input_value[3], umin = 1, umax = 512 : !transform.any_value
-    transform.iree.match.dim_bounds %filter_value[3], umin = 1, umax = 768 : !transform.any_value
+    // Cout has a *lower* bound of 32, and it is a measurement, not a
+    // convention. MobileNetV2's `112x112 Cin 48 -> Cout 24` pointwise
+    // convolution is wrong on this path: admitting it alone moves the
+    // model's logits from max|diff| 0.40 against a CPU reference to 4.71,
+    // with the mean rising from 0.07 to 0.99 against a logit standard
+    // deviation of 1.17 -- the output stops being a classification. Every
+    // other Cout the model asks for is exact, including 88, which is not a
+    // multiple of the 16-channel atom either, so the rule is not "whole
+    // atoms": 24 is simply below the smallest Cout measured correct (32).
+    // Bisected on `planck` 2026-09-06 by admitting convolutions in Cin
+    // order and then excluding this one shape, which restored the baseline
+    // exactly. 25..31 are untested and excluded with it.
+    transform.iree.match.dim_bounds %filter_value[3], umin = 32, umax = 768 : !transform.any_value
 
     %ins, %outs = transform.iree.match.cast_compatible_dag_from_root %root {
       ^bb0(%input: tensor<1x?x?x?xi8>, %weights: tensor<?x?x?x?xi8>,
@@ -5641,8 +5665,19 @@ module attributes {transform.with_named_sequence} {
     // linalg.dot is deliberately untouched -- see the pass -- because it
     // reduces to a scalar, and a dispatch plus a weight pack plus an output
     // compaction to produce one number is not a trade worth making.
+    // Collapses an ONNX QLinearConv's five-op requantization epilogue into the
+    // single generic @match_dynamic_conv2d_int8_requant is written against,
+    // so the requantized path is reachable from a real model rather than only
+    // from a hand-written canonical form. Has to run after
+    // `iree-global-opt-quantized-conv-to-conv` (which is what produces the
+    // chain) and after the channels-last conversion (it matches
+    // `linalg.conv_2d_nhwc_hwcf`, and an NCHW convolution is not that op), and
+    // before the match loops that claim convolutions.
+    %requant_fused_funcs = transform.apply_registered_pass
+        "rocket-fuse-int8-requant-epilogue" to %canonical_funcs
+      : (!transform.any_op) -> !transform.any_op
     %gemv_funcs = transform.apply_registered_pass
-        "rocket-expand-gemv-to-matmul" to %canonical_funcs
+        "rocket-expand-gemv-to-matmul" to %requant_fused_funcs
       : (!transform.any_op) -> !transform.any_op
 
     // Rocket's ABI is f16-in/f32-accumulate (see call_rocket_dynamic_conv2d
