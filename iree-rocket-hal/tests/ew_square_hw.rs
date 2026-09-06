@@ -12,6 +12,14 @@
 //! every input, root cause not resolved. This LUT-based approach replaces
 //! that attempt entirely rather than keeping both.
 //!
+//! **That failure was specific to the self-aliased configuration, and it
+//! is not a limit on the MUL unit.** Read as one, it blocked `arith.mulf`
+//! in ROADMAP.md for months. A genuine two-tensor multiply --
+//! `EwBinaryOp::Mul`, operand fetched through ERDMA from its own buffer --
+//! is bit-exact on `planck` (`tests/ew_binary_hw.rs`, 2026-09-06). This
+//! table remains the right way to build `square` from a *single* tensor;
+//! nothing above is retracted.
+//!
 //! Cross-compile this test, copy the resulting binary to the RK3588 board
 //! (`planck`), and run the ignored tests there:
 //!

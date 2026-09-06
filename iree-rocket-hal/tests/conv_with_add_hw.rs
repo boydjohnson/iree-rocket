@@ -40,7 +40,9 @@ use std::{fs::OpenOptions, mem, os::unix::io::AsRawFd, ptr};
 use iree_rocket_hal::rocket::{
     conv::{self, Kernels},
     device::{Buffer, close_bo, fini_bo, prep_bo, submit_tasks},
-    elementwise::{ConvThenAddBuffers, EwAddShape, EwPrecision, build_conv_then_add_regcmd},
+    elementwise::{
+        ConvThenAddBuffers, EwAddShape, EwBinaryOp, EwPrecision, build_conv_then_add_regcmd,
+    },
 };
 
 const DEVICE_PATH: &str = "/dev/accel/accel0";
@@ -107,13 +109,13 @@ fn conv_shape() -> conv::Shape {
     }
 }
 
-fn add_shape(algo: u32) -> EwAddShape {
+fn add_shape(op: EwBinaryOp) -> EwAddShape {
     EwAddShape {
         width: EXTENT,
         height: EXTENT,
         channels: 1,
         precision: EwPrecision::Fp16,
-        algo,
+        op,
         // int8-only fields, unused for fp16.
         output_zero_point: 0,
         w_cvt_offset: 0,
@@ -122,11 +124,11 @@ fn add_shape(algo: u32) -> EwAddShape {
     }
 }
 
-/// Builds and submits the two-task `x <algo> w_fill` (real conv, real
+/// Builds and submits the two-task `x <op> w_fill` (real conv, real
 /// weight `weight_fill`, `x_fill` input) job as one `submit_tasks()` job,
 /// waits once on the final output, and returns the 16 real (decoded fp16)
 /// output pixels.
-fn run_conv_then_add(x_fill: f32, weight_fill: f32, w_fill: f32, algo: u32) -> Vec<f32> {
+fn run_conv_then_add(x_fill: f32, weight_fill: f32, w_fill: f32, op: EwBinaryOp) -> Vec<f32> {
     let file = OpenOptions::new()
         .read(true)
         .write(true)
@@ -165,7 +167,7 @@ fn run_conv_then_add(x_fill: f32, weight_fill: f32, w_fill: f32, algo: u32) -> V
             output_addr: buf_out.dma_address,
         };
         let (conv_cmds, add_cmds) =
-            build_conv_then_add_regcmd(&conv_shape(), KERNELS, &add_shape(algo), &bufs);
+            build_conv_then_add_regcmd(&conv_shape(), KERNELS, &add_shape(op), &bufs);
 
         let conv_cmd_bytes = conv_cmds.len() * mem::size_of::<u64>();
         let buf_cmd_conv = Buffer::new(fd, conv_cmd_bytes.next_multiple_of(4096), &file);
@@ -242,7 +244,7 @@ fn run_conv_then_add(x_fill: f32, weight_fill: f32, w_fill: f32, algo: u32) -> V
 #[test]
 #[ignore = "needs the real NPU device -- cross-compile for aarch64, copy to the board, run there"]
 fn conv_then_add_completes() {
-    let out = run_conv_then_add(1.0, 1.0, 1.0, 2);
+    let out = run_conv_then_add(1.0, 1.0, 1.0, EwBinaryOp::Add);
     eprintln!("conv_then_add_completes: output={out:?}");
 }
 
@@ -260,7 +262,7 @@ fn conv_then_add_tracks_x_plus_y() {
     let mut prev: Option<f32> = None;
 
     for x_fill in fills {
-        let raw = run_conv_then_add(x_fill, 1.0, 0.0, 2)[0];
+        let raw = run_conv_then_add(x_fill, 1.0, 0.0, EwBinaryOp::Add)[0];
         eprintln!("conv_then_add_tracks_x_plus_y: x_fill={x_fill}: output={raw}");
 
         if let Some(prev_raw) = prev {
@@ -287,7 +289,7 @@ fn conv_then_add_tracks_w_alone() {
     let mut prev: Option<f32> = None;
 
     for w_fill in fills {
-        let raw = run_conv_then_add(1.0, 0.0, w_fill, 2)[0];
+        let raw = run_conv_then_add(1.0, 0.0, w_fill, EwBinaryOp::Add)[0];
         eprintln!(
             "conv_then_add_tracks_w_alone: w_fill={w_fill} (accumulator held at 0): output={raw}"
         );
@@ -304,10 +306,11 @@ fn conv_then_add_tracks_w_alone() {
     }
 }
 
-/// Subtraction, via `algo=4` -- the TRM's real, distinct Minus opcode. The
+/// Subtraction, via `EwBinaryOp::Sub` (`ew_alu_algo=4`) -- the TRM's real,
+/// distinct Minus opcode. The
 /// conv+add sweep found fp16 subtraction always uses this opcode directly
-/// (unlike int8, which reuses `algo=2` with a negated scale -- see
-/// `EwAddShape::algo`'s doc comment), so this is the fp16-correct way to
+/// (unlike int8, which reuses Add with a negated scale -- see
+/// `EwAddShape::op`'s doc comment), so this is the fp16-correct way to
 /// test subtraction, not a scaled Add. Same weight=0 isolation as
 /// `conv_then_add_tracks_w_alone`: accumulator held at `0`, so output
 /// should track `-w_fill` (`0 - w_real`) as `w_fill` increases --
@@ -319,7 +322,7 @@ fn conv_then_sub_tracks_neg_w() {
     let mut prev: Option<f32> = None;
 
     for w_fill in fills {
-        let raw = run_conv_then_add(1.0, 0.0, w_fill, 4)[0];
+        let raw = run_conv_then_add(1.0, 0.0, w_fill, EwBinaryOp::Sub)[0];
         eprintln!(
             "conv_then_sub_tracks_neg_w: w_fill={w_fill} (accumulator held at 0): output={raw}"
         );

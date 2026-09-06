@@ -17,9 +17,18 @@
 //! confirmed shape; see [`build_add_regcmd`]'s own doc comment for exactly
 //! which register values are capture-confirmed vs. inferred.
 //!
-//! A standalone element-wise op (EW without a producing conv) would reuse
+//! A standalone element-wise op (EW without a producing conv) reuses
 //! [`build_add_regcmd`] directly, the same way [`build_lut_regcmd`] serves
-//! both the standalone and conv-then-LUT cases.
+//! both the standalone and conv-then-LUT cases -- confirmed on real
+//! hardware, bit-exact over non-uniform operands and four cube shapes, by
+//! `tests/ew_binary_hw.rs`. Worth stating because the independent
+//! reference emitter in `../rocket-userspace` reports the opposite for its
+//! own flying-main EW builder (`gen_ew_mul_fp16`: the ERDMA operand "reads
+//! as 0" without a conv/CACC main feed, so its runtime routes every
+//! element-wise binary op through an identity matmul instead). That is not
+//! true of this register program: `SURF_NOTCH`/`EW_SURF_NOTCH` stay zero
+//! here and the operand is still fetched correctly for every position of
+//! an 8-surface cube.
 //!
 //! [`build_lut_regcmd`]: crate::rocket::activation::build_lut_regcmd
 //! [`build_conv_then_lut_regcmd`]: crate::rocket::activation::build_conv_then_lut_regcmd
@@ -40,6 +49,63 @@ pub enum EwPrecision {
     Int8,
 }
 
+/// Which operation the EW core's operator stage applies to the two tensors
+/// [`build_add_regcmd`] combines.
+///
+/// The EW operator stage is one of two sub-units, selected by `EW_CFG.
+/// EW_OP_TYPE`: an ALU (`ew_op_type=0`, opcode in `ew_alu_algo`) and a
+/// multiplier (`ew_op_type=1`, no opcode field of its own). Every variant
+/// here is a real second-tensor op -- the operand always arrives from
+/// outside via ERDMA (`ew_op_src=1`), never from `EW_OP_VALUE_0..7`; the
+/// scalar-operand shape is [`EwUnaryShape`]'s job.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum EwBinaryOp {
+    /// `ew_alu_algo=2`. Hardware-confirmed at both precisions by the
+    /// 47-model conv+add sweep, and on real silicon by
+    /// `tests/conv_with_add_hw.rs`.
+    Add,
+    /// `ew_alu_algo=4`, the TRM's real Minus opcode. fp16 only in
+    /// practice: real `rknn-toolkit2` compiles route int8 subtraction
+    /// through `Add` with a negated scale instead -- see
+    /// [`EwAddShape::op`].
+    Sub,
+    /// `ew_alu_algo=0`. TRM-documented, and used by the reference
+    /// `../rocket-userspace` emitter, but not measured here yet.
+    Max,
+    /// `ew_alu_algo=1`. Same status as [`EwBinaryOp::Max`].
+    Min,
+    /// The MUL sub-unit rather than the ALU: `ew_op_type=1`,
+    /// `ew_alu_algo` cleared, and `ew_op_cvt_bypass=1` (the operand
+    /// converter is an add-shaped scale/offset that the multiplier does
+    /// not want). fp16 only here -- int8 MUL would need a scale recipe
+    /// no capture in this repo shows.
+    ///
+    /// This is the op ROADMAP.md's `mulf` investigation is about: it
+    /// unblocks `linalg.mul`, `powf`, `fma` and softmax scaling. The
+    /// register word it produces (`EW_CFG=0x108003C4` at fp16) is the
+    /// same one `../rocket-userspace`'s `gen_matmul_fp16(ew_mul=1)`
+    /// emits and validates bit-exact.
+    Mul,
+}
+
+impl EwBinaryOp {
+    /// Raw `ew_alu_algo` opcode (bits 19:16 of `EW_CFG`). `Mul` does not
+    /// use the ALU at all, so it clears the field.
+    fn alu_algo(self) -> u32 {
+        match self {
+            EwBinaryOp::Max => 0,
+            EwBinaryOp::Min => 1,
+            EwBinaryOp::Add => 2,
+            EwBinaryOp::Sub => 4,
+            EwBinaryOp::Mul => 0,
+        }
+    }
+
+    fn is_mul(self) -> bool {
+        matches!(self, EwBinaryOp::Mul)
+    }
+}
+
 /// Logical shape for the standalone EW-add/subtract task -- the second half
 /// of the two-task `Conv2d(x) +/- w` pipeline
 /// ([`build_conv_then_add_regcmd`]), or usable on its own
@@ -54,19 +120,19 @@ pub struct EwAddShape {
     /// Real (unpadded) channel count.
     pub channels: u32,
     pub precision: EwPrecision,
-    /// Raw `ew_alu_algo` opcode (bits 19:16 of `EW_CFG`). Only `2` (Add) and
-    /// `4` (Minus) are hardware-confirmed for this task shape, both
-    /// precisions, by the conv+add sweep -- the TRM's full documented set
-    /// also includes `0=Max, 1=Min, 3=Div, 5=Abs, 6=Neg, 7=Floor, 8=Ceil`,
-    /// untested here.
+    /// Which two-tensor operation to apply. Only [`EwBinaryOp::Add`] and
+    /// [`EwBinaryOp::Sub`] are hardware-confirmed for this task shape at
+    /// both precisions, by the conv+add sweep; see [`EwBinaryOp`] for the
+    /// status of each of the others.
     ///
-    /// The sweep also found this is NOT purely a caller preference: real
-    /// `rknn-toolkit2` compiles route subtraction differently by precision
-    /// -- fp16 always used the real `algo=4` (Minus) opcode directly (with
-    /// an unnegated `EW_CVT_SCALE_VALUE`); every int8 subtraction instead
-    /// reused `algo=2` (Add) with a negated scale. Pick `algo` accordingly;
-    /// this type does not choose for the caller.
-    pub algo: u32,
+    /// The sweep also found the Add/Sub choice is NOT purely a caller
+    /// preference: real `rknn-toolkit2` compiles route subtraction
+    /// differently by precision -- fp16 always used the real `algo=4`
+    /// (Minus) opcode directly (with an unnegated `EW_CVT_SCALE_VALUE`);
+    /// every int8 subtraction instead reused `algo=2` (Add) with a negated
+    /// scale. Pick `op` accordingly; this type does not choose for the
+    /// caller.
+    pub op: EwBinaryOp,
     /// int8 only, ignored for fp16: this task's own real, decoded output
     /// zero point. Also used verbatim (negated) to re-center the primary
     /// operand's own zero point in `BS_ALU_CFG` -- confirmed exact, 10/10
@@ -145,10 +211,14 @@ pub struct EwAddBuffers {
 /// hardware-confirmed) piece -- see [`EwAddShape::w_scale_ratio`]/
 /// [`EwAddShape::output_scale_ratio`]'s own doc comments.
 ///
-/// NOT YET RUN ON REAL HARDWARE through this exact function -- structurally
-/// confirmed via static capture evidence only, same status
-/// `build_conv_then_lut_regcmd` had before its own hardware round. See
-/// `tests/conv_with_add_hw.rs` for the gate this needs before trusting it.
+/// Hardware-confirmed at fp16, both chained and standalone. Chained:
+/// `tests/conv_with_add_hw.rs` (Add and Sub on `planck`, over uniform
+/// operands). Standalone: `tests/ew_binary_hw.rs`, the stronger gate --
+/// non-uniform operands, every element checked, all five [`EwBinaryOp`]
+/// variants bit-exact, and `Mul` also across a four-shape geometry ladder
+/// up to 14x14x64. The int8 branch is still capture-only: its
+/// `w_scale_ratio`/`output_scale_ratio` semantics remain the inferred
+/// piece described above.
 ///
 /// [`build_lut_regcmd`]: crate::rocket::activation::build_lut_regcmd
 pub fn build_add_regcmd(shape: &EwAddShape, bufs: &EwAddBuffers) -> Vec<RegCmd> {
@@ -157,10 +227,9 @@ pub fn build_add_regcmd(shape: &EwAddShape, bufs: &EwAddBuffers) -> Vec<RegCmd> 
         "build_add_regcmd: width, height, and channels must be nonzero"
     );
     assert!(
-        matches!(shape.algo, 2 | 4),
-        "build_add_regcmd: only ew_alu_algo 2 (Add) and 4 (Minus) are hardware-confirmed for \
-         this task shape, got {}",
-        shape.algo
+        !(shape.op.is_mul() && matches!(shape.precision, EwPrecision::Int8)),
+        "build_add_regcmd: EwBinaryOp::Mul is fp16 only -- an int8 multiply needs an \
+         EW_CVT/OUT_CVT scale recipe no capture in this repo shows"
     );
 
     const FEATURE_ATOMIC_SIZE: u32 = 16;
@@ -306,17 +375,24 @@ pub fn build_add_regcmd(shape: &EwAddShape, bufs: &EwAddBuffers) -> Vec<RegCmd> 
     // values are bit-identical to the retired fused-path constants; fp16's
     // are new (that path never emitted fp16).
     let (ew_cvt_type, edata_size) = if is_fp16 { (0, 2) } else { (1, 1) };
-    cmds.push(
-        Register::<DpuEwCfg>::new()
-            .ew_cvt_type(Bits::new(ew_cvt_type))
-            .ew_data_mode(Bits::new(1))
-            .edata_size(Bits::new(edata_size))
-            .ew_alu_algo(Bits::new(shape.algo))
-            .ew_relu_bypass(Bits::new(1))
-            .ew_lut_bypass(Bits::new(1))
-            .ew_op_src(Bits::new(1)) // operand from outside (the second tensor)
-            .build(),
-    );
+    let mut ew_cfg_builder = Register::<DpuEwCfg>::new();
+    ew_cfg_builder
+        .ew_cvt_type(Bits::new(ew_cvt_type))
+        .ew_data_mode(Bits::new(1))
+        .edata_size(Bits::new(edata_size))
+        .ew_alu_algo(Bits::new(shape.op.alu_algo()))
+        .ew_relu_bypass(Bits::new(1))
+        .ew_lut_bypass(Bits::new(1))
+        .ew_op_src(Bits::new(1)); // operand from outside (the second tensor)
+    if shape.op.is_mul() {
+        // The MUL sub-unit instead of the ALU, with the operand converter
+        // bypassed -- byte-for-byte the reference emitter's own fp16
+        // multiply word (`../rocket-userspace`'s EW_CFG_MUL, 0x108003C4).
+        ew_cfg_builder
+            .ew_op_type(Bits::new(1))
+            .ew_op_cvt_bypass(Bits::new(1));
+    }
+    cmds.push(ew_cfg_builder.build());
 
     if is_fp16 {
         cmds.push(zero::<DpuEwCvtOffsetValue>());
