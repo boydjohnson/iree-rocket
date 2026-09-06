@@ -127,6 +127,40 @@ run both arms at the same core allocation, and do not use `taskset -c 4,5` --
 the offload deficit it reports is roughly double the one a full machine sees
 (ISSUES.md P8).
 
+### Opt-in coverage: `--elementwise`
+
+The two-tensor element-wise matchers (`linalg.add`, `mul`, `sub` on a rank-3
+`1 x tokens x channels` tensor) ship **disabled**. They are written into
+`rocket_conv2d_transform_spec.mlir`'s `foreach_match` list but commented out
+behind a `//@ROCKET_ELEMENTWISE@` marker, so anything that reads the spec
+directly -- a bare `iree-compile` included -- gets the conservative list.
+`--elementwise` uncomments exactly those lines.
+
+They are off because they are measured to be slower, not because they are
+provisional. On ViT at the full machine (2026-09-06, `performance` governor,
+NPU IRQs on a big core, 7 repetitions):
+
+| cpus | `--no-offload` | 12 matmul sites | 184 sites (`--elementwise`) |
+|---|---|---|---|
+| 0-7 | 3973 ms | 3709 ms (1.07x faster) | 4655 ms (**1.17x slower**) |
+
+Correct either way -- `max|err|` 0.0060 on logits with a standard deviation of
+0.90, same predicted class -- and `ROCKET_PROFILE=1` shows the NPU is only
+**4.2%** of wall. The extra time is the per-dispatch NC1HWC2 round trip plus
+the `truncf`/`extf` CPU dispatches the shims add around each offloaded op
+(ViT's CPU sites go 260 to 553). No matcher bound fixes that; layout
+propagation would. See ROADMAP.md's Phase 1 and ISSUES.md P2/P8.
+
+The flag composes with `--no-offload`, and only in one order: the entries are
+enabled first and neutralized second, so the element-wise matchers are checked
+for `dim_bounds` and defeated along with the rest and the baseline arm runs
+the identical pipeline.
+
+```sh
+cargo run -p rocket-compiler -- audit --input vit.mlir --elementwise
+cargo run -p rocket-compiler -- audit --input vit.mlir --elementwise --no-offload
+```
+
 ### Placement pinning
 
 The Rocket backend has no code generator. `serializeExecutable` only knows how
