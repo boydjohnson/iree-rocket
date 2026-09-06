@@ -269,12 +269,14 @@ impl LutTable {
 
     /// `log(x)` (natural log). See `lut_tables::LOG_LE`/`_LO`'s own doc
     /// comment for the generation formula and the real, load-bearing
-    /// domain restriction: only accurate for `x` in roughly `[0.02, e)`
-    /// (`e~=2.718`) -- unlike `rsqrt()` (clamped on one side only), `log`
-    /// clamps on BOTH sides (`32767` near the domain's far edge, `-32768`
-    /// near `x=0`) since it is unbounded in both directions. Both clamps
-    /// are at least sign-correct. `bn_scale_k` here MUST equal
-    /// `LOG_BN_SCALE_K`.
+    /// domain restriction: only accurate for `x` in `[1/e, e)`
+    /// (`~[0.368, 2.718)`) -- unlike `rsqrt()` (clamped on one side
+    /// only), `log` clamps on BOTH sides (`32767` at and above `e`,
+    /// `-32768` at and below `1/e`) since it is unbounded in both
+    /// directions and `|log(x)| <= 1.0` is all this Q15 encoding holds.
+    /// Both clamps are at least sign-correct. A caller feeding `x` below
+    /// `1/e` gets a silent flat `-1.0`, not a large negative number.
+    /// `bn_scale_k` here MUST equal `LOG_BN_SCALE_K`.
     pub fn log() -> Self {
         LutTable {
             le_entries: &crate::rocket::lut_tables::LOG_LE,

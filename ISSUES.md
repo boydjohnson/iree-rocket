@@ -22,9 +22,10 @@ developer or a measurement, **S3** performance, **S4** hygiene.
 This file is what is still open. [LIMITS.md](LIMITS.md) is the complement:
 what the stack is measured to do, and which layer enforces each bound.
 [ROADMAP.md](ROADMAP.md) is the third: which MLIR operations the hardware could
-run but no compiled model can reach yet. Two of its phases are gated on issues
-here by name -- C5 blocks the LUT path in a compiled model, and P8's measured
-per-dispatch cost is why its coverage matchers land behind a flag.
+run but no compiled model can reach yet. One of its phases is gated on an
+issue here by name: P8's measured per-dispatch cost is why its coverage
+matchers land behind a flag. C5, which used to gate the LUT path in a compiled
+model, was resolved 2026-09-06 -- see **Resolved**.
 
 Trimmed 2026-09-05: issues that are settled were cut down to one entry each
 in **Resolved** at the end, which keeps their IDs resolvable without keeping
@@ -134,53 +135,6 @@ Two candidate confounds for the repo's observation, and I ruled out the first:
 Worth retesting, because it gates P4 (the CBUF reuse bits require an
 uninterrupted job) and it removes one submit ioctl + one blocking fence wait per
 tile.
-
----
-
-## C5 (S2) — LUT tables carry `q = 0` entries at exactly the inputs models hit
-
-`encodings/dpu-lut-activation.md` QUIRK 4 [notes]:
-
-> A **zero-valued LUT table entry** trips a decode fault in the output
-> converter: it emits a constant **~4.0**, not 0. ... **Fix: floor every
-> shifted-table entry to `q>=1`.**
-
-Scanning `iree-rocket-hal/src/rocket/lut_tables.rs` [verified] — `q = 0` entries
-and where they sit:
-
-| table | zero at index | what input that is |
-|---|---|---|
-| `TANH_LE` / `TANH_LO` | 512 / 0 | x → 0⁻ and x = 0 |
-| `ERF_LE` / `ERF_LO` | 512 / 0 | x = 0 |
-| `SQUARE_LE` / `SQUARE_LO` | 510–512 / 0–2 | x ≈ 0 |
-| `SQRT_LE` / `SQRT_LO` | 0 / 0 | x = 0 |
-| `RSQRT_LE` | 0 | x = 0 |
-| `LOG_LE` / `LOG_LO` | 0 / 128 | x = 0, log(1) = 0 |
-
-`SIGMOID_*`, `EXP_*`, `RECIPROCAL_*` are clean.
-
-**Not confirmed as a live bug here**, and the counter-evidence is in this tree:
-`lut_standalone_tanh_matches_oracle` drives fill = 0 (real input 0.0) and
-asserts zero mismatches against the oracle. If tanh(0) were coming back as ~4.0
-it would saturate and that assertion would fail. So either the quirk does not
-reach this repo's int8-output LUT configuration, or the vendor-captured tables
-decode differently from the notes' `build_lut_shifted` tables. The notes
-themselves scope QUIRK 4 to the shifted-table build and flag the sigmoid/tanh
-deep tail as *"flagged, not chased."*
-
-What is genuinely untested here:
-
-- The **fp16-output** LUT configuration, if this repo ever uses one.
-- The **deep tails** (`TANH_LE[512]`, `SQUARE`, `LOG_LO[128]`), which no current
-  test drives.
-- **QUIRK 2**, a separate mux glitch: within ~±0.0015 of exactly 0, signed-output
-  kinds emit a discrete `+128` spike. tanh, erf and log are all signed-output.
-  The notes warn a sparse-linspace gate steps straight over the band and that
-  only dense random sampling finds it. `lut_standalone_tanh_matches_oracle`
-  drives a handful of discrete fills, so it would not see this.
-
-Action: add a dense sweep near 0 for every signed-output kind, and drive the
-tails at least once, before relying on the LUT path in a compiled model.
 
 ---
 
@@ -1292,6 +1246,63 @@ What was settled and how, newest first, in place of the narratives — those are
 in this file's git history (`git log -p ISSUES.md`). Everything cited below is
 something that still exists: a commit, a file, or a memory.
 
+**C5 (S2) — 2026-09-06. Neither LUT quirk reaches this stack; the one real
+defect the sweep found was a doc comment.** C5 asked whether QUIRK 4 (a `q = 0`
+table entry mis-decoding to a garbage `~4.0`) and QUIRK 2 (a discrete `+128`
+mux spike within ~±0.0015 of `x = 0` on signed-output kinds) apply to this
+crate's int8-output `build_lut_regcmd`, and noted the existing gates could not
+have seen either: each drives 6-13 hand-picked *uniform* fills per kind, and
+the notes say a sparse gate steps straight over QUIRK 2's band.
+`tests/lut_zero_join_hw.rs` answers both, board-run on `planck`, all green.
+
+The mechanism that makes it cheap: `push_lut_tables_and_config` sets
+`LE_START=-16384, LE_END=0, LO_START=0, LO_END=16384`, so **`LE[512]` and
+`LO[0]` are both fixed-domain index 0, i.e. real `x = 0`** — the LE/LO join.
+Every `q = 0` entry C5 lists except `LOG_LO[128]` (`log 1 = 0`) sits exactly
+there, so QUIRK 4's target and QUIRK 2's band are the same neighbourhood and
+one dense probe tests both.
+
+- **QUIRK 2 does not occur.** At `input_scale = 1/32768` all 256 int8 codes
+  collapse into `x` in `[-0.0039, +0.0039]` — ~100 of them inside the quoted
+  band, and *every* code within the single 32-wide table cell on each side of
+  the join. `tanh`, `erf` (the signed-output kinds C5 names), `square`,
+  `sigmoid` and `exp`: **0 spikes, worst error 1.08 LSB**, and `tanh`/`erf`
+  return exactly byte 0 at `x = 0`. int8 input is also why this is *complete*
+  rather than a denser-sample-please: the reachable inputs are a lattice of
+  spacing `input_scale`, so exactly one of them is `x = 0` and there is
+  nothing finer to probe.
+- **QUIRK 4 does not occur.** The `square` near-zero probe drives nothing but
+  the six `q = 0` entries (`SQUARE_LE[510..512]`, `SQUARE_LO[0..2]`) and
+  returns byte 0 at every code, worst error 1.5e-5. Stronger still:
+  `SQRT_LE`/`RSQRT_LE`/`LOG_LE` are all-zero *placeholder* tables — 513
+  consecutive `q = 0` entries each — and a negative input to `sqrt` returns
+  ~0, not garbage, for all 128 negative codes. Every saturation the sweep does
+  observe is a documented in-table clamp (`RSQRT_LO`/`LOG_LO`/`RECIPROCAL_*`
+  at their Q15 limits), never a `q = 0` decode.
+- **Tails driven.** The full-code sweep runs all 256 codes per kind in **one
+  NPU job** (the LUT is pointwise and both cubes share geometry, so element
+  `i` out is `f(element i in)`), covering both saturating ends of all nine
+  kinds. 9 of 10 sweeps pass at **≤ 1 LSB** first time.
+
+**The one real finding: `LutTable::log`'s domain was documented an order of
+magnitude too wide.** Both doc comments claimed accuracy for `x` in
+`[0.02, e)` while the same paragraph said the ceiling is `log(e) = 1.0` — a
+Q15 encoding that cannot hold `log x` past `+1` cannot hold it past `−1`
+either, so the floor is `1/e`, not 0.02. Hardware agreed with the table: codes
+2..23 returned a flat `−1.0`, the `−32768` clamp, exactly as `LOG_LO[0..47]`
+holds it. The true window is `[1/e, e)`, entries `48..=347`, `x` in
+`[0.375, 2.711]`. `lut_log_hw.rs` already said `[1/e, e)` and its fills
+already started at code 24; only the two library doc comments were wrong, and
+both are fixed. A caller trusting the old bound and feeding `x = 0.05` got a
+silent `−1.0`.
+
+Method note for anything that reuses the patterned harness:
+`lut_ramp_agrees_with_uniform_fill` is not decoration. It asserts that a
+monotone input ramp yields monotone output *and* that the ramp's answer at four
+codes equals the established uniform-fill harness's answer at those same codes.
+Without it, a DPU_RDMA/DPU_WDMA walk-order mismatch would have failed every
+oracle in the file for a harness reason and read as a hardware hazard.
+
 **C10 (S2) — 2026-09-05. A wide input row returned silently wrong data, and
 the planner never split it.** Two faults, both in `conv.rs`, neither in the
 CBUF capacity arithmetic the issue first blamed. (1) A surface-layout line is
@@ -1410,7 +1421,7 @@ longer exists for one of the two precisions.
    "layout propagation" lever P8 did not test; bounded at ~10% and
    shape-selective (one convolution carries a third of the model's
    compaction). **P7** is the case that most needs it.
-7. **C9, C5, C6, C7, D1, D2** — limitations, hygiene and reconciliation. C9 is
+7. **C9, C6, C7, D1, D2** — limitations, hygiene and reconciliation. C9 is
    the only S2 among them: above 3x3 there is a `Cin` cliff that hangs at every
    precision and an int8 program that is wrong at every shape, both now behind
    loud refusals rather than fixed.

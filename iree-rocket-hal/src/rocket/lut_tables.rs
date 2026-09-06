@@ -580,14 +580,23 @@ pub const RSQRT_LO: [u16; 513] = [
 /// real domain edge `x=4.0`. `log` is unbounded in BOTH directions
 /// (`-infinity` as `x->0+`, `+infinity` as `x->infinity`), so like
 /// `rsqrt`, this table is only accurate across part of its declared
-/// domain: real values only for `x` in roughly `[0.02, e)` (`e~=2.718`,
-/// where `log(e)=1.0` hits this encoding's ceiling) -- `x` in `(e, 4]`
-/// clamps to `32767` (log "saturates" at the max representable value),
-/// and `x` very close to `0` clamps to `-32768` (log "saturates" at the
-/// min representable value) purely because those real values overflow
-/// Q15, not because the true function is actually flat there. Both
-/// clamp directions are at least sign-correct (very negative near `0`,
-/// very positive near the far edge), unlike a naive zero-fill would be.
+/// domain: real values only for `x` in `[1/e, e)` (`~[0.368, 2.718)`),
+/// the window where `|log(x)| <= 1.0` fits this encoding. `x >= e`
+/// clamps to `32767` and `x <= 1/e` clamps to `-32768` (log "saturates"
+/// at the max/min representable value) purely because those real values
+/// overflow Q15, not because the true function is actually flat there.
+/// Both clamp directions are at least sign-correct (very negative near
+/// `0`, very positive near the far edge), unlike a naive zero-fill would
+/// be. On the table's own 32-wide index grid the accurate window is
+/// entries `48..=347`, i.e. `x` in `[0.375, 2.711]`.
+///
+/// The lower bound used to be documented here (and on `LutTable::log`) as
+/// `0.02`, which contradicted this same paragraph's own statement that
+/// the ceiling is `log(e)=1.0`: a Q15 encoding that cannot hold `log(x)`
+/// past `+1` cannot hold it past `-1` either, so the floor is `1/e`, an
+/// order of magnitude higher. Hardware confirms the table, not the old
+/// comment -- `lut_zero_join_hw.rs`'s full-code sweep drives every code
+/// and gets the flat `-1.0` clamp for all of `x < 0.375`.
 ///
 /// `LOG_LE` (`x<0`) is entirely placeholder (`0`) -- `log` is undefined
 /// there, not just inaccurate, same status as `SQRT_LE`/`RSQRT_LE`.

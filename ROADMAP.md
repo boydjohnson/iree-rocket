@@ -58,7 +58,7 @@ operations that no compiled `.vmfb` can reach:
 
 | Capability | Builder | Hardware test |
 |---|---|---|
-| 9 LUT curves: sigmoid, tanh, exp, square, erf, sqrt, rsqrt, log, reciprocal | [`activation.rs`](iree-rocket-hal/src/rocket/activation.rs) `build_lut_regcmd` | `lut_hw`, `lut_exp_hw`, `lut_erf_hw`, `lut_sqrt_hw`, `lut_rsqrt_hw`, `lut_log_hw`, `lut_reciprocal_hw`, `ew_square_hw` |
+| 9 LUT curves: sigmoid, tanh, exp, square, erf, sqrt, rsqrt, log, reciprocal | [`activation.rs`](iree-rocket-hal/src/rocket/activation.rs) `build_lut_regcmd` | `lut_zero_join_hw` (all 256 int8 codes, every kind), `lut_hw`, `lut_exp_hw`, `lut_erf_hw`, `lut_sqrt_hw`, `lut_rsqrt_hw`, `lut_log_hw`, `lut_reciprocal_hw`, `ew_square_hw` |
 | EW binary add / subtract / **multiply** / max / min, standalone or chained | [`elementwise.rs`](iree-rocket-hal/src/rocket/elementwise.rs) `build_add_regcmd`, `EwBinaryOp` | `ew_binary_hw` (all five, bit-exact), `conv_with_add_hw` |
 | EW unary abs / neg / floor / ceil, and add-with-scalar | `elementwise.rs` `build_unary_regcmd` | `ew_unary_hw`, `ew_round_hw` |
 | conv → LUT as two tasks in one job | `activation.rs` `build_conv_then_lut_regcmd` | `conv_then_lut_hw` |
@@ -352,13 +352,17 @@ behind the Phase 0 flag.
 > confirming an int8 zero-point/scale recipe for this task shape, and this crate
 > does not ship an int8 branch with zero hardware evidence behind it.
 
-> **Gated on [ISSUES.md C5](ISSUES.md).** C5's own action item is *"add a dense
+> **~~Gated on ISSUES.md C5~~ -- cleared 2026-09-06.** C5 asked for *"a dense
 > sweep near 0 for every signed-output kind, and drive the tails at least once,
-> **before relying on the LUT path in a compiled model**."* Phase 1 is precisely
-> the step that starts relying on it. C5 also names QUIRK 2 -- a discrete `+128`
-> spike within ~±0.0015 of zero on signed-output kinds, which `tanh`, `erf` and
-> `log` all are -- and warns that a sparse-linspace gate steps straight over the
-> band. Do C5's sweep first.
+> **before relying on the LUT path in a compiled model**."* That is
+> [`lut_zero_join_hw.rs`](iree-rocket-hal/tests/lut_zero_join_hw.rs), board-run
+> on `planck`: neither QUIRK 2 (the `+128` mux spike at `x~0`) nor QUIRK 4 (a
+> `q = 0` entry decoding to `~4.0`) reaches this crate's int8-output LUT path.
+> All 256 int8 codes now gate every kind, 9 of 10 at ≤ 1 LSB. Phase 1 may rely
+> on the LUT path. See ISSUES.md **Resolved**, and note the one real defect the
+> sweep found: `LutTable::log` is accurate only on `[1/e, e)`, not the
+> `[0.02, e)` its doc comment used to claim -- below `x = 0.375` it returns a
+> silent `-1.0` clamp.
 
 ### Phase 2 -- new LUT tables
 
@@ -370,8 +374,20 @@ documented domain restriction, one `*_hw.rs` oracle test run on `planck`.
 - **Tier 2**, domain design first: `asin` `acos` `atanh`, then the trig and
   inverse-hyperbolic set
 
-C5 gates this even harder than Phase 1: adding nine tables generated the same
-way propagates the same `q = 0` decode question ninefold. Fix C5 first.
+C5 used to gate this even harder than Phase 1, on the grounds that adding nine
+tables generated the same way would propagate the same `q = 0` decode question
+ninefold. It is cleared (2026-09-06): `q = 0` entries decode as 0 on this
+hardware, including the 513-entry all-zero placeholder tables
+`SQRT_LE`/`RSQRT_LE`/`LOG_LE`, so a self-derived table's zeros are safe.
+
+What C5 leaves behind for this phase is a *domain* discipline, not a decode
+one. The defect it actually found was `LutTable::log`'s documented domain being
+an order of magnitude too wide, silently returning a `-1.0` clamp below
+`x = 0.375`. Every table here is Q15 and holds `|f(x)| <= 1.0`; state each new
+kind's accurate window as the range where that actually holds, and add the kind
+to [`lut_zero_join_hw.rs`](iree-rocket-hal/tests/lut_zero_join_hw.rs)'s
+full-code sweep, which drives all 256 input codes in a single NPU job and would
+have caught it.
 
 Board protocol applies -- accumulator results are order-dependent and the NPU
 can go sick until reboot, so measure one shape per process.
@@ -479,10 +495,10 @@ service the existing "two menus" section performs for precisions.
 
 ## Recommended order
 
-**~~Phase 0~~ → ~~`mulf` investigation~~ → ~~Phase 3~~ → C5 → Phase 1 → Phase 2.**
+**~~Phase 0~~ → ~~`mulf` investigation~~ → ~~Phase 3~~ → ~~C5~~ → Phase 1 → Phase 2.**
 
-Phase 0, the `mulf` investigation and Phase 3 are done and board-validated;
-the rest stands.
+Phase 0, the `mulf` investigation, Phase 3 and C5 are done and
+board-validated; the rest stands.
 
 **Phase 0 produced the first counter-example to the warning above, and it is
 worth reading before Phases 1 and 2.** P8's law -- cost is flat per offloaded
@@ -504,7 +520,7 @@ back on the wrong side, which is what P8 lever #3 was really saying.
 | ~~Phase 0~~ | Done 2026-09-05, and **measured**. MobileNetV2 and ViT are unaffected (dispatch-site counts identical). VGG's five `onnx.MaxPool` sites now offload and it is **1.26x faster** for it -- 1018 ms to 806 ms median, five interleaved passes. See below: this is the first counter-example to P8's law |
 | ~~`mulf`~~ | Done 2026-09-06. It was bounded, and it was one register field: `EwBinaryOp::Mul` is bit-exact on `planck`, as are `Max` and `Min`. It changes the scope of Phases 1 and 2 by *removing* their only hardware unknown -- what is left there is matcher and wire-format work, not RE |
 | ~~Phase 3~~ | Done 2026-09-06 (#26), and it delivered the throughput story it was ranked for: MobileNetV2-static-int8 is **1.80x faster** than a like-for-like CPU build on a full machine and level with it at two cores, from 1.5x slower. The one prediction here that was wrong is "needs no new schema breadth" -- carrying per-convolution calibration to a shared executable took a new `Conv2DQuantParam` enum and a `runtime_quantization` vector on `Conv2DDef` |
-| C5 | Blocks both remaining phases by its own stated action item |
+| ~~C5~~ | Done 2026-09-06. It blocked both remaining phases by its own stated action item; `lut_zero_join_hw.rs` discharges it and both LUT quirks are shown not to reach this stack. It cost the phases nothing -- no table or register changed. Its one real finding was a wrong domain in `LutTable::log`'s doc comment, which is a standard Phase 2 should hold itself to |
 | Phase 1 | Breadth: makes the validated HAL capability expressible |
 | Phase 2 | Breadth: new curves, the most additive and least urgent work here |
 
