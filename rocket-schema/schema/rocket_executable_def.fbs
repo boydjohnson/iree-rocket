@@ -76,6 +76,68 @@ enum PoolingDimension : ubyte {
   STRIDE_Y = 6,
 }
 
+// Wire-format values, independent of the EW ALU's `ew_alu_algo` register
+// encoding. Keeping them independent is not only convention here: the
+// conv+add sweep found real rknn-toolkit2 compiles route int8 subtraction as
+// `algo = 2` (Add) with a negated scale rather than `algo = 4`, so the
+// register opcode is genuinely not a function of the logical operation alone.
+//
+// Split into unary and binary rather than one EwOp list, for the same reason
+// PoolingMethod has no SUM: a single list spanning both tables would let a
+// producer name ADD in an ElementwiseUnaryDef, which is a wire state the
+// runtime could not execute. Each enum is closed over what its own table can
+// actually run.
+enum EwUnaryOp : ubyte {
+  ABS = 0,
+  NEG = 1,
+  FLOOR = 2,
+  CEIL = 3,
+  // x + operand, with the scalar in ElementwiseUnaryDef.operand. Named
+  // separately from the binary ADD because it is a different table and a
+  // different operand source (EW_OP_VALUE_0, not a second tensor).
+  ADD_SCALAR = 4,
+}
+
+// Wire-format values for the two-tensor EW ops.
+//
+// There is deliberately no DIV. `ew_alu_algo = 3` is the one TRM-documented
+// binary opcode with no hardware evidence behind it anywhere in this project,
+// and iree-rocket-hal's EwBinaryOp does not carry it either.
+enum EwBinaryOp : ubyte {
+  ADD = 0,
+  SUB = 1,
+  MUL = 2,
+  MAX = 3,
+  MIN = 4,
+}
+
+// Which LUT curve an ElementwiseLutDef selects. Wire-format values, unrelated
+// to table content or to the per-function BN scale constant each curve
+// carries in iree-rocket-hal's LutTable.
+enum LutFn : ubyte {
+  SIGMOID = 0,
+  TANH = 1,
+  EXP = 2,
+  SQUARE = 3,
+  ERF = 4,
+  SQRT = 5,
+  RSQRT = 6,
+  LOG = 7,
+  RECIPROCAL = 8,
+}
+
+// Element-wise shape fields that may be supplied by dispatch push constants,
+// shared by ElementwiseUnaryDef and ElementwiseLutDef. Numeric values are
+// wire-format ABI and must not be changed or reused.
+//
+// These ops have no reduction: input and output geometry are identical, so
+// one list covers both ends and there is no output extent to disagree with.
+enum ElementwiseDimension : ubyte {
+  WIDTH = 0,
+  HEIGHT = 1,
+  CHANNELS = 2,
+}
+
 // Matmul shape fields that may be supplied by dispatch push constants.
 // Numeric values are wire-format ABI and must not be changed or reused.
 enum MatmulDimension : ubyte {
@@ -287,6 +349,116 @@ table MatmulDef {
   runtime_dimensions:[MatmulDimension];
 }
 
+// Describes one standalone unary element-wise operation on the EW ALU.
+//
+// A self-contained DPU + DPU_RDMA job: it reads the NC1HWC2 input cube,
+// applies one ALU opcode per element, and writes the output cube with
+// identical geometry. No convolution block participates, so there are no
+// weights, no bias and no reduction.
+//
+// fp16 only, and there is deliberately no precision field. iree-rocket-hal's
+// EwUnaryShape carries no int8 branch: unlike the two-tensor path, no capture
+// exists confirming an int8 zero-point/scale recipe for this task shape, and
+// this project does not ship an int8 branch with no hardware evidence behind
+// it. A precision field here would be a wire state the runtime must refuse.
+// If an int8 recipe is ever established, appending the field then is the
+// FlatBuffers-compatible move; declaring it now is not.
+table ElementwiseUnaryDef {
+  width:uint32;
+  height:uint32;
+
+  // The operation is elementwise, so input and output channel counts are
+  // necessarily equal and this is one field rather than a pair that could
+  // disagree with itself -- the same reasoning as PoolingDef.channels.
+  channels:uint32;
+
+  op:EwUnaryOp = ABS;
+
+  // Only meaningful when op is ADD_SCALAR: the scalar operand as
+  // `f32::to_bits`, an IEEE-754 binary32 bit pattern rather than a number,
+  // matching Conv2DQuantParam's stated convention for bit-pattern payloads.
+  // The EW ALU's datapath upconverts fp16 to fp32 internally, which is why
+  // the operand register is fed a binary32 encoding. Must be zero for every
+  // other op, which the runtime enforces.
+  operand:uint32;
+
+  // Ordered list mapping dispatch push-constant ordinal to a shape field,
+  // with the same contract as Conv2DDef.runtime_dimensions: each entry
+  // consumes one uint32 push constant, the listed field must be zero in this
+  // table, entries must be unique, and an absent vector preserves a fully
+  // static ABI.
+  runtime_dimensions:[ElementwiseDimension];
+}
+
+// Describes one standalone two-tensor element-wise operation on the EW
+// datapath.
+//
+// A self-contained DPU + DPU_RDMA job: DPU_RDMA fetches the primary operand
+// through its ordinary main feed, ERDMA fetches the second tensor, EW
+// combines them element by element, and the result is written with identical
+// geometry. Both operands and the result are the same shape -- this op does
+// not broadcast, and a producer that wants broadcasting must materialize it.
+//
+// fp16 only, and deliberately no precision field, for a narrower reason than
+// ElementwiseUnaryDef's. iree-rocket-hal's EwAddShape does carry an int8
+// branch, but its EW_CVT_SCALE/OUT_CVT_SCALE ratio semantics are INFERRED
+// from register shape rather than confirmed against a known value -- the
+// builder's own doc comments say so -- and MUL has no int8 recipe in any
+// capture at all. Putting the int8 fields on the wire would ship that
+// inference as an ABI. Appending `precision` and the int8 scale fields once
+// a capture confirms them is the FlatBuffers-compatible move.
+table ElementwiseBinaryDef {
+  width:uint32;
+  height:uint32;
+  channels:uint32;
+
+  op:EwBinaryOp = ADD;
+
+  // Same contract as ElementwiseUnaryDef.runtime_dimensions.
+  runtime_dimensions:[ElementwiseDimension];
+}
+
+// Describes one standalone LUT activation: `out = f(in)` for one of the
+// curves in LutFn, evaluated by the DPU's 513-entry interpolated hybrid
+// LE/LO table.
+//
+// Like ElementwiseUnaryDef this is a self-contained DPU + DPU_RDMA job with
+// identical input and output geometry. It is deliberately NOT fused into a
+// convolution's own DPU pass: live tracing of the vendor runtime showed
+// conv -> sigmoid/tanh really is a separate task reading the conv's output
+// back from memory, and iree-rocket-hal models it that way.
+//
+// int8 only, and there is deliberately no precision field, for the mirror
+// image of ElementwiseUnaryDef's reason: LutShape is quantized by
+// construction -- the curve is evaluated on the dequantized real value, so
+// the zero points and scales below are not optional metadata but how the
+// input reaches the table's fixed domain at all.
+table ElementwiseLutDef {
+  width:uint32;
+  height:uint32;
+  channels:uint32;
+
+  fn:LutFn = SIGMOID;
+
+  // Decoded (real) zero points, as the two's-complement encoding of an int32
+  // in a uint32 -- the convention Conv2DQuantParam documents, so a negative
+  // zero point survives the field. NOT the 0x80-biased raw register form
+  // LutShape happens to take; the runtime applies that bias.
+  //
+  // iree-rocket-hal only supports decoded input zero points of -128, -2, 0
+  // and 127, which is what its captures confirm the BN_ALU formula against.
+  // The runtime rejects anything else rather than programming an unverified
+  // operand.
+  input_zero_point:uint32;
+  output_zero_point:uint32;
+
+  input_scale:float = 1.0;
+  output_scale:float = 1.0;
+
+  // Same contract as ElementwiseUnaryDef.runtime_dimensions.
+  runtime_dimensions:[ElementwiseDimension];
+}
+
 // Add future Rocket kernel kinds here. Existing numeric values must not be
 // changed or reused -- a union tag is wire-format ABI, which is why the
 // deprecated FullyConnectedDef keeps its place.
@@ -295,6 +467,9 @@ union KernelDef {
   FullyConnectedDef,
   PoolingDef,
   MatmulDef,
+  ElementwiseUnaryDef,
+  ElementwiseLutDef,
+  ElementwiseBinaryDef,
 }
 
 // Information about one exported kernel.

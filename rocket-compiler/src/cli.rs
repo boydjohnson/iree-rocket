@@ -47,6 +47,22 @@ pub struct CommonArgs {
     #[arg(long)]
     pub no_offload: bool,
 
+    /// Enable the ROADMAP Phase 1 element-wise matchers, which are commented
+    /// out in the shipped transform spec.
+    ///
+    /// Off by default because ISSUES.md P8 measured that at the current
+    /// per-dispatch cost more offload sites make a model slower: an
+    /// element-wise op does less arithmetic than its own dispatch tax. This
+    /// exists so both arms can be measured, not because the default is
+    /// provisional -- turn it on, measure against `--no-offload`, and let the
+    /// number decide.
+    ///
+    /// Composes with `--no-offload`: the element-wise entries are enabled
+    /// first and then neutralized with everything else, so the baseline arm
+    /// runs the identical pipeline.
+    #[arg(long)]
+    pub elementwise: bool,
+
     #[arg(long, default_value = "rocket_device")]
     pub rocket_device_name: String,
 

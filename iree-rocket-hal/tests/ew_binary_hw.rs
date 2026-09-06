@@ -385,8 +385,61 @@ fn standalone_ew_mul_geometry_ladder() {
             height: 14,
             channels: 64,
         },
+        // ViT's own token-by-embedding shape, which is where the element-wise
+        // sites in a real model are: `1x197x768` maps to 197 pixels of 768
+        // channels at height one. That is **96 fp16 surfaces**, an order of
+        // magnitude past the 8 the entry above reaches, and the compiler
+        // matcher's channel bound has no business admitting it on the
+        // strength of a 64-channel cube. `build_lut_regcmd`'s surface stride
+        // was wrong for exactly this reason and nothing caught it, because
+        // every test of it used one surface (see `lut_multi_surface_hw.rs`).
+        Geometry {
+            width: 197,
+            height: 1,
+            channels: 768,
+        },
     ];
     for geometry in ladder {
         check_geometry(EwBinaryOp::Mul, geometry, |a, b| a * b);
     }
+}
+
+/// ViT's shape across every operator, not just `Mul`.
+///
+/// The ladder above widens geometry for one op; this widens ops at the one
+/// geometry a compiled model will actually ask for. Both matter: an ERDMA
+/// addressing fault would show in the first, and an operator that happens to
+/// mis-handle a deep cube would show only here.
+#[test]
+#[ignore = "needs the real NPU device -- cross-compile for aarch64, copy to the board, run there"]
+fn standalone_ew_vit_shape_matches_oracle_for_every_op() {
+    let vit = Geometry {
+        width: 197,
+        height: 1,
+        channels: 768,
+    };
+    let cases: [(EwBinaryOp, Oracle); 5] = [
+        (EwBinaryOp::Add, |a, b| a + b),
+        (EwBinaryOp::Sub, |a, b| a - b),
+        (EwBinaryOp::Mul, |a, b| a * b),
+        (EwBinaryOp::Max, |a, b| a.max(b)),
+        (EwBinaryOp::Min, |a, b| a.min(b)),
+    ];
+    for (op, oracle) in cases {
+        check_geometry(op, vit, oracle);
+    }
+
+    // ViT-base's MLP is 768 -> 3072 -> 768, so the element-wise ops inside
+    // the feed-forward block run at four times the embedding width: 384 fp16
+    // surfaces. This is the widest cube any measured model asks of this path,
+    // and it is what the compiler matcher's channel bound is set from.
+    check_geometry(
+        EwBinaryOp::Mul,
+        Geometry {
+            width: 197,
+            height: 1,
+            channels: 3072,
+        },
+        |a, b| a * b,
+    );
 }

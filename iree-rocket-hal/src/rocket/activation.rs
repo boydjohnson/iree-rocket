@@ -269,12 +269,14 @@ impl LutTable {
 
     /// `log(x)` (natural log). See `lut_tables::LOG_LE`/`_LO`'s own doc
     /// comment for the generation formula and the real, load-bearing
-    /// domain restriction: only accurate for `x` in roughly `[0.02, e)`
-    /// (`e~=2.718`) -- unlike `rsqrt()` (clamped on one side only), `log`
-    /// clamps on BOTH sides (`32767` near the domain's far edge, `-32768`
-    /// near `x=0`) since it is unbounded in both directions. Both clamps
-    /// are at least sign-correct. `bn_scale_k` here MUST equal
-    /// `LOG_BN_SCALE_K`.
+    /// domain restriction: only accurate for `x` in `[1/e, e)`
+    /// (`~[0.368, 2.718)`) -- unlike `rsqrt()` (clamped on one side
+    /// only), `log` clamps on BOTH sides (`32767` at and above `e`,
+    /// `-32768` at and below `1/e`) since it is unbounded in both
+    /// directions and `|log(x)| <= 1.0` is all this Q15 encoding holds.
+    /// Both clamps are at least sign-correct. A caller feeding `x` below
+    /// `1/e` gets a silent flat `-1.0`, not a large negative number.
+    /// `bn_scale_k` here MUST equal `LOG_BN_SCALE_K`.
     pub fn log() -> Self {
         LutTable {
             le_entries: &crate::rocket::lut_tables::LOG_LE,
@@ -580,7 +582,24 @@ pub fn build_lut_regcmd(shape: &LutShape, bufs: &LutBuffers, table: LutTable) ->
         .channels
         .max(FEATURE_ATOMIC_SIZE)
         .next_multiple_of(FEATURE_ATOMIC_SIZE);
-    let surface_stride = shape.width * shape.height * task_channels;
+    // `DPU_DST_SURF_STRIDE` and `DPU_SURFACE_ADD` count 16-byte feature
+    // atoms, not bytes, so a surface is `width * height` atoms and the
+    // channel count does not enter. This used to multiply by
+    // `task_channels`, which is a no-op for a single-surface cube and 16x
+    // too large for every other one: at `channels = 32` the second surface
+    // was addressed 8 KiB out and never written at all. Every LUT test in
+    // this crate used `channels <= 16` (`conv_then_lut_hw.rs` uses 1), so
+    // nothing exercised it until ROADMAP Phase 1 needed a real tensor's
+    // channel count. `tests/lut_multi_surface_hw.rs` is the gate.
+    //
+    // `elementwise.rs` (`output_area`, gated across 2 and 8 surfaces by
+    // `ew_binary_hw.rs`) and `pooling.rs` (`(width * ATOMIC_K_SIZE *
+    // height) / FEATURE_ATOMIC_SIZE`, both constants 16, capture-derived)
+    // are the two independent statements of the same rule, and a full
+    // register diff of this builder against `build_unary_regcmd` at
+    // `channels = 32` showed identical register *sets* with this the only
+    // unexplained value difference.
+    let surface_stride = shape.width * shape.height;
     let out_offset = shape.output_zero_point.wrapping_sub(0x80);
     let (bn_mul_operand, bn_mul_shift) = lut_bn_mul(shape.input_scale, table.bn_scale_k);
     let real_zero_point = shape.input_zero_point.wrapping_sub(0x80) as i8 as i32;

@@ -48,13 +48,16 @@ use crate::{
         iree_hal_resource_t, iree_host_size_t, iree_status_t, iree_string_view_t,
     },
     executable::{
-        Conv2dExecutable, MatmulExecutable, PoolingExecutable, RuntimeConv2dDimension,
-        RuntimeConv2dQuantParam, RuntimeMatmulDimension, RuntimePoolingDimension, UkernelShape,
+        Conv2dExecutable, ElementwiseBinaryExecutable, ElementwiseGeometry,
+        ElementwiseLutExecutable, ElementwiseUnaryExecutable, LutFunction, MatmulExecutable,
+        PoolingExecutable, RuntimeConv2dDimension, RuntimeConv2dQuantParam,
+        RuntimeElementwiseDimension, RuntimeMatmulDimension, RuntimePoolingDimension, UkernelShape,
     },
     status,
 };
 use iree_rocket_hal::rocket::{
     conv::{self, Activation, Kernels, Multiplier, Precision, Quantization},
+    elementwise::{EwBinaryOp, EwUnaryAlgo},
     executable_format::{CONV2D_V1_TAG, decode_conv_shape_v1, validate_conv_shape},
     fc,
     pooling::{PoolingMethod, PoolingPrecision, PoolingShape},
@@ -401,8 +404,111 @@ fn decode_flatbuffer_shape(data: &[u8]) -> Result<UkernelShape, ()> {
             executable.validate_template().map_err(|_| ())?;
             Ok(UkernelShape::Pooling(executable))
         }
+        schema::KernelDef::ElementwiseUnaryDef => {
+            let ew = export.kernel_as_elementwise_unary_def().ok_or(())?;
+            let algo = match ew.op() {
+                schema::EwUnaryOp::ABS => EwUnaryAlgo::Abs,
+                schema::EwUnaryOp::NEG => EwUnaryAlgo::Neg,
+                schema::EwUnaryOp::FLOOR => EwUnaryAlgo::Floor,
+                schema::EwUnaryOp::CEIL => EwUnaryAlgo::Ceil,
+                schema::EwUnaryOp::ADD_SCALAR => EwUnaryAlgo::Add,
+                _ => return Err(()),
+            };
+            let executable = ElementwiseUnaryExecutable {
+                geometry: ElementwiseGeometry {
+                    width: ew.width(),
+                    height: ew.height(),
+                    channels: ew.channels(),
+                },
+                algo,
+                operand: ew.operand(),
+                runtime_dimensions: decode_elementwise_dimensions(
+                    ew.runtime_dimensions().map(|dimensions| dimensions.iter()),
+                )?,
+            };
+            executable.validate_template().map_err(|_| ())?;
+            Ok(UkernelShape::ElementwiseUnary(executable))
+        }
+        schema::KernelDef::ElementwiseBinaryDef => {
+            let ew = export.kernel_as_elementwise_binary_def().ok_or(())?;
+            let op = match ew.op() {
+                schema::EwBinaryOp::ADD => EwBinaryOp::Add,
+                schema::EwBinaryOp::SUB => EwBinaryOp::Sub,
+                schema::EwBinaryOp::MUL => EwBinaryOp::Mul,
+                schema::EwBinaryOp::MAX => EwBinaryOp::Max,
+                schema::EwBinaryOp::MIN => EwBinaryOp::Min,
+                _ => return Err(()),
+            };
+            let executable = ElementwiseBinaryExecutable {
+                geometry: ElementwiseGeometry {
+                    width: ew.width(),
+                    height: ew.height(),
+                    channels: ew.channels(),
+                },
+                op,
+                runtime_dimensions: decode_elementwise_dimensions(
+                    ew.runtime_dimensions().map(|dimensions| dimensions.iter()),
+                )?,
+            };
+            executable.validate_template().map_err(|_| ())?;
+            Ok(UkernelShape::ElementwiseBinary(executable))
+        }
+        schema::KernelDef::ElementwiseLutDef => {
+            let lut = export.kernel_as_elementwise_lut_def().ok_or(())?;
+            let function = match lut.fn_() {
+                schema::LutFn::SIGMOID => LutFunction::Sigmoid,
+                schema::LutFn::TANH => LutFunction::Tanh,
+                schema::LutFn::EXP => LutFunction::Exp,
+                schema::LutFn::SQUARE => LutFunction::Square,
+                schema::LutFn::ERF => LutFunction::Erf,
+                schema::LutFn::SQRT => LutFunction::Sqrt,
+                schema::LutFn::RSQRT => LutFunction::Rsqrt,
+                schema::LutFn::LOG => LutFunction::Log,
+                schema::LutFn::RECIPROCAL => LutFunction::Reciprocal,
+                _ => return Err(()),
+            };
+            let executable = ElementwiseLutExecutable {
+                geometry: ElementwiseGeometry {
+                    width: lut.width(),
+                    height: lut.height(),
+                    channels: lut.channels(),
+                },
+                function,
+                // The wire carries decoded zero points as a two's-complement
+                // int32 in a uint32, so this is a reinterpretation, not a
+                // range conversion -- see the schema's own comment.
+                input_zero_point: lut.input_zero_point() as i32,
+                output_zero_point: lut.output_zero_point() as i32,
+                input_scale: lut.input_scale(),
+                output_scale: lut.output_scale(),
+                runtime_dimensions: decode_elementwise_dimensions(
+                    lut.runtime_dimensions().map(|dimensions| dimensions.iter()),
+                )?,
+            };
+            executable.validate_template().map_err(|_| ())?;
+            Ok(UkernelShape::ElementwiseLut(executable))
+        }
         _ => Err(()),
     }
+}
+
+/// Both element-wise tables carry the same `ElementwiseDimension` vector, so
+/// they decode it the same way.
+fn decode_elementwise_dimensions(
+    dimensions: Option<impl Iterator<Item = schema::ElementwiseDimension>>,
+) -> Result<Vec<RuntimeElementwiseDimension>, ()> {
+    let mut decoded = Vec::new();
+    if let Some(dimensions) = dimensions {
+        for dimension in dimensions {
+            decoded.push(match dimension {
+                schema::ElementwiseDimension::WIDTH => RuntimeElementwiseDimension::Width,
+                schema::ElementwiseDimension::HEIGHT => RuntimeElementwiseDimension::Height,
+                schema::ElementwiseDimension::CHANNELS => RuntimeElementwiseDimension::Channels,
+                _ => return Err(()),
+            });
+        }
+    }
+    Ok(decoded)
 }
 
 /// Shared by `MatmulDef` and the deprecated `FullyConnectedDef`, which carry
@@ -1084,6 +1190,494 @@ mod tests {
         data[8..16].copy_from_slice(&(flatbuffer.len() as u64).to_le_bytes());
         data.extend_from_slice(flatbuffer);
         data
+    }
+
+    /// The compiler's own FlatBuffer, decoded by the runtime.
+    ///
+    /// Every other Phase 1 test encodes with the Rust bindings and decodes
+    /// with them too, so none of them can catch the two sides disagreeing
+    /// about the wire -- both sides are the same side. This fixture is
+    /// produced by the real `iree-compile` from
+    /// `rocket-compiler-plugin/test/rocket_elementwise_unary.mlir`, which is
+    /// the C++ producer to Rust reader direction the schema's compatibility
+    /// policy asks for. Regenerate with, from the repo root:
+    ///
+    /// ```text
+    /// iree-compile rocket-compiler-plugin/test/rocket_elementwise_unary.mlir \
+    ///   --compile-mode=hal-executable \
+    ///   -o rocket-schema/testdata/elementwise_unary.rkt1
+    /// ```
+    #[test]
+    fn decodes_the_compilers_elementwise_unary_executable() {
+        let data = include_bytes!(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/../rocket-schema/testdata/elementwise_unary.rkt1"
+        ));
+        let UkernelShape::ElementwiseUnary(executable) =
+            decode_flatbuffer_shape(data).expect("the compiler's executable must decode")
+        else {
+            panic!("expected a unary element-wise executable");
+        };
+        assert_eq!(
+            executable.geometry,
+            ElementwiseGeometry {
+                width: 14,
+                height: 14,
+                channels: 64
+            }
+        );
+        assert_eq!(executable.algo, EwUnaryAlgo::Floor);
+        assert_eq!(executable.operand, 0);
+        assert!(executable.runtime_dimensions.is_empty());
+    }
+
+    /// As above, from `rocket_elementwise_binary.mlir`. The two-tensor form
+    /// is the one with a real target in a compiled model -- ViT carries 123
+    /// Add, 74 Mul and 25 Sub -- so its wire encoding is worth pinning
+    /// against the compiler that will actually emit it.
+    #[test]
+    fn decodes_the_compilers_elementwise_binary_executable() {
+        let data = include_bytes!(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/../rocket-schema/testdata/elementwise_binary.rkt1"
+        ));
+        let UkernelShape::ElementwiseBinary(executable) =
+            decode_flatbuffer_shape(data).expect("the compiler's executable must decode")
+        else {
+            panic!("expected a binary element-wise executable");
+        };
+        assert_eq!(executable.op, EwBinaryOp::Mul);
+        assert_eq!(
+            executable.geometry,
+            ElementwiseGeometry {
+                width: 197,
+                height: 1,
+                channels: 768
+            }
+        );
+    }
+
+    /// As above, from `rocket_elementwise_lut.mlir`. Also checks the
+    /// decoded-to-biased zero-point conversion across the compiler boundary:
+    /// the `.mlir` says 0 and `LutShape` must see 0x80.
+    #[test]
+    fn decodes_the_compilers_lut_executable() {
+        let data = include_bytes!(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/../rocket-schema/testdata/elementwise_lut.rkt1"
+        ));
+        let UkernelShape::ElementwiseLut(executable) =
+            decode_flatbuffer_shape(data).expect("the compiler's executable must decode")
+        else {
+            panic!("expected a LUT executable");
+        };
+        assert_eq!(executable.function, LutFunction::Tanh);
+        assert_eq!(
+            executable.geometry,
+            ElementwiseGeometry {
+                width: 7,
+                height: 5,
+                channels: 48
+            }
+        );
+        assert_eq!(executable.input_zero_point, 0);
+        assert_eq!(executable.input_scale, 1.0 / 32.0);
+        assert_eq!(executable.output_scale, 1.0 / 128.0);
+
+        let shape = executable.resolve_shape(&[]).unwrap();
+        assert_eq!(shape.input_zero_point, 0x80);
+        assert_eq!(shape.output_zero_point, 0x80);
+    }
+
+    /// As above, from `rocket_elementwise_lut_dynamic.mlir`, which declares
+    /// all three dimensions as push constants. The order asserted here is the
+    /// order the compiler wrote them in, which is the order this runtime
+    /// consumes them in -- the one thing a fixture from the other side can
+    /// check that a self-encoded one cannot.
+    #[test]
+    fn decodes_the_compilers_dynamic_lut_executable() {
+        let data = include_bytes!(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/../rocket-schema/testdata/elementwise_lut_dynamic.rkt1"
+        ));
+        let UkernelShape::ElementwiseLut(executable) =
+            decode_flatbuffer_shape(data).expect("the compiler's executable must decode")
+        else {
+            panic!("expected a LUT executable");
+        };
+        assert_eq!(executable.function, LutFunction::Sqrt);
+        assert_eq!(
+            executable.runtime_dimensions,
+            vec![
+                RuntimeElementwiseDimension::Width,
+                RuntimeElementwiseDimension::Height,
+                RuntimeElementwiseDimension::Channels,
+            ]
+        );
+
+        let mut constants = Vec::new();
+        for value in [14u32, 14, 64] {
+            constants.extend_from_slice(&value.to_ne_bytes());
+        }
+        let shape = executable.resolve_shape(&constants).unwrap();
+        assert_eq!((shape.width, shape.height, shape.channels), (14, 14, 64));
+    }
+
+    fn encode_elementwise_unary_executable(
+        op: schema::EwUnaryOp,
+        (width, height, channels): (u32, u32, u32),
+        operand: u32,
+        dimensions: &[schema::ElementwiseDimension],
+    ) -> Vec<u8> {
+        let mut builder = flatbuffers::FlatBufferBuilder::new();
+        let runtime_dimensions =
+            (!dimensions.is_empty()).then(|| builder.create_vector(dimensions));
+        let name = builder.create_string("rocket_elementwise_0");
+        let ew = schema::ElementwiseUnaryDef::create(
+            &mut builder,
+            &schema::ElementwiseUnaryDefArgs {
+                width,
+                height,
+                channels,
+                op,
+                operand,
+                runtime_dimensions,
+            },
+        );
+        let export = schema::ExportDef::create(
+            &mut builder,
+            &schema::ExportDefArgs {
+                name: Some(name),
+                kernel_type: schema::KernelDef::ElementwiseUnaryDef,
+                kernel: Some(ew.as_union_value()),
+            },
+        );
+        let exports = builder.create_vector(&[export]);
+        let root = schema::ExecutableDef::create(
+            &mut builder,
+            &schema::ExecutableDefArgs {
+                exports: Some(exports),
+            },
+        );
+        builder.finish(root, Some("RKT1"));
+        wrap_executable(builder)
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn encode_elementwise_lut_executable(
+        function: schema::LutFn,
+        (width, height, channels): (u32, u32, u32),
+        input_zero_point: i32,
+        output_zero_point: i32,
+        input_scale: f32,
+        output_scale: f32,
+        dimensions: &[schema::ElementwiseDimension],
+    ) -> Vec<u8> {
+        let mut builder = flatbuffers::FlatBufferBuilder::new();
+        let runtime_dimensions =
+            (!dimensions.is_empty()).then(|| builder.create_vector(dimensions));
+        let name = builder.create_string("rocket_lut_0");
+        let lut = schema::ElementwiseLutDef::create(
+            &mut builder,
+            &schema::ElementwiseLutDefArgs {
+                width,
+                height,
+                channels,
+                fn_: function,
+                input_zero_point: input_zero_point as u32,
+                output_zero_point: output_zero_point as u32,
+                input_scale,
+                output_scale,
+                runtime_dimensions,
+            },
+        );
+        let export = schema::ExportDef::create(
+            &mut builder,
+            &schema::ExportDefArgs {
+                name: Some(name),
+                kernel_type: schema::KernelDef::ElementwiseLutDef,
+                kernel: Some(lut.as_union_value()),
+            },
+        );
+        let exports = builder.create_vector(&[export]);
+        let root = schema::ExecutableDef::create(
+            &mut builder,
+            &schema::ExecutableDefArgs {
+                exports: Some(exports),
+            },
+        );
+        builder.finish(root, Some("RKT1"));
+        wrap_executable(builder)
+    }
+
+    #[test]
+    fn decodes_a_static_elementwise_unary_executable() {
+        let data =
+            encode_elementwise_unary_executable(schema::EwUnaryOp::FLOOR, (14, 14, 64), 0, &[]);
+        let UkernelShape::ElementwiseUnary(executable) = decode_flatbuffer_shape(&data).unwrap()
+        else {
+            panic!("expected a unary element-wise executable");
+        };
+        assert_eq!(
+            executable.geometry,
+            ElementwiseGeometry {
+                width: 14,
+                height: 14,
+                channels: 64
+            }
+        );
+        assert_eq!(executable.algo, EwUnaryAlgo::Floor);
+        assert_eq!(executable.operand, 0);
+        assert!(executable.runtime_dimensions.is_empty());
+
+        let shape = executable.resolve_shape(&[]).unwrap();
+        assert_eq!((shape.width, shape.height, shape.channels), (14, 14, 64));
+    }
+
+    /// The `ADD_SCALAR` operand is an IEEE-754 bit pattern, carried through
+    /// to `EwUnaryShape::operand` unchanged. `build_unary_regcmd` asserts the
+    /// same rule this checks, so a wrong wire value must be an error at the
+    /// decode boundary rather than a panic in the builder.
+    #[test]
+    fn decodes_add_scalar_and_rejects_a_stray_operand() {
+        let data = encode_elementwise_unary_executable(
+            schema::EwUnaryOp::ADD_SCALAR,
+            (4, 4, 16),
+            0.5f32.to_bits(),
+            &[],
+        );
+        let UkernelShape::ElementwiseUnary(executable) = decode_flatbuffer_shape(&data).unwrap()
+        else {
+            panic!("expected a unary element-wise executable");
+        };
+        assert_eq!(executable.algo, EwUnaryAlgo::Add);
+        assert_eq!(executable.resolve_shape(&[]).unwrap().operand, 0x3f00_0000);
+
+        let stray = encode_elementwise_unary_executable(schema::EwUnaryOp::NEG, (4, 4, 16), 1, &[]);
+        assert!(decode_flatbuffer_shape(&stray).is_err());
+    }
+
+    /// The two-tensor form. Both operands and the result share one geometry,
+    /// so the dispatch arm packs two input cubes of identical shape.
+    #[test]
+    fn decodes_an_elementwise_binary_executable() {
+        let mut builder = flatbuffers::FlatBufferBuilder::new();
+        let name = builder.create_string("rocket_elementwise_binary_0");
+        let ew = schema::ElementwiseBinaryDef::create(
+            &mut builder,
+            &schema::ElementwiseBinaryDefArgs {
+                width: 197,
+                height: 1,
+                channels: 768,
+                op: schema::EwBinaryOp::MUL,
+                runtime_dimensions: None,
+            },
+        );
+        let export = schema::ExportDef::create(
+            &mut builder,
+            &schema::ExportDefArgs {
+                name: Some(name),
+                kernel_type: schema::KernelDef::ElementwiseBinaryDef,
+                kernel: Some(ew.as_union_value()),
+            },
+        );
+        let exports = builder.create_vector(&[export]);
+        let root = schema::ExecutableDef::create(
+            &mut builder,
+            &schema::ExecutableDefArgs {
+                exports: Some(exports),
+            },
+        );
+        builder.finish(root, Some("RKT1"));
+        let data = wrap_executable(builder);
+
+        let UkernelShape::ElementwiseBinary(executable) = decode_flatbuffer_shape(&data).unwrap()
+        else {
+            panic!("expected a binary element-wise executable");
+        };
+        assert_eq!(executable.op, EwBinaryOp::Mul);
+        assert_eq!(
+            executable.geometry,
+            ElementwiseGeometry {
+                width: 197,
+                height: 1,
+                channels: 768
+            }
+        );
+
+        // fp16 is the only precision this executable can describe, so every
+        // int8-only field of `EwAddShape` resolves to its ignored default.
+        let shape = executable.resolve_shape(&[]).unwrap();
+        assert!(matches!(
+            shape.precision,
+            iree_rocket_hal::rocket::elementwise::EwPrecision::Fp16
+        ));
+        assert_eq!(shape.output_zero_point, 0);
+        assert_eq!(shape.w_cvt_offset, 0);
+    }
+
+    /// The wire carries the *decoded* zero point; `LutShape` takes the
+    /// `0x80`-biased raw register form. This is the one place that
+    /// conversion happens, so it is checked directly rather than through a
+    /// round trip that could be wrong in both directions.
+    #[test]
+    fn decodes_a_lut_executable_and_biases_its_zero_points() {
+        let data = encode_elementwise_lut_executable(
+            schema::LutFn::TANH,
+            (4, 4, 32),
+            -128,
+            0,
+            1.0 / 32.0,
+            1.0 / 128.0,
+            &[],
+        );
+        let UkernelShape::ElementwiseLut(executable) = decode_flatbuffer_shape(&data).unwrap()
+        else {
+            panic!("expected a LUT executable");
+        };
+        assert_eq!(executable.function, LutFunction::Tanh);
+        assert_eq!(executable.input_zero_point, -128);
+        assert_eq!(executable.output_zero_point, 0);
+
+        let shape = executable.resolve_shape(&[]).unwrap();
+        assert_eq!((shape.width, shape.height, shape.channels), (4, 4, 32));
+        // -128 biases to 0x00, 0 biases to 0x80 -- the form every LUT
+        // hardware test in iree-rocket-hal passes directly.
+        assert_eq!(shape.input_zero_point, 0x00);
+        assert_eq!(shape.output_zero_point, 0x80);
+        assert_eq!(shape.input_scale, 1.0 / 32.0);
+    }
+
+    /// `lut_bn_alu`'s operand formula is confirmed only at -128, -2, 0 and
+    /// 127, and there are known-bad captures at 42. `build_lut_regcmd`
+    /// asserts on the rest, so the decode boundary must refuse them.
+    #[test]
+    fn rejects_an_unsupported_lut_zero_point() {
+        for zero_point in [-128, -2, 0, 127] {
+            let data = encode_elementwise_lut_executable(
+                schema::LutFn::SIGMOID,
+                (4, 4, 16),
+                zero_point,
+                0,
+                1.0 / 32.0,
+                1.0 / 256.0,
+                &[],
+            );
+            assert!(
+                decode_flatbuffer_shape(&data).is_ok(),
+                "zero point {zero_point} is supported and must decode"
+            );
+        }
+        for zero_point in [42, -1, 1, 100] {
+            let data = encode_elementwise_lut_executable(
+                schema::LutFn::SIGMOID,
+                (4, 4, 16),
+                zero_point,
+                0,
+                1.0 / 32.0,
+                1.0 / 256.0,
+                &[],
+            );
+            assert!(
+                decode_flatbuffer_shape(&data).is_err(),
+                "zero point {zero_point} has no confirmed BN_ALU operand and must be refused"
+            );
+        }
+    }
+
+    /// A scale of zero would send `lut_bn_mul`/`lut_out_cvt`'s `log2` to
+    /// negative infinity and produce a nonsense shift rather than a wrong
+    /// number, so it is refused at the boundary.
+    #[test]
+    fn rejects_a_nonpositive_lut_scale() {
+        for (input_scale, output_scale) in [(0.0, 1.0 / 128.0), (1.0 / 32.0, 0.0), (-1.0, 1.0)] {
+            let data = encode_elementwise_lut_executable(
+                schema::LutFn::EXP,
+                (4, 4, 16),
+                0,
+                0,
+                input_scale,
+                output_scale,
+                &[],
+            );
+            assert!(
+                decode_flatbuffer_shape(&data).is_err(),
+                "scales ({input_scale}, {output_scale}) must be refused"
+            );
+        }
+    }
+
+    /// The same template/runtime contract every other executable here holds:
+    /// a listed dimension is zero in the template and supplied per dispatch,
+    /// an unlisted one is nonzero in the template, and a runtime zero is an
+    /// adapter bug rather than a legal extent.
+    #[test]
+    fn resolves_runtime_elementwise_dimensions_in_push_constant_order() {
+        let data = encode_elementwise_lut_executable(
+            schema::LutFn::SQRT,
+            (0, 0, 32),
+            0,
+            0,
+            1.0 / 128.0,
+            1.0 / 128.0,
+            &[
+                schema::ElementwiseDimension::WIDTH,
+                schema::ElementwiseDimension::HEIGHT,
+            ],
+        );
+        let UkernelShape::ElementwiseLut(executable) = decode_flatbuffer_shape(&data).unwrap()
+        else {
+            panic!("expected a LUT executable");
+        };
+        assert_eq!(
+            executable.runtime_dimensions,
+            vec![
+                RuntimeElementwiseDimension::Width,
+                RuntimeElementwiseDimension::Height
+            ]
+        );
+
+        let mut constants = Vec::new();
+        constants.extend_from_slice(&7u32.to_ne_bytes());
+        constants.extend_from_slice(&5u32.to_ne_bytes());
+        let shape = executable.resolve_shape(&constants).unwrap();
+        assert_eq!((shape.width, shape.height, shape.channels), (7, 5, 32));
+
+        // Too few constants, and a zero extent, are both rejected.
+        assert!(executable.resolve_shape(&7u32.to_ne_bytes()).is_err());
+        let mut zeroed = Vec::new();
+        zeroed.extend_from_slice(&7u32.to_ne_bytes());
+        zeroed.extend_from_slice(&0u32.to_ne_bytes());
+        assert!(executable.resolve_shape(&zeroed).is_err());
+    }
+
+    /// A dimension listed as runtime must be zero in the template, and one
+    /// left static must not be -- the check that catches a producer that
+    /// forgot to clear a field it also promised to push.
+    #[test]
+    fn rejects_a_contradictory_elementwise_template() {
+        let listed_but_nonzero = encode_elementwise_unary_executable(
+            schema::EwUnaryOp::ABS,
+            (4, 4, 16),
+            0,
+            &[schema::ElementwiseDimension::WIDTH],
+        );
+        assert!(decode_flatbuffer_shape(&listed_but_nonzero).is_err());
+
+        let static_but_zero =
+            encode_elementwise_unary_executable(schema::EwUnaryOp::ABS, (4, 0, 16), 0, &[]);
+        assert!(decode_flatbuffer_shape(&static_but_zero).is_err());
+
+        let duplicated = encode_elementwise_unary_executable(
+            schema::EwUnaryOp::ABS,
+            (0, 4, 16),
+            0,
+            &[
+                schema::ElementwiseDimension::WIDTH,
+                schema::ElementwiseDimension::WIDTH,
+            ],
+        );
+        assert!(decode_flatbuffer_shape(&duplicated).is_err());
     }
 
     #[allow(clippy::too_many_arguments)]

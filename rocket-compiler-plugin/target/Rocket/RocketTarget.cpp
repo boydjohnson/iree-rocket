@@ -111,6 +111,41 @@ constexpr std::array<const char *, 15> kRequiredPoolingConfigKeys = {
     "pad_bottom",  "method",        "precision",
 };
 
+// The whole shape of a unary element-wise task: geometry plus which ALU
+// opcode. 'operand' is deliberately optional -- it is only meaningful for
+// add_scalar, and requiring every other op to spell a zero would invite a
+// producer to spell a nonzero one.
+//
+// There is no 'precision' key. The unary EW task shape is fp16 only, which
+// is why the wire table has no precision field either; see the schema's own
+// comment on ElementwiseUnaryDef.
+constexpr std::array<const char *, 4> kRequiredElementwiseUnaryConfigKeys = {
+    "width",
+    "height",
+    "channels",
+    "op",
+};
+
+// The two-tensor form: geometry plus which operator. No 'precision' key,
+// for a narrower reason than the unary kernel's -- EwAddShape does carry an
+// int8 branch, but its EW_CVT_SCALE/OUT_CVT_SCALE ratio semantics are
+// inferred rather than confirmed, and MUL has no int8 recipe in any capture.
+constexpr std::array<const char *, 4> kRequiredElementwiseBinaryConfigKeys = {
+    "width",
+    "height",
+    "channels",
+    "op",
+};
+
+// Geometry, which curve, and the quantization that gets an input into the
+// table's fixed domain. Also no 'precision' key: the LUT path is int8 by
+// construction.
+constexpr std::array<const char *, 8> kRequiredElementwiseLutConfigKeys = {
+    "width",       "height",           "channels",  "fn",
+    "input_scale", "output_scale",     "input_zero_point",
+    "output_zero_point",
+};
+
 // Identical to the fully-connected set, because the operation is the same
 // one under a name that exists in the input dialect.
 constexpr std::array<const char *, 13> kRequiredMatmulConfigKeys = {
@@ -190,6 +225,39 @@ struct RocketPoolingConfig {
       iree_hal_rocket_PoolingMethod_MAX;
   iree_hal_rocket_Precision_enum_t precision = iree_hal_rocket_Precision_INT8;
   std::vector<iree_hal_rocket_PoolingDimension_enum_t> runtimeDimensions;
+};
+
+struct RocketElementwiseUnaryConfig {
+  uint32_t width = 0;
+  uint32_t height = 0;
+  uint32_t channels = 0;
+  iree_hal_rocket_EwUnaryOp_enum_t op = iree_hal_rocket_EwUnaryOp_ABS;
+  // IEEE-754 binary32 bit pattern; only meaningful for add_scalar.
+  uint32_t operand = 0;
+  std::vector<iree_hal_rocket_ElementwiseDimension_enum_t> runtimeDimensions;
+};
+
+struct RocketElementwiseBinaryConfig {
+  uint32_t width = 0;
+  uint32_t height = 0;
+  uint32_t channels = 0;
+  iree_hal_rocket_EwBinaryOp_enum_t op = iree_hal_rocket_EwBinaryOp_ADD;
+  std::vector<iree_hal_rocket_ElementwiseDimension_enum_t> runtimeDimensions;
+};
+
+struct RocketElementwiseLutConfig {
+  uint32_t width = 0;
+  uint32_t height = 0;
+  uint32_t channels = 0;
+  iree_hal_rocket_LutFn_enum_t fn = iree_hal_rocket_LutFn_SIGMOID;
+  // Decoded (real) zero points as a two's-complement int32 in a uint32 --
+  // Conv2DQuantParam's documented convention. The runtime applies the 0x80
+  // bias LutShape takes.
+  uint32_t inputZeroPoint = 0;
+  uint32_t outputZeroPoint = 0;
+  float inputScale = 1.0f;
+  float outputScale = 1.0f;
+  std::vector<iree_hal_rocket_ElementwiseDimension_enum_t> runtimeDimensions;
 };
 
 struct RocketMatmulConfig {
@@ -736,6 +804,324 @@ std::optional<RocketPoolingConfig> buildRocketPoolingConfigFromTarget(
   return shape;
 }
 
+// Both element-wise tables carry the same three-entry dimension list, so
+// they parse it the same way. Returns false on any diagnostic already
+// emitted.
+bool parseElementwiseRuntimeDimensions(
+    DictionaryAttr config,
+    std::vector<iree_hal_rocket_ElementwiseDimension_enum_t> &into,
+    std::array<bool, 3> &isRuntimeDimension,
+    llvm::function_ref<InFlightDiagnostic()> diagFn) {
+  Attribute runtimeDimensionsAttr = config.get("runtime_dimensions");
+  if (!runtimeDimensionsAttr) {
+    return true;
+  }
+  auto runtimeDimensions = llvm::dyn_cast<ArrayAttr>(runtimeDimensionsAttr);
+  if (!runtimeDimensions) {
+    diagFn() << "rocket backend: optional 'runtime_dimensions' config value "
+                "must be an array of strings";
+    return false;
+  }
+  for (Attribute dimensionAttr : runtimeDimensions) {
+    auto dimensionName = llvm::dyn_cast<StringAttr>(dimensionAttr);
+    if (!dimensionName) {
+      diagFn() << "rocket backend: every 'runtime_dimensions' entry must be "
+                  "a string";
+      return false;
+    }
+    std::optional<iree_hal_rocket_ElementwiseDimension_enum_t> dimension;
+    StringRef name = dimensionName.getValue();
+    if (name == "width") {
+      dimension = iree_hal_rocket_ElementwiseDimension_WIDTH;
+    } else if (name == "height") {
+      dimension = iree_hal_rocket_ElementwiseDimension_HEIGHT;
+    } else if (name == "channels") {
+      dimension = iree_hal_rocket_ElementwiseDimension_CHANNELS;
+    } else {
+      diagFn() << "rocket backend: unknown runtime element-wise dimension '"
+               << name << "'";
+      return false;
+    }
+    size_t dimensionIndex = static_cast<size_t>(*dimension);
+    if (isRuntimeDimension[dimensionIndex]) {
+      diagFn() << "rocket backend: duplicate runtime element-wise dimension '"
+               << name << "'";
+      return false;
+    }
+    isRuntimeDimension[dimensionIndex] = true;
+    into.push_back(*dimension);
+  }
+  return true;
+}
+
+// The template/runtime contract, identical for both element-wise kinds: a
+// listed dimension must be zero here and arrive per dispatch, an unlisted
+// one must be nonzero. rocket-hal-driver's
+// `validate_elementwise_template` is the runtime half of the same rule.
+bool checkElementwiseDimensions(
+    const std::array<bool, 3> &isRuntimeDimension, uint32_t width,
+    uint32_t height, uint32_t channels,
+    llvm::function_ref<InFlightDiagnostic()> diagFn) {
+  struct SettableDimension {
+    iree_hal_rocket_ElementwiseDimension_enum_t dimension;
+    StringRef name;
+    uint32_t value;
+  };
+  const std::array<SettableDimension, 3> dimensions = {{
+      {iree_hal_rocket_ElementwiseDimension_WIDTH, "width", width},
+      {iree_hal_rocket_ElementwiseDimension_HEIGHT, "height", height},
+      {iree_hal_rocket_ElementwiseDimension_CHANNELS, "channels", channels},
+  }};
+  for (const auto &[dimension, name, value] : dimensions) {
+    const bool isRuntime = isRuntimeDimension[static_cast<size_t>(dimension)];
+    if (isRuntime && value != 0) {
+      diagFn() << "rocket backend: runtime element-wise dimension '" << name
+               << "' must use 0 as its executable template value";
+      return false;
+    }
+    if (!isRuntime && value == 0) {
+      diagFn() << "rocket backend: zero element-wise dimension '" << name
+               << "' must be listed in 'runtime_dimensions'";
+      return false;
+    }
+  }
+  return true;
+}
+
+std::optional<RocketElementwiseUnaryConfig>
+buildRocketElementwiseUnaryConfigFromTarget(
+    DictionaryAttr config, llvm::function_ref<InFlightDiagnostic()> diagFn) {
+  if (!config) {
+    diagFn() << "rocket element-wise backend requires a non-empty executable "
+                "target config dict";
+    return std::nullopt;
+  }
+  for (const char *key : kRequiredElementwiseUnaryConfigKeys) {
+    if (!config.get(key)) {
+      diagFn() << "rocket element-wise executable target config is missing "
+                  "required key '"
+               << key << "'";
+      return std::nullopt;
+    }
+  }
+
+  auto getU32 = [&](StringRef key) -> uint32_t {
+    return static_cast<uint32_t>(
+        llvm::cast<IntegerAttr>(config.get(key)).getInt());
+  };
+
+  RocketElementwiseUnaryConfig shape;
+  shape.width = getU32("width");
+  shape.height = getU32("height");
+  shape.channels = getU32("channels");
+
+  StringRef op = llvm::cast<StringAttr>(config.get("op")).getValue();
+  if (op == "abs") {
+    shape.op = iree_hal_rocket_EwUnaryOp_ABS;
+  } else if (op == "neg") {
+    shape.op = iree_hal_rocket_EwUnaryOp_NEG;
+  } else if (op == "floor") {
+    shape.op = iree_hal_rocket_EwUnaryOp_FLOOR;
+  } else if (op == "ceil") {
+    shape.op = iree_hal_rocket_EwUnaryOp_CEIL;
+  } else if (op == "add_scalar") {
+    shape.op = iree_hal_rocket_EwUnaryOp_ADD_SCALAR;
+  } else {
+    diagFn() << "rocket backend: unrecognized element-wise unary 'op' config "
+                "value '"
+             << op << "' (expected abs/neg/floor/ceil/add_scalar)";
+    return std::nullopt;
+  }
+
+  if (Attribute operandAttr = config.get("operand")) {
+    auto operand = llvm::dyn_cast<IntegerAttr>(operandAttr);
+    if (!operand) {
+      diagFn() << "rocket backend: 'operand' must be an integer holding an "
+                  "IEEE-754 binary32 bit pattern";
+      return std::nullopt;
+    }
+    shape.operand = static_cast<uint32_t>(operand.getInt());
+  }
+  // The runtime refuses this too, because `build_unary_regcmd` asserts it.
+  // Catching it here turns a runtime rejection into a compile error.
+  if (shape.operand != 0 &&
+      shape.op != iree_hal_rocket_EwUnaryOp_ADD_SCALAR) {
+    diagFn() << "rocket backend: 'operand' is only meaningful for the "
+                "add_scalar element-wise op";
+    return std::nullopt;
+  }
+
+  std::array<bool, 3> isRuntimeDimension = {};
+  if (!parseElementwiseRuntimeDimensions(config, shape.runtimeDimensions,
+                                         isRuntimeDimension, diagFn)) {
+    return std::nullopt;
+  }
+  if (!checkElementwiseDimensions(isRuntimeDimension, shape.width,
+                                  shape.height, shape.channels, diagFn)) {
+    return std::nullopt;
+  }
+  return shape;
+}
+
+std::optional<RocketElementwiseBinaryConfig>
+buildRocketElementwiseBinaryConfigFromTarget(
+    DictionaryAttr config, llvm::function_ref<InFlightDiagnostic()> diagFn) {
+  if (!config) {
+    diagFn() << "rocket element-wise backend requires a non-empty executable "
+                "target config dict";
+    return std::nullopt;
+  }
+  for (const char *key : kRequiredElementwiseBinaryConfigKeys) {
+    if (!config.get(key)) {
+      diagFn() << "rocket element-wise executable target config is missing "
+                  "required key '"
+               << key << "'";
+      return std::nullopt;
+    }
+  }
+
+  auto getU32 = [&](StringRef key) -> uint32_t {
+    return static_cast<uint32_t>(
+        llvm::cast<IntegerAttr>(config.get(key)).getInt());
+  };
+
+  RocketElementwiseBinaryConfig shape;
+  shape.width = getU32("width");
+  shape.height = getU32("height");
+  shape.channels = getU32("channels");
+
+  StringRef op = llvm::cast<StringAttr>(config.get("op")).getValue();
+  if (op == "add") {
+    shape.op = iree_hal_rocket_EwBinaryOp_ADD;
+  } else if (op == "sub") {
+    shape.op = iree_hal_rocket_EwBinaryOp_SUB;
+  } else if (op == "mul") {
+    shape.op = iree_hal_rocket_EwBinaryOp_MUL;
+  } else if (op == "max") {
+    shape.op = iree_hal_rocket_EwBinaryOp_MAX;
+  } else if (op == "min") {
+    shape.op = iree_hal_rocket_EwBinaryOp_MIN;
+  } else {
+    // 'div' is deliberately not here: ew_alu_algo=3 is the one
+    // TRM-documented binary opcode with no hardware evidence in this
+    // project, and the wire enum does not carry it either.
+    diagFn() << "rocket backend: unrecognized element-wise binary 'op' config "
+                "value '"
+             << op << "' (expected add/sub/mul/max/min)";
+    return std::nullopt;
+  }
+
+  std::array<bool, 3> isRuntimeDimension = {};
+  if (!parseElementwiseRuntimeDimensions(config, shape.runtimeDimensions,
+                                         isRuntimeDimension, diagFn)) {
+    return std::nullopt;
+  }
+  if (!checkElementwiseDimensions(isRuntimeDimension, shape.width,
+                                  shape.height, shape.channels, diagFn)) {
+    return std::nullopt;
+  }
+  return shape;
+}
+
+std::optional<RocketElementwiseLutConfig>
+buildRocketElementwiseLutConfigFromTarget(
+    DictionaryAttr config, llvm::function_ref<InFlightDiagnostic()> diagFn) {
+  if (!config) {
+    diagFn() << "rocket LUT backend requires a non-empty executable target "
+                "config dict";
+    return std::nullopt;
+  }
+  for (const char *key : kRequiredElementwiseLutConfigKeys) {
+    if (!config.get(key)) {
+      diagFn() << "rocket LUT executable target config is missing required "
+                  "key '"
+               << key << "'";
+      return std::nullopt;
+    }
+  }
+
+  auto getU32 = [&](StringRef key) -> uint32_t {
+    return static_cast<uint32_t>(
+        llvm::cast<IntegerAttr>(config.get(key)).getInt());
+  };
+  auto getI64 = [&](StringRef key) -> int64_t {
+    return llvm::cast<IntegerAttr>(config.get(key)).getInt();
+  };
+  auto getF32 = [&](StringRef key) -> float {
+    return llvm::cast<FloatAttr>(config.get(key)).getValueAsDouble();
+  };
+
+  RocketElementwiseLutConfig shape;
+  shape.width = getU32("width");
+  shape.height = getU32("height");
+  shape.channels = getU32("channels");
+
+  StringRef fn = llvm::cast<StringAttr>(config.get("fn")).getValue();
+  if (fn == "sigmoid") {
+    shape.fn = iree_hal_rocket_LutFn_SIGMOID;
+  } else if (fn == "tanh") {
+    shape.fn = iree_hal_rocket_LutFn_TANH;
+  } else if (fn == "exp") {
+    shape.fn = iree_hal_rocket_LutFn_EXP;
+  } else if (fn == "square") {
+    shape.fn = iree_hal_rocket_LutFn_SQUARE;
+  } else if (fn == "erf") {
+    shape.fn = iree_hal_rocket_LutFn_ERF;
+  } else if (fn == "sqrt") {
+    shape.fn = iree_hal_rocket_LutFn_SQRT;
+  } else if (fn == "rsqrt") {
+    shape.fn = iree_hal_rocket_LutFn_RSQRT;
+  } else if (fn == "log") {
+    shape.fn = iree_hal_rocket_LutFn_LOG;
+  } else if (fn == "reciprocal") {
+    shape.fn = iree_hal_rocket_LutFn_RECIPROCAL;
+  } else {
+    diagFn() << "rocket backend: unrecognized LUT 'fn' config value '" << fn
+             << "'";
+    return std::nullopt;
+  }
+
+  // Only -128, -2, 0 and 127 have a confirmed BN_ALU operand;
+  // `build_lut_regcmd` asserts on the rest and the runtime refuses them, so
+  // this is the compile-time half of that same rule.
+  int64_t inputZeroPoint = getI64("input_zero_point");
+  int64_t outputZeroPoint = getI64("output_zero_point");
+  if (inputZeroPoint != -128 && inputZeroPoint != -2 && inputZeroPoint != 0 &&
+      inputZeroPoint != 127) {
+    diagFn() << "rocket backend: LUT 'input_zero_point' " << inputZeroPoint
+             << " has no confirmed BN_ALU operand (expected -128, -2, 0 or "
+                "127)";
+    return std::nullopt;
+  }
+  if (outputZeroPoint < -128 || outputZeroPoint > 127) {
+    diagFn() << "rocket backend: LUT 'output_zero_point' " << outputZeroPoint
+             << " does not fit an int8";
+    return std::nullopt;
+  }
+  shape.inputZeroPoint = static_cast<uint32_t>(
+      static_cast<int32_t>(inputZeroPoint));
+  shape.outputZeroPoint = static_cast<uint32_t>(
+      static_cast<int32_t>(outputZeroPoint));
+
+  shape.inputScale = getF32("input_scale");
+  shape.outputScale = getF32("output_scale");
+  if (!(shape.inputScale > 0.0f) || !(shape.outputScale > 0.0f)) {
+    diagFn() << "rocket backend: LUT scales must be finite and positive";
+    return std::nullopt;
+  }
+
+  std::array<bool, 3> isRuntimeDimension = {};
+  if (!parseElementwiseRuntimeDimensions(config, shape.runtimeDimensions,
+                                         isRuntimeDimension, diagFn)) {
+    return std::nullopt;
+  }
+  if (!checkElementwiseDimensions(isRuntimeDimension, shape.width,
+                                  shape.height, shape.channels, diagFn)) {
+    return std::nullopt;
+  }
+  return shape;
+}
+
 std::optional<RocketMatmulConfig> buildRocketMatmulConfigFromTarget(
     DictionaryAttr config, llvm::function_ref<InFlightDiagnostic()> diagFn) {
   if (!config) {
@@ -918,10 +1304,14 @@ public:
       kernel = kernelString.getValue();
     }
     if (kernel != "conv2d" && kernel != "fully_connected" &&
-        kernel != "pooling" && kernel != "matmul") {
+        kernel != "pooling" && kernel != "matmul" &&
+        kernel != "elementwise_unary" && kernel != "elementwise_lut" &&
+        kernel != "elementwise_binary") {
       return variantOp.emitOpError()
              << "unsupported Rocket kernel '" << kernel
-             << "'; expected 'conv2d', 'pooling', 'matmul' or the "
+             << "'; expected 'conv2d', 'pooling', 'matmul', "
+                "'elementwise_unary', 'elementwise_binary', "
+                "'elementwise_lut' or the "
                 "deprecated 'fully_connected'";
     }
 
@@ -933,16 +1323,27 @@ public:
     std::optional<RocketFullyConnectedConfig> fcShape;
     std::optional<RocketPoolingConfig> poolingShape;
     std::optional<RocketMatmulConfig> matmulShape;
+    std::optional<RocketElementwiseUnaryConfig> ewUnaryShape;
+    std::optional<RocketElementwiseBinaryConfig> ewBinaryShape;
+    std::optional<RocketElementwiseLutConfig> lutShape;
     if (kernel == "fully_connected") {
       fcShape = buildRocketFullyConnectedConfigFromTarget(config, diagFn);
     } else if (kernel == "pooling") {
       poolingShape = buildRocketPoolingConfigFromTarget(config, diagFn);
     } else if (kernel == "matmul") {
       matmulShape = buildRocketMatmulConfigFromTarget(config, diagFn);
+    } else if (kernel == "elementwise_unary") {
+      ewUnaryShape = buildRocketElementwiseUnaryConfigFromTarget(config, diagFn);
+    } else if (kernel == "elementwise_binary") {
+      ewBinaryShape =
+          buildRocketElementwiseBinaryConfigFromTarget(config, diagFn);
+    } else if (kernel == "elementwise_lut") {
+      lutShape = buildRocketElementwiseLutConfigFromTarget(config, diagFn);
     } else {
       convShape = buildRocketConv2dConfigFromTarget(config, diagFn);
     }
-    if (!convShape && !fcShape && !poolingShape && !matmulShape) {
+    if (!convShape && !fcShape && !poolingShape && !matmulShape &&
+        !ewUnaryShape && !ewBinaryShape && !lutShape) {
       return failure();
     }
 
@@ -968,6 +1369,12 @@ public:
       runtimeDimensionCount = poolingShape->runtimeDimensions.size();
     } else if (matmulShape) {
       runtimeDimensionCount = matmulShape->runtimeDimensions.size();
+    } else if (ewUnaryShape) {
+      runtimeDimensionCount = ewUnaryShape->runtimeDimensions.size();
+    } else if (ewBinaryShape) {
+      runtimeDimensionCount = ewBinaryShape->runtimeDimensions.size();
+    } else if (lutShape) {
+      runtimeDimensionCount = lutShape->runtimeDimensions.size();
     }
     // Only Conv2DDef carries runtime quantization; pooling has none to carry
     // and matmul's own lowering does not use the dispatch-supplied scale.
@@ -1105,6 +1512,113 @@ public:
                << "failed to finish Rocket matmul definition";
       }
       kernelRef = iree_hal_rocket_KernelDef_as_MatmulDef(matmulRef);
+    } else if (ewUnaryShape) {
+      iree_hal_rocket_ElementwiseDimension_vec_ref_t runtimeDimensionsRef = 0;
+      if (!ewUnaryShape->runtimeDimensions.empty()) {
+        runtimeDimensionsRef = iree_hal_rocket_ElementwiseDimension_vec_create(
+            builder, ewUnaryShape->runtimeDimensions.data(),
+            ewUnaryShape->runtimeDimensions.size());
+        if (!runtimeDimensionsRef) {
+          return variantOp.emitOpError()
+                 << "failed to build Rocket element-wise runtime-dimension "
+                    "vector";
+        }
+      }
+      if (iree_hal_rocket_ElementwiseUnaryDef_start(builder) ||
+          iree_hal_rocket_ElementwiseUnaryDef_width_add(builder,
+                                                        ewUnaryShape->width) ||
+          iree_hal_rocket_ElementwiseUnaryDef_height_add(
+              builder, ewUnaryShape->height) ||
+          iree_hal_rocket_ElementwiseUnaryDef_channels_add(
+              builder, ewUnaryShape->channels) ||
+          iree_hal_rocket_ElementwiseUnaryDef_op_add(builder,
+                                                     ewUnaryShape->op) ||
+          iree_hal_rocket_ElementwiseUnaryDef_operand_add(
+              builder, ewUnaryShape->operand) ||
+          (runtimeDimensionsRef &&
+           iree_hal_rocket_ElementwiseUnaryDef_runtime_dimensions_add(
+               builder, runtimeDimensionsRef))) {
+        return variantOp.emitOpError()
+               << "failed to build Rocket element-wise unary definition";
+      }
+      auto ewRef = iree_hal_rocket_ElementwiseUnaryDef_end(builder);
+      if (!ewRef) {
+        return variantOp.emitOpError()
+               << "failed to finish Rocket element-wise unary definition";
+      }
+      kernelRef = iree_hal_rocket_KernelDef_as_ElementwiseUnaryDef(ewRef);
+    } else if (ewBinaryShape) {
+      iree_hal_rocket_ElementwiseDimension_vec_ref_t runtimeDimensionsRef = 0;
+      if (!ewBinaryShape->runtimeDimensions.empty()) {
+        runtimeDimensionsRef = iree_hal_rocket_ElementwiseDimension_vec_create(
+            builder, ewBinaryShape->runtimeDimensions.data(),
+            ewBinaryShape->runtimeDimensions.size());
+        if (!runtimeDimensionsRef) {
+          return variantOp.emitOpError()
+                 << "failed to build Rocket element-wise runtime-dimension "
+                    "vector";
+        }
+      }
+      if (iree_hal_rocket_ElementwiseBinaryDef_start(builder) ||
+          iree_hal_rocket_ElementwiseBinaryDef_width_add(
+              builder, ewBinaryShape->width) ||
+          iree_hal_rocket_ElementwiseBinaryDef_height_add(
+              builder, ewBinaryShape->height) ||
+          iree_hal_rocket_ElementwiseBinaryDef_channels_add(
+              builder, ewBinaryShape->channels) ||
+          iree_hal_rocket_ElementwiseBinaryDef_op_add(builder,
+                                                      ewBinaryShape->op) ||
+          (runtimeDimensionsRef &&
+           iree_hal_rocket_ElementwiseBinaryDef_runtime_dimensions_add(
+               builder, runtimeDimensionsRef))) {
+        return variantOp.emitOpError()
+               << "failed to build Rocket element-wise binary definition";
+      }
+      auto ewRef = iree_hal_rocket_ElementwiseBinaryDef_end(builder);
+      if (!ewRef) {
+        return variantOp.emitOpError()
+               << "failed to finish Rocket element-wise binary definition";
+      }
+      kernelRef = iree_hal_rocket_KernelDef_as_ElementwiseBinaryDef(ewRef);
+    } else if (lutShape) {
+      iree_hal_rocket_ElementwiseDimension_vec_ref_t runtimeDimensionsRef = 0;
+      if (!lutShape->runtimeDimensions.empty()) {
+        runtimeDimensionsRef = iree_hal_rocket_ElementwiseDimension_vec_create(
+            builder, lutShape->runtimeDimensions.data(),
+            lutShape->runtimeDimensions.size());
+        if (!runtimeDimensionsRef) {
+          return variantOp.emitOpError()
+                 << "failed to build Rocket LUT runtime-dimension vector";
+        }
+      }
+      if (iree_hal_rocket_ElementwiseLutDef_start(builder) ||
+          iree_hal_rocket_ElementwiseLutDef_width_add(builder,
+                                                      lutShape->width) ||
+          iree_hal_rocket_ElementwiseLutDef_height_add(builder,
+                                                       lutShape->height) ||
+          iree_hal_rocket_ElementwiseLutDef_channels_add(builder,
+                                                         lutShape->channels) ||
+          iree_hal_rocket_ElementwiseLutDef_fn_add(builder, lutShape->fn) ||
+          iree_hal_rocket_ElementwiseLutDef_input_zero_point_add(
+              builder, lutShape->inputZeroPoint) ||
+          iree_hal_rocket_ElementwiseLutDef_output_zero_point_add(
+              builder, lutShape->outputZeroPoint) ||
+          iree_hal_rocket_ElementwiseLutDef_input_scale_add(
+              builder, lutShape->inputScale) ||
+          iree_hal_rocket_ElementwiseLutDef_output_scale_add(
+              builder, lutShape->outputScale) ||
+          (runtimeDimensionsRef &&
+           iree_hal_rocket_ElementwiseLutDef_runtime_dimensions_add(
+               builder, runtimeDimensionsRef))) {
+        return variantOp.emitOpError()
+               << "failed to build Rocket LUT definition";
+      }
+      auto lutRef = iree_hal_rocket_ElementwiseLutDef_end(builder);
+      if (!lutRef) {
+        return variantOp.emitOpError()
+               << "failed to finish Rocket LUT definition";
+      }
+      kernelRef = iree_hal_rocket_KernelDef_as_ElementwiseLutDef(lutRef);
     } else {
       iree_hal_rocket_Conv2DDimension_vec_ref_t runtimeDimensionsRef = 0;
       if (!convShape->runtimeDimensions.empty()) {

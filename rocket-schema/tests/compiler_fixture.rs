@@ -186,6 +186,248 @@ fn kernel_union_tags_are_stable() {
     assert_eq!(rocket::KernelDef::FullyConnectedDef.0, 2);
     assert_eq!(rocket::KernelDef::PoolingDef.0, 3);
     assert_eq!(rocket::KernelDef::MatmulDef.0, 4);
+    assert_eq!(rocket::KernelDef::ElementwiseUnaryDef.0, 5);
+    assert_eq!(rocket::KernelDef::ElementwiseLutDef.0, 6);
+    assert_eq!(rocket::KernelDef::ElementwiseBinaryDef.0, 7);
+}
+
+/// Element-wise operator values are wire format, deliberately independent of
+/// the EW ALU's own `ew_alu_algo` opcodes (`Abs` is register 5, not 0). The
+/// int8-subtraction finding is why that independence is load-bearing rather
+/// than stylistic: real vendor compiles route a subtract as the Add opcode
+/// with a negated scale, so the register value is not a function of the
+/// logical op alone.
+#[test]
+fn elementwise_op_values_are_stable() {
+    assert_eq!(rocket::EwUnaryOp::ABS.0, 0);
+    assert_eq!(rocket::EwUnaryOp::NEG.0, 1);
+    assert_eq!(rocket::EwUnaryOp::FLOOR.0, 2);
+    assert_eq!(rocket::EwUnaryOp::CEIL.0, 3);
+    assert_eq!(rocket::EwUnaryOp::ADD_SCALAR.0, 4);
+
+    assert_eq!(rocket::EwBinaryOp::ADD.0, 0);
+    assert_eq!(rocket::EwBinaryOp::SUB.0, 1);
+    assert_eq!(rocket::EwBinaryOp::MUL.0, 2);
+    assert_eq!(rocket::EwBinaryOp::MAX.0, 3);
+    assert_eq!(rocket::EwBinaryOp::MIN.0, 4);
+}
+
+/// The nine curves `iree-rocket-hal`'s `LutTable` builds, in wire order.
+#[test]
+fn lut_fn_values_are_stable() {
+    assert_eq!(rocket::LutFn::SIGMOID.0, 0);
+    assert_eq!(rocket::LutFn::TANH.0, 1);
+    assert_eq!(rocket::LutFn::EXP.0, 2);
+    assert_eq!(rocket::LutFn::SQUARE.0, 3);
+    assert_eq!(rocket::LutFn::ERF.0, 4);
+    assert_eq!(rocket::LutFn::SQRT.0, 5);
+    assert_eq!(rocket::LutFn::RSQRT.0, 6);
+    assert_eq!(rocket::LutFn::LOG.0, 7);
+    assert_eq!(rocket::LutFn::RECIPROCAL.0, 8);
+}
+
+/// A unary element-wise executable with no runtime dimensions: fully static,
+/// and with `operand` at its zero default because the op is not `ADD_SCALAR`.
+#[test]
+fn elementwise_unary_definition_round_trips() {
+    let mut builder = flatbuffers::FlatBufferBuilder::new();
+    let ew = rocket::ElementwiseUnaryDef::create(
+        &mut builder,
+        &rocket::ElementwiseUnaryDefArgs {
+            width: 14,
+            height: 14,
+            channels: 64,
+            op: rocket::EwUnaryOp::FLOOR,
+            ..Default::default()
+        },
+    );
+    let name = builder.create_string("elementwise_floor");
+    let export = rocket::ExportDef::create(
+        &mut builder,
+        &rocket::ExportDefArgs {
+            name: Some(name),
+            kernel_type: rocket::KernelDef::ElementwiseUnaryDef,
+            kernel: Some(ew.as_union_value()),
+        },
+    );
+    let exports = builder.create_vector(&[export]);
+    let root = rocket::ExecutableDef::create(
+        &mut builder,
+        &rocket::ExecutableDefArgs {
+            exports: Some(exports),
+        },
+    );
+    builder.finish(root, Some("RKT1"));
+
+    let parsed = rocket::root_as_executable_def(builder.finished_data())
+        .expect("the unary element-wise executable must verify");
+    let export = parsed.exports().get(0);
+    assert_eq!(export.kernel_type(), rocket::KernelDef::ElementwiseUnaryDef);
+    let ew = export.kernel_as_elementwise_unary_def().unwrap();
+    assert_eq!((ew.width(), ew.height(), ew.channels()), (14, 14, 64));
+    assert_eq!(ew.op(), rocket::EwUnaryOp::FLOOR);
+    assert_eq!(ew.operand(), 0);
+    assert!(ew.runtime_dimensions().is_none());
+}
+
+/// `ADD_SCALAR` carries its operand as an IEEE-754 binary32 bit pattern, not
+/// as a number -- the convention `Conv2DQuantParam` documents. Checked as
+/// bits so a reader that silently reinterpreted the field would fail here.
+#[test]
+fn elementwise_add_scalar_operand_is_a_bit_pattern() {
+    let mut builder = flatbuffers::FlatBufferBuilder::new();
+    let ew = rocket::ElementwiseUnaryDef::create(
+        &mut builder,
+        &rocket::ElementwiseUnaryDefArgs {
+            width: 4,
+            height: 4,
+            channels: 16,
+            op: rocket::EwUnaryOp::ADD_SCALAR,
+            operand: 0.5f32.to_bits(),
+            ..Default::default()
+        },
+    );
+    let name = builder.create_string("elementwise_add_half");
+    let export = rocket::ExportDef::create(
+        &mut builder,
+        &rocket::ExportDefArgs {
+            name: Some(name),
+            kernel_type: rocket::KernelDef::ElementwiseUnaryDef,
+            kernel: Some(ew.as_union_value()),
+        },
+    );
+    let exports = builder.create_vector(&[export]);
+    let root = rocket::ExecutableDef::create(
+        &mut builder,
+        &rocket::ExecutableDefArgs {
+            exports: Some(exports),
+        },
+    );
+    builder.finish(root, Some("RKT1"));
+
+    let parsed = rocket::root_as_executable_def(builder.finished_data()).unwrap();
+    let ew = parsed
+        .exports()
+        .get(0)
+        .kernel_as_elementwise_unary_def()
+        .unwrap();
+    assert_eq!(ew.op(), rocket::EwUnaryOp::ADD_SCALAR);
+    assert_eq!(ew.operand(), 0x3f00_0000);
+    assert_eq!(f32::from_bits(ew.operand()), 0.5);
+}
+
+/// The two-tensor form. Both operands and the result share this one
+/// geometry -- the op does not broadcast -- which is why there is a single
+/// width/height/channels rather than a per-operand set.
+#[test]
+fn elementwise_binary_definition_round_trips() {
+    let mut builder = flatbuffers::FlatBufferBuilder::new();
+    let ew = rocket::ElementwiseBinaryDef::create(
+        &mut builder,
+        &rocket::ElementwiseBinaryDefArgs {
+            width: 197,
+            height: 1,
+            channels: 768,
+            op: rocket::EwBinaryOp::MUL,
+            ..Default::default()
+        },
+    );
+    let name = builder.create_string("elementwise_mul");
+    let export = rocket::ExportDef::create(
+        &mut builder,
+        &rocket::ExportDefArgs {
+            name: Some(name),
+            kernel_type: rocket::KernelDef::ElementwiseBinaryDef,
+            kernel: Some(ew.as_union_value()),
+        },
+    );
+    let exports = builder.create_vector(&[export]);
+    let root = rocket::ExecutableDef::create(
+        &mut builder,
+        &rocket::ExecutableDefArgs {
+            exports: Some(exports),
+        },
+    );
+    builder.finish(root, Some("RKT1"));
+
+    let parsed = rocket::root_as_executable_def(builder.finished_data())
+        .expect("the binary element-wise executable must verify");
+    let export = parsed.exports().get(0);
+    assert_eq!(
+        export.kernel_type(),
+        rocket::KernelDef::ElementwiseBinaryDef
+    );
+    let ew = export.kernel_as_elementwise_binary_def().unwrap();
+    assert_eq!((ew.width(), ew.height(), ew.channels()), (197, 1, 768));
+    assert_eq!(ew.op(), rocket::EwBinaryOp::MUL);
+    assert!(ew.runtime_dimensions().is_none());
+}
+
+/// A LUT executable with every dimension runtime-supplied, which is the shape
+/// a dynamic element-wise dispatch takes. Also pins the zero-point encoding:
+/// the wire carries the *decoded* zero point as a two's-complement int32 in a
+/// uint32, not the 0x80-biased raw register form `LutShape` takes.
+#[test]
+fn elementwise_lut_definition_round_trips_with_runtime_dimensions() {
+    let mut builder = flatbuffers::FlatBufferBuilder::new();
+    let dimensions = builder.create_vector(&[
+        rocket::ElementwiseDimension::WIDTH,
+        rocket::ElementwiseDimension::HEIGHT,
+        rocket::ElementwiseDimension::CHANNELS,
+    ]);
+    let lut = rocket::ElementwiseLutDef::create(
+        &mut builder,
+        &rocket::ElementwiseLutDefArgs {
+            width: 0,
+            height: 0,
+            channels: 0,
+            fn_: rocket::LutFn::TANH,
+            input_zero_point: (-128i32) as u32,
+            output_zero_point: 0,
+            input_scale: 1.0 / 32.0,
+            output_scale: 1.0 / 128.0,
+            runtime_dimensions: Some(dimensions),
+        },
+    );
+    let name = builder.create_string("elementwise_tanh");
+    let export = rocket::ExportDef::create(
+        &mut builder,
+        &rocket::ExportDefArgs {
+            name: Some(name),
+            kernel_type: rocket::KernelDef::ElementwiseLutDef,
+            kernel: Some(lut.as_union_value()),
+        },
+    );
+    let exports = builder.create_vector(&[export]);
+    let root = rocket::ExecutableDef::create(
+        &mut builder,
+        &rocket::ExecutableDefArgs {
+            exports: Some(exports),
+        },
+    );
+    builder.finish(root, Some("RKT1"));
+
+    let parsed = rocket::root_as_executable_def(builder.finished_data())
+        .expect("the LUT executable must verify");
+    let export = parsed.exports().get(0);
+    assert_eq!(export.kernel_type(), rocket::KernelDef::ElementwiseLutDef);
+    let lut = export.kernel_as_elementwise_lut_def().unwrap();
+    assert_eq!(lut.fn_(), rocket::LutFn::TANH);
+    assert_eq!((lut.width(), lut.height(), lut.channels()), (0, 0, 0));
+    assert_eq!(lut.input_zero_point() as i32, -128);
+    assert_eq!(lut.output_zero_point() as i32, 0);
+    assert_eq!(lut.input_scale(), 1.0 / 32.0);
+    assert_eq!(lut.output_scale(), 1.0 / 128.0);
+
+    let dimensions: Vec<_> = lut.runtime_dimensions().unwrap().iter().collect();
+    assert_eq!(
+        dimensions,
+        vec![
+            rocket::ElementwiseDimension::WIDTH,
+            rocket::ElementwiseDimension::HEIGHT,
+            rocket::ElementwiseDimension::CHANNELS,
+        ]
+    );
 }
 
 /// The pooling method values are wire format, chosen independently of the

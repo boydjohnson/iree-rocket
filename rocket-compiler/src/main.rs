@@ -81,31 +81,54 @@ impl Drop for SpecFile {
 /// returned handle drops.
 fn resolve_transform_spec(common: &cli::CommonArgs) -> Result<SpecFile, Box<dyn Error>> {
     let source = transform_spec_path(common);
-    if !common.no_offload {
+    if !common.no_offload && !common.elementwise {
         return Ok(SpecFile {
             path: source,
             temporary: false,
         });
     }
 
-    let text = fs::read_to_string(&source)
+    let mut text = fs::read_to_string(&source)
         .map_err(|err| format!("failed to read transform spec {}: {err}", source.display()))?;
-    let neutralized = spec::neutralize(&text)?;
+
+    // Order matters, and only one way round is correct: enable first, then
+    // neutralize. `neutralize` refuses a matcher in the `foreach_match` list
+    // that constrains no dimension, and it rewrites the bounds of every
+    // matcher it finds there -- so running it second means the element-wise
+    // matchers are checked and defeated along with the rest, and
+    // `--no-offload --elementwise` is a true baseline for
+    // `--elementwise`. The other order would leave them live in the
+    // "no-offload" arm.
+    if common.elementwise {
+        let enabled = spec::enable_elementwise(&text)?;
+        eprintln!(
+            "--elementwise: {} matcher entries enabled in {}",
+            enabled.enabled,
+            source.display()
+        );
+        text = enabled.text;
+    }
+
+    let mut suffix = "elementwise";
+    if common.no_offload {
+        suffix = "no-offload";
+        let neutralized = spec::neutralize(&text)?;
+        // Said out loud because a baseline that silently stopped being a
+        // baseline is the failure this mode exists to prevent (ISSUES.md M4).
+        eprintln!(
+            "--no-offload: {} matchers defeated, {} dim_bounds rewritten in {}",
+            neutralized.matchers,
+            neutralized.rewritten,
+            source.display()
+        );
+        text = neutralized.text;
+    }
+
     let path = env::temp_dir().join(format!(
-        "rocket-compiler-no-offload-{}.mlir",
+        "rocket-compiler-{suffix}-{}.mlir",
         std::process::id()
     ));
-    fs::write(&path, &neutralized.text)
-        .map_err(|err| format!("failed to write {}: {err}", path.display()))?;
-
-    // Said out loud because a baseline that silently stopped being a baseline
-    // is the failure this mode exists to prevent (ISSUES.md M4).
-    eprintln!(
-        "--no-offload: {} matchers defeated, {} dim_bounds rewritten in {}",
-        neutralized.matchers,
-        neutralized.rewritten,
-        source.display()
-    );
+    fs::write(&path, &text).map_err(|err| format!("failed to write {}: {err}", path.display()))?;
 
     Ok(SpecFile {
         path,
@@ -347,6 +370,7 @@ mod tests {
             input: PathBuf::from("model.mlir"),
             transform_spec: None,
             no_offload: false,
+            elementwise: false,
             rocket_device_name: rocket.to_string(),
             cpu_device_name: cpu.to_string(),
             llvmcpu_target_cpu: "generic".to_string(),

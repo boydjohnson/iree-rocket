@@ -21,6 +21,9 @@ PASSES=${PASSES:-3}
 MINTIME=${MINTIME:-5s}
 CPUSETS=${CPUSETS:-"4,5 4-7"}
 ARMS=${ARMS:-"int8.cpu int8.landed fp16.cpu fp16.landed"}
+# The model's input, in ~. MobileNetV2's by default; ViT and VGG have their
+# own, so this is a variable rather than a constant.
+INPUT=${INPUT:-mnv2_in.npy}
 
 wait_quiet() {
   for _ in $(seq 1 60); do
@@ -39,6 +42,7 @@ echo "# governor: $(for c in 0 4 6; do printf 'cpu%s=%s ' $c \
     "$(cat /sys/devices/system/cpu/cpu$c/cpufreq/scaling_governor)"; done)"
 echo "# npu irqs: $(for i in 82 83 84; do printf '%s->%s ' $i "$(cat /proc/irq/$i/smp_affinity_list)"; done)"
 echo "# passes:   $PASSES   min_time: $MINTIME   cpusets: $CPUSETS"
+echo "# input:    $INPUT ($(md5sum "$INPUT" | cut -c1-8))"
 for a in $ARMS; do echo "# arm $a: $(md5sum bench/$a.vmfb | cut -c1-8)"; done
 echo
 
@@ -48,7 +52,7 @@ for p in $(seq 1 "$PASSES"); do
       wait_quiet
       out=$(taskset -c "$cpus" "$BIN" \
               --module=bench/$arm.vmfb --device=rocket --device=local-task \
-              --function=main_graph --input=@mnv2_in.npy \
+              --function=main_graph --input=@"$INPUT" \
               --benchmark_min_time=$MINTIME 2>&1)
       ips=$(echo "$out" | grep -oE 'items_per_second=[0-9.]+' | cut -d= -f2)
       ms=$(echo "$out" | grep -oE 'real_time[[:space:]]+[0-9.]+ ms' | grep -oE '[0-9.]+')
