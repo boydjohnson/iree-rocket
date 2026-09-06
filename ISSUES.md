@@ -791,6 +791,42 @@ Logits are **bit-identical** to the pre-change build (all 1001, max|diff| 0.0)
 NPU sites either way, 148 -> 145 CPU sites from the inline alone); its own
 epilogue still carries a genuine `f16 -> f32` widen and was left alone.
 
+### Cin 1344 is exact in every isolated test and wrong inside the model
+
+Open, 2026-09-06. Raising the requantized matchers' `Cin` bound from 512 to
+1344 puts 32 of MobileNetV2-static-int8's 34 dense convolutions on the
+requantized path and **breaks the model**: logits go from max|diff| 0.33
+against a CPU arm to 5.01, mean 0.07 to 0.92, and the argmax moves from 447
+to 977. Bisected by raising the bound one step at a time -- `Cin` 528 and 816
+are both clean (max 0.43 and 0.33, argmax correct) -- to exactly one
+convolution: **7x7 `Cin` 1344 -> `Cout` 448**.
+
+That convolution is exact everywhere it is tested on its own:
+
+| instrument | result |
+|---|---|
+| `dtype_boundary_probe`, `selectors-affine` | exact |
+| `dtype_boundary_probe`, `onehot` (the addressing-sensitive read map) | exact |
+| `dtype_boundary_probe`, `Cin` ladder to 1792, `Cout` ladder to 2048 | exact |
+| `e2e_conv_regression` at the identical shape | **max error 0**, not 1 |
+| same shape with a million-scale bias (`requant_int8_1x1_large_bias`) | exact |
+
+So neither the shape, the addressing, nor the folded bias magnitude is the
+discriminator, and the compiled differential -- which is the strongest
+instrument here, since it runs the real compiler against a CPU reference on
+real data -- is *bit-exact* for the convolution that ruins the model. What
+differs in the model and not in the fixture is unidentified.
+
+The bound therefore ships at `Cin` 816: the widest the model is measured
+correct at, well below everything the isolated tests support. `Cout` was
+raised 768 -> 1792 in the same session and is clean on the model.
+
+**Do not raise `Cin` past 816 on isolated evidence.** This issue exists
+because isolated evidence said 1792 and the model said 816. The next step is
+an instrument that can see *which* dispatch first diverges inside a real
+model -- comparing intermediate tensors, not logits -- because every
+shape-level instrument this repo has already says the shape is fine.
+
 ### The ranked levers this leaves
 
 1. **Stop materializing `i32` activations and stop leaving their epilogues

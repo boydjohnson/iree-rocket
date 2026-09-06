@@ -124,21 +124,19 @@ func.func @requant_3x3_cin512_matched(
   return %out : tensor<1x4x4x64xi8>
 }
 
-// Cin 528 is one 16-channel atom past the requantized matchers' measured
-// plain-int8 ceiling of 512, so the requantized loop must decline it. The
-// convolution is then still standing and is offered to the int8_accumulator
-// matchers, which -- since the per-channel coefficient limit that used to cap
-// them at Cin 352 was retracted as a measurement artifact -- now claim it.
-// So this case pins one thing only: that exceeding the bound leaves the
-// *requantized* path alone. Where it lands afterwards is the accumulator
-// matchers' own business, and `rocket_int8_match_boundaries.mlir` is where
-// that bound is pinned.
-// CHECK-LABEL: util.func public @requant_1x1_cin528_declined
+// Cin 1536 is past the requantized matchers' measured ceiling of 1344 --
+// itself the widest Cin MobileNetV2-static-int8 asks for, which is where the
+// bound was raised to on 2026-09-06 -- so the requantized loop must decline
+// it. This case pins one thing only: that exceeding the bound leaves the
+// *requantized* path alone. Where the convolution lands afterwards is the
+// accumulator matchers' business, and `rocket_int8_match_boundaries.mlir` is
+// where that bound is pinned.
+// CHECK-LABEL: util.func public @requant_1x1_cin1536_declined
 // CHECK-NOT: @rocket_dynamic_int8_requant_executable
-// CHECK: flow.dispatch @rocket_dynamic_int8_executable
-func.func @requant_1x1_cin528_declined(
-    %input: tensor<1x4x4x528xi8>,
-    %filter: tensor<1x1x528x64xi8>,
+// CHECK: linalg.conv_2d_nhwc_hwcf
+func.func @requant_1x1_cin1536_declined(
+    %input: tensor<1x4x4x1536xi8>,
+    %filter: tensor<1x1x1536x64xi8>,
     %bias: tensor<64xi32>) -> tensor<1x4x4x64xi8> {
   %zero = arith.constant 0 : i32
   %scale = arith.constant 1.500000e-03 : f32
@@ -149,7 +147,7 @@ func.func @requant_1x1_cin528_declined(
   %acc_init = linalg.fill ins(%zero : i32) outs(%acc_empty : tensor<1x4x4x64xi32>) -> tensor<1x4x4x64xi32>
   %acc = linalg.conv_2d_nhwc_hwcf
       {dilations = dense<1> : tensor<2xi64>, strides = dense<1> : tensor<2xi64>}
-      ins(%input, %filter : tensor<1x4x4x528xi8>, tensor<1x1x528x64xi8>)
+      ins(%input, %filter : tensor<1x4x4x1536xi8>, tensor<1x1x1536x64xi8>)
       outs(%acc_init : tensor<1x4x4x64xi32>) -> tensor<1x4x4x64xi32>
   %out_empty = tensor.empty() : tensor<1x4x4x64xi8>
   %out = linalg.generic {

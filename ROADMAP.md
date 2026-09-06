@@ -374,9 +374,12 @@ constant. Steps 4 and 5 collapse into the canonical generic. That is the pass.
 reaches the requantized path for the first time: 15 of MobileNetV2's dense
 convolutions.** It is as accurate as the accumulator build it replaces
 (max|diff| 0.334 against a CPU arm, against the accumulator build's 0.396,
-same top-5). The 19 that remain exceed the requantized matchers' measured
-`Cin` 512 / `Cout` 768 bounds; raising those is a separate measurement job and
-is now the largest single lever left on this path.
+same top-5). The bounds were then raised on measurement the same day -- `Cin` 512 -> 816
+and `Cout` 768 -> 1792 -- taking it to **29 of 34**, still at baseline
+accuracy (max|diff| 0.336, argmax and top-5 unchanged). `Cin` stops at 816
+rather than the 1792 every isolated instrument supports because the model
+says so: see ISSUES.md's "Cin 1344 is exact in every isolated test and wrong
+inside the model".
 
 The model also found a hardware limit no fixture had: **`Cout = 24` is wrong
 on the requantized path.** Admitting that one convolution moves the model's

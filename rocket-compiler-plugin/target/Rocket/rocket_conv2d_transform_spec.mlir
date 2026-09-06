@@ -5367,7 +5367,24 @@ module attributes {transform.with_named_sequence} {
 
     %input_value = transform.get_operand %conv[0] : (!transform.any_op) -> !transform.any_value
     %filter_value = transform.get_operand %conv[1] : (!transform.any_op) -> !transform.any_value
-    transform.iree.match.dim_bounds %input_value[3], umin = 1, umax = 512 : !transform.any_value
+    // Raised 512 -> 816 on 2026-09-06. The ceiling is a *model* measurement,
+    // not a shape one, and it is lower than every isolated test supports:
+    // the HAL sweep `dtype_boundary_probe` is exact to Cin 1792 under both
+    // patterns valid for this path (`selectors-affine` and `onehot`), and
+    // `tools/e2e_conv_regression.py` is exact at Cin 1344 Cout 448 -- max
+    // error 0, not 1 -- for the very convolution that breaks the model.
+    // Admitting Cin 1344 moves MobileNetV2's logits from max|diff| 0.33 to
+    // 5.01 and its argmax from 447 to 977, bisected to that one shape. Two
+    // hypotheses are ruled out by measurement: it is not the shape (exact in
+    // isolation) and not the folded bias magnitude (`requant_int8_1x1_
+    // large_bias` puts a million-scale bias through the same shape and is
+    // exact). The discriminator is unidentified, so the bound stops at the
+    // widest Cin the model is *measured* correct at. See ISSUES.md.
+    //
+    // The accumulator path's own caps do not apply here and never did: they
+    // came from the 384-coefficient-bytes-per-output-channel limit that
+    // `int8_accumulator` has and this path does not.
+    transform.iree.match.dim_bounds %input_value[3], umin = 1, umax = 816 : !transform.any_value
     // Cout has a *lower* bound of 32, and it is a measurement, not a
     // convention. MobileNetV2's `112x112 Cin 48 -> Cout 24` pointwise
     // convolution is wrong on this path: admitting it alone moves the
@@ -5380,7 +5397,7 @@ module attributes {transform.with_named_sequence} {
     // Bisected on `planck` 2026-09-06 by admitting convolutions in Cin
     // order and then excluding this one shape, which restored the baseline
     // exactly. 25..31 are untested and excluded with it.
-    transform.iree.match.dim_bounds %filter_value[3], umin = 32, umax = 768 : !transform.any_value
+    transform.iree.match.dim_bounds %filter_value[3], umin = 32, umax = 1792 : !transform.any_value
 
     %ins, %outs = transform.iree.match.cast_compatible_dag_from_root %root {
       ^bb0(%input: tensor<1x?x?x?xi8>, %weights: tensor<?x?x?x?xi8>,
@@ -5444,7 +5461,12 @@ module attributes {transform.with_named_sequence} {
 
     %input_value = transform.get_operand %conv[0] : (!transform.any_op) -> !transform.any_value
     %filter_value = transform.get_operand %conv[1] : (!transform.any_op) -> !transform.any_value
-    transform.iree.match.dim_bounds %input_value[3], umin = 1, umax = 512 : !transform.any_value
+    // Raised 512 -> 768, gated by `requant_int8_3x3_cin768`. Lower than the
+    // 1x1 ceiling because that is where this kernel's own compiled
+    // differential stops, not because 3x3 is known to fail above it -- the
+    // HAL sweep is exact at 3x3 Cin 1024 too. MobileNetV2's 3x3 convolutions
+    // are all depthwise, so nothing in the measured models needs more.
+    transform.iree.match.dim_bounds %input_value[3], umin = 1, umax = 768 : !transform.any_value
     // Cout has a *lower* bound of 32, and it is a measurement, not a
     // convention. MobileNetV2's `112x112 Cin 48 -> Cout 24` pointwise
     // convolution is wrong on this path: admitting it alone moves the
