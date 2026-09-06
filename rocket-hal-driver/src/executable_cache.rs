@@ -48,16 +48,16 @@ use crate::{
         iree_hal_resource_t, iree_host_size_t, iree_status_t, iree_string_view_t,
     },
     executable::{
-        Conv2dExecutable, ElementwiseGeometry, ElementwiseLutExecutable,
-        ElementwiseUnaryExecutable, LutFunction, MatmulExecutable, PoolingExecutable,
-        RuntimeConv2dDimension, RuntimeConv2dQuantParam, RuntimeElementwiseDimension,
-        RuntimeMatmulDimension, RuntimePoolingDimension, UkernelShape,
+        Conv2dExecutable, ElementwiseBinaryExecutable, ElementwiseGeometry,
+        ElementwiseLutExecutable, ElementwiseUnaryExecutable, LutFunction, MatmulExecutable,
+        PoolingExecutable, RuntimeConv2dDimension, RuntimeConv2dQuantParam,
+        RuntimeElementwiseDimension, RuntimeMatmulDimension, RuntimePoolingDimension, UkernelShape,
     },
     status,
 };
 use iree_rocket_hal::rocket::{
     conv::{self, Activation, Kernels, Multiplier, Precision, Quantization},
-    elementwise::EwUnaryAlgo,
+    elementwise::{EwBinaryOp, EwUnaryAlgo},
     executable_format::{CONV2D_V1_TAG, decode_conv_shape_v1, validate_conv_shape},
     fc,
     pooling::{PoolingMethod, PoolingPrecision, PoolingShape},
@@ -428,6 +428,30 @@ fn decode_flatbuffer_shape(data: &[u8]) -> Result<UkernelShape, ()> {
             };
             executable.validate_template().map_err(|_| ())?;
             Ok(UkernelShape::ElementwiseUnary(executable))
+        }
+        schema::KernelDef::ElementwiseBinaryDef => {
+            let ew = export.kernel_as_elementwise_binary_def().ok_or(())?;
+            let op = match ew.op() {
+                schema::EwBinaryOp::ADD => EwBinaryOp::Add,
+                schema::EwBinaryOp::SUB => EwBinaryOp::Sub,
+                schema::EwBinaryOp::MUL => EwBinaryOp::Mul,
+                schema::EwBinaryOp::MAX => EwBinaryOp::Max,
+                schema::EwBinaryOp::MIN => EwBinaryOp::Min,
+                _ => return Err(()),
+            };
+            let executable = ElementwiseBinaryExecutable {
+                geometry: ElementwiseGeometry {
+                    width: ew.width(),
+                    height: ew.height(),
+                    channels: ew.channels(),
+                },
+                op,
+                runtime_dimensions: decode_elementwise_dimensions(
+                    ew.runtime_dimensions().map(|dimensions| dimensions.iter()),
+                )?,
+            };
+            executable.validate_template().map_err(|_| ())?;
+            Ok(UkernelShape::ElementwiseBinary(executable))
         }
         schema::KernelDef::ElementwiseLutDef => {
             let lut = export.kernel_as_elementwise_lut_def().ok_or(())?;
@@ -1207,6 +1231,32 @@ mod tests {
         assert!(executable.runtime_dimensions.is_empty());
     }
 
+    /// As above, from `rocket_elementwise_binary.mlir`. The two-tensor form
+    /// is the one with a real target in a compiled model -- ViT carries 123
+    /// Add, 74 Mul and 25 Sub -- so its wire encoding is worth pinning
+    /// against the compiler that will actually emit it.
+    #[test]
+    fn decodes_the_compilers_elementwise_binary_executable() {
+        let data = include_bytes!(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/../rocket-schema/testdata/elementwise_binary.rkt1"
+        ));
+        let UkernelShape::ElementwiseBinary(executable) =
+            decode_flatbuffer_shape(data).expect("the compiler's executable must decode")
+        else {
+            panic!("expected a binary element-wise executable");
+        };
+        assert_eq!(executable.op, EwBinaryOp::Mul);
+        assert_eq!(
+            executable.geometry,
+            ElementwiseGeometry {
+                width: 197,
+                height: 1,
+                channels: 768
+            }
+        );
+    }
+
     /// As above, from `rocket_elementwise_lut.mlir`. Also checks the
     /// decoded-to-biased zero-point conversion across the compiler boundary:
     /// the `.mlir` says 0 and `LutShape` must see 0x80.
@@ -1405,6 +1455,65 @@ mod tests {
 
         let stray = encode_elementwise_unary_executable(schema::EwUnaryOp::NEG, (4, 4, 16), 1, &[]);
         assert!(decode_flatbuffer_shape(&stray).is_err());
+    }
+
+    /// The two-tensor form. Both operands and the result share one geometry,
+    /// so the dispatch arm packs two input cubes of identical shape.
+    #[test]
+    fn decodes_an_elementwise_binary_executable() {
+        let mut builder = flatbuffers::FlatBufferBuilder::new();
+        let name = builder.create_string("rocket_elementwise_binary_0");
+        let ew = schema::ElementwiseBinaryDef::create(
+            &mut builder,
+            &schema::ElementwiseBinaryDefArgs {
+                width: 197,
+                height: 1,
+                channels: 768,
+                op: schema::EwBinaryOp::MUL,
+                runtime_dimensions: None,
+            },
+        );
+        let export = schema::ExportDef::create(
+            &mut builder,
+            &schema::ExportDefArgs {
+                name: Some(name),
+                kernel_type: schema::KernelDef::ElementwiseBinaryDef,
+                kernel: Some(ew.as_union_value()),
+            },
+        );
+        let exports = builder.create_vector(&[export]);
+        let root = schema::ExecutableDef::create(
+            &mut builder,
+            &schema::ExecutableDefArgs {
+                exports: Some(exports),
+            },
+        );
+        builder.finish(root, Some("RKT1"));
+        let data = wrap_executable(builder);
+
+        let UkernelShape::ElementwiseBinary(executable) = decode_flatbuffer_shape(&data).unwrap()
+        else {
+            panic!("expected a binary element-wise executable");
+        };
+        assert_eq!(executable.op, EwBinaryOp::Mul);
+        assert_eq!(
+            executable.geometry,
+            ElementwiseGeometry {
+                width: 197,
+                height: 1,
+                channels: 768
+            }
+        );
+
+        // fp16 is the only precision this executable can describe, so every
+        // int8-only field of `EwAddShape` resolves to its ignored default.
+        let shape = executable.resolve_shape(&[]).unwrap();
+        assert!(matches!(
+            shape.precision,
+            iree_rocket_hal::rocket::elementwise::EwPrecision::Fp16
+        ));
+        assert_eq!(shape.output_zero_point, 0);
+        assert_eq!(shape.w_cvt_offset, 0);
     }
 
     /// The wire carries the *decoded* zero point; `LutShape` takes the

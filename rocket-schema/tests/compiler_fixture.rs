@@ -188,6 +188,7 @@ fn kernel_union_tags_are_stable() {
     assert_eq!(rocket::KernelDef::MatmulDef.0, 4);
     assert_eq!(rocket::KernelDef::ElementwiseUnaryDef.0, 5);
     assert_eq!(rocket::KernelDef::ElementwiseLutDef.0, 6);
+    assert_eq!(rocket::KernelDef::ElementwiseBinaryDef.0, 7);
 }
 
 /// Element-wise operator values are wire format, deliberately independent of
@@ -313,6 +314,53 @@ fn elementwise_add_scalar_operand_is_a_bit_pattern() {
     assert_eq!(ew.op(), rocket::EwUnaryOp::ADD_SCALAR);
     assert_eq!(ew.operand(), 0x3f00_0000);
     assert_eq!(f32::from_bits(ew.operand()), 0.5);
+}
+
+/// The two-tensor form. Both operands and the result share this one
+/// geometry -- the op does not broadcast -- which is why there is a single
+/// width/height/channels rather than a per-operand set.
+#[test]
+fn elementwise_binary_definition_round_trips() {
+    let mut builder = flatbuffers::FlatBufferBuilder::new();
+    let ew = rocket::ElementwiseBinaryDef::create(
+        &mut builder,
+        &rocket::ElementwiseBinaryDefArgs {
+            width: 197,
+            height: 1,
+            channels: 768,
+            op: rocket::EwBinaryOp::MUL,
+            ..Default::default()
+        },
+    );
+    let name = builder.create_string("elementwise_mul");
+    let export = rocket::ExportDef::create(
+        &mut builder,
+        &rocket::ExportDefArgs {
+            name: Some(name),
+            kernel_type: rocket::KernelDef::ElementwiseBinaryDef,
+            kernel: Some(ew.as_union_value()),
+        },
+    );
+    let exports = builder.create_vector(&[export]);
+    let root = rocket::ExecutableDef::create(
+        &mut builder,
+        &rocket::ExecutableDefArgs {
+            exports: Some(exports),
+        },
+    );
+    builder.finish(root, Some("RKT1"));
+
+    let parsed = rocket::root_as_executable_def(builder.finished_data())
+        .expect("the binary element-wise executable must verify");
+    let export = parsed.exports().get(0);
+    assert_eq!(
+        export.kernel_type(),
+        rocket::KernelDef::ElementwiseBinaryDef
+    );
+    let ew = export.kernel_as_elementwise_binary_def().unwrap();
+    assert_eq!((ew.width(), ew.height(), ew.channels()), (197, 1, 768));
+    assert_eq!(ew.op(), rocket::EwBinaryOp::MUL);
+    assert!(ew.runtime_dimensions().is_none());
 }
 
 /// A LUT executable with every dimension runtime-supplied, which is the shape

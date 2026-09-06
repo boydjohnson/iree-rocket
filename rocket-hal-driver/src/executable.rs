@@ -23,7 +23,7 @@ use crate::{
 use iree_rocket_hal::rocket::{
     activation::{LutShape, LutTable},
     conv::{self, Kernels, Multiplier, Precision},
-    elementwise::{EwUnaryAlgo, EwUnaryShape},
+    elementwise::{EwAddShape, EwBinaryOp, EwPrecision, EwUnaryAlgo, EwUnaryShape},
     executable_format::validate_conv_shape,
     fc,
     pooling::PoolingShape,
@@ -688,6 +688,56 @@ impl ElementwiseUnaryExecutable {
     }
 }
 
+/// Two-tensor element-wise executable metadata before per-dispatch runtime
+/// dimensions resolve.
+///
+/// fp16 only, and no precision field, for a narrower reason than
+/// [`ElementwiseUnaryExecutable`]'s: [`EwAddShape`] *does* carry an int8
+/// branch, but its `EW_CVT_SCALE`/`OUT_CVT_SCALE` ratio semantics are
+/// inferred from register shape rather than confirmed against a known value,
+/// and `Mul` has no int8 recipe in any capture. The wire format declines to
+/// carry that inference; see the schema's own comment.
+#[derive(Clone, Debug, PartialEq)]
+pub struct ElementwiseBinaryExecutable {
+    pub geometry: ElementwiseGeometry,
+    pub op: EwBinaryOp,
+    pub runtime_dimensions: Vec<RuntimeElementwiseDimension>,
+}
+
+impl ElementwiseBinaryExecutable {
+    pub fn new_static(geometry: ElementwiseGeometry, op: EwBinaryOp) -> Self {
+        Self {
+            geometry,
+            op,
+            runtime_dimensions: Vec::new(),
+        }
+    }
+
+    pub fn validate_template(&self) -> Result<(), &'static str> {
+        validate_elementwise_template(&self.geometry, &self.runtime_dimensions)
+    }
+
+    pub fn resolve_shape(&self, constants: &[u8]) -> Result<EwAddShape, &'static str> {
+        let geometry =
+            resolve_elementwise_geometry(&self.geometry, &self.runtime_dimensions, constants)?;
+        Ok(EwAddShape {
+            width: geometry.width,
+            height: geometry.height,
+            channels: geometry.channels,
+            precision: EwPrecision::Fp16,
+            op: self.op,
+            // Every field below is int8-only and ignored at fp16, which is
+            // the only precision this executable can describe. They are not
+            // on the wire for that reason, so there is nothing to carry
+            // here either.
+            output_zero_point: 0,
+            w_cvt_offset: 0,
+            w_scale_ratio: 1.0,
+            output_scale_ratio: 1.0,
+        })
+    }
+}
+
 /// Which LUT curve an [`ElementwiseLutExecutable`] selects.
 ///
 /// A runtime-owned mirror of the wire `LutFn`, for the same reason
@@ -920,6 +970,7 @@ pub enum UkernelShape {
     Pooling(PoolingExecutable),
     ElementwiseUnary(ElementwiseUnaryExecutable),
     ElementwiseLut(ElementwiseLutExecutable),
+    ElementwiseBinary(ElementwiseBinaryExecutable),
 }
 
 /// What every `iree_hal_executable_t*` this driver hands out actually

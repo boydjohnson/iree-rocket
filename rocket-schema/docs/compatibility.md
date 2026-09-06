@@ -52,16 +52,16 @@ plus a separate divide), recognizing that pair as an average is the
 compiler's job. Adding `SUM` here would create a wire state no runtime can
 execute.
 
-`ElementwiseUnaryDef` and `ElementwiseLutDef` were appended to `KernelDef` as
-union tags 5 and 6. Same rule as tags 3 and 4: the members must never be
-reordered, and `kernel_union_tags_are_stable` says so.
+`ElementwiseUnaryDef`, `ElementwiseLutDef` and `ElementwiseBinaryDef` were
+appended to `KernelDef` as union tags 5, 6 and 7. Same rule as tags 3 and 4:
+the members must never be reordered, and `kernel_union_tags_are_stable` says
+so.
 
 `EwUnaryOp` and `EwBinaryOp` are two enums rather than one `EwOp`. A single
 list spanning both tables would let a producer name `ADD` in an
 `ElementwiseUnaryDef` -- a wire state no runtime can execute, which is the
 same objection that keeps `SUM` out of `PoolingMethod`. Each enum is closed
-over what its own table can run. `EwBinaryOp` is declared now but has no
-table yet; the two-tensor def is separate work.
+over what its own table can run. 
 
 `EwBinaryOp` has no `DIV`. `ew_alu_algo = 3` is the one TRM-documented binary
 opcode with no hardware evidence anywhere in this project, and
@@ -73,6 +73,19 @@ stylistic: the conv+add sweep found real `rknn-toolkit2` compiles route an
 int8 subtraction as `algo = 2` (Add) with a negated scale rather than
 `algo = 4`, so the register value is not a function of the logical operation
 alone. `elementwise_op_values_are_stable` pins the wire values.
+
+`ElementwiseBinaryDef` also has no precision field, but for a narrower reason
+than the unary table's. `iree-rocket-hal`'s `EwAddShape` *does* carry an int8
+branch; what it does not carry is confirmation. Its `EW_CVT_SCALE` and
+`OUT_CVT_SCALE` ratio semantics are inferred from register shape rather than
+checked against a known value -- the builder's own doc comments say so -- and
+`MUL` has no int8 recipe in any capture at all. Putting `precision` and the
+int8 scale fields on the wire would ship that inference as an ABI. Appending
+them once a capture confirms them is the compatible move.
+
+`ElementwiseBinaryDef` does not broadcast. Both operands and the result share
+the one width/height/channels, which is why there is no per-operand shape; a
+producer that wants broadcasting must materialize it.
 
 `ElementwiseUnaryDef` has **no precision field**, deliberately. The unary EW
 task shape is fp16 only: `iree-rocket-hal`'s `EwUnaryShape` ships no int8

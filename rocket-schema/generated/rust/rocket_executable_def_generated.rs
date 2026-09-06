@@ -1106,10 +1106,10 @@ impl flatbuffers::SimpleToVerifyInSlice for Conv2DQuantParam {}
 #[deprecated(since = "2.0.0", note = "Use associated constants instead. This will no longer be generated in 2021.")]
 pub const ENUM_MIN_KERNEL_DEF: u8 = 0;
 #[deprecated(since = "2.0.0", note = "Use associated constants instead. This will no longer be generated in 2021.")]
-pub const ENUM_MAX_KERNEL_DEF: u8 = 6;
+pub const ENUM_MAX_KERNEL_DEF: u8 = 7;
 #[deprecated(since = "2.0.0", note = "Use associated constants instead. This will no longer be generated in 2021.")]
 #[allow(non_camel_case_types)]
-pub const ENUM_VALUES_KERNEL_DEF: [KernelDef; 7] = [
+pub const ENUM_VALUES_KERNEL_DEF: [KernelDef; 8] = [
   KernelDef::NONE,
   KernelDef::Conv2DDef,
   KernelDef::FullyConnectedDef,
@@ -1117,6 +1117,7 @@ pub const ENUM_VALUES_KERNEL_DEF: [KernelDef; 7] = [
   KernelDef::MatmulDef,
   KernelDef::ElementwiseUnaryDef,
   KernelDef::ElementwiseLutDef,
+  KernelDef::ElementwiseBinaryDef,
 ];
 
 #[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Default)]
@@ -1131,9 +1132,10 @@ impl KernelDef {
   pub const MatmulDef: Self = Self(4);
   pub const ElementwiseUnaryDef: Self = Self(5);
   pub const ElementwiseLutDef: Self = Self(6);
+  pub const ElementwiseBinaryDef: Self = Self(7);
 
   pub const ENUM_MIN: u8 = 0;
-  pub const ENUM_MAX: u8 = 6;
+  pub const ENUM_MAX: u8 = 7;
   pub const ENUM_VALUES: &'static [Self] = &[
     Self::NONE,
     Self::Conv2DDef,
@@ -1142,6 +1144,7 @@ impl KernelDef {
     Self::MatmulDef,
     Self::ElementwiseUnaryDef,
     Self::ElementwiseLutDef,
+    Self::ElementwiseBinaryDef,
   ];
   /// Returns the variant's name or "" if unknown.
   pub fn variant_name(self) -> Option<&'static str> {
@@ -1153,6 +1156,7 @@ impl KernelDef {
       Self::MatmulDef => Some("MatmulDef"),
       Self::ElementwiseUnaryDef => Some("ElementwiseUnaryDef"),
       Self::ElementwiseLutDef => Some("ElementwiseLutDef"),
+      Self::ElementwiseBinaryDef => Some("ElementwiseBinaryDef"),
       _ => None,
     }
   }
@@ -2634,6 +2638,156 @@ impl core::fmt::Debug for ElementwiseUnaryDef<'_> {
       ds.finish()
   }
 }
+pub enum ElementwiseBinaryDefOffset {}
+#[derive(Copy, Clone, PartialEq)]
+
+pub struct ElementwiseBinaryDef<'a> {
+  pub _tab: flatbuffers::Table<'a>,
+}
+
+impl<'a> flatbuffers::Follow<'a> for ElementwiseBinaryDef<'a> {
+  type Inner = ElementwiseBinaryDef<'a>;
+  #[inline]
+  fn follow(buf: &'a [u8], loc: usize) -> Self::Inner {
+    Self { _tab: flatbuffers::Table { buf, loc } }
+  }
+}
+
+impl<'a> ElementwiseBinaryDef<'a> {
+  pub const VT_WIDTH: flatbuffers::VOffsetT = 4;
+  pub const VT_HEIGHT: flatbuffers::VOffsetT = 6;
+  pub const VT_CHANNELS: flatbuffers::VOffsetT = 8;
+  pub const VT_OP: flatbuffers::VOffsetT = 10;
+  pub const VT_RUNTIME_DIMENSIONS: flatbuffers::VOffsetT = 12;
+
+  #[inline]
+  pub fn init_from_table(table: flatbuffers::Table<'a>) -> Self {
+    ElementwiseBinaryDef { _tab: table }
+  }
+  #[allow(unused_mut)]
+  pub fn create<'bldr: 'args, 'args: 'mut_bldr, 'mut_bldr>(
+    _fbb: &'mut_bldr mut flatbuffers::FlatBufferBuilder<'bldr>,
+    args: &'args ElementwiseBinaryDefArgs<'args>
+  ) -> flatbuffers::WIPOffset<ElementwiseBinaryDef<'bldr>> {
+    let mut builder = ElementwiseBinaryDefBuilder::new(_fbb);
+    if let Some(x) = args.runtime_dimensions { builder.add_runtime_dimensions(x); }
+    builder.add_channels(args.channels);
+    builder.add_height(args.height);
+    builder.add_width(args.width);
+    builder.add_op(args.op);
+    builder.finish()
+  }
+
+
+  #[inline]
+  pub fn width(&self) -> u32 {
+    self._tab.get::<u32>(ElementwiseBinaryDef::VT_WIDTH, Some(0)).unwrap()
+  }
+  #[inline]
+  pub fn height(&self) -> u32 {
+    self._tab.get::<u32>(ElementwiseBinaryDef::VT_HEIGHT, Some(0)).unwrap()
+  }
+  #[inline]
+  pub fn channels(&self) -> u32 {
+    self._tab.get::<u32>(ElementwiseBinaryDef::VT_CHANNELS, Some(0)).unwrap()
+  }
+  #[inline]
+  pub fn op(&self) -> EwBinaryOp {
+    self._tab.get::<EwBinaryOp>(ElementwiseBinaryDef::VT_OP, Some(EwBinaryOp::ADD)).unwrap()
+  }
+  #[inline]
+  pub fn runtime_dimensions(&self) -> Option<flatbuffers::Vector<'a, ElementwiseDimension>> {
+    self._tab.get::<flatbuffers::ForwardsUOffset<flatbuffers::Vector<'a, ElementwiseDimension>>>(ElementwiseBinaryDef::VT_RUNTIME_DIMENSIONS, None)
+  }
+}
+
+impl flatbuffers::Verifiable for ElementwiseBinaryDef<'_> {
+  #[inline]
+  fn run_verifier(
+    v: &mut flatbuffers::Verifier, pos: usize
+  ) -> Result<(), flatbuffers::InvalidFlatbuffer> {
+    use self::flatbuffers::Verifiable;
+    v.visit_table(pos)?
+     .visit_field::<u32>("width", Self::VT_WIDTH, false)?
+     .visit_field::<u32>("height", Self::VT_HEIGHT, false)?
+     .visit_field::<u32>("channels", Self::VT_CHANNELS, false)?
+     .visit_field::<EwBinaryOp>("op", Self::VT_OP, false)?
+     .visit_field::<flatbuffers::ForwardsUOffset<flatbuffers::Vector<'_, ElementwiseDimension>>>("runtime_dimensions", Self::VT_RUNTIME_DIMENSIONS, false)?
+     .finish();
+    Ok(())
+  }
+}
+pub struct ElementwiseBinaryDefArgs<'a> {
+    pub width: u32,
+    pub height: u32,
+    pub channels: u32,
+    pub op: EwBinaryOp,
+    pub runtime_dimensions: Option<flatbuffers::WIPOffset<flatbuffers::Vector<'a, ElementwiseDimension>>>,
+}
+impl<'a> Default for ElementwiseBinaryDefArgs<'a> {
+  #[inline]
+  fn default() -> Self {
+    ElementwiseBinaryDefArgs {
+      width: 0,
+      height: 0,
+      channels: 0,
+      op: EwBinaryOp::ADD,
+      runtime_dimensions: None,
+    }
+  }
+}
+
+pub struct ElementwiseBinaryDefBuilder<'a: 'b, 'b> {
+  fbb_: &'b mut flatbuffers::FlatBufferBuilder<'a>,
+  start_: flatbuffers::WIPOffset<flatbuffers::TableUnfinishedWIPOffset>,
+}
+impl<'a: 'b, 'b> ElementwiseBinaryDefBuilder<'a, 'b> {
+  #[inline]
+  pub fn add_width(&mut self, width: u32) {
+    self.fbb_.push_slot::<u32>(ElementwiseBinaryDef::VT_WIDTH, width, 0);
+  }
+  #[inline]
+  pub fn add_height(&mut self, height: u32) {
+    self.fbb_.push_slot::<u32>(ElementwiseBinaryDef::VT_HEIGHT, height, 0);
+  }
+  #[inline]
+  pub fn add_channels(&mut self, channels: u32) {
+    self.fbb_.push_slot::<u32>(ElementwiseBinaryDef::VT_CHANNELS, channels, 0);
+  }
+  #[inline]
+  pub fn add_op(&mut self, op: EwBinaryOp) {
+    self.fbb_.push_slot::<EwBinaryOp>(ElementwiseBinaryDef::VT_OP, op, EwBinaryOp::ADD);
+  }
+  #[inline]
+  pub fn add_runtime_dimensions(&mut self, runtime_dimensions: flatbuffers::WIPOffset<flatbuffers::Vector<'b , ElementwiseDimension>>) {
+    self.fbb_.push_slot_always::<flatbuffers::WIPOffset<_>>(ElementwiseBinaryDef::VT_RUNTIME_DIMENSIONS, runtime_dimensions);
+  }
+  #[inline]
+  pub fn new(_fbb: &'b mut flatbuffers::FlatBufferBuilder<'a>) -> ElementwiseBinaryDefBuilder<'a, 'b> {
+    let start = _fbb.start_table();
+    ElementwiseBinaryDefBuilder {
+      fbb_: _fbb,
+      start_: start,
+    }
+  }
+  #[inline]
+  pub fn finish(self) -> flatbuffers::WIPOffset<ElementwiseBinaryDef<'a>> {
+    let o = self.fbb_.end_table(self.start_);
+    flatbuffers::WIPOffset::new(o.value())
+  }
+}
+
+impl core::fmt::Debug for ElementwiseBinaryDef<'_> {
+  fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+    let mut ds = f.debug_struct("ElementwiseBinaryDef");
+      ds.field("width", &self.width());
+      ds.field("height", &self.height());
+      ds.field("channels", &self.channels());
+      ds.field("op", &self.op());
+      ds.field("runtime_dimensions", &self.runtime_dimensions());
+      ds.finish()
+  }
+}
 pub enum ElementwiseLutDefOffset {}
 #[derive(Copy, Clone, PartialEq)]
 
@@ -2955,6 +3109,17 @@ impl<'a> ExportDef<'a> {
     }
   }
 
+  #[inline]
+  #[allow(non_snake_case)]
+  pub fn kernel_as_elementwise_binary_def(&self) -> Option<ElementwiseBinaryDef<'a>> {
+    if self.kernel_type() == KernelDef::ElementwiseBinaryDef {
+      let u = self.kernel();
+      Some(ElementwiseBinaryDef::init_from_table(u))
+    } else {
+      None
+    }
+  }
+
 }
 
 impl flatbuffers::Verifiable for ExportDef<'_> {
@@ -2973,6 +3138,7 @@ impl flatbuffers::Verifiable for ExportDef<'_> {
           KernelDef::MatmulDef => v.verify_union_variant::<flatbuffers::ForwardsUOffset<MatmulDef>>("KernelDef::MatmulDef", pos),
           KernelDef::ElementwiseUnaryDef => v.verify_union_variant::<flatbuffers::ForwardsUOffset<ElementwiseUnaryDef>>("KernelDef::ElementwiseUnaryDef", pos),
           KernelDef::ElementwiseLutDef => v.verify_union_variant::<flatbuffers::ForwardsUOffset<ElementwiseLutDef>>("KernelDef::ElementwiseLutDef", pos),
+          KernelDef::ElementwiseBinaryDef => v.verify_union_variant::<flatbuffers::ForwardsUOffset<ElementwiseBinaryDef>>("KernelDef::ElementwiseBinaryDef", pos),
           _ => Ok(()),
         }
      })?
@@ -3073,6 +3239,13 @@ impl core::fmt::Debug for ExportDef<'_> {
         },
         KernelDef::ElementwiseLutDef => {
           if let Some(x) = self.kernel_as_elementwise_lut_def() {
+            ds.field("kernel", &x)
+          } else {
+            ds.field("kernel", &"InvalidFlatbuffer: Union discriminant does not match value.")
+          }
+        },
+        KernelDef::ElementwiseBinaryDef => {
+          if let Some(x) = self.kernel_as_elementwise_binary_def() {
             ds.field("kernel", &x)
           } else {
             ds.field("kernel", &"InvalidFlatbuffer: Union discriminant does not match value.")

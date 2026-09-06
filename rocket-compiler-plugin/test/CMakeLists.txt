@@ -8,6 +8,8 @@ iree_lit_test_suite(
     "rocket_fuse_int8_requant_epilogue.mlir"
     "rocket_expand_onnx_conv_integer.mlir"
     "rocket_elementwise_unary.mlir"
+    "rocket_elementwise_binary.mlir"
+    "rocket_elementwise_div_invalid.mlir"
     "rocket_elementwise_lut.mlir"
     "rocket_elementwise_lut_dynamic.mlir"
     "rocket_elementwise_lut_zero_point_invalid.mlir"

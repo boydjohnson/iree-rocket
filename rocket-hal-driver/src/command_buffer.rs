@@ -90,7 +90,7 @@ use iree_rocket_hal::rocket::{
     builders::RegCmd,
     conv::{AccumulatorOutputTile, Buffers, ConvPlan, FeatureLayout, Precision},
     device::{OwnedBuffer as RocketOwnedBuffer, fini_bo},
-    elementwise::{EwUnaryBuffers, build_unary_regcmd},
+    elementwise::{EwAddBuffers, EwUnaryBuffers, build_add_regcmd, build_unary_regcmd},
     fc,
     pooling::{PoolingBuffers, PoolingPlan},
     tensor_layout::{
@@ -434,6 +434,9 @@ pub enum RecordedOp {
         /// Set for multi-channel Conv2d dispatches whose dense IREE input
         /// must be packed into NC1HWC2 before the NPU reads it.
         input_packing: Option<InputPacking>,
+        /// The second tensor of a two-tensor element-wise op, packed the
+        /// same way as `input_packing`. None for every other kind.
+        operand_packing: Option<InputPacking>,
         /// Set for regular fp16 Conv2d dispatches whose logical HWCF filter
         /// must be packed into the CNA's blocked coefficient order.
         weight_packing: Option<WeightPacking>,
@@ -640,6 +643,7 @@ pub unsafe fn apply_ops(
                 in_bo_handles,
                 out_bo_handles,
                 input_packing,
+                operand_packing,
                 weight_packing,
                 bias_packing,
                 output_compaction,
@@ -649,83 +653,12 @@ pub unsafe fn apply_ops(
                 ..
             } => {
                 if let Some(packing) = input_packing {
-                    let timer = profile::start();
-                    let dense_len = packing
-                        .source_pixel_count
-                        .checked_mul(packing.bytes_per_pixel)
-                        .ok_or_else(|| {
-                            status::from_code(
-                                crate::bindings::iree_status_code_e_IREE_STATUS_INTERNAL,
-                            )
-                        })?;
-                    if dense_len as u64 > packing.input_length as u64 {
-                        return Err(status::from_code(
-                            crate::bindings::iree_status_code_e_IREE_STATUS_INVALID_ARGUMENT,
-                        ));
-                    }
-                    let input = unsafe { &*(packing.input_buffer as *const RocketBuffer) };
-                    let dense = unsafe {
-                        std::slice::from_raw_parts(
-                            input.host_ptr.add(packing.input_offset),
-                            dense_len,
-                        )
-                    };
-                    let padded_dense = if packing.source_pixel_count != packing.packed_pixel_count {
-                        let padded_len = packing
-                            .packed_pixel_count
-                            .checked_mul(packing.bytes_per_pixel)
-                            .ok_or_else(|| {
-                                status::from_code(
-                                    crate::bindings::iree_status_code_e_IREE_STATUS_INTERNAL,
-                                )
-                            })?;
-                        let mut padded = vec![packing.padding_byte; padded_len];
-                        padded[..dense_len].copy_from_slice(dense);
-                        Some(padded)
-                    } else {
-                        None
-                    };
-                    let dense = padded_dense.as_deref().unwrap_or(dense);
-                    let scratch = unsafe {
-                        std::slice::from_raw_parts_mut(packing.scratch_ptr, packing.scratch_length)
-                    };
-                    let packing_result = match packing.layout {
-                        InputPackingLayout::Dense => {
-                            if dense.len() > scratch.len() {
-                                Err("dense padded input exceeds its scratch buffer")
-                            } else {
-                                scratch[..dense.len()].copy_from_slice(dense);
-                                Ok(dense.len())
-                            }
-                        }
-                        InputPackingLayout::Nc1hwc2 => pack_nhwc_to_nc1hwc2_padded(
-                            dense,
-                            packing.packed_pixel_count,
-                            packing.bytes_per_pixel,
-                            packing.packed_bytes_per_pixel,
-                            scratch,
-                        ),
-                    };
-                    if packing_result.is_err() {
-                        return Err(status::from_code(
-                            crate::bindings::iree_status_code_e_IREE_STATUS_INTERNAL,
-                        ));
-                    }
-                    if unsafe {
-                        iree_rocket_hal::rocket::device::fini_bo(cb.fd, packing.scratch_handle)
-                    }
-                    .is_err()
-                    {
-                        return Err(status::from_code(
-                            crate::bindings::iree_status_code_e_IREE_STATUS_INTERNAL,
-                        ));
-                    }
-                    profile::stop(
-                        timer,
-                        profile::Phase::PackInput,
-                        profile_label,
-                        packing.scratch_length,
-                    );
+                    apply_input_packing(cb.fd, packing, profile_label)?;
+                }
+                // The second tensor of a two-tensor element-wise op. None
+                // for every other dispatch kind.
+                if let Some(packing) = operand_packing {
+                    apply_input_packing(cb.fd, packing, profile_label)?;
                 }
                 if let Some(packing) = weight_packing {
                     let timer = profile::start();
@@ -1724,6 +1657,7 @@ unsafe extern "C" fn dispatch_impl(
                 in_bo_handles: vec![input_handle, weights_handle, bias_handle],
                 out_bo_handles: vec![output_handle],
                 input_packing,
+                operand_packing: None,
                 weight_packing,
                 bias_packing,
                 output_compaction,
@@ -2013,6 +1947,7 @@ unsafe extern "C" fn dispatch_impl(
                 in_bo_handles: vec![input_scratch_handle, weight_scratch_handle, bias_handle],
                 out_bo_handles: vec![output_scratch_handle],
                 input_packing,
+                operand_packing: None,
                 weight_packing,
                 bias_packing,
                 output_compaction,
@@ -2192,6 +2127,7 @@ unsafe extern "C" fn dispatch_impl(
                 in_bo_handles,
                 out_bo_handles,
                 input_packing,
+                operand_packing: None,
                 weight_packing: None,
                 bias_packing: None,
                 output_compaction,
@@ -2209,25 +2145,25 @@ unsafe extern "C" fn dispatch_impl(
                     );
                 }
             };
-            // fp16, which is all `EwUnaryShape` supports.
-            let Some(plan) = elementwise_round_trip(
-                cb,
-                refs,
-                bindings.count,
-                shape.width,
-                shape.height,
-                shape.channels,
-                2,
+            // 0=input, 1=output. fp16 is all `EwUnaryShape` supports.
+            let Some(cube) = ElementwiseCube::new(shape.width, shape.height, shape.channels, 2)
+            else {
+                return invalid_argument();
+            };
+            if bindings.count < 2 {
+                return invalid_argument();
+            }
+            let (Some((input_scratch, input_packing)), Some((output_scratch, output_compaction))) = (
+                pack_elementwise_input(cb, &refs[0], &cube),
+                compact_elementwise_output(cb, &refs[1], &cube),
             ) else {
-                return status::from_code(
-                    crate::bindings::iree_status_code_e_IREE_STATUS_INVALID_ARGUMENT,
-                );
+                return invalid_argument();
             };
             let regcmd_tasks = vec![build_unary_regcmd(
                 &shape,
                 &EwUnaryBuffers {
-                    input_addr: plan.input_scratch.dma_address,
-                    output_addr: plan.output_scratch.dma_address,
+                    input_addr: input_scratch.dma_address,
+                    output_addr: output_scratch.dma_address,
                 },
             )];
             let profile_label = profile::label(|| {
@@ -2238,7 +2174,6 @@ unsafe extern "C" fn dispatch_impl(
             });
             cb.ops.push(RecordedOp::Dispatch {
                 regcmd_tasks,
-                dpu_mode: None,
                 // Neither field describes an element-wise task. `dpu_mode`
                 // exists for the depthwise-to-dense conv quiescence
                 // workaround, and `conv::Precision`'s int8 arm carries a
@@ -2246,15 +2181,84 @@ unsafe extern "C" fn dispatch_impl(
                 // pooling arm: not a conv, so it neither triggers the
                 // workaround nor claims a state it does not have. The
                 // profile label carries the op and its geometry instead.
+                dpu_mode: None,
                 precision_tag: None,
                 retained_bindings: unsafe { retain_direct_bindings(refs) },
-                in_bo_handles: vec![plan.input_scratch.handle],
-                out_bo_handles: vec![plan.output_scratch.handle],
-                scratch_buffers: vec![plan.input_scratch, plan.output_scratch],
-                input_packing: Some(plan.input_packing),
+                in_bo_handles: vec![input_scratch.handle],
+                out_bo_handles: vec![output_scratch.handle],
+                scratch_buffers: vec![input_scratch, output_scratch],
+                input_packing: Some(input_packing),
+                operand_packing: None,
                 weight_packing: None,
                 bias_packing: None,
-                output_compaction: Some(plan.output_compaction),
+                output_compaction: Some(output_compaction),
+                profile_label,
+                weight_scratch: None,
+                weight_publish: None,
+            });
+        }
+        UkernelShape::ElementwiseBinary(executable) => {
+            let shape = match executable.resolve_shape(constants) {
+                Ok(shape) => shape,
+                Err(_) => {
+                    return status::from_code(
+                        crate::bindings::iree_status_code_e_IREE_STATUS_INVALID_ARGUMENT,
+                    );
+                }
+            };
+            // 0=primary operand, 1=second tensor, 2=output. Unlike every
+            // other kind here, two bindings are packed on the way in:
+            // DPU_RDMA fetches the first through its main feed and ERDMA
+            // fetches the second, and neither is a layout the compiler
+            // produces. Both cubes have the identical geometry -- this op
+            // does not broadcast.
+            let Some(cube) = ElementwiseCube::new(shape.width, shape.height, shape.channels, 2)
+            else {
+                return invalid_argument();
+            };
+            if bindings.count < 3 {
+                return invalid_argument();
+            }
+            let (
+                Some((input_scratch, input_packing)),
+                Some((operand_scratch, operand_packing)),
+                Some((output_scratch, output_compaction)),
+            ) = (
+                pack_elementwise_input(cb, &refs[0], &cube),
+                pack_elementwise_input(cb, &refs[1], &cube),
+                compact_elementwise_output(cb, &refs[2], &cube),
+            )
+            else {
+                return invalid_argument();
+            };
+            let regcmd_tasks = vec![build_add_regcmd(
+                &shape,
+                &EwAddBuffers {
+                    intermediate_addr: input_scratch.dma_address,
+                    w_addr: operand_scratch.dma_address,
+                    output_addr: output_scratch.dma_address,
+                },
+            )];
+            let profile_label = profile::label(|| {
+                format!(
+                    "ew {:?} {}x{}x{}",
+                    shape.op, shape.height, shape.width, shape.channels
+                )
+            });
+            cb.ops.push(RecordedOp::Dispatch {
+                regcmd_tasks,
+                // See the unary arm.
+                dpu_mode: None,
+                precision_tag: None,
+                retained_bindings: unsafe { retain_direct_bindings(refs) },
+                in_bo_handles: vec![input_scratch.handle, operand_scratch.handle],
+                out_bo_handles: vec![output_scratch.handle],
+                scratch_buffers: vec![input_scratch, operand_scratch, output_scratch],
+                input_packing: Some(input_packing),
+                operand_packing: Some(operand_packing),
+                weight_packing: None,
+                bias_packing: None,
+                output_compaction: Some(output_compaction),
                 profile_label,
                 weight_scratch: None,
                 weight_publish: None,
@@ -2269,25 +2273,25 @@ unsafe extern "C" fn dispatch_impl(
                     );
                 }
             };
-            // int8, which is all `LutShape` supports.
-            let Some(plan) = elementwise_round_trip(
-                cb,
-                refs,
-                bindings.count,
-                shape.width,
-                shape.height,
-                shape.channels,
-                1,
+            // 0=input, 1=output. int8 is all `LutShape` supports.
+            let Some(cube) = ElementwiseCube::new(shape.width, shape.height, shape.channels, 1)
+            else {
+                return invalid_argument();
+            };
+            if bindings.count < 2 {
+                return invalid_argument();
+            }
+            let (Some((input_scratch, input_packing)), Some((output_scratch, output_compaction))) = (
+                pack_elementwise_input(cb, &refs[0], &cube),
+                compact_elementwise_output(cb, &refs[1], &cube),
             ) else {
-                return status::from_code(
-                    crate::bindings::iree_status_code_e_IREE_STATUS_INVALID_ARGUMENT,
-                );
+                return invalid_argument();
             };
             let regcmd_tasks = vec![build_lut_regcmd(
                 &shape,
                 &LutBuffers {
-                    input_addr: plan.input_scratch.dma_address,
-                    output_addr: plan.output_scratch.dma_address,
+                    input_addr: input_scratch.dma_address,
+                    output_addr: output_scratch.dma_address,
                 },
                 executable.function.table(),
             )];
@@ -2299,17 +2303,18 @@ unsafe extern "C" fn dispatch_impl(
             });
             cb.ops.push(RecordedOp::Dispatch {
                 regcmd_tasks,
+                // See the unary arm.
                 dpu_mode: None,
-                // See the unary arm above.
                 precision_tag: None,
                 retained_bindings: unsafe { retain_direct_bindings(refs) },
-                in_bo_handles: vec![plan.input_scratch.handle],
-                out_bo_handles: vec![plan.output_scratch.handle],
-                scratch_buffers: vec![plan.input_scratch, plan.output_scratch],
-                input_packing: Some(plan.input_packing),
+                in_bo_handles: vec![input_scratch.handle],
+                out_bo_handles: vec![output_scratch.handle],
+                scratch_buffers: vec![input_scratch, output_scratch],
+                input_packing: Some(input_packing),
+                operand_packing: None,
                 weight_packing: None,
                 bias_packing: None,
-                output_compaction: Some(plan.output_compaction),
+                output_compaction: Some(output_compaction),
                 profile_label,
                 weight_scratch: None,
                 weight_publish: None,
@@ -2319,91 +2324,88 @@ unsafe extern "C" fn dispatch_impl(
     status::ok()
 }
 
-/// The scratch buffers and host-side repacking one element-wise or LUT
-/// dispatch needs.
-struct ElementwiseRoundTrip {
-    input_scratch: RocketOwnedBuffer,
-    output_scratch: RocketOwnedBuffer,
-    input_packing: InputPacking,
-    output_compaction: OutputCompaction,
+/// The early return every element-wise binding check shares.
+fn invalid_argument() -> iree_status_t {
+    status::from_code(crate::bindings::iree_status_code_e_IREE_STATUS_INVALID_ARGUMENT)
 }
 
-/// Builds the NHWC-to-NC1HWC2 round trip both element-wise dispatch arms need.
+/// The cube arithmetic both element-wise kinds share.
 ///
-/// Simpler than the pooling arm this mirrors, in two ways that are worth
-/// naming because they are the reason this is one function rather than a
-/// parameterization of that one:
-///
-/// - There is no reduction, so input and output pixel counts are equal and
-///   there is no second geometry to derive or to check a template against.
-/// - The EW and LUT builders program `DPU_DST_SURF_STRIDE`/`DPU_SURFACE_ADD`
-///   as exactly `width * height` atoms. Pooling rounds its surface strides up
-///   to four pixels because `build_pooling_tile_task` does; these builders do
-///   not, so the packed pixel count is the real one and there is no surface
-///   padding to allocate or to skip on the way back.
-///
-/// `packed_channels` is the builders' own `channels.max(16).next_multiple_of(16)`,
-/// which is a channel count rounded to 16 **regardless of precision** -- not
-/// `PoolingShape::programmed_channels`, which rounds to the precision's
-/// channels-per-atom. The two differ exactly where it matters: at fp16 with 24
-/// channels, pooling would program three surfaces and these builders program
-/// four. `ew_unary_multi_surface_hw.rs` is the hardware statement of that.
-///
-/// Returns `None` for any binding or arithmetic the dispatch cannot satisfy;
-/// the caller turns that into `IREE_STATUS_INVALID_ARGUMENT`.
-#[allow(clippy::too_many_arguments)]
-fn elementwise_round_trip(
+/// `packed_channels` is the builders' own
+/// `channels.max(16).next_multiple_of(16)`, which is a channel count rounded
+/// to 16 **regardless of precision** -- not `PoolingShape::programmed_channels`,
+/// which rounds to the precision's channels-per-atom. The two differ exactly
+/// where it matters: at fp16 with 24 channels, pooling would program three
+/// surfaces and these builders program four.
+/// `ew_unary_multi_surface_hw.rs` is the hardware statement of that.
+#[derive(Clone, Copy)]
+struct ElementwiseCube {
+    pixels: usize,
+    logical_bytes_per_pixel: usize,
+    packed_bytes_per_pixel: usize,
+    scratch_bytes: usize,
+    width: usize,
+}
+
+impl ElementwiseCube {
+    fn new(width: u32, height: u32, channels: u32, element_bytes: usize) -> Option<Self> {
+        let packed_channels = (channels as usize).max(16).next_multiple_of(16);
+        let logical_bytes_per_pixel = (channels as usize).checked_mul(element_bytes)?;
+        let packed_bytes_per_pixel = packed_channels.checked_mul(element_bytes)?;
+        let pixels = (width as usize).checked_mul(height as usize)?;
+        if logical_bytes_per_pixel == 0 || pixels == 0 {
+            return None;
+        }
+        let scratch_bytes = nc1hwc2_storage_size(pixels, packed_bytes_per_pixel).ok()?;
+        if scratch_bytes > u32::MAX as usize {
+            return None;
+        }
+        Some(Self {
+            pixels,
+            logical_bytes_per_pixel,
+            packed_bytes_per_pixel,
+            scratch_bytes,
+            width: width as usize,
+        })
+    }
+
+    /// Bytes the caller's own dense NHWC binding must hold for this cube.
+    fn dense_bytes(&self) -> Option<usize> {
+        self.pixels.checked_mul(self.logical_bytes_per_pixel)
+    }
+}
+
+/// Allocates a scratch cube for one dense NHWC input binding and describes
+/// the repack that fills it.
+fn pack_elementwise_input(
     cb: &mut RocketCommandBuffer,
-    refs: &[iree_hal_buffer_ref_t],
-    binding_count: usize,
-    width: u32,
-    height: u32,
-    channels: u32,
-    element_bytes: usize,
-) -> Option<ElementwiseRoundTrip> {
-    // 0=input, 1=output.
-    if binding_count < 2 {
+    binding: &iree_hal_buffer_ref_t,
+    cube: &ElementwiseCube,
+) -> Option<(RocketOwnedBuffer, InputPacking)> {
+    if cube.dense_bytes()? as u64 > binding.length as u64 {
         return None;
     }
-
-    let packed_channels = (channels as usize).max(16).next_multiple_of(16);
-    let logical_bytes_per_pixel = (channels as usize).checked_mul(element_bytes)?;
-    let packed_bytes_per_pixel = packed_channels.checked_mul(element_bytes)?;
-    let pixels = (width as usize).checked_mul(height as usize)?;
-    if logical_bytes_per_pixel == 0 || pixels == 0 {
-        return None;
-    }
-
-    let dense_bytes = pixels.checked_mul(logical_bytes_per_pixel)?;
-    if dense_bytes as u64 > refs[0].length as u64 || dense_bytes as u64 > refs[1].length as u64 {
-        return None;
-    }
-
-    let scratch_bytes = nc1hwc2_storage_size(pixels, packed_bytes_per_pixel).ok()?;
-    if scratch_bytes > u32::MAX as usize {
-        return None;
-    }
-
-    let input_scratch = unsafe {
-        RocketOwnedBuffer::new(cb.fd, scratch_bytes.max(1), BorrowedFd::borrow_raw(cb.fd))
+    let scratch = unsafe {
+        RocketOwnedBuffer::new(
+            cb.fd,
+            cube.scratch_bytes.max(1),
+            BorrowedFd::borrow_raw(cb.fd),
+        )
     };
-    let output_scratch = unsafe {
-        RocketOwnedBuffer::new(cb.fd, scratch_bytes.max(1), BorrowedFd::borrow_raw(cb.fd))
-    };
-
-    let input_packing = InputPacking {
-        input_buffer: refs[0].buffer,
-        input_offset: refs[0].offset,
-        input_length: refs[0].length,
-        scratch_ptr: input_scratch.host_ptr,
-        scratch_length: scratch_bytes,
-        scratch_handle: input_scratch.handle,
-        source_pixel_count: pixels,
-        // No four-pixel surface rounding here, unlike pooling -- see this
-        // function's own doc comment.
-        packed_pixel_count: pixels,
-        bytes_per_pixel: logical_bytes_per_pixel,
-        packed_bytes_per_pixel,
+    let packing = InputPacking {
+        input_buffer: binding.buffer,
+        input_offset: binding.offset,
+        input_length: binding.length,
+        scratch_ptr: scratch.host_ptr,
+        scratch_length: cube.scratch_bytes,
+        scratch_handle: scratch.handle,
+        source_pixel_count: cube.pixels,
+        // No four-pixel surface rounding, unlike pooling: the EW and LUT
+        // builders program `DPU_DST_SURF_STRIDE`/`DPU_SURFACE_ADD` as exactly
+        // `width * height` atoms, where `build_pooling_tile_task` rounds up.
+        packed_pixel_count: cube.pixels,
+        bytes_per_pixel: cube.logical_bytes_per_pixel,
+        packed_bytes_per_pixel: cube.packed_bytes_per_pixel,
         // Channels past the real count are cube padding the op writes and no
         // caller reads back. Zero is the only value that is also a valid
         // input for every opcode and curve here, so a hardware fault that
@@ -2411,28 +2413,121 @@ fn elementwise_round_trip(
         padding_byte: 0,
         layout: InputPackingLayout::Nc1hwc2,
     };
-    let output_compaction = OutputCompaction {
-        output_buffer: refs[1].buffer,
-        output_offset: refs[1].offset,
-        output_length: refs[1].length,
-        scratch_ptr: output_scratch.host_ptr,
-        scratch_length: scratch_bytes,
-        source_pixel_count: pixels,
-        output_pixel_count: pixels,
-        output_width: width as usize,
-        bytes_per_pixel: logical_bytes_per_pixel,
+    Some((scratch, packing))
+}
+
+/// The output half: a scratch cube plus the compaction back to dense NHWC.
+fn compact_elementwise_output(
+    cb: &mut RocketCommandBuffer,
+    binding: &iree_hal_buffer_ref_t,
+    cube: &ElementwiseCube,
+) -> Option<(RocketOwnedBuffer, OutputCompaction)> {
+    if cube.dense_bytes()? as u64 > binding.length as u64 {
+        return None;
+    }
+    let scratch = unsafe {
+        RocketOwnedBuffer::new(
+            cb.fd,
+            cube.scratch_bytes.max(1),
+            BorrowedFd::borrow_raw(cb.fd),
+        )
+    };
+    let compaction = OutputCompaction {
+        output_buffer: binding.buffer,
+        output_offset: binding.offset,
+        output_length: binding.length,
+        scratch_ptr: scratch.host_ptr,
+        scratch_length: cube.scratch_bytes,
+        // No reduction: the output cube is the input cube's geometry, so
+        // these are equal and there is no surface padding to skip.
+        source_pixel_count: cube.pixels,
+        output_pixel_count: cube.pixels,
+        output_width: cube.width,
+        bytes_per_pixel: cube.logical_bytes_per_pixel,
         // One 16-byte feature atom per pixel per surface, which is what the
         // cube strides are counted in.
         source_block_bytes: 16,
         source_tiles: None,
     };
+    Some((scratch, compaction))
+}
 
-    Some(ElementwiseRoundTrip {
-        input_scratch,
-        output_scratch,
-        input_packing,
-        output_compaction,
-    })
+/// Reads one dense NHWC binding, repacks it into its NC1HWC2 scratch buffer
+/// and publishes it to the device.
+///
+/// Extracted from `apply_ops` so a two-tensor element-wise dispatch can run
+/// it for both operands. Every other dispatch kind has exactly one input
+/// tensor, which is why this used to be inline.
+fn apply_input_packing(
+    fd: i32,
+    packing: &InputPacking,
+    profile_label: &str,
+) -> Result<(), iree_status_t> {
+    let timer = profile::start();
+    let dense_len = packing
+        .source_pixel_count
+        .checked_mul(packing.bytes_per_pixel)
+        .ok_or_else(|| {
+            status::from_code(crate::bindings::iree_status_code_e_IREE_STATUS_INTERNAL)
+        })?;
+    if dense_len as u64 > packing.input_length as u64 {
+        return Err(status::from_code(
+            crate::bindings::iree_status_code_e_IREE_STATUS_INVALID_ARGUMENT,
+        ));
+    }
+    let input = unsafe { &*(packing.input_buffer as *const RocketBuffer) };
+    let dense =
+        unsafe { std::slice::from_raw_parts(input.host_ptr.add(packing.input_offset), dense_len) };
+    let padded_dense = if packing.source_pixel_count != packing.packed_pixel_count {
+        let padded_len = packing
+            .packed_pixel_count
+            .checked_mul(packing.bytes_per_pixel)
+            .ok_or_else(|| {
+                status::from_code(crate::bindings::iree_status_code_e_IREE_STATUS_INTERNAL)
+            })?;
+        let mut padded = vec![packing.padding_byte; padded_len];
+        padded[..dense_len].copy_from_slice(dense);
+        Some(padded)
+    } else {
+        None
+    };
+    let dense = padded_dense.as_deref().unwrap_or(dense);
+    let scratch =
+        unsafe { std::slice::from_raw_parts_mut(packing.scratch_ptr, packing.scratch_length) };
+    let packing_result = match packing.layout {
+        InputPackingLayout::Dense => {
+            if dense.len() > scratch.len() {
+                Err("dense padded input exceeds its scratch buffer")
+            } else {
+                scratch[..dense.len()].copy_from_slice(dense);
+                Ok(dense.len())
+            }
+        }
+        InputPackingLayout::Nc1hwc2 => pack_nhwc_to_nc1hwc2_padded(
+            dense,
+            packing.packed_pixel_count,
+            packing.bytes_per_pixel,
+            packing.packed_bytes_per_pixel,
+            scratch,
+        ),
+    };
+    if packing_result.is_err() {
+        return Err(status::from_code(
+            crate::bindings::iree_status_code_e_IREE_STATUS_INTERNAL,
+        ));
+    }
+    if unsafe { iree_rocket_hal::rocket::device::fini_bo(fd, packing.scratch_handle) }.is_err() {
+        return Err(status::from_code(
+            crate::bindings::iree_status_code_e_IREE_STATUS_INTERNAL,
+        ));
+    }
+    profile::stop(
+        timer,
+        profile::Phase::PackInput,
+        profile_label,
+        packing.scratch_length,
+    );
+    Ok(())
 }
 
 pub static VTABLE: iree_hal_command_buffer_vtable_t = iree_hal_command_buffer_vtable_t {

@@ -390,6 +390,34 @@ table ElementwiseUnaryDef {
   runtime_dimensions:[ElementwiseDimension];
 }
 
+// Describes one standalone two-tensor element-wise operation on the EW
+// datapath.
+//
+// A self-contained DPU + DPU_RDMA job: DPU_RDMA fetches the primary operand
+// through its ordinary main feed, ERDMA fetches the second tensor, EW
+// combines them element by element, and the result is written with identical
+// geometry. Both operands and the result are the same shape -- this op does
+// not broadcast, and a producer that wants broadcasting must materialize it.
+//
+// fp16 only, and deliberately no precision field, for a narrower reason than
+// ElementwiseUnaryDef's. iree-rocket-hal's EwAddShape does carry an int8
+// branch, but its EW_CVT_SCALE/OUT_CVT_SCALE ratio semantics are INFERRED
+// from register shape rather than confirmed against a known value -- the
+// builder's own doc comments say so -- and MUL has no int8 recipe in any
+// capture at all. Putting the int8 fields on the wire would ship that
+// inference as an ABI. Appending `precision` and the int8 scale fields once
+// a capture confirms them is the FlatBuffers-compatible move.
+table ElementwiseBinaryDef {
+  width:uint32;
+  height:uint32;
+  channels:uint32;
+
+  op:EwBinaryOp = ADD;
+
+  // Same contract as ElementwiseUnaryDef.runtime_dimensions.
+  runtime_dimensions:[ElementwiseDimension];
+}
+
 // Describes one standalone LUT activation: `out = f(in)` for one of the
 // curves in LutFn, evaluated by the DPU's 513-entry interpolated hybrid
 // LE/LO table.
@@ -441,6 +469,7 @@ union KernelDef {
   MatmulDef,
   ElementwiseUnaryDef,
   ElementwiseLutDef,
+  ElementwiseBinaryDef,
 }
 
 // Information about one exported kernel.

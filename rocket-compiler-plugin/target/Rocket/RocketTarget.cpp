@@ -126,6 +126,17 @@ constexpr std::array<const char *, 4> kRequiredElementwiseUnaryConfigKeys = {
     "op",
 };
 
+// The two-tensor form: geometry plus which operator. No 'precision' key,
+// for a narrower reason than the unary kernel's -- EwAddShape does carry an
+// int8 branch, but its EW_CVT_SCALE/OUT_CVT_SCALE ratio semantics are
+// inferred rather than confirmed, and MUL has no int8 recipe in any capture.
+constexpr std::array<const char *, 4> kRequiredElementwiseBinaryConfigKeys = {
+    "width",
+    "height",
+    "channels",
+    "op",
+};
+
 // Geometry, which curve, and the quantization that gets an input into the
 // table's fixed domain. Also no 'precision' key: the LUT path is int8 by
 // construction.
@@ -223,6 +234,14 @@ struct RocketElementwiseUnaryConfig {
   iree_hal_rocket_EwUnaryOp_enum_t op = iree_hal_rocket_EwUnaryOp_ABS;
   // IEEE-754 binary32 bit pattern; only meaningful for add_scalar.
   uint32_t operand = 0;
+  std::vector<iree_hal_rocket_ElementwiseDimension_enum_t> runtimeDimensions;
+};
+
+struct RocketElementwiseBinaryConfig {
+  uint32_t width = 0;
+  uint32_t height = 0;
+  uint32_t channels = 0;
+  iree_hal_rocket_EwBinaryOp_enum_t op = iree_hal_rocket_EwBinaryOp_ADD;
   std::vector<iree_hal_rocket_ElementwiseDimension_enum_t> runtimeDimensions;
 };
 
@@ -944,6 +963,66 @@ buildRocketElementwiseUnaryConfigFromTarget(
   return shape;
 }
 
+std::optional<RocketElementwiseBinaryConfig>
+buildRocketElementwiseBinaryConfigFromTarget(
+    DictionaryAttr config, llvm::function_ref<InFlightDiagnostic()> diagFn) {
+  if (!config) {
+    diagFn() << "rocket element-wise backend requires a non-empty executable "
+                "target config dict";
+    return std::nullopt;
+  }
+  for (const char *key : kRequiredElementwiseBinaryConfigKeys) {
+    if (!config.get(key)) {
+      diagFn() << "rocket element-wise executable target config is missing "
+                  "required key '"
+               << key << "'";
+      return std::nullopt;
+    }
+  }
+
+  auto getU32 = [&](StringRef key) -> uint32_t {
+    return static_cast<uint32_t>(
+        llvm::cast<IntegerAttr>(config.get(key)).getInt());
+  };
+
+  RocketElementwiseBinaryConfig shape;
+  shape.width = getU32("width");
+  shape.height = getU32("height");
+  shape.channels = getU32("channels");
+
+  StringRef op = llvm::cast<StringAttr>(config.get("op")).getValue();
+  if (op == "add") {
+    shape.op = iree_hal_rocket_EwBinaryOp_ADD;
+  } else if (op == "sub") {
+    shape.op = iree_hal_rocket_EwBinaryOp_SUB;
+  } else if (op == "mul") {
+    shape.op = iree_hal_rocket_EwBinaryOp_MUL;
+  } else if (op == "max") {
+    shape.op = iree_hal_rocket_EwBinaryOp_MAX;
+  } else if (op == "min") {
+    shape.op = iree_hal_rocket_EwBinaryOp_MIN;
+  } else {
+    // 'div' is deliberately not here: ew_alu_algo=3 is the one
+    // TRM-documented binary opcode with no hardware evidence in this
+    // project, and the wire enum does not carry it either.
+    diagFn() << "rocket backend: unrecognized element-wise binary 'op' config "
+                "value '"
+             << op << "' (expected add/sub/mul/max/min)";
+    return std::nullopt;
+  }
+
+  std::array<bool, 3> isRuntimeDimension = {};
+  if (!parseElementwiseRuntimeDimensions(config, shape.runtimeDimensions,
+                                         isRuntimeDimension, diagFn)) {
+    return std::nullopt;
+  }
+  if (!checkElementwiseDimensions(isRuntimeDimension, shape.width,
+                                  shape.height, shape.channels, diagFn)) {
+    return std::nullopt;
+  }
+  return shape;
+}
+
 std::optional<RocketElementwiseLutConfig>
 buildRocketElementwiseLutConfigFromTarget(
     DictionaryAttr config, llvm::function_ref<InFlightDiagnostic()> diagFn) {
@@ -1226,11 +1305,13 @@ public:
     }
     if (kernel != "conv2d" && kernel != "fully_connected" &&
         kernel != "pooling" && kernel != "matmul" &&
-        kernel != "elementwise_unary" && kernel != "elementwise_lut") {
+        kernel != "elementwise_unary" && kernel != "elementwise_lut" &&
+        kernel != "elementwise_binary") {
       return variantOp.emitOpError()
              << "unsupported Rocket kernel '" << kernel
              << "'; expected 'conv2d', 'pooling', 'matmul', "
-                "'elementwise_unary', 'elementwise_lut' or the "
+                "'elementwise_unary', 'elementwise_binary', "
+                "'elementwise_lut' or the "
                 "deprecated 'fully_connected'";
     }
 
@@ -1243,6 +1324,7 @@ public:
     std::optional<RocketPoolingConfig> poolingShape;
     std::optional<RocketMatmulConfig> matmulShape;
     std::optional<RocketElementwiseUnaryConfig> ewUnaryShape;
+    std::optional<RocketElementwiseBinaryConfig> ewBinaryShape;
     std::optional<RocketElementwiseLutConfig> lutShape;
     if (kernel == "fully_connected") {
       fcShape = buildRocketFullyConnectedConfigFromTarget(config, diagFn);
@@ -1252,13 +1334,16 @@ public:
       matmulShape = buildRocketMatmulConfigFromTarget(config, diagFn);
     } else if (kernel == "elementwise_unary") {
       ewUnaryShape = buildRocketElementwiseUnaryConfigFromTarget(config, diagFn);
+    } else if (kernel == "elementwise_binary") {
+      ewBinaryShape =
+          buildRocketElementwiseBinaryConfigFromTarget(config, diagFn);
     } else if (kernel == "elementwise_lut") {
       lutShape = buildRocketElementwiseLutConfigFromTarget(config, diagFn);
     } else {
       convShape = buildRocketConv2dConfigFromTarget(config, diagFn);
     }
     if (!convShape && !fcShape && !poolingShape && !matmulShape &&
-        !ewUnaryShape && !lutShape) {
+        !ewUnaryShape && !ewBinaryShape && !lutShape) {
       return failure();
     }
 
@@ -1286,6 +1371,8 @@ public:
       runtimeDimensionCount = matmulShape->runtimeDimensions.size();
     } else if (ewUnaryShape) {
       runtimeDimensionCount = ewUnaryShape->runtimeDimensions.size();
+    } else if (ewBinaryShape) {
+      runtimeDimensionCount = ewBinaryShape->runtimeDimensions.size();
     } else if (lutShape) {
       runtimeDimensionCount = lutShape->runtimeDimensions.size();
     }
@@ -1460,6 +1547,39 @@ public:
                << "failed to finish Rocket element-wise unary definition";
       }
       kernelRef = iree_hal_rocket_KernelDef_as_ElementwiseUnaryDef(ewRef);
+    } else if (ewBinaryShape) {
+      iree_hal_rocket_ElementwiseDimension_vec_ref_t runtimeDimensionsRef = 0;
+      if (!ewBinaryShape->runtimeDimensions.empty()) {
+        runtimeDimensionsRef = iree_hal_rocket_ElementwiseDimension_vec_create(
+            builder, ewBinaryShape->runtimeDimensions.data(),
+            ewBinaryShape->runtimeDimensions.size());
+        if (!runtimeDimensionsRef) {
+          return variantOp.emitOpError()
+                 << "failed to build Rocket element-wise runtime-dimension "
+                    "vector";
+        }
+      }
+      if (iree_hal_rocket_ElementwiseBinaryDef_start(builder) ||
+          iree_hal_rocket_ElementwiseBinaryDef_width_add(
+              builder, ewBinaryShape->width) ||
+          iree_hal_rocket_ElementwiseBinaryDef_height_add(
+              builder, ewBinaryShape->height) ||
+          iree_hal_rocket_ElementwiseBinaryDef_channels_add(
+              builder, ewBinaryShape->channels) ||
+          iree_hal_rocket_ElementwiseBinaryDef_op_add(builder,
+                                                      ewBinaryShape->op) ||
+          (runtimeDimensionsRef &&
+           iree_hal_rocket_ElementwiseBinaryDef_runtime_dimensions_add(
+               builder, runtimeDimensionsRef))) {
+        return variantOp.emitOpError()
+               << "failed to build Rocket element-wise binary definition";
+      }
+      auto ewRef = iree_hal_rocket_ElementwiseBinaryDef_end(builder);
+      if (!ewRef) {
+        return variantOp.emitOpError()
+               << "failed to finish Rocket element-wise binary definition";
+      }
+      kernelRef = iree_hal_rocket_KernelDef_as_ElementwiseBinaryDef(ewRef);
     } else if (lutShape) {
       iree_hal_rocket_ElementwiseDimension_vec_ref_t runtimeDimensionsRef = 0;
       if (!lutShape->runtimeDimensions.empty()) {
