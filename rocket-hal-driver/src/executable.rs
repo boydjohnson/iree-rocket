@@ -21,7 +21,9 @@ use crate::{
     status,
 };
 use iree_rocket_hal::rocket::{
+    activation::{LutShape, LutTable},
     conv::{self, Kernels, Multiplier, Precision},
+    elementwise::{EwUnaryAlgo, EwUnaryShape},
     executable_format::validate_conv_shape,
     fc,
     pooling::PoolingShape,
@@ -523,6 +525,269 @@ fn floor_output_extent(
     Ok((padded - kernel) / stride + 1)
 }
 
+/// The geometry both element-wise executables carry, and the only thing a
+/// dispatch may vary about them.
+///
+/// These ops have no reduction -- input and output cubes are identical -- so
+/// unlike [`PoolingExecutable`] there is no derived output extent to
+/// recompute or to check a template's claim against. Three fields is the
+/// whole shape story; what differs between the two kinds is the operation and
+/// its parameters, not the geometry.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct ElementwiseGeometry {
+    pub width: u32,
+    pub height: u32,
+    pub channels: u32,
+}
+
+/// A logical element-wise shape field supplied by one uint32 dispatch push
+/// constant. Shared by both element-wise executables, matching the single
+/// `ElementwiseDimension` the wire format carries for them.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum RuntimeElementwiseDimension {
+    Width,
+    Height,
+    Channels,
+}
+
+impl RuntimeElementwiseDimension {
+    fn index(self) -> usize {
+        match self {
+            Self::Width => 0,
+            Self::Height => 1,
+            Self::Channels => 2,
+        }
+    }
+
+    fn get(self, geometry: &ElementwiseGeometry) -> u32 {
+        match self {
+            Self::Width => geometry.width,
+            Self::Height => geometry.height,
+            Self::Channels => geometry.channels,
+        }
+    }
+
+    fn set(self, geometry: &mut ElementwiseGeometry, value: u32) {
+        match self {
+            Self::Width => geometry.width = value,
+            Self::Height => geometry.height = value,
+            Self::Channels => geometry.channels = value,
+        }
+    }
+}
+
+const ALL_ELEMENTWISE_DIMENSIONS: [RuntimeElementwiseDimension; 3] = [
+    RuntimeElementwiseDimension::Width,
+    RuntimeElementwiseDimension::Height,
+    RuntimeElementwiseDimension::Channels,
+];
+
+/// The template/runtime split every executable in this file shares: a listed
+/// dimension must be zero in the template, an unlisted one must be nonzero,
+/// and listed dimensions must be unique.
+fn validate_elementwise_template(
+    geometry: &ElementwiseGeometry,
+    runtime_dimensions: &[RuntimeElementwiseDimension],
+) -> Result<(), &'static str> {
+    let mut seen = [false; 3];
+    for dimension in runtime_dimensions {
+        let index = dimension.index();
+        if seen[index] {
+            return Err("runtime element-wise dimensions must be unique");
+        }
+        seen[index] = true;
+        if dimension.get(geometry) != 0 {
+            return Err("runtime element-wise dimensions must be zero in the executable template");
+        }
+    }
+    for dimension in ALL_ELEMENTWISE_DIMENSIONS {
+        if !seen[dimension.index()] && dimension.get(geometry) == 0 {
+            return Err(
+                "static element-wise dimensions must be nonzero in the executable template",
+            );
+        }
+    }
+    Ok(())
+}
+
+/// Resolves the three extents from native-endian uint32 push constants.
+fn resolve_elementwise_geometry(
+    template: &ElementwiseGeometry,
+    runtime_dimensions: &[RuntimeElementwiseDimension],
+    constants: &[u8],
+) -> Result<ElementwiseGeometry, &'static str> {
+    let expected_bytes = runtime_dimensions
+        .len()
+        .checked_mul(std::mem::size_of::<u32>())
+        .ok_or("runtime element-wise push-constant byte count overflow")?;
+    if constants.len() != expected_bytes {
+        return Err("runtime element-wise push-constant byte count does not match the executable");
+    }
+
+    let mut geometry = *template;
+    for (dimension, bytes) in runtime_dimensions
+        .iter()
+        .zip(constants.chunks_exact(std::mem::size_of::<u32>()))
+    {
+        let value = u32::from_ne_bytes(bytes.try_into().unwrap());
+        if value == 0 {
+            return Err("runtime element-wise dimensions must be nonzero");
+        }
+        dimension.set(&mut geometry, value);
+    }
+    Ok(geometry)
+}
+
+/// Unary element-wise executable metadata before per-dispatch runtime
+/// dimensions resolve.
+///
+/// fp16 only, which is why there is no precision field here or on the wire:
+/// [`EwUnaryShape`] ships no int8 branch, because no capture confirms an int8
+/// zero-point/scale recipe for this task shape.
+#[derive(Clone, Debug, PartialEq)]
+pub struct ElementwiseUnaryExecutable {
+    pub geometry: ElementwiseGeometry,
+    pub algo: EwUnaryAlgo,
+    /// The `ADD_SCALAR` operand as an IEEE-754 binary32 bit pattern. Must be
+    /// zero for every other opcode.
+    pub operand: u32,
+    pub runtime_dimensions: Vec<RuntimeElementwiseDimension>,
+}
+
+impl ElementwiseUnaryExecutable {
+    pub fn new_static(geometry: ElementwiseGeometry, algo: EwUnaryAlgo, operand: u32) -> Self {
+        Self {
+            geometry,
+            algo,
+            operand,
+            runtime_dimensions: Vec::new(),
+        }
+    }
+
+    pub fn validate_template(&self) -> Result<(), &'static str> {
+        validate_elementwise_template(&self.geometry, &self.runtime_dimensions)?;
+        // `build_unary_regcmd` asserts this. The shape came off a wire here,
+        // so it has to be an error at this boundary rather than a panic
+        // inside the builder.
+        if self.operand != 0 && !matches!(self.algo, EwUnaryAlgo::Add) {
+            return Err("an element-wise unary operand is only meaningful for ADD_SCALAR");
+        }
+        Ok(())
+    }
+
+    pub fn resolve_shape(&self, constants: &[u8]) -> Result<EwUnaryShape, &'static str> {
+        let geometry =
+            resolve_elementwise_geometry(&self.geometry, &self.runtime_dimensions, constants)?;
+        Ok(EwUnaryShape {
+            width: geometry.width,
+            height: geometry.height,
+            channels: geometry.channels,
+            algo: self.algo,
+            operand: self.operand,
+        })
+    }
+}
+
+/// Which LUT curve an [`ElementwiseLutExecutable`] selects.
+///
+/// A runtime-owned mirror of the wire `LutFn`, for the same reason
+/// [`RuntimeConv2dDimension`] mirrors `Conv2DDimension`: command recording
+/// must not depend on generated FlatBuffer objects staying alive.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum LutFunction {
+    Sigmoid,
+    Tanh,
+    Exp,
+    Square,
+    Erf,
+    Sqrt,
+    Rsqrt,
+    Log,
+    Reciprocal,
+}
+
+impl LutFunction {
+    pub fn table(self) -> LutTable {
+        match self {
+            Self::Sigmoid => LutTable::sigmoid(),
+            Self::Tanh => LutTable::tanh(),
+            Self::Exp => LutTable::exp(),
+            Self::Square => LutTable::square(),
+            Self::Erf => LutTable::erf(),
+            Self::Sqrt => LutTable::sqrt(),
+            Self::Rsqrt => LutTable::rsqrt(),
+            Self::Log => LutTable::log(),
+            Self::Reciprocal => LutTable::reciprocal(),
+        }
+    }
+}
+
+/// The decoded input zero points `build_lut_regcmd` will program a `BN_ALU`
+/// operand for.
+///
+/// Not a stylistic restriction: `lut_bn_alu`'s formula is exact by
+/// construction at zero, and confirmed against captures at -128, -2 and 127.
+/// Known-bad captures exist at 42. The builder asserts on anything else, so
+/// the wire boundary rejects it instead.
+const SUPPORTED_LUT_ZERO_POINTS: [i32; 4] = [-128, -2, 0, 127];
+
+/// LUT executable metadata before per-dispatch runtime dimensions resolve.
+///
+/// int8 only, and again with no precision field: the curve is evaluated on the
+/// dequantized real value, so the scales and zero points are how an input
+/// reaches the table's fixed domain at all rather than optional metadata.
+#[derive(Clone, Debug, PartialEq)]
+pub struct ElementwiseLutExecutable {
+    pub geometry: ElementwiseGeometry,
+    pub function: LutFunction,
+    /// Decoded (real) zero points. The wire carries these decoded; the
+    /// `0x80` bias `LutShape` takes is applied in [`Self::resolve_shape`].
+    pub input_zero_point: i32,
+    pub output_zero_point: i32,
+    pub input_scale: f32,
+    pub output_scale: f32,
+    pub runtime_dimensions: Vec<RuntimeElementwiseDimension>,
+}
+
+impl ElementwiseLutExecutable {
+    pub fn validate_template(&self) -> Result<(), &'static str> {
+        validate_elementwise_template(&self.geometry, &self.runtime_dimensions)?;
+        if !SUPPORTED_LUT_ZERO_POINTS.contains(&self.input_zero_point) {
+            return Err("unsupported LUT input zero point");
+        }
+        // The output zero point only shifts `OUT_CVT_OFFSET` and has no
+        // formula to be wrong about, but it still has to fit the byte the
+        // bias produces.
+        if !(-128..=127).contains(&self.output_zero_point) {
+            return Err("LUT output zero point does not fit an int8");
+        }
+        // A zero or non-finite scale makes `lut_bn_mul`/`lut_out_cvt`'s
+        // `log2` produce a nonsense shift rather than a wrong answer.
+        if !self.input_scale.is_finite()
+            || !self.output_scale.is_finite()
+            || self.input_scale <= 0.0
+            || self.output_scale <= 0.0
+        {
+            return Err("LUT scales must be finite and positive");
+        }
+        Ok(())
+    }
+
+    pub fn resolve_shape(&self, constants: &[u8]) -> Result<LutShape, &'static str> {
+        let geometry =
+            resolve_elementwise_geometry(&self.geometry, &self.runtime_dimensions, constants)?;
+        Ok(LutShape {
+            width: geometry.width,
+            height: geometry.height,
+            channels: geometry.channels,
+            input_zero_point: (self.input_zero_point as u8 as u32).wrapping_add(0x80) & 0xff,
+            output_zero_point: (self.output_zero_point as u8 as u32).wrapping_add(0x80) & 0xff,
+            input_scale: self.input_scale,
+            output_scale: self.output_scale,
+        })
+    }
+}
+
 /// A logical matmul shape field supplied by one uint32 dispatch push
 /// constant.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -653,6 +918,8 @@ pub enum UkernelShape {
     /// identically, so there is nothing for a second variant to distinguish.
     Matmul(MatmulExecutable),
     Pooling(PoolingExecutable),
+    ElementwiseUnary(ElementwiseUnaryExecutable),
+    ElementwiseLut(ElementwiseLutExecutable),
 }
 
 /// What every `iree_hal_executable_t*` this driver hands out actually

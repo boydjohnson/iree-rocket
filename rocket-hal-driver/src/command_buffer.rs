@@ -86,9 +86,11 @@ use crate::{
     profile, status, weight_cache,
 };
 use iree_rocket_hal::rocket::{
+    activation::{LutBuffers, build_lut_regcmd},
     builders::RegCmd,
     conv::{AccumulatorOutputTile, Buffers, ConvPlan, FeatureLayout, Precision},
     device::{OwnedBuffer as RocketOwnedBuffer, fini_bo},
+    elementwise::{EwUnaryBuffers, build_unary_regcmd},
     fc,
     pooling::{PoolingBuffers, PoolingPlan},
     tensor_layout::{
@@ -2198,8 +2200,239 @@ unsafe extern "C" fn dispatch_impl(
                 weight_publish: None,
             });
         }
+        UkernelShape::ElementwiseUnary(executable) => {
+            let shape = match executable.resolve_shape(constants) {
+                Ok(shape) => shape,
+                Err(_) => {
+                    return status::from_code(
+                        crate::bindings::iree_status_code_e_IREE_STATUS_INVALID_ARGUMENT,
+                    );
+                }
+            };
+            // fp16, which is all `EwUnaryShape` supports.
+            let Some(plan) = elementwise_round_trip(
+                cb,
+                refs,
+                bindings.count,
+                shape.width,
+                shape.height,
+                shape.channels,
+                2,
+            ) else {
+                return status::from_code(
+                    crate::bindings::iree_status_code_e_IREE_STATUS_INVALID_ARGUMENT,
+                );
+            };
+            let regcmd_tasks = vec![build_unary_regcmd(
+                &shape,
+                &EwUnaryBuffers {
+                    input_addr: plan.input_scratch.dma_address,
+                    output_addr: plan.output_scratch.dma_address,
+                },
+            )];
+            let profile_label = profile::label(|| {
+                format!(
+                    "ew {:?} {}x{}x{}",
+                    shape.algo, shape.height, shape.width, shape.channels
+                )
+            });
+            cb.ops.push(RecordedOp::Dispatch {
+                regcmd_tasks,
+                dpu_mode: None,
+                // Neither field describes an element-wise task. `dpu_mode`
+                // exists for the depthwise-to-dense conv quiescence
+                // workaround, and `conv::Precision`'s int8 arm carries a
+                // convolution's `Quantization`. Same reasoning as the
+                // pooling arm: not a conv, so it neither triggers the
+                // workaround nor claims a state it does not have. The
+                // profile label carries the op and its geometry instead.
+                precision_tag: None,
+                retained_bindings: unsafe { retain_direct_bindings(refs) },
+                in_bo_handles: vec![plan.input_scratch.handle],
+                out_bo_handles: vec![plan.output_scratch.handle],
+                scratch_buffers: vec![plan.input_scratch, plan.output_scratch],
+                input_packing: Some(plan.input_packing),
+                weight_packing: None,
+                bias_packing: None,
+                output_compaction: Some(plan.output_compaction),
+                profile_label,
+                weight_scratch: None,
+                weight_publish: None,
+            });
+        }
+        UkernelShape::ElementwiseLut(executable) => {
+            let shape = match executable.resolve_shape(constants) {
+                Ok(shape) => shape,
+                Err(_) => {
+                    return status::from_code(
+                        crate::bindings::iree_status_code_e_IREE_STATUS_INVALID_ARGUMENT,
+                    );
+                }
+            };
+            // int8, which is all `LutShape` supports.
+            let Some(plan) = elementwise_round_trip(
+                cb,
+                refs,
+                bindings.count,
+                shape.width,
+                shape.height,
+                shape.channels,
+                1,
+            ) else {
+                return status::from_code(
+                    crate::bindings::iree_status_code_e_IREE_STATUS_INVALID_ARGUMENT,
+                );
+            };
+            let regcmd_tasks = vec![build_lut_regcmd(
+                &shape,
+                &LutBuffers {
+                    input_addr: plan.input_scratch.dma_address,
+                    output_addr: plan.output_scratch.dma_address,
+                },
+                executable.function.table(),
+            )];
+            let profile_label = profile::label(|| {
+                format!(
+                    "lut {:?} {}x{}x{}",
+                    executable.function, shape.height, shape.width, shape.channels
+                )
+            });
+            cb.ops.push(RecordedOp::Dispatch {
+                regcmd_tasks,
+                dpu_mode: None,
+                // See the unary arm above.
+                precision_tag: None,
+                retained_bindings: unsafe { retain_direct_bindings(refs) },
+                in_bo_handles: vec![plan.input_scratch.handle],
+                out_bo_handles: vec![plan.output_scratch.handle],
+                scratch_buffers: vec![plan.input_scratch, plan.output_scratch],
+                input_packing: Some(plan.input_packing),
+                weight_packing: None,
+                bias_packing: None,
+                output_compaction: Some(plan.output_compaction),
+                profile_label,
+                weight_scratch: None,
+                weight_publish: None,
+            });
+        }
     }
     status::ok()
+}
+
+/// The scratch buffers and host-side repacking one element-wise or LUT
+/// dispatch needs.
+struct ElementwiseRoundTrip {
+    input_scratch: RocketOwnedBuffer,
+    output_scratch: RocketOwnedBuffer,
+    input_packing: InputPacking,
+    output_compaction: OutputCompaction,
+}
+
+/// Builds the NHWC-to-NC1HWC2 round trip both element-wise dispatch arms need.
+///
+/// Simpler than the pooling arm this mirrors, in two ways that are worth
+/// naming because they are the reason this is one function rather than a
+/// parameterization of that one:
+///
+/// - There is no reduction, so input and output pixel counts are equal and
+///   there is no second geometry to derive or to check a template against.
+/// - The EW and LUT builders program `DPU_DST_SURF_STRIDE`/`DPU_SURFACE_ADD`
+///   as exactly `width * height` atoms. Pooling rounds its surface strides up
+///   to four pixels because `build_pooling_tile_task` does; these builders do
+///   not, so the packed pixel count is the real one and there is no surface
+///   padding to allocate or to skip on the way back.
+///
+/// `packed_channels` is the builders' own `channels.max(16).next_multiple_of(16)`,
+/// which is a channel count rounded to 16 **regardless of precision** -- not
+/// `PoolingShape::programmed_channels`, which rounds to the precision's
+/// channels-per-atom. The two differ exactly where it matters: at fp16 with 24
+/// channels, pooling would program three surfaces and these builders program
+/// four. `ew_unary_multi_surface_hw.rs` is the hardware statement of that.
+///
+/// Returns `None` for any binding or arithmetic the dispatch cannot satisfy;
+/// the caller turns that into `IREE_STATUS_INVALID_ARGUMENT`.
+#[allow(clippy::too_many_arguments)]
+fn elementwise_round_trip(
+    cb: &mut RocketCommandBuffer,
+    refs: &[iree_hal_buffer_ref_t],
+    binding_count: usize,
+    width: u32,
+    height: u32,
+    channels: u32,
+    element_bytes: usize,
+) -> Option<ElementwiseRoundTrip> {
+    // 0=input, 1=output.
+    if binding_count < 2 {
+        return None;
+    }
+
+    let packed_channels = (channels as usize).max(16).next_multiple_of(16);
+    let logical_bytes_per_pixel = (channels as usize).checked_mul(element_bytes)?;
+    let packed_bytes_per_pixel = packed_channels.checked_mul(element_bytes)?;
+    let pixels = (width as usize).checked_mul(height as usize)?;
+    if logical_bytes_per_pixel == 0 || pixels == 0 {
+        return None;
+    }
+
+    let dense_bytes = pixels.checked_mul(logical_bytes_per_pixel)?;
+    if dense_bytes as u64 > refs[0].length as u64 || dense_bytes as u64 > refs[1].length as u64 {
+        return None;
+    }
+
+    let scratch_bytes = nc1hwc2_storage_size(pixels, packed_bytes_per_pixel).ok()?;
+    if scratch_bytes > u32::MAX as usize {
+        return None;
+    }
+
+    let input_scratch = unsafe {
+        RocketOwnedBuffer::new(cb.fd, scratch_bytes.max(1), BorrowedFd::borrow_raw(cb.fd))
+    };
+    let output_scratch = unsafe {
+        RocketOwnedBuffer::new(cb.fd, scratch_bytes.max(1), BorrowedFd::borrow_raw(cb.fd))
+    };
+
+    let input_packing = InputPacking {
+        input_buffer: refs[0].buffer,
+        input_offset: refs[0].offset,
+        input_length: refs[0].length,
+        scratch_ptr: input_scratch.host_ptr,
+        scratch_length: scratch_bytes,
+        scratch_handle: input_scratch.handle,
+        source_pixel_count: pixels,
+        // No four-pixel surface rounding here, unlike pooling -- see this
+        // function's own doc comment.
+        packed_pixel_count: pixels,
+        bytes_per_pixel: logical_bytes_per_pixel,
+        packed_bytes_per_pixel,
+        // Channels past the real count are cube padding the op writes and no
+        // caller reads back. Zero is the only value that is also a valid
+        // input for every opcode and curve here, so a hardware fault that
+        // reached them would not be disguised as a plausible result.
+        padding_byte: 0,
+        layout: InputPackingLayout::Nc1hwc2,
+    };
+    let output_compaction = OutputCompaction {
+        output_buffer: refs[1].buffer,
+        output_offset: refs[1].offset,
+        output_length: refs[1].length,
+        scratch_ptr: output_scratch.host_ptr,
+        scratch_length: scratch_bytes,
+        source_pixel_count: pixels,
+        output_pixel_count: pixels,
+        output_width: width as usize,
+        bytes_per_pixel: logical_bytes_per_pixel,
+        // One 16-byte feature atom per pixel per surface, which is what the
+        // cube strides are counted in.
+        source_block_bytes: 16,
+        source_tiles: None,
+    };
+
+    Some(ElementwiseRoundTrip {
+        input_scratch,
+        output_scratch,
+        input_packing,
+        output_compaction,
+    })
 }
 
 pub static VTABLE: iree_hal_command_buffer_vtable_t = iree_hal_command_buffer_vtable_t {
