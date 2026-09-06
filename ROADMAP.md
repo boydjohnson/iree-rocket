@@ -342,6 +342,42 @@ The requantized int8 path is the existence proof that this works -- it already
 fuses requantization into the conv dispatch, which is why it returns `i8` with
 no CPU epilogue at all.
 
+**Started 2026-09-06, and the first move was to put that existence proof in the
+tree.** It was not there: the whole path -- `Conv2DQuantParam` and
+`runtime_quantization` on the wire, the driver's `RuntimeConv2dQuantParam`,
+`#rocket_dynamic_int8_requant_target`, both requantized matchers, the lit test
+and the e2e fixtures -- had been sitting unmerged on
+`feature/more-mobilenetv2-convs` since 2026-09-03 while `main` moved twelve
+commits past it. Both this file and ISSUES.md P8 were ranking work against
+code no checkout contained. It is now on `main` and board-validated: the full
+`tools/e2e_conv_regression.py --board planck` gate is green, including
+`requant_int8_1x1_cin512` and `requant_int8_3x3_cin256` at max|error| 1 with
+0 mismatches, which is the documented tie-rounding difference and not a defect.
+
+**What is left is one compiler pass, and its shape is now known.** Measured on
+`mobilenetv2.static-int8.onnx` (47 `onnx.QLinearConv`): after the spec's
+`iree-global-opt-quantized-conv-to-conv`, all 34 dense convolutions still go
+to the *accumulator* executable, because the requantized matcher's canonical
+form is one convolution plus **one** elementwise generic and what the model
+actually produces is a chain of five:
+
+1. add the per-channel `i32` bias,
+2. reduce the (constant) filter to `sum_k(w)` and subtract `x_zp * sum_k(w)`,
+3. transpose NHWC -> NCHW,
+4. `sitofp` and multiply by `x_scale * w_scale`,
+5. divide by `y_scale`, round, offset by `y_zp`, clamp and narrow to 8 bits.
+
+Steps 1 and 2 fold to a single constant per-channel bias, because the filter is
+constant. Steps 4 and 5 collapse into the canonical generic. That is the pass.
+
+Two questions that looked like blockers and are not: the activations are ONNX
+`ui8`, but `quantized-conv-to-conv` has already folded the unsigned-to-signed
+shift into the zero point (30 of the 34 carry `x_zp = -128`), so the bytes the
+NPU sees are already right; and the model's `Clip` (ReLU6) happens in `f32`
+after requantization, so it stays a CPU pass and does not have to be part of
+the fused form. The one real difference left to reconcile is that the model
+narrows with `arith.fptoui` where the canonical form pins `arith.fptosi`.
+
 ### Phase 4 -- write the refusals down
 
 Extend LIMITS.md's *"Datatypes: two different menus"* section with an op menu on

@@ -799,6 +799,17 @@ epilogue still carries a genuine `f16 -> f32` widen and was left alone.
    the bias on the BS plane and no CPU epilogue at all, which removes the
    `i32` tensor rather than fusing passes over it. What landed above is the
    cheap half of the same idea.
+
+   **2026-09-06: that path is now on `main`, where it had never been.** It was
+   built and board-validated on 2026-09-03 and left on
+   `feature/more-mobilenetv2-convs` (1d1dc9a), so this lever has been ranked
+   for a day against code no checkout contained. Rescued, rebased over twelve
+   intervening commits, and re-validated end to end on `planck`. It does not
+   move a model yet: on `mobilenetv2.static-int8.onnx` all 34 dense
+   convolutions still take the accumulator path, because the model's
+   requantization arrives as a five-op chain and the matcher's canonical form
+   is one convolution plus one generic. ROADMAP.md's Phase 3 carries the
+   measured breakdown of that chain and what the remaining pass has to do.
 2. ~~**Re-take every offload number at a realistic core allocation.**~~ Done
    2026-09-05; see the re-measurement table below. It confirms this issue's law
    across a second precision and shows the 7.4 ms constant is the `4,5` value
@@ -1199,7 +1210,10 @@ spending on anything below it.
 2. **The requantized int8 path** — P8's lever 1, and the only structural item.
    It returns `i8` with the bias on the BS plane and no CPU epilogue, removing
    the `i32` activation tensor rather than fusing passes over it. Memory
-   `requantized-int8-conv-path` has the board-validated shapes.
+   `requantized-int8-conv-path` has the board-validated shapes. **On `main`
+   and re-validated since 2026-09-06**; what remains is the epilogue-fusion
+   pass that puts a real model into the form its matcher claims, scoped in
+   ROADMAP.md's Phase 3.
 3. **P6 → P3 → C4 → P4 → P1** — the dispatch-path cost stack, roughly in
    increasing order of work. P6's residual is one guard held across a whole
    command buffer's recording; the rest is per-tile taxes.
