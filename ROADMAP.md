@@ -370,6 +370,22 @@ actually produces is a chain of five:
 Steps 1 and 2 fold to a single constant per-channel bias, because the filter is
 constant. Steps 4 and 5 collapse into the canonical generic. That is the pass.
 
+**Built 2026-09-06 as `rocket-fuse-int8-requant-epilogue`, and a real model
+reaches the requantized path for the first time: 15 of MobileNetV2's dense
+convolutions.** It is as accurate as the accumulator build it replaces
+(max|diff| 0.334 against a CPU arm, against the accumulator build's 0.396,
+same top-5). The 19 that remain exceed the requantized matchers' measured
+`Cin` 512 / `Cout` 768 bounds; raising those is a separate measurement job and
+is now the largest single lever left on this path.
+
+The model also found a hardware limit no fixture had: **`Cout = 24` is wrong
+on the requantized path.** Admitting that one convolution moves the model's
+logits from max|diff| 0.40 to 4.71 and the mean from 0.07 to 0.99 against a
+logit standard deviation of 1.17 -- the output stops being a classification.
+`Cout` 88 is exact and is not a whole number of 16-channel atoms either, so
+the rule is not "whole atoms"; 24 is simply below the smallest `Cout`
+measured correct. Both requantized matchers now carry `umin = 32`.
+
 Two questions that looked like blockers and are not: the activations are ONNX
 `ui8`, but `quantized-conv-to-conv` has already folded the unsigned-to-signed
 shift into the zero point (30 of the 34 carry `x_zp = -128`), so the bytes the
