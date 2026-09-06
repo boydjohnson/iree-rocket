@@ -324,7 +324,9 @@ can go sick until reboot, so measure one shape per process.
 ### Phase 3 -- fusion, which is where the throughput actually is
 
 This is P8's lever **#2**, and the only phase in this document that makes a
-model faster.
+model faster. **Confirmed 2026-09-06, with a number: 1.54x faster than the
+CPU arm on a full machine, from 1.5x slower.** See the requantized-path note
+at the end of this section.
 
 - `build_conv_then_lut_regcmd` and `build_conv_then_add_regcmd` are built,
   board-tested, and unreachable. Give them a wire representation as an
@@ -376,7 +378,17 @@ convolutions.** It is as accurate as the accumulator build it replaces
 (max|diff| 0.334 against a CPU arm, against the accumulator build's 0.396,
 same top-5). The bounds were then raised on measurement the same day -- `Cin` 512 -> 816
 and `Cout` 768 -> 1792 -- taking it to **29 of 34**, still at baseline
-accuracy (max|diff| 0.336, argmax and top-5 unchanged). `Cin` stops at 816
+accuracy (max|diff| 0.336, argmax and top-5 unchanged).
+
+**And it is faster, which is the first time anything in this document has
+been.** Measured on `planck` over six interleaved passes: **1.54x faster than
+a like-for-like CPU build on a full machine** (173.5 ms against 267.0),
+1.40x faster on four A76s, and 23-30% faster than the accumulator build it
+replaces at every core allocation. The accumulator build was 1.5x *slower*
+than the same CPU arm. `ROCKET_PROFILE` puts the largest single term in
+compaction, more than halved, which is the mechanism doing exactly what it
+was supposed to: `i8` output instead of `i32` is a quarter of the bytes to
+compact. ISSUES.md carries the table and the protocol. `Cin` stops at 816
 rather than the 1792 every isolated instrument supports because the model
 says so: see ISSUES.md's "Cin 1344 is exact in every isolated test and wrong
 inside the model".

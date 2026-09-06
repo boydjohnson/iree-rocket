@@ -791,6 +791,59 @@ Logits are **bit-identical** to the pre-change build (all 1001, max|diff| 0.0)
 NPU sites either way, 148 -> 145 CPU sites from the inline alone); its own
 epilogue still carries a genuine `f16 -> f32` widen and was left alone.
 
+### Measured 2026-09-06: the requantized path makes the int8 offload FASTER than the CPU
+
+This is P8's lever 1, built and measured. **MobileNetV2-static-int8 with 29 of
+its 34 dense convolutions on the requantized path is 1.54x faster than a
+like-for-like CPU build on a full machine**, where the accumulator build it
+replaces was 1.5x *slower*. Same model, same input, same pipeline; the only
+difference between the two offload arms is `rocket-fuse-int8-requant-epilogue`
+and the raised channel bounds.
+
+Protocol, because a number here means nothing without it: `planck`, governor
+`performance` on both A76 clusters, `iree-benchmark-module
+--benchmark_min_time=3s`, six interleaved passes with the arm order rotating
+each pass so no arm is ever always second, a quiet-NPU wait and a 2 s dwell
+before every run. The CPU arm is `rocket-compiler --no-offload`, not plain
+`iree-compile` (see the NHWC baseline trap). Medians of six:
+
+| cpus | cpu-only | accumulator | requantized | requant vs cpu | requant vs accumulator |
+|---|---:|---:|---:|---:|---:|
+| `4,5` | 277.5 ms | 485.0 ms | 371.5 ms | 1.34x slower | **-23.4%** |
+| `4-7` | 277.0 ms | 283.0 ms | 198.0 ms | **1.40x faster** | **-30.0%** |
+| `0-7` | 267.0 ms | 240.5 ms | 173.5 ms | **1.54x faster** | **-27.9%** |
+
+Spread is tight (the `0-7` requantized arm is 172-177 ms across six passes)
+and the CPU arm is 267 ms in all six.
+
+**Where the win is, from `ROCKET_PROFILE` at `0-7`** -- composition only, one
+run each, which is what that instrument is for:
+
+| phase | accumulator | requantized | delta |
+|---|---:|---:|---:|
+| `compact` | 50.3 ms | 21.0 ms | **-29.3** |
+| `outside` | 182.5 ms | 162.5 ms | -20.0 |
+| `wait.npu` | 43.4 ms | 30.6 ms | -12.8 |
+| `record` | 34.4 ms | 26.2 ms | -8.3 |
+| `pack.weights` | 65.8 ms | 65.8 ms | 0 |
+
+Both arms issue the same 47 NPU dispatches, so none of this is dispatch count.
+The largest single term is **compaction, more than halved**, which is the
+mechanism working exactly as stated: the accumulator path writes `i32` through
+128-byte native accumulator blocks, the requantized path writes `i8` into
+16-byte slots, so there is a quarter of the output traffic to compact. `outside`
+falls because the CPU requantization epilogues are gone, and the device itself
+is quicker writing `i8`.
+
+**What this does and does not overturn.** P8's law -- cost is flat per offloaded
+dispatch and it parallelises -- still holds in shape: at `4,5` the requantized
+arm is still 1.34x slower than the CPU, and the offload still needs cores. What
+changed is the constant. The right reading is P8's own: the deficit was `i32`
+activation traffic and unfused epilogues, and removing them removes it.
+`pack.weights` at 65.8 ms is now the largest driver-side phase in both arms and
+is untouched by this work -- it is the next thing to look at, and the weight
+cache reports 0 hits over 49 misses, which is worth a look on its own.
+
 ### Cin 1344 is exact in every isolated test and wrong inside the model
 
 Open, 2026-09-06. Raising the requantized matchers' `Cin` bound from 512 to
@@ -829,8 +882,10 @@ shape-level instrument this repo has already says the shape is fine.
 
 ### The ranked levers this leaves
 
-1. **Stop materializing `i32` activations and stop leaving their epilogues
-   unfused.** This is the whole 7.4 ms. The structural version is the
+1. ~~**Stop materializing `i32` activations and stop leaving their epilogues
+   unfused.**~~ **Done and measured 2026-09-06 -- see the section above: the
+   requantized path is 1.54x faster than the CPU arm on a full machine, where
+   the accumulator build was 1.5x slower.** This was the whole 7.4 ms. The structural version is the
    requantized int8 path (`requantized-int8-conv-path`): it returns `i8` with
    the bias on the BS plane and no CPU epilogue at all, which removes the
    `i32` tensor rather than fusing passes over it. What landed above is the
