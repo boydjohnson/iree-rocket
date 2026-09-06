@@ -357,14 +357,49 @@ with a target in a compiled model:
 formats are in and tested, but nothing compiles to them yet, and the honest
 next step for the LUT half is an fp16 LUT in the HAL (see Phase 2).
 
-**Measured, not claimed.** On `planck`, a three-op probe at ViT's
-`1x197x768` is `max|err| 0.0214` on a range of `[-7.4, 23.7]` against a
-`--no-offload` build -- f16 rounding across three chained ops and nothing
-else. ViT's audit goes from 12 offloaded sites to 184 (123 add, 49 mul, 12
-matmul) with the flag, and its CPU sites go from 260 to 553, because every
-offloaded op adds a `truncf`/`extf` pair. That growth is P8's law showing up
-exactly where it was predicted, and is why `--elementwise` is off by default.
-**No throughput claim is made; both arms still need timing on a real model.**
+**Measured on ViT, 2026-09-06.** Both correctness and throughput, on
+`planck`, governor `performance` on both A76 clusters, NPU IRQs on cpu6,
+`iree-benchmark-module --benchmark_repetitions=7`, every arm built by
+`rocket-compiler` so the baseline is like-for-like ([ISSUES.md M4](ISSUES.md)).
+
+Correct: against the `--no-offload` arm the 184-site build is `max|err|`
+**0.0060** on logits with a standard deviation of 0.90, same predicted class.
+The 12-site matmul arm is 0.0015, so the extra error is the f16 round trip on
+172 more sites and nothing else.
+
+Slower, and by how much depends on the core allocation, which is why it is a
+column:
+
+| cpus | `--no-offload` | 12 matmul sites | 184 sites (`--elementwise`) |
+|---|---|---|---|
+| 0-7 | 3973 ms | **3709 ms** (1.07x faster) | 4655 ms (**1.17x slower**) |
+| 4-7 | 8598 ms | 7933 ms (1.08x faster) | 8857 ms (1.03x slower) |
+| 4,5 | 8778 ms | 7999 ms (1.10x faster) | 8848 ms (1.01x slower) |
+
+**`ROCKET_PROFILE` says why, and it is not the NPU.** At the full machine the
+NPU is **4.2%** of wall (206 ms of 4901). The +1209 ms the element-wise sites
+add splits almost evenly between two host costs:
+
+- **+554 ms inside the driver**, dominated by the NC1HWC2 round trip:
+  `compact` 243 ms, `pack.input` 147 ms (356 calls for 184 dispatches -- a
+  two-tensor op packs both operands), `record` 129 ms.
+- **+535 ms in `outside`**, which is the `truncf`/`extf` CPU dispatches the
+  shims add. ViT's CPU dispatch sites go 260 -> 553.
+
+Per site, `ew Add 1x197x3072` costs 9.07 ms of which the hardware is 2.18 ms;
+the other 6.9 ms is host layout work. That is
+[ISSUES.md P2](ISSUES.md)'s per-dispatch repack, paid at every link because
+nothing propagates a packed layout between dispatches. **No cut point in the
+shape distribution rescues it** -- even the widest op ViT has is net-negative
+-- so this is not a bounds-tuning problem.
+
+**Conclusion: `--elementwise` stays off by default.** It is P8's law confirmed
+on a second model and a second op family, with the mechanism named. The lever
+that would change the answer is layout propagation (P2), not a wider matcher.
+
+One incidental finding: 25 of the matched sites are `1x197x1` -- a single
+channel padded to a 16-channel atom. They cost only 7.9 ms in total, but a
+channel floor would skip them for free.
 
 ---
 
