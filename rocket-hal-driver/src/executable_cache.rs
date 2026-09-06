@@ -1168,6 +1168,111 @@ mod tests {
         data
     }
 
+    /// The compiler's own FlatBuffer, decoded by the runtime.
+    ///
+    /// Every other Phase 1 test encodes with the Rust bindings and decodes
+    /// with them too, so none of them can catch the two sides disagreeing
+    /// about the wire -- both sides are the same side. This fixture is
+    /// produced by the real `iree-compile` from
+    /// `rocket-compiler-plugin/test/rocket_elementwise_unary.mlir`, which is
+    /// the C++ producer to Rust reader direction the schema's compatibility
+    /// policy asks for. Regenerate with, from the repo root:
+    ///
+    /// ```text
+    /// iree-compile rocket-compiler-plugin/test/rocket_elementwise_unary.mlir \
+    ///   --compile-mode=hal-executable \
+    ///   -o rocket-schema/testdata/elementwise_unary.rkt1
+    /// ```
+    #[test]
+    fn decodes_the_compilers_elementwise_unary_executable() {
+        let data = include_bytes!(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/../rocket-schema/testdata/elementwise_unary.rkt1"
+        ));
+        let UkernelShape::ElementwiseUnary(executable) =
+            decode_flatbuffer_shape(data).expect("the compiler's executable must decode")
+        else {
+            panic!("expected a unary element-wise executable");
+        };
+        assert_eq!(
+            executable.geometry,
+            ElementwiseGeometry {
+                width: 14,
+                height: 14,
+                channels: 64
+            }
+        );
+        assert_eq!(executable.algo, EwUnaryAlgo::Floor);
+        assert_eq!(executable.operand, 0);
+        assert!(executable.runtime_dimensions.is_empty());
+    }
+
+    /// As above, from `rocket_elementwise_lut.mlir`. Also checks the
+    /// decoded-to-biased zero-point conversion across the compiler boundary:
+    /// the `.mlir` says 0 and `LutShape` must see 0x80.
+    #[test]
+    fn decodes_the_compilers_lut_executable() {
+        let data = include_bytes!(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/../rocket-schema/testdata/elementwise_lut.rkt1"
+        ));
+        let UkernelShape::ElementwiseLut(executable) =
+            decode_flatbuffer_shape(data).expect("the compiler's executable must decode")
+        else {
+            panic!("expected a LUT executable");
+        };
+        assert_eq!(executable.function, LutFunction::Tanh);
+        assert_eq!(
+            executable.geometry,
+            ElementwiseGeometry {
+                width: 7,
+                height: 5,
+                channels: 48
+            }
+        );
+        assert_eq!(executable.input_zero_point, 0);
+        assert_eq!(executable.input_scale, 1.0 / 32.0);
+        assert_eq!(executable.output_scale, 1.0 / 128.0);
+
+        let shape = executable.resolve_shape(&[]).unwrap();
+        assert_eq!(shape.input_zero_point, 0x80);
+        assert_eq!(shape.output_zero_point, 0x80);
+    }
+
+    /// As above, from `rocket_elementwise_lut_dynamic.mlir`, which declares
+    /// all three dimensions as push constants. The order asserted here is the
+    /// order the compiler wrote them in, which is the order this runtime
+    /// consumes them in -- the one thing a fixture from the other side can
+    /// check that a self-encoded one cannot.
+    #[test]
+    fn decodes_the_compilers_dynamic_lut_executable() {
+        let data = include_bytes!(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/../rocket-schema/testdata/elementwise_lut_dynamic.rkt1"
+        ));
+        let UkernelShape::ElementwiseLut(executable) =
+            decode_flatbuffer_shape(data).expect("the compiler's executable must decode")
+        else {
+            panic!("expected a LUT executable");
+        };
+        assert_eq!(executable.function, LutFunction::Sqrt);
+        assert_eq!(
+            executable.runtime_dimensions,
+            vec![
+                RuntimeElementwiseDimension::Width,
+                RuntimeElementwiseDimension::Height,
+                RuntimeElementwiseDimension::Channels,
+            ]
+        );
+
+        let mut constants = Vec::new();
+        for value in [14u32, 14, 64] {
+            constants.extend_from_slice(&value.to_ne_bytes());
+        }
+        let shape = executable.resolve_shape(&constants).unwrap();
+        assert_eq!((shape.width, shape.height, shape.channels), (14, 14, 64));
+    }
+
     fn encode_elementwise_unary_executable(
         op: schema::EwUnaryOp,
         (width, height, channels): (u32, u32, u32),
