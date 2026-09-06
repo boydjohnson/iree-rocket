@@ -582,7 +582,24 @@ pub fn build_lut_regcmd(shape: &LutShape, bufs: &LutBuffers, table: LutTable) ->
         .channels
         .max(FEATURE_ATOMIC_SIZE)
         .next_multiple_of(FEATURE_ATOMIC_SIZE);
-    let surface_stride = shape.width * shape.height * task_channels;
+    // `DPU_DST_SURF_STRIDE` and `DPU_SURFACE_ADD` count 16-byte feature
+    // atoms, not bytes, so a surface is `width * height` atoms and the
+    // channel count does not enter. This used to multiply by
+    // `task_channels`, which is a no-op for a single-surface cube and 16x
+    // too large for every other one: at `channels = 32` the second surface
+    // was addressed 8 KiB out and never written at all. Every LUT test in
+    // this crate used `channels <= 16` (`conv_then_lut_hw.rs` uses 1), so
+    // nothing exercised it until ROADMAP Phase 1 needed a real tensor's
+    // channel count. `tests/lut_multi_surface_hw.rs` is the gate.
+    //
+    // `elementwise.rs` (`output_area`, gated across 2 and 8 surfaces by
+    // `ew_binary_hw.rs`) and `pooling.rs` (`(width * ATOMIC_K_SIZE *
+    // height) / FEATURE_ATOMIC_SIZE`, both constants 16, capture-derived)
+    // are the two independent statements of the same rule, and a full
+    // register diff of this builder against `build_unary_regcmd` at
+    // `channels = 32` showed identical register *sets* with this the only
+    // unexplained value difference.
+    let surface_stride = shape.width * shape.height;
     let out_offset = shape.output_zero_point.wrapping_sub(0x80);
     let (bn_mul_operand, bn_mul_shift) = lut_bn_mul(shape.input_scale, table.bn_scale_k);
     let real_zero_point = shape.input_zero_point.wrapping_sub(0x80) as i8 as i32;
