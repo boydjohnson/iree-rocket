@@ -99,6 +99,67 @@ with the per-precision pad-fill identities already worked out
 below the compiler at all, which is the evidence that this diagnosis was
 right. All three PPU reductions are now reachable from a compiled model.
 
+## The plumbing ledger, 2026-09-06
+
+The three gaps above were written before Phase 0, 1 and 3 landed. This is the
+full inventory as of today, checked layer by layer against
+[`rocket_executable_def.fbs`](rocket-schema/schema/rocket_executable_def.fbs),
+the decode arms in
+[`executable_cache.rs`](rocket-hal-driver/src/executable_cache.rs), the
+serializer in
+[`RocketTarget.cpp`](rocket-compiler-plugin/target/Rocket/RocketTarget.cpp) and
+the `foreach_match` lists in
+[`rocket_conv2d_transform_spec.mlir`](rocket-compiler-plugin/target/Rocket/rocket_conv2d_transform_spec.mlir).
+It splits two ways, and the split matters because the fix is different: the
+first list needs a schema change (and so a compatibility entry), the second
+needs only a matcher and a shim.
+
+The reverse direction is clean. Nothing the compiler emits today exceeds what
+the driver decodes or the HAL plans, which is what lets a shape outside a
+matcher fall back to the CPU silently rather than panic.
+
+### Implemented in the HAL, not expressible by the schema
+
+| Capability | Where it lives | What the wire has instead |
+|---|---|---|
+| Five of the eight conv datatypes: bf16, int16, fp16 with fp32 accumulator, tf32, int4 -- all board-validated | `Precision` in [`conv.rs`](iree-rocket-hal/src/rocket/conv.rs); ladders in `conv2d_oracle_hw` | `Precision` has `INT8`, `FP16`, `INT8_ACCUMULATOR`. The driver's precision decode errors on anything else; the only place it names the other five is the profiler's label table |
+| conv → LUT and conv → EW add as two tasks in one job | `build_conv_then_lut_regcmd`, `build_conv_then_add_regcmd`; `conv_then_lut_hw`, `conv_with_add_hw` | No way to say "two tasks, one job". Every LUT or EW op is its own dispatch with its own NC1HWC2 round trip |
+| int8 two-tensor element-wise, with output zero point, conversion offset and two scale ratios | `EwAddShape` with `EwPrecision::Int8` in [`elementwise.rs`](iree-rocket-hal/src/rocket/elementwise.rs) | `ElementwiseBinaryDef` is fp16 only, deliberately: the ratio semantics are inferred from register shape, not confirmed by a capture, and MUL has no int8 recipe at all (`docs/compatibility.md`) |
+| Per-output-channel weight zero points | `pack_hwcf_to_rocket_weights_affine_i8` takes one zero point per `Cout` | One scalar `weights_zero_point`; the driver broadcasts it across every channel |
+| Explicit CBUF plans and bank overrides for kernels above 3x3 | `ConvPlan` with an override; fp16 measured to 11x11 (LIMITS.md) | `weights_width`/`height` can name any extent, but automatic planning covers 1x1 and 3x3 only and no wire field can ask for an override |
+
+Two absences are deliberate and are not gaps: the pooling pad-fill value,
+which the driver derives from method and precision so a producer cannot
+corrupt a max pool's border, and `FullyConnectedDef`, deprecated and never
+emitted.
+
+### Expressible and decoded, but not lowered by `rocket-compiler`
+
+Everything here is on the wire, has a decode arm in the driver and a
+serializer arm in the plugin, and has a HAL path with a hardware test. The
+compiler simply never asks for it -- the same diagnosis Gap 3 made for min and
+max pooling, which closed with six matchers and no change below the compiler.
+
+| Capability | Plumbed through | What the spec does today |
+|---|---|---|
+| Fused activation on a conv (`RELU`, `RELUX`) | schema `Activation`; serializer parses `relu`/`relux`; driver `decode_activation`; HAL `Activation::{Relu, Clamped}`; `conv_activation_fused_hw` | All 14 kernel targets say `activation = "none"`. This is why `audit` on MobileNetV2 shows a separate CPU clamp dispatch after every offloaded conv. Only `INT8_ACCUMULATOR` genuinely forbids it |
+| Conv padding | schema `pad_top`/`pad_left`; HAL leading pads 0..=15 | Hardcoded zero on every conv target, so a model's pad becomes a `slow_memcpy` CPU dispatch ahead of the conv (ten of them on MobileNetV2 fp16) |
+| Unary EW: abs, neg, floor, ceil, add-with-scalar (fp16) | `ElementwiseUnaryDef` (tag 5), driver, serializer, `ew_unary_hw` | No matcher. No measured model contains one of these ops |
+| The nine LUT curves (int8) | `ElementwiseLutDef` (tag 6), driver, serializer, `lut_zero_join_hw` | No matcher. The LUT path is int8 by construction and the models' `sqrt`/`erf` are f32 |
+| EW `MAX` and `MIN` | `EwBinaryOp`, driver, serializer, `ew_binary_hw` (bit-exact) | Only `add`/`sub`/`mul` have matchers, and those sit behind `--elementwise` |
+| Dense conv at stride 3 and 4 | `Conv2DDef.stride`; HAL `Shape::with_stride` | Executables *and* matchers are written in the spec but are not in the `foreach_match` list. Depthwise NHWC fp16 has no strided matcher at all, though NCHW does |
+| Kernels other than 1x1 and 3x3 | `weights_width`/`height`; HAL fp16 to 11x11 with the `Cin` cliffs in LIMITS.md | No matcher claims one |
+| int8 matmul and int8 pooling | `MatmulDef.precision`, `PoolingDef.precision`; driver maps `INT8` for both; `fc::Shape` takes any `Precision`, `PoolingPrecision::Int8` | Every matmul and pooling target is fp16. The serializer refuses only `int8_accumulator` for matmul |
+| Pooling padding and unequal per-axis stride | four pad fields, `stride_x`/`stride_y`; HAL pads 0..=7 | Matchers bake zero padding and equal strides of 1 or 2, so model-level pooling pads also run on the CPU |
+| Runtime input zero point | `Conv2DQuantParam::INPUT_ZERO_POINT` | The requant targets push only `output_scale` and `output_zero_point` |
+
+The two rows at the top of that table are the ones with a measured cost
+attached. On `mnv2.fp16.mlir` the unfused clamps and the pad copies are
+dispatches that exist only because the NPU conv cannot carry them, and P8's
+per-dispatch tax applies to each. They are the cheapest throughput lever left
+in this table: one string on a target and one field on the shim, no schema
+change, no hardware unknown.
+
 ---
 
 ## What the hardware can and cannot reach
