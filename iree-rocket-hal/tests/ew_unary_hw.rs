@@ -24,26 +24,30 @@
 //! ./ew_unary_hw-<hash> --ignored --nocapture
 //! ```
 //!
-//! **First hardware round for this task shape** -- `build_unary_regcmd`
-//! has never run on real silicon (see its own doc comment for exactly
-//! which register choices are inferred vs. carried over confirmed from
-//! `build_add_regcmd`). If these tests hang, suspect the `ew_op_src=0`/
-//! zeroed-operand choice or the explicit `ERDMA_DISABLE=1` first --
-//! neither is independently hardware-confirmed.
+//! This was the first hardware round for this task shape, and it passed:
+//! `build_unary_regcmd`'s two inferred choices (`ew_op_src=0` with a zeroed
+//! operand, and the explicit `ERDMA_DISABLE=1`) are confirmed for
+//! `Abs`/`Neg`/`Floor`/`Ceil` by the tests below.
 //!
-//! **`channels=1` only, deliberately.** `build_add_regcmd`'s own
-//! multi-channel output byte layout has never been confirmed on real
-//! hardware either (its `DST_SURF_STRIDE`/`SURFACE_ADD` use `width*height`
-//! with no channel factor, unlike `build_lut_regcmd`'s `width*height*
-//! task_channels` -- see `elementwise.rs`'s module doc comment), so a
-//! multi-channel oracle check here would be asserting against a guessed
-//! layout on top of an unconfirmed register recipe. Staying at
-//! `channels=1` collapses output to a flat, unambiguous `width*height`
-//! array of raw fp16 values and isolates the one thing this file actually
-//! sets out to prove: does each ALU opcode compute the right per-pixel
-//! value. Same restraint `conv_with_add_hw.rs` used for its own first
-//! hardware round. A multi-channel round is real follow-up work, not done
-//! here.
+//! **`channels=1` and a uniform fill, deliberately** -- this file proves the
+//! ALU opcodes, not the layout, and two things follow that a reader should
+//! not carry away as more than they are:
+//!
+//! - The output read below is `width * height` consecutive fp16 words, called
+//!   pixels. The cube is really NC1HWC2, where pixel `p`'s channel 0 sits at
+//!   fp16 element `p * 8`, so those words are the first two pixels' channels.
+//!   Under a uniform fill every channel holds the same value, so the oracle
+//!   check is valid for what it claims and silent about placement.
+//! - The original reason given for staying at one channel -- that
+//!   `build_add_regcmd`'s multi-channel layout was itself unconfirmed -- is
+//!   no longer true. `ew_binary_hw.rs` gates that builder at 16, 24 and 64
+//!   fp16 channels, and `build_lut_regcmd`'s conflicting
+//!   `width*height*task_channels` stride turned out to be the wrong one of
+//!   the pair (fixed 2026-09-06).
+//!
+//! The multi-channel round this file deferred is
+//! `ew_unary_multi_surface_hw.rs`: a position-dependent input over 2, 4 and 8
+//! surfaces, every opcode, bit-exact.
 
 use std::{fs::OpenOptions, mem, os::unix::io::AsRawFd, ptr};
 

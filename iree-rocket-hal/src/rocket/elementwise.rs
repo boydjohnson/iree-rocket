@@ -198,8 +198,11 @@ pub struct EwAddBuffers {
 /// output_mode=2, burst_len=15 -- byte-identical to
 /// [`build_lut_regcmd`]'s own), kick (`KICK_DPU|KICK_DPU_RDMA` only),
 /// `DST_SURF_STRIDE`/`EW_SURF_STRIDE`/`SURFACE_ADD` (`width*height`, no
-/// channel factor -- unlike `build_lut_regcmd`'s own `width*height*
-/// task_channels`), channel padding (reuses `build_lut_regcmd`'s exact
+/// channel factor -- these registers count 16-byte feature atoms;
+/// `build_lut_regcmd` used to multiply by `task_channels` here and was
+/// wrong for every cube past one surface, fixed 2026-09-06 against
+/// `tests/lut_multi_surface_hw.rs`), channel padding (reuses
+/// `build_lut_regcmd`'s exact
 /// `channels.max(16).next_multiple_of(16)` formula), `EW_CFG`'s shared bits
 /// and its precision-dependent `edata_size`/`ew_cvt_type`, `DPU_DATA_FORMAT`/
 /// `DPU_RDMA_RDMA_FEATURE_MODE_CFG`'s fp16-only precision fields, and `BS`/
