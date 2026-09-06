@@ -21,6 +21,76 @@
 
 use std::{collections::BTreeSet, error::Error};
 
+/// Prefix on the `foreach_match` entries that ROADMAP Phase 1's element-wise
+/// matchers are commented out with in the shipped spec.
+///
+/// They are disabled in the file itself, not merely absent from a default
+/// built here, because ISSUES.md P8 measured that at the current
+/// per-dispatch cost more offload sites make a model slower: an element-wise
+/// op does less arithmetic than its own dispatch tax. Anything that reads the
+/// spec without going through this module -- a bare `iree-compile
+/// --iree-preprocessing-transform-spec-filename=...` included -- therefore
+/// gets the conservative list.
+const ELEMENTWISE_MARKER: &str = "//@ROCKET_ELEMENTWISE@";
+
+/// Result of enabling the element-wise matchers, kept together so the caller
+/// can report what it did rather than trusting it silently -- the same
+/// reasoning as [`NeutralizedSpec`].
+#[derive(Debug)]
+pub struct ElementwiseSpec {
+    pub text: String,
+    /// How many marked `foreach_match` entries were uncommented.
+    pub enabled: usize,
+}
+
+/// Returns `spec` with the marked element-wise `foreach_match` entries
+/// uncommented, so they join the match loop.
+///
+/// Fails if the spec carries no marked entries at all. That would mean the
+/// marker was renamed or the entries were deleted, and silently compiling a
+/// spec with no element-wise matchers under `--elementwise` would look like
+/// "the flag works and nothing matched" -- indistinguishable from a real
+/// measurement of zero sites, which is exactly the confusion this check
+/// exists to prevent.
+pub fn enable_elementwise(spec: &str) -> Result<ElementwiseSpec, Box<dyn Error>> {
+    let mut enabled = 0;
+    let text = spec
+        .lines()
+        // `trim_start` so the marker does not have to sit at column 0. It
+        // reads better indented with the entries it belongs to, and a rule
+        // that depends on a file's leading whitespace is a rule that breaks
+        // the first time someone reformats the spec.
+        .map(
+            |line| match line.trim_start().strip_prefix(ELEMENTWISE_MARKER) {
+                Some(rest) => {
+                    enabled += 1;
+                    rest.to_string()
+                }
+                None => line.to_string(),
+            },
+        )
+        .collect::<Vec<_>>()
+        .join("\n");
+
+    if enabled == 0 {
+        return Err(format!(
+            "--elementwise found no `{ELEMENTWISE_MARKER}` entries in the transform spec, so \
+             it would compile exactly the default match loop under a flag that claims \
+             otherwise"
+        )
+        .into());
+    }
+
+    Ok(ElementwiseSpec {
+        text: if spec.ends_with('\n') {
+            format!("{text}\n")
+        } else {
+            text
+        },
+        enabled,
+    })
+}
+
 /// The sentinel every `dim_bounds` bound is rewritten to. Both ends are set,
 /// so the interval is a single value no real dimension can take.
 const NO_OFFLOAD_BOUND: &str = "999999";
@@ -316,6 +386,99 @@ mod tests {
         );
         let out = neutralize(&constrained).expect("a bounded matcher in either loop is fine");
         assert_eq!(out.matchers, 3);
+    }
+
+    #[test]
+    fn marked_entries_are_uncommented_and_nothing_else_changes() {
+        // The marker is indented here on purpose: `enable_elementwise`
+        // trims leading whitespace before looking for it, so the rule does
+        // not depend on the spec's own formatting.
+        let spec = [
+            "        transform.foreach_match in %func",
+            "    //@ROCKET_ELEMENTWISE@            @match_a -> @call_a,",
+            "//@ROCKET_ELEMENTWISE@            @match_b -> @call_b,",
+            "            // an ordinary comment",
+            "            @match_c -> @call_c",
+            "",
+        ]
+        .join("\n");
+        let spec = spec.as_str();
+        let out = enable_elementwise(spec).expect("the marked entries must be enabled");
+        assert_eq!(out.enabled, 2);
+        assert!(out.text.contains("            @match_a -> @call_a,"));
+        assert!(out.text.contains("            @match_b -> @call_b,"));
+        assert!(!out.text.contains(ELEMENTWISE_MARKER));
+        // Untouched lines stay byte-identical, including comments that are
+        // not the marker.
+        assert!(out.text.contains("// an ordinary comment"));
+        assert!(out.text.contains("            @match_c -> @call_c"));
+        assert!(out.text.ends_with('\n'));
+    }
+
+    /// Without this the flag would silently do nothing on a spec whose marker
+    /// was renamed, and a measurement of "zero element-wise sites" would be
+    /// indistinguishable from a real one.
+    #[test]
+    fn a_spec_with_no_marked_entries_is_refused() {
+        let err =
+            enable_elementwise(SPEC).expect_err("a spec with no marked entries must be refused");
+        assert!(err.to_string().contains("--elementwise"));
+    }
+
+    /// The two flags compose in one direction only. Enabling first and
+    /// neutralizing second means the element-wise matchers are checked for
+    /// `dim_bounds` and defeated along with everything else, so
+    /// `--no-offload --elementwise` is a true baseline for `--elementwise`.
+    #[test]
+    fn enabling_then_neutralizing_defeats_the_elementwise_matchers_too() {
+        let spec = "\
+transform.named_sequence @match_ew(%r: !transform.any_op) -> !transform.any_op {\n\
+  transform.iree.match.dim_bounds %v[2], umin = 1, umax = 3072 : !transform.any_value\n\
+}\n\
+transform.named_sequence @match_conv(%r: !transform.any_op) -> !transform.any_op {\n\
+  transform.iree.match.dim_bounds %v[3], umin = 1, umax = 512 : !transform.any_value\n\
+}\n\
+    transform.foreach_match in %func\n//@ROCKET_ELEMENTWISE@      @match_ew -> @call_ew,\n      @match_conv -> @call_conv\n";
+
+        let enabled = enable_elementwise(spec).expect("marked entry is enabled");
+        assert_eq!(enabled.enabled, 1);
+        let neutralized = neutralize(&enabled.text).expect("both matchers are bounded");
+        assert_eq!(
+            neutralized.matchers, 2,
+            "the element-wise matcher must be seen"
+        );
+        assert_eq!(neutralized.rewritten, 2);
+        assert!(!neutralized.text.contains("umax = 3072"));
+    }
+
+    /// The shipped spec's own marked entries, checked against the file rather
+    /// than a fixture: a renamed matcher or a dropped entry shows up here.
+    #[test]
+    fn the_shipped_spec_enables_its_elementwise_matchers() {
+        let spec = std::fs::read_to_string(crate::default_transform_spec_path())
+            .expect("the shipped spec must be readable");
+        let enabled =
+            enable_elementwise(&spec).expect("the shipped spec must carry marked entries");
+        assert_eq!(
+            enabled.enabled, 3,
+            "expected the add/sub/mul element-wise entries"
+        );
+
+        // Enabled, they must survive `neutralize` -- which is what proves
+        // each one carries a `dim_bounds`, since neutralize refuses a
+        // `foreach_match` matcher that does not.
+        let matchers = foreach_match_matchers(&enabled.text);
+        for name in [
+            "match_elementwise_add_f32",
+            "match_elementwise_sub_f32",
+            "match_elementwise_mul_f32",
+        ] {
+            assert!(
+                matchers.contains(name),
+                "{name} must join the foreach_match list once enabled"
+            );
+        }
+        neutralize(&enabled.text).expect("the enabled spec must still yield a no-offload spec");
     }
 
     #[test]

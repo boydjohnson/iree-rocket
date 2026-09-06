@@ -395,6 +395,45 @@
 ]>
 
 // A pool has no weights and no bias: input and output only.
+// Two-tensor element-wise, one target per operator. Everything but `op` is
+// identical, and all three extents arrive as push constants -- an
+// element-wise op has no weights and no reduction, so geometry is the only
+// thing that varies per dispatch.
+//
+// fp16 only. `EwAddShape` has an int8 branch but its EW_CVT_SCALE and
+// OUT_CVT_SCALE ratio semantics are inferred rather than confirmed, so the
+// wire format carries no precision field at all and there is nothing to
+// state here.
+#rocket_elementwise_add_target = #hal.executable.target<"rocket", "rocket-flatbuffer-v1", {
+  kernel = "elementwise_binary",
+  width = 0 : i32, height = 0 : i32, channels = 0 : i32,
+  op = "add",
+  runtime_dimensions = ["width", "height", "channels"]
+}>
+
+#rocket_elementwise_sub_target = #hal.executable.target<"rocket", "rocket-flatbuffer-v1", {
+  kernel = "elementwise_binary",
+  width = 0 : i32, height = 0 : i32, channels = 0 : i32,
+  op = "sub",
+  runtime_dimensions = ["width", "height", "channels"]
+}>
+
+#rocket_elementwise_mul_target = #hal.executable.target<"rocket", "rocket-flatbuffer-v1", {
+  kernel = "elementwise_binary",
+  width = 0 : i32, height = 0 : i32, channels = 0 : i32,
+  op = "mul",
+  runtime_dimensions = ["width", "height", "channels"]
+}>
+
+// Three push constants (width, height, channels) and three bindings: the
+// primary operand, the second tensor, and the output. Every other Rocket
+// kernel has two bindings; this is the only one that reads two tensors.
+#elementwise_binary_pipeline_layout = #hal.pipeline.layout<constants = 3, bindings = [
+  #hal.pipeline.binding<storage_buffer, ReadOnly>,
+  #hal.pipeline.binding<storage_buffer, ReadOnly>,
+  #hal.pipeline.binding<storage_buffer>
+]>
+
 #pooling_pipeline_layout = #hal.pipeline.layout<constants = 5, bindings = [
   #hal.pipeline.binding<storage_buffer, ReadOnly>,
   #hal.pipeline.binding<storage_buffer>
@@ -540,6 +579,48 @@ module attributes {transform.with_named_sequence} {
       }
       builtin.module {
         func.func @rocket_pooling_avg() {
+          return
+        }
+      }
+    }
+  }
+
+  hal.executable private @rocket_elementwise_add_executable {
+    hal.executable.variant public @rocket_elementwise_add_v1 target(#rocket_elementwise_add_target) {
+      hal.executable.export public @rocket_elementwise_add ordinal(0) layout(#elementwise_binary_pipeline_layout) count(%device: !hal.device, %workload: index) -> (index, index, index) {
+        %c1 = arith.constant 1 : index
+        hal.return %c1, %c1, %c1 : index, index, index
+      }
+      builtin.module {
+        func.func @rocket_elementwise_add() {
+          return
+        }
+      }
+    }
+  }
+
+  hal.executable private @rocket_elementwise_sub_executable {
+    hal.executable.variant public @rocket_elementwise_sub_v1 target(#rocket_elementwise_sub_target) {
+      hal.executable.export public @rocket_elementwise_sub ordinal(0) layout(#elementwise_binary_pipeline_layout) count(%device: !hal.device, %workload: index) -> (index, index, index) {
+        %c1 = arith.constant 1 : index
+        hal.return %c1, %c1, %c1 : index, index, index
+      }
+      builtin.module {
+        func.func @rocket_elementwise_sub() {
+          return
+        }
+      }
+    }
+  }
+
+  hal.executable private @rocket_elementwise_mul_executable {
+    hal.executable.variant public @rocket_elementwise_mul_v1 target(#rocket_elementwise_mul_target) {
+      hal.executable.export public @rocket_elementwise_mul ordinal(0) layout(#elementwise_binary_pipeline_layout) count(%device: !hal.device, %workload: index) -> (index, index, index) {
+        %c1 = arith.constant 1 : index
+        hal.return %c1, %c1, %c1 : index, index, index
+      }
+      builtin.module {
+        func.func @rocket_elementwise_mul() {
           return
         }
       }
@@ -1069,6 +1150,388 @@ module attributes {transform.with_named_sequence} {
         permutation = [0, 3, 1, 2]
 
     util.return %final_nchw : tensor<1x?x?x?xf32>
+  }
+
+
+  // Two-tensor element-wise `add`, rank 3. The shape a compiled model
+  // actually presents: ONNX `Add`/`Mul`/`Sub` reach the spec as a
+  // `linalg.generic` over `1x?x?` with an `arith.addf` body (verified
+  // by compiling a torch-onnx probe to `--compile-to=preprocessing`), not as
+  // a `linalg.add` named op and not as `linalg.elementwise`.
+  //
+  // `1 x T x C` maps to the hardware cube as width = T, height = 1,
+  // channels = C: the trailing dimension is innermost in memory and is what
+  // NC1HWC2 packs into feature atoms, and the leading 1 is the batch the
+  // matcher pins. For ViT that is 197 tokens of 768 (or 3072) channels.
+  //
+  // There is no init to fold in, unlike the pooling shims: `O = A add B`
+  // writes every element, so the `outs` operand is a pure destination and
+  // the CPU epilogue only has to widen f16 back to f32.
+  util.func private @call_rocket_elementwise_add(
+      %lhs: tensor<1x?x?xf32>,
+      %rhs: tensor<1x?x?xf32>,
+      %init: tensor<1x?x?xf32>) -> tensor<1x?x?xf32> {
+    %c1 = arith.constant 1 : index
+    %c2 = arith.constant 2 : index
+
+    %tokens = tensor.dim %lhs, %c1 : tensor<1x?x?xf32>
+    %channels = tensor.dim %lhs, %c2 : tensor<1x?x?xf32>
+
+    %width_i32 = arith.index_cast %tokens : index to i32
+    %channels_i32 = arith.index_cast %channels : index to i32
+    // Height is 1: a rank-3 token tensor is one row of `tokens` pixels.
+    %height_i32 = arith.constant 1 : i32
+
+    // The EW datapath is fp16; the model's tensors are f32.
+    %lhs_f16_empty = tensor.empty(%tokens, %channels) : tensor<1x?x?xf16>
+    %lhs_f16 = linalg.generic {
+        indexing_maps = [
+          affine_map<(d0, d1, d2) -> (d0, d1, d2)>,
+          affine_map<(d0, d1, d2) -> (d0, d1, d2)>
+        ],
+        iterator_types = ["parallel", "parallel", "parallel"]
+      } ins(%lhs : tensor<1x?x?xf32>)
+        outs(%lhs_f16_empty : tensor<1x?x?xf16>) {
+      ^bb0(%value: f32, %out: f16):
+        %narrowed = arith.truncf %value : f32 to f16
+        linalg.yield %narrowed : f16
+    } -> tensor<1x?x?xf16>
+
+    %rhs_f16_empty = tensor.empty(%tokens, %channels) : tensor<1x?x?xf16>
+    %rhs_f16 = linalg.generic {
+        indexing_maps = [
+          affine_map<(d0, d1, d2) -> (d0, d1, d2)>,
+          affine_map<(d0, d1, d2) -> (d0, d1, d2)>
+        ],
+        iterator_types = ["parallel", "parallel", "parallel"]
+      } ins(%rhs : tensor<1x?x?xf32>)
+        outs(%rhs_f16_empty : tensor<1x?x?xf16>) {
+      ^bb0(%value: f32, %out: f16):
+        %narrowed = arith.truncf %value : f32 to f16
+        linalg.yield %narrowed : f16
+    } -> tensor<1x?x?xf16>
+
+    %combined = flow.dispatch
+        @rocket_elementwise_add_executable::@rocket_elementwise_add_v1::@rocket_elementwise_add(
+          %width_i32, %height_i32, %channels_i32,
+          %lhs_f16, %rhs_f16)
+        {stream.affinity = #hal.device.affinity<@rocket_device>}
+        : (i32, i32, i32,
+           tensor<1x?x?xf16>{%tokens, %channels},
+           tensor<1x?x?xf16>{%tokens, %channels})
+        -> tensor<1x?x?xf16>{%tokens, %channels}
+
+    // Explicitly a CPU dispatch, for the reason the pooling shims record: an
+    // op that consumes the Rocket result inherits its affinity, gets formed
+    // into an executable for the rocket device, and that executable has no
+    // element-wise config to serialize. The failure is a serialization error
+    // naming a missing `width`, a long way from the cause.
+    %final = flow.dispatch.workgroups[%tokens, %channels](
+        %combined, %tokens, %channels)
+        : (tensor<1x?x?xf16>{%tokens, %channels}, index, index)
+        -> tensor<1x?x?xf32>{%tokens, %channels}
+        attributes { stream.affinity = #hal.device.affinity<@cpu_device> } =
+        (%combined_binding: !iree_tensor_ext.dispatch.tensor<readonly:tensor<1x?x?xf16>>,
+         %tokens_arg: index,
+         %channels_arg: index,
+         %final_binding: !iree_tensor_ext.dispatch.tensor<writeonly:tensor<1x?x?xf32>>) {
+      %tokens_size = iree_tensor_ext.dispatch.workload.ordinal %tokens_arg, 0 : index
+      %channels_size = iree_tensor_ext.dispatch.workload.ordinal %channels_arg, 1 : index
+      %combined_shaped = flow.dispatch.tie_shape %combined_binding
+          : !iree_tensor_ext.dispatch.tensor<readonly:tensor<1x?x?xf16>>{
+              %tokens_size, %channels_size}
+      %final_shaped = flow.dispatch.tie_shape %final_binding
+          : !iree_tensor_ext.dispatch.tensor<writeonly:tensor<1x?x?xf32>>{
+              %tokens_size, %channels_size}
+      %combined_loaded = iree_tensor_ext.dispatch.tensor.load %combined_shaped,
+          offsets = [0, 0, 0],
+          sizes = [1, %tokens_size, %channels_size],
+          strides = [1, 1, 1]
+          : !iree_tensor_ext.dispatch.tensor<readonly:tensor<1x?x?xf16>>{
+              %tokens_size, %channels_size}
+          -> tensor<1x?x?xf16>
+      %final_empty = tensor.empty(%tokens_size, %channels_size) : tensor<1x?x?xf32>
+      %final_inner = linalg.generic {
+          indexing_maps = [
+            affine_map<(d0, d1, d2) -> (d0, d1, d2)>,
+            affine_map<(d0, d1, d2) -> (d0, d1, d2)>
+          ],
+          iterator_types = ["parallel", "parallel", "parallel"]
+        } ins(%combined_loaded : tensor<1x?x?xf16>)
+          outs(%final_empty : tensor<1x?x?xf32>) {
+        ^bb0(%value: f16, %out: f32):
+          %widened = arith.extf %value : f16 to f32
+          linalg.yield %widened : f32
+      } -> tensor<1x?x?xf32>
+      iree_tensor_ext.dispatch.tensor.store %final_inner, %final_shaped,
+          offsets = [0, 0, 0],
+          sizes = [1, %tokens_size, %channels_size],
+          strides = [1, 1, 1]
+          : tensor<1x?x?xf32>
+          -> !iree_tensor_ext.dispatch.tensor<writeonly:tensor<1x?x?xf32>>{
+              %tokens_size, %channels_size}
+      flow.return
+    } count(%tokens_workload: index, %channels_workload: index) -> (index, index, index) {
+      %x, %y, %z = iree_tensor_ext.dispatch.workgroup_count_from_slice(
+          %tokens_workload, %channels_workload)
+      flow.return %x, %y, %z : index, index, index
+    }
+
+    util.return %final : tensor<1x?x?xf32>
+  }
+
+  // Two-tensor element-wise `subtract`, rank 3. The shape a compiled model
+  // actually presents: ONNX `Add`/`Mul`/`Sub` reach the spec as a
+  // `linalg.generic` over `1x?x?` with an `arith.subf` body (verified
+  // by compiling a torch-onnx probe to `--compile-to=preprocessing`), not as
+  // a `linalg.add` named op and not as `linalg.elementwise`.
+  //
+  // `1 x T x C` maps to the hardware cube as width = T, height = 1,
+  // channels = C: the trailing dimension is innermost in memory and is what
+  // NC1HWC2 packs into feature atoms, and the leading 1 is the batch the
+  // matcher pins. For ViT that is 197 tokens of 768 (or 3072) channels.
+  //
+  // There is no init to fold in, unlike the pooling shims: `O = A subtract B`
+  // writes every element, so the `outs` operand is a pure destination and
+  // the CPU epilogue only has to widen f16 back to f32.
+  util.func private @call_rocket_elementwise_sub(
+      %lhs: tensor<1x?x?xf32>,
+      %rhs: tensor<1x?x?xf32>,
+      %init: tensor<1x?x?xf32>) -> tensor<1x?x?xf32> {
+    %c1 = arith.constant 1 : index
+    %c2 = arith.constant 2 : index
+
+    %tokens = tensor.dim %lhs, %c1 : tensor<1x?x?xf32>
+    %channels = tensor.dim %lhs, %c2 : tensor<1x?x?xf32>
+
+    %width_i32 = arith.index_cast %tokens : index to i32
+    %channels_i32 = arith.index_cast %channels : index to i32
+    // Height is 1: a rank-3 token tensor is one row of `tokens` pixels.
+    %height_i32 = arith.constant 1 : i32
+
+    // The EW datapath is fp16; the model's tensors are f32.
+    %lhs_f16_empty = tensor.empty(%tokens, %channels) : tensor<1x?x?xf16>
+    %lhs_f16 = linalg.generic {
+        indexing_maps = [
+          affine_map<(d0, d1, d2) -> (d0, d1, d2)>,
+          affine_map<(d0, d1, d2) -> (d0, d1, d2)>
+        ],
+        iterator_types = ["parallel", "parallel", "parallel"]
+      } ins(%lhs : tensor<1x?x?xf32>)
+        outs(%lhs_f16_empty : tensor<1x?x?xf16>) {
+      ^bb0(%value: f32, %out: f16):
+        %narrowed = arith.truncf %value : f32 to f16
+        linalg.yield %narrowed : f16
+    } -> tensor<1x?x?xf16>
+
+    %rhs_f16_empty = tensor.empty(%tokens, %channels) : tensor<1x?x?xf16>
+    %rhs_f16 = linalg.generic {
+        indexing_maps = [
+          affine_map<(d0, d1, d2) -> (d0, d1, d2)>,
+          affine_map<(d0, d1, d2) -> (d0, d1, d2)>
+        ],
+        iterator_types = ["parallel", "parallel", "parallel"]
+      } ins(%rhs : tensor<1x?x?xf32>)
+        outs(%rhs_f16_empty : tensor<1x?x?xf16>) {
+      ^bb0(%value: f32, %out: f16):
+        %narrowed = arith.truncf %value : f32 to f16
+        linalg.yield %narrowed : f16
+    } -> tensor<1x?x?xf16>
+
+    %combined = flow.dispatch
+        @rocket_elementwise_sub_executable::@rocket_elementwise_sub_v1::@rocket_elementwise_sub(
+          %width_i32, %height_i32, %channels_i32,
+          %lhs_f16, %rhs_f16)
+        {stream.affinity = #hal.device.affinity<@rocket_device>}
+        : (i32, i32, i32,
+           tensor<1x?x?xf16>{%tokens, %channels},
+           tensor<1x?x?xf16>{%tokens, %channels})
+        -> tensor<1x?x?xf16>{%tokens, %channels}
+
+    // Explicitly a CPU dispatch, for the reason the pooling shims record: an
+    // op that consumes the Rocket result inherits its affinity, gets formed
+    // into an executable for the rocket device, and that executable has no
+    // element-wise config to serialize. The failure is a serialization error
+    // naming a missing `width`, a long way from the cause.
+    %final = flow.dispatch.workgroups[%tokens, %channels](
+        %combined, %tokens, %channels)
+        : (tensor<1x?x?xf16>{%tokens, %channels}, index, index)
+        -> tensor<1x?x?xf32>{%tokens, %channels}
+        attributes { stream.affinity = #hal.device.affinity<@cpu_device> } =
+        (%combined_binding: !iree_tensor_ext.dispatch.tensor<readonly:tensor<1x?x?xf16>>,
+         %tokens_arg: index,
+         %channels_arg: index,
+         %final_binding: !iree_tensor_ext.dispatch.tensor<writeonly:tensor<1x?x?xf32>>) {
+      %tokens_size = iree_tensor_ext.dispatch.workload.ordinal %tokens_arg, 0 : index
+      %channels_size = iree_tensor_ext.dispatch.workload.ordinal %channels_arg, 1 : index
+      %combined_shaped = flow.dispatch.tie_shape %combined_binding
+          : !iree_tensor_ext.dispatch.tensor<readonly:tensor<1x?x?xf16>>{
+              %tokens_size, %channels_size}
+      %final_shaped = flow.dispatch.tie_shape %final_binding
+          : !iree_tensor_ext.dispatch.tensor<writeonly:tensor<1x?x?xf32>>{
+              %tokens_size, %channels_size}
+      %combined_loaded = iree_tensor_ext.dispatch.tensor.load %combined_shaped,
+          offsets = [0, 0, 0],
+          sizes = [1, %tokens_size, %channels_size],
+          strides = [1, 1, 1]
+          : !iree_tensor_ext.dispatch.tensor<readonly:tensor<1x?x?xf16>>{
+              %tokens_size, %channels_size}
+          -> tensor<1x?x?xf16>
+      %final_empty = tensor.empty(%tokens_size, %channels_size) : tensor<1x?x?xf32>
+      %final_inner = linalg.generic {
+          indexing_maps = [
+            affine_map<(d0, d1, d2) -> (d0, d1, d2)>,
+            affine_map<(d0, d1, d2) -> (d0, d1, d2)>
+          ],
+          iterator_types = ["parallel", "parallel", "parallel"]
+        } ins(%combined_loaded : tensor<1x?x?xf16>)
+          outs(%final_empty : tensor<1x?x?xf32>) {
+        ^bb0(%value: f16, %out: f32):
+          %widened = arith.extf %value : f16 to f32
+          linalg.yield %widened : f32
+      } -> tensor<1x?x?xf32>
+      iree_tensor_ext.dispatch.tensor.store %final_inner, %final_shaped,
+          offsets = [0, 0, 0],
+          sizes = [1, %tokens_size, %channels_size],
+          strides = [1, 1, 1]
+          : tensor<1x?x?xf32>
+          -> !iree_tensor_ext.dispatch.tensor<writeonly:tensor<1x?x?xf32>>{
+              %tokens_size, %channels_size}
+      flow.return
+    } count(%tokens_workload: index, %channels_workload: index) -> (index, index, index) {
+      %x, %y, %z = iree_tensor_ext.dispatch.workgroup_count_from_slice(
+          %tokens_workload, %channels_workload)
+      flow.return %x, %y, %z : index, index, index
+    }
+
+    util.return %final : tensor<1x?x?xf32>
+  }
+
+  // Two-tensor element-wise `multiply`, rank 3. The shape a compiled model
+  // actually presents: ONNX `Add`/`Mul`/`Sub` reach the spec as a
+  // `linalg.generic` over `1x?x?` with an `arith.mulf` body (verified
+  // by compiling a torch-onnx probe to `--compile-to=preprocessing`), not as
+  // a `linalg.add` named op and not as `linalg.elementwise`.
+  //
+  // `1 x T x C` maps to the hardware cube as width = T, height = 1,
+  // channels = C: the trailing dimension is innermost in memory and is what
+  // NC1HWC2 packs into feature atoms, and the leading 1 is the batch the
+  // matcher pins. For ViT that is 197 tokens of 768 (or 3072) channels.
+  //
+  // There is no init to fold in, unlike the pooling shims: `O = A multiply B`
+  // writes every element, so the `outs` operand is a pure destination and
+  // the CPU epilogue only has to widen f16 back to f32.
+  util.func private @call_rocket_elementwise_mul(
+      %lhs: tensor<1x?x?xf32>,
+      %rhs: tensor<1x?x?xf32>,
+      %init: tensor<1x?x?xf32>) -> tensor<1x?x?xf32> {
+    %c1 = arith.constant 1 : index
+    %c2 = arith.constant 2 : index
+
+    %tokens = tensor.dim %lhs, %c1 : tensor<1x?x?xf32>
+    %channels = tensor.dim %lhs, %c2 : tensor<1x?x?xf32>
+
+    %width_i32 = arith.index_cast %tokens : index to i32
+    %channels_i32 = arith.index_cast %channels : index to i32
+    // Height is 1: a rank-3 token tensor is one row of `tokens` pixels.
+    %height_i32 = arith.constant 1 : i32
+
+    // The EW datapath is fp16; the model's tensors are f32.
+    %lhs_f16_empty = tensor.empty(%tokens, %channels) : tensor<1x?x?xf16>
+    %lhs_f16 = linalg.generic {
+        indexing_maps = [
+          affine_map<(d0, d1, d2) -> (d0, d1, d2)>,
+          affine_map<(d0, d1, d2) -> (d0, d1, d2)>
+        ],
+        iterator_types = ["parallel", "parallel", "parallel"]
+      } ins(%lhs : tensor<1x?x?xf32>)
+        outs(%lhs_f16_empty : tensor<1x?x?xf16>) {
+      ^bb0(%value: f32, %out: f16):
+        %narrowed = arith.truncf %value : f32 to f16
+        linalg.yield %narrowed : f16
+    } -> tensor<1x?x?xf16>
+
+    %rhs_f16_empty = tensor.empty(%tokens, %channels) : tensor<1x?x?xf16>
+    %rhs_f16 = linalg.generic {
+        indexing_maps = [
+          affine_map<(d0, d1, d2) -> (d0, d1, d2)>,
+          affine_map<(d0, d1, d2) -> (d0, d1, d2)>
+        ],
+        iterator_types = ["parallel", "parallel", "parallel"]
+      } ins(%rhs : tensor<1x?x?xf32>)
+        outs(%rhs_f16_empty : tensor<1x?x?xf16>) {
+      ^bb0(%value: f32, %out: f16):
+        %narrowed = arith.truncf %value : f32 to f16
+        linalg.yield %narrowed : f16
+    } -> tensor<1x?x?xf16>
+
+    %combined = flow.dispatch
+        @rocket_elementwise_mul_executable::@rocket_elementwise_mul_v1::@rocket_elementwise_mul(
+          %width_i32, %height_i32, %channels_i32,
+          %lhs_f16, %rhs_f16)
+        {stream.affinity = #hal.device.affinity<@rocket_device>}
+        : (i32, i32, i32,
+           tensor<1x?x?xf16>{%tokens, %channels},
+           tensor<1x?x?xf16>{%tokens, %channels})
+        -> tensor<1x?x?xf16>{%tokens, %channels}
+
+    // Explicitly a CPU dispatch, for the reason the pooling shims record: an
+    // op that consumes the Rocket result inherits its affinity, gets formed
+    // into an executable for the rocket device, and that executable has no
+    // element-wise config to serialize. The failure is a serialization error
+    // naming a missing `width`, a long way from the cause.
+    %final = flow.dispatch.workgroups[%tokens, %channels](
+        %combined, %tokens, %channels)
+        : (tensor<1x?x?xf16>{%tokens, %channels}, index, index)
+        -> tensor<1x?x?xf32>{%tokens, %channels}
+        attributes { stream.affinity = #hal.device.affinity<@cpu_device> } =
+        (%combined_binding: !iree_tensor_ext.dispatch.tensor<readonly:tensor<1x?x?xf16>>,
+         %tokens_arg: index,
+         %channels_arg: index,
+         %final_binding: !iree_tensor_ext.dispatch.tensor<writeonly:tensor<1x?x?xf32>>) {
+      %tokens_size = iree_tensor_ext.dispatch.workload.ordinal %tokens_arg, 0 : index
+      %channels_size = iree_tensor_ext.dispatch.workload.ordinal %channels_arg, 1 : index
+      %combined_shaped = flow.dispatch.tie_shape %combined_binding
+          : !iree_tensor_ext.dispatch.tensor<readonly:tensor<1x?x?xf16>>{
+              %tokens_size, %channels_size}
+      %final_shaped = flow.dispatch.tie_shape %final_binding
+          : !iree_tensor_ext.dispatch.tensor<writeonly:tensor<1x?x?xf32>>{
+              %tokens_size, %channels_size}
+      %combined_loaded = iree_tensor_ext.dispatch.tensor.load %combined_shaped,
+          offsets = [0, 0, 0],
+          sizes = [1, %tokens_size, %channels_size],
+          strides = [1, 1, 1]
+          : !iree_tensor_ext.dispatch.tensor<readonly:tensor<1x?x?xf16>>{
+              %tokens_size, %channels_size}
+          -> tensor<1x?x?xf16>
+      %final_empty = tensor.empty(%tokens_size, %channels_size) : tensor<1x?x?xf32>
+      %final_inner = linalg.generic {
+          indexing_maps = [
+            affine_map<(d0, d1, d2) -> (d0, d1, d2)>,
+            affine_map<(d0, d1, d2) -> (d0, d1, d2)>
+          ],
+          iterator_types = ["parallel", "parallel", "parallel"]
+        } ins(%combined_loaded : tensor<1x?x?xf16>)
+          outs(%final_empty : tensor<1x?x?xf32>) {
+        ^bb0(%value: f16, %out: f32):
+          %widened = arith.extf %value : f16 to f32
+          linalg.yield %widened : f32
+      } -> tensor<1x?x?xf32>
+      iree_tensor_ext.dispatch.tensor.store %final_inner, %final_shaped,
+          offsets = [0, 0, 0],
+          sizes = [1, %tokens_size, %channels_size],
+          strides = [1, 1, 1]
+          : tensor<1x?x?xf32>
+          -> !iree_tensor_ext.dispatch.tensor<writeonly:tensor<1x?x?xf32>>{
+              %tokens_size, %channels_size}
+      flow.return
+    } count(%tokens_workload: index, %channels_workload: index) -> (index, index, index) {
+      %x, %y, %z = iree_tensor_ext.dispatch.workgroup_count_from_slice(
+          %tokens_workload, %channels_workload)
+      flow.return %x, %y, %z : index, index, index
+    }
+
+    util.return %final : tensor<1x?x?xf32>
   }
 
   // Max pool, NHWC, stride 1. NHWC is the hardware's own layout, so unlike the
@@ -4018,6 +4481,199 @@ module attributes {transform.with_named_sequence} {
   // Stride 1 and 2 only: 2 is measured against the oracle in
   // `pooling_oracle_hw.rs`, and nothing above it is.
 
+
+  // ONNX `Add` on a rank-3 token tensor, as it actually reaches this loop.
+  //
+  // The op form here is not obvious and was established by running a
+  // torch-onnx probe through this very spec. The ONNX path produces a
+  // `linalg.generic` with an `arith.addf` body -- but `@__transform_main`
+  // runs `linalg-specialize-generic-ops` twice, with canonicalization
+  // between, and by the time this loop runs the op has been specialized into
+  // the named `linalg.add`. A matcher written against the generic form
+  // matches nothing and says nothing about why. (It is also not
+  // `linalg.elementwise`, which this build's linalg does define.)
+  //
+  // Matching the named op means no `cast_compatible_dag_from_root` is
+  // needed: the operation name already says the body is exactly this
+  // arithmetic, so there is no subgraph to describe and none of that op's
+  // silent-decline traps to fall into.
+  transform.named_sequence @match_elementwise_add_f32(
+      %root: !transform.any_op {transform.readonly}) -> !transform.any_op {
+    transform.match.operation_name %root ["linalg.add"] : !transform.any_op
+
+    %lhs_value = transform.get_operand %root[0] : (!transform.any_op) -> !transform.any_value
+    %rhs_value = transform.get_operand %root[1] : (!transform.any_op) -> !transform.any_value
+
+    // Rank 3, `1 x tokens x channels`, mapped to the hardware cube as
+    // width = tokens, height = 1, channels = channels: the trailing
+    // dimension is innermost in memory and is what NC1HWC2 packs into
+    // feature atoms. Requiring the leading extent to be 1 is what makes
+    // that mapping sound -- a real batch would need a fourth extent the
+    // cube does not have.
+    transform.iree.match.dim_bounds %lhs_value[0], umin = 1, umax = 1 : !transform.any_value
+    // Tokens. Board-measured to 197 (ViT's sequence length) by
+    // `ew_binary_hw`; nothing wider has been run, so nothing wider is
+    // admitted.
+    transform.iree.match.dim_bounds %lhs_value[1], umin = 1, umax = 197 : !transform.any_value
+    // Channels. Board-measured to 3072, ViT-base's MLP hidden width -- 384
+    // fp16 surfaces. That ladder's previous ceiling was 64 channels, which
+    // would have been a careless bound to set this from.
+    transform.iree.match.dim_bounds %lhs_value[2], umin = 1, umax = 3072 : !transform.any_value
+
+    // The second operand must be the same cube, not a broadcast: this kernel
+    // has one geometry for both inputs and the result.
+    transform.iree.match.dim_bounds %rhs_value[0], umin = 1, umax = 1 : !transform.any_value
+    transform.iree.match.dim_bounds %rhs_value[1], umin = 1, umax = 197 : !transform.any_value
+    transform.iree.match.dim_bounds %rhs_value[2], umin = 1, umax = 3072 : !transform.any_value
+
+    transform.yield %root : !transform.any_op
+  }
+
+  // ONNX `Sub` on a rank-3 token tensor, as it actually reaches this loop.
+  //
+  // The op form here is not obvious and was established by running a
+  // torch-onnx probe through this very spec. The ONNX path produces a
+  // `linalg.generic` with an `arith.subf` body -- but `@__transform_main`
+  // runs `linalg-specialize-generic-ops` twice, with canonicalization
+  // between, and by the time this loop runs the op has been specialized into
+  // the named `linalg.sub`. A matcher written against the generic form
+  // matches nothing and says nothing about why. (It is also not
+  // `linalg.elementwise`, which this build's linalg does define.)
+  //
+  // Matching the named op means no `cast_compatible_dag_from_root` is
+  // needed: the operation name already says the body is exactly this
+  // arithmetic, so there is no subgraph to describe and none of that op's
+  // silent-decline traps to fall into.
+  transform.named_sequence @match_elementwise_sub_f32(
+      %root: !transform.any_op {transform.readonly}) -> !transform.any_op {
+    transform.match.operation_name %root ["linalg.sub"] : !transform.any_op
+
+    %lhs_value = transform.get_operand %root[0] : (!transform.any_op) -> !transform.any_value
+    %rhs_value = transform.get_operand %root[1] : (!transform.any_op) -> !transform.any_value
+
+    // Rank 3, `1 x tokens x channels`, mapped to the hardware cube as
+    // width = tokens, height = 1, channels = channels: the trailing
+    // dimension is innermost in memory and is what NC1HWC2 packs into
+    // feature atoms. Requiring the leading extent to be 1 is what makes
+    // that mapping sound -- a real batch would need a fourth extent the
+    // cube does not have.
+    transform.iree.match.dim_bounds %lhs_value[0], umin = 1, umax = 1 : !transform.any_value
+    // Tokens. Board-measured to 197 (ViT's sequence length) by
+    // `ew_binary_hw`; nothing wider has been run, so nothing wider is
+    // admitted.
+    transform.iree.match.dim_bounds %lhs_value[1], umin = 1, umax = 197 : !transform.any_value
+    // Channels. Board-measured to 3072, ViT-base's MLP hidden width -- 384
+    // fp16 surfaces. That ladder's previous ceiling was 64 channels, which
+    // would have been a careless bound to set this from.
+    transform.iree.match.dim_bounds %lhs_value[2], umin = 1, umax = 3072 : !transform.any_value
+
+    // The second operand must be the same cube, not a broadcast: this kernel
+    // has one geometry for both inputs and the result.
+    transform.iree.match.dim_bounds %rhs_value[0], umin = 1, umax = 1 : !transform.any_value
+    transform.iree.match.dim_bounds %rhs_value[1], umin = 1, umax = 197 : !transform.any_value
+    transform.iree.match.dim_bounds %rhs_value[2], umin = 1, umax = 3072 : !transform.any_value
+
+    transform.yield %root : !transform.any_op
+  }
+
+  // ONNX `Mul` on a rank-3 token tensor, as it actually reaches this loop.
+  //
+  // The op form here is not obvious and was established by running a
+  // torch-onnx probe through this very spec. The ONNX path produces a
+  // `linalg.generic` with an `arith.mulf` body -- but `@__transform_main`
+  // runs `linalg-specialize-generic-ops` twice, with canonicalization
+  // between, and by the time this loop runs the op has been specialized into
+  // the named `linalg.mul`. A matcher written against the generic form
+  // matches nothing and says nothing about why. (It is also not
+  // `linalg.elementwise`, which this build's linalg does define.)
+  //
+  // Matching the named op means no `cast_compatible_dag_from_root` is
+  // needed: the operation name already says the body is exactly this
+  // arithmetic, so there is no subgraph to describe and none of that op's
+  // silent-decline traps to fall into.
+  transform.named_sequence @match_elementwise_mul_f32(
+      %root: !transform.any_op {transform.readonly}) -> !transform.any_op {
+    transform.match.operation_name %root ["linalg.mul"] : !transform.any_op
+
+    %lhs_value = transform.get_operand %root[0] : (!transform.any_op) -> !transform.any_value
+    %rhs_value = transform.get_operand %root[1] : (!transform.any_op) -> !transform.any_value
+
+    // Rank 3, `1 x tokens x channels`, mapped to the hardware cube as
+    // width = tokens, height = 1, channels = channels: the trailing
+    // dimension is innermost in memory and is what NC1HWC2 packs into
+    // feature atoms. Requiring the leading extent to be 1 is what makes
+    // that mapping sound -- a real batch would need a fourth extent the
+    // cube does not have.
+    transform.iree.match.dim_bounds %lhs_value[0], umin = 1, umax = 1 : !transform.any_value
+    // Tokens. Board-measured to 197 (ViT's sequence length) by
+    // `ew_binary_hw`; nothing wider has been run, so nothing wider is
+    // admitted.
+    transform.iree.match.dim_bounds %lhs_value[1], umin = 1, umax = 197 : !transform.any_value
+    // Channels. Board-measured to 3072, ViT-base's MLP hidden width -- 384
+    // fp16 surfaces. That ladder's previous ceiling was 64 channels, which
+    // would have been a careless bound to set this from.
+    transform.iree.match.dim_bounds %lhs_value[2], umin = 1, umax = 3072 : !transform.any_value
+
+    // The second operand must be the same cube, not a broadcast: this kernel
+    // has one geometry for both inputs and the result.
+    transform.iree.match.dim_bounds %rhs_value[0], umin = 1, umax = 1 : !transform.any_value
+    transform.iree.match.dim_bounds %rhs_value[1], umin = 1, umax = 197 : !transform.any_value
+    transform.iree.match.dim_bounds %rhs_value[2], umin = 1, umax = 3072 : !transform.any_value
+
+    transform.yield %root : !transform.any_op
+  }
+
+  transform.named_sequence @cast_and_call_elementwise_add(%root: !transform.any_op {transform.readonly}) {
+    %ins = transform.get_operand %root[all] : (!transform.any_op) -> !transform.any_value
+    %out = transform.get_result %root[all] : (!transform.any_op) -> !transform.any_value
+    %module = transform.util.get_nearest_symbol_table %root : (!transform.any_op) -> !transform.any_op
+    %topology_attr = transform.param.constant #hal.device.topology<links = [
+        (@rocket_device -> @cpu_device = {transparent_access = true, unified_memory = true}),
+        (@cpu_device -> @rocket_device = {transparent_access = true, unified_memory = true})
+      ]> -> !transform.any_param
+    transform.annotate %module "stream.topology" = %topology_attr : !transform.any_op, !transform.any_param
+    %executable = transform.util.import_symbol @rocket_elementwise_add_executable into %module if undefined : (!transform.any_op) -> !transform.any_op
+    %func = transform.util.import_symbol @call_rocket_elementwise_add into %module if undefined : (!transform.any_op) -> !transform.any_op
+    transform.util.cast_and_call %func(%ins) -> %out after %root {
+          transform.type_conversion.tensor.cast_shape_dynamic_dims
+      } : (!transform.any_op, !transform.any_value, !transform.any_value, !transform.any_op) -> !transform.any_op
+    transform.yield
+  }
+
+  transform.named_sequence @cast_and_call_elementwise_sub(%root: !transform.any_op {transform.readonly}) {
+    %ins = transform.get_operand %root[all] : (!transform.any_op) -> !transform.any_value
+    %out = transform.get_result %root[all] : (!transform.any_op) -> !transform.any_value
+    %module = transform.util.get_nearest_symbol_table %root : (!transform.any_op) -> !transform.any_op
+    %topology_attr = transform.param.constant #hal.device.topology<links = [
+        (@rocket_device -> @cpu_device = {transparent_access = true, unified_memory = true}),
+        (@cpu_device -> @rocket_device = {transparent_access = true, unified_memory = true})
+      ]> -> !transform.any_param
+    transform.annotate %module "stream.topology" = %topology_attr : !transform.any_op, !transform.any_param
+    %executable = transform.util.import_symbol @rocket_elementwise_sub_executable into %module if undefined : (!transform.any_op) -> !transform.any_op
+    %func = transform.util.import_symbol @call_rocket_elementwise_sub into %module if undefined : (!transform.any_op) -> !transform.any_op
+    transform.util.cast_and_call %func(%ins) -> %out after %root {
+          transform.type_conversion.tensor.cast_shape_dynamic_dims
+      } : (!transform.any_op, !transform.any_value, !transform.any_value, !transform.any_op) -> !transform.any_op
+    transform.yield
+  }
+
+  transform.named_sequence @cast_and_call_elementwise_mul(%root: !transform.any_op {transform.readonly}) {
+    %ins = transform.get_operand %root[all] : (!transform.any_op) -> !transform.any_value
+    %out = transform.get_result %root[all] : (!transform.any_op) -> !transform.any_value
+    %module = transform.util.get_nearest_symbol_table %root : (!transform.any_op) -> !transform.any_op
+    %topology_attr = transform.param.constant #hal.device.topology<links = [
+        (@rocket_device -> @cpu_device = {transparent_access = true, unified_memory = true}),
+        (@cpu_device -> @rocket_device = {transparent_access = true, unified_memory = true})
+      ]> -> !transform.any_param
+    transform.annotate %module "stream.topology" = %topology_attr : !transform.any_op, !transform.any_param
+    %executable = transform.util.import_symbol @rocket_elementwise_mul_executable into %module if undefined : (!transform.any_op) -> !transform.any_op
+    %func = transform.util.import_symbol @call_rocket_elementwise_mul into %module if undefined : (!transform.any_op) -> !transform.any_op
+    transform.util.cast_and_call %func(%ins) -> %out after %root {
+          transform.type_conversion.tensor.cast_shape_dynamic_dims
+      } : (!transform.any_op, !transform.any_value, !transform.any_value, !transform.any_op) -> !transform.any_op
+    transform.yield
+  }
+
   transform.named_sequence @match_pooling_nhwc_max(%root: !transform.any_op {transform.readonly}) -> !transform.any_op {
     transform.match.operation_name %root ["linalg.pooling_nhwc_max"] : !transform.any_op
     %batch, %out_img, %out_ch, %filter, %in_ch, %depth, %strides, %dilations =
@@ -6103,7 +6759,25 @@ module attributes {transform.with_named_sequence} {
         // (7.2e-07 against a plain f32 build). The isolated stem convolution
         // itself is correct on hardware to f16 epsilon, so this is the cost
         // of f16, not of the NPU being wrong.
+        //
+        // The three element-wise entries below are commented out on purpose,
+        // and this marker is load-bearing: `rocket-compiler --elementwise`
+        // uncomments exactly the lines carrying it, and nothing else does.
+        // ROADMAP Phase 1 requires these matchers to land behind a flag
+        // rather than in the default list, because ISSUES.md P8 measured that
+        // at the current per-dispatch cost more offload sites make a model
+        // slower -- an element-wise op does less arithmetic than its own
+        // dispatch tax. Shipping them on by default would regress every
+        // model P8 measured.
+        //
+        // They are written here, next to the entries they would join, rather
+        // than injected from Rust, so that the enabled and disabled specs
+        // differ by three characters per line and the list stays readable and
+        // maintainable in one place.
         transform.foreach_match in %func
+//@ROCKET_ELEMENTWISE@            @match_elementwise_add_f32 -> @cast_and_call_elementwise_add,
+//@ROCKET_ELEMENTWISE@            @match_elementwise_sub_f32 -> @cast_and_call_elementwise_sub,
+//@ROCKET_ELEMENTWISE@            @match_elementwise_mul_f32 -> @cast_and_call_elementwise_mul,
             @match_pooling_nchw_sum_avg -> @cast_and_call_pooling_avg_nchw,
             @match_pooling_nhwc_sum_avg -> @cast_and_call_pooling_avg_nhwc,
             @match_pooling_nhwc_max -> @cast_and_call_pooling_max_nhwc,

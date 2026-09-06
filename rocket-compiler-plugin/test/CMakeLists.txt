@@ -9,6 +9,7 @@ iree_lit_test_suite(
     "rocket_expand_onnx_conv_integer.mlir"
     "rocket_elementwise_unary.mlir"
     "rocket_elementwise_binary.mlir"
+    "rocket_elementwise_match_boundaries.mlir"
     "rocket_elementwise_div_invalid.mlir"
     "rocket_elementwise_lut.mlir"
     "rocket_elementwise_lut_dynamic.mlir"
