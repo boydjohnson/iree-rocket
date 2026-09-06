@@ -129,29 +129,41 @@ fn replace_bound(line: &mut String, key: &str) -> bool {
     true
 }
 
-/// The matcher half of every `@matcher -> @action` pair in the spec's
-/// `transform.foreach_match` list.
+/// The matcher half of every `@matcher -> @action` pair in **every**
+/// `transform.foreach_match` list in the spec.
 ///
-/// Read from the list rather than from the `@match_*` naming convention: the
-/// spec defines matchers that the list does not use (the s3/s4 dense ones),
-/// and a matcher that is never invoked cannot offload anything, so demanding
-/// bounds of it would fail the build for no reason.
+/// Read from the lists rather than from the `@match_*` naming convention: the
+/// spec defines matchers that no list uses (the s3/s4 dense ones), and a
+/// matcher that is never invoked cannot offload anything, so demanding bounds
+/// of it would fail the build for no reason.
+///
+/// All of them, not just the first: the spec has run more than one match loop
+/// since the requantized int8 path landed, and a matcher in a later loop
+/// offloads exactly as much as one in the first. Reading only the first list
+/// left the rest unchecked, so a `--no-offload` baseline built from this spec
+/// would have quietly offloaded them -- the precise failure this module
+/// exists to prevent, and it went unnoticed because the shipped-spec test
+/// asserted a *lower bound* on the matcher count that the first list alone
+/// could not meet.
 fn foreach_match_matchers(spec: &str) -> BTreeSet<&str> {
+    const LOOP: &str = "transform.foreach_match";
     let mut matchers = BTreeSet::new();
-    let Some(start) = spec.find("transform.foreach_match") else {
-        return matchers;
-    };
-    // The list ends at the op's type signature; everything before it is the
-    // `in %handle @a -> @b, ...` clause.
-    let body = &spec[start..];
-    let end = body.find(" : (").unwrap_or(body.len());
-    for pair in body[..end].split(',') {
-        let Some((lhs, _)) = pair.split_once("->") else {
-            continue;
-        };
-        if let Some(name) = symbol_after_last_at(lhs) {
-            matchers.insert(name);
+    let mut search = 0usize;
+    while let Some(offset) = spec[search..].find(LOOP) {
+        let start = search + offset;
+        // The list ends at the op's type signature; everything before it is
+        // the `in %handle @a -> @b, ...` clause.
+        let body = &spec[start..];
+        let end = body.find(" : (").unwrap_or(body.len());
+        for pair in body[..end].split(',') {
+            let Some((lhs, _)) = pair.split_once("->") else {
+                continue;
+            };
+            if let Some(name) = symbol_after_last_at(lhs) {
+                matchers.insert(name);
+            }
         }
+        search = start + LOOP.len();
     }
     matchers
 }
@@ -269,6 +281,41 @@ mod tests {
         let message = err.to_string();
         assert!(message.contains("@match_c"), "{message}");
         assert!(!message.contains("@match_a"), "{message}");
+    }
+
+    #[test]
+    fn every_foreach_match_list_is_read() {
+        // The shipped spec runs a second match loop for the requantized int8
+        // path. A matcher there offloads exactly as much as one in the first
+        // loop, so it has to be checked for bounds too -- reading only the
+        // first list is how a "CPU-only" baseline silently offloads.
+        let spec = SPEC.replace(
+            "      : (!transform.any_op) -> (!transform.any_op)\n  }",
+            "      : (!transform.any_op) -> (!transform.any_op)\n    \
+             transform.foreach_match in %requant_func\n        \
+             @match_c -> @cast_and_call_a\n      \
+             : (!transform.any_op) -> (!transform.any_op)\n  }",
+        );
+        let unconstrained = spec.replace(
+            "  transform.named_sequence @cast_and_call_a",
+            "  transform.named_sequence @match_c(%arg: !transform.any_op) {\n    \
+             transform.yield %arg : !transform.any_op\n  }\n  \
+             transform.named_sequence @cast_and_call_a",
+        );
+        let err = neutralize(&unconstrained)
+            .expect_err("a second loop's unconstrained matcher must be refused");
+        assert!(err.to_string().contains("@match_c"), "{err}");
+
+        let constrained = spec.replace(
+            "  transform.named_sequence @cast_and_call_a",
+            "  transform.named_sequence @match_c(%arg: !transform.any_op) {\n    \
+             transform.iree.match.dim_bounds %input_value[3], umin = 1, umax = 512 \
+             : !transform.any_value\n    \
+             transform.yield %arg : !transform.any_op\n  }\n  \
+             transform.named_sequence @cast_and_call_a",
+        );
+        let out = neutralize(&constrained).expect("a bounded matcher in either loop is fine");
+        assert_eq!(out.matchers, 3);
     }
 
     #[test]

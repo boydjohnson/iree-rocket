@@ -324,7 +324,9 @@ can go sick until reboot, so measure one shape per process.
 ### Phase 3 -- fusion, which is where the throughput actually is
 
 This is P8's lever **#2**, and the only phase in this document that makes a
-model faster.
+model faster. **Confirmed 2026-09-06, with a number: 1.80x faster than the
+CPU arm on a full machine and level with it at two cores, from 1.5x slower.** See the requantized-path note
+at the end of this section.
 
 - `build_conv_then_lut_regcmd` and `build_conv_then_add_regcmd` are built,
   board-tested, and unreachable. Give them a wire representation as an
@@ -341,6 +343,74 @@ model faster.
 The requantized int8 path is the existence proof that this works -- it already
 fuses requantization into the conv dispatch, which is why it returns `i8` with
 no CPU epilogue at all.
+
+**Started 2026-09-06, and the first move was to put that existence proof in the
+tree.** It was not there: the whole path -- `Conv2DQuantParam` and
+`runtime_quantization` on the wire, the driver's `RuntimeConv2dQuantParam`,
+`#rocket_dynamic_int8_requant_target`, both requantized matchers, the lit test
+and the e2e fixtures -- had been sitting unmerged on
+`feature/more-mobilenetv2-convs` since 2026-09-03 while `main` moved twelve
+commits past it. Both this file and ISSUES.md P8 were ranking work against
+code no checkout contained. It is now on `main` and board-validated: the full
+`tools/e2e_conv_regression.py --board planck` gate is green, including
+`requant_int8_1x1_cin512` and `requant_int8_3x3_cin256` at max|error| 1 with
+0 mismatches, which is the documented tie-rounding difference and not a defect.
+
+**What is left is one compiler pass, and its shape is now known.** Measured on
+`mobilenetv2.static-int8.onnx` (47 `onnx.QLinearConv`): after the spec's
+`iree-global-opt-quantized-conv-to-conv`, all 34 dense convolutions still go
+to the *accumulator* executable, because the requantized matcher's canonical
+form is one convolution plus **one** elementwise generic and what the model
+actually produces is a chain of five:
+
+1. add the per-channel `i32` bias,
+2. reduce the (constant) filter to `sum_k(w)` and subtract `x_zp * sum_k(w)`,
+3. transpose NHWC -> NCHW,
+4. `sitofp` and multiply by `x_scale * w_scale`,
+5. divide by `y_scale`, round, offset by `y_zp`, clamp and narrow to 8 bits.
+
+Steps 1 and 2 fold to a single constant per-channel bias, because the filter is
+constant. Steps 4 and 5 collapse into the canonical generic. That is the pass.
+
+**Built 2026-09-06 as `rocket-fuse-int8-requant-epilogue`, and a real model
+reaches the requantized path for the first time: 15 of MobileNetV2's dense
+convolutions.** It is as accurate as the accumulator build it replaces
+(max|diff| 0.334 against a CPU arm, against the accumulator build's 0.396,
+same top-5). The bounds were then raised on measurement the same day -- `Cin` 512 -> 816
+and `Cout` 768 -> 1792 -- taking it to **29 of 34**, still at baseline
+accuracy (max|diff| 0.336, argmax and top-5 unchanged).
+
+**And it is faster, which is the first time anything in this document has
+been.** Measured on `planck` over six interleaved passes: **1.54x faster than
+a like-for-like CPU build on a full machine** (173.5 ms against 267.0),
+1.40x faster on four A76s, and 23-30% faster than the accumulator build it
+replaces at every core allocation. **Extending the same treatment to the 13
+depthwise convolutions took it to 1.80x faster (148.5 ms) and to parity at
+two cores**, the allocation that had punished the offload in every earlier
+measurement. The accumulator build was 1.5x *slower*
+than the same CPU arm. `ROCKET_PROFILE` puts the largest single term in
+compaction, more than halved, which is the mechanism doing exactly what it
+was supposed to: `i8` output instead of `i32` is a quarter of the bytes to
+compact. ISSUES.md carries the table and the protocol. `Cin` stops at 816
+rather than the 1792 every isolated instrument supports because the model
+says so: see ISSUES.md's "Cin 1344 is exact in every isolated test and wrong
+inside the model".
+
+The model also found a hardware limit no fixture had: **`Cout = 24` is wrong
+on the requantized path.** Admitting that one convolution moves the model's
+logits from max|diff| 0.40 to 4.71 and the mean from 0.07 to 0.99 against a
+logit standard deviation of 1.17 -- the output stops being a classification.
+`Cout` 88 is exact and is not a whole number of 16-channel atoms either, so
+the rule is not "whole atoms"; 24 is simply below the smallest `Cout`
+measured correct. Both requantized matchers now carry `umin = 32`.
+
+Two questions that looked like blockers and are not: the activations are ONNX
+`ui8`, but `quantized-conv-to-conv` has already folded the unsigned-to-signed
+shift into the zero point (30 of the 34 carry `x_zp = -128`), so the bytes the
+NPU sees are already right; and the model's `Clip` (ReLU6) happens in `f32`
+after requantization, so it stays a CPU pass and does not have to be part of
+the fused form. The one real difference left to reconcile is that the model
+narrows with `arith.fptoui` where the canonical form pins `arith.fptosi`.
 
 ### Phase 4 -- write the refusals down
 

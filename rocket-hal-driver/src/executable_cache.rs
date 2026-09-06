@@ -49,7 +49,7 @@ use crate::{
     },
     executable::{
         Conv2dExecutable, MatmulExecutable, PoolingExecutable, RuntimeConv2dDimension,
-        RuntimeMatmulDimension, RuntimePoolingDimension, UkernelShape,
+        RuntimeConv2dQuantParam, RuntimeMatmulDimension, RuntimePoolingDimension, UkernelShape,
     },
     status,
 };
@@ -94,7 +94,18 @@ fn decode_precision(
     input_scale: f32,
     weights_scale: f32,
     output_scale: f32,
+    runtime_output_scale: bool,
 ) -> Result<Precision, ()> {
+    // A dispatch-supplied output scale is zero in the table -- the serializer
+    // enforces that, because zero is not a legal scale and so cannot be
+    // mistaken for calibration data. Substitute a unit scale to build a
+    // placeholder multiplier; `Conv2dExecutable::resolve_shape` replaces it
+    // with the real one before any register command is built.
+    let output_scale = if runtime_output_scale {
+        1.0
+    } else {
+        output_scale
+    };
     match precision {
         schema::Precision::INT8 | schema::Precision::INT8_ACCUMULATOR => {
             if !input_scale.is_finite()
@@ -107,8 +118,16 @@ fn decode_precision(
                 return Err(());
             }
             let ratio = f64::from(input_scale) * f64::from(weights_scale) / f64::from(output_scale);
-            let multiplier =
-                std::panic::catch_unwind(|| Multiplier::from_ratio(ratio)).map_err(|_| ())?;
+            // `from_ratio`, not `for_unit_bs`: the BS plane this driver packs
+            // carries `BS_UNIT_MULTIPLIER` and `DPU_BS_MUL_CFG.bs_mul_shift_value`
+            // cancels it exactly, so the stage's gain is 1 and OUT_CVT alone
+            // carries the requantization. Measured on `planck` 2026-09-03
+            // through the compiled requantized path: dividing the ratio by
+            // `BS_UNIT_MULTIPLIER >> BS_MULTIPLIER_SHIFT` (= 128) as
+            // `Multiplier::for_unit_bs` does made every output exactly 128
+            // times too small -- an int8 result of -1/0/1 against a CPU
+            // reference spanning the full range.
+            let multiplier = Multiplier::try_from_ratio(ratio).map_err(|_| ())?;
             let quantization = Quantization {
                 input_zero_point: input_zero_point as i32,
                 output_zero_point: output_zero_point as i32,
@@ -160,6 +179,29 @@ fn decode_flatbuffer_shape(data: &[u8]) -> Result<UkernelShape, ()> {
     match export.kernel_type() {
         schema::KernelDef::Conv2DDef => {
             let conv_def = export.kernel_as_conv_2ddef().ok_or(())?;
+            let mut runtime_quantization = Vec::new();
+            if let Some(params) = conv_def.runtime_quantization() {
+                for index in 0..params.len() {
+                    runtime_quantization.push(match params.get(index) {
+                        schema::Conv2DQuantParam::OUTPUT_SCALE => {
+                            RuntimeConv2dQuantParam::OutputScale
+                        }
+                        schema::Conv2DQuantParam::INPUT_ZERO_POINT => {
+                            RuntimeConv2dQuantParam::InputZeroPoint
+                        }
+                        schema::Conv2DQuantParam::OUTPUT_ZERO_POINT => {
+                            RuntimeConv2dQuantParam::OutputZeroPoint
+                        }
+                        // Unknown to this runtime: a value from a newer
+                        // schema. It still consumed a push-constant ordinal on
+                        // the producer's side, so skipping it would shift
+                        // every later constant onto the wrong field -- reject
+                        // the executable, exactly as the dimension vector
+                        // above does.
+                        _ => return Err(()),
+                    });
+                }
+            }
             let precision = decode_precision(
                 conv_def.precision(),
                 conv_def.input_zero_point(),
@@ -168,6 +210,7 @@ fn decode_flatbuffer_shape(data: &[u8]) -> Result<UkernelShape, ()> {
                 conv_def.input_scale(),
                 conv_def.weights_scale(),
                 conv_def.output_scale(),
+                runtime_quantization.contains(&RuntimeConv2dQuantParam::OutputScale),
             )?;
             let shape_template = conv::Shape {
                 width: conv_def.input_width(),
@@ -219,6 +262,7 @@ fn decode_flatbuffer_shape(data: &[u8]) -> Result<UkernelShape, ()> {
                 shape_template,
                 kernels,
                 runtime_dimensions,
+                runtime_quantization,
             };
             executable.validate_template().map_err(|_| ())?;
             Ok(UkernelShape::Conv2d(executable))
@@ -386,6 +430,11 @@ fn decode_matmul_shape(
         input_scale,
         weights_scale,
         output_scale,
+        // Neither MatmulDef nor the deprecated FullyConnectedDef has a
+        // `runtime_quantization` vector: the dispatch-supplied output scale
+        // is a Conv2DDef feature, so the scale in the table is always the
+        // real one here.
+        false,
     )?;
     if precision.writes_accumulators() {
         // The exact accumulator path is hardware-validated for Conv2D only;
@@ -742,6 +791,163 @@ mod tests {
         data[8..16].copy_from_slice(&(flatbuffer.len() as u64).to_le_bytes());
         data.extend_from_slice(flatbuffer);
         data
+    }
+
+    /// A requantized int8 conv whose scale and zero points arrive as push
+    /// constants, which is what one shared executable serving many
+    /// convolutions requires.
+    fn encode_requantized_conv_executable(
+        params: &[schema::Conv2DQuantParam],
+        output_scale: f32,
+        input_zero_point: u32,
+        output_zero_point: u32,
+    ) -> Vec<u8> {
+        let mut builder = flatbuffers::FlatBufferBuilder::new();
+        let runtime_dimensions = builder.create_vector(&[
+            schema::Conv2DDimension::INPUT_WIDTH,
+            schema::Conv2DDimension::INPUT_HEIGHT,
+        ]);
+        let runtime_quantization = builder.create_vector(params);
+        let name = builder.create_string("rocket_dynamic_conv_int8_requant");
+        let conv = schema::Conv2DDef::create(
+            &mut builder,
+            &schema::Conv2DDefArgs {
+                input_width: 0,
+                input_height: 0,
+                input_channels: 32,
+                output_channels: 16,
+                weights_width: 1,
+                weights_height: 1,
+                stride: 1,
+                precision: schema::Precision::INT8,
+                input_scale: 1.0,
+                weights_scale: 1.0,
+                output_scale,
+                input_zero_point,
+                output_zero_point,
+                runtime_dimensions: Some(runtime_dimensions),
+                runtime_quantization: Some(runtime_quantization),
+                ..Default::default()
+            },
+        );
+        let export = schema::ExportDef::create(
+            &mut builder,
+            &schema::ExportDefArgs {
+                name: Some(name),
+                kernel_type: schema::KernelDef::Conv2DDef,
+                kernel: Some(conv.as_union_value()),
+            },
+        );
+        let exports = builder.create_vector(&[export]);
+        let executable = schema::ExecutableDef::create(
+            &mut builder,
+            &schema::ExecutableDefArgs {
+                exports: Some(exports),
+            },
+        );
+        schema::finish_executable_def_buffer(&mut builder, executable);
+
+        let flatbuffer = builder.finished_data();
+        let mut data = vec![0u8; IREE_FLATBUFFER_HEADER_SIZE];
+        data[0..4].copy_from_slice(b"RKT1");
+        data[8..16].copy_from_slice(&(flatbuffer.len() as u64).to_le_bytes());
+        data.extend_from_slice(flatbuffer);
+        data
+    }
+
+    const REQUANT_PARAMS: [schema::Conv2DQuantParam; 3] = [
+        schema::Conv2DQuantParam::OUTPUT_SCALE,
+        schema::Conv2DQuantParam::INPUT_ZERO_POINT,
+        schema::Conv2DQuantParam::OUTPUT_ZERO_POINT,
+    ];
+
+    /// The push constants a dispatch pushes, in the order `resolve_shape`
+    /// reads them: dimensions first, then quantization.
+    fn requant_constants(
+        width: u32,
+        height: u32,
+        output_scale: f32,
+        input_zero_point: i32,
+        output_zero_point: i32,
+    ) -> Vec<u8> {
+        [
+            width,
+            height,
+            output_scale.to_bits(),
+            input_zero_point as u32,
+            output_zero_point as u32,
+        ]
+        .into_iter()
+        .flat_map(u32::to_ne_bytes)
+        .collect()
+    }
+
+    #[test]
+    fn resolves_runtime_conv_quantization() {
+        let data = encode_requantized_conv_executable(&REQUANT_PARAMS, 0.0, 0, 0);
+        let UkernelShape::Conv2d(executable) = decode_flatbuffer_shape(&data).unwrap() else {
+            panic!("expected Conv2d");
+        };
+
+        // A negative output zero point is the ordinary case for a ui8-domain
+        // model: `y_zp - 128`. It has to survive the uint32 schema field, so
+        // this is the assertion that pins the two's-complement convention.
+        let constants = requant_constants(32, 32, 0.25, -2, -6);
+        let (shape, _) = executable.resolve_shape(&constants).unwrap();
+        let Precision::Int8(quantization) = shape.precision else {
+            panic!("expected requantized int8");
+        };
+        assert_eq!(quantization.input_zero_point, -2);
+        assert_eq!(quantization.output_zero_point, -6);
+        // input_scale * weights_scale / output_scale = 1 * 1 / 0.25 = 4.
+        assert_eq!(quantization.multiplier, Multiplier::from_ratio(4.0));
+        assert_eq!((shape.width, shape.height), (32, 32));
+    }
+
+    #[test]
+    fn rejects_invalid_runtime_conv_quantization() {
+        let duplicate = encode_requantized_conv_executable(
+            &[
+                schema::Conv2DQuantParam::OUTPUT_SCALE,
+                schema::Conv2DQuantParam::OUTPUT_SCALE,
+            ],
+            0.0,
+            0,
+            0,
+        );
+        assert!(decode_flatbuffer_shape(&duplicate).is_err());
+
+        let unknown =
+            encode_requantized_conv_executable(&[schema::Conv2DQuantParam(99)], 0.0, 0, 0);
+        assert!(decode_flatbuffer_shape(&unknown).is_err());
+
+        // A listed zero point must be zero in the template, or a dispatch that
+        // failed to push one would silently inherit calibration data.
+        let nonzero_template = encode_requantized_conv_executable(&REQUANT_PARAMS, 0.0, 3, 0);
+        assert!(decode_flatbuffer_shape(&nonzero_template).is_err());
+
+        let data = encode_requantized_conv_executable(&REQUANT_PARAMS, 0.0, 0, 0);
+        let UkernelShape::Conv2d(executable) = decode_flatbuffer_shape(&data).unwrap() else {
+            panic!("expected Conv2d");
+        };
+        // Too few constants for the dimensions plus the quantization.
+        let short: Vec<u8> = [32u32, 32].into_iter().flat_map(u32::to_ne_bytes).collect();
+        assert!(executable.resolve_shape(&short).is_err());
+        // A zero output scale is what the template carries as its sentinel; a
+        // dispatch supplying it is a dispatch that pushed nothing.
+        assert!(
+            executable
+                .resolve_shape(&requant_constants(32, 32, 0.0, 0, 0))
+                .is_err()
+        );
+        // Unencodable ratios must be a rejected dispatch, never a panic across
+        // the extern "C" boundary: 1/1e-30 overflows DPU_OUT_CVT_SHIFT's
+        // nonnegative range.
+        assert!(
+            executable
+                .resolve_shape(&requant_constants(32, 32, 1e-30, 0, 0))
+                .is_err()
+        );
     }
 
     #[test]

@@ -791,14 +791,207 @@ Logits are **bit-identical** to the pre-change build (all 1001, max|diff| 0.0)
 NPU sites either way, 148 -> 145 CPU sites from the inline alone); its own
 epilogue still carries a genuine `f16 -> f32` widen and was left alone.
 
+### Measured 2026-09-06: the requantized path makes the int8 offload FASTER than the CPU
+
+This is P8's lever 1, built and measured. **MobileNetV2-static-int8 with 29 of
+its 34 dense convolutions on the requantized path is 1.54x faster than a
+like-for-like CPU build on a full machine**, where the accumulator build it
+replaces was 1.5x *slower*. Same model, same input, same pipeline; the only
+difference between the two offload arms is `rocket-fuse-int8-requant-epilogue`
+and the raised channel bounds.
+
+Protocol, because a number here means nothing without it: `planck`, governor
+`performance` on both A76 clusters, `iree-benchmark-module
+--benchmark_min_time=3s`, six interleaved passes with the arm order rotating
+each pass so no arm is ever always second, a quiet-NPU wait and a 2 s dwell
+before every run. The CPU arm is `rocket-compiler --no-offload`, not plain
+`iree-compile` (see the NHWC baseline trap). Medians of six:
+
+| cpus | cpu-only | accumulator | requantized | requant vs cpu | requant vs accumulator |
+|---|---:|---:|---:|---:|---:|
+| `4,5` | 277.5 ms | 485.0 ms | 371.5 ms | 1.34x slower | **-23.4%** |
+| `4-7` | 277.0 ms | 283.0 ms | 198.0 ms | **1.40x faster** | **-30.0%** |
+| `0-7` | 267.0 ms | 240.5 ms | 173.5 ms | **1.54x faster** | **-27.9%** |
+
+Spread is tight (the `0-7` requantized arm is 172-177 ms across six passes)
+and the CPU arm is 267 ms in all six.
+
+**Where the win is, from `ROCKET_PROFILE` at `0-7`** -- composition only, one
+run each, which is what that instrument is for:
+
+| phase | accumulator | requantized | delta |
+|---|---:|---:|---:|
+| `compact` | 50.3 ms | 21.0 ms | **-29.3** |
+| `outside` | 182.5 ms | 162.5 ms | -20.0 |
+| `wait.npu` | 43.4 ms | 30.6 ms | -12.8 |
+| `record` | 34.4 ms | 26.2 ms | -8.3 |
+| `pack.weights` | 65.8 ms | 65.8 ms | 0 |
+
+Both arms issue the same 47 NPU dispatches, so none of this is dispatch count.
+The largest single term is **compaction, more than halved**, which is the
+mechanism working exactly as stated: the accumulator path writes `i32` through
+128-byte native accumulator blocks, the requantized path writes `i8` into
+16-byte slots, so there is a quarter of the output traffic to compact. `outside`
+falls because the CPU requantization epilogues are gone, and the device itself
+is quicker writing `i8`.
+
+**What this does and does not overturn.** P8's law -- cost is flat per offloaded
+dispatch and it parallelises -- still holds in shape: at `4,5` the requantized
+arm is still 1.34x slower than the CPU, and the offload still needs cores. What
+changed is the constant. The right reading is P8's own: the deficit was `i32`
+activation traffic and unfused epilogues, and removing them removes it.
+`pack.weights` at 65.8 ms is now the largest driver-side phase in both arms and
+is untouched by this work -- it is the next thing to look at, and the weight
+cache reports 0 hits over 49 misses, which is worth a look on its own.
+
+### Where the remaining time is, and two levers measured to be worth nothing
+
+Measured 2026-09-06 on the requantized build, after it started beating the CPU.
+
+**`pack.weights` is a cold-start cost, not a steady-state one.** The single-run
+profile shows 65.8 ms and reads like the largest driver phase; over 35
+inferences it runs **49 times in total**, once per weight binding, with the
+weight cache reporting **1666 hits, 49 misses**. It is doing exactly what
+`weight_cache.rs` says it does. The visible effect is on the first inference
+only:
+
+    1 iteration    262 ms
+    3 iterations   214 ms
+    50 iterations  176 ms
+
+So packing the coefficients at compile time -- expressing the blocked layout
+as MLIR on the constant filter and letting const-eval fold it, with a
+`Conv2DDef` flag telling the driver to skip its packer -- would buy about 68
+of the ~86 ms cold-start penalty and 7.5 MiB of driver cache, and **nothing at
+all in steady state**. Worth doing for first-inference latency; not a
+throughput lever. Weigh it against carrying a second implementation of the
+blocked coefficient layout, which is the kind of duplication that produced the
+depthwise tap-major bug.
+
+**Transpose propagation is still worth nothing, re-measured under conditions
+that had changed.** P8 measured `iree-global-opt-propagate-linalg-transpose`
+at 0% when every transpose fused into an `i32` epilogue that had to run
+anyway. Those epilogues are now gone for 29 convolutions, so the premise
+looked different and it was re-run. It is not:
+
+| placement | 4-7 | 0-7 |
+|---|---:|---:|
+| shipped (29 requant / 5 accumulator) | 198.0 ms | 172.0 ms |
+| + propagation, after the fusion pass | 196.0 ms | 175.5 ms |
+
+-1.0% and **+2.0%**, six interleaved passes each, and it costs the classifier
+matmul its offload exactly as P8 recorded (propagation folds the constant RHS
+transpose into the matmul's indexing maps). Running it *before* the fusion
+pass is worse still: it rearranges the epilogue chain enough that
+`rocket-fuse-int8-requant-epilogue` declines, and placement inverts to 5
+requantized / 29 accumulator. The transposes remain fused into elementwise
+passes that run regardless. **Do not spend on this a third time.**
+
+**What the CPU is actually doing**, 93 dispatch sites in the shipped build,
+by kind:
+
+| count | kind |
+|---:|---|
+| 13 | `elementwise_i32xi32xi32xi8` |
+| 12 | `elementwise_transpose_i8` |
+| 10 | `slow_memcpy` |
+| 9 | `elementwise_i8` |
+| 5 | `transpose_i8` |
+
+The largest category was **one `i32` epilogue per depthwise convolution** --
+all 13 depthwise convolutions were still on the `int8_accumulator` path, each
+materializing an `i32` activation tensor and requantizing it on the CPU, the
+exact cost the dense path had just shed for a 28% win. **That lever was taken
+the same day; the next section has the result.** This breakdown is left as it
+was measured, because it is what pointed at it.
+
+### Requantized depthwise, 2026-09-06: 1.80x faster than the CPU
+
+The follow-through on the section above. All 13 of MobileNetV2's offloaded
+depthwise convolutions moved from `int8_accumulator` to the requantized path,
+so the `elementwise_i32xi32xi32xi8` per layer -- the largest remaining CPU
+dispatch category -- is gone. 42 of the model's 47 convolution dispatches are
+now requantized.
+
+| cpus | cpu-only | dense requant | + depthwise | vs cpu |
+|---|---:|---:|---:|---:|
+| `4,5` | 277.5 ms | 375.0 ms | 279.0 ms | **1.01x -- parity** |
+| `4-7` | 277.0 ms | 196.5 ms | 158.5 ms | **1.75x faster** |
+| `0-7` | 267.0 ms | 171.5 ms | 148.5 ms | **1.80x faster** |
+
+Same protocol as the dense measurement. -13% to -26% against the dense-only
+build. The two-core column is the one to notice: this configuration has
+punished the offload in every measurement this repo has ever taken -- 3.9x
+slower at its worst, 1.34x after the dense conversion -- and it is now level.
+Accuracy is unchanged (max|diff| 0.3298, same argmax and top-5).
+
+The hardware was measured first (`conv_depthwise_requant_hw.rs`, bit-exact at
+six widths including all four MobileNetV2 asks for), so nothing here was built
+on hope.
+
+**A failure mode worth naming, because it is silent.** The first depthwise
+matcher checked for a 1x1 kernel, copied from the dense 1x1 variant, and every
+depthwise convolution in this model is 3x3. It declined everything and the
+accumulator matchers claimed the convolutions straight back: no error, no test
+failure, placement simply unchanged -- exactly what "the matcher does not
+exist" looks like. The only instrument that catches it is a matched-case test
+asserting the dispatch reaches the *specific* executable, which
+`rocket_int8_requant_match.mlir` now carries for both dense and depthwise.
+
+### Cin 1344 is exact in every isolated test and wrong inside the model
+
+Open, 2026-09-06. Raising the requantized matchers' `Cin` bound from 512 to
+1344 puts 32 of MobileNetV2-static-int8's 34 dense convolutions on the
+requantized path and **breaks the model**: logits go from max|diff| 0.33
+against a CPU arm to 5.01, mean 0.07 to 0.92, and the argmax moves from 447
+to 977. Bisected by raising the bound one step at a time -- `Cin` 528 and 816
+are both clean (max 0.43 and 0.33, argmax correct) -- to exactly one
+convolution: **7x7 `Cin` 1344 -> `Cout` 448**.
+
+That convolution is exact everywhere it is tested on its own:
+
+| instrument | result |
+|---|---|
+| `dtype_boundary_probe`, `selectors-affine` | exact |
+| `dtype_boundary_probe`, `onehot` (the addressing-sensitive read map) | exact |
+| `dtype_boundary_probe`, `Cin` ladder to 1792, `Cout` ladder to 2048 | exact |
+| `e2e_conv_regression` at the identical shape | **max error 0**, not 1 |
+| same shape with a million-scale bias (`requant_int8_1x1_large_bias`) | exact |
+
+So neither the shape, the addressing, nor the folded bias magnitude is the
+discriminator, and the compiled differential -- which is the strongest
+instrument here, since it runs the real compiler against a CPU reference on
+real data -- is *bit-exact* for the convolution that ruins the model. What
+differs in the model and not in the fixture is unidentified.
+
+The bound therefore ships at `Cin` 816: the widest the model is measured
+correct at, well below everything the isolated tests support. `Cout` was
+raised 768 -> 1792 in the same session and is clean on the model.
+
+**Do not raise `Cin` past 816 on isolated evidence.** This issue exists
+because isolated evidence said 1792 and the model said 816. The next step is
+an instrument that can see *which* dispatch first diverges inside a real
+model -- comparing intermediate tensors, not logits -- because every
+shape-level instrument this repo has already says the shape is fine.
+
 ### The ranked levers this leaves
 
-1. **Stop materializing `i32` activations and stop leaving their epilogues
-   unfused.** This is the whole 7.4 ms. The structural version is the
-   requantized int8 path (`requantized-int8-conv-path`): it returns `i8` with
-   the bias on the BS plane and no CPU epilogue at all, which removes the
-   `i32` tensor rather than fusing passes over it. What landed above is the
-   cheap half of the same idea.
+1. ~~**Stop materializing `i32` activations and stop leaving their epilogues
+   unfused.**~~ **Done and measured 2026-09-06. This was the whole 7.4 ms, and
+   removing it reversed the deficit: MobileNetV2-static-int8 is now 1.80x
+   faster than a like-for-like CPU build on a full machine and level with it
+   at two cores, from 1.5x slower.** The structural version is the requantized
+   int8 path -- `i8` out, bias on the BS plane, no CPU epilogue at all -- which
+   removes the `i32` tensor rather than fusing passes over it.
+
+   Three things had to happen and all three are in the tree: the path itself,
+   which had been built on 2026-09-03 and left unmerged while both this file
+   and ROADMAP.md ranked work against it; `rocket-fuse-int8-requant-epilogue`,
+   which puts a real quantized model into the canonical form its matchers
+   claim; and the same treatment for depthwise. 42 of the model's 47
+   convolution dispatches are requantized. The two measured sections above
+   carry the numbers and the protocol.
+
 2. ~~**Re-take every offload number at a realistic core allocation.**~~ Done
    2026-09-05; see the re-measurement table below. It confirms this issue's law
    across a second precision and shows the 7.4 ms constant is the `4,5` value
@@ -1185,10 +1378,13 @@ in **Method note** below.
 
 ## Suggested order
 
-Revised 2026-09-05, after M4 closed. The offload deficit against a
-like-for-like CPU build is **1.5x (int8) / 1.7x (fp16)** on a full machine --
-smaller than the 3.7x this list used to be ranked against, so read P8 before
-spending on anything below it.
+Revised 2026-09-06. **There is no longer an int8 offload deficit.** With the
+requantized path on both dense and depthwise convolutions,
+MobileNetV2-static-int8 is **1.80x faster** than a like-for-like CPU build on
+a full machine and level with it at two cores, from 1.5x slower. fp16 is
+untouched by that work and its **1.7x deficit stands**. Read P8 before
+spending on anything below: the list was ranked against a deficit that no
+longer exists for one of the two precisions.
 
 1. **P8** — read first. It measures three things this list previously assumed
    were the cost (compiler-level transposes, dispatch count, thread churn) and
@@ -1196,10 +1392,12 @@ spending on anything below it.
    fix; and it points at the requantized int8 path as the structural one. It
    also carries the numbers of record, and the rule that a deficit quoted
    without its core allocation is arbitrary within 2.4x.
-2. **The requantized int8 path** — P8's lever 1, and the only structural item.
-   It returns `i8` with the bias on the BS plane and no CPU epilogue, removing
-   the `i32` activation tensor rather than fusing passes over it. Memory
-   `requantized-int8-conv-path` has the board-validated shapes.
+2. ~~**The requantized int8 path**~~ — P8's lever 1, and the only structural
+   item. **Done 2026-09-06**: on `main`, driving a real model through
+   `rocket-fuse-int8-requant-epilogue`, extended to depthwise, and measured.
+   What remains of it is bounded and named -- five dense convolutions blocked
+   by the `Cin` 1344 anomaly, and the model's stride-2 depthwise layers, which
+   reach no Rocket matcher at all.
 3. **P6 → P3 → C4 → P4 → P1** — the dispatch-path cost stack, roughly in
    increasing order of work. P6's residual is one guard held across a whole
    command buffer's recording; the rest is per-tile taxes.
