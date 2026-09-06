@@ -5,9 +5,11 @@
 // SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
 //
 // Collapses the requantization epilogue of an ONNX QLinearConv into the one
-// elementwise generic `@match_dynamic_conv2d_int8_requant` is written
-// against, so a real quantized model can reach the requantized int8 path
-// instead of the int32 accumulator one.
+// elementwise generic the requantized int8 matchers are written against, so
+// a real quantized model can reach the requantized int8 path instead of the
+// int32 accumulator one. Dense and depthwise convolutions both, through the
+// same pattern -- see `FuseInt8RequantEpilogue` for why one template covers
+// them.
 //
 // The accumulator path returns `i32` and leaves five unfused CPU passes over
 // that tensor behind it. ISSUES.md P8 measured the cost of exactly that --
@@ -19,7 +21,7 @@
 //
 // What arrives, per convolution, after `iree-global-opt-quantized-conv-to-conv`
 // and the channels-last conversion (measured on mobilenetv2.static-int8.onnx,
-// 34 dense convolutions, all identical in shape):
+// where 34 dense and 13 depthwise convolutions all arrive in this one shape):
 //
 //   %sumw = generic reduce(%filter)            // extsi, addi   -> tensor<Coutxi32>
 //   %acc  = conv_2d_nhwc_hwcf(%in, %filter)
@@ -111,9 +113,12 @@ static linalg::GenericOp soleGenericConsumer(Value value) {
   return dyn_cast<linalg::GenericOp>(*value.getUsers().begin());
 }
 
-/// Whether `op` is elementwise over `rank` parallel dimensions with identity
-/// maps for every operand except the ones named in `channelOperands`, which
-/// must project onto the last (channel) dimension.
+/// Whether `op` is a single-result, all-parallel elementwise generic whose
+/// operands are either identity-mapped or scalar (a zero-result map).
+///
+/// This is the shape every op in the epilogue *arrives* in. The per-channel
+/// map the fused form introduces for the bias is built below, not matched
+/// here.
 static bool isElementwiseWithIdentityMaps(linalg::GenericOp op) {
   if (op.getNumResults() != 1 || !op.isAllParallelLoops()) {
     return false;

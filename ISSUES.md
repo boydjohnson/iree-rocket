@@ -898,15 +898,12 @@ by kind:
 | 9 | `elementwise_i8` |
 | 5 | `transpose_i8` |
 
-The largest category is **one `i32` epilogue per depthwise convolution**. All
-13 depthwise convolutions are still on the `int8_accumulator` path, so each
-one materializes an `i32` activation tensor and requantizes it on the CPU --
-the exact cost the dense path just shed for a 28% win. That is the next lever,
-and the HAL already accepts `Precision::Int8` for depthwise
-(`depthwise_accepts_only_the_measured_element_widths`), so the missing pieces
-are a hardware probe, a requantized depthwise executable target and matcher,
-and extending the fusion pass to `linalg.depthwise_conv_2d_nhwc_hwc`. No
-depthwise knob exists in `dtype_boundary_probe` yet, so the probe is new code.
+The largest category was **one `i32` epilogue per depthwise convolution** --
+all 13 depthwise convolutions were still on the `int8_accumulator` path, each
+materializing an `i32` activation tensor and requantizing it on the CPU, the
+exact cost the dense path had just shed for a 28% win. **That lever was taken
+the same day; the next section has the result.** This breakdown is left as it
+was measured, because it is what pointed at it.
 
 ### Requantized depthwise, 2026-09-06: 1.80x faster than the CPU
 
@@ -980,24 +977,21 @@ shape-level instrument this repo has already says the shape is fine.
 ### The ranked levers this leaves
 
 1. ~~**Stop materializing `i32` activations and stop leaving their epilogues
-   unfused.**~~ **Done and measured 2026-09-06 -- see the section above: the
-   requantized path is 1.54x faster than the CPU arm on a full machine, where
-   the accumulator build was 1.5x slower.** This was the whole 7.4 ms. The structural version is the
-   requantized int8 path (`requantized-int8-conv-path`): it returns `i8` with
-   the bias on the BS plane and no CPU epilogue at all, which removes the
-   `i32` tensor rather than fusing passes over it. What landed above is the
-   cheap half of the same idea.
+   unfused.**~~ **Done and measured 2026-09-06. This was the whole 7.4 ms, and
+   removing it reversed the deficit: MobileNetV2-static-int8 is now 1.80x
+   faster than a like-for-like CPU build on a full machine and level with it
+   at two cores, from 1.5x slower.** The structural version is the requantized
+   int8 path -- `i8` out, bias on the BS plane, no CPU epilogue at all -- which
+   removes the `i32` tensor rather than fusing passes over it.
 
-   **2026-09-06: that path is now on `main`, where it had never been.** It was
-   built and board-validated on 2026-09-03 and left on
-   `feature/more-mobilenetv2-convs` (1d1dc9a), so this lever has been ranked
-   for a day against code no checkout contained. Rescued, rebased over twelve
-   intervening commits, and re-validated end to end on `planck`. It does not
-   move a model yet: on `mobilenetv2.static-int8.onnx` all 34 dense
-   convolutions still take the accumulator path, because the model's
-   requantization arrives as a five-op chain and the matcher's canonical form
-   is one convolution plus one generic. ROADMAP.md's Phase 3 carries the
-   measured breakdown of that chain and what the remaining pass has to do.
+   Three things had to happen and all three are in the tree: the path itself,
+   which had been built on 2026-09-03 and left unmerged while both this file
+   and ROADMAP.md ranked work against it; `rocket-fuse-int8-requant-epilogue`,
+   which puts a real quantized model into the canonical form its matchers
+   claim; and the same treatment for depthwise. 42 of the model's 47
+   convolution dispatches are requantized. The two measured sections above
+   carry the numbers and the protocol.
+
 2. ~~**Re-take every offload number at a realistic core allocation.**~~ Done
    2026-09-05; see the re-measurement table below. It confirms this issue's law
    across a second precision and shows the 7.4 ms constant is the `4,5` value
@@ -1384,10 +1378,13 @@ in **Method note** below.
 
 ## Suggested order
 
-Revised 2026-09-05, after M4 closed. The offload deficit against a
-like-for-like CPU build is **1.5x (int8) / 1.7x (fp16)** on a full machine --
-smaller than the 3.7x this list used to be ranked against, so read P8 before
-spending on anything below it.
+Revised 2026-09-06. **There is no longer an int8 offload deficit.** With the
+requantized path on both dense and depthwise convolutions,
+MobileNetV2-static-int8 is **1.80x faster** than a like-for-like CPU build on
+a full machine and level with it at two cores, from 1.5x slower. fp16 is
+untouched by that work and its **1.7x deficit stands**. Read P8 before
+spending on anything below: the list was ranked against a deficit that no
+longer exists for one of the two precisions.
 
 1. **P8** — read first. It measures three things this list previously assumed
    were the cost (compiler-level transposes, dispatch count, thread churn) and
@@ -1395,13 +1392,12 @@ spending on anything below it.
    fix; and it points at the requantized int8 path as the structural one. It
    also carries the numbers of record, and the rule that a deficit quoted
    without its core allocation is arbitrary within 2.4x.
-2. **The requantized int8 path** — P8's lever 1, and the only structural item.
-   It returns `i8` with the bias on the BS plane and no CPU epilogue, removing
-   the `i32` activation tensor rather than fusing passes over it. Memory
-   `requantized-int8-conv-path` has the board-validated shapes. **On `main`
-   and re-validated since 2026-09-06**; what remains is the epilogue-fusion
-   pass that puts a real model into the form its matcher claims, scoped in
-   ROADMAP.md's Phase 3.
+2. ~~**The requantized int8 path**~~ — P8's lever 1, and the only structural
+   item. **Done 2026-09-06**: on `main`, driving a real model through
+   `rocket-fuse-int8-requant-epilogue`, extended to depthwise, and measured.
+   What remains of it is bounded and named -- five dense convolutions blocked
+   by the `Cin` 1344 anomaly, and the model's stride-2 depthwise layers, which
+   reach no Rocket matcher at all.
 3. **P6 → P3 → C4 → P4 → P1** — the dispatch-path cost stack, roughly in
    increasing order of work. P6's residual is one guard held across a whole
    command buffer's recording; the rest is per-tile taxes.

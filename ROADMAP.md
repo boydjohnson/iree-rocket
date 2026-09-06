@@ -324,8 +324,8 @@ can go sick until reboot, so measure one shape per process.
 ### Phase 3 -- fusion, which is where the throughput actually is
 
 This is P8's lever **#2**, and the only phase in this document that makes a
-model faster. **Confirmed 2026-09-06, with a number: 1.54x faster than the
-CPU arm on a full machine, from 1.5x slower.** See the requantized-path note
+model faster. **Confirmed 2026-09-06, with a number: 1.80x faster than the
+CPU arm on a full machine and level with it at two cores, from 1.5x slower.** See the requantized-path note
 at the end of this section.
 
 - `build_conv_then_lut_regcmd` and `build_conv_then_add_regcmd` are built,
