@@ -300,7 +300,7 @@ above keeps `Placement` as a trait precisely so this becomes a third
 implementation rather than a rewrite. It is not the recommended first step
 only because it forks the uAPI; it is the better end state.
 
-## 8. Measurement plan (before M1 is judged)
+## 8. Measurement plan (before M1 is judged) -- steps 1 and 2 done, see §9
 
 1. `iree-rocket-hal/examples/multicore_bench`: one multi-task conv shape
    (e.g. the requant model's `112x112x24->144 k1x1`) and one ViT matmul,
@@ -313,3 +313,67 @@ only because it forks the uAPI; it is the better end state.
 3. E2E at N=1 vs N=3 on the three models, six interleaved passes, each arm
    first in half of them (the board drifts), governor `performance`,
    `taskset` stated. Quote `overlap` next to wall.
+
+## 9. Measured: §8 steps 1 and 2 (planck, 2026-09-06)
+
+`iree-rocket-hal/examples/multicore_bench` exists now. It opens the device
+N times, gives each file its own copy of one dispatch's BOs, and has N
+threads (pinned to cpu4-7) replay production's per-tile `submit` +
+`prep_bo` chain. Every context is verified bit-exactly after warm-up *and*
+after the timed concurrent run. Board state: cpu4-7 governor
+`performance`, cpu0-3 `ondemand`, NPU IRQs 82-84 on cpu6, nothing else
+running. 200 jobs per context, 3 passes; the ranges below span the passes.
+Both shapes are 3 CBUF tiles per job.
+
+**Step 1, hardware term** (submit + wait only), jobs/s and ratio to N=1:
+
+| Shape | N=1 | N=2 | N=3 | N=4 | N=5 | N=6 |
+|---|---|---|---|---|---|---|
+| conv 112x112x24->144 k1 fp16 | 316-372 | 617-748 (1.95-2.03x) | 924-1135 (2.5-3.0x) | 1075-1218 (2.9-3.5x) | ~1160 | ~1210 |
+| fc 197x768 @ 768x768 fp16 | 549-577 | 1018-1093 (1.8-2.0x) | 1530-1678 (2.8-3.1x) | 1518-1650 (2.7-3.0x) | -- | -- |
+
+The go/no-go of §8 is **go**: three files reach ~3x on both shapes, the
+notes' 1 / 2.1 / 2.9 / 3.1 reproduced. `overlap` reads 98-100% for every
+N >= 2. The conv keeps climbing past three cores (a fourth queue is worth
++10-15%, five and six a few percent more): with a per-tile blocking wait,
+each queue leaves a submit -> IRQ -> wake -> submit bubble on its core that
+another queue's job fills. The fc, whose tiles are longer, gains nothing
+from a fourth queue and its per-context `wait` rises instead.
+
+**Step 2, host phases included** (pack -> submit -> wait -> compact per
+worker per job):
+
+| Shape | N=1 | N=2 | N=3 | N=4 | pack+compact / job | overlap |
+|---|---|---|---|---|---|---|
+| conv | 137-167 | 236-251 (1.5-1.8x) | 324-342 (1.9-2.5x) | 404-412 (2.5-3.0x) | 2.9-3.6 ms at N=1 -> 5.5 ms at N=4 | 35-58% |
+| fc | 308-318 | 615-637 (1.95-2.04x) | 936-971 (2.9-3.15x) | 1232-1246 (3.9-4.0x) | 1.03-1.13 ms, flat | 47 / 67 / 96% |
+
+The fc is the clean case of §4's lever: at N=4 the host pack/compact runs
+on the fourth A76 while three jobs are on three cores, and the pipeline
+delivers **4.0x on 3 cores**. The conv shows the limit §4 named: its output
+compaction moves 3.5 MB per job, and four workers compacting at once push
+the per-job host cost from ~3 ms to 5.5 ms -- DRAM saturates before the
+NPU does. Per-band packing (level 2) does not change the bytes, so on
+output-heavy shapes the host term, not the NPU term, will bound N.
+
+**Control, `--shared-fd`** (N dups of one `open()`, otherwise identical):
+
+| Shape | N=2 | N=3 | N=4 | per-context wait |
+|---|---|---|---|---|
+| conv | 1.30x | 1.27x | 1.27x | 5.0 / 7.8 / 10.4 ms -- one queue, N deep |
+| fc | 1.00-1.04x | 0.96-0.98x | 1.01-1.02x | 3.5 / 5.6 / 7.1 ms |
+
+§2's constraint holds exactly: a dup is one scheduler entity, and N
+threads on it get one core, however many jobs are queued. The conv's flat
+1.3x is the queue-depth effect on that one core -- a non-empty entity
+queue removes the per-tile bubble -- and it is a lever **independent of
+multicore**: submitting a dispatch's tiles back to back and waiting once
+(they write disjoint rows) would buy it at N=1 today. Note it in ISSUES.md
+rather than folding it into M0.
+
+**Consequences for the milestones.** M1 as specified is justified by the
+hardware term alone. The fc numbers say `--host-phases` overlap is real
+and reaches the full core count without level 2; the conv numbers say
+level 2's band packing is worth less than §5.4 hoped on output-heavy
+shapes, because the bytes are the bound. Re-check §4's "1.15-1.3x" target
+against these before M2 is scoped.
