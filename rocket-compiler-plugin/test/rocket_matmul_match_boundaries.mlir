@@ -15,8 +15,10 @@
 // channels and N its output channels -- so the bounds here are the HAL's
 // channel ceilings under different names.
 
-// MobileNetV2's classifier, and exactly the shape the ceilings were measured
-// at: K = 1792 is MAX_INPUT_CHANNELS.
+// MobileNetV2's classifier, the shape the 1792 ceilings were measured at.
+// It is inside the bound rather than on it since 2026-09-06, when
+// MAX_INPUT_CHANNELS and MAX_OUTPUT_CHANNELS went to 3584; the case on the
+// new boundary is @vit_mlp_at_the_ceiling_matches below.
 //
 // Both narrowings must land *here*, in the caller, not in the operands the
 // wrapper builds for itself: a truncf that reaches the dispatch from inside
@@ -42,35 +44,52 @@ util.func public @classifier_matches(
   util.return %result : tensor<1x1001xf32>
 }
 
+// The shape the 2026-09-06 raise was for: a ViT-B/16 (and Qwen3) MLP, K =
+// N = 3072, over the old 1792 ceiling and inside the new 3584 one. Its QKV
+// sibling is N = 2304. Measured on `planck` at this geometry -- 197x1 with
+// K 3072 N 768 and K 768 N 2304/3072 -- not only at the 14x14 conv one.
+// CHECK-LABEL: util.func public @vit_mlp_at_the_ceiling_matches
+// CHECK-NOT: linalg.matmul
+// CHECK: flow.dispatch @rocket_matmul_executable
+util.func public @vit_mlp_at_the_ceiling_matches(
+    %lhs: tensor<197x3584xf32>,
+    %rhs: tensor<3584x3584xf32>,
+    %init: tensor<197x3584xf32>) -> tensor<197x3584xf32> {
+  %result = linalg.matmul
+      ins(%lhs, %rhs : tensor<197x3584xf32>, tensor<3584x3584xf32>)
+      outs(%init : tensor<197x3584xf32>) -> tensor<197x3584xf32>
+  util.return %result : tensor<197x3584xf32>
+}
+
 // One channel past it, and the whole matmul stays on the CPU rather than
 // reaching a driver that would refuse it -- in f32, because
 // rocket-promote-unclaimed-conv-inputs gives back what the demotion took.
 // Running an unclaimed matmul in f16 would be pure loss.
 // CHECK-LABEL: util.func public @k_past_the_ceiling_falls_back
 // CHECK: linalg.matmul
-// CHECK-SAME: ins(%{{.*}}, %{{.*}} : tensor<1x1793xf32>, tensor<1793x64xf32>)
+// CHECK-SAME: ins(%{{.*}}, %{{.*}} : tensor<1x3585xf32>, tensor<3585x64xf32>)
 util.func public @k_past_the_ceiling_falls_back(
-    %lhs: tensor<1x1793xf32>,
-    %rhs: tensor<1793x64xf32>,
+    %lhs: tensor<1x3585xf32>,
+    %rhs: tensor<3585x64xf32>,
     %init: tensor<1x64xf32>) -> tensor<1x64xf32> {
   %result = linalg.matmul
-      ins(%lhs, %rhs : tensor<1x1793xf32>, tensor<1793x64xf32>)
+      ins(%lhs, %rhs : tensor<1x3585xf32>, tensor<3585x64xf32>)
       outs(%init : tensor<1x64xf32>) -> tensor<1x64xf32>
   util.return %result : tensor<1x64xf32>
 }
 
 // N is the output-channel count, bounded by MAX_OUTPUT_CHANNELS at the same
-// 1792.
+// 3584.
 // CHECK-LABEL: util.func public @n_past_the_ceiling_falls_back
 // CHECK: linalg.matmul
 util.func public @n_past_the_ceiling_falls_back(
     %lhs: tensor<1x64xf32>,
-    %rhs: tensor<64x1793xf32>,
-    %init: tensor<1x1793xf32>) -> tensor<1x1793xf32> {
+    %rhs: tensor<64x3585xf32>,
+    %init: tensor<1x3585xf32>) -> tensor<1x3585xf32> {
   %result = linalg.matmul
-      ins(%lhs, %rhs : tensor<1x64xf32>, tensor<64x1793xf32>)
-      outs(%init : tensor<1x1793xf32>) -> tensor<1x1793xf32>
-  util.return %result : tensor<1x1793xf32>
+      ins(%lhs, %rhs : tensor<1x64xf32>, tensor<64x3585xf32>)
+      outs(%init : tensor<1x3585xf32>) -> tensor<1x3585xf32>
+  util.return %result : tensor<1x3585xf32>
 }
 
 // M becomes the convolution's width, and what bounds it is the 11-bit
@@ -209,16 +228,16 @@ util.func public @vecmat_reaches_the_matmul_matcher(
   util.return %result : tensor<1000xf32>
 }
 
-// A raised GEMV is still bound by K: this one is one past the 1792 ceiling
+// A raised GEMV is still bound by K: this one is one past the 3584 ceiling
 // and must fall back like any other oversized matmul.
-// CHECK-LABEL: util.func public @matvec_k_1793_rejected
+// CHECK-LABEL: util.func public @matvec_k_3585_rejected
 // CHECK: linalg.matmul
-util.func public @matvec_k_1793_rejected(
-    %a: tensor<197x1793xf32>,
-    %y: tensor<1793xf32>,
+util.func public @matvec_k_3585_rejected(
+    %a: tensor<197x3585xf32>,
+    %y: tensor<3585xf32>,
     %init: tensor<197xf32>) -> tensor<197xf32> {
   %result = linalg.matvec
-      ins(%a, %y : tensor<197x1793xf32>, tensor<1793xf32>)
+      ins(%a, %y : tensor<197x3585xf32>, tensor<3585xf32>)
       outs(%init : tensor<197xf32>) -> tensor<197xf32>
   util.return %result : tensor<197xf32>
 }

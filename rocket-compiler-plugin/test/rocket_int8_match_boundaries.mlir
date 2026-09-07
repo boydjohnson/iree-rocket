@@ -21,34 +21,41 @@
 // rules at k=3). Those two numbers were containment for a DPU output-writer bug
 // (`mc_surf_out`, see the transform spec's int8 section); with the writer and
 // its readback corrected there is no coefficient-per-channel ceiling left,
-// and both bounds are now the HAL's `MAX_INT8_INPUT_CHANNELS`. 513 falls back
-// because the *channel padding* rules are unmeasured above 512, which is a
-// different limit from the one that was lifted.
+// and both bounds are now the HAL's `MAX_INT8_INPUT_CHANNELS`.
+//
+// The 1x1 pairs moved again on 2026-09-06, to Cin and Cout **3584**, with
+// `MAX_INT8_INPUT_CHANNELS`/`MAX_INT8_OUTPUT_CHANNELS`. int8's evidence at
+// the new ceiling is in `MAX_INPUT_CHANNELS`' doc comment: k=1 exact at
+// 14x14 for Cin 1792..4096 under `SelectorsAffine` and `Counting`, the
+// `onehot` read map at Cout == Cin 3584, Cout 2304..4096 at 7x7 Cin 448,
+// and stride 2 at Cin 2304..4096. The 3x3 pair stays at 1152/1153 and the
+// depthwise pair at 1344/1345: neither of those limits is a channel
+// ceiling this raise touched.
 
-// CHECK-LABEL: util.func public @dense_1x1_cin_1344_matched
+// CHECK-LABEL: util.func public @dense_1x1_cin_3584_matched
 // CHECK-NOT: linalg.conv_2d_nhwc_hwcf
 // CHECK: flow.dispatch @rocket_dynamic_int8_executable
-func.func @dense_1x1_cin_1344_matched(
-    %input: tensor<1x4x4x1344xi8>,
-    %filter: tensor<1x1x1344x64xi8>,
+func.func @dense_1x1_cin_3584_matched(
+    %input: tensor<1x4x4x3584xi8>,
+    %filter: tensor<1x1x3584x64xi8>,
     %init: tensor<1x4x4x64xi32>) -> tensor<1x4x4x64xi32> {
   %result = linalg.conv_2d_nhwc_hwcf
       {dilations = dense<1> : vector<2xi64>, strides = dense<1> : vector<2xi64>}
-      ins(%input, %filter : tensor<1x4x4x1344xi8>, tensor<1x1x1344x64xi8>)
+      ins(%input, %filter : tensor<1x4x4x3584xi8>, tensor<1x1x3584x64xi8>)
       outs(%init : tensor<1x4x4x64xi32>) -> tensor<1x4x4x64xi32>
   return %result : tensor<1x4x4x64xi32>
 }
 
-// CHECK-LABEL: util.func public @dense_1x1_cin_1345_falls_back
+// CHECK-LABEL: util.func public @dense_1x1_cin_3585_falls_back
 // CHECK-NOT: flow.dispatch @rocket_dynamic_int8_executable
 // CHECK: linalg.conv_2d_nhwc_hwcf
-func.func @dense_1x1_cin_1345_falls_back(
-    %input: tensor<1x4x4x1345xi8>,
-    %filter: tensor<1x1x1345x64xi8>,
+func.func @dense_1x1_cin_3585_falls_back(
+    %input: tensor<1x4x4x3585xi8>,
+    %filter: tensor<1x1x3585x64xi8>,
     %init: tensor<1x4x4x64xi32>) -> tensor<1x4x4x64xi32> {
   %result = linalg.conv_2d_nhwc_hwcf
       {dilations = dense<1> : vector<2xi64>, strides = dense<1> : vector<2xi64>}
-      ins(%input, %filter : tensor<1x4x4x1345xi8>, tensor<1x1x1345x64xi8>)
+      ins(%input, %filter : tensor<1x4x4x3585xi8>, tensor<1x1x3585x64xi8>)
       outs(%init : tensor<1x4x4x64xi32>) -> tensor<1x4x4x64xi32>
   return %result : tensor<1x4x4x64xi32>
 }
@@ -101,32 +108,32 @@ func.func @dense_1x1_cout_512_matched(
 // identically before and after the 2026-09-03 Cin change. Corrected to the
 // real boundary.
 
-// CHECK-LABEL: util.func public @dense_1x1_cout_1792_matched
+// CHECK-LABEL: util.func public @dense_1x1_cout_3584_matched
 // CHECK-NOT: linalg.conv_2d_nhwc_hwcf
 // CHECK: flow.dispatch @rocket_dynamic_int8_executable
-func.func @dense_1x1_cout_1792_matched(
+func.func @dense_1x1_cout_3584_matched(
     %input: tensor<1x4x4x16xi8>,
-    %filter: tensor<1x1x16x1792xi8>,
-    %init: tensor<1x4x4x1792xi32>) -> tensor<1x4x4x1792xi32> {
+    %filter: tensor<1x1x16x3584xi8>,
+    %init: tensor<1x4x4x3584xi32>) -> tensor<1x4x4x3584xi32> {
   %result = linalg.conv_2d_nhwc_hwcf
       {dilations = dense<1> : vector<2xi64>, strides = dense<1> : vector<2xi64>}
-      ins(%input, %filter : tensor<1x4x4x16xi8>, tensor<1x1x16x1792xi8>)
-      outs(%init : tensor<1x4x4x1792xi32>) -> tensor<1x4x4x1792xi32>
-  return %result : tensor<1x4x4x1792xi32>
+      ins(%input, %filter : tensor<1x4x4x16xi8>, tensor<1x1x16x3584xi8>)
+      outs(%init : tensor<1x4x4x3584xi32>) -> tensor<1x4x4x3584xi32>
+  return %result : tensor<1x4x4x3584xi32>
 }
 
-// CHECK-LABEL: util.func public @dense_1x1_cout_1793_falls_back
+// CHECK-LABEL: util.func public @dense_1x1_cout_3585_falls_back
 // CHECK-NOT: flow.dispatch @rocket_dynamic_int8_executable
 // CHECK: linalg.conv_2d_nhwc_hwcf
-func.func @dense_1x1_cout_1793_falls_back(
+func.func @dense_1x1_cout_3585_falls_back(
     %input: tensor<1x4x4x16xi8>,
-    %filter: tensor<1x1x16x1793xi8>,
-    %init: tensor<1x4x4x1793xi32>) -> tensor<1x4x4x1793xi32> {
+    %filter: tensor<1x1x16x3585xi8>,
+    %init: tensor<1x4x4x3585xi32>) -> tensor<1x4x4x3585xi32> {
   %result = linalg.conv_2d_nhwc_hwcf
       {dilations = dense<1> : vector<2xi64>, strides = dense<1> : vector<2xi64>}
-      ins(%input, %filter : tensor<1x4x4x16xi8>, tensor<1x1x16x1793xi8>)
-      outs(%init : tensor<1x4x4x1793xi32>) -> tensor<1x4x4x1793xi32>
-  return %result : tensor<1x4x4x1793xi32>
+      ins(%input, %filter : tensor<1x4x4x16xi8>, tensor<1x1x16x3585xi8>)
+      outs(%init : tensor<1x4x4x3585xi32>) -> tensor<1x4x4x3585xi32>
+  return %result : tensor<1x4x4x3585xi32>
 }
 
 // CHECK-LABEL: util.func public @dense_3x3_cout_512_matched

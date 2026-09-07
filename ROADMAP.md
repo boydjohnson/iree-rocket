@@ -99,6 +99,135 @@ with the per-precision pad-fill identities already worked out
 below the compiler at all, which is the evidence that this diagnosis was
 right. All three PPU reductions are now reachable from a compiled model.
 
+## The plumbing ledger, 2026-09-06
+
+The three gaps above were written before Phase 0, 1 and 3 landed. This is the
+full inventory as of today, checked layer by layer against
+[`rocket_executable_def.fbs`](rocket-schema/schema/rocket_executable_def.fbs),
+the decode arms in
+[`executable_cache.rs`](rocket-hal-driver/src/executable_cache.rs), the
+serializer in
+[`RocketTarget.cpp`](rocket-compiler-plugin/target/Rocket/RocketTarget.cpp) and
+the `foreach_match` lists in
+[`rocket_conv2d_transform_spec.mlir`](rocket-compiler-plugin/target/Rocket/rocket_conv2d_transform_spec.mlir).
+It splits two ways, and the split matters because the fix is different: the
+first list needs a schema change (and so a compatibility entry), the second
+needs only a matcher and a shim.
+
+The reverse direction is clean. Nothing the compiler emits today exceeds what
+the driver decodes or the HAL plans, which is what lets a shape outside a
+matcher fall back to the CPU silently rather than panic.
+
+### Implemented in the HAL, not expressible by the schema
+
+| Capability | Where it lives | What the wire has instead |
+|---|---|---|
+| Five of the eight conv datatypes: bf16, int16, fp16 with fp32 accumulator, tf32, int4 -- all board-validated | `Precision` in [`conv.rs`](iree-rocket-hal/src/rocket/conv.rs); ladders in `conv2d_oracle_hw` | `Precision` has `INT8`, `FP16`, `INT8_ACCUMULATOR`. The driver's precision decode errors on anything else; the only place it names the other five is the profiler's label table |
+| conv → LUT and conv → EW add as two tasks in one job | `build_conv_then_lut_regcmd`, `build_conv_then_add_regcmd`; `conv_then_lut_hw`, `conv_with_add_hw` | No way to say "two tasks, one job". Every LUT or EW op is its own dispatch with its own NC1HWC2 round trip |
+| int8 two-tensor element-wise, with output zero point, conversion offset and two scale ratios | `EwAddShape` with `EwPrecision::Int8` in [`elementwise.rs`](iree-rocket-hal/src/rocket/elementwise.rs) | `ElementwiseBinaryDef` is fp16 only, deliberately: the ratio semantics are inferred from register shape, not confirmed by a capture, and MUL has no int8 recipe at all (`docs/compatibility.md`) |
+| Per-output-channel weight zero points | `pack_hwcf_to_rocket_weights_affine_i8` takes one zero point per `Cout` | One scalar `weights_zero_point`; the driver broadcasts it across every channel |
+| Explicit CBUF plans and bank overrides for kernels above 3x3 | `ConvPlan` with an override; fp16 measured to 11x11 (LIMITS.md) | `weights_width`/`height` can name any extent, but automatic planning covers 1x1 and 3x3 only and no wire field can ask for an override |
+
+Two absences are deliberate and are not gaps: the pooling pad-fill value,
+which the driver derives from method and precision so a producer cannot
+corrupt a max pool's border, and `FullyConnectedDef`, deprecated and never
+emitted.
+
+### Expressible and decoded, but not lowered by `rocket-compiler`
+
+Everything here is on the wire, has a decode arm in the driver and a
+serializer arm in the plugin, and has a HAL path with a hardware test. The
+compiler simply never asks for it -- the same diagnosis Gap 3 made for min and
+max pooling, which closed with six matchers and no change below the compiler.
+
+| Capability | Plumbed through | What the spec does today |
+|---|---|---|
+| Fused activation on a conv (`RELU`, `RELUX`) | schema `Activation`; serializer parses `relu`/`relux`; driver `decode_activation`; HAL `Activation::{Relu, Clamped}`; `conv_activation_fused_hw` | All 14 kernel targets say `activation = "none"`. This is why `audit` on MobileNetV2 shows a separate CPU clamp dispatch after every offloaded conv. Only `INT8_ACCUMULATOR` genuinely forbids it |
+| Conv padding | schema `pad_top`/`pad_left`; HAL leading pads 0..=15 | Hardcoded zero on every conv target, so a model's pad becomes a `slow_memcpy` CPU dispatch ahead of the conv (ten of them on MobileNetV2 fp16) |
+| Unary EW: abs, neg, floor, ceil, add-with-scalar (fp16) | `ElementwiseUnaryDef` (tag 5), driver, serializer, `ew_unary_hw` | No matcher. No measured model contains one of these ops |
+| The nine LUT curves (int8) | `ElementwiseLutDef` (tag 6), driver, serializer, `lut_zero_join_hw` | No matcher. The LUT path is int8 by construction and the models' `sqrt`/`erf` are f32 |
+| EW `MAX` and `MIN` | `EwBinaryOp`, driver, serializer, `ew_binary_hw` (bit-exact) | Only `add`/`sub`/`mul` have matchers, and those sit behind `--elementwise` |
+| Dense conv at stride 3 and 4 | `Conv2DDef.stride`; HAL `Shape::with_stride` | Executables *and* matchers are written in the spec but are not in the `foreach_match` list. Depthwise NHWC fp16 has no strided matcher at all, though NCHW does |
+| Kernels other than 1x1 and 3x3 | `weights_width`/`height`; HAL fp16 to 11x11 with the `Cin` cliffs in LIMITS.md | No matcher claims one |
+| int8 matmul and int8 pooling | `MatmulDef.precision`, `PoolingDef.precision`; driver maps `INT8` for both; `fc::Shape` takes any `Precision`, `PoolingPrecision::Int8` | Every matmul and pooling target is fp16. The serializer refuses only `int8_accumulator` for matmul |
+| Pooling padding and unequal per-axis stride | four pad fields, `stride_x`/`stride_y`; HAL pads 0..=7 | Matchers bake zero padding and equal strides of 1 or 2, so model-level pooling pads also run on the CPU |
+| Runtime input zero point | `Conv2DQuantParam::INPUT_ZERO_POINT` | The requant targets push only `output_scale` and `output_zero_point` |
+
+The two rows at the top of that table are the ones with a measured cost
+attached. On `mnv2.fp16.mlir` the unfused clamps and the pad copies are
+dispatches that exist only because the NPU conv cannot carry them, and P8's
+per-dispatch tax applies to each. They are the cheapest throughput lever left
+in this table: one string on a target and one field on the shim, no schema
+change, no hardware unknown.
+
+---
+
+## The channel ceilings, raised 2026-09-06
+
+A third kind of blocker, alongside the two the ledger lists: an op the whole
+stack supports at a *shape* the measurement has not reached. Every dense
+channel ceiling in [`conv.rs`](iree-rocket-hal/src/rocket/conv.rs) moved from
+1792 (fp16 family), 1344/1792 (int8, int4) and 1024/1792 (tf32) to a uniform
+**3584** on `Cin` and `Cout`, with the k=1 matchers and the matmul matcher
+following. [LIMITS.md](LIMITS.md#convolution-channel-limits) carries the sweep;
+the short version is that at k=1 the binding quantity is not CBUF feature
+residency, so every rung reaches the same ceiling, and 4096 measured clean
+everywhere while 8192 did at fp16.
+
+This is what a transformer needs. Both models in this repo were blocked on
+*channels*, not on geometry or on any missing op:
+
+| Model | Sites before | Sites after | What the caps had blocked |
+|---|---|---|---|
+| ViT-B/16 | 12 of 272 | **48 of 333** | QKV (`N` 2304), MLP up (`N` 3072), MLP down (`K` 3072) -- every matmul in all twelve encoder layers is now offloaded |
+| Qwen3-0.6B, prefill seq 128 | 56 of 1130 | **196 of 1494** | `q_proj` (`N` 2048), `o_proj` (`K` 2048), gate/up (`N` 3072), down (`K` 3072) -- every matmul but the `lm_head`, which is `N` 151936 and always will be |
+
+**ViT-B/16 end to end on `planck`** (7 repetitions, medians, every arm built by
+`rocket-compiler` so the baseline is like-for-like, same input, validated on a
+second random input too):
+
+| arm | per inference | vs `--no-offload` |
+|---|---|---|
+| `--no-offload` CPU | 4283 ms | -- |
+| 12 matmul sites (old caps) | 3922 ms | 1.09x faster |
+| **48 matmul sites (3584 caps)** | **873 ms** | **4.9x faster** |
+
+Correctness against the CPU arm: `max|err|` **0.0041** on logits of magnitude
+6.8 (standard deviation 0.93), top-5 identical; 0.0031 and identical top-5 on
+a second input. The 12-site arm was 0.0014, so the extra error is the f16 round
+trip on 36 more sites.
+
+That 4.9x is the largest margin any configuration in this repo has had, and it
+does not contradict [P8](ISSUES.md)'s per-dispatch law -- it is what P8
+predicts once the offloaded op is *arithmetic-dense enough to pay for its
+repack*. ViT's encoder matmuls are ~33 GFLOP; the twelve out-projections the
+old caps admitted were a twelfth of that, which is why 12 sites bought 9% and
+48 sites buy 390%. The element-wise experiment above is the same law with the
+sign flipped: an `Add` moves as many bytes and does one flop per element.
+
+**Qwen3-0.6B on the same day** (`taskset -c 4-7`, 3 repetitions, medians,
+prefill of 128 tokens), which is the second model and the second architecture:
+
+| arm | per prefill | vs `--no-offload` |
+|---|---|---|
+| `--no-offload` CPU | 49308 ms | -- |
+| **196 matmul sites (3584 caps)** | **30272 ms** | **1.63x faster** |
+
+(The 56-site arm was 48.3 s against 51.1 s on 2026-09-06 *before* the raise,
+1.06x -- a different run of the same protocol, not part of the back-to-back
+pair above.)
+
+`max|err|` **0.049** against the CPU arm on logits of magnitude 21 (standard
+deviation 2.5), top-10 token ids identical -- and the 56-site arm was 0.043, so
+tripling the offloaded sites cost almost no accuracy. The margin is smaller
+than ViT's because a 0.6B decoder spends much more of its wall clock outside
+the matmuls (`ROCKET_PROFILE` put `outside` at 97.7% for the 56-site build) and
+because the `lm_head` alone is 151936 output channels of CPU work that no
+ceiling will reach.
+
+Read the numbers with [planck's measurement caveats](ISSUES.md) -- one input,
+one core allocation, A76 clusters at `performance`.
+
 ---
 
 ## What the hardware can and cannot reach
