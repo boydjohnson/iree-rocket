@@ -76,6 +76,32 @@
 // still the right default, but for a performance reason on one model and a
 // correctness reason on the other; do not read it as "depthwise is broken".
 //
+// **Re-measured 2026-09-07, and the gap is a quarter of what it was.** The
+// 186-vs-148 above was taken before M2's scratch pool and before ReLU6
+// fusion. On the current baseline, adding the two lines below gives 44 sites
+// against 37 and:
+//
+//   133.0 ms   37 sites
+//   142.5 ms   44 sites, depthwise clamps on the CPU        1.071x
+//   140.0 ms   44 sites, depthwise ReLU6 fused into BN      1.053x
+//
+// The fused arm is the interesting one: P7 suspected the recorded `outside`
+// rise was partly the 17 depthwise ReLU6 clamps that offloading un-fuses,
+// and it is -- but only 2.5 ms of the 9.5 ms gap. That machinery is in the
+// tree and hardware-validated (`rocket-fuse-conv-relu6` handles
+// `DepthwiseConv2DNchwChwOp`, `#rocket_dynamic_depthwise_relu6_target` and
+// its stride-2 twin, `conv_fp16_bias_activation_hw`'s depthwise arms), so
+// re-testing this costs exactly the two lines:
+//
+//   DemoteInputsToF16<linalg::DepthwiseConv2DNhwcHwcOp>,
+//   DemoteInputsToF16<linalg::DepthwiseConv2DNchwChwOp>,
+//
+// plus their PromoteInputsToF32 counterparts. What is left of the gap is
+// P7's items 2-4: the explicit pad IREE materializes as its own dispatch,
+// the DEPTHWISE_TO_DENSE_QUIESCENCE dwell, and the Cin 512 matcher cap.
+// Accuracy at 44 sites is max|diff| 0.0320 against a --no-offload CPU arm
+// (0.0184 at 37), top-1 and top-5 stable.
+//
 // Anything left alone is safe: an op that stays f32 fails the matchers' f16
 // typing and goes to the CPU, and RocketPromoteUnclaimedConvInputsPass gives
 // f32 back to anything demoted that the match loop then declines.

@@ -142,8 +142,8 @@ max pooling, which closed with six matchers and no change below the compiler.
 
 | Capability | Plumbed through | What the spec does today |
 |---|---|---|
-| Fused activation on a conv (`RELU`, `RELUX`) | schema `Activation`; serializer parses `relu`/`relux`; driver `decode_activation`; HAL `Activation::{Relu, Clamped}`; `conv_activation_fused_hw` | All 14 kernel targets say `activation = "none"`. This is why `audit` on MobileNetV2 shows a separate CPU clamp dispatch after every offloaded conv. Only `INT8_ACCUMULATOR` genuinely forbids it |
-| Conv padding | schema `pad_top`/`pad_left`; HAL leading pads 0..=15 | Hardcoded zero on every conv target, so a model's pad becomes a `slow_memcpy` CPU dispatch ahead of the conv (ten of them on MobileNetV2 fp16) |
+| ~~Fused activation on a conv (`RELU`, `RELUX`)~~ | schema `Activation`; serializer parses `relu`/`relux`; driver `decode_activation`; HAL `Activation::{Relu, Clamped}`; `conv_activation_fused_hw`, `conv_fp16_bias_activation_hw` | **Done 2026-09-07 for fp16 ReLU6.** `#rocket_dynamic_relu6_target` plus `rocket-fuse-conv-relu6` and a DAG matcher claim 17 of MobileNetV2's 18 fusable sites; 146 -> 133 ms at four cores. The 18th is the stride-2 stem, and the int8 form is a different problem -- see below |
+| Conv padding | schema `pad_top`/`pad_left`; HAL leading pads 0..=15 | Hardcoded zero on every conv target. **Worth much less than it looks, and not independent:** of MobileNetV2 fp16's 18 `tensor.pad` ops, 17 feed the *depthwise* convolutions P7 keeps on the CPU, so folding them needs P7 first; the one that feeds an offloaded conv (the 224->225 stem) is **asymmetric** (`low[0,0,0,0,0] high[0,0,1,1,0]`), which the schema's symmetric two-value model cannot express at all |
 | Unary EW: abs, neg, floor, ceil, add-with-scalar (fp16) | `ElementwiseUnaryDef` (tag 5), driver, serializer, `ew_unary_hw` | No matcher. No measured model contains one of these ops |
 | The nine LUT curves (int8) | `ElementwiseLutDef` (tag 6), driver, serializer, `lut_zero_join_hw` | No matcher. The LUT path is int8 by construction and the models' `sqrt`/`erf` are f32 |
 | EW `MAX` and `MIN` | `EwBinaryOp`, driver, serializer, `ew_binary_hw` (bit-exact) | Only `add`/`sub`/`mul` have matchers, and those sit behind `--elementwise` |
@@ -153,12 +153,30 @@ max pooling, which closed with six matchers and no change below the compiler.
 | Pooling padding and unequal per-axis stride | four pad fields, `stride_x`/`stride_y`; HAL pads 0..=7 | Matchers bake zero padding and equal strides of 1 or 2, so model-level pooling pads also run on the CPU |
 | Runtime input zero point | `Conv2DQuantParam::INPUT_ZERO_POINT` | The requant targets push only `output_scale` and `output_zero_point` |
 
-The two rows at the top of that table are the ones with a measured cost
-attached. On `mnv2.fp16.mlir` the unfused clamps and the pad copies are
-dispatches that exist only because the NPU conv cannot carry them, and P8's
-per-dispatch tax applies to each. They are the cheapest throughput lever left
-in this table: one string on a target and one field on the shim, no schema
-change, no hardware unknown.
+The two rows at the top of that table were called the cheapest throughput
+lever left here -- "one string on a target and one field on the shim, no
+schema change, no hardware unknown". Measuring them split the pair apart.
+
+**Activation was worth more than that and cost more than that.** The 18 ReLU6
+sites that follow an offloaded convolution are each a *standalone* dispatch --
+IREE cannot fuse across a Rocket dispatch boundary, which is P8's central
+measurement -- and together they move 43.8 MB of f32 per inference to do three
+instructions per element. (The 17 that follow a CPU depthwise convolution are
+fused completely, which is what the contrast looks like.) But it was not one
+string: the hardware order is accumulate -> BS bias -> BN activation ->
+OUT_CVT, so a clamp in BN sees the biased value only if the bias is on the BS
+plane, and every fp16 convolution here was handing the NPU a *zero* bias and
+adding the real one back on the CPU. So the work was a hardware validation
+(`conv_fp16_bias_activation_hw`, the first nonzero fp16 bias ever driven), a
+canonicalisation pass, a target, a shim that carries the bias, and a DAG
+matcher. Landed 2026-09-07: 17 of 18 sites, 146 -> 133 ms at four cores
+(1.10x) and 122.5 -> 116.5 at eight (1.05x), max|diff| against a CPU arm
+0.0184 where the unfused arm is 0.0173, same argmax and top-5.
+
+**Padding was worth almost nothing and is not independent.** See its row: 17
+of the 18 pads feed convolutions that are not offloaded at all, and the one
+that does is asymmetric. It is gated on P7 *and* on four-value padding on the
+wire, not on a shim field.
 
 ---
 

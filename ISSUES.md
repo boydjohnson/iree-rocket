@@ -25,7 +25,9 @@ what the stack is measured to do, and which layer enforces each bound.
 run but no compiled model can reach yet. One of its phases is gated on an
 issue here by name: P8's measured per-dispatch cost is why its coverage
 matchers land behind a flag. C5, which used to gate the LUT path in a compiled
-model, was resolved 2026-09-06, and C2 2026-09-07 -- see **Resolved**.
+model, was resolved 2026-09-06, and C2 and P6 on 2026-09-07 -- see
+**Resolved**. ROADMAP's fused-activation row landed the same day, which is
+what moved P7's and P2's numbers below.
 
 Trimmed 2026-09-05: issues that are settled were cut down to one entry each
 in **Resolved** at the end, which keeps their IDs resolvable without keeping
@@ -334,6 +336,22 @@ chaining will look twice as strong as it is. MobileNetV2 fp16 does have
 adjacent NPU dispatch pairs (roughly 15 of 37 dispatches follow another NPU
 dispatch immediately), so the mechanism has somewhere to apply here.
 
+**Resized again 2026-09-07.** 24.4 ms (`compact` 17.7, `pack.input` 6.7)
+against a **127 ms** model — 19% of wall, and the second-largest term after
+P7's `outside`. See P7 for the profile. Two things to carry into any attempt:
+
+- **The cost is concentrated, not spread.** One convolution,
+  `112x112x24->144 k1x1`, is 5.4 ms of compaction per inference on its own —
+  30% of the whole `compact` budget. P8's lever 3 said this and the current
+  profile confirms it: the lever is shape-selective, and a chaining
+  implementation that pays a fixed cost per dispatch to save an average one
+  will lose.
+- **The reach is gated on P7.** Chaining needs producer *and* consumer on the
+  NPU, and this model alternates dense (NPU) with depthwise (CPU). The
+  biggest compaction, the one above, feeds a *depthwise* convolution — so it
+  is not chainable at all until P7 moves. Sizing P2 against the whole 24.4 ms
+  overstates what it can reach today.
+
 ---
 
 ## P3 (S3) — the full output BO is cache-synced once per tile, and a regcmd BO is allocated and mapped per tile
@@ -411,32 +429,10 @@ and worth not touching.
 
 ---
 
-## P6 (S3) — the command-buffer `record` phase still runs on a little core
+## P7 (S2) — MobileNetV2 fp16's 17 depthwise convolutions stay on the CPU; they are 54% of the model's wall time, and offloading them is 1.053x slower (re-measured 2026-09-07, was 1.26x)
 
-Items 1-3 are done (packed-coefficient caching, the classifier matmul's
-per-inference re-narrowing, and the host-side transforms' core placement --
-together 198 -> 146 ms on MobileNetV2 fp16); see **Resolved**. What they left
-behind is one residual and one pointer.
-
-Per inference after: `pack.input` 8.4 ms at 1023 MB/s (was 16 ms at 538),
-`compact` 18 ms at 694 MB/s (was 38 ms at 330), `record` 15 ms, `outside`
-88 ms, NPU 22 ms — 13.7% of wall. Logits bit-identical on both models, board
-gate green.
-
-**P2 is still open and still worth what it was**, but it is now worth 26 ms
-per inference rather than 53, and the next person should read this item and the
-M1/M3 entry under **Resolved** before quoting either number. The `record`
-phase's 15 ms is also still on a little core: it runs at command-buffer record time, outside `queue_execute`'s
-guard, and a guard per `dispatch` call measured as noise because 37
-back-to-back set/restore pairs migrate the thread off the big cluster between
-every one of them. One guard held across a whole command buffer's recording
-is the way to get it.
-
----
-
-## P7 (S2) — MobileNetV2 fp16's 17 depthwise convolutions stay on the CPU, and offloading them today makes the model 26% slower
-
-They are the whole of P6's `outside` term: ten executables over 17 dispatch
+They are the whole of the `outside` term (70.9 ms of a 127 ms model; see
+the profile below): ten executables over 17 dispatch
 sites, `112x112x48` down to `7x7x1344`, all `linalg.depthwise_conv_2d_nhwc_hwc`
 at f32. They stay on the CPU for one reason —
 `RocketDemoteConvInputsPass` deliberately excludes depthwise, so an f32
@@ -503,8 +499,100 @@ depthwise convolutions are the cheapest ops in the model per byte moved —
 one filter per channel, no Cout reduction — which is exactly the profile that
 loses to a per-dispatch layout round trip.
 
+### Re-measured 2026-09-07 with depthwise ReLU6 fused: the verdict holds, at a quarter of the cost
+
+This is item 0 below, done. The hypothesis was right in direction and too
+small to change the answer.
+
+|   | ms | vs 37 sites |
+|---|---:|---:|
+| 37 sites (dense ReLU6 fused) | 133.0 | — |
+| 44 sites, depthwise clamps on the CPU | 142.5 | 1.071x slower |
+| 44 sites, depthwise ReLU6 fused into BN | **140.0** | **1.053x slower** |
+
+Six interleaved passes each, `taskset -c 4-7`, governor `performance`,
+medians. Accuracy at 44 sites is max|diff| 0.0320 against a `--no-offload`
+CPU arm (0.0184 at 37 sites), top-1 and top-5 stable.
+
+**So the 26% is now 5.3%**, and two separate things did that. Most of it is
+M2's scratch pool, which removed the per-dispatch allocation the seven extra
+depthwise dispatches were each paying -- the 186-vs-148 above predates it.
+The rest, 2.5 ms of the 9.5 ms gap, is the depthwise clamps: the section
+below was right that offloading un-fuses them and that the recorded
+`outside` rise contains them, but they are a fifth of the gap, not the bulk
+of it.
+
+**What is in the tree.** All of the depthwise fusion machinery, and it is
+hardware-validated: `rocket-fuse-conv-relu6` handles
+`DepthwiseConv2DNchwChwOp` (the NCHW chain is
+`conv -> transpose -> expand_shape -> clamp`, and the bias broadcast retains
+dimension 1, so the canonical clamp is NCHW with a `(d1)` bias map),
+`#rocket_dynamic_depthwise_relu6_target` and its stride-2 twin exist with
+their shims and matchers, and `conv_fp16_bias_activation_hw` runs bias alone,
+bias + ReLU and bias + ReLU6 under the depthwise register program as well as
+the dense one -- all six exact. What is *not* in the tree is the demote,
+which stays off: `RocketDemoteConvInputsPass`'s scope comment carries the two
+lines that turn it on and this table.
+
+**What is left of the gap** is items 2-4 below, unchanged: the explicit pad
+IREE materializes as its own dispatch, the `DEPTHWISE_TO_DENSE_QUIESCENCE`
+dwell, and the `Cin` 512 matcher cap. Item 1, P2's chaining, is the one that
+would move it most and is also the one gated on this item -- see P2.
+
+### The 2026-09-07 profile, and why the earlier accounting understated the clamps
+
+Two things happened after the measurement above, and both move it.
+
+**The `outside` rise has a second cause the measurement never named.** It is
+attributed entirely to the explicit padding IREE materializes. But IREE
+currently fuses each depthwise convolution's ReLU6 **into the depthwise
+dispatch itself** — read the flow IR and one dispatch does depthwise + bias +
+clamp + `truncf` to f16 in a single pass. Offloading the depthwise breaks
+that fusion and hands back 17 more standalone CPU clamp dispatches. Those are
+inside the 88 -> 118 ms rise and were paid but not attributed. The mechanism
+to fuse them into the NPU instead now exists for dense convolutions
+(`rocket-fuse-conv-relu6`, `#rocket_dynamic_relu6_target`); extending it to
+depthwise is an increment on work that has landed, not new ground —
+though it does need a depthwise arm of `conv_fp16_bias_activation_hw` first,
+because that test covers the dense path only.
+
+**The denominator moved.** The 147/149 ms baseline is now 133 ms (the dense
+ReLU6 fusion), so the same absolute cost is a larger fraction, and P6's
+`record` term — which is 2.46 + 1.76 + 1.37 + ... of the per-op table above —
+has largely gone with the M2 scratch pool.
+
+### The current profile, 2026-09-07
+
+`ROCKET_PROFILE=1`, `taskset -c 4-7`, m2 driver, ~39 inferences, per
+inference. Both arms are the same binary and the same input; the fused arm is
+the ReLU6 build.
+
+| phase | 37 sites, unfused | 37 sites, ReLU6 fused |
+|---|---:|---:|
+| `outside` | 79.6 | **70.9** |
+| `wait.npu` | 25.9 | 25.4 |
+| `compact` | 17.7 | 17.7 |
+| `pack.input` | 6.6 | 6.7 |
+| `record` | 1.6 | 1.5 |
+| wall | 136.7 | 127.2 |
+
+The whole 9.4 ms is `outside` and every driver phase is flat, which is what
+removing a CPU dispatch should look like — and it is also the evidence that
+moving the bias onto the BS plane and turning BN on costs the hardware
+nothing (`wait.npu` -0.6 ms, noise).
+
+**What this profile says about where to spend.** `outside` is **54% of the
+model** and P7 is what it is made of: these 17 convolutions. `compact` plus
+`pack.input` is 24.4 ms, 19%, and that is P2 — but P2's cross-op chaining
+only pays between *adjacent* NPU dispatches, and this model alternates dense
+(NPU) with depthwise (CPU), so P2's reach is itself gated on this item. The
+knot is P7 -> P2 -> ROADMAP's conv padding row, and P7 is the end to pull.
+
 ### What would change the verdict, in order
 
+0. ~~**Re-measure the 44-site arm with depthwise ReLU6 fused**~~ — done
+   2026-09-07, see above. Worth 2.5 ms of the 9.5 ms gap; the verdict holds
+   at 1.053x rather than 1.26x.
 1. **P2's cross-op chaining.** These are the widest spatial extents in the
    model, so their round trip is the most expensive one there is: `pack.input`
    plus `compact` is 12.3 of the 32.7 ms. A depthwise sitting between two
@@ -938,6 +1026,11 @@ allocation rule below existed; read them with that in mind.
 
 ### The first hang-free int8 numbers, 2026-09-05, and where the time goes
 
+**The fp16 half of the phase numbers below is superseded** — P7 carries the
+2026-09-07 profile, in which `record` is 1.5 ms rather than 15 and `outside`
+is 70.9 rather than 88. The int8 figures here have not been retaken.
+
+
 With ISSUES.md C8 fixed the int8 offload finally completes a benchmark loop, so
 these are the first int8 figures that are not contaminated by watchdog kills or
 by a per-boundary dwell. Both arms are MobileNetV2 (`mnv2.int8.mlir`) through
@@ -1216,6 +1309,23 @@ What was settled and how, newest first, in place of the narratives — those are
 in this file's git history (`git log -p ISSUES.md`). Everything cited below is
 something that still exists: a commit, a file, or a memory.
 
+**P6 (S3) — 2026-09-07. The residual closed itself.** Items 1-3 (packed
+coefficient caching, the classifier matmul's per-inference re-narrowing, and
+the host transforms' core placement) took MobileNetV2 fp16 from 198 to 146 ms
+and are in this ledger already. What P6 kept open was one thing: `record`'s
+15 ms per inference, still on a little core, with "one guard held across a
+whole command buffer's recording" named as the fix.
+
+**Do not build that guard.** `record` is now **1.5 ms** per inference, not 15
+(`ROCKET_PROFILE=1`, `taskset -c 4-7`, m2 driver, 2026-09-07). M2's
+per-context scratch pool removed it as a side effect -- a dispatch no longer
+pays `CREATE_BO` + `mmap` + first-touch faults per tile, and recording was
+mostly those faults. `rocket-hal-driver/MULTICORE.md` §12 predicted exactly
+this shape (`record` 1.4 -> 0.22 ms per ViT dispatch) without noticing it
+also discharged this item.
+
+The phase profile P6 carried is superseded; P7 has the current one.
+
 **C2 (S2) — 2026-09-07. Measured, and the finding is the opposite of the
 one this issue proposed: RK3588 rounds half *away from zero*, so the oracle
 was right and the change C2 asked for would have introduced the bug.**
@@ -1371,7 +1481,8 @@ inferences (1.47x); the classifier matmul's operands are no longer re-narrowed
 every inference; and the host-side layout transforms ask for the big cluster
 (`rocket-hal-driver/src/cpu_affinity.rs`) after `layout_bench` showed identical
 code running 13.8 ms on A76 and 52.4 ms on A55. Together 198 -> 146 ms. Commits
-`021f0de`, `9f6426c`, `1bc3f62`. P6 stays open for what is left.
+`021f0de`, `9f6426c`, `1bc3f62`. The residual P6 kept open after these
+closed itself in turn -- see the 2026-09-07 entry above.
 
 **P5 (S3) — 2026-09-04. A pool submit does not cost 507 ms on this board.** The
 loaded module already unmasks the PPU_0/PPU_1 completion interrupts, and a pool
@@ -1408,43 +1519,53 @@ in **Method note** below.
 
 ## Suggested order
 
-Revised 2026-09-06. **There is no longer an int8 offload deficit.** With the
-requantized path on both dense and depthwise convolutions,
-MobileNetV2-static-int8 is **1.80x faster** than a like-for-like CPU build on
-a full machine and level with it at two cores, from 1.5x slower. fp16 is
-untouched by that work and its **1.7x deficit stands**. Read P8 before
-spending on anything below: the list was ranked against a deficit that no
-longer exists for one of the two precisions.
+Revised 2026-09-07 against a fresh profile of the fp16 model (P7 carries it),
+which moved two things this list was ranked on. **P6's residual is gone** --
+`record` is 1.5 ms per inference, not 15, discharged as a side effect of M2's
+scratch pool; do not build the guard it asked for. And **fp16's deficit is
+smaller**: dense ReLU6 now fuses into the convolution's BN stage, 146 -> 133
+ms, so the model is 127 ms under the profiler and every share below is
+against that.
 
-1. **P8** — read first. It measures three things this list previously assumed
-   were the cost (compiler-level transposes, dispatch count, thread churn) and
-   finds all three worth ~nothing; it lands the epilogue-fusion half of the
-   fix; and it points at the requantized int8 path as the structural one. It
-   also carries the numbers of record, and the rule that a deficit quoted
-   without its core allocation is arbitrary within 2.4x.
-2. ~~**The requantized int8 path**~~ — P8's lever 1, and the only structural
-   item. **Done 2026-09-06**: on `main`, driving a real model through
-   `rocket-fuse-int8-requant-epilogue`, extended to depthwise, and measured.
-   What remains of it is bounded and named -- five dense convolutions blocked
-   by the `Cin` 1344 anomaly, and the model's stride-2 depthwise layers, which
-   reach no Rocket matcher at all.
-3. **P6 → P3 → C4 → P4 → P1** — the dispatch-path cost stack, roughly in
-   increasing order of work. P6's residual is one guard held across a whole
-   command buffer's recording; the rest is per-tile taxes.
-4. ~~**C2**~~ — done 2026-09-07, and it went the other way: the hardware
-   rounds half *away from zero*, the oracle was already right, and the notes'
-   RK3588 prediction is falsified. See **Resolved**.
-5. **M2** — ~1.43x on the device half, but the device is ~10% of wall (see
-   P8's phase profile), it needs a driver-side `clk_set_rate`, and both
-   shortcuts hang the box. Low ceiling for the risk.
-6. **P2** — the driver-level NC1HWC2 round trip, the one part of the old
-   "layout propagation" lever P8 did not test; bounded at ~10% and
-   shape-selective (one convolution carries a third of the model's
-   compaction). **P7** is the case that most needs it.
+Where the time actually is, per inference: `outside` **70.9 ms (54%)**,
+`wait.npu` 25.4, `compact` 17.7, `pack.input` 6.7, `record` 1.5.
+
+1. **P7** — the largest term by a wide margin: `outside` *is* these 17
+   depthwise convolutions, and it is over half the model. Re-measured
+   2026-09-07 with depthwise ReLU6 fused: **1.053x slower, not 1.26x**, so
+   the verdict holds but the gap is a quarter of what it was. What is left of
+   it is the explicit pad, the quiesce dwell and the `Cin` 512 cap; the
+   fusion machinery for it is in the tree and only the demote is off. P2 and
+   ROADMAP's conv-padding row are both gated behind this one.
+2. **P2** — 24.4 ms, 19% of wall, and the one part of the old "layout
+   propagation" lever P8 never tested. Two caveats now attached to it: the
+   cost is concentrated in one convolution (5.4 ms, 30% of `compact`), and
+   that convolution feeds a *depthwise* op, so it is not chainable until P7
+   moves. Sizing P2 against the whole 24.4 ms overstates its reach.
+3. **P8's `Cin` 1344 anomaly** — the only open correctness unknown in this
+   file: exact in every isolated instrument, wrong inside the model, bisected
+   to one convolution, and currently capped by a measurement rather than an
+   explanation. It needs an instrument that compares *intermediate tensors*
+   inside a real model, which this repo does not have and has wanted more than
+   once. Ahead of P3/C4/P4/P1 on severity, behind P7/P2 on wall clock.
+4. **P3 → C4 → P4 → P1** — the dispatch-path cost stack, in increasing order
+   of work. P3's second half is done (the scratch pool); what stands is the
+   whole-BO cache sync, ∝ pages not bytes, which `MULTICORE.md` §12 also names
+   as its next lever.
+5. **C11** — VGG int8 aborts under a repeated benchmark loop, which is why
+   every VGG number in this repo includes a cold weight cache. Blocks a
+   measurement rather than a user.
+6. **M2** — ~1.43x on the device half, but the device is ~20% of wall, it
+   needs a driver-side `clk_set_rate`, and both shortcuts hang the box. Low
+   ceiling for the risk. (The "~10% of wall" this used to cite came from P8's
+   superseded profile; it is 20.6% now, because the denominator shrank.)
 7. **C9, C6, C7, D1, D2** — limitations, hygiene and reconciliation. C9 is
    the only S2 among them: above 3x3 there is a `Cin` cliff that hangs at every
    precision and an int8 program that is wrong at every shape, both now behind
    loud refusals rather than fixed.
+
+Done and in **Resolved**: the requantized int8 path (2026-09-06), C2
+(2026-09-07), P6 (2026-09-07).
 
 ---
 

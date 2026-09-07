@@ -306,7 +306,8 @@ ROCKET_PROFILE=1 ./iree-run-module --module=model.vmfb --function=main_graph \
 `ROCKET_PROFILE=trace` additionally prints a line per phase as it happens.
 The `outside` row is time spent outside this driver entirely (the CPU
 dispatches), so the two halves of a mixed model can be compared directly.
-See ISSUES.md's P6 for the MobileNetV2 fp16 numbers and what they say.
+See ISSUES.md's P7 for the current MobileNetV2 fp16 numbers and what they
+say; P6, which used to carry them, is resolved.
 
 Packed coefficients are cached across inferences (once per weight binding and
 geometry rather than once per dispatch), which is worth 1.47x on MobileNetV2
