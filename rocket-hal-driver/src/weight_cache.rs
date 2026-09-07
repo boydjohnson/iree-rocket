@@ -197,13 +197,22 @@ pub fn verifying() -> bool {
     setting() == "verify"
 }
 
+/// How many NPU contexts share the cache, from `device::create`. Each
+/// context needs its own copy of every packing, so the default budget
+/// scales with it; `ROCKET_WEIGHT_CACHE_MB` overrides the total.
+pub fn set_contexts(contexts: usize) {
+    CONTEXTS.store(contexts.max(1), Ordering::Relaxed);
+}
+
+static CONTEXTS: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(1);
+
 fn budget_bytes() -> usize {
     static BUDGET: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
     *BUDGET.get_or_init(|| {
         std::env::var("ROCKET_WEIGHT_CACHE_MB")
             .ok()
             .and_then(|value| value.parse::<usize>().ok())
-            .unwrap_or(256)
+            .unwrap_or(256 * CONTEXTS.load(Ordering::Relaxed))
             .saturating_mul(1024 * 1024)
     })
 }

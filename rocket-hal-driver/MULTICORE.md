@@ -274,7 +274,7 @@ totals and the fraction of wall during which >= 2 jobs were in flight
 |---|---|---|
 | **M0** (done, §10) | `NpuContext` + worker pool at N=1. `queue_execute` enqueues instead of running/spawning; `run_after_wait` stays for the host-memcpy ops. No second file yet. | MobileNetV2 fp16/int8/requant and ViT within noise of today's numbers on planck, `taskset -c 4-7` and `0-7`. This is the regression gate for everything after it. |
 | **M1** (built, §11) | N contexts, dispatch-level placement (5.4 level 1, assignment (a)), barrier groups honoured, `stage_binding` copy hop at the four direct sites, per-context weight cache, global quiescence rule, `dpu_mode_multicore_hw`. | Bit-exact against N=1 on every e2e model; `overlap` > 0 on ViT. |
-| **M2** | Task-level fan-out (5.4 level 2) with regcmd relocation (b), band packing, gather compaction, per-context scratch pools. | Bit-exact; requant MobileNetV2 faster than N=1 at N=3 on a full machine; `layout_bench`-style microbench shows pack/compact scaling. |
+| **M2** (built, §12) | Task-level fan-out (5.4 level 2) with regcmd relocation (b), band packing, gather compaction, per-context scratch pools. | Bit-exact; requant MobileNetV2 faster than N=1 at N=3 on a full machine; `layout_bench`-style microbench shows pack/compact scaling. |
 | **M3** (optional) | Kernel-side placement, §7. | -- |
 
 ## 7. The alternative: a 30-line kernel patch
@@ -545,3 +545,108 @@ the price of three pinned workers with nothing to overlap: the copy hop
 for its ARGB stem input, the coefficient fan-out, and a worker that can
 no longer drift to an idle core. It is the cost M2 has to earn back
 before anything else.
+
+## 12. M2 as built (2026-09-07)
+
+Task-level fan-out, §5.4 level 2, in the simplest form that keeps every
+tile program identical to the single-context one:
+
+- **Replicas, not bands of scratch.** A multi-tile conv or matmul on a
+  command buffer whose context has siblings gets a `Replica` on each of
+  up to `tiles - 1` siblings: that context's own input, bias, weights and
+  output buffers. Tile `t` runs on context `t mod K` and its program is
+  the unrelocated plan program bound to that context's four addresses
+  (`relocate` / the new `relocate_staged_accumulator`), so one plan serves
+  every context and the hardware sees exactly the programs it saw before.
+- **Copies at execute time**, after the home packing has produced the
+  bytes: only the input rows (plus halo) the replica's tiles read, per
+  NC1HWC2 plane (`InputBand`, `BandGeometry`); the bias; and the packed
+  coefficients through the per-context `weight_cache` (a hit on the
+  sibling, else a copy of the home packing published there).
+- **All tasks submitted before any is waited for**, each on its own file;
+  waits in order; the `dispatch` time and hung-job floor are per dispatch.
+  On one context this is the queue-depth effect of §9 for free.
+- **Gather compaction**: each tile's rectangle is compacted from the
+  scratch of the context that ran it (`compact_atomic_output_rect`, or the
+  tile's own entry of the staged accumulator layout).
+- **Per-context scratch pool** (`scratch_pool.rs`): every driver-private
+  GEM buffer -- input, bias, output, regcmd, replicas -- comes from a free
+  list keyed on (file, size class) instead of a fresh `CREATE_BO` + `mmap`
+  + first-touch faults per dispatch. `ROCKET_FANOUT=0`,
+  `ROCKET_SCRATCH_POOL=0`, `ROCKET_PIN_WORKERS=0` switch each piece off.
+
+Bit-identical to the pre-M0 binary at N=1, 3 and 4 on all four models,
+with and without fan-out.
+
+**What the profiles said on the way** (`iree-benchmark-module`, 5 s,
+`taskset -c 4-7`, per-call averages):
+
+- The first cut, replicas allocated fresh per dispatch, cost ViT ~3 ms of
+  `record` and ~0.7 ms of `stage` per fanned-out dispatch, and the 256 MiB
+  weight budget refused a third of ViT's coefficients once three contexts
+  each needed a copy. The hardware term still fell 8.1 -> 3.4 ms per
+  dispatch; the host cost ate it. Hence the pool and a budget that scales
+  with the context count.
+- **The pool alone is the biggest single win of the whole series at one
+  context**: ViT 1203 -> 990-1098 ms, MobileNetV2 requant 290 -> 255 ms,
+  MobileNetV2 fp16 166 -> 146 ms. `record` fell from 1.4 to 0.22 ms per
+  ViT dispatch. This is ISSUES.md P3's "regcmd BO allocated and mapped per
+  tile", paid by every scratch buffer, and it was never about multicore.
+- With the pool, ViT at N=3 is 922 against 1098 in the same session
+  (`wait.npu` 8.4 -> 3.4 ms per dispatch), MobileNetV2 requant 252 against
+  255, MobileNetV2 fp16 155 against 146. What the fan-out still pays per
+  dispatch: `stage` 0.47 ms (ViT) -- not the copy, which the bands cut to
+  a third, but `fini_bo` over the replica input BO's pages, ∝ BO size
+  (P3 again); `record` +0.3 ms warm; and `outside` +0.7 ms, IREE's own CPU
+  dispatches running slower next to two more cores of DMA and two more
+  pinned workers. MobileNetV2 fp16's dispatches average 0.75 ms of
+  hardware time, so three files' worth of submit and wait round trips
+  cost more than the split saves; §4 predicted exactly this.
+- Pinning workers to distinct cores versus letting them float over the
+  cluster is within noise either way (924 vs 908 ms on ViT).
+
+**Gate** (`tools/bench/binab.sh`, 3 interleaved passes, medians of
+real_time in ms, governor `performance`, NPU IRQs on cpu6, every core
+`suspended` before each run). First, what M2 does at one context -- the
+scratch pool and batched tile submission, against the M1 binary:
+
+| Arm | cpus | M1 N=1 | M2 N=1 | M2 / M1 |
+|---|---|---|---|---|
+| mnv2.fp16 | 4-7 | 166.0 | 144.0 | 0.867 |
+| mnv2.int8 (accumulator) | 4-7 | 319.0 | 283.0 | 0.887 |
+| mnv2.static-int8 (requant) | 4-7 | 290.0 | 259.0 | 0.893 |
+| vit.npu.caps3584 | 4-7 | 1225.0 | 1150.0 | 0.939 |
+| mnv2.fp16 | 0-7 | 140.0 | 124.0 | 0.886 |
+| mnv2.int8 (accumulator) | 0-7 | 271.0 | 243.0 | 0.897 |
+| mnv2.static-int8 (requant) | 0-7 | 240.0 | 218.0 | 0.908 |
+| vit.npu.caps3584 | 0-7 | 867.0 | 834.0 | 0.962 |
+
+Then the fan-out, the M2 binary at `ROCKET_NPU_CORES=1` against `3`:
+
+| Arm | cpus | N=1 | N=3 | N=3 / N=1 |
+|---|---|---|---|---|
+| mnv2.fp16 | 4-7 | 144.0 | 145.0 | 1.007 |
+| mnv2.int8 (accumulator) | 4-7 | 285.0 | 289.0 | 1.014 |
+| mnv2.static-int8 (requant) | 4-7 | 256.0 | 258.0 | 1.008 |
+| vit.npu.caps3584 | 4-7 | 1134.0 | 930.0 | **0.820** |
+| mnv2.fp16 | 0-7 | 123.0 | 120.0 | 0.976 |
+| mnv2.int8 (accumulator) | 0-7 | 241.0 | 241.0 | 1.000 |
+| mnv2.static-int8 (requant) | 0-7 | 219.0 | 212.0 | 0.968 |
+| vit.npu.caps3584 | 0-7 | 833.0 | 620.0 | **0.744** |
+
+Zero hangs in 96 runs; the conv, matmul and pooling e2e gates pass at
+`--board-env ROCKET_NPU_CORES=3`. Against the pre-M0 driver, ViT on eight
+cores is 875 -> 620 ms (1.41x) and MobileNetV2 fp16 156 -> 120 ms
+(1.30x), the latter entirely from the pool and batching.
+
+**Where this leaves the milestones.** M2's gate asked for the requant
+MobileNetV2 to be faster at N=3 than at N=1 on a full machine: it is, by
+3 %, which is noise-adjacent and honest. The model where fan-out pays is
+the one whose dispatches carry several milliseconds of hardware time each;
+MobileNetV2's carry under one, and three files' worth of round trips is
+the price of splitting them. The default stays `ROCKET_NPU_CORES=1`; a
+ViT-shaped model should run with `3`. The next levers, in order:
+`fini_bo` over whole BOs (P3's first half, now the dominant replica cost),
+`outside` growing 0.7 ms per dispatch at N=3 (IREE's CPU dispatches next
+to two more cores of DMA), and §7's kernel-side placement, which would
+remove the replica copies altogether.

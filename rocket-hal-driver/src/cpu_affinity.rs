@@ -178,7 +178,9 @@ pub fn prefer_fast_cpus() -> Restore {
 /// workers; pinning to one CPU only pays once several workers would
 /// otherwise crowd the same one after a `PREP_BO` wake.
 pub fn pin_worker(index: usize, workers: usize) -> Restore {
-    if workers <= 1 {
+    if workers <= 1 || std::env::var("ROCKET_PIN_WORKERS").is_ok_and(|value| value == "0") {
+        // `ROCKET_PIN_WORKERS=0`: every worker takes the whole big cluster
+        // and the scheduler places them, for measuring what pinning costs.
         return prefer_fast_cpus();
     }
     let Some(preferred) = preferred() else {

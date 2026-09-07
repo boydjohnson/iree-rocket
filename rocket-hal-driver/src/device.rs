@@ -49,7 +49,9 @@ use crate::{
 use iree_rocket_hal::rocket::{
     api::{DRM_IOCTL_BASE, drm_version},
     device as rocket_device,
-    tensor_layout::{compact_atomic_output, compact_tiled_accumulator_output},
+    tensor_layout::{
+        compact_atomic_output, compact_atomic_output_rect, compact_tiled_accumulator_output,
+    },
 };
 
 const DEVICE_PATH: &str = "/dev/accel/accel0";
@@ -565,6 +567,8 @@ pub unsafe fn create(
             file: context_file,
         }));
     }
+    crate::weight_cache::set_contexts(contexts.len());
+    crate::scratch_pool::set_contexts(contexts.len());
     let pool = crate::pool::WorkerPool::new(contexts, Box::new(crate::pool::RoundRobin::new()));
 
     let device_allocator = crate::allocator::create(allocator_file, host_allocator);
@@ -601,6 +605,9 @@ unsafe extern "C" fn destroy(device: *mut iree_hal_device_t) {
     // command buffer and may still be on the hardware, and its phases belong
     // in the profile below.
     unsafe { (*cast(device)).pool.shutdown() };
+    // Pooled scratch holds BOs on every context's file; close them while
+    // those files are still open.
+    crate::scratch_pool::clear();
     // The natural end of an inference run, and the point at which
     // `ROCKET_PROFILE`'s tables are worth printing. `report` is idempotent
     // and also runs from an `atexit` hook, for the hosts that never destroy
@@ -779,10 +786,13 @@ unsafe extern "C" fn create_command_buffer(
     let d = unsafe { &*cast(device) };
     // Placement, MULTICORE.md §5.4 (a): the context chosen here is the file
     // this command buffer's scratch lives on and the worker it will run on.
+    let home = d.pool.place();
+    let siblings = d.pool.siblings(home.id);
     unsafe {
         *out_command_buffer = crate::command_buffer::create(
             d.device_allocator,
-            d.pool.place(),
+            home,
+            siblings,
             mode,
             command_categories,
             queue_affinity,
@@ -1682,9 +1692,6 @@ unsafe extern "C" fn queue_execute(
                                 0,
                             );
                         }
-                        // The worker's own context: at M0 a dup of `d.file`,
-                        // so every IREE buffer handle is valid on it.
-                        let fd = ctx.file.as_raw_fd();
                         let regcmd_tasks = job.regcmd_tasks;
                         if regcmd_tasks.iter().any(Vec::is_empty) {
                             break 'result status::from_code(
@@ -1694,13 +1701,20 @@ unsafe extern "C" fn queue_execute(
 
                         // Allocate every split before submission so all command
                         // buffers remain alive until the dispatch is complete.
+                        // One regcmd BO per task, on the file the task runs on:
+                        // a fanned-out tile's program names that context's
+                        // replica buffers and must itself live there.
                         let regcmd_timer = crate::profile::start();
                         let mut cmd_bufs = Vec::with_capacity(regcmd_tasks.len());
-                        for regcmd in regcmd_tasks {
+                        for (regcmd, target) in regcmd_tasks.iter().zip(&job.task_targets) {
                             let cmd_bytes = regcmd.len() * std::mem::size_of::<u64>();
                             let cmd_len = cmd_bytes.next_multiple_of(4096);
                             cmd_bufs.push(unsafe {
-                                rocket_device::OwnedBuffer::new(fd, cmd_len, &ctx.file)
+                                crate::scratch_pool::ScratchBuffer::new(
+                                    target.fd,
+                                    cmd_len,
+                                    std::os::fd::BorrowedFd::borrow_raw(target.fd),
+                                )
                             });
                         }
 
@@ -1758,7 +1772,9 @@ unsafe extern "C" fn queue_execute(
                         }
 
                         let mut task_descriptors = Vec::with_capacity(regcmd_tasks.len());
-                        for (regcmd, cmd_buf) in regcmd_tasks.iter().zip(&cmd_bufs) {
+                        for ((regcmd, cmd_buf), target) in
+                            regcmd_tasks.iter().zip(&cmd_bufs).zip(&job.task_targets)
+                        {
                             unsafe {
                                 let cmd_slice = std::slice::from_raw_parts_mut(
                                     cmd_buf.host_ptr as *mut u64,
@@ -1768,7 +1784,7 @@ unsafe extern "C" fn queue_execute(
                                     cmd_slice[i] = c.0;
                                 }
                             }
-                            if unsafe { rocket_device::fini_bo(fd, cmd_buf.handle) }.is_err() {
+                            if unsafe { rocket_device::fini_bo(target.fd, cmd_buf.handle) }.is_err() {
                                 break 'result status::from_code(
                                     iree_status_code_e_IREE_STATUS_UNAVAILABLE,
                                 );
@@ -1807,16 +1823,6 @@ unsafe extern "C" fn queue_execute(
                         // (every prior hand-driven test used one dedicated
                         // buffer per binding), so dedupe defensively rather
                         // than assume DRM_ROCKET_SUBMIT tolerates duplicates.
-                        let mut in_handles =
-                            Vec::with_capacity(cmd_bufs.len() + job.in_bo_handles.len());
-                        for cmd_buf in &cmd_bufs {
-                            in_handles.push(cmd_buf.handle);
-                        }
-                        for &h in job.in_bo_handles {
-                            if !in_handles.contains(&h) {
-                                in_handles.push(h);
-                            }
-                        }
                         // The mainline driver's IRQ-mediated transition between
                         // tasks in one drm_rocket_job is not reliable on RK3588:
                         // task 0 completes correctly, but every later split leaves
@@ -1824,16 +1830,37 @@ unsafe extern "C" fn queue_execute(
                         // as individually fenced jobs is hardware-validated. Each
                         // split reloads its weights, so no CBUF state must survive
                         // between jobs.
-                        for &(regcmd_addr, regcmd_count) in &task_descriptors {
-                            let started = Instant::now();
+                        //
+                        // Every task is submitted before any is waited for. On
+                        // one file that keeps the entity's queue non-empty, so
+                        // the core never idles between tiles (MULTICORE.md §9's
+                        // queue-depth effect); across files it is what puts a
+                        // dispatch's tiles on several cores at once. Tiles write
+                        // disjoint output and each reloads its weights, so the
+                        // order they complete in does not matter.
+                        let started = Instant::now();
+                        let mut task_submitted = Vec::with_capacity(task_descriptors.len());
+                        for (((regcmd_addr, regcmd_count), cmd_buf), target) in task_descriptors
+                            .iter()
+                            .copied()
+                            .zip(&cmd_bufs)
+                            .zip(&job.task_targets)
+                        {
+                            let mut in_handles = Vec::with_capacity(1 + target.in_bo_handles.len());
+                            in_handles.push(cmd_buf.handle);
+                            for &h in &target.in_bo_handles {
+                                if !in_handles.contains(&h) {
+                                    in_handles.push(h);
+                                }
+                            }
                             let submit_timer = crate::profile::start();
                             if unsafe {
                                 rocket_device::submit(
-                                    fd,
+                                    target.fd,
                                     regcmd_addr,
                                     regcmd_count,
                                     &in_handles,
-                                    job.out_bo_handles,
+                                    &target.out_bo_handles,
                                 )
                             }
                             .is_err()
@@ -1842,23 +1869,25 @@ unsafe extern "C" fn queue_execute(
                                     iree_status_code_e_IREE_STATUS_UNAVAILABLE,
                                 );
                             }
+                            task_submitted.push(Instant::now());
                             crate::profile::stop(
                                 submit_timer,
                                 crate::profile::Phase::Submit,
                                 job.profile_label,
                                 0,
                             );
+                        }
 
-                            // PREP_BO waits on DMA_RESV_USAGE_WRITE fences for the
-                            // specific output handle. Besides making results
-                            // host-visible, waiting here prevents the next split
-                            // from entering the kernel until this one has completed.
-                            let wait_timer = crate::profile::start();
-                            let wait_started = Instant::now();
-                            for &out_handle in job.out_bo_handles {
+                        // PREP_BO waits on DMA_RESV_USAGE_WRITE fences for the
+                        // specific output handle, on the file that owns it. Each
+                        // task's interval from its submit to its wait returning
+                        // is what the profile's overlap line is built from.
+                        let wait_timer = crate::profile::start();
+                        for (target, submitted) in job.task_targets.iter().zip(&task_submitted) {
+                            for &out_handle in &target.out_bo_handles {
                                 if unsafe {
                                     rocket_device::prep_bo(
-                                        fd,
+                                        target.fd,
                                         out_handle,
                                         DISPATCH_COMPLETION_TIMEOUT_NS,
                                     )
@@ -1870,27 +1899,36 @@ unsafe extern "C" fn queue_execute(
                                     );
                                 }
                             }
-                            crate::profile::stop(
-                                wait_timer,
-                                crate::profile::Phase::Wait,
-                                job.profile_label,
-                                0,
-                            );
-                            crate::profile::record_wait(ctx.id, wait_started, Instant::now());
+                            crate::profile::record_wait(target.context, *submitted, Instant::now());
+                        }
+                        crate::profile::stop(
+                            wait_timer,
+                            crate::profile::Phase::Wait,
+                            job.profile_label,
+                            0,
+                        );
 
-                            // The task is now "complete" as far as the fence is
-                            // concerned. Whether it actually ran is a separate
+                        {
+                            // The dispatch is now "complete" as far as its fences
+                            // are concerned. Whether it actually ran is a separate
                             // question, and only the clock can answer it; see
                             // `HUNG_JOB_DISPATCH_FLOOR`. Refusing the result is
                             // the point -- returning it would be indistinguishable
-                            // from a correct inference.
+                            // from a correct inference. The floor is per dispatch
+                            // now that its tasks are batched: a killed task still
+                            // costs the whole watchdog timeout, so it still lands
+                            // past the floor.
                             let elapsed = started.elapsed();
                             if dispatch_times_enabled() {
                                 eprintln!(
-                                    "rocket: dispatch {:.2} ms  ctx={} prec={} mode={:?} tasks={} \
-                                 prog={:#018x} regcmd_iova={:?} in={:?} out={:?}",
+                                    "rocket: dispatch {:.2} ms  ctx={} task_ctx={:?} prec={} mode={:?} \
+                                     tasks={} prog={:#018x} regcmd_iova={:?} in={:?} out={:?}",
                                     elapsed.as_secs_f64() * 1e3,
                                     ctx.id,
+                                    job.task_targets
+                                        .iter()
+                                        .map(|target| target.context)
+                                        .collect::<Vec<_>>(),
                                     precision_label(job.precision_tag),
                                     job.dpu_mode,
                                     regcmd_tasks.len(),
@@ -1955,7 +1993,45 @@ unsafe extern "C" fn queue_execute(
                                     expected_bytes,
                                 )
                             };
-                            let written = if let Some(tiles) = &oc.source_tiles {
+                            let written = if !oc.tile_rects.is_empty() {
+                                // Fanned out: every tile's rows come from the
+                                // scratch of the context that ran it. The
+                                // replicas share the home scratch's layout, so
+                                // a tile's offsets are the same in each.
+                                let mut written = 0;
+                                for (tile, &context) in oc.tile_rects.iter().zip(&oc.tile_context) {
+                                    let source: &[u8] = if context == 0 {
+                                        scratch
+                                    } else {
+                                        let (ptr, len) = oc.replica_scratch[context - 1];
+                                        unsafe { std::slice::from_raw_parts(ptr as *const u8, len) }
+                                    };
+                                    written += if let Some(tiles) = &oc.source_tiles {
+                                        compact_tiled_accumulator_output(
+                                            source,
+                                            &tiles[tile.index..tile.index + 1],
+                                            oc.output_width,
+                                            oc.bytes_per_pixel,
+                                            oc.source_block_bytes,
+                                            dst,
+                                        )
+                                    } else {
+                                        compact_atomic_output_rect(
+                                            source,
+                                            oc.source_pixel_count,
+                                            oc.output_width,
+                                            tile.row,
+                                            tile.rows,
+                                            tile.column,
+                                            tile.columns,
+                                            oc.bytes_per_pixel,
+                                            oc.source_block_bytes,
+                                            dst,
+                                        )
+                                    };
+                                }
+                                written
+                            } else if let Some(tiles) = &oc.source_tiles {
                                 compact_tiled_accumulator_output(
                                     scratch,
                                     tiles,

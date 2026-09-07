@@ -548,6 +548,11 @@ pub fn report() {
         );
     }
 
+    let (reused, allocated) = crate::scratch_pool::stats();
+    if reused + allocated > 0 {
+        eprintln!("  scratch pool: {reused} reused, {allocated} allocated");
+    }
+
     // Per-op: which dispatch shapes the time is in, and for each, how it
     // splits between hardware and the host-side layout bridging around it.
     let columns: Vec<Phase> = Phase::ALL

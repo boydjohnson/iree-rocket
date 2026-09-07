@@ -198,6 +198,16 @@ impl WorkerPool {
         Arc::clone(&self.workers[self.placement.place(self.workers.len())].context)
     }
 
+    /// Every context but `home`, starting after it and wrapping, so the
+    /// tiles a command buffer fans out (`command_buffer::Replica`) land on
+    /// different first choices for different homes.
+    pub fn siblings(&self, home: usize) -> Vec<Arc<NpuContext>> {
+        let count = self.workers.len();
+        (1..count)
+            .map(|step| Arc::clone(&self.workers[(home + step) % count].context))
+            .collect()
+    }
+
     /// Queues `work` behind everything already queued on context `context`'s
     /// worker -- the context the command buffer was recorded against, since
     /// its scratch lives on that file. Returns immediately; the outcome

@@ -3140,6 +3140,21 @@ impl ConvPlan {
         &self,
         buffers: Buffers,
     ) -> StagedAccumulatorOutput {
+        let mut staged = self.staged_accumulator_programs();
+        for (program, tile) in staged.programs.iter_mut().zip(&staged.tiles) {
+            relocate_staged_accumulator(program, buffers, tile);
+        }
+        staged
+    }
+
+    /// [`ConvPlan::programs_with_staged_accumulator_output`] before
+    /// relocation: the programs still carry their input/weight/bias tile
+    /// offsets and an output offset of zero, and `tiles` says where each
+    /// one's output lands. Bind each with [`relocate_staged_accumulator`]
+    /// -- once per program, against whichever buffers that tile should use,
+    /// which is how one dispatch's tiles can be spread over several NPU
+    /// contexts without planning the dispatch once per context.
+    pub fn staged_accumulator_programs(&self) -> StagedAccumulatorOutput {
         assert!(
             self.shape.precision.writes_accumulators(),
             "staged accumulator output requires Int8Accumulator precision"
@@ -3159,14 +3174,7 @@ impl ConvPlan {
                 .checked_mul(blocks_per_pixel)
                 .and_then(|value| value.checked_mul(source_block_bytes))
                 .expect("accumulator tile scratch size overflow");
-            let local_output = buffers
-                .output
-                .checked_add(
-                    u32::try_from(scratch_offset)
-                        .expect("accumulator tile scratch offset exceeds u32"),
-                )
-                .expect("accumulator tile DMA address overflow");
-            let mut program = conv_2d_tile_program(
+            let program = conv_2d_tile_program(
                 self.shape,
                 self.kernels,
                 tile,
@@ -3174,13 +3182,6 @@ impl ConvPlan {
                 self.data_banks,
                 self.weight_banks,
                 OutputPlacement::ContiguousTile,
-            );
-            relocate_with_exact_output(
-                &mut program,
-                Buffers {
-                    output: local_output,
-                    ..buffers
-                },
             );
             programs.push(program);
             output_tiles.push(AccumulatorOutputTile {
@@ -3845,6 +3846,30 @@ pub fn relocate(commands: &mut [RegCmd], buffers: Buffers) {
     relocate_one::<CnaDcompAddr0>(commands, buffers.weights, true);
     relocate_one::<DpuRdmaBsBaseAddr>(commands, buffers.bias, true);
     relocate_one::<DpuDstBaseAddr>(commands, buffers.output, true);
+}
+
+/// Binds one program from [`ConvPlan::staged_accumulator_programs`]: input,
+/// weights and bias keep their tile offsets, and the output is placed at
+/// `buffers.output + tile.scratch_offset`, the tile's own contiguous range.
+pub fn relocate_staged_accumulator(
+    commands: &mut [RegCmd],
+    buffers: Buffers,
+    tile: &AccumulatorOutputTile,
+) {
+    let local_output = buffers
+        .output
+        .checked_add(
+            u32::try_from(tile.scratch_offset)
+                .expect("accumulator tile scratch offset exceeds u32"),
+        )
+        .expect("accumulator tile DMA address overflow");
+    relocate_with_exact_output(
+        commands,
+        Buffers {
+            output: local_output,
+            ..buffers
+        },
+    );
 }
 
 /// Binds a program while replacing its output tile offset with an exact DMA

@@ -424,6 +424,19 @@ since the program is self-contained and address-only-different between tiles.
 Both are cheap to fix and both compound with M3 (each tile is also an IRQ round
 trip on a little core).
 
+**Progress 2026-09-07** (`rocket-hal-driver/MULTICORE.md` §12). The second
+half is gone: `rocket-hal-driver/src/scratch_pool.rs` keeps every
+driver-private GEM buffer -- regcmd, input, bias, output, and the multicore
+replicas -- on a free list keyed on (file, size class), so a dispatch no
+longer pays `CREATE_BO` + `mmap` + first-touch faults per tile. Worth ViT
+1203 -> ~1050 ms, MobileNetV2 requant 290 -> 255, MobileNetV2 fp16 166 ->
+146 at one context, which makes it the largest single win of the multicore
+series. Also, every task of a dispatch is now submitted before any is waited
+for, so the per-tile `PREP_BO` no longer idles the core between tiles. The
+first half -- the whole-BO cache sync, ∝ pages not bytes -- stands, and is
+now the dominant cost of a fanned-out replica (`stage` 0.47 ms per ViT
+dispatch is mostly `fini_bo` over a 512 KiB input replica).
+
 ---
 
 ## P4 (S3) — the CBUF operand-reuse bits are never set
