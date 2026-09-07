@@ -70,6 +70,11 @@ from typing import NamedTuple, Sequence
 
 ROOT = Path(__file__).resolve().parents[1]
 
+# `KEY=VALUE` settings prefixed (via `env`) to every board run of the compiled
+# module, from `--board-env`. How a driver knob such as `ROCKET_NPU_CORES=3`
+# reaches the board without a shell profile the ssh session would not read.
+BOARD_ENV: list[str] = []
+
 # (test binary, test name). Two binaries, unlike the conv and pooling gates:
 # the FC oracle is split across `fc_hw` (the packing and column-independence
 # checks) and `fc_phase3_hw` (the ones that assert the job actually runs on
@@ -523,6 +528,7 @@ def run_rocket_module(
             f"chmod +x {shlex.quote(runtime_name)}",
             command_text(
                 [
+                    *(["env", *BOARD_ENV] if BOARD_ENV else []),
                     f"./{runtime_name}",
                     "--module=rocket.vmfb",
                     f"--function={function}",
@@ -794,6 +800,14 @@ def run_compiled_gate(
 def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument(
+        "--board-env",
+        action="append",
+        default=[],
+        metavar="KEY=VALUE",
+        help="environment setting for every board run of the compiled module (repeatable), "
+        "e.g. ROCKET_NPU_CORES=3",
+    )
+    parser.add_argument(
         "--board",
         required=True,
         help="SSH host name or config alias identifying the RK3588 board",
@@ -858,6 +872,10 @@ def main() -> None:
         help="leave staged artifacts in the printed remote temporary directory",
     )
     args = parser.parse_args()
+    for setting in args.board_env:
+        if "=" not in setting:
+            parser.error(f"--board-env expects KEY=VALUE, got {setting!r}")
+    BOARD_ENV.extend(args.board_env)
 
     if args.skip_raw and args.skip_compiled:
         raise SystemExit("both gates were skipped")

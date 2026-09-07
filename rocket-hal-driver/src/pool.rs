@@ -9,14 +9,20 @@
 //! `/dev/accel/accel0`, one DRM scheduler entity, one in-order queue that
 //! occupies at most one NPU core at a time.
 //!
-//! M0 ships with N fixed at 1: context 0 is a dup of the file every IREE
-//! buffer lives on, so nothing about which BO a job may name changes. What
-//! changes is the threading: a `queue_execute` returns as soon as its unit
-//! is queued, the worker pins itself to the big cluster once instead of per
-//! call, and the semaphore wait, the host layout work and the hardware
-//! submission all happen on the same thread in submission order. M1 adds
-//! contexts 1..N (their own `open()`s, their own scratch) and a placement
-//! policy that spreads units across them.
+//! Context 0 is a dup of the file every IREE buffer lives on, so a job on it
+//! may name any of them. Contexts `1..N` (M1) are fresh `open()`s: a job on
+//! one may only name BOs created on it, so every command buffer recorded
+//! against such a context stages the few bindings the hardware would read
+//! directly into its own scratch (`command_buffer::stage_direct`) and packs
+//! its coefficients on it (`weight_cache`, keyed per context). The host is
+//! the only fence IREE ever sees, so nothing cross-file is needed.
+//!
+//! Placement happens at command-buffer creation (`device::create_command_
+//! buffer`, MULTICORE.md §5.4 assignment (a)): the context chosen then is
+//! the file the command buffer's scratch is allocated on and the worker its
+//! unit goes to. `queue_execute` returns as soon as its unit is queued; the
+//! worker does the semaphore wait, the host layout work and the hardware
+//! submission on one thread, pinned once for its life.
 //!
 //! Ordering. A worker runs its units strictly in the order they were
 //! enqueued, waiting on each unit's semaphores before starting it. That is
@@ -27,14 +33,16 @@
 //! is therefore exactly today's semantics minus the thread churn.
 //!
 //! ```text
-//! ROCKET_NPU_CORES=N      worker contexts, 1..=8. M0 accepts only 1.
+//! ROCKET_NPU_CORES=N      worker contexts, 1..=8. Default 1. N above the
+//!                         core count is allowed: a fourth queue on three
+//!                         cores fills each core's submit bubble (§9).
 //! ROCKET_NPU_CORES=auto   one per NPU core (counted under
-//!                         /sys/bus/platform/devices/*.npu); M0 clamps to 1.
+//!                         /sys/bus/platform/devices/*.npu).
 //! ```
 
 use std::{
     sync::{
-        Mutex,
+        Arc, Mutex,
         atomic::{AtomicUsize, Ordering},
         mpsc,
     },
@@ -48,17 +56,21 @@ use crate::{
     status,
 };
 
-/// Everything a worker owns that is bound to one DRM file: MULTICORE.md
-/// §5.2. Scratch pools, regcmd pools and the per-context weight cache slice
-/// arrive with M1/M2; at M0 the context is the file and its identity.
+/// One DRM file and its identity: MULTICORE.md §5.2. Shared between the
+/// worker that submits on it and the command buffers recorded against it
+/// (which allocate their scratch on it at record time). Scratch and regcmd
+/// pools arrive with M2.
 pub struct NpuContext {
     /// `0` is the context whose file the device allocator also uses, so
     /// every IREE buffer is visible to it. Contexts `1..N` are fresh
     /// `open()`s and see only what was created on them.
     pub id: usize,
-    /// Owned by this context's worker thread and used from no other.
     pub file: std::fs::File,
 }
+
+/// How many contexts a pool may have: `ROCKET_NPU_CORES` is capped here and
+/// the profiler's per-context columns are sized by it.
+pub const MAX_CONTEXTS: usize = 8;
 
 /// Which worker a unit goes to. A trait so a kernel-side core hint
 /// (MULTICORE.md §7) slots in as a third implementation.
@@ -102,6 +114,7 @@ struct Unit {
 }
 
 struct Worker {
+    context: Arc<NpuContext>,
     sender: Mutex<Option<mpsc::Sender<Unit>>>,
     handle: Mutex<Option<JoinHandle<()>>>,
 }
@@ -113,23 +126,19 @@ pub struct WorkerPool {
 
 /// Reads `ROCKET_NPU_CORES`; see the module doc comment.
 pub fn requested_contexts() -> usize {
-    let requested = match std::env::var("ROCKET_NPU_CORES") {
-        Ok(value) if value == "auto" => npu_core_count().max(1),
+    match std::env::var("ROCKET_NPU_CORES") {
+        Ok(value) if value == "auto" => npu_core_count().clamp(1, MAX_CONTEXTS),
         Ok(value) => match value.parse::<usize>() {
-            Ok(n) if (1..=8).contains(&n) => n,
+            Ok(n) if (1..=MAX_CONTEXTS).contains(&n) => n,
             _ => {
-                eprintln!("rocket: ROCKET_NPU_CORES={value:?} is not 1..=8 or `auto`; using 1");
+                eprintln!(
+                    "rocket: ROCKET_NPU_CORES={value:?} is not 1..={MAX_CONTEXTS} or `auto`; using 1"
+                );
                 1
             }
         },
         Err(_) => 1,
-    };
-    if requested > 1 {
-        // M1 is where contexts 1..N get their own files and scratch.
-        eprintln!("rocket: ROCKET_NPU_CORES={requested} is not implemented yet (M0); using 1");
-        return 1;
     }
-    requested
 }
 
 /// The NPU cores the platform has, counted the only way mainline `rocket`
@@ -147,23 +156,27 @@ pub fn npu_core_count() -> usize {
 }
 
 impl WorkerPool {
-    /// Spawns one worker per context. Each worker asks for the big cluster
-    /// once, for its whole life (`cpu_affinity`), which is what
-    /// `prefer_fast_cpus` per `queue_execute` used to approximate.
-    pub fn new(contexts: Vec<NpuContext>, placement: Box<dyn Placement>) -> WorkerPool {
+    /// Spawns one worker per context. Each worker pins itself once, for its
+    /// whole life (`cpu_affinity::pin_worker`): to the big cluster when it
+    /// is alone, to its own big core when it has company.
+    pub fn new(contexts: Vec<Arc<NpuContext>>, placement: Box<dyn Placement>) -> WorkerPool {
         assert!(
-            !contexts.is_empty(),
-            "a worker pool needs at least one context"
+            !contexts.is_empty() && contexts.len() <= MAX_CONTEXTS,
+            "a worker pool needs 1..={MAX_CONTEXTS} contexts"
         );
+        let count = contexts.len();
         let workers = contexts
             .into_iter()
-            .map(|context| {
+            .enumerate()
+            .map(|(index, context)| {
                 let (sender, receiver) = mpsc::channel::<Unit>();
+                let worker_context = Arc::clone(&context);
                 let handle = std::thread::Builder::new()
                     .name(format!("rocket-npu-{}", context.id))
-                    .spawn(move || worker_main(context, receiver))
+                    .spawn(move || worker_main(worker_context, index, count, receiver))
                     .expect("spawn rocket NPU worker");
                 Worker {
+                    context,
                     sender: Mutex::new(Some(sender)),
                     handle: Mutex::new(Some(handle)),
                 }
@@ -176,17 +189,29 @@ impl WorkerPool {
         self.workers.len()
     }
 
-    /// Queues `work` behind everything already queued on the chosen worker.
-    /// Returns immediately; the outcome reaches IREE through `signal_list`
-    /// (signalled on success, failed with the status on error).
+    pub fn context(&self, id: usize) -> &Arc<NpuContext> {
+        &self.workers[id].context
+    }
+
+    /// The context the next command buffer should be recorded against.
+    pub fn place(&self) -> Arc<NpuContext> {
+        Arc::clone(&self.workers[self.placement.place(self.workers.len())].context)
+    }
+
+    /// Queues `work` behind everything already queued on context `context`'s
+    /// worker -- the context the command buffer was recorded against, since
+    /// its scratch lives on that file. Returns immediately; the outcome
+    /// reaches IREE through `signal_list` (signalled on success, failed with
+    /// the status on error).
     ///
     /// # Safety
     ///
     /// The semaphore lists must be valid for the duration of this call; they
     /// are copied and retained before it returns. `work` runs on another
     /// thread, so everything it captures must be safe to use there.
-    pub unsafe fn enqueue(
+    pub unsafe fn enqueue_on(
         &self,
+        context: usize,
         wait_list: iree_hal_semaphore_list_t,
         signal_list: iree_hal_semaphore_list_t,
         work: impl FnOnce(&NpuContext) -> iree_status_t + Send + 'static,
@@ -197,7 +222,7 @@ impl WorkerPool {
             work: Box::new(work),
             enqueued: Instant::now(),
         };
-        let index = self.placement.place(self.workers.len());
+        let index = context.min(self.workers.len() - 1);
         let sender = self.workers[index]
             .sender
             .lock()
@@ -242,10 +267,16 @@ impl Drop for WorkerPool {
     }
 }
 
-fn worker_main(context: NpuContext, receiver: mpsc::Receiver<Unit>) {
+fn worker_main(
+    context: Arc<NpuContext>,
+    index: usize,
+    workers: usize,
+    receiver: mpsc::Receiver<Unit>,
+) {
     // Held for the thread's life: the worker never wakes from `PREP_BO`
-    // onto an A55 (`cpu_affinity`, and MULTICORE.md §5.3).
-    let _fast_cpus = crate::cpu_affinity::prefer_fast_cpus();
+    // onto an A55, and with company never onto a sibling's core
+    // (`cpu_affinity`, and MULTICORE.md §5.3).
+    let _pinned = crate::cpu_affinity::pin_worker(index, workers);
     while let Ok(mut unit) = receiver.recv() {
         crate::profile::record(
             crate::profile::Phase::Queue,

@@ -170,6 +170,40 @@ pub fn prefer_fast_cpus() -> Restore {
     Restore(Some(current))
 }
 
+/// Pins the calling thread -- an NPU worker -- to one CPU of the preferred
+/// set for its life: worker `index` of `workers` takes the `index`-th
+/// preferred CPU the thread is allowed to use, wrapping if there are more
+/// workers than big cores. A lone worker keeps the whole preferred set
+/// ([`prefer_fast_cpus`]) so it can still move out of the way of IREE's own
+/// workers; pinning to one CPU only pays once several workers would
+/// otherwise crowd the same one after a `PREP_BO` wake.
+pub fn pin_worker(index: usize, workers: usize) -> Restore {
+    if workers <= 1 {
+        return prefer_fast_cpus();
+    }
+    let Some(preferred) = preferred() else {
+        return Restore(None);
+    };
+    let Ok(current) = sched_getaffinity(Pid::from_raw(0)) else {
+        return Restore(None);
+    };
+    let allowed: Vec<usize> = (0..CpuSet::count())
+        .filter(|&cpu| {
+            preferred.is_set(cpu).unwrap_or(false) && current.is_set(cpu).unwrap_or(false)
+        })
+        .collect();
+    if allowed.is_empty() {
+        return Restore(None);
+    }
+    let mut wanted = CpuSet::new();
+    if wanted.set(allowed[index % allowed.len()]).is_err()
+        || sched_setaffinity(Pid::from_raw(0), &wanted).is_err()
+    {
+        return Restore(None);
+    }
+    Restore(Some(current))
+}
+
 fn is_subset(inner: &CpuSet, outer: &CpuSet) -> bool {
     (0..CpuSet::count())
         .all(|cpu| !inner.is_set(cpu).unwrap_or(false) || outer.is_set(cpu).unwrap_or(false))

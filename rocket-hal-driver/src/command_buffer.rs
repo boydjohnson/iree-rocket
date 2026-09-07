@@ -111,6 +111,43 @@ pub enum InputPackingLayout {
 ///
 /// The scratch allocation and its DMA address are fixed while recording so
 /// the regcmd can be built immediately. The copy itself must happen later,
+/// Where a [`StagedCopy`] reads from.
+pub enum CopySource {
+    /// An IREE binding the hardware would have read directly on context 0.
+    Binding {
+        buffer: *mut iree_hal_buffer_t,
+        offset: usize,
+    },
+    /// Another context's cached coefficient packing, immutable once
+    /// published. `weight_buffer` is the binding it was packed from, whose
+    /// generation the copy is published under.
+    Shared {
+        source: Arc<weight_cache::SharedBuffer>,
+        weight_buffer: *mut iree_hal_buffer_t,
+    },
+}
+
+/// A byte copy into a non-zero context's own scratch, applied by
+/// `apply_ops` before the job that reads it is submitted.
+///
+/// MULTICORE.md §3/§5.2: a job on context `k` may only name BOs created on
+/// context `k`'s file. Almost every operand already goes through
+/// driver-private scratch (packing, compaction); the few that the hardware
+/// reads straight out of an IREE buffer on context 0 -- the ARGB feature
+/// input for `Cin <= 4`, coefficients and bias that need no packing -- are
+/// copied here instead, and so is a cached packing that lives on another
+/// context. On context 0 nothing is staged and no byte moves that did not
+/// move before.
+pub struct StagedCopy {
+    pub source: CopySource,
+    pub length: usize,
+    pub scratch_ptr: *mut u8,
+    pub scratch_handle: u32,
+    /// For a `Shared` source: the packing to publish under this context's
+    /// key once the copy is flushed, so the next command buffer here hits.
+    pub publish: Option<(WeightPublish, Arc<weight_cache::SharedBuffer>)>,
+}
+
 /// after preceding recorded update/fill/copy operations have populated the
 /// real IREE input buffer.
 #[derive(Clone, Copy)]
@@ -231,8 +268,52 @@ fn recorded_write_target(op: &RecordedOp) -> Option<*mut iree_hal_buffer_t> {
     }
 }
 
+/// The DMA address and GEM handle a job on `cb`'s context may use for a
+/// binding the hardware reads directly: the binding itself on context 0,
+/// a [`StagedCopy`] of it into this context's own scratch anywhere else.
+///
+/// # Safety
+///
+/// `binding.buffer` must be a live `RocketBuffer` and `cb.fd` a live Rocket
+/// DRM file description.
+unsafe fn stage_direct(
+    cb: &RocketCommandBuffer,
+    binding: &iree_hal_buffer_ref_t,
+    scratch_buffers: &mut Vec<RocketOwnedBuffer>,
+    staged_copies: &mut Vec<StagedCopy>,
+) -> (u32, u32) {
+    let rocket_buffer = unsafe { &*(binding.buffer as *const RocketBuffer) };
+    if cb.context.id == 0 {
+        return (
+            rocket_buffer.dma_address + binding.offset as u32,
+            rocket_buffer.handle,
+        );
+    }
+    let length = binding.length as usize;
+    let scratch =
+        unsafe { RocketOwnedBuffer::new(cb.fd, length.max(1), BorrowedFd::borrow_raw(cb.fd)) };
+    let staged = (scratch.dma_address, scratch.handle);
+    staged_copies.push(StagedCopy {
+        source: CopySource::Binding {
+            buffer: binding.buffer,
+            offset: binding.offset as usize,
+        },
+        length,
+        scratch_ptr: scratch.host_ptr,
+        scratch_handle: scratch.handle,
+        publish: None,
+    });
+    scratch_buffers.push(scratch);
+    staged
+}
+
 /// Points a dispatch at its packed coefficients, reusing a cached packing
 /// when one is valid for this binding at this geometry.
+///
+/// On a non-zero context a packing cached on another context cannot be
+/// named by this context's job; it is copied into a fresh buffer here
+/// (`staged_copies`) instead of packed again, and published under this
+/// context's key once the copy has landed.
 ///
 /// # Safety
 ///
@@ -242,12 +323,14 @@ unsafe fn stage_weights(
     cb: &RocketCommandBuffer,
     weight_ref: &iree_hal_buffer_ref_t,
     geometry: weight_cache::Geometry,
+    staged_copies: &mut Vec<StagedCopy>,
 ) -> StagedWeights {
     let key = weight_cache::Key {
         buffer: weight_ref.buffer as usize,
         offset: weight_ref.offset as u64,
         length: weight_ref.length as u64,
         geometry,
+        context: cb.context.id,
     };
     let generation = unsafe { crate::buffer::generation(weight_ref.buffer) };
     let pending_writer = cb
@@ -313,6 +396,34 @@ unsafe fn stage_weights(
             BorrowedFd::borrow_raw(cb.fd),
         )
     });
+    // Another context already packed these bytes: a copy is cheaper than a
+    // pack, and it is published under this context's key when it lands.
+    if !pending_writer && let Some(other) = weight_cache::lookup_other_context(&key, generation) {
+        staged_copies.push(StagedCopy {
+            source: CopySource::Shared {
+                source: other,
+                weight_buffer: weight_ref.buffer,
+            },
+            length: geometry.scratch_length,
+            scratch_ptr: scratch.host_ptr,
+            scratch_handle: scratch.handle,
+            publish: Some((
+                WeightPublish {
+                    key,
+                    bytes: geometry.scratch_length,
+                },
+                Arc::clone(&scratch),
+            )),
+        });
+        return StagedWeights {
+            addr: scratch.dma_address,
+            handle: scratch.handle,
+            packing: None,
+            scratch: Some(scratch),
+            publish: None,
+            probe: None,
+        };
+    }
     StagedWeights {
         addr: scratch.dma_address,
         handle: scratch.handle,
@@ -417,6 +528,9 @@ pub enum RecordedOp {
         /// the command buffer has finished executing and closes/unmaps them
         /// on every destruction path.
         scratch_buffers: Vec<RocketOwnedBuffer>,
+        /// Copies into this context's scratch that must land before the job
+        /// runs -- see [`StagedCopy`]. Empty on context 0.
+        staged_copies: Vec<StagedCopy>,
         /// GEM handles of every buffer this dispatch reads (bindings other
         /// than the output) -- must be listed in `drm_rocket_job.in_bo_handles`
         /// (device.rs's `queue_execute`) so the kernel driver's implicit
@@ -520,18 +634,23 @@ pub struct RocketCommandBuffer {
     /// plain field (rather than mimicking the null driver reference's
     /// single-trailing-allocation trick) is fine.
     validation_state: Vec<u8>,
-    /// A raw, borrowed device fd -- populated in `create()` from
-    /// `device_allocator`'s own `RocketAllocator.file`. Needed so
-    /// `dispatch()` can allocate a driver-private scratch GEM buffer for
-    /// Conv2d output compaction (see `OutputCompaction`) at record time,
-    /// before `build_conv_regcmd` bakes a DMA address into the regcmd
-    /// program. Sound to use independently of `RocketAllocator.file`'s own
-    /// lifetime: `RocketAllocator.file` and `RocketDevice.file` are
-    /// `try_clone()`'d duplicates of the same open file description (DRM
-    /// GEM handles are namespaced per underlying `struct file`, not per fd
-    /// integer), and `device_allocator` is guaranteed to outlive every
-    /// command buffer created against it.
+    /// The NPU context this command buffer was placed on at creation
+    /// (`device::create_command_buffer`): the DRM file every scratch GEM
+    /// buffer below is allocated on, and the worker `queue_execute` sends
+    /// it to. Context 0 is a dup of the allocator's file, so IREE buffers
+    /// may be handed to the hardware directly there; on any other context
+    /// a job may only name BOs created on that context's file, which is
+    /// what `stage_direct` and the per-context `weight_cache` key ensure.
+    context: Arc<crate::pool::NpuContext>,
+    /// `context.file`'s raw fd, for the many `RocketOwnedBuffer::new` and
+    /// `fini_bo` calls below. Valid as long as `context` is, which the
+    /// `Arc` guarantees.
     fd: RawFd,
+}
+
+/// The context `command_buffer` was recorded against, for `queue_execute`.
+pub unsafe fn context_id(command_buffer: *mut iree_hal_command_buffer_t) -> usize {
+    unsafe { (&*cast(command_buffer)).context.id }
 }
 
 unsafe fn cast(command_buffer: *mut iree_hal_command_buffer_t) -> *mut RocketCommandBuffer {
@@ -650,10 +769,46 @@ pub unsafe fn apply_ops(
                 profile_label,
                 weight_scratch,
                 weight_publish,
+                staged_copies,
                 ..
             } => {
                 if let Some(packing) = input_packing {
                     apply_input_packing(cb.fd, packing, profile_label)?;
+                }
+                // Bindings the hardware would read directly, and packings
+                // cached on another context: byte copies into this
+                // context's own scratch. Empty on context 0.
+                for copy in staged_copies {
+                    let timer = profile::start();
+                    let (source_ptr, generation) = match &copy.source {
+                        CopySource::Binding { buffer, offset } => {
+                            let source = unsafe { &*(*buffer as *const RocketBuffer) };
+                            (unsafe { source.host_ptr.add(*offset) as *const u8 }, 0)
+                        }
+                        CopySource::Shared {
+                            source,
+                            weight_buffer,
+                        } => (source.host_ptr as *const u8, unsafe {
+                            crate::buffer::generation(*weight_buffer)
+                        }),
+                    };
+                    unsafe {
+                        std::ptr::copy_nonoverlapping(source_ptr, copy.scratch_ptr, copy.length)
+                    };
+                    if unsafe { fini_bo(cb.fd, copy.scratch_handle) }.is_err() {
+                        return Err(status::from_code(
+                            crate::bindings::iree_status_code_e_IREE_STATUS_INTERNAL,
+                        ));
+                    }
+                    if let Some((publish, scratch)) = &copy.publish {
+                        weight_cache::publish(
+                            publish.key,
+                            generation,
+                            Arc::clone(scratch),
+                            publish.bytes,
+                        );
+                    }
+                    profile::stop(timer, profile::Phase::Stage, profile_label, copy.length);
                 }
                 // The second tensor of a two-tensor element-wise op. None
                 // for every other dispatch kind.
@@ -925,6 +1080,7 @@ pub unsafe fn apply_ops(
 
 pub unsafe fn create(
     device_allocator: *mut crate::bindings::iree_hal_allocator_t,
+    context: Arc<crate::pool::NpuContext>,
     mode: iree_hal_command_buffer_mode_t,
     command_categories: iree_hal_command_category_t,
     queue_affinity: iree_hal_queue_affinity_t,
@@ -933,15 +1089,12 @@ pub unsafe fn create(
     let validation_state_size = unsafe {
         crate::bindings::iree_hal_command_buffer_validation_state_size(mode, binding_capacity)
     };
-    let fd = unsafe {
-        (*(device_allocator as *mut crate::allocator::RocketAllocator))
-            .file
-            .as_raw_fd()
-    };
+    let fd = context.file.as_raw_fd();
     let cb = Box::new(RocketCommandBuffer {
         base: unsafe { std::mem::zeroed() }, // filled by iree_hal_command_buffer_initialize below
         ops: Vec::new(),
         validation_state: vec![0u8; validation_state_size],
+        context,
         fd,
     });
     let cb_ptr = Box::into_raw(cb);
@@ -1322,52 +1475,56 @@ unsafe extern "C" fn dispatch_impl(
                 );
             }
             let mut scratch_buffers = Vec::with_capacity(4);
+            let mut staged_copies = Vec::new();
 
             // CNA's surface-layout path consumes 16-byte feature-atomic
             // NC1HWC2 surfaces. Shapes with 1..=4 channels use the hardware's
             // dense ARGB modes and must remain dense; packing Cin 2..=4 into
             // 16-byte slots makes those modes read padding as later pixels.
-            let (input_addr, input_handle, input_packing) =
-                if shape.layout() == FeatureLayout::Surfaces {
-                    let scratch_bytes =
-                        match nc1hwc2_storage_size(pixel_count, packed_input_bytes_per_pixel) {
-                            Ok(value) => value,
-                            Err(_) => {
-                                return status::from_code(
+            let (input_addr, input_handle, input_packing) = if shape.layout()
+                == FeatureLayout::Surfaces
+            {
+                let scratch_bytes =
+                    match nc1hwc2_storage_size(pixel_count, packed_input_bytes_per_pixel) {
+                        Ok(value) => value,
+                        Err(_) => {
+                            return status::from_code(
                                 crate::bindings::iree_status_code_e_IREE_STATUS_INVALID_ARGUMENT,
                             );
-                            }
-                        };
-                    let scratch = unsafe {
-                        RocketOwnedBuffer::new(
-                            cb.fd,
-                            scratch_bytes.max(1),
-                            BorrowedFd::borrow_raw(cb.fd),
-                        )
+                        }
                     };
-                    let packed = (
-                        scratch.dma_address,
-                        scratch.handle,
-                        Some(InputPacking {
-                            input_buffer: refs[0].buffer,
-                            input_offset: refs[0].offset,
-                            input_length: refs[0].length,
-                            scratch_ptr: scratch.host_ptr,
-                            scratch_length: scratch_bytes,
-                            scratch_handle: scratch.handle,
-                            source_pixel_count: pixel_count,
-                            packed_pixel_count: pixel_count,
-                            bytes_per_pixel: input_bytes_per_pixel,
-                            packed_bytes_per_pixel: packed_input_bytes_per_pixel,
-                            padding_byte: 0,
-                            layout: InputPackingLayout::Nc1hwc2,
-                        }),
-                    );
-                    scratch_buffers.push(scratch);
-                    packed
-                } else {
-                    (addr(&refs[0]), handle(&refs[0]), None)
+                let scratch = unsafe {
+                    RocketOwnedBuffer::new(
+                        cb.fd,
+                        scratch_bytes.max(1),
+                        BorrowedFd::borrow_raw(cb.fd),
+                    )
                 };
+                let packed = (
+                    scratch.dma_address,
+                    scratch.handle,
+                    Some(InputPacking {
+                        input_buffer: refs[0].buffer,
+                        input_offset: refs[0].offset,
+                        input_length: refs[0].length,
+                        scratch_ptr: scratch.host_ptr,
+                        scratch_length: scratch_bytes,
+                        scratch_handle: scratch.handle,
+                        source_pixel_count: pixel_count,
+                        packed_pixel_count: pixel_count,
+                        bytes_per_pixel: input_bytes_per_pixel,
+                        packed_bytes_per_pixel: packed_input_bytes_per_pixel,
+                        padding_byte: 0,
+                        layout: InputPackingLayout::Nc1hwc2,
+                    }),
+                );
+                scratch_buffers.push(scratch);
+                packed
+            } else {
+                let (addr, handle) =
+                    unsafe { stage_direct(cb, &refs[0], &mut scratch_buffers, &mut staged_copies) };
+                (addr, handle, None)
+            };
             // IREE's conv ABI supplies a logical HWCF filter. Regular fp16
             // convolution consumes a blocked coefficient stream instead:
             // output-block, input-group, X, Y, output-lane, input-lane.
@@ -1420,6 +1577,7 @@ unsafe extern "C" fn dispatch_impl(
                                 .map(|q| q.weight_zero_point as i8),
                             scratch_length: scratch_bytes,
                         },
+                        &mut staged_copies,
                     )
                 }
             } else if shape.depthwise {
@@ -1461,10 +1619,13 @@ unsafe extern "C" fn dispatch_impl(
                                 .map(|q| q.weight_zero_point as i8),
                             scratch_length: scratch_bytes,
                         },
+                        &mut staged_copies,
                     )
                 }
             } else {
-                StagedWeights::direct(addr(&refs[1]), handle(&refs[1]))
+                let (addr, handle) =
+                    unsafe { stage_direct(cb, &refs[1], &mut scratch_buffers, &mut staged_copies) };
+                StagedWeights::direct(addr, handle)
             };
             let StagedWeights {
                 addr: weights_addr,
@@ -1563,7 +1724,9 @@ unsafe extern "C" fn dispatch_impl(
                 scratch_buffers.push(scratch);
                 packed
             } else {
-                (addr(&refs[2]), handle(&refs[2]), None)
+                let (addr, handle) =
+                    unsafe { stage_direct(cb, &refs[2], &mut scratch_buffers, &mut staged_copies) };
+                (addr, handle, None)
             };
             // DPU output write-back (16-byte slots normally, 128-byte native
             // accumulator blocks for bypassed int32) doesn't match IREE's
@@ -1654,6 +1817,7 @@ unsafe extern "C" fn dispatch_impl(
                 precision_tag: Some(shape.precision),
                 retained_bindings,
                 scratch_buffers,
+                staged_copies,
                 in_bo_handles: vec![input_handle, weights_handle, bias_handle],
                 out_bo_handles: vec![output_handle],
                 input_packing,
@@ -1794,6 +1958,8 @@ unsafe extern "C" fn dispatch_impl(
                     crate::bindings::iree_status_code_e_IREE_STATUS_INVALID_ARGUMENT,
                 );
             }
+            let mut staged_copies = Vec::new();
+            let mut staged_scratch = Vec::new();
             let StagedWeights {
                 addr: weights_addr,
                 handle: weights_handle,
@@ -1817,6 +1983,7 @@ unsafe extern "C" fn dispatch_impl(
                         weight_zero_point: None,
                         scratch_length: weight_scratch_bytes,
                     },
+                    &mut staged_copies,
                 )
             };
 
@@ -1861,7 +2028,9 @@ unsafe extern "C" fn dispatch_impl(
                     Some(scratch),
                 )
             } else {
-                (addr(&refs[2]), handle(&refs[2]), None, None)
+                let (addr, handle) =
+                    unsafe { stage_direct(cb, &refs[2], &mut staged_scratch, &mut staged_copies) };
+                (addr, handle, None, None)
             };
 
             let output_scratch_bytes =
@@ -1932,6 +2101,7 @@ unsafe extern "C" fn dispatch_impl(
                 )
             });
             let mut scratch_buffers = vec![input_scratch, output_scratch];
+            scratch_buffers.extend(staged_scratch);
             if let Some(probe) = weight_probe {
                 scratch_buffers.push(probe);
             }
@@ -1944,6 +2114,7 @@ unsafe extern "C" fn dispatch_impl(
                 precision_tag: None,
                 retained_bindings,
                 scratch_buffers,
+                staged_copies,
                 in_bo_handles: vec![input_scratch_handle, weight_scratch_handle, bias_handle],
                 out_bo_handles: vec![output_scratch_handle],
                 input_packing,
@@ -2124,6 +2295,7 @@ unsafe extern "C" fn dispatch_impl(
                 precision_tag: None,
                 retained_bindings,
                 scratch_buffers: vec![input_scratch, output_scratch],
+                staged_copies: Vec::new(),
                 in_bo_handles,
                 out_bo_handles,
                 input_packing,
@@ -2187,6 +2359,7 @@ unsafe extern "C" fn dispatch_impl(
                 in_bo_handles: vec![input_scratch.handle],
                 out_bo_handles: vec![output_scratch.handle],
                 scratch_buffers: vec![input_scratch, output_scratch],
+                staged_copies: Vec::new(),
                 input_packing: Some(input_packing),
                 operand_packing: None,
                 weight_packing: None,
@@ -2254,6 +2427,7 @@ unsafe extern "C" fn dispatch_impl(
                 in_bo_handles: vec![input_scratch.handle, operand_scratch.handle],
                 out_bo_handles: vec![output_scratch.handle],
                 scratch_buffers: vec![input_scratch, operand_scratch, output_scratch],
+                staged_copies: Vec::new(),
                 input_packing: Some(input_packing),
                 operand_packing: Some(operand_packing),
                 weight_packing: None,
@@ -2310,6 +2484,7 @@ unsafe extern "C" fn dispatch_impl(
                 in_bo_handles: vec![input_scratch.handle],
                 out_bo_handles: vec![output_scratch.handle],
                 scratch_buffers: vec![input_scratch, output_scratch],
+                staged_copies: Vec::new(),
                 input_packing: Some(input_packing),
                 operand_packing: None,
                 weight_packing: None,

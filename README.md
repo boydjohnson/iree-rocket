@@ -337,13 +337,17 @@ same this finds nothing to prefer and does nothing.
 queues it to a worker that owns one open of `/dev/accel/accel0` and runs
 units in submission order, signalling IREE's semaphores when each is done
 (`rocket-hal-driver/src/pool.rs`; the design and its measurements are in
-`rocket-hal-driver/MULTICORE.md`). The profile's `queue` row is the time a
-unit waited for its worker.
+`rocket-hal-driver/MULTICORE.md`). With `ROCKET_NPU_CORES=N` there are N
+such workers, each on its own open of the device -- its own DRM scheduler
+entity, so its own NPU core -- and each command buffer is placed on one of
+them when it is created. Results are bit-identical at any N; whether N > 1
+is faster depends on whether IREE gives the device independent command
+buffers to run at once, which the profile's `overlap` line reports.
 
 | Variable | Effect |
 |---|---|
-| `ROCKET_NPU_CORES=N` | Worker contexts. Only `1` is implemented (M0); higher values are refused with a message and fall back to 1. |
-| `ROCKET_NPU_CORES=auto` | One per NPU core once M1 lands; today the same fallback. |
+| `ROCKET_NPU_CORES=N` | Worker contexts, 1..=8. Default 1. |
+| `ROCKET_NPU_CORES=auto` | One per NPU core (3 on RK3588). |
 
 `iree-rocket-hal`'s `layout_bench` and `gem_bandwidth` examples measure the
 transforms and the GEM mapping directly, which is a much faster way to test a

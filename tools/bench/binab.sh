@@ -11,10 +11,17 @@
 #
 #   A=iree-benchmark-module-pre-m0 B=iree-benchmark-module-m0 \
 #     ARMS="mnv2.fp16 mnv2.int8 mnv2.static-int8" ./binab.sh
+#
+# A_ENV / B_ENV prefix each arm's command with environment settings, so one
+# binary can be A/B'd against itself under two configurations:
+#
+#   A=$B B_ENV="ROCKET_NPU_CORES=3" ./binab.sh
 set -u
 cd ~
 A=${A:-$HOME/iree-benchmark-module-pre-m0}
 B=${B:-$HOME/iree-benchmark-module-m0}
+A_ENV=${A_ENV:-}
+B_ENV=${B_ENV:-}
 PASSES=${PASSES:-4}
 MINTIME=${MINTIME:-3s}
 CPUSETS=${CPUSETS:-"4-7 0-7"}
@@ -35,8 +42,8 @@ wait_quiet() {
   echo "# WARNING: NPU never settled to suspended"
 }
 
-echo "# A:        $A ($(md5sum "$A" | cut -c1-8))"
-echo "# B:        $B ($(md5sum "$B" | cut -c1-8))"
+echo "# A:        $A ($(md5sum "$A" | cut -c1-8)) ${A_ENV}"
+echo "# B:        $B ($(md5sum "$B" | cut -c1-8)) ${B_ENV}"
 echo "# governor: $(for c in 0 4 6; do printf 'cpu%s=%s ' $c \
     "$(cat /sys/devices/system/cpu/cpu$c/cpufreq/scaling_governor)"; done)"
 echo "# npu irqs: $(for i in 82 83 84; do printf '%s->%s ' $i "$(cat /proc/irq/$i/smp_affinity_list)"; done)"
@@ -46,10 +53,10 @@ for a in $ARMS; do echo "# arm $a: $(md5sum $a.vmfb | cut -c1-8)"; done
 echo
 
 run_one() {
-  local bin=$1 label=$2 arm=$3 cpus=$4 p=$5
+  local bin=$1 label=$2 arm=$3 cpus=$4 p=$5 envs=$6
   wait_quiet
   sleep 1
-  out=$(taskset -c "$cpus" "$bin" \
+  out=$(env $envs taskset -c "$cpus" "$bin" \
           --module=$arm.vmfb --device=rocket --device=local-task \
           --function=main_graph --input=@"$INPUT" \
           --benchmark_min_time=$MINTIME 2>&1)
@@ -64,11 +71,11 @@ for p in $(seq 1 "$PASSES"); do
   for cpus in $CPUSETS; do
     for arm in $ARMS; do
       if [ $((p % 2)) = 1 ]; then
-        run_one "$A" A "$arm" "$cpus" "$p"
-        run_one "$B" B "$arm" "$cpus" "$p"
+        run_one "$A" A "$arm" "$cpus" "$p" "$A_ENV"
+        run_one "$B" B "$arm" "$cpus" "$p" "$B_ENV"
       else
-        run_one "$B" B "$arm" "$cpus" "$p"
-        run_one "$A" A "$arm" "$cpus" "$p"
+        run_one "$B" B "$arm" "$cpus" "$p" "$B_ENV"
+        run_one "$A" A "$arm" "$cpus" "$p" "$A_ENV"
       fi
     done
   done

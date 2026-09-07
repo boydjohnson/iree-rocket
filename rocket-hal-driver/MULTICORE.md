@@ -273,7 +273,7 @@ totals and the fraction of wall during which >= 2 jobs were in flight
 | | Scope | Gate |
 |---|---|---|
 | **M0** (done, §10) | `NpuContext` + worker pool at N=1. `queue_execute` enqueues instead of running/spawning; `run_after_wait` stays for the host-memcpy ops. No second file yet. | MobileNetV2 fp16/int8/requant and ViT within noise of today's numbers on planck, `taskset -c 4-7` and `0-7`. This is the regression gate for everything after it. |
-| **M1** | N contexts, dispatch-level placement (5.4 level 1, assignment (a)), barrier groups honoured, `stage_binding` copy hop at the four direct sites, per-context weight cache, global quiescence rule, `dpu_mode_multicore_hw`. | Bit-exact against N=1 on every e2e model; `overlap` > 0 on ViT. |
+| **M1** (built, §11) | N contexts, dispatch-level placement (5.4 level 1, assignment (a)), barrier groups honoured, `stage_binding` copy hop at the four direct sites, per-context weight cache, global quiescence rule, `dpu_mode_multicore_hw`. | Bit-exact against N=1 on every e2e model; `overlap` > 0 on ViT. |
 | **M2** | Task-level fan-out (5.4 level 2) with regcmd relocation (b), band packing, gather compaction, per-context scratch pools. | Bit-exact; requant MobileNetV2 faster than N=1 at N=3 on a full machine; `layout_bench`-style microbench shows pack/compact scaling. |
 | **M3** (optional) | Kernel-side placement, §7. | -- |
 
@@ -452,3 +452,96 @@ Not M0's, and not fixed here.
 The three e2e gates (`tools/e2e_{conv,matmul,pooling}_regression.py
 --board planck`) pass on the M0 runtime, including every mixed
 two-dispatches-in-one-command-buffer case.
+
+## 11. M1 as built (2026-09-07)
+
+What landed, against §5:
+
+- **N contexts.** `ROCKET_NPU_CORES=N|auto` works. Context 0 is a dup of
+  the device file; contexts 1..N are fresh `open()`s checked with
+  `is_rocket_device`. `NpuContext` is an `Arc` shared between its worker
+  and the command buffers placed on it, since scratch is allocated on the
+  context's file at record time.
+- **Placement at command-buffer creation** (§5.4 assignment (a)):
+  `create_command_buffer` takes `pool.place()` (round robin) and the
+  command buffer carries its context for its life; `queue_execute` sends
+  the unit to that context's worker. Workers with company pin to distinct
+  big cores (`cpu_affinity::pin_worker`); a lone worker keeps the cluster,
+  which is what M0 was gated with.
+- **The copy hop, `stage_direct`.** The four sites where the hardware read
+  an IREE buffer directly (conv ARGB input, unpacked coefficients, unpacked
+  bias, matmul bias) hand the binding through on context 0 and record a
+  `StagedCopy` into the context's own scratch anywhere else. `apply_ops`
+  applies the copies (`stage` profile phase) before the input sync. No
+  handle list ever names a foreign BO, which the kernel would reject.
+- **Weight cache per context.** `weight_cache::Key` gains `context`. A
+  miss on context k first looks for the same packing on any other context
+  (`lookup_other_context`) and, if found, records a byte copy of it and
+  publishes the copy under k's key when it lands -- `memcpy` at ~10 GB/s
+  instead of a re-pack. The profile's weight-cache line counts these as
+  `copied across contexts`.
+- **The hazard rule is time-based and device-global.** The old
+  `last_dpu_mode` mutex was held across the whole submission and would
+  have serialised every context. It is now a `last_depthwise_done`
+  instant: a dense submit on any context waits until 1 ms after the most
+  recent depthwise completion on any context, computed under the lock and
+  slept outside it. At N=1 this is the old dwell minus whatever compaction
+  already spent of it.
+- **`dpu_mode_multicore_hw`** (new hw test) settles §5.6's assumption:
+  depthwise on one file and dense on two others, 60 jobs each, four in
+  flight per queue so the entities stay on their cores, no dwell anywhere
+  -- exact, 0 wrong. The same-queue alternation control without dwell is
+  also 0 wrong of 120 at these shapes, which says nothing about the
+  original intermittent failure but is recorded.
+- **Barrier groups** are not split: with the two-device partitioning every
+  NPU command buffer this repo produces holds exactly one dispatch (49
+  units for ViT's 48 sites), so there is nothing inside a command buffer
+  to fan out. The hook is where `queue_execute` builds its unit.
+- **Diagnostics.** `ROCKET_DISPATCH_TIMES` lines carry `ctx=`; the profile
+  prints `wait.npu by context` and `overlap` (share of the span with two
+  or more waits in flight) whenever more than one context was used, and
+  the three e2e scripts take `--board-env KEY=VALUE` so a driver knob
+  reaches the board.
+
+**The finding that matters.** ViT at `ROCKET_NPU_CORES=3`, `ROCKET_PROFILE=1`:
+
+```text
+wait.npu by context: ctx0 127.6 ms, ctx1 125.2 ms, ctx2 124.6 ms
+overlap: 0.0% of the span between the first and last wait had >= 2 jobs in flight
+```
+
+Placement works -- the hardware time splits evenly three ways -- and
+nothing overlaps, because IREE orders command buffers on one device
+timeline: each NPU command buffer waits on the semaphore the previous one
+signals, whether or not the two are data-dependent. Concurrency in IREE's
+model lives *inside* a command buffer, between barriers, and the
+two-device partitioning gives this device one dispatch per command buffer.
+§4's hope that ViT's Q/K/V projections would fan out at this level was
+wrong for the program as compiled. So M1 is correct and buys nothing on
+the real models by itself; what it buys is the machinery M2 needs. The
+lever is task-level fan-out (§5.4 level 2): every ViT matmul and most
+MobileNetV2 convolutions are 3-12 CBUF tiles, and those are independent
+jobs today, just submitted one after another on one context.
+
+Gate (`tools/bench/binab.sh`, one binary, `A_ENV=ROCKET_NPU_CORES=1`
+against `B_ENV=ROCKET_NPU_CORES=3`, 4 interleaved passes, medians of
+real_time in ms):
+
+| Arm | cpus | N=1 | N=3 | N=3 / N=1 |
+|---|---|---|---|---|
+| mnv2.fp16 | 4-7 | 166.5 | 175.0 | 1.051 |
+| mnv2.int8 (accumulator) | 4-7 | 317.0 | 314.5 | 0.992 |
+| mnv2.static-int8 (requant) | 4-7 | 289.0 | 295.0 | 1.021 |
+| vit.npu.caps3584 | 4-7 | 1190.5 | 1186.0 | 0.996 |
+| mnv2.fp16 | 0-7 | 138.5 | 142.0 | 1.025 |
+| mnv2.int8 (accumulator) | 0-7 | 269.0 | 274.0 | 1.019 |
+| mnv2.static-int8 (requant) | 0-7 | 242.5 | 242.0 | 0.998 |
+| vit.npu.caps3584 | 0-7 | 866.5 | 864.5 | 0.998 |
+
+Zero hangs in 64 runs; output bit-identical to the pre-M0 binary at N=1,
+3 and 4 on all four models; the conv, matmul and pooling e2e gates pass at
+`--board-env ROCKET_NPU_CORES=3`. The 2-5 % the fp16 arm loses at N=3 is
+the price of three pinned workers with nothing to overlap: the copy hop
+for its ARGB stem input, the coefficient fan-out, and a worker that can
+no longer drift to an idle core. It is the cost M2 has to earn back
+before anything else.

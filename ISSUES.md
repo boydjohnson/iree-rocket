@@ -329,6 +329,20 @@ a cube-chained sequence is inherently single-fd. Pick per shape.
 Also worth knowing while you are there: each fd carries its own independent 4 GB
 IOVA window, so N fds also multiply addressable device memory.
 
+**Progress 2026-09-07** (`rocket-hal-driver/MULTICORE.md` §9-§11). The
+hardware term is measured: N opens scale 1 / 2.0 / 3.0x on three cores for
+both a conv and a matmul, and the fc host phases pipeline to 4.0x. The driver
+now has the N-context worker pool (`ROCKET_NPU_CORES`), placement per command
+buffer, the copy hop for the four direct-binding sites, a per-context weight
+cache and a device-global time-based depthwise dwell -- bit-exact at any N,
+gated on four models and the three e2e gates. It buys nothing yet: IREE
+orders command buffers on one device timeline and the two-device
+partitioning gives this device one dispatch per command buffer, so `overlap`
+is 0.0 % on ViT at N=3. Dispatch-level placement is therefore not the lever
+on these programs; the notes' "multicore only helps a multi-tile conv" above
+is exactly right, and the remaining work is M2, splitting one dispatch's CBUF
+tiles across contexts. Still open.
+
 ---
 
 ## P2 (S3) — cross-op chaining is HW-proven for fp16, and this repo's fp16 output cube is already the right layout
