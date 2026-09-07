@@ -3235,6 +3235,15 @@ impl ConvPlan {
 /// The `Cin` ceiling is [`large_kernel_max_in_channels`], which is where
 /// the hardware measurement lives.
 fn assert_large_kernel_plan_case(shape: Shape, kernel: usize, precision_neutral: bool) {
+    // Characterization needs to reach exactly the shapes this refuses: every
+    // refusal below is a record of what hardware does, and the only way to
+    // improve that record is to build the refused shape and read what comes
+    // back. This lifts all three -- precision, stride and `Cin` -- because
+    // each of them was written from a measurement that stopped where the
+    // instrument stopped. See `large_kernel_probing_allowed`.
+    if large_kernel_probing_allowed() {
+        return;
+    }
     assert!(
         precision_neutral || matches!(shape.precision, Precision::Fp16),
         "automatic planning at this kernel size currently has capture backing \
@@ -3244,13 +3253,7 @@ fn assert_large_kernel_plan_case(shape: Shape, kernel: usize, precision_neutral:
         shape.stride, 1,
         "automatic planning above 3x3 currently has capture backing only at stride 1"
     );
-    let ceiling = large_kernel_max_in_channels(shape.precision, kernel).unwrap_or_else(|| {
-        panic!(
-            "{:?} convolution above 3x3 computes wrong values on RK3588; see \
-             large_kernel_max_in_channels",
-            shape.precision
-        )
-    });
+    let ceiling = large_kernel_max_in_channels(shape.precision, kernel);
     assert!(
         shape.in_channels <= ceiling,
         "{kernel}x{kernel} {:?} is measured correct only to Cin {ceiling}, not \
@@ -3260,14 +3263,25 @@ fn assert_large_kernel_plan_case(shape: Shape, kernel: usize, precision_neutral:
     );
 }
 
-/// Largest `Cin` a kernel above 3x3 is measured correct at, per precision --
-/// or `None` where the rung computes wrong values at *every* `Cin` and the
-/// kernel is refused outright.
+/// Lifts [`assert_large_kernel_plan_case`] entirely, so a probe can build the
+/// shapes above 3x3 that the refusals exist to keep off hardware.
 ///
-/// Measured on `planck` 2026-09-04 with `dtype_boundary_probe`, `Selectors`,
-/// one shape per case, extents 8x8 / 16x16 / 32x32 (the boundary does not
-/// move with extent, and `Cout` does not move it either -- 7x7 fp16 at
-/// `Cin` 32 is exact at `Cout` 64, 128, 160, 192 and 256):
+/// The `Cin` cliff hangs the NPU and the watchdog kills the job, so a sweep
+/// that walks past a ceiling will leave the device sick -- see the wedge
+/// protocol in `dtype_boundary_probe`. Nothing on the compiled path sets
+/// this; it is the counterpart of [`unbacked_channels_allowed`] for kernel
+/// size rather than channel count.
+fn large_kernel_probing_allowed() -> bool {
+    std::env::var_os("ROCKET_ALLOW_LARGE_KERNEL_PROBING").is_some()
+}
+
+/// Largest `Cin` a kernel above 3x3 is measured correct at, per precision.
+///
+/// Measured on `planck` with `dtype_boundary_probe`, one shape per case (the
+/// sweep contaminates itself), extents 8x8 / 16x16 / 32x32. The boundary does
+/// not move with extent, and `Cout` does not move it either -- 7x7 fp16 at
+/// `Cin` 32 is exact at `Cout` 64, 128, 160, 192 and 256, and 7x7 int8 at
+/// `Cin` 64 is exact at `Cout` 64, 128 and 256:
 ///
 ///   7x7   fp16  Cin 64 exact, 72/80/88/96/128/192 hang
 ///   9x9   fp16  Cin 64 exact, 96 hangs
@@ -3275,33 +3289,46 @@ fn assert_large_kernel_plan_case(shape: Shape, kernel: usize, precision_neutral:
 ///   7x7   tf32  Cin 32 exact, 48/64/96 hang
 ///   7x7   int4  Cin 128 exact, 160/192/224/256/288/384 hang
 ///   7x7   bf16/int16  Cin 64 exact (the dtype ladders)
-///   5x5   fp16/bf16 to Cin 320, tf32 to 192, int4/int16 at 64: all exact
+///   7x7   int8  Cin 64 exact, 72 hangs      (2026-09-07)
+///   9x9   int8  Cin 64 exact, 96 hangs      (2026-09-07)
+///   11x11 int8  Cin 64 exact, 96 hangs      (2026-09-07)
+///   5x5   fp16/bf16/int8 to Cin 320, tf32 to 192, int4/int16 at 64: all exact
 ///
-/// The four ceilings do not reduce to one quantity. `Cin * element_bytes`
-/// fits fp16 (128 bytes) and tf32 (128) and misses int4, which stops at 64;
-/// feature atoms fit fp16 and tf32 at 8 and miss int4 at 4. So this is a
-/// table of what was measured rather than a rule, and 5x5 is deliberately
-/// not in it -- nothing at 5x5 has failed yet, at any width.
+/// Above 3x3 the ceilings fit **`Cin * element_bytes`** taking one of two
+/// values: 128 bytes at the two- and four-byte widths (fp16/bf16/int16 at
+/// `Cin` 64, tf32 at 32) and 64 bytes below two bytes (int8 at `Cin` 64, int4
+/// at 128). That fit only appeared once int8 was measured: with int8 missing,
+/// int4's 64 bytes was a lone outlier and the note here said the ceilings
+/// reduced to no single quantity. It is a fit to six points and not a
+/// mechanism -- nothing here explains why the budget halves below two bytes --
+/// so the table, not the formula, is what the code reads. 5x5 is deliberately
+/// absent: nothing at 5x5 has failed yet, at any width or precision.
 ///
-/// **int8 is refused above 3x3 outright.** It is not a ceiling: at 5x5 and
-/// 7x7, `Cin` 16, 32 and 64 alike come back with every output channel
-/// holding the *same* value at a given pixel (`want 2 got -13`, ~14600 of
-/// 16384 elements wrong, max|diff| 30-43). That is the signature of the
-/// coefficients not reaching their channels at all, not of a starved
-/// stream, and no int8 capture above 3x3 exists to say what the program
-/// should be. The requantized and accumulator rungs share the packing, so
-/// both are refused.
-fn large_kernel_max_in_channels(precision: Precision, kernel: usize) -> Option<u32> {
+/// **int8 used to be refused above 3x3 outright, and that refusal was wrong.**
+/// It rested on 5x5 and 7x7 returning the same value in every output channel
+/// of a pixel at `Cin` 16, 32 and 64 alike -- read at the time as coefficients
+/// not reaching their channels. The cause was the instrument: on 2026-09-04
+/// `dtype_boundary_probe` had no `SelectorsAffine` branch, so every int8 case
+/// fell through to `Selectors`, a signed coefficient form that is not the int8
+/// ABI and says nothing about the device. Re-measured on 2026-09-07 the same
+/// binary fails that way at 1x1 and 3x3 too, where int8 is known exact to
+/// `Cin` 512 -- the fault never had a kernel-size dependence, and only looked
+/// like one because 1x1 and 3x3 were gated by the ladders, which pass the
+/// affine pattern, and never went through the probe. Under `SelectorsAffine`
+/// int8 tracks fp16 at every kernel size, which is the table above.
+fn large_kernel_max_in_channels(precision: Precision, kernel: usize) -> u32 {
     match precision {
-        Precision::Int8(_) | Precision::Int8Accumulator(_) => None,
         // 5x5 has no measured ceiling at any width; the CBUF planner's own
         // refusal is what bounds it.
-        _ if kernel <= 5 => Some(u32::MAX),
-        Precision::Tf32 => Some(32),
-        Precision::Int4 => Some(128),
-        Precision::Fp16 | Precision::Fp16Accumulator | Precision::Bf16 | Precision::Int16 => {
-            Some(64)
-        }
+        _ if kernel <= 5 => u32::MAX,
+        Precision::Tf32 => 32,
+        Precision::Int4 => 128,
+        Precision::Fp16
+        | Precision::Fp16Accumulator
+        | Precision::Bf16
+        | Precision::Int16
+        | Precision::Int8(_)
+        | Precision::Int8Accumulator(_) => 64,
     }
 }
 

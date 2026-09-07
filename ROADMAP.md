@@ -126,7 +126,7 @@ matcher fall back to the CPU silently rather than panic.
 | conv → LUT and conv → EW add as two tasks in one job | `build_conv_then_lut_regcmd`, `build_conv_then_add_regcmd`; `conv_then_lut_hw`, `conv_with_add_hw` | No way to say "two tasks, one job". Every LUT or EW op is its own dispatch with its own NC1HWC2 round trip |
 | int8 two-tensor element-wise, with output zero point, conversion offset and two scale ratios | `EwAddShape` with `EwPrecision::Int8` in [`elementwise.rs`](iree-rocket-hal/src/rocket/elementwise.rs) | `ElementwiseBinaryDef` is fp16 only, deliberately: the ratio semantics are inferred from register shape, not confirmed by a capture, and MUL has no int8 recipe at all (`docs/compatibility.md`) |
 | Per-output-channel weight zero points | `pack_hwcf_to_rocket_weights_affine_i8` takes one zero point per `Cout` | One scalar `weights_zero_point`; the driver broadcasts it across every channel |
-| Explicit CBUF plans and bank overrides for kernels above 3x3 | `ConvPlan` with an override; fp16 measured to 11x11 (LIMITS.md) | `weights_width`/`height` can name any extent, but automatic planning covers 1x1 and 3x3 only and no wire field can ask for an override |
+| Explicit CBUF plans and bank overrides for kernels above 3x3 | `ConvPlan` with an override; fp16 measured to 11x11 and int8 to 7x7 (LIMITS.md) | `weights_width`/`height` can name any extent, but automatic planning covers 1x1 and 3x3 only and no wire field can ask for an override |
 
 Two absences are deliberate and are not gaps: the pooling pad-fill value,
 which the driver derives from method and precision so a producer cannot

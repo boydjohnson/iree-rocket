@@ -160,24 +160,29 @@ Measured on `planck` 2026-09-04 with `dtype_boundary_probe`. These are **hangs**
 (the watchdog kills the job), not wrong data, so they are contained by
 `large_kernel_max_in_channels` refusing the shape up front:
 
-| Kernel | fp16 / bf16 / int16 / fp16-acc | tf32 | int4 | int8 |
+| Kernel | fp16 / bf16 / int16 / fp16-acc | tf32 | int4 | int8 / int8-acc |
 |---|---|---|---|---|
-| 5x5 | no measured ceiling | no measured ceiling | no measured ceiling | **refused** |
-| 7x7 | `Cin` 64 | `Cin` 32 | `Cin` 128 | **refused** |
-| 9x9 | `Cin` 64 | refused (fp16-only) | refused (fp16-only) | **refused** |
-| 11x11 | `Cin` 64 | refused (fp16-only) | refused (fp16-only) | **refused** |
+| 5x5 | no measured ceiling | no measured ceiling | no measured ceiling | no measured ceiling |
+| 7x7 | `Cin` 64 | `Cin` 32 | `Cin` 128 | `Cin` 64 |
+| 9x9 | `Cin` 64 | refused (fp16-only) | refused (fp16-only) | refused (fp16-only) |
+| 11x11 | `Cin` 64 | refused (fp16-only) | refused (fp16-only) | refused (fp16-only) |
 
-At 5x5 nothing has failed at any width; the CBUF planner's own refusal is what
-bounds it. 5x5 and 7x7 are planned precision-neutrally, subject to that `Cin`
-ceiling; 9x9 and 11x11 key on a channel *count* whose byte footprint differs
-fourfold across the rungs, so `assert_large_kernel_plan_case` admits fp16 only
-there.
+At 5x5 nothing has failed at any width or precision; the CBUF planner's own
+refusal is what bounds it. 5x5 and 7x7 are planned precision-neutrally, subject
+to that `Cin` ceiling; 9x9 and 11x11 key on a channel *count* whose byte
+footprint differs fourfold across the rungs, so `assert_large_kernel_plan_case`
+admits fp16 only there.
 
-**int8 is refused above 3x3 outright**, and it is not a ceiling: at 5x5 and 7x7,
-`Cin` 16, 32 and 64 alike come back with every output channel holding the same
-value at a given pixel (~14600 of 16384 elements wrong). That is coefficients
-not reaching their channels at all. Both int8 rungs share the packing, so both
-are refused. ISSUES.md C9 carries the write-up.
+The ceilings fit `Cin * element_bytes` taking one of two values: 128 bytes at
+two and four bytes per element, 64 bytes below two. It is a fit to six points
+rather than a mechanism, so the code reads a table.
+
+**int8 above 3x3 was refused outright until 2026-09-07, and that refusal was
+wrong** — it rested on a probe that fed the int8 path a signed coefficient
+pattern which is not the int8 ABI, and which fails identically at 1x1 and 3x3.
+int8 is exact to `Cin` 320 at 5x5 and to the ordinary `Cin` 64 ceiling at 7x7,
+in both output modes, gated by `int8_large_kernel_matrix_matches_oracle`.
+ISSUES.md C9 carries the write-up and the retraction.
 
 ## Matmul
 

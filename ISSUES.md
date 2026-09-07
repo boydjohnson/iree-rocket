@@ -147,29 +147,33 @@ the memories that made load-bearing claims.
 
 ---
 
-## C9 (S2) — above 3x3 the conv path has two faults the fp16 capture sweep could not have seen: a `Cin` cliff that hangs at every width, and an int8 program that computes wrong values at every shape
+## C9 (S3) — above 3x3 there is a `Cin` cliff that hangs at every precision. The int8 half of this issue is **retracted**: it was the instrument, not the device
 
 Found 2026-09-04 while extending the datatype ladders past their first-light
-shapes (bf16, int16, int4, tf32, fp16-f32out). Both are **guarded now** rather
-than fixed: `large_kernel_max_in_channels` refuses what hardware does not do,
-so a program that used to hang is a loud panic instead. Neither is reachable
-from the compiler, whose matchers stop at 3x3.
+shapes. Re-measured 2026-09-07, which retracted half of it and moved int8 into
+the ordinary table.
+
+The cliff is **guarded** rather than fixed: `large_kernel_max_in_channels`
+refuses what hardware does not do, so a program that used to hang is a loud
+panic instead. It is not reachable from the compiler, whose matchers stop at
+3x3. Severity drops S2 -> S3 with the wrong-values half gone: what is left is a
+documented ceiling on shapes nothing can currently ask for.
 
 The same sweep found two tf32 faults that *are* fixed, both also hangs rather
-than wrong data, and both now board-validated over the whole ladder:
+than wrong data, and both board-validated over the whole ladder:
 `Precision::out_channel_granule` (tf32 was the one rung whose granule was not
 a multiple of 16, and every padded `Cout` at `8 (mod 16)` hung) and
 `streamed_weight_bank_preference_for_group` (its coefficient working set was
 calibrated at 1- and 2-byte widths and starved the 4-byte stream, so tf32 k=3
 `Cin` 576-896 planned 5/7 and hung where the same *footprint* at fp16 plans
-1/11 and is exact). Neither is in the table below.
+1/11 and is exact).
 
 ### The `Cin` cliff [verified]
 
 At 7x7, 9x9 and 11x11, a convolution is exact up to a per-width `Cin` and
 **hangs the NPU above it** -- a watchdog kill at ~500 ms, `prep_bo` returning
 success over an error-signalled fence, i.e. the C3 signature. Measured with
-`dtype_boundary_probe`, `Selectors`, one shape per case:
+`dtype_boundary_probe`, one shape per case:
 
 | kernel | precision | exact | hangs |
 |---|---|---|---|
@@ -179,35 +183,68 @@ success over an error-signalled fence, i.e. the C3 signature. Measured with
 | 7x7 | tf32 | 32 | 48, 64, 96 |
 | 7x7 | int4 | 128 | 160, 192, 224, 256, 288, 384 |
 | 7x7 | bf16, int16 | 64 | — (ladder stops at the fp16 ceiling) |
+| 7x7 | **int8** | **64** | **72** |
+| 9x9 | **int8** | **64** | **96** |
+| 11x11 | **int8** | **64** | **96** |
 
 Three things it is **not**: extent-dependent (the fp16 cliff sits between 64
-and 72 at 8x8, 16x16 and 32x32 alike), `Cout`-dependent (7x7 fp16 at `Cin` 32
-is exact at `Cout` 64, 128, 160, 192 and 256, up to a *larger* coefficient
-footprint than the hanging shapes), or a CBUF-split artifact (9x9 `Cin` 64
-takes 6/6 and 11x11 takes 3/9, and both hang one step later). The ceilings do
-not reduce to one quantity either: `Cin * element_bytes` fits fp16 and tf32 at
-128 bytes and misses int4 at 64; feature atoms fit those two at 8 and miss
-int4 at 4.
+and 72 at 8x8, 16x16 and 32x32 alike; int8's 7x7 `Cin` 64 is exact at 8x8,
+16x16 and 32x32), `Cout`-dependent (7x7 fp16 at `Cin` 32 is exact at `Cout`
+64, 128, 160, 192 and 256; int8 at `Cin` 64 is exact at `Cout` 64, 128 and
+256), or a CBUF-split artifact (9x9 `Cin` 64 takes 6/6 and 11x11 takes 3/9,
+and both hang one step later).
+
+**The ceilings now fit two constants, where before they fit none.**
+`Cin * element_bytes` is 128 bytes at the two- and four-byte widths (fp16,
+bf16, int16 at `Cin` 64; tf32 at 32) and 64 bytes below two bytes (int8 at
+`Cin` 64; int4 at 128). That fit only appeared once int8 was measured
+correctly: with int8 refused, int4's 64 bytes was a lone outlier and this
+section said the ceilings reduced to no single quantity. It is a fit to six
+points, not a mechanism — nothing explains why the budget halves below two
+bytes — so the code still reads a table.
 
 **Why it was invisible:** `conv_kernel_size_hw.rs`, the only above-3x3
 coverage, sweeps `Cin` 16, 24, 32, 48 and 64 -- it stops exactly at the last
-value that works. 5x5 is unaffected at every width tried (fp16 and bf16 to
-`Cin` 320, tf32 to 192).
+value that works. 5x5 is unaffected at every width tried (fp16, bf16 and int8
+to `Cin` 320, tf32 to 192).
 
-### int8 above 3x3 [verified]
+### int8 above 3x3 [retracted 2026-09-07]
 
-At 5x5 and 7x7, int8 returns **the same value in every output channel of a
-pixel** -- `want 2 got -13`, ~14,600 of 16,384 elements wrong, max|diff| 30-43
--- at `Cin` 16, 32 and 64 alike, on a healthy device with a passing canary.
-That is coefficients not reaching their channels, not a starved stream. No
-int8 capture above 3x3 exists to say what the program should be, so both int8
-rungs are refused there rather than guessed at.
+**There is no int8 fault above 3x3.** int8 is now gated at 5x5 and 7x7 in both
+output modes by `int8_large_kernel_matrix_matches_oracle`, 24 cases, all exact
+on `planck`, including `Cin` 320 at 5x5 and the ceiling rung `Cin` 64 at 7x7.
 
-The gate that used to hide all of this refused *every* non-fp16 precision above
-3x3, on the grounds that the capture sweep was fp16. Half of that was
-over-broad -- 5x5 and 7x7 take `demand_based_cbuf_partition`, which is stated
-in bytes and shared with 1x1 and 3x3 at every precision -- and the other half
-was masking a fault fp16 has too.
+The retracted claim was that at 5x5 and 7x7 int8 returned the same value in
+every output channel of a pixel — `want 2 got -13`, ~14,600 of 16,384 elements
+wrong — at `Cin` 16, 32 and 64 alike, read as coefficients not reaching their
+channels. The observation was real and reproduces exactly on a rebuild of
+f1a6f92. **The cause was the harness.** On 2026-09-04 `dtype_boundary_probe`
+had no `SelectorsAffine` branch, so every int8 case fell through to
+`_ => Selectors`, a signed coefficient form that is not the int8 ABI. Today's
+probe routes int8 to the affine pattern with the comment "or every int8 case
+fails before the hardware is asked" — someone fixed the instrument without
+coming back to retract the finding it had produced.
+
+What settles it is the control the original sweep never ran: on that same
+f1a6f92 binary, `Selectors` int8 fails **identically at 1x1 and 3x3**, where
+int8 is known exact to `Cin` 512, and `Dense` fails at all four kernel sizes
+while `Counting` passes at all four. The fault never had a kernel-size
+dependence. It looked like one because 1x1 and 3x3 were gated by the ladders,
+which pass the affine pattern, and so never went through the probe at all —
+the only int8 shapes anyone drove through the broken default were the
+above-3x3 ones.
+
+**Method note.** This is the third finding in this repo where a harness that
+assembled the wrong program was read as a hardware fault; see the retracted
+"int8 depthwise multi-tile" and the raw-plan depthwise repro that sent the C8
+search into the wrong layer. The cheap control in all three cases is the same:
+**run the instrument at a shape that is already known good.** Two minutes of
+1x1 would have caught this on the day.
+
+`ROCKET_ALLOW_LARGE_KERNEL_PROBING=1` lifts `assert_large_kernel_plan_case`
+entirely, which is how the above-3x3 shapes get built for characterization.
+It hangs the device by design at a shape past the cliff, so drive it one
+shape per process and keep the canary between runs.
 
 ---
 
@@ -1559,10 +1596,11 @@ Where the time actually is, per inference: `outside` **70.9 ms (54%)**,
    needs a driver-side `clk_set_rate`, and both shortcuts hang the box. Low
    ceiling for the risk. (The "~10% of wall" this used to cite came from P8's
    superseded profile; it is 20.6% now, because the denominator shrank.)
-7. **C9, C6, C7, D1, D2** — limitations, hygiene and reconciliation. C9 is
-   the only S2 among them: above 3x3 there is a `Cin` cliff that hangs at every
-   precision and an int8 program that is wrong at every shape, both now behind
-   loud refusals rather than fixed.
+7. **C9, C6, C7, D1, D2** — limitations, hygiene and reconciliation. All S3
+   now: C9's int8 half was retracted on 2026-09-07 (an instrument fault, not a
+   device one) and int8 joined the ordinary ceiling table, leaving only the
+   `Cin` cliff above 3x3 — a hang behind a loud refusal, on shapes the
+   compiler's matchers cannot reach.
 
 Done and in **Resolved**: the requantized int8 path (2026-09-06), C2
 (2026-09-07), P6 (2026-09-07).
