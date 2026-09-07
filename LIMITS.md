@@ -327,6 +327,27 @@ on them that are not in the table:
   stem is the one in that model -- offloads through the plain rows and keeps
   its clamp on the CPU.
 
+The `conv + pad 1` rows claim a convolution *and* the `tensor.pad` in front of
+it, so the CNA pads instead of IREE materializing a full-tensor copy. Bounds
+that are not in the table:
+
+- **The pad must be symmetric, and that is the hardware.** `CNA_PAD_CON0` has
+  `pad_top` and `pad_left` and nothing else, and each applies to *both* sides:
+  `Shape::output_width` is `(w + 2 * pad_left - kw) / stride + 1`, matched
+  against all 150 strided programs in the vendor corpus. There is no
+  trailing-pad register, so `low[0] high[1]` -- ONNX's `auto_pad = SAME_UPPER`
+  at stride 2 -- stays materialized.
+- **Exactly 1**, spatial axes only, zero fill. Pad 2 and 3 belong to 5x5 and
+  7x7, which no matcher claims.
+- **Not combined with a fused ReLU6.** A convolution with both folds the
+  activation and keeps its pad; no target claims the pair.
+
+Measured on ResNet50 fp16: all 16 pad sites folded, `slow_memcpy` executables
+7 -> 0, 230 -> 223 ms at `taskset -c 4-7` and 203.5 -> 195.5 at `0-7`, with
+output identical to the materialized-pad arm to five decimals. MobileNetV2 has
+almost nothing to give here -- 17 of its 18 pads feed depthwise convolutions
+that stay on the CPU, and the one that does not is asymmetric.
+
 Measured on MobileNetV2 fp16: 17 of 18 fusable sites, 146 -> 133 ms at
 `taskset -c 4-7` and 122.5 -> 116.5 at `0-7`, with max|diff| against a
 `--no-offload` CPU arm of 0.0184 where the unfused offload arm is 0.0173 and
@@ -339,6 +360,8 @@ narrowed to f16 for the Conv2D ABI's bias binding.
 | conv | NHWC HWCF | f16/f16/f32 | 3x3 | 1 | 1..=1152 | 1..=1792 |
 | conv | NHWC HWCF | f16/f16/f32 | 1x1, 3x3 | 2 | 1..=512 | 1..=512 |
 | conv + ReLU6 | NHWC HWCF | f16/f16/f32 | 1x1 | 1 | 1..=3584 | 1..=3584 |
+| conv + pad 1 | NHWC HWCF | f16/f16/f32 | 3x3 | 1 | 1..=1152 | 1..=3584 |
+| conv + pad 1 | NHWC HWCF | f16/f16/f32 | 3x3 | 2 | 1..=512 | 1..=3584 |
 | conv + ReLU6 | NHWC HWCF | f16/f16/f32 | 3x3 | 1 | 1..=1152 | 1..=3584 |
 | conv | NHWC HWCF | i8/i8/i32 | 1x1 | 1 | 1..=3584 | 1..=3584 |
 | conv | NHWC HWCF | i8/i8/i32 | 3x3 | 1 | 1..=1152 | 1..=512 |
