@@ -143,7 +143,7 @@ max pooling, which closed with six matchers and no change below the compiler.
 | Capability | Plumbed through | What the spec does today |
 |---|---|---|
 | ~~Fused activation on a conv (`RELU`, `RELUX`)~~ | schema `Activation`; serializer parses `relu`/`relux`; driver `decode_activation`; HAL `Activation::{Relu, Clamped}`; `conv_activation_fused_hw`, `conv_fp16_bias_activation_hw` | **Done 2026-09-07 for fp16 ReLU6.** `#rocket_dynamic_relu6_target` plus `rocket-fuse-conv-relu6` and a DAG matcher claim 17 of MobileNetV2's 18 fusable sites; 146 -> 133 ms at four cores. The 18th is the stride-2 stem, and the int8 form is a different problem -- see below |
-| Conv padding | schema `pad_top`/`pad_left`; HAL leading pads 0..=15 | Hardcoded zero on every conv target. **Worth much less than it looks, and not independent:** of MobileNetV2 fp16's 18 `tensor.pad` ops, 17 feed the *depthwise* convolutions P7 keeps on the CPU, so folding them needs P7 first; the one that feeds an offloaded conv (the 224->225 stem) is **asymmetric** (`low[0,0,0,0,0] high[0,0,1,1,0]`), which the schema's symmetric two-value model cannot express at all |
+| Conv padding | schema `pad_top`/`pad_left`; driver decodes them already; serializer carries them as of 2026-09-07; `rocket-fold-conv-pad` marks the foldable convolutions | **The matcher is the only piece left.** Sized on the wrong model at first: MobileNetV2 is a poor case (17 of its 18 pads feed the depthwise convolutions P7 keeps on the CPU, and the one reaching an offloaded conv is asymmetric), but **ResNet50 fp16 has 16 pad dispatch sites feeding offloaded convolutions and every one is symmetric** -- ~12 MB of copy per inference. `rocket-fold-conv-pad` marks all 16 at pad 1 |
 | Unary EW: abs, neg, floor, ceil, add-with-scalar (fp16) | `ElementwiseUnaryDef` (tag 5), driver, serializer, `ew_unary_hw` | No matcher. No measured model contains one of these ops |
 | The nine LUT curves (int8) | `ElementwiseLutDef` (tag 6), driver, serializer, `lut_zero_join_hw` | No matcher. The LUT path is int8 by construction and the models' `sqrt`/`erf` are f32 |
 | EW `MAX` and `MIN` | `EwBinaryOp`, driver, serializer, `ew_binary_hw` (bit-exact) | Only `add`/`sub`/`mul` have matchers, and those sit behind `--elementwise` |
@@ -173,10 +173,24 @@ matcher. Landed 2026-09-07: 17 of 18 sites, 146 -> 133 ms at four cores
 (1.10x) and 122.5 -> 116.5 at eight (1.05x), max|diff| against a CPU arm
 0.0184 where the unfused arm is 0.0173, same argmax and top-5.
 
-**Padding was worth almost nothing and is not independent.** See its row: 17
-of the 18 pads feed convolutions that are not offloaded at all, and the one
-that does is asymmetric. It is gated on P7 *and* on four-value padding on the
-wire, not on a shim field.
+**Padding was sized on the wrong model.** On MobileNetV2 it is worth almost
+nothing -- 17 of the 18 pads feed convolutions that are not offloaded at all,
+and the one that does is asymmetric. But **ResNet50 fp16 has 16 pad dispatch
+sites feeding offloaded convolutions, all symmetric**, about 12 MB of
+full-tensor copy per inference; CLIP, BLIP, ViT and Qwen3 have no pads at
+all. So the lever is real and it lives on a different model than the one this
+roadmap and ISSUES.md P7 were both measuring.
+
+**And asymmetric padding is a hardware limit, not a wire-format one.** This
+document implied a schema change would reach it. It would not: `CNA_PAD_CON0`
+has exactly `pad_top` and `pad_left`, and the hardware applies each to *both*
+sides -- `Shape::output_width` is `(w + 2 * pad_left - kw) / stride + 1`,
+matched against all 150 strided programs in the vendor corpus. There is no
+trailing-pad register to add a field for. `low[0] high[1]`, which is what
+ONNX emits for `auto_pad = SAME_UPPER` at stride 2, has to stay
+materialized. Adding `pad_right`/`pad_bottom` to `Conv2DDef` would be a wire
+state the runtime could not execute -- the same reason `PoolingMethod` has no
+`SUM`.
 
 ---
 

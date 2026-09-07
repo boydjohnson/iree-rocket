@@ -188,6 +188,10 @@ struct RocketConv2dConfig {
   iree_hal_rocket_Precision_enum_t precision = iree_hal_rocket_Precision_INT8;
   std::vector<iree_hal_rocket_Conv2DDimension_enum_t> runtimeDimensions;
   std::vector<iree_hal_rocket_Conv2DQuantParam_enum_t> runtimeQuantization;
+  // Symmetric spatial padding; see the parser for why it is optional and
+  // what "symmetric" means on this hardware.
+  uint32_t padTop = 0;
+  uint32_t padLeft = 0;
 };
 
 struct RocketFullyConnectedConfig {
@@ -348,7 +352,28 @@ std::optional<RocketConv2dConfig> buildRocketConv2dConfigFromTarget(
     return llvm::cast<FloatAttr>(config.get(key)).getValueAsDouble();
   };
 
+  // Padding is optional, unlike every other conv key: it was added after the
+  // 14 shipped targets were written and they do not spell it. Absent means
+  // zero, which is what those targets have always serialized.
+  //
+  // The hardware applies these *symmetrically* -- `Shape::output_width` is
+  // `w + 2 * pad_left`, matched against all 150 strided programs in the
+  // vendor corpus -- so `pad_top` also pads the bottom and `pad_left` also
+  // pads the right, exactly as `Conv2DDef` documents. There is no register
+  // for a trailing-only pad: `CNA_PAD_CON0` has `pad_top` and `pad_left` and
+  // nothing else, so an asymmetric pad cannot be expressed here at all and a
+  // producer must leave it materialized.
+  auto getOptionalU32 = [&](StringRef key) -> uint32_t {
+    Attribute attr = config.get(key);
+    if (!attr) {
+      return 0;
+    }
+    return static_cast<uint32_t>(llvm::cast<IntegerAttr>(attr).getInt());
+  };
+
   RocketConv2dConfig shape;
+  shape.padTop = getOptionalU32("pad_top");
+  shape.padLeft = getOptionalU32("pad_left");
   shape.inputWidth = getU32("input_width");
   shape.inputHeight = getU32("input_height");
   shape.inputChannels = getU32("input_channels");
@@ -1684,8 +1709,9 @@ public:
           (runtimeDimensionsRef &&
            iree_hal_rocket_Conv2DDef_runtime_dimensions_add(
                builder, runtimeDimensionsRef)) ||
-          iree_hal_rocket_Conv2DDef_pad_top_add(builder, 0) ||
-          iree_hal_rocket_Conv2DDef_pad_left_add(builder, 0) ||
+          iree_hal_rocket_Conv2DDef_pad_top_add(builder, convShape->padTop) ||
+          iree_hal_rocket_Conv2DDef_pad_left_add(builder,
+                                                 convShape->padLeft) ||
           (runtimeQuantizationRef &&
            iree_hal_rocket_Conv2DDef_runtime_quantization_add(
                builder, runtimeQuantizationRef))) {
