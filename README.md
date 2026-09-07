@@ -322,16 +322,28 @@ safe. Three knobs:
 
 The driver's host-side work is memory-bound, so on a big.LITTLE part it runs
 several times slower on the little cluster -- 52.4 ms against 13.8 ms for
-MobileNetV2 fp16's layout transforms on RK3588. `queue_execute` therefore asks
-the scheduler for the highest-`cpu_capacity` CPUs while it runs and restores
-the thread's original affinity afterwards; the profile's `host time by cpu`
-line shows where it actually landed. On a machine whose cores are all the same
-this finds nothing to prefer and does nothing.
+MobileNetV2 fp16's layout transforms on RK3588. The NPU worker thread that
+runs every `queue_execute` therefore asks the scheduler for the
+highest-`cpu_capacity` CPUs once, for its life; the profile's `host time by
+cpu` line shows where it actually landed. On a machine whose cores are all the
+same this finds nothing to prefer and does nothing.
 
 | Variable | Effect |
 |---|---|
 | `ROCKET_HOST_CPUS=off` | Never change affinity. |
 | `ROCKET_HOST_CPUS=0-3,7` | Use this CPU list instead of the highest-capacity one. |
+
+`queue_execute` does not run the command buffer on the calling thread: it
+queues it to a worker that owns one open of `/dev/accel/accel0` and runs
+units in submission order, signalling IREE's semaphores when each is done
+(`rocket-hal-driver/src/pool.rs`; the design and its measurements are in
+`rocket-hal-driver/MULTICORE.md`). The profile's `queue` row is the time a
+unit waited for its worker.
+
+| Variable | Effect |
+|---|---|
+| `ROCKET_NPU_CORES=N` | Worker contexts. Only `1` is implemented (M0); higher values are refused with a message and fall back to 1. |
+| `ROCKET_NPU_CORES=auto` | One per NPU core once M1 lands; today the same fallback. |
 
 `iree-rocket-hal`'s `layout_bench` and `gem_bandwidth` examples measure the
 transforms and the GEM mapping directly, which is a much faster way to test a

@@ -78,12 +78,17 @@ pub enum Phase {
     /// The whole `queue_execute` callback, as a check total: everything
     /// above it minus the phases above sums to unaccounted host overhead.
     Execute = 11,
+    /// From `queue_execute` enqueueing a unit to the NPU worker picking it
+    /// up (`pool.rs`). The worker is idle while a unit queues, so this
+    /// overlaps `Outside` and is not added to the wall total.
+    Queue = 12,
 }
 
 impl Phase {
     pub const ALL: [Phase; PHASE_COUNT] = [
         Phase::Outside,
         Phase::Record,
+        Phase::Queue,
         Phase::PackInput,
         Phase::PackWeights,
         Phase::PackBias,
@@ -110,6 +115,7 @@ impl Phase {
             Phase::Compact => "compact",
             Phase::Quiesce => "quiesce",
             Phase::Execute => "execute",
+            Phase::Queue => "queue",
         }
     }
 
@@ -128,6 +134,7 @@ impl Phase {
             Phase::Compact => "cmpct",
             Phase::Quiesce => "quies",
             Phase::Execute => "exec",
+            Phase::Queue => "queue",
         }
     }
 
@@ -135,12 +142,15 @@ impl Phase {
     /// it when totalling. `Record` runs before `queue_execute` and `Outside`
     /// runs between calls, so both are genuinely disjoint from it.
     fn nested_in_execute(self) -> bool {
-        !matches!(self, Phase::Outside | Phase::Record | Phase::Execute)
+        !matches!(
+            self,
+            Phase::Outside | Phase::Record | Phase::Queue | Phase::Execute
+        )
     }
 }
 
 /// Number of [`Phase`] variants, as an array length.
-const PHASE_COUNT: usize = 12;
+const PHASE_COUNT: usize = 13;
 
 /// The label used for phases that belong to no particular op.
 pub const NO_OP: &str = "-";
@@ -387,7 +397,12 @@ pub fn report() {
     );
     let host: u128 = Phase::ALL
         .iter()
-        .filter(|p| !matches!(p, Phase::Execute | Phase::Wait | Phase::Submit))
+        .filter(|p| {
+            !matches!(
+                p,
+                Phase::Execute | Phase::Wait | Phase::Submit | Phase::Queue
+            )
+        })
         .map(|p| registry.totals[*p as usize].nanos)
         .sum::<u128>()
         + execute.saturating_sub(nested);
@@ -585,7 +600,10 @@ mod tests {
     #[test]
     fn only_submit_time_phases_nest_in_execute() {
         for phase in Phase::ALL {
-            let expected = !matches!(phase, Phase::Outside | Phase::Record | Phase::Execute);
+            let expected = !matches!(
+                phase,
+                Phase::Outside | Phase::Record | Phase::Queue | Phase::Execute
+            );
             assert_eq!(phase.nested_in_execute(), expected, "{phase:?}");
         }
     }

@@ -272,7 +272,7 @@ totals and the fraction of wall during which >= 2 jobs were in flight
 
 | | Scope | Gate |
 |---|---|---|
-| **M0** | `NpuContext` + worker pool at N=1. `queue_execute` enqueues instead of running/spawning; `run_after_wait` stays for the host-memcpy ops. No second file yet. | MobileNetV2 fp16/int8/requant and ViT within noise of today's numbers on planck, `taskset -c 4-7` and `0-7`. This is the regression gate for everything after it. |
+| **M0** (done, §10) | `NpuContext` + worker pool at N=1. `queue_execute` enqueues instead of running/spawning; `run_after_wait` stays for the host-memcpy ops. No second file yet. | MobileNetV2 fp16/int8/requant and ViT within noise of today's numbers on planck, `taskset -c 4-7` and `0-7`. This is the regression gate for everything after it. |
 | **M1** | N contexts, dispatch-level placement (5.4 level 1, assignment (a)), barrier groups honoured, `stage_binding` copy hop at the four direct sites, per-context weight cache, global quiescence rule, `dpu_mode_multicore_hw`. | Bit-exact against N=1 on every e2e model; `overlap` > 0 on ViT. |
 | **M2** | Task-level fan-out (5.4 level 2) with regcmd relocation (b), band packing, gather compaction, per-context scratch pools. | Bit-exact; requant MobileNetV2 faster than N=1 at N=3 on a full machine; `layout_bench`-style microbench shows pack/compact scaling. |
 | **M3** (optional) | Kernel-side placement, §7. | -- |
@@ -377,3 +377,78 @@ and reaches the full core count without level 2; the conv numbers say
 level 2's band packing is worth less than §5.4 hoped on output-heavy
 shapes, because the bytes are the bound. Re-check §4's "1.15-1.3x" target
 against these before M2 is scoped.
+
+## 10. M0 as built (2026-09-07)
+
+`rocket-hal-driver/src/pool.rs`. What changed, against §1:
+
+- **`queue_execute` enqueues.** It retains the command buffer, wraps
+  today's body in a `Unit` and hands it to the pool; the caller's thread
+  returns at once. The unit's wait semaphores are waited on by the worker,
+  not the caller, and its signal semaphores are signalled (or failed with
+  the status) by the worker when the last host phase is done. `run_after_wait`
+  and its synchronous fast path survive unchanged for `queue_alloca`/
+  `dealloca`/`fill`/`update`/`copy`/`host_call`.
+- **One `NpuContext`, one worker.** Context 0 is a `try_clone()` of the
+  device's file, so every IREE buffer handle is valid on it and no copy hop
+  exists yet. The worker thread is named `rocket-npu-0`, asks for the big
+  cluster once (`cpu_affinity::prefer_fast_cpus`) and keeps that for its
+  life, replacing the per-`queue_execute` guard.
+- **In-order per worker.** Units run in enqueue order, each waiting on its
+  own semaphores first. IREE never makes a submission wait on a later
+  submission to the same queue (an in-order hardware queue would deadlock
+  too), so with one placement this is today's semantics exactly, minus the
+  thread per dispatch. With N workers and units only ever waiting on
+  earlier submissions, the globally earliest unfinished unit always has
+  its dependencies complete or running, so the same argument carries to M1.
+- **Errors route through the signal list.** Before, a `queue_execute`
+  whose waits were already satisfied returned its failure synchronously.
+  Now every failure (a hung-job refusal, a `SUBMIT` error) fails the
+  signal semaphores, which is how any asynchronous queue reports one. A
+  unit with no signal semaphore that fails prints a line instead, since
+  nothing else can carry it.
+- **`ROCKET_NPU_CORES`** is parsed (`N` or `auto`), and anything but 1 is
+  refused with a message until M1. `Placement` is a trait with
+  `RoundRobin` as its first implementation.
+- **`device::destroy` drains the pool** before the profiler prints, so a
+  unit still in flight completes and is counted. `profile` gains a `queue`
+  row: enqueue to pickup, overlapping `outside`, excluded from wall.
+- **The DPU-mode mutex stays**, device-global, as §5.6 wants.
+
+Correctness: `iree-run-module` output bit-identical to the pre-M0 binary
+on `mnv2.fp16`, `mnv2.int8`, `mnv2.static-int8` and `vit.npu.caps3584`
+(max|diff| 0.0, same argmax), `taskset -c 4-7`.
+
+Performance gate (`tools/bench/binab.sh`: pre-M0 vs M0
+`iree-benchmark-module`, same model files, 4 interleaved passes with the
+binary order alternating, `--benchmark_min_time=3s`, governor
+`performance` on cpu4-7, NPU IRQs on cpu6, every NPU core `suspended`
+before each run). Medians of real_time, ms:
+
+| Arm | cpus | pre-M0 | M0 | M0 / pre-M0 |
+|---|---|---|---|---|
+| mnv2.fp16 | 4-7 | 167.5 | 160.0 | 0.955 |
+| mnv2.int8 (accumulator) | 4-7 | 344.0 | 333.5 | 0.969 |
+| mnv2.static-int8 (requant) | 4-7 | 305.5 | 297.5 | 0.974 |
+| vit.npu.caps3584 | 4-7 | 1205.0 | 1198.0 | 0.994 |
+| mnv2.fp16 | 0-7 | 156.5 | 150.0 | 0.958 |
+| mnv2.int8 (accumulator) | 0-7 | 290.0 | 285.0 | 0.983 |
+| mnv2.static-int8 (requant) | 0-7 | 255.0 | 250.0 | 0.980 |
+| vit.npu.caps3584 | 0-7 | 875.0 | 870.5 | 0.995 |
+
+Zero hangs in 64 runs. Every arm is at or slightly under the pre-M0
+number, so the gate ("within noise") holds with a little to spare: what
+the pool removes is a thread spawn plus two affinity syscalls per
+dispatch and the wake of a fresh thread onto whichever CPU the scheduler
+liked, and MobileNetV2's ~50 dispatches per inference make that 2-4 %.
+
+HAL CTS on the board (`rocket_{queue,command_buffer,core,buffer,file}_tests`):
+the command-buffer, core, buffer and file suites pass; the queue suite has
+the same eight failures before and after M0 (seven `QueueAllocaTest`
+explicit-pool cases and `QueueHostCallTest.AsyncCallback`, whose
+`IREE_STATUS_DEFERRED` contract `queue_host_call` has never implemented).
+Not M0's, and not fixed here.
+
+The three e2e gates (`tools/e2e_{conv,matmul,pooling}_regression.py
+--board planck`) pass on the M0 runtime, including every mixed
+two-dispatches-in-one-command-buffer case.

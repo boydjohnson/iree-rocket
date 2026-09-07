@@ -1,12 +1,14 @@
 //! `iree_hal_device_vtable_t`. `create` opens `/dev/accel/accel0` and
-//! wires up the sub-objects (allocator, proactor-from-pool); `queue_execute`
-//! is the real dispatch path: wait on `wait_semaphore_list`, pull the
-//! regcmd program `command_buffer::dispatch` recorded, write it to a GEM
-//! buffer, `SUBMIT`, blocking `PREP_BO`, then signal
+//! wires up the sub-objects (allocator, proactor-from-pool, the NPU worker
+//! pool); `queue_execute` is the real dispatch path: it queues the command
+//! buffer to a worker (`pool.rs`), which waits on `wait_semaphore_list`,
+//! pulls the regcmd program `command_buffer::dispatch` recorded, writes it
+//! to a GEM buffer, `SUBMIT`s, blocks in `PREP_BO`, then signals
 //! `signal_semaphore_list` -- the synchronous pattern from
 //! `local_sync/sync_device.c` that this crate's research phase identified
 //! as the right model for a driver whose only completion signal is a
-//! blocking ioctl rather than a native timeline/fence primitive.
+//! blocking ioctl rather than a native timeline/fence primitive, moved off
+//! the caller's thread.
 
 use std::{
     os::fd::AsRawFd,
@@ -275,6 +277,9 @@ pub struct RocketDevice {
     /// across queue executions because the hardware is shared even when IREE
     /// invokes queue callbacks from different proactor threads.
     last_dpu_mode: Mutex<Option<crate::command_buffer::DpuMode>>,
+    /// The NPU worker threads every `queue_execute` hands its command buffer
+    /// to. Context 0 is a dup of `file`; see `pool.rs`.
+    pool: crate::pool::WorkerPool,
 }
 
 // `PREP_BO` observes the output fence, but the RK3588 DPU can still retain
@@ -305,9 +310,10 @@ unsafe fn cast(device: *mut iree_hal_device_t) -> *mut RocketDevice {
 /// signals are blocking ioctls, see module doc comment), so "queue order"
 /// is enforced simply: block on every wait semaphore before doing any
 /// work, then signal (or, on failure, fail) the signal list after. Shared
-/// by `queue_execute` and every `queue_alloca`/`queue_dealloca`/
-/// `queue_fill`/`queue_update`/`queue_copy`/`queue_host_call` below.
-unsafe fn wait_all(list: iree_hal_semaphore_list_t) -> iree_status_t {
+/// by the NPU worker (`pool.rs`, on behalf of `queue_execute`) and every
+/// `queue_alloca`/`queue_dealloca`/`queue_fill`/`queue_update`/
+/// `queue_copy`/`queue_host_call` below.
+pub(crate) unsafe fn wait_all(list: iree_hal_semaphore_list_t) -> iree_status_t {
     let infinite = iree_timeout_t {
         type_: iree_timeout_type_e_IREE_TIMEOUT_ABSOLUTE,
         nanos: i64::MAX, // IREE_TIME_INFINITE_FUTURE
@@ -325,11 +331,11 @@ unsafe fn wait_all(list: iree_hal_semaphore_list_t) -> iree_status_t {
     status::ok()
 }
 
-unsafe fn signal_all(list: iree_hal_semaphore_list_t) -> iree_status_t {
+pub(crate) unsafe fn signal_all(list: iree_hal_semaphore_list_t) -> iree_status_t {
     unsafe { crate::bindings::iree_hal_semaphore_list_signal(list, std::ptr::null()) }
 }
 
-unsafe fn fail_all(list: iree_hal_semaphore_list_t, failure: iree_status_t) {
+pub(crate) unsafe fn fail_all(list: iree_hal_semaphore_list_t, failure: iree_status_t) {
     unsafe { crate::bindings::iree_hal_semaphore_list_fail(list, failure) }
 }
 
@@ -366,7 +372,7 @@ impl<T> AssertSend<T> {
 /// Retains every semaphore on construction and releases them on drop, so
 /// the semaphore objects themselves also survive independent of whatever
 /// the caller does with its own references in the meantime.
-struct OwnedSemaphoreList {
+pub(crate) struct OwnedSemaphoreList {
     semaphores: Vec<*mut iree_hal_semaphore_t>,
     payload_values: Vec<u64>,
 }
@@ -374,7 +380,7 @@ struct OwnedSemaphoreList {
 unsafe impl Send for OwnedSemaphoreList {}
 
 impl OwnedSemaphoreList {
-    unsafe fn new(list: iree_hal_semaphore_list_t) -> Self {
+    pub(crate) unsafe fn new(list: iree_hal_semaphore_list_t) -> Self {
         // std::slice::from_raw_parts requires a non-null, aligned pointer
         // even for a zero-length slice -- an empty semaphore list (a
         // legitimate, common case: not every queue_* call needs to signal
@@ -399,7 +405,11 @@ impl OwnedSemaphoreList {
         }
     }
 
-    fn as_list(&mut self) -> iree_hal_semaphore_list_t {
+    pub(crate) fn is_empty(&self) -> bool {
+        self.semaphores.is_empty()
+    }
+
+    pub(crate) fn as_list(&mut self) -> iree_hal_semaphore_list_t {
         iree_hal_semaphore_list_t {
             count: self.semaphores.len() as iree_host_size_t,
             semaphores: self.semaphores.as_mut_ptr(),
@@ -517,6 +527,24 @@ pub unsafe fn create(
         return proactor_status;
     }
 
+    // Context 0 of the worker pool: the same DRM file as every IREE buffer,
+    // so a job on it may name any of them. A dup shares the GEM handle table
+    // and the scheduler entity; it is the same file, not a second core.
+    let worker_file = match file.try_clone() {
+        Ok(f) => f,
+        Err(_) => return status::from_code(iree_status_code_e_IREE_STATUS_UNAVAILABLE),
+    };
+    // M0: `requested_contexts` clamps to 1. Contexts 1..N need their own
+    // scratch and a copy hop for IREE buffers (MULTICORE.md §5.2), which is M1.
+    let _contexts = crate::pool::requested_contexts();
+    let pool = crate::pool::WorkerPool::new(
+        vec![crate::pool::NpuContext {
+            id: 0,
+            file: worker_file,
+        }],
+        Box::new(crate::pool::RoundRobin::new()),
+    );
+
     let device_allocator = crate::allocator::create(allocator_file, host_allocator);
 
     let device = Box::new(RocketDevice {
@@ -532,6 +560,7 @@ pub unsafe fn create(
         proactor,
         topology_info: unsafe { std::mem::zeroed() },
         last_dpu_mode: Mutex::new(None),
+        pool,
     });
     let device_ptr = Box::into_raw(device) as *mut iree_hal_device_t;
     // Chicken-and-egg: the allocator needs to know its owning device (see
@@ -546,6 +575,10 @@ pub unsafe fn create(
 }
 
 unsafe extern "C" fn destroy(device: *mut iree_hal_device_t) {
+    // Drain the worker pool first: a unit still queued holds a retained
+    // command buffer and may still be on the hardware, and its phases belong
+    // in the profile below.
+    unsafe { (*cast(device)).pool.shutdown() };
     // The natural end of an inference run, and the point at which
     // `ROCKET_PROFILE`'s tables are worth printing. `report` is idempotent
     // and also runs from an `atexit` hook, for the hosts that never destroy
@@ -1525,10 +1558,16 @@ unsafe extern "C" fn queue_execute(
     if !command_buffer.is_null() {
         unsafe { crate::bindings::iree_hal_command_buffer_retain(command_buffer) };
     }
+    // Enqueued, never run here: the worker that owns the NPU context waits
+    // on `wait_semaphore_list`, runs everything below in submission order
+    // and signals `signal_semaphore_list` -- see `pool.rs`. An error inside
+    // reaches IREE as a failed signal semaphore, the way any asynchronous
+    // queue reports one.
+    let pool = unsafe { &(*cast(device)).pool };
     let device = AssertSend(device);
     let command_buffer = AssertSend(command_buffer);
     unsafe {
-        run_after_wait(wait_semaphore_list, signal_semaphore_list, move |_sig| {
+        pool.enqueue(wait_semaphore_list, signal_semaphore_list, move |ctx| {
             let device = device.into_inner();
             let command_buffer = command_buffer.into_inner();
             let d = unsafe { &*cast(device) };
@@ -1547,12 +1586,6 @@ unsafe extern "C" fn queue_execute(
             // how much of an inference is not this driver at all, which is
             // the first thing to know before optimizing anything inside it.
             crate::profile::mark_outside_start();
-            // Held for the whole submission: everything below it is either
-            // memory-bound layout work or a syscall, and on a big.LITTLE part
-            // the first is 3.8x slower on the little cluster. See
-            // `cpu_affinity`, and `ROCKET_PROFILE`'s `host time by cpu` line
-            // for where it was actually landing.
-            let _fast_cpus = crate::cpu_affinity::prefer_fast_cpus();
             let execute_timer = crate::profile::start();
             let cmds = if command_buffer.is_null() {
                 Vec::new()
@@ -1596,7 +1629,9 @@ unsafe extern "C" fn queue_execute(
                             0,
                         );
                     }
-                    let fd = d.file.as_raw_fd();
+                    // The worker's own context: at M0 a dup of `d.file`,
+                    // so every IREE buffer handle is valid on it.
+                    let fd = ctx.file.as_raw_fd();
                     let regcmd_tasks = job.regcmd_tasks;
                     if regcmd_tasks.iter().any(Vec::is_empty) {
                         break 'result status::from_code(iree_status_code_e_IREE_STATUS_INTERNAL);
@@ -1609,8 +1644,9 @@ unsafe extern "C" fn queue_execute(
                     for regcmd in regcmd_tasks {
                         let cmd_bytes = regcmd.len() * std::mem::size_of::<u64>();
                         let cmd_len = cmd_bytes.next_multiple_of(4096);
-                        cmd_bufs
-                            .push(unsafe { rocket_device::OwnedBuffer::new(fd, cmd_len, &d.file) });
+                        cmd_bufs.push(unsafe {
+                            rocket_device::OwnedBuffer::new(fd, cmd_len, &ctx.file)
+                        });
                     }
 
                     // The registers this dispatch's first task programs, as
