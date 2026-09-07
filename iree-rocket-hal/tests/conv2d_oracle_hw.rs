@@ -2767,9 +2767,11 @@ fn tf32_regression_matrix_matches_oracle() {
 /// is the last value that works, so the 7x7 cliff at 72 was invisible; int8
 /// above 3x3 was meanwhile refused outright on a measurement that turned out
 /// to be an instrument fault (see `large_kernel_max_in_channels`). The
-/// ceiling is what this ladder brackets: `Cin` 64 is the last exact width at
-/// 7x7/9x9/11x11 and 72 hangs the NPU, so 64 is the top rung here and nothing
-/// above it can be a test -- a watchdog kill is not a comparison.
+/// ceiling is what this ladder brackets: at 7x7 `Cin` 208 is the last exact
+/// width and 224 hangs the NPU, so 208 is the top rung here and nothing above
+/// it can be a test -- a watchdog kill is not a comparison. `Cin` 72 is kept
+/// as the cliff regression: it hung under the old hardcoded `(8, 4)` grant and
+/// is exact under `unstarved_large_kernel_partition`.
 ///
 /// `SelectorsAffine` is the load-bearing choice. Raw `Selectors` is a signed
 /// coefficient form that is not the int8 ABI; it fails at *every* kernel size
@@ -2795,6 +2797,10 @@ fn int8_large_kernel_regression_cases() -> Vec<Conv2dCase> {
             (5, 320),
             (7, 32),
             (7, 64),
+            // Past the old starvation cliff at 64, up to the real ceiling.
+            (7, 72),
+            (7, 128),
+            (7, 208),
         ] {
             for pattern in [
                 OraclePattern::Counting,
@@ -2817,10 +2823,111 @@ fn int8_large_kernel_regression_cases() -> Vec<Conv2dCase> {
     cases
 }
 
+/// Every precision at 7x7, walked to its ceiling.
+///
+/// The gap this closes is the one that hid the `Cin` cliff for three days:
+/// `conv_kernel_size_hw.rs` sweeps `Cin` 16..64 and stopped exactly at the
+/// last value that worked, so nothing ever ran the shape one step past it.
+/// Each rung here is the **last width measured exact** on `planck`, so the
+/// ladder fails if a policy change starves a stream that used to be fed --
+/// which is precisely what `unstarved_large_kernel_partition` fixed.
+///
+/// The ceilings are real hardware boundaries, not planner artifacts: at 7x7
+/// `Cin` 224 no CBUF partition works (1/11 computes wrong values and the other
+/// ten hang), unlike the old cliff at 72, which was exact at seven of eleven.
+fn large_kernel_ceiling_cases() -> Vec<Conv2dCase> {
+    // (precision, first width the old grant hung on, ceiling). The cliff
+    // width is one step past the ceiling this table carried before
+    // `unstarved_large_kernel_partition`, and is a whole feature atom for its
+    // precision -- int4 needs a multiple of 32 and cannot use 72.
+    let rungs: [(OraclePrecision, u32, u32); 8] = [
+        (OraclePrecision::Fp16, 72, 208),
+        (OraclePrecision::Fp16Accumulator, 72, 208),
+        (OraclePrecision::Bf16, 72, 208),
+        (OraclePrecision::Int16, 72, 208),
+        (OraclePrecision::Int8, 72, 208),
+        (OraclePrecision::Int8Accumulator, 72, 208),
+        (OraclePrecision::Int4, 160, 224),
+        (OraclePrecision::Tf32, 48, 96),
+    ];
+    let mut cases = Vec::new();
+    for (precision, cliff, ceiling) in rungs {
+        for cin in [cliff, ceiling] {
+            cases.push(Conv2dCase {
+                width: 16,
+                height: 16,
+                cin,
+                cout: 64,
+                kernel: [7, 7],
+                stride: 1,
+                padding: [3, 3],
+                precision,
+                pattern: if precision == OraclePrecision::Int8 {
+                    OraclePattern::SelectorsAffine { phase: 0 }
+                } else {
+                    OraclePattern::Selectors { phase: 0 }
+                },
+            });
+        }
+    }
+    // 9x9 and 11x11 admit fp16 only; both hung above `Cin` 64 before the fix
+    // and 9x9 now reaches 128.
+    for (kernel, cin) in [(9usize, 96u32), (9, 128), (11, 64)] {
+        cases.push(Conv2dCase {
+            width: 16,
+            height: 16,
+            cin,
+            cout: 64,
+            kernel: [kernel, kernel],
+            stride: 1,
+            padding: [kernel / 2, kernel / 2],
+            precision: OraclePrecision::Fp16,
+            pattern: OraclePattern::Selectors { phase: 0 },
+        });
+    }
+    cases
+}
+
+#[test]
+fn large_kernel_ceiling_matrix_is_planable_and_gap_free() {
+    let cases = large_kernel_ceiling_cases();
+    assert_eq!(cases.len(), 19);
+    assert_planable_and_gap_free(cases);
+}
+
+/// Every rung must be reachable through `ConvPlan::new` without the probing
+/// escape hatch, or the ladder is testing a shape the planner refuses.
+#[test]
+fn large_kernel_ceiling_rungs_are_at_the_planner_ceiling() {
+    assert!(
+        std::env::var_os("ROCKET_ALLOW_LARGE_KERNEL_PROBING").is_none(),
+        "this test asserts the shipped ceilings; unset ROCKET_ALLOW_LARGE_KERNEL_PROBING",
+    );
+    for case in large_kernel_ceiling_cases() {
+        // `ConvPlan::new` is where `assert_large_kernel_plan_case` lives, so
+        // building the plan is the assertion.
+        let plan = ConvPlan::new(case.shape(), case.kernel);
+        assert_eq!(
+            plan.data_banks() + plan.weight_banks(),
+            12,
+            "{} planned a partition that does not fill the CBUF",
+            case.label(),
+        );
+    }
+}
+
+#[test]
+#[ignore = "needs /dev/accel/accel0 -- every precision walked to its 7x7 ceiling"]
+fn large_kernel_ceiling_matrix_matches_oracle() {
+    let cases = large_kernel_ceiling_cases();
+    assert_eq!(cases.len(), 19);
+    run_hardware_case_matrix("large-kernel ceiling matrix", cases);
+}
+
 #[test]
 fn int8_large_kernel_matrix_is_planable_and_gap_free() {
     let cases = int8_large_kernel_regression_cases();
-    assert_eq!(cases.len(), 24);
+    assert_eq!(cases.len(), 36);
     assert_planable_and_gap_free(cases);
 }
 
@@ -2830,7 +2937,7 @@ fn int8_large_kernel_matrix_is_planable_and_gap_free() {
 fn int8_large_kernel_ladder_stays_under_the_measured_ceiling() {
     for case in int8_large_kernel_regression_cases() {
         let kernel = case.kernel[0];
-        let ceiling = if kernel <= 5 { u32::MAX } else { 64 };
+        let ceiling = if kernel <= 5 { u32::MAX } else { 208 };
         assert!(
             case.cin <= ceiling,
             "{} is above the {kernel}x{kernel} int8 ceiling {ceiling}; above it \
@@ -2844,7 +2951,7 @@ fn int8_large_kernel_ladder_stays_under_the_measured_ceiling() {
 #[ignore = "needs /dev/accel/accel0 -- int8 above 3x3, bracketing the Cin ceiling"]
 fn int8_large_kernel_matrix_matches_oracle() {
     let cases = int8_large_kernel_regression_cases();
-    assert_eq!(cases.len(), 24);
+    assert_eq!(cases.len(), 36);
     run_hardware_case_matrix("int8 large-kernel regression matrix", cases);
 }
 

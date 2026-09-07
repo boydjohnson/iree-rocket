@@ -2936,24 +2936,26 @@ impl ConvPlan {
                 if shape.weight_bank_demand(kernels) <= 7 {
                     shape.demand_based_cbuf_partition(kernels)
                 } else {
-                    (8, 4)
+                    unstarved_large_kernel_partition(shape, kernels, (8, 4))
                 }
             }
             9 => {
                 assert_large_kernel_plan_case(shape, 9, false);
-                if (33..=48).contains(&shape.in_channels) {
+                let captured = if (33..=48).contains(&shape.in_channels) {
                     (7, 5)
                 } else {
                     (6, 6)
-                }
+                };
+                unstarved_large_kernel_partition(shape, kernels, captured)
             }
             11 => {
                 assert_large_kernel_plan_case(shape, 11, false);
-                match shape.in_channels {
+                let captured = match shape.in_channels {
                     1..=32 => (7, 5),
                     33..=48 => (5, 7),
                     _ => (3, 9),
-                }
+                };
+                unstarved_large_kernel_partition(shape, kernels, captured)
             }
             _ => unreachable!("kernel_programming accepted an unsupported kernel"),
         };
@@ -3263,6 +3265,46 @@ fn assert_large_kernel_plan_case(shape: Shape, kernel: usize, precision_neutral:
     );
 }
 
+/// A capture-derived split for a kernel above 3x3, raised if it would starve
+/// the coefficient stream.
+///
+/// The splits above 3x3 are read straight off the fp16 capture sweep -- 7x7's
+/// `(8, 4)` fallback, 9x9's `Cin`-keyed table, 11x11's -- and unlike
+/// [`Shape::demand_based_cbuf_partition`] they never consulted
+/// [`streamed_weight_bank_preference`]. That is what the `Cin` cliff was: at
+/// 7x7 fp16 `Cin` 72 the hardcoded `(8, 4)` grants four coefficient banks
+/// where the streamed working set needs seven, the stream starves, and the
+/// watchdog kills the job at ~500 ms. It is the same fault the tf32 k=3 hang
+/// turned out to be, and the same fix -- a grant, not a size, is what breaks.
+///
+/// Measured on `planck` 2026-09-07 by forcing every partition at the first
+/// hanging shape with `ROCKET_CBUF_SPLIT`: 7x7 fp16 `Cin` 72 is **exact at
+/// 1/11 through 7/5 and hangs at 8/4, 9/3, 10/2 and 11/1**. Five coefficient
+/// banks are enough there and four are not, so the cliff was never a hardware
+/// ceiling on `Cin` -- it was this policy handing out four banks regardless of
+/// what the stream asked for. C9 recorded it as "not a CBUF-split artifact"
+/// on the strength of *which* split the planner chose at each kernel size,
+/// which is not the same question as what happens when the split is forced.
+///
+/// The capture's own weight grant is kept as the lower bound: the preference
+/// is conservative rather than tight (`Cin` 64 wants seven banks and is exact
+/// with four), so this only ever raises, never lowers, and every shape the
+/// captures already validate keeps a grant at least as large as the one it
+/// was validated with.
+fn unstarved_large_kernel_partition(
+    shape: Shape,
+    kernels: Kernels,
+    captured: (u32, u32),
+) -> (u32, u32) {
+    let preference = streamed_weight_bank_preference(
+        shape.streamed_contraction_channels(),
+        kernels,
+        shape.precision.element_bits(),
+    );
+    let weight_banks = captured.1.max(preference).min(CBUF_BANKS - 1);
+    (CBUF_BANKS - weight_banks, weight_banks)
+}
+
 /// Lifts [`assert_large_kernel_plan_case`] entirely, so a probe can build the
 /// shapes above 3x3 that the refusals exist to keep off hardware.
 ///
@@ -3278,31 +3320,39 @@ fn large_kernel_probing_allowed() -> bool {
 /// Largest `Cin` a kernel above 3x3 is measured correct at, per precision.
 ///
 /// Measured on `planck` with `dtype_boundary_probe`, one shape per case (the
-/// sweep contaminates itself), extents 8x8 / 16x16 / 32x32. The boundary does
-/// not move with extent, and `Cout` does not move it either -- 7x7 fp16 at
-/// `Cin` 32 is exact at `Cout` 64, 128, 160, 192 and 256, and 7x7 int8 at
-/// `Cin` 64 is exact at `Cout` 64, 128 and 256:
+/// sweep contaminates itself) with a canary between runs. The boundary moves
+/// with neither extent nor `Cout`: 7x7 fp16 `Cin` 208 is exact at extents 8x8,
+/// 16x16 and 32x32 and at `Cout` 64, 128 and 256, and 7x7 int8 `Cin` 208 is
+/// exact at `Cout` 256.
 ///
-///   7x7   fp16  Cin 64 exact, 72/80/88/96/128/192 hang
-///   9x9   fp16  Cin 64 exact, 96 hangs
-///   11x11 fp16  Cin 64 exact, 96 hangs
-///   7x7   tf32  Cin 32 exact, 48/64/96 hang
-///   7x7   int4  Cin 128 exact, 160/192/224/256/288/384 hang
-///   7x7   bf16/int16  Cin 64 exact (the dtype ladders)
-///   7x7   int8  Cin 64 exact, 72 hangs      (2026-09-07)
-///   9x9   int8  Cin 64 exact, 96 hangs      (2026-09-07)
-///   11x11 int8  Cin 64 exact, 96 hangs      (2026-09-07)
-///   5x5   fp16/bf16/int8 to Cin 320, tf32 to 192, int4/int16 at 64: all exact
+///   7x7   fp16/bf16/int16/fp16-acc/int8/int8-acc  208 exact, 224 wrong or hangs
+///   7x7   int4                                    224 exact, 256 hangs
+///   7x7   tf32                                     96 exact, 128 wrong
+///   9x9   fp16                                    128 exact, 144 wrong
+///   11x11 fp16                                     64 exact,  96 hangs
+///   5x5   fp16/bf16/int8 to `Cin` 320, tf32 to 192: all exact
 ///
-/// Above 3x3 the ceilings fit **`Cin * element_bytes`** taking one of two
-/// values: 128 bytes at the two- and four-byte widths (fp16/bf16/int16 at
-/// `Cin` 64, tf32 at 32) and 64 bytes below two bytes (int8 at `Cin` 64, int4
-/// at 128). That fit only appeared once int8 was measured: with int8 missing,
-/// int4's 64 bytes was a lone outlier and the note here said the ceilings
-/// reduced to no single quantity. It is a fit to six points and not a
-/// mechanism -- nothing here explains why the budget halves below two bytes --
-/// so the table, not the formula, is what the code reads. 5x5 is deliberately
-/// absent: nothing at 5x5 has failed yet, at any width or precision.
+/// **These are ~3x the ceilings this table carried until 2026-09-07, and the
+/// difference is a planner fix, not new hardware.** The old numbers -- 64 for
+/// the 2-byte family, 32 for tf32, 128 for int4 -- were the point at which a
+/// starved coefficient grant hung the NPU. The splits above 3x3 are read off
+/// the fp16 capture sweep and, unlike `demand_based_cbuf_partition`, never
+/// consulted `streamed_weight_bank_preference`; 7x7's hardcoded `(8, 4)` gave
+/// four coefficient banks no matter what the stream asked for.
+/// `unstarved_large_kernel_partition` raises the grant to the streamed
+/// preference and every one of those hangs became exact. What is left is a
+/// genuine boundary: at 7x7 `Cin` 224 **no** CBUF partition works -- 1/11
+/// computes wrong values and the other ten hang -- so unlike the old cliff it
+/// does not move when the split is forced.
+///
+/// The old "the ceilings fit `Cin * element_bytes` at 128 or 64 bytes" reading
+/// is **withdrawn**. It was a fit to the starvation boundary, which was a
+/// property of our grant; the real ceilings sit at one `Cin` for six
+/// precisions of four different widths, which is not a byte budget at all.
+///
+/// 5x5 is deliberately absent: nothing at 5x5 has failed yet, at any width or
+/// precision. 9x9 and 11x11 carry fp16 only -- `assert_large_kernel_plan_case`
+/// admits nothing else there -- so their rows say nothing about the rest.
 ///
 /// **int8 used to be refused above 3x3 outright, and that refusal was wrong.**
 /// It rested on 5x5 and 7x7 returning the same value in every output channel
@@ -3310,25 +3360,27 @@ fn large_kernel_probing_allowed() -> bool {
 /// not reaching their channels. The cause was the instrument: on 2026-09-04
 /// `dtype_boundary_probe` had no `SelectorsAffine` branch, so every int8 case
 /// fell through to `Selectors`, a signed coefficient form that is not the int8
-/// ABI and says nothing about the device. Re-measured on 2026-09-07 the same
-/// binary fails that way at 1x1 and 3x3 too, where int8 is known exact to
-/// `Cin` 512 -- the fault never had a kernel-size dependence, and only looked
-/// like one because 1x1 and 3x3 were gated by the ladders, which pass the
-/// affine pattern, and never went through the probe. Under `SelectorsAffine`
-/// int8 tracks fp16 at every kernel size, which is the table above.
+/// ABI and says nothing about the device. Re-measured, the same binary fails
+/// that way at 1x1 and 3x3 too, where int8 is known exact to `Cin` 512 -- the
+/// fault never had a kernel-size dependence, and only looked like one because
+/// 1x1 and 3x3 were gated by the ladders, which pass the affine pattern, and
+/// never went through the probe.
 fn large_kernel_max_in_channels(precision: Precision, kernel: usize) -> u32 {
     match precision {
         // 5x5 has no measured ceiling at any width; the CBUF planner's own
         // refusal is what bounds it.
         _ if kernel <= 5 => u32::MAX,
-        Precision::Tf32 => 32,
-        Precision::Int4 => 128,
+        // 9x9 and 11x11 admit fp16 only, so one number each covers them.
+        _ if kernel == 9 => 128,
+        _ if kernel == 11 => 64,
+        Precision::Tf32 => 96,
+        Precision::Int4 => 224,
         Precision::Fp16
         | Precision::Fp16Accumulator
         | Precision::Bf16
         | Precision::Int16
         | Precision::Int8(_)
-        | Precision::Int8Accumulator(_) => 64,
+        | Precision::Int8Accumulator(_) => 208,
     }
 }
 
@@ -5911,14 +5963,23 @@ mod tests {
         );
     }
 
+    /// The focused above-3x3 policies at the sweep's centre shape.
+    ///
+    /// k=11 takes `(4, 8)` here, not the capture's `(7, 5)`:
+    /// `unstarved_large_kernel_partition` raises the grant to the streamed
+    /// coefficient preference, which is what removed the `Cin` cliff. The
+    /// extra coefficient bank costs data banks, so the row no longer fits one
+    /// column tile -- hence the `[128, 128]` split and 12 tiles rather than 7.
+    /// All four rows are board-validated by
+    /// `conv_kernel_size_hw::large_kernel_cbuf_partitions_run_on_npu`.
     #[test]
     fn conv_plan_selects_the_focused_large_kernel_policies() {
         let shape = Shape::with_out_channels(256, 32, 1, 32, 64);
-        for (kernel, banks, tiles) in [
-            (5usize, (8u32, 4u32), 3usize),
-            (7, (5, 7), 8),
-            (9, (6, 6), 7),
-            (11, (7, 5), 7),
+        for (kernel, banks, columns, tiles) in [
+            (5usize, (8u32, 4u32), &[256u32][..], 3usize),
+            (7, (5, 7), &[256][..], 8),
+            (9, (6, 6), &[256][..], 7),
+            (11, (4, 8), &[128, 128][..], 12),
         ] {
             let plan = ConvPlan::new(shape, [kernel, kernel]);
             assert_eq!(
@@ -5926,9 +5987,36 @@ mod tests {
                 banks,
                 "k{kernel} banks"
             );
-            assert_eq!(plan.output_column_widths(), &[256], "k{kernel} columns");
+            assert_eq!(plan.output_column_widths(), columns, "k{kernel} columns");
             assert_eq!(plan.tiles().len(), tiles, "k{kernel} tiles");
             assert!(plan.programs().iter().all(|program| program.len() == 136));
+        }
+    }
+
+    /// The streamed floor only ever raises a capture-derived grant.
+    ///
+    /// This is what makes `unstarved_large_kernel_partition` safe to apply to
+    /// shapes the captures already validate: every such shape keeps a
+    /// coefficient grant at least as large as the one it was validated with,
+    /// so the correction can cost tiles but cannot starve a stream that was
+    /// previously fed.
+    #[test]
+    fn unstarved_partition_never_lowers_the_captured_coefficient_grant() {
+        for kernel in [7usize, 9, 11] {
+            for cin in [16u32, 24, 32, 48, 64, 96, 128, 192] {
+                for captured in [(8u32, 4u32), (7, 5), (6, 6), (5, 7), (3, 9)] {
+                    let shape = Shape::with_out_channels(256, 32, 1, cin, 64);
+                    let (data, weights) =
+                        unstarved_large_kernel_partition(shape, [kernel, kernel], captured);
+                    assert!(
+                        weights >= captured.1,
+                        "k{kernel} Cin {cin} lowered {} to {weights}",
+                        captured.1,
+                    );
+                    assert_eq!(data + weights, CBUF_BANKS, "k{kernel} Cin {cin} sums");
+                    assert!(data >= 1, "k{kernel} Cin {cin} left no data bank");
+                }
+            }
         }
     }
 
