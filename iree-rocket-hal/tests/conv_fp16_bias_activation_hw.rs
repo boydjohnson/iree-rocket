@@ -54,6 +54,7 @@ use conv2d_oracle::{feature_offset, input_storage_bytes, output_offset, output_s
 use iree_rocket_hal::rocket::{
     conv::{Activation, Buffers, Kernels, Shape, Tile, conv_2d_tile, relocate},
     device::{Buffer, JobDesc, close_bo, fini_bo, prep_bo, submit_jobs},
+    tensor_layout::pack_depthwise_to_rocket_weights,
 };
 
 const DEVICE_PATH: &str = "/dev/accel/accel0";
@@ -121,9 +122,26 @@ struct Failure {
 
 /// Runs one job with `activation` fused over a nonzero per-channel bias, and
 /// checks every output against `expected(input + bias)`.
-fn run(activation: Activation, expected: impl Fn(f32) -> f32) -> Result<(), Failure> {
-    let shape = Shape::with_channels(WIDTH, HEIGHT, IN_CHANNELS, OUT_CHANNELS as u32)
-        .with_activation(activation);
+///
+/// `depthwise` selects the other register program -- `CNA_CONV_CON1.CONV_MODE
+/// = 3`, `CORE_MISC_CFG.DW_EN = 1` and a tap-major coefficient layout -- which
+/// is the reason it is worth running the same checks twice rather than
+/// assuming the BS and BN stages behave identically under both.
+fn run(
+    depthwise: bool,
+    activation: Activation,
+    expected: impl Fn(f32) -> f32,
+) -> Result<(), Failure> {
+    // Depthwise has one filter per channel, so `Cin` must equal `Cout`; the
+    // dense case keeps `Cin` 1 so the accumulator is the input byte alone.
+    let shape = if depthwise {
+        Shape::with_out_channels(WIDTH, HEIGHT, 1, OUT_CHANNELS as u32, OUT_CHANNELS as u32)
+            .with_depthwise()
+            .with_activation(activation)
+    } else {
+        Shape::with_channels(WIDTH, HEIGHT, IN_CHANNELS, OUT_CHANNELS as u32)
+            .with_activation(activation)
+    };
     let width = WIDTH as usize;
     let pixels = width * HEIGHT as usize;
     // Both layouts come from the oracle support module rather than being
@@ -145,23 +163,51 @@ fn run(activation: Activation, expected: impl Fn(f32) -> f32) -> Result<(), Fail
         let buf_input = Buffer::new(fd, page_aligned_size(input_bytes), &file);
         ptr::write_bytes(buf_input.host_ptr, 0, buf_input.size);
         let input = std::slice::from_raw_parts_mut(buf_input.host_ptr, buf_input.size);
+        let input_channels = if depthwise { OUT_CHANNELS } else { 1 };
         for pixel in 0..pixels {
-            let offset = feature_offset(shape, 0, pixel / width, pixel % width);
-            input[offset..offset + FP16_BYTES]
-                .copy_from_slice(&f32_to_f16(input_value(pixel)).to_le_bytes());
+            for channel in 0..input_channels {
+                let offset = feature_offset(shape, channel, pixel / width, pixel % width);
+                input[offset..offset + FP16_BYTES]
+                    .copy_from_slice(&f32_to_f16(input_value(pixel)).to_le_bytes());
+            }
         }
 
-        // Unit coefficients over the padded channel count: the padding
-        // channels multiply zeroed input and contribute nothing.
-        let weight_bytes = KERNELS[0]
-            * KERNELS[1]
-            * shape.weight_channels() as usize
-            * shape.padded_out_channels() as usize
-            * FP16_BYTES;
+        // Unit coefficients. Depthwise takes the tap-major packed layout its
+        // own builder needs; dense can fill raw, since every value is 1.0.
+        let weight_bytes = if depthwise {
+            shape.weight_bytes(KERNELS) as usize
+        } else {
+            KERNELS[0]
+                * KERNELS[1]
+                * shape.weight_channels() as usize
+                * shape.padded_out_channels() as usize
+                * FP16_BYTES
+        };
         let buf_weights = Buffer::new(fd, page_aligned_size(weight_bytes), &file);
         ptr::write_bytes(buf_weights.host_ptr, 0, buf_weights.size);
-        std::slice::from_raw_parts_mut(buf_weights.host_ptr as *mut u16, weight_bytes / 2)
-            .fill(f32_to_f16(1.0));
+        if depthwise {
+            let dense = vec![f32_to_f16(1.0); OUT_CHANNELS * KERNELS[0] * KERNELS[1]]
+                .iter()
+                .flat_map(|value| value.to_le_bytes())
+                .collect::<Vec<u8>>();
+            // The depthwise packer's channel stride comes from the weight
+            // buffer the shape asks for, not from `padded_out_channels` --
+            // they are padded to different granules.
+            let padded_channels = weight_bytes / (KERNELS[0] * KERNELS[1] * FP16_BYTES);
+            pack_depthwise_to_rocket_weights(
+                &dense,
+                KERNELS[0],
+                KERNELS[1],
+                OUT_CHANNELS,
+                padded_channels,
+                FP16_BYTES,
+                std::slice::from_raw_parts_mut(buf_weights.host_ptr, weight_bytes),
+            )
+            .expect("depthwise coefficient packing failed");
+        } else {
+            std::slice::from_raw_parts_mut(buf_weights.host_ptr as *mut u16, weight_bytes / 2)
+                .fill(f32_to_f16(1.0));
+        }
 
         // BRDMA reads the bias as fp32, one word per *padded* output
         // channel -- the widened form `pack_fp16_bias_to_rocket` produces.
@@ -263,8 +309,8 @@ fn run(activation: Activation, expected: impl Fn(f32) -> f32) -> Result<(), Fail
     }
 }
 
-fn check(label: &str, activation: Activation, expected: impl Fn(f32) -> f32) {
-    match run(activation, expected) {
+fn check(label: &str, depthwise: bool, activation: Activation, expected: impl Fn(f32) -> f32) {
+    match run(depthwise, activation, expected) {
         Ok(()) => println!("  {label}: exact over all {} outputs", 256 * OUT_CHANNELS),
         Err(failure) => panic!(
             "{label}: {} of {} outputs wrong\n  {}",
@@ -278,19 +324,57 @@ fn check(label: &str, activation: Activation, expected: impl Fn(f32) -> f32) {
 #[test]
 #[ignore = "needs /dev/accel/accel0 -- cross-compile for aarch64 and run on the RK3588 board"]
 fn a_nonzero_fp16_bias_reaches_the_output() {
-    check("bias only", Activation::None, |biased| biased);
+    check("bias only", false, Activation::None, |biased| biased);
 }
 
 #[test]
 #[ignore = "needs /dev/accel/accel0 -- cross-compile for aarch64 and run on the RK3588 board"]
 fn relu_sees_the_biased_value() {
-    check("bias + relu", Activation::Relu, |biased| biased.max(0.0));
+    check("bias + relu", false, Activation::Relu, |biased| {
+        biased.max(0.0)
+    });
 }
 
 #[test]
 #[ignore = "needs /dev/accel/accel0 -- cross-compile for aarch64 and run on the RK3588 board"]
 fn relu6_clamps_the_biased_value_at_both_ends() {
-    check("bias + relu6", Activation::clamped_fp16(6.0), |biased| {
-        biased.clamp(0.0, 6.0)
+    check(
+        "bias + relu6",
+        false,
+        Activation::clamped_fp16(6.0),
+        |biased| biased.clamp(0.0, 6.0),
+    );
+}
+
+// The same three under the depthwise register program. ISSUES.md P7's
+// depthwise offload needs the bias on the BS plane for exactly the reason the
+// dense path did, and the depthwise program moves six register fields the
+// dense one does not (`depthwise-conv.md` lists them), so this is measured
+// rather than inherited.
+
+#[test]
+#[ignore = "needs /dev/accel/accel0 -- cross-compile for aarch64 and run on the RK3588 board"]
+fn a_nonzero_fp16_bias_reaches_a_depthwise_output() {
+    check("depthwise bias only", true, Activation::None, |biased| {
+        biased
     });
+}
+
+#[test]
+#[ignore = "needs /dev/accel/accel0 -- cross-compile for aarch64 and run on the RK3588 board"]
+fn depthwise_relu_sees_the_biased_value() {
+    check("depthwise bias + relu", true, Activation::Relu, |biased| {
+        biased.max(0.0)
+    });
+}
+
+#[test]
+#[ignore = "needs /dev/accel/accel0 -- cross-compile for aarch64 and run on the RK3588 board"]
+fn depthwise_relu6_clamps_the_biased_value_at_both_ends() {
+    check(
+        "depthwise bias + relu6",
+        true,
+        Activation::clamped_fp16(6.0),
+        |biased| biased.clamp(0.0, 6.0),
+    );
 }

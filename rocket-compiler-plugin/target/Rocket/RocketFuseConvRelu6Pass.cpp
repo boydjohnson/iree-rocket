@@ -262,49 +262,43 @@ static Operation *soleConsumer(Value value) {
 /// `RocketFuseInt8RequantEpiloguePass::matchBiasInit` records the same
 /// hazard, and this pass hit it too -- the first version matched only the
 /// bare broadcast and fused zero of MobileNetV2's 18 sites.
-static Value matchPerChannelBias(Value init) {
-  auto broadcast = init.getDefiningOp<linalg::BroadcastOp>();
-  if (auto transpose = init.getDefiningOp<linalg::TransposeOp>()) {
-    broadcast = transpose.getInput().getDefiningOp<linalg::BroadcastOp>();
-    if (!broadcast) {
-      return nullptr;
-    }
-    // The broadcast adds every dimension but one, and that surviving
-    // dimension is the channel. After the transpose it has to be last,
-    // because that is where the fused generic's channel map reads it.
-    auto broadcastType =
-        cast<RankedTensorType>(broadcast.getResult()[0].getType());
-    llvm::SmallDenseSet<int64_t> added(broadcast.getDimensions().begin(),
-                                       broadcast.getDimensions().end());
-    std::optional<int64_t> retained;
-    for (int64_t dim = 0; dim < broadcastType.getRank(); ++dim) {
-      if (!added.contains(dim)) {
-        if (retained) {
-          return nullptr;
-        }
-        retained = dim;
-      }
-    }
-    ArrayRef<int64_t> permutation = transpose.getPermutation();
-    if (!retained || permutation.empty() || permutation.back() != *retained) {
-      return nullptr;
-    }
-  } else {
-    if (!broadcast) {
-      return nullptr;
-    }
-    auto broadcastType =
-        cast<RankedTensorType>(broadcast.getResult()[0].getType());
-    llvm::SmallDenseSet<int64_t> added(broadcast.getDimensions().begin(),
-                                       broadcast.getDimensions().end());
-    for (int64_t dim = 0; dim + 1 < broadcastType.getRank(); ++dim) {
-      if (!added.contains(dim)) {
+static Value matchPerChannelBias(Value init, int64_t &channelDim) {
+  auto transpose = init.getDefiningOp<linalg::TransposeOp>();
+  auto broadcast = transpose
+                       ? transpose.getInput().getDefiningOp<linalg::BroadcastOp>()
+                       : init.getDefiningOp<linalg::BroadcastOp>();
+  if (!broadcast) {
+    return nullptr;
+  }
+
+  // The broadcast adds every dimension but one; that surviving dimension is
+  // the channel. Which *position* it occupies in the convolution's own result
+  // depends on the layout -- last for NHWC, dim 1 for the NCHW depthwise
+  // form -- so it is reported rather than assumed.
+  auto broadcastType = cast<RankedTensorType>(broadcast.getResult()[0].getType());
+  llvm::SmallDenseSet<int64_t> added(broadcast.getDimensions().begin(),
+                                     broadcast.getDimensions().end());
+  std::optional<int64_t> retained;
+  for (int64_t dim = 0; dim < broadcastType.getRank(); ++dim) {
+    if (!added.contains(dim)) {
+      if (retained) {
         return nullptr;
       }
+      retained = dim;
     }
-    if (added.contains(broadcastType.getRank() - 1)) {
+  }
+  if (!retained) {
+    return nullptr;
+  }
+  channelDim = *retained;
+  if (transpose) {
+    // The transpose relabels it: find where the retained dimension lands.
+    ArrayRef<int64_t> permutation = transpose.getPermutation();
+    const auto *position = llvm::find(permutation, *retained);
+    if (position == permutation.end()) {
       return nullptr;
     }
+    channelDim = std::distance(permutation.begin(), position);
   }
   Value bias = broadcast.getInput();
   auto biasType = dyn_cast<RankedTensorType>(bias.getType());
@@ -337,69 +331,99 @@ struct FuseConvRelu6 : public OpRewritePattern<ConvOp> {
     for (Value input : conv.getDpsInputs()) {
       auto inputType = dyn_cast<RankedTensorType>(input.getType());
       if (!inputType || !inputType.getElementType().isF16()) {
+        LLVM_DEBUG(llvm::dbgs() << "declined: non-f16 operand\n");
         return failure();
       }
     }
 
-    // conv -> [expand_shape] -> clamp, each with a single use, because the
-    // rewrite deletes what it walks through.
+    // conv -> [transpose] -> [expand_shape] -> clamp, each with a single use,
+    // because the rewrite deletes what it walks through.
+    //
+    // Both relayouts are optional and both are re-emitted below. The NHWC
+    // dense form has only the reshape; the NCHW depthwise form has a
+    // NCHW -> NHWC transpose in front of it, because the channels-last
+    // conversion leaves the depthwise convolution itself in NCHW and puts the
+    // layout change on its result instead.
     Operation *consumer = soleConsumer(convResult);
     if (!consumer) {
-      LLVM_DEBUG(llvm::dbgs() << "declined: non-f16 operand\n");
+      LLVM_DEBUG(llvm::dbgs() << "declined: convolution result has no sole consumer\n");
       return failure();
+    }
+    auto transpose = dyn_cast<linalg::TransposeOp>(consumer);
+    if (transpose) {
+      consumer = soleConsumer(transpose.getResult()[0]);
+      if (!consumer) {
+        LLVM_DEBUG(llvm::dbgs() << "declined: transpose has no sole consumer\n");
+        return failure();
+      }
     }
     auto expand = dyn_cast<tensor::ExpandShapeOp>(consumer);
     if (expand) {
       consumer = soleConsumer(expand.getResult());
       if (!consumer) {
+        LLVM_DEBUG(llvm::dbgs() << "declined: reshape has no sole consumer\n");
         return failure();
       }
     }
     auto clamp = dyn_cast<linalg::GenericOp>(consumer);
     if (!clamp || !isElementwiseGeneric(clamp) || clamp.getNumDpsInputs() != 3) {
-      LLVM_DEBUG(llvm::dbgs() << "declined: convolution result has no sole consumer\n");
+      LLVM_DEBUG(llvm::dbgs() << "declined: consumer is not an elementwise 3-input generic\n");
       return failure();
     }
     // The convolution has to be the clamped value, not one of the bounds.
-    Value clamped = expand ? expand.getResult() : convResult;
+    Value clamped = convResult;
+    if (transpose) {
+      clamped = transpose.getResult()[0];
+    }
+    if (expand) {
+      clamped = expand.getResult();
+    }
     if (clamp.getDpsInputs()[0] != clamped) {
-      LLVM_DEBUG(llvm::dbgs() << "declined: reshape has no sole consumer\n");
+      LLVM_DEBUG(llvm::dbgs() << "declined: convolution is not the clamped operand\n");
       return failure();
     }
 
     std::optional<ClampBounds> bounds = matchClampBody(clamp);
     if (!bounds) {
-      LLVM_DEBUG(llvm::dbgs() << "declined: consumer is not an elementwise 3-input generic\n");
+      LLVM_DEBUG(llvm::dbgs() << "declined: body is not the ReLU6 sequence\n");
       return failure();
     }
     Value lowOperand = insOperandFor(clamp, bounds->low);
     Value highOperand = insOperandFor(clamp, bounds->high);
     if (!lowOperand || !highOperand) {
-      LLVM_DEBUG(llvm::dbgs() << "declined: convolution is not the clamped operand\n");
+      LLVM_DEBUG(llvm::dbgs() << "declined: clamp bounds are not ins operands\n");
       return failure();
     }
     std::optional<double> low = constantSplatFloat(lowOperand);
     std::optional<double> high = constantSplatFloat(highOperand);
     if (!low || !high || *low != 0.0 || *high != kRelu6Ceiling) {
-      LLVM_DEBUG(llvm::dbgs() << "declined: body is not the ReLU6 sequence\n");
+      LLVM_DEBUG(llvm::dbgs() << "declined: bounds are not the constants 0.0 and 6.0\n");
       return failure();
     }
 
-    Value bias = matchPerChannelBias(conv.getDpsInits()[0]);
+    int64_t channelDim = 0;
+    Value bias = matchPerChannelBias(conv.getDpsInits()[0], channelDim);
     if (!bias) {
-      LLVM_DEBUG(llvm::dbgs() << "declined: clamp bounds are not ins operands\n");
+      LLVM_DEBUG(llvm::dbgs() << "declined: init is not a per-channel bias broadcast\n");
       return failure();
     }
 
     Location loc = conv.getLoc();
-    rewriter.setInsertionPointAfter(conv);
+    // Everything is built at the clamp, not after the convolution. The
+    // relayouts this re-emits are clones, and they carry their original `outs`
+    // operands -- `tensor.empty` ops that sit *between* the convolution and
+    // the clamp. Building after the convolution puts a clone in front of its
+    // own operand and fails the dominance check.
+    rewriter.setInsertionPoint(clamp);
 
     int64_t rank = convType.getRank();
     MLIRContext *context = rewriter.getContext();
-    // The bias is indexed by the channel alone; the bounds are scalars.
+    // The bias is indexed by the channel alone -- whichever dimension that is
+    // in this convolution's own layout, which is the last one for NHWC and
+    // dimension 1 for the NCHW depthwise form -- and the bounds are scalars.
     AffineMap identity = rewriter.getMultiDimIdentityMap(rank);
     AffineMap channel =
-        AffineMap::get(rank, 0, {rewriter.getAffineDimExpr(rank - 1)}, context);
+        AffineMap::get(rank, 0, {rewriter.getAffineDimExpr(channelDim)}, context);
     AffineMap scalar = AffineMap::get(rank, 0, context);
     SmallVector<AffineMap> maps{identity, channel, scalar, scalar, identity};
     SmallVector<utils::IteratorType> iterators(rank,
@@ -442,9 +466,14 @@ struct FuseConvRelu6 : public OpRewritePattern<ConvOp> {
           linalg::YieldOp::create(builder, nested, result);
         });
 
-    // The reshape, if there was one, is re-emitted on the clamped value so
-    // everything downstream keeps the rank it expects.
+    // The relayouts, if there were any, are re-emitted on the clamped value in
+    // the same order, so everything downstream sees the shape it expects.
     Value result = activated.getResult(0);
+    if (transpose) {
+      IRMapping mapping;
+      mapping.map(transpose.getInput(), result);
+      result = rewriter.clone(*transpose.getOperation(), mapping)->getResult(0);
+    }
     if (expand) {
       IRMapping mapping;
       mapping.map(expand.getSrc(), result);
@@ -475,7 +504,9 @@ struct RocketFuseConvRelu6Pass
   void runOnOperation() final {
     MLIRContext *context = &getContext();
     RewritePatternSet patterns(context);
-    patterns.add<FuseConvRelu6<linalg::Conv2DNhwcHwcfOp>>(context);
+    patterns.add<FuseConvRelu6<linalg::Conv2DNhwcHwcfOp>,
+                 FuseConvRelu6<linalg::DepthwiseConv2DNhwcHwcOp>,
+                 FuseConvRelu6<linalg::DepthwiseConv2DNchwChwOp>>(context);
     if (failed(applyPatternsGreedily(getOperation(), std::move(patterns)))) {
       return signalPassFailure();
     }

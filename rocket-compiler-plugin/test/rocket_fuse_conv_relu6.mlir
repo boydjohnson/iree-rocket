@@ -133,6 +133,82 @@ util.func public @conv_relu6_folded_form(%input: tensor<1x14x14x88xf16>,
   util.return %clamped : tensor<1x14x14x528xf32>
 }
 
+// The NCHW depthwise form. The channels-last conversion leaves a depthwise
+// convolution in NCHW and puts the layout change on its *result*, so the
+// chain is conv -> transpose -> expand_shape -> clamp and the bias broadcast
+// retains dimension 1 rather than the last one. Both differences have to
+// reach the output: the clamp lands in NCHW with a `(d1)` bias map, and the
+// transpose is re-emitted after it.
+//
+// Reachable only when the depthwise convolutions are demoted to f16, which
+// is off by default -- see RocketDemoteConvInputsPass's scope comment for
+// the measurement and the two lines that turn it on.
+
+// CHECK-LABEL: util.func public @depthwise_conv_relu6_nchw
+// CHECK: %[[FILL:.+]] = linalg.fill
+// CHECK: %[[CONV:.+]] = linalg.depthwise_conv_2d_nchw_chw
+// CHECK-SAME: outs(%[[FILL]]
+// The clamp is in NCHW, so the bias map has to be (d1) rather than the NHWC
+// (d3). That is not spelled as a CHECK because MLIR hoists the map into a
+// `#mapN` alias whose number is not stable -- it is enforced instead by the
+// op verifying at all: a 144-channel bias read through (d3) against a
+// 1x144x56x56 tensor is `inferred input/output operand #1 has shape's
+// dimension #0 to be 56, but found 144`, which is exactly how the first cut
+// of this failed in the real pipeline.
+// CHECK: linalg.generic
+// CHECK-SAME: ins(%[[CONV]]
+// CHECK-SAME: tensor<1x144x56x56xf32>, tensor<144xf32>, f32, f32)
+// CHECK: arith.addf
+// CHECK: arith.maximumf
+// CHECK: arith.minimumf
+// CHECK-NOT: arith.cmpf
+// CHECK: linalg.transpose
+// CHECK: tensor.expand_shape
+util.func public @depthwise_conv_relu6_nchw(%input: tensor<1x144x113x113xf16>,
+                                            %filter: tensor<144x3x3xf16>,
+                                            %bias: tensor<144xf32>)
+    -> tensor<1x1x56x56x144xf32> {
+  %lo_scalar = arith.constant dense<0.000000e+00> : tensor<f32>
+  %hi_scalar = arith.constant dense<6.000000e+00> : tensor<f32>
+  %lo_empty = tensor.empty() : tensor<1x1x56x56x144xf32>
+  %hi_empty = tensor.empty() : tensor<1x1x56x56x144xf32>
+  %low = linalg.broadcast ins(%lo_scalar : tensor<f32>)
+      outs(%lo_empty : tensor<1x1x56x56x144xf32>) dimensions = [0, 1, 2, 3, 4]
+  %high = linalg.broadcast ins(%hi_scalar : tensor<f32>)
+      outs(%hi_empty : tensor<1x1x56x56x144xf32>) dimensions = [0, 1, 2, 3, 4]
+  %init_empty = tensor.empty() : tensor<1x144x56x56xf32>
+  %init = linalg.broadcast ins(%bias : tensor<144xf32>)
+      outs(%init_empty : tensor<1x144x56x56xf32>) dimensions = [0, 2, 3]
+  %conv = linalg.depthwise_conv_2d_nchw_chw
+      {dilations = dense<1> : vector<2xi64>, rocket.f16_demoted, strides = dense<2> : vector<2xi64>}
+      ins(%input, %filter : tensor<1x144x113x113xf16>, tensor<144x3x3xf16>)
+      outs(%init : tensor<1x144x56x56xf32>) -> tensor<1x144x56x56xf32>
+  %nhwc_empty = tensor.empty() : tensor<1x56x56x144xf32>
+  %nhwc = linalg.transpose ins(%conv : tensor<1x144x56x56xf32>)
+      outs(%nhwc_empty : tensor<1x56x56x144xf32>) permutation = [0, 2, 3, 1]
+  %expanded = tensor.expand_shape %nhwc [[0], [1, 2], [3], [4]]
+      output_shape [1, 1, 56, 56, 144]
+      : tensor<1x56x56x144xf32> into tensor<1x1x56x56x144xf32>
+  %empty = tensor.empty() : tensor<1x1x56x56x144xf32>
+  %clamped = linalg.generic {
+      indexing_maps = [affine_map<(d0, d1, d2, d3, d4) -> (d0, d1, d2, d3, d4)>,
+                       affine_map<(d0, d1, d2, d3, d4) -> (d0, d1, d2, d3, d4)>,
+                       affine_map<(d0, d1, d2, d3, d4) -> (d0, d1, d2, d3, d4)>,
+                       affine_map<(d0, d1, d2, d3, d4) -> (d0, d1, d2, d3, d4)>],
+      iterator_types = ["parallel", "parallel", "parallel", "parallel", "parallel"]}
+      ins(%expanded, %low, %high : tensor<1x1x56x56x144xf32>,
+          tensor<1x1x56x56x144xf32>, tensor<1x1x56x56x144xf32>)
+      outs(%empty : tensor<1x1x56x56x144xf32>) {
+  ^bb0(%in: f32, %l: f32, %h: f32, %out: f32):
+    %0 = arith.cmpf ult, %in, %l : f32
+    %1 = arith.select %0, %l, %in : f32
+    %2 = arith.cmpf ugt, %1, %h : f32
+    %3 = arith.select %2, %h, %1 : f32
+    linalg.yield %3 : f32
+  } -> tensor<1x1x56x56x144xf32>
+  util.return %clamped : tensor<1x1x56x56x144xf32>
+}
+
 // A ceiling other than 6.0 is left alone, and that is load-bearing rather
 // than a missing feature: the wire carries `activation_cmp` as a static
 // attribute on the executable target, so the canonical form encodes exactly

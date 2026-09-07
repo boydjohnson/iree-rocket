@@ -429,7 +429,7 @@ and worth not touching.
 
 ---
 
-## P7 (S2) — MobileNetV2 fp16's 17 depthwise convolutions stay on the CPU; they are 54% of the model's wall time, and the measurement that says offloading them is 26% slower no longer holds its own assumptions
+## P7 (S2) — MobileNetV2 fp16's 17 depthwise convolutions stay on the CPU; they are 54% of the model's wall time, and offloading them is 1.053x slower (re-measured 2026-09-07, was 1.26x)
 
 They are the whole of the `outside` term (70.9 ms of a 127 ms model; see
 the profile below): ten executables over 17 dispatch
@@ -499,7 +499,47 @@ depthwise convolutions are the cheapest ops in the model per byte moved —
 one filter per channel, no Cout reduction — which is exactly the profile that
 loses to a per-dispatch layout round trip.
 
-### The verdict is stale as of 2026-09-07, and one of its four terms is now half-removed
+### Re-measured 2026-09-07 with depthwise ReLU6 fused: the verdict holds, at a quarter of the cost
+
+This is item 0 below, done. The hypothesis was right in direction and too
+small to change the answer.
+
+|   | ms | vs 37 sites |
+|---|---:|---:|
+| 37 sites (dense ReLU6 fused) | 133.0 | — |
+| 44 sites, depthwise clamps on the CPU | 142.5 | 1.071x slower |
+| 44 sites, depthwise ReLU6 fused into BN | **140.0** | **1.053x slower** |
+
+Six interleaved passes each, `taskset -c 4-7`, governor `performance`,
+medians. Accuracy at 44 sites is max|diff| 0.0320 against a `--no-offload`
+CPU arm (0.0184 at 37 sites), top-1 and top-5 stable.
+
+**So the 26% is now 5.3%**, and two separate things did that. Most of it is
+M2's scratch pool, which removed the per-dispatch allocation the seven extra
+depthwise dispatches were each paying -- the 186-vs-148 above predates it.
+The rest, 2.5 ms of the 9.5 ms gap, is the depthwise clamps: the section
+below was right that offloading un-fuses them and that the recorded
+`outside` rise contains them, but they are a fifth of the gap, not the bulk
+of it.
+
+**What is in the tree.** All of the depthwise fusion machinery, and it is
+hardware-validated: `rocket-fuse-conv-relu6` handles
+`DepthwiseConv2DNchwChwOp` (the NCHW chain is
+`conv -> transpose -> expand_shape -> clamp`, and the bias broadcast retains
+dimension 1, so the canonical clamp is NCHW with a `(d1)` bias map),
+`#rocket_dynamic_depthwise_relu6_target` and its stride-2 twin exist with
+their shims and matchers, and `conv_fp16_bias_activation_hw` runs bias alone,
+bias + ReLU and bias + ReLU6 under the depthwise register program as well as
+the dense one -- all six exact. What is *not* in the tree is the demote,
+which stays off: `RocketDemoteConvInputsPass`'s scope comment carries the two
+lines that turn it on and this table.
+
+**What is left of the gap** is items 2-4 below, unchanged: the explicit pad
+IREE materializes as its own dispatch, the `DEPTHWISE_TO_DENSE_QUIESCENCE`
+dwell, and the `Cin` 512 matcher cap. Item 1, P2's chaining, is the one that
+would move it most and is also the one gated on this item -- see P2.
+
+### The 2026-09-07 profile, and why the earlier accounting understated the clamps
 
 Two things happened after the measurement above, and both move it.
 
@@ -550,11 +590,9 @@ knot is P7 -> P2 -> ROADMAP's conv padding row, and P7 is the end to pull.
 
 ### What would change the verdict, in order
 
-0. **Re-measure the 44-site arm with depthwise ReLU6 fused**, before
-   anything else on this list. It is the cheapest of the four, it is the one
-   whose mechanism already exists, and until it is done the "26% slower"
-   above is a number measured against a CPU arm that had a fusion the NPU arm
-   was not allowed.
+0. ~~**Re-measure the 44-site arm with depthwise ReLU6 fused**~~ — done
+   2026-09-07, see above. Worth 2.5 ms of the 9.5 ms gap; the verdict holds
+   at 1.053x rather than 1.26x.
 1. **P2's cross-op chaining.** These are the widest spatial extents in the
    model, so their round trip is the most expensive one there is: `pack.input`
    plus `compact` is 12.3 of the 32.7 ms. A depthwise sitting between two
@@ -1493,13 +1531,12 @@ Where the time actually is, per inference: `outside` **70.9 ms (54%)**,
 `wait.npu` 25.4, `compact` 17.7, `pack.input` 6.7, `record` 1.5.
 
 1. **P7** — the largest term by a wide margin: `outside` *is* these 17
-   depthwise convolutions, and it is over half the model. Its recorded "26%
-   slower" verdict is **stale in a way that matters**: it was measured while
-   IREE fused each depthwise convolution's ReLU6 into the depthwise dispatch
-   and the NPU arm had no way to do the same. That mechanism now exists for
-   dense convolutions. Item 0 of P7's own list is to re-measure the 44-site
-   arm with depthwise ReLU6 fused; nothing else here should be started first,
-   because P2 and ROADMAP's conv-padding row are both gated behind this one.
+   depthwise convolutions, and it is over half the model. Re-measured
+   2026-09-07 with depthwise ReLU6 fused: **1.053x slower, not 1.26x**, so
+   the verdict holds but the gap is a quarter of what it was. What is left of
+   it is the explicit pad, the quiesce dwell and the `Cin` 512 cap; the
+   fusion machinery for it is in the tree and only the demote is off. P2 and
+   ROADMAP's conv-padding row are both gated behind this one.
 2. **P2** — 24.4 ms, 19% of wall, and the one part of the old "layout
    propagation" lever P8 never tested. Two caveats now attached to it: the
    cost is concentrated in one convolution (5.4 ms, 30% of `compact`), and
