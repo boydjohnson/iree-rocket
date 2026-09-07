@@ -562,6 +562,20 @@ fn weight_value(
     }
 }
 
+/// The requantisation shift, rounding half **away from zero**.
+///
+/// Measured, not assumed: `conv_requant_tie_rule_hw` drives every `i8`
+/// accumulator through `DPU_OUT_CVT` at two shifts and classifies all 192
+/// exact ties, with the 320 non-tie accumulators exact as its validity
+/// gate. Half-up and half-to-even each miss exactly half the ties.
+///
+/// Two things this rules out. `DPU_OUT_CVT_SHIFT.cvt_round`, the only field
+/// that documents a tie rule (`0 = odd-in-even-not`, `1 = carry 1 no matter
+/// what`), does not select one here -- both states round half away from
+/// zero, so the register documentation does not describe RK3588 on this
+/// path. And `../rockchip-npu-notes/encodings/out-cvt-converter.md`
+/// measured half-to-even on RK3576 and recorded RK3588 as *predicted*; the
+/// prediction does not hold, so the two parts differ here.
 fn rounded_shift(value: i32, shift: u32) -> i32 {
     if shift == 0 {
         return value;
