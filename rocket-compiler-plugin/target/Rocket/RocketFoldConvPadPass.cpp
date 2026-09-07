@@ -35,6 +35,29 @@
 // `CNA_PAD_CON1.pad_value`, which the fp16 targets leave at zero; a nonzero
 // fill would need that field on the wire, and no measured model asks for one.
 //
+// # The region is rewritten too, and that is what pins the fill
+//
+// `transform.iree.match.cast_compatible_dag_from_root` compares regions
+// structurally, not just attribute dictionaries -- and a region that yields a
+// value defined *outside* it can never match, because structural equivalence
+// has nothing to map that value to. Which is exactly how the pad arrives: the
+// importer hoists the fill constant above the `tensor.pad` and yields it.
+//
+// So this pass also sinks the fill into the region, as
+// `arith.constant 0.0 : <element type>` immediately before the
+// `tensor.yield`. That makes the region self-contained, which makes it
+// matchable at all -- and it means the template's own inline constant pins
+// the fill to zero by attribute comparison rather than leaving it on this
+// pass's word.
+//
+// The sinking happens *after* the greedy driver, not inside the pattern.
+// `applyPatternsGreedily` runs a constant folder that hoists a constant out
+// of any region that is not isolated-from-above -- which `tensor.pad`'s is
+// not -- so a sink performed inside the pattern is undone before the pass
+// returns. Nothing re-hoists it afterwards: no canonicalisation runs between
+// this pass and `foreach_match`. The same is true of the scalar bounds
+// `rocket-fuse-conv-relu6` introduces, for the same reason.
+//
 // # Why an attribute rather than a rewrite
 //
 // The convolution keeps reading the *padded* tensor. This pass only records
@@ -125,14 +148,45 @@ static bool matchSymmetricSpatialPad(tensor::PadOp pad,
   return true;
 }
 
+/// The single user of `value`, or null when it has any other count.
+static Operation *soleUser(Value value) {
+  if (!value.hasOneUse()) {
+    return nullptr;
+  }
+  return *value.getUsers().begin();
+}
+
 template <typename ConvOp, int64_t SpatialH, int64_t SpatialW>
 struct MarkPaddedConv : public OpRewritePattern<ConvOp> {
-  using OpRewritePattern<ConvOp>::OpRewritePattern;
+  MarkPaddedConv(MLIRContext *context, llvm::SetVector<Operation *> *claimed)
+      : OpRewritePattern<ConvOp>(context), claimed(claimed) {}
+
+  llvm::SetVector<Operation *> *claimed;
 
   LogicalResult matchAndRewrite(ConvOp conv,
                                 PatternRewriter &rewriter) const override {
     if (conv->hasAttr(kPadTopAttrName)) {
       return failure();
+    }
+    // A convolution `rocket-fuse-conv-relu6` has already claimed is left
+    // alone. This pass runs after it (the sink below has to be the last thing
+    // before the match loop), and marking such a convolution would change the
+    // attribute dictionary the ReLU6 template compares -- costing the
+    // activation fusion and gaining nothing, because no template claims a pad
+    // and a clamp together. So a convolution with both folds the ReLU6 and
+    // keeps its pad materialized. No measured model has both: MobileNetV2's
+    // padded convolutions are its depthwise ones and ResNet50's activation is
+    // an unbounded ReLU.
+    if (auto activation = dyn_cast_or_null<linalg::GenericOp>(
+            soleUser(conv->getResult(0)))) {
+      if (activation.getNumDpsInputs() == 4) {
+        Block &body = activation.getRegion().front();
+        auto it = body.begin();
+        if (it != body.end() && isa<arith::AddFOp>(*it) &&
+            std::next(it) != body.end() && isa<arith::MaximumFOp>(*std::next(it))) {
+          return failure();
+        }
+      }
     }
     if (conv.getDpsInputs().empty()) {
       return failure();
@@ -176,6 +230,10 @@ struct MarkPaddedConv : public OpRewritePattern<ConvOp> {
     if (!matchSymmetricSpatialPad(pad, spatial, padHeight, padWidth)) {
       return failure();
     }
+    // The region is made self-contained after the greedy driver finishes --
+    // see the file comment. Record the pad for that second step.
+    claimed->insert(pad);
+
     rewriter.modifyOpInPlace(conv, [&] {
       conv->setAttr(kPadTopAttrName, rewriter.getI64IntegerAttr(padHeight));
       conv->setAttr(kPadLeftAttrName, rewriter.getI64IntegerAttr(padWidth));
@@ -204,14 +262,36 @@ struct RocketFoldConvPadPass
   void runOnOperation() final {
     MLIRContext *context = &getContext();
     RewritePatternSet patterns(context);
+    llvm::SetVector<Operation *> claimed;
     // NHWC puts height and width at 1 and 2; the NCHW depthwise form at 2
     // and 3.
     patterns.add<MarkPaddedConv<linalg::Conv2DNhwcHwcfOp, 1, 2>,
                  MarkPaddedConv<linalg::DepthwiseConv2DNhwcHwcOp, 1, 2>,
                  MarkPaddedConv<linalg::DepthwiseConv2DNchwChwOp, 2, 3>>(
-        context);
+        context, &claimed);
     if (failed(applyPatternsGreedily(getOperation(), std::move(patterns)))) {
       return signalPassFailure();
+    }
+
+    // Make each claimed pad's region self-contained, now that the driver's
+    // constant folder is done and cannot hoist it back out.
+    for (Operation *op : claimed) {
+      auto pad = cast<tensor::PadOp>(op);
+      auto yield =
+          cast<tensor::YieldOp>(pad.getRegion().front().getTerminator());
+      Operation *fill = yield.getValue().getDefiningOp();
+      if (fill && fill->getBlock() == &pad.getRegion().front()) {
+        continue;
+      }
+      auto floatType = dyn_cast<FloatType>(
+          cast<RankedTensorType>(pad.getResult().getType()).getElementType());
+      if (!floatType) {
+        continue;
+      }
+      OpBuilder builder(yield);
+      Value zero = arith::ConstantOp::create(
+          builder, pad.getLoc(), builder.getFloatAttr(floatType, 0.0));
+      yield.getValueMutable().assign(zero);
     }
   }
 };

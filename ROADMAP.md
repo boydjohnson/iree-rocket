@@ -143,7 +143,7 @@ max pooling, which closed with six matchers and no change below the compiler.
 | Capability | Plumbed through | What the spec does today |
 |---|---|---|
 | ~~Fused activation on a conv (`RELU`, `RELUX`)~~ | schema `Activation`; serializer parses `relu`/`relux`; driver `decode_activation`; HAL `Activation::{Relu, Clamped}`; `conv_activation_fused_hw`, `conv_fp16_bias_activation_hw` | **Done 2026-09-07 for fp16 ReLU6.** `#rocket_dynamic_relu6_target` plus `rocket-fuse-conv-relu6` and a DAG matcher claim 17 of MobileNetV2's 18 fusable sites; 146 -> 133 ms at four cores. The 18th is the stride-2 stem, and the int8 form is a different problem -- see below |
-| Conv padding | schema `pad_top`/`pad_left`; driver decodes them already; serializer carries them as of 2026-09-07; `rocket-fold-conv-pad` marks the foldable convolutions | **The matcher is the only piece left.** Sized on the wrong model at first: MobileNetV2 is a poor case (17 of its 18 pads feed the depthwise convolutions P7 keeps on the CPU, and the one reaching an offloaded conv is asymmetric), but **ResNet50 fp16 has 16 pad dispatch sites feeding offloaded convolutions and every one is symmetric** -- ~12 MB of copy per inference. `rocket-fold-conv-pad` marks all 16 at pad 1 |
+| ~~Conv padding~~ | schema `pad_top`/`pad_left`; driver decode; serializer; `rocket-fold-conv-pad`; `#rocket_dynamic_pad1_target` and its stride-2 twin | **Done 2026-09-07, symmetric pad 1.** ResNet50 fp16 folds all 16 of its pad sites into the CNA: `slow_memcpy` executables 7 -> 0, CPU dispatch sites 186 -> 170, 230 -> 223 ms at four cores and 203.5 -> 195.5 at eight, output identical to the materialized-pad arm. MobileNetV2 is unchanged, and that is the point of the sizing note below -- it was the wrong model to measure this on. Asymmetric padding remains impossible: it is a hardware limit, not a wire one |
 | Unary EW: abs, neg, floor, ceil, add-with-scalar (fp16) | `ElementwiseUnaryDef` (tag 5), driver, serializer, `ew_unary_hw` | No matcher. No measured model contains one of these ops |
 | The nine LUT curves (int8) | `ElementwiseLutDef` (tag 6), driver, serializer, `lut_zero_join_hw` | No matcher. The LUT path is int8 by construction and the models' `sqrt`/`erf` are f32 |
 | EW `MAX` and `MIN` | `EwBinaryOp`, driver, serializer, `ew_binary_hw` (bit-exact) | Only `add`/`sub`/`mul` have matchers, and those sit behind `--elementwise` |
@@ -173,8 +173,8 @@ matcher. Landed 2026-09-07: 17 of 18 sites, 146 -> 133 ms at four cores
 (1.10x) and 122.5 -> 116.5 at eight (1.05x), max|diff| against a CPU arm
 0.0184 where the unfused arm is 0.0173, same argmax and top-5.
 
-**Padding was sized on the wrong model.** On MobileNetV2 it is worth almost
-nothing -- 17 of the 18 pads feed convolutions that are not offloaded at all,
+**Padding was sized on the wrong model, and is now done.** On MobileNetV2 it is
+worth almost nothing -- 17 of the 18 pads feed convolutions that are not offloaded at all,
 and the one that does is asymmetric. But **ResNet50 fp16 has 16 pad dispatch
 sites feeding offloaded convolutions, all symmetric**, about 12 MB of
 full-tensor copy per inference; CLIP, BLIP, ViT and Qwen3 have no pads at
