@@ -95,9 +95,16 @@ fn vendor_fixture_plans_cover_convplan_shapes_i8() {
 
     for case in fixtures.cases {
         let s = &case.shape;
-        if s.kernel_h > 3 || s.kernel_w > 3 {
+        // int8 above 3x3 was refused outright until 2026-09-07; the refusal
+        // was an instrument fault (ISSUES.md C9). 5x5 and 7x7 are planned
+        // precision-neutrally now, so they belong in this comparison. What
+        // still has to be skipped is what the planner still refuses: 9x9 and
+        // 11x11 admit fp16 only, and 7x7 stops at the `Cin` 64 cliff.
+        let kernel = s.kernel_h.max(s.kernel_w);
+        if kernel > 7 || (kernel > 5 && s.cin > 64) {
             eprintln!(
-                "{}: skipping host comparison; ConvPlan has no automatic int8 policy above 3x3",
+                "{}: skipping host comparison; ConvPlan refuses int8 at this \
+                 kernel and Cin (see large_kernel_max_in_channels)",
                 case.model
             );
             continue;

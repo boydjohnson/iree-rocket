@@ -147,70 +147,6 @@ the memories that made load-bearing claims.
 
 ---
 
-## C9 (S2) — above 3x3 the conv path has two faults the fp16 capture sweep could not have seen: a `Cin` cliff that hangs at every width, and an int8 program that computes wrong values at every shape
-
-Found 2026-09-04 while extending the datatype ladders past their first-light
-shapes (bf16, int16, int4, tf32, fp16-f32out). Both are **guarded now** rather
-than fixed: `large_kernel_max_in_channels` refuses what hardware does not do,
-so a program that used to hang is a loud panic instead. Neither is reachable
-from the compiler, whose matchers stop at 3x3.
-
-The same sweep found two tf32 faults that *are* fixed, both also hangs rather
-than wrong data, and both now board-validated over the whole ladder:
-`Precision::out_channel_granule` (tf32 was the one rung whose granule was not
-a multiple of 16, and every padded `Cout` at `8 (mod 16)` hung) and
-`streamed_weight_bank_preference_for_group` (its coefficient working set was
-calibrated at 1- and 2-byte widths and starved the 4-byte stream, so tf32 k=3
-`Cin` 576-896 planned 5/7 and hung where the same *footprint* at fp16 plans
-1/11 and is exact). Neither is in the table below.
-
-### The `Cin` cliff [verified]
-
-At 7x7, 9x9 and 11x11, a convolution is exact up to a per-width `Cin` and
-**hangs the NPU above it** -- a watchdog kill at ~500 ms, `prep_bo` returning
-success over an error-signalled fence, i.e. the C3 signature. Measured with
-`dtype_boundary_probe`, `Selectors`, one shape per case:
-
-| kernel | precision | exact | hangs |
-|---|---|---|---|
-| 7x7 | fp16 | `Cin` 64 | 72, 80, 88, 96, 128, 192 |
-| 9x9 | fp16 | 64 | 96 |
-| 11x11 | fp16 | 64 | 96 |
-| 7x7 | tf32 | 32 | 48, 64, 96 |
-| 7x7 | int4 | 128 | 160, 192, 224, 256, 288, 384 |
-| 7x7 | bf16, int16 | 64 | — (ladder stops at the fp16 ceiling) |
-
-Three things it is **not**: extent-dependent (the fp16 cliff sits between 64
-and 72 at 8x8, 16x16 and 32x32 alike), `Cout`-dependent (7x7 fp16 at `Cin` 32
-is exact at `Cout` 64, 128, 160, 192 and 256, up to a *larger* coefficient
-footprint than the hanging shapes), or a CBUF-split artifact (9x9 `Cin` 64
-takes 6/6 and 11x11 takes 3/9, and both hang one step later). The ceilings do
-not reduce to one quantity either: `Cin * element_bytes` fits fp16 and tf32 at
-128 bytes and misses int4 at 64; feature atoms fit those two at 8 and miss
-int4 at 4.
-
-**Why it was invisible:** `conv_kernel_size_hw.rs`, the only above-3x3
-coverage, sweeps `Cin` 16, 24, 32, 48 and 64 -- it stops exactly at the last
-value that works. 5x5 is unaffected at every width tried (fp16 and bf16 to
-`Cin` 320, tf32 to 192).
-
-### int8 above 3x3 [verified]
-
-At 5x5 and 7x7, int8 returns **the same value in every output channel of a
-pixel** -- `want 2 got -13`, ~14,600 of 16,384 elements wrong, max|diff| 30-43
--- at `Cin` 16, 32 and 64 alike, on a healthy device with a passing canary.
-That is coefficients not reaching their channels, not a starved stream. No
-int8 capture above 3x3 exists to say what the program should be, so both int8
-rungs are refused there rather than guessed at.
-
-The gate that used to hide all of this refused *every* non-fp16 precision above
-3x3, on the grounds that the capture sweep was fp16. Half of that was
-over-broad -- 5x5 and 7x7 take `demand_based_cbuf_partition`, which is stated
-in bytes and shared with 1x1 and 3x3 at every precision -- and the other half
-was masking a fault fp16 has too.
-
----
-
 ## M2 (S3) — the NPU is running at 200 MHz
 
 `perf/clock.md` [notes]: the RK3588 compute clock `scmi_clk_npu` boots pinned at
@@ -1309,6 +1245,38 @@ What was settled and how, newest first, in place of the narratives — those are
 in this file's git history (`git log -p ISSUES.md`). Everything cited below is
 something that still exists: a commit, a file, or a memory.
 
+**C9 (S2) — 2026-09-07. Neither half was what it looked like.** The `Cin`
+cliff above 3x3 — a watchdog kill at ~500 ms, read as a hardware ceiling — was
+our own CBUF split. The above-3x3 policies are read off the fp16 capture sweep
+and never consulted `streamed_weight_bank_preference`; 7x7's fallback
+hardcoded `(8, 4)`, four coefficient banks regardless of the stream. Forcing
+every partition at the first hanging shape settles it: 7x7 fp16 `Cin` 72 is
+exact at 1/11 through 7/5 and hangs only from 8/4 down.
+`unstarved_large_kernel_partition` raises the captured grant to the streamed
+preference and never lowers it; ceilings roughly triple (7x7 64 -> **208** for
+the 2-byte family and int8, 32 -> **96** tf32, 128 -> **224** int4; 9x9 64 ->
+**128**; 11x11 unchanged at 64). Same fault as the tf32 k=3 hang: **a grant,
+not a size, is what breaks.** What is left is real — at 7x7 `Cin` 224 no
+partition works, and 11x11 above 64 hangs at 1/11, the maximum grant — so the
+old "ceilings fit `Cin * element_bytes`" reading is withdrawn; it was a fit to
+our starvation boundary.
+
+The **int8 half is retracted outright**: there was never a fault there. The
+probe had no `SelectorsAffine` branch that day, so int8 fell through to
+`Selectors`, which is not the int8 ABI and fails identically at 1x1 and 3x3.
+It looked kernel-specific only because 1x1/3x3 are gated by the ladders and
+never went through the probe.
+
+Gates: `large_kernel_ceiling_matrix_matches_oracle` (19 cases, every precision
+at its old cliff width and its new ceiling), `int8_large_kernel_matrix_matches_oracle`
+(36), `conv_kernel_size_hw` (27 shapes), `tools/e2e_conv_regression.py`. Table
+and reasoning in `large_kernel_max_in_channels` and LIMITS.md; memory
+[[large-kernels-above-3x3]]. Two method lessons, both cheap and both missed:
+**run the instrument at a shape already known good** (int8 at 1x1 refutes the
+coefficient story in two minutes), and **when a knob is suspected, turn it**
+(`ROCKET_CBUF_SPLIT` existed the whole time; "not a CBUF-split artifact" was
+inferred from the planner's choices, never measured by forcing one).
+
 **P6 (S3) — 2026-09-07. The residual closed itself.** Items 1-3 (packed
 coefficient caching, the classifier matmul's per-inference re-narrowing, and
 the host transforms' core placement) took MobileNetV2 fp16 from 198 to 146 ms
@@ -1559,13 +1527,12 @@ Where the time actually is, per inference: `outside` **70.9 ms (54%)**,
    needs a driver-side `clk_set_rate`, and both shortcuts hang the box. Low
    ceiling for the risk. (The "~10% of wall" this used to cite came from P8's
    superseded profile; it is 20.6% now, because the denominator shrank.)
-7. **C9, C6, C7, D1, D2** — limitations, hygiene and reconciliation. C9 is
-   the only S2 among them: above 3x3 there is a `Cin` cliff that hangs at every
-   precision and an int8 program that is wrong at every shape, both now behind
-   loud refusals rather than fixed.
+7. **C6, C7, D1, D2** — limitations, hygiene and reconciliation. C9 left this
+   list on 2026-09-07: both halves closed, one a planner fix that roughly
+   tripled the above-3x3 `Cin` ceilings and one a retraction.
 
 Done and in **Resolved**: the requantized int8 path (2026-09-06), C2
-(2026-09-07), P6 (2026-09-07).
+(2026-09-07), P6 (2026-09-07), C9 (2026-09-07).
 
 ---
 
