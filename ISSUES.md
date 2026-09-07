@@ -25,7 +25,7 @@ what the stack is measured to do, and which layer enforces each bound.
 run but no compiled model can reach yet. One of its phases is gated on an
 issue here by name: P8's measured per-dispatch cost is why its coverage
 matchers land behind a flag. C5, which used to gate the LUT path in a compiled
-model, was resolved 2026-09-06 -- see **Resolved**.
+model, was resolved 2026-09-06, and C2 2026-09-07 -- see **Resolved**.
 
 Trimmed 2026-09-05: issues that are settled were cut down to one entry each
 in **Resolved** at the end, which keeps their IDs resolvable without keeping
@@ -33,63 +33,6 @@ their narratives. Everything above that section is open. Evidence a resolved
 issue produced that open work still depends on was moved into the open issue
 that needs it, not deleted -- M4's phase profile and dispatch-family counts now
 live in P8.
-
----
-
-## C2 (S2) — the requant oracle rounds half-away-from-zero; the hardware rounds half-to-even, and this repo's multiplier encoding makes ties reachable
-
-**Two halves, both in this tree.**
-
-`conv2d_oracle.rs:386` [verified]:
-
-```rust
-fn rounded_shift(value: i32, shift: u32) -> i32 {
-    let half = 1i32 << (shift - 1);
-    if value >= 0 { (value + half) >> shift } else { -((-value + half) >> shift) }
-}
-```
-
-That is round-half-away-from-zero. `encodings/out-cvt-converter.md` [notes]
-measured the tie rule over 40 exact ties at two shifts and both signs:
-
-> `acc*SCALE >> SHIFT` rounds to nearest, and an exact half lands on the
-> **even** side: 0.5 -> 0, 1.5 -> 2, −0.5 -> 0, −1.5 -> −2. ... banker's rounding,
-> matching QNNPACK's *precise* requantization, and **not** the
-> round-half-away-from-zero the ancestor IP's documentation specifies, nor the
-> round-half-**up** that `(x + half) >> shift` gives and that every CPU model in
-> this tree used to spell.
-
-The notes scope this honestly: measured on RK3576, *predicted* for RK3588, and
-they say so — *"no probe run there has separated truncation from round-to-even."*
-
-**The second half is the part specific to this repo.** The notes argue ties are
-unreachable in practice because the Mesa/QNNPACK derivation ends in
-`MUL = ((bits>>9) & 0x7fff) + 1` with bit 14 forced, so `MUL` is always odd and
-an odd multiplier moves an exact half off the tie. `Multiplier::from_ratio`
-(`conv.rs:606`) does **not** use that derivation — it normalizes the mantissa
-into `[2^14, 2^15)` and takes `scaled.round()`, which can and does land on even
-values [verified]. `Multiplier::from_ratio(1.0 / 2^s)` returns
-`scale = 16384, shift = 14 + s` — exactly the deliberately-chosen power-of-two
-multiplier the notes' probe had to construct on purpose to reach a tie at all.
-And `conv2d_oracle.rs:129` builds precisely that for the `Counting` and
-`SelectorsAffine` patterns.
-
-So on this stack, ties *are* reachable, on roughly `2^-(SHIFT+1)` of a surface,
-and the model and the hardware disagree on half of them.
-
-**Actions.**
-
-1. Change `rounded_shift` to round half to even. It is a two-line change and it
-   is right under either the notes' rule or the QNNPACK rule this hardware's
-   scale derivation is copied from.
-2. This repo can settle the RK3588 prediction the notes explicitly flag as open,
-   because it already has a board-validated requantized int8 path
-   (`requantized-int8-conv-path`). One probe: pick a scale making `MUL` exactly
-   `2^14`, drive accumulators onto exact ties at two shifts and both signs,
-   classify. That is a genuine contribution back to `../rockchip-npu-notes`.
-3. Separately, consider adopting the QNNPACK `+1`/bit-14-forced derivation in
-   `from_ratio` so the shipped path never sits on a tie, independent of which
-   rounding rule wins. That is what the vendor emitters do.
 
 ---
 
@@ -1273,6 +1216,55 @@ What was settled and how, newest first, in place of the narratives — those are
 in this file's git history (`git log -p ISSUES.md`). Everything cited below is
 something that still exists: a commit, a file, or a memory.
 
+**C2 (S2) — 2026-09-07. Measured, and the finding is the opposite of the
+one this issue proposed: RK3588 rounds half *away from zero*, so the oracle
+was right and the change C2 asked for would have introduced the bug.**
+`tests/conv_requant_tie_rule_hw.rs` classifies the rule instead of assuming
+it. A 1x1 convolution at `Cin` 1 makes each output pixel's accumulator that
+pixel's input byte, so one 16x16 job sweeps every `i8` accumulator through
+`DPU_OUT_CVT`; coefficients are 1 and the BS plane is `BsEntry::default()`,
+whose `2^14` multiplier and `>> BS_MULTIPLIER_SHIFT` are exact, so the only
+rounding in the datapath is the one under test. Off a tie all three candidate
+rules agree, which the probe uses as its own validity gate.
+
+| shift | non-tie exact | ties | half-up wrong | half-away wrong | half-even wrong |
+|---|---|---|---|---|---|
+| 1 | 128/128 | 128 | 64 | **0** | 64 |
+| 2 | 192/192 | 64 | 32 | **0** | 32 |
+
+Both signs, 192 ties, no exceptions. Three consequences:
+
+- **`conv2d_oracle.rs`'s `rounded_shift` is correct as written** and now says
+  so with the measurement behind it. C2's action 1 is withdrawn.
+- **`../rockchip-npu-notes`' RK3588 prediction is falsified.** Its
+  `encodings/out-cvt-converter.md` measured round-half-to-even on RK3576 over
+  40 ties and explicitly scoped RK3588 as predicted, never probed — *"no probe
+  run there has separated truncation from round-to-even."* It has now been
+  probed and the two parts differ. This is the contribution back that C2
+  wanted; it is just the other answer.
+- **`DPU_OUT_CVT_SHIFT.cvt_round` does not select the tie rule on this path.**
+  It documents `0 = odd-in-even-not (round-half-to-even)` and `1 = carry 1 no
+  matter what`, and `conv.rs` has always left it 0 — which is why half-to-even
+  looked like the safe reading. Setting it changes **nothing** about the ties
+  (still 0/128 wrong for half-away) and moves exactly one non-tie value, the
+  most negative input: `-128 >> 1` returns `-65` rather than `-64`. So the
+  register documentation does not describe this silicon here, and the bit is
+  worth leaving clear for that stray value alone.
+
+C2's action 3 — adopting the QNNPACK `+1`/bit-14-forced derivation in
+`Multiplier::from_ratio` so the shipped path never sits on a tie — is dropped
+rather than done. Its entire motivation was "independent of which rounding
+rule wins"; the rule is now known and the model matches it, so forcing every
+multiplier odd would perturb every shipped scale to buy nothing. Ties stay
+reachable and stay correctly modelled.
+
+One real defect fell out of it. `conv_kernel_shape_hw.rs` attributed its
+rounding model to `conv_int8_probe_hw`, which measured the BS *gain* and never
+drove a tie; the attribution is now the probe above. The model itself was
+never wrong there — that harness's accumulator is a `usize`, so half-up and
+half-away-from-zero coincide, and its `Int8` tolerance of 1.0 is wide enough
+that the site could not have told them apart either way.
+
 **C5 (S2) — 2026-09-06. Neither LUT quirk reaches this stack; the one real
 defect the sweep found was a doc comment.** C5 asked whether QUIRK 4 (a `q = 0`
 table entry mis-decoding to a garbage `~4.0`) and QUIRK 2 (a discrete `+128`
@@ -1439,8 +1431,9 @@ longer exists for one of the two precisions.
 3. **P6 → P3 → C4 → P4 → P1** — the dispatch-path cost stack, roughly in
    increasing order of work. P6's residual is one guard held across a whole
    command buffer's recording; the rest is per-tile taxes.
-4. **C2** — small fix, plus a probe that settles a question the notes leave
-   open.
+4. ~~**C2**~~ — done 2026-09-07, and it went the other way: the hardware
+   rounds half *away from zero*, the oracle was already right, and the notes'
+   RK3588 prediction is falsified. See **Resolved**.
 5. **M2** — ~1.43x on the device half, but the device is ~10% of wall (see
    P8's phase profile), it needs a driver-side `clk_set_rate`, and both
    shortcuts hang the box. Low ceiling for the risk.

@@ -345,8 +345,14 @@ fn run(plan: &ConvPlan, shift: u32) -> Result<BTreeSet<i32>, Failure> {
                 let want: i32 = match shape.precision {
                     Precision::Fp16 => accumulator as i32,
                     Precision::Int8(quantization) => {
-                        // Rounds half away from zero, measured by
-                        // `conv_int8_probe_hw`.
+                        // Rounds half away from zero, classified over 192
+                        // exact ties at two shifts and both signs by
+                        // `conv_requant_tie_rule_hw`. (The attribution here
+                        // used to be `conv_int8_probe_hw`, which measured the
+                        // BS gain and never drove a tie.) This harness's
+                        // accumulator is a `usize`, so half-up would agree
+                        // with it anyway, and the `Int8` tolerance of 1.0
+                        // below means this site could not tell them apart.
                         let rounded = if shift == 0 {
                             accumulator
                         } else {

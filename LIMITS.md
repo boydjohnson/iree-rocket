@@ -284,6 +284,28 @@ The executable wire format supports **three**: `INT8`, `FP16`,
 path through `iree-compile` today. int16 in particular is explicitly waiting on
 a full-iteration integer *output* writer before anything should depend on it.
 
+### int8 requantisation rounds half away from zero
+
+`DPU_OUT_CVT` computes `(accumulator * SCALE) >> SHIFT`, and on an exact half it
+rounds **away from zero**: `0.5 -> 1`, `1.5 -> 2`, `-0.5 -> -1`, `-1.5 -> -2`.
+Measured by `tests/conv_requant_tie_rule_hw.rs`, which sweeps every `i8`
+accumulator through the datapath at two shifts and classifies all 192 exact
+ties; round-half-up and round-half-to-even each miss exactly half of them, and
+the 320 non-tie accumulators are exact, which is the probe's validity gate.
+
+Two things that look like they answer this and do not. `DPU_OUT_CVT_SHIFT`'s
+`cvt_round` field documents `0 = odd-in-even-not (round-half-to-even)`, and the
+driver has always left it 0 -- but setting it changes no tie at all, so the
+field does not select the rule here. And `../rockchip-npu-notes` measured
+round-half-to-even on **RK3576**, scoping RK3588 as predicted rather than
+probed; the prediction does not hold, so the two parts differ on this.
+
+The consequence for a caller: a framework that requantizes with banker's
+rounding (QNNPACK's *precise* mode, and anything matching it) will differ from
+this hardware by one LSB on roughly `2^-(SHIFT+1)` of a surface. That is the
+documented source of the `max|error| 1` in the requantized e2e fixtures, and it
+is a difference rather than a defect.
+
 ## What a compiled model actually offloads
 
 These are the enabled matchers -- the complete set of shapes that can leave the
