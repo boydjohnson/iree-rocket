@@ -251,7 +251,50 @@ pub const INPUT_CHANNELS: u32 = 3;
 /// because fp16 depthwise cannot reach a compiled dispatch at all -- the
 /// demote pass deliberately excludes it (see
 /// `RocketDemoteConvInputsPass.cpp`, reverted 2026-09-01).
-pub const MAX_INPUT_CHANNELS: u32 = 1792;
+///
+/// **Raised 1792 -> 3584 on 2026-09-06**, for the transformer matmuls. A
+/// ViT-B/16 MLP is `K = N = 3072` and its QKV projection is `N = 2304`;
+/// both sat over the old ceiling, and Qwen3's MLP is 3072 as well. Measured
+/// on `planck` from a quiet board with `dtype_boundary_probe`, one sweep
+/// per process, **0 mismatches and 0 device timeouts** at every point:
+///
+/// * k=1, 14x14 Cout 64, `Cin` 1792, 2048, 2304, 2560, 2816, 3072, 3328,
+///   3584 -- and on past the value taken here: 3840, 4096, 4608, 5120, 6144,
+///   **8192**. Under `Selectors` and again under `Counting`, which makes
+///   every one of those lanes contribute.
+/// * ragged `Cin` 1793, 2049, 2313, 3073, 3585, 4095 under `Selectors`, and
+///   the same six under `Counting` with the fp32 output container
+///   (`fp16acc`) -- see the note below on why the fp16 one cannot carry
+///   them.
+/// * `Cout` at 7x7 `Cin` 448: 1792, 2048, 2304, 2560, 3072, 3584, 4096, and
+///   ragged 1793, 2049, 2313, 3073, 3585, 4095. The CBUF split is flat at
+///   2d/10w across all of it, as it was over the previous raise's range.
+/// * the `onehot` read map at `Cout == Cin`, which is the instrument that
+///   says *where* a value was read from rather than only whether the sum is
+///   right: exact at 2313, 3072, 3584 and the ragged 3585 (14x14), at 2048
+///   (56x56, 56 tiles), and at 3072/3584 on the height-one matmul geometry
+///   `M = 197` where the row column-tiles.
+/// * the ViT shapes themselves, `197x1`: `K` 3072 `N` 768, and `K` 768 `N`
+///   2304 and 3072.
+/// * multi-tile 56x56 at `Cin` 2048, 3072, 3584 (112 to 224 tiles).
+/// * stride 2 at `Cin` 1792..4096 and `Cout` 2304..3584, which is also the
+///   first measurement of a *strided column partition* -- see
+///   `ConvPlan::new_with_cbuf_partition`.
+///
+/// **`Counting` cannot be read at fp16 above `Cin` 2048.** Its expected
+/// output is the input-channel count itself, and fp16 spaces integers by
+/// two from 2048 and by four from 4096, so `Cin` 2049 comes back 2048 --
+/// `max|diff| = 1`, every pixel, which reads exactly like a real
+/// channel-padding fault. The counts taken above are either representable
+/// (every aligned one here is) or run on `fp16acc`, whose fp32 output
+/// container holds them exactly. This is the same instrument trap as the
+/// bf16 ladder's nine-significant-bit ceiling.
+///
+/// 3584 rather than the 4096 (and, at k=1 `Cin`, 8192) that also measured
+/// clean, on this file's usual principle: 3584 covers every transformer
+/// shape in the corpus with a rung of headroom. A ViT-L/16 MLP at 4096
+/// would need the constant moved, not another measurement.
+pub const MAX_INPUT_CHANNELS: u32 = 3584;
 
 /// `CNA_DATA_SIZE1.datain_channel_real` counts `Cin - 1` modulo this, even
 /// though the field is 14 bits wide and could hold far more.
@@ -284,7 +327,14 @@ const CHANNEL_REAL_MODULUS: u32 = 64;
 /// corpus-backed. This bounds the *channel padding* rules only -- whether a
 /// given `(Cin, Cout, kernel)` fits the twelve CBUF banks stays `ConvPlan`'s
 /// separate question, and at k=3 it is the binding one well before this.
-pub const MAX_INT8_INPUT_CHANNELS: u32 = 1344;
+///
+/// **Raised 1344 -> 3584 on 2026-09-06**, with the rest of the rungs; see
+/// [`MAX_INPUT_CHANNELS`] for the sweep. int8's own points: k=1 14x14 Cout
+/// 64 at `Cin` 1792, 2304, 3072, 3584, 4096 under `SelectorsAffine` and
+/// again under `Counting` (whose int8 output shift makes the count
+/// readable), the `onehot` read map at `Cout == Cin` 3584, `Cout`
+/// 2304..4096 at 7x7 `Cin` 448, and stride 2 at `Cin` 2304..4096.
+pub const MAX_INT8_INPUT_CHANNELS: u32 = 3584;
 
 /// Largest output-channel count the int8 sweep measures.
 ///
@@ -298,7 +348,12 @@ pub const MAX_INT8_INPUT_CHANNELS: u32 = 1344;
 /// throughout), which is consistent with `MAX_OUTPUT_CHANNELS`' own note that
 /// the high-channel divergence is indexed by `Cin`, not `Cout`. Set at 1792,
 /// MobileNetV2's widest, rather than the 2048 that was also measured.
-pub const MAX_INT8_OUTPUT_CHANNELS: u32 = 1792;
+///
+/// **Raised 1792 -> 3584 on 2026-09-06**: exact at 7x7 `Cin` 448 for `Cout`
+/// 2304, 3072, 3584 and 4096, split flat at 7d/5w throughout, and at
+/// `Cout == Cin` 3584 under the `onehot` read map. Same sweep as
+/// [`MAX_INPUT_CHANNELS`].
+pub const MAX_INT8_OUTPUT_CHANNELS: u32 = 3584;
 
 /// Channel ceilings for int4, set to what the hardware ladder measures
 /// rather than to what the arithmetic would allow.
@@ -317,8 +372,20 @@ pub const MAX_INT8_OUTPUT_CHANNELS: u32 = 1792;
 /// `Cin` is always a whole 32-channel feature atom here -- `with_precision`
 /// refuses a partial one -- so unlike the 2-byte rungs there is no ragged
 /// input-channel case to bound.
-pub const MAX_INT4_INPUT_CHANNELS: u32 = 1344;
-pub const MAX_INT4_OUTPUT_CHANNELS: u32 = 1792;
+///
+/// **Raised 1344 -> 3584 / 1792 -> 3584 on 2026-09-06**, with the rest of
+/// the rungs (see [`MAX_INPUT_CHANNELS`]): `Cin` 1792, 2304, 3072, 3584 and
+/// 4096 at k=1 under both `Selectors` and `Counting`, and `Cout`
+/// 2304..4096 at 7x7 `Cin` 448. 3584 is 112 whole feature atoms, so the
+/// whole-atom rule below still admits the ceiling itself.
+///
+/// The `onehot` read map is the one instrument this rung cannot run: it
+/// encodes each input's own NHWC index, which does not fit a nibble, and it
+/// fails at `Cin` 64 exactly as it does at 3584. So int4's addressing
+/// evidence up here is `Selectors` alone, one rung weaker than every other
+/// datatype's.
+pub const MAX_INT4_INPUT_CHANNELS: u32 = 3584;
+pub const MAX_INT4_OUTPUT_CHANNELS: u32 = 3584;
 
 /// Channel ceilings for tf32, again the extent of the measurement rather
 /// than of the arithmetic. A 4-byte element charges four times fp16's CBUF
@@ -342,8 +409,20 @@ pub const MAX_INT4_OUTPUT_CHANNELS: u32 = 1792;
 /// [`Precision::out_channel_granule`] (a padded `Cout` at 8 modulo 16) and
 /// `streamed_weight_bank_preference_for_group`'s coefficient working set,
 /// which was calibrated at two bytes and starved the 4-byte stream.
-pub const MAX_TF32_INPUT_CHANNELS: u32 = 1024;
-pub const MAX_TF32_OUTPUT_CHANNELS: u32 = 1792;
+///
+/// **Raised 1024 -> 3584 / 1792 -> 3584 on 2026-09-06.** The paragraph
+/// above predicted this rung would stay lower than the 2-byte ones because
+/// a 4-byte element charges four times the CBUF residency per channel --
+/// that prediction is now measured wrong at k=1, where the residency is not
+/// what binds: `Cin` 1792, 2304, 3072, 3584 and 4096 are exact at 14x14
+/// Cout 64 under `Selectors` and `Counting`, the `onehot` read map is exact
+/// at `Cout == Cin` 3584, and `Cout` 2304..4096 is exact at 7x7 `Cin` 448.
+/// The tile count is roughly double the 2-byte rungs' at the same shape
+/// (28 against 14 at `Cin` 3584), which is the residency showing up as
+/// geometry rather than as a refusal. At k=3 it still binds, and there
+/// `ConvPlan`'s own refusal is what governs -- see [`MAX_INPUT_CHANNELS`].
+pub const MAX_TF32_INPUT_CHANNELS: u32 = 3584;
+pub const MAX_TF32_OUTPUT_CHANNELS: u32 = 3584;
 
 /// Widest input pixel the vendor keeps in dense NHWC, in bytes.
 ///
@@ -403,7 +482,36 @@ pub const OUTPUT_CHANNELS: u32 = 8;
 ///
 /// Depthwise constructs with `out_channels == in_channels`, so
 /// [`MAX_INPUT_CHANNELS`] binds it rather than this.
-pub const MAX_OUTPUT_CHANNELS: u32 = 1792;
+///
+/// **Raised 1792 -> 3584 on 2026-09-06** on the same sweep as
+/// [`MAX_INPUT_CHANNELS`], whose doc comment carries the evidence. The
+/// `Cout` half of it is the 7x7 `Cin` 448 ladder (1792..4096, aligned and
+/// ragged), the `onehot` read map at `Cout == Cin` to 3585, and stride 2 at
+/// `Cout` 2304..3584.
+///
+/// Depthwise does *not* follow it up: it constructs with
+/// `out_channels == in_channels`, and [`MAX_DEPTHWISE_CHANNELS`] now holds
+/// that path at the extent its own corpus reaches.
+pub const MAX_OUTPUT_CHANNELS: u32 = 3584;
+
+/// Most channels a *depthwise* convolution will program, at any precision.
+///
+/// Split out on 2026-09-06, when the dense ceilings went to 3584. Until
+/// then depthwise rode [`MAX_INPUT_CHANNELS`] -- it constructs with
+/// `out_channels == in_channels`, so that constant bound it -- and letting
+/// it keep riding would have extended the depthwise path by a factor of two
+/// on no depthwise evidence at all. The dense sweep does not carry over:
+/// depthwise has its own coefficient grouping (a 64-*byte* run), its own
+/// 256-byte output write atom, and its own vendor corpus, and each of those
+/// has been wrong at a shape the dense path was right at.
+///
+/// 1792 is where the shared constant already stood, so this is a freeze
+/// rather than a claim. The depthwise evidence behind it stops earlier
+/// still: the vendor corpus reaches C=1344, the hardware exactness tests
+/// reach 1536, and the transform spec's depthwise matchers stop at 1344.
+/// Raise it the same way as any other limit here -- a depthwise measurement
+/// first, on `conv_depthwise_two_byte_exact_hw` or a probe of its own.
+pub const MAX_DEPTHWISE_CHANNELS: u32 = 1792;
 
 /// `DPU_BS_MUL_CFG.bs_mul_shift_value`, and its negated twin
 /// `DPU_DATA_FORMAT.bs_mul_shift_value_neg`, in every quantized capture.
@@ -1422,6 +1530,12 @@ impl Shape {
         assert_eq!(
             self.in_channels, self.out_channels,
             "depthwise capture backing covers a channel multiplier of one only"
+        );
+        assert!(
+            self.in_channels <= MAX_DEPTHWISE_CHANNELS || unbacked_channels_allowed(),
+            "depthwise channels must be 1..={MAX_DEPTHWISE_CHANNELS}; the dense ceilings \
+             reach further on dense evidence that does not carry over -- see \
+             MAX_DEPTHWISE_CHANNELS"
         );
         // Depthwise is *not* automatically inherited by a new datatype the
         // way the dense path is. Two things stop it:
@@ -2895,10 +3009,22 @@ impl ConvPlan {
             FeatureLayout::Surfaces,
             "convolution needs horizontal tiling, which is only capture-backed for NC1HWC2 surfaces"
         );
-        assert_eq!(
-            shape.stride, 1,
-            "convolution needs horizontal tiling, which is only capture-backed at stride 1"
-        );
+        // A column partition at stride > 1 used to be refused here, on the
+        // grounds that no vendor capture had one. It is measured now
+        // (`planck`, 2026-09-06, `dtype_boundary_probe` with the stride
+        // field): fp16 32x32 k=1 s=2 at `Cin` 1792/2304/3072/3584/4096 (32
+        // to 64 tiles), int8 at 3584 and 4096, the `onehot` read map at
+        // `Cout == Cin` 2048, and -- the case that actually exercises the
+        // halo -- k=3 s=2 with padding at 160x8 `Cin` 512/768 fp16, 200x8
+        // `Cin` 512 int8, plus the read map at 160x8 `Cin` = `Cout` = 512.
+        // Every one exact.
+        //
+        // Lifting it matters more after the 3584 channel ceilings than
+        // before them: `Shape::max_tile_input_width` falls as `Cin` rises
+        // (18 pixels at fp16 `Cin` 3584 against 37 at 1792), so the widths
+        // that need a column partition come down into the range real
+        // strided convolutions occupy, and this refusal is a panic rather
+        // than a fallback.
 
         if let Some(output_column_widths) = captured_column_partition(shape, kernels) {
             let tiles = Tile2D::grid(shape, kernels, &output_column_widths, data_banks);
@@ -7132,6 +7258,36 @@ mod tests {
     #[should_panic(expected = "output channels must be")]
     fn rejects_output_channels_beyond_the_validated_range() {
         let _ = Shape::with_out_channels(32, 32, 1, 3, MAX_OUTPUT_CHANNELS + 1);
+    }
+
+    /// Depthwise stopped sharing the dense ceiling on 2026-09-06.
+    ///
+    /// Before that a depthwise `Shape` was bounded by `MAX_INPUT_CHANNELS`
+    /// alone, so raising the dense constant to 3584 would have doubled the
+    /// depthwise range without a single depthwise measurement. This is the
+    /// test that says the two moved apart on purpose: the same channel count
+    /// builds a dense shape and is refused a depthwise one.
+    #[test]
+    fn depthwise_stops_below_the_dense_channel_ceiling() {
+        let channels = MAX_DEPTHWISE_CHANNELS + 64;
+        assert!(
+            channels <= MAX_INPUT_CHANNELS,
+            "the dense ceiling admits it"
+        );
+        let _dense = Shape::with_out_channels(32, 32, 1, channels, channels);
+
+        let shape = Shape::with_out_channels(32, 32, 1, channels, channels);
+        let refused = std::panic::catch_unwind(move || shape.with_depthwise());
+        assert!(
+            refused.is_err(),
+            "depthwise must refuse {channels} channels"
+        );
+
+        // And the ceiling itself still builds, so this is a boundary rather
+        // than a blanket refusal.
+        let _at_the_ceiling =
+            Shape::with_out_channels(32, 32, 1, MAX_DEPTHWISE_CHANNELS, MAX_DEPTHWISE_CHANNELS)
+                .with_depthwise();
     }
 
     #[test]

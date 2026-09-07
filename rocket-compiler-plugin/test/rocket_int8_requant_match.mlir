@@ -131,9 +131,17 @@ func.func @requant_3x3_cin512_matched(
 // *requantized* path alone. Where the convolution lands afterwards is the
 // accumulator matchers' business, and `rocket_int8_match_boundaries.mlir` is
 // where that bound is pinned.
+//
+// It lands on the accumulator path since 2026-09-06, when
+// `MAX_INT8_INPUT_CHANNELS` went to 3584 and `@match_dynamic_conv2d_int8`
+// followed it: this convolution used to fall out of both loops and stay on
+// the CPU. The positive check is the accumulator dispatch rather than a
+// surviving `linalg.conv_2d_nhwc_hwcf` for exactly that reason -- the
+// assertion here is about which of the two int8 loops claims it, not about
+// whether anything does.
 // CHECK-LABEL: util.func public @requant_1x1_cin1536_declined
 // CHECK-NOT: @rocket_dynamic_int8_requant_executable
-// CHECK: linalg.conv_2d_nhwc_hwcf
+// CHECK: flow.dispatch @rocket_dynamic_int8_executable
 func.func @requant_1x1_cin1536_declined(
     %input: tensor<1x4x4x1536xi8>,
     %filter: tensor<1x1x1536x64xi8>,

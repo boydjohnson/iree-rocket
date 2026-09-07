@@ -18,7 +18,9 @@ Two independent checks, as in its neighbours:
 contraction and is worth stating plainly. The trick is the fixture: entries
 drawn from {-1, 0, 1} are exactly representable in f16, every product is
 exactly representable, and the sums stay small -- measured |C|max is 79 at
-K = 768 and 118 at K = 1792, against f16's integer-exact ceiling of 2048. So
+K = 768 and 118 at K = 1792, against f16's integer-exact ceiling of 2048; a
+ternary sum grows as the square root of K, so the K = 3584 cases stay inside it
+too, and they came back bit-exact. So
 the whole path is lossless and the hardware must return the CPU's answer
 bit for bit. A single wrong accumulator lane, a mis-packed weight column or a
 displaced output element then shows up as a nonzero difference rather than
@@ -115,14 +117,25 @@ func.func @matmul_classifier(%lhs: tensor<1x1792xf32>, %rhs: tensor<1792x1001xf3
   return %0 : tensor<1x1001xf32>
 }
 
-// Both channel ceilings at once: K = 1792 is MAX_INPUT_CHANNELS and N = 1792
+// Both channel ceilings at once: K = 3584 is MAX_INPUT_CHANNELS and N = 3584
 // is MAX_OUTPUT_CHANNELS. M stays small so a failure characterises the
-// channel limits rather than the row-width one below.
-func.func @matmul_k_n_ceilings(%lhs: tensor<8x1792xf32>, %rhs: tensor<1792x1792xf32>, %init: tensor<8x1792xf32>) -> tensor<8x1792xf32> {
+// channel limits rather than the row-width one below. Both were 1792 until
+// 2026-09-06; a transformer MLP at 3072 is what moved them.
+func.func @matmul_k_n_ceilings(%lhs: tensor<8x3584xf32>, %rhs: tensor<3584x3584xf32>, %init: tensor<8x3584xf32>) -> tensor<8x3584xf32> {
   %0 = linalg.matmul
-      ins(%lhs, %rhs : tensor<8x1792xf32>, tensor<1792x1792xf32>)
-      outs(%init : tensor<8x1792xf32>) -> tensor<8x1792xf32>
-  return %0 : tensor<8x1792xf32>
+      ins(%lhs, %rhs : tensor<8x3584xf32>, tensor<3584x3584xf32>)
+      outs(%init : tensor<8x3584xf32>) -> tensor<8x3584xf32>
+  return %0 : tensor<8x3584xf32>
+}
+
+// The shape the raise was for: ViT-B/16's first MLP projection, 768 -> 3072
+// at M = 197, which the old 1792 ceiling kept on the CPU. Ternary and so
+// exact, at an M that column-tiles.
+func.func @matmul_vit_mlp(%lhs: tensor<197x768xf32>, %rhs: tensor<768x3072xf32>, %init: tensor<197x3072xf32>) -> tensor<197x3072xf32> {
+  %0 = linalg.matmul
+      ins(%lhs, %rhs : tensor<197x768xf32>, tensor<768x3072xf32>)
+      outs(%init : tensor<197x3072xf32>) -> tensor<197x3072xf32>
+  return %0 : tensor<197x3072xf32>
 }
 
 // M at the matcher's accepted ceiling, 2047 -- the register's own limit,
@@ -314,9 +327,12 @@ def write_compiled_fixture(work_dir: Path) -> None:
     np.save(work_dir / "cls_rhs.npy", ternary(rng, 1792, 1001))
     np.save(work_dir / "cls_init.npy", zeros(1, 1001))
 
-    np.save(work_dir / "ceil_lhs.npy", ternary(rng, 8, 1792))
-    np.save(work_dir / "ceil_rhs.npy", ternary(rng, 1792, 1792))
-    np.save(work_dir / "ceil_init.npy", zeros(8, 1792))
+    np.save(work_dir / "ceil_lhs.npy", ternary(rng, 8, 3584))
+    np.save(work_dir / "ceil_rhs.npy", ternary(rng, 3584, 3584))
+    np.save(work_dir / "ceil_init.npy", zeros(8, 3584))
+    np.save(work_dir / "mlp_lhs.npy", ternary(rng, 197, 768))
+    np.save(work_dir / "mlp_rhs.npy", ternary(rng, 768, 3072))
+    np.save(work_dir / "mlp_init.npy", zeros(197, 3072))
 
     np.save(work_dir / "m2047_lhs.npy", ternary(rng, 2047, 64))
     np.save(work_dir / "m2047_rhs.npy", ternary(rng, 64, 64))
@@ -358,6 +374,7 @@ EXPECTED_FUNCTIONS = (
     "matmul_vit_dense",
     "matmul_classifier",
     "matmul_k_n_ceilings",
+    "matmul_vit_mlp",
     "matmul_m_2047",
     "matvec",
     "vecmat",
@@ -640,6 +657,13 @@ def build_cases(atol: float, rtol: float) -> list[Case]:
             "matmul_k_n_ceilings",
             ("ceil_lhs.npy", "ceil_rhs.npy", "ceil_init.npy"),
             ("matmul_k_n_ceilings_out.npy",),
+            0.0,
+            0.0,
+        ),
+        Case(
+            "matmul_vit_mlp",
+            ("mlp_lhs.npy", "mlp_rhs.npy", "mlp_init.npy"),
+            ("matmul_vit_mlp_out.npy",),
             0.0,
             0.0,
         ),

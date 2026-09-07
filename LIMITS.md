@@ -5,8 +5,8 @@ the extent of an actual measurement -- a vendor capture, a hardware sweep on
 an RK3588, or both -- not the extent of what the register encodings could
 express. The register fields are almost always wider: `CNA_WEIGHT_SIZE2.weight_kernels`
 is 14 bits and could hold 16383 output channels, and the constant that governs
-it sits at 1792 because that is where the evidence stops. Raise a limit with a
-measurement, never ahead of one.
+it sits at 3584 because that is where the evidence -- and the shape of a real
+model -- stops. Raise a limit with a measurement, never ahead of one.
 
 Read this alongside [ISSUES.md](ISSUES.md), which carries the open defects.
 A limit here says "this was tested and works"; it does not say "everything
@@ -34,41 +34,90 @@ other. Whichever is tightest for a given shape is the one that decides.
 The matcher bounds are deliberately *at or below* the HAL bounds. Where they
 differ it is because the HAL constant governs one rule and something else binds
 first: at a 3x3 kernel the matchers stop `Cin` at 1152 even though
-`MAX_INT8_INPUT_CHANNELS` is 1344, because `ConvPlan` refuses `Cin >= 1216` at
+`MAX_INT8_INPUT_CHANNELS` is 3584, because `ConvPlan` refuses `Cin >= 1216` at
 k=3 outright (the coefficient working set exceeds the eleven grantable CBUF
-banks) and that refusal is a panic, not a fallback.
+banks) and that refusal is a panic, not a fallback. The channel ceilings are a
+k=1 measurement and only k=1 matchers follow them up.
 
 ## Convolution channel limits
 
-These are the HAL constants in `iree-rocket-hal/src/rocket/conv.rs`. They are
-shared between the dense and depthwise `Shape` constructors, and -- because a
-matmul reaches this hardware as a height-one 1x1 convolution -- they are also
-the matmul limits under different names.
+These are the HAL constants in `iree-rocket-hal/src/rocket/conv.rs`. Dense
+convolution and matmul share them -- a matmul reaches this hardware as a
+height-one 1x1 convolution, so these are the matmul limits under different
+names -- while depthwise has its own, lower ceiling (below).
 
 | Precision | Element | `Cin` max | `Cout` max | Constant |
 |---|---|---|---|---|
-| fp16 | 2 B | **1792** | **1792** | `MAX_INPUT_CHANNELS` / `MAX_OUTPUT_CHANNELS` |
-| bf16 | 2 B | 1792 | 1792 | shares the fp16 constants |
-| int16 | 2 B | 1792 | 1792 | shares the fp16 constants |
-| fp16 + fp32 accumulator | 2 B in / 4 B out | 1792 | 1792 | shares the fp16 constants |
-| int8 (requantized) | 1 B | **1344** | **1792** | `MAX_INT8_INPUT_CHANNELS` / `MAX_INT8_OUTPUT_CHANNELS` |
-| int8 + int32 accumulator | 1 B in / 4 B out | 1344 | 1792 | shares the int8 constants |
-| int4 | 0.5 B | **1344** | **1792** | `MAX_INT4_INPUT_CHANNELS` / `MAX_INT4_OUTPUT_CHANNELS` |
-| tf32 | 4 B | **1024** | **1792** | `MAX_TF32_INPUT_CHANNELS` / `MAX_TF32_OUTPUT_CHANNELS` |
+| fp16 | 2 B | **3584** | **3584** | `MAX_INPUT_CHANNELS` / `MAX_OUTPUT_CHANNELS` |
+| bf16 | 2 B | 3584 | 3584 | shares the fp16 constants |
+| int16 | 2 B | 3584 | 3584 | shares the fp16 constants |
+| fp16 + fp32 accumulator | 2 B in / 4 B out | 3584 | 3584 | shares the fp16 constants |
+| int8 (requantized) | 1 B | **3584** | **3584** | `MAX_INT8_INPUT_CHANNELS` / `MAX_INT8_OUTPUT_CHANNELS` |
+| int8 + int32 accumulator | 1 B in / 4 B out | 3584 | 3584 | shares the int8 constants |
+| int4 | 0.5 B | **3584** | **3584** | `MAX_INT4_INPUT_CHANNELS` / `MAX_INT4_OUTPUT_CHANNELS` |
+| tf32 | 4 B | **3584** | **3584** | `MAX_TF32_INPUT_CHANNELS` / `MAX_TF32_OUTPUT_CHANNELS` |
+| any, depthwise | 1-2 B | **1792** | = `Cin` | `MAX_DEPTHWISE_CHANNELS` |
 
-`Cout` reaches the same 1792 at every width because an output channel does not
-charge CBUF feature residency; `Cin` does, which is why tf32's 4-byte element
-sits lower. The four `Cin` ceilings do not reduce to one quantity -- neither
-`Cin * element_bytes` nor feature-atom count fits all of them -- so this is a
-table of what was measured rather than a rule.
+**Every dense ceiling moved to 3584 on 2026-09-06**, from 1792 (fp16 family),
+1344/1792 (int8, int4) and 1024/1792 (tf32). Until then the ceilings differed
+per rung and the table above was a table of separate measurements; the ladders
+now agree at every width, because at k=1 the binding quantity is not CBUF
+feature residency. tf32 is the case that shows it: a 4-byte element charges
+four times fp16's residency per channel and was expected to stop lowest, and
+instead it reaches the same 3584 with roughly double the tile count (28 against
+14 at `Cin` 3584) -- the residency turns into geometry rather than into a
+refusal. `Cout` never charged residency at all, which is why it was already
+equal across the rungs.
+
+The raise was driven by transformer shapes: ViT-B/16 and Qwen3 both have
+`K = N = 3072` MLPs and ViT's QKV projection is `N = 2304`, all of which the
+old 1792 excluded. Measured on `planck` from a quiet board with
+`dtype_boundary_probe`, one sweep per process, 0 mismatches and 0 device
+timeouts at every point:
+
+* `Cin` at k=1, 14x14 `Cout` 64: 1792 through 3584 in 256-channel steps, then
+  3840, 4096, 4608, 5120, 6144 and **8192** at fp16, and 1792/2304/3072/3584/
+  4096 at every other rung. Under `Selectors` (addressing) and `Counting`
+  (every lane contributes).
+* `Cout` at k=1, 7x7 `Cin` 448: 1792 through 4096 at every rung, CBUF split
+  flat across the whole range.
+* ragged counts on both axes: 1793, 2049, 2313, 3073, 3585, 4095.
+* the `onehot` read map at `Cout == Cin` -- the instrument that says *where* a
+  value was read from -- at 2313, 3072, 3584 and 3585, at every rung except
+  int4, whose index encoding does not fit a nibble.
+* the matmul geometry itself, `197x1`: `K` 3072 `N` 768, `K` 768 `N` 2304 and
+  3072, and the read map at `K = N` 3072 and 3584.
+* 56x56 multi-tile to `Cin` 3584 (224 tiles), and stride 2 at `Cin`
+  1792..4096 and `Cout` 2304..3584.
+
+4096 measured clean everywhere and 8192 measured clean at fp16 k=1; the
+constants sit at 3584 on this repo's usual principle -- a limit is what a real
+model needs and the corpus reaches. A ViT-L/16 MLP at 4096 needs the constant
+moved, not another measurement.
+
+**`Counting` cannot be read at fp16 above `Cin` 2048**, and the failure looks
+exactly like a channel-padding fault: its expected output is the channel count
+itself, fp16 spaces integers by two above 2048, so `Cin` 2049 returns 2048 with
+`max|diff| = 1` at every pixel. The ragged counts above were taken with the
+fp32 output container (`fp16acc`) for this reason. Same trap as bf16's
+nine-significant-bit ceiling.
+
+**Depthwise did not follow the raise.** It constructs with
+`out_channels == in_channels`, so `MAX_INPUT_CHANNELS` used to bind it, and
+letting it keep riding that constant would have doubled the depthwise range on
+dense evidence. `MAX_DEPTHWISE_CHANNELS` freezes it at the 1792 it already had;
+the depthwise evidence itself stops earlier still (vendor corpus to 1344,
+hardware exactness to 1536, matchers at 1344). Depthwise has its own
+coefficient grouping and its own output writer, each of which has been wrong at
+a shape the dense path was right at.
 
 The sharing of the fp16 constants across the other 2-byte rungs is measured at
 each width rather than argued from the element width alone:
-`bf16_regression_matrix` (58/58), `int16_regression_matrix` (37/37) and
-`fp16_accumulator_matrix` (52/52) each run `Cin` 512/1024/1344 at k=1, `Cout`
-to 1792, ragged channel counts, 56x56 and 112x112 multi-tile, 5x5 and 7x7, and
-stride 2. int4 is `int4_regression_matrix_matches_oracle` (51/51) and tf32 is
-`tf32_regression_matrix_matches_oracle` (50/50). All six live in
+`bf16_regression_matrix` (63/63), `int16_regression_matrix` (42/42) and
+`fp16_accumulator_matrix` (57/57) each run `Cin` 512/1024/1344/1792/3584 at
+k=1, `Cout` to 3584, ragged channel counts, 56x56 and 112x112 multi-tile, 5x5
+and 7x7, and stride 2. int4 is `int4_regression_matrix_matches_oracle` (54/54)
+and tf32 is `tf32_regression_matrix_matches_oracle` (53/53). All six live in
 `iree-rocket-hal/tests/conv2d_oracle_hw.rs`.
 
 Extra constraints on top of the table:
@@ -103,7 +152,7 @@ off. It is a probe hatch for extending the measurement, not a supported mode.
 | Dilation | 1 | No dilation support in the builder at all |
 | Leading padding | 0..=15, and `pad < kernel extent` | The CNA's 4-bit pad fields. There are no *trailing* padding registers; the output extent implies bottom and right |
 | Input rows per program | `CNA_CBUF_CON1.data_entries` <= 0x7fff, `feature_grains` <= 0x3ff | Usually the CBUF bank grant binds first; the planner tiles |
-| Input row width per program | `(ceil(atoms/4) - 1) * in_cols <= 2047` for NC1HWC2 input (89 at fp16 `Cin` 768, 292 at 256, 37 at 1792; unbounded at one slab, `Cin` <= 32) | The CBUF's 11-bit entry-slab base, `MAX_ENTRY_SLAB_BASE`; measured exact at 2048 across fp16/bf16/int16/tf32/int8. `Shape::max_tile_input_width` bounds it and the planner splits columns. A row that does not fit its data grant is refused too (capacity 0), no longer forced through |
+| Input row width per program | `(ceil(atoms/4) - 1) * in_cols <= 2047` for NC1HWC2 input (89 at fp16 `Cin` 768, 292 at 256, 37 at 1792, 18 at 3584; unbounded at one slab, `Cin` <= 32) | The CBUF's 11-bit entry-slab base, `MAX_ENTRY_SLAB_BASE`; measured exact at 2048 across fp16/bf16/int16/tf32/int8. `Shape::max_tile_input_width` bounds it and the planner splits columns. A row that does not fit its data grant is refused too (capacity 0), no longer forced through |
 
 ### Above 3x3, `Cin` is the cliff
 
@@ -140,8 +189,8 @@ timeouts**, under both the `Selectors` and `Counting` oracle patterns:
 | Dimension | Tested range | Bound by |
 |---|---|---|
 | `M` (conv width at height one) | 1..=2047, measured end to end at 2047 by `tools/e2e_matmul_regression.py` (exact) as well as in the compiled matcher; 1..=296 measured in the HAL | `CNA_DATA_SIZE0.datain_width` is 11 bits. The vendor FC sweep covers 1, 2, 7, 16, 32 (three CBUF splits); above the row-width limit above the planner splits column tiles -- see below |
-| `K` (conv `Cin`) | 1..=1792 | `MAX_INPUT_CHANNELS`; measured 512, 1024, 1344, 1792, 2048 |
-| `N` (conv `Cout`) | 1..=1792 | `MAX_OUTPUT_CHANNELS`; measured 64, 512, 1001, 1792, 2048 |
+| `K` (conv `Cin`) | 1..=3584 | `MAX_INPUT_CHANNELS`; measured 512, 1024, 1344, 1792, 2048, and 2304..4096 in 2026-09-06's sweep |
+| `N` (conv `Cout`) | 1..=3584 | `MAX_OUTPUT_CHANNELS`; measured 64, 512, 1001, 1792, 2048, and 2304..4096 |
 
 MobileNetV2's classifier, `M=1 K=1792 N=1001`, is exact under both patterns and
 again with the fp32 accumulator kept. `K = 1792` is why `MAX_INPUT_CHANNELS` was
@@ -150,6 +199,13 @@ raised from 1344 on 2026-09-04: the geometry that carries it -- a 1x1 spatial
 `fc_matmul_ladder_matches_the_fc_lowering` keeps the regression's cases
 identical to what `fc::Shape::as_conv_shape` actually builds, so the ladder
 cannot drift into measuring its own geometry.
+
+`K` and `N` reached **3584** on 2026-09-06 with the channel ceilings, measured
+at this geometry as well as the convolution one: `197x1` with `K` 3072 `N` 768,
+`K` 768 `N` 2304 and 3072, and the `onehot` read map at `K = N` 3072 and 3584.
+End to end, `tools/e2e_matmul_regression.py` runs `matmul_k_n_ceilings`
+(`M` 8, `K` = `N` = 3584) and `matmul_vit_mlp` (`197x768x3072`) through
+compiled modules on the board, both bit-exact against the CPU arm.
 
 **Above `M` 32 the row splits, and the split is measured.** A single input
 row wider than `(K/32 - 1) * M <= 2047` CBUF entries reads its last 32
@@ -166,12 +222,18 @@ exact at the same points with fewer tiles (ISSUES.md D1).
 register's 2047 and the spec collapsing ONNX's unit-batch `batch_matmul` to
 `linalg.matmul`, `rocket-compiler` offloads the twelve `197x768x768` attention
 out-projections (12 of 272 dispatch sites; QKV at N 2304 and the MLP at N/K
-3072 exceed the 1792 channel caps). Against the `--no-offload` build on
+3072 exceeded the 1792 channel caps of that day -- the 2026-09-06 raise to 3584
+admits all three, taking the model to **48 of 333** dispatch sites, every
+matmul in all twelve encoder layers). Against the `--no-offload` build on
 `planck`, same input: max|err| 0.0014 on logits of magnitude 6.8, top-5
 identical, **3.87 s vs 4.06 s per inference** (`iree-benchmark-module`, 3
 repetitions each) -- the first configuration in this repo faster than its
-like-for-like CPU arm, by 5%. Read with [[planck-measurement-environment]]'s
-caveats; it is one input and one core allocation.
+like-for-like CPU arm, by 5%. With the 3584 ceilings and all 48 sites the
+same comparison is **873 ms vs 4283 ms** (7 repetitions, medians, arms measured
+back to back), `max|err|` 0.0041 with identical top-5, and Qwen3-0.6B's prefill
+goes 56 -> 196 sites for 30.3 s against 49.3 s. ROADMAP.md carries both
+tables. Read with [[planck-measurement-environment]]'s caveats; it is one input
+and one core allocation.
 
 ## Pooling
 
@@ -229,17 +291,17 @@ CPU today. Everything else falls back silently and correctly.
 
 | Op | Layout | Types | Kernel | Stride | `Cin` | `Cout` |
 |---|---|---|---|---|---|---|
-| conv | NHWC HWCF | f16/f16/f32 | 1x1 | 1 | 1..=1344 | 1..=1792 |
+| conv | NHWC HWCF | f16/f16/f32 | 1x1 | 1 | 1..=3584 | 1..=3584 |
 | conv | NHWC HWCF | f16/f16/f32 | 3x3 | 1 | 1..=1152 | 1..=1792 |
 | conv | NHWC HWCF | f16/f16/f32 | 1x1, 3x3 | 2 | 1..=512 | 1..=512 |
-| conv | NHWC HWCF | i8/i8/i32 | 1x1 | 1 | 1..=1344 | 1..=1792 |
+| conv | NHWC HWCF | i8/i8/i32 | 1x1 | 1 | 1..=3584 | 1..=3584 |
 | conv | NHWC HWCF | i8/i8/i32 | 3x3 | 1 | 1..=1152 | 1..=512 |
 | depthwise | NHWC HWC | f16/f16/f32 | 1x1, 3x3 | 1 | 1..=512 | = `Cin` |
 | depthwise | NCHW CHW | f16/f16/f32 | 1x1, 3x3 | 1, 2, 3, 4 | 1..=512 | = `Cin` |
 | depthwise | NHWC HWC | i8/i8/i32 | 1x1, 3x3 | 1, 2 | 1..=1344 | = `Cin` |
-| matmul | -- | f16/f16/f32 | -- | -- | `M` 1..=2047, `K` 1..=1792 | `N` 1..=1792 |
-| matvec | -- | f16/f16/f32 | -- | -- | `M` 1..=2047, `K` 1..=1792 | `N` = 1 |
-| vecmat | -- | f16/f16/f32 | -- | -- | `M` = 1, `K` 1..=1792 | `N` 1..=1792 |
+| matmul | -- | f16/f16/f32 | -- | -- | `M` 1..=2047, `K` 1..=3584 | `N` 1..=3584 |
+| matvec | -- | f16/f16/f32 | -- | -- | `M` 1..=2047, `K` 1..=3584 | `N` = 1 |
+| vecmat | -- | f16/f16/f32 | -- | -- | `M` = 1, `K` 1..=3584 | `N` 1..=3584 |
 | avg pool | NCHW sum | f32 | 2x2..=8x8 | 1 | H/W/C 1..=8192 | -- |
 | avg pool | NHWC sum | f32 | 2x2..=8x8 | 1 | H/W/C 1..=8192 | -- |
 | max pool | NHWC | f32 | 2x2..=8x8 | 1, 2 | H/W/C 1..=8192 | -- |
@@ -396,5 +458,7 @@ cause -- `brdma_data_use` left set on the int32-accumulator path -- fixed
    model reaches.
 
 Set the constant at what a real model needs and the corpus reaches, not at the
-furthest point that happened to pass. Several constants sit at 1792 where 2048
-also measured clean, deliberately.
+furthest point that happened to pass. The dense channel ceilings sit at 3584
+where 4096 also measured clean at every rung and 8192 did at fp16 k=1,
+deliberately -- 3584 is a rung above the widest transformer shape in the
+corpus.

@@ -4407,10 +4407,17 @@ module attributes {transform.with_named_sequence} {
   // The bounds are the HAL's, and they are the reason Phase 5 of the plan
   // ran before this matcher was written: K becomes the convolution's input
   // channels and N its output channels, so `MAX_INPUT_CHANNELS` and
-  // `MAX_OUTPUT_CHANNELS` bound them at 1792 -- exactly MobileNetV2's
-  // classifier, measured at that shape rather than inferred from the 14x14
-  // sweep that already reached 1792 at a different geometry. M becomes the
-  // convolution *width*, which no constant bounds.
+  // `MAX_OUTPUT_CHANNELS` bound them -- at 1792 when this was written,
+  // exactly MobileNetV2's classifier, measured at that shape rather than
+  // inferred from the 14x14 sweep that already reached 1792 at a different
+  // geometry. M becomes the convolution *width*, which no constant bounds.
+  //
+  // Both are **3584** since 2026-09-06, which is what puts a transformer's
+  // MLP on the NPU: ViT-B/16 and Qwen3 are both K = N = 3072, and ViT's QKV
+  // projection is N = 2304. The sweep behind the raise is in
+  // `MAX_INPUT_CHANNELS`' doc comment and includes these shapes at this
+  // geometry -- `197x1` with K 3072 N 768, and K 768 N 2304 and 3072 --
+  // rather than only the 14x14 conv one.
   //
   // M was bounded at 32 -- where the vendor FC ladder stopped -- until
   // 2026-09-05, and for a while that was holding a hardware fault at bay: a
@@ -4433,8 +4440,8 @@ module attributes {transform.with_named_sequence} {
     %lhs_value = transform.get_operand %root[0] : (!transform.any_op) -> !transform.any_value
     %rhs_value = transform.get_operand %root[1] : (!transform.any_op) -> !transform.any_value
     transform.iree.match.dim_bounds %lhs_value[0], umin = 1, umax = 2047 : !transform.any_value
-    transform.iree.match.dim_bounds %lhs_value[1], umin = 1, umax = 1792 : !transform.any_value
-    transform.iree.match.dim_bounds %rhs_value[1], umin = 1, umax = 1792 : !transform.any_value
+    transform.iree.match.dim_bounds %lhs_value[1], umin = 1, umax = 3584 : !transform.any_value
+    transform.iree.match.dim_bounds %rhs_value[1], umin = 1, umax = 3584 : !transform.any_value
     transform.yield %root : !transform.any_op
   }
 
@@ -4959,17 +4966,28 @@ module attributes {transform.with_named_sequence} {
     // agrees (conv_vendor_fixture_wide.rs). The 2026-08-28 attempt at 960 was
     // reverted for a CBUF-split divergence that the 2026-09-02 group-division
     // fix removed; see MAX_INPUT_CHANNELS' doc comment.
-    transform.iree.match.dim_bounds %input_value[3], umin = 1, umax = 1344 : !transform.any_value
+    //
+    // Raised again 1344 -> 3584 on 2026-09-06, with the constant. k=1 is the
+    // kernel the sweep covers and the only one this bound governs: at k=3
+    // the coefficient working set binds far below either number, and
+    // @match_dynamic_conv2d_3x3 keeps its own 1152. Board evidence, quiet
+    // board, `Selectors` for addressing and `Counting` for lane coverage at
+    // every point, plus the `onehot` read map at Cout == Cin: Cin 1792
+    // through 3584 in 256-channel steps and on to 8192, ragged 1793..4095,
+    // 56x56 multi-tile to 3584. Full list in MAX_INPUT_CHANNELS' doc comment.
+    transform.iree.match.dim_bounds %input_value[3], umin = 1, umax = 3584 : !transform.any_value
     // MobileNetV2's four 14x14, Cin=88, Cout=528 pointwise convolutions
     // pass the three hardware-oracle patterns with a 2/10 CBUF split. Keep
     // this narrow expansion local to the stride-1 1x1 matcher; the 3x3 and
     // strided matchers retain their separately characterized 512 limit.
-    // The HAL's `MAX_OUTPUT_CHANNELS`, raised 528 -> 1792. Measured exact at
-    // 7x7 Cin 448 for Cout 528, 640, 768, 1024, 1344, 1792 and 2048, with the
-    // CBUF split flat at 2d/10w -- the high-channel divergence is indexed by
-    // `Cin`, not `Cout`. The old 528 was a narrow expansion for MobileNetV2's
-    // Cin=88/Cout=528 pointwise convolutions.
-    transform.iree.match.dim_bounds %filter_value[3], umin = 1, umax = 1792 : !transform.any_value
+    // The HAL's `MAX_OUTPUT_CHANNELS`, raised 528 -> 1792, then 1792 -> 3584
+    // (2026-09-06). Measured exact at 7x7 Cin 448 for Cout 528, 640, 768,
+    // 1024, 1344, 1792, 2048, and then 2304, 2560, 3072, 3584 and 4096, with
+    // the CBUF split flat at 2d/10w over the whole range -- the high-channel
+    // divergence is indexed by `Cin`, not `Cout`. Ragged Cout 1793, 2049,
+    // 2313, 3073, 3585 and 4095 are exact too. The old 528 was a narrow
+    // expansion for MobileNetV2's Cin=88/Cout=528 pointwise convolutions.
+    transform.iree.match.dim_bounds %filter_value[3], umin = 1, umax = 3584 : !transform.any_value
     transform.yield %root : !transform.any_op
   }
 
@@ -5041,9 +5059,10 @@ module attributes {transform.with_named_sequence} {
     // and after a deliberate idle gap. It is the shape, not the timing.
     %input_value = transform.get_operand %root[0] : (!transform.any_op) -> !transform.any_value
     %filter_value = transform.get_operand %root[1] : (!transform.any_op) -> !transform.any_value
-    // 1152, not `MAX_INPUT_CHANNELS` (1344): at a 3x3 kernel the coefficient
-    // working set binds first and `ConvPlan` refuses Cin >= 1216 outright,
-    // which would reach the driver and panic rather than fall back. fp16 k=3
+    // 1152, not `MAX_INPUT_CHANNELS` (3584 since 2026-09-06): at a 3x3
+    // kernel the coefficient working set binds first and `ConvPlan` refuses
+    // Cin >= 1216 outright, which would reach the driver and panic rather
+    // than fall back. fp16 k=3
     // is exact at 28x28 Cout 64 for Cin 512..1152, including the 1/11 split
     // at 1152. Same reasoning as `@match_dynamic_conv2d_3x3_int8`.
     transform.iree.match.dim_bounds %input_value[3], umin = 1, umax = 1152 : !transform.any_value
@@ -5939,15 +5958,19 @@ module attributes {transform.with_named_sequence} {
     %input_value = transform.get_operand %root[0] : (!transform.any_op) -> !transform.any_value
     %filter_value = transform.get_operand %root[1] : (!transform.any_op) -> !transform.any_value
     // The HAL's `MAX_INT8_INPUT_CHANNELS`, raised 512 -> 1344 on hardware
-    // evidence. k=1 is measured exact to Cin 2048; 1344 is MobileNetV2's
-    // widest and the extent the vendor corpus reaches.
-    transform.iree.match.dim_bounds %input_value[3], umin = 1, umax = 1344 : !transform.any_value
+    // evidence, then 1344 -> 3584 on 2026-09-06 with the rest of the rungs.
+    // int8's own points at k=1: 14x14 Cout 64 at Cin 1792, 2304, 3072, 3584
+    // and 4096 under `SelectorsAffine` and again under `Counting`, the
+    // `onehot` read map at Cout == Cin 3584, and stride 2 at Cin 2304..4096.
+    // 1344 was MobileNetV2's widest; a transformer's is 3072.
+    transform.iree.match.dim_bounds %input_value[3], umin = 1, umax = 3584 : !transform.any_value
     // The HAL's `MAX_INT8_OUTPUT_CHANNELS`, split out from the shared
-    // `MAX_OUTPUT_CHANNELS` at 1792. Measured exact at 7x7 Cin 448 for Cout
-    // 768, 1024, 1280, 1536, 1792 and 2048, with the CBUF split flat (7d/5w)
+    // `MAX_OUTPUT_CHANNELS` at 1792, raised to 3584 on 2026-09-06. Measured
+    // exact at 7x7 Cin 448 for Cout 768, 1024, 1280, 1536, 1792, 2048, and
+    // then 2304, 3072, 3584 and 4096, with the CBUF split flat (7d/5w)
     // across the whole range -- the high-channel divergence is indexed by
-    // `Cin`, not `Cout`. fp16 keeps 768; the evidence here is int8 only.
-    transform.iree.match.dim_bounds %filter_value[3], umin = 1, umax = 1792 : !transform.any_value
+    // `Cin`, not `Cout`.
+    transform.iree.match.dim_bounds %filter_value[3], umin = 1, umax = 3584 : !transform.any_value
     transform.yield %root : !transform.any_op
   }
 
@@ -5968,8 +5991,9 @@ module attributes {transform.with_named_sequence} {
 
     %input_value = transform.get_operand %root[0] : (!transform.any_op) -> !transform.any_value
     %filter_value = transform.get_operand %root[1] : (!transform.any_op) -> !transform.any_value
-    // 1152, not `MAX_INT8_INPUT_CHANNELS` (1344): at a 3x3 kernel the binding
-    // limit is the coefficient working set, not the channel-padding rules.
+    // 1152, not `MAX_INT8_INPUT_CHANNELS` (3584 since 2026-09-06): at a 3x3
+    // kernel the binding limit is the coefficient working set, not the
+    // channel-padding rules.
     // `ConvPlan` plans and agrees with the vendor to Cin 1152 and **refuses**
     // Cin >= 1216 outright (the working set exceeds the eleven grantable CBUF
     // banks), so admitting past 1152 would reach the driver and panic rather

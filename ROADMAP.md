@@ -162,6 +162,74 @@ change, no hardware unknown.
 
 ---
 
+## The channel ceilings, raised 2026-09-06
+
+A third kind of blocker, alongside the two the ledger lists: an op the whole
+stack supports at a *shape* the measurement has not reached. Every dense
+channel ceiling in [`conv.rs`](iree-rocket-hal/src/rocket/conv.rs) moved from
+1792 (fp16 family), 1344/1792 (int8, int4) and 1024/1792 (tf32) to a uniform
+**3584** on `Cin` and `Cout`, with the k=1 matchers and the matmul matcher
+following. [LIMITS.md](LIMITS.md#convolution-channel-limits) carries the sweep;
+the short version is that at k=1 the binding quantity is not CBUF feature
+residency, so every rung reaches the same ceiling, and 4096 measured clean
+everywhere while 8192 did at fp16.
+
+This is what a transformer needs. Both models in this repo were blocked on
+*channels*, not on geometry or on any missing op:
+
+| Model | Sites before | Sites after | What the caps had blocked |
+|---|---|---|---|
+| ViT-B/16 | 12 of 272 | **48 of 333** | QKV (`N` 2304), MLP up (`N` 3072), MLP down (`K` 3072) -- every matmul in all twelve encoder layers is now offloaded |
+| Qwen3-0.6B, prefill seq 128 | 56 of 1130 | **196 of 1494** | `q_proj` (`N` 2048), `o_proj` (`K` 2048), gate/up (`N` 3072), down (`K` 3072) -- every matmul but the `lm_head`, which is `N` 151936 and always will be |
+
+**ViT-B/16 end to end on `planck`** (7 repetitions, medians, every arm built by
+`rocket-compiler` so the baseline is like-for-like, same input, validated on a
+second random input too):
+
+| arm | per inference | vs `--no-offload` |
+|---|---|---|
+| `--no-offload` CPU | 4283 ms | -- |
+| 12 matmul sites (old caps) | 3922 ms | 1.09x faster |
+| **48 matmul sites (3584 caps)** | **873 ms** | **4.9x faster** |
+
+Correctness against the CPU arm: `max|err|` **0.0041** on logits of magnitude
+6.8 (standard deviation 0.93), top-5 identical; 0.0031 and identical top-5 on
+a second input. The 12-site arm was 0.0014, so the extra error is the f16 round
+trip on 36 more sites.
+
+That 4.9x is the largest margin any configuration in this repo has had, and it
+does not contradict [P8](ISSUES.md)'s per-dispatch law -- it is what P8
+predicts once the offloaded op is *arithmetic-dense enough to pay for its
+repack*. ViT's encoder matmuls are ~33 GFLOP; the twelve out-projections the
+old caps admitted were a twelfth of that, which is why 12 sites bought 9% and
+48 sites buy 390%. The element-wise experiment above is the same law with the
+sign flipped: an `Add` moves as many bytes and does one flop per element.
+
+**Qwen3-0.6B on the same day** (`taskset -c 4-7`, 3 repetitions, medians,
+prefill of 128 tokens), which is the second model and the second architecture:
+
+| arm | per prefill | vs `--no-offload` |
+|---|---|---|
+| `--no-offload` CPU | 49308 ms | -- |
+| **196 matmul sites (3584 caps)** | **30272 ms** | **1.63x faster** |
+
+(The 56-site arm was 48.3 s against 51.1 s on 2026-09-06 *before* the raise,
+1.06x -- a different run of the same protocol, not part of the back-to-back
+pair above.)
+
+`max|err|` **0.049** against the CPU arm on logits of magnitude 21 (standard
+deviation 2.5), top-10 token ids identical -- and the 56-site arm was 0.043, so
+tripling the offloaded sites cost almost no accuracy. The margin is smaller
+than ViT's because a 0.6B decoder spends much more of its wall clock outside
+the matmuls (`ROCKET_PROFILE` put `outside` at 97.7% for the 56-site build) and
+because the `lm_head` alone is 151936 output channels of CPU work that no
+ceiling will reach.
+
+Read the numbers with [planck's measurement caveats](ISSUES.md) -- one input,
+one core allocation, A76 clusters at `performance`.
+
+---
+
 ## What the hardware can and cannot reach
 
 Three menus, one per dialect. "Have" means a hardware-validated HAL builder

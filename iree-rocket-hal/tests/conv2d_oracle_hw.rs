@@ -1076,6 +1076,45 @@ fn dense_geometry_regression_cases() -> Vec<Conv2dCase> {
     for cin in [1u32, 2, 4, 8, 16, 32] {
         cases.push(dense(34, 34, cin, 3, 1));
     }
+    // A *column-partitioned* stride. `ConvPlan` refused this combination
+    // outright until 2026-09-06 -- horizontal tiling was capture-backed at
+    // stride 1 only -- and the 3584 channel ceilings are what made it
+    // reachable: `Shape::max_tile_input_width` falls as `Cin` rises, to 18
+    // pixels at fp16 `Cin` 3584, so a 32-wide strided convolution now needs
+    // a partition where at `Cin` 1792 it did not.
+    //
+    // `Dense` cannot carry the wide case (its accumulator leaves fp16's
+    // exact range long before `Cin` 3584), so the first is `Selectors`,
+    // which moves if a column, tap or channel is permuted. The second is
+    // the read map, on the geometry that actually exercises a halo: k=3 at
+    // stride 2 with padding, where each column tile overlaps its neighbour
+    // and `Cout == Cin` makes every output channel name the input channel
+    // it came from.
+    cases.push(Conv2dCase {
+        width: 32,
+        height: 32,
+        cin: 3584,
+        cout: 64,
+        kernel: [1, 1],
+        stride: 2,
+        padding: [0, 0],
+        precision: OraclePrecision::Fp16,
+        pattern: OraclePattern::Selectors { phase: 7 },
+    });
+    cases.push(Conv2dCase {
+        width: 160,
+        height: 8,
+        cin: 512,
+        cout: 512,
+        kernel: [3, 3],
+        stride: 2,
+        padding: [1, 1],
+        precision: OraclePrecision::Fp16,
+        pattern: OraclePattern::OneHotNeutral80 {
+            phase: 0,
+            signed_input: false,
+        },
+    });
     cases
 }
 
@@ -1812,9 +1851,10 @@ fn dense_coefficient_vgg_blocks_match_oracle() {
 ///     ROCKET_DTYPE_SWEEP=tf32/cout/16/3/64/12,16,20,24 \
 ///       ./conv2d_oracle_hw dtype_boundary_probe --ignored --nocapture
 ///
-/// The spec is `precision/axis/extent/kernel/fixed/values`: `axis` is `cin`
-/// or `cout`, `fixed` is whichever of the two the axis does not sweep, and
-/// `values` is the sweep. `extent` is `N` for an `N x N` image or `WxH` for
+/// The spec is `precision/axis/extent/kernel/fixed/values[/stride]`: `axis`
+/// is `cin` or `cout`, `fixed` is whichever of the two the axis does not
+/// sweep, `values` is the sweep, and the optional seventh field is the
+/// stride (1 when absent). `extent` is `N` for an `N x N` image or `WxH` for
 /// a rectangular one -- the fully-connected lowering makes a matmul a
 /// convolution of height *one*, so `1x1` and `7x1` are shapes worth
 /// sweeping and a square extent cannot express them. Every case runs
@@ -1853,11 +1893,18 @@ fn dtype_boundary_probe() {
         return;
     };
     let fields: Vec<&str> = spec.split('/').collect();
-    assert_eq!(
-        fields.len(),
-        6,
-        "ROCKET_DTYPE_SWEEP=precision/axis/extent/kernel/fixed/values"
+    assert!(
+        matches!(fields.len(), 6 | 7),
+        "ROCKET_DTYPE_SWEEP=precision/axis/extent/kernel/fixed/values[/stride]"
     );
+    // Stride is programmed by the CNA ahead of the precision and channel
+    // stages, so it is a seventh field rather than another axis: it varies
+    // independently of everything else a sweep is asking about, and the
+    // channel ladders needed it to ask whether a raised ceiling still holds
+    // when the window walks.
+    let stride: u32 = fields
+        .get(6)
+        .map_or(1, |value| value.parse().expect("stride"));
     let precision = match fields[0] {
         "fp16" => OraclePrecision::Fp16,
         "fp16acc" => OraclePrecision::Fp16Accumulator,
@@ -1914,7 +1961,7 @@ fn dtype_boundary_probe() {
                 cin,
                 cout,
                 kernel: [kernel, kernel],
-                stride: 1,
+                stride,
                 padding: [kernel / 2, kernel / 2],
                 precision,
                 pattern,
@@ -1951,6 +1998,13 @@ fn dtype_boundary_probe() {
 struct ScaleLadder {
     /// `Cin` values at k=1, where the coefficient working set is smallest
     /// and the channel rules are what bind.
+    ///
+    /// `scale_cases` runs each of these under `Counting`, whose expected
+    /// output *is* the channel count, so an entry past the rung's
+    /// exact-integer range would fail on the output container rather than
+    /// on the hardware -- fp16 spaces integers by two above 2048, bf16 by
+    /// its ninth significant bit. Every value here is representable at
+    /// every rung that lists it; keep new ones round for the same reason.
     cin_k1: &'static [u32],
     /// `Cin` at k=3. `ConvPlan` refuses a coefficient working set past
     /// eleven banks, which at k=3 arrives well below every rung's channel
@@ -2180,9 +2234,9 @@ fn bf16_regression_cases() -> Vec<Conv2dCase> {
     cases.extend(scale_cases(
         OraclePrecision::Bf16,
         ScaleLadder {
-            cin_k1: &[512, 1024, 1344, 1792],
+            cin_k1: &[512, 1024, 1344, 1792, 3584],
             cin_k3: &[512, 1024],
-            cout: &[512, 1024, 1792],
+            cout: &[512, 1024, 1792, 3584],
             unaligned_cin: &[33, 65, 129],
             unaligned_cout: &[40, 72, 129],
             extents: &[(56, 64), (112, 32)],
@@ -2269,9 +2323,9 @@ fn int16_regression_cases() -> Vec<Conv2dCase> {
     cases.extend(scale_cases(
         OraclePrecision::Int16,
         ScaleLadder {
-            cin_k1: &[512, 1024, 1344, 1792],
+            cin_k1: &[512, 1024, 1344, 1792, 3584],
             cin_k3: &[512, 1024],
-            cout: &[512, 1024, 1792],
+            cout: &[512, 1024, 1792, 3584],
             unaligned_cin: &[33, 65, 129],
             unaligned_cout: &[40, 72, 129],
             extents: &[(56, 64), (112, 32)],
@@ -2374,9 +2428,9 @@ fn int4_regression_cases() -> Vec<Conv2dCase> {
     cases.extend(scale_cases(
         OraclePrecision::Int4,
         ScaleLadder {
-            cin_k1: &[512, 1024, 1344],
+            cin_k1: &[512, 1024, 1344, 3584],
             cin_k3: &[512, 1024],
-            cout: &[512, 1024, 1792],
+            cout: &[512, 1024, 1792, 3584],
             unaligned_cin: &[],
             unaligned_cout: &[96, 160],
             extents: &[(56, 64), (112, 32)],
@@ -2509,9 +2563,9 @@ fn tf32_regression_cases() -> Vec<Conv2dCase> {
     cases.extend(scale_cases(
         OraclePrecision::Tf32,
         ScaleLadder {
-            cin_k1: &[512, 1024],
+            cin_k1: &[512, 1024, 3584],
             cin_k3: &[384, 512, 576],
-            cout: &[512, 1024, 1792],
+            cout: &[512, 1024, 1792, 3584],
             unaligned_cin: &[34, 66, 130],
             unaligned_cout: &[12, 20, 68],
             extents: &[(56, 32), (112, 16)],
@@ -2606,9 +2660,9 @@ fn fp16_accumulator_regression_cases() -> Vec<Conv2dCase> {
     cases.extend(scale_cases(
         OraclePrecision::Fp16Accumulator,
         ScaleLadder {
-            cin_k1: &[512, 1024, 1344, 1792],
+            cin_k1: &[512, 1024, 1344, 1792, 3584],
             cin_k3: &[512, 1024],
-            cout: &[512, 1024, 1792],
+            cout: &[512, 1024, 1792, 3584],
             unaligned_cin: &[33, 65, 129],
             unaligned_cout: &[40, 72, 129],
             extents: &[(56, 64), (112, 32)],
@@ -2642,7 +2696,7 @@ fn fp16_accumulator_regression_cases() -> Vec<Conv2dCase> {
 #[test]
 fn fp16_accumulator_matrix_is_planable_and_gap_free() {
     let cases = fp16_accumulator_regression_cases();
-    assert_eq!(cases.len(), 54);
+    assert_eq!(cases.len(), 57);
     assert_planable_and_gap_free(cases);
 }
 
@@ -2675,14 +2729,14 @@ fn fp16_accumulator_ladder_leaves_the_fp16_grid() {
 #[ignore = "needs /dev/accel/accel0 -- establishes the fp32 result writer on the fp16 datapath"]
 fn fp16_accumulator_matrix_matches_oracle() {
     let cases = fp16_accumulator_regression_cases();
-    assert_eq!(cases.len(), 54);
+    assert_eq!(cases.len(), 57);
     run_hardware_case_matrix("fp16 fp32-result matrix", cases);
 }
 
 #[test]
 fn tf32_regression_matrix_is_planable_and_gap_free() {
     let cases = tf32_regression_cases();
-    assert_eq!(cases.len(), 50);
+    assert_eq!(cases.len(), 53);
     assert_planable_and_gap_free(cases);
 }
 
@@ -2690,14 +2744,14 @@ fn tf32_regression_matrix_is_planable_and_gap_free() {
 #[ignore = "needs /dev/accel/accel0 -- establishes tf32 (CNA/CORE field 7, DPU fp32) on the convolution datapath"]
 fn tf32_regression_matrix_matches_oracle() {
     let cases = tf32_regression_cases();
-    assert_eq!(cases.len(), 50);
+    assert_eq!(cases.len(), 53);
     run_hardware_case_matrix("tf32 regression matrix", cases);
 }
 
 #[test]
 fn int4_regression_matrix_is_planable_and_gap_free() {
     let cases = int4_regression_cases();
-    assert_eq!(cases.len(), 51);
+    assert_eq!(cases.len(), 54);
     assert_planable_and_gap_free(cases);
 }
 
@@ -2764,7 +2818,7 @@ fn int4_wide_cases_reach_both_nibble_extremes() {
 #[ignore = "needs /dev/accel/accel0 -- establishes int4 (precision field 6) with its int16 result"]
 fn int4_regression_matrix_matches_oracle() {
     let cases = int4_regression_cases();
-    assert_eq!(cases.len(), 51);
+    assert_eq!(cases.len(), 54);
     run_hardware_case_matrix("int4 regression matrix", cases);
 }
 
@@ -2968,7 +3022,7 @@ fn fc_matmul_geometry_matches_oracle() {
 #[test]
 fn bf16_regression_matrix_is_planable_and_gap_free() {
     let cases = bf16_regression_cases();
-    assert_eq!(cases.len(), 60);
+    assert_eq!(cases.len(), 63);
     assert_planable_and_gap_free(cases);
 }
 
@@ -2976,14 +3030,14 @@ fn bf16_regression_matrix_is_planable_and_gap_free() {
 #[ignore = "needs /dev/accel/accel0 -- establishes bf16 (precision field 3) on the convolution datapath"]
 fn bf16_regression_matrix_matches_oracle() {
     let cases = bf16_regression_cases();
-    assert_eq!(cases.len(), 60);
+    assert_eq!(cases.len(), 63);
     run_hardware_case_matrix("bf16 regression matrix", cases);
 }
 
 #[test]
 fn int16_regression_matrix_is_planable_and_gap_free() {
     let cases = int16_regression_cases();
-    assert_eq!(cases.len(), 39);
+    assert_eq!(cases.len(), 42);
     assert_planable_and_gap_free(cases);
 }
 
@@ -3016,7 +3070,7 @@ fn int16_cases_stay_inside_the_int16_result() {
 #[ignore = "needs /dev/accel/accel0 -- establishes int16 (precision field 1) convolution output"]
 fn int16_regression_matrix_matches_oracle() {
     let cases = int16_regression_cases();
-    assert_eq!(cases.len(), 39);
+    assert_eq!(cases.len(), 42);
     run_hardware_case_matrix("int16 regression matrix", cases);
 }
 
@@ -3258,7 +3312,7 @@ fn int8_accumulator_parity_regression_matrix_matches_oracle() {
 #[test]
 fn dense_geometry_regression_is_planable_and_gap_free() {
     let cases = dense_geometry_regression_cases();
-    assert_eq!(cases.len(), 22);
+    assert_eq!(cases.len(), 24);
     assert_planable_and_gap_free(cases);
 }
 
