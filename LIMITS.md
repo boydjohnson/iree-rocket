@@ -311,11 +311,35 @@ is a difference rather than a defect.
 These are the enabled matchers -- the complete set of shapes that can leave the
 CPU today. Everything else falls back silently and correctly.
 
+The `conv + ReLU6` rows claim a convolution *and* the clamp that follows it,
+and are the only rows that fuse anything: the clamp runs in the DPU's BN
+stage, so the CPU dispatch it would otherwise cost disappears. Three bounds
+on them that are not in the table:
+
+- **The ceiling must be exactly 6.0.** `activation_cmp` is a static attribute
+  on the executable target, and a transform matcher matches structure rather
+  than constant values, so what pins the ceiling is that
+  `rocket-fuse-conv-relu6` produces the canonical form for no other one.
+- **The bias must be a per-channel broadcast.** It moves onto the BS plane,
+  which is what puts it before the BN clamp; a convolution whose init is
+  anything else is declined and keeps its separate clamp dispatch.
+- **Stride 1 only**, so a strided convolution with a ReLU6 -- MobileNetV2's
+  stem is the one in that model -- offloads through the plain rows and keeps
+  its clamp on the CPU.
+
+Measured on MobileNetV2 fp16: 17 of 18 fusable sites, 146 -> 133 ms at
+`taskset -c 4-7` and 122.5 -> 116.5 at `0-7`, with max|diff| against a
+`--no-offload` CPU arm of 0.0184 where the unfused offload arm is 0.0173 and
+argmax and top-5 are unchanged. The residual difference is the bias being
+narrowed to f16 for the Conv2D ABI's bias binding.
+
 | Op | Layout | Types | Kernel | Stride | `Cin` | `Cout` |
 |---|---|---|---|---|---|---|
 | conv | NHWC HWCF | f16/f16/f32 | 1x1 | 1 | 1..=3584 | 1..=3584 |
 | conv | NHWC HWCF | f16/f16/f32 | 3x3 | 1 | 1..=1152 | 1..=1792 |
 | conv | NHWC HWCF | f16/f16/f32 | 1x1, 3x3 | 2 | 1..=512 | 1..=512 |
+| conv + ReLU6 | NHWC HWCF | f16/f16/f32 | 1x1 | 1 | 1..=3584 | 1..=3584 |
+| conv + ReLU6 | NHWC HWCF | f16/f16/f32 | 3x3 | 1 | 1..=1152 | 1..=3584 |
 | conv | NHWC HWCF | i8/i8/i32 | 1x1 | 1 | 1..=3584 | 1..=3584 |
 | conv | NHWC HWCF | i8/i8/i32 | 3x3 | 1 | 1..=1152 | 1..=512 |
 | depthwise | NHWC HWC | f16/f16/f32 | 1x1, 3x3 | 1 | 1..=512 | = `Cin` |

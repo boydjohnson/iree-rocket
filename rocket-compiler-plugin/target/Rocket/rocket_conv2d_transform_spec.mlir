@@ -450,6 +450,48 @@
 // program around. Plain requantized int8 has no such limit and is
 // hardware-exact at every Cin measured through 512 at both 1x1 and 3x3.
 //
+// Fused ReLU6, the fp16 activation MobileNetV2 puts after 18 of its
+// offloaded convolutions.
+//
+// `activation_cmp` is the f32 bit pattern of the ceiling -- 6.0 is
+// `0x40C00000` -- because the fp16 accumulator is float and the BN stage
+// compares against it in the accumulator's own units, before `OUT_CVT`
+// narrows. That is `Activation::clamped_fp16` in the HAL, confirmed there at
+// three ceilings.
+//
+// **The ceiling is static here, and `rocket-fuse-conv-relu6` is what makes
+// that sound.** A transform matcher matches structure, not constant values,
+// so nothing below can tell a ceiling of 6.0 from any other. What guarantees
+// this attribute is right is that the pass only ever produces the canonical
+// form this target's matchers claim when the ceiling is exactly 6.0. Widening
+// the pass without making `activation_cmp` a runtime push constant --
+// `runtime_quantization` is the mechanism, it already carries `output_scale`
+// -- would compile every other ceiling as 6.0.
+//
+// The bias is a real binding here rather than the zero fill every other fp16
+// conv target passes, and it has to be: the hardware order is accumulate ->
+// BS (bias) -> BN (activation) -> OUT_CVT, so the clamp sees the biased
+// value only when the bias is on the BS plane. Measured in
+// `conv_fp16_bias_activation_hw` -- bias alone, bias + ReLU and bias + ReLU6
+// are each exact over 1024 outputs with `acc + bias` crossing both ends of
+// the range.
+#rocket_dynamic_relu6_target = #hal.executable.target<"rocket", "rocket-flatbuffer-v1", {
+  kernel = "conv2d",
+  input_width = 0 : i32, input_height = 0 : i32, input_channels = 0 : i32,
+  output_width = 0 : i32, output_height = 0 : i32, output_channels = 0 : i32,
+  weights_width = 0 : i32, weights_height = 0 : i32, stride = 1 : i32,
+  depthwise = false,
+  input_zero_point = 0 : i32, output_zero_point = 0 : i32, weights_zero_point = 0 : i32,
+  input_scale = 1.0 : f32, weights_scale = 1.0 : f32, output_scale = 1.0 : f32,
+  truncate_bits = 0 : i32,
+  activation = "relux", activation_cmp = 1086324736 : i32,   // 0x40C00000, f32 6.0
+  precision = "fp16",
+  runtime_dimensions = [
+    "input_width", "input_height", "input_channels",
+    "output_channels", "weights_width", "weights_height"
+  ]
+}>
+
 // The scales here are not the model's. `pack_int8_bias_to_bs` normalizes the
 // i32 bias by `input_scale * weights_scale`, and a QLinearConv bias is
 // already in accumulator units, so holding both at 1.0 passes it through
@@ -691,6 +733,20 @@ module attributes {transform.with_named_sequence} {
       }
       builtin.module {
         func.func @rocket_dynamic_depthwise_conv2d() {
+          return
+        }
+      }
+    }
+  }
+
+  hal.executable private @rocket_dynamic_relu6_executable {
+    hal.executable.variant public @rocket_dynamic_conv2d_v1 target(#rocket_dynamic_relu6_target) {
+      hal.executable.export public @rocket_dynamic_conv2d ordinal(0) layout(#dynamic_pipeline_layout) count(%device: !hal.device, %workload: index) -> (index, index, index) {
+        %c1 = arith.constant 1 : index
+        hal.return %c1, %c1, %c1 : index, index, index
+      }
+      builtin.module {
+        func.func @rocket_dynamic_conv2d() {
           return
         }
       }
@@ -2603,6 +2659,143 @@ module attributes {transform.with_named_sequence} {
     }
 
     util.return %final_nhwc : tensor<1x?x?x?xf32>
+  }
+
+  // The ReLU6 shim. Same dispatch as @call_rocket_dynamic_conv2d with two
+  // differences, both of which are the point of the target:
+  //
+  //   * the bias binding carries the model's real per-channel bias instead
+  //     of a zero fill, so the DPU's BS plane adds it before BN clamps; and
+  //   * the CPU epilogue only widens f16 -> f32. It no longer adds the bias,
+  //     because the hardware already did, and it no longer needs a separate
+  //     clamp dispatch, which is the 43.8 MB of f32 traffic per inference
+  //     this whole path exists to remove.
+  //
+  // `%low` and `%high` are unused. They are parameters because the DAG match
+  // yields every leaf of the subgraph it claimed, and keeping them in the
+  // signature documents where the ceiling went: into the target's static
+  // `activation_cmp`, guaranteed to be 6.0 by `rocket-fuse-conv-relu6`.
+  //
+  // The bias is narrowed to f16 here because that is the binding type the
+  // Conv2D ABI gives it; the driver widens it straight back to f32 for
+  // BRDMA (`pack_fp16_bias_to_rocket`), so the round trip costs one f16
+  // rounding per output channel and nothing per element.
+  util.func private @call_rocket_dynamic_conv2d_relu6(
+      %input: tensor<1x?x?x?xf16>,
+      %filter: tensor<?x?x?x?xf16>,
+      %acc_init: tensor<1x?x?x?xf32>,
+      %bias: tensor<?xf32>,
+      %low: f32,
+      %high: f32,
+      %init: tensor<1x?x?x?xf32>) -> tensor<1x?x?x?xf32> {
+    %c0 = arith.constant 0 : index
+    %c1 = arith.constant 1 : index
+    %c2 = arith.constant 2 : index
+    %c3 = arith.constant 3 : index
+
+    %input_height = tensor.dim %input, %c1 : tensor<1x?x?x?xf16>
+    %input_width = tensor.dim %input, %c2 : tensor<1x?x?x?xf16>
+    %input_channels = tensor.dim %input, %c3 : tensor<1x?x?x?xf16>
+    %weights_height = tensor.dim %filter, %c0 : tensor<?x?x?x?xf16>
+    %weights_width = tensor.dim %filter, %c1 : tensor<?x?x?x?xf16>
+    %output_height = tensor.dim %init, %c1 : tensor<1x?x?x?xf32>
+    %output_width = tensor.dim %init, %c2 : tensor<1x?x?x?xf32>
+    %output_channels = tensor.dim %init, %c3 : tensor<1x?x?x?xf32>
+
+    %input_width_i32 = arith.index_cast %input_width : index to i32
+    %input_height_i32 = arith.index_cast %input_height : index to i32
+    %input_channels_i32 = arith.index_cast %input_channels : index to i32
+    %output_channels_i32 = arith.index_cast %output_channels : index to i32
+    %weights_width_i32 = arith.index_cast %weights_width : index to i32
+    %weights_height_i32 = arith.index_cast %weights_height : index to i32
+
+    %bias_empty = tensor.empty(%output_channels) : tensor<?xf16>
+    %bias_f16 = linalg.generic {
+        indexing_maps = [affine_map<(d0) -> (d0)>, affine_map<(d0) -> (d0)>],
+        iterator_types = ["parallel"]
+      } ins(%bias : tensor<?xf32>) outs(%bias_empty : tensor<?xf16>) {
+      ^bb0(%value: f32, %out: f16):
+        %narrowed = arith.truncf %value : f32 to f16
+        linalg.yield %narrowed : f16
+    } -> tensor<?xf16>
+
+    %raw_f16 = flow.dispatch
+        @rocket_dynamic_relu6_executable::@rocket_dynamic_conv2d_v1::@rocket_dynamic_conv2d(
+          %input_width_i32, %input_height_i32, %input_channels_i32,
+          %output_channels_i32, %weights_width_i32, %weights_height_i32,
+          %input, %filter, %bias_f16)
+        {stream.affinity = #hal.device.affinity<@rocket_device>}
+        : (i32, i32, i32, i32, i32, i32,
+           tensor<1x?x?x?xf16>{%input_height, %input_width, %input_channels},
+           tensor<?x?x?x?xf16>{%weights_height, %weights_width, %input_channels, %output_channels},
+           tensor<?xf16>{%output_channels})
+        -> tensor<1x?x?x?xf16>{%output_height, %output_width, %output_channels}
+
+    %final = flow.dispatch.workgroups[
+        %output_height, %output_width, %output_channels](
+        %raw_f16, %output_height, %output_width, %output_channels)
+        : (tensor<1x?x?x?xf16>{%output_height, %output_width, %output_channels},
+           index, index, index)
+        -> tensor<1x?x?x?xf32>{%output_height, %output_width, %output_channels}
+        attributes { stream.affinity = #hal.device.affinity<@cpu_device> } =
+        (%raw_binding: !iree_tensor_ext.dispatch.tensor<readonly:tensor<1x?x?x?xf16>>,
+         %output_height_arg: index,
+         %output_width_arg: index,
+         %output_channels_arg: index,
+         %final_binding: !iree_tensor_ext.dispatch.tensor<writeonly:tensor<1x?x?x?xf32>>) {
+      %output_height_size = iree_tensor_ext.dispatch.workload.ordinal
+          %output_height_arg, 0 : index
+      %output_width_size = iree_tensor_ext.dispatch.workload.ordinal
+          %output_width_arg, 1 : index
+      %output_channels_size = iree_tensor_ext.dispatch.workload.ordinal
+          %output_channels_arg, 2 : index
+      %raw_shaped = flow.dispatch.tie_shape %raw_binding
+          : !iree_tensor_ext.dispatch.tensor<readonly:tensor<1x?x?x?xf16>>{
+              %output_height_size, %output_width_size, %output_channels_size}
+      %final_shaped = flow.dispatch.tie_shape %final_binding
+          : !iree_tensor_ext.dispatch.tensor<writeonly:tensor<1x?x?x?xf32>>{
+              %output_height_size, %output_width_size, %output_channels_size}
+      %raw_loaded = iree_tensor_ext.dispatch.tensor.load %raw_shaped,
+          offsets = [0, 0, 0, 0],
+          sizes = [1, %output_height_size, %output_width_size, %output_channels_size],
+          strides = [1, 1, 1, 1]
+          : !iree_tensor_ext.dispatch.tensor<readonly:tensor<1x?x?x?xf16>>{
+              %output_height_size, %output_width_size, %output_channels_size}
+          -> tensor<1x?x?x?xf16>
+      %final_empty = tensor.empty(
+          %output_height_size, %output_width_size, %output_channels_size)
+          : tensor<1x?x?x?xf32>
+      %final_inner = linalg.generic {
+          indexing_maps = [
+            affine_map<(d0, d1, d2, d3) -> (d0, d1, d2, d3)>,
+            affine_map<(d0, d1, d2, d3) -> (d0, d1, d2, d3)>
+          ],
+          iterator_types = ["parallel", "parallel", "parallel", "parallel"]
+        } ins(%raw_loaded : tensor<1x?x?x?xf16>)
+          outs(%final_empty : tensor<1x?x?x?xf32>) {
+        ^bb0(%raw: f16, %out: f32):
+          %raw_f32 = arith.extf %raw : f16 to f32
+          linalg.yield %raw_f32 : f32
+      } -> tensor<1x?x?x?xf32>
+      iree_tensor_ext.dispatch.tensor.store %final_inner, %final_shaped,
+          offsets = [0, 0, 0, 0],
+          sizes = [1, %output_height_size, %output_width_size, %output_channels_size],
+          strides = [1, 1, 1, 1]
+          : tensor<1x?x?x?xf32>
+          -> !iree_tensor_ext.dispatch.tensor<writeonly:tensor<1x?x?x?xf32>>{
+              %output_height_size, %output_width_size, %output_channels_size}
+      flow.return
+    } count(%output_height_workload: index,
+            %output_width_workload: index,
+            %output_channels_workload: index) -> (index, index, index) {
+      %x, %y, %z = iree_tensor_ext.dispatch.workgroup_count_from_slice(
+          %output_height_workload,
+          %output_width_workload,
+          %output_channels_workload)
+      flow.return %x, %y, %z : index, index, index
+    }
+
+    util.return %final : tensor<1x?x?x?xf32>
   }
 
   // Generic runtime-shape adapter. Batch remains statically one because it is
@@ -6146,6 +6339,167 @@ module attributes {transform.with_named_sequence} {
   // dispatch as push constants.
   //===--------------------------------------------------------------------===//
 
+  //===--------------------------------------------------------------------===//
+  // Fused ReLU6 matchers
+  //
+  // These claim a convolution *and* the ReLU6 that follows it, and hand both
+  // to a dispatch that clamps in the DPU's own BN stage. On MobileNetV2 fp16
+  // that removes 18 standalone CPU dispatches -- 43.8 MB of f32 read and
+  // written per inference to do three instructions per element -- because
+  // nothing fuses across a Rocket dispatch boundary (ISSUES.md P8).
+  //
+  // The matched DAG is the canonical form `rocket-fuse-conv-relu6` produces:
+  // a plain f16 x f16 -> f32 convolution over a zero init, then one
+  // elementwise generic that adds the per-channel bias, clamps at 0 and
+  // clamps at the ceiling. Every piece of it maps onto a hardware stage --
+  // the bias and BS, the clamp and BN -- which is why the dispatch can
+  // replace both ops rather than just the convolution.
+  //
+  // Three things about the form are load-bearing rather than stylistic, and
+  // all three are the pass's doing:
+  //
+  //   * The bias and the bounds are *operands* of the generic. A value
+  //     captured from outside the region can never match, because
+  //     `cast_compatible_dag_from_root` builds its value mapping only from
+  //     the ops it walked, and a constant written inside the body does not
+  //     stay there -- the canonicaliser hoists it out.
+  //   * The channels-last `tensor.expand_shape` is moved *after* the clamp.
+  //     Its output shape is a static attribute that differs at every site,
+  //     and the DAG matcher compares whole attribute dictionaries, so a
+  //     template spanning one could match at most a single convolution.
+  //   * The ceiling is not checked here and cannot be: a matcher matches
+  //     structure, not constants. The pass only produces this form for a
+  //     ceiling of exactly 6.0, which is what makes the target's static
+  //     `activation_cmp` correct.
+  //
+  // Channel bounds are the plain fp16 ones -- this path changes what the BS
+  // and BN stages do, not how wide the convolution may be.
+  //===--------------------------------------------------------------------===//
+
+  transform.named_sequence @match_dynamic_conv2d_relu6(
+      %root: !transform.any_op {transform.readonly})
+      -> (!transform.any_value, !transform.any_value) {
+    transform.match.operation_name %root ["linalg.generic"] : !transform.any_op
+    %conv = transform.get_producer_of_operand %root[0]
+        : (!transform.any_op) -> !transform.any_op
+    transform.match.operation_name %conv ["linalg.conv_2d_nhwc_hwcf"] : !transform.any_op
+    %batch, %out_img, %out_ch, %filter, %in_ch, %depth, %strides, %dilations =
+        transform.iree.match.convolution %conv,
+          lhs_type = f16, rhs_type = f16, output_type = f32
+          : !transform.any_op -> !transform.param<i64>
+    transform.iree.match.dims_equal %batch, [1] : !transform.param<i64>
+    transform.iree.match.dims_equal %out_img, [-1, -1] : !transform.param<i64>
+    transform.iree.match.dims_equal %out_ch, [-1] : !transform.param<i64>
+    transform.iree.match.dims_equal %filter, [1, 1] : !transform.param<i64>
+    transform.iree.match.dims_equal %in_ch, [-1] : !transform.param<i64>
+    transform.iree.match.dims_equal %depth, [] : !transform.param<i64>
+    transform.iree.match.dims_equal %strides, [1, 1] : !transform.param<i64>
+    transform.iree.match.dims_equal %dilations, [1, 1] : !transform.param<i64>
+
+    %input_value = transform.get_operand %conv[0] : (!transform.any_op) -> !transform.any_value
+    %filter_value = transform.get_operand %conv[1] : (!transform.any_op) -> !transform.any_value
+    transform.iree.match.dim_bounds %input_value[3], umin = 1, umax = 3584 : !transform.any_value
+    transform.iree.match.dim_bounds %filter_value[3], umin = 1, umax = 3584 : !transform.any_value
+
+    %ins, %outs = transform.iree.match.cast_compatible_dag_from_root %root {
+      ^bb0(%input: tensor<1x?x?x?xf16>, %weights: tensor<?x?x?x?xf16>,
+           %acc_init: tensor<1x?x?x?xf32>, %bias: tensor<?xf32>,
+           %low: f32, %high: f32,
+           %out_init: tensor<1x?x?x?xf32>):
+        // `rocket.f16_demoted` is on the payload convolution --
+        // RocketDemoteConvInputsPass marks every convolution it narrows --
+        // and `cast_compatible_dag_from_root` compares whole attribute
+        // dictionaries, so leaving it out of the template makes every
+        // convolution decline.
+        %accumulator = linalg.conv_2d_nhwc_hwcf
+            {dilations = dense<1> : vector<2xi64>, rocket.f16_demoted,
+             strides = dense<1> : vector<2xi64>}
+            ins(%input, %weights : tensor<1x?x?x?xf16>, tensor<?x?x?x?xf16>)
+            outs(%acc_init : tensor<1x?x?x?xf32>) -> tensor<1x?x?x?xf32>
+        %activated = linalg.generic {
+            indexing_maps = [affine_map<(d0, d1, d2, d3) -> (d0, d1, d2, d3)>,
+                             affine_map<(d0, d1, d2, d3) -> (d3)>,
+                             affine_map<(d0, d1, d2, d3) -> ()>,
+                             affine_map<(d0, d1, d2, d3) -> ()>,
+                             affine_map<(d0, d1, d2, d3) -> (d0, d1, d2, d3)>],
+            iterator_types = ["parallel", "parallel", "parallel", "parallel"]}
+            ins(%accumulator, %bias, %low, %high
+                : tensor<1x?x?x?xf32>, tensor<?xf32>, f32, f32)
+            outs(%out_init : tensor<1x?x?x?xf32>) {
+          ^bb1(%raw: f32, %channel_bias: f32, %lo: f32, %hi: f32, %unused: f32):
+            %biased = arith.addf %raw, %channel_bias : f32
+            %low_clamped = arith.maximumf %biased, %lo : f32
+            %clamped = arith.minimumf %low_clamped, %hi : f32
+            linalg.yield %clamped : f32
+        } -> tensor<1x?x?x?xf32>
+    } : (!transform.any_op) -> (!transform.any_value, !transform.any_value)
+    transform.yield %ins, %outs : !transform.any_value, !transform.any_value
+  }
+
+  // The 3x3 twin. Spelled separately for the same reason every other conv
+  // matcher here is: 2x2 and non-square filters route through different
+  // ConvPlan partitions and must never be claimed by widening a bound. The
+  // Cin ceiling is @match_dynamic_conv2d_3x3's own 1152, not the 1x1 3584.
+  transform.named_sequence @match_dynamic_conv2d_3x3_relu6(
+      %root: !transform.any_op {transform.readonly})
+      -> (!transform.any_value, !transform.any_value) {
+    transform.match.operation_name %root ["linalg.generic"] : !transform.any_op
+    %conv = transform.get_producer_of_operand %root[0]
+        : (!transform.any_op) -> !transform.any_op
+    transform.match.operation_name %conv ["linalg.conv_2d_nhwc_hwcf"] : !transform.any_op
+    %batch, %out_img, %out_ch, %filter, %in_ch, %depth, %strides, %dilations =
+        transform.iree.match.convolution %conv,
+          lhs_type = f16, rhs_type = f16, output_type = f32
+          : !transform.any_op -> !transform.param<i64>
+    transform.iree.match.dims_equal %batch, [1] : !transform.param<i64>
+    transform.iree.match.dims_equal %out_img, [-1, -1] : !transform.param<i64>
+    transform.iree.match.dims_equal %out_ch, [-1] : !transform.param<i64>
+    transform.iree.match.dims_equal %filter, [3, 3] : !transform.param<i64>
+    transform.iree.match.dims_equal %in_ch, [-1] : !transform.param<i64>
+    transform.iree.match.dims_equal %depth, [] : !transform.param<i64>
+    transform.iree.match.dims_equal %strides, [1, 1] : !transform.param<i64>
+    transform.iree.match.dims_equal %dilations, [1, 1] : !transform.param<i64>
+
+    %input_value = transform.get_operand %conv[0] : (!transform.any_op) -> !transform.any_value
+    %filter_value = transform.get_operand %conv[1] : (!transform.any_op) -> !transform.any_value
+    transform.iree.match.dim_bounds %input_value[3], umin = 1, umax = 1152 : !transform.any_value
+    transform.iree.match.dim_bounds %filter_value[3], umin = 1, umax = 3584 : !transform.any_value
+
+    %ins, %outs = transform.iree.match.cast_compatible_dag_from_root %root {
+      ^bb0(%input: tensor<1x?x?x?xf16>, %weights: tensor<?x?x?x?xf16>,
+           %acc_init: tensor<1x?x?x?xf32>, %bias: tensor<?xf32>,
+           %low: f32, %high: f32,
+           %out_init: tensor<1x?x?x?xf32>):
+        // `rocket.f16_demoted` is on the payload convolution --
+        // RocketDemoteConvInputsPass marks every convolution it narrows --
+        // and `cast_compatible_dag_from_root` compares whole attribute
+        // dictionaries, so leaving it out of the template makes every
+        // convolution decline.
+        %accumulator = linalg.conv_2d_nhwc_hwcf
+            {dilations = dense<1> : vector<2xi64>, rocket.f16_demoted,
+             strides = dense<1> : vector<2xi64>}
+            ins(%input, %weights : tensor<1x?x?x?xf16>, tensor<?x?x?x?xf16>)
+            outs(%acc_init : tensor<1x?x?x?xf32>) -> tensor<1x?x?x?xf32>
+        %activated = linalg.generic {
+            indexing_maps = [affine_map<(d0, d1, d2, d3) -> (d0, d1, d2, d3)>,
+                             affine_map<(d0, d1, d2, d3) -> (d3)>,
+                             affine_map<(d0, d1, d2, d3) -> ()>,
+                             affine_map<(d0, d1, d2, d3) -> ()>,
+                             affine_map<(d0, d1, d2, d3) -> (d0, d1, d2, d3)>],
+            iterator_types = ["parallel", "parallel", "parallel", "parallel"]}
+            ins(%accumulator, %bias, %low, %high
+                : tensor<1x?x?x?xf32>, tensor<?xf32>, f32, f32)
+            outs(%out_init : tensor<1x?x?x?xf32>) {
+          ^bb1(%raw: f32, %channel_bias: f32, %lo: f32, %hi: f32, %unused: f32):
+            %biased = arith.addf %raw, %channel_bias : f32
+            %low_clamped = arith.maximumf %biased, %lo : f32
+            %clamped = arith.minimumf %low_clamped, %hi : f32
+            linalg.yield %clamped : f32
+        } -> tensor<1x?x?x?xf32>
+    } : (!transform.any_op) -> (!transform.any_value, !transform.any_value)
+    transform.yield %ins, %outs : !transform.any_value, !transform.any_value
+  }
+
   transform.named_sequence @match_dynamic_conv2d_int8_requant(
       %root: !transform.any_op {transform.readonly})
       -> (!transform.any_value, !transform.any_value) {
@@ -6497,6 +6851,24 @@ module attributes {transform.with_named_sequence} {
   // Shared by both requantized matchers. Unlike the other rewriters here it
   // takes the matched DAG's inputs and output rather than the root op: the
   // call replaces a two-op subgraph, so the values are what identify it.
+  transform.named_sequence @cast_and_call_dynamic_conv2d_relu6(
+      %ins: !transform.any_value {transform.readonly},
+      %out: !transform.any_value {transform.readonly}) {
+    %root = transform.get_defining_op %out : (!transform.any_value) -> !transform.any_op
+    %module = transform.util.get_nearest_symbol_table %root : (!transform.any_op) -> !transform.any_op
+    %topology_attr = transform.param.constant #hal.device.topology<links = [
+        (@rocket_device -> @cpu_device = {transparent_access = true, unified_memory = true}),
+        (@cpu_device -> @rocket_device = {transparent_access = true, unified_memory = true})
+      ]> -> !transform.any_param
+    transform.annotate %module "stream.topology" = %topology_attr : !transform.any_op, !transform.any_param
+    %executable = transform.util.import_symbol @rocket_dynamic_relu6_executable into %module if undefined : (!transform.any_op) -> !transform.any_op
+    %func = transform.util.import_symbol @call_rocket_dynamic_conv2d_relu6 into %module if undefined : (!transform.any_op) -> !transform.any_op
+    transform.util.cast_and_call %func(%ins) -> %out after %root {
+          transform.type_conversion.tensor.cast_shape_dynamic_dims
+      } : (!transform.any_op, !transform.any_value, !transform.any_value, !transform.any_op) -> !transform.any_op
+    transform.yield
+  }
+
   transform.named_sequence @cast_and_call_dynamic_conv2d_int8_requant(
       %ins: !transform.any_value {transform.readonly},
       %out: !transform.any_value {transform.readonly}) {
@@ -6705,6 +7077,18 @@ module attributes {transform.with_named_sequence} {
         "rocket-verify-conv-shapes" to %demoted_funcs
       : (!transform.any_op) -> !transform.any_op
 
+    // Puts an fp16 convolution and the ReLU6 after it into the two-op form
+    // @match_dynamic_conv2d_relu6 claims: bias lifted out of the init and
+    // into the epilogue generic (which is where the hardware computes it,
+    // on the BS plane), bounds as scalar operands, and the channels-last
+    // reshape moved out of the way. Like the requantized path below, this
+    // has to run before `rocket-annotate-original-placement` -- the
+    // `rocket.origin` tags that pass adds would make every convolution fail
+    // the DAG match, which compares whole attribute dictionaries.
+    %activated_funcs = transform.apply_registered_pass
+        "rocket-fuse-conv-relu6" to %verified_funcs
+      : (!transform.any_op) -> !transform.any_op
+
     // Tags every conv-family linalg op with rocket.origin/rocket.origin_kind
     // right before the match/rewrite loop below claims (and erases) some of
     // them -- see RocketAnnotateOriginalPlacementPass.cpp. A
@@ -6727,9 +7111,11 @@ module attributes {transform.with_named_sequence} {
     // Nothing is lost by claiming these first -- an op the loop rewrites is
     // erased, which is exactly what that annotation's readers already expect
     // of a claimed convolution.
-    %requantized_funcs = transform.foreach %verified_funcs : !transform.any_op -> !transform.any_op {
+    %requantized_funcs = transform.foreach %activated_funcs : !transform.any_op -> !transform.any_op {
       ^bb0(%requant_func: !transform.any_op):
         %matched_func = transform.foreach_match in %requant_func
+            @match_dynamic_conv2d_relu6 -> @cast_and_call_dynamic_conv2d_relu6,
+            @match_dynamic_conv2d_3x3_relu6 -> @cast_and_call_dynamic_conv2d_relu6,
             @match_dynamic_conv2d_int8_requant -> @cast_and_call_dynamic_conv2d_int8_requant,
             @match_dynamic_conv2d_3x3_int8_requant -> @cast_and_call_dynamic_conv2d_int8_requant,
             @match_dynamic_depthwise_conv2d_int8_requant -> @cast_and_call_dynamic_depthwise_conv2d_int8_requant,
