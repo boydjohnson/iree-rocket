@@ -1,12 +1,14 @@
 //! `iree_hal_device_vtable_t`. `create` opens `/dev/accel/accel0` and
-//! wires up the sub-objects (allocator, proactor-from-pool); `queue_execute`
-//! is the real dispatch path: wait on `wait_semaphore_list`, pull the
-//! regcmd program `command_buffer::dispatch` recorded, write it to a GEM
-//! buffer, `SUBMIT`, blocking `PREP_BO`, then signal
+//! wires up the sub-objects (allocator, proactor-from-pool, the NPU worker
+//! pool); `queue_execute` is the real dispatch path: it queues the command
+//! buffer to a worker (`pool.rs`), which waits on `wait_semaphore_list`,
+//! pulls the regcmd program `command_buffer::dispatch` recorded, writes it
+//! to a GEM buffer, `SUBMIT`s, blocks in `PREP_BO`, then signals
 //! `signal_semaphore_list` -- the synchronous pattern from
 //! `local_sync/sync_device.c` that this crate's research phase identified
 //! as the right model for a driver whose only completion signal is a
-//! blocking ioctl rather than a native timeline/fence primitive.
+//! blocking ioctl rather than a native timeline/fence primitive, moved off
+//! the caller's thread.
 
 use std::{
     os::fd::AsRawFd,
@@ -47,7 +49,9 @@ use crate::{
 use iree_rocket_hal::rocket::{
     api::{DRM_IOCTL_BASE, drm_version},
     device as rocket_device,
-    tensor_layout::{compact_atomic_output, compact_tiled_accumulator_output},
+    tensor_layout::{
+        compact_atomic_output, compact_atomic_output_rect, compact_tiled_accumulator_output,
+    },
 };
 
 const DEVICE_PATH: &str = "/dev/accel/accel0";
@@ -271,10 +275,14 @@ pub struct RocketDevice {
     /// driver today needs cross-device causal tracking. Revisit if/when
     /// multi-device topologies or real frontier-based sync matter.
     pub topology_info: crate::bindings::iree_hal_device_topology_info_t,
-    /// Last DPU mode that completed on this physical device. This is guarded
-    /// across queue executions because the hardware is shared even when IREE
-    /// invokes queue callbacks from different proactor threads.
-    last_dpu_mode: Mutex<Option<crate::command_buffer::DpuMode>>,
+    /// When the last depthwise job on any context completed -- the one
+    /// hardware transition that needs a dwell, see `DEPTHWISE_TO_DENSE_QUIESCENCE`.
+    /// Device-global on purpose: userspace cannot see which core a context's
+    /// job landed on (MULTICORE.md §5.6).
+    dpu_hazard: Mutex<DpuHazard>,
+    /// The NPU worker threads every `queue_execute` hands its command buffer
+    /// to. Context 0 is a dup of `file`; see `pool.rs`.
+    pool: crate::pool::WorkerPool,
 }
 
 // `PREP_BO` observes the output fence, but the RK3588 DPU can still retain
@@ -284,17 +292,29 @@ pub struct RocketDevice {
 // restricted to this mode transition rather than added to all dispatches.
 const DEPTHWISE_TO_DENSE_QUIESCENCE: Duration = Duration::from_millis(1);
 
-fn needs_depthwise_to_dense_quiescence(
-    last: Option<crate::command_buffer::DpuMode>,
+#[derive(Default)]
+struct DpuHazard {
+    last_depthwise_done: Option<Instant>,
+}
+
+/// How long a dense submit at `now` must still wait so that a full
+/// `DEPTHWISE_TO_DENSE_QUIESCENCE` has passed since the last depthwise
+/// completion. `None` when there is nothing to wait for. With several
+/// contexts this is conservative -- the hazard is per DPU and the
+/// depthwise may have run on another core -- and at one context it is the
+/// old rule minus the part of the dwell that compaction already spent.
+fn depthwise_to_dense_dwell(
+    last_depthwise_done: Option<Instant>,
     next: Option<crate::command_buffer::DpuMode>,
-) -> bool {
-    matches!(
-        (last, next),
-        (
-            Some(crate::command_buffer::DpuMode::Depthwise),
-            Some(crate::command_buffer::DpuMode::Dense)
-        )
-    )
+    now: Instant,
+) -> Option<Duration> {
+    if next != Some(crate::command_buffer::DpuMode::Dense) {
+        return None;
+    }
+    let done = last_depthwise_done?;
+    let remaining =
+        DEPTHWISE_TO_DENSE_QUIESCENCE.saturating_sub(now.saturating_duration_since(done));
+    (!remaining.is_zero()).then_some(remaining)
 }
 
 unsafe fn cast(device: *mut iree_hal_device_t) -> *mut RocketDevice {
@@ -305,9 +325,10 @@ unsafe fn cast(device: *mut iree_hal_device_t) -> *mut RocketDevice {
 /// signals are blocking ioctls, see module doc comment), so "queue order"
 /// is enforced simply: block on every wait semaphore before doing any
 /// work, then signal (or, on failure, fail) the signal list after. Shared
-/// by `queue_execute` and every `queue_alloca`/`queue_dealloca`/
-/// `queue_fill`/`queue_update`/`queue_copy`/`queue_host_call` below.
-unsafe fn wait_all(list: iree_hal_semaphore_list_t) -> iree_status_t {
+/// by the NPU worker (`pool.rs`, on behalf of `queue_execute`) and every
+/// `queue_alloca`/`queue_dealloca`/`queue_fill`/`queue_update`/
+/// `queue_copy`/`queue_host_call` below.
+pub(crate) unsafe fn wait_all(list: iree_hal_semaphore_list_t) -> iree_status_t {
     let infinite = iree_timeout_t {
         type_: iree_timeout_type_e_IREE_TIMEOUT_ABSOLUTE,
         nanos: i64::MAX, // IREE_TIME_INFINITE_FUTURE
@@ -325,11 +346,11 @@ unsafe fn wait_all(list: iree_hal_semaphore_list_t) -> iree_status_t {
     status::ok()
 }
 
-unsafe fn signal_all(list: iree_hal_semaphore_list_t) -> iree_status_t {
+pub(crate) unsafe fn signal_all(list: iree_hal_semaphore_list_t) -> iree_status_t {
     unsafe { crate::bindings::iree_hal_semaphore_list_signal(list, std::ptr::null()) }
 }
 
-unsafe fn fail_all(list: iree_hal_semaphore_list_t, failure: iree_status_t) {
+pub(crate) unsafe fn fail_all(list: iree_hal_semaphore_list_t, failure: iree_status_t) {
     unsafe { crate::bindings::iree_hal_semaphore_list_fail(list, failure) }
 }
 
@@ -366,7 +387,7 @@ impl<T> AssertSend<T> {
 /// Retains every semaphore on construction and releases them on drop, so
 /// the semaphore objects themselves also survive independent of whatever
 /// the caller does with its own references in the meantime.
-struct OwnedSemaphoreList {
+pub(crate) struct OwnedSemaphoreList {
     semaphores: Vec<*mut iree_hal_semaphore_t>,
     payload_values: Vec<u64>,
 }
@@ -374,7 +395,7 @@ struct OwnedSemaphoreList {
 unsafe impl Send for OwnedSemaphoreList {}
 
 impl OwnedSemaphoreList {
-    unsafe fn new(list: iree_hal_semaphore_list_t) -> Self {
+    pub(crate) unsafe fn new(list: iree_hal_semaphore_list_t) -> Self {
         // std::slice::from_raw_parts requires a non-null, aligned pointer
         // even for a zero-length slice -- an empty semaphore list (a
         // legitimate, common case: not every queue_* call needs to signal
@@ -399,7 +420,11 @@ impl OwnedSemaphoreList {
         }
     }
 
-    fn as_list(&mut self) -> iree_hal_semaphore_list_t {
+    pub(crate) fn is_empty(&self) -> bool {
+        self.semaphores.is_empty()
+    }
+
+    pub(crate) fn as_list(&mut self) -> iree_hal_semaphore_list_t {
         iree_hal_semaphore_list_t {
             count: self.semaphores.len() as iree_host_size_t,
             semaphores: self.semaphores.as_mut_ptr(),
@@ -517,6 +542,35 @@ pub unsafe fn create(
         return proactor_status;
     }
 
+    // Context 0 of the worker pool: the same DRM file as every IREE buffer,
+    // so a job on it may name any of them. A dup shares the GEM handle table
+    // and the scheduler entity; it is the same file, not a second core.
+    // Contexts 1..N are fresh opens -- their own entity, their own core --
+    // and see only the scratch their command buffers create on them.
+    let mut contexts = Vec::new();
+    for id in 0..crate::pool::requested_contexts() {
+        let context_file = if id == 0 {
+            file.try_clone().ok()
+        } else {
+            std::fs::OpenOptions::new()
+                .read(true)
+                .write(true)
+                .open(DEVICE_PATH)
+                .ok()
+                .filter(is_rocket_device)
+        };
+        let Some(context_file) = context_file else {
+            return status::from_code(iree_status_code_e_IREE_STATUS_UNAVAILABLE);
+        };
+        contexts.push(std::sync::Arc::new(crate::pool::NpuContext {
+            id,
+            file: context_file,
+        }));
+    }
+    crate::weight_cache::set_contexts(contexts.len());
+    crate::scratch_pool::set_contexts(contexts.len());
+    let pool = crate::pool::WorkerPool::new(contexts, Box::new(crate::pool::RoundRobin::new()));
+
     let device_allocator = crate::allocator::create(allocator_file, host_allocator);
 
     let device = Box::new(RocketDevice {
@@ -531,7 +585,8 @@ pub unsafe fn create(
         proactor_pool,
         proactor,
         topology_info: unsafe { std::mem::zeroed() },
-        last_dpu_mode: Mutex::new(None),
+        dpu_hazard: Mutex::new(DpuHazard::default()),
+        pool,
     });
     let device_ptr = Box::into_raw(device) as *mut iree_hal_device_t;
     // Chicken-and-egg: the allocator needs to know its owning device (see
@@ -546,6 +601,13 @@ pub unsafe fn create(
 }
 
 unsafe extern "C" fn destroy(device: *mut iree_hal_device_t) {
+    // Drain the worker pool first: a unit still queued holds a retained
+    // command buffer and may still be on the hardware, and its phases belong
+    // in the profile below.
+    unsafe { (*cast(device)).pool.shutdown() };
+    // Pooled scratch holds BOs on every context's file; close them while
+    // those files are still open.
+    crate::scratch_pool::clear();
     // The natural end of an inference run, and the point at which
     // `ROCKET_PROFILE`'s tables are worth printing. `report` is idempotent
     // and also runs from an `atexit` hook, for the hosts that never destroy
@@ -722,9 +784,15 @@ unsafe extern "C" fn create_command_buffer(
     out_command_buffer: *mut *mut iree_hal_command_buffer_t,
 ) -> iree_status_t {
     let d = unsafe { &*cast(device) };
+    // Placement, MULTICORE.md §5.4 (a): the context chosen here is the file
+    // this command buffer's scratch lives on and the worker it will run on.
+    let home = d.pool.place();
+    let siblings = d.pool.siblings(home.id);
     unsafe {
         *out_command_buffer = crate::command_buffer::create(
             d.device_allocator,
+            home,
+            siblings,
             mode,
             command_categories,
             queue_affinity,
@@ -1255,31 +1323,39 @@ status_stub!(queue_dispatch(
 #[allow(unused_variables)]
 #[cfg(test)]
 mod device_tests {
-    use super::needs_depthwise_to_dense_quiescence;
+    use super::{DEPTHWISE_TO_DENSE_QUIESCENCE, depthwise_to_dense_dwell};
     use crate::command_buffer::DpuMode;
     use iree_rocket_hal::rocket::{
         conv::AccumulatorOutputTile,
         tensor_layout::{compact_atomic_output, compact_tiled_accumulator_output},
     };
+    use std::time::{Duration, Instant};
 
     #[test]
-    fn quiesces_only_the_completed_depthwise_to_dense_transition() {
-        assert!(needs_depthwise_to_dense_quiescence(
-            Some(DpuMode::Depthwise),
-            Some(DpuMode::Dense),
-        ));
-        assert!(!needs_depthwise_to_dense_quiescence(
-            None,
-            Some(DpuMode::Dense),
-        ));
-        assert!(!needs_depthwise_to_dense_quiescence(
-            Some(DpuMode::Dense),
-            Some(DpuMode::Depthwise),
-        ));
-        assert!(!needs_depthwise_to_dense_quiescence(
-            Some(DpuMode::Depthwise),
-            None,
-        ));
+    fn dwells_only_for_a_dense_submit_within_the_window_of_a_depthwise_completion() {
+        let now = Instant::now();
+        let just_done = Some(now - Duration::from_micros(200));
+        // Dense right after depthwise: the remainder of the window.
+        let dwell = depthwise_to_dense_dwell(just_done, Some(DpuMode::Dense), now).unwrap();
+        assert!(dwell <= DEPTHWISE_TO_DENSE_QUIESCENCE - Duration::from_micros(199));
+        assert!(dwell >= DEPTHWISE_TO_DENSE_QUIESCENCE - Duration::from_micros(201));
+        // Long enough ago: nothing left to wait for.
+        let long_ago = Some(now - Duration::from_millis(5));
+        assert_eq!(
+            depthwise_to_dense_dwell(long_ago, Some(DpuMode::Dense), now),
+            None
+        );
+        // No depthwise ever completed.
+        assert_eq!(
+            depthwise_to_dense_dwell(None, Some(DpuMode::Dense), now),
+            None
+        );
+        // Only a dense submit is at risk.
+        assert_eq!(
+            depthwise_to_dense_dwell(just_done, Some(DpuMode::Depthwise), now),
+            None
+        );
+        assert_eq!(depthwise_to_dense_dwell(just_done, None, now), None);
     }
 
     #[test]
@@ -1525,250 +1601,266 @@ unsafe extern "C" fn queue_execute(
     if !command_buffer.is_null() {
         unsafe { crate::bindings::iree_hal_command_buffer_retain(command_buffer) };
     }
+    // Enqueued, never run here: the worker that owns the NPU context waits
+    // on `wait_semaphore_list`, runs everything below in submission order
+    // and signals `signal_semaphore_list` -- see `pool.rs`. An error inside
+    // reaches IREE as a failed signal semaphore, the way any asynchronous
+    // queue reports one.
+    let pool = unsafe { &(*cast(device)).pool };
+    // A bare barrier (no command buffer) has no scratch anywhere; worker 0
+    // is as good as any, since its ordering is entirely its semaphores'.
+    let context_id = if command_buffer.is_null() {
+        0
+    } else {
+        unsafe { crate::command_buffer::context_id(command_buffer) }
+    };
     let device = AssertSend(device);
     let command_buffer = AssertSend(command_buffer);
     unsafe {
-        run_after_wait(wait_semaphore_list, signal_semaphore_list, move |_sig| {
-            let device = device.into_inner();
-            let command_buffer = command_buffer.into_inner();
-            let d = unsafe { &*cast(device) };
+        pool.enqueue_on(
+            context_id,
+            wait_semaphore_list,
+            signal_semaphore_list,
+            move |ctx| {
+                let device = device.into_inner();
+                let command_buffer = command_buffer.into_inner();
+                let d = unsafe { &*cast(device) };
 
-            // Replay every recorded fill/update/copy (host-side, no
-            // hardware involved) and pull out every recorded `dispatch`'s
-            // regcmd, in call order. A non-null command buffer with no
-            // recorded `dispatch` (e.g. CTS's EventTest -- just
-            // signal_event/reset_event, nothing to actually run on the
-            // NPU) is likewise a legitimate empty job, not an error: skip
-            // straight to signaling. Matches the coarse per-command-buffer
-            // sync granularity documented in event.rs -- there's
-            // genuinely nothing to submit to hardware.
-            // Time the whole callback, and the gap since the previous one
-            // returned -- see profile.rs. `Outside` is the only measure of
-            // how much of an inference is not this driver at all, which is
-            // the first thing to know before optimizing anything inside it.
-            crate::profile::mark_outside_start();
-            // Held for the whole submission: everything below it is either
-            // memory-bound layout work or a syscall, and on a big.LITTLE part
-            // the first is 3.8x slower on the little cluster. See
-            // `cpu_affinity`, and `ROCKET_PROFILE`'s `host time by cpu` line
-            // for where it was actually landing.
-            let _fast_cpus = crate::cpu_affinity::prefer_fast_cpus();
-            let execute_timer = crate::profile::start();
-            let cmds = if command_buffer.is_null() {
-                Vec::new()
-            } else {
-                match unsafe { crate::command_buffer::apply_ops(command_buffer) } {
-                    Ok(cmds) => cmds,
-                    Err(st) => {
-                        unsafe { crate::bindings::iree_hal_command_buffer_release(command_buffer) };
-                        return st;
-                    }
-                }
-            };
-            let result = 'result: {
-                // The device has one DPU even if IREE calls this callback
-                // concurrently. Keep its mode history and the corresponding
-                // hardware submissions serialized as one critical section.
-                let mut last_dpu_mode = d
-                    .last_dpu_mode
-                    .lock()
-                    .unwrap_or_else(|poisoned| poisoned.into_inner());
-
-                // Each recorded dispatch is submitted and fenced as its own
-                // independent hardware job, in call order -- same reasoning
-                // as one dispatch's own CBUF-height-split task list just
-                // below (the mainline driver's inter-task IRQ transition
-                // isn't reliable on RK3588), just at the coarser
-                // dispatch-to-dispatch granularity. Each dispatch reloads
-                // its own weights/CBUF state, so no state needs to survive
-                // between jobs.
-                for job in cmds.iter().filter(|j| !j.regcmd_tasks.is_empty()) {
-                    if !quiesce_off()
-                        && (quiesce_all_enabled()
-                            || needs_depthwise_to_dense_quiescence(*last_dpu_mode, job.dpu_mode))
-                    {
-                        let timer = crate::profile::start();
-                        std::thread::sleep(DEPTHWISE_TO_DENSE_QUIESCENCE);
-                        crate::profile::stop(
-                            timer,
-                            crate::profile::Phase::Quiesce,
-                            job.profile_label,
-                            0,
-                        );
-                    }
-                    let fd = d.file.as_raw_fd();
-                    let regcmd_tasks = job.regcmd_tasks;
-                    if regcmd_tasks.iter().any(Vec::is_empty) {
-                        break 'result status::from_code(iree_status_code_e_IREE_STATUS_INTERNAL);
-                    }
-
-                    // Allocate every split before submission so all command
-                    // buffers remain alive until the dispatch is complete.
-                    let regcmd_timer = crate::profile::start();
-                    let mut cmd_bufs = Vec::with_capacity(regcmd_tasks.len());
-                    for regcmd in regcmd_tasks {
-                        let cmd_bytes = regcmd.len() * std::mem::size_of::<u64>();
-                        let cmd_len = cmd_bytes.next_multiple_of(4096);
-                        cmd_bufs
-                            .push(unsafe { rocket_device::OwnedBuffer::new(fd, cmd_len, &d.file) });
-                    }
-
-                    // The registers this dispatch's first task programs, as
-                    // `domain:offset=value` triples -- see `dump_regset_enabled`.
-                    // Values matter as much as coverage: against
-                    // ../rocket-userspace's `gen_conv2d_task` the *set* this
-                    // repo writes is identical, so a divergence can only be a
-                    // value.
-                    if dump_regset_enabled()
-                        && let Some(first) = regcmd_tasks.first()
-                    {
-                        let mut regs: Vec<String> = first
-                            .iter()
-                            .map(|c| {
-                                format!(
-                                    "{}:{:#06x}={:#010x}",
-                                    (c.0 >> 48) & 0xff,
-                                    (c.0 & 0xffff) as u16,
-                                    ((c.0 >> 16) & 0xffff_ffff) as u32,
-                                )
-                            })
-                            .collect();
-                        regs.sort();
-                        regs.dedup();
-                        // The PC trailer is order-sensitive and would be
-                        // destroyed by the sort above, so print the tail
-                        // verbatim: it carries the enable mask that says which
-                        // hardware blocks participate in this job.
-                        let tail: Vec<String> = first
-                            .iter()
-                            .rev()
-                            .take(8)
-                            .rev()
-                            .map(|c| {
-                                format!(
-                                    "{:#04x}:{:#06x}={:#010x}",
-                                    (c.0 >> 48) & 0xff,
-                                    (c.0 & 0xffff) as u16,
-                                    ((c.0 >> 16) & 0xffff_ffff) as u32,
-                                )
-                            })
-                            .collect();
-                        eprintln!(
-                            "rocket: trailer prec={} {}",
-                            precision_label(job.precision_tag),
-                            tail.join(" ")
-                        );
-                        eprintln!(
-                            "rocket: regset prec={} n={} {}",
-                            precision_label(job.precision_tag),
-                            regs.len(),
-                            regs.join(",")
-                        );
-                    }
-
-                    let mut task_descriptors = Vec::with_capacity(regcmd_tasks.len());
-                    for (regcmd, cmd_buf) in regcmd_tasks.iter().zip(&cmd_bufs) {
-                        unsafe {
-                            let cmd_slice = std::slice::from_raw_parts_mut(
-                                cmd_buf.host_ptr as *mut u64,
-                                regcmd.len(),
-                            );
-                            for (i, c) in regcmd.iter().enumerate() {
-                                cmd_slice[i] = c.0;
-                            }
-                        }
-                        if unsafe { rocket_device::fini_bo(fd, cmd_buf.handle) }.is_err() {
-                            break 'result status::from_code(
-                                iree_status_code_e_IREE_STATUS_UNAVAILABLE,
-                            );
-                        }
-                        task_descriptors.push((cmd_buf.dma_address, regcmd.len() as u32));
-                    }
-                    crate::profile::stop(
-                        regcmd_timer,
-                        crate::profile::Phase::Regcmd,
-                        job.profile_label,
-                        regcmd_tasks
-                            .iter()
-                            .map(|task| task.len() * std::mem::size_of::<u64>())
-                            .sum(),
-                    );
-
-                    // Real input/output GEM handles from the command
-                    // buffer's recorded dispatch (command_buffer.rs's
-                    // `RecordedOp::Dispatch`), same convention this crate's
-                    // hand-rolled hardware tests already validate against
-                    // real hardware: the regcmd buffer's own
-                    // handle plus every buffer the dispatch reads go in
-                    // in_bo_handles, everything it writes goes in
-                    // out_bo_handles. Without these the kernel driver's
-                    // implicit fencing has no way to know the job touches
-                    // those buffers at all -- SUBMIT/PREP_BO would still
-                    // round-trip (proving the ioctl plumbing works) but
-                    // give no real completion/dependency guarantee for the
-                    // tensors themselves.
-                    // Deduplicated: a real compiled program can pack
-                    // multiple bindings (e.g. input+weights) into one
-                    // combined transient buffer at different offsets, so
-                    // the same GEM handle can legitimately appear more than
-                    // once in job.in_bo_handles -- untested against the
-                    // kernel driver's fence/dependency tracking before now
-                    // (every prior hand-driven test used one dedicated
-                    // buffer per binding), so dedupe defensively rather
-                    // than assume DRM_ROCKET_SUBMIT tolerates duplicates.
-                    let mut in_handles =
-                        Vec::with_capacity(cmd_bufs.len() + job.in_bo_handles.len());
-                    for cmd_buf in &cmd_bufs {
-                        in_handles.push(cmd_buf.handle);
-                    }
-                    for &h in job.in_bo_handles {
-                        if !in_handles.contains(&h) {
-                            in_handles.push(h);
+                // Replay every recorded fill/update/copy (host-side, no
+                // hardware involved) and pull out every recorded `dispatch`'s
+                // regcmd, in call order. A non-null command buffer with no
+                // recorded `dispatch` (e.g. CTS's EventTest -- just
+                // signal_event/reset_event, nothing to actually run on the
+                // NPU) is likewise a legitimate empty job, not an error: skip
+                // straight to signaling. Matches the coarse per-command-buffer
+                // sync granularity documented in event.rs -- there's
+                // genuinely nothing to submit to hardware.
+                // Time the whole callback, and the gap since the previous one
+                // returned -- see profile.rs. `Outside` is the only measure of
+                // how much of an inference is not this driver at all, which is
+                // the first thing to know before optimizing anything inside it.
+                crate::profile::mark_outside_start();
+                let execute_timer = crate::profile::start();
+                let cmds = if command_buffer.is_null() {
+                    Vec::new()
+                } else {
+                    match unsafe { crate::command_buffer::apply_ops(command_buffer) } {
+                        Ok(cmds) => cmds,
+                        Err(st) => {
+                            unsafe {
+                                crate::bindings::iree_hal_command_buffer_release(command_buffer)
+                            };
+                            return st;
                         }
                     }
-                    // The mainline driver's IRQ-mediated transition between
-                    // tasks in one drm_rocket_job is not reliable on RK3588:
-                    // task 0 completes correctly, but every later split leaves
-                    // its output rows untouched. Submitting the same regcmds
-                    // as individually fenced jobs is hardware-validated. Each
-                    // split reloads its weights, so no CBUF state must survive
+                };
+                let result = 'result: {
+                    // Each recorded dispatch is submitted and fenced as its own
+                    // independent hardware job, in call order -- same reasoning
+                    // as one dispatch's own CBUF-height-split task list just
+                    // below (the mainline driver's inter-task IRQ transition
+                    // isn't reliable on RK3588), just at the coarser
+                    // dispatch-to-dispatch granularity. Each dispatch reloads
+                    // its own weights/CBUF state, so no state needs to survive
                     // between jobs.
-                    for &(regcmd_addr, regcmd_count) in &task_descriptors {
-                        let started = Instant::now();
-                        let submit_timer = crate::profile::start();
-                        if unsafe {
-                            rocket_device::submit(
-                                fd,
-                                regcmd_addr,
-                                regcmd_count,
-                                &in_handles,
-                                job.out_bo_handles,
+                    for job in cmds.iter().filter(|j| !j.regcmd_tasks.is_empty()) {
+                        // The dwell is computed under the lock and slept outside
+                        // it, so a context dwelling never holds up another's
+                        // submit. Any context's depthwise completion counts.
+                        let dwell = if quiesce_off() {
+                            None
+                        } else if quiesce_all_enabled() {
+                            Some(DEPTHWISE_TO_DENSE_QUIESCENCE)
+                        } else {
+                            let hazard = d
+                                .dpu_hazard
+                                .lock()
+                                .unwrap_or_else(|poisoned| poisoned.into_inner());
+                            depthwise_to_dense_dwell(
+                                hazard.last_depthwise_done,
+                                job.dpu_mode,
+                                Instant::now(),
                             )
-                        }
-                        .is_err()
-                        {
-                            break 'result status::from_code(
-                                iree_status_code_e_IREE_STATUS_UNAVAILABLE,
+                        };
+                        if let Some(dwell) = dwell {
+                            let timer = crate::profile::start();
+                            std::thread::sleep(dwell);
+                            crate::profile::stop(
+                                timer,
+                                crate::profile::Phase::Quiesce,
+                                job.profile_label,
+                                0,
                             );
                         }
+                        let regcmd_tasks = job.regcmd_tasks;
+                        if regcmd_tasks.iter().any(Vec::is_empty) {
+                            break 'result status::from_code(
+                                iree_status_code_e_IREE_STATUS_INTERNAL,
+                            );
+                        }
+
+                        // Allocate every split before submission so all command
+                        // buffers remain alive until the dispatch is complete.
+                        // One regcmd BO per task, on the file the task runs on:
+                        // a fanned-out tile's program names that context's
+                        // replica buffers and must itself live there.
+                        let regcmd_timer = crate::profile::start();
+                        let mut cmd_bufs = Vec::with_capacity(regcmd_tasks.len());
+                        for (regcmd, target) in regcmd_tasks.iter().zip(&job.task_targets) {
+                            let cmd_bytes = regcmd.len() * std::mem::size_of::<u64>();
+                            let cmd_len = cmd_bytes.next_multiple_of(4096);
+                            cmd_bufs.push(unsafe {
+                                crate::scratch_pool::ScratchBuffer::new(
+                                    target.fd,
+                                    cmd_len,
+                                    std::os::fd::BorrowedFd::borrow_raw(target.fd),
+                                )
+                            });
+                        }
+
+                        // The registers this dispatch's first task programs, as
+                        // `domain:offset=value` triples -- see `dump_regset_enabled`.
+                        // Values matter as much as coverage: against
+                        // ../rocket-userspace's `gen_conv2d_task` the *set* this
+                        // repo writes is identical, so a divergence can only be a
+                        // value.
+                        if dump_regset_enabled()
+                            && let Some(first) = regcmd_tasks.first()
+                        {
+                            let mut regs: Vec<String> = first
+                                .iter()
+                                .map(|c| {
+                                    format!(
+                                        "{}:{:#06x}={:#010x}",
+                                        (c.0 >> 48) & 0xff,
+                                        (c.0 & 0xffff) as u16,
+                                        ((c.0 >> 16) & 0xffff_ffff) as u32,
+                                    )
+                                })
+                                .collect();
+                            regs.sort();
+                            regs.dedup();
+                            // The PC trailer is order-sensitive and would be
+                            // destroyed by the sort above, so print the tail
+                            // verbatim: it carries the enable mask that says which
+                            // hardware blocks participate in this job.
+                            let tail: Vec<String> = first
+                                .iter()
+                                .rev()
+                                .take(8)
+                                .rev()
+                                .map(|c| {
+                                    format!(
+                                        "{:#04x}:{:#06x}={:#010x}",
+                                        (c.0 >> 48) & 0xff,
+                                        (c.0 & 0xffff) as u16,
+                                        ((c.0 >> 16) & 0xffff_ffff) as u32,
+                                    )
+                                })
+                                .collect();
+                            eprintln!(
+                                "rocket: trailer prec={} {}",
+                                precision_label(job.precision_tag),
+                                tail.join(" ")
+                            );
+                            eprintln!(
+                                "rocket: regset prec={} n={} {}",
+                                precision_label(job.precision_tag),
+                                regs.len(),
+                                regs.join(",")
+                            );
+                        }
+
+                        let mut task_descriptors = Vec::with_capacity(regcmd_tasks.len());
+                        for ((regcmd, cmd_buf), target) in
+                            regcmd_tasks.iter().zip(&cmd_bufs).zip(&job.task_targets)
+                        {
+                            unsafe {
+                                let cmd_slice = std::slice::from_raw_parts_mut(
+                                    cmd_buf.host_ptr as *mut u64,
+                                    regcmd.len(),
+                                );
+                                for (i, c) in regcmd.iter().enumerate() {
+                                    cmd_slice[i] = c.0;
+                                }
+                            }
+                            if unsafe { rocket_device::fini_bo(target.fd, cmd_buf.handle) }.is_err() {
+                                break 'result status::from_code(
+                                    iree_status_code_e_IREE_STATUS_UNAVAILABLE,
+                                );
+                            }
+                            task_descriptors.push((cmd_buf.dma_address, regcmd.len() as u32));
+                        }
                         crate::profile::stop(
-                            submit_timer,
-                            crate::profile::Phase::Submit,
+                            regcmd_timer,
+                            crate::profile::Phase::Regcmd,
                             job.profile_label,
-                            0,
+                            regcmd_tasks
+                                .iter()
+                                .map(|task| task.len() * std::mem::size_of::<u64>())
+                                .sum(),
                         );
 
-                        // PREP_BO waits on DMA_RESV_USAGE_WRITE fences for the
-                        // specific output handle. Besides making results
-                        // host-visible, waiting here prevents the next split
-                        // from entering the kernel until this one has completed.
-                        let wait_timer = crate::profile::start();
-                        for &out_handle in job.out_bo_handles {
+                        // Real input/output GEM handles from the command
+                        // buffer's recorded dispatch (command_buffer.rs's
+                        // `RecordedOp::Dispatch`), same convention this crate's
+                        // hand-rolled hardware tests already validate against
+                        // real hardware: the regcmd buffer's own
+                        // handle plus every buffer the dispatch reads go in
+                        // in_bo_handles, everything it writes goes in
+                        // out_bo_handles. Without these the kernel driver's
+                        // implicit fencing has no way to know the job touches
+                        // those buffers at all -- SUBMIT/PREP_BO would still
+                        // round-trip (proving the ioctl plumbing works) but
+                        // give no real completion/dependency guarantee for the
+                        // tensors themselves.
+                        // Deduplicated: a real compiled program can pack
+                        // multiple bindings (e.g. input+weights) into one
+                        // combined transient buffer at different offsets, so
+                        // the same GEM handle can legitimately appear more than
+                        // once in job.in_bo_handles -- untested against the
+                        // kernel driver's fence/dependency tracking before now
+                        // (every prior hand-driven test used one dedicated
+                        // buffer per binding), so dedupe defensively rather
+                        // than assume DRM_ROCKET_SUBMIT tolerates duplicates.
+                        // The mainline driver's IRQ-mediated transition between
+                        // tasks in one drm_rocket_job is not reliable on RK3588:
+                        // task 0 completes correctly, but every later split leaves
+                        // its output rows untouched. Submitting the same regcmds
+                        // as individually fenced jobs is hardware-validated. Each
+                        // split reloads its weights, so no CBUF state must survive
+                        // between jobs.
+                        //
+                        // Every task is submitted before any is waited for. On
+                        // one file that keeps the entity's queue non-empty, so
+                        // the core never idles between tiles (MULTICORE.md §9's
+                        // queue-depth effect); across files it is what puts a
+                        // dispatch's tiles on several cores at once. Tiles write
+                        // disjoint output and each reloads its weights, so the
+                        // order they complete in does not matter.
+                        let started = Instant::now();
+                        let mut task_submitted = Vec::with_capacity(task_descriptors.len());
+                        for (((regcmd_addr, regcmd_count), cmd_buf), target) in task_descriptors
+                            .iter()
+                            .copied()
+                            .zip(&cmd_bufs)
+                            .zip(&job.task_targets)
+                        {
+                            let mut in_handles = Vec::with_capacity(1 + target.in_bo_handles.len());
+                            in_handles.push(cmd_buf.handle);
+                            for &h in &target.in_bo_handles {
+                                if !in_handles.contains(&h) {
+                                    in_handles.push(h);
+                                }
+                            }
+                            let submit_timer = crate::profile::start();
                             if unsafe {
-                                rocket_device::prep_bo(
-                                    fd,
-                                    out_handle,
-                                    DISPATCH_COMPLETION_TIMEOUT_NS,
+                                rocket_device::submit(
+                                    target.fd,
+                                    regcmd_addr,
+                                    regcmd_count,
+                                    &in_handles,
+                                    &target.out_bo_handles,
                                 )
                             }
                             .is_err()
@@ -1777,6 +1869,37 @@ unsafe extern "C" fn queue_execute(
                                     iree_status_code_e_IREE_STATUS_UNAVAILABLE,
                                 );
                             }
+                            task_submitted.push(Instant::now());
+                            crate::profile::stop(
+                                submit_timer,
+                                crate::profile::Phase::Submit,
+                                job.profile_label,
+                                0,
+                            );
+                        }
+
+                        // PREP_BO waits on DMA_RESV_USAGE_WRITE fences for the
+                        // specific output handle, on the file that owns it. Each
+                        // task's interval from its submit to its wait returning
+                        // is what the profile's overlap line is built from.
+                        let wait_timer = crate::profile::start();
+                        for (target, submitted) in job.task_targets.iter().zip(&task_submitted) {
+                            for &out_handle in &target.out_bo_handles {
+                                if unsafe {
+                                    rocket_device::prep_bo(
+                                        target.fd,
+                                        out_handle,
+                                        DISPATCH_COMPLETION_TIMEOUT_NS,
+                                    )
+                                }
+                                .is_err()
+                                {
+                                    break 'result status::from_code(
+                                        iree_status_code_e_IREE_STATUS_UNAVAILABLE,
+                                    );
+                                }
+                            }
+                            crate::profile::record_wait(target.context, *submitted, Instant::now());
                         }
                         crate::profile::stop(
                             wait_timer,
@@ -1785,134 +1908,185 @@ unsafe extern "C" fn queue_execute(
                             0,
                         );
 
-                        // The task is now "complete" as far as the fence is
-                        // concerned. Whether it actually ran is a separate
-                        // question, and only the clock can answer it; see
-                        // `HUNG_JOB_DISPATCH_FLOOR`. Refusing the result is
-                        // the point -- returning it would be indistinguishable
-                        // from a correct inference.
-                        let elapsed = started.elapsed();
-                        if dispatch_times_enabled() {
-                            eprintln!(
-                                "rocket: dispatch {:.2} ms  prec={} mode={:?} tasks={} \
-                                 prog={:#018x} regcmd_iova={:?} in={:?} out={:?}",
-                                elapsed.as_secs_f64() * 1e3,
-                                precision_label(job.precision_tag),
-                                job.dpu_mode,
-                                regcmd_tasks.len(),
-                                program_hash(regcmd_tasks),
-                                cmd_bufs
-                                    .iter()
-                                    .map(|b| format!("{:#x}", b.dma_address))
-                                    .collect::<Vec<_>>(),
-                                job.in_bo_handles,
-                                job.out_bo_handles,
-                            );
-                        }
-                        if elapsed >= HUNG_JOB_DISPATCH_FLOOR {
-                            eprintln!(
-                                "rocket: NPU dispatch took {:.0} ms, at or past the {:.0} ms \
+                        {
+                            // The dispatch is now "complete" as far as its fences
+                            // are concerned. Whether it actually ran is a separate
+                            // question, and only the clock can answer it; see
+                            // `HUNG_JOB_DISPATCH_FLOOR`. Refusing the result is
+                            // the point -- returning it would be indistinguishable
+                            // from a correct inference. The floor is per dispatch
+                            // now that its tasks are batched: a killed task still
+                            // costs the whole watchdog timeout, so it still lands
+                            // past the floor.
+                            let elapsed = started.elapsed();
+                            if dispatch_times_enabled() {
+                                eprintln!(
+                                    "rocket: dispatch {:.2} ms  ctx={} task_ctx={:?} prec={} mode={:?} \
+                                     tasks={} prog={:#018x} regcmd_iova={:?} in={:?} out={:?}",
+                                    elapsed.as_secs_f64() * 1e3,
+                                    ctx.id,
+                                    job.task_targets
+                                        .iter()
+                                        .map(|target| target.context)
+                                        .collect::<Vec<_>>(),
+                                    precision_label(job.precision_tag),
+                                    job.dpu_mode,
+                                    regcmd_tasks.len(),
+                                    program_hash(regcmd_tasks),
+                                    cmd_bufs
+                                        .iter()
+                                        .map(|b| format!("{:#x}", b.dma_address))
+                                        .collect::<Vec<_>>(),
+                                    job.in_bo_handles,
+                                    job.out_bo_handles,
+                                );
+                            }
+                            if elapsed >= HUNG_JOB_DISPATCH_FLOOR {
+                                eprintln!(
+                                    "rocket: NPU dispatch took {:.0} ms, at or past the {:.0} ms \
                                  hung-job floor. The kernel watchdog kills a hung job and \
                                  signals its fence with an error, which PREP_BO reports as \
                                  success, so this output buffer is probably partly unwritten \
                                  and is being refused rather than returned. Check \
                                  `dmesg | grep -i npu` for `NPU job timed out`.",
-                                elapsed.as_secs_f64() * 1e3,
-                                HUNG_JOB_DISPATCH_FLOOR.as_secs_f64() * 1e3,
-                            );
-                            break 'result status::from_code(
-                                iree_status_code_e_IREE_STATUS_DEADLINE_EXCEEDED,
+                                    elapsed.as_secs_f64() * 1e3,
+                                    HUNG_JOB_DISPATCH_FLOOR.as_secs_f64() * 1e3,
+                                );
+                                break 'result status::from_code(
+                                    iree_status_code_e_IREE_STATUS_DEADLINE_EXCEEDED,
+                                );
+                            }
+                        }
+
+                        // `PREP_BO` above confirmed that every split completed;
+                        // only now does a depthwise job start the clock a later
+                        // dense submit must respect. Pooling is not a DPU mode
+                        // and intentionally leaves the hazard state intact.
+                        if job.dpu_mode == Some(crate::command_buffer::DpuMode::Depthwise) {
+                            d.dpu_hazard
+                                .lock()
+                                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                                .last_depthwise_done = Some(Instant::now());
+                        }
+
+                        // Conv2d only (see `command_buffer::OutputCompaction`'s
+                        // doc comment): the hardware write above landed in a
+                        // driver-private scratch buffer, atomic-slot-strided,
+                        // not the real IREE-visible output buffer. Compact it
+                        // into the real buffer now that prep_bo above confirmed
+                        // the write is complete and host-visible.
+                        if let Some(oc) = &job.output_compaction {
+                            let compact_timer = crate::profile::start();
+                            let expected_bytes = oc.output_pixel_count * oc.bytes_per_pixel;
+                            if expected_bytes as u64 > oc.output_length as u64 {
+                                break 'result status::from_code(
+                                    iree_status_code_e_IREE_STATUS_INTERNAL,
+                                );
+                            }
+                            let scratch = unsafe {
+                                std::slice::from_raw_parts(oc.scratch_ptr, oc.scratch_length)
+                            };
+                            let out_rb = unsafe { &*(oc.output_buffer as *const RocketBuffer) };
+                            let dst = unsafe {
+                                std::slice::from_raw_parts_mut(
+                                    out_rb.host_ptr.add(oc.output_offset),
+                                    expected_bytes,
+                                )
+                            };
+                            let written = if !oc.tile_rects.is_empty() {
+                                // Fanned out: every tile's rows come from the
+                                // scratch of the context that ran it. The
+                                // replicas share the home scratch's layout, so
+                                // a tile's offsets are the same in each.
+                                let mut written = 0;
+                                for (tile, &context) in oc.tile_rects.iter().zip(&oc.tile_context) {
+                                    let source: &[u8] = if context == 0 {
+                                        scratch
+                                    } else {
+                                        let (ptr, len) = oc.replica_scratch[context - 1];
+                                        unsafe { std::slice::from_raw_parts(ptr as *const u8, len) }
+                                    };
+                                    written += if let Some(tiles) = &oc.source_tiles {
+                                        compact_tiled_accumulator_output(
+                                            source,
+                                            &tiles[tile.index..tile.index + 1],
+                                            oc.output_width,
+                                            oc.bytes_per_pixel,
+                                            oc.source_block_bytes,
+                                            dst,
+                                        )
+                                    } else {
+                                        compact_atomic_output_rect(
+                                            source,
+                                            oc.source_pixel_count,
+                                            oc.output_width,
+                                            tile.row,
+                                            tile.rows,
+                                            tile.column,
+                                            tile.columns,
+                                            oc.bytes_per_pixel,
+                                            oc.source_block_bytes,
+                                            dst,
+                                        )
+                                    };
+                                }
+                                written
+                            } else if let Some(tiles) = &oc.source_tiles {
+                                compact_tiled_accumulator_output(
+                                    scratch,
+                                    tiles,
+                                    oc.output_width,
+                                    oc.bytes_per_pixel,
+                                    oc.source_block_bytes,
+                                    dst,
+                                )
+                            } else {
+                                compact_atomic_output(
+                                    scratch,
+                                    oc.source_pixel_count,
+                                    oc.output_pixel_count,
+                                    oc.bytes_per_pixel,
+                                    oc.source_block_bytes,
+                                    dst,
+                                )
+                            };
+                            if written != expected_bytes {
+                                break 'result status::from_code(
+                                    iree_status_code_e_IREE_STATUS_INTERNAL,
+                                );
+                            }
+                            // The one write to an IREE buffer that does not go
+                            // through a mapping, so the one the packed-coefficient
+                            // cache's generation has to be told about explicitly.
+                            unsafe { crate::buffer::note_write(oc.output_buffer) };
+                            crate::profile::stop(
+                                compact_timer,
+                                crate::profile::Phase::Compact,
+                                job.profile_label,
+                                written,
                             );
                         }
-                    }
 
-                    // `PREP_BO` above confirmed that every split completed;
-                    // only now is this DPU mode the state a later dispatch
-                    // must transition away from. Pooling is not a DPU mode
-                    // and intentionally leaves the last DPU state intact.
-                    if let Some(mode) = job.dpu_mode {
-                        *last_dpu_mode = Some(mode);
-                    }
-
-                    // Conv2d only (see `command_buffer::OutputCompaction`'s
-                    // doc comment): the hardware write above landed in a
-                    // driver-private scratch buffer, atomic-slot-strided,
-                    // not the real IREE-visible output buffer. Compact it
-                    // into the real buffer now that prep_bo above confirmed
-                    // the write is complete and host-visible.
-                    if let Some(oc) = &job.output_compaction {
-                        let compact_timer = crate::profile::start();
-                        let expected_bytes = oc.output_pixel_count * oc.bytes_per_pixel;
-                        if expected_bytes as u64 > oc.output_length as u64 {
-                            break 'result status::from_code(
-                                iree_status_code_e_IREE_STATUS_INTERNAL,
-                            );
+                        // Diagnostic only -- see `leak_regcmd_enabled`.
+                        if leak_regcmd_enabled() {
+                            std::mem::forget(std::mem::take(&mut cmd_bufs));
                         }
-                        let scratch = unsafe {
-                            std::slice::from_raw_parts(oc.scratch_ptr, oc.scratch_length)
-                        };
-                        let out_rb = unsafe { &*(oc.output_buffer as *const RocketBuffer) };
-                        let dst = unsafe {
-                            std::slice::from_raw_parts_mut(
-                                out_rb.host_ptr.add(oc.output_offset),
-                                expected_bytes,
-                            )
-                        };
-                        let written = if let Some(tiles) = &oc.source_tiles {
-                            compact_tiled_accumulator_output(
-                                scratch,
-                                tiles,
-                                oc.output_width,
-                                oc.bytes_per_pixel,
-                                oc.source_block_bytes,
-                                dst,
-                            )
-                        } else {
-                            compact_atomic_output(
-                                scratch,
-                                oc.source_pixel_count,
-                                oc.output_pixel_count,
-                                oc.bytes_per_pixel,
-                                oc.source_block_bytes,
-                                dst,
-                            )
-                        };
-                        if written != expected_bytes {
-                            break 'result status::from_code(
-                                iree_status_code_e_IREE_STATUS_INTERNAL,
-                            );
-                        }
-                        // The one write to an IREE buffer that does not go
-                        // through a mapping, so the one the packed-coefficient
-                        // cache's generation has to be told about explicitly.
-                        unsafe { crate::buffer::note_write(oc.output_buffer) };
-                        crate::profile::stop(
-                            compact_timer,
-                            crate::profile::Phase::Compact,
-                            job.profile_label,
-                            written,
-                        );
                     }
-
-                    // Diagnostic only -- see `leak_regcmd_enabled`.
-                    if leak_regcmd_enabled() {
-                        std::mem::forget(std::mem::take(&mut cmd_bufs));
-                    }
+                    status::ok()
+                };
+                crate::profile::stop(
+                    execute_timer,
+                    crate::profile::Phase::Execute,
+                    crate::profile::NO_OP,
+                    0,
+                );
+                crate::profile::mark_outside_end();
+                if !command_buffer.is_null() {
+                    unsafe { crate::bindings::iree_hal_command_buffer_release(command_buffer) };
                 }
-                status::ok()
-            };
-            crate::profile::stop(
-                execute_timer,
-                crate::profile::Phase::Execute,
-                crate::profile::NO_OP,
-                0,
-            );
-            crate::profile::mark_outside_end();
-            if !command_buffer.is_null() {
-                unsafe { crate::bindings::iree_hal_command_buffer_release(command_buffer) };
-            }
-            result
-        })
+                result
+            },
+        )
     }
 }
 

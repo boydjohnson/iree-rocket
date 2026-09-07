@@ -78,15 +78,27 @@ pub enum Phase {
     /// The whole `queue_execute` callback, as a check total: everything
     /// above it minus the phases above sums to unaccounted host overhead.
     Execute = 11,
+    /// From `queue_execute` enqueueing a unit to the NPU worker picking it
+    /// up (`pool.rs`). IREE submits a program's command buffers eagerly,
+    /// each waiting on its predecessors' semaphores, so this is mostly time
+    /// spent behind earlier units rather than time the pool cost; it
+    /// overlaps `Outside` and is not added to the wall total.
+    Queue = 12,
+    /// Copying a binding the hardware would otherwise read straight out of
+    /// an IREE buffer into a non-zero context's own scratch, or a cached
+    /// coefficient packing from another context's file (`pool.rs`).
+    Stage = 13,
 }
 
 impl Phase {
     pub const ALL: [Phase; PHASE_COUNT] = [
         Phase::Outside,
         Phase::Record,
+        Phase::Queue,
         Phase::PackInput,
         Phase::PackWeights,
         Phase::PackBias,
+        Phase::Stage,
         Phase::SyncInputs,
         Phase::Regcmd,
         Phase::Submit,
@@ -110,6 +122,8 @@ impl Phase {
             Phase::Compact => "compact",
             Phase::Quiesce => "quiesce",
             Phase::Execute => "execute",
+            Phase::Queue => "queue",
+            Phase::Stage => "stage",
         }
     }
 
@@ -128,6 +142,8 @@ impl Phase {
             Phase::Compact => "cmpct",
             Phase::Quiesce => "quies",
             Phase::Execute => "exec",
+            Phase::Queue => "queue",
+            Phase::Stage => "stage",
         }
     }
 
@@ -135,12 +151,15 @@ impl Phase {
     /// it when totalling. `Record` runs before `queue_execute` and `Outside`
     /// runs between calls, so both are genuinely disjoint from it.
     fn nested_in_execute(self) -> bool {
-        !matches!(self, Phase::Outside | Phase::Record | Phase::Execute)
+        !matches!(
+            self,
+            Phase::Outside | Phase::Record | Phase::Queue | Phase::Execute
+        )
     }
 }
 
 /// Number of [`Phase`] variants, as an array length.
-const PHASE_COUNT: usize = 12;
+const PHASE_COUNT: usize = 14;
 
 /// The label used for phases that belong to no particular op.
 pub const NO_OP: &str = "-";
@@ -277,6 +296,12 @@ struct Registry {
     /// that is what is happening rather than assume it.
     cpu_nanos: Vec<u128>,
     last_execute_end: Option<Instant>,
+    /// `Wait` nanoseconds per NPU context, and every wait's interval, so the
+    /// report can say how much of the run had two or more hardware jobs in
+    /// flight -- the number that says whether `ROCKET_NPU_CORES` > 1 did
+    /// anything (MULTICORE.md §5.7).
+    wait_by_context: [u128; crate::pool::MAX_CONTEXTS],
+    wait_intervals: Vec<(Instant, Instant)>,
 }
 
 impl Registry {
@@ -304,6 +329,49 @@ impl Registry {
             .or_insert_with(|| [PhaseStat::default(); Phase::ALL.len()])[phase as usize]
             .add(elapsed, bytes);
     }
+}
+
+/// Records one `PREP_BO` wait on `context`, for the per-context and overlap
+/// lines of the report.
+pub fn record_wait(context: usize, started: Instant, ended: Instant) {
+    if !enabled() || context >= crate::pool::MAX_CONTEXTS {
+        return;
+    }
+    let mut registry = registry().lock().unwrap_or_else(|e| e.into_inner());
+    registry.wait_by_context[context] += ended.saturating_duration_since(started).as_nanos();
+    registry.wait_intervals.push((started, ended));
+}
+
+/// Fraction of the span from the first wait's start to the last wait's end
+/// during which at least two waits were in flight.
+fn overlap_fraction(intervals: &[(Instant, Instant)]) -> f64 {
+    let (Some(start), Some(end)) = (
+        intervals.iter().map(|(s, _)| *s).min(),
+        intervals.iter().map(|(_, e)| *e).max(),
+    ) else {
+        return 0.0;
+    };
+    let span = end.saturating_duration_since(start);
+    if span.is_zero() {
+        return 0.0;
+    }
+    let mut edges: Vec<(Instant, i32)> = Vec::with_capacity(intervals.len() * 2);
+    for &(s, e) in intervals {
+        edges.push((s, 1));
+        edges.push((e, -1));
+    }
+    edges.sort_by_key(|&(at, delta)| (at, delta));
+    let mut depth = 0i32;
+    let mut covered = Duration::ZERO;
+    let mut previous = start;
+    for (at, delta) in edges {
+        if depth >= 2 {
+            covered += at.saturating_duration_since(previous);
+        }
+        previous = at;
+        depth += delta;
+    }
+    covered.as_secs_f64() / span.as_secs_f64()
 }
 
 fn registry() -> &'static Mutex<Registry> {
@@ -387,7 +455,12 @@ pub fn report() {
     );
     let host: u128 = Phase::ALL
         .iter()
-        .filter(|p| !matches!(p, Phase::Execute | Phase::Wait | Phase::Submit))
+        .filter(|p| {
+            !matches!(
+                p,
+                Phase::Execute | Phase::Wait | Phase::Submit | Phase::Queue
+            )
+        })
         .map(|p| registry.totals[*p as usize].nanos)
         .sum::<u128>()
         + execute.saturating_sub(nested);
@@ -410,6 +483,26 @@ pub fn report() {
             npu as f64 / (host + npu) as f64 * 100.0
         },
     );
+
+    // Per-context hardware time and overlap: only worth a line when there
+    // is more than one context, since one context overlaps with nothing.
+    let contexts_used = registry
+        .wait_by_context
+        .iter()
+        .rposition(|nanos| *nanos > 0)
+        .map_or(0, |last| last + 1);
+    if contexts_used > 1 {
+        let per_context: Vec<String> = registry.wait_by_context[..contexts_used]
+            .iter()
+            .enumerate()
+            .map(|(context, nanos)| format!("ctx{context} {:.3} ms", *nanos as f64 / 1e6))
+            .collect();
+        eprintln!("  wait.npu by context: {}", per_context.join(", "));
+        eprintln!(
+            "  overlap: {:.1}% of the span between the first and last wait had >= 2 jobs in flight",
+            overlap_fraction(&registry.wait_intervals) * 100.0
+        );
+    }
 
     // Which CPUs the host half actually ran on. A driver whose transforms all
     // land on cpu0 is not a driver with slow transforms; see `cpu_nanos`.
@@ -443,15 +536,21 @@ pub fn report() {
     let cache = crate::weight_cache::stats();
     if cache.hits + cache.misses_absent + cache.misses_stale > 0 {
         eprintln!(
-            "  weight cache: {} hit, {} miss (new), {} miss (rewritten), {} refused (recorded \
-             writer), {} refused (budget), {:.1} MiB peak",
+            "  weight cache: {} hit, {} miss (new), {} miss (rewritten), {} copied across \
+             contexts, {} refused (recorded writer), {} refused (budget), {:.1} MiB peak",
             cache.hits,
             cache.misses_absent,
             cache.misses_stale,
+            cache.copied,
             cache.recorded_writers,
             cache.over_budget,
             cache.peak_bytes as f64 / (1024.0 * 1024.0),
         );
+    }
+
+    let (reused, allocated) = crate::scratch_pool::stats();
+    if reused + allocated > 0 {
+        eprintln!("  scratch pool: {reused} reused, {allocated} allocated");
     }
 
     // Per-op: which dispatch shapes the time is in, and for each, how it
@@ -585,7 +684,10 @@ mod tests {
     #[test]
     fn only_submit_time_phases_nest_in_execute() {
         for phase in Phase::ALL {
-            let expected = !matches!(phase, Phase::Outside | Phase::Record | Phase::Execute);
+            let expected = !matches!(
+                phase,
+                Phase::Outside | Phase::Record | Phase::Queue | Phase::Execute
+            );
             assert_eq!(phase.nested_in_execute(), expected, "{phase:?}");
         }
     }

@@ -281,6 +281,56 @@ pub fn compact_atomic_output(
     written
 }
 
+/// [`compact_atomic_output`] for one rectangle of the output image.
+///
+/// `scratch` holds the whole `source_pixel_count`-pixel image in
+/// atomic-slot surfaces, exactly as [`compact_atomic_output`] expects; only
+/// the pixels in rows `first_row..first_row + rows`, columns
+/// `first_column..first_column + columns` of an `output_width`-wide image are
+/// compacted, into their own places in `dst`. This is how a dispatch whose
+/// tiles ran on several NPU contexts -- each writing its own copy of the
+/// output scratch -- gathers one dense output: one call per tile, each
+/// reading the scratch that tile's context wrote.
+#[allow(clippy::too_many_arguments)]
+pub fn compact_atomic_output_rect(
+    scratch: &[u8],
+    source_pixel_count: usize,
+    output_width: usize,
+    first_row: usize,
+    rows: usize,
+    first_column: usize,
+    columns: usize,
+    bytes_per_pixel: usize,
+    source_block_bytes: usize,
+    dst: &mut [u8],
+) -> usize {
+    if source_block_bytes == 0 || output_width == 0 {
+        return 0;
+    }
+    let mut written = 0;
+    for row in first_row..first_row + rows {
+        for column in first_column..first_column + columns {
+            let pixel = row * output_width + column;
+            let mut pixel_written = 0;
+            while pixel_written < bytes_per_pixel {
+                let surface = pixel_written / source_block_bytes;
+                let chunk_len = (bytes_per_pixel - pixel_written).min(source_block_bytes);
+                let src_off =
+                    surface * source_pixel_count * source_block_bytes + pixel * source_block_bytes;
+                let dst_off = pixel * bytes_per_pixel + pixel_written;
+                if src_off + chunk_len > scratch.len() || dst_off + chunk_len > dst.len() {
+                    return written;
+                }
+                dst[dst_off..dst_off + chunk_len]
+                    .copy_from_slice(&scratch[src_off..src_off + chunk_len]);
+                written += chunk_len;
+                pixel_written += chunk_len;
+            }
+        }
+    }
+    written
+}
+
 pub fn compact_tiled_accumulator_output(
     scratch: &[u8],
     tiles: &[AccumulatorOutputTile],

@@ -318,20 +318,48 @@ safe. Three knobs:
 |---|---|
 | `ROCKET_WEIGHT_CACHE=0` | Disable; pack on every dispatch, as before. |
 | `ROCKET_WEIGHT_CACHE=verify` | Pack anyway on a hit and compare against the cached bytes the regcmd reads, failing loudly on any difference. |
-| `ROCKET_WEIGHT_CACHE_MB=N` | Byte budget, default 256 MiB. |
+| `ROCKET_WEIGHT_CACHE_MB=N` | Byte budget, default 256 MiB per NPU context. |
 
 The driver's host-side work is memory-bound, so on a big.LITTLE part it runs
 several times slower on the little cluster -- 52.4 ms against 13.8 ms for
-MobileNetV2 fp16's layout transforms on RK3588. `queue_execute` therefore asks
-the scheduler for the highest-`cpu_capacity` CPUs while it runs and restores
-the thread's original affinity afterwards; the profile's `host time by cpu`
-line shows where it actually landed. On a machine whose cores are all the same
-this finds nothing to prefer and does nothing.
+MobileNetV2 fp16's layout transforms on RK3588. The NPU worker thread that
+runs every `queue_execute` therefore asks the scheduler for the
+highest-`cpu_capacity` CPUs once, for its life; the profile's `host time by
+cpu` line shows where it actually landed. On a machine whose cores are all the
+same this finds nothing to prefer and does nothing.
 
 | Variable | Effect |
 |---|---|
 | `ROCKET_HOST_CPUS=off` | Never change affinity. |
 | `ROCKET_HOST_CPUS=0-3,7` | Use this CPU list instead of the highest-capacity one. |
+
+`queue_execute` does not run the command buffer on the calling thread: it
+queues it to a worker that owns one open of `/dev/accel/accel0` and runs
+units in submission order, signalling IREE's semaphores when each is done
+(`rocket-hal-driver/src/pool.rs`; the design and its measurements are in
+`rocket-hal-driver/MULTICORE.md`). With `ROCKET_NPU_CORES=N` there are N
+such workers, each on its own open of the device -- its own DRM scheduler
+entity, so its own NPU core -- and each command buffer is placed on one of
+them when it is created. Results are bit-identical at any N; whether N > 1
+is faster depends on whether IREE gives the device independent command
+buffers to run at once, which the profile's `overlap` line reports.
+
+A dispatch with several CBUF tiles spreads them over the sibling contexts
+(each tile is an independent job): the siblings get a copy of the input
+rows their tiles read, the bias, and the packed coefficients (cached per
+context), the tiles are submitted to all files before any is waited for,
+and the output is gathered from each context's scratch. Driver-private
+scratch buffers are pooled across command buffers, which is worth ~1.2x on
+its own at one context.
+
+| Variable | Effect |
+|---|---|
+| `ROCKET_NPU_CORES=N` | Worker contexts, 1..=8. Default 1. |
+| `ROCKET_NPU_CORES=auto` | One per NPU core (3 on RK3588). |
+| `ROCKET_FANOUT=0` | Keep every tile of a dispatch on its command buffer's own context. |
+| `ROCKET_PIN_WORKERS=0` | Let workers float over the big cluster instead of one core each. |
+| `ROCKET_SCRATCH_POOL=0` | Allocate and free every scratch buffer instead of pooling. |
+| `ROCKET_SCRATCH_POOL_MB=N` | Bytes the scratch free lists may hold, default 256 per context. |
 
 `iree-rocket-hal`'s `layout_bench` and `gem_bandwidth` examples measure the
 transforms and the GEM mapping directly, which is a much faster way to test a

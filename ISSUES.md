@@ -329,6 +329,20 @@ a cube-chained sequence is inherently single-fd. Pick per shape.
 Also worth knowing while you are there: each fd carries its own independent 4 GB
 IOVA window, so N fds also multiply addressable device memory.
 
+**Progress 2026-09-07** (`rocket-hal-driver/MULTICORE.md` §9-§11). The
+hardware term is measured: N opens scale 1 / 2.0 / 3.0x on three cores for
+both a conv and a matmul, and the fc host phases pipeline to 4.0x. The driver
+now has the N-context worker pool (`ROCKET_NPU_CORES`), placement per command
+buffer, the copy hop for the four direct-binding sites, a per-context weight
+cache and a device-global time-based depthwise dwell -- bit-exact at any N,
+gated on four models and the three e2e gates. It buys nothing yet: IREE
+orders command buffers on one device timeline and the two-device
+partitioning gives this device one dispatch per command buffer, so `overlap`
+is 0.0 % on ViT at N=3. Dispatch-level placement is therefore not the lever
+on these programs; the notes' "multicore only helps a multi-tile conv" above
+is exactly right, and the remaining work is M2, splitting one dispatch's CBUF
+tiles across contexts. Still open.
+
 ---
 
 ## P2 (S3) — cross-op chaining is HW-proven for fp16, and this repo's fp16 output cube is already the right layout
@@ -409,6 +423,19 @@ since the program is self-contained and address-only-different between tiles.
 
 Both are cheap to fix and both compound with M3 (each tile is also an IRQ round
 trip on a little core).
+
+**Progress 2026-09-07** (`rocket-hal-driver/MULTICORE.md` §12). The second
+half is gone: `rocket-hal-driver/src/scratch_pool.rs` keeps every
+driver-private GEM buffer -- regcmd, input, bias, output, and the multicore
+replicas -- on a free list keyed on (file, size class), so a dispatch no
+longer pays `CREATE_BO` + `mmap` + first-touch faults per tile. Worth ViT
+1203 -> ~1050 ms, MobileNetV2 requant 290 -> 255, MobileNetV2 fp16 166 ->
+146 at one context, which makes it the largest single win of the multicore
+series. Also, every task of a dispatch is now submitted before any is waited
+for, so the per-tile `PREP_BO` no longer idles the core between tiles. The
+first half -- the whole-BO cache sync, ∝ pages not bytes -- stands, and is
+now the dominant cost of a fanned-out replica (`stage` 0.47 ms per ViT
+dispatch is mostly `fini_bo` over a 512 KiB input replica).
 
 ---
 

@@ -83,13 +83,18 @@ use crate::{
     },
     buffer::RocketBuffer,
     executable::UkernelShape,
-    profile, status, weight_cache,
+    profile,
+    scratch_pool::ScratchBuffer as RocketOwnedBuffer,
+    status, weight_cache,
 };
 use iree_rocket_hal::rocket::{
     activation::{LutBuffers, build_lut_regcmd},
     builders::RegCmd,
-    conv::{AccumulatorOutputTile, Buffers, ConvPlan, FeatureLayout, Precision},
-    device::{OwnedBuffer as RocketOwnedBuffer, fini_bo},
+    conv::{
+        AccumulatorOutputTile, Buffers, ConvPlan, FeatureLayout, Precision, relocate,
+        relocate_staged_accumulator,
+    },
+    device::{OwnedBuffer as RocketGemBuffer, fini_bo},
     elementwise::{EwAddBuffers, EwUnaryBuffers, build_add_regcmd, build_unary_regcmd},
     fc,
     pooling::{PoolingBuffers, PoolingPlan},
@@ -111,6 +116,187 @@ pub enum InputPackingLayout {
 ///
 /// The scratch allocation and its DMA address are fixed while recording so
 /// the regcmd can be built immediately. The copy itself must happen later,
+/// Where a [`StagedCopy`] reads from.
+pub enum CopySource {
+    /// An IREE binding the hardware would have read directly on context 0.
+    Binding {
+        buffer: *mut iree_hal_buffer_t,
+        offset: usize,
+    },
+    /// Another context's cached coefficient packing, immutable once
+    /// published. `weight_buffer` is the binding it was packed from, whose
+    /// generation the copy is published under.
+    Shared {
+        source: Arc<weight_cache::SharedBuffer>,
+        weight_buffer: *mut iree_hal_buffer_t,
+    },
+}
+
+/// A byte copy into a non-zero context's own scratch, applied by
+/// `apply_ops` before the job that reads it is submitted.
+///
+/// MULTICORE.md §3/§5.2: a job on context `k` may only name BOs created on
+/// context `k`'s file. Almost every operand already goes through
+/// driver-private scratch (packing, compaction); the few that the hardware
+/// reads straight out of an IREE buffer on context 0 -- the ARGB feature
+/// input for `Cin <= 4`, coefficients and bias that need no packing -- are
+/// copied here instead, and so is a cached packing that lives on another
+/// context. On context 0 nothing is staged and no byte moves that did not
+/// move before.
+pub struct StagedCopy {
+    pub source: CopySource,
+    pub length: usize,
+    pub scratch_ptr: *mut u8,
+    pub scratch_handle: u32,
+    /// For a `Shared` source: the packing to publish under this context's
+    /// key once the copy is flushed, so the next command buffer here hits.
+    pub publish: Option<(WeightPublish, Arc<weight_cache::SharedBuffer>)>,
+}
+
+/// Where a replica buffer's bytes come from when a dispatch fans out.
+#[derive(Clone, Copy)]
+pub enum ReplicaSource {
+    /// A host pointer valid for the command buffer's life: the home
+    /// context's packed scratch, filled by `apply_ops` before the replica
+    /// copies run.
+    Host(*const u8),
+    /// An IREE binding the home context hands to the hardware directly.
+    Binding {
+        buffer: *mut iree_hal_buffer_t,
+        offset: usize,
+    },
+}
+
+/// How an input scratch is laid out, so a replica can copy just the rows
+/// its tiles read: `surfaces` planes of `surface_stride` bytes, each holding
+/// `block_bytes` per pixel of a `width` x `height` image (NC1HWC2), or one
+/// dense plane with `block_bytes` per pixel and a stride of zero.
+#[derive(Clone, Copy)]
+pub struct BandGeometry {
+    pub width: usize,
+    pub height: usize,
+    pub surfaces: usize,
+    pub surface_stride: usize,
+    pub block_bytes: usize,
+}
+
+/// One tile's input rectangle, in input pixels.
+#[derive(Clone, Copy, Debug)]
+pub struct InputBand {
+    pub row: usize,
+    pub rows: usize,
+    pub column: usize,
+    pub columns: usize,
+}
+
+/// One operand copied onto a sibling context for the tiles that run there.
+/// With `bands` set only those rectangles of the source are copied (the
+/// tiles' input rows plus halo, MULTICORE.md §5.4 level 2); otherwise the
+/// whole `length`.
+pub struct ReplicaCopy {
+    pub buffer: RocketOwnedBuffer,
+    pub source: ReplicaSource,
+    pub length: usize,
+    pub geometry: Option<BandGeometry>,
+    pub bands: Vec<InputBand>,
+}
+
+/// A sibling context's coefficients: a copy of an unpacked binding, or a
+/// packing shared through `weight_cache` (a hit on that context, or a
+/// copy of the home packing published there once it lands).
+pub enum ReplicaWeights {
+    Direct(ReplicaCopy),
+    Packed {
+        buffer: Arc<weight_cache::SharedBuffer>,
+        copy: Option<(ReplicaSource, usize, Option<WeightPublish>)>,
+    },
+}
+
+impl ReplicaWeights {
+    fn dma_address(&self) -> u32 {
+        match self {
+            ReplicaWeights::Direct(copy) => copy.buffer.dma_address,
+            ReplicaWeights::Packed { buffer, .. } => buffer.dma_address,
+        }
+    }
+
+    fn handle(&self) -> u32 {
+        match self {
+            ReplicaWeights::Direct(copy) => copy.buffer.handle,
+            ReplicaWeights::Packed { buffer, .. } => buffer.handle,
+        }
+    }
+}
+
+/// A sibling context's full copy of one dispatch's operands, so the tiles
+/// placed there (MULTICORE.md §5.4 level 2) can name buffers on their own
+/// file. Each tile writes its own rows of `output`, and the gather
+/// compaction reads them from here.
+///
+/// A replica copies the whole input rather than the tile's band: at
+/// ~10 GB/s the copy is a few percent of the tile's hardware time, and
+/// it keeps the tile programs identical to the single-context ones --
+/// only their four base addresses change.
+pub struct Replica {
+    pub context: Arc<crate::pool::NpuContext>,
+    pub input: ReplicaCopy,
+    pub weights: ReplicaWeights,
+    pub bias: ReplicaCopy,
+    pub output: RocketOwnedBuffer,
+}
+
+impl Replica {
+    fn buffers(&self) -> Buffers {
+        Buffers {
+            input: self.input.buffer.dma_address,
+            weights: self.weights.dma_address(),
+            bias: self.bias.buffer.dma_address,
+            output: self.output.dma_address,
+        }
+    }
+}
+
+/// The output rectangle one tile writes, in output pixels, plus its index
+/// into the plan's tile list (which is also its index into a staged
+/// accumulator layout).
+#[derive(Clone, Copy, Debug)]
+pub struct TileRect {
+    pub index: usize,
+    pub row: usize,
+    pub rows: usize,
+    pub column: usize,
+    pub columns: usize,
+}
+
+/// Which file one task of a dispatch is submitted on and the BOs it names
+/// there, for `device::queue_execute`.
+pub struct TaskTarget {
+    pub fd: RawFd,
+    pub context: usize,
+    pub in_bo_handles: Vec<u32>,
+    pub out_bo_handles: Vec<u32>,
+}
+
+/// What a fanned-out replica needs to know about the home context's
+/// coefficients: where to copy them from and what to publish the copy as.
+#[derive(Clone, Copy)]
+struct WeightFanoutSource {
+    key: Option<weight_cache::Key>,
+    generation: u64,
+    /// False when an earlier op on this command buffer writes the weight
+    /// binding, in which case no packing of it may be published.
+    publishable: bool,
+    length: usize,
+}
+
+/// Whether multi-tile dispatches spread their tiles over sibling contexts
+/// (`ROCKET_FANOUT=0` keeps every tile on the command buffer's own
+/// context, which is M1's behaviour).
+fn fanout_enabled() -> bool {
+    static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ENABLED.get_or_init(|| std::env::var("ROCKET_FANOUT").map_or(true, |value| value != "0"))
+}
+
 /// after preceding recorded update/fill/copy operations have populated the
 /// real IREE input buffer.
 #[derive(Clone, Copy)]
@@ -198,12 +384,14 @@ struct StagedWeights {
     publish: Option<WeightPublish>,
     /// Verify mode only: the private buffer the re-pack lands in.
     probe: Option<RocketOwnedBuffer>,
+    /// What a replica on another context copies, see `build_replicas`.
+    fanout: WeightFanoutSource,
 }
 
 impl StagedWeights {
     /// Coefficients the hardware reads straight out of the IREE binding,
     /// with no packing and nothing to cache (the depthwise-free int8 path).
-    fn direct(addr: u32, handle: u32) -> StagedWeights {
+    fn direct(addr: u32, handle: u32, length: usize) -> StagedWeights {
         StagedWeights {
             addr,
             handle,
@@ -211,6 +399,12 @@ impl StagedWeights {
             scratch: None,
             publish: None,
             probe: None,
+            fanout: WeightFanoutSource {
+                key: None,
+                generation: 0,
+                publishable: false,
+                length,
+            },
         }
     }
 }
@@ -231,8 +425,259 @@ fn recorded_write_target(op: &RecordedOp) -> Option<*mut iree_hal_buffer_t> {
     }
 }
 
+/// Allocates one [`Replica`] per sibling context in `contexts`, each holding
+/// this dispatch's four operands on that context's file.
+///
+/// The input, bias and (unpacked) weights are copied from wherever the home
+/// context reads them; packed coefficients come through `weight_cache`,
+/// either a hit on the sibling or a copy of the home packing that is
+/// published there once `apply_ops` has flushed it.
+///
+/// # Safety
+///
+/// Every context's file must stay open for the command buffer's life, and
+/// `Binding` sources must be live `RocketBuffer`s retained by it.
+unsafe fn build_replicas(
+    contexts: &[Arc<crate::pool::NpuContext>],
+    input: (ReplicaSource, usize),
+    input_geometry: Option<BandGeometry>,
+    tile_bands: &[InputBand],
+    tile_context: &[usize],
+    weights: (
+        Option<&Arc<weight_cache::SharedBuffer>>,
+        ReplicaSource,
+        WeightFanoutSource,
+    ),
+    bias: (ReplicaSource, usize),
+    output_bytes: usize,
+) -> Vec<Replica> {
+    let alloc = |context: &Arc<crate::pool::NpuContext>, bytes: usize| unsafe {
+        let fd = context.file.as_raw_fd();
+        RocketOwnedBuffer::new(fd, bytes.max(1), BorrowedFd::borrow_raw(fd))
+    };
+    contexts
+        .iter()
+        .enumerate()
+        .map(|(replica_index, context)| {
+            let (home_packed, weight_source, fanout) = weights;
+            let weights = match (home_packed, fanout.key) {
+                (Some(home), Some(key)) => {
+                    let key = weight_cache::Key {
+                        context: context.id,
+                        ..key
+                    };
+                    let hit = fanout
+                        .publishable
+                        .then(|| weight_cache::lookup(&key, fanout.generation))
+                        .flatten();
+                    match hit {
+                        Some(buffer) => ReplicaWeights::Packed { buffer, copy: None },
+                        None => ReplicaWeights::Packed {
+                            buffer: weight_cache::SharedBuffer::new(unsafe {
+                                let fd = context.file.as_raw_fd();
+                                RocketGemBuffer::new(
+                                    fd,
+                                    fanout.length.max(1),
+                                    BorrowedFd::borrow_raw(fd),
+                                )
+                            }),
+                            copy: Some((
+                                ReplicaSource::Host(home.host_ptr as *const u8),
+                                fanout.length,
+                                fanout.publishable.then_some(WeightPublish {
+                                    key,
+                                    bytes: fanout.length,
+                                }),
+                            )),
+                        },
+                    }
+                }
+                _ => ReplicaWeights::Direct(ReplicaCopy {
+                    buffer: alloc(context, fanout.length),
+                    source: weight_source,
+                    length: fanout.length,
+                    geometry: None,
+                    bands: Vec::new(),
+                }),
+            };
+            Replica {
+                context: Arc::clone(context),
+                input: ReplicaCopy {
+                    buffer: alloc(context, input.1),
+                    source: input.0,
+                    length: input.1,
+                    geometry: input_geometry,
+                    bands: tile_bands
+                        .iter()
+                        .zip(tile_context)
+                        .filter(|(_, owner)| **owner == replica_index + 1)
+                        .map(|(band, _)| *band)
+                        .collect(),
+                },
+                weights,
+                bias: ReplicaCopy {
+                    buffer: alloc(context, bias.1),
+                    source: bias.0,
+                    length: bias.1,
+                    geometry: None,
+                    bands: Vec::new(),
+                },
+                output: alloc(context, output_bytes),
+            }
+        })
+        .collect()
+}
+
+/// Tile `t` of a dispatch with `replicas` siblings runs on context index
+/// `t % (replicas + 1)`: tiles in order alternate over every context, so a
+/// dispatch with more tiles than contexts keeps every core busy and one
+/// with fewer uses as many as it has tiles.
+fn tile_contexts(tiles: usize, replicas: usize) -> Vec<usize> {
+    (0..tiles).map(|tile| tile % (replicas + 1)).collect()
+}
+
+/// Copies the replica's bytes into place on the worker, after the home
+/// context's own packing has produced them.
+unsafe fn apply_replica_copy(fd: RawFd, copy: &ReplicaCopy) -> Result<(), iree_status_t> {
+    if let (Some(geometry), false) = (copy.geometry, copy.bands.is_empty()) {
+        let source_base = match copy.source {
+            ReplicaSource::Host(ptr) => ptr,
+            ReplicaSource::Binding { buffer, offset } => {
+                let source = unsafe { &*(buffer as *const RocketBuffer) };
+                unsafe { source.host_ptr.add(offset) as *const u8 }
+            }
+        };
+        let row_bytes = geometry.width * geometry.block_bytes;
+        for band in &copy.bands {
+            let row = band.row.min(geometry.height);
+            let rows = band.rows.min(geometry.height - row);
+            let column = band.column.min(geometry.width);
+            let columns = band.columns.min(geometry.width - column);
+            for surface in 0..geometry.surfaces {
+                let plane = surface * geometry.surface_stride;
+                if column == 0 && columns == geometry.width {
+                    // Full-width rows are one contiguous run per plane.
+                    let offset = plane + row * row_bytes;
+                    let bytes = rows * row_bytes;
+                    if offset + bytes > copy.length {
+                        return Err(status::from_code(
+                            crate::bindings::iree_status_code_e_IREE_STATUS_INTERNAL,
+                        ));
+                    }
+                    unsafe {
+                        std::ptr::copy_nonoverlapping(
+                            source_base.add(offset),
+                            copy.buffer.host_ptr.add(offset),
+                            bytes,
+                        )
+                    };
+                } else {
+                    for y in row..row + rows {
+                        let offset = plane + (y * geometry.width + column) * geometry.block_bytes;
+                        let bytes = columns * geometry.block_bytes;
+                        if offset + bytes > copy.length {
+                            return Err(status::from_code(
+                                crate::bindings::iree_status_code_e_IREE_STATUS_INTERNAL,
+                            ));
+                        }
+                        unsafe {
+                            std::ptr::copy_nonoverlapping(
+                                source_base.add(offset),
+                                copy.buffer.host_ptr.add(offset),
+                                bytes,
+                            )
+                        };
+                    }
+                }
+            }
+        }
+        if unsafe { fini_bo(fd, copy.buffer.handle) }.is_err() {
+            return Err(status::from_code(
+                crate::bindings::iree_status_code_e_IREE_STATUS_INTERNAL,
+            ));
+        }
+        return Ok(());
+    }
+    unsafe {
+        apply_replica_bytes(
+            fd,
+            copy.source,
+            copy.length,
+            copy.buffer.host_ptr,
+            copy.buffer.handle,
+        )
+    }
+}
+
+unsafe fn apply_replica_bytes(
+    fd: RawFd,
+    source: ReplicaSource,
+    length: usize,
+    destination: *mut u8,
+    handle: u32,
+) -> Result<(), iree_status_t> {
+    let source_ptr = match source {
+        ReplicaSource::Host(ptr) => ptr,
+        ReplicaSource::Binding { buffer, offset } => {
+            let source = unsafe { &*(buffer as *const RocketBuffer) };
+            unsafe { source.host_ptr.add(offset) as *const u8 }
+        }
+    };
+    unsafe { std::ptr::copy_nonoverlapping(source_ptr, destination, length) };
+    if unsafe { fini_bo(fd, handle) }.is_err() {
+        return Err(status::from_code(
+            crate::bindings::iree_status_code_e_IREE_STATUS_INTERNAL,
+        ));
+    }
+    Ok(())
+}
+
+/// The DMA address and GEM handle a job on `cb`'s context may use for a
+/// binding the hardware reads directly: the binding itself on context 0,
+/// a [`StagedCopy`] of it into this context's own scratch anywhere else.
+///
+/// # Safety
+///
+/// `binding.buffer` must be a live `RocketBuffer` and `cb.fd` a live Rocket
+/// DRM file description.
+unsafe fn stage_direct(
+    cb: &RocketCommandBuffer,
+    binding: &iree_hal_buffer_ref_t,
+    scratch_buffers: &mut Vec<RocketOwnedBuffer>,
+    staged_copies: &mut Vec<StagedCopy>,
+) -> (u32, u32) {
+    let rocket_buffer = unsafe { &*(binding.buffer as *const RocketBuffer) };
+    if cb.context.id == 0 {
+        return (
+            rocket_buffer.dma_address + binding.offset as u32,
+            rocket_buffer.handle,
+        );
+    }
+    let length = binding.length as usize;
+    let scratch =
+        unsafe { RocketOwnedBuffer::new(cb.fd, length.max(1), BorrowedFd::borrow_raw(cb.fd)) };
+    let staged = (scratch.dma_address, scratch.handle);
+    staged_copies.push(StagedCopy {
+        source: CopySource::Binding {
+            buffer: binding.buffer,
+            offset: binding.offset as usize,
+        },
+        length,
+        scratch_ptr: scratch.host_ptr,
+        scratch_handle: scratch.handle,
+        publish: None,
+    });
+    scratch_buffers.push(scratch);
+    staged
+}
+
 /// Points a dispatch at its packed coefficients, reusing a cached packing
 /// when one is valid for this binding at this geometry.
+///
+/// On a non-zero context a packing cached on another context cannot be
+/// named by this context's job; it is copied into a fresh buffer here
+/// (`staged_copies`) instead of packed again, and published under this
+/// context's key once the copy has landed.
 ///
 /// # Safety
 ///
@@ -242,12 +687,14 @@ unsafe fn stage_weights(
     cb: &RocketCommandBuffer,
     weight_ref: &iree_hal_buffer_ref_t,
     geometry: weight_cache::Geometry,
+    staged_copies: &mut Vec<StagedCopy>,
 ) -> StagedWeights {
     let key = weight_cache::Key {
         buffer: weight_ref.buffer as usize,
         offset: weight_ref.offset as u64,
         length: weight_ref.length as u64,
         geometry,
+        context: cb.context.id,
     };
     let generation = unsafe { crate::buffer::generation(weight_ref.buffer) };
     let pending_writer = cb
@@ -277,6 +724,12 @@ unsafe fn stage_weights(
         verify_against,
     };
 
+    let fanout = WeightFanoutSource {
+        key: Some(key),
+        generation,
+        publishable: !pending_writer,
+        length: geometry.scratch_length,
+    };
     let cached = if pending_writer {
         None
     } else {
@@ -303,16 +756,46 @@ unsafe fn stage_weights(
             scratch: Some(cached),
             publish: None,
             probe,
+            fanout,
         };
     }
 
     let scratch = weight_cache::SharedBuffer::new(unsafe {
-        RocketOwnedBuffer::new(
+        RocketGemBuffer::new(
             cb.fd,
             geometry.scratch_length.max(1),
             BorrowedFd::borrow_raw(cb.fd),
         )
     });
+    // Another context already packed these bytes: a copy is cheaper than a
+    // pack, and it is published under this context's key when it lands.
+    if !pending_writer && let Some(other) = weight_cache::lookup_other_context(&key, generation) {
+        staged_copies.push(StagedCopy {
+            source: CopySource::Shared {
+                source: other,
+                weight_buffer: weight_ref.buffer,
+            },
+            length: geometry.scratch_length,
+            scratch_ptr: scratch.host_ptr,
+            scratch_handle: scratch.handle,
+            publish: Some((
+                WeightPublish {
+                    key,
+                    bytes: geometry.scratch_length,
+                },
+                Arc::clone(&scratch),
+            )),
+        });
+        return StagedWeights {
+            addr: scratch.dma_address,
+            handle: scratch.handle,
+            packing: None,
+            scratch: Some(scratch),
+            publish: None,
+            probe: None,
+            fanout,
+        };
+    }
     StagedWeights {
         addr: scratch.dma_address,
         handle: scratch.handle,
@@ -323,6 +806,7 @@ unsafe fn stage_weights(
         }),
         scratch: Some(scratch),
         probe: None,
+        fanout,
     }
 }
 
@@ -373,6 +857,12 @@ pub struct OutputCompaction {
     pub bytes_per_pixel: usize,
     pub source_block_bytes: usize,
     pub source_tiles: Option<Arc<[AccumulatorOutputTile]>>,
+    /// Fan-out gather: each replica's output scratch as `(host pointer,
+    /// length)`, the context index each tile ran on (`0` = home) and each
+    /// tile's output rectangle. All empty for a dispatch that ran at home.
+    pub replica_scratch: Vec<(usize, usize)>,
+    pub tile_context: Vec<usize>,
+    pub tile_rects: Vec<TileRect>,
 }
 
 /// One recorded command-buffer operation, in call order -- see module doc
@@ -417,6 +907,15 @@ pub enum RecordedOp {
         /// the command buffer has finished executing and closes/unmaps them
         /// on every destruction path.
         scratch_buffers: Vec<RocketOwnedBuffer>,
+        /// Copies into this context's scratch that must land before the job
+        /// runs -- see [`StagedCopy`]. Empty on context 0.
+        staged_copies: Vec<StagedCopy>,
+        /// Sibling contexts this dispatch's tiles are spread over, and per
+        /// task which one runs it (`0` is this command buffer's own
+        /// context, `i + 1` is `replicas[i]`). Empty when every task runs
+        /// at home.
+        replicas: Vec<Replica>,
+        tile_context: Vec<usize>,
         /// GEM handles of every buffer this dispatch reads (bindings other
         /// than the output) -- must be listed in `drm_rocket_job.in_bo_handles`
         /// (device.rs's `queue_execute`) so the kernel driver's implicit
@@ -495,6 +994,9 @@ pub struct DispatchJob {
     /// op, which outlives the job (the command buffer is retained across
     /// `queue_execute`).
     pub profile_label: &'static str,
+    /// One per task in `regcmd_tasks`: the file it is submitted on and the
+    /// BOs it names there.
+    pub task_targets: Vec<TaskTarget>,
 }
 
 /// What every `iree_hal_command_buffer_t*` this driver hands out actually
@@ -520,18 +1022,37 @@ pub struct RocketCommandBuffer {
     /// plain field (rather than mimicking the null driver reference's
     /// single-trailing-allocation trick) is fine.
     validation_state: Vec<u8>,
-    /// A raw, borrowed device fd -- populated in `create()` from
-    /// `device_allocator`'s own `RocketAllocator.file`. Needed so
-    /// `dispatch()` can allocate a driver-private scratch GEM buffer for
-    /// Conv2d output compaction (see `OutputCompaction`) at record time,
-    /// before `build_conv_regcmd` bakes a DMA address into the regcmd
-    /// program. Sound to use independently of `RocketAllocator.file`'s own
-    /// lifetime: `RocketAllocator.file` and `RocketDevice.file` are
-    /// `try_clone()`'d duplicates of the same open file description (DRM
-    /// GEM handles are namespaced per underlying `struct file`, not per fd
-    /// integer), and `device_allocator` is guaranteed to outlive every
-    /// command buffer created against it.
+    /// The NPU context this command buffer was placed on at creation
+    /// (`device::create_command_buffer`): the DRM file every scratch GEM
+    /// buffer below is allocated on, and the worker `queue_execute` sends
+    /// it to. Context 0 is a dup of the allocator's file, so IREE buffers
+    /// may be handed to the hardware directly there; on any other context
+    /// a job may only name BOs created on that context's file, which is
+    /// what `stage_direct` and the per-context `weight_cache` key ensure.
+    context: Arc<crate::pool::NpuContext>,
+    /// `context.file`'s raw fd, for the many `RocketOwnedBuffer::new` and
+    /// `fini_bo` calls below. Valid as long as `context` is, which the
+    /// `Arc` guarantees.
     fd: RawFd,
+    /// The other contexts, in the order a multi-tile dispatch takes them
+    /// for its replicas (`device::WorkerPool::siblings`).
+    siblings: Vec<Arc<crate::pool::NpuContext>>,
+}
+
+impl RocketCommandBuffer {
+    /// The sibling contexts a `tiles`-task dispatch spreads over: at most
+    /// `tiles - 1`, so no context is given nothing to do.
+    fn fanout_contexts(&self, tiles: usize) -> &[Arc<crate::pool::NpuContext>] {
+        if !fanout_enabled() || tiles < 2 {
+            return &[];
+        }
+        &self.siblings[..self.siblings.len().min(tiles - 1)]
+    }
+}
+
+/// The context `command_buffer` was recorded against, for `queue_execute`.
+pub unsafe fn context_id(command_buffer: *mut iree_hal_command_buffer_t) -> usize {
+    unsafe { (&*cast(command_buffer)).context.id }
 }
 
 unsafe fn cast(command_buffer: *mut iree_hal_command_buffer_t) -> *mut RocketCommandBuffer {
@@ -650,10 +1171,49 @@ pub unsafe fn apply_ops(
                 profile_label,
                 weight_scratch,
                 weight_publish,
-                ..
+                staged_copies,
+                replicas,
+                tile_context,
+                scratch_buffers: _,
+                retained_bindings: _,
             } => {
                 if let Some(packing) = input_packing {
                     apply_input_packing(cb.fd, packing, profile_label)?;
+                }
+                // Bindings the hardware would read directly, and packings
+                // cached on another context: byte copies into this
+                // context's own scratch. Empty on context 0.
+                for copy in staged_copies {
+                    let timer = profile::start();
+                    let (source_ptr, generation) = match &copy.source {
+                        CopySource::Binding { buffer, offset } => {
+                            let source = unsafe { &*(*buffer as *const RocketBuffer) };
+                            (unsafe { source.host_ptr.add(*offset) as *const u8 }, 0)
+                        }
+                        CopySource::Shared {
+                            source,
+                            weight_buffer,
+                        } => (source.host_ptr as *const u8, unsafe {
+                            crate::buffer::generation(*weight_buffer)
+                        }),
+                    };
+                    unsafe {
+                        std::ptr::copy_nonoverlapping(source_ptr, copy.scratch_ptr, copy.length)
+                    };
+                    if unsafe { fini_bo(cb.fd, copy.scratch_handle) }.is_err() {
+                        return Err(status::from_code(
+                            crate::bindings::iree_status_code_e_IREE_STATUS_INTERNAL,
+                        ));
+                    }
+                    if let Some((publish, scratch)) = &copy.publish {
+                        weight_cache::publish(
+                            publish.key,
+                            generation,
+                            Arc::clone(scratch),
+                            publish.bytes,
+                        );
+                    }
+                    profile::stop(timer, profile::Phase::Stage, profile_label, copy.length);
                 }
                 // The second tensor of a two-tensor element-wise op. None
                 // for every other dispatch kind.
@@ -876,6 +1436,65 @@ pub unsafe fn apply_ops(
                         packing.scratch_length,
                     );
                 }
+                // Fan-out: the sibling contexts' copies of every operand,
+                // taken now that the home packing has produced them. A
+                // packed coefficient copy is published under the sibling's
+                // key so the next command buffer there hits.
+                for replica in replicas {
+                    let timer = profile::start();
+                    let fd = replica.context.file.as_raw_fd();
+                    let mut bytes = replica.input.length + replica.bias.length;
+                    unsafe { apply_replica_copy(fd, &replica.input)? };
+                    unsafe { apply_replica_copy(fd, &replica.bias)? };
+                    match &replica.weights {
+                        ReplicaWeights::Direct(copy) => {
+                            bytes += copy.length;
+                            unsafe { apply_replica_copy(fd, copy)? };
+                        }
+                        ReplicaWeights::Packed {
+                            buffer,
+                            copy: Some((source, length, publish)),
+                        } => {
+                            bytes += length;
+                            unsafe {
+                                apply_replica_bytes(
+                                    fd,
+                                    *source,
+                                    *length,
+                                    buffer.host_ptr,
+                                    buffer.handle,
+                                )?
+                            };
+                            if let (Some(publish), Some(packing)) = (publish, weight_packing) {
+                                let generation =
+                                    unsafe { crate::buffer::generation(packing.weight_buffer) };
+                                weight_cache::publish(
+                                    publish.key,
+                                    generation,
+                                    Arc::clone(buffer),
+                                    publish.bytes,
+                                );
+                            } else if let Some(publish) = publish {
+                                // The home hit the cache, so the binding's
+                                // current generation is the one its entry
+                                // matched; a write since would have made the
+                                // home miss instead.
+                                let generation = unsafe {
+                                    crate::buffer::generation(publish.key.buffer as *mut _)
+                                };
+                                weight_cache::publish(
+                                    publish.key,
+                                    generation,
+                                    Arc::clone(buffer),
+                                    publish.bytes,
+                                );
+                            }
+                        }
+                        ReplicaWeights::Packed { copy: None, .. } => {}
+                    }
+                    profile::stop(timer, profile::Phase::Stage, profile_label, bytes);
+                }
+
                 // Sync every buffer the NPU is about to read for device access.
                 //
                 // The packing paths above each `fini_bo` the scratch they
@@ -908,6 +1527,29 @@ pub unsafe fn apply_ops(
                     }
                 }
                 profile::stop(timer, profile::Phase::SyncInputs, profile_label, 0);
+                let task_targets = (0..regcmd_tasks.len())
+                    .map(|task| match tile_context.get(task).copied().unwrap_or(0) {
+                        0 => TaskTarget {
+                            fd: cb.fd,
+                            context: cb.context.id,
+                            in_bo_handles: in_bo_handles.clone(),
+                            out_bo_handles: out_bo_handles.clone(),
+                        },
+                        index => {
+                            let replica = &replicas[index - 1];
+                            TaskTarget {
+                                fd: replica.context.file.as_raw_fd(),
+                                context: replica.context.id,
+                                in_bo_handles: vec![
+                                    replica.input.buffer.handle,
+                                    replica.weights.handle(),
+                                    replica.bias.buffer.handle,
+                                ],
+                                out_bo_handles: vec![replica.output.handle],
+                            }
+                        }
+                    })
+                    .collect();
                 dispatch_jobs.push(DispatchJob {
                     regcmd_tasks: regcmd_tasks.as_slice(),
                     dpu_mode: *dpu_mode,
@@ -916,6 +1558,7 @@ pub unsafe fn apply_ops(
                     out_bo_handles: out_bo_handles.as_slice(),
                     output_compaction: output_compaction.clone(),
                     profile_label: profile_label.as_str(),
+                    task_targets,
                 });
             }
         }
@@ -925,6 +1568,8 @@ pub unsafe fn apply_ops(
 
 pub unsafe fn create(
     device_allocator: *mut crate::bindings::iree_hal_allocator_t,
+    context: Arc<crate::pool::NpuContext>,
+    siblings: Vec<Arc<crate::pool::NpuContext>>,
     mode: iree_hal_command_buffer_mode_t,
     command_categories: iree_hal_command_category_t,
     queue_affinity: iree_hal_queue_affinity_t,
@@ -933,16 +1578,14 @@ pub unsafe fn create(
     let validation_state_size = unsafe {
         crate::bindings::iree_hal_command_buffer_validation_state_size(mode, binding_capacity)
     };
-    let fd = unsafe {
-        (*(device_allocator as *mut crate::allocator::RocketAllocator))
-            .file
-            .as_raw_fd()
-    };
+    let fd = context.file.as_raw_fd();
     let cb = Box::new(RocketCommandBuffer {
         base: unsafe { std::mem::zeroed() }, // filled by iree_hal_command_buffer_initialize below
         ops: Vec::new(),
         validation_state: vec![0u8; validation_state_size],
+        context,
         fd,
+        siblings,
     });
     let cb_ptr = Box::into_raw(cb);
     unsafe {
@@ -1274,10 +1917,8 @@ unsafe extern "C" fn dispatch_impl(
     // weight-read register at byte 0 of that shared buffer (the INPUT
     // tensor's own data) instead of the real weight value 64 bytes in --
     // found via a hardware diagnostic dump, not by inspection.
-    let addr = |r: &iree_hal_buffer_ref_t| unsafe {
-        (*(r.buffer as *mut RocketBuffer)).dma_address + r.offset as u32
-    };
-    let handle = |r: &iree_hal_buffer_ref_t| unsafe { (*(r.buffer as *mut RocketBuffer)).handle };
+    // (Every direct use of a binding now goes through `stage_direct`, which
+    // computes that address itself.)
 
     // Binding convention: per-ukernel-kind, since each kind's regcmd
     // builder needs a different set of buffers -- see module doc comment
@@ -1322,52 +1963,56 @@ unsafe extern "C" fn dispatch_impl(
                 );
             }
             let mut scratch_buffers = Vec::with_capacity(4);
+            let mut staged_copies = Vec::new();
 
             // CNA's surface-layout path consumes 16-byte feature-atomic
             // NC1HWC2 surfaces. Shapes with 1..=4 channels use the hardware's
             // dense ARGB modes and must remain dense; packing Cin 2..=4 into
             // 16-byte slots makes those modes read padding as later pixels.
-            let (input_addr, input_handle, input_packing) =
-                if shape.layout() == FeatureLayout::Surfaces {
-                    let scratch_bytes =
-                        match nc1hwc2_storage_size(pixel_count, packed_input_bytes_per_pixel) {
-                            Ok(value) => value,
-                            Err(_) => {
-                                return status::from_code(
+            let (input_addr, input_handle, input_packing) = if shape.layout()
+                == FeatureLayout::Surfaces
+            {
+                let scratch_bytes =
+                    match nc1hwc2_storage_size(pixel_count, packed_input_bytes_per_pixel) {
+                        Ok(value) => value,
+                        Err(_) => {
+                            return status::from_code(
                                 crate::bindings::iree_status_code_e_IREE_STATUS_INVALID_ARGUMENT,
                             );
-                            }
-                        };
-                    let scratch = unsafe {
-                        RocketOwnedBuffer::new(
-                            cb.fd,
-                            scratch_bytes.max(1),
-                            BorrowedFd::borrow_raw(cb.fd),
-                        )
+                        }
                     };
-                    let packed = (
-                        scratch.dma_address,
-                        scratch.handle,
-                        Some(InputPacking {
-                            input_buffer: refs[0].buffer,
-                            input_offset: refs[0].offset,
-                            input_length: refs[0].length,
-                            scratch_ptr: scratch.host_ptr,
-                            scratch_length: scratch_bytes,
-                            scratch_handle: scratch.handle,
-                            source_pixel_count: pixel_count,
-                            packed_pixel_count: pixel_count,
-                            bytes_per_pixel: input_bytes_per_pixel,
-                            packed_bytes_per_pixel: packed_input_bytes_per_pixel,
-                            padding_byte: 0,
-                            layout: InputPackingLayout::Nc1hwc2,
-                        }),
-                    );
-                    scratch_buffers.push(scratch);
-                    packed
-                } else {
-                    (addr(&refs[0]), handle(&refs[0]), None)
+                let scratch = unsafe {
+                    RocketOwnedBuffer::new(
+                        cb.fd,
+                        scratch_bytes.max(1),
+                        BorrowedFd::borrow_raw(cb.fd),
+                    )
                 };
+                let packed = (
+                    scratch.dma_address,
+                    scratch.handle,
+                    Some(InputPacking {
+                        input_buffer: refs[0].buffer,
+                        input_offset: refs[0].offset,
+                        input_length: refs[0].length,
+                        scratch_ptr: scratch.host_ptr,
+                        scratch_length: scratch_bytes,
+                        scratch_handle: scratch.handle,
+                        source_pixel_count: pixel_count,
+                        packed_pixel_count: pixel_count,
+                        bytes_per_pixel: input_bytes_per_pixel,
+                        packed_bytes_per_pixel: packed_input_bytes_per_pixel,
+                        padding_byte: 0,
+                        layout: InputPackingLayout::Nc1hwc2,
+                    }),
+                );
+                scratch_buffers.push(scratch);
+                packed
+            } else {
+                let (addr, handle) =
+                    unsafe { stage_direct(cb, &refs[0], &mut scratch_buffers, &mut staged_copies) };
+                (addr, handle, None)
+            };
             // IREE's conv ABI supplies a logical HWCF filter. Regular fp16
             // convolution consumes a blocked coefficient stream instead:
             // output-block, input-group, X, Y, output-lane, input-lane.
@@ -1420,6 +2065,7 @@ unsafe extern "C" fn dispatch_impl(
                                 .map(|q| q.weight_zero_point as i8),
                             scratch_length: scratch_bytes,
                         },
+                        &mut staged_copies,
                     )
                 }
             } else if shape.depthwise {
@@ -1461,10 +2107,13 @@ unsafe extern "C" fn dispatch_impl(
                                 .map(|q| q.weight_zero_point as i8),
                             scratch_length: scratch_bytes,
                         },
+                        &mut staged_copies,
                     )
                 }
             } else {
-                StagedWeights::direct(addr(&refs[1]), handle(&refs[1]))
+                let (addr, handle) =
+                    unsafe { stage_direct(cb, &refs[1], &mut scratch_buffers, &mut staged_copies) };
+                StagedWeights::direct(addr, handle, refs[1].length as usize)
             };
             let StagedWeights {
                 addr: weights_addr,
@@ -1473,6 +2122,7 @@ unsafe extern "C" fn dispatch_impl(
                 scratch: weight_scratch,
                 publish: weight_publish,
                 probe: weight_probe,
+                fanout: weight_fanout,
             } = staged_weights;
             if let Some(probe) = weight_probe {
                 scratch_buffers.push(probe);
@@ -1563,7 +2213,9 @@ unsafe extern "C" fn dispatch_impl(
                 scratch_buffers.push(scratch);
                 packed
             } else {
-                (addr(&refs[2]), handle(&refs[2]), None)
+                let (addr, handle) =
+                    unsafe { stage_direct(cb, &refs[2], &mut scratch_buffers, &mut staged_copies) };
+                (addr, handle, None)
             };
             // DPU output write-back (16-byte slots normally, 128-byte native
             // accumulator blocks for bypassed int32) doesn't match IREE's
@@ -1590,18 +2242,142 @@ unsafe extern "C" fn dispatch_impl(
             // inconsistency rather than an ordinary user error. The builder
             // only returns fresh local vectors, so a panic mid-build leaves
             // no shared state half-mutated.
+            // Fan-out sources: what a sibling context copies for each operand.
+            let input_source = match &input_packing {
+                Some(packing) => (
+                    ReplicaSource::Host(packing.scratch_ptr as *const u8),
+                    packing.scratch_length,
+                ),
+                None => (
+                    ReplicaSource::Binding {
+                        buffer: refs[0].buffer,
+                        offset: refs[0].offset as usize,
+                    },
+                    refs[0].length as usize,
+                ),
+            };
+            let bias_source = match &bias_packing {
+                Some(packing) => (
+                    ReplicaSource::Host(packing.scratch_ptr as *const u8),
+                    packing.scratch_length,
+                ),
+                None => (
+                    ReplicaSource::Binding {
+                        buffer: refs[2].buffer,
+                        offset: refs[2].offset as usize,
+                    },
+                    refs[2].length as usize,
+                ),
+            };
+            let weight_binding_source = ReplicaSource::Binding {
+                buffer: refs[1].buffer,
+                offset: refs[1].offset as usize,
+            };
+            let input_geometry = Some(match &input_packing {
+                Some(packing) if matches!(packing.layout, InputPackingLayout::Nc1hwc2) => {
+                    BandGeometry {
+                        width: shape.width as usize,
+                        height: shape.height as usize,
+                        surfaces: packing.packed_bytes_per_pixel / 16,
+                        surface_stride: packing.packed_pixel_count * 16,
+                        block_bytes: 16,
+                    }
+                }
+                Some(packing) => BandGeometry {
+                    width: shape.width as usize,
+                    height: shape.height as usize,
+                    surfaces: 1,
+                    surface_stride: 0,
+                    block_bytes: packing.packed_bytes_per_pixel,
+                },
+                None => BandGeometry {
+                    width: shape.width as usize,
+                    height: shape.height as usize,
+                    surfaces: 1,
+                    surface_stride: 0,
+                    block_bytes: input_bytes_per_pixel,
+                },
+            });
             let planned = match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
                 let plan = ConvPlan::new(programmed_shape, kernels);
-                if programmed_shape.precision.writes_accumulators() {
-                    let staged = plan.programs_with_staged_accumulator_output(bufs);
+                let tiles = plan.tiles().len();
+                let contexts = cb.fanout_contexts(tiles);
+                let tile_context = tile_contexts(tiles, contexts.len());
+                let tile_bands: Vec<InputBand> = plan
+                    .tiles()
+                    .iter()
+                    .map(|tile| InputBand {
+                        row: tile.rows.in_first as usize,
+                        rows: tile.rows.in_rows as usize,
+                        column: tile.columns.in_first as usize,
+                        columns: tile.columns.in_cols as usize,
+                    })
+                    .collect();
+                let replicas = unsafe {
+                    build_replicas(
+                        contexts,
+                        input_source,
+                        input_geometry,
+                        &tile_bands,
+                        &tile_context,
+                        (
+                            weight_scratch.as_ref(),
+                            weight_binding_source,
+                            weight_fanout,
+                        ),
+                        bias_source,
+                        scratch_bytes,
+                    )
+                };
+                let buffers_for = |tile: usize| match tile_context[tile] {
+                    0 => bufs,
+                    index => replicas[index - 1].buffers(),
+                };
+                let (programs, source_tiles) = if programmed_shape.precision.writes_accumulators() {
+                    let staged = plan.staged_accumulator_programs();
                     assert_eq!(staged.scratch_bytes, scratch_bytes);
+                    let programs = staged
+                        .programs
+                        .into_iter()
+                        .zip(&staged.tiles)
+                        .enumerate()
+                        .map(|(tile, (mut program, layout))| {
+                            relocate_staged_accumulator(&mut program, buffers_for(tile), layout);
+                            program
+                        })
+                        .collect();
                     (
-                        staged.programs,
+                        programs,
                         Some(Arc::<[AccumulatorOutputTile]>::from(staged.tiles)),
                     )
                 } else {
-                    (plan.programs_with_buffers(bufs), None)
-                }
+                    let programs = plan
+                        .programs()
+                        .into_iter()
+                        .enumerate()
+                        .map(|(tile, mut program)| {
+                            relocate(&mut program, buffers_for(tile));
+                            program
+                        })
+                        .collect();
+                    (programs, None)
+                };
+                let tile_rects = if replicas.is_empty() {
+                    Vec::new()
+                } else {
+                    plan.tiles()
+                        .iter()
+                        .enumerate()
+                        .map(|(index, tile)| TileRect {
+                            index,
+                            row: tile.rows.out_first as usize,
+                            rows: tile.rows.out_rows as usize,
+                            column: tile.columns.out_first as usize,
+                            columns: tile.columns.out_cols as usize,
+                        })
+                        .collect()
+                };
+                (programs, source_tiles, replicas, tile_context, tile_rects)
             })) {
                 Ok(planned) => planned,
                 Err(_) => {
@@ -1610,7 +2386,16 @@ unsafe extern "C" fn dispatch_impl(
                     );
                 }
             };
-            let (regcmd_tasks, source_tiles) = planned;
+            let (regcmd_tasks, source_tiles, replicas, tile_context, tile_rects) = planned;
+            let replica_scratch: Vec<(usize, usize)> = replicas
+                .iter()
+                .map(|replica| (replica.output.host_ptr as usize, replica.output.size))
+                .collect();
+            let tile_context = if replicas.is_empty() {
+                Vec::new()
+            } else {
+                tile_context
+            };
             let output_pixel_count =
                 shape.output_width(kernels) as usize * shape.output_height(kernels) as usize;
             let output_compaction = Some(OutputCompaction {
@@ -1626,6 +2411,9 @@ unsafe extern "C" fn dispatch_impl(
                     * shape.precision.output_element_bytes() as usize,
                 source_block_bytes: programmed_shape.output_atom_bytes() as usize,
                 source_tiles,
+                replica_scratch,
+                tile_context: tile_context.clone(),
+                tile_rects,
             });
             let output_handle = scratch.handle;
             scratch_buffers.push(scratch);
@@ -1654,6 +2442,9 @@ unsafe extern "C" fn dispatch_impl(
                 precision_tag: Some(shape.precision),
                 retained_bindings,
                 scratch_buffers,
+                staged_copies,
+                replicas,
+                tile_context,
                 in_bo_handles: vec![input_handle, weights_handle, bias_handle],
                 out_bo_handles: vec![output_handle],
                 input_packing,
@@ -1794,6 +2585,8 @@ unsafe extern "C" fn dispatch_impl(
                     crate::bindings::iree_status_code_e_IREE_STATUS_INVALID_ARGUMENT,
                 );
             }
+            let mut staged_copies = Vec::new();
+            let mut staged_scratch = Vec::new();
             let StagedWeights {
                 addr: weights_addr,
                 handle: weights_handle,
@@ -1801,6 +2594,7 @@ unsafe extern "C" fn dispatch_impl(
                 scratch: weight_scratch,
                 publish: weight_publish,
                 probe: weight_probe,
+                fanout: weight_fanout,
             } = unsafe {
                 stage_weights(
                     cb,
@@ -1817,6 +2611,7 @@ unsafe extern "C" fn dispatch_impl(
                         weight_zero_point: None,
                         scratch_length: weight_scratch_bytes,
                     },
+                    &mut staged_copies,
                 )
             };
 
@@ -1861,7 +2656,9 @@ unsafe extern "C" fn dispatch_impl(
                     Some(scratch),
                 )
             } else {
-                (addr(&refs[2]), handle(&refs[2]), None, None)
+                let (addr, handle) =
+                    unsafe { stage_direct(cb, &refs[2], &mut staged_scratch, &mut staged_copies) };
+                (addr, handle, None, None)
             };
 
             let output_scratch_bytes =
@@ -1891,15 +2688,131 @@ unsafe extern "C" fn dispatch_impl(
                 bias: bias_addr,
                 output: output_scratch.dma_address,
             };
-            let regcmd_tasks = match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                fc::Plan::new(*shape).programs_with_buffers(bufs)
+            let input_source = match &input_packing {
+                Some(packing) => (
+                    ReplicaSource::Host(packing.scratch_ptr as *const u8),
+                    packing.scratch_length,
+                ),
+                None => (
+                    ReplicaSource::Binding {
+                        buffer: refs[0].buffer,
+                        offset: refs[0].offset as usize,
+                    },
+                    refs[0].length as usize,
+                ),
+            };
+            let bias_source = match &bias_packing {
+                Some(packing) => (
+                    ReplicaSource::Host(packing.scratch_ptr as *const u8),
+                    packing.scratch_length,
+                ),
+                None => (
+                    ReplicaSource::Binding {
+                        buffer: refs[2].buffer,
+                        offset: refs[2].offset as usize,
+                    },
+                    refs[2].length as usize,
+                ),
+            };
+            let weight_binding_source = ReplicaSource::Binding {
+                buffer: refs[1].buffer,
+                offset: refs[1].offset as usize,
+            };
+            let input_geometry = input_packing.as_ref().map(|packing| match packing.layout {
+                InputPackingLayout::Nc1hwc2 => BandGeometry {
+                    width: m,
+                    height: 1,
+                    surfaces: packing.packed_bytes_per_pixel / 16,
+                    surface_stride: packing.packed_pixel_count * 16,
+                    block_bytes: 16,
+                },
+                InputPackingLayout::Dense => BandGeometry {
+                    width: m,
+                    height: 1,
+                    surfaces: 1,
+                    surface_stride: 0,
+                    block_bytes: packing.packed_bytes_per_pixel,
+                },
+            });
+            let planned = match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                let plan = fc::Plan::new(*shape);
+                let tiles = plan.conv_plan().tiles().len();
+                let contexts = cb.fanout_contexts(tiles);
+                let tile_context = tile_contexts(tiles, contexts.len());
+                let tile_bands: Vec<InputBand> = plan
+                    .conv_plan()
+                    .tiles()
+                    .iter()
+                    .map(|tile| InputBand {
+                        row: tile.rows.in_first as usize,
+                        rows: tile.rows.in_rows as usize,
+                        column: tile.columns.in_first as usize,
+                        columns: tile.columns.in_cols as usize,
+                    })
+                    .collect();
+                let replicas = unsafe {
+                    build_replicas(
+                        contexts,
+                        input_source,
+                        input_geometry,
+                        &tile_bands,
+                        &tile_context,
+                        (
+                            weight_scratch.as_ref(),
+                            weight_binding_source,
+                            weight_fanout,
+                        ),
+                        bias_source,
+                        output_scratch_bytes,
+                    )
+                };
+                let programs: Vec<Vec<RegCmd>> = plan
+                    .programs()
+                    .into_iter()
+                    .enumerate()
+                    .map(|(tile, mut program)| {
+                        let buffers = match tile_context[tile] {
+                            0 => bufs,
+                            index => replicas[index - 1].buffers(),
+                        };
+                        relocate(&mut program, buffers);
+                        program
+                    })
+                    .collect();
+                let tile_rects = if replicas.is_empty() {
+                    Vec::new()
+                } else {
+                    plan.conv_plan()
+                        .tiles()
+                        .iter()
+                        .enumerate()
+                        .map(|(index, tile)| TileRect {
+                            index,
+                            row: tile.rows.out_first as usize,
+                            rows: tile.rows.out_rows as usize,
+                            column: tile.columns.out_first as usize,
+                            columns: tile.columns.out_cols as usize,
+                        })
+                        .collect()
+                };
+                (programs, replicas, tile_context, tile_rects)
             })) {
-                Ok(tasks) => tasks,
+                Ok(planned) => planned,
                 Err(_) => {
                     return status::from_code(
                         crate::bindings::iree_status_code_e_IREE_STATUS_INTERNAL,
                     );
                 }
+            };
+            let (regcmd_tasks, replicas, tile_context, tile_rects) = planned;
+            let replica_scratch: Vec<(usize, usize)> = replicas
+                .iter()
+                .map(|replica| (replica.output.host_ptr as usize, replica.output.size))
+                .collect();
+            let tile_context = if replicas.is_empty() {
+                Vec::new()
+            } else {
+                tile_context
             };
 
             let input_scratch_handle = input_scratch.handle;
@@ -1920,6 +2833,9 @@ unsafe extern "C" fn dispatch_impl(
                 bytes_per_pixel: output_bytes_per_pixel,
                 source_block_bytes: shape.as_conv_shape().output_channel_block_bytes() as usize,
                 source_tiles: None,
+                replica_scratch,
+                tile_context: tile_context.clone(),
+                tile_rects,
             });
             let retained_bindings = unsafe { retain_direct_bindings(refs) };
             let profile_label = profile::label(|| {
@@ -1932,6 +2848,7 @@ unsafe extern "C" fn dispatch_impl(
                 )
             });
             let mut scratch_buffers = vec![input_scratch, output_scratch];
+            scratch_buffers.extend(staged_scratch);
             if let Some(probe) = weight_probe {
                 scratch_buffers.push(probe);
             }
@@ -1944,6 +2861,9 @@ unsafe extern "C" fn dispatch_impl(
                 precision_tag: None,
                 retained_bindings,
                 scratch_buffers,
+                staged_copies,
+                replicas,
+                tile_context,
                 in_bo_handles: vec![input_scratch_handle, weight_scratch_handle, bias_handle],
                 out_bo_handles: vec![output_scratch_handle],
                 input_packing,
@@ -2095,6 +3015,9 @@ unsafe extern "C" fn dispatch_impl(
                 // what the PPU's cube strides are counted in.
                 source_block_bytes: 16,
                 source_tiles: None,
+                replica_scratch: Vec::new(),
+                tile_context: Vec::new(),
+                tile_rects: Vec::new(),
             });
 
             let bufs = PoolingBuffers {
@@ -2124,6 +3047,9 @@ unsafe extern "C" fn dispatch_impl(
                 precision_tag: None,
                 retained_bindings,
                 scratch_buffers: vec![input_scratch, output_scratch],
+                staged_copies: Vec::new(),
+                replicas: Vec::new(),
+                tile_context: Vec::new(),
                 in_bo_handles,
                 out_bo_handles,
                 input_packing,
@@ -2187,6 +3113,9 @@ unsafe extern "C" fn dispatch_impl(
                 in_bo_handles: vec![input_scratch.handle],
                 out_bo_handles: vec![output_scratch.handle],
                 scratch_buffers: vec![input_scratch, output_scratch],
+                staged_copies: Vec::new(),
+                replicas: Vec::new(),
+                tile_context: Vec::new(),
                 input_packing: Some(input_packing),
                 operand_packing: None,
                 weight_packing: None,
@@ -2254,6 +3183,9 @@ unsafe extern "C" fn dispatch_impl(
                 in_bo_handles: vec![input_scratch.handle, operand_scratch.handle],
                 out_bo_handles: vec![output_scratch.handle],
                 scratch_buffers: vec![input_scratch, operand_scratch, output_scratch],
+                staged_copies: Vec::new(),
+                replicas: Vec::new(),
+                tile_context: Vec::new(),
                 input_packing: Some(input_packing),
                 operand_packing: Some(operand_packing),
                 weight_packing: None,
@@ -2310,6 +3242,9 @@ unsafe extern "C" fn dispatch_impl(
                 in_bo_handles: vec![input_scratch.handle],
                 out_bo_handles: vec![output_scratch.handle],
                 scratch_buffers: vec![input_scratch, output_scratch],
+                staged_copies: Vec::new(),
+                replicas: Vec::new(),
+                tile_context: Vec::new(),
                 input_packing: Some(input_packing),
                 operand_packing: None,
                 weight_packing: None,
@@ -2448,6 +3383,9 @@ fn compact_elementwise_output(
         // cube strides are counted in.
         source_block_bytes: 16,
         source_tiles: None,
+        replica_scratch: Vec::new(),
+        tile_context: Vec::new(),
+        tile_rects: Vec::new(),
     };
     Some((scratch, compaction))
 }

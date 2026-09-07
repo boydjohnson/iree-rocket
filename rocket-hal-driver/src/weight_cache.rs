@@ -125,6 +125,11 @@ pub struct Key {
     pub offset: u64,
     pub length: u64,
     pub geometry: Geometry,
+    /// The NPU context (DRM file) the packing was allocated on. A job may
+    /// only name BOs created on its own file, so a packing is only a hit
+    /// for command buffers on the same context; [`lookup_other_context`]
+    /// finds one to copy from instead of re-packing (MULTICORE.md §5.5).
+    pub context: usize,
 }
 
 struct Entry {
@@ -154,6 +159,8 @@ struct Cache {
     misses_stale: u64,
     refused_recorded_writer: u64,
     refused_budget: u64,
+    /// Misses on one context served by copying another context's packing.
+    copied: u64,
 }
 
 fn cache() -> &'static Mutex<Cache> {
@@ -190,13 +197,22 @@ pub fn verifying() -> bool {
     setting() == "verify"
 }
 
+/// How many NPU contexts share the cache, from `device::create`. Each
+/// context needs its own copy of every packing, so the default budget
+/// scales with it; `ROCKET_WEIGHT_CACHE_MB` overrides the total.
+pub fn set_contexts(contexts: usize) {
+    CONTEXTS.store(contexts.max(1), Ordering::Relaxed);
+}
+
+static CONTEXTS: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(1);
+
 fn budget_bytes() -> usize {
     static BUDGET: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
     *BUDGET.get_or_init(|| {
         std::env::var("ROCKET_WEIGHT_CACHE_MB")
             .ok()
             .and_then(|value| value.parse::<usize>().ok())
-            .unwrap_or(256)
+            .unwrap_or(256 * CONTEXTS.load(Ordering::Relaxed))
             .saturating_mul(1024 * 1024)
     })
 }
@@ -227,6 +243,30 @@ pub fn lookup(key: &Key, generation: u64) -> Option<Arc<SharedBuffer>> {
             None
         }
     }
+}
+
+/// The same packing on any other context, if one was packed at
+/// `generation`: the source for a byte copy onto `key.context`'s file,
+/// which is cheaper than packing again. Counted separately from hits.
+pub fn lookup_other_context(key: &Key, generation: u64) -> Option<Arc<SharedBuffer>> {
+    if !enabled() {
+        return None;
+    }
+    let mut cache = lock();
+    let found = (0..crate::pool::MAX_CONTEXTS)
+        .filter(|&context| context != key.context)
+        .find_map(|context| {
+            let other = Key { context, ..*key };
+            cache
+                .entries
+                .get(&other)
+                .filter(|entry| entry.generation == generation)
+                .map(|entry| Arc::clone(&entry.buffer))
+        });
+    if found.is_some() {
+        cache.copied += 1;
+    }
+    found
 }
 
 /// Records a dispatch whose own command buffer already has a recorded write
@@ -312,6 +352,7 @@ pub fn stats() -> Stats {
         recorded_writers: cache.refused_recorded_writer,
         over_budget: cache.refused_budget,
         peak_bytes: cache.peak_bytes,
+        copied: cache.copied,
     }
 }
 
@@ -323,6 +364,7 @@ pub struct Stats {
     pub recorded_writers: u64,
     pub over_budget: u64,
     pub peak_bytes: usize,
+    pub copied: u64,
 }
 
 /// Monotonic write counter for one IREE buffer.
@@ -370,6 +412,7 @@ mod tests {
             offset: 0,
             length: 4096,
             geometry: geometry(),
+            context: 0,
         };
         let mut depthwise = base;
         depthwise.geometry.depthwise = true;
