@@ -364,6 +364,27 @@ conv1 -> conv2 -> conv3 edge is now NPU -> NPU with nothing between, which
 is exactly the set step 2 chains; what still crosses the CPU is the 16
 residual adds, the 7x7 stem, the padded max pool and the head.
 
+**Re-sized after step 1** (`ROCKET_PROFILE`, same build, per inference;
+the profiler inflates wall to 237 ms, composition only): `wait.npu` 108.2
+(46 %), `outside` 47.9, `compact` 37.0, `pack.input` 20.6. By role, the
+edges step 2 can chain are conv1 -> conv2 and conv2 -> conv3:
+
+| edge class | `pack.input` | `compact` |
+|---|---:|---:|
+| conv1 (reads the block input, from the CPU add) | 9.2 | 3.7 |
+| conv2 | 3.2 | 3.9 |
+| conv3 (feeds the CPU residual add) | 1.6 | 9.7 |
+| conv3 + downsample at 56x56x64->256 | 1.5 | 15.0 |
+
+So **step 2 is worth 12.4 ms**, 5 % of the profiled wall and at most 7 % of
+the real one: conv2's and conv3's packing plus conv1's and conv2's
+compaction. Three quarters of the remaining `compact` is conv3 writing the
+wide block output for the residual add, and half of `pack.input` is conv1
+reading it back, so **step 3 (the residual add on the NPU) is now the
+larger lever by four to one**: it unlocks ~57 ms of pack and compact plus
+the 16 CPU adds, against step 2's 12. Build step 3 first, and step 2 on
+the edges it leaves.
+
 ---
 
 ## P3 (S3) — the full output BO is cache-synced once per tile, and a regcmd BO is allocated and mapped per tile
