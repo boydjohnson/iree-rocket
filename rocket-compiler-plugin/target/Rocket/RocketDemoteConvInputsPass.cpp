@@ -102,6 +102,17 @@
 // Accuracy at 44 sites is max|diff| 0.0320 against a --no-offload CPU arm
 // (0.0184 at 37), top-1 and top-5 stable.
 //
+// **Re-measured 2026-09-08 with the driver chain (P2 step 2) on, and it
+// changes nothing**: 130.5 vs 137.0 ms at taskset -c 4-7 (1.05x), 108 vs
+// 127.5 with --task_topology_cpu_ids=4,5,6,7 (1.18x), chain on and off
+// within a millisecond of each other. The chain takes the same single edge
+// in both builds: every offloaded depthwise reads its input through the
+// explicit tensor.pad, which is a CPU dispatch, and the seven convolutions
+// cost 60% of the CPU time they replace in NPU time alone at 200 MHz. So the
+// lever P7 ranked first is worth ~0 here until the pad folds into the
+// dispatch and the residual add leaves the CPU; ISSUES.md P7 has the edge
+// census and the phase deltas. The demote stays off.
+//
 // Anything left alone is safe: an op that stays f32 fails the matchers' f16
 // typing and goes to the CPU, and RocketPromoteUnclaimedConvInputsPass gives
 // f32 back to anything demoted that the match loop then declines.

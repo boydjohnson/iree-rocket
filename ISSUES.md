@@ -456,7 +456,11 @@ have no NPU producer on their command buffer (the stem, behind the CPU max
 pool). MobileNetV2 fp16 is 134 -> 132 ms and bit-identical, with 1 of 34
 edges chained -- its depthwise convolutions sit on the CPU between every pair
 of dense ones, so its reach is gated on P7, exactly as the 2026-09-07 sizing
-above said.
+above said. **Corrected 2026-09-08 by measuring it** (P7): with the seven
+admissible depthwise offloaded the chain still takes that same one edge.
+The model's edges are behind the CPU residual add (10), the explicit pad
+in front of every depthwise (7) and the whole-atom rule (8 of the 14 direct
+NPU -> NPU edges, at 88/136/24 channels); P7 alone opens nothing.
 
 **What is left of P2 is the compaction, and it needs something this layer
 does not have.** `compact` is unmoved at 25.6 ms, 18% of wall, because the
@@ -554,7 +558,7 @@ and worth not touching.
 
 ---
 
-## P7 (S2) — MobileNetV2 fp16's 17 depthwise convolutions stay on the CPU; they are 54% of the model's wall time, and offloading them is 1.053x slower (re-measured 2026-09-07, was 1.26x)
+## P7 (S2) — MobileNetV2 fp16's 17 depthwise convolutions stay on the CPU; they are 54% of the model's wall time, and offloading them is 1.05x slower with the driver chain on, 1.18x at four workers (re-measured 2026-09-08; was 1.26x)
 
 They are the whole of the `outside` term (70.9 ms of a 127 ms model; see
 the profile below): ten executables over 17 dispatch
@@ -713,18 +717,87 @@ only pays between *adjacent* NPU dispatches, and this model alternates dense
 (NPU) with depthwise (CPU), so P2's reach is itself gated on this item. The
 knot is P7 -> P2 -> ROADMAP's conv padding row, and P7 is the end to pull.
 
+### Re-measured 2026-09-08 with the driver chain on: chaining reaches nothing here, and the verdict holds
+
+P2 step 2 landed (the consumer reads its NPU producer's output cube in
+place), and item 1 below said that was the lever that would move this most.
+Measured, it moves it by nothing, and the reason is structural rather than a
+tuning.
+
+Same two-line demote (`DemoteInputsToF16<linalg::DepthwiseConv2D{NhwcHwc,
+NchwChw}Op>` and the promote twins), same source model rebuilt for the run
+(`mnv2.fp16.mlir` is no longer on disk; the width-1.4 f32-constant form is
+the fp16 export widened with `widen_to_f32.py`, batch pinned, imported at
+opset 20 -- 37 sites, and 44 with the demote, exactly the 2026-09-07
+placement). `planck`, six interleaved passes, medians, governor
+`performance`, NPU IRQs on cpu6. All three arms are the same binary; the
+third is the 44-site build with `ROCKET_CHAIN=0`.
+
+|   | `taskset -c 4-7` | + `--task_topology_cpu_ids=4,5,6,7` |
+|---|---:|---:|
+| 37 sites | **130.5** ms | **108** ms |
+| 44 sites, chain on | 137.0 (1.050x slower) | 127.5 (**1.18x slower**) |
+| 44 sites, chain off | 136.5 | 126.5 |
+
+Correctness is unchanged: max|diff| 0.0078 against the `--no-offload` arm
+at 44 sites (0.0073 at 37), same top-5, and chain on/off are bit-identical.
+
+**Chaining took one edge in both arms -- the same one.** `ROCKET_CHAIN=debug`
+on the 44-site build: 1 taken (the 7x7x448 -> 1792 head), 32 declined for
+*no producer on this command buffer*, 8 declined because the consumer's
+pixel is not a whole number of 32-byte atoms (88-, 136- and 24-channel
+project outputs, which pack 176 -> 192, 272 -> 288 and 48 -> 64 bytes).
+Classifying every Rocket call's input operand in the post-match IR says what
+the 32 are:
+
+| Rocket conv inputs (44-site build) | fed by | chainable today |
+|---|---|---|
+| 10 expand 1x1 | `linalg.add` -- the residual add, on the CPU | no |
+| 10 project 1x1 | the CPU clamp after a still-unclaimed wide depthwise | no |
+| 7 depthwise 3x3 | `tensor.pad` -- the explicit pad, on the CPU | no |
+| 7 project 1x1 | the offloaded depthwise, directly | only if whole-atom |
+| 7 expand 1x1 | a project conv, directly (no residual) | only if whole-atom |
+
+So the reach was never "17 depthwise convolutions sitting between NPU pairs".
+Offloading the seven admissible ones opens at most 14 direct NPU -> NPU
+edges, 8 of which the whole-atom rule declines, and every other edge on the
+model is behind one of three CPU ops: the residual add (10 edges), the pad
+(7), and the clamps of the depthwise the `Cin` 512 cap leaves behind (10).
+On this model P2's reach is gated on those three, not on P7 alone; the
+2026-09-07 statement above that "P2's reach is itself gated on this item"
+was the right direction and too small a claim.
+
+**The hardware term is the binding one, and chaining cannot touch it.**
+Whole-run profile, 37 vs 44 sites at `taskset -c 4-7`: `outside` -1030 ms
+(the CPU depthwise and their clamps, gone), against `wait.npu` **+633**,
+`pack.input` +354, `compact` +265, `record` +47. The seven depthwise
+convolutions cost 60 % of the CPU time they replace *in NPU time alone*, at
+the 200 MHz M2 leaves the clock at; the layout round trip is the other 600.
+A perfect chain -- every pack and compact on those seven edges free -- would
+leave 44 sites at roughly 125 ms against 130, a 4 % win at best, and the
+four-worker column says the CPU side has more headroom than that
+(108 -> ~127 is the CPU depthwise getting four workers while the NPU path
+gains nothing).
+
+What this changes in the list below: item 1 is done and worth ~0 until the
+pad, the residual add and the whole-atom rule move; item 2 (the pad) is now
+also a P2 blocker and the first thing to build; and M2 is the only lever
+that touches the term that actually binds. The demote stays off.
+
 ### What would change the verdict, in order
 
 0. ~~**Re-measure the 44-site arm with depthwise ReLU6 fused**~~ — done
    2026-09-07, see above. Worth 2.5 ms of the 9.5 ms gap; the verdict holds
    at 1.053x rather than 1.26x.
-1. **P2's cross-op chaining.** These are the widest spatial extents in the
-   model, so their round trip is the most expensive one there is: `pack.input`
-   plus `compact` is 12.3 of the 32.7 ms. A depthwise sitting between two
-   Rocket 1x1 convolutions is also the ideal chaining shape — producer and
-   consumer both on the NPU.
+1. ~~**P2's cross-op chaining.**~~ Built (P2 step 2) and measured
+   2026-09-08 above: it takes the same single edge with or without the
+   depthwise offloaded, because every depthwise input sits behind the
+   explicit pad and 8 of the 14 direct edges fail the whole-atom rule. It
+   cannot reach the `wait.npu` term, which is the one that binds.
 2. **The pad.** Folding it into the dispatch (the driver already pads on the
-   input packing path) removes the added CPU dispatch and its buffer.
+   input packing path) removes the added CPU dispatch and its buffer -- and,
+   since 2026-09-08, it is what stands between every offloaded depthwise and
+   its producer's cube, so it is a P2 blocker on this model too.
 3. **The quiesce dwell.** 7.4 ms is pure empirical caution; it is C8's
    neighbour and should be re-derived rather than kept at a millisecond.
 4. **The `Cin <= 512` matcher cap**, last, because raising it only adds more
@@ -1773,8 +1846,14 @@ Where the time actually is, per inference: `outside` **70.9 ms (54%)**,
    2026-09-07 with depthwise ReLU6 fused: **1.053x slower, not 1.26x**, so
    the verdict holds but the gap is a quarter of what it was. What is left of
    it is the explicit pad, the quiesce dwell and the `Cin` 512 cap; the
-   fusion machinery for it is in the tree and only the demote is off. P2 and
-   ROADMAP's conv-padding row are both gated behind this one.
+   fusion machinery for it is in the tree and only the demote is off.
+   **Re-measured 2026-09-08 with P2's driver chain on: no change** (1.05x at
+   `taskset -c 4-7`, 1.18x at four workers). The chain takes the same one
+   edge either way -- every offloaded depthwise reads through the CPU pad --
+   and the seven convolutions cost 60 % of the CPU time they replace in
+   `wait.npu` alone. The term that binds is the 200 MHz clock (M2), not the
+   round trip; on this model P2's reach is gated on the residual add, the
+   pad and the whole-atom chain rule, not on P7.
 2. **P2** — 24.4 ms, 19% of wall, and the one part of the old "layout
    propagation" lever P8 never tested. Two caveats now attached to it: the
    cost is concentrated in one convolution (5.4 ms, 30% of `compact`), and
