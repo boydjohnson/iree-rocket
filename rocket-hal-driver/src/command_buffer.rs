@@ -1074,17 +1074,34 @@ unsafe fn retain_direct_bindings(refs: &[iree_hal_buffer_ref_t]) -> Vec<*mut ire
 }
 
 /// Not part of the vtable -- `device::queue_execute` calls this directly
-/// after its wait-semaphore gate. Applies every recorded fill/update/copy
+/// after its wait-semaphore gate, once per recorded dispatch. Applies the
+/// recorded ops from `*cursor` **in call order**: every fill/update/copy
 /// immediately (host-side, via IREE's generic `iree_hal_buffer_map_*`
 /// helpers -- `buffer::map_range`/`unmap_range` already back those
-/// correctly) and returns every recorded `dispatch`'s regcmd program, in
-/// call order, for the caller to submit to hardware afterward.
-pub unsafe fn apply_ops(
+/// correctly), and the first `dispatch` it reaches has its operands packed
+/// and is returned as the job to submit, with `*cursor` left just past it.
+/// `None` once the ops are exhausted.
+///
+/// One dispatch at a time is the whole point. This used to walk the entire
+/// command buffer and hand back every job at once, which packed every
+/// dispatch's input *before any dispatch had run* -- correct only while no
+/// dispatch in a command buffer read what an earlier one in the same buffer
+/// wrote. IREE puts two dependent Rocket dispatches in one command buffer
+/// with an execution barrier between them whenever nothing on the CPU sits
+/// between them, and the second then packed the transient before the first
+/// had compacted into it: an all-zero input, silently, for any chained
+/// pair (ISSUES.md C13; the requantized MobileNetV2 `Cout` 24 and `Cin`
+/// 1344 "anomalies"). The caller runs the returned job to completion --
+/// submit, wait, compact -- before asking for the next, which is exactly
+/// the ordering the barrier IREE recorded between them requires and the
+/// only one `execution_barrier` (a no-op here) could ever have meant.
+pub unsafe fn apply_ops_until_dispatch(
     command_buffer: *mut iree_hal_command_buffer_t,
-) -> Result<Vec<DispatchJob>, iree_status_t> {
+    cursor: &mut usize,
+) -> Result<Option<DispatchJob>, iree_status_t> {
     let cb = unsafe { &*cast(command_buffer) };
-    let mut dispatch_jobs = Vec::new();
-    for op in &cb.ops {
+    while let Some(op) = cb.ops.get(*cursor) {
+        *cursor += 1;
         // Indirect bindings (buffer == NULL, real buffer resolved from
         // binding_table.buffer_slot -- see command_buffer.h's own doc
         // comment on iree_hal_buffer_ref_t) aren't resolved anywhere in
@@ -1550,7 +1567,7 @@ pub unsafe fn apply_ops(
                         }
                     })
                     .collect();
-                dispatch_jobs.push(DispatchJob {
+                return Ok(Some(DispatchJob {
                     regcmd_tasks: regcmd_tasks.as_slice(),
                     dpu_mode: *dpu_mode,
                     precision_tag: *precision_tag,
@@ -1559,11 +1576,11 @@ pub unsafe fn apply_ops(
                     output_compaction: output_compaction.clone(),
                     profile_label: profile_label.as_str(),
                     task_targets,
-                });
+                }));
             }
         }
     }
-    Ok(dispatch_jobs)
+    Ok(None)
 }
 
 pub unsafe fn create(

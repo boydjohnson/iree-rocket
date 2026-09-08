@@ -142,7 +142,7 @@ max pooling, which closed with six matchers and no change below the compiler.
 
 | Capability | Plumbed through | What the spec does today |
 |---|---|---|
-| ~~Fused activation on a conv (`RELU`, `RELUX`)~~ | schema `Activation`; serializer parses `relu`/`relux`; driver `decode_activation`; HAL `Activation::{Relu, Clamped}`; `conv_activation_fused_hw`, `conv_fp16_bias_activation_hw` | **Done 2026-09-07 for fp16 ReLU6.** `#rocket_dynamic_relu6_target` plus `rocket-fuse-conv-relu6` and a DAG matcher claim 17 of MobileNetV2's 18 fusable sites; 146 -> 133 ms at four cores. The 18th is the stride-2 stem, and the int8 form is a different problem -- see below |
+| ~~Fused activation on a conv (`RELU`, `RELUX`)~~ | schema `Activation`; serializer parses `relu`/`relux`; driver `decode_activation`; HAL `Activation::{Relu, Clamped}`; `conv_activation_fused_hw`, `conv_fp16_bias_activation_hw` | **Done 2026-09-07 for fp16 ReLU6**, 17 of MobileNetV2's 18 fusable sites, 146 -> 133 ms at four cores. **Done 2026-09-08 for fp16 ReLU and for the bias alone**, on the f16-import chain too: ResNet50 230 -> 162 ms at four cores, 130 -> 22 CPU dispatch sites, and 32 of its 53 NPU results now feed another NPU dispatch directly (ISSUES.md P2). Still open: ReLU6 on an f16 import, the stride-2 stem, and the int8 form -- see below |
 | ~~Conv padding~~ | schema `pad_top`/`pad_left`; driver decode; serializer; `rocket-fold-conv-pad`; `#rocket_dynamic_pad1_target` and its stride-2 twin | **Done 2026-09-07, symmetric pad 1.** ResNet50 fp16 folds all 16 of its pad sites into the CNA: `slow_memcpy` executables 7 -> 0, CPU dispatch sites 186 -> 170, 230 -> 223 ms at four cores and 203.5 -> 195.5 at eight, output identical to the materialized-pad arm. MobileNetV2 is unchanged, and that is the point of the sizing note below -- it was the wrong model to measure this on. Asymmetric padding remains impossible: it is a hardware limit, not a wire one |
 | Unary EW: abs, neg, floor, ceil, add-with-scalar (fp16) | `ElementwiseUnaryDef` (tag 5), driver, serializer, `ew_unary_hw` | No matcher. No measured model contains one of these ops |
 | The nine LUT curves (int8) | `ElementwiseLutDef` (tag 6), driver, serializer, `lut_zero_join_hw` | No matcher. The LUT path is int8 by construction and the models' `sqrt`/`erf` are f32 |
@@ -741,13 +741,13 @@ rather than the 1792 every isolated instrument supports because the model
 says so: see ISSUES.md's "Cin 1344 is exact in every isolated test and wrong
 inside the model".
 
-The model also found a hardware limit no fixture had: **`Cout = 24` is wrong
-on the requantized path.** Admitting that one convolution moves the model's
-logits from max|diff| 0.40 to 4.71 and the mean from 0.07 to 0.99 against a
-logit standard deviation of 1.17 -- the output stops being a classification.
-`Cout` 88 is exact and is not a whole number of 16-channel atoms either, so
-the rule is not "whole atoms"; 24 is simply below the smallest `Cout`
-measured correct. Both requantized matchers now carry `umin = 32`.
+~~The model also found a hardware limit no fixture had: **`Cout = 24` is
+wrong on the requantized path.**~~ It was not a hardware limit and not a
+width: that convolution and the `Cin` 1344 one are the model's only two
+NPU -> NPU edges, and the driver packed the second dispatch's input before
+the first had written it (ISSUES.md **C13**, fixed 2026-09-08). Both
+requantized matchers now carry `umin = 16` and the 1x1 `Cin` bound is 1344;
+the model is max|diff| 0.35 against the CPU arm with both admitted.
 
 Two questions that looked like blockers and are not: the activations are ONNX
 `ui8`, but `quantized-conv-to-conv` has already folded the unsigned-to-signed

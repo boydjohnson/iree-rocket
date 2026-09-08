@@ -179,7 +179,10 @@ Parallelism comes from dispatches whose semaphores are independently
 satisfied: separate command buffers (every NPU dispatch is its own command
 buffer under the two-device setup) and, within one command buffer, groups
 separated by recorded `execution_barrier`s. Today the driver records
-barriers as no-ops and replays in call order; M1 honours them as
+barriers as no-ops and replays in call order -- and, since ISSUES.md C13
+(2026-09-08), *prepares* in call order too: a dispatch's operands are packed
+only after the dispatch before it has compacted, which is the one thing a
+barrier between two dependent dispatches has to mean. M1 honours them as
 group boundaries (dispatches between two barriers are independent, per
 IREE's own semantics). Chained CNN dispatches stay serial at this level;
 ViT's Q/K/V projections and the residual branches fan out.

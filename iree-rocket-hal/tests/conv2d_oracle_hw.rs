@@ -1943,6 +1943,22 @@ fn dtype_boundary_probe() {
     let pattern = match std::env::var("ROCKET_DTYPE_SWEEP_PATTERN").as_deref() {
         Ok("counting") => OraclePattern::Counting,
         Ok("dense") => OraclePattern::Dense { phase: 1 },
+        // `magnitude:<input>`: every input at `<input>`, every weight one, so
+        // the accumulator is `taps * Cin * input` and a sweep over `Cin`
+        // walks its magnitude past a datapath width. See
+        // `OraclePattern::Magnitude`.
+        Ok(spec) if spec.starts_with("magnitude:") => {
+            let mut fields = spec["magnitude:".len()..].split(':');
+            let mut field = || {
+                fields
+                    .next()
+                    .map(|value| value.parse::<i32>().expect("integer"))
+            };
+            OraclePattern::Magnitude {
+                input: field().expect("ROCKET_DTYPE_SWEEP_PATTERN=magnitude:<input>[:<bias>]"),
+                bias: field().unwrap_or(0),
+            }
+        }
         // A read map: with `Cout == Cin` every output channel copies one
         // input channel, and the input encodes its own NHWC linear index,
         // so a wrong value says *where* the CNA read from. The only pattern

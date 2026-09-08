@@ -1641,19 +1641,7 @@ unsafe extern "C" fn queue_execute(
                 // the first thing to know before optimizing anything inside it.
                 crate::profile::mark_outside_start();
                 let execute_timer = crate::profile::start();
-                let cmds = if command_buffer.is_null() {
-                    Vec::new()
-                } else {
-                    match unsafe { crate::command_buffer::apply_ops(command_buffer) } {
-                        Ok(cmds) => cmds,
-                        Err(st) => {
-                            unsafe {
-                                crate::bindings::iree_hal_command_buffer_release(command_buffer)
-                            };
-                            return st;
-                        }
-                    }
-                };
+                let mut cursor = 0usize;
                 let result = 'result: {
                     // Each recorded dispatch is submitted and fenced as its own
                     // independent hardware job, in call order -- same reasoning
@@ -1663,7 +1651,31 @@ unsafe extern "C" fn queue_execute(
                     // dispatch-to-dispatch granularity. Each dispatch reloads
                     // its own weights/CBUF state, so no state needs to survive
                     // between jobs.
-                    for job in cmds.iter().filter(|j| !j.regcmd_tasks.is_empty()) {
+                    //
+                    // And each is *prepared* in call order too: the next
+                    // dispatch's operands are packed only after this one has
+                    // compacted, because the next one may read what this one
+                    // wrote (`apply_ops_until_dispatch`). Packing every
+                    // dispatch up front handed a chained dispatch an
+                    // all-zero input -- ISSUES.md C13.
+                    loop {
+                        let job = if command_buffer.is_null() {
+                            None
+                        } else {
+                            match unsafe {
+                                crate::command_buffer::apply_ops_until_dispatch(
+                                    command_buffer,
+                                    &mut cursor,
+                                )
+                            } {
+                                Ok(job) => job,
+                                Err(st) => break 'result st,
+                            }
+                        };
+                        let Some(job) = job else { break };
+                        if job.regcmd_tasks.is_empty() {
+                            continue;
+                        }
                         // The dwell is computed under the lock and slept outside
                         // it, so a context dwelling never holds up another's
                         // submit. Any context's depthwise completion counts.

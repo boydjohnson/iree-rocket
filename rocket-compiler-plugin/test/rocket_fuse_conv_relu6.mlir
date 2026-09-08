@@ -332,3 +332,129 @@ util.func public @conv_relu6_f32_declines(%input: tensor<1x14x14x88xf32>,
   } -> tensor<1x14x14x528xf32>
   util.return %clamped : tensor<1x14x14x528xf32>
 }
+
+// The f16-import chain, as ResNet50 arrives: the bias init is
+// transpose(broadcast(extf(bias))), the accumulator is narrowed to f16 by a
+// generic, and the ReLU is a cmpf ugt / select in f16 against a *captured*
+// scalar constant. The clamp moves onto the BN stage as maximumf on the f32
+// accumulator, the narrow is re-emitted after the fused epilogue, and the
+// f16 clamp is gone.
+
+// CHECK-LABEL: util.func public @conv_relu_f16_import
+// CHECK: %[[FILL:.+]] = linalg.fill
+// CHECK: %[[CONV:.+]] = linalg.conv_2d_nhwc_hwcf
+// CHECK-SAME: outs(%[[FILL]]
+// CHECK: linalg.generic
+// CHECK-SAME: ins(%[[CONV]], %{{.+}}, %{{.+}} : tensor<1x56x56x64xf32>, tensor<64xf32>, f32)
+// CHECK: arith.addf
+// CHECK-NEXT: arith.maximumf
+// CHECK-NOT: arith.minimumf
+// CHECK: tensor.expand_shape
+// CHECK: arith.truncf
+// CHECK-NOT: arith.select
+util.func public @conv_relu_f16_import(%input: tensor<1x56x56x64xf16>,
+                                       %filter: tensor<1x1x64x64xf16>,
+                                       %bias_f16: tensor<64xf16>)
+    -> tensor<1x1x56x56x64xf16> {
+  %cst = arith.constant 0.000000e+00 : f16
+  %bias_empty = tensor.empty() : tensor<64xf32>
+  %bias = linalg.generic {
+      indexing_maps = [affine_map<(d0) -> (d0)>, affine_map<(d0) -> (d0)>],
+      iterator_types = ["parallel"]}
+      ins(%bias_f16 : tensor<64xf16>) outs(%bias_empty : tensor<64xf32>) {
+  ^bb0(%in: f16, %out: f32):
+    %0 = arith.extf %in : f16 to f32
+    linalg.yield %0 : f32
+  } -> tensor<64xf32>
+  %nchw_empty = tensor.empty() : tensor<1x64x56x56xf32>
+  %bias_nchw = linalg.broadcast ins(%bias : tensor<64xf32>)
+      outs(%nchw_empty : tensor<1x64x56x56xf32>) dimensions = [0, 2, 3]
+  %init_empty = tensor.empty() : tensor<1x56x56x64xf32>
+  %init = linalg.transpose ins(%bias_nchw : tensor<1x64x56x56xf32>)
+      outs(%init_empty : tensor<1x56x56x64xf32>) permutation = [0, 2, 3, 1]
+  %conv = linalg.conv_2d_nhwc_hwcf
+      {dilations = dense<1> : vector<2xi64>, strides = dense<1> : vector<2xi64>}
+      ins(%input, %filter : tensor<1x56x56x64xf16>, tensor<1x1x64x64xf16>)
+      outs(%init : tensor<1x56x56x64xf32>) -> tensor<1x56x56x64xf32>
+  %expanded = tensor.expand_shape %conv [[0], [1, 2], [3], [4]]
+      output_shape [1, 1, 56, 56, 64]
+      : tensor<1x56x56x64xf32> into tensor<1x1x56x56x64xf32>
+  %narrow_empty = tensor.empty() : tensor<1x1x56x56x64xf16>
+  %narrowed = linalg.generic {
+      indexing_maps = [affine_map<(d0, d1, d2, d3, d4) -> (d0, d1, d2, d3, d4)>,
+                       affine_map<(d0, d1, d2, d3, d4) -> (d0, d1, d2, d3, d4)>],
+      iterator_types = ["parallel", "parallel", "parallel", "parallel", "parallel"]}
+      ins(%expanded : tensor<1x1x56x56x64xf32>)
+      outs(%narrow_empty : tensor<1x1x56x56x64xf16>) {
+  ^bb0(%in: f32, %out: f16):
+    %0 = arith.truncf %in : f32 to f16
+    linalg.yield %0 : f16
+  } -> tensor<1x1x56x56x64xf16>
+  %relu_empty = tensor.empty() : tensor<1x1x56x56x64xf16>
+  %relu = linalg.generic {
+      indexing_maps = [affine_map<(d0, d1, d2, d3, d4) -> (d0, d1, d2, d3, d4)>,
+                       affine_map<(d0, d1, d2, d3, d4) -> (d0, d1, d2, d3, d4)>],
+      iterator_types = ["parallel", "parallel", "parallel", "parallel", "parallel"]}
+      ins(%narrowed : tensor<1x1x56x56x64xf16>)
+      outs(%relu_empty : tensor<1x1x56x56x64xf16>) {
+  ^bb0(%in: f16, %out: f16):
+    %0 = arith.cmpf ugt, %in, %cst : f16
+    %1 = arith.select %0, %in, %cst : f16
+    linalg.yield %1 : f16
+  } -> tensor<1x1x56x56x64xf16>
+  util.return %relu : tensor<1x1x56x56x64xf16>
+}
+
+// A convolution with a per-channel bias and no activation: the bias alone
+// moves onto the BS plane, so the shim no longer adds it on the CPU. The
+// consumers are untouched.
+
+// CHECK-LABEL: util.func public @conv_bias_only
+// CHECK: %[[FILL:.+]] = linalg.fill
+// CHECK: %[[CONV:.+]] = linalg.conv_2d_nhwc_hwcf
+// CHECK-SAME: outs(%[[FILL]]
+// CHECK: linalg.generic
+// CHECK-SAME: ins(%[[CONV]], %{{.+}} : tensor<1x56x56x256xf32>, tensor<256xf32>)
+// CHECK: arith.addf
+// CHECK-NEXT: linalg.yield
+// CHECK: tensor.expand_shape
+util.func public @conv_bias_only(%input: tensor<1x56x56x64xf16>,
+                                 %filter: tensor<1x1x64x256xf16>,
+                                 %bias: tensor<256xf32>)
+    -> tensor<1x1x56x56x256xf32> {
+  %nchw_empty = tensor.empty() : tensor<1x256x56x56xf32>
+  %bias_nchw = linalg.broadcast ins(%bias : tensor<256xf32>)
+      outs(%nchw_empty : tensor<1x256x56x56xf32>) dimensions = [0, 2, 3]
+  %init_empty = tensor.empty() : tensor<1x56x56x256xf32>
+  %init = linalg.transpose ins(%bias_nchw : tensor<1x256x56x56xf32>)
+      outs(%init_empty : tensor<1x56x56x256xf32>) permutation = [0, 2, 3, 1]
+  %conv = linalg.conv_2d_nhwc_hwcf
+      {dilations = dense<1> : vector<2xi64>, strides = dense<1> : vector<2xi64>}
+      ins(%input, %filter : tensor<1x56x56x64xf16>, tensor<1x1x64x256xf16>)
+      outs(%init : tensor<1x56x56x256xf32>) -> tensor<1x56x56x256xf32>
+  %expanded = tensor.expand_shape %conv [[0], [1, 2], [3], [4]]
+      output_shape [1, 1, 56, 56, 256]
+      : tensor<1x56x56x256xf32> into tensor<1x1x56x56x256xf32>
+  util.return %expanded : tensor<1x1x56x56x256xf32>
+}
+
+// A 7x7 filter has no fused target, so it is left with its bias init: a
+// convolution the matchers cannot claim keeps the form the CPU fuses best.
+
+// CHECK-LABEL: util.func public @conv_bias_7x7_declines
+// CHECK-NOT: linalg.fill
+// CHECK: linalg.conv_2d_nhwc_hwcf
+// CHECK-NOT: arith.addf
+util.func public @conv_bias_7x7_declines(%input: tensor<1x230x230x3xf16>,
+                                         %filter: tensor<7x7x3x64xf16>,
+                                         %bias: tensor<64xf32>)
+    -> tensor<1x112x112x64xf32> {
+  %init_empty = tensor.empty() : tensor<1x112x112x64xf32>
+  %init = linalg.broadcast ins(%bias : tensor<64xf32>)
+      outs(%init_empty : tensor<1x112x112x64xf32>) dimensions = [0, 1, 2]
+  %conv = linalg.conv_2d_nhwc_hwcf
+      {dilations = dense<1> : vector<2xi64>, strides = dense<2> : vector<2xi64>}
+      ins(%input, %filter : tensor<1x230x230x3xf16>, tensor<7x7x3x64xf16>)
+      outs(%init : tensor<1x112x112x64xf32>) -> tensor<1x112x112x64xf32>
+  util.return %conv : tensor<1x112x112x64xf32>
+}

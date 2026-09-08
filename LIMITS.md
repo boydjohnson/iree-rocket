@@ -490,20 +490,29 @@ epsilon.
 Being inside every bound above is necessary, not sufficient. These are the
 known ways a shape in range still misbehaves.
 
-- **An 11/1 CBUF split with a large coefficient footprint was measured to
-  produce silently all-zero output.** `Cin`=256/`Cout`=256/3x3 -- comfortably
-  inside the matcher bounds -- was deterministically all-zero (0/5) at every
-  spatial extent from 26x26 to 48x48, while extents 20-24 and 50-58 at the
-  *same* channel counts passed 5/5, with the pass/fail boundary on `ConvPlan`'s
-  split-flip points. `Cin`=3/`Cout`=64 also gets an 11/1 split and is fine, so
-  the discriminator is the split *combined with* a large coefficient footprint.
-  **Status is unclear and that is the hazard**: the finding survives only as a
-  comment in `@match_dynamic_conv2d_3x3` in the transform spec, the
-  `conv_cbuf_split_sweep_hw.rs` and `DESIGN_NOTES.md` that comment cites are
-  both gone from this tree, and ISSUES.md tracks it nowhere. The 3x3 matcher's
-  `Cout` bound has since been widened from 256 to 1792, so the "safe for VGG"
-  reasoning in that comment no longer describes the bounds in force. Re-measure
-  before trusting a 3x3 shape near an 11/1 split.
+- ~~**An 11/1 CBUF split with a large coefficient footprint was measured to
+  produce silently all-zero output.**~~ **Closed 2026-09-08, ISSUES.md C12.**
+  `Cin`=256/`Cout`=256/3x3 at 26x26 through 48x48 was all-zero on an early
+  planner that granted that shape a single coefficient bank. The planner has
+  granted the streamed working set -- five banks here, a 7/5 split at every
+  extent from 20 to 58 -- since `streamed_weight_bank_preference` landed, and
+  the shape is exact on `planck` at every one of those extents, fp16 and
+  int8, under `selectors` and `dense`. Forcing the old split back
+  (`ROCKET_CBUF_SPLIT=11/1`, and 10/2) is a watchdog kill with the output
+  unwritten, not a silent completion; 9/3 and 8/4 are exact. So the
+  "all-zero output" was a pre-C3 harness reading a killed job as a result,
+  and the fault was the grant, not the shape -- the same class as C9.
+  `dense_k3_plan_never_starves_the_streamed_coefficient_working_set` pins the
+  grant on the host, and a compiled model has no wire field that can force a
+  split, so `ConvPlan::new` is the only path it can take.
+- ~~**Two Rocket dispatches in one command buffer, the second reading the
+  first's output, computed on a zero input.**~~ **Fixed 2026-09-08, ISSUES.md
+  C13.** The driver packed every dispatch's operands before running any, so
+  a chained pair -- which IREE emits whenever nothing on the CPU sits between
+  two offloaded ops -- packed the transient before it was written. This is
+  what the requantized path's `Cin` 816 and `Cout` 32 bounds were really
+  measuring; they are 1344 and 16 now. `requant_int8_chain` in the compiled
+  conv gate is the regression case.
 - **`Cin > 4` and `Cin <= 4` take different feature paths**, and the dense
   ARGB path silently corrupts multi-row fetches at some alignments;
   `Shape::dense_feature_offset_safe` is the hardware-measured guard.

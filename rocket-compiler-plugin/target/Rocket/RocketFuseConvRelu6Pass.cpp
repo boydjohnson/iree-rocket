@@ -484,16 +484,273 @@ struct FuseConvRelu6 : public OpRewritePattern<ConvOp> {
   }
 };
 
+/// The ReLU body the ONNX importer emits, in f16 or f32:
+///
+///   %c = arith.cmpf ugt, %x, %zero
+///   %s = arith.select %c, %x, %zero
+///   linalg.yield %s
+///
+/// `zero` is either an `ins` operand or a constant captured from outside the
+/// region -- the f16-import pipeline produces the captured spelling, with a
+/// scalar `arith.constant 0.0 : f16` shared by every ReLU in the function.
+/// Returns the zero value, or nullopt on any deviation.
+static std::optional<Value> matchReluBody(linalg::GenericOp op) {
+  if (op.getNumDpsInputs() != 1) {
+    return std::nullopt;
+  }
+  Block &body = op.getRegion().front();
+  auto it = body.begin();
+  auto cmp = (it != body.end()) ? dyn_cast<arith::CmpFOp>(&*it) : nullptr;
+  if (!cmp) {
+    return std::nullopt;
+  }
+  ++it;
+  auto select = (it != body.end()) ? dyn_cast<arith::SelectOp>(&*it) : nullptr;
+  if (!select) {
+    return std::nullopt;
+  }
+  ++it;
+  if (it == body.end() || !isa<linalg::YieldOp>(*it) ||
+      std::next(it) != body.end()) {
+    return std::nullopt;
+  }
+  Value value = body.getArgument(0);
+  Value zero = cmp.getRhs();
+  if (cmp.getPredicate() != arith::CmpFPredicate::UGT || cmp.getLhs() != value ||
+      select.getCondition() != cmp.getResult() ||
+      select.getTrueValue() != value || select.getFalseValue() != zero ||
+      cast<linalg::YieldOp>(*it).getOperand(0) != select.getResult()) {
+    return std::nullopt;
+  }
+  return zero;
+}
+
+/// Whether `zero`, as used by `op`'s body, is the constant 0.0 in either
+/// spelling `matchReluBody` accepts.
+static bool isZeroFor(linalg::GenericOp op, Value zero) {
+  if (Value operand = insOperandFor(op, zero)) {
+    std::optional<double> value = constantSplatFloat(operand);
+    return value && *value == 0.0;
+  }
+  std::optional<double> value = constantSplatFloat(zero);
+  return value && *value == 0.0;
+}
+
+/// A one-input elementwise generic whose whole body is one `arith.truncf`
+/// -- the narrowing an f16 import puts behind every convolution, since the
+/// convolution accumulates in f32 and the model carries f16.
+static bool isTruncfGeneric(linalg::GenericOp op) {
+  if (!isElementwiseGeneric(op) || op.getNumDpsInputs() != 1) {
+    return false;
+  }
+  Block &body = op.getRegion().front();
+  auto it = body.begin();
+  if (it == body.end() || !isa<arith::TruncFOp>(*it)) {
+    return false;
+  }
+  auto truncf = cast<arith::TruncFOp>(*it);
+  ++it;
+  return it != body.end() && isa<linalg::YieldOp>(*it) &&
+         std::next(it) == body.end() &&
+         truncf.getOperand() == body.getArgument(0) &&
+         cast<linalg::YieldOp>(*it).getOperand(0) == truncf.getResult();
+}
+
+/// Whether this is a dense convolution the fused-epilogue targets exist for:
+/// a 1x1 or 3x3 filter at stride 1 or 2, f16 in, f32 out. The depthwise
+/// forms keep their own matchers and are left to the ReLU6 pattern only.
+static bool isFusableDenseConv(linalg::Conv2DNhwcHwcfOp conv) {
+  auto convType = dyn_cast<RankedTensorType>(conv->getResult(0).getType());
+  if (!convType || !convType.getElementType().isF32()) {
+    return false;
+  }
+  for (Value input : conv.getDpsInputs()) {
+    auto inputType = dyn_cast<RankedTensorType>(input.getType());
+    if (!inputType || !inputType.getElementType().isF16()) {
+      return false;
+    }
+  }
+  auto filterType = cast<RankedTensorType>(conv.getDpsInputs()[1].getType());
+  int64_t kh = filterType.getDimSize(0);
+  int64_t kw = filterType.getDimSize(1);
+  if (!((kh == 1 && kw == 1) || (kh == 3 && kw == 3))) {
+    return false;
+  }
+  SmallVector<int64_t> strides(conv.getStrides().getValues<int64_t>());
+  return strides.size() == 2 && strides[0] == strides[1] &&
+         (strides[0] == 1 || strides[0] == 2);
+}
+
+/// Builds the canonical fused epilogue for `conv`: a clone of the
+/// convolution over a zero init, then one generic adding the per-channel
+/// `bias` and, when `relu` is set, clamping at zero. Returns the generic's
+/// f32 result. The insertion point is the caller's.
+static Value buildFusedEpilogue(PatternRewriter &rewriter, Location loc,
+                                linalg::Conv2DNhwcHwcfOp conv, Value bias,
+                                int64_t channelDim, bool relu) {
+  Value convResult = conv->getResult(0);
+  auto convType = cast<RankedTensorType>(convResult.getType());
+  int64_t rank = convType.getRank();
+  MLIRContext *context = rewriter.getContext();
+  AffineMap identity = rewriter.getMultiDimIdentityMap(rank);
+  AffineMap channel =
+      AffineMap::get(rank, 0, {rewriter.getAffineDimExpr(channelDim)}, context);
+  AffineMap scalar = AffineMap::get(rank, 0, context);
+  SmallVector<utils::IteratorType> iterators(rank,
+                                             utils::IteratorType::parallel);
+  SmallVector<OpFoldResult> sizes =
+      tensor::getMixedSizes(rewriter, loc, convResult);
+  Value zero = arith::ConstantOp::create(
+      rewriter, loc, rewriter.getF32FloatAttr(0.0f));
+  Value accEmpty = tensor::EmptyOp::create(rewriter, loc, sizes,
+                                           convType.getElementType());
+  Value accInit =
+      linalg::FillOp::create(rewriter, loc, ValueRange{zero},
+                             ValueRange{accEmpty})
+          .getResult(0);
+  auto rawConv =
+      cast<linalg::Conv2DNhwcHwcfOp>(rewriter.clone(*conv.getOperation()));
+  rawConv.getDpsInitsMutable().assign(accInit);
+  Value empty =
+      tensor::EmptyOp::create(rewriter, loc, sizes, convType.getElementType());
+  SmallVector<Value> inputs{rawConv->getResult(0), bias};
+  SmallVector<AffineMap> maps{identity, channel};
+  if (relu) {
+    inputs.push_back(zero);
+    maps.push_back(scalar);
+  }
+  maps.push_back(identity);
+  auto epilogue = linalg::GenericOp::create(
+      rewriter, loc, TypeRange{convType}, inputs, ValueRange{empty}, maps,
+      iterators, [&](OpBuilder &builder, Location nested, ValueRange args) {
+        Value result = arith::AddFOp::create(builder, nested, args[0], args[1]);
+        if (relu) {
+          result = arith::MaximumFOp::create(builder, nested, result, args[2]);
+        }
+        linalg::YieldOp::create(builder, nested, result);
+      });
+  return epilogue.getResult(0);
+}
+
+/// conv -> [transpose] -> [expand_shape] -> truncf -> relu, or
+/// conv -> [transpose] -> [expand_shape] -> relu, into
+/// conv(fill 0) -> generic(addf bias, maximumf 0) -> [relayouts] -> [truncf].
+///
+/// The f16-import chain is the interesting one: ResNet50's export narrows
+/// every convolution's f32 accumulator to f16 and clamps in f16. The clamp
+/// moves onto the NPU's BN stage and the narrowing stays, now reading the
+/// fused generic; the matched shim widens the NPU's f16 result back to f32
+/// with a `linalg.generic`, and that widen and this narrow cancel once the
+/// wrapper is inlined -- which is what leaves two Rocket dispatches touching
+/// and lets the driver chain them (ISSUES.md P2).
+struct FuseConvRelu : public OpRewritePattern<linalg::Conv2DNhwcHwcfOp> {
+  FuseConvRelu(MLIRContext *context)
+      : OpRewritePattern<linalg::Conv2DNhwcHwcfOp>(context, /*benefit=*/2) {}
+  LogicalResult matchAndRewrite(linalg::Conv2DNhwcHwcfOp conv,
+                                PatternRewriter &rewriter) const override {
+    if (conv.getNumResults() != 1 || !isFusableDenseConv(conv)) {
+      return failure();
+    }
+    Value convResult = conv->getResult(0);
+    Operation *consumer = soleConsumer(convResult);
+    if (!consumer) {
+      return failure();
+    }
+    auto transpose = dyn_cast<linalg::TransposeOp>(consumer);
+    if (transpose) {
+      consumer = soleConsumer(transpose.getResult()[0]);
+      if (!consumer) {
+        return failure();
+      }
+    }
+    auto expand = dyn_cast<tensor::ExpandShapeOp>(consumer);
+    if (expand) {
+      consumer = soleConsumer(expand.getResult());
+      if (!consumer) {
+        return failure();
+      }
+    }
+    linalg::GenericOp narrow;
+    auto generic = dyn_cast<linalg::GenericOp>(consumer);
+    if (generic && isTruncfGeneric(generic)) {
+      narrow = generic;
+      consumer = soleConsumer(narrow.getResult(0));
+      generic = consumer ? dyn_cast<linalg::GenericOp>(consumer) : nullptr;
+    }
+    if (!generic || !isElementwiseGeneric(generic)) {
+      return failure();
+    }
+    std::optional<Value> zero = matchReluBody(generic);
+    if (!zero || !isZeroFor(generic, *zero)) {
+      return failure();
+    }
+    int64_t channelDim = 0;
+    Value bias = matchPerChannelBias(conv.getDpsInits()[0], channelDim);
+    if (!bias) {
+      return failure();
+    }
+    Location loc = conv.getLoc();
+    rewriter.setInsertionPoint(generic);
+    Value result =
+        buildFusedEpilogue(rewriter, loc, conv, bias, channelDim, /*relu=*/true);
+    if (transpose) {
+      IRMapping mapping;
+      mapping.map(transpose.getInput(), result);
+      result = rewriter.clone(*transpose.getOperation(), mapping)->getResult(0);
+    }
+    if (expand) {
+      IRMapping mapping;
+      mapping.map(expand.getSrc(), result);
+      result = rewriter.clone(*expand.getOperation(), mapping)->getResult(0);
+    }
+    if (narrow) {
+      IRMapping mapping;
+      mapping.map(narrow.getDpsInputs()[0], result);
+      result = rewriter.clone(*narrow.getOperation(), mapping)->getResult(0);
+    }
+    rewriter.replaceOp(generic, result);
+    return success();
+  }
+};
+
+/// Every other dense fp16 convolution seeded with a per-channel bias:
+/// conv(bias init) -> conv(fill 0) -> generic(addf bias). The consumers are
+/// untouched. This is the bias moving onto the BS plane for the convolutions
+/// that have no activation to fuse, so their shim no longer adds it on the
+/// CPU against a full-size hoisted bias tensor. Lowest benefit, so the
+/// activation patterns get first refusal on the same convolution.
+struct FuseConvBias : public OpRewritePattern<linalg::Conv2DNhwcHwcfOp> {
+  FuseConvBias(MLIRContext *context)
+      : OpRewritePattern<linalg::Conv2DNhwcHwcfOp>(context, /*benefit=*/1) {}
+  LogicalResult matchAndRewrite(linalg::Conv2DNhwcHwcfOp conv,
+                                PatternRewriter &rewriter) const override {
+    if (conv.getNumResults() != 1 || !isFusableDenseConv(conv)) {
+      return failure();
+    }
+    int64_t channelDim = 0;
+    Value bias = matchPerChannelBias(conv.getDpsInits()[0], channelDim);
+    if (!bias) {
+      return failure();
+    }
+    rewriter.setInsertionPoint(conv);
+    Value result = buildFusedEpilogue(rewriter, conv.getLoc(), conv, bias,
+                                      channelDim, /*relu=*/false);
+    rewriter.replaceOp(conv, result);
+    return success();
+  }
+};
+
 struct RocketFuseConvRelu6Pass
     : public PassWrapper<RocketFuseConvRelu6Pass, OperationPass<>> {
   MLIR_DEFINE_EXPLICIT_INTERNAL_INLINE_TYPE_ID(RocketFuseConvRelu6Pass)
 
   StringRef getArgument() const final { return "rocket-fuse-conv-relu6"; }
   StringRef getDescription() const final {
-    return "Rewrites an fp16 convolution and the ReLU6 that follows it into "
-           "the two-op canonical form the fused-activation matcher claims, "
-           "moving the clamp in front of the channels-last reshape and its "
-           "bounds from splat tensors to scalar operands.";
+    return "Rewrites an fp16 convolution and its epilogue -- a ReLU6, a ReLU "
+           "behind an f16 narrowing, or a bare per-channel bias -- into the "
+           "two-op canonical forms the fused-epilogue matchers claim, with "
+           "the bias lifted onto the BS plane and the clamp bounds as scalar "
+           "operands.";
   }
 
   void getDependentDialects(DialectRegistry &registry) const final {
@@ -506,7 +763,9 @@ struct RocketFuseConvRelu6Pass
     RewritePatternSet patterns(context);
     patterns.add<FuseConvRelu6<linalg::Conv2DNhwcHwcfOp>,
                  FuseConvRelu6<linalg::DepthwiseConv2DNhwcHwcOp>,
-                 FuseConvRelu6<linalg::DepthwiseConv2DNchwChwOp>>(context);
+                 FuseConvRelu6<linalg::DepthwiseConv2DNchwChwOp>>(
+        context, /*benefit=*/3);
+    patterns.add<FuseConvRelu, FuseConvBias>(context);
     if (failed(applyPatternsGreedily(getOperation(), std::move(patterns)))) {
       return signalPassFailure();
     }

@@ -26,7 +26,10 @@ run but no compiled model can reach yet. One of its phases is gated on an
 issue here by name: P8's measured per-dispatch cost is why its coverage
 matchers land behind a flag. C5, which used to gate the LUT path in a compiled
 model, was resolved 2026-09-06, and C2 and P6 on 2026-09-07 -- see
-**Resolved**. ROADMAP's fused-activation row landed the same day, which is
+**Resolved**. C12 and C13 (2026-09-08) are there too: the one hazard
+LIMITS.md and DYNAMIC_SHAPES.md carried that this file did not, and the
+chained-dispatch fault behind P8's `Cin` 1344 anomaly and the `Cout` 24
+rule. ROADMAP's fused-activation row landed the same day, which is
 what moved P7's and P2's numbers below.
 
 Trimmed 2026-09-05: issues that are settled were cut down to one entry each
@@ -287,6 +290,100 @@ P7's `outside`. See P7 for the profile. Two things to carry into any attempt:
   biggest compaction, the one above, feeds a *depthwise* convolution — so it
   is not chainable at all until P7 moves. Sizing P2 against the whole 24.4 ms
   overstates what it can reach today.
+
+---
+
+**Sized on ResNet50 fp16, 2026-09-08 -- the model where the NPU wins.**
+The reach of chaining is the set of edges where one NPU dispatch feeds
+another with nothing between them, and on the current ResNet50 build that
+set is **empty**: all 51 NPU results feed the plain fp16 shim's CPU epilogue
+(`extf` + bias add against a full-size hoisted f32 bias tensor), then a
+second CPU dispatch (ReLU + `truncf`) before the next convolution, and the
+bottleneck outputs go through a CPU residual add as well. Measured from the
+per-op profile (`taskset -c 4-7`, rebuilt runtime, 245 ms/inference:
+`outside` 100.1, `wait.npu` 79.2, `compact` 28.6, `pack.input` 15.7) and
+split by the role each shape plays in a bottleneck:
+
+| edge class | calls/inf | `pack.input` | `compact` | `npu` |
+|---|---:|---:|---:|---:|
+| conv1 (1x1 in, reads the block input) | 16 | 8.6 | 4.1 | 23.8 |
+| conv2 (3x3) | 16 | 3.5 | 2.1 | 33.2 |
+| conv3 (1x1 out, feeds the residual add) | 13 | 1.3 | 8.9 | 10.7 |
+| conv3 + downsample at 56x56x64->256 | 4 | 1.1 | 12.6 | 6.0 |
+| downsample 56x56x256->512 s2 | 1 | 1.2 | 0.9 | 4.0 |
+
+So the order of work, with what each step is worth per inference:
+
+1. **Fuse the fp16 epilogue into the dispatch** -- bias on the BS plane for
+   every convolution and ReLU on the BN stage where the model has one. This
+   is the ReLU6 machinery generalised to `relu` and to bias-only, on the
+   f16-import chain (`truncf` then a `cmpf ugt`/`select` clamp) rather than
+   the demoted one. It is not chaining, but it is the prerequisite for it
+   *and* the larger lever: it removes two full-tensor CPU passes behind each
+   of 51 convolutions, most of the 100 ms `outside`, and leaves conv1 ->
+   conv2 -> conv3 as direct NPU -> NPU edges once the shim's `extf` and the
+   graph's `truncf` cancel.
+2. **Chaining on those edges** (the driver keeps conv1's and conv2's output
+   cube and conv2 and conv3 read it): `pack.input` 4.7 + `compact` 6.2 =
+   **10.9 ms**, 4.5 % of wall. Bounded by the fact that the *wide* tensors
+   (conv3's Cout 256..2048 outputs, 21.5 of the 28.6 ms of compaction) all
+   cross the residual add.
+3. **Residual add on the NPU** (`build_conv_then_add_regcmd`, ROADMAP Phase
+   3's epilogue field) makes every edge direct: the whole `pack.input` +
+   `compact` term, **~44 ms**, 18 % of wall, plus the 16 CPU adds.
+
+Nothing in this list is worth building before step 1, and step 1 pays on
+its own.
+
+**Step 1 landed 2026-09-08.** `rocket-fuse-conv-relu6` gained two patterns:
+bias-only (every dense fp16 1x1/3x3 convolution seeded with a per-channel
+bias now hands it to the BS plane through the plain executables' bias
+binding, which had only ever carried zeros) and bias + ReLU on the
+f16-import chain (`truncf` then `cmpf ugt`/`select`, the clamp moving onto
+the BN stage through four new `relu` targets: stride 1 and 2, with and
+without the folded pad 1). The shims widen with a `linalg.generic` rather
+than a pre-formed dispatch, so the widen and the model's own narrow cancel
+once the wrapper is inlined -- that is what makes the edge direct. Two
+match-loop facts fell out: an epilogue-rooted matcher must live in the
+first loop, and a conv-rooted one in the second, because the walk reaches
+the convolution before its epilogue and a conv-rooted matcher in the first
+loop pre-empts everything behind it (the pad-1 matchers moved for this).
+
+ResNet50 fp16 on `planck`, `taskset -c 4-7`, 3 repetitions, medians:
+
+| | dispatches (NPU / CPU) | NPU results feeding an NPU dispatch | ms |
+|---|---|---|---:|
+| before | 51 / 130 | 0 of 51 | 230 |
+| after | 53 / 22 | **32 of 53** | **162** |
+
+1.42x on the model, max|diff| 0.0116 against onnxruntime (the CPU arm is
+0.0151), same argmax and top-5; the CPU arm is 1035 ms. MobileNetV2 fp16
+(f32 import, the demoted spelling) is unchanged in placement at 37 sites,
+129 ms, max|diff| 0.028 against onnxruntime with the same top-5. Every
+conv1 -> conv2 -> conv3 edge is now NPU -> NPU with nothing between, which
+is exactly the set step 2 chains; what still crosses the CPU is the 16
+residual adds, the 7x7 stem, the padded max pool and the head.
+
+**Re-sized after step 1** (`ROCKET_PROFILE`, same build, per inference;
+the profiler inflates wall to 237 ms, composition only): `wait.npu` 108.2
+(46 %), `outside` 47.9, `compact` 37.0, `pack.input` 20.6. By role, the
+edges step 2 can chain are conv1 -> conv2 and conv2 -> conv3:
+
+| edge class | `pack.input` | `compact` |
+|---|---:|---:|
+| conv1 (reads the block input, from the CPU add) | 9.2 | 3.7 |
+| conv2 | 3.2 | 3.9 |
+| conv3 (feeds the CPU residual add) | 1.6 | 9.7 |
+| conv3 + downsample at 56x56x64->256 | 1.5 | 15.0 |
+
+So **step 2 is worth 12.4 ms**, 5 % of the profiled wall and at most 7 % of
+the real one: conv2's and conv3's packing plus conv1's and conv2's
+compaction. Three quarters of the remaining `compact` is conv3 writing the
+wide block output for the residual add, and half of `pack.input` is conv1
+reading it back, so **step 3 (the residual add on the NPU) is now the
+larger lever by four to one**: it unlocks ~57 ms of pack and compact plus
+the 16 CPU adds, against step 2's 12. Build step 3 first, and step 2 on
+the edges it leaves.
 
 ---
 
@@ -888,6 +985,12 @@ asserting the dispatch reaches the *specific* executable, which
 
 ### Cin 1344 is exact in every isolated test and wrong inside the model
 
+**Resolved 2026-09-08 as C13 -- see Resolved.** It was never this
+convolution. The section below is kept as it was measured, because its
+method (every shape-level instrument exact, the model wrong) is what pointed
+at the chain rather than the dispatch. The bound now ships at 1344 and the
+`Cout` floor at 16.
+
 Open, 2026-09-06. Raising the requantized matchers' `Cin` bound from 512 to
 1344 puts 32 of MobileNetV2-static-int8's 34 dense convolutions on the
 requantized path and **breaks the model**: logits go from max|diff| 0.33
@@ -1245,6 +1348,81 @@ What was settled and how, newest first, in place of the narratives — those are
 in this file's git history (`git log -p ISSUES.md`). Everything cited below is
 something that still exists: a commit, a file, or a memory.
 
+**C13 (S1) — 2026-09-08. A dispatch that consumed another dispatch's output
+in the same command buffer read it before it was written.** `apply_ops`
+walked the whole recorded command buffer up front -- packing every
+dispatch's input, then handing `queue_execute` the list of jobs to submit,
+wait on and compact -- so the second of two chained dispatches packed the
+transient before the first had compacted into it, and the hardware saw an
+all-zero input. IREE emits exactly that command buffer whenever two Rocket
+dispatches have nothing on the CPU between them: one `hal.command_buffer`,
+two dispatches, an `execution_barrier` the driver records as a no-op.
+
+This is what P8's `Cin` 1344 anomaly and the requantized path's "`Cout` 24
+is wrong" rule both were. Those two convolutions -- `1344 -> 448` and
+`48 -> 24` -- are MobileNetV2's only two projection layers whose output feeds
+the next convolution alone; every other projection also feeds a residual
+add, and every expansion or depthwise output passes through a CPU ReLU6.
+With both convolutions on the requantized path, the producer's s8->u8 shift,
+the consumer's u8->s8 shift and the transpose pair fold away and the two
+dispatches touch. Nothing else in any measured model does: fp16 convolutions
+keep a CPU bias or clamp between them, ViT's matmuls have adds between them,
+and the accumulator path always leaves an `i32` epilogue on the CPU. So the
+bug hid behind two channel bounds that happened to exclude exactly those
+edges.
+
+Found by elimination on the board. Every value-shaped hypothesis was refuted
+first with a new `magnitude` oracle pattern (constant input, unit weights,
+optional BS-plane bias): accumulators to 877,824, a cancelling bias of
+either magnitude, 0x80 feature bytes and the exact 7x7 `Cin` 1344 `Cout`
+448 shape are all exact on the requantized path, both signs. Then the
+structural one reproduced at `Cin` 64: `requant_int8_chain`, two 1x1
+convolutions with the first's output as the second's input, 4048/4096
+wrong (max error 181), and its output is bit-for-bit `requant(0 + bias)` --
+a zero input. `requant_int8_chain_cpu_between`, the same pair with one CPU
+clamp between them, is exact.
+
+Fixed in `rocket-hal-driver`: `apply_ops_until_dispatch` applies the
+recorded ops in call order and stops at each dispatch, and `queue_execute`
+runs that dispatch to completion before asking for the next. M2's batched
+tile submission inside a dispatch is untouched. Gates: the full compiled
+conv gate (28 cases, chain and control included), matmul and pooling e2e,
+and MobileNetV2-static-int8 with the requant bounds widened to `Cin` 1344
+and `Cout` >= 16 -- max|diff| **0.35** against the CPU arm, same argmax and
+top-5, where the same build was 5.01 / 4.71 and a different class. The CPU
+arm itself is bit-identical to onnxruntime. Both bounds ship widened.
+
+Two things worth keeping. **A hazard that hides behind a shape bound looks
+like a shape rule**: both "rules" were measurements of the same bug, taken
+on the only two shapes that exercised it. **And the model was the only
+instrument that could see it**, because every fixture in every gate ran one
+dispatch per function; chaining is now in the gate.
+
+**C12 (S1) — 2026-09-08. The "11/1 silent-zero" 3x3 hazard was a
+watchdog-killed job on a planner that no longer exists.** LIMITS.md's
+*Hazards inside the limits* carried, and DYNAMIC_SHAPES.md DS3 escalated,
+a finding this file never tracked: `Cin`=256/`Cout`=256/3x3 at 26x26 through
+48x48 deterministically all-zero on an 11/1 CBUF split, recorded in
+`@match_dynamic_conv2d_3x3`'s comment against a `Cout<=256` rule since widened
+to 1792, with both evidence files gone from the tree. Re-measured on `planck`,
+one extent per process: the current planner grants the shape **7/5 at every
+extent from 20 to 58** (the streamed working set is five banks), and every
+one is exact -- fp16 under `selectors` and `dense`, int8 under
+`selectors-affine`. Forcing the old split back with `ROCKET_CBUF_SPLIT` at
+30x30 brackets the mechanism: **9/3 and 8/4 exact, 10/2 and 11/1 a device
+timeout** with the output unwritten (`0xa5a5` sentinel, `tile_mismatches`
+covering every element), and the device clean afterwards. So the fault was a
+starved coefficient grant -- the same class as C9 -- and the "all-zero
+output" was the pre-C3 harness zero-filling a killed job and reading it as a
+shape result. `streamed_weight_bank_preference` has prevented the grant since
+it landed; `dense_k3_plan_never_starves_the_streamed_coefficient_working_set`
+now pins it across both precisions, `Cin` 64..512, `Cout` 64..512 and every
+even extent 8..64; no wire field can force a split, so a compiled model can
+only reach `ConvPlan::new`. No runtime refusal was needed. Spec comments (both
+copies), LIMITS.md and DYNAMIC_SHAPES.md corrected. Not a fix, a closure --
+which is the point: a hazard nothing tracked cost a doc a severity it had not
+had for a month.
+
 **C9 (S2) — 2026-09-07. Neither half was what it looked like.** The `Cin`
 cliff above 3x3 — a watchdog kill at ~500 ms, read as a hardware ceiling — was
 our own CBUF split. The above-3x3 policies are read off the fp16 capture sweep
@@ -1510,12 +1688,11 @@ Where the time actually is, per inference: `outside` **70.9 ms (54%)**,
    cost is concentrated in one convolution (5.4 ms, 30% of `compact`), and
    that convolution feeds a *depthwise* op, so it is not chainable until P7
    moves. Sizing P2 against the whole 24.4 ms overstates its reach.
-3. **P8's `Cin` 1344 anomaly** — the only open correctness unknown in this
-   file: exact in every isolated instrument, wrong inside the model, bisected
-   to one convolution, and currently capped by a measurement rather than an
-   explanation. It needs an instrument that compares *intermediate tensors*
-   inside a real model, which this repo does not have and has wanted more than
-   once. Ahead of P3/C4/P4/P1 on severity, behind P7/P2 on wall clock.
+3. ~~**P8's `Cin` 1344 anomaly**~~ — closed 2026-09-08 as **C13**: the
+   driver packed a chained dispatch's input before the dispatch ahead of it
+   had written it. Not a `Cin` rule, not a `Cout` rule; the two "anomalies"
+   were the model's only two NPU -> NPU edges. No open correctness unknown
+   remains in this file.
 4. **P3 → C4 → P4 → P1** — the dispatch-path cost stack, in increasing order
    of work. P3's second half is done (the scratch pool); what stands is the
    whole-BO cache sync, ∝ pages not bytes, which `MULTICORE.md` §12 also names
@@ -1532,7 +1709,7 @@ Where the time actually is, per inference: `outside` **70.9 ms (54%)**,
    tripled the above-3x3 `Cin` ceilings and one a retraction.
 
 Done and in **Resolved**: the requantized int8 path (2026-09-06), C2
-(2026-09-07), P6 (2026-09-07), C9 (2026-09-07).
+(2026-09-07), P6 (2026-09-07), C9 (2026-09-07), C12 and C13 (2026-09-08).
 
 ---
 
