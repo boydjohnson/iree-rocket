@@ -163,7 +163,7 @@ fn parse_options() -> Options {
             _ => usage(),
         }
     }
-    if options.contexts.iter().any(|&n| n == 0) || options.jobs == 0 {
+    if options.contexts.contains(&0) || options.jobs == 0 {
         usage();
     }
     options
@@ -477,7 +477,7 @@ impl Context {
         let mut wrong = 0usize;
         let mut sentinel = 0usize;
         let mut first: Option<(usize, f32)> = None;
-        for (index, pair) in self.compacted.chunks_exact(2).enumerate() {
+        for (index, pair) in self.compacted.as_chunks::<2>().0.iter().enumerate() {
             let bits = u16::from_le_bytes([pair[0], pair[1]]);
             let value = f16_to_f32(bits);
             if value != dispatch.expected_output {
@@ -623,10 +623,10 @@ fn run_arm(
         let jobs = options.jobs;
         let host_phases = options.host_phases;
         handles.push(std::thread::spawn(move || {
-            if let Some(cpu) = cpu {
-                if let Err(err) = pin_to_cpu(cpu) {
-                    eprintln!("warning: {err}");
-                }
+            if let Some(cpu) = cpu
+                && let Err(err) = pin_to_cpu(cpu)
+            {
+                eprintln!("warning: {err}");
             }
             let mut intervals = Vec::with_capacity(jobs * dispatch.programs.len());
             let mut phases = Phases::default();

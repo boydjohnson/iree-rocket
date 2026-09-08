@@ -28,8 +28,7 @@ use iree_rocket_hal::rocket::{
     tensor_layout::{pack_hwcf_to_rocket_weights, rocket_weight_storage_size},
 };
 use support::conv2d_oracle::{
-    f16_to_f32, f32_to_f16, feature_offset, input_storage_bytes, output_offset,
-    output_storage_bytes,
+    f16_to_f32, f32_to_f16, feature_offset, input_storage_bytes, output_storage_bytes,
 };
 
 const DEVICE_PATH: &str = "/dev/accel/accel0";

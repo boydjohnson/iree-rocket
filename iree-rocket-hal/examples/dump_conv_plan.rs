@@ -44,7 +44,7 @@ fn main() {
 
     println!(
         "{width}x{height} cin={cin} cout={cout} k={kernel} pad={}  out={}x{} data_banks={} weight_banks={} tiles={}",
-        padding.map_or(kernel / 2, |pad| pad),
+        padding.unwrap_or(kernel / 2),
         shape.output_width(kernels),
         shape.output_height(kernels),
         plan.data_banks(),

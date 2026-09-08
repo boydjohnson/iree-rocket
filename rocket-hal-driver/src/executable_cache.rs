@@ -89,6 +89,10 @@ fn decode_activation(
 /// its normalized fixed-point form can't encode -- wrapped in `catch_unwind`
 /// so a malformed but structurally valid FlatBuffer produces a clean decode
 /// error instead of aborting the process at this `extern "C"` boundary.
+// Each argument is an independent quantization field from the FlatBuffer
+// schema; a struct wrapper would just move the same fields into a
+// constructor.
+#[allow(clippy::too_many_arguments)]
 fn decode_precision(
     precision: schema::Precision,
     input_zero_point: u32,
@@ -612,6 +616,10 @@ status_stub!(infer_format(
     out_inferred_size: *mut iree_host_size_t,
 ) -> iree_status_t);
 
+/// # Safety
+///
+/// `executable_format.data` must be either null or valid for reads of
+/// `executable_format.size` bytes.
 #[allow(unused_variables)]
 pub unsafe extern "C" fn can_prepare_format(
     executable_cache: *mut iree_hal_executable_cache_t,

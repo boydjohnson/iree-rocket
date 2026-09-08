@@ -496,6 +496,12 @@ unsafe fn run_after_wait(
 
 /// Mirrors `iree_hal_null_device_create()`. `identifier` is borrowed only
 /// for the duration of this call (copied into the device's own storage).
+///
+/// # Safety
+///
+/// `create_params` must be a valid, non-null pointer to an initialized
+/// `iree_hal_device_create_params_t`, and `out_device` a valid, non-null
+/// pointer to write the result into.
 pub unsafe fn create(
     identifier: &[u8],
     create_params: *const iree_hal_device_create_params_t,
@@ -936,10 +942,8 @@ unsafe extern "C" fn queue_dealloca(
             // The caller retains its own reference and is still
             // responsible for eventually releasing `buffer`; this only
             // makes further queue ops against it correctly fail.
-            unsafe {
-                crate::buffer::mark_deallocated(buffer);
-                crate::bindings::iree_hal_buffer_release(buffer);
-            }
+            crate::buffer::mark_deallocated(buffer);
+            crate::bindings::iree_hal_buffer_release(buffer);
             status::ok()
         })
     }
@@ -986,20 +990,18 @@ unsafe extern "C" fn queue_fill(
     unsafe {
         run_after_wait(wait_semaphore_list, signal_semaphore_list, move |_sig| {
             let target_buffer = target_buffer.into_inner();
-            let st = unsafe {
-                if crate::buffer::is_deallocated(target_buffer) {
-                    status::from_code(iree_status_code_e_IREE_STATUS_INVALID_ARGUMENT)
-                } else {
-                    crate::bindings::iree_hal_buffer_map_fill(
-                        target_buffer,
-                        target_offset,
-                        length,
-                        pattern_buf.as_ptr() as *const std::ffi::c_void,
-                        pattern_length,
-                    )
-                }
+            let st = if crate::buffer::is_deallocated(target_buffer) {
+                status::from_code(iree_status_code_e_IREE_STATUS_INVALID_ARGUMENT)
+            } else {
+                crate::bindings::iree_hal_buffer_map_fill(
+                    target_buffer,
+                    target_offset,
+                    length,
+                    pattern_buf.as_ptr() as *const std::ffi::c_void,
+                    pattern_length,
+                )
             };
-            unsafe { crate::bindings::iree_hal_buffer_release(target_buffer) };
+            crate::bindings::iree_hal_buffer_release(target_buffer);
             st
         })
     }
@@ -1031,19 +1033,17 @@ unsafe extern "C" fn queue_update(
     unsafe {
         run_after_wait(wait_semaphore_list, signal_semaphore_list, move |_sig| {
             let target_buffer = target_buffer.into_inner();
-            let st = unsafe {
-                if crate::buffer::is_deallocated(target_buffer) {
-                    status::from_code(iree_status_code_e_IREE_STATUS_INVALID_ARGUMENT)
-                } else {
-                    crate::bindings::iree_hal_buffer_map_write(
-                        target_buffer,
-                        target_offset,
-                        source.as_ptr() as *const std::ffi::c_void,
-                        length,
-                    )
-                }
+            let st = if crate::buffer::is_deallocated(target_buffer) {
+                status::from_code(iree_status_code_e_IREE_STATUS_INVALID_ARGUMENT)
+            } else {
+                crate::bindings::iree_hal_buffer_map_write(
+                    target_buffer,
+                    target_offset,
+                    source.as_ptr() as *const std::ffi::c_void,
+                    length,
+                )
             };
-            unsafe { crate::bindings::iree_hal_buffer_release(target_buffer) };
+            crate::bindings::iree_hal_buffer_release(target_buffer);
             st
         })
     }
@@ -1072,25 +1072,21 @@ unsafe extern "C" fn queue_copy(
         run_after_wait(wait_semaphore_list, signal_semaphore_list, move |_sig| {
             let source_buffer = source_buffer.into_inner();
             let target_buffer = target_buffer.into_inner();
-            let st = unsafe {
-                if crate::buffer::is_deallocated(source_buffer)
-                    || crate::buffer::is_deallocated(target_buffer)
-                {
-                    status::from_code(iree_status_code_e_IREE_STATUS_INVALID_ARGUMENT)
-                } else {
-                    crate::bindings::iree_hal_buffer_map_copy(
-                        source_buffer,
-                        source_offset,
-                        target_buffer,
-                        target_offset,
-                        length,
-                    )
-                }
+            let st = if crate::buffer::is_deallocated(source_buffer)
+                || crate::buffer::is_deallocated(target_buffer)
+            {
+                status::from_code(iree_status_code_e_IREE_STATUS_INVALID_ARGUMENT)
+            } else {
+                crate::bindings::iree_hal_buffer_map_copy(
+                    source_buffer,
+                    source_offset,
+                    target_buffer,
+                    target_offset,
+                    length,
+                )
             };
-            unsafe {
-                crate::bindings::iree_hal_buffer_release(source_buffer);
-                crate::bindings::iree_hal_buffer_release(target_buffer);
-            }
+            crate::bindings::iree_hal_buffer_release(source_buffer);
+            crate::bindings::iree_hal_buffer_release(target_buffer);
             st
         })
     }
@@ -1127,19 +1123,15 @@ unsafe extern "C" fn queue_read(
         run_after_wait(wait_semaphore_list, signal_semaphore_list, move |_sig| {
             let source_file = source_file.into_inner();
             let target_buffer = target_buffer.into_inner();
-            let st = unsafe {
-                crate::bindings::iree_hal_file_read(
-                    source_file,
-                    source_offset,
-                    target_buffer,
-                    target_offset,
-                    length,
-                )
-            };
-            unsafe {
-                crate::bindings::iree_hal_file_release(source_file);
-                crate::bindings::iree_hal_buffer_release(target_buffer);
-            }
+            let st = crate::bindings::iree_hal_file_read(
+                source_file,
+                source_offset,
+                target_buffer,
+                target_offset,
+                length,
+            );
+            crate::bindings::iree_hal_file_release(source_file);
+            crate::bindings::iree_hal_buffer_release(target_buffer);
             st
         })
     }
@@ -1168,19 +1160,15 @@ unsafe extern "C" fn queue_write(
         run_after_wait(wait_semaphore_list, signal_semaphore_list, move |_sig| {
             let source_buffer = source_buffer.into_inner();
             let target_file = target_file.into_inner();
-            let st = unsafe {
-                crate::bindings::iree_hal_file_write(
-                    target_file,
-                    target_offset,
-                    source_buffer,
-                    source_offset,
-                    length,
-                )
-            };
-            unsafe {
-                crate::bindings::iree_hal_buffer_release(source_buffer);
-                crate::bindings::iree_hal_file_release(target_file);
-            }
+            let st = crate::bindings::iree_hal_file_write(
+                target_file,
+                target_offset,
+                source_buffer,
+                source_offset,
+                length,
+            );
+            crate::bindings::iree_hal_buffer_release(source_buffer);
+            crate::bindings::iree_hal_file_release(target_file);
             st
         })
     }
@@ -1322,6 +1310,9 @@ status_stub!(queue_dispatch(
 
 #[allow(unused_variables)]
 #[cfg(test)]
+// `as_chunks` would need every `bytes.try_into()` below re-typed for
+// marginal benefit on these numeric decode paths; not worth the churn.
+#[allow(clippy::chunks_exact_to_as_chunks)]
 mod device_tests {
     use super::{DEPTHWISE_TO_DENSE_QUIESCENCE, depthwise_to_dense_dwell};
     use crate::command_buffer::DpuMode;
@@ -1624,7 +1615,7 @@ unsafe extern "C" fn queue_execute(
             move |ctx| {
                 let device = device.into_inner();
                 let command_buffer = command_buffer.into_inner();
-                let d = unsafe { &*cast(device) };
+                let d = &*cast(device);
 
                 // Replay every recorded fill/update/copy (host-side, no
                 // hardware involved) and pull out every recorded `dispatch`'s
@@ -1662,12 +1653,10 @@ unsafe extern "C" fn queue_execute(
                         let job = if command_buffer.is_null() {
                             None
                         } else {
-                            match unsafe {
-                                crate::command_buffer::apply_ops_until_dispatch(
-                                    command_buffer,
-                                    &mut cursor,
-                                )
-                            } {
+                            match crate::command_buffer::apply_ops_until_dispatch(
+                                command_buffer,
+                                &mut cursor,
+                            ) {
                                 Ok(job) => job,
                                 Err(st) => break 'result st,
                             }
@@ -1721,13 +1710,11 @@ unsafe extern "C" fn queue_execute(
                         for (regcmd, target) in regcmd_tasks.iter().zip(&job.task_targets) {
                             let cmd_bytes = regcmd.len() * std::mem::size_of::<u64>();
                             let cmd_len = cmd_bytes.next_multiple_of(4096);
-                            cmd_bufs.push(unsafe {
-                                crate::scratch_pool::ScratchBuffer::new(
-                                    target.fd,
-                                    cmd_len,
-                                    std::os::fd::BorrowedFd::borrow_raw(target.fd),
-                                )
-                            });
+                            cmd_bufs.push(crate::scratch_pool::ScratchBuffer::new(
+                                target.fd,
+                                cmd_len,
+                                std::os::fd::BorrowedFd::borrow_raw(target.fd),
+                            ));
                         }
 
                         // The registers this dispatch's first task programs, as
@@ -1787,16 +1774,14 @@ unsafe extern "C" fn queue_execute(
                         for ((regcmd, cmd_buf), target) in
                             regcmd_tasks.iter().zip(&cmd_bufs).zip(&job.task_targets)
                         {
-                            unsafe {
-                                let cmd_slice = std::slice::from_raw_parts_mut(
-                                    cmd_buf.host_ptr as *mut u64,
-                                    regcmd.len(),
-                                );
-                                for (i, c) in regcmd.iter().enumerate() {
-                                    cmd_slice[i] = c.0;
-                                }
+                            let cmd_slice = std::slice::from_raw_parts_mut(
+                                cmd_buf.host_ptr as *mut u64,
+                                regcmd.len(),
+                            );
+                            for (i, c) in regcmd.iter().enumerate() {
+                                cmd_slice[i] = c.0;
                             }
-                            if unsafe { rocket_device::fini_bo(target.fd, cmd_buf.handle) }.is_err() {
+                            if rocket_device::fini_bo(target.fd, cmd_buf.handle).is_err() {
                                 break 'result status::from_code(
                                     iree_status_code_e_IREE_STATUS_UNAVAILABLE,
                                 );
@@ -1866,15 +1851,13 @@ unsafe extern "C" fn queue_execute(
                                 }
                             }
                             let submit_timer = crate::profile::start();
-                            if unsafe {
-                                rocket_device::submit(
-                                    target.fd,
-                                    regcmd_addr,
-                                    regcmd_count,
-                                    &in_handles,
-                                    &target.out_bo_handles,
-                                )
-                            }
+                            if rocket_device::submit(
+                                target.fd,
+                                regcmd_addr,
+                                regcmd_count,
+                                &in_handles,
+                                &target.out_bo_handles,
+                            )
                             .is_err()
                             {
                                 break 'result status::from_code(
@@ -1897,13 +1880,11 @@ unsafe extern "C" fn queue_execute(
                         let wait_timer = crate::profile::start();
                         for (target, submitted) in job.task_targets.iter().zip(&task_submitted) {
                             for &out_handle in &target.out_bo_handles {
-                                if unsafe {
-                                    rocket_device::prep_bo(
-                                        target.fd,
-                                        out_handle,
-                                        DISPATCH_COMPLETION_TIMEOUT_NS,
-                                    )
-                                }
+                                if rocket_device::prep_bo(
+                                    target.fd,
+                                    out_handle,
+                                    DISPATCH_COMPLETION_TIMEOUT_NS,
+                                )
                                 .is_err()
                                 {
                                     break 'result status::from_code(
@@ -1995,16 +1976,13 @@ unsafe extern "C" fn queue_execute(
                                     iree_status_code_e_IREE_STATUS_INTERNAL,
                                 );
                             }
-                            let scratch = unsafe {
-                                std::slice::from_raw_parts(oc.scratch_ptr, oc.scratch_length)
-                            };
-                            let out_rb = unsafe { &*(oc.output_buffer as *const RocketBuffer) };
-                            let dst = unsafe {
-                                std::slice::from_raw_parts_mut(
-                                    out_rb.host_ptr.add(oc.output_offset),
-                                    expected_bytes,
-                                )
-                            };
+                            let scratch =
+                                std::slice::from_raw_parts(oc.scratch_ptr, oc.scratch_length);
+                            let out_rb = &*(oc.output_buffer as *const RocketBuffer);
+                            let dst = std::slice::from_raw_parts_mut(
+                                out_rb.host_ptr.add(oc.output_offset),
+                                expected_bytes,
+                            );
                             let written = if !oc.tile_rects.is_empty() {
                                 // Fanned out: every tile's rows come from the
                                 // scratch of the context that ran it. The
@@ -2016,7 +1994,7 @@ unsafe extern "C" fn queue_execute(
                                         scratch
                                     } else {
                                         let (ptr, len) = oc.replica_scratch[context - 1];
-                                        unsafe { std::slice::from_raw_parts(ptr as *const u8, len) }
+                                        std::slice::from_raw_parts(ptr as *const u8, len)
                                     };
                                     written += if let Some(tiles) = &oc.source_tiles {
                                         compact_tiled_accumulator_output(
@@ -2070,7 +2048,7 @@ unsafe extern "C" fn queue_execute(
                             // The one write to an IREE buffer that does not go
                             // through a mapping, so the one the packed-coefficient
                             // cache's generation has to be told about explicitly.
-                            unsafe { crate::buffer::note_write(oc.output_buffer) };
+                            crate::buffer::note_write(oc.output_buffer);
                             crate::profile::stop(
                                 compact_timer,
                                 crate::profile::Phase::Compact,
@@ -2094,7 +2072,7 @@ unsafe extern "C" fn queue_execute(
                 );
                 crate::profile::mark_outside_end();
                 if !command_buffer.is_null() {
-                    unsafe { crate::bindings::iree_hal_command_buffer_release(command_buffer) };
+                    crate::bindings::iree_hal_command_buffer_release(command_buffer);
                 }
                 result
             },

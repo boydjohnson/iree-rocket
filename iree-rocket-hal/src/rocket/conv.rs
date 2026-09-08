@@ -2202,7 +2202,7 @@ impl Shape {
             self.precision.element_bits(),
         );
         assert!(
-            streamed_preference <= CBUF_BANKS - 1,
+            streamed_preference < CBUF_BANKS,
             "coefficient working set wants {streamed_preference} CBUF banks for \
              {}x{} kernel and {} weight channels, more than the {} grantable; the \
              CBUF partition above that point is not capture-backed (see \
@@ -3904,9 +3904,11 @@ fn relocate_one<R: RegisterMeta>(commands: &mut [RegCmd], address: u32, keep_til
     // own byte offset from the tensor base in these registers, exactly as the
     // vendor's own height-split programs do. Independently staged output
     // tiles are the exception and bind DPU_DST_BASE_ADDR directly.
-    let tile_offset = keep_tile_offset
-        .then(|| (commands[matches[0]].0 >> 16) as u32)
-        .unwrap_or(0);
+    let tile_offset = if keep_tile_offset {
+        (commands[matches[0]].0 >> 16) as u32
+    } else {
+        0
+    };
     commands[matches[0]] = RegCmd::new(R::DOMAIN, R::OFFSET, address + tile_offset);
 }
 
@@ -4049,15 +4051,15 @@ enum GrainsOverride {
 /// `ROCKET_FEATURE_GRAINS=<n>` pins it; `ROCKET_FEATURE_GRAINS_MAX=<n>` clamps
 /// it. Nothing on the compiled path sets either.
 fn grains_override() -> Option<GrainsOverride> {
-    if let Ok(value) = std::env::var("ROCKET_FEATURE_GRAINS") {
-        if let Ok(parsed) = value.parse() {
-            return Some(GrainsOverride::Exact(parsed));
-        }
+    if let Ok(value) = std::env::var("ROCKET_FEATURE_GRAINS")
+        && let Ok(parsed) = value.parse()
+    {
+        return Some(GrainsOverride::Exact(parsed));
     }
-    if let Ok(value) = std::env::var("ROCKET_FEATURE_GRAINS_MAX") {
-        if let Ok(parsed) = value.parse() {
-            return Some(GrainsOverride::Cap(parsed));
-        }
+    if let Ok(value) = std::env::var("ROCKET_FEATURE_GRAINS_MAX")
+        && let Ok(parsed) = value.parse()
+    {
+        return Some(GrainsOverride::Cap(parsed));
     }
     None
 }
@@ -5372,8 +5374,8 @@ mod tests {
     fn two_byte_precisions_differ_from_fp16_only_in_the_precision_registers() {
         let kernels: Kernels = [3, 3];
         for (precision, field) in [
-            (Precision::Bf16, u32::from(DataPrecision::Bf16 as u32)),
-            (Precision::Int16, u32::from(DataPrecision::Int16 as u32)),
+            (Precision::Bf16, DataPrecision::Bf16 as u32),
+            (Precision::Int16, DataPrecision::Int16 as u32),
         ] {
             let fp16 = Shape::with_precision(32, 32, 1, 64, 32, Precision::Fp16);
             let other = Shape::with_precision(32, 32, 1, 64, 32, precision);

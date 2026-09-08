@@ -1,4 +1,7 @@
-use std::{env, path::PathBuf};
+use std::{
+    env,
+    path::{Path, PathBuf},
+};
 
 fn main() {
     println!("cargo:rerun-if-changed=rkt_registers.h");
@@ -39,7 +42,7 @@ fn main() {
 // none of drm_mode.h's KMS/display types are relevant to an NPU-only accel
 // driver and letting them through was the fault of the previous manually
 // dumped `api.rs`, which had no filtering at all.
-fn generate_rocket_accel_bindings(out_path: &PathBuf) {
+fn generate_rocket_accel_bindings(out_path: &Path) {
     println!("cargo:rerun-if-changed=vendor/linux-headers");
 
     let vendor_dir = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("vendor/linux-headers");

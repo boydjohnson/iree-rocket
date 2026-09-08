@@ -26,6 +26,7 @@
     dead_code
 )]
 
+#[allow(unsafe_op_in_unsafe_fn, clippy::all, clippy::pedantic)]
 pub mod bindings {
     include!(concat!(env!("OUT_DIR"), "/bindings.rs"));
 }
@@ -55,6 +56,11 @@ pub mod weight_cache;
 /// exactly -- the name a CMake `IREE_EXTERNAL_ROCKET_HAL_DRIVER_REGISTER`
 /// property will reference once the CMake side (see rocket-hal-driver's
 /// task list / rknpu-spelunking/NOTES.md) is wired up.
+///
+/// # Safety
+///
+/// `registry` must be a valid, non-null pointer to a live
+/// `iree_hal_driver_registry_t`.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn iree_hal_rocket_driver_module_register(
     registry: *mut bindings::iree_hal_driver_registry_t,

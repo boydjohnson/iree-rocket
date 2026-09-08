@@ -237,6 +237,10 @@ impl WorkerPool {
             .sender
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
+        // std's `SendError<Unit>` carries the whole rejected `Unit` back;
+        // the payload is discarded immediately below, never stored or
+        // propagated, and the type isn't ours to box.
+        #[allow(clippy::result_large_err)]
         match sender.as_ref().map(|sender| sender.send(unit)) {
             Some(Ok(())) => status::ok(),
             // The worker is gone: the pool is shutting down, or the worker

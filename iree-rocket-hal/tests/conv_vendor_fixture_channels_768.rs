@@ -91,6 +91,7 @@ fn print_grouped_bank_differences(
     }
 }
 
+#[allow(clippy::type_complexity)]
 fn run_channel_grid(fixtures: &str, precision: FixturePrecision) {
     let fixtures: FixtureFile = serde_json::from_str(fixtures).expect("valid fixture JSON");
     assert_eq!(fixtures.schema, 1);
@@ -190,7 +191,7 @@ fn run_channel_grid(fixtures: &str, precision: FixturePrecision) {
             // every row tile in the winning plan must repeat the same
             // output-channel groups, summing to the programmed kernel
             // count, with the right destination stride between groups.
-            let raw = &by_plan[&plan_index];
+            let raw = &by_plan[plan_index];
             match output_channel_groups(raw, s, shape.programmed_kernels(), precision.elem_bytes())
             {
                 Ok(groups) => {

@@ -37,6 +37,7 @@ fn report(label: &str, seconds: f64, bytes: usize) {
 
 /// Sums every 8th byte, which is enough to touch every 64-byte line without
 /// the loop itself becoming the bottleneck.
+#[allow(clippy::chunks_exact_to_as_chunks)]
 fn read_pass(buffer: &[u8]) -> u64 {
     let mut sum = 0u64;
     for chunk in buffer.chunks_exact(8) {

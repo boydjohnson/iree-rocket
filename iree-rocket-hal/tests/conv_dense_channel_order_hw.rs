@@ -220,7 +220,7 @@ fn run(fd: i32, file: &std::fs::File, width: u32, height: u32) -> Result<(), Fai
             let raw = std::slice::from_raw_parts(buf_output.host_ptr, output_bytes);
             for y in 0..height as usize {
                 for x in 0..width as usize {
-                    for channel in 0..COUT {
+                    for (channel, &value) in CHANNEL_VALUES.iter().enumerate().take(COUT) {
                         let surface = channel / CHANNELS_PER_ATOM;
                         let lane = channel % CHANNELS_PER_ATOM;
                         let offset =
@@ -228,7 +228,7 @@ fn run(fd: i32, file: &std::fs::File, width: u32, height: u32) -> Result<(), Fai
                                 + (y * width as usize + x) * FEATURE_ATOM_BYTES
                                 + lane * FP16_BYTES;
                         let got = f16_to_f32(u16::from_le_bytes([raw[offset], raw[offset + 1]]));
-                        let want = f16_to_f32(CHANNEL_VALUES[channel]);
+                        let want = f16_to_f32(value);
                         if got != want {
                             failure.mismatches += 1;
                             if failure.samples.len() < 8 {

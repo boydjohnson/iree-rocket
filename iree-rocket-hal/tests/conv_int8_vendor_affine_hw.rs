@@ -112,6 +112,10 @@ fn bs_i32(bs: &[u8], offset: usize) -> i32 {
     i32::from_le_bytes([bs[offset], bs[offset + 1], bs[offset + 2], bs[offset + 3]])
 }
 
+// `input_channel` indexes two independent collections in lockstep
+// (`row` and `case.centered[output_channel]`); a `.zip()` rewrite would
+// be no clearer than the explicit range.
+#[allow(clippy::needless_range_loop)]
 fn verify_payload(case: VendorCase) {
     for output_channel in 0..OUTPUT_CHANNELS {
         assert_eq!(bs_i32(case.bs, output_channel * 4), 0, "{} bias", case.name);

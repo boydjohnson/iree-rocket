@@ -1,3 +1,8 @@
+// Shared across 4 separate test binaries (each `#[path]`-included, so
+// compiled independently); any one binary only exercises a subset of this
+// oracle's precision/pattern coverage.
+#![allow(dead_code)]
+
 use iree_rocket_hal::rocket::{
     conv::{
         BsEntry, Kernels, Multiplier, Precision, Quantization, Shape, bs_buffer_bytes,
@@ -138,7 +143,7 @@ fn wide_magnitude(precision: OraclePrecision, index: usize, phase: usize) -> i32
         // order of magnitude past fp16's 65504 ceiling.
         OraclePrecision::Bf16 | OraclePrecision::Tf32 => (128 + 9 * step) << 12,
         OraclePrecision::Int4 => {
-            if (index + phase) % 2 == 0 {
+            if (index + phase).is_multiple_of(2) {
                 7
             } else {
                 8
@@ -465,7 +470,7 @@ fn input_value(case: Conv2dCase, y: usize, x: usize, channel: usize) -> i32 {
         } => {
             let linear = (y * case.width as usize + x) * case.cin as usize + channel;
             let magnitude = 1 + ((linear + phase * 17) % 61) as i32;
-            if signed_input && (linear + phase) % 2 != 0 {
+            if signed_input && !(linear + phase).is_multiple_of(2) {
                 -magnitude
             } else {
                 magnitude
@@ -480,7 +485,7 @@ fn input_value(case: Conv2dCase, y: usize, x: usize, channel: usize) -> i32 {
             }
             let linear = (y * case.width as usize + x) * case.cin as usize + channel;
             let magnitude = wide_magnitude(case.precision, linear, phase);
-            if (linear + phase) % 2 == 0 {
+            if (linear + phase).is_multiple_of(2) {
                 magnitude
             } else {
                 -magnitude
@@ -572,7 +577,7 @@ fn weight_value(
                 1
             } else {
                 let magnitude = wide_magnitude(case.precision, output_channel, phase);
-                if (output_channel + phase) % 2 == 0 {
+                if (output_channel + phase).is_multiple_of(2) {
                     magnitude
                 } else {
                     -magnitude
@@ -657,12 +662,7 @@ pub fn expected_accumulator(
                     ((0..case.height as isize).contains(&input_y)
                         && (0..case.width as isize).contains(&input_x))
                     .then(|| {
-                        i32::from(input_value(
-                            case,
-                            input_y as usize,
-                            input_x as usize,
-                            channel,
-                        )) * i32::from(weight)
+                        input_value(case, input_y as usize, input_x as usize, channel) * weight
                     })
                 })
                 .sum()
@@ -708,12 +708,8 @@ pub fn expected_accumulator(
                         continue;
                     }
                     for channel in 0..case.cin as usize {
-                        sum += i32::from(input_value(
-                            case,
-                            input_y as usize,
-                            input_x as usize,
-                            channel,
-                        )) * i32::from(weight_value(case, ky, kx, channel, output_channel));
+                        sum += input_value(case, input_y as usize, input_x as usize, channel)
+                            * weight_value(case, ky, kx, channel, output_channel);
                     }
                 }
             }
@@ -1323,6 +1319,10 @@ mod tests {
         assert!(build_raw_fixture(formerly_rejected).is_ok());
     }
 
+    // Both loop variables index multiple independent collections and feed
+    // arithmetic (`logical_index`) beyond plain indexing; an iterator
+    // rewrite would be no clearer than the explicit ranges.
+    #[allow(clippy::needless_range_loop)]
     #[test]
     fn affine_selector_fixture_centers_live_weights_padding_and_bs() {
         let case = Conv2dCase {

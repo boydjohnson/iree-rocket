@@ -197,6 +197,11 @@ static FACTORY: SyncFactory = SyncFactory(iree_hal_driver_factory_t {
 /// Mirrors `iree_hal_null_driver_module_register()` -- the entry point a
 /// host application calls to make "rocket" available through
 /// `iree_hal_driver_registry_t`.
+///
+/// # Safety
+///
+/// `registry` must be a valid, non-null pointer to a live
+/// `iree_hal_driver_registry_t`.
 pub unsafe fn register(registry: *mut iree_hal_driver_registry_t) -> iree_status_t {
     unsafe { crate::bindings::iree_hal_driver_registry_register_factory(registry, &FACTORY.0) }
 }

@@ -897,6 +897,7 @@ fn int8_accumulator_k1_cin_boundary_cases() -> Vec<Conv2dCase> {
 /// * odd 9x7 output extents leave the final logical accumulator(s) unwritten;
 /// * several small-Cin shapes corrupt most values at exact 32-lane block
 ///   boundaries.
+///
 /// Re-measured on `planck` 2026-08-31, each case alone in a fresh process
 /// via `ROCKET_PROBE_ONLY` -- the only way to get an uncontaminated verdict,
 /// since a case's result shifts with what ran before it. Counts below are

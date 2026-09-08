@@ -32,6 +32,9 @@ unsafe fn cast(event: *mut iree_hal_event_t) -> *mut RocketEvent {
     event as *mut RocketEvent
 }
 
+/// # Safety
+///
+/// `out_event` must be a valid, non-null pointer to write the result into.
 #[allow(unused_variables)]
 pub unsafe fn create(
     queue_affinity: iree_hal_queue_affinity_t,

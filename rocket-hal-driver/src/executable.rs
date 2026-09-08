@@ -272,6 +272,9 @@ impl Conv2dExecutable {
     /// Dimensions come first and quantization parameters after, matching the
     /// order `RocketTarget.cpp` counts them in when it checks a pipeline
     /// layout's constant count against the target.
+    // `as_chunks` would need every `bytes.try_into()` below re-typed for
+    // marginal benefit on a numeric decode path; not worth the churn.
+    #[allow(clippy::chunks_exact_to_as_chunks)]
     pub fn resolve_shape(&self, constants: &[u8]) -> Result<(conv::Shape, Kernels), &'static str> {
         let expected_bytes = self
             .runtime_dimensions
@@ -489,6 +492,9 @@ impl PoolingExecutable {
     /// pool cannot carry them (the compiler would have to predict them per
     /// dispatch) and a static one has already stated them, so this recomputes
     /// floor-mode geometry and rejects a template that disagreed.
+    // `as_chunks` would need every `bytes.try_into()` below re-typed for
+    // marginal benefit on a numeric decode path; not worth the churn.
+    #[allow(clippy::chunks_exact_to_as_chunks)]
     pub fn resolve_shape(&self, constants: &[u8]) -> Result<PoolingShape, &'static str> {
         let expected_bytes = self
             .runtime_dimensions
@@ -658,6 +664,9 @@ fn validate_elementwise_template(
 }
 
 /// Resolves the three extents from native-endian uint32 push constants.
+// `as_chunks` would need every `bytes.try_into()` below re-typed for
+// marginal benefit on a numeric decode path; not worth the churn.
+#[allow(clippy::chunks_exact_to_as_chunks)]
 fn resolve_elementwise_geometry(
     template: &ElementwiseGeometry,
     runtime_dimensions: &[RuntimeElementwiseDimension],
@@ -1014,6 +1023,9 @@ impl MatmulExecutable {
     /// convolution gate a Conv2D executable goes through -- `fc::Shape`'s
     /// own constructor only re-checks the channel-count bounds, while
     /// `validate_conv_shape` trial-plans the shape it will actually build.
+    // `as_chunks` would need every `bytes.try_into()` below re-typed for
+    // marginal benefit on a numeric decode path; not worth the churn.
+    #[allow(clippy::chunks_exact_to_as_chunks)]
     pub fn resolve_shape(&self, constants: &[u8]) -> Result<fc::Shape, &'static str> {
         let expected_bytes = self
             .runtime_dimensions
@@ -1092,6 +1104,11 @@ pub fn create(shape: UkernelShape) -> *mut iree_hal_executable_t {
 /// Not part of the vtable -- `command_buffer::dispatch` calls this
 /// directly to get at the shape it needs for the matching `build_*_regcmd`
 /// call.
+///
+/// # Safety
+///
+/// `executable` must be a valid, non-null pointer to a `RocketExecutable`
+/// created by this module's `create` and still live.
 pub unsafe fn shape(executable: *mut iree_hal_executable_t) -> *const UkernelShape {
     unsafe { &(*cast(executable)).shape }
 }

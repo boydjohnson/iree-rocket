@@ -197,7 +197,7 @@ fn fp16_height_one_fc_runs_on_npu() {
     ));
     let output = run_fc(shape, &input, &weights);
     for (m, row) in output.chunks_exact(shape.n as usize * 2).enumerate() {
-        for (n, value) in row.chunks_exact(2).enumerate() {
+        for (n, value) in row.as_chunks::<2>().0.iter().enumerate() {
             let actual = f16_to_f32(u16::from_le_bytes([value[0], value[1]]));
             assert_eq!(actual, (m + 1) as f32, "FC [{m}, {n}]");
         }

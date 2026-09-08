@@ -570,6 +570,11 @@ pub struct LutBuffers {
     pub output_addr: u32,
 }
 
+// This builds a fixed, straight-line hardware register program; converting
+// it to a `vec![]` literal would mean hand-transcribing every push argument,
+// which is exactly the kind of copy/reorder mistake that produces a silently
+// wrong register value.
+#[allow(clippy::vec_init_then_push)]
 pub fn build_lut_regcmd(shape: &LutShape, bufs: &LutBuffers, table: LutTable) -> Vec<RegCmd> {
     assert!(
         shape.width > 0 && shape.height > 0 && shape.channels > 0,
