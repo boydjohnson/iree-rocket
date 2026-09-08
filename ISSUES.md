@@ -293,6 +293,79 @@ P7's `outside`. See P7 for the profile. Two things to carry into any attempt:
 
 ---
 
+**Sized on ResNet50 fp16, 2026-09-08 -- the model where the NPU wins.**
+The reach of chaining is the set of edges where one NPU dispatch feeds
+another with nothing between them, and on the current ResNet50 build that
+set is **empty**: all 51 NPU results feed the plain fp16 shim's CPU epilogue
+(`extf` + bias add against a full-size hoisted f32 bias tensor), then a
+second CPU dispatch (ReLU + `truncf`) before the next convolution, and the
+bottleneck outputs go through a CPU residual add as well. Measured from the
+per-op profile (`taskset -c 4-7`, rebuilt runtime, 245 ms/inference:
+`outside` 100.1, `wait.npu` 79.2, `compact` 28.6, `pack.input` 15.7) and
+split by the role each shape plays in a bottleneck:
+
+| edge class | calls/inf | `pack.input` | `compact` | `npu` |
+|---|---:|---:|---:|---:|
+| conv1 (1x1 in, reads the block input) | 16 | 8.6 | 4.1 | 23.8 |
+| conv2 (3x3) | 16 | 3.5 | 2.1 | 33.2 |
+| conv3 (1x1 out, feeds the residual add) | 13 | 1.3 | 8.9 | 10.7 |
+| conv3 + downsample at 56x56x64->256 | 4 | 1.1 | 12.6 | 6.0 |
+| downsample 56x56x256->512 s2 | 1 | 1.2 | 0.9 | 4.0 |
+
+So the order of work, with what each step is worth per inference:
+
+1. **Fuse the fp16 epilogue into the dispatch** -- bias on the BS plane for
+   every convolution and ReLU on the BN stage where the model has one. This
+   is the ReLU6 machinery generalised to `relu` and to bias-only, on the
+   f16-import chain (`truncf` then a `cmpf ugt`/`select` clamp) rather than
+   the demoted one. It is not chaining, but it is the prerequisite for it
+   *and* the larger lever: it removes two full-tensor CPU passes behind each
+   of 51 convolutions, most of the 100 ms `outside`, and leaves conv1 ->
+   conv2 -> conv3 as direct NPU -> NPU edges once the shim's `extf` and the
+   graph's `truncf` cancel.
+2. **Chaining on those edges** (the driver keeps conv1's and conv2's output
+   cube and conv2 and conv3 read it): `pack.input` 4.7 + `compact` 6.2 =
+   **10.9 ms**, 4.5 % of wall. Bounded by the fact that the *wide* tensors
+   (conv3's Cout 256..2048 outputs, 21.5 of the 28.6 ms of compaction) all
+   cross the residual add.
+3. **Residual add on the NPU** (`build_conv_then_add_regcmd`, ROADMAP Phase
+   3's epilogue field) makes every edge direct: the whole `pack.input` +
+   `compact` term, **~44 ms**, 18 % of wall, plus the 16 CPU adds.
+
+Nothing in this list is worth building before step 1, and step 1 pays on
+its own.
+
+**Step 1 landed 2026-09-08.** `rocket-fuse-conv-relu6` gained two patterns:
+bias-only (every dense fp16 1x1/3x3 convolution seeded with a per-channel
+bias now hands it to the BS plane through the plain executables' bias
+binding, which had only ever carried zeros) and bias + ReLU on the
+f16-import chain (`truncf` then `cmpf ugt`/`select`, the clamp moving onto
+the BN stage through four new `relu` targets: stride 1 and 2, with and
+without the folded pad 1). The shims widen with a `linalg.generic` rather
+than a pre-formed dispatch, so the widen and the model's own narrow cancel
+once the wrapper is inlined -- that is what makes the edge direct. Two
+match-loop facts fell out: an epilogue-rooted matcher must live in the
+first loop, and a conv-rooted one in the second, because the walk reaches
+the convolution before its epilogue and a conv-rooted matcher in the first
+loop pre-empts everything behind it (the pad-1 matchers moved for this).
+
+ResNet50 fp16 on `planck`, `taskset -c 4-7`, 3 repetitions, medians:
+
+| | dispatches (NPU / CPU) | NPU results feeding an NPU dispatch | ms |
+|---|---|---|---:|
+| before | 51 / 130 | 0 of 51 | 230 |
+| after | 53 / 22 | **32 of 53** | **162** |
+
+1.42x on the model, max|diff| 0.0116 against onnxruntime (the CPU arm is
+0.0151), same argmax and top-5; the CPU arm is 1035 ms. MobileNetV2 fp16
+(f32 import, the demoted spelling) is unchanged in placement at 37 sites,
+129 ms, max|diff| 0.028 against onnxruntime with the same top-5. Every
+conv1 -> conv2 -> conv3 edge is now NPU -> NPU with nothing between, which
+is exactly the set step 2 chains; what still crosses the CPU is the 16
+residual adds, the 7x7 stem, the padded max pool and the head.
+
+---
+
 ## P3 (S3) — the full output BO is cache-synced once per tile, and a regcmd BO is allocated and mapped per tile
 
 `perf/bo-sync-cost.md` [notes]:
