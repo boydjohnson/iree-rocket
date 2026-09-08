@@ -316,6 +316,87 @@ fn chain_debug() -> bool {
     *DEBUG.get_or_init(|| std::env::var("ROCKET_CHAIN").is_ok_and(|value| value == "debug"))
 }
 
+/// Whether a dispatch may skip writing its dense output buffer when the
+/// compiler counted its readers and every one of them chained to its output
+/// cube on this command buffer (`ROCKET_LAZY_COMPACT=0` restores the
+/// unconditional compaction, `=debug` names every decision). The count comes
+/// down as the last push constant (`Conv2DDef.runtime_dense_readers`); see
+/// [`compaction_elidable`] for the rule and ISSUES.md P2 for why the signal
+/// has to come from the compiler.
+fn lazy_compact_enabled() -> bool {
+    static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ENABLED.get_or_init(|| {
+        chain_enabled() && std::env::var("ROCKET_LAZY_COMPACT").map_or(true, |value| value != "0")
+    })
+}
+
+fn lazy_compact_debug() -> bool {
+    static DEBUG: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *DEBUG.get_or_init(|| std::env::var("ROCKET_LAZY_COMPACT").is_ok_and(|value| value == "debug"))
+}
+
+/// The one rule that decides whether a dispatch's dense output write can be
+/// skipped, kept pure so it can be pinned by a test.
+///
+/// `dense_readers` is the compiler's count of Rocket dispatches that read the
+/// result in the final program, or 0 if it saw any other reader or did not
+/// count. `chained_readers` is how many consumers on this command buffer took
+/// the output cube in place; `dense_read_seen` is whether anything recorded
+/// on this command buffer read the dense bytes instead (a consumer that
+/// declined to chain, a dispatch kind that cannot chain, a copy).
+///
+/// Every failure mode keeps the write: a reader on a later command buffer
+/// leaves `chained_readers` short of the count, a same-buffer reader that
+/// did not chain sets `dense_read_seen`, and an executable compiled without
+/// the count says 0. Over-counting on the compiler's side can only ever
+/// keep a write that could have been skipped, never skip one that was
+/// needed, since a consumer that chained cannot also need the dense bytes.
+/// Dense output writes skipped so far in this process; `profile::report`
+/// prints it next to the `compact` phase.
+pub static ELIDED_COMPACTIONS: std::sync::atomic::AtomicUsize =
+    std::sync::atomic::AtomicUsize::new(0);
+
+pub fn compaction_elidable(
+    dense_readers: u32,
+    chained_readers: u32,
+    dense_read_seen: bool,
+) -> bool {
+    dense_readers > 0 && chained_readers == dense_readers && !dense_read_seen
+}
+
+/// Records that `binding`'s bytes are about to be read from the dense buffer
+/// by the dispatch or copy being recorded, so no earlier dispatch that wrote
+/// them may skip its compaction. Every read that does not go through
+/// [`chainable_cube`] must pass here; a missed call site is a silent
+/// all-zero read, which is why the conservative direction is the cheap one.
+///
+/// # Safety
+///
+/// `binding.buffer` and every recorded write target must be live
+/// `RocketBuffer`s -- the same contract as [`chainable_cube`].
+unsafe fn note_dense_read(cb: &mut RocketCommandBuffer, binding: &iree_hal_buffer_ref_t) {
+    if binding.buffer.is_null() {
+        return;
+    }
+    let Some(read) = (unsafe { dma_range(binding.buffer, binding.offset, binding.length) }) else {
+        return;
+    };
+    for op in cb.ops.iter_mut() {
+        let overlaps = recorded_write_extent(op)
+            .and_then(|(buffer, offset, length)| unsafe { dma_range(buffer, offset, length) })
+            .is_some_and(|wrote| wrote.0 < read.1 && read.0 < wrote.1);
+        if let (
+            true,
+            RecordedOp::Dispatch {
+                dense_read_seen, ..
+            },
+        ) = (overlaps, op)
+        {
+            *dense_read_seen = true;
+        }
+    }
+}
+
 /// after preceding recorded update/fill/copy operations have populated the
 /// real IREE input buffer.
 #[derive(Clone, Copy)]
@@ -532,7 +613,7 @@ unsafe fn dma_range(
 /// which every direct binding on this command buffer is -- indirect ones are
 /// rejected in `dispatch()` and `apply_ops_until_dispatch`.
 fn chainable_cube(
-    cb: &RocketCommandBuffer,
+    cb: &mut RocketCommandBuffer,
     binding: &iree_hal_buffer_ref_t,
     pixel_count: usize,
     bytes_per_pixel: usize,
@@ -566,7 +647,7 @@ fn chainable_cube(
             pixel_count * bytes_per_pixel,
         )
     }?;
-    let Some(producer) = cb.ops.iter().rev().find(|op| {
+    let Some((producer_index, producer)) = cb.ops.iter().enumerate().rev().find(|(_, op)| {
         recorded_write_extent(op)
             .and_then(|(buffer, offset, length)| unsafe { dma_range(buffer, offset, length) })
             .is_some_and(|wrote| wrote.0 < want.1 && want.0 < wrote.1)
@@ -621,7 +702,16 @@ fn chainable_cube(
             pixel_count, bytes_per_pixel
         );
     }
-    Some(*cube)
+    let cube = *cube;
+    // The producer now has one reader that will never touch its dense
+    // output; `apply_ops` weighs this against the compiler's count.
+    if let RecordedOp::Dispatch {
+        chained_readers, ..
+    } = &mut cb.ops[producer_index]
+    {
+        *chained_readers += 1;
+    }
+    Some(cube)
 }
 
 /// Allocates one [`Replica`] per sibling context in `contexts`, each holding
@@ -1079,10 +1169,14 @@ pub struct OutputCompaction {
 /// fp16-narrowed output cube are the same layout, both `feat_idx` with a
 /// 16-byte channel atom.
 ///
-/// The compaction still runs. Nothing here can prove the dense buffer has no
-/// other reader -- a later CPU dispatch, a later command buffer, or the
-/// model's own output -- so eliding it needs a liveness signal this layer
-/// does not have. See P2 for what that would take.
+/// The compaction still runs by default: nothing on a command buffer can
+/// prove the dense buffer has no other reader -- a later CPU dispatch, a
+/// later command buffer, the model's own output. The proof comes from the
+/// compiler as the dispatch's trailing push constant, its count of Rocket
+/// readers (`Conv2DDef.runtime_dense_readers`, `rocket-mark-dense-readers`),
+/// and `apply_ops` skips the dense write when exactly that many consumers
+/// chained here and nothing else read the bytes -- see
+/// [`compaction_elidable`]. ISSUES.md P2, the compaction half.
 #[derive(Clone, Copy)]
 pub struct OutputCube {
     /// The dense IREE buffer and offset this cube is compacted into, which
@@ -1206,6 +1300,17 @@ pub enum RecordedOp {
         /// record time, so no other command buffer can reach a buffer that
         /// has not been filled yet.
         weight_publish: Option<WeightPublish>,
+        /// The compiler's count of Rocket dispatches that read this
+        /// dispatch's result (`Conv2DDef.runtime_dense_readers`), 0 when it
+        /// did not count or saw another reader. Non-conv kinds record 0.
+        dense_readers: u32,
+        /// How many later dispatches on this command buffer took
+        /// `output_cube` in place of the dense buffer. Bumped at record time
+        /// by [`chainable_cube`].
+        chained_readers: u32,
+        /// Whether anything recorded after this dispatch read its dense
+        /// output bytes without chaining. Set by [`note_dense_read`].
+        dense_read_seen: bool,
     },
 }
 
@@ -1437,6 +1542,9 @@ pub unsafe fn apply_ops_until_dispatch(
                 // Record-time only: a later dispatch reads it while the
                 // command buffer is still being built, never here.
                 output_cube: _,
+                dense_readers,
+                chained_readers,
+                dense_read_seen,
             } => {
                 if let Some(packing) = input_packing {
                     apply_input_packing(cb.fd, packing, profile_label)?;
@@ -1811,13 +1919,37 @@ pub unsafe fn apply_ops_until_dispatch(
                         }
                     })
                     .collect();
+                // Every consumer of this output has been recorded by now, so
+                // this is where the dense write can be judged unnecessary:
+                // the compiler said how many Rocket readers there are, and
+                // the command buffer saw whether each one chained.
+                let elide = lazy_compact_enabled()
+                    && output_compaction.is_some()
+                    && compaction_elidable(*dense_readers, *chained_readers, *dense_read_seen);
+                if lazy_compact_debug() && output_compaction.is_some() {
+                    eprintln!(
+                        "rocket: compaction {} ({}): {} reader(s) counted, {} chained, dense read {}",
+                        if elide { "skipped" } else { "kept" },
+                        profile_label,
+                        dense_readers,
+                        chained_readers,
+                        if *dense_read_seen { "seen" } else { "not seen" }
+                    );
+                }
+                if elide {
+                    ELIDED_COMPACTIONS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                }
                 return Ok(Some(DispatchJob {
                     regcmd_tasks: regcmd_tasks.as_slice(),
                     dpu_mode: *dpu_mode,
                     precision_tag: *precision_tag,
                     in_bo_handles: in_bo_handles.as_slice(),
                     out_bo_handles: out_bo_handles.as_slice(),
-                    output_compaction: output_compaction.clone(),
+                    output_compaction: if elide {
+                        None
+                    } else {
+                        output_compaction.clone()
+                    },
                     profile_label: profile_label.as_str(),
                     task_targets,
                 }));
@@ -2065,6 +2197,7 @@ unsafe extern "C" fn copy_buffer(
         crate::bindings::iree_hal_buffer_retain(target_ref.buffer);
     }
     let cb = unsafe { &mut *cast(command_buffer) };
+    unsafe { note_dense_read(cb, &source_ref) };
     cb.ops.push(RecordedOp::Copy {
         source: source_ref,
         target: target_ref,
@@ -2260,6 +2393,15 @@ unsafe extern "C" fn dispatch_impl(
             } else {
                 None
             };
+            // Whatever is not read through a cube is read from the dense
+            // buffer, and its producer must keep writing it.
+            if chained_input.is_none() {
+                unsafe { note_dense_read(cb, &refs[0]) };
+            }
+            unsafe {
+                note_dense_read(cb, &refs[1]);
+                note_dense_read(cb, &refs[2]);
+            }
             let (input_addr, input_handle, input_packing) = if let Some(cube) = chained_input {
                 (cube.dma_address, cube.handle, None)
             } else if shape.layout() == FeatureLayout::Surfaces {
@@ -2789,6 +2931,9 @@ unsafe extern "C" fn dispatch_impl(
                     cube.packed_bytes_per_pixel,
                     "conv residual skip",
                 );
+                if chained_skip.is_none() {
+                    unsafe { note_dense_read(cb, &refs[3]) };
+                }
                 let residual = match chained_skip {
                     Some(skip) => Some((None, skip.dma_address, skip.handle)),
                     None => {
@@ -2892,6 +3037,9 @@ unsafe extern "C" fn dispatch_impl(
                 weight_scratch,
                 output_cube,
                 weight_publish,
+                dense_readers: executable.dense_readers(constants),
+                chained_readers: 0,
+                dense_read_seen: false,
             });
         }
         UkernelShape::Matmul(executable) => {
@@ -3292,6 +3440,13 @@ unsafe extern "C" fn dispatch_impl(
             if let Some(scratch) = bias_scratch {
                 scratch_buffers.push(scratch);
             }
+            // These kinds record no output cube and take none, so every
+            // operand is a dense read.
+            unsafe {
+                note_dense_read(cb, &refs[0]);
+                note_dense_read(cb, &refs[1]);
+                note_dense_read(cb, &refs[2]);
+            }
             cb.ops.push(RecordedOp::Dispatch {
                 regcmd_tasks,
                 dpu_mode: Some(DpuMode::Dense),
@@ -3311,6 +3466,9 @@ unsafe extern "C" fn dispatch_impl(
                 profile_label,
                 weight_scratch,
                 output_cube: None,
+                dense_readers: 0,
+                chained_readers: 0,
+                dense_read_seen: false,
                 weight_publish,
             });
         }
@@ -3479,6 +3637,11 @@ unsafe extern "C" fn dispatch_impl(
                     shape.stride_x,
                 )
             });
+            // These kinds record no output cube and take none, so every
+            // operand is a dense read.
+            unsafe {
+                note_dense_read(cb, &refs[0]);
+            }
             cb.ops.push(RecordedOp::Dispatch {
                 regcmd_tasks,
                 dpu_mode: None,
@@ -3498,6 +3661,9 @@ unsafe extern "C" fn dispatch_impl(
                 profile_label,
                 weight_scratch: None,
                 output_cube: None,
+                dense_readers: 0,
+                chained_readers: 0,
+                dense_read_seen: false,
                 weight_publish: None,
             });
         }
@@ -3537,6 +3703,11 @@ unsafe extern "C" fn dispatch_impl(
                     shape.algo, shape.height, shape.width, shape.channels
                 )
             });
+            // These kinds record no output cube and take none, so every
+            // operand is a dense read.
+            unsafe {
+                note_dense_read(cb, &refs[0]);
+            }
             cb.ops.push(RecordedOp::Dispatch {
                 regcmd_tasks,
                 // Neither field describes an element-wise task. `dpu_mode`
@@ -3563,6 +3734,9 @@ unsafe extern "C" fn dispatch_impl(
                 profile_label,
                 weight_scratch: None,
                 output_cube: None,
+                dense_readers: 0,
+                chained_readers: 0,
+                dense_read_seen: false,
                 weight_publish: None,
             });
         }
@@ -3614,6 +3788,12 @@ unsafe extern "C" fn dispatch_impl(
                     shape.op, shape.height, shape.width, shape.channels
                 )
             });
+            // These kinds record no output cube and take none, so every
+            // operand is a dense read.
+            unsafe {
+                note_dense_read(cb, &refs[0]);
+                note_dense_read(cb, &refs[1]);
+            }
             cb.ops.push(RecordedOp::Dispatch {
                 regcmd_tasks,
                 // See the unary arm.
@@ -3634,6 +3814,9 @@ unsafe extern "C" fn dispatch_impl(
                 profile_label,
                 weight_scratch: None,
                 output_cube: None,
+                dense_readers: 0,
+                chained_readers: 0,
+                dense_read_seen: false,
                 weight_publish: None,
             });
         }
@@ -3674,6 +3857,11 @@ unsafe extern "C" fn dispatch_impl(
                     executable.function, shape.height, shape.width, shape.channels
                 )
             });
+            // These kinds record no output cube and take none, so every
+            // operand is a dense read.
+            unsafe {
+                note_dense_read(cb, &refs[0]);
+            }
             cb.ops.push(RecordedOp::Dispatch {
                 regcmd_tasks,
                 // See the unary arm.
@@ -3694,6 +3882,9 @@ unsafe extern "C" fn dispatch_impl(
                 profile_label,
                 weight_scratch: None,
                 output_cube: None,
+                dense_readers: 0,
+                chained_readers: 0,
+                dense_read_seen: false,
                 weight_publish: None,
             });
         }
@@ -3927,3 +4118,26 @@ pub static VTABLE: iree_hal_command_buffer_vtable_t = iree_hal_command_buffer_vt
     collective: Some(collective),
     dispatch: Some(dispatch),
 };
+
+#[cfg(test)]
+mod lazy_compaction_tests {
+    use super::compaction_elidable;
+
+    // The rule behind skipping a dense output write. Each case is one way the
+    // write must be kept; only the last skips it.
+    #[test]
+    fn dense_write_is_kept_unless_every_counted_reader_chained() {
+        // No count from the compiler: never skip, however many chained.
+        assert!(!compaction_elidable(0, 0, false));
+        assert!(!compaction_elidable(0, 3, false));
+        // A reader the command buffer never saw -- it is on a later one.
+        assert!(!compaction_elidable(2, 1, false));
+        // A same-buffer reader that read the dense bytes instead of chaining.
+        assert!(!compaction_elidable(1, 1, true));
+        // More chained than counted cannot happen, but if it did the count is
+        // not to be trusted.
+        assert!(!compaction_elidable(1, 2, false));
+        assert!(compaction_elidable(1, 1, false));
+        assert!(compaction_elidable(2, 2, false));
+    }
+}

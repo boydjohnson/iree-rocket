@@ -1258,6 +1258,7 @@ impl<'a> Conv2DDef<'a> {
   pub const VT_RUNTIME_QUANTIZATION: flatbuffers::VOffsetT = 50;
   pub const VT_EPILOGUE_ADD: flatbuffers::VOffsetT = 52;
   pub const VT_EPILOGUE_ACTIVATION: flatbuffers::VOffsetT = 54;
+  pub const VT_RUNTIME_DENSE_READERS: flatbuffers::VOffsetT = 56;
 
   #[inline]
   pub fn init_from_table(table: flatbuffers::Table<'a>) -> Self {
@@ -1290,6 +1291,7 @@ impl<'a> Conv2DDef<'a> {
     builder.add_input_channels(args.input_channels);
     builder.add_input_height(args.input_height);
     builder.add_input_width(args.input_width);
+    builder.add_runtime_dense_readers(args.runtime_dense_readers);
     builder.add_epilogue_activation(args.epilogue_activation);
     builder.add_epilogue_add(args.epilogue_add);
     builder.add_precision(args.precision);
@@ -1403,6 +1405,10 @@ impl<'a> Conv2DDef<'a> {
   pub fn epilogue_activation(&self) -> Activation {
     self._tab.get::<Activation>(Conv2DDef::VT_EPILOGUE_ACTIVATION, Some(Activation::NONE)).unwrap()
   }
+  #[inline]
+  pub fn runtime_dense_readers(&self) -> bool {
+    self._tab.get::<bool>(Conv2DDef::VT_RUNTIME_DENSE_READERS, Some(false)).unwrap()
+  }
 }
 
 impl flatbuffers::Verifiable for Conv2DDef<'_> {
@@ -1438,6 +1444,7 @@ impl flatbuffers::Verifiable for Conv2DDef<'_> {
      .visit_field::<flatbuffers::ForwardsUOffset<flatbuffers::Vector<'_, Conv2DQuantParam>>>("runtime_quantization", Self::VT_RUNTIME_QUANTIZATION, false)?
      .visit_field::<bool>("epilogue_add", Self::VT_EPILOGUE_ADD, false)?
      .visit_field::<Activation>("epilogue_activation", Self::VT_EPILOGUE_ACTIVATION, false)?
+     .visit_field::<bool>("runtime_dense_readers", Self::VT_RUNTIME_DENSE_READERS, false)?
      .finish();
     Ok(())
   }
@@ -1469,6 +1476,7 @@ pub struct Conv2DDefArgs<'a> {
     pub runtime_quantization: Option<flatbuffers::WIPOffset<flatbuffers::Vector<'a, Conv2DQuantParam>>>,
     pub epilogue_add: bool,
     pub epilogue_activation: Activation,
+    pub runtime_dense_readers: bool,
 }
 impl<'a> Default for Conv2DDefArgs<'a> {
   #[inline]
@@ -1500,6 +1508,7 @@ impl<'a> Default for Conv2DDefArgs<'a> {
       runtime_quantization: None,
       epilogue_add: false,
       epilogue_activation: Activation::NONE,
+      runtime_dense_readers: false,
     }
   }
 }
@@ -1614,6 +1623,10 @@ impl<'a: 'b, 'b> Conv2DDefBuilder<'a, 'b> {
     self.fbb_.push_slot::<Activation>(Conv2DDef::VT_EPILOGUE_ACTIVATION, epilogue_activation, Activation::NONE);
   }
   #[inline]
+  pub fn add_runtime_dense_readers(&mut self, runtime_dense_readers: bool) {
+    self.fbb_.push_slot::<bool>(Conv2DDef::VT_RUNTIME_DENSE_READERS, runtime_dense_readers, false);
+  }
+  #[inline]
   pub fn new(_fbb: &'b mut flatbuffers::FlatBufferBuilder<'a>) -> Conv2DDefBuilder<'a, 'b> {
     let start = _fbb.start_table();
     Conv2DDefBuilder {
@@ -1657,6 +1670,7 @@ impl core::fmt::Debug for Conv2DDef<'_> {
       ds.field("runtime_quantization", &self.runtime_quantization());
       ds.field("epilogue_add", &self.epilogue_add());
       ds.field("epilogue_activation", &self.epilogue_activation());
+      ds.field("runtime_dense_readers", &self.runtime_dense_readers());
       ds.finish()
   }
 }

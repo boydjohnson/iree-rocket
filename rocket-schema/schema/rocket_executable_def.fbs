@@ -241,6 +241,19 @@ table Conv2DDef {
   // Appended last, for the vtable reason above.
   epilogue_add:bool = false;
   epilogue_activation:Activation = NONE;
+
+  // One more uint32 push constant, consumed after every runtime_dimensions
+  // and runtime_quantization entry: how many Rocket dispatches read this
+  // dispatch's result, as counted by the compiler over the final program,
+  // or zero when any other reader exists (a CPU dispatch, a copy, the
+  // module's own output) or the compiler did not count. The runtime may
+  // skip writing the dense output buffer only when exactly that many
+  // consumers on the same command buffer read the output cube in place
+  // instead; a reader on another command buffer leaves the count short and
+  // the dense write happens. Zero never elides anything, so an executable
+  // built without the count behaves as before. Appended last, for the
+  // vtable reason above.
+  runtime_dense_readers:bool = false;
 }
 
 // DEPRECATED: superseded by MatmulDef. Retained because union tags are

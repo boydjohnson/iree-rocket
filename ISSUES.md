@@ -462,14 +462,13 @@ The model's edges are behind the CPU residual add (10), the explicit pad
 in front of every depthwise (7) and the whole-atom rule (8 of the 14 direct
 NPU -> NPU edges, at 88/136/24 channels); P7 alone opens nothing.
 
-**What is left of P2 is the compaction, and it needs something this layer
-does not have.** `compact` is unmoved at 25.6 ms, 18% of wall, because the
-producer must still write the dense IREE buffer: nothing in a command buffer
-can prove that buffer has no other reader -- a later CPU dispatch, a later
+~~**What is left of P2 is the compaction, and it needs something this layer
+does not have.**~~ `compact` was unmoved at 25.6 ms, 18% of wall, because the
+producer still wrote the dense IREE buffer: nothing in a command buffer can
+prove that buffer has no other reader -- a later CPU dispatch, a later
 submission, or the model's own output -- and eliding the write on a guess is
-silent corruption. The signal exists in the compiler, where IREE's stream
-dialect knows a transient's last use, but reaching the HAL with it is a wire
-change, not a driver one. The other open edges are the elementwise, pooling
+silent corruption. **Landed 2026-09-08 as step 4 below**, with the signal
+coming from the compiler. The other open edges are the elementwise, pooling
 and matmul dispatch kinds, which record no cube yet: on a matmul-heavy model
 (ViT, Qwen3) that is where the same lever would apply.
 
@@ -480,6 +479,56 @@ to that buffer is usually a different tensor at a different offset, and every
 skip -- the wide tensors, `Cout` 512..2048 -- was declined as if blocked. The
 fix is to compare device byte *ranges* and skip writes that miss: 0 of 16
 skips became 16 of 16. `ROCKET_CHAIN=debug` printed the offsets that said so.
+
+**Step 4 landed 2026-09-08 -- the compaction half.** A dispatch skips
+writing its dense output buffer when every reader of its result took the
+output cube in place. The proof that there is no other reader is a count,
+not a flag, and it comes from the compiler: `rocket-mark-dense-readers`
+(run by `rocket-compiler` at the flow phase, next to the placement pin)
+walks each Rocket convolution's result once dispatch regions are final and
+counts the Rocket dispatches that read it, through `flow.tensor.reshape`;
+any other reader -- a CPU dispatch, `util.return`, a tied operand -- makes
+the count 0. The count rides as one more push constant
+(`Conv2DDef.runtime_dense_readers`, the trailing constant of every
+convolution target, literal 0 in every shim). The driver tallies, per
+recorded dispatch, how many later dispatches on the same command buffer
+chained to its cube and whether anything read its dense bytes instead (a
+consumer that declined, a kind that records no cube, a copy), and
+`apply_ops` drops the compaction iff `chained == count > 0` and no dense
+read was seen (`compaction_elidable`). Every failure mode keeps the write:
+a reader on a *later* command buffer leaves the tally short, which is why a
+count survives IREE's partitioning where a boolean would not; an executable
+compiled without the constant says 0. A driver-only version was considered
+and rejected: a transient from `queue_alloca` is not proof of a single
+command buffer, because IREE also allocas a result consumed by a later
+execute region.
+
+`planck`, `taskset -c 4-7`, medians of 4 interleaved passes, same binary
+and same `.vmfb`, `ROCKET_LAZY_COMPACT=1` against `=0`:
+
+| model | kept / skipped per inference | off | on | |
+|---|---|---:|---:|---:|
+| ResNet50 fp16, 224x224 | 2 / 51 | 142 ms | **114 ms** | **1.25x** |
+| ResNet50 fp16, 512x512 | 2 / 51 | 858 ms | **626 ms** | **1.37x** |
+| VGG19 fp16 | 5 / 11 | 533 ms | 502 ms | 1.06x |
+| MobileNetV2 fp16 (f16 import) | 45 / 2 | 87 ms | 88 ms | noise |
+
+Output bit-identical on and off for all four, and identical to the same
+model compiled before this change. ResNet50-224's profile: `compact` 0.45
+ms x 2650 calls -> 0.26 ms x 118 over the run, `wait.npu` share 62 -> 74 %.
+The compiler's own census matches the driver's: 51 of ResNet50's 52
+convolutions are read only by Rocket dispatches (66 reader edges, the 16
+residual skips counted twice), VGG19 11 of 16 (the other five feed max
+pools, which are Rocket dispatches that cannot chain), MobileNetV2 2 of 46.
+The two kept on ResNet50 are the stem (read by the CPU max pool) and the
+last conv (read by the head).
+
+With step 2 and step 4 together, ResNet50-224 is 169 -> 114 ms, and what
+the driver still does on the host for it is ~10 % of wall (`outside` is the
+CPU stem/pool/head). What is left of P2 is breadth, not depth: the
+elementwise, pooling and matmul kinds publish no cube, so nothing chains
+through them and nothing feeding them elides -- VGG19's five pool edges and
+every matmul edge on ViT/Qwen3.
 
 ---
 
@@ -1855,7 +1904,10 @@ Where the time actually is, per inference: `outside` **70.9 ms (54%)**,
    round trip; on this model P2's reach is gated on the residual add, the
    pad and the whole-atom chain rule, not on P7.
 2. **P2** — 24.4 ms, 19% of wall, and the one part of the old "layout
-   propagation" lever P8 never tested. Two caveats now attached to it: the
+   propagation" lever P8 never tested. **Steps 2 and 4 landed 2026-09-08**:
+   the driver chain and the compiler-counted lazy compaction take ResNet50
+   169 -> 114 ms bit-identically; the reach left is the matmul/pooling/
+   elementwise kinds, which publish no cube. Two caveats now attached to it: the
    cost is concentrated in one convolution (5.4 ms, 30% of `compact`), and
    that convolution feeds a *depthwise* op, so it is not chainable until P7
    moves. Sizing P2 against the whole 24.4 ms overstates its reach.

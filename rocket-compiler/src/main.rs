@@ -276,6 +276,12 @@ const PIN_PHASE: &str = "flow";
 /// Registered by the compiler plugin; see RocketPinUnclaimedDispatchesPass.cpp.
 const PIN_PASS: &str = "rocket-pin-unclaimed-dispatches";
 
+/// Registered by the compiler plugin; see RocketMarkDenseReadersPass.cpp. Runs
+/// at the same phase as the pin for the same reason: it needs every reader of
+/// a Rocket dispatch's result to be a formed dispatch, and it needs the
+/// dispatch's push constants to still be plain SSA operands.
+const MARK_DENSE_READERS_PASS: &str = "rocket-mark-dense-readers";
+
 /// Runs `Pipeline::Std` up to and including the `flow` phase and pins every
 /// dispatch the Rocket transform spec did not explicitly claim to the
 /// default (CPU) device, then leaves the invocation set to resume from
@@ -293,6 +299,7 @@ fn pin_unclaimed_dispatches(invocation: &Invocation) -> Result<(), Box<dyn Error
     invocation.set_compile_to_phase(PIN_PHASE);
     invocation.run_pipeline(Pipeline::Std)?;
     invocation.run_pass_pipeline(PIN_PASS)?;
+    invocation.run_pass_pipeline(MARK_DENSE_READERS_PASS)?;
     invocation.set_compile_from_phase(PIN_PHASE);
     Ok(())
 }

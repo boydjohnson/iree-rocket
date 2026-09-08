@@ -196,6 +196,9 @@ struct RocketConv2dConfig {
   // output cube and applies `epilogueActivation` in the EW core. Optional
   // keys, like the padding, for the same reason.
   bool epilogueAdd = false;
+  // One trailing push constant carries the compiler's count of Rocket
+  // dispatches that read the result (Conv2DDef.runtime_dense_readers).
+  bool runtimeDenseReaders = false;
   iree_hal_rocket_Activation_enum_t epilogueActivation =
       iree_hal_rocket_Activation_NONE;
 };
@@ -382,6 +385,15 @@ std::optional<RocketConv2dConfig> buildRocketConv2dConfigFromTarget(
   shape.padLeft = getOptionalU32("pad_left");
   if (Attribute attr = config.get("epilogue_add")) {
     shape.epilogueAdd = llvm::cast<BoolAttr>(attr).getValue();
+  }
+  if (Attribute attr = config.get("runtime_dense_readers")) {
+    auto boolAttr = llvm::dyn_cast<BoolAttr>(attr);
+    if (!boolAttr) {
+      diagFn() << "rocket backend: optional 'runtime_dense_readers' config "
+                  "value must be a bool";
+      return std::nullopt;
+    }
+    shape.runtimeDenseReaders = boolAttr.getValue();
   }
   if (Attribute attr = config.get("epilogue_activation")) {
     StringRef activation = llvm::cast<StringAttr>(attr).getValue();
@@ -1430,14 +1442,19 @@ public:
     // Dimensions first, then quantization parameters -- one flat push-constant
     // sequence in that order, which is the order rocket-hal-driver's
     // `Conv2dExecutable::resolve_shape` consumes them in.
+    // And last, the dense-reader count, when the convolution target asks for
+    // one (`runtime_dense_readers`); the driver reads it after the others.
+    size_t denseReaderCount =
+        convShape && convShape->runtimeDenseReaders ? 1 : 0;
     size_t runtimeConstantCount =
-        runtimeDimensionCount + runtimeQuantizationCount;
+        runtimeDimensionCount + runtimeQuantizationCount + denseReaderCount;
     if (pipelineConstantCount != static_cast<int64_t>(runtimeConstantCount)) {
       return exportOp.emitOpError()
              << "Rocket pipeline layout declares " << pipelineConstantCount
              << " push constants, but the executable target declares "
-             << runtimeDimensionCount << " runtime dimensions and "
-             << runtimeQuantizationCount << " runtime quantization parameters";
+             << runtimeDimensionCount << " runtime dimensions, "
+             << runtimeQuantizationCount << " runtime quantization parameters"
+             << " and " << denseReaderCount << " dense-reader count";
     }
 
     FlatbufferBuilder builder;
@@ -1740,7 +1757,9 @@ public:
           iree_hal_rocket_Conv2DDef_epilogue_add_add(builder,
                                                      convShape->epilogueAdd) ||
           iree_hal_rocket_Conv2DDef_epilogue_activation_add(
-              builder, convShape->epilogueActivation)) {
+              builder, convShape->epilogueActivation) ||
+          iree_hal_rocket_Conv2DDef_runtime_dense_readers_add(
+              builder, convShape->runtimeDenseReaders)) {
         return variantOp.emitOpError()
                << "failed to populate Rocket convolution definition";
       }

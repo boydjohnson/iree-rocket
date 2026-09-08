@@ -553,6 +553,11 @@ pub fn report() {
         eprintln!("  scratch pool: {reused} reused, {allocated} allocated");
     }
 
+    let elided = crate::command_buffer::ELIDED_COMPACTIONS.load(Ordering::Relaxed);
+    if elided > 0 {
+        eprintln!("  compaction: {elided} dense output write(s) skipped, every reader chained");
+    }
+
     // Per-op: which dispatch shapes the time is in, and for each, how it
     // splits between hardware and the host-side layout bridging around it.
     let columns: Vec<Phase> = Phase::ALL
