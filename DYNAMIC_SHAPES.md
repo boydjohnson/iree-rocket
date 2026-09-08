@@ -3,12 +3,15 @@
 What it would take to compile a model whose tensor dimensions are symbolic
 (`tensor<1x?x?x?xf16>`) through `rocket-compiler` and run it under
 `iree-run-module` with the extents supplied at invocation time. Written
-2026-09-07 against `main` at `965708a`.
+2026-09-07 against `main` at `965708a`, which was already three commits behind
+`main` when it was written. Every citation below was re-checked on 2026-09-07
+against `main` at `68f281c` and is given for *that* tree; the review that
+produced the corrections is recorded inline.
 
 Read alongside the other three. [LIMITS.md](LIMITS.md) says what the stack is
 *measured* to do and which layer enforces each bound; [ISSUES.md](ISSUES.md)
 carries the open defects; [ROADMAP.md](ROADMAP.md) says which operations the
-hardware could run but the compiler cannot reach. This file is a fifth
+hardware could run but the compiler cannot reach. This file is a fourth
 question that cuts across all three: not *which* op, but whether an op's
 **extents** have to be known when the `.vmfb` is written.
 
@@ -36,15 +39,17 @@ the executable template and is replaced before validation. `Conv2DDef` adds
 runtime derives them, so no dispatch can state an output shape the register
 program was not built for.
 
-**The serializer** [verified]. [`RocketTarget.cpp:389`](rocket-compiler-plugin/target/Rocket/RocketTarget.cpp:389)
+**The serializer** [verified]. [`RocketTarget.cpp:415`](rocket-compiler-plugin/target/Rocket/RocketTarget.cpp:415)
 parses `runtime_dimensions` off the `#hal.executable.target` config for conv,
-and again at `:707` (pooling), `:815` (matmul) and `:1174` (element-wise). It
-enforces the template contract in both directions: a listed dimension whose
+and again at `:732` (pooling), `:840` (element-wise, in the shared
+`parseElementwiseRuntimeDimensions` helper the three element-wise builders
+call) and `:1199` (matmul). It enforces the template contract in both
+directions: a listed dimension whose
 template value is nonzero is an error, and so is a zero dimension that is not
 listed.
 
 **The transform spec's dispatch helpers** [verified].
-[`@call_rocket_dynamic_conv2d`](rocket-compiler-plugin/target/Rocket/rocket_conv2d_transform_spec.mlir:2612)
+[`@call_rocket_dynamic_conv2d`](rocket-compiler-plugin/target/Rocket/rocket_conv2d_transform_spec.mlir:3279)
 is *already written against* `tensor<1x?x?x?xf16>`. It reads the six settable
 extents with `tensor.dim`, `arith.index_cast`s them to `i32`, and passes them
 as the push constants `#dynamic_pipeline_layout` declares (`constants = 6`).
@@ -109,8 +114,8 @@ reported.
 
 `@match_dynamic_conv2d` alone carries two of these
 (`transform.iree.match.dim_bounds %input_value[3], umin = 1, umax = 3584` on
-Cin and the same on the filter's Cout), and the strided, 3x3, depthwise and
-int8 variants each carry their own.
+Cin at spec `:5923` and the same on the filter's Cout at `:5935`), and the
+strided, 3x3, depthwise and int8 variants each carry their own.
 
 ### The mechanism to fix it exists, but is not wired end to end
 
@@ -124,11 +129,12 @@ dimension *value* is visible to the constraint set.
 What is not established is the chain from that index value to the *tensor
 value's* dim, which is what `dim_bounds` asks about. Grepping
 `compiler/src/iree/compiler/` for `ValueBoundsOpInterface` implementations
-returns only the Util, TensorExt (`DispatchTensorLoadOp`,
-`DispatchWorkloadOrdinalOp`) and HAL (workgroup ID/count) external models
-[verified] -- **nothing for `flow.tensor.tie_shape`**, which is the op that
-normally ties an assumed dim back onto a dynamically-shaped tensor at this
-stage of the pipeline.
+returns only the Util (`util.assume.int`), Codegen
+(`LoadFromBufferOp`, `Codegen/ExternalInterfaces/UtilExternalModels.cpp:21`),
+TensorExt (`DispatchTensorLoadOp`, `DispatchWorkloadOrdinalOp`) and HAL
+(workgroup ID/count) external models [verified] -- **nothing for
+`flow.tensor.tie_shape`**, which is the op that normally ties an assumed dim
+back onto a dynamically-shaped tensor at this stage of the pipeline.
 
 Two ways out, and they are genuinely different amounts of work:
 
@@ -180,16 +186,25 @@ needs none of this.
 
 ---
 
-## DS3 (S1) — the hardware envelope moves from compile time to dispatch time, and one bound is not checked at either
+## DS3 (S1) — the hardware envelope moves from compile time to dispatch time, and one bound is checked at neither -- already, today
 
-Today the channel and kernel ceilings are compile-time matcher facts.
+Today the *channel* ceilings are compile-time matcher facts.
 `@match_dynamic_conv2d` bounds Cin and Cout at 3584 (matching
 `conv::MAX_INPUT_CHANNELS` / `MAX_OUTPUT_CHANNELS`,
 `iree-rocket-hal/src/rocket/conv.rs:297` and `:495`); the 3x3 matcher keeps a
-separate 1152; stride lives in the executable variant. A model outside the
-envelope simply does not match and runs on the CPU -- correct, just slower.
+separate Cin 1152 / Cout 1792 (spec `:6013` and `:6014`); stride lives in the
+executable variant. A model outside *those* bounds does not match and runs on
+the CPU -- correct, just slower.
 
-With symbolic extents there is nothing to check at compile time. The check
+The spatial envelope is a different story, and it is the one that matters
+below: the dense conv matchers carry `dim_bounds` on Cin and Cout only, and no
+bound on H or W at all [verified] -- every `%input_value[1]`/`[2]` bound in the
+spec belongs to a pooling or NCHW-depthwise matcher. So for spatial extent the
+"move to dispatch time" this section describes has *already happened*, for
+static models, and the rest of this section is a statement about the stack as
+it stands rather than a consequence of symbolic shapes.
+
+With symbolic extents there is nothing left to check at compile time. The check
 lands at dispatch, in
 [`validate_conv_shape`](iree-rocket-hal/src/rocket/executable_format.rs:341)
 [verified], which trial-plans the shape under `catch_unwind` and turns a
@@ -210,10 +225,12 @@ let (resolved_shape, kernels) = match executable.resolve_shape(constants) {
 runtime CPU fallback**. An out-of-envelope invocation is a hard
 `iree-run-module` failure, not a slow success.
 
-### The part that is S1, not S3
+### The part that is S1, not S3 -- and is reachable now
 
-`@match_dynamic_conv2d`'s own comment says the Cout bound is not the real
-discriminator for the all-zero-output bug:
+`@match_dynamic_conv2d_3x3`'s own comment says the Cout bound is not the real
+discriminator for the all-zero-output bug (the same comment is duplicated
+verbatim in `@match_dynamic_conv2d`, but its content -- `features.0`,
+`features.19`, a 3x3 footprint -- is about the 3x3 matcher):
 
 > The real discriminator is an 11/1-style split combined with a large
 > coefficient footprint [...] This bound is still safe for VGG specifically --
@@ -221,16 +238,29 @@ discriminator for the all-zero-output bug:
 > channel count -- but that is a property of VGG's specific shapes, not a
 > guarantee this Cout<=256 rule provides in general.
 
+**That `Cout<=256` rule no longer exists** [verified]. `@match_dynamic_conv2d_3x3`
+now bounds Cin at 1152 and Cout at 1792 (spec `:6013`, `:6014`), so
+`Cin=256`/`Cout=256`/3x3 at 26x26 through 48x48 -- the exact shape the comment
+calls deterministically all-zero -- is comfortably inside the bounds in force,
+with fully static extents. The comment's reasoning describes a matcher that was
+narrowed away from underneath it. [LIMITS.md](LIMITS.md) `:493` already records
+this as an open hazard in the same terms, and adds that the
+`conv_cbuf_split_sweep_hw.rs` and `DESIGN_NOTES.md` the comment cites as its
+evidence are both gone from this tree.
+
 `validate_conv_shape` only runs `ConvPlan::new` and asks whether it panicked
 [verified]. The 11/1-split-plus-large-footprint case does not panic -- it
-plans, dispatches, and returns all zeros. So a symbolic convolution that lands
-there at runtime produces **silently wrong output**, which is the one outcome
-this repo's design notes consistently rank worst.
+plans, dispatches, and returns all zeros. So a convolution that lands there
+produces **silently wrong output**, which is the one outcome this repo's design
+notes consistently rank worst.
 
-**This must be closed before symbolic Cin/Cout ship.** `ConvPlan` (or
-`validate_conv_shape` on top of it) needs an explicit refusal for that split
-at a large coefficient footprint, so the case that is today merely
-*unreachable-by-matcher* becomes *rejected-by-runtime*.
+**This is a live defect, not a prerequisite this file creates.** Symbolic
+extents widen the exposure -- an in-envelope model could reach the bad split on
+one invocation's resolution and not another's -- but they do not open it.
+`ConvPlan` (or `validate_conv_shape` on top of it) needs an explicit refusal
+for that split at a large coefficient footprint, so a case that is today
+*silently wrong* becomes *rejected-by-runtime*. Because the evidence files are
+gone, the first step is re-measuring the shape, not writing the refusal.
 
 ### And a policy decision
 
@@ -322,21 +352,27 @@ Two smaller consequences of moving the decision to runtime:
   compiler: the model must be *imported* with dynamic dims in the entry
   signature (`iree-import-onnx` on a model with symbolic dim params, or a torch
   export with `dynamic_shapes`).
-- **`RocketExpandOnnxConvIntegerPass`** already declines a dynamic kernel
-  extent with a warning
+- **`RocketExpandOnnxConvIntegerPass`** handles a dynamic kernel extent by
+  falling back to the `torch.onnx.kernel_shape` attribute, and warns out only
+  when that attribute is missing or the wrong length
   ([`:204`](rocket-compiler-plugin/target/Rocket/RocketExpandOnnxConvIntegerPass.cpp:204))
-  [verified]. Weights are constants in every model measured here, so this is a
-  correct refusal rather than a gap.
+  [verified] -- a narrower refusal than "declines a dynamic kernel", and better
+  news for a symbolic import, since ONNX carries `kernel_shape` on the op.
+  Weights are constants in every model measured here either way, so this is not
+  a gap.
 
 ---
 
 ## Recommended order
 
-1. **DS3's silent-zero refusal first**, before anything else makes the case
-   reachable. It is the only S1 here, it is self-contained in
-   `ConvPlan`/`validate_conv_shape`, and it is worth having regardless of
-   whether symbolic shapes ever ship -- ISSUES.md C9 is the same class of
-   defect at a different kernel size.
+1. **DS3's silent-zero refusal first** -- and not because symbolic shapes make
+   the case reachable, but because it is reachable now, with static extents,
+   inside the bounds the 3x3 matcher enforces today (LIMITS.md `:493`). It is
+   the only S1 here, it is self-contained in `ConvPlan`/`validate_conv_shape`,
+   and it should be re-measured and closed whether or not symbolic shapes ever
+   ship -- ISSUES.md C9 is the same class of defect at a different kernel
+   size. Everything else on this list is genuinely gated on wanting the
+   feature; this is not.
 2. **DS1**, preferring the `tie_shape` external model (option 1) over
    re-spelling the matchers, because it leaves `spec::neutralize` and the
    `--no-offload` baseline intact (DS5). Acceptance is a lit test that a
@@ -353,10 +389,13 @@ Two smaller consequences of moving the decision to runtime:
 
 ## What this file does not claim
 
-That symbolic shapes are *worth* it. [ISSUES.md P8](ISSUES.md) measured that at
-the current per-dispatch cost more offload sites make a model slower, and
-nothing here changes a single dispatch's cost -- a symbolic model runs the same
-register program the static one does. The case for this work is **coverage**:
-serving a model whose input resolution or sequence length is not fixed at
-compile time, without recompiling per shape. Read ROADMAP.md's opening warning
+That symbolic shapes are *worth* it. [ISSUES.md P8](ISSUES.md) `:554` measured
+the offload's cost as a flat per-dispatch tax *that parallelises*, and its
+constant has moved since: on a full machine the fp16 dense models beat their
+own `--no-offload` baselines, so "more sites is slower" is the starved-core
+int8 reading, not a general law. What survives for this file is the weaker
+claim, which is enough: nothing here changes a single dispatch's cost -- a
+symbolic model runs the same register program the static one does. The case
+for this work is **coverage**: serving a model whose input resolution or
+sequence length is not fixed at compile time, without recompiling per shape. Read ROADMAP.md's opening warning
 before treating it as a throughput proposal.
