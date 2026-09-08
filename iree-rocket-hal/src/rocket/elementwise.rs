@@ -225,6 +225,19 @@ pub struct EwAddBuffers {
 ///
 /// [`build_lut_regcmd`]: crate::rocket::activation::build_lut_regcmd
 pub fn build_add_regcmd(shape: &EwAddShape, bufs: &EwAddBuffers) -> Vec<RegCmd> {
+    build_add_regcmd_with_relu(shape, bufs, false)
+}
+
+/// [`build_add_regcmd`] with the EW core's own ReLU optionally left in
+/// circuit after the ALU (`DPU_EW_CFG.ew_relu_bypass = 0`), so the task
+/// computes `max(a op b, 0)`: a residual block's `relu(conv(x) + skip)` in
+/// one task once the conv has written its cube. Hardware-validated by
+/// `tests/conv_residual_add_hw.rs` on a multi-tile conv's output cube.
+pub fn build_add_regcmd_with_relu(
+    shape: &EwAddShape,
+    bufs: &EwAddBuffers,
+    relu: bool,
+) -> Vec<RegCmd> {
     assert!(
         shape.width > 0 && shape.height > 0 && shape.channels > 0,
         "build_add_regcmd: width, height, and channels must be nonzero"
@@ -384,7 +397,7 @@ pub fn build_add_regcmd(shape: &EwAddShape, bufs: &EwAddBuffers) -> Vec<RegCmd> 
         .ew_data_mode(Bits::new(1))
         .edata_size(Bits::new(edata_size))
         .ew_alu_algo(Bits::new(shape.op.alu_algo()))
-        .ew_relu_bypass(Bits::new(1))
+        .ew_relu_bypass(Bits::new(if relu { 0 } else { 1 }))
         .ew_lut_bypass(Bits::new(1))
         .ew_op_src(Bits::new(1)); // operand from outside (the second tensor)
     if shape.op.is_mul() {
