@@ -362,6 +362,32 @@ its own at one context.
 | `ROCKET_SCRATCH_POOL=0` | Allocate and free every scratch buffer instead of pooling. |
 | `ROCKET_SCRATCH_POOL_MB=N` | Bytes the scratch free lists may hold, default 256 per context. |
 
+Two dispatches on one command buffer that share a tensor do not go through
+the dense buffer between them. The consumer reads the producer's NC1HWC2
+output cube in place instead of repacking (the *chain*), and the producer
+skips writing the dense buffer at all when the compiler counted every reader
+of its result as a Rocket dispatch and every one of them chained (*lazy
+compaction*). Every dispatch kind takes part -- convolution, matmul, pooling
+and element-wise -- with one geometric caveat: the PPU strides its surfaces
+by the pixel count rounded up to four, so a pool only chains at a multiple
+of four pixels. The count travels as the dispatch's last push constant
+(`rocket-mark-dense-readers`, run by `rocket-compiler` at the flow phase);
+a reader on another command buffer, a CPU reader, or a consumer that could
+not chain all keep the write. Two compiler details make the edges adjacent
+in the first place: each shim widens its f16 result with a plain generic
+whose accumulator-init term `rocket-fold-neutral-init` drops when the init
+is a zero (or -inf) fill, so the consumer's narrow cancels it, and the
+demote pass narrows an f32 import *through* its zero pads so the pad-folding
+matchers still see `pad -> conv`. The profile's `compaction:` line counts
+the writes skipped; `pack.input` and `compact` are the phases that shrink.
+
+| Variable | Effect |
+|---|---|
+| `ROCKET_CHAIN=0` | Always repack a consumer's input from the dense buffer. Implies no lazy compaction. |
+| `ROCKET_CHAIN=debug` | Print every chain edge taken and why each other one was declined. |
+| `ROCKET_LAZY_COMPACT=0` | Always write the dense output buffer. |
+| `ROCKET_LAZY_COMPACT=debug` | Print every dispatch's kept/skipped decision with the reader counts behind it. |
+
 `iree-rocket-hal`'s `layout_bench` and `gem_bandwidth` examples measure the
 transforms and the GEM mapping directly, which is a much faster way to test a
 hypothesis about either than a model run:

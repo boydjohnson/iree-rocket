@@ -241,6 +241,19 @@ table Conv2DDef {
   // Appended last, for the vtable reason above.
   epilogue_add:bool = false;
   epilogue_activation:Activation = NONE;
+
+  // One more uint32 push constant, consumed after every runtime_dimensions
+  // and runtime_quantization entry: how many Rocket dispatches read this
+  // dispatch's result, as counted by the compiler over the final program,
+  // or zero when any other reader exists (a CPU dispatch, a copy, the
+  // module's own output) or the compiler did not count. The runtime may
+  // skip writing the dense output buffer only when exactly that many
+  // consumers on the same command buffer read the output cube in place
+  // instead; a reader on another command buffer leaves the count short and
+  // the dense write happens. Zero never elides anything, so an executable
+  // built without the count behaves as before. Appended last, for the
+  // vtable reason above.
+  runtime_dense_readers:bool = false;
 }
 
 // DEPRECATED: superseded by MatmulDef. Retained because union tags are
@@ -323,6 +336,10 @@ table PoolingDef {
   // table, entries must be unique, and an absent vector preserves a fully
   // static ABI.
   runtime_dimensions:[PoolingDimension];
+
+  // See Conv2DDef.runtime_dense_readers: one trailing uint32 push constant
+  // carrying the compiler's count of Rocket dispatches that read the result.
+  runtime_dense_readers:bool = false;
 }
 
 // Describes one row-major [M,K] x [K,N] -> [M,N] matmul.
@@ -360,6 +377,10 @@ table MatmulDef {
 
   // Same contract as Conv2DDef.runtime_dimensions.
   runtime_dimensions:[MatmulDimension];
+
+  // See Conv2DDef.runtime_dense_readers: one trailing uint32 push constant
+  // carrying the compiler's count of Rocket dispatches that read the result.
+  runtime_dense_readers:bool = false;
 }
 
 // Describes one standalone unary element-wise operation on the EW ALU.
@@ -401,6 +422,10 @@ table ElementwiseUnaryDef {
   // table, entries must be unique, and an absent vector preserves a fully
   // static ABI.
   runtime_dimensions:[ElementwiseDimension];
+
+  // See Conv2DDef.runtime_dense_readers: one trailing uint32 push constant
+  // carrying the compiler's count of Rocket dispatches that read the result.
+  runtime_dense_readers:bool = false;
 }
 
 // Describes one standalone two-tensor element-wise operation on the EW
@@ -429,6 +454,10 @@ table ElementwiseBinaryDef {
 
   // Same contract as ElementwiseUnaryDef.runtime_dimensions.
   runtime_dimensions:[ElementwiseDimension];
+
+  // See Conv2DDef.runtime_dense_readers: one trailing uint32 push constant
+  // carrying the compiler's count of Rocket dispatches that read the result.
+  runtime_dense_readers:bool = false;
 }
 
 // Describes one standalone LUT activation: `out = f(in)` for one of the
@@ -470,6 +499,10 @@ table ElementwiseLutDef {
 
   // Same contract as ElementwiseUnaryDef.runtime_dimensions.
   runtime_dimensions:[ElementwiseDimension];
+
+  // See Conv2DDef.runtime_dense_readers: one trailing uint32 push constant
+  // carrying the compiler's count of Rocket dispatches that read the result.
+  runtime_dense_readers:bool = false;
 }
 
 // Add future Rocket kernel kinds here. Existing numeric values must not be

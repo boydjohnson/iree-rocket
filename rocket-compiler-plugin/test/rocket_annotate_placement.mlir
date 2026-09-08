@@ -9,6 +9,13 @@
 // RUN:   --compile-to=preprocessing \
 // RUN:   --mlir-print-op-generic=false \
 // RUN:   -o - | FileCheck %s --check-prefix=ORIGINAL
+// The FINAL stage is the three-stage pipeline rocket-compiler drives:
+// compile to flow, pin every dispatch the spec did not claim to the CPU
+// (and count each Rocket result's readers), then resume. The widen generic
+// each Rocket shim leaves behind would otherwise inherit the Rocket
+// dispatch's affinity and be formed into a "rocket" executable with no
+// config to serialize -- which is exactly what the pin exists to prevent,
+// and why a single iree-compile invocation is not how a model is compiled.
 // RUN: iree-compile %s \
 // RUN:   --iree-preprocessing-transform-spec-filename=%S/../target/Rocket/rocket_conv2d_transform_spec.mlir \
 // RUN:   --iree-hal-target-device=rocket_device=rocket \
@@ -17,6 +24,16 @@
 // RUN:   --iree-llvmcpu-target-cpu=generic \
 // RUN:   --iree-hal-default-device=cpu_device \
 // RUN:   --iree-hal-indirect-command-buffers=false \
+// RUN:   --compile-to=flow \
+// RUN:   -o - | iree-opt --pass-pipeline="builtin.module(rocket-pin-unclaimed-dispatches,rocket-mark-dense-readers)" \
+// RUN:   | iree-compile - \
+// RUN:   --iree-hal-target-device=rocket_device=rocket \
+// RUN:   --iree-hal-target-device=cpu_device=local \
+// RUN:   --iree-hal-local-target-device-backends=llvm-cpu \
+// RUN:   --iree-llvmcpu-target-cpu=generic \
+// RUN:   --iree-hal-default-device=cpu_device \
+// RUN:   --iree-hal-indirect-command-buffers=false \
+// RUN:   --compile-from=flow \
 // RUN:   --compile-to=executable-targets \
 // RUN:   --mlir-print-op-generic=false \
 // RUN:   -o - | iree-opt --pass-pipeline="builtin.module(rocket-annotate-final-placement)" \
@@ -128,7 +145,9 @@ util.func public @stride3_dense_conv_disabled_matcher(
 // It reads the resolved backend straight off each variant: the two matched
 // ops above produced Rocket executables; every CPU fallback -- the unmatched
 // ops, and the elementwise accumulate dispatch each Rocket call still needs
-// on the CPU side -- targets "llvm-cpu" and is tagged "cpu".
+// on the CPU side (this file's convolutions take their init as an argument,
+// so rocket-fold-neutral-init cannot drop it) -- targets "llvm-cpu" and is
+// tagged "cpu", because the pin stage placed it there.
 //
 // There is one accumulate dispatch rather than two: the stride-1 and
 // stride-2 calls need the identical f16-to-f32 body, and IREE deduplicates

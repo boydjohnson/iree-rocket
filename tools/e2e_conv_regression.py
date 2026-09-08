@@ -514,6 +514,67 @@ func.func @fp16_residual_relu(%input: tensor<1x16x16x64xf16>, %filter: tensor<1x
   return %out : tensor<1x16x16x128xf32>
 }
 
+// Two fp16 convolutions with a stride-2 max pool between them, all three on
+// the NPU -- VGG's block boundary. The pool reads conv A's output cube in
+// place (16x16 = 256 pixels, a multiple of the PPU's four-pixel surface
+// stride, at 64 whole-atom channels) and conv B reads the pool's; A and the
+// pool then skip their dense writes, since each is read only by the next
+// Rocket dispatch. ISSUES.md P2, the breadth half.
+func.func @fp16_conv_pool_conv_chain(%input: tensor<1x16x16x64xf16>, %f1: tensor<1x1x64x64xf16>, %f2: tensor<1x1x64x128xf16>) -> tensor<1x8x8x128xf32> {
+  %zero = arith.constant 0.000000e+00 : f32
+  %lowest = arith.constant 0xFF800000 : f32
+  %a_empty = tensor.empty() : tensor<1x16x16x64xf32>
+  %a_init = linalg.fill ins(%zero : f32) outs(%a_empty : tensor<1x16x16x64xf32>) -> tensor<1x16x16x64xf32>
+  %a = linalg.conv_2d_nhwc_hwcf
+      {dilations = dense<1> : vector<2xi64>, strides = dense<1> : vector<2xi64>}
+      ins(%input, %f1 : tensor<1x16x16x64xf16>, tensor<1x1x64x64xf16>)
+      outs(%a_init : tensor<1x16x16x64xf32>) -> tensor<1x16x16x64xf32>
+  %window = tensor.empty() : tensor<2x2xf32>
+  %p_empty = tensor.empty() : tensor<1x8x8x64xf32>
+  %p_init = linalg.fill ins(%lowest : f32) outs(%p_empty : tensor<1x8x8x64xf32>) -> tensor<1x8x8x64xf32>
+  %p = linalg.pooling_nhwc_max
+      {dilations = dense<1> : tensor<2xi64>, strides = dense<2> : tensor<2xi64>}
+      ins(%a, %window : tensor<1x16x16x64xf32>, tensor<2x2xf32>)
+      outs(%p_init : tensor<1x8x8x64xf32>) -> tensor<1x8x8x64xf32>
+  %p16_empty = tensor.empty() : tensor<1x8x8x64xf16>
+  %p16 = linalg.generic {
+      indexing_maps = [affine_map<(d0, d1, d2, d3) -> (d0, d1, d2, d3)>,
+                       affine_map<(d0, d1, d2, d3) -> (d0, d1, d2, d3)>],
+      iterator_types = ["parallel", "parallel", "parallel", "parallel"]}
+      ins(%p : tensor<1x8x8x64xf32>) outs(%p16_empty : tensor<1x8x8x64xf16>) {
+  ^bb0(%wide: f32, %unused: f16):
+    %narrow = arith.truncf %wide : f32 to f16
+    linalg.yield %narrow : f16
+  } -> tensor<1x8x8x64xf16>
+  %b_empty = tensor.empty() : tensor<1x8x8x128xf32>
+  %b_init = linalg.fill ins(%zero : f32) outs(%b_empty : tensor<1x8x8x128xf32>) -> tensor<1x8x8x128xf32>
+  %b = linalg.conv_2d_nhwc_hwcf
+      {dilations = dense<1> : vector<2xi64>, strides = dense<1> : vector<2xi64>}
+      ins(%p16, %f2 : tensor<1x8x8x64xf16>, tensor<1x1x64x128xf16>)
+      outs(%b_init : tensor<1x8x8x128xf32>) -> tensor<1x8x8x128xf32>
+  return %b : tensor<1x8x8x128xf32>
+}
+
+// Two matmuls back to back, the transformer's projection chain: the second
+// reads the first's width-M cube in place (M = 64 pixels at K = 128 whole-
+// atom channels) and the first skips its dense write. The f32 spelling is
+// what an f32 import gives the demote pass; its truncf/extf pair folds
+// after inlining so nothing sits between the two dispatches.
+func.func @fp16_matmul_chain(%lhs: tensor<64x128xf32>, %w1: tensor<128x128xf32>, %w2: tensor<128x64xf32>) -> tensor<64x64xf32> {
+  %zero = arith.constant 0.000000e+00 : f32
+  %a_empty = tensor.empty() : tensor<64x128xf32>
+  %a_init = linalg.fill ins(%zero : f32) outs(%a_empty : tensor<64x128xf32>) -> tensor<64x128xf32>
+  %a = linalg.matmul
+      ins(%lhs, %w1 : tensor<64x128xf32>, tensor<128x128xf32>)
+      outs(%a_init : tensor<64x128xf32>) -> tensor<64x128xf32>
+  %b_empty = tensor.empty() : tensor<64x64xf32>
+  %b_init = linalg.fill ins(%zero : f32) outs(%b_empty : tensor<64x64xf32>) -> tensor<64x64xf32>
+  %b = linalg.matmul
+      ins(%a, %w2 : tensor<64x128xf32>, tensor<128x64xf32>)
+      outs(%b_init : tensor<64x64xf32>) -> tensor<64x64xf32>
+  return %b : tensor<64x64xf32>
+}
+
 func.func @requant_int8_chain(%input: tensor<1x8x8x64xi8>, %f1: tensor<1x1x64x64xi8>, %b1: tensor<64xi32>, %f2: tensor<1x1x64x64xi8>, %b2: tensor<64xi32>) -> tensor<1x8x8x64xi8> {
   %a_zero = arith.constant 0 : i32
   %a_scale = arith.constant 2.000000e-02 : f32
@@ -1157,6 +1218,12 @@ def write_compiled_fixture(work_dir: Path) -> None:
     np.save(work_dir / "fp16_residual_relu_kernel.npy", rng.uniform(-0.25, 0.25, size=(1, 1, 64, 128)).astype(np.float16))
     np.save(work_dir / "fp16_residual_relu_bias.npy", rng.uniform(-1.0, 1.0, size=(128,)).astype(np.float32))
     np.save(work_dir / "fp16_residual_relu_skip.npy", rng.uniform(-2.0, 2.0, size=(1, 16, 16, 128)).astype(np.float16))
+    np.save(work_dir / "fp16_conv_pool_conv_chain_input.npy", rng.uniform(-1.0, 1.0, size=(1, 16, 16, 64)).astype(np.float16))
+    np.save(work_dir / "fp16_conv_pool_conv_chain_f1.npy", rng.uniform(-0.25, 0.25, size=(1, 1, 64, 64)).astype(np.float16))
+    np.save(work_dir / "fp16_conv_pool_conv_chain_f2.npy", rng.uniform(-0.25, 0.25, size=(1, 1, 64, 128)).astype(np.float16))
+    np.save(work_dir / "fp16_matmul_chain_lhs.npy", rng.uniform(-1.0, 1.0, size=(64, 128)).astype(np.float32))
+    np.save(work_dir / "fp16_matmul_chain_w1.npy", rng.uniform(-0.25, 0.25, size=(128, 128)).astype(np.float32))
+    np.save(work_dir / "fp16_matmul_chain_w2.npy", rng.uniform(-0.25, 0.25, size=(128, 64)).astype(np.float32))
 
     np.save(work_dir / "requant_int8_1x1_cout1792_input.npy", i8(1, 7, 7, 448))
     np.save(work_dir / "requant_int8_1x1_cout1792_kernel.npy", i8_small(1, 1, 448, 1792))
@@ -1232,7 +1299,7 @@ def compile_modules(
             str(flow),
             "-o",
             str(pinned),
-            "--pass-pipeline=builtin.module(rocket-pin-unclaimed-dispatches)",
+            "--pass-pipeline=builtin.module(rocket-pin-unclaimed-dispatches,rocket-mark-dense-readers)",
         ]
     )
     run(
@@ -1276,6 +1343,8 @@ def compile_modules(
         ("requant_int8_1x1_cin816_cout448", "rocket_dynamic_int8_requant_executable"),
         ("requant_int8_1x1_large_bias", "rocket_dynamic_int8_requant_executable"),
         ("fp16_residual_relu", "rocket_dynamic_residual_relu_executable"),
+        ("fp16_conv_pool_conv_chain", "rocket_pooling_max_executable_s2"),
+        ("fp16_matmul_chain", "rocket_matmul_executable"),
         ("requant_int8_chain", "rocket_dynamic_int8_requant_executable"),
         ("requant_int8_chain_cpu_between", "rocket_dynamic_int8_requant_executable"),
         ("requant_int8_1x1_acc_pos", "rocket_dynamic_int8_requant_executable"),
@@ -1644,6 +1713,28 @@ def run_compiled_gate(
             0.02,
         ),
         Case(
+            "fp16_conv_pool_conv_chain",
+            (
+                "fp16_conv_pool_conv_chain_input.npy",
+                "fp16_conv_pool_conv_chain_f1.npy",
+                "fp16_conv_pool_conv_chain_f2.npy",
+            ),
+            ("fp16_conv_pool_conv_chain_out_rocket.npy",),
+            0.05,
+            0.02,
+        ),
+        Case(
+            "fp16_matmul_chain",
+            (
+                "fp16_matmul_chain_lhs.npy",
+                "fp16_matmul_chain_w1.npy",
+                "fp16_matmul_chain_w2.npy",
+            ),
+            ("fp16_matmul_chain_out_rocket.npy",),
+            0.05,
+            0.02,
+        ),
+        Case(
             "requant_int8_chain",
             (
                 "requant_int8_chain_input.npy",
@@ -1878,7 +1969,7 @@ def main() -> None:
         type=Path,
         default=ROOT / "iree-build/build/tools/iree-opt",
         help="iree-opt with the Rocket plugin registered; runs "
-        "rocket-pin-unclaimed-dispatches between the flow and stream phases, "
+        "rocket-pin-unclaimed-dispatches and rocket-mark-dense-readers between the flow and stream phases, "
         "which a single iree-compile invocation cannot do",
     )
     parser.add_argument(

@@ -456,16 +456,19 @@ have no NPU producer on their command buffer (the stem, behind the CPU max
 pool). MobileNetV2 fp16 is 134 -> 132 ms and bit-identical, with 1 of 34
 edges chained -- its depthwise convolutions sit on the CPU between every pair
 of dense ones, so its reach is gated on P7, exactly as the 2026-09-07 sizing
-above said.
+above said. **Corrected 2026-09-08 by measuring it** (P7): with the seven
+admissible depthwise offloaded the chain still takes that same one edge.
+The model's edges are behind the CPU residual add (10), the explicit pad
+in front of every depthwise (7) and the whole-atom rule (8 of the 14 direct
+NPU -> NPU edges, at 88/136/24 channels); P7 alone opens nothing.
 
-**What is left of P2 is the compaction, and it needs something this layer
-does not have.** `compact` is unmoved at 25.6 ms, 18% of wall, because the
-producer must still write the dense IREE buffer: nothing in a command buffer
-can prove that buffer has no other reader -- a later CPU dispatch, a later
+~~**What is left of P2 is the compaction, and it needs something this layer
+does not have.**~~ `compact` was unmoved at 25.6 ms, 18% of wall, because the
+producer still wrote the dense IREE buffer: nothing in a command buffer can
+prove that buffer has no other reader -- a later CPU dispatch, a later
 submission, or the model's own output -- and eliding the write on a guess is
-silent corruption. The signal exists in the compiler, where IREE's stream
-dialect knows a transient's last use, but reaching the HAL with it is a wire
-change, not a driver one. The other open edges are the elementwise, pooling
+silent corruption. **Landed 2026-09-08 as step 4 below**, with the signal
+coming from the compiler. The other open edges are the elementwise, pooling
 and matmul dispatch kinds, which record no cube yet: on a matmul-heavy model
 (ViT, Qwen3) that is where the same lever would apply.
 
@@ -476,6 +479,121 @@ to that buffer is usually a different tensor at a different offset, and every
 skip -- the wide tensors, `Cout` 512..2048 -- was declined as if blocked. The
 fix is to compare device byte *ranges* and skip writes that miss: 0 of 16
 skips became 16 of 16. `ROCKET_CHAIN=debug` printed the offsets that said so.
+
+**Step 4 landed 2026-09-08 -- the compaction half.** A dispatch skips
+writing its dense output buffer when every reader of its result took the
+output cube in place. The proof that there is no other reader is a count,
+not a flag, and it comes from the compiler: `rocket-mark-dense-readers`
+(run by `rocket-compiler` at the flow phase, next to the placement pin)
+walks each Rocket convolution's result once dispatch regions are final and
+counts the Rocket dispatches that read it, through `flow.tensor.reshape`;
+any other reader -- a CPU dispatch, `util.return`, a tied operand -- makes
+the count 0. The count rides as one more push constant
+(`Conv2DDef.runtime_dense_readers`, the trailing constant of every
+convolution target, literal 0 in every shim). The driver tallies, per
+recorded dispatch, how many later dispatches on the same command buffer
+chained to its cube and whether anything read its dense bytes instead (a
+consumer that declined, a kind that records no cube, a copy), and
+`apply_ops` drops the compaction iff `chained == count > 0` and no dense
+read was seen (`compaction_elidable`). Every failure mode keeps the write:
+a reader on a *later* command buffer leaves the tally short, which is why a
+count survives IREE's partitioning where a boolean would not; an executable
+compiled without the constant says 0. A driver-only version was considered
+and rejected: a transient from `queue_alloca` is not proof of a single
+command buffer, because IREE also allocas a result consumed by a later
+execute region.
+
+`planck`, `taskset -c 4-7`, medians of 4 interleaved passes, same binary
+and same `.vmfb`, `ROCKET_LAZY_COMPACT=1` against `=0`:
+
+| model | kept / skipped per inference | off | on | |
+|---|---|---:|---:|---:|
+| ResNet50 fp16, 224x224 | 2 / 51 | 142 ms | **114 ms** | **1.25x** |
+| ResNet50 fp16, 512x512 | 2 / 51 | 858 ms | **626 ms** | **1.37x** |
+| VGG19 fp16 | 5 / 11 | 533 ms | 502 ms | 1.06x |
+| MobileNetV2 fp16 (f16 import) | 45 / 2 | 87 ms | 88 ms | noise |
+
+Output bit-identical on and off for all four, and identical to the same
+model compiled before this change. ResNet50-224's profile: `compact` 0.45
+ms x 2650 calls -> 0.26 ms x 118 over the run, `wait.npu` share 62 -> 74 %.
+The compiler's own census matches the driver's: 51 of ResNet50's 52
+convolutions are read only by Rocket dispatches (66 reader edges, the 16
+residual skips counted twice), VGG19 11 of 16 (the other five feed max
+pools, which are Rocket dispatches that cannot chain), MobileNetV2 2 of 46.
+The two kept on ResNet50 are the stem (read by the CPU max pool) and the
+last conv (read by the head).
+
+With step 2 and step 4 together, ResNet50-224 is 169 -> 114 ms, and what
+the driver still does on the host for it is ~10 % of wall (`outside` is the
+CPU stem/pool/head). ~~What is left of P2 is breadth, not depth: the
+elementwise, pooling and matmul kinds publish no cube, so nothing chains
+through them and nothing feeding them elides.~~ Step 5, below.
+
+**Step 5 landed 2026-09-08 -- breadth.** Matmul, pooling and element-wise
+dispatches now publish an output cube, take a producer's cube for their
+inputs, and carry the reader count (`runtime_dense_readers` on
+`MatmulDef`, `PoolingDef` and the three `Elementwise*Def`s; every shim
+passes it). `OutputCube` grew a `surface_pixel_count`: the PPU strides its
+surfaces by the pixel count rounded up to four, so a pool's cube matches a
+conv's only when the count is a multiple of four (VGG's 224/112/56/28
+images all are; a 7x7 is not), and `chain_identity_tests` pins the
+mismatch. Matmul's cube is width M, height 1, no row padding; the `[K,N]`
+operand is a coefficient stream and never chains.
+
+That was the smaller half. The larger one was that on every plain-conv,
+pool and matmul edge nothing could have chained anyway, because the shims
+widened their f16 result inside a `flow.dispatch.workgroups` that also
+folded in linalg's accumulator init -- opaque to fusion, so a CPU dispatch
+sat between the two Rocket dispatches on every such edge. Only the fused
+bias/ReLU shims (ResNet50's) used a plain generic, which is why ResNet50
+chained and MobileNetV2's f32 import did not. Two compiler changes fix it:
+every shim's widen is a plain `linalg.generic` (the placement pin, which
+postdates the workgroups form, keeps it off the NPU), and
+`rocket-fold-neutral-init`, run after inlining, drops the `+ init` /
+`max(.., init)` term when the init is a `linalg.fill` of the neutral element
+-- which arith itself never does, since `x + 0.0` is not `x` at `-0.0` --
+leaving a bare `extf` that the consumer's `truncf` cancels. And on an f32
+import the demote pass now narrows *through* a zero `tensor.pad`
+(`pad(truncf(x))`, not `truncf(pad(x))`), so `rocket-fold-conv-pad` and
+the pad-1 matchers see the same `pad -> conv` an f16 import gives them; the
+promote pass rebuilds the f32 pad for anything left unclaimed.
+
+Two chain fixtures joined the conv gate, both bit-exact and both chaining
+end to end with the middle compaction skipped: `fp16_conv_pool_conv_chain`
+(pool reads conv A's cube, conv B reads the pool's) and
+`fp16_matmul_chain`. On the models, `planck`, `taskset -c 4-7`, chain on
+vs `ROCKET_CHAIN=0`, medians:
+
+| model | NPU -> NPU edges chained | compactions skipped | chain off | on | |
+|---|---|---|---:|---:|---:|
+| VGG (f32 import, 16 conv + 5 pool), 10 s runs x3 | **20 of 20** (11 conv, 5 conv->pool, 4 pool->conv) | 20 of 21 | 676 ms | **617 ms** | **1.10x** |
+| VGG19 (f16 import, 16 conv; pools on CPU), 10 s x3 | 11 of 16 | 11 of 16 | 544 | **498** | 1.09x |
+| ResNet50 fp16 224x224 | 66 of 68 (unchanged) | 51 of 53 | 142 | 115 | 1.24x |
+| MobileNetV2 fp16 (f16 import) | 1 -> 6 of 47 | 2 | 87 | 88 | noise |
+
+All bit-identical chain on/off and against the earlier builds. The first
+row is the one this step is about: before it, the same model had 50 CPU
+dispatch sites (15 explicit pads, 16 widens, the rest shims' narrows) and
+5 chained edges; it now has 4 CPU sites, all of them the classifier, whose
+K = 25088 is past the matmul caps -- that is the `outside` 195 ms per
+inference in its profile and the whole reason the model is not faster.
+`pack.input` and `compact` are 0.0 and 0.1 ms per inference on it.
+
+Two things measured on the way that are not wins: a 3 s
+`--benchmark_min_time` on a 600 ms model is six iterations and the arms
+overlap by 15 % run to run -- the 10 s runs above are what settled both
+VGGs -- and the CNA padding the input itself was not faster than IREE's CPU
+pad plus a repack on this VGG (617 ms either way); it is the chaining the
+fold enables that pays, not the pad itself. Once during these measurements
+the board wedged (a benchmark left the NPU busy and the next process hung
+in `PREP_BO`, uninterruptible); it did not reproduce after a reboot in six
+further runs of both arms and is recorded rather than explained.
+
+What is left is coverage, not chaining: VGG19's torchvision export pools in
+f16 and the pooling matchers are f32-only, so its five pools stay on the
+CPU (and break the chain between blocks); ViT/Qwen3's matmul edges chain
+where the M/K/N caps admit both sides; and a matmul or pool whose consumer
+is the CPU (every classifier) keeps its dense write, as it must.
 
 ---
 
@@ -554,7 +672,7 @@ and worth not touching.
 
 ---
 
-## P7 (S2) — MobileNetV2 fp16's 17 depthwise convolutions stay on the CPU; they are 54% of the model's wall time, and offloading them is 1.053x slower (re-measured 2026-09-07, was 1.26x)
+## P7 (S2) — MobileNetV2 fp16's 17 depthwise convolutions stay on the CPU; they are 54% of the model's wall time, and offloading them is 1.05x slower with the driver chain on, 1.18x at four workers (re-measured 2026-09-08; was 1.26x)
 
 They are the whole of the `outside` term (70.9 ms of a 127 ms model; see
 the profile below): ten executables over 17 dispatch
@@ -713,18 +831,87 @@ only pays between *adjacent* NPU dispatches, and this model alternates dense
 (NPU) with depthwise (CPU), so P2's reach is itself gated on this item. The
 knot is P7 -> P2 -> ROADMAP's conv padding row, and P7 is the end to pull.
 
+### Re-measured 2026-09-08 with the driver chain on: chaining reaches nothing here, and the verdict holds
+
+P2 step 2 landed (the consumer reads its NPU producer's output cube in
+place), and item 1 below said that was the lever that would move this most.
+Measured, it moves it by nothing, and the reason is structural rather than a
+tuning.
+
+Same two-line demote (`DemoteInputsToF16<linalg::DepthwiseConv2D{NhwcHwc,
+NchwChw}Op>` and the promote twins), same source model rebuilt for the run
+(`mnv2.fp16.mlir` is no longer on disk; the width-1.4 f32-constant form is
+the fp16 export widened with `widen_to_f32.py`, batch pinned, imported at
+opset 20 -- 37 sites, and 44 with the demote, exactly the 2026-09-07
+placement). `planck`, six interleaved passes, medians, governor
+`performance`, NPU IRQs on cpu6. All three arms are the same binary; the
+third is the 44-site build with `ROCKET_CHAIN=0`.
+
+|   | `taskset -c 4-7` | + `--task_topology_cpu_ids=4,5,6,7` |
+|---|---:|---:|
+| 37 sites | **130.5** ms | **108** ms |
+| 44 sites, chain on | 137.0 (1.050x slower) | 127.5 (**1.18x slower**) |
+| 44 sites, chain off | 136.5 | 126.5 |
+
+Correctness is unchanged: max|diff| 0.0078 against the `--no-offload` arm
+at 44 sites (0.0073 at 37), same top-5, and chain on/off are bit-identical.
+
+**Chaining took one edge in both arms -- the same one.** `ROCKET_CHAIN=debug`
+on the 44-site build: 1 taken (the 7x7x448 -> 1792 head), 32 declined for
+*no producer on this command buffer*, 8 declined because the consumer's
+pixel is not a whole number of 32-byte atoms (88-, 136- and 24-channel
+project outputs, which pack 176 -> 192, 272 -> 288 and 48 -> 64 bytes).
+Classifying every Rocket call's input operand in the post-match IR says what
+the 32 are:
+
+| Rocket conv inputs (44-site build) | fed by | chainable today |
+|---|---|---|
+| 10 expand 1x1 | `linalg.add` -- the residual add, on the CPU | no |
+| 10 project 1x1 | the CPU clamp after a still-unclaimed wide depthwise | no |
+| 7 depthwise 3x3 | `tensor.pad` -- the explicit pad, on the CPU | no |
+| 7 project 1x1 | the offloaded depthwise, directly | only if whole-atom |
+| 7 expand 1x1 | a project conv, directly (no residual) | only if whole-atom |
+
+So the reach was never "17 depthwise convolutions sitting between NPU pairs".
+Offloading the seven admissible ones opens at most 14 direct NPU -> NPU
+edges, 8 of which the whole-atom rule declines, and every other edge on the
+model is behind one of three CPU ops: the residual add (10 edges), the pad
+(7), and the clamps of the depthwise the `Cin` 512 cap leaves behind (10).
+On this model P2's reach is gated on those three, not on P7 alone; the
+2026-09-07 statement above that "P2's reach is itself gated on this item"
+was the right direction and too small a claim.
+
+**The hardware term is the binding one, and chaining cannot touch it.**
+Whole-run profile, 37 vs 44 sites at `taskset -c 4-7`: `outside` -1030 ms
+(the CPU depthwise and their clamps, gone), against `wait.npu` **+633**,
+`pack.input` +354, `compact` +265, `record` +47. The seven depthwise
+convolutions cost 60 % of the CPU time they replace *in NPU time alone*, at
+the 200 MHz M2 leaves the clock at; the layout round trip is the other 600.
+A perfect chain -- every pack and compact on those seven edges free -- would
+leave 44 sites at roughly 125 ms against 130, a 4 % win at best, and the
+four-worker column says the CPU side has more headroom than that
+(108 -> ~127 is the CPU depthwise getting four workers while the NPU path
+gains nothing).
+
+What this changes in the list below: item 1 is done and worth ~0 until the
+pad, the residual add and the whole-atom rule move; item 2 (the pad) is now
+also a P2 blocker and the first thing to build; and M2 is the only lever
+that touches the term that actually binds. The demote stays off.
+
 ### What would change the verdict, in order
 
 0. ~~**Re-measure the 44-site arm with depthwise ReLU6 fused**~~ — done
    2026-09-07, see above. Worth 2.5 ms of the 9.5 ms gap; the verdict holds
    at 1.053x rather than 1.26x.
-1. **P2's cross-op chaining.** These are the widest spatial extents in the
-   model, so their round trip is the most expensive one there is: `pack.input`
-   plus `compact` is 12.3 of the 32.7 ms. A depthwise sitting between two
-   Rocket 1x1 convolutions is also the ideal chaining shape — producer and
-   consumer both on the NPU.
+1. ~~**P2's cross-op chaining.**~~ Built (P2 step 2) and measured
+   2026-09-08 above: it takes the same single edge with or without the
+   depthwise offloaded, because every depthwise input sits behind the
+   explicit pad and 8 of the 14 direct edges fail the whole-atom rule. It
+   cannot reach the `wait.npu` term, which is the one that binds.
 2. **The pad.** Folding it into the dispatch (the driver already pads on the
-   input packing path) removes the added CPU dispatch and its buffer.
+   input packing path) removes the added CPU dispatch and its buffer -- and,
+   since 2026-09-08, it is what stands between every offloaded depthwise and
+   its producer's cube, so it is a P2 blocker on this model too.
 3. **The quiesce dwell.** 7.4 ms is pure empirical caution; it is C8's
    neighbour and should be re-derived rather than kept at a millisecond.
 4. **The `Cin <= 512` matcher cap**, last, because raising it only adds more
@@ -1773,10 +1960,22 @@ Where the time actually is, per inference: `outside` **70.9 ms (54%)**,
    2026-09-07 with depthwise ReLU6 fused: **1.053x slower, not 1.26x**, so
    the verdict holds but the gap is a quarter of what it was. What is left of
    it is the explicit pad, the quiesce dwell and the `Cin` 512 cap; the
-   fusion machinery for it is in the tree and only the demote is off. P2 and
-   ROADMAP's conv-padding row are both gated behind this one.
+   fusion machinery for it is in the tree and only the demote is off.
+   **Re-measured 2026-09-08 with P2's driver chain on: no change** (1.05x at
+   `taskset -c 4-7`, 1.18x at four workers). The chain takes the same one
+   edge either way -- every offloaded depthwise reads through the CPU pad --
+   and the seven convolutions cost 60 % of the CPU time they replace in
+   `wait.npu` alone. The term that binds is the 200 MHz clock (M2), not the
+   round trip; on this model P2's reach is gated on the residual add, the
+   pad and the whole-atom chain rule, not on P7.
 2. **P2** — 24.4 ms, 19% of wall, and the one part of the old "layout
-   propagation" lever P8 never tested. Two caveats now attached to it: the
+   propagation" lever P8 never tested. **Steps 2, 4 and 5 landed
+   2026-09-08**: the driver chain and the compiler-counted lazy compaction
+   take ResNet50 169 -> 114 ms bit-identically, and the breadth step
+   extends both to matmul, pooling and element-wise dispatches and makes
+   the plain-conv, pool and matmul edges actually adjacent (VGG f32: 20 of
+   20 edges, 1.10x). P2 is closed; what remains is matcher coverage (f16
+   pooling, the classifier matmuls past the caps). Two caveats now attached to it: the
    cost is concentrated in one convolution (5.4 ms, 30% of `compact`), and
    that convolution feeds a *depthwise* op, so it is not chainable until P7
    moves. Sizing P2 against the whole 24.4 ms overstates its reach.

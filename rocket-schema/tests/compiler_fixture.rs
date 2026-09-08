@@ -387,6 +387,7 @@ fn elementwise_lut_definition_round_trips_with_runtime_dimensions() {
             input_scale: 1.0 / 32.0,
             output_scale: 1.0 / 128.0,
             runtime_dimensions: Some(dimensions),
+            ..Default::default()
         },
     );
     let name = builder.create_string("elementwise_tanh");

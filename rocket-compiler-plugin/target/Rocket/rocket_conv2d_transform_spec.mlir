@@ -18,6 +18,7 @@
   output_width = 0 : i32, output_height = 0 : i32, output_channels = 0 : i32,
   weights_width = 0 : i32, weights_height = 0 : i32, stride = 1 : i32,
   depthwise = false,
+  runtime_dense_readers = true,
   input_zero_point = 0 : i32, output_zero_point = 0 : i32, weights_zero_point = 0 : i32,
   input_scale = 1.0 : f32, weights_scale = 1.0 : f32, output_scale = 1.0 : f32,
   truncate_bits = 0 : i32,
@@ -51,6 +52,7 @@
   output_width = 0 : i32, output_height = 0 : i32, output_channels = 0 : i32,
   weights_width = 0 : i32, weights_height = 0 : i32, stride = 1 : i32,
   depthwise = true,
+  runtime_dense_readers = true,
   input_zero_point = 0 : i32, output_zero_point = 0 : i32, weights_zero_point = 0 : i32,
   input_scale = 1.0 : f32, weights_scale = 1.0 : f32, output_scale = 1.0 : f32,
   truncate_bits = 0 : i32,
@@ -68,6 +70,7 @@
   output_width = 0 : i32, output_height = 0 : i32, output_channels = 0 : i32,
   weights_width = 0 : i32, weights_height = 0 : i32, stride = 2 : i32,
   depthwise = false,
+  runtime_dense_readers = true,
   input_zero_point = 0 : i32, output_zero_point = 0 : i32, weights_zero_point = 0 : i32,
   input_scale = 1.0 : f32, weights_scale = 1.0 : f32, output_scale = 1.0 : f32,
   truncate_bits = 0 : i32,
@@ -85,6 +88,7 @@
   output_width = 0 : i32, output_height = 0 : i32, output_channels = 0 : i32,
   weights_width = 0 : i32, weights_height = 0 : i32, stride = 3 : i32,
   depthwise = false,
+  runtime_dense_readers = true,
   input_zero_point = 0 : i32, output_zero_point = 0 : i32, weights_zero_point = 0 : i32,
   input_scale = 1.0 : f32, weights_scale = 1.0 : f32, output_scale = 1.0 : f32,
   truncate_bits = 0 : i32,
@@ -102,6 +106,7 @@
   output_width = 0 : i32, output_height = 0 : i32, output_channels = 0 : i32,
   weights_width = 0 : i32, weights_height = 0 : i32, stride = 4 : i32,
   depthwise = false,
+  runtime_dense_readers = true,
   input_zero_point = 0 : i32, output_zero_point = 0 : i32, weights_zero_point = 0 : i32,
   input_scale = 1.0 : f32, weights_scale = 1.0 : f32, output_scale = 1.0 : f32,
   truncate_bits = 0 : i32,
@@ -119,6 +124,7 @@
   output_width = 0 : i32, output_height = 0 : i32, output_channels = 0 : i32,
   weights_width = 0 : i32, weights_height = 0 : i32, stride = 2 : i32,
   depthwise = true,
+  runtime_dense_readers = true,
   input_zero_point = 0 : i32, output_zero_point = 0 : i32, weights_zero_point = 0 : i32,
   input_scale = 1.0 : f32, weights_scale = 1.0 : f32, output_scale = 1.0 : f32,
   truncate_bits = 0 : i32,
@@ -136,6 +142,7 @@
   output_width = 0 : i32, output_height = 0 : i32, output_channels = 0 : i32,
   weights_width = 0 : i32, weights_height = 0 : i32, stride = 3 : i32,
   depthwise = true,
+  runtime_dense_readers = true,
   input_zero_point = 0 : i32, output_zero_point = 0 : i32, weights_zero_point = 0 : i32,
   input_scale = 1.0 : f32, weights_scale = 1.0 : f32, output_scale = 1.0 : f32,
   truncate_bits = 0 : i32,
@@ -153,6 +160,7 @@
   output_width = 0 : i32, output_height = 0 : i32, output_channels = 0 : i32,
   weights_width = 0 : i32, weights_height = 0 : i32, stride = 4 : i32,
   depthwise = true,
+  runtime_dense_readers = true,
   input_zero_point = 0 : i32, output_zero_point = 0 : i32, weights_zero_point = 0 : i32,
   input_scale = 1.0 : f32, weights_scale = 1.0 : f32, output_scale = 1.0 : f32,
   truncate_bits = 0 : i32,
@@ -195,6 +203,7 @@
   output_width = 0 : i32, output_height = 0 : i32, output_channels = 0 : i32,
   weights_width = 0 : i32, weights_height = 0 : i32, stride = 1 : i32,
   depthwise = false,
+  runtime_dense_readers = true,
   input_zero_point = 0 : i32, output_zero_point = 0 : i32, weights_zero_point = 0 : i32,
   input_scale = 1.0 : f32, weights_scale = 1.0 : f32, output_scale = 1.0 : f32,
   truncate_bits = 0 : i32,
@@ -212,6 +221,7 @@
   output_width = 0 : i32, output_height = 0 : i32, output_channels = 0 : i32,
   weights_width = 0 : i32, weights_height = 0 : i32, stride = 1 : i32,
   depthwise = true,
+  runtime_dense_readers = true,
   input_zero_point = 0 : i32, output_zero_point = 0 : i32, weights_zero_point = 0 : i32,
   input_scale = 1.0 : f32, weights_scale = 1.0 : f32, output_scale = 1.0 : f32,
   truncate_bits = 0 : i32,
@@ -229,6 +239,7 @@
   output_width = 0 : i32, output_height = 0 : i32, output_channels = 0 : i32,
   weights_width = 0 : i32, weights_height = 0 : i32, stride = 2 : i32,
   depthwise = true,
+  runtime_dense_readers = true,
   input_zero_point = 0 : i32, output_zero_point = 0 : i32, weights_zero_point = 0 : i32,
   input_scale = 1.0 : f32, weights_scale = 1.0 : f32, output_scale = 1.0 : f32,
   truncate_bits = 0 : i32,
@@ -266,6 +277,7 @@
 // extent arrive as push constants.
 #rocket_pooling_avg_target = #hal.executable.target<"rocket", "rocket-flatbuffer-v1", {
   kernel = "pooling",
+  runtime_dense_readers = true,
   input_width = 0 : i32, input_height = 0 : i32, channels = 0 : i32,
   output_width = 0 : i32, output_height = 0 : i32,
   kernel_width = 0 : i32, kernel_height = 0 : i32,
@@ -298,6 +310,7 @@
 // Nothing above 2 is, so there is deliberately no s3/s4 target.
 #rocket_pooling_max_target = #hal.executable.target<"rocket", "rocket-flatbuffer-v1", {
   kernel = "pooling",
+  runtime_dense_readers = true,
   input_width = 0 : i32, input_height = 0 : i32, channels = 0 : i32,
   output_width = 0 : i32, output_height = 0 : i32,
   kernel_width = 0 : i32, kernel_height = 0 : i32,
@@ -311,6 +324,7 @@
 
 #rocket_pooling_max_target_s2 = #hal.executable.target<"rocket", "rocket-flatbuffer-v1", {
   kernel = "pooling",
+  runtime_dense_readers = true,
   input_width = 0 : i32, input_height = 0 : i32, channels = 0 : i32,
   output_width = 0 : i32, output_height = 0 : i32,
   kernel_width = 0 : i32, kernel_height = 0 : i32,
@@ -340,6 +354,7 @@
 // reduction, and this path is f32 in, fp16 on the hardware.
 #rocket_pooling_min_target = #hal.executable.target<"rocket", "rocket-flatbuffer-v1", {
   kernel = "pooling",
+  runtime_dense_readers = true,
   input_width = 0 : i32, input_height = 0 : i32, channels = 0 : i32,
   output_width = 0 : i32, output_height = 0 : i32,
   kernel_width = 0 : i32, kernel_height = 0 : i32,
@@ -353,6 +368,7 @@
 
 #rocket_pooling_min_target_s2 = #hal.executable.target<"rocket", "rocket-flatbuffer-v1", {
   kernel = "pooling",
+  runtime_dense_readers = true,
   input_width = 0 : i32, input_height = 0 : i32, channels = 0 : i32,
   output_width = 0 : i32, output_height = 0 : i32,
   kernel_width = 0 : i32, kernel_height = 0 : i32,
@@ -376,6 +392,7 @@
 // matmul shape inside the channel ceilings.
 #rocket_matmul_target = #hal.executable.target<"rocket", "rocket-flatbuffer-v1", {
   kernel = "matmul",
+  runtime_dense_readers = true,
   m = 0 : i32, k = 0 : i32, n = 0 : i32,
   input_zero_point = 0 : i32, output_zero_point = 0 : i32, weights_zero_point = 0 : i32,
   input_scale = 1.0 : f32, weights_scale = 1.0 : f32, output_scale = 1.0 : f32,
@@ -387,7 +404,7 @@
 
 // Input, weights, bias, output -- the convolution binding convention, since
 // that is what this lowers to. The bias is zero-filled by the caller.
-#matmul_pipeline_layout = #hal.pipeline.layout<constants = 3, bindings = [
+#matmul_pipeline_layout = #hal.pipeline.layout<constants = 4, bindings = [
   #hal.pipeline.binding<storage_buffer, ReadOnly>,
   #hal.pipeline.binding<storage_buffer, ReadOnly>,
   #hal.pipeline.binding<storage_buffer, ReadOnly>,
@@ -406,6 +423,7 @@
 // state here.
 #rocket_elementwise_add_target = #hal.executable.target<"rocket", "rocket-flatbuffer-v1", {
   kernel = "elementwise_binary",
+  runtime_dense_readers = true,
   width = 0 : i32, height = 0 : i32, channels = 0 : i32,
   op = "add",
   runtime_dimensions = ["width", "height", "channels"]
@@ -413,6 +431,7 @@
 
 #rocket_elementwise_sub_target = #hal.executable.target<"rocket", "rocket-flatbuffer-v1", {
   kernel = "elementwise_binary",
+  runtime_dense_readers = true,
   width = 0 : i32, height = 0 : i32, channels = 0 : i32,
   op = "sub",
   runtime_dimensions = ["width", "height", "channels"]
@@ -420,6 +439,7 @@
 
 #rocket_elementwise_mul_target = #hal.executable.target<"rocket", "rocket-flatbuffer-v1", {
   kernel = "elementwise_binary",
+  runtime_dense_readers = true,
   width = 0 : i32, height = 0 : i32, channels = 0 : i32,
   op = "mul",
   runtime_dimensions = ["width", "height", "channels"]
@@ -428,13 +448,13 @@
 // Three push constants (width, height, channels) and three bindings: the
 // primary operand, the second tensor, and the output. Every other Rocket
 // kernel has two bindings; this is the only one that reads two tensors.
-#elementwise_binary_pipeline_layout = #hal.pipeline.layout<constants = 3, bindings = [
+#elementwise_binary_pipeline_layout = #hal.pipeline.layout<constants = 4, bindings = [
   #hal.pipeline.binding<storage_buffer, ReadOnly>,
   #hal.pipeline.binding<storage_buffer, ReadOnly>,
   #hal.pipeline.binding<storage_buffer>
 ]>
 
-#pooling_pipeline_layout = #hal.pipeline.layout<constants = 5, bindings = [
+#pooling_pipeline_layout = #hal.pipeline.layout<constants = 6, bindings = [
   #hal.pipeline.binding<storage_buffer, ReadOnly>,
   #hal.pipeline.binding<storage_buffer>
 ]>
@@ -503,6 +523,7 @@
   output_width = 0 : i32, output_height = 0 : i32, output_channels = 0 : i32,
   weights_width = 0 : i32, weights_height = 0 : i32, stride = 1 : i32,
   depthwise = false,
+  runtime_dense_readers = true,
   input_zero_point = 0 : i32, output_zero_point = 0 : i32, weights_zero_point = 0 : i32,
   input_scale = 1.0 : f32, weights_scale = 1.0 : f32, output_scale = 1.0 : f32,
   truncate_bits = 0 : i32,
@@ -543,6 +564,7 @@
   output_width = 0 : i32, output_height = 0 : i32, output_channels = 0 : i32,
   weights_width = 0 : i32, weights_height = 0 : i32, stride = 2 : i32,
   depthwise = false,
+  runtime_dense_readers = true,
   input_zero_point = 0 : i32, output_zero_point = 0 : i32, weights_zero_point = 0 : i32,
   input_scale = 1.0 : f32, weights_scale = 1.0 : f32, output_scale = 1.0 : f32,
   truncate_bits = 0 : i32,
@@ -568,6 +590,7 @@
   output_width = 0 : i32, output_height = 0 : i32, output_channels = 0 : i32,
   weights_width = 0 : i32, weights_height = 0 : i32, stride = 1 : i32,
   depthwise = false,
+  runtime_dense_readers = true,
   input_zero_point = 0 : i32, output_zero_point = 0 : i32, weights_zero_point = 0 : i32,
   input_scale = 1.0 : f32, weights_scale = 1.0 : f32, output_scale = 1.0 : f32,
   truncate_bits = 0 : i32,
@@ -585,6 +608,7 @@
   output_width = 0 : i32, output_height = 0 : i32, output_channels = 0 : i32,
   weights_width = 0 : i32, weights_height = 0 : i32, stride = 2 : i32,
   depthwise = false,
+  runtime_dense_readers = true,
   input_zero_point = 0 : i32, output_zero_point = 0 : i32, weights_zero_point = 0 : i32,
   input_scale = 1.0 : f32, weights_scale = 1.0 : f32, output_scale = 1.0 : f32,
   truncate_bits = 0 : i32,
@@ -602,6 +626,7 @@
   output_width = 0 : i32, output_height = 0 : i32, output_channels = 0 : i32,
   weights_width = 0 : i32, weights_height = 0 : i32, stride = 1 : i32,
   depthwise = false,
+  runtime_dense_readers = true,
   input_zero_point = 0 : i32, output_zero_point = 0 : i32, weights_zero_point = 0 : i32,
   input_scale = 1.0 : f32, weights_scale = 1.0 : f32, output_scale = 1.0 : f32,
   truncate_bits = 0 : i32,
@@ -620,6 +645,7 @@
   output_width = 0 : i32, output_height = 0 : i32, output_channels = 0 : i32,
   weights_width = 0 : i32, weights_height = 0 : i32, stride = 2 : i32,
   depthwise = false,
+  runtime_dense_readers = true,
   input_zero_point = 0 : i32, output_zero_point = 0 : i32, weights_zero_point = 0 : i32,
   input_scale = 1.0 : f32, weights_scale = 1.0 : f32, output_scale = 1.0 : f32,
   truncate_bits = 0 : i32,
@@ -642,6 +668,7 @@
   output_width = 0 : i32, output_height = 0 : i32, output_channels = 0 : i32,
   weights_width = 0 : i32, weights_height = 0 : i32, stride = 1 : i32,
   depthwise = false,
+  runtime_dense_readers = true,
   input_zero_point = 0 : i32, output_zero_point = 0 : i32, weights_zero_point = 0 : i32,
   input_scale = 1.0 : f32, weights_scale = 1.0 : f32, output_scale = 1.0 : f32,
   truncate_bits = 0 : i32,
@@ -660,6 +687,7 @@
   output_width = 0 : i32, output_height = 0 : i32, output_channels = 0 : i32,
   weights_width = 0 : i32, weights_height = 0 : i32, stride = 1 : i32,
   depthwise = false,
+  runtime_dense_readers = true,
   input_zero_point = 0 : i32, output_zero_point = 0 : i32, weights_zero_point = 0 : i32,
   input_scale = 1.0 : f32, weights_scale = 1.0 : f32, output_scale = 1.0 : f32,
   truncate_bits = 0 : i32,
@@ -685,6 +713,7 @@
   output_width = 0 : i32, output_height = 0 : i32, output_channels = 0 : i32,
   weights_width = 0 : i32, weights_height = 0 : i32, stride = 1 : i32,
   depthwise = true,
+  runtime_dense_readers = true,
   input_zero_point = 0 : i32, output_zero_point = 0 : i32, weights_zero_point = 0 : i32,
   input_scale = 1.0 : f32, weights_scale = 1.0 : f32, output_scale = 1.0 : f32,
   truncate_bits = 0 : i32,
@@ -710,6 +739,7 @@
   output_width = 0 : i32, output_height = 0 : i32, output_channels = 0 : i32,
   weights_width = 0 : i32, weights_height = 0 : i32, stride = 2 : i32,
   depthwise = true,
+  runtime_dense_readers = true,
   input_zero_point = 0 : i32, output_zero_point = 0 : i32, weights_zero_point = 0 : i32,
   input_scale = 1.0 : f32, weights_scale = 1.0 : f32, output_scale = 1.0 : f32,
   truncate_bits = 0 : i32,
@@ -747,6 +777,7 @@
   output_width = 0 : i32, output_height = 0 : i32, output_channels = 0 : i32,
   weights_width = 0 : i32, weights_height = 0 : i32, stride = 1 : i32,
   depthwise = false,
+  runtime_dense_readers = true,
   input_zero_point = 0 : i32, output_zero_point = 0 : i32, weights_zero_point = 0 : i32,
   input_scale = 1.0 : f32, weights_scale = 1.0 : f32, output_scale = 0.0 : f32,
   truncate_bits = 0 : i32,
@@ -783,6 +814,7 @@
   output_width = 0 : i32, output_height = 0 : i32, output_channels = 0 : i32,
   weights_width = 0 : i32, weights_height = 0 : i32, stride = 1 : i32,
   depthwise = true,
+  runtime_dense_readers = true,
   input_zero_point = 0 : i32, output_zero_point = 0 : i32, weights_zero_point = 0 : i32,
   input_scale = 1.0 : f32, weights_scale = 1.0 : f32, output_scale = 0.0 : f32,
   truncate_bits = 0 : i32,
@@ -795,20 +827,31 @@
   runtime_quantization = ["output_scale", "output_zero_point"]
 }>
 
-#dynamic_pipeline_layout = #hal.pipeline.layout<constants = 6, bindings = [
+#dynamic_pipeline_layout = #hal.pipeline.layout<constants = 7, bindings = [
   #hal.pipeline.binding<storage_buffer, ReadOnly>,
   #hal.pipeline.binding<storage_buffer, ReadOnly>,
   #hal.pipeline.binding<storage_buffer, ReadOnly>,
   #hal.pipeline.binding<storage_buffer>
 ]>
 
-// Six dimensions plus the two runtime quantization parameters. The count has
-// to match the target's two lists exactly -- RocketTarget.cpp checks it and
-// the driver reads the constants in the same order, dimensions first.
+// Six dimensions plus the two runtime quantization parameters, plus the one
+// trailing dense-reader count every convolution target declares with
+// `runtime_dense_readers` (see below). The count has to match the target's
+// lists exactly -- RocketTarget.cpp checks it and the driver reads the
+// constants in the same order, dimensions first.
+//
+// The dense-reader count is the only push constant a shim does not compute
+// from its operands: every shim passes a literal 0 ("always write the dense
+// output") and `rocket-mark-dense-readers`, which rocket-compiler runs at
+// the flow phase, replaces it per dispatch with the number of Rocket
+// dispatches that read the result once the program is final. The driver
+// skips the dispatch's dense output write when exactly that many consumers
+// on its command buffer read the output cube in place -- ISSUES.md P2, the
+// compaction half.
 // A residual epilogue's dispatch takes one more read-only binding: the
 // skip tensor, in the output's own geometry, between the bias and the
 // output (`Conv2DDef.epilogue_add`).
-#dynamic_residual_pipeline_layout = #hal.pipeline.layout<constants = 6, bindings = [
+#dynamic_residual_pipeline_layout = #hal.pipeline.layout<constants = 7, bindings = [
   #hal.pipeline.binding<storage_buffer, ReadOnly>,
   #hal.pipeline.binding<storage_buffer, ReadOnly>,
   #hal.pipeline.binding<storage_buffer, ReadOnly>,
@@ -816,7 +859,7 @@
   #hal.pipeline.binding<storage_buffer>
 ]>
 
-#dynamic_requant_pipeline_layout = #hal.pipeline.layout<constants = 8, bindings = [
+#dynamic_requant_pipeline_layout = #hal.pipeline.layout<constants = 9, bindings = [
   #hal.pipeline.binding<storage_buffer, ReadOnly>,
   #hal.pipeline.binding<storage_buffer, ReadOnly>,
   #hal.pipeline.binding<storage_buffer, ReadOnly>,
@@ -1320,70 +1363,41 @@ module attributes {transform.with_named_sequence} {
     %zero_bias = linalg.fill ins(%zero_f16 : f16)
         outs(%zero_bias_empty : tensor<?xf16>) -> tensor<?xf16>
 
+    %dense_readers_i32 = arith.constant 0 : i32
     %raw_f16 = flow.dispatch
         @rocket_matmul_executable::@rocket_matmul_v1::@rocket_matmul(
-          %m_i32, %k_i32, %n_i32,
+          %m_i32, %k_i32, %n_i32, %dense_readers_i32,
           %lhs, %rhs, %zero_bias)
         {stream.affinity = #hal.device.affinity<@rocket_device>}
-        : (i32, i32, i32,
+        : (i32, i32, i32, i32,
            tensor<?x?xf16>{%m, %k},
            tensor<?x?xf16>{%k, %n},
            tensor<?xf16>{%n})
         -> tensor<?x?xf16>{%m, %n}
 
-    // Widen and accumulate on the CPU, explicitly -- an op consuming the
-    // Rocket result otherwise inherits its affinity and is formed into an
-    // executable for a device with no config to serialize.
-    %final = flow.dispatch.workgroups[%m, %n](%raw_f16, %init, %m, %n)
-        : (tensor<?x?xf16>{%m, %n}, tensor<?x?xf32>{%m, %n}, index, index)
-        -> tensor<?x?xf32>{%m, %n}
-        attributes { stream.affinity = #hal.device.affinity<@cpu_device> } =
-        (%raw_binding: !iree_tensor_ext.dispatch.tensor<readonly:tensor<?x?xf16>>,
-         %init_binding: !iree_tensor_ext.dispatch.tensor<readonly:tensor<?x?xf32>>,
-         %m_arg: index,
-         %n_arg: index,
-         %final_binding: !iree_tensor_ext.dispatch.tensor<writeonly:tensor<?x?xf32>>) {
-      %m_size = iree_tensor_ext.dispatch.workload.ordinal %m_arg, 0 : index
-      %n_size = iree_tensor_ext.dispatch.workload.ordinal %n_arg, 1 : index
-      %raw_shaped = flow.dispatch.tie_shape %raw_binding
-          : !iree_tensor_ext.dispatch.tensor<readonly:tensor<?x?xf16>>{%m_size, %n_size}
-      %init_shaped = flow.dispatch.tie_shape %init_binding
-          : !iree_tensor_ext.dispatch.tensor<readonly:tensor<?x?xf32>>{%m_size, %n_size}
-      %final_shaped = flow.dispatch.tie_shape %final_binding
-          : !iree_tensor_ext.dispatch.tensor<writeonly:tensor<?x?xf32>>{%m_size, %n_size}
-      %raw_loaded = iree_tensor_ext.dispatch.tensor.load %raw_shaped,
-          offsets = [0, 0], sizes = [%m_size, %n_size], strides = [1, 1]
-          : !iree_tensor_ext.dispatch.tensor<readonly:tensor<?x?xf16>>{%m_size, %n_size}
-          -> tensor<?x?xf16>
-      %init_loaded = iree_tensor_ext.dispatch.tensor.load %init_shaped,
-          offsets = [0, 0], sizes = [%m_size, %n_size], strides = [1, 1]
-          : !iree_tensor_ext.dispatch.tensor<readonly:tensor<?x?xf32>>{%m_size, %n_size}
-          -> tensor<?x?xf32>
-      %final_empty = tensor.empty(%m_size, %n_size) : tensor<?x?xf32>
-      %final_inner = linalg.generic {
-          indexing_maps = [
-            affine_map<(d0, d1) -> (d0, d1)>,
-            affine_map<(d0, d1) -> (d0, d1)>,
-            affine_map<(d0, d1) -> (d0, d1)>
-          ],
-          iterator_types = ["parallel", "parallel"]
-        } ins(%raw_loaded, %init_loaded : tensor<?x?xf16>, tensor<?x?xf32>)
-          outs(%final_empty : tensor<?x?xf32>) {
-        ^bb0(%raw: f16, %initial: f32, %out: f32):
-          %raw_f32 = arith.extf %raw : f16 to f32
-          %sum = arith.addf %raw_f32, %initial : f32
-          linalg.yield %sum : f32
-      } -> tensor<?x?xf32>
-      iree_tensor_ext.dispatch.tensor.store %final_inner, %final_shaped,
-          offsets = [0, 0], sizes = [%m_size, %n_size], strides = [1, 1]
-          : tensor<?x?xf32>
-          -> !iree_tensor_ext.dispatch.tensor<writeonly:tensor<?x?xf32>>{%m_size, %n_size}
-      flow.return
-    } count(%m_workload: index, %n_workload: index) -> (index, index, index) {
-      %x, %y, %z = iree_tensor_ext.dispatch.workgroup_count_from_slice(
-          %m_workload, %n_workload)
-      flow.return %x, %y, %z : index, index, index
-    }
+    // Widen back to f32 and fold in the accumulator initialiser: linalg
+    // defines the op as an update of its init (`O += ...`, `O = max(O, ...)`),
+    // so this is exact for any init. A plain generic, not a pre-formed CPU
+    // dispatch: rocket-pin-unclaimed-dispatches keeps it off the NPU, and
+    // rocket-fold-neutral-init drops the init term when it is the neutral
+    // element, leaving a bare extf that fuses with the consumer's truncf
+    // and cancels -- which is what lets the next Rocket dispatch read this
+    // one's output cube in place (ISSUES.md P2).
+    %final_empty = tensor.empty(%m, %n) : tensor<?x?xf32>
+    %final = linalg.generic {
+        indexing_maps = [
+          affine_map<(d0, d1) -> (d0, d1)>,
+          affine_map<(d0, d1) -> (d0, d1)>,
+          affine_map<(d0, d1) -> (d0, d1)>
+        ],
+        iterator_types = ["parallel", "parallel"]
+      } ins(%raw_f16, %init : tensor<?x?xf16>, tensor<?x?xf32>)
+        outs(%final_empty : tensor<?x?xf32>) {
+      ^bb0(%raw: f16, %initial: f32, %out: f32):
+        %raw_f32 = arith.extf %raw : f16 to f32
+        %sum = arith.addf %raw_f32, %initial : f32
+        linalg.yield %sum : f32
+    } -> tensor<?x?xf32>
 
     util.return %final : tensor<?x?xf32>
   }
@@ -1453,13 +1467,14 @@ module attributes {transform.with_named_sequence} {
         linalg.yield %narrowed : f16
     } -> tensor<1x?x?x?xf16>
 
+    %dense_readers_i32 = arith.constant 0 : i32
     %averaged = flow.dispatch
         @rocket_pooling_executable::@rocket_pooling_avg_v1::@rocket_pooling_avg(
           %input_width_i32, %input_height_i32, %channels_i32,
-          %kernel_width_i32, %kernel_height_i32,
+          %kernel_width_i32, %kernel_height_i32, %dense_readers_i32,
           %input_f16)
         {stream.affinity = #hal.device.affinity<@rocket_device>}
-        : (i32, i32, i32, i32, i32,
+        : (i32, i32, i32, i32, i32, i32,
            tensor<1x?x?x?xf16>{%input_height, %input_width, %channels})
         -> tensor<1x?x?x?xf16>{%output_height, %output_width, %channels}
 
@@ -1481,88 +1496,35 @@ module attributes {transform.with_named_sequence} {
     // way from the cause.
     %taps = arith.muli %kernel_height, %kernel_width : index
 
-    %final_nhwc = flow.dispatch.workgroups[
-        %output_height, %output_width, %channels](
-        %averaged, %init_nhwc, %taps, %output_height, %output_width, %channels)
-        : (tensor<1x?x?x?xf16>{%output_height, %output_width, %channels},
-           tensor<1x?x?x?xf32>{%output_height, %output_width, %channels},
-           index, index, index, index)
-        -> tensor<1x?x?x?xf32>{%output_height, %output_width, %channels}
-        attributes { stream.affinity = #hal.device.affinity<@cpu_device> } =
-        (%averaged_binding: !iree_tensor_ext.dispatch.tensor<readonly:tensor<1x?x?x?xf16>>,
-         %init_binding: !iree_tensor_ext.dispatch.tensor<readonly:tensor<1x?x?x?xf32>>,
-         %taps_arg: index,
-         %output_height_arg: index,
-         %output_width_arg: index,
-         %channels_arg: index,
-         %final_binding: !iree_tensor_ext.dispatch.tensor<writeonly:tensor<1x?x?x?xf32>>) {
-      %output_height_size = iree_tensor_ext.dispatch.workload.ordinal
-          %output_height_arg, 0 : index
-      %output_width_size = iree_tensor_ext.dispatch.workload.ordinal
-          %output_width_arg, 1 : index
-      %channels_size = iree_tensor_ext.dispatch.workload.ordinal
-          %channels_arg, 2 : index
-      %averaged_shaped = flow.dispatch.tie_shape %averaged_binding
-          : !iree_tensor_ext.dispatch.tensor<readonly:tensor<1x?x?x?xf16>>{
-              %output_height_size, %output_width_size, %channels_size}
-      %init_shaped = flow.dispatch.tie_shape %init_binding
-          : !iree_tensor_ext.dispatch.tensor<readonly:tensor<1x?x?x?xf32>>{
-              %output_height_size, %output_width_size, %channels_size}
-      %final_shaped = flow.dispatch.tie_shape %final_binding
-          : !iree_tensor_ext.dispatch.tensor<writeonly:tensor<1x?x?x?xf32>>{
-              %output_height_size, %output_width_size, %channels_size}
-      %averaged_loaded = iree_tensor_ext.dispatch.tensor.load %averaged_shaped,
-          offsets = [0, 0, 0, 0],
-          sizes = [1, %output_height_size, %output_width_size, %channels_size],
-          strides = [1, 1, 1, 1]
-          : !iree_tensor_ext.dispatch.tensor<readonly:tensor<1x?x?x?xf16>>{
-              %output_height_size, %output_width_size, %channels_size}
-          -> tensor<1x?x?x?xf16>
-      %init_loaded = iree_tensor_ext.dispatch.tensor.load %init_shaped,
-          offsets = [0, 0, 0, 0],
-          sizes = [1, %output_height_size, %output_width_size, %channels_size],
-          strides = [1, 1, 1, 1]
-          : !iree_tensor_ext.dispatch.tensor<readonly:tensor<1x?x?x?xf32>>{
-              %output_height_size, %output_width_size, %channels_size}
-          -> tensor<1x?x?x?xf32>
-      %taps_i32 = arith.index_cast %taps_arg : index to i32
-      %taps_f32 = arith.sitofp %taps_i32 : i32 to f32
-      %final_empty = tensor.empty(
-          %output_height_size, %output_width_size, %channels_size)
-          : tensor<1x?x?x?xf32>
-      %final_inner = linalg.generic {
-          indexing_maps = [
-            affine_map<(d0, d1, d2, d3) -> (d0, d1, d2, d3)>,
-            affine_map<(d0, d1, d2, d3) -> (d0, d1, d2, d3)>,
-            affine_map<(d0, d1, d2, d3) -> (d0, d1, d2, d3)>
-          ],
-          iterator_types = ["parallel", "parallel", "parallel", "parallel"]
-        } ins(%averaged_loaded, %init_loaded
-            : tensor<1x?x?x?xf16>, tensor<1x?x?x?xf32>)
-          outs(%final_empty : tensor<1x?x?x?xf32>) {
-        ^bb0(%average: f16, %initial: f32, %out: f32):
-          %average_f32 = arith.extf %average : f16 to f32
-          %sum = arith.mulf %average_f32, %taps_f32 : f32
-          %accumulated = arith.addf %sum, %initial : f32
-          linalg.yield %accumulated : f32
-      } -> tensor<1x?x?x?xf32>
-      iree_tensor_ext.dispatch.tensor.store %final_inner, %final_shaped,
-          offsets = [0, 0, 0, 0],
-          sizes = [1, %output_height_size, %output_width_size, %channels_size],
-          strides = [1, 1, 1, 1]
-          : tensor<1x?x?x?xf32>
-          -> !iree_tensor_ext.dispatch.tensor<writeonly:tensor<1x?x?x?xf32>>{
-              %output_height_size, %output_width_size, %channels_size}
-      flow.return
-    } count(%output_height_workload: index,
-            %output_width_workload: index,
-            %channels_workload: index) -> (index, index, index) {
-      %x, %y, %z = iree_tensor_ext.dispatch.workgroup_count_from_slice(
-          %output_height_workload,
-          %output_width_workload,
-          %channels_workload)
-      flow.return %x, %y, %z : index, index, index
-    }
+    // Widen back to f32 and fold in the accumulator initialiser: linalg
+    // defines the op as an update of its init (`O += ...`, `O = max(O, ...)`),
+    // so this is exact for any init. A plain generic, not a pre-formed CPU
+    // dispatch: rocket-pin-unclaimed-dispatches keeps it off the NPU, and
+    // rocket-fold-neutral-init drops the init term when it is the neutral
+    // element, leaving a bare extf that fuses with the consumer's truncf
+    // and cancels -- which is what lets the next Rocket dispatch read this
+    // one's output cube in place (ISSUES.md P2).
+    %taps_i32 = arith.index_cast %taps : index to i32
+    %taps_f32 = arith.sitofp %taps_i32 : i32 to f32
+    %final_nhwc_empty = tensor.empty(
+        %output_height, %output_width, %channels)
+        : tensor<1x?x?x?xf32>
+    %final_nhwc = linalg.generic {
+        indexing_maps = [
+          affine_map<(d0, d1, d2, d3) -> (d0, d1, d2, d3)>,
+          affine_map<(d0, d1, d2, d3) -> (d0, d1, d2, d3)>,
+          affine_map<(d0, d1, d2, d3) -> (d0, d1, d2, d3)>
+        ],
+        iterator_types = ["parallel", "parallel", "parallel", "parallel"]
+      } ins(%averaged, %init_nhwc
+          : tensor<1x?x?x?xf16>, tensor<1x?x?x?xf32>)
+        outs(%final_nhwc_empty : tensor<1x?x?x?xf32>) {
+      ^bb0(%average: f16, %initial: f32, %out: f32):
+        %average_f32 = arith.extf %average : f16 to f32
+        %sum = arith.mulf %average_f32, %taps_f32 : f32
+        %accumulated = arith.addf %sum, %initial : f32
+        linalg.yield %accumulated : f32
+    } -> tensor<1x?x?x?xf32>
 
     // NHWC [1,H,W,C] -> NCHW [1,C,H,W].
     %final_nchw_empty = tensor.empty(%channels, %output_height, %output_width) : tensor<1x?x?x?xf32>
@@ -1633,71 +1595,38 @@ module attributes {transform.with_named_sequence} {
         linalg.yield %narrowed : f16
     } -> tensor<1x?x?xf16>
 
+    %dense_readers_i32 = arith.constant 0 : i32
     %combined = flow.dispatch
         @rocket_elementwise_add_executable::@rocket_elementwise_add_v1::@rocket_elementwise_add(
-          %width_i32, %height_i32, %channels_i32,
+          %width_i32, %height_i32, %channels_i32, %dense_readers_i32,
           %lhs_f16, %rhs_f16)
         {stream.affinity = #hal.device.affinity<@rocket_device>}
-        : (i32, i32, i32,
+        : (i32, i32, i32, i32,
            tensor<1x?x?xf16>{%tokens, %channels},
            tensor<1x?x?xf16>{%tokens, %channels})
         -> tensor<1x?x?xf16>{%tokens, %channels}
 
-    // Explicitly a CPU dispatch, for the reason the pooling shims record: an
-    // op that consumes the Rocket result inherits its affinity, gets formed
-    // into an executable for the rocket device, and that executable has no
-    // element-wise config to serialize. The failure is a serialization error
-    // naming a missing `width`, a long way from the cause.
-    %final = flow.dispatch.workgroups[%tokens, %channels](
-        %combined, %tokens, %channels)
-        : (tensor<1x?x?xf16>{%tokens, %channels}, index, index)
-        -> tensor<1x?x?xf32>{%tokens, %channels}
-        attributes { stream.affinity = #hal.device.affinity<@cpu_device> } =
-        (%combined_binding: !iree_tensor_ext.dispatch.tensor<readonly:tensor<1x?x?xf16>>,
-         %tokens_arg: index,
-         %channels_arg: index,
-         %final_binding: !iree_tensor_ext.dispatch.tensor<writeonly:tensor<1x?x?xf32>>) {
-      %tokens_size = iree_tensor_ext.dispatch.workload.ordinal %tokens_arg, 0 : index
-      %channels_size = iree_tensor_ext.dispatch.workload.ordinal %channels_arg, 1 : index
-      %combined_shaped = flow.dispatch.tie_shape %combined_binding
-          : !iree_tensor_ext.dispatch.tensor<readonly:tensor<1x?x?xf16>>{
-              %tokens_size, %channels_size}
-      %final_shaped = flow.dispatch.tie_shape %final_binding
-          : !iree_tensor_ext.dispatch.tensor<writeonly:tensor<1x?x?xf32>>{
-              %tokens_size, %channels_size}
-      %combined_loaded = iree_tensor_ext.dispatch.tensor.load %combined_shaped,
-          offsets = [0, 0, 0],
-          sizes = [1, %tokens_size, %channels_size],
-          strides = [1, 1, 1]
-          : !iree_tensor_ext.dispatch.tensor<readonly:tensor<1x?x?xf16>>{
-              %tokens_size, %channels_size}
-          -> tensor<1x?x?xf16>
-      %final_empty = tensor.empty(%tokens_size, %channels_size) : tensor<1x?x?xf32>
-      %final_inner = linalg.generic {
-          indexing_maps = [
-            affine_map<(d0, d1, d2) -> (d0, d1, d2)>,
-            affine_map<(d0, d1, d2) -> (d0, d1, d2)>
-          ],
-          iterator_types = ["parallel", "parallel", "parallel"]
-        } ins(%combined_loaded : tensor<1x?x?xf16>)
-          outs(%final_empty : tensor<1x?x?xf32>) {
-        ^bb0(%value: f16, %out: f32):
-          %widened = arith.extf %value : f16 to f32
-          linalg.yield %widened : f32
-      } -> tensor<1x?x?xf32>
-      iree_tensor_ext.dispatch.tensor.store %final_inner, %final_shaped,
-          offsets = [0, 0, 0],
-          sizes = [1, %tokens_size, %channels_size],
-          strides = [1, 1, 1]
-          : tensor<1x?x?xf32>
-          -> !iree_tensor_ext.dispatch.tensor<writeonly:tensor<1x?x?xf32>>{
-              %tokens_size, %channels_size}
-      flow.return
-    } count(%tokens_workload: index, %channels_workload: index) -> (index, index, index) {
-      %x, %y, %z = iree_tensor_ext.dispatch.workgroup_count_from_slice(
-          %tokens_workload, %channels_workload)
-      flow.return %x, %y, %z : index, index, index
-    }
+    // Widen back to f32 and fold in the accumulator initialiser: linalg
+    // defines the op as an update of its init (`O += ...`, `O = max(O, ...)`),
+    // so this is exact for any init. A plain generic, not a pre-formed CPU
+    // dispatch: rocket-pin-unclaimed-dispatches keeps it off the NPU, and
+    // rocket-fold-neutral-init drops the init term when it is the neutral
+    // element, leaving a bare extf that fuses with the consumer's truncf
+    // and cancels -- which is what lets the next Rocket dispatch read this
+    // one's output cube in place (ISSUES.md P2).
+    %final_empty = tensor.empty(%tokens, %channels) : tensor<1x?x?xf32>
+    %final = linalg.generic {
+        indexing_maps = [
+          affine_map<(d0, d1, d2) -> (d0, d1, d2)>,
+          affine_map<(d0, d1, d2) -> (d0, d1, d2)>
+        ],
+        iterator_types = ["parallel", "parallel", "parallel"]
+      } ins(%combined : tensor<1x?x?xf16>)
+        outs(%final_empty : tensor<1x?x?xf32>) {
+      ^bb0(%value: f16, %out: f32):
+        %widened = arith.extf %value : f16 to f32
+        linalg.yield %widened : f32
+    } -> tensor<1x?x?xf32>
 
     util.return %final : tensor<1x?x?xf32>
   }
@@ -1760,71 +1689,38 @@ module attributes {transform.with_named_sequence} {
         linalg.yield %narrowed : f16
     } -> tensor<1x?x?xf16>
 
+    %dense_readers_i32 = arith.constant 0 : i32
     %combined = flow.dispatch
         @rocket_elementwise_sub_executable::@rocket_elementwise_sub_v1::@rocket_elementwise_sub(
-          %width_i32, %height_i32, %channels_i32,
+          %width_i32, %height_i32, %channels_i32, %dense_readers_i32,
           %lhs_f16, %rhs_f16)
         {stream.affinity = #hal.device.affinity<@rocket_device>}
-        : (i32, i32, i32,
+        : (i32, i32, i32, i32,
            tensor<1x?x?xf16>{%tokens, %channels},
            tensor<1x?x?xf16>{%tokens, %channels})
         -> tensor<1x?x?xf16>{%tokens, %channels}
 
-    // Explicitly a CPU dispatch, for the reason the pooling shims record: an
-    // op that consumes the Rocket result inherits its affinity, gets formed
-    // into an executable for the rocket device, and that executable has no
-    // element-wise config to serialize. The failure is a serialization error
-    // naming a missing `width`, a long way from the cause.
-    %final = flow.dispatch.workgroups[%tokens, %channels](
-        %combined, %tokens, %channels)
-        : (tensor<1x?x?xf16>{%tokens, %channels}, index, index)
-        -> tensor<1x?x?xf32>{%tokens, %channels}
-        attributes { stream.affinity = #hal.device.affinity<@cpu_device> } =
-        (%combined_binding: !iree_tensor_ext.dispatch.tensor<readonly:tensor<1x?x?xf16>>,
-         %tokens_arg: index,
-         %channels_arg: index,
-         %final_binding: !iree_tensor_ext.dispatch.tensor<writeonly:tensor<1x?x?xf32>>) {
-      %tokens_size = iree_tensor_ext.dispatch.workload.ordinal %tokens_arg, 0 : index
-      %channels_size = iree_tensor_ext.dispatch.workload.ordinal %channels_arg, 1 : index
-      %combined_shaped = flow.dispatch.tie_shape %combined_binding
-          : !iree_tensor_ext.dispatch.tensor<readonly:tensor<1x?x?xf16>>{
-              %tokens_size, %channels_size}
-      %final_shaped = flow.dispatch.tie_shape %final_binding
-          : !iree_tensor_ext.dispatch.tensor<writeonly:tensor<1x?x?xf32>>{
-              %tokens_size, %channels_size}
-      %combined_loaded = iree_tensor_ext.dispatch.tensor.load %combined_shaped,
-          offsets = [0, 0, 0],
-          sizes = [1, %tokens_size, %channels_size],
-          strides = [1, 1, 1]
-          : !iree_tensor_ext.dispatch.tensor<readonly:tensor<1x?x?xf16>>{
-              %tokens_size, %channels_size}
-          -> tensor<1x?x?xf16>
-      %final_empty = tensor.empty(%tokens_size, %channels_size) : tensor<1x?x?xf32>
-      %final_inner = linalg.generic {
-          indexing_maps = [
-            affine_map<(d0, d1, d2) -> (d0, d1, d2)>,
-            affine_map<(d0, d1, d2) -> (d0, d1, d2)>
-          ],
-          iterator_types = ["parallel", "parallel", "parallel"]
-        } ins(%combined_loaded : tensor<1x?x?xf16>)
-          outs(%final_empty : tensor<1x?x?xf32>) {
-        ^bb0(%value: f16, %out: f32):
-          %widened = arith.extf %value : f16 to f32
-          linalg.yield %widened : f32
-      } -> tensor<1x?x?xf32>
-      iree_tensor_ext.dispatch.tensor.store %final_inner, %final_shaped,
-          offsets = [0, 0, 0],
-          sizes = [1, %tokens_size, %channels_size],
-          strides = [1, 1, 1]
-          : tensor<1x?x?xf32>
-          -> !iree_tensor_ext.dispatch.tensor<writeonly:tensor<1x?x?xf32>>{
-              %tokens_size, %channels_size}
-      flow.return
-    } count(%tokens_workload: index, %channels_workload: index) -> (index, index, index) {
-      %x, %y, %z = iree_tensor_ext.dispatch.workgroup_count_from_slice(
-          %tokens_workload, %channels_workload)
-      flow.return %x, %y, %z : index, index, index
-    }
+    // Widen back to f32 and fold in the accumulator initialiser: linalg
+    // defines the op as an update of its init (`O += ...`, `O = max(O, ...)`),
+    // so this is exact for any init. A plain generic, not a pre-formed CPU
+    // dispatch: rocket-pin-unclaimed-dispatches keeps it off the NPU, and
+    // rocket-fold-neutral-init drops the init term when it is the neutral
+    // element, leaving a bare extf that fuses with the consumer's truncf
+    // and cancels -- which is what lets the next Rocket dispatch read this
+    // one's output cube in place (ISSUES.md P2).
+    %final_empty = tensor.empty(%tokens, %channels) : tensor<1x?x?xf32>
+    %final = linalg.generic {
+        indexing_maps = [
+          affine_map<(d0, d1, d2) -> (d0, d1, d2)>,
+          affine_map<(d0, d1, d2) -> (d0, d1, d2)>
+        ],
+        iterator_types = ["parallel", "parallel", "parallel"]
+      } ins(%combined : tensor<1x?x?xf16>)
+        outs(%final_empty : tensor<1x?x?xf32>) {
+      ^bb0(%value: f16, %out: f32):
+        %widened = arith.extf %value : f16 to f32
+        linalg.yield %widened : f32
+    } -> tensor<1x?x?xf32>
 
     util.return %final : tensor<1x?x?xf32>
   }
@@ -1887,71 +1783,38 @@ module attributes {transform.with_named_sequence} {
         linalg.yield %narrowed : f16
     } -> tensor<1x?x?xf16>
 
+    %dense_readers_i32 = arith.constant 0 : i32
     %combined = flow.dispatch
         @rocket_elementwise_mul_executable::@rocket_elementwise_mul_v1::@rocket_elementwise_mul(
-          %width_i32, %height_i32, %channels_i32,
+          %width_i32, %height_i32, %channels_i32, %dense_readers_i32,
           %lhs_f16, %rhs_f16)
         {stream.affinity = #hal.device.affinity<@rocket_device>}
-        : (i32, i32, i32,
+        : (i32, i32, i32, i32,
            tensor<1x?x?xf16>{%tokens, %channels},
            tensor<1x?x?xf16>{%tokens, %channels})
         -> tensor<1x?x?xf16>{%tokens, %channels}
 
-    // Explicitly a CPU dispatch, for the reason the pooling shims record: an
-    // op that consumes the Rocket result inherits its affinity, gets formed
-    // into an executable for the rocket device, and that executable has no
-    // element-wise config to serialize. The failure is a serialization error
-    // naming a missing `width`, a long way from the cause.
-    %final = flow.dispatch.workgroups[%tokens, %channels](
-        %combined, %tokens, %channels)
-        : (tensor<1x?x?xf16>{%tokens, %channels}, index, index)
-        -> tensor<1x?x?xf32>{%tokens, %channels}
-        attributes { stream.affinity = #hal.device.affinity<@cpu_device> } =
-        (%combined_binding: !iree_tensor_ext.dispatch.tensor<readonly:tensor<1x?x?xf16>>,
-         %tokens_arg: index,
-         %channels_arg: index,
-         %final_binding: !iree_tensor_ext.dispatch.tensor<writeonly:tensor<1x?x?xf32>>) {
-      %tokens_size = iree_tensor_ext.dispatch.workload.ordinal %tokens_arg, 0 : index
-      %channels_size = iree_tensor_ext.dispatch.workload.ordinal %channels_arg, 1 : index
-      %combined_shaped = flow.dispatch.tie_shape %combined_binding
-          : !iree_tensor_ext.dispatch.tensor<readonly:tensor<1x?x?xf16>>{
-              %tokens_size, %channels_size}
-      %final_shaped = flow.dispatch.tie_shape %final_binding
-          : !iree_tensor_ext.dispatch.tensor<writeonly:tensor<1x?x?xf32>>{
-              %tokens_size, %channels_size}
-      %combined_loaded = iree_tensor_ext.dispatch.tensor.load %combined_shaped,
-          offsets = [0, 0, 0],
-          sizes = [1, %tokens_size, %channels_size],
-          strides = [1, 1, 1]
-          : !iree_tensor_ext.dispatch.tensor<readonly:tensor<1x?x?xf16>>{
-              %tokens_size, %channels_size}
-          -> tensor<1x?x?xf16>
-      %final_empty = tensor.empty(%tokens_size, %channels_size) : tensor<1x?x?xf32>
-      %final_inner = linalg.generic {
-          indexing_maps = [
-            affine_map<(d0, d1, d2) -> (d0, d1, d2)>,
-            affine_map<(d0, d1, d2) -> (d0, d1, d2)>
-          ],
-          iterator_types = ["parallel", "parallel", "parallel"]
-        } ins(%combined_loaded : tensor<1x?x?xf16>)
-          outs(%final_empty : tensor<1x?x?xf32>) {
-        ^bb0(%value: f16, %out: f32):
-          %widened = arith.extf %value : f16 to f32
-          linalg.yield %widened : f32
-      } -> tensor<1x?x?xf32>
-      iree_tensor_ext.dispatch.tensor.store %final_inner, %final_shaped,
-          offsets = [0, 0, 0],
-          sizes = [1, %tokens_size, %channels_size],
-          strides = [1, 1, 1]
-          : tensor<1x?x?xf32>
-          -> !iree_tensor_ext.dispatch.tensor<writeonly:tensor<1x?x?xf32>>{
-              %tokens_size, %channels_size}
-      flow.return
-    } count(%tokens_workload: index, %channels_workload: index) -> (index, index, index) {
-      %x, %y, %z = iree_tensor_ext.dispatch.workgroup_count_from_slice(
-          %tokens_workload, %channels_workload)
-      flow.return %x, %y, %z : index, index, index
-    }
+    // Widen back to f32 and fold in the accumulator initialiser: linalg
+    // defines the op as an update of its init (`O += ...`, `O = max(O, ...)`),
+    // so this is exact for any init. A plain generic, not a pre-formed CPU
+    // dispatch: rocket-pin-unclaimed-dispatches keeps it off the NPU, and
+    // rocket-fold-neutral-init drops the init term when it is the neutral
+    // element, leaving a bare extf that fuses with the consumer's truncf
+    // and cancels -- which is what lets the next Rocket dispatch read this
+    // one's output cube in place (ISSUES.md P2).
+    %final_empty = tensor.empty(%tokens, %channels) : tensor<1x?x?xf32>
+    %final = linalg.generic {
+        indexing_maps = [
+          affine_map<(d0, d1, d2) -> (d0, d1, d2)>,
+          affine_map<(d0, d1, d2) -> (d0, d1, d2)>
+        ],
+        iterator_types = ["parallel", "parallel", "parallel"]
+      } ins(%combined : tensor<1x?x?xf16>)
+        outs(%final_empty : tensor<1x?x?xf32>) {
+      ^bb0(%value: f16, %out: f32):
+        %widened = arith.extf %value : f16 to f32
+        linalg.yield %widened : f32
+    } -> tensor<1x?x?xf32>
 
     util.return %final : tensor<1x?x?xf32>
   }
@@ -1998,106 +1861,43 @@ module attributes {transform.with_named_sequence} {
         linalg.yield %narrowed : f16
     } -> tensor<1x?x?x?xf16>
 
+    %dense_readers_i32 = arith.constant 0 : i32
     %pooled = flow.dispatch
         @rocket_pooling_max_executable::@rocket_pooling_max_v1::@rocket_pooling_max(
           %input_width_i32, %input_height_i32, %channels_i32,
-          %kernel_width_i32, %kernel_height_i32,
+          %kernel_width_i32, %kernel_height_i32, %dense_readers_i32,
           %input_f16)
         {stream.affinity = #hal.device.affinity<@rocket_device>}
-        : (i32, i32, i32, i32, i32,
+        : (i32, i32, i32, i32, i32, i32,
            tensor<1x?x?x?xf16>{%input_height, %input_width, %channels})
         -> tensor<1x?x?x?xf16>{%output_height, %output_width, %channels}
 
-    // Widen back to f32 and fold in the accumulator initialiser. linalg
-    // defines a max pool as `O = max(O, I)`, so the init is part of the
-    // reduction rather than merely a destination, and dropping it would
-    // silently change the answer for any model that seeds it with something
-    // other than -inf.
-    //
-    // Explicitly a CPU dispatch, for the reason @call_rocket_pooling_avg_nchw
-    // records: an op that consumes the Rocket result inherits its affinity,
-    // gets formed into an executable for the rocket device, and that
-    // executable has no pooling config to serialize. The failure is a
-    // serialization error naming a missing `input_width`, a long way from
-    // the cause.
-    %final_nhwc = flow.dispatch.workgroups[
-        %output_height, %output_width, %channels](
-        %pooled, %init, %output_height, %output_width, %channels)
-        : (tensor<1x?x?x?xf16>{%output_height, %output_width, %channels},
-           tensor<1x?x?x?xf32>{%output_height, %output_width, %channels},
-           index, index, index)
-        -> tensor<1x?x?x?xf32>{%output_height, %output_width, %channels}
-        attributes { stream.affinity = #hal.device.affinity<@cpu_device> } =
-        (%pooled_binding: !iree_tensor_ext.dispatch.tensor<readonly:tensor<1x?x?x?xf16>>,
-         %init_binding: !iree_tensor_ext.dispatch.tensor<readonly:tensor<1x?x?x?xf32>>,
-         %output_height_arg: index,
-         %output_width_arg: index,
-         %channels_arg: index,
-         %final_binding: !iree_tensor_ext.dispatch.tensor<writeonly:tensor<1x?x?x?xf32>>) {
-      %output_height_size = iree_tensor_ext.dispatch.workload.ordinal
-          %output_height_arg, 0 : index
-      %output_width_size = iree_tensor_ext.dispatch.workload.ordinal
-          %output_width_arg, 1 : index
-      %channels_size = iree_tensor_ext.dispatch.workload.ordinal
-          %channels_arg, 2 : index
-      %pooled_shaped = flow.dispatch.tie_shape %pooled_binding
-          : !iree_tensor_ext.dispatch.tensor<readonly:tensor<1x?x?x?xf16>>{
-              %output_height_size, %output_width_size, %channels_size}
-      %init_shaped = flow.dispatch.tie_shape %init_binding
-          : !iree_tensor_ext.dispatch.tensor<readonly:tensor<1x?x?x?xf32>>{
-              %output_height_size, %output_width_size, %channels_size}
-      %final_shaped = flow.dispatch.tie_shape %final_binding
-          : !iree_tensor_ext.dispatch.tensor<writeonly:tensor<1x?x?x?xf32>>{
-              %output_height_size, %output_width_size, %channels_size}
-      %pooled_loaded = iree_tensor_ext.dispatch.tensor.load %pooled_shaped,
-          offsets = [0, 0, 0, 0],
-          sizes = [1, %output_height_size, %output_width_size, %channels_size],
-          strides = [1, 1, 1, 1]
-          : !iree_tensor_ext.dispatch.tensor<readonly:tensor<1x?x?x?xf16>>{
-              %output_height_size, %output_width_size, %channels_size}
-          -> tensor<1x?x?x?xf16>
-      %init_loaded = iree_tensor_ext.dispatch.tensor.load %init_shaped,
-          offsets = [0, 0, 0, 0],
-          sizes = [1, %output_height_size, %output_width_size, %channels_size],
-          strides = [1, 1, 1, 1]
-          : !iree_tensor_ext.dispatch.tensor<readonly:tensor<1x?x?x?xf32>>{
-              %output_height_size, %output_width_size, %channels_size}
-          -> tensor<1x?x?x?xf32>
-      %final_empty = tensor.empty(
-          %output_height_size, %output_width_size, %channels_size)
-          : tensor<1x?x?x?xf32>
-      %final_inner = linalg.generic {
-          indexing_maps = [
-            affine_map<(d0, d1, d2, d3) -> (d0, d1, d2, d3)>,
-            affine_map<(d0, d1, d2, d3) -> (d0, d1, d2, d3)>,
-            affine_map<(d0, d1, d2, d3) -> (d0, d1, d2, d3)>
-          ],
-          iterator_types = ["parallel", "parallel", "parallel", "parallel"]
-        } ins(%pooled_loaded, %init_loaded
-            : tensor<1x?x?x?xf16>, tensor<1x?x?x?xf32>)
-          outs(%final_empty : tensor<1x?x?x?xf32>) {
-        ^bb0(%pooled_value: f16, %initial: f32, %out: f32):
-          %pooled_f32 = arith.extf %pooled_value : f16 to f32
-          %accumulated = arith.maximumf %pooled_f32, %initial : f32
-          linalg.yield %accumulated : f32
-      } -> tensor<1x?x?x?xf32>
-      iree_tensor_ext.dispatch.tensor.store %final_inner, %final_shaped,
-          offsets = [0, 0, 0, 0],
-          sizes = [1, %output_height_size, %output_width_size, %channels_size],
-          strides = [1, 1, 1, 1]
-          : tensor<1x?x?x?xf32>
-          -> !iree_tensor_ext.dispatch.tensor<writeonly:tensor<1x?x?x?xf32>>{
-              %output_height_size, %output_width_size, %channels_size}
-      flow.return
-    } count(%output_height_workload: index,
-            %output_width_workload: index,
-            %channels_workload: index) -> (index, index, index) {
-      %x, %y, %z = iree_tensor_ext.dispatch.workgroup_count_from_slice(
-          %output_height_workload,
-          %output_width_workload,
-          %channels_workload)
-      flow.return %x, %y, %z : index, index, index
-    }
+    // Widen back to f32 and fold in the accumulator initialiser: linalg
+    // defines the op as an update of its init (`O += ...`, `O = max(O, ...)`),
+    // so this is exact for any init. A plain generic, not a pre-formed CPU
+    // dispatch: rocket-pin-unclaimed-dispatches keeps it off the NPU, and
+    // rocket-fold-neutral-init drops the init term when it is the neutral
+    // element, leaving a bare extf that fuses with the consumer's truncf
+    // and cancels -- which is what lets the next Rocket dispatch read this
+    // one's output cube in place (ISSUES.md P2).
+    %final_nhwc_empty = tensor.empty(
+        %output_height, %output_width, %channels)
+        : tensor<1x?x?x?xf32>
+    %final_nhwc = linalg.generic {
+        indexing_maps = [
+          affine_map<(d0, d1, d2, d3) -> (d0, d1, d2, d3)>,
+          affine_map<(d0, d1, d2, d3) -> (d0, d1, d2, d3)>,
+          affine_map<(d0, d1, d2, d3) -> (d0, d1, d2, d3)>
+        ],
+        iterator_types = ["parallel", "parallel", "parallel", "parallel"]
+      } ins(%pooled, %init
+          : tensor<1x?x?x?xf16>, tensor<1x?x?x?xf32>)
+        outs(%final_nhwc_empty : tensor<1x?x?x?xf32>) {
+      ^bb0(%pooled_value: f16, %initial: f32, %out: f32):
+        %pooled_f32 = arith.extf %pooled_value : f16 to f32
+        %accumulated = arith.maximumf %pooled_f32, %initial : f32
+        linalg.yield %accumulated : f32
+    } -> tensor<1x?x?x?xf32>
 
     util.return %final_nhwc : tensor<1x?x?x?xf32>
   }
@@ -2145,106 +1945,43 @@ module attributes {transform.with_named_sequence} {
         linalg.yield %narrowed : f16
     } -> tensor<1x?x?x?xf16>
 
+    %dense_readers_i32 = arith.constant 0 : i32
     %pooled = flow.dispatch
         @rocket_pooling_max_executable_s2::@rocket_pooling_max_v1::@rocket_pooling_max(
           %input_width_i32, %input_height_i32, %channels_i32,
-          %kernel_width_i32, %kernel_height_i32,
+          %kernel_width_i32, %kernel_height_i32, %dense_readers_i32,
           %input_f16)
         {stream.affinity = #hal.device.affinity<@rocket_device>}
-        : (i32, i32, i32, i32, i32,
+        : (i32, i32, i32, i32, i32, i32,
            tensor<1x?x?x?xf16>{%input_height, %input_width, %channels})
         -> tensor<1x?x?x?xf16>{%output_height, %output_width, %channels}
 
-    // Widen back to f32 and fold in the accumulator initialiser. linalg
-    // defines a max pool as `O = max(O, I)`, so the init is part of the
-    // reduction rather than merely a destination, and dropping it would
-    // silently change the answer for any model that seeds it with something
-    // other than -inf.
-    //
-    // Explicitly a CPU dispatch, for the reason @call_rocket_pooling_avg_nchw
-    // records: an op that consumes the Rocket result inherits its affinity,
-    // gets formed into an executable for the rocket device, and that
-    // executable has no pooling config to serialize. The failure is a
-    // serialization error naming a missing `input_width`, a long way from
-    // the cause.
-    %final_nhwc = flow.dispatch.workgroups[
-        %output_height, %output_width, %channels](
-        %pooled, %init, %output_height, %output_width, %channels)
-        : (tensor<1x?x?x?xf16>{%output_height, %output_width, %channels},
-           tensor<1x?x?x?xf32>{%output_height, %output_width, %channels},
-           index, index, index)
-        -> tensor<1x?x?x?xf32>{%output_height, %output_width, %channels}
-        attributes { stream.affinity = #hal.device.affinity<@cpu_device> } =
-        (%pooled_binding: !iree_tensor_ext.dispatch.tensor<readonly:tensor<1x?x?x?xf16>>,
-         %init_binding: !iree_tensor_ext.dispatch.tensor<readonly:tensor<1x?x?x?xf32>>,
-         %output_height_arg: index,
-         %output_width_arg: index,
-         %channels_arg: index,
-         %final_binding: !iree_tensor_ext.dispatch.tensor<writeonly:tensor<1x?x?x?xf32>>) {
-      %output_height_size = iree_tensor_ext.dispatch.workload.ordinal
-          %output_height_arg, 0 : index
-      %output_width_size = iree_tensor_ext.dispatch.workload.ordinal
-          %output_width_arg, 1 : index
-      %channels_size = iree_tensor_ext.dispatch.workload.ordinal
-          %channels_arg, 2 : index
-      %pooled_shaped = flow.dispatch.tie_shape %pooled_binding
-          : !iree_tensor_ext.dispatch.tensor<readonly:tensor<1x?x?x?xf16>>{
-              %output_height_size, %output_width_size, %channels_size}
-      %init_shaped = flow.dispatch.tie_shape %init_binding
-          : !iree_tensor_ext.dispatch.tensor<readonly:tensor<1x?x?x?xf32>>{
-              %output_height_size, %output_width_size, %channels_size}
-      %final_shaped = flow.dispatch.tie_shape %final_binding
-          : !iree_tensor_ext.dispatch.tensor<writeonly:tensor<1x?x?x?xf32>>{
-              %output_height_size, %output_width_size, %channels_size}
-      %pooled_loaded = iree_tensor_ext.dispatch.tensor.load %pooled_shaped,
-          offsets = [0, 0, 0, 0],
-          sizes = [1, %output_height_size, %output_width_size, %channels_size],
-          strides = [1, 1, 1, 1]
-          : !iree_tensor_ext.dispatch.tensor<readonly:tensor<1x?x?x?xf16>>{
-              %output_height_size, %output_width_size, %channels_size}
-          -> tensor<1x?x?x?xf16>
-      %init_loaded = iree_tensor_ext.dispatch.tensor.load %init_shaped,
-          offsets = [0, 0, 0, 0],
-          sizes = [1, %output_height_size, %output_width_size, %channels_size],
-          strides = [1, 1, 1, 1]
-          : !iree_tensor_ext.dispatch.tensor<readonly:tensor<1x?x?x?xf32>>{
-              %output_height_size, %output_width_size, %channels_size}
-          -> tensor<1x?x?x?xf32>
-      %final_empty = tensor.empty(
-          %output_height_size, %output_width_size, %channels_size)
-          : tensor<1x?x?x?xf32>
-      %final_inner = linalg.generic {
-          indexing_maps = [
-            affine_map<(d0, d1, d2, d3) -> (d0, d1, d2, d3)>,
-            affine_map<(d0, d1, d2, d3) -> (d0, d1, d2, d3)>,
-            affine_map<(d0, d1, d2, d3) -> (d0, d1, d2, d3)>
-          ],
-          iterator_types = ["parallel", "parallel", "parallel", "parallel"]
-        } ins(%pooled_loaded, %init_loaded
-            : tensor<1x?x?x?xf16>, tensor<1x?x?x?xf32>)
-          outs(%final_empty : tensor<1x?x?x?xf32>) {
-        ^bb0(%pooled_value: f16, %initial: f32, %out: f32):
-          %pooled_f32 = arith.extf %pooled_value : f16 to f32
-          %accumulated = arith.maximumf %pooled_f32, %initial : f32
-          linalg.yield %accumulated : f32
-      } -> tensor<1x?x?x?xf32>
-      iree_tensor_ext.dispatch.tensor.store %final_inner, %final_shaped,
-          offsets = [0, 0, 0, 0],
-          sizes = [1, %output_height_size, %output_width_size, %channels_size],
-          strides = [1, 1, 1, 1]
-          : tensor<1x?x?x?xf32>
-          -> !iree_tensor_ext.dispatch.tensor<writeonly:tensor<1x?x?x?xf32>>{
-              %output_height_size, %output_width_size, %channels_size}
-      flow.return
-    } count(%output_height_workload: index,
-            %output_width_workload: index,
-            %channels_workload: index) -> (index, index, index) {
-      %x, %y, %z = iree_tensor_ext.dispatch.workgroup_count_from_slice(
-          %output_height_workload,
-          %output_width_workload,
-          %channels_workload)
-      flow.return %x, %y, %z : index, index, index
-    }
+    // Widen back to f32 and fold in the accumulator initialiser: linalg
+    // defines the op as an update of its init (`O += ...`, `O = max(O, ...)`),
+    // so this is exact for any init. A plain generic, not a pre-formed CPU
+    // dispatch: rocket-pin-unclaimed-dispatches keeps it off the NPU, and
+    // rocket-fold-neutral-init drops the init term when it is the neutral
+    // element, leaving a bare extf that fuses with the consumer's truncf
+    // and cancels -- which is what lets the next Rocket dispatch read this
+    // one's output cube in place (ISSUES.md P2).
+    %final_nhwc_empty = tensor.empty(
+        %output_height, %output_width, %channels)
+        : tensor<1x?x?x?xf32>
+    %final_nhwc = linalg.generic {
+        indexing_maps = [
+          affine_map<(d0, d1, d2, d3) -> (d0, d1, d2, d3)>,
+          affine_map<(d0, d1, d2, d3) -> (d0, d1, d2, d3)>,
+          affine_map<(d0, d1, d2, d3) -> (d0, d1, d2, d3)>
+        ],
+        iterator_types = ["parallel", "parallel", "parallel", "parallel"]
+      } ins(%pooled, %init
+          : tensor<1x?x?x?xf16>, tensor<1x?x?x?xf32>)
+        outs(%final_nhwc_empty : tensor<1x?x?x?xf32>) {
+      ^bb0(%pooled_value: f16, %initial: f32, %out: f32):
+        %pooled_f32 = arith.extf %pooled_value : f16 to f32
+        %accumulated = arith.maximumf %pooled_f32, %initial : f32
+        linalg.yield %accumulated : f32
+    } -> tensor<1x?x?x?xf32>
 
     util.return %final_nhwc : tensor<1x?x?x?xf32>
   }
@@ -2301,13 +2038,14 @@ module attributes {transform.with_named_sequence} {
         linalg.yield %narrowed : f16
     } -> tensor<1x?x?x?xf16>
 
+    %dense_readers_i32 = arith.constant 0 : i32
     %pooled = flow.dispatch
         @rocket_pooling_max_executable::@rocket_pooling_max_v1::@rocket_pooling_max(
           %input_width_i32, %input_height_i32, %channels_i32,
-          %kernel_width_i32, %kernel_height_i32,
+          %kernel_width_i32, %kernel_height_i32, %dense_readers_i32,
           %input_f16)
         {stream.affinity = #hal.device.affinity<@rocket_device>}
-        : (i32, i32, i32, i32, i32,
+        : (i32, i32, i32, i32, i32, i32,
            tensor<1x?x?x?xf16>{%input_height, %input_width, %channels})
         -> tensor<1x?x?x?xf16>{%output_height, %output_width, %channels}
 
@@ -2318,96 +2056,32 @@ module attributes {transform.with_named_sequence} {
         outs(%init_nhwc_empty : tensor<1x?x?x?xf32>)
         permutation = [0, 2, 3, 1]
 
-    // Widen back to f32 and fold in the accumulator initialiser. linalg
-    // defines a max pool as `O = max(O, I)`, so the init is part of the
-    // reduction rather than merely a destination, and dropping it would
-    // silently change the answer for any model that seeds it with something
-    // other than -inf.
-    //
-    // Explicitly a CPU dispatch, for the reason @call_rocket_pooling_avg_nchw
-    // records: an op that consumes the Rocket result inherits its affinity,
-    // gets formed into an executable for the rocket device, and that
-    // executable has no pooling config to serialize. The failure is a
-    // serialization error naming a missing `input_width`, a long way from
-    // the cause.
-    %final_nhwc = flow.dispatch.workgroups[
-        %output_height, %output_width, %channels](
-        %pooled, %init_nhwc, %output_height, %output_width, %channels)
-        : (tensor<1x?x?x?xf16>{%output_height, %output_width, %channels},
-           tensor<1x?x?x?xf32>{%output_height, %output_width, %channels},
-           index, index, index)
-        -> tensor<1x?x?x?xf32>{%output_height, %output_width, %channels}
-        attributes { stream.affinity = #hal.device.affinity<@cpu_device> } =
-        (%pooled_binding: !iree_tensor_ext.dispatch.tensor<readonly:tensor<1x?x?x?xf16>>,
-         %init_binding: !iree_tensor_ext.dispatch.tensor<readonly:tensor<1x?x?x?xf32>>,
-         %output_height_arg: index,
-         %output_width_arg: index,
-         %channels_arg: index,
-         %final_binding: !iree_tensor_ext.dispatch.tensor<writeonly:tensor<1x?x?x?xf32>>) {
-      %output_height_size = iree_tensor_ext.dispatch.workload.ordinal
-          %output_height_arg, 0 : index
-      %output_width_size = iree_tensor_ext.dispatch.workload.ordinal
-          %output_width_arg, 1 : index
-      %channels_size = iree_tensor_ext.dispatch.workload.ordinal
-          %channels_arg, 2 : index
-      %pooled_shaped = flow.dispatch.tie_shape %pooled_binding
-          : !iree_tensor_ext.dispatch.tensor<readonly:tensor<1x?x?x?xf16>>{
-              %output_height_size, %output_width_size, %channels_size}
-      %init_shaped = flow.dispatch.tie_shape %init_binding
-          : !iree_tensor_ext.dispatch.tensor<readonly:tensor<1x?x?x?xf32>>{
-              %output_height_size, %output_width_size, %channels_size}
-      %final_shaped = flow.dispatch.tie_shape %final_binding
-          : !iree_tensor_ext.dispatch.tensor<writeonly:tensor<1x?x?x?xf32>>{
-              %output_height_size, %output_width_size, %channels_size}
-      %pooled_loaded = iree_tensor_ext.dispatch.tensor.load %pooled_shaped,
-          offsets = [0, 0, 0, 0],
-          sizes = [1, %output_height_size, %output_width_size, %channels_size],
-          strides = [1, 1, 1, 1]
-          : !iree_tensor_ext.dispatch.tensor<readonly:tensor<1x?x?x?xf16>>{
-              %output_height_size, %output_width_size, %channels_size}
-          -> tensor<1x?x?x?xf16>
-      %init_loaded = iree_tensor_ext.dispatch.tensor.load %init_shaped,
-          offsets = [0, 0, 0, 0],
-          sizes = [1, %output_height_size, %output_width_size, %channels_size],
-          strides = [1, 1, 1, 1]
-          : !iree_tensor_ext.dispatch.tensor<readonly:tensor<1x?x?x?xf32>>{
-              %output_height_size, %output_width_size, %channels_size}
-          -> tensor<1x?x?x?xf32>
-      %final_empty = tensor.empty(
-          %output_height_size, %output_width_size, %channels_size)
-          : tensor<1x?x?x?xf32>
-      %final_inner = linalg.generic {
-          indexing_maps = [
-            affine_map<(d0, d1, d2, d3) -> (d0, d1, d2, d3)>,
-            affine_map<(d0, d1, d2, d3) -> (d0, d1, d2, d3)>,
-            affine_map<(d0, d1, d2, d3) -> (d0, d1, d2, d3)>
-          ],
-          iterator_types = ["parallel", "parallel", "parallel", "parallel"]
-        } ins(%pooled_loaded, %init_loaded
-            : tensor<1x?x?x?xf16>, tensor<1x?x?x?xf32>)
-          outs(%final_empty : tensor<1x?x?x?xf32>) {
-        ^bb0(%pooled_value: f16, %initial: f32, %out: f32):
-          %pooled_f32 = arith.extf %pooled_value : f16 to f32
-          %accumulated = arith.maximumf %pooled_f32, %initial : f32
-          linalg.yield %accumulated : f32
-      } -> tensor<1x?x?x?xf32>
-      iree_tensor_ext.dispatch.tensor.store %final_inner, %final_shaped,
-          offsets = [0, 0, 0, 0],
-          sizes = [1, %output_height_size, %output_width_size, %channels_size],
-          strides = [1, 1, 1, 1]
-          : tensor<1x?x?x?xf32>
-          -> !iree_tensor_ext.dispatch.tensor<writeonly:tensor<1x?x?x?xf32>>{
-              %output_height_size, %output_width_size, %channels_size}
-      flow.return
-    } count(%output_height_workload: index,
-            %output_width_workload: index,
-            %channels_workload: index) -> (index, index, index) {
-      %x, %y, %z = iree_tensor_ext.dispatch.workgroup_count_from_slice(
-          %output_height_workload,
-          %output_width_workload,
-          %channels_workload)
-      flow.return %x, %y, %z : index, index, index
-    }
+    // Widen back to f32 and fold in the accumulator initialiser: linalg
+    // defines the op as an update of its init (`O += ...`, `O = max(O, ...)`),
+    // so this is exact for any init. A plain generic, not a pre-formed CPU
+    // dispatch: rocket-pin-unclaimed-dispatches keeps it off the NPU, and
+    // rocket-fold-neutral-init drops the init term when it is the neutral
+    // element, leaving a bare extf that fuses with the consumer's truncf
+    // and cancels -- which is what lets the next Rocket dispatch read this
+    // one's output cube in place (ISSUES.md P2).
+    %final_nhwc_empty = tensor.empty(
+        %output_height, %output_width, %channels)
+        : tensor<1x?x?x?xf32>
+    %final_nhwc = linalg.generic {
+        indexing_maps = [
+          affine_map<(d0, d1, d2, d3) -> (d0, d1, d2, d3)>,
+          affine_map<(d0, d1, d2, d3) -> (d0, d1, d2, d3)>,
+          affine_map<(d0, d1, d2, d3) -> (d0, d1, d2, d3)>
+        ],
+        iterator_types = ["parallel", "parallel", "parallel", "parallel"]
+      } ins(%pooled, %init_nhwc
+          : tensor<1x?x?x?xf16>, tensor<1x?x?x?xf32>)
+        outs(%final_nhwc_empty : tensor<1x?x?x?xf32>) {
+      ^bb0(%pooled_value: f16, %initial: f32, %out: f32):
+        %pooled_f32 = arith.extf %pooled_value : f16 to f32
+        %accumulated = arith.maximumf %pooled_f32, %initial : f32
+        linalg.yield %accumulated : f32
+    } -> tensor<1x?x?x?xf32>
 
     // NHWC [1,H,W,C] -> NCHW [1,C,H,W].
     %final_nchw_empty = tensor.empty(%channels, %output_height, %output_width) : tensor<1x?x?x?xf32>
@@ -2467,13 +2141,14 @@ module attributes {transform.with_named_sequence} {
         linalg.yield %narrowed : f16
     } -> tensor<1x?x?x?xf16>
 
+    %dense_readers_i32 = arith.constant 0 : i32
     %pooled = flow.dispatch
         @rocket_pooling_max_executable_s2::@rocket_pooling_max_v1::@rocket_pooling_max(
           %input_width_i32, %input_height_i32, %channels_i32,
-          %kernel_width_i32, %kernel_height_i32,
+          %kernel_width_i32, %kernel_height_i32, %dense_readers_i32,
           %input_f16)
         {stream.affinity = #hal.device.affinity<@rocket_device>}
-        : (i32, i32, i32, i32, i32,
+        : (i32, i32, i32, i32, i32, i32,
            tensor<1x?x?x?xf16>{%input_height, %input_width, %channels})
         -> tensor<1x?x?x?xf16>{%output_height, %output_width, %channels}
 
@@ -2484,96 +2159,32 @@ module attributes {transform.with_named_sequence} {
         outs(%init_nhwc_empty : tensor<1x?x?x?xf32>)
         permutation = [0, 2, 3, 1]
 
-    // Widen back to f32 and fold in the accumulator initialiser. linalg
-    // defines a max pool as `O = max(O, I)`, so the init is part of the
-    // reduction rather than merely a destination, and dropping it would
-    // silently change the answer for any model that seeds it with something
-    // other than -inf.
-    //
-    // Explicitly a CPU dispatch, for the reason @call_rocket_pooling_avg_nchw
-    // records: an op that consumes the Rocket result inherits its affinity,
-    // gets formed into an executable for the rocket device, and that
-    // executable has no pooling config to serialize. The failure is a
-    // serialization error naming a missing `input_width`, a long way from
-    // the cause.
-    %final_nhwc = flow.dispatch.workgroups[
-        %output_height, %output_width, %channels](
-        %pooled, %init_nhwc, %output_height, %output_width, %channels)
-        : (tensor<1x?x?x?xf16>{%output_height, %output_width, %channels},
-           tensor<1x?x?x?xf32>{%output_height, %output_width, %channels},
-           index, index, index)
-        -> tensor<1x?x?x?xf32>{%output_height, %output_width, %channels}
-        attributes { stream.affinity = #hal.device.affinity<@cpu_device> } =
-        (%pooled_binding: !iree_tensor_ext.dispatch.tensor<readonly:tensor<1x?x?x?xf16>>,
-         %init_binding: !iree_tensor_ext.dispatch.tensor<readonly:tensor<1x?x?x?xf32>>,
-         %output_height_arg: index,
-         %output_width_arg: index,
-         %channels_arg: index,
-         %final_binding: !iree_tensor_ext.dispatch.tensor<writeonly:tensor<1x?x?x?xf32>>) {
-      %output_height_size = iree_tensor_ext.dispatch.workload.ordinal
-          %output_height_arg, 0 : index
-      %output_width_size = iree_tensor_ext.dispatch.workload.ordinal
-          %output_width_arg, 1 : index
-      %channels_size = iree_tensor_ext.dispatch.workload.ordinal
-          %channels_arg, 2 : index
-      %pooled_shaped = flow.dispatch.tie_shape %pooled_binding
-          : !iree_tensor_ext.dispatch.tensor<readonly:tensor<1x?x?x?xf16>>{
-              %output_height_size, %output_width_size, %channels_size}
-      %init_shaped = flow.dispatch.tie_shape %init_binding
-          : !iree_tensor_ext.dispatch.tensor<readonly:tensor<1x?x?x?xf32>>{
-              %output_height_size, %output_width_size, %channels_size}
-      %final_shaped = flow.dispatch.tie_shape %final_binding
-          : !iree_tensor_ext.dispatch.tensor<writeonly:tensor<1x?x?x?xf32>>{
-              %output_height_size, %output_width_size, %channels_size}
-      %pooled_loaded = iree_tensor_ext.dispatch.tensor.load %pooled_shaped,
-          offsets = [0, 0, 0, 0],
-          sizes = [1, %output_height_size, %output_width_size, %channels_size],
-          strides = [1, 1, 1, 1]
-          : !iree_tensor_ext.dispatch.tensor<readonly:tensor<1x?x?x?xf16>>{
-              %output_height_size, %output_width_size, %channels_size}
-          -> tensor<1x?x?x?xf16>
-      %init_loaded = iree_tensor_ext.dispatch.tensor.load %init_shaped,
-          offsets = [0, 0, 0, 0],
-          sizes = [1, %output_height_size, %output_width_size, %channels_size],
-          strides = [1, 1, 1, 1]
-          : !iree_tensor_ext.dispatch.tensor<readonly:tensor<1x?x?x?xf32>>{
-              %output_height_size, %output_width_size, %channels_size}
-          -> tensor<1x?x?x?xf32>
-      %final_empty = tensor.empty(
-          %output_height_size, %output_width_size, %channels_size)
-          : tensor<1x?x?x?xf32>
-      %final_inner = linalg.generic {
-          indexing_maps = [
-            affine_map<(d0, d1, d2, d3) -> (d0, d1, d2, d3)>,
-            affine_map<(d0, d1, d2, d3) -> (d0, d1, d2, d3)>,
-            affine_map<(d0, d1, d2, d3) -> (d0, d1, d2, d3)>
-          ],
-          iterator_types = ["parallel", "parallel", "parallel", "parallel"]
-        } ins(%pooled_loaded, %init_loaded
-            : tensor<1x?x?x?xf16>, tensor<1x?x?x?xf32>)
-          outs(%final_empty : tensor<1x?x?x?xf32>) {
-        ^bb0(%pooled_value: f16, %initial: f32, %out: f32):
-          %pooled_f32 = arith.extf %pooled_value : f16 to f32
-          %accumulated = arith.maximumf %pooled_f32, %initial : f32
-          linalg.yield %accumulated : f32
-      } -> tensor<1x?x?x?xf32>
-      iree_tensor_ext.dispatch.tensor.store %final_inner, %final_shaped,
-          offsets = [0, 0, 0, 0],
-          sizes = [1, %output_height_size, %output_width_size, %channels_size],
-          strides = [1, 1, 1, 1]
-          : tensor<1x?x?x?xf32>
-          -> !iree_tensor_ext.dispatch.tensor<writeonly:tensor<1x?x?x?xf32>>{
-              %output_height_size, %output_width_size, %channels_size}
-      flow.return
-    } count(%output_height_workload: index,
-            %output_width_workload: index,
-            %channels_workload: index) -> (index, index, index) {
-      %x, %y, %z = iree_tensor_ext.dispatch.workgroup_count_from_slice(
-          %output_height_workload,
-          %output_width_workload,
-          %channels_workload)
-      flow.return %x, %y, %z : index, index, index
-    }
+    // Widen back to f32 and fold in the accumulator initialiser: linalg
+    // defines the op as an update of its init (`O += ...`, `O = max(O, ...)`),
+    // so this is exact for any init. A plain generic, not a pre-formed CPU
+    // dispatch: rocket-pin-unclaimed-dispatches keeps it off the NPU, and
+    // rocket-fold-neutral-init drops the init term when it is the neutral
+    // element, leaving a bare extf that fuses with the consumer's truncf
+    // and cancels -- which is what lets the next Rocket dispatch read this
+    // one's output cube in place (ISSUES.md P2).
+    %final_nhwc_empty = tensor.empty(
+        %output_height, %output_width, %channels)
+        : tensor<1x?x?x?xf32>
+    %final_nhwc = linalg.generic {
+        indexing_maps = [
+          affine_map<(d0, d1, d2, d3) -> (d0, d1, d2, d3)>,
+          affine_map<(d0, d1, d2, d3) -> (d0, d1, d2, d3)>,
+          affine_map<(d0, d1, d2, d3) -> (d0, d1, d2, d3)>
+        ],
+        iterator_types = ["parallel", "parallel", "parallel", "parallel"]
+      } ins(%pooled, %init_nhwc
+          : tensor<1x?x?x?xf16>, tensor<1x?x?x?xf32>)
+        outs(%final_nhwc_empty : tensor<1x?x?x?xf32>) {
+      ^bb0(%pooled_value: f16, %initial: f32, %out: f32):
+        %pooled_f32 = arith.extf %pooled_value : f16 to f32
+        %accumulated = arith.maximumf %pooled_f32, %initial : f32
+        linalg.yield %accumulated : f32
+    } -> tensor<1x?x?x?xf32>
 
     // NHWC [1,H,W,C] -> NCHW [1,C,H,W].
     %final_nchw_empty = tensor.empty(%channels, %output_height, %output_width) : tensor<1x?x?x?xf32>
@@ -2629,106 +2240,43 @@ module attributes {transform.with_named_sequence} {
         linalg.yield %narrowed : f16
     } -> tensor<1x?x?x?xf16>
 
+    %dense_readers_i32 = arith.constant 0 : i32
     %pooled = flow.dispatch
         @rocket_pooling_min_executable::@rocket_pooling_min_v1::@rocket_pooling_min(
           %input_width_i32, %input_height_i32, %channels_i32,
-          %kernel_width_i32, %kernel_height_i32,
+          %kernel_width_i32, %kernel_height_i32, %dense_readers_i32,
           %input_f16)
         {stream.affinity = #hal.device.affinity<@rocket_device>}
-        : (i32, i32, i32, i32, i32,
+        : (i32, i32, i32, i32, i32, i32,
            tensor<1x?x?x?xf16>{%input_height, %input_width, %channels})
         -> tensor<1x?x?x?xf16>{%output_height, %output_width, %channels}
 
-    // Widen back to f32 and fold in the accumulator initialiser. linalg
-    // defines a min pool as `O = min(O, I)`, so the init is part of the
-    // reduction rather than merely a destination, and dropping it would
-    // silently change the answer for any model that seeds it with something
-    // other than +inf.
-    //
-    // Explicitly a CPU dispatch, for the reason @call_rocket_pooling_avg_nchw
-    // records: an op that consumes the Rocket result inherits its affinity,
-    // gets formed into an executable for the rocket device, and that
-    // executable has no pooling config to serialize. The failure is a
-    // serialization error naming a missing `input_width`, a long way from
-    // the cause.
-    %final_nhwc = flow.dispatch.workgroups[
-        %output_height, %output_width, %channels](
-        %pooled, %init, %output_height, %output_width, %channels)
-        : (tensor<1x?x?x?xf16>{%output_height, %output_width, %channels},
-           tensor<1x?x?x?xf32>{%output_height, %output_width, %channels},
-           index, index, index)
-        -> tensor<1x?x?x?xf32>{%output_height, %output_width, %channels}
-        attributes { stream.affinity = #hal.device.affinity<@cpu_device> } =
-        (%pooled_binding: !iree_tensor_ext.dispatch.tensor<readonly:tensor<1x?x?x?xf16>>,
-         %init_binding: !iree_tensor_ext.dispatch.tensor<readonly:tensor<1x?x?x?xf32>>,
-         %output_height_arg: index,
-         %output_width_arg: index,
-         %channels_arg: index,
-         %final_binding: !iree_tensor_ext.dispatch.tensor<writeonly:tensor<1x?x?x?xf32>>) {
-      %output_height_size = iree_tensor_ext.dispatch.workload.ordinal
-          %output_height_arg, 0 : index
-      %output_width_size = iree_tensor_ext.dispatch.workload.ordinal
-          %output_width_arg, 1 : index
-      %channels_size = iree_tensor_ext.dispatch.workload.ordinal
-          %channels_arg, 2 : index
-      %pooled_shaped = flow.dispatch.tie_shape %pooled_binding
-          : !iree_tensor_ext.dispatch.tensor<readonly:tensor<1x?x?x?xf16>>{
-              %output_height_size, %output_width_size, %channels_size}
-      %init_shaped = flow.dispatch.tie_shape %init_binding
-          : !iree_tensor_ext.dispatch.tensor<readonly:tensor<1x?x?x?xf32>>{
-              %output_height_size, %output_width_size, %channels_size}
-      %final_shaped = flow.dispatch.tie_shape %final_binding
-          : !iree_tensor_ext.dispatch.tensor<writeonly:tensor<1x?x?x?xf32>>{
-              %output_height_size, %output_width_size, %channels_size}
-      %pooled_loaded = iree_tensor_ext.dispatch.tensor.load %pooled_shaped,
-          offsets = [0, 0, 0, 0],
-          sizes = [1, %output_height_size, %output_width_size, %channels_size],
-          strides = [1, 1, 1, 1]
-          : !iree_tensor_ext.dispatch.tensor<readonly:tensor<1x?x?x?xf16>>{
-              %output_height_size, %output_width_size, %channels_size}
-          -> tensor<1x?x?x?xf16>
-      %init_loaded = iree_tensor_ext.dispatch.tensor.load %init_shaped,
-          offsets = [0, 0, 0, 0],
-          sizes = [1, %output_height_size, %output_width_size, %channels_size],
-          strides = [1, 1, 1, 1]
-          : !iree_tensor_ext.dispatch.tensor<readonly:tensor<1x?x?x?xf32>>{
-              %output_height_size, %output_width_size, %channels_size}
-          -> tensor<1x?x?x?xf32>
-      %final_empty = tensor.empty(
-          %output_height_size, %output_width_size, %channels_size)
-          : tensor<1x?x?x?xf32>
-      %final_inner = linalg.generic {
-          indexing_maps = [
-            affine_map<(d0, d1, d2, d3) -> (d0, d1, d2, d3)>,
-            affine_map<(d0, d1, d2, d3) -> (d0, d1, d2, d3)>,
-            affine_map<(d0, d1, d2, d3) -> (d0, d1, d2, d3)>
-          ],
-          iterator_types = ["parallel", "parallel", "parallel", "parallel"]
-        } ins(%pooled_loaded, %init_loaded
-            : tensor<1x?x?x?xf16>, tensor<1x?x?x?xf32>)
-          outs(%final_empty : tensor<1x?x?x?xf32>) {
-        ^bb0(%pooled_value: f16, %initial: f32, %out: f32):
-          %pooled_f32 = arith.extf %pooled_value : f16 to f32
-          %accumulated = arith.minimumf %pooled_f32, %initial : f32
-          linalg.yield %accumulated : f32
-      } -> tensor<1x?x?x?xf32>
-      iree_tensor_ext.dispatch.tensor.store %final_inner, %final_shaped,
-          offsets = [0, 0, 0, 0],
-          sizes = [1, %output_height_size, %output_width_size, %channels_size],
-          strides = [1, 1, 1, 1]
-          : tensor<1x?x?x?xf32>
-          -> !iree_tensor_ext.dispatch.tensor<writeonly:tensor<1x?x?x?xf32>>{
-              %output_height_size, %output_width_size, %channels_size}
-      flow.return
-    } count(%output_height_workload: index,
-            %output_width_workload: index,
-            %channels_workload: index) -> (index, index, index) {
-      %x, %y, %z = iree_tensor_ext.dispatch.workgroup_count_from_slice(
-          %output_height_workload,
-          %output_width_workload,
-          %channels_workload)
-      flow.return %x, %y, %z : index, index, index
-    }
+    // Widen back to f32 and fold in the accumulator initialiser: linalg
+    // defines the op as an update of its init (`O += ...`, `O = max(O, ...)`),
+    // so this is exact for any init. A plain generic, not a pre-formed CPU
+    // dispatch: rocket-pin-unclaimed-dispatches keeps it off the NPU, and
+    // rocket-fold-neutral-init drops the init term when it is the neutral
+    // element, leaving a bare extf that fuses with the consumer's truncf
+    // and cancels -- which is what lets the next Rocket dispatch read this
+    // one's output cube in place (ISSUES.md P2).
+    %final_nhwc_empty = tensor.empty(
+        %output_height, %output_width, %channels)
+        : tensor<1x?x?x?xf32>
+    %final_nhwc = linalg.generic {
+        indexing_maps = [
+          affine_map<(d0, d1, d2, d3) -> (d0, d1, d2, d3)>,
+          affine_map<(d0, d1, d2, d3) -> (d0, d1, d2, d3)>,
+          affine_map<(d0, d1, d2, d3) -> (d0, d1, d2, d3)>
+        ],
+        iterator_types = ["parallel", "parallel", "parallel", "parallel"]
+      } ins(%pooled, %init
+          : tensor<1x?x?x?xf16>, tensor<1x?x?x?xf32>)
+        outs(%final_nhwc_empty : tensor<1x?x?x?xf32>) {
+      ^bb0(%pooled_value: f16, %initial: f32, %out: f32):
+        %pooled_f32 = arith.extf %pooled_value : f16 to f32
+        %accumulated = arith.minimumf %pooled_f32, %initial : f32
+        linalg.yield %accumulated : f32
+    } -> tensor<1x?x?x?xf32>
 
     util.return %final_nhwc : tensor<1x?x?x?xf32>
   }
@@ -2774,106 +2322,43 @@ module attributes {transform.with_named_sequence} {
         linalg.yield %narrowed : f16
     } -> tensor<1x?x?x?xf16>
 
+    %dense_readers_i32 = arith.constant 0 : i32
     %pooled = flow.dispatch
         @rocket_pooling_min_executable_s2::@rocket_pooling_min_v1::@rocket_pooling_min(
           %input_width_i32, %input_height_i32, %channels_i32,
-          %kernel_width_i32, %kernel_height_i32,
+          %kernel_width_i32, %kernel_height_i32, %dense_readers_i32,
           %input_f16)
         {stream.affinity = #hal.device.affinity<@rocket_device>}
-        : (i32, i32, i32, i32, i32,
+        : (i32, i32, i32, i32, i32, i32,
            tensor<1x?x?x?xf16>{%input_height, %input_width, %channels})
         -> tensor<1x?x?x?xf16>{%output_height, %output_width, %channels}
 
-    // Widen back to f32 and fold in the accumulator initialiser. linalg
-    // defines a min pool as `O = min(O, I)`, so the init is part of the
-    // reduction rather than merely a destination, and dropping it would
-    // silently change the answer for any model that seeds it with something
-    // other than +inf.
-    //
-    // Explicitly a CPU dispatch, for the reason @call_rocket_pooling_avg_nchw
-    // records: an op that consumes the Rocket result inherits its affinity,
-    // gets formed into an executable for the rocket device, and that
-    // executable has no pooling config to serialize. The failure is a
-    // serialization error naming a missing `input_width`, a long way from
-    // the cause.
-    %final_nhwc = flow.dispatch.workgroups[
-        %output_height, %output_width, %channels](
-        %pooled, %init, %output_height, %output_width, %channels)
-        : (tensor<1x?x?x?xf16>{%output_height, %output_width, %channels},
-           tensor<1x?x?x?xf32>{%output_height, %output_width, %channels},
-           index, index, index)
-        -> tensor<1x?x?x?xf32>{%output_height, %output_width, %channels}
-        attributes { stream.affinity = #hal.device.affinity<@cpu_device> } =
-        (%pooled_binding: !iree_tensor_ext.dispatch.tensor<readonly:tensor<1x?x?x?xf16>>,
-         %init_binding: !iree_tensor_ext.dispatch.tensor<readonly:tensor<1x?x?x?xf32>>,
-         %output_height_arg: index,
-         %output_width_arg: index,
-         %channels_arg: index,
-         %final_binding: !iree_tensor_ext.dispatch.tensor<writeonly:tensor<1x?x?x?xf32>>) {
-      %output_height_size = iree_tensor_ext.dispatch.workload.ordinal
-          %output_height_arg, 0 : index
-      %output_width_size = iree_tensor_ext.dispatch.workload.ordinal
-          %output_width_arg, 1 : index
-      %channels_size = iree_tensor_ext.dispatch.workload.ordinal
-          %channels_arg, 2 : index
-      %pooled_shaped = flow.dispatch.tie_shape %pooled_binding
-          : !iree_tensor_ext.dispatch.tensor<readonly:tensor<1x?x?x?xf16>>{
-              %output_height_size, %output_width_size, %channels_size}
-      %init_shaped = flow.dispatch.tie_shape %init_binding
-          : !iree_tensor_ext.dispatch.tensor<readonly:tensor<1x?x?x?xf32>>{
-              %output_height_size, %output_width_size, %channels_size}
-      %final_shaped = flow.dispatch.tie_shape %final_binding
-          : !iree_tensor_ext.dispatch.tensor<writeonly:tensor<1x?x?x?xf32>>{
-              %output_height_size, %output_width_size, %channels_size}
-      %pooled_loaded = iree_tensor_ext.dispatch.tensor.load %pooled_shaped,
-          offsets = [0, 0, 0, 0],
-          sizes = [1, %output_height_size, %output_width_size, %channels_size],
-          strides = [1, 1, 1, 1]
-          : !iree_tensor_ext.dispatch.tensor<readonly:tensor<1x?x?x?xf16>>{
-              %output_height_size, %output_width_size, %channels_size}
-          -> tensor<1x?x?x?xf16>
-      %init_loaded = iree_tensor_ext.dispatch.tensor.load %init_shaped,
-          offsets = [0, 0, 0, 0],
-          sizes = [1, %output_height_size, %output_width_size, %channels_size],
-          strides = [1, 1, 1, 1]
-          : !iree_tensor_ext.dispatch.tensor<readonly:tensor<1x?x?x?xf32>>{
-              %output_height_size, %output_width_size, %channels_size}
-          -> tensor<1x?x?x?xf32>
-      %final_empty = tensor.empty(
-          %output_height_size, %output_width_size, %channels_size)
-          : tensor<1x?x?x?xf32>
-      %final_inner = linalg.generic {
-          indexing_maps = [
-            affine_map<(d0, d1, d2, d3) -> (d0, d1, d2, d3)>,
-            affine_map<(d0, d1, d2, d3) -> (d0, d1, d2, d3)>,
-            affine_map<(d0, d1, d2, d3) -> (d0, d1, d2, d3)>
-          ],
-          iterator_types = ["parallel", "parallel", "parallel", "parallel"]
-        } ins(%pooled_loaded, %init_loaded
-            : tensor<1x?x?x?xf16>, tensor<1x?x?x?xf32>)
-          outs(%final_empty : tensor<1x?x?x?xf32>) {
-        ^bb0(%pooled_value: f16, %initial: f32, %out: f32):
-          %pooled_f32 = arith.extf %pooled_value : f16 to f32
-          %accumulated = arith.minimumf %pooled_f32, %initial : f32
-          linalg.yield %accumulated : f32
-      } -> tensor<1x?x?x?xf32>
-      iree_tensor_ext.dispatch.tensor.store %final_inner, %final_shaped,
-          offsets = [0, 0, 0, 0],
-          sizes = [1, %output_height_size, %output_width_size, %channels_size],
-          strides = [1, 1, 1, 1]
-          : tensor<1x?x?x?xf32>
-          -> !iree_tensor_ext.dispatch.tensor<writeonly:tensor<1x?x?x?xf32>>{
-              %output_height_size, %output_width_size, %channels_size}
-      flow.return
-    } count(%output_height_workload: index,
-            %output_width_workload: index,
-            %channels_workload: index) -> (index, index, index) {
-      %x, %y, %z = iree_tensor_ext.dispatch.workgroup_count_from_slice(
-          %output_height_workload,
-          %output_width_workload,
-          %channels_workload)
-      flow.return %x, %y, %z : index, index, index
-    }
+    // Widen back to f32 and fold in the accumulator initialiser: linalg
+    // defines the op as an update of its init (`O += ...`, `O = max(O, ...)`),
+    // so this is exact for any init. A plain generic, not a pre-formed CPU
+    // dispatch: rocket-pin-unclaimed-dispatches keeps it off the NPU, and
+    // rocket-fold-neutral-init drops the init term when it is the neutral
+    // element, leaving a bare extf that fuses with the consumer's truncf
+    // and cancels -- which is what lets the next Rocket dispatch read this
+    // one's output cube in place (ISSUES.md P2).
+    %final_nhwc_empty = tensor.empty(
+        %output_height, %output_width, %channels)
+        : tensor<1x?x?x?xf32>
+    %final_nhwc = linalg.generic {
+        indexing_maps = [
+          affine_map<(d0, d1, d2, d3) -> (d0, d1, d2, d3)>,
+          affine_map<(d0, d1, d2, d3) -> (d0, d1, d2, d3)>,
+          affine_map<(d0, d1, d2, d3) -> (d0, d1, d2, d3)>
+        ],
+        iterator_types = ["parallel", "parallel", "parallel", "parallel"]
+      } ins(%pooled, %init
+          : tensor<1x?x?x?xf16>, tensor<1x?x?x?xf32>)
+        outs(%final_nhwc_empty : tensor<1x?x?x?xf32>) {
+      ^bb0(%pooled_value: f16, %initial: f32, %out: f32):
+        %pooled_f32 = arith.extf %pooled_value : f16 to f32
+        %accumulated = arith.minimumf %pooled_f32, %initial : f32
+        linalg.yield %accumulated : f32
+    } -> tensor<1x?x?x?xf32>
 
     util.return %final_nhwc : tensor<1x?x?x?xf32>
   }
@@ -2929,100 +2414,48 @@ module attributes {transform.with_named_sequence} {
         linalg.yield %narrowed : f16
     } -> tensor<1x?x?x?xf16>
 
+    %dense_readers_i32 = arith.constant 0 : i32
     %averaged = flow.dispatch
         @rocket_pooling_executable::@rocket_pooling_avg_v1::@rocket_pooling_avg(
           %input_width_i32, %input_height_i32, %channels_i32,
-          %kernel_width_i32, %kernel_height_i32,
+          %kernel_width_i32, %kernel_height_i32, %dense_readers_i32,
           %input_f16)
         {stream.affinity = #hal.device.affinity<@rocket_device>}
-        : (i32, i32, i32, i32, i32,
+        : (i32, i32, i32, i32, i32, i32,
            tensor<1x?x?x?xf16>{%input_height, %input_width, %channels})
         -> tensor<1x?x?x?xf16>{%output_height, %output_width, %channels}
 
     %taps = arith.muli %kernel_height, %kernel_width : index
 
-    %final_nhwc = flow.dispatch.workgroups[
-        %output_height, %output_width, %channels](
-        %averaged, %init, %taps, %output_height, %output_width, %channels)
-        : (tensor<1x?x?x?xf16>{%output_height, %output_width, %channels},
-           tensor<1x?x?x?xf32>{%output_height, %output_width, %channels},
-           index, index, index, index)
-        -> tensor<1x?x?x?xf32>{%output_height, %output_width, %channels}
-        attributes { stream.affinity = #hal.device.affinity<@cpu_device> } =
-        (%averaged_binding: !iree_tensor_ext.dispatch.tensor<readonly:tensor<1x?x?x?xf16>>,
-         %init_binding: !iree_tensor_ext.dispatch.tensor<readonly:tensor<1x?x?x?xf32>>,
-         %taps_arg: index,
-         %output_height_arg: index,
-         %output_width_arg: index,
-         %channels_arg: index,
-         %final_binding: !iree_tensor_ext.dispatch.tensor<writeonly:tensor<1x?x?x?xf32>>) {
-      %output_height_size = iree_tensor_ext.dispatch.workload.ordinal
-          %output_height_arg, 0 : index
-      %output_width_size = iree_tensor_ext.dispatch.workload.ordinal
-          %output_width_arg, 1 : index
-      %channels_size = iree_tensor_ext.dispatch.workload.ordinal
-          %channels_arg, 2 : index
-      %averaged_shaped = flow.dispatch.tie_shape %averaged_binding
-          : !iree_tensor_ext.dispatch.tensor<readonly:tensor<1x?x?x?xf16>>{
-              %output_height_size, %output_width_size, %channels_size}
-      %init_shaped = flow.dispatch.tie_shape %init_binding
-          : !iree_tensor_ext.dispatch.tensor<readonly:tensor<1x?x?x?xf32>>{
-              %output_height_size, %output_width_size, %channels_size}
-      %final_shaped = flow.dispatch.tie_shape %final_binding
-          : !iree_tensor_ext.dispatch.tensor<writeonly:tensor<1x?x?x?xf32>>{
-              %output_height_size, %output_width_size, %channels_size}
-      %averaged_loaded = iree_tensor_ext.dispatch.tensor.load %averaged_shaped,
-          offsets = [0, 0, 0, 0],
-          sizes = [1, %output_height_size, %output_width_size, %channels_size],
-          strides = [1, 1, 1, 1]
-          : !iree_tensor_ext.dispatch.tensor<readonly:tensor<1x?x?x?xf16>>{
-              %output_height_size, %output_width_size, %channels_size}
-          -> tensor<1x?x?x?xf16>
-      %init_loaded = iree_tensor_ext.dispatch.tensor.load %init_shaped,
-          offsets = [0, 0, 0, 0],
-          sizes = [1, %output_height_size, %output_width_size, %channels_size],
-          strides = [1, 1, 1, 1]
-          : !iree_tensor_ext.dispatch.tensor<readonly:tensor<1x?x?x?xf32>>{
-              %output_height_size, %output_width_size, %channels_size}
-          -> tensor<1x?x?x?xf32>
-      %taps_i32 = arith.index_cast %taps_arg : index to i32
-      %taps_f32 = arith.sitofp %taps_i32 : i32 to f32
-      %final_empty = tensor.empty(
-          %output_height_size, %output_width_size, %channels_size)
-          : tensor<1x?x?x?xf32>
-      %final_inner = linalg.generic {
-          indexing_maps = [
-            affine_map<(d0, d1, d2, d3) -> (d0, d1, d2, d3)>,
-            affine_map<(d0, d1, d2, d3) -> (d0, d1, d2, d3)>,
-            affine_map<(d0, d1, d2, d3) -> (d0, d1, d2, d3)>
-          ],
-          iterator_types = ["parallel", "parallel", "parallel", "parallel"]
-        } ins(%averaged_loaded, %init_loaded
-            : tensor<1x?x?x?xf16>, tensor<1x?x?x?xf32>)
-          outs(%final_empty : tensor<1x?x?x?xf32>) {
-        ^bb0(%average: f16, %initial: f32, %out: f32):
-          %average_f32 = arith.extf %average : f16 to f32
-          %sum = arith.mulf %average_f32, %taps_f32 : f32
-          %accumulated = arith.addf %sum, %initial : f32
-          linalg.yield %accumulated : f32
-      } -> tensor<1x?x?x?xf32>
-      iree_tensor_ext.dispatch.tensor.store %final_inner, %final_shaped,
-          offsets = [0, 0, 0, 0],
-          sizes = [1, %output_height_size, %output_width_size, %channels_size],
-          strides = [1, 1, 1, 1]
-          : tensor<1x?x?x?xf32>
-          -> !iree_tensor_ext.dispatch.tensor<writeonly:tensor<1x?x?x?xf32>>{
-              %output_height_size, %output_width_size, %channels_size}
-      flow.return
-    } count(%output_height_workload: index,
-            %output_width_workload: index,
-            %channels_workload: index) -> (index, index, index) {
-      %x, %y, %z = iree_tensor_ext.dispatch.workgroup_count_from_slice(
-          %output_height_workload,
-          %output_width_workload,
-          %channels_workload)
-      flow.return %x, %y, %z : index, index, index
-    }
+    // Widen back to f32 and fold in the accumulator initialiser: linalg
+    // defines the op as an update of its init (`O += ...`, `O = max(O, ...)`),
+    // so this is exact for any init. A plain generic, not a pre-formed CPU
+    // dispatch: rocket-pin-unclaimed-dispatches keeps it off the NPU, and
+    // rocket-fold-neutral-init drops the init term when it is the neutral
+    // element, leaving a bare extf that fuses with the consumer's truncf
+    // and cancels -- which is what lets the next Rocket dispatch read this
+    // one's output cube in place (ISSUES.md P2).
+    %taps_i32 = arith.index_cast %taps : index to i32
+    %taps_f32 = arith.sitofp %taps_i32 : i32 to f32
+    %final_nhwc_empty = tensor.empty(
+        %output_height, %output_width, %channels)
+        : tensor<1x?x?x?xf32>
+    %final_nhwc = linalg.generic {
+        indexing_maps = [
+          affine_map<(d0, d1, d2, d3) -> (d0, d1, d2, d3)>,
+          affine_map<(d0, d1, d2, d3) -> (d0, d1, d2, d3)>,
+          affine_map<(d0, d1, d2, d3) -> (d0, d1, d2, d3)>
+        ],
+        iterator_types = ["parallel", "parallel", "parallel", "parallel"]
+      } ins(%averaged, %init
+          : tensor<1x?x?x?xf16>, tensor<1x?x?x?xf32>)
+        outs(%final_nhwc_empty : tensor<1x?x?x?xf32>) {
+      ^bb0(%average: f16, %initial: f32, %out: f32):
+        %average_f32 = arith.extf %average : f16 to f32
+        %sum = arith.mulf %average_f32, %taps_f32 : f32
+        %accumulated = arith.addf %sum, %initial : f32
+        linalg.yield %accumulated : f32
+    } -> tensor<1x?x?x?xf32>
 
     util.return %final_nhwc : tensor<1x?x?x?xf32>
   }
@@ -3077,96 +2510,45 @@ module attributes {transform.with_named_sequence} {
     %zero_bias = linalg.fill ins(%zero_f16 : f16)
         outs(%zero_bias_empty : tensor<?xf16>) -> tensor<?xf16>
 
+    %dense_readers_i32 = arith.constant 0 : i32
     %raw_f16 = flow.dispatch
         @rocket_dynamic_pad1_executable::@rocket_dynamic_conv2d_v1::@rocket_dynamic_conv2d(
           %input_width_i32, %input_height_i32, %input_channels_i32,
-          %output_channels_i32, %weights_width_i32, %weights_height_i32,
+          %output_channels_i32, %weights_width_i32, %weights_height_i32, %dense_readers_i32,
           %input_nhwc, %filter, %zero_bias)
         {stream.affinity = #hal.device.affinity<@rocket_device>}
-        : (i32, i32, i32, i32, i32, i32,
+        : (i32, i32, i32, i32, i32, i32, i32,
            tensor<1x?x?x?xf16>{%input_height, %input_width, %input_channels},
            tensor<?x?x?x?xf16>{%weights_height, %weights_width, %input_channels, %output_channels},
            tensor<?xf16>{%output_channels})
         -> tensor<1x?x?x?xf16>{%output_height, %output_width, %output_channels}
 
-    %final = flow.dispatch.workgroups[
-        %output_height, %output_width, %output_channels](
-        %raw_f16, %init, %output_height, %output_width, %output_channels)
-        : (tensor<1x?x?x?xf16>{%output_height, %output_width, %output_channels},
-           tensor<1x?x?x?xf32>{%output_height, %output_width, %output_channels},
-           index, index, index)
-        -> tensor<1x?x?x?xf32>{%output_height, %output_width, %output_channels}
-        attributes { stream.affinity = #hal.device.affinity<@cpu_device> } =
-        (%raw_binding: !iree_tensor_ext.dispatch.tensor<readonly:tensor<1x?x?x?xf16>>,
-         %init_binding: !iree_tensor_ext.dispatch.tensor<readonly:tensor<1x?x?x?xf32>>,
-         %output_height_arg: index,
-         %output_width_arg: index,
-         %output_channels_arg: index,
-         %final_binding: !iree_tensor_ext.dispatch.tensor<writeonly:tensor<1x?x?x?xf32>>) {
-      %output_height_size = iree_tensor_ext.dispatch.workload.ordinal
-          %output_height_arg, 0 : index
-      %output_width_size = iree_tensor_ext.dispatch.workload.ordinal
-          %output_width_arg, 1 : index
-      %output_channels_size = iree_tensor_ext.dispatch.workload.ordinal
-          %output_channels_arg, 2 : index
-      %raw_shaped = flow.dispatch.tie_shape %raw_binding
-          : !iree_tensor_ext.dispatch.tensor<readonly:tensor<1x?x?x?xf16>>{
-              %output_height_size, %output_width_size, %output_channels_size}
-      %init_shaped = flow.dispatch.tie_shape %init_binding
-          : !iree_tensor_ext.dispatch.tensor<readonly:tensor<1x?x?x?xf32>>{
-              %output_height_size, %output_width_size, %output_channels_size}
-      %final_shaped = flow.dispatch.tie_shape %final_binding
-          : !iree_tensor_ext.dispatch.tensor<writeonly:tensor<1x?x?x?xf32>>{
-              %output_height_size, %output_width_size, %output_channels_size}
-      %raw_loaded = iree_tensor_ext.dispatch.tensor.load %raw_shaped,
-          offsets = [0, 0, 0, 0],
-          sizes = [1, %output_height_size, %output_width_size, %output_channels_size],
-          strides = [1, 1, 1, 1]
-          : !iree_tensor_ext.dispatch.tensor<readonly:tensor<1x?x?x?xf16>>{
-              %output_height_size, %output_width_size, %output_channels_size}
-          -> tensor<1x?x?x?xf16>
-      %init_loaded = iree_tensor_ext.dispatch.tensor.load %init_shaped,
-          offsets = [0, 0, 0, 0],
-          sizes = [1, %output_height_size, %output_width_size, %output_channels_size],
-          strides = [1, 1, 1, 1]
-          : !iree_tensor_ext.dispatch.tensor<readonly:tensor<1x?x?x?xf32>>{
-              %output_height_size, %output_width_size, %output_channels_size}
-          -> tensor<1x?x?x?xf32>
-      %final_empty = tensor.empty(
-          %output_height_size, %output_width_size, %output_channels_size)
-          : tensor<1x?x?x?xf32>
-      %final_inner = linalg.generic {
-          indexing_maps = [
-            affine_map<(d0, d1, d2, d3) -> (d0, d1, d2, d3)>,
-            affine_map<(d0, d1, d2, d3) -> (d0, d1, d2, d3)>,
-            affine_map<(d0, d1, d2, d3) -> (d0, d1, d2, d3)>
-          ],
-          iterator_types = ["parallel", "parallel", "parallel", "parallel"]
-        } ins(%raw_loaded, %init_loaded
-            : tensor<1x?x?x?xf16>, tensor<1x?x?x?xf32>)
-          outs(%final_empty : tensor<1x?x?x?xf32>) {
-        ^bb0(%raw: f16, %initial: f32, %out: f32):
-          %raw_f32 = arith.extf %raw : f16 to f32
-          %sum = arith.addf %raw_f32, %initial : f32
-          linalg.yield %sum : f32
-      } -> tensor<1x?x?x?xf32>
-      iree_tensor_ext.dispatch.tensor.store %final_inner, %final_shaped,
-          offsets = [0, 0, 0, 0],
-          sizes = [1, %output_height_size, %output_width_size, %output_channels_size],
-          strides = [1, 1, 1, 1]
-          : tensor<1x?x?x?xf32>
-          -> !iree_tensor_ext.dispatch.tensor<writeonly:tensor<1x?x?x?xf32>>{
-              %output_height_size, %output_width_size, %output_channels_size}
-      flow.return
-    } count(%output_height_workload: index,
-            %output_width_workload: index,
-            %output_channels_workload: index) -> (index, index, index) {
-      %x, %y, %z = iree_tensor_ext.dispatch.workgroup_count_from_slice(
-          %output_height_workload,
-          %output_width_workload,
-          %output_channels_workload)
-      flow.return %x, %y, %z : index, index, index
-    }
+    // Widen back to f32 and fold in the accumulator initialiser: linalg
+    // defines the op as an update of its init (`O += ...`, `O = max(O, ...)`),
+    // so this is exact for any init. A plain generic, not a pre-formed CPU
+    // dispatch: rocket-pin-unclaimed-dispatches keeps it off the NPU, and
+    // rocket-fold-neutral-init drops the init term when it is the neutral
+    // element, leaving a bare extf that fuses with the consumer's truncf
+    // and cancels -- which is what lets the next Rocket dispatch read this
+    // one's output cube in place (ISSUES.md P2).
+    %final_empty = tensor.empty(
+        %output_height, %output_width, %output_channels)
+        : tensor<1x?x?x?xf32>
+    %final = linalg.generic {
+        indexing_maps = [
+          affine_map<(d0, d1, d2, d3) -> (d0, d1, d2, d3)>,
+          affine_map<(d0, d1, d2, d3) -> (d0, d1, d2, d3)>,
+          affine_map<(d0, d1, d2, d3) -> (d0, d1, d2, d3)>
+        ],
+        iterator_types = ["parallel", "parallel", "parallel", "parallel"]
+      } ins(%raw_f16, %init
+          : tensor<1x?x?x?xf16>, tensor<1x?x?x?xf32>)
+        outs(%final_empty : tensor<1x?x?x?xf32>) {
+      ^bb0(%raw: f16, %initial: f32, %out: f32):
+        %raw_f32 = arith.extf %raw : f16 to f32
+        %sum = arith.addf %raw_f32, %initial : f32
+        linalg.yield %sum : f32
+    } -> tensor<1x?x?x?xf32>
 
     util.return %final : tensor<1x?x?x?xf32>
   }
@@ -3221,96 +2603,45 @@ module attributes {transform.with_named_sequence} {
     %zero_bias = linalg.fill ins(%zero_f16 : f16)
         outs(%zero_bias_empty : tensor<?xf16>) -> tensor<?xf16>
 
+    %dense_readers_i32 = arith.constant 0 : i32
     %raw_f16 = flow.dispatch
         @rocket_dynamic_pad1_executable_s2::@rocket_dynamic_conv2d_v1::@rocket_dynamic_conv2d(
           %input_width_i32, %input_height_i32, %input_channels_i32,
-          %output_channels_i32, %weights_width_i32, %weights_height_i32,
+          %output_channels_i32, %weights_width_i32, %weights_height_i32, %dense_readers_i32,
           %input_nhwc, %filter, %zero_bias)
         {stream.affinity = #hal.device.affinity<@rocket_device>}
-        : (i32, i32, i32, i32, i32, i32,
+        : (i32, i32, i32, i32, i32, i32, i32,
            tensor<1x?x?x?xf16>{%input_height, %input_width, %input_channels},
            tensor<?x?x?x?xf16>{%weights_height, %weights_width, %input_channels, %output_channels},
            tensor<?xf16>{%output_channels})
         -> tensor<1x?x?x?xf16>{%output_height, %output_width, %output_channels}
 
-    %final = flow.dispatch.workgroups[
-        %output_height, %output_width, %output_channels](
-        %raw_f16, %init, %output_height, %output_width, %output_channels)
-        : (tensor<1x?x?x?xf16>{%output_height, %output_width, %output_channels},
-           tensor<1x?x?x?xf32>{%output_height, %output_width, %output_channels},
-           index, index, index)
-        -> tensor<1x?x?x?xf32>{%output_height, %output_width, %output_channels}
-        attributes { stream.affinity = #hal.device.affinity<@cpu_device> } =
-        (%raw_binding: !iree_tensor_ext.dispatch.tensor<readonly:tensor<1x?x?x?xf16>>,
-         %init_binding: !iree_tensor_ext.dispatch.tensor<readonly:tensor<1x?x?x?xf32>>,
-         %output_height_arg: index,
-         %output_width_arg: index,
-         %output_channels_arg: index,
-         %final_binding: !iree_tensor_ext.dispatch.tensor<writeonly:tensor<1x?x?x?xf32>>) {
-      %output_height_size = iree_tensor_ext.dispatch.workload.ordinal
-          %output_height_arg, 0 : index
-      %output_width_size = iree_tensor_ext.dispatch.workload.ordinal
-          %output_width_arg, 1 : index
-      %output_channels_size = iree_tensor_ext.dispatch.workload.ordinal
-          %output_channels_arg, 2 : index
-      %raw_shaped = flow.dispatch.tie_shape %raw_binding
-          : !iree_tensor_ext.dispatch.tensor<readonly:tensor<1x?x?x?xf16>>{
-              %output_height_size, %output_width_size, %output_channels_size}
-      %init_shaped = flow.dispatch.tie_shape %init_binding
-          : !iree_tensor_ext.dispatch.tensor<readonly:tensor<1x?x?x?xf32>>{
-              %output_height_size, %output_width_size, %output_channels_size}
-      %final_shaped = flow.dispatch.tie_shape %final_binding
-          : !iree_tensor_ext.dispatch.tensor<writeonly:tensor<1x?x?x?xf32>>{
-              %output_height_size, %output_width_size, %output_channels_size}
-      %raw_loaded = iree_tensor_ext.dispatch.tensor.load %raw_shaped,
-          offsets = [0, 0, 0, 0],
-          sizes = [1, %output_height_size, %output_width_size, %output_channels_size],
-          strides = [1, 1, 1, 1]
-          : !iree_tensor_ext.dispatch.tensor<readonly:tensor<1x?x?x?xf16>>{
-              %output_height_size, %output_width_size, %output_channels_size}
-          -> tensor<1x?x?x?xf16>
-      %init_loaded = iree_tensor_ext.dispatch.tensor.load %init_shaped,
-          offsets = [0, 0, 0, 0],
-          sizes = [1, %output_height_size, %output_width_size, %output_channels_size],
-          strides = [1, 1, 1, 1]
-          : !iree_tensor_ext.dispatch.tensor<readonly:tensor<1x?x?x?xf32>>{
-              %output_height_size, %output_width_size, %output_channels_size}
-          -> tensor<1x?x?x?xf32>
-      %final_empty = tensor.empty(
-          %output_height_size, %output_width_size, %output_channels_size)
-          : tensor<1x?x?x?xf32>
-      %final_inner = linalg.generic {
-          indexing_maps = [
-            affine_map<(d0, d1, d2, d3) -> (d0, d1, d2, d3)>,
-            affine_map<(d0, d1, d2, d3) -> (d0, d1, d2, d3)>,
-            affine_map<(d0, d1, d2, d3) -> (d0, d1, d2, d3)>
-          ],
-          iterator_types = ["parallel", "parallel", "parallel", "parallel"]
-        } ins(%raw_loaded, %init_loaded
-            : tensor<1x?x?x?xf16>, tensor<1x?x?x?xf32>)
-          outs(%final_empty : tensor<1x?x?x?xf32>) {
-        ^bb0(%raw: f16, %initial: f32, %out: f32):
-          %raw_f32 = arith.extf %raw : f16 to f32
-          %sum = arith.addf %raw_f32, %initial : f32
-          linalg.yield %sum : f32
-      } -> tensor<1x?x?x?xf32>
-      iree_tensor_ext.dispatch.tensor.store %final_inner, %final_shaped,
-          offsets = [0, 0, 0, 0],
-          sizes = [1, %output_height_size, %output_width_size, %output_channels_size],
-          strides = [1, 1, 1, 1]
-          : tensor<1x?x?x?xf32>
-          -> !iree_tensor_ext.dispatch.tensor<writeonly:tensor<1x?x?x?xf32>>{
-              %output_height_size, %output_width_size, %output_channels_size}
-      flow.return
-    } count(%output_height_workload: index,
-            %output_width_workload: index,
-            %output_channels_workload: index) -> (index, index, index) {
-      %x, %y, %z = iree_tensor_ext.dispatch.workgroup_count_from_slice(
-          %output_height_workload,
-          %output_width_workload,
-          %output_channels_workload)
-      flow.return %x, %y, %z : index, index, index
-    }
+    // Widen back to f32 and fold in the accumulator initialiser: linalg
+    // defines the op as an update of its init (`O += ...`, `O = max(O, ...)`),
+    // so this is exact for any init. A plain generic, not a pre-formed CPU
+    // dispatch: rocket-pin-unclaimed-dispatches keeps it off the NPU, and
+    // rocket-fold-neutral-init drops the init term when it is the neutral
+    // element, leaving a bare extf that fuses with the consumer's truncf
+    // and cancels -- which is what lets the next Rocket dispatch read this
+    // one's output cube in place (ISSUES.md P2).
+    %final_empty = tensor.empty(
+        %output_height, %output_width, %output_channels)
+        : tensor<1x?x?x?xf32>
+    %final = linalg.generic {
+        indexing_maps = [
+          affine_map<(d0, d1, d2, d3) -> (d0, d1, d2, d3)>,
+          affine_map<(d0, d1, d2, d3) -> (d0, d1, d2, d3)>,
+          affine_map<(d0, d1, d2, d3) -> (d0, d1, d2, d3)>
+        ],
+        iterator_types = ["parallel", "parallel", "parallel", "parallel"]
+      } ins(%raw_f16, %init
+          : tensor<1x?x?x?xf16>, tensor<1x?x?x?xf32>)
+        outs(%final_empty : tensor<1x?x?x?xf32>) {
+      ^bb0(%raw: f16, %initial: f32, %out: f32):
+        %raw_f32 = arith.extf %raw : f16 to f32
+        %sum = arith.addf %raw_f32, %initial : f32
+        linalg.yield %sum : f32
+    } -> tensor<1x?x?x?xf32>
 
     util.return %final : tensor<1x?x?x?xf32>
   }
@@ -3374,13 +2705,14 @@ module attributes {transform.with_named_sequence} {
         linalg.yield %narrowed : f16
     } -> tensor<?xf16>
 
+    %dense_readers_i32 = arith.constant 0 : i32
     %raw_f16 = flow.dispatch
         @rocket_dynamic_relu_executable::@rocket_dynamic_conv2d_v1::@rocket_dynamic_conv2d(
           %input_width_i32, %input_height_i32, %input_channels_i32,
-          %output_channels_i32, %weights_width_i32, %weights_height_i32,
+          %output_channels_i32, %weights_width_i32, %weights_height_i32, %dense_readers_i32,
           %input, %filter, %bias_f16)
         {stream.affinity = #hal.device.affinity<@rocket_device>}
-        : (i32, i32, i32, i32, i32, i32,
+        : (i32, i32, i32, i32, i32, i32, i32,
            tensor<1x?x?x?xf16>{%input_height, %input_width, %input_channels},
            tensor<?x?x?x?xf16>{%weights_height, %weights_width, %input_channels, %output_channels},
            tensor<?xf16>{%output_channels})
@@ -3448,13 +2780,14 @@ module attributes {transform.with_named_sequence} {
         linalg.yield %narrowed : f16
     } -> tensor<?xf16>
 
+    %dense_readers_i32 = arith.constant 0 : i32
     %raw_f16 = flow.dispatch
         @rocket_dynamic_relu_executable_s2::@rocket_dynamic_conv2d_v1::@rocket_dynamic_conv2d(
           %input_width_i32, %input_height_i32, %input_channels_i32,
-          %output_channels_i32, %weights_width_i32, %weights_height_i32,
+          %output_channels_i32, %weights_width_i32, %weights_height_i32, %dense_readers_i32,
           %input, %filter, %bias_f16)
         {stream.affinity = #hal.device.affinity<@rocket_device>}
-        : (i32, i32, i32, i32, i32, i32,
+        : (i32, i32, i32, i32, i32, i32, i32,
            tensor<1x?x?x?xf16>{%input_height, %input_width, %input_channels},
            tensor<?x?x?x?xf16>{%weights_height, %weights_width, %input_channels, %output_channels},
            tensor<?xf16>{%output_channels})
@@ -3524,13 +2857,14 @@ module attributes {transform.with_named_sequence} {
         linalg.yield %narrowed : f16
     } -> tensor<?xf16>
 
+    %dense_readers_i32 = arith.constant 0 : i32
     %raw_f16 = flow.dispatch
         @rocket_dynamic_pad1_relu_executable::@rocket_dynamic_conv2d_v1::@rocket_dynamic_conv2d(
           %input_width_i32, %input_height_i32, %input_channels_i32,
-          %output_channels_i32, %weights_width_i32, %weights_height_i32,
+          %output_channels_i32, %weights_width_i32, %weights_height_i32, %dense_readers_i32,
           %input_nhwc, %filter, %bias_f16)
         {stream.affinity = #hal.device.affinity<@rocket_device>}
-        : (i32, i32, i32, i32, i32, i32,
+        : (i32, i32, i32, i32, i32, i32, i32,
            tensor<1x?x?x?xf16>{%input_height, %input_width, %input_channels},
            tensor<?x?x?x?xf16>{%weights_height, %weights_width, %input_channels, %output_channels},
            tensor<?xf16>{%output_channels})
@@ -3600,13 +2934,14 @@ module attributes {transform.with_named_sequence} {
         linalg.yield %narrowed : f16
     } -> tensor<?xf16>
 
+    %dense_readers_i32 = arith.constant 0 : i32
     %raw_f16 = flow.dispatch
         @rocket_dynamic_pad1_relu_executable_s2::@rocket_dynamic_conv2d_v1::@rocket_dynamic_conv2d(
           %input_width_i32, %input_height_i32, %input_channels_i32,
-          %output_channels_i32, %weights_width_i32, %weights_height_i32,
+          %output_channels_i32, %weights_width_i32, %weights_height_i32, %dense_readers_i32,
           %input_nhwc, %filter, %bias_f16)
         {stream.affinity = #hal.device.affinity<@rocket_device>}
-        : (i32, i32, i32, i32, i32, i32,
+        : (i32, i32, i32, i32, i32, i32, i32,
            tensor<1x?x?x?xf16>{%input_height, %input_width, %input_channels},
            tensor<?x?x?x?xf16>{%weights_height, %weights_width, %input_channels, %output_channels},
            tensor<?xf16>{%output_channels})
@@ -3673,13 +3008,14 @@ module attributes {transform.with_named_sequence} {
         linalg.yield %narrowed : f16
     } -> tensor<?xf16>
 
+    %dense_readers_i32 = arith.constant 0 : i32
     %raw_f16 = flow.dispatch
         @rocket_dynamic_executable::@rocket_dynamic_conv2d_v1::@rocket_dynamic_conv2d(
           %input_width_i32, %input_height_i32, %input_channels_i32,
-          %output_channels_i32, %weights_width_i32, %weights_height_i32,
+          %output_channels_i32, %weights_width_i32, %weights_height_i32, %dense_readers_i32,
           %input, %filter, %bias_f16)
         {stream.affinity = #hal.device.affinity<@rocket_device>}
-        : (i32, i32, i32, i32, i32, i32,
+        : (i32, i32, i32, i32, i32, i32, i32,
            tensor<1x?x?x?xf16>{%input_height, %input_width, %input_channels},
            tensor<?x?x?x?xf16>{%weights_height, %weights_width, %input_channels, %output_channels},
            tensor<?xf16>{%output_channels})
@@ -3746,13 +3082,14 @@ module attributes {transform.with_named_sequence} {
         linalg.yield %narrowed : f16
     } -> tensor<?xf16>
 
+    %dense_readers_i32 = arith.constant 0 : i32
     %raw_f16 = flow.dispatch
         @rocket_dynamic_executable_s2::@rocket_dynamic_conv2d_v1::@rocket_dynamic_conv2d(
           %input_width_i32, %input_height_i32, %input_channels_i32,
-          %output_channels_i32, %weights_width_i32, %weights_height_i32,
+          %output_channels_i32, %weights_width_i32, %weights_height_i32, %dense_readers_i32,
           %input, %filter, %bias_f16)
         {stream.affinity = #hal.device.affinity<@rocket_device>}
-        : (i32, i32, i32, i32, i32, i32,
+        : (i32, i32, i32, i32, i32, i32, i32,
            tensor<1x?x?x?xf16>{%input_height, %input_width, %input_channels},
            tensor<?x?x?x?xf16>{%weights_height, %weights_width, %input_channels, %output_channels},
            tensor<?xf16>{%output_channels})
@@ -3821,13 +3158,14 @@ module attributes {transform.with_named_sequence} {
         linalg.yield %narrowed : f16
     } -> tensor<?xf16>
 
+    %dense_readers_i32 = arith.constant 0 : i32
     %raw_f16 = flow.dispatch
         @rocket_dynamic_pad1_executable::@rocket_dynamic_conv2d_v1::@rocket_dynamic_conv2d(
           %input_width_i32, %input_height_i32, %input_channels_i32,
-          %output_channels_i32, %weights_width_i32, %weights_height_i32,
+          %output_channels_i32, %weights_width_i32, %weights_height_i32, %dense_readers_i32,
           %input_nhwc, %filter, %bias_f16)
         {stream.affinity = #hal.device.affinity<@rocket_device>}
-        : (i32, i32, i32, i32, i32, i32,
+        : (i32, i32, i32, i32, i32, i32, i32,
            tensor<1x?x?x?xf16>{%input_height, %input_width, %input_channels},
            tensor<?x?x?x?xf16>{%weights_height, %weights_width, %input_channels, %output_channels},
            tensor<?xf16>{%output_channels})
@@ -3896,13 +3234,14 @@ module attributes {transform.with_named_sequence} {
         linalg.yield %narrowed : f16
     } -> tensor<?xf16>
 
+    %dense_readers_i32 = arith.constant 0 : i32
     %raw_f16 = flow.dispatch
         @rocket_dynamic_pad1_executable_s2::@rocket_dynamic_conv2d_v1::@rocket_dynamic_conv2d(
           %input_width_i32, %input_height_i32, %input_channels_i32,
-          %output_channels_i32, %weights_width_i32, %weights_height_i32,
+          %output_channels_i32, %weights_width_i32, %weights_height_i32, %dense_readers_i32,
           %input_nhwc, %filter, %bias_f16)
         {stream.affinity = #hal.device.affinity<@rocket_device>}
-        : (i32, i32, i32, i32, i32, i32,
+        : (i32, i32, i32, i32, i32, i32, i32,
            tensor<1x?x?x?xf16>{%input_height, %input_width, %input_channels},
            tensor<?x?x?x?xf16>{%weights_height, %weights_width, %input_channels, %output_channels},
            tensor<?xf16>{%output_channels})
@@ -3969,13 +3308,14 @@ module attributes {transform.with_named_sequence} {
         linalg.yield %narrowed : f16
     } -> tensor<?xf16>
 
+    %dense_readers_i32 = arith.constant 0 : i32
     %raw_f16 = flow.dispatch
         @rocket_dynamic_residual_relu_executable::@rocket_dynamic_conv2d_v1::@rocket_dynamic_conv2d(
           %input_width_i32, %input_height_i32, %input_channels_i32,
-          %output_channels_i32, %weights_width_i32, %weights_height_i32,
+          %output_channels_i32, %weights_width_i32, %weights_height_i32, %dense_readers_i32,
           %input, %filter, %bias_f16, %skip)
         {stream.affinity = #hal.device.affinity<@rocket_device>}
-        : (i32, i32, i32, i32, i32, i32,
+        : (i32, i32, i32, i32, i32, i32, i32,
            tensor<1x?x?x?xf16>{%input_height, %input_width, %input_channels},
            tensor<?x?x?x?xf16>{%weights_height, %weights_width, %input_channels, %output_channels},
            tensor<?xf16>{%output_channels},
@@ -4038,81 +3378,42 @@ module attributes {transform.with_named_sequence} {
         linalg.yield %narrowed : f16
     } -> tensor<?xf16>
 
+    %dense_readers_i32 = arith.constant 0 : i32
     %raw_f16 = flow.dispatch
         @rocket_dynamic_relu6_executable::@rocket_dynamic_conv2d_v1::@rocket_dynamic_conv2d(
           %input_width_i32, %input_height_i32, %input_channels_i32,
-          %output_channels_i32, %weights_width_i32, %weights_height_i32,
+          %output_channels_i32, %weights_width_i32, %weights_height_i32, %dense_readers_i32,
           %input, %filter, %bias_f16)
         {stream.affinity = #hal.device.affinity<@rocket_device>}
-        : (i32, i32, i32, i32, i32, i32,
+        : (i32, i32, i32, i32, i32, i32, i32,
            tensor<1x?x?x?xf16>{%input_height, %input_width, %input_channels},
            tensor<?x?x?x?xf16>{%weights_height, %weights_width, %input_channels, %output_channels},
            tensor<?xf16>{%output_channels})
         -> tensor<1x?x?x?xf16>{%output_height, %output_width, %output_channels}
 
-    %final = flow.dispatch.workgroups[
-        %output_height, %output_width, %output_channels](
-        %raw_f16, %output_height, %output_width, %output_channels)
-        : (tensor<1x?x?x?xf16>{%output_height, %output_width, %output_channels},
-           index, index, index)
-        -> tensor<1x?x?x?xf32>{%output_height, %output_width, %output_channels}
-        attributes { stream.affinity = #hal.device.affinity<@cpu_device> } =
-        (%raw_binding: !iree_tensor_ext.dispatch.tensor<readonly:tensor<1x?x?x?xf16>>,
-         %output_height_arg: index,
-         %output_width_arg: index,
-         %output_channels_arg: index,
-         %final_binding: !iree_tensor_ext.dispatch.tensor<writeonly:tensor<1x?x?x?xf32>>) {
-      %output_height_size = iree_tensor_ext.dispatch.workload.ordinal
-          %output_height_arg, 0 : index
-      %output_width_size = iree_tensor_ext.dispatch.workload.ordinal
-          %output_width_arg, 1 : index
-      %output_channels_size = iree_tensor_ext.dispatch.workload.ordinal
-          %output_channels_arg, 2 : index
-      %raw_shaped = flow.dispatch.tie_shape %raw_binding
-          : !iree_tensor_ext.dispatch.tensor<readonly:tensor<1x?x?x?xf16>>{
-              %output_height_size, %output_width_size, %output_channels_size}
-      %final_shaped = flow.dispatch.tie_shape %final_binding
-          : !iree_tensor_ext.dispatch.tensor<writeonly:tensor<1x?x?x?xf32>>{
-              %output_height_size, %output_width_size, %output_channels_size}
-      %raw_loaded = iree_tensor_ext.dispatch.tensor.load %raw_shaped,
-          offsets = [0, 0, 0, 0],
-          sizes = [1, %output_height_size, %output_width_size, %output_channels_size],
-          strides = [1, 1, 1, 1]
-          : !iree_tensor_ext.dispatch.tensor<readonly:tensor<1x?x?x?xf16>>{
-              %output_height_size, %output_width_size, %output_channels_size}
-          -> tensor<1x?x?x?xf16>
-      %final_empty = tensor.empty(
-          %output_height_size, %output_width_size, %output_channels_size)
-          : tensor<1x?x?x?xf32>
-      %final_inner = linalg.generic {
-          indexing_maps = [
-            affine_map<(d0, d1, d2, d3) -> (d0, d1, d2, d3)>,
-            affine_map<(d0, d1, d2, d3) -> (d0, d1, d2, d3)>
-          ],
-          iterator_types = ["parallel", "parallel", "parallel", "parallel"]
-        } ins(%raw_loaded : tensor<1x?x?x?xf16>)
-          outs(%final_empty : tensor<1x?x?x?xf32>) {
-        ^bb0(%raw: f16, %out: f32):
-          %raw_f32 = arith.extf %raw : f16 to f32
-          linalg.yield %raw_f32 : f32
-      } -> tensor<1x?x?x?xf32>
-      iree_tensor_ext.dispatch.tensor.store %final_inner, %final_shaped,
-          offsets = [0, 0, 0, 0],
-          sizes = [1, %output_height_size, %output_width_size, %output_channels_size],
-          strides = [1, 1, 1, 1]
-          : tensor<1x?x?x?xf32>
-          -> !iree_tensor_ext.dispatch.tensor<writeonly:tensor<1x?x?x?xf32>>{
-              %output_height_size, %output_width_size, %output_channels_size}
-      flow.return
-    } count(%output_height_workload: index,
-            %output_width_workload: index,
-            %output_channels_workload: index) -> (index, index, index) {
-      %x, %y, %z = iree_tensor_ext.dispatch.workgroup_count_from_slice(
-          %output_height_workload,
-          %output_width_workload,
-          %output_channels_workload)
-      flow.return %x, %y, %z : index, index, index
-    }
+    // Widen back to f32 and fold in the accumulator initialiser: linalg
+    // defines the op as an update of its init (`O += ...`, `O = max(O, ...)`),
+    // so this is exact for any init. A plain generic, not a pre-formed CPU
+    // dispatch: rocket-pin-unclaimed-dispatches keeps it off the NPU, and
+    // rocket-fold-neutral-init drops the init term when it is the neutral
+    // element, leaving a bare extf that fuses with the consumer's truncf
+    // and cancels -- which is what lets the next Rocket dispatch read this
+    // one's output cube in place (ISSUES.md P2).
+    %final_empty = tensor.empty(
+        %output_height, %output_width, %output_channels)
+        : tensor<1x?x?x?xf32>
+    %final = linalg.generic {
+        indexing_maps = [
+          affine_map<(d0, d1, d2, d3) -> (d0, d1, d2, d3)>,
+          affine_map<(d0, d1, d2, d3) -> (d0, d1, d2, d3)>
+        ],
+        iterator_types = ["parallel", "parallel", "parallel", "parallel"]
+      } ins(%raw_f16 : tensor<1x?x?x?xf16>)
+        outs(%final_empty : tensor<1x?x?x?xf32>) {
+      ^bb0(%raw: f16, %out: f32):
+        %raw_f32 = arith.extf %raw : f16 to f32
+        linalg.yield %raw_f32 : f32
+    } -> tensor<1x?x?x?xf32>
 
     util.return %final : tensor<1x?x?x?xf32>
   }
@@ -4154,96 +3455,45 @@ module attributes {transform.with_named_sequence} {
     %zero_bias = linalg.fill ins(%zero_f16 : f16)
         outs(%zero_bias_empty : tensor<?xf16>) -> tensor<?xf16>
 
+    %dense_readers_i32 = arith.constant 0 : i32
     %raw_f16 = flow.dispatch
         @rocket_dynamic_executable::@rocket_dynamic_conv2d_v1::@rocket_dynamic_conv2d(
           %input_width_i32, %input_height_i32, %input_channels_i32,
-          %output_channels_i32, %weights_width_i32, %weights_height_i32,
+          %output_channels_i32, %weights_width_i32, %weights_height_i32, %dense_readers_i32,
           %input, %filter, %zero_bias)
         {stream.affinity = #hal.device.affinity<@rocket_device>}
-        : (i32, i32, i32, i32, i32, i32,
+        : (i32, i32, i32, i32, i32, i32, i32,
            tensor<1x?x?x?xf16>{%input_height, %input_width, %input_channels},
            tensor<?x?x?x?xf16>{%weights_height, %weights_width, %input_channels, %output_channels},
            tensor<?xf16>{%output_channels})
         -> tensor<1x?x?x?xf16>{%output_height, %output_width, %output_channels}
 
-    %final = flow.dispatch.workgroups[
-        %output_height, %output_width, %output_channels](
-        %raw_f16, %init, %output_height, %output_width, %output_channels)
-        : (tensor<1x?x?x?xf16>{%output_height, %output_width, %output_channels},
-           tensor<1x?x?x?xf32>{%output_height, %output_width, %output_channels},
-           index, index, index)
-        -> tensor<1x?x?x?xf32>{%output_height, %output_width, %output_channels}
-        attributes { stream.affinity = #hal.device.affinity<@cpu_device> } =
-        (%raw_binding: !iree_tensor_ext.dispatch.tensor<readonly:tensor<1x?x?x?xf16>>,
-         %init_binding: !iree_tensor_ext.dispatch.tensor<readonly:tensor<1x?x?x?xf32>>,
-         %output_height_arg: index,
-         %output_width_arg: index,
-         %output_channels_arg: index,
-         %final_binding: !iree_tensor_ext.dispatch.tensor<writeonly:tensor<1x?x?x?xf32>>) {
-      %output_height_size = iree_tensor_ext.dispatch.workload.ordinal
-          %output_height_arg, 0 : index
-      %output_width_size = iree_tensor_ext.dispatch.workload.ordinal
-          %output_width_arg, 1 : index
-      %output_channels_size = iree_tensor_ext.dispatch.workload.ordinal
-          %output_channels_arg, 2 : index
-      %raw_shaped = flow.dispatch.tie_shape %raw_binding
-          : !iree_tensor_ext.dispatch.tensor<readonly:tensor<1x?x?x?xf16>>{
-              %output_height_size, %output_width_size, %output_channels_size}
-      %init_shaped = flow.dispatch.tie_shape %init_binding
-          : !iree_tensor_ext.dispatch.tensor<readonly:tensor<1x?x?x?xf32>>{
-              %output_height_size, %output_width_size, %output_channels_size}
-      %final_shaped = flow.dispatch.tie_shape %final_binding
-          : !iree_tensor_ext.dispatch.tensor<writeonly:tensor<1x?x?x?xf32>>{
-              %output_height_size, %output_width_size, %output_channels_size}
-      %raw_loaded = iree_tensor_ext.dispatch.tensor.load %raw_shaped,
-          offsets = [0, 0, 0, 0],
-          sizes = [1, %output_height_size, %output_width_size, %output_channels_size],
-          strides = [1, 1, 1, 1]
-          : !iree_tensor_ext.dispatch.tensor<readonly:tensor<1x?x?x?xf16>>{
-              %output_height_size, %output_width_size, %output_channels_size}
-          -> tensor<1x?x?x?xf16>
-      %init_loaded = iree_tensor_ext.dispatch.tensor.load %init_shaped,
-          offsets = [0, 0, 0, 0],
-          sizes = [1, %output_height_size, %output_width_size, %output_channels_size],
-          strides = [1, 1, 1, 1]
-          : !iree_tensor_ext.dispatch.tensor<readonly:tensor<1x?x?x?xf32>>{
-              %output_height_size, %output_width_size, %output_channels_size}
-          -> tensor<1x?x?x?xf32>
-      %final_empty = tensor.empty(
-          %output_height_size, %output_width_size, %output_channels_size)
-          : tensor<1x?x?x?xf32>
-      %final_inner = linalg.generic {
-          indexing_maps = [
-            affine_map<(d0, d1, d2, d3) -> (d0, d1, d2, d3)>,
-            affine_map<(d0, d1, d2, d3) -> (d0, d1, d2, d3)>,
-            affine_map<(d0, d1, d2, d3) -> (d0, d1, d2, d3)>
-          ],
-          iterator_types = ["parallel", "parallel", "parallel", "parallel"]
-        } ins(%raw_loaded, %init_loaded
-            : tensor<1x?x?x?xf16>, tensor<1x?x?x?xf32>)
-          outs(%final_empty : tensor<1x?x?x?xf32>) {
-        ^bb0(%raw: f16, %initial: f32, %out: f32):
-          %raw_f32 = arith.extf %raw : f16 to f32
-          %sum = arith.addf %raw_f32, %initial : f32
-          linalg.yield %sum : f32
-      } -> tensor<1x?x?x?xf32>
-      iree_tensor_ext.dispatch.tensor.store %final_inner, %final_shaped,
-          offsets = [0, 0, 0, 0],
-          sizes = [1, %output_height_size, %output_width_size, %output_channels_size],
-          strides = [1, 1, 1, 1]
-          : tensor<1x?x?x?xf32>
-          -> !iree_tensor_ext.dispatch.tensor<writeonly:tensor<1x?x?x?xf32>>{
-              %output_height_size, %output_width_size, %output_channels_size}
-      flow.return
-    } count(%output_height_workload: index,
-            %output_width_workload: index,
-            %output_channels_workload: index) -> (index, index, index) {
-      %x, %y, %z = iree_tensor_ext.dispatch.workgroup_count_from_slice(
-          %output_height_workload,
-          %output_width_workload,
-          %output_channels_workload)
-      flow.return %x, %y, %z : index, index, index
-    }
+    // Widen back to f32 and fold in the accumulator initialiser: linalg
+    // defines the op as an update of its init (`O += ...`, `O = max(O, ...)`),
+    // so this is exact for any init. A plain generic, not a pre-formed CPU
+    // dispatch: rocket-pin-unclaimed-dispatches keeps it off the NPU, and
+    // rocket-fold-neutral-init drops the init term when it is the neutral
+    // element, leaving a bare extf that fuses with the consumer's truncf
+    // and cancels -- which is what lets the next Rocket dispatch read this
+    // one's output cube in place (ISSUES.md P2).
+    %final_empty = tensor.empty(
+        %output_height, %output_width, %output_channels)
+        : tensor<1x?x?x?xf32>
+    %final = linalg.generic {
+        indexing_maps = [
+          affine_map<(d0, d1, d2, d3) -> (d0, d1, d2, d3)>,
+          affine_map<(d0, d1, d2, d3) -> (d0, d1, d2, d3)>,
+          affine_map<(d0, d1, d2, d3) -> (d0, d1, d2, d3)>
+        ],
+        iterator_types = ["parallel", "parallel", "parallel", "parallel"]
+      } ins(%raw_f16, %init
+          : tensor<1x?x?x?xf16>, tensor<1x?x?x?xf32>)
+        outs(%final_empty : tensor<1x?x?x?xf32>) {
+      ^bb0(%raw: f16, %initial: f32, %out: f32):
+        %raw_f32 = arith.extf %raw : f16 to f32
+        %sum = arith.addf %raw_f32, %initial : f32
+        linalg.yield %sum : f32
+    } -> tensor<1x?x?x?xf32>
 
     util.return %final : tensor<1x?x?x?xf32>
   }
@@ -4288,96 +3538,45 @@ module attributes {transform.with_named_sequence} {
     %zero_bias = linalg.fill ins(%zero_f16 : f16)
         outs(%zero_bias_empty : tensor<?xf16>) -> tensor<?xf16>
 
+    %dense_readers_i32 = arith.constant 0 : i32
     %raw_f16 = flow.dispatch
         @rocket_dynamic_executable_s2::@rocket_dynamic_conv2d_v1::@rocket_dynamic_conv2d(
           %input_width_i32, %input_height_i32, %input_channels_i32,
-          %output_channels_i32, %weights_width_i32, %weights_height_i32,
+          %output_channels_i32, %weights_width_i32, %weights_height_i32, %dense_readers_i32,
           %input, %filter, %zero_bias)
         {stream.affinity = #hal.device.affinity<@rocket_device>}
-        : (i32, i32, i32, i32, i32, i32,
+        : (i32, i32, i32, i32, i32, i32, i32,
            tensor<1x?x?x?xf16>{%input_height, %input_width, %input_channels},
            tensor<?x?x?x?xf16>{%weights_height, %weights_width, %input_channels, %output_channels},
            tensor<?xf16>{%output_channels})
         -> tensor<1x?x?x?xf16>{%output_height, %output_width, %output_channels}
 
-    %final = flow.dispatch.workgroups[
-        %output_height, %output_width, %output_channels](
-        %raw_f16, %init, %output_height, %output_width, %output_channels)
-        : (tensor<1x?x?x?xf16>{%output_height, %output_width, %output_channels},
-           tensor<1x?x?x?xf32>{%output_height, %output_width, %output_channels},
-           index, index, index)
-        -> tensor<1x?x?x?xf32>{%output_height, %output_width, %output_channels}
-        attributes { stream.affinity = #hal.device.affinity<@cpu_device> } =
-        (%raw_binding: !iree_tensor_ext.dispatch.tensor<readonly:tensor<1x?x?x?xf16>>,
-         %init_binding: !iree_tensor_ext.dispatch.tensor<readonly:tensor<1x?x?x?xf32>>,
-         %output_height_arg: index,
-         %output_width_arg: index,
-         %output_channels_arg: index,
-         %final_binding: !iree_tensor_ext.dispatch.tensor<writeonly:tensor<1x?x?x?xf32>>) {
-      %output_height_size = iree_tensor_ext.dispatch.workload.ordinal
-          %output_height_arg, 0 : index
-      %output_width_size = iree_tensor_ext.dispatch.workload.ordinal
-          %output_width_arg, 1 : index
-      %output_channels_size = iree_tensor_ext.dispatch.workload.ordinal
-          %output_channels_arg, 2 : index
-      %raw_shaped = flow.dispatch.tie_shape %raw_binding
-          : !iree_tensor_ext.dispatch.tensor<readonly:tensor<1x?x?x?xf16>>{
-              %output_height_size, %output_width_size, %output_channels_size}
-      %init_shaped = flow.dispatch.tie_shape %init_binding
-          : !iree_tensor_ext.dispatch.tensor<readonly:tensor<1x?x?x?xf32>>{
-              %output_height_size, %output_width_size, %output_channels_size}
-      %final_shaped = flow.dispatch.tie_shape %final_binding
-          : !iree_tensor_ext.dispatch.tensor<writeonly:tensor<1x?x?x?xf32>>{
-              %output_height_size, %output_width_size, %output_channels_size}
-      %raw_loaded = iree_tensor_ext.dispatch.tensor.load %raw_shaped,
-          offsets = [0, 0, 0, 0],
-          sizes = [1, %output_height_size, %output_width_size, %output_channels_size],
-          strides = [1, 1, 1, 1]
-          : !iree_tensor_ext.dispatch.tensor<readonly:tensor<1x?x?x?xf16>>{
-              %output_height_size, %output_width_size, %output_channels_size}
-          -> tensor<1x?x?x?xf16>
-      %init_loaded = iree_tensor_ext.dispatch.tensor.load %init_shaped,
-          offsets = [0, 0, 0, 0],
-          sizes = [1, %output_height_size, %output_width_size, %output_channels_size],
-          strides = [1, 1, 1, 1]
-          : !iree_tensor_ext.dispatch.tensor<readonly:tensor<1x?x?x?xf32>>{
-              %output_height_size, %output_width_size, %output_channels_size}
-          -> tensor<1x?x?x?xf32>
-      %final_empty = tensor.empty(
-          %output_height_size, %output_width_size, %output_channels_size)
-          : tensor<1x?x?x?xf32>
-      %final_inner = linalg.generic {
-          indexing_maps = [
-            affine_map<(d0, d1, d2, d3) -> (d0, d1, d2, d3)>,
-            affine_map<(d0, d1, d2, d3) -> (d0, d1, d2, d3)>,
-            affine_map<(d0, d1, d2, d3) -> (d0, d1, d2, d3)>
-          ],
-          iterator_types = ["parallel", "parallel", "parallel", "parallel"]
-        } ins(%raw_loaded, %init_loaded
-            : tensor<1x?x?x?xf16>, tensor<1x?x?x?xf32>)
-          outs(%final_empty : tensor<1x?x?x?xf32>) {
-        ^bb0(%raw: f16, %initial: f32, %out: f32):
-          %raw_f32 = arith.extf %raw : f16 to f32
-          %sum = arith.addf %raw_f32, %initial : f32
-          linalg.yield %sum : f32
-      } -> tensor<1x?x?x?xf32>
-      iree_tensor_ext.dispatch.tensor.store %final_inner, %final_shaped,
-          offsets = [0, 0, 0, 0],
-          sizes = [1, %output_height_size, %output_width_size, %output_channels_size],
-          strides = [1, 1, 1, 1]
-          : tensor<1x?x?x?xf32>
-          -> !iree_tensor_ext.dispatch.tensor<writeonly:tensor<1x?x?x?xf32>>{
-              %output_height_size, %output_width_size, %output_channels_size}
-      flow.return
-    } count(%output_height_workload: index,
-            %output_width_workload: index,
-            %output_channels_workload: index) -> (index, index, index) {
-      %x, %y, %z = iree_tensor_ext.dispatch.workgroup_count_from_slice(
-          %output_height_workload,
-          %output_width_workload,
-          %output_channels_workload)
-      flow.return %x, %y, %z : index, index, index
-    }
+    // Widen back to f32 and fold in the accumulator initialiser: linalg
+    // defines the op as an update of its init (`O += ...`, `O = max(O, ...)`),
+    // so this is exact for any init. A plain generic, not a pre-formed CPU
+    // dispatch: rocket-pin-unclaimed-dispatches keeps it off the NPU, and
+    // rocket-fold-neutral-init drops the init term when it is the neutral
+    // element, leaving a bare extf that fuses with the consumer's truncf
+    // and cancels -- which is what lets the next Rocket dispatch read this
+    // one's output cube in place (ISSUES.md P2).
+    %final_empty = tensor.empty(
+        %output_height, %output_width, %output_channels)
+        : tensor<1x?x?x?xf32>
+    %final = linalg.generic {
+        indexing_maps = [
+          affine_map<(d0, d1, d2, d3) -> (d0, d1, d2, d3)>,
+          affine_map<(d0, d1, d2, d3) -> (d0, d1, d2, d3)>,
+          affine_map<(d0, d1, d2, d3) -> (d0, d1, d2, d3)>
+        ],
+        iterator_types = ["parallel", "parallel", "parallel", "parallel"]
+      } ins(%raw_f16, %init
+          : tensor<1x?x?x?xf16>, tensor<1x?x?x?xf32>)
+        outs(%final_empty : tensor<1x?x?x?xf32>) {
+      ^bb0(%raw: f16, %initial: f32, %out: f32):
+        %raw_f32 = arith.extf %raw : f16 to f32
+        %sum = arith.addf %raw_f32, %initial : f32
+        linalg.yield %sum : f32
+    } -> tensor<1x?x?x?xf32>
 
     util.return %final : tensor<1x?x?x?xf32>
   }
@@ -4422,96 +3621,45 @@ module attributes {transform.with_named_sequence} {
     %zero_bias = linalg.fill ins(%zero_f16 : f16)
         outs(%zero_bias_empty : tensor<?xf16>) -> tensor<?xf16>
 
+    %dense_readers_i32 = arith.constant 0 : i32
     %raw_f16 = flow.dispatch
         @rocket_dynamic_executable_s3::@rocket_dynamic_conv2d_v1::@rocket_dynamic_conv2d(
           %input_width_i32, %input_height_i32, %input_channels_i32,
-          %output_channels_i32, %weights_width_i32, %weights_height_i32,
+          %output_channels_i32, %weights_width_i32, %weights_height_i32, %dense_readers_i32,
           %input, %filter, %zero_bias)
         {stream.affinity = #hal.device.affinity<@rocket_device>}
-        : (i32, i32, i32, i32, i32, i32,
+        : (i32, i32, i32, i32, i32, i32, i32,
            tensor<1x?x?x?xf16>{%input_height, %input_width, %input_channels},
            tensor<?x?x?x?xf16>{%weights_height, %weights_width, %input_channels, %output_channels},
            tensor<?xf16>{%output_channels})
         -> tensor<1x?x?x?xf16>{%output_height, %output_width, %output_channels}
 
-    %final = flow.dispatch.workgroups[
-        %output_height, %output_width, %output_channels](
-        %raw_f16, %init, %output_height, %output_width, %output_channels)
-        : (tensor<1x?x?x?xf16>{%output_height, %output_width, %output_channels},
-           tensor<1x?x?x?xf32>{%output_height, %output_width, %output_channels},
-           index, index, index)
-        -> tensor<1x?x?x?xf32>{%output_height, %output_width, %output_channels}
-        attributes { stream.affinity = #hal.device.affinity<@cpu_device> } =
-        (%raw_binding: !iree_tensor_ext.dispatch.tensor<readonly:tensor<1x?x?x?xf16>>,
-         %init_binding: !iree_tensor_ext.dispatch.tensor<readonly:tensor<1x?x?x?xf32>>,
-         %output_height_arg: index,
-         %output_width_arg: index,
-         %output_channels_arg: index,
-         %final_binding: !iree_tensor_ext.dispatch.tensor<writeonly:tensor<1x?x?x?xf32>>) {
-      %output_height_size = iree_tensor_ext.dispatch.workload.ordinal
-          %output_height_arg, 0 : index
-      %output_width_size = iree_tensor_ext.dispatch.workload.ordinal
-          %output_width_arg, 1 : index
-      %output_channels_size = iree_tensor_ext.dispatch.workload.ordinal
-          %output_channels_arg, 2 : index
-      %raw_shaped = flow.dispatch.tie_shape %raw_binding
-          : !iree_tensor_ext.dispatch.tensor<readonly:tensor<1x?x?x?xf16>>{
-              %output_height_size, %output_width_size, %output_channels_size}
-      %init_shaped = flow.dispatch.tie_shape %init_binding
-          : !iree_tensor_ext.dispatch.tensor<readonly:tensor<1x?x?x?xf32>>{
-              %output_height_size, %output_width_size, %output_channels_size}
-      %final_shaped = flow.dispatch.tie_shape %final_binding
-          : !iree_tensor_ext.dispatch.tensor<writeonly:tensor<1x?x?x?xf32>>{
-              %output_height_size, %output_width_size, %output_channels_size}
-      %raw_loaded = iree_tensor_ext.dispatch.tensor.load %raw_shaped,
-          offsets = [0, 0, 0, 0],
-          sizes = [1, %output_height_size, %output_width_size, %output_channels_size],
-          strides = [1, 1, 1, 1]
-          : !iree_tensor_ext.dispatch.tensor<readonly:tensor<1x?x?x?xf16>>{
-              %output_height_size, %output_width_size, %output_channels_size}
-          -> tensor<1x?x?x?xf16>
-      %init_loaded = iree_tensor_ext.dispatch.tensor.load %init_shaped,
-          offsets = [0, 0, 0, 0],
-          sizes = [1, %output_height_size, %output_width_size, %output_channels_size],
-          strides = [1, 1, 1, 1]
-          : !iree_tensor_ext.dispatch.tensor<readonly:tensor<1x?x?x?xf32>>{
-              %output_height_size, %output_width_size, %output_channels_size}
-          -> tensor<1x?x?x?xf32>
-      %final_empty = tensor.empty(
-          %output_height_size, %output_width_size, %output_channels_size)
-          : tensor<1x?x?x?xf32>
-      %final_inner = linalg.generic {
-          indexing_maps = [
-            affine_map<(d0, d1, d2, d3) -> (d0, d1, d2, d3)>,
-            affine_map<(d0, d1, d2, d3) -> (d0, d1, d2, d3)>,
-            affine_map<(d0, d1, d2, d3) -> (d0, d1, d2, d3)>
-          ],
-          iterator_types = ["parallel", "parallel", "parallel", "parallel"]
-        } ins(%raw_loaded, %init_loaded
-            : tensor<1x?x?x?xf16>, tensor<1x?x?x?xf32>)
-          outs(%final_empty : tensor<1x?x?x?xf32>) {
-        ^bb0(%raw: f16, %initial: f32, %out: f32):
-          %raw_f32 = arith.extf %raw : f16 to f32
-          %sum = arith.addf %raw_f32, %initial : f32
-          linalg.yield %sum : f32
-      } -> tensor<1x?x?x?xf32>
-      iree_tensor_ext.dispatch.tensor.store %final_inner, %final_shaped,
-          offsets = [0, 0, 0, 0],
-          sizes = [1, %output_height_size, %output_width_size, %output_channels_size],
-          strides = [1, 1, 1, 1]
-          : tensor<1x?x?x?xf32>
-          -> !iree_tensor_ext.dispatch.tensor<writeonly:tensor<1x?x?x?xf32>>{
-              %output_height_size, %output_width_size, %output_channels_size}
-      flow.return
-    } count(%output_height_workload: index,
-            %output_width_workload: index,
-            %output_channels_workload: index) -> (index, index, index) {
-      %x, %y, %z = iree_tensor_ext.dispatch.workgroup_count_from_slice(
-          %output_height_workload,
-          %output_width_workload,
-          %output_channels_workload)
-      flow.return %x, %y, %z : index, index, index
-    }
+    // Widen back to f32 and fold in the accumulator initialiser: linalg
+    // defines the op as an update of its init (`O += ...`, `O = max(O, ...)`),
+    // so this is exact for any init. A plain generic, not a pre-formed CPU
+    // dispatch: rocket-pin-unclaimed-dispatches keeps it off the NPU, and
+    // rocket-fold-neutral-init drops the init term when it is the neutral
+    // element, leaving a bare extf that fuses with the consumer's truncf
+    // and cancels -- which is what lets the next Rocket dispatch read this
+    // one's output cube in place (ISSUES.md P2).
+    %final_empty = tensor.empty(
+        %output_height, %output_width, %output_channels)
+        : tensor<1x?x?x?xf32>
+    %final = linalg.generic {
+        indexing_maps = [
+          affine_map<(d0, d1, d2, d3) -> (d0, d1, d2, d3)>,
+          affine_map<(d0, d1, d2, d3) -> (d0, d1, d2, d3)>,
+          affine_map<(d0, d1, d2, d3) -> (d0, d1, d2, d3)>
+        ],
+        iterator_types = ["parallel", "parallel", "parallel", "parallel"]
+      } ins(%raw_f16, %init
+          : tensor<1x?x?x?xf16>, tensor<1x?x?x?xf32>)
+        outs(%final_empty : tensor<1x?x?x?xf32>) {
+      ^bb0(%raw: f16, %initial: f32, %out: f32):
+        %raw_f32 = arith.extf %raw : f16 to f32
+        %sum = arith.addf %raw_f32, %initial : f32
+        linalg.yield %sum : f32
+    } -> tensor<1x?x?x?xf32>
 
     util.return %final : tensor<1x?x?x?xf32>
   }
@@ -4556,96 +3704,45 @@ module attributes {transform.with_named_sequence} {
     %zero_bias = linalg.fill ins(%zero_f16 : f16)
         outs(%zero_bias_empty : tensor<?xf16>) -> tensor<?xf16>
 
+    %dense_readers_i32 = arith.constant 0 : i32
     %raw_f16 = flow.dispatch
         @rocket_dynamic_executable_s4::@rocket_dynamic_conv2d_v1::@rocket_dynamic_conv2d(
           %input_width_i32, %input_height_i32, %input_channels_i32,
-          %output_channels_i32, %weights_width_i32, %weights_height_i32,
+          %output_channels_i32, %weights_width_i32, %weights_height_i32, %dense_readers_i32,
           %input, %filter, %zero_bias)
         {stream.affinity = #hal.device.affinity<@rocket_device>}
-        : (i32, i32, i32, i32, i32, i32,
+        : (i32, i32, i32, i32, i32, i32, i32,
            tensor<1x?x?x?xf16>{%input_height, %input_width, %input_channels},
            tensor<?x?x?x?xf16>{%weights_height, %weights_width, %input_channels, %output_channels},
            tensor<?xf16>{%output_channels})
         -> tensor<1x?x?x?xf16>{%output_height, %output_width, %output_channels}
 
-    %final = flow.dispatch.workgroups[
-        %output_height, %output_width, %output_channels](
-        %raw_f16, %init, %output_height, %output_width, %output_channels)
-        : (tensor<1x?x?x?xf16>{%output_height, %output_width, %output_channels},
-           tensor<1x?x?x?xf32>{%output_height, %output_width, %output_channels},
-           index, index, index)
-        -> tensor<1x?x?x?xf32>{%output_height, %output_width, %output_channels}
-        attributes { stream.affinity = #hal.device.affinity<@cpu_device> } =
-        (%raw_binding: !iree_tensor_ext.dispatch.tensor<readonly:tensor<1x?x?x?xf16>>,
-         %init_binding: !iree_tensor_ext.dispatch.tensor<readonly:tensor<1x?x?x?xf32>>,
-         %output_height_arg: index,
-         %output_width_arg: index,
-         %output_channels_arg: index,
-         %final_binding: !iree_tensor_ext.dispatch.tensor<writeonly:tensor<1x?x?x?xf32>>) {
-      %output_height_size = iree_tensor_ext.dispatch.workload.ordinal
-          %output_height_arg, 0 : index
-      %output_width_size = iree_tensor_ext.dispatch.workload.ordinal
-          %output_width_arg, 1 : index
-      %output_channels_size = iree_tensor_ext.dispatch.workload.ordinal
-          %output_channels_arg, 2 : index
-      %raw_shaped = flow.dispatch.tie_shape %raw_binding
-          : !iree_tensor_ext.dispatch.tensor<readonly:tensor<1x?x?x?xf16>>{
-              %output_height_size, %output_width_size, %output_channels_size}
-      %init_shaped = flow.dispatch.tie_shape %init_binding
-          : !iree_tensor_ext.dispatch.tensor<readonly:tensor<1x?x?x?xf32>>{
-              %output_height_size, %output_width_size, %output_channels_size}
-      %final_shaped = flow.dispatch.tie_shape %final_binding
-          : !iree_tensor_ext.dispatch.tensor<writeonly:tensor<1x?x?x?xf32>>{
-              %output_height_size, %output_width_size, %output_channels_size}
-      %raw_loaded = iree_tensor_ext.dispatch.tensor.load %raw_shaped,
-          offsets = [0, 0, 0, 0],
-          sizes = [1, %output_height_size, %output_width_size, %output_channels_size],
-          strides = [1, 1, 1, 1]
-          : !iree_tensor_ext.dispatch.tensor<readonly:tensor<1x?x?x?xf16>>{
-              %output_height_size, %output_width_size, %output_channels_size}
-          -> tensor<1x?x?x?xf16>
-      %init_loaded = iree_tensor_ext.dispatch.tensor.load %init_shaped,
-          offsets = [0, 0, 0, 0],
-          sizes = [1, %output_height_size, %output_width_size, %output_channels_size],
-          strides = [1, 1, 1, 1]
-          : !iree_tensor_ext.dispatch.tensor<readonly:tensor<1x?x?x?xf32>>{
-              %output_height_size, %output_width_size, %output_channels_size}
-          -> tensor<1x?x?x?xf32>
-      %final_empty = tensor.empty(
-          %output_height_size, %output_width_size, %output_channels_size)
-          : tensor<1x?x?x?xf32>
-      %final_inner = linalg.generic {
-          indexing_maps = [
-            affine_map<(d0, d1, d2, d3) -> (d0, d1, d2, d3)>,
-            affine_map<(d0, d1, d2, d3) -> (d0, d1, d2, d3)>,
-            affine_map<(d0, d1, d2, d3) -> (d0, d1, d2, d3)>
-          ],
-          iterator_types = ["parallel", "parallel", "parallel", "parallel"]
-        } ins(%raw_loaded, %init_loaded
-            : tensor<1x?x?x?xf16>, tensor<1x?x?x?xf32>)
-          outs(%final_empty : tensor<1x?x?x?xf32>) {
-        ^bb0(%raw: f16, %initial: f32, %out: f32):
-          %raw_f32 = arith.extf %raw : f16 to f32
-          %sum = arith.addf %raw_f32, %initial : f32
-          linalg.yield %sum : f32
-      } -> tensor<1x?x?x?xf32>
-      iree_tensor_ext.dispatch.tensor.store %final_inner, %final_shaped,
-          offsets = [0, 0, 0, 0],
-          sizes = [1, %output_height_size, %output_width_size, %output_channels_size],
-          strides = [1, 1, 1, 1]
-          : tensor<1x?x?x?xf32>
-          -> !iree_tensor_ext.dispatch.tensor<writeonly:tensor<1x?x?x?xf32>>{
-              %output_height_size, %output_width_size, %output_channels_size}
-      flow.return
-    } count(%output_height_workload: index,
-            %output_width_workload: index,
-            %output_channels_workload: index) -> (index, index, index) {
-      %x, %y, %z = iree_tensor_ext.dispatch.workgroup_count_from_slice(
-          %output_height_workload,
-          %output_width_workload,
-          %output_channels_workload)
-      flow.return %x, %y, %z : index, index, index
-    }
+    // Widen back to f32 and fold in the accumulator initialiser: linalg
+    // defines the op as an update of its init (`O += ...`, `O = max(O, ...)`),
+    // so this is exact for any init. A plain generic, not a pre-formed CPU
+    // dispatch: rocket-pin-unclaimed-dispatches keeps it off the NPU, and
+    // rocket-fold-neutral-init drops the init term when it is the neutral
+    // element, leaving a bare extf that fuses with the consumer's truncf
+    // and cancels -- which is what lets the next Rocket dispatch read this
+    // one's output cube in place (ISSUES.md P2).
+    %final_empty = tensor.empty(
+        %output_height, %output_width, %output_channels)
+        : tensor<1x?x?x?xf32>
+    %final = linalg.generic {
+        indexing_maps = [
+          affine_map<(d0, d1, d2, d3) -> (d0, d1, d2, d3)>,
+          affine_map<(d0, d1, d2, d3) -> (d0, d1, d2, d3)>,
+          affine_map<(d0, d1, d2, d3) -> (d0, d1, d2, d3)>
+        ],
+        iterator_types = ["parallel", "parallel", "parallel", "parallel"]
+      } ins(%raw_f16, %init
+          : tensor<1x?x?x?xf16>, tensor<1x?x?x?xf32>)
+        outs(%final_empty : tensor<1x?x?x?xf32>) {
+      ^bb0(%raw: f16, %initial: f32, %out: f32):
+        %raw_f32 = arith.extf %raw : f16 to f32
+        %sum = arith.addf %raw_f32, %initial : f32
+        linalg.yield %sum : f32
+    } -> tensor<1x?x?x?xf32>
 
     util.return %final : tensor<1x?x?x?xf32>
   }
@@ -4705,96 +3802,45 @@ module attributes {transform.with_named_sequence} {
         outs(%filter_chw_empty : tensor<?x?x?xf16>)
         permutation = [2, 0, 1]
 
+    %dense_readers_i32 = arith.constant 0 : i32
     %raw_f16 = flow.dispatch
         @rocket_dynamic_depthwise_executable::@rocket_dynamic_depthwise_conv2d_v1::@rocket_dynamic_depthwise_conv2d(
           %input_width_i32, %input_height_i32, %input_channels_i32,
-          %output_channels_i32, %weights_width_i32, %weights_height_i32,
+          %output_channels_i32, %weights_width_i32, %weights_height_i32, %dense_readers_i32,
           %input, %filter_chw, %zero_bias)
         {stream.affinity = #hal.device.affinity<@rocket_device>}
-        : (i32, i32, i32, i32, i32, i32,
+        : (i32, i32, i32, i32, i32, i32, i32,
            tensor<1x?x?x?xf16>{%input_height, %input_width, %input_channels},
            tensor<?x?x?xf16>{%input_channels, %weights_height, %weights_width},
            tensor<?xf16>{%output_channels})
         -> tensor<1x?x?x?xf16>{%output_height, %output_width, %output_channels}
 
-    %final = flow.dispatch.workgroups[
-        %output_height, %output_width, %output_channels](
-        %raw_f16, %init, %output_height, %output_width, %output_channels)
-        : (tensor<1x?x?x?xf16>{%output_height, %output_width, %output_channels},
-           tensor<1x?x?x?xf32>{%output_height, %output_width, %output_channels},
-           index, index, index)
-        -> tensor<1x?x?x?xf32>{%output_height, %output_width, %output_channels}
-        attributes { stream.affinity = #hal.device.affinity<@cpu_device> } =
-        (%raw_binding: !iree_tensor_ext.dispatch.tensor<readonly:tensor<1x?x?x?xf16>>,
-         %init_binding: !iree_tensor_ext.dispatch.tensor<readonly:tensor<1x?x?x?xf32>>,
-         %output_height_arg: index,
-         %output_width_arg: index,
-         %output_channels_arg: index,
-         %final_binding: !iree_tensor_ext.dispatch.tensor<writeonly:tensor<1x?x?x?xf32>>) {
-      %output_height_size = iree_tensor_ext.dispatch.workload.ordinal
-          %output_height_arg, 0 : index
-      %output_width_size = iree_tensor_ext.dispatch.workload.ordinal
-          %output_width_arg, 1 : index
-      %output_channels_size = iree_tensor_ext.dispatch.workload.ordinal
-          %output_channels_arg, 2 : index
-      %raw_shaped = flow.dispatch.tie_shape %raw_binding
-          : !iree_tensor_ext.dispatch.tensor<readonly:tensor<1x?x?x?xf16>>{
-              %output_height_size, %output_width_size, %output_channels_size}
-      %init_shaped = flow.dispatch.tie_shape %init_binding
-          : !iree_tensor_ext.dispatch.tensor<readonly:tensor<1x?x?x?xf32>>{
-              %output_height_size, %output_width_size, %output_channels_size}
-      %final_shaped = flow.dispatch.tie_shape %final_binding
-          : !iree_tensor_ext.dispatch.tensor<writeonly:tensor<1x?x?x?xf32>>{
-              %output_height_size, %output_width_size, %output_channels_size}
-      %raw_loaded = iree_tensor_ext.dispatch.tensor.load %raw_shaped,
-          offsets = [0, 0, 0, 0],
-          sizes = [1, %output_height_size, %output_width_size, %output_channels_size],
-          strides = [1, 1, 1, 1]
-          : !iree_tensor_ext.dispatch.tensor<readonly:tensor<1x?x?x?xf16>>{
-              %output_height_size, %output_width_size, %output_channels_size}
-          -> tensor<1x?x?x?xf16>
-      %init_loaded = iree_tensor_ext.dispatch.tensor.load %init_shaped,
-          offsets = [0, 0, 0, 0],
-          sizes = [1, %output_height_size, %output_width_size, %output_channels_size],
-          strides = [1, 1, 1, 1]
-          : !iree_tensor_ext.dispatch.tensor<readonly:tensor<1x?x?x?xf32>>{
-              %output_height_size, %output_width_size, %output_channels_size}
-          -> tensor<1x?x?x?xf32>
-      %final_empty = tensor.empty(
-          %output_height_size, %output_width_size, %output_channels_size)
-          : tensor<1x?x?x?xf32>
-      %final_inner = linalg.generic {
-          indexing_maps = [
-            affine_map<(d0, d1, d2, d3) -> (d0, d1, d2, d3)>,
-            affine_map<(d0, d1, d2, d3) -> (d0, d1, d2, d3)>,
-            affine_map<(d0, d1, d2, d3) -> (d0, d1, d2, d3)>
-          ],
-          iterator_types = ["parallel", "parallel", "parallel", "parallel"]
-        } ins(%raw_loaded, %init_loaded
-            : tensor<1x?x?x?xf16>, tensor<1x?x?x?xf32>)
-          outs(%final_empty : tensor<1x?x?x?xf32>) {
-        ^bb0(%raw: f16, %initial: f32, %out: f32):
-          %raw_f32 = arith.extf %raw : f16 to f32
-          %sum = arith.addf %raw_f32, %initial : f32
-          linalg.yield %sum : f32
-      } -> tensor<1x?x?x?xf32>
-      iree_tensor_ext.dispatch.tensor.store %final_inner, %final_shaped,
-          offsets = [0, 0, 0, 0],
-          sizes = [1, %output_height_size, %output_width_size, %output_channels_size],
-          strides = [1, 1, 1, 1]
-          : tensor<1x?x?x?xf32>
-          -> !iree_tensor_ext.dispatch.tensor<writeonly:tensor<1x?x?x?xf32>>{
-              %output_height_size, %output_width_size, %output_channels_size}
-      flow.return
-    } count(%output_height_workload: index,
-            %output_width_workload: index,
-            %output_channels_workload: index) -> (index, index, index) {
-      %x, %y, %z = iree_tensor_ext.dispatch.workgroup_count_from_slice(
-          %output_height_workload,
-          %output_width_workload,
-          %output_channels_workload)
-      flow.return %x, %y, %z : index, index, index
-    }
+    // Widen back to f32 and fold in the accumulator initialiser: linalg
+    // defines the op as an update of its init (`O += ...`, `O = max(O, ...)`),
+    // so this is exact for any init. A plain generic, not a pre-formed CPU
+    // dispatch: rocket-pin-unclaimed-dispatches keeps it off the NPU, and
+    // rocket-fold-neutral-init drops the init term when it is the neutral
+    // element, leaving a bare extf that fuses with the consumer's truncf
+    // and cancels -- which is what lets the next Rocket dispatch read this
+    // one's output cube in place (ISSUES.md P2).
+    %final_empty = tensor.empty(
+        %output_height, %output_width, %output_channels)
+        : tensor<1x?x?x?xf32>
+    %final = linalg.generic {
+        indexing_maps = [
+          affine_map<(d0, d1, d2, d3) -> (d0, d1, d2, d3)>,
+          affine_map<(d0, d1, d2, d3) -> (d0, d1, d2, d3)>,
+          affine_map<(d0, d1, d2, d3) -> (d0, d1, d2, d3)>
+        ],
+        iterator_types = ["parallel", "parallel", "parallel", "parallel"]
+      } ins(%raw_f16, %init
+          : tensor<1x?x?x?xf16>, tensor<1x?x?x?xf32>)
+        outs(%final_empty : tensor<1x?x?x?xf32>) {
+      ^bb0(%raw: f16, %initial: f32, %out: f32):
+        %raw_f32 = arith.extf %raw : f16 to f32
+        %sum = arith.addf %raw_f32, %initial : f32
+        linalg.yield %sum : f32
+    } -> tensor<1x?x?x?xf32>
 
     util.return %final : tensor<1x?x?x?xf32>
   }
@@ -4879,81 +3925,42 @@ module attributes {transform.with_named_sequence} {
         outs(%input_nhwc_empty : tensor<1x?x?x?xf16>)
         permutation = [0, 2, 3, 1]
 
+    %dense_readers_i32 = arith.constant 0 : i32
     %raw_f16 = flow.dispatch
         @rocket_dynamic_depthwise_relu6_executable::@rocket_dynamic_depthwise_conv2d_v1::@rocket_dynamic_depthwise_conv2d(
           %input_width_i32, %input_height_i32, %input_channels_i32,
-          %output_channels_i32, %weights_width_i32, %weights_height_i32,
+          %output_channels_i32, %weights_width_i32, %weights_height_i32, %dense_readers_i32,
           %input_nhwc, %filter, %bias_f16)
         {stream.affinity = #hal.device.affinity<@rocket_device>}
-        : (i32, i32, i32, i32, i32, i32,
+        : (i32, i32, i32, i32, i32, i32, i32,
            tensor<1x?x?x?xf16>{%input_height, %input_width, %input_channels},
            tensor<?x?x?xf16>{%input_channels, %weights_height, %weights_width},
            tensor<?xf16>{%output_channels})
         -> tensor<1x?x?x?xf16>{%output_height, %output_width, %output_channels}
 
-    %final_nhwc = flow.dispatch.workgroups[
-        %output_height, %output_width, %output_channels](
-        %raw_f16, %output_height, %output_width, %output_channels)
-        : (tensor<1x?x?x?xf16>{%output_height, %output_width, %output_channels},
-           index, index, index)
-        -> tensor<1x?x?x?xf32>{%output_height, %output_width, %output_channels}
-        attributes { stream.affinity = #hal.device.affinity<@cpu_device> } =
-        (%raw_binding: !iree_tensor_ext.dispatch.tensor<readonly:tensor<1x?x?x?xf16>>,
-         %output_height_arg: index,
-         %output_width_arg: index,
-         %output_channels_arg: index,
-         %final_binding: !iree_tensor_ext.dispatch.tensor<writeonly:tensor<1x?x?x?xf32>>) {
-      %output_height_size = iree_tensor_ext.dispatch.workload.ordinal
-          %output_height_arg, 0 : index
-      %output_width_size = iree_tensor_ext.dispatch.workload.ordinal
-          %output_width_arg, 1 : index
-      %output_channels_size = iree_tensor_ext.dispatch.workload.ordinal
-          %output_channels_arg, 2 : index
-      %raw_shaped = flow.dispatch.tie_shape %raw_binding
-          : !iree_tensor_ext.dispatch.tensor<readonly:tensor<1x?x?x?xf16>>{
-              %output_height_size, %output_width_size, %output_channels_size}
-      %final_shaped = flow.dispatch.tie_shape %final_binding
-          : !iree_tensor_ext.dispatch.tensor<writeonly:tensor<1x?x?x?xf32>>{
-              %output_height_size, %output_width_size, %output_channels_size}
-      %raw_loaded = iree_tensor_ext.dispatch.tensor.load %raw_shaped,
-          offsets = [0, 0, 0, 0],
-          sizes = [1, %output_height_size, %output_width_size, %output_channels_size],
-          strides = [1, 1, 1, 1]
-          : !iree_tensor_ext.dispatch.tensor<readonly:tensor<1x?x?x?xf16>>{
-              %output_height_size, %output_width_size, %output_channels_size}
-          -> tensor<1x?x?x?xf16>
-      %final_empty = tensor.empty(
-          %output_height_size, %output_width_size, %output_channels_size)
-          : tensor<1x?x?x?xf32>
-      %final_inner = linalg.generic {
-          indexing_maps = [
-            affine_map<(d0, d1, d2, d3) -> (d0, d1, d2, d3)>,
-            affine_map<(d0, d1, d2, d3) -> (d0, d1, d2, d3)>
-          ],
-          iterator_types = ["parallel", "parallel", "parallel", "parallel"]
-        } ins(%raw_loaded : tensor<1x?x?x?xf16>)
-          outs(%final_empty : tensor<1x?x?x?xf32>) {
-        ^bb0(%raw: f16, %out: f32):
-          %raw_f32 = arith.extf %raw : f16 to f32
-          linalg.yield %raw_f32 : f32
-      } -> tensor<1x?x?x?xf32>
-      iree_tensor_ext.dispatch.tensor.store %final_inner, %final_shaped,
-          offsets = [0, 0, 0, 0],
-          sizes = [1, %output_height_size, %output_width_size, %output_channels_size],
-          strides = [1, 1, 1, 1]
-          : tensor<1x?x?x?xf32>
-          -> !iree_tensor_ext.dispatch.tensor<writeonly:tensor<1x?x?x?xf32>>{
-              %output_height_size, %output_width_size, %output_channels_size}
-      flow.return
-    } count(%output_height_workload: index,
-            %output_width_workload: index,
-            %output_channels_workload: index) -> (index, index, index) {
-      %x, %y, %z = iree_tensor_ext.dispatch.workgroup_count_from_slice(
-          %output_height_workload,
-          %output_width_workload,
-          %output_channels_workload)
-      flow.return %x, %y, %z : index, index, index
-    }
+    // Widen back to f32 and fold in the accumulator initialiser: linalg
+    // defines the op as an update of its init (`O += ...`, `O = max(O, ...)`),
+    // so this is exact for any init. A plain generic, not a pre-formed CPU
+    // dispatch: rocket-pin-unclaimed-dispatches keeps it off the NPU, and
+    // rocket-fold-neutral-init drops the init term when it is the neutral
+    // element, leaving a bare extf that fuses with the consumer's truncf
+    // and cancels -- which is what lets the next Rocket dispatch read this
+    // one's output cube in place (ISSUES.md P2).
+    %final_nhwc_empty = tensor.empty(
+        %output_height, %output_width, %output_channels)
+        : tensor<1x?x?x?xf32>
+    %final_nhwc = linalg.generic {
+        indexing_maps = [
+          affine_map<(d0, d1, d2, d3) -> (d0, d1, d2, d3)>,
+          affine_map<(d0, d1, d2, d3) -> (d0, d1, d2, d3)>
+        ],
+        iterator_types = ["parallel", "parallel", "parallel", "parallel"]
+      } ins(%raw_f16 : tensor<1x?x?x?xf16>)
+        outs(%final_nhwc_empty : tensor<1x?x?x?xf32>) {
+      ^bb0(%raw: f16, %out: f32):
+        %raw_f32 = arith.extf %raw : f16 to f32
+        linalg.yield %raw_f32 : f32
+    } -> tensor<1x?x?x?xf32>
 
     %final_nchw_empty = tensor.empty(%output_channels, %output_height, %output_width) : tensor<1x?x?x?xf32>
     %final_nchw = linalg.transpose
@@ -5018,81 +4025,42 @@ module attributes {transform.with_named_sequence} {
         outs(%input_nhwc_empty : tensor<1x?x?x?xf16>)
         permutation = [0, 2, 3, 1]
 
+    %dense_readers_i32 = arith.constant 0 : i32
     %raw_f16 = flow.dispatch
         @rocket_dynamic_depthwise_relu6_executable_s2::@rocket_dynamic_depthwise_conv2d_v1::@rocket_dynamic_depthwise_conv2d(
           %input_width_i32, %input_height_i32, %input_channels_i32,
-          %output_channels_i32, %weights_width_i32, %weights_height_i32,
+          %output_channels_i32, %weights_width_i32, %weights_height_i32, %dense_readers_i32,
           %input_nhwc, %filter, %bias_f16)
         {stream.affinity = #hal.device.affinity<@rocket_device>}
-        : (i32, i32, i32, i32, i32, i32,
+        : (i32, i32, i32, i32, i32, i32, i32,
            tensor<1x?x?x?xf16>{%input_height, %input_width, %input_channels},
            tensor<?x?x?xf16>{%input_channels, %weights_height, %weights_width},
            tensor<?xf16>{%output_channels})
         -> tensor<1x?x?x?xf16>{%output_height, %output_width, %output_channels}
 
-    %final_nhwc = flow.dispatch.workgroups[
-        %output_height, %output_width, %output_channels](
-        %raw_f16, %output_height, %output_width, %output_channels)
-        : (tensor<1x?x?x?xf16>{%output_height, %output_width, %output_channels},
-           index, index, index)
-        -> tensor<1x?x?x?xf32>{%output_height, %output_width, %output_channels}
-        attributes { stream.affinity = #hal.device.affinity<@cpu_device> } =
-        (%raw_binding: !iree_tensor_ext.dispatch.tensor<readonly:tensor<1x?x?x?xf16>>,
-         %output_height_arg: index,
-         %output_width_arg: index,
-         %output_channels_arg: index,
-         %final_binding: !iree_tensor_ext.dispatch.tensor<writeonly:tensor<1x?x?x?xf32>>) {
-      %output_height_size = iree_tensor_ext.dispatch.workload.ordinal
-          %output_height_arg, 0 : index
-      %output_width_size = iree_tensor_ext.dispatch.workload.ordinal
-          %output_width_arg, 1 : index
-      %output_channels_size = iree_tensor_ext.dispatch.workload.ordinal
-          %output_channels_arg, 2 : index
-      %raw_shaped = flow.dispatch.tie_shape %raw_binding
-          : !iree_tensor_ext.dispatch.tensor<readonly:tensor<1x?x?x?xf16>>{
-              %output_height_size, %output_width_size, %output_channels_size}
-      %final_shaped = flow.dispatch.tie_shape %final_binding
-          : !iree_tensor_ext.dispatch.tensor<writeonly:tensor<1x?x?x?xf32>>{
-              %output_height_size, %output_width_size, %output_channels_size}
-      %raw_loaded = iree_tensor_ext.dispatch.tensor.load %raw_shaped,
-          offsets = [0, 0, 0, 0],
-          sizes = [1, %output_height_size, %output_width_size, %output_channels_size],
-          strides = [1, 1, 1, 1]
-          : !iree_tensor_ext.dispatch.tensor<readonly:tensor<1x?x?x?xf16>>{
-              %output_height_size, %output_width_size, %output_channels_size}
-          -> tensor<1x?x?x?xf16>
-      %final_empty = tensor.empty(
-          %output_height_size, %output_width_size, %output_channels_size)
-          : tensor<1x?x?x?xf32>
-      %final_inner = linalg.generic {
-          indexing_maps = [
-            affine_map<(d0, d1, d2, d3) -> (d0, d1, d2, d3)>,
-            affine_map<(d0, d1, d2, d3) -> (d0, d1, d2, d3)>
-          ],
-          iterator_types = ["parallel", "parallel", "parallel", "parallel"]
-        } ins(%raw_loaded : tensor<1x?x?x?xf16>)
-          outs(%final_empty : tensor<1x?x?x?xf32>) {
-        ^bb0(%raw: f16, %out: f32):
-          %raw_f32 = arith.extf %raw : f16 to f32
-          linalg.yield %raw_f32 : f32
-      } -> tensor<1x?x?x?xf32>
-      iree_tensor_ext.dispatch.tensor.store %final_inner, %final_shaped,
-          offsets = [0, 0, 0, 0],
-          sizes = [1, %output_height_size, %output_width_size, %output_channels_size],
-          strides = [1, 1, 1, 1]
-          : tensor<1x?x?x?xf32>
-          -> !iree_tensor_ext.dispatch.tensor<writeonly:tensor<1x?x?x?xf32>>{
-              %output_height_size, %output_width_size, %output_channels_size}
-      flow.return
-    } count(%output_height_workload: index,
-            %output_width_workload: index,
-            %output_channels_workload: index) -> (index, index, index) {
-      %x, %y, %z = iree_tensor_ext.dispatch.workgroup_count_from_slice(
-          %output_height_workload,
-          %output_width_workload,
-          %output_channels_workload)
-      flow.return %x, %y, %z : index, index, index
-    }
+    // Widen back to f32 and fold in the accumulator initialiser: linalg
+    // defines the op as an update of its init (`O += ...`, `O = max(O, ...)`),
+    // so this is exact for any init. A plain generic, not a pre-formed CPU
+    // dispatch: rocket-pin-unclaimed-dispatches keeps it off the NPU, and
+    // rocket-fold-neutral-init drops the init term when it is the neutral
+    // element, leaving a bare extf that fuses with the consumer's truncf
+    // and cancels -- which is what lets the next Rocket dispatch read this
+    // one's output cube in place (ISSUES.md P2).
+    %final_nhwc_empty = tensor.empty(
+        %output_height, %output_width, %output_channels)
+        : tensor<1x?x?x?xf32>
+    %final_nhwc = linalg.generic {
+        indexing_maps = [
+          affine_map<(d0, d1, d2, d3) -> (d0, d1, d2, d3)>,
+          affine_map<(d0, d1, d2, d3) -> (d0, d1, d2, d3)>
+        ],
+        iterator_types = ["parallel", "parallel", "parallel", "parallel"]
+      } ins(%raw_f16 : tensor<1x?x?x?xf16>)
+        outs(%final_nhwc_empty : tensor<1x?x?x?xf32>) {
+      ^bb0(%raw: f16, %out: f32):
+        %raw_f32 = arith.extf %raw : f16 to f32
+        linalg.yield %raw_f32 : f32
+    } -> tensor<1x?x?x?xf32>
 
     %final_nchw_empty = tensor.empty(%output_channels, %output_height, %output_width) : tensor<1x?x?x?xf32>
     %final_nchw = linalg.transpose
@@ -5143,13 +4111,14 @@ module attributes {transform.with_named_sequence} {
         outs(%input_nhwc_empty : tensor<1x?x?x?xf16>)
         permutation = [0, 2, 3, 1]
 
+    %dense_readers_i32 = arith.constant 0 : i32
     %raw_f16 = flow.dispatch
         @rocket_dynamic_depthwise_executable::@rocket_dynamic_depthwise_conv2d_v1::@rocket_dynamic_depthwise_conv2d(
           %input_width_i32, %input_height_i32, %input_channels_i32,
-          %output_channels_i32, %weights_width_i32, %weights_height_i32,
+          %output_channels_i32, %weights_width_i32, %weights_height_i32, %dense_readers_i32,
           %input_nhwc, %filter, %zero_bias)
         {stream.affinity = #hal.device.affinity<@rocket_device>}
-        : (i32, i32, i32, i32, i32, i32,
+        : (i32, i32, i32, i32, i32, i32, i32,
            tensor<1x?x?x?xf16>{%input_height, %input_width, %input_channels},
            tensor<?x?x?xf16>{%input_channels, %weights_height, %weights_width},
            tensor<?xf16>{%output_channels})
@@ -5163,84 +4132,32 @@ module attributes {transform.with_named_sequence} {
         outs(%init_nhwc_empty : tensor<1x?x?x?xf32>)
         permutation = [0, 2, 3, 1]
 
-    %final_nhwc = flow.dispatch.workgroups[
-        %output_height, %output_width, %output_channels](
-        %raw_f16, %init_nhwc, %output_height, %output_width, %output_channels)
-        : (tensor<1x?x?x?xf16>{%output_height, %output_width, %output_channels},
-           tensor<1x?x?x?xf32>{%output_height, %output_width, %output_channels},
-           index, index, index)
-        -> tensor<1x?x?x?xf32>{%output_height, %output_width, %output_channels}
-        attributes { stream.affinity = #hal.device.affinity<@cpu_device> } =
-        (%raw_binding: !iree_tensor_ext.dispatch.tensor<readonly:tensor<1x?x?x?xf16>>,
-         %init_binding: !iree_tensor_ext.dispatch.tensor<readonly:tensor<1x?x?x?xf32>>,
-         %output_height_arg: index,
-         %output_width_arg: index,
-         %output_channels_arg: index,
-         %final_binding: !iree_tensor_ext.dispatch.tensor<writeonly:tensor<1x?x?x?xf32>>) {
-      %output_height_size = iree_tensor_ext.dispatch.workload.ordinal
-          %output_height_arg, 0 : index
-      %output_width_size = iree_tensor_ext.dispatch.workload.ordinal
-          %output_width_arg, 1 : index
-      %output_channels_size = iree_tensor_ext.dispatch.workload.ordinal
-          %output_channels_arg, 2 : index
-      %raw_shaped = flow.dispatch.tie_shape %raw_binding
-          : !iree_tensor_ext.dispatch.tensor<readonly:tensor<1x?x?x?xf16>>{
-              %output_height_size, %output_width_size, %output_channels_size}
-      %init_shaped = flow.dispatch.tie_shape %init_binding
-          : !iree_tensor_ext.dispatch.tensor<readonly:tensor<1x?x?x?xf32>>{
-              %output_height_size, %output_width_size, %output_channels_size}
-      %final_shaped = flow.dispatch.tie_shape %final_binding
-          : !iree_tensor_ext.dispatch.tensor<writeonly:tensor<1x?x?x?xf32>>{
-              %output_height_size, %output_width_size, %output_channels_size}
-      %raw_loaded = iree_tensor_ext.dispatch.tensor.load %raw_shaped,
-          offsets = [0, 0, 0, 0],
-          sizes = [1, %output_height_size, %output_width_size, %output_channels_size],
-          strides = [1, 1, 1, 1]
-          : !iree_tensor_ext.dispatch.tensor<readonly:tensor<1x?x?x?xf16>>{
-              %output_height_size, %output_width_size, %output_channels_size}
-          -> tensor<1x?x?x?xf16>
-      %init_loaded = iree_tensor_ext.dispatch.tensor.load %init_shaped,
-          offsets = [0, 0, 0, 0],
-          sizes = [1, %output_height_size, %output_width_size, %output_channels_size],
-          strides = [1, 1, 1, 1]
-          : !iree_tensor_ext.dispatch.tensor<readonly:tensor<1x?x?x?xf32>>{
-              %output_height_size, %output_width_size, %output_channels_size}
-          -> tensor<1x?x?x?xf32>
-      %final_empty = tensor.empty(
-          %output_height_size, %output_width_size, %output_channels_size)
-          : tensor<1x?x?x?xf32>
-      %final_inner = linalg.generic {
-          indexing_maps = [
-            affine_map<(d0, d1, d2, d3) -> (d0, d1, d2, d3)>,
-            affine_map<(d0, d1, d2, d3) -> (d0, d1, d2, d3)>,
-            affine_map<(d0, d1, d2, d3) -> (d0, d1, d2, d3)>
-          ],
-          iterator_types = ["parallel", "parallel", "parallel", "parallel"]
-        } ins(%raw_loaded, %init_loaded
-            : tensor<1x?x?x?xf16>, tensor<1x?x?x?xf32>)
-          outs(%final_empty : tensor<1x?x?x?xf32>) {
-        ^bb0(%raw: f16, %initial: f32, %out: f32):
-          %raw_f32 = arith.extf %raw : f16 to f32
-          %sum = arith.addf %raw_f32, %initial : f32
-          linalg.yield %sum : f32
-      } -> tensor<1x?x?x?xf32>
-      iree_tensor_ext.dispatch.tensor.store %final_inner, %final_shaped,
-          offsets = [0, 0, 0, 0],
-          sizes = [1, %output_height_size, %output_width_size, %output_channels_size],
-          strides = [1, 1, 1, 1]
-          : tensor<1x?x?x?xf32>
-          -> !iree_tensor_ext.dispatch.tensor<writeonly:tensor<1x?x?x?xf32>>{
-              %output_height_size, %output_width_size, %output_channels_size}
-      flow.return
-    } count(%output_height_workload: index,
-            %output_width_workload: index,
-            %output_channels_workload: index) -> (index, index, index) {
-      %x, %y, %z = iree_tensor_ext.dispatch.workgroup_count_from_slice(
-          %output_height_workload,
-          %output_width_workload,
-          %output_channels_workload)
-      flow.return %x, %y, %z : index, index, index
-    }
+    // Widen back to f32 and fold in the accumulator initialiser: linalg
+    // defines the op as an update of its init (`O += ...`, `O = max(O, ...)`),
+    // so this is exact for any init. A plain generic, not a pre-formed CPU
+    // dispatch: rocket-pin-unclaimed-dispatches keeps it off the NPU, and
+    // rocket-fold-neutral-init drops the init term when it is the neutral
+    // element, leaving a bare extf that fuses with the consumer's truncf
+    // and cancels -- which is what lets the next Rocket dispatch read this
+    // one's output cube in place (ISSUES.md P2).
+    %final_nhwc_empty = tensor.empty(
+        %output_height, %output_width, %output_channels)
+        : tensor<1x?x?x?xf32>
+    %final_nhwc = linalg.generic {
+        indexing_maps = [
+          affine_map<(d0, d1, d2, d3) -> (d0, d1, d2, d3)>,
+          affine_map<(d0, d1, d2, d3) -> (d0, d1, d2, d3)>,
+          affine_map<(d0, d1, d2, d3) -> (d0, d1, d2, d3)>
+        ],
+        iterator_types = ["parallel", "parallel", "parallel", "parallel"]
+      } ins(%raw_f16, %init_nhwc
+          : tensor<1x?x?x?xf16>, tensor<1x?x?x?xf32>)
+        outs(%final_nhwc_empty : tensor<1x?x?x?xf32>) {
+      ^bb0(%raw: f16, %initial: f32, %out: f32):
+        %raw_f32 = arith.extf %raw : f16 to f32
+        %sum = arith.addf %raw_f32, %initial : f32
+        linalg.yield %sum : f32
+    } -> tensor<1x?x?x?xf32>
 
     // NHWC [1,H,W,C] -> NCHW [1,C,H,W] back again: perm = [0, 3, 1, 2].
     %final_nchw_empty = tensor.empty(%output_channels, %output_height, %output_width) : tensor<1x?x?x?xf32>
@@ -5304,13 +4221,14 @@ module attributes {transform.with_named_sequence} {
         outs(%input_nhwc_empty : tensor<1x?x?x?xf16>)
         permutation = [0, 2, 3, 1]
 
+    %dense_readers_i32 = arith.constant 0 : i32
     %raw_f16 = flow.dispatch
         @rocket_dynamic_depthwise_executable_s2::@rocket_dynamic_depthwise_conv2d_v1::@rocket_dynamic_depthwise_conv2d(
           %input_width_i32, %input_height_i32, %input_channels_i32,
-          %output_channels_i32, %weights_width_i32, %weights_height_i32,
+          %output_channels_i32, %weights_width_i32, %weights_height_i32, %dense_readers_i32,
           %input_nhwc, %filter, %zero_bias)
         {stream.affinity = #hal.device.affinity<@rocket_device>}
-        : (i32, i32, i32, i32, i32, i32,
+        : (i32, i32, i32, i32, i32, i32, i32,
            tensor<1x?x?x?xf16>{%input_height, %input_width, %input_channels},
            tensor<?x?x?xf16>{%input_channels, %weights_height, %weights_width},
            tensor<?xf16>{%output_channels})
@@ -5324,84 +4242,32 @@ module attributes {transform.with_named_sequence} {
         outs(%init_nhwc_empty : tensor<1x?x?x?xf32>)
         permutation = [0, 2, 3, 1]
 
-    %final_nhwc = flow.dispatch.workgroups[
-        %output_height, %output_width, %output_channels](
-        %raw_f16, %init_nhwc, %output_height, %output_width, %output_channels)
-        : (tensor<1x?x?x?xf16>{%output_height, %output_width, %output_channels},
-           tensor<1x?x?x?xf32>{%output_height, %output_width, %output_channels},
-           index, index, index)
-        -> tensor<1x?x?x?xf32>{%output_height, %output_width, %output_channels}
-        attributes { stream.affinity = #hal.device.affinity<@cpu_device> } =
-        (%raw_binding: !iree_tensor_ext.dispatch.tensor<readonly:tensor<1x?x?x?xf16>>,
-         %init_binding: !iree_tensor_ext.dispatch.tensor<readonly:tensor<1x?x?x?xf32>>,
-         %output_height_arg: index,
-         %output_width_arg: index,
-         %output_channels_arg: index,
-         %final_binding: !iree_tensor_ext.dispatch.tensor<writeonly:tensor<1x?x?x?xf32>>) {
-      %output_height_size = iree_tensor_ext.dispatch.workload.ordinal
-          %output_height_arg, 0 : index
-      %output_width_size = iree_tensor_ext.dispatch.workload.ordinal
-          %output_width_arg, 1 : index
-      %output_channels_size = iree_tensor_ext.dispatch.workload.ordinal
-          %output_channels_arg, 2 : index
-      %raw_shaped = flow.dispatch.tie_shape %raw_binding
-          : !iree_tensor_ext.dispatch.tensor<readonly:tensor<1x?x?x?xf16>>{
-              %output_height_size, %output_width_size, %output_channels_size}
-      %init_shaped = flow.dispatch.tie_shape %init_binding
-          : !iree_tensor_ext.dispatch.tensor<readonly:tensor<1x?x?x?xf32>>{
-              %output_height_size, %output_width_size, %output_channels_size}
-      %final_shaped = flow.dispatch.tie_shape %final_binding
-          : !iree_tensor_ext.dispatch.tensor<writeonly:tensor<1x?x?x?xf32>>{
-              %output_height_size, %output_width_size, %output_channels_size}
-      %raw_loaded = iree_tensor_ext.dispatch.tensor.load %raw_shaped,
-          offsets = [0, 0, 0, 0],
-          sizes = [1, %output_height_size, %output_width_size, %output_channels_size],
-          strides = [1, 1, 1, 1]
-          : !iree_tensor_ext.dispatch.tensor<readonly:tensor<1x?x?x?xf16>>{
-              %output_height_size, %output_width_size, %output_channels_size}
-          -> tensor<1x?x?x?xf16>
-      %init_loaded = iree_tensor_ext.dispatch.tensor.load %init_shaped,
-          offsets = [0, 0, 0, 0],
-          sizes = [1, %output_height_size, %output_width_size, %output_channels_size],
-          strides = [1, 1, 1, 1]
-          : !iree_tensor_ext.dispatch.tensor<readonly:tensor<1x?x?x?xf32>>{
-              %output_height_size, %output_width_size, %output_channels_size}
-          -> tensor<1x?x?x?xf32>
-      %final_empty = tensor.empty(
-          %output_height_size, %output_width_size, %output_channels_size)
-          : tensor<1x?x?x?xf32>
-      %final_inner = linalg.generic {
-          indexing_maps = [
-            affine_map<(d0, d1, d2, d3) -> (d0, d1, d2, d3)>,
-            affine_map<(d0, d1, d2, d3) -> (d0, d1, d2, d3)>,
-            affine_map<(d0, d1, d2, d3) -> (d0, d1, d2, d3)>
-          ],
-          iterator_types = ["parallel", "parallel", "parallel", "parallel"]
-        } ins(%raw_loaded, %init_loaded
-            : tensor<1x?x?x?xf16>, tensor<1x?x?x?xf32>)
-          outs(%final_empty : tensor<1x?x?x?xf32>) {
-        ^bb0(%raw: f16, %initial: f32, %out: f32):
-          %raw_f32 = arith.extf %raw : f16 to f32
-          %sum = arith.addf %raw_f32, %initial : f32
-          linalg.yield %sum : f32
-      } -> tensor<1x?x?x?xf32>
-      iree_tensor_ext.dispatch.tensor.store %final_inner, %final_shaped,
-          offsets = [0, 0, 0, 0],
-          sizes = [1, %output_height_size, %output_width_size, %output_channels_size],
-          strides = [1, 1, 1, 1]
-          : tensor<1x?x?x?xf32>
-          -> !iree_tensor_ext.dispatch.tensor<writeonly:tensor<1x?x?x?xf32>>{
-              %output_height_size, %output_width_size, %output_channels_size}
-      flow.return
-    } count(%output_height_workload: index,
-            %output_width_workload: index,
-            %output_channels_workload: index) -> (index, index, index) {
-      %x, %y, %z = iree_tensor_ext.dispatch.workgroup_count_from_slice(
-          %output_height_workload,
-          %output_width_workload,
-          %output_channels_workload)
-      flow.return %x, %y, %z : index, index, index
-    }
+    // Widen back to f32 and fold in the accumulator initialiser: linalg
+    // defines the op as an update of its init (`O += ...`, `O = max(O, ...)`),
+    // so this is exact for any init. A plain generic, not a pre-formed CPU
+    // dispatch: rocket-pin-unclaimed-dispatches keeps it off the NPU, and
+    // rocket-fold-neutral-init drops the init term when it is the neutral
+    // element, leaving a bare extf that fuses with the consumer's truncf
+    // and cancels -- which is what lets the next Rocket dispatch read this
+    // one's output cube in place (ISSUES.md P2).
+    %final_nhwc_empty = tensor.empty(
+        %output_height, %output_width, %output_channels)
+        : tensor<1x?x?x?xf32>
+    %final_nhwc = linalg.generic {
+        indexing_maps = [
+          affine_map<(d0, d1, d2, d3) -> (d0, d1, d2, d3)>,
+          affine_map<(d0, d1, d2, d3) -> (d0, d1, d2, d3)>,
+          affine_map<(d0, d1, d2, d3) -> (d0, d1, d2, d3)>
+        ],
+        iterator_types = ["parallel", "parallel", "parallel", "parallel"]
+      } ins(%raw_f16, %init_nhwc
+          : tensor<1x?x?x?xf16>, tensor<1x?x?x?xf32>)
+        outs(%final_nhwc_empty : tensor<1x?x?x?xf32>) {
+      ^bb0(%raw: f16, %initial: f32, %out: f32):
+        %raw_f32 = arith.extf %raw : f16 to f32
+        %sum = arith.addf %raw_f32, %initial : f32
+        linalg.yield %sum : f32
+    } -> tensor<1x?x?x?xf32>
 
     // NHWC [1,H,W,C] -> NCHW [1,C,H,W] back again: perm = [0, 3, 1, 2].
     %final_nchw_empty = tensor.empty(%output_channels, %output_height, %output_width) : tensor<1x?x?x?xf32>
@@ -5465,13 +4331,14 @@ module attributes {transform.with_named_sequence} {
         outs(%input_nhwc_empty : tensor<1x?x?x?xf16>)
         permutation = [0, 2, 3, 1]
 
+    %dense_readers_i32 = arith.constant 0 : i32
     %raw_f16 = flow.dispatch
         @rocket_dynamic_depthwise_executable_s3::@rocket_dynamic_depthwise_conv2d_v1::@rocket_dynamic_depthwise_conv2d(
           %input_width_i32, %input_height_i32, %input_channels_i32,
-          %output_channels_i32, %weights_width_i32, %weights_height_i32,
+          %output_channels_i32, %weights_width_i32, %weights_height_i32, %dense_readers_i32,
           %input_nhwc, %filter, %zero_bias)
         {stream.affinity = #hal.device.affinity<@rocket_device>}
-        : (i32, i32, i32, i32, i32, i32,
+        : (i32, i32, i32, i32, i32, i32, i32,
            tensor<1x?x?x?xf16>{%input_height, %input_width, %input_channels},
            tensor<?x?x?xf16>{%input_channels, %weights_height, %weights_width},
            tensor<?xf16>{%output_channels})
@@ -5485,84 +4352,32 @@ module attributes {transform.with_named_sequence} {
         outs(%init_nhwc_empty : tensor<1x?x?x?xf32>)
         permutation = [0, 2, 3, 1]
 
-    %final_nhwc = flow.dispatch.workgroups[
-        %output_height, %output_width, %output_channels](
-        %raw_f16, %init_nhwc, %output_height, %output_width, %output_channels)
-        : (tensor<1x?x?x?xf16>{%output_height, %output_width, %output_channels},
-           tensor<1x?x?x?xf32>{%output_height, %output_width, %output_channels},
-           index, index, index)
-        -> tensor<1x?x?x?xf32>{%output_height, %output_width, %output_channels}
-        attributes { stream.affinity = #hal.device.affinity<@cpu_device> } =
-        (%raw_binding: !iree_tensor_ext.dispatch.tensor<readonly:tensor<1x?x?x?xf16>>,
-         %init_binding: !iree_tensor_ext.dispatch.tensor<readonly:tensor<1x?x?x?xf32>>,
-         %output_height_arg: index,
-         %output_width_arg: index,
-         %output_channels_arg: index,
-         %final_binding: !iree_tensor_ext.dispatch.tensor<writeonly:tensor<1x?x?x?xf32>>) {
-      %output_height_size = iree_tensor_ext.dispatch.workload.ordinal
-          %output_height_arg, 0 : index
-      %output_width_size = iree_tensor_ext.dispatch.workload.ordinal
-          %output_width_arg, 1 : index
-      %output_channels_size = iree_tensor_ext.dispatch.workload.ordinal
-          %output_channels_arg, 2 : index
-      %raw_shaped = flow.dispatch.tie_shape %raw_binding
-          : !iree_tensor_ext.dispatch.tensor<readonly:tensor<1x?x?x?xf16>>{
-              %output_height_size, %output_width_size, %output_channels_size}
-      %init_shaped = flow.dispatch.tie_shape %init_binding
-          : !iree_tensor_ext.dispatch.tensor<readonly:tensor<1x?x?x?xf32>>{
-              %output_height_size, %output_width_size, %output_channels_size}
-      %final_shaped = flow.dispatch.tie_shape %final_binding
-          : !iree_tensor_ext.dispatch.tensor<writeonly:tensor<1x?x?x?xf32>>{
-              %output_height_size, %output_width_size, %output_channels_size}
-      %raw_loaded = iree_tensor_ext.dispatch.tensor.load %raw_shaped,
-          offsets = [0, 0, 0, 0],
-          sizes = [1, %output_height_size, %output_width_size, %output_channels_size],
-          strides = [1, 1, 1, 1]
-          : !iree_tensor_ext.dispatch.tensor<readonly:tensor<1x?x?x?xf16>>{
-              %output_height_size, %output_width_size, %output_channels_size}
-          -> tensor<1x?x?x?xf16>
-      %init_loaded = iree_tensor_ext.dispatch.tensor.load %init_shaped,
-          offsets = [0, 0, 0, 0],
-          sizes = [1, %output_height_size, %output_width_size, %output_channels_size],
-          strides = [1, 1, 1, 1]
-          : !iree_tensor_ext.dispatch.tensor<readonly:tensor<1x?x?x?xf32>>{
-              %output_height_size, %output_width_size, %output_channels_size}
-          -> tensor<1x?x?x?xf32>
-      %final_empty = tensor.empty(
-          %output_height_size, %output_width_size, %output_channels_size)
-          : tensor<1x?x?x?xf32>
-      %final_inner = linalg.generic {
-          indexing_maps = [
-            affine_map<(d0, d1, d2, d3) -> (d0, d1, d2, d3)>,
-            affine_map<(d0, d1, d2, d3) -> (d0, d1, d2, d3)>,
-            affine_map<(d0, d1, d2, d3) -> (d0, d1, d2, d3)>
-          ],
-          iterator_types = ["parallel", "parallel", "parallel", "parallel"]
-        } ins(%raw_loaded, %init_loaded
-            : tensor<1x?x?x?xf16>, tensor<1x?x?x?xf32>)
-          outs(%final_empty : tensor<1x?x?x?xf32>) {
-        ^bb0(%raw: f16, %initial: f32, %out: f32):
-          %raw_f32 = arith.extf %raw : f16 to f32
-          %sum = arith.addf %raw_f32, %initial : f32
-          linalg.yield %sum : f32
-      } -> tensor<1x?x?x?xf32>
-      iree_tensor_ext.dispatch.tensor.store %final_inner, %final_shaped,
-          offsets = [0, 0, 0, 0],
-          sizes = [1, %output_height_size, %output_width_size, %output_channels_size],
-          strides = [1, 1, 1, 1]
-          : tensor<1x?x?x?xf32>
-          -> !iree_tensor_ext.dispatch.tensor<writeonly:tensor<1x?x?x?xf32>>{
-              %output_height_size, %output_width_size, %output_channels_size}
-      flow.return
-    } count(%output_height_workload: index,
-            %output_width_workload: index,
-            %output_channels_workload: index) -> (index, index, index) {
-      %x, %y, %z = iree_tensor_ext.dispatch.workgroup_count_from_slice(
-          %output_height_workload,
-          %output_width_workload,
-          %output_channels_workload)
-      flow.return %x, %y, %z : index, index, index
-    }
+    // Widen back to f32 and fold in the accumulator initialiser: linalg
+    // defines the op as an update of its init (`O += ...`, `O = max(O, ...)`),
+    // so this is exact for any init. A plain generic, not a pre-formed CPU
+    // dispatch: rocket-pin-unclaimed-dispatches keeps it off the NPU, and
+    // rocket-fold-neutral-init drops the init term when it is the neutral
+    // element, leaving a bare extf that fuses with the consumer's truncf
+    // and cancels -- which is what lets the next Rocket dispatch read this
+    // one's output cube in place (ISSUES.md P2).
+    %final_nhwc_empty = tensor.empty(
+        %output_height, %output_width, %output_channels)
+        : tensor<1x?x?x?xf32>
+    %final_nhwc = linalg.generic {
+        indexing_maps = [
+          affine_map<(d0, d1, d2, d3) -> (d0, d1, d2, d3)>,
+          affine_map<(d0, d1, d2, d3) -> (d0, d1, d2, d3)>,
+          affine_map<(d0, d1, d2, d3) -> (d0, d1, d2, d3)>
+        ],
+        iterator_types = ["parallel", "parallel", "parallel", "parallel"]
+      } ins(%raw_f16, %init_nhwc
+          : tensor<1x?x?x?xf16>, tensor<1x?x?x?xf32>)
+        outs(%final_nhwc_empty : tensor<1x?x?x?xf32>) {
+      ^bb0(%raw: f16, %initial: f32, %out: f32):
+        %raw_f32 = arith.extf %raw : f16 to f32
+        %sum = arith.addf %raw_f32, %initial : f32
+        linalg.yield %sum : f32
+    } -> tensor<1x?x?x?xf32>
 
     // NHWC [1,H,W,C] -> NCHW [1,C,H,W] back again: perm = [0, 3, 1, 2].
     %final_nchw_empty = tensor.empty(%output_channels, %output_height, %output_width) : tensor<1x?x?x?xf32>
@@ -5626,13 +4441,14 @@ module attributes {transform.with_named_sequence} {
         outs(%input_nhwc_empty : tensor<1x?x?x?xf16>)
         permutation = [0, 2, 3, 1]
 
+    %dense_readers_i32 = arith.constant 0 : i32
     %raw_f16 = flow.dispatch
         @rocket_dynamic_depthwise_executable_s4::@rocket_dynamic_depthwise_conv2d_v1::@rocket_dynamic_depthwise_conv2d(
           %input_width_i32, %input_height_i32, %input_channels_i32,
-          %output_channels_i32, %weights_width_i32, %weights_height_i32,
+          %output_channels_i32, %weights_width_i32, %weights_height_i32, %dense_readers_i32,
           %input_nhwc, %filter, %zero_bias)
         {stream.affinity = #hal.device.affinity<@rocket_device>}
-        : (i32, i32, i32, i32, i32, i32,
+        : (i32, i32, i32, i32, i32, i32, i32,
            tensor<1x?x?x?xf16>{%input_height, %input_width, %input_channels},
            tensor<?x?x?xf16>{%input_channels, %weights_height, %weights_width},
            tensor<?xf16>{%output_channels})
@@ -5646,84 +4462,32 @@ module attributes {transform.with_named_sequence} {
         outs(%init_nhwc_empty : tensor<1x?x?x?xf32>)
         permutation = [0, 2, 3, 1]
 
-    %final_nhwc = flow.dispatch.workgroups[
-        %output_height, %output_width, %output_channels](
-        %raw_f16, %init_nhwc, %output_height, %output_width, %output_channels)
-        : (tensor<1x?x?x?xf16>{%output_height, %output_width, %output_channels},
-           tensor<1x?x?x?xf32>{%output_height, %output_width, %output_channels},
-           index, index, index)
-        -> tensor<1x?x?x?xf32>{%output_height, %output_width, %output_channels}
-        attributes { stream.affinity = #hal.device.affinity<@cpu_device> } =
-        (%raw_binding: !iree_tensor_ext.dispatch.tensor<readonly:tensor<1x?x?x?xf16>>,
-         %init_binding: !iree_tensor_ext.dispatch.tensor<readonly:tensor<1x?x?x?xf32>>,
-         %output_height_arg: index,
-         %output_width_arg: index,
-         %output_channels_arg: index,
-         %final_binding: !iree_tensor_ext.dispatch.tensor<writeonly:tensor<1x?x?x?xf32>>) {
-      %output_height_size = iree_tensor_ext.dispatch.workload.ordinal
-          %output_height_arg, 0 : index
-      %output_width_size = iree_tensor_ext.dispatch.workload.ordinal
-          %output_width_arg, 1 : index
-      %output_channels_size = iree_tensor_ext.dispatch.workload.ordinal
-          %output_channels_arg, 2 : index
-      %raw_shaped = flow.dispatch.tie_shape %raw_binding
-          : !iree_tensor_ext.dispatch.tensor<readonly:tensor<1x?x?x?xf16>>{
-              %output_height_size, %output_width_size, %output_channels_size}
-      %init_shaped = flow.dispatch.tie_shape %init_binding
-          : !iree_tensor_ext.dispatch.tensor<readonly:tensor<1x?x?x?xf32>>{
-              %output_height_size, %output_width_size, %output_channels_size}
-      %final_shaped = flow.dispatch.tie_shape %final_binding
-          : !iree_tensor_ext.dispatch.tensor<writeonly:tensor<1x?x?x?xf32>>{
-              %output_height_size, %output_width_size, %output_channels_size}
-      %raw_loaded = iree_tensor_ext.dispatch.tensor.load %raw_shaped,
-          offsets = [0, 0, 0, 0],
-          sizes = [1, %output_height_size, %output_width_size, %output_channels_size],
-          strides = [1, 1, 1, 1]
-          : !iree_tensor_ext.dispatch.tensor<readonly:tensor<1x?x?x?xf16>>{
-              %output_height_size, %output_width_size, %output_channels_size}
-          -> tensor<1x?x?x?xf16>
-      %init_loaded = iree_tensor_ext.dispatch.tensor.load %init_shaped,
-          offsets = [0, 0, 0, 0],
-          sizes = [1, %output_height_size, %output_width_size, %output_channels_size],
-          strides = [1, 1, 1, 1]
-          : !iree_tensor_ext.dispatch.tensor<readonly:tensor<1x?x?x?xf32>>{
-              %output_height_size, %output_width_size, %output_channels_size}
-          -> tensor<1x?x?x?xf32>
-      %final_empty = tensor.empty(
-          %output_height_size, %output_width_size, %output_channels_size)
-          : tensor<1x?x?x?xf32>
-      %final_inner = linalg.generic {
-          indexing_maps = [
-            affine_map<(d0, d1, d2, d3) -> (d0, d1, d2, d3)>,
-            affine_map<(d0, d1, d2, d3) -> (d0, d1, d2, d3)>,
-            affine_map<(d0, d1, d2, d3) -> (d0, d1, d2, d3)>
-          ],
-          iterator_types = ["parallel", "parallel", "parallel", "parallel"]
-        } ins(%raw_loaded, %init_loaded
-            : tensor<1x?x?x?xf16>, tensor<1x?x?x?xf32>)
-          outs(%final_empty : tensor<1x?x?x?xf32>) {
-        ^bb0(%raw: f16, %initial: f32, %out: f32):
-          %raw_f32 = arith.extf %raw : f16 to f32
-          %sum = arith.addf %raw_f32, %initial : f32
-          linalg.yield %sum : f32
-      } -> tensor<1x?x?x?xf32>
-      iree_tensor_ext.dispatch.tensor.store %final_inner, %final_shaped,
-          offsets = [0, 0, 0, 0],
-          sizes = [1, %output_height_size, %output_width_size, %output_channels_size],
-          strides = [1, 1, 1, 1]
-          : tensor<1x?x?x?xf32>
-          -> !iree_tensor_ext.dispatch.tensor<writeonly:tensor<1x?x?x?xf32>>{
-              %output_height_size, %output_width_size, %output_channels_size}
-      flow.return
-    } count(%output_height_workload: index,
-            %output_width_workload: index,
-            %output_channels_workload: index) -> (index, index, index) {
-      %x, %y, %z = iree_tensor_ext.dispatch.workgroup_count_from_slice(
-          %output_height_workload,
-          %output_width_workload,
-          %output_channels_workload)
-      flow.return %x, %y, %z : index, index, index
-    }
+    // Widen back to f32 and fold in the accumulator initialiser: linalg
+    // defines the op as an update of its init (`O += ...`, `O = max(O, ...)`),
+    // so this is exact for any init. A plain generic, not a pre-formed CPU
+    // dispatch: rocket-pin-unclaimed-dispatches keeps it off the NPU, and
+    // rocket-fold-neutral-init drops the init term when it is the neutral
+    // element, leaving a bare extf that fuses with the consumer's truncf
+    // and cancels -- which is what lets the next Rocket dispatch read this
+    // one's output cube in place (ISSUES.md P2).
+    %final_nhwc_empty = tensor.empty(
+        %output_height, %output_width, %output_channels)
+        : tensor<1x?x?x?xf32>
+    %final_nhwc = linalg.generic {
+        indexing_maps = [
+          affine_map<(d0, d1, d2, d3) -> (d0, d1, d2, d3)>,
+          affine_map<(d0, d1, d2, d3) -> (d0, d1, d2, d3)>,
+          affine_map<(d0, d1, d2, d3) -> (d0, d1, d2, d3)>
+        ],
+        iterator_types = ["parallel", "parallel", "parallel", "parallel"]
+      } ins(%raw_f16, %init_nhwc
+          : tensor<1x?x?x?xf16>, tensor<1x?x?x?xf32>)
+        outs(%final_nhwc_empty : tensor<1x?x?x?xf32>) {
+      ^bb0(%raw: f16, %initial: f32, %out: f32):
+        %raw_f32 = arith.extf %raw : f16 to f32
+        %sum = arith.addf %raw_f32, %initial : f32
+        linalg.yield %sum : f32
+    } -> tensor<1x?x?x?xf32>
 
     // NHWC [1,H,W,C] -> NCHW [1,C,H,W] back again: perm = [0, 3, 1, 2].
     %final_nchw_empty = tensor.empty(%output_channels, %output_height, %output_width) : tensor<1x?x?x?xf32>
@@ -5786,13 +4550,14 @@ module attributes {transform.with_named_sequence} {
     %zero_bias = linalg.fill ins(%zero_i32 : i32)
         outs(%zero_bias_empty : tensor<?xi32>) -> tensor<?xi32>
 
+    %dense_readers_i32 = arith.constant 0 : i32
     %raw_i32 = flow.dispatch
         @rocket_dynamic_int8_executable::@rocket_dynamic_conv2d_v1::@rocket_dynamic_conv2d(
           %input_width_i32, %input_height_i32, %input_channels_i32,
-          %output_channels_i32, %weights_width_i32, %weights_height_i32,
+          %output_channels_i32, %weights_width_i32, %weights_height_i32, %dense_readers_i32,
           %input, %filter, %zero_bias)
         {stream.affinity = #hal.device.affinity<@rocket_device>}
-        : (i32, i32, i32, i32, i32, i32,
+        : (i32, i32, i32, i32, i32, i32, i32,
            tensor<1x?x?x?xi8>{%input_height, %input_width, %input_channels},
            tensor<?x?x?x?xi8>{%weights_height, %weights_width, %input_channels, %output_channels},
            tensor<?xi32>{%output_channels})
@@ -5893,14 +4658,15 @@ module attributes {transform.with_named_sequence} {
     %schema_output_scale = arith.divf %one, %output_scale : f32
     %output_scale_i32 = arith.bitcast %schema_output_scale : f32 to i32
 
+    %dense_readers_i32 = arith.constant 0 : i32
     %quantized = flow.dispatch
         @rocket_dynamic_int8_requant_executable::@rocket_dynamic_conv2d_v1::@rocket_dynamic_conv2d(
           %input_width_i32, %input_height_i32, %input_channels_i32,
           %output_channels_i32, %weights_width_i32, %weights_height_i32,
-          %output_scale_i32, %output_zero_point,
+          %output_scale_i32, %output_zero_point, %dense_readers_i32,
           %input, %filter, %bias)
         {stream.affinity = #hal.device.affinity<@rocket_device>}
-        : (i32, i32, i32, i32, i32, i32, i32, i32,
+        : (i32, i32, i32, i32, i32, i32, i32, i32, i32,
            tensor<1x?x?x?xi8>{%input_height, %input_width, %input_channels},
            tensor<?x?x?x?xi8>{%weights_height, %weights_width, %input_channels, %output_channels},
            tensor<?xi32>{%output_channels})
@@ -5964,14 +4730,15 @@ module attributes {transform.with_named_sequence} {
         outs(%filter_chw_empty : tensor<?x?x?xi8>)
         permutation = [2, 0, 1]
 
+    %dense_readers_i32 = arith.constant 0 : i32
     %quantized = flow.dispatch
         @rocket_dynamic_depthwise_int8_requant_executable::@rocket_dynamic_depthwise_conv2d_v1::@rocket_dynamic_depthwise_conv2d(
           %input_width_i32, %input_height_i32, %input_channels_i32,
           %output_channels_i32, %weights_width_i32, %weights_height_i32,
-          %output_scale_i32, %output_zero_point,
+          %output_scale_i32, %output_zero_point, %dense_readers_i32,
           %input, %filter_chw, %bias)
         {stream.affinity = #hal.device.affinity<@rocket_device>}
-        : (i32, i32, i32, i32, i32, i32, i32, i32,
+        : (i32, i32, i32, i32, i32, i32, i32, i32, i32,
            tensor<1x?x?x?xi8>{%input_height, %input_width, %input_channels},
            tensor<?x?x?xi8>{%input_channels, %weights_height, %weights_width},
            tensor<?xi32>{%output_channels})
@@ -6029,13 +4796,14 @@ module attributes {transform.with_named_sequence} {
         outs(%filter_chw_empty : tensor<?x?x?xi8>)
         permutation = [2, 0, 1]
 
+    %dense_readers_i32 = arith.constant 0 : i32
     %raw_i32 = flow.dispatch
         @rocket_dynamic_depthwise_int8_executable::@rocket_dynamic_depthwise_conv2d_v1::@rocket_dynamic_depthwise_conv2d(
           %input_width_i32, %input_height_i32, %input_channels_i32,
-          %output_channels_i32, %weights_width_i32, %weights_height_i32,
+          %output_channels_i32, %weights_width_i32, %weights_height_i32, %dense_readers_i32,
           %input, %filter_chw, %zero_bias)
         {stream.affinity = #hal.device.affinity<@rocket_device>}
-        : (i32, i32, i32, i32, i32, i32,
+        : (i32, i32, i32, i32, i32, i32, i32,
            tensor<1x?x?x?xi8>{%input_height, %input_width, %input_channels},
            tensor<?x?x?xi8>{%input_channels, %weights_height, %weights_width},
            tensor<?xi32>{%output_channels})
@@ -6133,13 +4901,14 @@ module attributes {transform.with_named_sequence} {
         outs(%filter_chw_empty : tensor<?x?x?xi8>)
         permutation = [2, 0, 1]
 
+    %dense_readers_i32 = arith.constant 0 : i32
     %raw_i32 = flow.dispatch
         @rocket_dynamic_depthwise_int8_executable_s2::@rocket_dynamic_depthwise_conv2d_v1::@rocket_dynamic_depthwise_conv2d(
           %input_width_i32, %input_height_i32, %input_channels_i32,
-          %output_channels_i32, %weights_width_i32, %weights_height_i32,
+          %output_channels_i32, %weights_width_i32, %weights_height_i32, %dense_readers_i32,
           %input, %filter_chw, %zero_bias)
         {stream.affinity = #hal.device.affinity<@rocket_device>}
-        : (i32, i32, i32, i32, i32, i32,
+        : (i32, i32, i32, i32, i32, i32, i32,
            tensor<1x?x?x?xi8>{%input_height, %input_width, %input_channels},
            tensor<?x?x?xi8>{%input_channels, %weights_height, %weights_width},
            tensor<?xi32>{%output_channels})
@@ -10721,7 +9490,22 @@ module attributes {transform.with_named_sequence} {
         "inline" to %promoted_module
       : (!transform.any_op) -> !transform.any_op
 
-    transform.apply_dce to %inlined_module : !transform.any_op
+    // Every shim widens its f16 result with a generic that also folds in the
+    // linalg accumulator init (`extf(raw) + init`, `max(extf(raw), init)`).
+    // Now that the shims are inlined, that init is the caller's
+    // `linalg.fill` and its constant is visible; when it is the neutral
+    // element -- as under every imported convolution, matmul and max pool --
+    // the term is dropped, leaving a bare extf that IREE fuses with the
+    // consumer's truncf and cancels, so two Rocket dispatches end up
+    // adjacent and the driver can chain them. Before inlining the init is a
+    // function argument and nothing can be proved about it; after IREE's
+    // own fusion it is a scalar `+ 0.0` inside a generic, which arith never
+    // folds (it would change -0.0). See RocketFoldNeutralInitPass.cpp.
+    %folded_module = transform.apply_registered_pass
+        "rocket-fold-neutral-init" to %inlined_module
+      : (!transform.any_op) -> !transform.any_op
+
+    transform.apply_dce to %folded_module : !transform.any_op
     transform.yield
   }
 }
