@@ -5856,53 +5856,10 @@ module attributes {transform.with_named_sequence} {
     transform.iree.match.dims_equal %strides, [1, 1] : !transform.param<i64>
     transform.iree.match.dims_equal %dilations, [1, 1] : !transform.param<i64>
 
-    // Cin remains capped at 512 and Cout is capped well below
-    // MAX_OUTPUT_CHANNELS (528). This is hardware-verified, not a guess: an
-    // is hardware-verified, not a guess: an isolated correctness probe
-    // (iree-rocket-hal/tests/conv_cbuf_split_sweep_hw.rs and
-    // conv_features19_isolated_hw.rs), run in isolation on real Planck
-    // hardware with a fill-1.0/exact-expected-value check (not just
-    // "did it time out"), found:
-    //
-    //   Cout  64/128/256 (Cin 3, 64, 128, 256; banks 11/1, 9/3, 7/5, 3/9,
-    //         1/11 all covered)          -> correct, 5/5 every rep
-    //   Cout  512 (Cin 256 -- features.19; Cin 512 -- features.21; both
-    //         30x30, banks 11/1)         -> all-zero output, 0/5 every
-    //                                        rep, deterministic
-    //
-    // IMPORTANT CAVEAT, found later by a real-compiler-path harness
-    // (rocket_conv_harness.py in iree-rocket-design-spike) plus a follow-up
-    // extent_sweep_at_fixed_channels sweep in
-    // conv_cbuf_split_sweep_hw.rs: Cout is not actually the discriminator.
-    // Cin=256/Cout=256/3x3 -- comfortably inside this bound -- is ALSO
-    // deterministically all-zero (0/5, every output element wrong) across
-    // every spatial extent from 26x26 to 48x48, because ConvPlan picks the
-    // same 11/1 split there that it picks for the broken Cout=512 shapes
-    // above; extents 20-24 (banks 7/5, 9/3) and 50-58 (banks 1/11) at the
-    // SAME channel counts pass 5/5, and the pass/fail boundary lines up
-    // exactly with ConvPlan's split-flip points, with zero fuzziness. The
-    // real discriminator is an 11/1-style split combined with a large
-    // coefficient footprint: features.0 (Cin=3/Cout=64, footprint
-    // 3*3*3*64 = 1728 elements) also gets an 11/1 split and is fine, while
-    // Cin=256/Cout=256 (footprint 3*3*256*256 = 589824 elements) at that
-    // same split is broken everywhere it occurs. This bound is still safe
-    // for VGG specifically -- none of its real Cout<=256 layers land on an
-    // 11/1 split at a large-footprint channel count -- but that is a
-    // property of VGG's specific shapes, not a guarantee this Cout<=256
-    // rule provides in general. A future model (or a wider matcher) could
-    // reintroduce this exact bug at Cout<=256 with the wrong spatial
-    // extent. See DESIGN_NOTES.md for the full characterization.
-    //
-    // This is the same class of bug DESIGN_NOTES.md documents for 9x9/11x11
-    // -- ConvPlan's demand-based CBUF formula picks a split based on raw
-    // byte demand, but the real vendor coefficient-streaming schedule for
-    // high-pressure shapes isn't decoded, so an unvalidated split doesn't
-    // fail loudly, it silently completes with all-zero output. A live
-    // rocket-npu-trace initially suggested this was a timing/idle-gap
-    // issue (every failure followed an anomalously long idle gap on that
-    // core) -- ruled out by this same isolated probe: the shape fails
-    // identically as a fresh first job, after a sustained warmup burst,
-    // and after a deliberate idle gap. It is the shape, not the timing.
+    // A 3x3 CBUF-split hazard used to be recorded here verbatim from
+    // @match_dynamic_conv2d_3x3 (an all-zero Cin=256/Cout=256/3x3 at
+    // 26x26..48x48). It is closed -- ISSUES.md C12, 2026-09-08 -- and never
+    // applied to a 1x1 kernel; see that matcher for the current state.
     %input_value = transform.get_operand %root[0] : (!transform.any_op) -> !transform.any_value
     %filter_value = transform.get_operand %root[1] : (!transform.any_op) -> !transform.any_value
     // The HAL's `MAX_INPUT_CHANNELS`, raised 512 -> 1344 (2026-09-03) on
@@ -5956,52 +5913,21 @@ module attributes {transform.with_named_sequence} {
     transform.iree.match.dims_equal %strides, [1, 1] : !transform.param<i64>
     transform.iree.match.dims_equal %dilations, [1, 1] : !transform.param<i64>
 
-    // Cout is capped well below MAX_OUTPUT_CHANNELS (512); Cin is not. This
-    // is hardware-verified, not a guess: an isolated correctness probe
-    // (iree-rocket-hal/tests/conv_cbuf_split_sweep_hw.rs and
-    // conv_features19_isolated_hw.rs), run in isolation on real Planck
-    // hardware with a fill-1.0/exact-expected-value check (not just
-    // "did it time out"), found:
-    //
-    //   Cout  64/128/256 (Cin 3, 64, 128, 256; banks 11/1, 9/3, 7/5, 3/9,
-    //         1/11 all covered)          -> correct, 5/5 every rep
-    //   Cout  512 (Cin 256 -- features.19; Cin 512 -- features.21; both
-    //         30x30, banks 11/1)         -> all-zero output, 0/5 every
-    //                                        rep, deterministic
-    //
-    // IMPORTANT CAVEAT, found later by a real-compiler-path harness
-    // (rocket_conv_harness.py in iree-rocket-design-spike) plus a follow-up
-    // extent_sweep_at_fixed_channels sweep in
-    // conv_cbuf_split_sweep_hw.rs: Cout is not actually the discriminator.
-    // Cin=256/Cout=256/3x3 -- comfortably inside this bound -- is ALSO
-    // deterministically all-zero (0/5, every output element wrong) across
-    // every spatial extent from 26x26 to 48x48, because ConvPlan picks the
-    // same 11/1 split there that it picks for the broken Cout=512 shapes
-    // above; extents 20-24 (banks 7/5, 9/3) and 50-58 (banks 1/11) at the
-    // SAME channel counts pass 5/5, and the pass/fail boundary lines up
-    // exactly with ConvPlan's split-flip points, with zero fuzziness. The
-    // real discriminator is an 11/1-style split combined with a large
-    // coefficient footprint: features.0 (Cin=3/Cout=64, footprint
-    // 3*3*3*64 = 1728 elements) also gets an 11/1 split and is fine, while
-    // Cin=256/Cout=256 (footprint 3*3*256*256 = 589824 elements) at that
-    // same split is broken everywhere it occurs. This bound is still safe
-    // for VGG specifically -- none of its real Cout<=256 layers land on an
-    // 11/1 split at a large-footprint channel count -- but that is a
-    // property of VGG's specific shapes, not a guarantee this Cout<=256
-    // rule provides in general. A future model (or a wider matcher) could
-    // reintroduce this exact bug at Cout<=256 with the wrong spatial
-    // extent. See DESIGN_NOTES.md for the full characterization.
-    //
-    // This is the same class of bug DESIGN_NOTES.md documents for 9x9/11x11
-    // -- ConvPlan's demand-based CBUF formula picks a split based on raw
-    // byte demand, but the real vendor coefficient-streaming schedule for
-    // high-pressure shapes isn't decoded, so an unvalidated split doesn't
-    // fail loudly, it silently completes with all-zero output. A live
-    // rocket-npu-trace initially suggested this was a timing/idle-gap
-    // issue (every failure followed an anomalously long idle gap on that
-    // core) -- ruled out by this same isolated probe: the shape fails
-    // identically as a fresh first job, after a sustained warmup burst,
-    // and after a deliberate idle gap. It is the shape, not the timing.
+    // The CBUF-split hazard this comment used to carry is closed (ISSUES.md
+    // C12, 2026-09-08). An early planner granted Cin=256/Cout=256/3x3 a
+    // single coefficient bank at every extent from 26x26 to 48x48 and those
+    // jobs came back all-zero. That was a starved coefficient grant killed
+    // by the watchdog and read as a shape result before C3 existed: forcing
+    // the same 11/1 (or 10/2) back today with ROCKET_CBUF_SPLIT is a device
+    // timeout with the output unwritten, while 9/3 and 8/4 are exact. The
+    // planner has granted the streamed working set -- five banks here, 7/5
+    // at every extent from 20 to 58 -- since streamed_weight_bank_preference
+    // landed, the shape is exact on planck at every one of those extents at
+    // fp16 and int8 under the selectors and dense patterns, and
+    // dense_k3_plan_never_starves_the_streamed_coefficient_working_set pins
+    // the grant on the host. No wire field can force a split, so a compiled
+    // model can only reach ConvPlan::new. The bounds below are channel
+    // bounds; there is no spatial caveat left on this matcher.
     %input_value = transform.get_operand %root[0] : (!transform.any_op) -> !transform.any_value
     %filter_value = transform.get_operand %root[1] : (!transform.any_op) -> !transform.any_value
     // 1152, not `MAX_INPUT_CHANNELS` (3584 since 2026-09-06): at a 3x3
@@ -6015,10 +5941,9 @@ module attributes {transform.with_named_sequence} {
     transform.yield %root : !transform.any_op
   }
 
-  // Stride-2 counterpart of @match_dynamic_conv2d -- same 1x1 kernel and Cout/Cin
-  // <= 512 bound (see that matcher's own doc comment for the
-  // full CBUF-split correctness caveat, which applies identically here: it
-  // is a property of channel count and coefficient footprint, not stride).
+  // Stride-2 counterpart of @match_dynamic_conv2d -- same 1x1 kernel and the
+  // same channel bounds (the CBUF-split caveat that used to be cross-referenced
+  // here is closed, ISSUES.md C12).
   // What's new is `%strides` = [2, 2] instead of [1, 1] -- hardware-
   // confirmed dense fp16 at stride 2 by conv_wide_shape_hw.rs (see
   // DESIGN_NOTES.md "Stride and large-width sweeps").

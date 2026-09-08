@@ -26,7 +26,8 @@ run but no compiled model can reach yet. One of its phases is gated on an
 issue here by name: P8's measured per-dispatch cost is why its coverage
 matchers land behind a flag. C5, which used to gate the LUT path in a compiled
 model, was resolved 2026-09-06, and C2 and P6 on 2026-09-07 -- see
-**Resolved**. ROADMAP's fused-activation row landed the same day, which is
+**Resolved**. C12 (2026-09-08) is there too: the one hazard LIMITS.md and
+DYNAMIC_SHAPES.md carried that this file did not, closed by measurement. ROADMAP's fused-activation row landed the same day, which is
 what moved P7's and P2's numbers below.
 
 Trimmed 2026-09-05: issues that are settled were cut down to one entry each
@@ -1245,6 +1246,31 @@ What was settled and how, newest first, in place of the narratives — those are
 in this file's git history (`git log -p ISSUES.md`). Everything cited below is
 something that still exists: a commit, a file, or a memory.
 
+**C12 (S1) — 2026-09-08. The "11/1 silent-zero" 3x3 hazard was a
+watchdog-killed job on a planner that no longer exists.** LIMITS.md's
+*Hazards inside the limits* carried, and DYNAMIC_SHAPES.md DS3 escalated,
+a finding this file never tracked: `Cin`=256/`Cout`=256/3x3 at 26x26 through
+48x48 deterministically all-zero on an 11/1 CBUF split, recorded in
+`@match_dynamic_conv2d_3x3`'s comment against a `Cout<=256` rule since widened
+to 1792, with both evidence files gone from the tree. Re-measured on `planck`,
+one extent per process: the current planner grants the shape **7/5 at every
+extent from 20 to 58** (the streamed working set is five banks), and every
+one is exact -- fp16 under `selectors` and `dense`, int8 under
+`selectors-affine`. Forcing the old split back with `ROCKET_CBUF_SPLIT` at
+30x30 brackets the mechanism: **9/3 and 8/4 exact, 10/2 and 11/1 a device
+timeout** with the output unwritten (`0xa5a5` sentinel, `tile_mismatches`
+covering every element), and the device clean afterwards. So the fault was a
+starved coefficient grant -- the same class as C9 -- and the "all-zero
+output" was the pre-C3 harness zero-filling a killed job and reading it as a
+shape result. `streamed_weight_bank_preference` has prevented the grant since
+it landed; `dense_k3_plan_never_starves_the_streamed_coefficient_working_set`
+now pins it across both precisions, `Cin` 64..512, `Cout` 64..512 and every
+even extent 8..64; no wire field can force a split, so a compiled model can
+only reach `ConvPlan::new`. No runtime refusal was needed. Spec comments (both
+copies), LIMITS.md and DYNAMIC_SHAPES.md corrected. Not a fix, a closure --
+which is the point: a hazard nothing tracked cost a doc a severity it had not
+had for a month.
+
 **C9 (S2) — 2026-09-07. Neither half was what it looked like.** The `Cin`
 cliff above 3x3 — a watchdog kill at ~500 ms, read as a hardware ceiling — was
 our own CBUF split. The above-3x3 policies are read off the fp16 capture sweep
@@ -1532,7 +1558,7 @@ Where the time actually is, per inference: `outside` **70.9 ms (54%)**,
    tripled the above-3x3 `Cin` ceilings and one a retraction.
 
 Done and in **Resolved**: the requantized int8 path (2026-09-06), C2
-(2026-09-07), P6 (2026-09-07), C9 (2026-09-07).
+(2026-09-07), P6 (2026-09-07), C9 (2026-09-07), C12 (2026-09-08).
 
 ---
 

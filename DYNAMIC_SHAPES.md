@@ -225,42 +225,26 @@ let (resolved_shape, kernels) = match executable.resolve_shape(constants) {
 runtime CPU fallback**. An out-of-envelope invocation is a hard
 `iree-run-module` failure, not a slow success.
 
-### The part that is S1, not S3 -- and is reachable now
+### The part that was S1 -- measured and closed 2026-09-08
 
-`@match_dynamic_conv2d_3x3`'s own comment says the Cout bound is not the real
-discriminator for the all-zero-output bug (the same comment is duplicated
-verbatim in `@match_dynamic_conv2d`, but its content -- `features.0`,
-`features.19`, a 3x3 footprint -- is about the 3x3 matcher):
+This section used to carry a live S1: `@match_dynamic_conv2d_3x3`'s own
+comment recorded `Cin=256`/`Cout=256`/3x3 at 26x26 through 48x48 as
+deterministically all-zero on an 11/1 CBUF split, the `Cout<=256` rule that
+comment reasoned about had since been widened to 1792, and the evidence files
+it cited were gone from the tree -- so the shape was inside the bounds in
+force with static extents and nothing tracked it.
 
-> The real discriminator is an 11/1-style split combined with a large
-> coefficient footprint [...] This bound is still safe for VGG specifically --
-> none of its real Cout<=256 layers land on an 11/1 split at a large-footprint
-> channel count -- but that is a property of VGG's specific shapes, not a
-> guarantee this Cout<=256 rule provides in general.
-
-**That `Cout<=256` rule no longer exists** [verified]. `@match_dynamic_conv2d_3x3`
-now bounds Cin at 1152 and Cout at 1792 (spec `:6013`, `:6014`), so
-`Cin=256`/`Cout=256`/3x3 at 26x26 through 48x48 -- the exact shape the comment
-calls deterministically all-zero -- is comfortably inside the bounds in force,
-with fully static extents. The comment's reasoning describes a matcher that was
-narrowed away from underneath it. [LIMITS.md](LIMITS.md) `:493` already records
-this as an open hazard in the same terms, and adds that the
-`conv_cbuf_split_sweep_hw.rs` and `DESIGN_NOTES.md` the comment cites as its
-evidence are both gone from this tree.
-
-`validate_conv_shape` only runs `ConvPlan::new` and asks whether it panicked
-[verified]. The 11/1-split-plus-large-footprint case does not panic -- it
-plans, dispatches, and returns all zeros. So a convolution that lands there
-produces **silently wrong output**, which is the one outcome this repo's design
-notes consistently rank worst.
-
-**This is a live defect, not a prerequisite this file creates.** Symbolic
-extents widen the exposure -- an in-envelope model could reach the bad split on
-one invocation's resolution and not another's -- but they do not open it.
-`ConvPlan` (or `validate_conv_shape` on top of it) needs an explicit refusal
-for that split at a large coefficient footprint, so a case that is today
-*silently wrong* becomes *rejected-by-runtime*. Because the evidence files are
-gone, the first step is re-measuring the shape, not writing the refusal.
+Re-measured on `planck` (ISSUES.md **C12**): the current planner grants the
+shape a 7/5 split at every extent from 20 to 58 and every one is exact at
+fp16 and int8. Forcing the old 11/1 back is a watchdog kill with the output
+unwritten, not a silent completion, so the original "all-zero" was a killed
+job read as a result before C3 existed -- the same class as C9's large-kernel
+cliff, a starved coefficient grant. `validate_conv_shape` never needed a
+refusal for it: `streamed_weight_bank_preference` is what keeps the grant
+honest, `dense_k3_plan_never_starves_the_streamed_coefficient_working_set`
+pins it, and no wire field can force a split. What survives for symbolic
+shapes is only the general point above: the spatial envelope is checked at
+dispatch time and an out-of-envelope invocation is a hard error.
 
 ### And a policy decision
 
@@ -365,14 +349,10 @@ Two smaller consequences of moving the decision to runtime:
 
 ## Recommended order
 
-1. **DS3's silent-zero refusal first** -- and not because symbolic shapes make
-   the case reachable, but because it is reachable now, with static extents,
-   inside the bounds the 3x3 matcher enforces today (LIMITS.md `:493`). It is
-   the only S1 here, it is self-contained in `ConvPlan`/`validate_conv_shape`,
-   and it should be re-measured and closed whether or not symbolic shapes ever
-   ship -- ISSUES.md C9 is the same class of defect at a different kernel
-   size. Everything else on this list is genuinely gated on wanting the
-   feature; this is not.
+1. ~~**DS3's silent-zero refusal first**~~ -- closed 2026-09-08 without a
+   refusal: re-measured exact at every extent under the current planner's
+   grant, and the original observation was a watchdog-killed job (ISSUES.md
+   C12). Nothing on this list is S1 any more.
 2. **DS1**, preferring the `tie_shape` external model (option 1) over
    re-spelling the matchers, because it leaves `spec::neutralize` and the
    `--no-offload` baseline intact (DS5). Acceptance is a lit test that a

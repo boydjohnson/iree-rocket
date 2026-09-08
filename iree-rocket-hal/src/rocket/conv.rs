@@ -6020,6 +6020,68 @@ mod tests {
         }
     }
 
+    /// The `11/1` silent-zero finding, kept as a planner invariant.
+    ///
+    /// An early planner granted `Cin` = `Cout` = 256, k=3 a single
+    /// coefficient bank at every extent from 26x26 to 48x48, and the NPU
+    /// completed those jobs with all-zero output -- deterministically, every
+    /// element, with the pass/fail boundary on the split flips (ISSUES.md
+    /// C12; LIMITS.md "Hazards inside the limits"). The same working set at
+    /// the 7/5 split the planner grants today is exact at every extent from
+    /// 20 to 58 (`planck`, 2026-09-08, fp16 and int8, `selectors` and
+    /// `dense`), and forcing the old 11/1 back with `ROCKET_CBUF_SPLIT` is a
+    /// watchdog kill with the output unwritten (10/2 too; 9/3 and 8/4 are
+    /// exact), so the "all-zero" was a killed job read as a result before C3.
+    /// The fault was the grant, not the shape -- the same class as C9's
+    /// large-kernel cliff -- and what prevents it is
+    /// [`streamed_weight_bank_preference`]: a streamed coefficient working
+    /// set needs its banks whatever the feature map asks for.
+    ///
+    /// Pin that a k=3 plan never grants fewer coefficient banks than the
+    /// streamed working set needs, at every extent across the split flips,
+    /// so the correction in `demand_based_cbuf_partition` cannot be lost
+    /// without this failing.
+    #[test]
+    fn dense_k3_plan_never_starves_the_streamed_coefficient_working_set() {
+        let kernels = [3usize, 3];
+        for precision in [Precision::Fp16, captured_int8()] {
+            for cin in [64u32, 128, 192, 256, 320, 384, 448, 512] {
+                for cout in [64u32, 256, 512] {
+                    for extent in (8..=64).step_by(2) {
+                        let shape = Shape::with_precision(extent, extent, 1, cin, cout, precision);
+                        let plan = ConvPlan::new(shape, kernels);
+                        let streamed = streamed_weight_bank_preference(
+                            shape.streamed_contraction_channels(),
+                            kernels,
+                            precision.element_bits(),
+                        );
+                        // A footprint that fits outright needs only what it
+                        // occupies; anything larger is streamed and needs the
+                        // working set resident.
+                        let needed = streamed.min(shape.weight_bank_demand(kernels));
+                        assert!(
+                            plan.weight_banks() >= needed,
+                            "{precision:?} {extent}x{extent} Cin {cin} Cout {cout} k3: granted {} \
+                             coefficient banks, the streamed working set needs {needed}",
+                            plan.weight_banks()
+                        );
+                    }
+                }
+            }
+        }
+        // The shape the finding was recorded on, at the extents it tabulated:
+        // one split on both sides of the old flips, and never a single bank.
+        for extent in [20u32, 24, 26, 30, 36, 48, 50, 58] {
+            let shape = Shape::with_precision(extent, extent, 1, 256, 256, Precision::Fp16);
+            let plan = ConvPlan::new(shape, kernels);
+            assert_eq!(
+                (plan.data_banks(), plan.weight_banks()),
+                (7, 5),
+                "Cin 256 Cout 256 k3 at {extent}x{extent}"
+            );
+        }
+    }
+
     #[test]
     fn conv_plan_reproduces_the_three_hardware_proven_rectangular_grids() {
         for (kernel, in_channels, banks, columns, tiles) in [
