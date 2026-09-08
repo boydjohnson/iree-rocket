@@ -598,6 +598,8 @@ unsafe fn dma_range(
 ///   sides and a producer with physical height padding (`fc.rs`'s padded row
 ///   count, a reduced output extent) strides differently from what the
 ///   consumer's own geometry would pack;
+/// - equal surface strides (the consumer's packed pixel count), which the
+///   PPU alone rounds up to four pixels;
 /// - equal logical pixel widths, and the consumer asking for no channel
 ///   padding beyond them (`packed == logical`), since padding surfaces are
 ///   zero after a repack but hold the producer's padding channels here;
@@ -616,6 +618,7 @@ fn chainable_cube(
     cb: &mut RocketCommandBuffer,
     binding: &iree_hal_buffer_ref_t,
     pixel_count: usize,
+    packed_pixel_count: usize,
     bytes_per_pixel: usize,
     packed_bytes_per_pixel: usize,
     what: &str,
@@ -681,16 +684,23 @@ fn chainable_cube(
         )
     } != Some(want)
         || cube.pixel_count != pixel_count
+        || cube.surface_pixel_count != packed_pixel_count
         || cube.bytes_per_pixel != bytes_per_pixel
     {
+        // `packed_pixel_count` is the surface stride this consumer would
+        // pack to; the PPU rounds it up to four pixels where everything
+        // else uses the exact count, so a pool and a conv only agree when
+        // the count is a multiple of four.
         if chain_debug() {
             eprintln!(
-                "rocket: chain declined ({what}): producer cube {}x{} at +{} vs consumer {}x{} at +{}",
+                "rocket: chain declined ({what}): producer cube {}x{} (surfaces {} apart) at +{} vs consumer {}x{} (surfaces {} apart) at +{}",
                 cube.pixel_count,
                 cube.bytes_per_pixel,
+                cube.surface_pixel_count,
                 cube.dense_offset,
                 pixel_count,
                 bytes_per_pixel,
+                packed_pixel_count,
                 binding.offset
             );
         }
@@ -1190,9 +1200,13 @@ pub struct OutputCube {
     pub handle: u32,
     pub host_ptr: *mut u8,
     pub length: usize,
-    /// The cube's geometry: surfaces are `pixel_count * 16` bytes apart and
-    /// the logical pixel occupies `bytes_per_pixel`, a whole number of atoms.
+    /// The cube's geometry: `pixel_count` logical pixels, surfaces
+    /// `surface_pixel_count * 16` bytes apart (equal to `pixel_count` except
+    /// for the PPU, which strides surfaces by the count rounded up to four),
+    /// and the logical pixel occupies `bytes_per_pixel`, a whole number of
+    /// atoms.
     pub pixel_count: usize,
+    pub surface_pixel_count: usize,
     pub bytes_per_pixel: usize,
 }
 
@@ -2386,6 +2400,7 @@ unsafe extern "C" fn dispatch_impl(
                     cb,
                     &refs[0],
                     pixel_count,
+                    pixel_count,
                     input_bytes_per_pixel,
                     packed_input_bytes_per_pixel,
                     "conv input",
@@ -2892,6 +2907,7 @@ unsafe extern "C" fn dispatch_impl(
                 host_ptr: scratch.host_ptr,
                 length: scratch_bytes,
                 pixel_count: output_pixel_count,
+                surface_pixel_count: output_pixel_count,
                 bytes_per_pixel: output_bytes_per_pixel,
             });
             scratch_buffers.push(scratch);
@@ -2926,6 +2942,7 @@ unsafe extern "C" fn dispatch_impl(
                 let chained_skip = chainable_cube(
                     cb,
                     &refs[3],
+                    cube.pixels,
                     cube.pixels,
                     cube.logical_bytes_per_pixel,
                     cube.packed_bytes_per_pixel,
@@ -2993,6 +3010,7 @@ unsafe extern "C" fn dispatch_impl(
                     host_ptr: sum_scratch.host_ptr,
                     length: cube.scratch_bytes,
                     pixel_count: cube.pixels,
+                    surface_pixel_count: cube.pixels,
                     bytes_per_pixel: cube.logical_bytes_per_pixel,
                 });
                 output_compaction = Some(sum_compaction);
@@ -3132,14 +3150,38 @@ unsafe extern "C" fn dispatch_impl(
                     crate::bindings::iree_status_code_e_IREE_STATUS_INVALID_ARGUMENT,
                 );
             }
-            let input_scratch = unsafe {
-                RocketOwnedBuffer::new(
-                    cb.fd,
-                    input_scratch_bytes.max(1),
-                    BorrowedFd::borrow_raw(cb.fd),
+            // The [M,K] operand is a width-M, height-1 feature cube, so a
+            // producer's cube of M pixels at K channels is exactly what the
+            // repack would build (`chainable_cube`). The [K,N] operand is a
+            // coefficient stream and never chains.
+            let chained_input = if matches!(input_layout, InputPackingLayout::Nc1hwc2) {
+                chainable_cube(
+                    cb,
+                    &refs[0],
+                    physical_pixel_count,
+                    physical_pixel_count,
+                    input_bytes_per_pixel,
+                    packed_input_bytes_per_pixel,
+                    "matmul input",
                 )
+            } else {
+                None
             };
-            let input_packing = Some(InputPacking {
+            if chained_input.is_none() {
+                unsafe { note_dense_read(cb, &refs[0]) };
+            }
+            let input_scratch = if chained_input.is_some() {
+                None
+            } else {
+                Some(unsafe {
+                    RocketOwnedBuffer::new(
+                        cb.fd,
+                        input_scratch_bytes.max(1),
+                        BorrowedFd::borrow_raw(cb.fd),
+                    )
+                })
+            };
+            let input_packing = input_scratch.as_ref().map(|input_scratch| InputPacking {
                 input_buffer: refs[0].buffer,
                 input_offset: refs[0].offset,
                 input_length: refs[0].length,
@@ -3153,6 +3195,11 @@ unsafe extern "C" fn dispatch_impl(
                 padding_byte: input_zero_point as u8,
                 layout: input_layout,
             });
+            let (input_addr, input_handle) = match (&chained_input, &input_scratch) {
+                (Some(cube), _) => (cube.dma_address, cube.handle),
+                (None, Some(scratch)) => (scratch.dma_address, scratch.handle),
+                (None, None) => unreachable!("matmul input is either chained or packed"),
+            };
 
             // FC weights arrive as a logical row-major [K,N] matrix, which
             // is exactly a 1x1 HWCF filter and therefore always needs the
@@ -3268,17 +3315,20 @@ unsafe extern "C" fn dispatch_impl(
                 )
             };
             let bufs = Buffers {
-                input: input_scratch.dma_address,
+                input: input_addr,
                 weights: weights_addr,
                 bias: bias_addr,
                 output: output_scratch.dma_address,
             };
-            let input_source = match &input_packing {
-                Some(packing) => (
+            let input_source = match (&chained_input, &input_packing) {
+                // A chained input is already a cube on this context's file;
+                // a sibling copies it exactly as it copies a fresh packing.
+                (Some(cube), _) => (ReplicaSource::Host(cube.host_ptr as *const u8), cube.length),
+                (None, Some(packing)) => (
                     ReplicaSource::Host(packing.scratch_ptr as *const u8),
                     packing.scratch_length,
                 ),
-                None => (
+                (None, None) => (
                     ReplicaSource::Binding {
                         buffer: refs[0].buffer,
                         offset: refs[0].offset as usize,
@@ -3303,22 +3353,32 @@ unsafe extern "C" fn dispatch_impl(
                 buffer: refs[1].buffer,
                 offset: refs[1].offset as usize,
             };
-            let input_geometry = input_packing.as_ref().map(|packing| match packing.layout {
-                InputPackingLayout::Nc1hwc2 => BandGeometry {
+            let input_geometry = match (&chained_input, &input_packing) {
+                (Some(cube), _) => Some(BandGeometry {
                     width: m,
                     height: 1,
-                    surfaces: packing.packed_bytes_per_pixel / 16,
-                    surface_stride: packing.packed_pixel_count * 16,
+                    surfaces: cube.bytes_per_pixel / 16,
+                    surface_stride: cube.surface_pixel_count * 16,
                     block_bytes: 16,
-                },
-                InputPackingLayout::Dense => BandGeometry {
-                    width: m,
-                    height: 1,
-                    surfaces: 1,
-                    surface_stride: 0,
-                    block_bytes: packing.packed_bytes_per_pixel,
-                },
-            });
+                }),
+                (None, Some(packing)) => Some(match packing.layout {
+                    InputPackingLayout::Nc1hwc2 => BandGeometry {
+                        width: m,
+                        height: 1,
+                        surfaces: packing.packed_bytes_per_pixel / 16,
+                        surface_stride: packing.packed_pixel_count * 16,
+                        block_bytes: 16,
+                    },
+                    InputPackingLayout::Dense => BandGeometry {
+                        width: m,
+                        height: 1,
+                        surfaces: 1,
+                        surface_stride: 0,
+                        block_bytes: packing.packed_bytes_per_pixel,
+                    },
+                }),
+                (None, None) => None,
+            };
             let planned = match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
                 let plan = fc::Plan::new(*shape);
                 let tiles = plan.conv_plan().tiles().len();
@@ -3400,9 +3460,28 @@ unsafe extern "C" fn dispatch_impl(
                 tile_context
             };
 
-            let input_scratch_handle = input_scratch.handle;
             let weight_scratch_handle = weights_handle;
             let output_scratch_handle = output_scratch.handle;
+            // The cube a later dispatch may read in place: M pixels at N
+            // channels, one 16-byte atom per surface, no row padding. Not
+            // offered when the tiles fanned out (each context holds its own
+            // rows) or the write-out is the accumulator's 128-byte block.
+            let output_block_bytes = shape.as_conv_shape().output_channel_block_bytes() as usize;
+            let output_cube = (chain_enabled()
+                && tile_rects.is_empty()
+                && output_block_bytes == 16
+                && output_bytes_per_pixel.is_multiple_of(16))
+            .then_some(OutputCube {
+                dense_buffer: refs[3].buffer,
+                dense_offset: refs[3].offset,
+                dma_address: output_scratch.dma_address,
+                handle: output_scratch.handle,
+                host_ptr: output_scratch.host_ptr,
+                length: output_scratch_bytes,
+                pixel_count: m,
+                surface_pixel_count: m,
+                bytes_per_pixel: output_bytes_per_pixel,
+            });
             let output_compaction = Some(OutputCompaction {
                 output_buffer: refs[3].buffer,
                 output_offset: refs[3].offset,
@@ -3432,7 +3511,8 @@ unsafe extern "C" fn dispatch_impl(
                     n,
                 )
             });
-            let mut scratch_buffers = vec![input_scratch, output_scratch];
+            let mut scratch_buffers = vec![output_scratch];
+            scratch_buffers.extend(input_scratch);
             scratch_buffers.extend(staged_scratch);
             if let Some(probe) = weight_probe {
                 scratch_buffers.push(probe);
@@ -3440,10 +3520,9 @@ unsafe extern "C" fn dispatch_impl(
             if let Some(scratch) = bias_scratch {
                 scratch_buffers.push(scratch);
             }
-            // These kinds record no output cube and take none, so every
-            // operand is a dense read.
+            // Weights and bias are read from their dense buffers whatever
+            // happened to the input.
             unsafe {
-                note_dense_read(cb, &refs[0]);
                 note_dense_read(cb, &refs[1]);
                 note_dense_read(cb, &refs[2]);
             }
@@ -3456,7 +3535,7 @@ unsafe extern "C" fn dispatch_impl(
                 staged_copies,
                 replicas,
                 tile_context,
-                in_bo_handles: vec![input_scratch_handle, weight_scratch_handle, bias_handle],
+                in_bo_handles: vec![input_handle, weight_scratch_handle, bias_handle],
                 out_bo_handles: vec![output_scratch_handle],
                 input_packing,
                 operand_packing: None,
@@ -3465,8 +3544,8 @@ unsafe extern "C" fn dispatch_impl(
                 output_compaction,
                 profile_label,
                 weight_scratch,
-                output_cube: None,
-                dense_readers: 0,
+                output_cube,
+                dense_readers: executable.dense_readers(constants),
                 chained_readers: 0,
                 dense_read_seen: false,
                 weight_publish,
@@ -3559,12 +3638,32 @@ unsafe extern "C" fn dispatch_impl(
                 );
             }
 
-            let input_scratch = unsafe {
-                RocketOwnedBuffer::new(
-                    cb.fd,
-                    input_scratch_bytes.max(1),
-                    BorrowedFd::borrow_raw(cb.fd),
-                )
+            // A producer's cube qualifies when its surfaces are already the
+            // PPU's stride -- the pixel count rounded up to four, so only an
+            // image whose count is a multiple of four -- and its channels
+            // are whole atoms (`chainable_cube`).
+            let chained_input = chainable_cube(
+                cb,
+                &refs[0],
+                input_pixels,
+                packed_input_pixels,
+                logical_bytes_per_pixel,
+                packed_bytes_per_pixel,
+                "pool input",
+            );
+            if chained_input.is_none() {
+                unsafe { note_dense_read(cb, &refs[0]) };
+            }
+            let input_scratch = if chained_input.is_some() {
+                None
+            } else {
+                Some(unsafe {
+                    RocketOwnedBuffer::new(
+                        cb.fd,
+                        input_scratch_bytes.max(1),
+                        BorrowedFd::borrow_raw(cb.fd),
+                    )
+                })
             };
             let output_scratch = unsafe {
                 RocketOwnedBuffer::new(
@@ -3573,7 +3672,12 @@ unsafe extern "C" fn dispatch_impl(
                     BorrowedFd::borrow_raw(cb.fd),
                 )
             };
-            let input_packing = Some(InputPacking {
+            let (input_addr, input_handle) = match (&chained_input, &input_scratch) {
+                (Some(cube), _) => (cube.dma_address, cube.handle),
+                (None, Some(scratch)) => (scratch.dma_address, scratch.handle),
+                (None, None) => unreachable!("pool input is either chained or packed"),
+            };
+            let input_packing = input_scratch.as_ref().map(|input_scratch| InputPacking {
                 input_buffer: refs[0].buffer,
                 input_offset: refs[0].offset,
                 input_length: refs[0].length,
@@ -3617,12 +3721,29 @@ unsafe extern "C" fn dispatch_impl(
             });
 
             let bufs = PoolingBuffers {
-                input_addr: input_scratch.dma_address,
+                input_addr,
                 output_addr: output_scratch.dma_address,
             };
             let regcmd_tasks = PoolingPlan::new(shape).programs_with_buffers(&bufs);
-            let in_bo_handles = vec![input_scratch.handle];
+            let in_bo_handles = vec![input_handle];
             let out_bo_handles = vec![output_scratch.handle];
+            // The pool's own cube: real pixels at the PPU's four-rounded
+            // surface stride. Offered only when its channels are whole atoms
+            // with no padding, since a consumer would read the padding lanes.
+            let output_cube = (chain_enabled()
+                && logical_bytes_per_pixel.is_multiple_of(16)
+                && logical_bytes_per_pixel == packed_bytes_per_pixel)
+                .then_some(OutputCube {
+                    dense_buffer: refs[1].buffer,
+                    dense_offset: refs[1].offset,
+                    dma_address: output_scratch.dma_address,
+                    handle: output_scratch.handle,
+                    host_ptr: output_scratch.host_ptr,
+                    length: output_scratch_bytes,
+                    pixel_count: output_pixels,
+                    surface_pixel_count: packed_output_pixels,
+                    bytes_per_pixel: logical_bytes_per_pixel,
+                });
             let retained_bindings = unsafe { retain_direct_bindings(refs) };
             let profile_label = profile::label(|| {
                 format!(
@@ -3637,17 +3758,14 @@ unsafe extern "C" fn dispatch_impl(
                     shape.stride_x,
                 )
             });
-            // These kinds record no output cube and take none, so every
-            // operand is a dense read.
-            unsafe {
-                note_dense_read(cb, &refs[0]);
-            }
+            let mut scratch_buffers = vec![output_scratch];
+            scratch_buffers.extend(input_scratch);
             cb.ops.push(RecordedOp::Dispatch {
                 regcmd_tasks,
                 dpu_mode: None,
                 precision_tag: None,
                 retained_bindings,
-                scratch_buffers: vec![input_scratch, output_scratch],
+                scratch_buffers,
                 staged_copies: Vec::new(),
                 replicas: Vec::new(),
                 tile_context: Vec::new(),
@@ -3660,8 +3778,8 @@ unsafe extern "C" fn dispatch_impl(
                 output_compaction,
                 profile_label,
                 weight_scratch: None,
-                output_cube: None,
-                dense_readers: 0,
+                output_cube,
+                dense_readers: executable.dense_readers(constants),
                 chained_readers: 0,
                 dense_read_seen: false,
                 weight_publish: None,
@@ -3684,16 +3802,19 @@ unsafe extern "C" fn dispatch_impl(
             if bindings.count < 2 {
                 return invalid_argument();
             }
-            let (Some((input_scratch, input_packing)), Some((output_scratch, output_compaction))) = (
-                pack_elementwise_input(cb, &refs[0], &cube),
-                compact_elementwise_output(cb, &refs[1], &cube),
-            ) else {
+            let Some(input) = elementwise_operand(cb, &refs[0], &cube, "ew input") else {
                 return invalid_argument();
             };
+            let Some((output_scratch, output_compaction)) =
+                compact_elementwise_output(cb, &refs[1], &cube)
+            else {
+                return invalid_argument();
+            };
+            let output_cube = elementwise_output_cube(&refs[1], &output_scratch, &cube);
             let regcmd_tasks = vec![build_unary_regcmd(
                 &shape,
                 &EwUnaryBuffers {
-                    input_addr: input_scratch.dma_address,
+                    input_addr: input.addr,
                     output_addr: output_scratch.dma_address,
                 },
             )];
@@ -3705,9 +3826,6 @@ unsafe extern "C" fn dispatch_impl(
             });
             // These kinds record no output cube and take none, so every
             // operand is a dense read.
-            unsafe {
-                note_dense_read(cb, &refs[0]);
-            }
             cb.ops.push(RecordedOp::Dispatch {
                 regcmd_tasks,
                 // Neither field describes an element-wise task. `dpu_mode`
@@ -3720,21 +3838,21 @@ unsafe extern "C" fn dispatch_impl(
                 dpu_mode: None,
                 precision_tag: None,
                 retained_bindings: unsafe { retain_direct_bindings(refs) },
-                in_bo_handles: vec![input_scratch.handle],
+                in_bo_handles: vec![input.handle],
                 out_bo_handles: vec![output_scratch.handle],
-                scratch_buffers: vec![input_scratch, output_scratch],
+                scratch_buffers: input.scratch.into_iter().chain([output_scratch]).collect(),
                 staged_copies: Vec::new(),
                 replicas: Vec::new(),
                 tile_context: Vec::new(),
-                input_packing: Some(input_packing),
+                input_packing: input.packing,
                 operand_packing: None,
                 weight_packing: None,
                 bias_packing: None,
                 output_compaction: Some(output_compaction),
                 profile_label,
                 weight_scratch: None,
-                output_cube: None,
-                dense_readers: 0,
+                output_cube,
+                dense_readers: executable.dense_readers(constants),
                 chained_readers: 0,
                 dense_read_seen: false,
                 weight_publish: None,
@@ -3762,23 +3880,23 @@ unsafe extern "C" fn dispatch_impl(
             if bindings.count < 3 {
                 return invalid_argument();
             }
-            let (
-                Some((input_scratch, input_packing)),
-                Some((operand_scratch, operand_packing)),
-                Some((output_scratch, output_compaction)),
-            ) = (
-                pack_elementwise_input(cb, &refs[0], &cube),
-                pack_elementwise_input(cb, &refs[1], &cube),
-                compact_elementwise_output(cb, &refs[2], &cube),
-            )
+            let Some(input) = elementwise_operand(cb, &refs[0], &cube, "ew input") else {
+                return invalid_argument();
+            };
+            let Some(operand) = elementwise_operand(cb, &refs[1], &cube, "ew operand") else {
+                return invalid_argument();
+            };
+            let Some((output_scratch, output_compaction)) =
+                compact_elementwise_output(cb, &refs[2], &cube)
             else {
                 return invalid_argument();
             };
+            let output_cube = elementwise_output_cube(&refs[2], &output_scratch, &cube);
             let regcmd_tasks = vec![build_add_regcmd(
                 &shape,
                 &EwAddBuffers {
-                    intermediate_addr: input_scratch.dma_address,
-                    w_addr: operand_scratch.dma_address,
+                    intermediate_addr: input.addr,
+                    w_addr: operand.addr,
                     output_addr: output_scratch.dma_address,
                 },
             )];
@@ -3790,31 +3908,32 @@ unsafe extern "C" fn dispatch_impl(
             });
             // These kinds record no output cube and take none, so every
             // operand is a dense read.
-            unsafe {
-                note_dense_read(cb, &refs[0]);
-                note_dense_read(cb, &refs[1]);
-            }
             cb.ops.push(RecordedOp::Dispatch {
                 regcmd_tasks,
                 // See the unary arm.
                 dpu_mode: None,
                 precision_tag: None,
                 retained_bindings: unsafe { retain_direct_bindings(refs) },
-                in_bo_handles: vec![input_scratch.handle, operand_scratch.handle],
+                in_bo_handles: vec![input.handle, operand.handle],
                 out_bo_handles: vec![output_scratch.handle],
-                scratch_buffers: vec![input_scratch, operand_scratch, output_scratch],
+                scratch_buffers: input
+                    .scratch
+                    .into_iter()
+                    .chain(operand.scratch)
+                    .chain([output_scratch])
+                    .collect(),
                 staged_copies: Vec::new(),
                 replicas: Vec::new(),
                 tile_context: Vec::new(),
-                input_packing: Some(input_packing),
-                operand_packing: Some(operand_packing),
+                input_packing: input.packing,
+                operand_packing: operand.packing,
                 weight_packing: None,
                 bias_packing: None,
                 output_compaction: Some(output_compaction),
                 profile_label,
                 weight_scratch: None,
-                output_cube: None,
-                dense_readers: 0,
+                output_cube,
+                dense_readers: executable.dense_readers(constants),
                 chained_readers: 0,
                 dense_read_seen: false,
                 weight_publish: None,
@@ -3837,16 +3956,19 @@ unsafe extern "C" fn dispatch_impl(
             if bindings.count < 2 {
                 return invalid_argument();
             }
-            let (Some((input_scratch, input_packing)), Some((output_scratch, output_compaction))) = (
-                pack_elementwise_input(cb, &refs[0], &cube),
-                compact_elementwise_output(cb, &refs[1], &cube),
-            ) else {
+            let Some(input) = elementwise_operand(cb, &refs[0], &cube, "ew input") else {
                 return invalid_argument();
             };
+            let Some((output_scratch, output_compaction)) =
+                compact_elementwise_output(cb, &refs[1], &cube)
+            else {
+                return invalid_argument();
+            };
+            let output_cube = elementwise_output_cube(&refs[1], &output_scratch, &cube);
             let regcmd_tasks = vec![build_lut_regcmd(
                 &shape,
                 &LutBuffers {
-                    input_addr: input_scratch.dma_address,
+                    input_addr: input.addr,
                     output_addr: output_scratch.dma_address,
                 },
                 executable.function.table(),
@@ -3859,30 +3981,27 @@ unsafe extern "C" fn dispatch_impl(
             });
             // These kinds record no output cube and take none, so every
             // operand is a dense read.
-            unsafe {
-                note_dense_read(cb, &refs[0]);
-            }
             cb.ops.push(RecordedOp::Dispatch {
                 regcmd_tasks,
                 // See the unary arm.
                 dpu_mode: None,
                 precision_tag: None,
                 retained_bindings: unsafe { retain_direct_bindings(refs) },
-                in_bo_handles: vec![input_scratch.handle],
+                in_bo_handles: vec![input.handle],
                 out_bo_handles: vec![output_scratch.handle],
-                scratch_buffers: vec![input_scratch, output_scratch],
+                scratch_buffers: input.scratch.into_iter().chain([output_scratch]).collect(),
                 staged_copies: Vec::new(),
                 replicas: Vec::new(),
                 tile_context: Vec::new(),
-                input_packing: Some(input_packing),
+                input_packing: input.packing,
                 operand_packing: None,
                 weight_packing: None,
                 bias_packing: None,
                 output_compaction: Some(output_compaction),
                 profile_label,
                 weight_scratch: None,
-                output_cube: None,
-                dense_readers: 0,
+                output_cube,
+                dense_readers: executable.dense_readers(constants),
                 chained_readers: 0,
                 dense_read_seen: false,
                 weight_publish: None,
@@ -3982,6 +4101,74 @@ fn pack_elementwise_input(
         layout: InputPackingLayout::Nc1hwc2,
     };
     Some((scratch, packing))
+}
+
+/// One element-wise operand, resolved: a producer's cube read in place when
+/// one qualifies (`chainable_cube`), else a fresh packing plus the dense
+/// read that goes with it.
+struct ElementwiseOperand {
+    addr: u32,
+    handle: u32,
+    scratch: Option<RocketOwnedBuffer>,
+    packing: Option<InputPacking>,
+}
+
+fn elementwise_operand(
+    cb: &mut RocketCommandBuffer,
+    binding: &iree_hal_buffer_ref_t,
+    cube: &ElementwiseCube,
+    what: &str,
+) -> Option<ElementwiseOperand> {
+    // The EW and LUT cubes are exact in pixels and pad channels to 16 like a
+    // convolution's input, so a conv, matmul or EW producer's cube is the
+    // same bytes whenever the channel count is whole atoms.
+    if let Some(producer) = chainable_cube(
+        cb,
+        binding,
+        cube.pixels,
+        cube.pixels,
+        cube.logical_bytes_per_pixel,
+        cube.packed_bytes_per_pixel,
+        what,
+    ) {
+        return Some(ElementwiseOperand {
+            addr: producer.dma_address,
+            handle: producer.handle,
+            scratch: None,
+            packing: None,
+        });
+    }
+    unsafe { note_dense_read(cb, binding) };
+    let (scratch, packing) = pack_elementwise_input(cb, binding, cube)?;
+    Some(ElementwiseOperand {
+        addr: scratch.dma_address,
+        handle: scratch.handle,
+        scratch: Some(scratch),
+        packing: Some(packing),
+    })
+}
+
+/// The op's own output cube, offered to later dispatches when its channels
+/// are whole atoms with no padding lanes a consumer would otherwise read.
+fn elementwise_output_cube(
+    binding: &iree_hal_buffer_ref_t,
+    scratch: &RocketOwnedBuffer,
+    cube: &ElementwiseCube,
+) -> Option<OutputCube> {
+    (chain_enabled()
+        && cube.logical_bytes_per_pixel.is_multiple_of(16)
+        && cube.logical_bytes_per_pixel == cube.packed_bytes_per_pixel)
+        .then_some(OutputCube {
+            dense_buffer: binding.buffer,
+            dense_offset: binding.offset,
+            dma_address: scratch.dma_address,
+            handle: scratch.handle,
+            host_ptr: scratch.host_ptr,
+            length: cube.scratch_bytes,
+            pixel_count: cube.pixels,
+            surface_pixel_count: cube.pixels,
+            bytes_per_pixel: cube.logical_bytes_per_pixel,
+        })
 }
 
 /// The output half: a scratch cube plus the compaction back to dense NHWC.

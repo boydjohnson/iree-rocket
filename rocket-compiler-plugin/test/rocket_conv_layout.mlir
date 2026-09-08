@@ -9,6 +9,10 @@
 // RUN:   --compile-to=preprocessing \
 // RUN:   --mlir-print-op-generic=false \
 // RUN:   -o - | FileCheck %s
+// The full compile is the three-stage pipeline rocket-compiler drives: flow,
+// then the placement pin (the widen generic each Rocket shim leaves behind
+// would otherwise inherit the Rocket dispatch's affinity and be formed into
+// a "rocket" executable with no config to serialize), then resume.
 // RUN: iree-compile %s \
 // RUN:   --iree-preprocessing-transform-spec-filename=%S/../target/Rocket/rocket_conv2d_transform_spec.mlir \
 // RUN:   --iree-hal-target-device=rocket_device=rocket \
@@ -17,6 +21,16 @@
 // RUN:   --iree-llvmcpu-target-cpu=generic \
 // RUN:   --iree-hal-default-device=cpu_device \
 // RUN:   --iree-hal-indirect-command-buffers=false \
+// RUN:   --compile-to=flow \
+// RUN:   -o - | iree-opt --pass-pipeline="builtin.module(rocket-pin-unclaimed-dispatches,rocket-mark-dense-readers)" \
+// RUN:   | iree-compile - \
+// RUN:   --iree-hal-target-device=rocket_device=rocket \
+// RUN:   --iree-hal-target-device=cpu_device=local \
+// RUN:   --iree-hal-local-target-device-backends=llvm-cpu \
+// RUN:   --iree-llvmcpu-target-cpu=generic \
+// RUN:   --iree-hal-default-device=cpu_device \
+// RUN:   --iree-hal-indirect-command-buffers=false \
+// RUN:   --compile-from=flow \
 // RUN:   -o %t.vmfb
 
 // This shape intentionally does not match a current Rocket hardware
@@ -55,17 +69,22 @@ util.func public @regular_conv(
 // The adapter's own shape is checked here rather than on a
 // `util.func private @call_rocket_dynamic_conv2d`: @__transform_main inlines
 // the wrappers, so everything the adapter builds -- the tensor.dim/index_cast
-// push constants and the CPU-side accumulate epilogue -- now lands in the
-// function that used to call it.
+// push constants and the host-side widen-and-accumulate generic -- now lands
+// in the function that used to call it. The widen is a plain linalg.generic
+// (not a pre-formed dispatch) so a consumer's narrow can fuse with it; the
+// accumulate stays here because this function's `%init` is an argument,
+// not a zero fill, so rocket-fold-neutral-init cannot drop it.
 // CHECK-LABEL: util.func public @supported_nchw_conv
 // CHECK-NOT: linalg.conv_2d_nchw_fchw
 // CHECK-NOT: linalg.conv_2d_nhwc_hwcf
 // CHECK: flow.dispatch @rocket_dynamic_executable::@rocket_dynamic_conv2d_v1::@rocket_dynamic_conv2d(
-// One i32 push constant per settable Conv2D dimension. Six, not eight: the
-// runtime derives output_width/output_height rather than accepting them.
-// CHECK-SAME: : (i32, i32, i32, i32, i32, i32,
-// CHECK: flow.dispatch.workgroups
-// CHECK-SAME: stream.affinity = #hal.device.affinity<@cpu_device>
+// One i32 push constant per settable Conv2D dimension plus the trailing
+// dense-reader count. Six dimensions, not eight: the runtime derives
+// output_width/output_height rather than accepting them.
+// CHECK-SAME: : (i32, i32, i32, i32, i32, i32, i32,
+// CHECK: linalg.generic
+// CHECK: arith.extf
+// CHECK-NEXT: arith.addf
 // CHECK: linalg.transpose
 // CHECK-SAME: permutation = [0, 3, 1, 2]
 util.func public @supported_nchw_conv(

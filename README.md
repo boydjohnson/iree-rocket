@@ -367,11 +367,19 @@ the dense buffer between them. The consumer reads the producer's NC1HWC2
 output cube in place instead of repacking (the *chain*), and the producer
 skips writing the dense buffer at all when the compiler counted every reader
 of its result as a Rocket dispatch and every one of them chained (*lazy
-compaction*). The count travels as the convolution's last push constant
+compaction*). Every dispatch kind takes part -- convolution, matmul, pooling
+and element-wise -- with one geometric caveat: the PPU strides its surfaces
+by the pixel count rounded up to four, so a pool only chains at a multiple
+of four pixels. The count travels as the dispatch's last push constant
 (`rocket-mark-dense-readers`, run by `rocket-compiler` at the flow phase);
 a reader on another command buffer, a CPU reader, or a consumer that could
-not chain all keep the write. The profile's `compaction:` line counts the
-writes skipped; `pack.input` and `compact` are the phases that shrink.
+not chain all keep the write. Two compiler details make the edges adjacent
+in the first place: each shim widens its f16 result with a plain generic
+whose accumulator-init term `rocket-fold-neutral-init` drops when the init
+is a zero (or -inf) fill, so the consumer's narrow cancels it, and the
+demote pass narrows an f32 import *through* its zero pads so the pad-folding
+matchers still see `pad -> conv`. The profile's `compaction:` line counts
+the writes skipped; `pack.input` and `compact` are the phases that shrink.
 
 | Variable | Effect |
 |---|---|

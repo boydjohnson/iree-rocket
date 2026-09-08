@@ -525,10 +525,75 @@ last conv (read by the head).
 
 With step 2 and step 4 together, ResNet50-224 is 169 -> 114 ms, and what
 the driver still does on the host for it is ~10 % of wall (`outside` is the
-CPU stem/pool/head). What is left of P2 is breadth, not depth: the
+CPU stem/pool/head). ~~What is left of P2 is breadth, not depth: the
 elementwise, pooling and matmul kinds publish no cube, so nothing chains
-through them and nothing feeding them elides -- VGG19's five pool edges and
-every matmul edge on ViT/Qwen3.
+through them and nothing feeding them elides.~~ Step 5, below.
+
+**Step 5 landed 2026-09-08 -- breadth.** Matmul, pooling and element-wise
+dispatches now publish an output cube, take a producer's cube for their
+inputs, and carry the reader count (`runtime_dense_readers` on
+`MatmulDef`, `PoolingDef` and the three `Elementwise*Def`s; every shim
+passes it). `OutputCube` grew a `surface_pixel_count`: the PPU strides its
+surfaces by the pixel count rounded up to four, so a pool's cube matches a
+conv's only when the count is a multiple of four (VGG's 224/112/56/28
+images all are; a 7x7 is not), and `chain_identity_tests` pins the
+mismatch. Matmul's cube is width M, height 1, no row padding; the `[K,N]`
+operand is a coefficient stream and never chains.
+
+That was the smaller half. The larger one was that on every plain-conv,
+pool and matmul edge nothing could have chained anyway, because the shims
+widened their f16 result inside a `flow.dispatch.workgroups` that also
+folded in linalg's accumulator init -- opaque to fusion, so a CPU dispatch
+sat between the two Rocket dispatches on every such edge. Only the fused
+bias/ReLU shims (ResNet50's) used a plain generic, which is why ResNet50
+chained and MobileNetV2's f32 import did not. Two compiler changes fix it:
+every shim's widen is a plain `linalg.generic` (the placement pin, which
+postdates the workgroups form, keeps it off the NPU), and
+`rocket-fold-neutral-init`, run after inlining, drops the `+ init` /
+`max(.., init)` term when the init is a `linalg.fill` of the neutral element
+-- which arith itself never does, since `x + 0.0` is not `x` at `-0.0` --
+leaving a bare `extf` that the consumer's `truncf` cancels. And on an f32
+import the demote pass now narrows *through* a zero `tensor.pad`
+(`pad(truncf(x))`, not `truncf(pad(x))`), so `rocket-fold-conv-pad` and
+the pad-1 matchers see the same `pad -> conv` an f16 import gives them; the
+promote pass rebuilds the f32 pad for anything left unclaimed.
+
+Two chain fixtures joined the conv gate, both bit-exact and both chaining
+end to end with the middle compaction skipped: `fp16_conv_pool_conv_chain`
+(pool reads conv A's cube, conv B reads the pool's) and
+`fp16_matmul_chain`. On the models, `planck`, `taskset -c 4-7`, chain on
+vs `ROCKET_CHAIN=0`, medians:
+
+| model | NPU -> NPU edges chained | compactions skipped | chain off | on | |
+|---|---|---|---:|---:|---:|
+| VGG (f32 import, 16 conv + 5 pool), 10 s runs x3 | **20 of 20** (11 conv, 5 conv->pool, 4 pool->conv) | 20 of 21 | 676 ms | **617 ms** | **1.10x** |
+| VGG19 (f16 import, 16 conv; pools on CPU), 10 s x3 | 11 of 16 | 11 of 16 | 544 | **498** | 1.09x |
+| ResNet50 fp16 224x224 | 66 of 68 (unchanged) | 51 of 53 | 142 | 115 | 1.24x |
+| MobileNetV2 fp16 (f16 import) | 1 -> 6 of 47 | 2 | 87 | 88 | noise |
+
+All bit-identical chain on/off and against the earlier builds. The first
+row is the one this step is about: before it, the same model had 50 CPU
+dispatch sites (15 explicit pads, 16 widens, the rest shims' narrows) and
+5 chained edges; it now has 4 CPU sites, all of them the classifier, whose
+K = 25088 is past the matmul caps -- that is the `outside` 195 ms per
+inference in its profile and the whole reason the model is not faster.
+`pack.input` and `compact` are 0.0 and 0.1 ms per inference on it.
+
+Two things measured on the way that are not wins: a 3 s
+`--benchmark_min_time` on a 600 ms model is six iterations and the arms
+overlap by 15 % run to run -- the 10 s runs above are what settled both
+VGGs -- and the CNA padding the input itself was not faster than IREE's CPU
+pad plus a repack on this VGG (617 ms either way); it is the chaining the
+fold enables that pays, not the pad itself. Once during these measurements
+the board wedged (a benchmark left the NPU busy and the next process hung
+in `PREP_BO`, uninterruptible); it did not reproduce after a reboot in six
+further runs of both arms and is recorded rather than explained.
+
+What is left is coverage, not chaining: VGG19's torchvision export pools in
+f16 and the pooling matchers are f32-only, so its five pools stay on the
+CPU (and break the chain between blocks); ViT/Qwen3's matmul edges chain
+where the M/K/N caps admit both sides; and a matmul or pool whose consumer
+is the CPU (every classifier) keeps its dense write, as it must.
 
 ---
 
@@ -1904,10 +1969,13 @@ Where the time actually is, per inference: `outside` **70.9 ms (54%)**,
    round trip; on this model P2's reach is gated on the residual add, the
    pad and the whole-atom chain rule, not on P7.
 2. **P2** — 24.4 ms, 19% of wall, and the one part of the old "layout
-   propagation" lever P8 never tested. **Steps 2 and 4 landed 2026-09-08**:
-   the driver chain and the compiler-counted lazy compaction take ResNet50
-   169 -> 114 ms bit-identically; the reach left is the matmul/pooling/
-   elementwise kinds, which publish no cube. Two caveats now attached to it: the
+   propagation" lever P8 never tested. **Steps 2, 4 and 5 landed
+   2026-09-08**: the driver chain and the compiler-counted lazy compaction
+   take ResNet50 169 -> 114 ms bit-identically, and the breadth step
+   extends both to matmul, pooling and element-wise dispatches and makes
+   the plain-conv, pool and matmul edges actually adjacent (VGG f32: 20 of
+   20 edges, 1.10x). P2 is closed; what remains is matcher coverage (f16
+   pooling, the classifier matmuls past the caps). Two caveats now attached to it: the
    cost is concentrated in one convolution (5.4 ms, 30% of `compact`), and
    that convolution feeds a *depthwise* op, so it is not chainable until P7
    moves. Sizing P2 against the whole 24.4 ms overstates its reach.

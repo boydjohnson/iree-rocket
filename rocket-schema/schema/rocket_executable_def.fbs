@@ -336,6 +336,10 @@ table PoolingDef {
   // table, entries must be unique, and an absent vector preserves a fully
   // static ABI.
   runtime_dimensions:[PoolingDimension];
+
+  // See Conv2DDef.runtime_dense_readers: one trailing uint32 push constant
+  // carrying the compiler's count of Rocket dispatches that read the result.
+  runtime_dense_readers:bool = false;
 }
 
 // Describes one row-major [M,K] x [K,N] -> [M,N] matmul.
@@ -373,6 +377,10 @@ table MatmulDef {
 
   // Same contract as Conv2DDef.runtime_dimensions.
   runtime_dimensions:[MatmulDimension];
+
+  // See Conv2DDef.runtime_dense_readers: one trailing uint32 push constant
+  // carrying the compiler's count of Rocket dispatches that read the result.
+  runtime_dense_readers:bool = false;
 }
 
 // Describes one standalone unary element-wise operation on the EW ALU.
@@ -414,6 +422,10 @@ table ElementwiseUnaryDef {
   // table, entries must be unique, and an absent vector preserves a fully
   // static ABI.
   runtime_dimensions:[ElementwiseDimension];
+
+  // See Conv2DDef.runtime_dense_readers: one trailing uint32 push constant
+  // carrying the compiler's count of Rocket dispatches that read the result.
+  runtime_dense_readers:bool = false;
 }
 
 // Describes one standalone two-tensor element-wise operation on the EW
@@ -442,6 +454,10 @@ table ElementwiseBinaryDef {
 
   // Same contract as ElementwiseUnaryDef.runtime_dimensions.
   runtime_dimensions:[ElementwiseDimension];
+
+  // See Conv2DDef.runtime_dense_readers: one trailing uint32 push constant
+  // carrying the compiler's count of Rocket dispatches that read the result.
+  runtime_dense_readers:bool = false;
 }
 
 // Describes one standalone LUT activation: `out = f(in)` for one of the
@@ -483,6 +499,10 @@ table ElementwiseLutDef {
 
   // Same contract as ElementwiseUnaryDef.runtime_dimensions.
   runtime_dimensions:[ElementwiseDimension];
+
+  // See Conv2DDef.runtime_dense_readers: one trailing uint32 push constant
+  // carrying the compiler's count of Rocket dispatches that read the result.
+  runtime_dense_readers:bool = false;
 }
 
 // Add future Rocket kernel kinds here. Existing numeric values must not be

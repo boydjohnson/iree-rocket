@@ -174,6 +174,62 @@ void markDemoted(Operation *op, PatternRewriter &rewriter) {
   op->setAttr(kDemotedAttrName, rewriter.getUnitAttr());
 }
 
+// The f32 zero a static, zero-filled `tensor.pad` fills with, or null for
+// any other pad (dynamic amounts, a nonzero or non-constant fill).
+bool isStaticZeroPad(tensor::PadOp pad) {
+  if (!pad.getLow().empty() || !pad.getHigh().empty()) {
+    return false;
+  }
+  Value fill = pad.getConstantPaddingValue();
+  auto constant = fill ? fill.getDefiningOp<arith::ConstantOp>() : nullptr;
+  auto value = constant ? dyn_cast<FloatAttr>(constant.getValue()) : nullptr;
+  return value && value.getValue().isZero();
+}
+
+// Demotes `value`, the convolution's operand, to f16.
+//
+// Ordinarily that is one truncf generic over the operand. A zero pad in
+// front of the operand -- the explicit "same" padding every imported 3x3
+// convolution arrives with, possibly under the channels-last collapse -- is
+// demoted *through* instead: the truncf goes on the pad's source and the pad
+// is rebuilt in f16. Truncating and zero-padding commute exactly, and the
+// order matters for two later passes. rocket-fold-conv-pad and the pad-1
+// matchers want `pad -> collapse -> conv` with nothing between, which is the
+// f16 import's spelling and lets the CNA pad instead of a CPU copy; and the
+// truncf then sits directly on the producer's result, where the producer's
+// own f16 -> f32 widen cancels it and the two Rocket dispatches become
+// adjacent (ISSUES.md P2). Left as `truncf(pad(x))`, neither happens: the
+// pad is a CPU dispatch between every pair of convolutions.
+//
+// The rebuilt pad carries no tag (the DAG matchers compare whole attribute
+// dictionaries); RocketPromoteUnclaimedConvInputsPass recognises it by the
+// tagged truncf underneath.
+Value demoteInput(PatternRewriter &rewriter, Location loc, Value value) {
+  auto collapse = value.getDefiningOp<tensor::CollapseShapeOp>();
+  Value padded = collapse ? collapse.getSrc() : value;
+  if (auto pad = padded.getDefiningOp<tensor::PadOp>()) {
+    auto sourceType = cast<RankedTensorType>(pad.getSource().getType());
+    if (isStaticZeroPad(pad) && sourceType.getElementType().isF32()) {
+      Type f16 = rewriter.getF16Type();
+      Value source = truncateToF16(rewriter, loc, pad.getSource());
+      markDemoted(source.getDefiningOp(), rewriter);
+      Value zero = arith::ConstantOp::create(rewriter, loc, rewriter.getF16FloatAttr(0.0f));
+      Value newPad = tensor::PadOp::create(
+          rewriter, loc, cast<RankedTensorType>(pad.getType()).clone(f16), source,
+          pad.getMixedLowPad(), pad.getMixedHighPad(), zero);
+      if (!collapse) {
+        return newPad;
+      }
+      return tensor::CollapseShapeOp::create(
+          rewriter, loc, cast<RankedTensorType>(collapse.getType()).clone(f16), newPad,
+          collapse.getReassociationIndices());
+    }
+  }
+  Value demoted = truncateToF16(rewriter, loc, value);
+  markDemoted(demoted.getDefiningOp(), rewriter);
+  return demoted;
+}
+
 template <typename ContractionOpTy>
 struct DemoteInputsToF16 : OpRewritePattern<ContractionOpTy> {
   using OpRewritePattern<ContractionOpTy>::OpRewritePattern;
@@ -207,9 +263,7 @@ struct DemoteInputsToF16 : OpRewritePattern<ContractionOpTy> {
     Location loc = convOp.getLoc();
     SmallVector<Value> demotedInputs;
     for (OpOperand *inputOperand : convOp.getDpsInputOperands()) {
-      Value demoted = truncateToF16(rewriter, loc, inputOperand->get());
-      markDemoted(demoted.getDefiningOp(), rewriter);
-      demotedInputs.push_back(demoted);
+      demotedInputs.push_back(demoteInput(rewriter, loc, inputOperand->get()));
     }
     auto demotedOp = rewriter.replaceOpWithNewOp<ContractionOpTy>(
         convOp, demotedInputs, convOp.getDpsInits(), attributes);

@@ -333,6 +333,7 @@ fn decode_flatbuffer_shape(data: &[u8]) -> Result<UkernelShape, ()> {
             let executable = MatmulExecutable {
                 shape_template: shape,
                 runtime_dimensions,
+                runtime_dense_readers: matmul_def.runtime_dense_readers(),
             };
             executable.validate_template().map_err(|_| ())?;
             Ok(UkernelShape::Matmul(executable))
@@ -409,6 +410,7 @@ fn decode_flatbuffer_shape(data: &[u8]) -> Result<UkernelShape, ()> {
             let executable = PoolingExecutable {
                 shape_template,
                 runtime_dimensions,
+                runtime_dense_readers: pooling_def.runtime_dense_readers(),
             };
             executable.validate_template().map_err(|_| ())?;
             Ok(UkernelShape::Pooling(executable))
@@ -434,6 +436,7 @@ fn decode_flatbuffer_shape(data: &[u8]) -> Result<UkernelShape, ()> {
                 runtime_dimensions: decode_elementwise_dimensions(
                     ew.runtime_dimensions().map(|dimensions| dimensions.iter()),
                 )?,
+                runtime_dense_readers: ew.runtime_dense_readers(),
             };
             executable.validate_template().map_err(|_| ())?;
             Ok(UkernelShape::ElementwiseUnary(executable))
@@ -458,6 +461,7 @@ fn decode_flatbuffer_shape(data: &[u8]) -> Result<UkernelShape, ()> {
                 runtime_dimensions: decode_elementwise_dimensions(
                     ew.runtime_dimensions().map(|dimensions| dimensions.iter()),
                 )?,
+                runtime_dense_readers: ew.runtime_dense_readers(),
             };
             executable.validate_template().map_err(|_| ())?;
             Ok(UkernelShape::ElementwiseBinary(executable))
@@ -493,6 +497,7 @@ fn decode_flatbuffer_shape(data: &[u8]) -> Result<UkernelShape, ()> {
                 runtime_dimensions: decode_elementwise_dimensions(
                     lut.runtime_dimensions().map(|dimensions| dimensions.iter()),
                 )?,
+                runtime_dense_readers: lut.runtime_dense_readers(),
             };
             executable.validate_template().map_err(|_| ())?;
             Ok(UkernelShape::ElementwiseLut(executable))
@@ -1351,6 +1356,7 @@ mod tests {
                 op,
                 operand,
                 runtime_dimensions,
+                runtime_dense_readers: false,
             },
         );
         let export = schema::ExportDef::create(
@@ -1398,6 +1404,7 @@ mod tests {
                 input_scale,
                 output_scale,
                 runtime_dimensions,
+                runtime_dense_readers: false,
             },
         );
         let export = schema::ExportDef::create(
@@ -1480,6 +1487,7 @@ mod tests {
                 channels: 768,
                 op: schema::EwBinaryOp::MUL,
                 runtime_dimensions: None,
+                runtime_dense_readers: false,
             },
         );
         let export = schema::ExportDef::create(
@@ -1724,6 +1732,7 @@ mod tests {
                 method,
                 precision,
                 runtime_dimensions,
+                runtime_dense_readers: false,
             },
         );
         let export = schema::ExportDef::create(
@@ -1763,6 +1772,7 @@ mod tests {
                 n,
                 precision: schema::Precision::FP16,
                 runtime_dimensions,
+                runtime_dense_readers: false,
                 ..Default::default()
             },
         );

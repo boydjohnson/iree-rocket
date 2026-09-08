@@ -1697,6 +1697,29 @@ mod chain_identity_tests {
     }
 
     #[test]
+    fn a_four_rounded_surface_stride_is_a_different_cube() {
+        // The PPU strides its surfaces by the pixel count rounded up to
+        // four. A 7x7 pool output therefore lives at stride 52 while a conv
+        // or EW consumer of 49 pixels repacks at stride 49: compacting the
+        // one and repacking as the other does not give the bytes back, which
+        // is why `chainable_cube` compares surface strides and a pool only
+        // chains at a multiple of four pixels. At 8x8 the strides agree.
+        const BPP: usize = 64 * 2;
+        let surfaces = BPP / FEATURE_ATOMIC_BYTES;
+        let cube_52 = distinct_cube(52, BPP);
+        let mut dense = vec![0u8; 49 * BPP];
+        let written =
+            compact_atomic_output(&cube_52, 52, 49, BPP, FEATURE_ATOMIC_BYTES, &mut dense);
+        assert_eq!(written, dense.len());
+        let repacked_49 = repack(&dense, 49, BPP, BPP);
+        assert_eq!(repacked_49.len(), 49 * surfaces * FEATURE_ATOMIC_BYTES);
+        assert_ne!(&cube_52[..repacked_49.len()], &repacked_49[..]);
+
+        let cube_64 = distinct_cube(64, BPP);
+        assert_eq!(round_trip(&cube_64, 64, BPP, BPP), cube_64);
+    }
+
+    #[test]
     fn a_producers_padding_surfaces_lie_outside_the_chained_region() {
         // A producer writes `padded_out_channels`, which can be wider than
         // the logical tensor. Those surfaces sit past everything the

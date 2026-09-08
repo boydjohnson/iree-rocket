@@ -36,8 +36,10 @@
 // them and f16 weights already hoisted to constants, so undoing it there
 // would mean rewriting two executables and re-folding a constant.
 
+#include "mlir/Dialect/Arith/IR/Arith.h"
 #include "mlir/Dialect/Linalg/IR/Linalg.h"
 #include "mlir/Dialect/Linalg/Utils/Utils.h"
+#include "mlir/Dialect/Tensor/IR/Tensor.h"
 #include "mlir/IR/PatternMatch.h"
 #include "mlir/Pass/Pass.h"
 #include "mlir/Transforms/GreedyPatternRewriteDriver.h"
@@ -78,6 +80,39 @@ Value originalF32Source(Value demoted) {
   return source;
 }
 
+// `originalF32Source`, looking through the f16 zero pad (and the collapse
+// over it) the demote pass builds when it demotes *through* a pad. The pad
+// itself carries no tag -- the DAG matchers compare attribute dictionaries
+// -- so it is recognised by the tagged truncf underneath, and rebuilt in f32
+// over that truncf's source. Nullptr when `demoted` is none of these, so the
+// caller leaves the operation alone.
+Value promotedF32Source(PatternRewriter &rewriter, Location loc, Value demoted) {
+  if (Value source = originalF32Source(demoted)) {
+    return source;
+  }
+  Type f32 = rewriter.getF32Type();
+  if (auto collapse = demoted.getDefiningOp<tensor::CollapseShapeOp>()) {
+    Value source = promotedF32Source(rewriter, loc, collapse.getSrc());
+    if (!source) {
+      return {};
+    }
+    return tensor::CollapseShapeOp::create(
+        rewriter, loc, cast<RankedTensorType>(collapse.getType()).clone(f32), source,
+        collapse.getReassociationIndices());
+  }
+  if (auto pad = demoted.getDefiningOp<tensor::PadOp>()) {
+    Value source = originalF32Source(pad.getSource());
+    if (!source || !pad.getLow().empty() || !pad.getHigh().empty()) {
+      return {};
+    }
+    Value zero = arith::ConstantOp::create(rewriter, loc, rewriter.getF32FloatAttr(0.0f));
+    return tensor::PadOp::create(rewriter, loc,
+                                 cast<RankedTensorType>(pad.getType()).clone(f32), source,
+                                 pad.getMixedLowPad(), pad.getMixedHighPad(), zero);
+  }
+  return {};
+}
+
 template <typename ContractionOpTy>
 struct PromoteInputsToF32 : OpRewritePattern<ContractionOpTy> {
   using OpRewritePattern<ContractionOpTy>::OpRewritePattern;
@@ -88,15 +123,25 @@ struct PromoteInputsToF32 : OpRewritePattern<ContractionOpTy> {
       return failure();
     }
 
+    // Every input is checked before any is rebuilt: a demoted input whose
+    // truncf is gone or was rewritten leaves the whole operation alone
+    // rather than promoting it halfway.
     SmallVector<Value> promotedInputs;
     for (OpOperand *inputOperand : convOp.getDpsInputOperands()) {
-      Value source = originalF32Source(inputOperand->get());
-      if (!source) {
-        // A demoted input whose truncf is gone or was rewritten. Leave the
-        // whole operation alone rather than promote it halfway.
+      Value probe = inputOperand->get();
+      if (auto collapse = probe.getDefiningOp<tensor::CollapseShapeOp>()) {
+        probe = collapse.getSrc();
+      }
+      if (auto pad = probe.getDefiningOp<tensor::PadOp>()) {
+        probe = pad.getSource();
+      }
+      if (!originalF32Source(probe)) {
         return failure();
       }
-      promotedInputs.push_back(source);
+    }
+    Location loc = convOp.getLoc();
+    for (OpOperand *inputOperand : convOp.getDpsInputOperands()) {
+      promotedInputs.push_back(promotedF32Source(rewriter, loc, inputOperand->get()));
     }
 
     SmallVector<NamedAttribute> attributes =
@@ -131,7 +176,7 @@ struct RocketPromoteUnclaimedConvInputsPass
   }
 
   void getDependentDialects(DialectRegistry &registry) const final {
-    registry.insert<linalg::LinalgDialect>();
+    registry.insert<arith::ArithDialect, linalg::LinalgDialect, tensor::TensorDialect>();
   }
 
   void runOnOperation() final {

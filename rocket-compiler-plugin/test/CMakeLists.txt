@@ -20,6 +20,8 @@ iree_lit_test_suite(
     "rocket_int8_match_boundaries.mlir"
     "rocket_int8_requant_match.mlir"
     "rocket_mark_dense_readers.mlir"
+    "rocket_fold_neutral_init.mlir"
+    "rocket_demote_through_pad.mlir"
     "rocket_fp16_match_boundaries.mlir"
     "rocket_int8_offload.mlir"
     "rocket_matmul.mlir"
