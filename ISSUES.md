@@ -26,8 +26,10 @@ run but no compiled model can reach yet. One of its phases is gated on an
 issue here by name: P8's measured per-dispatch cost is why its coverage
 matchers land behind a flag. C5, which used to gate the LUT path in a compiled
 model, was resolved 2026-09-06, and C2 and P6 on 2026-09-07 -- see
-**Resolved**. C12 (2026-09-08) is there too: the one hazard LIMITS.md and
-DYNAMIC_SHAPES.md carried that this file did not, closed by measurement. ROADMAP's fused-activation row landed the same day, which is
+**Resolved**. C12 and C13 (2026-09-08) are there too: the one hazard
+LIMITS.md and DYNAMIC_SHAPES.md carried that this file did not, and the
+chained-dispatch fault behind P8's `Cin` 1344 anomaly and the `Cout` 24
+rule. ROADMAP's fused-activation row landed the same day, which is
 what moved P7's and P2's numbers below.
 
 Trimmed 2026-09-05: issues that are settled were cut down to one entry each
@@ -889,6 +891,12 @@ asserting the dispatch reaches the *specific* executable, which
 
 ### Cin 1344 is exact in every isolated test and wrong inside the model
 
+**Resolved 2026-09-08 as C13 -- see Resolved.** It was never this
+convolution. The section below is kept as it was measured, because its
+method (every shape-level instrument exact, the model wrong) is what pointed
+at the chain rather than the dispatch. The bound now ships at 1344 and the
+`Cout` floor at 16.
+
 Open, 2026-09-06. Raising the requantized matchers' `Cin` bound from 512 to
 1344 puts 32 of MobileNetV2-static-int8's 34 dense convolutions on the
 requantized path and **breaks the model**: logits go from max|diff| 0.33
@@ -1246,6 +1254,56 @@ What was settled and how, newest first, in place of the narratives — those are
 in this file's git history (`git log -p ISSUES.md`). Everything cited below is
 something that still exists: a commit, a file, or a memory.
 
+**C13 (S1) — 2026-09-08. A dispatch that consumed another dispatch's output
+in the same command buffer read it before it was written.** `apply_ops`
+walked the whole recorded command buffer up front -- packing every
+dispatch's input, then handing `queue_execute` the list of jobs to submit,
+wait on and compact -- so the second of two chained dispatches packed the
+transient before the first had compacted into it, and the hardware saw an
+all-zero input. IREE emits exactly that command buffer whenever two Rocket
+dispatches have nothing on the CPU between them: one `hal.command_buffer`,
+two dispatches, an `execution_barrier` the driver records as a no-op.
+
+This is what P8's `Cin` 1344 anomaly and the requantized path's "`Cout` 24
+is wrong" rule both were. Those two convolutions -- `1344 -> 448` and
+`48 -> 24` -- are MobileNetV2's only two projection layers whose output feeds
+the next convolution alone; every other projection also feeds a residual
+add, and every expansion or depthwise output passes through a CPU ReLU6.
+With both convolutions on the requantized path, the producer's s8->u8 shift,
+the consumer's u8->s8 shift and the transpose pair fold away and the two
+dispatches touch. Nothing else in any measured model does: fp16 convolutions
+keep a CPU bias or clamp between them, ViT's matmuls have adds between them,
+and the accumulator path always leaves an `i32` epilogue on the CPU. So the
+bug hid behind two channel bounds that happened to exclude exactly those
+edges.
+
+Found by elimination on the board. Every value-shaped hypothesis was refuted
+first with a new `magnitude` oracle pattern (constant input, unit weights,
+optional BS-plane bias): accumulators to 877,824, a cancelling bias of
+either magnitude, 0x80 feature bytes and the exact 7x7 `Cin` 1344 `Cout`
+448 shape are all exact on the requantized path, both signs. Then the
+structural one reproduced at `Cin` 64: `requant_int8_chain`, two 1x1
+convolutions with the first's output as the second's input, 4048/4096
+wrong (max error 181), and its output is bit-for-bit `requant(0 + bias)` --
+a zero input. `requant_int8_chain_cpu_between`, the same pair with one CPU
+clamp between them, is exact.
+
+Fixed in `rocket-hal-driver`: `apply_ops_until_dispatch` applies the
+recorded ops in call order and stops at each dispatch, and `queue_execute`
+runs that dispatch to completion before asking for the next. M2's batched
+tile submission inside a dispatch is untouched. Gates: the full compiled
+conv gate (28 cases, chain and control included), matmul and pooling e2e,
+and MobileNetV2-static-int8 with the requant bounds widened to `Cin` 1344
+and `Cout` >= 16 -- max|diff| **0.35** against the CPU arm, same argmax and
+top-5, where the same build was 5.01 / 4.71 and a different class. The CPU
+arm itself is bit-identical to onnxruntime. Both bounds ship widened.
+
+Two things worth keeping. **A hazard that hides behind a shape bound looks
+like a shape rule**: both "rules" were measurements of the same bug, taken
+on the only two shapes that exercised it. **And the model was the only
+instrument that could see it**, because every fixture in every gate ran one
+dispatch per function; chaining is now in the gate.
+
 **C12 (S1) — 2026-09-08. The "11/1 silent-zero" 3x3 hazard was a
 watchdog-killed job on a planner that no longer exists.** LIMITS.md's
 *Hazards inside the limits* carried, and DYNAMIC_SHAPES.md DS3 escalated,
@@ -1536,12 +1594,11 @@ Where the time actually is, per inference: `outside` **70.9 ms (54%)**,
    cost is concentrated in one convolution (5.4 ms, 30% of `compact`), and
    that convolution feeds a *depthwise* op, so it is not chainable until P7
    moves. Sizing P2 against the whole 24.4 ms overstates its reach.
-3. **P8's `Cin` 1344 anomaly** — the only open correctness unknown in this
-   file: exact in every isolated instrument, wrong inside the model, bisected
-   to one convolution, and currently capped by a measurement rather than an
-   explanation. It needs an instrument that compares *intermediate tensors*
-   inside a real model, which this repo does not have and has wanted more than
-   once. Ahead of P3/C4/P4/P1 on severity, behind P7/P2 on wall clock.
+3. ~~**P8's `Cin` 1344 anomaly**~~ — closed 2026-09-08 as **C13**: the
+   driver packed a chained dispatch's input before the dispatch ahead of it
+   had written it. Not a `Cin` rule, not a `Cout` rule; the two "anomalies"
+   were the model's only two NPU -> NPU edges. No open correctness unknown
+   remains in this file.
 4. **P3 → C4 → P4 → P1** — the dispatch-path cost stack, in increasing order
    of work. P3's second half is done (the scratch pool); what stands is the
    whole-BO cache sync, ∝ pages not bytes, which `MULTICORE.md` §12 also names
@@ -1558,7 +1615,7 @@ Where the time actually is, per inference: `outside` **70.9 ms (54%)**,
    tripled the above-3x3 `Cin` ceilings and one a retraction.
 
 Done and in **Resolved**: the requantized int8 path (2026-09-06), C2
-(2026-09-07), P6 (2026-09-07), C9 (2026-09-07), C12 (2026-09-08).
+(2026-09-07), P6 (2026-09-07), C9 (2026-09-07), C12 and C13 (2026-09-08).
 
 ---
 

@@ -7550,37 +7550,31 @@ module attributes {transform.with_named_sequence} {
 
     %input_value = transform.get_operand %conv[0] : (!transform.any_op) -> !transform.any_value
     %filter_value = transform.get_operand %conv[1] : (!transform.any_op) -> !transform.any_value
-    // Raised 512 -> 816 on 2026-09-06. The ceiling is a *model* measurement,
-    // not a shape one, and it is lower than every isolated test supports:
-    // the HAL sweep `dtype_boundary_probe` is exact to Cin 1792 under both
-    // patterns valid for this path (`selectors-affine` and `onehot`), and
-    // `tools/e2e_conv_regression.py` is exact at Cin 1344 Cout 448 -- max
-    // error 0, not 1 -- for the very convolution that breaks the model.
-    // Admitting Cin 1344 moves MobileNetV2's logits from max|diff| 0.33 to
-    // 5.01 and its argmax from 447 to 977, bisected to that one shape. Two
-    // hypotheses are ruled out by measurement: it is not the shape (exact in
-    // isolation) and not the folded bias magnitude (`requant_int8_1x1_
-    // large_bias` puts a million-scale bias through the same shape and is
-    // exact). The discriminator is unidentified, so the bound stops at the
-    // widest Cin the model is *measured* correct at. See ISSUES.md.
+    // 1344 is the widest Cin a measured model asks for, and it is the
+    // model that says so: MobileNetV2-static-int8 with its 7x7 Cin 1344 ->
+    // Cout 448 projection on this path is max|diff| 0.35 against the CPU
+    // arm, same argmax and top-5 (`planck`, 2026-09-08). This bound sat at
+    // 816 for two days because admitting 1344 used to move the logits to
+    // 5.01 while every isolated instrument said the shape was exact -- and
+    // it was. The fault was never this convolution: it is the only one in
+    // the model whose output feeds the next convolution with nothing on the
+    // CPU between them, and the driver packed a chained dispatch's input
+    // before the dispatch ahead of it had written it (ISSUES.md C13). The
+    // HAL sweep is exact to Cin 1792 and the compiled differential to
+    // 1344; raise this on a model, as before, not on a fixture.
     //
     // The accumulator path's own caps do not apply here and never did: they
     // came from the 384-coefficient-bytes-per-output-channel limit that
     // `int8_accumulator` has and this path does not.
-    transform.iree.match.dim_bounds %input_value[3], umin = 1, umax = 816 : !transform.any_value
-    // Cout has a *lower* bound of 32, and it is a measurement, not a
-    // convention. MobileNetV2's `112x112 Cin 48 -> Cout 24` pointwise
-    // convolution is wrong on this path: admitting it alone moves the
-    // model's logits from max|diff| 0.40 against a CPU reference to 4.71,
-    // with the mean rising from 0.07 to 0.99 against a logit standard
-    // deviation of 1.17 -- the output stops being a classification. Every
-    // other Cout the model asks for is exact, including 88, which is not a
-    // multiple of the 16-channel atom either, so the rule is not "whole
-    // atoms": 24 is simply below the smallest Cout measured correct (32).
-    // Bisected on `planck` 2026-09-06 by admitting convolutions in Cin
-    // order and then excluding this one shape, which restored the baseline
-    // exactly. 25..31 are untested and excluded with it.
-    transform.iree.match.dim_bounds %filter_value[3], umin = 32, umax = 1792 : !transform.any_value
+    transform.iree.match.dim_bounds %input_value[3], umin = 1, umax = 1344 : !transform.any_value
+    // Cout's lower bound is one 16-channel atom. It was 32 for two days on
+    // the strength of MobileNetV2's `112x112 Cin 48 -> Cout 24` projection,
+    // which moved the logits to max|diff| 4.71 when admitted; that
+    // convolution is the model's *other* NPU -> NPU edge with no CPU op
+    // between producer and consumer, and it failed for the reason above,
+    // not for its width (ISSUES.md C13). It is exact now, in the same
+    // model-level measurement. Below 16 is untested.
+    transform.iree.match.dim_bounds %filter_value[3], umin = 16, umax = 1792 : !transform.any_value
 
     %ins, %outs = transform.iree.match.cast_compatible_dag_from_root %root {
       ^bb0(%input: tensor<1x?x?x?xi8>, %weights: tensor<?x?x?x?xi8>,
@@ -7650,19 +7644,10 @@ module attributes {transform.with_named_sequence} {
     // HAL sweep is exact at 3x3 Cin 1024 too. MobileNetV2's 3x3 convolutions
     // are all depthwise, so nothing in the measured models needs more.
     transform.iree.match.dim_bounds %input_value[3], umin = 1, umax = 768 : !transform.any_value
-    // Cout has a *lower* bound of 32, and it is a measurement, not a
-    // convention. MobileNetV2's `112x112 Cin 48 -> Cout 24` pointwise
-    // convolution is wrong on this path: admitting it alone moves the
-    // model's logits from max|diff| 0.40 against a CPU reference to 4.71,
-    // with the mean rising from 0.07 to 0.99 against a logit standard
-    // deviation of 1.17 -- the output stops being a classification. Every
-    // other Cout the model asks for is exact, including 88, which is not a
-    // multiple of the 16-channel atom either, so the rule is not "whole
-    // atoms": 24 is simply below the smallest Cout measured correct (32).
-    // Bisected on `planck` 2026-09-06 by admitting convolutions in Cin
-    // order and then excluding this one shape, which restored the baseline
-    // exactly. 25..31 are untested and excluded with it.
-    transform.iree.match.dim_bounds %filter_value[3], umin = 32, umax = 768 : !transform.any_value
+    // Cout's lower bound is one 16-channel atom, as on the 1x1 matcher: the
+    // "Cout 24 is wrong" measurement that put 32 here was the chained
+    // dispatch fault of ISSUES.md C13, not a width. Below 16 is untested.
+    transform.iree.match.dim_bounds %filter_value[3], umin = 16, umax = 768 : !transform.any_value
 
     %ins, %outs = transform.iree.match.cast_compatible_dag_from_root %root {
       ^bb0(%input: tensor<1x?x?x?xi8>, %weights: tensor<?x?x?x?xi8>,

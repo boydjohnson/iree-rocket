@@ -58,6 +58,21 @@ pub enum OraclePattern {
     /// Every logical input and coefficient is one. This exercises every Cin
     /// lane and reduces the expected accumulator to Cin times valid taps.
     Counting,
+    /// `Counting` with every input at `input` instead of one, so the
+    /// accumulator is `valid_taps * Cin * input` and its *magnitude* is
+    /// dialled by the shape alone. This is the pattern that separates a
+    /// datapath width from a shape: at a 3x3 kernel and `input` 127 an
+    /// interior accumulator crosses 2^19 between `Cin` 448 and 464 while
+    /// the border pixels, with fewer valid taps, stay below it in the same
+    /// job. Every other pattern here keeps int8 accumulators in the tens of
+    /// thousands, which is why a requantized convolution that is exact under
+    /// all of them can still be wrong in a model (ISSUES.md P8's `Cin` 1344).
+    ///
+    /// `bias` goes onto the BS plane of every real output channel, so the
+    /// accumulator and the bias can each be driven past a width while their
+    /// sum stays small -- which is what a folded input zero point does to a
+    /// real quantized layer, and what no other fixture here reproduces.
+    Magnitude { input: i32, bias: i32 },
     /// Three signed coefficients per output channel select distinct HWCF
     /// positions. Inputs vary in y, x, and channel, exposing permutations.
     Selectors { phase: usize },
@@ -137,6 +152,7 @@ impl OraclePattern {
     pub fn name(self) -> &'static str {
         match self {
             Self::Counting => "counting",
+            Self::Magnitude { .. } => "magnitude",
             Self::Selectors { .. } => "selectors",
             Self::SelectorsAffine { .. } => "selectors-affine",
             Self::OneHotNeutral80 {
@@ -187,7 +203,16 @@ impl Conv2dCase {
         {
             return 0;
         }
-        let peak = self.cin * (self.kernel[0] * self.kernel[1]) as u32;
+        let taps = (self.kernel[0] * self.kernel[1]) as i64;
+        let peak = match self.pattern {
+            // The interior value is what the case is about; a border pixel,
+            // with fewer taps against the same bias, may clamp.
+            OraclePattern::Magnitude { input, bias } => {
+                (i64::from(self.cin) * taps * i64::from(input) + i64::from(bias)).unsigned_abs()
+                    as u32
+            }
+            _ => self.cin * taps as u32,
+        };
         let mut shift = 0;
         while (peak >> shift) > 127 {
             shift += 1;
@@ -206,7 +231,9 @@ impl Conv2dCase {
             OraclePrecision::Int8 => {
                 let (output_zero_point, multiplier) = match self.pattern {
                     OraclePattern::RawByteSweep => (-128, Multiplier::for_unit_bs(128.0)),
-                    OraclePattern::Counting | OraclePattern::SelectorsAffine { .. } => (
+                    OraclePattern::Counting
+                    | OraclePattern::Magnitude { .. }
+                    | OraclePattern::SelectorsAffine { .. } => (
                         0,
                         Multiplier::from_ratio(1.0 / f64::from(1u32 << self.output_shift())),
                     ),
@@ -426,6 +453,7 @@ pub fn f16_to_f32(bits: u16) -> f32 {
 fn input_value(case: Conv2dCase, y: usize, x: usize, channel: usize) -> i32 {
     match case.pattern {
         OraclePattern::Counting => 1,
+        OraclePattern::Magnitude { input, .. } => input,
         OraclePattern::Selectors { phase }
         | OraclePattern::SelectorsAffine { phase }
         | OraclePattern::Dense { phase } => {
@@ -470,6 +498,7 @@ fn selector_weights(case: Conv2dCase, output_channel: usize) -> [(usize, i32); 3
     let phase = match case.pattern {
         OraclePattern::Selectors { phase } | OraclePattern::SelectorsAffine { phase } => phase,
         OraclePattern::Counting
+        | OraclePattern::Magnitude { .. }
         | OraclePattern::OneHotNeutral80 { .. }
         | OraclePattern::RawByteSweep
         | OraclePattern::RawByteSweepUnit
@@ -491,6 +520,7 @@ fn one_hot_selector(case: Conv2dCase, output_channel: usize) -> usize {
         OraclePattern::OneHotNeutral80 { phase, .. }
         | OraclePattern::WideOperands { phase, .. } => phase,
         OraclePattern::Counting
+        | OraclePattern::Magnitude { .. }
         | OraclePattern::Selectors { .. }
         | OraclePattern::SelectorsAffine { .. }
         | OraclePattern::RawByteSweep
@@ -517,7 +547,7 @@ fn weight_value(
     output_channel: usize,
 ) -> i32 {
     match case.pattern {
-        OraclePattern::Counting => 1,
+        OraclePattern::Counting | OraclePattern::Magnitude { .. } => 1,
         OraclePattern::Selectors { .. } | OraclePattern::SelectorsAffine { .. } => {
             let selector = (ky * case.kernel[1] + kx) * case.cin as usize + input_channel;
             selector_weights(case, output_channel)
@@ -597,7 +627,11 @@ pub fn expected_accumulator(
     let input_origin_y = output_y as isize * case.stride as isize - case.padding[0] as isize;
     let input_origin_x = output_x as isize * case.stride as isize - case.padding[1] as isize;
     match case.pattern {
-        OraclePattern::Counting => {
+        OraclePattern::Counting | OraclePattern::Magnitude { .. } => {
+            let (input, bias) = match case.pattern {
+                OraclePattern::Magnitude { input, bias } => (input, bias),
+                _ => (1, 0),
+            };
             let mut valid_taps = 0i32;
             for ky in 0..case.kernel[0] {
                 let input_y = input_origin_y + ky as isize;
@@ -611,7 +645,7 @@ pub fn expected_accumulator(
                     }
                 }
             }
-            valid_taps * case.cin as i32
+            valid_taps * case.cin as i32 * input + bias
         }
         OraclePattern::Selectors { .. } | OraclePattern::SelectorsAffine { .. } => {
             selector_weights(case, output_channel)
@@ -787,7 +821,9 @@ fn uses_affine_int8_weights(case: Conv2dCase) -> bool {
     case.precision == OraclePrecision::Int8
         && matches!(
             case.pattern,
-            OraclePattern::Counting | OraclePattern::SelectorsAffine { .. }
+            OraclePattern::Counting
+                | OraclePattern::Magnitude { .. }
+                | OraclePattern::SelectorsAffine { .. }
         )
 }
 
@@ -1091,12 +1127,16 @@ fn build_fixture_for_shape(case: Conv2dCase, shape: Shape) -> Result<Conv2dFixtu
         OraclePrecision::Int8 => {
             let channels = shape.padded_out_channels();
             let mut bytes = vec![0; bs_buffer_bytes(channels)];
+            let plane_bias = match case.pattern {
+                OraclePattern::Magnitude { bias, .. } => bias,
+                _ => 0,
+            };
             let entries = if let Some(zero_points) = &weight_zero_points {
                 (0..channels as usize)
                     .map(|channel| {
                         if channel < zero_points.len() {
                             BsEntry {
-                                bias: 0,
+                                bias: plane_bias,
                                 constant: -i16::from(zero_points[channel]),
                                 multiplier: 1 << 14,
                             }

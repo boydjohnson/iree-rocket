@@ -505,6 +505,14 @@ known ways a shape in range still misbehaves.
   `dense_k3_plan_never_starves_the_streamed_coefficient_working_set` pins the
   grant on the host, and a compiled model has no wire field that can force a
   split, so `ConvPlan::new` is the only path it can take.
+- ~~**Two Rocket dispatches in one command buffer, the second reading the
+  first's output, computed on a zero input.**~~ **Fixed 2026-09-08, ISSUES.md
+  C13.** The driver packed every dispatch's operands before running any, so
+  a chained pair -- which IREE emits whenever nothing on the CPU sits between
+  two offloaded ops -- packed the transient before it was written. This is
+  what the requantized path's `Cin` 816 and `Cout` 32 bounds were really
+  measuring; they are 1344 and 16 now. `requant_int8_chain` in the compiled
+  conv gate is the regression case.
 - **`Cin > 4` and `Cin <= 4` take different feature paths**, and the dense
   ARGB path silently corrupts multi-row fetches at some alignments;
   `Shape::dense_feature_offset_safe` is the hardware-measured guard.

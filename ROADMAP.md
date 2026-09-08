@@ -741,13 +741,13 @@ rather than the 1792 every isolated instrument supports because the model
 says so: see ISSUES.md's "Cin 1344 is exact in every isolated test and wrong
 inside the model".
 
-The model also found a hardware limit no fixture had: **`Cout = 24` is wrong
-on the requantized path.** Admitting that one convolution moves the model's
-logits from max|diff| 0.40 to 4.71 and the mean from 0.07 to 0.99 against a
-logit standard deviation of 1.17 -- the output stops being a classification.
-`Cout` 88 is exact and is not a whole number of 16-channel atoms either, so
-the rule is not "whole atoms"; 24 is simply below the smallest `Cout`
-measured correct. Both requantized matchers now carry `umin = 32`.
+~~The model also found a hardware limit no fixture had: **`Cout = 24` is
+wrong on the requantized path.**~~ It was not a hardware limit and not a
+width: that convolution and the `Cin` 1344 one are the model's only two
+NPU -> NPU edges, and the driver packed the second dispatch's input before
+the first had written it (ISSUES.md **C13**, fixed 2026-09-08). Both
+requantized matchers now carry `umin = 16` and the 1x1 `Cin` bound is 1344;
+the model is max|diff| 0.35 against the CPU arm with both admitted.
 
 Two questions that looked like blockers and are not: the activations are ONNX
 `ui8`, but `quantized-conv-to-conv` has already folded the unsigned-to-signed
