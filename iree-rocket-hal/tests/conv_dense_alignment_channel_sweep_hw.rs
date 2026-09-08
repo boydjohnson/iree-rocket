@@ -124,7 +124,7 @@ fn run(fd: i32, file: &std::fs::File, cin: u32, cout: u32, width: u32, in_first:
 
         let dense_weight_elems = KERNEL * KERNEL * cin as usize * cout as usize;
         let mut dense_weights = vec![0u16; dense_weight_elems];
-        let center_index = (1 * KERNEL + 1) * cin as usize * cout as usize + 0 * cout as usize + 0;
+        let center_index = (KERNEL + 1) * cin as usize * cout as usize;
         dense_weights[center_index] = 0x3c00;
         let dense_weight_bytes: Vec<u8> =
             dense_weights.iter().flat_map(|w| w.to_le_bytes()).collect();

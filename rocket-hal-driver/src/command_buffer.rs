@@ -736,6 +736,9 @@ fn chainable_cube(
 ///
 /// Every context's file must stay open for the command buffer's life, and
 /// `Binding` sources must be live `RocketBuffer`s retained by it.
+// Several of these are already tuple-grouped; a struct wrapper would just
+// move the same fields into a constructor.
+#[allow(clippy::too_many_arguments)]
 unsafe fn build_replicas(
     contexts: &[Arc<crate::pool::NpuContext>],
     input: (ReplicaSource, usize),
@@ -952,14 +955,14 @@ unsafe fn stage_direct(
             rocket_buffer.handle,
         );
     }
-    let length = binding.length as usize;
+    let length = binding.length;
     let scratch =
         unsafe { RocketOwnedBuffer::new(cb.fd, length.max(1), BorrowedFd::borrow_raw(cb.fd)) };
     let staged = (scratch.dma_address, scratch.handle);
     staged_copies.push(StagedCopy {
         source: CopySource::Binding {
             buffer: binding.buffer,
-            offset: binding.offset as usize,
+            offset: binding.offset,
         },
         length,
         scratch_ptr: scratch.host_ptr,
@@ -1004,7 +1007,7 @@ unsafe fn stage_weights(
     if pending_writer {
         weight_cache::note_recorded_writer();
     }
-    let mut packing = |scratch_ptr: *mut u8, scratch_handle: u32, verify_against| WeightPacking {
+    let packing = |scratch_ptr: *mut u8, scratch_handle: u32, verify_against| WeightPacking {
         weight_buffer: weight_ref.buffer,
         weight_offset: weight_ref.offset,
         weight_length: weight_ref.length,
@@ -1212,6 +1215,10 @@ pub struct OutputCube {
 
 /// One recorded command-buffer operation, in call order -- see module doc
 /// comment for why these are recorded rather than applied immediately.
+// `Dispatch` dwarfs the other variants, but boxing its dozen-odd
+// `Option<...>` fields would touch every construction and field-access
+// site across this file for no behavioral change; not worth it here.
+#[allow(clippy::large_enum_variant)]
 pub enum RecordedOp {
     Fill {
         target: iree_hal_buffer_ref_t,
@@ -1411,6 +1418,11 @@ impl RocketCommandBuffer {
 }
 
 /// The context `command_buffer` was recorded against, for `queue_execute`.
+///
+/// # Safety
+///
+/// `command_buffer` must be a valid, non-null pointer to a
+/// `RocketCommandBuffer` created by [`create`] and still live.
 pub unsafe fn context_id(command_buffer: *mut iree_hal_command_buffer_t) -> usize {
     unsafe { (&*cast(command_buffer)).context.id }
 }
@@ -1455,6 +1467,13 @@ unsafe fn retain_direct_bindings(refs: &[iree_hal_buffer_ref_t]) -> Vec<*mut ire
 /// submit, wait, compact -- before asking for the next, which is exactly
 /// the ordering the barrier IREE recorded between them requires and the
 /// only one `execution_barrier` (a no-op here) could ever have meant.
+///
+/// # Safety
+///
+/// `command_buffer` must be a valid, non-null pointer to a
+/// `RocketCommandBuffer` created by [`create`] and still live, and
+/// `*cursor` must be a valid index into its recorded ops (0 on the first
+/// call, then whatever this function last wrote back).
 pub unsafe fn apply_ops_until_dispatch(
     command_buffer: *mut iree_hal_command_buffer_t,
     cursor: &mut usize,
@@ -1973,6 +1992,10 @@ pub unsafe fn apply_ops_until_dispatch(
     Ok(None)
 }
 
+/// # Safety
+///
+/// `device_allocator` must be a valid, non-null pointer to a live
+/// `iree_hal_allocator_t` that outlives the returned command buffer.
 pub unsafe fn create(
     device_allocator: *mut crate::bindings::iree_hal_allocator_t,
     context: Arc<crate::pool::NpuContext>,

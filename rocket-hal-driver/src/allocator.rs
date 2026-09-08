@@ -77,6 +77,11 @@ pub fn create(file: std::fs::File, host_allocator: iree_allocator_t) -> *mut ire
 
 /// See `RocketAllocator::device`'s doc comment for why this is a
 /// separate, post-construction step rather than a `create` parameter.
+///
+/// # Safety
+///
+/// `allocator` must be a valid, non-null pointer to a `RocketAllocator`
+/// returned by this module's `create` and still live.
 pub unsafe fn set_device(
     allocator: *mut iree_hal_allocator_t,
     device: *mut crate::bindings::iree_hal_device_t,
@@ -319,6 +324,9 @@ status_stub!(export_buffer(
     out_external_buffer: *mut iree_hal_external_buffer_t,
 ) -> iree_status_t);
 
+/// # Safety
+///
+/// `allocator` is never dereferenced; any pointer value is accepted.
 #[allow(unused_variables)]
 pub unsafe extern "C" fn supports_virtual_memory(allocator: *mut iree_hal_allocator_t) -> bool {
     false

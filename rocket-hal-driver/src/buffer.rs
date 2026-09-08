@@ -67,6 +67,11 @@ unsafe fn cast(buffer: *mut iree_hal_buffer_t) -> *mut RocketBuffer {
 /// Not part of the vtable -- `device::queue_dealloca`/`queue_fill`/
 /// `queue_update`/`queue_copy` call these directly to enforce the
 /// dealloca contract described on `RocketBuffer::deallocated`.
+///
+/// # Safety
+///
+/// `buffer` must be a valid, non-null pointer to a `RocketBuffer` created
+/// by this driver's allocator and still live.
 pub unsafe fn is_deallocated(buffer: *mut iree_hal_buffer_t) -> bool {
     unsafe {
         (*cast(buffer))
@@ -76,6 +81,11 @@ pub unsafe fn is_deallocated(buffer: *mut iree_hal_buffer_t) -> bool {
 }
 
 /// The buffer's current write generation, for `weight_cache` keys.
+///
+/// # Safety
+///
+/// `buffer` must be a valid, non-null pointer to a `RocketBuffer` created
+/// by this driver's allocator and still live.
 pub unsafe fn generation(buffer: *mut iree_hal_buffer_t) -> u64 {
     unsafe { (*cast(buffer)).generation.current() }
 }
@@ -86,10 +96,19 @@ pub unsafe fn generation(buffer: *mut iree_hal_buffer_t) -> u64 {
 /// `device::queue_execute`'s output compaction, which writes `host_ptr`
 /// without going through a mapping. Those are the only two ways bytes in an
 /// IREE buffer change; a third would need a call here too.
+///
+/// # Safety
+///
+/// `buffer` must be a valid, non-null pointer to a `RocketBuffer` created
+/// by this driver's allocator and still live.
 pub unsafe fn note_write(buffer: *mut iree_hal_buffer_t) {
     unsafe { (*cast(buffer)).generation.bump() }
 }
 
+/// # Safety
+///
+/// `buffer` must be a valid, non-null pointer to a `RocketBuffer` created
+/// by this driver's allocator and still live.
 pub unsafe fn mark_deallocated(buffer: *mut iree_hal_buffer_t) {
     unsafe {
         (*cast(buffer))

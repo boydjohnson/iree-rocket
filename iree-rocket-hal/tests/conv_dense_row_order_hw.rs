@@ -93,6 +93,9 @@ struct Failure {
     tile_mismatches: Vec<usize>,
 }
 
+// Each argument is an independent test-shape/timeout parameter; a struct
+// wrapper would just move the same fields into a constructor.
+#[allow(clippy::too_many_arguments)]
 fn run(
     fd: i32,
     file: &std::fs::File,
@@ -499,6 +502,7 @@ fn dense_row_order_break_point_vs_cbuf_split() {
 /// a narrower width; 7 tiles here, confirmed locally, not 1).
 #[test]
 #[ignore = "needs /dev/accel/accel0 -- cross-compile for aarch64 and run on the RK3588 board"]
+#[allow(clippy::type_complexity)]
 fn dense_row_order_at_features_0_real_shape() {
     let file = OpenOptions::new()
         .read(true)

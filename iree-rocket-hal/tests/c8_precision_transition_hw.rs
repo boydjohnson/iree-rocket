@@ -244,6 +244,8 @@ impl Drop for OwnedBuffer {
 /// so that submitting it is one ioctl and one fence wait and nothing else.
 struct PreparedJob {
     fixture: Conv2dFixture,
+    // Kept for `tiles()`, a diagnostic helper no current arm calls.
+    #[allow(dead_code)]
     plan: ConvPlan,
     accumulator_tiles: Option<Vec<AccumulatorOutputTile>>,
     _input: OwnedBuffer,
@@ -433,6 +435,7 @@ impl PreparedJob {
         Ok(mismatches)
     }
 
+    #[allow(dead_code)]
     fn tiles(&self) -> usize {
         self.plan.tiles().len()
     }
@@ -549,6 +552,8 @@ enum Gap {
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum Expect {
+    // Matched below but no current arm constructs it.
+    #[allow(dead_code)]
     Hang,
     Clean,
     /// A question the arm is asked to answer, not a prediction.

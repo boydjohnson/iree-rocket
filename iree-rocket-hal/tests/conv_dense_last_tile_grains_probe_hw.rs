@@ -137,7 +137,7 @@ fn run(fd: i32, file: &std::fs::File, grains: u32) -> Probe {
 
         let dense_weight_elems = KERNEL * KERNEL * CIN as usize * COUT as usize;
         let mut dense_weights = vec![0u16; dense_weight_elems];
-        let center_index = (1 * KERNEL + 1) * CIN as usize * COUT as usize + 0 * COUT as usize + 0;
+        let center_index = (KERNEL + 1) * CIN as usize * COUT as usize;
         dense_weights[center_index] = 0x3c00;
         let dense_weight_bytes: Vec<u8> =
             dense_weights.iter().flat_map(|w| w.to_le_bytes()).collect();

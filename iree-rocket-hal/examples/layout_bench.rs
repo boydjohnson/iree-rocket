@@ -229,7 +229,7 @@ fn main() {
     let cold = std::env::args().any(|arg| arg == "cold");
     // Comfortably past the 3 MiB L3, walked at one access per 64-byte line.
     let mut evictor = vec![0u8; 16 << 20];
-    let mut evict = |cold: bool, evictor: &mut Vec<u8>| {
+    let evict = |cold: bool, evictor: &mut Vec<u8>| {
         if !cold {
             return;
         }

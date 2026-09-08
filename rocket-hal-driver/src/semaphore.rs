@@ -91,6 +91,11 @@ fn semaphore_layout() -> (std::alloc::Layout, usize) {
 /// Mirrors `iree_hal_null_semaphore_create()`. Not called from anywhere
 /// yet -- `device::create_semaphore` (still UNIMPLEMENTED) is what will
 /// eventually call this with a proactor obtained from the device's pool.
+///
+/// # Safety
+///
+/// `proactor` must be a valid, non-null pointer to a live
+/// `iree_async_proactor_t` that outlives the returned semaphore.
 pub unsafe fn create(
     proactor: *mut iree_async_proactor_t,
     initial_value: u64,

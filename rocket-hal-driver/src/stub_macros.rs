@@ -9,6 +9,9 @@
 #[macro_export]
 macro_rules! status_stub {
     ($name:ident($($arg:ident: $ty:ty),* $(,)?) -> iree_status_t) => {
+        /// # Safety
+        ///
+        /// This stub never dereferences any argument; any pointer value is accepted.
         #[allow(unused_variables)]
         pub unsafe extern "C" fn $name($($arg: $ty),*) -> $crate::bindings::iree_status_t {
             $crate::status::unimplemented()
@@ -19,6 +22,9 @@ macro_rules! status_stub {
 #[macro_export]
 macro_rules! void_stub {
     ($name:ident($($arg:ident: $ty:ty),* $(,)?)) => {
+        /// # Safety
+        ///
+        /// This stub never dereferences any argument; any pointer value is accepted.
         #[allow(unused_variables)]
         pub unsafe extern "C" fn $name($($arg: $ty),*) {}
     };
@@ -27,6 +33,9 @@ macro_rules! void_stub {
 #[macro_export]
 macro_rules! bool_stub {
     ($name:ident($($arg:ident: $ty:ty),* $(,)?) -> bool, $val:expr) => {
+        /// # Safety
+        ///
+        /// This stub never dereferences any argument; any pointer value is accepted.
         #[allow(unused_variables)]
         pub unsafe extern "C" fn $name($($arg: $ty),*) -> bool {
             $val

@@ -1,5 +1,5 @@
 //! Shared `/dev/accel/accel0` primitives -- GEM buffer creation (CREATE_BO
-//! + mmap), job submission, and the CPU/device sync ioctls (PREP_BO/
+//! and mmap), job submission, and the CPU/device sync ioctls (PREP_BO/
 //! FINI_BO). Previously duplicated identically across `rkt-basic.rs`/
 //! `rkt-job.rs`/`rkt-simple-job.rs`; factored out here so out-of-tree
 //! consumers (`rocket-hal-driver`) can use the same primitives instead of
@@ -61,6 +61,12 @@ pub struct Buffer {
 }
 
 impl Buffer {
+    /// # Safety
+    ///
+    /// `fd` must be a valid, open file descriptor for `/dev/accel/accel0`
+    /// (or a compatible rocket accel device) matching `file`. The caller
+    /// must eventually release the returned buffer with [`close_bo`] and
+    /// [`unmap_bo`] before the fd is closed.
     pub unsafe fn new(fd: i32, size: usize, file: impl std::os::fd::AsFd) -> Self {
         unsafe {
             let mut create_params = drm_rocket_create_bo {
@@ -172,6 +178,14 @@ impl Drop for OwnedBuffer {
 /// kernel-mediated sync point between tasks in the same job for the CPU
 /// to wait on anyway (only real hardware writes + the completion IRQ
 /// mediate visibility from one task to the next).
+///
+/// # Safety
+///
+/// `fd` must be a valid, open rocket accel device fd. Every handle in
+/// `in_handles`/`out_handles`, and every `regcmd_dma_address` in `tasks`,
+/// must reference a GEM buffer created via [`Buffer::new`] on this same
+/// fd and still live; each task's regcmd buffer must contain a fully
+/// written, valid register program of `regcmd_count` entries.
 pub unsafe fn submit_tasks(
     fd: i32,
     tasks: &[(u32, u32)], // (regcmd_dma_address, regcmd_count) per task, in order
@@ -288,6 +302,13 @@ pub unsafe fn submit_jobs(fd: i32, jobs: &[JobDesc<'_>]) -> nix::Result<()> {
 /// buffer. `in_handles`/`out_handles` are the GEM handles the job reads
 /// from/writes to -- must include the regcmd buffer's own handle in
 /// `in_handles` (the kernel needs it retained for the job's duration).
+///
+/// # Safety
+///
+/// Same requirements as [`submit_tasks`]: `fd` must be a valid, open
+/// rocket accel device fd, and every handle plus `regcmd_dma_address`
+/// must reference a live GEM buffer on this fd containing a fully
+/// written, valid register program of `regcmd_count` entries.
 pub unsafe fn submit(
     fd: i32,
     regcmd_dma_address: u32,
@@ -305,6 +326,12 @@ pub unsafe fn submit(
     }
 }
 
+/// Syncs the buffer for device access (`ROCKET_FINI_BO`).
+///
+/// # Safety
+///
+/// `fd` must be a valid, open rocket accel device fd and `handle` a GEM
+/// handle created via [`Buffer::new`] on this same fd and still live.
 pub unsafe fn fini_bo(fd: i32, handle: u32) -> nix::Result<()> {
     unsafe {
         rocket_fini_bo(
@@ -325,6 +352,11 @@ pub unsafe fn fini_bo(fd: i32, handle: u32) -> nix::Result<()> {
 /// story of the bug this caused when every one of this project's own
 /// test clients got it wrong. `relative_timeout_ns` here is what callers
 /// actually want to express ("wait up to N ns from now").
+///
+/// # Safety
+///
+/// `fd` must be a valid, open rocket accel device fd and `handle` a GEM
+/// handle created via [`Buffer::new`] on this same fd and still live.
 pub unsafe fn prep_bo(fd: i32, handle: u32, relative_timeout_ns: u64) -> nix::Result<()> {
     let now = clock_gettime(ClockId::CLOCK_MONOTONIC).expect("clock_gettime failed");
     let now_ns = now.tv_sec() as u64 * 1_000_000_000 + now.tv_nsec() as u64;
@@ -352,6 +384,12 @@ pub unsafe fn prep_bo(fd: i32, handle: u32, relative_timeout_ns: u64) -> nix::Re
 /// buffer's `host_ptr` -- callers that also `mmap`'d (i.e. everyone using
 /// `Buffer::new()`) must call [`unmap_bo`] separately to release the VMA's
 /// GEM-object reference; this only releases the file's GEM handle.
+///
+/// # Safety
+///
+/// `fd` must be a valid, open rocket accel device fd and `handle` a GEM
+/// handle created via [`Buffer::new`] on this same fd and still live.
+/// `handle` must not be used again after this call.
 pub unsafe fn close_bo(fd: i32, handle: u32) -> nix::Result<()> {
     unsafe {
         gem_close(fd, &drm_gem_close { handle, pad: 0 })?;
@@ -366,6 +404,12 @@ pub unsafe fn close_bo(fd: i32, handle: u32) -> nix::Result<()> {
 /// Call both once no CPU pointer into the buffer remains. Otherwise the GEM
 /// object, its IOMMU domain reference, and its IOVA allocation remain alive
 /// until process exit even though the handle has been closed.
+///
+/// # Safety
+///
+/// `buffer.host_ptr`/`buffer.size` must describe a mapping created by
+/// [`Buffer::new`] that has not already been unmapped, and no other
+/// reference to that memory may be used after this call.
 pub unsafe fn unmap_bo(buffer: &Buffer) -> nix::Result<()> {
     let mapping =
         NonNull::new(buffer.host_ptr.cast()).expect("Buffer::new returned a null mapping");

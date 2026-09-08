@@ -422,7 +422,7 @@ fn lut_standalone_tanh_negative_zero_positive_are_ordered() {
 /// `TANH_LUT_BN_SCALE_K=5425.193` (`activation.rs`, `LutTable::bn_scale_k`)
 /// -- derived the same way `LUT_BN_SCALE_K` was, via a real 5-point
 /// calibration sweep (`rknpu-spelunking/config.tanh.w8a8.v{1,2,3,4}.toml`
-/// + the pre-existing base config, reusing the exact same `calib{0..4}
+/// plus the pre-existing base config, reusing the exact same `calib{0..4}
 /// .npy` arrays sigmoid's sweep used -- generic float32 calibration data,
 /// model-independent), bit-exact across all 5 points the same way
 /// sigmoid's constant is. See `TANH_LUT_BN_SCALE_K`'s own doc comment for

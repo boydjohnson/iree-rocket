@@ -40,10 +40,13 @@ fn vendor_split(case: &vendor_fixture::Case) -> Option<(u32, u32)> {
         .map(|p| (p.cbuf_data_banks, p.cbuf_weight_banks))
 }
 
+/// (cin, cout, extent, kernel, our (data, weight) banks, vendor's).
+type Difference = (u32, u32, u32, usize, (u32, u32), (u32, u32));
+
 struct Scores {
     agree: usize,
     refused: usize,
-    differences: Vec<(u32, u32, u32, usize, (u32, u32), (u32, u32))>,
+    differences: Vec<Difference>,
 }
 
 fn score(fixtures: &str, depthwise: bool) -> Scores {
@@ -158,7 +161,11 @@ fn wide_dense_channel_grid_matches_vendor_plans() {
         scores.refused,
         scores.differences.len()
     );
-    let mut seen: Vec<(u32, u32, usize, (u32, u32), (u32, u32))> = scores
+    // (cin, cout, kernel, our banks, vendor's) -- `Difference` with the
+    // per-extent field collapsed out, since only the shape identity matters
+    // for deduplication here.
+    type DifferenceKey = (u32, u32, usize, (u32, u32), (u32, u32));
+    let mut seen: Vec<DifferenceKey> = scores
         .differences
         .iter()
         .map(|(cin, cout, _, k, plan, vendor)| (*cin, *cout, *k, *plan, *vendor))

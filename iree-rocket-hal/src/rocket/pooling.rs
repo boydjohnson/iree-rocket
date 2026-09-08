@@ -339,6 +339,9 @@ fn validate_direct_kernel(kernel_width: u32, kernel_height: u32) {
     );
 }
 
+// Each argument is an independent geometry field; grouping them into a
+// struct here would just move the same 14 fields into a constructor.
+#[allow(clippy::too_many_arguments)]
 fn validate_pooling_geometry(
     input_width: u32,
     input_height: u32,
@@ -667,6 +670,9 @@ fn fp16_bits(value: f32) -> u16 {
 /// writing at; [`PoolingPlan::programs_with_buffers`] applies the tile's
 /// output offset before calling. The returned vector includes the captured
 /// alignment padding and its single combined `0x60` kick.
+// Straight-line hardware register program; hand-transcribing it into a
+// `vec![]` literal risks a copy/reorder mistake silently miscoding a register.
+#[allow(clippy::vec_init_then_push)]
 fn build_pooling_tile_task(
     shape: &PoolingShape,
     tile: &PoolingTile,

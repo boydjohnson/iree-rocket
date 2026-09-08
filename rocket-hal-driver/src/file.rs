@@ -37,6 +37,11 @@ unsafe fn cast(file: *mut iree_hal_file_t) -> *mut RocketFile {
     file as *mut RocketFile
 }
 
+/// # Safety
+///
+/// `handle` must be a valid, non-null pointer to a live
+/// `iree_io_file_handle_t`, and `out_file` a valid, non-null pointer to
+/// write the result into.
 pub unsafe fn import(
     access: iree_hal_memory_access_t,
     handle: *mut iree_io_file_handle_t,

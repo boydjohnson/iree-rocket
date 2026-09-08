@@ -35,8 +35,8 @@ fn diff(fixtures: &str, precision: Precision, label: &str) {
     let fixtures: FixtureFile = serde_json::from_str(fixtures).expect("valid fixture JSON");
     println!("\n=== {label} ===");
     println!(
-        "  {:<6} {:<11} {:<13} {:<15} {:<13} {}",
-        "Cin", "tiles v/o", "banks v/o", "in_rows v/o", "entries v/o", "grains v/o"
+        "  {:<6} {:<11} {:<13} {:<15} {:<13} grains v/o",
+        "Cin", "tiles v/o", "banks v/o", "in_rows v/o", "entries v/o"
     );
 
     for case in &fixtures.cases {
@@ -75,26 +75,32 @@ fn diff(fixtures: &str, precision: Precision, label: &str) {
         let our_grains = generated.first().and_then(|c| grains(c)).unwrap_or(0);
 
         let mark = |a: u32, b: u32| if a == b { ' ' } else { '*' };
-        println!(
-            "  {:<6} {}{:<10} {}{:<12} {}{:<14} {}{:<12} {}{}",
-            s.cin,
-            mark(vendor.len() as u32, tiles.len() as u32),
-            format!("{}/{}", vendor.len(), tiles.len()),
-            mark(first.cbuf_weight_banks, plan.weight_banks()),
-            format!(
-                "{}/{}/{}/{}",
-                first.cbuf_data_banks,
-                first.cbuf_weight_banks,
-                plan.data_banks(),
-                plan.weight_banks()
-            ),
-            mark(first.in_rows, our_rows),
-            format!("{}/{}", first.in_rows, our_rows),
-            mark(first.cbuf_data_entries, our_entries),
-            format!("{}/{}", first.cbuf_data_entries, our_entries),
-            mark(first.feature_grains, our_grains),
-            format!("{}/{}", first.feature_grains, our_grains),
-        );
+        // `format!` is required here, not `format_args!`: the outer
+        // `{:<N}` width specs pad the combined "a/b" strings, and a width
+        // spec has no effect on a nested `format_args!()` value.
+        #[allow(clippy::format_in_format_args)]
+        {
+            println!(
+                "  {:<6} {}{:<10} {}{:<12} {}{:<14} {}{:<12} {}{}",
+                s.cin,
+                mark(vendor.len() as u32, tiles.len() as u32),
+                format!("{}/{}", vendor.len(), tiles.len()),
+                mark(first.cbuf_weight_banks, plan.weight_banks()),
+                format!(
+                    "{}/{}/{}/{}",
+                    first.cbuf_data_banks,
+                    first.cbuf_weight_banks,
+                    plan.data_banks(),
+                    plan.weight_banks()
+                ),
+                mark(first.in_rows, our_rows),
+                format!("{}/{}", first.in_rows, our_rows),
+                mark(first.cbuf_data_entries, our_entries),
+                format!("{}/{}", first.cbuf_data_entries, our_entries),
+                mark(first.feature_grains, our_grains),
+                format!("{}/{}", first.feature_grains, our_grains),
+            );
+        }
     }
 }
 

@@ -709,6 +709,9 @@ pub struct EwUnaryBuffers {
 ///   rather than left at [`build_add_regcmd`]'s implicit
 ///   default-i.e.-enabled, since there is no second tensor for it to fetch
 ///   here.
+// Straight-line hardware register program; hand-transcribing it into a
+// `vec![]` literal risks a copy/reorder mistake silently miscoding a register.
+#[allow(clippy::vec_init_then_push)]
 pub fn build_unary_regcmd(shape: &EwUnaryShape, bufs: &EwUnaryBuffers) -> Vec<RegCmd> {
     assert!(
         shape.width > 0 && shape.height > 0 && shape.channels > 0,

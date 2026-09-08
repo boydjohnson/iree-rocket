@@ -137,7 +137,7 @@ fn run(channels: u32, kernels: Kernels, stride: u32) -> Result<(), Failure> {
         // a pure function of channel count and kernel size, not stride.
         let dense_bytes = channels * kh * kw * FP16_BYTES;
         let mut dense = vec![0u8; dense_bytes];
-        for entry in dense.chunks_exact_mut(FP16_BYTES) {
+        for entry in dense.as_chunks_mut::<FP16_BYTES>().0 {
             entry.copy_from_slice(&FP16_ONE.to_le_bytes());
         }
         let mut packed = vec![0u8; weight_bytes];

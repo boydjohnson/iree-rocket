@@ -1,4 +1,10 @@
-#[allow(non_upper_case_globals, non_camel_case_types)]
+#[allow(
+    non_upper_case_globals,
+    non_camel_case_types,
+    unsafe_op_in_unsafe_fn,
+    clippy::all,
+    clippy::pedantic
+)]
 pub mod api;
 pub mod builders;
 pub mod conv;
@@ -15,6 +21,12 @@ pub mod regcmd;
 pub mod activation;
 pub mod elementwise;
 pub mod pooling;
-#[allow(non_upper_case_globals, non_camel_case_types)]
+#[allow(
+    non_upper_case_globals,
+    non_camel_case_types,
+    unsafe_op_in_unsafe_fn,
+    clippy::all,
+    clippy::pedantic
+)]
 pub mod registers;
 pub mod tensor_layout;

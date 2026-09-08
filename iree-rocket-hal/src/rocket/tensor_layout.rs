@@ -598,6 +598,9 @@ pub fn pack_hwcf_to_rocket_weights(
 ///
 /// `padded_output_channels` must be at least `output_channels`. Passing them
 /// equal is exactly [`pack_hwcf_to_rocket_weights`].
+// Each argument is an independent tensor-shape dimension; a struct wrapper
+// would just move the same fields into a constructor.
+#[allow(clippy::too_many_arguments)]
 pub fn pack_hwcf_to_rocket_weights_padded(
     dense: &[u8],
     filter_height: usize,
@@ -802,6 +805,7 @@ pub fn pack_hwcf_to_rocket_weights_affine_i8(
     )
 }
 
+#[allow(clippy::too_many_arguments)]
 fn pack_hwcf_to_rocket_weights_impl(
     dense: &[u8],
     filter_height: usize,
@@ -989,6 +993,9 @@ pub fn pack_depthwise_to_rocket_weights(
 }
 
 #[cfg(test)]
+// `as_chunks` would need every `bytes.try_into()`/index below re-typed for
+// marginal benefit on these numeric decode paths; not worth the churn.
+#[allow(clippy::chunks_exact_to_as_chunks)]
 mod tests {
     use super::*;
     use crate::rocket::conv::Shape;
