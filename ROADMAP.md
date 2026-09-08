@@ -552,7 +552,11 @@ the other 6.9 ms is host layout work. That is
 [ISSUES.md P2](ISSUES.md)'s per-dispatch repack, paid at every link because
 nothing propagates a packed layout between dispatches. **No cut point in the
 shape distribution rescues it** -- even the widest op ViT has is net-negative
--- so this is not a bounds-tuning problem.
+-- so this is not a bounds-tuning problem. Since 2026-09-08 a *convolution*
+that reads another dispatch's output skips its half of that round trip
+(ISSUES.md P2 step 2, `ROCKET_CHAIN`); the element-wise dispatch kind records
+no output cube yet and still pays both halves, so this measurement stands
+until it does.
 
 **Conclusion: `--elementwise` stays off by default.** It is P8's law confirmed
 on a second model and a second op family, with the mechanism named. The lever
@@ -673,11 +677,13 @@ model faster. **Confirmed 2026-09-06, with a number: 1.80x faster than the
 CPU arm on a full machine and level with it at two cores, from 1.5x slower.** See the requantized-path note
 at the end of this section.
 
-- `build_conv_then_lut_regcmd` and `build_conv_then_add_regcmd` are built,
-  board-tested, and unreachable. Give them a wire representation as an
-  **optional epilogue field on `Conv2DDef`**, not a separate union member: it is
-  one dispatch that runs two hardware tasks, and modelling it as two kernels
-  would recreate the boundary the phase exists to remove.
+- ~~`build_conv_then_lut_regcmd` and `build_conv_then_add_regcmd` are built,
+  board-tested, and unreachable.~~ **The add is reachable since 2026-09-08**:
+  `Conv2DDef.epilogue_add` / `epilogue_activation`, the optional epilogue
+  field this item asked for, run the residual add and its ReLU in the EW
+  core after the convolution's own tiles, and ResNet50's sixteen residual
+  blocks compile to it (ISSUES.md P2, step 3). The LUT epilogue still has no
+  wire form.
 - Compiler side: a DAG matcher over `conv → elementwise` and `conv → lut` via
   `transform.iree.match.cast_compatible_dag_from_root`. Read the recorded
   DAG-matcher traps first -- there are three silent ways that op declines to

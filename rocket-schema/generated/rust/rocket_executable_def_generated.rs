@@ -1256,6 +1256,8 @@ impl<'a> Conv2DDef<'a> {
   pub const VT_PAD_TOP: flatbuffers::VOffsetT = 46;
   pub const VT_PAD_LEFT: flatbuffers::VOffsetT = 48;
   pub const VT_RUNTIME_QUANTIZATION: flatbuffers::VOffsetT = 50;
+  pub const VT_EPILOGUE_ADD: flatbuffers::VOffsetT = 52;
+  pub const VT_EPILOGUE_ACTIVATION: flatbuffers::VOffsetT = 54;
 
   #[inline]
   pub fn init_from_table(table: flatbuffers::Table<'a>) -> Self {
@@ -1288,6 +1290,8 @@ impl<'a> Conv2DDef<'a> {
     builder.add_input_channels(args.input_channels);
     builder.add_input_height(args.input_height);
     builder.add_input_width(args.input_width);
+    builder.add_epilogue_activation(args.epilogue_activation);
+    builder.add_epilogue_add(args.epilogue_add);
     builder.add_precision(args.precision);
     builder.add_activation(args.activation);
     builder.add_depthwise(args.depthwise);
@@ -1391,6 +1395,14 @@ impl<'a> Conv2DDef<'a> {
   pub fn runtime_quantization(&self) -> Option<flatbuffers::Vector<'a, Conv2DQuantParam>> {
     self._tab.get::<flatbuffers::ForwardsUOffset<flatbuffers::Vector<'a, Conv2DQuantParam>>>(Conv2DDef::VT_RUNTIME_QUANTIZATION, None)
   }
+  #[inline]
+  pub fn epilogue_add(&self) -> bool {
+    self._tab.get::<bool>(Conv2DDef::VT_EPILOGUE_ADD, Some(false)).unwrap()
+  }
+  #[inline]
+  pub fn epilogue_activation(&self) -> Activation {
+    self._tab.get::<Activation>(Conv2DDef::VT_EPILOGUE_ACTIVATION, Some(Activation::NONE)).unwrap()
+  }
 }
 
 impl flatbuffers::Verifiable for Conv2DDef<'_> {
@@ -1424,6 +1436,8 @@ impl flatbuffers::Verifiable for Conv2DDef<'_> {
      .visit_field::<u32>("pad_top", Self::VT_PAD_TOP, false)?
      .visit_field::<u32>("pad_left", Self::VT_PAD_LEFT, false)?
      .visit_field::<flatbuffers::ForwardsUOffset<flatbuffers::Vector<'_, Conv2DQuantParam>>>("runtime_quantization", Self::VT_RUNTIME_QUANTIZATION, false)?
+     .visit_field::<bool>("epilogue_add", Self::VT_EPILOGUE_ADD, false)?
+     .visit_field::<Activation>("epilogue_activation", Self::VT_EPILOGUE_ACTIVATION, false)?
      .finish();
     Ok(())
   }
@@ -1453,6 +1467,8 @@ pub struct Conv2DDefArgs<'a> {
     pub pad_top: u32,
     pub pad_left: u32,
     pub runtime_quantization: Option<flatbuffers::WIPOffset<flatbuffers::Vector<'a, Conv2DQuantParam>>>,
+    pub epilogue_add: bool,
+    pub epilogue_activation: Activation,
 }
 impl<'a> Default for Conv2DDefArgs<'a> {
   #[inline]
@@ -1482,6 +1498,8 @@ impl<'a> Default for Conv2DDefArgs<'a> {
       pad_top: 0,
       pad_left: 0,
       runtime_quantization: None,
+      epilogue_add: false,
+      epilogue_activation: Activation::NONE,
     }
   }
 }
@@ -1588,6 +1606,14 @@ impl<'a: 'b, 'b> Conv2DDefBuilder<'a, 'b> {
     self.fbb_.push_slot_always::<flatbuffers::WIPOffset<_>>(Conv2DDef::VT_RUNTIME_QUANTIZATION, runtime_quantization);
   }
   #[inline]
+  pub fn add_epilogue_add(&mut self, epilogue_add: bool) {
+    self.fbb_.push_slot::<bool>(Conv2DDef::VT_EPILOGUE_ADD, epilogue_add, false);
+  }
+  #[inline]
+  pub fn add_epilogue_activation(&mut self, epilogue_activation: Activation) {
+    self.fbb_.push_slot::<Activation>(Conv2DDef::VT_EPILOGUE_ACTIVATION, epilogue_activation, Activation::NONE);
+  }
+  #[inline]
   pub fn new(_fbb: &'b mut flatbuffers::FlatBufferBuilder<'a>) -> Conv2DDefBuilder<'a, 'b> {
     let start = _fbb.start_table();
     Conv2DDefBuilder {
@@ -1629,6 +1655,8 @@ impl core::fmt::Debug for Conv2DDef<'_> {
       ds.field("pad_top", &self.pad_top());
       ds.field("pad_left", &self.pad_left());
       ds.field("runtime_quantization", &self.runtime_quantization());
+      ds.field("epilogue_add", &self.epilogue_add());
+      ds.field("epilogue_activation", &self.epilogue_activation());
       ds.finish()
   }
 }

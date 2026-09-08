@@ -713,6 +713,224 @@ struct FuseConvRelu : public OpRewritePattern<linalg::Conv2DNhwcHwcfOp> {
   }
 };
 
+/// The residual block's tail on the f16-import chain:
+///
+///   conv(bias init) -> [transpose] -> [expand_shape] -> truncf
+///     -> generic(narrowed, skip) { addf; cmpf ugt %sum, %zero; select }
+///
+/// into conv(fill 0) -> generic(acc, bias, skip', 0.0) { addf bias; extf
+/// skip; addf; maximumf } -> [relayouts] -> truncf, where `skip'` is the
+/// skip tensor brought to the convolution's own rank with the inverse of
+/// the reshape (which the canonicaliser folds against the producer's own
+/// expand). The matched target runs the add and the ReLU in the DPU's EW
+/// core after the convolution's tiles (`Conv2DDef.epilogue_add`), so the
+/// whole block output stays on the NPU. ResNet50's sixteen residual adds
+/// are this exact shape.
+///
+/// The skip may be either operand of the add. `Cout` must be a whole
+/// number of 16-byte atoms, which is all the driver's EW cube handles.
+struct FuseConvResidualRelu : public OpRewritePattern<linalg::Conv2DNhwcHwcfOp> {
+  FuseConvResidualRelu(MLIRContext *context)
+      : OpRewritePattern<linalg::Conv2DNhwcHwcfOp>(context, /*benefit=*/2) {}
+  LogicalResult matchAndRewrite(linalg::Conv2DNhwcHwcfOp conv,
+                                PatternRewriter &rewriter) const override {
+    if (conv.getNumResults() != 1 || !isFusableDenseConv(conv)) {
+      return failure();
+    }
+    auto convType = cast<RankedTensorType>(conv->getResult(0).getType());
+    int64_t cout = convType.getDimSize(convType.getRank() - 1);
+    if (cout == ShapedType::kDynamic || cout % 16 != 0) {
+      return failure();
+    }
+    Value convResult = conv->getResult(0);
+    Operation *consumer = soleConsumer(convResult);
+    if (!consumer) {
+      return failure();
+    }
+    auto transpose = dyn_cast<linalg::TransposeOp>(consumer);
+    if (transpose) {
+      consumer = soleConsumer(transpose.getResult()[0]);
+      if (!consumer) {
+        return failure();
+      }
+    }
+    auto expand = dyn_cast<tensor::ExpandShapeOp>(consumer);
+    if (expand) {
+      consumer = soleConsumer(expand.getResult());
+      if (!consumer) {
+        return failure();
+      }
+    }
+    auto narrow = dyn_cast_or_null<linalg::GenericOp>(consumer);
+    if (!narrow || !isTruncfGeneric(narrow)) {
+      return failure();
+    }
+    // Two spellings of "add the skip, then ReLU": the pipeline's, a named
+    // `linalg.add` whose sole consumer is the ReLU generic (specialisation
+    // runs before this pass, so an ONNX Add arrives named), and the fused
+    // one a later elementwise fusion would produce, one generic with addf /
+    // cmpf ugt / select. `replaced` is the op whose result the rewrite
+    // takes over; `skip` is the add's other operand.
+    Value narrowed = narrow.getResult(0);
+    Operation *replaced = nullptr;
+    Value skip;
+    if (auto named = dyn_cast_or_null<linalg::AddOp>(soleConsumer(narrowed))) {
+      if (named.getDpsInputs()[0] == narrowed) {
+        skip = named.getDpsInputs()[1];
+      } else if (named.getDpsInputs()[1] == narrowed) {
+        skip = named.getDpsInputs()[0];
+      } else {
+        return failure();
+      }
+      auto relu = dyn_cast_or_null<linalg::GenericOp>(soleConsumer(named.getResult(0)));
+      if (!relu || !isElementwiseGeneric(relu)) {
+        return failure();
+      }
+      std::optional<Value> zero = matchReluBody(relu);
+      if (!zero || !isZeroFor(relu, *zero)) {
+        return failure();
+      }
+      replaced = relu;
+    } else if (auto add = dyn_cast_or_null<linalg::GenericOp>(soleConsumer(narrowed))) {
+      if (!isElementwiseGeneric(add) || add.getNumDpsInputs() != 2) {
+        return failure();
+      }
+      Block &body = add.getRegion().front();
+      auto it = body.begin();
+      auto addf = (it != body.end()) ? dyn_cast<arith::AddFOp>(&*it) : nullptr;
+      if (!addf) {
+        return failure();
+      }
+      ++it;
+      auto cmp = (it != body.end()) ? dyn_cast<arith::CmpFOp>(&*it) : nullptr;
+      if (!cmp) {
+        return failure();
+      }
+      ++it;
+      auto select = (it != body.end()) ? dyn_cast<arith::SelectOp>(&*it) : nullptr;
+      if (!select) {
+        return failure();
+      }
+      ++it;
+      if (it == body.end() || !isa<linalg::YieldOp>(*it) ||
+          std::next(it) != body.end()) {
+        return failure();
+      }
+      Value a = body.getArgument(0);
+      Value b = body.getArgument(1);
+      if (!((addf.getLhs() == a && addf.getRhs() == b) ||
+            (addf.getLhs() == b && addf.getRhs() == a))) {
+        return failure();
+      }
+      Value zero = cmp.getRhs();
+      if (cmp.getPredicate() != arith::CmpFPredicate::UGT ||
+          cmp.getLhs() != addf.getResult() ||
+          select.getCondition() != cmp.getResult() ||
+          select.getTrueValue() != addf.getResult() ||
+          select.getFalseValue() != zero ||
+          cast<linalg::YieldOp>(*it).getOperand(0) != select.getResult() ||
+          !isZeroFor(add, zero)) {
+        return failure();
+      }
+      if (add.getDpsInputs()[0] == narrowed) {
+        skip = add.getDpsInputs()[1];
+      } else if (add.getDpsInputs()[1] == narrowed) {
+        skip = add.getDpsInputs()[0];
+      } else {
+        return failure();
+      }
+      replaced = add;
+    } else {
+      return failure();
+    }
+    auto skipType = dyn_cast<RankedTensorType>(skip.getType());
+    if (!skipType || !skipType.getElementType().isF16()) {
+      return failure();
+    }
+    int64_t channelDim = 0;
+    Value bias = matchPerChannelBias(conv.getDpsInits()[0], channelDim);
+    if (!bias) {
+      return failure();
+    }
+    // The skip in the convolution's own layout and rank.
+    Location loc = conv.getLoc();
+    rewriter.setInsertionPoint(replaced);
+    Value skipNhwc = skip;
+    if (expand) {
+      skipNhwc = tensor::CollapseShapeOp::create(
+          rewriter, loc, skip, expand.getReassociationIndices());
+    }
+    if (transpose) {
+      // The conv's result was transposed before the reshape; undo that on
+      // the skip with the inverse permutation.
+      ArrayRef<int64_t> permutation = transpose.getPermutation();
+      SmallVector<int64_t> inverse(permutation.size());
+      for (auto [index, target] : llvm::enumerate(permutation)) {
+        inverse[target] = index;
+      }
+      auto inType = cast<RankedTensorType>(skipNhwc.getType());
+      SmallVector<int64_t> outShape(inType.getRank());
+      for (auto [index, target] : llvm::enumerate(inverse)) {
+        outShape[index] = inType.getDimSize(target);
+      }
+      Value empty = tensor::EmptyOp::create(rewriter, loc, outShape,
+                                            inType.getElementType());
+      skipNhwc = linalg::TransposeOp::create(rewriter, loc, skipNhwc, empty, inverse)
+                     .getResult()[0];
+    }
+    if (cast<RankedTensorType>(skipNhwc.getType()).getShape() != convType.getShape()) {
+      return failure();
+    }
+    // conv over a zero init, then the fused epilogue.
+    int64_t rank = convType.getRank();
+    MLIRContext *context = rewriter.getContext();
+    AffineMap identity = rewriter.getMultiDimIdentityMap(rank);
+    AffineMap channel =
+        AffineMap::get(rank, 0, {rewriter.getAffineDimExpr(channelDim)}, context);
+    AffineMap scalar = AffineMap::get(rank, 0, context);
+    SmallVector<utils::IteratorType> iterators(rank, utils::IteratorType::parallel);
+    SmallVector<OpFoldResult> sizes = tensor::getMixedSizes(rewriter, loc, convResult);
+    Value zeroF32 = arith::ConstantOp::create(rewriter, loc, rewriter.getF32FloatAttr(0.0f));
+    Value accEmpty =
+        tensor::EmptyOp::create(rewriter, loc, sizes, convType.getElementType());
+    Value accInit = linalg::FillOp::create(rewriter, loc, ValueRange{zeroF32},
+                                           ValueRange{accEmpty})
+                        .getResult(0);
+    auto rawConv = cast<linalg::Conv2DNhwcHwcfOp>(rewriter.clone(*conv.getOperation()));
+    rawConv.getDpsInitsMutable().assign(accInit);
+    Value empty = tensor::EmptyOp::create(rewriter, loc, sizes, convType.getElementType());
+    SmallVector<AffineMap> maps{identity, channel, identity, scalar, identity};
+    auto epilogue = linalg::GenericOp::create(
+        rewriter, loc, TypeRange{convType},
+        ValueRange{rawConv->getResult(0), bias, skipNhwc, zeroF32}, ValueRange{empty},
+        maps, iterators, [&](OpBuilder &builder, Location nested, ValueRange args) {
+          Value biased = arith::AddFOp::create(builder, nested, args[0], args[1]);
+          Value skipWide = arith::ExtFOp::create(builder, nested, builder.getF32Type(), args[2]);
+          Value summed = arith::AddFOp::create(builder, nested, biased, skipWide);
+          Value result = arith::MaximumFOp::create(builder, nested, summed, args[3]);
+          linalg::YieldOp::create(builder, nested, result);
+        });
+    Value result = epilogue.getResult(0);
+    if (transpose) {
+      IRMapping mapping;
+      mapping.map(transpose.getInput(), result);
+      result = rewriter.clone(*transpose.getOperation(), mapping)->getResult(0);
+    }
+    if (expand) {
+      IRMapping mapping;
+      mapping.map(expand.getSrc(), result);
+      result = rewriter.clone(*expand.getOperation(), mapping)->getResult(0);
+    }
+    {
+      IRMapping mapping;
+      mapping.map(narrow.getDpsInputs()[0], result);
+      result = rewriter.clone(*narrow.getOperation(), mapping)->getResult(0);
+    }
+    rewriter.replaceOp(replaced, result);
+    return success();
+  }
+};
+
 /// Every other dense fp16 convolution seeded with a per-channel bias:
 /// conv(bias init) -> conv(fill 0) -> generic(addf bias). The consumers are
 /// untouched. This is the bias moving onto the BS plane for the convolutions
@@ -765,7 +983,7 @@ struct RocketFuseConvRelu6Pass
                  FuseConvRelu6<linalg::DepthwiseConv2DNhwcHwcOp>,
                  FuseConvRelu6<linalg::DepthwiseConv2DNchwChwOp>>(
         context, /*benefit=*/3);
-    patterns.add<FuseConvRelu, FuseConvBias>(context);
+    patterns.add<FuseConvRelu, FuseConvResidualRelu, FuseConvBias>(context);
     if (failed(applyPatternsGreedily(getOperation(), std::move(patterns)))) {
       return signalPassFailure();
     }

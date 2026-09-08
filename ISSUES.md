@@ -385,6 +385,98 @@ larger lever by four to one**: it unlocks ~57 ms of pack and compact plus
 the 16 CPU adds, against step 2's 12. Build step 3 first, and step 2 on
 the edges it leaves.
 
+**Step 3 landed 2026-09-08.** `Conv2DDef.epilogue_add` and
+`epilogue_activation` put the residual add and its ReLU in the DPU's EW
+core after the convolution's own tiles, inside the same dispatch, with the
+skip as a fourth binding; the driver runs the tiles, then one EW task on
+the same in-order queue (no fan-out for such a dispatch), and compacts the
+sum. `conv_residual_add_hw` validated the multi-tile cube handoff and the
+EW-stage ReLU exactly before any wire or compiler work. The pass rewrites
+the f16-import chain `conv -> truncf -> linalg.add(skip) -> relu` (a named
+`linalg.add`, since specialisation runs first) into one epilogue generic
+over the accumulator, with the skip collapsed to the convolution's rank.
+
+ResNet50 fp16 on `planck`, `taskset -c 4-7`, medians:
+
+| | dispatches (NPU / CPU) | NPU results feeding an NPU dispatch | ms |
+|---|---|---|---:|
+| after step 1 | 53 / 22 | 32 of 53 | 162 |
+| after step 3 | 53 / 8 | **51 of 53** | 164 |
+
+Correctness is unchanged (max|diff| 0.0116 against onnxruntime, same top-5)
+and the wall is flat, and the profile says exactly why: `outside` fell
+47.9 -> 26.4 ms (the sixteen CPU adds), but each residual dispatch now
+packs its skip tensor (`pack.input` 20.6 -> 29.5) and its EW task is
+hardware time (`wait.npu` 108 -> 131). An even trade on its own. What it
+buys is the reach of step 2: `pack.input` + `compact` is now **61.5 ms**
+per inference and 51 of the 53 edges it sits on are NPU -> NPU, so the
+driver chain -- consumer reads the producer's cube, no compaction, no
+repack, the skip too -- is worth up to 37 % of the model. That is the next
+thing to build, and it is what P2 always was.
+
+What stays on the CPU: the 7x7 stem, the padded max pool, the head's
+pooling transpose and the classifier epilogue. MobileNetV2's residual adds
+have no ReLU after them (linear bottlenecks) and are not claimed; a
+`NONE`-activation twin of the target is one matcher away.
+
+**Step 2 landed 2026-09-08 -- the input half.** A dispatch whose input was
+written by an earlier dispatch on the same command buffer now reads that
+dispatch's output cube in place (`OutputCube`, `chainable_cube`,
+`ROCKET_CHAIN=0` to turn it off, `=debug` to trace every edge). No wire or
+compiler change: the producer already writes feature-atomic NC1HWC2 surfaces
+into scratch, and the repack the consumer used to do reproduces those exact
+bytes, so the consumer simply points its regcmd at the producer's scratch BO
+and the pack is skipped. This is the aliasing `encodings/cross-op-chaining.md`
+proved legal and the section above has carried since.
+
+The claim is `pack(compact(cube)) == cube`, and it holds when the two
+dispatches name the identical device byte range, the pixel counts are equal
+(surfaces are `pixels * 16` apart, so a producer with physical height padding
+strides differently), the logical pixel widths are equal with no channel
+padding beyond them, and the pixel is a whole number of 16-byte atoms -- the
+last two because a repack zeroes padding lanes where a producer leaves its
+padding channels. Fanned-out and accumulator dispatches offer no cube: the
+first has no single scratch (each context wrote its own tiles), the second
+writes 128-byte blocks. `tensor_layout.rs`'s `chain_identity_tests` pins the
+identity and each way it fails, since nothing at runtime can check it.
+
+ResNet50 fp16 on `planck`, `taskset -c 4-7`, medians of 3, same
+`resnet50.res.vmfb` with the feature only turned off and on:
+
+| | `pack.input` | `compact` | ms |
+|---|---:|---:|---:|
+| chaining off | 24.0 | 26.0 | 169 |
+| chaining on | **0.6** | 25.6 | **145** |
+
+**1.17x**, and the output is bit-identical to the same build with chaining
+off and to the step-3 reference -- byte for byte, not within a tolerance,
+which is the point of the identity above. 66 of the 68 conv operand repacks
+are gone: all 50 feature inputs and all 16 residual skips. The 2 that remain
+have no NPU producer on their command buffer (the stem, behind the CPU max
+pool). MobileNetV2 fp16 is 134 -> 132 ms and bit-identical, with 1 of 34
+edges chained -- its depthwise convolutions sit on the CPU between every pair
+of dense ones, so its reach is gated on P7, exactly as the 2026-09-07 sizing
+above said.
+
+**What is left of P2 is the compaction, and it needs something this layer
+does not have.** `compact` is unmoved at 25.6 ms, 18% of wall, because the
+producer must still write the dense IREE buffer: nothing in a command buffer
+can prove that buffer has no other reader -- a later CPU dispatch, a later
+submission, or the model's own output -- and eliding the write on a guess is
+silent corruption. The signal exists in the compiler, where IREE's stream
+dialect knows a transient's last use, but reaching the HAL with it is a wire
+change, not a driver one. The other open edges are the elementwise, pooling
+and matmul dispatch kinds, which record no cube yet: on a matmul-heavy model
+(ViT, Qwen3) that is where the same lever would apply.
+
+**A trap worth keeping.** The first cut matched producers by
+`iree_hal_buffer_t` pointer alone and chained **zero** residual skips: IREE
+packs neighbouring transients into one allocation, so the most recent write
+to that buffer is usually a different tensor at a different offset, and every
+skip -- the wide tensors, `Cout` 512..2048 -- was declined as if blocked. The
+fix is to compare device byte *ranges* and skip writes that miss: 0 of 16
+skips became 16 of 16. `ROCKET_CHAIN=debug` printed the offsets that said so.
+
 ---
 
 ## P3 (S3) — the full output BO is cache-synced once per tile, and a regcmd BO is allocated and mapped per tile

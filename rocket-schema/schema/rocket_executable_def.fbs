@@ -228,6 +228,19 @@ table Conv2DDef {
   // for the same reason: a field added mid-table would shift every later
   // field's vtable slot.
   runtime_quantization:[Conv2DQuantParam];
+
+  // A residual epilogue: after the convolution's own tiles have written
+  // their output cube, one EW task adds a fourth binding -- a tensor of the
+  // output's own geometry -- to that cube, applying `epilogue_activation`
+  // in the EW core afterwards, and the dispatch returns the sum. This is
+  // `relu(conv(x) + skip)`, a residual block's tail, without the host
+  // touching the intermediate. Bindings become input, weights, bias,
+  // residual, output. Only NONE and RELU are meaningful for the EW core's
+  // activation, and only the fp16 precision is validated (the EW task reads
+  // the conv's cube as an fp16 feature cube, which the fp16 output cube is).
+  // Appended last, for the vtable reason above.
+  epilogue_add:bool = false;
+  epilogue_activation:Activation = NONE;
 }
 
 // DEPRECATED: superseded by MatmulDef. Retained because union tags are

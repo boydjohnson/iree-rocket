@@ -485,6 +485,35 @@ func.func @requant_int8_1x1_large_bias(%input: tensor<1x7x7x816xi8>, %filter: te
   return %out : tensor<1x7x7x448xi8>
 }
 
+func.func @fp16_residual_relu(%input: tensor<1x16x16x64xf16>, %filter: tensor<1x1x64x128xf16>, %bias: tensor<128xf32>, %skip: tensor<1x16x16x128xf16>) -> tensor<1x16x16x128xf32> {
+  %zero = arith.constant 0.000000e+00 : f32
+  %low = arith.constant 0.000000e+00 : f32
+  %acc_empty = tensor.empty() : tensor<1x16x16x128xf32>
+  %acc_init = linalg.fill ins(%zero : f32) outs(%acc_empty : tensor<1x16x16x128xf32>) -> tensor<1x16x16x128xf32>
+  %acc = linalg.conv_2d_nhwc_hwcf
+      {dilations = dense<1> : vector<2xi64>, strides = dense<1> : vector<2xi64>}
+      ins(%input, %filter : tensor<1x16x16x64xf16>, tensor<1x1x64x128xf16>)
+      outs(%acc_init : tensor<1x16x16x128xf32>) -> tensor<1x16x16x128xf32>
+  %out_empty = tensor.empty() : tensor<1x16x16x128xf32>
+  %out = linalg.generic {
+      indexing_maps = [affine_map<(d0, d1, d2, d3) -> (d0, d1, d2, d3)>,
+                       affine_map<(d0, d1, d2, d3) -> (d3)>,
+                       affine_map<(d0, d1, d2, d3) -> (d0, d1, d2, d3)>,
+                       affine_map<(d0, d1, d2, d3) -> ()>,
+                       affine_map<(d0, d1, d2, d3) -> (d0, d1, d2, d3)>],
+      iterator_types = ["parallel", "parallel", "parallel", "parallel"]}
+      ins(%acc, %bias, %skip, %low : tensor<1x16x16x128xf32>, tensor<128xf32>, tensor<1x16x16x128xf16>, f32)
+      outs(%out_empty : tensor<1x16x16x128xf32>) {
+  ^bb0(%raw: f32, %channel_bias: f32, %residual: f16, %lo: f32, %unused: f32):
+    %biased = arith.addf %raw, %channel_bias : f32
+    %wide = arith.extf %residual : f16 to f32
+    %summed = arith.addf %biased, %wide : f32
+    %clamped = arith.maximumf %summed, %lo : f32
+    linalg.yield %clamped : f32
+  } -> tensor<1x16x16x128xf32>
+  return %out : tensor<1x16x16x128xf32>
+}
+
 func.func @requant_int8_chain(%input: tensor<1x8x8x64xi8>, %f1: tensor<1x1x64x64xi8>, %b1: tensor<64xi32>, %f2: tensor<1x1x64x64xi8>, %b2: tensor<64xi32>) -> tensor<1x8x8x64xi8> {
   %a_zero = arith.constant 0 : i32
   %a_scale = arith.constant 2.000000e-02 : f32
@@ -1120,6 +1149,15 @@ def write_compiled_fixture(work_dir: Path) -> None:
     np.save(work_dir / "requant_int8_chain_f2.npy", i8_small(1, 1, 64, 64))
     np.save(work_dir / "requant_int8_chain_b2.npy", bias_i32(64))
 
+    # The residual block's tail on the fp16 path: conv, per-channel bias,
+    # a skip tensor of the output geometry added in the DPU's EW core, and
+    # the EW core's ReLU on the sum (Conv2DDef.epilogue_add). Small values
+    # so the f16 intermediate is exact.
+    np.save(work_dir / "fp16_residual_relu_input.npy", rng.uniform(-1.0, 1.0, size=(1, 16, 16, 64)).astype(np.float16))
+    np.save(work_dir / "fp16_residual_relu_kernel.npy", rng.uniform(-0.25, 0.25, size=(1, 1, 64, 128)).astype(np.float16))
+    np.save(work_dir / "fp16_residual_relu_bias.npy", rng.uniform(-1.0, 1.0, size=(128,)).astype(np.float32))
+    np.save(work_dir / "fp16_residual_relu_skip.npy", rng.uniform(-2.0, 2.0, size=(1, 16, 16, 128)).astype(np.float16))
+
     np.save(work_dir / "requant_int8_1x1_cout1792_input.npy", i8(1, 7, 7, 448))
     np.save(work_dir / "requant_int8_1x1_cout1792_kernel.npy", i8_small(1, 1, 448, 1792))
     np.save(work_dir / "requant_int8_1x1_cout1792_bias.npy", bias_i32(1792))
@@ -1237,6 +1275,7 @@ def compile_modules(
         ("requant_int8_1x1_cin816", "rocket_dynamic_int8_requant_executable"),
         ("requant_int8_1x1_cin816_cout448", "rocket_dynamic_int8_requant_executable"),
         ("requant_int8_1x1_large_bias", "rocket_dynamic_int8_requant_executable"),
+        ("fp16_residual_relu", "rocket_dynamic_residual_relu_executable"),
         ("requant_int8_chain", "rocket_dynamic_int8_requant_executable"),
         ("requant_int8_chain_cpu_between", "rocket_dynamic_int8_requant_executable"),
         ("requant_int8_1x1_acc_pos", "rocket_dynamic_int8_requant_executable"),
@@ -1591,6 +1630,18 @@ def run_compiled_gate(
             ("requant_int8_1x1_large_bias_out_rocket.npy",),
             1.0,
             0.0,
+        ),
+        Case(
+            "fp16_residual_relu",
+            (
+                "fp16_residual_relu_input.npy",
+                "fp16_residual_relu_kernel.npy",
+                "fp16_residual_relu_bias.npy",
+                "fp16_residual_relu_skip.npy",
+            ),
+            ("fp16_residual_relu_out_rocket.npy",),
+            0.05,
+            0.02,
         ),
         Case(
             "requant_int8_chain",

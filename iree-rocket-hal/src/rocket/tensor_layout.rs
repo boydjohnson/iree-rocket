@@ -1631,3 +1631,119 @@ mod parity_padding_tests {
         );
     }
 }
+
+/// The identity the driver's cross-dispatch chaining rests on (ISSUES.md P2
+/// step 2).
+///
+/// A convolution writes its result as feature-atomic surfaces into scratch,
+/// `compact_atomic_output` interleaves that into the dense IREE buffer, and
+/// the next convolution repacks the dense buffer into surfaces again. When
+/// the repack would reproduce the producer's scratch byte for byte, the
+/// driver skips it and reads that scratch in place. Nothing at runtime can
+/// check the claim, so it is pinned here: once that it holds, and once for
+/// each way it stops holding, which is exactly the list `chainable_cube`
+/// refuses on.
+#[cfg(test)]
+mod chain_identity_tests {
+    use super::*;
+
+    /// A cube with a distinct nonzero byte in every lane, padding channels
+    /// included -- zeros there would hide the very mismatches these test.
+    fn distinct_cube(pixels: usize, padded_bytes_per_pixel: usize) -> Vec<u8> {
+        let surfaces = padded_bytes_per_pixel / FEATURE_ATOMIC_BYTES;
+        (0..pixels * surfaces * FEATURE_ATOMIC_BYTES)
+            .map(|index| (index % 251 + 1) as u8)
+            .collect()
+    }
+
+    /// What the consumer would compact and repack, given its own geometry.
+    fn compact(cube: &[u8], pixels: usize, bytes_per_pixel: usize) -> Vec<u8> {
+        let mut dense = vec![0u8; pixels * bytes_per_pixel];
+        let written = compact_atomic_output(
+            cube,
+            pixels,
+            pixels,
+            bytes_per_pixel,
+            FEATURE_ATOMIC_BYTES,
+            &mut dense,
+        );
+        assert_eq!(written, dense.len());
+        dense
+    }
+
+    fn repack(dense: &[u8], pixels: usize, bytes_per_pixel: usize, packed: usize) -> Vec<u8> {
+        let mut cube = vec![0u8; nc1hwc2_storage_size(pixels, packed).unwrap()];
+        pack_nhwc_to_nc1hwc2_padded(dense, pixels, bytes_per_pixel, packed, &mut cube).unwrap();
+        cube
+    }
+
+    fn round_trip(cube: &[u8], pixels: usize, bytes_per_pixel: usize, packed: usize) -> Vec<u8> {
+        repack(
+            &compact(cube, pixels, bytes_per_pixel),
+            pixels,
+            bytes_per_pixel,
+            packed,
+        )
+    }
+
+    #[test]
+    fn a_whole_atom_cube_survives_compaction_and_repacking() {
+        // 56x56 at Cin 64 fp16: ResNet50's conv1 -> conv2 edge, and the
+        // shape class every chained edge in that model belongs to.
+        const PIXELS: usize = 56 * 56;
+        const BPP: usize = 64 * 2;
+        let cube = distinct_cube(PIXELS, BPP);
+        assert_eq!(round_trip(&cube, PIXELS, BPP, BPP), cube);
+    }
+
+    #[test]
+    fn a_producers_padding_surfaces_lie_outside_the_chained_region() {
+        // A producer writes `padded_out_channels`, which can be wider than
+        // the logical tensor. Those surfaces sit past everything the
+        // consumer reads, so they cannot disturb the identity -- which is
+        // why `chainable_cube` compares cube geometry and not scratch length.
+        const PIXELS: usize = 8 * 8;
+        const BPP: usize = 32 * 2;
+        let cube = distinct_cube(PIXELS, BPP + 2 * FEATURE_ATOMIC_BYTES);
+        assert_eq!(round_trip(&cube, PIXELS, BPP, BPP), cube[..PIXELS * BPP]);
+    }
+
+    #[test]
+    fn a_partial_trailing_atom_breaks_the_identity() {
+        // Cin 20 fp16 is 40 bytes: two whole atoms and half of a third. A
+        // repack zeroes that half; the producer left padding channels in it.
+        const PIXELS: usize = 4 * 4;
+        const BPP: usize = 20 * 2;
+        let cube = distinct_cube(PIXELS, 3 * FEATURE_ATOMIC_BYTES);
+        let repacked = round_trip(&cube, PIXELS, BPP, BPP);
+        assert_ne!(repacked[..], cube[..repacked.len()]);
+    }
+
+    #[test]
+    fn a_consumer_that_pads_its_channels_breaks_the_identity() {
+        // Cin 8 fp16 is 16 bytes logically and packs to 32: the second
+        // surface is zero after a repack and is producer bytes here.
+        const PIXELS: usize = 4 * 4;
+        const BPP: usize = 8 * 2;
+        const PACKED: usize = 16 * 2;
+        let cube = distinct_cube(PIXELS, PACKED);
+        assert_ne!(round_trip(&cube, PIXELS, BPP, PACKED), cube);
+    }
+
+    #[test]
+    fn unequal_pixel_counts_read_the_wrong_surface() {
+        // Surfaces are `pixel_count * 16` bytes apart, so a producer with
+        // physical height padding (`fc.rs`'s padded row count) puts surface
+        // 1 somewhere the consumer's geometry does not look. The bytes still
+        // round-trip -- they are just the wrong bytes, which is why this is
+        // checked against the producer's own dense result rather than
+        // against the cube.
+        const PRODUCER_PIXELS: usize = 8;
+        const CONSUMER_PIXELS: usize = 4;
+        const BPP: usize = 2 * FEATURE_ATOMIC_BYTES;
+        let cube = distinct_cube(PRODUCER_PIXELS, BPP);
+        let truth = compact(&cube, PRODUCER_PIXELS, BPP);
+        let seen = compact(&cube, CONSUMER_PIXELS, BPP);
+        assert_ne!(seen[..], truth[..seen.len()]);
+    }
+}

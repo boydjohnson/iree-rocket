@@ -261,11 +261,19 @@ fn decode_flatbuffer_shape(data: &[u8]) -> Result<UkernelShape, ()> {
                     });
                 }
             }
+            let epilogue_activation = match conv_def.epilogue_activation() {
+                schema::Activation::NONE => Activation::None,
+                schema::Activation::RELU => Activation::Relu,
+                // The EW core has no RELUX ceiling on the wire yet.
+                _ => return Err(()),
+            };
             let executable = Conv2dExecutable {
                 shape_template,
                 kernels,
                 runtime_dimensions,
                 runtime_quantization,
+                epilogue_add: conv_def.epilogue_add(),
+                epilogue_activation,
             };
             executable.validate_template().map_err(|_| ())?;
             Ok(UkernelShape::Conv2d(executable))

@@ -458,3 +458,70 @@ util.func public @conv_bias_7x7_declines(%input: tensor<1x230x230x3xf16>,
       outs(%init : tensor<1x112x112x64xf32>) -> tensor<1x112x112x64xf32>
   util.return %conv : tensor<1x112x112x64xf32>
 }
+
+// The residual block's tail on the f16-import chain: conv, narrow, then an
+// add of the skip with a ReLU on the sum. The skip is brought to the
+// convolution's rank with the inverse reshape, the bias, the skip and the
+// ReLU all move into one epilogue generic on the f32 accumulator, and the
+// narrow is re-emitted after it.
+
+// CHECK-LABEL: util.func public @conv_residual_relu_f16_import
+// CHECK: tensor.collapse_shape %[[SKIP:.+]] {{\[}}[0], [1, 2], [3], [4]]
+// CHECK: %[[FILL:.+]] = linalg.fill
+// CHECK: %[[CONV:.+]] = linalg.conv_2d_nhwc_hwcf
+// CHECK-SAME: outs(%[[FILL]]
+// CHECK: linalg.generic
+// CHECK-SAME: ins(%[[CONV]], %{{.+}}, %{{.+}}, %{{.+}} : tensor<1x56x56x256xf32>, tensor<256xf32>, tensor<1x56x56x256xf16>, f32)
+// CHECK: arith.addf
+// CHECK-NEXT: arith.extf
+// CHECK-NEXT: arith.addf
+// CHECK-NEXT: arith.maximumf
+// CHECK: tensor.expand_shape
+// CHECK: arith.truncf
+// CHECK-NOT: arith.select
+util.func public @conv_residual_relu_f16_import(%input: tensor<1x56x56x64xf16>,
+                                                %filter: tensor<1x1x64x256xf16>,
+                                                %bias: tensor<256xf32>,
+                                                %skip: tensor<1x1x56x56x256xf16>)
+    -> tensor<1x1x56x56x256xf16> {
+  %cst = arith.constant 0.000000e+00 : f16
+  %nchw_empty = tensor.empty() : tensor<1x256x56x56xf32>
+  %bias_nchw = linalg.broadcast ins(%bias : tensor<256xf32>)
+      outs(%nchw_empty : tensor<1x256x56x56xf32>) dimensions = [0, 2, 3]
+  %init_empty = tensor.empty() : tensor<1x56x56x256xf32>
+  %init = linalg.transpose ins(%bias_nchw : tensor<1x256x56x56xf32>)
+      outs(%init_empty : tensor<1x56x56x256xf32>) permutation = [0, 2, 3, 1]
+  %conv = linalg.conv_2d_nhwc_hwcf
+      {dilations = dense<1> : vector<2xi64>, strides = dense<1> : vector<2xi64>}
+      ins(%input, %filter : tensor<1x56x56x64xf16>, tensor<1x1x64x256xf16>)
+      outs(%init : tensor<1x56x56x256xf32>) -> tensor<1x56x56x256xf32>
+  %expanded = tensor.expand_shape %conv [[0], [1, 2], [3], [4]]
+      output_shape [1, 1, 56, 56, 256]
+      : tensor<1x56x56x256xf32> into tensor<1x1x56x56x256xf32>
+  %narrow_empty = tensor.empty() : tensor<1x1x56x56x256xf16>
+  %narrowed = linalg.generic {
+      indexing_maps = [affine_map<(d0, d1, d2, d3, d4) -> (d0, d1, d2, d3, d4)>,
+                       affine_map<(d0, d1, d2, d3, d4) -> (d0, d1, d2, d3, d4)>],
+      iterator_types = ["parallel", "parallel", "parallel", "parallel", "parallel"]}
+      ins(%expanded : tensor<1x1x56x56x256xf32>)
+      outs(%narrow_empty : tensor<1x1x56x56x256xf16>) {
+  ^bb0(%in: f32, %out: f16):
+    %0 = arith.truncf %in : f32 to f16
+    linalg.yield %0 : f16
+  } -> tensor<1x1x56x56x256xf16>
+  %sum_empty = tensor.empty() : tensor<1x1x56x56x256xf16>
+  %sum = linalg.generic {
+      indexing_maps = [affine_map<(d0, d1, d2, d3, d4) -> (d0, d1, d2, d3, d4)>,
+                       affine_map<(d0, d1, d2, d3, d4) -> (d0, d1, d2, d3, d4)>,
+                       affine_map<(d0, d1, d2, d3, d4) -> (d0, d1, d2, d3, d4)>],
+      iterator_types = ["parallel", "parallel", "parallel", "parallel", "parallel"]}
+      ins(%narrowed, %skip : tensor<1x1x56x56x256xf16>, tensor<1x1x56x56x256xf16>)
+      outs(%sum_empty : tensor<1x1x56x56x256xf16>) {
+  ^bb0(%a: f16, %b: f16, %out: f16):
+    %0 = arith.addf %a, %b : f16
+    %1 = arith.cmpf ugt, %0, %cst : f16
+    %2 = arith.select %1, %0, %cst : f16
+    linalg.yield %2 : f16
+  } -> tensor<1x1x56x56x256xf16>
+  util.return %sum : tensor<1x1x56x56x256xf16>
+}
