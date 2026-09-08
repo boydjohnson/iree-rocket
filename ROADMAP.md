@@ -552,7 +552,11 @@ the other 6.9 ms is host layout work. That is
 [ISSUES.md P2](ISSUES.md)'s per-dispatch repack, paid at every link because
 nothing propagates a packed layout between dispatches. **No cut point in the
 shape distribution rescues it** -- even the widest op ViT has is net-negative
--- so this is not a bounds-tuning problem.
+-- so this is not a bounds-tuning problem. Since 2026-09-08 a *convolution*
+that reads another dispatch's output skips its half of that round trip
+(ISSUES.md P2 step 2, `ROCKET_CHAIN`); the element-wise dispatch kind records
+no output cube yet and still pays both halves, so this measurement stands
+until it does.
 
 **Conclusion: `--elementwise` stays off by default.** It is P8's law confirmed
 on a second model and a second op family, with the mechanism named. The lever

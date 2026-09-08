@@ -300,6 +300,22 @@ fn fanout_enabled() -> bool {
     *ENABLED.get_or_init(|| std::env::var("ROCKET_FANOUT").map_or(true, |value| value != "0"))
 }
 
+/// Whether a dispatch may read a preceding dispatch's output cube in place
+/// instead of repacking the dense buffer that cube was compacted into
+/// (`ROCKET_CHAIN=0` restores the unconditional repack). `ROCKET_CHAIN=debug`
+/// additionally names every edge it takes and every one it declines, which is
+/// the only way to tell "the shape does not qualify" from "no producer was
+/// found" -- see [`chainable_cube`]. ISSUES.md P2 step 2.
+fn chain_enabled() -> bool {
+    static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ENABLED.get_or_init(|| std::env::var("ROCKET_CHAIN").map_or(true, |value| value != "0"))
+}
+
+fn chain_debug() -> bool {
+    static DEBUG: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *DEBUG.get_or_init(|| std::env::var("ROCKET_CHAIN").is_ok_and(|value| value == "debug"))
+}
+
 /// after preceding recorded update/fill/copy operations have populated the
 /// real IREE input buffer.
 #[derive(Clone, Copy)]
@@ -419,13 +435,193 @@ impl StagedWeights {
 /// applied yet, so the generation counter cannot see it, and reusing a
 /// buffer packed from the pre-write bytes would silently use stale weights.
 fn recorded_write_target(op: &RecordedOp) -> Option<*mut iree_hal_buffer_t> {
+    recorded_write_extent(op).map(|(buffer, _, _)| buffer)
+}
+
+/// [`recorded_write_target`] with the byte range the operation actually
+/// writes, as `(buffer, offset, length)`.
+///
+/// IREE hands out one `iree_hal_buffer_t` per allocation and packs several
+/// transient tensors into it at different offsets, so the buffer alone does
+/// not say whether two operations touch the same bytes -- which is all
+/// `recorded_write_target`'s caller needs and not nearly enough for
+/// [`chainable_cube`], where treating a neighbouring tensor's write as a
+/// blocker declined every residual skip in ResNet50.
+///
+/// A dispatch's length is what its compaction writes, which `queue_execute`
+/// checks against the bytes it actually produced, not the binding's declared
+/// length.
+fn recorded_write_extent(
+    op: &RecordedOp,
+) -> Option<(*mut iree_hal_buffer_t, iree_device_size_t, usize)> {
     match op {
-        RecordedOp::Fill { target, .. } | RecordedOp::Update { target, .. } => Some(target.buffer),
-        RecordedOp::Copy { target, .. } => Some(target.buffer),
+        RecordedOp::Fill { target, .. } | RecordedOp::Update { target, .. } => {
+            Some((target.buffer, target.offset, target.length))
+        }
+        RecordedOp::Copy { target, .. } => Some((target.buffer, target.offset, target.length)),
         RecordedOp::Dispatch {
             output_compaction, ..
-        } => output_compaction.as_ref().map(|oc| oc.output_buffer),
+        } => output_compaction.as_ref().map(|oc| {
+            (
+                oc.output_buffer,
+                oc.output_offset,
+                oc.output_pixel_count * oc.bytes_per_pixel,
+            )
+        }),
     }
+}
+
+/// The device-visible byte range a binding covers, which is what decides
+/// whether two recorded operations touch the same memory.
+///
+/// Comparing `iree_hal_buffer_t` pointers would be enough for the buffers
+/// IREE hands this driver today, but the DMA address is the identity the
+/// hardware itself uses: two buffer objects that alias one allocation share
+/// it, and a stale chain served from a producer's scratch is silent.
+///
+/// # Safety
+///
+/// `buffer` must be a live `RocketBuffer`, which every direct binding
+/// recorded on this command buffer is (`stage_direct` casts the same way at
+/// the same point).
+unsafe fn dma_range(
+    buffer: *mut iree_hal_buffer_t,
+    offset: iree_device_size_t,
+    length: usize,
+) -> Option<(u64, u64)> {
+    if buffer.is_null() {
+        return None;
+    }
+    let base = unsafe { &*(buffer as *const RocketBuffer) }.dma_address as u64 + offset as u64;
+    Some((base, base + length as u64))
+}
+
+/// The output cube a dispatch may read in place of repacking `binding`.
+///
+/// Walks the ops recorded so far backwards to the most recent write whose
+/// device-visible bytes overlap the ones this dispatch reads. That write is
+/// the only one whose bytes the consumer can see, so if it is not a dispatch
+/// offering a compatible cube -- a fill, a copy, an update, a fanned-out
+/// dispatch, an accumulator dispatch, a partial overlap -- there is nothing
+/// to chain and the caller repacks as before. Writes that miss the range are
+/// skipped: IREE packs neighbouring transients into one allocation, and
+/// treating those as blockers declined every residual skip in ResNet50.
+///
+/// The compatibility test is exactly the condition under which
+/// `pack_nhwc_to_nc1hwc2_padded(compact_atomic_output(cube))` reproduces
+/// `cube`:
+///
+/// - the identical device byte range, so the consumer really is reading what
+///   the producer wrote and not a tensor that merely shares its allocation;
+/// - equal pixel counts, since the surface stride is `pixels * 16` on both
+///   sides and a producer with physical height padding (`fc.rs`'s padded row
+///   count, a reduced output extent) strides differently from what the
+///   consumer's own geometry would pack;
+/// - equal logical pixel widths, and the consumer asking for no channel
+///   padding beyond them (`packed == logical`), since padding surfaces are
+///   zero after a repack but hold the producer's padding channels here;
+/// - a whole number of 16-byte atoms per pixel, since a partial trailing atom
+///   is zeroed by the repack and holds the producer's padding channels here.
+///
+/// `bytes_per_pixel` is the consumer's logical width and `packed_bytes_per_pixel`
+/// the width it would have packed to.
+///
+/// # Safety
+///
+/// `binding` and every recorded write target must be live `RocketBuffer`s,
+/// which every direct binding on this command buffer is -- indirect ones are
+/// rejected in `dispatch()` and `apply_ops_until_dispatch`.
+fn chainable_cube(
+    cb: &RocketCommandBuffer,
+    binding: &iree_hal_buffer_ref_t,
+    pixel_count: usize,
+    bytes_per_pixel: usize,
+    packed_bytes_per_pixel: usize,
+    what: &str,
+) -> Option<OutputCube> {
+    if !chain_enabled() || binding.buffer.is_null() {
+        return None;
+    }
+    // A consumer that pads its channels, or whose pixel is a partial atom,
+    // cannot alias a producer cube however well the producer matches.
+    if packed_bytes_per_pixel != bytes_per_pixel
+        || bytes_per_pixel == 0
+        || !bytes_per_pixel.is_multiple_of(16)
+    {
+        if chain_debug() {
+            eprintln!(
+                "rocket: chain declined ({what}): consumer width {bytes_per_pixel} \
+                 packs to {packed_bytes_per_pixel}, not a whole-atom identity"
+            );
+        }
+        return None;
+    }
+    // The most recent write that overlaps the bytes this dispatch reads.
+    // Writes to other regions of the same allocation are neighbouring
+    // tensors, not blockers, so they are skipped rather than declined on.
+    let want = unsafe {
+        dma_range(
+            binding.buffer,
+            binding.offset,
+            pixel_count * bytes_per_pixel,
+        )
+    }?;
+    let Some(producer) = cb.ops.iter().rev().find(|op| {
+        recorded_write_extent(op)
+            .and_then(|(buffer, offset, length)| unsafe { dma_range(buffer, offset, length) })
+            .is_some_and(|wrote| wrote.0 < want.1 && want.0 < wrote.1)
+    }) else {
+        // Nothing on this command buffer wrote these bytes: they came from
+        // outside -- an upload, a CPU dispatch, an earlier submission. The
+        // commonest reason not to chain, and worth telling apart from a
+        // producer whose cube does not qualify.
+        if chain_debug() {
+            eprintln!("rocket: chain declined ({what}): no producer on this command buffer");
+        }
+        return None;
+    };
+    let RecordedOp::Dispatch {
+        output_cube: Some(cube),
+        ..
+    } = producer
+    else {
+        if chain_debug() {
+            eprintln!("rocket: chain declined ({what}): producer offers no cube");
+        }
+        return None;
+    };
+    // Overlapping is not enough: the producer must have written exactly the
+    // region this dispatch reads, in the geometry it would have packed.
+    if unsafe {
+        dma_range(
+            cube.dense_buffer,
+            cube.dense_offset,
+            cube.pixel_count * cube.bytes_per_pixel,
+        )
+    } != Some(want)
+        || cube.pixel_count != pixel_count
+        || cube.bytes_per_pixel != bytes_per_pixel
+    {
+        if chain_debug() {
+            eprintln!(
+                "rocket: chain declined ({what}): producer cube {}x{} at +{} vs consumer {}x{} at +{}",
+                cube.pixel_count,
+                cube.bytes_per_pixel,
+                cube.dense_offset,
+                pixel_count,
+                bytes_per_pixel,
+                binding.offset
+            );
+        }
+        return None;
+    }
+    if chain_debug() {
+        eprintln!(
+            "rocket: chain taken ({what}): {} pixels x {} bytes, skipping the repack",
+            pixel_count, bytes_per_pixel
+        );
+    }
+    Some(*cube)
 }
 
 /// Allocates one [`Replica`] per sibling context in `contexts`, each holding
@@ -868,6 +1064,44 @@ pub struct OutputCompaction {
     pub tile_rects: Vec<TileRect>,
 }
 
+/// A dispatch's NC1HWC2 output cube, offered to whichever later dispatch in
+/// this command buffer reads the dense buffer it compacts into.
+///
+/// The producer writes feature-atomic surfaces into a driver-private scratch
+/// BO and [`OutputCompaction`] interleaves them into the dense IREE buffer;
+/// the consumer then reads that dense buffer straight back into its own
+/// scratch through `pack_nhwc_to_nc1hwc2_padded`. Under the conditions
+/// [`chainable_cube`] checks, `pack(compact(cube)) == cube` byte for byte, so
+/// the consumer may simply point its regcmd at the producer's scratch and
+/// skip the repack entirely -- bit-identical output, one full pass over the
+/// tensor saved. This is the aliasing `encodings/cross-op-chaining.md` proved
+/// legal and ISSUES.md P2 has carried since: the input feature cube and the
+/// fp16-narrowed output cube are the same layout, both `feat_idx` with a
+/// 16-byte channel atom.
+///
+/// The compaction still runs. Nothing here can prove the dense buffer has no
+/// other reader -- a later CPU dispatch, a later command buffer, or the
+/// model's own output -- so eliding it needs a liveness signal this layer
+/// does not have. See P2 for what that would take.
+#[derive(Clone, Copy)]
+pub struct OutputCube {
+    /// The dense IREE buffer and offset this cube is compacted into, which
+    /// is what a consumer's input binding is matched against.
+    pub dense_buffer: *mut iree_hal_buffer_t,
+    pub dense_offset: iree_device_size_t,
+    /// The scratch BO the hardware wrote, on this command buffer's own
+    /// context -- a job may only name BOs created on its own file, and every
+    /// dispatch recorded here shares the command buffer's context.
+    pub dma_address: u32,
+    pub handle: u32,
+    pub host_ptr: *mut u8,
+    pub length: usize,
+    /// The cube's geometry: surfaces are `pixel_count * 16` bytes apart and
+    /// the logical pixel occupies `bytes_per_pixel`, a whole number of atoms.
+    pub pixel_count: usize,
+    pub bytes_per_pixel: usize,
+}
+
 /// One recorded command-buffer operation, in call order -- see module doc
 /// comment for why these are recorded rather than applied immediately.
 pub enum RecordedOp {
@@ -963,6 +1197,10 @@ pub enum RecordedOp {
         /// dispatch; `scratch_buffers` cannot own it because the cache may
         /// still be handing it to later command buffers.
         weight_scratch: Option<Arc<weight_cache::SharedBuffer>>,
+        /// Set when this dispatch writes its result as a plain 16-byte-atom
+        /// NC1HWC2 cube: the offer a later dispatch reading the same dense
+        /// buffer may take instead of repacking it. See [`OutputCube`].
+        output_cube: Option<OutputCube>,
         /// Set when this dispatch packed its own coefficients: `apply_ops`
         /// publishes them once the packing has actually succeeded, never at
         /// record time, so no other command buffer can reach a buffer that
@@ -1196,6 +1434,9 @@ pub unsafe fn apply_ops_until_dispatch(
                 tile_context,
                 scratch_buffers: _,
                 retained_bindings: _,
+                // Record-time only: a later dispatch reads it while the
+                // command buffer is still being built, never here.
+                output_cube: _,
             } => {
                 if let Some(packing) = input_packing {
                     apply_input_packing(cb.fd, packing, profile_label)?;
@@ -2001,9 +2242,27 @@ unsafe extern "C" fn dispatch_impl(
             // NC1HWC2 surfaces. Shapes with 1..=4 channels use the hardware's
             // dense ARGB modes and must remain dense; packing Cin 2..=4 into
             // 16-byte slots makes those modes read padding as later pixels.
-            let (input_addr, input_handle, input_packing) = if shape.layout()
-                == FeatureLayout::Surfaces
-            {
+            // A preceding dispatch on this command buffer may already have
+            // this input in the cube layout the CNA wants, in which case the
+            // repack below is a full pass over the tensor that reproduces
+            // bytes the hardware already wrote. Read them in place instead.
+            // ISSUES.md P2 step 2; see `chainable_cube` for when that is
+            // byte-identical.
+            let chained_input = if shape.layout() == FeatureLayout::Surfaces {
+                chainable_cube(
+                    cb,
+                    &refs[0],
+                    pixel_count,
+                    input_bytes_per_pixel,
+                    packed_input_bytes_per_pixel,
+                    "conv input",
+                )
+            } else {
+                None
+            };
+            let (input_addr, input_handle, input_packing) = if let Some(cube) = chained_input {
+                (cube.dma_address, cube.handle, None)
+            } else if shape.layout() == FeatureLayout::Surfaces {
                 let scratch_bytes =
                     match nc1hwc2_storage_size(pixel_count, packed_input_bytes_per_pixel) {
                         Ok(value) => value,
@@ -2275,12 +2534,15 @@ unsafe extern "C" fn dispatch_impl(
             // only returns fresh local vectors, so a panic mid-build leaves
             // no shared state half-mutated.
             // Fan-out sources: what a sibling context copies for each operand.
-            let input_source = match &input_packing {
-                Some(packing) => (
+            let input_source = match (&chained_input, &input_packing) {
+                // A chained input is already a cube on this context's file;
+                // a sibling copies it exactly as it copies a fresh packing.
+                (Some(cube), _) => (ReplicaSource::Host(cube.host_ptr as *const u8), cube.length),
+                (None, Some(packing)) => (
                     ReplicaSource::Host(packing.scratch_ptr as *const u8),
                     packing.scratch_length,
                 ),
-                None => (
+                (None, None) => (
                     ReplicaSource::Binding {
                         buffer: refs[0].buffer,
                         offset: refs[0].offset as usize,
@@ -2305,8 +2567,18 @@ unsafe extern "C" fn dispatch_impl(
                 buffer: refs[1].buffer,
                 offset: refs[1].offset as usize,
             };
-            let input_geometry = Some(match &input_packing {
-                Some(packing) if matches!(packing.layout, InputPackingLayout::Nc1hwc2) => {
+            let input_geometry = Some(match (&chained_input, &input_packing) {
+                // The producer's cube may carry padding surfaces past the
+                // logical channels; a band copy only needs the ones this
+                // dispatch reads, at the producer's own surface stride.
+                (Some(cube), _) => BandGeometry {
+                    width: shape.width as usize,
+                    height: shape.height as usize,
+                    surfaces: cube.bytes_per_pixel / 16,
+                    surface_stride: cube.pixel_count * 16,
+                    block_bytes: 16,
+                },
+                (None, Some(packing)) if matches!(packing.layout, InputPackingLayout::Nc1hwc2) => {
                     BandGeometry {
                         width: shape.width as usize,
                         height: shape.height as usize,
@@ -2315,14 +2587,14 @@ unsafe extern "C" fn dispatch_impl(
                         block_bytes: 16,
                     }
                 }
-                Some(packing) => BandGeometry {
+                (None, Some(packing)) => BandGeometry {
                     width: shape.width as usize,
                     height: shape.height as usize,
                     surfaces: 1,
                     surface_stride: 0,
                     block_bytes: packing.packed_bytes_per_pixel,
                 },
-                None => BandGeometry {
+                (None, None) => BandGeometry {
                     width: shape.width as usize,
                     height: shape.height as usize,
                     surfaces: 1,
@@ -2437,6 +2709,10 @@ unsafe extern "C" fn dispatch_impl(
             };
             let output_pixel_count =
                 shape.output_width(kernels) as usize * shape.output_height(kernels) as usize;
+            let output_bytes_per_pixel =
+                shape.out_channels as usize * shape.precision.output_element_bytes() as usize;
+            let tile_rects_empty = tile_rects.is_empty();
+            let source_tiles_none = source_tiles.is_none();
             let mut output_compaction = Some(OutputCompaction {
                 output_buffer: refs[output_index].buffer,
                 output_offset: refs[output_index].offset,
@@ -2446,8 +2722,7 @@ unsafe extern "C" fn dispatch_impl(
                 source_pixel_count: output_pixel_count,
                 output_pixel_count,
                 output_width: shape.output_width(kernels) as usize,
-                bytes_per_pixel: shape.out_channels as usize
-                    * shape.precision.output_element_bytes() as usize,
+                bytes_per_pixel: output_bytes_per_pixel,
                 source_block_bytes: programmed_shape.output_atom_bytes() as usize,
                 source_tiles,
                 replica_scratch,
@@ -2456,6 +2731,27 @@ unsafe extern "C" fn dispatch_impl(
             });
             let output_handle = scratch.handle;
             let conv_output_addr = scratch.dma_address;
+            // The cube a later dispatch may read in place. A fanned-out
+            // dispatch has no single one -- each context wrote its own tiles
+            // into its own copy, and only the compaction gathers them -- and
+            // an accumulator dispatch's 128-byte blocks are not the CNA's
+            // input layout at all. Both fall back to the repack.
+            let plain_atoms = programmed_shape.output_atom_bytes() as usize == 16;
+            let mut output_cube = (chain_enabled()
+                && plain_atoms
+                && tile_rects_empty
+                && source_tiles_none
+                && output_bytes_per_pixel.is_multiple_of(16))
+            .then_some(OutputCube {
+                dense_buffer: refs[output_index].buffer,
+                dense_offset: refs[output_index].offset,
+                dma_address: scratch.dma_address,
+                handle: scratch.handle,
+                host_ptr: scratch.host_ptr,
+                length: scratch_bytes,
+                pixel_count: output_pixel_count,
+                bytes_per_pixel: output_bytes_per_pixel,
+            });
             scratch_buffers.push(scratch);
             // The residual epilogue: pack the fourth binding as a feature cube
             // of the output geometry, then one EW task after the tiles adds
@@ -2482,11 +2778,32 @@ unsafe extern "C" fn dispatch_impl(
                         crate::bindings::iree_status_code_e_IREE_STATUS_INTERNAL,
                     );
                 }
+                // The skip is a block input, so on a residual network it is
+                // another dispatch's output as often as the feature input
+                // is -- and it is the wide tensor. Chain it the same way.
+                let chained_skip = chainable_cube(
+                    cb,
+                    &refs[3],
+                    cube.pixels,
+                    cube.logical_bytes_per_pixel,
+                    cube.packed_bytes_per_pixel,
+                    "conv residual skip",
+                );
+                let residual = match chained_skip {
+                    Some(skip) => Some((None, skip.dma_address, skip.handle)),
+                    None => {
+                        pack_elementwise_input(cb, &refs[3], &cube).map(|(scratch, packing)| {
+                            let addr = scratch.dma_address;
+                            let handle = scratch.handle;
+                            (Some((scratch, packing)), addr, handle)
+                        })
+                    }
+                };
                 let (
-                    Some((residual_scratch, residual_packing)),
+                    Some((residual_staged, residual_addr, residual_handle)),
                     Some((sum_scratch, sum_compaction)),
                 ) = (
-                    pack_elementwise_input(cb, &refs[3], &cube),
+                    residual,
                     compact_elementwise_output(cb, &refs[output_index], &cube),
                 )
                 else {
@@ -2509,16 +2826,31 @@ unsafe extern "C" fn dispatch_impl(
                     &add,
                     &EwAddBuffers {
                         intermediate_addr: conv_output_addr,
-                        w_addr: residual_scratch.dma_address,
+                        w_addr: residual_addr,
                         output_addr: sum_scratch.dma_address,
                     },
                     executable.epilogue_activation == Activation::Relu,
                 ));
-                in_bo_handles.push(residual_scratch.handle);
+                in_bo_handles.push(residual_handle);
                 out_bo_handles.push(sum_scratch.handle);
-                operand_packing = Some(residual_packing);
+                if let Some((residual_scratch, residual_packing)) = residual_staged {
+                    operand_packing = Some(residual_packing);
+                    scratch_buffers.push(residual_scratch);
+                }
+                // The EW task's sum, not the convolution's own cube, is what
+                // this dispatch publishes: it is what the compaction reads
+                // and so what a later dispatch would otherwise repack.
+                output_cube = output_cube.map(|_| OutputCube {
+                    dense_buffer: refs[output_index].buffer,
+                    dense_offset: refs[output_index].offset,
+                    dma_address: sum_scratch.dma_address,
+                    handle: sum_scratch.handle,
+                    host_ptr: sum_scratch.host_ptr,
+                    length: cube.scratch_bytes,
+                    pixel_count: cube.pixels,
+                    bytes_per_pixel: cube.logical_bytes_per_pixel,
+                });
                 output_compaction = Some(sum_compaction);
-                scratch_buffers.push(residual_scratch);
                 scratch_buffers.push(sum_scratch);
             }
             let retained_bindings = unsafe { retain_direct_bindings(refs) };
@@ -2558,6 +2890,7 @@ unsafe extern "C" fn dispatch_impl(
                 output_compaction,
                 profile_label,
                 weight_scratch,
+                output_cube,
                 weight_publish,
             });
         }
@@ -2977,6 +3310,7 @@ unsafe extern "C" fn dispatch_impl(
                 output_compaction,
                 profile_label,
                 weight_scratch,
+                output_cube: None,
                 weight_publish,
             });
         }
@@ -3163,6 +3497,7 @@ unsafe extern "C" fn dispatch_impl(
                 output_compaction,
                 profile_label,
                 weight_scratch: None,
+                output_cube: None,
                 weight_publish: None,
             });
         }
@@ -3227,6 +3562,7 @@ unsafe extern "C" fn dispatch_impl(
                 output_compaction: Some(output_compaction),
                 profile_label,
                 weight_scratch: None,
+                output_cube: None,
                 weight_publish: None,
             });
         }
@@ -3297,6 +3633,7 @@ unsafe extern "C" fn dispatch_impl(
                 output_compaction: Some(output_compaction),
                 profile_label,
                 weight_scratch: None,
+                output_cube: None,
                 weight_publish: None,
             });
         }
@@ -3356,6 +3693,7 @@ unsafe extern "C" fn dispatch_impl(
                 output_compaction: Some(output_compaction),
                 profile_label,
                 weight_scratch: None,
+                output_cube: None,
                 weight_publish: None,
             });
         }
