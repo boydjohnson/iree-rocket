@@ -154,6 +154,12 @@ pub struct Conv2dExecutable {
     pub runtime_dimensions: Vec<RuntimeConv2dDimension>,
     /// Consumed after every `runtime_dimensions` constant, in order.
     pub runtime_quantization: Vec<RuntimeConv2dQuantParam>,
+    /// A residual epilogue: after the tiles, one EW task adds the fourth
+    /// binding to the output cube and applies `epilogue_activation` in the
+    /// EW core (`Conv2DDef.epilogue_add`). Bindings are then input,
+    /// weights, bias, residual, output.
+    pub epilogue_add: bool,
+    pub epilogue_activation: conv::Activation,
 }
 
 impl Conv2dExecutable {
@@ -163,6 +169,8 @@ impl Conv2dExecutable {
             kernels,
             runtime_dimensions: Vec::new(),
             runtime_quantization: Vec::new(),
+            epilogue_add: false,
+            epilogue_activation: conv::Activation::None,
         }
     }
 
@@ -1086,6 +1094,8 @@ mod tests {
                 RuntimeConv2dDimension::InputWidth,
             ],
             runtime_quantization: Vec::new(),
+            epilogue_add: false,
+            epilogue_activation: conv::Activation::None,
         }
     }
 
@@ -1148,6 +1158,8 @@ mod tests {
                 RuntimeConv2dDimension::WeightsWidth,
             ],
             runtime_quantization: Vec::new(),
+            epilogue_add: false,
+            epilogue_activation: conv::Activation::None,
         };
         assert!(executable.resolve_shape(&constants(&[99, 99])).is_err());
     }

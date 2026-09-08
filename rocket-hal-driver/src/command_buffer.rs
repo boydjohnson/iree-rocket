@@ -91,11 +91,14 @@ use iree_rocket_hal::rocket::{
     activation::{LutBuffers, build_lut_regcmd},
     builders::RegCmd,
     conv::{
-        AccumulatorOutputTile, Buffers, ConvPlan, FeatureLayout, Precision, relocate,
+        AccumulatorOutputTile, Activation, Buffers, ConvPlan, FeatureLayout, Precision, relocate,
         relocate_staged_accumulator,
     },
     device::{OwnedBuffer as RocketGemBuffer, fini_bo},
-    elementwise::{EwAddBuffers, EwUnaryBuffers, build_add_regcmd, build_unary_regcmd},
+    elementwise::{
+        EwAddBuffers, EwAddShape, EwBinaryOp, EwPrecision, EwUnaryBuffers, build_add_regcmd,
+        build_add_regcmd_with_relu, build_unary_regcmd,
+    },
     fc,
     pooling::{PoolingBuffers, PoolingPlan},
     tensor_layout::{
@@ -1960,7 +1963,19 @@ unsafe extern "C" fn dispatch_impl(
                     );
                 }
             };
-            if bindings.count < 4 {
+            // With a residual epilogue the bindings are input, weights, bias,
+            // residual, output; otherwise input, weights, bias, output.
+            let output_index = if executable.epilogue_add { 4 } else { 3 };
+            if bindings.count < output_index + 1 {
+                return status::from_code(
+                    crate::bindings::iree_status_code_e_IREE_STATUS_INVALID_ARGUMENT,
+                );
+            }
+            if executable.epilogue_add
+                && (shape.precision != Precision::Fp16 || shape.out_channels % 16 != 0)
+            {
+                // The EW task reads the conv's cube as an fp16 feature cube of
+                // whole 16-byte atoms; nothing else is validated.
                 return status::from_code(
                     crate::bindings::iree_status_code_e_IREE_STATUS_INVALID_ARGUMENT,
                 );
@@ -2318,7 +2333,14 @@ unsafe extern "C" fn dispatch_impl(
             let planned = match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
                 let plan = ConvPlan::new(programmed_shape, kernels);
                 let tiles = plan.tiles().len();
-                let contexts = cb.fanout_contexts(tiles);
+                // A residual epilogue's EW task must run after every tile
+                // and reads the whole cube, so its dispatch stays on one
+                // in-order queue: no fan-out.
+                let contexts = if executable.epilogue_add {
+                    &[][..]
+                } else {
+                    cb.fanout_contexts(tiles)
+                };
                 let tile_context = tile_contexts(tiles, contexts.len());
                 let tile_bands: Vec<InputBand> = plan
                     .tiles()
@@ -2353,7 +2375,7 @@ unsafe extern "C" fn dispatch_impl(
                 let (programs, source_tiles) = if programmed_shape.precision.writes_accumulators() {
                     let staged = plan.staged_accumulator_programs();
                     assert_eq!(staged.scratch_bytes, scratch_bytes);
-                    let programs = staged
+                    let programs: Vec<Vec<RegCmd>> = staged
                         .programs
                         .into_iter()
                         .zip(&staged.tiles)
@@ -2368,7 +2390,7 @@ unsafe extern "C" fn dispatch_impl(
                         Some(Arc::<[AccumulatorOutputTile]>::from(staged.tiles)),
                     )
                 } else {
-                    let programs = plan
+                    let programs: Vec<Vec<RegCmd>> = plan
                         .programs()
                         .into_iter()
                         .enumerate()
@@ -2403,7 +2425,7 @@ unsafe extern "C" fn dispatch_impl(
                     );
                 }
             };
-            let (regcmd_tasks, source_tiles, replicas, tile_context, tile_rects) = planned;
+            let (mut regcmd_tasks, source_tiles, replicas, tile_context, tile_rects) = planned;
             let replica_scratch: Vec<(usize, usize)> = replicas
                 .iter()
                 .map(|replica| (replica.output.host_ptr as usize, replica.output.size))
@@ -2415,10 +2437,10 @@ unsafe extern "C" fn dispatch_impl(
             };
             let output_pixel_count =
                 shape.output_width(kernels) as usize * shape.output_height(kernels) as usize;
-            let output_compaction = Some(OutputCompaction {
-                output_buffer: refs[3].buffer,
-                output_offset: refs[3].offset,
-                output_length: refs[3].length,
+            let mut output_compaction = Some(OutputCompaction {
+                output_buffer: refs[output_index].buffer,
+                output_offset: refs[output_index].offset,
+                output_length: refs[output_index].length,
                 scratch_ptr: scratch.host_ptr,
                 scratch_length: scratch_bytes,
                 source_pixel_count: output_pixel_count,
@@ -2433,7 +2455,72 @@ unsafe extern "C" fn dispatch_impl(
                 tile_rects,
             });
             let output_handle = scratch.handle;
+            let conv_output_addr = scratch.dma_address;
             scratch_buffers.push(scratch);
+            // The residual epilogue: pack the fourth binding as a feature cube
+            // of the output geometry, then one EW task after the tiles adds
+            // it to the conv's cube and writes a second scratch, which is
+            // what gets compacted. The conv's own cube is never touched by
+            // the host. Validated on hardware by `conv_residual_add_hw`.
+            let mut in_bo_handles = vec![input_handle, weights_handle, bias_handle];
+            let mut out_bo_handles = vec![output_handle];
+            let mut operand_packing = None;
+            if executable.epilogue_add {
+                let Some(cube) = ElementwiseCube::new(
+                    shape.output_width(kernels),
+                    shape.output_height(kernels),
+                    shape.out_channels,
+                    2,
+                ) else {
+                    return status::from_code(
+                        crate::bindings::iree_status_code_e_IREE_STATUS_INVALID_ARGUMENT,
+                    );
+                };
+                if cube.scratch_bytes != scratch_bytes {
+                    // The EW task's cube must be the conv's cube, byte for byte.
+                    return status::from_code(
+                        crate::bindings::iree_status_code_e_IREE_STATUS_INTERNAL,
+                    );
+                }
+                let (
+                    Some((residual_scratch, residual_packing)),
+                    Some((sum_scratch, sum_compaction)),
+                ) = (
+                    pack_elementwise_input(cb, &refs[3], &cube),
+                    compact_elementwise_output(cb, &refs[output_index], &cube),
+                )
+                else {
+                    return status::from_code(
+                        crate::bindings::iree_status_code_e_IREE_STATUS_INVALID_ARGUMENT,
+                    );
+                };
+                let add = EwAddShape {
+                    width: shape.output_width(kernels),
+                    height: shape.output_height(kernels),
+                    channels: shape.out_channels,
+                    precision: EwPrecision::Fp16,
+                    op: EwBinaryOp::Add,
+                    output_zero_point: 0,
+                    w_cvt_offset: 0,
+                    w_scale_ratio: 1.0,
+                    output_scale_ratio: 1.0,
+                };
+                regcmd_tasks.push(build_add_regcmd_with_relu(
+                    &add,
+                    &EwAddBuffers {
+                        intermediate_addr: conv_output_addr,
+                        w_addr: residual_scratch.dma_address,
+                        output_addr: sum_scratch.dma_address,
+                    },
+                    executable.epilogue_activation == Activation::Relu,
+                ));
+                in_bo_handles.push(residual_scratch.handle);
+                out_bo_handles.push(sum_scratch.handle);
+                operand_packing = Some(residual_packing);
+                output_compaction = Some(sum_compaction);
+                scratch_buffers.push(residual_scratch);
+                scratch_buffers.push(sum_scratch);
+            }
             let retained_bindings = unsafe { retain_direct_bindings(refs) };
             let profile_label = profile::label(|| {
                 format!(
@@ -2462,10 +2549,10 @@ unsafe extern "C" fn dispatch_impl(
                 staged_copies,
                 replicas,
                 tile_context,
-                in_bo_handles: vec![input_handle, weights_handle, bias_handle],
-                out_bo_handles: vec![output_handle],
+                in_bo_handles,
+                out_bo_handles,
                 input_packing,
-                operand_packing: None,
+                operand_packing,
                 weight_packing,
                 bias_packing,
                 output_compaction,

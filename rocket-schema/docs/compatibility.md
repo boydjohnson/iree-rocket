@@ -27,6 +27,19 @@ Readers interpret an older `RKT1` executable that omits them as an unpadded
 convolution. Each leading value is applied symmetrically to the trailing side,
 matching the current two-value Rocket `ConvShape` model.
 
+`Conv2DDef.epilogue_add` and `epilogue_activation` were added compatibly,
+defaulting to `false` and `NONE`. An older `RKT1` executable that omits them
+is a plain convolution. With `epilogue_add` set the dispatch takes one more
+read-only binding -- the skip tensor, in the output's own geometry, between
+the bias and the output -- and after the convolution's tiles one EW task
+adds it to the output cube, applying `epilogue_activation` in the EW core.
+Only `NONE` and `RELU` are meaningful there (the EW core has no RELUX
+ceiling on the wire), and only the fp16 precision is validated: the EW task
+reads the convolution's cube as an fp16 feature cube, which the fp16 output
+cube is. An older runtime that does not know the fields decodes the
+executable as a plain convolution and would then bind the skip as the
+output; a producer must not emit them for a runtime that predates them.
+
 `Precision.INT8_ACCUMULATOR` was appended as enum value 2. Existing INT8 and
 FP16 values retain their wire encodings; older runtimes reject the unknown
 value rather than interpreting it as a different precision.

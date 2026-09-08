@@ -385,6 +385,40 @@ larger lever by four to one**: it unlocks ~57 ms of pack and compact plus
 the 16 CPU adds, against step 2's 12. Build step 3 first, and step 2 on
 the edges it leaves.
 
+**Step 3 landed 2026-09-08.** `Conv2DDef.epilogue_add` and
+`epilogue_activation` put the residual add and its ReLU in the DPU's EW
+core after the convolution's own tiles, inside the same dispatch, with the
+skip as a fourth binding; the driver runs the tiles, then one EW task on
+the same in-order queue (no fan-out for such a dispatch), and compacts the
+sum. `conv_residual_add_hw` validated the multi-tile cube handoff and the
+EW-stage ReLU exactly before any wire or compiler work. The pass rewrites
+the f16-import chain `conv -> truncf -> linalg.add(skip) -> relu` (a named
+`linalg.add`, since specialisation runs first) into one epilogue generic
+over the accumulator, with the skip collapsed to the convolution's rank.
+
+ResNet50 fp16 on `planck`, `taskset -c 4-7`, medians:
+
+| | dispatches (NPU / CPU) | NPU results feeding an NPU dispatch | ms |
+|---|---|---|---:|
+| after step 1 | 53 / 22 | 32 of 53 | 162 |
+| after step 3 | 53 / 8 | **51 of 53** | 164 |
+
+Correctness is unchanged (max|diff| 0.0116 against onnxruntime, same top-5)
+and the wall is flat, and the profile says exactly why: `outside` fell
+47.9 -> 26.4 ms (the sixteen CPU adds), but each residual dispatch now
+packs its skip tensor (`pack.input` 20.6 -> 29.5) and its EW task is
+hardware time (`wait.npu` 108 -> 131). An even trade on its own. What it
+buys is the reach of step 2: `pack.input` + `compact` is now **61.5 ms**
+per inference and 51 of the 53 edges it sits on are NPU -> NPU, so the
+driver chain -- consumer reads the producer's cube, no compaction, no
+repack, the skip too -- is worth up to 37 % of the model. That is the next
+thing to build, and it is what P2 always was.
+
+What stays on the CPU: the 7x7 stem, the padded max pool, the head's
+pooling transpose and the classifier epilogue. MobileNetV2's residual adds
+have no ReLU after them (linear bottlenecks) and are not claimed; a
+`NONE`-activation twin of the target is one matcher away.
+
 ---
 
 ## P3 (S3) — the full output BO is cache-synced once per tile, and a regcmd BO is allocated and mapped per tile

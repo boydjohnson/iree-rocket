@@ -192,6 +192,12 @@ struct RocketConv2dConfig {
   // what "symmetric" means on this hardware.
   uint32_t padTop = 0;
   uint32_t padLeft = 0;
+  // Residual epilogue: one EW task adds a fourth binding to the conv's
+  // output cube and applies `epilogueActivation` in the EW core. Optional
+  // keys, like the padding, for the same reason.
+  bool epilogueAdd = false;
+  iree_hal_rocket_Activation_enum_t epilogueActivation =
+      iree_hal_rocket_Activation_NONE;
 };
 
 struct RocketFullyConnectedConfig {
@@ -374,6 +380,22 @@ std::optional<RocketConv2dConfig> buildRocketConv2dConfigFromTarget(
   RocketConv2dConfig shape;
   shape.padTop = getOptionalU32("pad_top");
   shape.padLeft = getOptionalU32("pad_left");
+  if (Attribute attr = config.get("epilogue_add")) {
+    shape.epilogueAdd = llvm::cast<BoolAttr>(attr).getValue();
+  }
+  if (Attribute attr = config.get("epilogue_activation")) {
+    StringRef activation = llvm::cast<StringAttr>(attr).getValue();
+    if (activation == "none") {
+      shape.epilogueActivation = iree_hal_rocket_Activation_NONE;
+    } else if (activation == "relu") {
+      shape.epilogueActivation = iree_hal_rocket_Activation_RELU;
+    } else {
+      diagFn() << "rocket backend: unrecognized 'epilogue_activation' config "
+                  "value '"
+               << activation << "' (expected none/relu)";
+      return std::nullopt;
+    }
+  }
   shape.inputWidth = getU32("input_width");
   shape.inputHeight = getU32("input_height");
   shape.inputChannels = getU32("input_channels");
@@ -1714,7 +1736,11 @@ public:
                                                  convShape->padLeft) ||
           (runtimeQuantizationRef &&
            iree_hal_rocket_Conv2DDef_runtime_quantization_add(
-               builder, runtimeQuantizationRef))) {
+               builder, runtimeQuantizationRef)) ||
+          iree_hal_rocket_Conv2DDef_epilogue_add_add(builder,
+                                                     convShape->epilogueAdd) ||
+          iree_hal_rocket_Conv2DDef_epilogue_activation_add(
+              builder, convShape->epilogueActivation)) {
         return variantOp.emitOpError()
                << "failed to populate Rocket convolution definition";
       }
