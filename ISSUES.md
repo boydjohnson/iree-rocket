@@ -30,7 +30,10 @@ model, was resolved 2026-09-06, and C2 and P6 on 2026-09-07 -- see
 LIMITS.md and DYNAMIC_SHAPES.md carried that this file did not, and the
 chained-dispatch fault behind P8's `Cin` 1344 anomaly and the `Cout` 24
 rule. ROADMAP's fused-activation row landed the same day, which is
-what moved P7's and P2's numbers below.
+what moved P7's and P2's numbers below. **M2 was resolved 2026-09-09** -- the
+NPU now runs at 600 MHz, not 200 -- which means every board number in this
+file taken before that date has an inflated `wait.npu` and an understated host
+share; see **Suggested order** for what that reranks.
 
 Trimmed 2026-09-05: issues that are settled were cut down to one entry each
 in **Resolved** at the end, which keeps their IDs resolvable without keeping
@@ -147,33 +150,6 @@ memory believes is protecting production.
 
 Either recommit them or amend the memories to say they were lost. I have amended
 the memories that made load-bearing claims.
-
----
-
-## M2 (S3) — the NPU is running at 200 MHz
-
-`perf/clock.md` [notes]: the RK3588 compute clock `scmi_clk_npu` boots pinned at
-200 MHz, one fifth of silicon max, because there is no NPU devfreq under
-mainline `rocket` and the DT pins `assigned-clock-rates = <200000000>`. 200 MHz
-is the vendor's idle `POWER_DOWN_FREQ`; nothing ever ramps it back up.
-
-Consistent with the board [verified]: `/sys/class/devfreq` on `planck` contains
-only `fb000000.gpu` — there is no NPU devfreq node.
-
-Two consequences:
-
-1. ~1.43x is sitting on the table (the notes' measured 600 MHz figure; 900 MHz
-   buys nothing more and is dangerous). It requires a driver-side change —
-   `clk_set_rate` inside `rocket_device_runtime_resume()`, after the power domain
-   is up. **Both obvious shortcuts hang the box**: a DT `assigned-clock-rates`
-   override hangs the boot, and a standalone out-of-tree `clk_set_rate` module
-   at idle wedges the live SCMI firmware. The notes carry a working patch shape
-   (`rocket-clk`, built as a module so recovery is `rmmod`).
-2. It biases every offload decision in this repo toward "don't offload". At
-   1/5 clock the device half of a dispatch is ~5x inflated while the host half
-   (the pack/compact) is not, so a marginal layer looks worse than it is at the
-   real operating point. Compounds with M1, which inflates the host half in the
-   other direction.
 
 ---
 
@@ -672,7 +648,7 @@ and worth not touching.
 
 ---
 
-## P7 (S2) — MobileNetV2 fp16's 17 depthwise convolutions stay on the CPU; they are 54% of the model's wall time, and offloading them is 1.05x slower with the driver chain on, 1.18x at four workers (re-measured 2026-09-08; was 1.26x)
+## P7 (S2) — MobileNetV2 fp16's 17 depthwise convolutions stay on the CPU; at 600 MHz offloading them is 1.08x *faster* at the default allocation and 1.02x slower at four workers — but the whole fp16 offload loses to a four-worker CPU baseline, so the demote stays off (re-measured 2026-09-09)
 
 They are the whole of the `outside` term (70.9 ms of a 127 ms model; see
 the profile below): ten executables over 17 dispatch
@@ -897,6 +873,55 @@ What this changes in the list below: item 1 is done and worth ~0 until the
 pad, the residual add and the whole-atom rule move; item 2 (the pad) is now
 also a P2 blocker and the first thing to build; and M2 is the only lever
 that touches the term that actually binds. The demote stays off.
+
+### Re-measured 2026-09-09 at 600 MHz: the clock is worth 8-10 points, and it is not the thing that decides this
+
+M2 is resolved (see **Resolved**), and it was the term this issue named as
+binding. Governor `performance`, four interleaved passes, medians,
+`mnv2_14.f32.mlir`, against a `--no-offload` arm from the same pipeline:
+
+| allocation | clk | base (37) | dw (44) | nooff | dw vs base |
+|---|---|---:|---:|---:|---|
+| default topology | 200 MHz | 99.4 | 99.8 | 108.0 | 1.004x slower |
+| default topology | 600 MHz | 87.5 | **81.0** | 108.0 | **1.080x faster** |
+| four workers | 200 MHz | 83.1 | 93.2 | **54.5** | 1.122x slower |
+| four workers | 600 MHz | 73.1 | 74.7 | **54.5** | 1.022x slower |
+
+The clock moves the depthwise arm 8-10 points relative to the baseline in
+*both* allocations, enough to flip the sign at the default one. That is what
+this issue predicted, and the prediction was the reason it ranked the clock
+first. `max|diff|` vs `--no-offload` is 0.0051 (dw) and 0.0050 (base), top-1
+stable at both clocks, zero faults in ~60 runs.
+
+**The verdict holds anyway, and the reason has moved.** At four workers
+`--no-offload` is **54.5 ms** against a best NPU arm of 73.1 — the CPU is
+**1.34x faster**, at either clock. The CPU baseline nearly doubles from four
+workers (108.0 → 54.5, 1.98x) while every NPU arm gains 8-14%. So this is no
+longer "depthwise loses to the layout round trip"; the whole fp16 offload on
+this model is underwater once the CPU is allocated fairly, and whether the
+depthwise demote is on is a detail inside a losing trade. The 81.0-vs-108.0
+row is the only arm here that beats its CPU baseline and it does so only at an
+allocation that starves the CPU of workers — `taskset` does not set IREE's
+worker count. This is M4's baseline trap and P8's "what moves it: CPU slots"
+arriving together.
+
+**Two corrections to the 2026-09-08 entry above.** Its edge census is stale:
+compaction now skips 67 dense output writes in the 37-site build against
+**464** in the 44-site one, because the residual-add-on-NPU and lazy-compaction
+work landed the same day it was taken. And **governor `ondemand` cannot
+measure this**: it read the four-worker control at 1.078x against the
+documented 1.18x and gave the default-topology control the wrong *sign*. Under
+`performance` both controls reproduce. See the method note.
+
+**Reproducing it is now one compiler build.** `ROCKET_DEMOTE_DEPTHWISE=1`
+gates the demote in `RocketDemoteConvInputsPass`; the `PromoteInputsToF32`
+twins are registered unconditionally because they only fire on ops carrying
+`kDemotedAttrName`. Verify by dispatch-site count (37 off, 44 on) rather than
+by trusting the variable, and pass
+`--llvmcpu-target-triple aarch64-linux-gnu` or the vmfb is x86. Board script:
+`planck:~/p7ab.sh`.
+
+---
 
 ### What would change the verdict, in order
 
@@ -1627,6 +1652,48 @@ What was settled and how, newest first, in place of the narratives — those are
 in this file's git history (`git log -p ISSUES.md`). Everything cited below is
 something that still exists: a commit, a file, or a memory.
 
+**M2 (S3) — 2026-09-09. The NPU ran at 200 MHz; it now runs at 600, and the
+lever was a driver patch that was already built.** `scmi_clk_npu` boots pinned
+at 200 MHz (the vendor's idle `POWER_DOWN_FREQ`) because mainline `rocket` has
+no NPU devfreq and the DT sets `assigned-clock-rates = <200000000>`. A patched
+`rocket.ko` — `clk_set_rate` plus a coupled `regulator_set_voltage` in
+runtime-resume, exposed as the module parameters `rocket_npu_clk_hz` and
+`rocket_npu_uv` — is installed on `planck` and the board now defaults to
+600 MHz at 0.80 V. Measured, bit-identical output, zero faults:
+
+| model | 200 MHz | 600 MHz | speedup | npu share @200 | `wait.npu` mean/dispatch |
+|---|---:|---:|---|---:|---|
+| ResNet50-224 fp16 | ~123 ms | ~59.6 ms | **2.06x** | 76.0% | 1.888 → 0.656 ms (2.88x) |
+| MobileNetV2 fp16 | ~87.5 ms | ~78.2 ms | 1.12x | 34.0% | 0.674 → 0.417 ms (1.62x) |
+| MobileNetV2 int8 | ~81.3 ms | ~72.8 ms | 1.12x | 26.9% | 0.445 → 0.287 ms (1.55x) |
+
+This issue estimated ~1.43x and ranked itself sixth of seven on "low ceiling
+for the risk". The ceiling was 2.06x on the model where the NPU is the
+bottleneck, and the risk was zero: the two shortcuts it warned about (a DT
+override, a standalone `clk_set_rate` module) are genuinely dangerous, but the
+in-driver version is not. What the estimate missed is that the payoff is
+Amdahl-bound per model — `wait.npu` scales with the clock almost exactly
+(2.88x against a 3x ratio) when dispatches are large, and barely at all
+(~1.6x) when they are small enough that fixed submission latency dominates.
+
+**Three consequences for the rest of this file.** Every board number recorded
+before 2026-09-09 is a 200 MHz number, and their host/NPU balance no longer
+holds — ResNet50's NPU share is 60%, not 76%. ROADMAP's per-op bar ("a site is
+worth offloading when the op does more work than the dispatch tax") moved in
+the offload-favouring direction for every op at once. And it makes multicore
+fan-out *less* attractive, not more: `MULTICORE.md` §12 found fan-out pays only
+above ~1 ms of hardware time per dispatch, and raising the clock shrinks
+exactly that term.
+
+Two traps. The suspend-time park to `ROCKET_NPU_POWER_DOWN_HZ` is itself gated
+on `rocket_npu_clk_hz != 0`, so writing `0` while raised strands the clock at
+600 and the "stock" arm silently runs fast — use an explicit `200000000`
+baseline, and to truly restore stock write `200000000`, wait for every core to
+read `suspended`, then write `0`. And `updates/` only wins over
+`kernel/drivers/` after `depmod -a` runs; a KO dropped there without it is
+inert. Board script: `planck:~/clkab.sh`. Memory:
+`npu-clock-lever-600mhz`.
+
 **C13 (S1) — 2026-09-08. A dispatch that consumed another dispatch's output
 in the same command buffer read it before it was written.** `apply_ops`
 walked the whole recorded command buffer up front -- packing every
@@ -1944,63 +2011,58 @@ in **Method note** below.
 
 ## Suggested order
 
-Revised 2026-09-07 against a fresh profile of the fp16 model (P7 carries it),
-which moved two things this list was ranked on. **P6's residual is gone** --
-`record` is 1.5 ms per inference, not 15, discharged as a side effect of M2's
-scratch pool; do not build the guard it asked for. And **fp16's deficit is
-smaller**: dense ReLU6 now fuses into the convolution's BN stage, 146 -> 133
-ms, so the model is 127 ms under the profiler and every share below is
-against that.
+Revised 2026-09-09, after M2 (the 200 MHz clock) was resolved. **Read the
+denominator warning first: every profile share below this line that predates
+2026-09-09 was measured with the NPU at 200 MHz.** Raising it to 600 shrinks
+`wait.npu` by 1.5-2.9x depending on dispatch size and leaves every host term
+untouched, so host work is now a larger fraction of every model than the
+numbers in this file say. ResNet50's NPU share is 60%, not 76%.
 
-Where the time actually is, per inference: `outside` **70.9 ms (54%)**,
-`wait.npu` 25.4, `compact` 17.7, `pack.input` 6.7, `record` 1.5.
+The 2026-09-09 re-measurement of P7 also produced the single most important
+number in this list, and it is not about P7: **at four workers MobileNetV2
+fp16's `--no-offload` arm is 54.5 ms against a best NPU arm of 73.1.** The CPU
+baseline nearly doubles from four workers while every NPU arm gains 8-14%. On
+this model the offload is underwater at a fair allocation, at either clock.
+Rank work against that, not against the default-topology rows.
 
-1. **P7** — the largest term by a wide margin: `outside` *is* these 17
-   depthwise convolutions, and it is over half the model. Re-measured
-   2026-09-07 with depthwise ReLU6 fused: **1.053x slower, not 1.26x**, so
-   the verdict holds but the gap is a quarter of what it was. What is left of
-   it is the explicit pad, the quiesce dwell and the `Cin` 512 cap; the
-   fusion machinery for it is in the tree and only the demote is off.
-   **Re-measured 2026-09-08 with P2's driver chain on: no change** (1.05x at
-   `taskset -c 4-7`, 1.18x at four workers). The chain takes the same one
-   edge either way -- every offloaded depthwise reads through the CPU pad --
-   and the seven convolutions cost 60 % of the CPU time they replace in
-   `wait.npu` alone. The term that binds is the 200 MHz clock (M2), not the
-   round trip; on this model P2's reach is gated on the residual add, the
-   pad and the whole-atom chain rule, not on P7.
-2. **P2** — 24.4 ms, 19% of wall, and the one part of the old "layout
-   propagation" lever P8 never tested. **Steps 2, 4 and 5 landed
-   2026-09-08**: the driver chain and the compiler-counted lazy compaction
-   take ResNet50 169 -> 114 ms bit-identically, and the breadth step
-   extends both to matmul, pooling and element-wise dispatches and makes
-   the plain-conv, pool and matmul edges actually adjacent (VGG f32: 20 of
-   20 edges, 1.10x). P2 is closed; what remains is matcher coverage (f16
-   pooling, the classifier matmuls past the caps). Two caveats now attached to it: the
-   cost is concentrated in one convolution (5.4 ms, 30% of `compact`), and
-   that convolution feeds a *depthwise* op, so it is not chainable until P7
-   moves. Sizing P2 against the whole 24.4 ms overstates its reach.
-3. ~~**P8's `Cin` 1344 anomaly**~~ — closed 2026-09-08 as **C13**: the
-   driver packed a chained dispatch's input before the dispatch ahead of it
-   had written it. Not a `Cin` rule, not a `Cout` rule; the two "anomalies"
-   were the model's only two NPU -> NPU edges. No open correctness unknown
-   remains in this file.
-4. **P3 → C4 → P4 → P1** — the dispatch-path cost stack, in increasing order
-   of work. P3's second half is done (the scratch pool); what stands is the
-   whole-BO cache sync, ∝ pages not bytes, which `MULTICORE.md` §12 also names
-   as its next lever.
-5. **C11** — VGG int8 aborts under a repeated benchmark loop, which is why
+1. **P3's first half — the whole-BO cache sync, ∝ pages not bytes.** Promoted
+   from 4. It is pure host cost, so the clock change made it a strictly larger
+   share of every model, and it is independently named as the next lever by
+   `MULTICORE.md` §12, where `fini_bo` over a 512 KiB replica input BO is most
+   of the 0.47 ms per fanned-out ViT dispatch. The uAPI has no offset/length,
+   so the fix is to stop syncing whole combined transient buffers rather than
+   to sync them faster.
+2. **P8's allocation finding, made actionable.** The 54.5-vs-73.1 result says
+   the per-dispatch tax still dominates this model once the CPU is allowed to
+   use its cores. P8 measured the constant at 7.4 ms on two A76s and 1.6 ms on
+   eight and identified CPU slots as the only thing that moves it; nothing has
+   attacked the constant itself since. This is the difference between "the NPU
+   helps" and "the NPU helps only when the CPU is handicapped".
+3. **P2's remaining matcher coverage** — f16 pooling and the classifier
+   matmuls past the caps. P2 itself is closed; steps 2, 4 and 5 landed
+   2026-09-08 and take ResNet50 169 -> 114 ms bit-identically.
+4. **~~P7~~ — re-measured 2026-09-09 and closed as "not the deciding term".**
+   The clock was worth the 8-10 points it was predicted to be worth, and flips
+   the sign at the default allocation (1.080x faster at 600 MHz). It does not
+   change the verdict, because the verdict is now set by item 2 rather than by
+   anything about depthwise. `ROCKET_DEMOTE_DEPTHWISE=1` keeps the arm one
+   compiler build away. Revisit when the offload is competitive at four
+   workers.
+5. **C4 → P4 → P1** — the rest of the dispatch-path stack, in increasing
+   order of work.
+6. **C11** — VGG int8 aborts under a repeated benchmark loop, which is why
    every VGG number in this repo includes a cold weight cache. Blocks a
    measurement rather than a user.
-6. **M2** — ~1.43x on the device half, but the device is ~20% of wall, it
-   needs a driver-side `clk_set_rate`, and both shortcuts hang the box. Low
-   ceiling for the risk. (The "~10% of wall" this used to cite came from P8's
-   superseded profile; it is 20.6% now, because the denominator shrank.)
-7. **C6, C7, D1, D2** — limitations, hygiene and reconciliation. C9 left this
-   list on 2026-09-07: both halves closed, one a planner fix that roughly
-   tripled the above-3x3 `Cin` ceilings and one a retraction.
+7. **C6, C7, D1, D2** — limitations, hygiene and reconciliation.
 
 Done and in **Resolved**: the requantized int8 path (2026-09-06), C2
-(2026-09-07), P6 (2026-09-07), C9 (2026-09-07), C12 and C13 (2026-09-08).
+(2026-09-07), P6 (2026-09-07), C9 (2026-09-07), C12 and C13 (2026-09-08),
+M2 (2026-09-09).
+
+**Naming hazard.** Two different things in this repo are called M2: this
+file's M2 was the 200 MHz clock (now resolved), and `MULTICORE.md`'s M2 is the
+scratch pool and tile fan-out. Several references above and below are to the
+latter. Check which one a sentence means before acting on it.
 
 ---
 
@@ -2014,6 +2076,18 @@ and the `surf_add` half of my first joint attempt. When a mode bit
 (`mc_surf_out`) reinterprets what its neighbours mean, a null result from moving
 one of them says nothing at all. Diffing against a known-good emitter is what
 broke it open; no amount of further sweeping would have.
+
+**Measuring on `planck` under governor `ondemand`.** The 2026-09-09 P7
+re-test was run twice. Under `ondemand` it read the four-worker 200 MHz
+control at 1.078x against this file's documented 1.18x, and gave the
+default-topology 200 MHz control the wrong *sign* (1.02x faster against a
+documented 1.05x slower) -- which nearly produced a "the verdict flipped"
+conclusion from what was really CPU frequency noise. Under `performance` both
+controls reproduce. The A76 cluster idles at a 408 MHz floor under `ondemand`,
+so any host-bound arm is measured at whatever clock the governor happened to
+pick. Check `scaling_governor` before quoting a number, and re-run a control
+that disagrees with a recorded result rather than reporting the disagreement
+as a finding.
 
 **Degenerate test patterns.** `OraclePattern::Counting` sets every input and
 coefficient to 1, so any shape whose output is constant across pixels and
