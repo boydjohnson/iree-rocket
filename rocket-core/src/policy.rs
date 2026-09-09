@@ -6,17 +6,62 @@
 //! point of the override and the reason it is not the default. The compiler
 //! and the runtime read the same variables, so a model built under one has
 //! to run under the same one. A structured `PlanningPolicy` argument is the
-//! intended replacement (COMPILER_ROADMAP.md section 1); until then these
-//! two functions are the whole policy surface.
+//! intended replacement (COMPILER_ROADMAP.md section 1). [`PlanningPolicy`]
+//! is the first step: the environment is still the default, but a caller
+//! that holds an explicit policy -- the compiler plugin, through the C ABI
+//! in `rocket-plan-ffi` -- runs the planner under [`with_policy`] and the
+//! environment is not consulted at all. Threading the policy through every
+//! planner signature instead of a thread-local is the step after this one.
 
-/// Feature atoms the CBUF charges per `data_entries` entry.
-///
-/// The surface feature charge is counted in whole entries of four atoms, and
-/// it rounds *up*: a row whose atom count is not a multiple of four still
-/// occupies the whole final entry. `CNA_CBUF_CON1.data_entries` has always
-/// been programmed that way (see its `div_ceil` below); the residency bound
-/// in [`Shape::max_tile_input_rows_for_width_and_data_banks`] has to charge
-/// the same way or it over-commits the CBUF.
+use std::cell::Cell;
+
+/// What the planner may admit beyond its capture backing.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct PlanningPolicy {
+    /// [`unbacked_channels_allowed`].
+    pub allow_unbacked_channels: bool,
+    /// [`large_kernel_probing_allowed`].
+    pub allow_large_kernel_probing: bool,
+}
+
+thread_local! {
+    static OVERRIDE: Cell<Option<PlanningPolicy>> = const { Cell::new(None) };
+}
+
+impl PlanningPolicy {
+    /// The policy the environment variables spell: what every in-process
+    /// caller has always got.
+    pub fn from_env() -> PlanningPolicy {
+        PlanningPolicy {
+            allow_unbacked_channels: std::env::var_os("ROCKET_ALLOW_UNBACKED_CHANNELS").is_some(),
+            allow_large_kernel_probing: std::env::var_os("ROCKET_ALLOW_LARGE_KERNEL_PROBING")
+                .is_some(),
+        }
+    }
+
+    /// The policy in force on this thread: the [`with_policy`] override if
+    /// one is active, the environment otherwise.
+    pub fn current() -> PlanningPolicy {
+        OVERRIDE
+            .with(Cell::get)
+            .unwrap_or_else(PlanningPolicy::from_env)
+    }
+}
+
+/// Runs `f` with `policy` in force on this thread, restoring whatever was in
+/// force before -- so an explicit policy from across the C ABI never leaks
+/// into the next caller, and nesting behaves.
+pub fn with_policy<R>(policy: PlanningPolicy, f: impl FnOnce() -> R) -> R {
+    struct Restore(Option<PlanningPolicy>);
+    impl Drop for Restore {
+        fn drop(&mut self) {
+            OVERRIDE.with(|cell| cell.set(self.0));
+        }
+    }
+    let _restore = Restore(OVERRIDE.with(|cell| cell.replace(Some(policy))));
+    f()
+}
+
 /// Whether `Shape` may be built with more input channels than the capture
 /// corpus backs.
 ///
@@ -32,7 +77,7 @@
 /// could construct it to find out whether the `Cout` ceiling was a real limit
 /// or just the extent of the measurement. It was the latter.
 pub fn unbacked_channels_allowed() -> bool {
-    std::env::var_os("ROCKET_ALLOW_UNBACKED_CHANNELS").is_some()
+    PlanningPolicy::current().allow_unbacked_channels
 }
 
 /// Lifts [`check_large_kernel_plan_case`] entirely, so a probe can build the
@@ -44,5 +89,5 @@ pub fn unbacked_channels_allowed() -> bool {
 /// this; it is the counterpart of [`unbacked_channels_allowed`] for kernel
 /// size rather than channel count.
 pub fn large_kernel_probing_allowed() -> bool {
-    std::env::var_os("ROCKET_ALLOW_LARGE_KERNEL_PROBING").is_some()
+    PlanningPolicy::current().allow_large_kernel_probing
 }

@@ -12,6 +12,7 @@ for the Rocket NPU backend (RK3588). This repository produces:
 | Path | Role |
 |---|---|
 | [`rocket-schema`](rocket-schema) | Canonical FlatBuffers schema for Rocket executables; shared by the compiler plugin (C++) and the runtime crates (Rust). |
+| [`rocket-plan-ffi`](rocket-plan-ffi) | Versioned C ABI (`include/rocket_plan.h`) over `rocket-core`'s planner, built as a host staticlib by the compiler plugin's CMake and linked into `libIREECompiler.so`; how the compiler asks the same planner the runtime asks. |
 | [`rocket-core`](rocket-core) | Pure, dependency-free Rust crate: convolution/matmul descriptors, hardware limits, layout geometry, CBUF partitioning and tile planning, with fallible `try_*` APIs that return a `PlanError` code instead of panicking. Shared by the runtime and, eventually, the compiler. |
 | [`iree-rocket-hal`](iree-rocket-hal) | Low-level Rust crate: ioctl/mmap access to the RK3588 NPU and register command building. Consumes `rocket-core`'s plans and re-exports its planner under `rocket::conv`. |
 | [`rocket-hal-driver`](rocket-hal-driver) | Rust `staticlib` implementing IREE's HAL driver interface, statically linked into IREE via `iree_register_external_hal_driver()`. Depends on `iree-rocket-hal` and `rocket-schema`. Includes HAL CTS wiring under `cts/`. |
@@ -34,7 +35,9 @@ directly, vs. one of two small wrapper projects that register the Rocket HAL
 driver before IREE's own `add_subdirectory` runs):
 
 ```sh
-# iree-compile, with the Rocket compiler target registered
+# iree-compile, with the Rocket compiler target registered. Needs `cargo` on
+# PATH: the plugin links rocket-plan-ffi (the shared planner's C ABI), which
+# the CMake build compiles with cargo into its own target directory.
 ./iree-build/configure-compiler-host.sh
 cmake --build iree-build/build
 
@@ -57,7 +60,7 @@ single repo-root `CMakePresets.json` can't span these plus the vendored
 of the aarch64 configure preset, while `configure-compiler-host.sh` covers the
 compiler case, which has no wrapper project at all.
 
-The Rust crates (`rocket-core`, `rocket-schema`, `iree-rocket-hal`, `rocket-hal-driver`) form
+The Rust crates (`rocket-core`, `rocket-plan-ffi`, `rocket-schema`, `iree-rocket-hal`, `rocket-hal-driver`) form
 a single Cargo workspace and can be built/checked independently of the CMake
 builds above:
 
@@ -99,11 +102,15 @@ IREE's CPU backend is **2.8x slower** on NCHW MobileNetV2. Every NPU-vs-CPU
 number this repo quoted before 2026-09-04 was measured against that slower
 build; see ISSUES.md M4 for the bisection.
 
-`--no-offload` builds the baseline correctly. It rewrites every matcher's
-`transform.iree.match.dim_bounds` to `umin = umax = 999999` -- a bound no real
-dimension meets -- so the match loop declines everything, while the passes
-around it, the device topology and the placement pin stay exactly as the
-offload arm sees them:
+`--no-offload` builds the baseline correctly. It rewrites every matcher in
+the loop so it declines: the convolution and matmul matchers get a
+`no_offload` attribute on their `transform.rocket.match.admitted` line, and
+the pooling and element-wise ones -- which have no planner to ask, so they
+still carry bounds -- get `transform.iree.match.dim_bounds` set to
+`umin = umax = 999999`, a bound no real dimension meets. The passes around
+the loop, the device topology and the placement pin stay exactly as the
+offload arm sees them. A matcher carrying neither hook fails the build
+rather than quietly offloading:
 
 ```sh
 # The arm under test, and its like-for-like baseline.
@@ -154,8 +161,8 @@ propagation would. See ROADMAP.md's Phase 1 and ISSUES.md P2/P8.
 
 The flag composes with `--no-offload`, and only in one order: the entries are
 enabled first and neutralized second, so the element-wise matchers are checked
-for `dim_bounds` and defeated along with the rest and the baseline arm runs
-the identical pipeline.
+for a defeatable predicate and disarmed along with the rest, and the baseline
+arm runs the identical pipeline.
 
 ```sh
 cargo run -p rocket-compiler -- audit --input vit.mlir --elementwise

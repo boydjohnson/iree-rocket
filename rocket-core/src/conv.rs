@@ -384,6 +384,14 @@ pub const CBUF_BANKS: u32 = 12;
 /// Bytes one CBUF bank holds: 256 entries of 128 bytes.
 pub const CBUF_BANK_BYTES: u32 = 256 * 128;
 
+/// Feature atoms the CBUF charges per `data_entries` entry.
+///
+/// The surface feature charge is counted in whole entries of four atoms, and
+/// it rounds *up*: a row whose atom count is not a multiple of four still
+/// occupies the whole final entry. `CNA_CBUF_CON1.data_entries` has always
+/// been programmed that way (see its `div_ceil` below); the residency bound
+/// in [`Shape::max_tile_input_rows_for_width_and_data_banks`] has to charge
+/// the same way or it over-commits the CBUF.
 pub const CBUF_ATOMS_PER_ENTRY: u32 = 4;
 
 /// Minimum safe `weight_banks` once a coefficient footprint is being
@@ -1354,6 +1362,11 @@ impl Shape {
             stride > 0,
             PlanErrorCode::InvalidShape,
             "convolution stride must be nonzero"
+        );
+        refuse_unless!(
+            in_channels > 0 && out_channels > 0,
+            PlanErrorCode::InvalidShape,
+            "convolution channel counts must be nonzero"
         );
         refuse_unless!(
             (1..=precision.max_in_channels()).contains(&in_channels)

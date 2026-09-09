@@ -37,9 +37,12 @@ pub struct CommonArgs {
     pub transform_spec: Option<PathBuf>,
 
     /// Build the like-for-like CPU-only baseline: same pipeline, same device
-    /// topology, same placement pin, but every matcher's `dim_bounds` is
-    /// rewritten so none of them can claim a convolution and nothing reaches
-    /// the NPU.
+    /// topology, same placement pin, but every matcher in the loop is
+    /// rewritten so none of them can claim anything and nothing reaches the
+    /// NPU. The convolution and matmul matchers are defeated through their
+    /// `transform.rocket.match.admitted` line, the pooling and element-wise
+    /// ones through their `dim_bounds`; a matcher carrying neither is a
+    /// build failure rather than a silently offloading baseline.
     ///
     /// This is the only correct CPU arm for an NPU-vs-CPU comparison. A module
     /// built with plain `iree-compile` never runs the spec's channels-last

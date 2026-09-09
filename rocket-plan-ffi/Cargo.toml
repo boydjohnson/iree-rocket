@@ -1,0 +1,14 @@
+[package]
+name = "rocket-plan-ffi"
+version = "0.1.0"
+edition = "2024"
+description = "Versioned C ABI over rocket-core's planner, for the IREE compiler plugin"
+
+[lib]
+# staticlib for the C++ plugin's CMake build (see
+# rocket-compiler-plugin/target/Rocket/CMakeLists.txt), rlib so the ABI has
+# host tests and `cargo check --workspace` sees it.
+crate-type = ["staticlib", "rlib"]
+
+[dependencies]
+rocket-core = { path = "../rocket-core" }

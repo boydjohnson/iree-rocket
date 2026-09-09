@@ -132,6 +132,14 @@ func.func @requant_3x3_cin512_matched(
 // accumulator matchers' business, and `rocket_int8_match_boundaries.mlir` is
 // where that bound is pinned.
 //
+// Since 2026-09-09 the two envelopes are one table in `rocket-core`'s
+// `admission` module rather than two `dim_bounds` lines, and this path asks
+// it with `precision = "int8_requant"` on its
+// `transform.rocket.match.admitted` line. That attribute is the *only*
+// thing separating the two rungs: both convolutions are `i8 x i8 -> i32` in
+// the IR, so without it the requantized matcher would inherit the
+// accumulator's 3584 and claim this one.
+//
 // It lands on the accumulator path since 2026-09-06, when
 // `MAX_INT8_INPUT_CHANNELS` went to 3584 and `@match_dynamic_conv2d_int8`
 // followed it: this convolution used to fall out of both loops and stay on
@@ -241,3 +249,4 @@ func.func @requant_depthwise_3x3_matched(
   } -> tensor<1x4x4x48xi8>
   return %out : tensor<1x4x4x48xi8>
 }
+

@@ -437,7 +437,7 @@ line below the compiler changed for any of them. The one correction is item
    one new pass -- `rocket-expand-gemv-to-matmul` -- raises `matvec` and
    `vecmat` into `linalg.matmul` with a unit extent, and everything
    downstream claims them unchanged: the f16 demotion, `@match_rocket_matmul`
-   (whose `dim_bounds` already start at `umin = 1`), `@call_rocket_matmul`
+   (whose admission envelope already starts at 1), `@call_rocket_matmul`
    and `#rocket_matmul_target`. It is the batch-matmul unit-dim fold the spec
    already performs, run backwards.
 
@@ -460,12 +460,14 @@ its immediately-adjacent rejected neighbour, as in
 
 > **Hard constraint on every new matcher, in every phase.**
 > [`rocket-compiler/src/spec.rs`](rocket-compiler/src/spec.rs)'s `neutralize`
-> refuses to build a `--no-offload` spec if any matcher named in the
-> `foreach_match` list constrains no dimension with
-> `transform.iree.match.dim_bounds`. A matcher without one silently breaks the
-> baseline arm -- which, per the NHWC-baseline correction, is the only valid
-> comparison this repo has. This is deliberate: the check exists because the
-> spec grows matchers over time and nothing else would notice.
+> refuses to build a `--no-offload` spec if any matcher named in a
+> `foreach_match` list carries neither `transform.rocket.match.admitted` nor
+> `transform.iree.match.dim_bounds`. A matcher with neither silently breaks
+> the baseline arm -- which, per the NHWC-baseline correction, is the only
+> valid comparison this repo has. This is deliberate: the check exists
+> because the spec grows matchers over time and nothing else would notice.
+> A convolution or matmul matcher takes the admission line (and so gets the
+> shared planner's ceilings for free); anything else needs a bound.
 
 **Buys**: real op coverage, no new hardware risk. **Costs**: per P8, possibly
 throughput. Gate behind a flag and measure both arms.

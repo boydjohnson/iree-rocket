@@ -22,22 +22,35 @@ says only that it computes the right answer.
 
 ## Where a limit can bind
 
-A shape has to clear three independent gates, and they do not agree with each
-other. Whichever is tightest for a given shape is the one that decides.
+A shape has to clear several independent gates, and they do not agree with
+each other. Whichever is tightest for a given shape is the one that decides.
 
 | Layer | Where | What it bounds | What happens past it |
 |---|---|---|---|
-| Compiler matchers | [`rocket_conv2d_transform_spec.mlir`](rocket-compiler-plugin/target/Rocket/rocket_conv2d_transform_spec.mlir) | Which ops in a model are claimed for the NPU at all | Silent, graceful CPU fallback |
+| Compiler matchers | [`rocket_conv2d_transform_spec.mlir`](rocket-compiler-plugin/target/Rocket/rocket_conv2d_transform_spec.mlir) -- op *form* only | Which op shapes the lowering can express: op name, operand types, kernel, stride, dilation, batch, and the shape of any fused epilogue | Silent, graceful CPU fallback |
+| Compiler admission | [`rocket-core/src/admission.rs`](rocket-core/src/admission.rs), reached from each matcher's `transform.rocket.match.admitted` (2026-09-09) | Which *channel counts* have corpus or board backing, per precision / kernel / stride / depthwise | Silent, graceful CPU fallback |
+| Compiler planning gate | `rocket-plan-candidates` + `transform.rocket.match.admitted` (2026-09-09) | Whether the planner below accepts the op's static extents | Silent, graceful CPU fallback |
 | Wire format | [`rocket_executable_def.fbs`](rocket-schema/schema/rocket_executable_def.fbs) | Which precisions and ops a compiled `.vmfb` can even express | Serialization error at compile time |
 | Planner | [`rocket-core/src/conv.rs`](rocket-core/src/conv.rs), [`pooling.rs`](iree-rocket-hal/src/rocket/pooling.rs) | Which shapes `ConvPlan`/`PoolingPlan` will program | Panic (loud) -- the matchers are set so this is unreachable from a compiled model |
 
-The matcher bounds are deliberately *at or below* the HAL bounds. Where they
-differ it is because the HAL constant governs one rule and something else binds
-first: at a 3x3 kernel the matchers stop `Cin` at 1152 even though
+The admission ceilings are deliberately *at or below* the HAL bounds. Where
+they differ it is because the HAL constant governs one rule and something else
+binds first: at a 3x3 kernel admission stops `Cin` at 1152 even though
 `MAX_INT8_INPUT_CHANNELS` is 3584, because `ConvPlan` refuses `Cin >= 1216` at
 k=3 outright (the coefficient working set exceeds the eleven grantable CBUF
-banks) and that refusal is a panic, not a fallback. The channel ceilings are a
-k=1 measurement and only k=1 matchers follow them up.
+banks). The channel ceilings are a k=1 measurement and only the k=1 rows follow
+them up.
+
+Until 2026-09-09 the channel ceilings were `transform.iree.match.dim_bounds`
+lines in the spec, two or three on each of sixty-odd matchers, and the numbers
+had drifted apart between matchers describing the same hardware path -- a
+stride-2 1x1 convolution was admitted to `Cin` 3584 with a ReLU fused after it
+and to 512 with nothing after it, because the two matchers had been written
+eight weeks apart. Moving them to one table in `rocket-core` collapsed that
+drift onto the largest value in each row, each of which was already live in a
+shipping matcher for the same hardware path; the pooling and element-wise
+matchers keep their `dim_bounds`, because neither has a planner in
+`rocket-core` to ask.
 
 ## Convolution channel limits
 
@@ -108,7 +121,7 @@ nine-significant-bit ceiling.
 letting it keep riding that constant would have doubled the depthwise range on
 dense evidence. `MAX_DEPTHWISE_CHANNELS` freezes it at the 1792 it already had;
 the depthwise evidence itself stops earlier still (vendor corpus to 1344,
-hardware exactness to 1536, matchers at 1344). Depthwise has its own
+hardware exactness to 1536). Compiler admission sits below both, at 1344 for int8 and 512 for fp16. Depthwise has its own
 coefficient grouping and its own output writer, each of which has been wrong at
 a shape the dense path was right at.
 

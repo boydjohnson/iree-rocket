@@ -80,17 +80,48 @@ below is compiler-side.
 
 ---
 
-## DS1 (S2) — `dim_bounds` cannot prove a bound on an unbounded `?`, so a symbolic model offloads *nothing*, silently
+## DS1 (S2) — a symbolic *channel* count cannot be checked against the admission envelope, so a fully symbolic model offloads *nothing*
 
-This is the blocker, and its failure mode is the bad one: the compile
+**Restated 2026-09-09.** The convolution and matmul matchers no longer use
+`transform.iree.match.dim_bounds` at all: their channel ceilings moved to
+`rocket-core`'s `admission` module and are reached through
+`transform.rocket.match.admitted`, which reads the operand *types* rather
+than asking `ValueBoundsConstraintSet` anything (COMPILER_ROADMAP.md
+section 2). Two consequences.
+
+The failure is no longer silent. A convolution whose channel count or
+kernel extent is dynamic is declined with `dynamic channel counts or kernel
+extents: the admission envelope cannot be checked`, which
+`--mlir-print-ir-after-all` and a matcher-debug run both show; the old
+`dim_bounds` route failed inside `computeConstantBound` and said nothing.
+Spatial extents are unaffected and never were bounded, so a model that is
+symbolic in H and W alone offloads exactly as a static one does -- which is
+what `@dynamic_row_still_offloads` in `rocket_plan_gate.mlir` pins.
+
+And the fix is a different piece of work from the one described below.
+Option 1 -- a `ValueBoundsOpInterface` external model for
+`flow.tensor.tie_shape` -- is no longer on the conv path at all; it would
+only serve the pooling and element-wise matchers, which still carry bounds.
+Option 2 is what landed, in the stronger form: the predicate is a planner
+query, not a re-spelled bound. What remains for a symbolic-channel model is
+to give the admission query a channel *bound* to check instead of a value:
+an assumed range from the frontend, or an explicit compile-time channel
+bound. The rest of this section describes the mechanism as it stood before
+that move, and is kept because the pooling and element-wise matchers still
+depend on it.
+
+### As it stood (still true of the pooling and element-wise matchers)
+
+This was the blocker, and its failure mode was the bad one: the compile
 succeeds, the `.vmfb` runs, and every convolution is on the CPU with no
 diagnostic anywhere.
 
-Every matcher in the `foreach_match` list constrains at least one dimension
-with `transform.iree.match.dim_bounds`. That is not incidental -- `spec.rs`
-depends on it, and `spec::neutralize` *refuses* a spec containing a matcher
-with no `dim_bounds` at all, because such a matcher would still fire and
-quietly corrupt the `--no-offload` baseline.
+Every matcher in the `foreach_match` list carries a predicate `spec.rs` can
+rewrite into a refusal -- `transform.rocket.match.admitted` on the
+convolution and matmul matchers, `transform.iree.match.dim_bounds` on the
+pooling and element-wise ones. That is not incidental: `spec::neutralize`
+*refuses* a spec containing a matcher with neither, because such a matcher
+would still fire and quietly corrupt the `--no-offload` baseline.
 
 `MatchDimBoundsOp::matchValue`
 (`iree-build/iree-src/compiler/src/iree/compiler/Preprocessing/TransformExtensions/PreprocessingExtensions.cpp:656`)
@@ -112,10 +143,10 @@ result is a *silenceable* error, so `foreach_match` treats it as "this matcher
 declines" rather than as a compile failure -- which is exactly why nothing is
 reported.
 
-`@match_dynamic_conv2d` alone carries two of these
-(`transform.iree.match.dim_bounds %input_value[3], umin = 1, umax = 3584` on
-Cin at spec `:5923` and the same on the filter's Cout at `:5935`), and the
-strided, 3x3, depthwise and int8 variants each carry their own.
+`@match_dynamic_conv2d` used to carry two of these -- `umin = 1, umax = 3584`
+on Cin and the same on the filter's Cout -- and the strided, 3x3, depthwise
+and int8 variants each carried their own. The pooling matchers still do, on
+their input extents and window.
 
 ### The mechanism to fix it exists, but is not wired end to end
 
@@ -148,7 +179,9 @@ Two ways out, and they are genuinely different amounts of work:
    tensor values, which `assume.int` bounds already reach. Cheaper, but it
    touches every matcher and loses `dim_bounds`' tensor-dim addressing, so
    `spec::neutralize`'s invariant has to be restated in whatever the new
-   spelling is.
+   spelling is. *This is what landed for the conv and matmul matchers on
+   2026-09-09, in a stronger form -- a planner query rather than a bound --
+   and `neutralize`'s invariant was restated accordingly.*
 
 Either way the acceptance test is a lit test asserting that a `?`-shaped conv
 *does* match -- absence of offload is the thing that has to fail loudly.
@@ -188,18 +221,17 @@ needs none of this.
 
 ## DS3 (S1) — the hardware envelope moves from compile time to dispatch time, and one bound is checked at neither -- already, today
 
-Today the *channel* ceilings are compile-time matcher facts.
-`@match_dynamic_conv2d` bounds Cin and Cout at 3584 (matching
-`conv::MAX_INPUT_CHANNELS` / `MAX_OUTPUT_CHANNELS`,
-`rocket-core/src/conv.rs`, since the 2026-09-09 extraction); the 3x3 matcher keeps a
-separate Cin 1152 / Cout 1792 (spec `:6013` and `:6014`); stride lives in the
-executable variant. A model outside *those* bounds does not match and runs on
+Today the *channel* ceilings are compile-time admission facts, in
+`rocket-core/src/admission.rs` since 2026-09-09: fp16 dense 1x1 at Cin and
+Cout 3584 (`conv::MAX_INPUT_CHANNELS` / `MAX_OUTPUT_CHANNELS`), 3x3 at Cin
+1152 with Cout riding the dense ceiling, depthwise at 512; stride is part of
+the table's key and also lives in the executable variant. A model outside *those* bounds does not match and runs on
 the CPU -- correct, just slower.
 
 The spatial envelope is a different story, and it is the one that matters
-below: the dense conv matchers carry `dim_bounds` on Cin and Cout only, and no
-bound on H or W at all [verified] -- every `%input_value[1]`/`[2]` bound in the
-spec belongs to a pooling or NCHW-depthwise matcher. So for spatial extent the
+below: the admission envelope is indexed by channels, kernel and stride and
+says nothing about H or W -- every `%input_value[1]`/`[2]` bound left in the
+spec belongs to a pooling matcher. So for spatial extent the
 "move to dispatch time" this section describes has *already happened*, for
 static models, and the rest of this section is a statement about the stack as
 it stands rather than a consequence of symbolic shapes.
@@ -327,14 +359,20 @@ Two smaller consequences of moving the decision to runtime:
   this shape offload" is no longer answerable from the module alone. Worth
   saying so in the audit output rather than letting the number be read the old
   way.
-- **`spec::neutralize`** rewrites every `dim_bounds` interval to
+- **`spec::neutralize`** adds `no_offload` to every
+  `transform.rocket.match.admitted` and rewrites every remaining
+  `dim_bounds` interval to
   `umin = umax = 999999` to build the CPU baseline. If DS1 is solved by
   re-spelling the matchers away from `dim_bounds` (option 2), that mechanism
   stops working and `--no-offload` silently starts offloading -- the precise
   failure ISSUES.md M4 exists to prevent. `neutralize` already refuses a
   matcher with no `dim_bounds`, so it would fail loudly rather than lie
   [verified] -- but it would fail, and the neutralization has to be ported to
-  whatever the new spelling is. Option 1 leaves it untouched.
+  whatever the new spelling is. Option 1 leaves it untouched. Since
+  2026-09-09 there is a second, mechanism-independent guard:
+  `rocket-compiler compile --no-offload` checks the placed module for Rocket
+  executables and refuses to write one that has any, so a port that misses a
+  matcher fails loudly at the module rather than skewing a measurement.
 
 ---
 

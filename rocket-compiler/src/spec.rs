@@ -12,12 +12,22 @@
 //! measurement of the conv layout.
 //!
 //! The fix is to build the CPU arm with the *same* pipeline and only the
-//! match loop defeated. Every matcher constrains at least one dimension with
-//! `transform.iree.match.dim_bounds`, so rewriting every bound to
-//! `umin = umax = 999999` -- larger than any dimension a real model has --
-//! makes all of them decline, while leaving the passes around the loop, the
-//! device topology and the placement pin exactly as the offload arm sees
-//! them.
+//! match loop defeated, so the passes around the loop, the device topology
+//! and the placement pin are exactly what the offload arm sees.
+//!
+//! Every matcher in the loop carries one of two things this module can
+//! defeat, and it is checked rather than assumed -- a matcher that carried
+//! neither would still fire and the "CPU-only" baseline would quietly
+//! offload part of the model:
+//!
+//! - `transform.rocket.match.admitted`, on every convolution and matmul
+//!   matcher since the shape ceilings moved to `rocket-core`'s admission
+//!   table (COMPILER_ROADMAP.md section 2). Adding `no_offload` to it makes
+//!   the op decline unconditionally.
+//! - `transform.iree.match.dim_bounds`, still on the pooling and
+//!   element-wise matchers, which have no planner to ask. Rewriting every
+//!   bound to `umin = umax = 999999` -- larger than any dimension a real
+//!   model has -- makes those decline.
 
 use std::{collections::BTreeSet, error::Error};
 
@@ -97,46 +107,54 @@ const NO_OFFLOAD_BOUND: &str = "999999";
 
 const DIM_BOUNDS_OP: &str = "transform.iree.match.dim_bounds";
 
+/// The plugin's own admission matcher, and the unit attribute that makes it
+/// decline every operation. Both spellings are part of the contract with
+/// `RocketTransformOps.td`; a rename there has to land here.
+const ADMITTED_OP: &str = "transform.rocket.match.admitted";
+const NO_OFFLOAD_ATTR: &str = "no_offload";
+
 /// Result of neutering a spec, kept together so the caller can report what it
 /// did rather than trusting it silently.
 #[derive(Debug)]
 pub struct NeutralizedSpec {
     pub text: String,
-    /// How many `dim_bounds` bounds pairs were rewritten.
+    /// How many matcher lines were rewritten: one per `dim_bounds` bounds
+    /// pair and one per `transform.rocket.match.admitted`.
     pub rewritten: usize,
     /// The matcher names taken from the `foreach_match` list.
     pub matchers: usize,
 }
 
-/// Returns `spec` with every `dim_bounds` interval replaced by the sentinel.
+/// Returns `spec` with every matcher in the `foreach_match` lists defeated.
 ///
-/// Fails if any matcher in the `foreach_match` list has no `dim_bounds` at
-/// all: that matcher would still fire, and the caller would get a "CPU-only"
-/// baseline that quietly offloads part of the model -- exactly the class of
-/// error this whole path exists to prevent. It is checked rather than assumed
-/// because the spec grows matchers over time and nothing else would notice.
+/// Fails if any matcher in the lists carries neither an admission check nor
+/// a `dim_bounds`: that matcher would still fire, and the caller would get a
+/// "CPU-only" baseline that quietly offloads part of the model -- exactly
+/// the class of error this whole path exists to prevent. It is checked
+/// rather than assumed because the spec grows matchers over time and
+/// nothing else would notice.
 pub fn neutralize(spec: &str) -> Result<NeutralizedSpec, Box<dyn Error>> {
     let matchers = foreach_match_matchers(spec);
     if matchers.is_empty() {
-        return Err(format!(
-            "found no `{DIM_BOUNDS_OP}`-constrained matchers in the transform spec: its \
-             `transform.foreach_match` list could not be read, so a no-offload spec cannot \
-             be derived from it"
-        )
-        .into());
+        return Err(
+            "found no matchers in the transform spec: its `transform.foreach_match` \
+                    list could not be read, so a no-offload spec cannot be derived from it"
+                .into(),
+        );
     }
 
     let unconstrained: Vec<&str> = matchers
         .iter()
         .copied()
-        .filter(|name| !sequence_has_dim_bounds(spec, name))
+        .filter(|name| !sequence_is_defeatable(spec, name))
         .collect();
     if !unconstrained.is_empty() {
         return Err(format!(
-            "cannot build a no-offload spec: matcher(s) {} constrain no dimension with \
-             `{DIM_BOUNDS_OP}`, so rewriting the bounds would not stop them from claiming \
-             convolutions. The baseline would silently offload. Give each one a dim_bounds \
-             (every other matcher has at least one), or defeat it another way.",
+            "cannot build a no-offload spec: matcher(s) {} carry neither `{ADMITTED_OP}` nor \
+             `{DIM_BOUNDS_OP}`, so nothing in them can be rewritten to make them decline. The \
+             baseline would silently offload. Give each one an admission check (every \
+             convolution and matmul matcher has one) or a dim_bounds, or defeat it another \
+             way.",
             unconstrained
                 .iter()
                 .map(|name| format!("@{name}"))
@@ -149,6 +167,24 @@ pub fn neutralize(spec: &str) -> Result<NeutralizedSpec, Box<dyn Error>> {
     let mut text = String::with_capacity(spec.len());
     let mut rewritten = 0usize;
     for line in spec.split_inclusive('\n') {
+        // Prose mentions both op names -- the file's own header explains
+        // where the ceilings went -- and a comment is not a predicate.
+        if line.trim_start().starts_with("//") {
+            text.push_str(line);
+            continue;
+        }
+        if line.contains(ADMITTED_OP) {
+            let rewrite = disable_admission(line).ok_or_else(|| {
+                format!(
+                    "unrecognised `{ADMITTED_OP}` spelling, expected an optional \
+                     `{{...}}` attribute dictionary before the `:`: {}",
+                    line.trim()
+                )
+            })?;
+            rewritten += 1;
+            text.push_str(&rewrite);
+            continue;
+        }
         if !line.contains(DIM_BOUNDS_OP) {
             text.push_str(line);
             continue;
@@ -169,7 +205,10 @@ pub fn neutralize(spec: &str) -> Result<NeutralizedSpec, Box<dyn Error>> {
     }
 
     if rewritten == 0 {
-        return Err(format!("transform spec contains no `{DIM_BOUNDS_OP}` to rewrite").into());
+        return Err(format!(
+            "transform spec contains neither `{ADMITTED_OP}` nor `{DIM_BOUNDS_OP}` to rewrite"
+        )
+        .into());
     }
 
     Ok(NeutralizedSpec {
@@ -177,6 +216,37 @@ pub fn neutralize(spec: &str) -> Result<NeutralizedSpec, Box<dyn Error>> {
         rewritten,
         matchers: matchers.len(),
     })
+}
+
+/// Adds the `no_offload` unit attribute to one `transform.rocket.match.admitted`
+/// line, keeping any attribute it already carries.
+///
+/// The op's assembly is `admitted $handle attr-dict `:` type`, so the
+/// dictionary is optional and sits between the handle and the colon.
+fn disable_admission(line: &str) -> Option<String> {
+    if line.contains(NO_OFFLOAD_ATTR) {
+        return Some(line.to_string());
+    }
+    let at = line.find(ADMITTED_OP)?;
+    let colon = line[at..].find(" : ").map(|i| at + i)?;
+    let middle = &line[at + ADMITTED_OP.len()..colon];
+    let replacement = match middle.trim_end().strip_suffix('}') {
+        // Already has a dictionary: prepend into it.
+        Some(head) => {
+            let open = head.rfind('{')?;
+            format!(
+                "{}{{{NO_OFFLOAD_ATTR}, {}}}",
+                &head[..open],
+                head[open + 1..].trim()
+            )
+        }
+        None => format!("{} {{{NO_OFFLOAD_ATTR}}}", middle.trim_end()),
+    };
+    Some(format!(
+        "{}{ADMITTED_OP}{replacement}{}",
+        &line[..at],
+        &line[colon..]
+    ))
 }
 
 /// Replaces the integer after `<key> = ` with the sentinel, in place.
@@ -247,13 +317,14 @@ fn symbol_after_last_at(text: &str) -> Option<&str> {
     (end > 0).then(|| &name[..end])
 }
 
-/// Whether `@name`'s `transform.named_sequence` body contains a `dim_bounds`.
+/// Whether `@name`'s `transform.named_sequence` body contains something
+/// [`neutralize`] can rewrite into a refusal.
 ///
 /// Delimited by the next `transform.named_sequence` declaration rather than by
 /// brace matching: the spec's sequences are top-level and consecutive, and
 /// brace counting would have to understand MLIR's string and attribute
 /// literals to be correct.
-fn sequence_has_dim_bounds(spec: &str, name: &str) -> bool {
+fn sequence_is_defeatable(spec: &str, name: &str) -> bool {
     const DECL: &str = "transform.named_sequence @";
     let mut search = 0usize;
     while let Some(offset) = spec[search..].find(DECL) {
@@ -267,7 +338,10 @@ fn sequence_has_dim_bounds(spec: &str, name: &str) -> bool {
                 .find(DECL)
                 .map(|i| end + i)
                 .unwrap_or(spec.len());
-            return spec[end..body_end].contains(DIM_BOUNDS_OP);
+            return spec[end..body_end]
+                .lines()
+                .filter(|line| !line.trim_start().starts_with("//"))
+                .any(|line| line.contains(DIM_BOUNDS_OP) || line.contains(ADMITTED_OP));
         }
         search = start;
     }
@@ -288,13 +362,23 @@ mod tests {
     transform.iree.match.dim_bounds %lhs_value[1], umin = 2, umax = 1792 : !transform.any_value
     transform.yield %arg : !transform.any_op
   }
+  transform.named_sequence @match_admitted(%arg: !transform.any_op) {
+    transform.rocket.match.admitted %arg : !transform.any_op
+    transform.yield %arg : !transform.any_op
+  }
+  transform.named_sequence @match_admitted_int8(%arg: !transform.any_op) {
+    transform.rocket.match.admitted %arg {precision = "int8_requant"} : !transform.any_op
+    transform.yield %arg : !transform.any_op
+  }
   transform.named_sequence @cast_and_call_a(%arg: !transform.any_op) {
     transform.yield
   }
   transform.named_sequence @__transform_main(%module: !transform.any_op) {
     transform.foreach_match in %func
         @match_a -> @cast_and_call_a,
-        @match_b -> @cast_and_call_a
+        @match_b -> @cast_and_call_a,
+        @match_admitted -> @cast_and_call_a,
+        @match_admitted_int8 -> @cast_and_call_a
       : (!transform.any_op) -> (!transform.any_op)
   }
 "#;
@@ -302,11 +386,39 @@ mod tests {
     #[test]
     fn every_bound_becomes_the_sentinel() {
         let out = neutralize(SPEC).expect("spec is well formed");
-        assert_eq!(out.rewritten, 3);
-        assert_eq!(out.matchers, 2);
+        assert_eq!(out.rewritten, 5);
+        assert_eq!(out.matchers, 4);
         assert!(!out.text.contains("umax = 512"), "{}", out.text);
         assert!(!out.text.contains("umin = 2"), "{}", out.text);
         assert_eq!(out.text.matches("umin = 999999, umax = 999999").count(), 3);
+    }
+
+    #[test]
+    fn an_admission_check_is_defeated_by_the_attribute() {
+        // The convolution and matmul matchers carry no bounds at all since
+        // the ceilings moved to rocket-core; this is what stops them.
+        let out = neutralize(SPEC).expect("spec is well formed");
+        assert!(
+            out.text
+                .contains("transform.rocket.match.admitted %arg {no_offload} :"),
+            "{}",
+            out.text
+        );
+        // An attribute the matcher already carries survives alongside it --
+        // dropping `precision` would change which envelope is asked about,
+        // and a no-offload build must differ from the offload one only in
+        // that nothing matches.
+        assert!(
+            out.text.contains(
+                "transform.rocket.match.admitted %arg {no_offload, precision = \"int8_requant\"} :"
+            ),
+            "{}",
+            out.text
+        );
+        // Idempotent: neutralizing an already-neutralized spec is a no-op
+        // on these lines rather than a second attribute.
+        let twice = neutralize(&out.text).expect("already neutralized");
+        assert_eq!(twice.text, out.text);
     }
 
     #[test]
@@ -329,7 +441,7 @@ mod tests {
              transform.named_sequence @cast_and_call_a",
         );
         let out = neutralize(&spec).expect("an uninvoked matcher is not a problem");
-        assert_eq!(out.matchers, 2);
+        assert_eq!(out.matchers, 4);
     }
 
     #[test]
@@ -338,8 +450,9 @@ mod tests {
         // no dimension would still fire, and the "CPU-only" baseline would
         // quietly offload.
         let spec = SPEC.replace(
-            "        @match_b -> @cast_and_call_a\n",
-            "        @match_b -> @cast_and_call_a,\n        @match_c -> @cast_and_call_a\n",
+            "        @match_admitted_int8 -> @cast_and_call_a\n",
+            "        @match_admitted_int8 -> @cast_and_call_a,\n        \
+             @match_c -> @cast_and_call_a\n",
         );
         let spec = spec.replace(
             "  transform.named_sequence @cast_and_call_a",
@@ -385,7 +498,7 @@ mod tests {
              transform.named_sequence @cast_and_call_a",
         );
         let out = neutralize(&constrained).expect("a bounded matcher in either loop is fine");
-        assert_eq!(out.matchers, 3);
+        assert_eq!(out.matchers, 5);
     }
 
     #[test]
@@ -486,16 +599,43 @@ transform.named_sequence @match_conv(%r: !transform.any_op) -> !transform.any_op
         let spec = std::fs::read_to_string(crate::default_transform_spec_path())
             .expect("the shipped spec must be readable");
         let out = neutralize(&spec).expect("the shipped spec must yield a no-offload spec");
-        assert_eq!(out.rewritten, spec.matches(DIM_BOUNDS_OP).count());
+        // Counted over the ops' own lines rather than the whole text: the
+        // spec's prose names both ops -- its header explains where the
+        // channel ceilings went -- and a comment decides no offload.
+        let op_lines = |text: &str, op: &str| {
+            text.lines()
+                .filter(|line| !line.trim_start().starts_with("//"))
+                .filter(|line| line.contains(op))
+                .count()
+        };
+        assert_eq!(
+            out.rewritten,
+            op_lines(&spec, DIM_BOUNDS_OP) + op_lines(&spec, ADMITTED_OP)
+        );
         assert!(out.matchers >= 20, "{} matchers", out.matchers);
-        // Every surviving bound is the sentinel. Checked over the op's own
-        // lines rather than the whole text: the spec's prose mentions bounds
-        // too, and comments are not what decides an offload.
-        for line in out.text.lines().filter(|l| l.contains(DIM_BOUNDS_OP)) {
-            assert!(
-                line.contains("umin = 999999, umax = 999999"),
-                "left a live bound: {line}"
-            );
+        // The convolution and matmul matchers are defeated through the
+        // admission op, the pooling and element-wise ones through their
+        // bounds; both must be live in the shipped spec, or this test would
+        // pass while only half the loop was disarmed.
+        assert!(op_lines(&spec, ADMITTED_OP) >= 60);
+        assert!(op_lines(&spec, DIM_BOUNDS_OP) >= 40);
+        for line in out
+            .text
+            .lines()
+            .filter(|l| !l.trim_start().starts_with("//"))
+        {
+            if line.contains(DIM_BOUNDS_OP) {
+                assert!(
+                    line.contains("umin = 999999, umax = 999999"),
+                    "left a live bound: {line}"
+                );
+            }
+            if line.contains(ADMITTED_OP) {
+                assert!(
+                    line.contains(NO_OFFLOAD_ATTR),
+                    "left a live admission check: {line}"
+                );
+            }
         }
     }
 }
