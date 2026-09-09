@@ -123,6 +123,19 @@ fp16 `Cin` 3584 and 4096 at 14x14 `Cout` 64, fp16 `Cout` 3584 and 4096 at 7x7
 `Cin` 448, both again at int8 under `SelectorsAffine`, and fp16
 `Cin` = `Cout` = 4096 at 14x14. 0 mismatches.
 
+**The model the raise was made for now runs on it (2026-09-09).** ViT-L/16 at
+fp16, whose MLP is exactly the 1024 -> 4096 projection the paragraph above
+predicted, compiles with **97 of its 98 candidates on the NPU** -- the one left
+behind is the 16x16 patch embedding, whose kernel no matcher claims -- and
+matches an f32 ONNX Runtime oracle to `max|err|` 0.0033 on a distribution of
+sd 1.02, argmax and top-5 identical, with the CPU arm of the same build at
+0.0029. `tools/model_survey.py run --model vit_l_16` reproduces it. Two
+practical notes from that run: `Cout` 4096 aborts on a board binary built
+before the raise (`output channels must be 1..=3584`, thrown from the
+statically linked driver inside `iree-benchmark-module`, while a freshly built
+`iree-run-module` beside it ran the same module), and the survey harness now
+warns when a staged binary is older than the driver source it links.
+
 **`M` moved 2047 -> 4096 the same day, and that one did need new
 measurement.** The old note read "no board measurement has been taken above
 it, so the compiler stops here" -- so a transformer prefill longer than 2047

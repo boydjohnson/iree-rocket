@@ -16,3 +16,9 @@
 /rocket-compiler-plugin/test/Output/
 /rocket-compiler-plugin/test/Testing/
 __pycache__/
+
+# Model survey artifacts: ONNX exports, imported MLIR, .vmfb arms and board
+# results. Gigabytes per model, and none of it is reproducible-by-commit --
+# tools/model_survey.py rebuilds it from tools/export_onnx.py's registry.
+/survey/
+/.venv/

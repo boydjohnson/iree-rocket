@@ -80,6 +80,7 @@ Needs `onnx`, `onnxruntime` and `numpy` (a `uv venv` is enough) and
 from __future__ import annotations
 
 import argparse
+import json
 import re
 import subprocess
 import sys
@@ -212,9 +213,17 @@ def sample_for(value, shape: dict[str, int], overrides: dict[str, str], np, onnx
         onnx.TensorProto.INT64,
         onnx.TensorProto.INT32,
     )
-    dtype = np.int64 if tensor.elem_type == onnx.TensorProto.INT64 else (
-        np.int32 if tensor.elem_type == onnx.TensorProto.INT32 else np.float32
-    )
+    # float16 is here because a natively-half export (torchvision `.half()`,
+    # the recipe `tools/export_onnx.py` uses) declares half *inputs*, and
+    # ONNX Runtime refuses an f32 array for one -- "Unexpected input data
+    # type. Actual: (tensor(float)), expected: (tensor(float16))". Falling
+    # back to f32 for an unrecognized float type is deliberate: bf16 and the
+    # 8-bit float types have no numpy equivalent to sample into.
+    dtype = {
+        onnx.TensorProto.INT64: np.int64,
+        onnx.TensorProto.INT32: np.int32,
+        onnx.TensorProto.FLOAT16: np.float16,
+    }.get(tensor.elem_type, np.float32)
     kind = overrides.get(value.name)
     if kind is None:
         lowered = value.name.lower()
@@ -446,11 +455,29 @@ def main() -> None:
         value.name: sample_for(value, shape, overrides, np, onnx)
         for value in model.graph.input
     }
+    manifest = []
     for name, sample in samples.items():
         safe = re.sub(r"[^A-Za-z0-9_.-]", "_", name)
         np.save(args.out_dir / f"{stem}.{safe}.npy", sample)
         # Raw bytes, because that is what --input=@file reads.
         sample.tofile(args.out_dir / f"{stem}.{safe}.bin")
+        manifest.append(
+            {
+                "name": name,
+                "file": f"{stem}.{safe}.bin",
+                "dtype": str(sample.dtype),
+                "shape": list(sample.shape),
+            }
+        )
+    # The manifest exists because argument *order* is not recoverable from the
+    # files afterwards: `iree-run-module` takes its inputs positionally, the
+    # names are mangled to be filesystem-safe, and a multi-input model whose
+    # arguments get swapped runs and produces plausible garbage. It is written
+    # here, where `model.graph.input` still says the order, rather than
+    # re-derived later from a several-hundred-megabyte ONNX file.
+    (args.out_dir / f"{stem}.inputs.json").write_text(
+        json.dumps(manifest, indent=2) + "\n"
+    )
     print(f"    {len(samples)} input(s) written")
 
     if args.skip_oracle:

@@ -564,6 +564,66 @@ real fault. Averages cannot be exact -- the PPU's average is a multiply by
 `fp16(65536/k)` that the shim multiplies back out -- and take the `--atol`
 /`--rtol` defaults.
 
+## Whole-model survey
+
+`tools/model_survey.py` runs one model end to end -- export, import, both
+compile arms, correctness against an ONNX Runtime oracle, and a timing on the
+board -- and writes a machine-readable `result.json` next to the artifacts.
+`tools/export_onnx.py` is the registry of models it exports, so a re-export is
+reproducible rather than remembered.
+
+```sh
+tools/model_survey.py run --model wide_resnet50_2 --board planck
+tools/model_survey.py run --model vit_l_16 --board planck --repetitions 7
+tools/model_survey.py summarize
+```
+
+Each stage is skipped when its output already exists, so an interrupted run
+resumes and a re-timing costs only the timing. A model that is not in the
+registry brings its own file and its own pinning:
+`--onnx qwen3.onnx --dim batch_size=1 --dim sequence_length=128`.
+
+Three things it is careful about, each of which has cost this repository a
+result before:
+
+**The baseline is `--no-offload`, never a stock `iree-compile` build** -- see
+"The CPU-only baseline" above. The survey builds both arms from the same MLIR
+with the same device flags and reports the ratio between them.
+
+**The core allocation is a column, not a footnote.** `--cpu-ids` takes one
+`--task_topology_cpu_ids` value per timing column and defaults to `4,5,6,7`
+(the A76 cluster) and all eight. `taskset` is *not* the knob: IREE builds its
+task topology from the machine's cpuinfo rather than from the process affinity
+mask, so a `taskset -c 4-7` run thinks it has eight cores and puts about two of
+them to work. The governor, the NPU IRQ affinity and the NPU's runtime state
+are read off the board and recorded in `result.json` next to the numbers.
+
+**The first repetition is discarded.** An offloaded arm packs its weights on
+the first invocation only, which on a ResNet-scale model is a 945 ms
+first sample against a 124 ms steady state -- large enough to move a median
+taken over three. `--benchmark_repetitions` is raised by one behind the scenes
+so the requested count still survives.
+
+`summarize` is why the survey is worth running on more than one model. It
+pools every `result.json` and prints one histogram of *why* candidates stayed
+on the CPU, across all of them, ranked by count and tagged with each reason's
+class:
+
+```text
+Why candidates stayed on the CPU, every model pooled:
+
+    24  unvalidated_configuration [validation] dense_conv2d
+          in resnet50, vgg19, wide_resnet50_2
+          e.g. wide_resnet50_2: 230x230 Cin 3 Cout 64 k7x7 s2 [fp16]
+               automatic planning above 3x3 currently has capture backing only
+               at stride 1
+```
+
+A wall-clock number says one model got faster. A pooled reason histogram says
+which *compiler* lever is worth building next and roughly what it is worth --
+`shape` and `semantics` close with compiler work, `validation` needs a board
+measurement, `hardware` never closes.
+
 ## Precision-transition probe
 
 `tools/c8_precision_transition_probe.py` isolates ISSUES.md's C8: an int8
