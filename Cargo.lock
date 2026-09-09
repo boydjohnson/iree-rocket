@@ -393,6 +393,13 @@ dependencies = [
 ]
 
 [[package]]
+name = "rocket-plan-ffi"
+version = "0.1.0"
+dependencies = [
+ "rocket-core",
+]
+
+[[package]]
 name = "rocket-schema"
 version = "0.1.0"
 dependencies = [

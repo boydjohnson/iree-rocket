@@ -47,6 +47,11 @@
 #ifdef ROCKET_ENABLE_ONNX_INPUT
 #include "RocketPasses.h"
 #endif // ROCKET_ENABLE_ONNX_INPUT
+// Outside the guard: `onRegisterDialects` below calls into this
+// unconditionally, and the transform extension has nothing to do with the
+// ONNX input plugin. Inside it, a build configured without IREE_INPUT_TORCH
+// does not compile.
+#include "RocketTransformExtension.h"
 #include "iree/compiler/Dialect/HAL/Target/TargetBackend.h"
 #include "iree/compiler/Dialect/HAL/Target/TargetRegistry.h"
 #include "iree/compiler/PluginAPI/Client.h"
@@ -1860,6 +1865,11 @@ private:
 struct RocketSession final
     : PluginSession<RocketSession, RocketOptions,
                     PluginActivationPolicy::DefaultActivated> {
+  void onRegisterDialects(DialectRegistry &registry) override {
+    // transform.rocket.match.* -- the planner-admission matcher the spec
+    // uses (RocketTransformExtension.cpp).
+    registerRocketTransformExtension(registry);
+  }
   void populateHALTargetDevices(IREE::HAL::TargetDeviceList &targets) final {
     // #hal.device.target<"rocket", ...
     targets.add("rocket", [&]() {

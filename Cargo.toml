@@ -2,6 +2,7 @@
 resolver = "2"
 members = [
     "rocket-core",
+    "rocket-plan-ffi",
     "rocket-schema",
     "iree-rocket-hal",
     "rocket-hal-driver", "rocket-compiler",

@@ -11,6 +11,24 @@
 // rocket-hal-driver bugs the depthwise path exposed: a skipped weight-
 // packing branch and a tap-major layout formula only ever checked inside
 // one 32-channel coefficient group).
+//
+// **Where the shape ceilings live.** Until 2026-09-09 every convolution and
+// matmul matcher below carried two or three
+// `transform.iree.match.dim_bounds` lines naming its channel ceilings, and
+// the numbers drifted apart between matchers describing the same hardware
+// path -- a stride-2 1x1 convolution was admitted to Cin 3584 with a ReLU
+// after it and to 512 with nothing after it. Those ceilings are now one
+// table in `rocket-core`'s `admission` module, which carries the evidence
+// that set each one, and each matcher asks it through the single line
+// `transform.rocket.match.admitted`. That op also declines an operation the
+// planner refused at its real extents, which `rocket-plan-candidates`
+// records ahead of the match loop. So a claim needs three things: the
+// matcher's own form predicates here (op name, operand types, kernel,
+// stride, dilation, batch, and the fused epilogue's shape), the admission
+// envelope, and a plannable shape. See COMPILER_ROADMAP.md section 2.
+//
+// The pooling and element-wise matchers keep their `dim_bounds`: neither
+// has a planner in `rocket-core` yet, so there is no table for them to ask.
 
 #rocket_dynamic_target = #hal.executable.target<"rocket", "rocket-flatbuffer-v1", {
   kernel = "conv2d",
@@ -4990,17 +5008,13 @@ module attributes {transform.with_named_sequence} {
   // notes use is the better lowering above 32 is ISSUES.md D1.
   transform.named_sequence @match_rocket_matmul(%root: !transform.any_op {transform.readonly}) -> !transform.any_op {
     transform.match.operation_name %root ["linalg.matmul"] : !transform.any_op
+    transform.rocket.match.admitted %root : !transform.any_op
     %batch, %m, %n, %k = transform.iree.match.contraction %root,
         lhs_type = f16, rhs_type = f16, output_type = f32,
         indexing_maps = [#rocket_matmul_lhs, #rocket_matmul_rhs, #rocket_matmul_out]
         : !transform.any_op -> !transform.param<i64>
     transform.iree.match.dims_equal %batch, [] : !transform.param<i64>
 
-    %lhs_value = transform.get_operand %root[0] : (!transform.any_op) -> !transform.any_value
-    %rhs_value = transform.get_operand %root[1] : (!transform.any_op) -> !transform.any_value
-    transform.iree.match.dim_bounds %lhs_value[0], umin = 1, umax = 2047 : !transform.any_value
-    transform.iree.match.dim_bounds %lhs_value[1], umin = 1, umax = 3584 : !transform.any_value
-    transform.iree.match.dim_bounds %rhs_value[1], umin = 1, umax = 3584 : !transform.any_value
     transform.yield %root : !transform.any_op
   }
 
@@ -5457,6 +5471,7 @@ module attributes {transform.with_named_sequence} {
 
   transform.named_sequence @match_dynamic_conv2d(%root: !transform.any_op {transform.readonly}) -> !transform.any_op {
     transform.match.operation_name %root ["linalg.conv_2d_nhwc_hwcf"] : !transform.any_op
+    transform.rocket.match.admitted %root : !transform.any_op
     %batch, %out_img, %out_ch, %filter, %in_ch, %depth, %strides, %dilations =
         transform.iree.match.convolution %root,
           lhs_type = f16, rhs_type = f16, output_type = f32
@@ -5470,40 +5485,6 @@ module attributes {transform.with_named_sequence} {
     transform.iree.match.dims_equal %strides, [1, 1] : !transform.param<i64>
     transform.iree.match.dims_equal %dilations, [1, 1] : !transform.param<i64>
 
-    // A 3x3 CBUF-split hazard used to be recorded here verbatim from
-    // @match_dynamic_conv2d_3x3 (an all-zero Cin=256/Cout=256/3x3 at
-    // 26x26..48x48). It is closed -- ISSUES.md C12, 2026-09-08 -- and never
-    // applied to a 1x1 kernel; see that matcher for the current state.
-    %input_value = transform.get_operand %root[0] : (!transform.any_op) -> !transform.any_value
-    %filter_value = transform.get_operand %root[1] : (!transform.any_op) -> !transform.any_value
-    // The HAL's `MAX_INPUT_CHANNELS`, raised 512 -> 1344 (2026-09-03) on
-    // hardware: fp16 k=1 is exact at 14x14 Cout 64 for Cin 256..1792 across
-    // one to five tiles, and the fp16 vendor corpus above the old ceiling
-    // agrees (conv_vendor_fixture_wide.rs). The 2026-08-28 attempt at 960 was
-    // reverted for a CBUF-split divergence that the 2026-09-02 group-division
-    // fix removed; see MAX_INPUT_CHANNELS' doc comment.
-    //
-    // Raised again 1344 -> 3584 on 2026-09-06, with the constant. k=1 is the
-    // kernel the sweep covers and the only one this bound governs: at k=3
-    // the coefficient working set binds far below either number, and
-    // @match_dynamic_conv2d_3x3 keeps its own 1152. Board evidence, quiet
-    // board, `Selectors` for addressing and `Counting` for lane coverage at
-    // every point, plus the `onehot` read map at Cout == Cin: Cin 1792
-    // through 3584 in 256-channel steps and on to 8192, ragged 1793..4095,
-    // 56x56 multi-tile to 3584. Full list in MAX_INPUT_CHANNELS' doc comment.
-    transform.iree.match.dim_bounds %input_value[3], umin = 1, umax = 3584 : !transform.any_value
-    // MobileNetV2's four 14x14, Cin=88, Cout=528 pointwise convolutions
-    // pass the three hardware-oracle patterns with a 2/10 CBUF split. Keep
-    // this narrow expansion local to the stride-1 1x1 matcher; the 3x3 and
-    // strided matchers retain their separately characterized 512 limit.
-    // The HAL's `MAX_OUTPUT_CHANNELS`, raised 528 -> 1792, then 1792 -> 3584
-    // (2026-09-06). Measured exact at 7x7 Cin 448 for Cout 528, 640, 768,
-    // 1024, 1344, 1792, 2048, and then 2304, 2560, 3072, 3584 and 4096, with
-    // the CBUF split flat at 2d/10w over the whole range -- the high-channel
-    // divergence is indexed by `Cin`, not `Cout`. Ragged Cout 1793, 2049,
-    // 2313, 3073, 3585 and 4095 are exact too. The old 528 was a narrow
-    // expansion for MobileNetV2's Cin=88/Cout=528 pointwise convolutions.
-    transform.iree.match.dim_bounds %filter_value[3], umin = 1, umax = 3584 : !transform.any_value
     transform.yield %root : !transform.any_op
   }
 
@@ -5514,6 +5495,7 @@ module attributes {transform.with_named_sequence} {
   // partitions, are never silently claimed.
   transform.named_sequence @match_dynamic_conv2d_3x3(%root: !transform.any_op {transform.readonly}) -> !transform.any_op {
     transform.match.operation_name %root ["linalg.conv_2d_nhwc_hwcf"] : !transform.any_op
+    transform.rocket.match.admitted %root : !transform.any_op
     %batch, %out_img, %out_ch, %filter, %in_ch, %depth, %strides, %dilations =
         transform.iree.match.convolution %root,
           lhs_type = f16, rhs_type = f16, output_type = f32
@@ -5527,7 +5509,7 @@ module attributes {transform.with_named_sequence} {
     transform.iree.match.dims_equal %strides, [1, 1] : !transform.param<i64>
     transform.iree.match.dims_equal %dilations, [1, 1] : !transform.param<i64>
 
-    // The CBUF-split hazard this comment used to carry is closed (ISSUES.md
+    // The CBUF-split hazard this matcher used to carry is closed (ISSUES.md
     // C12, 2026-09-08). An early planner granted Cin=256/Cout=256/3x3 a
     // single coefficient bank at every extent from 26x26 to 48x48 and those
     // jobs came back all-zero. That was a starved coefficient grant killed
@@ -5540,18 +5522,7 @@ module attributes {transform.with_named_sequence} {
     // fp16 and int8 under the selectors and dense patterns, and
     // dense_k3_plan_never_starves_the_streamed_coefficient_working_set pins
     // the grant on the host. No wire field can force a split, so a compiled
-    // model can only reach ConvPlan::new. The bounds below are channel
-    // bounds; there is no spatial caveat left on this matcher.
-    %input_value = transform.get_operand %root[0] : (!transform.any_op) -> !transform.any_value
-    %filter_value = transform.get_operand %root[1] : (!transform.any_op) -> !transform.any_value
-    // 1152, not `MAX_INPUT_CHANNELS` (3584 since 2026-09-06): at a 3x3
-    // kernel the coefficient working set binds first and `ConvPlan` refuses
-    // Cin >= 1216 outright, which would reach the driver and panic rather
-    // than fall back. fp16 k=3
-    // is exact at 28x28 Cout 64 for Cin 512..1152, including the 1/11 split
-    // at 1152. Same reasoning as `@match_dynamic_conv2d_3x3_int8`.
-    transform.iree.match.dim_bounds %input_value[3], umin = 1, umax = 1152 : !transform.any_value
-    transform.iree.match.dim_bounds %filter_value[3], umin = 1, umax = 1792 : !transform.any_value
+    // model can only reach ConvPlan::new.
     transform.yield %root : !transform.any_op
   }
 
@@ -5563,6 +5534,7 @@ module attributes {transform.with_named_sequence} {
   // DESIGN_NOTES.md "Stride and large-width sweeps").
   transform.named_sequence @match_dynamic_conv2d_s2(%root: !transform.any_op {transform.readonly}) -> !transform.any_op {
     transform.match.operation_name %root ["linalg.conv_2d_nhwc_hwcf"] : !transform.any_op
+    transform.rocket.match.admitted %root : !transform.any_op
     %batch, %out_img, %out_ch, %filter, %in_ch, %depth, %strides, %dilations =
         transform.iree.match.convolution %root,
           lhs_type = f16, rhs_type = f16, output_type = f32
@@ -5576,10 +5548,6 @@ module attributes {transform.with_named_sequence} {
     transform.iree.match.dims_equal %strides, [2, 2] : !transform.param<i64>
     transform.iree.match.dims_equal %dilations, [1, 1] : !transform.param<i64>
 
-    %input_value = transform.get_operand %root[0] : (!transform.any_op) -> !transform.any_value
-    %filter_value = transform.get_operand %root[1] : (!transform.any_op) -> !transform.any_value
-    transform.iree.match.dim_bounds %input_value[3], umin = 1, umax = 512 : !transform.any_value
-    transform.iree.match.dim_bounds %filter_value[3], umin = 1, umax = 512 : !transform.any_value
     transform.yield %root : !transform.any_op
   }
 
@@ -5592,6 +5560,7 @@ module attributes {transform.with_named_sequence} {
   // DESIGN_NOTES.md "Stride and large-width sweeps").
   transform.named_sequence @match_dynamic_conv2d_3x3_s2(%root: !transform.any_op {transform.readonly}) -> !transform.any_op {
     transform.match.operation_name %root ["linalg.conv_2d_nhwc_hwcf"] : !transform.any_op
+    transform.rocket.match.admitted %root : !transform.any_op
     %batch, %out_img, %out_ch, %filter, %in_ch, %depth, %strides, %dilations =
         transform.iree.match.convolution %root,
           lhs_type = f16, rhs_type = f16, output_type = f32
@@ -5605,10 +5574,6 @@ module attributes {transform.with_named_sequence} {
     transform.iree.match.dims_equal %strides, [2, 2] : !transform.param<i64>
     transform.iree.match.dims_equal %dilations, [1, 1] : !transform.param<i64>
 
-    %input_value = transform.get_operand %root[0] : (!transform.any_op) -> !transform.any_value
-    %filter_value = transform.get_operand %root[1] : (!transform.any_op) -> !transform.any_value
-    transform.iree.match.dim_bounds %input_value[3], umin = 1, umax = 512 : !transform.any_value
-    transform.iree.match.dim_bounds %filter_value[3], umin = 1, umax = 512 : !transform.any_value
     transform.yield %root : !transform.any_op
   }
 
@@ -5621,6 +5586,7 @@ module attributes {transform.with_named_sequence} {
   // DESIGN_NOTES.md "Stride and large-width sweeps").
   transform.named_sequence @match_dynamic_conv2d_s3(%root: !transform.any_op {transform.readonly}) -> !transform.any_op {
     transform.match.operation_name %root ["linalg.conv_2d_nhwc_hwcf"] : !transform.any_op
+    transform.rocket.match.admitted %root : !transform.any_op
     %batch, %out_img, %out_ch, %filter, %in_ch, %depth, %strides, %dilations =
         transform.iree.match.convolution %root,
           lhs_type = f16, rhs_type = f16, output_type = f32
@@ -5634,10 +5600,6 @@ module attributes {transform.with_named_sequence} {
     transform.iree.match.dims_equal %strides, [3, 3] : !transform.param<i64>
     transform.iree.match.dims_equal %dilations, [1, 1] : !transform.param<i64>
 
-    %input_value = transform.get_operand %root[0] : (!transform.any_op) -> !transform.any_value
-    %filter_value = transform.get_operand %root[1] : (!transform.any_op) -> !transform.any_value
-    transform.iree.match.dim_bounds %input_value[3], umin = 1, umax = 512 : !transform.any_value
-    transform.iree.match.dim_bounds %filter_value[3], umin = 1, umax = 512 : !transform.any_value
     transform.yield %root : !transform.any_op
   }
 
@@ -5650,6 +5612,7 @@ module attributes {transform.with_named_sequence} {
   // DESIGN_NOTES.md "Stride and large-width sweeps").
   transform.named_sequence @match_dynamic_conv2d_3x3_s3(%root: !transform.any_op {transform.readonly}) -> !transform.any_op {
     transform.match.operation_name %root ["linalg.conv_2d_nhwc_hwcf"] : !transform.any_op
+    transform.rocket.match.admitted %root : !transform.any_op
     %batch, %out_img, %out_ch, %filter, %in_ch, %depth, %strides, %dilations =
         transform.iree.match.convolution %root,
           lhs_type = f16, rhs_type = f16, output_type = f32
@@ -5663,10 +5626,6 @@ module attributes {transform.with_named_sequence} {
     transform.iree.match.dims_equal %strides, [3, 3] : !transform.param<i64>
     transform.iree.match.dims_equal %dilations, [1, 1] : !transform.param<i64>
 
-    %input_value = transform.get_operand %root[0] : (!transform.any_op) -> !transform.any_value
-    %filter_value = transform.get_operand %root[1] : (!transform.any_op) -> !transform.any_value
-    transform.iree.match.dim_bounds %input_value[3], umin = 1, umax = 512 : !transform.any_value
-    transform.iree.match.dim_bounds %filter_value[3], umin = 1, umax = 512 : !transform.any_value
     transform.yield %root : !transform.any_op
   }
 
@@ -5679,6 +5638,7 @@ module attributes {transform.with_named_sequence} {
   // DESIGN_NOTES.md "Stride and large-width sweeps").
   transform.named_sequence @match_dynamic_conv2d_s4(%root: !transform.any_op {transform.readonly}) -> !transform.any_op {
     transform.match.operation_name %root ["linalg.conv_2d_nhwc_hwcf"] : !transform.any_op
+    transform.rocket.match.admitted %root : !transform.any_op
     %batch, %out_img, %out_ch, %filter, %in_ch, %depth, %strides, %dilations =
         transform.iree.match.convolution %root,
           lhs_type = f16, rhs_type = f16, output_type = f32
@@ -5692,10 +5652,6 @@ module attributes {transform.with_named_sequence} {
     transform.iree.match.dims_equal %strides, [4, 4] : !transform.param<i64>
     transform.iree.match.dims_equal %dilations, [1, 1] : !transform.param<i64>
 
-    %input_value = transform.get_operand %root[0] : (!transform.any_op) -> !transform.any_value
-    %filter_value = transform.get_operand %root[1] : (!transform.any_op) -> !transform.any_value
-    transform.iree.match.dim_bounds %input_value[3], umin = 1, umax = 512 : !transform.any_value
-    transform.iree.match.dim_bounds %filter_value[3], umin = 1, umax = 512 : !transform.any_value
     transform.yield %root : !transform.any_op
   }
 
@@ -5708,6 +5664,7 @@ module attributes {transform.with_named_sequence} {
   // DESIGN_NOTES.md "Stride and large-width sweeps").
   transform.named_sequence @match_dynamic_conv2d_3x3_s4(%root: !transform.any_op {transform.readonly}) -> !transform.any_op {
     transform.match.operation_name %root ["linalg.conv_2d_nhwc_hwcf"] : !transform.any_op
+    transform.rocket.match.admitted %root : !transform.any_op
     %batch, %out_img, %out_ch, %filter, %in_ch, %depth, %strides, %dilations =
         transform.iree.match.convolution %root,
           lhs_type = f16, rhs_type = f16, output_type = f32
@@ -5721,10 +5678,6 @@ module attributes {transform.with_named_sequence} {
     transform.iree.match.dims_equal %strides, [4, 4] : !transform.param<i64>
     transform.iree.match.dims_equal %dilations, [1, 1] : !transform.param<i64>
 
-    %input_value = transform.get_operand %root[0] : (!transform.any_op) -> !transform.any_value
-    %filter_value = transform.get_operand %root[1] : (!transform.any_op) -> !transform.any_value
-    transform.iree.match.dim_bounds %input_value[3], umin = 1, umax = 512 : !transform.any_value
-    transform.iree.match.dim_bounds %filter_value[3], umin = 1, umax = 512 : !transform.any_value
     transform.yield %root : !transform.any_op
   }
 
@@ -5763,6 +5716,7 @@ module attributes {transform.with_named_sequence} {
   // 512, both kernel sizes, so the cap now matches the dense matcher's.
   transform.named_sequence @match_dynamic_depthwise_conv2d(%root: !transform.any_op {transform.readonly}) -> !transform.any_op {
     transform.match.operation_name %root ["linalg.depthwise_conv_2d_nhwc_hwc"] : !transform.any_op
+    transform.rocket.match.admitted %root : !transform.any_op
     %batch, %out_img, %out_ch, %filter, %in_ch, %depth, %strides, %dilations =
         transform.iree.match.convolution %root,
           lhs_type = f16, rhs_type = f16, output_type = f32
@@ -5776,9 +5730,6 @@ module attributes {transform.with_named_sequence} {
     transform.iree.match.dims_equal %strides, [1, 1] : !transform.param<i64>
     transform.iree.match.dims_equal %dilations, [1, 1] : !transform.param<i64>
 
-    // Only one channel count to bound: depthwise Cout is always Cin.
-    %input_value = transform.get_operand %root[0] : (!transform.any_op) -> !transform.any_value
-    transform.iree.match.dim_bounds %input_value[3], umin = 1, umax = 512 : !transform.any_value
     transform.yield %root : !transform.any_op
   }
 
@@ -5789,6 +5740,7 @@ module attributes {transform.with_named_sequence} {
   // stage, so this is the practically load-bearing case.
   transform.named_sequence @match_dynamic_depthwise_conv2d_3x3(%root: !transform.any_op {transform.readonly}) -> !transform.any_op {
     transform.match.operation_name %root ["linalg.depthwise_conv_2d_nhwc_hwc"] : !transform.any_op
+    transform.rocket.match.admitted %root : !transform.any_op
     %batch, %out_img, %out_ch, %filter, %in_ch, %depth, %strides, %dilations =
         transform.iree.match.convolution %root,
           lhs_type = f16, rhs_type = f16, output_type = f32
@@ -5802,8 +5754,6 @@ module attributes {transform.with_named_sequence} {
     transform.iree.match.dims_equal %strides, [1, 1] : !transform.param<i64>
     transform.iree.match.dims_equal %dilations, [1, 1] : !transform.param<i64>
 
-    %input_value = transform.get_operand %root[0] : (!transform.any_op) -> !transform.any_value
-    transform.iree.match.dim_bounds %input_value[3], umin = 1, umax = 512 : !transform.any_value
     transform.yield %root : !transform.any_op
   }
 
@@ -5833,6 +5783,7 @@ module attributes {transform.with_named_sequence} {
   // bound is input dim 1 here (NCHW), not dim 3 (NHWC).
   transform.named_sequence @match_dynamic_depthwise_conv2d_nchw(%root: !transform.any_op {transform.readonly}) -> !transform.any_op {
     transform.match.operation_name %root ["linalg.depthwise_conv_2d_nchw_chw"] : !transform.any_op
+    transform.rocket.match.admitted %root : !transform.any_op
     %batch, %out_img, %out_ch, %filter, %in_ch, %depth, %strides, %dilations =
         transform.iree.match.convolution %root,
           lhs_type = f16, rhs_type = f16, output_type = f32
@@ -5846,8 +5797,6 @@ module attributes {transform.with_named_sequence} {
     transform.iree.match.dims_equal %strides, [1, 1] : !transform.param<i64>
     transform.iree.match.dims_equal %dilations, [1, 1] : !transform.param<i64>
 
-    %input_value = transform.get_operand %root[0] : (!transform.any_op) -> !transform.any_value
-    transform.iree.match.dim_bounds %input_value[1], umin = 1, umax = 512 : !transform.any_value
     transform.yield %root : !transform.any_op
   }
 
@@ -5872,6 +5821,7 @@ module attributes {transform.with_named_sequence} {
   // it.
   transform.named_sequence @match_dynamic_depthwise_conv2d_nchw_3x3(%root: !transform.any_op {transform.readonly}) -> !transform.any_op {
     transform.match.operation_name %root ["linalg.depthwise_conv_2d_nchw_chw"] : !transform.any_op
+    transform.rocket.match.admitted %root : !transform.any_op
     %batch, %out_img, %out_ch, %filter, %in_ch, %depth, %strides, %dilations =
         transform.iree.match.convolution %root,
           lhs_type = f16, rhs_type = f16, output_type = f32
@@ -5885,8 +5835,6 @@ module attributes {transform.with_named_sequence} {
     transform.iree.match.dims_equal %strides, [1, 1] : !transform.param<i64>
     transform.iree.match.dims_equal %dilations, [1, 1] : !transform.param<i64>
 
-    %input_value = transform.get_operand %root[0] : (!transform.any_op) -> !transform.any_value
-    transform.iree.match.dim_bounds %input_value[1], umin = 1, umax = 512 : !transform.any_value
     transform.yield %root : !transform.any_op
   }
 
@@ -5897,6 +5845,7 @@ module attributes {transform.with_named_sequence} {
   // "Depthwise stride hardware confirmation").
   transform.named_sequence @match_dynamic_depthwise_conv2d_nchw_s2(%root: !transform.any_op {transform.readonly}) -> !transform.any_op {
     transform.match.operation_name %root ["linalg.depthwise_conv_2d_nchw_chw"] : !transform.any_op
+    transform.rocket.match.admitted %root : !transform.any_op
     %batch, %out_img, %out_ch, %filter, %in_ch, %depth, %strides, %dilations =
         transform.iree.match.convolution %root,
           lhs_type = f16, rhs_type = f16, output_type = f32
@@ -5910,8 +5859,6 @@ module attributes {transform.with_named_sequence} {
     transform.iree.match.dims_equal %strides, [2, 2] : !transform.param<i64>
     transform.iree.match.dims_equal %dilations, [1, 1] : !transform.param<i64>
 
-    %input_value = transform.get_operand %root[0] : (!transform.any_op) -> !transform.any_value
-    transform.iree.match.dim_bounds %input_value[1], umin = 1, umax = 512 : !transform.any_value
     transform.yield %root : !transform.any_op
   }
 
@@ -5936,6 +5883,7 @@ module attributes {transform.with_named_sequence} {
   // before this bound can move; tracked as follow-up, not done here.
   transform.named_sequence @match_dynamic_depthwise_conv2d_nchw_3x3_s2(%root: !transform.any_op {transform.readonly}) -> !transform.any_op {
     transform.match.operation_name %root ["linalg.depthwise_conv_2d_nchw_chw"] : !transform.any_op
+    transform.rocket.match.admitted %root : !transform.any_op
     %batch, %out_img, %out_ch, %filter, %in_ch, %depth, %strides, %dilations =
         transform.iree.match.convolution %root,
           lhs_type = f16, rhs_type = f16, output_type = f32
@@ -5949,8 +5897,6 @@ module attributes {transform.with_named_sequence} {
     transform.iree.match.dims_equal %strides, [2, 2] : !transform.param<i64>
     transform.iree.match.dims_equal %dilations, [1, 1] : !transform.param<i64>
 
-    %input_value = transform.get_operand %root[0] : (!transform.any_op) -> !transform.any_value
-    transform.iree.match.dim_bounds %input_value[1], umin = 1, umax = 512 : !transform.any_value
     transform.yield %root : !transform.any_op
   }
 
@@ -5961,6 +5907,7 @@ module attributes {transform.with_named_sequence} {
   // "Depthwise stride hardware confirmation").
   transform.named_sequence @match_dynamic_depthwise_conv2d_nchw_s3(%root: !transform.any_op {transform.readonly}) -> !transform.any_op {
     transform.match.operation_name %root ["linalg.depthwise_conv_2d_nchw_chw"] : !transform.any_op
+    transform.rocket.match.admitted %root : !transform.any_op
     %batch, %out_img, %out_ch, %filter, %in_ch, %depth, %strides, %dilations =
         transform.iree.match.convolution %root,
           lhs_type = f16, rhs_type = f16, output_type = f32
@@ -5974,8 +5921,6 @@ module attributes {transform.with_named_sequence} {
     transform.iree.match.dims_equal %strides, [3, 3] : !transform.param<i64>
     transform.iree.match.dims_equal %dilations, [1, 1] : !transform.param<i64>
 
-    %input_value = transform.get_operand %root[0] : (!transform.any_op) -> !transform.any_value
-    transform.iree.match.dim_bounds %input_value[1], umin = 1, umax = 512 : !transform.any_value
     transform.yield %root : !transform.any_op
   }
 
@@ -5986,6 +5931,7 @@ module attributes {transform.with_named_sequence} {
   // "Depthwise stride hardware confirmation").
   transform.named_sequence @match_dynamic_depthwise_conv2d_nchw_3x3_s3(%root: !transform.any_op {transform.readonly}) -> !transform.any_op {
     transform.match.operation_name %root ["linalg.depthwise_conv_2d_nchw_chw"] : !transform.any_op
+    transform.rocket.match.admitted %root : !transform.any_op
     %batch, %out_img, %out_ch, %filter, %in_ch, %depth, %strides, %dilations =
         transform.iree.match.convolution %root,
           lhs_type = f16, rhs_type = f16, output_type = f32
@@ -5999,8 +5945,6 @@ module attributes {transform.with_named_sequence} {
     transform.iree.match.dims_equal %strides, [3, 3] : !transform.param<i64>
     transform.iree.match.dims_equal %dilations, [1, 1] : !transform.param<i64>
 
-    %input_value = transform.get_operand %root[0] : (!transform.any_op) -> !transform.any_value
-    transform.iree.match.dim_bounds %input_value[1], umin = 1, umax = 512 : !transform.any_value
     transform.yield %root : !transform.any_op
   }
 
@@ -6011,6 +5955,7 @@ module attributes {transform.with_named_sequence} {
   // "Depthwise stride hardware confirmation").
   transform.named_sequence @match_dynamic_depthwise_conv2d_nchw_s4(%root: !transform.any_op {transform.readonly}) -> !transform.any_op {
     transform.match.operation_name %root ["linalg.depthwise_conv_2d_nchw_chw"] : !transform.any_op
+    transform.rocket.match.admitted %root : !transform.any_op
     %batch, %out_img, %out_ch, %filter, %in_ch, %depth, %strides, %dilations =
         transform.iree.match.convolution %root,
           lhs_type = f16, rhs_type = f16, output_type = f32
@@ -6024,8 +5969,6 @@ module attributes {transform.with_named_sequence} {
     transform.iree.match.dims_equal %strides, [4, 4] : !transform.param<i64>
     transform.iree.match.dims_equal %dilations, [1, 1] : !transform.param<i64>
 
-    %input_value = transform.get_operand %root[0] : (!transform.any_op) -> !transform.any_value
-    transform.iree.match.dim_bounds %input_value[1], umin = 1, umax = 512 : !transform.any_value
     transform.yield %root : !transform.any_op
   }
 
@@ -6036,6 +5979,7 @@ module attributes {transform.with_named_sequence} {
   // "Depthwise stride hardware confirmation").
   transform.named_sequence @match_dynamic_depthwise_conv2d_nchw_3x3_s4(%root: !transform.any_op {transform.readonly}) -> !transform.any_op {
     transform.match.operation_name %root ["linalg.depthwise_conv_2d_nchw_chw"] : !transform.any_op
+    transform.rocket.match.admitted %root : !transform.any_op
     %batch, %out_img, %out_ch, %filter, %in_ch, %depth, %strides, %dilations =
         transform.iree.match.convolution %root,
           lhs_type = f16, rhs_type = f16, output_type = f32
@@ -6049,8 +5993,6 @@ module attributes {transform.with_named_sequence} {
     transform.iree.match.dims_equal %strides, [4, 4] : !transform.param<i64>
     transform.iree.match.dims_equal %dilations, [1, 1] : !transform.param<i64>
 
-    %input_value = transform.get_operand %root[0] : (!transform.any_op) -> !transform.any_value
-    transform.iree.match.dim_bounds %input_value[1], umin = 1, umax = 512 : !transform.any_value
     transform.yield %root : !transform.any_op
   }
 
@@ -6426,6 +6368,7 @@ module attributes {transform.with_named_sequence} {
 
   transform.named_sequence @match_dynamic_conv2d_int8(%root: !transform.any_op {transform.readonly}) -> !transform.any_op {
     transform.match.operation_name %root ["linalg.conv_2d_nhwc_hwcf"] : !transform.any_op
+    transform.rocket.match.admitted %root {precision = "int8_accumulator"} : !transform.any_op
     %batch, %out_img, %out_ch, %filter, %in_ch, %depth, %strides, %dilations =
         transform.iree.match.convolution %root,
           lhs_type = i8, rhs_type = i8, output_type = i32
@@ -6439,27 +6382,12 @@ module attributes {transform.with_named_sequence} {
     transform.iree.match.dims_equal %strides, [1, 1] : !transform.param<i64>
     transform.iree.match.dims_equal %dilations, [1, 1] : !transform.param<i64>
 
-    %input_value = transform.get_operand %root[0] : (!transform.any_op) -> !transform.any_value
-    %filter_value = transform.get_operand %root[1] : (!transform.any_op) -> !transform.any_value
-    // The HAL's `MAX_INT8_INPUT_CHANNELS`, raised 512 -> 1344 on hardware
-    // evidence, then 1344 -> 3584 on 2026-09-06 with the rest of the rungs.
-    // int8's own points at k=1: 14x14 Cout 64 at Cin 1792, 2304, 3072, 3584
-    // and 4096 under `SelectorsAffine` and again under `Counting`, the
-    // `onehot` read map at Cout == Cin 3584, and stride 2 at Cin 2304..4096.
-    // 1344 was MobileNetV2's widest; a transformer's is 3072.
-    transform.iree.match.dim_bounds %input_value[3], umin = 1, umax = 3584 : !transform.any_value
-    // The HAL's `MAX_INT8_OUTPUT_CHANNELS`, split out from the shared
-    // `MAX_OUTPUT_CHANNELS` at 1792, raised to 3584 on 2026-09-06. Measured
-    // exact at 7x7 Cin 448 for Cout 768, 1024, 1280, 1536, 1792, 2048, and
-    // then 2304, 3072, 3584 and 4096, with the CBUF split flat (7d/5w)
-    // across the whole range -- the high-channel divergence is indexed by
-    // `Cin`, not `Cout`.
-    transform.iree.match.dim_bounds %filter_value[3], umin = 1, umax = 3584 : !transform.any_value
     transform.yield %root : !transform.any_op
   }
 
   transform.named_sequence @match_dynamic_conv2d_3x3_int8(%root: !transform.any_op {transform.readonly}) -> !transform.any_op {
     transform.match.operation_name %root ["linalg.conv_2d_nhwc_hwcf"] : !transform.any_op
+    transform.rocket.match.admitted %root {precision = "int8_accumulator"} : !transform.any_op
     %batch, %out_img, %out_ch, %filter, %in_ch, %depth, %strides, %dilations =
         transform.iree.match.convolution %root,
           lhs_type = i8, rhs_type = i8, output_type = i32
@@ -6473,24 +6401,12 @@ module attributes {transform.with_named_sequence} {
     transform.iree.match.dims_equal %strides, [1, 1] : !transform.param<i64>
     transform.iree.match.dims_equal %dilations, [1, 1] : !transform.param<i64>
 
-    %input_value = transform.get_operand %root[0] : (!transform.any_op) -> !transform.any_value
-    %filter_value = transform.get_operand %root[1] : (!transform.any_op) -> !transform.any_value
-    // 1152, not `MAX_INT8_INPUT_CHANNELS` (3584 since 2026-09-06): at a 3x3
-    // kernel the binding limit is the coefficient working set, not the
-    // channel-padding rules.
-    // `ConvPlan` plans and agrees with the vendor to Cin 1152 and **refuses**
-    // Cin >= 1216 outright (the working set exceeds the eleven grantable CBUF
-    // banks), so admitting past 1152 would reach the driver and panic rather
-    // than fall back. 1152 is hardware-exact at Cout 64 and 448, including the
-    // 1/11 splits at 1088 and 1152. The Cout bound stays 512: the corpus
-    // backing above it was established against the 1x1 matcher, not this one.
-    transform.iree.match.dim_bounds %input_value[3], umin = 1, umax = 1152 : !transform.any_value
-    transform.iree.match.dim_bounds %filter_value[3], umin = 1, umax = 512 : !transform.any_value
     transform.yield %root : !transform.any_op
   }
 
   transform.named_sequence @match_dynamic_depthwise_conv2d_int8(%root: !transform.any_op {transform.readonly}) -> !transform.any_op {
     transform.match.operation_name %root ["linalg.depthwise_conv_2d_nhwc_hwc"] : !transform.any_op
+    transform.rocket.match.admitted %root {precision = "int8_accumulator"} : !transform.any_op
     %batch, %out_img, %out_ch, %filter, %in_ch, %depth, %strides, %dilations =
         transform.iree.match.convolution %root,
           lhs_type = i8, rhs_type = i8, output_type = i32
@@ -6504,20 +6420,12 @@ module attributes {transform.with_named_sequence} {
     transform.iree.match.dims_equal %strides, [1, 1] : !transform.param<i64>
     transform.iree.match.dims_equal %dilations, [1, 1] : !transform.param<i64>
 
-    // Only one channel count to bound: depthwise Cout is always Cin.
-    %input_value = transform.get_operand %root[0] : (!transform.any_op) -> !transform.any_value
-    // Raised 512 -> 1344 (2026-09-03) with the depthwise coefficient model
-    // fix: the streamed working set was using the *dense* product
-    // `kh*kw*Cin*64`, which scales with C and asked for 13 of eleven
-    // grantable CBUF banks at C=1344. A depthwise output channel
-    // accumulates over one input channel, so the contraction depth is 1.
-    // See `Shape::streamed_contraction_channels`.
-    transform.iree.match.dim_bounds %input_value[3], umin = 1, umax = 1344 : !transform.any_value
     transform.yield %root : !transform.any_op
   }
 
   transform.named_sequence @match_dynamic_depthwise_conv2d_3x3_int8(%root: !transform.any_op {transform.readonly}) -> !transform.any_op {
     transform.match.operation_name %root ["linalg.depthwise_conv_2d_nhwc_hwc"] : !transform.any_op
+    transform.rocket.match.admitted %root {precision = "int8_accumulator"} : !transform.any_op
     %batch, %out_img, %out_ch, %filter, %in_ch, %depth, %strides, %dilations =
         transform.iree.match.convolution %root,
           lhs_type = i8, rhs_type = i8, output_type = i32
@@ -6531,20 +6439,12 @@ module attributes {transform.with_named_sequence} {
     transform.iree.match.dims_equal %strides, [1, 1] : !transform.param<i64>
     transform.iree.match.dims_equal %dilations, [1, 1] : !transform.param<i64>
 
-    // Only one channel count to bound: depthwise Cout is always Cin.
-    %input_value = transform.get_operand %root[0] : (!transform.any_op) -> !transform.any_value
-    // Raised 512 -> 1344 (2026-09-03) with the depthwise coefficient model
-    // fix: the streamed working set was using the *dense* product
-    // `kh*kw*Cin*64`, which scales with C and asked for 13 of eleven
-    // grantable CBUF banks at C=1344. A depthwise output channel
-    // accumulates over one input channel, so the contraction depth is 1.
-    // See `Shape::streamed_contraction_channels`.
-    transform.iree.match.dim_bounds %input_value[3], umin = 1, umax = 1344 : !transform.any_value
     transform.yield %root : !transform.any_op
   }
 
   transform.named_sequence @match_dynamic_depthwise_conv2d_int8_s2(%root: !transform.any_op {transform.readonly}) -> !transform.any_op {
     transform.match.operation_name %root ["linalg.depthwise_conv_2d_nhwc_hwc"] : !transform.any_op
+    transform.rocket.match.admitted %root {precision = "int8_accumulator"} : !transform.any_op
     %batch, %out_img, %out_ch, %filter, %in_ch, %depth, %strides, %dilations =
         transform.iree.match.convolution %root,
           lhs_type = i8, rhs_type = i8, output_type = i32
@@ -6558,20 +6458,12 @@ module attributes {transform.with_named_sequence} {
     transform.iree.match.dims_equal %strides, [2, 2] : !transform.param<i64>
     transform.iree.match.dims_equal %dilations, [1, 1] : !transform.param<i64>
 
-    // Only one channel count to bound: depthwise Cout is always Cin.
-    %input_value = transform.get_operand %root[0] : (!transform.any_op) -> !transform.any_value
-    // Raised 512 -> 1344 (2026-09-03) with the depthwise coefficient model
-    // fix: the streamed working set was using the *dense* product
-    // `kh*kw*Cin*64`, which scales with C and asked for 13 of eleven
-    // grantable CBUF banks at C=1344. A depthwise output channel
-    // accumulates over one input channel, so the contraction depth is 1.
-    // See `Shape::streamed_contraction_channels`.
-    transform.iree.match.dim_bounds %input_value[3], umin = 1, umax = 1344 : !transform.any_value
     transform.yield %root : !transform.any_op
   }
 
   transform.named_sequence @match_dynamic_depthwise_conv2d_3x3_int8_s2(%root: !transform.any_op {transform.readonly}) -> !transform.any_op {
     transform.match.operation_name %root ["linalg.depthwise_conv_2d_nhwc_hwc"] : !transform.any_op
+    transform.rocket.match.admitted %root {precision = "int8_accumulator"} : !transform.any_op
     %batch, %out_img, %out_ch, %filter, %in_ch, %depth, %strides, %dilations =
         transform.iree.match.convolution %root,
           lhs_type = i8, rhs_type = i8, output_type = i32
@@ -6585,15 +6477,6 @@ module attributes {transform.with_named_sequence} {
     transform.iree.match.dims_equal %strides, [2, 2] : !transform.param<i64>
     transform.iree.match.dims_equal %dilations, [1, 1] : !transform.param<i64>
 
-    // Only one channel count to bound: depthwise Cout is always Cin.
-    %input_value = transform.get_operand %root[0] : (!transform.any_op) -> !transform.any_value
-    // Raised 512 -> 1344 (2026-09-03) with the depthwise coefficient model
-    // fix: the streamed working set was using the *dense* product
-    // `kh*kw*Cin*64`, which scales with C and asked for 13 of eleven
-    // grantable CBUF banks at C=1344. A depthwise output channel
-    // accumulates over one input channel, so the contraction depth is 1.
-    // See `Shape::streamed_contraction_channels`.
-    transform.iree.match.dim_bounds %input_value[3], umin = 1, umax = 1344 : !transform.any_value
     transform.yield %root : !transform.any_op
   }
 
@@ -6665,6 +6548,7 @@ module attributes {transform.with_named_sequence} {
       %root: !transform.any_op {transform.readonly})
       -> (!transform.any_value, !transform.any_value) {
     transform.match.operation_name %root ["linalg.conv_2d_nhwc_hwcf"] : !transform.any_op
+    transform.rocket.match.admitted %root : !transform.any_op
     %batch, %out_img, %out_ch, %filter, %in_ch, %depth, %strides, %dilations =
         transform.iree.match.convolution %root,
           lhs_type = f16, rhs_type = f16, output_type = f32
@@ -6678,12 +6562,6 @@ module attributes {transform.with_named_sequence} {
     transform.iree.match.dims_equal %strides, [1, 1] : !transform.param<i64>
     transform.iree.match.dims_equal %dilations, [1, 1] : !transform.param<i64>
 
-    // The bounds are the ones the unpadded 3x3 matchers already carry: this
-    // changes where the padding happens, not how wide the convolution may be.
-    %input_value = transform.get_operand %root[0] : (!transform.any_op) -> !transform.any_value
-    %filter_value = transform.get_operand %root[1] : (!transform.any_op) -> !transform.any_value
-    transform.iree.match.dim_bounds %input_value[3], umin = 1, umax = 1152 : !transform.any_value
-    transform.iree.match.dim_bounds %filter_value[3], umin = 1, umax = 3584 : !transform.any_value
 
     %ins, %outs = transform.iree.match.cast_compatible_dag_from_root %root {
       ^bb0(%input: tensor<1x1x?x?x?xf16>, %weights: tensor<?x?x?x?xf16>,
@@ -6713,6 +6591,7 @@ module attributes {transform.with_named_sequence} {
       %root: !transform.any_op {transform.readonly})
       -> (!transform.any_value, !transform.any_value) {
     transform.match.operation_name %root ["linalg.conv_2d_nhwc_hwcf"] : !transform.any_op
+    transform.rocket.match.admitted %root : !transform.any_op
     %batch, %out_img, %out_ch, %filter, %in_ch, %depth, %strides, %dilations =
         transform.iree.match.convolution %root,
           lhs_type = f16, rhs_type = f16, output_type = f32
@@ -6726,12 +6605,6 @@ module attributes {transform.with_named_sequence} {
     transform.iree.match.dims_equal %strides, [1, 1] : !transform.param<i64>
     transform.iree.match.dims_equal %dilations, [1, 1] : !transform.param<i64>
 
-    // The bounds are the ones the unpadded 3x3 matchers already carry: this
-    // changes where the padding happens, not how wide the convolution may be.
-    %input_value = transform.get_operand %root[0] : (!transform.any_op) -> !transform.any_value
-    %filter_value = transform.get_operand %root[1] : (!transform.any_op) -> !transform.any_value
-    transform.iree.match.dim_bounds %input_value[3], umin = 1, umax = 1152 : !transform.any_value
-    transform.iree.match.dim_bounds %filter_value[3], umin = 1, umax = 3584 : !transform.any_value
 
     %ins, %outs = transform.iree.match.cast_compatible_dag_from_root %root {
       ^bb0(%input: tensor<1x1x?x?x?xf16>, %weights: tensor<?x?x?x?xf16>,
@@ -6761,6 +6634,7 @@ module attributes {transform.with_named_sequence} {
       %root: !transform.any_op {transform.readonly})
       -> (!transform.any_value, !transform.any_value) {
     transform.match.operation_name %root ["linalg.conv_2d_nhwc_hwcf"] : !transform.any_op
+    transform.rocket.match.admitted %root : !transform.any_op
     %batch, %out_img, %out_ch, %filter, %in_ch, %depth, %strides, %dilations =
         transform.iree.match.convolution %root,
           lhs_type = f16, rhs_type = f16, output_type = f32
@@ -6774,12 +6648,6 @@ module attributes {transform.with_named_sequence} {
     transform.iree.match.dims_equal %strides, [2, 2] : !transform.param<i64>
     transform.iree.match.dims_equal %dilations, [1, 1] : !transform.param<i64>
 
-    // The bounds are the ones the unpadded 3x3 matchers already carry: this
-    // changes where the padding happens, not how wide the convolution may be.
-    %input_value = transform.get_operand %root[0] : (!transform.any_op) -> !transform.any_value
-    %filter_value = transform.get_operand %root[1] : (!transform.any_op) -> !transform.any_value
-    transform.iree.match.dim_bounds %input_value[3], umin = 1, umax = 512 : !transform.any_value
-    transform.iree.match.dim_bounds %filter_value[3], umin = 1, umax = 3584 : !transform.any_value
 
     %ins, %outs = transform.iree.match.cast_compatible_dag_from_root %root {
       ^bb0(%input: tensor<1x1x?x?x?xf16>, %weights: tensor<?x?x?x?xf16>,
@@ -6809,6 +6677,7 @@ module attributes {transform.with_named_sequence} {
       %root: !transform.any_op {transform.readonly})
       -> (!transform.any_value, !transform.any_value) {
     transform.match.operation_name %root ["linalg.conv_2d_nhwc_hwcf"] : !transform.any_op
+    transform.rocket.match.admitted %root : !transform.any_op
     %batch, %out_img, %out_ch, %filter, %in_ch, %depth, %strides, %dilations =
         transform.iree.match.convolution %root,
           lhs_type = f16, rhs_type = f16, output_type = f32
@@ -6822,12 +6691,6 @@ module attributes {transform.with_named_sequence} {
     transform.iree.match.dims_equal %strides, [2, 2] : !transform.param<i64>
     transform.iree.match.dims_equal %dilations, [1, 1] : !transform.param<i64>
 
-    // The bounds are the ones the unpadded 3x3 matchers already carry: this
-    // changes where the padding happens, not how wide the convolution may be.
-    %input_value = transform.get_operand %root[0] : (!transform.any_op) -> !transform.any_value
-    %filter_value = transform.get_operand %root[1] : (!transform.any_op) -> !transform.any_value
-    transform.iree.match.dim_bounds %input_value[3], umin = 1, umax = 512 : !transform.any_value
-    transform.iree.match.dim_bounds %filter_value[3], umin = 1, umax = 3584 : !transform.any_value
 
     %ins, %outs = transform.iree.match.cast_compatible_dag_from_root %root {
       ^bb0(%input: tensor<1x1x?x?x?xf16>, %weights: tensor<?x?x?x?xf16>,
@@ -6907,6 +6770,7 @@ module attributes {transform.with_named_sequence} {
     %conv = transform.get_producer_of_operand %root[0]
         : (!transform.any_op) -> !transform.any_op
     transform.match.operation_name %conv ["linalg.conv_2d_nhwc_hwcf"] : !transform.any_op
+    transform.rocket.match.admitted %conv : !transform.any_op
     %batch, %out_img, %out_ch, %filter, %in_ch, %depth, %strides, %dilations =
         transform.iree.match.convolution %conv,
           lhs_type = f16, rhs_type = f16, output_type = f32
@@ -6919,10 +6783,6 @@ module attributes {transform.with_named_sequence} {
     transform.iree.match.dims_equal %depth, [] : !transform.param<i64>
     transform.iree.match.dims_equal %strides, [1, 1] : !transform.param<i64>
     transform.iree.match.dims_equal %dilations, [1, 1] : !transform.param<i64>
-    %input_value = transform.get_operand %conv[0] : (!transform.any_op) -> !transform.any_value
-    %filter_value = transform.get_operand %conv[1] : (!transform.any_op) -> !transform.any_value
-    transform.iree.match.dim_bounds %input_value[3], umin = 1, umax = 3584 : !transform.any_value
-    transform.iree.match.dim_bounds %filter_value[3], umin = 1, umax = 3584 : !transform.any_value
     %ins, %outs = transform.iree.match.cast_compatible_dag_from_root %root {
       ^bb0(%input: tensor<1x?x?x?xf16>, %weights: tensor<?x?x?x?xf16>,
            %acc_init: tensor<1x?x?x?xf32>, %bias: tensor<?xf32>,
@@ -6956,6 +6816,7 @@ module attributes {transform.with_named_sequence} {
     %conv = transform.get_producer_of_operand %root[0]
         : (!transform.any_op) -> !transform.any_op
     transform.match.operation_name %conv ["linalg.conv_2d_nhwc_hwcf"] : !transform.any_op
+    transform.rocket.match.admitted %conv : !transform.any_op
     %batch, %out_img, %out_ch, %filter, %in_ch, %depth, %strides, %dilations =
         transform.iree.match.convolution %conv,
           lhs_type = f16, rhs_type = f16, output_type = f32
@@ -6968,10 +6829,6 @@ module attributes {transform.with_named_sequence} {
     transform.iree.match.dims_equal %depth, [] : !transform.param<i64>
     transform.iree.match.dims_equal %strides, [1, 1] : !transform.param<i64>
     transform.iree.match.dims_equal %dilations, [1, 1] : !transform.param<i64>
-    %input_value = transform.get_operand %conv[0] : (!transform.any_op) -> !transform.any_value
-    %filter_value = transform.get_operand %conv[1] : (!transform.any_op) -> !transform.any_value
-    transform.iree.match.dim_bounds %input_value[3], umin = 1, umax = 3584 : !transform.any_value
-    transform.iree.match.dim_bounds %filter_value[3], umin = 1, umax = 3584 : !transform.any_value
     %ins, %outs = transform.iree.match.cast_compatible_dag_from_root %root {
       ^bb0(%input: tensor<1x?x?x?xf16>, %weights: tensor<?x?x?x?xf16>,
            %acc_init: tensor<1x?x?x?xf32>, %bias: tensor<?xf32>,
@@ -7005,6 +6862,7 @@ module attributes {transform.with_named_sequence} {
     %conv = transform.get_producer_of_operand %root[0]
         : (!transform.any_op) -> !transform.any_op
     transform.match.operation_name %conv ["linalg.conv_2d_nhwc_hwcf"] : !transform.any_op
+    transform.rocket.match.admitted %conv : !transform.any_op
     %batch, %out_img, %out_ch, %filter, %in_ch, %depth, %strides, %dilations =
         transform.iree.match.convolution %conv,
           lhs_type = f16, rhs_type = f16, output_type = f32
@@ -7017,10 +6875,6 @@ module attributes {transform.with_named_sequence} {
     transform.iree.match.dims_equal %depth, [] : !transform.param<i64>
     transform.iree.match.dims_equal %strides, [1, 1] : !transform.param<i64>
     transform.iree.match.dims_equal %dilations, [1, 1] : !transform.param<i64>
-    %input_value = transform.get_operand %conv[0] : (!transform.any_op) -> !transform.any_value
-    %filter_value = transform.get_operand %conv[1] : (!transform.any_op) -> !transform.any_value
-    transform.iree.match.dim_bounds %input_value[3], umin = 1, umax = 1152 : !transform.any_value
-    transform.iree.match.dim_bounds %filter_value[3], umin = 1, umax = 1792 : !transform.any_value
     %ins, %outs = transform.iree.match.cast_compatible_dag_from_root %root {
       ^bb0(%input: tensor<1x?x?x?xf16>, %weights: tensor<?x?x?x?xf16>,
            %acc_init: tensor<1x?x?x?xf32>, %bias: tensor<?xf32>,
@@ -7054,6 +6908,7 @@ module attributes {transform.with_named_sequence} {
     %conv = transform.get_producer_of_operand %root[0]
         : (!transform.any_op) -> !transform.any_op
     transform.match.operation_name %conv ["linalg.conv_2d_nhwc_hwcf"] : !transform.any_op
+    transform.rocket.match.admitted %conv : !transform.any_op
     %batch, %out_img, %out_ch, %filter, %in_ch, %depth, %strides, %dilations =
         transform.iree.match.convolution %conv,
           lhs_type = f16, rhs_type = f16, output_type = f32
@@ -7066,10 +6921,6 @@ module attributes {transform.with_named_sequence} {
     transform.iree.match.dims_equal %depth, [] : !transform.param<i64>
     transform.iree.match.dims_equal %strides, [1, 1] : !transform.param<i64>
     transform.iree.match.dims_equal %dilations, [1, 1] : !transform.param<i64>
-    %input_value = transform.get_operand %conv[0] : (!transform.any_op) -> !transform.any_value
-    %filter_value = transform.get_operand %conv[1] : (!transform.any_op) -> !transform.any_value
-    transform.iree.match.dim_bounds %input_value[3], umin = 1, umax = 1152 : !transform.any_value
-    transform.iree.match.dim_bounds %filter_value[3], umin = 1, umax = 1792 : !transform.any_value
     %ins, %outs = transform.iree.match.cast_compatible_dag_from_root %root {
       ^bb0(%input: tensor<1x?x?x?xf16>, %weights: tensor<?x?x?x?xf16>,
            %acc_init: tensor<1x?x?x?xf32>, %bias: tensor<?xf32>,
@@ -7103,6 +6954,7 @@ module attributes {transform.with_named_sequence} {
     %conv = transform.get_producer_of_operand %root[0]
         : (!transform.any_op) -> !transform.any_op
     transform.match.operation_name %conv ["linalg.conv_2d_nhwc_hwcf"] : !transform.any_op
+    transform.rocket.match.admitted %conv : !transform.any_op
     %batch, %out_img, %out_ch, %filter, %in_ch, %depth, %strides, %dilations =
         transform.iree.match.convolution %conv,
           lhs_type = f16, rhs_type = f16, output_type = f32
@@ -7115,10 +6967,6 @@ module attributes {transform.with_named_sequence} {
     transform.iree.match.dims_equal %depth, [] : !transform.param<i64>
     transform.iree.match.dims_equal %strides, [2, 2] : !transform.param<i64>
     transform.iree.match.dims_equal %dilations, [1, 1] : !transform.param<i64>
-    %input_value = transform.get_operand %conv[0] : (!transform.any_op) -> !transform.any_value
-    %filter_value = transform.get_operand %conv[1] : (!transform.any_op) -> !transform.any_value
-    transform.iree.match.dim_bounds %input_value[3], umin = 1, umax = 3584 : !transform.any_value
-    transform.iree.match.dim_bounds %filter_value[3], umin = 1, umax = 3584 : !transform.any_value
     %ins, %outs = transform.iree.match.cast_compatible_dag_from_root %root {
       ^bb0(%input: tensor<1x?x?x?xf16>, %weights: tensor<?x?x?x?xf16>,
            %acc_init: tensor<1x?x?x?xf32>, %bias: tensor<?xf32>,
@@ -7152,6 +7000,7 @@ module attributes {transform.with_named_sequence} {
     %conv = transform.get_producer_of_operand %root[0]
         : (!transform.any_op) -> !transform.any_op
     transform.match.operation_name %conv ["linalg.conv_2d_nhwc_hwcf"] : !transform.any_op
+    transform.rocket.match.admitted %conv : !transform.any_op
     %batch, %out_img, %out_ch, %filter, %in_ch, %depth, %strides, %dilations =
         transform.iree.match.convolution %conv,
           lhs_type = f16, rhs_type = f16, output_type = f32
@@ -7164,10 +7013,6 @@ module attributes {transform.with_named_sequence} {
     transform.iree.match.dims_equal %depth, [] : !transform.param<i64>
     transform.iree.match.dims_equal %strides, [2, 2] : !transform.param<i64>
     transform.iree.match.dims_equal %dilations, [1, 1] : !transform.param<i64>
-    %input_value = transform.get_operand %conv[0] : (!transform.any_op) -> !transform.any_value
-    %filter_value = transform.get_operand %conv[1] : (!transform.any_op) -> !transform.any_value
-    transform.iree.match.dim_bounds %input_value[3], umin = 1, umax = 3584 : !transform.any_value
-    transform.iree.match.dim_bounds %filter_value[3], umin = 1, umax = 3584 : !transform.any_value
     %ins, %outs = transform.iree.match.cast_compatible_dag_from_root %root {
       ^bb0(%input: tensor<1x?x?x?xf16>, %weights: tensor<?x?x?x?xf16>,
            %acc_init: tensor<1x?x?x?xf32>, %bias: tensor<?xf32>,
@@ -7201,6 +7046,7 @@ module attributes {transform.with_named_sequence} {
     %conv = transform.get_producer_of_operand %root[0]
         : (!transform.any_op) -> !transform.any_op
     transform.match.operation_name %conv ["linalg.conv_2d_nhwc_hwcf"] : !transform.any_op
+    transform.rocket.match.admitted %conv : !transform.any_op
     %batch, %out_img, %out_ch, %filter, %in_ch, %depth, %strides, %dilations =
         transform.iree.match.convolution %conv,
           lhs_type = f16, rhs_type = f16, output_type = f32
@@ -7213,10 +7059,6 @@ module attributes {transform.with_named_sequence} {
     transform.iree.match.dims_equal %depth, [] : !transform.param<i64>
     transform.iree.match.dims_equal %strides, [2, 2] : !transform.param<i64>
     transform.iree.match.dims_equal %dilations, [1, 1] : !transform.param<i64>
-    %input_value = transform.get_operand %conv[0] : (!transform.any_op) -> !transform.any_value
-    %filter_value = transform.get_operand %conv[1] : (!transform.any_op) -> !transform.any_value
-    transform.iree.match.dim_bounds %input_value[3], umin = 1, umax = 1152 : !transform.any_value
-    transform.iree.match.dim_bounds %filter_value[3], umin = 1, umax = 1792 : !transform.any_value
     %ins, %outs = transform.iree.match.cast_compatible_dag_from_root %root {
       ^bb0(%input: tensor<1x?x?x?xf16>, %weights: tensor<?x?x?x?xf16>,
            %acc_init: tensor<1x?x?x?xf32>, %bias: tensor<?xf32>,
@@ -7250,6 +7092,7 @@ module attributes {transform.with_named_sequence} {
     %conv = transform.get_producer_of_operand %root[0]
         : (!transform.any_op) -> !transform.any_op
     transform.match.operation_name %conv ["linalg.conv_2d_nhwc_hwcf"] : !transform.any_op
+    transform.rocket.match.admitted %conv : !transform.any_op
     %batch, %out_img, %out_ch, %filter, %in_ch, %depth, %strides, %dilations =
         transform.iree.match.convolution %conv,
           lhs_type = f16, rhs_type = f16, output_type = f32
@@ -7262,10 +7105,6 @@ module attributes {transform.with_named_sequence} {
     transform.iree.match.dims_equal %depth, [] : !transform.param<i64>
     transform.iree.match.dims_equal %strides, [2, 2] : !transform.param<i64>
     transform.iree.match.dims_equal %dilations, [1, 1] : !transform.param<i64>
-    %input_value = transform.get_operand %conv[0] : (!transform.any_op) -> !transform.any_value
-    %filter_value = transform.get_operand %conv[1] : (!transform.any_op) -> !transform.any_value
-    transform.iree.match.dim_bounds %input_value[3], umin = 1, umax = 1152 : !transform.any_value
-    transform.iree.match.dim_bounds %filter_value[3], umin = 1, umax = 1792 : !transform.any_value
     %ins, %outs = transform.iree.match.cast_compatible_dag_from_root %root {
       ^bb0(%input: tensor<1x?x?x?xf16>, %weights: tensor<?x?x?x?xf16>,
            %acc_init: tensor<1x?x?x?xf32>, %bias: tensor<?xf32>,
@@ -7299,6 +7138,7 @@ module attributes {transform.with_named_sequence} {
     %conv = transform.get_producer_of_operand %root[0]
         : (!transform.any_op) -> !transform.any_op
     transform.match.operation_name %conv ["linalg.conv_2d_nhwc_hwcf"] : !transform.any_op
+    transform.rocket.match.admitted %conv : !transform.any_op
     %batch, %out_img, %out_ch, %filter, %in_ch, %depth, %strides, %dilations =
         transform.iree.match.convolution %conv,
           lhs_type = f16, rhs_type = f16, output_type = f32
@@ -7311,10 +7151,6 @@ module attributes {transform.with_named_sequence} {
     transform.iree.match.dims_equal %depth, [] : !transform.param<i64>
     transform.iree.match.dims_equal %strides, [1, 1] : !transform.param<i64>
     transform.iree.match.dims_equal %dilations, [1, 1] : !transform.param<i64>
-    %input_value = transform.get_operand %conv[0] : (!transform.any_op) -> !transform.any_value
-    %filter_value = transform.get_operand %conv[1] : (!transform.any_op) -> !transform.any_value
-    transform.iree.match.dim_bounds %input_value[3], umin = 1, umax = 1152 : !transform.any_value
-    transform.iree.match.dim_bounds %filter_value[3], umin = 1, umax = 3584 : !transform.any_value
     %ins, %outs = transform.iree.match.cast_compatible_dag_from_root %root {
       ^bb0(%input: tensor<1x1x?x?x?xf16>, %weights: tensor<?x?x?x?xf16>,
            %acc_init: tensor<1x?x?x?xf32>, %bias: tensor<?xf32>,
@@ -7355,6 +7191,7 @@ module attributes {transform.with_named_sequence} {
     %conv = transform.get_producer_of_operand %root[0]
         : (!transform.any_op) -> !transform.any_op
     transform.match.operation_name %conv ["linalg.conv_2d_nhwc_hwcf"] : !transform.any_op
+    transform.rocket.match.admitted %conv : !transform.any_op
     %batch, %out_img, %out_ch, %filter, %in_ch, %depth, %strides, %dilations =
         transform.iree.match.convolution %conv,
           lhs_type = f16, rhs_type = f16, output_type = f32
@@ -7367,10 +7204,6 @@ module attributes {transform.with_named_sequence} {
     transform.iree.match.dims_equal %depth, [] : !transform.param<i64>
     transform.iree.match.dims_equal %strides, [1, 1] : !transform.param<i64>
     transform.iree.match.dims_equal %dilations, [1, 1] : !transform.param<i64>
-    %input_value = transform.get_operand %conv[0] : (!transform.any_op) -> !transform.any_value
-    %filter_value = transform.get_operand %conv[1] : (!transform.any_op) -> !transform.any_value
-    transform.iree.match.dim_bounds %input_value[3], umin = 1, umax = 1152 : !transform.any_value
-    transform.iree.match.dim_bounds %filter_value[3], umin = 1, umax = 3584 : !transform.any_value
     %ins, %outs = transform.iree.match.cast_compatible_dag_from_root %root {
       ^bb0(%input: tensor<1x1x?x?x?xf16>, %weights: tensor<?x?x?x?xf16>,
            %acc_init: tensor<1x?x?x?xf32>, %bias: tensor<?xf32>,
@@ -7411,6 +7244,7 @@ module attributes {transform.with_named_sequence} {
     %conv = transform.get_producer_of_operand %root[0]
         : (!transform.any_op) -> !transform.any_op
     transform.match.operation_name %conv ["linalg.conv_2d_nhwc_hwcf"] : !transform.any_op
+    transform.rocket.match.admitted %conv : !transform.any_op
     %batch, %out_img, %out_ch, %filter, %in_ch, %depth, %strides, %dilations =
         transform.iree.match.convolution %conv,
           lhs_type = f16, rhs_type = f16, output_type = f32
@@ -7423,10 +7257,6 @@ module attributes {transform.with_named_sequence} {
     transform.iree.match.dims_equal %depth, [] : !transform.param<i64>
     transform.iree.match.dims_equal %strides, [2, 2] : !transform.param<i64>
     transform.iree.match.dims_equal %dilations, [1, 1] : !transform.param<i64>
-    %input_value = transform.get_operand %conv[0] : (!transform.any_op) -> !transform.any_value
-    %filter_value = transform.get_operand %conv[1] : (!transform.any_op) -> !transform.any_value
-    transform.iree.match.dim_bounds %input_value[3], umin = 1, umax = 1152 : !transform.any_value
-    transform.iree.match.dim_bounds %filter_value[3], umin = 1, umax = 3584 : !transform.any_value
     %ins, %outs = transform.iree.match.cast_compatible_dag_from_root %root {
       ^bb0(%input: tensor<1x1x?x?x?xf16>, %weights: tensor<?x?x?x?xf16>,
            %acc_init: tensor<1x?x?x?xf32>, %bias: tensor<?xf32>,
@@ -7467,6 +7297,7 @@ module attributes {transform.with_named_sequence} {
     %conv = transform.get_producer_of_operand %root[0]
         : (!transform.any_op) -> !transform.any_op
     transform.match.operation_name %conv ["linalg.conv_2d_nhwc_hwcf"] : !transform.any_op
+    transform.rocket.match.admitted %conv : !transform.any_op
     %batch, %out_img, %out_ch, %filter, %in_ch, %depth, %strides, %dilations =
         transform.iree.match.convolution %conv,
           lhs_type = f16, rhs_type = f16, output_type = f32
@@ -7479,10 +7310,6 @@ module attributes {transform.with_named_sequence} {
     transform.iree.match.dims_equal %depth, [] : !transform.param<i64>
     transform.iree.match.dims_equal %strides, [2, 2] : !transform.param<i64>
     transform.iree.match.dims_equal %dilations, [1, 1] : !transform.param<i64>
-    %input_value = transform.get_operand %conv[0] : (!transform.any_op) -> !transform.any_value
-    %filter_value = transform.get_operand %conv[1] : (!transform.any_op) -> !transform.any_value
-    transform.iree.match.dim_bounds %input_value[3], umin = 1, umax = 1152 : !transform.any_value
-    transform.iree.match.dim_bounds %filter_value[3], umin = 1, umax = 3584 : !transform.any_value
     %ins, %outs = transform.iree.match.cast_compatible_dag_from_root %root {
       ^bb0(%input: tensor<1x1x?x?x?xf16>, %weights: tensor<?x?x?x?xf16>,
            %acc_init: tensor<1x?x?x?xf32>, %bias: tensor<?xf32>,
@@ -7523,6 +7350,7 @@ module attributes {transform.with_named_sequence} {
     %conv = transform.get_producer_of_operand %root[0]
         : (!transform.any_op) -> !transform.any_op
     transform.match.operation_name %conv ["linalg.conv_2d_nhwc_hwcf"] : !transform.any_op
+    transform.rocket.match.admitted %conv : !transform.any_op
     %batch, %out_img, %out_ch, %filter, %in_ch, %depth, %strides, %dilations =
         transform.iree.match.convolution %conv,
           lhs_type = f16, rhs_type = f16, output_type = f32
@@ -7535,10 +7363,6 @@ module attributes {transform.with_named_sequence} {
     transform.iree.match.dims_equal %depth, [] : !transform.param<i64>
     transform.iree.match.dims_equal %strides, [1, 1] : !transform.param<i64>
     transform.iree.match.dims_equal %dilations, [1, 1] : !transform.param<i64>
-    %input_value = transform.get_operand %conv[0] : (!transform.any_op) -> !transform.any_value
-    %filter_value = transform.get_operand %conv[1] : (!transform.any_op) -> !transform.any_value
-    transform.iree.match.dim_bounds %input_value[3], umin = 1, umax = 3584 : !transform.any_value
-    transform.iree.match.dim_bounds %filter_value[3], umin = 1, umax = 3584 : !transform.any_value
     %ins, %outs = transform.iree.match.cast_compatible_dag_from_root %root {
       ^bb0(%input: tensor<1x?x?x?xf16>, %weights: tensor<?x?x?x?xf16>,
            %acc_init: tensor<1x?x?x?xf32>, %bias: tensor<?xf32>,
@@ -7569,6 +7393,7 @@ module attributes {transform.with_named_sequence} {
     %conv = transform.get_producer_of_operand %root[0]
         : (!transform.any_op) -> !transform.any_op
     transform.match.operation_name %conv ["linalg.conv_2d_nhwc_hwcf"] : !transform.any_op
+    transform.rocket.match.admitted %conv : !transform.any_op
     %batch, %out_img, %out_ch, %filter, %in_ch, %depth, %strides, %dilations =
         transform.iree.match.convolution %conv,
           lhs_type = f16, rhs_type = f16, output_type = f32
@@ -7581,10 +7406,6 @@ module attributes {transform.with_named_sequence} {
     transform.iree.match.dims_equal %depth, [] : !transform.param<i64>
     transform.iree.match.dims_equal %strides, [1, 1] : !transform.param<i64>
     transform.iree.match.dims_equal %dilations, [1, 1] : !transform.param<i64>
-    %input_value = transform.get_operand %conv[0] : (!transform.any_op) -> !transform.any_value
-    %filter_value = transform.get_operand %conv[1] : (!transform.any_op) -> !transform.any_value
-    transform.iree.match.dim_bounds %input_value[3], umin = 1, umax = 3584 : !transform.any_value
-    transform.iree.match.dim_bounds %filter_value[3], umin = 1, umax = 3584 : !transform.any_value
     %ins, %outs = transform.iree.match.cast_compatible_dag_from_root %root {
       ^bb0(%input: tensor<1x?x?x?xf16>, %weights: tensor<?x?x?x?xf16>,
            %acc_init: tensor<1x?x?x?xf32>, %bias: tensor<?xf32>,
@@ -7615,6 +7436,7 @@ module attributes {transform.with_named_sequence} {
     %conv = transform.get_producer_of_operand %root[0]
         : (!transform.any_op) -> !transform.any_op
     transform.match.operation_name %conv ["linalg.conv_2d_nhwc_hwcf"] : !transform.any_op
+    transform.rocket.match.admitted %conv : !transform.any_op
     %batch, %out_img, %out_ch, %filter, %in_ch, %depth, %strides, %dilations =
         transform.iree.match.convolution %conv,
           lhs_type = f16, rhs_type = f16, output_type = f32
@@ -7627,10 +7449,6 @@ module attributes {transform.with_named_sequence} {
     transform.iree.match.dims_equal %depth, [] : !transform.param<i64>
     transform.iree.match.dims_equal %strides, [1, 1] : !transform.param<i64>
     transform.iree.match.dims_equal %dilations, [1, 1] : !transform.param<i64>
-    %input_value = transform.get_operand %conv[0] : (!transform.any_op) -> !transform.any_value
-    %filter_value = transform.get_operand %conv[1] : (!transform.any_op) -> !transform.any_value
-    transform.iree.match.dim_bounds %input_value[3], umin = 1, umax = 1152 : !transform.any_value
-    transform.iree.match.dim_bounds %filter_value[3], umin = 1, umax = 1792 : !transform.any_value
     %ins, %outs = transform.iree.match.cast_compatible_dag_from_root %root {
       ^bb0(%input: tensor<1x?x?x?xf16>, %weights: tensor<?x?x?x?xf16>,
            %acc_init: tensor<1x?x?x?xf32>, %bias: tensor<?xf32>,
@@ -7661,6 +7479,7 @@ module attributes {transform.with_named_sequence} {
     %conv = transform.get_producer_of_operand %root[0]
         : (!transform.any_op) -> !transform.any_op
     transform.match.operation_name %conv ["linalg.conv_2d_nhwc_hwcf"] : !transform.any_op
+    transform.rocket.match.admitted %conv : !transform.any_op
     %batch, %out_img, %out_ch, %filter, %in_ch, %depth, %strides, %dilations =
         transform.iree.match.convolution %conv,
           lhs_type = f16, rhs_type = f16, output_type = f32
@@ -7673,10 +7492,6 @@ module attributes {transform.with_named_sequence} {
     transform.iree.match.dims_equal %depth, [] : !transform.param<i64>
     transform.iree.match.dims_equal %strides, [1, 1] : !transform.param<i64>
     transform.iree.match.dims_equal %dilations, [1, 1] : !transform.param<i64>
-    %input_value = transform.get_operand %conv[0] : (!transform.any_op) -> !transform.any_value
-    %filter_value = transform.get_operand %conv[1] : (!transform.any_op) -> !transform.any_value
-    transform.iree.match.dim_bounds %input_value[3], umin = 1, umax = 1152 : !transform.any_value
-    transform.iree.match.dim_bounds %filter_value[3], umin = 1, umax = 1792 : !transform.any_value
     %ins, %outs = transform.iree.match.cast_compatible_dag_from_root %root {
       ^bb0(%input: tensor<1x?x?x?xf16>, %weights: tensor<?x?x?x?xf16>,
            %acc_init: tensor<1x?x?x?xf32>, %bias: tensor<?xf32>,
@@ -7707,6 +7522,7 @@ module attributes {transform.with_named_sequence} {
     %conv = transform.get_producer_of_operand %root[0]
         : (!transform.any_op) -> !transform.any_op
     transform.match.operation_name %conv ["linalg.conv_2d_nhwc_hwcf"] : !transform.any_op
+    transform.rocket.match.admitted %conv : !transform.any_op
     %batch, %out_img, %out_ch, %filter, %in_ch, %depth, %strides, %dilations =
         transform.iree.match.convolution %conv,
           lhs_type = f16, rhs_type = f16, output_type = f32
@@ -7719,10 +7535,6 @@ module attributes {transform.with_named_sequence} {
     transform.iree.match.dims_equal %depth, [] : !transform.param<i64>
     transform.iree.match.dims_equal %strides, [2, 2] : !transform.param<i64>
     transform.iree.match.dims_equal %dilations, [1, 1] : !transform.param<i64>
-    %input_value = transform.get_operand %conv[0] : (!transform.any_op) -> !transform.any_value
-    %filter_value = transform.get_operand %conv[1] : (!transform.any_op) -> !transform.any_value
-    transform.iree.match.dim_bounds %input_value[3], umin = 1, umax = 3584 : !transform.any_value
-    transform.iree.match.dim_bounds %filter_value[3], umin = 1, umax = 3584 : !transform.any_value
     %ins, %outs = transform.iree.match.cast_compatible_dag_from_root %root {
       ^bb0(%input: tensor<1x?x?x?xf16>, %weights: tensor<?x?x?x?xf16>,
            %acc_init: tensor<1x?x?x?xf32>, %bias: tensor<?xf32>,
@@ -7753,6 +7565,7 @@ module attributes {transform.with_named_sequence} {
     %conv = transform.get_producer_of_operand %root[0]
         : (!transform.any_op) -> !transform.any_op
     transform.match.operation_name %conv ["linalg.conv_2d_nhwc_hwcf"] : !transform.any_op
+    transform.rocket.match.admitted %conv : !transform.any_op
     %batch, %out_img, %out_ch, %filter, %in_ch, %depth, %strides, %dilations =
         transform.iree.match.convolution %conv,
           lhs_type = f16, rhs_type = f16, output_type = f32
@@ -7765,10 +7578,6 @@ module attributes {transform.with_named_sequence} {
     transform.iree.match.dims_equal %depth, [] : !transform.param<i64>
     transform.iree.match.dims_equal %strides, [2, 2] : !transform.param<i64>
     transform.iree.match.dims_equal %dilations, [1, 1] : !transform.param<i64>
-    %input_value = transform.get_operand %conv[0] : (!transform.any_op) -> !transform.any_value
-    %filter_value = transform.get_operand %conv[1] : (!transform.any_op) -> !transform.any_value
-    transform.iree.match.dim_bounds %input_value[3], umin = 1, umax = 3584 : !transform.any_value
-    transform.iree.match.dim_bounds %filter_value[3], umin = 1, umax = 3584 : !transform.any_value
     %ins, %outs = transform.iree.match.cast_compatible_dag_from_root %root {
       ^bb0(%input: tensor<1x?x?x?xf16>, %weights: tensor<?x?x?x?xf16>,
            %acc_init: tensor<1x?x?x?xf32>, %bias: tensor<?xf32>,
@@ -7799,6 +7608,7 @@ module attributes {transform.with_named_sequence} {
     %conv = transform.get_producer_of_operand %root[0]
         : (!transform.any_op) -> !transform.any_op
     transform.match.operation_name %conv ["linalg.conv_2d_nhwc_hwcf"] : !transform.any_op
+    transform.rocket.match.admitted %conv : !transform.any_op
     %batch, %out_img, %out_ch, %filter, %in_ch, %depth, %strides, %dilations =
         transform.iree.match.convolution %conv,
           lhs_type = f16, rhs_type = f16, output_type = f32
@@ -7811,10 +7621,6 @@ module attributes {transform.with_named_sequence} {
     transform.iree.match.dims_equal %depth, [] : !transform.param<i64>
     transform.iree.match.dims_equal %strides, [2, 2] : !transform.param<i64>
     transform.iree.match.dims_equal %dilations, [1, 1] : !transform.param<i64>
-    %input_value = transform.get_operand %conv[0] : (!transform.any_op) -> !transform.any_value
-    %filter_value = transform.get_operand %conv[1] : (!transform.any_op) -> !transform.any_value
-    transform.iree.match.dim_bounds %input_value[3], umin = 1, umax = 1152 : !transform.any_value
-    transform.iree.match.dim_bounds %filter_value[3], umin = 1, umax = 1792 : !transform.any_value
     %ins, %outs = transform.iree.match.cast_compatible_dag_from_root %root {
       ^bb0(%input: tensor<1x?x?x?xf16>, %weights: tensor<?x?x?x?xf16>,
            %acc_init: tensor<1x?x?x?xf32>, %bias: tensor<?xf32>,
@@ -7845,6 +7651,7 @@ module attributes {transform.with_named_sequence} {
     %conv = transform.get_producer_of_operand %root[0]
         : (!transform.any_op) -> !transform.any_op
     transform.match.operation_name %conv ["linalg.conv_2d_nhwc_hwcf"] : !transform.any_op
+    transform.rocket.match.admitted %conv : !transform.any_op
     %batch, %out_img, %out_ch, %filter, %in_ch, %depth, %strides, %dilations =
         transform.iree.match.convolution %conv,
           lhs_type = f16, rhs_type = f16, output_type = f32
@@ -7857,10 +7664,6 @@ module attributes {transform.with_named_sequence} {
     transform.iree.match.dims_equal %depth, [] : !transform.param<i64>
     transform.iree.match.dims_equal %strides, [2, 2] : !transform.param<i64>
     transform.iree.match.dims_equal %dilations, [1, 1] : !transform.param<i64>
-    %input_value = transform.get_operand %conv[0] : (!transform.any_op) -> !transform.any_value
-    %filter_value = transform.get_operand %conv[1] : (!transform.any_op) -> !transform.any_value
-    transform.iree.match.dim_bounds %input_value[3], umin = 1, umax = 1152 : !transform.any_value
-    transform.iree.match.dim_bounds %filter_value[3], umin = 1, umax = 1792 : !transform.any_value
     %ins, %outs = transform.iree.match.cast_compatible_dag_from_root %root {
       ^bb0(%input: tensor<1x?x?x?xf16>, %weights: tensor<?x?x?x?xf16>,
            %acc_init: tensor<1x?x?x?xf32>, %bias: tensor<?xf32>,
@@ -7891,6 +7694,7 @@ module attributes {transform.with_named_sequence} {
     %conv = transform.get_producer_of_operand %root[0]
         : (!transform.any_op) -> !transform.any_op
     transform.match.operation_name %conv ["linalg.conv_2d_nhwc_hwcf"] : !transform.any_op
+    transform.rocket.match.admitted %conv : !transform.any_op
     %batch, %out_img, %out_ch, %filter, %in_ch, %depth, %strides, %dilations =
         transform.iree.match.convolution %conv,
           lhs_type = f16, rhs_type = f16, output_type = f32
@@ -7903,10 +7707,6 @@ module attributes {transform.with_named_sequence} {
     transform.iree.match.dims_equal %depth, [] : !transform.param<i64>
     transform.iree.match.dims_equal %strides, [1, 1] : !transform.param<i64>
     transform.iree.match.dims_equal %dilations, [1, 1] : !transform.param<i64>
-    %input_value = transform.get_operand %conv[0] : (!transform.any_op) -> !transform.any_value
-    %filter_value = transform.get_operand %conv[1] : (!transform.any_op) -> !transform.any_value
-    transform.iree.match.dim_bounds %input_value[3], umin = 1, umax = 1152 : !transform.any_value
-    transform.iree.match.dim_bounds %filter_value[3], umin = 1, umax = 3584 : !transform.any_value
     %ins, %outs = transform.iree.match.cast_compatible_dag_from_root %root {
       ^bb0(%input: tensor<1x1x?x?x?xf16>, %weights: tensor<?x?x?x?xf16>,
            %acc_init: tensor<1x?x?x?xf32>, %bias: tensor<?xf32>,
@@ -7944,6 +7744,7 @@ module attributes {transform.with_named_sequence} {
     %conv = transform.get_producer_of_operand %root[0]
         : (!transform.any_op) -> !transform.any_op
     transform.match.operation_name %conv ["linalg.conv_2d_nhwc_hwcf"] : !transform.any_op
+    transform.rocket.match.admitted %conv : !transform.any_op
     %batch, %out_img, %out_ch, %filter, %in_ch, %depth, %strides, %dilations =
         transform.iree.match.convolution %conv,
           lhs_type = f16, rhs_type = f16, output_type = f32
@@ -7956,10 +7757,6 @@ module attributes {transform.with_named_sequence} {
     transform.iree.match.dims_equal %depth, [] : !transform.param<i64>
     transform.iree.match.dims_equal %strides, [1, 1] : !transform.param<i64>
     transform.iree.match.dims_equal %dilations, [1, 1] : !transform.param<i64>
-    %input_value = transform.get_operand %conv[0] : (!transform.any_op) -> !transform.any_value
-    %filter_value = transform.get_operand %conv[1] : (!transform.any_op) -> !transform.any_value
-    transform.iree.match.dim_bounds %input_value[3], umin = 1, umax = 1152 : !transform.any_value
-    transform.iree.match.dim_bounds %filter_value[3], umin = 1, umax = 3584 : !transform.any_value
     %ins, %outs = transform.iree.match.cast_compatible_dag_from_root %root {
       ^bb0(%input: tensor<1x1x?x?x?xf16>, %weights: tensor<?x?x?x?xf16>,
            %acc_init: tensor<1x?x?x?xf32>, %bias: tensor<?xf32>,
@@ -7997,6 +7794,7 @@ module attributes {transform.with_named_sequence} {
     %conv = transform.get_producer_of_operand %root[0]
         : (!transform.any_op) -> !transform.any_op
     transform.match.operation_name %conv ["linalg.conv_2d_nhwc_hwcf"] : !transform.any_op
+    transform.rocket.match.admitted %conv : !transform.any_op
     %batch, %out_img, %out_ch, %filter, %in_ch, %depth, %strides, %dilations =
         transform.iree.match.convolution %conv,
           lhs_type = f16, rhs_type = f16, output_type = f32
@@ -8009,10 +7807,6 @@ module attributes {transform.with_named_sequence} {
     transform.iree.match.dims_equal %depth, [] : !transform.param<i64>
     transform.iree.match.dims_equal %strides, [2, 2] : !transform.param<i64>
     transform.iree.match.dims_equal %dilations, [1, 1] : !transform.param<i64>
-    %input_value = transform.get_operand %conv[0] : (!transform.any_op) -> !transform.any_value
-    %filter_value = transform.get_operand %conv[1] : (!transform.any_op) -> !transform.any_value
-    transform.iree.match.dim_bounds %input_value[3], umin = 1, umax = 1152 : !transform.any_value
-    transform.iree.match.dim_bounds %filter_value[3], umin = 1, umax = 3584 : !transform.any_value
     %ins, %outs = transform.iree.match.cast_compatible_dag_from_root %root {
       ^bb0(%input: tensor<1x1x?x?x?xf16>, %weights: tensor<?x?x?x?xf16>,
            %acc_init: tensor<1x?x?x?xf32>, %bias: tensor<?xf32>,
@@ -8050,6 +7844,7 @@ module attributes {transform.with_named_sequence} {
     %conv = transform.get_producer_of_operand %root[0]
         : (!transform.any_op) -> !transform.any_op
     transform.match.operation_name %conv ["linalg.conv_2d_nhwc_hwcf"] : !transform.any_op
+    transform.rocket.match.admitted %conv : !transform.any_op
     %batch, %out_img, %out_ch, %filter, %in_ch, %depth, %strides, %dilations =
         transform.iree.match.convolution %conv,
           lhs_type = f16, rhs_type = f16, output_type = f32
@@ -8062,10 +7857,6 @@ module attributes {transform.with_named_sequence} {
     transform.iree.match.dims_equal %depth, [] : !transform.param<i64>
     transform.iree.match.dims_equal %strides, [2, 2] : !transform.param<i64>
     transform.iree.match.dims_equal %dilations, [1, 1] : !transform.param<i64>
-    %input_value = transform.get_operand %conv[0] : (!transform.any_op) -> !transform.any_value
-    %filter_value = transform.get_operand %conv[1] : (!transform.any_op) -> !transform.any_value
-    transform.iree.match.dim_bounds %input_value[3], umin = 1, umax = 1152 : !transform.any_value
-    transform.iree.match.dim_bounds %filter_value[3], umin = 1, umax = 3584 : !transform.any_value
     %ins, %outs = transform.iree.match.cast_compatible_dag_from_root %root {
       ^bb0(%input: tensor<1x1x?x?x?xf16>, %weights: tensor<?x?x?x?xf16>,
            %acc_init: tensor<1x?x?x?xf32>, %bias: tensor<?xf32>,
@@ -8107,6 +7898,7 @@ module attributes {transform.with_named_sequence} {
     %conv = transform.get_producer_of_operand %root[0]
         : (!transform.any_op) -> !transform.any_op
     transform.match.operation_name %conv ["linalg.conv_2d_nhwc_hwcf"] : !transform.any_op
+    transform.rocket.match.admitted %conv : !transform.any_op
     %batch, %out_img, %out_ch, %filter, %in_ch, %depth, %strides, %dilations =
         transform.iree.match.convolution %conv,
           lhs_type = f16, rhs_type = f16, output_type = f32
@@ -8119,10 +7911,6 @@ module attributes {transform.with_named_sequence} {
     transform.iree.match.dims_equal %depth, [] : !transform.param<i64>
     transform.iree.match.dims_equal %strides, [1, 1] : !transform.param<i64>
     transform.iree.match.dims_equal %dilations, [1, 1] : !transform.param<i64>
-    %input_value = transform.get_operand %conv[0] : (!transform.any_op) -> !transform.any_value
-    %filter_value = transform.get_operand %conv[1] : (!transform.any_op) -> !transform.any_value
-    transform.iree.match.dim_bounds %input_value[3], umin = 1, umax = 3584 : !transform.any_value
-    transform.iree.match.dim_bounds %filter_value[3], umin = 16, umax = 3584 : !transform.any_value
     %ins, %outs = transform.iree.match.cast_compatible_dag_from_root %root {
       ^bb0(%input: tensor<1x?x?x?xf16>, %weights: tensor<?x?x?x?xf16>,
            %acc_init: tensor<1x?x?x?xf32>, %bias: tensor<?xf32>,
@@ -8160,6 +7948,7 @@ module attributes {transform.with_named_sequence} {
     %conv = transform.get_producer_of_operand %root[0]
         : (!transform.any_op) -> !transform.any_op
     transform.match.operation_name %conv ["linalg.conv_2d_nhwc_hwcf"] : !transform.any_op
+    transform.rocket.match.admitted %conv : !transform.any_op
     %batch, %out_img, %out_ch, %filter, %in_ch, %depth, %strides, %dilations =
         transform.iree.match.convolution %conv,
           lhs_type = f16, rhs_type = f16, output_type = f32
@@ -8172,10 +7961,6 @@ module attributes {transform.with_named_sequence} {
     transform.iree.match.dims_equal %depth, [] : !transform.param<i64>
     transform.iree.match.dims_equal %strides, [1, 1] : !transform.param<i64>
     transform.iree.match.dims_equal %dilations, [1, 1] : !transform.param<i64>
-    %input_value = transform.get_operand %conv[0] : (!transform.any_op) -> !transform.any_value
-    %filter_value = transform.get_operand %conv[1] : (!transform.any_op) -> !transform.any_value
-    transform.iree.match.dim_bounds %input_value[3], umin = 1, umax = 3584 : !transform.any_value
-    transform.iree.match.dim_bounds %filter_value[3], umin = 16, umax = 3584 : !transform.any_value
     %ins, %outs = transform.iree.match.cast_compatible_dag_from_root %root {
       ^bb0(%input: tensor<1x?x?x?xf16>, %weights: tensor<?x?x?x?xf16>,
            %acc_init: tensor<1x?x?x?xf32>, %bias: tensor<?xf32>,
@@ -8213,6 +7998,7 @@ module attributes {transform.with_named_sequence} {
     %conv = transform.get_producer_of_operand %root[0]
         : (!transform.any_op) -> !transform.any_op
     transform.match.operation_name %conv ["linalg.conv_2d_nhwc_hwcf"] : !transform.any_op
+    transform.rocket.match.admitted %conv : !transform.any_op
     %batch, %out_img, %out_ch, %filter, %in_ch, %depth, %strides, %dilations =
         transform.iree.match.convolution %conv,
           lhs_type = f16, rhs_type = f16, output_type = f32
@@ -8226,10 +8012,6 @@ module attributes {transform.with_named_sequence} {
     transform.iree.match.dims_equal %strides, [1, 1] : !transform.param<i64>
     transform.iree.match.dims_equal %dilations, [1, 1] : !transform.param<i64>
 
-    %input_value = transform.get_operand %conv[0] : (!transform.any_op) -> !transform.any_value
-    %filter_value = transform.get_operand %conv[1] : (!transform.any_op) -> !transform.any_value
-    transform.iree.match.dim_bounds %input_value[3], umin = 1, umax = 3584 : !transform.any_value
-    transform.iree.match.dim_bounds %filter_value[3], umin = 1, umax = 3584 : !transform.any_value
 
     %ins, %outs = transform.iree.match.cast_compatible_dag_from_root %root {
       ^bb0(%input: tensor<1x?x?x?xf16>, %weights: tensor<?x?x?x?xf16>,
@@ -8277,6 +8059,7 @@ module attributes {transform.with_named_sequence} {
     %conv = transform.get_producer_of_operand %root[0]
         : (!transform.any_op) -> !transform.any_op
     transform.match.operation_name %conv ["linalg.conv_2d_nhwc_hwcf"] : !transform.any_op
+    transform.rocket.match.admitted %conv : !transform.any_op
     %batch, %out_img, %out_ch, %filter, %in_ch, %depth, %strides, %dilations =
         transform.iree.match.convolution %conv,
           lhs_type = f16, rhs_type = f16, output_type = f32
@@ -8290,10 +8073,6 @@ module attributes {transform.with_named_sequence} {
     transform.iree.match.dims_equal %strides, [1, 1] : !transform.param<i64>
     transform.iree.match.dims_equal %dilations, [1, 1] : !transform.param<i64>
 
-    %input_value = transform.get_operand %conv[0] : (!transform.any_op) -> !transform.any_value
-    %filter_value = transform.get_operand %conv[1] : (!transform.any_op) -> !transform.any_value
-    transform.iree.match.dim_bounds %input_value[3], umin = 1, umax = 1152 : !transform.any_value
-    transform.iree.match.dim_bounds %filter_value[3], umin = 1, umax = 3584 : !transform.any_value
 
     %ins, %outs = transform.iree.match.cast_compatible_dag_from_root %root {
       ^bb0(%input: tensor<1x?x?x?xf16>, %weights: tensor<?x?x?x?xf16>,
@@ -8345,6 +8124,7 @@ module attributes {transform.with_named_sequence} {
     %conv = transform.get_producer_of_operand %root[0]
         : (!transform.any_op) -> !transform.any_op
     transform.match.operation_name %conv ["linalg.depthwise_conv_2d_nchw_chw"] : !transform.any_op
+    transform.rocket.match.admitted %conv : !transform.any_op
     %batch, %out_img, %out_ch, %filter, %in_ch, %depth, %strides, %dilations =
         transform.iree.match.convolution %conv,
           lhs_type = f16, rhs_type = f16, output_type = f32
@@ -8358,11 +8138,6 @@ module attributes {transform.with_named_sequence} {
     transform.iree.match.dims_equal %strides, [1, 1] : !transform.param<i64>
     transform.iree.match.dims_equal %dilations, [1, 1] : !transform.param<i64>
 
-    // NCHW: the channel is dimension 1. Cout is always Cin for depthwise, so
-    // there is only one bound to place, and it is the fp16 depthwise
-    // matchers' own 512 rather than any dense ceiling.
-    %input_value = transform.get_operand %conv[0] : (!transform.any_op) -> !transform.any_value
-    transform.iree.match.dim_bounds %input_value[1], umin = 1, umax = 512 : !transform.any_value
 
     %ins, %outs = transform.iree.match.cast_compatible_dag_from_root %root {
       ^bb0(%input: tensor<1x?x?x?xf16>, %weights: tensor<?x?x?xf16>,
@@ -8409,6 +8184,7 @@ module attributes {transform.with_named_sequence} {
     %conv = transform.get_producer_of_operand %root[0]
         : (!transform.any_op) -> !transform.any_op
     transform.match.operation_name %conv ["linalg.depthwise_conv_2d_nchw_chw"] : !transform.any_op
+    transform.rocket.match.admitted %conv : !transform.any_op
     %batch, %out_img, %out_ch, %filter, %in_ch, %depth, %strides, %dilations =
         transform.iree.match.convolution %conv,
           lhs_type = f16, rhs_type = f16, output_type = f32
@@ -8422,11 +8198,6 @@ module attributes {transform.with_named_sequence} {
     transform.iree.match.dims_equal %strides, [2, 2] : !transform.param<i64>
     transform.iree.match.dims_equal %dilations, [1, 1] : !transform.param<i64>
 
-    // NCHW: the channel is dimension 1. Cout is always Cin for depthwise, so
-    // there is only one bound to place, and it is the fp16 depthwise
-    // matchers' own 512 rather than any dense ceiling.
-    %input_value = transform.get_operand %conv[0] : (!transform.any_op) -> !transform.any_value
-    transform.iree.match.dim_bounds %input_value[1], umin = 1, umax = 512 : !transform.any_value
 
     %ins, %outs = transform.iree.match.cast_compatible_dag_from_root %root {
       ^bb0(%input: tensor<1x?x?x?xf16>, %weights: tensor<?x?x?xf16>,
@@ -8465,6 +8236,7 @@ module attributes {transform.with_named_sequence} {
     %conv = transform.get_producer_of_operand %root[0]
         : (!transform.any_op) -> !transform.any_op
     transform.match.operation_name %conv ["linalg.conv_2d_nhwc_hwcf"] : !transform.any_op
+    transform.rocket.match.admitted %conv {precision = "int8_requant"} : !transform.any_op
     %batch, %out_img, %out_ch, %filter, %in_ch, %depth, %strides, %dilations =
         transform.iree.match.convolution %conv,
           lhs_type = i8, rhs_type = i8, output_type = i32
@@ -8478,33 +8250,6 @@ module attributes {transform.with_named_sequence} {
     transform.iree.match.dims_equal %strides, [1, 1] : !transform.param<i64>
     transform.iree.match.dims_equal %dilations, [1, 1] : !transform.param<i64>
 
-    %input_value = transform.get_operand %conv[0] : (!transform.any_op) -> !transform.any_value
-    %filter_value = transform.get_operand %conv[1] : (!transform.any_op) -> !transform.any_value
-    // 1344 is the widest Cin a measured model asks for, and it is the
-    // model that says so: MobileNetV2-static-int8 with its 7x7 Cin 1344 ->
-    // Cout 448 projection on this path is max|diff| 0.35 against the CPU
-    // arm, same argmax and top-5 (`planck`, 2026-09-08). This bound sat at
-    // 816 for two days because admitting 1344 used to move the logits to
-    // 5.01 while every isolated instrument said the shape was exact -- and
-    // it was. The fault was never this convolution: it is the only one in
-    // the model whose output feeds the next convolution with nothing on the
-    // CPU between them, and the driver packed a chained dispatch's input
-    // before the dispatch ahead of it had written it (ISSUES.md C13). The
-    // HAL sweep is exact to Cin 1792 and the compiled differential to
-    // 1344; raise this on a model, as before, not on a fixture.
-    //
-    // The accumulator path's own caps do not apply here and never did: they
-    // came from the 384-coefficient-bytes-per-output-channel limit that
-    // `int8_accumulator` has and this path does not.
-    transform.iree.match.dim_bounds %input_value[3], umin = 1, umax = 1344 : !transform.any_value
-    // Cout's lower bound is one 16-channel atom. It was 32 for two days on
-    // the strength of MobileNetV2's `112x112 Cin 48 -> Cout 24` projection,
-    // which moved the logits to max|diff| 4.71 when admitted; that
-    // convolution is the model's *other* NPU -> NPU edge with no CPU op
-    // between producer and consumer, and it failed for the reason above,
-    // not for its width (ISSUES.md C13). It is exact now, in the same
-    // model-level measurement. Below 16 is untested.
-    transform.iree.match.dim_bounds %filter_value[3], umin = 16, umax = 1792 : !transform.any_value
 
     %ins, %outs = transform.iree.match.cast_compatible_dag_from_root %root {
       ^bb0(%input: tensor<1x?x?x?xi8>, %weights: tensor<?x?x?x?xi8>,
@@ -8553,6 +8298,7 @@ module attributes {transform.with_named_sequence} {
     %conv = transform.get_producer_of_operand %root[0]
         : (!transform.any_op) -> !transform.any_op
     transform.match.operation_name %conv ["linalg.conv_2d_nhwc_hwcf"] : !transform.any_op
+    transform.rocket.match.admitted %conv {precision = "int8_requant"} : !transform.any_op
     %batch, %out_img, %out_ch, %filter, %in_ch, %depth, %strides, %dilations =
         transform.iree.match.convolution %conv,
           lhs_type = i8, rhs_type = i8, output_type = i32
@@ -8566,18 +8312,6 @@ module attributes {transform.with_named_sequence} {
     transform.iree.match.dims_equal %strides, [1, 1] : !transform.param<i64>
     transform.iree.match.dims_equal %dilations, [1, 1] : !transform.param<i64>
 
-    %input_value = transform.get_operand %conv[0] : (!transform.any_op) -> !transform.any_value
-    %filter_value = transform.get_operand %conv[1] : (!transform.any_op) -> !transform.any_value
-    // Raised 512 -> 768, gated by `requant_int8_3x3_cin768`. Lower than the
-    // 1x1 ceiling because that is where this kernel's own compiled
-    // differential stops, not because 3x3 is known to fail above it -- the
-    // HAL sweep is exact at 3x3 Cin 1024 too. MobileNetV2's 3x3 convolutions
-    // are all depthwise, so nothing in the measured models needs more.
-    transform.iree.match.dim_bounds %input_value[3], umin = 1, umax = 768 : !transform.any_value
-    // Cout's lower bound is one 16-channel atom, as on the 1x1 matcher: the
-    // "Cout 24 is wrong" measurement that put 32 here was the chained
-    // dispatch fault of ISSUES.md C13, not a width. Below 16 is untested.
-    transform.iree.match.dim_bounds %filter_value[3], umin = 16, umax = 768 : !transform.any_value
 
     %ins, %outs = transform.iree.match.cast_compatible_dag_from_root %root {
       ^bb0(%input: tensor<1x?x?x?xi8>, %weights: tensor<?x?x?x?xi8>,
@@ -8635,6 +8369,7 @@ module attributes {transform.with_named_sequence} {
     %conv = transform.get_producer_of_operand %root[0]
         : (!transform.any_op) -> !transform.any_op
     transform.match.operation_name %conv ["linalg.depthwise_conv_2d_nhwc_hwc"] : !transform.any_op
+    transform.rocket.match.admitted %conv {precision = "int8_requant"} : !transform.any_op
     %batch, %out_img, %out_ch, %filter, %in_ch, %depth, %strides, %dilations =
         transform.iree.match.convolution %conv,
           lhs_type = i8, rhs_type = i8, output_type = i32
@@ -8648,8 +8383,6 @@ module attributes {transform.with_named_sequence} {
     transform.iree.match.dims_equal %strides, [1, 1] : !transform.param<i64>
     transform.iree.match.dims_equal %dilations, [1, 1] : !transform.param<i64>
 
-    %input_value = transform.get_operand %conv[0] : (!transform.any_op) -> !transform.any_value
-    transform.iree.match.dim_bounds %input_value[3], umin = 1, umax = 1344 : !transform.any_value
 
     %ins, %outs = transform.iree.match.cast_compatible_dag_from_root %root {
       ^bb0(%input: tensor<1x?x?x?xi8>, %weights: tensor<?x?x?xi8>,
@@ -8715,6 +8448,7 @@ module attributes {transform.with_named_sequence} {
     %conv = transform.get_producer_of_operand %root[0]
         : (!transform.any_op) -> !transform.any_op
     transform.match.operation_name %conv ["linalg.depthwise_conv_2d_nhwc_hwc"] : !transform.any_op
+    transform.rocket.match.admitted %conv {precision = "int8_requant"} : !transform.any_op
     %batch, %out_img, %out_ch, %filter, %in_ch, %depth, %strides, %dilations =
         transform.iree.match.convolution %conv,
           lhs_type = i8, rhs_type = i8, output_type = i32
@@ -8728,8 +8462,6 @@ module attributes {transform.with_named_sequence} {
     transform.iree.match.dims_equal %strides, [1, 1] : !transform.param<i64>
     transform.iree.match.dims_equal %dilations, [1, 1] : !transform.param<i64>
 
-    %input_value = transform.get_operand %conv[0] : (!transform.any_op) -> !transform.any_value
-    transform.iree.match.dim_bounds %input_value[3], umin = 1, umax = 1344 : !transform.any_value
 
     %ins, %outs = transform.iree.match.cast_compatible_dag_from_root %root {
       ^bb0(%input: tensor<1x?x?x?xi8>, %weights: tensor<?x?x?xi8>,
@@ -9195,7 +8927,7 @@ module attributes {transform.with_named_sequence} {
       : (!transform.any_op) -> !transform.any_op
     // A GEMV is a matmul with one extent pinned to 1, and everything below
     // this point already handles a matmul with a unit extent -- the demotion
-    // right after, @match_rocket_matmul (whose dim_bounds start at umin = 1),
+    // right after, @match_rocket_matmul (whose admission envelope starts at 1),
     // @call_rocket_matmul and #rocket_matmul_target. So raise
     // linalg.matvec/vecmat into linalg.matmul rather than teaching each of
     // those about two more ops: the vector operand and the accumulator each
@@ -9267,6 +8999,21 @@ module attributes {transform.with_named_sequence} {
         "rocket-verify-conv-shapes" to %demoted_funcs
       : (!transform.any_op) -> !transform.any_op
 
+    // Asks the shared planner (rocket-core, through rocket-plan-ffi) what it
+    // would do with every convolution and matmul, records the answers on
+    // the function as `rocket.plan_decisions` with a remark per refusal,
+    // and tags each *refused* op `rocket.plan_refused`. Every shape-admitting
+    // matcher below carries `transform.rocket.match.admitted %root`, which
+    // declines a tagged op; the DAG matchers decline it by attribute-
+    // dictionary inequality, so they need no line. Admission is thus the
+    // matcher's own bounds AND the planner's acceptance -- the planner can
+    // only narrow (COMPILER_ROADMAP.md section 2). It has to run here,
+    // before the first claiming loop, to see every candidate, and it leaves
+    // nothing on an accepted or deferred op.
+    %planned_funcs = transform.apply_registered_pass
+        "rocket-plan-candidates" to %verified_funcs
+      : (!transform.any_op) -> !transform.any_op
+
     // Puts an fp16 convolution and the ReLU6 after it into the two-op form
     // @match_dynamic_conv2d_relu6 claims: bias lifted out of the init and
     // into the epilogue generic (which is where the hardware computes it,
@@ -9276,7 +9023,7 @@ module attributes {transform.with_named_sequence} {
     // `rocket.origin` tags that pass adds would make every convolution fail
     // the DAG match, which compares whole attribute dictionaries.
     %activated_funcs = transform.apply_registered_pass
-        "rocket-fuse-conv-relu6" to %verified_funcs
+        "rocket-fuse-conv-relu6" to %planned_funcs
       : (!transform.any_op) -> !transform.any_op
 
     // Tags every conv-family linalg op with rocket.origin/rocket.origin_kind
