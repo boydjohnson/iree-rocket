@@ -43,6 +43,78 @@ use std::{collections::BTreeSet, error::Error};
 /// gets the conservative list.
 const ELEMENTWISE_MARKER: &str = "//@ROCKET_ELEMENTWISE@";
 
+/// The marker on the batch-matmul unbatching pass, and the handle rename
+/// that has to accompany uncommenting it.
+const BATCH_MATMUL_MARKER: &str = "//@ROCKET_BATCH_MATMUL@";
+const BATCH_MATMUL_CONSUMER: &str = r#""rocket-record-conv-attrs" to %gemv_funcs"#;
+const BATCH_MATMUL_CONSUMER_ENABLED: &str = r#""rocket-record-conv-attrs" to %unbatched_funcs"#;
+
+/// Result of enabling the batch-matmul unbatching pass.
+#[derive(Debug)]
+pub struct BatchMatmulSpec {
+    pub text: String,
+    /// How many marked lines were uncommented.
+    pub enabled: usize,
+}
+
+/// Returns `spec` with `rocket-unbatch-matmul` spliced into the pass chain.
+///
+/// Two edits, not one, and both are checked. Uncommenting the marked lines
+/// defines a new handle; the pass that consumed the old one has to be
+/// repointed at it or the new pass runs on nothing and its result is
+/// discarded -- which would look exactly like "the flag works and no
+/// batch_matmul matched". The transform dialect would not complain: an
+/// unused handle is legal, so this cannot be left to the compiler to catch.
+///
+/// Fails if either edit finds nothing, for the reason
+/// [`enable_elementwise`] fails the same way: a flag that silently compiles
+/// the default pipeline is worse than one that errors.
+pub fn enable_batch_matmul(spec: &str) -> Result<BatchMatmulSpec, Box<dyn Error>> {
+    let mut enabled = 0;
+    let text = spec
+        .lines()
+        .map(
+            |line| match line.trim_start().strip_prefix(BATCH_MATMUL_MARKER) {
+                Some(rest) => {
+                    enabled += 1;
+                    rest.to_string()
+                }
+                None => line.to_string(),
+            },
+        )
+        .collect::<Vec<_>>()
+        .join("\n");
+
+    if enabled == 0 {
+        return Err(format!(
+            "--batch-matmul found no `{BATCH_MATMUL_MARKER}` lines in the transform spec, so \
+             it would compile exactly the default pass chain under a flag that claims otherwise"
+        )
+        .into());
+    }
+
+    let consumers = text.matches(BATCH_MATMUL_CONSUMER).count();
+    if consumers != 1 {
+        return Err(format!(
+            "--batch-matmul expected exactly one `{BATCH_MATMUL_CONSUMER}` to repoint at the \
+             unbatched handle, found {consumers}. Uncommenting the pass without repointing its \
+             consumer leaves it running on a handle nobody reads, which the transform dialect \
+             accepts silently."
+        )
+        .into());
+    }
+    let text = text.replace(BATCH_MATMUL_CONSUMER, BATCH_MATMUL_CONSUMER_ENABLED);
+
+    Ok(BatchMatmulSpec {
+        text: if spec.ends_with('\n') {
+            format!("{text}\n")
+        } else {
+            text
+        },
+        enabled,
+    })
+}
+
 /// Result of enabling the element-wise matchers, kept together so the caller
 /// can report what it did rather than trusting it silently -- the same
 /// reasoning as [`NeutralizedSpec`].
@@ -351,6 +423,63 @@ fn sequence_is_defeatable(spec: &str, name: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Both halves of the edit, and the check that catches the half that is
+    /// easy to forget: an uncommented pass whose consumer still reads the
+    /// old handle runs on nothing, and the transform dialect accepts that
+    /// silently because an unused handle is legal.
+    #[test]
+    fn enabling_batch_matmul_repoints_the_consumer_too() {
+        let spec = concat!(
+            "    %gemv_funcs = transform.apply_registered_pass\n",
+            "        \"rocket-expand-gemv-to-matmul\" to %x\n",
+            "//@ROCKET_BATCH_MATMUL@    %unbatched_funcs = transform.apply_registered_pass\n",
+            "//@ROCKET_BATCH_MATMUL@        \"rocket-unbatch-matmul\" to %gemv_funcs\n",
+            "    %recorded_funcs = transform.apply_registered_pass\n",
+            "        \"rocket-record-conv-attrs\" to %gemv_funcs\n",
+        );
+        let enabled = super::enable_batch_matmul(spec).expect("both edits apply");
+        assert_eq!(enabled.enabled, 2);
+        assert!(
+            enabled
+                .text
+                .contains("\"rocket-unbatch-matmul\" to %gemv_funcs")
+        );
+        assert!(
+            enabled
+                .text
+                .contains("\"rocket-record-conv-attrs\" to %unbatched_funcs"),
+            "{}",
+            enabled.text
+        );
+        assert!(!enabled.text.contains("//@ROCKET_BATCH_MATMUL@"));
+    }
+
+    #[test]
+    fn enabling_batch_matmul_refuses_a_spec_with_no_marker() {
+        let err = super::enable_batch_matmul("nothing to see")
+            .expect_err("a spec with no marked lines must fail");
+        assert!(err.to_string().contains("--batch-matmul"), "{err}");
+    }
+
+    /// The consumer check is the point of the second half, so it gets its
+    /// own case: markers present, nothing to repoint.
+    #[test]
+    fn enabling_batch_matmul_refuses_when_the_consumer_is_missing() {
+        let spec = "//@ROCKET_BATCH_MATMUL@    %unbatched_funcs = x\n";
+        let err = super::enable_batch_matmul(spec).expect_err("no consumer to repoint");
+        assert!(err.to_string().contains("found 0"), "{err}");
+    }
+
+    /// The shipped spec must carry both halves, or the flag is dead.
+    #[test]
+    fn the_checked_in_spec_can_be_batch_matmul_enabled() {
+        let path = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("../rocket-compiler-plugin/target/Rocket/rocket_conv2d_transform_spec.mlir");
+        let text = std::fs::read_to_string(&path).expect("the shipped spec");
+        let enabled = super::enable_batch_matmul(&text).expect("the shipped spec must enable");
+        assert_eq!(enabled.enabled, 3, "three marked lines");
+    }
 
     const SPEC: &str = r#"
   transform.named_sequence @match_a(%arg: !transform.any_op) {

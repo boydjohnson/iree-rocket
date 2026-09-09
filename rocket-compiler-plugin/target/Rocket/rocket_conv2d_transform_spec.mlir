@@ -8956,6 +8956,23 @@ module attributes {transform.with_named_sequence} {
         "rocket-expand-gemv-to-matmul" to %requant_fused_funcs
       : (!transform.any_op) -> !transform.any_op
 
+    // Splits a static-batch `linalg.batch_matmul` into one `linalg.matmul`
+    // per batch element, so the existing matmul path claims them -- ViT's
+    // attention core, twenty-four dispatch sites on a twelve-layer model
+    // that otherwise never reach the planner at all (ISSUES.md C15).
+    //
+    // **Off by default**, and enabled by `rocket-compiler --batch-matmul`,
+    // which uncomments the three lines below *and* repoints
+    // `rocket-record-conv-attrs` at the handle they produce. It multiplies
+    // dispatch count by the batch -- twenty-four sites become two hundred
+    // and eighty-eight on ViT-B/16 -- against a per-dispatch cost that
+    // ISSUES.md P8 measured as flat and that the ViT profile puts at 1.6 ms
+    // of `record` alone. Turn it on, measure against `--no-offload`, and let
+    // the number decide; the same contract `--elementwise` has.
+//@ROCKET_BATCH_MATMUL@    %unbatched_funcs = transform.apply_registered_pass
+//@ROCKET_BATCH_MATMUL@        "rocket-unbatch-matmul" to %gemv_funcs
+//@ROCKET_BATCH_MATMUL@      : (!transform.any_op) -> !transform.any_op
+
     // Rocket's ABI is f16-in/f32-accumulate (see call_rocket_dynamic_conv2d
     // above), but models commonly arrive as plain f32 (e.g. ONNX/torch
     // import, no fp16 casting anywhere). Demote the conv and matmul operands

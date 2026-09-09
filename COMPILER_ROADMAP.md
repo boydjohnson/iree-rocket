@@ -367,10 +367,24 @@ reject. What remains unique to section 4 is register-program equality as a
 *proven* property rather than a shared-crate argument, and a target/policy
 identity in the executable.
 
-So this stays open with a measured reason to defer it, rather than being
-built for a 1.2% saving nobody has felt. The number to re-take before
-reconsidering is `record` on a many-site model -- Qwen3 has 196 matmul sites
-against MobileNetV2's 37, and no phase table has been taken on it.
+**That number has since been re-taken, and it is much larger.** ViT-B/16
+(f32 import, 73 NPU dispatch sites) spends **117 ms of a 592 ms inference in
+`record` -- 20% of wall**, at 1.6 ms per dispatch against MobileNetV2's
+0.043 ms. Planning cost scales with dispatch count *and* with how much
+search each shape needs, and a transformer's wide matmuls need far more of
+both than a MobileNet's convolutions. So the 1.2% above is the bottom of the
+range, not the middle of it, and section 4 is worth roughly an order of
+magnitude more on the models this repository is now measuring.
+
+What that does *not* do is rescue attention offload (ISSUES.md C15): removing
+`record` entirely would still leave 83 ms of cost against 3 ms of benefit
+there. But it does change section 4's own case, and it makes the ordering
+argument concrete -- every future increase in dispatch count is taxed at
+1.6 ms until this is done.
+
+Still worth taking before building: the same table on Qwen3, which has 196
+matmul sites, to see whether `record` per dispatch is a property of the shape
+class or of the model.
 
 First preserve the current execution model: one logical Rocket dispatch owns
 multiple standalone hardware jobs. Serialize the selected static plan with the

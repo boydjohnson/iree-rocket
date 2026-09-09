@@ -135,6 +135,23 @@ any CPU dispatch whose export name says it is running a convolution or a
 matmul. It cannot see an operation IREE fused into a larger element-wise
 dispatch, so a pass means "nothing observably left on the CPU", not a proof.
 
+### `--batch-matmul`: attention on the NPU, off by default
+
+`linalg.batch_matmul` reaches no matcher -- the matmul path reads row-major
+`linalg.matmul` -- so a transformer's attention core stays on the CPU.
+`--batch-matmul` splices in `rocket-unbatch-matmul`, which splits a
+static-batch contraction into one matmul per batch element. On ViT-B/16 that
+takes the model from 73 NPU dispatch sites to 361 and leaves nothing
+contraction-shaped on the CPU but the patch-embed stem, at max|diff| 0.0074
+against an ONNX Runtime oracle.
+
+It is off because it is **1.16x slower** (592 ms -> 687 ms on `planck` at
+eight workers). Offloading the whole attention core bought 3 ms of CPU time
+and cost 125 ms of `record`, `compact`, `pack.input` and NPU time -- the CPU
+was spending almost nothing on it. ISSUES.md C15 has the phase tables. Like
+`--elementwise`, the flag exists so both arms can be measured rather than
+argued about.
+
 ### The CPU-only baseline: `--no-offload`
 
 An NPU-vs-CPU comparison needs a CPU arm built by the *same* pipeline. A

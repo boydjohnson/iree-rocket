@@ -1726,42 +1726,78 @@ converter did not corrupt the model here, the importer mishandled what it
 produced. Root cause not yet localized -- the next step is a layer-wise
 comparison to find where the two imports first diverge.
 
-## C15 (S3) — ViT's attention `batch_matmul` pairs are not a candidate form, so 24 dispatch sites never reach the planner
+## C15 (S3) — RESOLVED as *implemented and off by default*: ViT's attention offloads correctly and is 1.16x slower; the CPU was only spending 3 ms on it
 
 **[verified]** `rocket-compiler audit` on ViT-B/16 (f32 import) reports 74
-convolution/matmul candidates: 73 matmuls accepted onto the NPU and one
-refusal, the `224x224 Cin 3 Cout 768 k16x16 s16` patch-embed stem, which is
-far outside the measured kernel envelope. But the *reconciliation* -- the half
-of the section 3 report that reads final placement rather than the decision
-record -- shows 25 convolution- or matmul-shaped CPU dispatch sites, and 24 of
-them are `batch_matmul`:
+convolution/matmul candidates: 73 matmuls accepted and one refusal, the
+`224x224 Cin 3 Cout 768 k16x16 s16` patch-embed stem. But the section 3
+*reconciliation* -- the half that reads final placement rather than the
+decision record -- showed 25 contraction-shaped CPU dispatch sites, 24 of them
+`batch_matmul`: twelve layers times `Q K^T` and `attn V`, the attention core.
+They were absent from the decision record entirely, because
+`readRocketCandidate` reads row-major `linalg.matmul` and these are
+`linalg.batch_matmul` with a real head batch.
 
-```text
-  73 accepted candidate(s) -> 73 Rocket dispatch site(s) running 301 hardware job(s)
-  200 CPU dispatch site(s), 25 of them convolution- or matmul-shaped
-    - main_graph$async_dispatch_6 (12 site(s)): batch_matmul
-    - main_graph$async_dispatch_8 (12 site(s)): batch_matmul
-    - main_graph$async_dispatch_0 (1 site(s)): conv
-```
+Worth noting what found this. The decision record alone said "74 candidates,
+73 accepted" and read as near-total coverage; only reconciling it against
+final placement showed 24 contraction sites the record had never heard of.
 
-Twelve layers times two: `Q K^T` and `attn V`, the attention core. They are
-absent from the decision record entirely, because `readRocketCandidate` reads
-row-major `linalg.matmul` and these are `linalg.batch_matmul` with a real
-batch (the head dimension), which no matcher and no planner descriptor
-expresses. The spec already collapses a *unit*-batch `batch_matmul`; a
-12-head one has nowhere to go.
+**Implemented** as `rocket-unbatch-matmul` (`RocketUnbatchMatmulPass.cpp`),
+which splits a static-batch `linalg.batch_matmul` into one `linalg.matmul`
+per batch element so the existing matmul path claims them, behind
+`rocket-compiler --batch-matmul`. There is no way to give the descriptor a
+batch instead: every batch element has its own right-hand operand and a
+convolution shares one coefficient set across every pixel, so B independent
+matmuls is what the hardware can run.
 
-This is the largest remaining offload gap on a transformer, and it is a
-matcher/lowering question rather than a hardware one: each head is an
-ordinary `[197,64] x [64,197]` matmul, comfortably inside every ceiling. The
-options are a spec-side unbatching into per-head matmuls (12 dispatches per
-site, and P8's flat per-dispatch tax applies) or a descriptor that carries a
-batch. Neither has been designed.
+It works, and it is **correct**: ViT-B/16 goes 73 -> **361 NPU dispatch
+sites**, the reconciliation drops to a single contraction-shaped CPU dispatch
+(the k16x16 stem), and the logits are max|diff| **0.0074** against the ONNX
+Runtime f32 oracle with top-1 and top-5 unchanged.
 
-Worth noting what found this: the decision record alone said "74 candidates,
-73 accepted" and looked like near-total coverage. Only reconciling it against
-final placement showed 24 contraction dispatch sites the record had never
-heard of.
+**And it is 1.16x slower**, so it stays off. `planck`, 8 workers,
+`iree-benchmark-module`:
+
+| arm | sites | ms |
+|---|---:|---:|
+| NPU, attention on CPU (default) | 73 | **592** |
+| NPU, attention offloaded (`--batch-matmul`) | 361 | 687 |
+| `--batch-matmul --no-offload` (like-for-like CPU) | 0 | 3471 |
+
+**Why, from `ROCKET_PROFILE=1` on both arms** -- and this is the number that
+settles it rather than the wall time:
+
+| phase | 73 sites | 361 sites | delta |
+|---|---:|---:|---:|
+| `outside` (everything not this driver) | 208.8 | 205.8 | **-3.0** |
+| `record` | 117.0 | 158.7 | +41.7 |
+| `wait.npu` | 130.3 | 163.3 | +33.0 |
+| `compact` | 93.1 | 128.7 | +35.6 |
+| `pack.input` | 28.2 | 43.2 | +15.0 |
+
+Offloading the entire attention core bought **3 ms** of CPU time and cost 125.
+The CPU was barely spending anything on it: 24 dispatch sites, ~1.4 % of
+`outside`. A FLOP count agrees -- attention is roughly 4 % of this model's
+arithmetic, against the projections and the MLP -- but the measured share is
+lower still, because those matmuls are small and the CPU runs small
+contractions well.
+
+Two details worth keeping. `wait.npu` went *up* 33 ms: the NPU takes longer
+doing the attention matmuls than not doing them, because `[197,64] x
+[64,197]` is a poor shape for the array. And these are the only matmuls in
+the model whose *right-hand operand is an activation* -- attention multiplies
+two things the model just computed -- so their coefficient packs can never
+hit the weight cache the way a projection's do (288 fresh packs per
+inference, ~0.16 ms each, ~45 ms).
+
+**What would change the verdict.** `record` is 20 % of this model's wall at 73
+sites and grows with dispatch count; that is COMPILER_ROADMAP section 4's
+target, and section 4's status note now carries this measurement. If
+compile-time plan materialization removed `record`, this trade would be
+roughly 125 - 42 = 83 ms of cost against 3 ms of benefit -- still losing.
+The honest conclusion is that attention offload needs the *shape* to get
+better (a batched descriptor, or fusing the pair so the intermediate never
+lands), not the dispatch tax to get cheaper.
 
 ## Resolved
 
