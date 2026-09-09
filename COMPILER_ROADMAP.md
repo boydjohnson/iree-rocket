@@ -133,6 +133,75 @@ including parity padding and accumulator staging.
 
 ## 2. Call the planner during compiler selection
 
+**Status 2026-09-09: the link, the decision record, and the admission gate
+have landed.** `rocket-plan-ffi` (`include/rocket_plan.h`, ABI version 1)
+exposes `rocket_plan_conv`/`rocket_plan_matmul` over fixed-width
+descriptors with 64-bit extents, a caller-owned message buffer,
+`struct_size` checks and `catch_unwind` at the edge; the plugin's CMake
+builds it with cargo into its own target directory and links it into
+`libIREECompiler.so`. `rocket-plan-candidates` runs right after
+`rocket-verify-conv-shapes` -- before the first claiming loop, so it sees
+every candidate -- records one decision per convolution/matmul (`direct`,
+`tiled`, `cpu`, `deferred`, with the planner's status and message) in a
+`rocket.plan_decisions` attribute on the function with a location-only
+remark per refusal, and tags each *refused* op `rocket.plan_refused`.
+Every shape-admitting sequence matcher in the spec (25 of them) now carries
+`transform.rocket.match.admitted %root`, the plugin's own transform-dialect
+matcher (`RocketTransformOps.td`), which declines a tagged op; the DAG
+matchers decline it by attribute-dictionary inequality. Admission is thus
+the matchers' own bounds AND the planner's acceptance -- a strict
+narrowing, deliberately: no `dim_bounds` was removed, so nothing got
+broader and `spec::neutralize` is untouched. What it closes: a shape the
+bounds admit but the planner refuses -- a dense-layout row too wide for one
+CBUF bank, say -- used to compile to a dispatch the runtime rejected with a
+bare `INVALID_ARGUMENT`; it now falls back to the CPU
+(`rocket_plan_gate.mlir`). Parity: MobileNetV2 fp16, 53 candidates, 0
+refusals, 47 sites unchanged; ResNet50 fp16, 54 candidates, 1 refusal (the
+7x7 stride-2 stem) that the matchers already left on the CPU, 53 sites
+unchanged; the boundary corpora unchanged. `rocket-compiler compile
+--no-offload` now also verifies on the placed module that zero Rocket
+executables exist and refuses to write otherwise, which is what made the
+next step safe.
+
+**Status 2026-09-09: the `dim_bounds` are gone from the convolution and
+matmul matchers, and the ceilings they spelled are one table in
+`rocket-core`.** `admission.rs` holds `ConvAdmission`/`MatmulAdmission` and
+a `conv_ceilings` table keyed by precision rung, depthwise, kernel and
+stride, carrying the evidence comment that set each entry; `rocket-plan-ffi`
+exposes it as `rocket_admit_conv`/`rocket_admit_matmul` (ABI version 2, no
+spatial extents and no calibration numbers in the descriptor, so it answers
+on a convolution whose height and width are still symbolic);
+`transform.rocket.match.admitted` gained an optional `precision` attribute
+and now asks *both* questions -- the planner's refusal tag and the admission
+envelope -- so every convolution and matmul matcher carries exactly one
+shape predicate and no numbers. `RocketPlanQuery.{h,cpp}` is the one linalg
+reader the pass and the matcher share, so the two cannot disagree about
+which operand is the filter.
+
+Three things this closed. The `precision` attribute makes the two int8
+lowerings ask different questions from the same IR: a requantized
+convolution and an accumulator one are both `i8 x i8 -> i32`, and the
+matcher now says which rung it is claiming for. A dynamic channel count is
+declined with a message instead of `dim_bounds`' silent
+`computeConstantBound` failure (DYNAMIC_SHAPES.md DS1). And the per-matcher
+drift is gone: the old table admitted a stride-2 1x1 convolution to `Cin`
+3584 when a ReLU followed it and to 512 when nothing did, and the epilogue
+a matcher fuses -- bias on the BS plane, activation on the BN plane -- is
+downstream of the MAC array and does not touch the channel path, so each
+class now takes the largest value of its row.
+
+`spec::neutralize` moved with them: `--no-offload` adds a `no_offload`
+attribute to each `transform.rocket.match.admitted` and still rewrites the
+`dim_bounds` the pooling and element-wise matchers keep, and it refuses a
+spec whose loop contains a matcher carrying neither. Parity: MobileNetV2
+fp16 47 sites (53 candidates, 0 refusals), ResNet50 fp16 53 sites (54
+candidates, 1 refusal -- the 7x7 stride-2 stem the matchers already left on
+the CPU), VGG19 21 sites, `--no-offload` 0 sites with and without
+`--elementwise`; all unchanged, so no measured model sits in a widened
+corner.
+
+Still open here: the strict-offload option and the dynamic-shape policy.
+
 Expose core through a small versioned C ABI adapter, built as a host Rust static
 library and linked into the C++ plugin through its CMake build. Use fixed-width
 descriptors and explicit status/result ownership. Never expose Rust Strings,

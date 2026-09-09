@@ -27,6 +27,15 @@
 // The 3x3 matcher stops at Cin 1152 and did not move: at k=3 the coefficient
 // working set binds first and `ConvPlan` refuses Cin >= 1216 outright, so the
 // channel ceiling is not what governs there.
+//
+// Since 2026-09-09 these ceilings are not in the spec at all. They are one
+// table in `rocket-core`'s `admission` module, reached from each matcher's
+// `transform.rocket.match.admitted` line, and moving them there collapsed
+// the per-matcher drift the old `dim_bounds` had accumulated: the stride-2
+// and stride-1 rows of a given kernel now share an envelope, because the
+// epilogue a matcher fuses (bias on the BS plane, activation on the BN
+// plane) sits downstream of the MAC array and does not touch the channel
+// path. The cases below the depthwise ones are the corners that moved.
 
 // CHECK-LABEL: util.func public @dense_1x1_cin_3584_matched
 // CHECK-NOT: linalg.conv_2d_nhwc_hwcf
@@ -111,3 +120,122 @@ func.func @dense_3x3_cin_1153_falls_back(
       outs(%init : tensor<1x?x?x64xf32>) -> tensor<1x?x?x64xf32>
   return %result : tensor<1x?x?x64xf32>
 }
+
+// -----------------------------------------------------------------------
+// The consolidated rows. Each of these was admitted to a *different*
+// ceiling before the table moved, purely by which matcher happened to claim
+// it, and each pair here is one channel apart across the new one.
+
+// A plain stride-2 1x1 with nothing fused after it. This was bounded at Cin
+// 512 while the same convolution with a ReLU after it was bounded at 3584.
+// CHECK-LABEL: util.func public @dense_1x1_s2_cin_3584_matched
+// CHECK-NOT: linalg.conv_2d_nhwc_hwcf
+// CHECK: flow.dispatch @rocket_dynamic_executable_s2
+func.func @dense_1x1_s2_cin_3584_matched(
+    %input: tensor<1x?x?x3584xf16>,
+    %filter: tensor<1x1x3584x64xf16>,
+    %init: tensor<1x?x?x64xf32>) -> tensor<1x?x?x64xf32> {
+  %result = linalg.conv_2d_nhwc_hwcf
+      {dilations = dense<1> : vector<2xi64>, strides = dense<2> : vector<2xi64>}
+      ins(%input, %filter : tensor<1x?x?x3584xf16>, tensor<1x1x3584x64xf16>)
+      outs(%init : tensor<1x?x?x64xf32>) -> tensor<1x?x?x64xf32>
+  return %result : tensor<1x?x?x64xf32>
+}
+
+// CHECK-LABEL: util.func public @dense_1x1_s2_cin_3585_falls_back
+// CHECK-NOT: flow.dispatch @rocket_dynamic_executable
+// CHECK: linalg.conv_2d_nhwc_hwcf
+func.func @dense_1x1_s2_cin_3585_falls_back(
+    %input: tensor<1x?x?x3585xf16>,
+    %filter: tensor<1x1x3585x64xf16>,
+    %init: tensor<1x?x?x64xf32>) -> tensor<1x?x?x64xf32> {
+  %result = linalg.conv_2d_nhwc_hwcf
+      {dilations = dense<1> : vector<2xi64>, strides = dense<2> : vector<2xi64>}
+      ins(%input, %filter : tensor<1x?x?x3585xf16>, tensor<1x1x3585x64xf16>)
+      outs(%init : tensor<1x?x?x64xf32>) -> tensor<1x?x?x64xf32>
+  return %result : tensor<1x?x?x64xf32>
+}
+
+// 3x3 `Cout`, which the padded matchers already admitted to the dense
+// ceiling while the unpadded ones stopped at 1792. `Cout` charges no
+// feature residency, so the kernel does not bound it.
+// CHECK-LABEL: util.func public @dense_3x3_cout_3584_matched
+// CHECK-NOT: linalg.conv_2d_nhwc_hwcf
+// CHECK: flow.dispatch @rocket_dynamic_executable
+func.func @dense_3x3_cout_3584_matched(
+    %input: tensor<1x?x?x64xf16>,
+    %filter: tensor<3x3x64x3584xf16>,
+    %init: tensor<1x?x?x3584xf32>) -> tensor<1x?x?x3584xf32> {
+  %result = linalg.conv_2d_nhwc_hwcf
+      {dilations = dense<1> : vector<2xi64>, strides = dense<1> : vector<2xi64>}
+      ins(%input, %filter : tensor<1x?x?x64xf16>, tensor<3x3x64x3584xf16>)
+      outs(%init : tensor<1x?x?x3584xf32>) -> tensor<1x?x?x3584xf32>
+  return %result : tensor<1x?x?x3584xf32>
+}
+
+// CHECK-LABEL: util.func public @dense_3x3_cout_3585_falls_back
+// CHECK-NOT: flow.dispatch @rocket_dynamic_executable
+// CHECK: linalg.conv_2d_nhwc_hwcf
+func.func @dense_3x3_cout_3585_falls_back(
+    %input: tensor<1x?x?x64xf16>,
+    %filter: tensor<3x3x64x3585xf16>,
+    %init: tensor<1x?x?x3585xf32>) -> tensor<1x?x?x3585xf32> {
+  %result = linalg.conv_2d_nhwc_hwcf
+      {dilations = dense<1> : vector<2xi64>, strides = dense<1> : vector<2xi64>}
+      ins(%input, %filter : tensor<1x?x?x64xf16>, tensor<3x3x64x3585xf16>)
+      outs(%init : tensor<1x?x?x3585xf32>) -> tensor<1x?x?x3585xf32>
+  return %result : tensor<1x?x?x3585xf32>
+}
+
+// 3x3 at stride 2, which the plain matcher bounded at Cin 512 and the
+// ReLU-fused one at 1152. The 1152 is `ConvPlan`'s own coefficient limit,
+// so it is the number that means something.
+// CHECK-LABEL: util.func public @dense_3x3_s2_cin_1152_matched
+// CHECK-NOT: linalg.conv_2d_nhwc_hwcf
+// CHECK: flow.dispatch @rocket_dynamic_executable_s2
+func.func @dense_3x3_s2_cin_1152_matched(
+    %input: tensor<1x?x?x1152xf16>,
+    %filter: tensor<3x3x1152x64xf16>,
+    %init: tensor<1x?x?x64xf32>) -> tensor<1x?x?x64xf32> {
+  %result = linalg.conv_2d_nhwc_hwcf
+      {dilations = dense<1> : vector<2xi64>, strides = dense<2> : vector<2xi64>}
+      ins(%input, %filter : tensor<1x?x?x1152xf16>, tensor<3x3x1152x64xf16>)
+      outs(%init : tensor<1x?x?x64xf32>) -> tensor<1x?x?x64xf32>
+  return %result : tensor<1x?x?x64xf32>
+}
+
+// CHECK-LABEL: util.func public @dense_3x3_s2_cin_1153_falls_back
+// CHECK-NOT: flow.dispatch @rocket_dynamic_executable
+// CHECK: linalg.conv_2d_nhwc_hwcf
+func.func @dense_3x3_s2_cin_1153_falls_back(
+    %input: tensor<1x?x?x1153xf16>,
+    %filter: tensor<3x3x1153x64xf16>,
+    %init: tensor<1x?x?x64xf32>) -> tensor<1x?x?x64xf32> {
+  %result = linalg.conv_2d_nhwc_hwcf
+      {dilations = dense<1> : vector<2xi64>, strides = dense<2> : vector<2xi64>}
+      ins(%input, %filter : tensor<1x?x?x1153xf16>, tensor<3x3x1153x64xf16>)
+      outs(%init : tensor<1x?x?x64xf32>) -> tensor<1x?x?x64xf32>
+  return %result : tensor<1x?x?x64xf32>
+}
+
+// Stride 3 keeps the 512 the s3/s4 matchers always had, and the
+// consolidation deliberately stops before it: no sweep has been taken at a
+// stride above 2. It is not observable here, because those two matchers are
+// defined in the spec but no `foreach_match` list invokes them, so a
+// stride-3 convolution reaches the CPU either way -- which is what this
+// pair pins. Admitting one is a two-part change: the envelope entry *and*
+// the loop entry.
+// CHECK-LABEL: util.func public @dense_1x1_s3_falls_back
+// CHECK-NOT: flow.dispatch @rocket_dynamic_executable
+// CHECK: linalg.conv_2d_nhwc_hwcf
+func.func @dense_1x1_s3_falls_back(
+    %input: tensor<1x?x?x512xf16>,
+    %filter: tensor<1x1x512x64xf16>,
+    %init: tensor<1x?x?x64xf32>) -> tensor<1x?x?x64xf32> {
+  %result = linalg.conv_2d_nhwc_hwcf
+      {dilations = dense<1> : vector<2xi64>, strides = dense<3> : vector<2xi64>}
+      ins(%input, %filter : tensor<1x?x?x512xf16>, tensor<1x1x512x64xf16>)
+      outs(%init : tensor<1x?x?x64xf32>) -> tensor<1x?x?x64xf32>
+  return %result : tensor<1x?x?x64xf32>
+}
+

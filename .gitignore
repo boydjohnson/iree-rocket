@@ -9,8 +9,10 @@
 /iree-build/build/
 /iree-build/host/build/
 /iree-build/host-aarch64/build/
+/iree-build/host/build-aarch64/
 
 # lit test run artifacts
 .lit_test_times.txt
 /rocket-compiler-plugin/test/Output/
+/rocket-compiler-plugin/test/Testing/
 __pycache__/

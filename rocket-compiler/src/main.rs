@@ -304,6 +304,46 @@ fn pin_unclaimed_dispatches(invocation: &Invocation) -> Result<(), Box<dyn Error
     Ok(())
 }
 
+/// The `--no-offload` baseline's last line of defence: after placement is
+/// pinned, refuse to emit a module with a single Rocket executable in it.
+///
+/// `spec::neutralize` defeats each matcher through whichever predicate it
+/// carries -- `no_offload` on `transform.rocket.match.admitted` for the
+/// convolution and matmul matchers, a rewritten `dim_bounds` for the pooling
+/// and element-wise ones -- and refuses a matcher carrying neither. That
+/// check is on the spec text; this one is on the module, and it is the
+/// property the baseline actually needs. A "CPU-only" arm that quietly
+/// offloads is exactly the error ISSUES.md M4 exists to prevent, and it must
+/// fail loudly here rather than skew a measurement.
+fn assert_nothing_offloaded(
+    library: &Library,
+    invocation: &Invocation,
+) -> Result<(), Box<dyn Error>> {
+    invocation.set_compile_to_phase("executable-targets");
+    invocation.run_pipeline(Pipeline::Std)?;
+    invocation.run_pass_pipeline("rocket-annotate-final-placement")?;
+    let output = Output::open_membuffer(library)?;
+    invocation.output_ir(&output)?;
+    let ir_bytes = output.map_memory()?;
+    let report = report::PlacementReport::scan(&String::from_utf8_lossy(ir_bytes));
+    if !report.rocket_executables.is_empty() {
+        let names: Vec<&str> = report
+            .rocket_executables
+            .iter()
+            .map(|executable| executable.name.as_str())
+            .collect();
+        return Err(format!(
+            "--no-offload produced {} Rocket executable(s) ({}); the neutralized spec did not \
+             defeat every matcher, so this is not a CPU-only baseline. Refusing to write it.",
+            names.len(),
+            names.join(", "),
+        )
+        .into());
+    }
+    invocation.set_compile_from_phase("executable-targets");
+    Ok(())
+}
+
 fn run_compile(args: &cli::CompileArgs) -> Result<(), Box<dyn Error>> {
     let lib_path = resolve_lib_path(args.common.iree_compiler_lib.as_deref())?;
     let transform_spec = resolve_transform_spec(&args.common)?;
@@ -318,6 +358,9 @@ fn run_compile(args: &cli::CompileArgs) -> Result<(), Box<dyn Error>> {
     invocation.enable_console_diagnostics();
     invocation.parse_source(&source)?;
     pin_unclaimed_dispatches(&invocation)?;
+    if args.common.no_offload {
+        assert_nothing_offloaded(&library, &invocation)?;
+    }
     invocation.set_compile_to_phase("end");
     invocation.run_pipeline(Pipeline::Std)?;
 

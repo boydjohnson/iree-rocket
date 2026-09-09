@@ -8,6 +8,7 @@
 //! relocation, register programs, buffer allocation and submission stay in
 //! `iree-rocket-hal`, which consumes the plans made here.
 
+pub mod admission;
 pub mod conv;
 pub mod error;
 pub mod fc;

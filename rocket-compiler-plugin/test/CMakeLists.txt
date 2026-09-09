@@ -27,6 +27,8 @@ iree_lit_test_suite(
     "rocket_matmul.mlir"
     "rocket_matmul_invalid.mlir"
     "rocket_matmul_match_boundaries.mlir"
+    "rocket_plan_candidates.mlir"
+    "rocket_plan_gate.mlir"
     "rocket_pooling.mlir"
     "rocket_pooling_dynamic.mlir"
     "rocket_pooling_dynamic_output_invalid.mlir"
