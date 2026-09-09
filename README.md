@@ -365,6 +365,20 @@ model leaves only batch symbolic -- ViT-B/16 leaves all four input dims that
 way, so its channel count and spatial extents need pinning too, or the
 patch-embed convolution is still symbolic after the batch is fixed.
 
+`tools/import_onnx.py` also handles ONNX Runtime *optimized* exports -- the
+`com.microsoft` contrib ops (`GroupQueryAttention`, `RotaryEmbedding`,
+`SimplifiedLayerNormalization`, `SkipSimplifiedLayerNormalization`) that
+`onnx-community/Qwen3-0.6B-ONNX` and models like it publish, often with no
+plain-op variant. torch-mlir supports all four, but five rewrites are needed
+around them and the script applies them when it sees such a node: pin
+`value_info` rather than clearing it (the opposite of the plain path, because
+`infer_shapes` cannot type a fused op), drop trailing empty optional node
+inputs, split `SkipSimplifiedLayerNormalization`, route rank-3
+`RotaryEmbedding` through the rank-4 entry point (torch-mlir's rank-3 path
+reshapes where it must transpose, and the logits come out uncorrelated), and
+pass `--large-model` so `onnx.checker` is skipped. Each is documented in the
+script with the evidence behind it.
+
 Build an ONNX Runtime oracle *before* importing. Without a reference from the
 model's own runtime, a later difference cannot be attributed to the NPU rather
 than to the import -- and at least one shipped model is mis-imported today

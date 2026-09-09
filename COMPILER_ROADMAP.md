@@ -382,9 +382,43 @@ there. But it does change section 4's own case, and it makes the ordering
 argument concrete -- every future increase in dispatch count is taxed at
 1.6 ms until this is done.
 
-Still worth taking before building: the same table on Qwen3, which has 196
-matmul sites, to see whether `record` per dispatch is a property of the shape
-class or of the model.
+**Qwen3-0.6B answers that, and it complicates the picture** rather than
+confirming it. Three models, `ROCKET_PROFILE=1` on `planck`, `record` being
+the phase `ConvPlan::new` runs in:
+
+| model | NPU sites | record ms | ms/dispatch | wall ms | record % | `outside` % |
+|---|---:|---:|---:|---:|---:|---:|
+| MobileNetV2 fp16 | 37 | 1.6 | 0.043 | 136.7 | 1.2% | 58% |
+| ViT-B/16 f32 | 73 | 117.0 | 1.603 | 592 | **19.8%** | 35% |
+| Qwen3-0.6B f32 (prefill 128) | 196 | 449.8 | 2.295 | 24080 | 1.9% | **96%** |
+
+Two separate things, and conflating them is what made the ViT number look
+decisive:
+
+- **Cost per dispatch is a property of the shape class**, and it scales
+  cleanly: 0.043 ms for a MobileNet convolution, 1.6 ms for a ViT projection,
+  2.3 ms for a Qwen3 one. Wider matmuls give the CBUF partition search more
+  to do. So section 4 removes more work per dispatch the bigger the
+  operations are.
+- **Share of wall is a property of the model**, and it does not track
+  dispatch count at all. Qwen3 has 2.7x ViT's dispatches and a *tenth* of the
+  relative planning cost, because 96% of its wall is `outside` -- CPU work
+  this backend never touches. Its `npu share` is 1.3%.
+
+So the honest statement of section 4's value is: it is worth roughly a fifth
+of a model whose NPU half is the bottleneck, and roughly nothing on a model
+bottlenecked elsewhere. Qwen3 is bottlenecked elsewhere for a reason worth
+naming -- its single refused candidate is the LM head,
+`128x1024 x 1024x151936`, whose `N` is 37x the channel ceiling and which
+therefore runs on the CPU. Offloading that would cut `outside` sharply and
+raise `record`'s share with it, so the two items are coupled: section 4 gets
+more valuable exactly as section 5's N-splitting (or a very large ceiling
+raise) succeeds.
+
+Nothing here changes the conclusion that section 4 is not the first thing to
+build. It does change the reason: not "the saving is 1.2%" but "the saving is
+between 2% and 20% depending on where the model's time actually goes, and the
+cheapest way to raise it is to offload more of the model first".
 
 First preserve the current execution model: one logical Rocket dispatch owns
 multiple standalone hardware jobs. Serialize the selected static plan with the
