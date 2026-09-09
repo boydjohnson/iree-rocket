@@ -165,13 +165,25 @@ pub fn conv_ceilings(
     // from the matcher comments in `rocket_conv2d_transform_spec.mlir`,
     // where they sat next to the `dim_bounds` lines this table replaced.
     match (class, depthwise, kernel) {
-        // **fp16 depthwise**, 512 at every kernel and stride. This is where
-        // the depthwise matchers have stood since they were written: well
-        // below [`conv::MAX_DEPTHWISE_CHANNELS`] (1792) and below what
-        // `conv_depthwise_two_byte_exact_hw` reaches. Raising it is the open
-        // lever -- fp16 depthwise is the one path whose compiler ceiling is
-        // far under the planner's.
-        (PrecisionClass::Fp16, true, 1 | 3) => ceilings(512, 512),
+        // **fp16 depthwise**, raised 512 -> 1536 on 2026-09-09.
+        //
+        // 512 was where the fp16 depthwise matchers had stood since they
+        // were written, and nothing had gone back to it: the int8 depthwise
+        // rung went to 1344 in September, [`conv::MAX_DEPTHWISE_CHANNELS`]
+        // is 1792, and `ConvPlan` plans fp16 depthwise cleanly to that
+        // ceiling. It bit: MobileNetV2's own fp16 depthwise convolutions at
+        // C=576 (14x14 and 7x7) and C=960 (7x7) sat *above* it, so six
+        // dispatch sites in a model this repo measures every week were on
+        // the CPU for want of a number.
+        //
+        // 1536, not 1792, because 1536 is what the compiled end-to-end gate
+        // proves. `tools/e2e_conv_regression.py` compiles a Rocket and a CPU
+        // module from the same MLIR and compares them on `planck`, and its
+        // `depthwise_fp16_c576`, `_c960`, `_c1536` and `_c1536_s2` cases
+        // cover the two model widths, the ceiling itself and a strided
+        // multi-tile plan at it. Raise it the way every other limit here
+        // moves: measure the next rung first.
+        (PrecisionClass::Fp16, true, 1 | 3) => ceilings(1536, 1536),
         // **fp16 dense 1x1**, both channel axes at the dense ceilings.
         //
         // `Cin`: [`conv::MAX_INPUT_CHANNELS`], 512 -> 1344 (2026-09-03) on
@@ -519,8 +531,23 @@ mod tests {
 
     #[test]
     fn depthwise_has_its_own_ceilings_per_precision() {
-        assert!(admit_conv(&conv(Precision::Fp16, true, 3, 1, 512, 512)).is_ok());
-        assert!(admit_conv(&conv(Precision::Fp16, true, 3, 1, 513, 513)).is_err());
+        // MobileNetV2's two widest fp16 depthwise convolutions, which sat
+        // above the old 512 and were on the CPU because of it.
+        assert!(admit_conv(&conv(Precision::Fp16, true, 3, 1, 576, 576)).is_ok());
+        assert!(admit_conv(&conv(Precision::Fp16, true, 3, 1, 960, 960)).is_ok());
+        assert!(admit_conv(&conv(Precision::Fp16, true, 3, 1, 1536, 1536)).is_ok());
+        assert!(admit_conv(&conv(Precision::Fp16, true, 3, 1, 1537, 1537)).is_err());
+        // Still under the planner's own depthwise ceiling, deliberately:
+        // 1536 is what the compiled gate measures, 1792 is what `ConvPlan`
+        // would program.
+        assert!(
+            u64::from(conv::MAX_DEPTHWISE_CHANNELS)
+                > u64::from(
+                    conv_ceilings(Precision::Fp16, true, 3, 1)
+                        .unwrap()
+                        .in_channels
+                )
+        );
         assert!(admit_conv(&conv(int8(false), true, 3, 2, 1344, 1344)).is_ok());
         assert!(admit_conv(&conv(int8(true), true, 1, 1, 1344, 1344)).is_ok());
         assert!(admit_conv(&conv(int8(true), true, 1, 1, 1345, 1345)).is_err());

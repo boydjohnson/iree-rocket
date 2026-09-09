@@ -658,6 +658,44 @@ at f32. They stay on the CPU for one reason —
 depthwise never becomes the f16/f16/f32 the matchers require and no depthwise
 matcher can ever fire.
 
+### The fp16 depthwise channel ceiling moved 512 -> 1536 (2026-09-09), and this verdict did not
+
+Separate from the demote gate above, and worth keeping apart from it. The
+*already-f16* MobileNetV2 import needs no demotion, so its depthwise
+convolutions reach the matchers directly -- and six of the seventeen were
+still on the CPU, because the fp16 depthwise admission ceiling was 512 while
+the model's own widest are C=576 and C=960. That 512 was where the depthwise
+matchers were first written and nothing had gone back to it: `ConvPlan`
+plans fp16 depthwise to `MAX_DEPTHWISE_CHANNELS` (1792), and the int8
+depthwise rung had already moved to 1344.
+
+Raised to 1536 in `rocket-core`'s `admission` table, backed end to end:
+`tools/e2e_conv_regression.py` gained `depthwise_fp16_c576`, `_c960`,
+`_c1536` and `_c1536_s2` (the last NCHW, the only layout the stride-2 fp16
+depthwise matcher exists in), each compiled to a Rocket and a CPU module from
+the same MLIR and compared on `planck`: max|error| 1.6e-4 to 2.4e-4, 0
+mismatches, at atol 1e-3.
+
+MobileNetV2 fp16 goes 47 -> 53 dispatch sites, all 17 depthwise convolutions
+now offloaded, max|diff| 0.0156 against its own `--no-offload` arm with top-1
+and top-5 unchanged. The wall time says the same thing this section already
+said, on `planck` at 600 MHz, `performance` governor, medians of three:
+
+| arm | sites | 4 A76 workers | all 8 cores |
+|---|---|---|---|
+| NPU, depthwise <= 512 | 47 | 58.9 ms | 77.5 ms |
+| NPU, depthwise <= 1536 | 53 | 63.5 ms | 77.3 ms |
+| `--no-offload` | 0 | **47.0 ms** | 81.4 ms |
+
+The six extra sites cost 4.6 ms at four workers and nothing at eight. A
+depthwise convolution here is still the cheapest op in the model and still
+does not pay for its own dispatch, which is what the rest of this section is
+about; the raise changes what is *admissible*, not that verdict. It is kept
+because admission is a statement about what has been measured, and because a
+model whose depthwise convolutions are not this cheap -- a wide MobileNetV3
+or EfficientNet stage -- can now reach the NPU at all. Nothing in that class
+has been measured here.
+
 ### The recorded reason for that exclusion does not apply to this model
 
 The pass's scope comment, and `depthwise-f16-demote-breaks-model`, say
