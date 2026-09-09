@@ -352,6 +352,74 @@ requested conv/matmul candidates fail compilation instead of falling back.
 
 ## 4. Materialize existing tile plans at compile time
 
+**Status 2026-09-09: not started, and deliberately so.** Section 3's report
+made the cost of what this section removes measurable, and it is small.
+Runtime planning happens inside `Phase::Record` (`ConvPlan::new` at
+`command_buffer.rs`), which `ROCKET_PROFILE=1` puts at **1.6 ms of a 136.7 ms**
+MobileNetV2 fp16 inference -- 1.2% of wall, and tile search is only a
+fraction of that phase. Against `outside` at 79.6 ms and `compact` +
+`pack.input` at 24.4 ms, serializing the plan is not where the time is.
+
+Two of the three things this section was also going to buy have since been
+delivered by section 2: the compiler already asks the same planner the
+runtime asks, and already refuses at compile time what the runtime would
+reject. What remains unique to section 4 is register-program equality as a
+*proven* property rather than a shared-crate argument, and a target/policy
+identity in the executable.
+
+**That number has since been re-taken, and it is much larger.** ViT-B/16
+(f32 import, 73 NPU dispatch sites) spends **117 ms of a 592 ms inference in
+`record` -- 20% of wall**, at 1.6 ms per dispatch against MobileNetV2's
+0.043 ms. Planning cost scales with dispatch count *and* with how much
+search each shape needs, and a transformer's wide matmuls need far more of
+both than a MobileNet's convolutions. So the 1.2% above is the bottom of the
+range, not the middle of it, and section 4 is worth roughly an order of
+magnitude more on the models this repository is now measuring.
+
+What that does *not* do is rescue attention offload (ISSUES.md C15): removing
+`record` entirely would still leave 83 ms of cost against 3 ms of benefit
+there. But it does change section 4's own case, and it makes the ordering
+argument concrete -- every future increase in dispatch count is taxed at
+1.6 ms until this is done.
+
+**Qwen3-0.6B answers that, and it complicates the picture** rather than
+confirming it. Three models, `ROCKET_PROFILE=1` on `planck`, `record` being
+the phase `ConvPlan::new` runs in:
+
+| model | NPU sites | record ms | ms/dispatch | wall ms | record % | `outside` % |
+|---|---:|---:|---:|---:|---:|---:|
+| MobileNetV2 fp16 | 37 | 1.6 | 0.043 | 136.7 | 1.2% | 58% |
+| ViT-B/16 f32 | 73 | 117.0 | 1.603 | 592 | **19.8%** | 35% |
+| Qwen3-0.6B f32 (prefill 128) | 196 | 449.8 | 2.295 | 24080 | 1.9% | **96%** |
+
+Two separate things, and conflating them is what made the ViT number look
+decisive:
+
+- **Cost per dispatch is a property of the shape class**, and it scales
+  cleanly: 0.043 ms for a MobileNet convolution, 1.6 ms for a ViT projection,
+  2.3 ms for a Qwen3 one. Wider matmuls give the CBUF partition search more
+  to do. So section 4 removes more work per dispatch the bigger the
+  operations are.
+- **Share of wall is a property of the model**, and it does not track
+  dispatch count at all. Qwen3 has 2.7x ViT's dispatches and a *tenth* of the
+  relative planning cost, because 96% of its wall is `outside` -- CPU work
+  this backend never touches. Its `npu share` is 1.3%.
+
+So the honest statement of section 4's value is: it is worth roughly a fifth
+of a model whose NPU half is the bottleneck, and roughly nothing on a model
+bottlenecked elsewhere. Qwen3 is bottlenecked elsewhere for a reason worth
+naming -- its single refused candidate is the LM head,
+`128x1024 x 1024x151936`, whose `N` is 37x the channel ceiling and which
+therefore runs on the CPU. Offloading that would cut `outside` sharply and
+raise `record`'s share with it, so the two items are coupled: section 4 gets
+more valuable exactly as section 5's N-splitting (or a very large ceiling
+raise) succeeds.
+
+Nothing here changes the conclusion that section 4 is not the first thing to
+build. It does change the reason: not "the saving is 1.2%" but "the saving is
+between 2% and 20% depending on where the model's time actually goes, and the
+cheapest way to raise it is to offload more of the model first".
+
 First preserve the current execution model: one logical Rocket dispatch owns
 multiple standalone hardware jobs. Serialize the selected static plan with the
 executable rather than immediately introducing an MLIR dispatch per tile.
@@ -378,6 +446,60 @@ execution retains explicit validation. Measure executable size and compiler
 time as well as runtime planning savings.
 
 ## 5. Tile operations beyond today's logical-shape limits
+
+**Status 2026-09-09: the premise was wrong, and the coverage it was for was
+delivered another way.** This section assumes operations exist that the
+hardware cannot execute in one dispatch and that decomposition is what
+reaches them. Swept with the capture-backing ceilings lifted
+(`rocket-core/examples/find_structural_limits.rs`), the planner already
+plans every shape steps 1 and 2 were written for:
+
+| axis | planner |
+|---|---|
+| conv `Cout` to 131072 | ok, 1 tile |
+| matmul `N` to 65536 | ok, 3 tiles |
+| matmul `M` to 65536 | ok, 737 tiles -- `ConvPlan` *already* splits `M` |
+| conv `Cin` / matmul `K` | ok to 8192; refuses at 16384 |
+
+Not one refusal in that sweep is structural; even the `Cin` 16384 one is a
+CBUF *grant* message, not a register field. Every limit that kept these
+shapes on the CPU was an `admission.rs` ceiling -- `UnvalidatedConfiguration`,
+the class section 3's report prints as "register-representable, not
+measured". Step 1's spatial-conv half had no failing case at all: a
+1024x1024 image plans into 341 hardware jobs today, and 4096 wide and 8192
+tall both plan.
+
+**What was done instead**: the ceilings were measured and raised, which is
+this repository's standing recipe for exactly this situation. Dense `Cin` and
+`Cout` 3584 -> 4096 at every precision rung, and matmul `M` 2047 -> 4096.
+LIMITS.md carries the ladders, the `onehot`-read-map reasoning behind the `M`
+sweep, and the compiled gates (`matmul_m_4096`, `matmul_k_n_4096`,
+`dense_fp16_cout4096`). Zero lines of new compiler code, and the work stays
+one dispatch with one pack and one compact -- where MLIR-level slicing would
+have paid the 19%-of-wall per-dispatch tax once per slice.
+
+**What is still genuinely this section's**, and what it now means:
+
+1. **Decomposition as an alternative to measurement.** Slicing an oversized
+   operation into slices that each sit inside an *already-gated* class buys
+   coverage with no new hardware campaign. That is a real motivation and the
+   one thing raising a ceiling cannot offer -- but it is a trade against the
+   per-dispatch cost, not a way to reach the unreachable, and it should be
+   written up as such rather than as "beyond today's limits".
+2. **`K`/reduction splitting** (step 3 below) is untouched and remains the
+   only axis where a real wall exists at a reachable extent: the CBUF grant
+   at `Cin` 16384. It still needs accumulation semantics, per-slice
+   zero-point correction, and defined overflow and floating-point ordering,
+   none of which exist.
+3. **The next ceiling raise** is cheaper than either: fp16 `k=1` measured
+   clean to 8192 in the 2026-09-06 corpus and `M` to 8192 in the 2026-09-09
+   one. Both stop at 4096 only because that is the widest extent measured at
+   *every* rung.
+
+The step list below is kept as written, because its halo, coverage, tail and
+zero-point requirements are all still correct for whoever builds
+decomposition. Only its premise -- that these shapes are otherwise
+unreachable -- has been falsified.
 
 This needs a higher-level decomposition planner and compiler rewrite support.
 Keep whole-operation descriptors distinct from legal hardware-task descriptors:

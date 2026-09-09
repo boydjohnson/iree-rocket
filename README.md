@@ -135,6 +135,23 @@ any CPU dispatch whose export name says it is running a convolution or a
 matmul. It cannot see an operation IREE fused into a larger element-wise
 dispatch, so a pass means "nothing observably left on the CPU", not a proof.
 
+### `--batch-matmul`: attention on the NPU, off by default
+
+`linalg.batch_matmul` reaches no matcher -- the matmul path reads row-major
+`linalg.matmul` -- so a transformer's attention core stays on the CPU.
+`--batch-matmul` splices in `rocket-unbatch-matmul`, which splits a
+static-batch contraction into one matmul per batch element. On ViT-B/16 that
+takes the model from 73 NPU dispatch sites to 361 and leaves nothing
+contraction-shaped on the CPU but the patch-embed stem, at max|diff| 0.0074
+against an ONNX Runtime oracle.
+
+It is off because it is **1.16x slower** (592 ms -> 687 ms on `planck` at
+eight workers). Offloading the whole attention core bought 3 ms of CPU time
+and cost 125 ms of `record`, `compact`, `pack.input` and NPU time -- the CPU
+was spending almost nothing on it. ISSUES.md C15 has the phase tables. Like
+`--elementwise`, the flag exists so both arms can be measured rather than
+argued about.
+
 ### The CPU-only baseline: `--no-offload`
 
 An NPU-vs-CPU comparison needs a CPU arm built by the *same* pipeline. A
@@ -330,12 +347,47 @@ tiled, so the relation is exact there. It should never fire.
 
 ### ONNX models
 
-Pin the batch dimension before importing. `iree-import-onnx` will happily
+`tools/import_onnx.py` does the whole import, and the three things below are
+why it exists rather than a bare `iree-import-onnx` call:
+
+```sh
+tools/import_onnx.py model.onnx --out-dir vit \
+    --dim batch_size=1 --dim num_channels=3 --dim height=224 --dim width=224
+```
+
+Pin the symbolic dimensions before importing. `iree-import-onnx` will happily
 import a model whose batch is a symbolic `dim_param`, but the Rocket ABI fixes
 batch at one and every matcher in the transform spec requires it, so a
 dynamic-batch model compiles cleanly and offloads **nothing**. Clear each
-`dim_param` on the graph inputs and outputs to 1, drop `graph.value_info`, and
-re-run `shape_inference.infer_shapes` before `iree-import-onnx`.
+`dim_param` on the graph inputs and outputs, drop `graph.value_info`, and
+re-run `shape_inference.infer_shapes` before `iree-import-onnx`. Not every
+model leaves only batch symbolic -- ViT-B/16 leaves all four input dims that
+way, so its channel count and spatial extents need pinning too, or the
+patch-embed convolution is still symbolic after the batch is fixed.
+
+`tools/import_onnx.py` also handles ONNX Runtime *optimized* exports -- the
+`com.microsoft` contrib ops (`GroupQueryAttention`, `RotaryEmbedding`,
+`SimplifiedLayerNormalization`, `SkipSimplifiedLayerNormalization`) that
+`onnx-community/Qwen3-0.6B-ONNX` and models like it publish, often with no
+plain-op variant. torch-mlir supports all four, but five rewrites are needed
+around them and the script applies them when it sees such a node: pin
+`value_info` rather than clearing it (the opposite of the plain path, because
+`infer_shapes` cannot type a fused op), drop trailing empty optional node
+inputs, split `SkipSimplifiedLayerNormalization`, route rank-3
+`RotaryEmbedding` through the rank-4 entry point (torch-mlir's rank-3 path
+reshapes where it must transpose, and the logits come out uncorrelated), and
+pass `--large-model` so `onnx.checker` is skipped. Each is documented in the
+script with the evidence behind it.
+
+Build an ONNX Runtime oracle *before* importing. Without a reference from the
+model's own runtime, a later difference cannot be attributed to the NPU rather
+than to the import -- and at least one shipped model is mis-imported today
+(ISSUES.md C14: a float16-converted ViT that ONNX Runtime runs correctly and
+that IREE gets wrong on the host CPU with no NPU involved). Prefer the f32
+file when a model ships both: the transform spec demotes convolutions and
+matmuls to f16 itself and restores f32 on whatever the match loop leaves
+behind, so the f32 import chooses precision per operation rather than for the
+whole graph, and it is the arm measured exact against the oracle.
 
 int8 models quantized with ONNX Runtime's `quantize_dynamic` are supported.
 They import as `onnx.ConvInteger`, which upstream torch-mlir cannot lower at

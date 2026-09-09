@@ -83,7 +83,7 @@ impl Drop for SpecFile {
 /// returned handle drops.
 fn resolve_transform_spec(common: &cli::CommonArgs) -> Result<SpecFile, Box<dyn Error>> {
     let source = transform_spec_path(common);
-    if !common.no_offload && !common.elementwise {
+    if !common.no_offload && !common.elementwise && !common.batch_matmul {
         return Ok(SpecFile {
             path: source,
             temporary: false,
@@ -111,7 +111,24 @@ fn resolve_transform_spec(common: &cli::CommonArgs) -> Result<SpecFile, Box<dyn 
         text = enabled.text;
     }
 
-    let mut suffix = "elementwise";
+    // Before neutralize for the reason elementwise is: the baseline arm has
+    // to run the identical pipeline, so the pass is spliced in and *then*
+    // every matcher is defeated.
+    if common.batch_matmul {
+        let enabled = spec::enable_batch_matmul(&text)?;
+        eprintln!(
+            "--batch-matmul: rocket-unbatch-matmul spliced in ({} line(s)) in {}",
+            enabled.enabled,
+            source.display()
+        );
+        text = enabled.text;
+    }
+
+    let mut suffix = if common.batch_matmul {
+        "batch-matmul"
+    } else {
+        "elementwise"
+    };
     if common.no_offload {
         suffix = "no-offload";
         let neutralized = spec::neutralize(&text)?;
@@ -506,6 +523,7 @@ mod tests {
             transform_spec: None,
             no_offload: false,
             elementwise: false,
+            batch_matmul: false,
             strict_offload: false,
             report_json: None,
             rocket_device_name: rocket.to_string(),

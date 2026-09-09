@@ -68,6 +68,24 @@ pub struct CommonArgs {
     #[arg(long)]
     pub elementwise: bool,
 
+    /// Enable ISSUES.md C15: split a static-batch `linalg.batch_matmul` into
+    /// one `linalg.matmul` per batch element, so the existing matmul path
+    /// claims them. ViT's attention core is twenty-four such dispatch sites
+    /// on a twelve-layer model.
+    ///
+    /// Off by default for the reason `--elementwise` is: it multiplies
+    /// dispatch count by the batch -- ViT-B/16's twenty-four sites become
+    /// two hundred and eighty-eight -- against a per-dispatch cost ISSUES.md
+    /// P8 measured as flat, and which the ViT profile puts at 1.6 ms of
+    /// `record` alone. This exists so both arms can be measured. Turn it on,
+    /// measure against `--no-offload`, and let the number decide.
+    ///
+    /// Composes with `--no-offload` the same way `--elementwise` does: the
+    /// pass is spliced in first and every matcher neutralized afterwards, so
+    /// the baseline runs the identical pipeline.
+    #[arg(long)]
+    pub batch_matmul: bool,
+
     #[arg(long, default_value = "rocket_device")]
     pub rocket_device_name: String,
 

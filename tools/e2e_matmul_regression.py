@@ -156,6 +156,33 @@ func.func @matmul_m_2047(%lhs: tensor<2047x64xf32>, %rhs: tensor<64x64xf32>, %in
   return %0 : tensor<2047x64xf32>
 }
 
+// M past the old 2047 row ceiling, at the new one. `CNA_DATA_SIZE0.datain_width`
+// is 11 bits, so every column tile is still under 2047 -- what this case gates is
+// that the planner splits a 4096-row matmul into those tiles and reassembles them
+// correctly through a compiled module. The raw HAL ladder that justified the
+// raise ran the `onehot` read map, because on a height-one image `Selectors`
+// cannot see a pixel shift; here the ternary fixture is exact, so a displaced
+// row shows up as a nonzero difference instead. K and N stay at 64 so a failure
+// characterises the row width and nothing else.
+func.func @matmul_m_4096(%lhs: tensor<4096x64xf32>, %rhs: tensor<64x64xf32>, %init: tensor<4096x64xf32>) -> tensor<4096x64xf32> {
+  %0 = linalg.matmul
+      ins(%lhs, %rhs : tensor<4096x64xf32>, tensor<64x64xf32>)
+      outs(%init : tensor<4096x64xf32>) -> tensor<4096x64xf32>
+  return %0 : tensor<4096x64xf32>
+}
+
+// Both channel ceilings at their 2026-09-09 value, 4096. The 3584 case above is
+// kept rather than moved: it is the extent the previous corpus reached, and a
+// regression that only bites past it should not be able to hide behind the new
+// number. |C|max for a ternary sum grows as the square root of K, so at K = 4096
+// it stays inside f16's integer-exact 2048 and this case is exact too.
+func.func @matmul_k_n_4096(%lhs: tensor<8x4096xf32>, %rhs: tensor<4096x4096xf32>, %init: tensor<8x4096xf32>) -> tensor<8x4096xf32> {
+  %0 = linalg.matmul
+      ins(%lhs, %rhs : tensor<8x4096xf32>, tensor<4096x4096xf32>)
+      outs(%init : tensor<8x4096xf32>) -> tensor<8x4096xf32>
+  return %0 : tensor<8x4096xf32>
+}
+
 // linalg.matvec: A[m,k] * y[k] -> z[m]. No matcher of its own --
 // rocket-expand-gemv-to-matmul raises it into a matmul with N = 1 -- so what
 // this gates is the raising, and specifically that the vector operand became
@@ -343,6 +370,14 @@ def write_compiled_fixture(work_dir: Path) -> None:
     np.save(work_dir / "m2047_rhs.npy", ternary(rng, 64, 64))
     np.save(work_dir / "m2047_init.npy", zeros(2047, 64))
 
+    np.save(work_dir / "m4096_lhs.npy", ternary(rng, 4096, 64))
+    np.save(work_dir / "m4096_rhs.npy", ternary(rng, 64, 64))
+    np.save(work_dir / "m4096_init.npy", zeros(4096, 64))
+
+    np.save(work_dir / "ceil4096_lhs.npy", ternary(rng, 8, 4096))
+    np.save(work_dir / "ceil4096_rhs.npy", ternary(rng, 4096, 4096))
+    np.save(work_dir / "ceil4096_init.npy", zeros(8, 4096))
+
     np.save(work_dir / "matvec_a.npy", ternary(rng, 197, 768))
     np.save(work_dir / "matvec_y.npy", ternary(rng, 768))
     np.save(work_dir / "matvec_init.npy", zeros(197))
@@ -381,6 +416,8 @@ EXPECTED_FUNCTIONS = (
     "matmul_k_n_ceilings",
     "matmul_vit_mlp",
     "matmul_m_2047",
+    "matmul_m_4096",
+    "matmul_k_n_4096",
     "matvec",
     "vecmat",
     "mixed_matmul_then_matmul",
@@ -677,6 +714,20 @@ def build_cases(atol: float, rtol: float) -> list[Case]:
             "matmul_m_2047",
             ("m2047_lhs.npy", "m2047_rhs.npy", "m2047_init.npy"),
             ("matmul_m_2047_out.npy",),
+            0.0,
+            0.0,
+        ),
+        Case(
+            "matmul_m_4096",
+            ("m4096_lhs.npy", "m4096_rhs.npy", "m4096_init.npy"),
+            ("matmul_m_4096_out.npy",),
+            0.0,
+            0.0,
+        ),
+        Case(
+            "matmul_k_n_4096",
+            ("ceil4096_lhs.npy", "ceil4096_rhs.npy", "ceil4096_init.npy"),
+            ("matmul_k_n_4096_out.npy",),
             0.0,
             0.0,
         ),

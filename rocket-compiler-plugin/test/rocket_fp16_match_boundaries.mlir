@@ -37,60 +37,60 @@
 // plane) sits downstream of the MAC array and does not touch the channel
 // path. The cases below the depthwise ones are the corners that moved.
 
-// CHECK-LABEL: util.func public @dense_1x1_cin_3584_matched
+// CHECK-LABEL: util.func public @dense_1x1_cin_4096_matched
 // CHECK-NOT: linalg.conv_2d_nhwc_hwcf
 // CHECK: flow.dispatch @rocket_dynamic_executable
-func.func @dense_1x1_cin_3584_matched(
-    %input: tensor<1x?x?x3584xf16>,
-    %filter: tensor<1x1x3584x64xf16>,
+func.func @dense_1x1_cin_4096_matched(
+    %input: tensor<1x?x?x4096xf16>,
+    %filter: tensor<1x1x4096x64xf16>,
     %init: tensor<1x?x?x64xf32>) -> tensor<1x?x?x64xf32> {
   %result = linalg.conv_2d_nhwc_hwcf
       {dilations = dense<1> : vector<2xi64>, strides = dense<1> : vector<2xi64>}
-      ins(%input, %filter : tensor<1x?x?x3584xf16>, tensor<1x1x3584x64xf16>)
+      ins(%input, %filter : tensor<1x?x?x4096xf16>, tensor<1x1x4096x64xf16>)
       outs(%init : tensor<1x?x?x64xf32>) -> tensor<1x?x?x64xf32>
   return %result : tensor<1x?x?x64xf32>
 }
 
-// CHECK-LABEL: util.func public @dense_1x1_cin_3585_falls_back
+// CHECK-LABEL: util.func public @dense_1x1_cin_4097_falls_back
 // CHECK-NOT: flow.dispatch @rocket_dynamic_executable
 // CHECK: linalg.conv_2d_nhwc_hwcf
-func.func @dense_1x1_cin_3585_falls_back(
-    %input: tensor<1x?x?x3585xf16>,
-    %filter: tensor<1x1x3585x64xf16>,
+func.func @dense_1x1_cin_4097_falls_back(
+    %input: tensor<1x?x?x4097xf16>,
+    %filter: tensor<1x1x4097x64xf16>,
     %init: tensor<1x?x?x64xf32>) -> tensor<1x?x?x64xf32> {
   %result = linalg.conv_2d_nhwc_hwcf
       {dilations = dense<1> : vector<2xi64>, strides = dense<1> : vector<2xi64>}
-      ins(%input, %filter : tensor<1x?x?x3585xf16>, tensor<1x1x3585x64xf16>)
+      ins(%input, %filter : tensor<1x?x?x4097xf16>, tensor<1x1x4097x64xf16>)
       outs(%init : tensor<1x?x?x64xf32>) -> tensor<1x?x?x64xf32>
   return %result : tensor<1x?x?x64xf32>
 }
 
-// CHECK-LABEL: util.func public @dense_1x1_cout_3584_matched
+// CHECK-LABEL: util.func public @dense_1x1_cout_4096_matched
 // CHECK-NOT: linalg.conv_2d_nhwc_hwcf
 // CHECK: flow.dispatch @rocket_dynamic_executable
-func.func @dense_1x1_cout_3584_matched(
+func.func @dense_1x1_cout_4096_matched(
     %input: tensor<1x?x?x448xf16>,
-    %filter: tensor<1x1x448x3584xf16>,
-    %init: tensor<1x?x?x3584xf32>) -> tensor<1x?x?x3584xf32> {
+    %filter: tensor<1x1x448x4096xf16>,
+    %init: tensor<1x?x?x4096xf32>) -> tensor<1x?x?x4096xf32> {
   %result = linalg.conv_2d_nhwc_hwcf
       {dilations = dense<1> : vector<2xi64>, strides = dense<1> : vector<2xi64>}
-      ins(%input, %filter : tensor<1x?x?x448xf16>, tensor<1x1x448x3584xf16>)
-      outs(%init : tensor<1x?x?x3584xf32>) -> tensor<1x?x?x3584xf32>
-  return %result : tensor<1x?x?x3584xf32>
+      ins(%input, %filter : tensor<1x?x?x448xf16>, tensor<1x1x448x4096xf16>)
+      outs(%init : tensor<1x?x?x4096xf32>) -> tensor<1x?x?x4096xf32>
+  return %result : tensor<1x?x?x4096xf32>
 }
 
-// CHECK-LABEL: util.func public @dense_1x1_cout_3585_falls_back
+// CHECK-LABEL: util.func public @dense_1x1_cout_4097_falls_back
 // CHECK-NOT: flow.dispatch @rocket_dynamic_executable
 // CHECK: linalg.conv_2d_nhwc_hwcf
-func.func @dense_1x1_cout_3585_falls_back(
+func.func @dense_1x1_cout_4097_falls_back(
     %input: tensor<1x?x?x448xf16>,
-    %filter: tensor<1x1x448x3585xf16>,
-    %init: tensor<1x?x?x3585xf32>) -> tensor<1x?x?x3585xf32> {
+    %filter: tensor<1x1x448x4097xf16>,
+    %init: tensor<1x?x?x4097xf32>) -> tensor<1x?x?x4097xf32> {
   %result = linalg.conv_2d_nhwc_hwcf
       {dilations = dense<1> : vector<2xi64>, strides = dense<1> : vector<2xi64>}
-      ins(%input, %filter : tensor<1x?x?x448xf16>, tensor<1x1x448x3585xf16>)
-      outs(%init : tensor<1x?x?x3585xf32>) -> tensor<1x?x?x3585xf32>
-  return %result : tensor<1x?x?x3585xf32>
+      ins(%input, %filter : tensor<1x?x?x448xf16>, tensor<1x1x448x4097xf16>)
+      outs(%init : tensor<1x?x?x4097xf32>) -> tensor<1x?x?x4097xf32>
+  return %result : tensor<1x?x?x4097xf32>
 }
 
 // CHECK-LABEL: util.func public @dense_3x3_cin_1152_matched
@@ -128,30 +128,30 @@ func.func @dense_3x3_cin_1153_falls_back(
 
 // A plain stride-2 1x1 with nothing fused after it. This was bounded at Cin
 // 512 while the same convolution with a ReLU after it was bounded at 3584.
-// CHECK-LABEL: util.func public @dense_1x1_s2_cin_3584_matched
+// CHECK-LABEL: util.func public @dense_1x1_s2_cin_4096_matched
 // CHECK-NOT: linalg.conv_2d_nhwc_hwcf
 // CHECK: flow.dispatch @rocket_dynamic_executable_s2
-func.func @dense_1x1_s2_cin_3584_matched(
-    %input: tensor<1x?x?x3584xf16>,
-    %filter: tensor<1x1x3584x64xf16>,
+func.func @dense_1x1_s2_cin_4096_matched(
+    %input: tensor<1x?x?x4096xf16>,
+    %filter: tensor<1x1x4096x64xf16>,
     %init: tensor<1x?x?x64xf32>) -> tensor<1x?x?x64xf32> {
   %result = linalg.conv_2d_nhwc_hwcf
       {dilations = dense<1> : vector<2xi64>, strides = dense<2> : vector<2xi64>}
-      ins(%input, %filter : tensor<1x?x?x3584xf16>, tensor<1x1x3584x64xf16>)
+      ins(%input, %filter : tensor<1x?x?x4096xf16>, tensor<1x1x4096x64xf16>)
       outs(%init : tensor<1x?x?x64xf32>) -> tensor<1x?x?x64xf32>
   return %result : tensor<1x?x?x64xf32>
 }
 
-// CHECK-LABEL: util.func public @dense_1x1_s2_cin_3585_falls_back
+// CHECK-LABEL: util.func public @dense_1x1_s2_cin_4097_falls_back
 // CHECK-NOT: flow.dispatch @rocket_dynamic_executable
 // CHECK: linalg.conv_2d_nhwc_hwcf
-func.func @dense_1x1_s2_cin_3585_falls_back(
-    %input: tensor<1x?x?x3585xf16>,
-    %filter: tensor<1x1x3585x64xf16>,
+func.func @dense_1x1_s2_cin_4097_falls_back(
+    %input: tensor<1x?x?x4097xf16>,
+    %filter: tensor<1x1x4097x64xf16>,
     %init: tensor<1x?x?x64xf32>) -> tensor<1x?x?x64xf32> {
   %result = linalg.conv_2d_nhwc_hwcf
       {dilations = dense<1> : vector<2xi64>, strides = dense<2> : vector<2xi64>}
-      ins(%input, %filter : tensor<1x?x?x3585xf16>, tensor<1x1x3585x64xf16>)
+      ins(%input, %filter : tensor<1x?x?x4097xf16>, tensor<1x1x4097x64xf16>)
       outs(%init : tensor<1x?x?x64xf32>) -> tensor<1x?x?x64xf32>
   return %result : tensor<1x?x?x64xf32>
 }
@@ -159,32 +159,32 @@ func.func @dense_1x1_s2_cin_3585_falls_back(
 // 3x3 `Cout`, which the padded matchers already admitted to the dense
 // ceiling while the unpadded ones stopped at 1792. `Cout` charges no
 // feature residency, so the kernel does not bound it.
-// CHECK-LABEL: util.func public @dense_3x3_cout_3584_matched
+// CHECK-LABEL: util.func public @dense_3x3_cout_4096_matched
 // CHECK-NOT: linalg.conv_2d_nhwc_hwcf
 // CHECK: flow.dispatch @rocket_dynamic_executable
-func.func @dense_3x3_cout_3584_matched(
+func.func @dense_3x3_cout_4096_matched(
     %input: tensor<1x?x?x64xf16>,
-    %filter: tensor<3x3x64x3584xf16>,
-    %init: tensor<1x?x?x3584xf32>) -> tensor<1x?x?x3584xf32> {
+    %filter: tensor<3x3x64x4096xf16>,
+    %init: tensor<1x?x?x4096xf32>) -> tensor<1x?x?x4096xf32> {
   %result = linalg.conv_2d_nhwc_hwcf
       {dilations = dense<1> : vector<2xi64>, strides = dense<1> : vector<2xi64>}
-      ins(%input, %filter : tensor<1x?x?x64xf16>, tensor<3x3x64x3584xf16>)
-      outs(%init : tensor<1x?x?x3584xf32>) -> tensor<1x?x?x3584xf32>
-  return %result : tensor<1x?x?x3584xf32>
+      ins(%input, %filter : tensor<1x?x?x64xf16>, tensor<3x3x64x4096xf16>)
+      outs(%init : tensor<1x?x?x4096xf32>) -> tensor<1x?x?x4096xf32>
+  return %result : tensor<1x?x?x4096xf32>
 }
 
-// CHECK-LABEL: util.func public @dense_3x3_cout_3585_falls_back
+// CHECK-LABEL: util.func public @dense_3x3_cout_4097_falls_back
 // CHECK-NOT: flow.dispatch @rocket_dynamic_executable
 // CHECK: linalg.conv_2d_nhwc_hwcf
-func.func @dense_3x3_cout_3585_falls_back(
+func.func @dense_3x3_cout_4097_falls_back(
     %input: tensor<1x?x?x64xf16>,
-    %filter: tensor<3x3x64x3585xf16>,
-    %init: tensor<1x?x?x3585xf32>) -> tensor<1x?x?x3585xf32> {
+    %filter: tensor<3x3x64x4097xf16>,
+    %init: tensor<1x?x?x4097xf32>) -> tensor<1x?x?x4097xf32> {
   %result = linalg.conv_2d_nhwc_hwcf
       {dilations = dense<1> : vector<2xi64>, strides = dense<1> : vector<2xi64>}
-      ins(%input, %filter : tensor<1x?x?x64xf16>, tensor<3x3x64x3585xf16>)
-      outs(%init : tensor<1x?x?x3585xf32>) -> tensor<1x?x?x3585xf32>
-  return %result : tensor<1x?x?x3585xf32>
+      ins(%input, %filter : tensor<1x?x?x64xf16>, tensor<3x3x64x4097xf16>)
+      outs(%init : tensor<1x?x?x4097xf32>) -> tensor<1x?x?x4097xf32>
+  return %result : tensor<1x?x?x4097xf32>
 }
 
 // 3x3 at stride 2, which the plain matcher bounded at Cin 512 and the

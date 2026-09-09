@@ -154,7 +154,17 @@ pub const INPUT_CHANNELS: u32 = 3;
 /// clean, on this file's usual principle: 3584 covers every transformer
 /// shape in the corpus with a rung of headroom. A ViT-L/16 MLP at 4096
 /// would need the constant moved, not another measurement.
-pub const MAX_INPUT_CHANNELS: u32 = 3584;
+///
+/// **Raised 3584 -> 4096 on 2026-09-09.** No new corpus was needed: the
+/// 2026-09-06 sweep that set 3584 had already measured 4096 clean at every
+/// rung, and LIMITS.md said so in as many words -- the constant sat lower
+/// only on this repository's principle that a limit is what a real model
+/// needs and the corpus reaches. A ViT-L/16 MLP at 4096 is that model.
+/// Re-confirmed on `planck` from a quiet board before moving it: fp16 `Cin`
+/// 3584 and 4096 at 14x14 `Cout` 64, fp16 `Cout` 3584 and 4096 at 7x7 `Cin`
+/// 448, the same two points at int8 under `SelectorsAffine`, and fp16
+/// `Cin` = `Cout` = 4096 at 14x14. 0 mismatches, 0 device timeouts.
+pub const MAX_INPUT_CHANNELS: u32 = 4096;
 
 /// `CNA_DATA_SIZE1.datain_channel_real` counts `Cin - 1` modulo this, even
 /// though the field is 14 bits wide and could hold far more.
@@ -194,7 +204,17 @@ pub const CHANNEL_REAL_MODULUS: u32 = 64;
 /// again under `Counting` (whose int8 output shift makes the count
 /// readable), the `onehot` read map at `Cout == Cin` 3584, `Cout`
 /// 2304..4096 at 7x7 `Cin` 448, and stride 2 at `Cin` 2304..4096.
-pub const MAX_INT8_INPUT_CHANNELS: u32 = 3584;
+///
+/// **Raised 3584 -> 4096 on 2026-09-09.** No new corpus was needed: the
+/// 2026-09-06 sweep that set 3584 had already measured 4096 clean at every
+/// rung, and LIMITS.md said so in as many words -- the constant sat lower
+/// only on this repository's principle that a limit is what a real model
+/// needs and the corpus reaches. A ViT-L/16 MLP at 4096 is that model.
+/// Re-confirmed on `planck` from a quiet board before moving it: fp16 `Cin`
+/// 3584 and 4096 at 14x14 `Cout` 64, fp16 `Cout` 3584 and 4096 at 7x7 `Cin`
+/// 448, the same two points at int8 under `SelectorsAffine`, and fp16
+/// `Cin` = `Cout` = 4096 at 14x14. 0 mismatches, 0 device timeouts.
+pub const MAX_INT8_INPUT_CHANNELS: u32 = 4096;
 
 /// Largest output-channel count the int8 sweep measures.
 ///
@@ -213,7 +233,17 @@ pub const MAX_INT8_INPUT_CHANNELS: u32 = 3584;
 /// 2304, 3072, 3584 and 4096, split flat at 7d/5w throughout, and at
 /// `Cout == Cin` 3584 under the `onehot` read map. Same sweep as
 /// [`MAX_INPUT_CHANNELS`].
-pub const MAX_INT8_OUTPUT_CHANNELS: u32 = 3584;
+///
+/// **Raised 3584 -> 4096 on 2026-09-09.** No new corpus was needed: the
+/// 2026-09-06 sweep that set 3584 had already measured 4096 clean at every
+/// rung, and LIMITS.md said so in as many words -- the constant sat lower
+/// only on this repository's principle that a limit is what a real model
+/// needs and the corpus reaches. A ViT-L/16 MLP at 4096 is that model.
+/// Re-confirmed on `planck` from a quiet board before moving it: fp16 `Cin`
+/// 3584 and 4096 at 14x14 `Cout` 64, fp16 `Cout` 3584 and 4096 at 7x7 `Cin`
+/// 448, the same two points at int8 under `SelectorsAffine`, and fp16
+/// `Cin` = `Cout` = 4096 at 14x14. 0 mismatches, 0 device timeouts.
+pub const MAX_INT8_OUTPUT_CHANNELS: u32 = 4096;
 
 /// Channel ceilings for int4, set to what the hardware ladder measures
 /// rather than to what the arithmetic would allow.
@@ -244,9 +274,29 @@ pub const MAX_INT8_OUTPUT_CHANNELS: u32 = 3584;
 /// fails at `Cin` 64 exactly as it does at 3584. So int4's addressing
 /// evidence up here is `Selectors` alone, one rung weaker than every other
 /// datatype's.
-pub const MAX_INT4_INPUT_CHANNELS: u32 = 3584;
+///
+/// **Raised 3584 -> 4096 on 2026-09-09.** No new corpus was needed: the
+/// 2026-09-06 sweep that set 3584 had already measured 4096 clean at every
+/// rung, and LIMITS.md said so in as many words -- the constant sat lower
+/// only on this repository's principle that a limit is what a real model
+/// needs and the corpus reaches. A ViT-L/16 MLP at 4096 is that model.
+/// Re-confirmed on `planck` from a quiet board before moving it: fp16 `Cin`
+/// 3584 and 4096 at 14x14 `Cout` 64, fp16 `Cout` 3584 and 4096 at 7x7 `Cin`
+/// 448, the same two points at int8 under `SelectorsAffine`, and fp16
+/// `Cin` = `Cout` = 4096 at 14x14. 0 mismatches, 0 device timeouts.
+pub const MAX_INT4_INPUT_CHANNELS: u32 = 4096;
 
-pub const MAX_INT4_OUTPUT_CHANNELS: u32 = 3584;
+///
+/// **Raised 3584 -> 4096 on 2026-09-09.** No new corpus was needed: the
+/// 2026-09-06 sweep that set 3584 had already measured 4096 clean at every
+/// rung, and LIMITS.md said so in as many words -- the constant sat lower
+/// only on this repository's principle that a limit is what a real model
+/// needs and the corpus reaches. A ViT-L/16 MLP at 4096 is that model.
+/// Re-confirmed on `planck` from a quiet board before moving it: fp16 `Cin`
+/// 3584 and 4096 at 14x14 `Cout` 64, fp16 `Cout` 3584 and 4096 at 7x7 `Cin`
+/// 448, the same two points at int8 under `SelectorsAffine`, and fp16
+/// `Cin` = `Cout` = 4096 at 14x14. 0 mismatches, 0 device timeouts.
+pub const MAX_INT4_OUTPUT_CHANNELS: u32 = 4096;
 
 /// Channel ceilings for tf32, again the extent of the measurement rather
 /// than of the arithmetic. A 4-byte element charges four times fp16's CBUF
@@ -282,9 +332,29 @@ pub const MAX_INT4_OUTPUT_CHANNELS: u32 = 3584;
 /// (28 against 14 at `Cin` 3584), which is the residency showing up as
 /// geometry rather than as a refusal. At k=3 it still binds, and there
 /// `ConvPlan`'s own refusal is what governs -- see [`MAX_INPUT_CHANNELS`].
-pub const MAX_TF32_INPUT_CHANNELS: u32 = 3584;
+///
+/// **Raised 3584 -> 4096 on 2026-09-09.** No new corpus was needed: the
+/// 2026-09-06 sweep that set 3584 had already measured 4096 clean at every
+/// rung, and LIMITS.md said so in as many words -- the constant sat lower
+/// only on this repository's principle that a limit is what a real model
+/// needs and the corpus reaches. A ViT-L/16 MLP at 4096 is that model.
+/// Re-confirmed on `planck` from a quiet board before moving it: fp16 `Cin`
+/// 3584 and 4096 at 14x14 `Cout` 64, fp16 `Cout` 3584 and 4096 at 7x7 `Cin`
+/// 448, the same two points at int8 under `SelectorsAffine`, and fp16
+/// `Cin` = `Cout` = 4096 at 14x14. 0 mismatches, 0 device timeouts.
+pub const MAX_TF32_INPUT_CHANNELS: u32 = 4096;
 
-pub const MAX_TF32_OUTPUT_CHANNELS: u32 = 3584;
+///
+/// **Raised 3584 -> 4096 on 2026-09-09.** No new corpus was needed: the
+/// 2026-09-06 sweep that set 3584 had already measured 4096 clean at every
+/// rung, and LIMITS.md said so in as many words -- the constant sat lower
+/// only on this repository's principle that a limit is what a real model
+/// needs and the corpus reaches. A ViT-L/16 MLP at 4096 is that model.
+/// Re-confirmed on `planck` from a quiet board before moving it: fp16 `Cin`
+/// 3584 and 4096 at 14x14 `Cout` 64, fp16 `Cout` 3584 and 4096 at 7x7 `Cin`
+/// 448, the same two points at int8 under `SelectorsAffine`, and fp16
+/// `Cin` = `Cout` = 4096 at 14x14. 0 mismatches, 0 device timeouts.
+pub const MAX_TF32_OUTPUT_CHANNELS: u32 = 4096;
 
 /// Widest input pixel the vendor keeps in dense NHWC, in bytes.
 ///
@@ -354,7 +424,17 @@ pub const OUTPUT_CHANNELS: u32 = 8;
 /// Depthwise does *not* follow it up: it constructs with
 /// `out_channels == in_channels`, and [`MAX_DEPTHWISE_CHANNELS`] now holds
 /// that path at the extent its own corpus reaches.
-pub const MAX_OUTPUT_CHANNELS: u32 = 3584;
+///
+/// **Raised 3584 -> 4096 on 2026-09-09.** No new corpus was needed: the
+/// 2026-09-06 sweep that set 3584 had already measured 4096 clean at every
+/// rung, and LIMITS.md said so in as many words -- the constant sat lower
+/// only on this repository's principle that a limit is what a real model
+/// needs and the corpus reaches. A ViT-L/16 MLP at 4096 is that model.
+/// Re-confirmed on `planck` from a quiet board before moving it: fp16 `Cin`
+/// 3584 and 4096 at 14x14 `Cout` 64, fp16 `Cout` 3584 and 4096 at 7x7 `Cin`
+/// 448, the same two points at int8 under `SelectorsAffine`, and fp16
+/// `Cin` = `Cout` = 4096 at 14x14. 0 mismatches, 0 device timeouts.
+pub const MAX_OUTPUT_CHANNELS: u32 = 4096;
 
 /// Most channels a *depthwise* convolution will program, at any precision.
 ///

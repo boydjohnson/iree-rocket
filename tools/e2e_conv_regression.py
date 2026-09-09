@@ -64,6 +64,22 @@ func.func @main(%input: tensor<1x32x32x512xf16>, %filter: tensor<3x3x512x512xf16
   return %0 : tensor<1x30x30x512xf32>
 }
 
+// `Cout` at the 2026-09-09 ceiling, 4096, on a real two-dimensional image
+// rather than the height-one row the matmul gate's `matmul_k_n_4096` covers.
+// Both ride the same `MAX_OUTPUT_CHANNELS`, but they reach it through
+// different geometry: the FC lowering programs height one, and a conv at
+// 8x8 exercises the row/column partition alongside the widened kernel count.
+// The raw oracle measured this shape class (`fp16/cout/7/1/448/4096` and
+// `fp16/cout/14/1/4096/4096`, `onehot`-free `Selectors`, 0 mismatches);
+// this is the compiled path over the same ground.
+func.func @dense_fp16_cout4096(%input: tensor<1x8x8x256xf16>, %filter: tensor<1x1x256x4096xf16>, %init: tensor<1x8x8x4096xf32>) -> tensor<1x8x8x4096xf32> {
+  %0 = linalg.conv_2d_nhwc_hwcf
+      {dilations = dense<1> : tensor<2xi64>, strides = dense<1> : tensor<2xi64>}
+      ins(%input, %filter : tensor<1x8x8x256xf16>, tensor<1x1x256x4096xf16>)
+      outs(%init : tensor<1x8x8x4096xf32>) -> tensor<1x8x8x4096xf32>
+  return %0 : tensor<1x8x8x4096xf32>
+}
+
 // Cin=3 exercises the dense (Cin<=4) ARGB feature path -- the only one that
 // hands an IREE buffer to the NPU directly instead of staging it through
 // driver-owned scratch, and so the only one needing its own
@@ -1097,6 +1113,23 @@ def write_compiled_fixture(work_dir: Path) -> None:
     np.save(work_dir / "input.npy", input_tensor)
     np.save(work_dir / "init.npy", np.zeros((1, 30, 30, 512), dtype=np.float32))
 
+    # Same ranges as `main`: |input| <= 0.25 against |weight| <= 0.5 over a
+    # 256-deep 1x1 contraction stays where an f32 accumulator and an f16
+    # operand agree far inside the tolerance, so a difference here is a
+    # kernel-count or output-surface fault, not rounding.
+    np.save(
+        work_dir / "cout4096_kernel.npy",
+        rng.uniform(-0.5, 0.5, size=(1, 1, 256, 4096)).astype(np.float16),
+    )
+    np.save(
+        work_dir / "cout4096_input.npy",
+        rng.uniform(-0.25, 0.25, size=(1, 8, 8, 256)).astype(np.float16),
+    )
+    np.save(
+        work_dir / "cout4096_init.npy",
+        np.zeros((1, 8, 8, 4096), dtype=np.float32),
+    )
+
     # Non-uniform across x, y *and* channel: a dense-path addressing or
     # staleness fault displaces values rather than changing their count, so
     # uniform data cannot see it.
@@ -1448,6 +1481,10 @@ def compile_modules(
         ("depthwise_fp16_c960", "rocket_dynamic_depthwise_executable"),
         ("depthwise_fp16_c1536", "rocket_dynamic_depthwise_executable"),
         ("depthwise_fp16_c1536_s2", "rocket_dynamic_depthwise_executable_s2"),
+        # The dense Cout the 2026-09-09 channel raise added, for the same
+        # reason: if it stopped reaching a matcher the differential would
+        # compare the CPU with itself and pass.
+        ("dense_fp16_cout4096", "rocket_dynamic_executable"),
     ):
         match = re.search(
             rf"util\.func public @{re.escape(function)}\b(?P<body>.*?)"
@@ -1702,6 +1739,13 @@ def run_compiled_gate(
             "main",
             ("input.npy", "kernel.npy", "init.npy"),
             ("out_rocket.npy",),
+            atol,
+            rtol,
+        ),
+        Case(
+            "dense_fp16_cout4096",
+            ("cout4096_input.npy", "cout4096_kernel.npy", "cout4096_init.npy"),
+            ("dense_fp16_cout4096_out_rocket.npy",),
             atol,
             rtol,
         ),
