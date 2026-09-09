@@ -216,8 +216,8 @@ offloading" is the third policy this section's opening asks for and the one
 still missing: admission and hardware legality are now separate, cost policy
 is not.
 
-Still open here: the strict-offload option, the cost policy above, and the
-dynamic-shape policy.
+Still open here: the cost policy above and the dynamic-shape policy. The
+strict-offload option landed with section 3.
 
 Expose core through a small versioned C ABI adapter, built as a host Rust static
 library and linked into the C++ plugin through its CMake build. Use fixed-width
@@ -257,6 +257,67 @@ rewriting dimension bounds, which will no longer be sufficient once planner
 queries replace those bounds. Preserve the like-for-like CPU baseline pipeline.
 
 ## 3. Explain placement reliably
+
+**Status 2026-09-09: landed.** `rocket-compiler audit` now prints one line
+per convolution and matmul candidate -- source location, kind, layout,
+shape, precision rung, decision, limit class and the planner's own message
+-- then the placement report, then a reconciliation of the two.
+`--report-json` writes the same record machine-readably from `audit` or
+`compile`, and `--strict-offload` fails the compile instead of falling
+back.
+
+Where each half comes from, and why not from one place. The decision record
+is read at the end of the **preprocessing** phase, the phase
+`rocket-plan-candidates` runs in (`rocket-compiler/src/decisions.rs`); the
+placement report is read at `executable-targets` as before. The record does
+survive to `executable-targets` on every model measured here, so one dump
+would have worked -- but whether a discardable attribute survives is a
+property of which passes IREE happens to run, and `report.rs` documents the
+`rocket.origin` tags that did not. `audit` and a reporting `compile`
+therefore stop at one more phase; the resulting `.vmfb` is byte-identical to
+one built without stopping (MobileNetV2 fp16, sha256 equal across plain,
+`--report-json` and `--strict-offload` builds).
+
+What the reconciliation is allowed to say. A Rocket dispatch has no per-op
+name -- the spec splices a handful of fixed executables across every matched
+shape -- and a CPU dispatch's name encodes its own loop ranges, not the
+candidate's logical shape (a convolution's are its *output* extents plus the
+kernel, with the input padding already folded away). So the join is by count
+and by op *kind*, never by a claimed per-op identity, and the report says
+"at least N" where N is a floor. What it does separate is the three cases a
+reader acts on: the planner refused, the admission envelope has no evidence
+for the shape class, or both said yes and a *matcher* still declined -- the
+last being a semantic or fusion gap in the transform spec, and the only one
+of the three that closes without new hardware measurements.
+
+Three defects this found and fixed. (1) The decision record asked only the
+planner, never the admission envelope, so a candidate the envelope declines
+-- which every matcher then declines -- was recorded as `direct`. The pass
+now asks both, and for an `i8 x i8 -> i32` operation it tries *both* int8
+rungs before calling the class unmeasured, because which rung applies is
+decided by the matcher that claims it and not by the operand types. The
+`rocket.plan_refused` tag is deliberately **not** extended to admission
+refusals: the tag makes every matcher decline, and this pass cannot know
+which rung a matcher is claiming for. (2) `report.rs` read only bare MLIR
+symbols, so every executable in a module whose entry point is
+`torch-jit-export$async` -- i.e. every ONNX import through torch-mlir --
+came back unnamed with zero dispatch sites. (3) `rocket_plan_precision_name`
+was added to the C ABI (version 3) so a report names a rung in the same
+spelling the transform spec's `precision` attribute uses.
+
+Evidence: 39 plugin lit tests pass, including `rocket_plan_candidates.mlir`
+with the new fields, an admission-declined depthwise proving it is *not*
+tagged refused, and an int8 3x3 admitted only on the requantized rung; 38
+`rocket-compiler` unit tests including the reconciliation and strict-offload
+cases; MobileNetV2 fp16 unchanged at 53 candidates -> 53 Rocket dispatch
+sites -> 77 hardware jobs, with `--strict-offload` passing on it and failing
+with a named reason on a module carrying a Cin-3585 convolution.
+
+Still open here: the cost policy. `limit` has a `cost` class and the report
+prints it, but nothing produces one -- a candidate that plans and admits but
+would be slower on the NPU (ISSUES.md P7's depthwise convolutions) is still
+recorded as accepted. That is the same gap section 2 closes with, and it
+needs a cost model before a report can honestly say so.
 
 Extend `rocket-compiler` reporting with a structured decision report generated
 at selection time and reconciled with final placement. Preserve origin IDs via

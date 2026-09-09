@@ -26,7 +26,7 @@ use rocket_core::{
     policy::{PlanningPolicy, with_policy},
 };
 
-pub const ROCKET_PLAN_ABI_VERSION: u32 = 2;
+pub const ROCKET_PLAN_ABI_VERSION: u32 = 3;
 
 pub const ROCKET_PLAN_OK: u32 = 0;
 pub const ROCKET_PLAN_INVALID_SHAPE: u32 = 1;
@@ -486,6 +486,27 @@ pub extern "C" fn rocket_plan_status_name(status: u32) -> *const c_char {
     NAMES[(status as usize).min(NAMES.len() - 1)].as_ptr()
 }
 
+#[unsafe(no_mangle)]
+pub extern "C" fn rocket_plan_precision_name(precision: u32) -> *const c_char {
+    // The spellings the transform spec's `precision` attribute uses, so a
+    // placement report and the spec name the same rung the same way. The
+    // two int8 entries are the whole reason this exists: `i8 x i8 -> i32`
+    // in the IR is either of them, and a report that only said "int8"
+    // would not say which lowering was asked about.
+    const NAMES: [&std::ffi::CStr; 9] = [
+        c"fp16",
+        c"fp16_accumulator",
+        c"bf16",
+        c"int16",
+        c"tf32",
+        c"int4",
+        c"int8_requant",
+        c"int8_accumulator",
+        c"unknown",
+    ];
+    NAMES[(precision as usize).min(NAMES.len() - 1)].as_ptr()
+}
+
 /// # Safety
 /// See `rocket_plan.h`.
 #[unsafe(no_mangle)]
@@ -743,6 +764,29 @@ mod tests {
             precision(8, &q).err().map(|r| r.status),
             Some(ROCKET_PLAN_INVALID_ARGUMENT)
         );
+    }
+
+    /// The names are what a placement report prints, so they are pinned to
+    /// the codes here rather than left to drift against the transform
+    /// spec's `precision` attribute, which uses the same spellings.
+    #[test]
+    fn the_precision_names_track_the_codes() {
+        let name = |code| {
+            unsafe { CStr::from_ptr(rocket_plan_precision_name(code)) }
+                .to_str()
+                .unwrap()
+        };
+        assert_eq!(name(0), "fp16");
+        assert_eq!(name(1), "fp16_accumulator");
+        assert_eq!(name(2), "bf16");
+        assert_eq!(name(3), "int16");
+        assert_eq!(name(4), "tf32");
+        assert_eq!(name(5), "int4");
+        assert_eq!(name(6), "int8_requant");
+        assert_eq!(name(7), "int8_accumulator");
+        // Past the table, and far past it: neither may read out of bounds.
+        assert_eq!(name(8), "unknown");
+        assert_eq!(name(u32::MAX), "unknown");
     }
 
     #[test]

@@ -116,17 +116,56 @@ impl PlacementReport {
     pub fn cpu_dispatches(&self) -> usize {
         self.cpu_executables.iter().map(|e| e.dispatches).sum()
     }
+
+    /// CPU dispatch sites whose export name says they are running a
+    /// convolution or a matmul: work that was a Rocket candidate and is not
+    /// on the NPU. This is the placement side of the reconciliation, and the
+    /// only per-dispatch evidence a module carries -- an operation IREE
+    /// fused into a larger element-wise dispatch leaves none, so a zero here
+    /// means "none named", not "none exist".
+    pub fn contraction_cpu_dispatches(&self) -> usize {
+        self.cpu_executables
+            .iter()
+            .filter(|executable| executable.is_contraction())
+            .map(|executable| executable.dispatches)
+            .sum()
+    }
+
+    /// The contraction-shaped CPU executables, most dispatch sites first, for
+    /// naming names in a strict-offload failure.
+    pub fn contraction_cpu_executables(&self) -> Vec<&PlacementExecutable> {
+        let mut executables: Vec<&PlacementExecutable> = self
+            .cpu_executables
+            .iter()
+            .filter(|executable| executable.is_contraction())
+            .collect();
+        executables.sort_by(|a, b| b.dispatches.cmp(&a.dispatches).then(a.name.cmp(&b.name)));
+        executables
+    }
+}
+
+impl PlacementExecutable {
+    /// The op kinds of this executable's exports, as IREE named them.
+    pub fn kinds(&self) -> Vec<String> {
+        self.exports.iter().filter_map(|e| export_kind(e)).collect()
+    }
+
+    /// Whether any export of this executable is a convolution or matmul.
+    pub fn is_contraction(&self) -> bool {
+        self.kinds().iter().any(|kind| is_contraction_kind(kind))
+    }
 }
 
 /// Pulls the executable symbol out of a
 /// `stream.cmd.dispatch @executable::@variant::@export(...)` line, i.e. the
-/// first `@name` up to its `::`.
+/// first `@name` up to its `::`. The quotes come off a quoted symbol so the
+/// name matches the one read off the executable's own declaration.
 fn dispatch_target(trimmed: &str) -> Option<String> {
     const MARKER: &str = "stream.cmd.dispatch @";
     let start = trimmed.find(MARKER)? + MARKER.len();
     let rest = &trimmed[start..];
     let end = rest.find("::")?;
-    Some(rest[..end].to_string())
+    Some(rest[..end].trim_matches('"').to_string())
 }
 
 /// Pulls `key = "value"` out of a printed MLIR attribute dict line. Good
@@ -141,15 +180,69 @@ fn extract_attr(line: &str, key: &str) -> Option<String> {
 
 /// Pulls the `@symbol_name` off a `hal.executable private @name attributes
 /// {...}` or `hal.executable.export public @name ordinal(...) ...` line.
-/// Stops at the first character that can't appear in a bare (unquoted) MLIR
-/// symbol name.
+///
+/// Both spellings, because IREE names an executable after the function that
+/// produced it and an entry point whose name is not a bare MLIR identifier
+/// is printed quoted -- `@"torch-jit-export$async_dispatch_0"`, which every
+/// ONNX import through torch-mlir produces. Reading only the bare spelling
+/// stopped at the opening quote and yielded an empty name, so every CPU
+/// executable in such a module was reported as `- (0 dispatch site(s))`
+/// with no name and no dispatch count at all.
 fn extract_symbol_name(line: &str) -> Option<String> {
     let start = line.find('@')? + 1;
-    let end = line[start..]
+    let rest = &line[start..];
+    if let Some(quoted) = rest.strip_prefix('"') {
+        let end = quoted.find('"')?;
+        return Some(quoted[..end].to_string());
+    }
+    let end = rest
         .find(|c: char| !(c.is_alphanumeric() || c == '_' || c == '$' || c == '.'))
-        .map(|i| start + i)
-        .unwrap_or(line.len());
-    Some(line[start..end].to_string())
+        .unwrap_or(rest.len());
+    Some(rest[..end].to_string())
+}
+
+/// The op kind IREE encoded in a dispatch export name.
+///
+/// An export is named `<function>_dispatch_<ordinal>_<kind>_<extents>_<dtypes>`
+/// -- `main$async_dispatch_3_conv_56x56x144x3x3_f16xf16xf32`,
+/// `..._matmul_like_196x64x192_f16xf16xf32`, `..._elementwise_401408_f16`,
+/// `..._slow_memcpy`. The kind is what survives reliably; the extents are
+/// the dispatch's loop ranges, not the candidate's logical shape (a
+/// convolution's are its *output* extents plus the kernel, and its input
+/// padding is already folded away), so they are not a key an original op
+/// can be matched on and this deliberately does not try.
+///
+/// Returns the kind with its extents and dtypes stripped, or `None` when the
+/// name does not have the `_dispatch_<n>_` infix -- which is every
+/// hand-authored Rocket export.
+fn export_kind(export: &str) -> Option<String> {
+    const MARKER: &str = "_dispatch_";
+    let tail = &export[export.rfind(MARKER)? + MARKER.len()..];
+    let after_ordinal = tail.strip_prefix(|c: char| c.is_ascii_digit())?;
+    let after_ordinal = after_ordinal.trim_start_matches(|c: char| c.is_ascii_digit());
+    let kind = after_ordinal.strip_prefix('_')?;
+    // Everything up to the first token that starts with a digit: that is the
+    // extents group, and `matmul_like` shows why the kind is not just the
+    // first token.
+    let words: Vec<&str> = kind
+        .split('_')
+        .take_while(|word| !word.starts_with(|c: char| c.is_ascii_digit()))
+        .collect();
+    if words.is_empty() {
+        return None;
+    }
+    Some(words.join("_"))
+}
+
+/// Whether a CPU dispatch is running a convolution or a matmul, i.e. work a
+/// Rocket candidate would have been. Names the classes IREE gives
+/// contraction dispatches; anything else (element-wise, transpose,
+/// reduction, pooling, a memcpy) is not a candidate this report tracks.
+fn is_contraction_kind(kind: &str) -> bool {
+    matches!(
+        kind,
+        "conv" | "conv_2d" | "depthwise_conv" | "matmul" | "matmul_like" | "batch_matmul"
+    )
 }
 
 impl fmt::Display for PlacementReport {
@@ -281,6 +374,96 @@ mod tests {
         assert_eq!(report.rocket_executables.len(), 2);
     }
 
+    /// Every ONNX import through torch-mlir names its entry point
+    /// `torch-jit-export$async`, whose `-` forces MLIR to quote every
+    /// executable symbol derived from it. Reading only bare symbols reported
+    /// the whole CPU side of such a module as unnamed executables with zero
+    /// dispatch sites.
+    const QUOTED_IR: &str = r#"
+  hal.executable private @"torch-jit-export$async_dispatch_3" attributes {rocket.final = "cpu"} {
+    hal.executable.variant public @embedded_elf_arm_64 target(<"llvm-cpu", "embedded-elf-arm_64">) {
+      hal.executable.export public @"torch-jit-export$async_dispatch_3_conv_56x56x144x3x3_f16xf16xf32" ordinal(0) layout(#layout) {
+      }
+    }
+  }
+  hal.executable private @"torch-jit-export$async_dispatch_4" attributes {rocket.final = "cpu"} {
+    hal.executable.variant public @embedded_elf_arm_64 target(<"llvm-cpu", "embedded-elf-arm_64">) {
+      hal.executable.export public @"torch-jit-export$async_dispatch_4_elementwise_401408_f16" ordinal(0) layout(#layout) {
+      }
+    }
+  }
+  util.func public @"torch-jit-export$async"() {
+    %0 = stream.cmd.execute with() {
+      stream.cmd.dispatch @"torch-jit-export$async_dispatch_3"::@embedded_elf_arm_64::@"torch-jit-export$async_dispatch_3_conv_56x56x144x3x3_f16xf16xf32"() {
+      }
+    } => !stream.timepoint
+    %1 = stream.cmd.execute with() {
+      stream.cmd.dispatch @"torch-jit-export$async_dispatch_4"::@embedded_elf_arm_64::@"torch-jit-export$async_dispatch_4_elementwise_401408_f16"() {
+      }
+    } => !stream.timepoint
+    util.return
+  }
+"#;
+
+    #[test]
+    fn a_quoted_executable_symbol_is_named_and_counted() {
+        let report = PlacementReport::scan(QUOTED_IR);
+        let names: Vec<&str> = report
+            .cpu_executables
+            .iter()
+            .map(|e| e.name.as_str())
+            .collect();
+        assert_eq!(
+            names,
+            vec![
+                "torch-jit-export$async_dispatch_3",
+                "torch-jit-export$async_dispatch_4"
+            ]
+        );
+        assert_eq!(report.cpu_dispatches(), 2);
+    }
+
+    /// The reconciliation signal: a convolution left on the CPU says so in
+    /// its export name, an element-wise dispatch is not a candidate.
+    #[test]
+    fn contraction_dispatches_are_told_apart_from_the_rest() {
+        let report = PlacementReport::scan(QUOTED_IR);
+        assert_eq!(report.contraction_cpu_dispatches(), 1);
+        let named: Vec<&str> = report
+            .contraction_cpu_executables()
+            .iter()
+            .map(|e| e.name.as_str())
+            .collect();
+        assert_eq!(named, vec!["torch-jit-export$async_dispatch_3"]);
+    }
+
+    #[test]
+    fn export_kinds_stop_before_the_extents() {
+        assert_eq!(
+            export_kind("main$async_dispatch_3_conv_56x56x144x3x3_f16xf16xf32").as_deref(),
+            Some("conv")
+        );
+        // `matmul_like` is why the kind is not just the first token.
+        assert_eq!(
+            export_kind("main$async_dispatch_12_matmul_like_196x64x192_f16xf16xf32").as_deref(),
+            Some("matmul_like")
+        );
+        assert_eq!(
+            export_kind("main$async_dispatch_7_elementwise_401408_f16").as_deref(),
+            Some("elementwise")
+        );
+        // No extents at all.
+        assert_eq!(
+            export_kind("main$async_dispatch_2_slow_memcpy").as_deref(),
+            Some("slow_memcpy")
+        );
+        // A hand-authored Rocket export has no `_dispatch_<n>_` infix.
+        assert_eq!(export_kind("rocket_dynamic_conv2d"), None);
+        assert!(is_contraction_kind("conv"));
+        assert!(is_contraction_kind("matmul_like"));
+        assert!(!is_contraction_kind("elementwise"));
+    }
+
     #[test]
     fn dispatch_target_reads_only_the_executable_symbol() {
         assert_eq!(
@@ -294,6 +477,13 @@ mod tests {
             Some("main_graph$async_dispatch_7")
         );
         assert_eq!(dispatch_target("stream.cmd.fill %c0_i8, %arg4"), None);
+        // A quoted symbol must come back as the bare name the executable's
+        // own declaration carries, or the two never join up.
+        assert_eq!(
+            dispatch_target("stream.cmd.dispatch @\"torch-jit-export$async_dispatch_3\"::@v::@e(")
+                .as_deref(),
+            Some("torch-jit-export$async_dispatch_3")
+        );
     }
 
     #[test]
