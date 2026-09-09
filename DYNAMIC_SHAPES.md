@@ -191,7 +191,7 @@ needs none of this.
 Today the *channel* ceilings are compile-time matcher facts.
 `@match_dynamic_conv2d` bounds Cin and Cout at 3584 (matching
 `conv::MAX_INPUT_CHANNELS` / `MAX_OUTPUT_CHANNELS`,
-`iree-rocket-hal/src/rocket/conv.rs:297` and `:495`); the 3x3 matcher keeps a
+`rocket-core/src/conv.rs`, since the 2026-09-09 extraction); the 3x3 matcher keeps a
 separate Cin 1152 / Cout 1792 (spec `:6013` and `:6014`); stride lives in the
 executable variant. A model outside *those* bounds does not match and runs on
 the CPU -- correct, just slower.
@@ -265,6 +265,28 @@ Once the check is honest, decide what an out-of-envelope dispatch should do:
 ---
 
 ## DS4 (S2) — `RocketVerifyConvShapesPass` goes blind exactly when shapes are symbolic
+
+**Resolved 2026-09-09.** The check is now stated on attributes, as the last
+paragraph of this section asked. `rocket-record-conv-attrs` runs right before
+the demotion and stamps every named convolution and contraction with
+`rocket.recorded_attrs` -- its effective `strides`, `dilations`,
+`indexing_maps` and `cast` -- as a discardable attribute, which is exactly
+what a `getPrunedAttributeList` rebuild carries over while eliding the
+inherent ones. `rocket-verify-conv-shapes` then errors on any op whose
+attributes no longer agree with its record, or that has lost its record
+while the enclosing function carries the pass's mark, and strips both before
+the DAG matchers (which compare whole attribute dictionaries) can see them.
+The arithmetic extent check is kept as a second opinion where the extents are
+static. `rocket_verify_conv_shapes_upstream_demote.mlir` is the regression:
+the original `iree-global-opt-demote-contraction-inputs` bug on a
+`tensor<1x?x?x3xf32>` stride-2 conv, which the old check passed and the new
+one refuses. Both passes live in
+[`RocketVerifyConvShapesPass.cpp`](rocket-compiler-plugin/target/Rocket/RocketVerifyConvShapesPass.cpp).
+The record is deliberately taken *after* the channels-last round trip:
+`linalg-specialize-generic-ops` rebuilds the named op without the generic's
+discardable attributes, so a record taken earlier would not survive it, and
+that leg stays covered by the arithmetic check alone. The rest of this
+section is the original analysis.
 
 The pass exists to catch an earlier pass having rewritten a convolution into a
 different one -- concretely, the
@@ -360,7 +382,8 @@ Two smaller consequences of moving the decision to runtime:
 3. **DS3's policy decision**, which falls out of (2): make the assumed `umax`
    reproduce the matcher envelope so the compile-time decision stays
    compile-time.
-4. **DS4**, restating the verify pass on attributes rather than extents.
+4. ~~**DS4**, restating the verify pass on attributes rather than extents.~~
+   -- done 2026-09-09; see the section.
 5. **DS5**, whichever half (1) turned out to need.
 6. **DS2 last, separately.** It is a wire-format change and a `conv::Shape`
    change, and `N == 1` covers every model this repo currently measures.

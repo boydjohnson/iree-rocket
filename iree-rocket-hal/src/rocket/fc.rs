@@ -32,51 +32,13 @@
 
 use crate::rocket::{
     builders::RegCmd,
-    conv::{Activation, Buffers, ConvPlan, Precision},
+    conv::{Buffers, ConvPlan, PlanError},
 };
 
-/// The 1x1 spatial kernel used by every captured FC program.
-pub const KERNELS: [usize; 2] = [1, 1];
-
-/// Logical `[M,K] x [K,N] -> [M,N]` fully-connected shape.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub struct Shape {
-    pub m: u32,
-    pub k: u32,
-    pub n: u32,
-    pub precision: Precision,
-    pub activation: Activation,
-}
-
-impl Shape {
-    /// Constructs an FC shape and validates it against the convolution
-    /// builder's capture-backed channel limits.
-    pub fn new(m: u32, k: u32, n: u32, precision: Precision) -> Shape {
-        let shape = Shape {
-            m,
-            k,
-            n,
-            precision,
-            activation: Activation::None,
-        };
-        let _ = shape.as_conv_shape();
-        shape
-    }
-
-    /// Fuses an activation through the convolution builder's captured BN
-    /// path.
-    pub fn with_activation(mut self, activation: Activation) -> Shape {
-        self.activation = activation;
-        self
-    }
-
-    /// Returns the physical convolution shape observed in the vendor sweep.
-    pub fn as_conv_shape(self) -> crate::rocket::conv::Shape {
-        crate::rocket::conv::Shape::with_precision(self.m, 1, 1, self.k, self.n, self.precision)
-            .with_padding([0, 0])
-            .with_activation(self.activation)
-    }
-}
+// The shape mapping itself lives in `rocket-core` (COMPILER_ROADMAP.md
+// section 1); this module keeps the register emission and the hardware
+// record above.
+pub use rocket_core::fc::{KERNELS, Shape};
 
 /// Standalone-job plan for a fully-connected operation.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -86,12 +48,18 @@ pub struct Plan {
 }
 
 impl Plan {
-    /// Plans the captured height-1, 1x1-convolution lowering.
+    /// Plans the captured height-1, 1x1-convolution lowering, panicking on
+    /// a refusal.
     pub fn new(shape: Shape) -> Plan {
-        Plan {
+        Plan::try_new(shape).unwrap_or_else(|error| panic!("{error}"))
+    }
+
+    /// [`Plan::new`], returning the planner's refusal instead of panicking.
+    pub fn try_new(shape: Shape) -> Result<Plan, PlanError> {
+        Ok(Plan {
             shape,
-            conv: ConvPlan::new(shape.as_conv_shape(), KERNELS),
-        }
+            conv: ConvPlan::try_new(shape.try_as_conv_shape()?, KERNELS)?,
+        })
     }
 
     pub fn shape(&self) -> Shape {
@@ -127,7 +95,7 @@ mod tests {
                 CnaFcDataSize1, CnaWeightSize0, CnaWeightSize1, CnaWeightSize2,
             },
         },
-        conv::{Multiplier, Quantization},
+        conv::{Multiplier, Precision, Quantization},
     };
 
     fn value_of<R: RegisterMeta>(program: &[RegCmd]) -> u32 {

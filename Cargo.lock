@@ -223,6 +223,7 @@ dependencies = [
  "bindgen",
  "cc",
  "nix",
+ "rocket-core",
  "serde",
  "serde_json",
 ]
@@ -375,6 +376,10 @@ dependencies = [
  "clap",
  "libloading",
 ]
+
+[[package]]
+name = "rocket-core"
+version = "0.1.0"
 
 [[package]]
 name = "rocket-hal-driver"

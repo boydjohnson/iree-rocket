@@ -9241,15 +9241,28 @@ module attributes {transform.with_named_sequence} {
     // the same convolution set, so that part is a behaviour-preserving swap
     // apart from keeping those two attributes. linalg.matmul was added to it
     // on 2026-09-04 and has no counterpart upstream.
-    %demoted_funcs = transform.apply_registered_pass
-        "rocket-demote-conv-inputs-to-f16" to %gemv_funcs
+    //
+    // The record/verify pair around it is the tripwire for the above and
+    // anything like it. Record stamps every named convolution and matmul
+    // with its `strides`/`dilations`/`indexing_maps`/`cast` (as a
+    // discardable attribute, which every getPrunedAttributeList rebuild
+    // carries over); verify errors if any op's attributes no longer agree
+    // with its record, or if an op has lost the record, and also -- where
+    // the extents are static -- if a convolution's output extent disagrees
+    // with its own input/filter/stride/dilation. The attribute check is
+    // what keeps this live on a symbolic-shaped model (DYNAMIC_SHAPES.md
+    // DS4); the arithmetic one is a second opinion. Runs while padding is
+    // still explicit and nothing has been tiled, so the relation is exact
+    // here. Never fires on a healthy compile. Verify also strips the record,
+    // which must not reach the DAG matchers below (they compare whole
+    // attribute dictionaries), so keep the pair adjacent to what it guards
+    // rather than moving record earlier.
+    %recorded_funcs = transform.apply_registered_pass
+        "rocket-record-conv-attrs" to %gemv_funcs
       : (!transform.any_op) -> !transform.any_op
-
-    // Tripwire for the above and anything like it: errors if any named
-    // convolution's output extent disagrees with its own input/filter/
-    // stride/dilation. Runs while padding is still explicit and nothing has
-    // been tiled, so the relation is exact here. Never fires on a healthy
-    // compile.
+    %demoted_funcs = transform.apply_registered_pass
+        "rocket-demote-conv-inputs-to-f16" to %recorded_funcs
+      : (!transform.any_op) -> !transform.any_op
     %verified_funcs = transform.apply_registered_pass
         "rocket-verify-conv-shapes" to %demoted_funcs
       : (!transform.any_op) -> !transform.any_op

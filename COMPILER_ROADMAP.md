@@ -44,8 +44,34 @@ CPU fallback after an NPU dispatch has already been selected.
 Preserve `RocketVerifyConvShapesPass.cpp` as an early semantic tripwire. An
 inconsistent convolution extent is a compilation error even if CPU fallback is
 enabled: moving an incorrectly rewritten operation to CPU does not repair it.
+Since 2026-09-09 (DYNAMIC_SHAPES.md DS4) it also checks each op's
+shape-defining attributes against a record taken before the demotion, so it
+holds on symbolic extents as well.
 
 ## 1. Extract a pure, fallible planning library
+
+**Status 2026-09-09: milestone A landed.** `rocket-core` is in the workspace
+with no dependencies; `conv.rs` holds the descriptors, limits, layout
+geometry, CBUF partitioning, tiles and the pure `ConvPlan`, `fc.rs` the
+matmul mapping, `error.rs` the `PlanError`/`PlanErrorCode` refusal, and
+`policy.rs` the two environment overrides. Every panicking constructor has a
+`try_*` twin (`Shape::try_with_precision`, `try_with_padding`,
+`try_with_activation`, `try_with_depthwise`, `ConvPlan::try_new`,
+`try_with_cbuf_banks`, `fc::Shape::try_new`, `fc::Plan::try_new`) and the
+panicking one is now a wrapper with the same message. `ConvPlan::try_new`
+checks the kernel against the padded extents and the coefficient footprint
+against 32 bits before planning, and `Shape::try_with_precision` refuses a
+surface that overflows the address space, so the planning path is free of
+arithmetic panics on malformed descriptors. The HAL's `conv::ConvPlan` is a
+newtype over the core plan that derefs to it and adds `programs()`;
+`validate_conv_shape` returns the actual `PlanError`, with a `catch_unwind`
+kept only as an `Internal` backstop. Evidence: the HAL's 177 unit tests
+(register hashes) and the vendor-fixture scorers pass unchanged; 19 new host
+refusal/overflow tests in `rocket-core`; old and new `iree-run-module`
+produce bit-identical outputs on planck for fp16 (both widths) and int8
+MobileNetV2. Still to do under this section: threading a `PlanningPolicy`
+argument in place of `policy.rs`'s environment reads, and the pooling
+planner, which stays in the HAL.
 
 Add `rocket-core` to the Cargo workspace. It must build and test on the host
 without a device, DRM, IREE, MLIR, or register submission dependencies.

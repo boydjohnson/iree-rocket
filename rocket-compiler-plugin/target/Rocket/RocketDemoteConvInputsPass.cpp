@@ -113,9 +113,48 @@
 // dispatch and the residual add leaves the CPU; ISSUES.md P7 has the edge
 // census and the phase deltas. The demote stays off.
 //
+// **Re-measured 2026-09-09 at 600 MHz, after ISSUES.md M2 was resolved.**
+// M2 was the clock this file's 2026-09-08 verdict named as the binding term,
+// so it was the one input that had actually changed. Governor `performance`,
+// four interleaved passes, medians, against a --no-offload arm built by the
+// same pipeline:
+//
+//                        base(37)   dw(44)   nooff    dw vs base
+//   default topo 200 MHz    99.4     99.8    108.0    1.004x slower
+//   default topo 600 MHz    87.5     81.0    108.0    1.080x FASTER
+//   four workers 200 MHz    83.1     93.2     54.5    1.122x slower
+//   four workers 600 MHz    73.1     74.7     54.5    1.022x slower
+//
+// The clock is worth 8-10 points to the depthwise arm in *both* allocations,
+// which is what P7 predicted, and it is enough to flip the sign at the
+// default allocation. max|diff| vs --no-offload 0.0051 (dw) / 0.0050 (base),
+// top-1 stable, zero faults in ~60 runs.
+//
+// **The demote still stays off, but the reason has moved.** It is no longer
+// "depthwise loses to the round trip": at four workers --no-offload is
+// 54.5 ms against a best NPU arm of 73.1, so the CPU is 1.34x faster and the
+// whole fp16 offload on this model is underwater. The CPU baseline nearly
+// doubles from four workers (108.0 -> 54.5) while every NPU arm gains 8-14%.
+// Whether this demote is on is a detail inside a losing trade, and the 81.0
+// vs 108.0 row that appears to beat the CPU only does so at an allocation
+// that starves the CPU of workers -- taskset does NOT set IREE's worker
+// count. Turn this on when the offload itself is competitive at four
+// workers, not before.
+//
+// **Two corrections to the paragraph above this one.** The "same single
+// edge" census is stale: compaction now skips 67 dense output writes in the
+// 37-site build and 464 in the 44-site one, because the residual-add-on-NPU
+// and lazy-compaction work landed the same day that census was taken.
+// And do not measure any of this under governor `ondemand`: it read the
+// four-worker control at 1.078x against the documented 1.18x and gave the
+// default-topology control the wrong *sign*. Under `performance` both
+// controls reproduce.
+//
 // Anything left alone is safe: an op that stays f32 fails the matchers' f16
 // typing and goes to the CPU, and RocketPromoteUnclaimedConvInputsPass gives
 // f32 back to anything demoted that the match loop then declines.
+
+#include <cstdlib>
 
 #include "mlir/Dialect/Arith/IR/Arith.h"
 #include "mlir/Dialect/Linalg/IR/Linalg.h"
@@ -230,6 +269,27 @@ Value demoteInput(PatternRewriter &rewriter, Location loc, Value value) {
   return demoted;
 }
 
+// P7 experiment gate. The depthwise demote is off by default -- the scope
+// comment above carries the accounting and the 2026-09-09 re-measurement at
+// 600 MHz. `ROCKET_DEMOTE_DEPTHWISE=1` builds the 44-site arm from the same
+// compiler binary, so both arms come out of one build and the A/B costs a
+// recompile of the model rather than of the compiler.
+//
+// Verify the gate by dispatch-site count, not by trusting the env var: 37
+// sites off, 44 on, the delta being rocket_dynamic_depthwise_relu6_executable
+// (4) and its _s2 twin (3). `rocket-compiler audit` prints them. And build
+// board arms with --llvmcpu-target-triple aarch64-linux-gnu, or the vmfb is
+// x86 and every run dies with "HAL device `cpu_device` not found".
+//
+// Read once: a pass runs many times per compile.
+static bool rocketDemoteDepthwiseEnabled() {
+  static const bool enabled = [] {
+    const char *value = std::getenv("ROCKET_DEMOTE_DEPTHWISE");
+    return value && llvm::StringRef(value) != "0";
+  }();
+  return enabled;
+}
+
 template <typename ContractionOpTy>
 struct DemoteInputsToF16 : OpRewritePattern<ContractionOpTy> {
   using OpRewritePattern<ContractionOpTy>::OpRewritePattern;
@@ -300,6 +360,10 @@ struct RocketDemoteConvInputsPass
                  DemoteInputsToF16<linalg::Conv2DNgchwFgchwOp>,
                  DemoteInputsToF16<linalg::Conv2DNgchwGfchwOp>,
                  DemoteInputsToF16<linalg::MatmulOp>>(context);
+    if (rocketDemoteDepthwiseEnabled()) {
+      patterns.add<DemoteInputsToF16<linalg::DepthwiseConv2DNhwcHwcOp>,
+                   DemoteInputsToF16<linalg::DepthwiseConv2DNchwChwOp>>(context);
+    }
     if (failed(applyPatternsGreedily(getOperation(), std::move(patterns)))) {
       return signalPassFailure();
     }

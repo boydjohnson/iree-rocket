@@ -189,6 +189,13 @@ struct RocketPromoteUnclaimedConvInputsPass
                  PromoteInputsToF32<linalg::Conv2DNgchwFgchwOp>,
                  PromoteInputsToF32<linalg::Conv2DNgchwGfchwOp>,
                  PromoteInputsToF32<linalg::MatmulOp>>(context);
+    // Unconditional, unlike the demote's depthwise gate: this pass only ever
+    // acts on ops carrying kDemotedAttrName, so with the gate off there are
+    // no demoted depthwise ops to promote and these patterns never fire.
+    // Registering them always means a spec that declines a demoted depthwise
+    // still gets its f32 back even if the two passes disagree about the gate.
+    patterns.add<PromoteInputsToF32<linalg::DepthwiseConv2DNhwcHwcOp>,
+                 PromoteInputsToF32<linalg::DepthwiseConv2DNchwChwOp>>(context);
     if (failed(applyPatternsGreedily(getOperation(), std::move(patterns)))) {
       return signalPassFailure();
     }

@@ -12,7 +12,8 @@ for the Rocket NPU backend (RK3588). This repository produces:
 | Path | Role |
 |---|---|
 | [`rocket-schema`](rocket-schema) | Canonical FlatBuffers schema for Rocket executables; shared by the compiler plugin (C++) and the runtime crates (Rust). |
-| [`iree-rocket-hal`](iree-rocket-hal) | Low-level Rust crate: ioctl/mmap access to the RK3588 NPU and register command building. |
+| [`rocket-core`](rocket-core) | Pure, dependency-free Rust crate: convolution/matmul descriptors, hardware limits, layout geometry, CBUF partitioning and tile planning, with fallible `try_*` APIs that return a `PlanError` code instead of panicking. Shared by the runtime and, eventually, the compiler. |
+| [`iree-rocket-hal`](iree-rocket-hal) | Low-level Rust crate: ioctl/mmap access to the RK3588 NPU and register command building. Consumes `rocket-core`'s plans and re-exports its planner under `rocket::conv`. |
 | [`rocket-hal-driver`](rocket-hal-driver) | Rust `staticlib` implementing IREE's HAL driver interface, statically linked into IREE via `iree_register_external_hal_driver()`. Depends on `iree-rocket-hal` and `rocket-schema`. Includes HAL CTS wiring under `cts/`. |
 | [`rocket-compiler-plugin`](rocket-compiler-plugin) | C++ IREE compiler target plugin ("Rocket"), loaded via `IREE_CMAKE_PLUGIN_PATHS`. Serializes executables using `rocket-schema`'s FlatBuffer format. |
 | [`rocket-compiler`](rocket-compiler) | Rust driver over `libIREECompiler.so`. Applies the Rocket transform spec and the device flags it expects, and can audit what ended up on the NPU. |
@@ -56,7 +57,7 @@ single repo-root `CMakePresets.json` can't span these plus the vendored
 of the aarch64 configure preset, while `configure-compiler-host.sh` covers the
 compiler case, which has no wrapper project at all.
 
-The Rust crates (`rocket-schema`, `iree-rocket-hal`, `rocket-hal-driver`) form
+The Rust crates (`rocket-core`, `rocket-schema`, `iree-rocket-hal`, `rocket-hal-driver`) form
 a single Cargo workspace and can be built/checked independently of the CMake
 builds above:
 
@@ -265,11 +266,16 @@ worth 0.349 max|err| on the final logits. Only the plugin's own demotion is
 reverted: both passes agree on a `rocket.f16_demoted` tag, so a model that
 authored its own f16 convolution is untouched.
 
-`rocket-verify-conv-shapes` is the tripwire for anything like it: it errors if
-a named convolution's output spatial extent disagrees with its own input,
-filter, stride and dilation. It runs immediately before the match/rewrite
-loop, while padding is still explicit and nothing has been tiled, so the
-relation is exact there. It should never fire.
+`rocket-record-conv-attrs` and `rocket-verify-conv-shapes` are the tripwire
+for anything like it. Record, run right before the demotion, stamps every
+named convolution and matmul with its `strides`, `dilations`,
+`indexing_maps` and `cast`; verify, run right after, errors if any op's
+attributes no longer agree with that record or if an op has lost the record
+-- a check that holds on symbolic shapes too -- and, where the extents are
+static, if a convolution's output spatial extent disagrees with its own
+input, filter, stride and dilation. Both run immediately before the
+match/rewrite loop, while padding is still explicit and nothing has been
+tiled, so the relation is exact there. It should never fire.
 
 ### ONNX models
 

@@ -1,0 +1,7 @@
+[package]
+name = "rocket-core"
+version = "0.1.0"
+edition = "2024"
+description = "Pure, fallible shape and tile planning for the RK3588 NPU, shared by the compiler and the runtime"
+
+[dependencies]

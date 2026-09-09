@@ -54,7 +54,9 @@
 //! This is `rocket-hal-driver`'s tag value `3` in `executable_cache.rs`'s
 //! tag convention -- see that module's doc comment.
 
-use crate::rocket::conv::{self, Activation, Kernels, Multiplier, Precision, Quantization};
+use crate::rocket::conv::{
+    self, Activation, Kernels, Multiplier, PlanError, PlanErrorCode, Precision, Quantization,
+};
 
 pub const CONV2D_V1_FORMAT_VERSION: u32 = 4;
 
@@ -333,34 +335,55 @@ pub fn decode_conv_shape_v1(payload: &[u8]) -> Result<(conv::Shape, Kernels), De
 /// `conv::Shape`'s and `ConvPlan`'s own bounds by hand (channel ranges,
 /// padding fitting the CNA's 4-bit fields, CBUF/kernel-plan capacity, ...),
 /// this rebuilds the shape through the exact same constructor chain a real
-/// caller would use (`Shape::with_precision`/`with_padding`/`with_depthwise`)
-/// derives its physical accumulator shape, and trial-plans that shape,
-/// catching whatever that chain's own `assert!`s reject. This is a single
-/// source of truth for those bounds -- there is exactly one place each one
-/// lives, in `conv.rs` itself -- rather than two copies that can drift.
-pub fn validate_conv_shape(shape: &conv::Shape, kernels: Kernels) -> Result<(), &'static str> {
-    std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-        let mut rebuilt = conv::Shape::with_precision(
+/// caller would use (`try_with_precision`/`try_with_padding`/
+/// `try_with_depthwise`), derives its physical accumulator shape, and
+/// trial-plans that shape through [`conv::ConvPlan::try_new`]. This is a
+/// single source of truth for those bounds -- there is exactly one place
+/// each one lives, in `rocket-core` -- rather than two copies that can
+/// drift, and the refusal that comes back names the actual bound.
+///
+/// The planner is meant to refuse rather than panic; the `catch_unwind`
+/// is a backstop for the runtime, where a shape came off a wire and an
+/// unwinding panic would take the whole HAL process with it. A panic
+/// caught here comes back as [`PlanErrorCode::Internal`] with the panic
+/// message, which is a planner bug to report, not a property of the shape.
+pub fn validate_conv_shape(shape: &conv::Shape, kernels: Kernels) -> Result<(), PlanError> {
+    let shape = *shape;
+    let planned = std::panic::catch_unwind(move || -> Result<(), PlanError> {
+        let mut rebuilt = conv::Shape::try_with_precision(
             shape.width,
             shape.height,
             shape.stride,
             shape.in_channels,
             shape.out_channels,
             shape.precision,
-        );
+        )?;
         if let Some(padding) = shape.padding {
-            rebuilt = rebuilt.with_padding(padding);
+            rebuilt = rebuilt.try_with_padding(padding)?;
         }
-        rebuilt = rebuilt.with_activation(shape.activation);
+        rebuilt = rebuilt.try_with_activation(shape.activation)?;
         if shape.depthwise {
-            rebuilt = rebuilt.with_depthwise();
+            rebuilt = rebuilt.try_with_depthwise()?;
         }
         let programmed = rebuilt
             .parity_padded_shape(kernels)
-            .expect("unsupported accumulator output geometry");
-        let _ = conv::ConvPlan::new(programmed, kernels);
-    }))
-    .map_err(|_| "convolution shape is not supported by the capture-derived planner")
+            .map_err(|reason| PlanError::new(PlanErrorCode::UnsupportedSemantics, reason))?;
+        conv::ConvPlan::try_new(programmed, kernels).map(|_| ())
+    });
+    match planned {
+        Ok(result) => result,
+        Err(payload) => {
+            let message = payload
+                .downcast_ref::<String>()
+                .map(String::as_str)
+                .or_else(|| payload.downcast_ref::<&str>().copied())
+                .unwrap_or("non-string panic payload");
+            Err(PlanError::new(
+                PlanErrorCode::Internal,
+                format!("convolution planner panicked instead of refusing: {message}"),
+            ))
+        }
+    }
 }
 
 #[cfg(test)]

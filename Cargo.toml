@@ -1,6 +1,7 @@
 [workspace]
 resolver = "2"
 members = [
+    "rocket-core",
     "rocket-schema",
     "iree-rocket-hal",
     "rocket-hal-driver", "rocket-compiler",
