@@ -52,13 +52,13 @@ util.func public @classifier_matches(
 // CHECK-NOT: linalg.matmul
 // CHECK: flow.dispatch @rocket_matmul_executable
 util.func public @vit_mlp_at_the_ceiling_matches(
-    %lhs: tensor<197x3584xf32>,
-    %rhs: tensor<3584x3584xf32>,
-    %init: tensor<197x3584xf32>) -> tensor<197x3584xf32> {
+    %lhs: tensor<197x4096xf32>,
+    %rhs: tensor<4096x4096xf32>,
+    %init: tensor<197x4096xf32>) -> tensor<197x4096xf32> {
   %result = linalg.matmul
-      ins(%lhs, %rhs : tensor<197x3584xf32>, tensor<3584x3584xf32>)
-      outs(%init : tensor<197x3584xf32>) -> tensor<197x3584xf32>
-  util.return %result : tensor<197x3584xf32>
+      ins(%lhs, %rhs : tensor<197x4096xf32>, tensor<4096x4096xf32>)
+      outs(%init : tensor<197x4096xf32>) -> tensor<197x4096xf32>
+  util.return %result : tensor<197x4096xf32>
 }
 
 // One channel past it, and the whole matmul stays on the CPU rather than
@@ -67,13 +67,13 @@ util.func public @vit_mlp_at_the_ceiling_matches(
 // Running an unclaimed matmul in f16 would be pure loss.
 // CHECK-LABEL: util.func public @k_past_the_ceiling_falls_back
 // CHECK: linalg.matmul
-// CHECK-SAME: ins(%{{.*}}, %{{.*}} : tensor<1x3585xf32>, tensor<3585x64xf32>)
+// CHECK-SAME: ins(%{{.*}}, %{{.*}} : tensor<1x4097xf32>, tensor<4097x64xf32>)
 util.func public @k_past_the_ceiling_falls_back(
-    %lhs: tensor<1x3585xf32>,
-    %rhs: tensor<3585x64xf32>,
+    %lhs: tensor<1x4097xf32>,
+    %rhs: tensor<4097x64xf32>,
     %init: tensor<1x64xf32>) -> tensor<1x64xf32> {
   %result = linalg.matmul
-      ins(%lhs, %rhs : tensor<1x3585xf32>, tensor<3585x64xf32>)
+      ins(%lhs, %rhs : tensor<1x4097xf32>, tensor<4097x64xf32>)
       outs(%init : tensor<1x64xf32>) -> tensor<1x64xf32>
   util.return %result : tensor<1x64xf32>
 }
@@ -84,12 +84,12 @@ util.func public @k_past_the_ceiling_falls_back(
 // CHECK: linalg.matmul
 util.func public @n_past_the_ceiling_falls_back(
     %lhs: tensor<1x64xf32>,
-    %rhs: tensor<64x3585xf32>,
-    %init: tensor<1x3585xf32>) -> tensor<1x3585xf32> {
+    %rhs: tensor<64x4097xf32>,
+    %init: tensor<1x4097xf32>) -> tensor<1x4097xf32> {
   %result = linalg.matmul
-      ins(%lhs, %rhs : tensor<1x64xf32>, tensor<64x3585xf32>)
-      outs(%init : tensor<1x3585xf32>) -> tensor<1x3585xf32>
-  util.return %result : tensor<1x3585xf32>
+      ins(%lhs, %rhs : tensor<1x64xf32>, tensor<64x4097xf32>)
+      outs(%init : tensor<1x4097xf32>) -> tensor<1x4097xf32>
+  util.return %result : tensor<1x4097xf32>
 }
 
 // M becomes the convolution's width, and what bounds it is the 11-bit
@@ -110,28 +110,28 @@ util.func public @m_197_matches(
   util.return %result : tensor<197x768xf32>
 }
 
-// CHECK-LABEL: util.func public @m_2047_matches
+// CHECK-LABEL: util.func public @m_4096_matches
 // CHECK: flow.dispatch @rocket_matmul_executable
-util.func public @m_2047_matches(
-    %lhs: tensor<2047x64xf32>,
+util.func public @m_4096_matches(
+    %lhs: tensor<4096x64xf32>,
     %rhs: tensor<64x64xf32>,
-    %init: tensor<2047x64xf32>) -> tensor<2047x64xf32> {
+    %init: tensor<4096x64xf32>) -> tensor<4096x64xf32> {
   %result = linalg.matmul
-      ins(%lhs, %rhs : tensor<2047x64xf32>, tensor<64x64xf32>)
-      outs(%init : tensor<2047x64xf32>) -> tensor<2047x64xf32>
-  util.return %result : tensor<2047x64xf32>
+      ins(%lhs, %rhs : tensor<4096x64xf32>, tensor<64x64xf32>)
+      outs(%init : tensor<4096x64xf32>) -> tensor<4096x64xf32>
+  util.return %result : tensor<4096x64xf32>
 }
 
-// CHECK-LABEL: util.func public @m_2048_falls_back
+// CHECK-LABEL: util.func public @m_4097_falls_back
 // CHECK: linalg.matmul
-util.func public @m_2048_falls_back(
-    %lhs: tensor<2048x64xf32>,
+util.func public @m_4097_falls_back(
+    %lhs: tensor<4097x64xf32>,
     %rhs: tensor<64x64xf32>,
-    %init: tensor<2048x64xf32>) -> tensor<2048x64xf32> {
+    %init: tensor<4097x64xf32>) -> tensor<4097x64xf32> {
   %result = linalg.matmul
-      ins(%lhs, %rhs : tensor<2048x64xf32>, tensor<64x64xf32>)
-      outs(%init : tensor<2048x64xf32>) -> tensor<2048x64xf32>
-  util.return %result : tensor<2048x64xf32>
+      ins(%lhs, %rhs : tensor<4097x64xf32>, tensor<64x64xf32>)
+      outs(%init : tensor<4097x64xf32>) -> tensor<4097x64xf32>
+  util.return %result : tensor<4097x64xf32>
 }
 
 // The case a name-only matcher would get wrong. `linalg.matmul` expresses a
@@ -230,14 +230,14 @@ util.func public @vecmat_reaches_the_matmul_matcher(
 
 // A raised GEMV is still bound by K: this one is one past the 3584 ceiling
 // and must fall back like any other oversized matmul.
-// CHECK-LABEL: util.func public @matvec_k_3585_rejected
+// CHECK-LABEL: util.func public @matvec_k_4097_rejected
 // CHECK: linalg.matmul
-util.func public @matvec_k_3585_rejected(
-    %a: tensor<197x3585xf32>,
-    %y: tensor<3585xf32>,
+util.func public @matvec_k_4097_rejected(
+    %a: tensor<197x4097xf32>,
+    %y: tensor<4097xf32>,
     %init: tensor<197xf32>) -> tensor<197xf32> {
   %result = linalg.matvec
-      ins(%a, %y : tensor<197x3585xf32>, tensor<3585xf32>)
+      ins(%a, %y : tensor<197x4097xf32>, tensor<4097xf32>)
       outs(%init : tensor<197xf32>) -> tensor<197xf32>
   util.return %result : tensor<197xf32>
 }

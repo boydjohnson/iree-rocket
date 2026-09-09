@@ -393,10 +393,36 @@ pub fn admit_conv(admission: &ConvAdmission) -> Result<(), PlanError> {
 ///
 /// `CNA_DATA_SIZE0.datain_width` is 11 bits, so 2047 is the widest row the
 /// field holds. Unlike the channel ceilings this one is a hardware limit on
-/// a *single tile*, and `ConvPlan` splits a wider `M` into column tiles --
-/// but no board measurement has been taken above it, so the compiler stops
-/// here (ISSUES.md C10, and the sweep at M 90/128/197/296/1035/2000).
-pub const MAX_ADMITTED_MATMUL_M: u64 = 2047;
+/// a *single tile*, and `ConvPlan` splits a wider `M` into column tiles
+/// (ISSUES.md C10, and the sweep at M 90/128/197/296/1035/2000).
+///
+/// **Raised 2047 -> 4096 on 2026-09-09**, and this one did need a new
+/// measurement: the note here previously read "no board measurement has
+/// been taken above it, so the compiler stops here", which is why a
+/// transformer prefill longer than 2047 tokens was refused by policy while
+/// the planner behind it was planning the shape happily. It plans `M`
+/// 65536 into 737 column tiles; nothing structural was ever in the way.
+///
+/// Measured on `planck` from a quiet board, one shape per process, with
+/// the **`onehot` read map** rather than the probe's default. That choice
+/// is the measurement: on a height-one image -- which is what the FC
+/// lowering makes a matmul -- `Selectors` and `Dense` cannot see a pixel
+/// shift at all, because their `x*7` term vanishes modulo 7 at `y = 0`, so
+/// every pixel of a channel carries the same value. `onehot` encodes each
+/// input's own linear index, so a wrong result says *where* the read came
+/// from. That is exactly the instrument C10's wide-row fault needed.
+///
+/// fp16 at `Cin` = `Cout` = 512: `M` 2047 (control), 2048, 2304, 3072,
+/// 4096, 6144 and 8192, plus ragged 2049 and 4095 -- 16 to 61 column tiles,
+/// 0 mismatches. `M` 4096 again at `Cin` = `Cout` 1024 and 2048, which
+/// narrows each tile by widening the slab count (63 and 128 tiles). And `M`
+/// 4096 at every other rung: int8, int8-accumulator, bf16, int16, tf32 and
+/// fp16-with-fp32-output, all exact.
+///
+/// 4096 rather than the 8192 the fp16 ladder reached, because this constant
+/// is precision-independent and 4096 is the widest `M` measured at *every*
+/// rung. Raising it further wants the other rungs measured there first.
+pub const MAX_ADMITTED_MATMUL_M: u64 = 4096;
 
 /// Accepts `admission` if the compiler has evidence for the matmul's class.
 pub fn admit_matmul(admission: &MatmulAdmission) -> Result<(), PlanError> {
@@ -490,13 +516,15 @@ mod tests {
 
     #[test]
     fn fp16_dense_1x1_rides_the_dense_ceilings() {
-        assert!(admit_conv(&conv(Precision::Fp16, false, 1, 1, 3584, 3584)).is_ok());
-        let error = admit_conv(&conv(Precision::Fp16, false, 1, 1, 3585, 64))
+        assert!(admit_conv(&conv(Precision::Fp16, false, 1, 1, 4096, 4096)).is_ok());
+        let error = admit_conv(&conv(Precision::Fp16, false, 1, 1, 4097, 64))
             .expect_err("one channel past the ceiling");
         assert_eq!(error.code(), PlanErrorCode::UnvalidatedConfiguration);
-        assert!(error.message().contains("3585"), "{error}");
-        assert!(error.message().contains("3584"), "{error}");
-        assert!(admit_conv(&conv(Precision::Fp16, false, 1, 1, 64, 3585)).is_err());
+        assert!(error.message().contains("4097"), "{error}");
+        assert!(error.message().contains("4096"), "{error}");
+        assert!(admit_conv(&conv(Precision::Fp16, false, 1, 1, 64, 4097)).is_err());
+        // The extent the 2026-09-06 corpus stopped at is still inside.
+        assert!(admit_conv(&conv(Precision::Fp16, false, 1, 1, 3584, 3584)).is_ok());
     }
 
     #[test]
@@ -602,10 +630,15 @@ mod tests {
                 n,
             })
         };
+        // M at the raised ceiling, with K and N at theirs.
+        assert!(matmul(4096, 4096, 4096).is_ok());
+        // The old ceiling is still inside, and a transformer prefill just
+        // past it -- the shape the raise was for -- is now admitted.
         assert!(matmul(2047, 3584, 3584).is_ok());
-        assert!(matmul(2048, 64, 64).is_err());
-        assert!(matmul(64, 3585, 64).is_err());
-        assert!(matmul(64, 64, 3585).is_err());
+        assert!(matmul(2048, 64, 64).is_ok());
+        assert!(matmul(4097, 64, 64).is_err());
+        assert!(matmul(64, 4097, 64).is_err());
+        assert!(matmul(64, 64, 4097).is_err());
         assert_eq!(
             matmul(0, 64, 64).expect_err("zero M").code(),
             PlanErrorCode::InvalidShape

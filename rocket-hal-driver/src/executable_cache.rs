@@ -2090,8 +2090,23 @@ mod tests {
     /// refuses it.
     #[test]
     fn refuses_a_matmul_past_the_channel_ceiling() {
-        let too_wide = encode_matmul_executable(1, 4096, 64, &[]);
+        // One past `MAX_INPUT_CHANNELS`, which went 3584 -> 4096 on
+        // 2026-09-09; 4096 itself now decodes, which is the point of the
+        // raise and why this uses the constant rather than a literal.
+        let too_wide = encode_matmul_executable(
+            1,
+            iree_rocket_hal::rocket::conv::MAX_INPUT_CHANNELS + 1,
+            64,
+            &[],
+        );
         assert!(decode_flatbuffer_shape(&too_wide).is_err());
+        let at_ceiling = encode_matmul_executable(
+            1,
+            iree_rocket_hal::rocket::conv::MAX_INPUT_CHANNELS,
+            64,
+            &[],
+        );
+        assert!(decode_flatbuffer_shape(&at_ceiling).is_ok());
     }
 
     /// The deprecated table still decodes, and lands on the same runtime

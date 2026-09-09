@@ -32,30 +32,30 @@
 // depthwise pair at 1344/1345: neither of those limits is a channel
 // ceiling this raise touched.
 
-// CHECK-LABEL: util.func public @dense_1x1_cin_3584_matched
+// CHECK-LABEL: util.func public @dense_1x1_cin_4096_matched
 // CHECK-NOT: linalg.conv_2d_nhwc_hwcf
 // CHECK: flow.dispatch @rocket_dynamic_int8_executable
-func.func @dense_1x1_cin_3584_matched(
-    %input: tensor<1x4x4x3584xi8>,
-    %filter: tensor<1x1x3584x64xi8>,
+func.func @dense_1x1_cin_4096_matched(
+    %input: tensor<1x4x4x4096xi8>,
+    %filter: tensor<1x1x4096x64xi8>,
     %init: tensor<1x4x4x64xi32>) -> tensor<1x4x4x64xi32> {
   %result = linalg.conv_2d_nhwc_hwcf
       {dilations = dense<1> : vector<2xi64>, strides = dense<1> : vector<2xi64>}
-      ins(%input, %filter : tensor<1x4x4x3584xi8>, tensor<1x1x3584x64xi8>)
+      ins(%input, %filter : tensor<1x4x4x4096xi8>, tensor<1x1x4096x64xi8>)
       outs(%init : tensor<1x4x4x64xi32>) -> tensor<1x4x4x64xi32>
   return %result : tensor<1x4x4x64xi32>
 }
 
-// CHECK-LABEL: util.func public @dense_1x1_cin_3585_falls_back
+// CHECK-LABEL: util.func public @dense_1x1_cin_4097_falls_back
 // CHECK-NOT: flow.dispatch @rocket_dynamic_int8_executable
 // CHECK: linalg.conv_2d_nhwc_hwcf
-func.func @dense_1x1_cin_3585_falls_back(
-    %input: tensor<1x4x4x3585xi8>,
-    %filter: tensor<1x1x3585x64xi8>,
+func.func @dense_1x1_cin_4097_falls_back(
+    %input: tensor<1x4x4x4097xi8>,
+    %filter: tensor<1x1x4097x64xi8>,
     %init: tensor<1x4x4x64xi32>) -> tensor<1x4x4x64xi32> {
   %result = linalg.conv_2d_nhwc_hwcf
       {dilations = dense<1> : vector<2xi64>, strides = dense<1> : vector<2xi64>}
-      ins(%input, %filter : tensor<1x4x4x3585xi8>, tensor<1x1x3585x64xi8>)
+      ins(%input, %filter : tensor<1x4x4x4097xi8>, tensor<1x1x4097x64xi8>)
       outs(%init : tensor<1x4x4x64xi32>) -> tensor<1x4x4x64xi32>
   return %result : tensor<1x4x4x64xi32>
 }
@@ -108,32 +108,32 @@ func.func @dense_1x1_cout_512_matched(
 // identically before and after the 2026-09-03 Cin change. Corrected to the
 // real boundary.
 
-// CHECK-LABEL: util.func public @dense_1x1_cout_3584_matched
+// CHECK-LABEL: util.func public @dense_1x1_cout_4096_matched
 // CHECK-NOT: linalg.conv_2d_nhwc_hwcf
 // CHECK: flow.dispatch @rocket_dynamic_int8_executable
-func.func @dense_1x1_cout_3584_matched(
+func.func @dense_1x1_cout_4096_matched(
     %input: tensor<1x4x4x16xi8>,
-    %filter: tensor<1x1x16x3584xi8>,
-    %init: tensor<1x4x4x3584xi32>) -> tensor<1x4x4x3584xi32> {
+    %filter: tensor<1x1x16x4096xi8>,
+    %init: tensor<1x4x4x4096xi32>) -> tensor<1x4x4x4096xi32> {
   %result = linalg.conv_2d_nhwc_hwcf
       {dilations = dense<1> : vector<2xi64>, strides = dense<1> : vector<2xi64>}
-      ins(%input, %filter : tensor<1x4x4x16xi8>, tensor<1x1x16x3584xi8>)
-      outs(%init : tensor<1x4x4x3584xi32>) -> tensor<1x4x4x3584xi32>
-  return %result : tensor<1x4x4x3584xi32>
+      ins(%input, %filter : tensor<1x4x4x16xi8>, tensor<1x1x16x4096xi8>)
+      outs(%init : tensor<1x4x4x4096xi32>) -> tensor<1x4x4x4096xi32>
+  return %result : tensor<1x4x4x4096xi32>
 }
 
-// CHECK-LABEL: util.func public @dense_1x1_cout_3585_falls_back
+// CHECK-LABEL: util.func public @dense_1x1_cout_4097_falls_back
 // CHECK-NOT: flow.dispatch @rocket_dynamic_int8_executable
 // CHECK: linalg.conv_2d_nhwc_hwcf
-func.func @dense_1x1_cout_3585_falls_back(
+func.func @dense_1x1_cout_4097_falls_back(
     %input: tensor<1x4x4x16xi8>,
-    %filter: tensor<1x1x16x3585xi8>,
-    %init: tensor<1x4x4x3585xi32>) -> tensor<1x4x4x3585xi32> {
+    %filter: tensor<1x1x16x4097xi8>,
+    %init: tensor<1x4x4x4097xi32>) -> tensor<1x4x4x4097xi32> {
   %result = linalg.conv_2d_nhwc_hwcf
       {dilations = dense<1> : vector<2xi64>, strides = dense<1> : vector<2xi64>}
-      ins(%input, %filter : tensor<1x4x4x16xi8>, tensor<1x1x16x3585xi8>)
-      outs(%init : tensor<1x4x4x3585xi32>) -> tensor<1x4x4x3585xi32>
-  return %result : tensor<1x4x4x3585xi32>
+      ins(%input, %filter : tensor<1x4x4x16xi8>, tensor<1x1x16x4097xi8>)
+      outs(%init : tensor<1x4x4x4097xi32>) -> tensor<1x4x4x4097xi32>
+  return %result : tensor<1x4x4x4097xi32>
 }
 
 // CHECK-LABEL: util.func public @dense_3x3_cout_512_matched

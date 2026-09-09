@@ -62,15 +62,22 @@ names -- while depthwise has its own, lower ceiling (below).
 
 | Precision | Element | `Cin` max | `Cout` max | Constant |
 |---|---|---|---|---|
-| fp16 | 2 B | **3584** | **3584** | `MAX_INPUT_CHANNELS` / `MAX_OUTPUT_CHANNELS` |
-| bf16 | 2 B | 3584 | 3584 | shares the fp16 constants |
-| int16 | 2 B | 3584 | 3584 | shares the fp16 constants |
-| fp16 + fp32 accumulator | 2 B in / 4 B out | 3584 | 3584 | shares the fp16 constants |
-| int8 (requantized) | 1 B | **3584** | **3584** | `MAX_INT8_INPUT_CHANNELS` / `MAX_INT8_OUTPUT_CHANNELS` |
-| int8 + int32 accumulator | 1 B in / 4 B out | 3584 | 3584 | shares the int8 constants |
-| int4 | 0.5 B | **3584** | **3584** | `MAX_INT4_INPUT_CHANNELS` / `MAX_INT4_OUTPUT_CHANNELS` |
-| tf32 | 4 B | **3584** | **3584** | `MAX_TF32_INPUT_CHANNELS` / `MAX_TF32_OUTPUT_CHANNELS` |
+| fp16 | 2 B | **4096** | **4096** | `MAX_INPUT_CHANNELS` / `MAX_OUTPUT_CHANNELS` |
+| bf16 | 2 B | 4096 | 4096 | shares the fp16 constants |
+| int16 | 2 B | 4096 | 4096 | shares the fp16 constants |
+| fp16 + fp32 accumulator | 2 B in / 4 B out | 4096 | 4096 | shares the fp16 constants |
+| int8 (requantized) | 1 B | **4096** | **4096** | `MAX_INT8_INPUT_CHANNELS` / `MAX_INT8_OUTPUT_CHANNELS` |
+| int8 + int32 accumulator | 1 B in / 4 B out | 4096 | 4096 | shares the int8 constants |
+| int4 | 0.5 B | **4096** | **4096** | `MAX_INT4_INPUT_CHANNELS` / `MAX_INT4_OUTPUT_CHANNELS` |
+| tf32 | 4 B | **4096** | **4096** | `MAX_TF32_INPUT_CHANNELS` / `MAX_TF32_OUTPUT_CHANNELS` |
 | any, depthwise | 1-2 B | **1792** | = `Cin` | `MAX_DEPTHWISE_CHANNELS` |
+
+Matmul carries one limit of its own, on the row count `M`, because `M` is the
+convolution *width* rather than a channel axis:
+
+| Axis | Max | Constant | Why |
+|---|---|---|---|
+| matmul `M` | **4096** | `MAX_ADMITTED_MATMUL_M` (`rocket-core/src/admission.rs`) | `CNA_DATA_SIZE0.datain_width` is 11 bits, so a single *tile* stops at 2047; `ConvPlan` column-tiles a wider `M`, and 4096 is the widest measured at every rung. |
 
 **Every dense ceiling moved to 3584 on 2026-09-06**, from 1792 (fp16 family),
 1344/1792 (int8, int4) and 1024/1792 (tf32). Until then the ceilings differed
@@ -104,10 +111,38 @@ timeouts at every point:
 * 56x56 multi-tile to `Cin` 3584 (224 tiles), and stride 2 at `Cin`
   1792..4096 and `Cout` 2304..3584.
 
-4096 measured clean everywhere and 8192 measured clean at fp16 k=1; the
-constants sit at 3584 on this repo's usual principle -- a limit is what a real
-model needs and the corpus reaches. A ViT-L/16 MLP at 4096 needs the constant
-moved, not another measurement.
+**The dense ceilings moved again, 3584 -> 4096, on 2026-09-09**, and this is
+the paragraph that used to predict it: "4096 measured clean everywhere and
+8192 measured clean at fp16 k=1; the constants sit at 3584 on this repo's
+usual principle -- a limit is what a real model needs and the corpus reaches.
+A ViT-L/16 MLP at 4096 needs the constant moved, not another measurement."
+That is exactly what happened, and no new channel corpus was taken. Four
+points were re-confirmed on a quiet board first, because moving a constant on
+the strength of a sentence is not the same as moving it on a measurement:
+fp16 `Cin` 3584 and 4096 at 14x14 `Cout` 64, fp16 `Cout` 3584 and 4096 at 7x7
+`Cin` 448, both again at int8 under `SelectorsAffine`, and fp16
+`Cin` = `Cout` = 4096 at 14x14. 0 mismatches.
+
+**`M` moved 2047 -> 4096 the same day, and that one did need new
+measurement.** The old note read "no board measurement has been taken above
+it, so the compiler stops here" -- so a transformer prefill longer than 2047
+tokens was refused by policy while `ConvPlan` behind it planned the shape
+without complaint (it plans `M` 65536 into 737 column tiles; nothing
+structural was ever in the way). The ladder was run with the **`onehot` read
+map**, which is the measurement, not a detail: on the height-one image the FC
+lowering produces, `Selectors` and `Dense` cannot see a pixel shift at all,
+because their `x*7` term vanishes modulo 7 at `y = 0`. fp16 at
+`Cin` = `Cout` = 512 for `M` 2047 (control), 2048, 2304, 3072, 4096, 6144 and
+8192, ragged 2049 and 4095, 16 to 61 column tiles; `M` 4096 again at
+`Cin` = `Cout` 1024 and 2048 (63 and 128 tiles, narrower tiles per slab); and
+`M` 4096 at int8, int8-accumulator, bf16, int16, tf32 and fp16-with-fp32-out.
+0 mismatches throughout. 4096 rather than fp16's 8192 because the constant is
+precision-independent and 4096 is the widest `M` measured at *every* rung.
+
+Compiled end-to-end, on `planck`: `matmul_m_4096` and `matmul_k_n_4096` in
+`tools/e2e_matmul_regression.py` and `dense_fp16_cout4096` in
+`tools/e2e_conv_regression.py`, all bit-exact or inside tolerance against
+their own CPU arm, with both full gates green and no case moved.
 
 **`Counting` cannot be read at fp16 above `Cin` 2048**, and the failure looks
 exactly like a channel-padding fault: its expected output is the channel count

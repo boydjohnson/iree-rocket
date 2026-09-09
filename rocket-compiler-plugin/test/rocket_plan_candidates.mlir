@@ -17,18 +17,21 @@
 // -- one dispatch site, `jobs` standalone hardware jobs.
 
 // The channel ceiling itself is accepted; at 7x7 the coefficient working
-// set splits the CBUF 5/7 and the rows tile.
+// set splits the CBUF 4/8 and the rows tile. The split was 5/7 while this
+// case sat at Cin 3584 -- a wider Cin charges more coefficient residency, so
+// the partition moving is the expected consequence of the 2026-09-09 raise
+// and not a regression.
 // CHECK-LABEL: util.func public @pointwise_at_the_channel_ceiling
-// CHECK-SAME: rocket.plan_decisions = [{columns = 1 : i64, decision = "tiled", detail = "cbuf 5/7, tiles {{[0-9]+}}, columns 1", jobs = {{[0-9]+}} : i64, kind = "dense_conv2d", layout = "nhwc", limit = "none", loc = #loc{{[0-9]*}}, precision = "fp16", shape = "7x7 Cin 3584 Cout 3584 k1x1 s1", status = "ok"}]
+// CHECK-SAME: rocket.plan_decisions = [{columns = 1 : i64, decision = "tiled", detail = "cbuf 4/8, tiles {{[0-9]+}}, columns 1", jobs = {{[0-9]+}} : i64, kind = "dense_conv2d", layout = "nhwc", limit = "none", loc = #loc{{[0-9]*}}, precision = "fp16", shape = "7x7 Cin 4096 Cout 4096 k1x1 s1", status = "ok"}]
 util.func public @pointwise_at_the_channel_ceiling(
-    %input: tensor<1x7x7x3584xf16>,
-    %filter: tensor<1x1x3584x3584xf16>,
-    %init: tensor<1x7x7x3584xf32>) -> tensor<1x7x7x3584xf32> {
+    %input: tensor<1x7x7x4096xf16>,
+    %filter: tensor<1x1x4096x4096xf16>,
+    %init: tensor<1x7x7x4096xf32>) -> tensor<1x7x7x4096xf32> {
   %0 = linalg.conv_2d_nhwc_hwcf
       {dilations = dense<1> : vector<2xi64>, strides = dense<1> : vector<2xi64>}
-      ins(%input, %filter : tensor<1x7x7x3584xf16>, tensor<1x1x3584x3584xf16>)
-      outs(%init : tensor<1x7x7x3584xf32>) -> tensor<1x7x7x3584xf32>
-  util.return %0 : tensor<1x7x7x3584xf32>
+      ins(%input, %filter : tensor<1x7x7x4096xf16>, tensor<1x1x4096x4096xf16>)
+      outs(%init : tensor<1x7x7x4096xf32>) -> tensor<1x7x7x4096xf32>
+  util.return %0 : tensor<1x7x7x4096xf32>
 }
 
 // A small pointwise conv is one job.
@@ -50,18 +53,18 @@ util.func public @pointwise_is_direct(
 
 // One past the ceiling: register-representable, no capture backing. The
 // matchers' dim_bounds decline it too; that agreement is the point.
-// REMARK: remark: rocket-plan: cpu [unvalidated_configuration] dense_conv2d 7x7 Cin 3585 Cout 64 k1x1 s1: input channels must be 1..=3584
+// REMARK: remark: rocket-plan: cpu [unvalidated_configuration] dense_conv2d 7x7 Cin 4097 Cout 64 k1x1 s1: input channels must be 1..=4096
 // CHECK-LABEL: util.func public @pointwise_past_the_channel_ceiling
 // CHECK-SAME: decision = "cpu"
 // CHECK-SAME: limit = "validation"
 // CHECK-SAME: status = "unvalidated_configuration"
 util.func public @pointwise_past_the_channel_ceiling(
-    %input: tensor<1x7x7x3585xf16>,
-    %filter: tensor<1x1x3585x64xf16>,
+    %input: tensor<1x7x7x4097xf16>,
+    %filter: tensor<1x1x4097x64xf16>,
     %init: tensor<1x7x7x64xf32>) -> tensor<1x7x7x64xf32> {
   %0 = linalg.conv_2d_nhwc_hwcf
       {dilations = dense<1> : vector<2xi64>, strides = dense<1> : vector<2xi64>}
-      ins(%input, %filter : tensor<1x7x7x3585xf16>, tensor<1x1x3585x64xf16>)
+      ins(%input, %filter : tensor<1x7x7x4097xf16>, tensor<1x1x4097x64xf16>)
       outs(%init : tensor<1x7x7x64xf32>) -> tensor<1x7x7x64xf32>
   util.return %0 : tensor<1x7x7x64xf32>
 }

@@ -352,6 +352,26 @@ requested conv/matmul candidates fail compilation instead of falling back.
 
 ## 4. Materialize existing tile plans at compile time
 
+**Status 2026-09-09: not started, and deliberately so.** Section 3's report
+made the cost of what this section removes measurable, and it is small.
+Runtime planning happens inside `Phase::Record` (`ConvPlan::new` at
+`command_buffer.rs`), which `ROCKET_PROFILE=1` puts at **1.6 ms of a 136.7 ms**
+MobileNetV2 fp16 inference -- 1.2% of wall, and tile search is only a
+fraction of that phase. Against `outside` at 79.6 ms and `compact` +
+`pack.input` at 24.4 ms, serializing the plan is not where the time is.
+
+Two of the three things this section was also going to buy have since been
+delivered by section 2: the compiler already asks the same planner the
+runtime asks, and already refuses at compile time what the runtime would
+reject. What remains unique to section 4 is register-program equality as a
+*proven* property rather than a shared-crate argument, and a target/policy
+identity in the executable.
+
+So this stays open with a measured reason to defer it, rather than being
+built for a 1.2% saving nobody has felt. The number to re-take before
+reconsidering is `record` on a many-site model -- Qwen3 has 196 matmul sites
+against MobileNetV2's 37, and no phase table has been taken on it.
+
 First preserve the current execution model: one logical Rocket dispatch owns
 multiple standalone hardware jobs. Serialize the selected static plan with the
 executable rather than immediately introducing an MLIR dispatch per tile.
@@ -378,6 +398,60 @@ execution retains explicit validation. Measure executable size and compiler
 time as well as runtime planning savings.
 
 ## 5. Tile operations beyond today's logical-shape limits
+
+**Status 2026-09-09: the premise was wrong, and the coverage it was for was
+delivered another way.** This section assumes operations exist that the
+hardware cannot execute in one dispatch and that decomposition is what
+reaches them. Swept with the capture-backing ceilings lifted
+(`rocket-core/examples/find_structural_limits.rs`), the planner already
+plans every shape steps 1 and 2 were written for:
+
+| axis | planner |
+|---|---|
+| conv `Cout` to 131072 | ok, 1 tile |
+| matmul `N` to 65536 | ok, 3 tiles |
+| matmul `M` to 65536 | ok, 737 tiles -- `ConvPlan` *already* splits `M` |
+| conv `Cin` / matmul `K` | ok to 8192; refuses at 16384 |
+
+Not one refusal in that sweep is structural; even the `Cin` 16384 one is a
+CBUF *grant* message, not a register field. Every limit that kept these
+shapes on the CPU was an `admission.rs` ceiling -- `UnvalidatedConfiguration`,
+the class section 3's report prints as "register-representable, not
+measured". Step 1's spatial-conv half had no failing case at all: a
+1024x1024 image plans into 341 hardware jobs today, and 4096 wide and 8192
+tall both plan.
+
+**What was done instead**: the ceilings were measured and raised, which is
+this repository's standing recipe for exactly this situation. Dense `Cin` and
+`Cout` 3584 -> 4096 at every precision rung, and matmul `M` 2047 -> 4096.
+LIMITS.md carries the ladders, the `onehot`-read-map reasoning behind the `M`
+sweep, and the compiled gates (`matmul_m_4096`, `matmul_k_n_4096`,
+`dense_fp16_cout4096`). Zero lines of new compiler code, and the work stays
+one dispatch with one pack and one compact -- where MLIR-level slicing would
+have paid the 19%-of-wall per-dispatch tax once per slice.
+
+**What is still genuinely this section's**, and what it now means:
+
+1. **Decomposition as an alternative to measurement.** Slicing an oversized
+   operation into slices that each sit inside an *already-gated* class buys
+   coverage with no new hardware campaign. That is a real motivation and the
+   one thing raising a ceiling cannot offer -- but it is a trade against the
+   per-dispatch cost, not a way to reach the unreachable, and it should be
+   written up as such rather than as "beyond today's limits".
+2. **`K`/reduction splitting** (step 3 below) is untouched and remains the
+   only axis where a real wall exists at a reachable extent: the CBUF grant
+   at `Cin` 16384. It still needs accumulation semantics, per-slice
+   zero-point correction, and defined overflow and floating-point ordering,
+   none of which exist.
+3. **The next ceiling raise** is cheaper than either: fp16 `k=1` measured
+   clean to 8192 in the 2026-09-06 corpus and `M` to 8192 in the 2026-09-09
+   one. Both stop at 4096 only because that is the widest extent measured at
+   *every* rung.
+
+The step list below is kept as written, because its halo, coverage, tail and
+zero-point requirements are all still correct for whoever builds
+decomposition. Only its premise -- that these shapes are otherwise
+unreachable -- has been falsified.
 
 This needs a higher-level decomposition planner and compiler rewrite support.
 Keep whole-operation descriptors distinct from legal hardware-task descriptors:

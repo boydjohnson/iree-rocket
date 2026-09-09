@@ -73,11 +73,11 @@ func.func @dynamic_row_still_offloads(
 // CHECK: linalg.matmul
 // CHECK-SAME: rocket.plan_refused
 func.func @refused_matmul_falls_back(
-    %lhs: tensor<4x3585xf16>,
-    %rhs: tensor<3585x64xf16>,
+    %lhs: tensor<4x4097xf16>,
+    %rhs: tensor<4097x64xf16>,
     %init: tensor<4x64xf32>) -> tensor<4x64xf32> {
   %result = linalg.matmul
-      ins(%lhs, %rhs : tensor<4x3585xf16>, tensor<3585x64xf16>)
+      ins(%lhs, %rhs : tensor<4x4097xf16>, tensor<4097x64xf16>)
       outs(%init : tensor<4x64xf32>) -> tensor<4x64xf32>
   return %result : tensor<4x64xf32>
 }

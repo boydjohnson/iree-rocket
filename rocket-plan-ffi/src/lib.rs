@@ -922,13 +922,13 @@ mod tests {
         // scales, and it still decides -- which is what makes it usable on
         // a convolution whose spatial extents are dynamic.
         assert_eq!(
-            admit(&admission_desc(0, false, 1, 1, 3584, 3584)).0,
+            admit(&admission_desc(0, false, 1, 1, 4096, 4096)).0,
             ROCKET_PLAN_OK
         );
-        let (status, message) = admit(&admission_desc(0, false, 1, 1, 3585, 64));
+        let (status, message) = admit(&admission_desc(0, false, 1, 1, 4097, 64));
         assert_eq!(status, ROCKET_PLAN_UNVALIDATED_CONFIGURATION);
         assert!(
-            message.contains("3585") && message.contains("3584"),
+            message.contains("4097") && message.contains("4096"),
             "{message}"
         );
     }
@@ -980,13 +980,16 @@ mod tests {
             // SAFETY: a live descriptor and a live buffer.
             unsafe { rocket_admit_matmul(d, message.as_mut_ptr().cast(), message.len()) }
         };
-        assert_eq!(call(&desc(2047, 3584, 3584)), ROCKET_PLAN_OK);
+        assert_eq!(call(&desc(4096, 4096, 4096)), ROCKET_PLAN_OK);
+        // A transformer prefill past the old 2047 row ceiling, which is
+        // what the 2026-09-09 raise was for.
+        assert_eq!(call(&desc(2048, 64, 64)), ROCKET_PLAN_OK);
         assert_eq!(
-            call(&desc(2048, 64, 64)),
+            call(&desc(4097, 64, 64)),
             ROCKET_PLAN_UNVALIDATED_CONFIGURATION
         );
         assert_eq!(
-            call(&desc(64, 64, 3585)),
+            call(&desc(64, 64, 4097)),
             ROCKET_PLAN_UNVALIDATED_CONFIGURATION
         );
     }
