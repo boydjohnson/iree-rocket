@@ -1684,6 +1684,85 @@ so they must disagree somewhere.
 
 ---
 
+## C14 (S2) — the HuggingFace float16-converter ViT mis-imports through torch-mlir; the f32 import of the same model is exact
+
+**[verified]** `onnx-community/vit-base-patch16-224-ONNX` ships both
+`model.onnx` (f32) and `model_fp16.onnx`. ONNX Runtime runs both correctly and
+they agree with each other to max|diff| 0.0400 with identical top-1 and top-5,
+which is what fp16 costs on this model. Imported with `iree-import-onnx` and
+compiled by `rocket-compiler --no-offload` -- **no NPU involved at all, host
+CPU only** -- the two diverge completely:
+
+| arm | vs ORT f32 | top-1 |
+|---|---:|---|
+| IREE, f32 import | **max\|diff\| 0.0000** | 767 (correct) |
+| IREE, fp16 import | max\|diff\| 6.0187 | 600 (wrong) |
+
+So the fault is in importing or compiling the converter's output, not in the
+model (ORT computes it correctly) and not in this backend (the NPU is not in
+the picture; with offload on, the NPU arm is bit-identical to this same wrong
+CPU arm, which is how the fault was isolated).
+
+Both graphs were preprocessed identically per README "ONNX models": all four
+`dim_param`s pinned (`batch_size` 1, `num_channels` 3, `height`/`width` 224 --
+ViT is unusual in leaving all four symbolic, not just batch), `value_info`
+cleared, `shape_inference.infer_shapes` re-run, `checker.check_model` clean.
+Same input bytes to both, fed as raw `.bin` (`--input=@x.npy` reads a npy
+header as data -- see the note in the profiling section).
+
+**What to do about it, today:** import the f32 model. The transform spec
+demotes every all-f32 named convolution and matmul to f16 itself and
+`rocket-promote-unclaimed-conv-inputs` restores f32 on whatever the match
+loop did not claim, so the f32 import is the *better* arm regardless -- it is
+exact against the oracle, and the fp16 the NPU actually runs is chosen per
+operation rather than for the whole graph. Measured on `planck`: ViT f32
+import, 73 NPU dispatch sites, max|diff| **0.0037** against both its own
+`--no-offload` arm and the ORT f32 oracle, top-1 and top-5 unchanged -- an
+order of magnitude *inside* the 0.0400 that fp16 costs in ORT alone.
+
+This is the same shape of hazard as the note in the fp16 export recipe ("use
+torch `.half()`, never the float16 converter"), but a different mechanism: the
+converter did not corrupt the model here, the importer mishandled what it
+produced. Root cause not yet localized -- the next step is a layer-wise
+comparison to find where the two imports first diverge.
+
+## C15 (S3) — ViT's attention `batch_matmul` pairs are not a candidate form, so 24 dispatch sites never reach the planner
+
+**[verified]** `rocket-compiler audit` on ViT-B/16 (f32 import) reports 74
+convolution/matmul candidates: 73 matmuls accepted onto the NPU and one
+refusal, the `224x224 Cin 3 Cout 768 k16x16 s16` patch-embed stem, which is
+far outside the measured kernel envelope. But the *reconciliation* -- the half
+of the section 3 report that reads final placement rather than the decision
+record -- shows 25 convolution- or matmul-shaped CPU dispatch sites, and 24 of
+them are `batch_matmul`:
+
+```text
+  73 accepted candidate(s) -> 73 Rocket dispatch site(s) running 301 hardware job(s)
+  200 CPU dispatch site(s), 25 of them convolution- or matmul-shaped
+    - main_graph$async_dispatch_6 (12 site(s)): batch_matmul
+    - main_graph$async_dispatch_8 (12 site(s)): batch_matmul
+    - main_graph$async_dispatch_0 (1 site(s)): conv
+```
+
+Twelve layers times two: `Q K^T` and `attn V`, the attention core. They are
+absent from the decision record entirely, because `readRocketCandidate` reads
+row-major `linalg.matmul` and these are `linalg.batch_matmul` with a real
+batch (the head dimension), which no matcher and no planner descriptor
+expresses. The spec already collapses a *unit*-batch `batch_matmul`; a
+12-head one has nowhere to go.
+
+This is the largest remaining offload gap on a transformer, and it is a
+matcher/lowering question rather than a hardware one: each head is an
+ordinary `[197,64] x [64,197]` matmul, comfortably inside every ceiling. The
+options are a spec-side unbatching into per-head matmuls (12 dispatches per
+site, and P8's flat per-dispatch tax applies) or a descriptor that carries a
+batch. Neither has been designed.
+
+Worth noting what found this: the decision record alone said "74 candidates,
+73 accepted" and looked like near-total coverage. Only reconciling it against
+final placement showed 24 contraction dispatch sites the record had never
+heard of.
+
 ## Resolved
 
 What was settled and how, newest first, in place of the narratives — those are

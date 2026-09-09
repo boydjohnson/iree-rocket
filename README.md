@@ -330,12 +330,33 @@ tiled, so the relation is exact there. It should never fire.
 
 ### ONNX models
 
-Pin the batch dimension before importing. `iree-import-onnx` will happily
+`tools/import_onnx.py` does the whole import, and the three things below are
+why it exists rather than a bare `iree-import-onnx` call:
+
+```sh
+tools/import_onnx.py model.onnx --out-dir vit \
+    --dim batch_size=1 --dim num_channels=3 --dim height=224 --dim width=224
+```
+
+Pin the symbolic dimensions before importing. `iree-import-onnx` will happily
 import a model whose batch is a symbolic `dim_param`, but the Rocket ABI fixes
 batch at one and every matcher in the transform spec requires it, so a
 dynamic-batch model compiles cleanly and offloads **nothing**. Clear each
-`dim_param` on the graph inputs and outputs to 1, drop `graph.value_info`, and
-re-run `shape_inference.infer_shapes` before `iree-import-onnx`.
+`dim_param` on the graph inputs and outputs, drop `graph.value_info`, and
+re-run `shape_inference.infer_shapes` before `iree-import-onnx`. Not every
+model leaves only batch symbolic -- ViT-B/16 leaves all four input dims that
+way, so its channel count and spatial extents need pinning too, or the
+patch-embed convolution is still symbolic after the batch is fixed.
+
+Build an ONNX Runtime oracle *before* importing. Without a reference from the
+model's own runtime, a later difference cannot be attributed to the NPU rather
+than to the import -- and at least one shipped model is mis-imported today
+(ISSUES.md C14: a float16-converted ViT that ONNX Runtime runs correctly and
+that IREE gets wrong on the host CPU with no NPU involved). Prefer the f32
+file when a model ships both: the transform spec demotes convolutions and
+matmuls to f16 itself and restores f32 on whatever the match loop leaves
+behind, so the f32 import chooses precision per operation rather than for the
+whole graph, and it is the arm measured exact against the oracle.
 
 int8 models quantized with ONNX Runtime's `quantize_dynamic` are supported.
 They import as `onnx.ConvInteger`, which upstream torch-mlir cannot lower at
