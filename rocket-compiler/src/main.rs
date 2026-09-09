@@ -1,6 +1,8 @@
+mod audit;
 mod bindings;
 mod cli;
 mod compiler;
+mod decisions;
 mod report;
 mod spec;
 
@@ -265,6 +267,60 @@ fn check_spec_device_names(
     .into())
 }
 
+/// The phase `rocket-plan-candidates` runs in, and therefore the only phase
+/// at which its decision record is certainly still on the function.
+///
+/// The record does survive to `executable-targets` on every model measured
+/// here, so reading it out of the placement dump would work today. It is
+/// taken at its own phase anyway: whether a discardable attribute survives
+/// is a property of which passes IREE happens to run, and `report.rs` above
+/// documents the `rocket.origin` tags that did not. A placement report that
+/// silently loses its "why" the next time a pass is added is exactly what
+/// COMPILER_ROADMAP.md section 3 asks not to build.
+const DECISIONS_PHASE: &str = "preprocessing";
+
+/// Runs the pipeline up to the end of preprocessing, reads the decision
+/// record off the IR, and leaves the invocation set to resume from there.
+fn capture_decisions(
+    library: &Library,
+    invocation: &Invocation,
+) -> Result<decisions::DecisionRecord, Box<dyn Error>> {
+    invocation.set_compile_to_phase(DECISIONS_PHASE);
+    invocation.run_pipeline(Pipeline::Std)?;
+    let output = Output::open_membuffer(library)?;
+    invocation.output_ir(&output)?;
+    let ir_bytes = output.map_memory()?;
+    let record = decisions::DecisionRecord::scan(&String::from_utf8_lossy(ir_bytes));
+    invocation.set_compile_from_phase(DECISIONS_PHASE);
+    Ok(record)
+}
+
+/// Runs the rest of the pipeline to `executable-targets`, tags placement,
+/// and reads the resulting module. Leaves the invocation set to resume.
+fn capture_placement(
+    library: &Library,
+    invocation: &Invocation,
+    emit_ir: Option<&Path>,
+) -> Result<report::PlacementReport, Box<dyn Error>> {
+    invocation.set_compile_to_phase("executable-targets");
+    invocation.run_pipeline(Pipeline::Std)?;
+    // Bare pass name, not "builtin.module(rocket-annotate-final-placement)":
+    // the invocation's PassManager (unlike iree-opt's generic tool machinery)
+    // is already module-anchored, so wrapping it re-nests one level too deep
+    // and silently matches zero ops instead of erroring.
+    invocation.run_pass_pipeline("rocket-annotate-final-placement")?;
+    let output = Output::open_membuffer(library)?;
+    invocation.output_ir(&output)?;
+    let ir_bytes = output.map_memory()?;
+    let ir_text = String::from_utf8_lossy(ir_bytes);
+    if let Some(path) = emit_ir {
+        fs::write(path, ir_text.as_bytes())?;
+    }
+    let report = report::PlacementReport::scan(&ir_text);
+    invocation.set_compile_from_phase("executable-targets");
+    Ok(report)
+}
+
 /// The phase the Rocket placement pin runs at. `flow` is the last point where
 /// every dispatch in the program is still a `flow.dispatch` carrying a plain
 /// `stream.affinity` attribute: dispatch regions have been formed and
@@ -315,36 +371,64 @@ fn pin_unclaimed_dispatches(invocation: &Invocation) -> Result<(), Box<dyn Error
 /// property the baseline actually needs. A "CPU-only" arm that quietly
 /// offloads is exactly the error ISSUES.md M4 exists to prevent, and it must
 /// fail loudly here rather than skew a measurement.
-fn assert_nothing_offloaded(
-    library: &Library,
-    invocation: &Invocation,
-) -> Result<(), Box<dyn Error>> {
-    invocation.set_compile_to_phase("executable-targets");
-    invocation.run_pipeline(Pipeline::Std)?;
-    invocation.run_pass_pipeline("rocket-annotate-final-placement")?;
-    let output = Output::open_membuffer(library)?;
-    invocation.output_ir(&output)?;
-    let ir_bytes = output.map_memory()?;
-    let report = report::PlacementReport::scan(&String::from_utf8_lossy(ir_bytes));
-    if !report.rocket_executables.is_empty() {
-        let names: Vec<&str> = report
-            .rocket_executables
-            .iter()
-            .map(|executable| executable.name.as_str())
-            .collect();
-        return Err(format!(
-            "--no-offload produced {} Rocket executable(s) ({}); the neutralized spec did not \
-             defeat every matcher, so this is not a CPU-only baseline. Refusing to write it.",
-            names.len(),
-            names.join(", "),
-        )
-        .into());
+fn assert_nothing_offloaded(report: &report::PlacementReport) -> Result<(), Box<dyn Error>> {
+    if report.rocket_executables.is_empty() {
+        return Ok(());
     }
-    invocation.set_compile_from_phase("executable-targets");
+    let names: Vec<&str> = report
+        .rocket_executables
+        .iter()
+        .map(|executable| executable.name.as_str())
+        .collect();
+    Err(format!(
+        "--no-offload produced {} Rocket executable(s) ({}); the neutralized spec did not \
+         defeat every matcher, so this is not a CPU-only baseline. Refusing to write it.",
+        names.len(),
+        names.join(", "),
+    )
+    .into())
+}
+
+/// Whether this invocation has to stop at `executable-targets` to look at
+/// the module before finishing the compile.
+fn needs_placement_pass(common: &cli::CommonArgs) -> bool {
+    common.no_offload || common.strict_offload || common.report_json.is_some()
+}
+
+/// Writes the machine-readable report when one was asked for, and applies
+/// the strict-offload gate.
+fn deliver_audit(
+    common: &cli::CommonArgs,
+    audit: &audit::PlacementAudit,
+) -> Result<(), Box<dyn Error>> {
+    if let Some(path) = &common.report_json {
+        fs::write(path, audit.to_json())
+            .map_err(|err| format!("failed to write {}: {err}", path.display()))?;
+        eprintln!("wrote placement report {}", path.display());
+    }
+    if common.strict_offload
+        && let Some(failure) = audit.strict_offload_failure()
+    {
+        return Err(failure.into());
+    }
+    Ok(())
+}
+
+/// `--strict-offload` and `--no-offload` ask for opposite things; letting
+/// both through would make the baseline arm fail on purpose.
+fn check_offload_flags(common: &cli::CommonArgs) -> Result<(), Box<dyn Error>> {
+    if common.no_offload && common.strict_offload {
+        return Err(
+            "--strict-offload and --no-offload are contradictory: the baseline arm \
+                    exists to keep every candidate on the CPU"
+                .into(),
+        );
+    }
     Ok(())
 }
 
 fn run_compile(args: &cli::CompileArgs) -> Result<(), Box<dyn Error>> {
+    check_offload_flags(&args.common)?;
     let lib_path = resolve_lib_path(args.common.iree_compiler_lib.as_deref())?;
     let transform_spec = resolve_transform_spec(&args.common)?;
     check_spec_device_names(&args.common, transform_spec.path())?;
@@ -357,9 +441,20 @@ fn run_compile(args: &cli::CompileArgs) -> Result<(), Box<dyn Error>> {
     let invocation = Invocation::create(&session);
     invocation.enable_console_diagnostics();
     invocation.parse_source(&source)?;
+    // Only when something will read it: capturing the decision record costs
+    // an extra full-module IR dump, and a plain compile has no use for one.
+    let record = if needs_placement_pass(&args.common) {
+        capture_decisions(&library, &invocation)?
+    } else {
+        decisions::DecisionRecord::default()
+    };
     pin_unclaimed_dispatches(&invocation)?;
-    if args.common.no_offload {
-        assert_nothing_offloaded(&library, &invocation)?;
+    if needs_placement_pass(&args.common) {
+        let placement = capture_placement(&library, &invocation, None)?;
+        if args.common.no_offload {
+            assert_nothing_offloaded(&placement)?;
+        }
+        deliver_audit(&args.common, &audit::PlacementAudit::new(record, placement))?;
     }
     invocation.set_compile_to_phase("end");
     invocation.run_pipeline(Pipeline::Std)?;
@@ -373,6 +468,7 @@ fn run_compile(args: &cli::CompileArgs) -> Result<(), Box<dyn Error>> {
 }
 
 fn run_audit(args: &cli::AuditArgs) -> Result<(), Box<dyn Error>> {
+    check_offload_flags(&args.common)?;
     let lib_path = resolve_lib_path(args.common.iree_compiler_lib.as_deref())?;
     let transform_spec = resolve_transform_spec(&args.common)?;
     check_spec_device_names(&args.common, transform_spec.path())?;
@@ -385,28 +481,17 @@ fn run_audit(args: &cli::AuditArgs) -> Result<(), Box<dyn Error>> {
     let invocation = Invocation::create(&session);
     invocation.enable_console_diagnostics();
     invocation.parse_source(&source)?;
+    // Read at the phase that wrote it, before anything downstream can drop
+    // it; see DECISIONS_PHASE.
+    let record = capture_decisions(&library, &invocation)?;
     // Same staging as `compile`, so the report describes the placement a
     // .vmfb from this input would actually get.
     pin_unclaimed_dispatches(&invocation)?;
-    invocation.set_compile_to_phase("executable-targets");
-    invocation.run_pipeline(Pipeline::Std)?;
-    // Bare pass name, not "builtin.module(rocket-annotate-final-placement)":
-    // the invocation's PassManager (unlike iree-opt's generic tool machinery)
-    // is already module-anchored, so wrapping it re-nests one level too deep
-    // and silently matches zero ops instead of erroring.
-    invocation.run_pass_pipeline("rocket-annotate-final-placement")?;
+    let placement = capture_placement(&library, &invocation, args.emit_ir.as_deref())?;
 
-    let output = Output::open_membuffer(&library)?;
-    invocation.output_ir(&output)?;
-    let ir_bytes = output.map_memory()?;
-    let ir_text = String::from_utf8_lossy(ir_bytes);
-
-    if let Some(path) = &args.emit_ir {
-        std::fs::write(path, ir_text.as_bytes())?;
-    }
-
-    let report = report::PlacementReport::scan(&ir_text);
-    print!("{report}");
+    let audit = audit::PlacementAudit::new(record, placement);
+    print!("{audit}");
+    deliver_audit(&args.common, &audit)?;
     Ok(())
 }
 
@@ -421,11 +506,35 @@ mod tests {
             transform_spec: None,
             no_offload: false,
             elementwise: false,
+            strict_offload: false,
+            report_json: None,
             rocket_device_name: rocket.to_string(),
             cpu_device_name: cpu.to_string(),
             llvmcpu_target_cpu: "generic".to_string(),
             llvmcpu_target_triple: triple.map(str::to_string),
         }
+    }
+
+    /// The baseline arm exists to keep everything on the CPU; asking it to
+    /// also insist everything reached the NPU would fail every time.
+    #[test]
+    fn strict_offload_and_no_offload_are_rejected_together() {
+        let mut args = common_args("rocket_device", "cpu_device", None);
+        args.strict_offload = true;
+        check_offload_flags(&args).expect("strict offload alone is fine");
+        args.no_offload = true;
+        let err = check_offload_flags(&args).expect_err("the pair must be rejected");
+        assert!(err.to_string().contains("contradictory"), "{err}");
+    }
+
+    /// The extra `executable-targets` stop is only taken when something will
+    /// read what it produces; a plain compile must not pay for it.
+    #[test]
+    fn a_plain_compile_takes_no_report_detour() {
+        let mut args = common_args("rocket_device", "cpu_device", None);
+        assert!(!needs_placement_pass(&args));
+        args.report_json = Some(PathBuf::from("report.json"));
+        assert!(needs_placement_pass(&args));
     }
 
     #[test]

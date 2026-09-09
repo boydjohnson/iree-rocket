@@ -17,7 +17,7 @@ for the Rocket NPU backend (RK3588). This repository produces:
 | [`iree-rocket-hal`](iree-rocket-hal) | Low-level Rust crate: ioctl/mmap access to the RK3588 NPU and register command building. Consumes `rocket-core`'s plans and re-exports its planner under `rocket::conv`. |
 | [`rocket-hal-driver`](rocket-hal-driver) | Rust `staticlib` implementing IREE's HAL driver interface, statically linked into IREE via `iree_register_external_hal_driver()`. Depends on `iree-rocket-hal` and `rocket-schema`. Includes HAL CTS wiring under `cts/`. |
 | [`rocket-compiler-plugin`](rocket-compiler-plugin) | C++ IREE compiler target plugin ("Rocket"), loaded via `IREE_CMAKE_PLUGIN_PATHS`. Serializes executables using `rocket-schema`'s FlatBuffer format. |
-| [`rocket-compiler`](rocket-compiler) | Rust driver over `libIREECompiler.so`. Applies the Rocket transform spec and the device flags it expects, and can audit what ended up on the NPU. |
+| [`rocket-compiler`](rocket-compiler) | Rust driver over `libIREECompiler.so`. Applies the Rocket transform spec and the device flags it expects, and can audit why each convolution and matmul is where it is. |
 | `iree-build/iree-src` | `iree-org/iree` as a pinned git submodule. |
 | `iree-build` | CMake configuration used to build IREE with the Rocket driver/plugin. |
 
@@ -85,11 +85,55 @@ cargo run -p rocket-compiler -- compile --input model.mlir --output model.vmfb
 cargo run -p rocket-compiler -- audit --input model.mlir
 ```
 
-`audit` reports both executable and dispatch-site counts. Dispatch sites are
-the number that answers "how much of the model ran on the NPU": the transform
-spec routes every matched convolution through a handful of fixed executables,
-so an executable count alone understates NPU placement badly, while IREE
-deduplicates identical CPU dispatches, which overstates the CPU side.
+`audit` answers "why is this operation where it is". It prints one line per
+convolution and matmul candidate -- source location, kind, layout, shape,
+precision rung, the decision, and the decisive reason -- then the executable
+and dispatch-site counts, then a reconciliation of the two:
+
+```text
+Placement decisions (2 candidate(s) at selection time):
+  dense_conv2d at model.mlir:7:12 -> Rocket, direct [fp16]
+      nhwc 14x14 Cin 88 Cout 528 k1x1 s1
+      cbuf 2/10
+  dense_conv2d at model.mlir:13:12 -> CPU [unvalidated_configuration] [fp16]
+      nhwc 7x7 Cin 3585 Cout 64 k1x1 s1
+      validation policy: register-representable, not measured
+      input channels must be 1..=3584; beyond that the channel padding has no
+      capture backing at this precision
+  1 direct, 0 tiled, 1 cpu, 0 deferred; 1 hardware job(s) planned
+  ...
+Reconciliation:
+  1 accepted candidate(s) -> 1 Rocket dispatch site(s) running 1 hardware job(s)
+  4 CPU dispatch site(s), 1 of them convolution- or matmul-shaped
+    - main_dispatch_3 (1 site(s)): matmul_like
+```
+
+Three counts, deliberately kept apart. **Candidates** are original
+operations. **Dispatch sites** are what actually ran where -- the number that
+answers "how much of the model ran on the NPU", because the transform spec
+routes every matched convolution through a handful of fixed executables (so
+an executable count understates the NPU badly) while IREE deduplicates
+identical CPU dispatches (which overstates the CPU side). **Hardware jobs**
+are standalone NPU jobs: one dispatch already runs several when the planner
+tiled it.
+
+The decisions come from the shared planner (`rocket-core`) at selection time,
+recorded by `rocket-plan-candidates` before the match loop erases the
+candidates it claims; the placement comes from the compiled module. Neither
+alone explains anything. Together they separate the planner refusing, the
+admission envelope having no evidence for the shape class, and *both* saying
+yes while a matcher still declined -- which is a semantic or fusion gap in
+the transform spec, and the only one of the three that closes without new
+hardware measurements. Each refusal names its class: `shape`, `semantics`,
+`hardware` (permanent), or `validation` (nobody has measured it yet).
+
+`--report-json <path>`, on `audit` or `compile`, writes the same thing
+machine-readably. `--strict-offload`, on either, fails the compile instead of
+falling back: any candidate the planner, the envelope or the op's form ruled
+out, any accepted candidate with no Rocket dispatch to account for it, and
+any CPU dispatch whose export name says it is running a convolution or a
+matmul. It cannot see an operation IREE fused into a larger element-wise
+dispatch, so a pass means "nothing observably left on the CPU", not a proof.
 
 ### The CPU-only baseline: `--no-offload`
 

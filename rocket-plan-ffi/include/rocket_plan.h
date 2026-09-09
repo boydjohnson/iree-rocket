@@ -31,7 +31,7 @@
 extern "C" {
 #endif
 
-#define ROCKET_PLAN_ABI_VERSION 2u
+#define ROCKET_PLAN_ABI_VERSION 3u
 
 /* Mirrors rocket_core::conv::Precision. Values are part of the ABI. */
 typedef enum rocket_plan_precision_e {
@@ -171,6 +171,12 @@ uint32_t rocket_plan_abi_version(void);
 
 /* A fixed name for a status, e.g. "unvalidated_configuration". */
 const char* rocket_plan_status_name(uint32_t status);
+
+/* A fixed name for a precision rung, in the spelling the transform spec's
+ * `precision` attribute uses: "fp16", "int8_requant", "int8_accumulator",
+ * ... Out-of-range values name "unknown" rather than reading past the
+ * table. Added in ABI version 3. */
+const char* rocket_plan_precision_name(uint32_t precision);
 
 /* Plans `desc` under `policy` (NULL for none). On ROCKET_PLAN_OK fills
  * `out_plan` (may be NULL if the caller only wants the verdict). On any

@@ -16,8 +16,10 @@ pub struct Cli {
 pub enum Command {
     /// Full compile to a .vmfb.
     Compile(CompileArgs),
-    /// Compile to executable-targets, run the placement-audit pass, and
-    /// print a report of what ended up on Rocket vs CPU.
+    /// Compile to executable-targets and print why each convolution and
+    /// matmul candidate is where it is: the shared planner's decision for
+    /// each, what ended up on Rocket vs CPU, and the reconciliation between
+    /// them.
     Audit(AuditArgs),
 }
 
@@ -74,6 +76,31 @@ pub struct CommonArgs {
 
     #[arg(long, default_value = "generic")]
     pub llvmcpu_target_cpu: String,
+
+    /// Fail the compile if any convolution or matmul candidate did not reach
+    /// the NPU, instead of letting it fall back to the CPU.
+    ///
+    /// Scope, which is narrower than "everything ran on the NPU". It fails on
+    /// a candidate the shared planner refused, one the admission envelope has
+    /// no evidence for, one whose form the Rocket lowering cannot express, an
+    /// accepted candidate with no Rocket dispatch site to account for it, and
+    /// any CPU dispatch whose export name says it is running a convolution or
+    /// a matmul. It cannot see an operation IREE fused into a larger
+    /// element-wise dispatch, which leaves no named evidence in the module --
+    /// so a pass means "nothing observably left on the CPU", not a proof.
+    ///
+    /// Pointless with `--no-offload`, which exists to put everything on the
+    /// CPU; the two together are rejected rather than made to contradict each
+    /// other.
+    #[arg(long)]
+    pub strict_offload: bool,
+
+    /// Also write the placement audit as JSON to this path: one record per
+    /// candidate with its location, kind, shape, precision, decision, reason
+    /// code and message, tile summary and limit class, plus the dispatch-site
+    /// and hardware-job counts and the reconciliation between them.
+    #[arg(long)]
+    pub report_json: Option<PathBuf>,
 
     /// LLVM target triple for the CPU half of the compile, e.g.
     /// `aarch64-linux-gnu` to build a module that runs on the board. Only
