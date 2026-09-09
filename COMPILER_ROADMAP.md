@@ -44,6 +44,9 @@ CPU fallback after an NPU dispatch has already been selected.
 Preserve `RocketVerifyConvShapesPass.cpp` as an early semantic tripwire. An
 inconsistent convolution extent is a compilation error even if CPU fallback is
 enabled: moving an incorrectly rewritten operation to CPU does not repair it.
+Since 2026-09-09 (DYNAMIC_SHAPES.md DS4) it also checks each op's
+shape-defining attributes against a record taken before the demotion, so it
+holds on symbolic extents as well.
 
 ## 1. Extract a pure, fallible planning library
 

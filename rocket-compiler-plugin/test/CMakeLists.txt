@@ -36,6 +36,9 @@ iree_lit_test_suite(
     "rocket_pooling_min_match_boundaries.mlir"
     "rocket_runtime_dimensions.mlir"
     "rocket_runtime_dimensions_invalid.mlir"
+    "rocket_verify_conv_shapes.mlir"
+    "rocket_verify_conv_shapes_invalid.mlir"
+    "rocket_verify_conv_shapes_upstream_demote.mlir"
   TOOLS
     FileCheck
     iree-compile

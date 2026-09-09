@@ -265,11 +265,16 @@ worth 0.349 max|err| on the final logits. Only the plugin's own demotion is
 reverted: both passes agree on a `rocket.f16_demoted` tag, so a model that
 authored its own f16 convolution is untouched.
 
-`rocket-verify-conv-shapes` is the tripwire for anything like it: it errors if
-a named convolution's output spatial extent disagrees with its own input,
-filter, stride and dilation. It runs immediately before the match/rewrite
-loop, while padding is still explicit and nothing has been tiled, so the
-relation is exact there. It should never fire.
+`rocket-record-conv-attrs` and `rocket-verify-conv-shapes` are the tripwire
+for anything like it. Record, run right before the demotion, stamps every
+named convolution and matmul with its `strides`, `dilations`,
+`indexing_maps` and `cast`; verify, run right after, errors if any op's
+attributes no longer agree with that record or if an op has lost the record
+-- a check that holds on symbolic shapes too -- and, where the extents are
+static, if a convolution's output spatial extent disagrees with its own
+input, filter, stride and dilation. Both run immediately before the
+match/rewrite loop, while padding is still explicit and nothing has been
+tiled, so the relation is exact there. It should never fire.
 
 ### ONNX models
 
