@@ -200,7 +200,24 @@ the CPU), VGG19 21 sites, `--no-offload` 0 sites with and without
 `--elementwise`; all unchanged, so no measured model sits in a widened
 corner.
 
-Still open here: the strict-offload option and the dynamic-shape policy.
+**Status 2026-09-09: the first deliberate raise off the shared table.** With
+the ceilings in one place it was visible that fp16 depthwise sat at 512
+while `ConvPlan` plans it to 1792 and the int8 depthwise rung was already at
+1344 -- so six of MobileNetV2's seventeen depthwise convolutions were on the
+CPU for want of a number nobody had revisited. Raised to 1536, the extent the
+compiled end-to-end gate now proves: `tools/e2e_conv_regression.py` gained
+`depthwise_fp16_c576`, `_c960`, `_c1536` and `_c1536_s2`, each compiled twice
+from one MLIR and compared on `planck` at atol 1e-3 (max|error| 1.6e-4 to
+2.4e-4, 0 mismatches). MobileNetV2 fp16 goes 47 -> 53 sites, max|diff| 0.0156
+against its own `--no-offload` arm with top-1 and top-5 unchanged, and 4.6 ms
+slower at four workers / flat at eight -- the ISSUES.md P7 verdict on cheap
+depthwise dispatches, unchanged. That gap between "characterized" and "worth
+offloading" is the third policy this section's opening asks for and the one
+still missing: admission and hardware legality are now separate, cost policy
+is not.
+
+Still open here: the strict-offload option, the cost policy above, and the
+dynamic-shape policy.
 
 Expose core through a small versioned C ABI adapter, built as a host Rust static
 library and linked into the C++ plugin through its CMake build. Use fixed-width

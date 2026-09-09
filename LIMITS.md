@@ -121,7 +121,13 @@ nine-significant-bit ceiling.
 letting it keep riding that constant would have doubled the depthwise range on
 dense evidence. `MAX_DEPTHWISE_CHANNELS` freezes it at the 1792 it already had;
 the depthwise evidence itself stops earlier still (vendor corpus to 1344,
-hardware exactness to 1536). Compiler admission sits below both, at 1344 for int8 and 512 for fp16. Depthwise has its own
+hardware exactness to 1536). Compiler admission sits below both: 1344 for
+int8 and, since 2026-09-09, **1536** for fp16 -- raised from 512, which was
+where the fp16 depthwise matchers had been written and never revisited, and
+which left MobileNetV2's own C=576 and C=960 depthwise convolutions on the
+CPU. The raise is gated end to end by `tools/e2e_conv_regression.py`'s
+`depthwise_fp16_c576`/`_c960`/`_c1536`/`_c1536_s2`; it costs 4.6 ms at four
+workers and nothing at eight, see ISSUES.md P7. Depthwise has its own
 coefficient grouping and its own output writer, each of which has been wrong at
 a shape the dense path was right at.
 

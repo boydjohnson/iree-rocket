@@ -92,6 +92,59 @@ func.func @depthwise(%input: tensor<1x8x8x40xf16>, %filter: tensor<3x3x40xf16>, 
   return %0 : tensor<1x6x6x40xf32>
 }
 
+// Wide fp16 depthwise, at the channel counts the admission envelope moved
+// for on 2026-09-09 (rocket-core's `admission` module, fp16 depthwise
+// 512 -> 1536). These are the measurement that number stands on, so they
+// are compiled end to end rather than probed through the HAL: the point is
+// that a *model* at these widths is right, not that `ConvPlan` will program
+// them.
+//
+// C=576 and C=960 are MobileNetV2's own two widest depthwise convolutions,
+// at their real extents; both were on the CPU under the old 512 for want of
+// a number. C=1536 is the new ceiling, at stride 1 and at stride 2, where
+// the plan is multi-tile (3 tiles at 14x14 s1, 13 at 28x28 s2), so a
+// tile-boundary fault at width cannot hide.
+//
+// Authored in f16, like the mixed cases below and for the same reason:
+// `rocket-demote-conv-inputs-to-f16` deliberately leaves depthwise alone, so
+// an f32 spelling would sit on the CPU and the differential would compare
+// the CPU with itself.
+func.func @depthwise_fp16_c576(%input: tensor<1x16x16x576xf16>, %filter: tensor<3x3x576xf16>, %init: tensor<1x14x14x576xf32>) -> tensor<1x14x14x576xf32> {
+  %0 = linalg.depthwise_conv_2d_nhwc_hwc
+      {dilations = dense<1> : tensor<2xi64>, strides = dense<1> : tensor<2xi64>}
+      ins(%input, %filter : tensor<1x16x16x576xf16>, tensor<3x3x576xf16>)
+      outs(%init : tensor<1x14x14x576xf32>) -> tensor<1x14x14x576xf32>
+  return %0 : tensor<1x14x14x576xf32>
+}
+
+func.func @depthwise_fp16_c960(%input: tensor<1x9x9x960xf16>, %filter: tensor<3x3x960xf16>, %init: tensor<1x7x7x960xf32>) -> tensor<1x7x7x960xf32> {
+  %0 = linalg.depthwise_conv_2d_nhwc_hwc
+      {dilations = dense<1> : tensor<2xi64>, strides = dense<1> : tensor<2xi64>}
+      ins(%input, %filter : tensor<1x9x9x960xf16>, tensor<3x3x960xf16>)
+      outs(%init : tensor<1x7x7x960xf32>) -> tensor<1x7x7x960xf32>
+  return %0 : tensor<1x7x7x960xf32>
+}
+
+func.func @depthwise_fp16_c1536(%input: tensor<1x16x16x1536xf16>, %filter: tensor<3x3x1536xf16>, %init: tensor<1x14x14x1536xf32>) -> tensor<1x14x14x1536xf32> {
+  %0 = linalg.depthwise_conv_2d_nhwc_hwc
+      {dilations = dense<1> : tensor<2xi64>, strides = dense<1> : tensor<2xi64>}
+      ins(%input, %filter : tensor<1x16x16x1536xf16>, tensor<3x3x1536xf16>)
+      outs(%init : tensor<1x14x14x1536xf32>) -> tensor<1x14x14x1536xf32>
+  return %0 : tensor<1x14x14x1536xf32>
+}
+
+// NCHW, unlike the three above, because that is the only layout the fp16
+// depthwise stride-2 matcher exists in -- the NHWC depthwise matchers are
+// stride 1 only. The `mixed_*_then_depthwise` cases below spell their
+// stride-2 depthwise the same way for the same reason.
+func.func @depthwise_fp16_c1536_s2(%input: tensor<1x1536x29x29xf16>, %filter: tensor<1536x3x3xf16>, %init: tensor<1x1536x14x14xf32>) -> tensor<1x1536x14x14xf32> {
+  %0 = linalg.depthwise_conv_2d_nchw_chw
+      {dilations = dense<1> : tensor<2xi64>, strides = dense<2> : tensor<2xi64>}
+      ins(%input, %filter : tensor<1x1536x29x29xf16>, tensor<1536x3x3xf16>)
+      outs(%init : tensor<1x1536x14x14xf32>) -> tensor<1x1536x14x14xf32>
+  return %0 : tensor<1x1536x14x14xf32>
+}
+
 // The int8 cases below are written in the *quantized* form an ONNX
 // ConvInteger model arrives in, with a non-zero input zero point and a zero
 // weight zero point (what ORT's quantize_dynamic always produces). That is
@@ -1090,6 +1143,40 @@ def write_compiled_fixture(work_dir: Path) -> None:
     np.save(work_dir / "depthwise_input.npy", depthwise_input)
     np.save(work_dir / "depthwise_init.npy", np.zeros((1, 6, 6, 40), dtype=np.float32))
 
+    # The wide fp16 depthwise ladder. Ranges are the same as the 40-channel
+    # case above: nine taps of |input| <= 0.25 times |weight| <= 0.5 cannot
+    # leave the range where an f32 accumulator and an f16 operand agree to
+    # far better than the 1e-2 the comparison allows, so a difference here
+    # is a layout or an addressing fault rather than rounding.
+    for name, channels, in_extent, out_extent, nchw in (
+        ("depthwise_fp16_c576", 576, 16, 14, False),
+        ("depthwise_fp16_c960", 960, 9, 7, False),
+        ("depthwise_fp16_c1536", 1536, 16, 14, False),
+        ("depthwise_fp16_c1536_s2", 1536, 29, 14, True),
+    ):
+        in_shape = (
+            (1, channels, in_extent, in_extent)
+            if nchw
+            else (1, in_extent, in_extent, channels)
+        )
+        out_shape = (
+            (1, channels, out_extent, out_extent)
+            if nchw
+            else (1, out_extent, out_extent, channels)
+        )
+        kernel_shape = (channels, 3, 3) if nchw else (3, 3, channels)
+        np.save(
+            work_dir / f"{name}_input.npy",
+            rng.uniform(-0.25, 0.25, size=in_shape).astype(np.float16),
+        )
+        np.save(
+            work_dir / f"{name}_kernel.npy",
+            rng.uniform(-0.5, 0.5, size=kernel_shape).astype(np.float16),
+        )
+        np.save(
+            work_dir / f"{name}_init.npy", np.zeros(out_shape, dtype=np.float32)
+        )
+
     # int8 fixtures. The values span the full signed range so a wrong
     # zero-point fold or a mis-permuted transpose cannot cancel out, and the
     # accumulators stay far inside i32.
@@ -1353,6 +1440,14 @@ def compile_modules(
         ("requant_int8_1x1_cout1792", "rocket_dynamic_int8_requant_executable"),
         ("requant_int8_3x3_cin768", "rocket_dynamic_int8_requant_executable"),
         ("requant_int8_3x3_cin256", "rocket_dynamic_int8_requant_executable"),
+        # The fp16 depthwise widths the 2026-09-09 admission raise added. If
+        # one stops reaching its matcher the differential would compare the
+        # CPU with itself and pass, which is the whole reason this check
+        # exists.
+        ("depthwise_fp16_c576", "rocket_dynamic_depthwise_executable"),
+        ("depthwise_fp16_c960", "rocket_dynamic_depthwise_executable"),
+        ("depthwise_fp16_c1536", "rocket_dynamic_depthwise_executable"),
+        ("depthwise_fp16_c1536_s2", "rocket_dynamic_depthwise_executable_s2"),
     ):
         match = re.search(
             rf"util\.func public @{re.escape(function)}\b(?P<body>.*?)"
@@ -1623,6 +1718,29 @@ def run_compiled_gate(
             ("dense_int8_out_rocket.npy",),
             0.0,
             0.0,
+        ),
+        # Tighter than the shared default (0.05/0.02), because these
+        # fixtures were built so it can be: nine taps of |input| <= 0.25
+        # times |weight| <= 0.5 keeps every accumulator small, and the
+        # measured spread on `planck` 2026-09-09 is 1.6e-4 to 2.4e-4 across
+        # all four. 1e-3 is four times the worst of those -- enough headroom
+        # for f16 rounding on another input draw, and far too little for a
+        # channel-group permutation, a tile-boundary fault or a zeroed
+        # surface to slip through.
+        *(
+            Case(
+                name,
+                (f"{name}_input.npy", f"{name}_kernel.npy", f"{name}_init.npy"),
+                (f"{name}_out_rocket.npy",),
+                1e-3,
+                0.0,
+            )
+            for name in (
+                "depthwise_fp16_c576",
+                "depthwise_fp16_c960",
+                "depthwise_fp16_c1536",
+                "depthwise_fp16_c1536_s2",
+            )
         ),
         Case(
             "dense_cin3",
