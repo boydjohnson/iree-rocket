@@ -22,12 +22,22 @@ use crate::{
 };
 use iree_rocket_hal::rocket::{
     activation::{LutShape, LutTable},
-    conv::{self, Kernels, Multiplier, Precision},
+    conv::{self, Kernels, Multiplier, PlanError, Precision},
     elementwise::{EwAddShape, EwBinaryOp, EwPrecision, EwUnaryAlgo, EwUnaryShape},
     executable_format::validate_conv_shape,
     fc,
     pooling::PoolingShape,
 };
+
+/// Narrows a planner refusal to the `&'static str` this module's error
+/// paths carry. The status that reaches IREE is a bare code either way
+/// (`status::from_code`), so the full message -- the one that names the
+/// actual bound -- goes to stderr here, where a developer running the
+/// module can see why a dispatch was refused.
+fn plan_refusal(error: PlanError) -> &'static str {
+    eprintln!("rocket: refusing convolution plan: {error}");
+    error.code().description()
+}
 
 /// A logical Conv2D shape/kernel field supplied by one uint32 dispatch push
 /// constant.
@@ -250,7 +260,7 @@ impl Conv2dExecutable {
         }
 
         if self.runtime_dimensions.is_empty() && self.runtime_quantization.is_empty() {
-            validate_conv_shape(&self.shape_template, self.kernels)?;
+            validate_conv_shape(&self.shape_template, self.kernels).map_err(plan_refusal)?;
         }
         Ok(())
     }
@@ -346,7 +356,7 @@ impl Conv2dExecutable {
             shape.precision = Precision::Int8(quantization);
         }
 
-        validate_conv_shape(&shape, kernels)?;
+        validate_conv_shape(&shape, kernels).map_err(plan_refusal)?;
         Ok((shape, kernels))
     }
 }
@@ -1049,9 +1059,8 @@ impl MatmulExecutable {
             }
             dimension.set(&mut shape, value);
         }
-        let conv = std::panic::catch_unwind(|| shape.as_conv_shape())
-            .map_err(|_| "matmul shape is outside the convolution builder's bounds")?;
-        validate_conv_shape(&conv, fc::KERNELS)?;
+        let conv = shape.try_as_conv_shape().map_err(plan_refusal)?;
+        validate_conv_shape(&conv, fc::KERNELS).map_err(plan_refusal)?;
         Ok(shape)
     }
 }

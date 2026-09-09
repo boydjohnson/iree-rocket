@@ -198,7 +198,7 @@ state the runtime could not execute -- the same reason `PoolingMethod` has no
 
 A third kind of blocker, alongside the two the ledger lists: an op the whole
 stack supports at a *shape* the measurement has not reached. Every dense
-channel ceiling in [`conv.rs`](iree-rocket-hal/src/rocket/conv.rs) moved from
+channel ceiling in [`conv.rs`](rocket-core/src/conv.rs) (then in the HAL) moved from
 1792 (fp16 family), 1344/1792 (int8, int4) and 1024/1792 (tf32) to a uniform
 **3584** on `Cin` and `Cout`, with the k=1 matchers and the matmul matcher
 following. [LIMITS.md](LIMITS.md#convolution-channel-limits) carries the sweep;

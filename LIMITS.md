@@ -29,7 +29,7 @@ other. Whichever is tightest for a given shape is the one that decides.
 |---|---|---|---|
 | Compiler matchers | [`rocket_conv2d_transform_spec.mlir`](rocket-compiler-plugin/target/Rocket/rocket_conv2d_transform_spec.mlir) | Which ops in a model are claimed for the NPU at all | Silent, graceful CPU fallback |
 | Wire format | [`rocket_executable_def.fbs`](rocket-schema/schema/rocket_executable_def.fbs) | Which precisions and ops a compiled `.vmfb` can even express | Serialization error at compile time |
-| HAL planner | [`conv.rs`](iree-rocket-hal/src/rocket/conv.rs), [`pooling.rs`](iree-rocket-hal/src/rocket/pooling.rs) | Which shapes `ConvPlan`/`PoolingPlan` will program | Panic (loud) -- the matchers are set so this is unreachable from a compiled model |
+| Planner | [`rocket-core/src/conv.rs`](rocket-core/src/conv.rs), [`pooling.rs`](iree-rocket-hal/src/rocket/pooling.rs) | Which shapes `ConvPlan`/`PoolingPlan` will program | Panic (loud) -- the matchers are set so this is unreachable from a compiled model |
 
 The matcher bounds are deliberately *at or below* the HAL bounds. Where they
 differ it is because the HAL constant governs one rule and something else binds
@@ -41,7 +41,8 @@ k=1 measurement and only k=1 matchers follow them up.
 
 ## Convolution channel limits
 
-These are the HAL constants in `iree-rocket-hal/src/rocket/conv.rs`. Dense
+These are the planner constants in `rocket-core/src/conv.rs` (re-exported by
+the HAL as `iree_rocket_hal::rocket::conv`). Dense
 convolution and matmul share them -- a matmul reaches this hardware as a
 height-one 1x1 convolution, so these are the matmul limits under different
 names -- while depthwise has its own, lower ceiling (below).

@@ -13,6 +13,7 @@ kernel-fix = []
 hardware-characterization = []
 
 [dependencies]
+rocket-core = { path = "../rocket-core" }
 nix = { version = "0.30.1", features = ["ioctl", "mman", "sched", "time"] }
 
 [dev-dependencies]

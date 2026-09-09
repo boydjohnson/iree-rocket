@@ -191,7 +191,7 @@ needs none of this.
 Today the *channel* ceilings are compile-time matcher facts.
 `@match_dynamic_conv2d` bounds Cin and Cout at 3584 (matching
 `conv::MAX_INPUT_CHANNELS` / `MAX_OUTPUT_CHANNELS`,
-`iree-rocket-hal/src/rocket/conv.rs:297` and `:495`); the 3x3 matcher keeps a
+`rocket-core/src/conv.rs`, since the 2026-09-09 extraction); the 3x3 matcher keeps a
 separate Cin 1152 / Cout 1792 (spec `:6013` and `:6014`); stride lives in the
 executable variant. A model outside *those* bounds does not match and runs on
 the CPU -- correct, just slower.
