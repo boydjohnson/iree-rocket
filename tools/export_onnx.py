@@ -40,29 +40,119 @@ from __future__ import annotations
 import argparse
 from pathlib import Path
 
-# name -> (torchvision attribute, weights enum attribute, input shape)
-#
-# The spatial extent is the model's own training resolution rather than a
-# uniform 224: a survey that silently resizes a model is measuring a shape its
-# author never shipped.
-REGISTRY: dict[str, tuple[str, str, tuple[int, ...]]] = {
+def torchvision_recipe(attribute: str, weights_name: str, shape: tuple[int, ...]):
+    """A single-image classifier: pretrained weights, one float input.
+
+    The spatial extent comes from the model rather than a uniform 224: a
+    survey that silently resizes a model is measuring a shape its author
+    never shipped.
+    """
+
+    def build(dtype):
+        import torch
+        import torchvision.models as models
+
+        weights = getattr(models, weights_name).DEFAULT
+        model = getattr(models, attribute)(weights=weights).eval()
+        if dtype is torch.float16:
+            model = model.half()
+        return (
+            model,
+            (torch.randn(*shape, dtype=dtype),),
+            ["input"],
+            ["output"],
+        )
+
+    return build
+
+
+def blip_captioning_recipe(checkpoint: str, resolution: int, tokens: int):
+    """BLIP image captioning, wrapped down to one forward pass.
+
+    Two things this wrapper decides, both of which change what gets measured:
+
+    **One forward pass, not `generate()`.** The Rocket ABI has no way to
+    express an autoregressive loop and the survey compares one invocation
+    against one invocation, so the export is a single teacher-forced step:
+    pixels and a fixed-length token prefix in, decoder logits out.
+
+    **Logits, not the loss.** `BlipForConditionalGeneration` returns a scalar
+    loss alongside its logits when labels are implied, and a scalar is a
+    useless correctness signal -- CLIP's `logits_per_image` taught this
+    repository that once already, at 1x1. The `tokens x vocab` logit block is
+    wide enough that an argmax over it means something.
+    """
+
+    def build(dtype):
+        import torch
+        from transformers import BlipForConditionalGeneration
+
+        model = BlipForConditionalGeneration.from_pretrained(checkpoint).eval()
+        if dtype is torch.float16:
+            model = model.half()
+
+        class OneStep(torch.nn.Module):
+            def __init__(self, inner):
+                super().__init__()
+                self.inner = inner
+
+            def forward(self, pixel_values, input_ids):
+                return self.inner(
+                    pixel_values=pixel_values, input_ids=input_ids
+                ).logits
+
+        # Token ids are int64 whatever the activations are; only the pixels
+        # follow the export precision.
+        example = (
+            torch.randn(1, 3, resolution, resolution, dtype=dtype),
+            torch.randint(0, 30000, (1, tokens), dtype=torch.int64),
+        )
+        return OneStep(model).eval(), example, ["pixel_values", "input_ids"], ["logits"]
+
+    return build
+
+
+# Every model the survey can export, by name. A recipe is a callable taking the
+# torch dtype and returning (module, example inputs, input names, output names),
+# so a model that needs a wrapper is not a special case in `export` below.
+REGISTRY = {
     # The set the repository already measures, here so a re-export is
     # reproducible rather than remembered.
-    "mobilenet_v2": ("mobilenet_v2", "MobileNet_V2_Weights", (1, 3, 224, 224)),
-    "resnet50": ("resnet50", "ResNet50_Weights", (1, 3, 224, 224)),
-    "vgg19": ("vgg19", "VGG19_Weights", (1, 3, 224, 224)),
-    # New: the two models that carry the 2026-09-09 ceiling raise on a real
-    # graph. `wide_resnet50_2` doubles ResNet50's bottleneck widths (to Cout
-    # 2048 at 1x1) and `vit_l_16` has the 1024x4096 MLP that LIMITS.md names
-    # as the reason `MAX_OUTPUT_CHANNELS` moved from 3584 to 4096.
-    "wide_resnet50_2": ("wide_resnet50_2", "Wide_ResNet50_2_Weights", (1, 3, 224, 224)),
-    "vit_l_16": ("vit_l_16", "ViT_L_16_Weights", (1, 3, 224, 224)),
-    "vit_b_16": ("vit_b_16", "ViT_B_16_Weights", (1, 3, 224, 224)),
-    "densenet121": ("densenet121", "DenseNet121_Weights", (1, 3, 224, 224)),
-    "efficientnet_b0": ("efficientnet_b0", "EfficientNet_B0_Weights", (1, 3, 224, 224)),
-    "inception_v3": ("inception_v3", "Inception_V3_Weights", (1, 3, 299, 299)),
-    "resnext50_32x4d": ("resnext50_32x4d", "ResNeXt50_32X4D_Weights", (1, 3, 224, 224)),
-    "convnext_tiny": ("convnext_tiny", "ConvNeXt_Tiny_Weights", (1, 3, 224, 224)),
+    "mobilenet_v2": torchvision_recipe(
+        "mobilenet_v2", "MobileNet_V2_Weights", (1, 3, 224, 224)
+    ),
+    "resnet50": torchvision_recipe("resnet50", "ResNet50_Weights", (1, 3, 224, 224)),
+    "vgg19": torchvision_recipe("vgg19", "VGG19_Weights", (1, 3, 224, 224)),
+    # The two models that carry the 2026-09-09 ceiling raise on a real graph.
+    # `wide_resnet50_2` doubles ResNet50's bottleneck widths (to Cout 2048 at
+    # 1x1) and `vit_l_16` has the 1024x4096 MLP that LIMITS.md names as the
+    # reason `MAX_OUTPUT_CHANNELS` moved from 3584 to 4096.
+    "wide_resnet50_2": torchvision_recipe(
+        "wide_resnet50_2", "Wide_ResNet50_2_Weights", (1, 3, 224, 224)
+    ),
+    "vit_l_16": torchvision_recipe("vit_l_16", "ViT_L_16_Weights", (1, 3, 224, 224)),
+    "vit_b_16": torchvision_recipe("vit_b_16", "ViT_B_16_Weights", (1, 3, 224, 224)),
+    "densenet121": torchvision_recipe(
+        "densenet121", "DenseNet121_Weights", (1, 3, 224, 224)
+    ),
+    "efficientnet_b0": torchvision_recipe(
+        "efficientnet_b0", "EfficientNet_B0_Weights", (1, 3, 224, 224)
+    ),
+    "inception_v3": torchvision_recipe(
+        "inception_v3", "Inception_V3_Weights", (1, 3, 299, 299)
+    ),
+    "resnext50_32x4d": torchvision_recipe(
+        "resnext50_32x4d", "ResNeXt50_32X4D_Weights", (1, 3, 224, 224)
+    ),
+    "convnext_tiny": torchvision_recipe(
+        "convnext_tiny", "ConvNeXt_Tiny_Weights", (1, 3, 224, 224)
+    ),
+    # Vision-language. Two inputs, one of them integer, and a vision tower
+    # whose 16x16 patch embedding no matcher claims -- the same shape ViT-L
+    # leaves on the CPU.
+    "blip": blip_captioning_recipe(
+        "Salesforce/blip-image-captioning-base", 384, 16
+    ),
 }
 
 
@@ -104,18 +194,11 @@ def export(
     name: str, precision: str, out_dir: Path, opset: int, simplify: bool
 ) -> Path:
     import torch
-    import torchvision.models as models
     import onnx
     from onnx import shape_inference
 
-    attribute, weights_name, shape = REGISTRY[name]
-    weights = getattr(models, weights_name).DEFAULT
-    model = getattr(models, attribute)(weights=weights).eval()
-
     dtype = torch.float16 if precision == "fp16" else torch.float32
-    if dtype is torch.float16:
-        model = model.half()
-    example = torch.randn(*shape, dtype=dtype)
+    model, example, input_names, output_names = REGISTRY[name](dtype)
 
     out_dir.mkdir(parents=True, exist_ok=True)
     path = out_dir / f"{name}.{precision}.onnx"
@@ -125,8 +208,8 @@ def export(
         example,
         str(path),
         opset_version=opset,
-        input_names=["input"],
-        output_names=["output"],
+        input_names=input_names,
+        output_names=output_names,
         do_constant_folding=True,
         dynamo=False,
     )
