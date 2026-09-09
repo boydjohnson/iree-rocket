@@ -112,6 +112,72 @@ def blip_captioning_recipe(checkpoint: str, resolution: int, tokens: int):
     return build
 
 
+def bert_encoder_recipe(checkpoint: str, tokens: int):
+    """A BERT encoder, wrapped down to ids and a mask in, hidden states out.
+
+    The only model here with **no convolution at all**: every candidate is a
+    matmul, so it reads the matmul path without a conv stem's contribution
+    mixed in. The sequence length is the matmul `M` directly, which makes it
+    the cheapest way to walk a real model along that axis -- `M` moved to 4096
+    on 2026-09-09 and 128 is well inside it.
+
+    The mask is emitted as an input rather than baked, because a baked
+    all-ones mask lets the exporter constant-fold the whole additive-mask
+    subgraph away and the export stops resembling how the model is served.
+    `tools/import_onnx.py` samples anything named `mask` as ones, which is the
+    no-padding case.
+
+    **Export this one at f32.** transformers runs BERT's attention softmax in
+    fp32 for numerical stability and does not cast the residual stream back,
+    so a half model exports a *mixed* graph -- an f32 residual reaching a
+    LayerNormalization whose scale is f16 -- which ONNX Runtime refuses to
+    load outright:
+
+        Type Error: Type parameter (T) of Optype (LayerNormalization) bound to
+        different types (tensor(float) and tensor(float16))
+
+    Neither `.half()`, `dtype=torch.float16` at load, nor
+    `attn_implementation="sdpa"` avoids it; the upcast is in the modelling
+    code. That costs nothing here, because the transform spec demotes matched
+    matmuls to f16 itself and restores f32 on what the match loop leaves
+    behind -- an f32 import picks precision per operation. It does mean the
+    `--no-offload` arm of this model is an f32 CPU arm, which is a weaker
+    baseline than an fp16 one (4.3x on Wide ResNet-50-2), so say so next to
+    any ratio quoted from it.
+    """
+
+    def build(dtype):
+        import torch
+        from transformers import AutoModel
+
+        model = AutoModel.from_pretrained(checkpoint).eval()
+        if dtype is torch.float16:
+            model = model.half()
+
+        class Encoder(torch.nn.Module):
+            def __init__(self, inner):
+                super().__init__()
+                self.inner = inner
+
+            def forward(self, input_ids, attention_mask):
+                return self.inner(
+                    input_ids=input_ids, attention_mask=attention_mask
+                ).last_hidden_state
+
+        example = (
+            torch.randint(0, 20000, (1, tokens), dtype=torch.int64),
+            torch.ones(1, tokens, dtype=torch.int64),
+        )
+        return (
+            Encoder(model).eval(),
+            example,
+            ["input_ids", "attention_mask"],
+            ["last_hidden_state"],
+        )
+
+    return build
+
+
 # Every model the survey can export, by name. A recipe is a callable taking the
 # torch dtype and returning (module, example inputs, input names, output names),
 # so a model that needs a wrapper is not a special case in `export` below.
@@ -153,6 +219,11 @@ REGISTRY = {
     "blip": blip_captioning_recipe(
         "Salesforce/blip-image-captioning-base", 384, 16
     ),
+    # Matmul only. `bert_base` at 128 tokens is the canonical serving shape;
+    # `bert_base_384` is the same weights at a wider `M`, which is the axis
+    # that moved to 4096 on 2026-09-09.
+    "bert_base": bert_encoder_recipe("google-bert/bert-base-uncased", 128),
+    "bert_base_384": bert_encoder_recipe("google-bert/bert-base-uncased", 384),
 }
 
 

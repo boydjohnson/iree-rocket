@@ -856,6 +856,13 @@ def main() -> None:
         summarize(args.work_root, args.limit)
         return
 
+    # An f32 import *is* the f32 reference, so asking for both means asking
+    # the importer for its own oracle. Without this the two flags cancel:
+    # the import is told to skip the oracle and the f32 stage then declines
+    # to build one, and every arm scores "no oracle".
+    if args.oracle == "f32" and args.precision == "f32" and args.oracle_onnx is None:
+        args.oracle = "same"
+
     arms = args.arm or list(DEFAULT_ARMS)
     cpu_ids = args.cpu_ids or list(DEFAULT_CPU_IDS)
     work = args.work_root / args.model
