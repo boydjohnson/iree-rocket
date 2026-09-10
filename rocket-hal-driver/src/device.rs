@@ -193,6 +193,46 @@ fn quiesce_all_enabled() -> bool {
 /// exactly this family of symptom. It may already be vestigial. Nothing above
 /// proves that.
 ///
+/// **The DRM interface offers userspace no alternative, so this sleep is the
+/// only tool on this side of the boundary.** `rocket_accel.h` has four
+/// ioctls -- CREATE_BO, SUBMIT, PREP_BO, FINI_BO. `SUBMIT` is fire-and-forget:
+/// no fence fd, no syncobj, no output field at all. There is no status ioctl
+/// and no register read. `PREP_BO` ("waiting for any NPU jobs that might still
+/// use the NPU") is the whole completion vocabulary, and it waits on the job's
+/// dma-fence -- the very fence whose early signalling this dwell exists to
+/// cover. Replacing the dwell with a real drain check is therefore a *kernel*
+/// change, not a driver-side one; nothing here can poll for it.
+///
+/// **What the kernel does, and where the suspicion should point.**
+/// `rocket_job.c`'s top half wakes the IRQ thread on *any* of `DPU_0`,
+/// `DPU_1`, `PPU_0`, `PPU_1` in `INTERRUPT_RAW_STATUS`, and the thread then
+/// writes `OPERATION_ENABLE = 0`, clears all seventeen interrupt bits
+/// (`INTERRUPT_CLEAR = 0x1ffff`), and signals `done_fence` without recording
+/// which bit actually fired. A convolution's `PC_OPERATION_ENABLE` is
+/// CNA|CORE|DPU|DPU_RDMA (`0x1d`) and enables no PPU stage, so a conv should
+/// only ever retire on a DPU bit -- but both PPU bits are armed for every job
+/// regardless.
+///
+/// **The sibling chip has this exact bug, named and patched.** The
+/// independent RE in `../rockchip-npu-notes` records for the RK3576: "The
+/// fence is signalled before the writes are visible", closed by their patch
+/// `0012`; the `DPU_0`/`DPU_1` bits "retire when the writes have landed" and
+/// set tens to hundreds of microseconds after `PC_DONE`; and the symptom of
+/// retiring early is "a partial surface, and the missing bytes are a
+/// contiguous tail" -- which is what "only the first 16 channels" is.
+/// Requiring the DPU bit was their fix, and mainline `rocket` on RK3588
+/// already requires it, which is a real reason to think this dwell is
+/// vestigial rather than load-bearing.
+///
+/// **The one open thread worth pulling.** Those same notes state that two
+/// task classes raise no DPU completion at all -- pooling, and *any output
+/// element wider than one byte*. If that holds on the RK3588 as well as the
+/// RK3576, then every fp16 convolution here is retiring on something other
+/// than a writes-have-landed DPU signal, which would be the mechanism. The
+/// experiment is to log `INTERRUPT_RAW_STATUS` at retire for an fp16
+/// depthwise job and see which bit is actually set; that needs a module
+/// rebuild, which is why it is written down rather than done here.
+///
 /// **The cost now matters, on a different model.** Re-measured 2026-09-10 on
 /// the fp16 MobileNetV2 arm built with `ROCKET_DEMOTE_DEPTHWISE=1`, which
 /// alternates depthwise and dense 17 times per inference and so pays 17
