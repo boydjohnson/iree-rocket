@@ -189,6 +189,11 @@ pub struct Conv2dExecutable {
     /// dispatches that read this dispatch's result
     /// (`Conv2DDef.runtime_dense_readers`); see [`Self::dense_readers`].
     pub runtime_dense_readers: bool,
+    /// `Conv2DDef.weights_packed` / `MatmulDef.weights_packed`: the weights
+    /// binding is already the packed coefficient stream, packed at compile
+    /// time by the same `rocket_core::weights::WeightPlan` the runtime packs
+    /// with; bind it directly, run no packer. COMPILER_ROADMAP.md 6.3.
+    pub weights_packed: bool,
 }
 
 impl Conv2dExecutable {
@@ -201,6 +206,7 @@ impl Conv2dExecutable {
             epilogue_add: false,
             epilogue_activation: conv::Activation::None,
             runtime_dense_readers: false,
+            weights_packed: false,
         }
     }
 
@@ -987,6 +993,11 @@ pub struct MatmulExecutable {
     pub runtime_dimensions: Vec<RuntimeMatmulDimension>,
     /// See [`trailing_dense_readers`].
     pub runtime_dense_readers: bool,
+    /// `Conv2DDef.weights_packed` / `MatmulDef.weights_packed`: the weights
+    /// binding is already the packed coefficient stream, packed at compile
+    /// time by the same `rocket_core::weights::WeightPlan` the runtime packs
+    /// with; bind it directly, run no packer. COMPILER_ROADMAP.md 6.3.
+    pub weights_packed: bool,
 }
 
 impl MatmulExecutable {
@@ -995,6 +1006,7 @@ impl MatmulExecutable {
             shape_template: shape,
             runtime_dimensions: Vec::new(),
             runtime_dense_readers: false,
+            weights_packed: false,
         }
     }
 
@@ -1204,6 +1216,7 @@ mod tests {
             epilogue_add: false,
             epilogue_activation: conv::Activation::None,
             runtime_dense_readers: false,
+            weights_packed: false,
         }
     }
 
@@ -1269,6 +1282,7 @@ mod tests {
             epilogue_add: false,
             epilogue_activation: conv::Activation::None,
             runtime_dense_readers: false,
+            weights_packed: false,
         };
         assert!(executable.resolve_shape(&constants(&[99, 99])).is_err());
     }

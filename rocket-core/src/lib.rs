@@ -14,3 +14,4 @@ pub mod error;
 pub mod fc;
 pub mod layout;
 pub mod policy;
+pub mod weights;

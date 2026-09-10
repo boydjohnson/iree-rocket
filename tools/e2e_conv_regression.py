@@ -1121,7 +1121,7 @@ def run_raw_gate(host: str, remote_dir: str, linker: str) -> None:
 
 
 def write_compiled_fixture(work_dir: Path) -> None:
-    (work_dir / "conv.mlir").write_text(CONV_MLIR)
+    (work_dir / "conv.mlir").write_text(CONV_MLIR + packed_weight_fixtures())
     rng = np.random.default_rng(20260830)
     weights = rng.uniform(-0.5, 0.5, size=(3, 3, 512, 512)).astype(np.float16)
     np.save(work_dir / "kernel.npy", weights)
@@ -1365,6 +1365,17 @@ def write_compiled_fixture(work_dir: Path) -> None:
     np.save(work_dir / "fp16_matmul_chain_w1.npy", rng.uniform(-0.25, 0.25, size=(128, 128)).astype(np.float32))
     np.save(work_dir / "fp16_matmul_chain_w2.npy", rng.uniform(-0.25, 0.25, size=(128, 64)).astype(np.float32))
 
+    # PACKED_WEIGHT_CASES: their filters are constants in the MLIR
+    # (`packed_weight_fixtures`), so only the activations are inputs. Their
+    # own rng, so the streams above and below do not move.
+    packed_rng = np.random.default_rng(20260911)
+    np.save(work_dir / "fp16_conv_packed_weights_input.npy", packed_rng.uniform(-1.0, 1.0, size=(1, 8, 8, 24)).astype(np.float16))
+    np.save(work_dir / "fp16_conv3x3_packed_weights_input.npy", packed_rng.uniform(-1.0, 1.0, size=(1, 16, 16, 64)).astype(np.float16))
+    np.save(work_dir / "requant_int8_packed_weights_input.npy", packed_rng.integers(-128, 128, size=(1, 8, 8, 64), dtype=np.int64).astype(np.int8))
+    np.save(work_dir / "requant_int8_packed_weights_b1.npy", packed_rng.integers(-1000, 1000, size=(64,), dtype=np.int64).astype(np.int32))
+    np.save(work_dir / "depthwise_fp16_packed_weights_input.npy", packed_rng.uniform(-0.25, 0.25, size=(1, 16, 16, 576)).astype(np.float16))
+    np.save(work_dir / "depthwise_fp16_packed_weights_init.npy", np.zeros((1, 14, 14, 576), dtype=np.float32))
+
     np.save(work_dir / "requant_int8_1x1_cout1792_input.npy", i8(1, 7, 7, 448))
     np.save(work_dir / "requant_int8_1x1_cout1792_kernel.npy", i8_small(1, 1, 448, 1792))
     np.save(work_dir / "requant_int8_1x1_cout1792_bias.npy", bias_i32(1792))
@@ -1439,9 +1450,27 @@ def compile_modules(
             str(flow),
             "-o",
             str(pinned),
-            "--pass-pipeline=builtin.module(rocket-pin-unclaimed-dispatches,rocket-mark-dense-readers)",
+            "--pass-pipeline=builtin.module(rocket-pin-unclaimed-dispatches,rocket-mark-dense-readers,rocket-pack-weights)",
         ]
     )
+    # The packed-weight cases exist to run the driver's direct-bind path. If
+    # rocket-pack-weights stopped packing one it would still pass, through
+    # the runtime packer, so each must dispatch at its `_packed` clone here.
+    pinned_text = pinned.read_text()
+    for function, executable in PACKED_WEIGHT_CASES:
+        match = re.search(
+            rf"util\.func public @{re.escape(function)}\b(?P<body>.*?)"
+            r"(?=\n\s*util\.func (?:public|private) @|\Z)",
+            pinned_text,
+            re.DOTALL,
+        )
+        if match is None or not re.search(
+            r"flow\.dispatch @" + re.escape(executable) + r"_packed::", match.group("body")
+        ):
+            raise SystemExit(
+                f"{function} was not packed by rocket-pack-weights; the differential "
+                "would run the runtime packer and prove nothing about weights_packed"
+            )
     run(
         [
             str(compiler),
@@ -1485,6 +1514,7 @@ def compile_modules(
         ("fp16_residual_relu", "rocket_dynamic_residual_relu_executable"),
         ("fp16_conv_pool_conv_chain", "rocket_pooling_max_executable_s2"),
         ("fp16_matmul_chain", "rocket_matmul_executable"),
+        *PACKED_WEIGHT_CASES,
         ("requant_int8_chain", "rocket_dynamic_int8_requant_executable"),
         ("requant_int8_chain_cpu_between", "rocket_dynamic_int8_requant_executable"),
         ("requant_int8_1x1_acc_pos", "rocket_dynamic_int8_requant_executable"),
@@ -1642,6 +1672,125 @@ def compare_outputs(
         f"atol={atol}, rtol={rtol}"
     )
     return mismatches == 0
+
+
+# The cases whose filters are constants, so `rocket-pack-weights` packs them
+# at compile time and the driver binds the packed stream directly
+# (Conv2DDef.weights_packed / MatmulDef.weights_packed, COMPILER_ROADMAP.md
+# 6.3). Each names the executable its dispatch reaches before packing; the
+# pinned program must dispatch it at that executable's `_packed` clone, or
+# the differential would pass through the runtime packer and prove nothing.
+PACKED_WEIGHT_CASES = (
+    ("fp16_conv_packed_weights", "rocket_dynamic_executable"),
+    ("fp16_conv3x3_packed_weights", "rocket_dynamic_executable"),
+    ("requant_int8_packed_weights", "rocket_dynamic_int8_requant_executable"),
+    ("depthwise_fp16_packed_weights", "rocket_dynamic_depthwise_executable"),
+)
+
+
+def hex_constant(values: np.ndarray) -> str:
+    """An MLIR `dense<"0x...">` literal: the array's bytes, element order."""
+    return '"0x' + np.ascontiguousarray(values).tobytes().hex() + '"'
+
+
+def packed_weight_fixtures() -> str:
+    """The PACKED_WEIGHT_CASES functions, with their filters as constants.
+
+    Rendered rather than written into CONV_MLIR because a filter worth
+    testing is not a splat -- a uniform filter makes every output channel
+    the same and cannot see a mis-permuted coefficient -- and a few thousand
+    literal f16 values are better generated than pasted. Their own rng, so
+    the existing fixtures' input streams do not move.
+    """
+    rng = np.random.default_rng(20260910)
+    f1 = rng.uniform(-0.25, 0.25, size=(1, 1, 24, 40)).astype(np.float16)
+    f3 = rng.uniform(-0.125, 0.125, size=(3, 3, 64, 64)).astype(np.float16)
+    fq = rng.integers(-8, 8, size=(1, 1, 64, 64), dtype=np.int8)
+    fd = rng.uniform(-0.5, 0.5, size=(3, 3, 576)).astype(np.float16)
+    return f"""
+// ---- constant filters, packed at compile time by rocket-pack-weights ----
+// fp16 1x1 at Cin 24 -> Cout 40: neither channel count fills its padding
+// unit, so the packed stream is wider than the filter (32 x 40 lanes).
+func.func @fp16_conv_packed_weights(%input: tensor<1x8x8x24xf16>) -> tensor<1x8x8x40xf32> {{
+  %filter = arith.constant dense<{hex_constant(f1)}> : tensor<1x1x24x40xf16>
+  %zero = arith.constant 0.000000e+00 : f32
+  %empty = tensor.empty() : tensor<1x8x8x40xf32>
+  %init = linalg.fill ins(%zero : f32) outs(%empty : tensor<1x8x8x40xf32>) -> tensor<1x8x8x40xf32>
+  %out = linalg.conv_2d_nhwc_hwcf
+      {{dilations = dense<1> : vector<2xi64>, strides = dense<1> : vector<2xi64>}}
+      ins(%input, %filter : tensor<1x8x8x24xf16>, tensor<1x1x24x40xf16>)
+      outs(%init : tensor<1x8x8x40xf32>) -> tensor<1x8x8x40xf32>
+  return %out : tensor<1x8x8x40xf32>
+}}
+
+// fp16 3x3, valid, at whole padding units: the tap order of the blocked
+// layout, on the shape class every ResNet block has.
+func.func @fp16_conv3x3_packed_weights(%input: tensor<1x16x16x64xf16>) -> tensor<1x14x14x64xf32> {{
+  %filter = arith.constant dense<{hex_constant(f3)}> : tensor<3x3x64x64xf16>
+  %zero = arith.constant 0.000000e+00 : f32
+  %empty = tensor.empty() : tensor<1x14x14x64xf32>
+  %init = linalg.fill ins(%zero : f32) outs(%empty : tensor<1x14x14x64xf32>) -> tensor<1x14x14x64xf32>
+  %out = linalg.conv_2d_nhwc_hwcf
+      {{dilations = dense<1> : vector<2xi64>, strides = dense<1> : vector<2xi64>}}
+      ins(%input, %filter : tensor<1x16x16x64xf16>, tensor<3x3x64x64xf16>)
+      outs(%init : tensor<1x14x14x64xf32>) -> tensor<1x14x14x64xf32>
+  return %out : tensor<1x14x14x64xf32>
+}}
+
+// The requantized int8 lowering: the affine packer, with the weight zero
+// point in the padding lanes. Same epilogue as requant_int8_chain's first
+// convolution.
+func.func @requant_int8_packed_weights(%input: tensor<1x8x8x64xi8>, %b1: tensor<64xi32>) -> tensor<1x8x8x64xi8> {{
+  %f1 = arith.constant dense<{hex_constant(fq)}> : tensor<1x1x64x64xi8>
+  %a_zero = arith.constant 0 : i32
+  %a_scale = arith.constant 2.000000e-02 : f32
+  %a_zp = arith.constant 3 : i32
+  %a_min = arith.constant -1.280000e+02 : f32
+  %a_max = arith.constant 1.270000e+02 : f32
+  %a_acc_empty = tensor.empty() : tensor<1x8x8x64xi32>
+  %a_acc_init = linalg.fill ins(%a_zero : i32) outs(%a_acc_empty : tensor<1x8x8x64xi32>) -> tensor<1x8x8x64xi32>
+  %a_acc = linalg.conv_2d_nhwc_hwcf
+      {{dilations = dense<1> : tensor<2xi64>, strides = dense<1> : tensor<2xi64>}}
+      ins(%input, %f1 : tensor<1x8x8x64xi8>, tensor<1x1x64x64xi8>)
+      outs(%a_acc_init : tensor<1x8x8x64xi32>) -> tensor<1x8x8x64xi32>
+  %a_empty = tensor.empty() : tensor<1x8x8x64xi8>
+  %a = linalg.generic {{
+      indexing_maps = [affine_map<(d0, d1, d2, d3) -> (d0, d1, d2, d3)>,
+                       affine_map<(d0, d1, d2, d3) -> (d3)>,
+                       affine_map<(d0, d1, d2, d3) -> ()>,
+                       affine_map<(d0, d1, d2, d3) -> ()>,
+                       affine_map<(d0, d1, d2, d3) -> ()>,
+                       affine_map<(d0, d1, d2, d3) -> ()>,
+                       affine_map<(d0, d1, d2, d3) -> (d0, d1, d2, d3)>],
+      iterator_types = ["parallel", "parallel", "parallel", "parallel"]}}
+      ins(%a_acc, %b1, %a_scale, %a_zp, %a_min, %a_max
+          : tensor<1x8x8x64xi32>, tensor<64xi32>, f32, i32, f32, f32)
+      outs(%a_empty : tensor<1x8x8x64xi8>) {{
+    ^bb0(%raw: i32, %channel_bias: i32, %sc: f32, %zpv: i32, %low: f32, %high: f32, %unused: i8):
+      %biased = arith.addi %raw, %channel_bias : i32
+      %real = arith.sitofp %biased : i32 to f32
+      %scaled = arith.mulf %real, %sc : f32
+      %rounded = math.roundeven %scaled : f32
+      %zpf = arith.sitofp %zpv : i32 to f32
+      %offset = arith.addf %rounded, %zpf : f32
+      %low_clamped = arith.maximumf %offset, %low : f32
+      %clamped = arith.minimumf %low_clamped, %high : f32
+      %narrowed = arith.fptosi %clamped : f32 to i8
+      linalg.yield %narrowed : i8
+  }} -> tensor<1x8x8x64xi8>
+  return %a : tensor<1x8x8x64xi8>
+}}
+
+// Depthwise fp16: the tap-major packer with its padded-channel stride.
+func.func @depthwise_fp16_packed_weights(%input: tensor<1x16x16x576xf16>, %init: tensor<1x14x14x576xf32>) -> tensor<1x14x14x576xf32> {{
+  %filter = arith.constant dense<{hex_constant(fd)}> : tensor<3x3x576xf16>
+  %0 = linalg.depthwise_conv_2d_nhwc_hwc
+      {{dilations = dense<1> : tensor<2xi64>, strides = dense<1> : tensor<2xi64>}}
+      ins(%input, %filter : tensor<1x16x16x576xf16>, tensor<3x3x576xf16>)
+      outs(%init : tensor<1x14x14x576xf32>) -> tensor<1x14x14x576xf32>
+  return %0 : tensor<1x14x14x576xf32>
+}}
+"""
 
 
 class Case(NamedTuple):
@@ -1913,6 +2062,40 @@ def run_compiled_gate(
                 "fp16_matmul_chain_w2.npy",
             ),
             ("fp16_matmul_chain_out_rocket.npy",),
+            0.05,
+            0.02,
+        ),
+        Case(
+            "fp16_conv_packed_weights",
+            ("fp16_conv_packed_weights_input.npy",),
+            ("fp16_conv_packed_weights_out_rocket.npy",),
+            0.05,
+            0.02,
+        ),
+        Case(
+            "fp16_conv3x3_packed_weights",
+            ("fp16_conv3x3_packed_weights_input.npy",),
+            ("fp16_conv3x3_packed_weights_out_rocket.npy",),
+            0.05,
+            0.02,
+        ),
+        Case(
+            "requant_int8_packed_weights",
+            (
+                "requant_int8_packed_weights_input.npy",
+                "requant_int8_packed_weights_b1.npy",
+            ),
+            ("requant_int8_packed_weights_out_rocket.npy",),
+            1.0,
+            0.0,
+        ),
+        Case(
+            "depthwise_fp16_packed_weights",
+            (
+                "depthwise_fp16_packed_weights_input.npy",
+                "depthwise_fp16_packed_weights_init.npy",
+            ),
+            ("depthwise_fp16_packed_weights_out_rocket.npy",),
             0.05,
             0.02,
         ),

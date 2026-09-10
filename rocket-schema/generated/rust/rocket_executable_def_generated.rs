@@ -1259,6 +1259,7 @@ impl<'a> Conv2DDef<'a> {
   pub const VT_EPILOGUE_ADD: flatbuffers::VOffsetT = 52;
   pub const VT_EPILOGUE_ACTIVATION: flatbuffers::VOffsetT = 54;
   pub const VT_RUNTIME_DENSE_READERS: flatbuffers::VOffsetT = 56;
+  pub const VT_WEIGHTS_PACKED: flatbuffers::VOffsetT = 58;
 
   #[inline]
   pub fn init_from_table(table: flatbuffers::Table<'a>) -> Self {
@@ -1291,6 +1292,7 @@ impl<'a> Conv2DDef<'a> {
     builder.add_input_channels(args.input_channels);
     builder.add_input_height(args.input_height);
     builder.add_input_width(args.input_width);
+    builder.add_weights_packed(args.weights_packed);
     builder.add_runtime_dense_readers(args.runtime_dense_readers);
     builder.add_epilogue_activation(args.epilogue_activation);
     builder.add_epilogue_add(args.epilogue_add);
@@ -1409,6 +1411,10 @@ impl<'a> Conv2DDef<'a> {
   pub fn runtime_dense_readers(&self) -> bool {
     self._tab.get::<bool>(Conv2DDef::VT_RUNTIME_DENSE_READERS, Some(false)).unwrap()
   }
+  #[inline]
+  pub fn weights_packed(&self) -> bool {
+    self._tab.get::<bool>(Conv2DDef::VT_WEIGHTS_PACKED, Some(false)).unwrap()
+  }
 }
 
 impl flatbuffers::Verifiable for Conv2DDef<'_> {
@@ -1445,6 +1451,7 @@ impl flatbuffers::Verifiable for Conv2DDef<'_> {
      .visit_field::<bool>("epilogue_add", Self::VT_EPILOGUE_ADD, false)?
      .visit_field::<Activation>("epilogue_activation", Self::VT_EPILOGUE_ACTIVATION, false)?
      .visit_field::<bool>("runtime_dense_readers", Self::VT_RUNTIME_DENSE_READERS, false)?
+     .visit_field::<bool>("weights_packed", Self::VT_WEIGHTS_PACKED, false)?
      .finish();
     Ok(())
   }
@@ -1477,6 +1484,7 @@ pub struct Conv2DDefArgs<'a> {
     pub epilogue_add: bool,
     pub epilogue_activation: Activation,
     pub runtime_dense_readers: bool,
+    pub weights_packed: bool,
 }
 impl<'a> Default for Conv2DDefArgs<'a> {
   #[inline]
@@ -1509,6 +1517,7 @@ impl<'a> Default for Conv2DDefArgs<'a> {
       epilogue_add: false,
       epilogue_activation: Activation::NONE,
       runtime_dense_readers: false,
+      weights_packed: false,
     }
   }
 }
@@ -1627,6 +1636,10 @@ impl<'a: 'b, 'b> Conv2DDefBuilder<'a, 'b> {
     self.fbb_.push_slot::<bool>(Conv2DDef::VT_RUNTIME_DENSE_READERS, runtime_dense_readers, false);
   }
   #[inline]
+  pub fn add_weights_packed(&mut self, weights_packed: bool) {
+    self.fbb_.push_slot::<bool>(Conv2DDef::VT_WEIGHTS_PACKED, weights_packed, false);
+  }
+  #[inline]
   pub fn new(_fbb: &'b mut flatbuffers::FlatBufferBuilder<'a>) -> Conv2DDefBuilder<'a, 'b> {
     let start = _fbb.start_table();
     Conv2DDefBuilder {
@@ -1671,6 +1684,7 @@ impl core::fmt::Debug for Conv2DDef<'_> {
       ds.field("epilogue_add", &self.epilogue_add());
       ds.field("epilogue_activation", &self.epilogue_activation());
       ds.field("runtime_dense_readers", &self.runtime_dense_readers());
+      ds.field("weights_packed", &self.weights_packed());
       ds.finish()
   }
 }
@@ -2285,6 +2299,7 @@ impl<'a> MatmulDef<'a> {
   pub const VT_PRECISION: flatbuffers::VOffsetT = 28;
   pub const VT_RUNTIME_DIMENSIONS: flatbuffers::VOffsetT = 30;
   pub const VT_RUNTIME_DENSE_READERS: flatbuffers::VOffsetT = 32;
+  pub const VT_WEIGHTS_PACKED: flatbuffers::VOffsetT = 34;
 
   #[inline]
   pub fn init_from_table(table: flatbuffers::Table<'a>) -> Self {
@@ -2308,6 +2323,7 @@ impl<'a> MatmulDef<'a> {
     builder.add_n(args.n);
     builder.add_k(args.k);
     builder.add_m(args.m);
+    builder.add_weights_packed(args.weights_packed);
     builder.add_runtime_dense_readers(args.runtime_dense_readers);
     builder.add_precision(args.precision);
     builder.add_activation(args.activation);
@@ -2375,6 +2391,10 @@ impl<'a> MatmulDef<'a> {
   pub fn runtime_dense_readers(&self) -> bool {
     self._tab.get::<bool>(MatmulDef::VT_RUNTIME_DENSE_READERS, Some(false)).unwrap()
   }
+  #[inline]
+  pub fn weights_packed(&self) -> bool {
+    self._tab.get::<bool>(MatmulDef::VT_WEIGHTS_PACKED, Some(false)).unwrap()
+  }
 }
 
 impl flatbuffers::Verifiable for MatmulDef<'_> {
@@ -2399,6 +2419,7 @@ impl flatbuffers::Verifiable for MatmulDef<'_> {
      .visit_field::<Precision>("precision", Self::VT_PRECISION, false)?
      .visit_field::<flatbuffers::ForwardsUOffset<flatbuffers::Vector<'_, MatmulDimension>>>("runtime_dimensions", Self::VT_RUNTIME_DIMENSIONS, false)?
      .visit_field::<bool>("runtime_dense_readers", Self::VT_RUNTIME_DENSE_READERS, false)?
+     .visit_field::<bool>("weights_packed", Self::VT_WEIGHTS_PACKED, false)?
      .finish();
     Ok(())
   }
@@ -2419,6 +2440,7 @@ pub struct MatmulDefArgs<'a> {
     pub precision: Precision,
     pub runtime_dimensions: Option<flatbuffers::WIPOffset<flatbuffers::Vector<'a, MatmulDimension>>>,
     pub runtime_dense_readers: bool,
+    pub weights_packed: bool,
 }
 impl<'a> Default for MatmulDefArgs<'a> {
   #[inline]
@@ -2439,6 +2461,7 @@ impl<'a> Default for MatmulDefArgs<'a> {
       precision: Precision::INT8,
       runtime_dimensions: None,
       runtime_dense_readers: false,
+      weights_packed: false,
     }
   }
 }
@@ -2509,6 +2532,10 @@ impl<'a: 'b, 'b> MatmulDefBuilder<'a, 'b> {
     self.fbb_.push_slot::<bool>(MatmulDef::VT_RUNTIME_DENSE_READERS, runtime_dense_readers, false);
   }
   #[inline]
+  pub fn add_weights_packed(&mut self, weights_packed: bool) {
+    self.fbb_.push_slot::<bool>(MatmulDef::VT_WEIGHTS_PACKED, weights_packed, false);
+  }
+  #[inline]
   pub fn new(_fbb: &'b mut flatbuffers::FlatBufferBuilder<'a>) -> MatmulDefBuilder<'a, 'b> {
     let start = _fbb.start_table();
     MatmulDefBuilder {
@@ -2541,6 +2568,7 @@ impl core::fmt::Debug for MatmulDef<'_> {
       ds.field("precision", &self.precision());
       ds.field("runtime_dimensions", &self.runtime_dimensions());
       ds.field("runtime_dense_readers", &self.runtime_dense_readers());
+      ds.field("weights_packed", &self.weights_packed());
       ds.finish()
   }
 }

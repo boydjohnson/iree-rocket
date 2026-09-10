@@ -25,9 +25,10 @@ use rocket_core::{
     fc,
     layout::{self, CubeGeometry, CubeKind},
     policy::{PlanningPolicy, with_policy},
+    weights::WeightPlan,
 };
 
-pub const ROCKET_PLAN_ABI_VERSION: u32 = 4;
+pub const ROCKET_PLAN_ABI_VERSION: u32 = 5;
 
 pub const ROCKET_PLAN_OK: u32 = 0;
 pub const ROCKET_PLAN_INVALID_SHAPE: u32 = 1;
@@ -843,10 +844,281 @@ pub unsafe extern "C" fn rocket_plan_chain_identity(
     unsafe { report(outcome, message, message_capacity, "layout") }
 }
 
+/// The shared body of the two packing entry points: `plan` is built from a
+/// checked descriptor, the sizes are reported, and the bytes are packed only
+/// when the caller supplied a destination.
+///
+/// # Safety
+/// Pointer contracts as documented in `rocket_plan.h`.
+// The parameters are the C entry points' own, forwarded; bundling them
+// would only add a struct the two callers build and this unpacks.
+#[allow(clippy::too_many_arguments)]
+unsafe fn pack_boundary(
+    plan: impl FnOnce() -> Result<WeightPlan, Refusal>,
+    dense: *const u8,
+    dense_length: usize,
+    packed: *mut u8,
+    packed_capacity: usize,
+    out_packed_length: *mut usize,
+    message: *mut c_char,
+    message_capacity: usize,
+) -> u32 {
+    let outcome = catch_unwind(AssertUnwindSafe(|| -> Result<(), Refusal> {
+        let plan = plan()?;
+        let packed_length = plan.packed_bytes()?;
+        if !out_packed_length.is_null() {
+            // SAFETY: non-null; the caller promises a writable size_t.
+            unsafe { *out_packed_length = packed_length };
+        }
+        if packed.is_null() {
+            // A size query: nothing is read or written.
+            return Ok(());
+        }
+        if dense.is_null() {
+            return Err(invalid("dense filter pointer is null"));
+        }
+        if dense_length != plan.dense_bytes()? {
+            return Err(invalid(format!(
+                "dense filter is {dense_length} bytes, the shape needs {}",
+                plan.dense_bytes()?
+            )));
+        }
+        if packed_capacity < packed_length {
+            return Err(invalid(format!(
+                "packed buffer holds {packed_capacity} bytes, the layout needs {packed_length}"
+            )));
+        }
+        // SAFETY: non-null and sized as the caller promised.
+        let dense = unsafe { std::slice::from_raw_parts(dense, dense_length) };
+        // SAFETY: non-null and sized as the caller promised; the caller's
+        // buffer and the dense one may not overlap.
+        let packed = unsafe { std::slice::from_raw_parts_mut(packed, packed_capacity) };
+        plan.pack(dense, packed)?;
+        Ok(())
+    }));
+    // SAFETY: caller's buffer contract.
+    unsafe { report(outcome, message, message_capacity, "weight packer") }
+}
+
+/// The convolution `plan_conv_checked` builds, without planning it: the
+/// packer needs the shape, not the tiles.
+fn conv_shape_checked(
+    desc: &rocket_plan_conv_desc_t,
+) -> Result<(conv::Shape, conv::Kernels), Refusal> {
+    let precision = precision(desc.precision, &desc.quantization)?;
+    let mut shape = conv::Shape::try_with_precision(
+        narrow(desc.width, "width")?,
+        narrow(desc.height, "height")?,
+        narrow(desc.stride, "stride")?,
+        narrow(desc.in_channels, "input channels")?,
+        narrow(desc.out_channels, "output channels")?,
+        precision,
+    )?;
+    if desc.depthwise != 0 {
+        shape = shape.try_with_depthwise()?;
+    }
+    let kernels = [
+        narrow(desc.kernel_height, "kernel height")? as usize,
+        narrow(desc.kernel_width, "kernel width")? as usize,
+    ];
+    Ok((shape, kernels))
+}
+
+/// # Safety
+/// See `rocket_plan.h`.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn rocket_pack_conv_weights(
+    desc: *const rocket_plan_conv_desc_t,
+    dense: *const u8,
+    dense_length: usize,
+    packed: *mut u8,
+    packed_capacity: usize,
+    out_packed_length: *mut usize,
+    message: *mut c_char,
+    message_capacity: usize,
+) -> u32 {
+    // SAFETY: forwarded contract.
+    unsafe {
+        pack_boundary(
+            || {
+                let desc = checked_desc(desc, |d| d.struct_size)?;
+                let (shape, kernels) = conv_shape_checked(desc)?;
+                Ok(WeightPlan::for_conv(shape, kernels))
+            },
+            dense,
+            dense_length,
+            packed,
+            packed_capacity,
+            out_packed_length,
+            message,
+            message_capacity,
+        )
+    }
+}
+
+/// # Safety
+/// See `rocket_plan.h`.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn rocket_pack_matmul_weights(
+    desc: *const rocket_plan_matmul_desc_t,
+    dense: *const u8,
+    dense_length: usize,
+    packed: *mut u8,
+    packed_capacity: usize,
+    out_packed_length: *mut usize,
+    message: *mut c_char,
+    message_capacity: usize,
+) -> u32 {
+    // SAFETY: forwarded contract.
+    unsafe {
+        pack_boundary(
+            || {
+                let desc = checked_desc(desc, |d| d.struct_size)?;
+                let precision = precision(desc.precision, &desc.quantization)?;
+                let shape = fc::Shape::try_new(
+                    narrow(desc.m, "m")?,
+                    narrow(desc.k, "k")?,
+                    narrow(desc.n, "n")?,
+                    precision,
+                )?;
+                Ok(WeightPlan::for_matmul(shape)?)
+            },
+            dense,
+            dense_length,
+            packed,
+            packed_capacity,
+            out_packed_length,
+            message,
+            message_capacity,
+        )
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+    use rocket_core::weights::pack_hwcf_to_rocket_weights;
     use std::{ffi::CStr, mem::size_of};
+
+    #[test]
+    fn the_packer_entry_is_the_drivers_packer() {
+        // fp16 3x3, Cin 24 -> Cout 40: neither channel count fills its
+        // padding unit, so every padding rule is exercised.
+        let desc = conv_desc(8, 8, 24, 40, 3);
+        let mut size = 0usize;
+        let mut message = [0 as c_char; 256];
+        let status = unsafe {
+            rocket_pack_conv_weights(
+                &desc,
+                std::ptr::null(),
+                0,
+                std::ptr::null_mut(),
+                0,
+                &mut size,
+                message.as_mut_ptr(),
+                message.len(),
+            )
+        };
+        assert_eq!(status, ROCKET_PLAN_OK);
+        assert_eq!(
+            size,
+            rocket_core::weights::rocket_weight_storage_size(3, 3, 24, 40, 2).unwrap()
+        );
+        let dense: Vec<u8> = (0..3 * 3 * 24 * 40 * 2)
+            .map(|i| (i % 253 + 1) as u8)
+            .collect();
+        let mut packed = vec![0xEEu8; size + 7];
+        let mut written = 0usize;
+        let status = unsafe {
+            rocket_pack_conv_weights(
+                &desc,
+                dense.as_ptr(),
+                dense.len(),
+                packed.as_mut_ptr(),
+                packed.len(),
+                &mut written,
+                message.as_mut_ptr(),
+                message.len(),
+            )
+        };
+        assert_eq!(status, ROCKET_PLAN_OK);
+        assert_eq!(written, size);
+        let mut expected = vec![0u8; size];
+        pack_hwcf_to_rocket_weights(&dense, 3, 3, 24, 40, 2, &mut expected).unwrap();
+        assert_eq!(&packed[..size], &expected[..]);
+        // The surplus capacity is untouched.
+        assert!(packed[size..].iter().all(|&b| b == 0xEE));
+
+        // A wrong dense length is a refusal, and the packed buffer is not
+        // written.
+        let mut packed = vec![0xEEu8; size];
+        let status = unsafe {
+            rocket_pack_conv_weights(
+                &desc,
+                dense.as_ptr(),
+                dense.len() - 2,
+                packed.as_mut_ptr(),
+                packed.len(),
+                &mut written,
+                message.as_mut_ptr(),
+                message.len(),
+            )
+        };
+        assert_eq!(status, ROCKET_PLAN_INVALID_ARGUMENT);
+        assert!(packed.iter().all(|&b| b == 0xEE));
+        let text = unsafe { CStr::from_ptr(message.as_ptr()) }.to_string_lossy();
+        assert!(text.contains("dense filter is"), "{text}");
+    }
+
+    #[test]
+    fn the_matmul_packer_is_the_one_by_one_lowering() {
+        let desc = rocket_plan_matmul_desc_t {
+            struct_size: size_of::<rocket_plan_matmul_desc_t>() as u32,
+            precision: 0,
+            m: 16,
+            k: 64,
+            n: 96,
+            activation: 0,
+            activation_ceiling: 0.0,
+            quantization: rocket_plan_quantization_t::default(),
+        };
+        let mut size = 0usize;
+        let status = unsafe {
+            rocket_pack_matmul_weights(
+                &desc,
+                std::ptr::null(),
+                0,
+                std::ptr::null_mut(),
+                0,
+                &mut size,
+                std::ptr::null_mut(),
+                0,
+            )
+        };
+        assert_eq!(status, ROCKET_PLAN_OK);
+        assert_eq!(
+            size,
+            rocket_core::weights::rocket_weight_storage_size(1, 1, 64, 96, 2).unwrap()
+        );
+        let dense: Vec<u8> = (0..64 * 96 * 2).map(|i| (i % 251 + 1) as u8).collect();
+        let mut packed = vec![0u8; size];
+        let status = unsafe {
+            rocket_pack_matmul_weights(
+                &desc,
+                dense.as_ptr(),
+                dense.len(),
+                packed.as_mut_ptr(),
+                packed.len(),
+                std::ptr::null_mut(),
+                std::ptr::null_mut(),
+                0,
+            )
+        };
+        assert_eq!(status, ROCKET_PLAN_OK);
+        let mut expected = vec![0u8; size];
+        pack_hwcf_to_rocket_weights(&dense, 1, 1, 64, 96, 2, &mut expected).unwrap();
+        assert_eq!(packed, expected);
+    }
 
     fn cube_desc(kind: u32, element_bytes: u32, w: u64, h: u64, c: u64) -> rocket_plan_cube_desc_t {
         rocket_plan_cube_desc_t {

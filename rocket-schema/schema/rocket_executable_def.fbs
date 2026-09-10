@@ -254,6 +254,16 @@ table Conv2DDef {
   // built without the count behaves as before. Appended last, for the
   // vtable reason above.
   runtime_dense_readers:bool = false;
+
+  // The weights binding already holds the CNA's blocked coefficient stream
+  // -- packed at compile time by `rocket-pack-weights` through
+  // `rocket_core::weights::WeightPlan`, the same function the runtime packs
+  // with -- so the runtime binds it directly and runs no packer. The binding
+  // must be at least `WeightPlan::packed_bytes` long; the runtime refuses
+  // the dispatch otherwise. False (or absent, in an older executable) keeps
+  // the logical HWCF filter and the runtime packer. Appended last, for the
+  // vtable reason above. COMPILER_ROADMAP.md 6.3.
+  weights_packed:bool = false;
 }
 
 // DEPRECATED: superseded by MatmulDef. Retained because union tags are
@@ -381,6 +391,10 @@ table MatmulDef {
   // See Conv2DDef.runtime_dense_readers: one trailing uint32 push constant
   // carrying the compiler's count of Rocket dispatches that read the result.
   runtime_dense_readers:bool = false;
+
+  // See Conv2DDef.weights_packed: the [K, N] operand is already the blocked
+  // coefficient stream of the 1x1 lowering, packed symmetrically.
+  weights_packed:bool = false;
 }
 
 // Describes one standalone unary element-wise operation on the EW ALU.

@@ -355,6 +355,13 @@ const PIN_PASS: &str = "rocket-pin-unclaimed-dispatches";
 /// dispatch's push constants to still be plain SSA operands.
 const MARK_DENSE_READERS_PASS: &str = "rocket-mark-dense-readers";
 
+/// Registered by the compiler plugin; see RocketPackWeightsPass.cpp. Runs
+/// after the reader count, at the same phase: a filter is a
+/// `util.global.load` of a folded constant by now, and the dispatch's
+/// dimensions are still constant push-constant operands it can read.
+/// COMPILER_ROADMAP.md 6.3.
+const PACK_WEIGHTS_PASS: &str = "rocket-pack-weights";
+
 /// Runs `Pipeline::Std` up to and including the `flow` phase and pins every
 /// dispatch the Rocket transform spec did not explicitly claim to the
 /// default (CPU) device, then leaves the invocation set to resume from
@@ -373,6 +380,7 @@ fn pin_unclaimed_dispatches(invocation: &Invocation) -> Result<(), Box<dyn Error
     invocation.run_pipeline(Pipeline::Std)?;
     invocation.run_pass_pipeline(PIN_PASS)?;
     invocation.run_pass_pipeline(MARK_DENSE_READERS_PASS)?;
+    invocation.run_pass_pipeline(PACK_WEIGHTS_PASS)?;
     invocation.set_compile_from_phase(PIN_PHASE);
     Ok(())
 }
