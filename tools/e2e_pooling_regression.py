@@ -130,6 +130,21 @@ func.func @avg_pool_global(%input: tensor<1x1792x7x7xf32>, %init: tensor<1x1792x
   return %0 : tensor<1x1792x1x1xf32>
 }
 
+// The f16 twin of the case above, at MobileNetV2's own global-pool shape.
+// An already-f16 import declines the f32 matcher on typing alone and lands
+// this on the CPU as a reduction dispatch; @call_rocket_pooling_avg_nchw_f16
+// is what claims it. The tolerance is the same as the f32 global pool -- the
+// error is dominated by the same reciprocal round trip, not by the element
+// type, and the shim keeps its multiply-by-kh*kw in f32 for that reason.
+func.func @avg_pool_global_f16(%input: tensor<1x1280x7x7xf16>, %init: tensor<1x1280x1x1xf16>) -> tensor<1x1280x1x1xf16> {
+  %window = tensor.empty() : tensor<7x7xf16>
+  %0 = linalg.pooling_nchw_sum
+      {dilations = dense<1> : tensor<2xi64>, strides = dense<1> : tensor<2xi64>}
+      ins(%input, %window : tensor<1x1280x7x7xf16>, tensor<7x7xf16>)
+      outs(%init : tensor<1x1280x1x1xf16>) -> tensor<1x1280x1x1xf16>
+  return %0 : tensor<1x1280x1x1xf16>
+}
+
 // A small average pool with a 2x2 window -- the matcher's kernel floor, which
 // exists because an fp16 average's reciprocal is fp16(65536/k) and k=1 needs
 // 65536, past fp16's 65504 ceiling. Two taps instead of 49 also means far
@@ -473,6 +488,14 @@ def write_compiled_fixture(work_dir: Path) -> None:
     )
     np.save(work_dir / "avg_global_init.npy", np.zeros((1, 1792, 1, 1), dtype=np.float32))
 
+    # MobileNetV2's own global-pool shape, authored in f16 so the f16 matcher
+    # is what claims it.
+    np.save(
+        work_dir / "avg_global_f16_input.npy",
+        rng.uniform(-0.25, 0.25, size=(1, 1280, 7, 7)).astype(np.float16),
+    )
+    np.save(work_dir / "avg_global_f16_init.npy", np.zeros((1, 1280, 1, 1), dtype=np.float16))
+
     np.save(
         work_dir / "avg_2x2_input.npy",
         rng.uniform(-0.25, 0.25, size=(1, 64, 16, 16)).astype(np.float32),
@@ -569,6 +592,7 @@ ROCKET_DEVICE_FLAGS = [
 # entirely on the CPU on both sides of the differential and agree with itself.
 EXPECTED_EXECUTABLE = {
     "avg_pool_global": "rocket_pooling_executable",
+    "avg_pool_global_f16": "rocket_pooling_executable",
     "avg_pool_2x2": "rocket_pooling_executable",
     "avg_pool_nhwc": "rocket_pooling_executable",
     "max_pool_nhwc_s2": "rocket_pooling_max_executable_s2",
@@ -861,6 +885,13 @@ def build_cases(atol: float, rtol: float) -> list[Case]:
             "avg_pool_global",
             ("avg_global_input.npy", "avg_global_init.npy"),
             ("avg_pool_global_out.npy",),
+            atol,
+            rtol,
+        ),
+        Case(
+            "avg_pool_global_f16",
+            ("avg_global_f16_input.npy", "avg_global_f16_init.npy"),
+            ("avg_pool_global_f16_out.npy",),
             atol,
             rtol,
         ),

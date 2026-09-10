@@ -1554,6 +1554,113 @@ module attributes {transform.with_named_sequence} {
     util.return %final_nchw : tensor<1x?x?x?xf32>
   }
 
+  // The f16 twin of the shim above, for a model imported already in f16.
+  //
+  // The executable is unchanged -- `#rocket_pooling_avg_target` is already
+  // `precision = "fp16"`, so the hardware side of this was never the gap.
+  // What the f32 shim does that this one must not is truncate on the way in
+  // and widen on the way out: an f16 model's pool arrives f16 and its
+  // consumer wants f16 back, so both conversions would be round trips that
+  // only lose bits. Everything else -- the NCHW <-> NHWC transposes, the
+  // multiply by kh*kw that turns the hardware's average back into the sum a
+  // `linalg.pooling_nchw_sum` promises, and folding in the accumulator
+  // initialiser -- is identical.
+  //
+  // **The correction arithmetic stays in f32 even though the tensors are
+  // f16.** The hardware returns an average and the model divides by the same
+  // kh*kw immediately after, so scaling up and back down in f16 would round
+  // twice for nothing; on MobileNetV2's 7x7 pool that is a multiply by 49
+  // into a range where f16's ulp is 0.25. Widening the two operands, doing
+  // the multiply-add in f32, and truncating once at the end costs nothing
+  // (the generic runs in f32 registers regardless) and rounds once.
+  util.func private @call_rocket_pooling_avg_nchw_f16(
+      %input: tensor<1x?x?x?xf16>,
+      %window: tensor<?x?xf16>,
+      %init: tensor<1x?x?x?xf16>) -> tensor<1x?x?x?xf16> {
+    %c0 = arith.constant 0 : index
+    %c1 = arith.constant 1 : index
+    %c2 = arith.constant 2 : index
+    %c3 = arith.constant 3 : index
+
+    // NCHW: dim 1 is channels, dims 2/3 are the spatial extent.
+    %channels = tensor.dim %input, %c1 : tensor<1x?x?x?xf16>
+    %input_height = tensor.dim %input, %c2 : tensor<1x?x?x?xf16>
+    %input_width = tensor.dim %input, %c3 : tensor<1x?x?x?xf16>
+    // The window operand carries no values, only [kh, kw].
+    %kernel_height = tensor.dim %window, %c0 : tensor<?x?xf16>
+    %kernel_width = tensor.dim %window, %c1 : tensor<?x?xf16>
+    %output_height = tensor.dim %init, %c2 : tensor<1x?x?x?xf16>
+    %output_width = tensor.dim %init, %c3 : tensor<1x?x?x?xf16>
+
+    %input_width_i32 = arith.index_cast %input_width : index to i32
+    %input_height_i32 = arith.index_cast %input_height : index to i32
+    %channels_i32 = arith.index_cast %channels : index to i32
+    %kernel_width_i32 = arith.index_cast %kernel_width : index to i32
+    %kernel_height_i32 = arith.index_cast %kernel_height : index to i32
+
+    // NCHW [1,C,H,W] -> NHWC [1,H,W,C]: out.shape[i] = in.shape[perm[i]].
+    %input_nhwc_empty = tensor.empty(%input_height, %input_width, %channels) : tensor<1x?x?x?xf16>
+    %input_nhwc = linalg.transpose
+        ins(%input : tensor<1x?x?x?xf16>)
+        outs(%input_nhwc_empty : tensor<1x?x?x?xf16>)
+        permutation = [0, 2, 3, 1]
+
+    %dense_readers_i32 = arith.constant 0 : i32
+    %averaged = flow.dispatch
+        @rocket_pooling_executable::@rocket_pooling_avg_v1::@rocket_pooling_avg(
+          %input_width_i32, %input_height_i32, %channels_i32,
+          %kernel_width_i32, %kernel_height_i32, %dense_readers_i32,
+          %input_nhwc)
+        {stream.affinity = #hal.device.affinity<@rocket_device>}
+        : (i32, i32, i32, i32, i32, i32,
+           tensor<1x?x?x?xf16>{%input_height, %input_width, %channels})
+        -> tensor<1x?x?x?xf16>{%output_height, %output_width, %channels}
+
+    // %init arrives NCHW too; line it up with the NHWC result.
+    %init_nhwc_empty = tensor.empty(%output_height, %output_width, %channels) : tensor<1x?x?x?xf16>
+    %init_nhwc = linalg.transpose
+        ins(%init : tensor<1x?x?x?xf16>)
+        outs(%init_nhwc_empty : tensor<1x?x?x?xf16>)
+        permutation = [0, 2, 3, 1]
+
+    // Undo the hardware's divide and add the accumulator initialiser. A
+    // plain generic, not a pre-formed CPU dispatch, for the reason the f32
+    // shim gives: rocket-pin-unclaimed-dispatches keeps it off the NPU.
+    %taps = arith.muli %kernel_height, %kernel_width : index
+    %taps_i32 = arith.index_cast %taps : index to i32
+    %taps_f32 = arith.sitofp %taps_i32 : i32 to f32
+    %final_nhwc_empty = tensor.empty(
+        %output_height, %output_width, %channels)
+        : tensor<1x?x?x?xf16>
+    %final_nhwc = linalg.generic {
+        indexing_maps = [
+          affine_map<(d0, d1, d2, d3) -> (d0, d1, d2, d3)>,
+          affine_map<(d0, d1, d2, d3) -> (d0, d1, d2, d3)>,
+          affine_map<(d0, d1, d2, d3) -> (d0, d1, d2, d3)>
+        ],
+        iterator_types = ["parallel", "parallel", "parallel", "parallel"]
+      } ins(%averaged, %init_nhwc
+          : tensor<1x?x?x?xf16>, tensor<1x?x?x?xf16>)
+        outs(%final_nhwc_empty : tensor<1x?x?x?xf16>) {
+      ^bb0(%average: f16, %initial: f16, %out: f16):
+        %average_f32 = arith.extf %average : f16 to f32
+        %sum = arith.mulf %average_f32, %taps_f32 : f32
+        %initial_f32 = arith.extf %initial : f16 to f32
+        %accumulated = arith.addf %sum, %initial_f32 : f32
+        %narrowed = arith.truncf %accumulated : f32 to f16
+        linalg.yield %narrowed : f16
+    } -> tensor<1x?x?x?xf16>
+
+    // NHWC [1,H,W,C] -> NCHW [1,C,H,W].
+    %final_nchw_empty = tensor.empty(%channels, %output_height, %output_width) : tensor<1x?x?x?xf16>
+    %final_nchw = linalg.transpose
+        ins(%final_nhwc : tensor<1x?x?x?xf16>)
+        outs(%final_nchw_empty : tensor<1x?x?x?xf16>)
+        permutation = [0, 3, 1, 2]
+
+    util.return %final_nchw : tensor<1x?x?x?xf16>
+  }
+
 
   // Two-tensor element-wise `add`, rank 3. The shape a compiled model
   // actually presents: ONNX `Add`/`Mul`/`Sub` reach the spec as a
@@ -5379,6 +5486,36 @@ module attributes {transform.with_named_sequence} {
     transform.yield %root : !transform.any_op
   }
 
+  // The f16 twin of the matcher above. Same op, same dimension buckets, same
+  // bounds; only the element types differ, and they are the whole gap -- an
+  // already-f16 import's pool declines on typing alone and lands on the CPU
+  // as a `reduction_<C>x<HW>_f16` dispatch. `@call_rocket_pooling_avg_nchw_f16`
+  // is what claims it; the executable is shared, since it was always fp16.
+  transform.named_sequence @match_pooling_nchw_sum_avg_f16(%root: !transform.any_op {transform.readonly}) -> !transform.any_op {
+    transform.match.operation_name %root ["linalg.pooling_nchw_sum"] : !transform.any_op
+    %batch, %out_img, %out_ch, %filter, %in_ch, %depth, %strides, %dilations =
+        transform.iree.match.convolution %root,
+          lhs_type = f16, rhs_type = f16, output_type = f16
+          : !transform.any_op -> !transform.param<i64>
+    transform.iree.match.dims_equal %batch, [1, -1] : !transform.param<i64>
+    transform.iree.match.dims_equal %out_img, [-1, -1] : !transform.param<i64>
+    transform.iree.match.dims_equal %out_ch, [] : !transform.param<i64>
+    transform.iree.match.dims_equal %in_ch, [] : !transform.param<i64>
+    transform.iree.match.dims_equal %depth, [] : !transform.param<i64>
+    transform.iree.match.dims_equal %filter, [-1, -1] : !transform.param<i64>
+    transform.iree.match.dims_equal %strides, [1, 1] : !transform.param<i64>
+    transform.iree.match.dims_equal %dilations, [1, 1] : !transform.param<i64>
+
+    %input_value = transform.get_operand %root[0] : (!transform.any_op) -> !transform.any_value
+    %window_value = transform.get_operand %root[1] : (!transform.any_op) -> !transform.any_value
+    transform.iree.match.dim_bounds %input_value[1], umin = 1, umax = 8192 : !transform.any_value
+    transform.iree.match.dim_bounds %input_value[2], umin = 1, umax = 8192 : !transform.any_value
+    transform.iree.match.dim_bounds %input_value[3], umin = 1, umax = 8192 : !transform.any_value
+    transform.iree.match.dim_bounds %window_value[0], umin = 2, umax = 8 : !transform.any_value
+    transform.iree.match.dim_bounds %window_value[1], umin = 2, umax = 8 : !transform.any_value
+    transform.yield %root : !transform.any_op
+  }
+
 
 
   // The NHWC average matcher. Same bounds and same dimension buckets as
@@ -6147,6 +6284,23 @@ module attributes {transform.with_named_sequence} {
     transform.annotate %module "stream.topology" = %topology_attr : !transform.any_op, !transform.any_param
     %executable = transform.util.import_symbol @rocket_pooling_executable into %module if undefined : (!transform.any_op) -> !transform.any_op
     %func = transform.util.import_symbol @call_rocket_pooling_avg_nchw into %module if undefined : (!transform.any_op) -> !transform.any_op
+    transform.util.cast_and_call %func(%ins) -> %out after %root {
+          transform.type_conversion.tensor.cast_shape_dynamic_dims
+      } : (!transform.any_op, !transform.any_value, !transform.any_value, !transform.any_op) -> !transform.any_op
+    transform.yield
+  }
+
+  transform.named_sequence @cast_and_call_pooling_avg_nchw_f16(%root: !transform.any_op {transform.readonly}) {
+    %ins = transform.get_operand %root[all] : (!transform.any_op) -> !transform.any_value
+    %out = transform.get_result %root[all] : (!transform.any_op) -> !transform.any_value
+    %module = transform.util.get_nearest_symbol_table %root : (!transform.any_op) -> !transform.any_op
+    %topology_attr = transform.param.constant #hal.device.topology<links = [
+        (@rocket_device -> @cpu_device = {transparent_access = true, unified_memory = true}),
+        (@cpu_device -> @rocket_device = {transparent_access = true, unified_memory = true})
+      ]> -> !transform.any_param
+    transform.annotate %module "stream.topology" = %topology_attr : !transform.any_op, !transform.any_param
+    %executable = transform.util.import_symbol @rocket_pooling_executable into %module if undefined : (!transform.any_op) -> !transform.any_op
+    %func = transform.util.import_symbol @call_rocket_pooling_avg_nchw_f16 into %module if undefined : (!transform.any_op) -> !transform.any_op
     transform.util.cast_and_call %func(%ins) -> %out after %root {
           transform.type_conversion.tensor.cast_shape_dynamic_dims
       } : (!transform.any_op, !transform.any_value, !transform.any_value, !transform.any_op) -> !transform.any_op
@@ -8229,6 +8383,239 @@ module attributes {transform.with_named_sequence} {
     transform.yield %ins, %outs : !transform.any_value, !transform.any_value
   }
 
+  //===--------------------------------------------------------------------===//
+  // Undemoted twins of the four ReLU6 matchers above.
+  //
+  // `rocket.f16_demoted` is added by `RocketDemoteConvInputsPass` only to the
+  // convolutions it actually *narrowed*, so a model imported at f32 carries it
+  // and one imported already f16 does not. Since `cast_compatible_dag_from_root`
+  // compares whole attribute dictionaries, a single spelling silently covers
+  // only half the models -- the same reason the padded matchers above already
+  // come in pairs.
+  //
+  // These four are what let an already-f16 import fuse ReLU6 at all, and they
+  // are only reachable because `rocket-fuse-conv-relu6` walks through the
+  // narrowing generic such an import puts between the convolution and its
+  // clamp. Fixing either half alone changes nothing: without the pass the
+  // canonical form is never produced for these to match, and without these
+  // the pass produces a form no matcher claims. Both halves landed together.
+  //===--------------------------------------------------------------------===//
+
+  transform.named_sequence @match_dynamic_conv2d_relu6_undemoted(
+      %root: !transform.any_op {transform.readonly})
+      -> (!transform.any_value, !transform.any_value) {
+    transform.match.operation_name %root ["linalg.generic"] : !transform.any_op
+    %conv = transform.get_producer_of_operand %root[0]
+        : (!transform.any_op) -> !transform.any_op
+    transform.match.operation_name %conv ["linalg.conv_2d_nhwc_hwcf"] : !transform.any_op
+    transform.rocket.match.admitted %conv : !transform.any_op
+    %batch, %out_img, %out_ch, %filter, %in_ch, %depth, %strides, %dilations =
+        transform.iree.match.convolution %conv,
+          lhs_type = f16, rhs_type = f16, output_type = f32
+          : !transform.any_op -> !transform.param<i64>
+    transform.iree.match.dims_equal %batch, [1] : !transform.param<i64>
+    transform.iree.match.dims_equal %out_img, [-1, -1] : !transform.param<i64>
+    transform.iree.match.dims_equal %out_ch, [-1] : !transform.param<i64>
+    transform.iree.match.dims_equal %filter, [1, 1] : !transform.param<i64>
+    transform.iree.match.dims_equal %in_ch, [-1] : !transform.param<i64>
+    transform.iree.match.dims_equal %depth, [] : !transform.param<i64>
+    transform.iree.match.dims_equal %strides, [1, 1] : !transform.param<i64>
+    transform.iree.match.dims_equal %dilations, [1, 1] : !transform.param<i64>
+
+
+    %ins, %outs = transform.iree.match.cast_compatible_dag_from_root %root {
+      ^bb0(%input: tensor<1x?x?x?xf16>, %weights: tensor<?x?x?x?xf16>,
+           %acc_init: tensor<1x?x?x?xf32>, %bias: tensor<?xf32>,
+           %low: f32, %high: f32,
+           %out_init: tensor<1x?x?x?xf32>):
+        // The marker is deliberately absent from this template: it is added
+        // only to convolutions RocketDemoteConvInputsPass narrowed, and an
+        // already-f16 import narrowed nothing. See the header above.
+        %accumulator = linalg.conv_2d_nhwc_hwcf
+            {dilations = dense<1> : vector<2xi64>,
+             strides = dense<1> : vector<2xi64>}
+            ins(%input, %weights : tensor<1x?x?x?xf16>, tensor<?x?x?x?xf16>)
+            outs(%acc_init : tensor<1x?x?x?xf32>) -> tensor<1x?x?x?xf32>
+        %activated = linalg.generic {
+            indexing_maps = [affine_map<(d0, d1, d2, d3) -> (d0, d1, d2, d3)>,
+                             affine_map<(d0, d1, d2, d3) -> (d3)>,
+                             affine_map<(d0, d1, d2, d3) -> ()>,
+                             affine_map<(d0, d1, d2, d3) -> ()>,
+                             affine_map<(d0, d1, d2, d3) -> (d0, d1, d2, d3)>],
+            iterator_types = ["parallel", "parallel", "parallel", "parallel"]}
+            ins(%accumulator, %bias, %low, %high
+                : tensor<1x?x?x?xf32>, tensor<?xf32>, f32, f32)
+            outs(%out_init : tensor<1x?x?x?xf32>) {
+          ^bb1(%raw: f32, %channel_bias: f32, %lo: f32, %hi: f32, %unused: f32):
+            %biased = arith.addf %raw, %channel_bias : f32
+            %low_clamped = arith.maximumf %biased, %lo : f32
+            %clamped = arith.minimumf %low_clamped, %hi : f32
+            linalg.yield %clamped : f32
+        } -> tensor<1x?x?x?xf32>
+    } : (!transform.any_op) -> (!transform.any_value, !transform.any_value)
+    transform.yield %ins, %outs : !transform.any_value, !transform.any_value
+  }
+
+  transform.named_sequence @match_dynamic_conv2d_3x3_relu6_undemoted(
+      %root: !transform.any_op {transform.readonly})
+      -> (!transform.any_value, !transform.any_value) {
+    transform.match.operation_name %root ["linalg.generic"] : !transform.any_op
+    %conv = transform.get_producer_of_operand %root[0]
+        : (!transform.any_op) -> !transform.any_op
+    transform.match.operation_name %conv ["linalg.conv_2d_nhwc_hwcf"] : !transform.any_op
+    transform.rocket.match.admitted %conv : !transform.any_op
+    %batch, %out_img, %out_ch, %filter, %in_ch, %depth, %strides, %dilations =
+        transform.iree.match.convolution %conv,
+          lhs_type = f16, rhs_type = f16, output_type = f32
+          : !transform.any_op -> !transform.param<i64>
+    transform.iree.match.dims_equal %batch, [1] : !transform.param<i64>
+    transform.iree.match.dims_equal %out_img, [-1, -1] : !transform.param<i64>
+    transform.iree.match.dims_equal %out_ch, [-1] : !transform.param<i64>
+    transform.iree.match.dims_equal %filter, [3, 3] : !transform.param<i64>
+    transform.iree.match.dims_equal %in_ch, [-1] : !transform.param<i64>
+    transform.iree.match.dims_equal %depth, [] : !transform.param<i64>
+    transform.iree.match.dims_equal %strides, [1, 1] : !transform.param<i64>
+    transform.iree.match.dims_equal %dilations, [1, 1] : !transform.param<i64>
+
+
+    %ins, %outs = transform.iree.match.cast_compatible_dag_from_root %root {
+      ^bb0(%input: tensor<1x?x?x?xf16>, %weights: tensor<?x?x?x?xf16>,
+           %acc_init: tensor<1x?x?x?xf32>, %bias: tensor<?xf32>,
+           %low: f32, %high: f32,
+           %out_init: tensor<1x?x?x?xf32>):
+        // The marker is deliberately absent from this template: it is added
+        // only to convolutions RocketDemoteConvInputsPass narrowed, and an
+        // already-f16 import narrowed nothing. See the header above.
+        %accumulator = linalg.conv_2d_nhwc_hwcf
+            {dilations = dense<1> : vector<2xi64>,
+             strides = dense<1> : vector<2xi64>}
+            ins(%input, %weights : tensor<1x?x?x?xf16>, tensor<?x?x?x?xf16>)
+            outs(%acc_init : tensor<1x?x?x?xf32>) -> tensor<1x?x?x?xf32>
+        %activated = linalg.generic {
+            indexing_maps = [affine_map<(d0, d1, d2, d3) -> (d0, d1, d2, d3)>,
+                             affine_map<(d0, d1, d2, d3) -> (d3)>,
+                             affine_map<(d0, d1, d2, d3) -> ()>,
+                             affine_map<(d0, d1, d2, d3) -> ()>,
+                             affine_map<(d0, d1, d2, d3) -> (d0, d1, d2, d3)>],
+            iterator_types = ["parallel", "parallel", "parallel", "parallel"]}
+            ins(%accumulator, %bias, %low, %high
+                : tensor<1x?x?x?xf32>, tensor<?xf32>, f32, f32)
+            outs(%out_init : tensor<1x?x?x?xf32>) {
+          ^bb1(%raw: f32, %channel_bias: f32, %lo: f32, %hi: f32, %unused: f32):
+            %biased = arith.addf %raw, %channel_bias : f32
+            %low_clamped = arith.maximumf %biased, %lo : f32
+            %clamped = arith.minimumf %low_clamped, %hi : f32
+            linalg.yield %clamped : f32
+        } -> tensor<1x?x?x?xf32>
+    } : (!transform.any_op) -> (!transform.any_value, !transform.any_value)
+    transform.yield %ins, %outs : !transform.any_value, !transform.any_value
+  }
+
+  transform.named_sequence @match_dynamic_depthwise_conv2d_nchw_relu6_undemoted(
+      %root: !transform.any_op {transform.readonly})
+      -> (!transform.any_value, !transform.any_value) {
+    transform.match.operation_name %root ["linalg.generic"] : !transform.any_op
+    %conv = transform.get_producer_of_operand %root[0]
+        : (!transform.any_op) -> !transform.any_op
+    transform.match.operation_name %conv ["linalg.depthwise_conv_2d_nchw_chw"] : !transform.any_op
+    transform.rocket.match.admitted %conv : !transform.any_op
+    %batch, %out_img, %out_ch, %filter, %in_ch, %depth, %strides, %dilations =
+        transform.iree.match.convolution %conv,
+          lhs_type = f16, rhs_type = f16, output_type = f32
+          : !transform.any_op -> !transform.param<i64>
+    transform.iree.match.dims_equal %batch, [1] : !transform.param<i64>
+    transform.iree.match.dims_equal %out_img, [-1, -1] : !transform.param<i64>
+    transform.iree.match.dims_equal %out_ch, [] : !transform.param<i64>
+    transform.iree.match.dims_equal %filter, [-1, -1] : !transform.param<i64>
+    transform.iree.match.dims_equal %in_ch, [] : !transform.param<i64>
+    transform.iree.match.dims_equal %depth, [-1] : !transform.param<i64>
+    transform.iree.match.dims_equal %strides, [1, 1] : !transform.param<i64>
+    transform.iree.match.dims_equal %dilations, [1, 1] : !transform.param<i64>
+
+
+    %ins, %outs = transform.iree.match.cast_compatible_dag_from_root %root {
+      ^bb0(%input: tensor<1x?x?x?xf16>, %weights: tensor<?x?x?xf16>,
+           %acc_init: tensor<1x?x?x?xf32>, %bias: tensor<?xf32>,
+           %low: f32, %high: f32,
+           %out_init: tensor<1x?x?x?xf32>):
+        %accumulator = linalg.depthwise_conv_2d_nchw_chw
+            {dilations = dense<1> : vector<2xi64>,
+             strides = dense<1> : vector<2xi64>}
+            ins(%input, %weights : tensor<1x?x?x?xf16>, tensor<?x?x?xf16>)
+            outs(%acc_init : tensor<1x?x?x?xf32>) -> tensor<1x?x?x?xf32>
+        %activated = linalg.generic {
+            indexing_maps = [affine_map<(d0, d1, d2, d3) -> (d0, d1, d2, d3)>,
+                             affine_map<(d0, d1, d2, d3) -> (d1)>,
+                             affine_map<(d0, d1, d2, d3) -> ()>,
+                             affine_map<(d0, d1, d2, d3) -> ()>,
+                             affine_map<(d0, d1, d2, d3) -> (d0, d1, d2, d3)>],
+            iterator_types = ["parallel", "parallel", "parallel", "parallel"]}
+            ins(%accumulator, %bias, %low, %high
+                : tensor<1x?x?x?xf32>, tensor<?xf32>, f32, f32)
+            outs(%out_init : tensor<1x?x?x?xf32>) {
+          ^bb1(%raw: f32, %channel_bias: f32, %lo: f32, %hi: f32, %unused: f32):
+            %biased = arith.addf %raw, %channel_bias : f32
+            %low_clamped = arith.maximumf %biased, %lo : f32
+            %clamped = arith.minimumf %low_clamped, %hi : f32
+            linalg.yield %clamped : f32
+        } -> tensor<1x?x?x?xf32>
+    } : (!transform.any_op) -> (!transform.any_value, !transform.any_value)
+    transform.yield %ins, %outs : !transform.any_value, !transform.any_value
+  }
+
+  transform.named_sequence @match_dynamic_depthwise_conv2d_nchw_relu6_s2_undemoted(
+      %root: !transform.any_op {transform.readonly})
+      -> (!transform.any_value, !transform.any_value) {
+    transform.match.operation_name %root ["linalg.generic"] : !transform.any_op
+    %conv = transform.get_producer_of_operand %root[0]
+        : (!transform.any_op) -> !transform.any_op
+    transform.match.operation_name %conv ["linalg.depthwise_conv_2d_nchw_chw"] : !transform.any_op
+    transform.rocket.match.admitted %conv : !transform.any_op
+    %batch, %out_img, %out_ch, %filter, %in_ch, %depth, %strides, %dilations =
+        transform.iree.match.convolution %conv,
+          lhs_type = f16, rhs_type = f16, output_type = f32
+          : !transform.any_op -> !transform.param<i64>
+    transform.iree.match.dims_equal %batch, [1] : !transform.param<i64>
+    transform.iree.match.dims_equal %out_img, [-1, -1] : !transform.param<i64>
+    transform.iree.match.dims_equal %out_ch, [] : !transform.param<i64>
+    transform.iree.match.dims_equal %filter, [-1, -1] : !transform.param<i64>
+    transform.iree.match.dims_equal %in_ch, [] : !transform.param<i64>
+    transform.iree.match.dims_equal %depth, [-1] : !transform.param<i64>
+    transform.iree.match.dims_equal %strides, [2, 2] : !transform.param<i64>
+    transform.iree.match.dims_equal %dilations, [1, 1] : !transform.param<i64>
+
+
+    %ins, %outs = transform.iree.match.cast_compatible_dag_from_root %root {
+      ^bb0(%input: tensor<1x?x?x?xf16>, %weights: tensor<?x?x?xf16>,
+           %acc_init: tensor<1x?x?x?xf32>, %bias: tensor<?xf32>,
+           %low: f32, %high: f32,
+           %out_init: tensor<1x?x?x?xf32>):
+        %accumulator = linalg.depthwise_conv_2d_nchw_chw
+            {dilations = dense<1> : vector<2xi64>,
+             strides = dense<2> : vector<2xi64>}
+            ins(%input, %weights : tensor<1x?x?x?xf16>, tensor<?x?x?xf16>)
+            outs(%acc_init : tensor<1x?x?x?xf32>) -> tensor<1x?x?x?xf32>
+        %activated = linalg.generic {
+            indexing_maps = [affine_map<(d0, d1, d2, d3) -> (d0, d1, d2, d3)>,
+                             affine_map<(d0, d1, d2, d3) -> (d1)>,
+                             affine_map<(d0, d1, d2, d3) -> ()>,
+                             affine_map<(d0, d1, d2, d3) -> ()>,
+                             affine_map<(d0, d1, d2, d3) -> (d0, d1, d2, d3)>],
+            iterator_types = ["parallel", "parallel", "parallel", "parallel"]}
+            ins(%accumulator, %bias, %low, %high
+                : tensor<1x?x?x?xf32>, tensor<?xf32>, f32, f32)
+            outs(%out_init : tensor<1x?x?x?xf32>) {
+          ^bb1(%raw: f32, %channel_bias: f32, %lo: f32, %hi: f32, %unused: f32):
+            %biased = arith.addf %raw, %channel_bias : f32
+            %low_clamped = arith.maximumf %biased, %lo : f32
+            %clamped = arith.minimumf %low_clamped, %hi : f32
+            linalg.yield %clamped : f32
+        } -> tensor<1x?x?x?xf32>
+    } : (!transform.any_op) -> (!transform.any_value, !transform.any_value)
+    transform.yield %ins, %outs : !transform.any_value, !transform.any_value
+  }
+
+
   transform.named_sequence @match_dynamic_conv2d_int8_requant(
       %root: !transform.any_op {transform.readonly})
       -> (!transform.any_value, !transform.any_value) {
@@ -9117,9 +9504,13 @@ module attributes {transform.with_named_sequence} {
             @match_dynamic_conv2d_3x3_pad1_bias_s2 -> @cast_and_call_dynamic_conv2d_pad1_bias_s2,
             @match_dynamic_conv2d_3x3_pad1_bias_demoted_s2 -> @cast_and_call_dynamic_conv2d_pad1_bias_s2,
             @match_dynamic_conv2d_relu6 -> @cast_and_call_dynamic_conv2d_relu6,
+            @match_dynamic_conv2d_relu6_undemoted -> @cast_and_call_dynamic_conv2d_relu6,
             @match_dynamic_conv2d_3x3_relu6 -> @cast_and_call_dynamic_conv2d_relu6,
+            @match_dynamic_conv2d_3x3_relu6_undemoted -> @cast_and_call_dynamic_conv2d_relu6,
             @match_dynamic_depthwise_conv2d_nchw_relu6 -> @cast_and_call_dynamic_depthwise_conv2d_nchw_relu6,
+            @match_dynamic_depthwise_conv2d_nchw_relu6_undemoted -> @cast_and_call_dynamic_depthwise_conv2d_nchw_relu6,
             @match_dynamic_depthwise_conv2d_nchw_relu6_s2 -> @cast_and_call_dynamic_depthwise_conv2d_nchw_relu6_s2,
+            @match_dynamic_depthwise_conv2d_nchw_relu6_s2_undemoted -> @cast_and_call_dynamic_depthwise_conv2d_nchw_relu6_s2,
             @match_dynamic_conv2d_int8_requant -> @cast_and_call_dynamic_conv2d_int8_requant,
             @match_dynamic_conv2d_3x3_int8_requant -> @cast_and_call_dynamic_conv2d_int8_requant,
             @match_dynamic_depthwise_conv2d_int8_requant -> @cast_and_call_dynamic_depthwise_conv2d_int8_requant,
@@ -9202,6 +9593,7 @@ module attributes {transform.with_named_sequence} {
             @match_dynamic_conv2d_3x3_pad1_s2 -> @cast_and_call_dynamic_conv2d_pad1_s2,
             @match_dynamic_conv2d_3x3_pad1_demoted_s2 -> @cast_and_call_dynamic_conv2d_pad1_s2,
             @match_pooling_nchw_sum_avg -> @cast_and_call_pooling_avg_nchw,
+            @match_pooling_nchw_sum_avg_f16 -> @cast_and_call_pooling_avg_nchw_f16,
             @match_pooling_nhwc_sum_avg -> @cast_and_call_pooling_avg_nhwc,
             @match_pooling_nhwc_max -> @cast_and_call_pooling_max_nhwc,
             @match_pooling_nhwc_max_s2 -> @cast_and_call_pooling_max_nhwc_s2,

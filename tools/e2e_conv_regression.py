@@ -307,6 +307,26 @@ func.func @mixed_fp16_then_depthwise(%qi: tensor<1x64x32x32xf16>, %qf: tensor<12
   return %0, %1 : tensor<1x128x32x32xf32>, tensor<1x144x56x56xf32>
 }
 
+// fp16 depthwise followed by fp16 dense -- the transition
+// DEPTHWISE_TO_DENSE_QUIESCENCE guards, and the one ordering the earlier
+// campaigns never covered. `mixed_depthwise_then_int8` put an *int8* dense
+// after the depthwise and `mixed_fp16_then_depthwise` runs the pair the other
+// way round, so neither exercises fp16-dense-after-depthwise -- which is
+// exactly what a MobileNetV2 fp16 build does seventeen times per inference
+// once the depthwise demote is on. 128 output channels, so the reported
+// symptom (only the first 16 channels written) is unmissable.
+func.func @mixed_depthwise_then_fp16(%qi: tensor<1x64x32x32xf16>, %qf: tensor<128x64x1x1xf16>, %qo: tensor<1x128x32x32xf32>, %di: tensor<1x144x113x113xf16>, %df: tensor<144x3x3xf16>, %do: tensor<1x144x56x56xf32>) -> (tensor<1x128x32x32xf32>, tensor<1x144x56x56xf32>) {
+  %1 = linalg.depthwise_conv_2d_nchw_chw
+      {dilations = dense<1> : tensor<2xi64>, strides = dense<2> : tensor<2xi64>}
+      ins(%di, %df : tensor<1x144x113x113xf16>, tensor<144x3x3xf16>)
+      outs(%do : tensor<1x144x56x56xf32>) -> tensor<1x144x56x56xf32>
+  %0 = linalg.conv_2d_nchw_fchw
+      {dilations = dense<1> : tensor<2xi64>, strides = dense<1> : tensor<2xi64>}
+      ins(%qi, %qf : tensor<1x64x32x32xf16>, tensor<128x64x1x1xf16>)
+      outs(%qo : tensor<1x128x32x32xf32>) -> tensor<1x128x32x32xf32>
+  return %0, %1 : tensor<1x128x32x32xf32>, tensor<1x144x56x56xf32>
+}
+
 func.func @depthwise_int8_s2(%input: tensor<1x33x33x64xi8>, %filter: tensor<3x3x64xi8>, %init: tensor<1x16x16x64xi32>) -> tensor<1x16x16x64xi32> {
   %izp = arith.constant -5 : i32
   %kzp = arith.constant 0 : i32
@@ -2029,6 +2049,13 @@ def run_compiled_gate(
             "mixed_fp16_then_depthwise",
             MIXED_FP16_INPUTS,
             ("mixed_fp16_then_depthwise_dense.npy", "mixed_fp16_then_depthwise_dw.npy"),
+            1e-2,
+            1e-2,
+        ),
+        Case(
+            "mixed_depthwise_then_fp16",
+            MIXED_FP16_INPUTS,
+            ("mixed_depthwise_then_fp16_dense.npy", "mixed_depthwise_then_fp16_dw.npy"),
             1e-2,
             1e-2,
         ),

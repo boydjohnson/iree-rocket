@@ -150,6 +150,54 @@
 // default-topology control the wrong *sign*. Under `performance` both
 // controls reproduce.
 //
+// **Re-measured 2026-09-10, and the site counts above are stale in a way
+// that matters.** The gate no longer buys 7 sites, it buys 17: the depthwise
+// channel ceiling raise put every one of MobileNetV2's depthwise convolutions
+// inside the matchers, where the Cin 512 cap named above had left ten of them
+// out. So verify the gate as **37 sites off, 54 on**, the delta being
+// `rocket_dynamic_depthwise_relu6_executable` (13) and its `_s2` twin (4).
+// The `audit` reconciliation goes 36/53 accepted with 17 convolutions on the
+// CPU, to 53/53 with none.
+//
+// That made the trade *worse*, not better, and consistently so. Governor
+// `performance`, NPU at 600 MHz, medians of six, on the survey's own
+// `mobilenet_v2` fp16 export:
+//
+//                        base(37)   dw(54)   nooff    dw vs base
+//   four workers            55.4     73.8     30.8    1.33x slower
+//   default topo            50.5     68.8     30.8    1.36x slower
+//
+// The 2026-09-09 table above had dw within 1.02x of base at four workers.
+// Correctness is not the issue: max|diff| 0.00195 against the --no-offload
+// arm for both NPU arms (reference sd 0.68), argmax stable.
+//
+// **And the deficit is not the layout round trip this file has blamed since
+// 2026-09-01. It is the quiescence dwell, all of it.** `ROCKET_PROFILE=1`
+// puts 346 ms of a 1513 ms twenty-iteration run in `quiesce` -- 17.3 ms per
+// inference against a base-to-dw gap of 18.3 ms -- because MobileNetV2
+// alternates depthwise and dense seventeen times and `device.rs`'s
+// `DEPTHWISE_TO_DENSE_QUIESCENCE` sleeps 1 ms at each transition. Confirmed
+// by A/B: with `ROCKET_QUIESCE_OFF=1` the dw arm runs 56.1 / 51.8 ms, which
+// is within 1-2.5% of base. Every other phase is flat between the two arms
+// (compact 9.5 vs 9.4 ms per inference, pack.weights 2.0 vs 2.0), and
+// `outside` *falls* 5.7 ms as the seventeen convolutions leave the CPU.
+//
+// So the ranking in P7's items 2-4 is wrong on this model: the dwell is
+// first by a wide margin and the explicit pad is not close. The fix is a
+// driver one -- order the depthwise write-back properly instead of sleeping,
+// the way ISSUES.md C8 found a real register for the same family of symptom
+// -- not a compiler one, and it is worth ~17 ms here.
+//
+// Note also that ReLU6 now fuses on an already-f16 import, so the 2026-09-07
+// row that separated "depthwise clamps on the CPU" from "depthwise ReLU6
+// fused into BN" no longer describes two reachable arms -- every depthwise
+// site in the 54 comes out as a `_relu6_` executable. That fusion was worth
+// 2.5 ms of the old 9.5 ms gap and is already inside the numbers above.
+//
+// The demote stays off, for the reason the paragraph above gives: at 30.8 ms
+// the --no-offload arm is 1.6x faster than the best NPU arm, so this is still
+// a detail inside a losing trade.
+//
 // Anything left alone is safe: an op that stays f32 fails the matchers' f16
 // typing and goes to the CPU, and RocketPromoteUnclaimedConvInputsPass gives
 // f32 back to anything demoted that the match loop then declines.
@@ -276,8 +324,10 @@ Value demoteInput(PatternRewriter &rewriter, Location loc, Value value) {
 // recompile of the model rather than of the compiler.
 //
 // Verify the gate by dispatch-site count, not by trusting the env var: 37
-// sites off, 44 on, the delta being rocket_dynamic_depthwise_relu6_executable
-// (4) and its _s2 twin (3). `rocket-compiler audit` prints them. And build
+// sites off, 54 on, the delta being rocket_dynamic_depthwise_relu6_executable
+// (13) and its _s2 twin (4). `rocket-compiler audit` prints them. (It was
+// 44 before the depthwise channel ceiling raise; see the scope comment's
+// 2026-09-10 entry.) And build
 // board arms with --llvmcpu-target-triple aarch64-linux-gnu, or the vmfb is
 // x86 and every run dies with "HAL device `cpu_device` not found".
 //
