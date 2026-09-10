@@ -356,73 +356,59 @@ requested conv/matmul candidates fail compilation instead of falling back.
 
 ## 4. Materialize existing tile plans at compile time
 
-**Status 2026-09-09: not started, and deliberately so.** Section 3's report
-made the cost of what this section removes measurable, and it is small.
-Runtime planning happens inside `Phase::Record` (`ConvPlan::new` at
-`command_buffer.rs`), which `ROCKET_PROFILE=1` puts at **1.6 ms of a 136.7 ms**
-MobileNetV2 fp16 inference -- 1.2% of wall, and tile search is only a
-fraction of that phase. Against `outside` at 79.6 ms and `compact` +
-`pack.input` at 24.4 ms, serializing the plan is not where the time is.
+**Status 2026-09-10: not started, and the case for starting is weaker than
+this section claimed.** Every `record` number below is retracted. `record`
+does not measure planning: `command_buffer::dispatch` times the whole of
+`dispatch_impl`, which is `ConvPlan::new` and `programs()` *plus* every
+`RocketOwnedBuffer::new` the dispatch needs -- the packed input, the bias,
+the output the hardware writes, and one regcmd BO per tile. Each of those is
+a `CREATE_BO` (page allocation plus an IOMMU map), an `mmap`, and a fault
+per 4 KiB page on first host touch. Those allocations, not tile search, are
+what the phase is made of, and they are paid once per buffer rather than
+once per dispatch -- so a profile of a *single* inference charges the whole
+cold-start cost to `record` and reads it as a per-dispatch tax.
+
+Re-measured 2026-09-10 on `planck` with `iree-benchmark-module
+--benchmark_min_time=0 --benchmark_repetitions=N`, `mnv2.fp16.npu.vmfb`
+(54 NPU dispatch sites):
+
+| reps | `record` ms | ms/dispatch | scratch allocations |
+|---:|---:|---:|---:|
+| 1 | 46.2 | 0.855 | 123 |
+| 2 | 15.3 | 0.142 | 139 |
+| 3 | 18.9 | 0.116 | 132 |
+| 5 | 19.0 | 0.070 | 132 |
+| 10 | 25.3 | 0.047 | 134 |
+| 20 | 31.7 | 0.029 | 140 |
+
+The marginal cost of one further iteration (reps 10 -> 20) is **0.012 ms per
+dispatch**; the remainder is a per-process fixed cost of roughly 15 to 45 ms
+depending on how cold the machine is. ViT is starker still:
+`vit_f32.bm.npu.vmfb` (361 sites) spends 242.6 ms in `record` at reps=1 and
+240.5 ms at reps=5 -- four more inferences, 1444 more `record` calls, and no
+measurable additional time. All of it is one-time.
+
+`ROCKET_SCRATCH_POOL=0` at reps=20 pins the cause directly: `record` goes
+from 0.029 to **0.321 ms per dispatch**, so roughly 91% of the per-dispatch
+term is buffer allocation at 0.1 to 0.35 ms per `CREATE_BO` plus `mmap`.
+That the scratch pool (MULTICORE.md 12) already removes most of it is why
+the steady-state figure is as small as it is.
+
+**What this section is therefore worth.** Serializing the tile plan removes
+planning and register emission, which is 0.01 to 0.03 ms per dispatch -- under
+1% of wall on every model measured here, transformers included. It does not
+remove the cold-start cost it appeared to, because that cost is GEM
+allocation; the cheap attack on *that* is pre-warming the scratch pool at
+executable-load time from the sizes the compiler already knows, which uses
+the same compile-time knowledge for a far smaller change.
 
 Two of the three things this section was also going to buy have since been
 delivered by section 2: the compiler already asks the same planner the
 runtime asks, and already refuses at compile time what the runtime would
 reject. What remains unique to section 4 is register-program equality as a
 *proven* property rather than a shared-crate argument, and a target/policy
-identity in the executable.
-
-**That number has since been re-taken, and it is much larger.** ViT-B/16
-(f32 import, 73 NPU dispatch sites) spends **117 ms of a 592 ms inference in
-`record` -- 20% of wall**, at 1.6 ms per dispatch against MobileNetV2's
-0.043 ms. Planning cost scales with dispatch count *and* with how much
-search each shape needs, and a transformer's wide matmuls need far more of
-both than a MobileNet's convolutions. So the 1.2% above is the bottom of the
-range, not the middle of it, and section 4 is worth roughly an order of
-magnitude more on the models this repository is now measuring.
-
-What that does *not* do is rescue attention offload (ISSUES.md C15): removing
-`record` entirely would still leave 83 ms of cost against 3 ms of benefit
-there. But it does change section 4's own case, and it makes the ordering
-argument concrete -- every future increase in dispatch count is taxed at
-1.6 ms until this is done.
-
-**Qwen3-0.6B answers that, and it complicates the picture** rather than
-confirming it. Three models, `ROCKET_PROFILE=1` on `planck`, `record` being
-the phase `ConvPlan::new` runs in:
-
-| model | NPU sites | record ms | ms/dispatch | wall ms | record % | `outside` % |
-|---|---:|---:|---:|---:|---:|---:|
-| MobileNetV2 fp16 | 37 | 1.6 | 0.043 | 136.7 | 1.2% | 58% |
-| ViT-B/16 f32 | 73 | 117.0 | 1.603 | 592 | **19.8%** | 35% |
-| Qwen3-0.6B f32 (prefill 128) | 196 | 449.8 | 2.295 | 24080 | 1.9% | **96%** |
-
-Two separate things, and conflating them is what made the ViT number look
-decisive:
-
-- **Cost per dispatch is a property of the shape class**, and it scales
-  cleanly: 0.043 ms for a MobileNet convolution, 1.6 ms for a ViT projection,
-  2.3 ms for a Qwen3 one. Wider matmuls give the CBUF partition search more
-  to do. So section 4 removes more work per dispatch the bigger the
-  operations are.
-- **Share of wall is a property of the model**, and it does not track
-  dispatch count at all. Qwen3 has 2.7x ViT's dispatches and a *tenth* of the
-  relative planning cost, because 96% of its wall is `outside` -- CPU work
-  this backend never touches. Its `npu share` is 1.3%.
-
-So the honest statement of section 4's value is: it is worth roughly a fifth
-of a model whose NPU half is the bottleneck, and roughly nothing on a model
-bottlenecked elsewhere. Qwen3 is bottlenecked elsewhere for a reason worth
-naming -- its single refused candidate is the LM head,
-`128x1024 x 1024x151936`, whose `N` is 37x the channel ceiling and which
-therefore runs on the CPU. Offloading that would cut `outside` sharply and
-raise `record`'s share with it, so the two items are coupled: section 4 gets
-more valuable exactly as section 5's N-splitting (or a very large ceiling
-raise) succeeds.
-
-Nothing here changes the conclusion that section 4 is not the first thing to
-build. It does change the reason: not "the saving is 1.2%" but "the saving is
-between 2% and 20% depending on where the model's time actually goes, and the
-cheapest way to raise it is to offload more of the model first".
+identity in the executable. Those are the honest reasons to build it. Its
+performance case is not one, and it should not be sold on `record` again.
 
 First preserve the current execution model: one logical Rocket dispatch owns
 multiple standalone hardware jobs. Serialize the selected static plan with the
@@ -448,6 +434,41 @@ Acceptance: decoded compile-time plans reproduce runtime-planned results and
 register programs; static execution no longer performs tile search. Dynamic
 execution retains explicit validation. Measure executable size and compiler
 time as well as runtime planning savings.
+
+### Retracted: the 2026-09-09 measurements
+
+Kept so the reasoning is not repeated. Each row is a single cold inference
+under `ROCKET_PROFILE=1`, and each therefore attributes cold GEM allocation
+to tile search:
+
+| model | NPU sites | record ms | ms/dispatch | wall ms | record % | `outside` % |
+|---|---:|---:|---:|---:|---:|---:|
+| MobileNetV2 fp16 | 37 | 1.6 | 0.043 | 136.7 | 1.2% | 58% |
+| ViT-B/16 f32 | 73 | 117.0 | 1.603 | 592 | 19.8% | 35% |
+| Qwen3-0.6B f32 (prefill 128) | 196 | 449.8 | 2.295 | 24080 | 1.9% | 96% |
+
+The conclusion drawn from them -- that per-dispatch planning cost scales with
+matmul width, 0.043 ms for a MobileNet convolution against 2.3 ms for a Qwen3
+projection, so that section 4 is worth "roughly a fifth of a model whose NPU
+half is the bottleneck" -- does not survive. The gradient across those three
+rows is a gradient in *buffer count and size*, not in search effort. Repeat
+the inference and it vanishes.
+
+Two traps produced it, both worth naming because neither is specific to this
+section. A one-shot `iree-run-module` profile runs against `ondemand` at the
+408 MHz A76 floor, which inflates every host phase three- to five-fold
+(`pack.input` reads 377 MB/s cold and 1442 MB/s warm); see ISSUES.md's
+method note, "Measuring on `planck` under governor `ondemand`". And
+`record`, like every phase in that table, is a sum
+over calls, so a cost paid once by the process is indistinguishable from a
+cost paid once per dispatch unless the inference is repeated.
+
+**What does survive** is the coupling to section 5, for a different reason
+than stated. Qwen3's `outside` is 96% because its one refused candidate is
+the LM head, `128x1024 x 1024x151936`, whose `N` is 37x the channel ceiling
+and which therefore runs on the CPU. Offloading it would cut `outside`
+sharply. That raises the value of everything this backend does per dispatch
+-- packing, compaction, allocation -- and not merely of planning.
 
 ## 5. Tile operations beyond today's logical-shape limits
 

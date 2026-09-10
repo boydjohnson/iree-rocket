@@ -1702,7 +1702,106 @@ against a steady-state figure from another model.
 
 Next step: `ROCKET_DISPATCH_TIMES` to name which dispatch hits the floor and
 at which iteration, then whether it is the int8 path alone (build a VGG arm
-with only the conv matchers, no pooling) or the mix.
+with only the conv matchers, no pooling) or the mix. **C16 does exactly that
+for ResNet50 int8 and names the pooling dispatches** -- which this arm has
+none of, so read C16's "Relation to C11" before assuming one mechanism.
+
+---
+
+## C16 (S2, blocks every int8 ResNet50 number) — an int8-accumulator convolution poisons the *pooling* dispatches; C8's fix covered only the conv emitter
+
+Found 2026-09-10 while taking a ResNet50-224 CPU/fp16/int8 latency triple.
+`resnet50-224.int8.npu.vmfb` cannot complete a benchmark loop: 5 of 8
+iterations fire the `HUNG_JOB_DISPATCH_FLOOR` guard at 503-526 ms and the
+output buffer is refused rather than returned.
+
+**It is the two pooling dispatches, and nothing else.** `ROCKET_PROFILE=1`
+over 3 iterations, `npu` column, totals across all calls:
+
+    pool Max 114x114x64 k3x3 s2x2      3 calls   npu 507.42 ms
+    pool Avg 7x7x2048   k7x7 s1x1      3 calls   npu 515.45 ms
+    conv int8 56x56x64->256 k1x1 s1   12 calls   npu   2.60 ms
+    conv int8acc 7x7x512->2048 k1x1    9 calls   npu   1.66 ms
+    matmul fp16 1x2048x1000            3 calls   npu   0.52 ms
+    ... 14 further conv classes, all npu <= 2.9 ms total
+
+Each pool row is one hang in three iterations; every convolution class and
+the fp16 matmul are in the ordinary 0.5-3 ms range. The guard's 503/507/515/
+522/524/526 ms readings are the watchdog kill, not slow pooling.
+
+**Three controls narrow it to the int8-accumulator path, not to pooling.**
+
+- **The same two pool shapes are clean at fp16.** `resnet50-224.fp16.npu`
+  runs 15 iterations x 2 interleaved passes with **zero** hangs, median
+  103 ms, and offloads the same `pool Max 114x114x64` and
+  `pool Avg 7x7x2048`. So it is not those shapes.
+- **int8 pooling is clean without an int8-accumulator conv in the model.**
+  `mnv2.int8.npu` offloads `pool Avg 7x7x1280 k7x7 s1x1` at 0.13 ms per
+  call, 6 iterations, zero hangs — and its per-op table contains no
+  `int8acc` row at all: every one of its convolutions takes the requantized
+  rung. So it is not int8 pooling as such.
+- **ResNet50's int8 arm is the one that mixes them**, with two accumulator
+  classes (`7x7x512->2048` and `7x7x2048->512`, both in layer4) alongside
+  fourteen requantized ones.
+
+That is the C8 signature — an `Int8Accumulator` job leaving state that hangs a
+later job of another kind, at ~510 ms — through an emitter C8's fix did not
+touch. C8 was resolved by writing `DPU_RDMA_BRDMA_CFG.brdma_data_use = 0` on
+the int32-accumulator path in the **convolution** emitter; the pooling emitter
+is a separate one, so either it needs the same treatment or the accumulator
+conv's own program still leaves something the pooling program does not
+re-initialise.
+
+**One observation that does not fit "the next job after an accumulator run",
+and that a fix must explain.** In model order the avg pool *is* the immediate
+consumer of `conv int8acc 7x7x512->2048`, and it hangs. But the fp16 matmul
+runs immediately after that avg pool and is clean, and the max pool that hangs
+sits at the *start* of the following inference with the matmul between it and
+any accumulator work. C8's state was established to be **per core**, so
+scheduler placement is the obvious candidate and should be checked first with
+`ROCKET_DISPATCH_TIMES` (which prints precision, DPU mode and the core) before
+any register work.
+
+**Single-shot is mostly clean, and the wedge crosses processes.** Three
+consecutive `iree-run-module` invocations from a quiet device went
+clean / hang / clean — consistent with the standing board protocol
+(`npu-wedges-after-failed-job`): a hang leaves the device sick for seconds, so
+the second process inherited the first one's wedge. Leave a dwell between
+runs before concluding anything from a single reading.
+
+**What this blocks.** Every int8 ResNet50 timing. The arm reads 841 ms mean
+with a 269 ms standard deviation and a 31% coefficient of variation, which is
+a hang count, not a latency. For the record, the arms that *are* measurable at
+224x224, 15 iterations, median, two agreeing passes:
+
+| arm | median |
+|---|---:|
+| fp16 CPU (`--no-offload`) | 630 ms |
+| fp16 NPU | 103 ms (6.1x) |
+| int8 CPU (`--no-offload`) | 2115 ms |
+| int8 NPU | not measurable |
+
+**Relation to C11.** C11 is the same symptom on VGG int8 — repeated
+invocation aborts on the hung-job floor — and its recorded next step is
+"name which dispatch hits the floor". This does that for ResNet50 and gets
+*pooling*, which C11 explicitly rules out for VGG's main arm ("no pooling
+offloaded at all"). So either they are two mechanisms, or the common factor is
+the accumulator rung and the victim is simply whichever dispatch kind follows
+it on the poisoned core. Re-run C11's VGG arm with the per-op table before
+assuming either.
+
+**Next steps, in order.** (1) `ROCKET_DISPATCH_TIMES` on the int8 ResNet50 arm
+to name the hanging dispatch's core, precision and DPU mode, and confirm the
+placement hypothesis. (2) If placement explains it, apply C8's
+`brdma_data_use = 0` reasoning to the pooling emitter and re-run.
+(3) Build a minimal probe in the shape of `tools/c8_precision_transition_probe.py`
+— one int8-accumulator conv followed by one pooling dispatch in a single
+function — so the repro is single-shot rather than benchmark-loop-dependent.
+(4) Re-run C11's VGG arm with `ROCKET_PROFILE=1` and compare.
+
+Correctness is not known to be affected: the guard refuses the buffer rather
+than returning it, so a hang is a failure, not a wrong answer. The clean
+iterations' logits were not diffed against the CPU arm here.
 
 ---
 
@@ -2331,9 +2430,15 @@ Rank work against that, not against the default-topology rows.
    workers.
 5. **C4 → P4 → P1** — the rest of the dispatch-path stack, in increasing
    order of work.
-6. **C11** — VGG int8 aborts under a repeated benchmark loop, which is why
-   every VGG number in this repo includes a cold weight cache. Blocks a
-   measurement rather than a user.
+6. **C16 → C11** — the int8 hung-job pair, most-characterized first. C16
+   (2026-09-10) names the hanging dispatch for ResNet50 int8 -- both pooling
+   dispatches, ~510 ms each, in a model that mixes requantized and
+   int8-accumulator convolutions -- and rules out both the pool shapes (clean
+   at fp16) and int8 pooling as such (clean on MobileNetV2, which has no
+   accumulator conv). It blocks every int8 ResNet50 number. C11 is the same
+   symptom on VGG, where the main arm offloads no pooling at all, so the two
+   may or may not be one mechanism; C16's next-step list starts by settling
+   that.
 7. **C6, C7, D1, D2** — limitations, hygiene and reconciliation.
 
 Done and in **Resolved**: the requantized int8 path (2026-09-06), C2
