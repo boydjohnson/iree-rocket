@@ -581,7 +581,7 @@ is the CPU (every classifier) keeps its dense write, as it must.
 
 ---
 
-## P3 (S3) — the full output BO is cache-synced once per tile, and a regcmd BO is allocated and mapped per tile
+## P3 (S3) — whole-BO cache sync: ∝ pages, not bytes, and since 6.3 it is 41% of ResNet50's wall (the regcmd half is resolved)
 
 `perf/bo-sync-cost.md` [notes]:
 
@@ -624,6 +624,67 @@ for, so the per-tile `PREP_BO` no longer idles the core between tiles. The
 first half -- the whole-BO cache sync, ∝ pages not bytes -- stands, and is
 now the dominant cost of a fanned-out replica (`stage` 0.47 ms per ViT
 dispatch is mostly `fini_bo` over a 512 KiB input replica).
+
+**Re-sized 2026-09-10, and it went from "useful, not first" to the largest
+single host cost on ResNet50: `sync.inputs` is now 41% of wall, larger than
+the hardware.** The 2026-09-09 sizing (memory `p3-cache-sync-sized`) measured
+this repo's input-side sync at **3.1%** of ResNet50's wall and 0.6% of
+MobileNetV2's, and concluded P3 did not justify being ranked first. That
+conclusion is void for ResNet50: section 6.3 of COMPILER_ROADMAP landed on
+2026-09-10 and made the sync 27x more expensive per dispatch.
+
+`ROCKET_PROFILE=1`, 15 iterations, 54 NPU dispatches, planck, **same driver
+binary and the same session** -- only the `.vmfb` differs:
+
+| build | `sync.inputs` | per dispatch | `pack.weights` | `compact` | wall |
+|---|---:|---:|---:|---:|---:|
+| `resnet50-224.fp16.p3` (2026-09-08, pre-6.3) | 26.5 ms / 795 | **0.033 ms** | 287.1 ms (cold) | 322.8 ms / 795 | 1845.9 ms |
+| `resnet50-224.fp16.npu` (2026-09-10, 6.3) | 736.7 ms / 810 | **0.910 ms** | none | 114.5 ms / 360 | 1733.7 ms |
+
+Across two runs of the newer build the per-dispatch figure is 0.79 to 0.91 ms,
+i.e. **43 to 49 ms of a 104 to 116 ms inference**. It is flat across shapes --
+0.796 ms on `14x14x256->1024`, 0.779 ms on `7x7x512->512 k3x3` -- which is the
+signature the notes predicted: cost ∝ the *allocated* BO's page count, not the
+bytes the dispatch touches.
+
+**The mechanism, and it is the one this section's own code comment predicts.**
+`command_buffer.rs`'s pre-submit loop `fini_bo`s every handle in
+`in_bo_handles`, with the stated rule "syncing every input handle rather than
+just the un-staged ones keeps the rule simple ... a redundant sync on an
+already-synced scratch BO is a cache operation with no effect on correctness".
+That was true while every weight was packed into a small right-sized scratch
+BO. With `Conv2DDef.weights_packed` the weights are already in the CNA's
+coefficient order in the `.vmfb`, so the binding goes through `stage_direct`
+and `in_bo_handles` now names **IREE's whole combined constant buffer** -- tens
+of MiB for ResNet50, against 48.6 MiB of packed coefficients in the pre-6.3
+arm's weight cache. Every dispatch walks that entire scatter-gather list.
+Scale confirms it: MobileNetV2, whose `.vmfb` is 7 MB against ResNet50's 51,
+pays 0.153 ms per dispatch on the same driver.
+
+**6.3 is still the right change; this is its unbilled cost.** Over 15
+iterations the newer build's wall is lower (1733.7 vs 1845.9 ms), but the
+older build's `pack.weights` is cold-start only (742 weight-cache hits against
+53 misses), so in steady state the two are within about ten milliseconds of
+each other -- the sync regression gives back most of what eliminating the
+packer and eliding 450 of 540 dense writes won. Fixing the sync is what
+converts 6.3's compaction and packing wins into wall-clock: it is worth
+roughly **40 ms of a 104 ms inference**, a further 1.4x on this model, and it
+is pure host cost so it does not shrink at a higher NPU clock.
+
+**Why the old sizing is not simply wrong.** It measured a real build honestly;
+the denominator moved under it. Both halves of that measurement still stand
+for what they covered -- the output-side fixed cost `c` hiding inside
+`wait.npu` at ~5% of wall on both models, and MobileNetV2's unchained
+compaction at 17.3% being the bigger lever *on that model*. MobileNetV2 is
+still not a P3 model. ResNet50 now is.
+
+**Fix direction.** The uAPI has no offset/length, so the answer is to sync the
+constant buffer *less often*, not faster. A constant BO is written once at
+upload and never again, and the driver already tracks a per-buffer
+`generation` (`crate::buffer::generation`, used by the weight cache to detect
+a rewritten source), so the sync can be hoisted to first use per generation
+rather than repeated per dispatch. Check the same treatment for any other
+directly-bound read-only binding before assuming weights are the only one.
 
 ---
 
@@ -2239,12 +2300,19 @@ this model the offload is underwater at a fair allocation, at either clock.
 Rank work against that, not against the default-topology rows.
 
 1. **P3's first half — the whole-BO cache sync, ∝ pages not bytes.** Promoted
-   from 4. It is pure host cost, so the clock change made it a strictly larger
-   share of every model, and it is independently named as the next lever by
-   `MULTICORE.md` §12, where `fini_bo` over a 512 KiB replica input BO is most
-   of the 0.47 ms per fanned-out ViT dispatch. The uAPI has no offset/length,
-   so the fix is to stop syncing whole combined transient buffers rather than
-   to sync them faster.
+   from 4, and **re-sized 2026-09-10 from 3.1% of ResNet50's wall to 41%**.
+   COMPILER_ROADMAP 6.3 binds packed weights straight out of the `.vmfb`, so
+   `in_bo_handles` now names IREE's whole combined constant buffer and every
+   dispatch walks its scatter-gather list: 0.033 -> 0.910 ms per dispatch
+   between the 2026-09-08 and 2026-09-10 builds on the same driver. It is now
+   larger than `wait.npu` on this model, it is pure host cost so the clock
+   change cannot touch it, and it is what stands between 6.3's compaction and
+   packing wins and an actual wall-clock gain -- roughly 40 ms of a 104 ms
+   inference. Also independently named by `MULTICORE.md` §12, where `fini_bo`
+   over a 512 KiB replica input BO is most of the 0.47 ms per fanned-out ViT
+   dispatch. The uAPI has no offset/length, so the fix is to sync a
+   write-once constant buffer once per generation rather than to sync it
+   faster.
 2. **P8's allocation finding, made actionable.** The 54.5-vs-73.1 result says
    the per-dispatch tax still dominates this model once the CPU is allowed to
    use its cores. P8 measured the constant at 7.4 ms on two A76s and 1.6 ms on
