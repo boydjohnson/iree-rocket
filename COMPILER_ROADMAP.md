@@ -18,12 +18,16 @@ an invalid operation, an unsupported lowering, a capacity limit that tiling
 can resolve, and a policy whose hardware behavior has not been validated.
 It must not infer those distinctions by parsing error text.
 
-There are two separate deliveries:
+There are three separate deliveries:
 
 1. Compute the existing HAL tile plans at compile time and explain placement.
 2. Add compiler transformations for operations larger than the existing
    logical-shape limits, including output-channel tiling and eventually
    reduction tiling.
+3. Own tensor layout and weight packing at compile time, so an executable
+   states which of its bindings are packed and which dense, the constant
+   filters ship prepacked, and activations are repacked only where a CPU
+   dispatch meets an NPU one (section 6, added 2026-09-09).
 
 Moving the planner alone delivers neither new reduction semantics nor automatic
 CPU fallback after an NPU dispatch has already been selected.
@@ -539,6 +543,324 @@ packing, repeated weights, halo traffic, submission, compaction, and CPU epilogu
 not only MAC count. Existing `ROADMAP.md` and `ISSUES.md` show why more offloaded
 dispatches need not make a model faster.
 
+## 6. Own the layout at compile time: packed tensors, boundary-only repacks, prepacked weights
+
+**Status 2026-09-09: not started.** This section exists because the end
+state the repository is working toward was only ever stated by halves. Put
+in one place, for a model whose input extents are static:
+
+1. the compiler knows which operations run on the CPU and which on the NPU
+   -- **landed**, sections 2 and 3;
+2. the compiler knows, per tensor edge, whether the tensor is in the NPU's
+   packed `NC1HWC2` cube layout or in IREE's dense row-major one, and the
+   executable says so rather than the driver guessing -- **not started**;
+3. every constant filter is stored in the `.vmfb` already in the CNA's
+   blocked coefficient order, so the driver never packs a weight --
+   **sized once as an aside (ISSUES.md P8), not started**;
+4. activations are packed and unpacked only where a CPU dispatch meets an
+   NPU one, never between two NPU dispatches -- **the runtime mechanism
+   landed as ISSUES.md P2 steps 2, 4 and 5; the compile-time form has not
+   been designed**.
+
+Items 2 to 4 are one piece of work, and this section is its design and
+order. The reason it belongs in this file and not in ISSUES.md is that
+every piece of it is a compiler decision that the runtime currently makes
+by inspection, and the argument of section 2 -- ask one planner, once,
+at compile time, and let the runtime check rather than rediscover -- is
+exactly the argument here.
+
+### What the runtime does today, and why it is discovery rather than knowledge
+
+The driver already achieves item 4 on most edges, by proving at record time
+an identity the compiler could have stated. `chainable_cube`
+(`rocket-hal-driver/src/command_buffer.rs`, ISSUES.md P2 step 2) matches a
+dispatch's input binding against the *device byte range* of every earlier
+dispatch's output on the same command buffer, and if the producer's
+`OutputCube` has the same pixel count, the same surface stride
+(`surface_pixel_count`, which the PPU rounds up to four) and a whole number
+of 16-byte atoms per pixel, the consumer reads the producer's scratch BO in
+place and skips its pack. `compaction_elidable` then skips the producer's
+dense write when the number of consumers that chained equals the number of
+Rocket readers the compiler counted (`rocket-mark-dense-readers`,
+`Conv2DDef.runtime_dense_readers` and its twins on `MatmulDef`,
+`PoolingDef` and the three `Elementwise*Def`s). It is bit-identical on and
+off (`ROCKET_CHAIN`, `ROCKET_LAZY_COMPACT`) and it is gated end to end by
+`fp16_conv_pool_conv_chain`, `fp16_matmul_chain` and `requant_int8_chain`.
+
+That is the mechanism working well, and the numbers say so: ResNet50 fp16
+chains 66 of 68 operand repacks and elides 51 of 53 compactions, 169 -> 114
+ms; VGG f32 20 of 20 edges. It is also the reason this section is not a
+throughput proposal on those models -- there is little left to remove.
+
+What it is instead is a set of decisions made in the wrong place, each with
+a cost that shows up somewhere other than the benchmark:
+
+| Runtime decision today | What it costs |
+|---|---|
+| A packed cube exists only as a driver-private scratch BO, pooled per context (`scratch_pool.rs`) and matched by byte range | A consumer on a *later* command buffer cannot chain, by construction. `rocket-mark-dense-readers` had to be a count rather than a flag purely to survive IREE's partitioning of the program, and its own header says so. |
+| Chainability is decided by geometry equality at record time | The whole-atom rule declines 8 of MobileNetV2's 14 direct NPU -> NPU edges (Cout 88, 136, 24). The compiler knows every one of those channel counts at compile time and could have padded the producer's programmed width, chosen a different consumer, or reported the edge as unchainable in the placement audit. Today the audit cannot mention layout at all. |
+| The dense write is elided when a runtime tally matches a compile-time count | Correct, but two mechanisms for one fact. A reader the pass does not understand is "always write", silently, and nothing in section 3's reconciliation can say which results are written and which are not. |
+| Weights are packed by `apply_ops` on first use and cached across inferences (`weight_cache.rs`) | 65.8 ms and 7.5 MiB per cold start on MobileNetV2 int8 (P8: 49 misses, 1666 hits over 35 inferences); a generation counter and a "nothing writes it before this dispatch" rule that every new way of writing a buffer must be taught about. |
+| Two environment variables can change what a `.vmfb` does | Not a correctness risk -- both arms are bit-identical -- but a `.vmfb` is not self-describing, and section 4's acceptance ("static execution no longer performs tile search") has a layout twin that is not met: static execution still performs layout search. |
+
+The `truncf`/`extf` cancellation is the same story one layer up. A Rocket
+shim widens its f16 result with a plain `linalg.generic` so that the
+consumer's own `truncf` folds against it and the edge becomes direct
+(P2 step 5, `rocket-fold-neutral-init`). That works, and it is what made
+chaining reach VGG's plain convolutions -- but it is IREE's canonicalizer
+being relied on to discover that the two dispatches agree on an element
+type. An encoding on the edge would state it.
+
+### 6.1 The layout contract
+
+The cube geometry has to be written down as a function of things the
+compiler knows, and nothing else. From `OutputCube` and the identity
+`chainable_cube` checks, that function is:
+
+- inputs: dispatch kind (conv, matmul, pooling, element-wise), precision
+  rung, logical width, height and channel count (or `M` and `N` for a
+  matmul, which is width `M`, height 1);
+- outputs: `pixel_count`, `surface_pixel_count` (equal to `pixel_count`,
+  except the PPU rounds it up to a multiple of four), `bytes_per_pixel`
+  (channels rounded up to the rung's 16-byte atom: C2 = 8 lanes at fp16,
+  16 at int8), and therefore the physical byte size, which is larger than
+  the dense tensor whenever the channel count is not a multiple of C2 or
+  the PPU rounding applies.
+
+And the things it must **not** depend on, each of which is a runtime
+freedom today and becomes a constraint:
+
+- **Tiling.** A multi-tile conv writes one cube; `Tile2D`'s row and column
+  partitions are internal to it. This holds today and section 4's serialized
+  plan does not change it.
+- **Fan-out** (MULTICORE.md M2). A fanned-out dispatch writes per-context
+  tiles and publishes no cube. Under a compile-time layout a fanned-out
+  dispatch must either assemble one cube or be declared dense-out; "declines
+  to chain" is no longer an available answer.
+- **Command-buffer partitioning.** A packed tensor that lives in the
+  dispatch's own IREE result buffer, rather than driver scratch, is readable
+  by any later command buffer on the same device file. That is the change
+  that removes the count/flag distinction. It collides with P1 and
+  `rocket-no-cross-fd-bo-sharing`: a job names only BOs created on its own
+  file, so a packed tensor is only reachable from the context that owns the
+  IREE allocation. Multicore (N contexts) and compile-time layout therefore
+  need one decision about who allocates, and it should be made before
+  either grows further.
+- **The accumulator int8 rung** has no identity at all -- it writes
+  128-byte blocks at 4 lanes per atom against a 16-lane input -- and stays
+  dense-out. The requantized rung does (i8 out, 16 lanes) and is gated.
+
+Write the contract as a pure function in `rocket-core` beside `admission.rs`
+(`layout.rs`: `cube_geometry(kind, precision, w, h, c) -> CubeGeometry`),
+expose it over `rocket-plan-ffi` (ABI version 4), and make the driver's
+`OutputCube` construction and `chainable_cube`'s comparison both call it,
+so the compiler and runtime cannot compute two geometries for one shape.
+That is section 1's extraction pattern applied to layout, and it is the
+prerequisite for everything below because it turns "does the producer's cube
+match" into "is the encoding equal".
+
+### 6.2 Layout assignment in the compiler
+
+Once each dispatch operand and result can carry an encoding, assignment is a
+walk over a graph the compiler already has. `rocket-mark-dense-readers`
+runs at the flow phase after `rocket-pin-unclaimed-dispatches`, when every
+reader of a dispatch result is a final SSA use; the same walk assigns
+layouts:
+
+- an edge from a Rocket dispatch to a Rocket dispatch whose cube geometries
+  agree is packed on both sides -- no pack, no compact, no runtime check;
+- an edge into a Rocket dispatch from anything else (a CPU dispatch, a
+  function argument, a constant) is packed on the consumer side only: a
+  pack happens here and nowhere else;
+- an edge out of a Rocket dispatch to anything else (a CPU dispatch,
+  `util.return`, a tied operand, a copy) is dense on the consumer side: a
+  compact happens here;
+- an edge between two Rocket dispatches whose geometries disagree (the PPU
+  rounding, a channel count that is not whole-atom) is the decision point
+  the runtime does not have today: pad the producer's programmed width so
+  they agree, or keep it dense and *say so in the audit*.
+
+The result is written into the executable, per binding: `packed_in`,
+`packed_out` (or an encoding id) on `Conv2DDef` and its twins, replacing
+`runtime_dense_readers` -- a boolean is enough once the packed tensor is an
+IREE buffer, because the reason the count existed was the driver's
+inability to see past its command buffer. The driver's `chainable_cube`
+becomes a check: an input declared packed whose producer cube is missing or
+mismatched is an `INTERNAL` failure, not a fallback to repacking, exactly
+as section 2 treats a shape the planner refused.
+
+Two choices are deliberately deferred, and each has a cheaper first form:
+
+- **Who allocates the packed buffer.** First form: the packed tensor stays
+  in driver scratch and the compiler-assigned layout is honoured only within
+  a command buffer, so the driver still falls back to a dense write when an
+  edge crosses one. That is bit-identical to today with the guesswork
+  replaced by a declaration, and it is enough to remove both environment
+  variables. Second form: the dispatch's IREE result buffer *is* the cube,
+  sized by the encoding, which is what lets the layout cross command buffers
+  and what makes the fan-out and multicore questions above unavoidable.
+  IREE's encoding attribute interface (a storage-size hook on the tensor
+  type) is the mechanism to evaluate for the second form; do not assume it
+  composes with the plugin's transform-spec pipeline until a lit test shows
+  it does.
+- **Who executes the pack at a CPU boundary.** First form: the driver, as
+  today -- it is one memcpy-shaped transform per boundary and P8 has
+  measured that a standalone dispatch for it would cost more than it saves.
+  Second form: an explicit pack op in IR, which is only worth building if it
+  can fuse into the adjacent CPU dispatch (the widen/narrow it replaces
+  already does), and which ROADMAP.md's closing section was right to refuse
+  as a *standalone* dispatch.
+
+The pipeline shape section 2 established applies: nothing widens. An edge
+the compiler cannot prove packable is dense, the audit prints why, and
+`--strict-offload` gains a layout mode that fails on any NPU -> NPU edge
+left dense.
+
+### 6.3 Weights packed at compile time
+
+The packers are `pack_hwcf_to_rocket_weights`, `_padded`, `_int4`,
+`_affine_i8` and `pack_depthwise_to_rocket_weights` in
+`iree-rocket-hal/src/rocket/tensor_layout.rs`, with the nesting
+`output_block -> input_group -> filter_y -> filter_x -> output_lane ->
+input_lane` and the per-rung padding rules in `rocket_weight_storage_size`.
+They depend on the logical filter shape, the programmed (padded) channel
+counts and the rung -- all compile-time facts for a static model -- and on
+nothing the runtime knows that the compiler does not.
+
+**The compiler already controls the bytes in that binding.** What IREE
+hands the driver is not the model's weight; it is a derived constant. The
+ONNX filter passes through `convert-conv-to-channels-last` (to HWCF),
+`rocket-demote-conv-inputs` (f32 -> f16) and, for depthwise, the shim's own
+HWC -> CHW `linalg.transpose`, and IREE's const-eval folds the whole chain
+into a `util.global` initializer -- the spec relies on it by name ("it is
+the layout `pack_depthwise_to_rocket_weights` reads and it const-evals away
+over a constant filter"). The CNA packing is one more link in a chain that
+exists, not a new mechanism. `RocketTarget.cpp` is *not* where it happens:
+the serializer emits executable definitions, and the constants are IREE's
+rodata, which it never touches.
+
+P8's objection to doing this at compile time was a second implementation
+of the blocked layout, "the kind of duplication that produced the depthwise
+tap-major bug". That objection is right and it chooses between the two
+routes that exist:
+
+1. **Express the packing as linalg in the shim's caller** -- pad `Cin` to
+   32-lane groups and `Cout` to 16- or 32-lane blocks, `expand_shape`,
+   `transpose` to `block, group, ky, kx, out_lane, in_lane`,
+   `collapse_shape` -- and let const-eval fold it as it folds the demote.
+   Hoisting is free and a non-constant weight degrades to a CPU dispatch
+   instead of failing. But it is a second spelling of the layout unless the
+   plugin *generates* the ops from `rocket-core`'s layout parameters, and it
+   cannot express int4 nibble packing.
+2. **A flow-phase pass that calls the packer over FFI.** By the flow phase
+   the filter operand is a `util.global.load` of an immutable initialized
+   global; the pass rewrites the initializer through `rocket-core`'s packer
+   and sets `weights_packed` on the def. `rocket-mark-dense-readers` already
+   runs there by name, so the slot exists; a non-constant weight keeps the
+   flag unset and the runtime packer.
+
+Take route 2: **move, do not copy.** The packers go into `rocket-core` (the
+same `layout.rs`; their one import, `AccumulatorOutputTile`, is already
+core data) and `rocket-plan-ffi` exposes one entry point per rung. The
+driver, seeing the flag, binds the weight buffer directly and skips
+`weight_cache`; an executable without the flag packs as before, so old
+`.vmfb`s keep working. Two recorded traps apply verbatim: nothing may be
+placed inside the never-inlined `@call_*` wrappers, or it becomes a
+per-inference CPU dispatch (ISSUES.md P6 item 2, the bug the demote hit);
+and `pack_hwcf_to_rocket_weights_affine_i8` fills padding lanes with each
+channel's weight zero point, not zero, so any route-1 `tensor.pad` would be
+per-channel on that rung.
+
+Two things fall out for free. The wire's one scalar `weights_zero_point`,
+broadcast across every channel by the driver (ROADMAP.md's ledger), stops
+being a limitation: `pack_hwcf_to_rocket_weights_affine_i8` takes one zero
+point per `Cout`, and a compile-time packer can hand it the per-channel
+vector the model actually has. And the driver's "nothing is about to write
+this buffer before the dispatch runs" rule, `WeightPacking`'s reason for
+deferred packing, has no compile-time counterpart to maintain.
+
+What it buys, stated the way P8 sized it: about 68 of the ~86 ms
+first-inference penalty and 7.5 MiB of driver cache on MobileNetV2 int8,
+nothing in steady state, and a `.vmfb` that grows by the group padding (16
+or 32 lanes per block, 32 per input group). It is worth doing for
+first-inference latency and because it is item 3 of the end state; it is
+not a benchmark lever and should not be measured as one.
+
+### 6.4 What the whole section is worth
+
+Honestly: little on the models this repository benchmarks, and that is
+fine, because the section is about what the compiler *knows*, not what the
+board does per iteration. ResNet50 and VGG already chain nearly every edge
+at runtime, and the compile-time form is bit-identical to them by
+construction. What changes is:
+
+- **First inference**: ~68 ms on MobileNetV2 int8 (6.3); proportionally
+  more on models with more weight bytes.
+- **The edges the runtime identity cannot take**: MobileNetV2's 8
+  whole-atom declines become a compile-time padding decision; a reader on a
+  later command buffer becomes chainable under the second form of 6.2.
+  Neither is sized yet, and MobileNetV2's own verdict (P7) says its offload
+  loses for other reasons, so do not expect either to move a headline.
+- **The audit** can finally say, per edge, packed or dense and why -- the
+  layout half of section 3, which today has no vocabulary for it.
+- **Two runtime heuristics and two environment variables retire**, and a
+  `.vmfb` describes its own layout the way it already describes its own
+  placement.
+
+The whole-atom rule deserves one caution. A producer leaves its padding
+lanes as the hardware wrote them, and a consumer's repack zeroes them; the
+identity fails when the two differ. Whether the DPU writes zeros or stale
+bytes into padding lanes is a hardware question, and if it is stale bytes
+then fp16 garbage can be NaN, which a zero weight does not neutralise. A
+compile-time contract for a non-whole-atom edge therefore needs a hardware
+measurement first (`Selectors`-pattern producer, read the padding lanes),
+not a compiler rule. Until then the compiler's answer for such an edge is
+dense, reported.
+
+### 6.5 Coupling
+
+- **DYNAMIC_SHAPES.md.** Scope is static extents only: an encoding fixes a
+  physical size, and a symbolic channel count has none. DS1's "a symbolic
+  model offloads nothing" already keeps such an op off the NPU, so nothing
+  here needs a dynamic story yet; state that, do not build one.
+- **Section 4.** The serialized plan and the layout encoding are the same
+  kind of thing -- a compile-time decision the executable carries and the
+  runtime validates -- and should share a version field and a target/policy
+  identity. Whichever lands first defines the versioning; the other reuses
+  it.
+- **MULTICORE.md M2 and P1.** See 6.1: fan-out and packed IREE buffers are
+  in tension, and the second form of 6.2 cannot be designed without settling
+  which context owns a packed tensor.
+- **The chain gate.** `fp16_conv_pool_conv_chain`, `fp16_matmul_chain`,
+  `requant_int8_chain` and `requant_int8_chain_cpu_between` are the
+  acceptance fixtures for every step below, unchanged: each must stay
+  bit-exact with the middle compaction skipped, and the last must keep its
+  dense write.
+
+### 6.6 Order
+
+1. **The contract (6.1).** `rocket-core::layout`, ABI v4, driver computes
+   `OutputCube` through it. No behaviour change; `chain_identity_tests`
+   move with it. Bit-identical on every model.
+2. **Weights (6.3).** Independent of the rest and the only step with a
+   number attached. Acceptance: packed bytes byte-identical to the driver
+   packer on every conv fixture in `tools/e2e_conv_regression.py`, the
+   first-inference latency before and after, the `.vmfb` size delta.
+3. **Declared layout, first form (6.2).** Encoding assigned in the compiler,
+   written per binding, driver checks instead of guesses, within a command
+   buffer. `ROCKET_CHAIN` and `ROCKET_LAZY_COMPACT` are removed, and
+   `runtime_dense_readers` with them. Acceptance: bit-identical to the
+   current chain on every model in the survey harness; the audit prints
+   every edge; `--strict-offload` layout mode on ResNet50 passes.
+4. **Packed IREE buffers, second form (6.2)**, after the multicore
+   ownership decision. Acceptance: a later-command-buffer reader chains; the
+   count is gone from the wire.
+
+Steps 1 and 2 are small and can go first without prejudice to anything in
+sections 4 and 5. Step 3 is the one that delivers the end state's items 2
+and 4 for a single command buffer, which on every model measured here is
+the whole model.
+
 ## Validation and delivery order
 
 | Milestone | Required evidence |
@@ -548,6 +870,8 @@ dispatches need not make a model faster.
 | C: serialized static plans | Schema compatibility and malformed-plan tests; compile/runtime plan equivalence; no repeated search for static dispatches. |
 | D: expanded spatial/M and N tiling | Tail/halo/coverage and scratch tests; CPU-reference comparisons and RK3588 execution on both sides of each newly admitted boundary. |
 | E: reduction tiling and tuning | Nonzero initial accumulators, bias/activation/quantization tests; precision/overflow tests; full-model correctness and end-to-end performance measurements. |
+| F: layout contract and prepacked weights (6.1, 6.3) | `OutputCube` computed through `rocket-core::layout` with the driver bit-identical on every surveyed model; packed weight bytes byte-identical to the driver packer on every conv fixture; first-inference latency and `.vmfb` size before and after. |
+| G: compiler-declared layout (6.2) | Per-binding encoding on the wire; driver checks and never repacks a declared-packed input; the chain fixtures bit-exact with `ROCKET_CHAIN`/`ROCKET_LAZY_COMPACT` removed; the audit names every NPU -> NPU edge packed or dense with a reason; `--strict-offload` layout mode. |
 
 Use addressing-sensitive dense/selector inputs, odd channels, multi-surface
 outputs, stride and padding cases, and adjacent NPU producers/consumers.
