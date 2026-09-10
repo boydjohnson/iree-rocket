@@ -1513,6 +1513,14 @@ replace this list:
    that scales with available CPUs, not with dispatches. Only the
    compiler-level half of this item was tested; the driver-level NC1HWC2 round
    trip (P2) is still open, and the profile bounds it at ~10%.
+   **Scope of the refutation, stated 2026-09-09 so it is not over-read:**
+   what was built and measured was transpose propagation
+   (`iree-global-opt-propagate-linalg-transpose`) in a build whose every
+   NPU result went through an `i32` CPU epilogue. It refutes *that*. It does
+   not bear on the driver chain P2 later landed (which is worth 1.24x on
+   ResNet50) nor on the compiler owning the packed layout as an edge
+   encoding, which is COMPILER_ROADMAP.md section 6 and has not been
+   measured at all.
 2. **Epilogue fusion into the Rocket dispatch.** The requantized int8 path
    already does this for requantization -- that is why it returns i8 with no
    CPU epilogue -- and `build_conv_then_add_regcmd` is the same idea for a

@@ -830,6 +830,13 @@ stands and the per-op bar above is still how to judge one.
   subtract, `exp`, a sum reduction and a divide -- four of which land in Phase 1
   and 2, but the reductions have no PPU path outside the pooling window. Revisit
   once the pieces exist.
-- **`linalg.pack` / `unpack`, `transpose`, `broadcast`.** These are layout ops,
-  and P8's lever (1) already measured the layout-propagation approach at **0%**.
-  Adding them as dispatches makes the layout problem worse, not better.
+- **`linalg.pack` / `unpack`, `transpose`, `broadcast` as standalone
+  dispatches.** Each would be one more Rocket dispatch with its own round
+  trip, and P8's law puts it on the wrong side of the line. This bullet used
+  to cite P8's lever (1) as having measured "layout propagation" at 0%; what
+  was measured was `iree-global-opt-propagate-linalg-transpose` on the old
+  `i32`-epilogue build, before the driver chain existed, and it says nothing
+  about the compiler *owning* the packed layout. That is now
+  [COMPILER_ROADMAP.md section 6](COMPILER_ROADMAP.md), and it is not a
+  matcher: the layout is an encoding on the edge, the pack happens only at a
+  CPU boundary, and the driver executes it as it does today.
