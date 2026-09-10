@@ -3,6 +3,7 @@ mod bindings;
 mod cli;
 mod compiler;
 mod decisions;
+mod layout;
 mod report;
 mod spec;
 
@@ -349,11 +350,13 @@ const PIN_PHASE: &str = "flow";
 /// Registered by the compiler plugin; see RocketPinUnclaimedDispatchesPass.cpp.
 const PIN_PASS: &str = "rocket-pin-unclaimed-dispatches";
 
-/// Registered by the compiler plugin; see RocketMarkDenseReadersPass.cpp. Runs
-/// at the same phase as the pin for the same reason: it needs every reader of
-/// a Rocket dispatch's result to be a formed dispatch, and it needs the
-/// dispatch's push constants to still be plain SSA operands.
-const MARK_DENSE_READERS_PASS: &str = "rocket-mark-dense-readers";
+/// Registered by the compiler plugin; see RocketAssignLayoutPass.cpp. Runs at
+/// the same phase as the pin for the same reason: it needs every reader of a
+/// Rocket dispatch's result to be a formed dispatch, and it needs the
+/// dispatch's push constants to still be plain SSA operands. It writes the
+/// `rocket.layout_decisions` record the audit prints (COMPILER_ROADMAP.md
+/// 6.2).
+const ASSIGN_LAYOUT_PASS: &str = "rocket-assign-layout";
 
 /// Registered by the compiler plugin; see RocketPackWeightsPass.cpp. Runs
 /// after the reader count, at the same phase: a filter is a
@@ -375,14 +378,30 @@ const PACK_WEIGHTS_PASS: &str = "rocket-pack-weights";
 /// fails to serialize, so "Rocket runs only what the spec put there" has to
 /// be enforced rather than hoped for, and the only hook a plugin gets --
 /// `extendPreprocessingPassPipeline` -- runs long before dispatches exist.
-fn pin_unclaimed_dispatches(invocation: &Invocation) -> Result<(), Box<dyn Error>> {
+///
+/// When `capture` is set the layout record is read off the IR right after
+/// `rocket-assign-layout` wrote it -- at the phase that produced it, for the
+/// same reason `capture_decisions` reads its record at preprocessing.
+fn pin_unclaimed_dispatches(
+    library: &Library,
+    invocation: &Invocation,
+    capture: bool,
+) -> Result<layout::LayoutRecord, Box<dyn Error>> {
     invocation.set_compile_to_phase(PIN_PHASE);
     invocation.run_pipeline(Pipeline::Std)?;
     invocation.run_pass_pipeline(PIN_PASS)?;
-    invocation.run_pass_pipeline(MARK_DENSE_READERS_PASS)?;
+    invocation.run_pass_pipeline(ASSIGN_LAYOUT_PASS)?;
+    let record = if capture {
+        let output = Output::open_membuffer(library)?;
+        invocation.output_ir(&output)?;
+        let ir_bytes = output.map_memory()?;
+        layout::LayoutRecord::scan(&String::from_utf8_lossy(ir_bytes))
+    } else {
+        layout::LayoutRecord::default()
+    };
     invocation.run_pass_pipeline(PACK_WEIGHTS_PASS)?;
     invocation.set_compile_from_phase(PIN_PHASE);
-    Ok(())
+    Ok(record)
 }
 
 /// The `--no-offload` baseline's last line of defence: after placement is
@@ -417,7 +436,10 @@ fn assert_nothing_offloaded(report: &report::PlacementReport) -> Result<(), Box<
 /// Whether this invocation has to stop at `executable-targets` to look at
 /// the module before finishing the compile.
 fn needs_placement_pass(common: &cli::CommonArgs) -> bool {
-    common.no_offload || common.strict_offload || common.report_json.is_some()
+    common.no_offload
+        || common.strict_offload
+        || common.strict_layout
+        || common.report_json.is_some()
 }
 
 /// Writes the machine-readable report when one was asked for, and applies
@@ -433,6 +455,11 @@ fn deliver_audit(
     }
     if common.strict_offload
         && let Some(failure) = audit.strict_offload_failure()
+    {
+        return Err(failure.into());
+    }
+    if common.strict_layout
+        && let Some(failure) = audit.strict_layout_failure()
     {
         return Err(failure.into());
     }
@@ -473,13 +500,17 @@ fn run_compile(args: &cli::CompileArgs) -> Result<(), Box<dyn Error>> {
     } else {
         decisions::DecisionRecord::default()
     };
-    pin_unclaimed_dispatches(&invocation)?;
+    let layout =
+        pin_unclaimed_dispatches(&library, &invocation, needs_placement_pass(&args.common))?;
     if needs_placement_pass(&args.common) {
         let placement = capture_placement(&library, &invocation, None)?;
         if args.common.no_offload {
             assert_nothing_offloaded(&placement)?;
         }
-        deliver_audit(&args.common, &audit::PlacementAudit::new(record, placement))?;
+        deliver_audit(
+            &args.common,
+            &audit::PlacementAudit::new(record, layout, placement),
+        )?;
     }
     invocation.set_compile_to_phase("end");
     invocation.run_pipeline(Pipeline::Std)?;
@@ -511,10 +542,10 @@ fn run_audit(args: &cli::AuditArgs) -> Result<(), Box<dyn Error>> {
     let record = capture_decisions(&library, &invocation)?;
     // Same staging as `compile`, so the report describes the placement a
     // .vmfb from this input would actually get.
-    pin_unclaimed_dispatches(&invocation)?;
+    let layout = pin_unclaimed_dispatches(&library, &invocation, true)?;
     let placement = capture_placement(&library, &invocation, args.emit_ir.as_deref())?;
 
-    let audit = audit::PlacementAudit::new(record, placement);
+    let audit = audit::PlacementAudit::new(record, layout, placement);
     print!("{audit}");
     deliver_audit(&args.common, &audit)?;
     Ok(())
@@ -533,6 +564,7 @@ mod tests {
             elementwise: false,
             batch_matmul: false,
             strict_offload: false,
+            strict_layout: false,
             report_json: None,
             rocket_device_name: rocket.to_string(),
             cpu_device_name: cpu.to_string(),

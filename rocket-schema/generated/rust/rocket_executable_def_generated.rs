@@ -1260,6 +1260,7 @@ impl<'a> Conv2DDef<'a> {
   pub const VT_EPILOGUE_ACTIVATION: flatbuffers::VOffsetT = 54;
   pub const VT_RUNTIME_DENSE_READERS: flatbuffers::VOffsetT = 56;
   pub const VT_WEIGHTS_PACKED: flatbuffers::VOffsetT = 58;
+  pub const VT_RUNTIME_LAYOUT: flatbuffers::VOffsetT = 60;
 
   #[inline]
   pub fn init_from_table(table: flatbuffers::Table<'a>) -> Self {
@@ -1292,6 +1293,7 @@ impl<'a> Conv2DDef<'a> {
     builder.add_input_channels(args.input_channels);
     builder.add_input_height(args.input_height);
     builder.add_input_width(args.input_width);
+    builder.add_runtime_layout(args.runtime_layout);
     builder.add_weights_packed(args.weights_packed);
     builder.add_runtime_dense_readers(args.runtime_dense_readers);
     builder.add_epilogue_activation(args.epilogue_activation);
@@ -1415,6 +1417,10 @@ impl<'a> Conv2DDef<'a> {
   pub fn weights_packed(&self) -> bool {
     self._tab.get::<bool>(Conv2DDef::VT_WEIGHTS_PACKED, Some(false)).unwrap()
   }
+  #[inline]
+  pub fn runtime_layout(&self) -> bool {
+    self._tab.get::<bool>(Conv2DDef::VT_RUNTIME_LAYOUT, Some(false)).unwrap()
+  }
 }
 
 impl flatbuffers::Verifiable for Conv2DDef<'_> {
@@ -1452,6 +1458,7 @@ impl flatbuffers::Verifiable for Conv2DDef<'_> {
      .visit_field::<Activation>("epilogue_activation", Self::VT_EPILOGUE_ACTIVATION, false)?
      .visit_field::<bool>("runtime_dense_readers", Self::VT_RUNTIME_DENSE_READERS, false)?
      .visit_field::<bool>("weights_packed", Self::VT_WEIGHTS_PACKED, false)?
+     .visit_field::<bool>("runtime_layout", Self::VT_RUNTIME_LAYOUT, false)?
      .finish();
     Ok(())
   }
@@ -1485,6 +1492,7 @@ pub struct Conv2DDefArgs<'a> {
     pub epilogue_activation: Activation,
     pub runtime_dense_readers: bool,
     pub weights_packed: bool,
+    pub runtime_layout: bool,
 }
 impl<'a> Default for Conv2DDefArgs<'a> {
   #[inline]
@@ -1518,6 +1526,7 @@ impl<'a> Default for Conv2DDefArgs<'a> {
       epilogue_activation: Activation::NONE,
       runtime_dense_readers: false,
       weights_packed: false,
+      runtime_layout: false,
     }
   }
 }
@@ -1640,6 +1649,10 @@ impl<'a: 'b, 'b> Conv2DDefBuilder<'a, 'b> {
     self.fbb_.push_slot::<bool>(Conv2DDef::VT_WEIGHTS_PACKED, weights_packed, false);
   }
   #[inline]
+  pub fn add_runtime_layout(&mut self, runtime_layout: bool) {
+    self.fbb_.push_slot::<bool>(Conv2DDef::VT_RUNTIME_LAYOUT, runtime_layout, false);
+  }
+  #[inline]
   pub fn new(_fbb: &'b mut flatbuffers::FlatBufferBuilder<'a>) -> Conv2DDefBuilder<'a, 'b> {
     let start = _fbb.start_table();
     Conv2DDefBuilder {
@@ -1685,6 +1698,7 @@ impl core::fmt::Debug for Conv2DDef<'_> {
       ds.field("epilogue_activation", &self.epilogue_activation());
       ds.field("runtime_dense_readers", &self.runtime_dense_readers());
       ds.field("weights_packed", &self.weights_packed());
+      ds.field("runtime_layout", &self.runtime_layout());
       ds.finish()
   }
 }
@@ -1983,6 +1997,7 @@ impl<'a> PoolingDef<'a> {
   pub const VT_PRECISION: flatbuffers::VOffsetT = 32;
   pub const VT_RUNTIME_DIMENSIONS: flatbuffers::VOffsetT = 34;
   pub const VT_RUNTIME_DENSE_READERS: flatbuffers::VOffsetT = 36;
+  pub const VT_RUNTIME_LAYOUT: flatbuffers::VOffsetT = 38;
 
   #[inline]
   pub fn init_from_table(table: flatbuffers::Table<'a>) -> Self {
@@ -2008,6 +2023,7 @@ impl<'a> PoolingDef<'a> {
     builder.add_channels(args.channels);
     builder.add_input_height(args.input_height);
     builder.add_input_width(args.input_width);
+    builder.add_runtime_layout(args.runtime_layout);
     builder.add_runtime_dense_readers(args.runtime_dense_readers);
     builder.add_precision(args.precision);
     builder.add_method(args.method);
@@ -2083,6 +2099,10 @@ impl<'a> PoolingDef<'a> {
   pub fn runtime_dense_readers(&self) -> bool {
     self._tab.get::<bool>(PoolingDef::VT_RUNTIME_DENSE_READERS, Some(false)).unwrap()
   }
+  #[inline]
+  pub fn runtime_layout(&self) -> bool {
+    self._tab.get::<bool>(PoolingDef::VT_RUNTIME_LAYOUT, Some(false)).unwrap()
+  }
 }
 
 impl flatbuffers::Verifiable for PoolingDef<'_> {
@@ -2109,6 +2129,7 @@ impl flatbuffers::Verifiable for PoolingDef<'_> {
      .visit_field::<Precision>("precision", Self::VT_PRECISION, false)?
      .visit_field::<flatbuffers::ForwardsUOffset<flatbuffers::Vector<'_, PoolingDimension>>>("runtime_dimensions", Self::VT_RUNTIME_DIMENSIONS, false)?
      .visit_field::<bool>("runtime_dense_readers", Self::VT_RUNTIME_DENSE_READERS, false)?
+     .visit_field::<bool>("runtime_layout", Self::VT_RUNTIME_LAYOUT, false)?
      .finish();
     Ok(())
   }
@@ -2131,6 +2152,7 @@ pub struct PoolingDefArgs<'a> {
     pub precision: Precision,
     pub runtime_dimensions: Option<flatbuffers::WIPOffset<flatbuffers::Vector<'a, PoolingDimension>>>,
     pub runtime_dense_readers: bool,
+    pub runtime_layout: bool,
 }
 impl<'a> Default for PoolingDefArgs<'a> {
   #[inline]
@@ -2153,6 +2175,7 @@ impl<'a> Default for PoolingDefArgs<'a> {
       precision: Precision::INT8,
       runtime_dimensions: None,
       runtime_dense_readers: false,
+      runtime_layout: false,
     }
   }
 }
@@ -2231,6 +2254,10 @@ impl<'a: 'b, 'b> PoolingDefBuilder<'a, 'b> {
     self.fbb_.push_slot::<bool>(PoolingDef::VT_RUNTIME_DENSE_READERS, runtime_dense_readers, false);
   }
   #[inline]
+  pub fn add_runtime_layout(&mut self, runtime_layout: bool) {
+    self.fbb_.push_slot::<bool>(PoolingDef::VT_RUNTIME_LAYOUT, runtime_layout, false);
+  }
+  #[inline]
   pub fn new(_fbb: &'b mut flatbuffers::FlatBufferBuilder<'a>) -> PoolingDefBuilder<'a, 'b> {
     let start = _fbb.start_table();
     PoolingDefBuilder {
@@ -2265,6 +2292,7 @@ impl core::fmt::Debug for PoolingDef<'_> {
       ds.field("precision", &self.precision());
       ds.field("runtime_dimensions", &self.runtime_dimensions());
       ds.field("runtime_dense_readers", &self.runtime_dense_readers());
+      ds.field("runtime_layout", &self.runtime_layout());
       ds.finish()
   }
 }
@@ -2300,6 +2328,7 @@ impl<'a> MatmulDef<'a> {
   pub const VT_RUNTIME_DIMENSIONS: flatbuffers::VOffsetT = 30;
   pub const VT_RUNTIME_DENSE_READERS: flatbuffers::VOffsetT = 32;
   pub const VT_WEIGHTS_PACKED: flatbuffers::VOffsetT = 34;
+  pub const VT_RUNTIME_LAYOUT: flatbuffers::VOffsetT = 36;
 
   #[inline]
   pub fn init_from_table(table: flatbuffers::Table<'a>) -> Self {
@@ -2323,6 +2352,7 @@ impl<'a> MatmulDef<'a> {
     builder.add_n(args.n);
     builder.add_k(args.k);
     builder.add_m(args.m);
+    builder.add_runtime_layout(args.runtime_layout);
     builder.add_weights_packed(args.weights_packed);
     builder.add_runtime_dense_readers(args.runtime_dense_readers);
     builder.add_precision(args.precision);
@@ -2395,6 +2425,10 @@ impl<'a> MatmulDef<'a> {
   pub fn weights_packed(&self) -> bool {
     self._tab.get::<bool>(MatmulDef::VT_WEIGHTS_PACKED, Some(false)).unwrap()
   }
+  #[inline]
+  pub fn runtime_layout(&self) -> bool {
+    self._tab.get::<bool>(MatmulDef::VT_RUNTIME_LAYOUT, Some(false)).unwrap()
+  }
 }
 
 impl flatbuffers::Verifiable for MatmulDef<'_> {
@@ -2420,6 +2454,7 @@ impl flatbuffers::Verifiable for MatmulDef<'_> {
      .visit_field::<flatbuffers::ForwardsUOffset<flatbuffers::Vector<'_, MatmulDimension>>>("runtime_dimensions", Self::VT_RUNTIME_DIMENSIONS, false)?
      .visit_field::<bool>("runtime_dense_readers", Self::VT_RUNTIME_DENSE_READERS, false)?
      .visit_field::<bool>("weights_packed", Self::VT_WEIGHTS_PACKED, false)?
+     .visit_field::<bool>("runtime_layout", Self::VT_RUNTIME_LAYOUT, false)?
      .finish();
     Ok(())
   }
@@ -2441,6 +2476,7 @@ pub struct MatmulDefArgs<'a> {
     pub runtime_dimensions: Option<flatbuffers::WIPOffset<flatbuffers::Vector<'a, MatmulDimension>>>,
     pub runtime_dense_readers: bool,
     pub weights_packed: bool,
+    pub runtime_layout: bool,
 }
 impl<'a> Default for MatmulDefArgs<'a> {
   #[inline]
@@ -2462,6 +2498,7 @@ impl<'a> Default for MatmulDefArgs<'a> {
       runtime_dimensions: None,
       runtime_dense_readers: false,
       weights_packed: false,
+      runtime_layout: false,
     }
   }
 }
@@ -2536,6 +2573,10 @@ impl<'a: 'b, 'b> MatmulDefBuilder<'a, 'b> {
     self.fbb_.push_slot::<bool>(MatmulDef::VT_WEIGHTS_PACKED, weights_packed, false);
   }
   #[inline]
+  pub fn add_runtime_layout(&mut self, runtime_layout: bool) {
+    self.fbb_.push_slot::<bool>(MatmulDef::VT_RUNTIME_LAYOUT, runtime_layout, false);
+  }
+  #[inline]
   pub fn new(_fbb: &'b mut flatbuffers::FlatBufferBuilder<'a>) -> MatmulDefBuilder<'a, 'b> {
     let start = _fbb.start_table();
     MatmulDefBuilder {
@@ -2569,6 +2610,7 @@ impl core::fmt::Debug for MatmulDef<'_> {
       ds.field("runtime_dimensions", &self.runtime_dimensions());
       ds.field("runtime_dense_readers", &self.runtime_dense_readers());
       ds.field("weights_packed", &self.weights_packed());
+      ds.field("runtime_layout", &self.runtime_layout());
       ds.finish()
   }
 }
@@ -2595,6 +2637,7 @@ impl<'a> ElementwiseUnaryDef<'a> {
   pub const VT_OPERAND: flatbuffers::VOffsetT = 12;
   pub const VT_RUNTIME_DIMENSIONS: flatbuffers::VOffsetT = 14;
   pub const VT_RUNTIME_DENSE_READERS: flatbuffers::VOffsetT = 16;
+  pub const VT_RUNTIME_LAYOUT: flatbuffers::VOffsetT = 18;
 
   #[inline]
   pub fn init_from_table(table: flatbuffers::Table<'a>) -> Self {
@@ -2611,6 +2654,7 @@ impl<'a> ElementwiseUnaryDef<'a> {
     builder.add_channels(args.channels);
     builder.add_height(args.height);
     builder.add_width(args.width);
+    builder.add_runtime_layout(args.runtime_layout);
     builder.add_runtime_dense_readers(args.runtime_dense_readers);
     builder.add_op(args.op);
     builder.finish()
@@ -2645,6 +2689,10 @@ impl<'a> ElementwiseUnaryDef<'a> {
   pub fn runtime_dense_readers(&self) -> bool {
     self._tab.get::<bool>(ElementwiseUnaryDef::VT_RUNTIME_DENSE_READERS, Some(false)).unwrap()
   }
+  #[inline]
+  pub fn runtime_layout(&self) -> bool {
+    self._tab.get::<bool>(ElementwiseUnaryDef::VT_RUNTIME_LAYOUT, Some(false)).unwrap()
+  }
 }
 
 impl flatbuffers::Verifiable for ElementwiseUnaryDef<'_> {
@@ -2661,6 +2709,7 @@ impl flatbuffers::Verifiable for ElementwiseUnaryDef<'_> {
      .visit_field::<u32>("operand", Self::VT_OPERAND, false)?
      .visit_field::<flatbuffers::ForwardsUOffset<flatbuffers::Vector<'_, ElementwiseDimension>>>("runtime_dimensions", Self::VT_RUNTIME_DIMENSIONS, false)?
      .visit_field::<bool>("runtime_dense_readers", Self::VT_RUNTIME_DENSE_READERS, false)?
+     .visit_field::<bool>("runtime_layout", Self::VT_RUNTIME_LAYOUT, false)?
      .finish();
     Ok(())
   }
@@ -2673,6 +2722,7 @@ pub struct ElementwiseUnaryDefArgs<'a> {
     pub operand: u32,
     pub runtime_dimensions: Option<flatbuffers::WIPOffset<flatbuffers::Vector<'a, ElementwiseDimension>>>,
     pub runtime_dense_readers: bool,
+    pub runtime_layout: bool,
 }
 impl<'a> Default for ElementwiseUnaryDefArgs<'a> {
   #[inline]
@@ -2685,6 +2735,7 @@ impl<'a> Default for ElementwiseUnaryDefArgs<'a> {
       operand: 0,
       runtime_dimensions: None,
       runtime_dense_readers: false,
+      runtime_layout: false,
     }
   }
 }
@@ -2723,6 +2774,10 @@ impl<'a: 'b, 'b> ElementwiseUnaryDefBuilder<'a, 'b> {
     self.fbb_.push_slot::<bool>(ElementwiseUnaryDef::VT_RUNTIME_DENSE_READERS, runtime_dense_readers, false);
   }
   #[inline]
+  pub fn add_runtime_layout(&mut self, runtime_layout: bool) {
+    self.fbb_.push_slot::<bool>(ElementwiseUnaryDef::VT_RUNTIME_LAYOUT, runtime_layout, false);
+  }
+  #[inline]
   pub fn new(_fbb: &'b mut flatbuffers::FlatBufferBuilder<'a>) -> ElementwiseUnaryDefBuilder<'a, 'b> {
     let start = _fbb.start_table();
     ElementwiseUnaryDefBuilder {
@@ -2747,6 +2802,7 @@ impl core::fmt::Debug for ElementwiseUnaryDef<'_> {
       ds.field("operand", &self.operand());
       ds.field("runtime_dimensions", &self.runtime_dimensions());
       ds.field("runtime_dense_readers", &self.runtime_dense_readers());
+      ds.field("runtime_layout", &self.runtime_layout());
       ds.finish()
   }
 }
@@ -2772,6 +2828,7 @@ impl<'a> ElementwiseBinaryDef<'a> {
   pub const VT_OP: flatbuffers::VOffsetT = 10;
   pub const VT_RUNTIME_DIMENSIONS: flatbuffers::VOffsetT = 12;
   pub const VT_RUNTIME_DENSE_READERS: flatbuffers::VOffsetT = 14;
+  pub const VT_RUNTIME_LAYOUT: flatbuffers::VOffsetT = 16;
 
   #[inline]
   pub fn init_from_table(table: flatbuffers::Table<'a>) -> Self {
@@ -2787,6 +2844,7 @@ impl<'a> ElementwiseBinaryDef<'a> {
     builder.add_channels(args.channels);
     builder.add_height(args.height);
     builder.add_width(args.width);
+    builder.add_runtime_layout(args.runtime_layout);
     builder.add_runtime_dense_readers(args.runtime_dense_readers);
     builder.add_op(args.op);
     builder.finish()
@@ -2817,6 +2875,10 @@ impl<'a> ElementwiseBinaryDef<'a> {
   pub fn runtime_dense_readers(&self) -> bool {
     self._tab.get::<bool>(ElementwiseBinaryDef::VT_RUNTIME_DENSE_READERS, Some(false)).unwrap()
   }
+  #[inline]
+  pub fn runtime_layout(&self) -> bool {
+    self._tab.get::<bool>(ElementwiseBinaryDef::VT_RUNTIME_LAYOUT, Some(false)).unwrap()
+  }
 }
 
 impl flatbuffers::Verifiable for ElementwiseBinaryDef<'_> {
@@ -2832,6 +2894,7 @@ impl flatbuffers::Verifiable for ElementwiseBinaryDef<'_> {
      .visit_field::<EwBinaryOp>("op", Self::VT_OP, false)?
      .visit_field::<flatbuffers::ForwardsUOffset<flatbuffers::Vector<'_, ElementwiseDimension>>>("runtime_dimensions", Self::VT_RUNTIME_DIMENSIONS, false)?
      .visit_field::<bool>("runtime_dense_readers", Self::VT_RUNTIME_DENSE_READERS, false)?
+     .visit_field::<bool>("runtime_layout", Self::VT_RUNTIME_LAYOUT, false)?
      .finish();
     Ok(())
   }
@@ -2843,6 +2906,7 @@ pub struct ElementwiseBinaryDefArgs<'a> {
     pub op: EwBinaryOp,
     pub runtime_dimensions: Option<flatbuffers::WIPOffset<flatbuffers::Vector<'a, ElementwiseDimension>>>,
     pub runtime_dense_readers: bool,
+    pub runtime_layout: bool,
 }
 impl<'a> Default for ElementwiseBinaryDefArgs<'a> {
   #[inline]
@@ -2854,6 +2918,7 @@ impl<'a> Default for ElementwiseBinaryDefArgs<'a> {
       op: EwBinaryOp::ADD,
       runtime_dimensions: None,
       runtime_dense_readers: false,
+      runtime_layout: false,
     }
   }
 }
@@ -2888,6 +2953,10 @@ impl<'a: 'b, 'b> ElementwiseBinaryDefBuilder<'a, 'b> {
     self.fbb_.push_slot::<bool>(ElementwiseBinaryDef::VT_RUNTIME_DENSE_READERS, runtime_dense_readers, false);
   }
   #[inline]
+  pub fn add_runtime_layout(&mut self, runtime_layout: bool) {
+    self.fbb_.push_slot::<bool>(ElementwiseBinaryDef::VT_RUNTIME_LAYOUT, runtime_layout, false);
+  }
+  #[inline]
   pub fn new(_fbb: &'b mut flatbuffers::FlatBufferBuilder<'a>) -> ElementwiseBinaryDefBuilder<'a, 'b> {
     let start = _fbb.start_table();
     ElementwiseBinaryDefBuilder {
@@ -2911,6 +2980,7 @@ impl core::fmt::Debug for ElementwiseBinaryDef<'_> {
       ds.field("op", &self.op());
       ds.field("runtime_dimensions", &self.runtime_dimensions());
       ds.field("runtime_dense_readers", &self.runtime_dense_readers());
+      ds.field("runtime_layout", &self.runtime_layout());
       ds.finish()
   }
 }
@@ -2940,6 +3010,7 @@ impl<'a> ElementwiseLutDef<'a> {
   pub const VT_OUTPUT_SCALE: flatbuffers::VOffsetT = 18;
   pub const VT_RUNTIME_DIMENSIONS: flatbuffers::VOffsetT = 20;
   pub const VT_RUNTIME_DENSE_READERS: flatbuffers::VOffsetT = 22;
+  pub const VT_RUNTIME_LAYOUT: flatbuffers::VOffsetT = 24;
 
   #[inline]
   pub fn init_from_table(table: flatbuffers::Table<'a>) -> Self {
@@ -2959,6 +3030,7 @@ impl<'a> ElementwiseLutDef<'a> {
     builder.add_channels(args.channels);
     builder.add_height(args.height);
     builder.add_width(args.width);
+    builder.add_runtime_layout(args.runtime_layout);
     builder.add_runtime_dense_readers(args.runtime_dense_readers);
     builder.add_fn_(args.fn_);
     builder.finish()
@@ -3005,6 +3077,10 @@ impl<'a> ElementwiseLutDef<'a> {
   pub fn runtime_dense_readers(&self) -> bool {
     self._tab.get::<bool>(ElementwiseLutDef::VT_RUNTIME_DENSE_READERS, Some(false)).unwrap()
   }
+  #[inline]
+  pub fn runtime_layout(&self) -> bool {
+    self._tab.get::<bool>(ElementwiseLutDef::VT_RUNTIME_LAYOUT, Some(false)).unwrap()
+  }
 }
 
 impl flatbuffers::Verifiable for ElementwiseLutDef<'_> {
@@ -3024,6 +3100,7 @@ impl flatbuffers::Verifiable for ElementwiseLutDef<'_> {
      .visit_field::<f32>("output_scale", Self::VT_OUTPUT_SCALE, false)?
      .visit_field::<flatbuffers::ForwardsUOffset<flatbuffers::Vector<'_, ElementwiseDimension>>>("runtime_dimensions", Self::VT_RUNTIME_DIMENSIONS, false)?
      .visit_field::<bool>("runtime_dense_readers", Self::VT_RUNTIME_DENSE_READERS, false)?
+     .visit_field::<bool>("runtime_layout", Self::VT_RUNTIME_LAYOUT, false)?
      .finish();
     Ok(())
   }
@@ -3039,6 +3116,7 @@ pub struct ElementwiseLutDefArgs<'a> {
     pub output_scale: f32,
     pub runtime_dimensions: Option<flatbuffers::WIPOffset<flatbuffers::Vector<'a, ElementwiseDimension>>>,
     pub runtime_dense_readers: bool,
+    pub runtime_layout: bool,
 }
 impl<'a> Default for ElementwiseLutDefArgs<'a> {
   #[inline]
@@ -3054,6 +3132,7 @@ impl<'a> Default for ElementwiseLutDefArgs<'a> {
       output_scale: 1.0,
       runtime_dimensions: None,
       runtime_dense_readers: false,
+      runtime_layout: false,
     }
   }
 }
@@ -3104,6 +3183,10 @@ impl<'a: 'b, 'b> ElementwiseLutDefBuilder<'a, 'b> {
     self.fbb_.push_slot::<bool>(ElementwiseLutDef::VT_RUNTIME_DENSE_READERS, runtime_dense_readers, false);
   }
   #[inline]
+  pub fn add_runtime_layout(&mut self, runtime_layout: bool) {
+    self.fbb_.push_slot::<bool>(ElementwiseLutDef::VT_RUNTIME_LAYOUT, runtime_layout, false);
+  }
+  #[inline]
   pub fn new(_fbb: &'b mut flatbuffers::FlatBufferBuilder<'a>) -> ElementwiseLutDefBuilder<'a, 'b> {
     let start = _fbb.start_table();
     ElementwiseLutDefBuilder {
@@ -3131,6 +3214,7 @@ impl core::fmt::Debug for ElementwiseLutDef<'_> {
       ds.field("output_scale", &self.output_scale());
       ds.field("runtime_dimensions", &self.runtime_dimensions());
       ds.field("runtime_dense_readers", &self.runtime_dense_readers());
+      ds.field("runtime_layout", &self.runtime_layout());
       ds.finish()
   }
 }

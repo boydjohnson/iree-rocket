@@ -135,7 +135,7 @@ const DECISIONS_ATTR: &str = "rocket.plan_decisions = ";
 /// Collects `#loc12 = loc("f.mlir":3:4)` alias definitions. MLIR prints a
 /// location inline the first time and as an alias when it is reused, so a
 /// record whose ops share a location would otherwise read as `#loc7`.
-fn location_aliases(ir_text: &str) -> BTreeMap<String, String> {
+pub(crate) fn location_aliases(ir_text: &str) -> BTreeMap<String, String> {
     let mut aliases = BTreeMap::new();
     for line in ir_text.lines() {
         let trimmed = line.trim_start();
@@ -193,7 +193,7 @@ fn parse_decision(function: &str, entry: &str, aliases: &BTreeMap<String, String
 /// `loc("model.mlir":42:7)` -> `model.mlir:42:7`. A fused or callsite
 /// location keeps its first file/line/column, which is the one a reader
 /// wants; anything else reads as `unknown`.
-fn format_location(text: &str) -> String {
+pub(crate) fn format_location(text: &str) -> String {
     let Some(open) = text.find('"') else {
         return "unknown".to_string();
     };
@@ -222,7 +222,7 @@ fn format_location(text: &str) -> String {
 /// executable after its source function, and an ONNX import's entry point is
 /// commonly `torch-jit-export$async`, whose `-` forces MLIR to quote the
 /// symbol.
-fn symbol_name(text: &str) -> Option<String> {
+pub(crate) fn symbol_name(text: &str) -> Option<String> {
     let start = text.find('@')? + 1;
     let rest = &text[start..];
     if let Some(quoted) = rest.strip_prefix('"') {
@@ -235,7 +235,7 @@ fn symbol_name(text: &str) -> Option<String> {
     Some(rest[..end].to_string())
 }
 
-fn unquote(value: &str) -> String {
+pub(crate) fn unquote(value: &str) -> String {
     let Some(rest) = value.strip_prefix('"') else {
         return value.to_string();
     };
@@ -257,7 +257,7 @@ fn unquote(value: &str) -> String {
 }
 
 /// `6 : i64` -> 6.
-fn leading_integer(value: &str) -> i64 {
+pub(crate) fn leading_integer(value: &str) -> i64 {
     let digits: String = value
         .chars()
         .take_while(|c| c.is_ascii_digit() || *c == '-')
@@ -268,7 +268,7 @@ fn leading_integer(value: &str) -> i64 {
 /// The text between `open` and its matching `close`, given `text` starts at
 /// or before the `open`. Skips string literals so a bracket inside one does
 /// not count.
-fn balanced(text: &str, open: char, close: char) -> Option<&str> {
+pub(crate) fn balanced(text: &str, open: char, close: char) -> Option<&str> {
     let start = text.find(open)?;
     let mut depth = 0usize;
     let mut in_string = false;
@@ -300,7 +300,7 @@ fn balanced(text: &str, open: char, close: char) -> Option<&str> {
 }
 
 /// Every `open`..`close` group at the top nesting level of `text`.
-fn top_level_groups(text: &str, open: char, close: char) -> Vec<&str> {
+pub(crate) fn top_level_groups(text: &str, open: char, close: char) -> Vec<&str> {
     let mut groups = Vec::new();
     let mut cursor = 0usize;
     while cursor < text.len() {
@@ -320,7 +320,7 @@ fn top_level_groups(text: &str, open: char, close: char) -> Vec<&str> {
 
 /// Splits `text` on `separator`, ignoring separators inside brackets,
 /// parentheses, braces or string literals.
-fn top_level_split(text: &str, separator: char) -> Vec<&str> {
+pub(crate) fn top_level_split(text: &str, separator: char) -> Vec<&str> {
     let mut parts = Vec::new();
     let mut depth = 0usize;
     let mut in_string = false;

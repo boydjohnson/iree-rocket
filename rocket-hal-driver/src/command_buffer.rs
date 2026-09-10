@@ -100,7 +100,7 @@ use iree_rocket_hal::rocket::{
         build_add_regcmd_with_relu, build_unary_regcmd,
     },
     fc,
-    layout::{ChainRefusal, CubeGeometry, CubeKind, chain_identity, cube_geometry},
+    layout::{CubeGeometry, CubeKind, DispatchLayout, chain_identity, cube_geometry},
     pooling::{PoolingBuffers, PoolingPlan},
     tensor_layout::{
         nc1hwc2_storage_size, pack_fp16_bias_to_rocket, pack_nhwc_to_nc1hwc2_padded,
@@ -300,47 +300,25 @@ fn fanout_enabled() -> bool {
     *ENABLED.get_or_init(|| std::env::var("ROCKET_FANOUT").map_or(true, |value| value != "0"))
 }
 
-/// Whether a dispatch may read a preceding dispatch's output cube in place
-/// instead of repacking the dense buffer that cube was compacted into
-/// (`ROCKET_CHAIN=0` restores the unconditional repack). `ROCKET_CHAIN=debug`
-/// additionally names every edge it takes and every one it declines, which is
-/// the only way to tell "the shape does not qualify" from "no producer was
-/// found" -- see [`chainable_cube`]. ISSUES.md P2 step 2.
-fn chain_enabled() -> bool {
-    static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *ENABLED.get_or_init(|| std::env::var("ROCKET_CHAIN").map_or(true, |value| value != "0"))
-}
-
-fn chain_debug() -> bool {
+/// `ROCKET_LAYOUT=debug` names every chain edge the compiler declared and
+/// what the runtime did with it, and every dense-write decision. There is
+/// no off switch any more: which inputs read a producer's cube and which
+/// dispatches skip their dense write are the compiler's declarations
+/// (`rocket-assign-layout`, the trailing layout push constant), and the
+/// runtime checks them rather than deciding for itself -- COMPILER_ROADMAP.md
+/// 6.2, the first form. A `.vmfb` built without the declaration says
+/// "all dense", which is the behaviour the retired `ROCKET_CHAIN=0` gave.
+fn layout_debug() -> bool {
     static DEBUG: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *DEBUG.get_or_init(|| std::env::var("ROCKET_CHAIN").is_ok_and(|value| value == "debug"))
-}
-
-/// Whether a dispatch may skip writing its dense output buffer when the
-/// compiler counted its readers and every one of them chained to its output
-/// cube on this command buffer (`ROCKET_LAZY_COMPACT=0` restores the
-/// unconditional compaction, `=debug` names every decision). The count comes
-/// down as the last push constant (`Conv2DDef.runtime_dense_readers`); see
-/// [`compaction_elidable`] for the rule and ISSUES.md P2 for why the signal
-/// has to come from the compiler.
-fn lazy_compact_enabled() -> bool {
-    static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *ENABLED.get_or_init(|| {
-        chain_enabled() && std::env::var("ROCKET_LAZY_COMPACT").map_or(true, |value| value != "0")
-    })
-}
-
-fn lazy_compact_debug() -> bool {
-    static DEBUG: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *DEBUG.get_or_init(|| std::env::var("ROCKET_LAZY_COMPACT").is_ok_and(|value| value == "debug"))
+    *DEBUG.get_or_init(|| std::env::var("ROCKET_LAYOUT").is_ok_and(|value| value == "debug"))
 }
 
 /// The one rule that decides whether a dispatch's dense output write can be
 /// skipped, kept pure so it can be pinned by a test.
 ///
-/// `dense_readers` is the compiler's count of Rocket dispatches that read the
-/// result in the final program, or 0 if it saw any other reader or did not
-/// count. `chained_readers` is how many consumers on this command buffer took
+/// `dense_readers` is the compiler's count of Rocket dispatches declared to
+/// read the result's cube in place (`DispatchLayout::packed_readers`), or 0
+/// if it saw any other reader or did not count. `chained_readers` is how many consumers on this command buffer took
 /// the output cube in place; `dense_read_seen` is whether anything recorded
 /// on this command buffer read the dense bytes instead (a consumer that
 /// declined to chain, a dispatch kind that cannot chain, a copy).
@@ -593,10 +571,23 @@ unsafe fn dma_range(
 /// - a whole number of 16-byte atoms per pixel, since a partial trailing atom
 ///   is zeroed by the repack and holds the producer's padding channels here.
 ///
-/// `consumer` is the cube this dispatch would pack its input to; the
-/// identity itself is `rocket_core::layout::chain_identity`, and this
-/// function adds only what the runtime alone knows -- which recorded write
-/// produced the bytes, and whether it published a cube.
+/// `consumer` is the cube this dispatch would pack its input to and
+/// `declared` whether the compiler said this input reads its producer's cube
+/// (`DispatchLayout::input_packed`, COMPILER_ROADMAP.md 6.2). The identity
+/// itself is `rocket_core::layout::chain_identity`, computed by the compiler
+/// from the same shapes; this function adds only what the runtime alone
+/// knows -- which recorded write produced the bytes, and whether it
+/// published a cube -- and *checks* the declaration:
+///
+/// - not declared: the dense bytes are read, no producer is looked for;
+/// - declared, and the producer is on this command buffer with a cube: the
+///   geometries must agree, or the compiler and runtime disagree about a
+///   shape and the dispatch fails `INTERNAL` rather than silently repacking;
+/// - declared, but the producer is on an earlier command buffer, or fanned
+///   out and published no single cube, or the most recent writer of these
+///   bytes is not a dispatch: the first form's permitted fallback. The
+///   producer kept its dense write in every one of those cases (its own
+///   tally of chained readers stayed short), so the repack reads real bytes.
 ///
 /// # Safety
 ///
@@ -607,57 +598,59 @@ fn chainable_cube(
     cb: &mut RocketCommandBuffer,
     binding: &iree_hal_buffer_ref_t,
     consumer: CubeGeometry,
+    declared: bool,
     what: &str,
-) -> Option<OutputCube> {
-    if !chain_enabled() || binding.buffer.is_null() {
-        return None;
+) -> Result<Option<OutputCube>, iree_status_t> {
+    if !declared || binding.buffer.is_null() {
+        return Ok(None);
     }
-    // A consumer that pads its channels, or whose pixel is a partial atom,
-    // cannot alias a producer cube however well the producer matches.
     if let Err(refusal) = consumer.can_chain() {
-        if chain_debug() {
-            eprintln!("rocket: chain declined ({what}): {refusal}");
-        }
-        return None;
+        eprintln!(
+            "rocket: INTERNAL: {what} was declared packed but its own geometry cannot read a \
+             cube: {refusal}"
+        );
+        return Err(status::from_code(
+            crate::bindings::iree_status_code_e_IREE_STATUS_INTERNAL,
+        ));
     }
     // The most recent write that overlaps the bytes this dispatch reads.
     // Writes to other regions of the same allocation are neighbouring
     // tensors, not blockers, so they are skipped rather than declined on.
-    let want = unsafe {
+    let Some(want) = (unsafe {
         dma_range(
             binding.buffer,
             binding.offset,
             consumer.pixel_count * consumer.bytes_per_pixel,
         )
-    }?;
+    }) else {
+        return Ok(None);
+    };
     let Some((producer_index, producer)) = cb.ops.iter().enumerate().rev().find(|(_, op)| {
         recorded_write_extent(op)
             .and_then(|(buffer, offset, length)| unsafe { dma_range(buffer, offset, length) })
             .is_some_and(|wrote| wrote.0 < want.1 && want.0 < wrote.1)
     }) else {
-        // Nothing on this command buffer wrote these bytes: they came from
-        // outside -- an upload, a CPU dispatch, an earlier submission. The
-        // commonest reason not to chain, and worth telling apart from a
-        // producer whose cube does not qualify.
-        if chain_debug() {
-            eprintln!("rocket: chain declined ({what}): no producer on this command buffer");
+        if layout_debug() {
+            eprintln!(
+                "rocket: layout ({what}): declared packed, but the producer is not on this \
+                 command buffer; repacking its dense write"
+            );
         }
-        return None;
+        return Ok(None);
     };
     let RecordedOp::Dispatch {
         output_cube: Some(cube),
         ..
     } = producer
     else {
-        if chain_debug() {
-            eprintln!("rocket: chain declined ({what}): producer offers no cube");
+        if layout_debug() {
+            eprintln!(
+                "rocket: layout ({what}): declared packed, but the producer published no cube \
+                 (fanned out, or not a dispatch); repacking its dense write"
+            );
         }
-        return None;
+        return Ok(None);
     };
-    // Overlapping is not enough: the producer must have written exactly the
-    // region this dispatch reads, in the geometry it would have packed --
-    // the identity `rocket_core::layout::chain_identity` states and
-    // `tensor_layout.rs`'s `chain_identity_tests` pin to the bytes.
     let same_bytes = unsafe {
         dma_range(
             cube.dense_buffer,
@@ -665,34 +658,34 @@ fn chainable_cube(
             cube.geometry.pixel_count * cube.geometry.bytes_per_pixel,
         )
     } == Some(want);
-    let verdict: Result<(), Option<ChainRefusal>> = if same_bytes {
-        chain_identity(&cube.geometry, &consumer).map_err(Some)
-    } else {
-        Err(None)
-    };
-    if let Err(refusal) = verdict {
-        if chain_debug() {
-            let why = refusal.map_or_else(
-                || "producer wrote a different byte range".to_string(),
-                |refusal| refusal.to_string(),
-            );
+    if !same_bytes {
+        if layout_debug() {
             eprintln!(
-                "rocket: chain declined ({what}): {why}; producer cube {}x{} (surfaces {} apart) at +{} vs consumer {}x{} (surfaces {} apart) at +{}",
-                cube.geometry.pixel_count,
-                cube.geometry.bytes_per_pixel,
-                cube.geometry.surface_pixel_count,
-                cube.dense_offset,
-                consumer.pixel_count,
-                consumer.bytes_per_pixel,
-                consumer.surface_pixel_count,
-                binding.offset
+                "rocket: layout ({what}): declared packed, but the most recent writer covers a \
+                 different byte range (producer cube at +{}, this read at +{}); repacking",
+                cube.dense_offset, binding.offset
             );
         }
-        return None;
+        return Ok(None);
     }
-    if chain_debug() {
+    if let Err(refusal) = chain_identity(&cube.geometry, &consumer) {
         eprintln!(
-            "rocket: chain taken ({what}): {} pixels x {} bytes, skipping the repack",
+            "rocket: INTERNAL: {what} was declared packed but the producer's cube does not match: \
+             {refusal}; producer cube {}x{} (surfaces {} apart) vs consumer {}x{} (surfaces {} apart)",
+            cube.geometry.pixel_count,
+            cube.geometry.bytes_per_pixel,
+            cube.geometry.surface_pixel_count,
+            consumer.pixel_count,
+            consumer.bytes_per_pixel,
+            consumer.surface_pixel_count,
+        );
+        return Err(status::from_code(
+            crate::bindings::iree_status_code_e_IREE_STATUS_INTERNAL,
+        ));
+    }
+    if layout_debug() {
+        eprintln!(
+            "rocket: layout ({what}): chained, {} pixels x {} bytes, no repack",
             consumer.pixel_count, consumer.bytes_per_pixel
         );
     }
@@ -705,7 +698,7 @@ fn chainable_cube(
     {
         *chained_readers += 1;
     }
-    Some(cube)
+    Ok(Some(cube))
 }
 
 /// Allocates one [`Replica`] per sibling context in `contexts`, each holding
@@ -1296,10 +1289,10 @@ pub enum RecordedOp {
         /// record time, so no other command buffer can reach a buffer that
         /// has not been filled yet.
         weight_publish: Option<WeightPublish>,
-        /// The compiler's count of Rocket dispatches that read this
-        /// dispatch's result (`Conv2DDef.runtime_dense_readers`), 0 when it
-        /// did not count or saw another reader. Non-conv kinds record 0.
-        dense_readers: u32,
+        /// What the compiler declared about this dispatch's layout: which
+        /// inputs read a producer's cube, and how many Rocket readers take
+        /// its own (`*Def.runtime_layout`). All-dense when it did not say.
+        layout: DispatchLayout,
         /// How many later dispatches on this command buffer took
         /// `output_cube` in place of the dense buffer. Bumped at record time
         /// by [`chainable_cube`].
@@ -1550,7 +1543,7 @@ pub unsafe fn apply_ops_until_dispatch(
                 // Record-time only: a later dispatch reads it while the
                 // command buffer is still being built, never here.
                 output_cube: _,
-                dense_readers,
+                layout,
                 chained_readers,
                 dense_read_seen,
             } => {
@@ -1871,15 +1864,18 @@ pub unsafe fn apply_ops_until_dispatch(
                 // this is where the dense write can be judged unnecessary:
                 // the compiler said how many Rocket readers there are, and
                 // the command buffer saw whether each one chained.
-                let elide = lazy_compact_enabled()
-                    && output_compaction.is_some()
-                    && compaction_elidable(*dense_readers, *chained_readers, *dense_read_seen);
-                if lazy_compact_debug() && output_compaction.is_some() {
+                let elide = output_compaction.is_some()
+                    && compaction_elidable(
+                        u32::from(layout.packed_readers),
+                        *chained_readers,
+                        *dense_read_seen,
+                    );
+                if layout_debug() && output_compaction.is_some() {
                     eprintln!(
-                        "rocket: compaction {} ({}): {} reader(s) counted, {} chained, dense read {}",
+                        "rocket: compaction {} ({}): {} reader(s) declared, {} chained, dense read {}",
                         if elide { "skipped" } else { "kept" },
                         profile_label,
-                        dense_readers,
+                        layout.packed_readers,
                         chained_readers,
                         if *dense_read_seen { "seen" } else { "not seen" }
                     );
@@ -2345,8 +2341,18 @@ unsafe extern "C" fn dispatch_impl(
             // bytes the hardware already wrote. Read them in place instead.
             // ISSUES.md P2 step 2; see `chainable_cube` for when that is
             // byte-identical.
+            let layout = executable.layout(constants);
             let chained_input = if shape.layout() == FeatureLayout::Surfaces {
-                chainable_cube(cb, &refs[0], input_geometry, "conv input")
+                match chainable_cube(
+                    cb,
+                    &refs[0],
+                    input_geometry,
+                    layout.input_packed(0),
+                    "conv input",
+                ) {
+                    Ok(chained) => chained,
+                    Err(status) => return status,
+                }
             } else {
                 None
             };
@@ -2867,8 +2873,7 @@ unsafe extern "C" fn dispatch_impl(
             // `Shape::output_cube_geometry` is the compiler's view of the same
             // offer; the two must agree on whether there is a cube at all.
             debug_assert_eq!(shape.output_cube_geometry(kernels).is_some(), plain_atoms);
-            let mut output_cube = (chain_enabled()
-                && plain_atoms
+            let mut output_cube = (plain_atoms
                 && tile_rects_empty
                 && source_tiles_none
                 && output_geometry.is_whole_atom())
@@ -2910,8 +2915,16 @@ unsafe extern "C" fn dispatch_impl(
                 // The skip is a block input, so on a residual network it is
                 // another dispatch's output as often as the feature input
                 // is -- and it is the wide tensor. Chain it the same way.
-                let chained_skip =
-                    chainable_cube(cb, &refs[3], cube.geometry, "conv residual skip");
+                let chained_skip = match chainable_cube(
+                    cb,
+                    &refs[3],
+                    cube.geometry,
+                    layout.input_packed(3),
+                    "conv residual skip",
+                ) {
+                    Ok(chained) => chained,
+                    Err(status) => return status,
+                };
                 if chained_skip.is_none() {
                     unsafe { note_dense_read(cb, &refs[3]) };
                 }
@@ -3017,7 +3030,7 @@ unsafe extern "C" fn dispatch_impl(
                 weight_scratch,
                 output_cube,
                 weight_publish,
-                dense_readers: executable.dense_readers(constants),
+                layout,
                 chained_readers: 0,
                 dense_read_seen: false,
             });
@@ -3113,8 +3126,18 @@ unsafe extern "C" fn dispatch_impl(
             // producer's cube of M pixels at K channels is exactly what the
             // repack would build (`chainable_cube`). The [K,N] operand is a
             // coefficient stream and never chains.
+            let layout = executable.layout(constants);
             let chained_input = if matches!(input_layout, InputPackingLayout::Nc1hwc2) {
-                chainable_cube(cb, &refs[0], input_geometry, "matmul input")
+                match chainable_cube(
+                    cb,
+                    &refs[0],
+                    input_geometry,
+                    layout.input_packed(0),
+                    "matmul input",
+                ) {
+                    Ok(chained) => chained,
+                    Err(status) => return status,
+                }
             } else {
                 None
             };
@@ -3437,8 +3460,7 @@ unsafe extern "C" fn dispatch_impl(
             // offered when the tiles fanned out (each context holds its own
             // rows) or the write-out is the accumulator's 128-byte block.
             let output_block_bytes = shape.as_conv_shape().output_channel_block_bytes() as usize;
-            let output_cube = (chain_enabled()
-                && tile_rects.is_empty()
+            let output_cube = (tile_rects.is_empty()
                 && output_block_bytes == 16
                 && output_geometry.is_whole_atom())
             .then_some(OutputCube {
@@ -3513,7 +3535,7 @@ unsafe extern "C" fn dispatch_impl(
                 profile_label,
                 weight_scratch,
                 output_cube,
-                dense_readers: executable.dense_readers(constants),
+                layout,
                 chained_readers: 0,
                 dense_read_seen: false,
                 weight_publish,
@@ -3620,7 +3642,17 @@ unsafe extern "C" fn dispatch_impl(
             // PPU's stride -- the pixel count rounded up to four, so only an
             // image whose count is a multiple of four -- and its channels
             // are whole atoms (`chainable_cube`).
-            let chained_input = chainable_cube(cb, &refs[0], input_geometry, "pool input");
+            let layout = executable.layout(constants);
+            let chained_input = match chainable_cube(
+                cb,
+                &refs[0],
+                input_geometry,
+                layout.input_packed(0),
+                "pool input",
+            ) {
+                Ok(chained) => chained,
+                Err(status) => return status,
+            };
             if chained_input.is_none() {
                 unsafe { note_dense_read(cb, &refs[0]) };
             }
@@ -3700,16 +3732,15 @@ unsafe extern "C" fn dispatch_impl(
             // The pool's own cube: real pixels at the PPU's four-rounded
             // surface stride. Offered only when its channels are whole atoms
             // with no padding, since a consumer would read the padding lanes.
-            let output_cube =
-                (chain_enabled() && output_geometry.is_exact()).then_some(OutputCube {
-                    dense_buffer: refs[1].buffer,
-                    dense_offset: refs[1].offset,
-                    dma_address: output_scratch.dma_address,
-                    handle: output_scratch.handle,
-                    host_ptr: output_scratch.host_ptr,
-                    length: output_scratch_bytes,
-                    geometry: output_geometry,
-                });
+            let output_cube = output_geometry.is_exact().then_some(OutputCube {
+                dense_buffer: refs[1].buffer,
+                dense_offset: refs[1].offset,
+                dma_address: output_scratch.dma_address,
+                handle: output_scratch.handle,
+                host_ptr: output_scratch.host_ptr,
+                length: output_scratch_bytes,
+                geometry: output_geometry,
+            });
             let retained_bindings = unsafe { retain_direct_bindings(refs) };
             let profile_label = profile::label(|| {
                 format!(
@@ -3745,7 +3776,7 @@ unsafe extern "C" fn dispatch_impl(
                 profile_label,
                 weight_scratch: None,
                 output_cube,
-                dense_readers: executable.dense_readers(constants),
+                layout,
                 chained_readers: 0,
                 dense_read_seen: false,
                 weight_publish: None,
@@ -3768,8 +3799,17 @@ unsafe extern "C" fn dispatch_impl(
             if bindings.count < 2 {
                 return invalid_argument();
             }
-            let Some(input) = elementwise_operand(cb, &refs[0], &cube, "ew input") else {
-                return invalid_argument();
+            let layout = executable.layout(constants);
+            let input = match elementwise_operand(
+                cb,
+                &refs[0],
+                &cube,
+                layout.input_packed(0),
+                "ew input",
+            ) {
+                Ok(Some(operand)) => operand,
+                Ok(None) => return invalid_argument(),
+                Err(status) => return status,
             };
             let Some((output_scratch, output_compaction)) =
                 compact_elementwise_output(cb, &refs[1], &cube)
@@ -3818,7 +3858,7 @@ unsafe extern "C" fn dispatch_impl(
                 profile_label,
                 weight_scratch: None,
                 output_cube,
-                dense_readers: executable.dense_readers(constants),
+                layout,
                 chained_readers: 0,
                 dense_read_seen: false,
                 weight_publish: None,
@@ -3846,11 +3886,28 @@ unsafe extern "C" fn dispatch_impl(
             if bindings.count < 3 {
                 return invalid_argument();
             }
-            let Some(input) = elementwise_operand(cb, &refs[0], &cube, "ew input") else {
-                return invalid_argument();
+            let layout = executable.layout(constants);
+            let input = match elementwise_operand(
+                cb,
+                &refs[0],
+                &cube,
+                layout.input_packed(0),
+                "ew input",
+            ) {
+                Ok(Some(operand)) => operand,
+                Ok(None) => return invalid_argument(),
+                Err(status) => return status,
             };
-            let Some(operand) = elementwise_operand(cb, &refs[1], &cube, "ew operand") else {
-                return invalid_argument();
+            let operand = match elementwise_operand(
+                cb,
+                &refs[1],
+                &cube,
+                layout.input_packed(1),
+                "ew operand",
+            ) {
+                Ok(Some(operand)) => operand,
+                Ok(None) => return invalid_argument(),
+                Err(status) => return status,
             };
             let Some((output_scratch, output_compaction)) =
                 compact_elementwise_output(cb, &refs[2], &cube)
@@ -3899,7 +3956,7 @@ unsafe extern "C" fn dispatch_impl(
                 profile_label,
                 weight_scratch: None,
                 output_cube,
-                dense_readers: executable.dense_readers(constants),
+                layout,
                 chained_readers: 0,
                 dense_read_seen: false,
                 weight_publish: None,
@@ -3922,8 +3979,17 @@ unsafe extern "C" fn dispatch_impl(
             if bindings.count < 2 {
                 return invalid_argument();
             }
-            let Some(input) = elementwise_operand(cb, &refs[0], &cube, "ew input") else {
-                return invalid_argument();
+            let layout = executable.layout(constants);
+            let input = match elementwise_operand(
+                cb,
+                &refs[0],
+                &cube,
+                layout.input_packed(0),
+                "ew input",
+            ) {
+                Ok(Some(operand)) => operand,
+                Ok(None) => return invalid_argument(),
+                Err(status) => return status,
             };
             let Some((output_scratch, output_compaction)) =
                 compact_elementwise_output(cb, &refs[1], &cube)
@@ -3967,7 +4033,7 @@ unsafe extern "C" fn dispatch_impl(
                 profile_label,
                 weight_scratch: None,
                 output_cube,
-                dense_readers: executable.dense_readers(constants),
+                layout,
                 chained_readers: 0,
                 dense_read_seen: false,
                 weight_publish: None,
@@ -4088,27 +4154,30 @@ fn elementwise_operand(
     cb: &mut RocketCommandBuffer,
     binding: &iree_hal_buffer_ref_t,
     cube: &ElementwiseCube,
+    declared: bool,
     what: &str,
-) -> Option<ElementwiseOperand> {
+) -> Result<Option<ElementwiseOperand>, iree_status_t> {
     // The EW and LUT cubes are exact in pixels and pad channels to 16 like a
     // convolution's input, so a conv, matmul or EW producer's cube is the
     // same bytes whenever the channel count is whole atoms.
-    if let Some(producer) = chainable_cube(cb, binding, cube.geometry, what) {
-        return Some(ElementwiseOperand {
+    if let Some(producer) = chainable_cube(cb, binding, cube.geometry, declared, what)? {
+        return Ok(Some(ElementwiseOperand {
             addr: producer.dma_address,
             handle: producer.handle,
             scratch: None,
             packing: None,
-        });
+        }));
     }
     unsafe { note_dense_read(cb, binding) };
-    let (scratch, packing) = pack_elementwise_input(cb, binding, cube)?;
-    Some(ElementwiseOperand {
+    let Some((scratch, packing)) = pack_elementwise_input(cb, binding, cube) else {
+        return Ok(None);
+    };
+    Ok(Some(ElementwiseOperand {
         addr: scratch.dma_address,
         handle: scratch.handle,
         scratch: Some(scratch),
         packing: Some(packing),
-    })
+    }))
 }
 
 /// The op's own output cube, offered to later dispatches when its channels
@@ -4118,7 +4187,7 @@ fn elementwise_output_cube(
     scratch: &RocketOwnedBuffer,
     cube: &ElementwiseCube,
 ) -> Option<OutputCube> {
-    (chain_enabled() && cube.geometry.is_exact()).then_some(OutputCube {
+    cube.geometry.is_exact().then_some(OutputCube {
         dense_buffer: binding.buffer,
         dense_offset: binding.offset,
         dma_address: scratch.dma_address,

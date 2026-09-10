@@ -113,6 +113,15 @@ pub struct CommonArgs {
     #[arg(long)]
     pub strict_offload: bool,
 
+    /// Fail the compile if any edge between two Rocket dispatches was left
+    /// dense by `rocket-assign-layout`: the consumer would repack what the
+    /// producer's cube already holds, because the two geometries differ (a
+    /// pool's four-rounded surface stride, a channel count the consumer pads)
+    /// or the producer publishes no cube. The audit names each such edge and
+    /// the failing condition. COMPILER_ROADMAP.md 6.2.
+    #[arg(long)]
+    pub strict_layout: bool,
+
     /// Also write the placement audit as JSON to this path: one record per
     /// candidate with its location, kind, shape, precision, decision, reason
     /// code and message, tile summary and limit class, plus the dispatch-site

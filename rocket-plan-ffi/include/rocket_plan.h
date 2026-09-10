@@ -71,6 +71,12 @@ typedef enum rocket_plan_status_e {
   ROCKET_PLAN_LAYOUT_MISMATCH = 8,
 } rocket_plan_status_e;
 
+/* A convolution whose input has this many channels or fewer reads dense
+ * ARGB rather than a feature cube (rocket_core::conv::MAX_DENSE_CHANNELS,
+ * FeatureLayout::Dense): such an input can never chain. Added in ABI
+ * version 5; the value is part of the ABI. */
+#define ROCKET_PLAN_MAX_DENSE_CHANNELS 4u
+
 /* Mirrors rocket_core::layout::CubeKind: which unit reads or writes a
  * feature cube, which picks its channel padding and surface stride. Added
  * in ABI version 4. */

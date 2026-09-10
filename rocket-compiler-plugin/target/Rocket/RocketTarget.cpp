@@ -204,6 +204,9 @@ struct RocketConv2dConfig {
   // One trailing push constant carries the compiler's count of Rocket
   // dispatches that read the result (Conv2DDef.runtime_dense_readers).
   bool runtimeDenseReaders = false;
+  // The trailing push constant is a layout word instead (runtime_layout);
+  // at most one of the two may be declared. COMPILER_ROADMAP.md 6.2.
+  bool runtimeLayout = false;
   iree_hal_rocket_Activation_enum_t epilogueActivation =
       iree_hal_rocket_Activation_NONE;
   // The weights binding is already the packed coefficient stream
@@ -248,6 +251,9 @@ struct RocketPoolingConfig {
   iree_hal_rocket_Precision_enum_t precision = iree_hal_rocket_Precision_INT8;
   std::vector<iree_hal_rocket_PoolingDimension_enum_t> runtimeDimensions;
   bool runtimeDenseReaders = false;
+  // The trailing push constant is a layout word instead (runtime_layout);
+  // at most one of the two may be declared. COMPILER_ROADMAP.md 6.2.
+  bool runtimeLayout = false;
 };
 
 struct RocketElementwiseUnaryConfig {
@@ -259,6 +265,9 @@ struct RocketElementwiseUnaryConfig {
   uint32_t operand = 0;
   std::vector<iree_hal_rocket_ElementwiseDimension_enum_t> runtimeDimensions;
   bool runtimeDenseReaders = false;
+  // The trailing push constant is a layout word instead (runtime_layout);
+  // at most one of the two may be declared. COMPILER_ROADMAP.md 6.2.
+  bool runtimeLayout = false;
 };
 
 struct RocketElementwiseBinaryConfig {
@@ -268,6 +277,9 @@ struct RocketElementwiseBinaryConfig {
   iree_hal_rocket_EwBinaryOp_enum_t op = iree_hal_rocket_EwBinaryOp_ADD;
   std::vector<iree_hal_rocket_ElementwiseDimension_enum_t> runtimeDimensions;
   bool runtimeDenseReaders = false;
+  // The trailing push constant is a layout word instead (runtime_layout);
+  // at most one of the two may be declared. COMPILER_ROADMAP.md 6.2.
+  bool runtimeLayout = false;
 };
 
 struct RocketElementwiseLutConfig {
@@ -284,6 +296,9 @@ struct RocketElementwiseLutConfig {
   float outputScale = 1.0f;
   std::vector<iree_hal_rocket_ElementwiseDimension_enum_t> runtimeDimensions;
   bool runtimeDenseReaders = false;
+  // The trailing push constant is a layout word instead (runtime_layout);
+  // at most one of the two may be declared. COMPILER_ROADMAP.md 6.2.
+  bool runtimeLayout = false;
 };
 
 struct RocketMatmulConfig {
@@ -303,6 +318,9 @@ struct RocketMatmulConfig {
   iree_hal_rocket_Precision_enum_t precision = iree_hal_rocket_Precision_INT8;
   std::vector<iree_hal_rocket_MatmulDimension_enum_t> runtimeDimensions;
   bool runtimeDenseReaders = false;
+  // The trailing push constant is a layout word instead (runtime_layout);
+  // at most one of the two may be declared. COMPILER_ROADMAP.md 6.2.
+  bool runtimeLayout = false;
   // See RocketConv2dConfig::weightsPacked (MatmulDef.weights_packed).
   bool weightsPacked = false;
 };
@@ -369,10 +387,25 @@ bool parseOptionalBool(DictionaryAttr config, StringRef key, bool &flag,
   return true;
 }
 
+// The two spellings of the trailing push constant: the retired reader count
+// and the layout word that superseded it. Both are read so an older module
+// still serializes; a target that declares both has no single meaning for
+// the constant and is refused.
 template <typename DiagFn>
-bool parseRuntimeDenseReaders(DictionaryAttr config, bool &flag,
-                              DiagFn &&diagFn) {
-  return parseOptionalBool(config, "runtime_dense_readers", flag, diagFn);
+bool parseTrailingConstantFlags(DictionaryAttr config, bool &denseReaders,
+                                bool &layout, DiagFn &&diagFn) {
+  if (!parseOptionalBool(config, "runtime_dense_readers", denseReaders,
+                         diagFn) ||
+      !parseOptionalBool(config, "runtime_layout", layout, diagFn)) {
+    return false;
+  }
+  if (denseReaders && layout) {
+    diagFn() << "rocket backend: 'runtime_dense_readers' and "
+                "'runtime_layout' both declared; the trailing push constant "
+                "can only be one of them";
+    return false;
+  }
+  return true;
 }
 
 std::optional<RocketConv2dConfig> buildRocketConv2dConfigFromTarget(
@@ -427,7 +460,8 @@ std::optional<RocketConv2dConfig> buildRocketConv2dConfigFromTarget(
   if (Attribute attr = config.get("epilogue_add")) {
     shape.epilogueAdd = llvm::cast<BoolAttr>(attr).getValue();
   }
-  if (!parseRuntimeDenseReaders(config, shape.runtimeDenseReaders, diagFn)) {
+  if (!parseTrailingConstantFlags(config, shape.runtimeDenseReaders,
+                                  shape.runtimeLayout, diagFn)) {
     return std::nullopt;
   }
   if (!parseOptionalBool(config, "weights_packed", shape.weightsPacked,
@@ -899,7 +933,8 @@ std::optional<RocketPoolingConfig> buildRocketPoolingConfigFromTarget(
     return std::nullopt;
   }
 
-  if (!parseRuntimeDenseReaders(config, shape.runtimeDenseReaders, diagFn)) {
+  if (!parseTrailingConstantFlags(config, shape.runtimeDenseReaders,
+                                  shape.runtimeLayout, diagFn)) {
     return std::nullopt;
   }
   return shape;
@@ -1061,7 +1096,8 @@ buildRocketElementwiseUnaryConfigFromTarget(
                                   shape.height, shape.channels, diagFn)) {
     return std::nullopt;
   }
-  if (!parseRuntimeDenseReaders(config, shape.runtimeDenseReaders, diagFn)) {
+  if (!parseTrailingConstantFlags(config, shape.runtimeDenseReaders,
+                                  shape.runtimeLayout, diagFn)) {
     return std::nullopt;
   }
   return shape;
@@ -1124,7 +1160,8 @@ buildRocketElementwiseBinaryConfigFromTarget(
                                   shape.height, shape.channels, diagFn)) {
     return std::nullopt;
   }
-  if (!parseRuntimeDenseReaders(config, shape.runtimeDenseReaders, diagFn)) {
+  if (!parseTrailingConstantFlags(config, shape.runtimeDenseReaders,
+                                  shape.runtimeLayout, diagFn)) {
     return std::nullopt;
   }
   return shape;
@@ -1226,7 +1263,8 @@ buildRocketElementwiseLutConfigFromTarget(
                                   shape.height, shape.channels, diagFn)) {
     return std::nullopt;
   }
-  if (!parseRuntimeDenseReaders(config, shape.runtimeDenseReaders, diagFn)) {
+  if (!parseTrailingConstantFlags(config, shape.runtimeDenseReaders,
+                                  shape.runtimeLayout, diagFn)) {
     return std::nullopt;
   }
   return shape;
@@ -1343,7 +1381,8 @@ std::optional<RocketMatmulConfig> buildRocketMatmulConfigFromTarget(
     }
   }
 
-  if (!parseRuntimeDenseReaders(config, shape.runtimeDenseReaders, diagFn)) {
+  if (!parseTrailingConstantFlags(config, shape.runtimeDenseReaders,
+                                  shape.runtimeLayout, diagFn)) {
     return std::nullopt;
   }
   if (!parseOptionalBool(config, "weights_packed", shape.weightsPacked,
@@ -1502,13 +1541,13 @@ public:
     // `Conv2dExecutable::resolve_shape` consumes them in.
     // And last, the dense-reader count, when the convolution target asks for
     // one (`runtime_dense_readers`); the driver reads it after the others.
+    auto declaresTrailing = [](const auto &shape) {
+      return shape && (shape->runtimeDenseReaders || shape->runtimeLayout);
+    };
     bool declaresDenseReaders =
-        (convShape && convShape->runtimeDenseReaders) ||
-        (poolingShape && poolingShape->runtimeDenseReaders) ||
-        (matmulShape && matmulShape->runtimeDenseReaders) ||
-        (ewUnaryShape && ewUnaryShape->runtimeDenseReaders) ||
-        (ewBinaryShape && ewBinaryShape->runtimeDenseReaders) ||
-        (lutShape && lutShape->runtimeDenseReaders);
+        declaresTrailing(convShape) || declaresTrailing(poolingShape) ||
+        declaresTrailing(matmulShape) || declaresTrailing(ewUnaryShape) ||
+        declaresTrailing(ewBinaryShape) || declaresTrailing(lutShape);
     size_t denseReaderCount = declaresDenseReaders ? 1 : 0;
     size_t runtimeConstantCount =
         runtimeDimensionCount + runtimeQuantizationCount + denseReaderCount;
@@ -1585,7 +1624,9 @@ public:
            iree_hal_rocket_PoolingDef_runtime_dimensions_add(
                builder, runtimeDimensionsRef)) ||
           iree_hal_rocket_PoolingDef_runtime_dense_readers_add(
-              builder, poolingShape->runtimeDenseReaders)) {
+              builder, poolingShape->runtimeDenseReaders) ||
+          iree_hal_rocket_PoolingDef_runtime_layout_add(
+              builder, poolingShape->runtimeLayout)) {
         return variantOp.emitOpError()
                << "failed to build Rocket pooling definition";
       }
@@ -1635,6 +1676,8 @@ public:
                builder, runtimeDimensionsRef)) ||
           iree_hal_rocket_MatmulDef_runtime_dense_readers_add(
               builder, matmulShape->runtimeDenseReaders) ||
+          iree_hal_rocket_MatmulDef_runtime_layout_add(
+              builder, matmulShape->runtimeLayout) ||
           iree_hal_rocket_MatmulDef_weights_packed_add(
               builder, matmulShape->weightsPacked)) {
         return variantOp.emitOpError()
@@ -1673,7 +1716,9 @@ public:
            iree_hal_rocket_ElementwiseUnaryDef_runtime_dimensions_add(
                builder, runtimeDimensionsRef)) ||
           iree_hal_rocket_ElementwiseUnaryDef_runtime_dense_readers_add(
-              builder, ewUnaryShape->runtimeDenseReaders)) {
+              builder, ewUnaryShape->runtimeDenseReaders) ||
+          iree_hal_rocket_ElementwiseUnaryDef_runtime_layout_add(
+              builder, ewUnaryShape->runtimeLayout)) {
         return variantOp.emitOpError()
                << "failed to build Rocket element-wise unary definition";
       }
@@ -1708,7 +1753,9 @@ public:
            iree_hal_rocket_ElementwiseBinaryDef_runtime_dimensions_add(
                builder, runtimeDimensionsRef)) ||
           iree_hal_rocket_ElementwiseBinaryDef_runtime_dense_readers_add(
-              builder, ewBinaryShape->runtimeDenseReaders)) {
+              builder, ewBinaryShape->runtimeDenseReaders) ||
+          iree_hal_rocket_ElementwiseBinaryDef_runtime_layout_add(
+              builder, ewBinaryShape->runtimeLayout)) {
         return variantOp.emitOpError()
                << "failed to build Rocket element-wise binary definition";
       }
@@ -1749,7 +1796,9 @@ public:
            iree_hal_rocket_ElementwiseLutDef_runtime_dimensions_add(
                builder, runtimeDimensionsRef)) ||
           iree_hal_rocket_ElementwiseLutDef_runtime_dense_readers_add(
-              builder, lutShape->runtimeDenseReaders)) {
+              builder, lutShape->runtimeDenseReaders) ||
+          iree_hal_rocket_ElementwiseLutDef_runtime_layout_add(
+              builder, lutShape->runtimeLayout)) {
         return variantOp.emitOpError()
                << "failed to build Rocket LUT definition";
       }
@@ -1836,6 +1885,8 @@ public:
               builder, convShape->epilogueActivation) ||
           iree_hal_rocket_Conv2DDef_runtime_dense_readers_add(
               builder, convShape->runtimeDenseReaders) ||
+          iree_hal_rocket_Conv2DDef_runtime_layout_add(
+              builder, convShape->runtimeLayout) ||
           iree_hal_rocket_Conv2DDef_weights_packed_add(
               builder, convShape->weightsPacked)) {
         return variantOp.emitOpError()

@@ -490,12 +490,19 @@ demote pass narrows an f32 import *through* its zero pads so the pad-folding
 matchers still see `pad -> conv`. The profile's `compaction:` line counts
 the writes skipped; `pack.input` and `compact` are the phases that shrink.
 
+Which edges chain and which dense writes are skipped are the *compiler's*
+declarations since COMPILER_ROADMAP.md 6.2 (`rocket-assign-layout`, the
+trailing layout push constant): the driver chains only an input declared
+packed, fails `INTERNAL` if the producer it finds does not match, and keeps
+the dense write whenever a declared reader is not on the same command
+buffer. `rocket-compiler audit` prints every NPU -> NPU edge with its
+verdict, and `--strict-layout` fails a compile that leaves one dense. The
+former `ROCKET_CHAIN` and `ROCKET_LAZY_COMPACT` switches are gone; a
+`.vmfb` built without the declaration behaves as `ROCKET_CHAIN=0` did.
+
 | Variable | Effect |
 |---|---|
-| `ROCKET_CHAIN=0` | Always repack a consumer's input from the dense buffer. Implies no lazy compaction. |
-| `ROCKET_CHAIN=debug` | Print every chain edge taken and why each other one was declined. |
-| `ROCKET_LAZY_COMPACT=0` | Always write the dense output buffer. |
-| `ROCKET_LAZY_COMPACT=debug` | Print every dispatch's kept/skipped decision with the reader counts behind it. |
+| `ROCKET_LAYOUT=debug` | Print what the runtime did with every declared edge (chained, or why it fell back to a repack) and every dispatch's kept/skipped dense-write decision with the counts behind it. |
 
 `iree-rocket-hal`'s `layout_bench` and `gem_bandwidth` examples measure the
 transforms and the GEM mapping directly, which is a much faster way to test a

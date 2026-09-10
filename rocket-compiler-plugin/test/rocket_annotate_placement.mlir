@@ -25,7 +25,7 @@
 // RUN:   --iree-hal-default-device=cpu_device \
 // RUN:   --iree-hal-indirect-command-buffers=false \
 // RUN:   --compile-to=flow \
-// RUN:   -o - | iree-opt --pass-pipeline="builtin.module(rocket-pin-unclaimed-dispatches,rocket-mark-dense-readers)" \
+// RUN:   -o - | iree-opt --pass-pipeline="builtin.module(rocket-pin-unclaimed-dispatches,rocket-assign-layout,rocket-pack-weights)" \
 // RUN:   | iree-compile - \
 // RUN:   --iree-hal-target-device=rocket_device=rocket \
 // RUN:   --iree-hal-target-device=cpu_device=local \

@@ -398,7 +398,10 @@ have no ReLU after them (linear bottlenecks) and are not claimed; a
 **Step 2 landed 2026-09-08 -- the input half.** A dispatch whose input was
 written by an earlier dispatch on the same command buffer now reads that
 dispatch's output cube in place (`OutputCube`, `chainable_cube`,
-`ROCKET_CHAIN=0` to turn it off, `=debug` to trace every edge). No wire or
+`ROCKET_CHAIN=0` to turn it off, `=debug` to trace every edge -- both
+switches retired 2026-09-10 when the decision moved to the compiler,
+COMPILER_ROADMAP.md 6.2; `ROCKET_LAYOUT=debug` traces the declarations
+now). No wire or
 compiler change: the producer already writes feature-atomic NC1HWC2 surfaces
 into scratch, and the repack the consumer used to do reproduces those exact
 bytes, so the consumer simply points its regcmd at the producer's scratch BO

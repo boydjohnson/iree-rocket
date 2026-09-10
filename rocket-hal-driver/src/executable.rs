@@ -26,6 +26,7 @@ use iree_rocket_hal::rocket::{
     elementwise::{EwAddShape, EwBinaryOp, EwPrecision, EwUnaryAlgo, EwUnaryShape},
     executable_format::validate_conv_shape,
     fc,
+    layout::DispatchLayout,
     pooling::PoolingShape,
 };
 
@@ -156,19 +157,34 @@ impl RuntimeConv2dQuantParam {
     }
 }
 
-/// The compiler's count of Rocket dispatches that read a dispatch's result,
-/// carried as the last push constant when the executable declared
-/// `runtime_dense_readers`; 0 otherwise, which is "always write the dense
-/// output". Not validated here: the command buffer compares it against the
-/// consumers it actually saw chain, and a mismatch in either direction keeps
-/// the dense write. Shared by every kernel kind, since each `*Def` declares
-/// the flag the same way.
-pub fn trailing_dense_readers(declared: bool, constants: &[u8]) -> u32 {
-    if !declared || constants.len() < std::mem::size_of::<u32>() {
-        return 0;
+/// What the compiler declared about a dispatch's layout, carried as the
+/// last push constant when the executable declared `runtime_layout`
+/// (`rocket_core::layout::DispatchLayout`, COMPILER_ROADMAP.md 6.2); the
+/// bare reader count when it declared the retired `runtime_dense_readers`
+/// instead; and all-dense otherwise, which is "chain nothing, always write
+/// the dense output". Not validated here: the command buffer chains only
+/// the inputs declared packed and compares the count against the consumers
+/// it actually saw chain. Shared by every kernel kind, since each `*Def`
+/// declares the flag the same way.
+pub fn trailing_layout(
+    declared_dense_readers: bool,
+    declared_layout: bool,
+    constants: &[u8],
+) -> DispatchLayout {
+    if (!declared_dense_readers && !declared_layout) || constants.len() < std::mem::size_of::<u32>()
+    {
+        return DispatchLayout::default();
     }
     let tail = &constants[constants.len() - std::mem::size_of::<u32>()..];
-    u32::from_ne_bytes(tail.try_into().unwrap())
+    let word = u32::from_ne_bytes(tail.try_into().unwrap());
+    if declared_layout {
+        DispatchLayout::from_word(word)
+    } else {
+        DispatchLayout {
+            packed_inputs: 0,
+            packed_readers: u16::try_from(word).unwrap_or(u16::MAX),
+        }
+    }
 }
 
 /// Conv2D executable metadata before per-dispatch runtime dimensions resolve.
@@ -187,8 +203,11 @@ pub struct Conv2dExecutable {
     pub epilogue_activation: conv::Activation,
     /// One trailing push constant carries the compiler's count of Rocket
     /// dispatches that read this dispatch's result
-    /// (`Conv2DDef.runtime_dense_readers`); see [`Self::dense_readers`].
+    /// (`Conv2DDef.runtime_dense_readers`); see [`Self::layout`].
     pub runtime_dense_readers: bool,
+    /// The trailing push constant is a layout word (`*Def.runtime_layout`);
+    /// see [`trailing_layout`].
+    pub runtime_layout: bool,
     /// `Conv2DDef.weights_packed` / `MatmulDef.weights_packed`: the weights
     /// binding is already the packed coefficient stream, packed at compile
     /// time by the same `rocket_core::weights::WeightPlan` the runtime packs
@@ -206,6 +225,7 @@ impl Conv2dExecutable {
             epilogue_add: false,
             epilogue_activation: conv::Activation::None,
             runtime_dense_readers: false,
+            runtime_layout: false,
             weights_packed: false,
         }
     }
@@ -273,12 +293,12 @@ impl Conv2dExecutable {
 
     /// The compiler's count of Rocket dispatches that read this dispatch's
     /// result, carried as the last push constant when
-    /// `runtime_dense_readers` is set; 0 otherwise, which is "always write
+    /// `runtime_dense_readers` or `runtime_layout` is set; all-dense otherwise, which is "always write
     /// the dense output". The count is not validated here: the command
     /// buffer compares it against the consumers it actually saw chain, and
     /// any mismatch in either direction keeps the dense write.
-    pub fn dense_readers(&self, constants: &[u8]) -> u32 {
-        trailing_dense_readers(self.runtime_dense_readers, constants)
+    pub fn layout(&self, constants: &[u8]) -> DispatchLayout {
+        trailing_layout(self.runtime_dense_readers, self.runtime_layout, constants)
     }
 
     /// Resolves runtime dimensions and quantization from native-endian uint32
@@ -296,7 +316,11 @@ impl Conv2dExecutable {
             .runtime_dimensions
             .len()
             .checked_add(self.runtime_quantization.len())
-            .and_then(|count| count.checked_add(usize::from(self.runtime_dense_readers)))
+            .and_then(|count| {
+                count.checked_add(usize::from(
+                    self.runtime_dense_readers || self.runtime_layout,
+                ))
+            })
             .and_then(|count| count.checked_mul(std::mem::size_of::<u32>()))
             .ok_or("runtime Conv2D push-constant byte count overflow")?;
         if constants.len() != expected_bytes {
@@ -448,8 +472,11 @@ impl RuntimePoolingDimension {
 pub struct PoolingExecutable {
     pub shape_template: PoolingShape,
     pub runtime_dimensions: Vec<RuntimePoolingDimension>,
-    /// See [`trailing_dense_readers`].
+    /// See [`trailing_layout`].
     pub runtime_dense_readers: bool,
+    /// The trailing push constant is a layout word (`*Def.runtime_layout`);
+    /// see [`trailing_layout`].
+    pub runtime_layout: bool,
 }
 
 impl PoolingExecutable {
@@ -458,11 +485,12 @@ impl PoolingExecutable {
             shape_template: shape,
             runtime_dimensions: Vec::new(),
             runtime_dense_readers: false,
+            runtime_layout: false,
         }
     }
 
-    pub fn dense_readers(&self, constants: &[u8]) -> u32 {
-        trailing_dense_readers(self.runtime_dense_readers, constants)
+    pub fn layout(&self, constants: &[u8]) -> DispatchLayout {
+        trailing_layout(self.runtime_dense_readers, self.runtime_layout, constants)
     }
 
     /// Validates the schema-level dynamic mapping independently of runtime
@@ -515,7 +543,9 @@ impl PoolingExecutable {
         let expected_bytes = self
             .runtime_dimensions
             .len()
-            .checked_add(usize::from(self.runtime_dense_readers))
+            .checked_add(usize::from(
+                self.runtime_dense_readers || self.runtime_layout,
+            ))
             .and_then(|count| count.checked_mul(std::mem::size_of::<u32>()))
             .ok_or("runtime pooling push-constant byte count overflow")?;
         if constants.len() != expected_bytes {
@@ -726,8 +756,11 @@ pub struct ElementwiseUnaryExecutable {
     /// zero for every other opcode.
     pub operand: u32,
     pub runtime_dimensions: Vec<RuntimeElementwiseDimension>,
-    /// See [`trailing_dense_readers`].
+    /// See [`trailing_layout`].
     pub runtime_dense_readers: bool,
+    /// The trailing push constant is a layout word (`*Def.runtime_layout`);
+    /// see [`trailing_layout`].
+    pub runtime_layout: bool,
 }
 
 impl ElementwiseUnaryExecutable {
@@ -738,11 +771,12 @@ impl ElementwiseUnaryExecutable {
             operand,
             runtime_dimensions: Vec::new(),
             runtime_dense_readers: false,
+            runtime_layout: false,
         }
     }
 
-    pub fn dense_readers(&self, constants: &[u8]) -> u32 {
-        trailing_dense_readers(self.runtime_dense_readers, constants)
+    pub fn layout(&self, constants: &[u8]) -> DispatchLayout {
+        trailing_layout(self.runtime_dense_readers, self.runtime_layout, constants)
     }
 
     pub fn validate_template(&self) -> Result<(), &'static str> {
@@ -760,7 +794,7 @@ impl ElementwiseUnaryExecutable {
         let geometry = resolve_elementwise_geometry(
             &self.geometry,
             &self.runtime_dimensions,
-            self.runtime_dense_readers,
+            self.runtime_dense_readers || self.runtime_layout,
             constants,
         )?;
         Ok(EwUnaryShape {
@@ -787,8 +821,11 @@ pub struct ElementwiseBinaryExecutable {
     pub geometry: ElementwiseGeometry,
     pub op: EwBinaryOp,
     pub runtime_dimensions: Vec<RuntimeElementwiseDimension>,
-    /// See [`trailing_dense_readers`].
+    /// See [`trailing_layout`].
     pub runtime_dense_readers: bool,
+    /// The trailing push constant is a layout word (`*Def.runtime_layout`);
+    /// see [`trailing_layout`].
+    pub runtime_layout: bool,
 }
 
 impl ElementwiseBinaryExecutable {
@@ -798,11 +835,12 @@ impl ElementwiseBinaryExecutable {
             op,
             runtime_dimensions: Vec::new(),
             runtime_dense_readers: false,
+            runtime_layout: false,
         }
     }
 
-    pub fn dense_readers(&self, constants: &[u8]) -> u32 {
-        trailing_dense_readers(self.runtime_dense_readers, constants)
+    pub fn layout(&self, constants: &[u8]) -> DispatchLayout {
+        trailing_layout(self.runtime_dense_readers, self.runtime_layout, constants)
     }
 
     pub fn validate_template(&self) -> Result<(), &'static str> {
@@ -813,7 +851,7 @@ impl ElementwiseBinaryExecutable {
         let geometry = resolve_elementwise_geometry(
             &self.geometry,
             &self.runtime_dimensions,
-            self.runtime_dense_readers,
+            self.runtime_dense_readers || self.runtime_layout,
             constants,
         )?;
         Ok(EwAddShape {
@@ -893,13 +931,16 @@ pub struct ElementwiseLutExecutable {
     pub input_scale: f32,
     pub output_scale: f32,
     pub runtime_dimensions: Vec<RuntimeElementwiseDimension>,
-    /// See [`trailing_dense_readers`].
+    /// See [`trailing_layout`].
     pub runtime_dense_readers: bool,
+    /// The trailing push constant is a layout word (`*Def.runtime_layout`);
+    /// see [`trailing_layout`].
+    pub runtime_layout: bool,
 }
 
 impl ElementwiseLutExecutable {
-    pub fn dense_readers(&self, constants: &[u8]) -> u32 {
-        trailing_dense_readers(self.runtime_dense_readers, constants)
+    pub fn layout(&self, constants: &[u8]) -> DispatchLayout {
+        trailing_layout(self.runtime_dense_readers, self.runtime_layout, constants)
     }
 
     pub fn validate_template(&self) -> Result<(), &'static str> {
@@ -929,7 +970,7 @@ impl ElementwiseLutExecutable {
         let geometry = resolve_elementwise_geometry(
             &self.geometry,
             &self.runtime_dimensions,
-            self.runtime_dense_readers,
+            self.runtime_dense_readers || self.runtime_layout,
             constants,
         )?;
         Ok(LutShape {
@@ -991,8 +1032,11 @@ impl RuntimeMatmulDimension {
 pub struct MatmulExecutable {
     pub shape_template: fc::Shape,
     pub runtime_dimensions: Vec<RuntimeMatmulDimension>,
-    /// See [`trailing_dense_readers`].
+    /// See [`trailing_layout`].
     pub runtime_dense_readers: bool,
+    /// The trailing push constant is a layout word (`*Def.runtime_layout`);
+    /// see [`trailing_layout`].
+    pub runtime_layout: bool,
     /// `Conv2DDef.weights_packed` / `MatmulDef.weights_packed`: the weights
     /// binding is already the packed coefficient stream, packed at compile
     /// time by the same `rocket_core::weights::WeightPlan` the runtime packs
@@ -1006,12 +1050,13 @@ impl MatmulExecutable {
             shape_template: shape,
             runtime_dimensions: Vec::new(),
             runtime_dense_readers: false,
+            runtime_layout: false,
             weights_packed: false,
         }
     }
 
-    pub fn dense_readers(&self, constants: &[u8]) -> u32 {
-        trailing_dense_readers(self.runtime_dense_readers, constants)
+    pub fn layout(&self, constants: &[u8]) -> DispatchLayout {
+        trailing_layout(self.runtime_dense_readers, self.runtime_layout, constants)
     }
 
     pub fn validate_template(&self) -> Result<(), &'static str> {
@@ -1052,7 +1097,9 @@ impl MatmulExecutable {
         let expected_bytes = self
             .runtime_dimensions
             .len()
-            .checked_add(usize::from(self.runtime_dense_readers))
+            .checked_add(usize::from(
+                self.runtime_dense_readers || self.runtime_layout,
+            ))
             .and_then(|count| count.checked_mul(std::mem::size_of::<u32>()))
             .ok_or("runtime matmul push-constant byte count overflow")?;
         if constants.len() != expected_bytes {
@@ -1216,6 +1263,7 @@ mod tests {
             epilogue_add: false,
             epilogue_activation: conv::Activation::None,
             runtime_dense_readers: false,
+            runtime_layout: false,
             weights_packed: false,
         }
     }
@@ -1282,6 +1330,7 @@ mod tests {
             epilogue_add: false,
             epilogue_activation: conv::Activation::None,
             runtime_dense_readers: false,
+            runtime_layout: false,
             weights_packed: false,
         };
         assert!(executable.resolve_shape(&constants(&[99, 99])).is_err());

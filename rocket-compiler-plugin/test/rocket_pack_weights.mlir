@@ -17,7 +17,7 @@
   output_width = 0 : i32, output_height = 0 : i32, output_channels = 0 : i32,
   weights_width = 0 : i32, weights_height = 0 : i32, stride = 1 : i32,
   depthwise = false,
-  runtime_dense_readers = true,
+  runtime_layout = true,
   input_zero_point = 0 : i32, output_zero_point = 0 : i32, weights_zero_point = 0 : i32,
   input_scale = 1.0 : f32, weights_scale = 1.0 : f32, output_scale = 1.0 : f32,
   truncate_bits = 0 : i32,
