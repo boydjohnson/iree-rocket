@@ -340,9 +340,79 @@ pub fn chain_identity(
     Ok(())
 }
 
+/// What the compiler declared about one dispatch's layout, as the trailing
+/// `u32` push constant carries it (`Conv2DDef.runtime_layout` and its
+/// twins). COMPILER_ROADMAP.md 6.2, first form.
+///
+/// The word is `packed_inputs | (packed_readers << 16)`, so zero -- what
+/// every shim passes as a literal, and what an executable built without
+/// `rocket-assign-layout` sees -- is "every input dense, always write the
+/// dense output": exactly the runtime's behaviour before any layout was
+/// declared. `packed_inputs` has bit `i` set when input binding `i` reads
+/// its producer's cube in place ([`chain_identity`] held at compile time);
+/// `packed_readers` is how many Rocket dispatches read this dispatch's
+/// result that way, or zero when any other reader exists. The driver
+/// attempts a chain only on a declared-packed input, and skips the dense
+/// output write only when exactly `packed_readers` consumers chained on the
+/// same command buffer -- a reader on a later command buffer leaves the
+/// tally short and the write happens, which is what "first form" means.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct DispatchLayout {
+    pub packed_inputs: u16,
+    pub packed_readers: u16,
+}
+
+impl DispatchLayout {
+    pub const READERS_SHIFT: u32 = 16;
+
+    pub fn from_word(word: u32) -> DispatchLayout {
+        DispatchLayout {
+            packed_inputs: (word & 0xFFFF) as u16,
+            packed_readers: (word >> Self::READERS_SHIFT) as u16,
+        }
+    }
+
+    pub fn to_word(self) -> u32 {
+        u32::from(self.packed_inputs) | (u32::from(self.packed_readers) << Self::READERS_SHIFT)
+    }
+
+    /// Whether input binding `index` was declared to read its producer's
+    /// cube in place.
+    pub fn input_packed(self, index: u32) -> bool {
+        index < 16 && self.packed_inputs & (1 << index) != 0
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn the_layout_word_round_trips_and_zero_is_all_dense() {
+        let zero = DispatchLayout::from_word(0);
+        assert_eq!(zero, DispatchLayout::default());
+        assert_eq!(zero.packed_readers, 0);
+        assert!(!zero.input_packed(0));
+        let layout = DispatchLayout {
+            packed_inputs: 0b1001,
+            packed_readers: 3,
+        };
+        assert_eq!(layout.to_word(), 0x0003_0009);
+        assert_eq!(DispatchLayout::from_word(0x0003_0009), layout);
+        assert!(layout.input_packed(0));
+        assert!(!layout.input_packed(1));
+        assert!(layout.input_packed(3));
+        assert!(!layout.input_packed(16));
+        // An older executable's plain reader count decodes as a count with
+        // no packed input, which is what it meant.
+        assert_eq!(
+            DispatchLayout::from_word(2 << DispatchLayout::READERS_SHIFT),
+            DispatchLayout {
+                packed_inputs: 0,
+                packed_readers: 2,
+            }
+        );
+    }
 
     fn conv(elem: u32, w: u32, h: u32, c: u32) -> CubeGeometry {
         cube_geometry(CubeKind::Conv, elem, w, h, c).unwrap()

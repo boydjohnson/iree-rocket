@@ -545,8 +545,9 @@ dispatches need not make a model faster.
 
 ## 6. Own the layout at compile time: packed tensors, boundary-only repacks, prepacked weights
 
-**Status 2026-09-10: steps 1 and 2 of 6.6 -- the layout contract (6.1) and
-compile-time weight packing (6.3) -- landed; steps 3 and 4 not started.** This section exists because the end state the
+**Status 2026-09-10: steps 1 to 3 of 6.6 -- the layout contract (6.1),
+compile-time weight packing (6.3) and the declared layout's first form
+(6.2) -- landed; step 4 not started.** This section exists because the end state the
 repository is working toward was only ever stated by halves. Put in one
 place, for a model whose input extents are static:
 
@@ -554,14 +555,17 @@ place, for a model whose input extents are static:
    -- **landed**, sections 2 and 3;
 2. the compiler knows, per tensor edge, whether the tensor is in the NPU's
    packed `NC1HWC2` cube layout or in IREE's dense row-major one, and the
-   executable says so rather than the driver guessing -- **not started**;
+   executable says so rather than the driver guessing -- **landed in its
+   first form**, 6.2: declared per dispatch, honoured within a command
+   buffer;
 3. every constant filter is stored in the `.vmfb` already in the CNA's
    blocked coefficient order, so the driver never packs a weight --
    **landed**, 6.3;
 4. activations are packed and unpacked only where a CPU dispatch meets an
    NPU one, never between two NPU dispatches -- **the runtime mechanism
-   landed as ISSUES.md P2 steps 2, 4 and 5; the compile-time form has not
-   been designed**.
+   landed as ISSUES.md P2 steps 2, 4 and 5; its compile-time form is 6.2's
+   first form, landed**: the decision is the compiler's, the runtime checks
+   it, and only a command-buffer boundary still forces a dense write.
 
 Items 2 to 4 are one piece of work, and this section is its design and
 order. The reason it belongs in this file and not in ISSUES.md is that
@@ -756,6 +760,69 @@ the compiler cannot prove packable is dense, the audit prints why, and
 `--strict-offload` gains a layout mode that fails on any NPU -> NPU edge
 left dense.
 
+**Landed 2026-09-10, the first form.** The declaration is
+`rocket_core::layout::DispatchLayout`, one trailing `u32` push constant per
+dispatch -- `packed_inputs | (packed_readers << 16)` -- carried under a
+`runtime_layout` flag on every def (`runtime_dense_readers` is retired but
+still decoded, as a bare count). Zero means "every input dense, always
+write", which is what every shim passes as a literal and what an executable
+built without the pass sees, so nothing widens and old `.vmfb`s keep their
+old behaviour. `rocket-assign-layout` replaces `rocket-mark-dense-readers`
+at the same flow-phase slot: for every Rocket dispatch it builds each
+binding's cube through `rocket_plan_cube_geometry` (conv output extents
+from `rocket_plan_conv`, so the formula is not restated), decides each
+NPU -> NPU edge with `rocket_plan_chain_identity`, counts the readers that
+take the cube, writes the word, and records every edge and every reader
+count in `rocket.layout_decisions` on the function. `rocket-compiler`
+captures that record at the flow phase, the audit prints it (`Layout (N
+NPU -> NPU edge(s): P packed, D dense ...)` followed by one line per edge
+with the failing condition), the JSON gains a `layout` section, and
+`--strict-layout` fails a compile that leaves an NPU -> NPU edge dense.
+
+The driver now *checks*. `chainable_cube` looks for a producer only on an
+input declared packed; a same-command-buffer producer whose cube does not
+match the declared geometry is an `INTERNAL` failure, not a repack; a
+declared reader whose producer is on an earlier command buffer, or fanned
+out and published no cube, falls back to the repack -- the producer kept its
+dense write in exactly those cases, because its tally of chained readers
+stayed short. That fallback is what "first form" means, and why the reader
+count survives it: the count is how the runtime learns that an edge crossed
+a command buffer. `ROCKET_CHAIN` and `ROCKET_LAZY_COMPACT` are gone;
+`ROCKET_LAYOUT=debug` names what the runtime did with each declaration.
+
+Why a push constant rather than a def field, when 6.3 chose a def field for
+`weights_packed`: an executable is shared by every dispatch of its shape
+class, and which of *this* dispatch's producers is a Rocket dispatch with an
+agreeing cube is a per-site fact. The def field is the right home for a
+property of the executable's bytes; the edge is a property of the program.
+Two choices from the sketch above are now settled by measurement rather
+than argument: the disagreeing-edge decision point is *reported, dense*
+(padding a producer's programmed width is not built), and the runtime's
+per-kind offer rules (a pool or element-wise producer must be exact, a conv
+or matmul need only be whole-atom) are restated in the pass rather than
+relaxed, so the declared edges are the runtime's former decisions and no
+others.
+
+Acceptance, planck 2026-09-10, fp16 survey models, the previous runtime on
+the previous `.vmfb` (`ROCKET_CHAIN=debug`, `ROCKET_LAZY_COMPACT=debug`)
+against the new runtime on the declared one (`ROCKET_LAYOUT=debug`). Wide
+ResNet50: 57 chains taken / 31 dense writes skipped / 23 kept before, 57
+declared-and-chained / 31 / 23 after, 0 fallbacks, 0 `INTERNAL`; the
+runtime's 9 "no producer on this command buffer" declines are the
+compiler's 9 CPU- or argument-fed edges and its 1 pool decline the
+compiler's 1 dense edge. MobileNetV2: 2 / 2 / 35 both ways. Outputs
+bit-identical in every arm, including an undeclared `.vmfb` on the new
+runtime, which runs all-dense (0 skipped, 54 kept) as `ROCKET_CHAIN=0`
+did. The audit on Wide ResNet50 prints 58 NPU -> NPU edges, 57 packed and
+one dense: the last 7x7 convolution feeding the average pool, `producer
+surfaces 49 pixels apart, consumer packs at 52`. That edge is the PPU's
+four-rounded surface stride and it is structural on every ResNet, so the
+acceptance line "`--strict-offload` layout mode on ResNet50 passes" was
+never achievable as written: `--strict-layout` fails on ResNet-family
+models by design, naming that edge, which is the report the section asked
+for. Making it pass is the padding decision above -- programming the pool
+at a 49-pixel stride, or the consumer at 52 -- and is not built.
+
 ### 6.3 Weights packed at compile time
 
 The packers are `pack_hwcf_to_rocket_weights`, `_padded`, `_int4`,
@@ -942,6 +1009,7 @@ dense, reported.
    `runtime_dense_readers` with them. Acceptance: bit-identical to the
    current chain on every model in the survey harness; the audit prints
    every edge; `--strict-offload` layout mode on ResNet50 passes.
+   **Landed 2026-09-10**; see 6.2 for what the acceptance measured.
 4. **Packed IREE buffers, second form (6.2)**, after the multicore
    ownership decision. Acceptance: a later-command-buffer reader chains; the
    count is gone from the wire.
@@ -961,7 +1029,7 @@ the whole model.
 | D: expanded spatial/M and N tiling | Tail/halo/coverage and scratch tests; CPU-reference comparisons and RK3588 execution on both sides of each newly admitted boundary. |
 | E: reduction tiling and tuning | Nonzero initial accumulators, bias/activation/quantization tests; precision/overflow tests; full-model correctness and end-to-end performance measurements. |
 | F: layout contract and prepacked weights (6.1, 6.3) | **Met 2026-09-10.** `OutputCube` computed through `rocket-core::layout` with the driver bit-identical on every surveyed model; packed weight bytes byte-identical to the driver packer on every conv fixture; first-inference latency and `.vmfb` size before and after (6.3). |
-| G: compiler-declared layout (6.2) | Per-binding encoding on the wire; driver checks and never repacks a declared-packed input; the chain fixtures bit-exact with `ROCKET_CHAIN`/`ROCKET_LAZY_COMPACT` removed; the audit names every NPU -> NPU edge packed or dense with a reason; `--strict-offload` layout mode. |
+| G: compiler-declared layout (6.2) | **First form met 2026-09-10** (6.2). Per-binding encoding on the wire; driver checks and never repacks a declared-packed input on the same command buffer; the chain fixtures bit-exact with `ROCKET_CHAIN`/`ROCKET_LAZY_COMPACT` removed; the audit names every NPU -> NPU edge packed or dense with a reason; `--strict-layout`. |
 
 Use addressing-sensitive dense/selector inputs, odd channels, multi-surface
 outputs, stride and padding cases, and adjacent NPU producers/consumers.

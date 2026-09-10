@@ -26,13 +26,14 @@
 // dispatch's result), whose dimensions are not all constants, or whose
 // bytes the packer refuses is left alone and counted in the remark.
 //
-// Runs at the flow phase after rocket-mark-dense-readers; rocket-compiler
+// Runs at the flow phase after rocket-assign-layout; rocket-compiler
 // drives it by name the same way.
 
 #include <optional>
 #include <string>
 #include <vector>
 
+#include "RocketDispatchQuery.h"
 #include "iree/compiler/Dialect/Flow/IR/FlowOps.h"
 #include "iree/compiler/Dialect/HAL/IR/HALOps.h"
 #include "iree/compiler/Dialect/Util/IR/UtilDialect.h"
@@ -50,104 +51,11 @@
 namespace mlir::iree_compiler::IREE::HAL {
 namespace {
 
-constexpr StringLiteral kRocketBackend = "rocket";
+using namespace rocket_query;
+
 constexpr StringLiteral kWeightsPackedKey = "weights_packed";
 
-// The Rocket executable a dispatch runs on, or nothing when it is not a
-// Rocket dispatch or names more than one entry point.
-struct DispatchTarget {
-  IREE::HAL::ExecutableOp executableOp;
-  IREE::HAL::ExecutableVariantOp variantOp;
-  SymbolRefAttr entryPoint;
-  IREE::HAL::ExecutableTargetAttr target;
-};
-
-std::optional<DispatchTarget> rocketTarget(IREE::Flow::DispatchOp dispatchOp) {
-  auto entryPoints = dispatchOp.getEntryPointsAttr();
-  if (!entryPoints || entryPoints.size() != 1) {
-    return std::nullopt;
-  }
-  auto entryPoint = dyn_cast<SymbolRefAttr>(entryPoints[0]);
-  if (!entryPoint) {
-    return std::nullopt;
-  }
-  Operation *symbol = SymbolTable::lookupNearestSymbolFrom(dispatchOp, entryPoint);
-  auto exportOp = dyn_cast_or_null<IREE::HAL::ExecutableExportOp>(symbol);
-  if (!exportOp) {
-    return std::nullopt;
-  }
-  auto variantOp = exportOp->getParentOfType<IREE::HAL::ExecutableVariantOp>();
-  auto executableOp = variantOp ? variantOp->getParentOfType<IREE::HAL::ExecutableOp>()
-                                : IREE::HAL::ExecutableOp();
-  if (!variantOp || !executableOp) {
-    return std::nullopt;
-  }
-  IREE::HAL::ExecutableTargetAttr target = variantOp.getTarget();
-  if (!target || target.getBackend().getValue() != kRocketBackend) {
-    return std::nullopt;
-  }
-  return DispatchTarget{executableOp, variantOp, entryPoint, target};
-}
-
-// One dimension of the dispatch: the push constant the target lists it as,
-// which must be an `arith.constant` here, or the config's static value.
-std::optional<int64_t> dimension(DictionaryAttr config, ArrayAttr runtimeDims,
-                                 OperandRange arguments, StringRef name) {
-  if (runtimeDims) {
-    for (auto [index, attr] : llvm::enumerate(runtimeDims)) {
-      auto listed = dyn_cast<StringAttr>(attr);
-      if (!listed || listed.getValue() != name) {
-        continue;
-      }
-      if (index >= arguments.size()) {
-        return std::nullopt;
-      }
-      auto constantOp = arguments[index].getDefiningOp<arith::ConstantOp>();
-      if (!constantOp) {
-        return std::nullopt;
-      }
-      auto value = dyn_cast<IntegerAttr>(constantOp.getValue());
-      if (!value) {
-        return std::nullopt;
-      }
-      return value.getInt();
-    }
-  }
-  auto value = dyn_cast_or_null<IntegerAttr>(config.get(name));
-  if (!value) {
-    return std::nullopt;
-  }
-  return value.getInt();
-}
-
-size_t arrayLength(DictionaryAttr config, StringRef key) {
-  auto array = dyn_cast_or_null<ArrayAttr>(config.get(key));
-  return array ? array.size() : 0;
-}
-
-// The wire's precision spellings, to the ABI's codes. The pack descriptor
-// needs the rung for the element width and the packer selection only.
-std::optional<uint32_t> precisionCode(DictionaryAttr config) {
-  auto precision = dyn_cast_or_null<StringAttr>(config.get("precision"));
-  if (!precision) {
-    return std::nullopt;
-  }
-  StringRef name = precision.getValue();
-  if (name == "fp16") {
-    return ROCKET_PLAN_PRECISION_FP16;
-  }
-  if (name == "int8") {
-    return ROCKET_PLAN_PRECISION_INT8;
-  }
-  if (name == "int8_accumulator") {
-    return ROCKET_PLAN_PRECISION_INT8_ACCUMULATOR;
-  }
-  return std::nullopt;
-}
-
-size_t elementBytes(uint32_t precision) {
-  return precision == ROCKET_PLAN_PRECISION_FP16 ? 2 : 1;
-}
+size_t elementBytes(uint32_t precision) { return inputElementBytes(precision); }
 
 // Everything the packer needs about one dispatch, read from the target
 // config and the constant push constants. Either a conv or a matmul
@@ -174,13 +82,7 @@ std::optional<PackRequest> readRequest(DictionaryAttr config,
   if (!precision) {
     return std::nullopt;
   }
-  auto runtimeDims = dyn_cast_or_null<ArrayAttr>(config.get("runtime_dimensions"));
-  size_t constants = arrayLength(config, "runtime_dimensions") +
-                     arrayLength(config, "runtime_quantization");
-  if (auto declared = dyn_cast_or_null<BoolAttr>(config.get("runtime_dense_readers"));
-      declared && declared.getValue()) {
-    ++constants;
-  }
+  size_t constants = constantCount(config);
   OperandRange arguments = dispatchOp.getArguments();
   if (arguments.size() < constants + 2) {
     return std::nullopt;
@@ -197,9 +99,9 @@ std::optional<PackRequest> readRequest(DictionaryAttr config,
   }
   llvm::raw_string_ostream key(request.key);
   if (kernel.getValue() == "matmul") {
-    auto m = dimension(config, runtimeDims, arguments, "m");
-    auto k = dimension(config, runtimeDims, arguments, "k");
-    auto n = dimension(config, runtimeDims, arguments, "n");
+    auto m = dimension(config, arguments, "m");
+    auto k = dimension(config, arguments, "k");
+    auto n = dimension(config, arguments, "n");
     if (!m || !k || !n) {
       return std::nullopt;
     }
@@ -217,13 +119,13 @@ std::optional<PackRequest> readRequest(DictionaryAttr config,
   if (kernel.getValue() != "conv2d") {
     return std::nullopt;
   }
-  auto width = dimension(config, runtimeDims, arguments, "input_width");
-  auto height = dimension(config, runtimeDims, arguments, "input_height");
-  auto cin = dimension(config, runtimeDims, arguments, "input_channels");
-  auto cout = dimension(config, runtimeDims, arguments, "output_channels");
-  auto kw = dimension(config, runtimeDims, arguments, "weights_width");
-  auto kh = dimension(config, runtimeDims, arguments, "weights_height");
-  auto stride = dimension(config, runtimeDims, arguments, "stride");
+  auto width = dimension(config, arguments, "input_width");
+  auto height = dimension(config, arguments, "input_height");
+  auto cin = dimension(config, arguments, "input_channels");
+  auto cout = dimension(config, arguments, "output_channels");
+  auto kw = dimension(config, arguments, "weights_width");
+  auto kh = dimension(config, arguments, "weights_height");
+  auto stride = dimension(config, arguments, "stride");
   if (!width || !height || !cin || !cout || !kw || !kh || !stride) {
     return std::nullopt;
   }

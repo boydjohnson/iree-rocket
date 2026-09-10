@@ -36,7 +36,7 @@
   output_width = 0 : i32, output_height = 0 : i32, output_channels = 0 : i32,
   weights_width = 0 : i32, weights_height = 0 : i32, stride = 1 : i32,
   depthwise = false,
-  runtime_dense_readers = true,
+  runtime_layout = true,
   input_zero_point = 0 : i32, output_zero_point = 0 : i32, weights_zero_point = 0 : i32,
   input_scale = 1.0 : f32, weights_scale = 1.0 : f32, output_scale = 1.0 : f32,
   truncate_bits = 0 : i32,
@@ -70,7 +70,7 @@
   output_width = 0 : i32, output_height = 0 : i32, output_channels = 0 : i32,
   weights_width = 0 : i32, weights_height = 0 : i32, stride = 1 : i32,
   depthwise = true,
-  runtime_dense_readers = true,
+  runtime_layout = true,
   input_zero_point = 0 : i32, output_zero_point = 0 : i32, weights_zero_point = 0 : i32,
   input_scale = 1.0 : f32, weights_scale = 1.0 : f32, output_scale = 1.0 : f32,
   truncate_bits = 0 : i32,
@@ -88,7 +88,7 @@
   output_width = 0 : i32, output_height = 0 : i32, output_channels = 0 : i32,
   weights_width = 0 : i32, weights_height = 0 : i32, stride = 2 : i32,
   depthwise = false,
-  runtime_dense_readers = true,
+  runtime_layout = true,
   input_zero_point = 0 : i32, output_zero_point = 0 : i32, weights_zero_point = 0 : i32,
   input_scale = 1.0 : f32, weights_scale = 1.0 : f32, output_scale = 1.0 : f32,
   truncate_bits = 0 : i32,
@@ -106,7 +106,7 @@
   output_width = 0 : i32, output_height = 0 : i32, output_channels = 0 : i32,
   weights_width = 0 : i32, weights_height = 0 : i32, stride = 3 : i32,
   depthwise = false,
-  runtime_dense_readers = true,
+  runtime_layout = true,
   input_zero_point = 0 : i32, output_zero_point = 0 : i32, weights_zero_point = 0 : i32,
   input_scale = 1.0 : f32, weights_scale = 1.0 : f32, output_scale = 1.0 : f32,
   truncate_bits = 0 : i32,
@@ -124,7 +124,7 @@
   output_width = 0 : i32, output_height = 0 : i32, output_channels = 0 : i32,
   weights_width = 0 : i32, weights_height = 0 : i32, stride = 4 : i32,
   depthwise = false,
-  runtime_dense_readers = true,
+  runtime_layout = true,
   input_zero_point = 0 : i32, output_zero_point = 0 : i32, weights_zero_point = 0 : i32,
   input_scale = 1.0 : f32, weights_scale = 1.0 : f32, output_scale = 1.0 : f32,
   truncate_bits = 0 : i32,
@@ -142,7 +142,7 @@
   output_width = 0 : i32, output_height = 0 : i32, output_channels = 0 : i32,
   weights_width = 0 : i32, weights_height = 0 : i32, stride = 2 : i32,
   depthwise = true,
-  runtime_dense_readers = true,
+  runtime_layout = true,
   input_zero_point = 0 : i32, output_zero_point = 0 : i32, weights_zero_point = 0 : i32,
   input_scale = 1.0 : f32, weights_scale = 1.0 : f32, output_scale = 1.0 : f32,
   truncate_bits = 0 : i32,
@@ -160,7 +160,7 @@
   output_width = 0 : i32, output_height = 0 : i32, output_channels = 0 : i32,
   weights_width = 0 : i32, weights_height = 0 : i32, stride = 3 : i32,
   depthwise = true,
-  runtime_dense_readers = true,
+  runtime_layout = true,
   input_zero_point = 0 : i32, output_zero_point = 0 : i32, weights_zero_point = 0 : i32,
   input_scale = 1.0 : f32, weights_scale = 1.0 : f32, output_scale = 1.0 : f32,
   truncate_bits = 0 : i32,
@@ -178,7 +178,7 @@
   output_width = 0 : i32, output_height = 0 : i32, output_channels = 0 : i32,
   weights_width = 0 : i32, weights_height = 0 : i32, stride = 4 : i32,
   depthwise = true,
-  runtime_dense_readers = true,
+  runtime_layout = true,
   input_zero_point = 0 : i32, output_zero_point = 0 : i32, weights_zero_point = 0 : i32,
   input_scale = 1.0 : f32, weights_scale = 1.0 : f32, output_scale = 1.0 : f32,
   truncate_bits = 0 : i32,
@@ -221,7 +221,7 @@
   output_width = 0 : i32, output_height = 0 : i32, output_channels = 0 : i32,
   weights_width = 0 : i32, weights_height = 0 : i32, stride = 1 : i32,
   depthwise = false,
-  runtime_dense_readers = true,
+  runtime_layout = true,
   input_zero_point = 0 : i32, output_zero_point = 0 : i32, weights_zero_point = 0 : i32,
   input_scale = 1.0 : f32, weights_scale = 1.0 : f32, output_scale = 1.0 : f32,
   truncate_bits = 0 : i32,
@@ -239,7 +239,7 @@
   output_width = 0 : i32, output_height = 0 : i32, output_channels = 0 : i32,
   weights_width = 0 : i32, weights_height = 0 : i32, stride = 1 : i32,
   depthwise = true,
-  runtime_dense_readers = true,
+  runtime_layout = true,
   input_zero_point = 0 : i32, output_zero_point = 0 : i32, weights_zero_point = 0 : i32,
   input_scale = 1.0 : f32, weights_scale = 1.0 : f32, output_scale = 1.0 : f32,
   truncate_bits = 0 : i32,
@@ -257,7 +257,7 @@
   output_width = 0 : i32, output_height = 0 : i32, output_channels = 0 : i32,
   weights_width = 0 : i32, weights_height = 0 : i32, stride = 2 : i32,
   depthwise = true,
-  runtime_dense_readers = true,
+  runtime_layout = true,
   input_zero_point = 0 : i32, output_zero_point = 0 : i32, weights_zero_point = 0 : i32,
   input_scale = 1.0 : f32, weights_scale = 1.0 : f32, output_scale = 1.0 : f32,
   truncate_bits = 0 : i32,
@@ -295,7 +295,7 @@
 // extent arrive as push constants.
 #rocket_pooling_avg_target = #hal.executable.target<"rocket", "rocket-flatbuffer-v1", {
   kernel = "pooling",
-  runtime_dense_readers = true,
+  runtime_layout = true,
   input_width = 0 : i32, input_height = 0 : i32, channels = 0 : i32,
   output_width = 0 : i32, output_height = 0 : i32,
   kernel_width = 0 : i32, kernel_height = 0 : i32,
@@ -328,7 +328,7 @@
 // Nothing above 2 is, so there is deliberately no s3/s4 target.
 #rocket_pooling_max_target = #hal.executable.target<"rocket", "rocket-flatbuffer-v1", {
   kernel = "pooling",
-  runtime_dense_readers = true,
+  runtime_layout = true,
   input_width = 0 : i32, input_height = 0 : i32, channels = 0 : i32,
   output_width = 0 : i32, output_height = 0 : i32,
   kernel_width = 0 : i32, kernel_height = 0 : i32,
@@ -342,7 +342,7 @@
 
 #rocket_pooling_max_target_s2 = #hal.executable.target<"rocket", "rocket-flatbuffer-v1", {
   kernel = "pooling",
-  runtime_dense_readers = true,
+  runtime_layout = true,
   input_width = 0 : i32, input_height = 0 : i32, channels = 0 : i32,
   output_width = 0 : i32, output_height = 0 : i32,
   kernel_width = 0 : i32, kernel_height = 0 : i32,
@@ -372,7 +372,7 @@
 // reduction, and this path is f32 in, fp16 on the hardware.
 #rocket_pooling_min_target = #hal.executable.target<"rocket", "rocket-flatbuffer-v1", {
   kernel = "pooling",
-  runtime_dense_readers = true,
+  runtime_layout = true,
   input_width = 0 : i32, input_height = 0 : i32, channels = 0 : i32,
   output_width = 0 : i32, output_height = 0 : i32,
   kernel_width = 0 : i32, kernel_height = 0 : i32,
@@ -386,7 +386,7 @@
 
 #rocket_pooling_min_target_s2 = #hal.executable.target<"rocket", "rocket-flatbuffer-v1", {
   kernel = "pooling",
-  runtime_dense_readers = true,
+  runtime_layout = true,
   input_width = 0 : i32, input_height = 0 : i32, channels = 0 : i32,
   output_width = 0 : i32, output_height = 0 : i32,
   kernel_width = 0 : i32, kernel_height = 0 : i32,
@@ -410,7 +410,7 @@
 // matmul shape inside the channel ceilings.
 #rocket_matmul_target = #hal.executable.target<"rocket", "rocket-flatbuffer-v1", {
   kernel = "matmul",
-  runtime_dense_readers = true,
+  runtime_layout = true,
   m = 0 : i32, k = 0 : i32, n = 0 : i32,
   input_zero_point = 0 : i32, output_zero_point = 0 : i32, weights_zero_point = 0 : i32,
   input_scale = 1.0 : f32, weights_scale = 1.0 : f32, output_scale = 1.0 : f32,
@@ -441,7 +441,7 @@
 // state here.
 #rocket_elementwise_add_target = #hal.executable.target<"rocket", "rocket-flatbuffer-v1", {
   kernel = "elementwise_binary",
-  runtime_dense_readers = true,
+  runtime_layout = true,
   width = 0 : i32, height = 0 : i32, channels = 0 : i32,
   op = "add",
   runtime_dimensions = ["width", "height", "channels"]
@@ -449,7 +449,7 @@
 
 #rocket_elementwise_sub_target = #hal.executable.target<"rocket", "rocket-flatbuffer-v1", {
   kernel = "elementwise_binary",
-  runtime_dense_readers = true,
+  runtime_layout = true,
   width = 0 : i32, height = 0 : i32, channels = 0 : i32,
   op = "sub",
   runtime_dimensions = ["width", "height", "channels"]
@@ -457,7 +457,7 @@
 
 #rocket_elementwise_mul_target = #hal.executable.target<"rocket", "rocket-flatbuffer-v1", {
   kernel = "elementwise_binary",
-  runtime_dense_readers = true,
+  runtime_layout = true,
   width = 0 : i32, height = 0 : i32, channels = 0 : i32,
   op = "mul",
   runtime_dimensions = ["width", "height", "channels"]
@@ -541,7 +541,7 @@
   output_width = 0 : i32, output_height = 0 : i32, output_channels = 0 : i32,
   weights_width = 0 : i32, weights_height = 0 : i32, stride = 1 : i32,
   depthwise = false,
-  runtime_dense_readers = true,
+  runtime_layout = true,
   input_zero_point = 0 : i32, output_zero_point = 0 : i32, weights_zero_point = 0 : i32,
   input_scale = 1.0 : f32, weights_scale = 1.0 : f32, output_scale = 1.0 : f32,
   truncate_bits = 0 : i32,
@@ -582,7 +582,7 @@
   output_width = 0 : i32, output_height = 0 : i32, output_channels = 0 : i32,
   weights_width = 0 : i32, weights_height = 0 : i32, stride = 2 : i32,
   depthwise = false,
-  runtime_dense_readers = true,
+  runtime_layout = true,
   input_zero_point = 0 : i32, output_zero_point = 0 : i32, weights_zero_point = 0 : i32,
   input_scale = 1.0 : f32, weights_scale = 1.0 : f32, output_scale = 1.0 : f32,
   truncate_bits = 0 : i32,
@@ -608,7 +608,7 @@
   output_width = 0 : i32, output_height = 0 : i32, output_channels = 0 : i32,
   weights_width = 0 : i32, weights_height = 0 : i32, stride = 1 : i32,
   depthwise = false,
-  runtime_dense_readers = true,
+  runtime_layout = true,
   input_zero_point = 0 : i32, output_zero_point = 0 : i32, weights_zero_point = 0 : i32,
   input_scale = 1.0 : f32, weights_scale = 1.0 : f32, output_scale = 1.0 : f32,
   truncate_bits = 0 : i32,
@@ -626,7 +626,7 @@
   output_width = 0 : i32, output_height = 0 : i32, output_channels = 0 : i32,
   weights_width = 0 : i32, weights_height = 0 : i32, stride = 2 : i32,
   depthwise = false,
-  runtime_dense_readers = true,
+  runtime_layout = true,
   input_zero_point = 0 : i32, output_zero_point = 0 : i32, weights_zero_point = 0 : i32,
   input_scale = 1.0 : f32, weights_scale = 1.0 : f32, output_scale = 1.0 : f32,
   truncate_bits = 0 : i32,
@@ -644,7 +644,7 @@
   output_width = 0 : i32, output_height = 0 : i32, output_channels = 0 : i32,
   weights_width = 0 : i32, weights_height = 0 : i32, stride = 1 : i32,
   depthwise = false,
-  runtime_dense_readers = true,
+  runtime_layout = true,
   input_zero_point = 0 : i32, output_zero_point = 0 : i32, weights_zero_point = 0 : i32,
   input_scale = 1.0 : f32, weights_scale = 1.0 : f32, output_scale = 1.0 : f32,
   truncate_bits = 0 : i32,
@@ -663,7 +663,7 @@
   output_width = 0 : i32, output_height = 0 : i32, output_channels = 0 : i32,
   weights_width = 0 : i32, weights_height = 0 : i32, stride = 2 : i32,
   depthwise = false,
-  runtime_dense_readers = true,
+  runtime_layout = true,
   input_zero_point = 0 : i32, output_zero_point = 0 : i32, weights_zero_point = 0 : i32,
   input_scale = 1.0 : f32, weights_scale = 1.0 : f32, output_scale = 1.0 : f32,
   truncate_bits = 0 : i32,
@@ -686,7 +686,7 @@
   output_width = 0 : i32, output_height = 0 : i32, output_channels = 0 : i32,
   weights_width = 0 : i32, weights_height = 0 : i32, stride = 1 : i32,
   depthwise = false,
-  runtime_dense_readers = true,
+  runtime_layout = true,
   input_zero_point = 0 : i32, output_zero_point = 0 : i32, weights_zero_point = 0 : i32,
   input_scale = 1.0 : f32, weights_scale = 1.0 : f32, output_scale = 1.0 : f32,
   truncate_bits = 0 : i32,
@@ -705,7 +705,7 @@
   output_width = 0 : i32, output_height = 0 : i32, output_channels = 0 : i32,
   weights_width = 0 : i32, weights_height = 0 : i32, stride = 1 : i32,
   depthwise = false,
-  runtime_dense_readers = true,
+  runtime_layout = true,
   input_zero_point = 0 : i32, output_zero_point = 0 : i32, weights_zero_point = 0 : i32,
   input_scale = 1.0 : f32, weights_scale = 1.0 : f32, output_scale = 1.0 : f32,
   truncate_bits = 0 : i32,
@@ -731,7 +731,7 @@
   output_width = 0 : i32, output_height = 0 : i32, output_channels = 0 : i32,
   weights_width = 0 : i32, weights_height = 0 : i32, stride = 1 : i32,
   depthwise = true,
-  runtime_dense_readers = true,
+  runtime_layout = true,
   input_zero_point = 0 : i32, output_zero_point = 0 : i32, weights_zero_point = 0 : i32,
   input_scale = 1.0 : f32, weights_scale = 1.0 : f32, output_scale = 1.0 : f32,
   truncate_bits = 0 : i32,
@@ -757,7 +757,7 @@
   output_width = 0 : i32, output_height = 0 : i32, output_channels = 0 : i32,
   weights_width = 0 : i32, weights_height = 0 : i32, stride = 2 : i32,
   depthwise = true,
-  runtime_dense_readers = true,
+  runtime_layout = true,
   input_zero_point = 0 : i32, output_zero_point = 0 : i32, weights_zero_point = 0 : i32,
   input_scale = 1.0 : f32, weights_scale = 1.0 : f32, output_scale = 1.0 : f32,
   truncate_bits = 0 : i32,
@@ -795,7 +795,7 @@
   output_width = 0 : i32, output_height = 0 : i32, output_channels = 0 : i32,
   weights_width = 0 : i32, weights_height = 0 : i32, stride = 1 : i32,
   depthwise = false,
-  runtime_dense_readers = true,
+  runtime_layout = true,
   input_zero_point = 0 : i32, output_zero_point = 0 : i32, weights_zero_point = 0 : i32,
   input_scale = 1.0 : f32, weights_scale = 1.0 : f32, output_scale = 0.0 : f32,
   truncate_bits = 0 : i32,
@@ -832,7 +832,7 @@
   output_width = 0 : i32, output_height = 0 : i32, output_channels = 0 : i32,
   weights_width = 0 : i32, weights_height = 0 : i32, stride = 1 : i32,
   depthwise = true,
-  runtime_dense_readers = true,
+  runtime_layout = true,
   input_zero_point = 0 : i32, output_zero_point = 0 : i32, weights_zero_point = 0 : i32,
   input_scale = 1.0 : f32, weights_scale = 1.0 : f32, output_scale = 0.0 : f32,
   truncate_bits = 0 : i32,
@@ -853,19 +853,21 @@
 ]>
 
 // Six dimensions plus the two runtime quantization parameters, plus the one
-// trailing dense-reader count every convolution target declares with
-// `runtime_dense_readers` (see below). The count has to match the target's
-// lists exactly -- RocketTarget.cpp checks it and the driver reads the
-// constants in the same order, dimensions first.
+// trailing layout word every Rocket target declares with `runtime_layout`
+// (see below). The count has to match the target's lists exactly --
+// RocketTarget.cpp checks it and the driver reads the constants in the same
+// order, dimensions first.
 //
-// The dense-reader count is the only push constant a shim does not compute
-// from its operands: every shim passes a literal 0 ("always write the dense
-// output") and `rocket-mark-dense-readers`, which rocket-compiler runs at
-// the flow phase, replaces it per dispatch with the number of Rocket
-// dispatches that read the result once the program is final. The driver
-// skips the dispatch's dense output write when exactly that many consumers
-// on its command buffer read the output cube in place -- ISSUES.md P2, the
-// compaction half.
+// The layout word is the only push constant a shim does not compute from
+// its operands: every shim passes a literal 0 ("every input dense, always
+// write the dense output") and `rocket-assign-layout`, which rocket-compiler
+// runs at the flow phase, replaces it per dispatch once the program is
+// final: bits 0..15 say which input bindings read their producer's NC1HWC2
+// cube in place (the compiler proved the geometries identical), bits 16..31
+// how many Rocket dispatches read this result that way. The driver chains
+// only the declared inputs and skips the dense output write when exactly
+// that many consumers on its command buffer chained -- ISSUES.md P2 and
+// COMPILER_ROADMAP.md 6.2, the first form.
 // A residual epilogue's dispatch takes one more read-only binding: the
 // skip tensor, in the output's own geometry, between the bias and the
 // output (`Conv2DDef.epilogue_add`).
@@ -1381,10 +1383,10 @@ module attributes {transform.with_named_sequence} {
     %zero_bias = linalg.fill ins(%zero_f16 : f16)
         outs(%zero_bias_empty : tensor<?xf16>) -> tensor<?xf16>
 
-    %dense_readers_i32 = arith.constant 0 : i32
+    %layout_i32 = arith.constant 0 : i32
     %raw_f16 = flow.dispatch
         @rocket_matmul_executable::@rocket_matmul_v1::@rocket_matmul(
-          %m_i32, %k_i32, %n_i32, %dense_readers_i32,
+          %m_i32, %k_i32, %n_i32, %layout_i32,
           %lhs, %rhs, %zero_bias)
         {stream.affinity = #hal.device.affinity<@rocket_device>}
         : (i32, i32, i32, i32,
@@ -1485,11 +1487,11 @@ module attributes {transform.with_named_sequence} {
         linalg.yield %narrowed : f16
     } -> tensor<1x?x?x?xf16>
 
-    %dense_readers_i32 = arith.constant 0 : i32
+    %layout_i32 = arith.constant 0 : i32
     %averaged = flow.dispatch
         @rocket_pooling_executable::@rocket_pooling_avg_v1::@rocket_pooling_avg(
           %input_width_i32, %input_height_i32, %channels_i32,
-          %kernel_width_i32, %kernel_height_i32, %dense_readers_i32,
+          %kernel_width_i32, %kernel_height_i32, %layout_i32,
           %input_f16)
         {stream.affinity = #hal.device.affinity<@rocket_device>}
         : (i32, i32, i32, i32, i32, i32,
@@ -1605,11 +1607,11 @@ module attributes {transform.with_named_sequence} {
         outs(%input_nhwc_empty : tensor<1x?x?x?xf16>)
         permutation = [0, 2, 3, 1]
 
-    %dense_readers_i32 = arith.constant 0 : i32
+    %layout_i32 = arith.constant 0 : i32
     %averaged = flow.dispatch
         @rocket_pooling_executable::@rocket_pooling_avg_v1::@rocket_pooling_avg(
           %input_width_i32, %input_height_i32, %channels_i32,
-          %kernel_width_i32, %kernel_height_i32, %dense_readers_i32,
+          %kernel_width_i32, %kernel_height_i32, %layout_i32,
           %input_nhwc)
         {stream.affinity = #hal.device.affinity<@rocket_device>}
         : (i32, i32, i32, i32, i32, i32,
@@ -1720,10 +1722,10 @@ module attributes {transform.with_named_sequence} {
         linalg.yield %narrowed : f16
     } -> tensor<1x?x?xf16>
 
-    %dense_readers_i32 = arith.constant 0 : i32
+    %layout_i32 = arith.constant 0 : i32
     %combined = flow.dispatch
         @rocket_elementwise_add_executable::@rocket_elementwise_add_v1::@rocket_elementwise_add(
-          %width_i32, %height_i32, %channels_i32, %dense_readers_i32,
+          %width_i32, %height_i32, %channels_i32, %layout_i32,
           %lhs_f16, %rhs_f16)
         {stream.affinity = #hal.device.affinity<@rocket_device>}
         : (i32, i32, i32, i32,
@@ -1814,10 +1816,10 @@ module attributes {transform.with_named_sequence} {
         linalg.yield %narrowed : f16
     } -> tensor<1x?x?xf16>
 
-    %dense_readers_i32 = arith.constant 0 : i32
+    %layout_i32 = arith.constant 0 : i32
     %combined = flow.dispatch
         @rocket_elementwise_sub_executable::@rocket_elementwise_sub_v1::@rocket_elementwise_sub(
-          %width_i32, %height_i32, %channels_i32, %dense_readers_i32,
+          %width_i32, %height_i32, %channels_i32, %layout_i32,
           %lhs_f16, %rhs_f16)
         {stream.affinity = #hal.device.affinity<@rocket_device>}
         : (i32, i32, i32, i32,
@@ -1908,10 +1910,10 @@ module attributes {transform.with_named_sequence} {
         linalg.yield %narrowed : f16
     } -> tensor<1x?x?xf16>
 
-    %dense_readers_i32 = arith.constant 0 : i32
+    %layout_i32 = arith.constant 0 : i32
     %combined = flow.dispatch
         @rocket_elementwise_mul_executable::@rocket_elementwise_mul_v1::@rocket_elementwise_mul(
-          %width_i32, %height_i32, %channels_i32, %dense_readers_i32,
+          %width_i32, %height_i32, %channels_i32, %layout_i32,
           %lhs_f16, %rhs_f16)
         {stream.affinity = #hal.device.affinity<@rocket_device>}
         : (i32, i32, i32, i32,
@@ -1986,11 +1988,11 @@ module attributes {transform.with_named_sequence} {
         linalg.yield %narrowed : f16
     } -> tensor<1x?x?x?xf16>
 
-    %dense_readers_i32 = arith.constant 0 : i32
+    %layout_i32 = arith.constant 0 : i32
     %pooled = flow.dispatch
         @rocket_pooling_max_executable::@rocket_pooling_max_v1::@rocket_pooling_max(
           %input_width_i32, %input_height_i32, %channels_i32,
-          %kernel_width_i32, %kernel_height_i32, %dense_readers_i32,
+          %kernel_width_i32, %kernel_height_i32, %layout_i32,
           %input_f16)
         {stream.affinity = #hal.device.affinity<@rocket_device>}
         : (i32, i32, i32, i32, i32, i32,
@@ -2070,11 +2072,11 @@ module attributes {transform.with_named_sequence} {
         linalg.yield %narrowed : f16
     } -> tensor<1x?x?x?xf16>
 
-    %dense_readers_i32 = arith.constant 0 : i32
+    %layout_i32 = arith.constant 0 : i32
     %pooled = flow.dispatch
         @rocket_pooling_max_executable_s2::@rocket_pooling_max_v1::@rocket_pooling_max(
           %input_width_i32, %input_height_i32, %channels_i32,
-          %kernel_width_i32, %kernel_height_i32, %dense_readers_i32,
+          %kernel_width_i32, %kernel_height_i32, %layout_i32,
           %input_f16)
         {stream.affinity = #hal.device.affinity<@rocket_device>}
         : (i32, i32, i32, i32, i32, i32,
@@ -2163,11 +2165,11 @@ module attributes {transform.with_named_sequence} {
         linalg.yield %narrowed : f16
     } -> tensor<1x?x?x?xf16>
 
-    %dense_readers_i32 = arith.constant 0 : i32
+    %layout_i32 = arith.constant 0 : i32
     %pooled = flow.dispatch
         @rocket_pooling_max_executable::@rocket_pooling_max_v1::@rocket_pooling_max(
           %input_width_i32, %input_height_i32, %channels_i32,
-          %kernel_width_i32, %kernel_height_i32, %dense_readers_i32,
+          %kernel_width_i32, %kernel_height_i32, %layout_i32,
           %input_f16)
         {stream.affinity = #hal.device.affinity<@rocket_device>}
         : (i32, i32, i32, i32, i32, i32,
@@ -2266,11 +2268,11 @@ module attributes {transform.with_named_sequence} {
         linalg.yield %narrowed : f16
     } -> tensor<1x?x?x?xf16>
 
-    %dense_readers_i32 = arith.constant 0 : i32
+    %layout_i32 = arith.constant 0 : i32
     %pooled = flow.dispatch
         @rocket_pooling_max_executable_s2::@rocket_pooling_max_v1::@rocket_pooling_max(
           %input_width_i32, %input_height_i32, %channels_i32,
-          %kernel_width_i32, %kernel_height_i32, %dense_readers_i32,
+          %kernel_width_i32, %kernel_height_i32, %layout_i32,
           %input_f16)
         {stream.affinity = #hal.device.affinity<@rocket_device>}
         : (i32, i32, i32, i32, i32, i32,
@@ -2365,11 +2367,11 @@ module attributes {transform.with_named_sequence} {
         linalg.yield %narrowed : f16
     } -> tensor<1x?x?x?xf16>
 
-    %dense_readers_i32 = arith.constant 0 : i32
+    %layout_i32 = arith.constant 0 : i32
     %pooled = flow.dispatch
         @rocket_pooling_min_executable::@rocket_pooling_min_v1::@rocket_pooling_min(
           %input_width_i32, %input_height_i32, %channels_i32,
-          %kernel_width_i32, %kernel_height_i32, %dense_readers_i32,
+          %kernel_width_i32, %kernel_height_i32, %layout_i32,
           %input_f16)
         {stream.affinity = #hal.device.affinity<@rocket_device>}
         : (i32, i32, i32, i32, i32, i32,
@@ -2447,11 +2449,11 @@ module attributes {transform.with_named_sequence} {
         linalg.yield %narrowed : f16
     } -> tensor<1x?x?x?xf16>
 
-    %dense_readers_i32 = arith.constant 0 : i32
+    %layout_i32 = arith.constant 0 : i32
     %pooled = flow.dispatch
         @rocket_pooling_min_executable_s2::@rocket_pooling_min_v1::@rocket_pooling_min(
           %input_width_i32, %input_height_i32, %channels_i32,
-          %kernel_width_i32, %kernel_height_i32, %dense_readers_i32,
+          %kernel_width_i32, %kernel_height_i32, %layout_i32,
           %input_f16)
         {stream.affinity = #hal.device.affinity<@rocket_device>}
         : (i32, i32, i32, i32, i32, i32,
@@ -2539,11 +2541,11 @@ module attributes {transform.with_named_sequence} {
         linalg.yield %narrowed : f16
     } -> tensor<1x?x?x?xf16>
 
-    %dense_readers_i32 = arith.constant 0 : i32
+    %layout_i32 = arith.constant 0 : i32
     %averaged = flow.dispatch
         @rocket_pooling_executable::@rocket_pooling_avg_v1::@rocket_pooling_avg(
           %input_width_i32, %input_height_i32, %channels_i32,
-          %kernel_width_i32, %kernel_height_i32, %dense_readers_i32,
+          %kernel_width_i32, %kernel_height_i32, %layout_i32,
           %input_f16)
         {stream.affinity = #hal.device.affinity<@rocket_device>}
         : (i32, i32, i32, i32, i32, i32,
@@ -2635,11 +2637,11 @@ module attributes {transform.with_named_sequence} {
     %zero_bias = linalg.fill ins(%zero_f16 : f16)
         outs(%zero_bias_empty : tensor<?xf16>) -> tensor<?xf16>
 
-    %dense_readers_i32 = arith.constant 0 : i32
+    %layout_i32 = arith.constant 0 : i32
     %raw_f16 = flow.dispatch
         @rocket_dynamic_pad1_executable::@rocket_dynamic_conv2d_v1::@rocket_dynamic_conv2d(
           %input_width_i32, %input_height_i32, %input_channels_i32,
-          %output_channels_i32, %weights_width_i32, %weights_height_i32, %dense_readers_i32,
+          %output_channels_i32, %weights_width_i32, %weights_height_i32, %layout_i32,
           %input_nhwc, %filter, %zero_bias)
         {stream.affinity = #hal.device.affinity<@rocket_device>}
         : (i32, i32, i32, i32, i32, i32, i32,
@@ -2728,11 +2730,11 @@ module attributes {transform.with_named_sequence} {
     %zero_bias = linalg.fill ins(%zero_f16 : f16)
         outs(%zero_bias_empty : tensor<?xf16>) -> tensor<?xf16>
 
-    %dense_readers_i32 = arith.constant 0 : i32
+    %layout_i32 = arith.constant 0 : i32
     %raw_f16 = flow.dispatch
         @rocket_dynamic_pad1_executable_s2::@rocket_dynamic_conv2d_v1::@rocket_dynamic_conv2d(
           %input_width_i32, %input_height_i32, %input_channels_i32,
-          %output_channels_i32, %weights_width_i32, %weights_height_i32, %dense_readers_i32,
+          %output_channels_i32, %weights_width_i32, %weights_height_i32, %layout_i32,
           %input_nhwc, %filter, %zero_bias)
         {stream.affinity = #hal.device.affinity<@rocket_device>}
         : (i32, i32, i32, i32, i32, i32, i32,
@@ -2830,11 +2832,11 @@ module attributes {transform.with_named_sequence} {
         linalg.yield %narrowed : f16
     } -> tensor<?xf16>
 
-    %dense_readers_i32 = arith.constant 0 : i32
+    %layout_i32 = arith.constant 0 : i32
     %raw_f16 = flow.dispatch
         @rocket_dynamic_relu_executable::@rocket_dynamic_conv2d_v1::@rocket_dynamic_conv2d(
           %input_width_i32, %input_height_i32, %input_channels_i32,
-          %output_channels_i32, %weights_width_i32, %weights_height_i32, %dense_readers_i32,
+          %output_channels_i32, %weights_width_i32, %weights_height_i32, %layout_i32,
           %input, %filter, %bias_f16)
         {stream.affinity = #hal.device.affinity<@rocket_device>}
         : (i32, i32, i32, i32, i32, i32, i32,
@@ -2905,11 +2907,11 @@ module attributes {transform.with_named_sequence} {
         linalg.yield %narrowed : f16
     } -> tensor<?xf16>
 
-    %dense_readers_i32 = arith.constant 0 : i32
+    %layout_i32 = arith.constant 0 : i32
     %raw_f16 = flow.dispatch
         @rocket_dynamic_relu_executable_s2::@rocket_dynamic_conv2d_v1::@rocket_dynamic_conv2d(
           %input_width_i32, %input_height_i32, %input_channels_i32,
-          %output_channels_i32, %weights_width_i32, %weights_height_i32, %dense_readers_i32,
+          %output_channels_i32, %weights_width_i32, %weights_height_i32, %layout_i32,
           %input, %filter, %bias_f16)
         {stream.affinity = #hal.device.affinity<@rocket_device>}
         : (i32, i32, i32, i32, i32, i32, i32,
@@ -2982,11 +2984,11 @@ module attributes {transform.with_named_sequence} {
         linalg.yield %narrowed : f16
     } -> tensor<?xf16>
 
-    %dense_readers_i32 = arith.constant 0 : i32
+    %layout_i32 = arith.constant 0 : i32
     %raw_f16 = flow.dispatch
         @rocket_dynamic_pad1_relu_executable::@rocket_dynamic_conv2d_v1::@rocket_dynamic_conv2d(
           %input_width_i32, %input_height_i32, %input_channels_i32,
-          %output_channels_i32, %weights_width_i32, %weights_height_i32, %dense_readers_i32,
+          %output_channels_i32, %weights_width_i32, %weights_height_i32, %layout_i32,
           %input_nhwc, %filter, %bias_f16)
         {stream.affinity = #hal.device.affinity<@rocket_device>}
         : (i32, i32, i32, i32, i32, i32, i32,
@@ -3059,11 +3061,11 @@ module attributes {transform.with_named_sequence} {
         linalg.yield %narrowed : f16
     } -> tensor<?xf16>
 
-    %dense_readers_i32 = arith.constant 0 : i32
+    %layout_i32 = arith.constant 0 : i32
     %raw_f16 = flow.dispatch
         @rocket_dynamic_pad1_relu_executable_s2::@rocket_dynamic_conv2d_v1::@rocket_dynamic_conv2d(
           %input_width_i32, %input_height_i32, %input_channels_i32,
-          %output_channels_i32, %weights_width_i32, %weights_height_i32, %dense_readers_i32,
+          %output_channels_i32, %weights_width_i32, %weights_height_i32, %layout_i32,
           %input_nhwc, %filter, %bias_f16)
         {stream.affinity = #hal.device.affinity<@rocket_device>}
         : (i32, i32, i32, i32, i32, i32, i32,
@@ -3133,11 +3135,11 @@ module attributes {transform.with_named_sequence} {
         linalg.yield %narrowed : f16
     } -> tensor<?xf16>
 
-    %dense_readers_i32 = arith.constant 0 : i32
+    %layout_i32 = arith.constant 0 : i32
     %raw_f16 = flow.dispatch
         @rocket_dynamic_executable::@rocket_dynamic_conv2d_v1::@rocket_dynamic_conv2d(
           %input_width_i32, %input_height_i32, %input_channels_i32,
-          %output_channels_i32, %weights_width_i32, %weights_height_i32, %dense_readers_i32,
+          %output_channels_i32, %weights_width_i32, %weights_height_i32, %layout_i32,
           %input, %filter, %bias_f16)
         {stream.affinity = #hal.device.affinity<@rocket_device>}
         : (i32, i32, i32, i32, i32, i32, i32,
@@ -3207,11 +3209,11 @@ module attributes {transform.with_named_sequence} {
         linalg.yield %narrowed : f16
     } -> tensor<?xf16>
 
-    %dense_readers_i32 = arith.constant 0 : i32
+    %layout_i32 = arith.constant 0 : i32
     %raw_f16 = flow.dispatch
         @rocket_dynamic_executable_s2::@rocket_dynamic_conv2d_v1::@rocket_dynamic_conv2d(
           %input_width_i32, %input_height_i32, %input_channels_i32,
-          %output_channels_i32, %weights_width_i32, %weights_height_i32, %dense_readers_i32,
+          %output_channels_i32, %weights_width_i32, %weights_height_i32, %layout_i32,
           %input, %filter, %bias_f16)
         {stream.affinity = #hal.device.affinity<@rocket_device>}
         : (i32, i32, i32, i32, i32, i32, i32,
@@ -3283,11 +3285,11 @@ module attributes {transform.with_named_sequence} {
         linalg.yield %narrowed : f16
     } -> tensor<?xf16>
 
-    %dense_readers_i32 = arith.constant 0 : i32
+    %layout_i32 = arith.constant 0 : i32
     %raw_f16 = flow.dispatch
         @rocket_dynamic_pad1_executable::@rocket_dynamic_conv2d_v1::@rocket_dynamic_conv2d(
           %input_width_i32, %input_height_i32, %input_channels_i32,
-          %output_channels_i32, %weights_width_i32, %weights_height_i32, %dense_readers_i32,
+          %output_channels_i32, %weights_width_i32, %weights_height_i32, %layout_i32,
           %input_nhwc, %filter, %bias_f16)
         {stream.affinity = #hal.device.affinity<@rocket_device>}
         : (i32, i32, i32, i32, i32, i32, i32,
@@ -3359,11 +3361,11 @@ module attributes {transform.with_named_sequence} {
         linalg.yield %narrowed : f16
     } -> tensor<?xf16>
 
-    %dense_readers_i32 = arith.constant 0 : i32
+    %layout_i32 = arith.constant 0 : i32
     %raw_f16 = flow.dispatch
         @rocket_dynamic_pad1_executable_s2::@rocket_dynamic_conv2d_v1::@rocket_dynamic_conv2d(
           %input_width_i32, %input_height_i32, %input_channels_i32,
-          %output_channels_i32, %weights_width_i32, %weights_height_i32, %dense_readers_i32,
+          %output_channels_i32, %weights_width_i32, %weights_height_i32, %layout_i32,
           %input_nhwc, %filter, %bias_f16)
         {stream.affinity = #hal.device.affinity<@rocket_device>}
         : (i32, i32, i32, i32, i32, i32, i32,
@@ -3433,11 +3435,11 @@ module attributes {transform.with_named_sequence} {
         linalg.yield %narrowed : f16
     } -> tensor<?xf16>
 
-    %dense_readers_i32 = arith.constant 0 : i32
+    %layout_i32 = arith.constant 0 : i32
     %raw_f16 = flow.dispatch
         @rocket_dynamic_residual_relu_executable::@rocket_dynamic_conv2d_v1::@rocket_dynamic_conv2d(
           %input_width_i32, %input_height_i32, %input_channels_i32,
-          %output_channels_i32, %weights_width_i32, %weights_height_i32, %dense_readers_i32,
+          %output_channels_i32, %weights_width_i32, %weights_height_i32, %layout_i32,
           %input, %filter, %bias_f16, %skip)
         {stream.affinity = #hal.device.affinity<@rocket_device>}
         : (i32, i32, i32, i32, i32, i32, i32,
@@ -3503,11 +3505,11 @@ module attributes {transform.with_named_sequence} {
         linalg.yield %narrowed : f16
     } -> tensor<?xf16>
 
-    %dense_readers_i32 = arith.constant 0 : i32
+    %layout_i32 = arith.constant 0 : i32
     %raw_f16 = flow.dispatch
         @rocket_dynamic_relu6_executable::@rocket_dynamic_conv2d_v1::@rocket_dynamic_conv2d(
           %input_width_i32, %input_height_i32, %input_channels_i32,
-          %output_channels_i32, %weights_width_i32, %weights_height_i32, %dense_readers_i32,
+          %output_channels_i32, %weights_width_i32, %weights_height_i32, %layout_i32,
           %input, %filter, %bias_f16)
         {stream.affinity = #hal.device.affinity<@rocket_device>}
         : (i32, i32, i32, i32, i32, i32, i32,
@@ -3580,11 +3582,11 @@ module attributes {transform.with_named_sequence} {
     %zero_bias = linalg.fill ins(%zero_f16 : f16)
         outs(%zero_bias_empty : tensor<?xf16>) -> tensor<?xf16>
 
-    %dense_readers_i32 = arith.constant 0 : i32
+    %layout_i32 = arith.constant 0 : i32
     %raw_f16 = flow.dispatch
         @rocket_dynamic_executable::@rocket_dynamic_conv2d_v1::@rocket_dynamic_conv2d(
           %input_width_i32, %input_height_i32, %input_channels_i32,
-          %output_channels_i32, %weights_width_i32, %weights_height_i32, %dense_readers_i32,
+          %output_channels_i32, %weights_width_i32, %weights_height_i32, %layout_i32,
           %input, %filter, %zero_bias)
         {stream.affinity = #hal.device.affinity<@rocket_device>}
         : (i32, i32, i32, i32, i32, i32, i32,
@@ -3663,11 +3665,11 @@ module attributes {transform.with_named_sequence} {
     %zero_bias = linalg.fill ins(%zero_f16 : f16)
         outs(%zero_bias_empty : tensor<?xf16>) -> tensor<?xf16>
 
-    %dense_readers_i32 = arith.constant 0 : i32
+    %layout_i32 = arith.constant 0 : i32
     %raw_f16 = flow.dispatch
         @rocket_dynamic_executable_s2::@rocket_dynamic_conv2d_v1::@rocket_dynamic_conv2d(
           %input_width_i32, %input_height_i32, %input_channels_i32,
-          %output_channels_i32, %weights_width_i32, %weights_height_i32, %dense_readers_i32,
+          %output_channels_i32, %weights_width_i32, %weights_height_i32, %layout_i32,
           %input, %filter, %zero_bias)
         {stream.affinity = #hal.device.affinity<@rocket_device>}
         : (i32, i32, i32, i32, i32, i32, i32,
@@ -3746,11 +3748,11 @@ module attributes {transform.with_named_sequence} {
     %zero_bias = linalg.fill ins(%zero_f16 : f16)
         outs(%zero_bias_empty : tensor<?xf16>) -> tensor<?xf16>
 
-    %dense_readers_i32 = arith.constant 0 : i32
+    %layout_i32 = arith.constant 0 : i32
     %raw_f16 = flow.dispatch
         @rocket_dynamic_executable_s3::@rocket_dynamic_conv2d_v1::@rocket_dynamic_conv2d(
           %input_width_i32, %input_height_i32, %input_channels_i32,
-          %output_channels_i32, %weights_width_i32, %weights_height_i32, %dense_readers_i32,
+          %output_channels_i32, %weights_width_i32, %weights_height_i32, %layout_i32,
           %input, %filter, %zero_bias)
         {stream.affinity = #hal.device.affinity<@rocket_device>}
         : (i32, i32, i32, i32, i32, i32, i32,
@@ -3829,11 +3831,11 @@ module attributes {transform.with_named_sequence} {
     %zero_bias = linalg.fill ins(%zero_f16 : f16)
         outs(%zero_bias_empty : tensor<?xf16>) -> tensor<?xf16>
 
-    %dense_readers_i32 = arith.constant 0 : i32
+    %layout_i32 = arith.constant 0 : i32
     %raw_f16 = flow.dispatch
         @rocket_dynamic_executable_s4::@rocket_dynamic_conv2d_v1::@rocket_dynamic_conv2d(
           %input_width_i32, %input_height_i32, %input_channels_i32,
-          %output_channels_i32, %weights_width_i32, %weights_height_i32, %dense_readers_i32,
+          %output_channels_i32, %weights_width_i32, %weights_height_i32, %layout_i32,
           %input, %filter, %zero_bias)
         {stream.affinity = #hal.device.affinity<@rocket_device>}
         : (i32, i32, i32, i32, i32, i32, i32,
@@ -3927,11 +3929,11 @@ module attributes {transform.with_named_sequence} {
         outs(%filter_chw_empty : tensor<?x?x?xf16>)
         permutation = [2, 0, 1]
 
-    %dense_readers_i32 = arith.constant 0 : i32
+    %layout_i32 = arith.constant 0 : i32
     %raw_f16 = flow.dispatch
         @rocket_dynamic_depthwise_executable::@rocket_dynamic_depthwise_conv2d_v1::@rocket_dynamic_depthwise_conv2d(
           %input_width_i32, %input_height_i32, %input_channels_i32,
-          %output_channels_i32, %weights_width_i32, %weights_height_i32, %dense_readers_i32,
+          %output_channels_i32, %weights_width_i32, %weights_height_i32, %layout_i32,
           %input, %filter_chw, %zero_bias)
         {stream.affinity = #hal.device.affinity<@rocket_device>}
         : (i32, i32, i32, i32, i32, i32, i32,
@@ -4050,11 +4052,11 @@ module attributes {transform.with_named_sequence} {
         outs(%input_nhwc_empty : tensor<1x?x?x?xf16>)
         permutation = [0, 2, 3, 1]
 
-    %dense_readers_i32 = arith.constant 0 : i32
+    %layout_i32 = arith.constant 0 : i32
     %raw_f16 = flow.dispatch
         @rocket_dynamic_depthwise_relu6_executable::@rocket_dynamic_depthwise_conv2d_v1::@rocket_dynamic_depthwise_conv2d(
           %input_width_i32, %input_height_i32, %input_channels_i32,
-          %output_channels_i32, %weights_width_i32, %weights_height_i32, %dense_readers_i32,
+          %output_channels_i32, %weights_width_i32, %weights_height_i32, %layout_i32,
           %input_nhwc, %filter, %bias_f16)
         {stream.affinity = #hal.device.affinity<@rocket_device>}
         : (i32, i32, i32, i32, i32, i32, i32,
@@ -4150,11 +4152,11 @@ module attributes {transform.with_named_sequence} {
         outs(%input_nhwc_empty : tensor<1x?x?x?xf16>)
         permutation = [0, 2, 3, 1]
 
-    %dense_readers_i32 = arith.constant 0 : i32
+    %layout_i32 = arith.constant 0 : i32
     %raw_f16 = flow.dispatch
         @rocket_dynamic_depthwise_relu6_executable_s2::@rocket_dynamic_depthwise_conv2d_v1::@rocket_dynamic_depthwise_conv2d(
           %input_width_i32, %input_height_i32, %input_channels_i32,
-          %output_channels_i32, %weights_width_i32, %weights_height_i32, %dense_readers_i32,
+          %output_channels_i32, %weights_width_i32, %weights_height_i32, %layout_i32,
           %input_nhwc, %filter, %bias_f16)
         {stream.affinity = #hal.device.affinity<@rocket_device>}
         : (i32, i32, i32, i32, i32, i32, i32,
@@ -4236,11 +4238,11 @@ module attributes {transform.with_named_sequence} {
         outs(%input_nhwc_empty : tensor<1x?x?x?xf16>)
         permutation = [0, 2, 3, 1]
 
-    %dense_readers_i32 = arith.constant 0 : i32
+    %layout_i32 = arith.constant 0 : i32
     %raw_f16 = flow.dispatch
         @rocket_dynamic_depthwise_executable::@rocket_dynamic_depthwise_conv2d_v1::@rocket_dynamic_depthwise_conv2d(
           %input_width_i32, %input_height_i32, %input_channels_i32,
-          %output_channels_i32, %weights_width_i32, %weights_height_i32, %dense_readers_i32,
+          %output_channels_i32, %weights_width_i32, %weights_height_i32, %layout_i32,
           %input_nhwc, %filter, %zero_bias)
         {stream.affinity = #hal.device.affinity<@rocket_device>}
         : (i32, i32, i32, i32, i32, i32, i32,
@@ -4346,11 +4348,11 @@ module attributes {transform.with_named_sequence} {
         outs(%input_nhwc_empty : tensor<1x?x?x?xf16>)
         permutation = [0, 2, 3, 1]
 
-    %dense_readers_i32 = arith.constant 0 : i32
+    %layout_i32 = arith.constant 0 : i32
     %raw_f16 = flow.dispatch
         @rocket_dynamic_depthwise_executable_s2::@rocket_dynamic_depthwise_conv2d_v1::@rocket_dynamic_depthwise_conv2d(
           %input_width_i32, %input_height_i32, %input_channels_i32,
-          %output_channels_i32, %weights_width_i32, %weights_height_i32, %dense_readers_i32,
+          %output_channels_i32, %weights_width_i32, %weights_height_i32, %layout_i32,
           %input_nhwc, %filter, %zero_bias)
         {stream.affinity = #hal.device.affinity<@rocket_device>}
         : (i32, i32, i32, i32, i32, i32, i32,
@@ -4456,11 +4458,11 @@ module attributes {transform.with_named_sequence} {
         outs(%input_nhwc_empty : tensor<1x?x?x?xf16>)
         permutation = [0, 2, 3, 1]
 
-    %dense_readers_i32 = arith.constant 0 : i32
+    %layout_i32 = arith.constant 0 : i32
     %raw_f16 = flow.dispatch
         @rocket_dynamic_depthwise_executable_s3::@rocket_dynamic_depthwise_conv2d_v1::@rocket_dynamic_depthwise_conv2d(
           %input_width_i32, %input_height_i32, %input_channels_i32,
-          %output_channels_i32, %weights_width_i32, %weights_height_i32, %dense_readers_i32,
+          %output_channels_i32, %weights_width_i32, %weights_height_i32, %layout_i32,
           %input_nhwc, %filter, %zero_bias)
         {stream.affinity = #hal.device.affinity<@rocket_device>}
         : (i32, i32, i32, i32, i32, i32, i32,
@@ -4566,11 +4568,11 @@ module attributes {transform.with_named_sequence} {
         outs(%input_nhwc_empty : tensor<1x?x?x?xf16>)
         permutation = [0, 2, 3, 1]
 
-    %dense_readers_i32 = arith.constant 0 : i32
+    %layout_i32 = arith.constant 0 : i32
     %raw_f16 = flow.dispatch
         @rocket_dynamic_depthwise_executable_s4::@rocket_dynamic_depthwise_conv2d_v1::@rocket_dynamic_depthwise_conv2d(
           %input_width_i32, %input_height_i32, %input_channels_i32,
-          %output_channels_i32, %weights_width_i32, %weights_height_i32, %dense_readers_i32,
+          %output_channels_i32, %weights_width_i32, %weights_height_i32, %layout_i32,
           %input_nhwc, %filter, %zero_bias)
         {stream.affinity = #hal.device.affinity<@rocket_device>}
         : (i32, i32, i32, i32, i32, i32, i32,
@@ -4675,11 +4677,11 @@ module attributes {transform.with_named_sequence} {
     %zero_bias = linalg.fill ins(%zero_i32 : i32)
         outs(%zero_bias_empty : tensor<?xi32>) -> tensor<?xi32>
 
-    %dense_readers_i32 = arith.constant 0 : i32
+    %layout_i32 = arith.constant 0 : i32
     %raw_i32 = flow.dispatch
         @rocket_dynamic_int8_executable::@rocket_dynamic_conv2d_v1::@rocket_dynamic_conv2d(
           %input_width_i32, %input_height_i32, %input_channels_i32,
-          %output_channels_i32, %weights_width_i32, %weights_height_i32, %dense_readers_i32,
+          %output_channels_i32, %weights_width_i32, %weights_height_i32, %layout_i32,
           %input, %filter, %zero_bias)
         {stream.affinity = #hal.device.affinity<@rocket_device>}
         : (i32, i32, i32, i32, i32, i32, i32,
@@ -4783,12 +4785,12 @@ module attributes {transform.with_named_sequence} {
     %schema_output_scale = arith.divf %one, %output_scale : f32
     %output_scale_i32 = arith.bitcast %schema_output_scale : f32 to i32
 
-    %dense_readers_i32 = arith.constant 0 : i32
+    %layout_i32 = arith.constant 0 : i32
     %quantized = flow.dispatch
         @rocket_dynamic_int8_requant_executable::@rocket_dynamic_conv2d_v1::@rocket_dynamic_conv2d(
           %input_width_i32, %input_height_i32, %input_channels_i32,
           %output_channels_i32, %weights_width_i32, %weights_height_i32,
-          %output_scale_i32, %output_zero_point, %dense_readers_i32,
+          %output_scale_i32, %output_zero_point, %layout_i32,
           %input, %filter, %bias)
         {stream.affinity = #hal.device.affinity<@rocket_device>}
         : (i32, i32, i32, i32, i32, i32, i32, i32, i32,
@@ -4855,12 +4857,12 @@ module attributes {transform.with_named_sequence} {
         outs(%filter_chw_empty : tensor<?x?x?xi8>)
         permutation = [2, 0, 1]
 
-    %dense_readers_i32 = arith.constant 0 : i32
+    %layout_i32 = arith.constant 0 : i32
     %quantized = flow.dispatch
         @rocket_dynamic_depthwise_int8_requant_executable::@rocket_dynamic_depthwise_conv2d_v1::@rocket_dynamic_depthwise_conv2d(
           %input_width_i32, %input_height_i32, %input_channels_i32,
           %output_channels_i32, %weights_width_i32, %weights_height_i32,
-          %output_scale_i32, %output_zero_point, %dense_readers_i32,
+          %output_scale_i32, %output_zero_point, %layout_i32,
           %input, %filter_chw, %bias)
         {stream.affinity = #hal.device.affinity<@rocket_device>}
         : (i32, i32, i32, i32, i32, i32, i32, i32, i32,
@@ -4921,11 +4923,11 @@ module attributes {transform.with_named_sequence} {
         outs(%filter_chw_empty : tensor<?x?x?xi8>)
         permutation = [2, 0, 1]
 
-    %dense_readers_i32 = arith.constant 0 : i32
+    %layout_i32 = arith.constant 0 : i32
     %raw_i32 = flow.dispatch
         @rocket_dynamic_depthwise_int8_executable::@rocket_dynamic_depthwise_conv2d_v1::@rocket_dynamic_depthwise_conv2d(
           %input_width_i32, %input_height_i32, %input_channels_i32,
-          %output_channels_i32, %weights_width_i32, %weights_height_i32, %dense_readers_i32,
+          %output_channels_i32, %weights_width_i32, %weights_height_i32, %layout_i32,
           %input, %filter_chw, %zero_bias)
         {stream.affinity = #hal.device.affinity<@rocket_device>}
         : (i32, i32, i32, i32, i32, i32, i32,
@@ -5026,11 +5028,11 @@ module attributes {transform.with_named_sequence} {
         outs(%filter_chw_empty : tensor<?x?x?xi8>)
         permutation = [2, 0, 1]
 
-    %dense_readers_i32 = arith.constant 0 : i32
+    %layout_i32 = arith.constant 0 : i32
     %raw_i32 = flow.dispatch
         @rocket_dynamic_depthwise_int8_executable_s2::@rocket_dynamic_depthwise_conv2d_v1::@rocket_dynamic_depthwise_conv2d(
           %input_width_i32, %input_height_i32, %input_channels_i32,
-          %output_channels_i32, %weights_width_i32, %weights_height_i32, %dense_readers_i32,
+          %output_channels_i32, %weights_width_i32, %weights_height_i32, %layout_i32,
           %input, %filter_chw, %zero_bias)
         {stream.affinity = #hal.device.affinity<@rocket_device>}
         : (i32, i32, i32, i32, i32, i32, i32,

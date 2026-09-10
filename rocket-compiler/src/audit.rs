@@ -26,6 +26,7 @@
 //! not the candidate's logical shape. So the join is by count and by op
 //! *kind*, and every statement below is one those two support.
 
+use crate::layout::LayoutRecord;
 use std::fmt;
 
 use crate::{decisions::DecisionRecord, report::PlacementReport};
@@ -60,15 +61,48 @@ impl Reconciliation {
 
 pub struct PlacementAudit {
     pub decisions: DecisionRecord,
+    pub layout: LayoutRecord,
     pub placement: PlacementReport,
 }
 
 impl PlacementAudit {
-    pub fn new(decisions: DecisionRecord, placement: PlacementReport) -> Self {
+    pub fn new(
+        decisions: DecisionRecord,
+        layout: LayoutRecord,
+        placement: PlacementReport,
+    ) -> Self {
         PlacementAudit {
             decisions,
+            layout,
             placement,
         }
+    }
+
+    /// `--strict-layout`: every edge between two Rocket dispatches must be
+    /// packed. A dense one names the identity's failing condition, which is
+    /// the padding decision COMPILER_ROADMAP.md 6.2 leaves open.
+    pub fn strict_layout_failure(&self) -> Option<String> {
+        if self.layout.is_empty() {
+            return Some(
+                "--strict-layout: no rocket.layout_decisions record was found, so no edge \
+                 could be checked. Either the module holds no Rocket dispatch, or \
+                 rocket-assign-layout did not run."
+                    .to_string(),
+            );
+        }
+        let dense: Vec<String> = self
+            .layout
+            .dense_npu_edges()
+            .map(|edge| format!("{edge}").trim_end().to_string())
+            .collect();
+        if dense.is_empty() {
+            return None;
+        }
+        Some(format!(
+            "--strict-layout: {} NPU -> NPU edge(s) left dense:\n{}",
+            dense.len(),
+            dense.join("\n")
+        ))
     }
 
     pub fn reconciliation(&self) -> Reconciliation {
@@ -210,7 +244,33 @@ impl PlacementAudit {
             r.beyond_candidates(),
             r.contraction_cpu_dispatches,
         ));
-        out.push_str("}\n}\n");
+        out.push_str("},\n  \"layout\": {");
+        out.push_str(&format!(
+            "\"npu_edges\": {}, \"packed_npu_edges\": {}, \"cube_only_sites\": {}, \"edges\": [\n",
+            self.layout.npu_edges().count(),
+            self.layout.packed_npu_edges(),
+            self.layout.cube_only_sites(),
+        ));
+        for (i, edge) in self.layout.edges.iter().enumerate() {
+            let comma = if i + 1 == self.layout.edges.len() {
+                ""
+            } else {
+                ","
+            };
+            out.push_str(&format!(
+                "    {{\"function\": {}, \"site\": {}, \"kind\": {}, \"binding\": {}, \
+                 \"producer\": {}, \"verdict\": {}, \"reason\": {}, \"location\": {}}}{comma}\n",
+                json_string(&edge.function),
+                json_string(&edge.site),
+                json_string(&edge.kind),
+                edge.binding,
+                json_string(&edge.producer),
+                json_string(&edge.verdict),
+                json_string(&edge.reason),
+                json_string(&edge.location),
+            ));
+        }
+        out.push_str("  ]}\n}\n");
         out
     }
 }
@@ -300,6 +360,27 @@ impl fmt::Display for PlacementAudit {
                 executable.kinds().join(", ")
             )?;
         }
+        writeln!(f)?;
+        if self.layout.is_empty() {
+            writeln!(
+                f,
+                "Layout: none recorded (no Rocket dispatch, or rocket-assign-layout did not run)."
+            )?;
+        } else {
+            let npu = self.layout.npu_edges().count();
+            let packed = self.layout.packed_npu_edges();
+            writeln!(
+                f,
+                "Layout ({npu} NPU -> NPU edge(s): {packed} packed, {} dense; {} dispatch(es) read \
+                 only through their cube; {} edge(s) fed from the CPU or an argument):",
+                npu - packed,
+                self.layout.cube_only_sites(),
+                self.layout.edges.len() - npu,
+            )?;
+            for edge in self.layout.npu_edges() {
+                write!(f, "{edge}")?;
+            }
+        }
         Ok(())
     }
 }
@@ -348,6 +429,7 @@ mod tests {
     fn audit() -> PlacementAudit {
         PlacementAudit::new(
             DecisionRecord::scan(DECISIONS_IR),
+            LayoutRecord::default(),
             PlacementReport::scan(PLACEMENT_IR),
         )
     }
@@ -404,6 +486,7 @@ mod tests {
     fn an_accepted_candidate_with_no_dispatch_is_reported_as_a_matcher_gap() {
         let audit = PlacementAudit::new(
             DecisionRecord::scan(DECISIONS_IR),
+            LayoutRecord::default(),
             PlacementReport::scan(""),
         );
         assert_eq!(audit.reconciliation().unclaimed(), 1);
@@ -441,7 +524,11 @@ mod tests {
     /// Nothing to check against is a failure, not a pass.
     #[test]
     fn strict_offload_refuses_an_empty_record() {
-        let audit = PlacementAudit::new(DecisionRecord::default(), PlacementReport::scan(""));
+        let audit = PlacementAudit::new(
+            DecisionRecord::default(),
+            LayoutRecord::default(),
+            PlacementReport::scan(""),
+        );
         let failure = audit.strict_offload_failure().expect("must not pass");
         assert!(
             failure.contains("no rocket.plan_decisions record"),
@@ -471,6 +558,7 @@ mod tests {
 "#;
         let audit = PlacementAudit::new(
             DecisionRecord::scan(ACCEPTED),
+            LayoutRecord::default(),
             PlacementReport::scan(ACCEPTED),
         );
         assert_eq!(audit.strict_offload_failure(), None);

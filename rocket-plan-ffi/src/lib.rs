@@ -1161,6 +1161,23 @@ mod tests {
         (status, text)
     }
 
+    /// The header's dense-ARGB threshold is core's, and the layout word the
+    /// compiler writes (`rocket-assign-layout`, `mask | readers << 16`) is
+    /// what `DispatchLayout` decodes.
+    #[test]
+    fn the_header_constants_track_core() {
+        assert_eq!(rocket_core::conv::MAX_DENSE_CHANNELS, 4);
+        use rocket_core::layout::DispatchLayout;
+        assert_eq!(DispatchLayout::READERS_SHIFT, 16);
+        assert_eq!(
+            DispatchLayout::from_word(0b101 | (7 << 16)),
+            DispatchLayout {
+                packed_inputs: 0b101,
+                packed_readers: 7,
+            }
+        );
+    }
+
     #[test]
     fn the_cube_geometry_is_the_drivers() {
         // ResNet50's conv1 -> conv2 edge, and a 7x7 pool's four-rounded

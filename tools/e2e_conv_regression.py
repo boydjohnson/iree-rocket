@@ -1450,7 +1450,7 @@ def compile_modules(
             str(flow),
             "-o",
             str(pinned),
-            "--pass-pipeline=builtin.module(rocket-pin-unclaimed-dispatches,rocket-mark-dense-readers,rocket-pack-weights)",
+            "--pass-pipeline=builtin.module(rocket-pin-unclaimed-dispatches,rocket-assign-layout,rocket-pack-weights)",
         ]
     )
     # The packed-weight cases exist to run the driver's direct-bind path. If
@@ -2341,7 +2341,7 @@ def main() -> None:
         type=Path,
         default=ROOT / "iree-build/build/tools/iree-opt",
         help="iree-opt with the Rocket plugin registered; runs "
-        "rocket-pin-unclaimed-dispatches and rocket-mark-dense-readers between the flow and stream phases, "
+        "rocket-pin-unclaimed-dispatches, rocket-assign-layout and rocket-pack-weights between the flow and stream phases, "
         "which a single iree-compile invocation cannot do",
     )
     parser.add_argument(

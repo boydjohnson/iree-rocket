@@ -264,6 +264,20 @@ table Conv2DDef {
   // the logical HWCF filter and the runtime packer. Appended last, for the
   // vtable reason above. COMPILER_ROADMAP.md 6.3.
   weights_packed:bool = false;
+
+  // The trailing uint32 push constant is a layout word rather than a bare
+  // reader count: bits 0..15 are a per-input-binding mask, bit i set when
+  // input i reads its producer's NC1HWC2 cube in place (the compiler proved
+  // the two geometries identical, rocket_core::layout::chain_identity);
+  // bits 16..31 are the count of Rocket dispatches that read this
+  // dispatch's result that way, or zero when any other reader exists. Zero
+  // is "every input dense, always write the dense output", which is what
+  // every shim passes as a literal and what an executable built without
+  // rocket-assign-layout sees. Supersedes runtime_dense_readers, whose
+  // constant was the count alone (bits 16..31 with an empty mask); a
+  // runtime reads either, and an executable declares at most one.
+  // Appended last, for the vtable reason above. COMPILER_ROADMAP.md 6.2.
+  runtime_layout:bool = false;
 }
 
 // DEPRECATED: superseded by MatmulDef. Retained because union tags are
@@ -350,6 +364,9 @@ table PoolingDef {
   // See Conv2DDef.runtime_dense_readers: one trailing uint32 push constant
   // carrying the compiler's count of Rocket dispatches that read the result.
   runtime_dense_readers:bool = false;
+
+  // See Conv2DDef.runtime_layout.
+  runtime_layout:bool = false;
 }
 
 // Describes one row-major [M,K] x [K,N] -> [M,N] matmul.
@@ -395,6 +412,9 @@ table MatmulDef {
   // See Conv2DDef.weights_packed: the [K, N] operand is already the blocked
   // coefficient stream of the 1x1 lowering, packed symmetrically.
   weights_packed:bool = false;
+
+  // See Conv2DDef.runtime_layout.
+  runtime_layout:bool = false;
 }
 
 // Describes one standalone unary element-wise operation on the EW ALU.
@@ -440,6 +460,9 @@ table ElementwiseUnaryDef {
   // See Conv2DDef.runtime_dense_readers: one trailing uint32 push constant
   // carrying the compiler's count of Rocket dispatches that read the result.
   runtime_dense_readers:bool = false;
+
+  // See Conv2DDef.runtime_layout.
+  runtime_layout:bool = false;
 }
 
 // Describes one standalone two-tensor element-wise operation on the EW
@@ -472,6 +495,9 @@ table ElementwiseBinaryDef {
   // See Conv2DDef.runtime_dense_readers: one trailing uint32 push constant
   // carrying the compiler's count of Rocket dispatches that read the result.
   runtime_dense_readers:bool = false;
+
+  // See Conv2DDef.runtime_layout.
+  runtime_layout:bool = false;
 }
 
 // Describes one standalone LUT activation: `out = f(in)` for one of the
@@ -517,6 +543,9 @@ table ElementwiseLutDef {
   // See Conv2DDef.runtime_dense_readers: one trailing uint32 push constant
   // carrying the compiler's count of Rocket dispatches that read the result.
   runtime_dense_readers:bool = false;
+
+  // See Conv2DDef.runtime_layout.
+  runtime_layout:bool = false;
 }
 
 // Add future Rocket kernel kinds here. Existing numeric values must not be
