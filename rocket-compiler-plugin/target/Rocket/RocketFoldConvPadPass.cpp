@@ -174,9 +174,25 @@ struct MarkPaddedConv : public OpRewritePattern<ConvOp> {
     // attribute dictionary the ReLU6 template compares -- costing the
     // activation fusion and gaining nothing, because no template claims a pad
     // and a clamp together. So a convolution with both folds the ReLU6 and
-    // keeps its pad materialized. No measured model has both: MobileNetV2's
-    // padded convolutions are its depthwise ones and ResNet50's activation is
-    // an unbounded ReLU.
+    // keeps its pad materialized.
+    //
+    // **That tie-break used to be free and is not any more.** It read "no
+    // measured model has both: MobileNetV2's padded convolutions are its
+    // depthwise ones and ResNet50's activation is an unbounded ReLU". Since
+    // ReLU6 fusion started firing on an already-f16 import, MobileNetV2's
+    // seventeen depthwise convolutions have *both* -- they fuse the clamp
+    // here and keep their pad on the CPU, which is seventeen `slow_memcpy`
+    // dispatches plus seventeen whole-buffer zero fills, about 16 MB of
+    // traffic per inference and the largest single item left on the CPU for
+    // that model.
+    //
+    // Nothing regressed -- those pads never folded, because every `pad1`
+    // executable in the transform spec is a *dense* one
+    // (`rocket_dynamic_conv2d_v1`) and no depthwise padded target or matcher
+    // exists at all. But it does set the shape of the fix: a depthwise padded
+    // path has to be a **pad + ReLU6** template, not a bare pad one, or this
+    // branch will decline every site it was built for and the work will
+    // silently buy nothing.
     if (auto activation = dyn_cast_or_null<linalg::GenericOp>(
             soleUser(conv->getResult(0)))) {
       if (activation.getNumDpsInputs() == 4) {
