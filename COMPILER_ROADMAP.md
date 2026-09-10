@@ -545,9 +545,10 @@ dispatches need not make a model faster.
 
 ## 6. Own the layout at compile time: packed tensors, boundary-only repacks, prepacked weights
 
-**Status 2026-09-09: not started.** This section exists because the end
-state the repository is working toward was only ever stated by halves. Put
-in one place, for a model whose input extents are static:
+**Status 2026-09-10: step 1 of 6.6 -- the layout contract (6.1) -- landed;
+steps 2 to 4 not started.** This section exists because the end state the
+repository is working toward was only ever stated by halves. Put in one
+place, for a model whose input extents are static:
 
 1. the compiler knows which operations run on the CPU and which on the NPU
    -- **landed**, sections 2 and 3;
@@ -658,6 +659,45 @@ so the compiler and runtime cannot compute two geometries for one shape.
 That is section 1's extraction pattern applied to layout, and it is the
 prerequisite for everything below because it turns "does the producer's cube
 match" into "is the encoding equal".
+
+**Landed 2026-09-10.** `rocket_core::layout` holds `CubeKind`,
+`CubeGeometry`, `cube_geometry`, `packed_channels` and
+`chain_identity -> Result<(), ChainRefusal>`, with `conv::Shape::
+input_cube_geometry` / `output_cube_geometry` as the compiler-facing entry
+points (`None` where the shape reads dense ARGB or writes accumulator
+blocks). `rocket-plan-ffi` is ABI 4: `rocket_plan_cube_geometry`,
+`rocket_plan_chain_identity` and a `ROCKET_PLAN_LAYOUT_MISMATCH` status
+whose message is the failing condition. In the driver `OutputCube` carries
+a `CubeGeometry`, all six `chainable_cube` call sites and five cube offers
+build theirs through `cube_geometry`, `chainable_cube` itself is
+`chain_identity` plus the two things only the runtime knows (which recorded
+write produced the bytes, and whether it published a cube), and
+`PoolingShape::programmed_channels` reads `packed_channels`. Every
+`chain_identity_tests` case now asserts the pure verdict beside the bytes
+it was already pinning.
+
+Acceptance, planck 2026-09-10, before/after `iree-run-module` built from the
+same HEAD with only this change stashed: bit-identical outputs on ResNet50
+(the P2 build, 66 chains taken / 3 declined on both, per-site sets equal),
+MobileNetV2 (2 taken / 34 declined, same per-site reasons), Wide ResNet50,
+CLIP, BLIP, ViT-L/16, and int8 ResNet50 and MobileNetV2 (int8 ResNet50 three
+alternating isolated runs; its one watchdog trip was the thirteenth
+consecutive NPU process, not this change, and did not reproduce alone). The
+four chain fixtures pass through the e2e gate with the ABI-4 plugin.
+
+Moving the numbers exposed one correction to the contract as it was stated
+above. The channel padding is a property of the **reader**, not the rung:
+the CNA-fed kinds (conv, matmul, element-wise) pad to 16 *lanes* whatever
+the element width -- two atoms at fp16 -- while the PPU programs whole atoms
+only, 8 lanes at fp16 and 16 at int8. `bytes_per_pixel` is still channels
+times element bytes, but the identity's consumer-side condition is "no
+padding under *the consumer's* rule", so a conv output at Cout 24 fp16 (48
+bytes, three whole atoms) feeds a pool in place and not a conv. That is what
+MobileNetV2's "whole-atom" declines at Cout 24, 88 and 136 actually are, and
+it changes 6.2's padding decision: the producer's atoms were never the
+problem, the consumer's 16-lane programming is. Whether a conv can be
+programmed at `Cin = 24` rather than 32 without reading the padding
+surface is the hardware question that decision now turns on.
 
 ### 6.2 Layout assignment in the compiler
 
@@ -841,7 +881,9 @@ dense, reported.
 
 1. **The contract (6.1).** `rocket-core::layout`, ABI v4, driver computes
    `OutputCube` through it. No behaviour change; `chain_identity_tests`
-   move with it. Bit-identical on every model.
+   gain the pure verdict beside each byte-level case (they cannot move: the
+   bytes need the HAL's packer). Bit-identical on every model. **Landed
+   2026-09-10**; see 6.1.
 2. **Weights (6.3).** Independent of the rest and the only step with a
    number attached. Acceptance: packed bytes byte-identical to the driver
    packer on every conv fixture in `tools/e2e_conv_regression.py`, the

@@ -100,6 +100,7 @@ use iree_rocket_hal::rocket::{
         build_add_regcmd_with_relu, build_unary_regcmd,
     },
     fc,
+    layout::{ChainRefusal, CubeGeometry, CubeKind, chain_identity, cube_geometry},
     pooling::{PoolingBuffers, PoolingPlan},
     tensor_layout::{
         nc1hwc2_storage_size, pack_depthwise_to_rocket_weights, pack_fp16_bias_to_rocket,
@@ -606,8 +607,10 @@ unsafe fn dma_range(
 /// - a whole number of 16-byte atoms per pixel, since a partial trailing atom
 ///   is zeroed by the repack and holds the producer's padding channels here.
 ///
-/// `bytes_per_pixel` is the consumer's logical width and `packed_bytes_per_pixel`
-/// the width it would have packed to.
+/// `consumer` is the cube this dispatch would pack its input to; the
+/// identity itself is `rocket_core::layout::chain_identity`, and this
+/// function adds only what the runtime alone knows -- which recorded write
+/// produced the bytes, and whether it published a cube.
 ///
 /// # Safety
 ///
@@ -617,10 +620,7 @@ unsafe fn dma_range(
 fn chainable_cube(
     cb: &mut RocketCommandBuffer,
     binding: &iree_hal_buffer_ref_t,
-    pixel_count: usize,
-    packed_pixel_count: usize,
-    bytes_per_pixel: usize,
-    packed_bytes_per_pixel: usize,
+    consumer: CubeGeometry,
     what: &str,
 ) -> Option<OutputCube> {
     if !chain_enabled() || binding.buffer.is_null() {
@@ -628,15 +628,9 @@ fn chainable_cube(
     }
     // A consumer that pads its channels, or whose pixel is a partial atom,
     // cannot alias a producer cube however well the producer matches.
-    if packed_bytes_per_pixel != bytes_per_pixel
-        || bytes_per_pixel == 0
-        || !bytes_per_pixel.is_multiple_of(16)
-    {
+    if let Err(refusal) = consumer.can_chain() {
         if chain_debug() {
-            eprintln!(
-                "rocket: chain declined ({what}): consumer width {bytes_per_pixel} \
-                 packs to {packed_bytes_per_pixel}, not a whole-atom identity"
-            );
+            eprintln!("rocket: chain declined ({what}): {refusal}");
         }
         return None;
     }
@@ -647,7 +641,7 @@ fn chainable_cube(
         dma_range(
             binding.buffer,
             binding.offset,
-            pixel_count * bytes_per_pixel,
+            consumer.pixel_count * consumer.bytes_per_pixel,
         )
     }?;
     let Some((producer_index, producer)) = cb.ops.iter().enumerate().rev().find(|(_, op)| {
@@ -675,32 +669,36 @@ fn chainable_cube(
         return None;
     };
     // Overlapping is not enough: the producer must have written exactly the
-    // region this dispatch reads, in the geometry it would have packed.
-    if unsafe {
+    // region this dispatch reads, in the geometry it would have packed --
+    // the identity `rocket_core::layout::chain_identity` states and
+    // `tensor_layout.rs`'s `chain_identity_tests` pin to the bytes.
+    let same_bytes = unsafe {
         dma_range(
             cube.dense_buffer,
             cube.dense_offset,
-            cube.pixel_count * cube.bytes_per_pixel,
+            cube.geometry.pixel_count * cube.geometry.bytes_per_pixel,
         )
-    } != Some(want)
-        || cube.pixel_count != pixel_count
-        || cube.surface_pixel_count != packed_pixel_count
-        || cube.bytes_per_pixel != bytes_per_pixel
-    {
-        // `packed_pixel_count` is the surface stride this consumer would
-        // pack to; the PPU rounds it up to four pixels where everything
-        // else uses the exact count, so a pool and a conv only agree when
-        // the count is a multiple of four.
+    } == Some(want);
+    let verdict: Result<(), Option<ChainRefusal>> = if same_bytes {
+        chain_identity(&cube.geometry, &consumer).map_err(Some)
+    } else {
+        Err(None)
+    };
+    if let Err(refusal) = verdict {
         if chain_debug() {
+            let why = refusal.map_or_else(
+                || "producer wrote a different byte range".to_string(),
+                |refusal| refusal.to_string(),
+            );
             eprintln!(
-                "rocket: chain declined ({what}): producer cube {}x{} (surfaces {} apart) at +{} vs consumer {}x{} (surfaces {} apart) at +{}",
-                cube.pixel_count,
-                cube.bytes_per_pixel,
-                cube.surface_pixel_count,
+                "rocket: chain declined ({what}): {why}; producer cube {}x{} (surfaces {} apart) at +{} vs consumer {}x{} (surfaces {} apart) at +{}",
+                cube.geometry.pixel_count,
+                cube.geometry.bytes_per_pixel,
+                cube.geometry.surface_pixel_count,
                 cube.dense_offset,
-                pixel_count,
-                bytes_per_pixel,
-                packed_pixel_count,
+                consumer.pixel_count,
+                consumer.bytes_per_pixel,
+                consumer.surface_pixel_count,
                 binding.offset
             );
         }
@@ -709,7 +707,7 @@ fn chainable_cube(
     if chain_debug() {
         eprintln!(
             "rocket: chain taken ({what}): {} pixels x {} bytes, skipping the repack",
-            pixel_count, bytes_per_pixel
+            consumer.pixel_count, consumer.bytes_per_pixel
         );
     }
     let cube = *cube;
@@ -1203,14 +1201,12 @@ pub struct OutputCube {
     pub handle: u32,
     pub host_ptr: *mut u8,
     pub length: usize,
-    /// The cube's geometry: `pixel_count` logical pixels, surfaces
-    /// `surface_pixel_count * 16` bytes apart (equal to `pixel_count` except
-    /// for the PPU, which strides surfaces by the count rounded up to four),
-    /// and the logical pixel occupies `bytes_per_pixel`, a whole number of
-    /// atoms.
-    pub pixel_count: usize,
-    pub surface_pixel_count: usize,
-    pub bytes_per_pixel: usize,
+    /// The cube's geometry -- `pixel_count` logical pixels, surfaces
+    /// `surface_pixel_count * 16` bytes apart, `bytes_per_pixel` a whole
+    /// number of atoms wherever a cube is offered at all -- computed through
+    /// `rocket_core::layout` so this driver and the compiler cannot arrive at
+    /// two geometries for one shape (COMPILER_ROADMAP.md 6.1).
+    pub geometry: CubeGeometry,
 }
 
 /// One recorded command-buffer operation, in call order -- see module doc
@@ -2391,15 +2387,27 @@ unsafe extern "C" fn dispatch_impl(
                     crate::bindings::iree_status_code_e_IREE_STATUS_INVALID_ARGUMENT,
                 );
             }
-            let pixel_count = shape.width as usize * shape.height as usize;
-            let input_bytes_per_pixel =
-                shape.in_channels as usize * shape.precision.element_bytes() as usize;
-            let packed_input_bytes_per_pixel = shape.in_channels.max(16).next_multiple_of(16)
-                as usize
-                * shape.precision.element_bytes() as usize;
+            // The input's cube geometry, through the layout contract the
+            // compiler reads (COMPILER_ROADMAP.md 6.1). Computed for the
+            // dense ARGB layouts too: the byte widths are the same, only
+            // the packing below is skipped for them.
+            let Ok(input_geometry) = cube_geometry(
+                CubeKind::Conv,
+                shape.precision.element_bytes(),
+                shape.width,
+                shape.height,
+                shape.in_channels,
+            ) else {
+                return status::from_code(
+                    crate::bindings::iree_status_code_e_IREE_STATUS_INVALID_ARGUMENT,
+                );
+            };
+            let pixel_count = input_geometry.pixel_count;
+            let input_bytes_per_pixel = input_geometry.bytes_per_pixel;
+            let packed_input_bytes_per_pixel = input_geometry.packed_bytes_per_pixel;
             if !matches!(
-                pixel_count.checked_mul(input_bytes_per_pixel),
-                Some(value) if value as u64 <= refs[0].length as u64
+                input_geometry.dense_bytes(),
+                Ok(value) if value as u64 <= refs[0].length as u64
             ) {
                 return status::from_code(
                     crate::bindings::iree_status_code_e_IREE_STATUS_INVALID_ARGUMENT,
@@ -2419,15 +2427,7 @@ unsafe extern "C" fn dispatch_impl(
             // ISSUES.md P2 step 2; see `chainable_cube` for when that is
             // byte-identical.
             let chained_input = if shape.layout() == FeatureLayout::Surfaces {
-                chainable_cube(
-                    cb,
-                    &refs[0],
-                    pixel_count,
-                    pixel_count,
-                    input_bytes_per_pixel,
-                    packed_input_bytes_per_pixel,
-                    "conv input",
-                )
+                chainable_cube(cb, &refs[0], input_geometry, "conv input")
             } else {
                 None
             };
@@ -2754,8 +2754,8 @@ unsafe extern "C" fn dispatch_impl(
                 (Some(cube), _) => BandGeometry {
                     width: shape.width as usize,
                     height: shape.height as usize,
-                    surfaces: cube.bytes_per_pixel / 16,
-                    surface_stride: cube.pixel_count * 16,
+                    surfaces: cube.geometry.bytes_per_pixel / 16,
+                    surface_stride: cube.geometry.surface_pixel_count * 16,
                     block_bytes: 16,
                 },
                 (None, Some(packing)) if matches!(packing.layout, InputPackingLayout::Nc1hwc2) => {
@@ -2887,10 +2887,22 @@ unsafe extern "C" fn dispatch_impl(
             } else {
                 tile_context
             };
-            let output_pixel_count =
-                shape.output_width(kernels) as usize * shape.output_height(kernels) as usize;
-            let output_bytes_per_pixel =
-                shape.out_channels as usize * shape.precision.output_element_bytes() as usize;
+            // The output's geometry through the same contract, at the
+            // *output* element width -- an fp32-result rung is a 4-lane cube
+            // here and an 8-lane one on the input side.
+            let Ok(output_geometry) = cube_geometry(
+                CubeKind::Conv,
+                shape.precision.output_element_bytes(),
+                shape.output_width(kernels),
+                shape.output_height(kernels),
+                shape.out_channels,
+            ) else {
+                return status::from_code(
+                    crate::bindings::iree_status_code_e_IREE_STATUS_INVALID_ARGUMENT,
+                );
+            };
+            let output_pixel_count = output_geometry.pixel_count;
+            let output_bytes_per_pixel = output_geometry.bytes_per_pixel;
             let tile_rects_empty = tile_rects.is_empty();
             let source_tiles_none = source_tiles.is_none();
             let mut output_compaction = Some(OutputCompaction {
@@ -2917,11 +2929,14 @@ unsafe extern "C" fn dispatch_impl(
             // an accumulator dispatch's 128-byte blocks are not the CNA's
             // input layout at all. Both fall back to the repack.
             let plain_atoms = programmed_shape.output_atom_bytes() as usize == 16;
+            // `Shape::output_cube_geometry` is the compiler's view of the same
+            // offer; the two must agree on whether there is a cube at all.
+            debug_assert_eq!(shape.output_cube_geometry(kernels).is_some(), plain_atoms);
             let mut output_cube = (chain_enabled()
                 && plain_atoms
                 && tile_rects_empty
                 && source_tiles_none
-                && output_bytes_per_pixel.is_multiple_of(16))
+                && output_geometry.is_whole_atom())
             .then_some(OutputCube {
                 dense_buffer: refs[output_index].buffer,
                 dense_offset: refs[output_index].offset,
@@ -2929,9 +2944,7 @@ unsafe extern "C" fn dispatch_impl(
                 handle: scratch.handle,
                 host_ptr: scratch.host_ptr,
                 length: scratch_bytes,
-                pixel_count: output_pixel_count,
-                surface_pixel_count: output_pixel_count,
-                bytes_per_pixel: output_bytes_per_pixel,
+                geometry: output_geometry,
             });
             scratch_buffers.push(scratch);
             // The residual epilogue: pack the fourth binding as a feature cube
@@ -2962,15 +2975,8 @@ unsafe extern "C" fn dispatch_impl(
                 // The skip is a block input, so on a residual network it is
                 // another dispatch's output as often as the feature input
                 // is -- and it is the wide tensor. Chain it the same way.
-                let chained_skip = chainable_cube(
-                    cb,
-                    &refs[3],
-                    cube.pixels,
-                    cube.pixels,
-                    cube.logical_bytes_per_pixel,
-                    cube.packed_bytes_per_pixel,
-                    "conv residual skip",
-                );
+                let chained_skip =
+                    chainable_cube(cb, &refs[3], cube.geometry, "conv residual skip");
                 if chained_skip.is_none() {
                     unsafe { note_dense_read(cb, &refs[3]) };
                 }
@@ -3032,9 +3038,7 @@ unsafe extern "C" fn dispatch_impl(
                     handle: sum_scratch.handle,
                     host_ptr: sum_scratch.host_ptr,
                     length: cube.scratch_bytes,
-                    pixel_count: cube.pixels,
-                    surface_pixel_count: cube.pixels,
-                    bytes_per_pixel: cube.logical_bytes_per_pixel,
+                    geometry: cube.geometry,
                 });
                 output_compaction = Some(sum_compaction);
                 scratch_buffers.push(sum_scratch);
@@ -3111,22 +3115,19 @@ unsafe extern "C" fn dispatch_impl(
             // exactly one -- no `FC_PHYSICAL_HEIGHT` padding, so the
             // packed pixel count is just the logical row count `m`.
             let physical_pixel_count = m;
-            let input_bytes_per_pixel = match k.checked_mul(element_size) {
-                Some(value) => value,
-                None => {
-                    return status::from_code(
-                        crate::bindings::iree_status_code_e_IREE_STATUS_INVALID_ARGUMENT,
-                    );
-                }
+            // Both operands' cube geometries through the layout contract
+            // (COMPILER_ROADMAP.md 6.1): width `m`, height 1, at `k` and `n`
+            // channels.
+            let (Ok(input_geometry), Ok(output_geometry)) = (
+                cube_geometry(CubeKind::Matmul, element_size as u32, shape.m, 1, shape.k),
+                cube_geometry(CubeKind::Matmul, element_size as u32, shape.m, 1, shape.n),
+            ) else {
+                return status::from_code(
+                    crate::bindings::iree_status_code_e_IREE_STATUS_INVALID_ARGUMENT,
+                );
             };
-            let output_bytes_per_pixel = match n.checked_mul(element_size) {
-                Some(value) => value,
-                None => {
-                    return status::from_code(
-                        crate::bindings::iree_status_code_e_IREE_STATUS_INVALID_ARGUMENT,
-                    );
-                }
-            };
+            let input_bytes_per_pixel = input_geometry.bytes_per_pixel;
+            let output_bytes_per_pixel = output_geometry.bytes_per_pixel;
             let input_len = m.checked_mul(input_bytes_per_pixel);
             let weights_len = k
                 .checked_mul(n)
@@ -3148,7 +3149,7 @@ unsafe extern "C" fn dispatch_impl(
             // (see fc.rs's module doc comment) -- the public input already
             // is exactly `m` physical rows, so this only needs the same
             // NC1HWC2 channel blocking used by convolution, no row padding.
-            let packed_input_bytes_per_pixel = k.max(16).next_multiple_of(16) * element_size;
+            let packed_input_bytes_per_pixel = input_geometry.packed_bytes_per_pixel;
             let (input_scratch_bytes, input_layout) = if k > 1 {
                 match nc1hwc2_storage_size(physical_pixel_count, packed_input_bytes_per_pixel) {
                     Ok(value) => (value, InputPackingLayout::Nc1hwc2),
@@ -3178,15 +3179,7 @@ unsafe extern "C" fn dispatch_impl(
             // repack would build (`chainable_cube`). The [K,N] operand is a
             // coefficient stream and never chains.
             let chained_input = if matches!(input_layout, InputPackingLayout::Nc1hwc2) {
-                chainable_cube(
-                    cb,
-                    &refs[0],
-                    physical_pixel_count,
-                    physical_pixel_count,
-                    input_bytes_per_pixel,
-                    packed_input_bytes_per_pixel,
-                    "matmul input",
-                )
+                chainable_cube(cb, &refs[0], input_geometry, "matmul input")
             } else {
                 None
             };
@@ -3380,8 +3373,8 @@ unsafe extern "C" fn dispatch_impl(
                 (Some(cube), _) => Some(BandGeometry {
                     width: m,
                     height: 1,
-                    surfaces: cube.bytes_per_pixel / 16,
-                    surface_stride: cube.surface_pixel_count * 16,
+                    surfaces: cube.geometry.bytes_per_pixel / 16,
+                    surface_stride: cube.geometry.surface_pixel_count * 16,
                     block_bytes: 16,
                 }),
                 (None, Some(packing)) => Some(match packing.layout {
@@ -3493,7 +3486,7 @@ unsafe extern "C" fn dispatch_impl(
             let output_cube = (chain_enabled()
                 && tile_rects.is_empty()
                 && output_block_bytes == 16
-                && output_bytes_per_pixel.is_multiple_of(16))
+                && output_geometry.is_whole_atom())
             .then_some(OutputCube {
                 dense_buffer: refs[3].buffer,
                 dense_offset: refs[3].offset,
@@ -3501,9 +3494,7 @@ unsafe extern "C" fn dispatch_impl(
                 handle: output_scratch.handle,
                 host_ptr: output_scratch.host_ptr,
                 length: output_scratch_bytes,
-                pixel_count: m,
-                surface_pixel_count: m,
-                bytes_per_pixel: output_bytes_per_pixel,
+                geometry: output_geometry,
             });
             let output_compaction = Some(OutputCompaction {
                 output_buffer: refs[3].buffer,
@@ -3599,33 +3590,43 @@ unsafe extern "C" fn dispatch_impl(
             // neither repack, which is the cross-op chaining ISSUES.md P2
             // describes and this is deliberately not that.
             let element_bytes = shape.precision.element_bytes() as usize;
-            let logical_bytes_per_pixel = shape.logical_bytes_per_pixel() as usize;
-            let packed_bytes_per_pixel = shape.packed_bytes_per_pixel() as usize;
-            let input_pixels =
-                match (shape.input_width as usize).checked_mul(shape.input_height as usize) {
-                    Some(value) => value,
-                    None => {
-                        return status::from_code(
-                            crate::bindings::iree_status_code_e_IREE_STATUS_INVALID_ARGUMENT,
-                        );
-                    }
-                };
-            let output_pixels =
-                match (shape.output_width as usize).checked_mul(shape.output_height as usize) {
-                    Some(value) => value,
-                    None => {
-                        return status::from_code(
-                            crate::bindings::iree_status_code_e_IREE_STATUS_INVALID_ARGUMENT,
-                        );
-                    }
-                };
-            // `build_pooling_tile_task` programs both surface strides
-            // rounded up to four pixels (the vendor's 7x5 controls program
-            // 36 for an area of 35), so the packed cubes must be strided the
-            // same way or every surface past the first is read, and written,
-            // at the wrong offset.
-            let packed_input_pixels = input_pixels.next_multiple_of(4);
-            let packed_output_pixels = output_pixels.next_multiple_of(4);
+            // Both cubes through the layout contract (COMPILER_ROADMAP.md
+            // 6.1), which carries the PPU's two rules: channels padded to one
+            // atom, and surfaces strided by the pixel count rounded up to
+            // four -- `build_pooling_tile_task` programs both strides that
+            // way (the vendor's 7x5 controls program 36 for an area of 35),
+            // so the packed cubes must be strided the same or every surface
+            // past the first is read, and written, at the wrong offset.
+            let (Ok(input_geometry), Ok(output_geometry)) = (
+                cube_geometry(
+                    CubeKind::Pooling,
+                    shape.precision.element_bytes(),
+                    shape.input_width,
+                    shape.input_height,
+                    shape.input_channels,
+                ),
+                cube_geometry(
+                    CubeKind::Pooling,
+                    shape.precision.element_bytes(),
+                    shape.output_width,
+                    shape.output_height,
+                    shape.input_channels,
+                ),
+            ) else {
+                return status::from_code(
+                    crate::bindings::iree_status_code_e_IREE_STATUS_INVALID_ARGUMENT,
+                );
+            };
+            debug_assert_eq!(
+                input_geometry.packed_bytes_per_pixel,
+                shape.packed_bytes_per_pixel() as usize
+            );
+            let logical_bytes_per_pixel = input_geometry.bytes_per_pixel;
+            let packed_bytes_per_pixel = input_geometry.packed_bytes_per_pixel;
+            let input_pixels = input_geometry.pixel_count;
+            let output_pixels = output_geometry.pixel_count;
+            let packed_input_pixels = input_geometry.surface_pixel_count;
+            let packed_output_pixels = output_geometry.surface_pixel_count;
             let dense_input_bytes = input_pixels.checked_mul(logical_bytes_per_pixel);
             let dense_output_bytes = output_pixels.checked_mul(logical_bytes_per_pixel);
             if !matches!(dense_input_bytes, Some(value) if value as u64 <= refs[0].length as u64)
@@ -3665,15 +3666,7 @@ unsafe extern "C" fn dispatch_impl(
             // PPU's stride -- the pixel count rounded up to four, so only an
             // image whose count is a multiple of four -- and its channels
             // are whole atoms (`chainable_cube`).
-            let chained_input = chainable_cube(
-                cb,
-                &refs[0],
-                input_pixels,
-                packed_input_pixels,
-                logical_bytes_per_pixel,
-                packed_bytes_per_pixel,
-                "pool input",
-            );
+            let chained_input = chainable_cube(cb, &refs[0], input_geometry, "pool input");
             if chained_input.is_none() {
                 unsafe { note_dense_read(cb, &refs[0]) };
             }
@@ -3753,19 +3746,15 @@ unsafe extern "C" fn dispatch_impl(
             // The pool's own cube: real pixels at the PPU's four-rounded
             // surface stride. Offered only when its channels are whole atoms
             // with no padding, since a consumer would read the padding lanes.
-            let output_cube = (chain_enabled()
-                && logical_bytes_per_pixel.is_multiple_of(16)
-                && logical_bytes_per_pixel == packed_bytes_per_pixel)
-                .then_some(OutputCube {
+            let output_cube =
+                (chain_enabled() && output_geometry.is_exact()).then_some(OutputCube {
                     dense_buffer: refs[1].buffer,
                     dense_offset: refs[1].offset,
                     dma_address: output_scratch.dma_address,
                     handle: output_scratch.handle,
                     host_ptr: output_scratch.host_ptr,
                     length: output_scratch_bytes,
-                    pixel_count: output_pixels,
-                    surface_pixel_count: packed_output_pixels,
-                    bytes_per_pixel: logical_bytes_per_pixel,
+                    geometry: output_geometry,
                 });
             let retained_bindings = unsafe { retain_direct_bindings(refs) };
             let profile_label = profile::label(|| {
@@ -4050,6 +4039,9 @@ fn invalid_argument() -> iree_status_t {
 /// `ew_unary_multi_surface_hw.rs` is the hardware statement of that.
 #[derive(Clone, Copy)]
 struct ElementwiseCube {
+    /// Through the layout contract (COMPILER_ROADMAP.md 6.1); the fields
+    /// below are its members, kept spelled out for the packing code.
+    geometry: CubeGeometry,
     pixels: usize,
     logical_bytes_per_pixel: usize,
     packed_bytes_per_pixel: usize,
@@ -4059,21 +4051,23 @@ struct ElementwiseCube {
 
 impl ElementwiseCube {
     fn new(width: u32, height: u32, channels: u32, element_bytes: usize) -> Option<Self> {
-        let packed_channels = (channels as usize).max(16).next_multiple_of(16);
-        let logical_bytes_per_pixel = (channels as usize).checked_mul(element_bytes)?;
-        let packed_bytes_per_pixel = packed_channels.checked_mul(element_bytes)?;
-        let pixels = (width as usize).checked_mul(height as usize)?;
-        if logical_bytes_per_pixel == 0 || pixels == 0 {
-            return None;
-        }
-        let scratch_bytes = nc1hwc2_storage_size(pixels, packed_bytes_per_pixel).ok()?;
+        let geometry = cube_geometry(
+            CubeKind::Elementwise,
+            element_bytes as u32,
+            width,
+            height,
+            channels,
+        )
+        .ok()?;
+        let scratch_bytes = geometry.storage_bytes().ok()?;
         if scratch_bytes > u32::MAX as usize {
             return None;
         }
         Some(Self {
-            pixels,
-            logical_bytes_per_pixel,
-            packed_bytes_per_pixel,
+            geometry,
+            pixels: geometry.pixel_count,
+            logical_bytes_per_pixel: geometry.bytes_per_pixel,
+            packed_bytes_per_pixel: geometry.packed_bytes_per_pixel,
             scratch_bytes,
             width: width as usize,
         })
@@ -4145,15 +4139,7 @@ fn elementwise_operand(
     // The EW and LUT cubes are exact in pixels and pad channels to 16 like a
     // convolution's input, so a conv, matmul or EW producer's cube is the
     // same bytes whenever the channel count is whole atoms.
-    if let Some(producer) = chainable_cube(
-        cb,
-        binding,
-        cube.pixels,
-        cube.pixels,
-        cube.logical_bytes_per_pixel,
-        cube.packed_bytes_per_pixel,
-        what,
-    ) {
+    if let Some(producer) = chainable_cube(cb, binding, cube.geometry, what) {
         return Some(ElementwiseOperand {
             addr: producer.dma_address,
             handle: producer.handle,
@@ -4178,20 +4164,15 @@ fn elementwise_output_cube(
     scratch: &RocketOwnedBuffer,
     cube: &ElementwiseCube,
 ) -> Option<OutputCube> {
-    (chain_enabled()
-        && cube.logical_bytes_per_pixel.is_multiple_of(16)
-        && cube.logical_bytes_per_pixel == cube.packed_bytes_per_pixel)
-        .then_some(OutputCube {
-            dense_buffer: binding.buffer,
-            dense_offset: binding.offset,
-            dma_address: scratch.dma_address,
-            handle: scratch.handle,
-            host_ptr: scratch.host_ptr,
-            length: cube.scratch_bytes,
-            pixel_count: cube.pixels,
-            surface_pixel_count: cube.pixels,
-            bytes_per_pixel: cube.logical_bytes_per_pixel,
-        })
+    (chain_enabled() && cube.geometry.is_exact()).then_some(OutputCube {
+        dense_buffer: binding.buffer,
+        dense_offset: binding.offset,
+        dma_address: scratch.dma_address,
+        handle: scratch.handle,
+        host_ptr: scratch.host_ptr,
+        length: cube.scratch_bytes,
+        geometry: cube.geometry,
+    })
 }
 
 /// The output half: a scratch cube plus the compaction back to dense NHWC.
