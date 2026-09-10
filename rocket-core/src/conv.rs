@@ -2133,6 +2133,43 @@ impl Shape {
         }
     }
 
+    /// The cube this convolution reads its input feature map as, or `None`
+    /// when it reads no cube: a dense ARGB input ([`FeatureLayout::Dense`])
+    /// or a sub-byte element. COMPILER_ROADMAP.md section 6.1.
+    pub fn input_cube_geometry(&self) -> Option<crate::layout::CubeGeometry> {
+        if self.layout() == FeatureLayout::Dense || !self.precision.element_bits().is_multiple_of(8)
+        {
+            return None;
+        }
+        crate::layout::cube_geometry(
+            crate::layout::CubeKind::Conv,
+            self.precision.element_bytes(),
+            self.width,
+            self.height,
+            self.in_channels,
+        )
+        .ok()
+    }
+
+    /// The cube this convolution writes, or `None` when its output is not
+    /// one: the accumulator writers whose atom is not the 16-byte feature
+    /// atom ([`Shape::output_atom_bytes`]). The element width is the
+    /// *output* one, so an fp32-result rung is a 4-lane cube here and an
+    /// 8-lane one on the input side.
+    pub fn output_cube_geometry(&self, kernels: Kernels) -> Option<crate::layout::CubeGeometry> {
+        if self.output_atom_bytes() != FEATURE_ATOM_BYTES {
+            return None;
+        }
+        crate::layout::cube_geometry(
+            crate::layout::CubeKind::Conv,
+            self.precision.output_element_bytes(),
+            self.output_width(kernels),
+            self.output_height(kernels),
+            self.out_channels,
+        )
+        .ok()
+    }
+
     /// Output width, `floor((w + 2 * pad_left - kw) / stride) + 1`. Matches
     /// all 150 stride-2, -3 and -4 programs in the sweep corpus. Each extent
     /// governs its own axis, so a 3x9 and a 9x3 differ here.

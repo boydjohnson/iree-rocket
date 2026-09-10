@@ -31,7 +31,7 @@
 extern "C" {
 #endif
 
-#define ROCKET_PLAN_ABI_VERSION 3u
+#define ROCKET_PLAN_ABI_VERSION 4u
 
 /* Mirrors rocket_core::conv::Precision. Values are part of the ABI. */
 typedef enum rocket_plan_precision_e {
@@ -53,7 +53,7 @@ typedef enum rocket_plan_activation_e {
   ROCKET_PLAN_ACTIVATION_CLAMPED = 2,
 } rocket_plan_activation_e;
 
-/* Mirrors rocket_core::error::PlanErrorCode, plus the two the boundary
+/* Mirrors rocket_core::error::PlanErrorCode, plus the three the boundary
  * itself produces. */
 typedef enum rocket_plan_status_e {
   ROCKET_PLAN_OK = 0,
@@ -65,7 +65,21 @@ typedef enum rocket_plan_status_e {
   ROCKET_PLAN_INTERNAL = 6,
   /* A malformed call: null pointer, wrong struct_size, enum out of range. */
   ROCKET_PLAN_INVALID_ARGUMENT = 7,
+  /* rocket_plan_chain_identity: the consumer cannot read the producer's
+   * cube in place; the message says which of the identity's conditions
+   * fails. Added in ABI version 4. */
+  ROCKET_PLAN_LAYOUT_MISMATCH = 8,
 } rocket_plan_status_e;
+
+/* Mirrors rocket_core::layout::CubeKind: which unit reads or writes a
+ * feature cube, which picks its channel padding and surface stride. Added
+ * in ABI version 4. */
+typedef enum rocket_plan_cube_kind_e {
+  ROCKET_PLAN_CUBE_CONV = 0,
+  ROCKET_PLAN_CUBE_MATMUL = 1,
+  ROCKET_PLAN_CUBE_POOLING = 2,
+  ROCKET_PLAN_CUBE_ELEMENTWISE = 3,
+} rocket_plan_cube_kind_e;
 
 /* int8 requantization parameters; read only for the two INT8 precisions. */
 typedef struct rocket_plan_quantization_t {
@@ -166,6 +180,46 @@ typedef struct rocket_plan_conv_plan_t {
   uint64_t output_scratch_bytes;
 } rocket_plan_conv_plan_t;
 
+/* One feature map as `kind` reads or writes it (COMPILER_ROADMAP.md 6.1).
+ * `element_bytes` is the element width of *this side* -- a convolution's
+ * input is its input element, its output the output element, so an
+ * fp32-result rung is 2 here on the way in and 4 on the way out. A matmul
+ * operand is width m, height 1. Sub-byte elements have no cube; ask with
+ * 1, 2 or 4 only. */
+typedef struct rocket_plan_cube_desc_t {
+  uint32_t struct_size;
+  uint32_t kind;          /* rocket_plan_cube_kind_e */
+  uint32_t element_bytes; /* 1, 2 or 4 */
+  uint32_t reserved_;
+  uint64_t width;
+  uint64_t height;
+  uint64_t channels;
+} rocket_plan_cube_desc_t;
+
+/* What rocket_plan_cube_geometry computed: the four numbers a producer and
+ * a consumer must agree on, the packed storage, and the two predicates the
+ * chain identity is built from. */
+typedef struct rocket_plan_cube_geometry_t {
+  uint32_t struct_size;
+  /* The logical pixel is a whole number of 16-byte atoms. */
+  uint8_t whole_atom;
+  /* whole_atom, and the reader pads no channels past the logical ones:
+   * the consumer-side precondition of the chain identity. */
+  uint8_t exact;
+  uint8_t reserved_[2];
+  uint64_t pixel_count;
+  /* Pixels one surface is strided by: pixel_count rounded up to four for
+   * POOLING, equal to it for every other kind. */
+  uint64_t surface_pixel_count;
+  /* channels * element_bytes. */
+  uint64_t bytes_per_pixel;
+  /* The width the reader pads a pixel to: 16 lanes for the CNA-fed kinds
+   * whatever the element width, one atom for POOLING. */
+  uint64_t packed_bytes_per_pixel;
+  /* Bytes the packed cube occupies. */
+  uint64_t storage_bytes;
+} rocket_plan_cube_geometry_t;
+
 /* The ABI version this library was built for. */
 uint32_t rocket_plan_abi_version(void);
 
@@ -206,6 +260,27 @@ uint32_t rocket_admit_conv(const rocket_plan_admission_desc_t* desc,
 
 uint32_t rocket_admit_matmul(const rocket_plan_matmul_admission_desc_t* desc,
                              char* message, size_t message_capacity);
+
+/* The geometry of one feature cube, the same function the runtime builds
+ * its `OutputCube` from. On ROCKET_PLAN_OK fills `out_geometry` (may be
+ * NULL for the verdict alone). Never panics across the boundary. Added in
+ * ABI version 4. */
+uint32_t rocket_plan_cube_geometry(const rocket_plan_cube_desc_t* desc,
+                                   rocket_plan_cube_geometry_t* out_geometry,
+                                   char* message, size_t message_capacity);
+
+/* Whether `consumer` may read `producer`'s cube in place of repacking it:
+ * pack(compact(cube)) == cube under the consumer's geometry, the identity
+ * the runtime's cross-dispatch chaining rests on. ROCKET_PLAN_OK when it
+ * holds, ROCKET_PLAN_LAYOUT_MISMATCH with the failing condition in
+ * `message` when it does not, and a malformed descriptor's own status
+ * otherwise. Says nothing about whether the producer offers a cube at all
+ * (a fanned-out or accumulator dispatch does not) or whether the consumer
+ * reads one (a Cin <= 4 convolution reads dense ARGB); those stay the
+ * runtime's, see rocket_core::layout. Added in ABI version 4. */
+uint32_t rocket_plan_chain_identity(const rocket_plan_cube_desc_t* producer,
+                                    const rocket_plan_cube_desc_t* consumer,
+                                    char* message, size_t message_capacity);
 
 #ifdef __cplusplus
 }

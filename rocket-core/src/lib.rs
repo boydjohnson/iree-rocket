@@ -12,4 +12,5 @@ pub mod admission;
 pub mod conv;
 pub mod error;
 pub mod fc;
+pub mod layout;
 pub mod policy;

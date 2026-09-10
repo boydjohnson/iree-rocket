@@ -23,10 +23,11 @@ use rocket_core::{
     conv::{self, Activation, ConvPlan, Multiplier, Precision, Quantization},
     error::{PlanError, PlanErrorCode},
     fc,
+    layout::{self, CubeGeometry, CubeKind},
     policy::{PlanningPolicy, with_policy},
 };
 
-pub const ROCKET_PLAN_ABI_VERSION: u32 = 3;
+pub const ROCKET_PLAN_ABI_VERSION: u32 = 4;
 
 pub const ROCKET_PLAN_OK: u32 = 0;
 pub const ROCKET_PLAN_INVALID_SHAPE: u32 = 1;
@@ -36,6 +37,7 @@ pub const ROCKET_PLAN_CAPACITY_EXCEEDED: u32 = 4;
 pub const ROCKET_PLAN_UNVALIDATED_CONFIGURATION: u32 = 5;
 pub const ROCKET_PLAN_INTERNAL: u32 = 6;
 pub const ROCKET_PLAN_INVALID_ARGUMENT: u32 = 7;
+pub const ROCKET_PLAN_LAYOUT_MISMATCH: u32 = 8;
 
 #[repr(C)]
 #[derive(Clone, Copy, Debug, Default)]
@@ -119,6 +121,32 @@ pub struct rocket_plan_policy_t {
 }
 
 #[repr(C)]
+#[derive(Clone, Copy, Debug)]
+pub struct rocket_plan_cube_desc_t {
+    pub struct_size: u32,
+    pub kind: u32,
+    pub element_bytes: u32,
+    pub reserved_: u32,
+    pub width: u64,
+    pub height: u64,
+    pub channels: u64,
+}
+
+#[repr(C)]
+#[derive(Clone, Copy, Debug, Default)]
+pub struct rocket_plan_cube_geometry_t {
+    pub struct_size: u32,
+    pub whole_atom: u8,
+    pub exact: u8,
+    pub reserved_: [u8; 2],
+    pub pixel_count: u64,
+    pub surface_pixel_count: u64,
+    pub bytes_per_pixel: u64,
+    pub packed_bytes_per_pixel: u64,
+    pub storage_bytes: u64,
+}
+
+#[repr(C)]
 #[derive(Clone, Copy, Debug, Default)]
 pub struct rocket_plan_conv_plan_t {
     pub struct_size: u32,
@@ -176,6 +204,7 @@ pub fn status_name(status: u32) -> &'static str {
         ROCKET_PLAN_UNVALIDATED_CONFIGURATION => "unvalidated_configuration",
         ROCKET_PLAN_INTERNAL => "internal",
         ROCKET_PLAN_INVALID_ARGUMENT => "invalid_argument",
+        ROCKET_PLAN_LAYOUT_MISMATCH => "layout_mismatch",
         _ => "unknown",
     }
 }
@@ -472,7 +501,7 @@ pub extern "C" fn rocket_plan_abi_version() -> u32 {
 pub extern "C" fn rocket_plan_status_name(status: u32) -> *const c_char {
     // Every arm of `status_name` is a NUL-terminated literal via the table
     // below, which is what lets a `&'static str` be handed out as C string.
-    const NAMES: [&std::ffi::CStr; 9] = [
+    const NAMES: [&std::ffi::CStr; 10] = [
         c"ok",
         c"invalid_shape",
         c"unsupported_semantics",
@@ -481,6 +510,7 @@ pub extern "C" fn rocket_plan_status_name(status: u32) -> *const c_char {
         c"unvalidated_configuration",
         c"internal",
         c"invalid_argument",
+        c"layout_mismatch",
         c"unknown",
     ];
     NAMES[(status as usize).min(NAMES.len() - 1)].as_ptr()
@@ -663,10 +693,278 @@ pub unsafe extern "C" fn rocket_admit_matmul(
     }
 }
 
+fn cube_kind(code: u32) -> Result<CubeKind, Refusal> {
+    Ok(match code {
+        0 => CubeKind::Conv,
+        1 => CubeKind::Matmul,
+        2 => CubeKind::Pooling,
+        3 => CubeKind::Elementwise,
+        other => {
+            return Err(invalid(format!(
+                "cube kind {other} is not a rocket_plan_cube_kind_e"
+            )));
+        }
+    })
+}
+
+fn cube_of(desc: &rocket_plan_cube_desc_t) -> Result<CubeGeometry, Refusal> {
+    Ok(layout::cube_geometry(
+        cube_kind(desc.kind)?,
+        desc.element_bytes,
+        narrow(desc.width, "width")?,
+        narrow(desc.height, "height")?,
+        narrow(desc.channels, "channels")?,
+    )?)
+}
+
+fn describe(geometry: &CubeGeometry) -> Result<rocket_plan_cube_geometry_t, Refusal> {
+    Ok(rocket_plan_cube_geometry_t {
+        struct_size: std::mem::size_of::<rocket_plan_cube_geometry_t>() as u32,
+        whole_atom: geometry.is_whole_atom() as u8,
+        exact: geometry.is_exact() as u8,
+        reserved_: [0; 2],
+        pixel_count: geometry.pixel_count as u64,
+        surface_pixel_count: geometry.surface_pixel_count as u64,
+        bytes_per_pixel: geometry.bytes_per_pixel as u64,
+        packed_bytes_per_pixel: geometry.packed_bytes_per_pixel as u64,
+        storage_bytes: geometry.storage_bytes()? as u64,
+    })
+}
+
+/// The descriptor half of every boundary: null and `struct_size` checked
+/// before anything else is read.
+///
+/// # Safety
+/// `desc` is null or points at a readable `D` whose first field is its
+/// `struct_size`.
+unsafe fn checked_desc<'a, D>(
+    desc: *const D,
+    struct_size_of: impl Fn(&D) -> u32,
+) -> Result<&'a D, Refusal> {
+    if desc.is_null() {
+        return Err(invalid("descriptor pointer is null"));
+    }
+    // SAFETY: non-null; the caller promises a readable descriptor whose
+    // first field is struct_size, checked before the rest is trusted.
+    let desc = unsafe { &*desc };
+    if struct_size_of(desc) as usize != std::mem::size_of::<D>() {
+        return Err(invalid("descriptor struct_size does not match this ABI"));
+    }
+    Ok(desc)
+}
+
+/// The reporting half: a caught outcome becomes the status the caller
+/// sees, with the refusal or panic message in their buffer.
+///
+/// # Safety
+/// `message` follows the caller's buffer contract.
+unsafe fn report(
+    outcome: Result<Result<(), Refusal>, Box<dyn std::any::Any + Send>>,
+    message: *mut c_char,
+    message_capacity: usize,
+    what: &str,
+) -> u32 {
+    match outcome {
+        Ok(Ok(())) => ROCKET_PLAN_OK,
+        Ok(Err(refusal)) => {
+            // SAFETY: caller's buffer contract.
+            unsafe { write_message(message, message_capacity, &refusal.message) };
+            refusal.status
+        }
+        Err(payload) => {
+            let text = payload
+                .downcast_ref::<String>()
+                .map(String::as_str)
+                .or_else(|| payload.downcast_ref::<&str>().copied())
+                .unwrap_or("non-string panic payload");
+            // SAFETY: caller's buffer contract.
+            unsafe {
+                write_message(
+                    message,
+                    message_capacity,
+                    &format!("{what} panicked instead of refusing: {text}"),
+                )
+            };
+            ROCKET_PLAN_INTERNAL
+        }
+    }
+}
+
+/// # Safety
+/// See `rocket_plan.h`.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn rocket_plan_cube_geometry(
+    desc: *const rocket_plan_cube_desc_t,
+    out_geometry: *mut rocket_plan_cube_geometry_t,
+    message: *mut c_char,
+    message_capacity: usize,
+) -> u32 {
+    let outcome = catch_unwind(AssertUnwindSafe(|| -> Result<(), Refusal> {
+        // SAFETY: forwarded contract.
+        let desc = unsafe { checked_desc(desc, |d| d.struct_size)? };
+        let geometry = cube_of(desc)?;
+        if !out_geometry.is_null() {
+            // SAFETY: non-null; the caller promises a writable geometry
+            // struct, whose struct_size is checked before it is written.
+            let out = unsafe { &mut *out_geometry };
+            if out.struct_size as usize != std::mem::size_of::<rocket_plan_cube_geometry_t>() {
+                return Err(invalid(
+                    "rocket_plan_cube_geometry_t.struct_size does not match this ABI",
+                ));
+            }
+            *out = describe(&geometry)?;
+        }
+        Ok(())
+    }));
+    // SAFETY: caller's buffer contract.
+    unsafe { report(outcome, message, message_capacity, "layout") }
+}
+
+/// # Safety
+/// See `rocket_plan.h`.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn rocket_plan_chain_identity(
+    producer: *const rocket_plan_cube_desc_t,
+    consumer: *const rocket_plan_cube_desc_t,
+    message: *mut c_char,
+    message_capacity: usize,
+) -> u32 {
+    let outcome = catch_unwind(AssertUnwindSafe(|| -> Result<(), Refusal> {
+        // SAFETY: forwarded contract.
+        let producer = cube_of(unsafe { checked_desc(producer, |d| d.struct_size)? })?;
+        // SAFETY: forwarded contract.
+        let consumer = cube_of(unsafe { checked_desc(consumer, |d| d.struct_size)? })?;
+        layout::chain_identity(&producer, &consumer).map_err(|refusal| Refusal {
+            status: ROCKET_PLAN_LAYOUT_MISMATCH,
+            message: refusal.to_string(),
+        })
+    }));
+    // SAFETY: caller's buffer contract.
+    unsafe { report(outcome, message, message_capacity, "layout") }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use std::{ffi::CStr, mem::size_of};
+
+    fn cube_desc(kind: u32, element_bytes: u32, w: u64, h: u64, c: u64) -> rocket_plan_cube_desc_t {
+        rocket_plan_cube_desc_t {
+            struct_size: size_of::<rocket_plan_cube_desc_t>() as u32,
+            kind,
+            element_bytes,
+            reserved_: 0,
+            width: w,
+            height: h,
+            channels: c,
+        }
+    }
+
+    fn geometry(desc: &rocket_plan_cube_desc_t) -> (u32, rocket_plan_cube_geometry_t, String) {
+        let mut out = rocket_plan_cube_geometry_t {
+            struct_size: size_of::<rocket_plan_cube_geometry_t>() as u32,
+            ..Default::default()
+        };
+        let mut message = [0 as c_char; 256];
+        let status = unsafe {
+            rocket_plan_cube_geometry(desc, &mut out, message.as_mut_ptr(), message.len())
+        };
+        let text = unsafe { CStr::from_ptr(message.as_ptr()) }
+            .to_string_lossy()
+            .into_owned();
+        (status, out, text)
+    }
+
+    fn identity(
+        producer: &rocket_plan_cube_desc_t,
+        consumer: &rocket_plan_cube_desc_t,
+    ) -> (u32, String) {
+        let mut message = [0 as c_char; 256];
+        let status = unsafe {
+            rocket_plan_chain_identity(producer, consumer, message.as_mut_ptr(), message.len())
+        };
+        let text = unsafe { CStr::from_ptr(message.as_ptr()) }
+            .to_string_lossy()
+            .into_owned();
+        (status, text)
+    }
+
+    #[test]
+    fn the_cube_geometry_is_the_drivers() {
+        // ResNet50's conv1 -> conv2 edge, and a 7x7 pool's four-rounded
+        // stride: the two numbers `chain_identity_tests` pins to the bytes.
+        let (status, g, _) = geometry(&cube_desc(0, 2, 56, 56, 64));
+        assert_eq!(status, ROCKET_PLAN_OK);
+        assert_eq!(g.pixel_count, 56 * 56);
+        assert_eq!(g.surface_pixel_count, 56 * 56);
+        assert_eq!(g.bytes_per_pixel, 128);
+        assert_eq!(g.packed_bytes_per_pixel, 128);
+        assert_eq!(g.storage_bytes, 56 * 56 * 8 * 16);
+        assert_eq!((g.whole_atom, g.exact), (1, 1));
+
+        let (status, g, _) = geometry(&cube_desc(2, 2, 7, 7, 64));
+        assert_eq!(status, ROCKET_PLAN_OK);
+        assert_eq!(g.surface_pixel_count, 52);
+
+        // Cout 24 fp16: whole atoms, but the CNA would pad it to 32 lanes.
+        let (_, g, _) = geometry(&cube_desc(0, 2, 4, 4, 24));
+        assert_eq!((g.whole_atom, g.exact), (1, 0));
+        assert_eq!(g.packed_bytes_per_pixel, 64);
+    }
+
+    #[test]
+    fn the_chain_identity_names_its_refusal() {
+        let conv = |w, h, c| cube_desc(0, 2, w, h, c);
+        assert_eq!(
+            identity(&conv(56, 56, 64), &conv(56, 56, 64)).0,
+            ROCKET_PLAN_OK
+        );
+        let (status, text) = identity(&cube_desc(2, 2, 7, 7, 64), &conv(7, 7, 64));
+        assert_eq!(status, ROCKET_PLAN_LAYOUT_MISMATCH);
+        assert_eq!(
+            text,
+            "producer surfaces 52 pixels apart, consumer packs at 49"
+        );
+        let (status, text) = identity(&conv(4, 4, 24), &conv(4, 4, 24));
+        assert_eq!(status, ROCKET_PLAN_LAYOUT_MISMATCH);
+        assert_eq!(
+            text,
+            "consumer width 48 packs to 64, not a whole-atom identity"
+        );
+        let name = unsafe { CStr::from_ptr(rocket_plan_status_name(status)) };
+        assert_eq!(name.to_str().unwrap(), "layout_mismatch");
+        assert_eq!(status_name(ROCKET_PLAN_LAYOUT_MISMATCH), "layout_mismatch");
+    }
+
+    #[test]
+    fn a_malformed_cube_call_is_a_refusal_not_a_misread() {
+        let (status, _, text) = geometry(&cube_desc(4, 2, 1, 1, 1));
+        assert_eq!(status, ROCKET_PLAN_INVALID_ARGUMENT);
+        assert!(text.contains("cube kind 4"), "{text}");
+        let (status, _, _) = geometry(&cube_desc(0, 3, 1, 1, 1));
+        assert_eq!(status, ROCKET_PLAN_INVALID_SHAPE);
+        let (status, _, _) = geometry(&cube_desc(0, 2, 1, 1, 0));
+        assert_eq!(status, ROCKET_PLAN_INVALID_SHAPE);
+        let (status, _, text) = geometry(&cube_desc(0, 2, u64::from(u32::MAX) + 1, 1, 1));
+        assert_eq!(status, ROCKET_PLAN_HARDWARE_LIMIT);
+        assert!(text.contains("32-bit"), "{text}");
+        let mut bad = cube_desc(0, 2, 1, 1, 8);
+        bad.struct_size = 1;
+        assert_eq!(geometry(&bad).0, ROCKET_PLAN_INVALID_ARGUMENT);
+        let status =
+            unsafe { rocket_plan_chain_identity(std::ptr::null(), &bad, std::ptr::null_mut(), 0) };
+        assert_eq!(status, ROCKET_PLAN_INVALID_ARGUMENT);
+        // A verdict without a geometry out-parameter is still a verdict.
+        let status = unsafe {
+            rocket_plan_cube_geometry(
+                &cube_desc(0, 2, 8, 8, 8),
+                std::ptr::null_mut(),
+                std::ptr::null_mut(),
+                0,
+            )
+        };
+        assert_eq!(status, ROCKET_PLAN_OK);
+    }
 
     fn conv_desc(width: u64, height: u64, cin: u64, cout: u64, k: u64) -> rocket_plan_conv_desc_t {
         rocket_plan_conv_desc_t {

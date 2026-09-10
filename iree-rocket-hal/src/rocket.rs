@@ -30,3 +30,7 @@ pub mod pooling;
 )]
 pub mod registers;
 pub mod tensor_layout;
+
+/// The feature-cube layout contract (COMPILER_ROADMAP.md 6.1), re-exported
+/// from `rocket-core` so the driver reads it from one place.
+pub use rocket_core::layout;

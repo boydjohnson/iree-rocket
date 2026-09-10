@@ -12,6 +12,8 @@
 //! not command order: matching captures configure PPU before its PPU_RDMA
 //! feeder. No CNA/CORE/DPU bypass is part of the public pooling path.
 
+use rocket_core::layout::{CubeKind, packed_channels};
+
 use crate::rocket::{
     builders::{Bits, RegCmd, Register, pc::PCTrailer, ppu::*, ppu_rdma::*},
     regcmd::{KICK_PPU, KICK_PPU_RDMA, push_kick, zero},
@@ -449,8 +451,19 @@ impl PoolingShape {
     /// packing an input buffer has to agree with it exactly, and deriving
     /// the rule twice is how the two come to disagree.
     pub fn programmed_channels(&self) -> u32 {
-        self.input_channels
-            .next_multiple_of(self.precision.channels_per_atom())
+        // The rule itself lives in `rocket_core::layout` (COMPILER_ROADMAP.md
+        // 6.1) so the compiler can ask it; this is the PPU's own unit.
+        packed_channels(
+            CubeKind::Pooling,
+            self.precision.element_bytes(),
+            self.input_channels,
+        )
+        .unwrap_or_else(|| {
+            panic!(
+                "{} channels do not fit the PPU's fields",
+                self.input_channels
+            )
+        })
     }
 
     /// Bytes one packed NC1HWC2 pixel occupies: one 16-byte atom per

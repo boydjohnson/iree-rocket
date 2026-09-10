@@ -1648,11 +1648,25 @@ mod parity_padding_tests {
 /// the repack would reproduce the producer's scratch byte for byte, the
 /// driver skips it and reads that scratch in place. Nothing at runtime can
 /// check the claim, so it is pinned here: once that it holds, and once for
-/// each way it stops holding, which is exactly the list `chainable_cube`
-/// refuses on.
+/// each way it stops holding, which is exactly the list
+/// `rocket_core::layout::chain_identity` refuses on -- and each case asks
+/// that pure verdict too, so the contract the compiler reads
+/// (COMPILER_ROADMAP.md 6.1) is pinned to the bytes, not restated beside
+/// them.
 #[cfg(test)]
 mod chain_identity_tests {
     use super::*;
+    use rocket_core::layout::{
+        ChainRefusal, CubeGeometry, CubeKind, chain_identity, cube_geometry,
+    };
+
+    fn conv(w: u32, h: u32, c: u32) -> CubeGeometry {
+        cube_geometry(CubeKind::Conv, 2, w, h, c).unwrap()
+    }
+
+    fn pool(w: u32, h: u32, c: u32) -> CubeGeometry {
+        cube_geometry(CubeKind::Pooling, 2, w, h, c).unwrap()
+    }
 
     /// A cube with a distinct nonzero byte in every lane, padding channels
     /// included -- zeros there would hide the very mismatches these test.
@@ -1701,6 +1715,33 @@ mod chain_identity_tests {
         const BPP: usize = 64 * 2;
         let cube = distinct_cube(PIXELS, BPP);
         assert_eq!(round_trip(&cube, PIXELS, BPP, BPP), cube);
+        let g = conv(56, 56, 64);
+        assert_eq!((g.pixel_count, g.bytes_per_pixel), (PIXELS, BPP));
+        assert_eq!(chain_identity(&g, &g), Ok(()));
+    }
+
+    /// The contract's storage size is the packer's, so a scratch sized by
+    /// one is filled by the other.
+    #[test]
+    fn the_contract_sizes_the_cube_as_the_packer_does() {
+        for (w, h, c) in [
+            (56, 56, 64),
+            (4, 4, 8),
+            (4, 4, 20),
+            (7, 7, 64),
+            (1, 197, 768),
+        ] {
+            let g = conv(w, h, c);
+            assert_eq!(
+                g.storage_bytes().unwrap(),
+                nc1hwc2_storage_size(g.surface_pixel_count, g.packed_bytes_per_pixel).unwrap()
+            );
+            let g = pool(w, h, c);
+            assert_eq!(
+                g.storage_bytes().unwrap(),
+                nc1hwc2_storage_size(g.surface_pixel_count, g.packed_bytes_per_pixel).unwrap()
+            );
+        }
     }
 
     #[test]
@@ -1724,6 +1765,15 @@ mod chain_identity_tests {
 
         let cube_64 = distinct_cube(64, BPP);
         assert_eq!(round_trip(&cube_64, 64, BPP, BPP), cube_64);
+
+        assert_eq!(
+            chain_identity(&pool(7, 7, 64), &conv(7, 7, 64)),
+            Err(ChainRefusal::SurfaceStride {
+                producer: 52,
+                consumer: 49,
+            })
+        );
+        assert_eq!(chain_identity(&pool(8, 8, 64), &conv(8, 8, 64)), Ok(()));
     }
 
     #[test]
@@ -1736,6 +1786,11 @@ mod chain_identity_tests {
         const BPP: usize = 32 * 2;
         let cube = distinct_cube(PIXELS, BPP + 2 * FEATURE_ATOMIC_BYTES);
         assert_eq!(round_trip(&cube, PIXELS, BPP, BPP), cube[..PIXELS * BPP]);
+        let producer = CubeGeometry {
+            packed_bytes_per_pixel: BPP + 2 * FEATURE_ATOMIC_BYTES,
+            ..conv(8, 8, 32)
+        };
+        assert_eq!(chain_identity(&producer, &conv(8, 8, 32)), Ok(()));
     }
 
     #[test]
@@ -1747,6 +1802,12 @@ mod chain_identity_tests {
         let cube = distinct_cube(PIXELS, 3 * FEATURE_ATOMIC_BYTES);
         let repacked = round_trip(&cube, PIXELS, BPP, BPP);
         assert_ne!(repacked[..], cube[..repacked.len()]);
+        assert_eq!(
+            chain_identity(&conv(4, 4, 20), &conv(4, 4, 20)),
+            Err(ChainRefusal::PartialAtom {
+                bytes_per_pixel: BPP
+            })
+        );
     }
 
     #[test]
@@ -1758,6 +1819,15 @@ mod chain_identity_tests {
         const PACKED: usize = 16 * 2;
         let cube = distinct_cube(PIXELS, PACKED);
         assert_ne!(round_trip(&cube, PIXELS, BPP, PACKED), cube);
+        let g = conv(4, 4, 8);
+        assert_eq!((g.bytes_per_pixel, g.packed_bytes_per_pixel), (BPP, PACKED));
+        assert_eq!(
+            chain_identity(&g, &g),
+            Err(ChainRefusal::ConsumerPadsChannels {
+                bytes_per_pixel: BPP,
+                packed_bytes_per_pixel: PACKED,
+            })
+        );
     }
 
     #[test]
@@ -1775,5 +1845,12 @@ mod chain_identity_tests {
         let truth = compact(&cube, PRODUCER_PIXELS, BPP);
         let seen = compact(&cube, CONSUMER_PIXELS, BPP);
         assert_ne!(seen[..], truth[..seen.len()]);
+        assert_eq!(
+            chain_identity(&conv(8, 1, 16), &conv(4, 1, 16)),
+            Err(ChainRefusal::PixelCount {
+                producer: PRODUCER_PIXELS,
+                consumer: CONSUMER_PIXELS,
+            })
+        );
     }
 }

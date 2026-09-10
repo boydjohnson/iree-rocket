@@ -414,7 +414,12 @@ last two because a repack zeroes padding lanes where a producer leaves its
 padding channels. Fanned-out and accumulator dispatches offer no cube: the
 first has no single scratch (each context wrote its own tiles), the second
 writes 128-byte blocks. `tensor_layout.rs`'s `chain_identity_tests` pins the
-identity and each way it fails, since nothing at runtime can check it.
+identity and each way it fails, since nothing at runtime can check it. Since
+2026-09-10 the identity is a pure function, `rocket_core::layout::
+chain_identity` over `CubeGeometry` (COMPILER_ROADMAP.md 6.1): the driver's
+`OutputCube` and every consumer geometry are built through it, those tests
+assert its verdict beside each byte-level case, and the compiler can ask it
+over `rocket-plan-ffi` ABI 4.
 
 ResNet50 fp16 on `planck`, `taskset -c 4-7`, medians of 3, same
 `resnet50.res.vmfb` with the feature only turned off and on:
