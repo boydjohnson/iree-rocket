@@ -1726,7 +1726,7 @@ converter did not corrupt the model here, the importer mishandled what it
 produced. Root cause not yet localized -- the next step is a layer-wise
 comparison to find where the two imports first diverge.
 
-## C15 (S3) — RESOLVED as *implemented and off by default*: ViT's attention offloads correctly and is 1.16x slower; the CPU was only spending 3 ms on it
+## C15 (S3) — RESOLVED as *implemented and off by default*: attention offloads correctly and is slower on both models measured (ViT-B 1.16x, BERT-384 1.41x); the CPU was barely spending anything on it
 
 **[verified]** `rocket-compiler audit` on ViT-B/16 (f32 import) reports 74
 convolution/matmul candidates: 73 matmuls accepted and one refusal, the
@@ -1798,6 +1798,43 @@ roughly 125 - 42 = 83 ms of cost against 3 ms of benefit -- still losing.
 The honest conclusion is that attention offload needs the *shape* to get
 better (a batched descriptor, or fusing the pair so the intermediate never
 lands), not the dispatch tax to get cheaper.
+
+**Confirmed on a second model, 2026-09-09: BERT-base at 384 tokens, 1.41x
+slower.** The ViT measurement above could have been an artifact of one model,
+one head width, or the per-dispatch cost as it stood that week -- so it was
+re-run through `tools/model_survey.py` on a graph with no convolution in it at
+all, whose attention has twelve heads against ViT-B's twelve at a wider
+sequence, and after the epilogue-fusion and lazy-compaction work landed.
+`planck`, f32 import, medians of 7 warm repetitions:
+
+| arm | candidates | NPU sites | contraction on CPU | cpus 4-7 |
+|---|---:|---:|---:|---:|
+| NPU, attention on CPU (default) | 72 | 72 | 24 | **636 ms** |
+| NPU, attention offloaded (`--batch-matmul`) | 360 | 360 | **0** | 894 ms |
+| `--no-offload` (like-for-like CPU) | 72 | 0 | 96 | 5074 ms |
+
+Same shape of result, larger margin. It is again *correct* -- every one of the
+360 candidates offloads, `max|err|` 0.0165 against the f32 oracle on a
+distribution of sd 0.60, argmax and top-5 unchanged -- and again the failure
+is dispatch granularity rather than the matcher or the hardware. 24 sites
+become 288, each a `384x64 x 64x384` too small to amortize its own dispatch,
+and `ROCKET_PROFILE` on the default arm puts the per-dispatch host tax
+(`pack.input` + `compact` + `record` + submit) at about 1.6 ms averaged over
+72 dispatches -- so 288 more of them is a few hundred milliseconds of new cost
+against attention work the CPU was not spending much on. The CPU dispatch
+count *rises* too, 199 -> 1063, because splitting the batch multiplies the
+surrounding reshape and transpose glue.
+
+The same profile says where this model's time actually is, which is not
+attention: of 636 ms, **314 ms (48%) is `outside`** -- layernorm, GELU,
+softmax and the transposes -- **206 ms (32%) is `wait.npu`**, and **110 ms
+(17%) is the NC1HWC2 round trip** (`compact` 69, `pack.input` 41). One
+asymmetry in there is worth its own look: the MLP down-projection
+(`384x3072x768`, `K` = 3072) takes **9.87 ms** per dispatch on the hardware
+against the up-projection's (`384x768x3072`, `N` = 3072) **2.99 ms** for
+identical arithmetic, because `K` becomes `Cin` and charges CBUF feature
+residency while `N` becomes `Cout` and charges none. The up-projection pays
+instead on the way out, 31 ms of `compact` per inference against 7.5.
 
 ## Resolved
 
