@@ -279,6 +279,7 @@ fn decode_flatbuffer_shape(data: &[u8]) -> Result<UkernelShape, ()> {
                 epilogue_add: conv_def.epilogue_add(),
                 epilogue_activation,
                 runtime_dense_readers: conv_def.runtime_dense_readers(),
+                weights_packed: conv_def.weights_packed(),
             };
             executable.validate_template().map_err(|_| ())?;
             Ok(UkernelShape::Conv2d(executable))
@@ -338,6 +339,7 @@ fn decode_flatbuffer_shape(data: &[u8]) -> Result<UkernelShape, ()> {
                 shape_template: shape,
                 runtime_dimensions,
                 runtime_dense_readers: matmul_def.runtime_dense_readers(),
+                weights_packed: matmul_def.weights_packed(),
             };
             executable.validate_template().map_err(|_| ())?;
             Ok(UkernelShape::Matmul(executable))

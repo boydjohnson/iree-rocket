@@ -12,7 +12,7 @@ for the Rocket NPU backend (RK3588). This repository produces:
 | Path | Role |
 |---|---|
 | [`rocket-schema`](rocket-schema) | Canonical FlatBuffers schema for Rocket executables; shared by the compiler plugin (C++) and the runtime crates (Rust). |
-| [`rocket-plan-ffi`](rocket-plan-ffi) | Versioned C ABI (`include/rocket_plan.h`) over `rocket-core`'s planner, built as a host staticlib by the compiler plugin's CMake and linked into `libIREECompiler.so`; how the compiler asks the same planner the runtime asks. |
+| [`rocket-plan-ffi`](rocket-plan-ffi) | Versioned C ABI (`include/rocket_plan.h`) over `rocket-core`'s planner, layout contract and weight packers, built as a host staticlib by the compiler plugin's CMake and linked into `libIREECompiler.so`; how the compiler asks the same planner -- and packs the same coefficient bytes -- the runtime does. |
 | [`rocket-core`](rocket-core) | Pure, dependency-free Rust crate: convolution/matmul descriptors, hardware limits, layout geometry, CBUF partitioning and tile planning, with fallible `try_*` APIs that return a `PlanError` code instead of panicking. Shared by the runtime and, eventually, the compiler. |
 | [`iree-rocket-hal`](iree-rocket-hal) | Low-level Rust crate: ioctl/mmap access to the RK3588 NPU and register command building. Consumes `rocket-core`'s plans and re-exports its planner under `rocket::conv`. |
 | [`rocket-hal-driver`](rocket-hal-driver) | Rust `staticlib` implementing IREE's HAL driver interface, statically linked into IREE via `iree_register_external_hal_driver()`. Depends on `iree-rocket-hal` and `rocket-schema`. Includes HAL CTS wiring under `cts/`. |

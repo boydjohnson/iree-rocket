@@ -103,11 +103,10 @@ use iree_rocket_hal::rocket::{
     layout::{ChainRefusal, CubeGeometry, CubeKind, chain_identity, cube_geometry},
     pooling::{PoolingBuffers, PoolingPlan},
     tensor_layout::{
-        nc1hwc2_storage_size, pack_depthwise_to_rocket_weights, pack_fp16_bias_to_rocket,
-        pack_hwcf_to_rocket_weights, pack_hwcf_to_rocket_weights_affine_i8,
-        pack_hwcf_to_rocket_weights_padded, pack_nhwc_to_nc1hwc2_padded,
+        nc1hwc2_storage_size, pack_fp16_bias_to_rocket, pack_nhwc_to_nc1hwc2_padded,
         rocket_fp16_bias_storage_size, rocket_weight_storage_size,
     },
+    weights::WeightPlan,
 };
 
 #[derive(Clone, Copy)]
@@ -430,25 +429,12 @@ pub struct WeightPacking {
     pub scratch_ptr: *mut u8,
     pub scratch_length: usize,
     pub scratch_handle: u32,
-    pub filter_height: usize,
-    pub filter_width: usize,
-    pub input_channels: usize,
-    /// Logical output channels present in the source binding.
-    pub output_channels: usize,
-    /// Physical output channels encoded in the regcmd and packed weights.
-    pub programmed_output_channels: usize,
-    pub element_size: usize,
-    /// One filter per input channel (no `(input, output)` pairing) packed
-    /// tap-major via [`pack_depthwise_to_rocket_weights`] instead of
-    /// [`pack_hwcf_to_rocket_weights`]'s blocked dense order. `output_channels`
-    /// is unused in this mode -- Cout is always Cin, per
-    /// `iree-rocket-hal`'s `Shape::with_depthwise` -- and `padded_channels`
-    /// is read instead.
-    pub depthwise: bool,
-    /// Tap-major stride, only meaningful when `depthwise` is set. See
-    /// `iree-rocket-hal`'s `Shape::depthwise_padded_channels`.
-    pub padded_channels: usize,
-    pub weight_zero_point: Option<i8>,
+    /// What to pack and how: the shape, the kernel and the packer it
+    /// selects (tap-major for depthwise, affine for an int8 zero point,
+    /// plain otherwise), as `rocket_core::weights` states it. The compiler's
+    /// `rocket-pack-weights` builds the same plan from the same shape, which
+    /// is what makes `Conv2DDef.weights_packed` bytes identical to these.
+    pub plan: WeightPlan,
     /// Set only under `ROCKET_WEIGHT_CACHE=verify`: the cached buffer the
     /// regcmd actually points at. The packing above then runs into a private
     /// probe buffer instead, and `apply_ops` compares the two -- so a stale
@@ -987,6 +973,7 @@ unsafe fn stage_weights(
     cb: &RocketCommandBuffer,
     weight_ref: &iree_hal_buffer_ref_t,
     geometry: weight_cache::Geometry,
+    plan: WeightPlan,
     staged_copies: &mut Vec<StagedCopy>,
 ) -> StagedWeights {
     let key = weight_cache::Key {
@@ -1012,15 +999,7 @@ unsafe fn stage_weights(
         scratch_ptr,
         scratch_length: geometry.scratch_length,
         scratch_handle,
-        filter_height: geometry.filter_height,
-        filter_width: geometry.filter_width,
-        input_channels: geometry.input_channels,
-        output_channels: geometry.output_channels,
-        programmed_output_channels: geometry.programmed_output_channels,
-        element_size: geometry.element_size,
-        depthwise: geometry.depthwise,
-        padded_channels: geometry.padded_channels,
-        weight_zero_point: geometry.weight_zero_point,
+        plan,
         verify_against,
     };
 
@@ -1625,27 +1604,17 @@ pub unsafe fn apply_ops_until_dispatch(
                     // entry is published under, so it can never be mistaken
                     // for the bytes this pack actually read.
                     let generation = unsafe { crate::buffer::generation(packing.weight_buffer) };
-                    // Depthwise's dense_len has no Cout factor -- one filter
-                    // per input channel, not a kernel set per output channel
-                    // (packing.output_channels is unused in this mode; see
-                    // WeightPacking's doc comment).
-                    let dense_len = if packing.depthwise {
-                        packing
-                            .filter_height
-                            .checked_mul(packing.filter_width)
-                            .and_then(|value| value.checked_mul(packing.input_channels))
-                            .and_then(|value| value.checked_mul(packing.element_size))
-                    } else {
-                        packing
-                            .filter_height
-                            .checked_mul(packing.filter_width)
-                            .and_then(|value| value.checked_mul(packing.input_channels))
-                            .and_then(|value| value.checked_mul(packing.output_channels))
-                            .and_then(|value| value.checked_mul(packing.element_size))
-                    }
-                    .ok_or_else(|| {
-                        status::from_code(crate::bindings::iree_status_code_e_IREE_STATUS_INTERNAL)
-                    })?;
+                    // The plan is the driver's own packer selection, moved
+                    // to `rocket_core::weights` so the compiler's
+                    // `rocket-pack-weights` produces these exact bytes.
+                    let dense_len = match packing.plan.dense_bytes() {
+                        Ok(value) => value,
+                        Err(_) => {
+                            return Err(status::from_code(
+                                crate::bindings::iree_status_code_e_IREE_STATUS_INTERNAL,
+                            ));
+                        }
+                    };
                     if dense_len as u64 > packing.weight_length as u64 {
                         return Err(status::from_code(
                             crate::bindings::iree_status_code_e_IREE_STATUS_INVALID_ARGUMENT,
@@ -1661,57 +1630,7 @@ pub unsafe fn apply_ops_until_dispatch(
                     let scratch = unsafe {
                         std::slice::from_raw_parts_mut(packing.scratch_ptr, packing.scratch_length)
                     };
-                    let pack_result = if packing.depthwise {
-                        pack_depthwise_to_rocket_weights(
-                            dense,
-                            packing.filter_height,
-                            packing.filter_width,
-                            packing.input_channels,
-                            packing.padded_channels,
-                            packing.element_size,
-                            scratch,
-                        )
-                    } else if let Some(zero_point) = packing.weight_zero_point {
-                        if packing.programmed_output_channels > packing.output_channels {
-                            if zero_point != 0 {
-                                Err(
-                                    "programmed Cout padding requires symmetric accumulator weights",
-                                )
-                            } else {
-                                pack_hwcf_to_rocket_weights_padded(
-                                    dense,
-                                    packing.filter_height,
-                                    packing.filter_width,
-                                    packing.input_channels,
-                                    packing.output_channels,
-                                    packing.programmed_output_channels,
-                                    packing.element_size,
-                                    scratch,
-                                )
-                            }
-                        } else {
-                            let zero_points = vec![zero_point; packing.output_channels];
-                            pack_hwcf_to_rocket_weights_affine_i8(
-                                dense,
-                                packing.filter_height,
-                                packing.filter_width,
-                                packing.input_channels,
-                                packing.output_channels,
-                                &zero_points,
-                                scratch,
-                            )
-                        }
-                    } else {
-                        pack_hwcf_to_rocket_weights(
-                            dense,
-                            packing.filter_height,
-                            packing.filter_width,
-                            packing.input_channels,
-                            packing.output_channels,
-                            packing.element_size,
-                            scratch,
-                        )
-                    };
+                    let pack_result = packing.plan.pack(dense, scratch);
                     if pack_result.is_err() {
                         return Err(status::from_code(
                             crate::bindings::iree_status_code_e_IREE_STATUS_INTERNAL,
@@ -2490,7 +2409,25 @@ unsafe extern "C" fn dispatch_impl(
             // This is independently deferred for the same reason as input
             // packing: an earlier recorded operation may populate weights.
             let element_size = shape.precision.element_bytes() as usize;
-            let staged_weights = if !shape.depthwise {
+            let weight_plan = WeightPlan::for_conv(*shape, kernels);
+            let staged_weights = if executable.weights_packed {
+                // Packed at compile time (`rocket-pack-weights`,
+                // `Conv2DDef.weights_packed`): the binding already holds
+                // what `WeightPlan::pack` would have produced, so it is bound
+                // as the coefficient stream and no packer runs. Its length
+                // is checked rather than trusted. COMPILER_ROADMAP.md 6.3.
+                if !matches!(
+                    weight_plan.packed_bytes(),
+                    Ok(bytes) if bytes as u64 <= refs[1].length as u64
+                ) {
+                    return status::from_code(
+                        crate::bindings::iree_status_code_e_IREE_STATUS_INVALID_ARGUMENT,
+                    );
+                }
+                let (addr, handle) =
+                    unsafe { stage_direct(cb, &refs[1], &mut scratch_buffers, &mut staged_copies) };
+                StagedWeights::direct(addr, handle, refs[1].length as usize)
+            } else if !shape.depthwise {
                 if !matches!(
                     kernels[0]
                     .checked_mul(kernels[1])
@@ -2536,10 +2473,11 @@ unsafe extern "C" fn dispatch_impl(
                                 .map(|q| q.weight_zero_point as i8),
                             scratch_length: scratch_bytes,
                         },
+                        weight_plan,
                         &mut staged_copies,
                     )
                 }
-            } else if shape.depthwise {
+            } else {
                 // One filter per input channel -- no Cout factor, unlike
                 // the dense branch above. The compiler-emitted dispatch
                 // (transform.0.mlir's depthwise matcher) supplies the
@@ -2578,13 +2516,10 @@ unsafe extern "C" fn dispatch_impl(
                                 .map(|q| q.weight_zero_point as i8),
                             scratch_length: scratch_bytes,
                         },
+                        weight_plan,
                         &mut staged_copies,
                     )
                 }
-            } else {
-                let (addr, handle) =
-                    unsafe { stage_direct(cb, &refs[1], &mut scratch_buffers, &mut staged_copies) };
-                StagedWeights::direct(addr, handle, refs[1].length as usize)
             };
             let StagedWeights {
                 addr: weights_addr,
@@ -3243,24 +3178,43 @@ unsafe extern "C" fn dispatch_impl(
                 publish: weight_publish,
                 probe: weight_probe,
                 fanout: weight_fanout,
-            } = unsafe {
-                stage_weights(
-                    cb,
-                    &refs[1],
-                    weight_cache::Geometry {
-                        filter_height: 1,
-                        filter_width: 1,
-                        input_channels: k,
-                        output_channels: n,
-                        programmed_output_channels: n,
-                        element_size,
-                        depthwise: false,
-                        padded_channels: 0,
-                        weight_zero_point: None,
-                        scratch_length: weight_scratch_bytes,
-                    },
-                    &mut staged_copies,
-                )
+            } = if executable.weights_packed {
+                // See the convolution arm: the `[K, N]` operand is already
+                // the packed stream (`MatmulDef.weights_packed`).
+                if weight_scratch_bytes as u64 > refs[1].length as u64 {
+                    return status::from_code(
+                        crate::bindings::iree_status_code_e_IREE_STATUS_INVALID_ARGUMENT,
+                    );
+                }
+                let (addr, handle) =
+                    unsafe { stage_direct(cb, &refs[1], &mut staged_scratch, &mut staged_copies) };
+                StagedWeights::direct(addr, handle, refs[1].length as usize)
+            } else {
+                let Ok(weight_plan) = WeightPlan::for_matmul(*shape) else {
+                    return status::from_code(
+                        crate::bindings::iree_status_code_e_IREE_STATUS_INVALID_ARGUMENT,
+                    );
+                };
+                unsafe {
+                    stage_weights(
+                        cb,
+                        &refs[1],
+                        weight_cache::Geometry {
+                            filter_height: 1,
+                            filter_width: 1,
+                            input_channels: k,
+                            output_channels: n,
+                            programmed_output_channels: n,
+                            element_size,
+                            depthwise: false,
+                            padded_channels: 0,
+                            weight_zero_point: None,
+                            scratch_length: weight_scratch_bytes,
+                        },
+                        weight_plan,
+                        &mut staged_copies,
+                    )
+                }
             };
 
             let (bias_addr, bias_handle, bias_packing, bias_scratch) = if shape.precision

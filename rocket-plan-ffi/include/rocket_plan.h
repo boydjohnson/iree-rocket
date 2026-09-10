@@ -31,7 +31,7 @@
 extern "C" {
 #endif
 
-#define ROCKET_PLAN_ABI_VERSION 4u
+#define ROCKET_PLAN_ABI_VERSION 5u
 
 /* Mirrors rocket_core::conv::Precision. Values are part of the ABI. */
 typedef enum rocket_plan_precision_e {
@@ -281,6 +281,39 @@ uint32_t rocket_plan_cube_geometry(const rocket_plan_cube_desc_t* desc,
 uint32_t rocket_plan_chain_identity(const rocket_plan_cube_desc_t* producer,
                                     const rocket_plan_cube_desc_t* consumer,
                                     char* message, size_t message_capacity);
+
+/* Packs a convolution's logical HWCF filter into the CNA's blocked
+ * coefficient stream -- the bytes the runtime would otherwise produce at
+ * dispatch time, through the same rocket_core::weights::WeightPlan, so a
+ * compile-time packed filter is byte-identical to a runtime packed one
+ * (COMPILER_ROADMAP.md 6.3).
+ *
+ * `desc` needs the shape and precision; activation and scales do not
+ * affect the bytes (the int8 rungs' weights_zero_point does, and is read).
+ * `dense` holds exactly kh * kw * Cin * Cout elements (kh * kw * Cin for
+ * depthwise) at the rung's element width, in HWCF order as IREE's conv ABI
+ * hands them over. On ROCKET_PLAN_OK the packed length is written to
+ * `out_packed_length` (may be NULL) and, when `packed` is non-NULL, the
+ * bytes to `packed`, which must hold at least that many. Pass `packed` as
+ * NULL to query the size without packing; `dense` is then not read. A
+ * length mismatch or a short buffer is ROCKET_PLAN_INVALID_ARGUMENT with
+ * nothing written. Never panics across the boundary. Added in ABI version
+ * 5. */
+uint32_t rocket_pack_conv_weights(const rocket_plan_conv_desc_t* desc,
+                                  const uint8_t* dense, size_t dense_length,
+                                  uint8_t* packed, size_t packed_capacity,
+                                  size_t* out_packed_length, char* message,
+                                  size_t message_capacity);
+
+/* The [K, N] operand of a matmul, packed for the height-one 1x1 lowering
+ * the runtime plans it as: symmetric on every rung, K input channels, N
+ * output channels. Same contract as rocket_pack_conv_weights. Added in ABI
+ * version 5. */
+uint32_t rocket_pack_matmul_weights(const rocket_plan_matmul_desc_t* desc,
+                                    const uint8_t* dense, size_t dense_length,
+                                    uint8_t* packed, size_t packed_capacity,
+                                    size_t* out_packed_length, char* message,
+                                    size_t message_capacity);
 
 #ifdef __cplusplus
 }

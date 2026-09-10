@@ -545,8 +545,8 @@ dispatches need not make a model faster.
 
 ## 6. Own the layout at compile time: packed tensors, boundary-only repacks, prepacked weights
 
-**Status 2026-09-10: step 1 of 6.6 -- the layout contract (6.1) -- landed;
-steps 2 to 4 not started.** This section exists because the end state the
+**Status 2026-09-10: steps 1 and 2 of 6.6 -- the layout contract (6.1) and
+compile-time weight packing (6.3) -- landed; steps 3 and 4 not started.** This section exists because the end state the
 repository is working toward was only ever stated by halves. Put in one
 place, for a model whose input extents are static:
 
@@ -557,7 +557,7 @@ place, for a model whose input extents are static:
    executable says so rather than the driver guessing -- **not started**;
 3. every constant filter is stored in the `.vmfb` already in the CNA's
    blocked coefficient order, so the driver never packs a weight --
-   **sized once as an aside (ISSUES.md P8), not started**;
+   **landed**, 6.3;
 4. activations are packed and unpacked only where a CPU dispatch meets an
    NPU one, never between two NPU dispatches -- **the runtime mechanism
    landed as ISSUES.md P2 steps 2, 4 and 5; the compile-time form has not
@@ -826,6 +826,52 @@ or 32 lanes per block, 32 per input group). It is worth doing for
 first-inference latency and because it is item 3 of the end state; it is
 not a benchmark lever and should not be measured as one.
 
+**Landed 2026-09-10, by route 2.** The packers moved -- not copied -- into
+`rocket_core::weights`, and the one new thing there is `WeightPlan`: the
+packer *selection* the driver's `apply_ops` used to make inline (tap-major
+for depthwise, the affine int8 packer when the rung carries a zero point,
+the plain one otherwise), as a value both sides build from the shape. The
+driver's `WeightPacking` carries a `WeightPlan` and `apply_ops` calls
+`plan.pack`; `rocket-plan-ffi` is ABI 5 with `rocket_pack_conv_weights` and
+`rocket_pack_matmul_weights` over the same plan. The flow-phase pass is
+`rocket-pack-weights`, after `rocket-mark-dense-readers`: it follows the
+weights operand through the shim's `flow.tensor.reshape` to its
+`util.global.load immutable`, packs the initializer, stores the stream in a
+new i8 global, and retargets the dispatch at a clone of its executable whose
+config carries `weights_packed = true`. That flag is an executable property
+(`Conv2DDef.weights_packed`, `MatmulDef.weights_packed`; schema appended,
+older `.vmfb`s read as false), which is why it needs no push constant, no
+pipeline-layout change and no edit to the 54 shim dispatch sites -- the
+first design sketch above had it as a def field for that reason. The driver
+binds a flagged executable's weights binding directly after checking it is
+at least `WeightPlan::packed_bytes` long; the runtime packer and
+`weight_cache` are untouched by an unflagged one. A dispatch whose filter is
+not a constant, or whose dimensions are not, is left to the runtime packer
+and counted in the pass's remark.
+
+Acceptance, planck 2026-09-10, fp16 (P8's int8 model has no MLIR in the
+tree; the survey's fp16 ones do). MobileNetV2: 36 of 36 weight-bearing
+dispatches packed, 6,811,072 -> 6,818,560 coefficient bytes, `.vmfb`
++7.5 KB (+0.1%), `pack.weights` (39.8 ms) and the 6.5 MiB weight cache
+gone, cold single-inference wall 184-195 -> 146-149 ms. Wide ResNet50: 53
+of 53 packed, coefficient bytes unchanged (every channel count fills its
+padding unit), `.vmfb` 15 bytes smaller, `pack.weights` (137 MB at 168 MB/s,
+815 ms) gone, cold wall 1290 -> 551 ms. Outputs bit-identical packed
+against unpacked, and the unpacked `.vmfb` bit-identical on the runtime
+before and after. The one cost that appeared: the packed binding is
+cache-synced as an ordinary input (`sync.inputs` 0.3 -> 5.5 ms on
+MobileNetV2), where the packer's scratch never was -- P3's whole-BO sync,
+now on the weights too. Four constant-filter fixtures
+(`fp16_conv_packed_weights`, `fp16_conv3x3_packed_weights`,
+`requant_int8_packed_weights`, `depthwise_fp16_packed_weights`) gate the
+direct-bind path in `tools/e2e_conv_regression.py`, and the gate refuses to
+run if any of them stops dispatching at a `_packed` executable.
+
+Not done, and worth saying: the fp16 bias is still packed at dispatch
+(`pack.bias`, 0.2 ms on MobileNetV2 -- not worth a pass), and the
+per-channel weight zero point the affine packer can take is still the
+wire's one scalar, broadcast.
+
 ### 6.4 What the whole section is worth
 
 Honestly: little on the models this repository benchmarks, and that is
@@ -888,6 +934,8 @@ dense, reported.
    number attached. Acceptance: packed bytes byte-identical to the driver
    packer on every conv fixture in `tools/e2e_conv_regression.py`, the
    first-inference latency before and after, the `.vmfb` size delta.
+   **Landed 2026-09-10**; see 6.3. Byte identity is by construction (one
+   `WeightPlan` on both sides) and the fixtures gate the bound path.
 3. **Declared layout, first form (6.2).** Encoding assigned in the compiler,
    written per binding, driver checks instead of guesses, within a command
    buffer. `ROCKET_CHAIN` and `ROCKET_LAZY_COMPACT` are removed, and
@@ -912,7 +960,7 @@ the whole model.
 | C: serialized static plans | Schema compatibility and malformed-plan tests; compile/runtime plan equivalence; no repeated search for static dispatches. |
 | D: expanded spatial/M and N tiling | Tail/halo/coverage and scratch tests; CPU-reference comparisons and RK3588 execution on both sides of each newly admitted boundary. |
 | E: reduction tiling and tuning | Nonzero initial accumulators, bias/activation/quantization tests; precision/overflow tests; full-model correctness and end-to-end performance measurements. |
-| F: layout contract and prepacked weights (6.1, 6.3) | `OutputCube` computed through `rocket-core::layout` with the driver bit-identical on every surveyed model; packed weight bytes byte-identical to the driver packer on every conv fixture; first-inference latency and `.vmfb` size before and after. |
+| F: layout contract and prepacked weights (6.1, 6.3) | **Met 2026-09-10.** `OutputCube` computed through `rocket-core::layout` with the driver bit-identical on every surveyed model; packed weight bytes byte-identical to the driver packer on every conv fixture; first-inference latency and `.vmfb` size before and after (6.3). |
 | G: compiler-declared layout (6.2) | Per-binding encoding on the wire; driver checks and never repacks a declared-packed input; the chain fixtures bit-exact with `ROCKET_CHAIN`/`ROCKET_LAZY_COMPACT` removed; the audit names every NPU -> NPU edge packed or dense with a reason; `--strict-offload` layout mode. |
 
 Use addressing-sensitive dense/selector inputs, odd channels, multi-surface

@@ -34,3 +34,8 @@ pub mod tensor_layout;
 /// The feature-cube layout contract (COMPILER_ROADMAP.md 6.1), re-exported
 /// from `rocket-core` so the driver reads it from one place.
 pub use rocket_core::layout;
+
+/// The coefficient layout and its packers (COMPILER_ROADMAP.md 6.3),
+/// re-exported from `rocket-core`; `tensor_layout` re-exports the packers
+/// under their old names, this is the `WeightPlan` that selects them.
+pub use rocket_core::weights;

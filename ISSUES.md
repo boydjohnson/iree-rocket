@@ -1260,6 +1260,13 @@ throughput lever. Weigh it against carrying a second implementation of the
 blocked coefficient layout, which is the kind of duplication that produced the
 depthwise tap-major bug.
 
+**Done 2026-09-10** (COMPILER_ROADMAP.md 6.3), without the second
+implementation: the packers moved into `rocket_core::weights`, and the
+`rocket-pack-weights` pass calls them over `rocket-plan-ffi`. Measured on the
+fp16 survey models: MobileNetV2 `pack.weights` 39.8 ms and the 6.5 MiB cache
+gone, cold wall 184-195 -> 146-149 ms; Wide ResNet50 815 ms gone, 1290 ->
+551 ms; bit-identical.
+
 **Transpose propagation is still worth nothing, re-measured under conditions
 that had changed.** P8 measured `iree-global-opt-propagate-linalg-transpose`
 at 0% when every transpose fused into an `i32` epilogue that had to run

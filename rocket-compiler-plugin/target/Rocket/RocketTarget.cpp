@@ -206,6 +206,10 @@ struct RocketConv2dConfig {
   bool runtimeDenseReaders = false;
   iree_hal_rocket_Activation_enum_t epilogueActivation =
       iree_hal_rocket_Activation_NONE;
+  // The weights binding is already the packed coefficient stream
+  // (Conv2DDef.weights_packed): set by rocket-pack-weights on the clone of
+  // an executable whose constant filter it packed. COMPILER_ROADMAP.md 6.3.
+  bool weightsPacked = false;
 };
 
 struct RocketFullyConnectedConfig {
@@ -299,6 +303,8 @@ struct RocketMatmulConfig {
   iree_hal_rocket_Precision_enum_t precision = iree_hal_rocket_Precision_INT8;
   std::vector<iree_hal_rocket_MatmulDimension_enum_t> runtimeDimensions;
   bool runtimeDenseReaders = false;
+  // See RocketConv2dConfig::weightsPacked (MatmulDef.weights_packed).
+  bool weightsPacked = false;
 };
 
 LogicalResult
@@ -347,20 +353,26 @@ parseActivationAndPrecision(DictionaryAttr config,
 // Every kernel kind declares the trailing dense-reader push constant the
 // same way (`runtime_dense_readers = true`); see Conv2DDef in the schema.
 template <typename DiagFn>
-bool parseRuntimeDenseReaders(DictionaryAttr config, bool &flag,
-                              DiagFn &&diagFn) {
-  Attribute attr = config.get("runtime_dense_readers");
+bool parseOptionalBool(DictionaryAttr config, StringRef key, bool &flag,
+                       DiagFn &&diagFn) {
+  Attribute attr = config.get(key);
   if (!attr) {
     return true;
   }
   auto boolAttr = llvm::dyn_cast<BoolAttr>(attr);
   if (!boolAttr) {
-    diagFn() << "rocket backend: optional 'runtime_dense_readers' config "
-                "value must be a bool";
+    diagFn() << "rocket backend: optional '" << key
+             << "' config value must be a bool";
     return false;
   }
   flag = boolAttr.getValue();
   return true;
+}
+
+template <typename DiagFn>
+bool parseRuntimeDenseReaders(DictionaryAttr config, bool &flag,
+                              DiagFn &&diagFn) {
+  return parseOptionalBool(config, "runtime_dense_readers", flag, diagFn);
 }
 
 std::optional<RocketConv2dConfig> buildRocketConv2dConfigFromTarget(
@@ -416,6 +428,10 @@ std::optional<RocketConv2dConfig> buildRocketConv2dConfigFromTarget(
     shape.epilogueAdd = llvm::cast<BoolAttr>(attr).getValue();
   }
   if (!parseRuntimeDenseReaders(config, shape.runtimeDenseReaders, diagFn)) {
+    return std::nullopt;
+  }
+  if (!parseOptionalBool(config, "weights_packed", shape.weightsPacked,
+                         diagFn)) {
     return std::nullopt;
   }
   if (Attribute attr = config.get("epilogue_activation")) {
@@ -1330,6 +1346,10 @@ std::optional<RocketMatmulConfig> buildRocketMatmulConfigFromTarget(
   if (!parseRuntimeDenseReaders(config, shape.runtimeDenseReaders, diagFn)) {
     return std::nullopt;
   }
+  if (!parseOptionalBool(config, "weights_packed", shape.weightsPacked,
+                         diagFn)) {
+    return std::nullopt;
+  }
   return shape;
 }
 
@@ -1614,7 +1634,9 @@ public:
            iree_hal_rocket_MatmulDef_runtime_dimensions_add(
                builder, runtimeDimensionsRef)) ||
           iree_hal_rocket_MatmulDef_runtime_dense_readers_add(
-              builder, matmulShape->runtimeDenseReaders)) {
+              builder, matmulShape->runtimeDenseReaders) ||
+          iree_hal_rocket_MatmulDef_weights_packed_add(
+              builder, matmulShape->weightsPacked)) {
         return variantOp.emitOpError()
                << "failed to build Rocket matmul definition";
       }
@@ -1813,7 +1835,9 @@ public:
           iree_hal_rocket_Conv2DDef_epilogue_activation_add(
               builder, convShape->epilogueActivation) ||
           iree_hal_rocket_Conv2DDef_runtime_dense_readers_add(
-              builder, convShape->runtimeDenseReaders)) {
+              builder, convShape->runtimeDenseReaders) ||
+          iree_hal_rocket_Conv2DDef_weights_packed_add(
+              builder, convShape->weightsPacked)) {
         return variantOp.emitOpError()
                << "failed to populate Rocket convolution definition";
       }
