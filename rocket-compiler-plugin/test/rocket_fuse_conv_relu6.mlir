@@ -525,3 +525,78 @@ util.func public @conv_residual_relu_f16_import(%input: tensor<1x56x56x64xf16>,
   } -> tensor<1x1x56x56x256xf16>
   util.return %sum : tensor<1x1x56x56x256xf16>
 }
+
+// An already-f16 import narrows the accumulator before it clamps, so the
+// clamp arrives one domain lower with a `truncf` generic between it and the
+// convolution, and with each bound narrowed *inside* the region. Before the
+// walk stepped through that narrowing this fused nothing at all -- which is
+// the whole ReLU6 gap on an f16-imported MobileNetV2, 34 standalone clamp
+// dispatches. What leaves puts the clamp back in f32 on the raw accumulator,
+// with the narrowing re-emitted after it: the same function, because
+// rounding to f16 is monotone and 0.0 and 6.0 are exactly representable
+// there.
+
+// CHECK-LABEL: util.func public @conv_relu6_f16_import
+//   The convolution now accumulates over a zero init, bias lifted out.
+// CHECK:       %[[ZERO:.+]] = arith.constant 0.000000e+00 : f32
+// CHECK:       %[[FILL:.+]] = linalg.fill ins(%[[ZERO]]
+// CHECK:       %[[CONV:.+]] = linalg.conv_2d_nhwc_hwcf
+// CHECK-SAME:      outs(%[[FILL]]
+//   Bias and both bounds are scalar/1-D operands on the epilogue, and the
+//   body is the short form in f32.
+// CHECK:       linalg.generic
+// CHECK-SAME:      ins(%[[CONV]]
+// CHECK:         arith.addf
+// CHECK:         arith.maximumf
+// CHECK:         arith.minimumf
+//   The narrowing is re-emitted last, so the result type is unchanged.
+// CHECK:       arith.truncf
+// CHECK-NOT:   arith.cmpf
+util.func public @conv_relu6_f16_import(
+    %input: tensor<1x14x14x96xf16>,
+    %filter: tensor<1x1x96x576xf16>,
+    %bias: tensor<576xf32>) -> tensor<1x1x14x14x576xf16> {
+  %lo = arith.constant dense<0.000000e+00> : tensor<f32>
+  %hi = arith.constant dense<6.000000e+00> : tensor<f32>
+  %acc = tensor.empty() : tensor<1x14x14x576xf32>
+  %init = linalg.broadcast ins(%bias : tensor<576xf32>)
+      outs(%acc : tensor<1x14x14x576xf32>) dimensions = [0, 1, 2]
+  %conv = linalg.conv_2d_nhwc_hwcf
+      {dilations = dense<1> : vector<2xi64>, strides = dense<1> : vector<2xi64>}
+      ins(%input, %filter : tensor<1x14x14x96xf16>, tensor<1x1x96x576xf16>)
+      outs(%init : tensor<1x14x14x576xf32>) -> tensor<1x14x14x576xf32>
+  %expanded = tensor.expand_shape %conv [[0], [1, 2], [3], [4]]
+      output_shape [1, 1, 14, 14, 576]
+      : tensor<1x14x14x576xf32> into tensor<1x1x14x14x576xf32>
+  %narrow_empty = tensor.empty() : tensor<1x1x14x14x576xf16>
+  %narrowed = linalg.generic {
+      indexing_maps = [affine_map<(d0, d1, d2, d3, d4) -> (d0, d1, d2, d3, d4)>,
+                       affine_map<(d0, d1, d2, d3, d4) -> (d0, d1, d2, d3, d4)>],
+      iterator_types = ["parallel", "parallel", "parallel", "parallel", "parallel"]}
+      ins(%expanded : tensor<1x1x14x14x576xf32>)
+      outs(%narrow_empty : tensor<1x1x14x14x576xf16>) {
+  ^bb0(%in: f32, %out: f16):
+    %0 = arith.truncf %in : f32 to f16
+    linalg.yield %0 : f16
+  } -> tensor<1x1x14x14x576xf16>
+  %clamp_empty = tensor.empty() : tensor<1x1x14x14x576xf16>
+  %clamped = linalg.generic {
+      indexing_maps = [affine_map<(d0, d1, d2, d3, d4) -> (d0, d1, d2, d3, d4)>,
+                       affine_map<(d0, d1, d2, d3, d4) -> ()>,
+                       affine_map<(d0, d1, d2, d3, d4) -> ()>,
+                       affine_map<(d0, d1, d2, d3, d4) -> (d0, d1, d2, d3, d4)>],
+      iterator_types = ["parallel", "parallel", "parallel", "parallel", "parallel"]}
+      ins(%narrowed, %lo, %hi
+          : tensor<1x1x14x14x576xf16>, tensor<f32>, tensor<f32>)
+      outs(%clamp_empty : tensor<1x1x14x14x576xf16>) {
+  ^bb0(%x: f16, %l: f32, %u: f32, %out: f16):
+    %lf = arith.truncf %l : f32 to f16
+    %p = arith.cmpf ult, %x, %lf : f16
+    %q = arith.select %p, %lf, %x : f16
+    %uf = arith.truncf %u : f32 to f16
+    %r = arith.cmpf ugt, %q, %uf : f16
+    %s = arith.select %r, %uf, %q : f16
+    linalg.yield %s : f16
+  } -> tensor<1x1x14x14x576xf16>
+  util.return %clamped : tensor<1x1x14x14x576xf16>
+}

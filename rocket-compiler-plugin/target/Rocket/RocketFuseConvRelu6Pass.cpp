@@ -39,6 +39,25 @@
 // is a static attribute that differs at every site, so no DAG template
 // spanning one can match more than a single convolution.
 //
+// **An already-f16 import narrows before it clamps**, so the same chain
+// arrives with a `truncf` generic wedged in and the clamp a domain lower:
+//
+//   %conv   = conv_2d_nhwc_hwcf(%in, %w) outs(broadcast(%bias)) // f16, f32 out
+//   %exp    = tensor.expand_shape %conv
+//   %narrow = generic(%exp)                                     // truncf f32 -> f16
+//   %clamp  = generic(%narrow, %lo, %hi)                        // truncf'd bounds
+//
+// and the NCHW depthwise chain puts that narrowing *before* its transpose
+// rather than after the reshape. Both spellings fuse: the walk accepts the
+// transpose, the reshape and the narrowing in whatever order it meets them
+// and re-emits that order, which puts the clamp back in f32 on the raw
+// accumulator where the BN stage computes it. That is the same function,
+// because rounding to f16 is monotone and 0.0 and 6.0 are exactly
+// representable there, so `clamp_f16(truncf(x))` and `truncf(clamp_f32(x))`
+// agree bit for bit. Before this, an f16 import fused nothing at all: the
+// walk found the 1-input narrowing where it wanted the 3-input clamp, and
+// `matchClampBody` found seven body operations where it wanted five.
+//
 // Three things worth knowing about why it is shaped this way.
 //
 // **The bounds become scalar operands.** They arrive as full-size splat
@@ -156,6 +175,24 @@ struct ClampBounds {
 ///   %s1 = arith.select %c1, %high, %s0
 ///   linalg.yield %s1
 ///
+/// An already-f16 import narrows each bound *inside* the region first, so the
+/// same clamp arrives as seven operations rather than five:
+///
+///   %lf = arith.truncf %low : f32 to f16
+///   %c0 = arith.cmpf ult, %value, %lf
+///   %s0 = arith.select %c0, %lf, %value
+///   %hf = arith.truncf %high : f32 to f16
+///   %c1 = arith.cmpf ugt, %s0, %hf
+///   %s1 = arith.select %c1, %hf, %s0
+///   linalg.yield %s1
+///
+/// Both spellings are accepted and both report the *pre-narrowing* value as
+/// the bound, which is the block argument either way -- so `insOperandFor`
+/// still finds the `ins` operand and `constantSplatFloat` still reads 0.0 and
+/// 6.0 off the f32 constant. The narrowing is only ever peeled off a bound,
+/// never off the clamped value: a `truncf` on the value path would mean the
+/// clamp runs in a different domain than the epilogue this rewrites to.
+///
 /// Returns which block arguments carry the bounds, or nullopt on any
 /// deviation. Spelled as an exact sequence rather than a pattern DSL for the
 /// same reason `RocketFuseInt8RequantEpiloguePass` spells its bodies that
@@ -170,9 +207,32 @@ static std::optional<ClampBounds> matchClampBody(linalg::GenericOp op) {
     }
     return &*it++;
   };
+  // Consumes `%narrow = arith.truncf %bound` when it is next and reports it,
+  // so the bound the caller is handed is the block argument rather than the
+  // in-body narrowing of it. A `truncf` of anything but a block argument is
+  // left alone, which makes the sequence below fail rather than silently
+  // accepting a reshaped body.
+  auto peelNarrowing = [&]() -> arith::TruncFOp {
+    if (it == body.end()) {
+      return {};
+    }
+    auto trunc = dyn_cast<arith::TruncFOp>(&*it);
+    if (!trunc || !isa<BlockArgument>(trunc.getIn())) {
+      return {};
+    }
+    ++it;
+    return trunc;
+  };
+  // Reports the value a bound came from, seeing through the narrowing above.
+  auto source = [](arith::TruncFOp narrowing, Value bound) {
+    return (narrowing && narrowing.getResult() == bound) ? narrowing.getIn()
+                                                         : bound;
+  };
 
+  auto lowNarrowing = peelNarrowing();
   auto *lowCmp = next("arith.cmpf");
   auto *lowSel = next("arith.select");
+  auto highNarrowing = peelNarrowing();
   auto *highCmp = next("arith.cmpf");
   auto *highSel = next("arith.select");
   if (!lowCmp || !lowSel || !highCmp || !highSel) {
@@ -209,7 +269,9 @@ static std::optional<ClampBounds> matchClampBody(linalg::GenericOp op) {
   if (cast<linalg::YieldOp>(*it).getOperand(0) != highSel->getResult(0)) {
     return std::nullopt;
   }
-  return ClampBounds{low, high};
+  // The structural checks above are on the in-body values; what leaves is the
+  // block argument each bound came from, narrowed or not.
+  return ClampBounds{source(lowNarrowing, low), source(highNarrowing, high)};
 }
 
 /// The `ins` operand a body block argument reads, or null when the argument
@@ -235,6 +297,54 @@ static bool isElementwiseGeneric(linalg::GenericOp op) {
   return llvm::all_of(op.getIndexingMapsArray(), [](AffineMap map) {
     return map.isIdentity() || map.getNumResults() == 0;
   });
+}
+
+/// The narrowing an already-f16 import puts between the convolution and its
+/// activation:
+///
+///   %narrowed = linalg.generic ins(%wide) outs(%empty) {
+///     ^bb0(%in: f32, %out: f16):
+///       %v = arith.truncf %in : f32 to f16
+///       linalg.yield %v
+///   }
+///
+/// Exactly f32 -> f16 and nothing else: this pass only ever runs on the fp16
+/// path (the convolution's own operands are checked for f16 above), and a
+/// narrowing to any other type would put the clamp in a domain the BN stage
+/// does not compute in.
+static bool isNarrowingGeneric(linalg::GenericOp op) {
+  if (op.getNumDpsInputs() != 1 || !isElementwiseGeneric(op)) {
+    return false;
+  }
+  auto inputType = dyn_cast<RankedTensorType>(op.getDpsInputs()[0].getType());
+  auto resultType = dyn_cast<RankedTensorType>(op.getResult(0).getType());
+  if (!inputType || !resultType || !inputType.getElementType().isF32() ||
+      !resultType.getElementType().isF16()) {
+    return false;
+  }
+  Block &body = op.getRegion().front();
+  auto it = body.begin();
+  auto trunc = (it != body.end()) ? dyn_cast<arith::TruncFOp>(&*it) : nullptr;
+  if (!trunc || trunc.getIn() != body.getArgument(0)) {
+    return false;
+  }
+  ++it;
+  auto yield = (it != body.end()) ? dyn_cast<linalg::YieldOp>(&*it) : nullptr;
+  return yield && std::next(it) == body.end() &&
+         yield.getOperand(0) == trunc.getResult();
+}
+
+/// The value a pass-through step in the convolution -> clamp chain reads, so
+/// a clone of it can be re-pointed at the activation's result. Every op kind
+/// the walk collects spells its input differently.
+static Value passThroughInput(Operation *op) {
+  if (auto transpose = dyn_cast<linalg::TransposeOp>(op)) {
+    return transpose.getInput();
+  }
+  if (auto expand = dyn_cast<tensor::ExpandShapeOp>(op)) {
+    return expand.getSrc();
+  }
+  return cast<linalg::GenericOp>(op).getDpsInputs()[0];
 }
 
 /// The single consumer of `value`, or null when it has any other count.
@@ -336,48 +446,75 @@ struct FuseConvRelu6 : public OpRewritePattern<ConvOp> {
       }
     }
 
-    // conv -> [transpose] -> [expand_shape] -> clamp, each with a single use,
-    // because the rewrite deletes what it walks through.
+    // conv -> [transpose] | [expand_shape] | [narrowing] -> clamp, each with a
+    // single use, because the rewrite deletes what it walks through.
     //
     // Both relayouts are optional and both are re-emitted below. The NHWC
     // dense form has only the reshape; the NCHW depthwise form has a
     // NCHW -> NHWC transpose in front of it, because the channels-last
     // conversion leaves the depthwise convolution itself in NCHW and puts the
     // layout change on its result instead.
-    Operation *consumer = soleConsumer(convResult);
-    if (!consumer) {
-      LLVM_DEBUG(llvm::dbgs() << "declined: convolution result has no sole consumer\n");
-      return failure();
-    }
-    auto transpose = dyn_cast<linalg::TransposeOp>(consumer);
-    if (transpose) {
-      consumer = soleConsumer(transpose.getResult()[0]);
+    // An already-f16 import adds a third kind of step: the `truncf` generic
+    // that narrows the f32 accumulator to f16. It can sit on either side of
+    // the relayouts -- after the reshape in the NHWC dense chain, before the
+    // transpose in the NCHW depthwise one -- so the walk collects whatever
+    // it finds in encountered order rather than testing for a fixed shape,
+    // and re-emits that same order below. At most one of each kind, because
+    // two of any of them is not a chain this pass has ever seen and guessing
+    // is how a rewrite miscompiles.
+    SmallVector<Operation *> passThrough;
+    bool seenTranspose = false, seenExpand = false, seenNarrowing = false;
+    Value clamped = convResult;
+    linalg::GenericOp clamp;
+    while (true) {
+      Operation *consumer = soleConsumer(clamped);
       if (!consumer) {
-        LLVM_DEBUG(llvm::dbgs() << "declined: transpose has no sole consumer\n");
+        LLVM_DEBUG(llvm::dbgs() << "declined: no sole consumer in the chain\n");
         return failure();
       }
-    }
-    auto expand = dyn_cast<tensor::ExpandShapeOp>(consumer);
-    if (expand) {
-      consumer = soleConsumer(expand.getResult());
-      if (!consumer) {
-        LLVM_DEBUG(llvm::dbgs() << "declined: reshape has no sole consumer\n");
+      if (auto transpose = dyn_cast<linalg::TransposeOp>(consumer)) {
+        if (seenTranspose) {
+          LLVM_DEBUG(llvm::dbgs() << "declined: second transpose in the chain\n");
+          return failure();
+        }
+        seenTranspose = true;
+        passThrough.push_back(consumer);
+        clamped = transpose.getResult()[0];
+        continue;
+      }
+      if (auto expand = dyn_cast<tensor::ExpandShapeOp>(consumer)) {
+        if (seenExpand) {
+          LLVM_DEBUG(llvm::dbgs() << "declined: second reshape in the chain\n");
+          return failure();
+        }
+        seenExpand = true;
+        passThrough.push_back(consumer);
+        clamped = expand.getResult();
+        continue;
+      }
+      auto generic = dyn_cast<linalg::GenericOp>(consumer);
+      if (!generic || !isElementwiseGeneric(generic)) {
+        LLVM_DEBUG(llvm::dbgs() << "declined: consumer is not an elementwise generic\n");
         return failure();
       }
+      if (isNarrowingGeneric(generic)) {
+        if (seenNarrowing) {
+          LLVM_DEBUG(llvm::dbgs() << "declined: second narrowing in the chain\n");
+          return failure();
+        }
+        seenNarrowing = true;
+        passThrough.push_back(consumer);
+        clamped = generic.getResult(0);
+        continue;
+      }
+      clamp = generic;
+      break;
     }
-    auto clamp = dyn_cast<linalg::GenericOp>(consumer);
-    if (!clamp || !isElementwiseGeneric(clamp) || clamp.getNumDpsInputs() != 3) {
+    if (clamp.getNumDpsInputs() != 3) {
       LLVM_DEBUG(llvm::dbgs() << "declined: consumer is not an elementwise 3-input generic\n");
       return failure();
     }
     // The convolution has to be the clamped value, not one of the bounds.
-    Value clamped = convResult;
-    if (transpose) {
-      clamped = transpose.getResult()[0];
-    }
-    if (expand) {
-      clamped = expand.getResult();
-    }
     if (clamp.getDpsInputs()[0] != clamped) {
       LLVM_DEBUG(llvm::dbgs() << "declined: convolution is not the clamped operand\n");
       return failure();
@@ -466,18 +603,23 @@ struct FuseConvRelu6 : public OpRewritePattern<ConvOp> {
           linalg::YieldOp::create(builder, nested, result);
         });
 
-    // The relayouts, if there were any, are re-emitted on the clamped value in
-    // the same order, so everything downstream sees the shape it expects.
+    // The relayouts and the narrowing, if there were any, are re-emitted on
+    // the clamped value in the same order, so everything downstream sees the
+    // shape and the element type it expects. The types line up without any
+    // adjustment because `activated` has exactly the convolution's own result
+    // type -- so each clone sees the operand type its original saw.
+    //
+    // Re-emitting the narrowing *after* the activation is the whole point on
+    // an f16 import: the clamp then runs in f32 on the raw accumulator, which
+    // is where the BN stage computes it. That is the same function the model
+    // asked for, because rounding to f16 is monotone and both bounds are
+    // exactly representable there, so clamping either side of the narrowing
+    // gives bit-identical results.
     Value result = activated.getResult(0);
-    if (transpose) {
+    for (Operation *op : passThrough) {
       IRMapping mapping;
-      mapping.map(transpose.getInput(), result);
-      result = rewriter.clone(*transpose.getOperation(), mapping)->getResult(0);
-    }
-    if (expand) {
-      IRMapping mapping;
-      mapping.map(expand.getSrc(), result);
-      result = rewriter.clone(*expand.getOperation(), mapping)->getResult(0);
+      mapping.map(passThroughInput(op), result);
+      result = rewriter.clone(*op, mapping)->getResult(0);
     }
     rewriter.replaceOp(clamp, result);
     return success();
