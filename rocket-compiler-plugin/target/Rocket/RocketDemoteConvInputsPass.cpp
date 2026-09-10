@@ -168,11 +168,25 @@
 //   default topo            50.5     68.8     30.8    1.36x slower
 //
 // The 2026-09-09 table above had dw within 1.02x of base at four workers.
-// It is 1.33x now because the ten newly-matchable depthwise convolutions are
-// exactly the op this file has said all along loses to the per-dispatch
-// layout round trip -- raising the ceiling let more of the losing trade
-// through. Correctness is not the issue: max|diff| 0.00195 against the
-// --no-offload arm for both NPU arms (reference sd 0.68), argmax stable.
+// Correctness is not the issue: max|diff| 0.00195 against the --no-offload
+// arm for both NPU arms (reference sd 0.68), argmax stable.
+//
+// **And the deficit is not the layout round trip this file has blamed since
+// 2026-09-01. It is the quiescence dwell, all of it.** `ROCKET_PROFILE=1`
+// puts 346 ms of a 1513 ms twenty-iteration run in `quiesce` -- 17.3 ms per
+// inference against a base-to-dw gap of 18.3 ms -- because MobileNetV2
+// alternates depthwise and dense seventeen times and `device.rs`'s
+// `DEPTHWISE_TO_DENSE_QUIESCENCE` sleeps 1 ms at each transition. Confirmed
+// by A/B: with `ROCKET_QUIESCE_OFF=1` the dw arm runs 56.1 / 51.8 ms, which
+// is within 1-2.5% of base. Every other phase is flat between the two arms
+// (compact 9.5 vs 9.4 ms per inference, pack.weights 2.0 vs 2.0), and
+// `outside` *falls* 5.7 ms as the seventeen convolutions leave the CPU.
+//
+// So the ranking in P7's items 2-4 is wrong on this model: the dwell is
+// first by a wide margin and the explicit pad is not close. The fix is a
+// driver one -- order the depthwise write-back properly instead of sleeping,
+// the way ISSUES.md C8 found a real register for the same family of symptom
+// -- not a compiler one, and it is worth ~17 ms here.
 //
 // Note also that ReLU6 now fuses on an already-f16 import, so the 2026-09-07
 // row that separated "depthwise clamps on the CPU" from "depthwise ReLU6

@@ -149,6 +149,33 @@ fn quiesce_all_enabled() -> bool {
 /// speedup for a re-run of silent wrong data at an unbounded rate is a bad
 /// deal, and the offload's problem is 3.7x, not 3%.
 ///
+/// **The cost now matters, on a different model.** Re-measured 2026-09-10 on
+/// the fp16 MobileNetV2 arm built with `ROCKET_DEMOTE_DEPTHWISE=1`, which
+/// alternates depthwise and dense 17 times per inference and so pays 17
+/// transitions rather than the int8 arm's ~14 against a much shorter wall:
+///
+/// ```text
+///                        four workers   default topo
+///   base (37 sites)          55.4 ms        50.5 ms
+///   dw   (54 sites)          73.8 ms        68.8 ms
+///   dw, ROCKET_QUIESCE_OFF   56.1 ms        51.8 ms
+/// ```
+///
+/// `ROCKET_PROFILE=1` attributes 346 ms of a 1513 ms twenty-iteration run to
+/// `quiesce` -- 17.3 ms per inference, against a measured base-to-dw gap of
+/// 18.3 ms. So this dwell is essentially the *whole* cost of offloading
+/// depthwise on fp16: 23% of that arm's wall, not the int8 arm's 2.6%, and
+/// without it the depthwise arm lands within 1-2.5% of the arm that leaves
+/// all seventeen on the CPU.
+///
+/// That still is not a reason to delete it -- the bound above is unchanged,
+/// 0 of 240 runs puts the original failure rate at roughly 1.5% and no lower,
+/// and silent 16-channel truncation is the worst kind of wrong. It is a
+/// reason to *fix* it: find the register or fence that actually orders the
+/// depthwise write-back (the C8 fix found exactly such a register for the
+/// same family of symptom) and drop the sleep, rather than trading
+/// correctness for the 23%.
+///
 /// Revisit if the cost ever matters, or if someone reproduces the original
 /// failure and can quote a rate to test against.
 fn quiesce_off() -> bool {
