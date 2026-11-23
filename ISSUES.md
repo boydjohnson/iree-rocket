@@ -1904,6 +1904,29 @@ What was settled and how, newest first, in place of the narratives — those are
 in this file's git history (`git log -p ISSUES.md`). Everything cited below is
 something that still exists: a commit, a file, or a memory.
 
+**int8 downsample at `Cout` 2048 (S2) — 2026-11-23. ResNet50-224 int8 204 ->
+150 ms.** After the stride-2 matchers, ResNet50 int8 was still 70% CPU, and
+`perf` put ~46% of its CPU cycles in one dispatch: layer4's 14x14 `Cin` 1024
+-> 2048 stride-2 downsample, past the requantized 1x1 `Cout` ceiling of 1792
+(and the accumulator path has no dense stride-2 matcher). The same ceiling
+sent layer4's three 7x7 `Cin` 512 -> 2048 expansions down the accumulator
+path with a CPU requantization. The ceiling is policy, not hardware (the HAL
+int8 constant is 4096): `int8_requant_cout2048_matches_oracle` runs both
+shapes exact on the board, and `admission.rs` now admits requantized 1x1
+`Cout` 2048 (`Cin` stays 1344; unit test
+`requant_1x1_admits_cout_2048_at_both_strides`).
+
+ResNet50-224 int8, built by a compiler from this change, against `main`'s
+build, median of 15, ABBA, 200 MHz: **203/205 -> 150/149 ms on cpu 4-7,
+203/201 -> 128/127 ms on all eight** (1.36x / 1.58x). CPU contraction
+sites 2 -> 1 (the 7x7 stem is what is left), Rocket sites 54 -> 55, two
+accumulator jobs left (the 7x7 2048 -> 512 projections, past the requantized
+`Cin` 1344). **Output bit-identical to `main`'s build.** The compiler also
+carried newer IREE sources; its `--no-offload` arm is bit-identical to the
+old one and the same speed (1080 vs 1083 ms), so the gain is the offload.
+Phase split at cpu 4-7: outside the driver 61% (~91 ms), NPU 25%, `compact`
+7%, `pack.input` 5%.
+
 **C16 (S2) — 2026-11-23. A pooling program with an unread trailing input row
 poisoned the core for the next pool; the PPU's cube height is now the rows the
 windows read.** ResNet50 int8 hung its pooling dispatches at ~510 ms (5 of 8
