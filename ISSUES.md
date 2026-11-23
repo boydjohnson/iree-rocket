@@ -44,79 +44,6 @@ live in P8.
 
 ---
 
-## C4 (S3, blocks P4) — multi-task jobs were written off on evidence that contradicts source-confirmed mainline behaviour
-
-`rocket-hal-driver/src/device.rs:1563` [verified]:
-
-> The mainline driver's IRQ-mediated transition between tasks in one
-> `drm_rocket_job` is not reliable on RK3588: task 0 completes correctly, but
-> every later split leaves its output rows untouched.
-
-So every tile of every dispatch is submitted as its own single-task job with its
-own blocking `PREP_BO`.
-
-`encodings/cbuf-reuse.md` reads the same driver the other way [notes,
-source-confirmed against v7.1, which is the kernel on `planck`]:
-
-> Mainline `rocket` gives that for nothing: `rocket_job_handle_irq()` programs
-> the next task of the **same** job and only signals the done fence once
-> `next_task_idx` reaches `task_count`, so `core->in_flight_job` holds the core
-> for the whole sequence.
-
-and `encodings/regcmd-task-model.md` classifies gapped multi-task jobs as
-**safe for all dtypes** (N kicks, N IRQs, one fence), reserving the integer
-breakage for *contiguous chaining* (one kick), where the int32 CACC clears per
-kick rather than per task.
-
-Two candidate confounds for the repo's observation, and I ruled out the first:
-
-- **The `rocket_batch_submit` kernel param.** The notes warn it is global, and
-  that with it on, a *gapped* multi-task job mismatches the kernel and task 0
-  streams into the gap — which is the repo's exact symptom. Not it:
-  `/sys/module/rocket/` on `planck` exposes no `parameters/` directory at all
-  [verified].
-- **Incomplete per-task regcmd.** The notes' delta-regcmd probe produces
-  precisely "task 0 correct, later tasks leave output untouched", caused by a
-  task writing an incomplete ping-pong producer group. This repo emits a full
-  self-contained program per tile with `S_POINTER = 0xE`
-  (`conv.rs:3563`) [verified], so it should not be this — but the two failure
-  descriptions match well enough that it is worth re-deriving rather than
-  assuming.
-
-Worth retesting, because it gates P4 (the CBUF reuse bits require an
-uninterrupted job) and it removes one submit ioctl + one blocking fence wait per
-tile.
-
-**Retested 2026-11-23: multi-task jobs are correct on 7.3.5** [measured]. `conv2d_oracle_hw`'s `multi_task_job_matches_oracle` takes every case of
-the gated regression matrices whose plan needs two or more programs and submits
-each case's programs as the tasks of **one** `drm_rocket_job`, against the same
-exact oracle. On `planck`'s own board (an Orange Pi 5 Max), re-flashed with
-Armbian `7.3.5-edge-rockchip64` and now reached as `ssh orangepi`, whose `rocket`
-carries Armbian's RK3576 series plus the PPU-completion patch:
-
-- **58 of 58** exact, six times back to back, across fp16, fp16→fp32, bf16,
-  int16, tf32, requantized int8 and the int8 accumulator — up to **64 tasks** in
-  one job, CBUF splits from 1/11 to 11/1, 7x7 and 5x5 kernels. Every dispatch
-  0.6–40 ms, so no watchdog kill hid behind a signalled fence.
-- `ROCKET_SUBMIT=one-job` re-runs every matrix in the file the same way: all 20
-  hardware tests, **812 cases (~250 multi-tile)**, pass.
-- `tiled_pooling_matches_oracle` already ran its 2–7 PPU tiles as one job, and
-  `conv_then_lut_hw` / `conv_with_add_hw` run two-task jobs; all pass there too.
-  Int4 is the one rung not covered — its gated matrix has no multi-tile case.
-
-So "task 0 completes correctly, but every later split leaves its output rows
-untouched" does not reproduce on the same silicon with today's kernel and
-today's register programs. The v7.1 kernel it was seen on is gone from the
-board, so which of the two made the difference cannot be re-checked. Both
-candidates stay live: this kernel's completion path is not v7.1's (Armbian's
-series takes the completion writes under `job_lock` and factors the
-completion tail out of the IRQ handler), and the incomplete-per-task-regcmd
-confound above would also explain it.
-What is left is `rocket-hal-driver`: it still gives each tile its own job,
-and `device.rs`'s comment still says multi-task jobs are unreliable.
-
----
-
 ## C6 (S4) — `DPU_BS_OW_OP` is always zero, including depthwise
 
 `conv.rs:3838` [verified]: `commands.push(zero::<DpuBsOwOp>())`, unconditionally.
@@ -729,8 +656,8 @@ and argues the wait drop is itself the proof the bit is honored.
 Three preconditions, all of which this repo would have to arrange:
 
 - The run of tiles must be **one uninterrupted job**, so the operand is still
-  resident. C4 measured multi-task jobs exact on 7.3.5 (2026-11-23); the
-  driver still has to be switched over to use them.
+  resident. Since C4 (resolved 2026-11-23) a dispatch's tiles on one file
+  are one job, so this holds by default.
 - Only **one** bit can pay at a time (a 1-D task order makes only one operand
   identical to the previous task); pick by reuse depth.
 - The tile loop must be ordered so the shared operand is adjacent.
@@ -2054,6 +1981,41 @@ What was settled and how, newest first, in place of the narratives — those are
 in this file's git history (`git log -p ISSUES.md`). Everything cited below is
 something that still exists: a commit, a file, or a memory.
 
+**C4 (S3) — 2026-11-23. Multi-task jobs work; the driver now uses them.**
+`device.rs` had written them off ("task 0 completes correctly, but every later
+split leaves its output rows untouched") and gave every tile its own job, while
+the notes read the mainline source as handling them correctly. Measured on
+`planck`'s board re-flashed to Armbian `7.3.5-edge-rockchip64` (`ssh orangepi`;
+`rocket` is Armbian's RK3576 series plus the unconditional PPU patch):
+`conv2d_oracle_hw::multi_task_job_matches_oracle` runs the 58 multi-program
+cases of the gated matrices (fp16, fp16→fp32, bf16, int16, tf32, requantized
+int8, int8 accumulator; up to 64 tasks, CBUF splits 1/11 to 11/1) each as ONE
+job, exact six times back to back. `ROCKET_SUBMIT=one-job` puts all 20
+hardware tests / 812 cases in that file through the same path, all exact.
+
+`queue_execute` now submits a dispatch's tiles as one multi-task job per file
+(`submit_groups`; fanned-out tiles live on other files, so one job each).
+Wide ResNet50: 233 tasks → 54 jobs. Every model output is bit-identical to
+`ROCKET_JOB_PER_TILE=1`, the per-tile A/B switch that was kept: MobileNetV2
+fp16/int8, ResNet50-224 fp16/int8 and Wide ResNet50 fp16, plus MobileNetV2
+and Wide ResNet50 at `ROCKET_NPU_CORES=3`. MobileNetV2 fp16 also matches the
+September survey's NPU output exactly. Median ms, ABBA, NPU at 200 MHz,
+`ondemand`:
+
+| model | per tile | one job per file |
+|---|---|---|
+| ResNet50-224 fp16 | 158, 170 | 151, 151 |
+| Wide ResNet50 fp16 | 462, 465 | 446, 426 |
+| MobileNetV2 fp16 | 107, 99.8 | 104, 110 |
+| MobileNetV2 int8 | 85.6, 86.2 | 89.3, 85.7 |
+
+About 6-8% on the ResNets, noise on MobileNetV2 (few multi-tile dispatches).
+Why v7.1 failed cannot be re-checked, since that kernel is gone from the board.
+This kernel's completion path differs (Armbian's series takes the completion
+writes under `job_lock`), and an incomplete per-task regcmd would also explain
+it. Int4 has no multi-tile case in the gate. Unblocks P4's reuse bits, which
+need an uninterrupted job.
+
 **M2 (S3) — 2026-09-09. The NPU ran at 200 MHz; it now runs at 600, and the
 lever was a driver patch that was already built.** `scmi_clk_npu` boots pinned
 at 200 MHz (the vendor's idle `POWER_DOWN_FREQ`) because mainline `rocket` has
@@ -2457,7 +2419,7 @@ Rank work against that, not against the default-topology rows.
    anything about depthwise. `ROCKET_DEMOTE_DEPTHWISE=1` keeps the arm one
    compiler build away. Revisit when the offload is competitive at four
    workers.
-5. **C4 → P4 → P1** — the rest of the dispatch-path stack, in increasing
+5. **P4 → P1** — the rest of the dispatch-path stack, in increasing
    order of work.
 6. **C16 → C11** — the int8 hung-job pair, most-characterized first. C16
    (2026-09-10) names the hanging dispatch for ResNet50 int8 -- both pooling

@@ -194,9 +194,9 @@ plus the kernel halo), the weights and bias on that context, and its own
 regcmd BO. Compaction gathers from up to N scratches into the dense IREE
 buffer -- it already walks output rows, so this is a change of source
 pointer per band, not a new pass. The tasks write disjoint output rows and
-each reloads its weights (the mainline driver's inter-task IRQ transition
-is unreliable on RK3588, which is why they are already separate jobs), so
-nothing about the hardware programs changes; only who submits them.
+each reloads its weights, so nothing about the hardware programs changes;
+only who submits them. (Since ISSUES C4, 2026-11-23, the tiles that land on
+one context go in as one multi-task job, one job per context.)
 
 Level 2 is where a chained CNN benefits at all, and it is also where host
 packing parallelises: band packing per worker is the same total bytes as

@@ -205,9 +205,10 @@ integer contiguous chains. [ISSUES C4, `regcmd-task-model.md` in the notes]
 task transition, or an incomplete per-task regcmd, which produces the
 identical symptom in the notes? On 7.3.5 they are exact: 58/58 multi-tile
 cases as single jobs, up to 64 tasks, and every conv matrix in one-job mode
-(ISSUES C4, 2026-11-23). The v7.1 kernel is gone from the board, so this
-matters only if an older kernel has to be supported. [ISSUES C4, `device.rs`
-~1563]
+(ISSUES C4, 2026-11-23), and `rocket-hal-driver` now submits a dispatch's
+tiles as one job per file, bit-identical on five models. The v7.1 kernel is
+gone from the board, so this matters only if an older kernel has to be
+supported. [ISSUES Resolved C4]
 
 2.2 Would upstream accept per-core scheduling entities with a core hint in
 `drm_rocket_submit.reserved`? That is the "30-line kernel patch" that would

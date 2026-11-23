@@ -32,11 +32,9 @@
 //!
 //! Supports recording multiple `dispatch` calls per command buffer --
 //! `apply_ops` returns every recorded dispatch's regcmd program, in call
-//! order, and `device::queue_execute` submits each as its own individually
-//! fenced hardware job (the same "submit, then `prep_bo`-wait before the
-//! next" sequencing already used for one dispatch's own CBUF-height-split
-//! task list, since the mainline driver's inter-task IRQ transition isn't
-//! reliable on RK3588 -- see that function's comment). Originally this
+//! order, and `device::queue_execute` submits and fences each one before the
+//! next ("submit, then `prep_bo`-wait"), a dispatch's own tiles going in as
+//! one multi-task job per file -- see that function's comment. Originally this
 //! rejected a second recorded dispatch outright: real compiled programs
 //! (a ResNet50 bottleneck block's shortcut projection and its first reduce
 //! conv, both independent 1x1 convs reading the same upstream activation)
