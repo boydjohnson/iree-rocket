@@ -650,15 +650,36 @@ four 3x3 layer kinds at 3/9 banks (30x30 Cin 512 s2, 16x16 Cin 512, 16x16 Cin
 1024 s2, 9x9 Cin 1024). MobileNetV2 has nothing here (4.3 MB fetched, 4.3
 unique).
 
-**Next lever, not built.** Split `Cout` into groups whose weights *are*
-resident (a 16-kernel group at 3x3 `Cin` 1024 is 288 KiB, 9 banks), walk every
-row tile of one group before the next, and set `WEIGHT_REUSE` on tiles 2..N
-of each group -- now known to be honoured and exact. Weights then cross the
-bus once per inference and the input once per group: for 16x16 `Cin` 1024
-s2, ~19 + 33 MB instead of 151 MB. It needs `ConvPlan` to emit
-output-channel-sliced tiles (an output surface offset per group) and the
-driver to keep a group's tiles in one job, which C4 already gives. Measure the
-1-group-of-N case on the probes above before planning it.
+**The obvious fix, measured (`cout_group_probe`): worth ~8% on Wide
+ResNet50, not the 192 ms.** Split `Cout` into groups whose weights stay
+resident, run every row tile of a group before the next, and set
+`WEIGHT_REUSE` on tiles 2..N of each group. The probe plans a group as its own
+`Cout` = G convolution and times `C/G` repeats of its programs in one job --
+the grouped scheme's bus traffic, weights once and input once per group. All
+exact; median of five, same board and clock:
+
+| layer (count in Wide ResNet50) | today | grouped, reuse on | |
+|---|---|---|---|
+| 30x30 `Cin` 512 3x3 s2 (1), 14 tiles | 22.6 ms | 15.5 ms (G=32, 16 groups) | 1.46x |
+| 16x16 `Cin` 1024 3x3 s2 (1), 7 tiles | 57.0 ms | 39.5 ms (G=16, 64 groups) | 1.44x |
+| 9x9 `Cin` 1024 3x3 s1 (2), 3 tiles | 26.6 ms | 26.3 ms (G=16) | 1.01x |
+| 16x16 `Cin` 512 3x3 s1 (5), 4 tiles | 7.2 ms | 9.4 ms (G=32) | 0.77x |
+
+Grouping trades weight re-streaming for re-reading the input once per group
+and multiplies the task count, and each task carries a fixed ~50-90 µs (the
+completion IRQ round trip and task setup). So it pays only when a group has
+many row tiles: 14 and 7 win, 3 and 4 do not. Without the bit the grouped
+arm is *slower* than today (24.9 and 76.7 ms on the two winners), which
+confirms the win is the reuse and not the regrouping. On Wide ResNet50 that
+is two layers, ~25 ms of a ~305 ms inference at 200 MHz (plus perhaps 2-3 ms
+on the unprobed 58x58 `Cin` 256 s2); ResNet50-224's streamed 3x3 layers sit
+at 3-4 tiles and would not qualify. Building it means `ConvPlan` emitting
+output-channel-sliced tiles (a surface offset per group), a rule that groups
+only above some tile depth, and keeping each group's tiles in one job (C4
+gives that). The ~192 ms of streaming is mostly the unavoidable per-row
+weight pass at 3 data banks; cutting it further needs fewer, taller tiles,
+which the 16-kernel working set forbids without splitting `Cin` (open
+question 4.5.1).
 
 While in that register: `FC_DATA_BANK[10:8]` is live on the conv datapath and
 any non-zero value corrupts the output. This repo leaves it 0 [verified] --

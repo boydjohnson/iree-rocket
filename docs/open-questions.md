@@ -97,13 +97,12 @@ rounded `cbuf_atoms`, which is width-dependent. The notes prescribe a flat
 `data_bank = min(fd_banks + 1, 11)`. Both are hardware-backed, so they must
 disagree somewhere. [ISSUES D2]
 
-1.3.3 Would `Cout`-sliced tiles with `WEIGHT_REUSE` remove the per-row
-weight re-streaming that dominates Wide ResNet50's NPU time? The bit itself is
-answered (ISSUES P4, 2026-11-23): honoured and exact on RK3588 under mainline,
-proven by a decoy-weights control, but no faster on today's resident tiles.
-What is open is how much of Wide ResNet50's weight streaming (~192 of ~259 ms
-of NPU time at 200 MHz) a group of output channels kept resident across every
-row tile, at 3x3 `Cin` 512 and 1024, actually removes. [ISSUES P4]
+1.3.3 Is a `Cout`-sliced tile worth building into `ConvPlan` for ~8% on Wide
+ResNet50 (two layers, 1.44-1.46x each at 200 MHz) and nothing measured on
+ResNet50 or MobileNetV2? `cout_group_probe` measured the scheme exact and
+showed the task-count overhead that limits it to deep-tiled layers. Does the
+answer change at 600 MHz, where compute shrinks but per-task overhead may
+not? [ISSUES P4]
 
 1.3.4 Does `ConvPlan`'s CBUF split still diverge from the vendor captures for
 dense shapes above `Cin` 384, and does the "sawtooth reset rule" the spec

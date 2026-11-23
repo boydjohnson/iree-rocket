@@ -396,6 +396,12 @@ thread_local! {
     /// control); with it on, a correct output means the hardware really did
     /// not fetch the weights again.
     static WEIGHT_DECOY: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+    /// Submits the case's whole program list this many times back to back
+    /// in one job. With `WEIGHT_REUSE`, each repeat's first task carries no
+    /// reuse bit and reloads the weights, so N repeats of a `Cout` = G case
+    /// time the bus traffic of a `Cout` = N*G convolution split into N
+    /// resident output-channel groups (ISSUES P4).
+    static PROGRAM_REPEATS: std::cell::Cell<usize> = const { std::cell::Cell::new(1) };
 }
 
 /// ORs `CNA_CBUF_CON0.weight_reuse` into every CBUF_CON0 write of `program`,
@@ -504,6 +510,22 @@ fn execute_case_output_with_plan(
                 // The programs write CBUF_CON0 twice, as the vendor's do,
                 // always with the same value; both carry the bit.
                 assert!(set_weight_reuse(program) >= 1, "no CBUF_CON0 in a task");
+            }
+        }
+        let repeats = PROGRAM_REPEATS.with(std::cell::Cell::get).max(1);
+        if repeats > 1 {
+            assert_eq!(submit_shape(), SubmitShape::OneJob, "repeats are one job");
+            let base: Vec<Vec<u64>> = programs
+                .iter()
+                .map(|program| program.iter().map(|command| command.0).collect())
+                .collect();
+            for _ in 1..repeats {
+                programs.extend(base.iter().map(|program| {
+                    program
+                        .iter()
+                        .map(|&word| iree_rocket_hal::rocket::builders::RegCmd(word))
+                        .collect::<Vec<_>>()
+                }));
             }
         }
         let mut command_buffers = Vec::with_capacity(programs.len());
@@ -3944,6 +3966,108 @@ fn weight_reuse_honoured_probe() {
     WEIGHT_REUSE.with(|flag| flag.set(false));
     WEIGHT_DECOY.with(|flag| flag.set(false));
     SUBMIT_SHAPE_OVERRIDE.with(|shape| shape.set(None));
+}
+
+/// ISSUES P4's proposed fix, measured before planning it: split a
+/// streamed-weight convolution into output-channel groups small enough to
+/// keep their weights resident, run every row tile of a group with
+/// `WEIGHT_REUSE`, and compare with the convolution as `ConvPlan` tiles it
+/// today.
+///
+/// A group is planned as its own convolution with `Cout` = G, and the
+/// `C/G` groups are timed as `C/G` repeats of its programs in one job (each
+/// repeat's first task reloads the weights). That is the grouped scheme's
+/// bus traffic -- weights once, input once per group -- except that a real
+/// split writes one output cube at a channel offset; the output bytes are
+/// the same either way. The shapes are Wide ResNet50's four streamed 3x3
+/// layer kinds.
+#[cfg(feature = "hardware-characterization")]
+#[test]
+#[ignore = "needs /dev/accel/accel0 -- times resident Cout groups against streamed weights (ISSUES P4)"]
+fn cout_group_probe() {
+    let _guard = NPU_TEST_LOCK.lock().unwrap_or_else(|p| p.into_inner());
+    let file = OpenOptions::new()
+        .read(true)
+        .write(true)
+        .open(DEVICE_PATH)
+        .expect("failed to open RK3588 NPU device");
+    SUBMIT_SHAPE_OVERRIDE.with(|shape| shape.set(Some(SubmitShape::OneJob)));
+    let case = |width, cin, cout, stride| Conv2dCase {
+        width,
+        height: width,
+        cin,
+        cout,
+        kernel: [3, 3],
+        stride,
+        padding: [0, 0],
+        precision: OraclePrecision::Fp16,
+        pattern: OraclePattern::Selectors { phase: 2 },
+    };
+    // Median of five, each checked exact.
+    let time = |case: Conv2dCase, reuse: bool, repeats: usize| {
+        let fixture = build_fixture(case).expect("fixture");
+        let mut times = Vec::new();
+        let mut tiles = 0;
+        for _ in 0..5 {
+            WEIGHT_REUSE.with(|flag| flag.set(reuse));
+            PROGRAM_REPEATS.with(|flag| flag.set(repeats));
+            let execution = execute_case_output(&file, &fixture).expect("dispatch");
+            WEIGHT_REUSE.with(|flag| flag.set(false));
+            PROGRAM_REPEATS.with(|flag| flag.set(1));
+            let report = compare_output(&fixture, &execution.plan, &execution.output);
+            assert_eq!(
+                report.mismatches,
+                0,
+                "{} reuse={reuse} x{repeats} is wrong: {:?}",
+                case.label(),
+                report.tile_mismatches
+            );
+            tiles = execution.plan.tiles().len();
+            times.push(execution.dispatch.as_secs_f64() * 1e3);
+        }
+        times.sort_by(f64::total_cmp);
+        (times[2], tiles, execution_banks(case))
+    };
+    for &(width, cin, stride) in &[
+        (30u32, 512u32, 2u32),
+        (16, 512, 1),
+        (16, 1024, 2),
+        (9, 1024, 1),
+    ] {
+        let full = case(width, cin, cin, stride);
+        let (full_ms, full_tiles, full_banks) = time(full, false, 1);
+        println!(
+            "{width}x{width} Cin {cin} Cout {cin} k3 s{stride}: today {full_tiles} tiles at {}/{} banks, {full_ms:.3} ms",
+            full_banks.0, full_banks.1
+        );
+        for group in [16u32, 32, 64] {
+            let grouped = case(width, cin, group, stride);
+            let weights = cin * group * 9 * 2;
+            let (data_banks, weight_banks) = execution_banks(grouped);
+            if weights > weight_banks * 32 * 1024 {
+                println!(
+                    "  G={group}: weights {weights} B do not fit {weight_banks} banks, skipped"
+                );
+                continue;
+            }
+            let groups = (cin / group) as usize;
+            let (off_ms, tiles, _) = time(grouped, false, groups);
+            let (on_ms, _, _) = time(grouped, true, groups);
+            println!(
+                "  G={group}: {groups} groups x {tiles} tiles at {data_banks}/{weight_banks} banks; \
+                 reuse off {off_ms:.3} ms, on {on_ms:.3} ms -> {:.2}x vs today",
+                full_ms / on_ms
+            );
+        }
+    }
+    SUBMIT_SHAPE_OVERRIDE.with(|shape| shape.set(None));
+}
+
+/// `ConvPlan`'s automatic `(data, weight)` bank split for a case.
+#[cfg(feature = "hardware-characterization")]
+fn execution_banks(case: Conv2dCase) -> (u32, u32) {
+    let plan = ConvPlan::new(case.shape(), case.kernel);
+    (plan.data_banks(), plan.weight_banks())
 }
 
 /// ISSUES P4, the other half: is re-streaming weights per tile on the
