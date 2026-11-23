@@ -63,6 +63,11 @@ pub struct RocketBuffer {
     /// written only for buffers IREE declared immutable -- see
     /// [`constant_sync_due`].
     pub synced_generation: std::sync::atomic::AtomicU64,
+    /// Bytes of IOVA the GEM object maps from `dma_address`: the allocation
+    /// rounded up to whole pages, which can be more than IREE's view of the
+    /// buffer. The hardware may read up to here without faulting; past it
+    /// the page may be unmapped (see `command_buffer::stage_direct`).
+    pub mapped_bytes: usize,
 }
 
 unsafe fn cast(buffer: *mut iree_hal_buffer_t) -> *mut RocketBuffer {

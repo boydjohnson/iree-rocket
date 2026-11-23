@@ -402,6 +402,11 @@ thread_local! {
     /// time the bus traffic of a `Cout` = N*G convolution split into N
     /// resident output-channel groups (ISSUES P4).
     static PROGRAM_REPEATS: std::cell::Cell<usize> = const { std::cell::Cell::new(1) };
+    /// Relocates the input to a buffer allocated after every other one -- the
+    /// top of this file's IOVA space, nothing mapped past it -- with exactly
+    /// this many mapped bytes after the input's last byte. Measures how far
+    /// the feature DMA reads past a buffer's end (the int8 stem hang).
+    static INPUT_TAIL: std::cell::Cell<Option<usize>> = const { std::cell::Cell::new(None) };
 }
 
 /// ORs `CNA_CBUF_CON0.weight_reuse` into every CBUF_CON0 write of `program`,
@@ -541,8 +546,50 @@ fn execute_case_output_with_plan(
             command_buffers.push((buffer, program.len() as u32));
         }
 
+        // `INPUT_TAIL`: move the input to the top of the IOVA space and patch
+        // every feature address in the already-written programs to match.
+        let relocated = INPUT_TAIL.with(std::cell::Cell::get).map(|tail| {
+            use iree_rocket_hal::rocket::builders::{RegisterMeta, cna::CnaFeatureDataAddr};
+            let bytes = &fixture.input;
+            let top = OwnedBuffer::new(fd, bytes.len() + tail, file);
+            // Highest 64-byte-aligned offset that still leaves `tail` bytes.
+            let offset = (top.buffer.size - bytes.len() - tail) & !63;
+            ptr::write_bytes(top.buffer.host_ptr, 0, top.buffer.size);
+            ptr::copy_nonoverlapping(bytes.as_ptr(), top.buffer.host_ptr.add(offset), bytes.len());
+            let base = top.buffer.dma_address + offset as u32;
+            for (buffer, count) in &command_buffers {
+                let words = std::slice::from_raw_parts_mut(
+                    buffer.buffer.host_ptr as *mut u64,
+                    *count as usize,
+                );
+                for word in words.iter_mut() {
+                    let domain = (*word >> 48) as u32;
+                    let register = *word as u32 & 0xffff;
+                    if domain == CnaFeatureDataAddr::DOMAIN
+                        && register == CnaFeatureDataAddr::OFFSET
+                    {
+                        let address = (*word >> 16) as u32;
+                        let moved = address - input.buffer.dma_address + base;
+                        *word = (*word & !(0xffff_ffffu64 << 16)) | (u64::from(moved) << 16);
+                    }
+                }
+            }
+            let mapped_after = top.buffer.size - offset - bytes.len();
+            (top, mapped_after)
+        });
+        #[cfg(feature = "hardware-characterization")]
+        if let Some((top, mapped_after)) = &relocated {
+            println!(
+                "  input relocated to {:#x}..{:#x}, {mapped_after} mapped bytes after it",
+                top.buffer.dma_address,
+                top.buffer.dma_address as usize + top.buffer.size,
+            );
+        }
+        let input_handle = relocated
+            .as_ref()
+            .map_or(input.buffer.handle, |(top, _)| top.buffer.handle);
         for handle in [
-            input.buffer.handle,
+            input_handle,
             weights.buffer.handle,
             bias.buffer.handle,
             output.buffer.handle,
@@ -554,11 +601,7 @@ fn execute_case_output_with_plan(
                 .map_err(|error| format!("sync regcmd BO: {error}"))?;
         }
 
-        let mut data_handles = vec![
-            input.buffer.handle,
-            weights.buffer.handle,
-            bias.buffer.handle,
-        ];
+        let mut data_handles = vec![input_handle, weights.buffer.handle, bias.buffer.handle];
         if let Some(decoy) = &decoy {
             fini_bo(fd, decoy.buffer.handle).map_err(|error| format!("sync decoy BO: {error}"))?;
             data_handles.push(decoy.buffer.handle);
@@ -3238,6 +3281,171 @@ fn stem_7x7_stride2_matches_oracle() {
     let cases = stem_7x7_stride2_cases();
     assert_eq!(cases.len(), 18);
     run_hardware_case_matrix("7x7 stride-2 dense stem", cases);
+}
+
+/// The dense (ARGB) feature DMA's over-fetch stays inside the bound the
+/// planner reports. Each case's input is moved to the top of the IOVA space
+/// -- nothing mapped past it -- with exactly
+/// `ConvPlan::dense_input_read_bytes` mapped from its base, which is all the
+/// driver guarantees (`stage_direct`). Too small a bound faults the DMA and
+/// the job hangs until the watchdog kills it: ResNet50's int8 stem did
+/// exactly that whenever its input binding happened to end a mapping.
+///
+/// Covers the precisions and channel counts the bound was not bisected at
+/// (`stem_int8_loop_probe`, `ROCKET_STEM_TAIL`): fp16, Cin 1 and Cin 4.
+#[test]
+#[ignore = "needs /dev/accel/accel0 -- the dense feature over-fetch stays mapped"]
+fn dense_input_overfetch_stays_inside_the_planned_bound() {
+    let _device_guard = NPU_TEST_LOCK
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    let file = OpenOptions::new()
+        .read(true)
+        .write(true)
+        .open(DEVICE_PATH)
+        .expect("failed to open RK3588 NPU device");
+    let mut failures = Vec::new();
+    for (precision, pattern) in [
+        (
+            OraclePrecision::Int8Accumulator,
+            OraclePattern::Selectors { phase: 5 },
+        ),
+        (OraclePrecision::Fp16, OraclePattern::Selectors { phase: 5 }),
+    ] {
+        for (width, height, cin, kernel) in [
+            (230, 230, 3, 7),
+            (230, 226, 3, 7),
+            (200, 230, 3, 7),
+            (226, 226, 3, 3),
+            (230, 230, 1, 7),
+            (230, 230, 4, 7),
+        ] {
+            let case = Conv2dCase {
+                width,
+                height,
+                cin,
+                cout: 64,
+                kernel: [kernel, kernel],
+                stride: 2,
+                padding: [0, 0],
+                precision,
+                pattern,
+            };
+            let label = case.label();
+            let fixture = build_fixture(case).expect("dense fixture must build");
+            let read = ConvPlan::new(fixture.shape, case.kernel)
+                .dense_input_read_bytes()
+                .expect("Cin <= 4 is dense");
+            INPUT_TAIL.with(|cell| cell.set(Some(read - fixture.input.len())));
+            let report = execute_case(&file, &fixture);
+            INPUT_TAIL.with(|cell| cell.set(None));
+            match report {
+                Ok(report) if report.timed_out() => failures.push(format!(
+                    "{label}: DMA fault -- hung {:.0} ms with {read} bytes mapped",
+                    report.dispatch.as_secs_f64() * 1e3
+                )),
+                Ok(CaseReport {
+                    verdict: Err(error),
+                    ..
+                }) => failures.push(format!("{label}: {error}")),
+                Ok(_) => println!(
+                    "ok   {label}: {read} bytes read, {} in the tensor",
+                    fixture.input.len()
+                ),
+                Err(error) => failures.push(format!("{label}: {error}")),
+            }
+        }
+    }
+    assert!(failures.is_empty(), "{}", failures.join("\n"));
+}
+
+/// Probe: the int8 accumulator stem run back to back in one process, the
+/// way a benchmark loop runs it -- where ResNet50's stem intermittently hit
+/// the watchdog while every single-shot run passed. `ROCKET_STEM_LOOPS`
+/// (default 200) sets the iteration count; `ROCKET_STEM_CIN`, `_W`, `_H`,
+/// `_K`, `_S` and `_PREC=fp16` the shape. `ROCKET_STEM_TAIL=<bytes>` moves
+/// the input to the top of the IOVA space with that many mapped bytes after
+/// it -- how the over-fetch was bisected
+/// (`ConvPlan::dense_input_read_bytes`).
+#[cfg(feature = "hardware-characterization")]
+#[test]
+#[ignore = "needs /dev/accel/accel0 -- probe, the int8 stem back to back"]
+fn stem_int8_loop_probe() {
+    let _device_guard = NPU_TEST_LOCK
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    let file = OpenOptions::new()
+        .read(true)
+        .write(true)
+        .open(DEVICE_PATH)
+        .expect("failed to open RK3588 NPU device");
+    let loops: usize = std::env::var("ROCKET_STEM_LOOPS")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(200);
+    let cin: u32 = std::env::var("ROCKET_STEM_CIN")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(3);
+    let env = |name: &str, default: usize| {
+        std::env::var(name)
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(default)
+    };
+    let kernel = env("ROCKET_STEM_K", 7);
+    let precision = match std::env::var("ROCKET_STEM_PREC").as_deref() {
+        Ok("fp16") => OraclePrecision::Fp16,
+        _ => OraclePrecision::Int8Accumulator,
+    };
+    let case = Conv2dCase {
+        width: env("ROCKET_STEM_W", 230) as u32,
+        height: env("ROCKET_STEM_H", 230) as u32,
+        cin,
+        cout: 64,
+        kernel: [kernel, kernel],
+        stride: env("ROCKET_STEM_S", 2) as u32,
+        padding: [0, 0],
+        precision,
+        pattern: OraclePattern::Selectors { phase: 5 },
+    };
+    let fixture = build_fixture(case).expect("stem fixture must build");
+    let tail: Option<usize> = std::env::var("ROCKET_STEM_TAIL")
+        .ok()
+        .and_then(|v| v.parse().ok());
+    INPUT_TAIL.with(|cell| cell.set(tail));
+    println!("stem input {} bytes, tail {tail:?}", fixture.input.len());
+    for tile in ConvPlan::new(fixture.shape, fixture.case.kernel).tiles() {
+        println!("  tile {tile:?}");
+    }
+    let (mut timeouts, mut wrong, mut first_timeout) = (0usize, 0usize, None);
+    let mut slowest = std::time::Duration::ZERO;
+    for i in 0..loops {
+        let report = execute_case(&file, &fixture).expect("stem must execute");
+        slowest = slowest.max(report.dispatch);
+        if report.timed_out() {
+            timeouts += 1;
+            first_timeout.get_or_insert(i);
+            println!(
+                "  iter {i}: TIMEOUT {:.0} ms",
+                report.dispatch.as_secs_f64() * 1e3
+            );
+        } else if let Err(error) = &report.verdict {
+            wrong += 1;
+            println!("  iter {i}: WRONG {error}");
+        }
+    }
+    INPUT_TAIL.with(|cell| cell.set(None));
+    println!(
+        "stem int8 loop: {loops} iterations, {timeouts} timeouts (first at {first_timeout:?}), \
+         {wrong} wrong, slowest {:.2} ms",
+        slowest.as_secs_f64() * 1e3
+    );
+    assert_eq!(
+        (timeouts, wrong),
+        (0, 0),
+        "the stem must survive a back-to-back loop"
+    );
 }
 
 #[test]

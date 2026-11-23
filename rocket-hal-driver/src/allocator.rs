@@ -249,6 +249,9 @@ unsafe extern "C" fn allocate_buffer(
         deallocated: std::sync::atomic::AtomicBool::new(false),
         generation: crate::weight_cache::Generation::default(),
         synced_generation: std::sync::atomic::AtomicU64::new(u64::MAX),
+        // CREATE_BO backs a GEM object of whole pages; 4 KiB is the smallest
+        // page this kernel can use, so this never overstates the mapping.
+        mapped_bytes: raw.size.next_multiple_of(4096),
     });
     let buffer_ptr = Box::into_raw(buffer);
 

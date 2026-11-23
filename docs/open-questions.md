@@ -233,8 +233,16 @@ come back right, but `tiled_pooling_matches_oracle` fails, because only the
 first task runs before the kill. The board now runs that module plus the
 *unconditional* PPU patch (`drm-misc-next` `0001`, which arms PPU and DPU
 for every job), not the flag-gated `093`/`PPU_DONE` one: this repo never sets
-`DRM_ROCKET_JOB_PPU_DONE`. It has no clock patch, so the NPU is back at
-200 MHz and every 600 MHz number predates the re-flash.
+`DRM_ROCKET_JOB_PPU_DONE`.
+
+The clock patch (`081`) is back on it since 2026-11-23, rebased onto
+Armbian's module (one hunk hand-merged: its suspend path counts clocks
+with `soc->num_clks`) and loaded with `rocket_npu_clk_hz=600000000`; so is
+`088` (reset before IOMMU detach, see 2.7). At 600 MHz: gate 409/409,
+every board model bit-identical to its 200 MHz output, ResNet50-224 fp16
+~105 -> 45 ms and int8 150 -> 125 ms (cpu 4-7, `#60` build), MobileNetV2
+fp16 63 -> 55.5 ms. The rebased patches are in `~/projects/patches/rocket/`
+with an `-armbian-7.3.5` suffix.
 
 - 2.6.1 Is NPU devfreq (OPP table plus governor) the right upstream shape for
   the clock fix, in place of module parameters? [ISSUES M2]
@@ -245,6 +253,14 @@ for every job), not the flag-gated `093`/`PPU_DONE` one: this repo never sets
 2.7 What does the kernel do to a core after a job timeout? Does it fully
 reset the core (CNA, CORE, DPU, PPU state and IOMMU), or only stop it? This
 is the kernel half of 1.1.3. [LIMITS hazards, ISSUES Resolved C16]
+
+Part answered 2026-11-23 (ISSUES C17): Armbian's `rocket_reset` detached
+the IOMMU *before* resetting the still-running core, so the stall handshake
+timed out on every timeout, and one burst was followed by page-table
+corruption in the submitting process. With `088` (reset first) a timeout
+recovers with nothing logged but `NPU job timed out`, and the next job on
+that core runs correctly. Whether CNA/DPU/PPU state survives the reset is
+still open.
 
 2.8 Is the per-file 4 GB IOVA window ever a constraint in practice, for
 example for an LLM's weights on one file? [ISSUES P1]
@@ -309,6 +325,13 @@ inference? [ISSUES Resolved C16, C3]
 fetches, and is `Shape::dense_feature_offset_safe` a complete guard or only a
 measured one? [LIMITS "Hazards inside the limits"]
 
+A second dense hazard, found and fixed 2026-11-23 (ISSUES C17): the feature
+DMA fetches `data_entries` pixels per tile, the row padded to the atom
+width, so it reads past the tensor's end and hangs when that page is
+unmapped. `ConvPlan::dense_input_read_bytes` is measured for full-width
+tiles only; its column-tile half is a conservative bound, not a
+measurement.
+
 3.4.2 Is there a tool that compares *intermediate* tensors between the NPU
 and CPU arms of a real model, to find the first dispatch that diverges? P8
 asked for one after C13 showed that a model can be the only instrument that
@@ -346,7 +369,9 @@ blocks. [ISSUES P2 step 5]
 
 4.2.3 Which stems should be claimed, and how? ResNet50's 7x7 stride-2 stem is
 claimed at int8 (2026-11-23) and left on the CPU at fp16, where the NPU was
-slower at 200 MHz -- should it be admitted at 600 MHz? ViT's 16x16 stride-16
+slower at 200 MHz -- should it be admitted at 600 MHz? (Re-measured
+2026-11-23 at 600 MHz: slower on cpu 4-7, 53.6/48.8 vs 45.0/44.4 ms, faster
+on all eight, 45.7/44.4 vs 47.4/50.4 -- still mixed, still out.) ViT's 16x16 stride-16
 patch embedding and ResNet50 fp16's padded max pool still have no matcher.
 [LIMITS ViT-L/16, ISSUES P2, C15, Resolved stem]
 
