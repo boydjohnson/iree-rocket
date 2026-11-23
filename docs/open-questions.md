@@ -5,8 +5,7 @@ the RK3588 NPU itself, the mainline `accel/rocket` kernel driver, the
 iree-rocket runtime (`iree-rocket-hal` + `rocket-hal-driver`), and the
 iree-rocket compiler (`rocket-compiler-plugin`, `rocket-compiler`,
 `rocket-core`'s admission and planning as the compiler uses them). A fifth
-section collects questions about measurement method and about the docs
-themselves.
+section collects questions about measurement method.
 
 Written against `main` at `b46c625` (2026-09-10). Each question names where it
 came from in brackets, so it can be checked against its source rather than
@@ -106,8 +105,9 @@ and also 29/120 plausible-looking corruptions under the vendor driver.
 
 1.3.4 Does `ConvPlan`'s CBUF split still diverge from the vendor captures for
 dense shapes above `Cin` 384, and does the "sawtooth reset rule" the spec
-comment asks for exist? The comment's own premise (`MAX_INT8_INPUT_CHANNELS`
-is 512) is stale. [`rocket_conv2d_transform_spec.mlir` ~line 6500]
+comment asks for exist? (The comment was written when
+`MAX_INT8_INPUT_CHANNELS` was 512; it is 4096 now.)
+[`rocket_conv2d_transform_spec.mlir` ~line 6500]
 
 1.3.5 Why does BERT's MLP down-projection (`K` = 3072) take 9.87 ms on the
 hardware against 2.99 ms for the up-projection (`N` = 3072) at identical
@@ -151,13 +151,6 @@ The compile-time layout contract for non-whole-atom edges waits on this.
 multiple of 16 lanes (for example `Cin` = 24 at fp16) without reading the
 padding surface? This is what MobileNetV2's whole-atom chain declines at Cout
 24, 88 and 136 turn on. [COMPILER_ROADMAP 6.1]
-
-1.5.5 Is there still an unexplained accumulator truncation? `conv.rs`
-(`bs_ow_size_e_override`) says the truncation "in
-`MAX_ACCUMULATOR_COEFFICIENT_BYTES_PER_CHANNEL` is still unexplained". That
-constant no longer exists, and C1 concluded there is no
-coefficient-per-channel limit. Is the sentence obsolete, or is there a
-residual effect? [`iree-rocket-hal/src/rocket/conv.rs:928`, ISSUES C1]
 
 1.5.6 For depthwise, which is right: this repo's `DPU_BS_OW_OP = 0` with
 `od_bypass = 1`, or Mesa's `bs_ow_op = 0x80 - weight_zero_point` with
@@ -524,41 +517,3 @@ Still one board, but now two kernels. Since 2026-11-23, `planck` runs Armbian
 `--release`, with the PPU patch in place (see 2.6). Model-level numbers have
 not been re-taken on the new OS, and its NPU runs at 200 MHz (5.1.1 in
 reverse).
-
-### 5.2 Docs that disagree with the code or with each other
-
-These are questions only in the sense of "which one is right". Each needs a
-one-line fix once checked.
-
-5.2.1 LIMITS.md's "What a compiled model actually offloads" table still says
-dense 1x1 `Cin`/`Cout` 1..=3584, matmul `M` 1..=2047 and `K`/`N` 1..=3584,
-and fp16 depthwise 1..=512. The text above it, and `rocket-core`, say 4096,
-4096 and 1536. LIMITS's Matmul table has the same 2047 and 3584. [LIMITS,
-`rocket-core/src/conv.rs`, `admission.rs`]
-
-5.2.2 LIMITS.md "Changing a limit" says the dense ceilings "sit at 3584 ...
-deliberately". They have been 4096 since 2026-09-09. [LIMITS]
-
-5.2.3 DYNAMIC_SHAPES DS3 still gives the fp16 dense 1x1 ceilings as 3584 and
-depthwise as 512. [DYNAMIC_SHAPES DS3]
-
-5.2.4 ISSUES C7's table lists `DISPATCH_TIMEOUT_FLOOR` and
-`HUNG_JOB_DISPATCH_FLOOR` as absent. Both are now in
-`rocket-hal-driver/src/device.rs` and the HAL tests. Which of C7's other
-absences are also out of date? [ISSUES C7]
-
-5.2.5 MULTICORE §1 "What the driver does today" describes serial replay
-under one mutex and a thread per dispatch. M0 to M2 changed both. Should §1
-be relabelled as historical? [MULTICORE §1, §10 to §12]
-
-5.2.6 The int8 accumulator matcher comment in the transform spec gives
-`MAX_INT8_INPUT_CHANNELS` as 512. [`rocket_conv2d_transform_spec.mlir`
-~6500]
-
-5.2.7 `conv.rs`'s doc link to `MAX_ACCUMULATOR_COEFFICIENT_BYTES_PER_CHANNEL`
-points at a constant that no longer exists (see 1.5.5).
-[`iree-rocket-hal/src/rocket/conv.rs:928`]
-
-5.2.8 ISSUES P8 still says "Do not raise `Cin` past 816 on isolated
-evidence", in a section now marked resolved as C13, with the bound at 1344.
-Should that sentence be struck through like its neighbours? [ISSUES P8]

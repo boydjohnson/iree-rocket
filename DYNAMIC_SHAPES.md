@@ -223,8 +223,8 @@ needs none of this.
 
 Today the *channel* ceilings are compile-time admission facts, in
 `rocket-core/src/admission.rs` since 2026-09-09: fp16 dense 1x1 at Cin and
-Cout 3584 (`conv::MAX_INPUT_CHANNELS` / `MAX_OUTPUT_CHANNELS`), 3x3 at Cin
-1152 with Cout riding the dense ceiling, depthwise at 512; stride is part of
+Cout 4096 (`conv::MAX_INPUT_CHANNELS` / `MAX_OUTPUT_CHANNELS`), 3x3 at Cin
+1152 with Cout riding the dense ceiling, depthwise at 1536; stride is part of
 the table's key and also lives in the executable variant. A model outside *those* bounds does not match and runs on
 the CPU -- correct, just slower.
 

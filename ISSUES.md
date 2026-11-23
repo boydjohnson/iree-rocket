@@ -73,8 +73,10 @@ backing. Two reasons to keep it on the list anyway:
 `grep -r` over `.rs`/`.sh`/`.py`, excluding `target/` [verified]. Present:
 `ROCKET_PROBE_ONLY`, `ROCKET_PROBE_RESUME_AT`, `run_hardware_case_matrix`,
 `ROCKET_DUMP_PRECISION`, `accumulator_written_lanes_probe`,
-`accumulator_written_region_map`, `accumulator_per_channel_threshold_probe`,
-`MAX_ACCUMULATOR_COEFFICIENT_BYTES_PER_CHANNEL`.
+`accumulator_written_region_map`, `accumulator_per_channel_threshold_probe`.
+(`MAX_ACCUMULATOR_COEFFICIENT_BYTES_PER_CHANNEL` was on this list; it has
+since been removed with the coefficient limit C1 retracted, and only a stale
+doc link in `iree-rocket-hal/src/rocket/conv.rs` names it.)
 
 Also present, and I initially got this wrong: **`ROCKET_PAD_INPUT` / `_WEIGHTS` /
 `_BIAS` and `ROCKET_POISON_*` do exist.** They are built with
@@ -89,10 +91,13 @@ Genuinely absent:
 | `accumulator_truncation_anatomy` | no |
 | `ROCKET_ANATOMY_SHAPES` / `_REPEATS` / `_PRECISION` / `_BANKS` / `_CANARY` | no |
 | `ROCKET_TILE_LIMIT` | no |
-| `ROCKET_PAD_OUTPUT` | added during C1 |
+| `ROCKET_PAD_OUTPUT` | yes, added during C1 |
 | `ROCKET_IOVA_LEDGER` | no |
-| `DISPATCH_TIMEOUT_FLOOR`, `HUNG_JOB_DISPATCH_FLOOR` | no |
+| `DISPATCH_TIMEOUT_FLOOR`, `HUNG_JOB_DISPATCH_FLOOR` | yes, rebuilt in 0dbbaae ("Tell a watchdog-killed NPU job apart from a shape result"): `iree-rocket-hal/tests/support/dispatch.rs` and `rocket-hal-driver/src/device.rs` |
 | `tools/npu_hang_survey.sh` | no |
+
+Re-checked 2026-11-23 with the same `grep`: the rows marked "no" are still
+absent.
 
 The measurements those tools produced are recorded in detail and are probably
 sound — the C1 work reproduced the `accumulator-per-channel-coefficient-limit`
@@ -100,8 +105,9 @@ numbers exactly (6144 + 512 written bytes at `@0` and `@229376`, 63884
 mismatches), which is good evidence the vanished harness was faithful. The tools
 themselves were built in a working tree that was never committed. The cost is
 that the memories instruct a future session to reproduce findings with
-instruments that are not there, and one of them (C3) is a correctness guard the
-memory believes is protecting production.
+instruments that are not there. The one that mattered most, C3's hung-job
+guard in production, has since been rebuilt, so what is still missing is
+diagnostics only.
 
 Either recommit them or amend the memories to say they were lost. I have amended
 the memories that made load-bearing claims.
@@ -1393,11 +1399,15 @@ The bound therefore ships at `Cin` 816: the widest the model is measured
 correct at, well below everything the isolated tests support. `Cout` was
 raised 768 -> 1792 in the same session and is clean on the model.
 
-**Do not raise `Cin` past 816 on isolated evidence.** This issue exists
+~~**Do not raise `Cin` past 816 on isolated evidence.** This issue exists
 because isolated evidence said 1792 and the model said 816. The next step is
 an instrument that can see *which* dispatch first diverges inside a real
 model -- comparing intermediate tensors, not logits -- because every
-shape-level instrument this repo has already says the shape is fine.
+shape-level instrument this repo has already says the shape is fine.~~
+Superseded by C13 (Resolved): the divergence was a chained dispatch packed
+before its producer ran, not the shape, and the requantized int8 1x1 bound is
+1344 now (`rocket-core/src/admission.rs`). The intermediate-tensor
+instrument is still worth having; it is open question 3.4.2.
 
 ### The ranked levers this leaves
 

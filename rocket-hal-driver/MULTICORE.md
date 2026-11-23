@@ -3,7 +3,15 @@
 Design note, 2026-09-06. Status: proposal, nothing implemented. Resolves
 ISSUES.md P1 ("one fd is one scheduler entity is one core").
 
-## 1. What the driver does today
+## 1. What the driver did before M0 (historical)
+
+This is the starting point the design below was written against, kept so §4
+and §5 read against what they changed. None of it describes the driver any
+more: M0 (§10) replaced the thread per dispatch with a worker pool, M1 (§11)
+opened one file per context, M2 (§12) fans a dispatch's tiles out across
+contexts, and since ISSUES C4 (2026-11-23) a dispatch's tiles on one file go
+in as one multi-task job rather than one `SUBMIT` each. Line numbers below
+are as of then.
 
 - **One `open()` of `/dev/accel/accel0`** (`device.rs` `create`). The
   allocator gets a `try_clone()` of it. A dup shares the `struct file`, so
