@@ -1537,7 +1537,7 @@ pub unsafe fn apply_ops_until_dispatch(
                 replicas,
                 tile_context,
                 scratch_buffers: _,
-                retained_bindings: _,
+                retained_bindings,
                 // Record-time only: a later dispatch reads it while the
                 // command buffer is still being built, never here.
                 output_cube: _,
@@ -1826,12 +1826,35 @@ pub unsafe fn apply_ops_until_dispatch(
                 // hazard for any buffer passed directly in future. A
                 // redundant sync on an already-synced scratch BO is a cache
                 // operation with no effect on correctness.
+                //
+                // The exception is a buffer IREE declared immutable: a
+                // directly bound constant (packed weights since
+                // COMPILER_ROADMAP 6.3) is the whole combined constant BO,
+                // and `FINI_BO` costs its page count every time. It is
+                // synced once per write instead -- see
+                // `buffer::constant_sync_due` for why that is safe.
                 let timer = profile::start();
                 for &input_handle in in_bo_handles.iter() {
+                    let constant = retained_bindings.iter().find_map(|&buffer| {
+                        unsafe {
+                            crate::buffer::constant_sync_due(
+                                buffer,
+                                cb.context.id == 0,
+                                input_handle,
+                            )
+                        }
+                        .map(|due| (buffer, due))
+                    });
+                    if let Some((_, None)) = constant {
+                        continue;
+                    }
                     if unsafe { fini_bo(cb.fd, input_handle) }.is_err() {
                         return Err(status::from_code(
                             crate::bindings::iree_status_code_e_IREE_STATUS_INTERNAL,
                         ));
+                    }
+                    if let Some((buffer, Some(generation))) = constant {
+                        unsafe { crate::buffer::note_constant_synced(buffer, generation) };
                     }
                 }
                 profile::stop(timer, profile::Phase::SyncInputs, profile_label, 0);
