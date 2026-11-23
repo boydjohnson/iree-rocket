@@ -214,12 +214,14 @@ created on file *k*, which forces replica copies and collides with packed
 IREE buffers. [MULTICORE §2, COMPILER_ROADMAP 6.1]
 
 2.4 Would upstream accept an offset/length on `PREP_BO`/`FINI_BO`? Cache
-maintenance is ∝ the BO's page count, not the bytes touched, and since
-COMPILER_ROADMAP 6.3 that is 41% of ResNet50's wall. [ISSUES P3]
+maintenance is ∝ the BO's page count, not the bytes touched. The constant
+buffer no longer pays it per dispatch (ISSUES P3, resolved 2026-11-23); what
+still does is the output `PREP_BO` and a fanned-out replica's staged input.
+[ISSUES P3]
 
 - 2.4.1 Are NPU BOs mapped cached on the CPU side? Would an uncached or
-  write-combined mapping for write-once constants make the sync unnecessary
-  rather than cheaper? [ISSUES P3; inferred]
+  write-combined mapping make the remaining syncs unnecessary rather than
+  cheaper? [ISSUES P3; inferred]
 
 2.5 Could `SUBMIT` return an out-fence (sync_file or syncobj)? Today it is
 fire-and-forget, `PREP_BO` is the only completion primitive, and there is no
@@ -261,16 +263,6 @@ example for an LLM's weights on one file? [ISSUES P1]
 ## 3. iree-rocket runtime (`iree-rocket-hal`, `rocket-hal-driver`)
 
 ### 3.1 Host cost
-
-3.1.1 Can the input-side cache sync be hoisted to once per buffer
-`generation` for write-once constant bindings? Is that safe for every
-directly bound read-only binding, not only `weights_packed`? This is ranked
-first in Suggested order and worth about 40 ms of a 104 ms ResNet50
-inference. [ISSUES P3, Suggested order 1]
-
-- 3.1.1.1 Can IREE ever rewrite a constant buffer after upload, for example
-  through parameter loading or a later `queue_update`, in a way that the
-  generation counter would miss? [ISSUES P3; inferred]
 
 3.1.2 What is the per-dispatch tax made of now? At four workers,
 MobileNetV2 fp16's `--no-offload` arm (54.5 ms) beats the best NPU arm

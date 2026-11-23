@@ -58,6 +58,11 @@ pub struct RocketBuffer {
     /// keys reuse on it, so a write that does not bump it is a correctness
     /// bug in that cache, not just a stale statistic.
     pub generation: crate::weight_cache::Generation,
+    /// The `generation` at which this driver last ran `FINI_BO` over the
+    /// whole buffer for an NPU read, or `u64::MAX` if it never has. Read and
+    /// written only for buffers IREE declared immutable -- see
+    /// [`constant_sync_due`].
+    pub synced_generation: std::sync::atomic::AtomicU64,
 }
 
 unsafe fn cast(buffer: *mut iree_hal_buffer_t) -> *mut RocketBuffer {
@@ -103,6 +108,82 @@ pub unsafe fn generation(buffer: *mut iree_hal_buffer_t) -> u64 {
 /// by this driver's allocator and still live.
 pub unsafe fn note_write(buffer: *mut iree_hal_buffer_t) {
     unsafe { (*cast(buffer)).generation.bump() }
+}
+
+/// For an NPU read of `buffer` through GEM `handle`, on context 0 when `home`
+/// is set: `None` when
+/// the read must be synced the ordinary way (this is not that buffer, or it
+/// is not a constant), `Some(None)` when it is a constant already synced at
+/// its current generation, so the `FINI_BO` can be skipped, and
+/// `Some(Some(generation))` when it is a constant that must be synced now and
+/// then recorded with [`note_constant_synced`].
+///
+/// ISSUES.md P3: `FINI_BO` walks the whole BO, and with packed weights bound
+/// directly the BO is IREE's combined constant buffer -- tens of MiB, synced
+/// on every dispatch, 41% of ResNet50's wall. A constant only needs it once
+/// per write. IREE gives every `Lifetime::Constant` resource
+/// `IREE_HAL_BUFFER_USAGE_SHARING_IMMUTABLE` ("immutable once initialized;
+/// implementations are allowed to avoid synchronization"), and every host
+/// write this driver can see bumps `generation` (`note_write`).
+///
+/// The one write it cannot see is a CPU dispatch through `local-task`'s
+/// persistent mapping, which never unmaps. That is why the sync is recorded
+/// only here, at an NPU read, and not at `unmap_range`: a constant is
+/// finished initializing before anything reads it, so the first NPU read
+/// syncs whatever the CPU wrote, and an immutable buffer is not written
+/// after that. `ROCKET_SYNC_CONSTANTS=1` restores the per-dispatch sync.
+///
+/// # Safety
+///
+/// `buffer` must be a valid, non-null pointer to a `RocketBuffer` created
+/// by this driver's allocator and still live.
+///
+/// Only context 0 names an IREE buffer's own GEM handle: its file is the one
+/// the allocator `dup`s (so `rb.fd` is a different number for the same open
+/// file), and every other context stages bindings into its own scratch,
+/// whose handle numbers can collide with this buffer's. Hence `home`, not an
+/// fd comparison.
+pub unsafe fn constant_sync_due(
+    buffer: *mut iree_hal_buffer_t,
+    home: bool,
+    handle: u32,
+) -> Option<Option<u64>> {
+    let rb = unsafe { &*cast(buffer) };
+    if !home || rb.handle != handle || sync_constants_every_dispatch() {
+        return None;
+    }
+    let usage = unsafe { crate::bindings::iree_hal_buffer_allowed_usage(buffer) };
+    if usage & crate::bindings::iree_hal_buffer_usage_bits_t_IREE_HAL_BUFFER_USAGE_SHARING_IMMUTABLE
+        == 0
+    {
+        return None;
+    }
+    let generation = rb.generation.current();
+    let synced = rb
+        .synced_generation
+        .load(std::sync::atomic::Ordering::Acquire);
+    Some((synced != generation).then_some(generation))
+}
+
+/// Records that `buffer` was synced for device reads at `generation`.
+///
+/// # Safety
+///
+/// As [`constant_sync_due`].
+pub unsafe fn note_constant_synced(buffer: *mut iree_hal_buffer_t, generation: u64) {
+    unsafe {
+        (*cast(buffer))
+            .synced_generation
+            .store(generation, std::sync::atomic::Ordering::Release)
+    }
+}
+
+/// Whether to `FINI_BO` constant buffers before every NPU read, as before
+/// ISSUES.md P3 (`ROCKET_SYNC_CONSTANTS=1`), for an A/B or to rule the skip
+/// out of a wrong result.
+fn sync_constants_every_dispatch() -> bool {
+    static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ENABLED.get_or_init(|| std::env::var("ROCKET_SYNC_CONSTANTS").is_ok_and(|value| value != "0"))
 }
 
 /// # Safety
