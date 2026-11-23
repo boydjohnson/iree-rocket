@@ -3115,6 +3115,53 @@ fn int8_large_kernel_ladder_stays_under_the_measured_ceiling() {
     }
 }
 
+/// Requantized int8 at stride 2, at ResNet50's own stride-2 shapes.
+///
+/// Every dense stride-2 int8 convolution in ResNet50-224 int8 ran on the CPU
+/// -- ~91% of that model's CPU dispatch time -- because no int8 matcher
+/// claims stride 2. This gates the stride-2 requantized matchers before they
+/// exist: the five shapes inside the requantized admission envelope (1x1 up
+/// to `Cin` 1344 / `Cout` 1792, 3x3 up to 768), at the padded input extents
+/// the model reaches them with, under `Counting` (lane coverage) and
+/// `SelectorsAffine` (addressing). The 14x14 `Cin` 1024 -> 2048 1x1 is past
+/// the requantized `Cout` ceiling and stays on the CPU.
+fn int8_requant_stride2_cases() -> Vec<Conv2dCase> {
+    let mut cases = Vec::new();
+    for (width, cin, cout, kernel) in [
+        (56u32, 256u32, 512u32, 1usize),
+        (28, 512, 1024, 1),
+        (58, 128, 128, 3),
+        (30, 256, 256, 3),
+        (16, 512, 512, 3),
+    ] {
+        for pattern in [
+            OraclePattern::Counting,
+            OraclePattern::SelectorsAffine { phase: 3 },
+        ] {
+            cases.push(Conv2dCase {
+                width,
+                height: width,
+                cin,
+                cout,
+                kernel: [kernel, kernel],
+                stride: 2,
+                padding: [0, 0],
+                precision: OraclePrecision::Int8,
+                pattern,
+            });
+        }
+    }
+    cases
+}
+
+#[test]
+#[ignore = "needs /dev/accel/accel0 -- requantized int8 at stride 2, ResNet50's shapes"]
+fn int8_requant_stride2_matches_oracle() {
+    let cases = int8_requant_stride2_cases();
+    assert_eq!(cases.len(), 10);
+    run_hardware_case_matrix("requantized int8 stride 2 (ResNet50 shapes)", cases);
+}
+
 #[test]
 #[ignore = "needs /dev/accel/accel0 -- int8 above 3x3, bracketing the Cin ceiling"]
 fn int8_large_kernel_matrix_matches_oracle() {

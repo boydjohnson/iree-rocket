@@ -1777,6 +1777,25 @@ Correctness is not known to be affected: the guard refuses the buffer rather
 than returning it, so a hang is a failure, not a wrong answer. The clean
 iterations' logits were not diffed against the CPU arm here.
 
+**Deterministic single-shot repro, 2026-11-23** (`planck` re-flashed to
+7.3.5, `ssh orangepi`, NPU 200 MHz). Adding the requantized int8 stride-2
+matchers (`@match_dynamic_conv2d{,_3x3}_int8_requant_s2`) to ResNet50-224
+int8 moves its five stride-2 convolutions onto the NPU, and the final
+`pool Avg 7x7x2048 k7x7 s1x1` then hangs on **every** run: 9 of 9
+single-shot `iree-run-module` invocations, ~510 ms, dispatch 53 of 53. The
+build without those matchers runs the same pool clean, single-shot, right
+after the same `conv int8acc 7x7x512->2048`. Ruled out, each 3 of 3 still
+hanging: `ROCKET_QUIESCE_ALL=1` (a dwell before every dispatch), and
+`ROCKET_NPU_CORES=1` (one context, so placement is not it). The pool's input
+is CPU-produced (no chaining into it), and its predecessor is the same
+accumulator conv class as in the clean build -- so the trigger is state left
+by something earlier in the run, most likely the new stride-2 requantized
+jobs. Rebuilding with only one of the two new matchers is the next bisect.
+The pooling-free build of the same model runs clean every time, which is
+also how the stride-2 gain was measured (see the int8 stride-2 note in
+Resolved).
+
+
 ---
 
 ## D1 (S4) — the FC lowering here and in the notes use opposite geometries, and this one may be better
@@ -1998,6 +2017,30 @@ instead on the way out, 31 ms of `compact` per inference against 7.5.
 What was settled and how, newest first, in place of the narratives — those are
 in this file's git history (`git log -p ISSUES.md`). Everything cited below is
 something that still exists: a commit, a file, or a memory.
+
+**int8 stride-2 coverage (S2) — 2026-11-23, built and gated, blocked from
+shipping by C16.** Every dense stride-2 int8 convolution in ResNet50-224 int8
+ran on the CPU: the planner accepted them, but no int8 matcher claimed stride
+2, and they were ~91% of that model's CPU-dispatch cycles (found by `perf`;
+see memory `default-task-topology-trap` for the recipe). Added a stride-2
+requantized target, executable and call, and 1x1 and 3x3 stride-2 twins of
+the requantized matchers. Gated on hardware first by
+`conv2d_oracle_hw::int8_requant_stride2_matches_oracle` -- ResNet50's own five
+shapes inside the requantized envelope, `Counting` and `SelectorsAffine`, 10
+of 10 exact -- and by two new `rocket_int8_requant_match.mlir` lit cases. The
+14x14 `Cin` 1024 -> 2048 stride-2 1x1 is past the requantized `Cout`
+ceiling (1792) and stays on the CPU with the 7x7 stem.
+
+ResNet50-224 int8, both builds with the pooling matchers removed so C16
+cannot fire, median of 10, ABBA, workers pinned, 200 MHz: **378/382 -> 200/196
+ms on cpu 4-7, 442/434 -> 197/196 ms on all eight** (1.9-2.2x); `--no-offload`
+is 1082 / 1983 ms. NPU dispatches 47 -> 52. Output against `--no-offload`:
+mean |d| 0.076 (was 0.082) on logits of sd 1.8, argmax unchanged; not
+bit-identical to the old build (max |d| 0.33), as expected when five more
+layers switch from the CPU's round-half-even requantization to the NPU's
+round-half-away (memory `int8-tie-rule-half-away`). With the pooling matchers
+in, the model hangs every run on C16 -- so this lands only with C16 fixed or
+with ResNet50 int8's pooling kept on the CPU.
 
 **P3, constant half (S3) — 2026-11-23. A constant buffer is cache-synced
 once per write, not once per dispatch.** COMPILER_ROADMAP 6.3 bound packed
