@@ -270,9 +270,17 @@ pub fn conv_ceilings(
         // admitted; that was the *other* chained edge and the same C13
         // fault, not a width. It is exact now in the same model-level
         // measurement. Below 16 is untested.
+        //
+        // `Cout` raised 1792 -> 2048 on 2026-11-23, on ResNet50-224 int8:
+        // layer4's 14x14 Cin 1024 -> 2048 stride-2 downsample ran on the CPU
+        // (~46% of that model's CPU cycles) and its three 7x7 Cin 512 ->
+        // 2048 expansions fell back to the accumulator path and a CPU
+        // requantization. `int8_requant_cout2048_matches_oracle` gates both
+        // shapes on hardware, and the model is measured against its
+        // `--no-offload` arm (ISSUES.md Resolved, the int8 downsample).
         (PrecisionClass::Int8Requant, false, 1) => Some(ChannelCeilings {
             in_channels: 1344,
-            out_channels: 1792,
+            out_channels: 2048,
             min_out_channels: 16,
         }),
         // **int8 requantized, dense 3x3.** Raised 512 -> 768, gated by
@@ -511,6 +519,18 @@ mod tests {
             stride,
             in_channels: cin,
             out_channels: cout,
+        }
+    }
+
+    /// ResNet50-224 int8's layer4 needs requantized 1x1 `Cout` 2048 at both
+    /// strides; `Cin` stays at 1344.
+    #[test]
+    fn requant_1x1_admits_cout_2048_at_both_strides() {
+        for stride in [1, 2] {
+            assert!(admit_conv(&conv(int8(true), false, 1, stride, 1024, 2048)).is_ok());
+            assert!(admit_conv(&conv(int8(true), false, 1, stride, 512, 2048)).is_ok());
+            assert!(admit_conv(&conv(int8(true), false, 1, stride, 1024, 2064)).is_err());
+            assert!(admit_conv(&conv(int8(true), false, 1, stride, 2048, 512)).is_err());
         }
     }
 

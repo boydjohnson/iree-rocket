@@ -465,8 +465,10 @@ The conv and matmul channel columns are `rocket-core/src/admission.rs`
 consults through `transform.rocket.match.admitted`; if this table and that
 function disagree, the function is right. The i8 rows are the accumulator
 path. A convolution lowered to the requantized int8 path (`precision = int8`)
-admits less: 1x1 at `Cin` 1344 / `Cout` 1792, 3x3 at 768 / 768, depthwise at
-1344, with `Cout` a whole 16-channel atom.
+admits less: 1x1 at `Cin` 1344 / `Cout` 2048 (raised from 1792 on
+2026-11-23 for ResNet50 int8), 3x3 at 768 / 768, depthwise at 1344, with
+`Cout` a whole 16-channel atom. Requantized stride 2 has its own matchers
+(1x1 and 3x3, 2026-11-23).
 
 All three matmul rows have an end-to-end differential behind them:
 `tools/e2e_matmul_regression.py`, eight cases, all passing on `planck`

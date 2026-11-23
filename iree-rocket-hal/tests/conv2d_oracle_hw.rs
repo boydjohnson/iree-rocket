@@ -3154,6 +3154,42 @@ fn int8_requant_stride2_cases() -> Vec<Conv2dCase> {
     cases
 }
 
+/// Requantized int8 at `Cout` 2048, the two shapes ResNet50-224 int8 needs
+/// past the old 1792 admission ceiling: layer4's 14x14 `Cin` 1024 -> 2048
+/// stride-2 downsample (which ran on the CPU and was ~46% of that model's CPU
+/// cycles) and its three 7x7 `Cin` 512 -> 2048 expansions (which fell back to
+/// the int8-accumulator path and a CPU requantization).
+fn int8_requant_cout2048_cases() -> Vec<Conv2dCase> {
+    let mut cases = Vec::new();
+    for (width, cin, stride) in [(14u32, 1024u32, 2u32), (7, 512, 1)] {
+        for pattern in [
+            OraclePattern::Counting,
+            OraclePattern::SelectorsAffine { phase: 4 },
+        ] {
+            cases.push(Conv2dCase {
+                width,
+                height: width,
+                cin,
+                cout: 2048,
+                kernel: [1, 1],
+                stride,
+                padding: [0, 0],
+                precision: OraclePrecision::Int8,
+                pattern,
+            });
+        }
+    }
+    cases
+}
+
+#[test]
+#[ignore = "needs /dev/accel/accel0 -- requantized int8 at Cout 2048, ResNet50's shapes"]
+fn int8_requant_cout2048_matches_oracle() {
+    let cases = int8_requant_cout2048_cases();
+    assert_eq!(cases.len(), 4);
+    run_hardware_case_matrix("requantized int8 Cout 2048 (ResNet50 shapes)", cases);
+}
+
 #[test]
 #[ignore = "needs /dev/accel/accel0 -- requantized int8 at stride 2, ResNet50's shapes"]
 fn int8_requant_stride2_matches_oracle() {
