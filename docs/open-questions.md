@@ -97,11 +97,13 @@ rounded `cbuf_atoms`, which is width-dependent. The notes prescribe a flat
 `data_bank = min(fd_banks + 1, 11)`. Both are hardware-backed, so they must
 disagree somewhere. [ISSUES D2]
 
-1.3.3 Are the CBUF operand-reuse bits (`weight_reuse`, `data_reuse`) honoured
-by this silicon under the mainline driver? Are they safe once validated with
-aperiodic inputs and interleaved repeats? The notes measured +7% in-model,
-and also 29/120 plausible-looking corruptions under the vendor driver.
-[ISSUES P4]
+1.3.3 Would `Cout`-sliced tiles with `WEIGHT_REUSE` remove the per-row
+weight re-streaming that dominates Wide ResNet50's NPU time? The bit itself is
+answered (ISSUES P4, 2026-11-23): honoured and exact on RK3588 under mainline,
+proven by a decoy-weights control, but no faster on today's resident tiles.
+What is open is how much of Wide ResNet50's weight streaming (~192 of ~259 ms
+of NPU time at 200 MHz) a group of output channels kept resident across every
+row tile, at 3x3 `Cin` 512 and 1024, actually removes. [ISSUES P4]
 
 1.3.4 Does `ConvPlan`'s CBUF split still diverge from the vendor captures for
 dense shapes above `Cin` 384, and does the "sawtooth reset rule" the spec
