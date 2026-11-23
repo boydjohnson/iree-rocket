@@ -158,9 +158,11 @@ it? [`iree-rocket-hal/src/rocket/elementwise.rs`]
 
 ### 1.6 Capability that has never been measured
 
-1.6.1 Does the hardware support stride above 1 at kernels above 3x3? The
-capture sweep has no strided capture at any larger kernel. [LIMITS "Kernel,
-stride, spatial and padding limits"]
+1.6.1 Does the hardware support stride above 1 at kernels above 3x3 beyond
+the 7x7 stride-2 image stem? That one is measured exact on the dense path
+(`Cin` 1..=4, `Cout` 32..=128, every rung; ISSUES Resolved, 2026-11-23).
+Surface-layout inputs (`Cin` > 4), 5x5 and 9x9+, and stride 3 or more are
+still unmeasured. [LIMITS "Kernel, stride, spatial and padding limits"]
 
 1.6.2 Is there any hardware path to dilation, a depthwise channel multiplier
 above one, or a batch dimension? Today the builder has none, depthwise fixes
@@ -342,9 +344,11 @@ worth its per-dispatch cost? [ISSUES Suggested order 3, COMPILER_ROADMAP 5]
 pools in f16, so its five pools stay on the CPU and break the chain between
 blocks. [ISSUES P2 step 5]
 
-4.2.3 Which stems should be claimed, and how? ViT's 16x16 stride-16 patch
-embedding and ResNet50's 7x7 stem plus padded max pool have no matcher.
-[LIMITS ViT-L/16, ISSUES P2, C15]
+4.2.3 Which stems should be claimed, and how? ResNet50's 7x7 stride-2 stem is
+claimed at int8 (2026-11-23) and left on the CPU at fp16, where the NPU was
+slower at 200 MHz -- should it be admitted at 600 MHz? ViT's 16x16 stride-16
+patch embedding and ResNet50 fp16's padded max pool still have no matcher.
+[LIMITS ViT-L/16, ISSUES P2, C15, Resolved stem]
 
 4.2.4 Should MobileNetV2's linear-bottleneck residual adds get a
 `NONE`-activation twin of the epilogue-add target? It is described as "one

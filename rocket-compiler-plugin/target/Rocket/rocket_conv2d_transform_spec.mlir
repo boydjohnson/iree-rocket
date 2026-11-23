@@ -233,6 +233,28 @@
   ]
 }>
 
+// Stride-2 twin of the dense int8-accumulator target, for the 7x7 image stem
+// of a quantized ResNet: its requantization epilogue (`divf`, `fptoui`)
+// is not the canonical requantized form, so it takes the accumulator path and
+// the CPU keeps the cheap elementwise tail.
+#rocket_dynamic_int8_target_s2 = #hal.executable.target<"rocket", "rocket-flatbuffer-v1", {
+  kernel = "conv2d",
+  input_width = 0 : i32, input_height = 0 : i32, input_channels = 0 : i32,
+  output_width = 0 : i32, output_height = 0 : i32, output_channels = 0 : i32,
+  weights_width = 0 : i32, weights_height = 0 : i32, stride = 2 : i32,
+  depthwise = false,
+  runtime_layout = true,
+  input_zero_point = 0 : i32, output_zero_point = 0 : i32, weights_zero_point = 0 : i32,
+  input_scale = 1.0 : f32, weights_scale = 1.0 : f32, output_scale = 1.0 : f32,
+  truncate_bits = 0 : i32,
+  activation = "none", activation_cmp = 0 : i32,
+  precision = "int8_accumulator",
+  runtime_dimensions = [
+    "input_width", "input_height", "input_channels",
+    "output_channels", "weights_width", "weights_height"
+  ]
+}>
+
 #rocket_dynamic_depthwise_int8_target = #hal.executable.target<"rocket", "rocket-flatbuffer-v1", {
   kernel = "conv2d",
   input_width = 0 : i32, input_height = 0 : i32, input_channels = 0 : i32,
@@ -1294,6 +1316,20 @@ module attributes {transform.with_named_sequence} {
 
   hal.executable private @rocket_dynamic_int8_executable {
     hal.executable.variant public @rocket_dynamic_conv2d_v1 target(#rocket_dynamic_int8_target) {
+      hal.executable.export public @rocket_dynamic_conv2d ordinal(0) layout(#dynamic_pipeline_layout) count(%device: !hal.device, %workload: index) -> (index, index, index) {
+        %c1 = arith.constant 1 : index
+        hal.return %c1, %c1, %c1 : index, index, index
+      }
+      builtin.module {
+        func.func @rocket_dynamic_conv2d() {
+          return
+        }
+      }
+    }
+  }
+
+  hal.executable private @rocket_dynamic_int8_executable_s2 {
+    hal.executable.variant public @rocket_dynamic_conv2d_v1 target(#rocket_dynamic_int8_target_s2) {
       hal.executable.export public @rocket_dynamic_conv2d ordinal(0) layout(#dynamic_pipeline_layout) count(%device: !hal.device, %workload: index) -> (index, index, index) {
         %c1 = arith.constant 1 : index
         hal.return %c1, %c1, %c1 : index, index, index
@@ -4763,6 +4799,92 @@ module attributes {transform.with_named_sequence} {
     util.return %final : tensor<1x?x?x?xi32>
   }
 
+  // @call_rocket_dynamic_conv2d_int8 against the stride-2 executable.
+  util.func private @call_rocket_dynamic_conv2d_int8_s2(
+      %input: tensor<1x?x?x?xi8>,
+      %filter: tensor<?x?x?x?xi8>,
+      %init: tensor<1x?x?x?xi32>) -> tensor<1x?x?x?xi32> {
+    %c0 = arith.constant 0 : index
+    %c1 = arith.constant 1 : index
+    %c2 = arith.constant 2 : index
+    %c3 = arith.constant 3 : index
+
+    %input_height = tensor.dim %input, %c1 : tensor<1x?x?x?xi8>
+    %input_width = tensor.dim %input, %c2 : tensor<1x?x?x?xi8>
+    %input_channels = tensor.dim %input, %c3 : tensor<1x?x?x?xi8>
+    %weights_height = tensor.dim %filter, %c0 : tensor<?x?x?x?xi8>
+    %weights_width = tensor.dim %filter, %c1 : tensor<?x?x?x?xi8>
+    %output_height = tensor.dim %init, %c1 : tensor<1x?x?x?xi32>
+    %output_width = tensor.dim %init, %c2 : tensor<1x?x?x?xi32>
+    %output_channels = tensor.dim %init, %c3 : tensor<1x?x?x?xi32>
+
+    %input_width_i32 = arith.index_cast %input_width : index to i32
+    %input_height_i32 = arith.index_cast %input_height : index to i32
+    %input_channels_i32 = arith.index_cast %input_channels : index to i32
+    %output_channels_i32 = arith.index_cast %output_channels : index to i32
+    %weights_width_i32 = arith.index_cast %weights_width : index to i32
+    %weights_height_i32 = arith.index_cast %weights_height : index to i32
+
+    // The bias binding is i32 here, not i8: rocket-hal-driver validates it
+    // as output_channels * 4 bytes for both int8 precisions and reads it as
+    // i32 in pack_int8_bias_to_bs, whereas the fp16 path binds an f16
+    // vector. It stays zero -- int8_accumulator bypasses the BS stage
+    // entirely, so nothing here can be folded into a hardware bias; the
+    // zero-point correction lives in a separate CPU op that
+    // iree-global-opt-quantized-conv-to-conv already emitted next to this
+    // convolution.
+    %zero_bias_empty = tensor.empty(%output_channels) : tensor<?xi32>
+    %zero_i32 = arith.constant 0 : i32
+    %zero_bias = linalg.fill ins(%zero_i32 : i32)
+        outs(%zero_bias_empty : tensor<?xi32>) -> tensor<?xi32>
+
+    %layout_i32 = arith.constant 0 : i32
+    %raw_i32 = flow.dispatch
+        @rocket_dynamic_int8_executable_s2::@rocket_dynamic_conv2d_v1::@rocket_dynamic_conv2d(
+          %input_width_i32, %input_height_i32, %input_channels_i32,
+          %output_channels_i32, %weights_width_i32, %weights_height_i32, %layout_i32,
+          %input, %filter, %zero_bias)
+        {stream.affinity = #hal.device.affinity<@rocket_device>}
+        : (i32, i32, i32, i32, i32, i32, i32,
+           tensor<1x?x?x?xi8>{%input_height, %input_width, %input_channels},
+           tensor<?x?x?x?xi8>{%weights_height, %weights_width, %input_channels, %output_channels},
+           tensor<?xi32>{%output_channels})
+        -> tensor<1x?x?x?xi32>{%output_height, %output_width, %output_channels}
+
+    // The epilogue is a plain `linalg.generic`, not a hand-written
+    // `flow.dispatch.workgroups`, and the `inline` pass at the end of
+    // @__transform_main puts it in the caller. Both halves matter, and only
+    // together: a pre-formed dispatch is opaque to dispatch-region formation,
+    // so nothing downstream can fuse into it, and a `linalg.generic` left
+    // inside a `util.func private` that is never inlined just becomes its own
+    // dispatch anyway (the trap ISSUES.md P6 item 2 records for the
+    // classifier matmul's truncf). Inlined and generic, IREE fuses this add
+    // with the zero-point correction and requantization that follow it in
+    // main_graph -- on MobileNetV2 int8 that is 265 dispatch sites down to
+    // 145. It needs no `stream.affinity`: rocket-pin-unclaimed-dispatches
+    // stamps the CPU default onto every dispatch this spec did not claim,
+    // which is what the explicit @cpu_device annotation here used to be for.
+    %final_empty_outer = tensor.empty(
+        %output_height, %output_width, %output_channels) : tensor<1x?x?x?xi32>
+    %final = linalg.generic {
+        indexing_maps = [
+          affine_map<(d0, d1, d2, d3) -> (d0, d1, d2, d3)>,
+          affine_map<(d0, d1, d2, d3) -> (d0, d1, d2, d3)>,
+          affine_map<(d0, d1, d2, d3) -> (d0, d1, d2, d3)>
+        ],
+        iterator_types = ["parallel", "parallel", "parallel", "parallel"]
+      } ins(%raw_i32, %init : tensor<1x?x?x?xi32>, tensor<1x?x?x?xi32>)
+        outs(%final_empty_outer : tensor<1x?x?x?xi32>) {
+      ^bb0(%raw: i32, %initial: i32, %out: i32):
+        // No extend, unlike the fp16 epilogue: int8_accumulator mode
+        // already hands back a full i32 accumulator.
+        %sum = arith.addi %raw, %initial : i32
+        linalg.yield %sum : i32
+    } -> tensor<1x?x?x?xi32>
+
+    util.return %final : tensor<1x?x?x?xi32>
+  }
+
   // Requantized int8 dense conv. Unlike every other adapter here this one has
   // no CPU epilogue at all: the DPU's BS stage adds the bias, its out-convert
   // stage applies the multiplier and output zero point, and the dispatch
@@ -6657,6 +6779,28 @@ module attributes {transform.with_named_sequence} {
     transform.iree.match.dims_equal %in_ch, [-1] : !transform.param<i64>
     transform.iree.match.dims_equal %depth, [] : !transform.param<i64>
     transform.iree.match.dims_equal %strides, [1, 1] : !transform.param<i64>
+    transform.iree.match.dims_equal %dilations, [1, 1] : !transform.param<i64>
+
+    transform.yield %root : !transform.any_op
+  }
+
+  // The 7x7 stride-2 image stem on the int8-accumulator path. Admission keeps
+  // it to the dense feature path (`Cin` <= 4); the call adds the conv's own
+  // init (a quantized ResNet folds its bias there) back on the CPU.
+  transform.named_sequence @match_dynamic_conv2d_7x7_int8_s2(%root: !transform.any_op {transform.readonly}) -> !transform.any_op {
+    transform.match.operation_name %root ["linalg.conv_2d_nhwc_hwcf"] : !transform.any_op
+    transform.rocket.match.admitted %root {precision = "int8_accumulator"} : !transform.any_op
+    %batch, %out_img, %out_ch, %filter, %in_ch, %depth, %strides, %dilations =
+        transform.iree.match.convolution %root,
+          lhs_type = i8, rhs_type = i8, output_type = i32
+          : !transform.any_op -> !transform.param<i64>
+    transform.iree.match.dims_equal %batch, [1] : !transform.param<i64>
+    transform.iree.match.dims_equal %out_img, [-1, -1] : !transform.param<i64>
+    transform.iree.match.dims_equal %out_ch, [-1] : !transform.param<i64>
+    transform.iree.match.dims_equal %filter, [7, 7] : !transform.param<i64>
+    transform.iree.match.dims_equal %in_ch, [-1] : !transform.param<i64>
+    transform.iree.match.dims_equal %depth, [] : !transform.param<i64>
+    transform.iree.match.dims_equal %strides, [2, 2] : !transform.param<i64>
     transform.iree.match.dims_equal %dilations, [1, 1] : !transform.param<i64>
 
     transform.yield %root : !transform.any_op
@@ -8970,6 +9114,70 @@ module attributes {transform.with_named_sequence} {
     transform.yield %ins, %outs : !transform.any_value, !transform.any_value
   }
 
+  // The 7x7 twin of @match_dynamic_conv2d_3x3_int8_requant_s2: ResNet's stride-2 image stem. Admission
+  // (`conv_ceilings`, kernel 7) keeps it to the dense path, `Cin` <= 4.
+  transform.named_sequence @match_dynamic_conv2d_7x7_int8_requant_s2(
+      %root: !transform.any_op {transform.readonly})
+      -> (!transform.any_value, !transform.any_value) {
+    transform.match.operation_name %root ["linalg.generic"] : !transform.any_op
+    %conv = transform.get_producer_of_operand %root[0]
+        : (!transform.any_op) -> !transform.any_op
+    transform.match.operation_name %conv ["linalg.conv_2d_nhwc_hwcf"] : !transform.any_op
+    transform.rocket.match.admitted %conv {precision = "int8_requant"} : !transform.any_op
+    %batch, %out_img, %out_ch, %filter, %in_ch, %depth, %strides, %dilations =
+        transform.iree.match.convolution %conv,
+          lhs_type = i8, rhs_type = i8, output_type = i32
+          : !transform.any_op -> !transform.param<i64>
+    transform.iree.match.dims_equal %batch, [1] : !transform.param<i64>
+    transform.iree.match.dims_equal %out_img, [-1, -1] : !transform.param<i64>
+    transform.iree.match.dims_equal %out_ch, [-1] : !transform.param<i64>
+    transform.iree.match.dims_equal %filter, [7, 7] : !transform.param<i64>
+    transform.iree.match.dims_equal %in_ch, [-1] : !transform.param<i64>
+    transform.iree.match.dims_equal %depth, [] : !transform.param<i64>
+    transform.iree.match.dims_equal %strides, [2, 2] : !transform.param<i64>
+    transform.iree.match.dims_equal %dilations, [1, 1] : !transform.param<i64>
+
+
+    %ins, %outs = transform.iree.match.cast_compatible_dag_from_root %root {
+      ^bb0(%input: tensor<1x?x?x?xi8>, %weights: tensor<?x?x?x?xi8>,
+           %acc_init: tensor<1x?x?x?xi32>, %bias: tensor<?xi32>,
+           %output_scale: f32, %output_zero_point: i32,
+           %int8_min: f32, %int8_max: f32,
+           %out_init: tensor<1x?x?x?xi8>):
+        %accumulator = linalg.conv_2d_nhwc_hwcf
+            {dilations = dense<1> : tensor<2xi64>, strides = dense<2> : tensor<2xi64>}
+            ins(%input, %weights : tensor<1x?x?x?xi8>, tensor<?x?x?x?xi8>)
+            outs(%acc_init : tensor<1x?x?x?xi32>) -> tensor<1x?x?x?xi32>
+        %quantized = linalg.generic {
+            indexing_maps = [affine_map<(d0, d1, d2, d3) -> (d0, d1, d2, d3)>,
+                             affine_map<(d0, d1, d2, d3) -> (d3)>,
+                             affine_map<(d0, d1, d2, d3) -> ()>,
+                             affine_map<(d0, d1, d2, d3) -> ()>,
+                             affine_map<(d0, d1, d2, d3) -> ()>,
+                             affine_map<(d0, d1, d2, d3) -> ()>,
+                             affine_map<(d0, d1, d2, d3) -> (d0, d1, d2, d3)>],
+            iterator_types = ["parallel", "parallel", "parallel", "parallel"]}
+            ins(%accumulator, %bias, %output_scale, %output_zero_point,
+                %int8_min, %int8_max
+                : tensor<1x?x?x?xi32>, tensor<?xi32>, f32, i32, f32, f32)
+            outs(%out_init : tensor<1x?x?x?xi8>) {
+          ^bb1(%raw: i32, %channel_bias: i32, %scale: f32, %zero_point: i32,
+               %low: f32, %high: f32, %unused: i8):
+            %biased = arith.addi %raw, %channel_bias : i32
+            %real = arith.sitofp %biased : i32 to f32
+            %scaled = arith.mulf %real, %scale : f32
+            %rounded = math.roundeven %scaled : f32
+            %zero_point_f32 = arith.sitofp %zero_point : i32 to f32
+            %offset = arith.addf %rounded, %zero_point_f32 : f32
+            %low_clamped = arith.maximumf %offset, %low : f32
+            %clamped = arith.minimumf %low_clamped, %high : f32
+            %narrowed = arith.fptosi %clamped : f32 to i8
+            linalg.yield %narrowed : i8
+        } -> tensor<1x?x?x?xi8>
+    } : (!transform.any_op) -> (!transform.any_value, !transform.any_value)
+    transform.yield %ins, %outs : !transform.any_value, !transform.any_value
+  }
+
   // The depthwise twin of @match_dynamic_conv2d_int8_requant. Same epilogue,
   // same canonical form, a different convolution op and a rank-3 filter.
   //
@@ -9448,6 +9656,23 @@ module attributes {transform.with_named_sequence} {
     transform.yield
   }
 
+  transform.named_sequence @cast_and_call_dynamic_conv2d_int8_s2(%root: !transform.any_op {transform.readonly}) {
+    %ins = transform.get_operand %root[all] : (!transform.any_op) -> !transform.any_value
+    %out = transform.get_result %root[all] : (!transform.any_op) -> !transform.any_value
+    %module = transform.util.get_nearest_symbol_table %root : (!transform.any_op) -> !transform.any_op
+    %topology_attr = transform.param.constant #hal.device.topology<links = [
+        (@rocket_device -> @cpu_device = {transparent_access = true, unified_memory = true}),
+        (@cpu_device -> @rocket_device = {transparent_access = true, unified_memory = true})
+      ]> -> !transform.any_param
+    transform.annotate %module "stream.topology" = %topology_attr : !transform.any_op, !transform.any_param
+    %executable = transform.util.import_symbol @rocket_dynamic_int8_executable_s2 into %module if undefined : (!transform.any_op) -> !transform.any_op
+    %func = transform.util.import_symbol @call_rocket_dynamic_conv2d_int8_s2 into %module if undefined : (!transform.any_op) -> !transform.any_op
+    transform.util.cast_and_call %func(%ins) -> %out after %root {
+          transform.type_conversion.tensor.cast_shape_dynamic_dims
+      } : (!transform.any_op, !transform.any_value, !transform.any_value, !transform.any_op) -> !transform.any_op
+    transform.yield
+  }
+
   transform.named_sequence @cast_and_call_dynamic_depthwise_conv2d_int8(%root: !transform.any_op {transform.readonly}) {
     %ins = transform.get_operand %root[all] : (!transform.any_op) -> !transform.any_value
     %out = transform.get_result %root[all] : (!transform.any_op) -> !transform.any_value
@@ -9763,6 +9988,7 @@ module attributes {transform.with_named_sequence} {
             @match_dynamic_conv2d_3x3_int8_requant -> @cast_and_call_dynamic_conv2d_int8_requant,
             @match_dynamic_conv2d_int8_requant_s2 -> @cast_and_call_dynamic_conv2d_int8_requant_s2,
             @match_dynamic_conv2d_3x3_int8_requant_s2 -> @cast_and_call_dynamic_conv2d_int8_requant_s2,
+            @match_dynamic_conv2d_7x7_int8_requant_s2 -> @cast_and_call_dynamic_conv2d_int8_requant_s2,
             @match_dynamic_depthwise_conv2d_int8_requant -> @cast_and_call_dynamic_depthwise_conv2d_int8_requant,
             @match_dynamic_depthwise_conv2d_3x3_int8_requant -> @cast_and_call_dynamic_depthwise_conv2d_int8_requant
           : (!transform.any_op) -> (!transform.any_op)
@@ -9868,6 +10094,7 @@ module attributes {transform.with_named_sequence} {
             @match_dynamic_depthwise_conv2d_nchw_3x3_s4 -> @cast_and_call_dynamic_depthwise_conv2d_nchw_s4,
             @match_dynamic_conv2d_int8 -> @cast_and_call_dynamic_conv2d_int8,
             @match_dynamic_conv2d_3x3_int8 -> @cast_and_call_dynamic_conv2d_int8,
+            @match_dynamic_conv2d_7x7_int8_s2 -> @cast_and_call_dynamic_conv2d_int8_s2,
             @match_dynamic_depthwise_conv2d_int8 -> @cast_and_call_dynamic_depthwise_conv2d_int8,
             @match_dynamic_depthwise_conv2d_3x3_int8 -> @cast_and_call_dynamic_depthwise_conv2d_int8,
             @match_dynamic_depthwise_conv2d_int8_s2 -> @cast_and_call_dynamic_depthwise_conv2d_int8_s2,

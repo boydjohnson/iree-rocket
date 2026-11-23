@@ -1904,6 +1904,39 @@ What was settled and how, newest first, in place of the narratives — those are
 in this file's git history (`git log -p ISSUES.md`). Everything cited below is
 something that still exists: a commit, a file, or a memory.
 
+**ResNet's 7x7 stride-2 stem on the NPU at int8 (S2) — 2026-11-23.
+ResNet50-224 int8 150 -> 126 ms, bit-identical.** After the downsample, `perf`
+put ~62% of ResNet50 int8's remaining CPU-worker time in the stem
+(`230x230 Cin 3 -> 64`, 7x7, stride 2). The planner refused every kernel
+above 3x3 at stride 2 for want of a capture. Measured instead
+(`dtype_boundary_probe`, new `ROCKET_DTYPE_SWEEP_PAD`): 30 of 30 exact at
+fp16, requantized int8 and the int8 accumulator, `Cin` 1..=4 and `Cout`
+32..=128 at padding 0, plus `Dense` repeats at fp16 and the accumulator.
+(Requantized int8 fails `Dense` on *every* shape, a 16x16 1x1 included: the
+pattern has no affine form, which is why the int8 suites use
+`SelectorsAffine`. Not a stem result.)
+
+- `conv::stride_two_dense_stem` admits exactly that grid; gate
+  `stem_7x7_stride2_matches_oracle` (18 cases) and a unit test without any
+  probing override.
+- The int8 stem is **not** in the canonical requantized form -- its bias is
+  folded into the convolution's init and its requantization ends in `divf`
+  and `fptoui` -- so it takes a new stride-2 int8-accumulator path
+  (`@match_dynamic_conv2d_7x7_int8_s2`, `#rocket_dynamic_int8_target_s2`),
+  whose call adds the init back on the CPU. A requantized 7x7 stride-2 twin
+  is in for a stem that does arrive canonical.
+- **fp16 is left on the CPU on measurement**: offloaded, ResNet50-224 fp16
+  went 105 -> 115 ms (~16 ms of NPU at 200 MHz against ~11 ms on four A76s),
+  so admission has no fp16 entry at 7x7. Revisit at 600 MHz.
+- `rocket-hal-driver/CMakeLists.txt` did not list `rocket-core`'s sources as
+  dependencies of the driver's cargo step, so a planner change rebuilt
+  nothing and the board kept refusing the plan the compiler now made. Fixed.
+
+ResNet50-224 int8 against `main`, median of 15, ABBA, 200 MHz: 150/151 ->
+125/128 ms on cpu 4-7, 127/129 -> 113/114 ms on all eight; CPU contraction
+sites 1 -> 0; output bit-identical. Full `iree-rocket-hal` gate 409/409;
+plugin lit 43/43.
+
 **int8 downsample at `Cout` 2048 (S2) — 2026-11-23. ResNet50-224 int8 204 ->
 150 ms.** After the stride-2 matchers, ResNet50 int8 was still 70% CPU, and
 `perf` put ~46% of its CPU cycles in one dispatch: layer4's 14x14 `Cin` 1024

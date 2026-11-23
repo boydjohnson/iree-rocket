@@ -215,7 +215,7 @@ off. It is a probe hatch for extending the measurement, not a supported mode.
 |---|---|---|
 | Kernel extent | 1..=11 per axis | Vendor reference data stops at 11 |
 | Automatic CBUF planning | 1x1 and 3x3 only | Anything else needs an explicit `ConvPlan` or a bank override |
-| Stride | 1 and 2 measured at 1x1 and 3x3 | **Stride is 1 everywhere above 3x3** -- the capture sweep has no strided capture at any larger kernel, and `assert_large_kernel_plan_case` enforces it |
+| Stride | 1 and 2 measured at 1x1 and 3x3; 2 at 7x7 on the dense path (`Cin` 1..=4, `Cout` to 128) | **Stride is 1 everywhere above 3x3 except the 7x7 stride-2 image stem** -- the capture sweep has no strided capture at any larger kernel; the stem is hardware-backed instead (`conv::stride_two_dense_stem`, gate `stem_7x7_stride2_matches_oracle`, 2026-11-23), and the planner refuses every other strided large kernel |
 | Batch | 1 | The ABI fixes it; every matcher requires it |
 | Dilation | 1 | No dilation support in the builder at all |
 | Leading padding | 0..=15, and `pad < kernel extent` | The CNA's 4-bit pad fields. There are no *trailing* padding registers; the output extent implies bottom and right |
