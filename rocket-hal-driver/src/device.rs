@@ -291,6 +291,40 @@ fn dump_regset_enabled() -> bool {
     *ENABLED.get_or_init(|| std::env::var("ROCKET_DUMP_REGSET").is_ok_and(|value| value != "0"))
 }
 
+/// Whether to submit every tile as its own single-task job, as this driver
+/// did before ISSUES C4 was retested (`ROCKET_JOB_PER_TILE=1`). For an A/B
+/// against the default of one multi-task job per file, and for bisecting a
+/// failure that might be the kernel's task-to-task transition.
+fn job_per_tile_enabled() -> bool {
+    static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ENABLED.get_or_init(|| std::env::var("ROCKET_JOB_PER_TILE").is_ok_and(|value| value != "0"))
+}
+
+/// Partitions a dispatch's task indices into the jobs to submit: one job per
+/// file, holding that file's tasks in their original order, with files in
+/// order of first appearance. `job_per_tile` gives every task its own job.
+///
+/// Order within a file is the only order that matters: a job's tasks run in
+/// sequence on one core, and a task may read what an earlier one wrote (the
+/// epilogue-add EW task reads the conv tiles' output). Across files nothing
+/// can depend on anything, because a job may only name its own file's BOs.
+fn submit_groups(
+    targets: &[crate::command_buffer::TaskTarget],
+    job_per_tile: bool,
+) -> Vec<Vec<usize>> {
+    if job_per_tile {
+        return (0..targets.len()).map(|task| vec![task]).collect();
+    }
+    let mut groups: Vec<(std::os::fd::RawFd, Vec<usize>)> = Vec::new();
+    for (task, target) in targets.iter().enumerate() {
+        match groups.iter_mut().find(|(fd, _)| *fd == target.fd) {
+            Some((_, tasks)) => tasks.push(task),
+            None => groups.push((target.fd, vec![task])),
+        }
+    }
+    groups.into_iter().map(|(_, tasks)| tasks).collect()
+}
+
 /// Short label for a dispatch's precision, for the diagnostic prints above.
 fn precision_label(precision: Option<iree_rocket_hal::rocket::conv::Precision>) -> &'static str {
     use iree_rocket_hal::rocket::conv::Precision;
@@ -1425,13 +1459,50 @@ status_stub!(queue_dispatch(
 // marginal benefit on these numeric decode paths; not worth the churn.
 #[allow(clippy::chunks_exact_to_as_chunks)]
 mod device_tests {
-    use super::{DEPTHWISE_TO_DENSE_QUIESCENCE, depthwise_to_dense_dwell};
-    use crate::command_buffer::DpuMode;
+    use super::{DEPTHWISE_TO_DENSE_QUIESCENCE, depthwise_to_dense_dwell, submit_groups};
+    use crate::command_buffer::{DpuMode, TaskTarget};
     use iree_rocket_hal::rocket::{
         conv::AccumulatorOutputTile,
         tensor_layout::{compact_atomic_output, compact_tiled_accumulator_output},
     };
     use std::time::{Duration, Instant};
+
+    fn target(fd: i32) -> TaskTarget {
+        TaskTarget {
+            fd,
+            context: fd as usize,
+            in_bo_handles: Vec::new(),
+            out_bo_handles: Vec::new(),
+        }
+    }
+
+    #[test]
+    fn one_job_per_file_keeps_each_files_task_order() {
+        // An unfanned dispatch is one job of every tile, in order.
+        assert_eq!(
+            submit_groups(&[target(3), target(3), target(3)], false),
+            [vec![0, 1, 2]]
+        );
+        // Fanned out round-robin: one job per file, files in first-seen order,
+        // each file's tasks in their original order.
+        let fanned = [
+            target(3),
+            target(7),
+            target(9),
+            target(3),
+            target(7),
+            target(3),
+        ];
+        assert_eq!(
+            submit_groups(&fanned, false),
+            [vec![0, 3, 5], vec![1, 4], vec![2]]
+        );
+        // The A/B escape hatch: every task its own job.
+        assert_eq!(
+            submit_groups(&fanned[..3], true),
+            [vec![0], vec![1], vec![2]]
+        );
+    }
 
     #[test]
     fn dwells_only_for_a_dense_submit_within_the_window_of_a_depthwise_completion() {
@@ -1745,14 +1816,12 @@ unsafe extern "C" fn queue_execute(
                 let execute_timer = crate::profile::start();
                 let mut cursor = 0usize;
                 let result = 'result: {
-                    // Each recorded dispatch is submitted and fenced as its own
-                    // independent hardware job, in call order -- same reasoning
-                    // as one dispatch's own CBUF-height-split task list just
-                    // below (the mainline driver's inter-task IRQ transition
-                    // isn't reliable on RK3588), just at the coarser
-                    // dispatch-to-dispatch granularity. Each dispatch reloads
-                    // its own weights/CBUF state, so no state needs to survive
-                    // between jobs.
+                    // Each recorded dispatch is submitted and fenced on its own,
+                    // in call order: its tiles go in as one multi-task job per
+                    // file (see below), and the next dispatch is not submitted
+                    // until this one's fences have signalled and its output is
+                    // compacted. Each dispatch reloads its own weights/CBUF
+                    // state, so no state needs to survive between them.
                     //
                     // And each is *prepared* in call order too: the next
                     // dispatch's operands are packed only after this one has
@@ -1931,43 +2000,55 @@ unsafe extern "C" fn queue_execute(
                         // (every prior hand-driven test used one dedicated
                         // buffer per binding), so dedupe defensively rather
                         // than assume DRM_ROCKET_SUBMIT tolerates duplicates.
-                        // The mainline driver's IRQ-mediated transition between
-                        // tasks in one drm_rocket_job is not reliable on RK3588:
-                        // task 0 completes correctly, but every later split leaves
-                        // its output rows untouched. Submitting the same regcmds
-                        // as individually fenced jobs is hardware-validated. Each
-                        // split reloads its weights, so no CBUF state must survive
-                        // between jobs.
                         //
-                        // Every task is submitted before any is waited for. On
-                        // one file that keeps the entity's queue non-empty, so
-                        // the core never idles between tiles (MULTICORE.md §9's
-                        // queue-depth effect); across files it is what puts a
-                        // dispatch's tiles on several cores at once. Tiles write
-                        // disjoint output and each reloads its weights, so the
-                        // order they complete in does not matter.
+                        // A dispatch's tiles on one file go in as the tasks of
+                        // ONE drm_rocket_job: the kernel runs them in order on
+                        // one core, kicking each from the previous one's
+                        // completion IRQ, with one scheduler job and one fence
+                        // for the lot. ISSUES C4: this used to be written off
+                        // ("task 0 completes correctly, but every later split
+                        // leaves its output rows untouched"), and is measured
+                        // exact on 7.3.5 -- every conv oracle matrix in one-job
+                        // mode. `ROCKET_JOB_PER_TILE=1` restores one job per
+                        // tile for an A/B. Each tile reloads its weights, so no
+                        // CBUF state has to survive between tasks either way.
+                        //
+                        // Fanned-out tiles live on other files, and a job may
+                        // only name BOs created on its own file, so there is one
+                        // job per file. Every job is submitted before any is
+                        // waited for, which is what puts a fanned-out dispatch's
+                        // tiles on several cores at once.
                         let started = Instant::now();
-                        let mut task_submitted = Vec::with_capacity(task_descriptors.len());
-                        for (((regcmd_addr, regcmd_count), cmd_buf), target) in task_descriptors
-                            .iter()
-                            .copied()
-                            .zip(&cmd_bufs)
-                            .zip(&job.task_targets)
-                        {
-                            let mut in_handles = Vec::with_capacity(1 + target.in_bo_handles.len());
-                            in_handles.push(cmd_buf.handle);
-                            for &h in &target.in_bo_handles {
-                                if !in_handles.contains(&h) {
-                                    in_handles.push(h);
+                        let groups = submit_groups(&job.task_targets, job_per_tile_enabled());
+                        let mut group_submitted = Vec::with_capacity(groups.len());
+                        for group in &groups {
+                            let target = &job.task_targets[group[0]];
+                            let mut in_handles = Vec::with_capacity(group.len() + 4);
+                            let mut out_handles = Vec::with_capacity(1);
+                            for &task in group {
+                                in_handles.push(cmd_bufs[task].handle);
+                            }
+                            for &task in group {
+                                let task_target = &job.task_targets[task];
+                                for &h in &task_target.in_bo_handles {
+                                    if !in_handles.contains(&h) {
+                                        in_handles.push(h);
+                                    }
+                                }
+                                for &h in &task_target.out_bo_handles {
+                                    if !out_handles.contains(&h) {
+                                        out_handles.push(h);
+                                    }
                                 }
                             }
+                            let tasks: Vec<(u32, u32)> =
+                                group.iter().map(|&task| task_descriptors[task]).collect();
                             let submit_timer = crate::profile::start();
-                            if rocket_device::submit(
+                            if rocket_device::submit_tasks(
                                 target.fd,
-                                regcmd_addr,
-                                regcmd_count,
+                                &tasks,
                                 &in_handles,
-                                &target.out_bo_handles,
+                                &out_handles,
                             )
                             .is_err()
                             {
@@ -1975,7 +2056,7 @@ unsafe extern "C" fn queue_execute(
                                     iree_status_code_e_IREE_STATUS_UNAVAILABLE,
                                 );
                             }
-                            task_submitted.push(Instant::now());
+                            group_submitted.push((target.fd, target.context, out_handles, Instant::now()));
                             crate::profile::stop(
                                 submit_timer,
                                 crate::profile::Phase::Submit,
@@ -1986,13 +2067,13 @@ unsafe extern "C" fn queue_execute(
 
                         // PREP_BO waits on DMA_RESV_USAGE_WRITE fences for the
                         // specific output handle, on the file that owns it. Each
-                        // task's interval from its submit to its wait returning
+                        // job's interval from its submit to its wait returning
                         // is what the profile's overlap line is built from.
                         let wait_timer = crate::profile::start();
-                        for (target, submitted) in job.task_targets.iter().zip(&task_submitted) {
-                            for &out_handle in &target.out_bo_handles {
+                        for (fd, context, out_handles, submitted) in &group_submitted {
+                            for &out_handle in out_handles {
                                 if rocket_device::prep_bo(
-                                    target.fd,
+                                    *fd,
                                     out_handle,
                                     DISPATCH_COMPLETION_TIMEOUT_NS,
                                 )
@@ -2003,7 +2084,7 @@ unsafe extern "C" fn queue_execute(
                                     );
                                 }
                             }
-                            crate::profile::record_wait(target.context, *submitted, Instant::now());
+                            crate::profile::record_wait(*context, *submitted, Instant::now());
                         }
                         crate::profile::stop(
                             wait_timer,
@@ -2026,7 +2107,7 @@ unsafe extern "C" fn queue_execute(
                             if dispatch_times_enabled() {
                                 eprintln!(
                                     "rocket: dispatch {:.2} ms  ctx={} task_ctx={:?} prec={} mode={:?} \
-                                     tasks={} prog={:#018x} regcmd_iova={:?} in={:?} out={:?}",
+                                     tasks={} jobs={} prog={:#018x} regcmd_iova={:?} in={:?} out={:?}",
                                     elapsed.as_secs_f64() * 1e3,
                                     ctx.id,
                                     job.task_targets
@@ -2036,6 +2117,7 @@ unsafe extern "C" fn queue_execute(
                                     precision_label(job.precision_tag),
                                     job.dpu_mode,
                                     regcmd_tasks.len(),
+                                    groups.len(),
                                     program_hash(regcmd_tasks),
                                     cmd_bufs
                                         .iter()

@@ -924,10 +924,12 @@ fn int4_override(precision: Precision, name: &str) -> Option<u32> {
 /// Cout 16 still requires 7 on the accumulator path, where `Cout/8 - 1` would
 /// be 1 and 1 writes 512 of 131072 bytes. Every earlier measurement used Cout
 /// 64, where `Cout/8 - 1` is also 7, so the two readings had never been
-/// separated. The accumulator
-/// truncation in [`MAX_ACCUMULATOR_COEFFICIENT_BYTES_PER_CHANNEL`] is still
-/// unexplained, and this is one more register eliminated: with `size_e` inert
-/// and `surf_add` swept, the output-side register archaeology is exhausted.
+/// separated. This sweep was hunting an accumulator truncation then blamed
+/// on a per-channel coefficient limit; ISSUES.md C1 (resolved 2026-09-03)
+/// later explained it as the wrong DPU writer (`mc_surf_out = 1`) plus a
+/// readback modelling the wrong cube, with no coefficient limit at all. The
+/// constant that encoded the limit is gone. What this sweep still shows is
+/// that `size_e` is inert on this path.
 fn bs_ow_size_e_override(in_channels: u32) -> Option<u32> {
     let min_channels: u32 = std::env::var("ROCKET_ACC_SIZE_E_MIN_CIN")
         .ok()

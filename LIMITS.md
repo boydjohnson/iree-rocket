@@ -5,7 +5,7 @@ the extent of an actual measurement -- a vendor capture, a hardware sweep on
 an RK3588, or both -- not the extent of what the register encodings could
 express. The register fields are almost always wider: `CNA_WEIGHT_SIZE2.weight_kernels`
 is 14 bits and could hold 16383 output channels, and the constant that governs
-it sits at 3584 because that is where the evidence -- and the shape of a real
+it sits at 4096 because that is where the evidence -- and the shape of a real
 model -- stops. Raise a limit with a measurement, never ahead of one.
 
 Read this alongside [ISSUES.md](ISSUES.md), which carries the open defects.
@@ -36,7 +36,7 @@ each other. Whichever is tightest for a given shape is the one that decides.
 The admission ceilings are deliberately *at or below* the HAL bounds. Where
 they differ it is because the HAL constant governs one rule and something else
 binds first: at a 3x3 kernel admission stops `Cin` at 1152 even though
-`MAX_INT8_INPUT_CHANNELS` is 3584, because `ConvPlan` refuses `Cin >= 1216` at
+`MAX_INT8_INPUT_CHANNELS` is 4096, because `ConvPlan` refuses `Cin >= 1216` at
 k=3 outright (the coefficient working set exceeds the eleven grantable CBUF
 banks). The channel ceilings are a k=1 measurement and only the k=1 rows follow
 them up.
@@ -269,9 +269,9 @@ timeouts**, under both the `Selectors` and `Counting` oracle patterns:
 
 | Dimension | Tested range | Bound by |
 |---|---|---|
-| `M` (conv width at height one) | 1..=2047, measured end to end at 2047 by `tools/e2e_matmul_regression.py` (exact) as well as in the compiled matcher; 1..=296 measured in the HAL | `CNA_DATA_SIZE0.datain_width` is 11 bits. The vendor FC sweep covers 1, 2, 7, 16, 32 (three CBUF splits); above the row-width limit above the planner splits column tiles -- see below |
-| `K` (conv `Cin`) | 1..=3584 | `MAX_INPUT_CHANNELS`; measured 512, 1024, 1344, 1792, 2048, and 2304..4096 in 2026-09-06's sweep |
-| `N` (conv `Cout`) | 1..=3584 | `MAX_OUTPUT_CHANNELS`; measured 64, 512, 1001, 1792, 2048, and 2304..4096 |
+| `M` (conv width at height one) | 1..=4096, measured end to end at 4096 by `tools/e2e_matmul_regression.py`'s `matmul_m_4096` (exact); 2047..8192 at fp16 and 4096 at every other rung in the HAL | `MAX_ADMITTED_MATMUL_M`. `CNA_DATA_SIZE0.datain_width` is 11 bits, so one *tile* stops at 2047 and the planner column-tiles a wider `M`. The vendor FC sweep covers 1, 2, 7, 16, 32 (three CBUF splits) -- see below |
+| `K` (conv `Cin`) | 1..=4096 | `MAX_INPUT_CHANNELS`; measured 512, 1024, 1344, 1792, 2048, and 2304..4096 in 2026-09-06's sweep, and end to end by `matmul_k_n_4096` |
+| `N` (conv `Cout`) | 1..=4096 | `MAX_OUTPUT_CHANNELS`; measured 64, 512, 1001, 1792, 2048, and 2304..4096 |
 
 MobileNetV2's classifier, `M=1 K=1792 N=1001`, is exact under both patterns and
 again with the fp32 accumulator kept. `K = 1792` is why `MAX_INPUT_CHANNELS` was
@@ -437,21 +437,21 @@ narrowed to f16 for the Conv2D ABI's bias binding.
 
 | Op | Layout | Types | Kernel | Stride | `Cin` | `Cout` |
 |---|---|---|---|---|---|---|
-| conv | NHWC HWCF | f16/f16/f32 | 1x1 | 1 | 1..=3584 | 1..=3584 |
-| conv | NHWC HWCF | f16/f16/f32 | 3x3 | 1 | 1..=1152 | 1..=1792 |
-| conv | NHWC HWCF | f16/f16/f32 | 1x1, 3x3 | 2 | 1..=512 | 1..=512 |
-| conv + ReLU6 | NHWC HWCF | f16/f16/f32 | 1x1 | 1 | 1..=3584 | 1..=3584 |
-| conv + pad 1 | NHWC HWCF | f16/f16/f32 | 3x3 | 1 | 1..=1152 | 1..=3584 |
-| conv + pad 1 | NHWC HWCF | f16/f16/f32 | 3x3 | 2 | 1..=512 | 1..=3584 |
-| conv + ReLU6 | NHWC HWCF | f16/f16/f32 | 3x3 | 1 | 1..=1152 | 1..=3584 |
-| conv | NHWC HWCF | i8/i8/i32 | 1x1 | 1 | 1..=3584 | 1..=3584 |
+| conv | NHWC HWCF | f16/f16/f32 | 1x1 | 1 | 1..=4096 | 1..=4096 |
+| conv | NHWC HWCF | f16/f16/f32 | 3x3 | 1 | 1..=1152 | 1..=4096 |
+| conv | NHWC HWCF | f16/f16/f32 | 1x1 | 2 | 1..=4096 | 1..=4096 |
+| conv | NHWC HWCF | f16/f16/f32 | 3x3 | 2 | 1..=1152 | 1..=4096 |
+| conv + ReLU6 | NHWC HWCF | f16/f16/f32 | 1x1 | 1 | 1..=4096 | 1..=4096 |
+| conv + pad 1 | NHWC HWCF | f16/f16/f32 | 3x3 | 1, 2 | 1..=1152 | 1..=4096 |
+| conv + ReLU6 | NHWC HWCF | f16/f16/f32 | 3x3 | 1 | 1..=1152 | 1..=4096 |
+| conv | NHWC HWCF | i8/i8/i32 | 1x1 | 1 | 1..=4096 | 1..=4096 |
 | conv | NHWC HWCF | i8/i8/i32 | 3x3 | 1 | 1..=1152 | 1..=512 |
-| depthwise | NHWC HWC | f16/f16/f32 | 1x1, 3x3 | 1 | 1..=512 | = `Cin` |
-| depthwise | NCHW CHW | f16/f16/f32 | 1x1, 3x3 | 1, 2, 3, 4 | 1..=512 | = `Cin` |
+| depthwise | NHWC HWC | f16/f16/f32 | 1x1, 3x3 | 1 | 1..=1536 | = `Cin` |
+| depthwise | NCHW CHW | f16/f16/f32 | 1x1, 3x3 | 1, 2, 3, 4 | 1..=1536 | = `Cin` |
 | depthwise | NHWC HWC | i8/i8/i32 | 1x1, 3x3 | 1, 2 | 1..=1344 | = `Cin` |
-| matmul | -- | f16/f16/f32 | -- | -- | `M` 1..=2047, `K` 1..=3584 | `N` 1..=3584 |
-| matvec | -- | f16/f16/f32 | -- | -- | `M` 1..=2047, `K` 1..=3584 | `N` = 1 |
-| vecmat | -- | f16/f16/f32 | -- | -- | `M` = 1, `K` 1..=3584 | `N` 1..=3584 |
+| matmul | -- | f16/f16/f32 | -- | -- | `M` 1..=4096, `K` 1..=4096 | `N` 1..=4096 |
+| matvec | -- | f16/f16/f32 | -- | -- | `M` 1..=4096, `K` 1..=4096 | `N` = 1 |
+| vecmat | -- | f16/f16/f32 | -- | -- | `M` = 1, `K` 1..=4096 | `N` 1..=4096 |
 | avg pool | NCHW sum | f32 | 2x2..=8x8 | 1 | H/W/C 1..=8192 | -- |
 | avg pool | NHWC sum | f32 | 2x2..=8x8 | 1 | H/W/C 1..=8192 | -- |
 | max pool | NHWC | f32 | 2x2..=8x8 | 1, 2 | H/W/C 1..=8192 | -- |
@@ -459,6 +459,14 @@ narrowed to f16 for the Conv2D ABI's bias binding.
 | min pool | NHWC | f32 | 2x2..=8x8 | 1, 2 | H/W/C 1..=8192 | -- |
 
 All of these additionally require batch 1 and dilation 1.
+
+The conv and matmul channel columns are `rocket-core/src/admission.rs`
+(`conv_ceilings`, `MAX_ADMITTED_MATMUL_M`), which every one of those matchers
+consults through `transform.rocket.match.admitted`; if this table and that
+function disagree, the function is right. The i8 rows are the accumulator
+path. A convolution lowered to the requantized int8 path (`precision = int8`)
+admits less: 1x1 at `Cin` 1344 / `Cout` 1792, 3x3 at 768 / 768, depthwise at
+1344, with `Cout` a whole 16-channel atom.
 
 All three matmul rows have an end-to-end differential behind them:
 `tools/e2e_matmul_regression.py`, eight cases, all passing on `planck`
@@ -611,13 +619,17 @@ cause -- `brdma_data_use` left set on the int32-accumulator path -- fixed
 2. Raise the HAL constant and record the evidence in its doc comment -- date,
    board, probe, and the points measured. Every constant in `conv.rs` carries
    its own provenance; that is what makes a later raise reviewable.
-3. Raise the matcher bound in the transform spec, and move the paired
-   accepted/rejected shapes in the corresponding `*_match_boundaries.mlir`.
+3. Raise the admission ceiling -- `conv_ceilings` or `MAX_ADMITTED_MATMUL_M`
+   in `rocket-core/src/admission.rs` for a convolution or matmul, the
+   `dim_bounds` line in the transform spec for a pooling or element-wise
+   matcher -- and move the paired accepted/rejected shapes in the
+   corresponding `*_match_boundaries.mlir`.
 4. Add the shape to `tools/e2e_conv_regression.py` if it is a shape a real
    model reaches.
 
 Set the constant at what a real model needs and the corpus reaches, not at the
-furthest point that happened to pass. The dense channel ceilings sit at 3584
-where 4096 also measured clean at every rung and 8192 did at fp16 k=1,
-deliberately -- 3584 is a rung above the widest transformer shape in the
-corpus.
+furthest point that happened to pass. The dense channel ceilings and matmul
+`M` sit at 4096 where 8192 also measured clean at fp16 k=1, deliberately --
+4096 is the widest extent measured at *every* rung, and it is what ViT-L's
+1024 -> 4096 MLP needs. They moved from 3584 on 2026-09-09; see
+[Convolution channel limits](#convolution-channel-limits).

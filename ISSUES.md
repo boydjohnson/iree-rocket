@@ -44,51 +44,6 @@ live in P8.
 
 ---
 
-## C4 (S3, blocks P4) — multi-task jobs were written off on evidence that contradicts source-confirmed mainline behaviour
-
-`rocket-hal-driver/src/device.rs:1563` [verified]:
-
-> The mainline driver's IRQ-mediated transition between tasks in one
-> `drm_rocket_job` is not reliable on RK3588: task 0 completes correctly, but
-> every later split leaves its output rows untouched.
-
-So every tile of every dispatch is submitted as its own single-task job with its
-own blocking `PREP_BO`.
-
-`encodings/cbuf-reuse.md` reads the same driver the other way [notes,
-source-confirmed against v7.1, which is the kernel on `planck`]:
-
-> Mainline `rocket` gives that for nothing: `rocket_job_handle_irq()` programs
-> the next task of the **same** job and only signals the done fence once
-> `next_task_idx` reaches `task_count`, so `core->in_flight_job` holds the core
-> for the whole sequence.
-
-and `encodings/regcmd-task-model.md` classifies gapped multi-task jobs as
-**safe for all dtypes** (N kicks, N IRQs, one fence), reserving the integer
-breakage for *contiguous chaining* (one kick), where the int32 CACC clears per
-kick rather than per task.
-
-Two candidate confounds for the repo's observation, and I ruled out the first:
-
-- **The `rocket_batch_submit` kernel param.** The notes warn it is global, and
-  that with it on, a *gapped* multi-task job mismatches the kernel and task 0
-  streams into the gap — which is the repo's exact symptom. Not it:
-  `/sys/module/rocket/` on `planck` exposes no `parameters/` directory at all
-  [verified].
-- **Incomplete per-task regcmd.** The notes' delta-regcmd probe produces
-  precisely "task 0 correct, later tasks leave output untouched", caused by a
-  task writing an incomplete ping-pong producer group. This repo emits a full
-  self-contained program per tile with `S_POINTER = 0xE`
-  (`conv.rs:3563`) [verified], so it should not be this — but the two failure
-  descriptions match well enough that it is worth re-deriving rather than
-  assuming.
-
-Worth retesting, because it gates P4 (the CBUF reuse bits require an
-uninterrupted job) and it removes one submit ioctl + one blocking fence wait per
-tile.
-
----
-
 ## C6 (S4) — `DPU_BS_OW_OP` is always zero, including depthwise
 
 `conv.rs:3838` [verified]: `commands.push(zero::<DpuBsOwOp>())`, unconditionally.
@@ -118,8 +73,10 @@ backing. Two reasons to keep it on the list anyway:
 `grep -r` over `.rs`/`.sh`/`.py`, excluding `target/` [verified]. Present:
 `ROCKET_PROBE_ONLY`, `ROCKET_PROBE_RESUME_AT`, `run_hardware_case_matrix`,
 `ROCKET_DUMP_PRECISION`, `accumulator_written_lanes_probe`,
-`accumulator_written_region_map`, `accumulator_per_channel_threshold_probe`,
-`MAX_ACCUMULATOR_COEFFICIENT_BYTES_PER_CHANNEL`.
+`accumulator_written_region_map`, `accumulator_per_channel_threshold_probe`.
+(`MAX_ACCUMULATOR_COEFFICIENT_BYTES_PER_CHANNEL` was on this list; it has
+since been removed with the coefficient limit C1 retracted, and only a stale
+doc link in `iree-rocket-hal/src/rocket/conv.rs` names it.)
 
 Also present, and I initially got this wrong: **`ROCKET_PAD_INPUT` / `_WEIGHTS` /
 `_BIAS` and `ROCKET_POISON_*` do exist.** They are built with
@@ -134,10 +91,13 @@ Genuinely absent:
 | `accumulator_truncation_anatomy` | no |
 | `ROCKET_ANATOMY_SHAPES` / `_REPEATS` / `_PRECISION` / `_BANKS` / `_CANARY` | no |
 | `ROCKET_TILE_LIMIT` | no |
-| `ROCKET_PAD_OUTPUT` | added during C1 |
+| `ROCKET_PAD_OUTPUT` | yes, added during C1 |
 | `ROCKET_IOVA_LEDGER` | no |
-| `DISPATCH_TIMEOUT_FLOOR`, `HUNG_JOB_DISPATCH_FLOOR` | no |
+| `DISPATCH_TIMEOUT_FLOOR`, `HUNG_JOB_DISPATCH_FLOOR` | yes, rebuilt in 0dbbaae ("Tell a watchdog-killed NPU job apart from a shape result"): `iree-rocket-hal/tests/support/dispatch.rs` and `rocket-hal-driver/src/device.rs` |
 | `tools/npu_hang_survey.sh` | no |
+
+Re-checked 2026-11-23 with the same `grep`: the rows marked "no" are still
+absent.
 
 The measurements those tools produced are recorded in detail and are probably
 sound — the C1 work reproduced the `accumulator-per-channel-coefficient-limit`
@@ -145,8 +105,9 @@ numbers exactly (6144 + 512 written bytes at `@0` and `@229376`, 63884
 mismatches), which is good evidence the vanished harness was faithful. The tools
 themselves were built in a working tree that was never committed. The cost is
 that the memories instruct a future session to reproduce findings with
-instruments that are not there, and one of them (C3) is a correctness guard the
-memory believes is protecting production.
+instruments that are not there. The one that mattered most, C3's hung-job
+guard in production, has since been rebuilt, so what is still missing is
+diagnostics only.
 
 Either recommit them or amend the memories to say they were lost. I have amended
 the memories that made load-bearing claims.
@@ -701,7 +662,8 @@ and argues the wait drop is itself the proof the bit is honored.
 Three preconditions, all of which this repo would have to arrange:
 
 - The run of tiles must be **one uninterrupted job**, so the operand is still
-  resident. Blocked by C4 today.
+  resident. Since C4 (resolved 2026-11-23) a dispatch's tiles on one file
+  are one job, so this holds by default.
 - Only **one** bit can pay at a time (a 1-D task order makes only one operand
   identical to the previous task); pick by reuse depth.
 - The tile loop must be ordered so the shared operand is adjacent.
@@ -1437,11 +1399,15 @@ The bound therefore ships at `Cin` 816: the widest the model is measured
 correct at, well below everything the isolated tests support. `Cout` was
 raised 768 -> 1792 in the same session and is clean on the model.
 
-**Do not raise `Cin` past 816 on isolated evidence.** This issue exists
+~~**Do not raise `Cin` past 816 on isolated evidence.** This issue exists
 because isolated evidence said 1792 and the model said 816. The next step is
 an instrument that can see *which* dispatch first diverges inside a real
 model -- comparing intermediate tensors, not logits -- because every
-shape-level instrument this repo has already says the shape is fine.
+shape-level instrument this repo has already says the shape is fine.~~
+Superseded by C13 (Resolved): the divergence was a chained dispatch packed
+before its producer ran, not the shape, and the requantized int8 1x1 bound is
+1344 now (`rocket-core/src/admission.rs`). The intermediate-tensor
+instrument is still worth having; it is open question 3.4.2.
 
 ### The ranked levers this leaves
 
@@ -2025,6 +1991,41 @@ What was settled and how, newest first, in place of the narratives — those are
 in this file's git history (`git log -p ISSUES.md`). Everything cited below is
 something that still exists: a commit, a file, or a memory.
 
+**C4 (S3) — 2026-11-23. Multi-task jobs work; the driver now uses them.**
+`device.rs` had written them off ("task 0 completes correctly, but every later
+split leaves its output rows untouched") and gave every tile its own job, while
+the notes read the mainline source as handling them correctly. Measured on
+`planck`'s board re-flashed to Armbian `7.3.5-edge-rockchip64` (`ssh orangepi`;
+`rocket` is Armbian's RK3576 series plus the unconditional PPU patch):
+`conv2d_oracle_hw::multi_task_job_matches_oracle` runs the 58 multi-program
+cases of the gated matrices (fp16, fp16→fp32, bf16, int16, tf32, requantized
+int8, int8 accumulator; up to 64 tasks, CBUF splits 1/11 to 11/1) each as ONE
+job, exact six times back to back. `ROCKET_SUBMIT=one-job` puts all 20
+hardware tests / 812 cases in that file through the same path, all exact.
+
+`queue_execute` now submits a dispatch's tiles as one multi-task job per file
+(`submit_groups`; fanned-out tiles live on other files, so one job each).
+Wide ResNet50: 233 tasks → 54 jobs. Every model output is bit-identical to
+`ROCKET_JOB_PER_TILE=1`, the per-tile A/B switch that was kept: MobileNetV2
+fp16/int8, ResNet50-224 fp16/int8 and Wide ResNet50 fp16, plus MobileNetV2
+and Wide ResNet50 at `ROCKET_NPU_CORES=3`. MobileNetV2 fp16 also matches the
+September survey's NPU output exactly. Median ms, ABBA, NPU at 200 MHz,
+`ondemand`:
+
+| model | per tile | one job per file |
+|---|---|---|
+| ResNet50-224 fp16 | 158, 170 | 151, 151 |
+| Wide ResNet50 fp16 | 462, 465 | 446, 426 |
+| MobileNetV2 fp16 | 107, 99.8 | 104, 110 |
+| MobileNetV2 int8 | 85.6, 86.2 | 89.3, 85.7 |
+
+About 6-8% on the ResNets, noise on MobileNetV2 (few multi-tile dispatches).
+Why v7.1 failed cannot be re-checked, since that kernel is gone from the board.
+This kernel's completion path differs (Armbian's series takes the completion
+writes under `job_lock`), and an incomplete per-task regcmd would also explain
+it. Int4 has no multi-tile case in the gate. Unblocks P4's reuse bits, which
+need an uninterrupted job.
+
 **M2 (S3) — 2026-09-09. The NPU ran at 200 MHz; it now runs at 600, and the
 lever was a driver patch that was already built.** `scmi_clk_npu` boots pinned
 at 200 MHz (the vendor's idle `POWER_DOWN_FREQ`) because mainline `rocket` has
@@ -2428,7 +2429,7 @@ Rank work against that, not against the default-topology rows.
    anything about depthwise. `ROCKET_DEMOTE_DEPTHWISE=1` keeps the arm one
    compiler build away. Revisit when the offload is competitive at four
    workers.
-5. **C4 → P4 → P1** — the rest of the dispatch-path stack, in increasing
+5. **P4 → P1** — the rest of the dispatch-path stack, in increasing
    order of work.
 6. **C16 → C11** — the int8 hung-job pair, most-characterized first. C16
    (2026-09-10) names the hanging dispatch for ResNet50 int8 -- both pooling

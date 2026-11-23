@@ -6469,8 +6469,12 @@ module attributes {transform.with_named_sequence} {
   //
   // The dense int8 Cin bounds were 352 (1x1) and 32 (3x3), containment for a
   // silent near-all-zero result first measured on 2026-08-31. **That cause is
-  // found and fixed (2026-09-03), and both bounds are now the HAL's own
-  // `MAX_INT8_INPUT_CHANNELS` of 512.**
+  // found and fixed (2026-09-03)**, and both bounds became the HAL's own
+  // `MAX_INT8_INPUT_CHANNELS`, 512 at the time. The channel numbers in this
+  // block's prose are that day's: since 2026-09-09 the ceilings live in
+  // `rocket-core/src/admission.rs` (`conv_ceilings`), and for the
+  // accumulator path they are 1x1 Cin/Cout 4096, 3x3 Cin 1152 / Cout 512 and
+  // depthwise 1344.
   //
   // The cause was never ConvPlan's int8 modelling, which is why every
   // candidate ruled out at the time -- coefficient stream order, the CBUF
@@ -6496,8 +6500,9 @@ module attributes {transform.with_named_sequence} {
   // output extent with a 3x3 kernel, which used to be refused outright.
   // There is no coefficient-per-channel ceiling left to contain.
   //
-  // 512 is the ceiling because `MAX_INT8_INPUT_CHANNELS` is 512 -- above it
-  // the *channel padding* rules are unmeasured, and separately ConvPlan's
+  // 512 was the ceiling then because `MAX_INT8_INPUT_CHANNELS` was 512 (it is
+  // 4096 now, with the measurements in its doc comment) -- above it
+  // the *channel padding* rules were unmeasured, and separately ConvPlan's
   // CBUF split is known to diverge from vendor captures for dense shapes
   // above Cin 384. Both are questions about planning, not about this writer.
   // Raising past 512 needs that split's sawtooth reset rule; see

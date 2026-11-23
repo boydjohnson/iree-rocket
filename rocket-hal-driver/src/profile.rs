@@ -597,10 +597,10 @@ pub fn report() {
     rows.sort_by(|a, b| b.1.total_cmp(&a.1));
     for (label, total_ms) in rows {
         let stats = &registry.ops[label];
-        // Dispatches, not hardware jobs: one dispatch whose CBUF split makes
-        // it several individually fenced jobs pays `Record` once and `Submit`
-        // /`Wait` per split, so the max across phases would report a
-        // six-task stem convolution as six dispatches.
+        // Dispatches, not hardware jobs: one dispatch pays `Record` once and
+        // `Submit`/`Wait` once per job -- one per file it fans out to, or one
+        // per tile under `ROCKET_JOB_PER_TILE=1` -- so the max across phases
+        // would over-count a multi-tile dispatch.
         let calls = stats[Phase::Record as usize].calls;
         let mut line = format!(
             "  {:<44} {:>5} {:>9.3}",

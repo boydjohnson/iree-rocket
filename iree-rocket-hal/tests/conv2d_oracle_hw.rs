@@ -365,6 +365,45 @@ fn explicit_cbuf_split() -> Option<(u32, u32)> {
     ))
 }
 
+/// How a case's tile programs reach the kernel.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum SubmitShape {
+    /// One single-task `drm_rocket_job` per program, all in one SUBMIT --
+    /// the shape every matrix in this file has always used, and close to
+    /// what `rocket-hal-driver`'s `queue_execute` does (it also gives each
+    /// tile its own job, though in separate SUBMITs).
+    JobPerTile,
+    /// Every program as a task of one `drm_rocket_job`. ISSUES C4: the
+    /// driver wrote this off ("task 0 completes correctly, but every later
+    /// split leaves its output rows untouched"), and the notes read the
+    /// mainline source as handling it correctly.
+    OneJob,
+}
+
+thread_local! {
+    /// Set by a test that is *about* the submit shape, so it does not depend
+    /// on the environment. `run_hardware_case_matrix` runs every case on the
+    /// calling thread, so a thread-local reaches all of them.
+    static SUBMIT_SHAPE_OVERRIDE: std::cell::Cell<Option<SubmitShape>> =
+        const { std::cell::Cell::new(None) };
+}
+
+/// The test's override, else `ROCKET_SUBMIT=one-job|job-per-tile` (default
+/// `job-per-tile`), so any existing matrix can be re-run as multi-task jobs.
+fn submit_shape() -> SubmitShape {
+    if let Some(shape) = SUBMIT_SHAPE_OVERRIDE.with(std::cell::Cell::get) {
+        return shape;
+    }
+    match std::env::var("ROCKET_SUBMIT").as_deref() {
+        Err(_) | Ok("job-per-tile") => SubmitShape::JobPerTile,
+        Ok("one-job") => SubmitShape::OneJob,
+        Ok(other) => panic!("ROCKET_SUBMIT={other}: expected one-job or job-per-tile"),
+    }
+}
+
+/// One job's `(regcmd_dma_address, regcmd_count)` tasks.
+type JobTasks = Vec<(u32, u32)>;
+
 fn execute_case_output_with_plan(
     file: &std::fs::File,
     fixture: &Conv2dFixture,
@@ -426,22 +465,38 @@ fn execute_case_output_with_plan(
                 .map_err(|error| format!("sync regcmd BO: {error}"))?;
         }
 
-        let tasks = command_buffers
-            .iter()
-            .map(|(buffer, count)| [(buffer.buffer.dma_address, *count)])
-            .collect::<Vec<_>>();
-        let input_handles = command_buffers
-            .iter()
-            .map(|(buffer, _)| {
-                [
-                    buffer.buffer.handle,
-                    input.buffer.handle,
-                    weights.buffer.handle,
-                    bias.buffer.handle,
-                ]
-            })
-            .collect::<Vec<_>>();
+        let data_handles = [
+            input.buffer.handle,
+            weights.buffer.handle,
+            bias.buffer.handle,
+        ];
         let output_handles = [output.buffer.handle];
+        // `JobPerTile`: one single-task job per program, all in one SUBMIT.
+        // `OneJob`: every program as a task of a single job, which the
+        // kernel runs in order on one core, kicking each next task from the
+        // previous one's completion interrupt (ISSUES C4).
+        let (tasks, input_handles): (Vec<JobTasks>, Vec<Vec<u32>>) = match submit_shape() {
+            SubmitShape::JobPerTile => command_buffers
+                .iter()
+                .map(|(buffer, count)| {
+                    let mut handles = vec![buffer.buffer.handle];
+                    handles.extend(data_handles);
+                    (vec![(buffer.buffer.dma_address, *count)], handles)
+                })
+                .unzip(),
+            SubmitShape::OneJob => {
+                let mut handles: Vec<u32> = command_buffers
+                    .iter()
+                    .map(|(buffer, _)| buffer.buffer.handle)
+                    .collect();
+                handles.extend(data_handles);
+                let tasks = command_buffers
+                    .iter()
+                    .map(|(buffer, count)| (buffer.buffer.dma_address, *count))
+                    .collect();
+                (vec![tasks], vec![handles])
+            }
+        };
         let jobs = tasks
             .iter()
             .zip(&input_handles)
@@ -1650,6 +1705,9 @@ fn run_hardware_case_matrix(title: &str, cases: Vec<Conv2dCase>) {
     let mut skipped = 0usize;
 
     println!("\n=== {title} ===");
+    if submit_shape() == SubmitShape::OneJob {
+        println!("  every case's tiles submitted as the tasks of ONE job");
+    }
     match only {
         Some(index) => println!("  running index {index} of {total_cases} on its own"),
         None if resume != 0 => println!("  resuming at index {resume} of {total_cases}"),
@@ -3570,6 +3628,93 @@ fn dense_geometry_regression_matches_oracle() {
     run_hardware_case_matrix(
         "dense fp16 stride/window-parity and sub-atom Cin geometries",
         dense_geometry_regression_cases(),
+    );
+}
+
+/// How many register programs -- tasks, if submitted as one job -- a case's
+/// default plan emits.
+fn program_count(case: Conv2dCase) -> usize {
+    let shape = case.shape();
+    let plan = ConvPlan::new(shape, case.kernel);
+    let buffers = Buffers {
+        input: 0,
+        weights: 0,
+        bias: 0,
+        output: 0,
+    };
+    if shape.precision.writes_accumulators() {
+        plan.programs_with_staged_accumulator_output(buffers)
+            .programs
+            .len()
+    } else {
+        plan.programs_with_buffers(buffers).len()
+    }
+}
+
+/// Every case from the gated regression matrices whose plan needs more than
+/// one program, across every precision those matrices cover. These are the
+/// shapes ISSUES C4's claim is about: "task 0 completes correctly, but every
+/// later split leaves its output rows untouched" is only observable with a
+/// second task.
+fn multi_task_job_cases() -> Vec<Conv2dCase> {
+    dense_geometry_regression_cases()
+        .into_iter()
+        .chain(cbuf_residency_boundary_cases())
+        .chain(fc_matmul_geometry_cases())
+        .chain(int8_large_kernel_regression_cases())
+        .chain(int8_accumulator_regression_cases())
+        .chain(fp16_accumulator_regression_cases())
+        .chain(bf16_regression_cases())
+        .chain(int16_regression_cases())
+        .chain(int4_regression_cases())
+        .chain(tf32_regression_cases())
+        .filter(|case| program_count(*case) >= 2)
+        .collect()
+}
+
+#[test]
+fn multi_task_job_cases_cover_every_precision() {
+    let cases = multi_task_job_cases();
+    let mut by_precision: BTreeMap<&str, (usize, usize)> = BTreeMap::new();
+    for case in &cases {
+        let entry = by_precision.entry(case.precision.name()).or_default();
+        entry.0 += 1;
+        entry.1 = entry.1.max(program_count(*case));
+    }
+    println!(
+        "{} multi-task cases: {by_precision:?} (count, most tasks)",
+        cases.len()
+    );
+    // No int4: even its 112x112 ladder rung fits one program, so the gated
+    // int4 matrix has no multi-tile case to borrow.
+    for precision in [
+        "fp16",
+        "fp16-f32out",
+        "int8",
+        "int8-accumulator",
+        "bf16",
+        "int16",
+        "tf32",
+    ] {
+        assert!(
+            by_precision.contains_key(precision),
+            "no multi-task case at {precision}: {by_precision:?}"
+        );
+    }
+}
+
+/// ISSUES C4: does the mainline IRQ-mediated transition between the tasks of
+/// one `drm_rocket_job` work on RK3588? Each case runs as one job whose
+/// tasks are the plan's tile programs, against the same exact oracle the
+/// per-tile matrices use. `ROCKET_SUBMIT=one-job` re-runs any other matrix
+/// in this file the same way.
+#[test]
+#[ignore = "needs /dev/accel/accel0 -- multi-tile convolutions as ONE multi-task job (ISSUES C4)"]
+fn multi_task_job_matches_oracle() {
+    SUBMIT_SHAPE_OVERRIDE.with(|shape| shape.set(Some(SubmitShape::OneJob)));
+    run_hardware_case_matrix(
+        "multi-tile convolutions as the tasks of one job",
+        multi_task_job_cases(),
     );
 }
 
