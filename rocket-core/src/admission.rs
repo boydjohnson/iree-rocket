@@ -298,6 +298,24 @@ pub fn conv_ceilings(
         // for the same coefficient-model reason; depthwise `Cout` is always
         // `Cin`, so the output-atom floor does not apply.
         (PrecisionClass::Int8Requant, true, 1 | 3) => ceilings(1344, 1344),
+        // **The 7x7 stride-2 image stem**, int8 only, on the dense feature
+        // path. ResNet's stem (`Cin` 3 -> 64 at 230x230) ran on the CPU in
+        // every build, ~60% of int8 ResNet50's remaining CPU time.
+        // `conv::stride_two_dense_stem` is the planner side and carries the
+        // hardware evidence (exact at fp16 too). fp16 is left out on
+        // measurement, not correctness: at the board's 200 MHz NPU clock the
+        // fp16 stem costs ~16 ms on the NPU against ~11 ms on four A76s, and
+        // ResNet50-224 fp16 went 105 -> 115 ms with it offloaded (int8: 150
+        // -> 125 ms, bit-identical). Revisit at 600 MHz. Stride 1 at 7x7 has
+        // no matcher and no entry here; nothing measured needs it.
+        (PrecisionClass::Int8Accumulator, false, 7) if stride == 2 => {
+            ceilings(conv::MAX_DENSE_CHANNELS, 128)
+        }
+        (PrecisionClass::Int8Requant, false, 7) if stride == 2 => Some(ChannelCeilings {
+            in_channels: conv::MAX_DENSE_CHANNELS,
+            out_channels: 128,
+            min_out_channels: 16,
+        }),
         _ => None,
     }
 }
@@ -519,6 +537,36 @@ mod tests {
             stride,
             in_channels: cin,
             out_channels: cout,
+        }
+    }
+
+    /// The 7x7 stride-2 stem is admitted on the dense path at both int8
+    /// rungs, nowhere past its measured grid, and not at fp16 (slower than
+    /// the CPU at 200 MHz).
+    #[test]
+    fn stride_two_7x7_stem_is_admitted_on_the_dense_path() {
+        assert!(admit_conv(&conv(Precision::Fp16, false, 7, 2, 3, 64)).is_err());
+        for precision in [int8(true), int8(false)] {
+            assert!(
+                admit_conv(&conv(precision, false, 7, 2, 3, 64)).is_ok(),
+                "{precision:?}"
+            );
+            assert!(
+                admit_conv(&conv(precision, false, 7, 2, 4, 128)).is_ok(),
+                "{precision:?}"
+            );
+            assert!(
+                admit_conv(&conv(precision, false, 7, 2, 8, 64)).is_err(),
+                "{precision:?}"
+            );
+            assert!(
+                admit_conv(&conv(precision, false, 7, 2, 3, 256)).is_err(),
+                "{precision:?}"
+            );
+            assert!(
+                admit_conv(&conv(precision, false, 7, 1, 3, 64)).is_err(),
+                "{precision:?}"
+            );
         }
     }
 

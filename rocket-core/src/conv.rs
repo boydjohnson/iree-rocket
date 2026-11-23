@@ -3717,7 +3717,8 @@ impl ConvPlan {
 ///     tables cannot be reinterpreted at another width without measuring,
 ///     so they stay fp16.
 ///
-/// Stride stays 1 everywhere above 3x3: the sweep has no strided capture at
+/// Stride stays 1 everywhere above 3x3, with one hardware-backed exception
+/// ([`stride_two_dense_stem`]): the sweep has no strided capture at
 /// any kernel size, and that gap is precision-independent.
 ///
 /// The `Cin` ceiling is [`large_kernel_max_in_channels`], which is where
@@ -3743,7 +3744,7 @@ fn check_large_kernel_plan_case(
          only for fp16"
     );
     refuse_unless!(
-        shape.stride == 1,
+        shape.stride == 1 || stride_two_dense_stem(shape, kernel),
         PlanErrorCode::UnvalidatedConfiguration,
         "automatic planning above 3x3 currently has capture backing only at stride 1"
     );
@@ -3757,6 +3758,25 @@ fn check_large_kernel_plan_case(
         shape.in_channels
     );
     Ok(())
+}
+
+/// Above 3x3 the one strided case with backing: a 7x7 stride-2 image stem on
+/// the dense feature path -- ResNet's, `Cin` 3 -> 64 at 230x230 -- which ran
+/// on the CPU in every ResNet50 build (~60% of int8's remaining CPU time).
+///
+/// Hardware backing, not capture backing: `dtype_boundary_probe` on `planck`
+/// re-flashed to 7.3.5, 2026-11-23, 230x230 at padding 0, demand-based
+/// partition (10/2 at `Cout` 64), 30 of 30 exact -- fp16, requantized int8
+/// and the int8 accumulator, `Cin` 1, 2, 3 and 4 at `Cout` 64 under
+/// `Selectors`/`SelectorsAffine` and `Counting`, and `Cout` 32, 96 and 128 at
+/// `Cin` 3; fp16 and the accumulator also exact under `Dense` three times
+/// over, and 224x224 at padding 3. The bound is that grid: the dense path
+/// (`Cin <= MAX_DENSE_CHANNELS`) and `Cout` 128.
+fn stride_two_dense_stem(shape: Shape, kernel: usize) -> bool {
+    kernel == 7
+        && shape.stride == 2
+        && shape.in_channels <= MAX_DENSE_CHANNELS
+        && shape.out_channels <= 128
 }
 
 /// A capture-derived split for a kernel above 3x3, raised if it would starve
@@ -4259,6 +4279,48 @@ mod tests {
 
     fn code_of<T: std::fmt::Debug>(result: Result<T, PlanError>) -> PlanErrorCode {
         result.expect_err("expected a refusal").code()
+    }
+
+    /// The 7x7 stride-2 dense stem plans without any probing override, over
+    /// exactly the grid measured on hardware, and nothing past it does. At
+    /// padding 0 -- the compiled stem arrives padded to 230x230.
+    #[test]
+    fn stride_two_7x7_dense_stem_plans_inside_its_measured_grid() {
+        let requant = Precision::Int8(Quantization {
+            input_zero_point: 0,
+            output_zero_point: 0,
+            weight_zero_point: 0,
+            input_scale: 1.0,
+            weights_scale: 1.0,
+            multiplier: Multiplier::for_unit_bs(1.0),
+        });
+        for precision in [Precision::Fp16, requant, int8_accumulator(0)] {
+            for (cin, cout) in [
+                (1, 64),
+                (2, 64),
+                (3, 64),
+                (4, 64),
+                (3, 32),
+                (3, 96),
+                (3, 128),
+            ] {
+                let shape =
+                    Shape::with_precision(230, 230, 2, cin, cout, precision).with_padding([0, 0]);
+                let plan = ConvPlan::try_new(shape, [7, 7])
+                    .unwrap_or_else(|error| panic!("{precision:?} Cin {cin} Cout {cout}: {error}"));
+                assert!(!plan.tiles().is_empty());
+            }
+            // Past the grid: surfaces (`Cin` 8), wider `Cout`, stride 3.
+            for (cin, cout, stride) in [(8, 64, 2), (3, 256, 2), (3, 64, 3)] {
+                let shape = Shape::with_precision(230, 230, stride, cin, cout, precision)
+                    .with_padding([0, 0]);
+                assert_eq!(
+                    code_of(ConvPlan::try_new(shape, [7, 7])),
+                    PlanErrorCode::UnvalidatedConfiguration,
+                    "{precision:?} Cin {cin} Cout {cout} s{stride}"
+                );
+            }
+        }
     }
 
     // --- Shape construction refusals, one per code.

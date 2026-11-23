@@ -41,6 +41,13 @@ file(GLOB_RECURSE ROCKET_SCHEMA_SOURCES CONFIGURE_DEPENDS
 file(GLOB_RECURSE IREE_ROCKET_HAL_RUST_SOURCES CONFIGURE_DEPENDS
   "${CMAKE_CURRENT_SOURCE_DIR}/../iree-rocket-hal/src/*.rs"
 )
+# rocket-core is the planner the driver runs at dispatch time. Without it
+# here a planner change rebuilds nothing, and the old binary keeps refusing
+# (or accepting) plans the compiler now decides differently.
+file(GLOB_RECURSE ROCKET_CORE_RUST_SOURCES CONFIGURE_DEPENDS
+  "${CMAKE_CURRENT_SOURCE_DIR}/../rocket-core/src/*.rs"
+  "${CMAKE_CURRENT_SOURCE_DIR}/../rocket-core/Cargo.toml"
+)
 
 add_custom_command(
   OUTPUT "${ROCKET_LIB_PATH}"
@@ -54,6 +61,7 @@ add_custom_command(
     ${ROCKET_RUST_SOURCES}
     ${ROCKET_SCHEMA_SOURCES}
     ${IREE_ROCKET_HAL_RUST_SOURCES}
+    ${ROCKET_CORE_RUST_SOURCES}
     "${CMAKE_CURRENT_SOURCE_DIR}/Cargo.toml"
     "${CMAKE_CURRENT_SOURCE_DIR}/../iree-rocket-hal/Cargo.toml"
     "${CMAKE_CURRENT_SOURCE_DIR}/../rocket-schema/Cargo.toml"

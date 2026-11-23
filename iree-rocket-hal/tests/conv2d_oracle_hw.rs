@@ -2091,6 +2091,15 @@ fn dtype_boundary_probe() {
         }
     };
     let kernel: usize = fields[3].parse().expect("kernel");
+    // `ROCKET_DTYPE_SWEEP_PAD=<n>` overrides the `kernel / 2` CNA padding --
+    // a compiled model often materializes its pad, so the convolution it
+    // dispatches is the padded extent at padding 0 (ResNet50's 7x7 stem is
+    // 230x230 at 0, not 224x224 at 3).
+    let pad: usize = std::env::var("ROCKET_DTYPE_SWEEP_PAD")
+        .ok()
+        .map_or(kernel / 2, |value| {
+            value.parse().expect("ROCKET_DTYPE_SWEEP_PAD")
+        });
     let fixed: u32 = fields[4].parse().expect("fixed channel count");
     let pattern = match std::env::var("ROCKET_DTYPE_SWEEP_PATTERN").as_deref() {
         Ok("counting") => OraclePattern::Counting,
@@ -2142,7 +2151,7 @@ fn dtype_boundary_probe() {
                 cout,
                 kernel: [kernel, kernel],
                 stride,
-                padding: [kernel / 2, kernel / 2],
+                padding: [pad, pad],
                 precision,
                 pattern,
             }
@@ -3180,6 +3189,55 @@ fn int8_requant_cout2048_cases() -> Vec<Conv2dCase> {
         }
     }
     cases
+}
+
+/// The 7x7 stride-2 image stem on the dense feature path, over the grid
+/// `conv::stride_two_dense_stem` admits: ResNet's 230x230 `Cin` 3 -> 64 at
+/// padding 0 (the compiled stem arrives padded), `Cin` 1..=4 and `Cout` 32
+/// and 128, at every rung -- fp16 is planned and exact even though the
+/// compiler leaves it on the CPU at 200 MHz.
+fn stem_7x7_stride2_cases() -> Vec<Conv2dCase> {
+    let mut cases = Vec::new();
+    for precision in [
+        OraclePrecision::Fp16,
+        OraclePrecision::Int8,
+        OraclePrecision::Int8Accumulator,
+    ] {
+        let addressing = if precision == OraclePrecision::Int8 {
+            OraclePattern::SelectorsAffine { phase: 5 }
+        } else {
+            OraclePattern::Selectors { phase: 5 }
+        };
+        for (cin, cout, pattern) in [
+            (3, 64, addressing),
+            (3, 64, OraclePattern::Counting),
+            (1, 64, addressing),
+            (4, 64, OraclePattern::Counting),
+            (3, 32, addressing),
+            (3, 128, addressing),
+        ] {
+            cases.push(Conv2dCase {
+                width: 230,
+                height: 230,
+                cin,
+                cout,
+                kernel: [7, 7],
+                stride: 2,
+                padding: [0, 0],
+                precision,
+                pattern,
+            });
+        }
+    }
+    cases
+}
+
+#[test]
+#[ignore = "needs /dev/accel/accel0 -- the 7x7 stride-2 image stem"]
+fn stem_7x7_stride2_matches_oracle() {
+    let cases = stem_7x7_stride2_cases();
+    assert_eq!(cases.len(), 18);
+    run_hardware_case_matrix("7x7 stride-2 dense stem", cases);
 }
 
 #[test]
