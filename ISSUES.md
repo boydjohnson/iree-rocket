@@ -608,33 +608,82 @@ The first two would shrink with an offset/length on `PREP_BO`/`FINI_BO`
 
 ---
 
-## P4 (S3) — the CBUF operand-reuse bits are never set
+## P4 (S3) — the CBUF reuse bits work and buy nothing as tiled today; the cost they were meant to cut is streamed weights, re-fetched once per output row
 
-`conv.rs:3524` sets only `weight_bank` and `data_bank` on `CNA_CBUF_CON0`; no
-call site anywhere sets `.weight_reuse()` or `.data_reuse()` [verified], though
-both builders exist in `builders/cna.rs`.
+`conv.rs` sets only `weight_bank` and `data_bank` on `CNA_CBUF_CON0`; the
+`.weight_reuse()` and `.data_reuse()` builders exist and nothing calls them.
+`encodings/cbuf-reuse.md` [notes] measured `DATA_REUSE` at +7% in-model on
+Gemma prefill under the vendor driver, and 29/120 plausible-looking
+corruptions when the job did not hold the core.
 
-`encodings/cbuf-reuse.md` [notes] measured **DATA_REUSE at +7% in-model** on
-Gemma prefill, with the NPU `wait` bucket dropping 21% and everything else flat —
-and argues the wait drop is itself the proof the bit is honored.
+**Measured 2026-11-23** on `planck` re-flashed to 7.3.5 (`ssh orangepi`), NPU
+at 200 MHz, every tile of a dispatch in one job (C4).
+`conv2d_oracle_hw`'s three `hardware-characterization` probes:
 
-Three preconditions, all of which this repo would have to arrange:
+- **`weight_reuse_probe`: exact, and no faster.** Wide ResNet50's
+  multi-tile convolutions whose weights fit the granted banks (58x58 Cin 128
+  3x3, 56x56 Cin 256 -> 512 1x1 s2, 56x56 Cin 256 -> 256 and -> 128 1x1; 6 to
+  14 tiles), `WEIGHT_REUSE` on tasks 2..N, 12 ABBA rounds under `Selectors`
+  and `Dense` with the phase changing every round: 0 wrong of 96 reuse-on
+  dispatches and 0 of 96 off. Median dispatch moves -4.8% to +4.6%, noise.
+- **`weight_reuse_honoured_probe`: the bit is real.** Tasks 2..N pointed at
+  a zero-filled copy of the weights: with reuse off every one of those tiles
+  is wrong (the control -- 255k to 346k mismatches); with reuse on, all three
+  shapes are exact. The CNA never fetched the decoy. So resident weights are
+  simply not on the critical path: the reload is hidden behind compute.
+- **`DATA_REUSE` has no use here.** `ConvPlan` tiles rows and columns and
+  every tile computes every output channel, so no two consecutive tasks read
+  the same input.
+- **`streamed_weight_dma_probe`: the real cost.** When a convolution's
+  weights do not fit, the CNA streams the whole weight set *per tile*. For
+  3x3 at `Cin` 512 and 1024 the streamed working set takes 9 banks, leaving
+  3 for data, so every tile is **one output row**. Holding the shape and
+  growing the height: 1.757 ms per tile at 30 wide `Cin` = `Cout` = 512 (4.72
+  MB re-streamed, 0.066 GMAC), 7.737 ms per tile at 16 wide 1024 (18.87 MB,
+  0.132 GMAC). Weight throughput is flat (2.68 / 2.44 GB/s) while the implied
+  MAC rate halves, so these tiles are weight-DMA-bound.
 
-- The run of tiles must be **one uninterrupted job**, so the operand is still
-  resident. Since C4 (resolved 2026-11-23) a dispatch's tiles on one file
-  are one job, so this holds by default.
-- Only **one** bit can pay at a time (a 1-D task order makes only one operand
-  identical to the previous task); pick by reuse depth.
-- The tile loop must be ordered so the shared operand is adjacent.
+**What that is worth.** The planner's real bank splits, at ~2.5 GB/s, put
+Wide ResNet50's weight streaming at ~192 ms of its ~259 ms of NPU time per
+inference (537.5 MB fetched for 133.5 MB of weights). About 170 ms of it is
+four 3x3 layer kinds at 3/9 banks (30x30 Cin 512 s2, 16x16 Cin 512, 16x16 Cin
+1024 s2, 9x9 Cin 1024). MobileNetV2 has nothing here (4.3 MB fetched, 4.3
+unique).
 
-The notes also carry a sharp warning about validating it: with the vendor driver,
-which does not hold the core across tasks, reuse-on corrupted 29 of 120 runs with
-*plausible* output, and a periodic-input gate reported clean for months. Validate
-with aperiodic inputs and interleaved repeats, never a single run.
+**The obvious fix, measured (`cout_group_probe`): worth ~8% on Wide
+ResNet50, not the 192 ms.** Split `Cout` into groups whose weights stay
+resident, run every row tile of a group before the next, and set
+`WEIGHT_REUSE` on tiles 2..N of each group. The probe plans a group as its own
+`Cout` = G convolution and times `C/G` repeats of its programs in one job --
+the grouped scheme's bus traffic, weights once and input once per group. All
+exact; median of five, same board and clock:
 
-While in that register: `FC_DATA_BANK[10:8]` is live on the conv datapath and any
-non-zero value corrupts the output. This repo leaves it 0 [verified] — correct,
-and worth not touching.
+| layer (count in Wide ResNet50) | today | grouped, reuse on | |
+|---|---|---|---|
+| 30x30 `Cin` 512 3x3 s2 (1), 14 tiles | 22.6 ms | 15.5 ms (G=32, 16 groups) | 1.46x |
+| 16x16 `Cin` 1024 3x3 s2 (1), 7 tiles | 57.0 ms | 39.5 ms (G=16, 64 groups) | 1.44x |
+| 9x9 `Cin` 1024 3x3 s1 (2), 3 tiles | 26.6 ms | 26.3 ms (G=16) | 1.01x |
+| 16x16 `Cin` 512 3x3 s1 (5), 4 tiles | 7.2 ms | 9.4 ms (G=32) | 0.77x |
+
+Grouping trades weight re-streaming for re-reading the input once per group
+and multiplies the task count, and each task carries a fixed ~50-90 µs (the
+completion IRQ round trip and task setup). So it pays only when a group has
+many row tiles: 14 and 7 win, 3 and 4 do not. Without the bit the grouped
+arm is *slower* than today (24.9 and 76.7 ms on the two winners), which
+confirms the win is the reuse and not the regrouping. On Wide ResNet50 that
+is two layers, ~25 ms of a ~305 ms inference at 200 MHz (plus perhaps 2-3 ms
+on the unprobed 58x58 `Cin` 256 s2); ResNet50-224's streamed 3x3 layers sit
+at 3-4 tiles and would not qualify. Building it means `ConvPlan` emitting
+output-channel-sliced tiles (a surface offset per group), a rule that groups
+only above some tile depth, and keeping each group's tiles in one job (C4
+gives that). The ~192 ms of streaming is mostly the unavoidable per-row
+weight pass at 3 data banks; cutting it further needs fewer, taller tiles,
+which the 16-kernel working set forbids without splitting `Cin` (open
+question 4.5.1).
+
+While in that register: `FC_DATA_BANK[10:8]` is live on the conv datapath and
+any non-zero value corrupts the output. This repo leaves it 0 [verified] --
+correct, and worth not touching.
 
 ---
 
