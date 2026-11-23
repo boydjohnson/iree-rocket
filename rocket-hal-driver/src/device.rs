@@ -291,6 +291,53 @@ fn dump_regset_enabled() -> bool {
     *ENABLED.get_or_init(|| std::env::var("ROCKET_DUMP_REGSET").is_ok_and(|value| value != "0"))
 }
 
+/// `ROCKET_PRE_POOL_DWELL_MS=<n>`: sleep before every non-DPU (pooling) job.
+/// ISSUES C16 diagnostic -- a dwell past the cores' autosuspend delay lets a
+/// poisoned core power-cycle, which is what cleared C8's per-core state.
+fn pre_pool_dwell() -> Option<Duration> {
+    static DWELL: std::sync::OnceLock<Option<Duration>> = std::sync::OnceLock::new();
+    *DWELL.get_or_init(|| {
+        std::env::var("ROCKET_PRE_POOL_DWELL_MS")
+            .ok()
+            .and_then(|value| value.parse().ok())
+            .map(Duration::from_millis)
+    })
+}
+
+/// Completed-interrupt counts per NPU core, from `/proc/interrupts`, in core
+/// order. Read only under `ROCKET_DISPATCH_TIMES`.
+fn npu_irq_counts() -> Vec<u64> {
+    std::fs::read_to_string("/proc/interrupts")
+        .unwrap_or_default()
+        .lines()
+        .filter(|line| line.contains(".npu"))
+        .map(|line| {
+            line.split_whitespace()
+                .skip(1)
+                .take_while(|field| field.chars().all(|c| c.is_ascii_digit()))
+                .filter_map(|field| field.parse::<u64>().ok())
+                .sum()
+        })
+        .collect()
+}
+
+/// Which cores raised interrupts between two readings, e.g. `c0` or
+/// `c0+c1`; `?` when none did (a job the watchdog killed raises none).
+fn cores_between(before: &[u64], after: &[u64]) -> String {
+    let cores: Vec<String> = before
+        .iter()
+        .zip(after)
+        .enumerate()
+        .filter(|(_, (b, a))| a > b)
+        .map(|(core, _)| format!("c{core}"))
+        .collect();
+    if cores.is_empty() {
+        "?".to_string()
+    } else {
+        cores.join("+")
+    }
+}
+
 /// Whether to submit every tile as its own single-task job, as this driver
 /// did before ISSUES C4 was retested (`ROCKET_JOB_PER_TILE=1`). For an A/B
 /// against the default of one multi-task job per file, and for bisecting a
@@ -2018,6 +2065,13 @@ unsafe extern "C" fn queue_execute(
                         // job per file. Every job is submitted before any is
                         // waited for, which is what puts a fanned-out dispatch's
                         // tiles on several cores at once.
+                        // Diagnostics for ISSUES C16: an optional dwell before a
+                        // non-DPU (pooling) job, and which core each job's
+                        // completion IRQ landed on.
+                        if job.dpu_mode.is_none() && let Some(dwell) = pre_pool_dwell() {
+                            std::thread::sleep(dwell);
+                        }
+                        let irqs_before = dispatch_times_enabled().then(npu_irq_counts);
                         let started = Instant::now();
                         let groups = submit_groups(&job.task_targets, job_per_tile_enabled());
                         let mut group_submitted = Vec::with_capacity(groups.len());
@@ -2107,7 +2161,7 @@ unsafe extern "C" fn queue_execute(
                             if dispatch_times_enabled() {
                                 eprintln!(
                                     "rocket: dispatch {:.2} ms  ctx={} task_ctx={:?} prec={} mode={:?} \
-                                     tasks={} jobs={} prog={:#018x} regcmd_iova={:?} in={:?} out={:?}",
+                                     tasks={} jobs={} cores={} prog={:#018x} regcmd_iova={:?} in={:?} out={:?}",
                                     elapsed.as_secs_f64() * 1e3,
                                     ctx.id,
                                     job.task_targets
@@ -2118,6 +2172,10 @@ unsafe extern "C" fn queue_execute(
                                     job.dpu_mode,
                                     regcmd_tasks.len(),
                                     groups.len(),
+                                    irqs_before
+                                        .as_deref()
+                                        .map(|before| cores_between(before, &npu_irq_counts()))
+                                        .unwrap_or_default(),
                                     program_hash(regcmd_tasks),
                                     cmd_bufs
                                         .iter()

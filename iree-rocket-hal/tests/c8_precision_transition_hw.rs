@@ -90,6 +90,7 @@ use dispatch::DISPATCH_TIMEOUT_FLOOR;
 use iree_rocket_hal::rocket::{
     conv::{AccumulatorOutputTile, Buffers, ConvPlan, Shape},
     device::{Buffer, JobDesc, close_bo, fini_bo, prep_bo, submit_jobs, unmap_bo},
+    pooling::{PoolingBuffers, PoolingMethod, PoolingPlan, PoolingPrecision, PoolingShape},
 };
 
 const DEVICE_PATH: &str = "/dev/accel/accel0";
@@ -1123,4 +1124,275 @@ fn int8acc_to_fp16_transition_no_longer_poisons_a_core() {
         wrong.len(),
         wrong.join("\n  ")
     );
+}
+
+// ---------------------------------------------------------------------------
+// ISSUES C16: what poisons a core for a later *pooling* job?
+// ---------------------------------------------------------------------------
+//
+// ResNet50-224 int8 with the stride-2 requantized matchers hangs its final
+// `pool Avg 7x7x2048 k7x7` on every run; a dwell of 100 ms or more before it
+// (past the 50 ms autosuspend) clears it and 30 ms does not -- C8's per-core,
+// cleared-by-power-cycle signature. Cores alternate c0/c1 between back-to-
+// back jobs, and in the hanging build both of the model's pools land on c0
+// while in the clean build they do not. These sequences put chosen jobs on
+// one core without the model: positions 0, 2, 4 share a core and 1, 3 the
+// other, which every row checks from the recorded cores rather than assumes.
+
+struct PreparedPool {
+    label: String,
+    _input: OwnedBuffer,
+    output: OwnedBuffer,
+    _command_buffers: Vec<OwnedBuffer>,
+    tasks: Vec<(u32, u32)>,
+    in_handles: Vec<u32>,
+    out_handles: Vec<u32>,
+}
+
+impl PreparedPool {
+    unsafe fn prepare(
+        file: &std::fs::File,
+        (width, height, channels, kernel, stride): (u32, u32, u32, u32, u32),
+        method: PoolingMethod,
+    ) -> Self {
+        let fd = file.as_raw_fd();
+        let precision = PoolingPrecision::Fp16;
+        let shape = PoolingShape {
+            input_width: width,
+            input_height: height,
+            input_channels: channels,
+            output_width: (width - kernel) / stride + 1,
+            output_height: (height - kernel) / stride + 1,
+            output_channels: channels,
+            precision,
+            kernel_width: kernel,
+            kernel_height: kernel,
+            stride_x: stride,
+            stride_y: stride,
+            method,
+            pad_left: 0,
+            pad_top: 0,
+            pad_right: 0,
+            pad_bottom: 0,
+            pad_value: method.required_pad_fill(precision, false).unwrap(),
+        };
+        let surfaces = shape.programmed_channels() as usize / 8;
+        let in_bytes = surfaces * ((width * height) as usize).next_multiple_of(4) * 16;
+        let out_bytes = surfaces
+            * ((shape.output_width * shape.output_height) as usize).next_multiple_of(4)
+            * 16;
+        unsafe {
+            let input = OwnedBuffer::new(fd, in_bytes, file);
+            // fp16 1.0 everywhere: the values do not matter, only the hang.
+            let halves = std::slice::from_raw_parts_mut(
+                input.buffer.host_ptr as *mut u16,
+                input.buffer.size / 2,
+            );
+            halves.fill(0x3c00);
+            let output = OwnedBuffer::new(fd, out_bytes, file);
+            ptr::write_bytes(output.buffer.host_ptr, OUTPUT_SENTINEL, output.buffer.size);
+            let plan = PoolingPlan::new(shape);
+            let programs = plan.programs_with_buffers(&PoolingBuffers {
+                input_addr: input.buffer.dma_address,
+                output_addr: output.buffer.dma_address,
+            });
+            let mut command_buffers = Vec::new();
+            let mut tasks = Vec::new();
+            for program in &programs {
+                let buffer = OwnedBuffer::new(fd, program.len() * mem::size_of::<u64>(), file);
+                let words = std::slice::from_raw_parts_mut(
+                    buffer.buffer.host_ptr as *mut u64,
+                    program.len(),
+                );
+                for (word, command) in words.iter_mut().zip(program) {
+                    *word = command.0;
+                }
+                fini_bo(fd, buffer.buffer.handle).unwrap();
+                tasks.push((buffer.buffer.dma_address, program.len() as u32));
+                command_buffers.push(buffer);
+            }
+            fini_bo(fd, input.buffer.handle).unwrap();
+            fini_bo(fd, output.buffer.handle).unwrap();
+            let mut in_handles: Vec<u32> =
+                command_buffers.iter().map(|b| b.buffer.handle).collect();
+            in_handles.push(input.buffer.handle);
+            let out_handles = vec![output.buffer.handle];
+            PreparedPool {
+                label: format!(
+                    "pool {method:?} {width}x{height}x{channels} k{kernel} s{stride}, {} task(s)",
+                    tasks.len()
+                ),
+                _input: input,
+                output,
+                _command_buffers: command_buffers,
+                tasks,
+                in_handles,
+                out_handles,
+            }
+        }
+    }
+
+    unsafe fn submit(&self, fd: i32) -> Result<(Duration, String), String> {
+        let irqs_before = npu_irq_counts();
+        let started = Instant::now();
+        unsafe {
+            submit_jobs(
+                fd,
+                &[JobDesc {
+                    tasks: &self.tasks,
+                    in_handles: &self.in_handles,
+                    out_handles: &self.out_handles,
+                }],
+            )
+            .map_err(|error| format!("submit: {error}"))?;
+            prep_bo(fd, self.output.buffer.handle, PER_JOB_TIMEOUT_NS)
+                .map_err(|error| format!("completion wait: {error}"))?;
+        }
+        Ok((
+            started.elapsed(),
+            cores_between(&irqs_before, &npu_irq_counts()),
+        ))
+    }
+}
+
+#[derive(Clone, Copy)]
+enum Step {
+    Conv(Conv2dCase),
+    Pool((u32, u32, u32, u32, u32), PoolingMethod),
+}
+
+enum PreparedStep {
+    Conv(Box<PreparedJob>),
+    Pool(PreparedPool),
+}
+
+fn c16_steps(name: &str) -> Vec<Step> {
+    use OraclePrecision::{Fp16, Int8, Int8Accumulator};
+    let max_pool = Step::Pool((114, 114, 64, 3, 2), PoolingMethod::Max);
+    let avg_pool = Step::Pool((7, 7, 2048, 7, 1), PoolingMethod::Avg);
+    let filler = Step::Conv(case(8, 8, 64, 64, 1, 1, Fp16));
+    let s2_requant = Step::Conv(case(16, 16, 512, 512, 3, 2, Int8));
+    let s1_requant = Step::Conv(case(16, 16, 512, 512, 3, 1, Int8));
+    let acc = Step::Conv(case(7, 7, 512, 2048, 1, 1, Int8Accumulator));
+    match name {
+        "avgpool_alone" => vec![avg_pool],
+        "maxpool_conv_avgpool" => vec![max_pool, filler, avg_pool],
+        "maxpool_conv_conv_avgpool" => vec![max_pool, filler, filler, avg_pool],
+        "avgpool_conv_avgpool" => vec![avg_pool, filler, avg_pool],
+        "s2req_conv_avgpool" => vec![s2_requant, filler, avg_pool],
+        "s1req_conv_avgpool" => vec![s1_requant, filler, avg_pool],
+        "acc_conv_avgpool" => vec![acc, filler, avg_pool],
+        "maxpool_conv_maxpool" => vec![max_pool, filler, max_pool],
+        // Ad hoc: `max:W:C:K:S>conv>avg:W:C:K:S`, each pool square with
+        // width W, C channels, kernel K and stride S; `conv` is the fp16
+        // filler.
+        spec if spec.contains('>') => spec
+            .split('>')
+            .map(|step| {
+                let fields: Vec<&str> = step.split(':').collect();
+                let num = |i: usize| fields[i].parse::<u32>().expect("pool field");
+                match fields[0] {
+                    "conv" => filler,
+                    "max" | "avg" | "min" => Step::Pool(
+                        (num(1), num(1), num(2), num(3), num(4)),
+                        match fields[0] {
+                            "max" => PoolingMethod::Max,
+                            "avg" => PoolingMethod::Avg,
+                            _ => PoolingMethod::Min,
+                        },
+                    ),
+                    other => panic!("unknown C16 step {other}"),
+                }
+            })
+            .collect(),
+        other => panic!("unknown C16 sequence {other}"),
+    }
+}
+
+const C16_SEQUENCES: [&str; 8] = [
+    "avgpool_alone",
+    "maxpool_conv_avgpool",
+    "maxpool_conv_conv_avgpool",
+    "avgpool_conv_avgpool",
+    "maxpool_conv_maxpool",
+    "s2req_conv_avgpool",
+    "s1req_conv_avgpool",
+    "acc_conv_avgpool",
+];
+
+/// ISSUES C16: run each sequence back to back from a suspended domain and
+/// report every step's time and core. Characterisation: it prints and never
+/// fails. `ROCKET_C16_SEQUENCES=a,b` picks a subset, `ROCKET_C8_REPEAT` the
+/// repeats.
+#[test]
+#[ignore = "needs /dev/accel/accel0 -- characterizes ISSUES C16"]
+fn c16_pool_sequences() {
+    let _guard = NPU_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    let file = OpenOptions::new()
+        .read(true)
+        .write(true)
+        .open(DEVICE_PATH)
+        .expect("open /dev/accel/accel0");
+    let fd = file.as_raw_fd();
+    let paths = npu_runtime_status_paths();
+    let names: Vec<String> = match std::env::var("ROCKET_C16_SEQUENCES") {
+        Ok(list) if !list.is_empty() => list.split(',').map(|n| n.trim().to_string()).collect(),
+        _ => C16_SEQUENCES.iter().map(|n| n.to_string()).collect(),
+    };
+    let mut rows = Vec::new();
+    for name in &names {
+        for trial in 1..=repeat() {
+            let prepared: Vec<PreparedStep> = c16_steps(name)
+                .into_iter()
+                .map(|step| match step {
+                    Step::Conv(case) => PreparedStep::Conv(Box::new(
+                        unsafe { PreparedJob::prepare(&file, case) }.unwrap(),
+                    )),
+                    Step::Pool(dims, method) => {
+                        PreparedStep::Pool(unsafe { PreparedPool::prepare(&file, dims, method) })
+                    }
+                })
+                .collect();
+            std::thread::sleep(SETTLE);
+            let (_, suspended) = wait_all_suspended(&paths, SUSPEND_BUDGET);
+            let mut cells = Vec::new();
+            let mut hung = false;
+            for step in &prepared {
+                let (label, result) = match step {
+                    PreparedStep::Conv(job) => (job.label(), unsafe { job.submit(fd) }),
+                    PreparedStep::Pool(pool) => (pool.label.clone(), unsafe { pool.submit(fd) }),
+                };
+                let (elapsed, core) = result.unwrap_or((Duration::ZERO, "err".into()));
+                let slow = elapsed >= DISPATCH_TIMEOUT_FLOOR;
+                hung |= slow;
+                println!(
+                    "  {name} t{trial}: {label:<60} {:>7} ms on {core}{}",
+                    ms(elapsed),
+                    if slow { "  <-- HUNG" } else { "" }
+                );
+                cells.push(format!("{}{}", core, if slow { "!" } else { "" }));
+                if slow {
+                    break;
+                }
+            }
+            rows.push(format!(
+                "{name:<28} t{trial} {}  cores {}{}",
+                if hung { "HUNG" } else { "ok  " },
+                cells.join(","),
+                if suspended {
+                    ""
+                } else {
+                    "  (did not start suspended)"
+                }
+            ));
+            if hung && !canary_passes(&file, &paths) {
+                rows.push("device sick after a hang; stopping".into());
+                break;
+            }
+        }
+    }
+    println!("\n=== C16 sequences ===");
+    for row in rows {
+        println!("{row}");
+    }
 }

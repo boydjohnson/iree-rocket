@@ -265,6 +265,11 @@ fn run_case(case: PoolCase) {
     let fd = file.as_raw_fd();
 
     unsafe {
+        // ISSUES C16: push this case's buffers up the file's IOVA space. The
+        // allocator is first-fit from zero per file, so a ballast BO created
+        // first places everything after it. Unset, nothing changes.
+        let ballast = BALLAST_BYTES.with(std::cell::Cell::get);
+        let ballast = (ballast > 0).then(|| Buffer::new(fd, ballast, &file));
         let input = Buffer::new(
             fd,
             page_aligned_size(surfaces * in_surface_pixels * FEATURE_ATOM_BYTES),
@@ -390,6 +395,9 @@ fn run_case(case: PoolCase) {
         }
         close_bo(fd, input.handle).unwrap();
         close_bo(fd, output.handle).unwrap();
+        if let Some(ballast) = ballast {
+            close_bo(fd, ballast.handle).unwrap();
+        }
 
         let total = out_pixels * case.channels as usize;
         // The dispatch clock is what separates a shape result from a
@@ -429,6 +437,11 @@ fn run_case(case: PoolCase) {
 /// pooling. The dispatch clock in the failure message is what still tells
 /// a real hang from that.
 const SETTLE: std::time::Duration = std::time::Duration::from_millis(1200);
+
+thread_local! {
+    /// Bytes of ballast allocated ahead of a case's buffers; see `run_case`.
+    static BALLAST_BYTES: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
 
 fn run_cases(cases: &[PoolCase]) {
     let mut failures = Vec::new();
@@ -762,4 +775,91 @@ fn tiled_pooling_matches_oracle() {
             precision: PoolingPrecision::Fp16,
         },
     ]);
+}
+
+/// ISSUES C16: does the hanging pool -- ResNet50's global `Avg 7x7x2048
+/// k7x7` -- hang because of *where* its buffers sit? In the hanging model
+/// build its input and output IOVAs were 0x0475a000 / 0x0479a000; in clean
+/// builds they were 0x03f7a000, 0x0425e000 and 0x0450a000. This places the
+/// same pool's buffers at a ladder of offsets with a ballast BO, from a
+/// fresh file, with nothing else run first. `ROCKET_POOL_BALLAST_MB` takes a
+/// comma-separated list instead of the default ladder.
+/// ISSUES C16: overlapping windows at stride 2 on an even extent leave a
+/// trailing input row that no window reads; the PPU's cube height is now
+/// programmed to the rows actually read. These are the shapes that hit it --
+/// ResNet50's own stem pool among them -- checked against the oracle so the
+/// trimmed height cannot silently drop a row that *is* read.
+#[test]
+#[ignore = "needs /dev/accel/accel0"]
+fn overlapping_stride2_pooling_matches_oracle() {
+    run_cases(&[
+        PoolCase {
+            label: "max 3x3s2 even",
+            width: 16,
+            height: 16,
+            channels: 8,
+            kernel: (3, 3),
+            stride: (2, 2),
+            pad: [0; 4],
+            method: PoolingMethod::Max,
+            precision: PoolingPrecision::Fp16,
+        },
+        PoolCase {
+            label: "max 3x3s2 ResNet50 stem",
+            width: 114,
+            height: 114,
+            channels: 64,
+            kernel: (3, 3),
+            stride: (2, 2),
+            pad: [0; 4],
+            method: PoolingMethod::Max,
+            precision: PoolingPrecision::Fp16,
+        },
+        PoolCase {
+            label: "avg 3x3s2 even",
+            width: 30,
+            height: 30,
+            channels: 16,
+            kernel: (3, 3),
+            stride: (2, 2),
+            pad: [0; 4],
+            method: PoolingMethod::Avg,
+            precision: PoolingPrecision::Fp16,
+        },
+        PoolCase {
+            label: "max 3x3s2 even int8",
+            width: 32,
+            height: 20,
+            channels: 16,
+            kernel: (3, 3),
+            stride: (2, 2),
+            pad: [0; 4],
+            method: PoolingMethod::Max,
+            precision: PoolingPrecision::Int8,
+        },
+    ]);
+}
+
+#[test]
+#[ignore = "needs /dev/accel/accel0 -- characterizes the C16 pool hang against IOVA"]
+fn pool_iova_probe() {
+    let ladder: Vec<usize> = std::env::var("ROCKET_POOL_BALLAST_MB")
+        .map(|list| list.split(',').map(|v| v.trim().parse().unwrap()).collect())
+        .unwrap_or_else(|_| vec![0, 60, 64, 66, 69, 70, 71, 72, 80, 128]);
+    for mb in ladder {
+        BALLAST_BYTES.with(|b| b.set(mb << 20));
+        println!("ballast {mb} MiB:");
+        run_cases(&[PoolCase {
+            label: "avg 7x7x2048 k7 (ResNet50 global pool)",
+            width: 7,
+            height: 7,
+            channels: 2048,
+            kernel: (7, 7),
+            stride: (1, 1),
+            pad: [0; 4],
+            method: PoolingMethod::Avg,
+            precision: PoolingPrecision::Fp16,
+        }]);
+    }
+    BALLAST_BYTES.with(|b| b.set(0));
 }

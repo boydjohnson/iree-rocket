@@ -766,6 +766,18 @@ fn build_pooling_tile_task(
         shape.pad_top,
     );
 
+    // ISSUES C16: the cube height is the rows an output window reads, not the
+    // whole input -- the same trim the tile planner applies to the width.
+    // With overlapping windows at stride > 1 (3x3/s2 on an even height) the
+    // last input row reaches no window; programmed anyway, it is left behind
+    // in the PPU and the *next* pooling job on that core hangs until the core
+    // power-cycles. Measured: every 3x3/s2 pool, max or avg, 16x16x8 to
+    // 114x114x64, poisoned the core for a following pool; 2x2/s2, 3x3/s1 and
+    // 7x7/s1, which consume their whole input, never did.
+    let consumed_input_height = ((shape.output_height - 1) * shape.stride_y + shape.kernel_height)
+        .saturating_sub(shape.pad_top)
+        .min(shape.input_height);
+
     let mut cmds: Vec<RegCmd> = Vec::new();
 
     // ========================================================================
@@ -806,7 +818,7 @@ fn build_pooling_tile_task(
     );
     cmds.push(
         Register::<PpuDataCubeInHeight>::new()
-            .cube_in_height(Bits::new(shape.input_height - 1))
+            .cube_in_height(Bits::new(consumed_input_height - 1))
             .build(),
     );
     cmds.push(
@@ -912,7 +924,7 @@ fn build_pooling_tile_task(
     );
     cmds.push(
         Register::<PpuRdmaCubeInHeight>::new()
-            .cube_in_height(Bits::new(shape.input_height - 1))
+            .cube_in_height(Bits::new(consumed_input_height - 1))
             .build(),
     );
     cmds.push(
@@ -1212,7 +1224,9 @@ mod tests {
             },
         );
         let output_area = (31_u32 * 4095).next_multiple_of(4);
-        assert_eq!(register_value::<PpuDataCubeInHeight>(&commands), 8191);
+        // 4095 output rows of a 3x3/s2 window read rows 0..=8190: the last
+        // input row reaches no window and is not programmed (ISSUES C16).
+        assert_eq!(register_value::<PpuDataCubeInHeight>(&commands), 8190);
         assert_eq!(register_value::<PpuDataCubeOutHeight>(&commands), 4094);
         assert_eq!(
             register_value::<PpuRdmaSrcSurfStride>(&commands),
@@ -1227,6 +1241,48 @@ mod tests {
             output_area << 4 | 2
         );
         assert_eq!(register_value::<PpuMiscCtrl>(&commands), 3);
+    }
+
+    /// ISSUES C16: both cube heights are the rows an output window reads.
+    /// Programming a trailing row no window reaches left state in the PPU
+    /// that hung the next pooling job on that core until it power-cycled.
+    #[test]
+    fn cube_in_height_is_the_consumed_rows() {
+        for (height, kernel, stride, consumed) in [
+            (16, 3, 2, 15), // 7 windows read rows 0..=14
+            (114, 3, 2, 113),
+            (15, 3, 2, 15), // odd height: every row is read
+            (16, 2, 2, 16), // non-overlapping: every row is read
+            (16, 3, 1, 16), // stride 1: every row is read
+            (7, 7, 1, 7),
+        ] {
+            let shape = shape(
+                16,
+                height,
+                kernel,
+                kernel,
+                stride,
+                stride,
+                PoolingPrecision::Fp16,
+            );
+            let commands = single_task(
+                &shape,
+                &PoolingBuffers {
+                    input_addr: 0,
+                    output_addr: 0,
+                },
+            );
+            assert_eq!(
+                register_value::<PpuDataCubeInHeight>(&commands),
+                consumed - 1,
+                "PPU height {height} k{kernel} s{stride}"
+            );
+            assert_eq!(
+                register_value::<PpuRdmaCubeInHeight>(&commands),
+                consumed - 1,
+                "PPU_RDMA height {height} k{kernel} s{stride}"
+            );
+        }
     }
 
     #[test]

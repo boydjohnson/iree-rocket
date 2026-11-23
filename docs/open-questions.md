@@ -51,38 +51,26 @@ doc comment]
 
 1.1.3 What state does a hung (watchdog-killed) job leave behind, and why does
 it make the device "sick" for the next job, sometimes in the next process?
-[LIMITS "Hazards inside the limits", ISSUES C16 "the wedge crosses processes"]
+[LIMITS "Hazards inside the limits", ISSUES Resolved C16; memory `npu-wedges-after-failed-job` "the wedge crosses processes"]
 
 - 1.1.3.1 Is there a reset that clears it short of a reboot? Once a board
   hung uninterruptibly in `PREP_BO` after a benchmark left the NPU busy, and
   it did not reproduce after reboot. [ISSUES P2 step 5]
 - 1.1.3.2 How long is the dwell between runs that the board protocol actually
   needs, and is that a property of the hardware or of the kernel's timeout
-  handling? [ISSUES C16, `npu-wedges-after-failed-job` memory]
+  handling? [ISSUES Resolved C16, `npu-wedges-after-failed-job` memory]
 
 ### 1.2 State that leaks between jobs
 
-1.2.1 What does an int8-accumulator convolution leave behind that hangs a
-later *pooling* job? C8's fix (`DPU_RDMA_BRDMA_CFG.brdma_data_use = 0`) was
-applied only in the conv emitter. [ISSUES C16]
-
-- 1.2.1.1 Is the poisoned state per core, so that the victim is whichever job
-  next lands on that core? The avg pool hangs right after the accumulator
-  conv, but the fp16 matmul right after the pool is clean and the max pool
-  that hangs is at the start of the next inference. [ISSUES C16]
-- 1.2.1.2 Does the pooling emitter need the same BRDMA treatment, or does the
-  accumulator program leave some other register that the PPU program never
-  re-initialises? [ISSUES C16]
-
-1.2.2 Is VGG int8's repeated-loop abort the same mechanism? VGG's main arm
-offloads no pooling at all, and C8's PM-dwell workaround does not clear it.
-[ISSUES C11]
+1.2.2 What is VGG int8's repeated-loop abort? C16 turned out to be a pooling
+program (an unread trailing input row), and VGG's main arm offloads no
+pooling at all, so it is probably a different mechanism. [ISSUES C11]
 
 1.2.3 Which registers does each emitter (conv, depthwise, pooling,
 element-wise, LUT) leave unwritten, relative to the union of all registers any
-emitter writes? C8 and C16 are both "a register one emitter sets and another
+emitter writes? C8 is "a register one emitter sets and another
 does not reset". An explicit audit might find the next one before a model
-does. [ISSUES C8, C16; inferred]
+does. [ISSUES C8, Resolved C16; inferred]
 
 ### 1.3 CBUF
 
@@ -254,7 +242,7 @@ for every job), not the flag-gated `093`/`PPU_DONE` one: this repo never sets
 
 2.7 What does the kernel do to a core after a job timeout? Does it fully
 reset the core (CNA, CORE, DPU, PPU state and IOMMU), or only stop it? This
-is the kernel half of 1.1.3. [LIMITS hazards, ISSUES C16]
+is the kernel half of 1.1.3. [LIMITS hazards, ISSUES Resolved C16]
 
 2.8 Is the per-file 4 GB IOVA window ever a constraint in practice, for
 example for an LLM's weights on one file? [ISSUES P1]
@@ -311,10 +299,7 @@ carrying the envelope in compile-time assumptions. [DYNAMIC_SHAPES DS3]
 
 3.3.3 When `HUNG_JOB_DISPATCH_FLOOR` refuses a buffer after a hang, should
 the driver attempt recovery (dwell, reset, retry) or always fail the
-inference? [ISSUES C16, C3]
-
-3.3.4 Are the clean iterations of the int8 ResNet50 arm actually correct? Its
-logits were never diffed against the CPU arm. [ISSUES C16]
+inference? [ISSUES Resolved C16, C3]
 
 ### 3.4 Correctness hazards still inside the limits
 
