@@ -201,16 +201,13 @@ integer contiguous chains. [ISSUES C4, `regcmd-task-model.md` in the notes]
 
 ## 2. `accel/rocket` kernel driver (mainline)
 
-2.1 Does the mainline IRQ-mediated transition between tasks of one
-`drm_rocket_job` actually fail on RK3588? The driver gave up on multi-task
-jobs because later tasks left their rows untouched. The notes read the same
-v7.1 source as handling it correctly, and `rocket_batch_submit` is ruled out.
-[ISSUES C4, `device.rs` ~1563]
-
-- 2.1.1 If it does work, was the original observation an incomplete per-task
-  regcmd, which produces the identical symptom in the notes? [ISSUES C4]
-- 2.1.2 This gates P4's reuse bits and would remove one submit and one
-  blocking fence wait per tile. [ISSUES C4, P4]
+2.1 What made multi-task jobs fail on v7.1: that kernel's IRQ-mediated
+task transition, or an incomplete per-task regcmd, which produces the
+identical symptom in the notes? On 7.3.5 they are exact: 58/58 multi-tile
+cases as single jobs, up to 64 tasks, and every conv matrix in one-job mode
+(ISSUES C4, 2026-11-23). The v7.1 kernel is gone from the board, so this
+matters only if an older kernel has to be supported. [ISSUES C4, `device.rs`
+~1563]
 
 2.2 Would upstream accept per-core scheduling entities with a core hint in
 `drm_rocket_submit.reserved`? That is the "30-line kernel patch" that would
@@ -236,10 +233,21 @@ status ioctl or register read. That rules out a userspace drain check (1.1.1)
 and makes IREE semaphore integration thread-per-wait. [`device.rs` dwell
 comment, ISSUES P8 "284 threads per inference"]
 
-2.6 What is the upstream status of the two out-of-tree patches `planck` runs?
-They are the PPU_DONE patch and the `rocket_npu_clk_hz`/`rocket_npu_uv` clock
-and regulator parameters. Which results in this repo would not reproduce on
-a stock kernel? [MULTICORE §7, ISSUES M2]
+2.6 What is the upstream status of the two out-of-tree changes `planck` has
+run: PPU completion and the `rocket_npu_clk_hz`/`rocket_npu_uv` clock and
+regulator parameters? Which results in this repo would not reproduce on a
+stock kernel? [MULTICORE §7, ISSUES M2]
+
+Part answered 2026-11-23, when `planck` was re-flashed to Armbian
+`7.3.5-edge-rockchip64` (reached as `ssh orangepi`). Its stock `rocket`
+(upstream plus Armbian's RK3576 series) arms only the DPU interrupts, so
+every pooling job is watchdog-killed at ~500 ms. Single-tile pools still
+come back right, but `tiled_pooling_matches_oracle` fails, because only the
+first task runs before the kill. The board now runs that module plus the
+*unconditional* PPU patch (`drm-misc-next` `0001`, which arms PPU and DPU
+for every job), not the flag-gated `093`/`PPU_DONE` one: this repo never sets
+`DRM_ROCKET_JOB_PPU_DONE`. It has no clock patch, so the NPU is back at
+200 MHz and every 600 MHz number predates the re-flash.
 
 - 2.6.1 Is NPU devfreq (OPP table plus governor) the right upstream shape for
   the clock fix, in place of module parameters? [ISSUES M2]
@@ -508,6 +516,13 @@ existed? [ISSUES "Method note"]
 board, one kernel build and one input per model. Have any results been
 checked on a second RK3588 (or RK3588S) board? [LIMITS ViT-B/16 note,
 `planck-measurement-environment` memory]
+
+Still one board, but now two kernels. Since 2026-11-23, `planck` runs Armbian
+`7.3.5-edge-rockchip64` and is reached as `ssh orangepi`. The full
+`iree-rocket-hal` hardware gate passes 400/400 there, in both debug and
+`--release`, with the PPU patch in place (see 2.6). Model-level numbers have
+not been re-taken on the new OS, and its NPU runs at 200 MHz (5.1.1 in
+reverse).
 
 ### 5.2 Docs that disagree with the code or with each other
 

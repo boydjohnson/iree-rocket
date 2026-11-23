@@ -87,6 +87,34 @@ Worth retesting, because it gates P4 (the CBUF reuse bits require an
 uninterrupted job) and it removes one submit ioctl + one blocking fence wait per
 tile.
 
+**Retested 2026-11-23: multi-task jobs are correct on 7.3.5** [measured]. `conv2d_oracle_hw`'s `multi_task_job_matches_oracle` takes every case of
+the gated regression matrices whose plan needs two or more programs and submits
+each case's programs as the tasks of **one** `drm_rocket_job`, against the same
+exact oracle. On `planck`'s own board (an Orange Pi 5 Max), re-flashed with
+Armbian `7.3.5-edge-rockchip64` and now reached as `ssh orangepi`, whose `rocket`
+carries Armbian's RK3576 series plus the PPU-completion patch:
+
+- **58 of 58** exact, six times back to back, across fp16, fp16→fp32, bf16,
+  int16, tf32, requantized int8 and the int8 accumulator — up to **64 tasks** in
+  one job, CBUF splits from 1/11 to 11/1, 7x7 and 5x5 kernels. Every dispatch
+  0.6–40 ms, so no watchdog kill hid behind a signalled fence.
+- `ROCKET_SUBMIT=one-job` re-runs every matrix in the file the same way: all 20
+  hardware tests, **812 cases (~250 multi-tile)**, pass.
+- `tiled_pooling_matches_oracle` already ran its 2–7 PPU tiles as one job, and
+  `conv_then_lut_hw` / `conv_with_add_hw` run two-task jobs; all pass there too.
+  Int4 is the one rung not covered — its gated matrix has no multi-tile case.
+
+So "task 0 completes correctly, but every later split leaves its output rows
+untouched" does not reproduce on the same silicon with today's kernel and
+today's register programs. The v7.1 kernel it was seen on is gone from the
+board, so which of the two made the difference cannot be re-checked. Both
+candidates stay live: this kernel's completion path is not v7.1's (Armbian's
+series takes the completion writes under `job_lock` and factors the
+completion tail out of the IRQ handler), and the incomplete-per-task-regcmd
+confound above would also explain it.
+What is left is `rocket-hal-driver`: it still gives each tile its own job,
+and `device.rs`'s comment still says multi-task jobs are unreliable.
+
 ---
 
 ## C6 (S4) — `DPU_BS_OW_OP` is always zero, including depthwise
@@ -701,7 +729,8 @@ and argues the wait drop is itself the proof the bit is honored.
 Three preconditions, all of which this repo would have to arrange:
 
 - The run of tiles must be **one uninterrupted job**, so the operand is still
-  resident. Blocked by C4 today.
+  resident. C4 measured multi-task jobs exact on 7.3.5 (2026-11-23); the
+  driver still has to be switched over to use them.
 - Only **one** bit can pay at a time (a 1-D task order makes only one operand
   identical to the previous task); pick by reuse depth.
 - The tile loop must be ordered so the shared operand is adjacent.
