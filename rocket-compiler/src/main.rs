@@ -177,6 +177,7 @@ fn compile_flags(common: &cli::CommonArgs, transform_spec: &Path) -> Vec<String>
     if let Some(triple) = &common.llvmcpu_target_triple {
         flags.push(format!("--iree-llvmcpu-target-triple={triple}"));
     }
+    flags.extend(common.iree_flags.iter().cloned());
     flags
 }
 
@@ -570,7 +571,24 @@ mod tests {
             cpu_device_name: cpu.to_string(),
             llvmcpu_target_cpu: "generic".to_string(),
             llvmcpu_target_triple: triple.map(str::to_string),
+            iree_flags: Vec::new(),
         }
+    }
+
+    #[test]
+    fn passthrough_iree_flags_come_last() {
+        let spec = PathBuf::from("spec.mlir");
+        let mut args = common_args("rocket_device", "cpu_device", Some("aarch64-linux-gnu"));
+        args.iree_flags = vec![
+            "--iree-llvmcpu-link-embedded=false".to_string(),
+            "--iree-llvmcpu-debug-symbols=true".to_string(),
+        ];
+        let flags = compile_flags(&args, &spec);
+        assert_eq!(
+            &flags[flags.len() - 2..],
+            args.iree_flags.as_slice(),
+            "{flags:?}"
+        );
     }
 
     /// The baseline arm exists to keep everything on the CPU; asking it to

@@ -135,6 +135,16 @@ pub struct CommonArgs {
     /// by the plugin and are target-independent. Defaults to the host triple.
     #[arg(long)]
     pub llvmcpu_target_triple: Option<String>,
+
+    /// An extra IREE compiler flag, passed through verbatim after the ones
+    /// this CLI sets, so it wins where they overlap. Repeatable. For
+    /// diagnostic builds the CLI has no option for, e.g. a CPU profile:
+    /// `--iree-flag=--iree-llvmcpu-link-embedded=false
+    /// --iree-flag=--iree-llvmcpu-debug-symbols=true` makes every CPU
+    /// dispatch a system shared library that `perf` can name (run it with
+    /// `IREE_PRESERVE_DYLIB_TEMP_FILES=1`).
+    #[arg(long = "iree-flag", allow_hyphen_values = true)]
+    pub iree_flags: Vec<String>,
 }
 
 #[derive(Args)]
