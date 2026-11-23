@@ -3639,6 +3639,50 @@ impl ConvPlan {
         &self.tiles
     }
 
+    /// Bytes past the input tensor's base that this plan's feature DMA
+    /// reads, for a dense (ARGB, `Cin <= 4`) input; `None` for surfaces,
+    /// which are always read from a driver-sized cube.
+    ///
+    /// A dense tile does not stop at its last row. It fetches
+    /// `CNA_CBUF_CON1.data_entries` pixels -- `cbuf_input_width(in_cols) *
+    /// in_rows`, the row rounded up to the CBUF's channel-atom width -- as
+    /// one contiguous run from the tile's feature address, so it reads
+    /// `(charged - real) * in_rows` pixels past its own data. On the last
+    /// tile that lands past the end of the tensor: 2070 bytes for ResNet's
+    /// 230x230 int8 stem. When the page there is unmapped the DMA faults,
+    /// the job never completes, and the watchdog kills it -- the stem hang.
+    /// Measured on RK3588 with the input at the top of the IOVA space, at
+    /// five shapes, to 64 bytes: the read ends at `data_entries` times the
+    /// dense pixel size every time (`stem_int8_loop_probe`,
+    /// `ROCKET_STEM_TAIL`).
+    ///
+    /// Only full-width tiles were measured. A column tile's contiguous run
+    /// would end before its own rows do, so the bound also covers a
+    /// line-by-line read of the charged width at the full row stride, and
+    /// never falls below the tensor itself.
+    pub fn dense_input_read_bytes(&self) -> Option<usize> {
+        let shape = self.shape;
+        if shape.layout() != FeatureLayout::Dense {
+            return None;
+        }
+        let pixel = (shape.in_channels * shape.precision.element_bytes()) as usize;
+        let row_stride = shape.input_row_stride() as usize;
+        let tensor = row_stride * shape.height as usize;
+        let fetched = self
+            .tiles
+            .iter()
+            .map(|tile| {
+                let charged = shape.cbuf_input_width(tile.columns.in_cols) as usize * pixel;
+                let rows = tile.rows.in_rows as usize;
+                let contiguous = charged * rows;
+                let by_line = rows.saturating_sub(1) * row_stride + charged;
+                tile.input_offset(shape) as usize + contiguous.max(by_line)
+            })
+            .max()
+            .unwrap_or(0);
+        Some(fetched.max(tensor))
+    }
+
     /// Where each tile's int32 accumulator output lands in one private
     /// scratch buffer: contiguous, disjoint ranges in tile order, summing
     /// to [`Shape::output_scratch_bytes`]. The HAL's
@@ -4279,6 +4323,39 @@ mod tests {
 
     fn code_of<T: std::fmt::Debug>(result: Result<T, PlanError>) -> PlanErrorCode {
         result.expect_err("expected a refusal").code()
+    }
+
+    /// The dense feature DMA's read end, at the five shapes it was measured
+    /// at on RK3588 (input at the top of the IOVA space, bisected to 64
+    /// bytes): every measured end lies within 64 bytes above this value,
+    /// which is the last tile's offset plus `data_entries` dense pixels. A
+    /// plan whose input mapping stops short of it hangs the core.
+    #[test]
+    fn dense_input_read_bytes_matches_the_measured_dma_end() {
+        // (width, height, kernel, measured end lower bound exclusive, upper bound)
+        for (width, height, kernel, low, high) in [
+            (230, 230, 7, 160_064, 160_128),
+            (230, 226, 7, 157_184, 157_248),
+            (230, 232, 7, 161_472, 161_536),
+            (200, 230, 7, 138_432, 138_496),
+            (226, 226, 3, 155_584, 155_648),
+        ] {
+            let shape = Shape::with_precision(width, height, 2, 3, 64, int8_accumulator(0))
+                .with_padding([0, 0]);
+            let plan = ConvPlan::new(shape, [kernel, kernel]);
+            let read = plan.dense_input_read_bytes().expect("Cin 3 is dense");
+            assert!(
+                low < read && read <= high,
+                "{width}x{height} k{kernel}: {read} outside the measured ({low}, {high}]"
+            );
+            // The stem's whole point: the read runs past the tensor.
+            assert!(read > (width * height * 3) as usize);
+        }
+        let surfaces = Shape::with_precision(32, 32, 1, 8, 64, int8_accumulator(0));
+        assert_eq!(
+            ConvPlan::new(surfaces, [3, 3]).dense_input_read_bytes(),
+            None
+        );
     }
 
     /// The 7x7 stride-2 dense stem plans without any probing override, over

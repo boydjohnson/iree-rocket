@@ -1682,6 +1682,13 @@ none of. C16 is resolved (2026-11-23) as a *pooling* program that leaves PPU
 state behind (see Resolved), and this arm offloads no pooling, so C11 is a
 different mechanism unless VGG's pools reach the NPU in some build.
 
+**Probably C17 (2026-11-23), not re-run.** VGG's first convolution is a
+`Cin` 3 dense input (`features.0`, lowered to 226x226), read straight out of
+IREE's buffer, and C17 is exactly "clean once, hangs under a repeated
+benchmark loop, depending on what the allocator put after that buffer". The
+fix there should clear this; the VGG model was not on the re-flashed board
+to confirm it.
+
 ---
 
 ## D1 (S4) — the FC lowering here and in the notes use opposite geometries, and this one may be better
@@ -1903,6 +1910,64 @@ instead on the way out, 31 ms of `compact` per inference against 7.5.
 What was settled and how, newest first, in place of the narratives — those are
 in this file's git history (`git log -p ISSUES.md`). Everything cited below is
 something that still exists: a commit, a file, or a memory.
+
+**C17 (S1) — 2026-11-23. The dense (ARGB, `Cin <= 4`) feature DMA reads past
+the end of its input; when the page there is unmapped the job hangs, and on
+Armbian's stock reset path that can corrupt kernel memory.** Found validating
+the 600 MHz clock patch: ResNet50-224 int8 with the 7x7 stem (the entry
+below) hit the watchdog on its stem in 6 of 8 benchmark processes, at 200
+and 600 MHz alike, while every single `iree-run-module` run was clean and
+bit-identical. Once a process hit it, every later stem in that process
+timed out. The 200 MHz session that admitted the stem had the same bursts
+in its kernel log; nobody had checked.
+
+- **Mechanism.** A dense tile fetches `CNA_CBUF_CON1.data_entries` pixels as
+  one contiguous run from its feature address, and `data_entries` is
+  `cbuf_input_width(in_cols) * in_rows`: the row rounded up to the CBUF's
+  channel-atom width (230 -> 240 at int8). The last tile therefore reads
+  `(240 - 230) * 69` pixels past its own rows, 2070 bytes, and past the end
+  of the tensor. The driver hands a dense input to the hardware straight
+  out of IREE's buffer (`stage_direct`), and IREE sizes that buffer exactly.
+  Whether the next page is mapped depends on where the allocator put it,
+  which is why the scratch pool decided it: `ROCKET_SCRATCH_POOL=0` was
+  clean (0 of 12 processes), zero-filling reused buffers did nothing,
+  a 1024-deep reuse quarantine did nothing, and the stem's program differed
+  between hanging and clean iterations only in `CNA_FEATURE_DATA_ADDR` (and
+  an unread `BS_BASE_ADDR`; `BRDMA` is off).
+- **Measured, not inferred.** With the input moved to the top of the IOVA
+  space (`stem_int8_loop_probe`, `ROCKET_STEM_TAIL`, behind
+  `hardware-characterization`), the stem hangs 5 of 5 with 20 mapped bytes
+  after the tensor and never with 4116. Bisected to 64 bytes at five shapes
+  (7x7 at 230x230, 230x226, 230x232, 200x230; 3x3 at 226x226), the read ends
+  at the last tile's offset plus `data_entries` dense pixels every time.
+- **Fix.** `ConvPlan::dense_input_read_bytes` (`rocket-core`) returns that
+  bound (and a line-by-line one, for column tiles nobody has measured).
+  `RocketBuffer.mapped_bytes` records how much IOVA a GEM object really
+  maps. `stage_direct` uses a binding directly only when the mapping covers
+  the read, and otherwise stages it into a scratch buffer big enough; fan-out
+  replica inputs are sized to the bound too. Register programs are
+  unchanged. Gate `dense_input_overfetch_stays_inside_the_planned_bound`
+  maps exactly the bound for int8 and fp16, `Cin` 1/3/4, at both kernels:
+  12 of 12 exact, no timeouts. At fp16 the bound equals the tensor (an
+  8-channel atom rounds 230 to 232 and the tiling ends short of it).
+- **Result.** ResNet50-224 int8 (stem build), 600 MHz: 0 timeouts in 10
+  benchmark processes, from 30-50 per 6, at 95 ms median on cpu 4-7 (the
+  staging copy is ~1 ms). Seven board models (ResNet50 int8 two builds and
+  fp16 two builds, MobileNetV2 fp16 and int8, Wide ResNet50-2 fp16)
+  bit-identical to their pre-fix outputs. `iree-rocket-hal` gate 410/410.
+- **The kernel half.** Armbian's `rocket_reset` detaches the IOMMU while the
+  hung core is still mid-DMA, so every timeout logged `Enable stall request
+  timed out` / `Disable paging request timed out` and an `iommu.c:157` WARN.
+  One burst during this work was followed by page-table corruption in the
+  submitting process (`free_pgtables` WARN, an `exit_mmap` Oops, "reboot is
+  needed"). That arm freed every data buffer after each dispatch, so the
+  probable route is in-flight DMA landing in freed pages. Patch `088`
+  (reset, then detach) ported to that module
+  (`~/projects/patches/rocket/088-rocket-drv-reset-before-iommu-detach-armbian-7.3.5.patch`):
+  dozens of deliberate hangs afterwards, every one recovered with a bare
+  `NPU job timed out` and nothing else.
+- C11 (VGG int8 aborting under a benchmark loop) is probably this bug; see
+  there.
 
 **ResNet's 7x7 stride-2 stem on the NPU at int8 (S2) — 2026-11-23.
 ResNet50-224 int8 150 -> 126 ms, bit-identical.** After the downsample, `perf`

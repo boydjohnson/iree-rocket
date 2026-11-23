@@ -727,6 +727,7 @@ unsafe fn build_replicas(
     ),
     bias: (ReplicaSource, usize),
     output_bytes: usize,
+    input_read_bytes: usize,
 ) -> Vec<Replica> {
     let alloc = |context: &Arc<crate::pool::NpuContext>, bytes: usize| unsafe {
         let fd = context.file.as_raw_fd();
@@ -780,7 +781,9 @@ unsafe fn build_replicas(
             Replica {
                 context: Arc::clone(context),
                 input: ReplicaCopy {
-                    buffer: alloc(context, input.1),
+                    // A replica's tiles read the same offsets as at home, and
+                    // a dense feature DMA reads past the tensor's end.
+                    buffer: alloc(context, input.1.max(input_read_bytes)),
                     source: input.0,
                     length: input.1,
                     geometry: input_geometry,
@@ -913,6 +916,14 @@ unsafe fn apply_replica_bytes(
 /// binding the hardware reads directly: the binding itself on context 0,
 /// a [`StagedCopy`] of it into this context's own scratch anywhere else.
 ///
+/// `read_bytes` is how far past the binding's start the hardware reads,
+/// which can be more than the binding holds: a dense conv input's feature
+/// DMA over-fetches past its last row ([`ConvPlan::dense_input_read_bytes`]).
+/// Every byte of that must be mapped, or the DMA faults and the job hangs
+/// until the watchdog kills it, so a binding whose GEM object stops short is
+/// staged on context 0 too, into a scratch buffer big enough for the read.
+/// What the over-fetch reads there is never used.
+///
 /// # Safety
 ///
 /// `binding.buffer` must be a live `RocketBuffer` and `cb.fd` a live Rocket
@@ -920,19 +931,25 @@ unsafe fn apply_replica_bytes(
 unsafe fn stage_direct(
     cb: &RocketCommandBuffer,
     binding: &iree_hal_buffer_ref_t,
+    read_bytes: usize,
     scratch_buffers: &mut Vec<RocketOwnedBuffer>,
     staged_copies: &mut Vec<StagedCopy>,
 ) -> (u32, u32) {
     let rocket_buffer = unsafe { &*(binding.buffer as *const RocketBuffer) };
-    if cb.context.id == 0 {
+    let length = binding.length;
+    let read_bytes = read_bytes.max(length);
+    let mapped = binding
+        .offset
+        .checked_add(read_bytes)
+        .is_some_and(|end| end <= rocket_buffer.mapped_bytes);
+    if cb.context.id == 0 && mapped {
         return (
             rocket_buffer.dma_address + binding.offset as u32,
             rocket_buffer.handle,
         );
     }
-    let length = binding.length;
     let scratch =
-        unsafe { RocketOwnedBuffer::new(cb.fd, length.max(1), BorrowedFd::borrow_raw(cb.fd)) };
+        unsafe { RocketOwnedBuffer::new(cb.fd, read_bytes.max(1), BorrowedFd::borrow_raw(cb.fd)) };
     let staged = (scratch.dma_address, scratch.handle);
     staged_copies.push(StagedCopy {
         source: CopySource::Binding {
@@ -1226,7 +1243,8 @@ pub enum RecordedOp {
         /// on every destruction path.
         scratch_buffers: Vec<RocketOwnedBuffer>,
         /// Copies into this context's scratch that must land before the job
-        /// runs -- see [`StagedCopy`]. Empty on context 0.
+        /// runs -- see [`StagedCopy`]. On context 0 only a direct read its
+        /// binding's mapping cannot cover (`stage_direct`).
         staged_copies: Vec<StagedCopy>,
         /// Sibling contexts this dispatch's tiles are spread over, and per
         /// task which one runs it (`0` is this command buffer's own
@@ -1550,7 +1568,8 @@ pub unsafe fn apply_ops_until_dispatch(
                 }
                 // Bindings the hardware would read directly, and packings
                 // cached on another context: byte copies into this
-                // context's own scratch. Empty on context 0.
+                // context's own scratch. On context 0, only a direct read
+                // that would run past its binding's mapping.
                 for copy in staged_copies {
                     let timer = profile::start();
                     let (source_ptr, generation) = match &copy.source {
@@ -2386,6 +2405,9 @@ unsafe extern "C" fn dispatch_impl(
                 note_dense_read(cb, &refs[1]);
                 note_dense_read(cb, &refs[2]);
             }
+            // Bytes the dense feature DMA reads from the input binding; zero
+            // when the input is read through a packed or chained cube.
+            let mut dense_read_bytes = 0usize;
             let (input_addr, input_handle, input_packing) = if let Some(cube) = chained_input {
                 (cube.dma_address, cube.handle, None)
             } else if shape.layout() == FeatureLayout::Surfaces {
@@ -2426,8 +2448,28 @@ unsafe extern "C" fn dispatch_impl(
                 scratch_buffers.push(scratch);
                 packed
             } else {
-                let (addr, handle) =
-                    unsafe { stage_direct(cb, &refs[0], &mut scratch_buffers, &mut staged_copies) };
+                // Dense (ARGB) input is read straight out of the binding, and
+                // its feature DMA reads past the tensor's last row; see
+                // `ConvPlan::dense_input_read_bytes`. `resolve_shape` already
+                // trial-planned this shape, so a panic here is an internal
+                // inconsistency, caught like the planning below.
+                let Ok(read_bytes) = std::panic::catch_unwind(|| {
+                    ConvPlan::new(programmed_shape, kernels).dense_input_read_bytes()
+                }) else {
+                    return status::from_code(
+                        crate::bindings::iree_status_code_e_IREE_STATUS_INTERNAL,
+                    );
+                };
+                dense_read_bytes = read_bytes.unwrap_or(0);
+                let (addr, handle) = unsafe {
+                    stage_direct(
+                        cb,
+                        &refs[0],
+                        dense_read_bytes,
+                        &mut scratch_buffers,
+                        &mut staged_copies,
+                    )
+                };
                 (addr, handle, None)
             };
             // IREE's conv ABI supplies a logical HWCF filter. Regular fp16
@@ -2451,8 +2493,9 @@ unsafe extern "C" fn dispatch_impl(
                         crate::bindings::iree_status_code_e_IREE_STATUS_INVALID_ARGUMENT,
                     );
                 }
-                let (addr, handle) =
-                    unsafe { stage_direct(cb, &refs[1], &mut scratch_buffers, &mut staged_copies) };
+                let (addr, handle) = unsafe {
+                    stage_direct(cb, &refs[1], 0, &mut scratch_buffers, &mut staged_copies)
+                };
                 StagedWeights::direct(addr, handle, refs[1].length as usize)
             } else if !shape.depthwise {
                 if !matches!(
@@ -2646,8 +2689,9 @@ unsafe extern "C" fn dispatch_impl(
                 scratch_buffers.push(scratch);
                 packed
             } else {
-                let (addr, handle) =
-                    unsafe { stage_direct(cb, &refs[2], &mut scratch_buffers, &mut staged_copies) };
+                let (addr, handle) = unsafe {
+                    stage_direct(cb, &refs[2], 0, &mut scratch_buffers, &mut staged_copies)
+                };
                 (addr, handle, None)
             };
             // DPU output write-back (16-byte slots normally, 128-byte native
@@ -2780,6 +2824,7 @@ unsafe extern "C" fn dispatch_impl(
                         ),
                         bias_source,
                         scratch_bytes,
+                        dense_read_bytes,
                     )
                 };
                 let buffers_for = |tile: usize| match tile_context[tile] {
@@ -3230,8 +3275,9 @@ unsafe extern "C" fn dispatch_impl(
                         crate::bindings::iree_status_code_e_IREE_STATUS_INVALID_ARGUMENT,
                     );
                 }
-                let (addr, handle) =
-                    unsafe { stage_direct(cb, &refs[1], &mut staged_scratch, &mut staged_copies) };
+                let (addr, handle) = unsafe {
+                    stage_direct(cb, &refs[1], 0, &mut staged_scratch, &mut staged_copies)
+                };
                 StagedWeights::direct(addr, handle, refs[1].length as usize)
             } else {
                 let Ok(weight_plan) = WeightPlan::for_matmul(*shape) else {
@@ -3302,8 +3348,9 @@ unsafe extern "C" fn dispatch_impl(
                     Some(scratch),
                 )
             } else {
-                let (addr, handle) =
-                    unsafe { stage_direct(cb, &refs[2], &mut staged_scratch, &mut staged_copies) };
+                let (addr, handle) = unsafe {
+                    stage_direct(cb, &refs[2], 0, &mut staged_scratch, &mut staged_copies)
+                };
                 (addr, handle, None, None)
             };
 
@@ -3423,6 +3470,7 @@ unsafe extern "C" fn dispatch_impl(
                         ),
                         bias_source,
                         output_scratch_bytes,
+                        0,
                     )
                 };
                 let programs: Vec<Vec<RegCmd>> = plan
