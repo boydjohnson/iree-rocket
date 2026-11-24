@@ -64,8 +64,7 @@ impl PoolingMethod {
     }
 
     /// The value the PPU should fill padded taps with, as the raw bit
-    /// pattern `PPU_PADDING_VALUE_1_CFG.pad_value_0` takes -- or `None`
-    /// where no measurement says what it is.
+    /// pattern `PPU_PADDING_VALUE_1_CFG.pad_value_0` takes.
     ///
     /// This is the reduction's identity element, so it follows from the
     /// method and the element format rather than being a caller's choice.
@@ -75,58 +74,41 @@ impl PoolingMethod {
     /// the executable wire format does not carry one and consumers derive
     /// it here instead.
     ///
-    /// What is backed by evidence, and what is not:
+    /// What is backed by evidence:
     ///
     /// * **Avg, either format: 0.** Every vendor average capture programs
     ///   zero, and it is the right answer twice over -- the PPU divides by
     ///   `kh * kw` whether or not a tap was padding (count-include-pad), so
     ///   a zero tap contributes nothing to the sum and still counts in the
-    ///   divisor.
-    /// * **Max at fp16: `0xFC00`, -inf.** The vendor's own padded max
-    ///   captures program it (`../rockchip-npu-notes/encodings/ppu-pooling.md`).
-    /// * **Max at int8: `0x80`, and the value is inert.** Measured 2026-11-24
-    ///   (`pooling_oracle_hw.rs`, `int8_max_pad_fill_probe`): thirteen
-    ///   encodings of the 35-bit `PPU_PADDING_VALUE` -- 0, +5, +127, 0x80,
-    ///   -5 at 8/16/32/35 bits, -128 at 35 bits, fp16 -inf, 0x8000,
-    ///   0x80000000 and the 35-bit minimum -- all give the clamp-to-image
-    ///   answer in every border window, including windows whose only image
-    ///   tap is -8, where a fill of 0 or +127 would have won. The int8 PPU
-    ///   max never lets a padded tap win, so the result is exact for any
-    ///   fill; `0x80` is programmed because it is the identity (-128) in
-    ///   the format's own width, which is what a register dump should show.
-    ///   **Padding must stay below the kernel** (see
-    ///   [`PoolingShape::validate`]): a window lying entirely in the
-    ///   padding hangs the job.
-    /// * **Everything else: unmeasured.** Min at either format has no
-    ///   capture and no hardware run behind it. The obvious guess --
-    ///   `0x7C00` for fp16 min -- is only a guess. Callers must refuse a
-    ///   *padded* pool here rather than fill in something plausible; an
-    ///   unpadded one never reads the field and can pass zero.
+    ///   divisor. The average is also the one reduction that *reads* the
+    ///   field (`avg_pad_fill_control_probe`), and not as its own format:
+    ///   int8 as an unsigned byte that wraps, fp16 not as fp16 bits.
+    /// * **Max and min, either format: the value is inert.** Measured
+    ///   2026-11-24 (`pooling_oracle_hw.rs`, `*_pad_fill_probe`): no
+    ///   encoding of the 35-bit `PPU_PADDING_VALUE` -- thirteen at int8 max
+    ///   (0, +127, 0x80, -5 at 8/16/32/35 bits, fp16 -inf, the 35-bit
+    ///   minimum, ...), ten at int8 min (0, -5 at 8/16/35 bits, 0x80, the
+    ///   35-bit maximum, ...), six at each fp16 reduction (+/-inf, +/-1.0,
+    ///   0, +/-65504) -- changes any border window, under both a worst-case
+    ///   constant input and `input_at`, whose border windows a mid-range
+    ///   fill would win. The average control shows the field live in those
+    ///   same windows, so this is the reduction ignoring it, not the write
+    ///   going nowhere: **a padded max or min is clamp-to-image**. Each
+    ///   format's identity is programmed anyway -- `0xFC00`/`0x7C00` (fp16
+    ///   -/+inf, the vendor's own max value) and `0x80`/`0x7F` (int8
+    ///   -128/+127) -- because that is what a register dump should show.
     ///
-    /// Lifting the rest is one probe each: `int8_max_pad_fill_probe`'s
-    /// shape, per method and format.
-    pub fn pad_fill_value(self, precision: PoolingPrecision) -> Option<u32> {
+    /// Clamp-to-image equals the framework's answer only while every window
+    /// holds an image pixel, which [`PoolingShape::validate`] guarantees by
+    /// refusing pad >= kernel -- and a window lying entirely in the padding
+    /// hangs the job anyway.
+    pub fn pad_fill_value(self, precision: PoolingPrecision) -> u32 {
         match (self, precision) {
-            (PoolingMethod::Avg, _) => Some(0),
-            (PoolingMethod::Max, PoolingPrecision::Fp16) => Some(0xFC00),
-            (PoolingMethod::Max, PoolingPrecision::Int8) => Some(0x80),
-            (PoolingMethod::Min, _) => None,
-        }
-    }
-
-    /// The fill a shape must actually program, or `None` when the
-    /// combination is unmeasured *and* the shape pads.
-    ///
-    /// An unpadded pool never reads the field, so an unmeasured combination
-    /// is perfectly runnable there -- which is most of them, and is why this
-    /// exists separately from [`PoolingMethod::pad_fill_value`]. Every
-    /// consumer needs both halves of that rule, and stating it twice is how
-    /// two consumers come to disagree about which pools they will run.
-    pub fn required_pad_fill(self, precision: PoolingPrecision, padded: bool) -> Option<u32> {
-        match (self.pad_fill_value(precision), padded) {
-            (Some(value), _) => Some(value),
-            (None, false) => Some(0),
-            (None, true) => None,
+            (PoolingMethod::Avg, _) => 0,
+            (PoolingMethod::Max, PoolingPrecision::Fp16) => 0xFC00,
+            (PoolingMethod::Max, PoolingPrecision::Int8) => 0x80,
+            (PoolingMethod::Min, PoolingPrecision::Fp16) => 0x7C00,
+            (PoolingMethod::Min, PoolingPrecision::Int8) => 0x7F,
         }
     }
 }
@@ -1539,21 +1521,18 @@ mod tests {
         shape(64, 48, 16, 3, 2, 2, PoolingPrecision::Int8).validate();
     }
 
-    /// A padded int8 max pool is runnable now; padded min still is not.
+    /// Every reduction has its format's identity: inert for max and min
+    /// (the PPU clamps to the image), read by the average.
     #[test]
-    fn padded_int8_max_has_a_fill_and_padded_min_does_not() {
-        assert_eq!(
-            PoolingMethod::Max.required_pad_fill(PoolingPrecision::Int8, true),
-            Some(0x80)
-        );
-        assert_eq!(
-            PoolingMethod::Min.required_pad_fill(PoolingPrecision::Int8, true),
-            None
-        );
-        assert_eq!(
-            PoolingMethod::Min.required_pad_fill(PoolingPrecision::Fp16, true),
-            None
-        );
+    fn every_reduction_programs_its_identity() {
+        use PoolingMethod::*;
+        use PoolingPrecision::*;
+        assert_eq!(Max.pad_fill_value(Fp16), 0xFC00);
+        assert_eq!(Max.pad_fill_value(Int8), 0x80);
+        assert_eq!(Min.pad_fill_value(Fp16), 0x7C00);
+        assert_eq!(Min.pad_fill_value(Int8), 0x7F);
+        assert_eq!(Avg.pad_fill_value(Fp16), 0);
+        assert_eq!(Avg.pad_fill_value(Int8), 0);
     }
 
     /// A window entirely in the padding hangs the PPU.

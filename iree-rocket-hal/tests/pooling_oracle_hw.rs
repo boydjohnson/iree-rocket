@@ -155,10 +155,7 @@ impl PoolCase {
             // Derived, never chosen -- the same rule the runtime applies when
             // it decodes a `PoolingDef`, and the reason that wire format has
             // no field for it.
-            pad_value: self
-                .method
-                .required_pad_fill(self.precision, self.pad.iter().any(|pad| *pad != 0))
-                .expect("this ladder only pads where the fill value is measured"),
+            pad_value: self.method.pad_fill_value(self.precision),
         }
     }
 
@@ -708,9 +705,10 @@ fn padded_max_pooling_matches_oracle() {
     ]);
 }
 
-/// Min pooling, unpadded only: no measurement says what the PPU should fill
-/// a padded min window with, and the runtime refuses that combination
-/// rather than guessing (`PoolingMethod::pad_fill_value`).
+/// Min pooling, unpadded and padded. A padded min is clamp-to-image on the
+/// PPU whatever the fill (`int8_min_pad_fill_probe`,
+/// `fp16_min_pad_fill_probe`), which is the oracle's answer while pad <
+/// kernel.
 #[test]
 #[ignore = "needs /dev/accel/accel0 -- cross-compile for aarch64 and run on the RK3588 board"]
 fn min_pooling_matches_oracle() {
@@ -734,6 +732,50 @@ fn min_pooling_matches_oracle() {
             kernel: (2, 2),
             stride: (2, 2),
             pad: [0; 4],
+            method: PoolingMethod::Min,
+            precision: PoolingPrecision::Int8,
+        },
+        PoolCase {
+            label: "min 3x3s2 pad1",
+            width: 32,
+            height: 32,
+            channels: 16,
+            kernel: (3, 3),
+            stride: (2, 2),
+            pad: [1, 1, 1, 1],
+            method: PoolingMethod::Min,
+            precision: PoolingPrecision::Fp16,
+        },
+        PoolCase {
+            label: "min 3x3s2 pad1",
+            width: 112,
+            height: 112,
+            channels: 64,
+            kernel: (3, 3),
+            stride: (2, 2),
+            pad: [1, 1, 1, 1],
+            method: PoolingMethod::Min,
+            precision: PoolingPrecision::Int8,
+        },
+        PoolCase {
+            label: "min 3x3s1 pad-lead",
+            width: 16,
+            height: 16,
+            channels: 8,
+            kernel: (3, 3),
+            stride: (1, 1),
+            pad: [2, 1, 0, 0],
+            method: PoolingMethod::Min,
+            precision: PoolingPrecision::Fp16,
+        },
+        PoolCase {
+            label: "min 3x3s1 pad-lead",
+            width: 16,
+            height: 16,
+            channels: 16,
+            kernel: (3, 3),
+            stride: (1, 1),
+            pad: [2, 1, 0, 0],
             method: PoolingMethod::Min,
             precision: PoolingPrecision::Int8,
         },
@@ -941,62 +983,56 @@ fn pool_iova_probe() {
     BALLAST_BYTES.with(|b| b.set(0));
 }
 
-/// What the PPU fills a padded **int8** max window with, per encoding of the
-/// 35-bit `PPU_PADDING_VALUE` (`_1_CFG` holds bits [31:0], `_2_CFG` bits
-/// [34:32], which the planner always zeroes and this patches).
+/// What the PPU fills a padded window with, per encoding of the 35-bit
+/// `PPU_PADDING_VALUE` (`_1_CFG` holds bits [31:0], `_2_CFG` bits [34:32],
+/// which the planner always zeroes and this patches).
 ///
 /// A characterization, not a gate: it asserts nothing about the fill and
 /// prints what each candidate does. 6x6 C16, 3x3 stride 1, padding 2 on
-/// every side, so each corner window holds exactly one image pixel. With the
-/// default constant -128 input, anything a border window returns above -128
-/// is the fill as the PPU read it; `ROCKET_FILL_INPUT=varied` runs
-/// `input_at` instead, whose all-negative border windows a fill of 0 or +127
-/// would win and which cannot hide a misplaced window.
+/// every side, so each corner window holds exactly one image pixel. The
+/// default input is the method's worst value everywhere (the smallest code
+/// for max, the largest for min), so whatever a border window returns past
+/// it is the fill as the PPU read it; `ROCKET_FILL_INPUT=varied` runs
+/// `input_at` instead, whose border windows a mid-range fill would win and
+/// which cannot hide a misplaced window.
 ///
-/// Measured 2026-11-24: every candidate gives the clamp-to-image answer in
-/// all 768 border windows under both inputs -- the int8 max ignores the
-/// fill (`PoolingMethod::pad_fill_value`). Padding 3 (a whole window in the
-/// padding) hung 13 of 13 dispatches instead, which is why
-/// `PoolingShape::validate` now refuses pad >= kernel.
+/// A window lying *entirely* in the padding would read the fill directly,
+/// but that shape (pad 3) hangs the PPU -- 13 of 13 dispatches killed -- which
+/// is why `PoolingShape::validate` refuses pad >= kernel.
 ///
-///     ./pooling_oracle_hw-<hash> int8_max_pad_fill_probe --ignored --nocapture
-#[test]
-#[ignore = "needs /dev/accel/accel0 -- characterization, prints rather than asserts"]
-fn int8_max_pad_fill_probe() {
+///     ./pooling_oracle_hw-<hash> pad_fill_probe --ignored --nocapture
+fn pad_fill_probe(
+    method: PoolingMethod,
+    precision: PoolingPrecision,
+    worst_input: f32,
+    candidates: &[(u32, u32, &str)],
+) {
     const SIDE: u32 = 6;
     const PAD: u32 = 2;
     const KERNEL: u32 = 3;
-    const CHANNELS: u32 = 16;
+    let channels = precision.channels_per_atom() * 2;
     let out_side = output_extent(SIDE, KERNEL, 1, PAD, PAD);
-    // `ROCKET_FILL_INPUT=varied` swaps the constant for `input_at`, whose
-    // [-8, 8] pattern has border windows that are all negative -- where a
-    // fill of 0 or +127 would win -- and cannot hide a misplaced window.
     let varied = std::env::var("ROCKET_FILL_INPUT").is_ok_and(|value| value == "varied");
-    // Otherwise the smallest code everywhere: whatever a border window
-    // returns above -128 is the fill as the PPU read it.
     let input = move |y: usize, x: usize, channel: usize| -> f32 {
         if varied {
             input_at(y, x, channel)
         } else {
-            -128.0
+            worst_input
         }
     };
-    // (PADDING_VALUE_1, PADDING_VALUE_2, what the encoding would mean)
-    let candidates: &[(u32, u32, &str)] = &[
-        (0x0000_0000, 0, "0"),
-        (0x0000_0005, 0, "+5"),
-        (0x0000_007F, 0, "+127 / 0x7F"),
-        (0x0000_0080, 0, "0x80: -128 as 8 bits, +128 wider"),
-        (0x0000_00FB, 0, "0xFB: -5 as 8 bits"),
-        (0x0000_FFFB, 0, "0xFFFB: -5 as 16 bits"),
-        (0xFFFF_FFFB, 0, "0xFFFFFFFB: -5 as 32 bits"),
-        (0xFFFF_FFFB, 7, "-5 as 35 bits"),
-        (0xFFFF_FF80, 7, "-128 as 35 bits"),
-        (0x0000_FC00, 0, "0xFC00: fp16 -inf"),
-        (0x0000_8000, 0, "0x8000: -32768 as 16 bits"),
-        (0x8000_0000, 0, "0x80000000"),
-        (0x0000_0000, 4, "-2^34: 35-bit minimum"),
-    ];
+    let reduce = |a: f32, b: f32| match method {
+        PoolingMethod::Max => a.max(b),
+        PoolingMethod::Min => a.min(b),
+        PoolingMethod::Avg => unreachable!("the probe is for max and min"),
+    };
+    println!(
+        "  {method:?} {precision:?}, input {}",
+        if varied {
+            "input_at".to_string()
+        } else {
+            format!("{worst_input} everywhere")
+        }
+    );
     for &(low, high, meaning) in candidates {
         std::thread::sleep(SETTLE);
         let _guard = NPU_TEST_LOCK
@@ -1005,16 +1041,16 @@ fn int8_max_pad_fill_probe() {
         let shape = PoolingShape {
             input_width: SIDE,
             input_height: SIDE,
-            input_channels: CHANNELS,
+            input_channels: channels,
             output_width: out_side,
             output_height: out_side,
-            output_channels: CHANNELS,
-            precision: PoolingPrecision::Int8,
+            output_channels: channels,
+            precision,
             kernel_width: KERNEL,
             kernel_height: KERNEL,
             stride_x: 1,
             stride_y: 1,
-            method: PoolingMethod::Max,
+            method,
             pad_left: PAD,
             pad_top: PAD,
             pad_right: PAD,
@@ -1035,48 +1071,47 @@ fn int8_max_pad_fill_probe() {
         };
         let dispatched = dispatch_pool(shape, &input, &patch);
 
-        let mut all_pad = std::collections::BTreeMap::<i32, usize>::new();
         let mut mixed = 0usize;
         let mut mixed_clamp = 0usize;
         let mut mixed_wrong = None;
-        let mut mixed_values = std::collections::BTreeMap::<i32, usize>::new();
+        let mut mixed_values = std::collections::BTreeMap::<String, usize>::new();
+        let mut interior_wrong = 0usize;
         for out_y in 0..out_side as usize {
             for out_x in 0..out_side as usize {
-                for channel in 0..CHANNELS as usize {
-                    let got = read_output(shape, &dispatched.raw, out_y, out_x, channel) as i32;
-                    let mut best: Option<i32> = None;
+                for channel in 0..channels as usize {
+                    let got = read_output(shape, &dispatched.raw, out_y, out_x, channel);
+                    let mut best: Option<f32> = None;
                     let mut padded_tap = false;
                     for ky in 0..KERNEL as isize {
                         for kx in 0..KERNEL as isize {
                             let y = out_y as isize - PAD as isize + ky;
                             let x = out_x as isize - PAD as isize + kx;
                             if (0..SIDE as isize).contains(&y) && (0..SIDE as isize).contains(&x) {
-                                let value = input(y as usize, x as usize, channel) as i32;
-                                best = Some(best.map_or(value, |best| best.max(value)));
+                                let value = input(y as usize, x as usize, channel);
+                                best = Some(best.map_or(value, |best| reduce(best, value)));
                             } else {
                                 padded_tap = true;
                             }
                         }
                     }
-                    match best {
-                        None => *all_pad.entry(got).or_default() += 1,
-                        Some(clamp) if padded_tap => {
-                            mixed += 1;
-                            *mixed_values.entry(got).or_default() += 1;
-                            if got == clamp {
-                                mixed_clamp += 1;
-                            } else {
-                                mixed_wrong.get_or_insert((out_y, out_x, channel, clamp, got));
-                            }
+                    let clamp = best.expect("pad < kernel: every window holds a pixel");
+                    if padded_tap {
+                        mixed += 1;
+                        *mixed_values.entry(format!("{got}")).or_default() += 1;
+                        if got == clamp {
+                            mixed_clamp += 1;
+                        } else {
+                            mixed_wrong.get_or_insert((out_y, out_x, channel, clamp, got));
                         }
-                        Some(_) => {}
+                    } else if got != clamp {
+                        interior_wrong += 1;
                     }
                 }
             }
         }
         println!(
-            "  fill {low:#010x}/{high} ({meaning}): all-pad outputs {all_pad:?}; \
-             mixed windows {mixed_clamp}/{mixed} equal clamp-to-image, values {mixed_values:?}{}{}",
+            "    fill {low:#010x}/{high} ({meaning}): border windows {mixed_clamp}/{mixed} \
+             equal clamp-to-image, values {mixed_values:?}{}; interior wrong {interior_wrong}{}",
             mixed_wrong
                 .map(|(y, x, c, want, got)| format!(
                     ", first other at ({y},{x},c{c}) clamp {want} got {got}"
@@ -1091,5 +1126,184 @@ fn int8_max_pad_fill_probe() {
                 String::new()
             },
         );
+    }
+}
+
+/// Measured 2026-11-24: every candidate gives the clamp-to-image answer
+/// under both inputs -- the int8 max ignores the fill
+/// (`PoolingMethod::pad_fill_value`).
+#[test]
+#[ignore = "needs /dev/accel/accel0 -- characterization, prints rather than asserts"]
+fn int8_max_pad_fill_probe() {
+    pad_fill_probe(
+        PoolingMethod::Max,
+        PoolingPrecision::Int8,
+        -128.0,
+        &[
+            (0x0000_0000, 0, "0"),
+            (0x0000_0005, 0, "+5"),
+            (0x0000_007F, 0, "+127 / 0x7F"),
+            (0x0000_0080, 0, "0x80: -128 as 8 bits, +128 wider"),
+            (0x0000_00FB, 0, "0xFB: -5 as 8 bits"),
+            (0x0000_FFFB, 0, "0xFFFB: -5 as 16 bits"),
+            (0xFFFF_FFFB, 0, "0xFFFFFFFB: -5 as 32 bits"),
+            (0xFFFF_FFFB, 7, "-5 as 35 bits"),
+            (0xFFFF_FF80, 7, "-128 as 35 bits"),
+            (0x0000_FC00, 0, "0xFC00: fp16 -inf"),
+            (0x0000_8000, 0, "0x8000: -32768 as 16 bits"),
+            (0x8000_0000, 0, "0x80000000"),
+            (0x0000_0000, 4, "-2^34: 35-bit minimum"),
+        ],
+    );
+}
+
+#[test]
+#[ignore = "needs /dev/accel/accel0 -- characterization, prints rather than asserts"]
+fn int8_min_pad_fill_probe() {
+    pad_fill_probe(
+        PoolingMethod::Min,
+        PoolingPrecision::Int8,
+        127.0,
+        &[
+            (0x0000_0000, 0, "0"),
+            (0x0000_0005, 0, "+5"),
+            (0x0000_007F, 0, "+127 / 0x7F"),
+            (0x0000_0080, 0, "0x80: -128 as 8 bits, +128 wider"),
+            (0x0000_00FB, 0, "0xFB: -5 as 8 bits, +251 wider"),
+            (0x0000_FFFB, 0, "0xFFFB: -5 as 16 bits"),
+            (0xFFFF_FFFB, 7, "-5 as 35 bits"),
+            (0x0000_7C00, 0, "0x7C00: fp16 +inf"),
+            (0x7FFF_FFFF, 0, "0x7FFFFFFF"),
+            (0xFFFF_FFFF, 3, "2^34 - 1: 35-bit maximum"),
+        ],
+    );
+}
+
+/// The control: fp16 max, where the vendor's own captures program -inf. If
+/// the PPU reads the fill anywhere, a 0 or +1.0 fill shows here.
+#[test]
+#[ignore = "needs /dev/accel/accel0 -- characterization, prints rather than asserts"]
+fn fp16_max_pad_fill_probe() {
+    pad_fill_probe(
+        PoolingMethod::Max,
+        PoolingPrecision::Fp16,
+        -8.0,
+        &[
+            (0x0000_FC00, 0, "-inf (the vendor's)"),
+            (0x0000_0000, 0, "0.0"),
+            (0x0000_3C00, 0, "+1.0"),
+            (0x0000_BC00, 0, "-1.0"),
+            (0x0000_7C00, 0, "+inf"),
+            (0x0000_FBFF, 0, "-65504"),
+        ],
+    );
+}
+
+#[test]
+#[ignore = "needs /dev/accel/accel0 -- characterization, prints rather than asserts"]
+fn fp16_min_pad_fill_probe() {
+    pad_fill_probe(
+        PoolingMethod::Min,
+        PoolingPrecision::Fp16,
+        8.0,
+        &[
+            (0x0000_7C00, 0, "+inf"),
+            (0x0000_0000, 0, "0.0"),
+            (0x0000_3C00, 0, "+1.0"),
+            (0x0000_BC00, 0, "-1.0"),
+            (0x0000_FC00, 0, "-inf"),
+            (0x0000_7BFF, 0, "+65504"),
+        ],
+    );
+}
+
+/// The control the max/min probes need: an *average* pool has to add the
+/// fill into its sum (it divides by the whole window), so if
+/// `PPU_PADDING_VALUE` reaches the hardware at all, a nonzero fill moves an
+/// average's border outputs. Input 0 everywhere, so a border window reads
+/// `padded_taps * fill / 9` and nothing else.
+#[test]
+#[ignore = "needs /dev/accel/accel0 -- characterization, prints rather than asserts"]
+fn avg_pad_fill_control_probe() {
+    const SIDE: u32 = 6;
+    const PAD: u32 = 2;
+    const KERNEL: u32 = 3;
+    let out_side = output_extent(SIDE, KERNEL, 1, PAD, PAD);
+    for (precision, candidates) in [
+        (
+            PoolingPrecision::Fp16,
+            &[
+                (0x0000u32, "0.0"),
+                (0x3C00, "+1.0"),
+                (0x4880, "+9.0"),
+                (0xC880, "-9.0"),
+            ][..],
+        ),
+        (
+            PoolingPrecision::Int8,
+            &[
+                (0x00, "0"),
+                (0x09, "+9"),
+                (0x12, "+18"),
+                (0xF7, "0xF7: -9 as 8 bits"),
+            ][..],
+        ),
+    ] {
+        let channels = precision.channels_per_atom();
+        for &(fill, meaning) in candidates {
+            std::thread::sleep(SETTLE);
+            let _guard = NPU_TEST_LOCK
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            let shape = PoolingShape {
+                input_width: SIDE,
+                input_height: SIDE,
+                input_channels: channels,
+                output_width: out_side,
+                output_height: out_side,
+                output_channels: channels,
+                precision,
+                kernel_width: KERNEL,
+                kernel_height: KERNEL,
+                stride_x: 1,
+                stride_y: 1,
+                method: PoolingMethod::Avg,
+                pad_left: PAD,
+                pad_top: PAD,
+                pad_right: PAD,
+                pad_bottom: PAD,
+                pad_value: fill,
+            };
+            shape.validate();
+            let dispatched = dispatch_pool(shape, &|_, _, _| 0.0, &|_| {});
+            // padded taps -> the outputs seen for that count
+            let mut by_taps =
+                std::collections::BTreeMap::<usize, std::collections::BTreeSet<String>>::new();
+            for out_y in 0..out_side as usize {
+                for out_x in 0..out_side as usize {
+                    let mut padded = 0;
+                    for ky in 0..KERNEL as isize {
+                        for kx in 0..KERNEL as isize {
+                            let y = out_y as isize - PAD as isize + ky;
+                            let x = out_x as isize - PAD as isize + kx;
+                            if !((0..SIDE as isize).contains(&y) && (0..SIDE as isize).contains(&x))
+                            {
+                                padded += 1;
+                            }
+                        }
+                    }
+                    let got = read_output(shape, &dispatched.raw, out_y, out_x, 0);
+                    by_taps.entry(padded).or_default().insert(format!("{got}"));
+                }
+            }
+            println!(
+                "  avg {precision:?} fill {fill:#06x} ({meaning}): padded taps -> outputs {by_taps:?}{}",
+                if dispatch::is_device_timeout(dispatched.elapsed) {
+                    " -- watchdog kill"
+                } else {
+                    ""
+                }
+            );
+        }
     }
 }

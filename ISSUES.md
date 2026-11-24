@@ -1911,6 +1911,31 @@ What was settled and how, newest first, in place of the narratives — those are
 in this file's git history (`git log -p ISSUES.md`). Everything cited below is
 something that still exists: a commit, a file, or a memory.
 
+**Padded max and min: the PPU ignores the fill at both precisions —
+2026-11-24.** The int8 max probe generalized to `pad_fill_probe` and run four
+ways: int8 max (13 encodings), int8 min (10, incl. 0, -5 at 8/16/35 bits and
+the 35-bit maximum), fp16 max and fp16 min (6 each: +/-inf, +/-1.0, 0,
++/-65504). Every candidate gives the clamp-to-image answer in every border
+window, under a worst-case constant input and under `input_at`. The
+fp16 max run was meant as the positive control (the vendor programs -inf
+there) and was inert too, so `avg_pad_fill_control_probe` is the real one: an
+average must add the fill into its sum, and an int8 fill of +9 moves the
+3- and 5-padded-tap windows to exactly 3 and 5. The field is live; max and
+min ignore it. (Incidentally, the average reads an int8 fill as an unsigned
+byte that wraps rather than saturates, fp16 fills are not fp16 bits, and at
+pad 2 only windows with two image rows take it -- irrelevant while averages
+program 0.)
+
+So `PoolingMethod::pad_fill_value` is now infallible -- each format's
+identity (min `0x7C00`/`0x7F`), programmed for register dumps, not for
+correctness -- `required_pad_fill` and the driver's padded-pool refusal are
+gone, and pad < kernel (`PoolingShape::validate`) is the only rule a padded
+pool needs. `min_pooling_matches_oracle` gains padded fp16/int8 cases (3x3 s2
+pad 1 at 32x32 and the 112x112x64 stem shape, plus leading-pad), all exact;
+the compiled pooling gate (`tools/e2e_pooling_regression.py`) passes, min and
+max at atol 0, 0 timeouts. No padded min target exists: no model pads a min
+pool.
+
 **Padded int8 max pool: the fill is inert (S3) — 2026-11-24. ResNet50-224
 int8 20.8 -> 20.2 ms, bit-identical.** `PoolingMethod::pad_fill_value` had
 no answer for (Max, Int8), so the stem pool's padding stayed a CPU
@@ -1937,8 +1962,8 @@ CPU dispatch executables 6 -> 5, NPU edges 82/82 packed, 20.7/20.9/20.9 ->
 `padded_max_pooling_matches_oracle` gains the int8 stem shape (112x112x64 3x3
 s2 pad 1) and an int8 leading-pad case, both exact; compiled e2e passes
 (`int8_max_pool_stem` now on the pad1 executable, 0 mismatches at atol 0);
-lit `rocket_int8_max_pool.mlir` gains `@pad2_stays_on_the_cpu`. Padded int8
-min and padded fp16 min are still unmeasured.
+lit `rocket_int8_max_pool.mlir` gains `@pad2_stays_on_the_cpu`. (Min: see
+the entry above.)
 
 **ResNet's int8 stem on the requantized path (S3) — 2026-11-24. ResNet50-224
 int8 24.6 -> 21.2 ms.** The stem (7x7 stride 2, `Cin` 3 -> 64) ran on the

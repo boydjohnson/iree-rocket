@@ -19,12 +19,10 @@
 // a matcher to claim. ONNX has no MinPool operator at all, which is
 // presumably why the dialect never grew one.
 //
-// The zero padding these executables bake is load-bearing here in a way it is
-// not for max. `PoolingMethod::pad_fill_value` has no measured identity for
-// min at *any* precision, so `required_pad_fill` returns None for a padded
-// min and the driver refuses the executable outright. An unpadded pool never
-// reads the field, and the driver derives `padded` from the executable's own
-// pad fields, so tiling a wide input cannot reintroduce it.
+// These executables bake zero padding; model-level padding stays a CPU
+// tensor.pad. A padded min would be exact on the PPU too -- it clamps the
+// window to the image whatever the fill (`*_pad_fill_probe`) -- but no model
+// pads a min pool, so no padded min target exists.
 
 // ---------------------------------------------------------------- accepted
 

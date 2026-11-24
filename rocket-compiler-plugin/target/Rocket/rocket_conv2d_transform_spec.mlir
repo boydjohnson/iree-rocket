@@ -335,13 +335,11 @@
 // the accumulator initialiser, which linalg defines into the reduction
 // itself (`O = max(O, I)`, confirmed by generalizing the named op).
 //
-// Padding stays baked at zero, and for max that is what makes the method
-// safe rather than merely conventional. `PoolingMethod::pad_fill_value`
-// (pooling.rs) has a measured pad fill for max only at fp16 (0xFC00), none
-// at int8, and none for min at any precision; an *unpadded* pool never reads
-// the field, which is why an unmeasured combination is still runnable there.
-// Model-level padding arrives as a separate tensor.pad the CPU runs, so the
-// executable never sees a padded window.
+// Padding stays baked at zero here: model-level padding arrives as a
+// separate tensor.pad the CPU runs. A padded max or min would be exact on the
+// PPU -- it ignores the pad fill and clamps the window to the image, at both
+// precisions (`*_pad_fill_probe`, pooling_oracle_hw.rs) -- and the int8 pad1
+// target below is the one place that is used so far.
 //
 // Stride is baked, one executable per value, matching the convolution
 // variants. Both exist here because -- unlike the average pool, where every
@@ -415,14 +413,9 @@
                         "kernel_width", "kernel_height"]
 }>
 
-// Min pooling: the third PPU reduction, and the one whose zero padding is
-// not merely conventional but *required*. `PoolingMethod::pad_fill_value`
-// has no measured identity for min at any precision -- unlike max, which has
-// 0xFC00 at fp16 -- so `required_pad_fill` returns None for a padded min and
-// the driver refuses the executable outright (executable_cache.rs). Baking
-// all four pad fields to zero is what keeps that path unreachable, and the
-// driver derives `padded` from these fields alone, so tiling a wide input
-// cannot reintroduce it.
+// Min pooling: the third PPU reduction. Unpadded like the others; a padded
+// min is clamp-to-image on the PPU (`*_pad_fill_probe`), but no model pads
+// one.
 //
 // NHWC only, and that is linalg's asymmetry rather than a choice here: the
 // dialect defines pooling_nchw_max but no pooling_nchw_min, so there is no

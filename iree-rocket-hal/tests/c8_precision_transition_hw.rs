@@ -1174,7 +1174,7 @@ impl PreparedPool {
             pad_top: 0,
             pad_right: 0,
             pad_bottom: 0,
-            pad_value: method.required_pad_fill(precision, false).unwrap(),
+            pad_value: method.pad_fill_value(precision),
         };
         let surfaces = shape.programmed_channels() as usize / 8;
         let in_bytes = surfaces * ((width * height) as usize).next_multiple_of(4) * 16;

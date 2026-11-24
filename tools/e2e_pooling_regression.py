@@ -55,11 +55,10 @@ pool also returns one of its inputs unchanged. It is NHWC-only because linalg
 defines `pooling_nchw_max` but no `pooling_nchw_min`, so the layout has no op
 for a matcher to claim.
 
-`min_pool_wide` earns its place: min is the method with *no* measured
-pad-fill identity at any precision, so `required_pad_fill` refuses a padded
-min outright. The executables bake zero padding and the driver derives
-`padded` from those fields alone, which means tiling cannot reintroduce it --
-and that case is what says so on hardware rather than on inspection.
+`min_pool_wide` earns its place: it is the min pool wide enough to tile,
+and a tile that misplaced its border would show here. (The pad fill itself is
+inert for min and max -- the PPU clamps to the image, `*_pad_fill_probe` --
+and these executables bake zero padding anyway.)
 
 Unlike the convolution harness, the window operand is a `tensor.empty()`
 inside each function rather than a fixture: a pool's second operand carries no
