@@ -315,8 +315,16 @@ pub fn conv_ceilings(
         // measurement, not correctness: at the board's 200 MHz NPU clock the
         // fp16 stem costs ~16 ms on the NPU against ~11 ms on four A76s, and
         // ResNet50-224 fp16 went 105 -> 115 ms with it offloaded (int8: 150
-        // -> 125 ms, bit-identical). Revisit at 600 MHz. Stride 1 at 7x7 has
-        // no matcher and no entry here; nothing measured needs it.
+        // -> 125 ms, bit-identical). **Re-measured at 600 MHz (2026-11-24)
+        // and still a loss:** with an fp16 7x7 s2 matcher and this entry,
+        // ResNet50-224 fp16 went 55.3 -> 57.3 ms and ResNeXt50 192 -> 194 ms
+        // (ABAB, cpu 4-7, both oracle-correct). The stem takes ~3.4 ms of
+        // NPU time plus ~0.9 ms compaction per inference: at `Cin` 3 the CNA
+        // runs on its dense image path and most of the MAC array idles.
+        // A space-to-depth rewrite (7x7 s2 over 3 channels as 4x4 s1 over
+        // 12) would be the way to make it pay; nothing has tried it. Stride
+        // 1 at 7x7 has no matcher and no entry here; nothing measured needs
+        // it.
         (PrecisionClass::Int8Accumulator, false, 7) if stride == 2 => {
             ceilings(conv::MAX_DENSE_CHANNELS, 128)
         }

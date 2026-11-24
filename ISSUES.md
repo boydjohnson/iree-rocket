@@ -1911,6 +1911,22 @@ What was settled and how, newest first, in place of the narratives — those are
 in this file's git history (`git log -p ISSUES.md`). Everything cited below is
 something that still exists: a commit, a file, or a memory.
 
+**fp16 7x7 stride-2 stem stays on the CPU, re-measured at 600 MHz —
+2026-11-24.** The 2026-11-24 survey found the fp16 stem refused in ResNeXt50
+and ResNet50 ("no fp16 dense 7x7 stride-2"). Correctness was never the
+question -- `stem_7x7_stride2_matches_oracle` has gated fp16 exact all along
+-- and the refusal was a 200 MHz measurement with "revisit at 600 MHz"
+attached. Revisited: with fp16 admission plus 7x7 twins of the plain,
+ReLU and demoted-ReLU stride-2 matchers, the stem is claimed in both models
+(ResNet50 then has every conv on the NPU), and both get slower -- ResNet50-224
+fp16 55.2/55.5/55.3 -> 57.2/57.4/57.3 ms, ResNeXt50 191/192/192 ->
+193/203/194 ms (ABAB, cpu 4-7, oracle-correct, 0 timeouts). `ROCKET_PROFILE`:
+the stem is ~3.4 ms of NPU time and ~0.9 ms of compaction per inference; at
+`Cin` 3 the CNA runs its dense image path and most of the array idles.
+Reverted; the measurement lives in `admission.rs`'s comment. The lever, if
+anyone wants it: a space-to-depth rewrite (7x7 s2 over 3 channels as 4x4 s1
+over 12, the even kernel at stride 1 that is already backed).
+
 **Patchify convolutions run as matmuls — 2026-11-24. vit_b_16 254 -> 202
 ms, ConvNeXt-T 170 -> 112 ms, BLIP 951 -> 825 ms.** A convolution whose
 stride equals its kernel tiles the image without overlap: ViT/BLIP's 16x16
