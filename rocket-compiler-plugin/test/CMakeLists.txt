@@ -22,6 +22,7 @@ iree_lit_test_suite(
     "rocket_int8_requant_pad1.mlir"
     "rocket_int8_residual_add.mlir"
     "rocket_int8_max_pool.mlir"
+    "rocket_block_diagonal_grouped_conv.mlir"
     "rocket_patchify_conv.mlir"
     "rocket_space_to_depth_stem.mlir"
     "rocket_fp16_max_pool_pad.mlir"

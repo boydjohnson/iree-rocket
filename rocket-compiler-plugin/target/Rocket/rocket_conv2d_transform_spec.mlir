@@ -10891,8 +10891,17 @@ module attributes {transform.with_named_sequence} {
     // before attempting any Rocket specialization: the first pass does the
     // conversion but leaves the op generalized to linalg.generic, so the
     // second re-specializes it back to the named op the matchers look for.
+    // A grouped convolution (ResNeXt) has no channels-last conversion and no
+    // matcher; as the dense convolution with a block-diagonal filter it gets
+    // both, at G x the multiply-adds. Before the channels-last conversion so
+    // it is converted like any dense convolution. `offload` is flipped to
+    // false in `rocket-compiler --no-offload`'s spec: a CPU baseline must keep
+    // the true grouped convolution, not pay G x for it.
+    %ungrouped_funcs = transform.apply_registered_pass
+        "rocket-block-diagonal-grouped-conv" with options = {"offload" = true} to %dequantized_funcs
+      : (!transform.any_op) -> !transform.any_op
     %channels_last_funcs = transform.apply_registered_pass
-        "iree-preprocessing-convert-conv-to-channels-last" to %dequantized_funcs
+        "iree-preprocessing-convert-conv-to-channels-last" to %ungrouped_funcs
       : (!transform.any_op) -> !transform.any_op
     %specialized_funcs = transform.apply_registered_pass
         "linalg-specialize-generic-ops" to %channels_last_funcs

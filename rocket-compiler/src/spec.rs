@@ -183,6 +183,13 @@ const DIM_BOUNDS_OP: &str = "transform.iree.match.dim_bounds";
 /// decline every operation. Both spellings are part of the contract with
 /// `RocketTransformOps.td`; a rename there has to land here.
 const ADMITTED_OP: &str = "transform.rocket.match.admitted";
+
+/// The pass option an offload-only preprocessing rewrite carries in the spec
+/// (`rocket-block-diagonal-grouped-conv`): a rewrite that only pays when the
+/// NPU claims its result. [`neutralize`] turns it off, so the CPU baseline
+/// is not charged for work the offload exists to move.
+const OFFLOAD_ONLY_ON: &str = r#"with options = {"offload" = true}"#;
+const OFFLOAD_ONLY_OFF: &str = r#"with options = {"offload" = false}"#;
 const NO_OFFLOAD_ATTR: &str = "no_offload";
 
 /// Result of neutering a spec, kept together so the caller can report what it
@@ -243,6 +250,10 @@ pub fn neutralize(spec: &str) -> Result<NeutralizedSpec, Box<dyn Error>> {
         // where the ceilings went -- and a comment is not a predicate.
         if line.trim_start().starts_with("//") {
             text.push_str(line);
+            continue;
+        }
+        if line.contains(OFFLOAD_ONLY_ON) {
+            text.push_str(&line.replace(OFFLOAD_ONLY_ON, OFFLOAD_ONLY_OFF));
             continue;
         }
         if line.contains(ADMITTED_OP) {
@@ -513,6 +524,20 @@ mod tests {
 "#;
 
     #[test]
+    fn an_offload_only_rewrite_is_switched_off() {
+        let spec = SPEC.replace(
+            "  transform.named_sequence @__transform_main(%module: !transform.any_op) {\n",
+            "  transform.named_sequence @__transform_main(%module: !transform.any_op) {\n    \
+             %u = transform.apply_registered_pass \"rocket-block-diagonal-grouped-conv\" \
+             with options = {\"offload\" = true} to %f : (!transform.any_op) -> !transform.any_op\n",
+        );
+        assert!(spec.contains(OFFLOAD_ONLY_ON));
+        let out = neutralize(&spec).expect("spec is well formed");
+        assert!(!out.text.contains(OFFLOAD_ONLY_ON), "{}", out.text);
+        assert!(out.text.contains(OFFLOAD_ONLY_OFF), "{}", out.text);
+    }
+
+    #[test]
     fn every_bound_becomes_the_sentinel() {
         let out = neutralize(SPEC).expect("spec is well formed");
         assert_eq!(out.rewritten, 5);
@@ -748,6 +773,11 @@ transform.named_sequence @match_conv(%r: !transform.any_op) -> !transform.any_op
         // pass while only half the loop was disarmed.
         assert!(op_lines(&spec, ADMITTED_OP) >= 60);
         assert!(op_lines(&spec, DIM_BOUNDS_OP) >= 40);
+        // The block-diagonal grouped-conv rewrite runs only when offloading:
+        // the shipped spec turns it on and the no-offload spec turns it off.
+        assert_eq!(op_lines(&spec, OFFLOAD_ONLY_ON), 1);
+        assert_eq!(op_lines(&out.text, OFFLOAD_ONLY_ON), 0);
+        assert_eq!(op_lines(&out.text, OFFLOAD_ONLY_OFF), 1);
         for line in out
             .text
             .lines()

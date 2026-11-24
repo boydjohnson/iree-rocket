@@ -1546,7 +1546,9 @@ def run_raw_gate(host: str, remote_dir: str, linker: str) -> None:
 
 
 def write_compiled_fixture(work_dir: Path) -> None:
-    (work_dir / "conv.mlir").write_text(CONV_MLIR + packed_weight_fixtures())
+    (work_dir / "conv.mlir").write_text(
+        CONV_MLIR + packed_weight_fixtures() + grouped_conv_fixture()
+    )
     rng = np.random.default_rng(20260830)
     weights = rng.uniform(-0.5, 0.5, size=(3, 3, 512, 512)).astype(np.float16)
     np.save(work_dir / "kernel.npy", weights)
@@ -1831,6 +1833,9 @@ def write_compiled_fixture(work_dir: Path) -> None:
     np.save(work_dir / "fp16_patchify_conv_feature.npy", patchify_rng.uniform(-1.0, 1.0, size=(1, 33, 33, 32)).astype(np.float32))
     np.save(work_dir / "fp16_patchify_conv_down.npy", patchify_rng.uniform(-0.25, 0.25, size=(2, 2, 32, 64)).astype(np.float32))
 
+    grouped_rng = np.random.default_rng(20261129)
+    np.save(work_dir / "fp16_grouped_conv_input.npy", grouped_rng.uniform(-1.0, 1.0, size=(1, 64, 18, 18)).astype(np.float32))
+
     # PACKED_WEIGHT_CASES: their filters are constants in the MLIR
     # (`packed_weight_fixtures`), so only the activations are inputs. Their
     # own rng, so the streams above and below do not move.
@@ -1986,6 +1991,7 @@ def compile_modules(
         ("fp16_matmul_chain", "rocket_matmul_executable"),
         ("fp16_patchify_conv", "rocket_matmul_executable"),
         ("fp16_stem_space_to_depth", "rocket_pooling_max_pad1_executable_s2"),
+        ("fp16_grouped_conv", "rocket_dynamic_executable"),
         *PACKED_WEIGHT_CASES,
         ("requant_int8_chain", "rocket_dynamic_int8_requant_executable"),
         ("requant_int8_chain_cpu_between", "rocket_dynamic_int8_requant_executable"),
@@ -2264,6 +2270,39 @@ func.func @depthwise_fp16_packed_weights(%input: tensor<1x16x16x576xf16>, %init:
       ins(%input, %filter : tensor<1x16x16x576xf16>, tensor<3x3x576xf16>)
       outs(%init : tensor<1x14x14x576xf32>) -> tensor<1x14x14x576xf32>
   return %0 : tensor<1x14x14x576xf32>
+}}
+"""
+
+
+def grouped_conv_fixture() -> str:
+    """A ResNeXt-style grouped 3x3 convolution with a constant filter.
+
+    rocket-block-diagonal-grouped-conv only rewrites a constant filter (a
+    runtime one would be expanded on the CPU every call), so the filter is
+    rendered into the MLIR rather than passed in. 8 groups of 8 channels: a
+    mis-placed block or a group read against the wrong input slice shows as
+    whole channels wrong. Its own rng.
+    """
+    rng = np.random.default_rng(20261128)
+    filt = rng.uniform(-0.25, 0.25, size=(8, 8, 8, 3, 3)).astype(np.float32)
+    return f"""
+// ---- grouped convolution, as the ONNX importer spells it ----
+// rocket-block-diagonal-grouped-conv turns it into a dense 3x3 with a
+// block-diagonal filter, which the dense Rocket path claims.
+func.func @fp16_grouped_conv(%input: tensor<1x64x18x18xf32>) -> tensor<1x64x16x16xf32> {{
+  %filter = arith.constant dense<{hex_constant(filt)}> : tensor<8x8x8x3x3xf32>
+  %zero = arith.constant 0.000000e+00 : f32
+  %grouped = tensor.expand_shape %input [[0], [1, 2], [3], [4]] output_shape [1, 8, 8, 18, 18]
+      : tensor<1x64x18x18xf32> into tensor<1x8x8x18x18xf32>
+  %empty = tensor.empty() : tensor<1x8x8x16x16xf32>
+  %init = linalg.fill ins(%zero : f32) outs(%empty : tensor<1x8x8x16x16xf32>) -> tensor<1x8x8x16x16xf32>
+  %conv = linalg.conv_2d_ngchw_gfchw
+      {{dilations = dense<1> : vector<2xi64>, strides = dense<1> : vector<2xi64>}}
+      ins(%grouped, %filter : tensor<1x8x8x18x18xf32>, tensor<8x8x8x3x3xf32>)
+      outs(%init : tensor<1x8x8x16x16xf32>) -> tensor<1x8x8x16x16xf32>
+  %out = tensor.collapse_shape %conv [[0], [1, 2], [3], [4]]
+      : tensor<1x8x8x16x16xf32> into tensor<1x64x16x16xf32>
+  return %out : tensor<1x64x16x16xf32>
 }}
 """
 
@@ -2630,6 +2669,13 @@ def run_compiled_gate(
                 "fp16_stem_space_to_depth_filter.npy",
             ),
             ("fp16_stem_space_to_depth_out_rocket.npy",),
+            0.05,
+            0.02,
+        ),
+        Case(
+            "fp16_grouped_conv",
+            ("fp16_grouped_conv_input.npy",),
+            ("fp16_grouped_conv_out_rocket.npy",),
             0.05,
             0.02,
         ),
