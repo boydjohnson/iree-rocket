@@ -31,6 +31,21 @@ trusting the flags:
     validated. Activation zero points are free to be non-zero: the compiler
     folds those into a CPU-side correction.
 
+One choice is about speed rather than correctness: Relu is quantized
+alongside Conv (`--quantize-op-types Conv Relu`, the default). For Relu,
+ORT's QOperator quantizer does not emit a quantized op -- it *removes* the
+activation and gives the convolution in front of it the activation's output
+scale and zero point, so the clamp at zero point 0 is the ReLU. (Clip, the
+ReLU6 MobileNetV2 uses, is handled the same way by ORT but has not been
+measured through this stack, so it is not in the default.) Left
+in float, every Conv -> Relu -> Conv edge became QLinearConv -> Dequantize ->
+Relu -> Quantize -> QLinearConv: a CPU requantization pass between every
+pair of offloaded convolutions (33 of them on ResNet50) and no NPU->NPU edge
+anywhere. It also changes the model's numbers (one rounding instead of two),
+so outputs are not comparable with a model quantized without it. A Relu
+whose input is not quantized -- after a residual Add, which stays float --
+is left as it is.
+
 The batch dimension is pinned to 1 first. Every matcher in the Rocket
 transform spec requires batch 1, so a symbolic-batch model compiles perfectly
 cleanly and offloads nothing at all.
@@ -265,13 +280,16 @@ def main() -> None:
     parser.add_argument(
         "--quantize-op-types",
         nargs="+",
-        default=["Conv"],
+        default=["Conv", "Relu"],
         metavar="OP",
-        help="ONNX op types to quantize (default: Conv). Widening this is "
-        "usually wrong: QOperator format spells quantized Add/Gemm/pooling as "
-        "com.microsoft ops that torch-mlir cannot lower at all, and Conv is "
-        "the only thing Rocket offloads anyway. Everything left in float is "
-        "demoted to f16 and can still take the Rocket fp16 path.",
+        help="ONNX op types to quantize (default: Conv Relu). Relu is not a "
+        "quantized op here: ORT folds it into the convolution in front of it, "
+        "which is what lets consecutive offloaded convolutions chain on the "
+        "NPU (see the module docstring). Widening further is usually wrong: "
+        "QOperator format spells quantized Add/Gemm/pooling as com.microsoft "
+        "ops that torch-mlir cannot lower at all, and Conv is the only thing "
+        "Rocket offloads anyway. Everything left in float is demoted to f16 "
+        "and can still take the Rocket fp16 path.",
     )
     parser.add_argument(
         "--quantize-asymmetric-pads",
