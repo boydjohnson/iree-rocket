@@ -362,6 +362,26 @@
                         "kernel_width", "kernel_height"]
 }>
 
+// The int8 twin of #rocket_pooling_max_target_s2, for the max pool a
+// quantized model runs on its codes (rocket-fuse-int8-max-pool). Unpadded,
+// like the fp16 one: the model's padding (filled with the smallest code, -128)
+// stays a CPU `tensor.pad`, because padded int8 max has no measured fill
+// (PoolingMethod::pad_fill_value). Hardware: `max_pooling_matches_oracle`,
+// exact at ResNet's 114x114x64 3x3 stride 2.
+#rocket_pooling_max_int8_target_s2 = #hal.executable.target<"rocket", "rocket-flatbuffer-v1", {
+  kernel = "pooling",
+  runtime_layout = true,
+  input_width = 0 : i32, input_height = 0 : i32, channels = 0 : i32,
+  output_width = 0 : i32, output_height = 0 : i32,
+  kernel_width = 0 : i32, kernel_height = 0 : i32,
+  stride_x = 2 : i32, stride_y = 2 : i32,
+  pad_left = 0 : i32, pad_top = 0 : i32, pad_right = 0 : i32, pad_bottom = 0 : i32,
+  method = "max",
+  precision = "int8",
+  runtime_dimensions = ["input_width", "input_height", "channels",
+                        "kernel_width", "kernel_height"]
+}>
+
 #rocket_pooling_max_target_s2 = #hal.executable.target<"rocket", "rocket-flatbuffer-v1", {
   kernel = "pooling",
   runtime_layout = true,
@@ -1119,6 +1139,20 @@ module attributes {transform.with_named_sequence} {
 
   hal.executable private @rocket_pooling_max_executable {
     hal.executable.variant public @rocket_pooling_max_v1 target(#rocket_pooling_max_target) {
+      hal.executable.export public @rocket_pooling_max ordinal(0) layout(#pooling_pipeline_layout) count(%device: !hal.device, %workload: index) -> (index, index, index) {
+        %c1 = arith.constant 1 : index
+        hal.return %c1, %c1, %c1 : index, index, index
+      }
+      builtin.module {
+        func.func @rocket_pooling_max() {
+          return
+        }
+      }
+    }
+  }
+
+  hal.executable private @rocket_pooling_max_int8_executable_s2 {
+    hal.executable.variant public @rocket_pooling_max_v1 target(#rocket_pooling_max_int8_target_s2) {
       hal.executable.export public @rocket_pooling_max ordinal(0) layout(#pooling_pipeline_layout) count(%device: !hal.device, %workload: index) -> (index, index, index) {
         %c1 = arith.constant 1 : index
         hal.return %c1, %c1, %c1 : index, index, index
@@ -2275,6 +2309,59 @@ module attributes {transform.with_named_sequence} {
   // Max pool, NHWC, stride 2 -- the shape a real model actually has. Identical
   // to the stride-1 shim but for the executable it dispatches to; stride is
   // baked per executable, matching the convolution variants.
+  // The int8 twin of @call_rocket_pooling_max_nhwc_s2: no narrowing on the
+  // way in, and the accumulator initialiser folds back in with a signed max.
+  // rocket-fold-neutral-init drops that when the init is a fill of -128 (the
+  // int8 max's neutral element), which is what lets a following Rocket
+  // dispatch read this one's cube in place.
+  util.func private @call_rocket_pooling_max_nhwc_s2_i8(
+      %input: tensor<1x?x?x?xi8>,
+      %window: tensor<?x?xi8>,
+      %init: tensor<1x?x?x?xi8>) -> tensor<1x?x?x?xi8> {
+    %c0 = arith.constant 0 : index
+    %c1 = arith.constant 1 : index
+    %c2 = arith.constant 2 : index
+    %c3 = arith.constant 3 : index
+    %input_height = tensor.dim %input, %c1 : tensor<1x?x?x?xi8>
+    %input_width = tensor.dim %input, %c2 : tensor<1x?x?x?xi8>
+    %channels = tensor.dim %input, %c3 : tensor<1x?x?x?xi8>
+    %kernel_height = tensor.dim %window, %c0 : tensor<?x?xi8>
+    %kernel_width = tensor.dim %window, %c1 : tensor<?x?xi8>
+    %output_height = tensor.dim %init, %c1 : tensor<1x?x?x?xi8>
+    %output_width = tensor.dim %init, %c2 : tensor<1x?x?x?xi8>
+    %input_width_i32 = arith.index_cast %input_width : index to i32
+    %input_height_i32 = arith.index_cast %input_height : index to i32
+    %channels_i32 = arith.index_cast %channels : index to i32
+    %kernel_width_i32 = arith.index_cast %kernel_width : index to i32
+    %kernel_height_i32 = arith.index_cast %kernel_height : index to i32
+    %layout_i32 = arith.constant 0 : i32
+    %pooled = flow.dispatch
+        @rocket_pooling_max_int8_executable_s2::@rocket_pooling_max_v1::@rocket_pooling_max(
+          %input_width_i32, %input_height_i32, %channels_i32,
+          %kernel_width_i32, %kernel_height_i32, %layout_i32,
+          %input)
+        {stream.affinity = #hal.device.affinity<@rocket_device>}
+        : (i32, i32, i32, i32, i32, i32,
+           tensor<1x?x?x?xi8>{%input_height, %input_width, %channels})
+        -> tensor<1x?x?x?xi8>{%output_height, %output_width, %channels}
+    %final_empty = tensor.empty(%output_height, %output_width, %channels)
+        : tensor<1x?x?x?xi8>
+    %final = linalg.generic {
+        indexing_maps = [
+          affine_map<(d0, d1, d2, d3) -> (d0, d1, d2, d3)>,
+          affine_map<(d0, d1, d2, d3) -> (d0, d1, d2, d3)>,
+          affine_map<(d0, d1, d2, d3) -> (d0, d1, d2, d3)>
+        ],
+        iterator_types = ["parallel", "parallel", "parallel", "parallel"]
+      } ins(%pooled, %init : tensor<1x?x?x?xi8>, tensor<1x?x?x?xi8>)
+        outs(%final_empty : tensor<1x?x?x?xi8>) {
+      ^bb0(%pooled_value: i8, %initial: i8, %out: i8):
+        %accumulated = arith.maxsi %pooled_value, %initial : i8
+        linalg.yield %accumulated : i8
+    } -> tensor<1x?x?x?xi8>
+    util.return %final : tensor<1x?x?x?xi8>
+  }
+
   util.func private @call_rocket_pooling_max_nhwc_s2(
       %input: tensor<1x?x?x?xf32>,
       %window: tensor<?x?xf32>,
@@ -6005,6 +6092,51 @@ module attributes {transform.with_named_sequence} {
     transform.iree.match.dim_bounds %window_value[0], umin = 2, umax = 8 : !transform.any_value
     transform.iree.match.dim_bounds %window_value[1], umin = 2, umax = 8 : !transform.any_value
     transform.yield %root : !transform.any_op
+  }
+
+  // The int8 max pool rocket-fuse-int8-max-pool produces. Bounded to what
+  // `max_pooling_matches_oracle` measured at int8: ResNet's stem pool,
+  // 114x114x64 3x3 stride 2 on a pre-padded input.
+  transform.named_sequence @match_pooling_nhwc_max_s2_i8(%root: !transform.any_op {transform.readonly}) -> !transform.any_op {
+    transform.match.operation_name %root ["linalg.pooling_nhwc_max"] : !transform.any_op
+    %batch, %out_img, %out_ch, %filter, %in_ch, %depth, %strides, %dilations =
+        transform.iree.match.convolution %root,
+          lhs_type = i8, rhs_type = i8, output_type = i8
+          : !transform.any_op -> !transform.param<i64>
+    transform.iree.match.dims_equal %batch, [1, -1] : !transform.param<i64>
+    transform.iree.match.dims_equal %out_img, [-1, -1] : !transform.param<i64>
+    transform.iree.match.dims_equal %out_ch, [] : !transform.param<i64>
+    transform.iree.match.dims_equal %in_ch, [] : !transform.param<i64>
+    transform.iree.match.dims_equal %depth, [] : !transform.param<i64>
+    transform.iree.match.dims_equal %filter, [-1, -1] : !transform.param<i64>
+    transform.iree.match.dims_equal %strides, [2, 2] : !transform.param<i64>
+    transform.iree.match.dims_equal %dilations, [1, 1] : !transform.param<i64>
+
+    %input_value = transform.get_operand %root[0] : (!transform.any_op) -> !transform.any_value
+    %window_value = transform.get_operand %root[1] : (!transform.any_op) -> !transform.any_value
+    transform.iree.match.dim_bounds %input_value[1], umin = 1, umax = 114 : !transform.any_value
+    transform.iree.match.dim_bounds %input_value[2], umin = 1, umax = 114 : !transform.any_value
+    transform.iree.match.dim_bounds %input_value[3], umin = 1, umax = 64 : !transform.any_value
+    transform.iree.match.dim_bounds %window_value[0], umin = 2, umax = 3 : !transform.any_value
+    transform.iree.match.dim_bounds %window_value[1], umin = 2, umax = 3 : !transform.any_value
+    transform.yield %root : !transform.any_op
+  }
+
+  transform.named_sequence @cast_and_call_pooling_max_nhwc_s2_i8(%root: !transform.any_op {transform.readonly}) {
+    %ins = transform.get_operand %root[all] : (!transform.any_op) -> !transform.any_value
+    %out = transform.get_result %root[all] : (!transform.any_op) -> !transform.any_value
+    %module = transform.util.get_nearest_symbol_table %root : (!transform.any_op) -> !transform.any_op
+    %topology_attr = transform.param.constant #hal.device.topology<links = [
+        (@rocket_device -> @cpu_device = {transparent_access = true, unified_memory = true}),
+        (@cpu_device -> @rocket_device = {transparent_access = true, unified_memory = true})
+      ]> -> !transform.any_param
+    transform.annotate %module "stream.topology" = %topology_attr : !transform.any_op, !transform.any_param
+    %executable = transform.util.import_symbol @rocket_pooling_max_int8_executable_s2 into %module if undefined : (!transform.any_op) -> !transform.any_op
+    %func = transform.util.import_symbol @call_rocket_pooling_max_nhwc_s2_i8 into %module if undefined : (!transform.any_op) -> !transform.any_op
+    transform.util.cast_and_call %func(%ins) -> %out after %root {
+          transform.type_conversion.tensor.cast_shape_dynamic_dims
+      } : (!transform.any_op, !transform.any_value, !transform.any_value, !transform.any_op) -> !transform.any_op
+    transform.yield
   }
 
   transform.named_sequence @match_pooling_nchw_max(%root: !transform.any_op {transform.readonly}) -> !transform.any_op {
@@ -10369,8 +10501,14 @@ module attributes {transform.with_named_sequence} {
     %residual_funcs = transform.apply_registered_pass
         "rocket-fuse-int8-residual-add" to %requant_fused_funcs
       : (!transform.any_op) -> !transform.any_op
+    // The max pool between a DequantizeLinear and a QuantizeLinear that share
+    // their parameters, into an int8 NHWC max pool on the codes, which
+    // @match_pooling_nhwc_max_s2_i8 claims. Exact.
+    %max_pool_funcs = transform.apply_registered_pass
+        "rocket-fuse-int8-max-pool" to %residual_funcs
+      : (!transform.any_op) -> !transform.any_op
     %gemv_funcs = transform.apply_registered_pass
-        "rocket-expand-gemv-to-matmul" to %residual_funcs
+        "rocket-expand-gemv-to-matmul" to %max_pool_funcs
       : (!transform.any_op) -> !transform.any_op
 
     // Splits a static-batch `linalg.batch_matmul` into one `linalg.matmul`
@@ -10633,6 +10771,7 @@ module attributes {transform.with_named_sequence} {
             @match_pooling_nhwc_sum_avg -> @cast_and_call_pooling_avg_nhwc,
             @match_pooling_nhwc_max -> @cast_and_call_pooling_max_nhwc,
             @match_pooling_nhwc_max_s2 -> @cast_and_call_pooling_max_nhwc_s2,
+            @match_pooling_nhwc_max_s2_i8 -> @cast_and_call_pooling_max_nhwc_s2_i8,
             @match_pooling_nchw_max -> @cast_and_call_pooling_max_nchw,
             @match_pooling_nchw_max_s2 -> @cast_and_call_pooling_max_nchw_s2,
             @match_pooling_nhwc_min -> @cast_and_call_pooling_min_nhwc,

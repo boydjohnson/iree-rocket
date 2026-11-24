@@ -46,11 +46,21 @@ namespace {
 // The constant a `linalg.fill` seeds `value` with, looking through the
 // metadata ops a shim puts between them (a cast, a reshape, the NCHW pool's
 // transpose of its init), or null.
-FloatAttr fillConstant(Value value) {
+// The fill value, float or integer: the int8 max pool's shim combines with
+// a fill of the type's minimum under `maxsi` the way the fp16 one does with
+// -inf under `maximumf`.
+TypedAttr fillConstant(Value value) {
   while (Operation *def = value.getDefiningOp()) {
     if (auto fill = dyn_cast<linalg::FillOp>(def)) {
       auto constant = fill.getInputs()[0].getDefiningOp<arith::ConstantOp>();
-      return constant ? dyn_cast<FloatAttr>(constant.getValue()) : nullptr;
+      if (!constant) {
+        return nullptr;
+      }
+      Attribute attr = constant.getValue();
+      if (isa<FloatAttr, IntegerAttr>(attr)) {
+        return cast<TypedAttr>(attr);
+      }
+      return nullptr;
     }
     if (auto transpose = dyn_cast<linalg::TransposeOp>(def)) {
       value = transpose.getInput();
@@ -68,15 +78,31 @@ FloatAttr fillConstant(Value value) {
 }
 
 // Whether `init` is the neutral element of `op`.
-bool isNeutral(Operation *op, const APFloat &init) {
-  if (isa<arith::AddFOp>(op)) {
-    return init.isZero();
+bool isNeutral(Operation *op, TypedAttr attr) {
+  if (auto floatAttr = dyn_cast<FloatAttr>(attr)) {
+    const APFloat &init = floatAttr.getValue();
+    if (isa<arith::AddFOp>(op)) {
+      return init.isZero();
+    }
+    if (isa<arith::MaximumFOp>(op)) {
+      return init.isInfinity() && init.isNegative();
+    }
+    if (isa<arith::MinimumFOp>(op)) {
+      return init.isInfinity() && !init.isNegative();
+    }
+    return false;
   }
-  if (isa<arith::MaximumFOp>(op)) {
-    return init.isInfinity() && init.isNegative();
-  }
-  if (isa<arith::MinimumFOp>(op)) {
-    return init.isInfinity() && !init.isNegative();
+  if (auto intAttr = dyn_cast<IntegerAttr>(attr)) {
+    const APInt &init = intAttr.getValue();
+    if (isa<arith::AddIOp>(op)) {
+      return init.isZero();
+    }
+    if (isa<arith::MaxSIOp>(op)) {
+      return init.isMinSignedValue();
+    }
+    if (isa<arith::MinSIOp>(op)) {
+      return init.isMaxSignedValue();
+    }
   }
   return false;
 }
@@ -120,9 +146,9 @@ struct FoldNeutralInit : OpRewritePattern<linalg::GenericOp> {
     if (!initArg) {
       return failure();
     }
-    FloatAttr constant =
+    TypedAttr constant =
         fillConstant(generic.getDpsInputOperand(initArg.getArgNumber())->get());
-    if (!constant || !isNeutral(combine, constant.getValue())) {
+    if (!constant || !isNeutral(combine, constant)) {
       return failure();
     }
     // The other input, and its map, survive; the body is cloned without the
@@ -159,8 +185,9 @@ struct RocketFoldNeutralInitPass
   StringRef getArgument() const final { return "rocket-fold-neutral-init"; }
   StringRef getDescription() const final {
     return "Drops a neutral accumulator initialiser (fill 0 under add, -inf "
-           "under max, +inf under min) from a widening generic, leaving the "
-           "bare extf the consumer's truncf can cancel.";
+           "under max, +inf under min, and the integer minimum/maximum under "
+           "signed max/min) from a widening generic, leaving the bare extf "
+           "the consumer's truncf can cancel.";
   }
 
   void getDependentDialects(DialectRegistry &registry) const final {

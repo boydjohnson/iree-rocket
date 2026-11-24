@@ -1911,6 +1911,37 @@ What was settled and how, newest first, in place of the narratives — those are
 in this file's git history (`git log -p ISSUES.md`). Everything cited below is
 something that still exists: a commit, a file, or a memory.
 
+**int8 max pool on the NPU (S3) — 2026-11-24. ResNet50-224 int8 26.7 ->
+24.3 ms, bit-identical.** QOperator quantization leaves MaxPool in float, so
+the stem's pool ran as: requantize to `ui8`, dequantize to f32, pad with
+-inf, transpose and narrow to fp16, an fp16 NPU pool, then quantize f16 ->
+`ui8` on the CPU -- four full-tensor CPU passes around a 0.6 ms pool.
+
+- `tools/quantize_onnx_int8.py` now gives each MaxPool's QuantizeLinear its
+  DequantizeLinear's own scale and zero point (ONNX Runtime's QDQ quantizer
+  does the same). Every value a max pool outputs is already on its input's
+  grid, so this only removes a rounding; on this model the calibrated scales
+  were already equal (max|d| 0.0 in onnxruntime).
+- `rocket-fuse-int8-max-pool` (in `RocketFuseInt8QdqPass.cpp`, which now holds
+  both QDQ rewrites) turns `Q(max_pool(pad(DQ(x), -inf)))` with shared
+  parameters into an int8 NHWC max pool on the codes, padded with -128. Exact:
+  max commutes with a monotone dequantization, `Q(DQ(c)) == c`, and the -inf
+  pad never wins because every window holds a real element (the pass checks
+  pad < kernel). `@match_pooling_nhwc_max_s2_i8` claims it into
+  `#rocket_pooling_max_int8_target_s2`; the pad stays a CPU `tensor.pad`
+  because padded int8 max still has no measured fill.
+- `rocket-fold-neutral-init` learned the integer neutrals (`addi` 0, `maxsi`
+  the minimum, `minsi` the maximum), so the int8 shim's init fold disappears
+  and the pool's two conv readers chain.
+
+Hardware: `max_pooling_matches_oracle` gains ResNet's 114x114x64 3x3 stride 2
+at int8, exact. ResNet50 (relu-fused, int8 skip): 81 NPU->NPU edges, all
+packed (was 79; the pool feeds both stage-1 convs in place), CPU dispatch
+executables 10 -> 7; output bit-identical to the fp16-pool build (whose pool
+was already exact here), deterministic, 0 timeouts; 27.1/26.2 -> 24.2/24.4 ms
+ABAB on cpu 4-7. e2e `int8_max_pool_stem` exact at atol 0; lit
+`rocket_int8_max_pool.mlir`.
+
 **int8 residual add on the NPU, with an int8 skip (S2) — 2026-11-24.
 ResNet50-224 int8 50.6 -> 27.5 ms (1.84x), now faster than its fp16 build
 (42.5 ms). Lossy by construction, and opt-in in the model.** After the conv

@@ -186,6 +186,51 @@ def asymmetric_pad_convs(path: Path) -> list[str]:
     return names
 
 
+def share_maxpool_quantization(path: Path) -> int:
+    """Give each MaxPool's output its input's quantization.
+
+    QOperator format leaves MaxPool in float: `DequantizeLinear(x) ->
+    MaxPool -> QuantizeLinear` with an output scale calibrated on its own.
+    Max commutes with a monotone dequantization, so with equal parameters
+    the pair is exactly a max pool on the int8 codes -- no rounding at all --
+    and that is what lets the NPU run it at int8. With different parameters
+    it is a max pool followed by a requantization, which only adds rounding:
+    every value a max pool outputs is already on its input's grid. ONNX
+    Runtime's QDQ quantizer shares the parameters the same way.
+
+    Rewrites the output scale and zero-point initializers in place, so every
+    consumer (the QuantizeLinear and the convolutions that read its scale)
+    stays consistent. Returns the number of MaxPools changed.
+    """
+    model = onnx.load(path)
+    graph = model.graph
+    producers = {out: node for node in graph.node for out in node.output}
+    initializers = {init.name: init for init in graph.initializer}
+    changed = 0
+    for node in graph.node:
+        if node.op_type != "MaxPool":
+            continue
+        dequant = producers.get(node.input[0])
+        if dequant is None or dequant.op_type != "DequantizeLinear":
+            continue
+        quants = [n for n in graph.node if n.op_type == "QuantizeLinear" and n.input[0] == node.output[0]]
+        if len(quants) != 1:
+            continue
+        quant = quants[0]
+        if len(dequant.input) < 3 or len(quant.input) < 3:
+            continue
+        pairs = [(dequant.input[1], quant.input[1]), (dequant.input[2], quant.input[2])]
+        if not all(src in initializers and dst in initializers for src, dst in pairs):
+            continue
+        for src, dst in pairs:
+            initializers[dst].CopyFrom(
+                numpy_helper.from_array(numpy_helper.to_array(initializers[src]), dst)
+            )
+        changed += 1
+    onnx.save(model, path)
+    return changed
+
+
 def quantize_residual_skips(path: Path) -> int:
     """Make every residual Add read its float operand back through int8.
 
@@ -420,6 +465,10 @@ def main() -> None:
         op_types_to_quantize=args.quantize_op_types,
         nodes_to_exclude=excluded,
     )
+
+    shared = share_maxpool_quantization(args.output)
+    if shared:
+        print(f"gave {shared} MaxPool output(s) their input's quantization")
 
     if args.quantize_residual_skip:
         count = quantize_residual_skips(args.output)
