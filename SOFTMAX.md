@@ -147,12 +147,12 @@ and its output has the same shape as its input.
 
 | Step | Mechanism | Status |
 |---|---|---|
-| row max | PPU max pool, kernel `k x 1`, stride `k x 1` | **exists**, hardware-exact; `Max=1` encoding confirmed, `pooling_oracle_hw.rs` |
+| row max | PPU max pool, kernel `k x 1`, stride `k x 1` | **exists**, and exact at atol 0 over `N` 8..512 as a tree in one job, probe S2 (`reduce_width_hw.rs`) |
 | max over tiles | `EwBinaryOp::Max` on two width-1 cubes | **exists**; oracle-checked on `planck` by `ew_binary_hw.rs:346` and again across ViT's shapes at `:421`. The `EwBinaryOp::Max` doc comment still says "not measured here yet" -- that comment is stale and worth deleting. Needed only for §6's fused form; §5.1's combine does not use it |
 | subtract the max | BN ALU operand from NRDMA, per channel | **exists**, as of probe S1: flat IEEE `f32` at `channel * 4`, broadcast over the cube, `bn_plane_probe_hw.rs` |
 | `exp` | DPU LUT, `LutTable::exp()` | **exists**, `lut_exp_hw.rs` against an oracle; domain needs §3's `input_scale` choice |
 | square (range extension) | `EwBinaryOp::Mul` with both operands the same buffer | **exists**, `ew_binary_hw.rs`, `ew_square_hw.rs` |
-| row sum | all-ones column on the second matmul (§1.1); or depthwise all-ones `1 x k` conv; or PPU avg pool x k | **exists** three ways |
+| row sum | all-ones column on the second matmul (§1.1); or depthwise all-ones `1 x k` conv | **two ways, not three** -- the PPU avg route is gone at fp16, see §2.1. Neither of the two is gated yet |
 | reciprocal | `LutTable::reciprocal()` + one Newton step | **exists**, `lut_reciprocal_hw.rs`; domain needs §4 |
 | divide by the sum | BN MUL operand from NRDMA, per channel | **exists**, as of probe S1: flat IEEE `fp16` at `channel * 2`, shift 0, same file |
 
@@ -171,28 +171,36 @@ caller doing anything:
   thirteen encodings at int8 and six at fp16 (`pooling_oracle_hw.rs`'s
   `*_pad_fill_probe`) [verified, `pooling.rs:105`]. A partial window
   therefore returns the max of its real taps.
+  Measured: exact at atol 0 at `N = 197`, whose stages pad by 3 then 7
+  (probe S2).
 * **sum via avg**: the PPU divides by `kh * kw` whether or not a tap was
   padding (count-include-pad) and the avg fill is zero, so `avg * kh * kw`
-  is the sum of the real taps exactly [verified, same doc comment].
+  would be the sum of the real taps exactly [verified, same doc comment] --
+  **except that an fp16 average cannot be programmed at all here.** This
+  paragraph used to end with a two-level tree recovering the sum as
+  `avg_final * 256`; probe S2 found that shape refuses at program-build
+  time and every other height-1 average with it.
 
-So a two-level tree over `N = 197` at `k = 8, 8, 4` recovers the exact sum as
-`avg_final * 256`, with every per-level divisor a power of two (exact in
-fp16). The scale factor folds into the reciprocal or into the BN multiplier;
-it never needs its own pass.
-
-What is *not* free: a plain **sum** pool is not encodable at fp16. The
-`RECIP_KERNEL` field holds the fp16 bit pattern of `65536 / k`
-[verified, `pooling.rs:636`, and the bug this fixed], so a multiplier of 1.0
-would need `65536`, past fp16's 65504 ceiling -- which is the same reason
-`average_reciprocal` panics at `k = 1`. Do not add a `PoolingMethod::Sum`;
-carry the factor.
+  The reason is the axis *not* being reduced. `RECIP_KERNEL` holds the fp16
+  bit pattern of `65536 / k` on each axis [verified, `pooling.rs:636`, and
+  the bug this fixed], so the identity divisor a height-1 window needs on
+  the height axis is `65536 / 1`, past fp16's 65504 ceiling. int8 has no
+  such limit and programs 65536 plainly, which is how we know this is a
+  precision restriction and not a geometry one
+  (`an_fp16_average_cannot_reduce_width_only`,
+  `an_int8_average_can_reduce_width_only`). It is the same ceiling that
+  makes a plain **sum** pool unencodable, so there is still no
+  `PoolingMethod::Sum` to add -- but now there is no fp16 average to carry
+  a factor out of either. §2.2's two DPU routes are the sum, not a
+  preference over a third.
 
 ### 2.2 Prefer the DPU for the sum
 
-The PPU accumulates an average in its own internal precision over up to 64
-taps per level. For a sum of `N` terms each in `(0, 1]` that is good enough
-for fp16 but it is not free of error, and it has no oracle here. Two better
-routes, both already validated paths in this repo:
+This section used to rank the DPU above an fp16 PPU average on accuracy.
+After S2 the ranking is moot: there is no fp16 PPU average to rank against
+(§2.1). Both remaining routes run on the DPU, and both are already
+validated paths in this repo, though neither is gated *as a reduction*
+yet:
 
 * the all-ones column of §1.1 (fused attention): the DPU accumulates, which
   is fp32 for fp16 inputs (LIMITS.md's precision table);
@@ -202,8 +210,11 @@ routes, both already validated paths in this repo:
   demote-pass fix (ISSUES.md), and the kernel is a
   compile-time constant so it packs once.
 
-Use the PPU max pool for the max, where there is no alternative, and the DPU
-for the sum, where there is.
+So: the PPU max pool for the max, where S2 shows it is exact and where
+there is no alternative anyway, and the DPU for the sum, where at fp16
+there is now no alternative either. Gating one of the two sum routes is the
+first thing S2's successor should do -- the max half is done and the sum
+half is untested.
 
 ---
 
@@ -366,10 +377,28 @@ that cube**: a single task with `kernel = tiles x 1`, no `EwBinaryOp::Max`
 chain, no accumulator, no new primitive. The tree does not care that its
 elements came from different tasks.
 
-For `N = 384` keys the PPU's 129-column direct limit gives 3 tiles, so the
-combine is one task at `kernel 3 x 1`. Tiles stay at or below 8 until
-`N > 1032`, past which the combine is itself two levels. The sequential
-execution inside the job is exactly the ordering the tree needs.
+**Measured** (probe S2, `the_combine_is_one_more_tree_level_over_one_shared_cube`):
+at `N = 384` the first stage plans 3 column tiles, every column of the
+shared cube holds the max of its own window whichever tile wrote it, and
+two further stages finish the row -- all as one job's ordered task array,
+exact at atol 0. The sequential execution inside the job is exactly the
+ordering the tree needs, and `PoolingPlan::programs_with_buffers` already
+emits tiles that write disjoint column offsets of one output buffer, so
+this needed no new HAL mechanism.
+
+It did need one HAL *fix*. `PoolingPlan::new` derived its tile count from
+the output-width cap alone, but a tile emitting `w` columns reads
+`(w - 1) * stride + kernel` input columns, so a stride as wide as the
+kernel makes the input cap the binding one: an 8x1 window at stride 8 over
+384 columns balanced to a single 48-column tile and then read 384 input
+columns against a limit of 129, tripping the function's own `assert!`
+rather than splitting. Every extent above 128 was affected, which is every
+transformer extent. The cap is now the lower of the two, which can only
+narrow a split and leaves every capture-backed one alone (at 3x3/s2 over
+256 columns both caps come to 64; at 2x2/s2 over 258 both come to 128).
+
+Whole-row cost, for the record: 512 columns reduce in 3 stages and 6 tasks,
+197 in 3 stages and 4 tasks.
 
 So: **structure A -- one dispatch, one job, one ordered task array holding
 the whole of §7.** One flat per-dispatch host cost, which is the term that
@@ -489,14 +518,26 @@ to serve both: `bn_plane_bytes` and `bn_mul_plane_bytes` are separate
 functions for that reason, and a test loads a MUL plane with a sentinel
 over the bytes an ALU-sized one would have occupied.
 
-The plane wants a dense vector and the reduction produces a cube, but at
-width 1 and height 1 those are the same thing: each NC1HWC2 surface is
-exactly one 16-byte atom and surfaces are consecutive, so channel `c` lands
-at byte `c * element_bytes`. A width-1 height-1 fp32 cube *is* a dense fp32
-vector. What still has to be confirmed is the element-type widen on the way
-there -- the max tree writes fp16 and the ALU plane wants fp32 (the MUL
-plane does not, which is the easier direction) -- so S2 should check the
-widen's output placement rather than assume it.
+Getting the reduction's output *into* a plane is the step this section
+originally waved at and S2 turned into a real one. The argument was that a
+width-1, height-1 cube's NC1HWC2 layout collapses to dense -- each surface
+is one 16-byte atom, surfaces are consecutive, so channel `c` lands at
+`c * element_bytes` -- leaving only an fp16-to-fp32 widen. That holds for
+the **DPU's** writer. It does not hold for the **PPU's**: that path rounds
+both cube strides up to four pixels, so a width-1 pooling output puts
+channel `c` at `(c / 8) * 64 + (c % 8) * 2`, with 48 bytes of nothing
+between consecutive surfaces
+[verified, `the_reduced_vector_is_four_pixel_strided_not_dense`].
+
+So the max tree's output is a strided gather away from an ALU plane
+operand, not a widen away, and §8's S2a is that bridge. Three candidates,
+cheapest first: program `RDMA_SURF_NOTCH` -- "number of pixels from the end
+of this process's feature map to the end of the underlying shape's" -- to 3
+on a DPU pass-through that reads the pooled cube and writes dense fp32,
+which is one register that is zero in every builder here; stop the tree at
+4 columns and do the last `4 -> 1` on the DPU, whose writer is already
+dense; or gather `M` values on the CPU, which is cheap in itself but puts a
+host round trip inside §5's one-job structure.
 
 ---
 
@@ -559,19 +600,52 @@ turned out not to matter -- the same shape of result as the `mulf`
 investigation, where the reference emitter's claim about the EW operand
 path was simply not true of this register program.
 
-**S2 -- width reduction geometry.** `reduce_width_hw.rs`. Max pool at
-`kernel 8 x 1`, `stride 8 x 1`, height 1, against a non-uniform input and a
-host oracle, at the channel counts and extents a transformer actually uses
-(`M` 197/384/512, `N` the same), including a non-multiple extent so the
-partial-window clamp-to-image path is exercised rather than reasoned about.
-Then the same for the depthwise all-ones sum, and the §5.1 combine: that
-`PoolingPlan`'s column tiling at `N > 129` can be pointed at disjoint width
-slices of one shared cube, and that a second pooling task over that cube
-agrees with a host max over the whole row. Submit the tile tasks and the
-combine as **one multi-task job** -- that is the structure under test, not
-just the arithmetic. `Counting`-style uniform patterns cannot test this -- use
-`Dense` -- a `Counting` pattern
-makes a 1x1 output constant, so it proves coverage and never addressing.
+**S2 -- width reduction geometry. DONE 2026-11-24** (`reduce_width_hw.rs`,
+plus a `PoolingPlan` fix and two `pooling.rs` unit tests, run on the
+board). Four hardware tests, all green:
+
+* **The `k x 1` reduction is exact at atol 0** at `N` 8, 16, 64, 128, 197,
+  384 and 512 -- a max of fp16-exact values is exact, so there is nothing
+  for a tolerance to absorb. 197 is the case that earns its place: ViT's
+  token count, not a multiple of 8, and wide enough to need several column
+  tiles per stage, so one case covers the partial window, the split and the
+  tree depth. Inputs vary along both axes, per the `Counting` trap.
+* **The whole tree fits in one job**, every stage and every tile in one
+  ordered task array, with no CPU wait between stages and no fence on the
+  intermediates. 512 columns is 3 stages and 6 tasks; 197 is 3 and 4.
+* **The combine is one more tree level over one shared cube** (§5.1),
+  checked by reading the intermediate rather than inferring it from a right
+  answer: at `N = 384` three column tiles write disjoint slices and every
+  column holds the max of its own window.
+* **Multi-surface channel counts work** (16 and 32), which the 8-channel
+  cases could not have shown -- eight fp16 channels are one atom and one
+  surface, so they would pass with the surface stride ignored entirely.
+
+Two findings that change the design rather than confirm it.
+
+**`PoolingPlan::new` could not plan a strided reduction at all.** It took
+its tile count from the output-width cap alone, so an 8x1 window at stride
+8 over 384 columns balanced to one 48-column tile that then read 384 input
+columns against the 129 limit -- and tripped the function's own `assert!`.
+Every extent above 128 panicked at plan time. §5.1 has the fix and why it
+leaves the capture-backed splits alone.
+
+**An fp16 average pool cannot reduce along one axis only**, which removes
+§2.2's third route to a row sum. `average_reciprocal` is asked for the
+*height* axis's identity divisor `65536 / 1`, past fp16's 65504 ceiling, so
+every height-1 average shape refuses before it reaches the device. int8
+programs 65536 plainly, so it is a precision restriction, not a geometry
+one. Both halves are pinned by unit tests that need no board
+(`an_fp16_average_cannot_reduce_width_only`,
+`an_int8_average_can_reduce_width_only`). The sum now has exactly two
+routes, both on the DPU, and **neither is gated yet** -- that is the gap
+S2 leaves open and the first thing to close.
+
+**S2a -- the plane bridge.** The reduced vector comes out four-pixel
+strided, not dense, so it is a gather away from an ALU plane operand rather
+than a widen away. §7 has the three candidates; try `RDMA_SURF_NOTCH` on a
+DPU pass-through first, since it is one register and the DPU's own width-1
+writer is already dense.
 
 **S3 -- `exp` over the real domain.** Extend `lut_exp_hw.rs` with
 `input_scale = 1/2` plus `EwBinaryOp::Mul(u, u)`, oracle-checked across
@@ -615,6 +689,12 @@ precisely the form this hardware cannot run.
   sub-stage per task and does not need it; a fused op that wanted
   `relu(a * x + b)` in one pass would, and should start from
   `bn_plane_add_then_mul_fit`'s dump rather than a fresh sweep.
+* **The sum has no gated route.** S2 removed the fp16 PPU average and left
+  two DPU routes, neither of which has been run as a reduction: the
+  all-ones column on the PV matmul (§1.1) and a depthwise all-ones `1 x k`
+  conv (§2.2). The max half of the reduction is exact and done; if both sum
+  routes turned out to need something the planner refuses, §7 would have no
+  denominator.
 * **The Q15 `exp` floor is not where §3 computes it.** The `out_cvt` scalar
   scale may interact with the entry encoding in a way the existing tests do
   not pin down. S3 settles it.
