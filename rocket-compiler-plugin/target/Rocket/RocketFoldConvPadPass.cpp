@@ -25,8 +25,9 @@
 // `low[0] high[1]` pad -- what ONNX emits for `auto_pad = SAME_UPPER` at
 // stride 2 -- cannot be expressed at all. Folding it as a symmetric pad
 // would shift every output window by one and silently compute a different
-// convolution. Those stay materialized, and MobileNetV2's five stride-2 pads
-// are exactly that case.
+// convolution. Those stay materialized. (An older ONNX import of MobileNetV2
+// had five such stride-2 pads; the survey's torch export pads every one of
+// its convolutions symmetrically, and all seventeen depthwise pads fold.)
 //
 // **Spatial only.** A pad on the batch or channel axis is not padding in the
 // convolution's sense and is declined.
@@ -209,6 +210,121 @@ static bool feedsRequantEpilogue(Value accumulator) {
          resultType.getElementType().isInteger(8);
 }
 
+/// Whether `conv`'s sole user is the bias + clamp epilogue
+/// `rocket-fuse-conv-relu6` builds: accumulator, bias and two bounds in,
+/// `addf` then `maximumf` first in the body.
+static bool feedsFusedClamp(Operation *conv) {
+  auto activation = dyn_cast_or_null<linalg::GenericOp>(soleUser(conv->getResult(0)));
+  if (!activation || activation.getNumDpsInputs() != 4) {
+    return false;
+  }
+  Block &body = activation.getRegion().front();
+  auto it = body.begin();
+  return it != body.end() && isa<arith::AddFOp>(*it) && std::next(it) != body.end() &&
+         isa<arith::MaximumFOp>(*std::next(it));
+}
+
+/// The padded depthwise convolutions a template claims together with their
+/// ReLU6 (`@match_dynamic_depthwise_conv2d_nchw_pad1_relu6*`): 3x3, pad 1 on
+/// both axes, stride 1 or 2, no dilation. MobileNetV2's seventeen depthwise
+/// convolutions are all of this form, and `depthwise_pad1_hw` in
+/// iree-rocket-hal runs each of its ten distinct shapes bit-exactly with the
+/// CNA padding.
+static bool isClaimablePaddedDepthwise(linalg::DepthwiseConv2DNchwChwOp conv,
+                                       int64_t padHeight, int64_t padWidth) {
+  auto filterType = dyn_cast<RankedTensorType>(conv.getDpsInputs()[1].getType());
+  if (padHeight != 1 || padWidth != 1 || !filterType || filterType.getRank() != 3 ||
+      filterType.getDimSize(1) != 3 || filterType.getDimSize(2) != 3) {
+    return false;
+  }
+  SmallVector<int64_t> strides(conv.getStrides().getValues<int64_t>());
+  SmallVector<int64_t> dilations(conv.getDilations().getValues<int64_t>());
+  return (strides == SmallVector<int64_t>{1, 1} || strides == SmallVector<int64_t>{2, 2}) &&
+         dilations == SmallVector<int64_t>{1, 1};
+}
+
+/// Moves a depthwise convolution's pad below the NCHW transpose in front of
+/// it, so the pad is the convolution's immediate producer.
+///
+/// The channels-last conversion leaves a depthwise convolution in NCHW and
+/// pads its input while it is still NHWC, so the chain arrives as
+/// `transpose[0, 3, 1, 2](collapse(pad(x)))` -- with the pad two ops from
+/// the convolution, where neither `MarkPaddedConv` nor a DAG template can see
+/// it. A zero pad commutes with the layout change exactly, so this rebuilds
+/// it as `pad(transpose(collapse(x)))` with the spatial amounts moved to the
+/// NCHW axes. That is the whole of what MobileNetV2's seventeen CPU pad
+/// copies needed: each then folds into the CNA, and the transpose the shim
+/// applies to `x` cancels against the model's own.
+///
+/// Only for the form a template claims (`isClaimablePaddedDepthwise`, ReLU6
+/// after it) and a single-use chain, so no other convolution's pad moves.
+/// The demote pass delivers the f32 import in this same form, its truncf on
+/// `x` (see `demoteInput`), so both imports take this one path.
+struct SinkDepthwisePadBelowTranspose
+    : public OpRewritePattern<linalg::DepthwiseConv2DNchwChwOp> {
+  using OpRewritePattern::OpRewritePattern;
+
+  LogicalResult matchAndRewrite(linalg::DepthwiseConv2DNchwChwOp conv,
+                                PatternRewriter &rewriter) const override {
+    if (conv->hasAttr(kPadTopAttrName) || !feedsFusedClamp(conv)) {
+      return failure();
+    }
+    auto transpose = conv.getDpsInputs()[0].getDefiningOp<linalg::TransposeOp>();
+    if (!transpose || transpose.getPermutation() != ArrayRef<int64_t>{0, 3, 1, 2} ||
+        !transpose->getResult(0).hasOneUse()) {
+      return failure();
+    }
+    Value inner = transpose.getInput();
+    auto collapse = inner.getDefiningOp<tensor::CollapseShapeOp>();
+    if (collapse && !inner.hasOneUse()) {
+      return failure();
+    }
+    Value padded = collapse ? collapse.getSrc() : inner;
+    auto pad = padded.getDefiningOp<tensor::PadOp>();
+    if (!pad || !padded.hasOneUse()) {
+      return failure();
+    }
+    auto padType = cast<RankedTensorType>(pad.getResult().getType());
+    int64_t shift = collapse ? 1 : 0;
+    if (padType.getRank() != 4 + shift || !padType.hasStaticShape()) {
+      return failure();
+    }
+    const int64_t spatial[2] = {1 + shift, 2 + shift};
+    int64_t padHeight = 0;
+    int64_t padWidth = 0;
+    bool int8Fill = false;
+    if (!matchSymmetricSpatialPad(pad, spatial, padHeight, padWidth, int8Fill) || int8Fill ||
+        !isClaimablePaddedDepthwise(conv, padHeight, padWidth)) {
+      return failure();
+    }
+    Value fill = pad.getConstantPaddingValue();
+    if (!fill) {
+      return failure();
+    }
+
+    Location loc = conv.getLoc();
+    Value source = pad.getSource();
+    if (collapse) {
+      source = tensor::CollapseShapeOp::create(rewriter, loc, source,
+                                               collapse.getReassociationIndices());
+    }
+    auto sourceType = cast<RankedTensorType>(source.getType());
+    SmallVector<int64_t> nchw = {sourceType.getDimSize(0), sourceType.getDimSize(3),
+                                 sourceType.getDimSize(1), sourceType.getDimSize(2)};
+    Value init = tensor::EmptyOp::create(rewriter, loc, nchw, sourceType.getElementType());
+    Value transposed = linalg::TransposeOp::create(rewriter, loc, source, init,
+                                                   transpose.getPermutation())
+                           ->getResult(0);
+    SmallVector<OpFoldResult> amounts = {rewriter.getIndexAttr(0), rewriter.getIndexAttr(0),
+                                         rewriter.getIndexAttr(padHeight),
+                                         rewriter.getIndexAttr(padWidth)};
+    Value newPad = tensor::PadOp::create(rewriter, loc, transpose->getResult(0).getType(),
+                                         transposed, amounts, amounts, fill);
+    rewriter.modifyOpInPlace(conv, [&] { conv->setOperand(0, newPad); });
+    return success();
+  }
+};
+
 template <typename ConvOp, int64_t SpatialH, int64_t SpatialW>
 struct MarkPaddedConv : public OpRewritePattern<ConvOp> {
   MarkPaddedConv(MLIRContext *context, llvm::SetVector<Operation *> *claimed)
@@ -246,16 +362,18 @@ struct MarkPaddedConv : public OpRewritePattern<ConvOp> {
     // path has to be a **pad + ReLU6** template, not a bare pad one, or this
     // branch will decline every site it was built for and the work will
     // silently buy nothing.
-    if (auto activation = dyn_cast_or_null<linalg::GenericOp>(
-            soleUser(conv->getResult(0)))) {
-      if (activation.getNumDpsInputs() == 4) {
-        Block &body = activation.getRegion().front();
-        auto it = body.begin();
-        if (it != body.end() && isa<arith::AddFOp>(*it) &&
-            std::next(it) != body.end() && isa<arith::MaximumFOp>(*std::next(it))) {
-          return failure();
-        }
-      }
+    //
+    // **The depthwise half of that is now built** (2026-11-24):
+    // `@match_dynamic_depthwise_conv2d_nchw_pad1_relu6*` claim the pad and
+    // the clamp together, so a ReLU6 depthwise convolution is marked after
+    // all -- but only in the form those claim (`isClaimablePaddedDepthwise`),
+    // checked below once the pad is known. A dense ReLU6 convolution still
+    // keeps its pad.
+    const bool fusedClamp = feedsFusedClamp(conv);
+    constexpr bool kNchwDepthwise =
+        std::is_same_v<ConvOp, linalg::DepthwiseConv2DNchwChwOp>;
+    if (fusedClamp && !kNchwDepthwise) {
+      return failure();
     }
     if (conv.getDpsInputs().empty()) {
       return failure();
@@ -322,6 +440,14 @@ struct MarkPaddedConv : public OpRewritePattern<ConvOp> {
         return failure();
       }
       if (!feedsRequantEpilogue(conv->getResult(0))) {
+        return failure();
+      }
+    }
+    // A ReLU6 depthwise convolution is marked only in the one form a padded
+    // template claims; anything else keeps its plain ReLU6 matcher and its
+    // materialized pad, as every ReLU6 convolution did before.
+    if constexpr (kNchwDepthwise) {
+      if (fusedClamp && !isClaimablePaddedDepthwise(conv, padHeight, padWidth)) {
         return failure();
       }
     }
@@ -596,6 +722,7 @@ struct RocketFoldConvPadPass
     llvm::SetVector<Operation *> claimed;
     // NHWC puts height and width at 1 and 2; the NCHW depthwise form at 2
     // and 3.
+    patterns.add<SinkDepthwisePadBelowTranspose>(context);
     patterns.add<MarkPaddedConv<linalg::Conv2DNhwcHwcfOp, 1, 2>,
                  MarkPaddedConv<linalg::DepthwiseConv2DNhwcHwcOp, 1, 2>,
                  MarkPaddedConv<linalg::DepthwiseConv2DNchwChwOp, 2, 3>,
