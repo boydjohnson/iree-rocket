@@ -441,6 +441,186 @@ func.func @requant_int8_3x3_cin256(%input: tensor<1x34x34x256xi8>, %filter: tens
   return %out : tensor<1x32x32x64xi8>
 }
 
+// "Same" padding on the requantized int8 path, done by the CNA. The pad is
+// filled with -128 -- the signed encoding of a `ui8` zero point of 0, which
+// is every ReLU output's once the quantizer folds the ReLU into the conv --
+// and `rocket-fold-conv-pad` hands it to the
+// #rocket_dynamic_int8_requant_pad1{,_s2}_target executables, which bake that
+// fill as `input_zero_point` (CNA_PAD_CON1.pad_value). A wrong fill or a
+// wrong pad amount shows on every border pixel, far outside atol=1. The
+// chain case is ResNet's conv1 -> conv2 edge: the 3x3 reads the 1x1's output
+// cube in place *and* pads it.
+func.func @requant_int8_3x3_pad1(%input: tensor<1x56x56x64xi8>, %filter: tensor<3x3x64x64xi8>, %bias: tensor<64xi32>) -> tensor<1x56x56x64xi8> {
+  %padded_fill = arith.constant -128 : i8
+  %padded = tensor.pad %input low[0, 1, 1, 0] high[0, 1, 1, 0] {
+  ^bb0(%i0: index, %i1: index, %i2: index, %i3: index):
+    tensor.yield %padded_fill : i8
+  } : tensor<1x56x56x64xi8> to tensor<1x58x58x64xi8>
+  %c_zero = arith.constant 0 : i32
+  %c_acc_empty = tensor.empty() : tensor<1x56x56x64xi32>
+  %c_acc_init = linalg.fill ins(%c_zero : i32) outs(%c_acc_empty : tensor<1x56x56x64xi32>) -> tensor<1x56x56x64xi32>
+  %c_acc = linalg.conv_2d_nhwc_hwcf
+      {dilations = dense<1> : tensor<2xi64>, strides = dense<1> : tensor<2xi64>}
+      ins(%padded, %filter : tensor<1x58x58x64xi8>, tensor<3x3x64x64xi8>)
+      outs(%c_acc_init : tensor<1x56x56x64xi32>) -> tensor<1x56x56x64xi32>
+  %out_scale = arith.constant 5.000000e-04 : f32
+  %out_zp = arith.constant -6 : i32
+  %out_min = arith.constant -1.280000e+02 : f32
+  %out_max = arith.constant 1.270000e+02 : f32
+  %out_empty = tensor.empty() : tensor<1x56x56x64xi8>
+  %out = linalg.generic {
+      indexing_maps = [affine_map<(d0, d1, d2, d3) -> (d0, d1, d2, d3)>,
+                       affine_map<(d0, d1, d2, d3) -> (d3)>,
+                       affine_map<(d0, d1, d2, d3) -> ()>,
+                       affine_map<(d0, d1, d2, d3) -> ()>,
+                       affine_map<(d0, d1, d2, d3) -> ()>,
+                       affine_map<(d0, d1, d2, d3) -> ()>,
+                       affine_map<(d0, d1, d2, d3) -> (d0, d1, d2, d3)>],
+      iterator_types = ["parallel", "parallel", "parallel", "parallel"]}
+      ins(%c_acc, %bias, %out_scale, %out_zp, %out_min, %out_max
+          : tensor<1x56x56x64xi32>, tensor<64xi32>, f32, i32, f32, f32)
+      outs(%out_empty : tensor<1x56x56x64xi8>) {
+    ^bb0(%raw: i32, %channel_bias: i32, %sc: f32, %zpv: i32, %low: f32, %high: f32, %unused: i8):
+      %biased = arith.addi %raw, %channel_bias : i32
+      %real = arith.sitofp %biased : i32 to f32
+      %scaled = arith.mulf %real, %sc : f32
+      %rounded = math.roundeven %scaled : f32
+      %zpf = arith.sitofp %zpv : i32 to f32
+      %offset = arith.addf %rounded, %zpf : f32
+      %low_clamped = arith.maximumf %offset, %low : f32
+      %clamped = arith.minimumf %low_clamped, %high : f32
+      %narrowed = arith.fptosi %clamped : f32 to i8
+      linalg.yield %narrowed : i8
+  } -> tensor<1x56x56x64xi8>
+  return %out : tensor<1x56x56x64xi8>
+}
+
+func.func @requant_int8_3x3_pad1_s2(%input: tensor<1x56x56x128xi8>, %filter: tensor<3x3x128x128xi8>, %bias: tensor<128xi32>) -> tensor<1x28x28x128xi8> {
+  %padded_fill = arith.constant -128 : i8
+  %padded = tensor.pad %input low[0, 1, 1, 0] high[0, 1, 1, 0] {
+  ^bb0(%i0: index, %i1: index, %i2: index, %i3: index):
+    tensor.yield %padded_fill : i8
+  } : tensor<1x56x56x128xi8> to tensor<1x58x58x128xi8>
+  %c_zero = arith.constant 0 : i32
+  %c_acc_empty = tensor.empty() : tensor<1x28x28x128xi32>
+  %c_acc_init = linalg.fill ins(%c_zero : i32) outs(%c_acc_empty : tensor<1x28x28x128xi32>) -> tensor<1x28x28x128xi32>
+  %c_acc = linalg.conv_2d_nhwc_hwcf
+      {dilations = dense<1> : tensor<2xi64>, strides = dense<2> : tensor<2xi64>}
+      ins(%padded, %filter : tensor<1x58x58x128xi8>, tensor<3x3x128x128xi8>)
+      outs(%c_acc_init : tensor<1x28x28x128xi32>) -> tensor<1x28x28x128xi32>
+  %out_scale = arith.constant 5.000000e-04 : f32
+  %out_zp = arith.constant -6 : i32
+  %out_min = arith.constant -1.280000e+02 : f32
+  %out_max = arith.constant 1.270000e+02 : f32
+  %out_empty = tensor.empty() : tensor<1x28x28x128xi8>
+  %out = linalg.generic {
+      indexing_maps = [affine_map<(d0, d1, d2, d3) -> (d0, d1, d2, d3)>,
+                       affine_map<(d0, d1, d2, d3) -> (d3)>,
+                       affine_map<(d0, d1, d2, d3) -> ()>,
+                       affine_map<(d0, d1, d2, d3) -> ()>,
+                       affine_map<(d0, d1, d2, d3) -> ()>,
+                       affine_map<(d0, d1, d2, d3) -> ()>,
+                       affine_map<(d0, d1, d2, d3) -> (d0, d1, d2, d3)>],
+      iterator_types = ["parallel", "parallel", "parallel", "parallel"]}
+      ins(%c_acc, %bias, %out_scale, %out_zp, %out_min, %out_max
+          : tensor<1x28x28x128xi32>, tensor<128xi32>, f32, i32, f32, f32)
+      outs(%out_empty : tensor<1x28x28x128xi8>) {
+    ^bb0(%raw: i32, %channel_bias: i32, %sc: f32, %zpv: i32, %low: f32, %high: f32, %unused: i8):
+      %biased = arith.addi %raw, %channel_bias : i32
+      %real = arith.sitofp %biased : i32 to f32
+      %scaled = arith.mulf %real, %sc : f32
+      %rounded = math.roundeven %scaled : f32
+      %zpf = arith.sitofp %zpv : i32 to f32
+      %offset = arith.addf %rounded, %zpf : f32
+      %low_clamped = arith.maximumf %offset, %low : f32
+      %clamped = arith.minimumf %low_clamped, %high : f32
+      %narrowed = arith.fptosi %clamped : f32 to i8
+      linalg.yield %narrowed : i8
+  } -> tensor<1x28x28x128xi8>
+  return %out : tensor<1x28x28x128xi8>
+}
+
+func.func @requant_int8_1x1_then_pad1(%input: tensor<1x28x28x64xi8>, %f1: tensor<1x1x64x64xi8>, %b1: tensor<64xi32>, %f2: tensor<3x3x64x64xi8>, %b2: tensor<64xi32>) -> tensor<1x28x28x64xi8> {
+  %a_zero = arith.constant 0 : i32
+  %a_acc_empty = tensor.empty() : tensor<1x28x28x64xi32>
+  %a_acc_init = linalg.fill ins(%a_zero : i32) outs(%a_acc_empty : tensor<1x28x28x64xi32>) -> tensor<1x28x28x64xi32>
+  %a_acc = linalg.conv_2d_nhwc_hwcf
+      {dilations = dense<1> : tensor<2xi64>, strides = dense<1> : tensor<2xi64>}
+      ins(%input, %f1 : tensor<1x28x28x64xi8>, tensor<1x1x64x64xi8>)
+      outs(%a_acc_init : tensor<1x28x28x64xi32>) -> tensor<1x28x28x64xi32>
+  %a_q_scale = arith.constant 2.000000e-02 : f32
+  %a_q_zp = arith.constant 3 : i32
+  %a_q_min = arith.constant -1.280000e+02 : f32
+  %a_q_max = arith.constant 1.270000e+02 : f32
+  %a_q_empty = tensor.empty() : tensor<1x28x28x64xi8>
+  %a_q = linalg.generic {
+      indexing_maps = [affine_map<(d0, d1, d2, d3) -> (d0, d1, d2, d3)>,
+                       affine_map<(d0, d1, d2, d3) -> (d3)>,
+                       affine_map<(d0, d1, d2, d3) -> ()>,
+                       affine_map<(d0, d1, d2, d3) -> ()>,
+                       affine_map<(d0, d1, d2, d3) -> ()>,
+                       affine_map<(d0, d1, d2, d3) -> ()>,
+                       affine_map<(d0, d1, d2, d3) -> (d0, d1, d2, d3)>],
+      iterator_types = ["parallel", "parallel", "parallel", "parallel"]}
+      ins(%a_acc, %b1, %a_q_scale, %a_q_zp, %a_q_min, %a_q_max
+          : tensor<1x28x28x64xi32>, tensor<64xi32>, f32, i32, f32, f32)
+      outs(%a_q_empty : tensor<1x28x28x64xi8>) {
+    ^bb0(%raw: i32, %channel_bias: i32, %sc: f32, %zpv: i32, %low: f32, %high: f32, %unused: i8):
+      %biased = arith.addi %raw, %channel_bias : i32
+      %real = arith.sitofp %biased : i32 to f32
+      %scaled = arith.mulf %real, %sc : f32
+      %rounded = math.roundeven %scaled : f32
+      %zpf = arith.sitofp %zpv : i32 to f32
+      %offset = arith.addf %rounded, %zpf : f32
+      %low_clamped = arith.maximumf %offset, %low : f32
+      %clamped = arith.minimumf %low_clamped, %high : f32
+      %narrowed = arith.fptosi %clamped : f32 to i8
+      linalg.yield %narrowed : i8
+  } -> tensor<1x28x28x64xi8>
+  %padded_fill = arith.constant -128 : i8
+  %padded = tensor.pad %a_q low[0, 1, 1, 0] high[0, 1, 1, 0] {
+  ^bb0(%i0: index, %i1: index, %i2: index, %i3: index):
+    tensor.yield %padded_fill : i8
+  } : tensor<1x28x28x64xi8> to tensor<1x30x30x64xi8>
+  %c_zero = arith.constant 0 : i32
+  %c_acc_empty = tensor.empty() : tensor<1x28x28x64xi32>
+  %c_acc_init = linalg.fill ins(%c_zero : i32) outs(%c_acc_empty : tensor<1x28x28x64xi32>) -> tensor<1x28x28x64xi32>
+  %c_acc = linalg.conv_2d_nhwc_hwcf
+      {dilations = dense<1> : tensor<2xi64>, strides = dense<1> : tensor<2xi64>}
+      ins(%padded, %f2 : tensor<1x30x30x64xi8>, tensor<3x3x64x64xi8>)
+      outs(%c_acc_init : tensor<1x28x28x64xi32>) -> tensor<1x28x28x64xi32>
+  %out_scale = arith.constant 5.000000e-04 : f32
+  %out_zp = arith.constant -6 : i32
+  %out_min = arith.constant -1.280000e+02 : f32
+  %out_max = arith.constant 1.270000e+02 : f32
+  %out_empty = tensor.empty() : tensor<1x28x28x64xi8>
+  %out = linalg.generic {
+      indexing_maps = [affine_map<(d0, d1, d2, d3) -> (d0, d1, d2, d3)>,
+                       affine_map<(d0, d1, d2, d3) -> (d3)>,
+                       affine_map<(d0, d1, d2, d3) -> ()>,
+                       affine_map<(d0, d1, d2, d3) -> ()>,
+                       affine_map<(d0, d1, d2, d3) -> ()>,
+                       affine_map<(d0, d1, d2, d3) -> ()>,
+                       affine_map<(d0, d1, d2, d3) -> (d0, d1, d2, d3)>],
+      iterator_types = ["parallel", "parallel", "parallel", "parallel"]}
+      ins(%c_acc, %b2, %out_scale, %out_zp, %out_min, %out_max
+          : tensor<1x28x28x64xi32>, tensor<64xi32>, f32, i32, f32, f32)
+      outs(%out_empty : tensor<1x28x28x64xi8>) {
+    ^bb0(%raw: i32, %channel_bias: i32, %sc: f32, %zpv: i32, %low: f32, %high: f32, %unused: i8):
+      %biased = arith.addi %raw, %channel_bias : i32
+      %real = arith.sitofp %biased : i32 to f32
+      %scaled = arith.mulf %real, %sc : f32
+      %rounded = math.roundeven %scaled : f32
+      %zpf = arith.sitofp %zpv : i32 to f32
+      %offset = arith.addf %rounded, %zpf : f32
+      %low_clamped = arith.maximumf %offset, %low : f32
+      %clamped = arith.minimumf %low_clamped, %high : f32
+      %narrowed = arith.fptosi %clamped : f32 to i8
+      linalg.yield %narrowed : i8
+  } -> tensor<1x28x28x64xi8>
+  return %out : tensor<1x28x28x64xi8>
+}
+
 // The three cases below exist to raise the requantized matchers' channel
 // bounds, and they are MobileNetV2's own widest shapes rather than round
 // numbers: `1x1 Cin 1344 -> Cout 224` and `1x1 Cin 448 -> Cout 1792` are the
@@ -1294,6 +1474,20 @@ def write_compiled_fixture(work_dir: Path) -> None:
     np.save(work_dir / "requant_int8_3x3_cin256_kernel.npy", i8_small(3, 3, 256, 64))
     np.save(work_dir / "requant_int8_3x3_cin256_bias.npy", bias_i32(64))
 
+    np.save(work_dir / "requant_int8_3x3_pad1_input.npy", i8(1, 56, 56, 64))
+    np.save(work_dir / "requant_int8_3x3_pad1_kernel.npy", i8_small(3, 3, 64, 64))
+    np.save(work_dir / "requant_int8_3x3_pad1_bias.npy", bias_i32(64))
+
+    np.save(work_dir / "requant_int8_3x3_pad1_s2_input.npy", i8(1, 56, 56, 128))
+    np.save(work_dir / "requant_int8_3x3_pad1_s2_kernel.npy", i8_small(3, 3, 128, 128))
+    np.save(work_dir / "requant_int8_3x3_pad1_s2_bias.npy", bias_i32(128))
+
+    np.save(work_dir / "requant_int8_1x1_then_pad1_input.npy", i8(1, 28, 28, 64))
+    np.save(work_dir / "requant_int8_1x1_then_pad1_f1.npy", i8_small(1, 1, 64, 64))
+    np.save(work_dir / "requant_int8_1x1_then_pad1_b1.npy", bias_i32(64))
+    np.save(work_dir / "requant_int8_1x1_then_pad1_f2.npy", i8_small(3, 3, 64, 64))
+    np.save(work_dir / "requant_int8_1x1_then_pad1_b2.npy", bias_i32(64))
+
     np.save(work_dir / "requant_int8_1x1_cin816_input.npy", i8(1, 7, 7, 816))
     np.save(work_dir / "requant_int8_1x1_cin816_kernel.npy", i8_small(1, 1, 816, 224))
     np.save(work_dir / "requant_int8_1x1_cin816_bias.npy", bias_i32(224))
@@ -1523,6 +1717,9 @@ def compile_modules(
         ("requant_int8_1x1_cout1792", "rocket_dynamic_int8_requant_executable"),
         ("requant_int8_3x3_cin768", "rocket_dynamic_int8_requant_executable"),
         ("requant_int8_3x3_cin256", "rocket_dynamic_int8_requant_executable"),
+        ("requant_int8_3x3_pad1", "rocket_dynamic_int8_requant_pad1_executable"),
+        ("requant_int8_3x3_pad1_s2", "rocket_dynamic_int8_requant_pad1_s2_executable"),
+        ("requant_int8_1x1_then_pad1", "rocket_dynamic_int8_requant_pad1_executable"),
         # The fp16 depthwise widths the 2026-09-09 admission raise added. If
         # one stops reaching its matcher the differential would compare the
         # CPU with itself and pass, which is the whole reason this check
@@ -1995,6 +2192,41 @@ def run_compiled_gate(
                 "requant_int8_3x3_cin256_bias.npy",
             ),
             ("requant_int8_3x3_cin256_out_rocket.npy",),
+            1.0,
+            0.0,
+        ),
+        Case(
+            "requant_int8_3x3_pad1",
+            (
+                "requant_int8_3x3_pad1_input.npy",
+                "requant_int8_3x3_pad1_kernel.npy",
+                "requant_int8_3x3_pad1_bias.npy",
+            ),
+            ("requant_int8_3x3_pad1_out_rocket.npy",),
+            1.0,
+            0.0,
+        ),
+        Case(
+            "requant_int8_3x3_pad1_s2",
+            (
+                "requant_int8_3x3_pad1_s2_input.npy",
+                "requant_int8_3x3_pad1_s2_kernel.npy",
+                "requant_int8_3x3_pad1_s2_bias.npy",
+            ),
+            ("requant_int8_3x3_pad1_s2_out_rocket.npy",),
+            1.0,
+            0.0,
+        ),
+        Case(
+            "requant_int8_1x1_then_pad1",
+            (
+                "requant_int8_1x1_then_pad1_input.npy",
+                "requant_int8_1x1_then_pad1_f1.npy",
+                "requant_int8_1x1_then_pad1_b1.npy",
+                "requant_int8_1x1_then_pad1_f2.npy",
+                "requant_int8_1x1_then_pad1_b2.npy",
+            ),
+            ("requant_int8_1x1_then_pad1_out_rocket.npy",),
             1.0,
             0.0,
         ),

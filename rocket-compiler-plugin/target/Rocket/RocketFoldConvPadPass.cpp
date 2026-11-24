@@ -31,9 +31,21 @@
 // **Spatial only.** A pad on the batch or channel axis is not padding in the
 // convolution's sense and is declined.
 //
-// **The pad value must be zero.** The CNA fills with
-// `CNA_PAD_CON1.pad_value`, which the fp16 targets leave at zero; a nonzero
-// fill would need that field on the wire, and no measured model asks for one.
+// **The pad value must be zero -- or, for int8, the one zero point a target
+// bakes.** The CNA fills with `CNA_PAD_CON1.pad_value`, which the fp16
+// targets leave at zero. An int8 QLinearConv pads with its *input zero
+// point*, because the zero-point correction folded into the bias,
+// `-x_zp * sum_k(w)`, counts every tap -- so an out-of-image tap has to
+// contribute `x_zp * w` for the border to come out right. The requantized
+// pad1 targets carry that fill as a static `input_zero_point`, which the
+// driver programs into `pad_value`, and they bake exactly one value: -128,
+// the signed encoding of a `ui8` zero point of 0. That is every activation a
+// ReLU produces once the quantizer folds the ReLU into the conv (min 0 means
+// zero point 0), which is every 3x3 input in a QDQ ResNet. Any other fill is
+// left unmarked and its pad stays materialized, rather than being marked
+// with nothing to claim it -- a mark changes the convolution's attribute
+// dictionary, which would make the unpadded requantized matchers decline it
+// too.
 //
 // # The region is rewritten too, and that is what pins the fill
 //
@@ -78,6 +90,8 @@
 #include "mlir/Pass/Pass.h"
 #include "mlir/Transforms/GreedyPatternRewriteDriver.h"
 
+#include <type_traits>
+
 namespace mlir::iree_compiler::IREE::HAL {
 namespace {
 
@@ -89,6 +103,10 @@ constexpr StringLiteral kPadLeftAttrName = "rocket.pad_left";
 /// The largest pad `CNA_PAD_CON0`'s 4-bit fields hold.
 constexpr int64_t kMaxPad = 15;
 
+/// The int8 fill the requantized pad1 targets bake as `input_zero_point`:
+/// a `ui8` zero point of 0 in the signed encoding the convolution reads.
+constexpr int64_t kInt8PadFill = -128;
+
 /// Reads a `tensor.pad` whose region yields a zero constant and whose low and
 /// high amounts are equal, static, and nonzero on exactly the two spatial
 /// axes of `layout`.
@@ -98,7 +116,8 @@ constexpr int64_t kMaxPad = 15;
 /// which axes may be padded is a property of the operand, not of the pad.
 static bool matchSymmetricSpatialPad(tensor::PadOp pad,
                                      ArrayRef<int64_t> spatial,
-                                     int64_t &padHeight, int64_t &padWidth) {
+                                     int64_t &padHeight, int64_t &padWidth,
+                                     bool &int8Fill) {
   ArrayRef<int64_t> low = pad.getStaticLow();
   ArrayRef<int64_t> high = pad.getStaticHigh();
   if (low.size() != high.size()) {
@@ -141,11 +160,22 @@ static bool matchSymmetricSpatialPad(tensor::PadOp pad,
     return false;
   }
   APFloat fill(0.0f);
-  if (!matchPattern(yield.getValue(), m_ConstantFloat(&fill)) ||
-      !fill.isZero()) {
-    return false;
+  if (matchPattern(yield.getValue(), m_ConstantFloat(&fill))) {
+    int8Fill = false;
+    return fill.isZero();
   }
-  return true;
+  // The int8 requantized pad1 targets' one baked zero point; see the file
+  // comment.
+  APInt integerFill;
+  auto elementType = cast<RankedTensorType>(pad.getResult().getType())
+                         .getElementType();
+  if (elementType.isInteger(8) &&
+      matchPattern(yield.getValue(), m_ConstantInt(&integerFill)) &&
+      integerFill.getSExtValue() == kInt8PadFill) {
+    int8Fill = true;
+    return true;
+  }
+  return false;
 }
 
 /// The single user of `value`, or null when it has any other count.
@@ -154,6 +184,25 @@ static Operation *soleUser(Value value) {
     return nullptr;
   }
   return *value.getUsers().begin();
+}
+
+/// Whether `accumulator` is read only by the canonical requantization
+/// epilogue: one `linalg.generic` taking the i32 accumulator, the per-channel
+/// bias, and the scale, zero point and two clamp bounds as scalars, and
+/// writing i8. That is the shape `rocket-fuse-int8-requant-epilogue` emits
+/// and the only one the requantized pad1 matchers claim.
+static bool feedsRequantEpilogue(Value accumulator) {
+  auto epilogue = dyn_cast_or_null<linalg::GenericOp>(soleUser(accumulator));
+  if (!epilogue || epilogue.getNumDpsInputs() != 6 ||
+      epilogue.getNumDpsInits() != 1) {
+    return false;
+  }
+  auto accumulatorType = dyn_cast<RankedTensorType>(accumulator.getType());
+  auto resultType =
+      dyn_cast<RankedTensorType>(epilogue.getResult(0).getType());
+  return accumulatorType && resultType &&
+         accumulatorType.getElementType().isInteger(32) &&
+         resultType.getElementType().isInteger(8);
 }
 
 template <typename ConvOp, int64_t SpatialH, int64_t SpatialW>
@@ -243,8 +292,34 @@ struct MarkPaddedConv : public OpRewritePattern<ConvOp> {
     const int64_t spatial[2] = {SpatialH + shift, SpatialW + shift};
     int64_t padHeight = 0;
     int64_t padWidth = 0;
-    if (!matchSymmetricSpatialPad(pad, spatial, padHeight, padWidth)) {
+    bool int8Fill = false;
+    if (!matchSymmetricSpatialPad(pad, spatial, padHeight, padWidth,
+                                  int8Fill)) {
       return failure();
+    }
+    // An int8 fill is marked only where a target claims it: a dense 3x3 at
+    // pad 1 whose result feeds the requantization epilogue
+    // `rocket-fuse-int8-requant-epilogue` produced -- the one form the pad1
+    // matchers claim. A mark is an attribute every DAG matcher compares, so
+    // marking a convolution no pad1 matcher can take only risks costing it
+    // the unpadded matcher that would have claimed it. (The int8_accumulator
+    // matchers are not DAG-based and ignore the mark; a -128-padded 3x3
+    // whose bias did not reach the requantized form stays theirs either
+    // way.)
+    if (int8Fill) {
+      if (!std::is_same_v<ConvOp, linalg::Conv2DNhwcHwcfOp> ||
+          padHeight != 1 || padWidth != 1) {
+        return failure();
+      }
+      auto filterType =
+          cast<RankedTensorType>(conv.getDpsInputs()[1].getType());
+      if (filterType.getRank() != 4 || filterType.getDimSize(0) != 3 ||
+          filterType.getDimSize(1) != 3) {
+        return failure();
+      }
+      if (!feedsRequantEpilogue(conv->getResult(0))) {
+        return failure();
+      }
     }
     // The region is made self-contained after the greedy driver finishes --
     // see the file comment. Record the pad for that second step.
@@ -264,10 +339,10 @@ struct RocketFoldConvPadPass
 
   StringRef getArgument() const final { return "rocket-fold-conv-pad"; }
   StringRef getDescription() const final {
-    return "Marks a convolution whose input is a symmetric, zero-filled, "
-           "spatial-only tensor.pad with rocket.pad_top/rocket.pad_left, so "
-           "the matcher can hand the padding to the CNA instead of leaving it "
-           "as a materialized copy.";
+    return "Marks a convolution whose input is a symmetric, zero-filled "
+           "(or, for an int8 3x3, -128-filled), spatial-only tensor.pad "
+           "with rocket.pad_top/rocket.pad_left, so the matcher can hand the "
+           "padding to the CNA instead of leaving it as a materialized copy.";
   }
 
   void getDependentDialects(DialectRegistry &registry) const final {
@@ -299,15 +374,20 @@ struct RocketFoldConvPadPass
       if (fill && fill->getBlock() == &pad.getRegion().front()) {
         continue;
       }
-      auto floatType = dyn_cast<FloatType>(
-          cast<RankedTensorType>(pad.getResult().getType()).getElementType());
-      if (!floatType) {
+      Type elementType =
+          cast<RankedTensorType>(pad.getResult().getType()).getElementType();
+      OpBuilder builder(yield);
+      TypedAttr fillAttr;
+      if (auto floatType = dyn_cast<FloatType>(elementType)) {
+        fillAttr = builder.getFloatAttr(floatType, 0.0);
+      } else if (elementType.isInteger(8)) {
+        fillAttr = builder.getIntegerAttr(elementType, kInt8PadFill);
+      } else {
         continue;
       }
-      OpBuilder builder(yield);
-      Value zero = arith::ConstantOp::create(
-          builder, pad.getLoc(), builder.getFloatAttr(floatType, 0.0));
-      yield.getValueMutable().assign(zero);
+      Value sunk =
+          arith::ConstantOp::create(builder, pad.getLoc(), fillAttr);
+      yield.getValueMutable().assign(sunk);
     }
   }
 };

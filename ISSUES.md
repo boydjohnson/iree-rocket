@@ -1911,6 +1911,51 @@ What was settled and how, newest first, in place of the narratives — those are
 in this file's git history (`git log -p ISSUES.md`). Everything cited below is
 something that still exists: a commit, a file, or a memory.
 
+**int8 conv -> conv chaining (S2) — 2026-11-23. ResNet50-224 int8 had no
+NPU->NPU edge at all; now 30 of 32 conv->conv edges chain, 64.8 -> ~52 ms.**
+`rocket-assign-layout` declared `0 NPU->NPU edge(s) packed` on the int8
+build, and the reason was not the driver. Two things sat on every edge:
+
+- **Our quantizer left ReLU in float.** `tools/quantize_onnx_int8.py`
+  quantized only `Conv`, so each edge was QLinearConv -> DequantizeLinear ->
+  Relu -> QuantizeLinear -> QLinearConv: a CPU dequantize + ReLU + requantize
+  to the ReLU's own scale (33 dispatches on ResNet50). That is two roundings,
+  so no compiler fusion of it could be exact. Quantizing `Relu` as well (now
+  the default) is ORT's own Conv+ReLU fold: the ReLU is removed and the conv
+  takes its output scale with zero point 0. It changes the model, so compare
+  against that model's own `--no-offload` arm: max|d| 0.26 on the logits (the
+  f16 stem's, as before), same top-5. Alone: 16 edges (conv2 -> conv3),
+  64.8 -> 57.6 ms.
+- **Every 3x3's pad was three CPU dispatches.** A QLinearConv's "same"
+  padding is an NCHW `tensor.pad` filled with the input zero point, and
+  `rocket-transpose-quantized-conv-to-nhwc` put its transpose between that pad
+  and the conv, so IREE emitted transpose -> `slow_memcpy` -> transpose in
+  front of each one, and `rocket-fold-conv-pad` (zero fills only) could not
+  see it. The pass now transposes the pad's *source* and pads in NHWC; the
+  fold marks an i8 pad filled with exactly -128 (the signed encoding of a ui8
+  zero point of 0, every ReLU output's) on a dense 3x3 pad-1 conv that feeds
+  the requantization epilogue; and `#rocket_dynamic_int8_requant_pad1{,_s2}_target`
+  bake `input_zero_point = -128`, which the driver already programs into
+  `CNA_PAD_CON1.pad_value` (the encoding Mesa and rocket-userspace use,
+  `(zp_u8 & 0xff) - 0x80`). No wire or driver change. 30 edges, CPU
+  dispatch executables 58 -> 30.
+
+The relu-fused ResNet50 with the CNA padding is **bit-identical** to the same
+model with the pad on the CPU, which is the check that the fill is right; e2e
+`requant_int8_3x3_pad1`, `_pad1_s2` and `requant_int8_1x1_then_pad1` are 0
+mismatches at atol 1. Medians of 15 on cpu 4-7, 600 MHz, 0 NPU timeouts:
+main 64.8-67.4 ms, ReLU fold alone 57.2-57.8, both 51.3-54.1; the CPU arm of
+the same model is 1068 ms. The two edges left dense are in stage 4, where
+conv1 (1x1 `Cin` 2048 -> 512) is still on the int8 accumulator with a CPU
+requantization. Lit `rocket_int8_requant_pad1.mlir`; full compiled e2e
+gate 46/46.
+
+The padding on its own is worth little: the old model (ReLU in float) built
+with this compiler takes the pad1 targets on all 16 3x3s too -- its pads are
+also -128-filled -- and is bit-identical to main at 63.5-65.1 vs 64.9-65.1 ms.
+Three CPU dispatches per 3x3 cost about 1 ms; what pays is the edge they were
+blocking, 57.6 -> ~52 ms once the ReLU fold leaves nothing else on it.
+
 **P9 (S2) — 2026-11-23. Every IREE transient was a fresh GEM object,
 created and freed on every inference; reusing them makes ResNet50-224 int8
 1.46x faster and MobileNetV2 fp16 1.63x.** Found from a C17 diagnostic: growing

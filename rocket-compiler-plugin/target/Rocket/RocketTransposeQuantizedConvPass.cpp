@@ -31,6 +31,17 @@
 // then do their jobs in order. It is deliberately a named-op-to-named-op
 // rewrite: generalizing to linalg.generic is exactly the thing that does not
 // work here.
+//
+// **A pad in front of the convolution moves to the NHWC side.** An ONNX
+// QLinearConv's "same" padding arrives as an NCHW `tensor.pad` (filled with
+// the input zero point) directly in front of the quantized conv. Left there,
+// the transpose this pass adds lands *between* the pad and the conv, so
+// `rocket-fold-conv-pad` cannot see the pad and IREE materializes it as
+// three CPU dispatches per 3x3 conv -- transpose to NCHW, pad copy,
+// transpose back. Transposing the pad's source instead and padding in NHWC
+// is the same tensor (a constant pad commutes with a permutation), puts the
+// pad next to the conv where the fold can hand it to the CNA, and leaves the
+// transposes adjacent to the producer's own, where they cancel.
 
 #include "mlir/Dialect/Linalg/IR/Linalg.h"
 #include "mlir/Dialect/Tensor/IR/Tensor.h"
@@ -62,6 +73,39 @@ Value transposeTo(PatternRewriter &rewriter, Location loc, Value source,
       .getResult()[0];
 }
 
+/// `transposeTo(pad(x))` rebuilt as `pad(transposeTo(x))`, or null when the
+/// pad is not one this can move: it must be static, filled with a single
+/// constant, and read only by the convolution being rewritten (a second
+/// reader would keep the NCHW pad alive next to the new one).
+Value transposePadTo(PatternRewriter &rewriter, Location loc, Value input,
+                     ArrayRef<int64_t> permutation) {
+  auto pad = input.getDefiningOp<tensor::PadOp>();
+  if (!pad || !pad->hasOneUse() || !pad.getLow().empty() ||
+      !pad.getHigh().empty()) {
+    return nullptr;
+  }
+  Value fill = pad.getConstantPaddingValue();
+  if (!fill) {
+    return nullptr;
+  }
+  ArrayRef<int64_t> low = pad.getStaticLow();
+  ArrayRef<int64_t> high = pad.getStaticHigh();
+  SmallVector<OpFoldResult> permutedLow, permutedHigh;
+  SmallVector<int64_t> permutedShape;
+  auto paddedType = cast<RankedTensorType>(pad.getResult().getType());
+  for (int64_t dim : permutation) {
+    permutedLow.push_back(rewriter.getIndexAttr(low[dim]));
+    permutedHigh.push_back(rewriter.getIndexAttr(high[dim]));
+    permutedShape.push_back(paddedType.getDimSize(dim));
+  }
+  Value source = transposeTo(rewriter, loc, pad.getSource(), permutation);
+  auto resultType =
+      RankedTensorType::get(permutedShape, paddedType.getElementType());
+  return tensor::PadOp::create(rewriter, loc, resultType, source, permutedLow,
+                               permutedHigh, fill, pad.getNofold())
+      .getResult();
+}
+
 struct TransposeQuantizedConvToNhwc
     : OpRewritePattern<linalg::Conv2DNchwFchwQOp> {
   using OpRewritePattern::OpRewritePattern;
@@ -84,7 +128,10 @@ struct TransposeQuantizedConvToNhwc
     }
 
     // NCHW -> NHWC for the image operands, FCHW -> HWCF for the filter.
-    Value nhwcInput = transposeTo(rewriter, loc, input, {0, 2, 3, 1});
+    Value nhwcInput = transposePadTo(rewriter, loc, input, {0, 2, 3, 1});
+    if (!nhwcInput) {
+      nhwcInput = transposeTo(rewriter, loc, input, {0, 2, 3, 1});
+    }
     Value hwcfFilter = transposeTo(rewriter, loc, filter, {2, 3, 1, 0});
     Value nhwcInit = transposeTo(rewriter, loc, init, {0, 2, 3, 1});
 
