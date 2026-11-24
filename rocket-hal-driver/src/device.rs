@@ -2234,7 +2234,31 @@ unsafe extern "C" fn queue_execute(
                                 out_rb.host_ptr.add(oc.output_offset),
                                 expected_bytes,
                             );
-                            let written = if !oc.tile_rects.is_empty() {
+                            let written = if oc.row_major {
+                                // The DPU wrote the dense layout itself; only
+                                // whole rows move. Fanned out, each tile's
+                                // rows come from its context's scratch, at
+                                // the same offsets as in the home scratch.
+                                let row_bytes = oc.bytes_per_pixel;
+                                if oc.tile_rects.is_empty() {
+                                    dst.copy_from_slice(&scratch[..expected_bytes]);
+                                } else {
+                                    for (tile, &context) in
+                                        oc.tile_rects.iter().zip(&oc.tile_context)
+                                    {
+                                        let source: &[u8] = if context == 0 {
+                                            scratch
+                                        } else {
+                                            let (ptr, len) = oc.replica_scratch[context - 1];
+                                            std::slice::from_raw_parts(ptr as *const u8, len)
+                                        };
+                                        let rows = tile.row * row_bytes
+                                            ..(tile.row + tile.rows) * row_bytes;
+                                        dst[rows.clone()].copy_from_slice(&source[rows]);
+                                    }
+                                }
+                                expected_bytes
+                            } else if !oc.tile_rects.is_empty() {
                                 // Fanned out: every tile's rows come from the
                                 // scratch of the context that ran it. The
                                 // replicas share the home scratch's layout, so

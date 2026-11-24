@@ -1911,6 +1911,36 @@ What was settled and how, newest first, in place of the narratives — those are
 in this file's git history (`git log -p ISSUES.md`). Everything cited below is
 something that still exists: a commit, a file, or a memory.
 
+**Row-major matmul output: the DPU writes `[M, N]` itself — 2026-11-24.
+BLIP fp16 1300 -> 968 ms, bit-identical.** BLIP's re-survey showed matmul
+compaction (NC1HWC2 -> the dense IREE buffer) costing ~309 ms per inference,
+as much as the NPU's own ~330 ms, and none of it avoidable by chaining: every
+BLIP matmul feeds a CPU LayerNorm, GELU, softmax or add (0 NPU->NPU edges).
+
+The DPU has no destination line stride, but `DPU_DATA_CUBE_NOTCH_ADDR` skips
+atoms at the end of every output line. Lower the matmul as a width-1,
+height-`M` 1x1 convolution (every line is one row), set the surface stride to
+one atom, the notch to `N * 2 / 16 - 1` and `DPU_SURFACE_ADD` to 2, and
+channel group `c1` of row `m` lands at byte `m * N * 2 + c1 * 16`: row-major.
+`matmul_dense_output_probe_hw.rs` measured it: bit-identical to the width-`M`
+lowering on all seven BLIP shapes, never slower on the NPU, and faster at
+wide K (577x3072x768: 28 tasks/12.5 ms -> 19 tasks/8.9 ms). `SURFACE_ADD` 0,
+1, 4 and the planner's whole-image value all misplace channel groups.
+**Padded output channels must be empty:** the DPU writes every programmed
+channel, so at N 8 (padded to 16) the last pad atom lands past `[M, N]` and
+at N 24 each row's pad atom overwrites the next row.
+
+`rocket_core::fc::Plan::try_new_row_major_output` (fp16, K >= 32, no padded
+channels, notch <= 8191) and the HAL's `place_row_major_output` implement it;
+the driver's matmul arm uses it whenever the compiler declares no packed
+reader (`packed_readers == 0`), and compaction becomes a row copy (fanned-out
+tiles copy their own rows). A result with packed readers keeps the cube.
+`ROCKET_MATMUL_OUTPUT=cube` forces the old path for A/B. BLIP per inference:
+compact ~309 -> ~30 ms, NPU ~330 -> ~269 ms; 1297/1301/1301 -> 966/970/968 ms
+ABAB on cpu 4-7, output bit-identical, 0 timeouts. Gates:
+`row_major_matmul_output_matches_cube` (six shapes incl. M 1, odd M,
+multi-tile, nothing written past `[M, N]`), compiled e2e 49/49.
+
 **Padded max and min: the PPU ignores the fill at both precisions —
 2026-11-24.** The int8 max probe generalized to `pad_fill_probe` and run four
 ways: int8 max (13 encodings), int8 min (10, incl. 0, -5 at 8/16/35 bits and

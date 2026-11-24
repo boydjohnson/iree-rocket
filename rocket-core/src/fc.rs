@@ -32,6 +32,12 @@ use crate::{
 /// The 1x1 spatial kernel used by every captured FC program.
 pub const KERNELS: [usize; 2] = [1, 1];
 
+/// The largest `DPU_DATA_CUBE_NOTCH_ADDR` field: 13 bits.
+const MAX_NOTCH: u32 = 8191;
+
+/// Bytes in one DPU output atom.
+const ATOM_BYTES: u32 = 16;
+
 /// Logical `[M,K] x [K,N] -> [M,N]` fully-connected shape.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Shape {
@@ -69,6 +75,49 @@ impl Shape {
         self
     }
 
+    /// Whether the DPU can write this matmul's result straight into a
+    /// row-major `[M, N]` buffer ([`Shape::try_as_row_major_output_conv_shape`]).
+    ///
+    /// fp16 only -- `DPU_SURFACE_ADD`'s value at a one-atom surface stride is
+    /// measured for the 2-byte float writer and nothing else -- `K` at least
+    /// 32 (the narrowest measured), `N` already a whole number of the
+    /// planner's output-channel granule (no padded channels), and `N` a
+    /// whole number of 16-byte atoms, so a row's last atom does not spill
+    /// into the next row. The row pitch rides in the 13-bit notch field.
+    pub fn supports_row_major_output(self) -> bool {
+        let row_bytes = self.n * self.precision.element_bytes();
+        // The DPU writes every *programmed* channel, padding included, so the
+        // padding has to be empty: at N 8 (padded to 16) the last row's pad
+        // atom lands past `[M, N]`, and at N 24 (padded to 32) each row's pad
+        // atom overwrites the next row's first -- both measured
+        // (`row_major_matmul_output_matches_cube`).
+        let unpadded = self
+            .try_as_row_major_output_conv_shape()
+            .is_ok_and(|conv| conv.padded_out_channels() == self.n);
+        self.precision == Precision::Fp16
+            // Measured from K 32 up; a narrower input switches the CNA to its
+            // dense image-input regime, which this lowering never ran.
+            && self.k >= 32
+            && unpadded
+            && row_bytes.is_multiple_of(ATOM_BYTES)
+            && row_bytes / ATOM_BYTES - 1 <= MAX_NOTCH
+    }
+
+    /// The transposed lowering the row-major output needs: width 1, height
+    /// `M`, so every output line is one pixel and the DPU's line pitch
+    /// (`width + notch` atoms) can be set to one output row.
+    ///
+    /// Same 1x1 convolution, same input bytes: an NC1HWC2 cube of `M` pixels
+    /// is laid out identically whether those pixels form one row or one
+    /// column, so packing and chaining are unchanged. Measured bit-identical
+    /// to the width-`M` lowering on BLIP's seven matmul shapes, and no slower
+    /// on any of them (`matmul_dense_output_timing_probe`).
+    pub fn try_as_row_major_output_conv_shape(self) -> Result<conv::Shape, PlanError> {
+        conv::Shape::try_with_precision(1, self.m, 1, self.k, self.n, self.precision)?
+            .try_with_padding([0, 0])?
+            .try_with_activation(self.activation)
+    }
+
     /// Returns the physical convolution shape observed in the vendor sweep.
     pub fn as_conv_shape(self) -> conv::Shape {
         self.try_as_conv_shape()
@@ -91,6 +140,7 @@ impl Shape {
 pub struct Plan {
     shape: Shape,
     conv: ConvPlan,
+    row_major_output: bool,
 }
 
 impl Plan {
@@ -105,11 +155,37 @@ impl Plan {
         Ok(Plan {
             shape,
             conv: ConvPlan::try_new(shape.try_as_conv_shape()?, KERNELS)?,
+            row_major_output: false,
+        })
+    }
+
+    /// Plans the width-1 lowering whose tiles the HAL points straight at a
+    /// row-major `[M, N]` output, or `None` where the shape does not support
+    /// it ([`Shape::supports_row_major_output`]) or the planner refuses it.
+    /// The caller falls back to [`Plan::try_new`] and its NC1HWC2 output.
+    pub fn try_new_row_major_output(shape: Shape) -> Option<Plan> {
+        if !shape.supports_row_major_output() {
+            return None;
+        }
+        let conv =
+            ConvPlan::try_new(shape.try_as_row_major_output_conv_shape().ok()?, KERNELS).ok()?;
+        // Width 1 never splits into columns; every tile is a band of rows.
+        debug_assert!(conv.tiles().iter().all(|tile| tile.columns.out_cols == 1));
+        Some(Plan {
+            shape,
+            conv,
+            row_major_output: true,
         })
     }
 
     pub fn shape(&self) -> Shape {
         self.shape
+    }
+
+    /// Whether this plan writes a row-major `[M, N]` output
+    /// ([`Plan::try_new_row_major_output`]) rather than an NC1HWC2 cube.
+    pub fn row_major_output(&self) -> bool {
+        self.row_major_output
     }
 
     /// Exposes the underlying convolution plan for storage and scheduling
@@ -164,6 +240,32 @@ mod tests {
             296
         );
         assert_eq!(plan, Plan::new(plan.shape()));
+    }
+
+    #[test]
+    fn row_major_output_is_fp16_whole_atom_rows_only() {
+        let fp16 = |m, n| Shape::try_new(m, 768, n, Precision::Fp16).unwrap();
+        assert!(fp16(577, 768).supports_row_major_output());
+        assert!(fp16(1, 16).supports_row_major_output());
+        // 12 fp16 channels is a row and a half of atoms.
+        assert!(!fp16(16, 12).supports_row_major_output());
+        // Whole atoms but padded channels: the pad atoms would be written.
+        assert!(!fp16(7, 8).supports_row_major_output());
+        assert!(!fp16(16, 24).supports_row_major_output());
+        let plan = Plan::try_new_row_major_output(fp16(577, 3072)).unwrap();
+        assert!(plan.row_major_output());
+        let conv = plan.conv_plan().shape();
+        assert_eq!((conv.width, conv.height), (1, 577));
+        assert_eq!(
+            plan.conv_plan()
+                .tiles()
+                .iter()
+                .map(|tile| tile.rows.out_rows)
+                .sum::<u32>(),
+            577
+        );
+        assert!(Plan::try_new_row_major_output(fp16(16, 12)).is_none());
+        assert!(!Plan::try_new(fp16(577, 768)).unwrap().row_major_output());
     }
 
     fn code<T: std::fmt::Debug>(result: Result<T, PlanError>) -> PlanErrorCode {
