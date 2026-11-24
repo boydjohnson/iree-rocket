@@ -2066,12 +2066,11 @@ mod tests {
         assert_eq!(executable.shape_template.pad_value, 0xFC00);
     }
 
-    /// And where no measurement says what the fill should be, a padded pool
-    /// is refused rather than filled with a plausible guess. Unpadded is
-    /// fine: nothing reads the field.
+    /// A padded int8 max pool decodes too: its fill was measured inert on
+    /// the PPU (`int8_max_pad_fill_probe`), and the identity is programmed.
     #[test]
-    fn refuses_padded_pooling_with_an_unmeasured_fill_value() {
-        let padded_int8_max = encode_pooling_executable(
+    fn padded_int8_max_pooling_programs_the_int8_identity() {
+        let executable = pooling_of(&encode_pooling_executable(
             schema::PoolingMethod::MAX,
             schema::Precision::INT8,
             (8, 8),
@@ -2081,8 +2080,27 @@ mod tests {
             (2, 2),
             [1, 1, 1, 1],
             &[],
+        ));
+        assert_eq!(executable.shape_template.pad_value, 0x80);
+    }
+
+    /// And where no measurement says what the fill should be, a padded pool
+    /// is refused rather than filled with a plausible guess. Unpadded is
+    /// fine: nothing reads the field.
+    #[test]
+    fn refuses_padded_pooling_with_an_unmeasured_fill_value() {
+        let padded_int8_min = encode_pooling_executable(
+            schema::PoolingMethod::MIN,
+            schema::Precision::INT8,
+            (8, 8),
+            32,
+            (4, 4),
+            (3, 3),
+            (2, 2),
+            [1, 1, 1, 1],
+            &[],
         );
-        assert!(decode_flatbuffer_shape(&padded_int8_max).is_err());
+        assert!(decode_flatbuffer_shape(&padded_int8_min).is_err());
 
         let padded_min = encode_pooling_executable(
             schema::PoolingMethod::MIN,

@@ -15,16 +15,17 @@
 // and a QuantizeLinear. tools/quantize_onnx_int8.py gives the QuantizeLinear
 // the DequantizeLinear's own parameters, and then rocket-fuse-int8-max-pool
 // turns the four into an int8 max pool on the codes -- exactly -- which the
-// NPU's int8 pooling runs.
+// NPU's int8 pooling runs. Its -128 pad is marked by rocket-fold-conv-pad and
+// claimed with the pool, so the PPU pads: the dispatch reads the unpadded
+// 16x16 tensor.
 
 #map = affine_map<(d0, d1, d2, d3) -> (d0, d1, d2, d3)>
 
 // CHECK-LABEL: util.func public @stem_max_pool
-// The pad survives on the CPU at int8, filled with the smallest code.
-// CHECK: tensor.pad {{.*}} low[0, 1, 1, 0] high[0, 1, 1, 0]
-// CHECK: tensor.yield %c-128_i8 : i8
-// CHECK: flow.dispatch @rocket_pooling_max_int8_executable_s2::
+// CHECK-NOT: tensor.pad
+// CHECK: flow.dispatch @rocket_pooling_max_int8_pad1_executable_s2::{{.*}}(%c16_i32, %c16_i32, %c64_i32, %c3_i32, %c3_i32
 // CHECK-NOT: linalg.pooling_nchw_max
+// CHECK-NOT: tensor.pad
 // CHECK: util.return
 util.func public @stem_max_pool(%x: tensor<1x64x16x16xi8>) -> tensor<1x64x8x8xi8> {
   %scale = arith.constant 1.370000e-01 : f32
@@ -98,4 +99,46 @@ util.func public @requantizing_max_pool_declines(%x: tensor<1x64x16x16xi8>) -> t
     linalg.yield %n : i8
   } -> tensor<1x64x8x8xi8>
   util.return %q : tensor<1x64x8x8xi8>
+}
+
+// Padding 2 on a 3x3 window is below the kernel, so rocket-fold-conv-pad
+// marks it, but no target bakes pad 2: the pad1 matcher declines on the DAG
+// and the unpadded int8 matcher claims the pool alone, with the pad staying a
+// CPU tensor.pad. Correct either way -- the unpadded executable pads nothing.
+// CHECK-LABEL: util.func public @pad2_stays_on_the_cpu
+// CHECK: tensor.pad {{.*}} low[0, 2, 2, 0] high[0, 2, 2, 0]
+// CHECK: flow.dispatch @rocket_pooling_max_int8_executable_s2::
+// CHECK: util.return
+util.func public @pad2_stays_on_the_cpu(%x: tensor<1x64x16x16xi8>) -> tensor<1x64x9x9xi8> {
+  %scale = arith.constant 1.370000e-01 : f32
+  %zero = arith.constant 0.000000e+00 : f32
+  %max = arith.constant 2.550000e+02 : f32
+  %neg_inf = arith.constant 0xFF800000 : f32
+  %f_empty = tensor.empty() : tensor<1x64x16x16xf32>
+  %f = linalg.generic {indexing_maps = [#map, #map], iterator_types = ["parallel", "parallel", "parallel", "parallel"]} ins(%x : tensor<1x64x16x16xi8>) outs(%f_empty : tensor<1x64x16x16xf32>) {
+  ^bb0(%in: i8, %out: f32):
+    %v = arith.uitofp %in : i8 to f32
+    %s = arith.mulf %v, %scale : f32
+    linalg.yield %s : f32
+  } -> tensor<1x64x16x16xf32>
+  %padded = tensor.pad %f low[0, 0, 2, 2] high[0, 0, 2, 2] {
+  ^bb0(%a: index, %b: index, %c: index, %d: index):
+    tensor.yield %neg_inf : f32
+  } : tensor<1x64x16x16xf32> to tensor<1x64x20x20xf32>
+  %p_empty = tensor.empty() : tensor<1x64x9x9xf32>
+  %p_init = linalg.fill ins(%neg_inf : f32) outs(%p_empty : tensor<1x64x9x9xf32>) -> tensor<1x64x9x9xf32>
+  %window = tensor.empty() : tensor<3x3xf32>
+  %pooled = linalg.pooling_nchw_max {dilations = dense<1> : vector<2xi64>, strides = dense<2> : vector<2xi64>} ins(%padded, %window : tensor<1x64x20x20xf32>, tensor<3x3xf32>) outs(%p_init : tensor<1x64x9x9xf32>) -> tensor<1x64x9x9xf32>
+  %q_empty = tensor.empty() : tensor<1x64x9x9xi8>
+  %q = linalg.generic {indexing_maps = [#map, #map], iterator_types = ["parallel", "parallel", "parallel", "parallel"]} ins(%pooled : tensor<1x64x9x9xf32>) outs(%q_empty : tensor<1x64x9x9xi8>) {
+  ^bb0(%in: f32, %out: i8):
+    %d = arith.divf %in, %scale : f32
+    %r = math.roundeven %d : f32
+    %z = arith.addf %r, %zero : f32
+    %lo = arith.maximumf %z, %zero : f32
+    %hi = arith.minimumf %lo, %max : f32
+    %n = arith.fptoui %hi : f32 to i8
+    linalg.yield %n : i8
+  } -> tensor<1x64x9x9xi8>
+  util.return %q : tensor<1x64x9x9xi8>
 }

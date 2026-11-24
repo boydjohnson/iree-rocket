@@ -84,22 +84,32 @@ impl PoolingMethod {
     ///   divisor.
     /// * **Max at fp16: `0xFC00`, -inf.** The vendor's own padded max
     ///   captures program it (`../rockchip-npu-notes/encodings/ppu-pooling.md`).
-    /// * **Everything else: unmeasured.** Min at either format, and max at
-    ///   int8, have no capture and no hardware run behind them. The obvious
-    ///   guesses -- `0x7C00` for fp16 min, `0x80`/`0x7F` for int8 -- are
-    ///   only guesses, and an int8 pool's operands may carry a zero point,
-    ///   which moves what "most negative" even means. Callers must refuse a
+    /// * **Max at int8: `0x80`, and the value is inert.** Measured 2026-11-24
+    ///   (`pooling_oracle_hw.rs`, `int8_max_pad_fill_probe`): thirteen
+    ///   encodings of the 35-bit `PPU_PADDING_VALUE` -- 0, +5, +127, 0x80,
+    ///   -5 at 8/16/32/35 bits, -128 at 35 bits, fp16 -inf, 0x8000,
+    ///   0x80000000 and the 35-bit minimum -- all give the clamp-to-image
+    ///   answer in every border window, including windows whose only image
+    ///   tap is -8, where a fill of 0 or +127 would have won. The int8 PPU
+    ///   max never lets a padded tap win, so the result is exact for any
+    ///   fill; `0x80` is programmed because it is the identity (-128) in
+    ///   the format's own width, which is what a register dump should show.
+    ///   **Padding must stay below the kernel** (see
+    ///   [`PoolingShape::validate`]): a window lying entirely in the
+    ///   padding hangs the job.
+    /// * **Everything else: unmeasured.** Min at either format has no
+    ///   capture and no hardware run behind it. The obvious guess --
+    ///   `0x7C00` for fp16 min -- is only a guess. Callers must refuse a
     ///   *padded* pool here rather than fill in something plausible; an
     ///   unpadded one never reads the field and can pass zero.
     ///
-    /// Lifting this is one probe: a padded pool whose border window is
-    /// entirely padding, checked against the identity element, per method
-    /// and format.
+    /// Lifting the rest is one probe each: `int8_max_pad_fill_probe`'s
+    /// shape, per method and format.
     pub fn pad_fill_value(self, precision: PoolingPrecision) -> Option<u32> {
         match (self, precision) {
             (PoolingMethod::Avg, _) => Some(0),
             (PoolingMethod::Max, PoolingPrecision::Fp16) => Some(0xFC00),
-            (PoolingMethod::Max, PoolingPrecision::Int8) => None,
+            (PoolingMethod::Max, PoolingPrecision::Int8) => Some(0x80),
             (PoolingMethod::Min, _) => None,
         }
     }
@@ -393,6 +403,23 @@ fn validate_pooling_geometry(
         assert!(
             value <= MAX_PPU_PADDING,
             "{name} must be 0..={MAX_PPU_PADDING}, the PPU's 3-bit range"
+        );
+    }
+    // A pad as wide as the kernel puts a whole window in the padding, and
+    // the PPU does not produce the fill there -- it hangs the job (measured
+    // at int8 3x3 pad 3, 13 of 13 dispatches killed by the watchdog, the
+    // same shape at pad 2 exact; `int8_max_pad_fill_probe`). No framework
+    // pool pads that far, so this refuses rather than characterizes it.
+    for (name, pad, kernel) in [
+        ("left padding", pad_left, kernel_width),
+        ("right padding", pad_right, kernel_width),
+        ("top padding", pad_top, kernel_height),
+        ("bottom padding", pad_bottom, kernel_height),
+    ] {
+        assert!(
+            pad < kernel,
+            "{name} {pad} must be below the kernel ({kernel}): a window entirely in the \
+             padding hangs the PPU"
         );
     }
     assert_eq!(
@@ -1510,5 +1537,45 @@ mod tests {
     #[should_panic(expected = "pooling kernel axes must be 1..=8")]
     fn rejects_kernel_beyond_hardware_backed_direct_limit() {
         shape(64, 48, 16, 3, 2, 2, PoolingPrecision::Int8).validate();
+    }
+
+    /// A padded int8 max pool is runnable now; padded min still is not.
+    #[test]
+    fn padded_int8_max_has_a_fill_and_padded_min_does_not() {
+        assert_eq!(
+            PoolingMethod::Max.required_pad_fill(PoolingPrecision::Int8, true),
+            Some(0x80)
+        );
+        assert_eq!(
+            PoolingMethod::Min.required_pad_fill(PoolingPrecision::Int8, true),
+            None
+        );
+        assert_eq!(
+            PoolingMethod::Min.required_pad_fill(PoolingPrecision::Fp16, true),
+            None
+        );
+    }
+
+    /// A window entirely in the padding hangs the PPU.
+    #[test]
+    #[should_panic(expected = "must be below the kernel")]
+    fn rejects_padding_as_wide_as_the_kernel() {
+        let mut padded = shape(6, 6, 3, 3, 1, 1, PoolingPrecision::Int8);
+        padded.pad_left = 3;
+        padded.pad_right = 3;
+        padded.output_width = output_extent(6, 3, 1, 3, 3);
+        padded.validate();
+    }
+
+    #[test]
+    fn padding_one_below_the_kernel_validates() {
+        let mut padded = shape(6, 6, 3, 3, 1, 1, PoolingPrecision::Int8);
+        padded.pad_left = 2;
+        padded.pad_top = 2;
+        padded.pad_right = 2;
+        padded.pad_bottom = 2;
+        padded.output_width = output_extent(6, 3, 1, 2, 2);
+        padded.output_height = output_extent(6, 3, 1, 2, 2);
+        padded.validate();
     }
 }

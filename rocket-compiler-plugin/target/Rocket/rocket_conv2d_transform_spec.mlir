@@ -364,10 +364,8 @@
 
 // The int8 twin of #rocket_pooling_max_target_s2, for the max pool a
 // quantized model runs on its codes (rocket-fuse-int8-max-pool). Unpadded,
-// like the fp16 one: the model's padding (filled with the smallest code, -128)
-// stays a CPU `tensor.pad`, because padded int8 max has no measured fill
-// (PoolingMethod::pad_fill_value). Hardware: `max_pooling_matches_oracle`,
-// exact at ResNet's 114x114x64 3x3 stride 2.
+// for a pool whose padding the pad1 twin below cannot take. Hardware:
+// `max_pooling_matches_oracle`, exact at ResNet's 114x114x64 3x3 stride 2.
 #rocket_pooling_max_int8_target_s2 = #hal.executable.target<"rocket", "rocket-flatbuffer-v1", {
   kernel = "pooling",
   runtime_layout = true,
@@ -376,6 +374,27 @@
   kernel_width = 0 : i32, kernel_height = 0 : i32,
   stride_x = 2 : i32, stride_y = 2 : i32,
   pad_left = 0 : i32, pad_top = 0 : i32, pad_right = 0 : i32, pad_bottom = 0 : i32,
+  method = "max",
+  precision = "int8",
+  runtime_dimensions = ["input_width", "input_height", "channels",
+                        "kernel_width", "kernel_height"]
+}>
+
+// The same pool with its padding on the PPU: the -128-filled pad
+// `rocket-fold-conv-pad` marks on an int8 max pool. The PPU's int8 max never
+// lets a padded tap win, whatever the fill (`int8_max_pad_fill_probe`), and a
+// -128 pad never wins a max either, so the two agree exactly wherever every
+// window holds an image pixel -- pad < kernel, which the marking checks.
+// Hardware: `padded_max_pooling_matches_oracle`, exact at ResNet's
+// 112x112x64 3x3 stride 2 pad 1.
+#rocket_pooling_max_int8_pad1_target_s2 = #hal.executable.target<"rocket", "rocket-flatbuffer-v1", {
+  kernel = "pooling",
+  runtime_layout = true,
+  input_width = 0 : i32, input_height = 0 : i32, channels = 0 : i32,
+  output_width = 0 : i32, output_height = 0 : i32,
+  kernel_width = 0 : i32, kernel_height = 0 : i32,
+  stride_x = 2 : i32, stride_y = 2 : i32,
+  pad_left = 1 : i32, pad_top = 1 : i32, pad_right = 1 : i32, pad_bottom = 1 : i32,
   method = "max",
   precision = "int8",
   runtime_dimensions = ["input_width", "input_height", "channels",
@@ -1153,6 +1172,20 @@ module attributes {transform.with_named_sequence} {
 
   hal.executable private @rocket_pooling_max_int8_executable_s2 {
     hal.executable.variant public @rocket_pooling_max_v1 target(#rocket_pooling_max_int8_target_s2) {
+      hal.executable.export public @rocket_pooling_max ordinal(0) layout(#pooling_pipeline_layout) count(%device: !hal.device, %workload: index) -> (index, index, index) {
+        %c1 = arith.constant 1 : index
+        hal.return %c1, %c1, %c1 : index, index, index
+      }
+      builtin.module {
+        func.func @rocket_pooling_max() {
+          return
+        }
+      }
+    }
+  }
+
+  hal.executable private @rocket_pooling_max_int8_pad1_executable_s2 {
+    hal.executable.variant public @rocket_pooling_max_v1 target(#rocket_pooling_max_int8_pad1_target_s2) {
       hal.executable.export public @rocket_pooling_max ordinal(0) layout(#pooling_pipeline_layout) count(%device: !hal.device, %workload: index) -> (index, index, index) {
         %c1 = arith.constant 1 : index
         hal.return %c1, %c1, %c1 : index, index, index
@@ -2337,6 +2370,56 @@ module attributes {transform.with_named_sequence} {
     %layout_i32 = arith.constant 0 : i32
     %pooled = flow.dispatch
         @rocket_pooling_max_int8_executable_s2::@rocket_pooling_max_v1::@rocket_pooling_max(
+          %input_width_i32, %input_height_i32, %channels_i32,
+          %kernel_width_i32, %kernel_height_i32, %layout_i32,
+          %input)
+        {stream.affinity = #hal.device.affinity<@rocket_device>}
+        : (i32, i32, i32, i32, i32, i32,
+           tensor<1x?x?x?xi8>{%input_height, %input_width, %channels})
+        -> tensor<1x?x?x?xi8>{%output_height, %output_width, %channels}
+    %final_empty = tensor.empty(%output_height, %output_width, %channels)
+        : tensor<1x?x?x?xi8>
+    %final = linalg.generic {
+        indexing_maps = [
+          affine_map<(d0, d1, d2, d3) -> (d0, d1, d2, d3)>,
+          affine_map<(d0, d1, d2, d3) -> (d0, d1, d2, d3)>,
+          affine_map<(d0, d1, d2, d3) -> (d0, d1, d2, d3)>
+        ],
+        iterator_types = ["parallel", "parallel", "parallel", "parallel"]
+      } ins(%pooled, %init : tensor<1x?x?x?xi8>, tensor<1x?x?x?xi8>)
+        outs(%final_empty : tensor<1x?x?x?xi8>) {
+      ^bb0(%pooled_value: i8, %initial: i8, %out: i8):
+        %accumulated = arith.maxsi %pooled_value, %initial : i8
+        linalg.yield %accumulated : i8
+    } -> tensor<1x?x?x?xi8>
+    util.return %final : tensor<1x?x?x?xi8>
+  }
+
+  // The pad1 twin: %input is the *unpadded* tensor -- the PPU pads it -- so
+  // the output extents come from %init rather than from the input.
+  util.func private @call_rocket_pooling_max_nhwc_s2_i8_pad1(
+      %input: tensor<1x?x?x?xi8>,
+      %window: tensor<?x?xi8>,
+      %init: tensor<1x?x?x?xi8>) -> tensor<1x?x?x?xi8> {
+    %c0 = arith.constant 0 : index
+    %c1 = arith.constant 1 : index
+    %c2 = arith.constant 2 : index
+    %c3 = arith.constant 3 : index
+    %input_height = tensor.dim %input, %c1 : tensor<1x?x?x?xi8>
+    %input_width = tensor.dim %input, %c2 : tensor<1x?x?x?xi8>
+    %channels = tensor.dim %input, %c3 : tensor<1x?x?x?xi8>
+    %kernel_height = tensor.dim %window, %c0 : tensor<?x?xi8>
+    %kernel_width = tensor.dim %window, %c1 : tensor<?x?xi8>
+    %output_height = tensor.dim %init, %c1 : tensor<1x?x?x?xi8>
+    %output_width = tensor.dim %init, %c2 : tensor<1x?x?x?xi8>
+    %input_width_i32 = arith.index_cast %input_width : index to i32
+    %input_height_i32 = arith.index_cast %input_height : index to i32
+    %channels_i32 = arith.index_cast %channels : index to i32
+    %kernel_width_i32 = arith.index_cast %kernel_width : index to i32
+    %kernel_height_i32 = arith.index_cast %kernel_height : index to i32
+    %layout_i32 = arith.constant 0 : i32
+    %pooled = flow.dispatch
+        @rocket_pooling_max_int8_pad1_executable_s2::@rocket_pooling_max_v1::@rocket_pooling_max(
           %input_width_i32, %input_height_i32, %channels_i32,
           %kernel_width_i32, %kernel_height_i32, %layout_i32,
           %input)
@@ -6133,6 +6216,71 @@ module attributes {transform.with_named_sequence} {
     transform.annotate %module "stream.topology" = %topology_attr : !transform.any_op, !transform.any_param
     %executable = transform.util.import_symbol @rocket_pooling_max_int8_executable_s2 into %module if undefined : (!transform.any_op) -> !transform.any_op
     %func = transform.util.import_symbol @call_rocket_pooling_max_nhwc_s2_i8 into %module if undefined : (!transform.any_op) -> !transform.any_op
+    transform.util.cast_and_call %func(%ins) -> %out after %root {
+          transform.type_conversion.tensor.cast_shape_dynamic_dims
+      } : (!transform.any_op, !transform.any_value, !transform.any_value, !transform.any_op) -> !transform.any_op
+    transform.yield
+  }
+
+  // The int8 max pool with its -128 pad marked by `rocket-fold-conv-pad`:
+  // the pair, claimed together, so the PPU pads and the CPU `tensor.pad`
+  // disappears. Same bounds as @match_pooling_nhwc_max_s2_i8, on the padded
+  // extent; hardware-checked at ResNet's stem (112x112x64 + pad 1).
+  transform.named_sequence @match_pooling_nhwc_max_s2_i8_pad1(
+      %root: !transform.any_op {transform.readonly})
+      -> (!transform.any_value, !transform.any_value) {
+    transform.match.operation_name %root ["linalg.pooling_nhwc_max"] : !transform.any_op
+    %batch, %out_img, %out_ch, %filter, %in_ch, %depth, %strides, %dilations =
+        transform.iree.match.convolution %root,
+          lhs_type = i8, rhs_type = i8, output_type = i8
+          : !transform.any_op -> !transform.param<i64>
+    transform.iree.match.dims_equal %batch, [1, -1] : !transform.param<i64>
+    transform.iree.match.dims_equal %out_img, [-1, -1] : !transform.param<i64>
+    transform.iree.match.dims_equal %out_ch, [] : !transform.param<i64>
+    transform.iree.match.dims_equal %in_ch, [] : !transform.param<i64>
+    transform.iree.match.dims_equal %depth, [] : !transform.param<i64>
+    transform.iree.match.dims_equal %filter, [-1, -1] : !transform.param<i64>
+    transform.iree.match.dims_equal %strides, [2, 2] : !transform.param<i64>
+    transform.iree.match.dims_equal %dilations, [1, 1] : !transform.param<i64>
+
+    %input_value = transform.get_operand %root[0] : (!transform.any_op) -> !transform.any_value
+    %window_value = transform.get_operand %root[1] : (!transform.any_op) -> !transform.any_value
+    transform.iree.match.dim_bounds %input_value[1], umin = 1, umax = 114 : !transform.any_value
+    transform.iree.match.dim_bounds %input_value[2], umin = 1, umax = 114 : !transform.any_value
+    transform.iree.match.dim_bounds %input_value[3], umin = 1, umax = 64 : !transform.any_value
+    transform.iree.match.dim_bounds %window_value[0], umin = 2, umax = 3 : !transform.any_value
+    transform.iree.match.dim_bounds %window_value[1], umin = 2, umax = 3 : !transform.any_value
+
+    %ins, %outs = transform.iree.match.cast_compatible_dag_from_root %root {
+      ^bb0(%input: tensor<1x?x?x?xi8>, %window: tensor<?x?xi8>,
+           %init: tensor<1x?x?x?xi8>):
+        // Self-contained by construction: `rocket-fold-conv-pad` sinks the
+        // fill into the region. The inline constant pins it to -128.
+        %padded = tensor.pad %input low[0, 1, 1, 0] high[0, 1, 1, 0] {
+          ^bb1(%i0: index, %i1: index, %i2: index, %i3: index):
+            %fill = arith.constant -128 : i8
+            tensor.yield %fill : i8
+        } : tensor<1x?x?x?xi8> to tensor<1x?x?x?xi8>
+        %pooled = linalg.pooling_nhwc_max
+            {dilations = dense<1> : vector<2xi64>, rocket.pad_left = 1 : i64, rocket.pad_top = 1 : i64, strides = dense<2> : vector<2xi64>}
+            ins(%padded, %window : tensor<1x?x?x?xi8>, tensor<?x?xi8>)
+            outs(%init : tensor<1x?x?x?xi8>) -> tensor<1x?x?x?xi8>
+    } : (!transform.any_op) -> (!transform.any_value, !transform.any_value)
+    transform.yield %ins, %outs : !transform.any_value, !transform.any_value
+  }
+
+  transform.named_sequence @cast_and_call_pooling_max_nhwc_s2_i8_pad1(
+      %ins: !transform.any_value {transform.readonly},
+      %out: !transform.any_value {transform.readonly}) {
+    %root = transform.get_defining_op %out : (!transform.any_value) -> !transform.any_op
+    %module = transform.util.get_nearest_symbol_table %root : (!transform.any_op) -> !transform.any_op
+    %topology_attr = transform.param.constant #hal.device.topology<links = [
+        (@rocket_device -> @cpu_device = {transparent_access = true, unified_memory = true}),
+        (@cpu_device -> @rocket_device = {transparent_access = true, unified_memory = true})
+      ]> -> !transform.any_param
+    transform.annotate %module "stream.topology" = %topology_attr : !transform.any_op, !transform.any_param
+    %executable = transform.util.import_symbol @rocket_pooling_max_int8_pad1_executable_s2 into %module if undefined : (!transform.any_op) -> !transform.any_op
+    %func = transform.util.import_symbol @call_rocket_pooling_max_nhwc_s2_i8_pad1 into %module if undefined : (!transform.any_op) -> !transform.any_op
     transform.util.cast_and_call %func(%ins) -> %out after %root {
           transform.type_conversion.tensor.cast_shape_dynamic_dims
       } : (!transform.any_op, !transform.any_value, !transform.any_value, !transform.any_op) -> !transform.any_op
@@ -10771,6 +10919,7 @@ module attributes {transform.with_named_sequence} {
             @match_pooling_nhwc_sum_avg -> @cast_and_call_pooling_avg_nhwc,
             @match_pooling_nhwc_max -> @cast_and_call_pooling_max_nhwc,
             @match_pooling_nhwc_max_s2 -> @cast_and_call_pooling_max_nhwc_s2,
+            @match_pooling_nhwc_max_s2_i8_pad1 -> @cast_and_call_pooling_max_nhwc_s2_i8_pad1,
             @match_pooling_nhwc_max_s2_i8 -> @cast_and_call_pooling_max_nhwc_s2_i8,
             @match_pooling_nchw_max -> @cast_and_call_pooling_max_nchw,
             @match_pooling_nchw_max_s2 -> @cast_and_call_pooling_max_nchw_s2,

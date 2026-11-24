@@ -46,6 +46,7 @@ use std::{fs::OpenOptions, mem, os::unix::io::AsRawFd, ptr, sync::Mutex, time::I
 mod dispatch;
 
 use iree_rocket_hal::rocket::{
+    builders::RegCmd,
     device::{Buffer, JobDesc, close_bo, fini_bo, prep_bo, submit_jobs},
     pooling::{PoolingBuffers, PoolingMethod, PoolingPlan, PoolingPrecision, PoolingShape},
 };
@@ -225,37 +226,35 @@ fn expected(case: PoolCase, out_y: usize, out_x: usize, channel: usize) -> f32 {
     }
 }
 
-fn run_case(case: PoolCase) {
-    let _guard = NPU_TEST_LOCK
-        .lock()
-        .unwrap_or_else(|poisoned| poisoned.into_inner());
-    let shape = case.shape();
-    shape.validate();
+/// What one pooling dispatch left in its output cube.
+struct Dispatched {
+    raw: Vec<u8>,
+    elapsed: std::time::Duration,
+    tiles: usize,
+}
 
-    let channels_per_atom = case.precision.channels_per_atom() as usize;
-    let element_bytes = case.precision.element_bytes() as usize;
+/// Runs `shape` once on the device and returns the raw output cube.
+///
+/// `input` gives each logical element; `patch` sees every tile's register
+/// program before it is written to a command buffer, which is how the pad
+/// fill probe programs `PPU_PADDING_VALUE_2_CFG` -- a field the planner
+/// always zeroes.
+fn dispatch_pool(
+    shape: PoolingShape,
+    input: &dyn Fn(usize, usize, usize) -> f32,
+    patch: &dyn Fn(&mut Vec<RegCmd>),
+) -> Dispatched {
+    let precision = shape.precision;
+    let channels_per_atom = precision.channels_per_atom() as usize;
+    let element_bytes = precision.element_bytes() as usize;
     let surfaces = shape.programmed_channels() as usize / channels_per_atom;
-    let in_pixels = (case.width * case.height) as usize;
+    let in_pixels = (shape.input_width * shape.input_height) as usize;
     let out_pixels = (shape.output_width * shape.output_height) as usize;
     // Both cube strides are rounded up to four pixels by
     // `build_pooling_tile_task`; a buffer laid out any other way puts every
     // surface past the first at the wrong offset.
     let in_surface_pixels = in_pixels.next_multiple_of(4);
     let out_surface_pixels = out_pixels.next_multiple_of(4);
-
-    let label = format!(
-        "{} {}x{} C{} k{}x{} s{}x{} pad{:?} {:?}",
-        case.label,
-        case.width,
-        case.height,
-        case.channels,
-        case.kernel.1,
-        case.kernel.0,
-        case.stride.1,
-        case.stride.0,
-        case.pad,
-        case.precision,
-    );
 
     let file = OpenOptions::new()
         .read(true)
@@ -270,26 +269,27 @@ fn run_case(case: PoolCase) {
         // first places everything after it. Unset, nothing changes.
         let ballast = BALLAST_BYTES.with(std::cell::Cell::get);
         let ballast = (ballast > 0).then(|| Buffer::new(fd, ballast, &file));
-        let input = Buffer::new(
+        let input_buffer = Buffer::new(
             fd,
             page_aligned_size(surfaces * in_surface_pixels * FEATURE_ATOM_BYTES),
             &file,
         );
-        ptr::write_bytes(input.host_ptr, 0, input.size);
-        for channel in 0..case.channels as usize {
-            for y in 0..case.height as usize {
-                for x in 0..case.width as usize {
+        ptr::write_bytes(input_buffer.host_ptr, 0, input_buffer.size);
+        for channel in 0..shape.input_channels as usize {
+            for y in 0..shape.input_height as usize {
+                for x in 0..shape.input_width as usize {
                     let offset =
                         (channel / channels_per_atom) * in_surface_pixels * FEATURE_ATOM_BYTES
-                            + (y * case.width as usize + x) * FEATURE_ATOM_BYTES
+                            + (y * shape.input_width as usize + x) * FEATURE_ATOM_BYTES
                             + (channel % channels_per_atom) * element_bytes;
-                    let value = input_at(y, x, channel);
-                    match case.precision {
-                        PoolingPrecision::Fp16 => {
-                            ptr::write(input.host_ptr.add(offset) as *mut u16, f32_to_f16(value))
-                        }
+                    let value = input(y, x, channel);
+                    match precision {
+                        PoolingPrecision::Fp16 => ptr::write(
+                            input_buffer.host_ptr.add(offset) as *mut u16,
+                            f32_to_f16(value),
+                        ),
                         PoolingPrecision::Int8 => {
-                            ptr::write(input.host_ptr.add(offset), value as i8 as u8)
+                            ptr::write(input_buffer.host_ptr.add(offset), value as i8 as u8)
                         }
                     }
                 }
@@ -304,10 +304,13 @@ fn run_case(case: PoolCase) {
         ptr::write_bytes(output.host_ptr, OUTPUT_SENTINEL, output.size);
 
         let plan = PoolingPlan::new(shape);
-        let programs = plan.programs_with_buffers(&PoolingBuffers {
-            input_addr: input.dma_address,
+        let mut programs = plan.programs_with_buffers(&PoolingBuffers {
+            input_addr: input_buffer.dma_address,
             output_addr: output.dma_address,
         });
+        for program in &mut programs {
+            patch(program);
+        }
         let mut command_buffers = Vec::with_capacity(programs.len());
         for commands in &programs {
             let buffer = Buffer::new(
@@ -323,7 +326,7 @@ fn run_case(case: PoolCase) {
             command_buffers.push((buffer, commands.len() as u32));
         }
 
-        for handle in [input.handle, output.handle] {
+        for handle in [input_buffer.handle, output.handle] {
             fini_bo(fd, handle).unwrap();
         }
         for (buffer, _) in &command_buffers {
@@ -342,7 +345,7 @@ fn run_case(case: PoolCase) {
             .iter()
             .map(|(buffer, _)| buffer.handle)
             .collect();
-        in_handles.push(input.handle);
+        in_handles.push(input_buffer.handle);
         let out_handles = [output.handle];
         let jobs = [JobDesc {
             tasks: &tasks,
@@ -351,78 +354,112 @@ fn run_case(case: PoolCase) {
         }];
 
         let started = Instant::now();
-        submit_jobs(fd, &jobs).unwrap_or_else(|error| {
-            panic!("{label} ({} tile(s)): SUBMIT failed: {error}", tasks.len())
-        });
+        submit_jobs(fd, &jobs)
+            .unwrap_or_else(|error| panic!("SUBMIT failed ({} tile(s)): {error}", tasks.len()));
         prep_bo(fd, output.handle, COMPLETION_TIMEOUT_NS)
-            .unwrap_or_else(|error| panic!("{label}: did not complete: {error}"));
+            .unwrap_or_else(|error| panic!("did not complete: {error}"));
         let elapsed = started.elapsed();
 
-        let raw = std::slice::from_raw_parts(output.host_ptr, output.size);
-        let read = |out_y: usize, out_x: usize, channel: usize| -> f32 {
-            let offset = (channel / channels_per_atom) * out_surface_pixels * FEATURE_ATOM_BYTES
-                + (out_y * shape.output_width as usize + out_x) * FEATURE_ATOM_BYTES
-                + (channel % channels_per_atom) * element_bytes;
-            match case.precision {
-                PoolingPrecision::Fp16 => {
-                    f16_to_f32(u16::from_le_bytes([raw[offset], raw[offset + 1]]))
-                }
-                PoolingPrecision::Int8 => f32::from(raw[offset] as i8),
-            }
-        };
-
-        let tolerance = case.tolerance();
-        let mut mismatches = 0usize;
-        let mut first = None;
-        let mut worst = 0.0f32;
-        for out_y in 0..shape.output_height as usize {
-            for out_x in 0..shape.output_width as usize {
-                for channel in 0..case.channels as usize {
-                    let want = expected(case, out_y, out_x, channel);
-                    let got = read(out_y, out_x, channel);
-                    let difference = (got - want).abs();
-                    worst = worst.max(difference);
-                    if !got.is_finite() || difference > tolerance {
-                        mismatches += 1;
-                        first.get_or_insert((out_y, out_x, channel, want, got));
-                    }
-                }
-            }
-        }
+        let raw = std::slice::from_raw_parts(output.host_ptr, output.size).to_vec();
 
         for (buffer, _) in &command_buffers {
             close_bo(fd, buffer.handle).unwrap();
         }
-        close_bo(fd, input.handle).unwrap();
+        close_bo(fd, input_buffer.handle).unwrap();
         close_bo(fd, output.handle).unwrap();
         if let Some(ballast) = ballast {
             close_bo(fd, ballast.handle).unwrap();
         }
-
-        let total = out_pixels * case.channels as usize;
-        // The dispatch clock is what separates a shape result from a
-        // watchdog kill: `prep_bo` returns success over an error-signalled
-        // fence, so a killed job looks like a wrong answer unless the wall
-        // time is in the report. Healthy pools here run in single-digit
-        // milliseconds; a kill costs ~500 ms per tile.
-        assert!(
-            mismatches == 0,
-            "{label}: {mismatches} of {total} elements wrong (tolerance {tolerance}), \
-             max|diff| {worst}, first at {:?}, dispatch {:.1} ms{}",
-            first.unwrap(),
-            elapsed.as_secs_f64() * 1e3,
-            if elapsed.as_millis() >= 150 {
-                " -- OVER THE TIMEOUT FLOOR, suspect a watchdog kill rather than a shape result"
-            } else {
-                ""
-            },
-        );
-        println!(
-            "  {label}: ok, {} tile(s), max|diff| {worst}{}",
-            tasks.len(),
-            dispatch::note(elapsed),
-        );
+        Dispatched {
+            raw,
+            elapsed,
+            tiles: tasks.len(),
+        }
     }
+}
+
+/// Reads one logical output element of a cube `dispatch_pool` returned.
+fn read_output(shape: PoolingShape, raw: &[u8], out_y: usize, out_x: usize, channel: usize) -> f32 {
+    let channels_per_atom = shape.precision.channels_per_atom() as usize;
+    let element_bytes = shape.precision.element_bytes() as usize;
+    let out_surface_pixels = (shape.output_width * shape.output_height) as usize;
+    let out_surface_pixels = out_surface_pixels.next_multiple_of(4);
+    let offset = (channel / channels_per_atom) * out_surface_pixels * FEATURE_ATOM_BYTES
+        + (out_y * shape.output_width as usize + out_x) * FEATURE_ATOM_BYTES
+        + (channel % channels_per_atom) * element_bytes;
+    match shape.precision {
+        PoolingPrecision::Fp16 => f16_to_f32(u16::from_le_bytes([raw[offset], raw[offset + 1]])),
+        PoolingPrecision::Int8 => f32::from(raw[offset] as i8),
+    }
+}
+
+fn run_case(case: PoolCase) {
+    let _guard = NPU_TEST_LOCK
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    let shape = case.shape();
+    shape.validate();
+
+    let label = format!(
+        "{} {}x{} C{} k{}x{} s{}x{} pad{:?} {:?}",
+        case.label,
+        case.width,
+        case.height,
+        case.channels,
+        case.kernel.1,
+        case.kernel.0,
+        case.stride.1,
+        case.stride.0,
+        case.pad,
+        case.precision,
+    );
+    let Dispatched {
+        raw,
+        elapsed,
+        tiles,
+    } = dispatch_pool(shape, &input_at, &|_| {});
+
+    let tolerance = case.tolerance();
+    let mut mismatches = 0usize;
+    let mut first = None;
+    let mut worst = 0.0f32;
+    for out_y in 0..shape.output_height as usize {
+        for out_x in 0..shape.output_width as usize {
+            for channel in 0..case.channels as usize {
+                let want = expected(case, out_y, out_x, channel);
+                let got = read_output(shape, &raw, out_y, out_x, channel);
+                let difference = (got - want).abs();
+                worst = worst.max(difference);
+                if !got.is_finite() || difference > tolerance {
+                    mismatches += 1;
+                    first.get_or_insert((out_y, out_x, channel, want, got));
+                }
+            }
+        }
+    }
+
+    let total = (shape.output_width * shape.output_height * case.channels) as usize;
+    // The dispatch clock is what separates a shape result from a
+    // watchdog kill: `prep_bo` returns success over an error-signalled
+    // fence, so a killed job looks like a wrong answer unless the wall
+    // time is in the report. Healthy pools here run in single-digit
+    // milliseconds; a kill costs ~500 ms per tile.
+    assert!(
+        mismatches == 0,
+        "{label}: {mismatches} of {total} elements wrong (tolerance {tolerance}), \
+         max|diff| {worst}, first at {:?}, dispatch {:.1} ms{}",
+        first.unwrap(),
+        elapsed.as_secs_f64() * 1e3,
+        if elapsed.as_millis() >= 150 {
+            " -- OVER THE TIMEOUT FLOOR, suspect a watchdog kill rather than a shape result"
+        } else {
+            ""
+        },
+    );
+    println!(
+        "  {label}: ok, {tiles} tile(s), max|diff| {worst}{}",
+        dispatch::note(elapsed),
+    );
 }
 
 /// Runs every case before reporting, so one bad shape does not hide the
@@ -629,6 +666,31 @@ fn padded_max_pooling_matches_oracle() {
             pad: [1, 1, 1, 1],
             method: PoolingMethod::Max,
             precision: PoolingPrecision::Fp16,
+        },
+        // ResNet's stem pool at int8, with its padding on the PPU: the shape
+        // `@match_pooling_nhwc_max_s2_i8_pad1` claims. The int8 fill is inert
+        // (`int8_max_pad_fill_probe`), so this is the clamp-to-image answer.
+        PoolCase {
+            label: "max 3x3s2 pad1 resnet stem",
+            width: 112,
+            height: 112,
+            channels: 64,
+            kernel: (3, 3),
+            stride: (2, 2),
+            pad: [1, 1, 1, 1],
+            method: PoolingMethod::Max,
+            precision: PoolingPrecision::Int8,
+        },
+        PoolCase {
+            label: "max 3x3s1 pad-lead",
+            width: 16,
+            height: 16,
+            channels: 16,
+            kernel: (3, 3),
+            stride: (1, 1),
+            pad: [2, 1, 0, 0],
+            method: PoolingMethod::Max,
+            precision: PoolingPrecision::Int8,
         },
         // Leading padding only, so the two axes' pad fields cannot be
         // confused with each other.
@@ -877,4 +939,157 @@ fn pool_iova_probe() {
         }]);
     }
     BALLAST_BYTES.with(|b| b.set(0));
+}
+
+/// What the PPU fills a padded **int8** max window with, per encoding of the
+/// 35-bit `PPU_PADDING_VALUE` (`_1_CFG` holds bits [31:0], `_2_CFG` bits
+/// [34:32], which the planner always zeroes and this patches).
+///
+/// A characterization, not a gate: it asserts nothing about the fill and
+/// prints what each candidate does. 6x6 C16, 3x3 stride 1, padding 2 on
+/// every side, so each corner window holds exactly one image pixel. With the
+/// default constant -128 input, anything a border window returns above -128
+/// is the fill as the PPU read it; `ROCKET_FILL_INPUT=varied` runs
+/// `input_at` instead, whose all-negative border windows a fill of 0 or +127
+/// would win and which cannot hide a misplaced window.
+///
+/// Measured 2026-11-24: every candidate gives the clamp-to-image answer in
+/// all 768 border windows under both inputs -- the int8 max ignores the
+/// fill (`PoolingMethod::pad_fill_value`). Padding 3 (a whole window in the
+/// padding) hung 13 of 13 dispatches instead, which is why
+/// `PoolingShape::validate` now refuses pad >= kernel.
+///
+///     ./pooling_oracle_hw-<hash> int8_max_pad_fill_probe --ignored --nocapture
+#[test]
+#[ignore = "needs /dev/accel/accel0 -- characterization, prints rather than asserts"]
+fn int8_max_pad_fill_probe() {
+    const SIDE: u32 = 6;
+    const PAD: u32 = 2;
+    const KERNEL: u32 = 3;
+    const CHANNELS: u32 = 16;
+    let out_side = output_extent(SIDE, KERNEL, 1, PAD, PAD);
+    // `ROCKET_FILL_INPUT=varied` swaps the constant for `input_at`, whose
+    // [-8, 8] pattern has border windows that are all negative -- where a
+    // fill of 0 or +127 would win -- and cannot hide a misplaced window.
+    let varied = std::env::var("ROCKET_FILL_INPUT").is_ok_and(|value| value == "varied");
+    // Otherwise the smallest code everywhere: whatever a border window
+    // returns above -128 is the fill as the PPU read it.
+    let input = move |y: usize, x: usize, channel: usize| -> f32 {
+        if varied {
+            input_at(y, x, channel)
+        } else {
+            -128.0
+        }
+    };
+    // (PADDING_VALUE_1, PADDING_VALUE_2, what the encoding would mean)
+    let candidates: &[(u32, u32, &str)] = &[
+        (0x0000_0000, 0, "0"),
+        (0x0000_0005, 0, "+5"),
+        (0x0000_007F, 0, "+127 / 0x7F"),
+        (0x0000_0080, 0, "0x80: -128 as 8 bits, +128 wider"),
+        (0x0000_00FB, 0, "0xFB: -5 as 8 bits"),
+        (0x0000_FFFB, 0, "0xFFFB: -5 as 16 bits"),
+        (0xFFFF_FFFB, 0, "0xFFFFFFFB: -5 as 32 bits"),
+        (0xFFFF_FFFB, 7, "-5 as 35 bits"),
+        (0xFFFF_FF80, 7, "-128 as 35 bits"),
+        (0x0000_FC00, 0, "0xFC00: fp16 -inf"),
+        (0x0000_8000, 0, "0x8000: -32768 as 16 bits"),
+        (0x8000_0000, 0, "0x80000000"),
+        (0x0000_0000, 4, "-2^34: 35-bit minimum"),
+    ];
+    for &(low, high, meaning) in candidates {
+        std::thread::sleep(SETTLE);
+        let _guard = NPU_TEST_LOCK
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let shape = PoolingShape {
+            input_width: SIDE,
+            input_height: SIDE,
+            input_channels: CHANNELS,
+            output_width: out_side,
+            output_height: out_side,
+            output_channels: CHANNELS,
+            precision: PoolingPrecision::Int8,
+            kernel_width: KERNEL,
+            kernel_height: KERNEL,
+            stride_x: 1,
+            stride_y: 1,
+            method: PoolingMethod::Max,
+            pad_left: PAD,
+            pad_top: PAD,
+            pad_right: PAD,
+            pad_bottom: PAD,
+            pad_value: low,
+        };
+        shape.validate();
+        let patch = |program: &mut Vec<RegCmd>| {
+            let mut patched = 0;
+            for command in program.iter_mut() {
+                if command.0 & 0xFFFF == 0x6048 {
+                    let domain = (command.0 >> 48) as u32;
+                    *command = RegCmd::new(domain, 0x6048, high);
+                    patched += 1;
+                }
+            }
+            assert_eq!(patched, 1, "one PPU_PADDING_VALUE_2_CFG per tile");
+        };
+        let dispatched = dispatch_pool(shape, &input, &patch);
+
+        let mut all_pad = std::collections::BTreeMap::<i32, usize>::new();
+        let mut mixed = 0usize;
+        let mut mixed_clamp = 0usize;
+        let mut mixed_wrong = None;
+        let mut mixed_values = std::collections::BTreeMap::<i32, usize>::new();
+        for out_y in 0..out_side as usize {
+            for out_x in 0..out_side as usize {
+                for channel in 0..CHANNELS as usize {
+                    let got = read_output(shape, &dispatched.raw, out_y, out_x, channel) as i32;
+                    let mut best: Option<i32> = None;
+                    let mut padded_tap = false;
+                    for ky in 0..KERNEL as isize {
+                        for kx in 0..KERNEL as isize {
+                            let y = out_y as isize - PAD as isize + ky;
+                            let x = out_x as isize - PAD as isize + kx;
+                            if (0..SIDE as isize).contains(&y) && (0..SIDE as isize).contains(&x) {
+                                let value = input(y as usize, x as usize, channel) as i32;
+                                best = Some(best.map_or(value, |best| best.max(value)));
+                            } else {
+                                padded_tap = true;
+                            }
+                        }
+                    }
+                    match best {
+                        None => *all_pad.entry(got).or_default() += 1,
+                        Some(clamp) if padded_tap => {
+                            mixed += 1;
+                            *mixed_values.entry(got).or_default() += 1;
+                            if got == clamp {
+                                mixed_clamp += 1;
+                            } else {
+                                mixed_wrong.get_or_insert((out_y, out_x, channel, clamp, got));
+                            }
+                        }
+                        Some(_) => {}
+                    }
+                }
+            }
+        }
+        println!(
+            "  fill {low:#010x}/{high} ({meaning}): all-pad outputs {all_pad:?}; \
+             mixed windows {mixed_clamp}/{mixed} equal clamp-to-image, values {mixed_values:?}{}{}",
+            mixed_wrong
+                .map(|(y, x, c, want, got)| format!(
+                    ", first other at ({y},{x},c{c}) clamp {want} got {got}"
+                ))
+                .unwrap_or_default(),
+            if dispatch::is_device_timeout(dispatched.elapsed) {
+                format!(
+                    " -- DISPATCH {:.0} ms, watchdog kill",
+                    dispatched.elapsed.as_secs_f64() * 1e3
+                )
+            } else {
+                String::new()
+            },
+        );
+    }
 }
