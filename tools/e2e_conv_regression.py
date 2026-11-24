@@ -1043,6 +1043,26 @@ func.func @fp16_matmul_chain(%lhs: tensor<64x128xf32>, %w1: tensor<128x128xf32>,
   return %b : tensor<64x64xf32>
 }
 
+// Two "patchify" convolutions -- stride equal to the kernel -- which the
+// planner refuses as convolutions and rocket-patchify-conv-to-matmul turns
+// into a space-to-depth transpose and a matmul: a 16x16 stride-16 patch
+// embedding, and a 2x2 stride-2 downsample over an odd extent, whose last
+// row and column a floor-mode convolution never reads.
+func.func @fp16_patchify_conv(%image: tensor<1x64x64x3xf32>, %patch: tensor<16x16x3x128xf32>, %feature: tensor<1x33x33x32xf32>, %down: tensor<2x2x32x64xf32>) -> (tensor<1x4x4x128xf32>, tensor<1x16x16x64xf32>) {
+  %zero = arith.constant 0.000000e+00 : f32
+  %p_empty = tensor.empty() : tensor<1x4x4x128xf32>
+  %p_init = linalg.fill ins(%zero : f32) outs(%p_empty : tensor<1x4x4x128xf32>) -> tensor<1x4x4x128xf32>
+  %p = linalg.conv_2d_nhwc_hwcf {dilations = dense<1> : tensor<2xi64>, strides = dense<16> : tensor<2xi64>}
+      ins(%image, %patch : tensor<1x64x64x3xf32>, tensor<16x16x3x128xf32>)
+      outs(%p_init : tensor<1x4x4x128xf32>) -> tensor<1x4x4x128xf32>
+  %d_empty = tensor.empty() : tensor<1x16x16x64xf32>
+  %d_init = linalg.fill ins(%zero : f32) outs(%d_empty : tensor<1x16x16x64xf32>) -> tensor<1x16x16x64xf32>
+  %d = linalg.conv_2d_nhwc_hwcf {dilations = dense<1> : tensor<2xi64>, strides = dense<2> : tensor<2xi64>}
+      ins(%feature, %down : tensor<1x33x33x32xf32>, tensor<2x2x32x64xf32>)
+      outs(%d_init : tensor<1x16x16x64xf32>) -> tensor<1x16x16x64xf32>
+  return %p, %d : tensor<1x4x4x128xf32>, tensor<1x16x16x64xf32>
+}
+
 func.func @requant_int8_chain(%input: tensor<1x8x8x64xi8>, %f1: tensor<1x1x64x64xi8>, %b1: tensor<64xi32>, %f2: tensor<1x1x64x64xi8>, %b2: tensor<64xi32>) -> tensor<1x8x8x64xi8> {
   %a_zero = arith.constant 0 : i32
   %a_scale = arith.constant 2.000000e-02 : f32
@@ -1776,6 +1796,11 @@ def write_compiled_fixture(work_dir: Path) -> None:
     np.save(work_dir / "fp16_matmul_chain_lhs.npy", rng.uniform(-1.0, 1.0, size=(64, 128)).astype(np.float32))
     np.save(work_dir / "fp16_matmul_chain_w1.npy", rng.uniform(-0.25, 0.25, size=(128, 128)).astype(np.float32))
     np.save(work_dir / "fp16_matmul_chain_w2.npy", rng.uniform(-0.25, 0.25, size=(128, 64)).astype(np.float32))
+    patchify_rng = np.random.default_rng(20261126)
+    np.save(work_dir / "fp16_patchify_conv_image.npy", patchify_rng.uniform(-1.0, 1.0, size=(1, 64, 64, 3)).astype(np.float32))
+    np.save(work_dir / "fp16_patchify_conv_patch.npy", patchify_rng.uniform(-0.1, 0.1, size=(16, 16, 3, 128)).astype(np.float32))
+    np.save(work_dir / "fp16_patchify_conv_feature.npy", patchify_rng.uniform(-1.0, 1.0, size=(1, 33, 33, 32)).astype(np.float32))
+    np.save(work_dir / "fp16_patchify_conv_down.npy", patchify_rng.uniform(-0.25, 0.25, size=(2, 2, 32, 64)).astype(np.float32))
 
     # PACKED_WEIGHT_CASES: their filters are constants in the MLIR
     # (`packed_weight_fixtures`), so only the activations are inputs. Their
@@ -1930,6 +1955,7 @@ def compile_modules(
         ("fp16_residual_relu", "rocket_dynamic_residual_relu_executable"),
         ("fp16_conv_pool_conv_chain", "rocket_pooling_max_executable_s2"),
         ("fp16_matmul_chain", "rocket_matmul_executable"),
+        ("fp16_patchify_conv", "rocket_matmul_executable"),
         *PACKED_WEIGHT_CASES,
         ("requant_int8_chain", "rocket_dynamic_int8_requant_executable"),
         ("requant_int8_chain_cpu_between", "rocket_dynamic_int8_requant_executable"),
@@ -2552,6 +2578,18 @@ def run_compiled_gate(
                 "fp16_matmul_chain_w2.npy",
             ),
             ("fp16_matmul_chain_out_rocket.npy",),
+            0.05,
+            0.02,
+        ),
+        Case(
+            "fp16_patchify_conv",
+            (
+                "fp16_patchify_conv_image.npy",
+                "fp16_patchify_conv_patch.npy",
+                "fp16_patchify_conv_feature.npy",
+                "fp16_patchify_conv_down.npy",
+            ),
+            ("fp16_patchify_conv_patch_out.npy", "fp16_patchify_conv_down_out.npy"),
             0.05,
             0.02,
         ),
