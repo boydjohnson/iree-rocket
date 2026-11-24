@@ -103,6 +103,21 @@ impl Shape {
             && row_bytes / ATOM_BYTES - 1 <= MAX_NOTCH
     }
 
+    /// Whether a [`Plan::try_new_row_major_output`] plan may also *read* a
+    /// row-major `[M, K]` input in place (the HAL's `place_row_major_input`)
+    /// instead of an NC1HWC2 cube.
+    ///
+    /// The CNA reads `CNA_DATA_SIZE1.datain_channel` channels per pixel --
+    /// `K` rounded up to a whole atom -- so `K` must already be whole atoms
+    /// or a row's read would run into the next row. Measured exact at K 32
+    /// through 3072 (`matmul_dense_input_timing_probe`).
+    pub fn supports_row_major_input(self) -> bool {
+        self.supports_row_major_output()
+            && self
+                .try_as_row_major_output_conv_shape()
+                .is_ok_and(|conv| conv.padded_channels() == self.k)
+    }
+
     /// The transposed lowering the row-major output needs: width 1, height
     /// `M`, so every output line is one pixel and the DPU's line pitch
     /// (`width + notch` atoms) can be set to one output row.
@@ -265,6 +280,13 @@ mod tests {
             577
         );
         assert!(Plan::try_new_row_major_output(fp16(16, 12)).is_none());
+        // K 768 is whole atoms; K 36 is not.
+        assert!(fp16(577, 768).supports_row_major_input());
+        assert!(
+            !Shape::try_new(16, 36, 64, Precision::Fp16)
+                .unwrap()
+                .supports_row_major_input()
+        );
         assert!(!Plan::try_new(fp16(577, 768)).unwrap().row_major_output());
     }
 

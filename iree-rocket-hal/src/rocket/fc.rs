@@ -33,6 +33,7 @@
 use crate::rocket::{
     builders::{
         Bits, RegCmd, Register, RegisterMeta,
+        cna::{CnaConvCon1, CnaDmaCon1, CnaDmaCon2, CnaFeatureDataAddr},
         dpu::{DpuDataCubeNotchAddr, DpuDstBaseAddr, DpuDstSurfStride, DpuSurfaceAdd},
     },
     conv::{Buffers, ConvPlan, PlanError},
@@ -145,6 +146,67 @@ impl Plan {
         );
     }
 
+    /// Points tile `tile`'s already-relocated program at its rows of a
+    /// row-major `[M, K]` input starting at `input`, so the driver copies the
+    /// input instead of packing it into an NC1HWC2 cube.
+    ///
+    /// The width-1 lowering reads one pixel per line, so a line is one input
+    /// row of `K * 2 / 16` atoms and a channel group is one atom. Measured on
+    /// RK3588 2026-11-24 (`matmul_dense_input_probe`): grouped line fetch
+    /// off, `line_stride` one row, `surf_stride` 0 -- the planner's
+    /// horizontal-tile rule `surface_pitch - input_width` with a one-atom
+    /// surface and a one-pixel line -- is bit-identical to the packed input
+    /// from K 32 to 3072 and costs 1-8% NPU time. Grouped fetch with
+    /// `line = 4 * Kc`, `surf = 1 - 4 * Kc` (the packed rule transcribed) and
+    /// two other encodings hang the NPU.
+    ///
+    /// Panics on a plan that is not [`Plan::row_major_output`] or a shape
+    /// without [`Shape::supports_row_major_input`].
+    pub fn place_row_major_input(&self, program: &mut [RegCmd], tile: usize, input: u32) {
+        assert!(
+            self.row_major_output && self.shape.supports_row_major_input(),
+            "place_row_major_input needs a row-major plan whose K is whole atoms"
+        );
+        let row_bytes = self.shape.k * self.shape.precision.element_bytes();
+        let first_row = self.conv.tiles()[tile].rows.in_first;
+        let base = input + first_row * row_bytes;
+        assert_eq!(
+            base % FEATURE_ATOM_BYTES,
+            0,
+            "row-major input must be 16-byte aligned"
+        );
+        replace_one::<CnaFeatureDataAddr>(
+            program,
+            Register::<CnaFeatureDataAddr>::new()
+                .feature_base_addr(Bits::new(base))
+                .build(),
+        );
+        replace_one::<CnaDmaCon1>(
+            program,
+            Register::<CnaDmaCon1>::new()
+                .line_stride(Bits::new(row_bytes / FEATURE_ATOM_BYTES))
+                .build(),
+        );
+        replace_one::<CnaDmaCon2>(
+            program,
+            Register::<CnaDmaCon2>::new()
+                .surf_stride(Bits::new(0))
+                .build(),
+        );
+        // The program writes CNA_CONV_CON1 more than once; every write
+        // carries the flag, as in the probe that measured it.
+        let mut written = 0;
+        for slot in program.iter_mut().filter(|command| {
+            (command.0 >> 48) as u32 == CnaConvCon1::DOMAIN
+                && command.0 as u32 & 0xffff == CnaConvCon1::OFFSET
+        }) {
+            let value = (slot.0 >> 16) as u32 | GROUP_LINE_OFF;
+            *slot = RegCmd::new(CnaConvCon1::DOMAIN, CnaConvCon1::OFFSET, value);
+            written += 1;
+        }
+        assert!(written > 0, "CNA_CONV_CON1 is present");
+    }
+
     pub fn shape(&self) -> Shape {
         self.shape
     }
@@ -167,6 +229,9 @@ impl Plan {
 }
 
 const FEATURE_ATOM_BYTES: u32 = 16;
+
+/// `CNA_CONV_CON1.group_line_off`.
+const GROUP_LINE_OFF: u32 = 0x2000_0000;
 
 fn replace_one<R: RegisterMeta>(program: &mut [RegCmd], value: RegCmd) {
     let mut matches = program.iter_mut().filter(|command| {
@@ -237,6 +302,16 @@ mod tests {
             assert!(changed <= 4, "only the four writer registers move");
         }
         assert_eq!(rows_seen, 577);
+        let mut program: Vec<RegCmd> = programs[1].iter().map(|c| RegCmd(c.0)).collect();
+        plan.place_row_major_input(&mut program, 1, buffers.input);
+        let first_row = plan.conv_plan().tiles()[1].rows.in_first;
+        assert_eq!(
+            value_of::<CnaFeatureDataAddr>(&program),
+            0x10_0000 + first_row * 768 * 2
+        );
+        assert_eq!(value_of::<CnaDmaCon1>(&program), 96);
+        assert_eq!(value_of::<CnaDmaCon2>(&program), 0);
+        assert_ne!(value_of::<CnaConvCon1>(&program) & GROUP_LINE_OFF, 0);
         assert!(Plan::try_new_row_major_output(Shape::new(16, 768, 12, Precision::Fp16)).is_none());
     }
 

@@ -313,6 +313,14 @@ fn layout_debug() -> bool {
 
 /// `ROCKET_MATMUL_OUTPUT=cube` keeps every matmul on the NC1HWC2 output and
 /// its compaction, for A/B against the row-major writer on one binary.
+/// `ROCKET_MATMUL_INPUT=packed` keeps a row-major matmul on the NC1HWC2
+/// input packing, for A/B against reading the row-major input in place.
+fn matmul_packed_input_forced() -> bool {
+    static FORCED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *FORCED
+        .get_or_init(|| std::env::var("ROCKET_MATMUL_INPUT").is_ok_and(|value| value == "packed"))
+}
+
 fn matmul_cube_output_forced() -> bool {
     static FORCED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *FORCED.get_or_init(|| std::env::var("ROCKET_MATMUL_OUTPUT").is_ok_and(|value| value == "cube"))
@@ -3230,6 +3238,29 @@ unsafe extern "C" fn dispatch_impl(
             if chained_input.is_none() {
                 unsafe { note_dense_read(cb, &refs[0]) };
             }
+            // A row-major plan whose K is whole atoms reads the row-major
+            // input in place (`fc::Plan::place_row_major_input`): the
+            // "packing" is then one contiguous copy into scratch rather than
+            // an NC1HWC2 scatter. A chained input stays the producer's cube.
+            let row_major_input = chained_input.is_none()
+                && !matmul_packed_input_forced()
+                && row_major_plan
+                    .as_ref()
+                    .is_some_and(|plan| plan.shape().supports_row_major_input());
+            let (input_scratch_bytes, input_layout, packed_input_bytes_per_pixel) =
+                if row_major_input {
+                    (
+                        m * k * element_size,
+                        InputPackingLayout::Dense,
+                        k * element_size,
+                    )
+                } else {
+                    (
+                        input_scratch_bytes,
+                        input_layout,
+                        packed_input_bytes_per_pixel,
+                    )
+                };
             let input_scratch = if chained_input.is_some() {
                 None
             } else {
@@ -3523,6 +3554,9 @@ unsafe extern "C" fn dispatch_impl(
                         if plan.row_major_output() {
                             plan.place_row_major_output(&mut program, tile, buffers.output);
                         }
+                        if row_major_input {
+                            plan.place_row_major_input(&mut program, tile, buffers.input);
+                        }
                         program
                     })
                     .collect();
@@ -3610,7 +3644,11 @@ unsafe extern "C" fn dispatch_impl(
                     m,
                     k,
                     n,
-                    if row_major_plan.is_some() { " rm" } else { "" },
+                    match (row_major_plan.is_some(), row_major_input) {
+                        (true, true) => " rm in+out",
+                        (true, false) => " rm out",
+                        _ => "",
+                    },
                 )
             });
             let mut scratch_buffers = vec![output_scratch];
