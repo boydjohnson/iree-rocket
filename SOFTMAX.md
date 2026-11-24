@@ -152,7 +152,7 @@ and its output has the same shape as its input.
 | subtract the max | BN ALU operand from NRDMA, per channel | **exists**, as of probe S1: flat IEEE `f32` at `channel * 4`, broadcast over the cube, `bn_plane_probe_hw.rs` |
 | `exp` | DPU LUT, `LutTable::exp()` | **exists**, `lut_exp_hw.rs` against an oracle; domain needs §3's `input_scale` choice |
 | square (range extension) | `EwBinaryOp::Mul` with both operands the same buffer | **exists**, `ew_binary_hw.rs`, `ew_square_hw.rs` |
-| row sum | all-ones column on the second matmul (§1.1); or depthwise all-ones `1 x k` conv | **two ways, not three** -- the PPU avg route is gone at fp16, see §2.1. Neither of the two is gated yet |
+| row sum | depthwise all-ones **3x3 at stride 3** on a height-1 cube; or the all-ones column on the second matmul (§1.1) | **exists**, and exact at atol 0 over `N` 9..512 as a tree in one job, probe S2 (`reduce_width_hw.rs`). The window is 3x3 and not `1 x k` for the reason in §2.2. The avg-pool route is gone at fp16, §2.1 |
 | reciprocal | `LutTable::reciprocal()` + one Newton step | **exists**, `lut_reciprocal_hw.rs`; domain needs §4 |
 | divide by the sum | BN MUL operand from NRDMA, per channel | **exists**, as of probe S1: flat IEEE `fp16` at `channel * 2`, shift 0, same file |
 
@@ -198,9 +198,7 @@ caller doing anything:
 
 This section used to rank the DPU above an fp16 PPU average on accuracy.
 After S2 the ranking is moot: there is no fp16 PPU average to rank against
-(§2.1). Both remaining routes run on the DPU, and both are already
-validated paths in this repo, though neither is gated *as a reduction*
-yet:
+(§2.1). Both remaining routes run on the DPU:
 
 * the all-ones column of §1.1 (fused attention): the DPU accumulates, which
   is fp32 for fp16 inputs (LIMITS.md's precision table);
@@ -212,9 +210,31 @@ yet:
 
 So: the PPU max pool for the max, where S2 shows it is exact and where
 there is no alternative anyway, and the DPU for the sum, where at fp16
-there is now no alternative either. Gating one of the two sum routes is the
-first thing S2's successor should do -- the max half is done and the sum
-half is untested.
+there is now no alternative either.
+
+**The window is 3x3 at stride 3, not `1 x k`,** and that is the planner's
+choice rather than a preference. Asked directly, it refuses a `1 x k`
+window at any stride but 1 ("non-square kernels currently have capture
+backing only at stride 1"), and at stride 1 such a window is a sliding box
+filter rather than a reduction. It refuses an *even* square window at any
+stride but 1 as well, which rules out the 2x2/s2 halving tree and 4x4 and
+8x8 with it. What is left is the one strided square kernel the corpus
+backs, 3x3 at stride 3, laid on a height-1 cube: its vertical taps are
+padding, a convolution's padding is zero, so the window sums three real
+columns. `only_an_odd_square_window_can_stride` pins both refusals, so a
+later widening of the admission rules shows up as a choice rather than as
+a surprise -- an 8x8 window would reduce a row in two stages where this
+takes six.
+
+The horizontal geometry needs care the max tree did not. A convolution has
+leading padding registers and no trailing ones -- the output extent implies
+the right edge -- and that extent is floor-mode, so a row whose length is
+not a multiple of 3 silently drops its tail unless the *leading* pad makes
+up the difference. With `p = (3 - N % 3) % 3` the windows tile `[-p, N - 1]`
+exactly: disjoint, every real column covered once, and `p <= 2` stays under
+the kernel. One all-ones coefficient buffer serves every stage of the tree,
+since the channel count and kernel do not change
+(`one_all_ones_coefficient_buffer_serves_every_sum_stage`).
 
 ---
 
@@ -638,8 +658,22 @@ programs 65536 plainly, so it is a precision restriction, not a geometry
 one. Both halves are pinned by unit tests that need no board
 (`an_fp16_average_cannot_reduce_width_only`,
 `an_int8_average_can_reduce_width_only`). The sum now has exactly two
-routes, both on the DPU, and **neither is gated yet** -- that is the gap
-S2 leaves open and the first thing to close.
+routes, both on the DPU.
+
+**The sum route is gated too**, in the same file: a depthwise all-ones
+window reduces a row **exactly, at atol 0**, at `N` of 9, 27, 64, 197, 384
+and 512, as a tree in one job. Every input is a multiple of 0.25 in
+`[0, 1]` -- the range `exp(x - m)` actually produces -- so every partial
+sum is a multiple of 0.25 and exact in fp16 well past the total, which is
+what lets this be gated exactly rather than to a tolerance that could hide
+a dropped or double-counted column. It also checks the fp16 vertical pad
+fill as a side effect: a nonzero one would add three taps to every window.
+The window had to be 3x3 at stride 3 and the geometry needs a per-stage
+leading pad; §2.2 has both and why.
+
+Whole-row cost at `N = 384`, both halves: the max is 3 stages and 6 tasks,
+the sum is 6 stages and 6 tasks. The sum's extra depth is the price of a
+3-wide window where the PPU could take 8.
 
 **S2a -- the plane bridge.** The reduced vector comes out four-pixel
 strided, not dense, so it is a gather away from an ALU plane operand rather
@@ -689,12 +723,6 @@ precisely the form this hardware cannot run.
   sub-stage per task and does not need it; a fused op that wanted
   `relu(a * x + b)` in one pass would, and should start from
   `bn_plane_add_then_mul_fit`'s dump rather than a fresh sweep.
-* **The sum has no gated route.** S2 removed the fp16 PPU average and left
-  two DPU routes, neither of which has been run as a reduction: the
-  all-ones column on the PV matmul (§1.1) and a depthwise all-ones `1 x k`
-  conv (§2.2). The max half of the reduction is exact and done; if both sum
-  routes turned out to need something the planner refuses, §7 would have no
-  denominator.
 * **The Q15 `exp` floor is not where §3 computes it.** The `out_cvt` scalar
   scale may interact with the entry encoding in a way the existing tests do
   not pin down. S3 settles it.
