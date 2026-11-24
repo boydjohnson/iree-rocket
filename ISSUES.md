@@ -689,6 +689,12 @@ correct, and worth not touching.
 
 ## P7 (S2) — MobileNetV2 fp16's 17 depthwise convolutions stay on the CPU; at 600 MHz offloading them is 1.08x *faster* at the default allocation and 1.02x slower at four workers — but the whole fp16 offload loses to a four-worker CPU baseline, so the demote stays off (re-measured 2026-09-09)
 
+**Superseded 2026-11-24: the depthwise demote is on by default, and
+MobileNetV2 fp16 ties `--no-offload` (30.8 ms each, base 35.3).** Everything
+below predates removing the quiescence dwell, which was the whole deficit;
+see the Resolved entry. What is left of P7 is host work around the 17 CPU pad
+copies (`pack.input`, `compact`), i.e. conv padding, not the demote.
+
 They are the whole of the `outside` term (70.9 ms of a 127 ms model; see
 the profile below): ten executables over 17 dispatch
 sites, `112x112x48` down to `7x7x1344`, all `linalg.depthwise_conv_2d_nhwc_hwc`
@@ -1911,6 +1917,27 @@ instead on the way out, 31 ms of `compact` per inference against 7.5.
 What was settled and how, newest first, in place of the narratives — those are
 in this file's git history (`git log -p ISSUES.md`). Everything cited below is
 something that still exists: a commit, a file, or a memory.
+
+**Depthwise demotion on by default — 2026-11-24. MobileNetV2 fp16 35.3 ->
+30.8 ms, tying `--no-offload`.** P7 kept `ROCKET_DEMOTE_DEPTHWISE` off
+because the 54-site arm lost; the 2026-09-10 profile pinned that loss on the
+quiescence dwell, which the entry below retired. Re-measured on the survey's
+`mobilenet_v2` fp16 export, one compiler, cpu 4-7, 600 MHz, medians of five,
+three interleaved passes, 0 NPU timeouts:
+
+    nooff 30.8   base(37) 35.3   dw(54) 30.8   dw + ROCKET_QUIESCE_DEPTHWISE=1 49.2 ms
+
+f32-oracle max|err| 0.0639 / 0.0659 / 0.0639 (dw / base / nooff), top-5
+identical across all three; dw vs base max|diff| 0.0029. So
+`RocketDemoteConvInputsPass` demotes every depthwise by default and
+`ROCKET_DEMOTE_DEPTHWISE=0` builds the old arm (7x7 stride-1 still demoted).
+Verified by site count: 54 by default, 37 with `=0`, and the default `.vmfb`
+is byte-identical to the measured dw arm. Per inference, dw still spends
+`outside` 9.8 ms, `compact` 7.1 and `pack.input` 5.7 against `wait.npu` 7.8:
+the 17 CPU pad copies in front of each depthwise break the NPU chain on both
+sides, so folding that pad (conv padding) is the next lever on this model.
+Gates: lit `rocket_demote_large_depthwise.mlir` (both gate settings, 51/51),
+compiled e2e (pass).
 
 **The depthwise -> dense quiescence dwell is off by default — 2026-11-24.
 ConvNeXt-T fp16 103 -> 93.5 ms.** `DEPTHWISE_TO_DENSE_QUIESCENCE` slept
