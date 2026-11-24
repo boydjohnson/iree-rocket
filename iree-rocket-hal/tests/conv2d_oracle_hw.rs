@@ -3262,6 +3262,48 @@ fn int8_requant_cin2048_cases() -> Vec<Conv2dCase> {
     cases
 }
 
+/// MobileNetV2's 3x3 stride-2 image stem with the CNA doing its pad 1:
+/// 224x224 `Cin` 3 -> 32 at padding 1, the dense (ARGB) feature path, which
+/// is the one C17's over-fetch lives on. Every padded case measured before
+/// on this path was a single 28x28 tile at stride 1; this is the multi-tile
+/// image a compiled model would hand it once `rocket-fold-conv-pad` folds
+/// the stem's pad. Stride 1 at the same extent, `Cin` 1 and 4, and a
+/// half-size image ride along. `Dense` for addressing (`Selectors` is
+/// x-invariant at y=0), `Counting` for coverage.
+fn stem_3x3_pad1_cases() -> Vec<Conv2dCase> {
+    let mut cases = Vec::new();
+    for (side, cin, cout, stride, pattern) in [
+        (224u32, 3u32, 32u32, 2u32, OraclePattern::Dense { phase: 0 }),
+        (224, 3, 32, 2, OraclePattern::Dense { phase: 3 }),
+        (224, 3, 32, 2, OraclePattern::Counting),
+        (224, 3, 32, 1, OraclePattern::Dense { phase: 0 }),
+        (224, 1, 32, 2, OraclePattern::Dense { phase: 0 }),
+        (224, 4, 32, 2, OraclePattern::Dense { phase: 0 }),
+        (112, 3, 32, 2, OraclePattern::Dense { phase: 0 }),
+    ] {
+        cases.push(Conv2dCase {
+            width: side,
+            height: side,
+            cin,
+            cout,
+            kernel: [3, 3],
+            stride,
+            padding: [1, 1],
+            precision: OraclePrecision::Fp16,
+            pattern,
+        });
+    }
+    cases
+}
+
+#[test]
+#[ignore = "needs /dev/accel/accel0 -- the 3x3 image stem with CNA padding"]
+fn stem_3x3_pad1_matches_oracle() {
+    let cases = stem_3x3_pad1_cases();
+    assert_eq!(cases.len(), 7);
+    run_hardware_case_matrix("3x3 dense stem, pad 1 on the CNA", cases);
+}
+
 /// The 7x7 stride-2 image stem on the dense feature path, over the grid
 /// `conv::stride_two_dense_stem` admits: ResNet's 230x230 `Cin` 3 -> 64 at
 /// padding 0 (the compiled stem arrives padded), `Cin` 1..=4 and `Cout` 32

@@ -243,6 +243,23 @@ static bool isClaimablePaddedDepthwise(linalg::DepthwiseConv2DNchwChwOp conv,
          dilations == SmallVector<int64_t>{1, 1};
 }
 
+/// The padded dense convolutions a template claims together with their
+/// ReLU6 (`@match_dynamic_conv2d_3x3_pad1_relu6*`): 3x3, pad 1 on both axes,
+/// stride 1 or 2, no dilation. `stem_3x3_pad1_matches_oracle` in
+/// iree-rocket-hal runs MobileNetV2's 224x224 Cin 3 stem this way, exact.
+static bool isClaimablePaddedDense(linalg::Conv2DNhwcHwcfOp conv, int64_t padHeight,
+                                   int64_t padWidth) {
+  auto filterType = dyn_cast<RankedTensorType>(conv.getDpsInputs()[1].getType());
+  if (padHeight != 1 || padWidth != 1 || !filterType || filterType.getRank() != 4 ||
+      filterType.getDimSize(0) != 3 || filterType.getDimSize(1) != 3) {
+    return false;
+  }
+  SmallVector<int64_t> strides(conv.getStrides().getValues<int64_t>());
+  SmallVector<int64_t> dilations(conv.getDilations().getValues<int64_t>());
+  return (strides == SmallVector<int64_t>{1, 1} || strides == SmallVector<int64_t>{2, 2}) &&
+         dilations == SmallVector<int64_t>{1, 1};
+}
+
 /// Moves a depthwise convolution's pad below the NCHW transpose in front of
 /// it, so the pad is the convolution's immediate producer.
 ///
@@ -367,12 +384,18 @@ struct MarkPaddedConv : public OpRewritePattern<ConvOp> {
     // `@match_dynamic_depthwise_conv2d_nchw_pad1_relu6*` claim the pad and
     // the clamp together, so a ReLU6 depthwise convolution is marked after
     // all -- but only in the form those claim (`isClaimablePaddedDepthwise`),
-    // checked below once the pad is known. A dense ReLU6 convolution still
+    // checked below once the pad is known.
+    //
+    // **And the dense half** (2026-11-24): `@match_dynamic_conv2d_3x3_pad1_relu6*`
+    // do the same for a dense 3x3 at stride 1 or 2 (`isClaimablePaddedDense`) --
+    // MobileNetV2's stem, whose pad and clamp both ran on the CPU. Only the
+    // NHWC depthwise form, which no padded ReLU6 template covers, still
     // keeps its pad.
     const bool fusedClamp = feedsFusedClamp(conv);
     constexpr bool kNchwDepthwise =
         std::is_same_v<ConvOp, linalg::DepthwiseConv2DNchwChwOp>;
-    if (fusedClamp && !kNchwDepthwise) {
+    constexpr bool kNhwcDense = std::is_same_v<ConvOp, linalg::Conv2DNhwcHwcfOp>;
+    if (fusedClamp && !kNchwDepthwise && !kNhwcDense) {
       return failure();
     }
     if (conv.getDpsInputs().empty()) {
@@ -448,6 +471,16 @@ struct MarkPaddedConv : public OpRewritePattern<ConvOp> {
     // materialized pad, as every ReLU6 convolution did before.
     if constexpr (kNchwDepthwise) {
       if (fusedClamp && !isClaimablePaddedDepthwise(conv, padHeight, padWidth)) {
+        return failure();
+      }
+    }
+    // The dense pad-1 ReLU6 templates spell the channels-last form, a rank-5
+    // pad and its collapse (`shift == 1`). A rank-4 NHWC pad would be marked
+    // and then claimed by nothing -- and the mark costs the plain ReLU6
+    // matcher that claims it today, sending the convolution to the CPU.
+    if constexpr (kNhwcDense) {
+      if (fusedClamp &&
+          (int8Fill || shift != 1 || !isClaimablePaddedDense(conv, padHeight, padWidth))) {
         return failure();
       }
     }

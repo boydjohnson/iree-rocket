@@ -816,6 +816,60 @@
   ]
 }>
 
+// Pad-1 twin of #rocket_dynamic_relu6_target, stride 1: a dense 3x3
+// convolution, its model "same" padding done by the CNA and its ReLU6 by BN.
+// `rocket-fold-conv-pad` marks a ReLU6 dense convolution only in the form
+// @match_dynamic_conv2d_3x3_pad1_relu6* claim (3x3, pad 1, stride 1/2), so
+// pad, convolution and clamp go to the NPU together. MobileNetV2's stem is
+// the stride-2 case. Hardware: `stem_3x3_pad1_matches_oracle` in
+// conv2d_oracle_hw.rs runs the 224x224 Cin 3 -> 32 stem with the CNA padding
+// (dense ARGB input, 5 tiles) at stride 1 and 2, exact.
+#rocket_dynamic_pad1_relu6_target = #hal.executable.target<"rocket", "rocket-flatbuffer-v1", {
+  kernel = "conv2d",
+  input_width = 0 : i32, input_height = 0 : i32, input_channels = 0 : i32,
+  output_width = 0 : i32, output_height = 0 : i32, output_channels = 0 : i32,
+  weights_width = 0 : i32, weights_height = 0 : i32, stride = 1 : i32,
+  depthwise = false,
+  runtime_layout = true,
+  input_zero_point = 0 : i32, output_zero_point = 0 : i32, weights_zero_point = 0 : i32,
+  input_scale = 1.0 : f32, weights_scale = 1.0 : f32, output_scale = 1.0 : f32,
+  truncate_bits = 0 : i32,
+  activation = "relux", activation_cmp = 1086324736 : i32,   // 0x40C00000, f32 6.0
+  precision = "fp16",
+  pad_top = 1 : i32, pad_left = 1 : i32,
+  runtime_dimensions = [
+    "input_width", "input_height", "input_channels",
+    "output_channels", "weights_width", "weights_height"
+  ]
+}>
+
+// Pad-1 twin of #rocket_dynamic_relu6_target, stride 2: a dense 3x3
+// convolution, its model "same" padding done by the CNA and its ReLU6 by BN.
+// `rocket-fold-conv-pad` marks a ReLU6 dense convolution only in the form
+// @match_dynamic_conv2d_3x3_pad1_relu6* claim (3x3, pad 1, stride 1/2), so
+// pad, convolution and clamp go to the NPU together. MobileNetV2's stem is
+// the stride-2 case. Hardware: `stem_3x3_pad1_matches_oracle` in
+// conv2d_oracle_hw.rs runs the 224x224 Cin 3 -> 32 stem with the CNA padding
+// (dense ARGB input, 5 tiles) at stride 1 and 2, exact.
+#rocket_dynamic_pad1_relu6_target_s2 = #hal.executable.target<"rocket", "rocket-flatbuffer-v1", {
+  kernel = "conv2d",
+  input_width = 0 : i32, input_height = 0 : i32, input_channels = 0 : i32,
+  output_width = 0 : i32, output_height = 0 : i32, output_channels = 0 : i32,
+  weights_width = 0 : i32, weights_height = 0 : i32, stride = 2 : i32,
+  depthwise = false,
+  runtime_layout = true,
+  input_zero_point = 0 : i32, output_zero_point = 0 : i32, weights_zero_point = 0 : i32,
+  input_scale = 1.0 : f32, weights_scale = 1.0 : f32, output_scale = 1.0 : f32,
+  truncate_bits = 0 : i32,
+  activation = "relux", activation_cmp = 1086324736 : i32,   // 0x40C00000, f32 6.0
+  precision = "fp16",
+  pad_top = 1 : i32, pad_left = 1 : i32,
+  runtime_dimensions = [
+    "input_width", "input_height", "input_channels",
+    "output_channels", "weights_width", "weights_height"
+  ]
+}>
+
 // Depthwise twin of #rocket_dynamic_relu6_target, stride 1. Same reasoning
 // throughout -- the ceiling is static and `rocket-fuse-conv-relu6` is what
 // makes that sound, and the bias is a real binding because BN clamps after
@@ -1432,6 +1486,34 @@ module attributes {transform.with_named_sequence} {
 
   hal.executable private @rocket_dynamic_relu6_executable {
     hal.executable.variant public @rocket_dynamic_conv2d_v1 target(#rocket_dynamic_relu6_target) {
+      hal.executable.export public @rocket_dynamic_conv2d ordinal(0) layout(#dynamic_pipeline_layout) count(%device: !hal.device, %workload: index) -> (index, index, index) {
+        %c1 = arith.constant 1 : index
+        hal.return %c1, %c1, %c1 : index, index, index
+      }
+      builtin.module {
+        func.func @rocket_dynamic_conv2d() {
+          return
+        }
+      }
+    }
+  }
+
+  hal.executable private @rocket_dynamic_pad1_relu6_executable {
+    hal.executable.variant public @rocket_dynamic_conv2d_v1 target(#rocket_dynamic_pad1_relu6_target) {
+      hal.executable.export public @rocket_dynamic_conv2d ordinal(0) layout(#dynamic_pipeline_layout) count(%device: !hal.device, %workload: index) -> (index, index, index) {
+        %c1 = arith.constant 1 : index
+        hal.return %c1, %c1, %c1 : index, index, index
+      }
+      builtin.module {
+        func.func @rocket_dynamic_conv2d() {
+          return
+        }
+      }
+    }
+  }
+
+  hal.executable private @rocket_dynamic_pad1_relu6_executable_s2 {
+    hal.executable.variant public @rocket_dynamic_conv2d_v1 target(#rocket_dynamic_pad1_relu6_target_s2) {
       hal.executable.export public @rocket_dynamic_conv2d ordinal(0) layout(#dynamic_pipeline_layout) count(%device: !hal.device, %workload: index) -> (index, index, index) {
         %c1 = arith.constant 1 : index
         hal.return %c1, %c1, %c1 : index, index, index
@@ -4123,6 +4205,178 @@ module attributes {transform.with_named_sequence} {
           %input_width_i32, %input_height_i32, %input_channels_i32,
           %output_channels_i32, %weights_width_i32, %weights_height_i32, %layout_i32,
           %input, %filter, %bias_f16)
+        {stream.affinity = #hal.device.affinity<@rocket_device>}
+        : (i32, i32, i32, i32, i32, i32, i32,
+           tensor<1x?x?x?xf16>{%input_height, %input_width, %input_channels},
+           tensor<?x?x?x?xf16>{%weights_height, %weights_width, %input_channels, %output_channels},
+           tensor<?xf16>{%output_channels})
+        -> tensor<1x?x?x?xf16>{%output_height, %output_width, %output_channels}
+
+    // Widen back to f32 and fold in the accumulator initialiser: linalg
+    // defines the op as an update of its init (`O += ...`, `O = max(O, ...)`),
+    // so this is exact for any init. A plain generic, not a pre-formed CPU
+    // dispatch: rocket-pin-unclaimed-dispatches keeps it off the NPU, and
+    // rocket-fold-neutral-init drops the init term when it is the neutral
+    // element, leaving a bare extf that fuses with the consumer's truncf
+    // and cancels -- which is what lets the next Rocket dispatch read this
+    // one's output cube in place (ISSUES.md P2).
+    %final_empty = tensor.empty(
+        %output_height, %output_width, %output_channels)
+        : tensor<1x?x?x?xf32>
+    %final = linalg.generic {
+        indexing_maps = [
+          affine_map<(d0, d1, d2, d3) -> (d0, d1, d2, d3)>,
+          affine_map<(d0, d1, d2, d3) -> (d0, d1, d2, d3)>
+        ],
+        iterator_types = ["parallel", "parallel", "parallel", "parallel"]
+      } ins(%raw_f16 : tensor<1x?x?x?xf16>)
+        outs(%final_empty : tensor<1x?x?x?xf32>) {
+      ^bb0(%raw: f16, %out: f32):
+        %raw_f32 = arith.extf %raw : f16 to f32
+        linalg.yield %raw_f32 : f32
+    } -> tensor<1x?x?x?xf32>
+
+    util.return %final : tensor<1x?x?x?xf32>
+  }
+
+  // Pad-1 twin of @call_rocket_dynamic_conv2d_relu6, stride 1.
+  // `%input` is the *unpadded* rank-5 channels-last tensor the matcher hands
+  // over (the pad's source); the target has the CNA pad it, so the extents
+  // passed are the unpadded ones, as @call_rocket_dynamic_conv2d_pad1_relu
+  // does for the ReLU twin.
+  util.func private @call_rocket_dynamic_conv2d_pad1_relu6(
+      %input: tensor<1x1x?x?x?xf16>,
+      %filter: tensor<?x?x?x?xf16>,
+      %acc_init: tensor<1x?x?x?xf32>,
+      %bias: tensor<?xf32>,
+      %low: f32,
+      %high: f32,
+      %init: tensor<1x?x?x?xf32>) -> tensor<1x?x?x?xf32> {
+    %c0 = arith.constant 0 : index
+    %c1 = arith.constant 1 : index
+    %c2 = arith.constant 2 : index
+    %c3 = arith.constant 3 : index
+    %input_nhwc = tensor.collapse_shape %input [[0], [1, 2], [3], [4]]
+        : tensor<1x1x?x?x?xf16> into tensor<1x?x?x?xf16>
+
+    %input_height = tensor.dim %input_nhwc, %c1 : tensor<1x?x?x?xf16>
+    %input_width = tensor.dim %input_nhwc, %c2 : tensor<1x?x?x?xf16>
+    %input_channels = tensor.dim %input_nhwc, %c3 : tensor<1x?x?x?xf16>
+    %weights_height = tensor.dim %filter, %c0 : tensor<?x?x?x?xf16>
+    %weights_width = tensor.dim %filter, %c1 : tensor<?x?x?x?xf16>
+    %output_height = tensor.dim %init, %c1 : tensor<1x?x?x?xf32>
+    %output_width = tensor.dim %init, %c2 : tensor<1x?x?x?xf32>
+    %output_channels = tensor.dim %init, %c3 : tensor<1x?x?x?xf32>
+
+    %input_width_i32 = arith.index_cast %input_width : index to i32
+    %input_height_i32 = arith.index_cast %input_height : index to i32
+    %input_channels_i32 = arith.index_cast %input_channels : index to i32
+    %output_channels_i32 = arith.index_cast %output_channels : index to i32
+    %weights_width_i32 = arith.index_cast %weights_width : index to i32
+    %weights_height_i32 = arith.index_cast %weights_height : index to i32
+
+    %bias_empty = tensor.empty(%output_channels) : tensor<?xf16>
+    %bias_f16 = linalg.generic {
+        indexing_maps = [affine_map<(d0) -> (d0)>, affine_map<(d0) -> (d0)>],
+        iterator_types = ["parallel"]
+      } ins(%bias : tensor<?xf32>) outs(%bias_empty : tensor<?xf16>) {
+      ^bb0(%value: f32, %out: f16):
+        %narrowed = arith.truncf %value : f32 to f16
+        linalg.yield %narrowed : f16
+    } -> tensor<?xf16>
+
+    %layout_i32 = arith.constant 0 : i32
+    %raw_f16 = flow.dispatch
+        @rocket_dynamic_pad1_relu6_executable::@rocket_dynamic_conv2d_v1::@rocket_dynamic_conv2d(
+          %input_width_i32, %input_height_i32, %input_channels_i32,
+          %output_channels_i32, %weights_width_i32, %weights_height_i32, %layout_i32,
+          %input_nhwc, %filter, %bias_f16)
+        {stream.affinity = #hal.device.affinity<@rocket_device>}
+        : (i32, i32, i32, i32, i32, i32, i32,
+           tensor<1x?x?x?xf16>{%input_height, %input_width, %input_channels},
+           tensor<?x?x?x?xf16>{%weights_height, %weights_width, %input_channels, %output_channels},
+           tensor<?xf16>{%output_channels})
+        -> tensor<1x?x?x?xf16>{%output_height, %output_width, %output_channels}
+
+    // Widen back to f32 and fold in the accumulator initialiser: linalg
+    // defines the op as an update of its init (`O += ...`, `O = max(O, ...)`),
+    // so this is exact for any init. A plain generic, not a pre-formed CPU
+    // dispatch: rocket-pin-unclaimed-dispatches keeps it off the NPU, and
+    // rocket-fold-neutral-init drops the init term when it is the neutral
+    // element, leaving a bare extf that fuses with the consumer's truncf
+    // and cancels -- which is what lets the next Rocket dispatch read this
+    // one's output cube in place (ISSUES.md P2).
+    %final_empty = tensor.empty(
+        %output_height, %output_width, %output_channels)
+        : tensor<1x?x?x?xf32>
+    %final = linalg.generic {
+        indexing_maps = [
+          affine_map<(d0, d1, d2, d3) -> (d0, d1, d2, d3)>,
+          affine_map<(d0, d1, d2, d3) -> (d0, d1, d2, d3)>
+        ],
+        iterator_types = ["parallel", "parallel", "parallel", "parallel"]
+      } ins(%raw_f16 : tensor<1x?x?x?xf16>)
+        outs(%final_empty : tensor<1x?x?x?xf32>) {
+      ^bb0(%raw: f16, %out: f32):
+        %raw_f32 = arith.extf %raw : f16 to f32
+        linalg.yield %raw_f32 : f32
+    } -> tensor<1x?x?x?xf32>
+
+    util.return %final : tensor<1x?x?x?xf32>
+  }
+
+  // Pad-1 twin of @call_rocket_dynamic_conv2d_relu6, stride 2.
+  // `%input` is the *unpadded* rank-5 channels-last tensor the matcher hands
+  // over (the pad's source); the target has the CNA pad it, so the extents
+  // passed are the unpadded ones, as @call_rocket_dynamic_conv2d_pad1_relu
+  // does for the ReLU twin.
+  util.func private @call_rocket_dynamic_conv2d_pad1_relu6_s2(
+      %input: tensor<1x1x?x?x?xf16>,
+      %filter: tensor<?x?x?x?xf16>,
+      %acc_init: tensor<1x?x?x?xf32>,
+      %bias: tensor<?xf32>,
+      %low: f32,
+      %high: f32,
+      %init: tensor<1x?x?x?xf32>) -> tensor<1x?x?x?xf32> {
+    %c0 = arith.constant 0 : index
+    %c1 = arith.constant 1 : index
+    %c2 = arith.constant 2 : index
+    %c3 = arith.constant 3 : index
+    %input_nhwc = tensor.collapse_shape %input [[0], [1, 2], [3], [4]]
+        : tensor<1x1x?x?x?xf16> into tensor<1x?x?x?xf16>
+
+    %input_height = tensor.dim %input_nhwc, %c1 : tensor<1x?x?x?xf16>
+    %input_width = tensor.dim %input_nhwc, %c2 : tensor<1x?x?x?xf16>
+    %input_channels = tensor.dim %input_nhwc, %c3 : tensor<1x?x?x?xf16>
+    %weights_height = tensor.dim %filter, %c0 : tensor<?x?x?x?xf16>
+    %weights_width = tensor.dim %filter, %c1 : tensor<?x?x?x?xf16>
+    %output_height = tensor.dim %init, %c1 : tensor<1x?x?x?xf32>
+    %output_width = tensor.dim %init, %c2 : tensor<1x?x?x?xf32>
+    %output_channels = tensor.dim %init, %c3 : tensor<1x?x?x?xf32>
+
+    %input_width_i32 = arith.index_cast %input_width : index to i32
+    %input_height_i32 = arith.index_cast %input_height : index to i32
+    %input_channels_i32 = arith.index_cast %input_channels : index to i32
+    %output_channels_i32 = arith.index_cast %output_channels : index to i32
+    %weights_width_i32 = arith.index_cast %weights_width : index to i32
+    %weights_height_i32 = arith.index_cast %weights_height : index to i32
+
+    %bias_empty = tensor.empty(%output_channels) : tensor<?xf16>
+    %bias_f16 = linalg.generic {
+        indexing_maps = [affine_map<(d0) -> (d0)>, affine_map<(d0) -> (d0)>],
+        iterator_types = ["parallel"]
+      } ins(%bias : tensor<?xf32>) outs(%bias_empty : tensor<?xf16>) {
+      ^bb0(%value: f32, %out: f16):
+        %narrowed = arith.truncf %value : f32 to f16
+        linalg.yield %narrowed : f16
+    } -> tensor<?xf16>
+
+    %layout_i32 = arith.constant 0 : i32
+    %raw_f16 = flow.dispatch
+        @rocket_dynamic_pad1_relu6_executable_s2::@rocket_dynamic_conv2d_v1::@rocket_dynamic_conv2d(
+          %input_width_i32, %input_height_i32, %input_channels_i32,
+          %output_channels_i32, %weights_width_i32, %weights_height_i32, %layout_i32,
+          %input_nhwc, %filter, %bias_f16)
         {stream.affinity = #hal.device.affinity<@rocket_device>}
         : (i32, i32, i32, i32, i32, i32, i32,
            tensor<1x?x?x?xf16>{%input_height, %input_width, %input_channels},
@@ -10033,6 +10287,266 @@ module attributes {transform.with_named_sequence} {
     transform.yield %ins, %outs : !transform.any_value, !transform.any_value
   }
 
+  // Pad-1 twins of the dense 3x3 ReLU6 matchers, stride 1 and 2, demoted and
+  // undemoted: the model's `tensor.pad` (rank-5 channels-last, then the
+  // collapse) in front of the convolution, which `rocket-fold-conv-pad`
+  // marks `rocket.pad_top`/`rocket.pad_left`. `%input` binds the pad's
+  // source, so the CNA pads. Before these existed a ReLU6 dense convolution
+  // kept its pad on the CPU -- and the stride-2 ones (MobileNetV2's stem) had
+  // no ReLU6 matcher at all, so the clamp ran on the CPU too.
+
+  transform.named_sequence @match_dynamic_conv2d_3x3_pad1_relu6(
+      %root: !transform.any_op {transform.readonly})
+      -> (!transform.any_value, !transform.any_value) {
+    transform.match.operation_name %root ["linalg.generic"] : !transform.any_op
+    %conv = transform.get_producer_of_operand %root[0]
+        : (!transform.any_op) -> !transform.any_op
+    transform.match.operation_name %conv ["linalg.conv_2d_nhwc_hwcf"] : !transform.any_op
+    transform.rocket.match.admitted %conv : !transform.any_op
+    %batch, %out_img, %out_ch, %filter, %in_ch, %depth, %strides, %dilations =
+        transform.iree.match.convolution %conv,
+          lhs_type = f16, rhs_type = f16, output_type = f32
+          : !transform.any_op -> !transform.param<i64>
+    transform.iree.match.dims_equal %batch, [1] : !transform.param<i64>
+    transform.iree.match.dims_equal %out_img, [-1, -1] : !transform.param<i64>
+    transform.iree.match.dims_equal %out_ch, [-1] : !transform.param<i64>
+    transform.iree.match.dims_equal %filter, [3, 3] : !transform.param<i64>
+    transform.iree.match.dims_equal %in_ch, [-1] : !transform.param<i64>
+    transform.iree.match.dims_equal %depth, [] : !transform.param<i64>
+    transform.iree.match.dims_equal %strides, [1, 1] : !transform.param<i64>
+    transform.iree.match.dims_equal %dilations, [1, 1] : !transform.param<i64>
+
+
+    %ins, %outs = transform.iree.match.cast_compatible_dag_from_root %root {
+      ^bb0(%input: tensor<1x1x?x?x?xf16>, %weights: tensor<?x?x?x?xf16>,
+           %acc_init: tensor<1x?x?x?xf32>, %bias: tensor<?xf32>,
+           %low: f32, %high: f32,
+           %out_init: tensor<1x?x?x?xf32>):
+        // `rocket.f16_demoted` is on the payload convolution --
+        // RocketDemoteConvInputsPass marks every convolution it narrows --
+        // and `cast_compatible_dag_from_root` compares whole attribute
+        // dictionaries, so leaving it out of the template makes every
+        // convolution decline.
+        %padded = tensor.pad %input low[0, 0, 1, 1, 0] high[0, 0, 1, 1, 0] {
+          ^bb2(%i0: index, %i1: index, %i2: index, %i3: index, %i4: index):
+            %zero = arith.constant 0.000000e+00 : f16
+            tensor.yield %zero : f16
+        } : tensor<1x1x?x?x?xf16> to tensor<1x1x?x?x?xf16>
+        %collapsed = tensor.collapse_shape %padded [[0], [1, 2], [3], [4]]
+            : tensor<1x1x?x?x?xf16> into tensor<1x?x?x?xf16>
+        %accumulator = linalg.conv_2d_nhwc_hwcf
+            {dilations = dense<1> : vector<2xi64>, rocket.pad_left = 1 : i64, rocket.pad_top = 1 : i64, rocket.f16_demoted,
+             strides = dense<1> : vector<2xi64>}
+            ins(%collapsed, %weights : tensor<1x?x?x?xf16>, tensor<?x?x?x?xf16>)
+            outs(%acc_init : tensor<1x?x?x?xf32>) -> tensor<1x?x?x?xf32>
+        %activated = linalg.generic {
+            indexing_maps = [affine_map<(d0, d1, d2, d3) -> (d0, d1, d2, d3)>,
+                             affine_map<(d0, d1, d2, d3) -> (d3)>,
+                             affine_map<(d0, d1, d2, d3) -> ()>,
+                             affine_map<(d0, d1, d2, d3) -> ()>,
+                             affine_map<(d0, d1, d2, d3) -> (d0, d1, d2, d3)>],
+            iterator_types = ["parallel", "parallel", "parallel", "parallel"]}
+            ins(%accumulator, %bias, %low, %high
+                : tensor<1x?x?x?xf32>, tensor<?xf32>, f32, f32)
+            outs(%out_init : tensor<1x?x?x?xf32>) {
+          ^bb1(%raw: f32, %channel_bias: f32, %lo: f32, %hi: f32, %unused: f32):
+            %biased = arith.addf %raw, %channel_bias : f32
+            %low_clamped = arith.maximumf %biased, %lo : f32
+            %clamped = arith.minimumf %low_clamped, %hi : f32
+            linalg.yield %clamped : f32
+        } -> tensor<1x?x?x?xf32>
+    } : (!transform.any_op) -> (!transform.any_value, !transform.any_value)
+    transform.yield %ins, %outs : !transform.any_value, !transform.any_value
+  }
+
+  transform.named_sequence @match_dynamic_conv2d_3x3_pad1_relu6_s2(
+      %root: !transform.any_op {transform.readonly})
+      -> (!transform.any_value, !transform.any_value) {
+    transform.match.operation_name %root ["linalg.generic"] : !transform.any_op
+    %conv = transform.get_producer_of_operand %root[0]
+        : (!transform.any_op) -> !transform.any_op
+    transform.match.operation_name %conv ["linalg.conv_2d_nhwc_hwcf"] : !transform.any_op
+    transform.rocket.match.admitted %conv : !transform.any_op
+    %batch, %out_img, %out_ch, %filter, %in_ch, %depth, %strides, %dilations =
+        transform.iree.match.convolution %conv,
+          lhs_type = f16, rhs_type = f16, output_type = f32
+          : !transform.any_op -> !transform.param<i64>
+    transform.iree.match.dims_equal %batch, [1] : !transform.param<i64>
+    transform.iree.match.dims_equal %out_img, [-1, -1] : !transform.param<i64>
+    transform.iree.match.dims_equal %out_ch, [-1] : !transform.param<i64>
+    transform.iree.match.dims_equal %filter, [3, 3] : !transform.param<i64>
+    transform.iree.match.dims_equal %in_ch, [-1] : !transform.param<i64>
+    transform.iree.match.dims_equal %depth, [] : !transform.param<i64>
+    transform.iree.match.dims_equal %strides, [2, 2] : !transform.param<i64>
+    transform.iree.match.dims_equal %dilations, [1, 1] : !transform.param<i64>
+
+
+    %ins, %outs = transform.iree.match.cast_compatible_dag_from_root %root {
+      ^bb0(%input: tensor<1x1x?x?x?xf16>, %weights: tensor<?x?x?x?xf16>,
+           %acc_init: tensor<1x?x?x?xf32>, %bias: tensor<?xf32>,
+           %low: f32, %high: f32,
+           %out_init: tensor<1x?x?x?xf32>):
+        // `rocket.f16_demoted` is on the payload convolution --
+        // RocketDemoteConvInputsPass marks every convolution it narrows --
+        // and `cast_compatible_dag_from_root` compares whole attribute
+        // dictionaries, so leaving it out of the template makes every
+        // convolution decline.
+        %padded = tensor.pad %input low[0, 0, 1, 1, 0] high[0, 0, 1, 1, 0] {
+          ^bb2(%i0: index, %i1: index, %i2: index, %i3: index, %i4: index):
+            %zero = arith.constant 0.000000e+00 : f16
+            tensor.yield %zero : f16
+        } : tensor<1x1x?x?x?xf16> to tensor<1x1x?x?x?xf16>
+        %collapsed = tensor.collapse_shape %padded [[0], [1, 2], [3], [4]]
+            : tensor<1x1x?x?x?xf16> into tensor<1x?x?x?xf16>
+        %accumulator = linalg.conv_2d_nhwc_hwcf
+            {dilations = dense<1> : vector<2xi64>, rocket.pad_left = 1 : i64, rocket.pad_top = 1 : i64, rocket.f16_demoted,
+             strides = dense<2> : vector<2xi64>}
+            ins(%collapsed, %weights : tensor<1x?x?x?xf16>, tensor<?x?x?x?xf16>)
+            outs(%acc_init : tensor<1x?x?x?xf32>) -> tensor<1x?x?x?xf32>
+        %activated = linalg.generic {
+            indexing_maps = [affine_map<(d0, d1, d2, d3) -> (d0, d1, d2, d3)>,
+                             affine_map<(d0, d1, d2, d3) -> (d3)>,
+                             affine_map<(d0, d1, d2, d3) -> ()>,
+                             affine_map<(d0, d1, d2, d3) -> ()>,
+                             affine_map<(d0, d1, d2, d3) -> (d0, d1, d2, d3)>],
+            iterator_types = ["parallel", "parallel", "parallel", "parallel"]}
+            ins(%accumulator, %bias, %low, %high
+                : tensor<1x?x?x?xf32>, tensor<?xf32>, f32, f32)
+            outs(%out_init : tensor<1x?x?x?xf32>) {
+          ^bb1(%raw: f32, %channel_bias: f32, %lo: f32, %hi: f32, %unused: f32):
+            %biased = arith.addf %raw, %channel_bias : f32
+            %low_clamped = arith.maximumf %biased, %lo : f32
+            %clamped = arith.minimumf %low_clamped, %hi : f32
+            linalg.yield %clamped : f32
+        } -> tensor<1x?x?x?xf32>
+    } : (!transform.any_op) -> (!transform.any_value, !transform.any_value)
+    transform.yield %ins, %outs : !transform.any_value, !transform.any_value
+  }
+
+  transform.named_sequence @match_dynamic_conv2d_3x3_pad1_relu6_undemoted(
+      %root: !transform.any_op {transform.readonly})
+      -> (!transform.any_value, !transform.any_value) {
+    transform.match.operation_name %root ["linalg.generic"] : !transform.any_op
+    %conv = transform.get_producer_of_operand %root[0]
+        : (!transform.any_op) -> !transform.any_op
+    transform.match.operation_name %conv ["linalg.conv_2d_nhwc_hwcf"] : !transform.any_op
+    transform.rocket.match.admitted %conv : !transform.any_op
+    %batch, %out_img, %out_ch, %filter, %in_ch, %depth, %strides, %dilations =
+        transform.iree.match.convolution %conv,
+          lhs_type = f16, rhs_type = f16, output_type = f32
+          : !transform.any_op -> !transform.param<i64>
+    transform.iree.match.dims_equal %batch, [1] : !transform.param<i64>
+    transform.iree.match.dims_equal %out_img, [-1, -1] : !transform.param<i64>
+    transform.iree.match.dims_equal %out_ch, [-1] : !transform.param<i64>
+    transform.iree.match.dims_equal %filter, [3, 3] : !transform.param<i64>
+    transform.iree.match.dims_equal %in_ch, [-1] : !transform.param<i64>
+    transform.iree.match.dims_equal %depth, [] : !transform.param<i64>
+    transform.iree.match.dims_equal %strides, [1, 1] : !transform.param<i64>
+    transform.iree.match.dims_equal %dilations, [1, 1] : !transform.param<i64>
+
+
+    %ins, %outs = transform.iree.match.cast_compatible_dag_from_root %root {
+      ^bb0(%input: tensor<1x1x?x?x?xf16>, %weights: tensor<?x?x?x?xf16>,
+           %acc_init: tensor<1x?x?x?xf32>, %bias: tensor<?xf32>,
+           %low: f32, %high: f32,
+           %out_init: tensor<1x?x?x?xf32>):
+        // The marker is deliberately absent from this template: it is added
+        // only to convolutions RocketDemoteConvInputsPass narrowed, and an
+        // already-f16 import narrowed nothing. See the header above.
+        %padded = tensor.pad %input low[0, 0, 1, 1, 0] high[0, 0, 1, 1, 0] {
+          ^bb2(%i0: index, %i1: index, %i2: index, %i3: index, %i4: index):
+            %zero = arith.constant 0.000000e+00 : f16
+            tensor.yield %zero : f16
+        } : tensor<1x1x?x?x?xf16> to tensor<1x1x?x?x?xf16>
+        %collapsed = tensor.collapse_shape %padded [[0], [1, 2], [3], [4]]
+            : tensor<1x1x?x?x?xf16> into tensor<1x?x?x?xf16>
+        %accumulator = linalg.conv_2d_nhwc_hwcf
+            {dilations = dense<1> : vector<2xi64>, rocket.pad_left = 1 : i64, rocket.pad_top = 1 : i64,
+             strides = dense<1> : vector<2xi64>}
+            ins(%collapsed, %weights : tensor<1x?x?x?xf16>, tensor<?x?x?x?xf16>)
+            outs(%acc_init : tensor<1x?x?x?xf32>) -> tensor<1x?x?x?xf32>
+        %activated = linalg.generic {
+            indexing_maps = [affine_map<(d0, d1, d2, d3) -> (d0, d1, d2, d3)>,
+                             affine_map<(d0, d1, d2, d3) -> (d3)>,
+                             affine_map<(d0, d1, d2, d3) -> ()>,
+                             affine_map<(d0, d1, d2, d3) -> ()>,
+                             affine_map<(d0, d1, d2, d3) -> (d0, d1, d2, d3)>],
+            iterator_types = ["parallel", "parallel", "parallel", "parallel"]}
+            ins(%accumulator, %bias, %low, %high
+                : tensor<1x?x?x?xf32>, tensor<?xf32>, f32, f32)
+            outs(%out_init : tensor<1x?x?x?xf32>) {
+          ^bb1(%raw: f32, %channel_bias: f32, %lo: f32, %hi: f32, %unused: f32):
+            %biased = arith.addf %raw, %channel_bias : f32
+            %low_clamped = arith.maximumf %biased, %lo : f32
+            %clamped = arith.minimumf %low_clamped, %hi : f32
+            linalg.yield %clamped : f32
+        } -> tensor<1x?x?x?xf32>
+    } : (!transform.any_op) -> (!transform.any_value, !transform.any_value)
+    transform.yield %ins, %outs : !transform.any_value, !transform.any_value
+  }
+
+  transform.named_sequence @match_dynamic_conv2d_3x3_pad1_relu6_s2_undemoted(
+      %root: !transform.any_op {transform.readonly})
+      -> (!transform.any_value, !transform.any_value) {
+    transform.match.operation_name %root ["linalg.generic"] : !transform.any_op
+    %conv = transform.get_producer_of_operand %root[0]
+        : (!transform.any_op) -> !transform.any_op
+    transform.match.operation_name %conv ["linalg.conv_2d_nhwc_hwcf"] : !transform.any_op
+    transform.rocket.match.admitted %conv : !transform.any_op
+    %batch, %out_img, %out_ch, %filter, %in_ch, %depth, %strides, %dilations =
+        transform.iree.match.convolution %conv,
+          lhs_type = f16, rhs_type = f16, output_type = f32
+          : !transform.any_op -> !transform.param<i64>
+    transform.iree.match.dims_equal %batch, [1] : !transform.param<i64>
+    transform.iree.match.dims_equal %out_img, [-1, -1] : !transform.param<i64>
+    transform.iree.match.dims_equal %out_ch, [-1] : !transform.param<i64>
+    transform.iree.match.dims_equal %filter, [3, 3] : !transform.param<i64>
+    transform.iree.match.dims_equal %in_ch, [-1] : !transform.param<i64>
+    transform.iree.match.dims_equal %depth, [] : !transform.param<i64>
+    transform.iree.match.dims_equal %strides, [2, 2] : !transform.param<i64>
+    transform.iree.match.dims_equal %dilations, [1, 1] : !transform.param<i64>
+
+
+    %ins, %outs = transform.iree.match.cast_compatible_dag_from_root %root {
+      ^bb0(%input: tensor<1x1x?x?x?xf16>, %weights: tensor<?x?x?x?xf16>,
+           %acc_init: tensor<1x?x?x?xf32>, %bias: tensor<?xf32>,
+           %low: f32, %high: f32,
+           %out_init: tensor<1x?x?x?xf32>):
+        // The marker is deliberately absent from this template: it is added
+        // only to convolutions RocketDemoteConvInputsPass narrowed, and an
+        // already-f16 import narrowed nothing. See the header above.
+        %padded = tensor.pad %input low[0, 0, 1, 1, 0] high[0, 0, 1, 1, 0] {
+          ^bb2(%i0: index, %i1: index, %i2: index, %i3: index, %i4: index):
+            %zero = arith.constant 0.000000e+00 : f16
+            tensor.yield %zero : f16
+        } : tensor<1x1x?x?x?xf16> to tensor<1x1x?x?x?xf16>
+        %collapsed = tensor.collapse_shape %padded [[0], [1, 2], [3], [4]]
+            : tensor<1x1x?x?x?xf16> into tensor<1x?x?x?xf16>
+        %accumulator = linalg.conv_2d_nhwc_hwcf
+            {dilations = dense<1> : vector<2xi64>, rocket.pad_left = 1 : i64, rocket.pad_top = 1 : i64,
+             strides = dense<2> : vector<2xi64>}
+            ins(%collapsed, %weights : tensor<1x?x?x?xf16>, tensor<?x?x?x?xf16>)
+            outs(%acc_init : tensor<1x?x?x?xf32>) -> tensor<1x?x?x?xf32>
+        %activated = linalg.generic {
+            indexing_maps = [affine_map<(d0, d1, d2, d3) -> (d0, d1, d2, d3)>,
+                             affine_map<(d0, d1, d2, d3) -> (d3)>,
+                             affine_map<(d0, d1, d2, d3) -> ()>,
+                             affine_map<(d0, d1, d2, d3) -> ()>,
+                             affine_map<(d0, d1, d2, d3) -> (d0, d1, d2, d3)>],
+            iterator_types = ["parallel", "parallel", "parallel", "parallel"]}
+            ins(%accumulator, %bias, %low, %high
+                : tensor<1x?x?x?xf32>, tensor<?xf32>, f32, f32)
+            outs(%out_init : tensor<1x?x?x?xf32>) {
+          ^bb1(%raw: f32, %channel_bias: f32, %lo: f32, %hi: f32, %unused: f32):
+            %biased = arith.addf %raw, %channel_bias : f32
+            %low_clamped = arith.maximumf %biased, %lo : f32
+            %clamped = arith.minimumf %low_clamped, %hi : f32
+            linalg.yield %clamped : f32
+        } -> tensor<1x?x?x?xf32>
+    } : (!transform.any_op) -> (!transform.any_value, !transform.any_value)
+    transform.yield %ins, %outs : !transform.any_value, !transform.any_value
+  }
+
   transform.named_sequence @match_dynamic_depthwise_conv2d_nchw_relu6_undemoted(
       %root: !transform.any_op {transform.readonly})
       -> (!transform.any_value, !transform.any_value) {
@@ -11217,6 +11731,42 @@ module attributes {transform.with_named_sequence} {
     transform.yield
   }
 
+  transform.named_sequence @cast_and_call_dynamic_conv2d_pad1_relu6(
+      %ins: !transform.any_value {transform.readonly},
+      %out: !transform.any_value {transform.readonly}) {
+    %root = transform.get_defining_op %out : (!transform.any_value) -> !transform.any_op
+    %module = transform.util.get_nearest_symbol_table %root : (!transform.any_op) -> !transform.any_op
+    %topology_attr = transform.param.constant #hal.device.topology<links = [
+        (@rocket_device -> @cpu_device = {transparent_access = true, unified_memory = true}),
+        (@cpu_device -> @rocket_device = {transparent_access = true, unified_memory = true})
+      ]> -> !transform.any_param
+    transform.annotate %module "stream.topology" = %topology_attr : !transform.any_op, !transform.any_param
+    %executable = transform.util.import_symbol @rocket_dynamic_pad1_relu6_executable into %module if undefined : (!transform.any_op) -> !transform.any_op
+    %func = transform.util.import_symbol @call_rocket_dynamic_conv2d_pad1_relu6 into %module if undefined : (!transform.any_op) -> !transform.any_op
+    transform.util.cast_and_call %func(%ins) -> %out after %root {
+          transform.type_conversion.tensor.cast_shape_dynamic_dims
+      } : (!transform.any_op, !transform.any_value, !transform.any_value, !transform.any_op) -> !transform.any_op
+    transform.yield
+  }
+
+  transform.named_sequence @cast_and_call_dynamic_conv2d_pad1_relu6_s2(
+      %ins: !transform.any_value {transform.readonly},
+      %out: !transform.any_value {transform.readonly}) {
+    %root = transform.get_defining_op %out : (!transform.any_value) -> !transform.any_op
+    %module = transform.util.get_nearest_symbol_table %root : (!transform.any_op) -> !transform.any_op
+    %topology_attr = transform.param.constant #hal.device.topology<links = [
+        (@rocket_device -> @cpu_device = {transparent_access = true, unified_memory = true}),
+        (@cpu_device -> @rocket_device = {transparent_access = true, unified_memory = true})
+      ]> -> !transform.any_param
+    transform.annotate %module "stream.topology" = %topology_attr : !transform.any_op, !transform.any_param
+    %executable = transform.util.import_symbol @rocket_dynamic_pad1_relu6_executable_s2 into %module if undefined : (!transform.any_op) -> !transform.any_op
+    %func = transform.util.import_symbol @call_rocket_dynamic_conv2d_pad1_relu6_s2 into %module if undefined : (!transform.any_op) -> !transform.any_op
+    transform.util.cast_and_call %func(%ins) -> %out after %root {
+          transform.type_conversion.tensor.cast_shape_dynamic_dims
+      } : (!transform.any_op, !transform.any_value, !transform.any_value, !transform.any_op) -> !transform.any_op
+    transform.yield
+  }
+
   transform.named_sequence @cast_and_call_dynamic_depthwise_conv2d_nchw_relu6(
       %ins: !transform.any_value {transform.readonly},
       %out: !transform.any_value {transform.readonly}) {
@@ -11741,6 +12291,10 @@ module attributes {transform.with_named_sequence} {
             @match_dynamic_conv2d_3x3_pad1_bias_demoted_s2 -> @cast_and_call_dynamic_conv2d_pad1_bias_s2,
             @match_dynamic_conv2d_relu6 -> @cast_and_call_dynamic_conv2d_relu6,
             @match_dynamic_conv2d_relu6_undemoted -> @cast_and_call_dynamic_conv2d_relu6,
+            @match_dynamic_conv2d_3x3_pad1_relu6 -> @cast_and_call_dynamic_conv2d_pad1_relu6,
+            @match_dynamic_conv2d_3x3_pad1_relu6_undemoted -> @cast_and_call_dynamic_conv2d_pad1_relu6,
+            @match_dynamic_conv2d_3x3_pad1_relu6_s2 -> @cast_and_call_dynamic_conv2d_pad1_relu6_s2,
+            @match_dynamic_conv2d_3x3_pad1_relu6_s2_undemoted -> @cast_and_call_dynamic_conv2d_pad1_relu6_s2,
             @match_dynamic_conv2d_3x3_relu6 -> @cast_and_call_dynamic_conv2d_relu6,
             @match_dynamic_conv2d_3x3_relu6_undemoted -> @cast_and_call_dynamic_conv2d_relu6,
             // Pad-1 depthwise before the unpadded forms; a marked convolution
