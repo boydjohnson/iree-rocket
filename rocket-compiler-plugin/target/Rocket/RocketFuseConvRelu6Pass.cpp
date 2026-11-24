@@ -699,8 +699,10 @@ static bool isTruncfGeneric(linalg::GenericOp op) {
 }
 
 /// Whether this is a dense convolution the fused-epilogue targets exist for:
-/// a 1x1 or 3x3 filter at stride 1 or 2, f16 in, f32 out. The depthwise
-/// forms keep their own matchers and are left to the ReLU6 pattern only.
+/// a 1x1 or 3x3 filter at stride 1 or 2, or the 4x4 stride-1 convolution
+/// `rocket-space-to-depth-stem` folds a 7x7 stride-2 stem into
+/// (@match_dynamic_conv2d_4x4_relu), f16 in, f32 out. The depthwise forms
+/// keep their own matchers and are left to the ReLU6 pattern only.
 static bool isFusableDenseConv(linalg::Conv2DNhwcHwcfOp conv) {
   auto convType = dyn_cast<RankedTensorType>(conv->getResult(0).getType());
   if (!convType || !convType.getElementType().isF32()) {
@@ -715,12 +717,17 @@ static bool isFusableDenseConv(linalg::Conv2DNhwcHwcfOp conv) {
   auto filterType = cast<RankedTensorType>(conv.getDpsInputs()[1].getType());
   int64_t kh = filterType.getDimSize(0);
   int64_t kw = filterType.getDimSize(1);
+  SmallVector<int64_t> strides(conv.getStrides().getValues<int64_t>());
+  if (strides.size() != 2 || strides[0] != strides[1]) {
+    return false;
+  }
+  if (kh == 4 && kw == 4) {
+    return strides[0] == 1;
+  }
   if (!((kh == 1 && kw == 1) || (kh == 3 && kw == 3))) {
     return false;
   }
-  SmallVector<int64_t> strides(conv.getStrides().getValues<int64_t>());
-  return strides.size() == 2 && strides[0] == strides[1] &&
-         (strides[0] == 1 || strides[0] == 2);
+  return strides[0] == 1 || strides[0] == 2;
 }
 
 /// Builds the canonical fused epilogue for `conv`: a clone of the

@@ -1063,6 +1063,32 @@ func.func @fp16_patchify_conv(%image: tensor<1x64x64x3xf32>, %patch: tensor<16x1
   return %p, %d : tensor<1x4x4x128xf32>, tensor<1x16x16x64xf32>
 }
 
+// ResNet's fp16 stem and pool in the importer's NCHW form: a 7x7 stride-2
+// convolution over a padded 3-channel image, then a -inf-padded 3x3 stride-2
+// max pool. rocket-space-to-depth-stem folds the stem into a 4x4 stride-1
+// convolution over 12 channels, and rocket-fold-conv-pad hands the pool's pad
+// to the PPU (the pad1 executable), so the two chain on the NPU.
+func.func @fp16_stem_space_to_depth(%image: tensor<1x3x70x70xf32>, %filter: tensor<64x3x7x7xf32>) -> tensor<1x64x16x16xf32> {
+  %zero = arith.constant 0.000000e+00 : f32
+  %neg_inf = arith.constant 0xFF800000 : f32
+  %c_empty = tensor.empty() : tensor<1x64x32x32xf32>
+  %c_init = linalg.fill ins(%zero : f32) outs(%c_empty : tensor<1x64x32x32xf32>) -> tensor<1x64x32x32xf32>
+  %c = linalg.conv_2d_nchw_fchw {dilations = dense<1> : tensor<2xi64>, strides = dense<2> : tensor<2xi64>}
+      ins(%image, %filter : tensor<1x3x70x70xf32>, tensor<64x3x7x7xf32>)
+      outs(%c_init : tensor<1x64x32x32xf32>) -> tensor<1x64x32x32xf32>
+  %padded = tensor.pad %c low[0, 0, 1, 1] high[0, 0, 1, 1] {
+  ^bb0(%a: index, %b: index, %h: index, %w: index):
+    tensor.yield %neg_inf : f32
+  } : tensor<1x64x32x32xf32> to tensor<1x64x34x34xf32>
+  %p_empty = tensor.empty() : tensor<1x64x16x16xf32>
+  %p_init = linalg.fill ins(%neg_inf : f32) outs(%p_empty : tensor<1x64x16x16xf32>) -> tensor<1x64x16x16xf32>
+  %window = tensor.empty() : tensor<3x3xf32>
+  %p = linalg.pooling_nchw_max {dilations = dense<1> : vector<2xi64>, strides = dense<2> : vector<2xi64>}
+      ins(%padded, %window : tensor<1x64x34x34xf32>, tensor<3x3xf32>)
+      outs(%p_init : tensor<1x64x16x16xf32>) -> tensor<1x64x16x16xf32>
+  return %p : tensor<1x64x16x16xf32>
+}
+
 func.func @requant_int8_chain(%input: tensor<1x8x8x64xi8>, %f1: tensor<1x1x64x64xi8>, %b1: tensor<64xi32>, %f2: tensor<1x1x64x64xi8>, %b2: tensor<64xi32>) -> tensor<1x8x8x64xi8> {
   %a_zero = arith.constant 0 : i32
   %a_scale = arith.constant 2.000000e-02 : f32
@@ -1796,6 +1822,9 @@ def write_compiled_fixture(work_dir: Path) -> None:
     np.save(work_dir / "fp16_matmul_chain_lhs.npy", rng.uniform(-1.0, 1.0, size=(64, 128)).astype(np.float32))
     np.save(work_dir / "fp16_matmul_chain_w1.npy", rng.uniform(-0.25, 0.25, size=(128, 128)).astype(np.float32))
     np.save(work_dir / "fp16_matmul_chain_w2.npy", rng.uniform(-0.25, 0.25, size=(128, 64)).astype(np.float32))
+    stem_rng = np.random.default_rng(20261127)
+    np.save(work_dir / "fp16_stem_space_to_depth_image.npy", stem_rng.uniform(-1.0, 1.0, size=(1, 3, 70, 70)).astype(np.float32))
+    np.save(work_dir / "fp16_stem_space_to_depth_filter.npy", stem_rng.uniform(-0.2, 0.2, size=(64, 3, 7, 7)).astype(np.float32))
     patchify_rng = np.random.default_rng(20261126)
     np.save(work_dir / "fp16_patchify_conv_image.npy", patchify_rng.uniform(-1.0, 1.0, size=(1, 64, 64, 3)).astype(np.float32))
     np.save(work_dir / "fp16_patchify_conv_patch.npy", patchify_rng.uniform(-0.1, 0.1, size=(16, 16, 3, 128)).astype(np.float32))
@@ -1956,6 +1985,7 @@ def compile_modules(
         ("fp16_conv_pool_conv_chain", "rocket_pooling_max_executable_s2"),
         ("fp16_matmul_chain", "rocket_matmul_executable"),
         ("fp16_patchify_conv", "rocket_matmul_executable"),
+        ("fp16_stem_space_to_depth", "rocket_pooling_max_pad1_executable_s2"),
         *PACKED_WEIGHT_CASES,
         ("requant_int8_chain", "rocket_dynamic_int8_requant_executable"),
         ("requant_int8_chain_cpu_between", "rocket_dynamic_int8_requant_executable"),
@@ -2590,6 +2620,16 @@ def run_compiled_gate(
                 "fp16_patchify_conv_down.npy",
             ),
             ("fp16_patchify_conv_patch_out.npy", "fp16_patchify_conv_down_out.npy"),
+            0.05,
+            0.02,
+        ),
+        Case(
+            "fp16_stem_space_to_depth",
+            (
+                "fp16_stem_space_to_depth_image.npy",
+                "fp16_stem_space_to_depth_filter.npy",
+            ),
+            ("fp16_stem_space_to_depth_out_rocket.npy",),
             0.05,
             0.02,
         ),

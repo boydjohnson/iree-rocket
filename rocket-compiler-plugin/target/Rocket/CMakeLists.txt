@@ -85,6 +85,7 @@ set(_ROCKET_SRCS
   "RocketDemoteConvInputsPass.cpp"
   "RocketExpandGemvToMatmulPass.cpp"
   "RocketPatchifyConvPass.cpp"
+  "RocketSpaceToDepthStemPass.cpp"
   "RocketUnbatchMatmulPass.cpp"
   "RocketFoldConvPadPass.cpp"
   "RocketFoldNeutralInitPass.cpp"

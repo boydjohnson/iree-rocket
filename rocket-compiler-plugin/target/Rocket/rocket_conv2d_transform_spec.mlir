@@ -399,6 +399,25 @@
                         "kernel_width", "kernel_height"]
 }>
 
+// #rocket_pooling_max_target_s2 with its padding on the PPU: the -inf pad
+// `rocket-fold-conv-pad` marks on an fp16-path max pool (ResNet's stem pool).
+// The PPU's fp16 max ignores the fill and clamps windows to the image
+// (`fp16_max_pad_fill_probe`), the same answer a -inf pad gives while
+// pad < kernel. Hardware: `padded_max_pooling_matches_oracle`.
+#rocket_pooling_max_pad1_target_s2 = #hal.executable.target<"rocket", "rocket-flatbuffer-v1", {
+  kernel = "pooling",
+  runtime_layout = true,
+  input_width = 0 : i32, input_height = 0 : i32, channels = 0 : i32,
+  output_width = 0 : i32, output_height = 0 : i32,
+  kernel_width = 0 : i32, kernel_height = 0 : i32,
+  stride_x = 2 : i32, stride_y = 2 : i32,
+  pad_left = 1 : i32, pad_top = 1 : i32, pad_right = 1 : i32, pad_bottom = 1 : i32,
+  method = "max",
+  precision = "fp16",
+  runtime_dimensions = ["input_width", "input_height", "channels",
+                        "kernel_width", "kernel_height"]
+}>
+
 #rocket_pooling_max_target_s2 = #hal.executable.target<"rocket", "rocket-flatbuffer-v1", {
   kernel = "pooling",
   runtime_layout = true,
@@ -1179,6 +1198,20 @@ module attributes {transform.with_named_sequence} {
 
   hal.executable private @rocket_pooling_max_int8_pad1_executable_s2 {
     hal.executable.variant public @rocket_pooling_max_v1 target(#rocket_pooling_max_int8_pad1_target_s2) {
+      hal.executable.export public @rocket_pooling_max ordinal(0) layout(#pooling_pipeline_layout) count(%device: !hal.device, %workload: index) -> (index, index, index) {
+        %c1 = arith.constant 1 : index
+        hal.return %c1, %c1, %c1 : index, index, index
+      }
+      builtin.module {
+        func.func @rocket_pooling_max() {
+          return
+        }
+      }
+    }
+  }
+
+  hal.executable private @rocket_pooling_max_pad1_executable_s2 {
+    hal.executable.variant public @rocket_pooling_max_v1 target(#rocket_pooling_max_pad1_target_s2) {
       hal.executable.export public @rocket_pooling_max ordinal(0) layout(#pooling_pipeline_layout) count(%device: !hal.device, %workload: index) -> (index, index, index) {
         %c1 = arith.constant 1 : index
         hal.return %c1, %c1, %c1 : index, index, index
@@ -2481,6 +2514,99 @@ module attributes {transform.with_named_sequence} {
     %layout_i32 = arith.constant 0 : i32
     %pooled = flow.dispatch
         @rocket_pooling_max_executable_s2::@rocket_pooling_max_v1::@rocket_pooling_max(
+          %input_width_i32, %input_height_i32, %channels_i32,
+          %kernel_width_i32, %kernel_height_i32, %layout_i32,
+          %input_f16)
+        {stream.affinity = #hal.device.affinity<@rocket_device>}
+        : (i32, i32, i32, i32, i32, i32,
+           tensor<1x?x?x?xf16>{%input_height, %input_width, %channels})
+        -> tensor<1x?x?x?xf16>{%output_height, %output_width, %channels}
+
+    // Widen back to f32 and fold in the accumulator initialiser: linalg
+    // defines the op as an update of its init (`O += ...`, `O = max(O, ...)`),
+    // so this is exact for any init. A plain generic, not a pre-formed CPU
+    // dispatch: rocket-pin-unclaimed-dispatches keeps it off the NPU, and
+    // rocket-fold-neutral-init drops the init term when it is the neutral
+    // element, leaving a bare extf that fuses with the consumer's truncf
+    // and cancels -- which is what lets the next Rocket dispatch read this
+    // one's output cube in place (ISSUES.md P2).
+    %final_nhwc_empty = tensor.empty(
+        %output_height, %output_width, %channels)
+        : tensor<1x?x?x?xf32>
+    %final_nhwc = linalg.generic {
+        indexing_maps = [
+          affine_map<(d0, d1, d2, d3) -> (d0, d1, d2, d3)>,
+          affine_map<(d0, d1, d2, d3) -> (d0, d1, d2, d3)>,
+          affine_map<(d0, d1, d2, d3) -> (d0, d1, d2, d3)>
+        ],
+        iterator_types = ["parallel", "parallel", "parallel", "parallel"]
+      } ins(%pooled, %init
+          : tensor<1x?x?x?xf16>, tensor<1x?x?x?xf32>)
+        outs(%final_nhwc_empty : tensor<1x?x?x?xf32>) {
+      ^bb0(%pooled_value: f16, %initial: f32, %out: f32):
+        %pooled_f32 = arith.extf %pooled_value : f16 to f32
+        %accumulated = arith.maximumf %pooled_f32, %initial : f32
+        linalg.yield %accumulated : f32
+    } -> tensor<1x?x?x?xf32>
+
+    util.return %final_nhwc : tensor<1x?x?x?xf32>
+  }
+
+  // Max pool, NCHW, stride 1. ONNX imports max pools NCHW, and
+  // iree-preprocessing-convert-conv-to-channels-last does not touch pooling
+  // ops -- verified here: a linalg.pooling_nchw_max survives the spec's
+  // preprocessing unchanged. So this layout needs its own shim rather than
+  // being normalized into the NHWC one above.
+  // The pad-1 twin of @call_rocket_pooling_max_nhwc_s2: %input_5d is the
+  // *unpadded* rank-5 tensor the matched pad read, so the output extents come
+  // from %init, not from the input.
+  util.func private @call_rocket_pooling_max_nhwc_s2_pad1(
+      %input_5d: tensor<1x1x?x?x?xf32>,
+      %window: tensor<?x?xf32>,
+      %init: tensor<1x?x?x?xf32>) -> tensor<1x?x?x?xf32> {
+    // The unpadded channels-last `1x1xHxWxC` tensor the matched pad read;
+    // the PPU pads it (pad 1, the executable's own fields).
+    %input = tensor.collapse_shape %input_5d [[0], [1, 2], [3], [4]]
+        : tensor<1x1x?x?x?xf32> into tensor<1x?x?x?xf32>
+    %c0 = arith.constant 0 : index
+    %c1 = arith.constant 1 : index
+    %c2 = arith.constant 2 : index
+    %c3 = arith.constant 3 : index
+
+    // NHWC: dims 1 and 2 are the spatial extent, dim 3 is channels.
+    %input_height = tensor.dim %input, %c1 : tensor<1x?x?x?xf32>
+    %input_width = tensor.dim %input, %c2 : tensor<1x?x?x?xf32>
+    %channels = tensor.dim %input, %c3 : tensor<1x?x?x?xf32>
+    // The window operand carries no values, only [kh, kw].
+    %kernel_height = tensor.dim %window, %c0 : tensor<?x?xf32>
+    %kernel_width = tensor.dim %window, %c1 : tensor<?x?xf32>
+    %output_height = tensor.dim %init, %c1 : tensor<1x?x?x?xf32>
+    %output_width = tensor.dim %init, %c2 : tensor<1x?x?x?xf32>
+
+    %input_width_i32 = arith.index_cast %input_width : index to i32
+    %input_height_i32 = arith.index_cast %input_height : index to i32
+    %channels_i32 = arith.index_cast %channels : index to i32
+    %kernel_width_i32 = arith.index_cast %kernel_width : index to i32
+    %kernel_height_i32 = arith.index_cast %kernel_height : index to i32
+
+    // The PPU pools in fp16; the model's tensor is f32.
+    %input_f16_empty = tensor.empty(%input_height, %input_width, %channels) : tensor<1x?x?x?xf16>
+    %input_f16 = linalg.generic {
+        indexing_maps = [
+          affine_map<(d0, d1, d2, d3) -> (d0, d1, d2, d3)>,
+          affine_map<(d0, d1, d2, d3) -> (d0, d1, d2, d3)>
+        ],
+        iterator_types = ["parallel", "parallel", "parallel", "parallel"]
+      } ins(%input : tensor<1x?x?x?xf32>)
+        outs(%input_f16_empty : tensor<1x?x?x?xf16>) {
+      ^bb0(%value: f32, %out: f16):
+        %narrowed = arith.truncf %value : f32 to f16
+        linalg.yield %narrowed : f16
+    } -> tensor<1x?x?x?xf16>
+
+    %layout_i32 = arith.constant 0 : i32
+    %pooled = flow.dispatch
+        @rocket_pooling_max_pad1_executable_s2::@rocket_pooling_max_v1::@rocket_pooling_max(
           %input_width_i32, %input_height_i32, %channels_i32,
           %kernel_width_i32, %kernel_height_i32, %layout_i32,
           %input_f16)
@@ -6532,6 +6658,43 @@ module attributes {transform.with_named_sequence} {
     transform.yield %root : !transform.any_op
   }
 
+  // The 4x4 twin of @match_dynamic_conv2d_3x3, for the fp16 7x7 stride-2 stem after
+  // `rocket-space-to-depth-stem` folds it into a 4x4 stride-1 convolution
+  // over 4x the channels. Admission keeps it to that grid (`Cin` <= 16,
+  // `Cout` <= 128).
+  transform.named_sequence @match_dynamic_conv2d_4x4(%root: !transform.any_op {transform.readonly}) -> !transform.any_op {
+    transform.match.operation_name %root ["linalg.conv_2d_nhwc_hwcf"] : !transform.any_op
+    transform.rocket.match.admitted %root : !transform.any_op
+    %batch, %out_img, %out_ch, %filter, %in_ch, %depth, %strides, %dilations =
+        transform.iree.match.convolution %root,
+          lhs_type = f16, rhs_type = f16, output_type = f32
+          : !transform.any_op -> !transform.param<i64>
+    transform.iree.match.dims_equal %batch, [1] : !transform.param<i64>
+    transform.iree.match.dims_equal %out_img, [-1, -1] : !transform.param<i64>
+    transform.iree.match.dims_equal %out_ch, [-1] : !transform.param<i64>
+    transform.iree.match.dims_equal %filter, [4, 4] : !transform.param<i64>
+    transform.iree.match.dims_equal %in_ch, [-1] : !transform.param<i64>
+    transform.iree.match.dims_equal %depth, [] : !transform.param<i64>
+    transform.iree.match.dims_equal %strides, [1, 1] : !transform.param<i64>
+    transform.iree.match.dims_equal %dilations, [1, 1] : !transform.param<i64>
+
+    // The CBUF-split hazard this matcher used to carry is closed (ISSUES.md
+    // C12, 2026-09-08). An early planner granted Cin=256/Cout=256/3x3 a
+    // single coefficient bank at every extent from 26x26 to 48x48 and those
+    // jobs came back all-zero. That was a starved coefficient grant killed
+    // by the watchdog and read as a shape result before C3 existed: forcing
+    // the same 11/1 (or 10/2) back today with ROCKET_CBUF_SPLIT is a device
+    // timeout with the output unwritten, while 9/3 and 8/4 are exact. The
+    // planner has granted the streamed working set -- five banks here, 7/5
+    // at every extent from 20 to 58 -- since streamed_weight_bank_preference
+    // landed, the shape is exact on planck at every one of those extents at
+    // fp16 and int8 under the selectors and dense patterns, and
+    // dense_k3_plan_never_starves_the_streamed_coefficient_working_set pins
+    // the grant on the host. No wire field can force a split, so a compiled
+    // model can only reach ConvPlan::new.
+    transform.yield %root : !transform.any_op
+  }
+
   // Stride-2 counterpart of @match_dynamic_conv2d -- same 1x1 kernel and the
   // same channel bounds (the CBUF-split caveat that used to be cross-referenced
   // here is closed, ISSUES.md C12).
@@ -7102,6 +7265,74 @@ module attributes {transform.with_named_sequence} {
     transform.annotate %module "stream.topology" = %topology_attr : !transform.any_op, !transform.any_param
     %executable = transform.util.import_symbol @rocket_pooling_max_executable_s2 into %module if undefined : (!transform.any_op) -> !transform.any_op
     %func = transform.util.import_symbol @call_rocket_pooling_max_nhwc_s2 into %module if undefined : (!transform.any_op) -> !transform.any_op
+    transform.util.cast_and_call %func(%ins) -> %out after %root {
+          transform.type_conversion.tensor.cast_shape_dynamic_dims
+      } : (!transform.any_op, !transform.any_value, !transform.any_value, !transform.any_op) -> !transform.any_op
+    transform.yield
+  }
+
+  // The fp16-path max pool with its -inf pad marked by `rocket-fold-conv-pad`,
+  // in the rank-5 form a ResNet stem pool arrives in after the channels-last
+  // conversion: pad and pool claimed together, so the PPU pads. Bounded like
+  // @match_pooling_nhwc_max_s2_i8_pad1 on the padded extent; a rank-4 pad has
+  // no twin yet and keeps the CPU pad under @match_pooling_nhwc_max_s2.
+  transform.named_sequence @match_pooling_nhwc_max_s2_pad1(
+      %root: !transform.any_op {transform.readonly})
+      -> (!transform.any_value, !transform.any_value) {
+    transform.match.operation_name %root ["linalg.pooling_nhwc_max"] : !transform.any_op
+    %batch, %out_img, %out_ch, %filter, %in_ch, %depth, %strides, %dilations =
+        transform.iree.match.convolution %root,
+          lhs_type = f32, rhs_type = f32, output_type = f32
+          : !transform.any_op -> !transform.param<i64>
+    transform.iree.match.dims_equal %batch, [1, -1] : !transform.param<i64>
+    transform.iree.match.dims_equal %out_img, [-1, -1] : !transform.param<i64>
+    transform.iree.match.dims_equal %out_ch, [] : !transform.param<i64>
+    transform.iree.match.dims_equal %in_ch, [] : !transform.param<i64>
+    transform.iree.match.dims_equal %depth, [] : !transform.param<i64>
+    transform.iree.match.dims_equal %filter, [-1, -1] : !transform.param<i64>
+    transform.iree.match.dims_equal %strides, [2, 2] : !transform.param<i64>
+    transform.iree.match.dims_equal %dilations, [1, 1] : !transform.param<i64>
+
+    %input_value = transform.get_operand %root[0] : (!transform.any_op) -> !transform.any_value
+    %window_value = transform.get_operand %root[1] : (!transform.any_op) -> !transform.any_value
+    transform.iree.match.dim_bounds %input_value[1], umin = 1, umax = 8192 : !transform.any_value
+    transform.iree.match.dim_bounds %input_value[2], umin = 1, umax = 8192 : !transform.any_value
+    transform.iree.match.dim_bounds %input_value[3], umin = 1, umax = 8192 : !transform.any_value
+    transform.iree.match.dim_bounds %window_value[0], umin = 2, umax = 8 : !transform.any_value
+    transform.iree.match.dim_bounds %window_value[1], umin = 2, umax = 8 : !transform.any_value
+
+    %ins, %outs = transform.iree.match.cast_compatible_dag_from_root %root {
+      ^bb0(%input: tensor<1x1x?x?x?xf32>, %window: tensor<?x?xf32>,
+           %init: tensor<1x?x?x?xf32>):
+        // Self-contained by construction: `rocket-fold-conv-pad` sinks the
+        // fill into the region. The inline constant pins it to -inf.
+        %padded = tensor.pad %input low[0, 0, 1, 1, 0] high[0, 0, 1, 1, 0] {
+          ^bb1(%i0: index, %i1: index, %i2: index, %i3: index, %i4: index):
+            %fill = arith.constant 0xFF800000 : f32
+            tensor.yield %fill : f32
+        } : tensor<1x1x?x?x?xf32> to tensor<1x1x?x?x?xf32>
+        %collapsed = tensor.collapse_shape %padded [[0], [1, 2], [3], [4]]
+            : tensor<1x1x?x?x?xf32> into tensor<1x?x?x?xf32>
+        %pooled = linalg.pooling_nhwc_max
+            {dilations = dense<1> : vector<2xi64>, rocket.pad_left = 1 : i64, rocket.pad_top = 1 : i64, strides = dense<2> : vector<2xi64>}
+            ins(%collapsed, %window : tensor<1x?x?x?xf32>, tensor<?x?xf32>)
+            outs(%init : tensor<1x?x?x?xf32>) -> tensor<1x?x?x?xf32>
+    } : (!transform.any_op) -> (!transform.any_value, !transform.any_value)
+    transform.yield %ins, %outs : !transform.any_value, !transform.any_value
+  }
+
+  transform.named_sequence @cast_and_call_pooling_max_nhwc_s2_pad1(
+      %ins: !transform.any_value {transform.readonly},
+      %out: !transform.any_value {transform.readonly}) {
+    %root = transform.get_defining_op %out : (!transform.any_value) -> !transform.any_op
+    %module = transform.util.get_nearest_symbol_table %root : (!transform.any_op) -> !transform.any_op
+    %topology_attr = transform.param.constant #hal.device.topology<links = [
+        (@rocket_device -> @cpu_device = {transparent_access = true, unified_memory = true}),
+        (@cpu_device -> @rocket_device = {transparent_access = true, unified_memory = true})
+      ]> -> !transform.any_param
+    transform.annotate %module "stream.topology" = %topology_attr : !transform.any_op, !transform.any_param
+    %executable = transform.util.import_symbol @rocket_pooling_max_pad1_executable_s2 into %module if undefined : (!transform.any_op) -> !transform.any_op
+    %func = transform.util.import_symbol @call_rocket_pooling_max_nhwc_s2_pad1 into %module if undefined : (!transform.any_op) -> !transform.any_op
     transform.util.cast_and_call %func(%ins) -> %out after %root {
           transform.type_conversion.tensor.cast_shape_dynamic_dims
       } : (!transform.any_op, !transform.any_value, !transform.any_value, !transform.any_op) -> !transform.any_op
@@ -7951,6 +8182,56 @@ module attributes {transform.with_named_sequence} {
     transform.yield %ins, %outs : !transform.any_value, !transform.any_value
   }
 
+  // The 4x4 twin of @match_dynamic_conv2d_3x3_relu, for the fp16 7x7 stride-2 stem after
+  // `rocket-space-to-depth-stem` folds it into a 4x4 stride-1 convolution
+  // over 4x the channels. Admission keeps it to that grid (`Cin` <= 16,
+  // `Cout` <= 128).
+  transform.named_sequence @match_dynamic_conv2d_4x4_relu(
+      %root: !transform.any_op {transform.readonly})
+      -> (!transform.any_value, !transform.any_value) {
+    transform.match.operation_name %root ["linalg.generic"] : !transform.any_op
+    %conv = transform.get_producer_of_operand %root[0]
+        : (!transform.any_op) -> !transform.any_op
+    transform.match.operation_name %conv ["linalg.conv_2d_nhwc_hwcf"] : !transform.any_op
+    transform.rocket.match.admitted %conv : !transform.any_op
+    %batch, %out_img, %out_ch, %filter, %in_ch, %depth, %strides, %dilations =
+        transform.iree.match.convolution %conv,
+          lhs_type = f16, rhs_type = f16, output_type = f32
+          : !transform.any_op -> !transform.param<i64>
+    transform.iree.match.dims_equal %batch, [1] : !transform.param<i64>
+    transform.iree.match.dims_equal %out_img, [-1, -1] : !transform.param<i64>
+    transform.iree.match.dims_equal %out_ch, [-1] : !transform.param<i64>
+    transform.iree.match.dims_equal %filter, [4, 4] : !transform.param<i64>
+    transform.iree.match.dims_equal %in_ch, [-1] : !transform.param<i64>
+    transform.iree.match.dims_equal %depth, [] : !transform.param<i64>
+    transform.iree.match.dims_equal %strides, [1, 1] : !transform.param<i64>
+    transform.iree.match.dims_equal %dilations, [1, 1] : !transform.param<i64>
+    %ins, %outs = transform.iree.match.cast_compatible_dag_from_root %root {
+      ^bb0(%input: tensor<1x?x?x?xf16>, %weights: tensor<?x?x?x?xf16>,
+           %acc_init: tensor<1x?x?x?xf32>, %bias: tensor<?xf32>,
+           %low: f32,
+           %out_init: tensor<1x?x?x?xf32>):
+        %accumulator = linalg.conv_2d_nhwc_hwcf
+            {dilations = dense<1> : vector<2xi64>, strides = dense<1> : vector<2xi64>}
+            ins(%input, %weights : tensor<1x?x?x?xf16>, tensor<?x?x?x?xf16>)
+            outs(%acc_init : tensor<1x?x?x?xf32>) -> tensor<1x?x?x?xf32>
+        %epilogue = linalg.generic {
+            indexing_maps = [affine_map<(d0, d1, d2, d3) -> (d0, d1, d2, d3)>,
+                             affine_map<(d0, d1, d2, d3) -> (d3)>,
+                             affine_map<(d0, d1, d2, d3) -> ()>,
+                             affine_map<(d0, d1, d2, d3) -> (d0, d1, d2, d3)>],
+            iterator_types = ["parallel", "parallel", "parallel", "parallel"]}
+            ins(%accumulator, %bias, %low : tensor<1x?x?x?xf32>, tensor<?xf32>, f32)
+            outs(%out_init : tensor<1x?x?x?xf32>) {
+          ^bb2(%raw: f32, %channel_bias: f32, %lo: f32, %unused: f32):
+            %biased = arith.addf %raw, %channel_bias : f32
+            %clamped = arith.maximumf %biased, %lo : f32
+            linalg.yield %clamped : f32
+        } -> tensor<1x?x?x?xf32>
+    } : (!transform.any_op) -> (!transform.any_value, !transform.any_value)
+    transform.yield %ins, %outs : !transform.any_value, !transform.any_value
+  }
+
   transform.named_sequence @match_dynamic_conv2d_3x3_relu_demoted(
       %root: !transform.any_op {transform.readonly})
       -> (!transform.any_value, !transform.any_value) {
@@ -7967,6 +8248,56 @@ module attributes {transform.with_named_sequence} {
     transform.iree.match.dims_equal %out_img, [-1, -1] : !transform.param<i64>
     transform.iree.match.dims_equal %out_ch, [-1] : !transform.param<i64>
     transform.iree.match.dims_equal %filter, [3, 3] : !transform.param<i64>
+    transform.iree.match.dims_equal %in_ch, [-1] : !transform.param<i64>
+    transform.iree.match.dims_equal %depth, [] : !transform.param<i64>
+    transform.iree.match.dims_equal %strides, [1, 1] : !transform.param<i64>
+    transform.iree.match.dims_equal %dilations, [1, 1] : !transform.param<i64>
+    %ins, %outs = transform.iree.match.cast_compatible_dag_from_root %root {
+      ^bb0(%input: tensor<1x?x?x?xf16>, %weights: tensor<?x?x?x?xf16>,
+           %acc_init: tensor<1x?x?x?xf32>, %bias: tensor<?xf32>,
+           %low: f32,
+           %out_init: tensor<1x?x?x?xf32>):
+        %accumulator = linalg.conv_2d_nhwc_hwcf
+            {dilations = dense<1> : vector<2xi64>, rocket.f16_demoted, strides = dense<1> : vector<2xi64>}
+            ins(%input, %weights : tensor<1x?x?x?xf16>, tensor<?x?x?x?xf16>)
+            outs(%acc_init : tensor<1x?x?x?xf32>) -> tensor<1x?x?x?xf32>
+        %epilogue = linalg.generic {
+            indexing_maps = [affine_map<(d0, d1, d2, d3) -> (d0, d1, d2, d3)>,
+                             affine_map<(d0, d1, d2, d3) -> (d3)>,
+                             affine_map<(d0, d1, d2, d3) -> ()>,
+                             affine_map<(d0, d1, d2, d3) -> (d0, d1, d2, d3)>],
+            iterator_types = ["parallel", "parallel", "parallel", "parallel"]}
+            ins(%accumulator, %bias, %low : tensor<1x?x?x?xf32>, tensor<?xf32>, f32)
+            outs(%out_init : tensor<1x?x?x?xf32>) {
+          ^bb2(%raw: f32, %channel_bias: f32, %lo: f32, %unused: f32):
+            %biased = arith.addf %raw, %channel_bias : f32
+            %clamped = arith.maximumf %biased, %lo : f32
+            linalg.yield %clamped : f32
+        } -> tensor<1x?x?x?xf32>
+    } : (!transform.any_op) -> (!transform.any_value, !transform.any_value)
+    transform.yield %ins, %outs : !transform.any_value, !transform.any_value
+  }
+
+  // The 4x4 twin of @match_dynamic_conv2d_3x3_relu_demoted, for the fp16 7x7 stride-2 stem after
+  // `rocket-space-to-depth-stem` folds it into a 4x4 stride-1 convolution
+  // over 4x the channels. Admission keeps it to that grid (`Cin` <= 16,
+  // `Cout` <= 128).
+  transform.named_sequence @match_dynamic_conv2d_4x4_relu_demoted(
+      %root: !transform.any_op {transform.readonly})
+      -> (!transform.any_value, !transform.any_value) {
+    transform.match.operation_name %root ["linalg.generic"] : !transform.any_op
+    %conv = transform.get_producer_of_operand %root[0]
+        : (!transform.any_op) -> !transform.any_op
+    transform.match.operation_name %conv ["linalg.conv_2d_nhwc_hwcf"] : !transform.any_op
+    transform.rocket.match.admitted %conv : !transform.any_op
+    %batch, %out_img, %out_ch, %filter, %in_ch, %depth, %strides, %dilations =
+        transform.iree.match.convolution %conv,
+          lhs_type = f16, rhs_type = f16, output_type = f32
+          : !transform.any_op -> !transform.param<i64>
+    transform.iree.match.dims_equal %batch, [1] : !transform.param<i64>
+    transform.iree.match.dims_equal %out_img, [-1, -1] : !transform.param<i64>
+    transform.iree.match.dims_equal %out_ch, [-1] : !transform.param<i64>
+    transform.iree.match.dims_equal %filter, [4, 4] : !transform.param<i64>
     transform.iree.match.dims_equal %in_ch, [-1] : !transform.param<i64>
     transform.iree.match.dims_equal %depth, [] : !transform.param<i64>
     transform.iree.match.dims_equal %strides, [1, 1] : !transform.param<i64>
@@ -10657,8 +10988,17 @@ module attributes {transform.with_named_sequence} {
     %patchified_funcs = transform.apply_registered_pass
         "rocket-patchify-conv-to-matmul" to %max_pool_funcs
       : (!transform.any_op) -> !transform.any_op
+    // The fp16 7x7 stride-2 image stem at `Cin` <= 4 runs slowly on the
+    // CNA's dense image path (~4 ms vs ~2 ms on the CPU); folded 2x2 into
+    // channels it is a 4x4 stride-1 convolution over 4x the channels, which
+    // @match_dynamic_conv2d_4x4(_relu) claims (1.5 ms). Float only -- the
+    // int8 stem has its own requantized path -- and before record/demote/
+    // plan, like the patchify rewrite above.
+    %stem_funcs = transform.apply_registered_pass
+        "rocket-space-to-depth-stem" to %patchified_funcs
+      : (!transform.any_op) -> !transform.any_op
     %gemv_funcs = transform.apply_registered_pass
-        "rocket-expand-gemv-to-matmul" to %patchified_funcs
+        "rocket-expand-gemv-to-matmul" to %stem_funcs
       : (!transform.any_op) -> !transform.any_op
 
     // Splits a static-batch `linalg.batch_matmul` into one `linalg.matmul`
@@ -10801,6 +11141,8 @@ module attributes {transform.with_named_sequence} {
             @match_dynamic_conv2d_relu_demoted -> @cast_and_call_dynamic_conv2d_relu,
             @match_dynamic_conv2d_3x3_relu -> @cast_and_call_dynamic_conv2d_relu,
             @match_dynamic_conv2d_3x3_relu_demoted -> @cast_and_call_dynamic_conv2d_relu,
+            @match_dynamic_conv2d_4x4_relu -> @cast_and_call_dynamic_conv2d_relu,
+            @match_dynamic_conv2d_4x4_relu_demoted -> @cast_and_call_dynamic_conv2d_relu,
             @match_dynamic_conv2d_relu_s2 -> @cast_and_call_dynamic_conv2d_relu_s2,
             @match_dynamic_conv2d_relu_demoted_s2 -> @cast_and_call_dynamic_conv2d_relu_s2,
             @match_dynamic_conv2d_3x3_relu_s2 -> @cast_and_call_dynamic_conv2d_relu_s2,
@@ -10920,6 +11262,7 @@ module attributes {transform.with_named_sequence} {
             @match_pooling_nchw_sum_avg_f16 -> @cast_and_call_pooling_avg_nchw_f16,
             @match_pooling_nhwc_sum_avg -> @cast_and_call_pooling_avg_nhwc,
             @match_pooling_nhwc_max -> @cast_and_call_pooling_max_nhwc,
+            @match_pooling_nhwc_max_s2_pad1 -> @cast_and_call_pooling_max_nhwc_s2_pad1,
             @match_pooling_nhwc_max_s2 -> @cast_and_call_pooling_max_nhwc_s2,
             @match_pooling_nhwc_max_s2_i8_pad1 -> @cast_and_call_pooling_max_nhwc_s2_i8_pad1,
             @match_pooling_nhwc_max_s2_i8 -> @cast_and_call_pooling_max_nhwc_s2_i8,
@@ -10930,6 +11273,7 @@ module attributes {transform.with_named_sequence} {
             @match_rocket_matmul -> @cast_and_call_rocket_matmul,
             @match_dynamic_conv2d -> @cast_and_call_dynamic_conv2d,
             @match_dynamic_conv2d_3x3 -> @cast_and_call_dynamic_conv2d,
+            @match_dynamic_conv2d_4x4 -> @cast_and_call_dynamic_conv2d,
             @match_dynamic_conv2d_s2 -> @cast_and_call_dynamic_conv2d_s2,
             @match_dynamic_conv2d_3x3_s2 -> @cast_and_call_dynamic_conv2d_s2,
             @match_dynamic_depthwise_conv2d -> @cast_and_call_dynamic_depthwise_conv2d,

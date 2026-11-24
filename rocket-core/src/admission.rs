@@ -321,10 +321,25 @@ pub fn conv_ceilings(
         // (ABAB, cpu 4-7, both oracle-correct). The stem takes ~3.4 ms of
         // NPU time plus ~0.9 ms compaction per inference: at `Cin` 3 the CNA
         // runs on its dense image path and most of the MAC array idles.
-        // A space-to-depth rewrite (7x7 s2 over 3 channels as 4x4 s1 over
-        // 12) would be the way to make it pay; nothing has tried it. Stride
-        // 1 at 7x7 has no matcher and no entry here; nothing measured needs
-        // it.
+        // So the fp16 stem reaches the NPU another way:
+        // `rocket-space-to-depth-stem` folds it into the 4x4 stride-1
+        // convolution admitted below. Stride 1 at 7x7 has no matcher and no
+        // entry here; nothing measured needs it.
+        // **The fp16 7x7 stem after `rocket-space-to-depth-stem`**: a 4x4
+        // stride-1 convolution over the image folded 2x2 into channels --
+        // `Cin` 4, 8, 12 or 16 for an image of 1 to 4 channels. Exact at
+        // 115x115 `Cin` 12 for `Cout` 32/64/128 under every pattern, 1.5 ms
+        // per dispatch against 4.0 ms for the direct stem
+        // (`stem_space_to_depth_4x4_matches_oracle`). With the stem pool's
+        // pad on the PPU so the two chain, ResNet50-224 fp16 55.3 -> 52.3 ms
+        // (ISSUES.md "fp16 stem on the NPU by space-to-depth"). Nothing else
+        // in a measured model is a 4x4 stride-1 convolution, so the grid is
+        // the stem's.
+        (PrecisionClass::Fp16, false, 4) if stride == 1 => Some(ChannelCeilings {
+            in_channels: 16,
+            out_channels: 128,
+            min_out_channels: 1,
+        }),
         (PrecisionClass::Int8Accumulator, false, 7) if stride == 2 => {
             ceilings(conv::MAX_DENSE_CHANNELS, 128)
         }
@@ -555,6 +570,18 @@ mod tests {
             in_channels: cin,
             out_channels: cout,
         }
+    }
+
+    /// The space-to-depth stem's 4x4 stride-1 convolution is admitted at fp16
+    /// over the folded image's channel counts, and nowhere else.
+    #[test]
+    fn space_to_depth_stem_is_admitted_at_fp16() {
+        assert!(admit_conv(&conv(Precision::Fp16, false, 4, 1, 12, 64)).is_ok());
+        assert!(admit_conv(&conv(Precision::Fp16, false, 4, 1, 16, 128)).is_ok());
+        assert!(admit_conv(&conv(Precision::Fp16, false, 4, 1, 32, 64)).is_err());
+        assert!(admit_conv(&conv(Precision::Fp16, false, 4, 1, 12, 256)).is_err());
+        assert!(admit_conv(&conv(Precision::Fp16, false, 4, 2, 12, 64)).is_err());
+        assert!(admit_conv(&conv(int8(true), false, 4, 1, 12, 64)).is_err());
     }
 
     /// The 7x7 stride-2 stem is admitted on the dense path at both int8

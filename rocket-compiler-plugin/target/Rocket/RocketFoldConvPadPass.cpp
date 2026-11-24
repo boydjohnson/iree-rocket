@@ -90,6 +90,7 @@
 #include "mlir/Pass/Pass.h"
 #include "mlir/Transforms/GreedyPatternRewriteDriver.h"
 
+#include <optional>
 #include <type_traits>
 
 namespace mlir::iree_compiler::IREE::HAL {
@@ -396,6 +397,180 @@ struct MarkPaddedInt8MaxPool
   }
 };
 
+/// A symmetric spatial -inf pad a float max pool can hand to the PPU: the
+/// NHWC tensor the pool reads, traced through the rank-5 `1x1xHxWxC`
+/// channels-last form's `collapse_shape` when present.
+struct FloatPoolPad {
+  tensor::PadOp pad;
+  int64_t height;
+  int64_t width;
+};
+
+/// Matches `source` (an NHWC pool input) against a -inf pad below `window`
+/// and within the PPU's 3-bit pad fields.
+static std::optional<FloatPoolPad> matchFloatPoolPad(Value source,
+                                                     RankedTensorType window) {
+  if (!window || window.getRank() != 2 || window.isDynamicDim(0) ||
+      window.isDynamicDim(1)) {
+    return std::nullopt;
+  }
+  int64_t shift = 0;
+  if (auto collapse = source.getDefiningOp<tensor::CollapseShapeOp>()) {
+    source = collapse.getSrc();
+    shift = 1;
+  }
+  auto pad = source.getDefiningOp<tensor::PadOp>();
+  if (!pad) {
+    return std::nullopt;
+  }
+  auto padType = cast<RankedTensorType>(pad.getResult().getType());
+  if (padType.getRank() != 4 + shift ||
+      !isa<FloatType>(padType.getElementType())) {
+    return std::nullopt;
+  }
+  ArrayRef<int64_t> low = pad.getStaticLow();
+  ArrayRef<int64_t> high = pad.getStaticHigh();
+  if (!pad.getLow().empty() || !pad.getHigh().empty() ||
+      low.size() != high.size()) {
+    return std::nullopt;
+  }
+  const int64_t spatial[2] = {1 + shift, 2 + shift};
+  for (int64_t dim = 0, rank = low.size(); dim < rank; ++dim) {
+    bool isSpatial = llvm::is_contained(spatial, dim);
+    if (low[dim] != high[dim] || (!isSpatial && low[dim] != 0)) {
+      return std::nullopt;
+    }
+  }
+  int64_t height = low[spatial[0]];
+  int64_t width = low[spatial[1]];
+  if ((height == 0 && width == 0) || height > kMaxPoolPad ||
+      width > kMaxPoolPad || height >= window.getDimSize(0) ||
+      width >= window.getDimSize(1)) {
+    return std::nullopt;
+  }
+  auto yield = dyn_cast<tensor::YieldOp>(pad.getRegion().front().getTerminator());
+  APFloat fill(0.0f);
+  if (!yield || !matchPattern(yield.getValue(), m_ConstantFloat(&fill)) ||
+      !fill.isInfinity() || !fill.isNegative()) {
+    return std::nullopt;
+  }
+  return FloatPoolPad{pad, height, width};
+}
+
+/// The fp16 path's max pool: an f32 `pooling_nhwc_max` reading a symmetric
+/// spatial pad filled with -inf, either directly or -- as a ResNet stem
+/// arrives after the channels-last conversion -- through the rank-5
+/// `1x1xHxWxC` pad and a `collapse_shape`. Marked the same way, so
+/// @match_pooling_nhwc_max_s2_pad1 can hand the padding to the PPU.
+///
+/// The PPU's max ignores its pad fill at fp16 and clamps every window to the
+/// image (`fp16_max_pad_fill_probe` in iree-rocket-hal), and a -inf pad never
+/// wins a max either, so the two agree exactly wherever every window holds
+/// an image pixel -- pad < kernel, checked here. The PPU's pad fields are 3
+/// bits.
+struct MarkPaddedFloatMaxPool
+    : public OpRewritePattern<linalg::PoolingNhwcMaxOp> {
+  MarkPaddedFloatMaxPool(MLIRContext *context,
+                         llvm::SetVector<Operation *> *claimed)
+      : OpRewritePattern<linalg::PoolingNhwcMaxOp>(context),
+        claimed(claimed) {}
+
+  llvm::SetVector<Operation *> *claimed;
+
+  LogicalResult matchAndRewrite(linalg::PoolingNhwcMaxOp pool,
+                                PatternRewriter &rewriter) const override {
+    if (pool->hasAttr(kPadTopAttrName)) {
+      return failure();
+    }
+    auto inputType =
+        dyn_cast<RankedTensorType>(pool.getDpsInputs()[0].getType());
+    if (!inputType || !isa<FloatType>(inputType.getElementType())) {
+      return failure();
+    }
+    std::optional<FloatPoolPad> found = matchFloatPoolPad(
+        pool.getDpsInputs()[0],
+        dyn_cast<RankedTensorType>(pool.getDpsInputs()[1].getType()));
+    if (!found) {
+      return failure();
+    }
+    claimed->insert(found->pad);
+    rewriter.modifyOpInPlace(pool, [&] {
+      pool->setAttr(kPadTopAttrName, rewriter.getI64IntegerAttr(found->height));
+      pool->setAttr(kPadLeftAttrName, rewriter.getI64IntegerAttr(found->width));
+    });
+    return success();
+  }
+};
+
+/// The same pool as the ONNX importer leaves it: `pooling_nchw_max` over a
+/// `[0, 3, 1, 2]` transpose of that padded NHWC tensor (the channels-last
+/// conversion moves convolutions, not pools). Rewritten to the NHWC pool on
+/// the NHWC tensor -- marked like the one above -- and a transpose of its
+/// result back to NCHW, which cancels against the transpose to NHWC the
+/// next convolution starts with. Only pools whose pad the PPU can take are
+/// touched; every other NCHW pool keeps its own matcher.
+struct MarkPaddedFloatNchwMaxPool
+    : public OpRewritePattern<linalg::PoolingNchwMaxOp> {
+  MarkPaddedFloatNchwMaxPool(MLIRContext *context,
+                             llvm::SetVector<Operation *> *claimed)
+      : OpRewritePattern<linalg::PoolingNchwMaxOp>(context),
+        claimed(claimed) {}
+
+  llvm::SetVector<Operation *> *claimed;
+
+  LogicalResult matchAndRewrite(linalg::PoolingNchwMaxOp pool,
+                                PatternRewriter &rewriter) const override {
+    auto transpose = pool.getDpsInputs()[0].getDefiningOp<linalg::TransposeOp>();
+    if (!transpose ||
+        transpose.getPermutation() != ArrayRef<int64_t>{0, 3, 1, 2}) {
+      return failure();
+    }
+    Value nhwc = transpose.getInput();
+    auto nhwcType = dyn_cast<RankedTensorType>(nhwc.getType());
+    auto windowType =
+        dyn_cast<RankedTensorType>(pool.getDpsInputs()[1].getType());
+    auto initType = dyn_cast<RankedTensorType>(pool.getDpsInits()[0].getType());
+    if (!nhwcType || !isa<FloatType>(nhwcType.getElementType()) ||
+        !initType || !initType.hasStaticShape()) {
+      return failure();
+    }
+    std::optional<FloatPoolPad> found = matchFloatPoolPad(nhwc, windowType);
+    if (!found) {
+      return failure();
+    }
+    // The init is a -inf fill (the reduction's identity); rebuild it NHWC.
+    auto fill = pool.getDpsInits()[0].getDefiningOp<linalg::FillOp>();
+    APFloat initValue(0.0f);
+    if (!fill || !matchPattern(fill.getInputs()[0], m_ConstantFloat(&initValue)) ||
+        !initValue.isInfinity() || !initValue.isNegative()) {
+      return failure();
+    }
+    Location loc = pool.getLoc();
+    SmallVector<int64_t> nhwcOut = {initType.getDimSize(0),
+                                    initType.getDimSize(2),
+                                    initType.getDimSize(3),
+                                    initType.getDimSize(1)};
+    Value empty = tensor::EmptyOp::create(rewriter, loc, nhwcOut,
+                                          initType.getElementType());
+    Value init = linalg::FillOp::create(rewriter, loc,
+                                        ValueRange{fill.getInputs()[0]},
+                                        ValueRange{empty})
+                     .getResult(0);
+    auto nhwcPool = linalg::PoolingNhwcMaxOp::create(
+        rewriter, loc, TypeRange{init.getType()},
+        ValueRange{nhwc, pool.getDpsInputs()[1]}, ValueRange{init},
+        pool.getStridesAttr(), pool.getDilationsAttr());
+    nhwcPool->setAttr(kPadTopAttrName, rewriter.getI64IntegerAttr(found->height));
+    nhwcPool->setAttr(kPadLeftAttrName, rewriter.getI64IntegerAttr(found->width));
+    claimed->insert(found->pad);
+    Value back = tensor::EmptyOp::create(rewriter, loc, initType.getShape(),
+                                         initType.getElementType());
+    rewriter.replaceOpWithNewOp<linalg::TransposeOp>(
+        pool, nhwcPool.getResult(0), back, ArrayRef<int64_t>{0, 3, 1, 2});
+    return success();
+  }
+};
+
 struct RocketFoldConvPadPass
     : public PassWrapper<RocketFoldConvPadPass, OperationPass<>> {
   MLIR_DEFINE_EXPLICIT_INTERNAL_INLINE_TYPE_ID(RocketFoldConvPadPass)
@@ -424,7 +599,8 @@ struct RocketFoldConvPadPass
     patterns.add<MarkPaddedConv<linalg::Conv2DNhwcHwcfOp, 1, 2>,
                  MarkPaddedConv<linalg::DepthwiseConv2DNhwcHwcOp, 1, 2>,
                  MarkPaddedConv<linalg::DepthwiseConv2DNchwChwOp, 2, 3>,
-                 MarkPaddedInt8MaxPool>(context, &claimed);
+                 MarkPaddedInt8MaxPool, MarkPaddedFloatMaxPool,
+                 MarkPaddedFloatNchwMaxPool>(context, &claimed);
     if (failed(applyPatternsGreedily(getOperation(), std::move(patterns)))) {
       return signalPassFailure();
     }
@@ -437,6 +613,15 @@ struct RocketFoldConvPadPass
           cast<tensor::YieldOp>(pad.getRegion().front().getTerminator());
       Operation *fill = yield.getValue().getDefiningOp();
       if (fill && fill->getBlock() == &pad.getRegion().front()) {
+        continue;
+      }
+      // A max pool's -inf (or any constant fill a pattern above verified)
+      // is sunk as itself.
+      if (auto constant = dyn_cast_or_null<arith::ConstantOp>(fill)) {
+        OpBuilder builder(yield);
+        Value sunk = arith::ConstantOp::create(builder, pad.getLoc(),
+                                               constant.getValue());
+        yield.getValueMutable().assign(sunk);
         continue;
       }
       Type elementType =
