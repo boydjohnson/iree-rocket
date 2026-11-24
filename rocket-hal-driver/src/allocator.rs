@@ -8,8 +8,6 @@
 
 use std::os::fd::AsRawFd;
 
-use iree_rocket_hal::rocket::device;
-
 use crate::{
     bindings::{
         iree_allocator_t, iree_device_size_t, iree_hal_allocator_memory_heap_t,
@@ -57,6 +55,10 @@ pub struct RocketAllocator {
     /// allocator has to exist before that pointer does, since it's one of
     /// the fields used to construct `RocketDevice` in the first place).
     pub device: *mut crate::bindings::iree_hal_device_t,
+    /// Freed buffers' GEM objects, for reuse by the next allocation of the
+    /// same size (`buffer_cache.rs`). Shared with every buffer, which gives
+    /// its allocation back here in `buffer::destroy`.
+    pub cache: std::sync::Arc<crate::buffer_cache::BufferCache>,
 }
 
 /// Mirrors `iree_hal_null_allocator_create()`. Not called from anywhere
@@ -69,6 +71,7 @@ pub fn create(file: std::fs::File, host_allocator: iree_allocator_t) -> *mut ire
             vtable: &VTABLE as *const _ as *const std::ffi::c_void,
         },
         host_allocator,
+        cache: std::sync::Arc::new(crate::buffer_cache::BufferCache::new(file.as_raw_fd())),
         file,
         device: std::ptr::null_mut(),
     });
@@ -98,9 +101,11 @@ unsafe extern "C" fn destroy(allocator: *mut iree_hal_allocator_t) {
     // kernel then cleans up any handles still outstanding as a backstop.
     // Normal HAL buffers and driver-private owned buffers close their GEM
     // handles eagerly when their own lifetimes end.
-    unsafe {
-        drop(Box::from_raw(cast(allocator)));
-    }
+    let allocator = unsafe { Box::from_raw(cast(allocator)) };
+    // Idle cached allocations are closed on the file they were made on,
+    // while it is still open. A buffer outliving this frees its own.
+    allocator.cache.close();
+    drop(allocator);
 }
 
 unsafe extern "C" fn host_allocator(allocator: *const iree_hal_allocator_t) -> iree_allocator_t {
@@ -232,9 +237,10 @@ unsafe extern "C" fn allocate_buffer(
     // ENOSPC (drm_mm_insert_node_generic can't place a zero-length node),
     // and even if it didn't, iree_rocket_hal's own Buffer::new immediately
     // follows with `NonZeroUsize::new(size).unwrap()` for the mmap length,
-    // which panics on exactly this input.
+    // which panics on exactly this input. (`BufferCache::take` rounds up to
+    // whole pages besides, and may hand back a freed buffer of that size.)
     let real_size = allocation_size.max(4);
-    let raw = unsafe { device::Buffer::new(alloc.file.as_raw_fd(), real_size, &alloc.file) };
+    let raw = unsafe { alloc.cache.take(real_size, &alloc.file) };
 
     let buffer = Box::new(RocketBuffer {
         // Filled in by iree_hal_buffer_initialize below -- this is just
@@ -249,9 +255,9 @@ unsafe extern "C" fn allocate_buffer(
         deallocated: std::sync::atomic::AtomicBool::new(false),
         generation: crate::weight_cache::Generation::default(),
         synced_generation: std::sync::atomic::AtomicU64::new(u64::MAX),
-        // CREATE_BO backs a GEM object of whole pages; 4 KiB is the smallest
-        // page this kernel can use, so this never overstates the mapping.
-        mapped_bytes: raw.size.next_multiple_of(4096),
+        // `BufferCache::take` allocates and maps whole pages.
+        mapped_bytes: raw.size,
+        cache: std::sync::Arc::clone(&alloc.cache),
     });
     let buffer_ptr = Box::into_raw(buffer);
 

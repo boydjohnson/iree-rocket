@@ -1911,6 +1911,60 @@ What was settled and how, newest first, in place of the narratives — those are
 in this file's git history (`git log -p ISSUES.md`). Everything cited below is
 something that still exists: a commit, a file, or a memory.
 
+**P9 (S2) — 2026-11-23. Every IREE transient was a fresh GEM object,
+created and freed on every inference; reusing them makes ResNet50-224 int8
+1.46x faster and MobileNetV2 fp16 1.63x.** Found from a C17 diagnostic: growing
+every `allocate_buffer` GEM object by >= 4 KiB took ResNet50 int8 from ~94 to
+~78 ms, bit-identically. That was a leak, not a fast path. `buffer::destroy`
+munmapped `base.allocation_size` (IREE's size), so the slack's tail page stayed
+mapped, the VMA held the GEM object, and no IREE buffer was ever freed. Slack
+plus a munmap of the true length measured 94.6 ms, and under `ROCKET_PROFILE`
+the leaking arm died in `CREATE_BO` with `ENOSPC`. (The C17 staging decision,
+which the slack also flips for the stem input, was ruled out with an arm that
+kept `mapped_bytes` unslacked: the same 77.5 ms.)
+
+- **What the leak skipped.** ResNet50 int8 makes ~85 `queue_alloca`s per
+  inference (~20 MB). A trace over 30 inferences: `CREATE_BO` 14.6 ms,
+  `GEM_CLOSE` 18 ms (~0.78 us per KiB: 2.4 ms for a 3.2 MB tensor) and
+  `munmap` 2 ms per inference, plus a first-touch fault per page. In the
+  profile it is all `outside` (1.08 -> 0.76 ms per gap); `execute`,
+  `wait.npu` and `compact` did not move. `replace_device_allocator` is a stub
+  and `queue_alloca` calls the device allocator directly, so IREE's
+  `--device_allocator=caching` could not reach it.
+- **Fix.** `rocket-hal-driver/src/buffer_cache.rs`: a free list per allocator,
+  keyed on the exact page-rounded size (no size classes: `fini_bo` walks every
+  page an IREE buffer has, and those are synced far more often than scratch).
+  `buffer::destroy` returns the GEM object to it. A buffer that outlives its
+  allocator finds the cache closed and frees itself, now by the mapping's real
+  length. Nothing a buffer held in a previous life is visible: IREE promises
+  no zero fill, `weight_cache::forget` still runs in `destroy`, constant-sync
+  state lives on the new `RocketBuffer`, and every job's output is
+  `prep_bo`-synced after the job. `ROCKET_BUFFER_CACHE=0` restores
+  allocate-and-free, `ROCKET_BUFFER_CACHE_MB` sets the budget (default 256),
+  and `ROCKET_PROFILE` reports `buffer cache: N reused, M allocated`.
+- **Checked.** All seven board models are bit-identical to their C17
+  references on three back-to-back invocations in one process (a wrapper
+  module that imports `module.main_graph` and calls it three times; one
+  `iree-run-module` call reuses only 7 buffers), at one NPU context and at
+  three, with 0 timeouts. Rocket CTS identical both ways: the same 8
+  pre-existing queue failures. The `iree-rocket-hal` gate does not link the
+  HAL driver, so it cannot see this change and was not re-run.
+- **Measured.** 600 MHz, medians of 15 repetitions, ABBA (off on on off):
+
+| model | cpu 4-7 off -> on (ms) | cpu 0-7 off -> on (ms) |
+|---|---|---|
+| ResNet50 int8 (stem) | 96.8 -> 64.8 | 84.6 -> 61.0 |
+| ResNet50 int8 (pre-stem) | 179 -> 146 | 170.5 -> 160.5 |
+| ResNet50 fp16 | 46.4 -> 42.5 | 49.6 -> 46.3 |
+| ResNet50 fp16 (stem) | 46.9 -> 41.7 | 48.5 -> 45.7 |
+| MobileNetV2 fp16 | 58.5 -> 36.0 | 53.1 -> 40.5 |
+| MobileNetV2 int8 | 56.0 -> 41.1 | 52.8 -> 44.2 |
+| Wide ResNet50-2 fp16 | 121 -> 107 | 116 -> 108.5 |
+
+`run_after_wait` still spawns a thread per `queue_dealloca` (P8, "284 threads
+per inference"); the free now costs a mutex on that thread instead of a
+`GEM_CLOSE`.
+
 **C17 (S1) — 2026-11-23. The dense (ARGB, `Cin <= 4`) feature DMA reads past
 the end of its input; when the page there is unmapped the job hangs, and on
 Armbian's stock reset path that can corrupt kernel memory.** Found validating

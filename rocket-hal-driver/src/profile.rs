@@ -552,6 +552,10 @@ pub fn report() {
     if reused + allocated > 0 {
         eprintln!("  scratch pool: {reused} reused, {allocated} allocated");
     }
+    let (reused, allocated) = crate::buffer_cache::stats();
+    if reused + allocated > 0 {
+        eprintln!("  buffer cache: {reused} reused, {allocated} allocated");
+    }
 
     let elided = crate::command_buffer::ELIDED_COMPACTIONS.load(Ordering::Relaxed);
     if elided > 0 {
