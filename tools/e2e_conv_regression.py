@@ -1089,6 +1089,21 @@ func.func @fp16_stem_space_to_depth(%image: tensor<1x3x70x70xf32>, %filter: tens
   return %p : tensor<1x64x16x16xf32>
 }
 
+// ConvNeXt's 7x7 stride-1 depthwise convolution, f32 as an ONNX import
+// leaves it: rocket-demote-conv-inputs-to-f16 demotes a 7x7 depthwise by
+// default (the 3x3 ones stay behind ROCKET_DEMOTE_DEPTHWISE), and
+// @match_dynamic_depthwise_conv2d_nchw_7x7 claims it.
+func.func @fp16_depthwise_7x7(%input: tensor<1x96x20x20xf32>, %filter: tensor<96x7x7xf32>) -> tensor<1x96x14x14xf32> {
+  %zero = arith.constant 0.000000e+00 : f32
+  %empty = tensor.empty() : tensor<1x96x14x14xf32>
+  %init = linalg.fill ins(%zero : f32) outs(%empty : tensor<1x96x14x14xf32>) -> tensor<1x96x14x14xf32>
+  %out = linalg.depthwise_conv_2d_nchw_chw
+      {dilations = dense<1> : vector<2xi64>, strides = dense<1> : vector<2xi64>}
+      ins(%input, %filter : tensor<1x96x20x20xf32>, tensor<96x7x7xf32>)
+      outs(%init : tensor<1x96x14x14xf32>) -> tensor<1x96x14x14xf32>
+  return %out : tensor<1x96x14x14xf32>
+}
+
 func.func @requant_int8_chain(%input: tensor<1x8x8x64xi8>, %f1: tensor<1x1x64x64xi8>, %b1: tensor<64xi32>, %f2: tensor<1x1x64x64xi8>, %b2: tensor<64xi32>) -> tensor<1x8x8x64xi8> {
   %a_zero = arith.constant 0 : i32
   %a_scale = arith.constant 2.000000e-02 : f32
@@ -1833,6 +1848,9 @@ def write_compiled_fixture(work_dir: Path) -> None:
     np.save(work_dir / "fp16_patchify_conv_feature.npy", patchify_rng.uniform(-1.0, 1.0, size=(1, 33, 33, 32)).astype(np.float32))
     np.save(work_dir / "fp16_patchify_conv_down.npy", patchify_rng.uniform(-0.25, 0.25, size=(2, 2, 32, 64)).astype(np.float32))
 
+    depthwise7_rng = np.random.default_rng(20261130)
+    np.save(work_dir / "fp16_depthwise_7x7_input.npy", depthwise7_rng.uniform(-1.0, 1.0, size=(1, 96, 20, 20)).astype(np.float32))
+    np.save(work_dir / "fp16_depthwise_7x7_filter.npy", depthwise7_rng.uniform(-0.25, 0.25, size=(96, 7, 7)).astype(np.float32))
     grouped_rng = np.random.default_rng(20261129)
     np.save(work_dir / "fp16_grouped_conv_input.npy", grouped_rng.uniform(-1.0, 1.0, size=(1, 64, 18, 18)).astype(np.float32))
 
@@ -2010,6 +2028,7 @@ def compile_modules(
         ("fp16_patchify_conv", "rocket_matmul_executable"),
         ("fp16_stem_space_to_depth", "rocket_pooling_max_pad1_executable_s2"),
         ("fp16_grouped_conv", "rocket_dynamic_executable"),
+        ("fp16_depthwise_7x7", "rocket_dynamic_depthwise_executable"),
         *PACKED_WEIGHT_CASES,
         ("requant_int8_chain", "rocket_dynamic_int8_requant_executable"),
         ("requant_int8_chain_cpu_between", "rocket_dynamic_int8_requant_executable"),
@@ -2692,6 +2711,13 @@ def run_compiled_gate(
                 "fp16_stem_space_to_depth_filter.npy",
             ),
             ("fp16_stem_space_to_depth_out_rocket.npy",),
+            0.05,
+            0.02,
+        ),
+        Case(
+            "fp16_depthwise_7x7",
+            ("fp16_depthwise_7x7_input.npy", "fp16_depthwise_7x7_filter.npy"),
+            ("fp16_depthwise_7x7_out_rocket.npy",),
             0.05,
             0.02,
         ),

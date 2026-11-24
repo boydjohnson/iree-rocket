@@ -382,6 +382,35 @@ struct DemoteInputsToF16 : OpRewritePattern<ContractionOpTy> {
   }
 };
 
+/// A 7x7 stride-1 depthwise convolution is demoted whatever the experiment
+/// gate says. The gate exists because MobileNetV2's many small 3x3 depthwise
+/// convolutions lose on the NPU (per-dispatch overhead against ~9 taps of
+/// work); a 7x7 one does ~5x the work per dispatch. ConvNeXt-T, whose 18
+/// depthwise convolutions are all 7x7: 113 -> 103 ms ABAB on cpu 4-7,
+/// f32-oracle max|err| 0.0053 -> 0.0061, top-5 unchanged (2026-11-24; with
+/// the quiescence dwell off, 94 ms). Admission and the 7x7 NCHW matcher
+/// (@match_dynamic_depthwise_conv2d_nchw_7x7) bound what reaches the NPU.
+template <typename DepthwiseOpTy, int KernelHeightDim, int KernelWidthDim>
+struct DemoteLargeDepthwise : DemoteInputsToF16<DepthwiseOpTy> {
+  using DemoteInputsToF16<DepthwiseOpTy>::DemoteInputsToF16;
+
+  LogicalResult matchAndRewrite(DepthwiseOpTy convOp,
+                                PatternRewriter &rewriter) const override {
+    auto filterType =
+        dyn_cast<RankedTensorType>(convOp.getDpsInputs()[1].getType());
+    if (!filterType || filterType.getRank() != 3 ||
+        filterType.getDimSize(KernelHeightDim) != 7 ||
+        filterType.getDimSize(KernelWidthDim) != 7) {
+      return failure();
+    }
+    SmallVector<int64_t> strides(convOp.getStrides().template getValues<int64_t>());
+    if (strides != SmallVector<int64_t>{1, 1}) {
+      return failure();
+    }
+    return DemoteInputsToF16<DepthwiseOpTy>::matchAndRewrite(convOp, rewriter);
+  }
+};
+
 struct RocketDemoteConvInputsPass
     : public PassWrapper<RocketDemoteConvInputsPass, OperationPass<>> {
   MLIR_DEFINE_EXPLICIT_INTERNAL_INLINE_TYPE_ID(RocketDemoteConvInputsPass)
@@ -413,6 +442,11 @@ struct RocketDemoteConvInputsPass
     if (rocketDemoteDepthwiseEnabled()) {
       patterns.add<DemoteInputsToF16<linalg::DepthwiseConv2DNhwcHwcOp>,
                    DemoteInputsToF16<linalg::DepthwiseConv2DNchwChwOp>>(context);
+    } else {
+      // NHWC filters are [kh, kw, C]; NCHW ones [C, kh, kw].
+      patterns.add<DemoteLargeDepthwise<linalg::DepthwiseConv2DNhwcHwcOp, 0, 1>,
+                   DemoteLargeDepthwise<linalg::DepthwiseConv2DNchwChwOp, 1, 2>>(
+          context);
     }
     if (failed(applyPatternsGreedily(getOperation(), std::move(patterns)))) {
       return signalPassFailure();
