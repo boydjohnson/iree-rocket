@@ -138,6 +138,20 @@ enum ElementwiseDimension : ubyte {
   CHANNELS = 2,
 }
 
+// ElementwiseBinaryDef quantization fields that may be supplied by dispatch
+// push constants, ordered after every runtime_dimensions constant. Same
+// bit-pattern convention as Conv2DQuantParam: scales travel as IEEE-754
+// binary32 bits, zero points as two's-complement int32. Numeric values are
+// wire-format ABI and must not be changed or reused.
+enum ElementwiseQuantParam : ubyte {
+  A_SCALE = 0,
+  A_ZERO_POINT = 1,
+  B_SCALE = 2,
+  B_ZERO_POINT = 3,
+  OUTPUT_SCALE = 4,
+  OUTPUT_ZERO_POINT = 5,
+}
+
 // Matmul shape fields that may be supplied by dispatch push constants.
 // Numeric values are wire-format ABI and must not be changed or reused.
 enum MatmulDimension : ubyte {
@@ -474,14 +488,14 @@ table ElementwiseUnaryDef {
 // geometry. Both operands and the result are the same shape -- this op does
 // not broadcast, and a producer that wants broadcasting must materialize it.
 //
-// fp16 only, and deliberately no precision field, for a narrower reason than
-// ElementwiseUnaryDef's. iree-rocket-hal's EwAddShape does carry an int8
-// branch, but its EW_CVT_SCALE/OUT_CVT_SCALE ratio semantics are INFERRED
-// from register shape rather than confirmed against a known value -- the
-// builder's own doc comments say so -- and MUL has no int8 recipe in any
-// capture at all. Putting the int8 fields on the wire would ship that
-// inference as an ABI. Appending `precision` and the int8 scale fields once
-// a capture confirms them is the FlatBuffers-compatible move.
+// fp16 by default. `precision = INT8` (appended 2026-11-24, once
+// iree-rocket-hal's `tests/ew_int8_add_hw.rs` measured the int8 arithmetic;
+// the capture-inferred form had saturated nearly every element) is ADD only:
+// MUL has no int8 recipe in any capture. An int8 add computes
+// `clamp(round(relu?(a_scale*(a - a_zp) + b_scale*(b - b_zp)) /
+// output_scale) + output_zero_point)`, and its six quantization fields are
+// per-dispatch calibration data, so they arrive as push constants listed in
+// `runtime_quantization` -- a shared executable cannot carry them.
 table ElementwiseBinaryDef {
   width:uint32;
   height:uint32;
@@ -498,6 +512,17 @@ table ElementwiseBinaryDef {
 
   // See Conv2DDef.runtime_layout.
   runtime_layout:bool = false;
+
+  // Appended 2026-11-24; older RKT1 binaries read as an fp16 op with no
+  // ReLU. `relu` applies the EW core's ReLU to the result (to the real-valued
+  // sum at int8, before the output requantization).
+  precision:Precision = FP16;
+  relu:bool = false;
+
+  // int8 only. Each entry consumes one uint32 push constant after the
+  // runtime_dimensions constants and before the trailing layout word. An
+  // int8 executable must list all six; an fp16 one must list none.
+  runtime_quantization:[ElementwiseQuantParam];
 }
 
 // Describes one standalone LUT activation: `out = f(in)` for one of the

@@ -1911,6 +1911,59 @@ What was settled and how, newest first, in place of the narratives — those are
 in this file's git history (`git log -p ISSUES.md`). Everything cited below is
 something that still exists: a commit, a file, or a memory.
 
+**int8 residual add on the NPU, with an int8 skip (S2) — 2026-11-24.
+ResNet50-224 int8 50.6 -> 27.5 ms (1.84x), now faster than its fp16 build
+(42.5 ms). Lossy by construction, and opt-in in the model.** After the conv
+chaining every remaining int8 CPU cost was the residual tail
+`relu(dequant(conv3) + skip)` with the skip an f32 tensor, read and rewritten
+whole every block.
+
+- **The model change.** `tools/quantize_onnx_int8.py --quantize-residual-skip`
+  (off by default) points each Add's float skip at `DequantizeLinear` of the
+  QuantizeLinear the skip already feeds, so both operands are int8 -- the
+  form a fully quantized ResNet deploys. 12 of ResNet50's 16 Adds change (the
+  four downsample blocks already were). onnxruntime: max|d| 0.22 on the
+  logits against the model without it, same top-5 (synthetic calibration, so
+  this is the only accuracy statement available).
+- **The hardware, measured.** `build_add_regcmd`'s int8 branch had never run,
+  and its capture-inferred encoding saturated nearly every element. Fitting
+  the applied gains from the readback (`tests/ew_int8_add_hw.rs`) gave the
+  real arithmetic: both operands go into a common unit with 2^14 of headroom,
+  each scaled relative to the *larger* of the two scales -- the primary
+  through `BS_MUL_CFG.bs_mul_operand` (the capture constant `0x4000` is that
+  gain when the primary carries the larger scale), the second through
+  `EW_CVT` -- and `OUT_CVT` divides the 2^14 back out. Fixing only the 2^14
+  overflowed the second gain once `sb > 2 * sa`. `EwInt8Quant` encodes it;
+  the gate is 0 wrong over 11 configurations (scale ratios 0.08..12, distinct
+  zero points, ReLU on and off, ResNet50's three residual geometries up to
+  802816 elements), every off-by-one at a real-valued tie.
+- **Wire.** `ElementwiseBinaryDef` gains `precision`, `relu` and
+  `runtime_quantization:[ElementwiseQuantParam]` (six push constants),
+  appended compatibly (`docs/compatibility.md`).
+- **Compiler.** `rocket-fuse-int8-residual-add` rewrites
+  `Q(relu(DQ(a) + DQ(b)))` on the importer's NCHW `ui8` tensors into one
+  signed NHWC generic with every scale, zero point and bound as an operand,
+  wrapped in shifts and transposes that cancel against the convolutions' own;
+  `@match_elementwise_add_int8_relu` claims it into
+  `#rocket_elementwise_add_int8_relu_target`. A build that declines it (or
+  `--no-offload`) computes the same arithmetic on the CPU.
+
+ResNet50 (relu-fused, int8 skip): 15 of 16 residual adds on the NPU (the last
+feeds the float average pool), **79 NPU->NPU edges, every one packed** (was
+32), CPU dispatch executables 28 -> 10. Against its own `--no-offload` build:
+max|d| 0.25 (the f16 stem's, as before), same top-5 set; deterministic, 0 NPU
+timeouts. 50.4/50.8 -> 27.0/27.9 ms, ABAB on cpu 4-7 at 600 MHz.
+
+Gates: compiled e2e 48/48 (new `int8_residual_add_relu`, whose second scale
+is 4.5x the first -- the case the half-fixed encoding overflowed), lit 45/45
+(new `rocket_int8_residual_add.mlir`), `ew_int8_add_hw` plus the fp16
+`ew_binary_hw`/`conv_with_add_hw`/`conv_residual_add_hw` on the board, driver
+decode tests for the int8 wire. MobileNetV2 int8, ResNet50-224 fp16 and int8
+and the chained int8 build are bit-identical on the new runtime. One trap
+cost a gate run: the fixture's first version returned `ui8` values in an i8
+tensor, and a rounding tie at 127.5 (127 against 128) reads as an error of
+255 there. It now returns the signed shift every consumer applies.
+
 **Requantized int8 1x1 `Cin` 1344 -> 2048 (S3) — 2026-11-24. ResNet50-224
 int8 chains all 32 conv -> conv edges; worth ~0.5 ms.** The last two
 unchained edges (below) were layer4's 7x7 `Cin` 2048 -> 512 bottleneck

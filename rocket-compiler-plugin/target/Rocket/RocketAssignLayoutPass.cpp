@@ -248,10 +248,14 @@ bool describe(Site &site) {
     if (!width || !height || !channels) {
       return false;
     }
+    // fp16 unless the target says int8 (the int8 residual add): one byte per
+    // element, the same 16-byte atoms an int8 conv writes, which is what
+    // lets a conv -> add -> conv chain read cubes in place.
+    size_t elem = precision ? inputElementBytes(*precision) : 2;
     site.inputs.assign(3, std::nullopt);
-    site.inputs[0] = cube(ROCKET_PLAN_CUBE_ELEMENTWISE, 2, *width, *height, *channels);
+    site.inputs[0] = cube(ROCKET_PLAN_CUBE_ELEMENTWISE, elem, *width, *height, *channels);
     site.inputs[1] = site.inputs[0];
-    std::optional<Cube> out = cube(ROCKET_PLAN_CUBE_ELEMENTWISE, 2, *width, *height, *channels);
+    std::optional<Cube> out = cube(ROCKET_PLAN_CUBE_ELEMENTWISE, elem, *width, *height, *channels);
     if (out && out->exact) {
       site.output = out;
     } else {

@@ -131,10 +131,11 @@ constexpr std::array<const char *, 4> kRequiredElementwiseUnaryConfigKeys = {
     "op",
 };
 
-// The two-tensor form: geometry plus which operator. No 'precision' key,
-// for a narrower reason than the unary kernel's -- EwAddShape does carry an
-// int8 branch, but its EW_CVT_SCALE/OUT_CVT_SCALE ratio semantics are
-// inferred rather than confirmed, and MUL has no int8 recipe in any capture.
+// The two-tensor form: geometry plus which operator. 'precision' is optional
+// (fp16 when absent); "int8" is ADD only and must list all six
+// 'runtime_quantization' fields -- the int8 arithmetic is measured
+// (iree-rocket-hal tests/ew_int8_add_hw.rs), MUL's has no recipe at all.
+// 'relu' is optional too.
 constexpr std::array<const char *, 4> kRequiredElementwiseBinaryConfigKeys = {
     "width",
     "height",
@@ -275,6 +276,10 @@ struct RocketElementwiseBinaryConfig {
   uint32_t height = 0;
   uint32_t channels = 0;
   iree_hal_rocket_EwBinaryOp_enum_t op = iree_hal_rocket_EwBinaryOp_ADD;
+  iree_hal_rocket_Precision_enum_t precision = iree_hal_rocket_Precision_FP16;
+  bool relu = false;
+  std::vector<iree_hal_rocket_ElementwiseQuantParam_enum_t>
+      runtimeQuantization;
   std::vector<iree_hal_rocket_ElementwiseDimension_enum_t> runtimeDimensions;
   bool runtimeDenseReaders = false;
   // The trailing push constant is a layout word instead (runtime_layout);
@@ -1164,6 +1169,88 @@ buildRocketElementwiseBinaryConfigFromTarget(
                                   shape.runtimeLayout, diagFn)) {
     return std::nullopt;
   }
+  if (Attribute attr = config.get("relu")) {
+    auto relu = llvm::dyn_cast<BoolAttr>(attr);
+    if (!relu) {
+      diagFn() << "rocket backend: element-wise binary 'relu' must be a bool";
+      return std::nullopt;
+    }
+    shape.relu = relu.getValue();
+  }
+  if (Attribute attr = config.get("precision")) {
+    StringRef precision = llvm::cast<StringAttr>(attr).getValue();
+    if (precision == "fp16") {
+      shape.precision = iree_hal_rocket_Precision_FP16;
+    } else if (precision == "int8") {
+      shape.precision = iree_hal_rocket_Precision_INT8;
+    } else {
+      diagFn() << "rocket backend: element-wise binary 'precision' must be "
+                  "fp16 or int8, got '"
+               << precision << "'";
+      return std::nullopt;
+    }
+  }
+  std::array<bool, 6> isRuntimeQuantParam = {};
+  if (Attribute attr = config.get("runtime_quantization")) {
+    auto params = llvm::dyn_cast<ArrayAttr>(attr);
+    if (!params) {
+      diagFn() << "rocket backend: element-wise 'runtime_quantization' must "
+                  "be an array of strings";
+      return std::nullopt;
+    }
+    for (Attribute paramAttr : params) {
+      auto paramName = llvm::dyn_cast<StringAttr>(paramAttr);
+      if (!paramName) {
+        diagFn() << "rocket backend: every element-wise "
+                    "'runtime_quantization' entry must be a string";
+        return std::nullopt;
+      }
+      StringRef name = paramName.getValue();
+      std::optional<iree_hal_rocket_ElementwiseQuantParam_enum_t> param;
+      if (name == "a_scale") {
+        param = iree_hal_rocket_ElementwiseQuantParam_A_SCALE;
+      } else if (name == "a_zero_point") {
+        param = iree_hal_rocket_ElementwiseQuantParam_A_ZERO_POINT;
+      } else if (name == "b_scale") {
+        param = iree_hal_rocket_ElementwiseQuantParam_B_SCALE;
+      } else if (name == "b_zero_point") {
+        param = iree_hal_rocket_ElementwiseQuantParam_B_ZERO_POINT;
+      } else if (name == "output_scale") {
+        param = iree_hal_rocket_ElementwiseQuantParam_OUTPUT_SCALE;
+      } else if (name == "output_zero_point") {
+        param = iree_hal_rocket_ElementwiseQuantParam_OUTPUT_ZERO_POINT;
+      } else {
+        diagFn() << "rocket backend: unknown element-wise quantization "
+                    "parameter '"
+                 << name << "'";
+        return std::nullopt;
+      }
+      size_t index = static_cast<size_t>(*param);
+      if (isRuntimeQuantParam[index]) {
+        diagFn() << "rocket backend: duplicate element-wise quantization "
+                    "parameter '"
+                 << name << "'";
+        return std::nullopt;
+      }
+      isRuntimeQuantParam[index] = true;
+      shape.runtimeQuantization.push_back(*param);
+    }
+  }
+  if (shape.precision == iree_hal_rocket_Precision_INT8) {
+    if (shape.op != iree_hal_rocket_EwBinaryOp_ADD) {
+      diagFn() << "rocket backend: int8 element-wise binary ops are ADD only";
+      return std::nullopt;
+    }
+    if (shape.runtimeQuantization.size() != isRuntimeQuantParam.size()) {
+      diagFn() << "rocket backend: an int8 element-wise add must list all "
+                  "six 'runtime_quantization' fields";
+      return std::nullopt;
+    }
+  } else if (!shape.runtimeQuantization.empty()) {
+    diagFn() << "rocket backend: 'runtime_quantization' is only meaningful "
+                "for an int8 element-wise add";
+    return std::nullopt;
+  }
   return shape;
 }
 
@@ -1532,10 +1619,13 @@ public:
     } else if (lutShape) {
       runtimeDimensionCount = lutShape->runtimeDimensions.size();
     }
-    // Only Conv2DDef carries runtime quantization; pooling has none to carry
-    // and matmul's own lowering does not use the dispatch-supplied scale.
+    // Conv2DDef and the int8 element-wise add carry runtime quantization;
+    // pooling has none to carry and matmul's own lowering does not use the
+    // dispatch-supplied scale.
     size_t runtimeQuantizationCount =
-        convShape ? convShape->runtimeQuantization.size() : 0;
+        convShape ? convShape->runtimeQuantization.size()
+        : ewBinaryShape ? ewBinaryShape->runtimeQuantization.size()
+                        : 0;
     // Dimensions first, then quantization parameters -- one flat push-constant
     // sequence in that order, which is the order rocket-hal-driver's
     // `Conv2dExecutable::resolve_shape` consumes them in.
@@ -1740,6 +1830,18 @@ public:
                     "vector";
         }
       }
+      iree_hal_rocket_ElementwiseQuantParam_vec_ref_t runtimeQuantizationRef =
+          0;
+      if (!ewBinaryShape->runtimeQuantization.empty()) {
+        runtimeQuantizationRef =
+            iree_hal_rocket_ElementwiseQuantParam_vec_create(
+                builder, ewBinaryShape->runtimeQuantization.data(),
+                ewBinaryShape->runtimeQuantization.size());
+        if (!runtimeQuantizationRef) {
+          return variantOp.emitOpError()
+                 << "failed to build Rocket element-wise quantization vector";
+        }
+      }
       if (iree_hal_rocket_ElementwiseBinaryDef_start(builder) ||
           iree_hal_rocket_ElementwiseBinaryDef_width_add(
               builder, ewBinaryShape->width) ||
@@ -1755,7 +1857,14 @@ public:
           iree_hal_rocket_ElementwiseBinaryDef_runtime_dense_readers_add(
               builder, ewBinaryShape->runtimeDenseReaders) ||
           iree_hal_rocket_ElementwiseBinaryDef_runtime_layout_add(
-              builder, ewBinaryShape->runtimeLayout)) {
+              builder, ewBinaryShape->runtimeLayout) ||
+          iree_hal_rocket_ElementwiseBinaryDef_precision_add(
+              builder, ewBinaryShape->precision) ||
+          iree_hal_rocket_ElementwiseBinaryDef_relu_add(builder,
+                                                        ewBinaryShape->relu) ||
+          (runtimeQuantizationRef &&
+           iree_hal_rocket_ElementwiseBinaryDef_runtime_quantization_add(
+               builder, runtimeQuantizationRef))) {
         return variantOp.emitOpError()
                << "failed to build Rocket element-wise binary definition";
       }

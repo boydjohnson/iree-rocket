@@ -717,6 +717,70 @@ func.func @requant_int8_1x1_cin2048(%input: tensor<1x7x7x2048xi8>, %filter: tens
   return %out : tensor<1x7x7x512xi8>
 }
 
+// A quantized residual tail in the importer's form -- two `ui8` NCHW
+// dequantizations (one with zero point 0, spelled `uitofp`), an add, ReLU,
+// a `ui8` QuantizeLinear -- which rocket-fuse-int8-residual-add hands to
+// the NPU's int8 EW add (#rocket_elementwise_add_int8_relu_target). The
+// scales put the second operand above twice the first, which is where the
+// capture-inferred encoding overflowed.
+func.func @int8_residual_add_relu(%a: tensor<1x256x14x14xi8>, %b: tensor<1x256x14x14xi8>) -> tensor<1x256x14x14xi8> {
+  %a_scale = arith.constant 2.000000e-02 : f32
+  %b_scale = arith.constant 9.000000e-02 : f32
+  %out_scale = arith.constant 6.000000e-02 : f32
+  %a_zp = arith.constant 163 : i32
+  %out_zp = arith.constant 4.000000e+00 : f32
+  %zero = arith.constant 0.000000e+00 : f32
+  %max = arith.constant 2.550000e+02 : f32
+  %f_empty = tensor.empty() : tensor<1x256x14x14xf32>
+  %fa = linalg.generic {indexing_maps = [affine_map<(d0, d1, d2, d3) -> (d0, d1, d2, d3)>, affine_map<(d0, d1, d2, d3) -> (d0, d1, d2, d3)>], iterator_types = ["parallel", "parallel", "parallel", "parallel"]} ins(%a : tensor<1x256x14x14xi8>) outs(%f_empty : tensor<1x256x14x14xf32>) {
+  ^bb0(%in: i8, %out: f32):
+    %w = arith.extui %in : i8 to i32
+    %c = arith.subi %w, %a_zp : i32
+    %f = arith.sitofp %c : i32 to f32
+    %s = arith.mulf %f, %a_scale : f32
+    linalg.yield %s : f32
+  } -> tensor<1x256x14x14xf32>
+  %fb = linalg.generic {indexing_maps = [affine_map<(d0, d1, d2, d3) -> (d0, d1, d2, d3)>, affine_map<(d0, d1, d2, d3) -> (d0, d1, d2, d3)>], iterator_types = ["parallel", "parallel", "parallel", "parallel"]} ins(%b : tensor<1x256x14x14xi8>) outs(%f_empty : tensor<1x256x14x14xf32>) {
+  ^bb0(%in: i8, %out: f32):
+    %f = arith.uitofp %in : i8 to f32
+    %s = arith.mulf %f, %b_scale : f32
+    linalg.yield %s : f32
+  } -> tensor<1x256x14x14xf32>
+  %sum = linalg.generic {indexing_maps = [affine_map<(d0, d1, d2, d3) -> (d0, d1, d2, d3)>, affine_map<(d0, d1, d2, d3) -> (d0, d1, d2, d3)>, affine_map<(d0, d1, d2, d3) -> (d0, d1, d2, d3)>], iterator_types = ["parallel", "parallel", "parallel", "parallel"]} ins(%fa, %fb : tensor<1x256x14x14xf32>, tensor<1x256x14x14xf32>) outs(%f_empty : tensor<1x256x14x14xf32>) {
+  ^bb0(%x: f32, %y: f32, %out: f32):
+    %r = arith.addf %x, %y : f32
+    linalg.yield %r : f32
+  } -> tensor<1x256x14x14xf32>
+  %relu = linalg.generic {indexing_maps = [affine_map<(d0, d1, d2, d3) -> (d0, d1, d2, d3)>, affine_map<(d0, d1, d2, d3) -> (d0, d1, d2, d3)>], iterator_types = ["parallel", "parallel", "parallel", "parallel"]} ins(%sum : tensor<1x256x14x14xf32>) outs(%f_empty : tensor<1x256x14x14xf32>) {
+  ^bb0(%in: f32, %out: f32):
+    %p = arith.cmpf ugt, %in, %zero : f32
+    %r = arith.select %p, %in, %zero : f32
+    linalg.yield %r : f32
+  } -> tensor<1x256x14x14xf32>
+  %q_empty = tensor.empty() : tensor<1x256x14x14xi8>
+  %q = linalg.generic {indexing_maps = [affine_map<(d0, d1, d2, d3) -> (d0, d1, d2, d3)>, affine_map<(d0, d1, d2, d3) -> (d0, d1, d2, d3)>], iterator_types = ["parallel", "parallel", "parallel", "parallel"]} ins(%relu : tensor<1x256x14x14xf32>) outs(%q_empty : tensor<1x256x14x14xi8>) {
+  ^bb0(%in: f32, %out: i8):
+    %d = arith.divf %in, %out_scale : f32
+    %r = math.roundeven %d : f32
+    %z = arith.addf %r, %out_zp : f32
+    %lo = arith.maximumf %z, %zero : f32
+    %hi = arith.minimumf %lo, %max : f32
+    %n = arith.fptoui %hi : f32 to i8
+    linalg.yield %n : i8
+  } -> tensor<1x256x14x14xi8>
+  // The signed shift every consumer applies (the next conv reads s8). It is
+  // also what keeps the differential honest: compared as `ui8`, a rounding
+  // tie at 127.5 reads 127 against 128 -- 127 against -128 once stored as
+  // int8, an "error" of 255 that is really one tie.
+  %c_shift = arith.constant -128 : i8
+  %s = linalg.generic {indexing_maps = [affine_map<(d0, d1, d2, d3) -> (d0, d1, d2, d3)>, affine_map<(d0, d1, d2, d3) -> (d0, d1, d2, d3)>], iterator_types = ["parallel", "parallel", "parallel", "parallel"]} ins(%q : tensor<1x256x14x14xi8>) outs(%q_empty : tensor<1x256x14x14xi8>) {
+  ^bb0(%in: i8, %out: i8):
+    %t = arith.addi %in, %c_shift : i8
+    linalg.yield %t : i8
+  } -> tensor<1x256x14x14xi8>
+  return %s : tensor<1x256x14x14xi8>
+}
+
 func.func @requant_int8_1x1_cin816_cout448(%input: tensor<1x7x7x816xi8>, %filter: tensor<1x1x816x448xi8>, %bias: tensor<448xi32>) -> tensor<1x7x7x448xi8> {
   %zero = arith.constant 0 : i32
   %scale = arith.constant 3.000000e-04 : f32
@@ -1531,6 +1595,10 @@ def write_compiled_fixture(work_dir: Path) -> None:
     np.save(work_dir / "requant_int8_1x1_then_pad1_f2.npy", i8_small(3, 3, 64, 64))
     np.save(work_dir / "requant_int8_1x1_then_pad1_b2.npy", bias_i32(64))
 
+    residual_rng = np.random.default_rng(20261125)
+    np.save(work_dir / "int8_residual_add_relu_a.npy", residual_rng.integers(-128, 128, size=(1, 256, 14, 14), dtype=np.int8))
+    np.save(work_dir / "int8_residual_add_relu_b.npy", residual_rng.integers(-128, 128, size=(1, 256, 14, 14), dtype=np.int8))
+
     # Its own rng, so the shared stream every later fixture draws from does
     # not move.
     cin2048_rng = np.random.default_rng(20261124)
@@ -1754,6 +1822,7 @@ def compile_modules(
         ("requant_int8_1x1_cin512", "rocket_dynamic_int8_requant_executable"),
         ("requant_int8_1x1_cin816", "rocket_dynamic_int8_requant_executable"),
         ("requant_int8_1x1_cin2048", "rocket_dynamic_int8_requant_executable"),
+        ("int8_residual_add_relu", "rocket_elementwise_add_int8_relu_executable"),
         ("requant_int8_1x1_cin816_cout448", "rocket_dynamic_int8_requant_executable"),
         ("requant_int8_1x1_large_bias", "rocket_dynamic_int8_requant_executable"),
         ("fp16_residual_relu", "rocket_dynamic_residual_relu_executable"),
@@ -2300,6 +2369,13 @@ def run_compiled_gate(
                 "requant_int8_1x1_cin2048_bias.npy",
             ),
             ("requant_int8_1x1_cin2048_out_rocket.npy",),
+            1.0,
+            0.0,
+        ),
+        Case(
+            "int8_residual_add_relu",
+            ("int8_residual_add_relu_a.npy", "int8_residual_add_relu_b.npy"),
+            ("int8_residual_add_relu_out_rocket.npy",),
             1.0,
             0.0,
         ),

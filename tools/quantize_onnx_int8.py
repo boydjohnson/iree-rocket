@@ -186,6 +186,62 @@ def asymmetric_pad_convs(path: Path) -> list[str]:
     return names
 
 
+def quantize_residual_skips(path: Path) -> int:
+    """Make every residual Add read its float operand back through int8.
+
+    After QOperator quantization a residual block's tail is
+    `Add(DequantizeLinear(conv_out), skip)` with `skip` a *float* tensor --
+    the previous block's ReLU output, kept in float because Add is not a
+    quantized op here. That skip is also quantized (a QuantizeLinear feeds
+    the next convolutions from it), so this points the Add at
+    `DequantizeLinear(that QuantizeLinear)` instead: both operands int8, the
+    form a fully quantized ResNet deploys, and one the NPU's int8 EW add can
+    run. It is lossy -- the skip loses everything below its 8-bit
+    quantization step -- and it is a model change, so compare the result
+    with its own `--no-offload` build, not with the model without it.
+    Returns the number of Add operands rewritten.
+    """
+    model = onnx.load(path)
+    graph = model.graph
+    producers = {out: node for node in graph.node for out in node.output}
+    quantizers: dict[str, onnx.NodeProto] = {}
+    for node in graph.node:
+        if node.op_type == "QuantizeLinear":
+            quantizers.setdefault(node.input[0], node)
+
+    new_nodes: list[onnx.NodeProto] = []
+    rewritten = 0
+    dequantized: dict[str, str] = {}
+    for node in graph.node:
+        if node.op_type == "Add":
+            for slot, name in enumerate(node.input):
+                producer = producers.get(name)
+                if producer is not None and producer.op_type == "DequantizeLinear":
+                    continue
+                quantizer = quantizers.get(name)
+                if quantizer is None:
+                    continue
+                if name not in dequantized:
+                    out = f"{name}_requantized_skip"
+                    new_nodes.append(
+                        onnx.helper.make_node(
+                            "DequantizeLinear",
+                            [quantizer.output[0], quantizer.input[1], quantizer.input[2]],
+                            [out],
+                            name=f"{name}_skip_DequantizeLinear",
+                        )
+                    )
+                    dequantized[name] = out
+                node.input[slot] = dequantized[name]
+                rewritten += 1
+        new_nodes.append(node)
+    del graph.node[:]
+    graph.node.extend(new_nodes)
+    onnx.checker.check_model(model)
+    onnx.save(model, path)
+    return rewritten
+
+
 def verify_quantized_model(path: Path) -> int:
     """Re-check on the output the three properties the Rocket path depends on.
 
@@ -292,6 +348,13 @@ def main() -> None:
         "and can still take the Rocket fp16 path.",
     )
     parser.add_argument(
+        "--quantize-residual-skip",
+        action="store_true",
+        help="read every residual Add's float skip back through its own int8 "
+        "quantization, so both Add operands are int8 and the NPU can run the "
+        "add. Lossy and a model change; off by default.",
+    )
+    parser.add_argument(
         "--quantize-asymmetric-pads",
         action="store_true",
         help="quantize convolutions with asymmetric padding too. They are "
@@ -357,6 +420,10 @@ def main() -> None:
         op_types_to_quantize=args.quantize_op_types,
         nodes_to_exclude=excluded,
     )
+
+    if args.quantize_residual_skip:
+        count = quantize_residual_skips(args.output)
+        print(f"read {count} residual skip operand(s) back through int8")
 
     print("verifying:")
     verify_quantized_model(args.output)
