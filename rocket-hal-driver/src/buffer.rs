@@ -68,6 +68,8 @@ pub struct RocketBuffer {
     /// buffer. The hardware may read up to here without faulting; past it
     /// the page may be unmapped (see `command_buffer::stage_direct`).
     pub mapped_bytes: usize,
+    /// Where `destroy` returns the GEM object (`buffer_cache.rs`).
+    pub cache: std::sync::Arc<crate::buffer_cache::BufferCache>,
 }
 
 unsafe fn cast(buffer: *mut iree_hal_buffer_t) -> *mut RocketBuffer {
@@ -215,19 +217,19 @@ unsafe extern "C" fn destroy(buffer: *mut iree_hal_buffer_t) {
     // address can inherit its packed coefficients -- see `weight_cache`.
     crate::weight_cache::forget(buffer);
     let buffer = unsafe { Box::from_raw(cast(buffer)) };
-    // The permanent CPU mapping and the DRM file's GEM handle hold
-    // independent references to the allocation. Release both; dropping only
-    // one leaves the GEM object, IOMMU mapping, and IOVA live until process or
-    // device teardown.
-    if !buffer.host_ptr.is_null() && buffer.base.allocation_size > 0 {
-        let _ = unsafe {
-            nix::sys::mman::munmap(
-                std::ptr::NonNull::new_unchecked(buffer.host_ptr as *mut std::ffi::c_void),
-                buffer.base.allocation_size,
-            )
-        };
-    }
-    let _ = unsafe { device::close_bo(buffer.fd, buffer.handle) };
+    // The GEM object goes back to the allocator's cache, which keeps it for
+    // the next allocation of its size or releases both of its references
+    // (the mapping and the handle) -- by the mapping's real length, which
+    // `allocation_size` is not: munmapping that leaves the tail page mapped,
+    // and the VMA alone keeps the GEM object and its IOVA alive.
+    unsafe {
+        buffer.cache.give(device::Buffer {
+            handle: buffer.handle,
+            dma_address: buffer.dma_address,
+            size: buffer.mapped_bytes,
+            host_ptr: buffer.host_ptr,
+        })
+    };
 }
 
 #[allow(unused_variables)]
