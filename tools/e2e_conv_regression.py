@@ -1090,8 +1090,8 @@ func.func @fp16_stem_space_to_depth(%image: tensor<1x3x70x70xf32>, %filter: tens
 }
 
 // ConvNeXt's 7x7 stride-1 depthwise convolution, f32 as an ONNX import
-// leaves it: rocket-demote-conv-inputs-to-f16 demotes a 7x7 depthwise by
-// default (the 3x3 ones stay behind ROCKET_DEMOTE_DEPTHWISE), and
+// leaves it: rocket-demote-conv-inputs-to-f16 demotes a 7x7 depthwise even
+// with ROCKET_DEMOTE_DEPTHWISE=0 (which keeps the 3x3 ones f32), and
 // @match_dynamic_depthwise_conv2d_nchw_7x7 claims it.
 func.func @fp16_depthwise_7x7(%input: tensor<1x96x20x20xf32>, %filter: tensor<96x7x7xf32>) -> tensor<1x96x14x14xf32> {
   %zero = arith.constant 0.000000e+00 : f32

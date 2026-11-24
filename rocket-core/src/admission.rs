@@ -186,8 +186,8 @@ pub fn conv_ceilings(
         (PrecisionClass::Fp16, true, 1 | 3) => ceilings(1536, 1536),
         // **fp16 depthwise 7x7, stride 1**: ConvNeXt's. Exact at all four of
         // its stages, 62x62x96 to 13x13x768 (`depthwise_7x7_convnext_probe`);
-        // the bound is that grid. Reached only when the depthwise demotion
-        // runs (`ROCKET_DEMOTE_DEPTHWISE`), which is off by default.
+        // the bound is that grid. The depthwise demotion that brings it here
+        // runs for 7x7 stride 1 even with `ROCKET_DEMOTE_DEPTHWISE=0`.
         (PrecisionClass::Fp16, true, 7) if stride == 1 => ceilings(
             conv::DEPTHWISE_7X7_MAX_CHANNELS,
             conv::DEPTHWISE_7X7_MAX_CHANNELS,

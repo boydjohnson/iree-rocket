@@ -198,6 +198,23 @@
 // the --no-offload arm is 1.6x faster than the best NPU arm, so this is still
 // a detail inside a losing trade.
 //
+// **On by default since 2026-11-24, once the dwell went.** The driver's
+// depthwise -> dense dwell is opt-in now (60000 transitions without it, 0
+// wrong; see device.rs `depthwise_quiesce_enabled`), and with it gone the
+// trade flips. Same export, same compiler, cpu 4-7, NPU at 600 MHz, medians
+// of five, three interleaved passes, 0 NPU timeouts:
+//
+//                 nooff    base(37)   dw(54)   dw + ROCKET_QUIESCE_DEPTHWISE=1
+//   wall ms       30.8      35.3      30.8         49.2
+//
+// So demoting every depthwise is 1.15x faster than the 37-site arm and ties
+// --no-offload, where base had lost to it by 1.15x. Against the f32 oracle,
+// max|err| 0.0639 (dw) / 0.0659 (base) / 0.0639 (nooff), top-5 identical
+// across the three arms; dw vs base max|diff| 0.0029. What is left in dw is
+// host work: per inference `outside` 9.8 ms, `compact` 7.1, `pack.input` 5.7
+// against `wait.npu` 7.8 -- the 17 CPU pad copies in front of every depthwise
+// still break the chain on both sides of it.
+//
 // Anything left alone is safe: an op that stays f32 fails the matchers' f16
 // typing and goes to the CPU, and RocketPromoteUnclaimedConvInputsPass gives
 // f32 back to anything demoted that the match loop then declines.
@@ -317,11 +334,11 @@ Value demoteInput(PatternRewriter &rewriter, Location loc, Value value) {
   return demoted;
 }
 
-// P7 experiment gate. The depthwise demote is off by default -- the scope
-// comment above carries the accounting and the 2026-09-09 re-measurement at
-// 600 MHz. `ROCKET_DEMOTE_DEPTHWISE=1` builds the 44-site arm from the same
-// compiler binary, so both arms come out of one build and the A/B costs a
-// recompile of the model rather than of the compiler.
+// P7 gate. The depthwise demote is on by default since 2026-11-24 -- the
+// scope comment above carries the accounting. `ROCKET_DEMOTE_DEPTHWISE=0`
+// builds the old arm (only 7x7 stride-1 depthwise demoted) from the same
+// compiler binary, so the A/B costs a recompile of the model rather than of
+// the compiler.
 //
 // Verify the gate by dispatch-site count, not by trusting the env var: 37
 // sites off, 54 on, the delta being rocket_dynamic_depthwise_relu6_executable
@@ -335,7 +352,7 @@ Value demoteInput(PatternRewriter &rewriter, Location loc, Value value) {
 static bool rocketDemoteDepthwiseEnabled() {
   static const bool enabled = [] {
     const char *value = std::getenv("ROCKET_DEMOTE_DEPTHWISE");
-    return value && llvm::StringRef(value) != "0";
+    return !value || llvm::StringRef(value) != "0";
   }();
   return enabled;
 }
@@ -382,10 +399,11 @@ struct DemoteInputsToF16 : OpRewritePattern<ContractionOpTy> {
   }
 };
 
-/// A 7x7 stride-1 depthwise convolution is demoted whatever the experiment
-/// gate says. The gate exists because MobileNetV2's many small 3x3 depthwise
-/// convolutions lose on the NPU (per-dispatch overhead against ~9 taps of
-/// work); a 7x7 one does ~5x the work per dispatch. ConvNeXt-T, whose 18
+/// A 7x7 stride-1 depthwise convolution is demoted even with the gate off
+/// (`ROCKET_DEMOTE_DEPTHWISE=0`). The gate was off until 2026-11-24 because
+/// MobileNetV2's 3x3 depthwise convolutions lost on the NPU -- to the
+/// driver's quiescence dwell, it turned out; a 7x7 one does ~5x the work per
+/// dispatch and won even with the dwell. ConvNeXt-T, whose 18
 /// depthwise convolutions are all 7x7: 113 -> 103 ms ABAB on cpu 4-7,
 /// f32-oracle max|err| 0.0053 -> 0.0061, top-5 unchanged (2026-11-24; with
 /// the quiescence dwell off, 94 ms). Admission and the 7x7 NCHW matcher

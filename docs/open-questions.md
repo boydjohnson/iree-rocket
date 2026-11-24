@@ -289,7 +289,9 @@ cost? [COMPILER_ROADMAP 4]
 3.1.4 Is the depthwise dwell (1.1.1) the whole remaining cost of offloading
 fp16 depthwise? With the dwell off (the default since 2026-11-24) the
 depthwise arm landed within 1 to 2.5% of the arm that leaves depthwise on
-the CPU; MobileNetV2's demote gate has not been re-measured since.
+the CPU. Re-measured 2026-11-24: the demote (on by default now) ties
+`--no-offload` on MobileNetV2 fp16, 30.8 ms each, base 35.3; what is left is
+the CPU pad in front of each depthwise. [ISSUES Resolved]
 [`device.rs` `depthwise_quiesce_enabled`]
 
 ### 3.2 Multicore
