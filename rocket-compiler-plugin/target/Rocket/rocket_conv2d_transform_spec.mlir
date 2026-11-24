@@ -798,6 +798,32 @@
   ]
 }>
 
+// `conv(x) + skip`, the linear twin of #rocket_dynamic_residual_relu_target:
+// the same conv tiles + one EW task, with the EW core's ReLU off
+// (`build_add_regcmd_with_relu(.., false)`; `conv_residual_add_hw` runs both
+// settings exact). MobileNetV2's linear bottlenecks: the 1x1 projection adds
+// the block input and stops. `rocket-fuse-conv-relu6`'s
+// FuseConvResidualLinear builds the form @match_dynamic_conv2d_residual*
+// claim.
+#rocket_dynamic_residual_target = #hal.executable.target<"rocket", "rocket-flatbuffer-v1", {
+  kernel = "conv2d",
+  input_width = 0 : i32, input_height = 0 : i32, input_channels = 0 : i32,
+  output_width = 0 : i32, output_height = 0 : i32, output_channels = 0 : i32,
+  weights_width = 0 : i32, weights_height = 0 : i32, stride = 1 : i32,
+  depthwise = false,
+  runtime_layout = true,
+  input_zero_point = 0 : i32, output_zero_point = 0 : i32, weights_zero_point = 0 : i32,
+  input_scale = 1.0 : f32, weights_scale = 1.0 : f32, output_scale = 1.0 : f32,
+  truncate_bits = 0 : i32,
+  activation = "none", activation_cmp = 0 : i32,
+  precision = "fp16",
+  epilogue_add = true, epilogue_activation = "none",
+  runtime_dimensions = [
+    "input_width", "input_height", "input_channels",
+    "output_channels", "weights_width", "weights_height"
+  ]
+}>
+
 #rocket_dynamic_relu6_target = #hal.executable.target<"rocket", "rocket-flatbuffer-v1", {
   kernel = "conv2d",
   input_width = 0 : i32, input_height = 0 : i32, input_channels = 0 : i32,
@@ -1472,6 +1498,20 @@ module attributes {transform.with_named_sequence} {
 
   hal.executable private @rocket_dynamic_residual_relu_executable {
     hal.executable.variant public @rocket_dynamic_conv2d_v1 target(#rocket_dynamic_residual_relu_target) {
+      hal.executable.export public @rocket_dynamic_conv2d ordinal(0) layout(#dynamic_residual_pipeline_layout) count(%device: !hal.device, %workload: index) -> (index, index, index) {
+        %c1 = arith.constant 1 : index
+        hal.return %c1, %c1, %c1 : index, index, index
+      }
+      builtin.module {
+        func.func @rocket_dynamic_conv2d() {
+          return
+        }
+      }
+    }
+  }
+
+  hal.executable private @rocket_dynamic_residual_executable {
+    hal.executable.variant public @rocket_dynamic_conv2d_v1 target(#rocket_dynamic_residual_target) {
       hal.executable.export public @rocket_dynamic_conv2d ordinal(0) layout(#dynamic_residual_pipeline_layout) count(%device: !hal.device, %workload: index) -> (index, index, index) {
         %c1 = arith.constant 1 : index
         hal.return %c1, %c1, %c1 : index, index, index
@@ -4132,6 +4172,166 @@ module attributes {transform.with_named_sequence} {
     %layout_i32 = arith.constant 0 : i32
     %raw_f16 = flow.dispatch
         @rocket_dynamic_residual_relu_executable::@rocket_dynamic_conv2d_v1::@rocket_dynamic_conv2d(
+          %input_width_i32, %input_height_i32, %input_channels_i32,
+          %output_channels_i32, %weights_width_i32, %weights_height_i32, %layout_i32,
+          %input, %filter, %bias_f16, %skip)
+        {stream.affinity = #hal.device.affinity<@rocket_device>}
+        : (i32, i32, i32, i32, i32, i32, i32,
+           tensor<1x?x?x?xf16>{%input_height, %input_width, %input_channels},
+           tensor<?x?x?x?xf16>{%weights_height, %weights_width, %input_channels, %output_channels},
+           tensor<?xf16>{%output_channels},
+           tensor<1x?x?x?xf16>{%output_height, %output_width, %output_channels})
+        -> tensor<1x?x?x?xf16>{%output_height, %output_width, %output_channels}
+
+    %final_empty = tensor.empty(%output_height, %output_width, %output_channels)
+        : tensor<1x?x?x?xf32>
+    %final = linalg.generic {
+        indexing_maps = [
+          affine_map<(d0, d1, d2, d3) -> (d0, d1, d2, d3)>,
+          affine_map<(d0, d1, d2, d3) -> (d0, d1, d2, d3)>
+        ],
+        iterator_types = ["parallel", "parallel", "parallel", "parallel"]
+      } ins(%raw_f16 : tensor<1x?x?x?xf16>)
+        outs(%final_empty : tensor<1x?x?x?xf32>) {
+      ^bb0(%raw: f16, %out: f32):
+        %raw_f32 = arith.extf %raw : f16 to f32
+        linalg.yield %raw_f32 : f32
+    } -> tensor<1x?x?x?xf32>
+    util.return %final : tensor<1x?x?x?xf32>
+  }
+
+  // Linear twins of @call_rocket_dynamic_conv2d_residual_relu, for
+  // #rocket_dynamic_residual_target: no %low (nothing clamps the sum). The
+  // `_wide` one takes an f32 skip, which is how an f32 import's residual add
+  // arrives, and narrows it here.
+  util.func private @call_rocket_dynamic_conv2d_residual(
+      %input: tensor<1x?x?x?xf16>,
+      %filter: tensor<?x?x?x?xf16>,
+      %acc_init: tensor<1x?x?x?xf32>,
+      %bias: tensor<?xf32>,
+      %skip: tensor<1x?x?x?xf16>,
+      %init: tensor<1x?x?x?xf32>) -> tensor<1x?x?x?xf32> {
+    %c0 = arith.constant 0 : index
+    %c1 = arith.constant 1 : index
+    %c2 = arith.constant 2 : index
+    %c3 = arith.constant 3 : index
+
+    %input_height = tensor.dim %input, %c1 : tensor<1x?x?x?xf16>
+    %input_width = tensor.dim %input, %c2 : tensor<1x?x?x?xf16>
+    %input_channels = tensor.dim %input, %c3 : tensor<1x?x?x?xf16>
+    %weights_height = tensor.dim %filter, %c0 : tensor<?x?x?x?xf16>
+    %weights_width = tensor.dim %filter, %c1 : tensor<?x?x?x?xf16>
+    %output_height = tensor.dim %init, %c1 : tensor<1x?x?x?xf32>
+    %output_width = tensor.dim %init, %c2 : tensor<1x?x?x?xf32>
+    %output_channels = tensor.dim %init, %c3 : tensor<1x?x?x?xf32>
+
+    %input_width_i32 = arith.index_cast %input_width : index to i32
+    %input_height_i32 = arith.index_cast %input_height : index to i32
+    %input_channels_i32 = arith.index_cast %input_channels : index to i32
+    %output_channels_i32 = arith.index_cast %output_channels : index to i32
+    %weights_width_i32 = arith.index_cast %weights_width : index to i32
+    %weights_height_i32 = arith.index_cast %weights_height : index to i32
+
+    %bias_empty = tensor.empty(%output_channels) : tensor<?xf16>
+    %bias_f16 = linalg.generic {
+        indexing_maps = [affine_map<(d0) -> (d0)>, affine_map<(d0) -> (d0)>],
+        iterator_types = ["parallel"]
+      } ins(%bias : tensor<?xf32>) outs(%bias_empty : tensor<?xf16>) {
+      ^bb0(%value: f32, %out: f16):
+        %narrowed = arith.truncf %value : f32 to f16
+        linalg.yield %narrowed : f16
+    } -> tensor<?xf16>
+
+    %layout_i32 = arith.constant 0 : i32
+    %raw_f16 = flow.dispatch
+        @rocket_dynamic_residual_executable::@rocket_dynamic_conv2d_v1::@rocket_dynamic_conv2d(
+          %input_width_i32, %input_height_i32, %input_channels_i32,
+          %output_channels_i32, %weights_width_i32, %weights_height_i32, %layout_i32,
+          %input, %filter, %bias_f16, %skip)
+        {stream.affinity = #hal.device.affinity<@rocket_device>}
+        : (i32, i32, i32, i32, i32, i32, i32,
+           tensor<1x?x?x?xf16>{%input_height, %input_width, %input_channels},
+           tensor<?x?x?x?xf16>{%weights_height, %weights_width, %input_channels, %output_channels},
+           tensor<?xf16>{%output_channels},
+           tensor<1x?x?x?xf16>{%output_height, %output_width, %output_channels})
+        -> tensor<1x?x?x?xf16>{%output_height, %output_width, %output_channels}
+
+    %final_empty = tensor.empty(%output_height, %output_width, %output_channels)
+        : tensor<1x?x?x?xf32>
+    %final = linalg.generic {
+        indexing_maps = [
+          affine_map<(d0, d1, d2, d3) -> (d0, d1, d2, d3)>,
+          affine_map<(d0, d1, d2, d3) -> (d0, d1, d2, d3)>
+        ],
+        iterator_types = ["parallel", "parallel", "parallel", "parallel"]
+      } ins(%raw_f16 : tensor<1x?x?x?xf16>)
+        outs(%final_empty : tensor<1x?x?x?xf32>) {
+      ^bb0(%raw: f16, %out: f32):
+        %raw_f32 = arith.extf %raw : f16 to f32
+        linalg.yield %raw_f32 : f32
+    } -> tensor<1x?x?x?xf32>
+    util.return %final : tensor<1x?x?x?xf32>
+  }
+
+  util.func private @call_rocket_dynamic_conv2d_residual_wide(
+      %input: tensor<1x?x?x?xf16>,
+      %filter: tensor<?x?x?x?xf16>,
+      %acc_init: tensor<1x?x?x?xf32>,
+      %bias: tensor<?xf32>,
+      %skip_f32: tensor<1x?x?x?xf32>,
+      %init: tensor<1x?x?x?xf32>) -> tensor<1x?x?x?xf32> {
+    %c0 = arith.constant 0 : index
+    %c1 = arith.constant 1 : index
+    %c2 = arith.constant 2 : index
+    %c3 = arith.constant 3 : index
+
+    %input_height = tensor.dim %input, %c1 : tensor<1x?x?x?xf16>
+    %input_width = tensor.dim %input, %c2 : tensor<1x?x?x?xf16>
+    %input_channels = tensor.dim %input, %c3 : tensor<1x?x?x?xf16>
+    %weights_height = tensor.dim %filter, %c0 : tensor<?x?x?x?xf16>
+    %weights_width = tensor.dim %filter, %c1 : tensor<?x?x?x?xf16>
+    %output_height = tensor.dim %init, %c1 : tensor<1x?x?x?xf32>
+    %output_width = tensor.dim %init, %c2 : tensor<1x?x?x?xf32>
+    %output_channels = tensor.dim %init, %c3 : tensor<1x?x?x?xf32>
+
+    %input_width_i32 = arith.index_cast %input_width : index to i32
+    %input_height_i32 = arith.index_cast %input_height : index to i32
+    %input_channels_i32 = arith.index_cast %input_channels : index to i32
+    %output_channels_i32 = arith.index_cast %output_channels : index to i32
+    %weights_width_i32 = arith.index_cast %weights_width : index to i32
+    %weights_height_i32 = arith.index_cast %weights_height : index to i32
+
+    %bias_empty = tensor.empty(%output_channels) : tensor<?xf16>
+    %bias_f16 = linalg.generic {
+        indexing_maps = [affine_map<(d0) -> (d0)>, affine_map<(d0) -> (d0)>],
+        iterator_types = ["parallel"]
+      } ins(%bias : tensor<?xf32>) outs(%bias_empty : tensor<?xf16>) {
+      ^bb0(%value: f32, %out: f16):
+        %narrowed = arith.truncf %value : f32 to f16
+        linalg.yield %narrowed : f16
+    } -> tensor<?xf16>
+
+    // The skip arrives f32 (an f32 import); the binding is f16. In a chain
+    // the skip is the previous dispatch's widened result, and this truncf
+    // cancels against that widen.
+    %skip_empty = tensor.empty(%output_height, %output_width, %output_channels)
+        : tensor<1x?x?x?xf16>
+    %skip = linalg.generic {
+        indexing_maps = [
+          affine_map<(d0, d1, d2, d3) -> (d0, d1, d2, d3)>,
+          affine_map<(d0, d1, d2, d3) -> (d0, d1, d2, d3)>
+        ],
+        iterator_types = ["parallel", "parallel", "parallel", "parallel"]
+      } ins(%skip_f32 : tensor<1x?x?x?xf32>)
+        outs(%skip_empty : tensor<1x?x?x?xf16>) {
+      ^bb0(%value: f32, %out: f16):
+        %narrowed = arith.truncf %value : f32 to f16
+        linalg.yield %narrowed : f16
+    } -> tensor<1x?x?x?xf16>
+
+    %layout_i32 = arith.constant 0 : i32
+    %raw_f16 = flow.dispatch
+        @rocket_dynamic_residual_executable::@rocket_dynamic_conv2d_v1::@rocket_dynamic_conv2d(
           %input_width_i32, %input_height_i32, %input_channels_i32,
           %output_channels_i32, %weights_width_i32, %weights_height_i32, %layout_i32,
           %input, %filter, %bias_f16, %skip)
@@ -9921,6 +10121,202 @@ module attributes {transform.with_named_sequence} {
     transform.yield %ins, %outs : !transform.any_value, !transform.any_value
   }
 
+  // Linear twins of the two residual ReLU matchers: `conv + bias + skip`
+  // with nothing after it, as `FuseConvResidualLinear` builds it. Each comes
+  // with an f16 skip (an f16 import, widened in the body) and an f32 one (an
+  // f32 import, `_wide`, added as is) -- the epilogue's operand type is part
+  // of what the DAG compares -- and plain and demoted spellings of the conv.
+
+  transform.named_sequence @match_dynamic_conv2d_residual(
+      %root: !transform.any_op {transform.readonly})
+      -> (!transform.any_value, !transform.any_value) {
+    transform.match.operation_name %root ["linalg.generic"] : !transform.any_op
+    %conv = transform.get_producer_of_operand %root[0]
+        : (!transform.any_op) -> !transform.any_op
+    transform.match.operation_name %conv ["linalg.conv_2d_nhwc_hwcf"] : !transform.any_op
+    transform.rocket.match.admitted %conv : !transform.any_op
+    %batch, %out_img, %out_ch, %filter, %in_ch, %depth, %strides, %dilations =
+        transform.iree.match.convolution %conv,
+          lhs_type = f16, rhs_type = f16, output_type = f32
+          : !transform.any_op -> !transform.param<i64>
+    transform.iree.match.dims_equal %batch, [1] : !transform.param<i64>
+    transform.iree.match.dims_equal %out_img, [-1, -1] : !transform.param<i64>
+    transform.iree.match.dims_equal %out_ch, [-1] : !transform.param<i64>
+    transform.iree.match.dims_equal %filter, [1, 1] : !transform.param<i64>
+    transform.iree.match.dims_equal %in_ch, [-1] : !transform.param<i64>
+    transform.iree.match.dims_equal %depth, [] : !transform.param<i64>
+    transform.iree.match.dims_equal %strides, [1, 1] : !transform.param<i64>
+    transform.iree.match.dims_equal %dilations, [1, 1] : !transform.param<i64>
+    %ins, %outs = transform.iree.match.cast_compatible_dag_from_root %root {
+      ^bb0(%input: tensor<1x?x?x?xf16>, %weights: tensor<?x?x?x?xf16>,
+           %acc_init: tensor<1x?x?x?xf32>, %bias: tensor<?xf32>,
+           %skip: tensor<1x?x?x?xf16>,
+           %out_init: tensor<1x?x?x?xf32>):
+        %accumulator = linalg.conv_2d_nhwc_hwcf
+            {dilations = dense<1> : vector<2xi64>, strides = dense<1> : vector<2xi64>}
+            ins(%input, %weights : tensor<1x?x?x?xf16>, tensor<?x?x?x?xf16>)
+            outs(%acc_init : tensor<1x?x?x?xf32>) -> tensor<1x?x?x?xf32>
+        %epilogue = linalg.generic {
+            indexing_maps = [affine_map<(d0, d1, d2, d3) -> (d0, d1, d2, d3)>,
+                             affine_map<(d0, d1, d2, d3) -> (d3)>,
+                             affine_map<(d0, d1, d2, d3) -> (d0, d1, d2, d3)>,
+                             affine_map<(d0, d1, d2, d3) -> (d0, d1, d2, d3)>],
+            iterator_types = ["parallel", "parallel", "parallel", "parallel"]}
+            ins(%accumulator, %bias, %skip
+                : tensor<1x?x?x?xf32>, tensor<?xf32>, tensor<1x?x?x?xf16>)
+            outs(%out_init : tensor<1x?x?x?xf32>) {
+          ^bb2(%raw: f32, %channel_bias: f32, %residual: f16, %unused: f32):
+            %biased = arith.addf %raw, %channel_bias : f32
+            %wide = arith.extf %residual : f16 to f32
+            %summed = arith.addf %biased, %wide : f32
+            linalg.yield %summed : f32
+        } -> tensor<1x?x?x?xf32>
+    } : (!transform.any_op) -> (!transform.any_value, !transform.any_value)
+    transform.yield %ins, %outs : !transform.any_value, !transform.any_value
+  }
+
+  transform.named_sequence @match_dynamic_conv2d_residual_demoted(
+      %root: !transform.any_op {transform.readonly})
+      -> (!transform.any_value, !transform.any_value) {
+    transform.match.operation_name %root ["linalg.generic"] : !transform.any_op
+    %conv = transform.get_producer_of_operand %root[0]
+        : (!transform.any_op) -> !transform.any_op
+    transform.match.operation_name %conv ["linalg.conv_2d_nhwc_hwcf"] : !transform.any_op
+    transform.rocket.match.admitted %conv : !transform.any_op
+    %batch, %out_img, %out_ch, %filter, %in_ch, %depth, %strides, %dilations =
+        transform.iree.match.convolution %conv,
+          lhs_type = f16, rhs_type = f16, output_type = f32
+          : !transform.any_op -> !transform.param<i64>
+    transform.iree.match.dims_equal %batch, [1] : !transform.param<i64>
+    transform.iree.match.dims_equal %out_img, [-1, -1] : !transform.param<i64>
+    transform.iree.match.dims_equal %out_ch, [-1] : !transform.param<i64>
+    transform.iree.match.dims_equal %filter, [1, 1] : !transform.param<i64>
+    transform.iree.match.dims_equal %in_ch, [-1] : !transform.param<i64>
+    transform.iree.match.dims_equal %depth, [] : !transform.param<i64>
+    transform.iree.match.dims_equal %strides, [1, 1] : !transform.param<i64>
+    transform.iree.match.dims_equal %dilations, [1, 1] : !transform.param<i64>
+    %ins, %outs = transform.iree.match.cast_compatible_dag_from_root %root {
+      ^bb0(%input: tensor<1x?x?x?xf16>, %weights: tensor<?x?x?x?xf16>,
+           %acc_init: tensor<1x?x?x?xf32>, %bias: tensor<?xf32>,
+           %skip: tensor<1x?x?x?xf16>,
+           %out_init: tensor<1x?x?x?xf32>):
+        %accumulator = linalg.conv_2d_nhwc_hwcf
+            {dilations = dense<1> : vector<2xi64>, rocket.f16_demoted, strides = dense<1> : vector<2xi64>}
+            ins(%input, %weights : tensor<1x?x?x?xf16>, tensor<?x?x?x?xf16>)
+            outs(%acc_init : tensor<1x?x?x?xf32>) -> tensor<1x?x?x?xf32>
+        %epilogue = linalg.generic {
+            indexing_maps = [affine_map<(d0, d1, d2, d3) -> (d0, d1, d2, d3)>,
+                             affine_map<(d0, d1, d2, d3) -> (d3)>,
+                             affine_map<(d0, d1, d2, d3) -> (d0, d1, d2, d3)>,
+                             affine_map<(d0, d1, d2, d3) -> (d0, d1, d2, d3)>],
+            iterator_types = ["parallel", "parallel", "parallel", "parallel"]}
+            ins(%accumulator, %bias, %skip
+                : tensor<1x?x?x?xf32>, tensor<?xf32>, tensor<1x?x?x?xf16>)
+            outs(%out_init : tensor<1x?x?x?xf32>) {
+          ^bb2(%raw: f32, %channel_bias: f32, %residual: f16, %unused: f32):
+            %biased = arith.addf %raw, %channel_bias : f32
+            %wide = arith.extf %residual : f16 to f32
+            %summed = arith.addf %biased, %wide : f32
+            linalg.yield %summed : f32
+        } -> tensor<1x?x?x?xf32>
+    } : (!transform.any_op) -> (!transform.any_value, !transform.any_value)
+    transform.yield %ins, %outs : !transform.any_value, !transform.any_value
+  }
+
+  transform.named_sequence @match_dynamic_conv2d_residual_wide(
+      %root: !transform.any_op {transform.readonly})
+      -> (!transform.any_value, !transform.any_value) {
+    transform.match.operation_name %root ["linalg.generic"] : !transform.any_op
+    %conv = transform.get_producer_of_operand %root[0]
+        : (!transform.any_op) -> !transform.any_op
+    transform.match.operation_name %conv ["linalg.conv_2d_nhwc_hwcf"] : !transform.any_op
+    transform.rocket.match.admitted %conv : !transform.any_op
+    %batch, %out_img, %out_ch, %filter, %in_ch, %depth, %strides, %dilations =
+        transform.iree.match.convolution %conv,
+          lhs_type = f16, rhs_type = f16, output_type = f32
+          : !transform.any_op -> !transform.param<i64>
+    transform.iree.match.dims_equal %batch, [1] : !transform.param<i64>
+    transform.iree.match.dims_equal %out_img, [-1, -1] : !transform.param<i64>
+    transform.iree.match.dims_equal %out_ch, [-1] : !transform.param<i64>
+    transform.iree.match.dims_equal %filter, [1, 1] : !transform.param<i64>
+    transform.iree.match.dims_equal %in_ch, [-1] : !transform.param<i64>
+    transform.iree.match.dims_equal %depth, [] : !transform.param<i64>
+    transform.iree.match.dims_equal %strides, [1, 1] : !transform.param<i64>
+    transform.iree.match.dims_equal %dilations, [1, 1] : !transform.param<i64>
+    %ins, %outs = transform.iree.match.cast_compatible_dag_from_root %root {
+      ^bb0(%input: tensor<1x?x?x?xf16>, %weights: tensor<?x?x?x?xf16>,
+           %acc_init: tensor<1x?x?x?xf32>, %bias: tensor<?xf32>,
+           %skip: tensor<1x?x?x?xf32>,
+           %out_init: tensor<1x?x?x?xf32>):
+        %accumulator = linalg.conv_2d_nhwc_hwcf
+            {dilations = dense<1> : vector<2xi64>, strides = dense<1> : vector<2xi64>}
+            ins(%input, %weights : tensor<1x?x?x?xf16>, tensor<?x?x?x?xf16>)
+            outs(%acc_init : tensor<1x?x?x?xf32>) -> tensor<1x?x?x?xf32>
+        %epilogue = linalg.generic {
+            indexing_maps = [affine_map<(d0, d1, d2, d3) -> (d0, d1, d2, d3)>,
+                             affine_map<(d0, d1, d2, d3) -> (d3)>,
+                             affine_map<(d0, d1, d2, d3) -> (d0, d1, d2, d3)>,
+                             affine_map<(d0, d1, d2, d3) -> (d0, d1, d2, d3)>],
+            iterator_types = ["parallel", "parallel", "parallel", "parallel"]}
+            ins(%accumulator, %bias, %skip
+                : tensor<1x?x?x?xf32>, tensor<?xf32>, tensor<1x?x?x?xf32>)
+            outs(%out_init : tensor<1x?x?x?xf32>) {
+          ^bb2(%raw: f32, %channel_bias: f32, %residual: f32, %unused: f32):
+            %biased = arith.addf %raw, %channel_bias : f32
+            %summed = arith.addf %biased, %residual : f32
+            linalg.yield %summed : f32
+        } -> tensor<1x?x?x?xf32>
+    } : (!transform.any_op) -> (!transform.any_value, !transform.any_value)
+    transform.yield %ins, %outs : !transform.any_value, !transform.any_value
+  }
+
+  transform.named_sequence @match_dynamic_conv2d_residual_demoted_wide(
+      %root: !transform.any_op {transform.readonly})
+      -> (!transform.any_value, !transform.any_value) {
+    transform.match.operation_name %root ["linalg.generic"] : !transform.any_op
+    %conv = transform.get_producer_of_operand %root[0]
+        : (!transform.any_op) -> !transform.any_op
+    transform.match.operation_name %conv ["linalg.conv_2d_nhwc_hwcf"] : !transform.any_op
+    transform.rocket.match.admitted %conv : !transform.any_op
+    %batch, %out_img, %out_ch, %filter, %in_ch, %depth, %strides, %dilations =
+        transform.iree.match.convolution %conv,
+          lhs_type = f16, rhs_type = f16, output_type = f32
+          : !transform.any_op -> !transform.param<i64>
+    transform.iree.match.dims_equal %batch, [1] : !transform.param<i64>
+    transform.iree.match.dims_equal %out_img, [-1, -1] : !transform.param<i64>
+    transform.iree.match.dims_equal %out_ch, [-1] : !transform.param<i64>
+    transform.iree.match.dims_equal %filter, [1, 1] : !transform.param<i64>
+    transform.iree.match.dims_equal %in_ch, [-1] : !transform.param<i64>
+    transform.iree.match.dims_equal %depth, [] : !transform.param<i64>
+    transform.iree.match.dims_equal %strides, [1, 1] : !transform.param<i64>
+    transform.iree.match.dims_equal %dilations, [1, 1] : !transform.param<i64>
+    %ins, %outs = transform.iree.match.cast_compatible_dag_from_root %root {
+      ^bb0(%input: tensor<1x?x?x?xf16>, %weights: tensor<?x?x?x?xf16>,
+           %acc_init: tensor<1x?x?x?xf32>, %bias: tensor<?xf32>,
+           %skip: tensor<1x?x?x?xf32>,
+           %out_init: tensor<1x?x?x?xf32>):
+        %accumulator = linalg.conv_2d_nhwc_hwcf
+            {dilations = dense<1> : vector<2xi64>, rocket.f16_demoted, strides = dense<1> : vector<2xi64>}
+            ins(%input, %weights : tensor<1x?x?x?xf16>, tensor<?x?x?x?xf16>)
+            outs(%acc_init : tensor<1x?x?x?xf32>) -> tensor<1x?x?x?xf32>
+        %epilogue = linalg.generic {
+            indexing_maps = [affine_map<(d0, d1, d2, d3) -> (d0, d1, d2, d3)>,
+                             affine_map<(d0, d1, d2, d3) -> (d3)>,
+                             affine_map<(d0, d1, d2, d3) -> (d0, d1, d2, d3)>,
+                             affine_map<(d0, d1, d2, d3) -> (d0, d1, d2, d3)>],
+            iterator_types = ["parallel", "parallel", "parallel", "parallel"]}
+            ins(%accumulator, %bias, %skip
+                : tensor<1x?x?x?xf32>, tensor<?xf32>, tensor<1x?x?x?xf32>)
+            outs(%out_init : tensor<1x?x?x?xf32>) {
+          ^bb2(%raw: f32, %channel_bias: f32, %residual: f32, %unused: f32):
+            %biased = arith.addf %raw, %channel_bias : f32
+            %summed = arith.addf %biased, %residual : f32
+            linalg.yield %summed : f32
+        } -> tensor<1x?x?x?xf32>
+    } : (!transform.any_op) -> (!transform.any_value, !transform.any_value)
+    transform.yield %ins, %outs : !transform.any_value, !transform.any_value
+  }
+
   transform.named_sequence @match_dynamic_conv2d_relu6(
       %root: !transform.any_op {transform.readonly})
       -> (!transform.any_value, !transform.any_value) {
@@ -11713,6 +12109,42 @@ module attributes {transform.with_named_sequence} {
     transform.yield
   }
 
+  transform.named_sequence @cast_and_call_dynamic_conv2d_residual(
+      %ins: !transform.any_value {transform.readonly},
+      %out: !transform.any_value {transform.readonly}) {
+    %root = transform.get_defining_op %out : (!transform.any_value) -> !transform.any_op
+    %module = transform.util.get_nearest_symbol_table %root : (!transform.any_op) -> !transform.any_op
+    %topology_attr = transform.param.constant #hal.device.topology<links = [
+        (@rocket_device -> @cpu_device = {transparent_access = true, unified_memory = true}),
+        (@cpu_device -> @rocket_device = {transparent_access = true, unified_memory = true})
+      ]> -> !transform.any_param
+    transform.annotate %module "stream.topology" = %topology_attr : !transform.any_op, !transform.any_param
+    %executable = transform.util.import_symbol @rocket_dynamic_residual_executable into %module if undefined : (!transform.any_op) -> !transform.any_op
+    %func = transform.util.import_symbol @call_rocket_dynamic_conv2d_residual into %module if undefined : (!transform.any_op) -> !transform.any_op
+    transform.util.cast_and_call %func(%ins) -> %out after %root {
+          transform.type_conversion.tensor.cast_shape_dynamic_dims
+      } : (!transform.any_op, !transform.any_value, !transform.any_value, !transform.any_op) -> !transform.any_op
+    transform.yield
+  }
+
+  transform.named_sequence @cast_and_call_dynamic_conv2d_residual_wide(
+      %ins: !transform.any_value {transform.readonly},
+      %out: !transform.any_value {transform.readonly}) {
+    %root = transform.get_defining_op %out : (!transform.any_value) -> !transform.any_op
+    %module = transform.util.get_nearest_symbol_table %root : (!transform.any_op) -> !transform.any_op
+    %topology_attr = transform.param.constant #hal.device.topology<links = [
+        (@rocket_device -> @cpu_device = {transparent_access = true, unified_memory = true}),
+        (@cpu_device -> @rocket_device = {transparent_access = true, unified_memory = true})
+      ]> -> !transform.any_param
+    transform.annotate %module "stream.topology" = %topology_attr : !transform.any_op, !transform.any_param
+    %executable = transform.util.import_symbol @rocket_dynamic_residual_executable into %module if undefined : (!transform.any_op) -> !transform.any_op
+    %func = transform.util.import_symbol @call_rocket_dynamic_conv2d_residual_wide into %module if undefined : (!transform.any_op) -> !transform.any_op
+    transform.util.cast_and_call %func(%ins) -> %out after %root {
+          transform.type_conversion.tensor.cast_shape_dynamic_dims
+      } : (!transform.any_op, !transform.any_value, !transform.any_value, !transform.any_op) -> !transform.any_op
+    transform.yield
+  }
+
   transform.named_sequence @cast_and_call_dynamic_conv2d_relu6(
       %ins: !transform.any_value {transform.readonly},
       %out: !transform.any_value {transform.readonly}) {
@@ -12261,6 +12693,10 @@ module attributes {transform.with_named_sequence} {
             // Fused epilogues first: they root at the epilogue generic, and a
             @match_dynamic_conv2d_residual_relu -> @cast_and_call_dynamic_conv2d_residual_relu,
             @match_dynamic_conv2d_residual_relu_demoted -> @cast_and_call_dynamic_conv2d_residual_relu,
+            @match_dynamic_conv2d_residual -> @cast_and_call_dynamic_conv2d_residual,
+            @match_dynamic_conv2d_residual_demoted -> @cast_and_call_dynamic_conv2d_residual,
+            @match_dynamic_conv2d_residual_wide -> @cast_and_call_dynamic_conv2d_residual_wide,
+            @match_dynamic_conv2d_residual_demoted_wide -> @cast_and_call_dynamic_conv2d_residual_wide,
             // conv-rooted matcher below would otherwise claim the convolution
             // and leave the generic on the CPU.
             @match_dynamic_conv2d_relu -> @cast_and_call_dynamic_conv2d_relu,

@@ -373,20 +373,73 @@ unsafe fn note_dense_read(cb: &mut RocketCommandBuffer, binding: &iree_hal_buffe
     let Some(read) = (unsafe { dma_range(binding.buffer, binding.offset, binding.length) }) else {
         return;
     };
-    for op in cb.ops.iter_mut() {
-        let overlaps = recorded_write_extent(op)
-            .and_then(|(buffer, offset, length)| unsafe { dma_range(buffer, offset, length) })
-            .is_some_and(|wrote| wrote.0 < read.1 && read.0 < wrote.1);
-        if let (
-            true,
-            RecordedOp::Dispatch {
-                dense_read_seen, ..
-            },
-        ) = (overlaps, op)
+    let extents: Vec<Option<(u64, u64)>> = cb
+        .ops
+        .iter()
+        .map(|op| {
+            recorded_write_extent(op)
+                .and_then(|(buffer, offset, length)| unsafe { dma_range(buffer, offset, length) })
+        })
+        .collect();
+    for index in observed_writes(read, &extents) {
+        if let RecordedOp::Dispatch {
+            dense_read_seen, ..
+        } = &mut cb.ops[index]
         {
             *dense_read_seen = true;
         }
     }
+}
+
+/// The recorded writes a dense read of `read` actually observes, as indices
+/// into `extents` (one write extent per recorded op, `None` for an op that
+/// writes nothing dense).
+///
+/// Walking back from the most recent op, each write overlapping what is still
+/// unexplained is the source of those bytes: it is observed, and its extent is
+/// removed from the read. The walk stops once nothing is left. An earlier
+/// write the read overlaps only through a later one is *not* observed --
+/// which is the common case, because IREE reuses transient allocations: on a
+/// command buffer that spans most of a model, one dense read used to mark
+/// every dispatch that had ever written those bytes, and each of them then
+/// kept a compaction no reader needed. On MobileNetV2 with its residual adds
+/// on the NPU (one command buffer instead of seventeen), that was 25 kept
+/// compactions per inference whose every declared reader had chained.
+///
+/// Sound because a later write always lands after an earlier one in
+/// `apply_ops`, and the one that is observed sets `dense_read_seen`, so it
+/// keeps its own write: the read can only see bytes this marks as needed.
+pub fn observed_writes(read: (u64, u64), extents: &[Option<(u64, u64)>]) -> Vec<usize> {
+    let mut unexplained = vec![read];
+    let mut observed = Vec::new();
+    for (index, extent) in extents.iter().enumerate().rev() {
+        if unexplained.is_empty() {
+            break;
+        }
+        let Some((start, end)) = *extent else {
+            continue;
+        };
+        let mut hit = false;
+        let mut left = Vec::with_capacity(unexplained.len() + 1);
+        for (a, b) in unexplained {
+            if start < b && a < end {
+                hit = true;
+                if a < start {
+                    left.push((a, start));
+                }
+                if end < b {
+                    left.push((end, b));
+                }
+            } else {
+                left.push((a, b));
+            }
+        }
+        if hit {
+            observed.push(index);
+        }
+        unexplained = left;
+    }
+    observed
 }
 
 /// after preceding recorded update/fill/copy operations have populated the
@@ -4570,7 +4623,28 @@ pub static VTABLE: iree_hal_command_buffer_vtable_t = iree_hal_command_buffer_vt
 
 #[cfg(test)]
 mod lazy_compaction_tests {
-    use super::compaction_elidable;
+    use super::{compaction_elidable, observed_writes};
+
+    // A dense read marks only the writes whose bytes it sees: the most recent
+    // writer of each byte, not every op that ever wrote the range.
+    #[test]
+    fn a_dense_read_observes_only_the_most_recent_writer_of_each_byte() {
+        // An allocation reused three times; the read sees the last write only.
+        let reused = [Some((0, 100)), None, Some((0, 100)), Some((0, 100))];
+        assert_eq!(observed_writes((0, 100), &reused), vec![3]);
+        // A later write that covers half: the earlier one still supplies the
+        // other half, and is observed too.
+        let partial = [Some((0, 100)), Some((0, 50))];
+        assert_eq!(observed_writes((0, 100), &partial), vec![1, 0]);
+        // A write inside the read leaves both ends to earlier writers.
+        let middle = [Some((0, 40)), Some((60, 100)), Some((30, 70))];
+        assert_eq!(observed_writes((0, 100), &middle), vec![2, 1, 0]);
+        // Disjoint writes are never observed, whatever their order.
+        let disjoint = [Some((0, 10)), Some((200, 300)), Some((90, 110))];
+        assert_eq!(observed_writes((100, 200), &disjoint), vec![2]);
+        // Nothing wrote these bytes on this command buffer.
+        assert!(observed_writes((0, 10), &[None, Some((10, 20))]).is_empty());
+    }
 
     // The rule behind skipping a dense output write. Each case is one way the
     // write must be kept; only the last skips it.
