@@ -23,12 +23,13 @@ use rocket_core::{
     conv::{self, Activation, ConvPlan, Multiplier, Precision, Quantization},
     error::{PlanError, PlanErrorCode},
     fc,
+    grouped::{GroupedConv, detect_block_diagonal_groups},
     layout::{self, CubeGeometry, CubeKind},
     policy::{PlanningPolicy, with_policy},
     weights::WeightPlan,
 };
 
-pub const ROCKET_PLAN_ABI_VERSION: u32 = 5;
+pub const ROCKET_PLAN_ABI_VERSION: u32 = 6;
 
 pub const ROCKET_PLAN_OK: u32 = 0;
 pub const ROCKET_PLAN_INVALID_SHAPE: u32 = 1;
@@ -994,11 +995,162 @@ pub unsafe extern "C" fn rocket_pack_matmul_weights(
     }
 }
 
+/// # Safety
+/// See `rocket_plan.h`.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn rocket_detect_block_diagonal_groups(
+    desc: *const rocket_plan_conv_desc_t,
+    dense: *const u8,
+    dense_length: usize,
+) -> u32 {
+    catch_unwind(AssertUnwindSafe(|| {
+        // SAFETY: forwarded contract.
+        let Ok(desc) = (unsafe { checked_desc(desc, |d| d.struct_size) }) else {
+            return 1;
+        };
+        let Ok((shape, kernels)) = conv_shape_checked(desc) else {
+            return 1;
+        };
+        if dense.is_null() || shape.depthwise {
+            return 1;
+        }
+        // SAFETY: non-null and sized as the caller promised.
+        let dense = unsafe { std::slice::from_raw_parts(dense, dense_length) };
+        detect_block_diagonal_groups(
+            dense,
+            kernels,
+            shape.in_channels as usize,
+            shape.out_channels as usize,
+            shape.precision.element_bytes() as usize,
+        )
+    }))
+    .unwrap_or(1)
+}
+
+/// # Safety
+/// See `rocket_plan.h`.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn rocket_pack_grouped_conv_weights(
+    desc: *const rocket_plan_conv_desc_t,
+    groups: u32,
+    dense: *const u8,
+    dense_length: usize,
+    packed: *mut u8,
+    packed_capacity: usize,
+    out_packed_length: *mut usize,
+    message: *mut c_char,
+    message_capacity: usize,
+) -> u32 {
+    let outcome = catch_unwind(AssertUnwindSafe(|| -> Result<(), Refusal> {
+        // SAFETY: forwarded contract.
+        let desc = unsafe { checked_desc(desc, |d| d.struct_size) }?;
+        let (shape, kernels) = conv_shape_checked(desc)?;
+        let grouped = GroupedConv::try_new(shape, kernels, groups)?;
+        let packed_length = grouped.packed_bytes()?;
+        if !out_packed_length.is_null() {
+            // SAFETY: non-null; the caller promises a writable size_t.
+            unsafe { *out_packed_length = packed_length };
+        }
+        if packed.is_null() {
+            return Ok(());
+        }
+        if dense.is_null() {
+            return Err(invalid("dense filter pointer is null"));
+        }
+        if packed_capacity < packed_length {
+            return Err(invalid(format!(
+                "packed buffer holds {packed_capacity} bytes, the layout needs {packed_length}"
+            )));
+        }
+        // SAFETY: non-null and sized as the caller promised.
+        let dense = unsafe { std::slice::from_raw_parts(dense, dense_length) };
+        // SAFETY: non-null and sized as the caller promised.
+        let packed = unsafe { std::slice::from_raw_parts_mut(packed, packed_capacity) };
+        grouped.pack(dense, packed)?;
+        Ok(())
+    }));
+    // SAFETY: caller's buffer contract.
+    unsafe { report(outcome, message, message_capacity, "grouped weight packer") }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use rocket_core::weights::pack_hwcf_to_rocket_weights;
     use std::{ffi::CStr, mem::size_of};
+
+    #[test]
+    fn grouped_entries_detect_and_pack_a_block_diagonal_filter() {
+        // 4 groups of 16 channels, fp16 3x3.
+        let desc = conv_desc(8, 8, 64, 64, 3);
+        let mut dense = vec![0u8; 9 * 64 * 64 * 2];
+        for tap in 0..9 {
+            for i in 0..64 {
+                for o in 0..64 {
+                    if i / 16 == o / 16 {
+                        let at = ((tap * 64 + i) * 64 + o) * 2;
+                        dense[at..at + 2].copy_from_slice(&0x3c00u16.to_le_bytes());
+                    }
+                }
+            }
+        }
+        let groups =
+            unsafe { rocket_detect_block_diagonal_groups(&desc, dense.as_ptr(), dense.len()) };
+        assert_eq!(groups, 4);
+        let mut size = 0usize;
+        let mut message = [0 as c_char; 256];
+        let status = unsafe {
+            rocket_pack_grouped_conv_weights(
+                &desc,
+                groups,
+                dense.as_ptr(),
+                dense.len(),
+                std::ptr::null_mut(),
+                0,
+                &mut size,
+                message.as_mut_ptr(),
+                message.len(),
+            )
+        };
+        assert_eq!(status, ROCKET_PLAN_OK);
+        let mut packed = vec![0u8; size];
+        let status = unsafe {
+            rocket_pack_grouped_conv_weights(
+                &desc,
+                groups,
+                dense.as_ptr(),
+                dense.len(),
+                packed.as_mut_ptr(),
+                packed.len(),
+                &mut size,
+                message.as_mut_ptr(),
+                message.len(),
+            )
+        };
+        assert_eq!(status, ROCKET_PLAN_OK);
+        let Ok((shape, kernels)) = conv_shape_checked(&desc) else {
+            panic!("descriptor is valid");
+        };
+        let grouped = GroupedConv::try_new(shape, kernels, 4).unwrap();
+        let mut expected = vec![0u8; grouped.packed_bytes().unwrap()];
+        grouped.pack(&dense, &mut expected).unwrap();
+        assert_eq!(packed, expected);
+        // A refused grouping reports instead of packing.
+        let status = unsafe {
+            rocket_pack_grouped_conv_weights(
+                &desc,
+                1,
+                dense.as_ptr(),
+                dense.len(),
+                std::ptr::null_mut(),
+                0,
+                &mut size,
+                message.as_mut_ptr(),
+                message.len(),
+            )
+        };
+        assert_ne!(status, ROCKET_PLAN_OK);
+    }
 
     #[test]
     fn the_packer_entry_is_the_drivers_packer() {

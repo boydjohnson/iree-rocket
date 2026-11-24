@@ -1942,6 +1942,24 @@ def compile_modules(
                 f"{function} was not packed by rocket-pack-weights; the differential "
                 "would run the runtime packer and prove nothing about weights_packed"
             )
+    # The grouped convolution must reach the per-slice lowering, not just the
+    # block-diagonal dense one: rocket-pack-weights retargets it at the
+    # `_packed_g<groups>` clone (Conv2DDef.groups).
+    for function, executable in GROUPED_CASES:
+        match = re.search(
+            rf"util\.func public @{re.escape(function)}\b(?P<body>.*?)"
+            r"(?=\n\s*util\.func (?:public|private) @|\Z)",
+            pinned_text,
+            re.DOTALL,
+        )
+        if match is None or not re.search(
+            r"flow\.dispatch @" + re.escape(executable) + r"::", match.group("body")
+        ):
+            raise SystemExit(
+                f"{function} was not packed as a grouped convolution; the differential "
+                "would run the block-diagonal dense convolution and prove nothing about "
+                "Conv2DDef.groups"
+            )
     run(
         [
             str(compiler),
@@ -2272,6 +2290,11 @@ func.func @depthwise_fp16_packed_weights(%input: tensor<1x16x16x576xf16>, %init:
   return %0 : tensor<1x14x14x576xf32>
 }}
 """
+
+
+# Grouped convolutions and the clone rocket-pack-weights must retarget them
+# at -- 8 groups of 8 channels.
+GROUPED_CASES = (("fp16_grouped_conv", "rocket_dynamic_executable_packed_g8"),)
 
 
 def grouped_conv_fixture() -> str:

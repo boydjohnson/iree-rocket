@@ -31,7 +31,7 @@
 extern "C" {
 #endif
 
-#define ROCKET_PLAN_ABI_VERSION 5u
+#define ROCKET_PLAN_ABI_VERSION 6u
 
 /* Mirrors rocket_core::conv::Precision. Values are part of the ABI. */
 typedef enum rocket_plan_precision_e {
@@ -320,6 +320,30 @@ uint32_t rocket_pack_matmul_weights(const rocket_plan_matmul_desc_t* desc,
                                     uint8_t* packed, size_t packed_capacity,
                                     size_t* out_packed_length, char* message,
                                     size_t message_capacity);
+
+/* The largest group count (up to 64) for which a dense convolution's HWCF
+ * filter is zero wherever an output channel's group differs from an input
+ * channel's -- the block-diagonal filter rocket-block-diagonal-grouped-conv
+ * builds -- or 1 when there is none or `desc`/`dense` is unusable. Always
+ * safe to act on: a dense filter that is zero off its diagonal blocks
+ * computes the same thing grouped. Never panics. Added in ABI version 6. */
+uint32_t rocket_detect_block_diagonal_groups(const rocket_plan_conv_desc_t* desc,
+                                             const uint8_t* dense,
+                                             size_t dense_length);
+
+/* Packs a block-diagonal dense filter for the grouped lowering
+ * (rocket_core::grouped::GroupedConv, `groups` groups): each channel
+ * slice's diagonal block through the dense packer, back to back, slice `s`
+ * at `s * (total / slices)`. Same contract as rocket_pack_conv_weights; a
+ * shape the grouped lowering refuses is ROCKET_PLAN_UNVALIDATED_CONFIGURATION (or
+ * INVALID_ARGUMENT). Added in ABI version 6. */
+uint32_t rocket_pack_grouped_conv_weights(const rocket_plan_conv_desc_t* desc,
+                                          uint32_t groups, const uint8_t* dense,
+                                          size_t dense_length, uint8_t* packed,
+                                          size_t packed_capacity,
+                                          size_t* out_packed_length,
+                                          char* message,
+                                          size_t message_capacity);
 
 #ifdef __cplusplus
 }

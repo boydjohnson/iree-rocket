@@ -33,6 +33,9 @@ pub mod tensor_layout;
 
 /// The feature-cube layout contract (COMPILER_ROADMAP.md 6.1), re-exported
 /// from `rocket-core` so the driver reads it from one place.
+/// A grouped convolution as per-channel-slice tasks, re-exported from
+/// `rocket-core` so the compile-time packer and the driver share its slicing.
+pub use rocket_core::grouped;
 pub use rocket_core::layout;
 
 /// The coefficient layout and its packers (COMPILER_ROADMAP.md 6.3),

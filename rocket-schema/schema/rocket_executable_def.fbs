@@ -292,6 +292,15 @@ table Conv2DDef {
   // runtime reads either, and an executable declares at most one.
   // Appended last, for the vtable reason above. COMPILER_ROADMAP.md 6.2.
   runtime_layout:bool = false;
+
+  // A grouped convolution (rocket_core::grouped::GroupedConv): run as one
+  // job of dense per-channel-slice tasks, each over its own run of input
+  // and output surfaces. The weights binding is the grouped packed stream
+  // (slice after slice), so `groups` > 1 requires `weights_packed`. 1 is an
+  // ordinary dense convolution -- what every executable before this field
+  // means. Set by rocket-pack-weights when the constant filter is block-
+  // diagonal.
+  groups:uint32 = 1;
 }
 
 // DEPRECATED: superseded by MatmulDef. Retained because union tags are

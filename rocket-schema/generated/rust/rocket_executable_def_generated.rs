@@ -1364,6 +1364,7 @@ impl<'a> Conv2DDef<'a> {
   pub const VT_RUNTIME_DENSE_READERS: flatbuffers::VOffsetT = 56;
   pub const VT_WEIGHTS_PACKED: flatbuffers::VOffsetT = 58;
   pub const VT_RUNTIME_LAYOUT: flatbuffers::VOffsetT = 60;
+  pub const VT_GROUPS: flatbuffers::VOffsetT = 62;
 
   #[inline]
   pub fn init_from_table(table: flatbuffers::Table<'a>) -> Self {
@@ -1375,6 +1376,7 @@ impl<'a> Conv2DDef<'a> {
     args: &'args Conv2DDefArgs<'args>
   ) -> flatbuffers::WIPOffset<Conv2DDef<'bldr>> {
     let mut builder = Conv2DDefBuilder::new(_fbb);
+    builder.add_groups(args.groups);
     if let Some(x) = args.runtime_quantization { builder.add_runtime_quantization(x); }
     builder.add_pad_left(args.pad_left);
     builder.add_pad_top(args.pad_top);
@@ -1524,6 +1526,10 @@ impl<'a> Conv2DDef<'a> {
   pub fn runtime_layout(&self) -> bool {
     self._tab.get::<bool>(Conv2DDef::VT_RUNTIME_LAYOUT, Some(false)).unwrap()
   }
+  #[inline]
+  pub fn groups(&self) -> u32 {
+    self._tab.get::<u32>(Conv2DDef::VT_GROUPS, Some(1)).unwrap()
+  }
 }
 
 impl flatbuffers::Verifiable for Conv2DDef<'_> {
@@ -1562,6 +1568,7 @@ impl flatbuffers::Verifiable for Conv2DDef<'_> {
      .visit_field::<bool>("runtime_dense_readers", Self::VT_RUNTIME_DENSE_READERS, false)?
      .visit_field::<bool>("weights_packed", Self::VT_WEIGHTS_PACKED, false)?
      .visit_field::<bool>("runtime_layout", Self::VT_RUNTIME_LAYOUT, false)?
+     .visit_field::<u32>("groups", Self::VT_GROUPS, false)?
      .finish();
     Ok(())
   }
@@ -1596,6 +1603,7 @@ pub struct Conv2DDefArgs<'a> {
     pub runtime_dense_readers: bool,
     pub weights_packed: bool,
     pub runtime_layout: bool,
+    pub groups: u32,
 }
 impl<'a> Default for Conv2DDefArgs<'a> {
   #[inline]
@@ -1630,6 +1638,7 @@ impl<'a> Default for Conv2DDefArgs<'a> {
       runtime_dense_readers: false,
       weights_packed: false,
       runtime_layout: false,
+      groups: 1,
     }
   }
 }
@@ -1756,6 +1765,10 @@ impl<'a: 'b, 'b> Conv2DDefBuilder<'a, 'b> {
     self.fbb_.push_slot::<bool>(Conv2DDef::VT_RUNTIME_LAYOUT, runtime_layout, false);
   }
   #[inline]
+  pub fn add_groups(&mut self, groups: u32) {
+    self.fbb_.push_slot::<u32>(Conv2DDef::VT_GROUPS, groups, 1);
+  }
+  #[inline]
   pub fn new(_fbb: &'b mut flatbuffers::FlatBufferBuilder<'a>) -> Conv2DDefBuilder<'a, 'b> {
     let start = _fbb.start_table();
     Conv2DDefBuilder {
@@ -1802,6 +1815,7 @@ impl core::fmt::Debug for Conv2DDef<'_> {
       ds.field("runtime_dense_readers", &self.runtime_dense_readers());
       ds.field("weights_packed", &self.weights_packed());
       ds.field("runtime_layout", &self.runtime_layout());
+      ds.field("groups", &self.groups());
       ds.finish()
   }
 }
