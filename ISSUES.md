@@ -1911,6 +1911,30 @@ What was settled and how, newest first, in place of the narratives — those are
 in this file's git history (`git log -p ISSUES.md`). Everything cited below is
 something that still exists: a commit, a file, or a memory.
 
+**Row-major matmul input: the CNA reads `[M, K]` in place — 2026-11-24.
+BLIP fp16 ~970 -> ~947 ms, bit-identical.** The mirror of the row-major
+output below. With the width-1 lowering a CNA line is one input row, so a
+row-major input needs `line_stride = K * 2 / 16` atoms, `surf_stride = 0` and
+`CNA_CONV_CON1.group_line_off` set (every write of it) -- the planner's
+horizontal-tile rule `surface_pitch - input_width` at a one-atom surface and
+a one-pixel line (`matmul_dense_input_probe`). The packed rule transcribed
+(grouped fetch, `line = 4 * Kc`, `surf = 1 - 4 * Kc`) and two other
+encodings hang the NPU; two more compute garbage. `K` must be whole atoms
+(the CNA reads `datain_channel`, `K` rounded to 8); exact at K 32, 40, 88
+(the fp16 coefficient bump), 768 and 3072, M 1 to 577
+(`row_major_matmul_input_matches_cube`).
+
+The driver uses it on every row-major plan whose input is not chained:
+"packing" becomes one contiguous copy into scratch (the existing `Dense`
+packing layout). `ROCKET_MATMUL_INPUT=packed` forces the NC1HWC2 packing.
+It costs 1-8% NPU time per matmul (577x768x768: 1.37 -> 1.48 ms). BLIP per
+inference: pack.input ~59 -> ~29 ms (the copy runs at 3.4 GB/s), NPU
+~271 -> ~287 ms; 972/966/973 -> 949/945/948 ms ABAB on cpu 4-7, 0 timeouts,
+output bit-identical; compiled e2e 49/49. **Left on the table:** the copy
+itself -- reading the IREE binding directly (`stage_direct`) would drop it,
+but every input handle gets a whole-BO `FINI_BO` before submit, so its cost
+depends on how large IREE's transient BO is; unmeasured.
+
 **Row-major matmul output: the DPU writes `[M, N]` itself — 2026-11-24.
 BLIP fp16 1300 -> 968 ms, bit-identical.** BLIP's re-survey showed matmul
 compaction (NC1HWC2 -> the dense IREE buffer) costing ~309 ms per inference,

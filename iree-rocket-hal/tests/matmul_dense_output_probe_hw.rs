@@ -22,6 +22,7 @@ use std::{fs::OpenOptions, mem, os::unix::io::AsRawFd, ptr, time::Instant};
 use iree_rocket_hal::rocket::{
     builders::{
         Bits, RegCmd, Register, RegisterMeta,
+        cna::{CnaConvCon1, CnaDmaCon1, CnaDmaCon2, CnaFeatureDataAddr},
         dpu::{DpuDataCubeNotchAddr, DpuDstSurfStride, DpuSurfaceAdd},
     },
     conv::{Buffers, ConvPlan, Precision, Shape},
@@ -460,6 +461,201 @@ fn run_full(
     }
 }
 
+fn run_dense_input(
+    m: usize,
+    k: usize,
+    n: usize,
+    candidate: InputStrides,
+    reps: usize,
+) -> (Vec<u16>, f64, usize, usize) {
+    let variant = Variant::TallDense;
+    use iree_rocket_hal::rocket::device::{JobDesc, submit_jobs};
+    let (width, height) = match variant {
+        Variant::WideCube => (m as u32, 1),
+        Variant::TallCube | Variant::TallDense => (1, m as u32),
+    };
+    let shape = Shape::try_with_precision(width, height, 1, k as u32, n as u32, Precision::Fp16)
+        .unwrap()
+        .try_with_padding([0, 0])
+        .unwrap();
+    let plan = ConvPlan::try_new(shape, [1, 1]).unwrap();
+
+    let dense_input: Vec<u8> = (0..m)
+        .flat_map(|row| (0..k).map(move |col| input_at(row, col) / 4.0))
+        .flat_map(|value| f32_to_f16_bits(value).to_le_bytes())
+        .collect();
+    let dense_weights: Vec<u8> = (0..k)
+        .flat_map(|row| (0..n).map(move |col| weight_at(row, col) / 4.0))
+        .flat_map(|value| f32_to_f16_bits(value).to_le_bytes())
+        .collect();
+    let input_len = nc1hwc2_storage_size(m, k * 2).unwrap();
+    let mut packed_input = vec![0; input_len];
+    pack_nhwc_to_nc1hwc2(&dense_input, m, k * 2, &mut packed_input).unwrap();
+    let weight_len = rocket_weight_storage_size(1, 1, k, n, 2).unwrap();
+    let mut packed_weights = vec![0; weight_len];
+    pack_hwcf_to_rocket_weights(&dense_weights, 1, 1, k, n, 2, &mut packed_weights).unwrap();
+    let bias_len = shape.padded_out_channels() as usize * 4;
+    let cube_len = nc1hwc2_storage_size(m, n * 2).unwrap();
+    let output_len = cube_len.max(m * n * 2);
+
+    let file = OpenOptions::new()
+        .read(true)
+        .write(true)
+        .open(DEVICE_PATH)
+        .expect("failed to open NPU device");
+    let fd = file.as_raw_fd();
+    let page = |bytes: usize| bytes.max(1).next_multiple_of(PAGE_BYTES);
+    unsafe {
+        let buf_in = Buffer::new(fd, page(input_len.max(m * k * 2)), &file);
+        // The row-major [M, K] input itself, not the NC1HWC2 cube.
+        let _ = &packed_input;
+        ptr::copy_nonoverlapping(dense_input.as_ptr(), buf_in.host_ptr, m * k * 2);
+        let buf_weights = Buffer::new(fd, page(weight_len), &file);
+        ptr::copy_nonoverlapping(packed_weights.as_ptr(), buf_weights.host_ptr, weight_len);
+        let buf_bias = Buffer::new(fd, page(bias_len), &file);
+        ptr::write_bytes(buf_bias.host_ptr, 0, buf_bias.size);
+        let buf_out = Buffer::new(fd, page(output_len), &file);
+        ptr::write_bytes(buf_out.host_ptr, SENTINEL, buf_out.size);
+
+        let mut programs = plan.programs_with_buffers(Buffers {
+            input: buf_in.dma_address,
+            weights: buf_weights.dma_address,
+            bias: buf_bias.dma_address,
+            output: buf_out.dma_address,
+        });
+        if variant == Variant::TallDense {
+            // The shipping path: `fc::Plan::try_new_row_major_output` and
+            // `place_row_major_output`, not hand-patched registers.
+            let fc_plan = iree_rocket_hal::rocket::fc::Plan::try_new_row_major_output(
+                iree_rocket_hal::rocket::fc::Shape::new(
+                    m as u32,
+                    k as u32,
+                    n as u32,
+                    Precision::Fp16,
+                ),
+            )
+            .expect("row-major output supported");
+            assert_eq!(fc_plan.conv_plan().tiles(), plan.tiles());
+            for (tile, program) in programs.iter_mut().enumerate() {
+                fc_plan.place_row_major_output(program, tile, buf_out.dma_address);
+                if candidate.api {
+                    fc_plan.place_row_major_input(program, tile, buf_in.dma_address);
+                    continue;
+                }
+                let first_row = plan.tiles()[tile].rows.in_first;
+                let base = buf_in.dma_address + first_row * (k as u32) * 2;
+                assert_eq!(
+                    replace::<CnaFeatureDataAddr>(
+                        program,
+                        Register::<CnaFeatureDataAddr>::new()
+                            .feature_base_addr(Bits::new(base))
+                            .build()
+                    ),
+                    1
+                );
+                replace::<CnaDmaCon1>(
+                    program,
+                    Register::<CnaDmaCon1>::new()
+                        .line_stride(Bits::new(candidate.line & 0x0fff_ffff))
+                        .build(),
+                );
+                replace::<CnaDmaCon2>(
+                    program,
+                    Register::<CnaDmaCon2>::new()
+                        .surf_stride(Bits::new(candidate.surf & 0x0fff_ffff))
+                        .build(),
+                );
+                if let Some(group_line_off) = candidate.group_line_off {
+                    for command in program.iter_mut() {
+                        if (command.0 >> 48) as u32 == CnaConvCon1::DOMAIN
+                            && command.0 as u32 & 0xffff == CnaConvCon1::OFFSET
+                        {
+                            let mut value = (command.0 >> 16) as u32;
+                            value = if group_line_off {
+                                value | GROUP_LINE_OFF
+                            } else {
+                                value & !GROUP_LINE_OFF
+                            };
+                            *command = RegCmd::new(CnaConvCon1::DOMAIN, CnaConvCon1::OFFSET, value);
+                        }
+                    }
+                }
+            }
+        }
+        let mut command_buffers = Vec::new();
+        for program in &programs {
+            let buffer = Buffer::new(fd, page(program.len() * mem::size_of::<u64>()), &file);
+            let words = std::slice::from_raw_parts_mut(buffer.host_ptr as *mut u64, program.len());
+            for (word, command) in words.iter_mut().zip(program) {
+                *word = command.0;
+            }
+            fini_bo(fd, buffer.handle).ok();
+            command_buffers.push((buffer, program.len() as u32));
+        }
+        for handle in [
+            buf_in.handle,
+            buf_weights.handle,
+            buf_bias.handle,
+            buf_out.handle,
+        ] {
+            fini_bo(fd, handle).ok();
+        }
+        let tasks: Vec<(u32, u32)> = command_buffers
+            .iter()
+            .map(|(buffer, count)| (buffer.dma_address, *count))
+            .collect();
+        let mut in_handles: Vec<u32> = command_buffers.iter().map(|(b, _)| b.handle).collect();
+        in_handles.extend([buf_in.handle, buf_weights.handle, buf_bias.handle]);
+        let out_handles = [buf_out.handle];
+        let mut best = f64::MAX;
+        for _ in 0..reps {
+            let jobs = [JobDesc {
+                tasks: &tasks,
+                in_handles: &in_handles,
+                out_handles: &out_handles,
+            }];
+            let started = Instant::now();
+            submit_jobs(fd, &jobs).expect("SUBMIT failed");
+            prep_bo(fd, buf_out.handle, 5_000_000_000).ok();
+            best = best.min(started.elapsed().as_secs_f64() * 1e3);
+        }
+
+        let raw = std::slice::from_raw_parts(buf_out.host_ptr, buf_out.size);
+        let mut out = vec![0u16; m * n];
+        for row in 0..m {
+            for col in 0..n {
+                let offset = match variant {
+                    Variant::TallDense => (row * n + col) * 2,
+                    _ => (col / 8) * (m.next_multiple_of(1)) * 16 + row * 16 + (col % 8) * 2,
+                };
+                out[row * n + col] = u16::from_le_bytes([raw[offset], raw[offset + 1]]);
+            }
+        }
+        // Bytes past the dense [M, N] extent the writer should never touch
+        // (only meaningful for the row-major variant; a cube is larger).
+        let past = if variant == Variant::TallDense {
+            raw[m * n * 2..]
+                .iter()
+                .filter(|byte| **byte != SENTINEL)
+                .count()
+        } else {
+            0
+        };
+        for (buffer, _) in &command_buffers {
+            close_bo(fd, buffer.handle).ok();
+        }
+        for handle in [
+            buf_in.handle,
+            buf_weights.handle,
+            buf_bias.handle,
+            buf_out.handle,
+        ] {
+            close_bo(fd, handle).ok();
+        }
+        (out, best, tasks.len(), past)
+    }
+}
+
 /// BLIP's matmul shapes in all three variants: NPU time (best of 5) and
 /// whether each variant is bit-identical to today's lowering.
 #[test]
@@ -538,6 +734,185 @@ fn row_major_matmul_output_matches_cube() {
         println!(
             "  {m}x{k}x{n}: {tasks} task(s), {wrong} differ, {past} bytes past [M, N], {ms:.2} ms"
         );
+        if wrong != 0 || past != 0 || ms > 150.0 {
+            failures.push(format!(
+                "{m}x{k}x{n}: {wrong} differ, {past} past, {ms:.1} ms"
+            ));
+        }
+    }
+    assert!(failures.is_empty(), "{failures:?}");
+}
+
+/// `CNA_CONV_CON1.group_line_off`.
+const GROUP_LINE_OFF: u32 = 0x2000_0000;
+
+/// One candidate encoding of the CNA's input strides for a row-major
+/// `[M, K]` read: `line` and `surf` as the raw (wrapping, 28-bit) register
+/// values, and `group_line_off` forced on or off (`None` keeps the plan's).
+#[derive(Clone, Copy, Debug)]
+struct InputStrides {
+    label: &'static str,
+    /// Use `fc::Plan::place_row_major_input` (the shipping path) instead of
+    /// the fields below.
+    api: bool,
+    line: u32,
+    surf: u32,
+    group_line_off: Option<bool>,
+}
+
+/// Can the CNA read a row-major `[M, K]` input in place, so the driver never
+/// packs it? The width-1 lowering reads one pixel per line; the planner
+/// programs `line_stride = 4` and `surf_stride = M - 4` for its NC1HWC2 cube,
+/// i.e. a stride per group of four lines and a surface pitch measured from
+/// the end of that group. For a row-major input a line is one row
+/// (`Kc = K * 2 / 16` atoms) and a channel group is one atom. Each candidate
+/// runs with the row-major output and is compared with the cube lowering.
+#[test]
+#[ignore = "needs /dev/accel/accel0 -- characterization, prints rather than asserts"]
+fn matmul_dense_input_probe() {
+    for (m, k, n) in [(16usize, 64usize, 64usize), (40, 768, 64)] {
+        let kc = (k * 2 / 16) as u32;
+        let wrap = |value: i64| (value as u32) & 0x0fff_ffff;
+        let candidates = [
+            InputStrides {
+                api: false,
+                label: "grouped: line 4Kc, surf 1-4Kc",
+                line: 4 * kc,
+                surf: wrap(1 - 4 * kc as i64),
+                group_line_off: Some(false),
+            },
+            InputStrides {
+                api: false,
+                label: "grouped: line 4Kc, surf 1",
+                line: 4 * kc,
+                surf: 1,
+                group_line_off: Some(false),
+            },
+            InputStrides {
+                api: false,
+                label: "line-off: line Kc, surf 0",
+                line: kc,
+                surf: 0,
+                group_line_off: Some(true),
+            },
+            InputStrides {
+                api: false,
+                label: "line-off: line Kc, surf 1",
+                line: kc,
+                surf: 1,
+                group_line_off: Some(true),
+            },
+            InputStrides {
+                api: false,
+                label: "line-off: line Kc, surf 1-Kc",
+                line: kc,
+                surf: wrap(1 - kc as i64),
+                group_line_off: Some(true),
+            },
+            InputStrides {
+                api: false,
+                label: "grouped: line Kc, surf 1-Kc",
+                line: kc,
+                surf: wrap(1 - kc as i64),
+                group_line_off: Some(false),
+            },
+        ];
+        std::thread::sleep(std::time::Duration::from_millis(800));
+        let (reference, _, _, _) = run_full(m, k, n, Variant::WideCube, 1);
+        println!("  M {m} K {k} N {n} (Kc {kc})");
+        for candidate in candidates {
+            std::thread::sleep(std::time::Duration::from_millis(800));
+            let (out, ms, _, past) = run_dense_input(m, k, n, candidate, 1);
+            let wrong = reference.iter().zip(&out).filter(|(a, b)| a != b).count();
+            println!(
+                "    {}: {wrong}/{} differ, {past} past, {ms:.2} ms{}",
+                candidate.label,
+                m * n,
+                if ms > 150.0 { " -- WATCHDOG KILL" } else { "" }
+            );
+        }
+    }
+}
+
+/// The working encoding from `matmul_dense_input_probe`: grouped line fetch
+/// off, a line is one row of `Kc` atoms, and `surf_stride = 0` -- the
+/// planner's horizontal-tile rule `surface_pitch - input_width` with a
+/// one-atom surface and a one-pixel line.
+fn row_major_input_strides(k: usize) -> InputStrides {
+    InputStrides {
+        api: false,
+        label: "line-off: line Kc, surf 0",
+        line: (k * 2 / 16) as u32,
+        surf: 0,
+        group_line_off: Some(true),
+    }
+}
+
+/// BLIP's shapes with the row-major output, packed input vs row-major input:
+/// NPU time (best of 5) and bit-identity with the cube lowering.
+#[test]
+#[ignore = "needs /dev/accel/accel0 -- characterization, prints rather than asserts"]
+fn matmul_dense_input_timing_probe() {
+    for (m, k, n) in [
+        (577, 768, 768),
+        (577, 768, 3072),
+        (577, 3072, 768),
+        (577, 768, 2304),
+        (16, 768, 768),
+        (16, 3072, 768),
+        (197, 768, 768),
+        (1, 64, 64),
+        (7, 32, 16),
+    ] {
+        std::thread::sleep(std::time::Duration::from_millis(800));
+        let (reference, wide_ms, _, _) = run_full(m, k, n, Variant::WideCube, 5);
+        std::thread::sleep(std::time::Duration::from_millis(800));
+        let (_, packed_ms, _, _) = run_full(m, k, n, Variant::TallDense, 5);
+        std::thread::sleep(std::time::Duration::from_millis(800));
+        let (dense, dense_ms, tasks, past) =
+            run_dense_input(m, k, n, row_major_input_strides(k), 5);
+        let wrong = reference.iter().zip(&dense).filter(|(a, b)| a != b).count();
+        println!(
+            "  {m}x{k}x{n}: {tasks} task(s); npu wide-cube {wide_ms:.2}, packed-in {packed_ms:.2}, \
+             row-major-in {dense_ms:.2} ms; {wrong} differ, {past} past{}",
+            if dense_ms > 150.0 {
+                " -- WATCHDOG KILL"
+            } else {
+                ""
+            }
+        );
+    }
+}
+
+/// The gate for the shipping row-major input: `fc::Plan::place_row_major_input`
+/// with the row-major output is bit-identical to the NC1HWC2 lowering, across
+/// one-row and odd-row shapes and K at 4, 5 and 11 atoms (11 is the fp16
+/// coefficient bump) up to 384.
+#[test]
+#[ignore = "needs /dev/accel/accel0 -- cross-compile for aarch64 and run on the RK3588 board"]
+fn row_major_matmul_input_matches_cube() {
+    let mut failures = Vec::new();
+    for (m, k, n) in [
+        (1, 64, 64),
+        (7, 32, 16),
+        (16, 40, 48),
+        (33, 88, 64),
+        (197, 768, 768),
+        (577, 3072, 768),
+    ] {
+        std::thread::sleep(std::time::Duration::from_millis(800));
+        let (reference, _, _, _) = run_full(m, k, n, Variant::WideCube, 1);
+        std::thread::sleep(std::time::Duration::from_millis(800));
+        let api = InputStrides {
+            api: true,
+            label: "api",
+            line: 0,
+            surf: 0,
+            group_line_off: None,
+        };
+        let (dense, ms, tasks, past) = run_dense_input(m, k, n, api, 1);
+        let wrong = reference.iter().zip(&dense).filter(|(a, b)| a != b).count();
+        println!("  {m}x{k}x{n}: {tasks} task(s), {wrong} differ, {past} past, {ms:.2} ms");
         if wrong != 0 || past != 0 || ms > 150.0 {
             failures.push(format!(
                 "{m}x{k}x{n}: {wrong} differ, {past} past, {ms:.1} ms"
