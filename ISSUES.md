@@ -1921,6 +1921,47 @@ What was settled and how, newest first, in place of the narratives — those are
 in this file's git history (`git log -p ISSUES.md`). Everything cited below is
 something that still exists: a commit, a file, or a memory.
 
+**The stem's pad and ReLU6 fold — 2026-11-24. MobileNetV2 fp16 13.4 ->
+12.2 ms, 2.55x faster than `--no-offload`.** After the depthwise fold, the
+stem was the last convolution with work around it on the CPU: its pad ran
+fused into the input transpose, and its clamp ran as its own CPU elementwise
+(`dispatch_1`, 112x112x32), because no *dense* stride-2 ReLU6 matcher existed
+-- only stride 1 -- and the fold pass's "a ReLU6 convolution keeps its pad"
+rule covered dense convolutions.
+
+- Spec: `#rocket_dynamic_pad1_relu6_target` (+ `_s2`), executables, shims
+  and four matchers (`@match_dynamic_conv2d_3x3_pad1_relu6{,_s2}{,_undemoted}`).
+- `rocket-fold-conv-pad` marks a ReLU6 dense convolution in the form those
+  claim (`isClaimablePaddedDense`: 3x3, pad 1, stride 1/2) and only in the
+  rank-5 channels-last spelling the templates use -- a rank-4 NHWC pad would
+  be marked, claimed by nothing, and lose the plain ReLU6 matcher.
+
+CPU dispatch sites 19 -> 18, NPU->NPU edges packed 35 -> 36 (the stem ->
+first-depthwise edge). cpu 4-7, 600 MHz, medians of five, three interleaved
+passes, 0 NPU timeouts:
+
+    nooff 31.1 / 31.2 / 31.2   fold 13.6 / 13.4 / 13.3   stem 11.9 / 12.4 / 12.4 ms
+
+Per inference: `queue` 18 -> 17, `outside` 4.0 -> 2.4 ms, `pack.input`
+1.2 -> 0.6, `compact` 1.5 -> 1.1. **Not bit-identical to the fold build, by
+design**: max|diff| 0.0029, f32-oracle max|err| 0.0639 -> 0.0659, top-5
+unchanged. The stem's bias now rides the f16 BS plane, the same one-rounding-
+per-channel trade every other fused-ReLU6 convolution here already makes (the
+same 0.0029 / 0.0659 the fused base arm showed against dw).
+
+Hardware: `stem_3x3_pad1_matches_oracle` (conv2d_oracle_hw.rs) runs the dense
+ARGB input path with the CNA padding at 224x224 Cin 3 -> 32 s2 (5 tiles,
+`Dense` and `Counting`), s1, Cin 1 and 4, and 112x112 -- 7/7 exact. Every
+padded Cin <= 4 case before was one 28x28 tile at stride 1. Gates: lit 53/53
+(`rocket_fold_conv_pad.mlir` marked/5x5/rank-4 cases,
+`rocket_fp16_pad1_relu6_match.mlir` stem s2 + s1 claims), compiled e2e.
+
+What is left on this model: the residual adds (the linear bottleneck's
+`conv + skip`, no activation) run on the CPU and feed the next blocks'
+1x1 expansion convolutions dense (`rocket-assign-layout`: "the producer is a
+CPU dispatch"); and the final conv -> avgpool edge (49 vs 52 surface
+stride).
+
 **Depthwise padding folds into the CNA — 2026-11-24. MobileNetV2 fp16
 30.8 -> 13.5 ms, 2.3x faster than `--no-offload`, bit-identical.** Each of
 MobileNetV2's 17 depthwise convolutions read its "same" pad from a CPU
@@ -1969,6 +2010,7 @@ depthwise case in `rocket_demote_through_pad.mlir`), compiled e2e.
 What is left on this model: the dense stem's pad (a ReLU6 dense conv keeps its
 pad; it would need a dense pad-1 ReLU6 template) and the stem -> depthwise
 edge, which still repacks (`pack.input` on the first depthwise, 0.6 ms).
+**Both done the same day; see "The stem's pad and ReLU6 fold" above.**
 
 **Depthwise demotion on by default — 2026-11-24. MobileNetV2 fp16 35.3 ->
 30.8 ms, tying `--no-offload`.** P7 kept `ROCKET_DEMOTE_DEPTHWISE` off
