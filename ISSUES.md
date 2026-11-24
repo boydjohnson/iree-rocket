@@ -1911,6 +1911,20 @@ What was settled and how, newest first, in place of the narratives — those are
 in this file's git history (`git log -p ISSUES.md`). Everything cited below is
 something that still exists: a commit, a file, or a memory.
 
+**Requantized int8 1x1 `Cin` 1344 -> 2048 (S3) — 2026-11-24. ResNet50-224
+int8 chains all 32 conv -> conv edges; worth ~0.5 ms.** The last two
+unchained edges (below) were layer4's 7x7 `Cin` 2048 -> 512 bottleneck
+inputs, the model's last convolutions on the int8 accumulator, each with a
+CPU requantization. `int8_requant_cin2048_matches_oracle` is exact at 7x7
+`Cin` 1792 and 2048 -> 512 under `Counting` and `SelectorsAffine`, and the
+admission ceiling went to 2048. The model, the relu-fused ResNet50, is
+**bit-identical** to the build before (no accumulator tie landed on the
+logits path), 32 of 32 edges packed, no accumulator executable left, CPU
+dispatch executables 30 -> 28. Time is within noise: 50.9-52.8 against
+51.4-52.0 ms, ABAB on cpu 4-7 -- the stage-4 tensors are 7x7, so there was
+little to remove. Compiled e2e `requant_int8_1x1_cin2048`; the lit boundary
+case moved to `Cin` 2064.
+
 **int8 conv -> conv chaining (S2) — 2026-11-23. ResNet50-224 int8 had no
 NPU->NPU edge at all; now 30 of 32 conv->conv edges chain, 64.8 -> ~52 ms.**
 `rocket-assign-layout` declared `0 NPU->NPU edge(s) packed` on the int8
