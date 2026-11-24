@@ -7007,6 +7007,29 @@ module attributes {transform.with_named_sequence} {
     transform.yield %root : !transform.any_op
   }
 
+  // The 7x7 twin of @match_dynamic_depthwise_conv2d_nchw_3x3: ConvNeXt's
+  // depthwise convolutions. Admission keeps it to stride 1 and the measured
+  // channel grid (`depthwise_7x7_convnext_probe`), and it only sees an op
+  // the depthwise demotion made f16.
+  transform.named_sequence @match_dynamic_depthwise_conv2d_nchw_7x7(%root: !transform.any_op {transform.readonly}) -> !transform.any_op {
+    transform.match.operation_name %root ["linalg.depthwise_conv_2d_nchw_chw"] : !transform.any_op
+    transform.rocket.match.admitted %root : !transform.any_op
+    %batch, %out_img, %out_ch, %filter, %in_ch, %depth, %strides, %dilations =
+        transform.iree.match.convolution %root,
+          lhs_type = f16, rhs_type = f16, output_type = f32
+          : !transform.any_op -> !transform.param<i64>
+    transform.iree.match.dims_equal %batch, [1] : !transform.param<i64>
+    transform.iree.match.dims_equal %out_img, [-1, -1] : !transform.param<i64>
+    transform.iree.match.dims_equal %out_ch, [] : !transform.param<i64>
+    transform.iree.match.dims_equal %filter, [7, 7] : !transform.param<i64>
+    transform.iree.match.dims_equal %in_ch, [] : !transform.param<i64>
+    transform.iree.match.dims_equal %depth, [-1] : !transform.param<i64>
+    transform.iree.match.dims_equal %strides, [1, 1] : !transform.param<i64>
+    transform.iree.match.dims_equal %dilations, [1, 1] : !transform.param<i64>
+
+    transform.yield %root : !transform.any_op
+  }
+
   // Stride-2 counterpart of @match_dynamic_depthwise_conv2d_nchw -- same 1x1 kernel and Cin <= 512
   // bound (Cout is always Cin here, see that matcher's own doc comment).
   // `%strides` = [2, 2] instead of [1, 1] -- hardware-confirmed depthwise
@@ -11289,6 +11312,7 @@ module attributes {transform.with_named_sequence} {
             @match_dynamic_depthwise_conv2d_3x3 -> @cast_and_call_dynamic_depthwise_conv2d,
             @match_dynamic_depthwise_conv2d_nchw -> @cast_and_call_dynamic_depthwise_conv2d_nchw,
             @match_dynamic_depthwise_conv2d_nchw_3x3 -> @cast_and_call_dynamic_depthwise_conv2d_nchw,
+            @match_dynamic_depthwise_conv2d_nchw_7x7 -> @cast_and_call_dynamic_depthwise_conv2d_nchw,
             @match_dynamic_depthwise_conv2d_nchw_s2 -> @cast_and_call_dynamic_depthwise_conv2d_nchw_s2,
             @match_dynamic_depthwise_conv2d_nchw_3x3_s2 -> @cast_and_call_dynamic_depthwise_conv2d_nchw_s2,
             @match_dynamic_depthwise_conv2d_nchw_s3 -> @cast_and_call_dynamic_depthwise_conv2d_nchw_s3,

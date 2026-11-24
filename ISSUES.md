@@ -1911,6 +1911,38 @@ What was settled and how, newest first, in place of the narratives — those are
 in this file's git history (`git log -p ISSUES.md`). Everything cited below is
 something that still exists: a commit, a file, or a memory.
 
+**ConvNeXt's 7x7 depthwise convolutions on the NPU — 2026-11-24.
+ConvNeXt-T fp16 113 -> 103 ms.** The four-model survey left ConvNeXt's 18
+depthwise convolutions (all 7x7, stride 1) on the CPU in f32. Two things
+held them there: the depthwise demotion is an experiment gate
+(`ROCKET_DEMOTE_DEPTHWISE`), off because MobileNetV2's small 3x3 depthwise
+convolutions lose on the NPU; and depthwise admission stopped at 3x3, with
+the planner applying the *dense* 7x7 `Cin` ceiling (208) to depthwise too.
+
+`depthwise_7x7_convnext_probe` measured all four ConvNeXt stages (62x62x96,
+34x34x192, 20x20x384, 13x13x768) exact against an f32 reference, max|err| 0,
+0.21-0.90 ms each -- the dense ceiling is a coefficient-stream limit, and a
+depthwise filter streams one 7x7 plane per channel. (Harness trap, caught by
+running the same probe at 3x3, which is gated exact: the depthwise packer
+takes the filter `[C][kh][kw]`, not HWC; handing it HWC reads as max|err|
+1-3 at every kernel size.)
+
+So: the planner exempts 7x7 depthwise from the dense ceiling up to
+`DEPTHWISE_7X7_MAX_CHANNELS` (768); admission covers fp16 7x7 stride-1
+depthwise to 768; `@match_dynamic_depthwise_conv2d_nchw_7x7` claims it; and
+`rocket-demote-conv-inputs-to-f16` demotes a 7x7 stride-1 depthwise
+regardless of the gate (`DemoteLargeDepthwise`) -- ~5x a 3x3's work per
+dispatch. 3x3 depthwise stays gated, so MobileNetV2 does not change.
+
+ConvNeXt-T: 18 more NPU sites (42 -> 60), nothing refused; 114/112/114 ->
+102/102/104 ms ABAB on cpu 4-7, 0 timeouts; f32-oracle max|err| 0.0053 ->
+0.0061, top-5 unchanged. With `ROCKET_QUIESCE_OFF=1` it is 94 ms: the
+depthwise -> dense quiescence dwell costs ConvNeXt ~9 ms (every block
+alternates the two), and is the next lever there. Gates: board
+`depthwise_7x7_convnext_probe` (all four stages exact), lit
+`rocket_demote_large_depthwise.mlir` (51/51), compiled e2e
+`fp16_depthwise_7x7` (54/54), admission unit tests.
+
 **Grouped convolutions run as per-channel-slice tasks — 2026-11-24.
 ResNeXt50 fp16 102 -> 57 ms, bit-identical.** The block-diagonal rewrite
 (entry below) made ResNeXt's grouped convolutions offloadable at G x the

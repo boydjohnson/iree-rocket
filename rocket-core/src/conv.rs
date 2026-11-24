@@ -3792,7 +3792,17 @@ fn check_large_kernel_plan_case(
         PlanErrorCode::UnvalidatedConfiguration,
         "automatic planning above 3x3 currently has capture backing only at stride 1"
     );
-    let ceiling = large_kernel_max_in_channels(shape.precision, kernel);
+    // The dense ceiling is a coefficient-stream limit -- it moved threefold
+    // when the CBUF grant stopped starving the stream -- and a depthwise
+    // filter streams one `kh x kw` plane per channel, not `Cin` of them. A
+    // 7x7 depthwise convolution is measured exact far past it: ConvNeXt-T's
+    // four stages, 62x62x96 through 13x13x768, max|err| 0
+    // (`depthwise_7x7_convnext_probe`, 2026-11-24).
+    let ceiling = if shape.depthwise && kernel == 7 {
+        DEPTHWISE_7X7_MAX_CHANNELS
+    } else {
+        large_kernel_max_in_channels(shape.precision, kernel)
+    };
     refuse_unless!(
         shape.in_channels <= ceiling,
         PlanErrorCode::UnvalidatedConfiguration,
@@ -3911,6 +3921,9 @@ pub fn unstarved_large_kernel_partition(
 /// fault never had a kernel-size dependence, and only looked like one because
 /// 1x1 and 3x3 were gated by the ladders, which pass the affine pattern, and
 /// never went through the probe.
+/// Widest 7x7 depthwise convolution measured exact: ConvNeXt-T's last stage.
+pub const DEPTHWISE_7X7_MAX_CHANNELS: u32 = 768;
+
 pub fn large_kernel_max_in_channels(precision: Precision, kernel: usize) -> u32 {
     match precision {
         // 5x5 has no measured ceiling at any width; the CBUF planner's own

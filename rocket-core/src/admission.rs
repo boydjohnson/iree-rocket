@@ -184,6 +184,14 @@ pub fn conv_ceilings(
         // multi-tile plan at it. Raise it the way every other limit here
         // moves: measure the next rung first.
         (PrecisionClass::Fp16, true, 1 | 3) => ceilings(1536, 1536),
+        // **fp16 depthwise 7x7, stride 1**: ConvNeXt's. Exact at all four of
+        // its stages, 62x62x96 to 13x13x768 (`depthwise_7x7_convnext_probe`);
+        // the bound is that grid. Reached only when the depthwise demotion
+        // runs (`ROCKET_DEMOTE_DEPTHWISE`), which is off by default.
+        (PrecisionClass::Fp16, true, 7) if stride == 1 => ceilings(
+            conv::DEPTHWISE_7X7_MAX_CHANNELS,
+            conv::DEPTHWISE_7X7_MAX_CHANNELS,
+        ),
         // **fp16 dense 1x1**, both channel axes at the dense ceilings.
         //
         // `Cin`: [`conv::MAX_INPUT_CHANNELS`], 512 -> 1344 (2026-09-03) on
@@ -570,6 +578,17 @@ mod tests {
             in_channels: cin,
             out_channels: cout,
         }
+    }
+
+    /// ConvNeXt's 7x7 stride-1 depthwise convolution is admitted at fp16 to
+    /// its widest measured stage, and not strided or wider.
+    #[test]
+    fn convnext_depthwise_7x7_is_admitted() {
+        assert!(admit_conv(&conv(Precision::Fp16, true, 7, 1, 96, 96)).is_ok());
+        assert!(admit_conv(&conv(Precision::Fp16, true, 7, 1, 768, 768)).is_ok());
+        assert!(admit_conv(&conv(Precision::Fp16, true, 7, 1, 1024, 1024)).is_err());
+        assert!(admit_conv(&conv(Precision::Fp16, true, 7, 2, 96, 96)).is_err());
+        assert!(admit_conv(&conv(int8(true), true, 7, 1, 96, 96)).is_err());
     }
 
     /// The space-to-depth stem's 4x4 stride-1 convolution is admitted at fp16
