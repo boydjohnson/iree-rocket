@@ -1016,6 +1016,7 @@ by trusting the variable, and pass
    its producer's cube, so it is a P2 blocker on this model too.
 3. **The quiesce dwell.** 7.4 ms is pure empirical caution; it is C8's
    neighbour and should be re-derived rather than kept at a millisecond.
+   (Off by default since 2026-11-24; see Resolved.)
 4. **The `Cin <= 512` matcher cap**, last, because raising it only adds more
    of a currently-losing trade until the three above land. The HAL is exact
    to 1536.
@@ -1910,6 +1911,37 @@ instead on the way out, 31 ms of `compact` per inference against 7.5.
 What was settled and how, newest first, in place of the narratives — those are
 in this file's git history (`git log -p ISSUES.md`). Everything cited below is
 something that still exists: a commit, a file, or a memory.
+
+**The depthwise -> dense quiescence dwell is off by default — 2026-11-24.
+ConvNeXt-T fp16 103 -> 93.5 ms.** `DEPTHWISE_TO_DENSE_QUIESCENCE` slept
+1 ms between a depthwise completion and the next dense submit, against a
+report -- with no recorded rate, and from before C8's fix -- that the dense
+job then intermittently wrote only its first 16 channels. Earlier campaigns
+had bounded the rate at ~0.15% and kept it.
+
+`depthwise_to_dense_transition_campaign` (iree-rocket-hal/tests/
+dpu_mode_multicore_hw.rs) runs three depthwise -> dense pairs with no dwell:
+MobileNetV2's original 3x3 s2 pair, and ConvNeXt-T's 7x7 depthwise ->
+pwconv1 at stages 1 and 3. Each pair runs two ways: two jobs with the dense
+SUBMIT issued the instant the depthwise PREP_BO returns (the depthwise output
+copied at that instant, so an early fence would show as an unwritten tail),
+and one job whose dense tasks the kernel's IRQ thread starts microseconds
+after the depthwise task retires -- tighter than any path the driver takes. A
+detector self-check proves an unwritten output fails first. On `orangepi`
+(Armbian 7.3.5 rocket + PPU/600 MHz/088 patches), 10000 rounds of each: **60000
+transitions, 0 wrong outputs, 0 NPU timeouts.** Then 500 whole ConvNeXt-T fp16
+inferences with the dwell off (18 transitions each), **all bit-identical** to
+a dwell-on golden. With the earlier ~2020 that is ~71000 transitions, a rule-
+of-three bound of ~0.004%.
+
+So the dwell is opt-in (`ROCKET_QUIESCE_DEPTHWISE=1`, which replaces
+`ROCKET_QUIESCE_OFF`). ConvNeXt-T fp16 ABAB on cpu 4-7, same `.vmfb`:
+104/102/103 -> 93.1/93.5/93.8 ms, 0 timeouts. The fp16 MobileNetV2 depthwise
+arm paid the same 17 ms per inference (P7). What stays open is whether a conv
+can retire on a PPU bit (docs/open-questions.md 1.1.2); the campaign shows
+only that no transition this driver makes exhibits the hazard. Gates: the
+campaign (500 rounds by default), compiled e2e 54/54 incl. the `mixed_*`
+transition cases.
 
 **ConvNeXt's 7x7 depthwise convolutions on the NPU — 2026-11-24.
 ConvNeXt-T fp16 113 -> 103 ms.** The four-model survey left ConvNeXt's 18

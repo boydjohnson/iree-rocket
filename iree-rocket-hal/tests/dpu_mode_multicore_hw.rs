@@ -40,13 +40,13 @@ use std::{
     os::fd::AsRawFd,
     ptr,
     sync::{Arc, Barrier},
-    time::Duration,
+    time::{Duration, Instant},
 };
 
 use iree_rocket_hal::rocket::{
     builders::RegCmd,
     conv::{Buffers, ConvPlan, Kernels, Shape, relocate},
-    device::{OwnedBuffer, fini_bo, prep_bo, submit},
+    device::{OwnedBuffer, fini_bo, prep_bo, submit, submit_tasks},
     tensor_layout::{
         compact_atomic_output, nc1hwc2_storage_size, pack_depthwise_to_rocket_weights,
         pack_hwcf_to_rocket_weights, pack_nhwc_to_nc1hwc2_padded, rocket_weight_storage_size,
@@ -87,18 +87,66 @@ fn f16_to_f32(bits: u16) -> f32 {
     f32::from_bits(f32_bits)
 }
 
-fn valid_taps(coordinate: usize, extent: usize, kernel: usize) -> usize {
-    match kernel {
-        1 => 1,
-        3 => 3 - usize::from(coordinate == 0) - usize::from(coordinate + 1 == extent),
-        _ => unreachable!("only 1x1 and 3x3 shapes here"),
-    }
+/// Kernel taps that land inside the image for an output whose window starts
+/// at input `start` (its top-left tap, padding included).
+fn valid_taps(start: isize, extent: usize, kernel: usize) -> usize {
+    (0..kernel as isize)
+        .filter(|tap| (0..extent as isize).contains(&(start + tap)))
+        .count()
 }
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 enum Kind {
     Dense,
     Depthwise,
+}
+
+/// A depthwise -> dense pair the transition campaign runs.
+struct Pair {
+    label: &'static str,
+    depthwise: (Shape, Kernels),
+    dense: (Shape, Kernels),
+}
+
+/// The original `mixed_*` pair, plus ConvNeXt-T's dwconv 7x7 -> pwconv1 at
+/// stages 1 and 3. The 7x7 depthwise jobs are the longest depthwise
+/// write-backs the compiler now emits, and each pwconv1 widens 4x, so a
+/// truncation to the first 16 channels leaves most of the output unwritten.
+fn transition_pairs() -> Vec<Pair> {
+    // Padding 0 on the pre-padded extent, as the compiled path runs it (the
+    // pad is a separate op) and as `depthwise_7x7_probe_hw` validated it.
+    let fp16_dw7 = |side: u32, c: u32| {
+        (
+            Shape::with_out_channels(side + 6, side + 6, 1, c, c)
+                .with_padding([0, 0])
+                .with_depthwise(),
+            [7, 7],
+        )
+    };
+    vec![
+        Pair {
+            label: "mnv2 dw3x3s2 113x113x144 -> dense 32x32 64->128",
+            depthwise: Dispatch::spec(Kind::Depthwise),
+            dense: Dispatch::spec(Kind::Dense),
+        },
+        Pair {
+            label: "convnext s1 dw7x7 62x62x96 -> pw 56x56 96->384",
+            depthwise: fp16_dw7(56, 96),
+            dense: (Shape::with_out_channels(56, 56, 1, 96, 384), [1, 1]),
+        },
+        Pair {
+            label: "convnext s3 dw7x7 20x20x384 -> pw 14x14 384->1536",
+            depthwise: fp16_dw7(14, 384),
+            dense: (Shape::with_out_channels(14, 14, 1, 384, 1536), [1, 1]),
+        },
+    ]
+}
+
+fn transition_rounds() -> usize {
+    std::env::var("ROCKET_TRANSITION_ROUNDS")
+        .ok()
+        .and_then(|value| value.parse().ok())
+        .unwrap_or(500)
 }
 
 /// One dispatch: uniform 1.0 input and weights, so a dense output element
@@ -120,13 +168,26 @@ struct Dispatch {
 }
 
 impl Dispatch {
-    fn new(kind: Kind) -> Dispatch {
-        let (shape, kernels): (Shape, Kernels) = match kind {
+    fn spec(kind: Kind) -> (Shape, Kernels) {
+        match kind {
             Kind::Dense => (Shape::with_out_channels(32, 32, 1, 64, 128), [1, 1]),
             Kind::Depthwise => (
                 Shape::with_out_channels(113, 113, 2, 144, 144).with_depthwise(),
                 [3, 3],
             ),
+        }
+    }
+
+    fn new(kind: Kind) -> Dispatch {
+        let (shape, kernels) = Dispatch::spec(kind);
+        Dispatch::from_shape(shape, kernels)
+    }
+
+    fn from_shape(shape: Shape, kernels: Kernels) -> Dispatch {
+        let kind = if shape.depthwise {
+            Kind::Depthwise
+        } else {
+            Kind::Dense
         };
         let cin = shape.in_channels as usize;
         let cout = shape.out_channels as usize;
@@ -215,9 +276,19 @@ impl Dispatch {
             Kind::Dense => self.shape.in_channels as f32,
             Kind::Depthwise => {
                 let stride = self.shape.stride as usize;
-                (valid_taps(y * stride, self.shape.height as usize, self.kernels[0])
-                    * valid_taps(x * stride, self.shape.width as usize, self.kernels[1]))
-                    as f32
+                let [pad_top, pad_left] = self
+                    .shape
+                    .padding
+                    .unwrap_or([self.kernels[0] / 2, self.kernels[1] / 2]);
+                (valid_taps(
+                    (y * stride) as isize - pad_top as isize,
+                    self.shape.height as usize,
+                    self.kernels[0],
+                ) * valid_taps(
+                    (x * stride) as isize - pad_left as isize,
+                    self.shape.width as usize,
+                    self.kernels[1],
+                )) as f32
             }
         }
     }
@@ -333,8 +404,33 @@ impl Staged {
 
     /// Checks `slot`'s output exactly, then re-arms it with the sentinel.
     fn verify_slot(&mut self, slot: usize, dispatch: &Dispatch, label: &str) -> Result<(), String> {
+        self.verify_slot_from(slot, dispatch, label, None)
+    }
+
+    /// Copies `slot`'s raw output now, for checking later with
+    /// [`Staged::verify_slot_from`] -- so what is checked is what the CPU
+    /// saw at this instant, not after some later job has also finished.
+    fn snapshot_slot(&self, slot: usize, dispatch: &Dispatch, into: &mut Vec<u8>) {
         let (output, _) = &self.slots[slot];
-        let scratch = unsafe { std::slice::from_raw_parts(output.host_ptr, dispatch.output_bytes) };
+        into.clear();
+        into.extend_from_slice(unsafe {
+            std::slice::from_raw_parts(output.host_ptr, dispatch.output_bytes)
+        });
+    }
+
+    /// [`Staged::verify_slot`], checking `source` (a snapshot) in place of
+    /// the live output when given. The live output is re-armed either way.
+    fn verify_slot_from(
+        &mut self,
+        slot: usize,
+        dispatch: &Dispatch,
+        label: &str,
+        source: Option<&[u8]>,
+    ) -> Result<(), String> {
+        let (output, _) = &self.slots[slot];
+        let scratch = source.unwrap_or_else(|| unsafe {
+            std::slice::from_raw_parts(output.host_ptr, dispatch.output_bytes)
+        });
         let written = compact_atomic_output(
             scratch,
             dispatch.output_pixel_count,
@@ -517,4 +613,154 @@ fn same_queue_alternation_without_dwell_is_reported() {
     for sample in samples {
         println!("  {sample}");
     }
+}
+
+/// How a dense job follows a depthwise one in the transition campaign.
+#[derive(Clone, Copy, Debug)]
+enum Gap {
+    /// Two jobs on one file: the dense SUBMIT goes in the moment the
+    /// depthwise PREP_BO returns, and the depthwise output is copied while
+    /// the dense job runs -- the driver's own order (it compacts the
+    /// depthwise output right after its fence), with no dwell and no
+    /// compaction time between the two submits.
+    Userspace,
+    /// One job, depthwise tasks then dense tasks. The kernel's IRQ thread
+    /// starts the first dense task straight from the depthwise retire, a
+    /// few microseconds later: tighter than any path the driver can take.
+    SameJob,
+}
+
+/// Submits `depthwise` then `dense` as the tasks of a single job.
+fn submit_same_job(depthwise: &Staged, dense: &Staged) -> Result<(), String> {
+    let fd = depthwise.file.as_raw_fd();
+    let mut tasks = Vec::new();
+    let mut in_handles = Vec::new();
+    for staged in [depthwise, dense] {
+        let (_, regcmds) = &staged.slots[0];
+        for (regcmd, count) in regcmds {
+            tasks.push((regcmd.dma_address, *count));
+            in_handles.push(regcmd.handle);
+        }
+        in_handles.extend([
+            staged.input.handle,
+            staged.weights.handle,
+            staged.bias.handle,
+        ]);
+    }
+    let out_handles = [depthwise.slots[0].0.handle, dense.slots[0].0.handle];
+    unsafe { submit_tasks(fd, &tasks, &in_handles, &out_handles) }
+        .map_err(|err| format!("same-job SUBMIT failed: {err}"))
+}
+
+/// Depthwise -> dense with no dwell, `ROCKET_TRANSITION_ROUNDS` times (500 by
+/// default) per pair and gap, every output checked exactly.
+///
+/// This is the question `DEPTHWISE_TO_DENSE_QUIESCENCE` (rocket-hal-driver
+/// device.rs) leaves open: does a dense job that starts right after a
+/// depthwise one ever write only its first 16 channels, and is a depthwise
+/// output ever incomplete when its fence has signaled. Both pairs of shapes
+/// that matter are here -- the MobileNetV2 pair where the hazard was
+/// reported, and ConvNeXt-T's 7x7 depthwise -> pwconv1 -- each run both the
+/// way the driver submits and inside one job, where the dense task starts
+/// microseconds after the depthwise one retires.
+///
+/// Uniform data is enough for this question: an element the DPU never wrote
+/// keeps the 0xa5a5 sentinel, and a dense job run in depthwise mode writes a
+/// tap count rather than `Cin`. The test checks first that the detector sees
+/// an unwritten output.
+///
+///   ROCKET_TRANSITION_ROUNDS=5000 ./dpu_mode_multicore_hw-<hash> --ignored \
+///     --nocapture --test-threads=1 depthwise_to_dense_transition_campaign
+#[test]
+#[ignore = "needs /dev/accel/accel0 -- cross-compile for aarch64 and run on the RK3588 board"]
+fn depthwise_to_dense_transition_campaign() {
+    let rounds = transition_rounds();
+    let mut failures = Vec::new();
+    let mut transitions = 0usize;
+    for pair in transition_pairs() {
+        let depthwise = Dispatch::from_shape(pair.depthwise.0, pair.depthwise.1);
+        let dense = Dispatch::from_shape(pair.dense.0, pair.dense.1);
+
+        // Detector self-check: a slot no job has written must fail, entirely.
+        let mut probe = Staged::new(open_device(), &dense, 1);
+        match probe.verify_slot(0, &dense, "unwritten") {
+            Ok(()) => panic!("{}: an unwritten output verified clean", pair.label),
+            Err(err) => assert!(
+                err.contains(&format!(
+                    "{0} of {0} elements wrong ({0} never written)",
+                    dense.output_pixel_count * dense.output_bytes_per_pixel / FP16_BYTES
+                )),
+                "{}: detector self-check: {err}",
+                pair.label
+            ),
+        }
+        drop(probe);
+
+        for gap in [Gap::Userspace, Gap::SameJob] {
+            let file = open_device();
+            let mut dw = Staged::new(file.try_clone().unwrap(), &depthwise, 1);
+            let mut dn = Staged::new(file, &dense, 1);
+            let mut snapshot = Vec::with_capacity(depthwise.output_bytes);
+            let mut wrong = 0usize;
+            let mut samples = Vec::new();
+            let mut aborted = None;
+            let start = Instant::now();
+            let mut done = 0usize;
+            for round in 0..rounds {
+                let ran = match gap {
+                    Gap::Userspace => dw
+                        .submit_slot(0)
+                        .and_then(|()| dw.wait_slot(0))
+                        .and_then(|()| dn.submit_slot(0))
+                        .map(|()| dw.snapshot_slot(0, &depthwise, &mut snapshot))
+                        .and_then(|()| dn.wait_slot(0)),
+                    Gap::SameJob => submit_same_job(&dw, &dn)
+                        .and_then(|()| dn.wait_slot(0))
+                        .and_then(|()| dw.wait_slot(0)),
+                };
+                if let Err(err) = ran {
+                    aborted = Some(format!("round {round}: {err}"));
+                    break;
+                }
+                let source = matches!(gap, Gap::Userspace).then_some(snapshot.as_slice());
+                for result in [
+                    dw.verify_slot_from(0, &depthwise, "depthwise", source),
+                    dn.verify_slot(0, &dense, "dense after depthwise"),
+                ] {
+                    if let Err(err) = result {
+                        wrong += 1;
+                        if samples.len() < 4 {
+                            samples.push(format!("round {round}: {err}"));
+                        }
+                    }
+                }
+                done += 1;
+            }
+            let elapsed = start.elapsed();
+            transitions += done;
+            println!(
+                "{} [{gap:?}]: {done} transitions, {wrong} wrong outputs, {:.2} ms/round{}",
+                pair.label,
+                elapsed.as_secs_f64() * 1e3 / done.max(1) as f64,
+                aborted
+                    .as_deref()
+                    .map(|err| format!(", ABORTED at {err}"))
+                    .unwrap_or_default()
+            );
+            for sample in &samples {
+                println!("    {sample}");
+            }
+            if wrong > 0 || aborted.is_some() {
+                failures.push(format!(
+                    "{} [{gap:?}]: {wrong} wrong, aborted: {aborted:?}",
+                    pair.label
+                ));
+            }
+        }
+    }
+    println!("{transitions} depthwise -> dense transitions without a dwell");
+    assert!(
+        failures.is_empty(),
+        "depthwise -> dense without a dwell went wrong: {failures:#?}"
+    );
 }

@@ -35,10 +35,12 @@ output fence appears to signal before the write-back finishes, and it costs
 about 23% of the fp16 depthwise arm's wall. [`device.rs`
 `DEPTHWISE_TO_DENSE_QUIESCENCE`, ISSUES P7]
 
-- 1.1.1.1 Is the dwell still needed at all? It predates C8's
-  `brdma_data_use` fix, and C8 produced the same family of symptom. 0 of 240
-  runs only bounds the original failure rate at about 1.5%. [`device.rs`
-  `quiesce_off`]
+- 1.1.1.1 Is the dwell still needed at all? Answered 2026-11-24: no
+  transition the driver makes shows the hazard -- 60000 depthwise -> dense
+  transitions without it, including in-job ones the kernel starts
+  microseconds after the depthwise retires, plus 500 bit-identical ConvNeXt
+  inferences. It is opt-in now (`ROCKET_QUIESCE_DEPTHWISE=1`). [`device.rs`
+  `depthwise_quiesce_enabled`, ISSUES Resolved]
 - 1.1.1.2 Can anyone reproduce the original failure (a dense job after a
   depthwise one writing only its first 16 channels) often enough to quote a
   rate to test a fix against? [`device.rs`]
@@ -285,9 +287,10 @@ compiler already knows, remove the 15 to 45 ms per-process cold `record`
 cost? [COMPILER_ROADMAP 4]
 
 3.1.4 Is the depthwise dwell (1.1.1) the whole remaining cost of offloading
-fp16 depthwise? With `ROCKET_QUIESCE_OFF` the depthwise arm lands within
-1 to 2.5% of the arm that leaves depthwise on the CPU. [`device.rs`
-`quiesce_off`]
+fp16 depthwise? With the dwell off (the default since 2026-11-24) the
+depthwise arm landed within 1 to 2.5% of the arm that leaves depthwise on
+the CPU; MobileNetV2's demote gate has not been re-measured since.
+[`device.rs` `depthwise_quiesce_enabled`]
 
 ### 3.2 Multicore
 
