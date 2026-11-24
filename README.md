@@ -85,6 +85,27 @@ cargo run -p rocket-compiler -- compile --input model.mlir --output model.vmfb
 cargo run -p rocket-compiler -- audit --input model.mlir
 ```
 
+### Prebuilt compiler (nightly)
+
+The `Nightly artifacts` workflow ships `rocket-compiler` ready to run, in the
+`iree-compile-x86_64` artifact (x86_64 Linux): `bin/rocket-compiler`,
+`bin/iree-compile`, `bin/iree-lld`, `lib/libIREECompiler.so` and the transform
+spec under `share/rocket/`. Unpacked anywhere, it needs no environment setup:
+
+```sh
+gh run download --repo boydjohnson/iree-rocket -n iree-compile-x86_64
+tar -xzf iree-compile-x86_64.tar.gz
+iree-compile-x86_64/bin/rocket-compiler compile --input model.mlir \
+  --output model.vmfb --llvmcpu-target-triple aarch64-linux-gnu
+```
+
+`rocket-compiler` looks for `libIREECompiler.so` as `--iree-compiler-lib`,
+then `IREE_COMPILER_LIB`, then `../lib/` beside its own executable; and for the
+spec as `--transform-spec`, then `../share/rocket/` beside it, then the source
+checkout it was built from. `libIREECompiler.so` finds `iree-lld` in `../bin/`
+on its own. The board-side `iree-run-module` is the `iree-runtime-aarch64`
+artifact of the same run.
+
 `audit` answers "why is this operation where it is". It prints one line per
 convolution and matmul candidate -- source location, kind, layout, shape,
 precision rung, the decision, and the decisive reason -- then the executable
