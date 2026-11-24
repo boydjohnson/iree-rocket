@@ -1911,6 +1911,60 @@ What was settled and how, newest first, in place of the narratives — those are
 in this file's git history (`git log -p ISSUES.md`). Everything cited below is
 something that still exists: a commit, a file, or a memory.
 
+**Padded max and min: the PPU ignores the fill at both precisions —
+2026-11-24.** The int8 max probe generalized to `pad_fill_probe` and run four
+ways: int8 max (13 encodings), int8 min (10, incl. 0, -5 at 8/16/35 bits and
+the 35-bit maximum), fp16 max and fp16 min (6 each: +/-inf, +/-1.0, 0,
++/-65504). Every candidate gives the clamp-to-image answer in every border
+window, under a worst-case constant input and under `input_at`. The
+fp16 max run was meant as the positive control (the vendor programs -inf
+there) and was inert too, so `avg_pad_fill_control_probe` is the real one: an
+average must add the fill into its sum, and an int8 fill of +9 moves the
+3- and 5-padded-tap windows to exactly 3 and 5. The field is live; max and
+min ignore it. (Incidentally, the average reads an int8 fill as an unsigned
+byte that wraps rather than saturates, fp16 fills are not fp16 bits, and at
+pad 2 only windows with two image rows take it -- irrelevant while averages
+program 0.)
+
+So `PoolingMethod::pad_fill_value` is now infallible -- each format's
+identity (min `0x7C00`/`0x7F`), programmed for register dumps, not for
+correctness -- `required_pad_fill` and the driver's padded-pool refusal are
+gone, and pad < kernel (`PoolingShape::validate`) is the only rule a padded
+pool needs. `min_pooling_matches_oracle` gains padded fp16/int8 cases (3x3 s2
+pad 1 at 32x32 and the 112x112x64 stem shape, plus leading-pad), all exact;
+the compiled pooling gate (`tools/e2e_pooling_regression.py`) passes, min and
+max at atol 0, 0 timeouts. No padded min target exists: no model pads a min
+pool.
+
+**Padded int8 max pool: the fill is inert (S3) — 2026-11-24. ResNet50-224
+int8 20.8 -> 20.2 ms, bit-identical.** `PoolingMethod::pad_fill_value` had
+no answer for (Max, Int8), so the stem pool's padding stayed a CPU
+`tensor.pad`. `int8_max_pad_fill_probe` (`pooling_oracle_hw.rs`) measured it:
+thirteen encodings of the 35-bit `PPU_PADDING_VALUE` (0, +5, +127, 0x80, -5 at
+8/16/32/35 bits, -128 at 35 bits, fp16 -inf, 0x8000, 0x80000000, the 35-bit
+minimum) all give the clamp-to-image answer in every border window, under a
+constant -128 input and under `input_at`, whose corner windows hold a single
+-8 a fill of 0 or +127 would beat. **The int8 PPU max never lets a padded tap
+win.** The HAL now programs 0x80 (the identity at the format's width).
+
+Second finding: **pad >= kernel hangs the PPU** (3x3 pad 3: 13 of 13
+dispatches killed by the watchdog; pad 2 exact). `PoolingShape::validate`
+now refuses it on every axis, at every method and precision.
+
+Compiler: `rocket-fold-conv-pad` also marks an int8 `pooling_nhwc_max` that
+reads a symmetric -128 pad below the kernel (a -128 pad never wins a max
+either, so the two agree exactly), and `@match_pooling_nhwc_max_s2_i8_pad1`
+claims the pad and the pool together into
+`#rocket_pooling_max_int8_pad1_target_s2`. A pad no target bakes (pad 2)
+keeps the CPU pad and the unpadded matcher. ResNet50 (relu-fused, int8 skip):
+CPU dispatch executables 6 -> 5, NPU edges 82/82 packed, 20.7/20.9/20.9 ->
+20.1/20.6/20.0 ms ABAB on cpu 4-7, 0 timeouts, output bit-identical. Gates:
+`padded_max_pooling_matches_oracle` gains the int8 stem shape (112x112x64 3x3
+s2 pad 1) and an int8 leading-pad case, both exact; compiled e2e passes
+(`int8_max_pool_stem` now on the pad1 executable, 0 mismatches at atol 0);
+lit `rocket_int8_max_pool.mlir` gains `@pad2_stays_on_the_cpu`. (Min: see
+the entry above.)
+
 **ResNet's int8 stem on the requantized path (S3) — 2026-11-24. ResNet50-224
 int8 24.6 -> 21.2 ms.** The stem (7x7 stride 2, `Cin` 3 -> 64) ran on the
 int8 accumulator: the NPU wrote a 3.2 MB `i32` cube, the driver compacted it
@@ -1933,7 +1987,8 @@ NPU build by the requantizer's tie rule (the NPU rounds ties away from zero).
 MobileNetV2 int8 is bit-identical to the previous compiler's build. Compiled e2e 50/50; e2e `requant_int8_stem_zero_zp` (the
 pre-fusion form, 802816 elements) 0 mismatches at atol 1; lit case
 `@zero_input_zero_point_stem`. What is left between stem and pool is the int8
-pad, which a padded int8 max pool needs a measured fill to take.
+pad, which a padded int8 max pool needs a measured fill to take (since taken;
+see the entry above).
 
 **int8 max pool on the NPU (S3) — 2026-11-24. ResNet50-224 int8 26.7 ->
 24.3 ms, bit-identical.** QOperator quantization leaves MaxPool in float, so

@@ -784,8 +784,10 @@ func.func @int8_residual_add_relu(%a: tensor<1x256x14x14xi8>, %b: tensor<1x256x1
 // A quantized ResNet stem's max pool in the importer's form (`ui8`
 // dequantization, -inf pad, pool, QuantizeLinear sharing the dequantization's
 // parameters): rocket-fuse-int8-max-pool runs it as an int8 max pool on the
-// codes, on the NPU's int8 PPU, exactly. A wrong pad fill, a wrong signed vs
-// unsigned order, or a lost window shows as a whole-code error, not a tie.
+// codes, on the NPU's int8 PPU, exactly -- padding included, since
+// rocket-fold-conv-pad hands the -128 pad to the PPU (the pad1 executable). A
+// wrong pad fill, a wrong signed vs unsigned order, or a lost window shows as
+// a whole-code error, not a tie.
 func.func @int8_max_pool_stem(%x: tensor<1x64x56x56xi8>) -> tensor<1x64x28x28xi8> {
   %scale = arith.constant 1.370000e-01 : f32
   %zp = arith.constant 7 : i32
@@ -1921,7 +1923,7 @@ def compile_modules(
         ("requant_int8_1x1_cin816", "rocket_dynamic_int8_requant_executable"),
         ("requant_int8_1x1_cin2048", "rocket_dynamic_int8_requant_executable"),
         ("int8_residual_add_relu", "rocket_elementwise_add_int8_relu_executable"),
-        ("int8_max_pool_stem", "rocket_pooling_max_int8_executable_s2"),
+        ("int8_max_pool_stem", "rocket_pooling_max_int8_pad1_executable_s2"),
         ("requant_int8_stem_zero_zp", "rocket_dynamic_int8_requant_s2_executable"),
         ("requant_int8_1x1_cin816_cout448", "rocket_dynamic_int8_requant_executable"),
         ("requant_int8_1x1_large_bias", "rocket_dynamic_int8_requant_executable"),

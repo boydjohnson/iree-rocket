@@ -364,18 +364,12 @@ fn decode_flatbuffer_shape(data: &[u8]) -> Result<UkernelShape, ()> {
                 // accumulator precision has nothing to mean here.
                 _ => return Err(()),
             };
-            let padded = pooling_def.pad_left()
-                | pooling_def.pad_top()
-                | pooling_def.pad_right()
-                | pooling_def.pad_bottom()
-                != 0;
-            // The fill value is derived, never carried -- and where no
-            // measurement says what it should be, a *padded* pool is
-            // refused rather than filled with a plausible guess. An
-            // unpadded pool never reads the field.
-            let Some(pad_value) = method.required_pad_fill(precision, padded) else {
-                return Err(());
-            };
+            // The fill value is derived, never carried: it is each
+            // reduction's identity, and inert for max and min, which the PPU
+            // clamps to the image (`PoolingMethod::pad_fill_value`). A pad
+            // as wide as the kernel is refused by `PoolingShape::validate`
+            // when the shape resolves.
+            let pad_value = method.pad_fill_value(precision);
             let shape_template = PoolingShape {
                 input_width: pooling_def.input_width(),
                 input_height: pooling_def.input_height(),
@@ -2066,12 +2060,11 @@ mod tests {
         assert_eq!(executable.shape_template.pad_value, 0xFC00);
     }
 
-    /// And where no measurement says what the fill should be, a padded pool
-    /// is refused rather than filled with a plausible guess. Unpadded is
-    /// fine: nothing reads the field.
+    /// A padded int8 max pool decodes too: its fill was measured inert on
+    /// the PPU (`int8_max_pad_fill_probe`), and the identity is programmed.
     #[test]
-    fn refuses_padded_pooling_with_an_unmeasured_fill_value() {
-        let padded_int8_max = encode_pooling_executable(
+    fn padded_int8_max_pooling_programs_the_int8_identity() {
+        let executable = pooling_of(&encode_pooling_executable(
             schema::PoolingMethod::MAX,
             schema::Precision::INT8,
             (8, 8),
@@ -2081,34 +2074,32 @@ mod tests {
             (2, 2),
             [1, 1, 1, 1],
             &[],
-        );
-        assert!(decode_flatbuffer_shape(&padded_int8_max).is_err());
+        ));
+        assert_eq!(executable.shape_template.pad_value, 0x80);
+    }
 
-        let padded_min = encode_pooling_executable(
-            schema::PoolingMethod::MIN,
-            schema::Precision::FP16,
-            (8, 8),
-            32,
-            (4, 4),
-            (3, 3),
-            (2, 2),
-            [1, 1, 1, 1],
-            &[],
-        );
-        assert!(decode_flatbuffer_shape(&padded_min).is_err());
-
-        let unpadded_min = encode_pooling_executable(
-            schema::PoolingMethod::MIN,
-            schema::Precision::FP16,
-            (8, 8),
-            32,
-            (4, 4),
-            (2, 2),
-            (2, 2),
-            [0; 4],
-            &[],
-        );
-        assert_eq!(pooling_of(&unpadded_min).shape_template.pad_value, 0);
+    /// Padded min decodes at both precisions with its format's identity --
+    /// inert on the PPU, which clamps max and min to the image
+    /// (`min_pad_fill_probe`s), but what a register dump should show.
+    #[test]
+    fn padded_min_pooling_programs_the_identity() {
+        for (precision, identity) in [
+            (schema::Precision::INT8, 0x7F),
+            (schema::Precision::FP16, 0x7C00),
+        ] {
+            let padded_min = encode_pooling_executable(
+                schema::PoolingMethod::MIN,
+                precision,
+                (8, 8),
+                32,
+                (4, 4),
+                (3, 3),
+                (2, 2),
+                [1, 1, 1, 1],
+                &[],
+            );
+            assert_eq!(pooling_of(&padded_min).shape_template.pad_value, identity);
+        }
     }
 
     /// A static executable states its own output extents. They are not what

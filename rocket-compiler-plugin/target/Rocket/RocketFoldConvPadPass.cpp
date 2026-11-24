@@ -103,6 +103,9 @@ constexpr StringLiteral kPadLeftAttrName = "rocket.pad_left";
 /// The largest pad `CNA_PAD_CON0`'s 4-bit fields hold.
 constexpr int64_t kMaxPad = 15;
 
+/// The largest pad `PPU_POOLING_PADDING_CFG`'s 3-bit fields hold.
+constexpr int64_t kMaxPoolPad = 7;
+
 /// The int8 fill the requantized pad1 targets bake as `input_zero_point`:
 /// a `ui8` zero point of 0 in the signed encoding the convolution reads.
 constexpr int64_t kInt8PadFill = -128;
@@ -333,6 +336,66 @@ struct MarkPaddedConv : public OpRewritePattern<ConvOp> {
   }
 };
 
+/// The int8 max pool `rocket-fuse-int8-max-pool` produces, reading a
+/// symmetric spatial pad filled with -128: marked the same way a convolution
+/// is, so `@match_pooling_nhwc_max_s2_i8_pad1` can hand the padding to the
+/// PPU.
+///
+/// -128 is the int8 max's identity, so the padded pool computes exactly the
+/// clamp-to-image answer -- which is what the PPU's int8 max produces for
+/// every fill (`int8_max_pad_fill_probe` in iree-rocket-hal: the fill is
+/// inert). That equivalence needs every window to hold an image pixel, i.e.
+/// pad < kernel on each axis, and the PPU hangs otherwise, so a pad as wide
+/// as the window is left alone. The PPU's pad fields are 3 bits.
+struct MarkPaddedInt8MaxPool
+    : public OpRewritePattern<linalg::PoolingNhwcMaxOp> {
+  MarkPaddedInt8MaxPool(MLIRContext *context,
+                        llvm::SetVector<Operation *> *claimed)
+      : OpRewritePattern<linalg::PoolingNhwcMaxOp>(context),
+        claimed(claimed) {}
+
+  llvm::SetVector<Operation *> *claimed;
+
+  LogicalResult matchAndRewrite(linalg::PoolingNhwcMaxOp pool,
+                                PatternRewriter &rewriter) const override {
+    if (pool->hasAttr(kPadTopAttrName)) {
+      return failure();
+    }
+    auto pad = pool.getDpsInputs()[0].getDefiningOp<tensor::PadOp>();
+    if (!pad) {
+      return failure();
+    }
+    auto padType = cast<RankedTensorType>(pad.getResult().getType());
+    auto windowType =
+        dyn_cast<RankedTensorType>(pool.getDpsInputs()[1].getType());
+    if (padType.getRank() != 4 || !padType.getElementType().isInteger(8) ||
+        !windowType || windowType.getRank() != 2 ||
+        windowType.isDynamicDim(0) || windowType.isDynamicDim(1)) {
+      return failure();
+    }
+    int64_t padHeight = 0;
+    int64_t padWidth = 0;
+    bool int8Fill = false;
+    const int64_t spatial[2] = {1, 2};
+    if (!matchSymmetricSpatialPad(pad, spatial, padHeight, padWidth,
+                                  int8Fill) ||
+        !int8Fill) {
+      return failure();
+    }
+    if (padHeight > kMaxPoolPad || padWidth > kMaxPoolPad ||
+        padHeight >= windowType.getDimSize(0) ||
+        padWidth >= windowType.getDimSize(1)) {
+      return failure();
+    }
+    claimed->insert(pad);
+    rewriter.modifyOpInPlace(pool, [&] {
+      pool->setAttr(kPadTopAttrName, rewriter.getI64IntegerAttr(padHeight));
+      pool->setAttr(kPadLeftAttrName, rewriter.getI64IntegerAttr(padWidth));
+    });
+    return success();
+  }
+};
+
 struct RocketFoldConvPadPass
     : public PassWrapper<RocketFoldConvPadPass, OperationPass<>> {
   MLIR_DEFINE_EXPLICIT_INTERNAL_INLINE_TYPE_ID(RocketFoldConvPadPass)
@@ -342,7 +405,9 @@ struct RocketFoldConvPadPass
     return "Marks a convolution whose input is a symmetric, zero-filled "
            "(or, for an int8 3x3, -128-filled), spatial-only tensor.pad "
            "with rocket.pad_top/rocket.pad_left, so the matcher can hand the "
-           "padding to the CNA instead of leaving it as a materialized copy.";
+           "padding to the CNA instead of leaving it as a materialized copy. "
+           "Also marks an int8 max pool reading a -128-filled pad, for the "
+           "PPU.";
   }
 
   void getDependentDialects(DialectRegistry &registry) const final {
@@ -358,8 +423,8 @@ struct RocketFoldConvPadPass
     // and 3.
     patterns.add<MarkPaddedConv<linalg::Conv2DNhwcHwcfOp, 1, 2>,
                  MarkPaddedConv<linalg::DepthwiseConv2DNhwcHwcOp, 1, 2>,
-                 MarkPaddedConv<linalg::DepthwiseConv2DNchwChwOp, 2, 3>>(
-        context, &claimed);
+                 MarkPaddedConv<linalg::DepthwiseConv2DNchwChwOp, 2, 3>,
+                 MarkPaddedInt8MaxPool>(context, &claimed);
     if (failed(applyPatternsGreedily(getOperation(), std::move(patterns)))) {
       return signalPassFailure();
     }

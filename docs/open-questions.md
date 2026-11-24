@@ -112,10 +112,13 @@ corpus has direct 129-wide 3x3 captures, and this repo's register *set*
 matches `rocket-userspace`'s `gen_pool_fp16`, so some other value differs.
 [LIMITS "Pooling", `pooling-and-matmul-plan.md` "Still open"]
 
-1.4.2 What is the correct pad-fill identity for min pooling at any precision,
-and for max pooling at int8? Neither has been measured. Today every matched
-executable bakes zero padding, so the field is never read. [LIMITS "Pooling",
-`pooling.rs` `pad_fill_value`]
+1.4.2 ~~What is the correct pad-fill identity for min pooling at any
+precision, and for max pooling at int8?~~ **Answered 2026-11-24: none is
+needed.** The PPU's max and min ignore `PPU_PADDING_VALUE` at both
+precisions and clamp the window to the image (`*_pad_fill_probe` in
+`pooling_oracle_hw.rs`; `avg_pad_fill_control_probe` shows the field live
+for the average in the same windows). A pad as wide as the kernel hangs the
+job instead. [ISSUES Resolved, `pooling.rs` `pad_fill_value`]
 
 1.4.3 Is pooling at stride above 2 correct? Nothing above 2 has been measured
 at any method. [LIMITS "Pooling"]

@@ -92,8 +92,8 @@ the wire schema, the decode arm in
 [`executable_cache.rs:287`](rocket-hal-driver/src/executable_cache.rs), and
 `PoolingMethod::{Max,Min}` in [`pooling.rs`](iree-rocket-hal/src/rocket/pooling.rs)
 with the per-precision pad-fill identities already worked out
-(`pad_fill_value`: max/fp16 is `0xFC00`, min and int8-max take the
-"no fill" path). The compiler simply never asked for them.
+(`pad_fill_value`: max/fp16 is `0xFC00`, min and int8-max took the
+"no fill" path -- since measured inert, 2026-11-24). The compiler simply never asked for them.
 
 **Both were closed on 2026-09-05** -- six matchers and six shims, no change
 below the compiler at all, which is the evidence that this diagnosis was
