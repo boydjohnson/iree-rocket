@@ -1911,6 +1911,56 @@ What was settled and how, newest first, in place of the narratives — those are
 in this file's git history (`git log -p ISSUES.md`). Everything cited below is
 something that still exists: a commit, a file, or a memory.
 
+**fp16 stem on the NPU by space-to-depth, chained into its pool —
+2026-11-24. ResNet50-224 fp16 55.3 -> 52.3 ms.** The direct fp16 7x7
+stride-2 stem loses on the NPU (entry below: ~3.4 ms at `Cin` 3 on the CNA's
+dense image path). Stride 2 over an image is stride 1 over the image folded
+2x2 into channels, so `rocket-space-to-depth-stem` rewrites a float 7x7 s2
+convolution over <= 4 channels into a 4x4 s1 convolution over 4x the
+channels (the 8x8-padded kernel regrouped, `w'[a, b, (dy, dx, c)] = w[2a+dy,
+2b+dx, c]`), which the CNA reads as feature surfaces: 1.5 ms against 4.0 ms
+per dispatch, exact under every pattern at `Cout` 32/64/128
+(`stem_space_to_depth_4x4_matches_oracle`). fp16 admission for 4x4 s1 at
+`Cin` <= 16 / `Cout` <= 128, 4x4 twins of the stride-1 plain and ReLU
+matchers, and 4x4 s1 added to `RocketFuseConvRelu6Pass`'s fusable set so the
+stem's bias and ReLU go to the BS/BN stages.
+
+**That alone measured flat** (55.1 -> 55.5 ms): the CPU stem it replaces is
+only ~1.5-2 ms, and the stem's output was compacted to dense and repacked
+for the max pool (~0.9 + ~1.0 ms) because a CPU -inf `tensor.pad` sat
+between them. So the fp16 pool's pad moved to the PPU as the int8 one did
+(the fp16 max fill is inert, `fp16_max_pad_fill_probe`):
+`rocket-fold-conv-pad` marks an f32 max pool over a symmetric -inf pad,
+direct or through the rank-5 channels-last collapse, and rewrites the
+importer's `pooling_nchw_max(transpose(...))` over such a pad into the NHWC
+pool plus a transpose back (which cancels against the next conv's);
+`@match_pooling_nhwc_max_s2_pad1` claims pad and pool into
+`#rocket_pooling_max_pad1_target_s2`. Stem -> pool now chains: ResNet50 34 ->
+35 packed NPU edges, CPU dispatch sites 24 -> 21.
+
+ABAB on cpu 4-7, 0 timeouts: ResNet50-224 fp16 55.3/55.2/55.3 ->
+52.1/52.4/52.3 ms; ResNeXt50 ~194 -> ~190 ms (noisier). Both match the f32
+oracle (ResNeXt's top-5 is the same near-tie reorder its base build has);
+vs the base build max|d| 0.006. Gates: lit `rocket_space_to_depth_stem.mlir`
+and `rocket_fp16_max_pool_pad.mlir` (49/49), compiled e2e
+`fp16_stem_space_to_depth` (NCHW stem -> padded pool, max|err| 0.0015; 52/52),
+pooling e2e 20/20, `padded_max_pooling_matches_oracle` +fp16 112x112x64 pad 1.
+
+**fp16 7x7 stride-2 stem stays on the CPU, re-measured at 600 MHz —
+2026-11-24.** The 2026-11-24 survey found the fp16 stem refused in ResNeXt50
+and ResNet50 ("no fp16 dense 7x7 stride-2"). Correctness was never the
+question -- `stem_7x7_stride2_matches_oracle` has gated fp16 exact all along
+-- and the refusal was a 200 MHz measurement with "revisit at 600 MHz"
+attached. Revisited: with fp16 admission plus 7x7 twins of the plain,
+ReLU and demoted-ReLU stride-2 matchers, the stem is claimed in both models
+(ResNet50 then has every conv on the NPU), and both get slower -- ResNet50-224
+fp16 55.2/55.5/55.3 -> 57.2/57.4/57.3 ms, ResNeXt50 191/192/192 ->
+193/203/194 ms (ABAB, cpu 4-7, oracle-correct, 0 timeouts). `ROCKET_PROFILE`:
+the stem is ~3.4 ms of NPU time and ~0.9 ms of compaction per inference; at
+`Cin` 3 the CNA runs its dense image path and most of the array idles.
+Reverted; the measurement lives in `admission.rs`'s comment. The lever was a
+space-to-depth rewrite -- done, see the entry above.
+
 **Patchify convolutions run as matmuls — 2026-11-24. vit_b_16 254 -> 202
 ms, ConvNeXt-T 170 -> 112 ms, BLIP 951 -> 825 ms.** A convolution whose
 stride equals its kernel tiles the image without overlap: ViT/BLIP's 16x16

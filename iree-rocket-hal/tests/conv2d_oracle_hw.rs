@@ -3311,6 +3311,45 @@ fn stem_7x7_stride2_matches_oracle() {
     run_hardware_case_matrix("7x7 stride-2 dense stem", cases);
 }
 
+/// The 7x7 stride-2 stem rewritten by space-to-depth: the 230x230x3 padded
+/// image folded 2x2 into 115x115x12, and the 7x7 kernel zero-padded to 8x8
+/// and regrouped into a 4x4 stride-1 kernel over those 12 channels -- the
+/// same 112x112 output. At `Cin` 12 the CNA reads feature surfaces instead
+/// of its dense image path, which is the point (the direct 7x7 stem at `Cin`
+/// 3 leaves the array idle). fp16, `Cout` 32/64/128, every pattern.
+fn stem_space_to_depth_cases() -> Vec<Conv2dCase> {
+    let mut cases = Vec::new();
+    for (cout, pattern) in [
+        (64, OraclePattern::Selectors { phase: 5 }),
+        (64, OraclePattern::Counting),
+        (64, OraclePattern::Dense { phase: 3 }),
+        (32, OraclePattern::Selectors { phase: 5 }),
+        (128, OraclePattern::Selectors { phase: 5 }),
+    ] {
+        cases.push(Conv2dCase {
+            width: 115,
+            height: 115,
+            cin: 12,
+            cout,
+            kernel: [4, 4],
+            stride: 1,
+            padding: [0, 0],
+            precision: OraclePrecision::Fp16,
+            pattern,
+        });
+    }
+    cases
+}
+
+#[test]
+#[ignore = "needs /dev/accel/accel0 -- the space-to-depth 7x7 stride-2 stem"]
+fn stem_space_to_depth_4x4_matches_oracle() {
+    run_hardware_case_matrix(
+        "space-to-depth stem 4x4 s1 Cin 12",
+        stem_space_to_depth_cases(),
+    );
+}
+
 /// The dense (ARGB) feature DMA's over-fetch stays inside the bound the
 /// planner reports. Each case's input is moved to the top of the IOVA space
 /// -- nothing mapped past it -- with exactly

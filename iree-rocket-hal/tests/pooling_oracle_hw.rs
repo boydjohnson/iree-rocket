@@ -664,6 +664,20 @@ fn padded_max_pooling_matches_oracle() {
             method: PoolingMethod::Max,
             precision: PoolingPrecision::Fp16,
         },
+        // The same pool at fp16, with its padding on the PPU: the shape
+        // `@match_pooling_nhwc_max_s2_pad1` claims after the space-to-depth
+        // stem. The fp16 fill is inert too (`fp16_max_pad_fill_probe`).
+        PoolCase {
+            label: "max 3x3s2 pad1 resnet stem",
+            width: 112,
+            height: 112,
+            channels: 64,
+            kernel: (3, 3),
+            stride: (2, 2),
+            pad: [1, 1, 1, 1],
+            method: PoolingMethod::Max,
+            precision: PoolingPrecision::Fp16,
+        },
         // ResNet's stem pool at int8, with its padding on the PPU: the shape
         // `@match_pooling_nhwc_max_s2_i8_pad1` claims. The int8 fill is inert
         // (`int8_max_pad_fill_probe`), so this is the clamp-to-image answer.
