@@ -43,7 +43,9 @@ fn main() {
         None => shape,
     };
     let shape = if depthwise {
-        shape.try_with_depthwise().expect("depthwise needs cout == cin")
+        shape
+            .try_with_depthwise()
+            .expect("depthwise needs cout == cin")
     } else {
         shape
     };

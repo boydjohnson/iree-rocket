@@ -176,19 +176,24 @@ fn run_job(
 fn depthwise_pad1_mobilenetv2_shapes() {
     let mut failures = Vec::new();
     // `ROCKET_DW_PAD=0` runs the same shapes unpadded: the harness check.
-    let pad: usize = std::env::var("ROCKET_DW_PAD").ok().map_or(1, |v| v.parse().unwrap());
+    let pad: usize = std::env::var("ROCKET_DW_PAD")
+        .ok()
+        .map_or(1, |v| v.parse().unwrap());
     let split = std::env::var("ROCKET_CBUF_SPLIT").ok().map(|spec| {
-        let (data, weight) = spec.split_once('/').expect("ROCKET_CBUF_SPLIT=<data>/<weight>");
+        let (data, weight) = spec
+            .split_once('/')
+            .expect("ROCKET_CBUF_SPLIT=<data>/<weight>");
         (data.parse::<u32>().unwrap(), weight.parse::<u32>().unwrap())
     });
-    let custom: Option<Vec<(u32, u32, u32)>> = std::env::var("ROCKET_PAD1_SHAPES").ok().map(|spec| {
-        spec.split(',')
-            .map(|shape| {
-                let fields: Vec<u32> = shape.split(':').map(|f| f.parse().unwrap()).collect();
-                (fields[0], fields[1], fields[2])
-            })
-            .collect()
-    });
+    let custom: Option<Vec<(u32, u32, u32)>> =
+        std::env::var("ROCKET_PAD1_SHAPES").ok().map(|spec| {
+            spec.split(',')
+                .map(|shape| {
+                    let fields: Vec<u32> = shape.split(':').map(|f| f.parse().unwrap()).collect();
+                    (fields[0], fields[1], fields[2])
+                })
+                .collect()
+        });
     // MobileNetV2's seventeen depthwise convolutions, deduplicated: input
     // side, channels, stride. Every one of them is 3x3 with symmetric pad 1.
     let mobilenet = vec![
@@ -207,14 +212,20 @@ fn depthwise_pad1_mobilenetv2_shapes() {
         let c = channels as usize;
         let s = stride as usize;
         let label = format!("{side}x{side} C{c} s{s}");
-        let shape = Shape::try_with_precision(side, side, stride, channels, channels, Precision::Fp16)
-            .unwrap()
-            .try_with_padding([pad, pad])
-            .unwrap()
-            .try_with_depthwise()
-            .unwrap();
+        let shape =
+            Shape::try_with_precision(side, side, stride, channels, channels, Precision::Fp16)
+                .unwrap()
+                .try_with_padding([pad, pad])
+                .unwrap()
+                .try_with_depthwise()
+                .unwrap();
         let planned = match split {
-            Some((data, weight)) => Ok(ConvPlan::with_cbuf_banks(shape, [KERNEL, KERNEL], data, weight)),
+            Some((data, weight)) => Ok(ConvPlan::with_cbuf_banks(
+                shape,
+                [KERNEL, KERNEL],
+                data,
+                weight,
+            )),
             None => ConvPlan::try_new(shape, [KERNEL, KERNEL]),
         };
         let plan = match planned {
@@ -245,7 +256,9 @@ fn depthwise_pad1_mobilenetv2_shapes() {
         weight_plan.pack(&filter, &mut packed).unwrap();
         let bias = shape.padded_out_channels() as usize * 4;
         let written = shape.padded_out_channels() as usize;
-        let run = run_job(&plan, in_pixels, out_pixels, c, written, &input, &packed, bias, 5);
+        let run = run_job(
+            &plan, in_pixels, out_pixels, c, written, &input, &packed, bias, 5,
+        );
 
         let mut worst = 0.0f32;
         let mut worst_at = (0, 0, 0);
@@ -267,8 +280,8 @@ fn depthwise_pad1_mobilenetv2_shapes() {
                                 continue;
                             }
                             let pixel = y as usize * side + x as usize;
-                            want += input_f32[pixel * c + ch]
-                                * filter_f32[(ky * KERNEL + kx) * c + ch];
+                            want +=
+                                input_f32[pixel * c + ch] * filter_f32[(ky * KERNEL + kx) * c + ch];
                         }
                     }
                     let offset =
