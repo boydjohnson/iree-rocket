@@ -311,6 +311,13 @@ fn layout_debug() -> bool {
     *DEBUG.get_or_init(|| std::env::var("ROCKET_LAYOUT").is_ok_and(|value| value == "debug"))
 }
 
+/// `ROCKET_MATMUL_OUTPUT=cube` keeps every matmul on the NC1HWC2 output and
+/// its compaction, for A/B against the row-major writer on one binary.
+fn matmul_cube_output_forced() -> bool {
+    static FORCED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *FORCED.get_or_init(|| std::env::var("ROCKET_MATMUL_OUTPUT").is_ok_and(|value| value == "cube"))
+}
+
 /// The one rule that decides whether a dispatch's dense output write can be
 /// skipped, kept pure so it can be pinned by a test.
 ///
@@ -1144,6 +1151,11 @@ pub struct OutputCompaction {
     pub bytes_per_pixel: usize,
     pub source_block_bytes: usize,
     pub source_tiles: Option<Arc<[AccumulatorOutputTile]>>,
+    /// The scratch already holds the dense row-major output (a matmul planned
+    /// with `fc::Plan::try_new_row_major_output`): compaction is a copy of
+    /// whole rows, and a fanned-out tile's rows come from its context's
+    /// scratch at the same offsets.
+    pub row_major: bool,
     /// Fan-out gather: each replica's output scratch as `(host pointer,
     /// length)`, the context index each tile ran on (`0` = home) and each
     /// tile's output rectangle. All empty for a dispatch that ran at home.
@@ -2924,6 +2936,7 @@ unsafe extern "C" fn dispatch_impl(
                 bytes_per_pixel: output_bytes_per_pixel,
                 source_block_bytes: programmed_shape.output_atom_bytes() as usize,
                 source_tiles,
+                row_major: false,
                 replica_scratch,
                 tile_context: tile_context.clone(),
                 tile_rects,
@@ -3190,6 +3203,16 @@ unsafe extern "C" fn dispatch_impl(
             // repack would build (`chainable_cube`). The [K,N] operand is a
             // coefficient stream and never chains.
             let layout = executable.layout(constants);
+            // A result no Rocket dispatch reads in place is written straight
+            // into row-major layout by the DPU (`fc::Plan::
+            // try_new_row_major_output`), so the dense write-out is a copy of
+            // whole rows rather than an atom gather -- and on the wide-K
+            // shapes the width-1 lowering is faster on the NPU too. A result
+            // with declared packed readers keeps the NC1HWC2 cube they chain
+            // from.
+            let row_major_plan = (layout.packed_readers == 0 && !matmul_cube_output_forced())
+                .then(|| fc::Plan::try_new_row_major_output(*shape))
+                .flatten();
             let chained_input = if matches!(input_layout, InputPackingLayout::Nc1hwc2) {
                 match chainable_cube(
                     cb,
@@ -3351,7 +3374,9 @@ unsafe extern "C" fn dispatch_impl(
                 (addr, handle, None, None)
             };
 
-            let output_scratch_bytes =
+            let output_scratch_bytes = if row_major_plan.is_some() {
+                m * n * element_size
+            } else {
                 match nc1hwc2_storage_size(physical_pixel_count, output_bytes_per_pixel) {
                     Ok(value) => value,
                     Err(_) => {
@@ -3359,7 +3384,8 @@ unsafe extern "C" fn dispatch_impl(
                             crate::bindings::iree_status_code_e_IREE_STATUS_INVALID_ARGUMENT,
                         );
                     }
-                };
+                }
+            };
             if output_scratch_bytes > u32::MAX as usize {
                 return status::from_code(
                     crate::bindings::iree_status_code_e_IREE_STATUS_INVALID_ARGUMENT,
@@ -3438,7 +3464,21 @@ unsafe extern "C" fn dispatch_impl(
                 (None, None) => None,
             };
             let planned = match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                let plan = fc::Plan::new(*shape);
+                let plan = row_major_plan
+                    .clone()
+                    .unwrap_or_else(|| fc::Plan::new(*shape));
+                // The width-1 lowering reads the same input bytes -- M
+                // pixels in raster order -- as a column instead of a row, so
+                // a replica's input bands are bands of rows.
+                let input_geometry = if plan.row_major_output() {
+                    input_geometry.map(|geometry| BandGeometry {
+                        width: geometry.height,
+                        height: geometry.width,
+                        ..geometry
+                    })
+                } else {
+                    input_geometry
+                };
                 let tiles = plan.conv_plan().tiles().len();
                 let contexts = cb.fanout_contexts(tiles);
                 let tile_context = tile_contexts(tiles, contexts.len());
@@ -3480,6 +3520,9 @@ unsafe extern "C" fn dispatch_impl(
                             index => replicas[index - 1].buffers(),
                         };
                         relocate(&mut program, buffers);
+                        if plan.row_major_output() {
+                            plan.place_row_major_output(&mut program, tile, buffers.output);
+                        }
                         program
                     })
                     .collect();
@@ -3527,6 +3570,7 @@ unsafe extern "C" fn dispatch_impl(
             // rows) or the write-out is the accumulator's 128-byte block.
             let output_block_bytes = shape.as_conv_shape().output_channel_block_bytes() as usize;
             let output_cube = (tile_rects.is_empty()
+                && row_major_plan.is_none()
                 && output_block_bytes == 16
                 && output_geometry.is_whole_atom())
             .then_some(OutputCube {
@@ -3553,6 +3597,7 @@ unsafe extern "C" fn dispatch_impl(
                 bytes_per_pixel: output_bytes_per_pixel,
                 source_block_bytes: shape.as_conv_shape().output_channel_block_bytes() as usize,
                 source_tiles: None,
+                row_major: row_major_plan.is_some(),
                 replica_scratch,
                 tile_context: tile_context.clone(),
                 tile_rects,
@@ -3560,11 +3605,12 @@ unsafe extern "C" fn dispatch_impl(
             let retained_bindings = unsafe { retain_direct_bindings(refs) };
             let profile_label = profile::label(|| {
                 format!(
-                    "matmul {} {}x{}x{}",
+                    "matmul {} {}x{}x{}{}",
                     profile::precision_name(shape.precision),
                     m,
                     k,
                     n,
+                    if row_major_plan.is_some() { " rm" } else { "" },
                 )
             });
             let mut scratch_buffers = vec![output_scratch];
@@ -3783,6 +3829,7 @@ unsafe extern "C" fn dispatch_impl(
                 // what the PPU's cube strides are counted in.
                 source_block_bytes: 16,
                 source_tiles: None,
+                row_major: false,
                 replica_scratch: Vec::new(),
                 tile_context: Vec::new(),
                 tile_rects: Vec::new(),
@@ -4308,6 +4355,7 @@ fn compact_elementwise_output(
         // cube strides are counted in.
         source_block_bytes: 16,
         source_tiles: None,
+        row_major: false,
         replica_scratch: Vec::new(),
         tile_context: Vec::new(),
         tile_rects: Vec::new(),

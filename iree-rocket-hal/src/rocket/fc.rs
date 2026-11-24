@@ -31,7 +31,10 @@
 //! same points; which of the two is the better lowering above 32 is open.
 
 use crate::rocket::{
-    builders::RegCmd,
+    builders::{
+        Bits, RegCmd, Register, RegisterMeta,
+        dpu::{DpuDataCubeNotchAddr, DpuDstBaseAddr, DpuDstSurfStride, DpuSurfaceAdd},
+    },
     conv::{Buffers, ConvPlan, PlanError},
 };
 
@@ -45,6 +48,7 @@ pub use rocket_core::fc::{KERNELS, Shape};
 pub struct Plan {
     shape: Shape,
     conv: ConvPlan,
+    row_major_output: bool,
 }
 
 impl Plan {
@@ -59,7 +63,86 @@ impl Plan {
         Ok(Plan {
             shape,
             conv: ConvPlan::try_new(shape.try_as_conv_shape()?, KERNELS)?,
+            row_major_output: false,
         })
+    }
+
+    /// Plans the width-1 lowering whose output the DPU writes straight into
+    /// a row-major `[M, N]` buffer, or `None` where the shape does not
+    /// support it -- see `rocket_core::fc::Plan::try_new_row_major_output`.
+    ///
+    /// The DPU has no destination line stride, but it skips
+    /// `DPU_DATA_CUBE_NOTCH_ADDR` atoms at the end of every output line, and
+    /// at width 1 every line is one output row. So with the surface stride
+    /// at one atom and the notch at `N * 2 / 16 - 1`, channel group `c1` of
+    /// row `m` lands at byte `m * N * 2 + c1 * 16` -- row-major, with no
+    /// compaction pass. Measured on RK3588 2026-11-24
+    /// (`matmul_dense_output_probe_hw.rs`): bit-identical to the NC1HWC2
+    /// lowering on every BLIP matmul shape, nothing written past the dense
+    /// extent, and `DPU_SURFACE_ADD` must be 2 (the fp16 writer's rule,
+    /// twice the surface stride) -- 0, 1, 4 and the planner's whole-image
+    /// value all misplace channel groups.
+    pub fn try_new_row_major_output(shape: Shape) -> Option<Plan> {
+        let core = rocket_core::fc::Plan::try_new_row_major_output(shape)?;
+        Some(Plan {
+            shape,
+            conv: ConvPlan::from(core.conv_plan().clone()),
+            row_major_output: true,
+        })
+    }
+
+    /// Whether [`Plan::place_row_major_output`] applies to this plan's
+    /// programs.
+    pub fn row_major_output(&self) -> bool {
+        self.row_major_output
+    }
+
+    /// Points tile `tile`'s already-relocated program at its rows of a
+    /// row-major `[M, N]` output starting at `output`: the destination base
+    /// moves to the tile's first row, and the surface stride, notch and
+    /// surface add become the row-major writer's.
+    ///
+    /// Panics on a plan that is not [`Plan::row_major_output`], or when the
+    /// program does not carry exactly one of each register.
+    pub fn place_row_major_output(&self, program: &mut [RegCmd], tile: usize, output: u32) {
+        assert!(
+            self.row_major_output,
+            "place_row_major_output needs a plan from Plan::try_new_row_major_output"
+        );
+        let row_bytes = self.shape.n * self.shape.precision.element_bytes();
+        let notch = row_bytes / FEATURE_ATOM_BYTES - 1;
+        let first_row = self.conv.tiles()[tile].rows.out_first;
+        let base = output + first_row * row_bytes;
+        assert_eq!(
+            base % FEATURE_ATOM_BYTES,
+            0,
+            "row-major output must be 16-byte aligned"
+        );
+        replace_one::<DpuDstBaseAddr>(
+            program,
+            Register::<DpuDstBaseAddr>::new()
+                .dst_base_addr(Bits::new(base))
+                .build(),
+        );
+        replace_one::<DpuDstSurfStride>(
+            program,
+            Register::<DpuDstSurfStride>::new()
+                .dst_surf_stride(Bits::new(1))
+                .build(),
+        );
+        replace_one::<DpuDataCubeNotchAddr>(
+            program,
+            Register::<DpuDataCubeNotchAddr>::new()
+                .notch_addr_0(Bits::new(notch))
+                .notch_addr_1(Bits::new(notch))
+                .build(),
+        );
+        replace_one::<DpuSurfaceAdd>(
+            program,
+            Register::<DpuSurfaceAdd>::new()
+                .surf_add(Bits::new(2))
+                .build(),
+        );
     }
 
     pub fn shape(&self) -> Shape {
@@ -83,6 +166,24 @@ impl Plan {
     }
 }
 
+const FEATURE_ATOM_BYTES: u32 = 16;
+
+fn replace_one<R: RegisterMeta>(program: &mut [RegCmd], value: RegCmd) {
+    let mut matches = program.iter_mut().filter(|command| {
+        (command.0 >> 48) as u32 == R::DOMAIN && command.0 as u32 & 0xffff == R::OFFSET
+    });
+    let slot = matches
+        .next()
+        .unwrap_or_else(|| panic!("register {:#x}:{:#x} is absent", R::DOMAIN, R::OFFSET));
+    *slot = value;
+    assert!(
+        matches.next().is_none(),
+        "register {:#x}:{:#x} appears twice",
+        R::DOMAIN,
+        R::OFFSET
+    );
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -97,6 +198,47 @@ mod tests {
         },
         conv::{Multiplier, Precision, Quantization},
     };
+
+    #[test]
+    fn row_major_output_rewrites_only_the_dpu_writer() {
+        let shape = Shape::new(577, 768, 3072, Precision::Fp16);
+        let plan = Plan::try_new_row_major_output(shape).unwrap();
+        assert!(plan.row_major_output());
+        let buffers = Buffers {
+            input: 0x10_0000,
+            weights: 0x20_0000,
+            bias: 0x30_0000,
+            output: 0x40_0000,
+        };
+        let programs = plan.programs_with_buffers(buffers);
+        assert!(programs.len() > 1, "577 rows tile");
+        let mut rows_seen = 0;
+        for (tile, original) in programs.iter().enumerate() {
+            let mut program: Vec<RegCmd> =
+                original.iter().map(|command| RegCmd(command.0)).collect();
+            plan.place_row_major_output(&mut program, tile, buffers.output);
+            let first_row = plan.conv_plan().tiles()[tile].rows.out_first;
+            assert_eq!(first_row, rows_seen);
+            rows_seen += plan.conv_plan().tiles()[tile].rows.out_rows;
+            assert_eq!(
+                value_of::<DpuDstBaseAddr>(&program),
+                0x40_0000 + first_row * 3072 * 2
+            );
+            assert_eq!(value_of::<DpuDstSurfStride>(&program), 16);
+            assert_eq!(
+                value_of::<DpuDataCubeNotchAddr>(&program),
+                (383 << 16) | 383
+            );
+            let changed = original
+                .iter()
+                .zip(program.iter())
+                .filter(|(before, after)| before.0 != after.0)
+                .count();
+            assert!(changed <= 4, "only the four writer registers move");
+        }
+        assert_eq!(rows_seen, 577);
+        assert!(Plan::try_new_row_major_output(Shape::new(16, 768, 12, Precision::Fp16)).is_none());
+    }
 
     fn value_of<R: RegisterMeta>(program: &[RegCmd]) -> u32 {
         let values = program
