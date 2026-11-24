@@ -49,7 +49,8 @@ util.func public @conv_symmetric_pad(%input: tensor<1x1x56x56x64xf16>,
 // `low[0] high[1]` as a symmetric pad of any amount would shift every output
 // window and silently compute a different convolution. This is what ONNX
 // emits for `auto_pad = SAME_UPPER` at stride 2, so it is the common case,
-// not a corner one -- five of MobileNetV2's eighteen pads are this.
+// not a corner one -- five of the eighteen pads in an older ONNX import of
+// MobileNetV2 were this (a torch export pads symmetrically).
 
 // CHECK-LABEL: util.func public @conv_asymmetric_pad_declines
 // CHECK: linalg.conv_2d_nhwc_hwcf

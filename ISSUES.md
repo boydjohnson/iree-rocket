@@ -694,6 +694,9 @@ MobileNetV2 fp16 ties `--no-offload` (30.8 ms each, base 35.3).** Everything
 below predates removing the quiescence dwell, which was the whole deficit;
 see the Resolved entry. What is left of P7 is host work around the 17 CPU pad
 copies (`pack.input`, `compact`), i.e. conv padding, not the demote.
+**And that is resolved too (2026-11-24): the pads fold into the CNA and
+MobileNetV2 fp16 is 13.5 ms, 2.3x faster than `--no-offload`.** See the
+Resolved entry "Depthwise padding folds into the CNA".
 
 They are the whole of the `outside` term (70.9 ms of a 127 ms model; see
 the profile below): ten executables over 17 dispatch
@@ -1917,6 +1920,55 @@ instead on the way out, 31 ms of `compact` per inference against 7.5.
 What was settled and how, newest first, in place of the narratives — those are
 in this file's git history (`git log -p ISSUES.md`). Everything cited below is
 something that still exists: a commit, a file, or a memory.
+
+**Depthwise padding folds into the CNA — 2026-11-24. MobileNetV2 fp16
+30.8 -> 13.5 ms, 2.3x faster than `--no-offload`, bit-identical.** Each of
+MobileNetV2's 17 depthwise convolutions read its "same" pad from a CPU
+`tensor.pad` copy, so every depthwise sat in a CPU island between two NPU
+dispatches. The fold pass could not see those pads: the channels-last
+conversion leaves a depthwise NCHW and pads its input while still NHWC, so the
+chain is `transpose(collapse(pad(x)))`, and the pad-1 targets were all dense.
+
+- `rocket-demote-conv-inputs-to-f16` demotes through that transpose (truncf on
+  `x`, where the producer's widen cancels it).
+- `rocket-fold-conv-pad` moves a zero pad below the NCHW transpose and marks
+  the convolution, for the form a template claims (3x3, pad 1, stride 1/2,
+  fused ReLU6 after it); the old "a ReLU6 convolution keeps its pad"
+  tie-break now exempts exactly that form.
+- `rocket-promote-unclaimed-conv-inputs` rebuilds either chain in f32 for an
+  unclaimed convolution.
+- The spec gains `#rocket_dynamic_depthwise_pad1_relu6_target` (+ `_s2`), their
+  shims and four matchers (demoted / undemoted x stride 1/2).
+
+The survey export pads every convolution symmetrically (the asymmetric
+stride-2 pads in the conv-padding note were an older ONNX import's), so all
+17 fold. CPU dispatch sites 69 -> 19 (`rocket-pin-unclaimed-dispatches`),
+`slow_memcpy` executables 7 -> 0, NPU->NPU edges packed by
+`rocket-assign-layout` 19 -> 35. cpu 4-7, 600 MHz, medians of five, three
+interleaved passes, 0 NPU timeouts:
+
+    nooff 30.7 / 31.2 / 30.8   dw 30.8 / 31.5 / 31.3   fold 13.5 / 13.9 / 13.2 ms
+
+Output bit-identical to the dw build (f32-oracle max|err| 0.0639, top-5
+unchanged). The profile says why the gain is larger than 17 copies: per
+inference `queue` submissions 34 -> 18 (each CPU island was a round trip),
+host 24.8 -> 8.9 ms (`outside` 9.1 -> 4.0, `compact` 7.1 -> 1.5,
+`pack.input` 5.6 -> 1.2), `wait.npu` 7.9 -> 7.2.
+
+Hardware: `iree-rocket-hal/tests/depthwise_pad1_hw.rs` runs all ten distinct
+MobileNetV2 depthwise shapes with the CNA padding, bit-exact, plus C12, 16,
+136, 152 and 112x112 C144. **Harness trap it hit:** size a depthwise output
+from `Shape::padded_out_channels` (granule 32 fp16 channels), not `Cin`. A
+cube sized for `Cin` 144 is overrun by the DPU's 160 and the job hangs, at
+every `Cin % 32 != 0`, padded or not -- which reads exactly like a hardware
+channel limit, and briefly looked like one. `depthwise_7x7_probe_hw.rs` had
+the same sizing and only ran multiples of 32; fixed. Gates: lit 53/53 (new
+`rocket_fold_depthwise_pad.mlir`, `rocket_fp16_depthwise_pad1_match.mlir`, a
+depthwise case in `rocket_demote_through_pad.mlir`), compiled e2e.
+
+What is left on this model: the dense stem's pad (a ReLU6 dense conv keeps its
+pad; it would need a dense pad-1 ReLU6 template) and the stem -> depthwise
+edge, which still repacks (`pack.input` on the first depthwise, 0.6 ms).
 
 **Depthwise demotion on by default — 2026-11-24. MobileNetV2 fp16 35.3 ->
 30.8 ms, tying `--no-offload`.** P7 kept `ROCKET_DEMOTE_DEPTHWISE` off

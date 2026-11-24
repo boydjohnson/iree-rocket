@@ -5,7 +5,9 @@
 //! before spending hardware time on the poison-predecessor bug.
 //!
 //!   cargo run -p iree-rocket-hal --example dump_conv_plan -- \
-//!       <width> <height> <stride> <cin> <cout> <kernel> [pad]
+//!       <width> <height> <stride> <cin> <cout> <kernel> [pad] [dw]
+//!
+//! A trailing `dw` plans the depthwise program (`cout` must equal `cin`).
 //!
 //! `pad` is optional and defaults to `kernel / 2` -- which is what
 //! `Shape`'s `padding: None` means, *not* zero. Pass `0` explicitly for the
@@ -26,6 +28,7 @@ fn main() {
     let cout = value(4);
     let kernel = value(5) as usize;
     let padding = args.get(6).map(|_| value(6) as usize);
+    let depthwise = args.get(7).is_some_and(|flag| flag == "dw");
 
     let shape = Shape::with_precision(
         width,
@@ -39,12 +42,18 @@ fn main() {
         Some(pad) => shape.with_padding([pad, pad]),
         None => shape,
     };
+    let shape = if depthwise {
+        shape.try_with_depthwise().expect("depthwise needs cout == cin")
+    } else {
+        shape
+    };
     let kernels = [kernel, kernel];
     let plan = ConvPlan::new(shape, kernels);
 
     println!(
-        "{width}x{height} cin={cin} cout={cout} k={kernel} pad={}  out={}x{} data_banks={} weight_banks={} tiles={}",
+        "{width}x{height} cin={cin} cout={cout} k={kernel} pad={}{}  out={}x{} data_banks={} weight_banks={} tiles={}",
         padding.unwrap_or(kernel / 2),
+        if depthwise { " depthwise" } else { "" },
         shape.output_width(kernels),
         shape.output_height(kernels),
         plan.data_banks(),
@@ -54,8 +63,16 @@ fn main() {
     for (i, tile) in plan.tiles().iter().enumerate() {
         let grains = feature_grains(kernels, &tile.rows);
         println!(
-            "  tile {i}: in_rows={} pad_top={} out_first={} out_rows={}  feature_grains={grains}",
-            tile.rows.in_rows, tile.rows.pad_top, tile.rows.out_first, tile.rows.out_rows,
+            "  tile {i}: in_rows={} pad_top={} out_first={} out_rows={}  \
+             in_cols={} pad_left={} out_first_col={} out_cols={}  feature_grains={grains}",
+            tile.rows.in_rows,
+            tile.rows.pad_top,
+            tile.rows.out_first,
+            tile.rows.out_rows,
+            tile.columns.in_cols,
+            tile.columns.pad_left,
+            tile.columns.out_first,
+            tile.columns.out_cols,
         );
     }
 }

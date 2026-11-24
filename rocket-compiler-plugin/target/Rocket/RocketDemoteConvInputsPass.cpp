@@ -215,6 +215,12 @@
 // against `wait.npu` 7.8 -- the 17 CPU pad copies in front of every depthwise
 // still break the chain on both sides of it.
 //
+// **Those fold now (2026-11-24, later the same day): 30.8 -> 13.5 ms, 2.3x
+// faster than --no-offload, bit-identical.** `demoteInput` goes through the
+// depthwise's NCHW transpose, rocket-fold-conv-pad moves the pad below it,
+// and the pad-1 depthwise ReLU6 targets let the CNA pad. ISSUES.md Resolved,
+// "Depthwise padding folds into the CNA".
+//
 // Anything left alone is safe: an op that stays f32 fails the matchers' f16
 // typing and goes to the CPU, and RocketPromoteUnclaimedConvInputsPass gives
 // f32 back to anything demoted that the match loop then declines.
@@ -309,6 +315,30 @@ bool isStaticZeroPad(tensor::PadOp pad) {
 // dictionaries); RocketPromoteUnclaimedConvInputsPass recognises it by the
 // tagged truncf underneath.
 Value demoteInput(PatternRewriter &rewriter, Location loc, Value value) {
+  // A depthwise convolution stays NCHW through the channels-last conversion,
+  // so its padded input is `transpose(collapse(pad(x)))`: the pad still in
+  // the rank-5 NHWC form, then the layout change. Demote through the
+  // transpose as well, so the truncf lands on `x` -- the producer's result,
+  // where its widen cancels it -- rather than between the transpose and the
+  // convolution, where it would hide the pad from rocket-fold-conv-pad.
+  // That pass then moves the pad below the transpose (it has to do the same
+  // for an f16 import, which arrives in this form with no truncf at all).
+  if (auto transpose = value.getDefiningOp<linalg::TransposeOp>()) {
+    Value inner = transpose.getInput();
+    auto innerCollapse = inner.getDefiningOp<tensor::CollapseShapeOp>();
+    auto innerPad = (innerCollapse ? innerCollapse.getSrc() : inner)
+                        .getDefiningOp<tensor::PadOp>();
+    auto resultType = cast<RankedTensorType>(transpose->getResult(0).getType());
+    if (innerPad && isStaticZeroPad(innerPad) && resultType.hasStaticShape() &&
+        cast<RankedTensorType>(innerPad.getSource().getType()).getElementType().isF32()) {
+      Value demotedInner = demoteInput(rewriter, loc, inner);
+      Type f16 = rewriter.getF16Type();
+      Value init = tensor::EmptyOp::create(rewriter, loc, resultType.getShape(), f16);
+      return linalg::TransposeOp::create(rewriter, loc, demotedInner, init,
+                                         transpose.getPermutation())
+          ->getResult(0);
+    }
+  }
   auto collapse = value.getDefiningOp<tensor::CollapseShapeOp>();
   Value padded = collapse ? collapse.getSrc() : value;
   if (auto pad = padded.getDefiningOp<tensor::PadOp>()) {

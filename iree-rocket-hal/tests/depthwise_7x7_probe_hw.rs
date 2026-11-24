@@ -208,11 +208,15 @@ fn depthwise_7x7_convnext_probe() {
         weight_plan.pack(&filter, &mut packed).unwrap();
         let bias = shape.padded_out_channels() as usize * 4;
         std::thread::sleep(std::time::Duration::from_millis(800));
+        // Size the output by what the DPU writes: a depthwise output granule
+        // is 32 fp16 channels, so a `Cin % 32 != 0` cube sized for `Cin` is
+        // overrun and the job hangs (`depthwise_pad1_hw`'s doc). Every
+        // ConvNeXt stage is a multiple of 32, which is why this went unseen.
         let run = run_job(
             in_pixels,
             c,
             out_pixels,
-            c,
+            shape.padded_out_channels() as usize,
             &input,
             &[(plan, 0, 0, packed, bias)],
             5,

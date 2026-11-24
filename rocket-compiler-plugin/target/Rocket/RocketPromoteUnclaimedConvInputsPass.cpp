@@ -80,6 +80,27 @@ Value originalF32Source(Value demoted) {
   return source;
 }
 
+// Whether `demoted` is one of the demote pass's truncfs, possibly under the
+// collapse, transpose and static pad it demotes through -- exactly the chains
+// `promotedF32Source` can rebuild, checked before it builds anything.
+bool reachesDemotedSource(Value demoted) {
+  if (originalF32Source(demoted)) {
+    return true;
+  }
+  if (auto collapse = demoted.getDefiningOp<tensor::CollapseShapeOp>()) {
+    return reachesDemotedSource(collapse.getSrc());
+  }
+  if (auto transpose = demoted.getDefiningOp<linalg::TransposeOp>()) {
+    return cast<RankedTensorType>(transpose->getResult(0).getType()).hasStaticShape() &&
+           reachesDemotedSource(transpose.getInput());
+  }
+  if (auto pad = demoted.getDefiningOp<tensor::PadOp>()) {
+    return pad.getLow().empty() && pad.getHigh().empty() &&
+           reachesDemotedSource(pad.getSource());
+  }
+  return false;
+}
+
 // `originalF32Source`, looking through the f16 zero pad (and the collapse
 // over it) the demote pass builds when it demotes *through* a pad. The pad
 // itself carries no tag -- the DAG matchers compare attribute dictionaries
@@ -100,8 +121,22 @@ Value promotedF32Source(PatternRewriter &rewriter, Location loc, Value demoted) 
         rewriter, loc, cast<RankedTensorType>(collapse.getType()).clone(f32), source,
         collapse.getReassociationIndices());
   }
+  // A depthwise input: the demote pass goes through the NCHW transpose too,
+  // and rocket-fold-conv-pad then moves the pad below it, so the transpose
+  // may sit on either side of the pad.
+  if (auto transpose = demoted.getDefiningOp<linalg::TransposeOp>()) {
+    Value source = promotedF32Source(rewriter, loc, transpose.getInput());
+    auto resultType = cast<RankedTensorType>(transpose->getResult(0).getType());
+    if (!source || !resultType.hasStaticShape()) {
+      return {};
+    }
+    Value init = tensor::EmptyOp::create(rewriter, loc, resultType.getShape(), f32);
+    return linalg::TransposeOp::create(rewriter, loc, source, init,
+                                       transpose.getPermutation())
+        ->getResult(0);
+  }
   if (auto pad = demoted.getDefiningOp<tensor::PadOp>()) {
-    Value source = originalF32Source(pad.getSource());
+    Value source = promotedF32Source(rewriter, loc, pad.getSource());
     if (!source || !pad.getLow().empty() || !pad.getHigh().empty()) {
       return {};
     }
@@ -128,14 +163,7 @@ struct PromoteInputsToF32 : OpRewritePattern<ContractionOpTy> {
     // rather than promoting it halfway.
     SmallVector<Value> promotedInputs;
     for (OpOperand *inputOperand : convOp.getDpsInputOperands()) {
-      Value probe = inputOperand->get();
-      if (auto collapse = probe.getDefiningOp<tensor::CollapseShapeOp>()) {
-        probe = collapse.getSrc();
-      }
-      if (auto pad = probe.getDefiningOp<tensor::PadOp>()) {
-        probe = pad.getSource();
-      }
-      if (!originalF32Source(probe)) {
+      if (!reachesDemotedSource(inputOperand->get())) {
         return failure();
       }
     }
