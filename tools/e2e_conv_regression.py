@@ -674,6 +674,49 @@ func.func @requant_int8_1x1_cin816(%input: tensor<1x7x7x816xi8>, %filter: tensor
   return %out : tensor<1x7x7x224xi8>
 }
 
+// ResNet50-224 int8's layer4 bottleneck input, 7x7 Cin 2048 -> Cout 512: the
+// shape that took the requantized 1x1 `Cin` ceiling 1344 -> 2048 (HAL gate
+// `int8_requant_cin2048_matches_oracle`).
+func.func @requant_int8_1x1_cin2048(%input: tensor<1x7x7x2048xi8>, %filter: tensor<1x1x2048x512xi8>, %bias: tensor<512xi32>) -> tensor<1x7x7x512xi8> {
+  %zero = arith.constant 0 : i32
+  %scale = arith.constant 3.000000e-04 : f32
+  %zp = arith.constant -6 : i32
+  %int8_min = arith.constant -1.280000e+02 : f32
+  %int8_max = arith.constant 1.270000e+02 : f32
+  %acc_empty = tensor.empty() : tensor<1x7x7x512xi32>
+  %acc_init = linalg.fill ins(%zero : i32) outs(%acc_empty : tensor<1x7x7x512xi32>) -> tensor<1x7x7x512xi32>
+  %acc = linalg.conv_2d_nhwc_hwcf
+      {dilations = dense<1> : tensor<2xi64>, strides = dense<1> : tensor<2xi64>}
+      ins(%input, %filter : tensor<1x7x7x2048xi8>, tensor<1x1x2048x512xi8>)
+      outs(%acc_init : tensor<1x7x7x512xi32>) -> tensor<1x7x7x512xi32>
+  %out_empty = tensor.empty() : tensor<1x7x7x512xi8>
+  %out = linalg.generic {
+      indexing_maps = [affine_map<(d0, d1, d2, d3) -> (d0, d1, d2, d3)>,
+                       affine_map<(d0, d1, d2, d3) -> (d3)>,
+                       affine_map<(d0, d1, d2, d3) -> ()>,
+                       affine_map<(d0, d1, d2, d3) -> ()>,
+                       affine_map<(d0, d1, d2, d3) -> ()>,
+                       affine_map<(d0, d1, d2, d3) -> ()>,
+                       affine_map<(d0, d1, d2, d3) -> (d0, d1, d2, d3)>],
+      iterator_types = ["parallel", "parallel", "parallel", "parallel"]}
+      ins(%acc, %bias, %scale, %zp, %int8_min, %int8_max
+          : tensor<1x7x7x512xi32>, tensor<512xi32>, f32, i32, f32, f32)
+      outs(%out_empty : tensor<1x7x7x512xi8>) {
+    ^bb0(%raw: i32, %channel_bias: i32, %s: f32, %z: i32, %low: f32, %high: f32, %unused: i8):
+      %biased = arith.addi %raw, %channel_bias : i32
+      %real = arith.sitofp %biased : i32 to f32
+      %scaled = arith.mulf %real, %s : f32
+      %rounded = math.roundeven %scaled : f32
+      %zf = arith.sitofp %z : i32 to f32
+      %offset = arith.addf %rounded, %zf : f32
+      %low_clamped = arith.maximumf %offset, %low : f32
+      %clamped = arith.minimumf %low_clamped, %high : f32
+      %narrowed = arith.fptosi %clamped : f32 to i8
+      linalg.yield %narrowed : i8
+  } -> tensor<1x7x7x512xi8>
+  return %out : tensor<1x7x7x512xi8>
+}
+
 func.func @requant_int8_1x1_cin816_cout448(%input: tensor<1x7x7x816xi8>, %filter: tensor<1x1x816x448xi8>, %bias: tensor<448xi32>) -> tensor<1x7x7x448xi8> {
   %zero = arith.constant 0 : i32
   %scale = arith.constant 3.000000e-04 : f32
@@ -1488,6 +1531,13 @@ def write_compiled_fixture(work_dir: Path) -> None:
     np.save(work_dir / "requant_int8_1x1_then_pad1_f2.npy", i8_small(3, 3, 64, 64))
     np.save(work_dir / "requant_int8_1x1_then_pad1_b2.npy", bias_i32(64))
 
+    # Its own rng, so the shared stream every later fixture draws from does
+    # not move.
+    cin2048_rng = np.random.default_rng(20261124)
+    np.save(work_dir / "requant_int8_1x1_cin2048_input.npy", cin2048_rng.integers(-128, 128, size=(1, 7, 7, 2048), dtype=np.int8))
+    np.save(work_dir / "requant_int8_1x1_cin2048_kernel.npy", cin2048_rng.integers(-8, 8, size=(1, 1, 2048, 512), dtype=np.int8))
+    np.save(work_dir / "requant_int8_1x1_cin2048_bias.npy", cin2048_rng.integers(-1000, 1000, size=(512,), dtype=np.int32))
+
     np.save(work_dir / "requant_int8_1x1_cin816_input.npy", i8(1, 7, 7, 816))
     np.save(work_dir / "requant_int8_1x1_cin816_kernel.npy", i8_small(1, 1, 816, 224))
     np.save(work_dir / "requant_int8_1x1_cin816_bias.npy", bias_i32(224))
@@ -1703,6 +1753,7 @@ def compile_modules(
         ("dense_int8_cout512_3x3", "rocket_dynamic_int8_executable"),
         ("requant_int8_1x1_cin512", "rocket_dynamic_int8_requant_executable"),
         ("requant_int8_1x1_cin816", "rocket_dynamic_int8_requant_executable"),
+        ("requant_int8_1x1_cin2048", "rocket_dynamic_int8_requant_executable"),
         ("requant_int8_1x1_cin816_cout448", "rocket_dynamic_int8_requant_executable"),
         ("requant_int8_1x1_large_bias", "rocket_dynamic_int8_requant_executable"),
         ("fp16_residual_relu", "rocket_dynamic_residual_relu_executable"),
@@ -2238,6 +2289,17 @@ def run_compiled_gate(
                 "requant_int8_1x1_cin816_bias.npy",
             ),
             ("requant_int8_1x1_cin816_out_rocket.npy",),
+            1.0,
+            0.0,
+        ),
+        Case(
+            "requant_int8_1x1_cin2048",
+            (
+                "requant_int8_1x1_cin2048_input.npy",
+                "requant_int8_1x1_cin2048_kernel.npy",
+                "requant_int8_1x1_cin2048_bias.npy",
+            ),
+            ("requant_int8_1x1_cin2048_out_rocket.npy",),
             1.0,
             0.0,
         ),

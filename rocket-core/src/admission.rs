@@ -248,8 +248,9 @@ pub fn conv_ceilings(
         // channel, so the contraction depth is 1
         // (`Shape::streamed_contraction_channels`).
         (PrecisionClass::Int8Accumulator, true, 1 | 3) => ceilings(1344, 1344),
-        // **int8 requantized, dense 1x1.** 1344 is the widest `Cin` a
-        // measured model asks for, and it is the model that says so:
+        // **int8 requantized, dense 1x1.** 1344 was the widest `Cin` a
+        // measured model asked for until ResNet50's 2048 (below), and it is
+        // the model that said so:
         // MobileNetV2-static-int8's 7x7 Cin 1344 -> Cout 448 projection on
         // this path is max|diff| 0.35 against the CPU arm, same argmax and
         // top-5 (`planck`, 2026-09-08). It sat at 816 for two days because
@@ -278,8 +279,16 @@ pub fn conv_ceilings(
         // requantization. `int8_requant_cout2048_matches_oracle` gates both
         // shapes on hardware, and the model is measured against its
         // `--no-offload` arm (ISSUES.md Resolved, the int8 downsample).
+        //
+        // `Cin` raised 1344 -> 2048 on 2026-11-24, on the same model:
+        // layer4's three 7x7 Cin 2048 -> 512 bottleneck inputs were its last
+        // convolutions on the accumulator path, and the only conv -> conv
+        // edges left that could not chain (a CPU requantization sat on each).
+        // `int8_requant_cin2048_matches_oracle` is exact at Cin 1792 and 2048
+        // under `Counting` and `SelectorsAffine`; the model is the gate, as
+        // above.
         (PrecisionClass::Int8Requant, false, 1) => Some(ChannelCeilings {
-            in_channels: 1344,
+            in_channels: 2048,
             out_channels: 2048,
             min_out_channels: 16,
         }),
@@ -571,14 +580,15 @@ mod tests {
     }
 
     /// ResNet50-224 int8's layer4 needs requantized 1x1 `Cout` 2048 at both
-    /// strides; `Cin` stays at 1344.
+    /// strides, and `Cin` 2048 for its 7x7 bottleneck inputs.
     #[test]
-    fn requant_1x1_admits_cout_2048_at_both_strides() {
+    fn requant_1x1_admits_layer4_widths() {
         for stride in [1, 2] {
             assert!(admit_conv(&conv(int8(true), false, 1, stride, 1024, 2048)).is_ok());
             assert!(admit_conv(&conv(int8(true), false, 1, stride, 512, 2048)).is_ok());
             assert!(admit_conv(&conv(int8(true), false, 1, stride, 1024, 2064)).is_err());
-            assert!(admit_conv(&conv(int8(true), false, 1, stride, 2048, 512)).is_err());
+            assert!(admit_conv(&conv(int8(true), false, 1, stride, 2048, 512)).is_ok());
+            assert!(admit_conv(&conv(int8(true), false, 1, stride, 2064, 512)).is_err());
         }
     }
 

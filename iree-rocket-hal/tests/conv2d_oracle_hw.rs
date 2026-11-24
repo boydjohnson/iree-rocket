@@ -3234,6 +3234,34 @@ fn int8_requant_cout2048_cases() -> Vec<Conv2dCase> {
     cases
 }
 
+/// Requantized int8 1x1 above the `Cin` 1344 ceiling, at ResNet50-224
+/// int8's layer4 bottleneck input: 7x7 `Cin` 2048 -> `Cout` 512, stride 1.
+/// Those three convolutions are the last ResNet50 int8 convolutions on the
+/// int8-accumulator path (a CPU requantization each) and the only conv->conv
+/// edges in the model that cannot chain. 1792 brackets the step from 1344.
+fn int8_requant_cin2048_cases() -> Vec<Conv2dCase> {
+    let mut cases = Vec::new();
+    for cin in [1792u32, 2048] {
+        for pattern in [
+            OraclePattern::Counting,
+            OraclePattern::SelectorsAffine { phase: 5 },
+        ] {
+            cases.push(Conv2dCase {
+                width: 7,
+                height: 7,
+                cin,
+                cout: 512,
+                kernel: [1, 1],
+                stride: 1,
+                padding: [0, 0],
+                precision: OraclePrecision::Int8,
+                pattern,
+            });
+        }
+    }
+    cases
+}
+
 /// The 7x7 stride-2 image stem on the dense feature path, over the grid
 /// `conv::stride_two_dense_stem` admits: ResNet's 230x230 `Cin` 3 -> 64 at
 /// padding 0 (the compiled stem arrives padded), `Cin` 1..=4 and `Cout` 32
@@ -3454,6 +3482,14 @@ fn int8_requant_cout2048_matches_oracle() {
     let cases = int8_requant_cout2048_cases();
     assert_eq!(cases.len(), 4);
     run_hardware_case_matrix("requantized int8 Cout 2048 (ResNet50 shapes)", cases);
+}
+
+#[test]
+#[ignore = "needs /dev/accel/accel0 -- requantized int8 1x1 at Cin 2048, ResNet50's layer4"]
+fn int8_requant_cin2048_matches_oracle() {
+    let cases = int8_requant_cin2048_cases();
+    assert_eq!(cases.len(), 4);
+    run_hardware_case_matrix("requantized int8 Cin 2048 (ResNet50 layer4)", cases);
 }
 
 #[test]
