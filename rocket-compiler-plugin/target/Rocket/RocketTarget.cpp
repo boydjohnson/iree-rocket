@@ -38,6 +38,7 @@
 // same placeholders rocket-hal-driver's own tag=0 hardcoded shape already
 // uses.
 
+#include <limits>
 #include <array>
 #include <cstdint>
 #include <optional>
@@ -214,6 +215,11 @@ struct RocketConv2dConfig {
   // (Conv2DDef.weights_packed): set by rocket-pack-weights on the clone of
   // an executable whose constant filter it packed. COMPILER_ROADMAP.md 6.3.
   bool weightsPacked = false;
+  // A grouped convolution run as per-channel-slice tasks
+  // (Conv2DDef.groups): set by rocket-pack-weights, with the grouped packed
+  // stream, on the clone of an executable whose constant filter is
+  // block-diagonal. 1 is dense.
+  uint32_t groups = 1;
 };
 
 struct RocketFullyConnectedConfig {
@@ -472,6 +478,21 @@ std::optional<RocketConv2dConfig> buildRocketConv2dConfigFromTarget(
   if (!parseOptionalBool(config, "weights_packed", shape.weightsPacked,
                          diagFn)) {
     return std::nullopt;
+  }
+  if (Attribute attr = config.get("groups")) {
+    auto groups = llvm::dyn_cast<IntegerAttr>(attr);
+    if (!groups || groups.getInt() < 1 ||
+        groups.getInt() > std::numeric_limits<uint32_t>::max()) {
+      diagFn() << "rocket backend: convolution 'groups' must be a positive "
+                  "integer";
+      return std::nullopt;
+    }
+    shape.groups = static_cast<uint32_t>(groups.getInt());
+    if (shape.groups > 1 && !shape.weightsPacked) {
+      diagFn() << "rocket backend: a grouped convolution ('groups' > 1) needs "
+                  "its weights packed at compile time ('weights_packed')";
+      return std::nullopt;
+    }
   }
   if (Attribute attr = config.get("epilogue_activation")) {
     StringRef activation = llvm::cast<StringAttr>(attr).getValue();
@@ -1997,7 +2018,8 @@ public:
           iree_hal_rocket_Conv2DDef_runtime_layout_add(
               builder, convShape->runtimeLayout) ||
           iree_hal_rocket_Conv2DDef_weights_packed_add(
-              builder, convShape->weightsPacked)) {
+              builder, convShape->weightsPacked) ||
+          iree_hal_rocket_Conv2DDef_groups_add(builder, convShape->groups)) {
         return variantOp.emitOpError()
                << "failed to populate Rocket convolution definition";
       }

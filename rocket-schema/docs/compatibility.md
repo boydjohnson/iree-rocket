@@ -65,6 +65,16 @@ plus a separate divide), recognizing that pair as an average is the
 compiler's job. Adding `SUM` here would create a wire state no runtime can
 execute.
 
+`Conv2DDef.groups` was added compatibly with a default of 1, which is the
+dense convolution every older `RKT1` executable means. A value above 1 runs
+the convolution as one job of dense per-channel-slice tasks
+(`rocket_core::grouped::GroupedConv`), and the weights binding is then the
+grouped packed stream, slice after slice -- so `groups` > 1 requires
+`weights_packed`, and the compiler refuses to serialize one without it. A
+reader refuses a grouped executable it cannot slice (not fp16, depthwise, a
+residual epilogue, or channels that do not split into whole atoms) rather
+than running it dense against a stream packed for slices.
+
 `ElementwiseUnaryDef`, `ElementwiseLutDef` and `ElementwiseBinaryDef` were
 appended to `KernelDef` as union tags 5, 6 and 7. Same rule as tags 3 and 4:
 the members must never be reordered, and `kernel_union_tags_are_stable` says

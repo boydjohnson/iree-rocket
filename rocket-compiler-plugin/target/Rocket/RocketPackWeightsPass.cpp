@@ -54,6 +54,7 @@ namespace {
 using namespace rocket_query;
 
 constexpr StringLiteral kWeightsPackedKey = "weights_packed";
+constexpr StringLiteral kGroupsKey = "groups";
 
 size_t elementBytes(uint32_t precision) { return inputElementBytes(precision); }
 
@@ -214,8 +215,12 @@ struct RocketPackWeightsPass
     SymbolTable symbolTable(module);
     // One packed clone per source executable, and one packed global per
     // (global, geometry): a filter shared by two dispatches is packed once.
-    llvm::DenseMap<Operation *, IREE::HAL::ExecutableOp> packedExecutables;
-    llvm::StringMap<IREE::Util::GlobalOp> packedGlobals;
+    // Keyed by (executable, groups): a grouped dispatch gets its own clone
+    // carrying `groups`, a dense one the plain `_packed` clone.
+    llvm::DenseMap<std::pair<Operation *, unsigned>, IREE::HAL::ExecutableOp>
+        packedExecutables;
+    llvm::StringMap<std::pair<IREE::Util::GlobalOp, unsigned>> packedGlobals;
+    unsigned grouped = 0;
     unsigned packed = 0;
     unsigned nonConstant = 0;
     unsigned refused = 0;
@@ -277,7 +282,9 @@ struct RocketPackWeightsPass
       }
 
       std::string globalKey = (globalOp.getSymName() + "|" + request->key).str();
-      IREE::Util::GlobalOp packedGlobal = packedGlobals.lookup(globalKey);
+      auto cached = packedGlobals.lookup(globalKey);
+      IREE::Util::GlobalOp packedGlobal = cached.first;
+      unsigned groups = cached.second ? cached.second : 1;
       if (!packedGlobal) {
         std::vector<char> storage;
         ArrayRef<char> bytes;
@@ -289,6 +296,35 @@ struct RocketPackWeightsPass
         size_t packedLength = 0;
         std::vector<uint8_t> output;
         uint32_t status;
+        // A block-diagonal fp16 filter -- what
+        // rocket-block-diagonal-grouped-conv builds for a grouped
+        // convolution -- runs as per-channel-slice tasks
+        // (rocket_core::grouped, Conv2DDef.groups) and is packed slice by
+        // slice. A grouping the grouped lowering refuses falls back to the
+        // dense packing below; nothing is lost but the speedup.
+        groups = 1;
+        if (!request->matmul && !request->conv.depthwise &&
+            request->conv.precision == ROCKET_PLAN_PRECISION_FP16) {
+          const auto *dense = reinterpret_cast<const uint8_t *>(bytes.data());
+          unsigned detected = rocket_detect_block_diagonal_groups(
+              &request->conv, dense, bytes.size());
+          if (detected > 1) {
+            status = rocket_pack_grouped_conv_weights(
+                &request->conv, detected, dense, bytes.size(), nullptr, 0,
+                &packedLength, message, sizeof(message));
+            if (status == ROCKET_PLAN_OK) {
+              output.resize(packedLength);
+              status = rocket_pack_grouped_conv_weights(
+                  &request->conv, detected, dense, bytes.size(), output.data(),
+                  output.size(), &packedLength, message, sizeof(message));
+            }
+            if (status == ROCKET_PLAN_OK) {
+              groups = detected;
+            } else {
+              output.clear();
+            }
+          }
+        }
         auto pack = [&](uint8_t *out, size_t capacity) {
           const auto *dense = reinterpret_cast<const uint8_t *>(bytes.data());
           return request->matmul
@@ -300,10 +336,12 @@ struct RocketPackWeightsPass
                                                 out, capacity, &packedLength,
                                                 message, sizeof(message));
         };
-        status = pack(nullptr, 0);
-        if (status == ROCKET_PLAN_OK) {
-          output.resize(packedLength);
-          status = pack(output.data(), output.size());
+        if (groups == 1) {
+          status = pack(nullptr, 0);
+          if (status == ROCKET_PLAN_OK) {
+            output.resize(packedLength);
+            status = pack(output.data(), output.size());
+          }
         }
         if (status != ROCKET_PLAN_OK) {
           dispatchOp.emitWarning()
@@ -334,7 +372,7 @@ struct RocketPackWeightsPass
         // duplicated.
         packedGlobal->remove();
         symbolTable.insert(packedGlobal, Block::iterator(globalOp->getNextNode()));
-        packedGlobals[globalKey] = packedGlobal;
+        packedGlobals[globalKey] = {packedGlobal, groups};
         denseBytes += bytes.size();
         packedBytes += output.size();
       }
@@ -375,12 +413,14 @@ struct RocketPackWeightsPass
 
       // Retarget at the packed clone of the executable.
       IREE::HAL::ExecutableOp packedExecutable =
-          packedExecutables.lookup(target->executableOp);
+          packedExecutables.lookup({target->executableOp, groups});
       if (!packedExecutable) {
         Operation *cloned = target->executableOp->clone();
         packedExecutable = cast<IREE::HAL::ExecutableOp>(cloned);
+        std::string suffix =
+            groups > 1 ? "_packed_g" + std::to_string(groups) : "_packed";
         SymbolTable::setSymbolName(
-            packedExecutable, (target->executableOp.getSymName() + "_packed").str());
+            packedExecutable, (target->executableOp.getSymName() + suffix).str());
         symbolTable.insert(packedExecutable,
                            Block::iterator(target->executableOp->getNextNode()));
         for (auto variantOp : packedExecutable.getOps<IREE::HAL::ExecutableVariantOp>()) {
@@ -390,27 +430,36 @@ struct RocketPackWeightsPass
           }
           SmallVector<NamedAttribute> entries;
           for (NamedAttribute entry : variantTarget.getConfiguration()) {
-            if (entry.getName().getValue() != kWeightsPackedKey) {
+            if (entry.getName().getValue() != kWeightsPackedKey &&
+                entry.getName().getValue() != kGroupsKey) {
               entries.push_back(entry);
             }
           }
           entries.emplace_back(builder.getStringAttr(kWeightsPackedKey),
                                builder.getBoolAttr(true));
+          if (groups > 1) {
+            entries.emplace_back(builder.getStringAttr(kGroupsKey),
+                                 builder.getI32IntegerAttr(groups));
+          }
           variantOp.setTargetAttr(IREE::HAL::ExecutableTargetAttr::get(
               builder.getContext(), variantTarget.getBackend(),
               variantTarget.getFormat(), builder.getDictionaryAttr(entries)));
         }
-        packedExecutables[target->executableOp] = packedExecutable;
+        packedExecutables[{target->executableOp, groups}] = packedExecutable;
       }
       dispatchOp.setEntryPointsAttr(builder.getArrayAttr({SymbolRefAttr::get(
           builder.getContext(), packedExecutable.getSymName(),
           target->entryPoint.getNestedReferences())}));
       ++packed;
+      if (groups > 1) {
+        ++grouped;
+      }
     }
     if (packed > 0 || nonConstant > 0 || refused > 0) {
       module.emitRemark() << "rocket-pack-weights: " << packed
                           << " dispatch(es) packed (" << denseBytes << " -> "
-                          << packedBytes << " bytes), " << nonConstant
+                          << packedBytes << " bytes, " << grouped
+                          << " grouped), " << nonConstant
                           << " with non-constant weights or dimensions, "
                           << refused << " refused by the packer";
     }

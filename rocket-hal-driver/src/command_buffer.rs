@@ -98,6 +98,7 @@ use iree_rocket_hal::rocket::{
         build_add_regcmd_with_relu, build_unary_regcmd,
     },
     fc,
+    grouped::GroupedConv,
     layout::{CubeGeometry, CubeKind, DispatchLayout, chain_identity, cube_geometry},
     pooling::{PoolingBuffers, PoolingPlan},
     tensor_layout::{
@@ -2345,6 +2346,41 @@ unsafe extern "C" fn dispatch_impl(
                     );
                 }
             };
+            // A grouped convolution (`Conv2DDef.groups`, rocket_core::grouped)
+            // runs as one job of dense per-channel-slice tasks over the full
+            // input and output cubes. Its weights binding is the grouped
+            // packed stream, so it must be packed at compile time; it has no
+            // residual epilogue and reads feature surfaces, which is all
+            // `rocket-pack-weights` ever marks.
+            let grouped = if executable.groups > 1 {
+                match GroupedConv::try_new(*shape, kernels, executable.groups) {
+                    Ok(grouped)
+                        if executable.weights_packed
+                            && !executable.epilogue_add
+                            && shape.layout() == FeatureLayout::Surfaces =>
+                    {
+                        Some(grouped)
+                    }
+                    _ => {
+                        return status::from_code(
+                            crate::bindings::iree_status_code_e_IREE_STATUS_INVALID_ARGUMENT,
+                        );
+                    }
+                }
+            } else {
+                None
+            };
+            let slice_programmed_shape = match grouped
+                .map(|grouped| grouped.slice_shape().parity_padded_shape(kernels))
+                .transpose()
+            {
+                Ok(slice) => slice,
+                Err(_) => {
+                    return status::from_code(
+                        crate::bindings::iree_status_code_e_IREE_STATUS_INVALID_ARGUMENT,
+                    );
+                }
+            };
             // With a residual epilogue the bindings are input, weights, bias,
             // residual, output; otherwise input, weights, bias, output.
             let output_index = if executable.epilogue_add { 4 } else { 3 };
@@ -2378,6 +2414,7 @@ unsafe extern "C" fn dispatch_impl(
                 );
             };
             let pixel_count = input_geometry.pixel_count;
+            let input_geometry_surface_bytes = input_geometry.surface_pixel_count * 16;
             let input_bytes_per_pixel = input_geometry.bytes_per_pixel;
             let packed_input_bytes_per_pixel = input_geometry.packed_bytes_per_pixel;
             if !matches!(
@@ -2505,8 +2542,12 @@ unsafe extern "C" fn dispatch_impl(
                 // what `WeightPlan::pack` would have produced, so it is bound
                 // as the coefficient stream and no packer runs. Its length
                 // is checked rather than trusted. COMPILER_ROADMAP.md 6.3.
+                let packed_bytes = match &grouped {
+                    Some(grouped) => grouped.packed_bytes(),
+                    None => weight_plan.packed_bytes(),
+                };
                 if !matches!(
-                    weight_plan.packed_bytes(),
+                    packed_bytes,
                     Ok(bytes) if bytes as u64 <= refs[1].length as u64
                 ) {
                     return status::from_code(
@@ -2808,13 +2849,18 @@ unsafe extern "C" fn dispatch_impl(
                     block_bytes: input_bytes_per_pixel,
                 },
             });
+            let input_surface_bytes = input_geometry_surface_bytes;
+            let output_surface_bytes =
+                (shape.output_width(kernels) * shape.output_height(kernels)) as usize * 16;
             let planned = match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                let plan = ConvPlan::new(programmed_shape, kernels);
+                let plan =
+                    ConvPlan::new(slice_programmed_shape.unwrap_or(programmed_shape), kernels);
                 let tiles = plan.tiles().len();
                 // A residual epilogue's EW task must run after every tile
                 // and reads the whole cube, so its dispatch stays on one
-                // in-order queue: no fan-out.
-                let contexts = if executable.epilogue_add {
+                // in-order queue: no fan-out. A grouped one's slices all
+                // write the one output cube; fan-out is not built for them.
+                let contexts = if executable.epilogue_add || grouped.is_some() {
                     &[][..]
                 } else {
                     cb.fanout_contexts(tiles)
@@ -2868,6 +2914,31 @@ unsafe extern "C" fn dispatch_impl(
                         programs,
                         Some(Arc::<[AccumulatorOutputTile]>::from(staged.tiles)),
                     )
+                } else if let Some(grouped) = grouped {
+                    // Slice `s`: the same tile programs, at that slice's
+                    // input and output surfaces, packed-weight chunk and
+                    // bias channels.
+                    let slice_weights = grouped
+                        .slice_packed_bytes()
+                        .expect("validated with the packed length above");
+                    let mut programs = Vec::with_capacity(tiles * grouped.slices() as usize);
+                    for slice in 0..grouped.slices() {
+                        let buffers = Buffers {
+                            input: bufs.input
+                                + (grouped.input_surface(slice) as usize * input_surface_bytes)
+                                    as u32,
+                            weights: bufs.weights + (slice as usize * slice_weights) as u32,
+                            bias: bufs.bias + grouped.output_channel(slice) * 4,
+                            output: bufs.output
+                                + (grouped.output_surface(slice) as usize * output_surface_bytes)
+                                    as u32,
+                        };
+                        for mut program in plan.programs() {
+                            relocate(&mut program, buffers);
+                            programs.push(program);
+                        }
+                    }
+                    (programs, None)
                 } else {
                     let programs: Vec<Vec<RegCmd>> = plan
                         .programs()

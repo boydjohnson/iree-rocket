@@ -213,6 +213,10 @@ pub struct Conv2dExecutable {
     /// time by the same `rocket_core::weights::WeightPlan` the runtime packs
     /// with; bind it directly, run no packer. COMPILER_ROADMAP.md 6.3.
     pub weights_packed: bool,
+    /// `Conv2DDef.groups`: a grouped convolution run as per-channel-slice
+    /// tasks (`rocket_core::grouped::GroupedConv`), its weights binding the
+    /// grouped packed stream. 1 is dense.
+    pub groups: u32,
 }
 
 impl Conv2dExecutable {
@@ -227,6 +231,7 @@ impl Conv2dExecutable {
             runtime_dense_readers: false,
             runtime_layout: false,
             weights_packed: false,
+            groups: 1,
         }
     }
 
@@ -1367,6 +1372,7 @@ mod tests {
             runtime_dense_readers: false,
             runtime_layout: false,
             weights_packed: false,
+            groups: 1,
         }
     }
 
@@ -1434,6 +1440,7 @@ mod tests {
             runtime_dense_readers: false,
             runtime_layout: false,
             weights_packed: false,
+            groups: 1,
         };
         assert!(executable.resolve_shape(&constants(&[99, 99])).is_err());
     }

@@ -1911,6 +1911,53 @@ What was settled and how, newest first, in place of the narratives — those are
 in this file's git history (`git log -p ISSUES.md`). Everything cited below is
 something that still exists: a commit, a file, or a memory.
 
+**Grouped convolutions run as per-channel-slice tasks — 2026-11-24.
+ResNeXt50 fp16 102 -> 57 ms, bit-identical.** The block-diagonal rewrite
+(entry below) made ResNeXt's grouped convolutions offloadable at G x the
+multiply-adds and filter bytes: ~51 ms of NPU per inference, half of it
+stage 4, and a 138 MB `.vmfb`. A grouped convolution is independent dense
+convolutions over channel slices, and in NC1HWC2 a slice of whole atoms is a
+contiguous run of surfaces whose stride depends only on the pixel count --
+so slice `s` is the ordinary dense plan for its `Cs -> Fs` channels with its
+input and output bases moved `s * Cs` / `s * Fs` channels' worth of surfaces
+into the full cubes, and every slice's tasks go in one job.
+
+`grouped_conv_probe_hw.rs` measured it first: bit-identical to the
+block-diagonal convolution at every ResNeXt stage and slicing, and 0.29-0.49
+ms against 1.35-14.95 ms per conv (stage 4's 14x14 stride-2 site 34x). 32-64
+channel slices were fastest everywhere; 16-channel ones paid ~2x per slice.
+
+- **rocket-core `grouped`**: `GroupedConv` -- validation (fp16, dense, whole
+  input atoms and an unpadded output granule per slice), the slice policy
+  (32-channel slices, 64 at >= 512 channels), surface/bias/weight offsets,
+  the slice-by-slice packer -- and `detect_block_diagonal_groups`. The
+  compile-time packer and the driver both read it, so the stream and the
+  programs cannot disagree.
+- **plan-FFI ABI 6**: `rocket_detect_block_diagonal_groups`,
+  `rocket_pack_grouped_conv_weights`.
+- **Schema**: `Conv2DDef.groups` (default 1, compatible append; > 1 requires
+  `weights_packed`), serialized by `RocketTarget.cpp`.
+- **`rocket-pack-weights`**: a block-diagonal fp16 constant filter is packed
+  per slice and the dispatch moves to an `_packed_g<G>` clone carrying
+  `groups`; a grouping the lowering refuses falls back to the dense packing.
+  Detection is always safe: a filter zero off its blocks computes the same
+  thing grouped.
+- **Driver**: `groups` > 1 plans the slice shape once and relocates its tile
+  programs per slice (input/output surfaces, weight chunk, bias channels);
+  no fan-out for grouped dispatches. Refuses a grouped executable it cannot
+  slice rather than running it dense.
+
+ResNeXt50 fp16: 16 grouped dispatches, packed weights 138 -> 55 MB (`.vmfb`
+55 MB), output **bit-identical** to the block-diagonal build;
+102/102/103 -> 59.6/56.8/56.8 ms ABAB on cpu 4-7, 0 timeouts; f32-oracle
+max|err| 0.031 unchanged. Across both changes ResNeXt50 is 189 -> 57 ms.
+Gates: board `grouped_conv_matches_block_diagonal` (rocket-core's own
+slicing and packing at every stage, stride 1 and 2, plus 8 groups of 8:
+bit-identical), lit `rocket_pack_weights.mlir` (+grouped case; 50/50),
+compiled e2e `fp16_grouped_conv` now required to dispatch through
+`_packed_g8` (53/53), unit tests in rocket-core, plan-FFI and the driver
+(+decode of `groups`).
+
 **Grouped convolutions run as block-diagonal dense ones — 2026-11-24.
 ResNeXt50 fp16 189 -> 103 ms.** ResNeXt's sixteen 3x3 convolutions have 32
 groups (4-32 channels each) and import as `linalg.conv_2d_ngchw_gfchw`, which

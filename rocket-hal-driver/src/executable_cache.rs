@@ -283,6 +283,7 @@ fn decode_flatbuffer_shape(data: &[u8]) -> Result<UkernelShape, ()> {
 
                 runtime_layout: conv_def.runtime_layout(),
                 weights_packed: conv_def.weights_packed(),
+                groups: conv_def.groups(),
             };
             executable.validate_template().map_err(|_| ())?;
             Ok(UkernelShape::Conv2d(executable))
@@ -964,6 +965,61 @@ mod tests {
         data[8..16].copy_from_slice(&(flatbuffer.len() as u64).to_le_bytes());
         data.extend_from_slice(flatbuffer);
         data
+    }
+
+    /// `Conv2DDef.groups` reaches the executable; an executable without the
+    /// field (every one built before it) decodes as dense.
+    #[test]
+    fn decodes_the_group_count() {
+        for (groups, expected) in [(None, 1), (Some(32), 32)] {
+            let mut builder = flatbuffers::FlatBufferBuilder::new();
+            let name = builder.create_string("rocket_grouped_conv");
+            let mut args = schema::Conv2DDefArgs {
+                input_width: 14,
+                input_height: 14,
+                input_channels: 512,
+                output_width: 14,
+                output_height: 14,
+                output_channels: 512,
+                weights_width: 3,
+                weights_height: 3,
+                stride: 1,
+                precision: schema::Precision::FP16,
+                pad_top: 1,
+                pad_left: 1,
+                weights_packed: true,
+                ..Default::default()
+            };
+            if let Some(groups) = groups {
+                args.groups = groups;
+            }
+            let conv = schema::Conv2DDef::create(&mut builder, &args);
+            let export = schema::ExportDef::create(
+                &mut builder,
+                &schema::ExportDefArgs {
+                    name: Some(name),
+                    kernel_type: schema::KernelDef::Conv2DDef,
+                    kernel: Some(conv.as_union_value()),
+                },
+            );
+            let exports = builder.create_vector(&[export]);
+            let executable = schema::ExecutableDef::create(
+                &mut builder,
+                &schema::ExecutableDefArgs {
+                    exports: Some(exports),
+                },
+            );
+            schema::finish_executable_def_buffer(&mut builder, executable);
+            let flatbuffer = builder.finished_data();
+            let mut data = vec![0u8; IREE_FLATBUFFER_HEADER_SIZE];
+            data[0..4].copy_from_slice(b"RKT1");
+            data[8..16].copy_from_slice(&(flatbuffer.len() as u64).to_le_bytes());
+            data.extend_from_slice(flatbuffer);
+            let UkernelShape::Conv2d(executable) = decode_flatbuffer_shape(&data).unwrap() else {
+                panic!("expected Conv2d");
+            };
+            assert_eq!(executable.groups, expected);
+        }
     }
 
     /// A requantized int8 conv whose scale and zero points arrive as push
