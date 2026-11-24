@@ -1911,6 +1911,48 @@ What was settled and how, newest first, in place of the narratives — those are
 in this file's git history (`git log -p ISSUES.md`). Everything cited below is
 something that still exists: a commit, a file, or a memory.
 
+**Grouped convolutions run as block-diagonal dense ones — 2026-11-24.
+ResNeXt50 fp16 189 -> 103 ms.** ResNeXt's sixteen 3x3 convolutions have 32
+groups (4-32 channels each) and import as `linalg.conv_2d_ngchw_gfchw`, which
+nothing converted or claimed: they ran on the CPU in f32 (~125 ms of
+`outside` per inference against ResNet50's ~6.5) and broke every chain
+around them (3 NPU->NPU edges against ResNet50's 35).
+
+`rocket-block-diagonal-grouped-conv` rewrites one into the dense
+`conv_2d_nchw_fchw` it equals, with the filter zero off the diagonal blocks,
+before the channels-last conversion -- so the importer's expand/collapse
+cancel and the pad, bias and ReLU reach the dense op as a dense model's do,
+and every later pass applies unchanged. It costs G x the MACs and filter
+bytes. Three guards, each learned the hard way:
+
+- **The filter is folded to a constant in the pass** (through the reshapes
+  and the `extf` an fp16 import puts in front of it). Left as a constant
+  expression, IREE's const-expr hoisting will not lift a value that grows
+  32-fold, and the expansion ran on the CPU every inference (the `.vmfb`
+  stayed 50 MB with `elementwise_broadcast_9x32x...` dispatches). Raising
+  `--iree-opt-const-expr-max-size-increase-threshold` also works but is
+  global and would hoist every bias broadcast. A non-constant filter is
+  declined.
+- **Only inside the fp16 dense envelope** (1x1/3x3, stride <= 2, `Cin` 1152
+  at 3x3): an unclaimed block-diagonal conv would run on the CPU at G x.
+- **Offload builds only**: the pass takes `offload`, true in the spec;
+  `rocket-compiler --no-offload` flips it (`spec::neutralize`), so the CPU
+  baseline keeps the true grouped convolution.
+
+ResNeXt50 fp16: all 16 convs accepted on the NPU, 35 packed NPU edges, CPU
+dispatch sites 34 -> 21, `.vmfb` 50 -> 138 MB (the dense filters, packed at
+compile time); 189/190/188 -> 103/103/103 ms ABAB on cpu 4-7, 0 timeouts;
+max|err| vs the f32 oracle 0.031 (unchanged), argmax equal. Per inference
+the block-diagonal convs cost ~51 ms of NPU, **half of it stage 4** (1024
+channels: 14.8 ms for the stride-2 site, ~5 ms each at 7x7) -- the inflation
+and ~19 MB filters bite there. A true grouped conv in the HAL (one job, a
+task per channel slice; groups of >= 16 channels need no inflation at all)
+is the follow-up for stages 3-4. Gates: lit
+`rocket_block_diagonal_grouped_conv.mlir` (exact block values, the extf
+fold, `offload=false`, three declines; 50/50), compiled e2e
+`fp16_grouped_conv` (8 groups of 8, max|err| 0.0011; 53/53), `rocket-compiler`
+spec tests (the shipped no-offload spec turns the pass off).
+
 **fp16 stem on the NPU by space-to-depth, chained into its pool —
 2026-11-24. ResNet50-224 fp16 55.3 -> 52.3 ms.** The direct fp16 7x7
 stride-2 stem loses on the NPU (entry below: ~3.4 ms at `Cin` 3 on the CNA's
