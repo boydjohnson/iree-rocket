@@ -497,7 +497,8 @@ What landed, against §5:
   instant: a dense submit on any context waits until 1 ms after the most
   recent depthwise completion on any context, computed under the lock and
   slept outside it. At N=1 this is the old dwell minus whatever compaction
-  already spent of it.
+  already spent of it. (The dwell itself is opt-in since 2026-11-24,
+  `ROCKET_QUIESCE_DEPTHWISE=1`.)
 - **`dpu_mode_multicore_hw`** (new hw test) settles §5.6's assumption:
   depthwise on one file and dense on two others, 60 jobs each, four in
   flight per queue so the entities stay on their cores, no dwell anywhere

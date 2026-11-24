@@ -117,154 +117,47 @@ fn quiesce_all_enabled() -> bool {
     *ENABLED.get_or_init(|| std::env::var("ROCKET_QUIESCE_ALL").is_ok_and(|value| value != "0"))
 }
 
-/// Whether to skip [`DEPTHWISE_TO_DENSE_QUIESCENCE`] entirely
-/// (`ROCKET_QUIESCE_OFF=1`).
+/// Whether to dwell [`DEPTHWISE_TO_DENSE_QUIESCENCE`] between a depthwise
+/// completion and the next dense submit (`ROCKET_QUIESCE_DEPTHWISE=1`).
+/// **Off by default since 2026-11-24**; the knob stays to put the old
+/// behaviour back for a bisect.
 ///
-/// The dwell predates ISSUES.md C8's fix, and its symptom -- a dense job after
-/// a depthwise one intermittently writing only its first 16 channels -- is the
-/// same family as the poisoning that turned out to be BRDMA left fetching on a
-/// path with no consumer. This is the knob that says whether the dwell is
-/// still buying anything. It costs 1.06 ms per transition, 207 ms of a 7.9 s
-/// MobileNetV2 int8 benchmark.
+/// The dwell guarded "a dense job after a depthwise one intermittently writes
+/// only its first 16 channels". No failure rate was ever recorded, and the
+/// report predates ISSUES.md C8's fix, whose root cause (BRDMA fetching on a
+/// path with no consumer) produced the same family of symptom.
 ///
-/// The original failure was **intermittent**, so a handful of clean runs here
-/// proves nothing; removing the dwell needs repetition on the shapes that
-/// caught it.
-///
-/// **The 2026-09-05 campaign had a hole: it never ran an fp16 dense job after
-/// a depthwise one.** `mixed_depthwise_then_int8` puts an *int8* dense after
-/// the depthwise, `mixed_fp16_then_depthwise` runs the pair the other way
-/// round, and the MobileNetV2 arm was int8. Fp16-dense-after-depthwise is the
-/// transition this dwell is actually named for and the one a fp16 MobileNetV2
-/// build makes seventeen times per inference. `mixed_depthwise_then_fp16`
-/// (tools/e2e_conv_regression.py) now covers it and gates.
-///
-/// **Measured 2026-09-05, and the dwell stays.** With `ROCKET_QUIESCE_OFF=1`,
-/// on `planck`, output compared bitwise against a golden every run:
+/// **What removed it** was `depthwise_to_dense_transition_campaign` in
+/// iree-rocket-hal/tests/dpu_mode_multicore_hw.rs, on `orangepi` (Armbian
+/// 7.3.5 rocket + the PPU, 600 MHz and reset patches): 10000 rounds of each
+/// of three depthwise -> dense pairs (MobileNetV2's original 3x3 s2 pair,
+/// and ConvNeXt-T's 7x7 depthwise -> pwconv1 at stages 1 and 3), each run two
+/// ways -- two jobs with the dense SUBMIT issued the instant the depthwise
+/// PREP_BO returns, and one job whose dense tasks the kernel's IRQ thread
+/// starts microseconds after the depthwise task retires, tighter than any
+/// path through this driver. Every depthwise and dense output was checked
+/// exactly; the depthwise one from a copy taken right at its fence, so an
+/// early fence would show as an unwritten tail.
 ///
 /// ```text
-///   240 runs  e2e mixed_depthwise_then_int8 (fp16 depthwise -> int8 dense,
-///             128 output channels, so a 16-channel truncation is unmissable)
-///    40 runs  MobileNetV2 int8 end to end, ~14 transitions per inference
-///   ---
-///     0 wrong, 0 failed, with the dwell on or off
+///   60000 transitions, 0 wrong outputs, 0 NPU timeouts
+///     500 ConvNeXt-T fp16 inferences without the dwell (18 transitions
+///         each, 9000 in all), every output bit-identical to a dwell-on one
 /// ```
 ///
-/// That is not enough to remove it. No failure *rate* was ever recorded for
-/// the original -- only the word "intermittently" -- so 0 of 240 bounds it at
-/// roughly 1.5% and no lower, while the dwell costs 207 ms of a 7902 ms
-/// MobileNetV2 int8 benchmark (2.6%, `ROCKET_PROFILE=1`). Trading a 2.6%
-/// speedup for a re-run of silent wrong data at an unbounded rate is a bad
-/// deal, and the offload's problem is 3.7x, not 3%.
+/// With the earlier campaigns (~2020 transitions, 2026-09-05 and -10) that is
+/// ~71000 without a failure: the rule of three bounds the rate at ~0.004%
+/// per transition, against the ~0.15% the dwell was kept for. Whether a
+/// conv can retire on a PPU bit (docs/open-questions.md 1.1.2) is still not
+/// known; the campaign says only that no transition this driver makes shows
+/// the hazard.
 ///
-/// **Extended 2026-09-10, on the transition that hole left out**, every run
-/// compared bitwise against a golden taken with the dwell on:
-///
-/// ```text
-///   200 runs  e2e mixed_depthwise_then_fp16 (fp16 depthwise -> fp16 dense,
-///             128 output channels)                        1 transition each
-///    60 runs  MobileNetV2 fp16, ROCKET_DEMOTE_DEPTHWISE=1
-///                                                       17 transitions each
-///   ---
-///     0 wrong, 0 failed
-/// ```
-///
-/// The knob was confirmed live rather than assumed, the way `ROCKET_QUIESCE_ALL`
-/// was: under `ROCKET_PROFILE=1` the `quiesce` phase vanishes from the table
-/// and wall falls 291 -> 237 ms over three iterations. Pooling all four
-/// campaigns gives roughly 2020 transitions with 0 failures, which by the rule
-/// of three bounds the rate at about 0.15% rather than 1.5% -- ten times
-/// tighter, still not zero, and pooling assumes the hazard is not specific to
-/// one transition kind, which is exactly what is not known.
-///
-/// **The register-level explanations are closed, and that matters for which
-/// hypothesis is left.** All four registers carrying depthwise mode -- CNA
-/// `conv_con1.conv_mode`, CORE `dw_en`, DPU `feature_mode_cfg.conv_mode` and
-/// DPU_RDMA `feature_mode_cfg.conv_mode` -- are written unconditionally from
-/// the shape on every dispatch, so no mode bit survives a job; and
-/// `brdma_data_use` is 1 for fp16 dense and fp16 depthwise alike, so C8's
-/// mechanism does not differ across this pair. What is left is the mechanism
-/// the comment on the constant already states: the output fence signals
-/// before the DPU has drained its depthwise write-back. That is a
-/// completion-detection problem, and the fix is to find the signal that
-/// actually reports drain rather than to tune or delete a sleep.
-///
-/// Note also that this dwell predates C8's fix, and C8's root cause produced
-/// exactly this family of symptom. It may already be vestigial. Nothing above
-/// proves that.
-///
-/// **The DRM interface offers userspace no alternative, so this sleep is the
-/// only tool on this side of the boundary.** `rocket_accel.h` has four
-/// ioctls -- CREATE_BO, SUBMIT, PREP_BO, FINI_BO. `SUBMIT` is fire-and-forget:
-/// no fence fd, no syncobj, no output field at all. There is no status ioctl
-/// and no register read. `PREP_BO` ("waiting for any NPU jobs that might still
-/// use the NPU") is the whole completion vocabulary, and it waits on the job's
-/// dma-fence -- the very fence whose early signalling this dwell exists to
-/// cover. Replacing the dwell with a real drain check is therefore a *kernel*
-/// change, not a driver-side one; nothing here can poll for it.
-///
-/// **What the kernel does, and where the suspicion should point.**
-/// `rocket_job.c`'s top half wakes the IRQ thread on *any* of `DPU_0`,
-/// `DPU_1`, `PPU_0`, `PPU_1` in `INTERRUPT_RAW_STATUS`, and the thread then
-/// writes `OPERATION_ENABLE = 0`, clears all seventeen interrupt bits
-/// (`INTERRUPT_CLEAR = 0x1ffff`), and signals `done_fence` without recording
-/// which bit actually fired. A convolution's `PC_OPERATION_ENABLE` is
-/// CNA|CORE|DPU|DPU_RDMA (`0x1d`) and enables no PPU stage, so a conv should
-/// only ever retire on a DPU bit -- but both PPU bits are armed for every job
-/// regardless.
-///
-/// **The sibling chip has this exact bug, named and patched.** The
-/// independent RE in `../rockchip-npu-notes` records for the RK3576: "The
-/// fence is signalled before the writes are visible", closed by their patch
-/// `0012`; the `DPU_0`/`DPU_1` bits "retire when the writes have landed" and
-/// set tens to hundreds of microseconds after `PC_DONE`; and the symptom of
-/// retiring early is "a partial surface, and the missing bytes are a
-/// contiguous tail" -- which is what "only the first 16 channels" is.
-/// Requiring the DPU bit was their fix, and mainline `rocket` on RK3588
-/// already requires it, which is a real reason to think this dwell is
-/// vestigial rather than load-bearing.
-///
-/// **The one open thread worth pulling.** Those same notes state that two
-/// task classes raise no DPU completion at all -- pooling, and *any output
-/// element wider than one byte*. If that holds on the RK3588 as well as the
-/// RK3576, then every fp16 convolution here is retiring on something other
-/// than a writes-have-landed DPU signal, which would be the mechanism. The
-/// experiment is to log `INTERRUPT_RAW_STATUS` at retire for an fp16
-/// depthwise job and see which bit is actually set; that needs a module
-/// rebuild, which is why it is written down rather than done here.
-///
-/// **The cost now matters, on a different model.** Re-measured 2026-09-10 on
-/// the fp16 MobileNetV2 arm built with `ROCKET_DEMOTE_DEPTHWISE=1`, which
-/// alternates depthwise and dense 17 times per inference and so pays 17
-/// transitions rather than the int8 arm's ~14 against a much shorter wall:
-///
-/// ```text
-///                        four workers   default topo
-///   base (37 sites)          55.4 ms        50.5 ms
-///   dw   (54 sites)          73.8 ms        68.8 ms
-///   dw, ROCKET_QUIESCE_OFF   56.1 ms        51.8 ms
-/// ```
-///
-/// `ROCKET_PROFILE=1` attributes 346 ms of a 1513 ms twenty-iteration run to
-/// `quiesce` -- 17.3 ms per inference, against a measured base-to-dw gap of
-/// 18.3 ms. So this dwell is essentially the *whole* cost of offloading
-/// depthwise on fp16: 23% of that arm's wall, not the int8 arm's 2.6%, and
-/// without it the depthwise arm lands within 1-2.5% of the arm that leaves
-/// all seventeen on the CPU.
-///
-/// That still is not a reason to delete it -- the bound above is unchanged,
-/// 0 of 240 runs puts the original failure rate at roughly 1.5% and no lower,
-/// and silent 16-channel truncation is the worst kind of wrong. It is a
-/// reason to *fix* it: find the register or fence that actually orders the
-/// depthwise write-back (the C8 fix found exactly such a register for the
-/// same family of symptom) and drop the sleep, rather than trading
-/// correctness for the 23%.
-///
-/// Revisit if the cost ever matters, or if someone reproduces the original
-/// failure and can quote a rate to test against.
-fn quiesce_off() -> bool {
-    static OFF: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *OFF.get_or_init(|| std::env::var("ROCKET_QUIESCE_OFF").is_ok_and(|value| value != "0"))
+/// It cost ConvNeXt-T fp16 ~9 ms of 103 and the fp16 MobileNetV2 depthwise
+/// arm 17 ms per inference (`quiesce` in `ROCKET_PROFILE`).
+fn depthwise_quiesce_enabled() -> bool {
+    static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ENABLED
+        .get_or_init(|| std::env::var("ROCKET_QUIESCE_DEPTHWISE").is_ok_and(|value| value != "0"))
 }
 
 /// Whether to leak every per-tile regcmd BO rather than closing it
@@ -477,11 +370,10 @@ pub struct RocketDevice {
     pool: crate::pool::WorkerPool,
 }
 
-// `PREP_BO` observes the output fence, but the RK3588 DPU can still retain
-// depthwise write-back state briefly after that fence has signaled. An
-// immediately following dense job then intermittently writes only its first
-// 16 channels. A 1 ms dwell is hardware-validated; it is deliberately
-// restricted to this mode transition rather than added to all dispatches.
+// The dwell once kept between a depthwise completion and the next dense
+// submit, against a report that the dense job then intermittently wrote only
+// its first 16 channels. Opt-in now (`ROCKET_QUIESCE_DEPTHWISE=1`): see
+// `depthwise_quiesce_enabled` for the campaign that retired it.
 const DEPTHWISE_TO_DENSE_QUIESCENCE: Duration = Duration::from_millis(1);
 
 #[derive(Default)]
@@ -1895,10 +1787,10 @@ unsafe extern "C" fn queue_execute(
                         // The dwell is computed under the lock and slept outside
                         // it, so a context dwelling never holds up another's
                         // submit. Any context's depthwise completion counts.
-                        let dwell = if quiesce_off() {
-                            None
-                        } else if quiesce_all_enabled() {
+                        let dwell = if quiesce_all_enabled() {
                             Some(DEPTHWISE_TO_DENSE_QUIESCENCE)
+                        } else if !depthwise_quiesce_enabled() {
+                            None
                         } else {
                             let hazard = d
                                 .dpu_hazard
