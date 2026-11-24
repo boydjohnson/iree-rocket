@@ -1911,6 +1911,34 @@ What was settled and how, newest first, in place of the narratives — those are
 in this file's git history (`git log -p ISSUES.md`). Everything cited below is
 something that still exists: a commit, a file, or a memory.
 
+**Patchify convolutions run as matmuls — 2026-11-24. vit_b_16 254 -> 202
+ms, ConvNeXt-T 170 -> 112 ms, BLIP 951 -> 825 ms.** A convolution whose
+stride equals its kernel tiles the image without overlap: ViT/BLIP's 16x16
+s16 patch embedding, ConvNeXt's 4x4 s4 stem and its three 2x2 s2
+downsamples. The planner refused every one as a convolution (kernel above
+11; even kernels have capture backing only at stride 1), and the
+2026-11-24 survey found them on the CPU in all three models. None needs a
+convolution engine: `out[oh, ow, f]` reads its own `kh x kw x C` patch, so
+it is a `[N*OH*OW, kh*kw*C] x [kh*kw*C, F]` matmul after a space-to-depth
+transpose of the input (HWCF filters need no movement).
+
+`rocket-patchify-conv-to-matmul` (`RocketPatchifyConvPass.cpp`) does that
+rewrite on `linalg.conv_2d_nhwc_hwcf` with stride == kernel > 1x1, unit
+dilation and static shapes, cropping the rows/columns a floor-mode
+convolution never reads; it runs before record/demote/plan, so the matmul
+is planned and claimed like any other (and gets the row-major input and
+output). Placement: vit_b_16 49 -> 50 NPU sites, ConvNeXt 38 -> 42, BLIP
+169 -> 170; no patchify refusal is left. ABAB on cpu 4-7, 0 timeouts:
+254/253 -> 203/201 ms, 169/172 -> 113/112 ms, 952/950 -> 826/823 ms. All
+three match the f32 oracle on argmax and top-5 (max|err| 0.0037, 0.0053,
+0.029). **The win is ~10x what an isolated CPU benchmark of BLIP's patch
+conv predicted (14 ms vs 126 ms)** -- in the model the conv is f32 x f16 and
+fused with the channels-last transpose; measure in-model, not the op alone.
+Gates: lit `rocket_patchify_conv.mlir` (rewrite, remainder crop, and the
+overlapping/dilated/1x1 declines), compiled e2e `fp16_patchify_conv` (patch
+embedding and odd-extent downsample, max|err| 0.0014), e2e 51/51, lit
+47/47.
+
 **Row-major matmul input: the CNA reads `[M, K]` in place — 2026-11-24.
 BLIP fp16 ~970 -> ~947 ms, bit-identical.** The mirror of the row-major
 output below. With the width-1 lowering a CNA line is one input row, so a
