@@ -354,7 +354,9 @@ thing to build, and it is what P2 always was.
 What stays on the CPU: the 7x7 stem, the padded max pool, the head's
 pooling transpose and the classifier epilogue. MobileNetV2's residual adds
 have no ReLU after them (linear bottlenecks) and are not claimed; a
-`NONE`-activation twin of the target is one matcher away.
+`NONE`-activation twin of the target is one matcher away. **(Done
+2026-11-24 -- and it was a pattern and a driver fix away too; see Resolved,
+"MobileNetV2's residual adds run on the NPU".)**
 
 **Step 2 landed 2026-09-08 -- the input half.** A dispatch whose input was
 written by an earlier dispatch on the same command buffer now reads that
@@ -1921,6 +1923,60 @@ What was settled and how, newest first, in place of the narratives — those are
 in this file's git history (`git log -p ISSUES.md`). Everything cited below is
 something that still exists: a commit, a file, or a memory.
 
+**MobileNetV2's residual adds run on the NPU — 2026-11-24. fp16 12.0 ->
+10.0 ms, 3.1x faster than `--no-offload`.** The ten linear-bottleneck adds
+(`conv + skip`, nothing after) were CPU dispatches between NPU ones. The
+residual epilogue (conv tiles + one EW task, P2 step 3) had only ever been
+built as `relu(conv + skip)`, and only for the f16-import spelling.
+
+- `rocket-fuse-conv-relu6`'s `FuseConvResidualLinear` builds the linear
+  epilogue for a 1x1 s1 conv with `Cout % 16 == 0`, in both spellings: an
+  f16 import (truncf, f16 skip) and an f32 import the demote narrowed (no
+  truncf, f32 skip -- added as is, so a declined match stays exact), through
+  an NCHW transpose or the rank-5 expand. A sum something ReLUs is left
+  alone.
+- Spec: `#rocket_dynamic_residual_target` (`epilogue_activation = "none"`;
+  the driver, serializer and layout pass already carried it), executable,
+  an f16-skip shim and a `_wide` one that narrows an f32 skip, four matchers
+  ({plain, demoted} x {f16, f32 skip}).
+
+9 of 10 adds fold (the 56x56 Cout-24 one fails the EW cube's 16-channel
+rule). CPU dispatch sites 18 -> 5, NPU->NPU edges packed 36 -> 58.
+
+**It was slower until a driver fix: 12.0 -> 14.4 ms.** With the CPU islands
+gone the model became one long command buffer, and `note_dense_read`
+marked *every* recorded op whose write overlapped a dense read -- every
+dispatch that had ever written bytes IREE's transient allocator later
+reused. `ROCKET_LAYOUT=debug`: 25 compactions per inference kept with every
+declared reader chained ("dense read seen"), `compact` 1.1 -> 4.5 ms, and
+the host work serialized on one CPU. `observed_writes` marks only the most
+recent writer of each byte read (walking back, subtracting each writer's
+extent; unit-tested), which is the bytes the read can actually see. Kept
+compactions 30 -> 5 per inference, the 5 being the dispatches with a CPU
+reader. Outputs bit-identical across the two runtimes on both builds.
+
+cpu 4-7, 600 MHz, medians of five, three interleaved passes, 0 NPU
+timeouts (old = main's runtime, new = with the fix):
+
+    nooff 31.1 / 30.8 / 30.8
+    main (stem)   old 11.9 / 12.1 / 12.0   new 11.7 / 11.6 / 11.6
+    residual      old 14.4 / 14.4 / 14.4   new 9.98 / 10.2 / 9.96 ms
+
+So the driver fix alone is worth 0.4 ms on main and the pair 2.0 ms. Per
+inference on the residual build: `queue` 4, host 4.4 ms, `compact` 0.4,
+`wait.npu` 7.3 -- the NPU is now 63% of wall. Correctness: f32-oracle
+max|err| 0.0639 (= `--no-offload`), top-5 unchanged, max|diff| vs main
+0.0039 (the sum now formed in the EW core and stored f16).
+
+Gates: lit 55/55 (new `rocket_fuse_conv_residual_linear.mlir`: rank-5 f32,
+NCHW f32, Cout-24 and ReLU declines; `rocket_fp16_residual_match.mlir`: the
+spec claims it), `lazy_compaction_tests`, compiled e2e. Hardware: the EW
+task with its ReLU off is `conv_residual_add_hw` (exact since 2026-09-08).
+
+What is left on this model: the input transpose, the Cout-24 add (two CPU
+dispatches), the head's two small elementwise ops, and the conv -> avgpool
+edge (49 vs 52 surface stride).
+
 **The stem's pad and ReLU6 fold — 2026-11-24. MobileNetV2 fp16 13.4 ->
 12.2 ms, 2.55x faster than `--no-offload`.** After the depthwise fold, the
 stem was the last convolution with work around it on the CPU: its pad ran
@@ -1961,6 +2017,8 @@ What is left on this model: the residual adds (the linear bottleneck's
 1x1 expansion convolutions dense (`rocket-assign-layout`: "the producer is a
 CPU dispatch"); and the final conv -> avgpool edge (49 vs 52 surface
 stride).
+**The residual adds: done the same day, 12.0 -> 10.0 ms; see the entry
+above.**
 
 **Depthwise padding folds into the CNA — 2026-11-24. MobileNetV2 fp16
 30.8 -> 13.5 ms, 2.3x faster than `--no-offload`, bit-identical.** Each of
