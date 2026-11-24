@@ -94,7 +94,7 @@ use iree_rocket_hal::rocket::{
     },
     device::{OwnedBuffer as RocketGemBuffer, fini_bo},
     elementwise::{
-        EwAddBuffers, EwAddShape, EwBinaryOp, EwPrecision, EwUnaryBuffers, build_add_regcmd,
+        EwAddBuffers, EwAddShape, EwBinaryOp, EwPrecision, EwUnaryBuffers,
         build_add_regcmd_with_relu, build_unary_regcmd,
     },
     fc,
@@ -3022,10 +3022,7 @@ unsafe extern "C" fn dispatch_impl(
                     channels: shape.out_channels,
                     precision: EwPrecision::Fp16,
                     op: EwBinaryOp::Add,
-                    output_zero_point: 0,
-                    w_cvt_offset: 0,
-                    w_scale_ratio: 1.0,
-                    output_scale_ratio: 1.0,
+                    int8: None,
                 };
                 regcmd_tasks.push(build_add_regcmd_with_relu(
                     &add,
@@ -3947,8 +3944,14 @@ unsafe extern "C" fn dispatch_impl(
             // DPU_RDMA fetches the first through its main feed and ERDMA
             // fetches the second, and neither is a layout the compiler
             // produces. Both cubes have the identical geometry -- this op
-            // does not broadcast.
-            let Some(cube) = ElementwiseCube::new(shape.width, shape.height, shape.channels, 2)
+            // does not broadcast. int8 cubes are one byte per element, the
+            // same 16-byte atoms an int8 conv writes.
+            let element_bytes = match shape.precision {
+                EwPrecision::Fp16 => 2,
+                EwPrecision::Int8 => 1,
+            };
+            let Some(cube) =
+                ElementwiseCube::new(shape.width, shape.height, shape.channels, element_bytes)
             else {
                 return invalid_argument();
             };
@@ -3984,18 +3987,24 @@ unsafe extern "C" fn dispatch_impl(
                 return invalid_argument();
             };
             let output_cube = elementwise_output_cube(&refs[2], &output_scratch, &cube);
-            let regcmd_tasks = vec![build_add_regcmd(
+            let regcmd_tasks = vec![build_add_regcmd_with_relu(
                 &shape,
                 &EwAddBuffers {
                     intermediate_addr: input.addr,
                     w_addr: operand.addr,
                     output_addr: output_scratch.dma_address,
                 },
+                executable.relu,
             )];
             let profile_label = profile::label(|| {
                 format!(
-                    "ew {:?} {}x{}x{}",
-                    shape.op, shape.height, shape.width, shape.channels
+                    "ew {:?}{} {:?} {}x{}x{}",
+                    shape.op,
+                    if executable.relu { "+relu" } else { "" },
+                    shape.precision,
+                    shape.height,
+                    shape.width,
+                    shape.channels
                 )
             });
             // These kinds record no output cube and take none, so every

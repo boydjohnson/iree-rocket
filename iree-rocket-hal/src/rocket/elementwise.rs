@@ -133,43 +133,84 @@ pub struct EwAddShape {
     /// scale. Pick `op` accordingly; this type does not choose for the
     /// caller.
     pub op: EwBinaryOp,
-    /// int8 only, ignored for fp16: this task's own real, decoded output
-    /// zero point. Also used verbatim (negated) to re-center the primary
-    /// operand's own zero point in `BS_ALU_CFG` -- confirmed exact, 10/10
-    /// real int8 captures in the conv+add sweep, by cross-referencing each
-    /// capture's EW task `BS_ALU_CFG` against its own producing conv task's
-    /// `DPU_OUT_CVT_OFFSET` in the same file (always an exact negation).
-    /// When chaining after a real conv via [`build_conv_then_add_regcmd`],
-    /// this is the SAME value as `conv_shape`'s own
-    /// `Quantization.output_zero_point` -- both the intermediate's real
-    /// zero point (what `BS_ALU_CFG` undoes) and this task's own final
-    /// output zero point happen to be the same field on this type since
-    /// `OUT_CVT_OFFSET` reuses it too; a caller wanting genuinely different
-    /// intermediate/final zero points is not supported by this shape (no
-    /// real capture has shown they differ).
+    /// int8's quantization, `None` at fp16. Required at int8: the builder
+    /// panics without it, so a caller decoding untrusted input should check
+    /// [`EwInt8Quant::encoding`] first.
+    pub int8: Option<EwInt8Quant>,
+}
+
+/// The int8 two-tensor add, `out = clamp(round(relu?(sa*(a - za) +
+/// sb*(b - zb)) / so) + zo)`: each operand's own scale and zero point and
+/// the result's.
+///
+/// **Measured, not inferred** (`tests/ew_int8_add_hw.rs`, 2026-11-24). The
+/// task computes, in integers:
+///
+/// * BS: `A = (a - za) * GA` -- `BS_ALU_CFG` re-centres by `-za`,
+///   `BS_MUL_CFG.bs_mul_operand` is `GA` with shift 0;
+/// * EW_CVT: `B = (b - zb) * GB` -- offset `-zb`, then the encoded
+///   [`Multiplier`];
+/// * EW: `A + B`, then ReLU if asked (`ew_relu_bypass = 0`);
+/// * OUT_CVT: `* MO >> shift + zo`, clamped to int8.
+///
+/// So the sum is in a common unit with `2^14` of headroom: `GA` and `GB`
+/// are each operand's scale relative to the *larger* of the two, times
+/// 2^14, and `MO` divides the 2^14 back out. That is why the BS stage's
+/// capture-constant `0x4000` was an "identity": it is `GA` when the primary
+/// carries the larger scale. The inferred form (ratios relative to the
+/// primary, no 2^14) saturated nearly every element, and fixing only the
+/// 2^14 overflowed `GB` once `sb > 2 * sa`; the balanced form is exact,
+/// apart from rounding ties, at scale ratios 0.08..12, distinct zero
+/// points, with and without ReLU.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct EwInt8Quant {
+    pub a_zero_point: i32,
+    pub b_zero_point: i32,
     pub output_zero_point: i32,
-    /// int8 only, ignored for fp16: raw `EW_CVT_OFFSET_VALUE`, passed
-    /// through verbatim -- same ambiguity the superseded `AddTensor.
-    /// cvt_offset` already had (Mesa's own C used
-    /// `operation->addition_offset` as-is with no zero-point-derived
-    /// formula shown deriving it; this doesn't invent one either).
-    pub w_cvt_offset: u32,
-    /// int8 only, ignored for fp16: the second tensor's real scale divided
-    /// by the intermediate's real (producing conv's own output) scale.
-    /// Encoded into `EW_CVT_SCALE_VALUE`/`_SHIFT` via
-    /// [`Multiplier::from_ratio`] -- INFERRED, not independently
-    /// hardware-confirmed: the register pair is the same 16-bit-operand/
-    /// 6-bit-shift shape `Multiplier` already encodes for `DPU_OUT_CVT_
-    /// SCALE` elsewhere in this crate, but the real ratio rknn-toolkit2
-    /// picked for the sweep's own captures isn't recoverable from decoded
-    /// registers alone, so this specific mapping has not been checked
-    /// against a known value the way the rest of this shape's fields have.
-    pub w_scale_ratio: f64,
-    /// int8 only, ignored for fp16: the intermediate's real (producing
-    /// conv's own output) scale divided by this task's own final output
-    /// scale. Encoded into `OUT_CVT_SCALE`/`_SHIFT` the same way
-    /// `w_scale_ratio` is, with the same INFERRED caveat.
-    pub output_scale_ratio: f64,
+    pub a_scale: f64,
+    pub b_scale: f64,
+    pub output_scale: f64,
+}
+
+/// [`EwInt8Quant`] in register form.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct EwInt8Encoding {
+    /// `BS_MUL_CFG.bs_mul_operand` (shift 0): the primary's gain.
+    pub a_gain: u32,
+    /// `EW_CVT_SCALE_VALUE`/`_SHIFT`: the second operand's gain.
+    pub b_gain: Multiplier,
+    /// `OUT_CVT_SCALE`/`_SHIFT`.
+    pub output: Multiplier,
+}
+
+/// The common unit's headroom: each operand's gain is at most this.
+const EW_INT8_HEADROOM: f64 = 16384.0;
+
+impl EwInt8Quant {
+    pub fn encoding(&self) -> Result<EwInt8Encoding, &'static str> {
+        for scale in [self.a_scale, self.b_scale, self.output_scale] {
+            if !scale.is_finite() || scale <= 0.0 {
+                return Err("int8 EW add scales must be finite and positive");
+            }
+        }
+        for zero_point in [self.a_zero_point, self.b_zero_point, self.output_zero_point] {
+            if !(-128..=127).contains(&zero_point) {
+                return Err("int8 EW add zero points must be int8");
+            }
+        }
+        let unit = self.a_scale.max(self.b_scale);
+        let a_gain = (self.a_scale / unit * EW_INT8_HEADROOM).round() as u32;
+        if a_gain == 0 {
+            return Err("int8 EW add operand scales differ by more than 2^15");
+        }
+        let b_gain = Multiplier::try_from_ratio(self.b_scale / unit * EW_INT8_HEADROOM)?;
+        let output = Multiplier::try_from_ratio(unit / self.output_scale / EW_INT8_HEADROOM)?;
+        Ok(EwInt8Encoding {
+            a_gain,
+            b_gain,
+            output,
+        })
+    }
 }
 
 pub struct EwAddBuffers {
@@ -207,21 +248,16 @@ pub struct EwAddBuffers {
 /// and its precision-dependent `edata_size`/`ew_cvt_type`, `DPU_DATA_FORMAT`/
 /// `DPU_RDMA_RDMA_FEATURE_MODE_CFG`'s fp16-only precision fields, and `BS`/
 /// `BN` handling (`BN` always fully bypassed; `BS` fully bypassed for fp16,
-/// or for int8 a fixed-constant re-centering of the primary operand's own
-/// zero point -- see [`EwAddShape::output_zero_point`]'s doc comment for the
-/// exact confirmed formula). `EW_CVT_SCALE`/`OUT_CVT_SCALE`'s exact ratio
-/// semantics for int8 are the one INFERRED (not independently
-/// hardware-confirmed) piece -- see [`EwAddShape::w_scale_ratio`]/
-/// [`EwAddShape::output_scale_ratio`]'s own doc comments.
+/// or for int8 the primary operand's re-centring and gain -- see
+/// [`EwInt8Quant`] for the measured int8 arithmetic).
 ///
 /// Hardware-confirmed at fp16, both chained and standalone. Chained:
 /// `tests/conv_with_add_hw.rs` (Add and Sub on `planck`, over uniform
 /// operands). Standalone: `tests/ew_binary_hw.rs`, the stronger gate --
 /// non-uniform operands, every element checked, all five [`EwBinaryOp`]
 /// variants bit-exact, and `Mul` also across a four-shape geometry ladder
-/// up to 14x14x64. The int8 branch is still capture-only: its
-/// `w_scale_ratio`/`output_scale_ratio` semantics remain the inferred
-/// piece described above.
+/// up to 14x14x64. int8 Add: `tests/ew_int8_add_hw.rs`, exact apart from
+/// rounding ties over distinct random operands.
 ///
 /// [`build_lut_regcmd`]: crate::rocket::activation::build_lut_regcmd
 pub fn build_add_regcmd(shape: &EwAddShape, bufs: &EwAddBuffers) -> Vec<RegCmd> {
@@ -255,6 +291,23 @@ pub fn build_add_regcmd_with_relu(
         .next_multiple_of(FEATURE_ATOMIC_SIZE);
     let output_area = shape.width * shape.height;
     let is_fp16 = matches!(shape.precision, EwPrecision::Fp16);
+    // At fp16 neither is read; a placeholder keeps the int8 arms below
+    // straight-line.
+    let int8 = shape.int8.unwrap_or(EwInt8Quant {
+        a_zero_point: 0,
+        b_zero_point: 0,
+        output_zero_point: 0,
+        a_scale: 1.0,
+        b_scale: 1.0,
+        output_scale: 1.0,
+    });
+    assert!(
+        is_fp16 || shape.int8.is_some(),
+        "build_add_regcmd: an int8 add needs EwAddShape::int8"
+    );
+    let encoding = int8
+        .encoding()
+        .expect("build_add_regcmd: int8 EW add quantization does not encode");
 
     let mut cmds: Vec<RegCmd> = Vec::new();
 
@@ -339,16 +392,15 @@ pub fn build_add_regcmd_with_relu(
         );
         cmds.push(
             Register::<DpuBsAluCfg>::new()
-                .bs_alu_operand(Bits::new(shape.output_zero_point.wrapping_neg() as u32))
+                .bs_alu_operand(Bits::new(int8.a_zero_point.wrapping_neg() as u32))
                 .build(),
         );
-        // Fixed constant, confirmed byte-identical across all 10 real int8
-        // captures regardless of geometry/channels/kernel/stride -- an
-        // identity multiply, not a real per-model requantization (that work
-        // is EW_CVT's/OUT_CVT's, not BS's, in this task shape).
+        // The primary's gain into the common unit (see EwInt8Quant). The
+        // capture constant 0x4000 is this value when the primary carries
+        // the larger scale.
         cmds.push(
             Register::<DpuBsMulCfg>::new()
-                .bs_mul_operand(Bits::new(0x4000))
+                .bs_mul_operand(Bits::new(encoding.a_gain))
                 .build(),
         );
     }
@@ -420,14 +472,13 @@ pub fn build_add_regcmd_with_relu(
     } else {
         cmds.push(
             Register::<DpuEwCvtOffsetValue>::new()
-                .ew_op_cvt_offset(Bits::new(shape.w_cvt_offset))
+                .ew_op_cvt_offset(Bits::new(int8.b_zero_point.wrapping_neg() as u32))
                 .build(),
         );
-        let m = Multiplier::from_ratio(shape.w_scale_ratio);
         cmds.push(
             Register::<DpuEwCvtScaleValue>::new()
-                .ew_op_cvt_scale(Bits::new(m.scale))
-                .ew_op_cvt_shift(Bits::new(m.shift))
+                .ew_op_cvt_scale(Bits::new(encoding.b_gain.scale))
+                .ew_op_cvt_shift(Bits::new(encoding.b_gain.shift))
                 .build(),
         );
     }
@@ -448,18 +499,17 @@ pub fn build_add_regcmd_with_relu(
     } else {
         cmds.push(
             Register::<DpuOutCvtOffset>::new()
-                .out_cvt_offset(Bits::new(shape.output_zero_point as u32))
+                .out_cvt_offset(Bits::new(int8.output_zero_point as u32))
                 .build(),
         );
-        let m = Multiplier::from_ratio(shape.output_scale_ratio);
         cmds.push(
             Register::<DpuOutCvtScale>::new()
-                .out_cvt_scale(Bits::new(m.scale))
+                .out_cvt_scale(Bits::new(encoding.output.scale))
                 .build(),
         );
         cmds.push(
             Register::<DpuOutCvtShift>::new()
-                .out_cvt_shift(Bits::new(m.shift))
+                .out_cvt_shift(Bits::new(encoding.output.shift))
                 .build(),
         );
     }
@@ -657,9 +707,8 @@ pub enum EwUnaryAlgo {
 /// (vendor or otherwise) to confirm an int8 zero-point/scale recipe against
 /// for this task shape, and this crate's convention is to not ship an
 /// int8 branch with zero hardware evidence behind it (see
-/// [`EwAddShape::w_scale_ratio`]'s doc comment for the standard this
-/// project holds even *inferred* int8 formulas to -- this would be worse,
-/// wholly unconfirmed).
+/// [`EwInt8Quant`] for what it took to confirm the binary add's int8
+/// arithmetic -- the capture-inferred form saturated nearly every element).
 #[derive(Clone, Copy, Debug)]
 pub struct EwUnaryShape {
     pub width: u32,

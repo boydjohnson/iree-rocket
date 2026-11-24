@@ -193,6 +193,15 @@ During migration, use a distinct HAL executable format string so the driver
 can route old and new payloads explicitly. Remove the legacy decoder only
 after old VMFB artifacts are no longer supported.
 
+`ElementwiseBinaryDef.precision`, `relu` and `runtime_quantization` were
+added compatibly, defaulting to `FP16`, `false` and empty: an older `RKT1`
+executable is the fp16 op it always was. With `precision = INT8` (ADD only)
+the six `ElementwiseQuantParam` fields arrive as push constants after the
+runtime dimensions and before the trailing layout word. An older runtime
+does not know these fields and would run an int8 executable as fp16 with its
+push-constant count off by six; it refuses the dispatch on that count, which
+is the failure a new vmfb on an old runtime should produce.
+
 ## Required tests
 
 Consumers should share binary golden fixtures produced from this schema:

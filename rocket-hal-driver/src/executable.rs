@@ -23,7 +23,7 @@ use crate::{
 use iree_rocket_hal::rocket::{
     activation::{LutShape, LutTable},
     conv::{self, Kernels, Multiplier, PlanError, Precision},
-    elementwise::{EwAddShape, EwBinaryOp, EwPrecision, EwUnaryAlgo, EwUnaryShape},
+    elementwise::{EwAddShape, EwBinaryOp, EwInt8Quant, EwPrecision, EwUnaryAlgo, EwUnaryShape},
     executable_format::validate_conv_shape,
     fc,
     layout::DispatchLayout,
@@ -719,9 +719,29 @@ fn resolve_elementwise_geometry(
     runtime_dense_readers: bool,
     constants: &[u8],
 ) -> Result<ElementwiseGeometry, &'static str> {
+    resolve_elementwise_geometry_with(
+        template,
+        runtime_dimensions,
+        0,
+        runtime_dense_readers,
+        constants,
+    )
+}
+
+/// [`resolve_elementwise_geometry`] for an executable with `extra` more
+/// push constants (its quantization) between the dimensions and the
+/// trailing layout word; the caller reads those itself.
+fn resolve_elementwise_geometry_with(
+    template: &ElementwiseGeometry,
+    runtime_dimensions: &[RuntimeElementwiseDimension],
+    extra: usize,
+    runtime_dense_readers: bool,
+    constants: &[u8],
+) -> Result<ElementwiseGeometry, &'static str> {
     let expected_bytes = runtime_dimensions
         .len()
-        .checked_add(usize::from(runtime_dense_readers))
+        .checked_add(extra)
+        .and_then(|count| count.checked_add(usize::from(runtime_dense_readers)))
         .and_then(|count| count.checked_mul(std::mem::size_of::<u32>()))
         .ok_or("runtime element-wise push-constant byte count overflow")?;
     if constants.len() != expected_bytes {
@@ -729,11 +749,8 @@ fn resolve_elementwise_geometry(
     }
 
     let mut geometry = *template;
-    for (dimension, bytes) in runtime_dimensions
-        .iter()
-        .zip(constants.chunks_exact(std::mem::size_of::<u32>()))
-    {
-        let value = u32::from_ne_bytes(bytes.try_into().unwrap());
+    for (dimension, bytes) in runtime_dimensions.iter().zip(constants.as_chunks::<4>().0) {
+        let value = u32::from_ne_bytes(*bytes);
         if value == 0 {
             return Err("runtime element-wise dimensions must be nonzero");
         }
@@ -807,19 +824,48 @@ impl ElementwiseUnaryExecutable {
     }
 }
 
+/// One per-dispatch quantization field of an int8 [`ElementwiseBinaryExecutable`]
+/// (the wire's `ElementwiseQuantParam`). Same bit-pattern convention as
+/// [`RuntimeConv2dQuantParam`]: scales are f32 bits, zero points i32.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum RuntimeElementwiseQuantParam {
+    AScale,
+    AZeroPoint,
+    BScale,
+    BZeroPoint,
+    OutputScale,
+    OutputZeroPoint,
+}
+
+impl RuntimeElementwiseQuantParam {
+    fn index(self) -> usize {
+        match self {
+            Self::AScale => 0,
+            Self::AZeroPoint => 1,
+            Self::BScale => 2,
+            Self::BZeroPoint => 3,
+            Self::OutputScale => 4,
+            Self::OutputZeroPoint => 5,
+        }
+    }
+}
+
 /// Two-tensor element-wise executable metadata before per-dispatch runtime
 /// dimensions resolve.
 ///
-/// fp16 only, and no precision field, for a narrower reason than
-/// [`ElementwiseUnaryExecutable`]'s: [`EwAddShape`] *does* carry an int8
-/// branch, but its `EW_CVT_SCALE`/`OUT_CVT_SCALE` ratio semantics are
-/// inferred from register shape rather than confirmed against a known value,
-/// and `Mul` has no int8 recipe in any capture. The wire format declines to
-/// carry that inference; see the schema's own comment.
+/// fp16, or int8 ADD (2026-11-24): an int8 executable takes its six
+/// quantization fields as push constants (`runtime_quantization`), because
+/// they are calibration data and the executable is shared. `Mul` has no
+/// int8 recipe in any capture, so int8 is ADD only.
 #[derive(Clone, Debug, PartialEq)]
 pub struct ElementwiseBinaryExecutable {
     pub geometry: ElementwiseGeometry,
     pub op: EwBinaryOp,
+    pub precision: EwPrecision,
+    /// The EW core's ReLU on the result.
+    pub relu: bool,
+    /// int8 only: consumed after the dimensions, before the layout word.
+    pub runtime_quantization: Vec<RuntimeElementwiseQuantParam>,
     pub runtime_dimensions: Vec<RuntimeElementwiseDimension>,
     /// See [`trailing_layout`].
     pub runtime_dense_readers: bool,
@@ -833,6 +879,9 @@ impl ElementwiseBinaryExecutable {
         Self {
             geometry,
             op,
+            precision: EwPrecision::Fp16,
+            relu: false,
+            runtime_quantization: Vec::new(),
             runtime_dimensions: Vec::new(),
             runtime_dense_readers: false,
             runtime_layout: false,
@@ -844,30 +893,83 @@ impl ElementwiseBinaryExecutable {
     }
 
     pub fn validate_template(&self) -> Result<(), &'static str> {
-        validate_elementwise_template(&self.geometry, &self.runtime_dimensions)
+        validate_elementwise_template(&self.geometry, &self.runtime_dimensions)?;
+        match self.precision {
+            EwPrecision::Fp16 => {
+                if !self.runtime_quantization.is_empty() {
+                    return Err("an fp16 element-wise binary op takes no quantization");
+                }
+            }
+            EwPrecision::Int8 => {
+                if !matches!(self.op, EwBinaryOp::Add) {
+                    return Err("int8 element-wise binary ops are ADD only");
+                }
+                // All six, each once: there is no static fallback for any of
+                // them, so a missing one cannot be defaulted.
+                let mut seen = [false; 6];
+                for param in &self.runtime_quantization {
+                    let slot = &mut seen[param.index()];
+                    if *slot {
+                        return Err("int8 element-wise quantization field listed twice");
+                    }
+                    *slot = true;
+                }
+                if seen.iter().any(|seen| !seen) {
+                    return Err("int8 element-wise add needs all six quantization fields");
+                }
+            }
+        }
+        Ok(())
     }
 
     pub fn resolve_shape(&self, constants: &[u8]) -> Result<EwAddShape, &'static str> {
-        let geometry = resolve_elementwise_geometry(
+        let geometry = resolve_elementwise_geometry_with(
             &self.geometry,
             &self.runtime_dimensions,
+            self.runtime_quantization.len(),
             self.runtime_dense_readers || self.runtime_layout,
             constants,
         )?;
+        let int8 = match self.precision {
+            EwPrecision::Fp16 => None,
+            EwPrecision::Int8 => {
+                let mut quant = EwInt8Quant {
+                    a_zero_point: 0,
+                    b_zero_point: 0,
+                    output_zero_point: 0,
+                    a_scale: 0.0,
+                    b_scale: 0.0,
+                    output_scale: 0.0,
+                };
+                let start = self.runtime_dimensions.len() * std::mem::size_of::<u32>();
+                let words = constants[start..].as_chunks::<4>().0;
+                for (param, bytes) in self.runtime_quantization.iter().zip(words) {
+                    let value = u32::from_ne_bytes(*bytes);
+                    let scale = f64::from(f32::from_bits(value));
+                    let zero_point = value as i32;
+                    match param {
+                        RuntimeElementwiseQuantParam::AScale => quant.a_scale = scale,
+                        RuntimeElementwiseQuantParam::AZeroPoint => quant.a_zero_point = zero_point,
+                        RuntimeElementwiseQuantParam::BScale => quant.b_scale = scale,
+                        RuntimeElementwiseQuantParam::BZeroPoint => quant.b_zero_point = zero_point,
+                        RuntimeElementwiseQuantParam::OutputScale => quant.output_scale = scale,
+                        RuntimeElementwiseQuantParam::OutputZeroPoint => {
+                            quant.output_zero_point = zero_point
+                        }
+                    }
+                }
+                // The builder asserts this; a push constant is untrusted.
+                quant.encoding()?;
+                Some(quant)
+            }
+        };
         Ok(EwAddShape {
             width: geometry.width,
             height: geometry.height,
             channels: geometry.channels,
-            precision: EwPrecision::Fp16,
+            precision: self.precision,
             op: self.op,
-            // Every field below is int8-only and ignored at fp16, which is
-            // the only precision this executable can describe. They are not
-            // on the wire for that reason, so there is nothing to carry
-            // here either.
-            output_zero_point: 0,
-            w_cvt_offset: 0,
-            w_scale_ratio: 1.0,
-            output_scale_ratio: 1.0,
+            int8,
         })
     }
 }

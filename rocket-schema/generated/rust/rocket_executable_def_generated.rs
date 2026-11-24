@@ -922,6 +922,109 @@ impl<'a> flatbuffers::Verifiable for ElementwiseDimension {
 
 impl flatbuffers::SimpleToVerifyInSlice for ElementwiseDimension {}
 #[deprecated(since = "2.0.0", note = "Use associated constants instead. This will no longer be generated in 2021.")]
+pub const ENUM_MIN_ELEMENTWISE_QUANT_PARAM: u8 = 0;
+#[deprecated(since = "2.0.0", note = "Use associated constants instead. This will no longer be generated in 2021.")]
+pub const ENUM_MAX_ELEMENTWISE_QUANT_PARAM: u8 = 5;
+#[deprecated(since = "2.0.0", note = "Use associated constants instead. This will no longer be generated in 2021.")]
+#[allow(non_camel_case_types)]
+pub const ENUM_VALUES_ELEMENTWISE_QUANT_PARAM: [ElementwiseQuantParam; 6] = [
+  ElementwiseQuantParam::A_SCALE,
+  ElementwiseQuantParam::A_ZERO_POINT,
+  ElementwiseQuantParam::B_SCALE,
+  ElementwiseQuantParam::B_ZERO_POINT,
+  ElementwiseQuantParam::OUTPUT_SCALE,
+  ElementwiseQuantParam::OUTPUT_ZERO_POINT,
+];
+
+#[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Default)]
+#[repr(transparent)]
+pub struct ElementwiseQuantParam(pub u8);
+#[allow(non_upper_case_globals)]
+impl ElementwiseQuantParam {
+  pub const A_SCALE: Self = Self(0);
+  pub const A_ZERO_POINT: Self = Self(1);
+  pub const B_SCALE: Self = Self(2);
+  pub const B_ZERO_POINT: Self = Self(3);
+  pub const OUTPUT_SCALE: Self = Self(4);
+  pub const OUTPUT_ZERO_POINT: Self = Self(5);
+
+  pub const ENUM_MIN: u8 = 0;
+  pub const ENUM_MAX: u8 = 5;
+  pub const ENUM_VALUES: &'static [Self] = &[
+    Self::A_SCALE,
+    Self::A_ZERO_POINT,
+    Self::B_SCALE,
+    Self::B_ZERO_POINT,
+    Self::OUTPUT_SCALE,
+    Self::OUTPUT_ZERO_POINT,
+  ];
+  /// Returns the variant's name or "" if unknown.
+  pub fn variant_name(self) -> Option<&'static str> {
+    match self {
+      Self::A_SCALE => Some("A_SCALE"),
+      Self::A_ZERO_POINT => Some("A_ZERO_POINT"),
+      Self::B_SCALE => Some("B_SCALE"),
+      Self::B_ZERO_POINT => Some("B_ZERO_POINT"),
+      Self::OUTPUT_SCALE => Some("OUTPUT_SCALE"),
+      Self::OUTPUT_ZERO_POINT => Some("OUTPUT_ZERO_POINT"),
+      _ => None,
+    }
+  }
+}
+impl core::fmt::Debug for ElementwiseQuantParam {
+  fn fmt(&self, f: &mut core::fmt::Formatter) -> core::fmt::Result {
+    if let Some(name) = self.variant_name() {
+      f.write_str(name)
+    } else {
+      f.write_fmt(format_args!("<UNKNOWN {:?}>", self.0))
+    }
+  }
+}
+impl<'a> flatbuffers::Follow<'a> for ElementwiseQuantParam {
+  type Inner = Self;
+  #[inline]
+  fn follow(buf: &'a [u8], loc: usize) -> Self::Inner {
+    let b = unsafe {
+      flatbuffers::read_scalar_at::<u8>(buf, loc)
+    };
+    Self(b)
+  }
+}
+
+impl flatbuffers::Push for ElementwiseQuantParam {
+    type Output = ElementwiseQuantParam;
+    #[inline]
+    fn push(&self, dst: &mut [u8], _rest: &[u8]) {
+        unsafe { flatbuffers::emplace_scalar::<u8>(dst, self.0); }
+    }
+}
+
+impl flatbuffers::EndianScalar for ElementwiseQuantParam {
+  #[inline]
+  fn to_little_endian(self) -> Self {
+    let b = u8::to_le(self.0);
+    Self(b)
+  }
+  #[inline]
+  #[allow(clippy::wrong_self_convention)]
+  fn from_little_endian(self) -> Self {
+    let b = u8::from_le(self.0);
+    Self(b)
+  }
+}
+
+impl<'a> flatbuffers::Verifiable for ElementwiseQuantParam {
+  #[inline]
+  fn run_verifier(
+    v: &mut flatbuffers::Verifier, pos: usize
+  ) -> Result<(), flatbuffers::InvalidFlatbuffer> {
+    use self::flatbuffers::Verifiable;
+    u8::run_verifier(v, pos)
+  }
+}
+
+impl flatbuffers::SimpleToVerifyInSlice for ElementwiseQuantParam {}
+#[deprecated(since = "2.0.0", note = "Use associated constants instead. This will no longer be generated in 2021.")]
 pub const ENUM_MIN_MATMUL_DIMENSION: u8 = 0;
 #[deprecated(since = "2.0.0", note = "Use associated constants instead. This will no longer be generated in 2021.")]
 pub const ENUM_MAX_MATMUL_DIMENSION: u8 = 2;
@@ -2829,6 +2932,9 @@ impl<'a> ElementwiseBinaryDef<'a> {
   pub const VT_RUNTIME_DIMENSIONS: flatbuffers::VOffsetT = 12;
   pub const VT_RUNTIME_DENSE_READERS: flatbuffers::VOffsetT = 14;
   pub const VT_RUNTIME_LAYOUT: flatbuffers::VOffsetT = 16;
+  pub const VT_PRECISION: flatbuffers::VOffsetT = 18;
+  pub const VT_RELU: flatbuffers::VOffsetT = 20;
+  pub const VT_RUNTIME_QUANTIZATION: flatbuffers::VOffsetT = 22;
 
   #[inline]
   pub fn init_from_table(table: flatbuffers::Table<'a>) -> Self {
@@ -2840,10 +2946,13 @@ impl<'a> ElementwiseBinaryDef<'a> {
     args: &'args ElementwiseBinaryDefArgs<'args>
   ) -> flatbuffers::WIPOffset<ElementwiseBinaryDef<'bldr>> {
     let mut builder = ElementwiseBinaryDefBuilder::new(_fbb);
+    if let Some(x) = args.runtime_quantization { builder.add_runtime_quantization(x); }
     if let Some(x) = args.runtime_dimensions { builder.add_runtime_dimensions(x); }
     builder.add_channels(args.channels);
     builder.add_height(args.height);
     builder.add_width(args.width);
+    builder.add_relu(args.relu);
+    builder.add_precision(args.precision);
     builder.add_runtime_layout(args.runtime_layout);
     builder.add_runtime_dense_readers(args.runtime_dense_readers);
     builder.add_op(args.op);
@@ -2879,6 +2988,18 @@ impl<'a> ElementwiseBinaryDef<'a> {
   pub fn runtime_layout(&self) -> bool {
     self._tab.get::<bool>(ElementwiseBinaryDef::VT_RUNTIME_LAYOUT, Some(false)).unwrap()
   }
+  #[inline]
+  pub fn precision(&self) -> Precision {
+    self._tab.get::<Precision>(ElementwiseBinaryDef::VT_PRECISION, Some(Precision::FP16)).unwrap()
+  }
+  #[inline]
+  pub fn relu(&self) -> bool {
+    self._tab.get::<bool>(ElementwiseBinaryDef::VT_RELU, Some(false)).unwrap()
+  }
+  #[inline]
+  pub fn runtime_quantization(&self) -> Option<flatbuffers::Vector<'a, ElementwiseQuantParam>> {
+    self._tab.get::<flatbuffers::ForwardsUOffset<flatbuffers::Vector<'a, ElementwiseQuantParam>>>(ElementwiseBinaryDef::VT_RUNTIME_QUANTIZATION, None)
+  }
 }
 
 impl flatbuffers::Verifiable for ElementwiseBinaryDef<'_> {
@@ -2895,6 +3016,9 @@ impl flatbuffers::Verifiable for ElementwiseBinaryDef<'_> {
      .visit_field::<flatbuffers::ForwardsUOffset<flatbuffers::Vector<'_, ElementwiseDimension>>>("runtime_dimensions", Self::VT_RUNTIME_DIMENSIONS, false)?
      .visit_field::<bool>("runtime_dense_readers", Self::VT_RUNTIME_DENSE_READERS, false)?
      .visit_field::<bool>("runtime_layout", Self::VT_RUNTIME_LAYOUT, false)?
+     .visit_field::<Precision>("precision", Self::VT_PRECISION, false)?
+     .visit_field::<bool>("relu", Self::VT_RELU, false)?
+     .visit_field::<flatbuffers::ForwardsUOffset<flatbuffers::Vector<'_, ElementwiseQuantParam>>>("runtime_quantization", Self::VT_RUNTIME_QUANTIZATION, false)?
      .finish();
     Ok(())
   }
@@ -2907,6 +3031,9 @@ pub struct ElementwiseBinaryDefArgs<'a> {
     pub runtime_dimensions: Option<flatbuffers::WIPOffset<flatbuffers::Vector<'a, ElementwiseDimension>>>,
     pub runtime_dense_readers: bool,
     pub runtime_layout: bool,
+    pub precision: Precision,
+    pub relu: bool,
+    pub runtime_quantization: Option<flatbuffers::WIPOffset<flatbuffers::Vector<'a, ElementwiseQuantParam>>>,
 }
 impl<'a> Default for ElementwiseBinaryDefArgs<'a> {
   #[inline]
@@ -2919,6 +3046,9 @@ impl<'a> Default for ElementwiseBinaryDefArgs<'a> {
       runtime_dimensions: None,
       runtime_dense_readers: false,
       runtime_layout: false,
+      precision: Precision::FP16,
+      relu: false,
+      runtime_quantization: None,
     }
   }
 }
@@ -2957,6 +3087,18 @@ impl<'a: 'b, 'b> ElementwiseBinaryDefBuilder<'a, 'b> {
     self.fbb_.push_slot::<bool>(ElementwiseBinaryDef::VT_RUNTIME_LAYOUT, runtime_layout, false);
   }
   #[inline]
+  pub fn add_precision(&mut self, precision: Precision) {
+    self.fbb_.push_slot::<Precision>(ElementwiseBinaryDef::VT_PRECISION, precision, Precision::FP16);
+  }
+  #[inline]
+  pub fn add_relu(&mut self, relu: bool) {
+    self.fbb_.push_slot::<bool>(ElementwiseBinaryDef::VT_RELU, relu, false);
+  }
+  #[inline]
+  pub fn add_runtime_quantization(&mut self, runtime_quantization: flatbuffers::WIPOffset<flatbuffers::Vector<'b , ElementwiseQuantParam>>) {
+    self.fbb_.push_slot_always::<flatbuffers::WIPOffset<_>>(ElementwiseBinaryDef::VT_RUNTIME_QUANTIZATION, runtime_quantization);
+  }
+  #[inline]
   pub fn new(_fbb: &'b mut flatbuffers::FlatBufferBuilder<'a>) -> ElementwiseBinaryDefBuilder<'a, 'b> {
     let start = _fbb.start_table();
     ElementwiseBinaryDefBuilder {
@@ -2981,6 +3123,9 @@ impl core::fmt::Debug for ElementwiseBinaryDef<'_> {
       ds.field("runtime_dimensions", &self.runtime_dimensions());
       ds.field("runtime_dense_readers", &self.runtime_dense_readers());
       ds.field("runtime_layout", &self.runtime_layout());
+      ds.field("precision", &self.precision());
+      ds.field("relu", &self.relu());
+      ds.field("runtime_quantization", &self.runtime_quantization());
       ds.finish()
   }
 }

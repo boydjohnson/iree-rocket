@@ -51,13 +51,14 @@ use crate::{
         Conv2dExecutable, ElementwiseBinaryExecutable, ElementwiseGeometry,
         ElementwiseLutExecutable, ElementwiseUnaryExecutable, LutFunction, MatmulExecutable,
         PoolingExecutable, RuntimeConv2dDimension, RuntimeConv2dQuantParam,
-        RuntimeElementwiseDimension, RuntimeMatmulDimension, RuntimePoolingDimension, UkernelShape,
+        RuntimeElementwiseDimension, RuntimeElementwiseQuantParam, RuntimeMatmulDimension,
+        RuntimePoolingDimension, UkernelShape,
     },
     status,
 };
 use iree_rocket_hal::rocket::{
     conv::{self, Activation, Kernels, Multiplier, Precision, Quantization},
-    elementwise::{EwBinaryOp, EwUnaryAlgo},
+    elementwise::{EwBinaryOp, EwPrecision, EwUnaryAlgo},
     executable_format::{CONV2D_V1_TAG, decode_conv_shape_v1, validate_conv_shape},
     fc,
     pooling::{PoolingMethod, PoolingPrecision, PoolingShape},
@@ -465,6 +466,39 @@ fn decode_flatbuffer_shape(data: &[u8]) -> Result<UkernelShape, ()> {
                 schema::EwBinaryOp::MIN => EwBinaryOp::Min,
                 _ => return Err(()),
             };
+            let precision = match ew.precision() {
+                schema::Precision::FP16 => EwPrecision::Fp16,
+                schema::Precision::INT8 => EwPrecision::Int8,
+                _ => return Err(()),
+            };
+            let mut runtime_quantization = Vec::new();
+            if let Some(params) = ew.runtime_quantization() {
+                for index in 0..params.len() {
+                    runtime_quantization.push(match params.get(index) {
+                        schema::ElementwiseQuantParam::A_SCALE => {
+                            RuntimeElementwiseQuantParam::AScale
+                        }
+                        schema::ElementwiseQuantParam::A_ZERO_POINT => {
+                            RuntimeElementwiseQuantParam::AZeroPoint
+                        }
+                        schema::ElementwiseQuantParam::B_SCALE => {
+                            RuntimeElementwiseQuantParam::BScale
+                        }
+                        schema::ElementwiseQuantParam::B_ZERO_POINT => {
+                            RuntimeElementwiseQuantParam::BZeroPoint
+                        }
+                        schema::ElementwiseQuantParam::OUTPUT_SCALE => {
+                            RuntimeElementwiseQuantParam::OutputScale
+                        }
+                        schema::ElementwiseQuantParam::OUTPUT_ZERO_POINT => {
+                            RuntimeElementwiseQuantParam::OutputZeroPoint
+                        }
+                        // A newer schema's field still consumed a push
+                        // constant on the producer's side; see the conv arm.
+                        _ => return Err(()),
+                    });
+                }
+            }
             let executable = ElementwiseBinaryExecutable {
                 geometry: ElementwiseGeometry {
                     width: ew.width(),
@@ -472,6 +506,9 @@ fn decode_flatbuffer_shape(data: &[u8]) -> Result<UkernelShape, ()> {
                     channels: ew.channels(),
                 },
                 op,
+                precision,
+                relu: ew.relu(),
+                runtime_quantization,
                 runtime_dimensions: decode_elementwise_dimensions(
                     ew.runtime_dimensions().map(|dimensions| dimensions.iter()),
                 )?,
@@ -1513,6 +1550,7 @@ mod tests {
                 runtime_dimensions: None,
                 runtime_dense_readers: false,
                 runtime_layout: false,
+                ..Default::default()
             },
         );
         let export = schema::ExportDef::create(
@@ -1547,15 +1585,123 @@ mod tests {
             }
         );
 
-        // fp16 is the only precision this executable can describe, so every
-        // int8-only field of `EwAddShape` resolves to its ignored default.
+        // An executable with no precision field is fp16 and carries no int8
+        // quantization.
         let shape = executable.resolve_shape(&[]).unwrap();
         assert!(matches!(
             shape.precision,
             iree_rocket_hal::rocket::elementwise::EwPrecision::Fp16
         ));
-        assert_eq!(shape.output_zero_point, 0);
-        assert_eq!(shape.w_cvt_offset, 0);
+        assert!(shape.int8.is_none());
+    }
+
+    fn encode_int8_binary_executable(
+        op: schema::EwBinaryOp,
+        params: &[schema::ElementwiseQuantParam],
+    ) -> Vec<u8> {
+        let mut builder = flatbuffers::FlatBufferBuilder::new();
+        let name = builder.create_string("rocket_elementwise_binary_int8");
+        let dims = builder.create_vector(&[
+            schema::ElementwiseDimension::WIDTH,
+            schema::ElementwiseDimension::HEIGHT,
+            schema::ElementwiseDimension::CHANNELS,
+        ]);
+        let quant = builder.create_vector(params);
+        let ew = schema::ElementwiseBinaryDef::create(
+            &mut builder,
+            &schema::ElementwiseBinaryDefArgs {
+                op,
+                runtime_dimensions: Some(dims),
+                runtime_layout: true,
+                precision: schema::Precision::INT8,
+                relu: true,
+                runtime_quantization: Some(quant),
+                ..Default::default()
+            },
+        );
+        let export = schema::ExportDef::create(
+            &mut builder,
+            &schema::ExportDefArgs {
+                name: Some(name),
+                kernel_type: schema::KernelDef::ElementwiseBinaryDef,
+                kernel: Some(ew.as_union_value()),
+            },
+        );
+        let exports = builder.create_vector(&[export]);
+        let root = schema::ExecutableDef::create(
+            &mut builder,
+            &schema::ExecutableDefArgs {
+                exports: Some(exports),
+            },
+        );
+        builder.finish(root, Some("RKT1"));
+        wrap_executable(builder)
+    }
+
+    const ALL_EW_QUANT: [schema::ElementwiseQuantParam; 6] = [
+        schema::ElementwiseQuantParam::A_SCALE,
+        schema::ElementwiseQuantParam::A_ZERO_POINT,
+        schema::ElementwiseQuantParam::B_SCALE,
+        schema::ElementwiseQuantParam::B_ZERO_POINT,
+        schema::ElementwiseQuantParam::OUTPUT_SCALE,
+        schema::ElementwiseQuantParam::OUTPUT_ZERO_POINT,
+    ];
+
+    /// The int8 add, a quantized residual tail: three dimensions, then the
+    /// six quantization fields in wire order, then the layout word.
+    #[test]
+    fn decodes_an_int8_elementwise_add_with_runtime_quantization() {
+        let data = encode_int8_binary_executable(schema::EwBinaryOp::ADD, &ALL_EW_QUANT);
+        let UkernelShape::ElementwiseBinary(executable) = decode_flatbuffer_shape(&data).unwrap()
+        else {
+            panic!("expected a binary element-wise executable");
+        };
+        assert!(executable.relu);
+        let words: [u32; 10] = [
+            7,
+            7,
+            2048,
+            0.12_f32.to_bits(),
+            25,
+            0.09_f32.to_bits(),
+            (-128_i32) as u32,
+            0.11_f32.to_bits(),
+            (-128_i32) as u32,
+            0,
+        ];
+        let constants: Vec<u8> = words.iter().flat_map(|w| w.to_ne_bytes()).collect();
+        let shape = executable.resolve_shape(&constants).unwrap();
+        assert_eq!((shape.width, shape.height, shape.channels), (7, 7, 2048));
+        assert!(matches!(shape.precision, EwPrecision::Int8));
+        let q = shape.int8.unwrap();
+        assert_eq!(
+            (q.a_zero_point, q.b_zero_point, q.output_zero_point),
+            (25, -128, -128)
+        );
+        assert_eq!(q.a_scale, f64::from(0.12_f32));
+        assert_eq!(q.output_scale, f64::from(0.11_f32));
+
+        // The count is exact: one constant short is refused, not misread.
+        assert!(executable.resolve_shape(&constants[4..]).is_err());
+        // A scale of zero does not encode.
+        let mut zero_scale = words;
+        zero_scale[3] = 0;
+        let constants: Vec<u8> = zero_scale.iter().flat_map(|w| w.to_ne_bytes()).collect();
+        assert!(executable.resolve_shape(&constants).is_err());
+    }
+
+    /// No static fallback exists for any int8 field, and MUL has no int8
+    /// recipe: both are decode errors, not dispatches with a guessed value.
+    #[test]
+    fn rejects_incomplete_or_unsupported_int8_elementwise() {
+        let missing = encode_int8_binary_executable(schema::EwBinaryOp::ADD, &ALL_EW_QUANT[..5]);
+        assert!(decode_flatbuffer_shape(&missing).is_err());
+        let mut twice = ALL_EW_QUANT.to_vec();
+        twice[5] = schema::ElementwiseQuantParam::A_SCALE;
+        let duplicated = encode_int8_binary_executable(schema::EwBinaryOp::ADD, &twice);
+        assert!(decode_flatbuffer_shape(&duplicated).is_err());
+        let mul = encode_int8_binary_executable(schema::EwBinaryOp::MUL, &ALL_EW_QUANT);
+        assert!(decode_flatbuffer_shape(&mul).is_err());
     }
 
     /// The wire carries the *decoded* zero point; `LutShape` takes the

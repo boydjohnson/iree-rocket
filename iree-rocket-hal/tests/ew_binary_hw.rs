@@ -153,11 +153,7 @@ fn shape(op: EwBinaryOp, geometry: Geometry) -> EwAddShape {
         channels: geometry.channels,
         precision: EwPrecision::Fp16,
         op,
-        // int8-only fields, unused at fp16.
-        output_zero_point: 0,
-        w_cvt_offset: 0,
-        w_scale_ratio: 1.0,
-        output_scale_ratio: 1.0,
+        int8: None,
     }
 }
 

@@ -494,6 +494,32 @@
   #hal.pipeline.binding<storage_buffer>
 ]>
 
+// The int8 element-wise add: three dimensions, six quantization fields, the
+// layout word.
+#elementwise_binary_int8_pipeline_layout = #hal.pipeline.layout<constants = 10, bindings = [
+  #hal.pipeline.binding<storage_buffer, ReadOnly>,
+  #hal.pipeline.binding<storage_buffer, ReadOnly>,
+  #hal.pipeline.binding<storage_buffer>
+]>
+
+// A quantized residual block's tail, `Q(relu(DQ(a) + DQ(b)))`, on two int8
+// tensors: what `rocket-fuse-int8-residual-add` canonicalizes and
+// @match_elementwise_add_int8_relu claims. The six scales and zero points are
+// per-dispatch calibration data, so they are push constants; the arithmetic
+// is measured in iree-rocket-hal's tests/ew_int8_add_hw.rs (exact apart from
+// rounding ties).
+#rocket_elementwise_add_int8_relu_target = #hal.executable.target<"rocket", "rocket-flatbuffer-v1", {
+  kernel = "elementwise_binary",
+  runtime_layout = true,
+  width = 0 : i32, height = 0 : i32, channels = 0 : i32,
+  op = "add",
+  precision = "int8",
+  relu = true,
+  runtime_dimensions = ["width", "height", "channels"],
+  runtime_quantization = ["a_scale", "a_zero_point", "b_scale", "b_zero_point",
+                          "output_scale", "output_zero_point"]
+}>
+
 #pooling_pipeline_layout = #hal.pipeline.layout<constants = 6, bindings = [
   #hal.pipeline.binding<storage_buffer, ReadOnly>,
   #hal.pipeline.binding<storage_buffer>
@@ -1029,6 +1055,20 @@ module attributes {transform.with_named_sequence} {
       }
       builtin.module {
         func.func @rocket_pooling_avg() {
+          return
+        }
+      }
+    }
+  }
+
+  hal.executable private @rocket_elementwise_add_int8_relu_executable {
+    hal.executable.variant public @rocket_elementwise_add_v1 target(#rocket_elementwise_add_int8_relu_target) {
+      hal.executable.export public @rocket_elementwise_add ordinal(0) layout(#elementwise_binary_int8_pipeline_layout) count(%device: !hal.device, %workload: index) -> (index, index, index) {
+        %c1 = arith.constant 1 : index
+        hal.return %c1, %c1, %c1 : index, index, index
+      }
+      builtin.module {
+        func.func @rocket_elementwise_add() {
           return
         }
       }
@@ -1839,6 +1879,48 @@ module attributes {transform.with_named_sequence} {
   // There is no init to fold in, unlike the pooling shims: `O = A add B`
   // writes every element, so the `outs` operand is a pure destination and
   // the CPU epilogue only has to widen f16 back to f32.
+  // The int8 residual add. Arguments are the matched DAG's block arguments
+  // in order: both NHWC operands, then the canonical generic's scalars --
+  // scale, zero point for `a`, for `b`, for the output (zero points already
+  // in the signed encoding), and the ReLU floor and int8 clamp bounds, which
+  // the hardware applies itself and which are here only because the CPU form
+  // names them.
+  util.func private @call_rocket_elementwise_add_int8_relu(
+      %a: tensor<1x?x?x?xi8>,
+      %b: tensor<1x?x?x?xi8>,
+      %a_scale: f32, %a_zero_point: i32,
+      %b_scale: f32, %b_zero_point: i32,
+      %output_scale: f32, %output_zero_point: i32,
+      %floor: f32, %int8_min: f32, %int8_max: f32,
+      %init: tensor<1x?x?x?xi8>) -> tensor<1x?x?x?xi8> {
+    %c1 = arith.constant 1 : index
+    %c2 = arith.constant 2 : index
+    %c3 = arith.constant 3 : index
+    %height = tensor.dim %a, %c1 : tensor<1x?x?x?xi8>
+    %width = tensor.dim %a, %c2 : tensor<1x?x?x?xi8>
+    %channels = tensor.dim %a, %c3 : tensor<1x?x?x?xi8>
+    %width_i32 = arith.index_cast %width : index to i32
+    %height_i32 = arith.index_cast %height : index to i32
+    %channels_i32 = arith.index_cast %channels : index to i32
+    // Scales travel as their f32 bit patterns (ElementwiseQuantParam).
+    %a_scale_i32 = arith.bitcast %a_scale : f32 to i32
+    %b_scale_i32 = arith.bitcast %b_scale : f32 to i32
+    %output_scale_i32 = arith.bitcast %output_scale : f32 to i32
+    %layout_i32 = arith.constant 0 : i32
+    %sum = flow.dispatch
+        @rocket_elementwise_add_int8_relu_executable::@rocket_elementwise_add_v1::@rocket_elementwise_add(
+          %width_i32, %height_i32, %channels_i32,
+          %a_scale_i32, %a_zero_point, %b_scale_i32, %b_zero_point,
+          %output_scale_i32, %output_zero_point, %layout_i32,
+          %a, %b)
+        {stream.affinity = #hal.device.affinity<@rocket_device>}
+        : (i32, i32, i32, i32, i32, i32, i32, i32, i32, i32,
+           tensor<1x?x?x?xi8>{%height, %width, %channels},
+           tensor<1x?x?x?xi8>{%height, %width, %channels})
+        -> tensor<1x?x?x?xi8>{%height, %width, %channels}
+    util.return %sum : tensor<1x?x?x?xi8>
+  }
+
   util.func private @call_rocket_elementwise_add(
       %lhs: tensor<1x?x?xf32>,
       %rhs: tensor<1x?x?xf32>,
@@ -5612,6 +5694,92 @@ module attributes {transform.with_named_sequence} {
   // needed: the operation name already says the body is exactly this
   // arithmetic, so there is no subgraph to describe and none of that op's
   // silent-decline traps to fall into.
+  // The int8 residual add, in the exact form rocket-fuse-int8-residual-add
+  // emits. The scalars are block arguments, not body constants: the DAG match
+  // cannot map a captured value, and the canonicaliser hoists constants out.
+  transform.named_sequence @match_elementwise_add_int8_relu(
+      %root: !transform.any_op {transform.readonly})
+      -> (!transform.any_value, !transform.any_value) {
+    transform.match.operation_name %root ["linalg.generic"] : !transform.any_op
+    // The extents `ew_int8_add_hw` measured: NHWC `1 x H x W x C` up to
+    // ResNet50's residuals, 56x56 at 256 channels and 7x7 at 2048. Both
+    // operands share the result's geometry (the DAG below has one).
+    %result = transform.get_operand %root[0] : (!transform.any_op) -> !transform.any_value
+    transform.iree.match.dim_bounds %result[0], umin = 1, umax = 1 : !transform.any_value
+    transform.iree.match.dim_bounds %result[1], umin = 1, umax = 56 : !transform.any_value
+    transform.iree.match.dim_bounds %result[2], umin = 1, umax = 56 : !transform.any_value
+    transform.iree.match.dim_bounds %result[3], umin = 1, umax = 2048 : !transform.any_value
+    %ins, %outs = transform.iree.match.cast_compatible_dag_from_root %root {
+      ^bb0(%a: tensor<1x?x?x?xi8>, %b: tensor<1x?x?x?xi8>,
+           %a_scale: f32, %a_zero_point: i32,
+           %b_scale: f32, %b_zero_point: i32,
+           %output_scale: f32, %output_zero_point: i32,
+           %floor: f32, %int8_min: f32, %int8_max: f32,
+           %init: tensor<1x?x?x?xi8>):
+        %sum = linalg.generic {
+            indexing_maps = [affine_map<(d0, d1, d2, d3) -> (d0, d1, d2, d3)>,
+                             affine_map<(d0, d1, d2, d3) -> (d0, d1, d2, d3)>,
+                             affine_map<(d0, d1, d2, d3) -> ()>,
+                             affine_map<(d0, d1, d2, d3) -> ()>,
+                             affine_map<(d0, d1, d2, d3) -> ()>,
+                             affine_map<(d0, d1, d2, d3) -> ()>,
+                             affine_map<(d0, d1, d2, d3) -> ()>,
+                             affine_map<(d0, d1, d2, d3) -> ()>,
+                             affine_map<(d0, d1, d2, d3) -> ()>,
+                             affine_map<(d0, d1, d2, d3) -> ()>,
+                             affine_map<(d0, d1, d2, d3) -> ()>,
+                             affine_map<(d0, d1, d2, d3) -> (d0, d1, d2, d3)>],
+            iterator_types = ["parallel", "parallel", "parallel", "parallel"]}
+            ins(%a, %b, %a_scale, %a_zero_point, %b_scale, %b_zero_point,
+                %output_scale, %output_zero_point, %floor, %int8_min, %int8_max
+                : tensor<1x?x?x?xi8>, tensor<1x?x?x?xi8>, f32, i32, f32, i32,
+                  f32, i32, f32, f32, f32)
+            outs(%init : tensor<1x?x?x?xi8>) {
+          ^bb1(%x: i8, %y: i8, %sa: f32, %za: i32, %sb: f32, %zb: i32,
+               %so: f32, %zo: i32, %zero: f32, %low: f32, %high: f32,
+               %unused: i8):
+            %xw = arith.extsi %x : i8 to i32
+            %xc = arith.subi %xw, %za : i32
+            %xf = arith.sitofp %xc : i32 to f32
+            %xs = arith.mulf %xf, %sa : f32
+            %yw = arith.extsi %y : i8 to i32
+            %yc = arith.subi %yw, %zb : i32
+            %yf = arith.sitofp %yc : i32 to f32
+            %ys = arith.mulf %yf, %sb : f32
+            %added = arith.addf %xs, %ys : f32
+            %positive = arith.cmpf ugt, %added, %zero : f32
+            %rectified = arith.select %positive, %added, %zero : f32
+            %scaled = arith.divf %rectified, %so : f32
+            %rounded = math.roundeven %scaled : f32
+            %zof = arith.sitofp %zo : i32 to f32
+            %offset = arith.addf %rounded, %zof : f32
+            %low_clamped = arith.maximumf %offset, %low : f32
+            %clamped = arith.minimumf %low_clamped, %high : f32
+            %narrowed = arith.fptosi %clamped : f32 to i8
+            linalg.yield %narrowed : i8
+        } -> tensor<1x?x?x?xi8>
+    } : (!transform.any_op) -> (!transform.any_value, !transform.any_value)
+    transform.yield %ins, %outs : !transform.any_value, !transform.any_value
+  }
+
+  transform.named_sequence @cast_and_call_elementwise_add_int8_relu(
+      %ins: !transform.any_value {transform.readonly},
+      %out: !transform.any_value {transform.readonly}) {
+    %root = transform.get_defining_op %out : (!transform.any_value) -> !transform.any_op
+    %module = transform.util.get_nearest_symbol_table %root : (!transform.any_op) -> !transform.any_op
+    %topology_attr = transform.param.constant #hal.device.topology<links = [
+        (@rocket_device -> @cpu_device = {transparent_access = true, unified_memory = true}),
+        (@cpu_device -> @rocket_device = {transparent_access = true, unified_memory = true})
+      ]> -> !transform.any_param
+    transform.annotate %module "stream.topology" = %topology_attr : !transform.any_op, !transform.any_param
+    %executable = transform.util.import_symbol @rocket_elementwise_add_int8_relu_executable into %module if undefined : (!transform.any_op) -> !transform.any_op
+    %func = transform.util.import_symbol @call_rocket_elementwise_add_int8_relu into %module if undefined : (!transform.any_op) -> !transform.any_op
+    transform.util.cast_and_call %func(%ins) -> %out after %root {
+          transform.type_conversion.tensor.cast_shape_dynamic_dims
+      } : (!transform.any_op, !transform.any_value, !transform.any_value, !transform.any_op) -> !transform.any_op
+    transform.yield
+  }
+
   transform.named_sequence @match_elementwise_add_f32(
       %root: !transform.any_op {transform.readonly}) -> !transform.any_op {
     transform.match.operation_name %root ["linalg.add"] : !transform.any_op
@@ -10195,8 +10363,14 @@ module attributes {transform.with_named_sequence} {
     %requant_fused_funcs = transform.apply_registered_pass
         "rocket-fuse-int8-requant-epilogue" to %canonical_funcs
       : (!transform.any_op) -> !transform.any_op
+    // A quantized residual tail, Q(relu(DQ(a) + DQ(b))), into the canonical
+    // signed NHWC form @match_elementwise_add_int8_relu claims. After the
+    // requant fusion, whose conv outputs are this pattern's operands.
+    %residual_funcs = transform.apply_registered_pass
+        "rocket-fuse-int8-residual-add" to %requant_fused_funcs
+      : (!transform.any_op) -> !transform.any_op
     %gemv_funcs = transform.apply_registered_pass
-        "rocket-expand-gemv-to-matmul" to %requant_fused_funcs
+        "rocket-expand-gemv-to-matmul" to %residual_funcs
       : (!transform.any_op) -> !transform.any_op
 
     // Splits a static-batch `linalg.batch_matmul` into one `linalg.matmul`
@@ -10367,6 +10541,7 @@ module attributes {transform.with_named_sequence} {
             @match_dynamic_depthwise_conv2d_nchw_relu6_undemoted -> @cast_and_call_dynamic_depthwise_conv2d_nchw_relu6,
             @match_dynamic_depthwise_conv2d_nchw_relu6_s2 -> @cast_and_call_dynamic_depthwise_conv2d_nchw_relu6_s2,
             @match_dynamic_depthwise_conv2d_nchw_relu6_s2_undemoted -> @cast_and_call_dynamic_depthwise_conv2d_nchw_relu6_s2,
+            @match_elementwise_add_int8_relu -> @cast_and_call_elementwise_add_int8_relu,
             @match_dynamic_conv2d_3x3_pad1_int8_requant -> @cast_and_call_dynamic_conv2d_int8_requant_pad1,
             @match_dynamic_conv2d_3x3_pad1_int8_requant_s2 -> @cast_and_call_dynamic_conv2d_int8_requant_pad1_s2,
             @match_dynamic_conv2d_int8_requant -> @cast_and_call_dynamic_conv2d_int8_requant,

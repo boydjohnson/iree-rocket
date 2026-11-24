@@ -164,10 +164,7 @@ fn run(relu: bool) -> Result<usize, String> {
             channels: COUT as u32,
             precision: EwPrecision::Fp16,
             op: EwBinaryOp::Add,
-            output_zero_point: 0,
-            w_cvt_offset: 0,
-            w_scale_ratio: 1.0,
-            output_scale_ratio: 1.0,
+            int8: None,
         };
         let add_cmds = build_add_regcmd_with_relu(
             &add,

@@ -20,6 +20,7 @@ iree_lit_test_suite(
     "rocket_int8_match_boundaries.mlir"
     "rocket_int8_requant_match.mlir"
     "rocket_int8_requant_pad1.mlir"
+    "rocket_int8_residual_add.mlir"
     "rocket_assign_layout.mlir"
     "rocket_pack_weights.mlir"
     "rocket_fold_neutral_init.mlir"
