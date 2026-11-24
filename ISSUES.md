@@ -1911,6 +1911,30 @@ What was settled and how, newest first, in place of the narratives — those are
 in this file's git history (`git log -p ISSUES.md`). Everything cited below is
 something that still exists: a commit, a file, or a memory.
 
+**ResNet's int8 stem on the requantized path (S3) — 2026-11-24. ResNet50-224
+int8 24.6 -> 21.2 ms.** The stem (7x7 stride 2, `Cin` 3 -> 64) ran on the
+int8 accumulator: the NPU wrote a 3.2 MB `i32` cube, the driver compacted it
+(~2.8 ms per inference), and a CPU pass requantized it. The requantized 7x7
+stride-2 target and matcher already existed (and the shape is gated at
+requantized int8 by `stem_7x7_stride2_matches_oracle`); the stem never reached
+them because `rocket-fuse-int8-requant-epilogue` required the zero-point
+correction `acc - x_zp * sum_k(w)`, and the stem has none. Its input zero
+point is 0 in the signed encoding (`ui8` 128, what an image input calibrated
+on [-1, 1] gets), so `quantized-conv-to-conv` emits the convolution straight
+into the dequantization. The pass now takes that form: no correction, the
+bias (or zeros) as the folded bias.
+
+ResNet50 (relu-fused, int8 skip, shared max-pool quantization): the stem's
+CPU requantization gone, CPU dispatch executables 7 -> 6; 24.6/24.6 -> 21.3/
+21.0 ms ABAB on cpu 4-7, 0 timeouts. Against its own `--no-offload` build
+max|d| **0.20** (was 0.25), same top-5 in the same order -- the old 0.25 was
+partly the stem's own requantization. The output differs from the previous
+NPU build by the requantizer's tie rule (the NPU rounds ties away from zero).
+MobileNetV2 int8 is bit-identical to the previous compiler's build. Compiled e2e 50/50; e2e `requant_int8_stem_zero_zp` (the
+pre-fusion form, 802816 elements) 0 mismatches at atol 1; lit case
+`@zero_input_zero_point_stem`. What is left between stem and pool is the int8
+pad, which a padded int8 max pool needs a measured fill to take.
+
 **int8 max pool on the NPU (S3) — 2026-11-24. ResNet50-224 int8 26.7 ->
 24.3 ms, bit-identical.** QOperator quantization leaves MaxPool in float, so
 the stem's pool ran as: requantize to `ui8`, dequantize to f32, pad with

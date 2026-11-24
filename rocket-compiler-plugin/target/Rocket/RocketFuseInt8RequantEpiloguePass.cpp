@@ -331,52 +331,59 @@ static std::optional<RequantEpilogue> matchEpilogue(ConvOp convOp) {
     return std::nullopt;
   }
 
-  // The zero-point correction: acc - sum_k(w) * x_zp.
+  // The zero-point correction: acc - sum_k(w) * x_zp. Absent when the input
+  // zero point is 0 in the signed encoding (a `ui8` zero point of 128, which
+  // an image input calibrated on [-1, 1] gets): `quantized-conv-to-conv`
+  // emits no correction at all then, and the convolution feeds the
+  // dequantization directly. ResNet's stem is that case -- it took the
+  // int8_accumulator path and a CPU requantization for want of this.
+  Value scaled = convOp.getResult(0);
   linalg::GenericOp correction = soleGenericConsumer(convOp.getResult(0));
-  if (!correction || correction.getNumDpsInputs() != 2 ||
-      !isElementwiseWithIdentityMaps(correction)) {
-    return std::nullopt;
+  SmallVector<Operation *> correctionBody;
+  if (correction && correction.getNumDpsInputs() == 2 &&
+      isElementwiseWithIdentityMaps(correction)) {
+    correctionBody = matchBody(correction, {"arith.muli", "arith.subi"});
   }
-  SmallVector<Operation *> correctionBody =
-      matchBody(correction, {"arith.muli", "arith.subi"});
   if (correctionBody.empty()) {
-    return std::nullopt;
-  }
-  auto *muli = correctionBody[0];
-  auto *subi = correctionBody[1];
-  if (subi->getOperand(1) != muli->getResult(0)) {
-    return std::nullopt;
-  }
-  std::optional<APInt> zeroPoint =
-      constantIntOperand(correction, muli->getOperand(1));
-  if (!zeroPoint) {
-    return std::nullopt;
-  }
-  found.inputZeroPoint = zeroPoint->getSExtValue();
-  // Which of the two inputs is the broadcast weight sum: the one the muli
-  // reads, not the one the subi does.
-  auto sumArg = dyn_cast<BlockArgument>(muli->getOperand(0));
-  auto accArg = dyn_cast<BlockArgument>(subi->getOperand(0));
-  if (!sumArg || !accArg || sumArg.getArgNumber() >= correction.getNumDpsInputs() ||
-      accArg.getArgNumber() >= correction.getNumDpsInputs()) {
-    return std::nullopt;
-  }
-  if (correction.getDpsInputs()[accArg.getArgNumber()] != convOp.getResult(0)) {
-    return std::nullopt;
-  }
-  auto sumBroadcast = correction.getDpsInputs()[sumArg.getArgNumber()]
-                          .getDefiningOp<linalg::BroadcastOp>();
-  if (!sumBroadcast) {
-    return std::nullopt;
-  }
-  found.weightSum =
-      matchWeightSum(sumBroadcast.getInput(), convOp.getDpsInputs()[1]);
-  if (!found.weightSum) {
-    return std::nullopt;
+    found.inputZeroPoint = 0;
+    found.weightSum = nullptr;
+  } else {
+    auto *muli = correctionBody[0];
+    auto *subi = correctionBody[1];
+    if (subi->getOperand(1) != muli->getResult(0)) {
+      return std::nullopt;
+    }
+    std::optional<APInt> zeroPoint =
+        constantIntOperand(correction, muli->getOperand(1));
+    if (!zeroPoint) {
+      return std::nullopt;
+    }
+    found.inputZeroPoint = zeroPoint->getSExtValue();
+    // Which of the two inputs is the broadcast weight sum: the one the muli
+    // reads, not the one the subi does.
+    auto sumArg = dyn_cast<BlockArgument>(muli->getOperand(0));
+    auto accArg = dyn_cast<BlockArgument>(subi->getOperand(0));
+    if (!sumArg || !accArg || sumArg.getArgNumber() >= correction.getNumDpsInputs() ||
+        accArg.getArgNumber() >= correction.getNumDpsInputs()) {
+      return std::nullopt;
+    }
+    if (correction.getDpsInputs()[accArg.getArgNumber()] != convOp.getResult(0)) {
+      return std::nullopt;
+    }
+    auto sumBroadcast = correction.getDpsInputs()[sumArg.getArgNumber()]
+                            .getDefiningOp<linalg::BroadcastOp>();
+    if (!sumBroadcast) {
+      return std::nullopt;
+    }
+    found.weightSum =
+        matchWeightSum(sumBroadcast.getInput(), convOp.getDpsInputs()[1]);
+    if (!found.weightSum) {
+      return std::nullopt;
+    }
+    scaled = correction.getResult(0);
   }
 
   // An optional layout transpose, which the rewrite re-emits on i8.
-  Value scaled = correction.getResult(0);
   if (scaled.hasOneUse()) {
     if (auto transpose =
             dyn_cast<linalg::TransposeOp>(*scaled.getUsers().begin())) {
@@ -444,7 +451,20 @@ static std::optional<RequantEpilogue> matchEpilogue(ConvOp convOp) {
 /// constants in a real model, so this folds away entirely.
 static Value buildFoldedBias(PatternRewriter &rewriter, Location loc,
                              Value bias, Value weightSum,
-                             int64_t inputZeroPoint) {
+                             int64_t inputZeroPoint, int64_t channels) {
+  // No correction to fold (input zero point 0): the bias as it is, or zeros.
+  if (!weightSum) {
+    if (bias) {
+      return bias;
+    }
+    Value zero = arith::ConstantOp::create(rewriter, loc,
+                                           rewriter.getI32IntegerAttr(0));
+    Value empty =
+        tensor::EmptyOp::create(rewriter, loc, {channels}, rewriter.getI32Type());
+    return linalg::FillOp::create(rewriter, loc, ValueRange{zero},
+                                  ValueRange{empty})
+        .getResult(0);
+  }
   auto sumType = cast<RankedTensorType>(weightSum.getType());
   Value empty = tensor::EmptyOp::create(rewriter, loc, sumType.getShape(),
                                         sumType.getElementType());
@@ -551,9 +571,9 @@ struct FuseInt8RequantEpilogue : public OpRewritePattern<ConvOp> {
         DenseIntElementsAttr::get(attrType, strideValues),
         DenseIntElementsAttr::get(attrType, dilationValues));
 
-    Value foldedBias = buildFoldedBias(rewriter, loc, epilogue->bias,
-                                       epilogue->weightSum,
-                                       epilogue->inputZeroPoint);
+    Value foldedBias = buildFoldedBias(
+        rewriter, loc, epilogue->bias, epilogue->weightSum,
+        epilogue->inputZeroPoint, accType.getShape().back());
 
     // One rounding of the ratio rather than a multiply and a divide; see the
     // numerics note in this file's header.

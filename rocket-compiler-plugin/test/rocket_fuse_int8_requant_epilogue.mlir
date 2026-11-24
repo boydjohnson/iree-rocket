@@ -214,3 +214,65 @@ func.func @accumulator_has_two_readers(
 
   return %quantized, %corr : tensor<1x4x4x144xi8>, tensor<1x4x4x144xi32>
 }
+
+// An input zero point of 0 in the signed encoding (`ui8` 128 -- what an
+// image input calibrated on [-1, 1] gets) leaves quantized-conv-to-conv
+// nothing to correct, so the convolution feeds the dequantization directly.
+// ResNet's 7x7 stride-2 stem arrives this way; the rewrite has to take it
+// with the bias as the whole folded bias, not decline it to the
+// int8_accumulator path.
+// CHECK-LABEL: func.func @zero_input_zero_point_stem
+// CHECK:       %[[INIT:.+]] = linalg.fill ins(%{{.+}} : i32) outs(%{{.+}} : tensor<1x112x112x64xi32>)
+// CHECK:       %[[ACC:.+]] = linalg.conv_2d_nhwc_hwcf
+// CHECK-SAME:      strides = dense<2> : tensor<2xi64>
+// CHECK-SAME:      outs(%[[INIT]] : tensor<1x112x112x64xi32>)
+// CHECK:       linalg.generic
+// CHECK-SAME:      ins(%[[ACC]], %{{.+}} :
+// CHECK:         arith.fptosi
+// CHECK-NOT:   arith.fptoui
+func.func @zero_input_zero_point_stem(
+    %input: tensor<1x230x230x3xi8>,
+    %filter: tensor<7x7x3x64xi8>,
+    %bias: tensor<64xi32>) -> tensor<1x64x112x112xi8> {
+  %acc_scale = arith.constant 1.500000e-03 : f32
+  %out_scale = arith.constant 1.370000e-01 : f32
+  %out_zp = arith.constant 0.000000e+00 : f32
+  %lo = arith.constant 0.000000e+00 : f32
+  %hi = arith.constant 2.550000e+02 : f32
+  %acc_empty = tensor.empty() : tensor<1x112x112x64xi32>
+  %bias_bcast = linalg.broadcast ins(%bias : tensor<64xi32>)
+      outs(%acc_empty : tensor<1x112x112x64xi32>) dimensions = [0, 1, 2]
+  %acc = linalg.conv_2d_nhwc_hwcf
+      {dilations = dense<1> : vector<2xi64>, strides = dense<2> : vector<2xi64>}
+      ins(%input, %filter : tensor<1x230x230x3xi8>, tensor<7x7x3x64xi8>)
+      outs(%bias_bcast : tensor<1x112x112x64xi32>) -> tensor<1x112x112x64xi32>
+  %t_empty = tensor.empty() : tensor<1x64x112x112xi32>
+  %t = linalg.transpose ins(%acc : tensor<1x112x112x64xi32>) outs(%t_empty : tensor<1x64x112x112xi32>) permutation = [0, 3, 1, 2]
+  %real_empty = tensor.empty() : tensor<1x64x112x112xf32>
+  %real = linalg.generic {
+      indexing_maps = [affine_map<(d0, d1, d2, d3) -> (d0, d1, d2, d3)>,
+                       affine_map<(d0, d1, d2, d3) -> (d0, d1, d2, d3)>],
+      iterator_types = ["parallel", "parallel", "parallel", "parallel"]}
+      ins(%t : tensor<1x64x112x112xi32>) outs(%real_empty : tensor<1x64x112x112xf32>) {
+    ^bb0(%in: i32, %out: f32):
+      %f = arith.sitofp %in : i32 to f32
+      %s = arith.mulf %f, %acc_scale : f32
+      linalg.yield %s : f32
+  } -> tensor<1x64x112x112xf32>
+  %q_empty = tensor.empty() : tensor<1x64x112x112xi8>
+  %q = linalg.generic {
+      indexing_maps = [affine_map<(d0, d1, d2, d3) -> (d0, d1, d2, d3)>,
+                       affine_map<(d0, d1, d2, d3) -> (d0, d1, d2, d3)>],
+      iterator_types = ["parallel", "parallel", "parallel", "parallel"]}
+      ins(%real : tensor<1x64x112x112xf32>) outs(%q_empty : tensor<1x64x112x112xi8>) {
+    ^bb0(%in: f32, %out: i8):
+      %d = arith.divf %in, %out_scale : f32
+      %r = math.roundeven %d : f32
+      %z = arith.addf %r, %out_zp : f32
+      %l = arith.maximumf %z, %lo : f32
+      %h = arith.minimumf %l, %hi : f32
+      %n = arith.fptoui %h : f32 to i8
+      linalg.yield %n : i8
+  } -> tensor<1x64x112x112xi8>
+  return %q : tensor<1x64x112x112xi8>
+}

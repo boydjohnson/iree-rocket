@@ -824,6 +824,53 @@ func.func @int8_max_pool_stem(%x: tensor<1x64x56x56xi8>) -> tensor<1x64x28x28xi8
   return %q : tensor<1x64x28x28xi8>
 }
 
+// ResNet's 7x7 stride-2 stem in the form quantized-conv-to-conv leaves it when
+// the input zero point is 0 in the signed encoding: bias as the accumulator
+// init, no zero-point correction at all, a layout transpose, then the
+// dequantize/quantize pair. rocket-fuse-int8-requant-epilogue now takes that
+// form (it used to require the correction and declined, leaving the stem on
+// the int8 accumulator with a CPU requantization), so the requantized 7x7
+// stride-2 target runs it and returns int8.
+func.func @requant_int8_stem_zero_zp(%input: tensor<1x230x230x3xi8>, %filter: tensor<7x7x3x64xi8>, %bias: tensor<64xi32>) -> tensor<1x64x112x112xi8> {
+  %acc_scale = arith.constant 1.500000e-03 : f32
+  %out_scale = arith.constant 1.370000e-01 : f32
+  %out_zp = arith.constant 0.000000e+00 : f32
+  %lo = arith.constant 0.000000e+00 : f32
+  %hi = arith.constant 2.550000e+02 : f32
+  %acc_empty = tensor.empty() : tensor<1x112x112x64xi32>
+  %bias_bcast = linalg.broadcast ins(%bias : tensor<64xi32>) outs(%acc_empty : tensor<1x112x112x64xi32>) dimensions = [0, 1, 2]
+  %acc = linalg.conv_2d_nhwc_hwcf {dilations = dense<1> : vector<2xi64>, strides = dense<2> : vector<2xi64>} ins(%input, %filter : tensor<1x230x230x3xi8>, tensor<7x7x3x64xi8>) outs(%bias_bcast : tensor<1x112x112x64xi32>) -> tensor<1x112x112x64xi32>
+  %t_empty = tensor.empty() : tensor<1x64x112x112xi32>
+  %t = linalg.transpose ins(%acc : tensor<1x112x112x64xi32>) outs(%t_empty : tensor<1x64x112x112xi32>) permutation = [0, 3, 1, 2]
+  %real_empty = tensor.empty() : tensor<1x64x112x112xf32>
+  %real = linalg.generic {indexing_maps = [affine_map<(d0, d1, d2, d3) -> (d0, d1, d2, d3)>, affine_map<(d0, d1, d2, d3) -> (d0, d1, d2, d3)>], iterator_types = ["parallel", "parallel", "parallel", "parallel"]} ins(%t : tensor<1x64x112x112xi32>) outs(%real_empty : tensor<1x64x112x112xf32>) {
+  ^bb0(%in: i32, %out: f32):
+    %f = arith.sitofp %in : i32 to f32
+    %r = arith.mulf %f, %acc_scale : f32
+    linalg.yield %r : f32
+  } -> tensor<1x64x112x112xf32>
+  %q_empty = tensor.empty() : tensor<1x64x112x112xi8>
+  %q = linalg.generic {indexing_maps = [affine_map<(d0, d1, d2, d3) -> (d0, d1, d2, d3)>, affine_map<(d0, d1, d2, d3) -> (d0, d1, d2, d3)>], iterator_types = ["parallel", "parallel", "parallel", "parallel"]} ins(%real : tensor<1x64x112x112xf32>) outs(%q_empty : tensor<1x64x112x112xi8>) {
+  ^bb0(%in: f32, %out: i8):
+    %d = arith.divf %in, %out_scale : f32
+    %r = math.roundeven %d : f32
+    %z = arith.addf %r, %out_zp : f32
+    %l = arith.maximumf %z, %lo : f32
+    %h = arith.minimumf %l, %hi : f32
+    %n = arith.fptoui %h : f32 to i8
+    linalg.yield %n : i8
+  } -> tensor<1x64x112x112xi8>
+  // The signed shift every consumer applies; compared as `ui8` a tie at
+  // 127.5 would read as an error of 255 (see int8_residual_add_relu).
+  %c_shift = arith.constant -128 : i8
+  %s = linalg.generic {indexing_maps = [affine_map<(d0, d1, d2, d3) -> (d0, d1, d2, d3)>, affine_map<(d0, d1, d2, d3) -> (d0, d1, d2, d3)>], iterator_types = ["parallel", "parallel", "parallel", "parallel"]} ins(%q : tensor<1x64x112x112xi8>) outs(%q_empty : tensor<1x64x112x112xi8>) {
+  ^bb0(%in: i8, %out: i8):
+    %v = arith.addi %in, %c_shift : i8
+    linalg.yield %v : i8
+  } -> tensor<1x64x112x112xi8>
+  return %s : tensor<1x64x112x112xi8>
+}
+
 func.func @requant_int8_1x1_cin816_cout448(%input: tensor<1x7x7x816xi8>, %filter: tensor<1x1x816x448xi8>, %bias: tensor<448xi32>) -> tensor<1x7x7x448xi8> {
   %zero = arith.constant 0 : i32
   %scale = arith.constant 3.000000e-04 : f32
@@ -1638,6 +1685,11 @@ def write_compiled_fixture(work_dir: Path) -> None:
     np.save(work_dir / "requant_int8_1x1_then_pad1_f2.npy", i8_small(3, 3, 64, 64))
     np.save(work_dir / "requant_int8_1x1_then_pad1_b2.npy", bias_i32(64))
 
+    stem_rng = np.random.default_rng(20261127)
+    np.save(work_dir / "requant_int8_stem_zero_zp_input.npy", stem_rng.integers(-128, 128, size=(1, 230, 230, 3), dtype=np.int8))
+    np.save(work_dir / "requant_int8_stem_zero_zp_kernel.npy", stem_rng.integers(-8, 8, size=(7, 7, 3, 64), dtype=np.int8))
+    np.save(work_dir / "requant_int8_stem_zero_zp_bias.npy", stem_rng.integers(-1000, 1000, size=(64,), dtype=np.int32))
+
     max_pool_rng = np.random.default_rng(20261126)
     np.save(work_dir / "int8_max_pool_stem_x.npy", max_pool_rng.integers(-128, 128, size=(1, 64, 56, 56), dtype=np.int8))
 
@@ -1870,6 +1922,7 @@ def compile_modules(
         ("requant_int8_1x1_cin2048", "rocket_dynamic_int8_requant_executable"),
         ("int8_residual_add_relu", "rocket_elementwise_add_int8_relu_executable"),
         ("int8_max_pool_stem", "rocket_pooling_max_int8_executable_s2"),
+        ("requant_int8_stem_zero_zp", "rocket_dynamic_int8_requant_s2_executable"),
         ("requant_int8_1x1_cin816_cout448", "rocket_dynamic_int8_requant_executable"),
         ("requant_int8_1x1_large_bias", "rocket_dynamic_int8_requant_executable"),
         ("fp16_residual_relu", "rocket_dynamic_residual_relu_executable"),
@@ -2431,6 +2484,17 @@ def run_compiled_gate(
             ("int8_max_pool_stem_x.npy",),
             ("int8_max_pool_stem_out_rocket.npy",),
             0.0,
+            0.0,
+        ),
+        Case(
+            "requant_int8_stem_zero_zp",
+            (
+                "requant_int8_stem_zero_zp_input.npy",
+                "requant_int8_stem_zero_zp_kernel.npy",
+                "requant_int8_stem_zero_zp_bias.npy",
+            ),
+            ("requant_int8_stem_zero_zp_out_rocket.npy",),
+            1.0,
             0.0,
         ),
         Case(
