@@ -580,6 +580,21 @@ fn max_pooling_matches_oracle() {
             method: PoolingMethod::Max,
             precision: PoolingPrecision::Int8,
         },
+        // ResNet's stem pool at int8, on the input the CPU has already
+        // padded (112 + 2): the shape the int8 max-pool matcher hands the
+        // NPU. 64 channels is four whole int8 atoms; the extent is past
+        // every other int8 case here.
+        PoolCase {
+            label: "max 3x3s2 resnet stem",
+            width: 114,
+            height: 114,
+            channels: 64,
+            kernel: (3, 3),
+            stride: (2, 2),
+            pad: [0; 4],
+            method: PoolingMethod::Max,
+            precision: PoolingPrecision::Int8,
+        },
         // A non-square window and a non-square stride, which move the two
         // axes' kernel and stride fields independently.
         PoolCase {

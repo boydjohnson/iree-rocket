@@ -781,6 +781,49 @@ func.func @int8_residual_add_relu(%a: tensor<1x256x14x14xi8>, %b: tensor<1x256x1
   return %s : tensor<1x256x14x14xi8>
 }
 
+// A quantized ResNet stem's max pool in the importer's form (`ui8`
+// dequantization, -inf pad, pool, QuantizeLinear sharing the dequantization's
+// parameters): rocket-fuse-int8-max-pool runs it as an int8 max pool on the
+// codes, on the NPU's int8 PPU, exactly. A wrong pad fill, a wrong signed vs
+// unsigned order, or a lost window shows as a whole-code error, not a tie.
+func.func @int8_max_pool_stem(%x: tensor<1x64x56x56xi8>) -> tensor<1x64x28x28xi8> {
+  %scale = arith.constant 1.370000e-01 : f32
+  %zp = arith.constant 7 : i32
+  %zp_f = arith.constant 7.000000e+00 : f32
+  %zero = arith.constant 0.000000e+00 : f32
+  %max = arith.constant 2.550000e+02 : f32
+  %neg_inf = arith.constant 0xFF800000 : f32
+  %f_empty = tensor.empty() : tensor<1x64x56x56xf32>
+  %f = linalg.generic {indexing_maps = [affine_map<(d0, d1, d2, d3) -> (d0, d1, d2, d3)>, affine_map<(d0, d1, d2, d3) -> (d0, d1, d2, d3)>], iterator_types = ["parallel", "parallel", "parallel", "parallel"]} ins(%x : tensor<1x64x56x56xi8>) outs(%f_empty : tensor<1x64x56x56xf32>) {
+  ^bb0(%in: i8, %out: f32):
+    %w = arith.extui %in : i8 to i32
+    %c = arith.subi %w, %zp : i32
+    %v = arith.sitofp %c : i32 to f32
+    %r = arith.mulf %v, %scale : f32
+    linalg.yield %r : f32
+  } -> tensor<1x64x56x56xf32>
+  %padded = tensor.pad %f low[0, 0, 1, 1] high[0, 0, 1, 1] {
+  ^bb0(%a: index, %b: index, %c: index, %d: index):
+    tensor.yield %neg_inf : f32
+  } : tensor<1x64x56x56xf32> to tensor<1x64x58x58xf32>
+  %p_empty = tensor.empty() : tensor<1x64x28x28xf32>
+  %p_init = linalg.fill ins(%neg_inf : f32) outs(%p_empty : tensor<1x64x28x28xf32>) -> tensor<1x64x28x28xf32>
+  %window = tensor.empty() : tensor<3x3xf32>
+  %pooled = linalg.pooling_nchw_max {dilations = dense<1> : vector<2xi64>, strides = dense<2> : vector<2xi64>} ins(%padded, %window : tensor<1x64x58x58xf32>, tensor<3x3xf32>) outs(%p_init : tensor<1x64x28x28xf32>) -> tensor<1x64x28x28xf32>
+  %q_empty = tensor.empty() : tensor<1x64x28x28xi8>
+  %q = linalg.generic {indexing_maps = [affine_map<(d0, d1, d2, d3) -> (d0, d1, d2, d3)>, affine_map<(d0, d1, d2, d3) -> (d0, d1, d2, d3)>], iterator_types = ["parallel", "parallel", "parallel", "parallel"]} ins(%pooled : tensor<1x64x28x28xf32>) outs(%q_empty : tensor<1x64x28x28xi8>) {
+  ^bb0(%in: f32, %out: i8):
+    %d = arith.divf %in, %scale : f32
+    %r = math.roundeven %d : f32
+    %z = arith.addf %r, %zp_f : f32
+    %lo = arith.maximumf %z, %zero : f32
+    %hi = arith.minimumf %lo, %max : f32
+    %n = arith.fptoui %hi : f32 to i8
+    linalg.yield %n : i8
+  } -> tensor<1x64x28x28xi8>
+  return %q : tensor<1x64x28x28xi8>
+}
+
 func.func @requant_int8_1x1_cin816_cout448(%input: tensor<1x7x7x816xi8>, %filter: tensor<1x1x816x448xi8>, %bias: tensor<448xi32>) -> tensor<1x7x7x448xi8> {
   %zero = arith.constant 0 : i32
   %scale = arith.constant 3.000000e-04 : f32
@@ -1595,6 +1638,9 @@ def write_compiled_fixture(work_dir: Path) -> None:
     np.save(work_dir / "requant_int8_1x1_then_pad1_f2.npy", i8_small(3, 3, 64, 64))
     np.save(work_dir / "requant_int8_1x1_then_pad1_b2.npy", bias_i32(64))
 
+    max_pool_rng = np.random.default_rng(20261126)
+    np.save(work_dir / "int8_max_pool_stem_x.npy", max_pool_rng.integers(-128, 128, size=(1, 64, 56, 56), dtype=np.int8))
+
     residual_rng = np.random.default_rng(20261125)
     np.save(work_dir / "int8_residual_add_relu_a.npy", residual_rng.integers(-128, 128, size=(1, 256, 14, 14), dtype=np.int8))
     np.save(work_dir / "int8_residual_add_relu_b.npy", residual_rng.integers(-128, 128, size=(1, 256, 14, 14), dtype=np.int8))
@@ -1823,6 +1869,7 @@ def compile_modules(
         ("requant_int8_1x1_cin816", "rocket_dynamic_int8_requant_executable"),
         ("requant_int8_1x1_cin2048", "rocket_dynamic_int8_requant_executable"),
         ("int8_residual_add_relu", "rocket_elementwise_add_int8_relu_executable"),
+        ("int8_max_pool_stem", "rocket_pooling_max_int8_executable_s2"),
         ("requant_int8_1x1_cin816_cout448", "rocket_dynamic_int8_requant_executable"),
         ("requant_int8_1x1_large_bias", "rocket_dynamic_int8_requant_executable"),
         ("fp16_residual_relu", "rocket_dynamic_residual_relu_executable"),
@@ -2377,6 +2424,13 @@ def run_compiled_gate(
             ("int8_residual_add_relu_a.npy", "int8_residual_add_relu_b.npy"),
             ("int8_residual_add_relu_out_rocket.npy",),
             1.0,
+            0.0,
+        ),
+        Case(
+            "int8_max_pool_stem",
+            ("int8_max_pool_stem_x.npy",),
+            ("int8_max_pool_stem_out_rocket.npy",),
+            0.0,
             0.0,
         ),
         Case(

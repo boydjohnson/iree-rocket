@@ -4,9 +4,14 @@
 // See https://llvm.org/LICENSE.txt for license information.
 // SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
 //
-// Puts a quantized residual block's tail -- `Q(relu(DQ(a) + DQ(b)))` with
-// both operands int8 -- into the one canonical form the int8 element-wise
-// add matcher claims.
+// Two passes that put a quantized op the ONNX importer leaves in float, between
+// a DequantizeLinear and a QuantizeLinear, into the int8 form a Rocket matcher
+// claims: `rocket-fuse-int8-residual-add` (the residual tail, below) and
+// `rocket-fuse-int8-max-pool` (see `FuseInt8MaxPool`).
+//
+// The residual add: puts a quantized residual block's tail --
+// `Q(relu(DQ(a) + DQ(b)))` with both operands int8 -- into the one canonical
+// form the int8 element-wise add matcher claims.
 //
 // An ONNX QOperator model whose residual Add reads both operands through
 // DequantizeLinear (tools/quantize_onnx_int8.py --quantize-residual-skip)
@@ -383,6 +388,129 @@ struct FuseInt8ResidualAdd : public OpRewritePattern<linalg::GenericOp> {
   }
 };
 
+
+/// The max pool: `Q(pooling_nchw_max(pad(DQ(x), -inf)))` where the
+/// DequantizeLinear and QuantizeLinear share one scale and zero point
+/// (tools/quantize_onnx_int8.py makes them), rewritten as an int8 max pool on
+/// the codes themselves:
+///
+///   %p = pooling_nhwc_max(pad(transpose(addi(%x, -128)), -128), fill -128)
+///   %q' = addi(transpose(%p) to NCHW, -128)
+///
+/// Exact, with no rounding anywhere: max commutes with a monotone
+/// dequantization, and with equal parameters `Q(DQ(c)) == c` for every code
+/// (the f32 round trip lands within an ulp of `c` and `roundeven` takes it
+/// back). The `-inf` padding never wins because every window holds at least
+/// one real element (the pad is narrower than the kernel), so padding with
+/// the smallest code, -128 in the signed encoding, is the same result. And
+/// signed max over `u8 - 128` orders exactly like unsigned max over `u8`.
+struct FuseInt8MaxPool : public OpRewritePattern<linalg::GenericOp> {
+  using OpRewritePattern::OpRewritePattern;
+
+  LogicalResult matchAndRewrite(linalg::GenericOp quant,
+                                PatternRewriter &rewriter) const override {
+    double outputScale = 0.0;
+    int64_t outputZeroPoint = 0;
+    if (!matchQuant(quant, outputScale, outputZeroPoint)) {
+      return failure();
+    }
+    auto pool =
+        quant.getDpsInputs()[0].getDefiningOp<linalg::PoolingNchwMaxOp>();
+    if (!pool || !pool->hasOneUse()) {
+      return failure();
+    }
+    // The init has to be -inf: anything else is a different reduction.
+    auto initFill = pool.getDpsInits()[0].getDefiningOp<linalg::FillOp>();
+    APFloat initValue(0.0f);
+    if (!initFill ||
+        !matchPattern(initFill.getInputs()[0], m_ConstantFloat(&initValue)) ||
+        !initValue.isInfinity() || !initValue.isNegative()) {
+      return failure();
+    }
+    auto pad = pool.getDpsInputs()[0].getDefiningOp<tensor::PadOp>();
+    if (!pad || !pad->hasOneUse() || !pad.getLow().empty() ||
+        !pad.getHigh().empty()) {
+      return failure();
+    }
+    Value fill = pad.getConstantPaddingValue();
+    APFloat padValue(0.0f);
+    if (!fill || !matchPattern(fill, m_ConstantFloat(&padValue)) ||
+        !padValue.isInfinity() || !padValue.isNegative()) {
+      return failure();
+    }
+    std::optional<Dequant> dequant = matchDequant(pad.getSource());
+    if (!dequant || dequant->scale != outputScale ||
+        dequant->zeroPoint != outputZeroPoint) {
+      return failure();
+    }
+    auto sourceType = cast<RankedTensorType>(dequant->source.getType());
+    auto resultType = cast<RankedTensorType>(quant.getResult(0).getType());
+    if (sourceType.getRank() != 4 || !sourceType.hasStaticShape() ||
+        sourceType.getDimSize(0) != 1 || !resultType.hasStaticShape()) {
+      return failure();
+    }
+    ArrayRef<int64_t> low = pad.getStaticLow();
+    ArrayRef<int64_t> high = pad.getStaticHigh();
+    if (low[0] != 0 || low[1] != 0 || high[0] != 0 || high[1] != 0) {
+      return failure();
+    }
+    auto windowType = cast<RankedTensorType>(pool.getDpsInputs()[1].getType());
+    if (windowType.getRank() != 2 || !windowType.hasStaticShape()) {
+      return failure();
+    }
+    // Every window must hold a real element, or a -inf window would come out
+    // as the smallest code rather than -inf (and then saturate).
+    for (int64_t axis = 0; axis < 2; ++axis) {
+      int64_t kernel = windowType.getDimSize(axis);
+      if (low[2 + axis] >= kernel || high[2 + axis] >= kernel) {
+        return failure();
+      }
+    }
+
+    Location loc = quant.getLoc();
+    const int64_t toNhwc[] = {0, 2, 3, 1};
+    const int64_t toNchw[] = {0, 3, 1, 2};
+    Value nhwc = emitTranspose(rewriter, loc,
+                               emitShift(rewriter, loc, dequant->source),
+                               toNhwc);
+    Type i8 = rewriter.getI8Type();
+    Value smallest = arith::ConstantOp::create(
+        rewriter, loc, rewriter.getIntegerAttr(i8, -128));
+    SmallVector<OpFoldResult> padLow = {
+        rewriter.getIndexAttr(0), rewriter.getIndexAttr(low[2]),
+        rewriter.getIndexAttr(low[3]), rewriter.getIndexAttr(0)};
+    SmallVector<OpFoldResult> padHigh = {
+        rewriter.getIndexAttr(0), rewriter.getIndexAttr(high[2]),
+        rewriter.getIndexAttr(high[3]), rewriter.getIndexAttr(0)};
+    auto nhwcType = cast<RankedTensorType>(nhwc.getType());
+    auto paddedType = RankedTensorType::get(
+        {1, nhwcType.getDimSize(1) + low[2] + high[2],
+         nhwcType.getDimSize(2) + low[3] + high[3], nhwcType.getDimSize(3)},
+        i8);
+    Value padded = tensor::PadOp::create(rewriter, loc, paddedType, nhwc,
+                                         padLow, padHigh, smallest)
+                       .getResult();
+    SmallVector<int64_t> outShape = {1, resultType.getDimSize(2),
+                                     resultType.getDimSize(3),
+                                     resultType.getDimSize(1)};
+    Value outEmpty = tensor::EmptyOp::create(rewriter, loc, outShape, i8);
+    Value outInit =
+        linalg::FillOp::create(rewriter, loc, smallest, outEmpty).getResult(0);
+    Value window = tensor::EmptyOp::create(rewriter, loc,
+                                           windowType.getShape(), i8);
+    Value pooled =
+        linalg::PoolingNhwcMaxOp::create(
+            rewriter, loc, TypeRange{outInit.getType()},
+            ValueRange{padded, window}, ValueRange{outInit},
+            pool.getStridesAttr(), pool.getDilationsAttr())
+            .getResult(0);
+    Value back = emitShift(rewriter, loc,
+                           emitTranspose(rewriter, loc, pooled, toNchw));
+    rewriter.replaceOp(quant, back);
+    return success();
+  }
+};
+
 struct RocketFuseInt8ResidualAddPass
     : public PassWrapper<RocketFuseInt8ResidualAddPass, OperationPass<>> {
   MLIR_DEFINE_EXPLICIT_INTERNAL_INLINE_TYPE_ID(RocketFuseInt8ResidualAddPass)
@@ -418,6 +546,37 @@ struct RocketFuseInt8ResidualAddPass
 };
 
 static PassRegistration<RocketFuseInt8ResidualAddPass> reg;
+
+struct RocketFuseInt8MaxPoolPass
+    : public PassWrapper<RocketFuseInt8MaxPoolPass, OperationPass<>> {
+  MLIR_DEFINE_EXPLICIT_INTERNAL_INLINE_TYPE_ID(RocketFuseInt8MaxPoolPass)
+
+  StringRef getArgument() const final { return "rocket-fuse-int8-max-pool"; }
+  StringRef getDescription() const final {
+    return "Rewrites Q(max_pool(pad(DQ(x), -inf))) with shared quantization "
+           "into an int8 NHWC max pool on the codes, which the Rocket int8 "
+           "max-pool matcher claims.";
+  }
+
+  void getDependentDialects(DialectRegistry &registry) const final {
+    registry.insert<arith::ArithDialect, linalg::LinalgDialect,
+                    tensor::TensorDialect>();
+  }
+
+  void runOnOperation() final {
+    MLIRContext *context = &getContext();
+    RewritePatternSet patterns(context);
+    patterns.add<FuseInt8MaxPool>(context);
+    GreedyRewriteConfig config;
+    config.enableFolding(false);
+    if (failed(applyPatternsGreedily(getOperation(), std::move(patterns),
+                                     config))) {
+      return signalPassFailure();
+    }
+  }
+};
+
+static PassRegistration<RocketFuseInt8MaxPoolPass> maxPoolReg;
 
 } // namespace
 } // namespace mlir::iree_compiler::IREE::HAL
