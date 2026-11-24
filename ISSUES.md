@@ -1917,6 +1917,112 @@ identical arithmetic, because `K` becomes `Cin` and charges CBUF feature
 residency while `N` becomes `Cout` and charges none. The up-projection pays
 instead on the way out, 31 ms of `compact` per inference against 7.5.
 
+## P10 (S3) — IREE compiles the CPU softmax with a 4-wide vector tile; a 16-wide tile is bit-identical and 1.39x faster, and nothing in this stack can set it
+
+Found 2026-11-24 profiling BLIP fp16 at `main` `74787f0` on `orangepi`
+(governor `performance`, NPU 600 MHz, `--task_topology_cpu_ids=4,5,6,7`).
+BLIP runs 825 ms against 5305 ms `--no-offload`, and its CPU half is now the
+larger half: **[verified]** `ROCKET_PROFILE` puts `outside` (CPU dispatches) at
+~512 ms per inference against `wait.npu` 283, `record` 46, `pack.input` 26,
+`compact` 27.
+
+**Where the CPU time is.** **[verified]** `perf record -e cycles:u
+--user-callchains` on a system-linked build (the recipe in the `rocket-compiler
+compile --iree-flag` help), A76 counter only:
+
+| CPU dispatch group | share of A76 cycles |
+|---|---|
+| vision self-attention, 577 tokens | ~70% |
+| ↳ `softmax_12x577x577xf32` | **24.0%** |
+| ↳ `batch_matmul_12x577x577x64` (QKᵀ) | 19.5% |
+| ↳ `batch_matmul_12x577x64x577` (AV) | 18.7% |
+| ↳ head split / broadcast reshapes | ~8% |
+| vision GELU (the f32 `erf` alone 7.5%) | 13.5% |
+| LM head `16x30524x768` (refused, `N` > 4096) | 3.2% |
+| cross-attention | ~2.7% |
+| every LayerNorm (252 of the 621 CPU sites) | ~2.6% |
+| the whole 16-token text side | ~0.3% |
+
+Site counts mislead here: LayerNorm is 40% of the CPU *sites* and 3% of the
+CPU *time*.
+
+**Why the softmax is slow.** **[verified]** The dispatch reads f16 scores,
+scales by 1/8, runs `linalg.softmax` in f32 along the 577-wide row, and
+truncates to f16. IREE (`a869dc3`, unpatched) configures the decomposition
+with `vector_inner_parallel = [0, 0, 4]` and `vector_reduction = [0, 0, 4]`
+(8 for the sum): one 4-wide f32 vector per loop iteration. The `exp` is a
+vectorized `fmla` polynomial, not a libm call, but one vector per iteration
+makes every iteration one long dependent chain. `perf annotate` on the
+standalone kernel shows IPC below 1, about 44 cycles per 4 elements. Three
+further costs, read off the assembly:
+
+- `exp` is computed **twice**, once in the sum pass and again in the
+  normalize pass (45% and 48% of the kernel's cycles; the max pass is 6%).
+- The normalize pass divides with a vector `fdiv` per element instead of
+  multiplying by a reciprocal.
+- With FP reassociation off (IREE's global default is `O0`), the sum is 8
+  dependent scalar `fadd`s per iteration.
+
+**Standalone kernel, `12x577x577`.** **[verified]** Median ms, 4×A76 / 1×A76.
+The lowering config was edited between `--compile-to=executable-configurations`
+and `--compile-from=executable-configurations`. Every variant has the same
+4.1e-05 error against an f64 reference.
+
+| variant | 4×A76 | 1×A76 | output vs default |
+|---|---|---|---|
+| IREE default (tile 4) | 9.96 | 38.2 | — |
+| tile 8 | 8.98 | 34.9 | bit-identical |
+| **tile 16** | **7.23** | **27.5** | **bit-identical** |
+| tile 32 | 6.93 | 26.3 | bit-identical |
+| tile 32 + reassociated sum | 6.31 | 23.6 | 1.5e-05 (one f16 ulp) |
+
+**Flags that do not fix it.** **[verified]**
+`--iree-llvmcpu-use-decompose-softmax-fuse=false` produces a byte-identical
+binary (codegen's tile-and-fuse recomputes the `exp` anyway).
+`--iree-llvmcpu-target-cpu=cortex-a76` changes nothing.
+`--iree-llvmcpu-reassociate-fp-reductions=true` (the same binary as
+`--iree-opt-level=O2` for this dispatch) is 7% on the kernel and **826 -> 817
+ms on BLIP end to end** (the `--no-offload` arm 4990 -> 5006), so not worth
+taking alone.
+
+**The attention matmuls do not share the problem.** **[verified]** QKᵀ and AV
+(f16 in, f32 accumulate) under IREE's default (`DoubleTilingExpert`, 8×8
+register tile, K step 4) run 8.16 / 8.24 ms at 4×A76 and 31.1 / 29.7 ms on
+one core: ~16.4 GFLOP/s, about 43% of the A76's f32 NEON peak, scaling 3.8x.
+That default beat every alternative tried. Data tiling is +32%, and data
+tiling with microkernels is +35% (QK) / +88% (AV): this A76 has `asimdhp` and
+`asimddp` but **not `fhm`**, so there is no f16→f32 widening-FMA microkernel
+to win with. Tiles 4×16, 16×4, 8×8 k1/k8 and 6×16 were all slower, and 8×12
+was 5x slower (register spill). The fused `iree_linalg_ext.attention` op is
+correct (4.8e-4 vs f64) but **1902 ms** at 4×A76 against ~26 ms for QKᵀ +
+softmax + AV unfused, and nothing in this IREE raises the three ops into it
+anyway. So the softmax tile is the only CPU code-generation lever found in
+BLIP's attention. Offloading attention is C15's question, and it lost there.
+
+**What a fix is worth.** Tile 16 saves ~2.7 ms per call × 12 vision layers ≈
+**33 ms per BLIP inference (~4%)**. The same dispatch shape appears in every
+transformer in the survey (ViT-B/16, ViT-L/16, BERT at 128 and 384), whose
+softmax shares have not been measured.
+
+**Ways to land it, none built:**
+
+1. A compiler hook that pins the softmax dispatch's lowering config: IREE's
+   tuning-spec mechanism (`--iree-codegen-tuning-spec-path`) or a
+   `compilation_info` attribute attached before configuration. Nothing in
+   `rocket-compiler` or the plugin sets CPU lowering configs today, so this
+   would be the first. Wherever it lands, it must apply to both arms: the
+   `--no-offload` baseline must get the same CPU softmax, or the survey ratio
+   stops being like-for-like.
+2. Upstream: change IREE's CPU heuristic so the softmax decomposition's
+   parallel vector size is not the native vector width. That benefits every
+   CPU target, at the cost of carrying the change until a rebase.
+
+**To reproduce:** the standalone MLIR is one `linalg.softmax` between an
+`extf`/`mulf` generic and a `truncf` generic, which is exactly the source
+`--iree-hal-dump-executable-sources-to` shows for BLIP's
+`main_graph$async_dispatch_27`. Benchmark it with `iree-benchmark-module
+--device=local-task --task_topology_cpu_ids=4,5,6,7`.
+
 ## Resolved
 
 What was settled and how, newest first, in place of the narratives — those are
