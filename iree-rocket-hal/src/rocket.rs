@@ -19,6 +19,7 @@ pub mod regcmd;
 // `regcmd` grab-bag. `regcmd` itself now holds only what all of them
 // share (see its module doc comment).
 pub mod activation;
+pub mod bn_plane;
 pub mod elementwise;
 pub mod pooling;
 #[allow(
