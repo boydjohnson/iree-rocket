@@ -1066,7 +1066,8 @@ The coefficient packer that gated it landed in #92 at 5.4-10.7x, taking
 `P^T` to 0.048 ms a head, and C15 has now been re-measured on it: the
 offloaded arm goes 302 -> 266 ms against a 205 ms default, so **36 of its
 97 ms came back and it still loses by 61**. Offloading the whole attention
-core buys about 2 ms of CPU time. So lever 2's epilogue is free and its gate
+core buys no measurable CPU time at all -- `outside` moves by -0.02 ms an
+inference taken as marginal cost. So lever 2's epilogue is free and its gate
 is open, and the fused block it would sit inside is still not worth
 assembling -- what blocks it is `record`, `compact` and `wait.npu` per
 dispatch, which is COMPILER_ROADMAP §4's target and not a softmax problem.
