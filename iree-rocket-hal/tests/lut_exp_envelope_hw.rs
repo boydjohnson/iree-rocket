@@ -47,7 +47,7 @@ use std::{fs::OpenOptions, mem, os::unix::io::AsRawFd, ptr, time::Instant};
 mod dispatch;
 
 use iree_rocket_hal::rocket::{
-    activation::{LutBuffers, LutShape, LutTable, build_lut_regcmd},
+    activation::{LutBuffers, LutShape, LutTable, build_lut_q15_regcmd, build_lut_regcmd},
     builders::{Bits, Register, RegisterMeta, dpu::DpuEwCfg},
     device::{Buffer, close_bo, fini_bo, prep_bo, submit},
 };
@@ -188,6 +188,86 @@ fn run_int8_exp_with_slope(
 
         if dispatch::is_device_timeout(elapsed) {
             let strict = dispatch::report("int8 exp envelope", elapsed);
+            assert!(!strict, "killed dispatch under ROCKET_STRICT_DISPATCH");
+            return None;
+        }
+        Some(out)
+    }
+}
+
+/// Runs the int8 `exp` LUT with the Q15 integer written straight to memory
+/// as `int16` -- `build_lut_q15_regcmd`. One code per pixel, one `i16` back.
+fn run_int8_exp_q15(input_scale: f32, codes: &[i8], table: &LutTable) -> Option<Vec<i16>> {
+    let width = codes.len() as u32;
+    let file = OpenOptions::new()
+        .read(true)
+        .write(true)
+        .open(DEVICE_PATH)
+        .expect("failed to open RK3588 NPU device");
+    let fd = file.as_raw_fd();
+
+    unsafe {
+        let buf_in = Buffer::new(fd, BUFFER_SIZE, &file);
+        ptr::write_bytes(buf_in.host_ptr, 0, BUFFER_SIZE);
+        for (pixel, &code) in codes.iter().enumerate() {
+            ptr::write(buf_in.host_ptr.add(pixel * FEATURE_ATOM_BYTES), code as u8);
+        }
+        let buf_out = Buffer::new(fd, BUFFER_SIZE, &file);
+        ptr::write_bytes(buf_out.host_ptr, 0x5A, BUFFER_SIZE);
+
+        let cmds = build_lut_q15_regcmd(
+            &LutShape {
+                width,
+                height: 1,
+                channels: 1,
+                input_zero_point: 0x80,
+                output_zero_point: 0x80,
+                input_scale,
+                // Ignored by this builder; the converter sits at identity.
+                output_scale: 1.0,
+            },
+            &LutBuffers {
+                input_addr: buf_in.dma_address,
+                output_addr: buf_out.dma_address,
+            },
+            *table,
+        );
+        let buf_cmd = Buffer::new(
+            fd,
+            (cmds.len() * mem::size_of::<u64>()).next_multiple_of(4096),
+            &file,
+        );
+        ptr::write_bytes(buf_cmd.host_ptr, 0, buf_cmd.size);
+        let slots = std::slice::from_raw_parts_mut(buf_cmd.host_ptr as *mut u64, cmds.len());
+        for (slot, cmd) in slots.iter_mut().zip(&cmds) {
+            *slot = cmd.0;
+        }
+        for handle in [buf_in.handle, buf_out.handle, buf_cmd.handle] {
+            fini_bo(fd, handle).ok();
+        }
+        let started = Instant::now();
+        submit(
+            fd,
+            buf_cmd.dma_address,
+            cmds.len() as u32,
+            &[buf_cmd.handle, buf_in.handle],
+            &[buf_out.handle],
+        )
+        .expect("SUBMIT ioctl failed");
+        prep_bo(fd, buf_out.handle, 2_000_000_000).unwrap_or_else(|error| {
+            panic!("the Q15 exp LUT did not complete (first use of int16 output): {error}")
+        });
+        let elapsed = started.elapsed();
+        let out: Vec<i16> = (0..codes.len())
+            .map(|pixel| {
+                ptr::read_unaligned(buf_out.host_ptr.add(pixel * FEATURE_ATOM_BYTES) as *const i16)
+            })
+            .collect();
+        for handle in [buf_in.handle, buf_out.handle, buf_cmd.handle] {
+            close_bo(fd, handle).ok();
+        }
+        if dispatch::is_device_timeout(elapsed) {
+            let strict = dispatch::report("Q15 exp", elapsed);
             assert!(!strict, "killed dispatch under ROCKET_STRICT_DISPATCH");
             return None;
         }
@@ -405,4 +485,167 @@ fn the_ew_relu_is_inert_on_a_lut_task() {
          clamp its own negative extrapolation -- which would be the better answer"
     );
     println!("  the EW ReLU is inert on a LUT task: {bypassed:?} either way");
+}
+
+// ===========================================================================
+// Tuning the tail against a real attention distribution.
+// ===========================================================================
+//
+// §3.3 left one judgement open: which `(input_scale, slope)` pair to use.
+// The two error terms pull against each other -- the int8 input's
+// quantization wants a *fine* scale, since a code step of `s` puts a
+// relative error of up to `s/2` on every weight, while the table's `-5`
+// domain edge wants a *coarse* one, since anything past the reach of
+// `-128 * s` is approximated by the ramp. Picking the pair at the domain's
+// corner, as §3.3 did, is not the same as picking it where the data is.
+//
+// `fixtures/vit_b_16_attention_rows.f32` is 64 rows of real pre-softmax
+// attention logits, already reduced by their own row maximum: torchvision's
+// ViT-B/16 at IMAGENET1K_V1 weights on `mlir-spike/Unicorn.jpg`, scores
+// recomputed from each block's `in_proj_weight` rather than read from
+// `output_attentions` (which gives probabilities, not logits), sampled every
+// (12 layers x 12 heads x 197 rows)/64'th row. Its shape is what makes the
+// choice: median `-3.44`, and **28% of all entries fall past the table's
+// `-5` edge**, 8.7% past `-8`, 1.4% past `-16`.
+//
+// A host sweep over that fixture under the measured LUT shape puts the
+// optimum at `input_scale = 1/20`, and the curve is shallow around it:
+//
+// ```text
+//   1/s   reach   slope   d err %   TV %    flat-clamp TV %
+//    24    -5.3    3315      1.98   2.13
+//    20    -6.4     789      0.70   1.11              6.69
+//    16    -8.0     368      1.38   1.60              6.77
+//    12   -10.7     195      3.51   3.25
+// ```
+//
+// TV is total variation -- half the L1 distance between the LUT's softmax
+// and an exact one, which bounds how far the attention output can move.
+// Relative error on an individual weight is not a useful figure here: it is
+// dominated by weights of order 1e-9 whose absolute error is nil.
+
+/// The 64 real rows, as `(rows, keys)`.
+fn attention_rows() -> (Vec<f32>, usize, usize) {
+    const RAW: &[u8] = include_bytes!("fixtures/vit_b_16_attention_rows.f32");
+    const ROWS: usize = 64;
+    let values: Vec<f32> = RAW
+        .chunks_exact(4)
+        .map(|word| f32::from_le_bytes([word[0], word[1], word[2], word[3]]))
+        .collect();
+    let keys = values.len() / ROWS;
+    assert_eq!(keys, 197, "ViT-B/16 has 197 tokens");
+    (values, ROWS, keys)
+}
+
+/// Half the L1 distance between two distributions.
+fn total_variation(got: &[f32], want: &[f32]) -> f32 {
+    0.5 * got
+        .iter()
+        .zip(want)
+        .map(|(a, b)| (a - b).abs())
+        .sum::<f32>()
+}
+
+/// The tuned pair, measured end to end on real attention logits.
+///
+/// Every value the device touches is real: the input codes come from
+/// ViT-B/16's own logits, the `exp` is the hardware's, and only the
+/// denominator and the division happen on the host (which is where §4 puts
+/// them anyway, pending the reciprocal). The output is the table's Q15
+/// integer read back through `build_lut_q15_regcmd`, because an int8 output
+/// quantizes a probability to 1/128 and would swamp the figure being
+/// measured.
+///
+/// The bound is the host sweep's prediction with room for the hardware to
+/// differ from the model of it: 1.11% predicted, asserted under 2%.
+#[test]
+#[ignore = "requires an RK3588 NPU at /dev/accel/accel0"]
+fn the_tuned_pair_reaches_one_percent_on_real_attention_rows() {
+    let input_scale = 1.0 / 20.0;
+    let (rows, row_count, keys) = attention_rows();
+    let table = LutTable::exp_with_decaying_tail(input_scale);
+    assert_eq!(
+        (table.le_slope_uflow_scale, table.le_slope_uflow_shift),
+        (789, 14),
+        "the pair the host sweep picked"
+    );
+
+    let mut worst = 0.0f32;
+    let mut total = 0.0f32;
+    let mut measured = 0usize;
+    for row in 0..row_count {
+        let logits = &rows[row * keys..(row + 1) * keys];
+        let codes: Vec<i8> = logits
+            .iter()
+            .map(|&x| (x / input_scale).round().clamp(-128.0, 0.0) as i8)
+            .collect();
+        let Some(counts) = run_int8_exp_q15(input_scale, &codes, &table) else {
+            continue;
+        };
+        measured += 1;
+
+        // Q15 integers, so the 32768 cancels in the ratio and never has to
+        // be divided out at all -- which is the whole point of §9's plan.
+        let sum: f32 = counts.iter().map(|&c| f32::from(c)).sum();
+        assert!(sum > 0.0, "row {row} summed to zero");
+        let got: Vec<f32> = counts.iter().map(|&c| f32::from(c) / sum).collect();
+
+        let exact: Vec<f32> = logits.iter().map(|&x| x.exp()).collect();
+        let exact_sum: f32 = exact.iter().sum();
+        let want: Vec<f32> = exact.iter().map(|&value| value / exact_sum).collect();
+
+        let tv = total_variation(&got, &want);
+        worst = worst.max(tv);
+        total += tv;
+    }
+    assert!(measured > 0, "no row was measured");
+    let mean = total / measured as f32;
+    println!(
+        "  {measured} real ViT-B/16 rows at input_scale 1/20, slope (789, 14): mean total \
+         variation {:.2}%, worst {:.2}%",
+        100.0 * mean,
+        100.0 * worst
+    );
+    assert!(
+        mean < 0.02,
+        "mean total variation {:.3}% against an exact softmax; the host sweep over the same \
+         fixture predicted 1.11%, so a figure far above this is the hardware departing from \
+         the piecewise model §3.3 was tuned against",
+        100.0 * mean
+    );
+}
+
+/// The flat clamp on the same rows, for the comparison that justifies the
+/// slope at all. Reported, not asserted: it is the arm this design does not
+/// use.
+#[test]
+#[ignore = "requires an RK3588 NPU at /dev/accel/accel0"]
+fn the_flat_clamp_on_real_attention_rows() {
+    let input_scale = 1.0 / 20.0;
+    let (rows, row_count, keys) = attention_rows();
+    let mut total = 0.0f32;
+    let mut measured = 0usize;
+    for row in 0..row_count {
+        let logits = &rows[row * keys..(row + 1) * keys];
+        let codes: Vec<i8> = logits
+            .iter()
+            .map(|&x| (x / input_scale).round().clamp(-128.0, 0.0) as i8)
+            .collect();
+        let Some(counts) = run_int8_exp_q15(input_scale, &codes, &LutTable::exp()) else {
+            continue;
+        };
+        measured += 1;
+        let sum: f32 = counts.iter().map(|&c| f32::from(c)).sum();
+        let got: Vec<f32> = counts.iter().map(|&c| f32::from(c) / sum).collect();
+        let exact: Vec<f32> = logits.iter().map(|&x| x.exp()).collect();
+        let exact_sum: f32 = exact.iter().sum();
+        let want: Vec<f32> = exact.iter().map(|&value| value / exact_sum).collect();
+        total += total_variation(&got, &want);
+    }
+    assert!(measured > 0);
+    println!(
+        "  the same {measured} rows with the shipped flat clamp: mean total variation {:.2}% \
+         (the host sweep predicted 6.69%)",
+        100.0 * total / measured as f32
+    );
 }

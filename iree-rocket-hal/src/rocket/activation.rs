@@ -893,6 +893,296 @@ pub fn build_lut_regcmd(shape: &LutShape, bufs: &LutBuffers, table: LutTable) ->
     cmds
 }
 
+/// A standalone LUT pass whose output is the table's own **Q15 integer**,
+/// written as `int16` with the output converter at identity.
+///
+/// SOFTMAX.md §9's remaining question, made concrete. Probe S3 measured
+/// that `OUT_CVT` is an integer multiply-shift, so a Q15 entry cannot
+/// become a fraction inside the task: at `(1, 15)` the entry for `exp(0)`
+/// survives as 1.0 and every smaller one underflows to 0. An int8 output
+/// is worse still -- 128 levels for a probability in `[0, 1]`, which is
+/// coarser than the tail this design has to resolve.
+///
+/// Carrying the Q15 integer instead costs nothing arithmetically, because
+/// softmax is a ratio: a constant 32768 in both the numerator and the
+/// denominator cancels. §2.2's sum reduction is a convolution, and the
+/// DPU's int32 accumulator has room for `N` fifteen-bit addends.
+///
+/// Differences from [`build_lut_regcmd`], which are the whole content:
+/// `out_precision` is 1 ("Integer 16bit"), `BS_OW_CFG.size_e` is 1 (the
+/// value `conv.rs`'s `bs_ow_size_e` gives every non-accumulator two-byte
+/// rung), and `OUT_CVT` is `(offset 0, scale 1, shift 0)`. The input side
+/// is untouched -- still int8 at `shape.input_scale`, still the same table
+/// and the same `lut_bn_mul`. `shape.output_scale` and
+/// `shape.output_zero_point` are **ignored**.
+///
+pub fn build_lut_q15_regcmd(shape: &LutShape, bufs: &LutBuffers, table: LutTable) -> Vec<RegCmd> {
+    assert!(
+        shape.width > 0 && shape.height > 0 && shape.channels > 0,
+        "build_lut_q15_regcmd: width, height, and channels must be nonzero"
+    );
+
+    const FEATURE_ATOMIC_SIZE: u32 = 16;
+
+    let task_channels = shape
+        .channels
+        .max(FEATURE_ATOMIC_SIZE)
+        .next_multiple_of(FEATURE_ATOMIC_SIZE);
+    // `DPU_DST_SURF_STRIDE` and `DPU_SURFACE_ADD` count 16-byte feature
+    // atoms, not bytes, so a surface is `width * height` atoms and the
+    // channel count does not enter. This used to multiply by
+    // `task_channels`, which is a no-op for a single-surface cube and 16x
+    // too large for every other one: at `channels = 32` the second surface
+    // was addressed 8 KiB out and never written at all. Every LUT test in
+    // this crate used `channels <= 16` (`conv_then_lut_hw.rs` uses 1), so
+    // nothing exercised it until ROADMAP Phase 1 needed a real tensor's
+    // channel count. `tests/lut_multi_surface_hw.rs` is the gate.
+    //
+    // `elementwise.rs` (`output_area`, gated across 2 and 8 surfaces by
+    // `ew_binary_hw.rs`) and `pooling.rs` (`(width * ATOMIC_K_SIZE *
+    // height) / FEATURE_ATOMIC_SIZE`, both constants 16, capture-derived)
+    // are the two independent statements of the same rule, and a full
+    // register diff of this builder against `build_unary_regcmd` at
+    // `channels = 32` showed identical register *sets* with this the only
+    // unexplained value difference.
+    let surface_stride = shape.width * shape.height;
+    // No output zero point and no output scale: the point of this
+    // variant is that the table's own Q15 integer reaches memory
+    // untouched, so the converter sits at identity.
+    let out_offset = 0;
+    let (bn_mul_operand, bn_mul_shift) = lut_bn_mul(shape.input_scale, table.bn_scale_k);
+    let real_zero_point = shape.input_zero_point.wrapping_sub(0x80) as i8 as i32;
+    assert!(
+        lut_bn_alu_supports_zero_point(real_zero_point),
+        "build_lut_q15_regcmd: only input_zero_point values whose decoded signed zero point is one of \
+         -128, -2, 0, or 127 are supported for now; got raw input_zero_point={} (decoded {})",
+        shape.input_zero_point,
+        real_zero_point
+    );
+    let bn_alu_operand = lut_bn_alu(real_zero_point, bn_mul_operand);
+    let (out_cvt_scale, out_cvt_shift) = (1, 0);
+
+    let mut cmds = Vec::new();
+
+    cmds.push(
+        Register::<DpuSPointer>::new()
+            .pointer_pp_mode(Bits::new(1))
+            .executer_pp_en(Bits::new(1))
+            .pointer_pp_en(Bits::new(1))
+            .build(),
+    );
+    cmds.push(
+        Register::<DpuRdmaSPointer>::new()
+            .pointer_pp_mode(Bits::new(1))
+            .executer_pp_en(Bits::new(1))
+            .pointer_pp_en(Bits::new(1))
+            .build(),
+    );
+
+    cmds.push(
+        Register::<DpuFeatureModeCfg>::new()
+            .flying_mode(Bits::new(1))
+            .output_mode(Bits::new(2))
+            .burst_len(Bits::new(15))
+            .build(),
+    );
+    cmds.push(
+        Register::<DpuDataFormat>::new()
+            .out_precision(Bits::new(1))
+            .bn_mul_shift_value_neg(Bits::new(bn_mul_shift))
+            .build(),
+    );
+    cmds.push(zero::<DpuOffsetPend>());
+    cmds.push(
+        Register::<DpuDstBaseAddr>::new()
+            .dst_base_addr(Bits::new(bufs.output_addr))
+            .build(),
+    );
+    cmds.push(
+        Register::<DpuDstSurfStride>::new()
+            .dst_surf_stride(Bits::new(surface_stride))
+            .build(),
+    );
+    cmds.push(
+        Register::<DpuDataCubeWidth>::new()
+            .width(Bits::new(shape.width - 1))
+            .build(),
+    );
+    cmds.push(
+        Register::<DpuDataCubeHeight>::new()
+            .height(Bits::new(shape.height - 1))
+            .build(),
+    );
+    cmds.push(zero::<DpuDataCubeNotchAddr>());
+    cmds.push(
+        Register::<DpuDataCubeChannel>::new()
+            .orig_channel(Bits::new(shape.channels - 1))
+            .channel(Bits::new(task_channels - 1))
+            .build(),
+    );
+
+    cmds.push(
+        Register::<DpuBsCfg>::new()
+            .bs_bypass(Bits::new(1))
+            .bs_alu_bypass(Bits::new(1))
+            .bs_mul_bypass(Bits::new(1))
+            .bs_relu_bypass(Bits::new(1))
+            .build(),
+    );
+    cmds.push(zero::<DpuBsAluCfg>());
+    cmds.push(zero::<DpuBsMulCfg>());
+    cmds.push(zero::<DpuBsReluxCmpValue>());
+    cmds.push(
+        Register::<DpuBsOwCfg>::new()
+            // `conv.rs`'s `bs_ow_size_e` else-branch, the value every
+            // non-accumulator two-byte rung uses.
+            .size_e_0(Bits::new(1))
+            .size_e_1(Bits::new(1))
+            .size_e_2(Bits::new(1))
+            .od_bypass(Bits::new(1))
+            .build(),
+    );
+    cmds.push(zero::<DpuBsOwOp>());
+    cmds.push(
+        Register::<DpuWdmaSize0>::new()
+            .channel_wdma(Bits::new(task_channels - 1))
+            .build(),
+    );
+    cmds.push(
+        Register::<DpuWdmaSize1>::new()
+            .height_wdma(Bits::new(shape.height - 1))
+            .width_wdma(Bits::new(shape.width - 1))
+            .build(),
+    );
+
+    cmds.push(
+        Register::<DpuBnCfg>::new()
+            .bn_alu_algo(Bits::new(2))
+            .bn_alu_src(Bits::new(0))
+            .bn_relu_bypass(Bits::new(1))
+            .bn_mul_bypass(Bits::new(0))
+            .bn_alu_bypass(Bits::new(0))
+            .bn_bypass(Bits::new(0))
+            .build(),
+    );
+    cmds.push(
+        Register::<DpuBnAluCfg>::new()
+            .bn_alu_operand(Bits::new(bn_alu_operand))
+            .build(),
+    );
+    cmds.push(
+        Register::<DpuBnMulCfg>::new()
+            .bn_mul_operand(Bits::new(bn_mul_operand))
+            .bn_mul_shift_value(Bits::new(bn_mul_shift))
+            .bn_mul_src(Bits::new(0))
+            .bn_truncate_src(Bits::new(0))
+            .build(),
+    );
+    cmds.push(zero::<DpuBnReluxCmpValue>());
+
+    cmds.push(
+        Register::<DpuEwCfg>::new()
+            .ew_relu_bypass(Bits::new(1))
+            .ew_op_cvt_bypass(Bits::new(1))
+            .ew_lut_bypass(Bits::new(0))
+            .ew_op_bypass(Bits::new(table.ew_op_bypass as u32))
+            .ew_bypass(Bits::new(0))
+            .build(),
+    );
+    cmds.push(zero::<DpuEwCvtOffsetValue>());
+    cmds.push(
+        Register::<DpuEwCvtScaleValue>::new()
+            .ew_op_cvt_scale(Bits::new(1))
+            .build(),
+    );
+    cmds.push(zero::<DpuEwReluxCmpValue>());
+
+    cmds.push(
+        Register::<DpuOutCvtOffset>::new()
+            .out_cvt_offset(Bits::new(out_offset))
+            .build(),
+    );
+    cmds.push(
+        Register::<DpuOutCvtScale>::new()
+            .out_cvt_scale(Bits::new(out_cvt_scale))
+            .build(),
+    );
+    cmds.push(
+        Register::<DpuOutCvtShift>::new()
+            .out_cvt_shift(Bits::new(out_cvt_shift))
+            .build(),
+    );
+    cmds.push(zero::<DpuEwOpValue0>());
+    cmds.push(zero::<DpuEwOpValue1>());
+    cmds.push(zero::<DpuEwOpValue2>());
+    cmds.push(zero::<DpuEwOpValue3>());
+    cmds.push(zero::<DpuEwOpValue4>());
+    cmds.push(zero::<DpuEwOpValue5>());
+    cmds.push(zero::<DpuEwOpValue6>());
+    cmds.push(zero::<DpuEwOpValue7>());
+    cmds.push(
+        Register::<DpuSurfaceAdd>::new()
+            .surf_add(Bits::new(surface_stride))
+            .build(),
+    );
+    cmds.push(zero::<DpuReserved40c4>());
+
+    push_lut_tables_and_config(&mut cmds, table);
+
+    cmds.push(
+        Register::<DpuRdmaDataCubeWidth>::new()
+            .width(Bits::new(shape.width - 1))
+            .build(),
+    );
+    cmds.push(
+        Register::<DpuRdmaDataCubeHeight>::new()
+            .height(Bits::new(shape.height - 1))
+            .build(),
+    );
+    cmds.push(
+        Register::<DpuRdmaDataCubeChannel>::new()
+            .channel(Bits::new(task_channels - 1))
+            .build(),
+    );
+    cmds.push(
+        Register::<DpuRdmaSrcBaseAddr>::new()
+            .src_base_addr(Bits::new(bufs.input_addr))
+            .build(),
+    );
+    cmds.push(zero::<DpuRdmaBrdmaCfg>());
+    cmds.push(zero::<DpuRdmaBsBaseAddr>());
+    cmds.push(zero::<DpuRdmaNrdmaCfg>());
+    cmds.push(zero::<DpuRdmaBnBaseAddr>());
+    cmds.push(
+        Register::<DpuRdmaErdmaCfg>::new()
+            .erdma_disable(Bits::new(1))
+            .build(),
+    );
+    cmds.push(zero::<DpuRdmaEwBaseAddr>());
+    cmds.push(zero::<DpuRdmaEwSurfStride>());
+    cmds.push(
+        Register::<DpuRdmaFeatureModeCfg>::new()
+            .flying_mode(Bits::new(1))
+            .burst_len(Bits::new(15))
+            .build(),
+    );
+    cmds.push(zero::<DpuRdmaSrcDmaCfg>());
+    cmds.push(zero::<DpuRdmaSurfNotch>());
+    cmds.push(zero::<DpuRdmaPadCfg>());
+    cmds.push(
+        Register::<DpuRdmaWeight>::new()
+            .e_weight(Bits::new(1))
+            .n_weight(Bits::new(1))
+            .b_weight(Bits::new(1))
+            .m_weight(Bits::new(1))
+            .build(),
+    );
+    cmds.push(zero::<DpuRdmaEwSurfNotch>());
+
+    push_kick(&mut cmds, KICK_DPU | KICK_DPU_RDMA);
+    cmds
+}
+
 /// Logical shape for an **fp16** standalone DPU LUT pass.
 ///
 /// [`LutShape`] and [`build_lut_regcmd`] are int8 throughout: neither

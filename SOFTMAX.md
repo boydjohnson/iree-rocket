@@ -150,7 +150,7 @@ and its output has the same shape as its input.
 | row max | PPU max pool, kernel `k x 1`, stride `k x 1` | **exists**, and exact at atol 0 over `N` 8..512 as a tree in one job, probe S2 (`reduce_width_hw.rs`) |
 | max over tiles | `EwBinaryOp::Max` on two width-1 cubes | **exists**; oracle-checked on `planck` by `ew_binary_hw.rs:346` and again across ViT's shapes at `:421`. The `EwBinaryOp::Max` doc comment still says "not measured here yet" -- that comment is stale and worth deleting. Needed only for §6's fused form; §5.1's combine does not use it |
 | subtract the max | BN ALU operand from NRDMA, per channel | **exists**, as of probe S1: flat IEEE `f32` at `channel * 4`, broadcast over the cube, `bn_plane_probe_hw.rs` |
-| `exp` | DPU LUT, `LutTable::exp_with_decaying_tail()` | **int8 only** (S3: the output converter is an integer multiply-shift, so the result is a Q15 integer), and its tail needs the tuned underflow slope of §3.3 or a wide softmax is corrupted outright |
+| `exp` | DPU LUT, `LutTable::exp_with_decaying_tail(1/20)` into `build_lut_q15_regcmd` | **exists**, int8 in and Q15 `int16` out, measured within **1.12%** total variation of an exact softmax on real ViT-B/16 attention rows (§3.4). The shipped flat tail is 6.69% and unusable |
 | square (range extension) | `EwBinaryOp::Mul` with both operands the same buffer | **exists**, `ew_binary_hw.rs`, `ew_square_hw.rs` |
 | row sum | depthwise all-ones **3x3 at stride 3** on a height-1 cube; or the all-ones column on the second matmul (§1.1) | **exists**, and exact at atol 0 over `N` 9..512 as a tree in one job, probe S2 (`reduce_width_hw.rs`). The window is 3x3 and not `1 x k` for the reason in §2.2. The avg-pool route is gone at fp16, §2.1 |
 | reciprocal | `LutTable::reciprocal()` + one Newton step | **exists**, `lut_reciprocal_hw.rs`; domain needs §4 |
@@ -332,15 +332,59 @@ bottom -- **for no extra task**. That is
 `(368, 14)`, and the hardware reaches 0 at exactly `x = -8.0`
 (`the_tuned_tail_decays_to_zero_and_never_below`).
 
-What it costs, and the one judgement left. The ramp averages about `3.4e-3`
-over `[-8, -5]` where `exp`'s true average is about `2.2e-3`, so the error
-per tail key falls from `6.7e-3` to about `1.2e-3` -- 5.6x -- and the
-denominator error at `N = 384` from 2.6 to about 0.46. A *wider* domain is
-not better: at `input_scale = 1/8` the ramp spans `[-16, -5]` and
-overestimates `exp`'s own tail more badly, not less. So `input_scale` and
-the slope trade against each other around `1/16`, and picking the pair
-belongs to a measurement against a real attention distribution rather than
-to a HAL probe. That is S5's, not S3's.
+### 3.4 The pair, tuned against real attention and measured
+
+`input_scale` and the slope trade against each other -- the int8 input's
+quantization wants a fine scale, since a code step of `s` puts up to `s/2`
+of relative error on every weight, while the `-5` domain edge wants a
+coarse one. Picking the pair at the domain's corner is not the same as
+picking it where the data is, so it was picked against real data.
+
+`fixtures/vit_b_16_attention_rows.f32` is 64 rows of real pre-softmax
+attention logits, already reduced by their own row maximum: torchvision's
+ViT-B/16 on one image, scores recomputed from each block's `in_proj_weight`
+(`output_attentions` returns probabilities, not logits), sampled across
+every layer. `tools/fixtures/dump_vit_attention_rows.py` regenerates it.
+Its shape is what decides the pair: median `-3.44`, and **28% of all
+entries fall past the table's `-5` edge**, 8.7% past `-8`, 1.4% past `-16`.
+So the tail is not a corner case in a real transformer -- it is a quarter
+of the data.
+
+The figure of merit is **total variation** against an exact softmax, half
+the L1 distance between the two distributions, which bounds how far the
+attention output can move. Relative error on an individual weight is
+useless here: it is dominated by weights of order 1e-9 whose absolute error
+is nil, and reports ~100% at every scale including the best one.
+
+| `1/s` | reach | slope | denominator err | TV, tuned | TV, flat clamp |
+|---|---|---|---|---|---|
+| 24 | -5.3 | 3315 | 1.98% | 2.13% | |
+| **20** | **-6.4** | **789** | **0.70%** | **1.11%** | 6.69% |
+| 16 | -8.0 | 368 | 1.38% | 1.60% | 6.77% |
+| 12 | -10.7 | 195 | 3.51% | 3.25% | |
+
+**Measured on the board at the chosen pair: 1.12% mean total variation,
+against the host sweep's 1.11%** -- and 6.69% for the flat clamp, against
+its predicted 6.69%. The hardware and the piecewise model agree on both
+arms to a hundredth of a percentage point, which is what makes the sweep
+usable for choosing the pair in the first place
+(`the_tuned_pair_reaches_one_percent_on_real_attention_rows`,
+`the_flat_clamp_on_real_attention_rows`). So the tuned slope is a measured
+**6.0x**, not a predicted one.
+
+Two caveats worth carrying. The optimum is shallow -- `1/16` costs 1.6% and
+`1/24` 2.1% -- so the pair is not delicate, which matters because a
+different model's logits will not have ViT-B/16's exact distribution. And
+the *worst* row of the 64 is 14% rather than 1%: the mean is good and the
+tail of the row distribution is not, so a model-level gate should report
+both.
+
+This also closes §9's Q15 question on the output side. The end-to-end
+figure above is measured through `build_lut_q15_regcmd`, which writes the
+table's Q15 integer to memory as `int16` with the converter at identity --
+`out_precision = 1`, `size_e = 1`, `OUT_CVT (0, 1, 0)`. It worked first
+try, and the 32768 never has to be divided out at all: the sum and the
+division are a ratio, so it cancels.
 
 ### 3.2 The domain arithmetic, corrected
 
@@ -887,23 +931,24 @@ precisely the form this hardware cannot run.
   against the design: the floor is not the binding constraint at all, and
   the real one is worse. `OUT_CVT` is an integer multiply-shift, so the
   `exp` step cannot emit a fractional value -- its output is a Q15 integer.
-* **Whether §7 can run on Q15 probabilities** is still open, but it is no
-  longer the biggest risk: softmax is a ratio, so a constant 32768 cancels
-  between the numerator and the denominator, §2.2's sum reduction is a
-  convolution that could run on the integers, and the DPU's int32
-  accumulator has the headroom a sum of `N` fifteen-bit values needs. What
-  has to be checked is what the BN MUL plane wants for the final divide,
-  since S1 measured that operand as fp16 rather than fixed point.
-* **The `exp` step's accuracy is now the thing to measure, not its
-  viability.** §3.3 took the tail from a flat `6.74e-3` -- fatal -- to a
-  tuned decay worth about `1.2e-3` per tail key, which at `N = 384` is a
-  denominator error of roughly 0.46 against a true value of order 1 to 3.
-  That is a 10-25% error on every weight in the row, so the
-  `(input_scale, slope)` pair has to be chosen against a real attention
-  distribution rather than at the domain's corner. If no pair is good
-  enough, the honest conclusion is that this table cannot serve a wide
-  softmax and the `exp` step needs a different one -- which is a table
-  regeneration, the thing §3 originally said was unnecessary.
+* ~~**Whether §7 can run on Q15 probabilities.**~~ Closed on the output
+  side by §3.4: `build_lut_q15_regcmd` writes the Q15 integer as `int16`
+  with the converter at identity, it worked first try, and the end-to-end
+  softmax measured through it is within 1.12% of exact. The 32768 never
+  has to be divided out, because the sum and the division are a ratio.
+  What is left of this question is only the final divide: S1 measured the
+  BN MUL plane's operand as fp16, so `1/d` has to become an fp16 number
+  somewhere, which is §4's problem rather than this one.
+* ~~**The `exp` step's accuracy.**~~ Measured: 1.12% mean total variation
+  against exact softmax on real ViT-B/16 attention rows, at
+  `input_scale = 1/20` with the tuned slope (§3.4). The table does not need
+  regenerating.
+* **The worst row is 14%, not 1%.** The mean is good and the spread is not,
+  on the same 64 real rows. A model-level gate should report both, and if
+  the bad rows turn out to be the ones that matter -- a near-uniform
+  attention row is exactly where a denominator error moves every weight --
+  then the answer is a finer `input_scale` for that layer rather than a
+  different table.
 * **The fused-attention win does not survive measurement.** C15 measured
   unbatched attention at 1.16x (ViT-B) to 1.41x (BERT-384) *slower*, and the
   CPU spends little on attention. This design removes softmax and the
