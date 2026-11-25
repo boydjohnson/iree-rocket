@@ -437,6 +437,7 @@ fn pin_unclaimed_dispatches(
     library: &Library,
     invocation: &Invocation,
     capture: bool,
+    pack_weights: bool,
 ) -> Result<layout::LayoutRecord, Box<dyn Error>> {
     invocation.set_compile_to_phase(PIN_PHASE);
     invocation.run_pipeline(Pipeline::Std)?;
@@ -450,7 +451,9 @@ fn pin_unclaimed_dispatches(
     } else {
         layout::LayoutRecord::default()
     };
-    invocation.run_pass_pipeline(PACK_WEIGHTS_PASS)?;
+    if pack_weights {
+        invocation.run_pass_pipeline(PACK_WEIGHTS_PASS)?;
+    }
     invocation.set_compile_from_phase(PIN_PHASE);
     Ok(record)
 }
@@ -551,8 +554,12 @@ fn run_compile(args: &cli::CompileArgs) -> Result<(), Box<dyn Error>> {
     } else {
         decisions::DecisionRecord::default()
     };
-    let layout =
-        pin_unclaimed_dispatches(&library, &invocation, needs_placement_pass(&args.common))?;
+    let layout = pin_unclaimed_dispatches(
+        &library,
+        &invocation,
+        needs_placement_pass(&args.common),
+        !args.common.no_pack_weights,
+    )?;
     if needs_placement_pass(&args.common) {
         let placement = capture_placement(&library, &invocation, None)?;
         if args.common.no_offload {
@@ -593,7 +600,8 @@ fn run_audit(args: &cli::AuditArgs) -> Result<(), Box<dyn Error>> {
     let record = capture_decisions(&library, &invocation)?;
     // Same staging as `compile`, so the report describes the placement a
     // .vmfb from this input would actually get.
-    let layout = pin_unclaimed_dispatches(&library, &invocation, true)?;
+    let layout =
+        pin_unclaimed_dispatches(&library, &invocation, true, !args.common.no_pack_weights)?;
     let placement = capture_placement(&library, &invocation, args.emit_ir.as_deref())?;
 
     let audit = audit::PlacementAudit::new(record, layout, placement);
@@ -616,6 +624,7 @@ mod tests {
             batch_matmul: false,
             strict_offload: false,
             strict_layout: false,
+            no_pack_weights: false,
             report_json: None,
             rocket_device_name: rocket.to_string(),
             cpu_device_name: cpu.to_string(),

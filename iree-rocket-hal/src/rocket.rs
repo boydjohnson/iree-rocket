@@ -19,6 +19,7 @@ pub mod regcmd;
 // `regcmd` grab-bag. `regcmd` itself now holds only what all of them
 // share (see its module doc comment).
 pub mod activation;
+pub mod bn_plane;
 pub mod elementwise;
 pub mod pooling;
 #[allow(
@@ -29,6 +30,7 @@ pub mod pooling;
     clippy::pedantic
 )]
 pub mod registers;
+pub mod softmax;
 pub mod tensor_layout;
 
 /// The feature-cube layout contract (COMPILER_ROADMAP.md 6.1), re-exported

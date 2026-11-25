@@ -955,6 +955,65 @@ now on the weights too. Four constant-filter fixtures
 direct-bind path in `tools/e2e_conv_regression.py`, and the gate refuses to
 run if any of them stops dispatching at a `_packed` executable.
 
+**The packer itself got 5-10x faster, 2026-11-24, and that reprices this
+whole section.** Every figure above is a cost measured against a packer
+running at about 170-215 MB/s -- `memcpy` of the same bytes on the same core
+is 19 GB/s -- because `pack_hwcf_to_rocket_weights` drove
+`WeightLayout::visit_slots`, a closure call per coefficient with two
+multiplies and a bounds-checked one-element copy inside it. SOFTMAX.md
+section 11.3 found that from the other side while pricing a fused SDPA, and
+showed the same coefficient order written as strided runs reaching 1602 MB/s
+at one shape. `rocket_core::weights` now routes every symmetric 1- and
+2-byte filter -- int8 and the whole 2-byte family, every kernel size, dense
+convolutions and matmuls -- down that strided arm, with
+`pack_hwcf_to_rocket_weights_reference` keeping the per-coefficient arm as
+the fallback (a nonzero weight zero point, int4 nibbles, tf32's different
+group geometry) and as the reference the equivalence sweep compares against.
+The coefficient *order* is untouched; this only produces the same bytes
+faster.
+
+On the board (`weight_pack_rate_hw`, `taskset -c 4-7`, both arms in one
+process so the ratio is not a codegen artefact; the absolute rate moves
+180-215 MB/s across rebuilds of identical source, which is codegen layout,
+so only ratios get decimals):
+
+| coefficient tensor | per-coefficient | strided | |
+|---|---:|---:|---:|
+| mnv2 1x1 fp16 960 -> 320 | 2.90-3.18 ms | 0.42-0.43 ms | 6.9-7.3x |
+| rn50 1x1 fp16 2048 -> 512 | 10.0-10.9 ms | 1.68-1.96 ms | 5.6-5.9x |
+| rn50 3x3 fp16 512 -> 512 | 23.6-26.2 ms | 4.21-4.86 ms | 5.4-5.6x |
+| rn50 7x7 fp16 3 -> 64 | 0.217-0.233 ms | 0.022-0.023 ms | 9.3-10.7x |
+| ViT P^T 1x1 fp16 197 -> 197 | 0.374-0.409 ms | 0.048 ms | 7.7-8.5x |
+| int8 3x3 256 -> 256 | 5.54-6.08 ms | 0.81-0.82 ms | 6.9-7.4x |
+
+Per model, over the dense dispatch sites these `.vmfb`s actually have (the
+same harness, counts read off `ROCKET_PROFILE=1`'s op table): MobileNetV2
+fp16's 36 sites and 6.5 MiB of coefficients go **32.4 ms -> 4.4 ms (7.4x)**,
+ResNet50-224 fp16's 53 sites and 48.6 MiB go **248.9 ms -> 45.0 ms (5.5x)**.
+Read against this section's own acceptance numbers, the `pack.weights` the
+hoist deleted would have been 39.8 ms -> about 5 ms on MobileNetV2 and
+Wide ResNet50's 815 ms -> roughly 110-150 ms. The hoist is still the larger
+win for a constant filter, because it removes the work rather than
+accelerating it; what changes is the size of the hole left for everything the
+hoist cannot reach.
+
+**And the honest negative: end to end on today's board set it buys nothing,
+by construction.** `irm-before`/`irm-after` on `planck`, cpus 4-7, on
+`mobilenet_v2.fp16.npu.declared.vmfb` and `resnet50-224.fp16.npu.vmfb`:
+logits bit-identical, cold single-inference wall 97-111 ms either way on
+MobileNetV2 and 161-190 ms either way on ResNet50, warm
+`iree-benchmark-module` medians 35.7/36.6 -> 35.0/35.0 and 34.5/34.6 ->
+34.4/34.4 -- noise in both directions. The reason is this section: both
+`.vmfb`s are hoisted, so `ROCKET_PROFILE=1` prints no `pack.weights` phase
+and no weight-cache line at all, and the runtime packer is simply not on
+their path. The packer's speed is worth something in exactly three places --
+the compile-time pass here, a cold first inference of an unhoisted module,
+and a filter the hoist cannot reach because it is not a constant (attention's
+right-hand operand, ISSUES.md C15, where 45 ms of per-inference packing
+becomes about 6) -- and nothing at all in the steady state of a hoisted
+model. It is not a benchmark lever either, for the same reason this section
+said it was not.
+
 Not done, and worth saying: the fp16 bias is still packed at dispatch
 (`pack.bias`, 0.2 ms on MobileNetV2 -- not worth a pass), and the
 per-channel weight zero point the affine packer can take is still the

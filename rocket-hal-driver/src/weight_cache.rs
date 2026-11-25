@@ -8,6 +8,14 @@
 //! 99 ms of a 321 ms run, a third of all host time, for data that never
 //! changes: a `.vmfb`'s filters are constants written once at module load.
 //!
+//! Two things have shrunk that 99 ms since, and neither removes this cache:
+//! COMPILER_ROADMAP.md 6.3 hoists a *constant* filter's packing to compile
+//! time (a hoisted `.vmfb` reaches the packer not at all, and prints no
+//! `pack.weights` phase), and the packer itself is 5-10x faster as of
+//! 2026-11-24 (`rocket_core::weights`' strided arm). What is left for this
+//! cache is a filter the hoist cannot reach -- one that is not a constant,
+//! or whose dimensions are not -- on the second inference onward.
+//!
 //! This caches the packed GEM buffer so the transform runs once per
 //! (weight binding, geometry) rather than once per dispatch. There is no
 //! within-inference reuse to be had -- MobileNetV2's 36 weight-bearing

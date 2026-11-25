@@ -15,4 +15,5 @@ pub mod fc;
 pub mod grouped;
 pub mod layout;
 pub mod policy;
+pub mod softmax;
 pub mod weights;
