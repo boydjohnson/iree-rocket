@@ -15,6 +15,8 @@
 //! otherwise -- as a value both sides construct from the shape, so the
 //! compiler cannot pick a different packer than the runtime would have.
 
+use std::sync::OnceLock;
+
 use crate::{
     conv::{FEATURE_ATOM_BYTES, Kernels, Shape},
     error::{PlanError, PlanErrorCode},
@@ -543,6 +545,29 @@ pub fn pack_hwcf_to_rocket_weights_affine_i8(
     )
 }
 
+/// Whether `ROCKET_WEIGHTS_REFERENCE_PACKER` is set in the environment.
+///
+/// Set it to route *every* symmetric pack through the per-coefficient
+/// reference arm, so the two packers can be A/B'd end to end in one binary
+/// against one `.vmfb` -- which is the only way to price the strided packer
+/// on a real model. The microbenchmark
+/// (`iree-rocket-hal/tests/weight_pack_rate_hw.rs`) times the two arms by
+/// calling them directly; this knob is for the case where the caller is
+/// IREE and the packs are driven by a model's dispatches.
+///
+/// It is read once and cached: `apply_ops` calls the packer per dispatch,
+/// and `var_os` takes the environment lock and allocates on every call.
+///
+/// A knob that silently disables a fast path is exactly the shape of the
+/// `ROCKET_ACC_SIZE_E_MIN_CIN` trap -- a probe override left set turned the
+/// harness canary into a spurious failure -- so the equivalence sweep
+/// asserts this is *unset* rather than comparing the reference arm against
+/// itself and passing vacuously.
+pub fn reference_packer_forced() -> bool {
+    static FORCED: OnceLock<bool> = OnceLock::new();
+    *FORCED.get_or_init(|| std::env::var_os("ROCKET_WEIGHTS_REFERENCE_PACKER").is_some())
+}
+
 #[allow(clippy::too_many_arguments)]
 fn pack_hwcf_to_rocket_weights_impl(
     dense: &[u8],
@@ -591,7 +616,8 @@ fn pack_hwcf_to_rocket_weights_impl(
     // zero fill coincide -- so the int8 convolution rungs that carry a zero
     // point of 0 take the fast path too.
     let symmetric = weight_zero_points.is_none_or(|points| points.iter().all(|&point| point == 0));
-    if symmetric && !force_reference && matches!(element_size, 1 | 2) {
+    if symmetric && !force_reference && !reference_packer_forced() && matches!(element_size, 1 | 2)
+    {
         let fill = layout.padded_input_channels != input_channels
             || layout.programmed_output_channels != output_channels;
         if fill {
@@ -1204,6 +1230,15 @@ mod tests {
     /// drive the fast path.
     #[test]
     fn the_striped_packer_is_byte_identical_to_the_visited_one() {
+        // Without this the sweep compares the reference arm against itself
+        // and passes while testing nothing -- the shape of trap that
+        // `ROCKET_ACC_SIZE_E_MIN_CIN` already cost this repo once.
+        assert!(
+            !reference_packer_forced(),
+            "ROCKET_WEIGHTS_REFERENCE_PACKER is set, which routes the arm \
+             under test to the reference arm; unset it to run this sweep"
+        );
+
         let mut saw_partial_input_group = false;
         let mut saw_no_padding_at_all = false;
         let mut saw_input_atom_bump = false;
