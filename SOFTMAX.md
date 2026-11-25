@@ -1083,6 +1083,19 @@ precisely the form this hardware cannot run.
 
 ## 9. What would falsify this
 
+* **Nothing here is a performance measurement.** Every number in this
+  document is accuracy or task count; no arm of it has been timed against
+  anything. That is the largest gap, and ISSUES.md's **P10** now gives the
+  figure to beat: on BLIP fp16 the f32 CPU softmax is **24% of the A76
+  cycles**, and a 16-wide vector tile is bit-identical and 1.39x faster on
+  the standalone kernel, worth about 33 ms per inference. So the CPU side
+  is both a real cost *and* about to get cheaper, and an NPU softmax has to
+  beat the improved one. The pieces to price are already measured: 13
+  device tasks, two host boundaries at 0.037 to 0.059 ms each, and ISSUES
+  P8's flat 1.6 to 7.4 ms per *dispatch* -- which, if a softmax is one
+  dispatch, is the term that decides it. §5's structure A exists to keep
+  that count at one.
+
 * ~~**S1 comes back dead or fixed-point-only.**~~ Answered 2026-11-24: the
   plane carries a per-channel float on both sub-stages. The fallback this
   bullet named -- an ERDMA broadcast operand, or a materialised broadcast
