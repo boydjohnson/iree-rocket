@@ -1244,6 +1244,9 @@ off by default.
 Not accuracy, and not the host. Task count:
 
 * ~~**Rows per task.**~~ Done, and it **flips the sign** -- §10.3.
+* ~~**A calibrated bound instead of the maximum.**~~ Tried -- §12. Closed
+  negative: a real per-head bound needs 78 to 495 codes of slack and the op
+  can afford one or two. The max tree stays.
 * **A wider sum window.** The sum tree is the op's largest single cost --
   measured, 5 of 13 tasks at 64 rows and **11 of 19 at 1792** (§11.1) --
   because the planner backs only a 3x3 stride-3 square window (§2.2). An
@@ -1471,3 +1474,160 @@ needs about 3.2x to break even and has 7.5x available.
 * **Whether offloading attention's matmuls wins at all**, which is C15 and
   is upstream of this whole lever. Lever 2 is free *given* an offloaded PV
   matmul; it does not argue for one.
+
+---
+
+## 12. Lever 3, tried: dead, and its stated risk was the wrong sign
+
+ROADMAP's lever 3 replaces the exact per-row maximum with a bound
+calibrated offline, deleting the max tree -- **4 device tasks at every row
+count**, 0.134 ms of 0.495 by §10's breakdown, a quarter of the op -- and
+the first host boundary with it.
+
+It does not work, for a reason nobody had identified, and the risk ROADMAP
+warned about turns out to be the *safe* direction.
+
+Both halves were measured through **one knob on the real op** rather than
+through a model of it. The host step between submissions 1 and 2 already
+writes the subtrahend by hand into the `exp` task's BN ALU plane, so
+writing `max + slack` there *is* lever 3, with no new mechanism:
+`lever3_bound_slack_hw.rs`, `PROBE_BOUND_SLACK` in int8 code units, one
+value per process. `the_fixture_is_pre_reduced_so_it_cannot_price_a_bound`
+in the same file is the tripwire for §12.1's trap.
+
+### 12.1 A real per-head bound needs 78 to 495 codes of slack
+
+The committed fixture cannot answer this and it is worth saying why, since
+it looked like it could: `tools/fixtures/dump_vit_attention_rows.py` stores
+`scores - scores.max(dim=-1)`, so every row's maximum is **already zero**
+and the spread is zero by construction. A first pass at this section
+measured zero spread and nearly believed it.
+
+So the raw logits were regenerated -- 144 real ViT-B/16 heads, 197 rows
+each, over three images (`head_bound_spread.py`'s recipe is
+`dump_vit_attention_rows.py`'s without the reduction):
+
+| | Unicorn | Donkey | Totoro |
+|---|---|---|---|
+| raw logit range | -24.6 .. +24.4 | -17.9 .. +23.1 | -26.0 .. +25.3 |
+| per-head row-max spread, median | 4.94 (99 codes) | 4.82 (96) | 4.90 (98) |
+| per-head row-max spread, worst | 23.65 (473) | 21.95 (439) | 24.76 (495) |
+| heads whose own spread exceeds the 100-code domain | 49% | 44% | 50% |
+
+Across the three images the per-head bound itself moves by a median of 21
+codes and a worst of 264. A bound calibrated on all three forces **a median
+of 78 codes of slack on the typical row and 495 on the worst**, against an
+accurate `exp` domain 100 codes wide.
+
+Half the heads cannot be covered by any single bound at all. **The per-row
+maximum is doing real work**, not saving an optimisation someone forgot.
+
+### 12.2 And the op cannot afford five
+
+Measured, the whole op on the board, 64 real rows, one slack per process:
+
+| slack | real units | Q15 at the peak | mean TV | worst TV | weights zeroed | dead rows |
+|---|---|---|---|---|---|---|
+| -40 | -2.00 | 32767 *(sat)* | 26.08% | 68.76% | 0 | 0 |
+| -20 | -1.00 | 32767 *(sat)* | 12.82% | 46.89% | 0 | 0 |
+| -5 | -0.25 | 32767 *(sat)* | 3.02% | 18.02% | 0 | 0 |
+| -1 | -0.05 | 32767 *(sat)* | 1.28% | 9.86% | 0 | 0 |
+| **0** | 0 | 32767 | **1.12%** | 13.97% | 2518 | 0 |
+| +5 | +0.25 | 25520 | 4.11% | 52.18% | 50 | 0 |
+| +10 | +0.50 | 19876 | 16.28% | 307.60% | 43 | 0 |
+| +20 | +1.00 | 12053 | 37.28% | 1005.36% | 646 | 3 |
+| +40 | +2.00 | 4435 | 59.58% | 456.45% | 3599 | 18 |
+
+**A quarter of one real unit of slack quadruples the error.** The usable
+budget is one or two codes against the 78 to 495 §12.1 says a real bound
+needs -- short by two orders of magnitude, not by a tuning pass.
+
+A total variation above 100% is not a typo. Half the L1 distance between
+two probability distributions cannot exceed 1, so 307% and 1005% mean the
+output has **stopped being a distribution**: §12.3 is why.
+
+### 12.3 The mechanism is the Q15 ceiling and the sum tree, not the domain
+
+`exp` itself is exact throughout. The Q15 count at each row's own largest
+code tracks `exp(-slack * input_scale)` to within two counts at every slack
+measured -- 25520 against a predicted 25520, 19876 against 19875, 12053
+against 12055. The table is doing its job.
+
+What fails is the **denominator**, measured directly against
+`exp(-slack * input_scale) * sum_k exp(x_k - max_k)`:
+
+| slack | worst row's sum tree | worst row's TV |
+|---|---|---|
+| 0 | 1.2x too small | 13.97% |
+| +5 | 1.6x | 52.18% |
+| +10 | 4.3x | 307.60% |
+| +20 | 11.4x | 1005.36% |
+| -20 | 1.7x | 46.89% |
+
+Every factor of denominator deficit inflates the output by that factor
+directly, which is where a TV above 1 comes from. And the cause is the
+**fixed-point output encoding**, not the table's domain: a Q15 count is an
+integer in `[0, 32767]`, so a probability below `1/32767` of the row's peak
+is unrepresentable. Slack moves the peak *down* from that ceiling --
+32767 to 12053 at slack 20 -- and compresses the whole representable
+dynamic range with it. Attention rows have long tails, and that tail mass
+is exactly what the sum then loses.
+
+This is a different binding constraint from §3.2's, and both hold. §3.2 is
+about how far *down* the table resolves, and the domain edge binds there.
+This is about how much headroom there is *above* the peak, and the Q15
+ceiling binds here.
+
+An incidental result worth keeping: **row 5's long-standing 13.97% worst
+case is now diagnosed.** At slack 0 its denominator is already 1.2x short,
+for the same reason -- 2518 of 12608 weights fall below fp16's floor at the
+output and carry 0.54% of the true mass with them. The worst-row figure was
+recorded five times across §10 and never explained.
+
+### 12.4 The risk ROADMAP warned about is the safe direction
+
+ROADMAP: "a logit above the bound is silently wrong by an unbounded
+amount". **Falsified.** Driven directly, by a negative slack:
+
+At slack -40 the peak's unclamped Q15 would be 242125, nearly four times
+`i16`'s range -- a wrap would land it at a large negative count and give the
+row's dominant key a negative probability. Measured, it comes back
+**32767**, `i16`'s ceiling, at every negative slack tried. Not one weight
+in 12608 comes back zero, no row dies, and total variation is a tidy 26.08%
+-- the answer you would get from a *saturating* softmax, computed as if
+every over-bound logit sat exactly at the bound. Bounded, monotone in the
+overshoot, and still a probability distribution.
+
+So the error is asymmetric, and in the opposite direction from the one the
+lever was designed around:
+
+> **Too tight is graceful. Too loose is catastrophic.** And a calibrated
+> bound can only ever err loose, because erring tight is the thing it
+> exists to avoid.
+
+That is the whole verdict on lever 3. It is also a useful fact about the
+shipped op, which keeps its exact max tree: if that tree ever returned a
+maximum that was too *small* -- a tiling bug, a partial reduction, a
+mis-sized operand plane -- the op would degrade gracefully rather than
+explode, which is the failure mode you want from a reduction tree and not
+the one to assume.
+
+### 12.5 What this leaves
+
+The max tree stays, at 4 tasks. Of §10.1's levers:
+
+* lever 1 is done and flipped the sign;
+* lever 2's mechanism is confirmed and free, gated on the coefficient
+  packer (§11);
+* **lever 3 is closed negative** -- not "needs calibration work", closed:
+  §12.1's spread is a property of attention, not of this implementation,
+  and no amount of tuning closes two orders of magnitude;
+* lever 4, splitting keys across cores, is untouched and is now the only
+  structural lever left besides the packer.
+
+A narrower version of lever 3 does survive the arithmetic and is worth
+recording rather than pursuing: a bound **per row** is exactly the maximum
+and saves nothing, while a bound per *tensor* is strictly worse than per
+head. The only way to buy slack back would be a wider output encoding than
+Q15, which is the `int16`-PV-matmul question §11.6 leaves open for lever 2
+rather than anything lever 3 can reach on its own.

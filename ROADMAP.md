@@ -943,15 +943,44 @@ Original projection, for the record: about 5 tasks a head where the softmax
 alone is 13. Post-lever-1 the honest form is 8 of 19 tasks per 9-head
 batch, which is what §11.1 measures.
 
-**3. Replace the max reduction with a calibrated bound.** Softmax is
-shift-invariant, so the subtrahend need only be a true *upper bound*, not
-the maximum. A per-head bound measured offline deletes the three-task max
-tree and the first host boundary with it. The catch is specific and sharp
-rather than vague: SOFTMAX.md S3 found `exp`'s `LO` half is a placeholder
-returning a constant 1.0, so a logit above the bound is silently wrong by
-an unbounded amount, and §3.2's usable domain is only about 6.4 units wide
-at `input_scale = 1/20`, so a loose bound costs resolution. That makes this
-a calibration-risk trade and not a free win.
+**3. ~~Replace the max reduction with a calibrated bound.~~ TRIED, and
+CLOSED NEGATIVE** (SOFTMAX.md §12). Softmax is shift-invariant, so the
+subtrahend need only be a true *upper bound*. Deleting the max tree is
+worth 4 device tasks at every row count and the first host boundary -- a
+quarter of the op by §10's breakdown. It does not work, and the catch this
+bullet used to state turns out to be the wrong one.
+
+**The slack a real bound needs is two orders of magnitude past what the op
+can absorb.** Measured on 144 real ViT-B/16 heads over three images, the
+row-max spread *within a single head* is a median of 4.9 real units -- 99
+int8 codes, against an accurate `exp` domain 100 codes wide -- and 44% to
+50% of heads exceed that domain on their own. A bound calibrated across the
+three images forces a median of **78 codes** of slack on the typical row
+and **495** on the worst. Measured against the op, a quarter of one real
+unit (5 codes) already takes total variation from 1.12% to 4.11%, and 20
+codes takes it to 37% with 3 of 64 rows underflowing to nothing. The budget
+is one or two codes. The per-row maximum is doing real work.
+
+The mechanism is the **Q15 output encoding**, not the domain: a count is an
+integer in `[0, 32767]`, so slack moves the row's peak down from that
+ceiling and compresses the representable dynamic range with it, after which
+the sum tree loses the tail and the denominator comes back up to 11.4x too
+small -- which is why the measured total variation passes 100% and the
+output stops being a distribution at all.
+
+**And the risk this bullet used to warn about is the safe direction.** The
+old text read: "`exp`'s `LO` half is a placeholder returning a constant
+1.0, so a logit above the bound is silently wrong by an unbounded amount."
+Driven directly, that is false. At a bound 40 codes *below* the true
+maximum, where the peak's unclamped Q15 would be 242125 -- nearly 4x
+`i16`'s range, so a wrap would give the row's dominant key a negative
+probability -- the count comes back saturated at 32767, not one weight in
+12608 is zeroed, no row dies, and total variation is 26%. That is a
+saturating softmax: bounded, monotone in the overshoot, still a
+distribution. So **too tight is graceful and too loose is catastrophic**,
+and a calibrated bound can only ever err loose. Useful for the shipped op
+too, which keeps its exact max tree: were that tree ever to return a
+maximum that is too small, the op degrades rather than explodes.
 
 **4. Split the keys across cores -- the one place the online recurrence
 earns its keep.** FlashDecoding's split over the KV axis maps onto M2's
@@ -1001,13 +1030,16 @@ attention matmuls already run at about 43% of f32 peak, which is not a
 number an offload beats easily. P10 also has 1.39x still to collect from a
 wider vector tile, so the CPU target moves before any of this lands.
 
-Levers 1 and 2 were the ones worth trying, and both have been. Lever 1
-flipped the sign (1.7x faster at 1792 rows). Lever 2's mechanism is
-confirmed and free, and measuring it turned the coefficient packer into the
-next piece of work -- for C15 as much as for attention, since 69 ms an
-inference of uncacheable packing is a plausible share of C15's own loss.
-C15 is still worth re-measuring, and now there is a specific reason to
-expect a different answer afterwards.
+Levers 1, 2 and 3 have all been tried. Lever 1 flipped the sign (1.7x
+faster at 1792 rows). Lever 2's mechanism is confirmed and free, and
+measuring it turned the coefficient packer into the next piece of work --
+for C15 as much as for attention, since 69 ms an inference of uncacheable
+packing is a plausible share of C15's own loss. Lever 3 is closed negative:
+the row-max spread it would have to absorb is a property of attention
+rather than of this implementation, and no tuning closes two orders of
+magnitude. **Lever 4 and the packer are what is left.** C15 is still worth
+re-measuring, and now there is a specific reason to expect a different
+answer afterwards.
 
 ---
 
