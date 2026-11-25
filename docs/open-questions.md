@@ -287,8 +287,9 @@ example for an LLM's weights on one file? [ISSUES P1]
 
 3.1.2 What is the per-dispatch tax made of now, and what is the largest host
 term? The premise this question carried is gone: MobileNetV2 fp16 at four
-workers is **10.0 ms offloaded against 54.2 ms `--no-offload`** (2026-11-25),
-not the 73.1-against-54.5 that made the tax look decisive, and it reaches
+workers is **10.0 ms offloaded against 30.9 ms `--no-offload`** on the same
+f32 import (2026-11-25), not the 73.1-against-54.5 that made the tax look
+decisive, and it reaches
 that with *more* offloaded sites (54 against 37-44). The question survives in
 a narrower form, because the tax is still the thing worth attacking on a
 dispatch-heavy model: ISSUES C15's marginal attribution on a 338-site arm

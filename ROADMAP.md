@@ -42,14 +42,15 @@ P8's own ranked lever list puts *"standalone elementwise/transpose matchers"* at
 > ~~at the current per-dispatch cost, **more offload sites make the model
 > slower**.~~
 
-**That sentence is retired, 2026-11-25.** It was measured on MobileNetV2 fp16
-when the offloaded arm was 73.1 ms against a `--no-offload` arm of 54.5 at
-four workers. Re-measured on the same four A76s: **10.0 ms against 54.2**,
-with the CPU arm unmoved and the NPU arm 7.3x faster. The build that does
-that offloads **54** sites where the losing one offloaded 37 to 44 -- more
-sites, far faster -- so site count is not the variable, and the 2026-11-24
-ten-model survey has every model beating its own `--no-offload` arm by 2.6x
-to 35x. ISSUES.md P7 carries the table and the two caveats.
+**That sentence is retired, 2026-11-25.** It was measured on MobileNetV2 when
+the offloaded arm was 73.1 ms against a `--no-offload` arm of 54.5 at four
+workers. The offloaded arm is now **10.0 ms** and the same f32 `--no-offload`
+arm is **30.9**, so the verdict is **3.1x the other way** rather than 1.34x
+against -- and the build that does it offloads **54** sites where the losing
+one offloaded 37 to 44. More sites, and the NPU arm 7.3x faster, so site
+count is not the variable. The 2026-11-24 ten-model survey has every model
+beating its own `--no-offload` arm by 2.6x to 35x. ISSUES.md P7 carries the
+table, why the f32 baseline is the fair one, and what is still open about it.
 
 **What this does not change is the conclusion below, and it matters that the
 conclusion has its own evidence.** Coverage matchers still land behind a
@@ -837,8 +838,8 @@ back on the wrong side, which is what P8 lever #3 was really saying.
 
 Phases 1 and 2 land their matchers **behind a flag**, with the `--no-offload`
 arm measured alongside on every model. P8's *MobileNetV2* measurement has
-been displaced -- that model is now 10.0 ms offloaded against 54.2 ms
-`--no-offload` at four workers, 5.4x the other way (ISSUES.md P7,
+been displaced -- that model is now 10.0 ms offloaded against 30.9 ms
+`--no-offload` at four workers, 3.1x the other way (ISSUES.md P7,
 2026-11-25) -- but the flag does not depend on it. What holds the flag shut
 is the direct measurement of the thing behind it: ViT with `--elementwise`
 is 1.17x slower at eight cores.
