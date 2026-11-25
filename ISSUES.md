@@ -1917,6 +1917,22 @@ identical arithmetic, because `K` becomes `Cin` and charges CBUF feature
 residency while `N` becomes `Cout` and charges none. The up-projection pays
 instead on the way out, 31 ms of `compact` per inference against 7.5.
 
+**The uncacheable packing in there is now about 6 ms, not 45 (2026-11-24),
+and it does not change the verdict.** The paragraph above prices attention's
+one structural disadvantage -- its right-hand operands are activations, so
+their coefficient packs can never hit the weight cache -- at 288 fresh packs
+an inference, ~45 ms. `rocket_core::weights` now packs symmetric 1- and
+2-byte filters as strided runs instead of one closure call per coefficient
+(COMPILER_ROADMAP.md 6.3), and on the board the shape this depends on, 1x1
+fp16 `[197, 197]`, goes 0.374-0.409 ms -> 0.048 ms, 7.7-8.5x. So the 45 ms
+becomes about 6, which recovers roughly 39 of the 95 ms this entry's ViT
+delta is made of -- the largest single nameable piece of it, and still not
+enough to flip the sign on its own. SOFTMAX.md section 11.4 predicted 39 ms
+from the prototype at one shape; the generalised packer lands on the same
+number. The rest of C15's cost is `record`, `wait.npu` and `compact`, none of
+which this touches, so the conclusion stands unchanged: attention offload
+needs a better *shape*, not a cheaper tax.
+
 ## P10 (S3) — IREE compiles the CPU softmax with a 4-wide vector tile; a 16-wide tile is bit-identical and 1.39x faster, and nothing in this stack can set it
 
 Found 2026-11-24 profiling BLIP fp16 at `main` `74787f0` on `orangepi`

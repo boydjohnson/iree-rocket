@@ -32,8 +32,7 @@
 use std::time::Instant;
 
 use rocket_core::weights::{
-    pack_hwcf_to_rocket_weights, pack_hwcf_to_rocket_weights_reference,
-    rocket_weight_storage_size,
+    pack_hwcf_to_rocket_weights, pack_hwcf_to_rocket_weights_reference, rocket_weight_storage_size,
 };
 
 /// One real coefficient tensor: `kh x kw x Cin x Cout` at `element_size`
@@ -281,4 +280,143 @@ fn the_dense_packer_s_rate_on_both_arms() {
         rate_mb_s(bytes, copy_ms)
     );
     assert_eq!(destination[0], 0xA5);
+}
+
+/// One model's whole dense coefficient set, as its dispatch sites ask for
+/// it: `(kernel, Cin, Cout, dispatches)`.
+///
+/// Both lists are read off `ROCKET_PROFILE=1`'s per-op table on the board,
+/// so they are the NPU dispatch sites those `.vmfb`s actually have, counts
+/// included -- two dispatches of one shape are two distinct filters and
+/// two packs. Depthwise sites are absent from both: this packer is the
+/// dense one, and `pack_depthwise_to_rocket_weights` is untouched.
+type Site = (usize, usize, usize, usize);
+
+/// `mobilenet_v2.fp16.npu.declared.vmfb`: 36 dense convolutions and the
+/// classifier matmul.
+const MNV2_FP16: &[Site] = &[
+    (3, 3, 32, 1),
+    (1, 16, 96, 1),
+    (1, 24, 144, 2),
+    (1, 32, 192, 3),
+    (1, 32, 16, 1),
+    (1, 64, 384, 4),
+    (1, 96, 576, 3),
+    (1, 144, 24, 1),
+    (1, 192, 32, 2),
+    (1, 96, 24, 1),
+    (1, 384, 64, 3),
+    (1, 576, 96, 2),
+    (1, 160, 960, 3),
+    (1, 960, 160, 2),
+    (1, 144, 32, 1),
+    (1, 384, 96, 1),
+    (1, 320, 1280, 1),
+    (1, 192, 64, 1),
+    (1, 960, 320, 1),
+    (1, 576, 160, 1),
+    (1, 1280, 1000, 1),
+];
+
+/// `resnet50-224.fp16.npu.vmfb`: 52 convolutions and the classifier matmul.
+const RESNET50_FP16: &[Site] = &[
+    (1, 64, 256, 4),
+    (1, 128, 512, 4),
+    (1, 256, 1024, 6),
+    (3, 256, 256, 5),
+    (1, 512, 2048, 3),
+    (1, 1024, 256, 5),
+    (3, 64, 64, 3),
+    (3, 512, 512, 1),
+    (1, 256, 64, 2),
+    (3, 128, 128, 3),
+    (1, 512, 128, 3),
+    (3, 512, 512, 2),
+    (1, 256, 512, 1),
+    (1, 1024, 2048, 1),
+    (1, 256, 128, 1),
+    (1, 64, 64, 1),
+    (1, 2048, 512, 2),
+    (1, 512, 1024, 1),
+    (3, 128, 128, 1),
+    (1, 512, 256, 1),
+    (1, 1024, 512, 1),
+    (3, 256, 256, 1),
+    (1, 2048, 1000, 1),
+];
+
+/// What one inference's worth of dense coefficient packing costs, both arms.
+///
+/// This is the figure `rocket-hal-driver/src/weight_cache.rs` records from
+/// the other side: `ROCKET_PROFILE=1` put packing at 99 ms of a 321 ms
+/// MobileNetV2 fp16 run, a third of all host time. Since COMPILER_ROADMAP.md
+/// 6.3 hoisted constant filters to compile time, a current `.vmfb` has no
+/// `pack.weights` phase at all -- so this is what a *cold* cache costs
+/// wherever the hoist cannot reach: a filter that is not a constant
+/// (attention's right-hand operand, ISSUES.md C15), and the compile-time
+/// pass's own bill.
+#[test]
+#[ignore = "board measurement: run on the RK3588 with --ignored --nocapture"]
+fn one_inference_s_worth_of_coefficient_packing() {
+    println!("--- one inference's dense coefficient set, cold ---");
+    for (model, sites) in [
+        ("MobileNetV2 fp16", MNV2_FP16),
+        ("ResNet50 fp16", RESNET50_FP16),
+    ] {
+        let mut dispatches = 0;
+        let mut bytes = 0;
+        let mut reference_total = 0.0;
+        let mut strided_total = 0.0;
+        for &(kernel, input_channels, output_channels, count) in sites {
+            let dense_bytes = kernel * kernel * input_channels * output_channels * 2;
+            let packed_bytes =
+                rocket_weight_storage_size(kernel, kernel, input_channels, output_channels, 2)
+                    .expect("packed size");
+            let dense: Vec<u8> = (0..dense_bytes).map(|i| (i % 251 + 1) as u8).collect();
+            let mut scratch = vec![0u8; packed_bytes];
+
+            let (reference_ms, _, _) = median_ms(dense_bytes, || {
+                pack_hwcf_to_rocket_weights_reference(
+                    &dense,
+                    kernel,
+                    kernel,
+                    input_channels,
+                    output_channels,
+                    2,
+                    &mut scratch,
+                )
+                .expect("reference pack");
+            });
+            let expected = scratch.clone();
+            let (strided_ms, _, _) = median_ms(dense_bytes, || {
+                pack_hwcf_to_rocket_weights(
+                    &dense,
+                    kernel,
+                    kernel,
+                    input_channels,
+                    output_channels,
+                    2,
+                    &mut scratch,
+                )
+                .expect("strided pack");
+            });
+            assert_eq!(
+                scratch, expected,
+                "arms disagree at {model} {kernel}x{kernel} {input_channels}->{output_channels}"
+            );
+
+            dispatches += count;
+            bytes += dense_bytes * count;
+            reference_total += reference_ms * count as f64;
+            strided_total += strided_ms * count as f64;
+        }
+        println!(
+            "{model}: {dispatches} dense sites, {:.2} MiB of coefficients -- \
+             {:.1} ms -> {:.1} ms ({:.2}x)",
+            bytes as f64 / (1024.0 * 1024.0),
+            reference_total,
+            strided_total,
+            reference_total / strided_total
+        );
+    }
 }
