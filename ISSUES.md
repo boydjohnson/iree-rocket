@@ -1985,10 +1985,40 @@ first two sum to the third.
 is the one number here worth carrying forward. `weight_pack_rate_hw` on this
 board measures 1x1 fp16 `[197, 197]` at 0.3725 -> 0.0483 ms, 7.72x at 208 ->
 1609 MB/s, `taskset -c 4-7` with nothing else running. The same packs driven
-by IREE's dispatches reach 163 -> 674 MB/s, because four IREE worker threads
-are competing for the same cores and the same memory bandwidth. A packing
-microbenchmark on this board overstates what the model will see by about
-1.8x; price the next one accordingly.
+by IREE's dispatches reach 163 -> 674 MB/s. A packing microbenchmark on this
+board overstates what the model will see by about 1.8x; price the next one
+accordingly.
+
+**That factor was measured independently, on a different arm, and the two
+agree -- but the mechanism is the other one's, not the one guessed here.**
+COMPILER_ROADMAP.md 6.3's unhoisted cold-start A/B (#93) prices the same
+packer on *constant* filters in ResNet50-224 and MobileNetV2 and gets
+**4.0-4.1x in situ against a 5.5-7.4x harness**: a different model, a
+different filter kind, and a cold first inference rather than this entry's
+steady state, landing on the same number. So ~4x is a property of the board
+under a real dispatch stream rather than an artifact of either setup.
+
+It also falsifies the explanation this entry first gave. The obvious guess is
+worker-thread contention -- four IREE workers competing for the same cores and
+bandwidth -- and 6.3 rules that out as the main cause: over the same 48.62 MiB
+the *per-coefficient* arm moves 181 MB/s in situ against the harness's 205,
+inside the rebuild spread, so the slow arm behaves identically in both
+settings. Contention would have slowed it too. What moves is the fast arm,
+732 against 1133, and the cause is **first touch**: the harness re-packs one
+filter in a loop with source and destination resident, while the driver packs
+each filter once out of pages nothing has touched. With five times less
+arithmetic left, that traffic stops being hidden.
+
+Whether that is the mechanism *here* is not established, and the difference
+matters for anyone extending this. 6.3's operands are cold constant pages;
+this entry's are activations the previous dispatch just wrote, 288 times an
+inference, into scratch buffers the pool reports as 94% reused (15146 against
+925 allocated over eleven inferences) -- so they should be warmer than 6.3's,
+yet the factor is the same. Either first touch still dominates even on a
+reused scratch destination, or contention contributes here where it did not
+there. Neither measurement separates them, so the honest reading is that
+**the 4x is reproducible while its cause is established only for the constant
+case.**
 
 **What this does and does not change.** It recovers **36 of the 97 ms, 37% of
 the loss** -- SOFTMAX.md section 11.4 predicted 39 ms and 41% from the

@@ -1501,10 +1501,15 @@ goes 302 -> 266 ms against a 205 ms default, so the delta falls from 97 ms to
 ms an inference with every other phase unmoved, which is a controlled result,
 and the shortfall against the projection has one cause worth carrying into
 any future estimate from this section: **the in-situ factor is 4.13x where
-`weight_pack_rate_hw` measures 7.72x**, because the microbenchmark runs
-`taskset`ed and uncontended while the real packs compete with four IREE
-worker threads. §11.3's and §11.4's numbers are the uncontended kind. The
-full table is ISSUES.md C15.
+`weight_pack_rate_hw` measures 7.72x**. §11.3's and §11.4's numbers are the
+loop-benchmark kind, so halve their headroom before promising it.
+COMPILER_ROADMAP.md 6.3 measures 4.0-4.1x independently on constant filters
+in two convolutional models, which makes ~4x reproducible rather than a
+one-off; it also shows the cause is **first touch** rather than the
+thread contention this document first guessed, since the per-coefficient arm
+is unchanged between loop and model while only the fast arm loses. The full
+table, and why that mechanism is established for constants but not for
+attention's activations, is ISSUES.md C15.
 
 ### 11.6 What is still untested
 
