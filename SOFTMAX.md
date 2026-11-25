@@ -1244,18 +1244,23 @@ off by default.
 Not accuracy, and not the host. Task count:
 
 * ~~**Rows per task.**~~ Done, and it **flips the sign** -- §10.3.
-* **A wider sum window.** The sum tree is 5 of the 13 tasks because the
-  planner backs only a 3x3 stride-3 square window (§2.2). An 8x8 at stride
-  8 would reduce a row in two levels instead of five -- three tasks, about
-  0.11 ms --
-  and `only_an_odd_square_window_can_stride` pins the refusal so that a
-  capture which widened it would show up here.
-* **Fusion into attention.** §1.1's whole argument: inside an attention
-  block the comparison is not against a CPU softmax in isolation but
-  against the CPU doing softmax *plus* the round trips an NPU-resident
-  block avoids. ISSUES C15 measured unbatched attention offload as a loss
-  (1.16x to 1.41x slower) before softmax was available at all, so this is
-  a reason to re-measure C15 rather than a reason to expect a win.
+* **A wider sum window.** The sum tree is the op's largest single cost --
+  measured, 5 of 13 tasks at 64 rows and **11 of 19 at 1792** (§11.1) --
+  because the planner backs only a 3x3 stride-3 square window (§2.2). An
+  8x8 at stride 8 would reduce a row in two levels instead of five, and
+  `only_an_odd_square_window_can_stride` pins the refusal so that a capture
+  which widened it would show up here. This is the fallback for a
+  *standalone* softmax; inside attention the next bullet deletes the tree
+  outright rather than shortening it.
+* ~~**Fusion into attention.**~~ Tried -- §11. The denominator really is
+  free from an all-ones column on `V^T` (2.44e-3 worst error, no extra job,
+  no extra tile), which deletes all 11 sum-tree tasks and the 1792-row
+  ceiling with them. But it needs the probabilities down the **weight**
+  path, and coefficient packing runs at 214 MB/s, making `P^T` 3.2x the
+  saving. §11.4 shows the same byte order written as strided runs at 1,602
+  MB/s, which turns the loss into a 0.42x win, so the lever is real and
+  gated on the packer rather than on the hardware. ISSUES C15 is still
+  upstream of all of it.
 
 ### 10.2 What this means for the op
 
@@ -1271,3 +1276,198 @@ is measured and reusable -- the operand planes, the Q15 bridge, the int16
 read, the tuned `exp` tail and the width-mapped reduction are all general.
 It is an argument about *where* a softmax should run today, and the answer
 is the CPU until the task count comes down.
+
+---
+
+## 11. Lever 2, tried: the denominator is free, and the packer is the gate
+
+ROADMAP's lever 2 folds the softmax's epilogue into attention's two
+matmuls. It has four claims. The one that matters is measured and **true**,
+one of the others turns out to contradict it, and the whole lever is gated
+by a cost that is neither the hardware's nor the design's.
+
+### 11.1 The all-ones column works, and it is free
+
+§1.1's mechanism, run on hardware for the first time
+(`lever2_all_ones_column_hw.rs`, real ViT-B/16 attention rows through an
+exact f32 softmax, so the only error measured is the contraction's):
+
+```
+O^T = V^T P^T     V^T [d_v + 1, N] on width, keys on Cin, P^T down the weight path
+                  width position d_v of V^T is all ones
+                  => output width position d_v holds sum_k P^T[k, q]
+```
+
+| | measured |
+|---|---|
+| worst `abs(denominator - 1)` over 64 queries | **2.44e-3** |
+| worst `abs(O^T - reference)`, 64x64 | 9.74e-4 |
+| extra jobs the column costs | **0** |
+| extra tiles the column costs | **0** |
+
+The denominator is the hardware adding up 197 separately fp16-rounded
+probabilities in its own accumulator, and it lands within 0.24% of one.
+That is **five times tighter than the op's own 1.12% total variation**, so
+the matmul is not where a fused softmax would lose accuracy. And the extra
+width position changes neither the job count nor the tile count, which is
+what "free" has to mean: `the_all_ones_column_costs_no_extra_task` pins
+both.
+
+**What it deletes is large.** Measured exactly, not apportioned -- the
+per-stage task census at 197 keys:
+
+| rows | total tasks | max tree | `exp` + bridges | sum tree | normalise |
+|---|---|---|---|---|---|
+| 64 | 13 | 4 | 3 | 5 | 1 |
+| 197 | 13 | 4 | 3 | 5 | 1 |
+| 394 | 14 | 4 | 3 | 6 | 1 |
+| 788 | 15 | 4 | 3 | 7 | 1 |
+| 1792 | 19 | 4 | 3 | **11** | 1 |
+
+So at §10.3's measured batch the sum tree is **11 of 19 tasks**, about
+**1.04 ms of the 1.80 ms**, or 0.11 ms a head. The all-ones column deletes
+all of it, and with it the 1792-row ceiling -- which §10.3 found was the
+sum tree's depthwise channel limit and nothing else.
+
+Note what this does *not* cost: lever 1's batching survives. The max tree
+and `exp` stay row-parallel across heads exactly as before; only the sum
+moves, and it moves onto a matmul that is per-head anyway.
+
+### 11.2 Claims 2 and 3 are alternatives, not a set
+
+ROADMAP lists "the denominator comes free from an all-ones column" and "the
+normalising multiply folds into the PV matmul's BN plane" as two items of
+one lever. They cannot both hold: if the denominator is produced *by* the
+PV matmul, it is not known when that matmul's own BN plane is programmed.
+The multiply can only fold into a matmul that runs **after** the one that
+summed.
+
+Which is fine, because they are wildly unequal: the sum tree is 11 tasks
+and the normalise is 1. Claim 2 dominates 11 to 1 and claim 3 should be
+dropped from the lever rather than reconciled with it.
+
+It is recoverable, for what it is worth, but not worth it. Queries are on
+`Cout` in `O^T`, so a per-channel plane *is* per-query -- but only while
+queries stay on channels, and the output projection puts them on width
+unless its activations also go down the weight path. One task is not worth
+a second runtime coefficient pack.
+
+### 11.3 The gate: coefficient packing at 214 MB/s
+
+Every one of lever 2's claims needs `P^T` to reach the hardware as a
+**coefficient** tensor. ROADMAP says of exactly this: "This is probably the
+real gate on a fused SDPA, and it is unmeasured." It is the gate, and here
+it is (`lever2_pack_cost_hw.rs`, board A76 at 2.4 GHz, `performance`, 50
+packs a sample and five samples; within one binary the samples agree to
+0.3%, and across rebuilds the rate moved between 190 and 220 MB/s, which is
+codegen layout and is the honest width of the figure):
+
+| | dense | time | rate |
+|---|---|---|---|
+| `Q^T` `[d=64, M=197]` fp16 | 25,216 B | 0.115 ms | 220 MB/s |
+| `P^T` `[N=197, M=197]` fp16 | 77,618 B | **0.363 ms** | 214 MB/s |
+| the same bytes, plain `memcpy` | 77,618 B | 0.0026 ms | 29,700 MB/s |
+
+Against the 0.11 ms of sum tree it would replace, `P^T` alone is **3.2x the
+saving**, and a whole head's packing is **2.4x the entire softmax**. Per
+ViT-B/16 inference, 12 heads x 12 layers, that is **69 ms of pure host
+permutation**. On those numbers lever 2 loses outright.
+
+### 11.4 But the gate is the packer, not the problem
+
+214 MB/s is **139x slower than `memcpy` of the same bytes**, which is not
+what a byte permutation costs on an A76. `pack_hwcf_to_rocket_weights`
+drives `WeightLayout::visit_slots`, a six-deep loop nest that calls a
+closure once per coefficient and does two multiplies and a bounds-checked
+two-byte `copy_from_slice` inside it.
+
+The coefficient *order* is the hardware's and is not in question. Writing
+that same order the obvious other way -- one contiguous run of destination
+coefficients per `(output block, input group, output lane)`, gathered from
+the dense filter at a constant stride, as a zipped pair of fixed-size chunk
+iterators instead of an indexed closure -- gives:
+
+| | time | rate | vs today |
+|---|---|---|---|
+| `Q^T` `[d=64, M=197]` fp16 | 0.0155 ms | 1,628 MB/s | **7.4x** |
+| `P^T` `[N=197, M=197]` fp16 | **0.0485 ms** | 1,602 MB/s | **7.5x** |
+
+`the_striped_packer_is_byte_identical` checks it against the real packer at
+eight shapes first -- including the partial final input group, the partial
+final output block and the 3-mod-4 atom bump -- so this is the same bytes,
+not a cheaper approximation. Still safe Rust, no `unsafe`, no intrinsics;
+`as_chunks` over `chunks_exact` is itself worth 1.6x of the 7.5x, which is
+a fair measure of how much of the original cost was bounds checking.
+
+At 0.0485 ms, `P^T` is **0.42x the sum tree it replaces**, and lever 2 goes
+from losing 3.2x to winning by better than two to one. The verdict on lever
+2 is therefore:
+
+> **The mechanism is confirmed and free. The lever is viable. It is gated
+> entirely on coefficient packing, which is 7.5x off its own achievable
+> speed.**
+
+### 11.5 Why that gate is worth more than lever 2 is
+
+The packer is not softmax's problem; it is everything's, and **ISSUES C15
+had already found it** -- its own last paragraph but one:
+
+> these are the only matmuls in the model whose *right-hand operand is an
+> activation* [...] so their coefficient packs can never hit the weight
+> cache the way a projection's do (288 fresh packs per inference, ~0.16 ms
+> each, ~45 ms).
+
+288 is 12 layers x 12 heads x 2 matmuls, and ~0.16 ms a pack corroborates
+the 0.115 ms measured above for a 25 KB operand on a quieter machine. So
+the figure is independently arrived at twice.
+
+**What a 7.5x packer would be worth to C15, arithmetically.** C15's
+attention arm cost 687 ms against 592 ms, a 95 ms delta. Packing is ~45 ms
+of it; at 7.5x that becomes ~6 ms, recovering **39 of the 95 ms -- 41% of
+the loss**. That does **not** flip C15 on its own: the rest is `record`
+(+41.7 ms), `wait.npu` (+33.0) and `compact` (+35.6), and C15's own
+conclusion -- that attention offload needs the shape to get better -- still
+stands. But it is the largest single nameable piece of that delta, and the
+only one a purely local fix reaches.
+
+**And lever 2 pays more packing than C15 did, not less.** This is a cost of
+§1.1's layout that §1.2 did not price. C15 offloads `attn V` untransposed,
+so its weight operand is `V`, `N x d_v = 197 x 64`. §1.1's transposed form
+makes the weight operand `P^T`, `N x M = 197 x 197` -- **3.08x the
+coefficients** for the same contraction. Measured, 0.363 ms a head against
+0.115. What §1.1 buys for that is real (no transpose, queries on `Cout`, so
+the per-channel planes and the all-ones column both work) but it is bought,
+not free.
+
+The two other figures already in the tree point the same way:
+
+* `rocket-hal-driver/src/weight_cache.rs`'s own doc comment: packing was
+  **99 ms of a 321 ms MobileNetV2 fp16 run, a third of all host time**.
+  That is why the cross-inference cache exists.
+* COMPILER_ROADMAP §6.3's `rocket-pack-weights` moved it to compile time
+  for constants: MobileNetV2 cold start -37 ms, Wide ResNet50 1290 -> 551
+  ms.
+
+Both are ways of *avoiding* the packer -- cache it, or hoist it to compile
+time -- and neither is available to attention, whose coefficients are
+computed fresh every inference. Making the packer itself faster is the one
+fix that reaches that case, and it makes the cache misses and the cold
+starts cheaper by the same factor.
+
+So the ordering is: the packer first, then lever 2 on top of it. Lever 2
+needs about 3.2x to break even and has 7.5x available.
+
+### 11.6 What is still untested
+
+* **Claim 1**, `1/sqrt(d)` folding into the QK matmul's output converter.
+  Plausible -- `OUT_CVT` is an integer multiply-and-shift and `1/sqrt(64)`
+  is exactly `2^-3`, so at a head width that is a power of four it is a
+  pure shift. It saves no softmax task; it removes a CPU scale.
+* **Claim 4**, Q15 probabilities straight into an `int16` PV matmul,
+  deleting both bridge tasks and folding `2^-15` into its requant scale.
+  Worth 2 tasks of 19. Untested, and §4.2's datapath rule is what decides
+  it: an `int16` input makes the datapath integer, which is exactly what
+  the bridge exists to undo.
+* **Whether offloading attention's matmuls wins at all**, which is C15 and
+  is upstream of this whole lever. Lever 2 is free *given* an offloaded PV
+  matmul; it does not argue for one.
