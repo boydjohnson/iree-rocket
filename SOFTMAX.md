@@ -1494,6 +1494,18 @@ per-model numbers and the honest negative that goes with them (a hoisted
 measurement shows nothing); ISSUES.md C15's 45 ms becomes about 6, which is
 the 39 ms predicted just above. **Lever 2's gate is open.**
 
+**And C15 was re-measured on it, 2026-11-25: 36 ms of 97, sign unchanged.**
+The 39 ms above was arithmetic; end to end on ViT-B/16 fp16 the offloaded arm
+goes 302 -> 266 ms against a 205 ms default, so the delta falls from 97 ms to
+61 and attention offload still loses. `pack.weights` itself goes 44.9 -> 10.9
+ms an inference with every other phase unmoved, which is a controlled result,
+and the shortfall against the projection has one cause worth carrying into
+any future estimate from this section: **the in-situ factor is 4.13x where
+`weight_pack_rate_hw` measures 7.72x**, because the microbenchmark runs
+`taskset`ed and uncontended while the real packs compete with four IREE
+worker threads. §11.3's and §11.4's numbers are the uncontended kind. The
+full table is ISSUES.md C15.
+
 ### 11.6 What is still untested
 
 * **Claim 1**, `1/sqrt(d)` folding into the QK matmul's output converter.
