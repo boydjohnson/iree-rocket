@@ -114,6 +114,48 @@ fn attention_rows() -> (Vec<f32>, usize, usize) {
     (values, ROWS, keys)
 }
 
+/// The fixture repeated to `rows`, for ROADMAP's lever 1: batching a
+/// layer's heads onto the channel axis.
+///
+/// Repeating 64 real rows rather than inventing more is deliberate. What a
+/// wider shape tests is layout and cost -- whether a 1792-lane operand
+/// plane is indexed correctly and what a task costs when it is wide -- and
+/// the per-row oracle is just as sharp on a repeat as on a novel row. It is
+/// not a claim about a wider *distribution*; §3.4's tuning used all 64
+/// distinct rows.
+fn attention_rows_repeated(rows: usize) -> (Vec<f32>, usize, usize) {
+    let (base, base_rows, keys) = attention_rows();
+    let mut values = Vec::with_capacity(rows * keys);
+    for row in 0..rows {
+        let source = row % base_rows;
+        values.extend_from_slice(&base[source * keys..(source + 1) * keys]);
+    }
+    (values, rows, keys)
+}
+
+/// Bytes a per-channel operand plane needs for `rows` lanes at four bytes a
+/// lane, page-rounded. The planes were 4 KiB fixed while rows was 64; at
+/// 1792 lanes the ALU plane alone is 7 KiB, and a plane short of the
+/// programmed channel count is how NRDMA reads into whatever follows it.
+/// The row count this process measures, from `PROBE_ROWS`, defaulting to
+/// the fixture's own 64.
+///
+/// One row count per process rather than a sweep inside one: an NPU
+/// measurement taken after another in the same process is not independent
+/// -- the accumulator sweeps that taught this repo so are recorded in
+/// ISSUES -- and a shape that wedges the device would otherwise poison
+/// every shape after it.
+fn rows_from_env() -> usize {
+    std::env::var("PROBE_ROWS")
+        .ok()
+        .and_then(|value| value.parse().ok())
+        .unwrap_or(64)
+}
+
+fn plane_bytes(rows: usize) -> usize {
+    ((rows.max(16).next_multiple_of(16)) * 4).next_multiple_of(4096)
+}
+
 fn total_variation(got: &[f32], want: &[f32]) -> f32 {
     0.5 * got
         .iter()
@@ -237,7 +279,7 @@ unsafe fn run(
 #[test]
 #[ignore = "requires an RK3588 NPU at /dev/accel/accel0"]
 fn softmax_matches_an_exact_oracle_on_real_attention_rows() {
-    let (rows_f32, row_count, keys) = attention_rows();
+    let (rows_f32, row_count, keys) = attention_rows_repeated(rows_from_env());
     let shape = Shape::new(keys as u32, row_count as u32);
     let plan = SoftmaxPlan::try_new(shape).expect("the fixture's shape should plan");
     let input_scale = shape.exp_input_scale;
@@ -300,11 +342,11 @@ fn softmax_matches_an_exact_oracle_on_real_attention_rows() {
 
         let scratch = owned.add(fd, plan.scratch().bytes(), &file);
         let scratch_ptr = owned.buffers[1].host_ptr;
-        let alu_plane = owned.add(fd, 4 * 1024, &file);
+        let alu_plane = owned.add(fd, plane_bytes(row_count), &file);
         let alu_ptr = owned.buffers[2].host_ptr;
-        let const_plane = owned.add(fd, 4 * 1024, &file);
+        let const_plane = owned.add(fd, plane_bytes(row_count), &file);
         let const_ptr = owned.buffers[3].host_ptr;
-        let reciprocal_plane = owned.add(fd, 4 * 1024, &file);
+        let reciprocal_plane = owned.add(fd, plane_bytes(row_count), &file);
         let reciprocal_ptr = owned.buffers[4].host_ptr;
         let weight_bytes = sum_weight_bytes(row_count as u32).unwrap() as usize;
         let sum_weights = owned.add(fd, weight_bytes, &file);
@@ -319,7 +361,7 @@ fn softmax_matches_an_exact_oracle_on_real_attention_rows() {
         let mut packed = vec![0u8; weight_bytes];
         pack_sum_weights(row_count as u32, &mut packed).expect("all-ones packing");
         ptr::copy_nonoverlapping(packed.as_ptr(), weights_ptr, packed.len());
-        let mut constant = vec![0u8; 4 * 1024];
+        let mut constant = vec![0u8; plane_bytes(row_count)];
         write_constant_plane(row_count as u32, &mut constant).expect("constant plane");
         ptr::copy_nonoverlapping(constant.as_ptr(), const_ptr, constant.len());
 
@@ -501,7 +543,7 @@ fn softmax_matches_an_exact_oracle_on_real_attention_rows() {
             assert!(d > 0.0, "row {row}: the sum came back {d}");
             reciprocals.push(1.0 / d);
         }
-        let mut plane = vec![0u8; 4 * 1024];
+        let mut plane = vec![0u8; plane_bytes(row_count)];
         write_bn_mul_plane_fp16(
             &mut plane,
             (row_count as u32).max(16).next_multiple_of(16),
@@ -621,7 +663,7 @@ fn the_fixture_s_shape_plans() {
 fn softmax_wall_time_against_the_cpu() {
     const WARMUP: usize = 3;
     const ITERATIONS: usize = 20;
-    let (rows_f32, row_count, keys) = attention_rows();
+    let (rows_f32, row_count, keys) = attention_rows_repeated(rows_from_env());
     let shape = Shape::new(keys as u32, row_count as u32);
     let plan = SoftmaxPlan::try_new(shape).unwrap();
     let input_scale = shape.exp_input_scale;
@@ -656,11 +698,11 @@ fn softmax_wall_time_against_the_cpu() {
         }
         let scratch = owned.add(fd, plan.scratch().bytes(), &file);
         let scratch_ptr = owned.buffers[1].host_ptr;
-        let alu_plane = owned.add(fd, 4096, &file);
+        let alu_plane = owned.add(fd, plane_bytes(row_count), &file);
         let alu_ptr = owned.buffers[2].host_ptr;
-        let const_plane = owned.add(fd, 4096, &file);
+        let const_plane = owned.add(fd, plane_bytes(row_count), &file);
         let const_ptr = owned.buffers[3].host_ptr;
-        let reciprocal_plane = owned.add(fd, 4096, &file);
+        let reciprocal_plane = owned.add(fd, plane_bytes(row_count), &file);
         let reciprocal_ptr = owned.buffers[4].host_ptr;
         let weight_bytes = sum_weight_bytes(row_count as u32).unwrap() as usize;
         let sum_weights = owned.add(fd, weight_bytes, &file);
@@ -671,7 +713,7 @@ fn softmax_wall_time_against_the_cpu() {
         let mut packed = vec![0u8; weight_bytes];
         pack_sum_weights(row_count as u32, &mut packed).unwrap();
         ptr::copy_nonoverlapping(packed.as_ptr(), weights_ptr, packed.len());
-        let mut constant = vec![0u8; 4096];
+        let mut constant = vec![0u8; plane_bytes(row_count)];
         write_constant_plane(row_count as u32, &mut constant).unwrap();
         ptr::copy_nonoverlapping(constant.as_ptr(), const_ptr, constant.len());
 
@@ -761,7 +803,7 @@ fn softmax_wall_time_against_the_cpu() {
                 );
                 reciprocals.push(1.0 / f16_to_f32(bits));
             }
-            let mut plane = vec![0u8; 4096];
+            let mut plane = vec![0u8; plane_bytes(row_count)];
             write_bn_mul_plane_fp16(
                 &mut plane,
                 (row_count as u32).max(16).next_multiple_of(16),
@@ -815,6 +857,13 @@ fn softmax_wall_time_against_the_cpu() {
         println!(
             "    per task: {:.0} us, against S4's 37-59 us for a bare submit-and-wait",
             npu * 1e3 / plan.device_tasks() as f64
+        );
+        // What ROADMAP's lever 1 is about: a task's cost is fixed and its
+        // width is free, so the figure that should fall as rows rise is the
+        // cost per row.
+        println!(
+            "    per row: {:.1} us ({row_count} rows)",
+            npu * 1e3 / row_count as f64
         );
 
         // The CPU arm: a plain scalar softmax over the same data. Not

@@ -1178,15 +1178,72 @@ two host steps, which §4 argued about at length, come to **0.009 ms of
 0.49** -- under 2%, and S4's conclusion was right for a reason that barely
 matters.
 
+
+### 10.3 Rows per task, measured: the sign flips at about 400 rows
+
+ROADMAP's lever 1, and it was the one worth trying. A task's cost is fixed
+and its width is nearly free, so the figure that matters is not the cost of
+a softmax but the cost **per row**. Measured, one row count per process,
+`ROCKET_ALLOW_UNBACKED_CHANNELS=1` for the rows past the recorded bound:
+
+| rows | device tasks | NPU ms | CPU ms | ratio | NPU per row |
+|---|---|---|---|---|---|
+| 64 | 13 | 0.495 | 0.112 | 4.41x slower | 7.7 us |
+| 197 | 13 | 0.594 | 0.349 | 1.70x slower | 3.0 us |
+| 394 | 14 | 0.716 - 0.763 | 0.69 | **1.03 - 1.11x, even** | 1.8 us |
+| 788 | 15 | 1.082 | 1.366 | **0.79x, NPU faster** | 1.4 us |
+| 1792 | 19 | 1.803 - 1.855 | 3.10 - 3.19 | **0.58x, NPU 1.7x faster** | 1.0 us |
+
+**The CPU is dead flat at 1.73 to 1.78 microseconds a row** at every size,
+exactly as a linear kernel should be. The NPU falls from 7.7 to 1.0 as the
+fixed per-task cost is spread wider, and crosses the CPU at about **400
+rows -- two ViT-B heads**. At the ceiling it is 1.7x faster, reproducibly
+(0.58x twice).
+
+**Correctness holds the whole way**: mean total variation stays between
+1.11% and 1.15% from 64 rows to 1792, and the worst row stays 13.97%. So
+the operand planes index correctly at 1792 lanes, which is 28x the widest
+any probe had driven, and §8's S5 refusal at 64 was conservative by that
+factor rather than by a little.
+
+Task count grows only from 13 to 19 over that range -- the sum tree's
+convolutions start tiling once their working set outgrows the CBUF -- so
+28x the rows costs 1.5x the tasks. That ratio is the whole lever.
+
+**The ceiling is the sum tree's**, not the plane's: §2.2's reduction is a
+depthwise convolution, so its channel count *is* the row count, and
+`conv::MAX_DEPTHWISE_CHANNELS` is 1792. That is 9 ViT-B heads, so a 12-head
+layer wants two passes -- and 6 + 6 rather than 9 + 3, since both halves
+should sit well past the crossover. §10.1's lever 2 would lift the ceiling
+outright by moving the sum onto the PV matmul, whose dense ceiling is 3584.
+
+### 10.4 Two reasons not to believe the 1.7x yet
+
+**The CPU arm is one core.** This is the big one. IREE threads a softmax
+across its workers, and on four A76s the CPU side would be roughly 4x
+faster -- which would move the crossover above the 1792 ceiling and make
+the NPU a loss again at every shape that fits. The comparison measured here
+is *one NPU core against one CPU core*, and nothing in it says what happens
+on a full machine. The NPU has three cores too, so the honest next
+measurement is a threaded CPU arm against a fanned-out NPU arm, and
+MULTICORE.md §12's tile fan-out plus §10.1's lever 4 are how the second
+half of that would work.
+
+**And the CPU arm is still scalar Rust**, not IREE's codegen. P10 has 1.39x
+in hand from a wider vector tile, which alone moves the crossover from
+about 400 rows to about 550 and cuts the 1792-row margin from 1.7x to
+roughly 1.24x.
+
+So the result is not "softmax belongs on the NPU". It is: **the per-task
+cost was the whole problem, batching rows is the cure, and whether the cure
+is enough depends on a comparison nobody has made yet.** The op still ships
+off by default.
+
 ### 10.1 Which levers are left
 
 Not accuracy, and not the host. Task count:
 
-* **Rows per task.** 64 rows is not a hardware bound, it is the widest
-  per-channel plane any probe has driven (§8's S5 refusal). A ViT head is
-  197 rows, so the same three submissions could carry 3x the work for
-  roughly the same 13 IRQs. This is the biggest single lever and it is a
-  measurement, not a mechanism.
+* ~~**Rows per task.**~~ Done, and it **flips the sign** -- §10.3.
 * **A wider sum window.** The sum tree is 5 of the 13 tasks because the
   planner backs only a 3x3 stride-3 square window (§2.2). An 8x8 at stride
   8 would reduce a row in two levels instead of five -- three tasks, about
