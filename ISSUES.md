@@ -689,7 +689,7 @@ correct, and worth not touching.
 
 ---
 
-## P7 (S2) — CLOSED on its own question, with one figure's provenance open: the depthwise demote is on by default and the pads fold into the CNA, and MobileNetV2 fp16 is 10.0 ms against a four-worker `--no-offload` arm of 54.2 — so the "whole fp16 offload loses to a fair CPU baseline" verdict this entry carried is overturned by 7.3x (2026-11-25). The 30.8 ms baseline quoted in the 2026-11-24 note below cannot be reproduced at any allocation; see the last subsection
+## P7 (S2) — CLOSED: the depthwise demote is on by default and the pads fold into the CNA, and MobileNetV2 is 10.0 ms against a four-worker `--no-offload` arm of 30.9 (f32 import) or 54.2 (fp16 export) — so the "whole fp16 offload loses to a fair CPU baseline" verdict this entry carried is overturned, 3.1x precision-matched, with the NPU arm itself down 7.3x from 73.1 (2026-11-25)
 
 **Superseded 2026-11-24: the depthwise demote is on by default, and
 MobileNetV2 fp16 ties `--no-offload` (30.8 ms each, base 35.3).** Everything
@@ -700,12 +700,12 @@ copies (`pack.input`, `compact`), i.e. conv padding, not the demote.
 MobileNetV2 fp16 is 13.5 ms, 2.3x faster than `--no-offload`.** See the
 Resolved entry "Depthwise padding folds into the CNA".
 
-> **The `--no-offload` arm behind both figures in this note -- 30.8 ms -- is
-> unattributed.** It cannot be reproduced on this board at any core
-> allocation (54.4 / 57.8 / 181 measured 2026-11-25), so "ties" and "2.3x
-> faster" are quoted against something nothing here matches. The last
-> subsection of this entry has the measurements and what would settle it. The
-> 2026-11-25 result does not depend on it.
+> **The 30.8 ms `--no-offload` arm behind both figures in this note is the
+> f32 import**, not the fp16 export the survey builds for this model -- which
+> is 54.2 ms at the same allocation and clock. Both claims are sound; the
+> precision just was not labelled. The f32 arm is the fairer baseline, and
+> the last subsection of this entry has why, plus the one thing about it that
+> is still open.
 
 They are the whole of the `outside` term (70.9 ms of a 127 ms model; see
 the profile below): ten executables over 17 dispatch
@@ -990,9 +990,10 @@ stable at both clocks, zero faults in ~60 runs.
 
 > **Superseded 2026-11-25 — read the note at the end of this entry first.**
 > The paragraph below concluded that MobileNetV2 fp16's offload is underwater
-> at a fair allocation. It is not: the same four-worker comparison is now
-> 10.0 ms offloaded against 54.2 ms `--no-offload`, 5.4x the other way. The
-> table above is kept as the 2026-09-09 record.
+> at a fair allocation. It is not: the same comparison, precision-matched to
+> this one's f32 import, is now 10.0 ms offloaded against 30.9 ms
+> `--no-offload` -- 3.1x the other way. The table above is kept as the
+> 2026-09-09 record.
 
 **The verdict holds anyway, and the reason has moved.** At four workers
 `--no-offload` is **54.5 ms** against a best NPU arm of 73.1 — the CPU is
@@ -1054,24 +1055,32 @@ weight packing and the HAL are all already there and all already correct.
 
 ---
 
-### Overturned 2026-11-25: the four-worker verdict has inverted, and by 7.3x
+### Overturned 2026-11-25: the four-worker verdict has inverted, and the NPU arm fell 7.3x
 
 The paragraph above -- "the whole fp16 offload on this model is underwater
 once the CPU is allocated fairly" -- was the number this file's **Suggested
-order** told readers to rank work against. It is no longer true. `orangepi`,
-governor `performance`, NPU 600 MHz, `--task_topology_cpu_ids=4,5,6,7`,
+order** told readers to rank work against. It is no longer true, on either
+CPU baseline. `orangepi`, governor `performance`, NPU 600 MHz, cpu 4-7,
 medians of 5 warm repetitions:
 
-| arm | 2026-09-09 | 2026-11-25 |
-|---|---:|---:|
-| NPU, best arm | 73.1 ms | **10.0 ms** (9.90-10.2) |
-| `--no-offload` | 54.5 ms | **54.2 ms** (54.1-54.2) |
-| verdict | CPU 1.34x faster | **NPU 5.4x faster** |
+| arm | 2026-09-09 | now | source |
+|---|---:|---:|---|
+| NPU, best arm | 73.1 ms | **10.0 ms** (9.90-10.2) | measured 2026-11-25 |
+| `--no-offload`, f32 import | 54.5 ms | **30.9 ms** | #81, 2026-11-24 |
+| `--no-offload`, fp16 export | — | **54.2 ms** (54.1-54.2) | measured 2026-11-25 |
+| verdict | CPU 1.34x faster | **NPU 3.1x faster** | precision-matched |
 
-**The control is that the CPU arm did not move**: 54.5 against 54.2, inside
-the spread of either. The same four A76s do the same work in the same time,
-so the two rows are on the same footing and the whole change is on the NPU
-side -- 73.1 to 10.0, a factor of 7.3.
+**The NPU arm fell 7.3x, from 73.1 to 10.0, and that is the whole of the
+change.** The verdict flips on either baseline: 3.1x against the f32 CPU arm
+and 5.4x against the fp16 one.
+
+**3.1x is the figure to quote.** The 2026-09-09 claim was f32 on both sides,
+so the precision-matched successor is the f32 CPU arm, and the f32 arm is
+1.76x faster than the fp16 one because IREE's CPU codegen is good at f32 on
+an A76 and poor at fp16. The subsection below has the evidence and what is
+still open about it; **the first version of this note got that wrong**, taking
+54.5 and 54.2 for the same measurement and calling the CPU arm unmoved. It
+is not unmoved -- those are two different baselines, and the f32 one halved.
 
 What moved it is not one thing, which is why no single entry claimed it: the
 depthwise pad fold (item 2 of the list just above, now done), the fp16
@@ -1097,16 +1106,11 @@ demote went, and the trade is not losing any more. The three remaining items
 in the list above are worth re-pricing against a 10.0 ms model rather than a
 73.1 ms one, where a 7.4 ms dwell or a CPU pad is a far larger share.
 
-### Unresolved while reconciling this: a 1.76x discrepancy in this entry's own CPU baseline
+### The 30.8 ms baseline is the f32 import, and it is the fairer one
 
-This entry now carries three MobileNetV2 fp16 comparisons, and **their
-`--no-offload` arms do not agree.** The 2026-11-24 supersession at the top
-says the demote arm "ties `--no-offload` (30.8 ms each)" and then that the
-pad fold makes the model "13.5 ms, 2.3x faster than `--no-offload`" --
-13.5 x 2.3 = 31.0, so that baseline is 30.8 ms. The 2026-09-09 table says
-54.5 ms at four workers, and 2026-11-25 measures 54.2.
-
-**Allocation does not explain it.** Measured 2026-11-25 on
+The first pass at this reconciliation flagged the 30.8 ms `--no-offload` arm
+behind "ties `--no-offload`" and "2.3x faster" as unattributable, because no
+core allocation reproduces it. Measured 2026-11-25 on
 `mobilenet_v2.fp16.cpu.vmfb`, medians of 5 warm repetitions:
 
 | `--task_topology_cpu_ids` | ms |
@@ -1115,23 +1119,39 @@ pad fold makes the model "13.5 ms, 2.3x faster than `--no-offload`" --
 | `0,...,7` | 57.8 |
 | omitted (default topology) | 181 |
 
-No allocation on this board puts this model's `--no-offload` arm near 30.8,
-and the default topology is 3.3x *slower* rather than faster, which is the
-trap the method note already warns about. So the 30.8 ms arm is a different
-model file or a different notion of baseline, not a different core count --
-most likely `mnv2_14.f32.mlir` against `mobilenet_v2.fp16`, but the
-2026-09-09 four-worker row is `mnv2_14.f32.mlir` at 54.5, so that does not
-settle it either.
+So allocation is not it, and the default topology is 3.3x *slower* rather
+than faster. **The answer is in #81's own commit body**, which says it in one
+line: *"The survey mnv2 is an f32 import"*. The 30.8/30.9 ms arm is
+`--no-offload` on the **f32** import; the 54.2 ms arm is `--no-offload` on
+the **fp16** export, which is what `tools/model_survey.py` builds for this
+model. Both are real, neither is wrong, and nothing labelled which.
 
-**Why it matters rather than being bookkeeping.** "Ties `--no-offload`" and
-"2.3x faster than `--no-offload`" are the two claims that closed the
-depthwise demote and the pad fold, and both are quoted against a baseline
-nothing here can reproduce. The 7.3x result above does not depend on them --
-it uses the 54.2 arm measured alongside it, with the 54.5 arm as its control
--- so the verdict stands either way. What is open is the **provenance of the
-30.8 ms figure**: recovering the pad-fold measurement's model file and flags
-would either reconcile it or retract two "resolved" claims. Until then, treat
-30.8 as unattributed and rank against the 54.2 arm.
+**The fp16 CPU arm is 1.76x slower than the f32 one, so a precision-matched
+comparison is the honest one.** IREE's CPU codegen is good at f32 on an A76
+and poor at fp16, so quoting an fp16 NPU arm against an fp16 CPU arm flatters
+the offload by that factor. Both multiples, same conditions (cpu 4-7,
+600 MHz):
+
+| baseline | `--no-offload` | NPU | ratio |
+|---|---:|---:|---|
+| f32 import (#81, 2026-11-24) | 30.9 ms | 10.0 ms | **3.1x faster** |
+| fp16 export (survey, 2026-11-25) | 54.2 ms | 10.0 ms | 5.4x faster |
+
+**3.1x is the number to quote**, because it is precision-matched and because
+the 2026-09-09 claim it overturns was f32 on both sides. The verdict does not
+depend on the choice -- the old claim was that the CPU is 1.34x *faster*, and
+on either baseline the NPU now wins -- but the magnitude does, and 5.4x
+overstates it.
+
+**Still open: the f32 arm reads 54.5 in September and 30.9 in November.** The
+2026-09-09 four-worker row is `mnv2_14.f32.mlir` at 54.5; #81's f32 arm is
+30.9 at the same allocation and clock. That is another 1.76x, and it is
+either a different model file or eleven weeks of CPU-side change in IREE and
+the spec. Settling it needs an f32 `--no-offload` build from current `main`
+measured beside the fp16 one, which this pass could not do: no host
+`libIREECompiler.so` newer than the pad fold exists in this checkout. Until
+then the September row and the November row should not be subtracted from
+each other.
 
 ---
 
@@ -3631,18 +3651,23 @@ numbers in this file say. ResNet50's NPU share is 60%, not 76%.
 ~~The 2026-09-09 re-measurement of P7 also produced the single most important
 number in this list, and it is not about P7: **at four workers MobileNetV2
 fp16's `--no-offload` arm is 54.5 ms against a best NPU arm of 73.1.**~~
-**Overturned 2026-11-25 and by 7.3x** (see the note at the end of P7). The
-NPU arm is **10.0 ms** against a `--no-offload` arm of **54.2** at the same
-four workers: the CPU side did not move, the NPU side fell 73.1 to 10.0, and
-the offload is now **5.4x faster** rather than 1.34x slower. The 2026-11-24
-ten-model survey agrees -- every model beats its own `--no-offload` arm, 2.6x
-to 35x -- so this is not one model's artefact.
+**Overturned 2026-11-25** (see the note at the end of P7). The NPU arm is
+**10.0 ms** against a `--no-offload` arm of **30.9 ms** on the f32 import
+that the 2026-09-09 row also used, so the offload is **3.1x faster** rather
+than 1.34x slower. The NPU arm itself fell 73.1 to 10.0, a factor of 7.3;
+the CPU arm roughly halved over the same period, which is why the ratio
+moves by less. (Against the fp16 export's `--no-offload` arm, 54.2 ms, it is
+5.4x -- but IREE's CPU codegen is 1.76x worse at fp16 than f32 on an A76, so
+that comparison flatters the offload and 3.1x is the one to quote.) The
+2026-11-24 ten-model survey agrees on the direction -- every model beats its
+own `--no-offload` arm, 2.6x to 35x -- so this is not one model's artefact.
 
 **Rank work against that instead, and note what it does to the ranking.** The
 old number said the per-dispatch tax dominated, so the first question about
 any new offload was whether it added sites. It does not dominate any more:
 the 10.0 ms build offloads **54** sites where the 73.1 ms one offloaded 37 to
-44. More sites, 7.3x faster. What displaced the tax was P2's epilogue fusion
+44. More sites, and the NPU arm 7.3x faster. What displaced the tax was P2's
+epilogue fusion
 and residual adds, lazy compaction, P3's sized constant sync and the
 depthwise pad fold -- each measured against its own baseline, none of which
 came back to re-price this line.
