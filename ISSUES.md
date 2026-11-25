@@ -1807,7 +1807,7 @@ converter did not corrupt the model here, the importer mishandled what it
 produced. Root cause not yet localized -- the next step is a layer-wise
 comparison to find where the two imports first diverge.
 
-## C15 (S3) — RESOLVED as *implemented and off by default*: attention offloads correctly and is slower on both models measured (ViT-B 1.16x, BERT-384 1.41x); the CPU was barely spending anything on it
+## C15 (S3) — RESOLVED as *implemented and off by default*: attention offloads correctly and is slower on every arm measured (ViT-B f32 1.16x, BERT-384 1.41x, ViT-B fp16 1.30x on the strided packer); the CPU was barely spending anything on it, and re-measuring on a 4.1x faster coefficient packer moved that by 36 ms of 97 and did not change the sign
 
 **[verified]** `rocket-compiler audit` on ViT-B/16 (f32 import) reports 74
 convolution/matmul candidates: 73 matmuls accepted and one refusal, the
@@ -1917,21 +1917,125 @@ identical arithmetic, because `K` becomes `Cin` and charges CBUF feature
 residency while `N` becomes `Cout` and charges none. The up-projection pays
 instead on the way out, 31 ms of `compact` per inference against 7.5.
 
-**The uncacheable packing in there is now about 6 ms, not 45 (2026-11-24),
-and it does not change the verdict.** The paragraph above prices attention's
-one structural disadvantage -- its right-hand operands are activations, so
-their coefficient packs can never hit the weight cache -- at 288 fresh packs
-an inference, ~45 ms. `rocket_core::weights` now packs symmetric 1- and
-2-byte filters as strided runs instead of one closure call per coefficient
-(COMPILER_ROADMAP.md 6.3), and on the board the shape this depends on, 1x1
-fp16 `[197, 197]`, goes 0.374-0.409 ms -> 0.048 ms, 7.7-8.5x. So the 45 ms
-becomes about 6, which recovers roughly 39 of the 95 ms this entry's ViT
-delta is made of -- the largest single nameable piece of it, and still not
-enough to flip the sign on its own. SOFTMAX.md section 11.4 predicted 39 ms
-from the prototype at one shape; the generalised packer lands on the same
-number. The rest of C15's cost is `record`, `wait.npu` and `compact`, none of
-which this touches, so the conclusion stands unchanged: attention offload
-needs a better *shape*, not a cheaper tax.
+**Re-measured end to end on the strided packer, 2026-11-25: the packing is
+11 ms an inference, not 45, it recovers 36 of the 97 ms, and the verdict is
+unchanged.** The paragraph above prices attention's one structural
+disadvantage -- its right-hand operands are activations, so their coefficient
+packs can never hit the weight cache -- at 288 fresh packs an inference,
+~45 ms, and that figure was arrived at by arithmetic. It is now measured, on
+both sides, and it was right.
+
+`orangepi` (Armbian 7.3.5, governor `performance`, NPU 600 MHz),
+ViT-B/16 **fp16** this time rather than the f32 import above,
+`--task_topology_cpu_ids=4,5,6,7`, medians of 5 warm repetitions, arms
+ABBA-interleaved, two full passes each:
+
+| arm | NPU sites | contraction on CPU | per-coefficient packer | strided packer |
+|---|---:|---:|---:|---:|
+| NPU, attention on CPU (default) | 50 | 24 | **205 ms** | **205 ms** |
+| NPU, attention offloaded (`--batch-matmul`) | 338 | 0 | **302 ms** | **266 ms** |
+| delta | | | +97 ms (1.47x) | **+61 ms (1.30x)** |
+
+Both arms are correct: `max|err|` 0.0410 against the ONNX Runtime oracle on
+the same inputs, argmax and top-5 unchanged, on both packers. The default arm
+does not move, which is the control -- it has no `pack.weights` phase at all,
+because its filters are constants the 6.3 hoist already packed at compile
+time.
+
+**Two independent A/Bs agree.** The table above is cross-binary: the board's
+`iree-benchmark-module` of 2026-11-24 predates the strided packer, and
+`git diff` over the three directories the board binary statically links
+(`rocket-core/src`, `iree-rocket-hal/src`, `rocket-hal-driver/src`) shows
+only `weights.rs` and a comment-only hunk of `weight_cache.rs` between it and
+the fresh build -- so the packer is the only behavioural difference. Its
+`pack.weights` rate of 163 MB/s confirms it empirically, against 674 for the
+new one. `ROCKET_WEIGHTS_REFERENCE_PACKER` then does the same comparison
+*inside one binary against one module*, with the packer as the only variable:
+298 ms forced down the per-coefficient arm against 268 ms, -30 ms. So the
+saving is 30-36 ms by two routes that share no binary.
+
+To reproduce the two arms,
+`tools/model_survey.py run --model vit_b_16 --arm npu --arm npu-bmm --board
+orangepi`; `npu-bmm` is the `--batch-matmul` arm. The board binary has to be
+built *after* 2026-11-24 or it is the per-coefficient arm, which is the whole
+point of the table -- `check_binary_is_current` in that harness warns about
+exactly this.
+
+**`ROCKET_PROFILE` at 11 repetitions, same module, same pinning, shows the
+change is confined to one phase** -- which is what makes this a controlled
+result rather than two walls that happened to differ:
+
+| phase, ms an inference | per-coefficient | strided | delta |
+|---|---:|---:|---:|
+| `pack.weights` (3168 calls = 288 x 11) | **44.9** | **10.9** | **-34.0** |
+| `outside` | 108.2 | 106.0 | -2.2 |
+| `record` | 28.0 | 28.9 | +0.9 |
+| `pack.input` | 15.0 | 14.9 | -0.1 |
+| `wait.npu` | 102.6 | 102.3 | -0.3 |
+| `compact` | 30.2 | 29.8 | -0.4 |
+
+`pack.weights` moves by 34 ms and nothing else moves at all. The profiled
+wall falls 339.6 -> 303.3 ms an inference, a 36.2 ms drop against that 34.0
+ms of host work, so the transfer is about 1:1 -- as it has to be, because
+this driver does not overlap host and device: the same profile reports
+`host 2565.5 ms, npu 1169.5 ms, wall 3735.1` for eleven inferences, and the
+first two sum to the third.
+
+**The in-situ factor is 4.13x, not the microbenchmark's 7.7x**, and that gap
+is the one number here worth carrying forward. `weight_pack_rate_hw` on this
+board measures 1x1 fp16 `[197, 197]` at 0.3725 -> 0.0483 ms, 7.72x at 208 ->
+1609 MB/s, `taskset -c 4-7` with nothing else running. The same packs driven
+by IREE's dispatches reach 163 -> 674 MB/s. A packing microbenchmark on this
+board overstates what the model will see by about 1.8x; price the next one
+accordingly.
+
+**That factor was measured independently, on a different arm, and the two
+agree -- but the mechanism is the other one's, not the one guessed here.**
+COMPILER_ROADMAP.md 6.3's unhoisted cold-start A/B (#93) prices the same
+packer on *constant* filters in ResNet50-224 and MobileNetV2 and gets
+**4.0-4.1x in situ against a 5.5-7.4x harness**: a different model, a
+different filter kind, and a cold first inference rather than this entry's
+steady state, landing on the same number. So ~4x is a property of the board
+under a real dispatch stream rather than an artifact of either setup.
+
+It also falsifies the explanation this entry first gave. The obvious guess is
+worker-thread contention -- four IREE workers competing for the same cores and
+bandwidth -- and 6.3 rules that out as the main cause: over the same 48.62 MiB
+the *per-coefficient* arm moves 181 MB/s in situ against the harness's 205,
+inside the rebuild spread, so the slow arm behaves identically in both
+settings. Contention would have slowed it too. What moves is the fast arm,
+732 against 1133, and the cause is **first touch**: the harness re-packs one
+filter in a loop with source and destination resident, while the driver packs
+each filter once out of pages nothing has touched. With five times less
+arithmetic left, that traffic stops being hidden.
+
+Whether that is the mechanism *here* is not established, and the difference
+matters for anyone extending this. 6.3's operands are cold constant pages;
+this entry's are activations the previous dispatch just wrote, 288 times an
+inference, into scratch buffers the pool reports as 94% reused (15146 against
+925 allocated over eleven inferences) -- so they should be warmer than 6.3's,
+yet the factor is the same. Either first touch still dominates even on a
+reused scratch destination, or contention contributes here where it did not
+there. Neither measurement separates them, so the honest reading is that
+**the 4x is reproducible while its cause is established only for the constant
+case.**
+
+**What this does and does not change.** It recovers **36 of the 97 ms, 37% of
+the loss** -- SOFTMAX.md section 11.4 predicted 39 ms and 41% from the
+prototype at one shape, so the projection was good to within the in-situ
+factor. It is still the largest single nameable piece of the delta and still
+not enough to flip the sign. What is left, per inference: `record` +22.8,
+`compact` +25.0, `wait.npu` +17.8, `pack.input` +8.9 -- none of which the
+packer touches.
+
+And the benefit side is unchanged, which is the real verdict. Moving the
+*entire* attention core onto the NPU takes `outside` from 108.2 ms to 106.0:
+**about 2 ms of CPU time bought for 61 ms spent.** The f32 ViT measurement
+above bought 3 ms for 125; the shapes, the precision, the board and nine
+weeks of per-dispatch work have all changed, and the answer has not. The
+conclusion stands as written: attention offload needs a better *shape* -- a
+batched descriptor, or fusing the pair so the intermediate never lands -- not
+a cheaper tax.
 
 ## P10 (S3) — IREE compiles the CPU softmax with a 4-wide vector tile; a 16-wide tile is bit-identical and 1.39x faster, and nothing in this stack can set it
 

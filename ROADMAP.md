@@ -941,6 +941,18 @@ MobileNetV2 and 1290 -> 551 ms on Wide ResNet50; both of those *avoid* the
 packer rather than fix it, and neither is available to activations. The
 ordering is the packer first, then lever 2 on top of it.
 
+**The packer landed, 2026-11-24 (#92),** which closes that gate.
+`rocket_core::weights` packs every symmetric 1- and 2-byte filter as
+strided runs -- generalised past the 1x1 fp16 prototype to int8 and the
+whole 2-byte family at every kernel size -- measured at **5.4x to 10.7x**
+by shape on the board, both arms in one process. `P^T` `[197, 197]` fp16 is
+0.374-0.409 ms -> **0.048 ms** (8.47x), so the 69 ms an inference above
+becomes about 8, and `P^T` lands at 0.42x the sum tree it replaces rather
+than 3.2x. The end-to-end model answer is an honest zero -- a hoisted
+`.vmfb` never reaches the runtime packer -- so what the speed buys is the
+three cases the hoist cannot reach, of which attention is one. C15's ~45 ms
+becomes about 6.
+
 One cost of this lever that SOFTMAX.md §1.2 did not price: the transposed
 form makes the PV weight operand `P^T` (`N x M`) where the untransposed one
 is `V` (`N x d_v`) -- at ViT-B/16, **3.08x the coefficients**, 0.363 ms a
@@ -1050,9 +1062,14 @@ a 2.42x gap at the 1.22x-1.34x its own path measured.
 denominator column is hardware-confirmed and free, and it pays exactly
 where §13.2's last caveat bites: given a PV matmul already on the NPU the
 epilogue costs nothing and there is no CPU softmax in the loop to beat.
-That is gated on the coefficient packer (69 ms an inference of uncacheable
-packing, 7.5x available) and on re-measuring C15 -- which are the two
-pieces of work left, and neither of them is a softmax problem.
+The coefficient packer that gated it landed in #92 at 5.4-10.7x, taking
+`P^T` to 0.048 ms a head, and C15 has now been re-measured on it: the
+offloaded arm goes 302 -> 266 ms against a 205 ms default, so **36 of its
+97 ms came back and it still loses by 61**. Offloading the whole attention
+core buys about 2 ms of CPU time. So lever 2's epilogue is free and its gate
+is open, and the fused block it would sit inside is still not worth
+assembling -- what blocks it is `record`, `compact` and `wait.npu` per
+dispatch, which is COMPILER_ROADMAP §4's target and not a softmax problem.
 
 ---
 
