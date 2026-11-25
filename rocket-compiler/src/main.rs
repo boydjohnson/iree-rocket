@@ -574,6 +574,7 @@ mod tests {
             batch_matmul: false,
             strict_offload: false,
             strict_layout: false,
+            no_pack_weights: false,
             report_json: None,
             rocket_device_name: rocket.to_string(),
             cpu_device_name: cpu.to_string(),
