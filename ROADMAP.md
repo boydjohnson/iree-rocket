@@ -37,11 +37,32 @@ becomes its own dispatch. That is what the 5079 ms of `outside` is.
 
 P8's own ranked lever list puts *"standalone elementwise/transpose matchers"* at
 **#3, explicitly "not before (1)"** -- and (1), layout propagation, was built and
-**refuted**, worth 0%. Its closing sentence is the one to hold onto:
+**refuted**, worth 0%. Its closing sentence used to be the one to hold onto:
 
-> at the current per-dispatch cost, **more offload sites make the model slower**.
+> ~~at the current per-dispatch cost, **more offload sites make the model
+> slower**.~~
 
-So this roadmap separates two things the repo has previously conflated:
+**That sentence is retired, 2026-11-25.** It was measured on MobileNetV2 fp16
+when the offloaded arm was 73.1 ms against a `--no-offload` arm of 54.5 at
+four workers. Re-measured on the same four A76s: **10.0 ms against 54.2**,
+with the CPU arm unmoved and the NPU arm 7.3x faster. The build that does
+that offloads **54** sites where the losing one offloaded 37 to 44 -- more
+sites, far faster -- so site count is not the variable, and the 2026-11-24
+ten-model survey has every model beating its own `--no-offload` arm by 2.6x
+to 35x. ISSUES.md P7 carries the table and the two caveats.
+
+**What this does not change is the conclusion below, and it matters that the
+conclusion has its own evidence.** Coverage matchers still land behind a
+flag, because the one that was built and measured loses on its own terms:
+ViT with `--elementwise` is **1.17x slower at eight cores**, and no matcher
+cut point rescues it -- even ViT's widest element-wise op is net-negative, so
+it is not a bounds problem. The lever that would change that answer is layout
+propagation, which is P2 and refuted, not a wider matcher. So read the
+ordering below as resting on that measurement rather than on a blanket rule
+about dispatch counts, and judge a new op by the per-op bar the "Recommended
+order" section states: *does this op do more work than its dispatch costs?*
+
+With that, this roadmap separates two things the repo has previously conflated:
 
 - **Coverage work** (Phases 1 and 2) makes an op *expressible and correct*. It
   is worth doing -- an op that cannot be compiled at all cannot later be fused --
@@ -50,8 +71,10 @@ So this roadmap separates two things the repo has previously conflated:
 - **Throughput work** (Phase 3) *removes* a dispatch boundary rather than adding
   one, and is the only phase here with a positive performance story.
 
-A phase that ships coverage matchers switched on by default would regress every
-model measured in P8. That is the failure mode this ordering exists to prevent.
+A phase that ships element-wise coverage matchers switched on by default would
+regress ViT by 1.17x on the measurement above. That is the failure mode this
+ordering exists to prevent -- and it is now a statement about element-wise
+ops specifically, not about offload sites in general.
 
 ---
 
@@ -813,9 +836,12 @@ back on the wrong side, which is what P8 lever #3 was really saying.
 | Phase 2 | Breadth: new curves, the most additive and least urgent work here |
 
 Phases 1 and 2 land their matchers **behind a flag**, with the `--no-offload`
-arm measured alongside on every model. P8's measurement stands until something
-displaces it: at the current per-dispatch cost, switching them on by default
-would make MobileNetV2 slower.
+arm measured alongside on every model. P8's *MobileNetV2* measurement has
+been displaced -- that model is now 10.0 ms offloaded against 54.2 ms
+`--no-offload` at four workers, 5.4x the other way (ISSUES.md P7,
+2026-11-25) -- but the flag does not depend on it. What holds the flag shut
+is the direct measurement of the thing behind it: ViT with `--elementwise`
+is 1.17x slower at eight cores.
 
 Phase 3 moved that reference point and did not remove it. The int8 dispatch
 tax is much lower than it was -- the model beats the CPU now -- but what

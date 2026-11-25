@@ -7,11 +7,20 @@ iree-rocket compiler (`rocket-compiler-plugin`, `rocket-compiler`,
 `rocket-core`'s admission and planning as the compiler uses them). A fifth
 section collects questions about measurement method.
 
-Written against `main` at `b46c625` (2026-09-10). Each question names where it
-came from in brackets, so it can be checked against its source rather than
-taken on trust. A question here is *open*: if one of these is answered, move
-the answer into ISSUES.md, LIMITS.md or the relevant roadmap and delete the
+Written against `main` at `b46c625` (2026-09-10); section 3.1, 4.9 and 5.1
+reconciled against `2fe6ded` (2026-11-25). Each question names where it came
+from in brackets, so it can be checked against its source rather than taken
+on trust. A question here is *open*: if one of these is answered, move the
+answer into ISSUES.md, LIMITS.md or the relevant roadmap and delete the
 question, rather than annotating it here.
+
+**The 2026-11-25 pass checked the questions whose premises had moved, not all
+72.** What it found: one question answered in code (4.9.2), two resting on a
+number that has since inverted (3.1.2, 5.1.1), and one stating a board
+condition that is no longer true (5.1.3). The rest were read and left alone --
+most of this file still holds, and a question citing an issue now in ISSUES'
+**Resolved** section is usually citing it as background rather than being
+stale.
 
 How this relates to the other documents: [ISSUES.md](../ISSUES.md) carries
 open defects with their evidence, [LIMITS.md](../LIMITS.md) what is measured
@@ -276,11 +285,17 @@ example for an LLM's weights on one file? [ISSUES P1]
 
 ### 3.1 Host cost
 
-3.1.2 What is the per-dispatch tax made of now? At four workers,
-MobileNetV2 fp16's `--no-offload` arm (54.5 ms) beats the best NPU arm
-(73.1 ms). P8 measured the constant at 7.4 ms on two A76s and 1.6 ms on
-eight, at 200 MHz and before most of P2 landed. Nothing has attacked it
-since. [ISSUES Suggested order 2, P8]
+3.1.2 What is the per-dispatch tax made of now, and what is the largest host
+term? The premise this question carried is gone: MobileNetV2 fp16 at four
+workers is **10.0 ms offloaded against 54.2 ms `--no-offload`** (2026-11-25),
+not the 73.1-against-54.5 that made the tax look decisive, and it reaches
+that with *more* offloaded sites (54 against 37-44). The question survives in
+a narrower form, because the tax is still the thing worth attacking on a
+dispatch-heavy model: ISSUES C15's marginal attribution on a 338-site arm
+puts `compact` first at ~24.5 ms an inference, `record` second at ~18.7 and
+`pack.input` at ~9.1, where the same 50-site arm pays 3.0, 3.2 and 3.3. So:
+is the NC1HWC2 round trip now the binding host term, and does P8's flat
+per-dispatch model still describe it? [ISSUES P7 2026-11-25, C15, P8]
 
 3.1.3 Would pre-warming the scratch pool at executable load, from sizes the
 compiler already knows, remove the 15 to 45 ms per-process cold `record`
@@ -503,9 +518,15 @@ Both were measured clean at fp16 and stop at 4096 only because that is the
 widest extent measured at every rung. Should ceilings be per rung instead of
 precision-independent? [LIMITS, COMPILER_ROADMAP 5]
 
-4.9.2 Should requantized int8 dense `Cin` stay at 1344? It was the widest
-`Cin` measured correct on MobileNetV2, but its original reason (the chain bug
-C13) is fixed, while the HAL constant is 4096. [`admission.rs`, ISSUES C13]
+~~4.9.2 Should requantized int8 dense `Cin` stay at 1344?~~ **Answered in the
+tree, 2026-11-24: it is 2048.** Raised on ResNet50-224 int8, whose layer4
+`7x7 Cin 2048 -> 512` bottleneck inputs were its last convolutions on the
+accumulator path and the only `conv -> conv` edges left that could not chain.
+Gated by `int8_requant_cin2048_matches_oracle` and by the model against its
+`--no-offload` arm; `Cout` went to 2048 the day before on the same model.
+`admission.rs` carries the full rationale. Not deleted yet only because
+LIMITS.md has no requantized-dense ceiling table to move it into -- that
+table is the actual outstanding work here. [`admission.rs`, ISSUES Resolved]
 
 ---
 
@@ -515,8 +536,14 @@ C13) is fixed, while the HAL constant is 4096. [`admission.rs`, ISSUES C13]
 
 5.1.1 Which recorded conclusions depend on 200 MHz numbers and need
 re-measuring at 600 MHz? Every board number before 2026-09-09 has an
-inflated `wait.npu`. Candidates include P8's law, P1's "buys nothing yet"
-and the D1 geometry question. [ISSUES header, Suggested order]
+inflated `wait.npu`. This question named **P8's law** as its first
+candidate, and that one has now been collected: the law's MobileNetV2
+measurement is overturned at 600 MHz *and* a fair allocation (ISSUES P7,
+2026-11-25), though the clock is not what did it -- P2, P3 and the pad fold
+are. **P1's "buys nothing yet" and the D1 geometry question are still
+uncollected**, and so is every profile *share* quoted in this file from
+before 2026-09-09, since raising the clock shrinks `wait.npu` by 1.5-2.9x
+and leaves host terms untouched. [ISSUES header, Suggested order]
 
 5.1.2 Which numbers were taken under `ondemand` before the method note
 existed? [ISSUES "Method note"]
@@ -529,6 +556,15 @@ checked on a second RK3588 (or RK3588S) board? [LIMITS ViT-B/16 note,
 Still one board, but now two kernels. Since 2026-11-23, `planck` runs Armbian
 `7.3.5-edge-rockchip64` and is reached as `ssh orangepi`. The full
 `iree-rocket-hal` hardware gate passes 400/400 there, in both debug and
-`--release`, with the PPU patch in place (see 2.6). Model-level numbers have
-not been re-taken on the new OS, and its NPU runs at 200 MHz (5.1.1 in
-reverse).
+`--release`, with the PPU patch in place (see 2.6).
+
+Two corrections to the sentence that used to end this paragraph (2026-11-25).
+**Model-level numbers have been re-taken on the new OS**: the 2026-11-24
+ten-model survey ran there and every model beat its own `--no-offload` arm by
+2.6x to 35x. And **the board does not run at 200 MHz** -- it runs at 600,
+which is what the sentence had backwards. `/etc/modprobe.d/rocket.conf` sets
+`rocket_npu_clk_hz=600000000` and
+`/sys/module/rocket/parameters/rocket_npu_clk_hz` reads it back, so a board
+number taken here since 2026-09-09 is a 600 MHz number unless the parameter
+says otherwise. The second-board question is untouched: still one board, one
+kernel build per OS, one input per model.
