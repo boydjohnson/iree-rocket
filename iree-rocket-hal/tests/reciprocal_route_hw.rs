@@ -49,7 +49,7 @@ use iree_rocket_hal::rocket::{
     bn_plane::{
         BnPlaneBuffers, BnPlaneOp, BnPlaneShape, PlaneElement, Q15BridgeBuffers, Q15BridgeShape,
         build_bn_plane_regcmd, build_plane_gather_regcmd, build_q15_bridge_regcmd,
-        write_bn_mul_plane_fp16,
+        write_bn_alu_plane_fp32, write_bn_mul_plane_fp16,
     },
     builders::{
         Bits, Register, RegisterMeta,
@@ -806,6 +806,8 @@ fn run_bridge(
             input_int16: int16,
             constant_shift,
             per_channel: plane.is_some(),
+            per_channel_add: false,
+            out_scale: 0,
         };
         if let Some(plane) = plane {
             let mut bytes = vec![0u8; 4 * shape.channels.max(16) as usize];
@@ -874,6 +876,149 @@ fn run_bridge(
         }
         if dispatch::is_device_timeout(elapsed) {
             let strict = dispatch::report("q15 bridge", elapsed);
+            assert!(!strict, "killed dispatch under ROCKET_STRICT_DISPATCH");
+            return None;
+        }
+        Some(out)
+    }
+}
+
+/// §7's subtract-and-quantize stage, the last mechanism the chain needed
+/// and the one that was not measured: fp16 scores in, the per-row `-m` on
+/// the BN **ALU** plane, and an int8 output scaled by 20 for §3.4's
+/// `input_scale = 1/20`.
+///
+/// **First run, 2026-11-24: both arms hang at the watchdog**, and that is
+/// the finding rather than a flaky kill -- it reproduces, and the same task
+/// shape with an fp16 output is the identity
+/// (`the_bridge_passes_fp16_through_unchanged`). So an int8 *output* is not
+/// something this pass-through shape can be talked into by setting
+/// `out_precision` to 0.
+///
+/// Which is unsurprising in hindsight, and says where the stage belongs:
+/// subtract-and-quantize is a **requantisation with a per-channel bias**,
+/// and that is exactly what `conv.rs`'s int8 path does every time it runs
+/// -- bias on the BS plane, the multiplier and the output zero point on
+/// `OUT_CVT`, `od_bypass` clear, `ow_src` set, the `BS_OW_OP` word
+/// programmed. This probe set none of that. The stage should be derived
+/// from that configuration rather than from an fp16 pass-through, which is
+/// SOFTMAX.md §8's S5b.
+#[test]
+#[ignore = "requires an RK3588 NPU at /dev/accel/accel0"]
+fn the_subtract_and_quantize_probe() {
+    // One channel, so one `-m`. Scores already relative to a maximum of 0,
+    // as they arrive in §7.
+    let scores = [0.0f32, -0.25, -1.0, -2.5, -5.0, -6.4];
+    let minus_m = 0.0f32;
+    let want: Vec<i8> = scores
+        .iter()
+        .map(|&x| ((x + minus_m) * 20.0).round().clamp(-128.0, 127.0) as i8)
+        .collect();
+
+    for (label, out_scale) in [("scale 20", 20u32), ("scale 1", 1)] {
+        match run_quantize(&scores, minus_m, out_scale) {
+            None => println!(
+                "  {label}: HUNG. The fp16 arm of this same shape is the identity, so this \
+                 is the int8 output and not the task"
+            ),
+            Some(got) => {
+                print!("  {label}:");
+                for (index, &code) in got.iter().enumerate() {
+                    print!(" {}->{code} (want {})", scores[index], want[index]);
+                }
+                println!();
+            }
+        }
+    }
+}
+
+/// Runs one subtract-and-quantize task: fp16 in, int8 out.
+fn run_quantize(scores: &[f32], minus_m: f32, out_scale: u32) -> Option<Vec<i8>> {
+    let width = scores.len() as u32;
+    let file = OpenOptions::new()
+        .read(true)
+        .write(true)
+        .open(DEVICE_PATH)
+        .expect("failed to open RK3588 NPU device");
+    let fd = file.as_raw_fd();
+    unsafe {
+        let buf_in = Buffer::new(fd, BUFFER_SIZE, &file);
+        ptr::write_bytes(buf_in.host_ptr, 0, BUFFER_SIZE);
+        for (pixel, &x) in scores.iter().enumerate() {
+            ptr::write(
+                buf_in.host_ptr.add(pixel * FEATURE_ATOM_BYTES) as *mut u16,
+                f32_to_f16(x),
+            );
+        }
+        let buf_plane = Buffer::new(fd, BUFFER_SIZE, &file);
+        ptr::write_bytes(buf_plane.host_ptr, 0, BUFFER_SIZE);
+        // The ALU plane is a flat f32 per channel (S1).
+        let mut plane = vec![0u8; 4 * 16];
+        write_bn_alu_plane_fp32(&mut plane, 16, &[minus_m]).expect("plane fits");
+        ptr::copy_nonoverlapping(plane.as_ptr(), buf_plane.host_ptr, plane.len());
+
+        let buf_out = Buffer::new(fd, BUFFER_SIZE, &file);
+        ptr::write_bytes(buf_out.host_ptr, 0x5A, BUFFER_SIZE);
+        let cmds = build_q15_bridge_regcmd(
+            &Q15BridgeShape {
+                width,
+                height: 1,
+                channels: 1,
+                input_int16: false,
+                constant_shift: 0,
+                per_channel: false,
+                per_channel_add: true,
+                out_scale,
+            },
+            &Q15BridgeBuffers {
+                input_addr: buf_in.dma_address,
+                plane_addr: buf_plane.dma_address,
+                output_addr: buf_out.dma_address,
+            },
+        );
+        let buf_cmd = Buffer::new(
+            fd,
+            (cmds.len() * mem::size_of::<u64>()).next_multiple_of(4096),
+            &file,
+        );
+        ptr::write_bytes(buf_cmd.host_ptr, 0, buf_cmd.size);
+        let slots = std::slice::from_raw_parts_mut(buf_cmd.host_ptr as *mut u64, cmds.len());
+        for (slot, cmd) in slots.iter_mut().zip(&cmds) {
+            *slot = cmd.0;
+        }
+        for handle in [
+            buf_in.handle,
+            buf_plane.handle,
+            buf_out.handle,
+            buf_cmd.handle,
+        ] {
+            fini_bo(fd, handle).ok();
+        }
+        let started = Instant::now();
+        submit(
+            fd,
+            buf_cmd.dma_address,
+            cmds.len() as u32,
+            &[buf_cmd.handle, buf_in.handle, buf_plane.handle],
+            &[buf_out.handle],
+        )
+        .expect("SUBMIT failed");
+        prep_bo(fd, buf_out.handle, 2_000_000_000)
+            .unwrap_or_else(|error| panic!("the quantize task did not complete: {error}"));
+        let elapsed = started.elapsed();
+        let out: Vec<i8> = (0..scores.len())
+            .map(|pixel| ptr::read(buf_out.host_ptr.add(pixel * FEATURE_ATOM_BYTES)) as i8)
+            .collect();
+        for handle in [
+            buf_in.handle,
+            buf_plane.handle,
+            buf_out.handle,
+            buf_cmd.handle,
+        ] {
+            close_bo(fd, handle).ok();
+        }
+        if dispatch::is_device_timeout(elapsed) {
+            let strict = dispatch::report("subtract and quantize", elapsed);
             assert!(!strict, "killed dispatch under ROCKET_STRICT_DISPATCH");
             return None;
         }

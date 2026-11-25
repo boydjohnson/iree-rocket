@@ -943,6 +943,18 @@ pub struct Q15BridgeShape {
     pub constant_shift: u32,
     /// Engage the BN MUL plane from NRDMA.
     pub per_channel: bool,
+    /// Engage the BN **ALU** plane from NRDMA as well, which adds a
+    /// per-channel value before the multiply. SOFTMAX.md §7's
+    /// subtract-and-quantize stage carries `-m` here.
+    pub per_channel_add: bool,
+    /// Narrow the output to int8 with `OUT_CVT` scaling by this integer --
+    /// the `exp` table's input scale reciprocal, 20 for §3.4's `1/20`.
+    /// Zero leaves the fp16 output alone.
+    ///
+    /// `OUT_CVT`'s *shift* is an integer right shift (S3), but whether its
+    /// 16-bit *multiply* is applied to a float datapath value as a float is
+    /// what `the_subtract_and_quantize_probe` asks.
+    pub out_scale: u32,
 }
 
 pub struct Q15BridgeBuffers {
@@ -961,7 +973,7 @@ pub fn build_q15_bridge_regcmd(shape: &Q15BridgeShape, bufs: &Q15BridgeBuffers) 
         "build_q15_bridge_regcmd: width, height and channels must be nonzero"
     );
     assert!(
-        !shape.per_channel || bufs.plane_addr != 0,
+        (!shape.per_channel && !shape.per_channel_add) || bufs.plane_addr != 0,
         "build_q15_bridge_regcmd: the per-channel stage needs a real plane address, or this \
          is ISSUES.md C8's shape"
     );
@@ -973,6 +985,7 @@ pub fn build_q15_bridge_regcmd(shape: &Q15BridgeShape, bufs: &Q15BridgeBuffers) 
     let constant = shape.constant_shift > 0;
     let input_addr = bufs.input_addr;
     let output_addr = bufs.output_addr;
+    let narrow = shape.out_scale > 0;
 
     let mut cmds: Vec<RegCmd> = Vec::new();
 
@@ -1001,7 +1014,7 @@ pub fn build_q15_bridge_regcmd(shape: &Q15BridgeShape, bufs: &Q15BridgeBuffers) 
     cmds.push(
         Register::<DpuDataFormat>::new()
             .in_precision(Bits::new(if shape.input_int16 { 1 } else { 2 }))
-            .out_precision(Bits::new(2))
+            .out_precision(Bits::new(if narrow { 0 } else { 2 }))
             .proc_precision(Bits::new(2))
             .mc_surf_out(Bits::new(0))
             .bs_mul_shift_value_neg(Bits::new(shape.constant_shift))
@@ -1078,10 +1091,14 @@ pub fn build_q15_bridge_regcmd(shape: &Q15BridgeShape, bufs: &Q15BridgeBuffers) 
 
     cmds.push(
         Register::<DpuBnCfg>::new()
-            .bn_bypass(Bits::new(u32::from(!shape.per_channel)))
-            .bn_alu_bypass(Bits::new(1))
+            .bn_bypass(Bits::new(u32::from(
+                !shape.per_channel && !shape.per_channel_add,
+            )))
+            .bn_alu_bypass(Bits::new(u32::from(!shape.per_channel_add)))
             .bn_mul_bypass(Bits::new(u32::from(!shape.per_channel)))
             .bn_relu_bypass(Bits::new(1))
+            .bn_alu_algo(Bits::new(if shape.per_channel_add { 2 } else { 0 }))
+            .bn_alu_src(Bits::new(u32::from(shape.per_channel_add)))
             .build(),
     );
     cmds.push(zero::<DpuBnAluCfg>());
@@ -1113,8 +1130,10 @@ pub fn build_q15_bridge_regcmd(shape: &Q15BridgeShape, bufs: &Q15BridgeBuffers) 
     cmds.push(zero::<DpuOutCvtOffset>());
     cmds.push(
         Register::<DpuOutCvtScale>::new()
-            .fp32tofp16_en(Bits::new(1))
-            .out_cvt_scale(Bits::new(1))
+            // The narrowing bit is the fp32-to-fp16 one, so an int8 output
+            // clears it and lets `out_cvt_scale` carry the scale instead.
+            .fp32tofp16_en(Bits::new(u32::from(!narrow)))
+            .out_cvt_scale(Bits::new(if narrow { shape.out_scale } else { 1 }))
             .build(),
     );
     cmds.push(zero::<DpuOutCvtShift>());
@@ -1172,12 +1191,14 @@ pub fn build_q15_bridge_regcmd(shape: &Q15BridgeShape, bufs: &Q15BridgeBuffers) 
     cmds.push(zero::<DpuRdmaBsBaseAddr>());
     cmds.push(
         Register::<DpuRdmaNrdmaCfg>::new()
-            .nrdma_data_use(Bits::new(if shape.per_channel { 0b0100 } else { 0 }))
+            .nrdma_data_use(Bits::new(
+                u32::from(shape.per_channel_add) | (u32::from(shape.per_channel) << 2),
+            ))
             .build(),
     );
     cmds.push(
         Register::<DpuRdmaBnBaseAddr>::new()
-            .bn_base_addr(Bits::new(if shape.per_channel {
+            .bn_base_addr(Bits::new(if shape.per_channel || shape.per_channel_add {
                 bufs.plane_addr
             } else {
                 0

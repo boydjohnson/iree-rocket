@@ -1012,15 +1012,41 @@ and only the BN plane multiplies by a true fraction -- plus the two
 fp16-reading bugs it turned up, one of them pre-existing in fifteen test
 files.
 
-**S5 -- the op.** `softmax.rs` in `iree-rocket-hal/src/rocket`, holding a
-`SoftmaxShape { width, height: 1, channels, precision }` and a
-`SoftmaxPlan` that returns the ordered task array of §7, plus a
-`SoftmaxBuffers` naming the scratch cubes. Shape refusals go through
-`PlanError` with a code, not a panic, per
-COMPILER_ROADMAP.md section 1's `try_*` contract -- and the planning
-itself belongs in `rocket-core` so the compiler can ask the same question
-the runtime does. `softmax_oracle_hw.rs` gates the whole thing against a
-host softmax at `atol = 1e-3`.
+**S5 -- the op. Planner DONE 2026-11-24, emission blocked on S5b**
+(`rocket_core::softmax`, 7 tests, no device needed).
+
+`rocket_core::softmax::Plan::try_new` is §7 as a plan: it enumerates the
+ordered stages, both reduction trees with their per-level extents and
+padding, and reports the costs §4 and §5 argue about before anything runs
+-- 14 device tasks and 1 host boundary at `keys = 197, rows = 64`. Column
+tiling stays with the planners that own it, `PoolingPlan` for a max level
+and `ConvPlan` for a sum level, exactly as `fc` delegates to `conv`.
+
+Its refusals are where the *measurement* stops rather than where the
+hardware does, and each names what would have to be measured:
+`exp_input_scale` other than §3.4's `1/20`, more than 64 rows (the widest
+per-channel plane any probe has driven), more than 512 keys (S2's
+reduction). All three come back `UnvalidatedConfiguration`, and the tests
+assert the code rather than just the failure.
+
+One stage of §7 changed on the way. `MaxToPlane` does not need S2a's
+gather: the maximum is a width-1, `rows`-wide vector, so negating it and
+writing the ALU plane is the same order of host work as the reciprocal --
+microseconds -- and S4 already established that a width-1 vector belongs on
+the host while a cube pass does not. The gather stays the optimisation it
+was; it is not on the critical path, and it would need a negation
+mechanism nobody has measured.
+
+**S5b -- subtract and quantize.** The one mechanism §7 still needs, and the
+first configuration tried **hangs at the watchdog** on both output scales
+(`the_subtract_and_quantize_probe`). That is a finding and not a flaky
+kill: the same task shape with an fp16 output is the identity, so it is the
+int8 *output* and not the task. Which says where the stage belongs --
+subtract-and-quantize is a requantisation with a per-channel bias, and
+that is what `conv.rs`'s int8 path does every time it runs: bias on the BS
+plane, multiplier and output zero point on `OUT_CVT`, `od_bypass` clear,
+`ow_src` set, `BS_OW_OP` programmed. The probe set none of it. Derive the
+stage from that configuration rather than from an fp16 pass-through.
 
 Only after S5: the schema def, the driver's dispatch, the transform-spec
 matcher. Those follow COMPILER_ROADMAP's existing grooves and are not
