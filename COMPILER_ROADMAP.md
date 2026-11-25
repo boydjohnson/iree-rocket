@@ -1014,6 +1014,59 @@ becomes about 6) -- and nothing at all in the steady state of a hoisted
 model. It is not a benchmark lever either, for the same reason this section
 said it was not.
 
+**And the unhoisted cold start, measured, 2026-11-25.** The second of those
+three places is the one every runtime-packing figure in this section was
+measured in -- including `weight_cache.rs`'s 99 ms and the 39.8 ms and 815 ms
+above -- so it deserves a number rather than an inference.
+`rocket-compiler --no-pack-weights` rebuilds that configuration and exists
+for no other purpose: the pass is skipped, constant filters stay in logical
+HWCF order, and the driver packs them at dispatch. On `orangepi`, cpus 4-7,
+600 MHz, `irm-before`/`irm-after` differing only in `weights.rs`:
+
+| module | `pack.weights` | profiled wall | cold process wall |
+|---|---:|---:|---:|
+| mnv2 fp16 unhoisted, per-coefficient | 37.6 ms | 71.0 ms | 105-113 ms |
+| mnv2 fp16 unhoisted, strided | 9.1 ms | 41.2 ms | 75-85 ms |
+| mnv2 fp16 hoisted, either arm | absent | 26.0-26.2 ms | 61-71 ms |
+| rn50-224 fp16 unhoisted, per-coefficient | 281.5 ms | 406.9 ms | 495-502 ms |
+| rn50-224 fp16 unhoisted, strided | 69.7 ms | 186.1 ms | 283-288 ms |
+| rn50-224 fp16 hoisted, either arm | absent | 72.6-73.4 ms | 173-197 ms |
+
+Logits are bit-identical by `cmp` across all four before/after pairs, and the
+hoisted and unhoisted modules agree with each other as well. So where the
+packer is on a model's path it is **4.0-4.1x** faster in situ, and the cold
+first inference drops **1.36x** on MobileNetV2 (about 29 ms, median 108 ->
+79) and **1.74x** on ResNet50-224 (about 212 ms, median 498 -> 286). The
+hoisted arm does not move, which is the control this whole subsection rests
+on.
+
+4.0x in situ against the harness's 5.5-7.4x is a real gap, and it is
+measurable rather than guessable. Depthwise is not the cause: MobileNetV2's
+depthwise filters, still on `visit_slots`, are 0.72 ms of its 37.6 and
+unchanged across the arms. The rates are. Over the same 48.62 MiB of
+ResNet50 coefficients the per-coefficient arm moves 181 MB/s in situ against
+the harness's 205 -- inside the rebuild spread, so that arm behaves
+identically in both -- while the strided arm moves 732 MB/s in situ against
+1133. `weight_pack_rate_hw` re-packs one filter in a loop, where source and
+destination stay resident; the driver packs each filter once, out of constant
+pages nothing has touched yet and into a fresh scratch buffer. With five
+times less arithmetic left, that first-touch traffic stops being hidden, and
+it costs about a third of the win. Anything that prices this packer from a
+loop benchmark should expect to lose that third.
+
+Steady state, same unhoisted modules: with `ROCKET_WEIGHT_CACHE=0`, where
+every dispatch re-packs, MobileNetV2 goes 60.4 -> 28.4-29.7 ms and
+ResNet50-224 370-371 -> 137 ms; with the cache on, 10.0 -> 10.1 and
+33.5 -> 32.2, which is the cache doing its job and the packer's speed
+ceasing to matter once it has. The gap between those two rows is not purely
+packing -- the cache also avoids the per-dispatch scratch and buffer-GEM
+churn -- so it is quoted as wall time and not as a packer rate.
+
+And the hoist still wins, which is this section's point: even on the strided
+packer the unhoisted cold start is 79 ms on MobileNetV2 and 286 ms on
+ResNet50-224, against 67 and 178 ms hoisted. That remaining 1.2x and 1.6x is
+what only removing the work can buy, and 6.3 buys it.
+
 Not done, and worth saying: the fp16 bias is still packed at dispatch
 (`pack.bias`, 0.2 ms on MobileNetV2 -- not worth a pass), and the
 per-channel weight zero point the affine packer can take is still the

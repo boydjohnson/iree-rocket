@@ -254,6 +254,32 @@ cargo run -p rocket-compiler -- audit --input vit.mlir --elementwise
 cargo run -p rocket-compiler -- audit --input vit.mlir --elementwise --no-offload
 ```
 
+### The pre-hoist configuration: `--no-pack-weights`
+
+By default a constant filter is packed into the CNA's blocked coefficient
+order at compile time and written into the `.vmfb`
+(COMPILER_ROADMAP.md 6.3), so a hoisted module reaches the runtime packer not
+at all -- `ROCKET_PROFILE=1` prints no `pack.weights` phase and no
+weight-cache line. `--no-pack-weights` skips that pass: filters stay in
+logical HWCF order and the driver packs them at dispatch, which is what every
+build before the hoist did.
+
+Like `--no-offload` and `--elementwise`, it exists so an arm can be measured
+rather than argued about. It is the only configuration in which the runtime
+packer is on a model's path, so it is the arm to use when pricing
+`rocket_core::weights`, the weight cache, or anything else downstream of
+`pack.weights`. Outputs are bit-identical to the hoisted module's.
+
+```sh
+cargo run -p rocket-compiler -- compile --input mnv2.fp16.mlir \
+    --llvmcpu-target-triple aarch64-linux-gnu \
+    --no-pack-weights --output mnv2.unhoisted.vmfb
+```
+
+It costs cold-start time by construction: on `orangepi` at 600 MHz an
+unhoisted MobileNetV2 fp16 starts in 79 ms against 67 hoisted, and an
+unhoisted ResNet50-224 in 286 ms against 178.
+
 ### Placement pinning
 
 The Rocket backend has no code generator. `serializeExecutable` only knows how
