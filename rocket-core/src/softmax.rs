@@ -61,6 +61,14 @@ const MEASURED_MAX_ROWS: u32 = 64;
 /// Keys measured through the whole reduction, by S2's max tree.
 const MEASURED_MAX_KEYS: u32 = 512;
 
+/// The int8 code the padding columns of [`Shape::physical_keys`] carry.
+///
+/// The most negative code there is, so it never wins a maximum, and under
+/// §3.3's tuned tail its `exp` is exactly zero, so it adds nothing to a
+/// sum. Both properties are needed: a zero code would contribute
+/// `exp(-m)` to every row's denominator.
+pub const PAD_CODE: i8 = -128;
+
 /// Logical softmax shape, in §1.1's layout.
 ///
 /// The reduced axis is **width**, because every reduction this hardware has
@@ -96,6 +104,25 @@ impl Shape {
     /// which is what the underflow slope has to decay to zero over (§3.3).
     pub fn exp_reach(&self) -> f32 {
         -128.0 * self.exp_input_scale
+    }
+
+    /// The cube width the lowering actually uses: `keys` rounded up to
+    /// four.
+    ///
+    /// **This is not padding for convenience, it is the only width at
+    /// which the op's own two readers agree.** The score buffer is read by
+    /// the PPU, whose cube rounds each surface stride up to four pixels,
+    /// *and* by the `exp` task's DPU_RDMA, whose does not. At 197 keys
+    /// those strides are 200 and 197 atoms, so every channel past the
+    /// first atom lands somewhere different for the two of them -- and the
+    /// failure is quiet, because a row whose maximum is at its first
+    /// surface still comes out right.
+    ///
+    /// The trailing columns hold [`PAD_CODE`], which loses the maximum and
+    /// contributes exactly zero to the sum under §3.3's tuned tail, so
+    /// they change neither reduction.
+    pub fn physical_keys(&self) -> u32 {
+        self.keys.next_multiple_of(4)
     }
 }
 
@@ -198,14 +225,14 @@ impl Plan {
         );
 
         let mut stages = Vec::new();
-        for level in max_levels(shape.keys) {
+        for level in max_levels(shape.physical_keys()) {
             stages.push(level);
         }
         stages.push(Stage::HostMaxToPlane);
         stages.push(Stage::Exp);
         stages.push(Stage::BridgeRead);
         stages.push(Stage::BridgeScale);
-        for level in sum_levels(shape.keys) {
+        for level in sum_levels(shape.physical_keys()) {
             stages.push(level);
         }
         stages.push(Stage::HostReciprocal);
@@ -335,7 +362,7 @@ mod tests {
     fn both_trees_tile_the_row() {
         for keys in [1u32, 2, 3, 8, 9, 27, 64, 128, 197, 384, 512] {
             let plan = Plan::try_new(Shape::new(keys, 8)).unwrap();
-            let mut width = keys;
+            let mut width = Shape::new(keys, 8).physical_keys();
             for stage in plan.stages() {
                 if let Stage::MaxLevel {
                     input_width,
@@ -353,7 +380,7 @@ mod tests {
             }
             assert_eq!(width, 1, "the max tree did not reduce keys {keys} to one");
 
-            let mut width = keys;
+            let mut width = Shape::new(keys, 8).physical_keys();
             for stage in plan.stages() {
                 if let Stage::SumLevel {
                     input_width,
@@ -375,9 +402,9 @@ mod tests {
     /// before anything runs.
     #[test]
     fn the_task_count_is_what_the_design_predicts() {
-        // 197 keys: 3 max levels (197 -> 25 -> 4 -> 1) and 5 sum levels
-        // (197 -> 66 -> 22 -> 8 -> 3 -> 1), plus the six fixed device
-        // stages.
+        // 197 keys is 200 physically (`Shape::physical_keys`): 3 max
+        // levels (200 -> 25 -> 4 -> 1) and 5 sum levels (200 -> 67 -> 23
+        // -> 8 -> 3 -> 1), plus the four fixed device stages.
         let plan = Plan::try_new(Shape::new(197, 64)).unwrap();
         // Three max levels, five sum levels, and four fixed device stages:
         // exp, the two bridge tasks, and the normalize.
@@ -385,18 +412,17 @@ mod tests {
         assert_eq!(plan.host_boundaries(), 2);
     }
 
+    /// One key still has a physical width of four
+    /// ([`Shape::physical_keys`]), so it still reduces -- over three
+    /// padding columns that cannot win the maximum and add nothing to the
+    /// sum.
     #[test]
     fn a_single_key_still_plans() {
         let plan = Plan::try_new(Shape::new(1, 1)).unwrap();
-        // Nothing to reduce, so no tree levels at all -- and the softmax of
-        // one element is 1.0, which the remaining stages still compute.
-        assert!(
-            !plan
-                .stages()
-                .iter()
-                .any(|stage| matches!(stage, Stage::MaxLevel { .. } | Stage::SumLevel { .. }))
-        );
-        assert_eq!(plan.device_tasks(), 4);
+        assert_eq!(plan.host_boundaries(), 2);
+        // One max level (4 -> 1) and two sum levels (4 -> 2 -> 1), plus the
+        // four fixed device stages.
+        assert_eq!(plan.device_tasks(), 1 + 2 + 4);
     }
 
     #[test]
@@ -425,6 +451,16 @@ mod tests {
                 "{shape:?} should refuse as unvalidated, not as something else"
             );
         }
+    }
+
+    /// The width both readers agree at, and the padding that makes it
+    /// harmless.
+    #[test]
+    fn the_physical_width_is_a_multiple_of_four() {
+        for (keys, physical) in [(1u32, 4u32), (4, 4), (197, 200), (384, 384), (511, 512)] {
+            assert_eq!(Shape::new(keys, 8).physical_keys(), physical);
+        }
+        assert_eq!(PAD_CODE, i8::MIN, "a padding code must never win a maximum");
     }
 
     #[test]

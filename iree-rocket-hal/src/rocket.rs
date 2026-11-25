@@ -30,6 +30,7 @@ pub mod pooling;
     clippy::pedantic
 )]
 pub mod registers;
+pub mod softmax;
 pub mod tensor_layout;
 
 /// The feature-cube layout contract (COMPILER_ROADMAP.md 6.1), re-exported

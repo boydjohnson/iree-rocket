@@ -1014,63 +1014,62 @@ and only the BN plane multiplies by a true fraction -- plus the two
 fp16-reading bugs it turned up, one of them pre-existing in fifteen test
 files.
 
-**S5 -- the op. Planner DONE 2026-11-24, emission blocked on S5b**
-(`rocket_core::softmax`, 7 tests, no device needed).
+**S5 -- the op. DONE 2026-11-24** (`rocket_core::softmax`,
+`iree_rocket_hal::rocket::softmax`, `softmax_oracle_hw.rs`).
 
-`rocket_core::softmax::Plan::try_new` is §7 as a plan: it enumerates the
-ordered stages, both reduction trees with their per-level extents and
-padding, and reports the costs §4 and §5 argue about before anything runs
--- 12 device tasks and 2 host boundaries at `keys = 197, rows = 64`. Column
-tiling stays with the planners that own it, `PoolingPlan` for a max level
-and `ConvPlan` for a sum level, exactly as `fc` delegates to `conv`.
+**The assembled op is within 1.12% total variation of an exact softmax on
+64 real ViT-B/16 attention rows** -- the same figure as §3.4's `exp` step
+alone and §4's passes 2 and 3, so the device's own maximum, the int8 score
+quantisation and the two reduction trees add nothing measurable on top.
+Worst row 13.97%, which is §9's spread item. 13 device tasks across three
+submissions, 2 host steps, 92160 bytes of scratch.
 
-Its refusals are where the *measurement* stops rather than where the
-hardware does, and each names what would have to be measured:
-`exp_input_scale` other than §3.4's `1/20`, more than 64 rows (the widest
-per-channel plane any probe has driven), more than 512 keys (S2's
-reduction). All three come back `UnvalidatedConfiguration`, and the tests
-assert the code rather than just the failure.
+`rocket_core::softmax::Plan::try_new` is §7 as a plan: the ordered stages,
+both reduction trees with their per-level extents and padding, and the
+costs §4 and §5 argue about reported before anything runs. Column tiling
+stays with the planners that own it, `PoolingPlan` for a max level and
+`ConvPlan` for a sum level, as `fc` delegates to `conv`. Its refusals mark
+where the *measurement* stops rather than where the hardware does -- an
+`exp_input_scale` other than §3.4's `1/20`, more than 64 rows, more than
+512 keys -- and all three come back `UnvalidatedConfiguration`.
 
-Two stages of §7 changed on the way. `MaxToPlane` does not need S2a's
-gather: the maximum is a width-1, `rows`-wide vector, so negating it and
-writing the ALU plane is the same order of host work as the reciprocal --
-microseconds -- and S4 already established that a width-1 vector belongs on
-the host while a cube pass does not. The gather stays the optimisation it
-was; it is not on the critical path, and it would need a negation
-mechanism nobody has measured. And `SubtractAndQuantize` is gone entirely;
-S5b has why.
+`iree_rocket_hal::rocket::softmax` emits them and owns the two things a
+plan cannot: the scratch layout and the submission boundaries.
 
-**S5b -- subtract and quantize. DONE 2026-11-24, by deleting the stage**
-(`build_lut_q15_regcmd_with_plane`).
+Three things the assembly taught that no single probe could.
 
-The stage existed because I assumed the `exp` task would be handed fp16
-scores and have to narrow them. Its first configuration **hung at the
-watchdog** on both output scales -- a finding rather than a flaky kill,
-since the same task shape with an fp16 output is the identity, so it was
-the int8 *output* and not the task. A DPU task that reads fp16 and writes
-int8 is a mixed-precision shape nothing in this crate drives: the LUT
-writes int8 from a DPU-only task happily, but it is int8 *throughout*.
+**The physical width has to be a multiple of four, and that is a
+correctness rule rather than padding for tidiness.** The score buffer is
+read by the PPU, whose cube rounds each surface stride up to four pixels,
+*and* by the `exp` task's DPU_RDMA, whose does not. At 197 keys those
+strides are 200 and 197 atoms, so every channel past the first atom lands
+somewhere different for the two readers. `Shape::physical_keys` rounds up
+and the trailing columns carry `PAD_CODE` -- the most negative int8, which
+never wins a maximum and whose `exp` is exactly zero under §3.3's tuned
+tail, so it changes neither reduction. The failure is quiet without it: a
+row whose maximum sits in the first atom still comes out right, which is
+how the first run's maxima assertion passed while everything downstream was
+zero.
 
-The way out was to stop adding a stage and read §7 again, which had always
-put the subtraction on the `exp` task's own BN ALU plane. That works:
-`build_lut_q15_regcmd_with_plane` takes the ALU operand per channel from
-NRDMA, and with the plane carrying `-m_code * lut_bn_mul_operand(..)` per
-row -- the same arithmetic `lut_bn_alu` does for the scalar int8 zero
-point, pre-scaled because the add lands after the multiply -- the result is
-within `1e-4` absolute of `exp(x - m)` across four rows with four
-different maxima. The scores arrive as int8 from the matmul's own requant,
-which is a gated path, and nothing has to narrow anything.
+**A BO listed in a job's `in_bo_handles` *and* its `out_bo_handles` is not
+written.** This cost the longest bisection of the whole design. The `exp`
+task returned all zeros while the identical program -- byte-identical,
+asserted against a direct build -- wrote correct values elsewhere, and what
+differed was that the harness passed every buffer as an input, the output
+among them. Each step of the bisection ruled out something likelier: the
+input codes read back correctly, the task is exact at this width and row
+count standalone and at every width from 197 to 256, a preceding PPU job
+does not disturb it, one task per job behaves like one grouped job, and an
+output offset of 15360 into a shared allocation is fine. Nothing in this
+repo documented the rule; `submit_tasks`'s doc comment says a buffer only
+tasks within the job touch "does not need to appear in either list", which
+is not the same as saying both is harmful. It is worth a test of its own in
+`device.rs`.
 
-**The plane's element format follows the datapath.** `i32` here, where S1
-measured `f32` on the fp16 path, and the `f32` reading of the same plane is
-wrong by 0.86 absolute -- so the format is not a property of the plane but
-of the precision the task runs at. Both are asserted, the wrong one
-included, so a later change that makes them interchangeable shows up.
-
-So §7 is one stage shorter than §8 thought, and `rocket_core::softmax`
-drops `SubtractAndQuantize` for a `HostMaxToPlane` that writes the plane --
-a width-1, `rows`-wide vector, the host's side of §4's line. 12 device
-tasks and 2 host boundaries at `keys = 197, rows = 64`.
+**And one of my own tools lied twice.** `ls -t` over the cargo target
+directory picked a stale cross-compiled binary, so two board runs reported
+results from code that no longer existed -- including one that appeared to
+clear a hypothesis. Take the path from `cargo --message-format=json`.
 
 Only after S5: the schema def, the driver's dispatch, the transform-spec
 matcher. Those follow COMPILER_ROADMAP's existing grooves and are not

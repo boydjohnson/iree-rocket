@@ -1107,6 +1107,24 @@ fn run_exp_with_plane(
     offsets: &[i8],
     plane: &[u8],
 ) -> Option<Vec<i16>> {
+    run_exp_with_plane_at(input_scale, table, maxima, offsets, plane, 0)
+}
+
+/// `run_exp_with_plane` with the output written at `out_offset` into the
+/// output BO rather than at its base.
+///
+/// `softmax_oracle_hw.rs` writes every intermediate at an offset into one
+/// shared scratch allocation, and its `exp` task returns zeros while the
+/// same program -- byte-identical, verified -- works here. An output offset
+/// is the last difference left.
+fn run_exp_with_plane_at(
+    input_scale: f32,
+    table: LutTable,
+    maxima: &[i8],
+    offsets: &[i8],
+    plane: &[u8],
+    out_offset: u32,
+) -> Option<Vec<i16>> {
     let rows = maxima.len();
     let keys = offsets.len();
     let file = OpenOptions::new()
@@ -1142,7 +1160,7 @@ fn run_exp_with_plane(
             },
             &LutBuffers {
                 input_addr: buf_in.dma_address,
-                output_addr: buf_out.dma_address,
+                output_addr: buf_out.dma_address + out_offset,
             },
             table,
             buf_plane.dma_address,
@@ -1179,7 +1197,8 @@ fn run_exp_with_plane(
         let elapsed = started.elapsed();
         let out: Vec<i16> = (0..rows * keys)
             .map(|index| {
-                let at = cube_offset(index / keys, index % keys, keys, FP16_LANES_PER_ATOM, 2);
+                let at = out_offset as usize
+                    + cube_offset(index / keys, index % keys, keys, FP16_LANES_PER_ATOM, 2);
                 ptr::read_unaligned(buf_out.host_ptr.add(at) as *const i16)
             })
             .collect();
@@ -1197,5 +1216,214 @@ fn run_exp_with_plane(
             return None;
         }
         Some(out)
+    }
+}
+
+/// S5b at scale: the same per-row-max exp task at the row and key counts
+/// the assembled op uses.
+///
+/// `the_exp_task_subtracts_a_per_row_max_from_its_own_plane` ran 4 rows by
+/// 4 keys, and `softmax_oracle_hw.rs` found the task returning zeros at 64
+/// by 197. This bisects which extent does it: rows scale the ALU plane's
+/// lane count, keys scale the cube.
+#[test]
+#[ignore = "requires an RK3588 NPU at /dev/accel/accel0"]
+fn the_planed_exp_task_at_scale() {
+    let input_scale = 1.0 / 20.0;
+    let table = LutTable::exp_with_decaying_tail(input_scale);
+    let operand = lut_bn_mul_operand(input_scale, table);
+
+    for (rows, keys) in [
+        (64usize, 197usize),
+        (64, 198),
+        (64, 199),
+        (64, 200),
+        (64, 204),
+        (64, 256),
+        (8, 200),
+    ] {
+        // Row r has maximum -r, and its keys step down from it.
+        let maxima: Vec<i8> = (0..rows).map(|r| -(r as i8)).collect();
+        let offsets: Vec<i8> = (0..keys).map(|k| -((k % 8) as i8)).collect();
+        let mut plane = vec![0u8; 4 * rows.max(16)];
+        for (row, &m) in maxima.iter().enumerate() {
+            let value = -(i64::from(m)) * i64::from(operand);
+            plane[row * 4..row * 4 + 4].copy_from_slice(&(value as i32).to_le_bytes());
+        }
+        match run_exp_with_plane(input_scale, table, &maxima, &offsets, &plane) {
+            None => println!("  {rows} rows x {keys} keys: NOT MEASURED"),
+            Some(counts) => {
+                let mut worst = 0.0f32;
+                let mut zero_rows = 0;
+                for (row, &m) in maxima.iter().enumerate() {
+                    let mut row_zero = true;
+                    for (column, &offset) in offsets.iter().enumerate() {
+                        let code = m.saturating_add(offset);
+                        let want = (f32::from(code - m) * input_scale).exp();
+                        let got = f32::from(counts[row * keys + column]) / 32768.0;
+                        if got != 0.0 {
+                            row_zero = false;
+                        }
+                        worst = worst.max((got - want).abs());
+                    }
+                    if row_zero {
+                        zero_rows += 1;
+                    }
+                }
+                println!(
+                    "  {rows} rows x {keys} keys: worst absolute error {worst:.4}, \
+                     {zero_rows}/{rows} rows all zero"
+                );
+            }
+        }
+    }
+}
+
+/// Does a PPU job before the `exp` task break it?
+///
+/// `softmax_oracle_hw.rs` assembles the op as a max tree (PPU) and then
+/// `exp` (DPU LUT), and the `exp` task returns zeros there while being
+/// measured correct at the same shape standalone
+/// (`the_planed_exp_task_at_scale`, every width through 256). One job
+/// leaving the core in a state that breaks the next is a class of problem
+/// this repo already has on record -- ISSUES.md C8 -- so this runs a
+/// pooling job first and then the same `exp` task.
+#[test]
+#[ignore = "requires an RK3588 NPU at /dev/accel/accel0"]
+fn a_pooling_job_before_the_exp_task() {
+    use iree_rocket_hal::rocket::pooling::{
+        PoolingBuffers, PoolingMethod, PoolingPlan, PoolingPrecision, PoolingShape,
+    };
+
+    let input_scale = 1.0 / 20.0;
+    let table = LutTable::exp_with_decaying_tail(input_scale);
+    let operand = lut_bn_mul_operand(input_scale, table);
+    let (rows, keys) = (64usize, 200usize);
+    let maxima: Vec<i8> = (0..rows).map(|r| -(r as i8)).collect();
+    let offsets: Vec<i8> = (0..keys).map(|k| -((k % 8) as i8)).collect();
+    let mut plane = vec![0u8; 4 * rows];
+    for (row, &m) in maxima.iter().enumerate() {
+        let value = -(i64::from(m)) * i64::from(operand);
+        plane[row * 4..row * 4 + 4].copy_from_slice(&(value as i32).to_le_bytes());
+    }
+
+    // A pooling job of exactly the shape the max tree's first level uses.
+    let file = OpenOptions::new()
+        .read(true)
+        .write(true)
+        .open(DEVICE_PATH)
+        .expect("failed to open RK3588 NPU device");
+    let fd = file.as_raw_fd();
+    unsafe {
+        let pool_in = Buffer::new(fd, BUFFER_SIZE, &file);
+        ptr::write_bytes(pool_in.host_ptr, 0, BUFFER_SIZE);
+        let pool_out = Buffer::new(fd, BUFFER_SIZE, &file);
+        ptr::write_bytes(pool_out.host_ptr, 0, BUFFER_SIZE);
+        let shape = PoolingShape {
+            input_width: keys as u32,
+            input_height: 1,
+            input_channels: rows as u32,
+            output_width: 25,
+            output_height: 1,
+            output_channels: rows as u32,
+            precision: PoolingPrecision::Int8,
+            kernel_width: 8,
+            kernel_height: 1,
+            stride_x: 8,
+            stride_y: 1,
+            method: PoolingMethod::Max,
+            pad_left: 0,
+            pad_top: 0,
+            pad_right: 0,
+            pad_bottom: 0,
+            pad_value: PoolingMethod::Max.pad_fill_value(PoolingPrecision::Int8),
+        };
+        let programs = PoolingPlan::new(shape).programs_with_buffers(&PoolingBuffers {
+            input_addr: pool_in.dma_address,
+            output_addr: pool_out.dma_address,
+        });
+        let mut cmd_bufs = Vec::new();
+        for commands in &programs {
+            let buffer = Buffer::new(
+                fd,
+                (commands.len() * mem::size_of::<u64>()).next_multiple_of(4096),
+                &file,
+            );
+            let slots = std::slice::from_raw_parts_mut(buffer.host_ptr as *mut u64, commands.len());
+            for (slot, command) in slots.iter_mut().zip(commands) {
+                *slot = command.0;
+            }
+            cmd_bufs.push((buffer, commands.len() as u32));
+        }
+        for handle in [pool_in.handle, pool_out.handle] {
+            fini_bo(fd, handle).ok();
+        }
+        for (buffer, _) in &cmd_bufs {
+            fini_bo(fd, buffer.handle).ok();
+        }
+        let tasks: Vec<(u32, u32)> = cmd_bufs
+            .iter()
+            .map(|(buffer, count)| (buffer.dma_address, *count))
+            .collect();
+        let mut in_handles: Vec<u32> = cmd_bufs.iter().map(|(b, _)| b.handle).collect();
+        in_handles.push(pool_in.handle);
+        submit_tasks(fd, &tasks, &in_handles, &[pool_out.handle]).expect("pooling SUBMIT failed");
+        prep_bo(fd, pool_out.handle, 2_000_000_000).expect("pooling did not complete");
+        println!("  ran a {}-task int8 max pool first", tasks.len());
+        for (buffer, _) in &cmd_bufs {
+            close_bo(fd, buffer.handle).ok();
+        }
+        close_bo(fd, pool_in.handle).ok();
+        close_bo(fd, pool_out.handle).ok();
+    }
+
+    // Now the same exp task that passes on its own.
+    match run_exp_with_plane(input_scale, table, &maxima, &offsets, &plane) {
+        None => println!("  exp after pooling: NOT MEASURED"),
+        Some(counts) => {
+            let zero_rows = (0..rows)
+                .filter(|&row| (0..keys).all(|key| counts[row * keys + key] == 0))
+                .count();
+            println!("  exp after pooling: {zero_rows}/{rows} rows all zero");
+            assert_eq!(
+                zero_rows, 0,
+                "a pooling job before the exp task zeroes it, which is what \
+                 softmax_oracle_hw.rs sees -- ISSUES.md C8's shape, one job leaving the core \
+                 in a state the next cannot run in"
+            );
+        }
+    }
+}
+
+/// Does writing at an offset into a shared allocation break the `exp` task?
+///
+/// The last difference between `softmax_oracle_hw.rs`'s failing `exp` and
+/// the passing one here. Everything else is eliminated: the program is
+/// byte-identical, the input codes are correct, the shape is measured at
+/// this width and row count, and a preceding pooling job does not break it.
+#[test]
+#[ignore = "requires an RK3588 NPU at /dev/accel/accel0"]
+fn the_exp_task_output_at_an_offset() {
+    let input_scale = 1.0 / 20.0;
+    let table = LutTable::exp_with_decaying_tail(input_scale);
+    let operand = lut_bn_mul_operand(input_scale, table);
+    let (rows, keys) = (64usize, 200usize);
+    let maxima: Vec<i8> = (0..rows).map(|r| -(r as i8)).collect();
+    let offsets: Vec<i8> = (0..keys).map(|k| -((k % 8) as i8)).collect();
+    let mut plane = vec![0u8; 4 * rows];
+    for (row, &m) in maxima.iter().enumerate() {
+        let value = -(i64::from(m)) * i64::from(operand);
+        plane[row * 4..row * 4 + 4].copy_from_slice(&(value as i32).to_le_bytes());
+    }
+    for out_offset in [0u32, 16, 4096, 15360] {
+        match run_exp_with_plane_at(input_scale, table, &maxima, &offsets, &plane, out_offset) {
+            None => println!("  output offset {out_offset}: NOT MEASURED"),
+            Some(counts) => {
+                let zero_rows = (0..rows)
+                    .filter(|&row| (0..keys).all(|key| counts[row * keys + key] == 0))
+                    .count();
+                println!("  output offset {out_offset}: {zero_rows}/{rows} rows all zero");
+            }
+        }
     }
 }
