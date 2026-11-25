@@ -1244,18 +1244,26 @@ off by default.
 Not accuracy, and not the host. Task count:
 
 * ~~**Rows per task.**~~ Done, and it **flips the sign** -- §10.3.
-* **A wider sum window.** The sum tree is 5 of the 13 tasks because the
-  planner backs only a 3x3 stride-3 square window (§2.2). An 8x8 at stride
-  8 would reduce a row in two levels instead of five -- three tasks, about
-  0.11 ms --
-  and `only_an_odd_square_window_can_stride` pins the refusal so that a
-  capture which widened it would show up here.
-* **Fusion into attention.** §1.1's whole argument: inside an attention
-  block the comparison is not against a CPU softmax in isolation but
-  against the CPU doing softmax *plus* the round trips an NPU-resident
-  block avoids. ISSUES C15 measured unbatched attention offload as a loss
-  (1.16x to 1.41x slower) before softmax was available at all, so this is
-  a reason to re-measure C15 rather than a reason to expect a win.
+* ~~**A calibrated bound instead of the maximum.**~~ Tried -- §12. Closed
+  negative: a real per-head bound needs 78 to 495 codes of slack and the op
+  can afford one or two. The max tree stays.
+* **A wider sum window.** The sum tree is the op's largest single cost --
+  measured, 5 of 13 tasks at 64 rows and **11 of 19 at 1792** (§11.1) --
+  because the planner backs only a 3x3 stride-3 square window (§2.2). An
+  8x8 at stride 8 would reduce a row in two levels instead of five, and
+  `only_an_odd_square_window_can_stride` pins the refusal so that a capture
+  which widened it would show up here. This is the fallback for a
+  *standalone* softmax; inside attention the next bullet deletes the tree
+  outright rather than shortening it.
+* ~~**Fusion into attention.**~~ Tried -- §11. The denominator really is
+  free from an all-ones column on `V^T` (2.44e-3 worst error, no extra job,
+  no extra tile), which deletes all 11 sum-tree tasks and the 1792-row
+  ceiling with them. But it needs the probabilities down the **weight**
+  path, and coefficient packing runs at 214 MB/s, making `P^T` 3.2x the
+  saving. §11.4 shows the same byte order written as strided runs at 1,602
+  MB/s, which turns the loss into a 0.42x win, so the lever is real and
+  gated on the packer rather than on the hardware. ISSUES C15 is still
+  upstream of all of it.
 
 ### 10.2 What this means for the op
 
@@ -1271,3 +1279,355 @@ is measured and reusable -- the operand planes, the Q15 bridge, the int16
 read, the tuned `exp` tail and the width-mapped reduction are all general.
 It is an argument about *where* a softmax should run today, and the answer
 is the CPU until the task count comes down.
+
+---
+
+## 11. Lever 2, tried: the denominator is free, and the packer is the gate
+
+ROADMAP's lever 2 folds the softmax's epilogue into attention's two
+matmuls. It has four claims. The one that matters is measured and **true**,
+one of the others turns out to contradict it, and the whole lever is gated
+by a cost that is neither the hardware's nor the design's.
+
+### 11.1 The all-ones column works, and it is free
+
+§1.1's mechanism, run on hardware for the first time
+(`lever2_all_ones_column_hw.rs`, real ViT-B/16 attention rows through an
+exact f32 softmax, so the only error measured is the contraction's):
+
+```
+O^T = V^T P^T     V^T [d_v + 1, N] on width, keys on Cin, P^T down the weight path
+                  width position d_v of V^T is all ones
+                  => output width position d_v holds sum_k P^T[k, q]
+```
+
+| | measured |
+|---|---|
+| worst `abs(denominator - 1)` over 64 queries | **2.44e-3** |
+| worst `abs(O^T - reference)`, 64x64 | 9.74e-4 |
+| extra jobs the column costs | **0** |
+| extra tiles the column costs | **0** |
+
+The denominator is the hardware adding up 197 separately fp16-rounded
+probabilities in its own accumulator, and it lands within 0.24% of one.
+That is **five times tighter than the op's own 1.12% total variation**, so
+the matmul is not where a fused softmax would lose accuracy. And the extra
+width position changes neither the job count nor the tile count, which is
+what "free" has to mean: `the_all_ones_column_costs_no_extra_task` pins
+both.
+
+**What it deletes is large.** Measured exactly, not apportioned -- the
+per-stage task census at 197 keys:
+
+| rows | total tasks | max tree | `exp` + bridges | sum tree | normalise |
+|---|---|---|---|---|---|
+| 64 | 13 | 4 | 3 | 5 | 1 |
+| 197 | 13 | 4 | 3 | 5 | 1 |
+| 394 | 14 | 4 | 3 | 6 | 1 |
+| 788 | 15 | 4 | 3 | 7 | 1 |
+| 1792 | 19 | 4 | 3 | **11** | 1 |
+
+So at §10.3's measured batch the sum tree is **11 of 19 tasks**, about
+**1.04 ms of the 1.80 ms**, or 0.11 ms a head. The all-ones column deletes
+all of it, and with it the 1792-row ceiling -- which §10.3 found was the
+sum tree's depthwise channel limit and nothing else.
+
+Note what this does *not* cost: lever 1's batching survives. The max tree
+and `exp` stay row-parallel across heads exactly as before; only the sum
+moves, and it moves onto a matmul that is per-head anyway.
+
+### 11.2 Claims 2 and 3 are alternatives, not a set
+
+ROADMAP lists "the denominator comes free from an all-ones column" and "the
+normalising multiply folds into the PV matmul's BN plane" as two items of
+one lever. They cannot both hold: if the denominator is produced *by* the
+PV matmul, it is not known when that matmul's own BN plane is programmed.
+The multiply can only fold into a matmul that runs **after** the one that
+summed.
+
+Which is fine, because they are wildly unequal: the sum tree is 11 tasks
+and the normalise is 1. Claim 2 dominates 11 to 1 and claim 3 should be
+dropped from the lever rather than reconciled with it.
+
+It is recoverable, for what it is worth, but not worth it. Queries are on
+`Cout` in `O^T`, so a per-channel plane *is* per-query -- but only while
+queries stay on channels, and the output projection puts them on width
+unless its activations also go down the weight path. One task is not worth
+a second runtime coefficient pack.
+
+### 11.3 The gate: coefficient packing at 214 MB/s
+
+Every one of lever 2's claims needs `P^T` to reach the hardware as a
+**coefficient** tensor. ROADMAP says of exactly this: "This is probably the
+real gate on a fused SDPA, and it is unmeasured." It is the gate, and here
+it is (`lever2_pack_cost_hw.rs`, board A76 at 2.4 GHz, `performance`, 50
+packs a sample and five samples; within one binary the samples agree to
+0.3%, and across rebuilds the rate moved between 190 and 220 MB/s, which is
+codegen layout and is the honest width of the figure):
+
+| | dense | time | rate |
+|---|---|---|---|
+| `Q^T` `[d=64, M=197]` fp16 | 25,216 B | 0.115 ms | 220 MB/s |
+| `P^T` `[N=197, M=197]` fp16 | 77,618 B | **0.363 ms** | 214 MB/s |
+| the same bytes, plain `memcpy` | 77,618 B | 0.0026 ms | 29,700 MB/s |
+
+Against the 0.11 ms of sum tree it would replace, `P^T` alone is **3.2x the
+saving**, and a whole head's packing is **2.4x the entire softmax**. Per
+ViT-B/16 inference, 12 heads x 12 layers, that is **69 ms of pure host
+permutation**. On those numbers lever 2 loses outright.
+
+### 11.4 But the gate is the packer, not the problem
+
+214 MB/s is **139x slower than `memcpy` of the same bytes**, which is not
+what a byte permutation costs on an A76. `pack_hwcf_to_rocket_weights`
+drives `WeightLayout::visit_slots`, a six-deep loop nest that calls a
+closure once per coefficient and does two multiplies and a bounds-checked
+two-byte `copy_from_slice` inside it.
+
+The coefficient *order* is the hardware's and is not in question. Writing
+that same order the obvious other way -- one contiguous run of destination
+coefficients per `(output block, input group, output lane)`, gathered from
+the dense filter at a constant stride, as a zipped pair of fixed-size chunk
+iterators instead of an indexed closure -- gives:
+
+| | time | rate | vs today |
+|---|---|---|---|
+| `Q^T` `[d=64, M=197]` fp16 | 0.0155 ms | 1,628 MB/s | **7.4x** |
+| `P^T` `[N=197, M=197]` fp16 | **0.0485 ms** | 1,602 MB/s | **7.5x** |
+
+`the_striped_packer_is_byte_identical` checks it against the real packer at
+eight shapes first -- including the partial final input group, the partial
+final output block and the 3-mod-4 atom bump -- so this is the same bytes,
+not a cheaper approximation. Still safe Rust, no `unsafe`, no intrinsics;
+`as_chunks` over `chunks_exact` is itself worth 1.6x of the 7.5x, which is
+a fair measure of how much of the original cost was bounds checking.
+
+At 0.0485 ms, `P^T` is **0.42x the sum tree it replaces**, and lever 2 goes
+from losing 3.2x to winning by better than two to one. The verdict on lever
+2 is therefore:
+
+> **The mechanism is confirmed and free. The lever is viable. It is gated
+> entirely on coefficient packing, which is 7.5x off its own achievable
+> speed.**
+
+### 11.5 Why that gate is worth more than lever 2 is
+
+The packer is not softmax's problem; it is everything's, and **ISSUES C15
+had already found it** -- its own last paragraph but one:
+
+> these are the only matmuls in the model whose *right-hand operand is an
+> activation* [...] so their coefficient packs can never hit the weight
+> cache the way a projection's do (288 fresh packs per inference, ~0.16 ms
+> each, ~45 ms).
+
+288 is 12 layers x 12 heads x 2 matmuls, and ~0.16 ms a pack corroborates
+the 0.115 ms measured above for a 25 KB operand on a quieter machine. So
+the figure is independently arrived at twice.
+
+**What a 7.5x packer would be worth to C15, arithmetically.** C15's
+attention arm cost 687 ms against 592 ms, a 95 ms delta. Packing is ~45 ms
+of it; at 7.5x that becomes ~6 ms, recovering **39 of the 95 ms -- 41% of
+the loss**. That does **not** flip C15 on its own: the rest is `record`
+(+41.7 ms), `wait.npu` (+33.0) and `compact` (+35.6), and C15's own
+conclusion -- that attention offload needs the shape to get better -- still
+stands. But it is the largest single nameable piece of that delta, and the
+only one a purely local fix reaches.
+
+**And lever 2 pays more packing than C15 did, not less.** This is a cost of
+§1.1's layout that §1.2 did not price. C15 offloads `attn V` untransposed,
+so its weight operand is `V`, `N x d_v = 197 x 64`. §1.1's transposed form
+makes the weight operand `P^T`, `N x M = 197 x 197` -- **3.08x the
+coefficients** for the same contraction. Measured, 0.363 ms a head against
+0.115. What §1.1 buys for that is real (no transpose, queries on `Cout`, so
+the per-channel planes and the all-ones column both work) but it is bought,
+not free.
+
+The two other figures already in the tree point the same way:
+
+* `rocket-hal-driver/src/weight_cache.rs`'s own doc comment: packing was
+  **99 ms of a 321 ms MobileNetV2 fp16 run, a third of all host time**.
+  That is why the cross-inference cache exists.
+* COMPILER_ROADMAP §6.3's `rocket-pack-weights` moved it to compile time
+  for constants: MobileNetV2 cold start -37 ms, Wide ResNet50 1290 -> 551
+  ms.
+
+Both are ways of *avoiding* the packer -- cache it, or hoist it to compile
+time -- and neither is available to attention, whose coefficients are
+computed fresh every inference. Making the packer itself faster is the one
+fix that reaches that case, and it makes the cache misses and the cold
+starts cheaper by the same factor.
+
+So the ordering is: the packer first, then lever 2 on top of it. Lever 2
+needs about 3.2x to break even and has 7.5x available.
+
+### 11.6 What is still untested
+
+* **Claim 1**, `1/sqrt(d)` folding into the QK matmul's output converter.
+  Plausible -- `OUT_CVT` is an integer multiply-and-shift and `1/sqrt(64)`
+  is exactly `2^-3`, so at a head width that is a power of four it is a
+  pure shift. It saves no softmax task; it removes a CPU scale.
+* **Claim 4**, Q15 probabilities straight into an `int16` PV matmul,
+  deleting both bridge tasks and folding `2^-15` into its requant scale.
+  Worth 2 tasks of 19. Untested, and §4.2's datapath rule is what decides
+  it: an `int16` input makes the datapath integer, which is exactly what
+  the bridge exists to undo.
+* **Whether offloading attention's matmuls wins at all**, which is C15 and
+  is upstream of this whole lever. Lever 2 is free *given* an offloaded PV
+  matmul; it does not argue for one.
+
+---
+
+## 12. Lever 3, tried: dead, and its stated risk was the wrong sign
+
+ROADMAP's lever 3 replaces the exact per-row maximum with a bound
+calibrated offline, deleting the max tree -- **4 device tasks at every row
+count**, 0.134 ms of 0.495 by §10's breakdown, a quarter of the op -- and
+the first host boundary with it.
+
+It does not work, for a reason nobody had identified, and the risk ROADMAP
+warned about turns out to be the *safe* direction.
+
+Both halves were measured through **one knob on the real op** rather than
+through a model of it. The host step between submissions 1 and 2 already
+writes the subtrahend by hand into the `exp` task's BN ALU plane, so
+writing `max + slack` there *is* lever 3, with no new mechanism:
+`lever3_bound_slack_hw.rs`, `PROBE_BOUND_SLACK` in int8 code units, one
+value per process. `the_fixture_is_pre_reduced_so_it_cannot_price_a_bound`
+in the same file is the tripwire for §12.1's trap.
+
+### 12.1 A real per-head bound needs 78 to 495 codes of slack
+
+The committed fixture cannot answer this and it is worth saying why, since
+it looked like it could: `tools/fixtures/dump_vit_attention_rows.py` stores
+`scores - scores.max(dim=-1)`, so every row's maximum is **already zero**
+and the spread is zero by construction. A first pass at this section
+measured zero spread and nearly believed it.
+
+So the raw logits were regenerated -- 144 real ViT-B/16 heads, 197 rows
+each, over three images (`head_bound_spread.py`'s recipe is
+`dump_vit_attention_rows.py`'s without the reduction):
+
+| | Unicorn | Donkey | Totoro |
+|---|---|---|---|
+| raw logit range | -24.6 .. +24.4 | -17.9 .. +23.1 | -26.0 .. +25.3 |
+| per-head row-max spread, median | 4.94 (99 codes) | 4.82 (96) | 4.90 (98) |
+| per-head row-max spread, worst | 23.65 (473) | 21.95 (439) | 24.76 (495) |
+| heads whose own spread exceeds the 100-code domain | 49% | 44% | 50% |
+
+Across the three images the per-head bound itself moves by a median of 21
+codes and a worst of 264. A bound calibrated on all three forces **a median
+of 78 codes of slack on the typical row and 495 on the worst**, against an
+accurate `exp` domain 100 codes wide.
+
+Half the heads cannot be covered by any single bound at all. **The per-row
+maximum is doing real work**, not saving an optimisation someone forgot.
+
+### 12.2 And the op cannot afford five
+
+Measured, the whole op on the board, 64 real rows, one slack per process:
+
+| slack | real units | Q15 at the peak | mean TV | worst TV | weights zeroed | dead rows |
+|---|---|---|---|---|---|---|
+| -40 | -2.00 | 32767 *(sat)* | 26.08% | 68.76% | 0 | 0 |
+| -20 | -1.00 | 32767 *(sat)* | 12.82% | 46.89% | 0 | 0 |
+| -5 | -0.25 | 32767 *(sat)* | 3.02% | 18.02% | 0 | 0 |
+| -1 | -0.05 | 32767 *(sat)* | 1.28% | 9.86% | 0 | 0 |
+| **0** | 0 | 32767 | **1.12%** | 13.97% | 2518 | 0 |
+| +5 | +0.25 | 25520 | 4.11% | 52.18% | 50 | 0 |
+| +10 | +0.50 | 19876 | 16.28% | 307.60% | 43 | 0 |
+| +20 | +1.00 | 12053 | 37.28% | 1005.36% | 646 | 3 |
+| +40 | +2.00 | 4435 | 59.58% | 456.45% | 3599 | 18 |
+
+**A quarter of one real unit of slack quadruples the error.** The usable
+budget is one or two codes against the 78 to 495 §12.1 says a real bound
+needs -- short by two orders of magnitude, not by a tuning pass.
+
+A total variation above 100% is not a typo. Half the L1 distance between
+two probability distributions cannot exceed 1, so 307% and 1005% mean the
+output has **stopped being a distribution**: §12.3 is why.
+
+### 12.3 The mechanism is the Q15 ceiling and the sum tree, not the domain
+
+`exp` itself is exact throughout. The Q15 count at each row's own largest
+code tracks `exp(-slack * input_scale)` to within two counts at every slack
+measured -- 25520 against a predicted 25520, 19876 against 19875, 12053
+against 12055. The table is doing its job.
+
+What fails is the **denominator**, measured directly against
+`exp(-slack * input_scale) * sum_k exp(x_k - max_k)`:
+
+| slack | worst row's sum tree | worst row's TV |
+|---|---|---|
+| 0 | 1.2x too small | 13.97% |
+| +5 | 1.6x | 52.18% |
+| +10 | 4.3x | 307.60% |
+| +20 | 11.4x | 1005.36% |
+| -20 | 1.7x | 46.89% |
+
+Every factor of denominator deficit inflates the output by that factor
+directly, which is where a TV above 1 comes from. And the cause is the
+**fixed-point output encoding**, not the table's domain: a Q15 count is an
+integer in `[0, 32767]`, so a probability below `1/32767` of the row's peak
+is unrepresentable. Slack moves the peak *down* from that ceiling --
+32767 to 12053 at slack 20 -- and compresses the whole representable
+dynamic range with it. Attention rows have long tails, and that tail mass
+is exactly what the sum then loses.
+
+This is a different binding constraint from §3.2's, and both hold. §3.2 is
+about how far *down* the table resolves, and the domain edge binds there.
+This is about how much headroom there is *above* the peak, and the Q15
+ceiling binds here.
+
+An incidental result worth keeping: **row 5's long-standing 13.97% worst
+case is now diagnosed.** At slack 0 its denominator is already 1.2x short,
+for the same reason -- 2518 of 12608 weights fall below fp16's floor at the
+output and carry 0.54% of the true mass with them. The worst-row figure was
+recorded five times across §10 and never explained.
+
+### 12.4 The risk ROADMAP warned about is the safe direction
+
+ROADMAP: "a logit above the bound is silently wrong by an unbounded
+amount". **Falsified.** Driven directly, by a negative slack:
+
+At slack -40 the peak's unclamped Q15 would be 242125, nearly four times
+`i16`'s range -- a wrap would land it at a large negative count and give the
+row's dominant key a negative probability. Measured, it comes back
+**32767**, `i16`'s ceiling, at every negative slack tried. Not one weight
+in 12608 comes back zero, no row dies, and total variation is a tidy 26.08%
+-- the answer you would get from a *saturating* softmax, computed as if
+every over-bound logit sat exactly at the bound. Bounded, monotone in the
+overshoot, and still a probability distribution.
+
+So the error is asymmetric, and in the opposite direction from the one the
+lever was designed around:
+
+> **Too tight is graceful. Too loose is catastrophic.** And a calibrated
+> bound can only ever err loose, because erring tight is the thing it
+> exists to avoid.
+
+That is the whole verdict on lever 3. It is also a useful fact about the
+shipped op, which keeps its exact max tree: if that tree ever returned a
+maximum that was too *small* -- a tiling bug, a partial reduction, a
+mis-sized operand plane -- the op would degrade gracefully rather than
+explode, which is the failure mode you want from a reduction tree and not
+the one to assume.
+
+### 12.5 What this leaves
+
+The max tree stays, at 4 tasks. Of §10.1's levers:
+
+* lever 1 is done and flipped the sign;
+* lever 2's mechanism is confirmed and free, gated on the coefficient
+  packer (§11);
+* **lever 3 is closed negative** -- not "needs calibration work", closed:
+  §12.1's spread is a property of attention, not of this implementation,
+  and no amount of tuning closes two orders of magnitude;
+* lever 4, splitting keys across cores, is untouched and is now the only
+  structural lever left besides the packer.
+
+A narrower version of lever 3 does survive the arithmetic and is worth
+recording rather than pursuing: a bound **per row** is exactly the maximum
+and saves nothing, while a bound per *tensor* is strictly worse than per
+head. The only way to buy slack back would be a wider output encoding than
+Q15, which is the `int16`-PV-matmul question §11.6 leaves open for lever 2
+rather than anything lever 3 can reach on its own.
