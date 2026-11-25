@@ -42,6 +42,28 @@ on:
         required: false
         default: 14
         type: number
+      runner:
+        description: >-
+          Runner image. Pinned, never ubuntu-latest: the image's glibc becomes
+          the floor of every binary built on it -- the host compiler links
+          against it, and the aarch64 cross toolchain ships the same release's
+          libc6-arm64-cross -- and the binaries have to run on the developer
+          host and the board. ubuntu-latest moved to 26.04 (glibc 2.43) in
+          November 2026 and from then on no artifact ran on either. Keep this
+          in step with max-glibc below; it is also part of the ccache key,
+          since a different image means a different gcc and so no hits.
+        required: false
+        default: ubuntu-24.04
+        type: string
+      max-glibc:
+        description: >-
+          Newest GLIBC_x.y symbol version a shipped binary may require; the
+          packaging steps fail the job above it. 2.39 is ubuntu-24.04's own,
+          and at or under both consumers: the developer host (Ubuntu 24.04,
+          2.39) and the board (Debian 13, 2.41).
+        required: false
+        default: "2.39"
+        type: string
 
 permissions:
   contents: read
@@ -49,7 +71,7 @@ permissions:
 jobs:
   build:
     name: ${{ inputs.target }}
-    runs-on: ubuntu-latest
+    runs-on: ${{ inputs.runner }}
     timeout-minutes: ${{ inputs.timeout-minutes }}
 
     env:
@@ -166,14 +188,14 @@ jobs:
           # github.run_id makes every run's key unique, because cache entries
           # are immutable -- reusing an existing key would silently skip the
           # save and the cache would never pick up newly compiled objects.
-          key: ccache-${{ inputs.target }}-${{ steps.pin.outputs.iree_sha }}-${{ hashFiles('iree-build/configure-compiler-host.sh', 'iree-build/configure-runtime-aarch64.sh', 'iree-build/aarch64_linux_gnu.cmake', 'iree-build/host-aarch64/CMakeLists.txt') }}-${{ github.run_id }}
+          key: ccache-${{ inputs.target }}-${{ inputs.runner }}-${{ steps.pin.outputs.iree_sha }}-${{ hashFiles('iree-build/configure-compiler-host.sh', 'iree-build/configure-runtime-aarch64.sh', 'iree-build/aarch64_linux_gnu.cmake', 'iree-build/host-aarch64/CMakeLists.txt') }}-${{ github.run_id }}
           # Falling back across iree-src SHAs is deliberate: an IREE bump moves
           # relatively few translation units, so a previous pin's cache still
           # hits on the vast majority of LLVM.
           restore-keys: |
-            ccache-${{ inputs.target }}-${{ steps.pin.outputs.iree_sha }}-${{ hashFiles('iree-build/configure-compiler-host.sh', 'iree-build/configure-runtime-aarch64.sh', 'iree-build/aarch64_linux_gnu.cmake', 'iree-build/host-aarch64/CMakeLists.txt') }}-
-            ccache-${{ inputs.target }}-${{ steps.pin.outputs.iree_sha }}-
-            ccache-${{ inputs.target }}-
+            ccache-${{ inputs.target }}-${{ inputs.runner }}-${{ steps.pin.outputs.iree_sha }}-${{ hashFiles('iree-build/configure-compiler-host.sh', 'iree-build/configure-runtime-aarch64.sh', 'iree-build/aarch64_linux_gnu.cmake', 'iree-build/host-aarch64/CMakeLists.txt') }}-
+            ccache-${{ inputs.target }}-${{ inputs.runner }}-${{ steps.pin.outputs.iree_sha }}-
+            ccache-${{ inputs.target }}-${{ inputs.runner }}-
 
       - name: Reset ccache stats
         run: ccache --zero-stats
@@ -209,6 +231,8 @@ jobs:
 
       - name: Package compiler-host artifacts
         if: inputs.target == 'compiler-host'
+        env:
+          MAX_GLIBC: ${{ inputs.max-glibc }}
         run: |
           set -euo pipefail
           BUILD=iree-build/build
@@ -297,6 +321,11 @@ jobs:
           cp "${BUILD}/lib/libIREECompiler.so" dist/iree-host-tools/lib/
           write_version dist/iree-host-tools/VERSION.txt
           tar -C dist -czf iree-host-tools.tar.gz iree-host-tools
+
+          # Before upload: a binary the host cannot load fails the job here
+          # rather than in a user's shell (see the `runner` input).
+          .github/scripts/check-glibc-ceiling.sh "${MAX_GLIBC}" \
+            dist/iree-compile-x86_64 dist/iree-host-tools
 
           ls -lh ./*.tar.gz
 
@@ -420,6 +449,8 @@ jobs:
 
       - name: Package runtime-aarch64 artifacts
         if: inputs.target == 'runtime-aarch64'
+        env:
+          MAX_GLIBC: ${{ inputs.max-glibc }}
         run: |
           set -euo pipefail
           BUILD=iree-build/host-aarch64/build
@@ -494,6 +525,11 @@ jobs:
           ```
           EOF
           tar -C dist -czf rocket-rust-tests-aarch64.tar.gz rocket-rust-tests-aarch64
+
+          # Same guard as compiler-host's: the board's glibc is the ceiling.
+          .github/scripts/check-glibc-ceiling.sh "${MAX_GLIBC}" \
+            dist/iree-runtime-aarch64 dist/rocket-cts-aarch64 \
+            dist/rocket-rust-tests-aarch64
 
           ls -lh ./*.tar.gz
 
