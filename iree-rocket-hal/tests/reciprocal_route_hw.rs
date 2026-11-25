@@ -45,7 +45,10 @@ use std::{fs::OpenOptions, mem, os::unix::io::AsRawFd, ptr, time::Instant};
 mod dispatch;
 
 use iree_rocket_hal::rocket::{
-    activation::{LutBuffers, LutShape, LutTable, build_lut_q15_regcmd},
+    activation::{
+        LutBuffers, LutShape, LutTable, build_lut_q15_regcmd, build_lut_q15_regcmd_with_plane,
+        lut_bn_mul_operand,
+    },
     bn_plane::{
         BnPlaneBuffers, BnPlaneOp, BnPlaneShape, PlaneElement, Q15BridgeBuffers, Q15BridgeShape,
         build_bn_plane_regcmd, build_plane_gather_regcmd, build_q15_bridge_regcmd,
@@ -1019,6 +1022,177 @@ fn run_quantize(scores: &[f32], minus_m: f32, out_scale: u32) -> Option<Vec<i8>>
         }
         if dispatch::is_device_timeout(elapsed) {
             let strict = dispatch::report("subtract and quantize", elapsed);
+            assert!(!strict, "killed dispatch under ROCKET_STRICT_DISPATCH");
+            return None;
+        }
+        Some(out)
+    }
+}
+
+/// **S5b**: the per-row maximum subtracted *inside* the `exp` task, from an
+/// NRDMA plane, which removes §7's subtract-and-quantize stage rather than
+/// fixing it.
+///
+/// Four rows, each with its own maximum, fed as int8 codes that have *not*
+/// been reduced by it. The plane carries `-m_code * lut_bn_mul_operand(..)`
+/// per row -- the same arithmetic `lut_bn_alu` does for the scalar int8
+/// zero point, since the operand is pre-scaled by the multiplier because
+/// the add lands after the multiply (S1).
+///
+/// The plane element format is the open part: S1 measured the fp16 ALU
+/// plane as a flat `f32` per channel, while the BS plane's int8 operands
+/// are `i32`. The LUT runs on the int8 datapath, so `i32` is the
+/// expectation; both are tried and the result says which.
+#[test]
+#[ignore = "requires an RK3588 NPU at /dev/accel/accel0"]
+fn the_exp_task_subtracts_a_per_row_max_from_its_own_plane() {
+    let input_scale = 1.0 / 20.0;
+    let table = LutTable::exp_with_decaying_tail(input_scale);
+    let operand = lut_bn_mul_operand(input_scale, table);
+    // Row maxima as int8 codes, and scores at or below them.
+    let maxima = [0i8, -20, -60, -100];
+    let offsets = [0i8, -5, -20, -40];
+
+    for (label, as_f32) in [("i32 plane", false), ("f32 plane", true)] {
+        let mut plane = vec![0u8; 4 * 16];
+        for (row, &m) in maxima.iter().enumerate() {
+            let value = -(i64::from(m)) * i64::from(operand);
+            let bytes = if as_f32 {
+                (value as f32).to_bits().to_le_bytes()
+            } else {
+                (value as i32).to_le_bytes()
+            };
+            plane[row * 4..row * 4 + 4].copy_from_slice(&bytes);
+        }
+        match run_exp_with_plane(input_scale, table, &maxima, &offsets, &plane) {
+            None => println!("  {label}: NOT MEASURED"),
+            Some(counts) => {
+                print!("  {label}:");
+                let mut worst = 0.0f32;
+                for (row, &m) in maxima.iter().enumerate() {
+                    for (column, &offset) in offsets.iter().enumerate() {
+                        let code = m.saturating_add(offset);
+                        let x = f32::from(code - m) * input_scale;
+                        let want = x.exp();
+                        let got = f32::from(counts[row * offsets.len() + column]) / 32768.0;
+                        worst = worst.max((got - want).abs());
+                    }
+                }
+                println!(" worst absolute error {worst:.4} over 16 (row, column) pairs");
+                if as_f32 {
+                    assert!(
+                        worst > 0.1,
+                        "the f32 reading of the plane also works, so the element format is \
+                         not datapath-determined after all and both are usable"
+                    );
+                } else {
+                    assert!(
+                        worst < 0.01,
+                        "the i32 plane gave {worst} of absolute error, so the per-row maximum \
+                         is not reaching the exp task's ALU stage and SOFTMAX.md section 7 \
+                         still needs a subtract stage of its own"
+                    );
+                }
+            }
+        }
+    }
+}
+
+/// Runs one `exp` task whose BN ALU operand comes per channel from `plane`.
+/// Rows are channels, columns are width: §1.1's layout.
+fn run_exp_with_plane(
+    input_scale: f32,
+    table: LutTable,
+    maxima: &[i8],
+    offsets: &[i8],
+    plane: &[u8],
+) -> Option<Vec<i16>> {
+    let rows = maxima.len();
+    let keys = offsets.len();
+    let file = OpenOptions::new()
+        .read(true)
+        .write(true)
+        .open(DEVICE_PATH)
+        .expect("failed to open RK3588 NPU device");
+    let fd = file.as_raw_fd();
+    unsafe {
+        let buf_in = Buffer::new(fd, BUFFER_SIZE, &file);
+        ptr::write_bytes(buf_in.host_ptr, 0, BUFFER_SIZE);
+        for (row, &m) in maxima.iter().enumerate() {
+            for (column, &offset) in offsets.iter().enumerate() {
+                let at = cube_offset(row, column, keys, INT8_LANES_PER_ATOM, 1);
+                ptr::write(buf_in.host_ptr.add(at), m.saturating_add(offset) as u8);
+            }
+        }
+        let buf_plane = Buffer::new(fd, BUFFER_SIZE, &file);
+        ptr::write_bytes(buf_plane.host_ptr, 0, BUFFER_SIZE);
+        ptr::copy_nonoverlapping(plane.as_ptr(), buf_plane.host_ptr, plane.len());
+        let buf_out = Buffer::new(fd, BUFFER_SIZE, &file);
+        ptr::write_bytes(buf_out.host_ptr, 0, BUFFER_SIZE);
+
+        let cmds = build_lut_q15_regcmd_with_plane(
+            &LutShape {
+                width: keys as u32,
+                height: 1,
+                channels: rows as u32,
+                input_zero_point: 0x80,
+                output_zero_point: 0x80,
+                input_scale,
+                output_scale: 1.0,
+            },
+            &LutBuffers {
+                input_addr: buf_in.dma_address,
+                output_addr: buf_out.dma_address,
+            },
+            table,
+            buf_plane.dma_address,
+        );
+        let buf_cmd = Buffer::new(
+            fd,
+            (cmds.len() * mem::size_of::<u64>()).next_multiple_of(4096),
+            &file,
+        );
+        ptr::write_bytes(buf_cmd.host_ptr, 0, buf_cmd.size);
+        let slots = std::slice::from_raw_parts_mut(buf_cmd.host_ptr as *mut u64, cmds.len());
+        for (slot, cmd) in slots.iter_mut().zip(&cmds) {
+            *slot = cmd.0;
+        }
+        for handle in [
+            buf_in.handle,
+            buf_plane.handle,
+            buf_out.handle,
+            buf_cmd.handle,
+        ] {
+            fini_bo(fd, handle).ok();
+        }
+        let started = Instant::now();
+        submit(
+            fd,
+            buf_cmd.dma_address,
+            cmds.len() as u32,
+            &[buf_cmd.handle, buf_in.handle, buf_plane.handle],
+            &[buf_out.handle],
+        )
+        .expect("SUBMIT failed");
+        prep_bo(fd, buf_out.handle, 2_000_000_000)
+            .unwrap_or_else(|error| panic!("the planed exp task did not complete: {error}"));
+        let elapsed = started.elapsed();
+        let out: Vec<i16> = (0..rows * keys)
+            .map(|index| {
+                let at = cube_offset(index / keys, index % keys, keys, FP16_LANES_PER_ATOM, 2);
+                ptr::read_unaligned(buf_out.host_ptr.add(at) as *const i16)
+            })
+            .collect();
+        for handle in [
+            buf_in.handle,
+            buf_plane.handle,
+            buf_out.handle,
+            buf_cmd.handle,
+        ] {
+            close_bo(fd, handle).ok();
+        }
+        if dispatch::is_device_timeout(elapsed) {
+            let strict = dispatch::report("planed exp", elapsed);
             assert!(!strict, "killed dispatch under ROCKET_STRICT_DISPATCH");
             return None;
         }

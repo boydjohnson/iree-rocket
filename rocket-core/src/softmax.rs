@@ -11,16 +11,15 @@
 //! 1. **The row maximum**, a tree of PPU max-pool levels over the width
 //!    axis. There is no convolution path for a maximum, and the pooling
 //!    window is at most 8 wide, so wide rows take several levels (§2, S2).
-//! 2. **The maximum into an operand plane.** The PPU writes a width-1 cube
-//!    whose surfaces are four pixels apart, and the DPU's BN ALU plane
-//!    wants a dense `f32`, so one pass-through bridges them through
-//!    `RDMA_SURF_NOTCH` (§7, S2a).
-//! 3. **Subtract and quantize.** The `exp` table's input is int8 (§3.1), so
-//!    the scores are reduced by the per-row maximum on the BN ALU plane and
-//!    narrowed in the same task.
-//! 4. **`exp`**, the DPU LUT, int8 in and the table's Q15 integer out as
-//!    `int16`. Its tail needs the tuned underflow slope or a wide softmax
-//!    is corrupted outright (§3.3, §3.4).
+//! 2. **The maximum into an operand plane**, on the host: a width-1,
+//!    `rows`-wide vector negated, scaled by the `exp` task's own BN
+//!    multiplier and written as `i32` per channel. Microseconds, like the
+//!    reciprocal (§4, S5b).
+//! 3. **`exp`**, the DPU LUT, int8 in and the table's Q15 integer out as
+//!    `int16`, **with the per-row maximum subtracted inside it** from that
+//!    plane. There is no separate subtract stage: §7 always put the
+//!    subtraction here, and S5b measured it exact. Its tail needs the tuned
+//!    underflow slope or a wide softmax is corrupted outright (§3.3, §3.4).
 //! 5. **Two bridge tasks**, because an integer input makes the DPU's
 //!    datapath integer: the first reads `int16` to fp16 exactly and cannot
 //!    scale, the second applies the `2^-15` that turns a Q15 count into a
@@ -118,14 +117,19 @@ pub enum Stage {
         output_width: u32,
         pad_right: u32,
     },
-    /// The width-1 maximum, four-pixel strided and fp16, into a dense
-    /// negated `f32` BN ALU plane (§7, S2a). Negated because the plane
-    /// *adds*.
-    MaxToPlane,
-    /// Reduce the scores by the per-row maximum on the BN ALU plane and
-    /// narrow to the `exp` table's int8 input in the same task.
-    SubtractAndQuantize,
-    /// The `exp` LUT: int8 in, the table's Q15 integer out as `int16`.
+    /// The width-1 maximum into the `exp` task's BN ALU plane, on the
+    /// host: negate it (the plane *adds*), scale it by the task's own
+    /// `lut_bn_mul_operand` (the operand is pre-scaled because the add
+    /// lands after the multiply), and write it as `i32` per channel -- the
+    /// element format the int8 datapath wants, where the fp16 datapath
+    /// wants `f32` (S1, S5b).
+    ///
+    /// On the host because it is a width-1, `rows`-wide vector, which §4
+    /// established is the host's side of the line. S2a's device gather
+    /// remains an optimisation.
+    HostMaxToPlane,
+    /// The `exp` LUT: int8 scores in, the table's Q15 integer out as
+    /// `int16`, with the per-row maximum subtracted from the plane above.
     Exp,
     /// `int16` to fp16, exactly, which is all an integer read can do
     /// (§4.2).
@@ -197,8 +201,7 @@ impl Plan {
         for level in max_levels(shape.keys) {
             stages.push(level);
         }
-        stages.push(Stage::MaxToPlane);
-        stages.push(Stage::SubtractAndQuantize);
+        stages.push(Stage::HostMaxToPlane);
         stages.push(Stage::Exp);
         stages.push(Stage::BridgeRead);
         stages.push(Stage::BridgeScale);
@@ -223,16 +226,18 @@ impl Plan {
     pub fn device_tasks(&self) -> usize {
         self.stages
             .iter()
-            .filter(|stage| !matches!(stage, Stage::HostReciprocal))
+            .filter(|stage| !matches!(stage, Stage::HostReciprocal | Stage::HostMaxToPlane))
             .count()
     }
 
-    /// Where the host has to intervene, splitting the job into submissions.
-    /// One boundary, measured at 0.037 to 0.059 ms (§4).
+    /// Where the host has to intervene, splitting the job into
+    /// submissions: two, each measured at 0.037 to 0.059 ms (§4). One
+    /// before `exp` for the maximum's plane and one after the sum for the
+    /// reciprocal, both width-1 vectors.
     pub fn host_boundaries(&self) -> usize {
         self.stages
             .iter()
-            .filter(|stage| matches!(stage, Stage::HostReciprocal))
+            .filter(|stage| matches!(stage, Stage::HostReciprocal | Stage::HostMaxToPlane))
             .count()
     }
 }
@@ -299,8 +304,7 @@ mod tests {
         assert_eq!(
             tail,
             vec![
-                Stage::MaxToPlane,
-                Stage::SubtractAndQuantize,
+                Stage::HostMaxToPlane,
                 Stage::Exp,
                 Stage::BridgeRead,
                 Stage::BridgeScale,
@@ -375,8 +379,10 @@ mod tests {
         // (197 -> 66 -> 22 -> 8 -> 3 -> 1), plus the six fixed device
         // stages.
         let plan = Plan::try_new(Shape::new(197, 64)).unwrap();
-        assert_eq!(plan.device_tasks(), 3 + 5 + 6);
-        assert_eq!(plan.host_boundaries(), 1);
+        // Three max levels, five sum levels, and four fixed device stages:
+        // exp, the two bridge tasks, and the normalize.
+        assert_eq!(plan.device_tasks(), 3 + 5 + 4);
+        assert_eq!(plan.host_boundaries(), 2);
     }
 
     #[test]
@@ -390,7 +396,7 @@ mod tests {
                 .iter()
                 .any(|stage| matches!(stage, Stage::MaxLevel { .. } | Stage::SumLevel { .. }))
         );
-        assert_eq!(plan.device_tasks(), 6);
+        assert_eq!(plan.device_tasks(), 4);
     }
 
     #[test]

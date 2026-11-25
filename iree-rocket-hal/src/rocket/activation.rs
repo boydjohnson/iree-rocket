@@ -603,6 +603,23 @@ fn lut_out_cvt(output_scale: f32) -> (u32, u32) {
     (operand, shift as u32)
 }
 
+/// The `BN_MUL` operand a LUT task programs for `input_scale`, which a
+/// caller needs to build a **per-channel** ALU operand plane.
+///
+/// `lut_bn_alu`'s own formula for the register-sourced case is
+/// `-zero_point * bn_mul_operand`: the operand is pre-scaled by the
+/// multiplier, because the add lands after the multiply (measured, S1).
+/// A per-channel version is the same arithmetic with the row's own
+/// subtrahend in place of the scalar zero point, so the caller needs this
+/// number.
+///
+/// SOFTMAX.md §7's `exp` pass uses it that way: the plane carries
+/// `-m_code * bn_mul_operand` per row, which is how the per-row maximum is
+/// subtracted inside the `exp` task rather than in a stage of its own.
+pub fn lut_bn_mul_operand(input_scale: f32, table: LutTable) -> u32 {
+    lut_bn_mul(input_scale, table.bn_scale_k).0
+}
+
 /// Logical shape for a standalone DPU LUT pass -- the only LUT-activation
 /// path this crate builds, matching the vendor compiler's decoded
 /// sigmoid/tanh routing (confirmed via live hardware trace of the vendor
@@ -917,6 +934,34 @@ pub fn build_lut_regcmd(shape: &LutShape, bufs: &LutBuffers, table: LutTable) ->
 /// `shape.output_zero_point` are **ignored**.
 ///
 pub fn build_lut_q15_regcmd(shape: &LutShape, bufs: &LutBuffers, table: LutTable) -> Vec<RegCmd> {
+    build_lut_q15_regcmd_with_plane(shape, bufs, table, 0)
+}
+
+/// [`build_lut_q15_regcmd`] with its BN **ALU** operand taken per channel
+/// from NRDMA at `plane_addr` rather than from the config register.
+///
+/// This is SOFTMAX.md §7's `exp` pass as that section always wrote it: the
+/// plane carries `-m_code * lut_bn_mul_operand(..)` for each row, so the
+/// per-row maximum is subtracted *inside* the `exp` task. S5's first
+/// attempt gave the subtraction a stage of its own, with the fp16 scores
+/// quantized to int8 on the way, and that stage hung at the watchdog -- a
+/// DPU task reading fp16 and writing int8 is a mixed-precision shape
+/// nothing in this crate drives. This instead applies the plane S1
+/// measured to the datapath the LUT already runs on, and removes a stage
+/// rather than adding one.
+///
+/// A `plane_addr` of zero keeps the config-register operand, and the int8
+/// zero-point formula with it.
+// Straight-line hardware register program; hand-transcribing it into a
+// `vec![]` literal risks a copy/reorder mistake silently miscoding a register.
+#[allow(clippy::vec_init_then_push)]
+pub fn build_lut_q15_regcmd_with_plane(
+    shape: &LutShape,
+    bufs: &LutBuffers,
+    table: LutTable,
+    plane_addr: u32,
+) -> Vec<RegCmd> {
+    let per_channel = plane_addr != 0;
     assert!(
         shape.width > 0 && shape.height > 0 && shape.channels > 0,
         "build_lut_q15_regcmd: width, height, and channels must be nonzero"
@@ -1069,7 +1114,7 @@ pub fn build_lut_q15_regcmd(shape: &LutShape, bufs: &LutBuffers, table: LutTable
     cmds.push(
         Register::<DpuBnCfg>::new()
             .bn_alu_algo(Bits::new(2))
-            .bn_alu_src(Bits::new(0))
+            .bn_alu_src(Bits::new(u32::from(per_channel)))
             .bn_relu_bypass(Bits::new(1))
             .bn_mul_bypass(Bits::new(0))
             .bn_alu_bypass(Bits::new(0))
@@ -1078,7 +1123,10 @@ pub fn build_lut_q15_regcmd(shape: &LutShape, bufs: &LutBuffers, table: LutTable
     );
     cmds.push(
         Register::<DpuBnAluCfg>::new()
-            .bn_alu_operand(Bits::new(bn_alu_operand))
+            // Ignored when the source is NRDMA, so a per-channel plane
+            // leaves it zero rather than leaving a stale scalar that would
+            // make a passing result ambiguous (S1's rule).
+            .bn_alu_operand(Bits::new(if per_channel { 0 } else { bn_alu_operand }))
             .build(),
     );
     cmds.push(
@@ -1162,8 +1210,19 @@ pub fn build_lut_q15_regcmd(shape: &LutShape, bufs: &LutBuffers, table: LutTable
     );
     cmds.push(zero::<DpuRdmaBrdmaCfg>());
     cmds.push(zero::<DpuRdmaBsBaseAddr>());
-    cmds.push(zero::<DpuRdmaNrdmaCfg>());
-    cmds.push(zero::<DpuRdmaBnBaseAddr>());
+    cmds.push(
+        Register::<DpuRdmaNrdmaCfg>::new()
+            // Bit 0 is the ALU operand. Derived from the same flag that
+            // engages the stage, so a fetch cannot be left on without a
+            // consumer (ISSUES.md C8).
+            .nrdma_data_use(Bits::new(u32::from(per_channel)))
+            .build(),
+    );
+    cmds.push(
+        Register::<DpuRdmaBnBaseAddr>::new()
+            .bn_base_addr(Bits::new(plane_addr))
+            .build(),
+    );
     cmds.push(
         Register::<DpuRdmaErdmaCfg>::new()
             .erdma_disable(Bits::new(1))

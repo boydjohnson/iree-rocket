@@ -736,12 +736,14 @@ the whole of this is **one job's ordered task array** under structure A
 pass 1   PPU max pool, kernel k x 1, per tile  [N, M] -> [tiles, M]
            tiles write disjoint width slices of one shared cube (§5.1)
          PPU max pool, kernel tiles x 1        [tiles, M] -> [1, M]    m
-pass 2   DPU LUT task, flying mode:            <-- see §3.1: Q15 output
-           BN ALU operand <- NRDMA, -m per channel
-           input_scale = 1/2, LutTable::exp()
-           -> u = exp((x - m)/2)               [N, M] -> [N, M]
-         EwBinaryOp::Mul(u, u) -> P            [N, M] -> [N, M]
-         depthwise all-ones 1 x k conv tree    [N, M] -> [1, M]        d
+         HOST: negate m, scale by the exp task's own BN multiplier,
+           write it as i32 per channel (§4.2, S5b)
+pass 2   DPU LUT task, flying mode:            <-- Q15 int16 output, §3.1
+           BN ALU operand <- NRDMA, -m per channel: the subtraction
+           happens *here*, not in a stage of its own (S5b)
+           input_scale = 1/20, exp_with_decaying_tail (§3.3, §3.4)
+           -> P in Q15                         [N, M] -> [N, M]
+         depthwise all-ones 3x3/s3 conv tree   [N, M] -> [1, M]        d
 pass 3   bridge task 1: int16 -> fp16         [N, M] -> [N, M]
            an integer read cannot also scale (§4.2)
          bridge task 2: BN MUL plane = 2^-15   [N, M] -> [N, M]
@@ -1018,7 +1020,7 @@ files.
 `rocket_core::softmax::Plan::try_new` is §7 as a plan: it enumerates the
 ordered stages, both reduction trees with their per-level extents and
 padding, and reports the costs §4 and §5 argue about before anything runs
--- 14 device tasks and 1 host boundary at `keys = 197, rows = 64`. Column
+-- 12 device tasks and 2 host boundaries at `keys = 197, rows = 64`. Column
 tiling stays with the planners that own it, `PoolingPlan` for a max level
 and `ConvPlan` for a sum level, exactly as `fc` delegates to `conv`.
 
@@ -1029,24 +1031,46 @@ per-channel plane any probe has driven), more than 512 keys (S2's
 reduction). All three come back `UnvalidatedConfiguration`, and the tests
 assert the code rather than just the failure.
 
-One stage of §7 changed on the way. `MaxToPlane` does not need S2a's
+Two stages of §7 changed on the way. `MaxToPlane` does not need S2a's
 gather: the maximum is a width-1, `rows`-wide vector, so negating it and
 writing the ALU plane is the same order of host work as the reciprocal --
 microseconds -- and S4 already established that a width-1 vector belongs on
 the host while a cube pass does not. The gather stays the optimisation it
 was; it is not on the critical path, and it would need a negation
-mechanism nobody has measured.
+mechanism nobody has measured. And `SubtractAndQuantize` is gone entirely;
+S5b has why.
 
-**S5b -- subtract and quantize.** The one mechanism §7 still needs, and the
-first configuration tried **hangs at the watchdog** on both output scales
-(`the_subtract_and_quantize_probe`). That is a finding and not a flaky
-kill: the same task shape with an fp16 output is the identity, so it is the
-int8 *output* and not the task. Which says where the stage belongs --
-subtract-and-quantize is a requantisation with a per-channel bias, and
-that is what `conv.rs`'s int8 path does every time it runs: bias on the BS
-plane, multiplier and output zero point on `OUT_CVT`, `od_bypass` clear,
-`ow_src` set, `BS_OW_OP` programmed. The probe set none of it. Derive the
-stage from that configuration rather than from an fp16 pass-through.
+**S5b -- subtract and quantize. DONE 2026-11-24, by deleting the stage**
+(`build_lut_q15_regcmd_with_plane`).
+
+The stage existed because I assumed the `exp` task would be handed fp16
+scores and have to narrow them. Its first configuration **hung at the
+watchdog** on both output scales -- a finding rather than a flaky kill,
+since the same task shape with an fp16 output is the identity, so it was
+the int8 *output* and not the task. A DPU task that reads fp16 and writes
+int8 is a mixed-precision shape nothing in this crate drives: the LUT
+writes int8 from a DPU-only task happily, but it is int8 *throughout*.
+
+The way out was to stop adding a stage and read §7 again, which had always
+put the subtraction on the `exp` task's own BN ALU plane. That works:
+`build_lut_q15_regcmd_with_plane` takes the ALU operand per channel from
+NRDMA, and with the plane carrying `-m_code * lut_bn_mul_operand(..)` per
+row -- the same arithmetic `lut_bn_alu` does for the scalar int8 zero
+point, pre-scaled because the add lands after the multiply -- the result is
+within `1e-4` absolute of `exp(x - m)` across four rows with four
+different maxima. The scores arrive as int8 from the matmul's own requant,
+which is a gated path, and nothing has to narrow anything.
+
+**The plane's element format follows the datapath.** `i32` here, where S1
+measured `f32` on the fp16 path, and the `f32` reading of the same plane is
+wrong by 0.86 absolute -- so the format is not a property of the plane but
+of the precision the task runs at. Both are asserted, the wrong one
+included, so a later change that makes them interchangeable shows up.
+
+So §7 is one stage shorter than §8 thought, and `rocket_core::softmax`
+drops `SubtractAndQuantize` for a `HostMaxToPlane` that writes the plane --
+a width-1, `rows`-wide vector, the host's side of §4's line. 12 device
+tasks and 2 host boundaries at `keys = 197, rows = 64`.
 
 Only after S5: the schema def, the driver's dispatch, the transform-spec
 matcher. Those follow COMPILER_ROADMAP's existing grooves and are not
