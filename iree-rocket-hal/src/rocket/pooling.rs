@@ -529,6 +529,31 @@ impl PoolingPlan {
     pub fn new(shape: PoolingShape) -> PoolingPlan {
         shape.validate();
         let (max_input_width, max_output_width) = direct_width_limits(&shape);
+        // Both direct limits bind, and the output one is not always the
+        // tighter. A tile emitting `w` output columns reads
+        // `(w - 1) * stride_x + kernel_width` input columns, so a stride
+        // wide enough makes the *input* cap decide the tile count: an 8x1
+        // window at stride 8 over 384 columns balances to one 48-column
+        // tile under the output cap of 64 and then reads 384 input columns
+        // against a limit of 129. That tripped this function's own
+        // `assert!` below rather than splitting, so every pooling
+        // reduction wide enough to need tiling -- which is every
+        // transformer extent, SOFTMAX.md section 7's max tree included --
+        // panicked at plan time. Fold the input cap into the per-tile
+        // output cap instead.
+        //
+        // This can only *lower* the cap, and only where the input limit is
+        // the binding one, so it leaves every capture-backed split alone:
+        // at 3x3/s2 over 256 columns the input cap allows 64 output
+        // columns and the output cap is 64, and at 2x2/s2 over 258 both
+        // come to 128. `wide_plan_reproduces_the_unpadded_vendor_tiles`
+        // and the int8 width-258 split are the two that would notice.
+        let output_columns_per_input_limit = max_input_width
+            .saturating_sub(shape.kernel_width)
+            .checked_div(shape.stride_x)
+            .map_or(1, |columns| columns + 1)
+            .max(1);
+        let max_output_width = max_output_width.min(output_columns_per_input_limit);
         let tile_count = shape.output_width.div_ceil(max_output_width);
         let base_width = shape.output_width / tile_count;
         let wider_tiles = shape.output_width % tile_count;
@@ -1308,6 +1333,84 @@ mod tests {
             register_value::<PpuPoolingKernelCfg>(&commands),
             0x00ff_0707
         );
+    }
+
+    /// An fp16 average pool cannot reduce along one axis only, because the
+    /// *other* axis's identity divisor has no fp16 encoding -- and that
+    /// closes SOFTMAX.md section 2.2's third route to a row sum.
+    ///
+    /// Found by running it (`reduce_width_hw.rs`'s first pass): every
+    /// height-1 average shape refuses at program-build time, whatever its
+    /// width kernel is, since `average_reciprocal` is asked for `65536 / 1`
+    /// on the height axis. int8 has no such limit, so this is a precision
+    /// restriction rather than a geometry one. The two routes the design
+    /// prefers both run on the DPU and are unaffected; see section 2.2.
+    #[test]
+    #[should_panic(expected = "cannot encode a kernel of 1")]
+    fn an_fp16_average_cannot_reduce_width_only() {
+        let mut shape = shape(64, 1, 8, 1, 8, 1, PoolingPrecision::Fp16);
+        shape.method = PoolingMethod::Avg;
+        shape.output_width = 8;
+        single_task(
+            &shape,
+            &PoolingBuffers {
+                input_addr: 0,
+                output_addr: 0,
+            },
+        );
+    }
+
+    /// The same shape at int8, to pin that the refusal above is about
+    /// fp16's 65504 ceiling and not about a height-1 window.
+    #[test]
+    fn an_int8_average_can_reduce_width_only() {
+        let mut shape = shape(64, 1, 8, 1, 8, 1, PoolingPrecision::Int8);
+        shape.method = PoolingMethod::Avg;
+        shape.output_width = 8;
+        let commands = single_task(
+            &shape,
+            &PoolingBuffers {
+                input_addr: 0,
+                output_addr: 0,
+            },
+        );
+        // 65536 / 8 across the width, 65536 / 1 along the height, both as
+        // plain fixed point.
+        assert_eq!(register_value::<PpuRecipKernelWidth>(&commands), 8192);
+        assert_eq!(register_value::<PpuRecipKernelHeight>(&commands), 65536);
+    }
+
+    /// A `k x 1` window at a stride as wide as the kernel is SOFTMAX.md
+    /// section 7's row reduction, and it is the geometry where the *input*
+    /// direct limit binds before the output one. Every transformer extent
+    /// used to panic in `PoolingPlan::new`'s own assert instead of
+    /// splitting.
+    #[test]
+    fn a_strided_reduction_splits_on_the_input_limit() {
+        // (129 - 8) / 8 + 1 = 16 output columns per tile, against an
+        // output cap of 64.
+        for (width, expected_tiles) in [(64u32, 1usize), (128, 1), (197, 2), (384, 3), (512, 4)] {
+            let mut shape = shape(width, 1, 8, 1, 8, 1, PoolingPrecision::Fp16);
+            shape.output_width = width.div_ceil(8);
+            shape.pad_right = shape.output_width * 8 - width;
+            let plan = PoolingPlan::new(shape);
+            assert_eq!(
+                plan.tiles().len(),
+                expected_tiles,
+                "width {width} split into {:?}",
+                plan.tiles()
+            );
+            // The split has to cover the row exactly once, and every tile
+            // has to be one the direct path is measured to run.
+            let (max_input, _) = direct_width_limits(&shape);
+            let mut output_next = 0;
+            for tile in plan.tiles() {
+                assert_eq!(tile.output_first, output_next, "gap or overlap: {tile:?}");
+                assert!(tile.input_width <= max_input, "{tile:?}");
+                output_next += tile.output_width;
+            }
+            assert_eq!(output_next, shape.output_width, "width {width}");
+        }
     }
 
     #[test]
