@@ -184,6 +184,60 @@ impl LutTable {
         }
     }
 
+    /// `exp(x)` with the underflow extrapolation tuned so the tail reaches
+    /// exactly **zero** at the most negative input an int8 `input_scale`
+    /// can express, instead of holding flat at `exp(-5)`.
+    ///
+    /// SOFTMAX.md §3.3. [`LutTable::exp`] ships
+    /// `le_slope_uflow_scale = 0`, a flat clamp, so every input past the
+    /// table's `-5` domain edge returns the edge entry -- measured at a
+    /// constant `6.74e-3` (`lut_exp_envelope_hw.rs`). In a softmax that is
+    /// fatal rather than merely inaccurate: `N` tail keys put
+    /// `N * 6.74e-3` of spurious mass in the denominator, 2.6 at `N = 384`
+    /// against a true denominator of order 1.
+    ///
+    /// The slope is a real register, though, and the extrapolation it
+    /// drives is a straight line in the table's index space -- measured,
+    /// and it runs *through* zero into negative output if the slope is too
+    /// steep, which for a probability is worse than the flat clamp. The EW
+    /// stage's ReLU does not stop it either: `ew_relu_bypass = 0` on a LUT
+    /// task is inert (same file).
+    ///
+    /// So the slope is tuned to the input domain rather than clamped
+    /// afterwards. At an int8 `input_scale` the most negative real input is
+    /// `-128 * input_scale`, and a slope that takes the edge entry's 221
+    /// counts to zero over exactly that distance leaves the tail
+    /// monotonically decreasing, non-negative everywhere, and zero at the
+    /// bottom -- for no extra task. Hardware-confirmed at
+    /// `input_scale = 1/16`, where this returns `(368, 14)` and the output
+    /// reaches 0 at exactly `x = -8.0`.
+    ///
+    /// Panics unless `128 * input_scale` is past the domain edge by enough
+    /// to encode a slope: below that the table never clamps in the first
+    /// place (so [`LutTable::exp`] is what you want), and far past it the
+    /// ramp is so shallow that it is worse than useless -- a linear decay
+    /// over a wide span overestimates `exp`'s own tail badly.
+    pub fn exp_with_decaying_tail(input_scale: f32) -> Self {
+        const EDGE_COUNTS: f32 = 221.0;
+        const SHIFT: u8 = 14;
+        let reach = 128.0 * input_scale;
+        assert!(
+            reach > DOMAIN_EDGE_MAGNITUDE,
+            "an int8 input at scale {input_scale} reaches only {reach}, inside the table's              own {DOMAIN_EDGE_MAGNITUDE} domain, so nothing is ever extrapolated and              LutTable::exp is the one to use"
+        );
+        let distance = (reach - DOMAIN_EDGE_MAGNITUDE) * EXP_LUT_BN_SCALE_K;
+        let scale = (EDGE_COUNTS / distance * f32::from(1u16 << SHIFT)).round();
+        assert!(
+            scale >= 1.0 && scale <= f32::from(u16::MAX),
+            "the slope for input_scale {input_scale} encodes as {scale}, outside the              register's 16 bits"
+        );
+        LutTable {
+            le_slope_uflow_scale: scale as u16,
+            le_slope_uflow_shift: SHIFT,
+            ..LutTable::exp()
+        }
+    }
+
     /// `square(x) = x*x`. The first table in this file with no vendor
     /// capture behind it at all -- see `lut_tables::SQUARE_LE`/`_LO`'s own
     /// doc comment for the generation formula and why `bn_scale_k` here
@@ -477,6 +531,12 @@ const RSQRT_BN_SCALE_K: f32 = 1024.0;
 /// edge at `x=4.0`, matching `ERF_BN_SCALE_K` (`LOG_LE`/`_LO`'s doc
 /// comment covers why only part of that domain holds real values).
 const LOG_BN_SCALE_K: f32 = 4096.0;
+
+/// Magnitude of the LE table's real domain edge, `16384 / EXP_LUT_BN_SCALE_K`.
+///
+/// Measured exactly: at `input_scale = 1` the output tracks `exp` down to
+/// `-5.00` and is constant below it (`lut_exp_envelope_hw.rs`).
+const DOMAIN_EDGE_MAGNITUDE: f32 = 5.0;
 
 /// `reciprocal()`'s `bn_scale_k`, same "chosen together with the table
 /// generator" status as the constants above. `1024` puts the real domain

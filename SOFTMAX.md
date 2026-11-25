@@ -150,7 +150,7 @@ and its output has the same shape as its input.
 | row max | PPU max pool, kernel `k x 1`, stride `k x 1` | **exists**, and exact at atol 0 over `N` 8..512 as a tree in one job, probe S2 (`reduce_width_hw.rs`) |
 | max over tiles | `EwBinaryOp::Max` on two width-1 cubes | **exists**; oracle-checked on `planck` by `ew_binary_hw.rs:346` and again across ViT's shapes at `:421`. The `EwBinaryOp::Max` doc comment still says "not measured here yet" -- that comment is stale and worth deleting. Needed only for §6's fused form; §5.1's combine does not use it |
 | subtract the max | BN ALU operand from NRDMA, per channel | **exists**, as of probe S1: flat IEEE `f32` at `channel * 4`, broadcast over the cube, `bn_plane_probe_hw.rs` |
-| `exp` | DPU LUT, `LutTable::exp()` | **int8 only**, probe S3: the LUT block's output converter is an integer multiply-shift, so a Q15 table entry cannot leave the task as a fraction. The fp16 task runs and `exp(0)` is exact; everything else needs §3.1's Q15 plan |
+| `exp` | DPU LUT, `LutTable::exp_with_decaying_tail()` | **int8 only** (S3: the output converter is an integer multiply-shift, so the result is a Q15 integer), and its tail needs the tuned underflow slope of §3.3 or a wide softmax is corrupted outright |
 | square (range extension) | `EwBinaryOp::Mul` with both operands the same buffer | **exists**, `ew_binary_hw.rs`, `ew_square_hw.rs` |
 | row sum | depthwise all-ones **3x3 at stride 3** on a height-1 cube; or the all-ones column on the second matmul (§1.1) | **exists**, and exact at atol 0 over `N` 9..512 as a tree in one job, probe S2 (`reduce_width_hw.rs`). The window is 3x3 and not `1 x k` for the reason in §2.2. The avg-pool route is gone at fp16, §2.1 |
 | reciprocal | `LutTable::reciprocal()` + one Newton step | **exists**, `lut_reciprocal_hw.rs`; domain needs §4 |
@@ -297,6 +297,50 @@ orders of magnitude too large. Two mechanisms were tried and neither fits
 critical path while the converter finding stands, since both would have to
 be solved to keep `exp` in fp16 and only one of them has to be solved to
 move to Q15.
+
+### 3.3 The envelope, and the slope that makes it usable
+
+§3.1 left the Q15 output as §9's open question. Measuring the envelope on
+the **int8** path -- the one `lut_exp_hw.rs` has gated against an oracle --
+turned out to matter more than the output format, and to have an answer.
+
+**The domain edge is exactly `-5.0`, and below it the shipped table holds a
+flat `6.74e-3`** [verified, `lut_exp_envelope_hw.rs`: the output tracks
+`exp` down to `-5.00` and is a constant 28 counts at `1/4096` from there to
+`-8.0`]. That is not an accuracy problem, it is a correctness one. A softmax
+over `N` keys puts up to `N * 6.74e-3` of spurious mass in its denominator
+-- 2.6 at `N = 384`, against a true denominator of order 1 -- and nothing
+downstream recovers it.
+
+**The flat clamp is a programmed choice, and undoing it fixes the tail.**
+`LutTable::exp()` ships `le_slope_uflow_scale = 0`; `sigmoid()` carries a
+real slope, "consistent with sigmoid's tail not being fully flat even far
+from zero". Measured, that register drives a straight line in the table's
+index space, and it runs *through* zero into negative output if the slope is
+too steep -- `(4420, 14)` crosses zero at `-5.25` and hits int8's floor by
+`-6.5`. A negative probability is worse than the flat clamp, and the EW
+stage's ReLU does not stop it: `ew_relu_bypass = 0` on a LUT task is
+**inert**, byte-identical output either way
+(`the_ew_relu_is_inert_on_a_lut_task`).
+
+So the slope is tuned to the input domain instead. At an int8 `input_scale`
+the most negative real input is `-128 * input_scale`, and a slope taking the
+edge entry's 221 counts to zero over exactly that distance leaves the tail
+monotonically decreasing, non-negative everywhere, and exactly zero at the
+bottom -- **for no extra task**. That is
+`LutTable::exp_with_decaying_tail(input_scale)`; at `1/16` it is
+`(368, 14)`, and the hardware reaches 0 at exactly `x = -8.0`
+(`the_tuned_tail_decays_to_zero_and_never_below`).
+
+What it costs, and the one judgement left. The ramp averages about `3.4e-3`
+over `[-8, -5]` where `exp`'s true average is about `2.2e-3`, so the error
+per tail key falls from `6.7e-3` to about `1.2e-3` -- 5.6x -- and the
+denominator error at `N = 384` from 2.6 to about 0.46. A *wider* domain is
+not better: at `input_scale = 1/8` the ramp spans `[-16, -5]` and
+overestimates `exp`'s own tail more badly, not less. So `input_scale` and
+the slope trade against each other around `1/16`, and picking the pair
+belongs to a measurement against a real attention distribution rather than
+to a HAL probe. That is S5's, not S3's.
 
 ### 3.2 The domain arithmetic, corrected
 
@@ -843,16 +887,23 @@ precisely the form this hardware cannot run.
   against the design: the floor is not the binding constraint at all, and
   the real one is worse. `OUT_CVT` is an integer multiply-shift, so the
   `exp` step cannot emit a fractional value -- its output is a Q15 integer.
-* **Whether §7 can run on Q15 probabilities is now the open question**, and
-  the biggest one left. Softmax is a ratio, so a constant 32768 cancels
-  between the numerator and the denominator, and §2.2's sum reduction is a
-  convolution that could run on the integers. What has to be checked is the
-  dynamic range -- a Q15 probability has 15 bits and the sum of up to `N`
-  of them needs `log2(N)` more, which the DPU's int32 accumulator has --
-  and what the BN MUL plane wants for the final divide, since S1 measured
-  that operand as fp16 rather than fixed point. If it does not work, the
-  `exp` step needs a quantize/dequantize pair around it and §7 grows two
-  passes.
+* **Whether §7 can run on Q15 probabilities** is still open, but it is no
+  longer the biggest risk: softmax is a ratio, so a constant 32768 cancels
+  between the numerator and the denominator, §2.2's sum reduction is a
+  convolution that could run on the integers, and the DPU's int32
+  accumulator has the headroom a sum of `N` fifteen-bit values needs. What
+  has to be checked is what the BN MUL plane wants for the final divide,
+  since S1 measured that operand as fp16 rather than fixed point.
+* **The `exp` step's accuracy is now the thing to measure, not its
+  viability.** §3.3 took the tail from a flat `6.74e-3` -- fatal -- to a
+  tuned decay worth about `1.2e-3` per tail key, which at `N = 384` is a
+  denominator error of roughly 0.46 against a true value of order 1 to 3.
+  That is a 10-25% error on every weight in the row, so the
+  `(input_scale, slope)` pair has to be chosen against a real attention
+  distribution rather than at the domain's corner. If no pair is good
+  enough, the honest conclusion is that this table cannot serve a wide
+  softmax and the `exp` step needs a different one -- which is a table
+  regeneration, the thing §3 originally said was unnecessary.
 * **The fused-attention win does not survive measurement.** C15 measured
   unbatched attention at 1.16x (ViT-B) to 1.41x (BERT-384) *slower*, and the
   CPU spends little on attention. This design removes softmax and the
