@@ -35,19 +35,69 @@ fn main() -> ExitCode {
     }
 }
 
+/// Where a packaged install keeps things, relative to the directory holding
+/// `bin/rocket-compiler`. The nightly `iree-compile-x86_64` tarball is laid
+/// out this way (see `.github/workflows/iree-build.yml`): an unpacked copy
+/// compiles with no `--iree-compiler-lib`, no `IREE_COMPILER_LIB` and no
+/// `--transform-spec`.
+const PACKAGED_LIB: &str = "../lib/libIREECompiler.so";
+const PACKAGED_SPEC: &str = "../share/rocket/rocket_conv2d_transform_spec.mlir";
+
+/// The spec in the source checkout this binary was built from. Right for
+/// `cargo run`; meaningless on any machine but the one that built it.
+fn source_tree_transform_spec_path() -> PathBuf {
+    PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        .join("../rocket-compiler-plugin/target/Rocket/rocket_conv2d_transform_spec.mlir")
+}
+
+/// `relative` resolved against the running executable's directory, if that
+/// file exists. `current_exe` is `/proc/self/exe` on Linux, so a symlink to
+/// the binary (say from `~/.local/bin`) still resolves inside the package.
+fn beside_executable(relative: &str) -> Option<PathBuf> {
+    let exe = env::current_exe().ok()?;
+    packaged_path(&exe, relative).filter(|path| path.is_file())
+}
+
+fn packaged_path(exe: &Path, relative: &str) -> Option<PathBuf> {
+    Some(exe.parent()?.join(relative))
+}
+
 fn resolve_lib_path(explicit: Option<&Path>) -> Result<PathBuf, Box<dyn Error>> {
+    pick_lib_path(
+        explicit,
+        env::var_os("IREE_COMPILER_LIB").map(PathBuf::from),
+        beside_executable(PACKAGED_LIB),
+    )
+}
+
+/// Flag, then environment, then the packaged layout -- an explicit choice
+/// always beats the one the binary happens to sit next to.
+fn pick_lib_path(
+    explicit: Option<&Path>,
+    from_env: Option<PathBuf>,
+    packaged: Option<PathBuf>,
+) -> Result<PathBuf, Box<dyn Error>> {
     if let Some(path) = explicit {
         return Ok(path.to_path_buf());
     }
-    if let Ok(path) = env::var("IREE_COMPILER_LIB") {
-        return Ok(PathBuf::from(path));
+    if let Some(path) = from_env.filter(|path| !path.as_os_str().is_empty()) {
+        return Ok(path);
     }
-    Err("no --iree-compiler-lib given and IREE_COMPILER_LIB is not set".into())
+    if let Some(path) = packaged {
+        return Ok(path);
+    }
+    Err(format!(
+        "no --iree-compiler-lib given, IREE_COMPILER_LIB is not set, and there is no \
+         {PACKAGED_LIB} beside this executable"
+    )
+    .into())
 }
 
+/// The packaged spec when this binary is running from an unpacked release,
+/// else the source checkout's. `--no-offload`, `--elementwise` and
+/// `--batch-matmul` all derive their specs from this one.
 fn default_transform_spec_path() -> PathBuf {
-    PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-        .join("../rocket-compiler-plugin/target/Rocket/rocket_conv2d_transform_spec.mlir")
+    beside_executable(PACKAGED_SPEC).unwrap_or_else(source_tree_transform_spec_path)
 }
 
 fn transform_spec_path(common: &cli::CommonArgs) -> PathBuf {
@@ -582,6 +632,85 @@ mod tests {
             llvmcpu_target_triple: triple.map(str::to_string),
             iree_flags: Vec::new(),
         }
+    }
+
+    #[test]
+    fn an_explicit_library_beats_the_environment_and_the_package() {
+        let picked = pick_lib_path(
+            Some(Path::new("/flag/lib.so")),
+            Some(PathBuf::from("/env/lib.so")),
+            Some(PathBuf::from("/pkg/lib.so")),
+        )
+        .unwrap();
+        assert_eq!(picked, PathBuf::from("/flag/lib.so"));
+
+        let picked = pick_lib_path(
+            None,
+            Some(PathBuf::from("/env/lib.so")),
+            Some(PathBuf::from("/pkg/lib.so")),
+        )
+        .unwrap();
+        assert_eq!(picked, PathBuf::from("/env/lib.so"));
+    }
+
+    /// The unpacked nightly tarball has no environment set up at all.
+    #[test]
+    fn the_packaged_library_is_the_last_resort() {
+        let picked = pick_lib_path(None, None, Some(PathBuf::from("/pkg/lib.so"))).unwrap();
+        assert_eq!(picked, PathBuf::from("/pkg/lib.so"));
+
+        // `IREE_COMPILER_LIB=` (set but empty) is not a choice.
+        let picked = pick_lib_path(
+            None,
+            Some(PathBuf::new()),
+            Some(PathBuf::from("/pkg/lib.so")),
+        )
+        .unwrap();
+        assert_eq!(picked, PathBuf::from("/pkg/lib.so"));
+
+        let err = pick_lib_path(None, None, None).expect_err("nothing to load");
+        assert!(err.to_string().contains("IREE_COMPILER_LIB"), "{err}");
+    }
+
+    /// `bin/rocket-compiler` finds `lib/` and `share/` as siblings of `bin/`.
+    #[test]
+    fn packaged_paths_are_relative_to_the_bin_directory() {
+        let exe = Path::new("/opt/iree-compile-x86_64/bin/rocket-compiler");
+        let lib = packaged_path(exe, PACKAGED_LIB).unwrap();
+        let spec = packaged_path(exe, PACKAGED_SPEC).unwrap();
+        let normalize = |p: PathBuf| {
+            let mut out = PathBuf::new();
+            for c in p.components() {
+                match c {
+                    std::path::Component::ParentDir => {
+                        out.pop();
+                    }
+                    other => out.push(other),
+                }
+            }
+            out
+        };
+        assert_eq!(
+            normalize(lib),
+            PathBuf::from("/opt/iree-compile-x86_64/lib/libIREECompiler.so")
+        );
+        assert_eq!(
+            normalize(spec),
+            PathBuf::from(
+                "/opt/iree-compile-x86_64/share/rocket/rocket_conv2d_transform_spec.mlir"
+            )
+        );
+    }
+
+    /// A test binary is not in a package, so the default must still be the
+    /// checked-in spec -- the other tests here read it.
+    #[test]
+    fn outside_a_package_the_source_spec_is_the_default() {
+        assert_eq!(
+            default_transform_spec_path(),
+            source_tree_transform_spec_path()
+        );
+        assert!(default_transform_spec_path().is_file());
     }
 
     #[test]

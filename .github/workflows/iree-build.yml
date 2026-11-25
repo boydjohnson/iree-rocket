@@ -3,7 +3,10 @@ name: IREE build (reusable)
 # Builds one of the two CMake/Ninja configurations this repo produces:
 #
 #   compiler-host    iree-compile (x86_64) with the Rocket compiler target
-#                    plugin registered -- ../../iree-build/configure-compiler-host.sh.
+#                    plugin registered -- ../../iree-build/configure-compiler-host.sh
+#                    -- plus rocket-compiler, the Rust driver over the same
+#                    libIREECompiler.so, packaged so an unpacked tarball
+#                    compiles a model with no environment setup.
 #   runtime-aarch64  iree-run-module / iree-benchmark-module cross-compiled for
 #                    the RK3588 board with the Rocket HAL driver statically
 #                    linked -- ../../iree-build/configure-runtime-aarch64.sh --
@@ -39,6 +42,28 @@ on:
         required: false
         default: 14
         type: number
+      runner:
+        description: >-
+          Runner image. Pinned, never ubuntu-latest: the image's glibc becomes
+          the floor of every binary built on it -- the host compiler links
+          against it, and the aarch64 cross toolchain ships the same release's
+          libc6-arm64-cross -- and the binaries have to run on the developer
+          host and the board. ubuntu-latest moved to 26.04 (glibc 2.43) in
+          November 2026 and from then on no artifact ran on either. Keep this
+          in step with max-glibc below; it is also part of the ccache key,
+          since a different image means a different gcc and so no hits.
+        required: false
+        default: ubuntu-24.04
+        type: string
+      max-glibc:
+        description: >-
+          Newest GLIBC_x.y symbol version a shipped binary may require; the
+          packaging steps fail the job above it. 2.39 is ubuntu-24.04's own,
+          and at or under both consumers: the developer host (Ubuntu 24.04,
+          2.39) and the board (Debian 13, 2.41).
+        required: false
+        default: "2.39"
+        type: string
 
 permissions:
   contents: read
@@ -46,7 +71,7 @@ permissions:
 jobs:
   build:
     name: ${{ inputs.target }}
-    runs-on: ubuntu-latest
+    runs-on: ${{ inputs.runner }}
     timeout-minutes: ${{ inputs.timeout-minutes }}
 
     env:
@@ -117,28 +142,36 @@ jobs:
           # patchelf: iree-compile is a thin wrapper that loads
           # libIREECompiler.so through an absolute RUNPATH baked in at link
           # time; the packaging step below rewrites it to $ORIGIN/../lib.
+          # libclang-dev: bindgen runs from build.rs on both sides --
+          # rocket-compiler (host) and iree-rocket-hal / rocket-hal-driver
+          # (aarch64); see ci.yml's own note.
           sudo apt-get install -y --no-install-recommends \
-            ninja-build ccache patchelf
+            ninja-build ccache patchelf libclang-dev
 
-      # Only the aarch64 side involves Rust at all: rocket-hal-driver's
-      # staticlib is built by cargo from within that CMake tree, and the
-      # crates' own test binaries are built below. The compiler-host build is
-      # pure C++ (rocket-compiler-plugin has no cargo step).
       - name: Install aarch64 cross toolchain
         if: inputs.target == 'runtime-aarch64'
         run: |
           # aarch64_linux_gnu.cmake relies on these packages' built-in sysroot
           # search paths -- no separate --sysroot configuration.
-          # libclang-dev: iree-rocket-hal and rocket-hal-driver both run
-          # bindgen from build.rs (see ci.yml's own note).
           sudo apt-get install -y --no-install-recommends \
-            gcc-aarch64-linux-gnu g++-aarch64-linux-gnu libclang-dev
+            gcc-aarch64-linux-gnu g++-aarch64-linux-gnu
 
-      - name: Install Rust (stable)
-        if: inputs.target == 'runtime-aarch64'
-        uses: dtolnay/rust-toolchain@stable
+      # Both targets run cargo, and both from inside CMake as well as directly:
+      #   compiler-host    the Rocket plugin's CMake builds rocket-plan-ffi
+      #                    (find_program(cargo REQUIRED), linked into
+      #                    libIREECompiler.so), and rocket-compiler is built
+      #                    below.
+      #   runtime-aarch64  rocket-hal-driver's staticlib is built by cargo from
+      #                    within that CMake tree, and the crates' own test
+      #                    binaries are built below.
+      # So this has to run before either Configure step. Pinned rather than
+      # `stable` so a Rust release cannot change what a nightly ships between
+      # two runs of the same commit; bump it deliberately.
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@master
         with:
-          targets: aarch64-unknown-linux-gnu
+          toolchain: "1.99.0"
+          targets: ${{ inputs.target == 'runtime-aarch64' && 'aarch64-unknown-linux-gnu' || '' }}
 
       - uses: Swatinem/rust-cache@v2
         if: inputs.target == 'runtime-aarch64'
@@ -155,14 +188,14 @@ jobs:
           # github.run_id makes every run's key unique, because cache entries
           # are immutable -- reusing an existing key would silently skip the
           # save and the cache would never pick up newly compiled objects.
-          key: ccache-${{ inputs.target }}-${{ steps.pin.outputs.iree_sha }}-${{ hashFiles('iree-build/configure-compiler-host.sh', 'iree-build/configure-runtime-aarch64.sh', 'iree-build/aarch64_linux_gnu.cmake', 'iree-build/host-aarch64/CMakeLists.txt') }}-${{ github.run_id }}
+          key: ccache-${{ inputs.target }}-${{ inputs.runner }}-${{ steps.pin.outputs.iree_sha }}-${{ hashFiles('iree-build/configure-compiler-host.sh', 'iree-build/configure-runtime-aarch64.sh', 'iree-build/aarch64_linux_gnu.cmake', 'iree-build/host-aarch64/CMakeLists.txt') }}-${{ github.run_id }}
           # Falling back across iree-src SHAs is deliberate: an IREE bump moves
           # relatively few translation units, so a previous pin's cache still
           # hits on the vast majority of LLVM.
           restore-keys: |
-            ccache-${{ inputs.target }}-${{ steps.pin.outputs.iree_sha }}-${{ hashFiles('iree-build/configure-compiler-host.sh', 'iree-build/configure-runtime-aarch64.sh', 'iree-build/aarch64_linux_gnu.cmake', 'iree-build/host-aarch64/CMakeLists.txt') }}-
-            ccache-${{ inputs.target }}-${{ steps.pin.outputs.iree_sha }}-
-            ccache-${{ inputs.target }}-
+            ccache-${{ inputs.target }}-${{ inputs.runner }}-${{ steps.pin.outputs.iree_sha }}-${{ hashFiles('iree-build/configure-compiler-host.sh', 'iree-build/configure-runtime-aarch64.sh', 'iree-build/aarch64_linux_gnu.cmake', 'iree-build/host-aarch64/CMakeLists.txt') }}-
+            ccache-${{ inputs.target }}-${{ inputs.runner }}-${{ steps.pin.outputs.iree_sha }}-
+            ccache-${{ inputs.target }}-${{ inputs.runner }}-
 
       - name: Reset ccache stats
         run: ccache --zero-stats
@@ -189,8 +222,17 @@ jobs:
         if: inputs.target == 'compiler-host'
         run: cmake --build iree-build/build
 
+      # Not through CMake: rocket-compiler dlopens libIREECompiler.so at run
+      # time rather than linking it, so it builds independently of the tree
+      # above and only has to be packaged next to it.
+      - name: Build rocket-compiler (x86_64)
+        if: inputs.target == 'compiler-host'
+        run: cargo build -p rocket-compiler --release --locked
+
       - name: Package compiler-host artifacts
         if: inputs.target == 'compiler-host'
+        env:
+          MAX_GLIBC: ${{ inputs.max-glibc }}
         run: |
           set -euo pipefail
           BUILD=iree-build/build
@@ -217,13 +259,55 @@ jobs:
           EOF
           }
 
-          # 1. The user-facing compiler: just iree-compile plus the shared
-          #    library it loads.
-          mkdir -p dist/iree-compile-x86_64/bin dist/iree-compile-x86_64/lib
-          cp "${BUILD}/tools/iree-compile" dist/iree-compile-x86_64/bin/
-          cp "${BUILD}/lib/libIREECompiler.so" dist/iree-compile-x86_64/lib/
-          cp "${BUILD}/tools/build_config.txt" dist/iree-compile-x86_64/
-          write_version dist/iree-compile-x86_64/VERSION.txt
+          # 1. The user-facing compiler: rocket-compiler and iree-compile,
+          #    the shared library both load, and what that library and
+          #    rocket-compiler look up at run time. rocket-compiler rides in
+          #    this tarball rather than a sibling one because it is useless
+          #    without the ~300 MB libIREECompiler.so; two artifacts would
+          #    mean shipping that twice or making users assemble the layout.
+          #
+          #    Every path below is load-bearing:
+          #      bin/rocket-compiler   finds ../lib/libIREECompiler.so and
+          #                            ../share/rocket/<spec> beside itself
+          #                            (rocket-compiler/src/main.rs,
+          #                            PACKAGED_LIB / PACKAGED_SPEC).
+          #      bin/iree-lld          libIREECompiler.so looks for it at
+          #                            <its dir>/../bin/ (IREE's
+          #                            findToolFromDylibDir); without it every
+          #                            embedded CPU link fails unless one is
+          #                            on PATH. RUNPATH already rewritten by
+          #                            the loop above.
+          OUT=dist/iree-compile-x86_64
+          mkdir -p "${OUT}/bin" "${OUT}/lib" "${OUT}/share/rocket"
+          cp "${BUILD}/tools/iree-compile" "${BUILD}/tools/iree-lld" "${OUT}/bin/"
+          cp target/release/rocket-compiler "${OUT}/bin/"
+          cp "${BUILD}/lib/libIREECompiler.so" "${OUT}/lib/"
+          cp rocket-compiler-plugin/target/Rocket/rocket_conv2d_transform_spec.mlir \
+             "${OUT}/share/rocket/"
+          cp "${BUILD}/tools/build_config.txt" "${OUT}/"
+          write_version "${OUT}/VERSION.txt"
+          cat > "${OUT}/RUN.md" <<'EOF'
+          # rocket-compiler / iree-compile (x86_64)
+
+          Unpack anywhere; nothing needs to be set in the environment.
+
+          ```sh
+          bin/rocket-compiler compile --input model.mlir --output model.vmfb \
+            --llvmcpu-target-triple aarch64-linux-gnu
+
+          # The like-for-like CPU-only baseline, and the placement report:
+          bin/rocket-compiler compile --input model.mlir --output cpu.vmfb \
+            --llvmcpu-target-triple aarch64-linux-gnu --no-offload
+          bin/rocket-compiler audit --input model.mlir
+          ```
+
+          `rocket-compiler` loads `lib/libIREECompiler.so` and the transform
+          spec in `share/rocket/` relative to its own location; the
+          `--iree-compiler-lib` / `IREE_COMPILER_LIB` and `--transform-spec`
+          overrides still win when given. Use `rocket-compiler`, not
+          `iree-compile`, for models: it pins placement between two pipeline
+          stages, which a single `iree-compile` invocation cannot do.
+          EOF
           tar -C dist -czf iree-compile-x86_64.tar.gz iree-compile-x86_64
 
           # 2. The full tools/ directory, in the exact layout
@@ -238,13 +322,56 @@ jobs:
           write_version dist/iree-host-tools/VERSION.txt
           tar -C dist -czf iree-host-tools.tar.gz iree-host-tools
 
+          # Before upload: a binary the host cannot load fails the job here
+          # rather than in a user's shell (see the `runner` input).
+          .github/scripts/check-glibc-ceiling.sh "${MAX_GLIBC}" \
+            dist/iree-compile-x86_64 dist/iree-host-tools
+
           ls -lh ./*.tar.gz
+
+      # The tarball as a user gets it: unpacked somewhere unrelated, with an
+      # empty environment, so neither IREE_COMPILER_LIB nor a PATH entry can
+      # stand in for the packaged layout. The checkout's own copy of the spec
+      # is moved aside first: the binary still carries that source path as its
+      # last fallback, and on this runner it exists, so it would otherwise
+      # hide a broken packaged lookup. --no-offload also prints the path of
+      # the spec it derived from, which is checked to be the packaged one.
+      - name: Smoke-test the packaged rocket-compiler
+        if: inputs.target == 'compiler-host'
+        run: |
+          set -euo pipefail
+          SMOKE="${RUNNER_TEMP}/rocket-compiler-smoke"
+          rm -rf "${SMOKE}" && mkdir -p "${SMOKE}"
+          tar -xzf iree-compile-x86_64.tar.gz -C "${SMOKE}"
+          cp rocket-compiler-plugin/test/rocket_conv_layout.mlir "${SMOKE}/model.mlir"
+
+          SPEC=rocket-compiler-plugin/target/Rocket/rocket_conv2d_transform_spec.mlir
+          mv "${SPEC}" "${SPEC}.smoke-hidden"
+          trap 'mv "${GITHUB_WORKSPACE}/${SPEC}.smoke-hidden" "${GITHUB_WORKSPACE}/${SPEC}"' EXIT
+
+          cd "${SMOKE}"
+          run() { env -i PATH=/usr/bin:/bin HOME="${HOME}" "$@"; }
+
+          run iree-compile-x86_64/bin/rocket-compiler compile \
+            --input model.mlir --output offload.vmfb \
+            --llvmcpu-target-triple aarch64-linux-gnu
+          test -s offload.vmfb
+
+          run iree-compile-x86_64/bin/rocket-compiler compile \
+            --input model.mlir --output no-offload.vmfb \
+            --llvmcpu-target-triple aarch64-linux-gnu --no-offload 2>&1 \
+            | tee no-offload.log
+          test -s no-offload.vmfb
+          grep -q 'share/rocket/rocket_conv2d_transform_spec.mlir' no-offload.log \
+            || { echo "::error::--no-offload did not derive from the packaged spec"; exit 1; }
+
+          ls -l ./*.vmfb
 
       # Everything is uploaded as a tarball rather than a bare directory:
       # actions/upload-artifact zips its input and the zip round-trip drops the
       # executable bit, which would make every one of these downloads useless.
       # compression-level 0 because the tarballs are already gzipped.
-      - name: Upload iree-compile (x86_64)
+      - name: Upload iree-compile + rocket-compiler (x86_64)
         if: inputs.target == 'compiler-host'
         uses: actions/upload-artifact@v4
         with:
@@ -322,6 +449,8 @@ jobs:
 
       - name: Package runtime-aarch64 artifacts
         if: inputs.target == 'runtime-aarch64'
+        env:
+          MAX_GLIBC: ${{ inputs.max-glibc }}
         run: |
           set -euo pipefail
           BUILD=iree-build/host-aarch64/build
@@ -396,6 +525,11 @@ jobs:
           ```
           EOF
           tar -C dist -czf rocket-rust-tests-aarch64.tar.gz rocket-rust-tests-aarch64
+
+          # Same guard as compiler-host's: the board's glibc is the ceiling.
+          .github/scripts/check-glibc-ceiling.sh "${MAX_GLIBC}" \
+            dist/iree-runtime-aarch64 dist/rocket-cts-aarch64 \
+            dist/rocket-rust-tests-aarch64
 
           ls -lh ./*.tar.gz
 

@@ -25,7 +25,9 @@ pub enum Command {
 
 #[derive(Args)]
 pub struct CommonArgs {
-    /// Path to libIREECompiler.so. Falls back to the IREE_COMPILER_LIB env var.
+    /// Path to libIREECompiler.so. Falls back to the IREE_COMPILER_LIB env var,
+    /// then to `../lib/libIREECompiler.so` beside this executable (the
+    /// layout of the nightly `iree-compile-x86_64` tarball).
     #[arg(long)]
     pub iree_compiler_lib: Option<PathBuf>,
 
@@ -33,8 +35,10 @@ pub struct CommonArgs {
     #[arg(long)]
     pub input: PathBuf,
 
-    /// Rocket transform spec .mlir file. Defaults to the one in the sibling
-    /// rocket-compiler-plugin checkout.
+    /// Rocket transform spec .mlir file. Defaults to
+    /// `../share/rocket/rocket_conv2d_transform_spec.mlir` beside this
+    /// executable when that exists (the nightly tarball), else to the one in
+    /// the sibling rocket-compiler-plugin checkout.
     #[arg(long)]
     pub transform_spec: Option<PathBuf>,
 
