@@ -14,10 +14,16 @@ carries the open defects. This file is the third question -- what is *not*
 reached yet -- and it defers to both: a phase here that contradicts a measurement
 there is wrong, and two of them below are gated on open issues by name.
 
-Nothing here is a throughput proposal. The distinction matters more in this
-document than anywhere else in the repo, because most of the work below buys
-**coverage** and P8 has already measured that coverage of this particular shape
-buys **negative** throughput. See the next section before reading the phases.
+Nothing here is a throughput proposal, with one marked exception. The
+distinction matters more in this document than anywhere else in the repo,
+because most of the work below buys **coverage** and P8 has already measured
+that coverage of this particular shape buys **negative** throughput. See the
+next section before reading the phases. The exception is
+[Attention](#attention-and-which-flashattention-ideas-transfer) near the end,
+which is a throughput proposal and says so: it exists because
+[SOFTMAX.md](SOFTMAX.md) §10 measured where attention's time actually goes,
+and a proposal that starts from a measurement is a different thing from one
+that starts from a hope.
 
 ---
 
@@ -818,6 +824,116 @@ not a cost a standalone element-wise matcher has in the first place. An
 element-wise op still does less work than its own dispatch costs, so the flag
 stands and the per-op bar above is still how to judge one.
 
+## Attention, and which FlashAttention ideas transfer
+
+The one section here that *is* a throughput proposal, which the header
+forbids everywhere else. It earns the exception by starting from a
+measurement rather than from a hope: SOFTMAX.md §10 timed the assembled
+softmax at 0.46 to 0.51 ms against a CPU's 0.11, and found the entire cost
+to be **35 to 39 microseconds a task** across 13 tasks, with a bare
+submit-and-wait on an empty job costing 37 to 59. The arithmetic is free;
+the IRQs are everything. So the question "how do we make attention fast
+here" has a single well-posed form -- *how do we use fewer tasks* -- and
+that is narrow enough to reason about.
+
+FlashAttention is the obvious place to look, and most of it does not
+transfer. On a GPU the enemy is HBM traffic and the fix is tiling to keep
+the score matrix in SRAM. This device has no on-chip staging between tasks
+at all: every task boundary is a DRAM boundary, and the driver's NPU→NPU
+chain removes the *repack*, not the round trip (ISSUES P2). So "never
+materialise S" buys nothing, and the online-softmax recurrence that exists
+to enable it buys nothing either, except in lever 4 below.
+
+What does transfer is FlashAttention's *other* property, the single kernel
+launch -- for a completely different reason. Fewer launches there means
+less intermediate traffic; fewer tasks here means fewer completion IRQs,
+which §10 measured as the whole cost. The instinct to take is therefore
+**fuse and batch, not tile**, which inverts the original.
+
+Four levers, ranked by expected payoff. Only the premises are measured; the
+task counts below are projections and are marked as such.
+
+**1. Batch the heads onto the channel axis.** This is the inversion, and
+the largest factor available. Cost is per task and arithmetic is free, so
+each task should be as *large* as the planner allows rather than as small
+as a cache. SOFTMAX.md §1.1 puts queries on the channel axis, so a ViT
+layer's twelve heads is `12 x 197 = 2364` channels -- inside the 13-bit
+`DPU_DATA_CUBE_CHANNEL` and `PPU` extent fields, and inside the 3584-to-4096
+ceilings this file's own section records. A layer's softmax would be ~13
+tasks rather than twelve times that. It needs no new mechanism: only
+`rocket_core::softmax`'s `rows` refusal, which stands at 64 because 64 is
+the widest per-channel operand plane any probe has driven, validated
+upward.
+
+**2. Let the two matmuls absorb the softmax's epilogue.** A fused SDPA has
+strictly fewer tasks than its parts, using fusions this repo already has
+from Phase 3 and ISSUES P2:
+
+* the `1/sqrt(d)` scale folds into the QK^T matmul's output converter;
+* the denominator comes free from an all-ones column appended to `V^T`
+  (SOFTMAX.md §1.1), which deletes the five-task sum tree outright;
+* the normalising multiply folds into the PV matmul's BN plane;
+* and if the probabilities stay Q15 with an `int16` PV matmul, both bridge
+  tasks disappear and the `2^-15` folds into that matmul's requant scale.
+
+Projection: about 5 tasks a head where the softmax alone is 13.
+
+**3. Replace the max reduction with a calibrated bound.** Softmax is
+shift-invariant, so the subtrahend need only be a true *upper bound*, not
+the maximum. A per-head bound measured offline deletes the three-task max
+tree and the first host boundary with it. The catch is specific and sharp
+rather than vague: SOFTMAX.md S3 found `exp`'s `LO` half is a placeholder
+returning a constant 1.0, so a logit above the bound is silently wrong by
+an unbounded amount, and §3.2's usable domain is only about 6.4 units wide
+at `input_scale = 1/20`, so a loose bound costs resolution. That makes this
+a calibration-risk trade and not a free win.
+
+**4. Split the keys across cores -- the one place the online recurrence
+earns its keep.** FlashDecoding's split over the KV axis maps onto M2's
+job fan-out (MULTICORE.md §12), and combining partial `(m, d, O)` triples
+is exactly the online-softmax merge. It is also the *only* way to get more
+than one core onto a single attention head, because mainline `rocket` has
+no cross-fd BO sharing, so the merge has to be host-side -- on width-1
+vectors, which §10 measured at about 6 microseconds. Note M1 measured 0%
+overlap from submitting more dispatches, because IREE chains one per
+command buffer on one timeline; this needs the fan-out path, not naive
+submission.
+
+### What does not transfer
+
+Avoiding the score matrix's materialisation, for the reason above. Online
+rescaling as a memory device, except in lever 4. Backward-pass
+recomputation, which is a training concern. And FA3's asynchrony and warp
+specialisation: there is one pipeline per core, and the driver chains one
+dispatch at a time.
+
+### The obstacle FlashAttention does not address
+
+The two matmuls want opposite layouts. `S^T = K Q^T` needs keys on width,
+and the PV contraction needs keys on channels, because this hardware's
+contraction axis is always the input-channel axis. Feeding `P^T` as the
+second matmul's *weights* avoids a transpose -- SOFTMAX.md §1.1 -- but
+means runtime coefficient packing of `N x M` values a head, where packing
+is otherwise a cold-start cost (COMPILER_ROADMAP.md §6.3). A GPU has no
+weight-versus-activation asymmetry and so no equivalent problem. This is
+probably the real gate on a fused SDPA, and it is **unmeasured**.
+
+### The baseline to beat
+
+Sobering, and it belongs here rather than in a footnote. ISSUES C15
+measured unbatched attention offload at 1.16x (ViT-B) to 1.41x (BERT-384)
+*slower*, with the CPU barely spending anything on attention. ISSUES P10
+puts the f32 CPU softmax at 24% of the A76 cycles on BLIP fp16 -- a real
+cost, and the one lever 1 and 2 would compete for -- while noting the CPU's
+attention matmuls already run at about 43% of f32 peak, which is not a
+number an offload beats easily. P10 also has 1.39x still to collect from a
+wider vector tile, so the CPU target moves before any of this lands.
+
+Levers 1 and 2 are the ones worth trying, and C15 is worth re-measuring
+before trusting any projection above.
+
+---
+
 ## What this roadmap does not propose
 
 - **Integer and predicate element-wise ops.** ~35 of `arith`, 9 of `math`. No
@@ -826,10 +942,13 @@ stands and the per-op bar above is still how to judge one.
   explicitly refuse to do.
 - **1-D and 3-D convolutions**, `linalg.conv_1d*` and `conv_3d*`. The builder is
   2-D throughout; a 3-D convolution is not a shape this hardware has.
-- **`linalg.softmax`** as a single op. It decomposes into a max reduction, a
-  subtract, `exp`, a sum reduction and a divide -- four of which land in Phase 1
-  and 2, but the reductions have no PPU path outside the pooling window. Revisit
-  once the pieces exist.
+- ~~**`linalg.softmax`** as a single op.~~ Revisited and built:
+  [SOFTMAX.md](SOFTMAX.md). The reductions do have a path -- the softmax axis
+  maps to *width*, where both the pooling window and a strided depthwise
+  convolution reduce -- and the assembled op is within 1.12% total variation
+  of an exact softmax on real attention rows. It is also **4.4x slower than
+  the CPU**, for P8's reason rather than a new one, so it ships off by
+  default. The section below is what to do about that.
 - **`linalg.pack` / `unpack`, `transpose`, `broadcast` as standalone
   dispatches.** Each would be one more Rocket dispatch with its own round
   trip, and P8's law puts it on the wrong side of the line. This bullet used
