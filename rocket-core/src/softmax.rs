@@ -36,7 +36,11 @@
 //! the planners that own it -- `PoolingPlan` for a max level, `ConvPlan` for
 //! a sum level -- exactly as [`crate::fc`] delegates to [`crate::conv`].
 
-use crate::error::{PlanError, PlanErrorCode, refuse_unless};
+use crate::{
+    conv,
+    error::{PlanError, PlanErrorCode, refuse_unless},
+    policy,
+};
 
 /// The `exp` table's domain edge in real units, `16384 / EXP_LUT_BN_SCALE_K`.
 /// Measured exactly (§3.3).
@@ -55,8 +59,26 @@ const MAX_POOL_KERNEL: u32 = 8;
 pub const SUM_KERNEL: u32 = 3;
 
 /// Rows whose per-channel planes have an end-to-end measurement behind
-/// them. §4's end-to-end gate ran 64; S1 checked the plane itself at 32.
-const MEASURED_MAX_ROWS: u32 = 64;
+/// them.
+///
+/// Raised 64 -> 1792 on 2026-11-24 by ROADMAP's lever 1, the whole point of
+/// which is that a task's cost is fixed and its width is free: batching a
+/// layer's heads onto this axis is how an attention layer stops paying 13
+/// completion IRQs a head. 64 was never a hardware bound, only the widest
+/// operand plane any probe had driven.
+///
+/// 1792 is [`conv::MAX_DEPTHWISE_CHANNELS`], and the ceiling is the **sum
+/// tree's** rather than the plane's: §2.2's reduction is a depthwise
+/// convolution, so its channel count is the op's row count. That is 9
+/// ViT-B heads of 197 queries, or 4 BERT-384 heads. Lever 2 would lift it
+/// -- the all-ones column puts the sum on the PV matmul, whose dense
+/// ceiling is 3584 -- which is a real interaction between the two levers
+/// rather than a coincidence.
+///
+/// `ROCKET_ALLOW_UNBACKED_CHANNELS` lifts it for a probe, the same escape
+/// `conv`'s own channel ceilings take, so the next walk upward does not
+/// need a code change.
+const MEASURED_MAX_ROWS: u32 = conv::MAX_DEPTHWISE_CHANNELS;
 
 /// Keys measured through the whole reduction, by S2's max tree.
 const MEASURED_MAX_KEYS: u32 = 512;
@@ -209,11 +231,13 @@ impl Plan {
             MEASURED_EXP_INPUT_SCALE
         );
         refuse_unless!(
-            shape.rows <= MEASURED_MAX_ROWS,
+            shape.rows <= MEASURED_MAX_ROWS || policy::unbacked_channels_allowed(),
             PlanErrorCode::UnvalidatedConfiguration,
-            "{} rows is past the {MEASURED_MAX_ROWS} measured end to end (SOFTMAX.md section \
-             4). Each row is one lane of three per-channel operand planes, and the widest \
-             plane any probe has driven is 64 lanes",
+            "{} rows is past the {MEASURED_MAX_ROWS} measured end to end. The binding \
+             ceiling is the sum tree's, not the operand plane's: section 2.2's reduction is a \
+             depthwise convolution whose channel count is this op's row count, and \
+             MAX_DEPTHWISE_CHANNELS is {MEASURED_MAX_ROWS}. ROCKET_ALLOW_UNBACKED_CHANNELS \
+             lifts this for a probe",
             shape.rows
         );
         refuse_unless!(
@@ -437,7 +461,7 @@ mod tests {
     fn unmeasured_shapes_are_refused_as_unvalidated() {
         for shape in [
             Shape::new(513, 8),
-            Shape::new(197, 65),
+            Shape::new(197, MEASURED_MAX_ROWS + 1),
             Shape {
                 keys: 197,
                 rows: 8,
@@ -451,6 +475,18 @@ mod tests {
                 "{shape:?} should refuse as unvalidated, not as something else"
             );
         }
+    }
+
+    /// The row ceiling is the sum tree's, and a layer's worth of heads
+    /// fits under it -- which is the whole point of ROADMAP's lever 1.
+    #[test]
+    fn a_layer_s_heads_fit_the_row_ceiling() {
+        // ViT-B: 12 heads of 197 queries is past it, 9 heads is not.
+        assert!(Plan::try_new(Shape::new(197, 9 * 197)).is_ok());
+        assert!(Plan::try_new(Shape::new(197, 12 * 197)).is_err());
+        // BERT-384: four heads fit.
+        assert!(Plan::try_new(Shape::new(384, 4 * 384)).is_ok());
+        assert_eq!(MEASURED_MAX_ROWS, conv::MAX_DEPTHWISE_CHANNELS);
     }
 
     /// The width both readers agree at, and the padding that makes it

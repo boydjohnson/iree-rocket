@@ -612,7 +612,45 @@ mod tests {
     #[test]
     fn a_shape_the_core_refuses_is_refused_here() {
         assert!(SoftmaxPlan::try_new(Shape::new(0, 8)).is_err());
-        assert!(SoftmaxPlan::try_new(Shape::new(197, 65)).is_err());
+        // Past the sum tree's depthwise channel ceiling, which is what
+        // bounds the row count (§10.3).
+        assert!(
+            SoftmaxPlan::try_new(Shape::new(
+                197,
+                rocket_core::conv::MAX_DEPTHWISE_CHANNELS + 1
+            ))
+            .is_err()
+        );
+    }
+
+    /// A layer's worth of heads plans and emits, which is ROADMAP's lever
+    /// 1: 1792 rows in 19 tasks against 64 rows in 13.
+    #[test]
+    fn a_layer_s_heads_plan_and_emit() {
+        let plan = SoftmaxPlan::try_new(Shape::new(197, 1792)).unwrap();
+        assert_eq!(plan.host_steps().len(), 2);
+        let bufs = SoftmaxBuffers {
+            scores: 0x1_0000,
+            scratch: 0x100_0000,
+            alu_plane: 0x2_0000,
+            const_plane: 0x3_0000,
+            reciprocal_plane: 0x4_0000,
+            sum_weights: 0x5_0000,
+            sum_bias: 0x6_0000,
+            output: 0x7_0000,
+        };
+        let total = plan.programs_max(&bufs).len()
+            + plan.programs_exp_and_sum(&bufs).len()
+            + plan.programs_normalize(&bufs).len();
+        assert_eq!(total, plan.device_tasks());
+        // 28x the rows of the 64-row case for well under twice the tasks:
+        // that ratio is the whole lever.
+        assert!(
+            plan.device_tasks()
+                < 2 * SoftmaxPlan::try_new(Shape::new(197, 64))
+                    .unwrap()
+                    .device_tasks()
+        );
     }
 
     #[test]

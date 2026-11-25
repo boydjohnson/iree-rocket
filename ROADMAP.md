@@ -853,16 +853,27 @@ which §10 measured as the whole cost. The instinct to take is therefore
 Four levers, ranked by expected payoff. Only the premises are measured; the
 task counts below are projections and are marked as such.
 
-**1. Batch the heads onto the channel axis.** This is the inversion, and
-the largest factor available. Cost is per task and arithmetic is free, so
-each task should be as *large* as the planner allows rather than as small
-as a cache. SOFTMAX.md §1.1 puts queries on the channel axis, so a ViT
-layer's twelve heads is `12 x 197 = 2364` channels -- inside the 13-bit
+**1. Batch the heads onto the channel axis -- TRIED, and it flips the
+sign** (SOFTMAX.md §10.3). At 1792 rows the op is **1.7x faster** than the
+CPU where at 64 rows it was 4.4x slower, with the crossover at about 400
+rows -- two ViT-B heads. Correctness is unchanged the whole way (1.11% to
+1.15% total variation), so the operand planes index correctly at 28x the
+width any probe had driven, and 28x the rows costs only 1.5x the tasks.
+The ceiling is 1792, which is the *sum tree's* depthwise channel limit
+rather than the plane's, so lever 2 would lift it. Two caveats keep this
+from being a verdict: the CPU arm is one core where IREE would thread it,
+and it is scalar Rust rather than IREE's codegen -- SOFTMAX.md §10.4 has
+both. The rest of this bullet is the original reasoning.
+
+This is the inversion, and the largest factor available. Cost is per
+task and arithmetic is free, so each task should be as *large* as the
+planner allows rather than as small as a cache. SOFTMAX.md §1.1 puts
+queries on the channel axis, so a ViT layer's twelve heads is `12 x 197 = 2364` channels -- inside the 13-bit
 `DPU_DATA_CUBE_CHANNEL` and `PPU` extent fields, and inside the 3584-to-4096
 ceilings this file's own section records. A layer's softmax would be ~13
 tasks rather than twelve times that. It needs no new mechanism: only
-`rocket_core::softmax`'s `rows` refusal, which stands at 64 because 64 is
-the widest per-channel operand plane any probe has driven, validated
+`rocket_core::softmax`'s `rows` refusal, which stood at 64 because 64 was
+the widest per-channel operand plane any probe had driven, validated
 upward.
 
 **2. Let the two matmuls absorb the softmax's epilogue.** A fused SDPA has
