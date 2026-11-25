@@ -96,7 +96,15 @@ fn f16_to_f32(bits: u16) -> f32 {
     let word = match exponent {
         0 if fraction == 0 => sign,
         0 => {
-            let mut exponent = -1i32;
+            // An fp16 subnormal is `mantissa * 2^-24`. Normalising it so
+            // bit 10 is set after `j` shifts leaves `1.m * 2^(-14 - j)`, so
+            // the f32 exponent field wants `113 - j` and this counter has
+            // to start at **1**, not -1: `exponent + 127 - 15` is the field.
+            // Starting at -1 reports every subnormal a factor of four low,
+            // which is what it did until 2026-11-24 -- harmless in tests
+            // whose values are of order 1, and not harmless in one reading
+            // a softmax's small weights.
+            let mut exponent = 1i32;
             let mut fraction = fraction;
             while fraction & 0x400 == 0 {
                 fraction <<= 1;

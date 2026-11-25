@@ -498,6 +498,53 @@ because it is a power of two. That conversion is a pass over the whole
 `[N, M]` cube (0.18 ms on the host for `64 x 197`), and moving it onto the
 device is §9's open item -- not the reciprocal, which is 64 divides.
 
+### 4.2 The Q15-to-fp16 bridge, and the DPU's two datapaths
+
+§9 carried the Q15-to-fp16 conversion as the last host step and the only
+one in §7 that is a pass over the whole `[N, M]` cube rather than a width-1
+vector -- 0.18 ms for `64 x 197`, against the reciprocal's 0.004. Probe
+**S4a** moved it onto the device (`build_q15_bridge_regcmd`), and it takes
+**two** tasks rather than the one it looked like, for a reason worth
+knowing beyond softmax.
+
+**An `int16` input works, and it makes the datapath integer.** `exp`'s Q15
+counts read back exactly as fp16 through `in_precision = 1` with
+`mrdma_fp16tofp32_en` clear -- 221 to 221.0, 1 to 1.0 -- which is the first
+integer input any task in this crate has taken. But with that input the
+whole post-processing path is integer-valued: a BN MUL plane of `2^-13`
+turns 16384 into 2.0 correctly and 4096 into **0** instead of 0.5. So the
+int16 read can hand on exact integer counts and nothing else.
+
+**An fp16 input gives the float datapath**, where the same plane is exact
+down to at least `2^-16`, power-of-two subnormals included. So the constant
+`2^-15` that turns a Q15 count into a probability goes in a *second* task,
+on the fp16 path, and §7's pass 3 multiplies by `1/d` after it.
+
+Neither shift stage can stand in for that plane. `BS_MUL` at shift 15 and
+`OUT_CVT` both return 0 for a Q15 count, on the fp16 path as well as the
+int16 one: every scaling stage in the DPU but the BN plane is an integer
+multiply-then-right-shift, and an integer multiply-shift cannot produce a
+value below 1. The plane's fp16 operand is the only true fractional
+multiplier the DPU has.
+
+And the two multiplies cannot be folded into one plane, which is what makes
+this two tasks and not one: their product is `1/d_q15`, a non-power-of-two
+subnormal worth about 2% of relative precision at a real row's median `d`
+and 24% at the worst.
+
+Two of this design's own bugs came out of it, both in code that reads fp16
+back. `write_bn_mul_plane_fp16` encoded an exact subnormal four times too
+small, which showed up on the board as a factor of four before it showed up
+anywhere else, and `exact_power_of_two_subnormals_encode` now pins it. And
+the `f16_to_f32` helper copied across **fifteen** hardware test files -- not
+just this design's -- reported every subnormal a factor of four low, its
+renormalising counter starting at -1 where it has to start at 1. That one is
+pre-existing and harmless in a test whose values are of order 1; it is not
+harmless in one reading a softmax's small weights, so it is fixed in all
+fifteen. Neither of §3.4's or §4's measured total variations moves: both
+come out at 1.12% after the fix, because a weight small enough to be
+subnormal is too small to shift an L1 distance.
+
 ### 4.1 The routes this replaces
 
 Kept because the reasoning is what a later widening of the LUT's input
@@ -695,7 +742,10 @@ pass 2   DPU LUT task, flying mode:            <-- see §3.1: Q15 output
            -> u = exp((x - m)/2)               [N, M] -> [N, M]
          EwBinaryOp::Mul(u, u) -> P            [N, M] -> [N, M]
          depthwise all-ones 1 x k conv tree    [N, M] -> [1, M]        d
-pass 3   reciprocal of d: HOST (§4)          [1, M] -> [1, M]
+pass 3   bridge task 1: int16 -> fp16         [N, M] -> [N, M]
+           an integer read cannot also scale (§4.2)
+         bridge task 2: BN MUL plane = 2^-15   [N, M] -> [N, M]
+         reciprocal of d: HOST (§4)            [1, M] -> [1, M]
          DPU task, BN MUL operand <- NRDMA     [N, M] -> [N, M]        y
            the operand is 1/d in real units, not 1/d_q15: see §4
 ```
@@ -953,6 +1003,15 @@ fp16's normal range, and `write_bn_mul_plane_fp16` refuses it rather than
 flushing a channel's multiplier to zero. The `1/32768` rides the
 Q15-to-fp16 conversion instead, exactly, since it is a power of two.
 
+**S4a -- the Q15-to-fp16 bridge. DONE 2026-11-24**
+(`bn_plane::build_q15_bridge_regcmd`, four more tests in
+`reciprocal_route_hw.rs`). The last host step in §7 moves onto the device
+as two tasks. §4.2 has the finding that makes it two -- the DPU has an
+integer datapath for an integer input and a float one for an fp16 input,
+and only the BN plane multiplies by a true fraction -- plus the two
+fp16-reading bugs it turned up, one of them pre-existing in fifteen test
+files.
+
 **S5 -- the op.** `softmax.rs` in `iree-rocket-hal/src/rocket`, holding a
 `SoftmaxShape { width, height: 1, channels, precision }` and a
 `SoftmaxPlan` that returns the ordered task array of §7, plus a
@@ -1002,16 +1061,8 @@ precisely the form this hardware cannot run.
   against exact softmax on real ViT-B/16 attention rows, at
   `input_scale = 1/20` with the tuned slope (§3.4). The table does not need
   regenerating.
-* **The Q15-to-fp16 bridge is the last step still on the host**, and the
-  only one in §7 that is a pass over the whole `[N, M]` cube rather than a
-  width-1 vector -- 0.18 ms for `64 x 197`, against the reciprocal's 0.006
-  ms. It has to turn an `int16` Q15 count into an fp16 fraction, which is
-  an integer-to-float conversion plus an exact `2^-15`. `S2a`'s
-  `build_plane_gather_regcmd` already does the first half in the other
-  direction (fp16 in, fp32 out), and `RDMA_SURF_NOTCH` plus the two-byte
-  writer rule are both measured now, so this is a small probe rather than
-  an open question -- but until it is done, §7 has a host pass in the
-  middle that §5's one-job structure does not want.
+* ~~**The Q15-to-fp16 bridge.**~~ Closed by S4a: `build_q15_bridge_regcmd`,
+  two device tasks rather than the one it looked like. §4.2 has it.
 * **The worst row is 14%, not 1%.** The mean is good and the spread is not,
   on the same 64 real rows. A model-level gate should report both, and if
   the bad rows turn out to be the ones that matter -- a near-uniform

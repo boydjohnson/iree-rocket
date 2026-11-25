@@ -47,8 +47,9 @@ mod dispatch;
 use iree_rocket_hal::rocket::{
     activation::{LutBuffers, LutShape, LutTable, build_lut_q15_regcmd},
     bn_plane::{
-        BnPlaneBuffers, BnPlaneOp, BnPlaneShape, PlaneElement, build_bn_plane_regcmd,
-        build_plane_gather_regcmd, write_bn_mul_plane_fp16,
+        BnPlaneBuffers, BnPlaneOp, BnPlaneShape, PlaneElement, Q15BridgeBuffers, Q15BridgeShape,
+        build_bn_plane_regcmd, build_plane_gather_regcmd, build_q15_bridge_regcmd,
+        write_bn_mul_plane_fp16,
     },
     builders::{
         Bits, Register, RegisterMeta,
@@ -93,7 +94,15 @@ fn f16_to_f32(bits: u16) -> f32 {
         0 if frac == 0 => sign << 31,
         0x1f => (sign << 31) | 0x7f80_0000 | (frac << 13),
         0 => {
-            let mut exponent = -1i32;
+            // An fp16 subnormal is `mantissa * 2^-24`. Normalising it so
+            // bit 10 is set after `j` shifts leaves `1.m * 2^(-14 - j)`, so
+            // the f32 exponent field wants `113 - j` and this counter has
+            // to start at **1**, not -1: `exponent + 127 - 15` is the field.
+            // Starting at -1 reports every subnormal a factor of four low,
+            // which is what it did until 2026-11-24 -- harmless in tests
+            // whose values are of order 1, and not harmless in one reading
+            // a softmax's small weights.
+            let mut exponent = 1i32;
             let mut mantissa = frac;
             while mantissa & 0x400 == 0 {
                 mantissa <<= 1;
@@ -599,5 +608,275 @@ fn the_q15_writer_channel_map() {
                 format!("{good:?}")
             }
         );
+    }
+}
+
+// ===========================================================================
+// The Q15-to-fp16 bridge: SOFTMAX.md section 9's last host step.
+// ===========================================================================
+//
+// `exp` emits the table's Q15 integer as `int16`, and a standalone softmax
+// owes the rest of the model fp16 probabilities. That conversion is the only
+// step left in section 7 that is a pass over the whole `[N, M]` cube rather
+// than a width-1 vector -- 0.18 ms for 64x197 on the host, against the
+// reciprocal's 0.006 -- so it is the one worth moving onto the device.
+//
+// `build_q15_bridge_regcmd` is one DPU task that would do all of it: an
+// integer read, an exact `2^-15` on the BS MUL stage from the config
+// register, and the per-row `1/d` on the BN MUL plane. The three tests below
+// take it in stages so a failure says which part, because the open question
+// is the first one: MRDMA has an `mrdma_fp16tofp32_en` and no integer
+// equivalent, so whether it can feed an integer cube into a float datapath
+// at all is not established anywhere in this crate.
+
+/// Stage 0, the control: fp16 in, fp16 out, no scaling. If this is not the
+/// identity the harness is wrong and the other two mean nothing.
+#[test]
+#[ignore = "requires an RK3588 NPU at /dev/accel/accel0"]
+fn the_bridge_passes_fp16_through_unchanged() {
+    let values = [1.0f32, 0.5, 0.25, -2.0, 8.0, 0.0625];
+    let Some(got) = run_bridge(&values, false, 0, None) else {
+        return;
+    };
+    for (&want, &value) in values.iter().zip(&got) {
+        assert!(
+            (value - want).abs() <= 1e-3,
+            "fp16 pass-through gave {value} for {want}"
+        );
+    }
+    println!("  the bridge task is the identity on fp16 in, fp16 out");
+}
+
+/// Stage 1, the open question: can MRDMA read an `int16` cube into the
+/// float datapath? Reported, not asserted -- a negative answer is the
+/// result, and it keeps the conversion on the host.
+#[test]
+#[ignore = "requires an RK3588 NPU at /dev/accel/accel0"]
+fn the_bridge_int16_read_probe() {
+    // Q15 counts as they come out of `exp`: the peak, a half, and small
+    // tail values.
+    let counts = [32767.0f32, 16384.0, 4096.0, 221.0, 28.0, 1.0];
+    match run_bridge(&counts, true, 0, None) {
+        None => println!("  int16 read: NOT MEASURED"),
+        Some(got) => {
+            print!("  int16 read, no scaling:");
+            for (&want, &value) in counts.iter().zip(&got) {
+                print!(" {want}->{value}");
+            }
+            println!();
+        }
+    }
+}
+
+/// Stage 2: the same read with the BS MUL stage's `2^-15`, which is what
+/// turns a Q15 count into a probability. Reported for the same reason.
+#[test]
+#[ignore = "requires an RK3588 NPU at /dev/accel/accel0"]
+fn the_bridge_constant_scale_probe() {
+    let counts = [32767.0f32, 16384.0, 4096.0, 221.0];
+    for (label, int16) in [("int16 in", true), ("fp16 in", false)] {
+        match run_bridge(&counts, int16, 15, None) {
+            None => println!("  {label} with 2^-15: NOT MEASURED"),
+            Some(got) => {
+                print!("  {label} with 2^-15:");
+                for (&want, &value) in counts.iter().zip(&got) {
+                    print!(" {want}->{value:.6} (want {:.6})", want / 32768.0);
+                }
+                println!();
+            }
+        }
+    }
+}
+
+/// Which plane constants the hardware honours: `2^-15` is an exact fp16
+/// *subnormal*, `2^-14` the smallest *normal*. S1 only ever measured normal
+/// operands.
+#[test]
+#[ignore = "requires an RK3588 NPU at /dev/accel/accel0"]
+fn the_plane_constant_probe() {
+    let counts = [32767.0f32, 16384.0, 4096.0];
+    for (label, int16) in [("int16 in", true), ("fp16 in", false)] {
+        for exponent in [-13i32, -14, -15, -16] {
+            let plane = vec![2.0f32.powi(exponent)];
+            match run_bridge(&counts, int16, 0, Some(&plane)) {
+                None => println!("  {label} plane 2^{exponent}: NOT MEASURED"),
+                Some(got) => {
+                    print!("  {label} plane 2^{exponent}:");
+                    for (&count, &value) in counts.iter().zip(&got) {
+                        print!(
+                            " {count}->{value:.6} (want {:.6})",
+                            count * 2.0f32.powi(exponent)
+                        );
+                    }
+                    println!();
+                }
+            }
+        }
+    }
+}
+
+/// Stage 3: the bridge that works, and it is **two** tasks rather than
+/// one.
+///
+/// An `int16` input makes the datapath integer -- measured in
+/// `the_plane_constant_probe`, where a plane of `2^-13` turns 16384 into
+/// 2.0 correctly and 4096 into **0** instead of 0.5. So the int16 read
+/// cannot also scale: it can only hand on exact integer counts as fp16,
+/// which it does.
+///
+/// Everything fractional then happens on the fp16 path, where the plane
+/// honours fractional operands down to at least `2^-16`, exact power-of-two
+/// subnormals included. The constant `2^-15` turns a Q15 count into a
+/// probability, and §7's pass 3 multiplies by `1/d` afterwards.
+///
+/// Why the two cannot be folded into one plane: their product is
+/// `1/d_q15`, a non-power-of-two subnormal worth about 2% of relative
+/// precision at a real row's median `d` and 24% at the worst (§4).
+#[test]
+#[ignore = "requires an RK3588 NPU at /dev/accel/accel0"]
+fn the_bridge_turns_q15_counts_into_fp16_probabilities() {
+    let counts = [32767.0f32, 16384.0, 4096.0, 221.0, 28.0, 1.0];
+
+    // Task 1: int16 in, fp16 out, no scaling.
+    let Some(as_fp16) = run_bridge(&counts, true, 0, None) else {
+        return;
+    };
+    for (&count, &value) in counts.iter().zip(&as_fp16) {
+        // fp16 is exact on integers to 2048 and steps by 16 at 32768, so
+        // the peak rounds; everything below 2048 is exact.
+        let tolerance = (count * 1e-3).max(1.0);
+        assert!(
+            (value - count).abs() <= tolerance,
+            "the int16 read gave {value} for a count of {count}"
+        );
+    }
+
+    // Task 2: fp16 in, the constant 2^-15 on the plane.
+    let plane = vec![2.0f32.powi(-15)];
+    let Some(probabilities) = run_bridge(&as_fp16, false, 0, Some(&plane)) else {
+        return;
+    };
+    for (&count, &value) in counts.iter().zip(&probabilities) {
+        let want = count / 32768.0;
+        let tolerance = (want * 2e-3).max(2.0f32.powi(-24));
+        assert!(
+            (value - want).abs() <= tolerance,
+            "a Q15 count of {count} became {value}, wanted {want}"
+        );
+    }
+    println!(
+        "  the bridge is two tasks: an int16 read that cannot scale, then a 2^-15 plane on \
+         the fp16 path. Q15 counts become probabilities exactly."
+    );
+}
+
+/// Runs the bridge over one row of `values`, written as fp16 or as `int16`
+/// depending on `int16`, and returns the fp16 output.
+fn run_bridge(
+    values: &[f32],
+    int16: bool,
+    constant_shift: u32,
+    plane: Option<&[f32]>,
+) -> Option<Vec<f32>> {
+    let width = values.len() as u32;
+    let file = OpenOptions::new()
+        .read(true)
+        .write(true)
+        .open(DEVICE_PATH)
+        .expect("failed to open RK3588 NPU device");
+    let fd = file.as_raw_fd();
+
+    unsafe {
+        let buf_in = Buffer::new(fd, BUFFER_SIZE, &file);
+        ptr::write_bytes(buf_in.host_ptr, 0, BUFFER_SIZE);
+        for (pixel, &value) in values.iter().enumerate() {
+            let at = pixel * FEATURE_ATOM_BYTES;
+            if int16 {
+                ptr::write(buf_in.host_ptr.add(at) as *mut i16, value as i16);
+            } else {
+                ptr::write(buf_in.host_ptr.add(at) as *mut u16, f32_to_f16(value));
+            }
+        }
+        let buf_plane = Buffer::new(fd, BUFFER_SIZE, &file);
+        ptr::write_bytes(buf_plane.host_ptr, 0, BUFFER_SIZE);
+        let shape = Q15BridgeShape {
+            width,
+            height: 1,
+            channels: 1,
+            input_int16: int16,
+            constant_shift,
+            per_channel: plane.is_some(),
+        };
+        if let Some(plane) = plane {
+            let mut bytes = vec![0u8; 4 * shape.channels.max(16) as usize];
+            write_bn_mul_plane_fp16(&mut bytes, shape.channels.max(16), plane).expect("plane fits");
+            ptr::copy_nonoverlapping(bytes.as_ptr(), buf_plane.host_ptr, bytes.len());
+        }
+        let buf_out = Buffer::new(fd, BUFFER_SIZE, &file);
+        ptr::write_bytes(buf_out.host_ptr, 0x5A, BUFFER_SIZE);
+
+        let cmds = build_q15_bridge_regcmd(
+            &shape,
+            &Q15BridgeBuffers {
+                input_addr: buf_in.dma_address,
+                plane_addr: if plane.is_some() {
+                    buf_plane.dma_address
+                } else {
+                    0
+                },
+                output_addr: buf_out.dma_address,
+            },
+        );
+        let buf_cmd = Buffer::new(
+            fd,
+            (cmds.len() * mem::size_of::<u64>()).next_multiple_of(4096),
+            &file,
+        );
+        ptr::write_bytes(buf_cmd.host_ptr, 0, buf_cmd.size);
+        let slots = std::slice::from_raw_parts_mut(buf_cmd.host_ptr as *mut u64, cmds.len());
+        for (slot, cmd) in slots.iter_mut().zip(&cmds) {
+            *slot = cmd.0;
+        }
+        for handle in [
+            buf_in.handle,
+            buf_plane.handle,
+            buf_out.handle,
+            buf_cmd.handle,
+        ] {
+            fini_bo(fd, handle).ok();
+        }
+        let started = Instant::now();
+        submit(
+            fd,
+            buf_cmd.dma_address,
+            cmds.len() as u32,
+            &[buf_cmd.handle, buf_in.handle, buf_plane.handle],
+            &[buf_out.handle],
+        )
+        .expect("SUBMIT failed");
+        prep_bo(fd, buf_out.handle, 2_000_000_000)
+            .unwrap_or_else(|error| panic!("the bridge task did not complete: {error}"));
+        let elapsed = started.elapsed();
+        let out: Vec<f32> = (0..values.len())
+            .map(|pixel| {
+                f16_to_f32(ptr::read_unaligned(
+                    buf_out.host_ptr.add(pixel * FEATURE_ATOM_BYTES) as *const u16,
+                ))
+            })
+            .collect();
+        for handle in [
+            buf_in.handle,
+            buf_plane.handle,
+            buf_out.handle,
+            buf_cmd.handle,
+        ] {
+            close_bo(fd, handle).ok();
+        }
+        if dispatch::is_device_timeout(elapsed) {
+            let strict = dispatch::report("q15 bridge", elapsed);
+            assert!(!strict, "killed dispatch under ROCKET_STRICT_DISPATCH");
+            return None;
+        }
+        Some(out)
     }
 }

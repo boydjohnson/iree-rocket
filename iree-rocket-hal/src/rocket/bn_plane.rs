@@ -281,6 +281,28 @@ fn fp16_bits(value: f32) -> Result<u16, &'static str> {
     let sign = ((bits >> 16) & 0x8000) as u16;
     let exponent = ((bits >> 23) & 0xff) as i32 - 127 + 15;
     if !(1..=30).contains(&exponent) {
+        // One exception, and it is the one SOFTMAX.md needs: an exact
+        // power of two below fp16's normal range is still exact as a
+        // subnormal, since subnormals are `k * 2^-24`. `2^-15` is `512 *
+        // 2^-24`, and it is the constant that turns a Q15 count into a
+        // probability -- the only stage in the DPU that multiplies by a
+        // true fraction is this plane, because every other one is an
+        // integer multiply-then-right-shift (measured: BS MUL at shift 15
+        // and `OUT_CVT` both return 0 for a Q15 count).
+        //
+        // A *non*-power-of-two subnormal is still refused. `1/d_q15` is
+        // one of those: at the median `d` of a real attention row it has
+        // about 2% of relative precision and at the worst 24%, which is
+        // why the constant and the per-row reciprocal have to be separate
+        // multiplies rather than folded into one plane.
+        // `exponent` here is already fp16-biased-relative: it is the
+        // unbiased f32 exponent plus 15, so `2^-15` arrives as 0. An fp16
+        // subnormal encodes `k * 2^-24`, so `k = 2^(exponent + 9)` -- 512
+        // for `2^-15`, down to 1 for `2^-24`.
+        let mantissa = bits & 0x7f_ffff;
+        if mantissa == 0 && (-9..=0).contains(&exponent) {
+            return Ok(sign | (1u16 << (exponent + 9)));
+        }
         return Err("a BN multiplier must be inside fp16's normal range");
     }
     let mantissa = bits & 0x7f_ffff;
@@ -882,6 +904,320 @@ pub fn build_plane_gather_regcmd(
     cmds
 }
 
+/// Shape for the Q15-to-fp16 bridge, SOFTMAX.md §9's last host step.
+///
+/// `exp` emits the table's Q15 integer as `int16`
+/// ([`crate::rocket::activation::build_lut_q15_regcmd`]), and a standalone
+/// softmax has to hand the rest of the model fp16 probabilities. That needs
+/// an integer-to-float read, an exact `2^-15`, and the per-row `1/d` -- and
+/// the last two are separate stages, so the one task can do all of it:
+///
+/// * **`2^-15`** on the **BS** MUL stage, operand 1 at shift 15, from the
+///   config register rather than BRDMA so that DMA stays off (ISSUES C8).
+///   `conv.rs` notes that `bs_mul_bypass` bypasses the multiply "and not
+///   the shift that follows it", which is why the operand and the shift are
+///   programmed together here.
+/// * **`1/d`** on the **BN** MUL plane from NRDMA, per channel, the operand
+///   S1 measured as a flat fp16 at `channel * 2`. It has to be `1/d` in
+///   *real* units: `1/d_q15` is 1.5e-7 to 3e-5, below fp16's normal range,
+///   which is why the `2^-15` is a separate stage at all.
+///
+/// `input_int16` and `constant_shift` are separable so a probe can tell an
+/// int16 *read* failing from the scaling failing: with `input_int16` false
+/// and `constant_shift` 0 this is a plain fp16 pass-through, the control
+/// arm.
+///
+/// **Status: unmeasured.** Whether MRDMA can feed an integer cube into a
+/// float datapath at all is the open question -- it has an
+/// `mrdma_fp16tofp32_en` and no integer equivalent.
+#[derive(Clone, Copy, Debug)]
+pub struct Q15BridgeShape {
+    pub width: u32,
+    pub height: u32,
+    pub channels: u32,
+    /// `in_precision = 1` ("Integer 16bit") rather than 2, and no
+    /// `mrdma_fp16tofp32_en`.
+    pub input_int16: bool,
+    /// BS MUL shift, so a multiply by `2^-constant_shift`. Zero bypasses
+    /// the stage.
+    pub constant_shift: u32,
+    /// Engage the BN MUL plane from NRDMA.
+    pub per_channel: bool,
+}
+
+pub struct Q15BridgeBuffers {
+    pub input_addr: u32,
+    /// The per-channel `1/d` plane; zero when `per_channel` is false.
+    pub plane_addr: u32,
+    pub output_addr: u32,
+}
+
+// Straight-line hardware register program; hand-transcribing it into a
+// `vec![]` literal risks a copy/reorder mistake silently miscoding a register.
+#[allow(clippy::vec_init_then_push)]
+pub fn build_q15_bridge_regcmd(shape: &Q15BridgeShape, bufs: &Q15BridgeBuffers) -> Vec<RegCmd> {
+    assert!(
+        shape.width > 0 && shape.height > 0 && shape.channels > 0,
+        "build_q15_bridge_regcmd: width, height and channels must be nonzero"
+    );
+    assert!(
+        !shape.per_channel || bufs.plane_addr != 0,
+        "build_q15_bridge_regcmd: the per-channel stage needs a real plane address, or this \
+         is ISSUES.md C8's shape"
+    );
+    let task_channels = shape
+        .channels
+        .max(FEATURE_ATOMIC_SIZE)
+        .next_multiple_of(FEATURE_ATOMIC_SIZE);
+    let surface_stride = shape.width * shape.height;
+    let constant = shape.constant_shift > 0;
+    let input_addr = bufs.input_addr;
+    let output_addr = bufs.output_addr;
+
+    let mut cmds: Vec<RegCmd> = Vec::new();
+
+    cmds.push(
+        Register::<DpuSPointer>::new()
+            .pointer_pp_mode(Bits::new(1))
+            .executer_pp_en(Bits::new(1))
+            .pointer_pp_en(Bits::new(1))
+            .build(),
+    );
+    cmds.push(
+        Register::<DpuRdmaSPointer>::new()
+            .pointer_pp_mode(Bits::new(1))
+            .executer_pp_en(Bits::new(1))
+            .pointer_pp_en(Bits::new(1))
+            .build(),
+    );
+
+    cmds.push(
+        Register::<DpuFeatureModeCfg>::new()
+            .flying_mode(Bits::new(1))
+            .output_mode(Bits::new(2))
+            .burst_len(Bits::new(15))
+            .build(),
+    );
+    cmds.push(
+        Register::<DpuDataFormat>::new()
+            .in_precision(Bits::new(if shape.input_int16 { 1 } else { 2 }))
+            .out_precision(Bits::new(2))
+            .proc_precision(Bits::new(2))
+            .mc_surf_out(Bits::new(0))
+            .bs_mul_shift_value_neg(Bits::new(shape.constant_shift))
+            .build(),
+    );
+
+    cmds.push(zero::<DpuOffsetPend>());
+    cmds.push(
+        Register::<DpuDstBaseAddr>::new()
+            .dst_base_addr(Bits::new(output_addr))
+            .build(),
+    );
+    // Width 1, height 1: one atom per surface, surfaces consecutive.
+    cmds.push(
+        Register::<DpuDstSurfStride>::new()
+            .dst_surf_stride(Bits::new(surface_stride))
+            .build(),
+    );
+    cmds.push(
+        Register::<DpuDataCubeWidth>::new()
+            .width(Bits::new(shape.width - 1))
+            .build(),
+    );
+    cmds.push(
+        Register::<DpuDataCubeHeight>::new()
+            .height(Bits::new(shape.height - 1))
+            .build(),
+    );
+    cmds.push(zero::<DpuDataCubeNotchAddr>());
+    cmds.push(
+        Register::<DpuDataCubeChannel>::new()
+            .orig_channel(Bits::new(shape.channels - 1))
+            .channel(Bits::new(task_channels - 1))
+            .build(),
+    );
+
+    cmds.push(
+        Register::<DpuBsCfg>::new()
+            .bs_bypass(Bits::new(u32::from(!constant)))
+            .bs_alu_bypass(Bits::new(1))
+            .bs_mul_bypass(Bits::new(u32::from(!constant)))
+            .bs_relu_bypass(Bits::new(1))
+            .build(),
+    );
+    cmds.push(zero::<DpuBsAluCfg>());
+    cmds.push(
+        Register::<DpuBsMulCfg>::new()
+            // Operand 1 at shift `s` is a multiply by `2^-s`, taken from
+            // the config register so BRDMA stays off (C8).
+            .bs_mul_operand(Bits::new(u32::from(constant)))
+            .bs_mul_shift_value(Bits::new(shape.constant_shift))
+            .bs_mul_src(Bits::new(0))
+            .bs_truncate_src(Bits::new(0))
+            .build(),
+    );
+    cmds.push(zero::<DpuBsReluxCmpValue>());
+    cmds.push(
+        Register::<DpuBsOwCfg>::new()
+            .od_bypass(Bits::new(1))
+            .build(),
+    );
+    cmds.push(zero::<DpuBsOwOp>());
+    cmds.push(
+        Register::<DpuWdmaSize0>::new()
+            .channel_wdma(Bits::new(task_channels - 1))
+            .build(),
+    );
+    cmds.push(
+        Register::<DpuWdmaSize1>::new()
+            .height_wdma(Bits::new(shape.height - 1))
+            .width_wdma(Bits::new(shape.width - 1))
+            .build(),
+    );
+
+    cmds.push(
+        Register::<DpuBnCfg>::new()
+            .bn_bypass(Bits::new(u32::from(!shape.per_channel)))
+            .bn_alu_bypass(Bits::new(1))
+            .bn_mul_bypass(Bits::new(u32::from(!shape.per_channel)))
+            .bn_relu_bypass(Bits::new(1))
+            .build(),
+    );
+    cmds.push(zero::<DpuBnAluCfg>());
+    cmds.push(
+        Register::<DpuBnMulCfg>::new()
+            .bn_mul_src(Bits::new(u32::from(shape.per_channel)))
+            .bn_truncate_src(Bits::new(0))
+            .build(),
+    );
+    cmds.push(zero::<DpuBnReluxCmpValue>());
+
+    cmds.push(
+        Register::<DpuEwCfg>::new()
+            .ew_bypass(Bits::new(1))
+            .ew_op_bypass(Bits::new(1))
+            .ew_op_cvt_bypass(Bits::new(1))
+            .ew_lut_bypass(Bits::new(1))
+            .ew_relu_bypass(Bits::new(1))
+            .build(),
+    );
+    cmds.push(zero::<DpuEwCvtOffsetValue>());
+    cmds.push(
+        Register::<DpuEwCvtScaleValue>::new()
+            .ew_op_cvt_scale(Bits::new(1))
+            .build(),
+    );
+    cmds.push(zero::<DpuEwReluxCmpValue>());
+
+    cmds.push(zero::<DpuOutCvtOffset>());
+    cmds.push(
+        Register::<DpuOutCvtScale>::new()
+            .fp32tofp16_en(Bits::new(1))
+            .out_cvt_scale(Bits::new(1))
+            .build(),
+    );
+    cmds.push(zero::<DpuOutCvtShift>());
+
+    cmds.push(zero::<DpuEwOpValue0>());
+    cmds.push(zero::<DpuEwOpValue1>());
+    cmds.push(zero::<DpuEwOpValue2>());
+    cmds.push(zero::<DpuEwOpValue3>());
+    cmds.push(zero::<DpuEwOpValue4>());
+    cmds.push(zero::<DpuEwOpValue5>());
+    cmds.push(zero::<DpuEwOpValue6>());
+    cmds.push(zero::<DpuEwOpValue7>());
+    cmds.push(
+        Register::<DpuSurfaceAdd>::new()
+            // The narrowing bit is set, so the one-atom multiplier.
+            .surf_add(Bits::new(surface_stride))
+            .build(),
+    );
+    cmds.push(zero::<DpuReserved40c4>());
+
+    cmds.push(zero::<DpuLutAccessCfg>());
+    cmds.push(zero::<DpuLutAccessData>());
+    cmds.push(zero::<DpuLutCfg>());
+    cmds.push(zero::<DpuLutInfo>());
+    cmds.push(zero::<DpuLutLeStart>());
+    cmds.push(zero::<DpuLutLeEnd>());
+    cmds.push(zero::<DpuLutLoStart>());
+    cmds.push(zero::<DpuLutLoEnd>());
+    cmds.push(zero::<DpuLutLeSlopeScale>());
+    cmds.push(zero::<DpuLutLeSlopeShift>());
+    cmds.push(zero::<DpuLutLoSlopeScale>());
+    cmds.push(zero::<DpuLutLoSlopeShift>());
+
+    cmds.push(
+        Register::<DpuRdmaDataCubeWidth>::new()
+            .width(Bits::new(shape.width - 1))
+            .build(),
+    );
+    cmds.push(
+        Register::<DpuRdmaDataCubeHeight>::new()
+            .height(Bits::new(shape.height - 1))
+            .build(),
+    );
+    cmds.push(
+        Register::<DpuRdmaDataCubeChannel>::new()
+            .channel(Bits::new(task_channels - 1))
+            .build(),
+    );
+    cmds.push(
+        Register::<DpuRdmaSrcBaseAddr>::new()
+            .src_base_addr(Bits::new(input_addr))
+            .build(),
+    );
+    cmds.push(zero::<DpuRdmaBrdmaCfg>());
+    cmds.push(zero::<DpuRdmaBsBaseAddr>());
+    cmds.push(
+        Register::<DpuRdmaNrdmaCfg>::new()
+            .nrdma_data_use(Bits::new(if shape.per_channel { 0b0100 } else { 0 }))
+            .build(),
+    );
+    cmds.push(
+        Register::<DpuRdmaBnBaseAddr>::new()
+            .bn_base_addr(Bits::new(if shape.per_channel {
+                bufs.plane_addr
+            } else {
+                0
+            }))
+            .build(),
+    );
+    cmds.push(
+        Register::<DpuRdmaErdmaCfg>::new()
+            .erdma_disable(Bits::new(1))
+            .build(),
+    );
+    cmds.push(zero::<DpuRdmaEwBaseAddr>());
+    cmds.push(zero::<DpuRdmaEwSurfStride>());
+
+    cmds.push(
+        Register::<DpuRdmaFeatureModeCfg>::new()
+            .flying_mode(Bits::new(1))
+            .burst_len(Bits::new(15))
+            .in_precision(Bits::new(if shape.input_int16 { 1 } else { 2 }))
+            .proc_precision(Bits::new(2))
+            .mrdma_fp16tofp32_en(Bits::new(u32::from(!shape.input_int16)))
+            .build(),
+    );
+    cmds.push(zero::<DpuRdmaSrcDmaCfg>());
+    cmds.push(zero::<DpuRdmaSurfNotch>());
+    cmds.push(zero::<DpuRdmaPadCfg>());
+    cmds.push(
+        Register::<DpuRdmaWeight>::new()
+            .e_weight(Bits::new(1))
+            .n_weight(Bits::new(1))
+            .b_weight(Bits::new(1))
+            .m_weight(Bits::new(1))
+            .build(),
+    );
+    cmds.push(zero::<DpuRdmaEwSurfNotch>());
+
+    push_kick(&mut cmds, KICK_DPU | KICK_DPU_RDMA);
+    cmds
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1081,6 +1417,33 @@ mod tests {
                 "surf_notch_addr is bits 31:4, in pixels"
             );
         }
+    }
+
+    /// The subnormal encoding, pinned: `2^-15` is `512 * 2^-24`, so its
+    /// fp16 word is `0x0200`. Getting this wrong produced a factor of four
+    /// on the board before it produced a unit-test failure, which is the
+    /// argument for the test.
+    #[test]
+    fn exact_power_of_two_subnormals_encode() {
+        for (value, bits) in [
+            (2.0f32.powi(-15), 0x0200u16),
+            (2.0f32.powi(-16), 0x0100),
+            (2.0f32.powi(-24), 0x0001),
+            (2.0f32.powi(-14), 0x0400), // the smallest normal
+        ] {
+            let mut buffer = vec![0u8; 32];
+            write_bn_mul_plane_fp16(&mut buffer, 16, &[value]).unwrap();
+            assert_eq!(
+                u16::from_le_bytes([buffer[0], buffer[1]]),
+                bits,
+                "2^{} encodes wrong",
+                value.log2()
+            );
+        }
+        // Not a power of two and below the normal range: refused, because
+        // its precision there is a few bits (SOFTMAX.md section 4).
+        assert!(write_bn_mul_plane_fp16(&mut vec![0u8; 32], 16, &[2.83e-6]).is_err());
+        assert!(write_bn_mul_plane_fp16(&mut vec![0u8; 32], 16, &[2.0f32.powi(-25)]).is_err());
     }
 
     #[test]
