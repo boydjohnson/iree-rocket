@@ -1205,6 +1205,7 @@ mod tests {
     #[test]
     fn the_striped_packer_is_byte_identical_to_the_visited_one() {
         let mut saw_partial_input_group = false;
+        let mut saw_no_padding_at_all = false;
         let mut saw_input_atom_bump = false;
         let mut saw_partial_output_block = false;
         let mut saw_output_padding = false;
@@ -1236,6 +1237,11 @@ mod tests {
                                 .programmed_output_channels
                                 .is_multiple_of(layout.output_block_channels);
                             saw_output_padding |= layout.programmed_output_channels > cout;
+                            // The arm that skips the zero fill, which is
+                            // only sound if every slot is then written: the
+                            // 0xCD prefill below is what proves it.
+                            saw_no_padding_at_all |= layout.padded_input_channels == cin
+                                && layout.programmed_output_channels == cout;
 
                             let mut reference = vec![0xABu8; packed_len];
                             pack_dense_visited(
@@ -1289,6 +1295,11 @@ mod tests {
             "sweep missed a partial output block"
         );
         assert!(saw_output_padding, "sweep missed programmed output padding");
+        assert!(
+            saw_no_padding_at_all,
+            "sweep missed a shape with no padding lane, so it never exercised \
+             the skipped zero fill"
+        );
     }
 
     /// An int8 rung whose weight zero point is 0 takes the fast path, and
