@@ -12,7 +12,9 @@
 //! COMPILER_ROADMAP.md 6.3 hoists a *constant* filter's packing to compile
 //! time (a hoisted `.vmfb` reaches the packer not at all, and prints no
 //! `pack.weights` phase), and the packer itself is 5-10x faster as of
-//! 2026-11-24 (`rocket_core::weights`' strided arm). What is left for this
+//! 2026-11-24 (`rocket_core::weights`' strided arm) -- 4.0-4.1x measured in
+//! situ, where each filter is packed once out of pages nothing has touched
+//! yet rather than in a loop. What is left for this
 //! cache is a filter the hoist cannot reach -- one that is not a constant,
 //! or whose dimensions are not -- on the second inference onward.
 //!
