@@ -550,14 +550,20 @@ between consecutive surfaces
 [verified, `the_reduced_vector_is_four_pixel_strided_not_dense`].
 
 So the max tree's output is a strided gather away from an ALU plane
-operand, not a widen away, and §8's S2a is that bridge. Three candidates,
-cheapest first: program `RDMA_SURF_NOTCH` -- "number of pixels from the end
-of this process's feature map to the end of the underlying shape's" -- to 3
-on a DPU pass-through that reads the pooled cube and writes dense fp32,
-which is one register that is zero in every builder here; stop the tree at
-4 columns and do the last `4 -> 1` on the DPU, whose writer is already
-dense; or gather `M` values on the CPU, which is cheap in itself but puts a
-host round trip inside §5's one-job structure.
+operand, not a widen away. **That bridge is built and measured** (S2a):
+`build_plane_gather_regcmd` is one DPU pass-through that reads the pooled
+cube through `RDMA_SURF_NOTCH` -- "number of pixels from the end of this
+process's feature map to the end of the underlying shape's" -- and writes a
+width-1 cube, which is dense because `DST_SURF_STRIDE` counts atoms. One
+task closes both the pitch and the element type, and §8 has what it cost to
+find. The two alternatives that bullet listed are not needed: stopping the
+tree at 4 columns to finish on the DPU, or gathering `M` values on the host
+and paying a round trip inside §5's one-job structure.
+
+The sum side needs no bridge. A conv's output cube has no four-pixel
+rounding -- its surface stride is `width * height` atoms -- so the sum
+tree's width-1 fp16 output is already dense at `channel * 2`, which is
+exactly the MUL plane's format.
 
 ---
 
@@ -675,11 +681,38 @@ Whole-row cost at `N = 384`, both halves: the max is 3 stages and 6 tasks,
 the sum is 6 stages and 6 tasks. The sum's extra depth is the price of a
 3-wide window where the PPU could take 8.
 
-**S2a -- the plane bridge.** The reduced vector comes out four-pixel
-strided, not dense, so it is a gather away from an ALU plane operand rather
-than a widen away. §7 has the three candidates; try `RDMA_SURF_NOTCH` on a
-DPU pass-through first, since it is one register and the DPU's own width-1
-writer is already dense.
+**S2a -- the plane bridge. DONE 2026-11-24**
+(`bn_plane::build_plane_gather_regcmd`, three more tests in
+`bn_plane_probe_hw.rs`). One DPU pass-through turns the PPU's
+four-pixel-strided width-1 cube into a dense plane operand, and the two
+halves were tested separately so a failure would localise:
+
+* **`RDMA_SURF_NOTCH` reads the strided cube**, first try, at 32 channels
+  -- four source surfaces, with a `-99.0` sentinel in the slack pixels so
+  an ignored notch would be obvious rather than merely wrong.
+* **The fp32 writer took a sweep.** Reading
+  `Precision::Fp16Accumulator`'s recipe off `conv.rs` gave `size_e = 3`
+  (its "float rule, size_e = output bytes - 1"), and that **hung at the
+  watchdog**, 522 ms, twice. Sweeping `size_e` alone then showed 0 and 1
+  running and writing channel 0 *correctly* as `f32` at `channel * 4` with
+  28 of 32 channels wrong -- exactly one atom's worth right, which pointed
+  at the surface stride rather than the element type.
+
+  `conv.rs` says why one field at a time reads as "nothing helps": the
+  4-byte writer's `(mc_surf_out, size_e, surf_add)` are one configuration
+  and "move together or not at all". Sweeping the triple one combination
+  per process -- a hung job can leave the core sick -- found
+  **`(0, 1, dst_surf_stride * 2)`**, and the neighbours confirm it is an
+  optimum rather than luck: `surf_add` at twice that writes every other
+  surface, at the same value with `size_e = 0` it stops after the first,
+  and `size_e` 3 or 7 hangs. The 2 is the multiplier `conv.rs`'s int4 note
+  predicted when it called 8 the integer quirk, "not the float path's
+  natural 1 and 2x". `the_fp32_gather_programs_the_measured_writer_triple`
+  pins all of it without a board.
+* **The edge works end to end**: a gathered `f32` plane feeds the BN ALU
+  stage in one job, with no host write between the two tasks. That is §7's
+  pass-2 edge, and it is the claim S2a exists to support rather than either
+  half on its own.
 
 **S3 -- `exp` over the real domain.** Extend `lut_exp_hw.rs` with
 `input_scale = 1/2` plus `EwBinaryOp::Mul(u, u)`, oracle-checked across
@@ -716,8 +749,8 @@ precisely the form this hardware cannot run.
   plane carries a per-channel float on both sub-stages. The fallback this
   bullet named -- an ERDMA broadcast operand, or a materialised broadcast
   tensor and the full-size pass it costs -- is not needed.
-* **The combined ALU-plus-MUL plane layout is open**, the one thing S1 did
-  not settle. Each stream's own stride is measured, but with both engaged
+* **The combined ALU-plus-MUL plane layout is open**, the one thing S1 and
+  S2a did not settle. Each stream's own stride is measured, but with both engaged
   the MUL stream is fetched two bytes further on than `Mul` alone reads it,
   so they are not simply both based at `BN_BASE_ADDR`. §7 engages one
   sub-stage per task and does not need it; a fused op that wanted

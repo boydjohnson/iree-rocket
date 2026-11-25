@@ -76,10 +76,15 @@ mod dispatch;
 
 use iree_rocket_hal::rocket::{
     bn_plane::{
-        BnPlaneBuffers, BnPlaneOp, BnPlaneShape, bn_mul_plane_bytes, bn_plane_bytes,
-        build_bn_plane_regcmd, write_bn_alu_plane_fp32, write_bn_mul_plane_fp16,
+        BnPlaneBuffers, BnPlaneOp, BnPlaneShape, PlaneElement, bn_mul_plane_bytes, bn_plane_bytes,
+        build_bn_plane_regcmd, build_plane_gather_regcmd, write_bn_alu_plane_fp32,
+        write_bn_mul_plane_fp16,
     },
-    device::{Buffer, close_bo, fini_bo, prep_bo, submit},
+    builders::{
+        Bits, Register, RegisterMeta,
+        dpu::{DpuBsOwCfg, DpuDataFormat, DpuSurfaceAdd},
+    },
+    device::{Buffer, close_bo, fini_bo, prep_bo, submit, submit_tasks},
     elementwise::{EwUnaryAlgo, EwUnaryBuffers, EwUnaryShape, build_unary_regcmd},
 };
 
@@ -977,5 +982,469 @@ fn bn_mul_plane_dump() {
             None => println!("  {op:?} shift{shift} {encoding}: NOT MEASURED"),
             Some(got) => dump(&format!("{op:?} shift{shift} {encoding}"), &got, &values),
         }
+    }
+}
+
+// ===========================================================================
+// SOFTMAX.md probe S2a: the bridge from a strided reduction output to a
+// dense plane operand.
+// ===========================================================================
+//
+// S1 established what the plane wants: a flat `f32` at `channel * 4` for the
+// ALU, a flat `fp16` at `channel * 2` for the MUL. S2 established what the
+// row maximum arrives as: a width-1 cube whose *surfaces* are four pixels
+// apart, because the PPU's writer rounds both cube strides up to four
+// pixels. So channel `c` of the maximum sits at `(c / 8) * 64 + (c % 8) * 2`
+// and the ALU plane wants it at `c * 4`.
+//
+// `build_plane_gather_regcmd` is one DPU pass-through that closes both gaps:
+// `RDMA_SURF_NOTCH` gives the read the four-pixel slack, and the write is a
+// width-1 cube, which is dense because `DST_SURF_STRIDE` counts atoms.
+//
+// Two questions, deliberately separate so a failure localises:
+//
+// 1. `the_gather_reads_a_four_pixel_strided_cube` -- fp16 out, which S2
+//    already showed is the easy half of the write. A failure here is the
+//    notch.
+// 2. `the_gather_writes_a_dense_f32_plane` -- the same read with `Fp32` out.
+//    A failure here is the writer, and the fp16 arm above says so.
+
+/// The strided source this bridge exists to read: the four-pixel surface
+/// pitch a width-1 PPU output has.
+const POOLED_SURFACE_PIXELS: u32 = 4;
+
+fn pooled_offset(channel: usize) -> usize {
+    (channel / FP16_LANES_PER_ATOM) * POOLED_SURFACE_PIXELS as usize * FEATURE_ATOM_BYTES
+        + (channel % FP16_LANES_PER_ATOM) * 2
+}
+
+/// Writes a width-1 cube with the PPU's four-pixel surface pitch, runs the
+/// gather over it, and returns the output buffer's raw bytes.
+fn run_gather(channels: u32, element: PlaneElement) -> Option<Vec<u8>> {
+    run_gather_with_size_e(channels, element, None)
+}
+
+/// `run_gather`, with the 4-byte writer's whole triple overridden from the
+/// environment: `PROBE_MC_SURF_OUT`, `PROBE_SIZE_E`, `PROBE_SURF_ADD`.
+///
+/// One combination per process, which is how this repo measures anything
+/// on the NPU after a failed job -- a hung job can leave the core sick, so
+/// a 32-case in-process sweep is exactly the shape that produces results
+/// nobody can reproduce.
+fn writer_override() -> Option<(u32, u32, u32)> {
+    let read = |name: &str| {
+        std::env::var(name)
+            .ok()
+            .and_then(|value| value.parse::<u32>().ok())
+    };
+    match (
+        read("PROBE_MC_SURF_OUT"),
+        read("PROBE_SIZE_E"),
+        read("PROBE_SURF_ADD"),
+    ) {
+        (Some(mc), Some(size_e), Some(surf_add)) => Some((mc, size_e, surf_add)),
+        _ => None,
+    }
+}
+
+/// `run_gather`, with `BS_OW_CFG.size_e_0..2` overridden.
+///
+/// The field exists in this harness because the first fp32 attempt hung at
+/// 522 ms -- the watchdog -- and `conv.rs`'s `bs_ow_size_e` records exactly
+/// that symptom for a wrong value on a *different* path: "at 3 or 7 writes
+/// 1024 of 65536 bytes and takes ~525 ms per tile -- the watchdog killing
+/// the job, with PREP_BO still returning success". So the value is swept
+/// rather than reasoned about.
+fn run_gather_with_size_e(
+    channels: u32,
+    element: PlaneElement,
+    size_e: Option<u32>,
+) -> Option<Vec<u8>> {
+    let file = OpenOptions::new()
+        .read(true)
+        .write(true)
+        .open(DEVICE_PATH)
+        .expect("failed to open NPU device");
+    let fd = file.as_raw_fd();
+
+    unsafe {
+        let buf_in = Buffer::new(fd, BUFFER_SIZE, &file);
+        // A sentinel in the slack pixels: if the notch is wrong the gather
+        // reads these instead of the next surface's real value, and a
+        // recognisable number is easier to diagnose than a zero.
+        let words = std::slice::from_raw_parts_mut(buf_in.host_ptr as *mut u16, BUFFER_SIZE / 2);
+        words.fill(f32_to_f16(-99.0));
+        for channel in 0..channels as usize {
+            ptr::write(
+                buf_in.host_ptr.add(pooled_offset(channel)) as *mut u16,
+                f32_to_f16(alu_value(channel)),
+            );
+        }
+
+        let buf_out = Buffer::new(fd, BUFFER_SIZE, &file);
+        ptr::write_bytes(buf_out.host_ptr, 0x5A, BUFFER_SIZE);
+
+        let mut cmds = build_plane_gather_regcmd(
+            channels,
+            POOLED_SURFACE_PIXELS,
+            element,
+            buf_in.dma_address,
+            buf_out.dma_address,
+        );
+        // `conv.rs`'s own lesson about this writer: "the three move
+        // together or not at all ... sweeping surf_add alone and size_e
+        // alone both read as 'no effect / no value helps'". So the
+        // environment sets all three or none.
+        let triple = writer_override();
+        if let Some(size_e) = size_e.or(triple.map(|(_, size_e, _)| size_e)) {
+            let mut patched = 0;
+            for cmd in &mut cmds {
+                if (cmd.0 >> 48) as u32 == DpuBsOwCfg::DOMAIN
+                    && (cmd.0 as u32 & 0xffff) == DpuBsOwCfg::OFFSET
+                {
+                    *cmd = Register::<DpuBsOwCfg>::new()
+                        .size_e_0(Bits::new(size_e))
+                        .size_e_1(Bits::new(size_e))
+                        .size_e_2(Bits::new(size_e))
+                        .od_bypass(Bits::new(1))
+                        .build();
+                    patched += 1;
+                }
+            }
+            assert_eq!(patched, 1, "BS_OW_CFG is written exactly once");
+        }
+        if let Some((mc_surf_out, _, surf_add)) = triple {
+            let mut patched = 0;
+            for cmd in &mut cmds {
+                if (cmd.0 >> 48) as u32 == DpuDataFormat::DOMAIN
+                    && (cmd.0 as u32 & 0xffff) == DpuDataFormat::OFFSET
+                {
+                    *cmd = Register::<DpuDataFormat>::new()
+                        .in_precision(Bits::new(2))
+                        .out_precision(Bits::new(5))
+                        .proc_precision(Bits::new(2))
+                        .mc_surf_out(Bits::new(mc_surf_out))
+                        .build();
+                    patched += 1;
+                }
+                if (cmd.0 >> 48) as u32 == DpuSurfaceAdd::DOMAIN
+                    && (cmd.0 as u32 & 0xffff) == DpuSurfaceAdd::OFFSET
+                {
+                    *cmd = Register::<DpuSurfaceAdd>::new()
+                        .surf_add(Bits::new(surf_add))
+                        .build();
+                    patched += 1;
+                }
+            }
+            assert_eq!(patched, 2, "DATA_FORMAT and SURFACE_ADD once each");
+        }
+        let cmd_bytes = cmds.len() * mem::size_of::<u64>();
+        let buf_cmd = Buffer::new(fd, cmd_bytes.next_multiple_of(4096), &file);
+        let cmd_slice = std::slice::from_raw_parts_mut(buf_cmd.host_ptr as *mut u64, cmds.len());
+        for (i, c) in cmds.iter().enumerate() {
+            cmd_slice[i] = c.0;
+        }
+
+        fini_bo(fd, buf_in.handle).ok();
+        fini_bo(fd, buf_out.handle).ok();
+        fini_bo(fd, buf_cmd.handle).ok();
+
+        let started = Instant::now();
+        submit(
+            fd,
+            buf_cmd.dma_address,
+            cmds.len() as u32,
+            &[buf_cmd.handle, buf_in.handle],
+            &[buf_out.handle],
+        )
+        .expect("SUBMIT ioctl failed");
+        prep_bo(fd, buf_out.handle, 2_000_000_000).unwrap_or_else(|e| {
+            panic!(
+                "the plane gather ({channels} channels, {element:?}) did not complete. Both \
+                 RDMA_SURF_NOTCH and the fp32 writer are first-use here, so a hang is a \
+                 plausible outcome of a wrong program: {e}"
+            )
+        });
+        let elapsed = started.elapsed();
+
+        let raw = std::slice::from_raw_parts(buf_out.host_ptr, 512).to_vec();
+        close_bo(fd, buf_in.handle).ok();
+        close_bo(fd, buf_out.handle).ok();
+        close_bo(fd, buf_cmd.handle).ok();
+
+        if dispatch::is_device_timeout(elapsed) {
+            let strict = dispatch::report(&format!("gather {channels}ch {element:?}"), elapsed);
+            assert!(!strict, "killed dispatch under ROCKET_STRICT_DISPATCH");
+            return None;
+        }
+        Some(raw)
+    }
+}
+
+/// Question 1: does `RDMA_SURF_NOTCH` give the read its four-pixel slack?
+///
+/// fp16 out, so the write is the arrangement S2 already measured and any
+/// failure is the notch. 32 channels is four source surfaces, so a notch
+/// that were ignored would read channel 8 from the slack of surface 0 --
+/// the -99.0 sentinel -- rather than from surface 1.
+#[test]
+#[ignore = "requires an RK3588 NPU at /dev/accel/accel0"]
+fn the_gather_reads_a_four_pixel_strided_cube() {
+    let channels = 32u32;
+    let Some(raw) = run_gather(channels, PlaneElement::Fp16) else {
+        return;
+    };
+    for channel in 0..channels as usize {
+        let at = channel * 2;
+        let got = f16_to_f32(u16::from_le_bytes([raw[at], raw[at + 1]]));
+        let want = alu_value(channel);
+        assert!(
+            (got - want).abs() <= TOLERANCE,
+            "channel {channel} (source surface {}) came back {got}, wanted {want}. -99 means \
+             RDMA_SURF_NOTCH was ignored and the read ran straight through the slack pixels; \
+             anything else means the write, not the notch.",
+            channel / FP16_LANES_PER_ATOM
+        );
+    }
+    println!("  RDMA_SURF_NOTCH reads a 4-pixel-pitched width-1 cube at {channels} channels");
+}
+
+/// One `(mc_surf_out, size_e, surf_add)` combination for the fp32 writer,
+/// taken from the environment and reported rather than asserted.
+///
+/// The first fp32 attempt -- `mc_surf_out 0`, `size_e 3`, `surf_add 1`, the
+/// reading of `Precision::Fp16Accumulator`'s recipe that seemed to follow
+/// from `conv.rs` -- hung at the watchdog. An in-process sweep of `size_e`
+/// alone then showed 0 and 1 running and writing channel 0 *correctly* in
+/// `f32` at `channel * 4`, with 28 of 32 channels wrong: exactly one atom's
+/// worth right, which points at the surface stride rather than the element
+/// type.
+///
+/// `conv.rs` says why sweeping one field reads as "nothing helps": the
+/// 4-byte writer's three fields are one configuration. It records two
+/// known-good triples, both for int32 -- `(0, 7, dst_surf_stride * 8)` from
+/// `rocket-userspace`'s matmul, and `(1, 1, 16)`, this crate's own
+/// accumulator mode, "a different writer, not a variant of the same one".
+/// For fp32 the multiplier should be smaller: the int4 note calls 8 the
+/// integer quirk, "not the float path's natural 1 and 2x".
+#[test]
+#[ignore = "requires an RK3588 NPU at /dev/accel/accel0"]
+fn the_fp32_writer_triple_probe() {
+    let Some((mc_surf_out, size_e, surf_add)) = writer_override() else {
+        println!(
+            "set PROBE_MC_SURF_OUT, PROBE_SIZE_E and PROBE_SURF_ADD; one combination per \
+             process, since a hung job can leave the core sick"
+        );
+        return;
+    };
+    let channels = 32u32;
+    print!("  mc_surf_out {mc_surf_out} size_e {size_e} surf_add {surf_add}: ");
+    match run_gather_with_size_e(channels, PlaneElement::Fp32, None) {
+        None => println!("HUNG (watchdog)"),
+        Some(raw) => {
+            let wrong: Vec<usize> = (0..channels as usize)
+                .filter(|&channel| {
+                    let at = channel * 4;
+                    let got = f32::from_bits(u32::from_le_bytes([
+                        raw[at],
+                        raw[at + 1],
+                        raw[at + 2],
+                        raw[at + 3],
+                    ]));
+                    (got - alu_value(channel)).abs() > TOLERANCE
+                })
+                .collect();
+            if wrong.is_empty() {
+                println!("MATCHES a dense f32 plane on all {channels} channels");
+            } else {
+                println!(
+                    "ran, {}/{channels} wrong, first wrong c{}",
+                    wrong.len(),
+                    wrong[0]
+                );
+            }
+        }
+    }
+}
+
+/// Question 2: does the `Fp16Accumulator` writer recipe produce a dense
+/// `f32` plane -- the thing the BN ALU plane actually consumes?
+#[test]
+#[ignore = "requires an RK3588 NPU at /dev/accel/accel0"]
+fn the_gather_writes_a_dense_f32_plane() {
+    let channels = 32u32;
+    let Some(raw) = run_gather(channels, PlaneElement::Fp32) else {
+        return;
+    };
+    for channel in 0..channels as usize {
+        let at = channel * 4;
+        let got = f32::from_bits(u32::from_le_bytes([
+            raw[at],
+            raw[at + 1],
+            raw[at + 2],
+            raw[at + 3],
+        ]));
+        let want = alu_value(channel);
+        assert!(
+            (got - want).abs() <= TOLERANCE,
+            "channel {channel} of the f32 plane came back {got} ({:#010x}), wanted {want}. \
+             If the fp16 arm passed, this is the writer: out_precision 5, size_e 3 and a \
+             cleared fp32tofp16_en are `Precision::Fp16Accumulator`'s recipe, and 4 channels \
+             to a 16-byte atom is the geometry it implies at width 1.",
+            u32::from_le_bytes([raw[at], raw[at + 1], raw[at + 2], raw[at + 3]])
+        );
+    }
+    println!("  the gather writes a dense f32 plane at {channels} channels");
+}
+
+/// The bridge end to end: gather a strided maximum into an `f32` plane,
+/// then have the BN ALU stage consume *that buffer* -- no host write
+/// between them. This is SOFTMAX.md section 7's pass-2 edge, and it is the
+/// claim S2a exists to support rather than either half on its own.
+#[test]
+#[ignore = "requires an RK3588 NPU at /dev/accel/accel0"]
+fn a_gathered_plane_feeds_the_bn_alu_stage() {
+    let channels = 8u32;
+    let file = OpenOptions::new()
+        .read(true)
+        .write(true)
+        .open(DEVICE_PATH)
+        .expect("failed to open NPU device");
+    let fd = file.as_raw_fd();
+
+    unsafe {
+        // The "pooled maximum": a strided width-1 cube, negated, because
+        // what pass 2 adds is `-m`.
+        let pooled = Buffer::new(fd, BUFFER_SIZE, &file);
+        let words = std::slice::from_raw_parts_mut(pooled.host_ptr as *mut u16, BUFFER_SIZE / 2);
+        words.fill(f32_to_f16(-99.0));
+        for channel in 0..channels as usize {
+            ptr::write(
+                pooled.host_ptr.add(pooled_offset(channel)) as *mut u16,
+                f32_to_f16(-alu_value(channel)),
+            );
+        }
+
+        // The plane the gather writes and the BN stage reads. Nothing on
+        // the host touches it in between.
+        let plane = Buffer::new(fd, BUFFER_SIZE, &file);
+        ptr::write_bytes(plane.host_ptr, 0, plane.size);
+
+        let case = Case {
+            width: 4,
+            height: 4,
+            channels,
+            op: BnPlaneOp::Add,
+            mul_shift: 0,
+        };
+        let pixels = case.pixels();
+        let buf_in = Buffer::new(fd, BUFFER_SIZE, &file);
+        ptr::write_bytes(buf_in.host_ptr, 0, BUFFER_SIZE);
+        for channel in 0..channels as usize {
+            for pixel in 0..pixels {
+                ptr::write(
+                    buf_in.host_ptr.add(nc1hwc2_offset(channel, pixel, pixels)) as *mut u16,
+                    f32_to_f16(input_value(channel, pixel)),
+                );
+            }
+        }
+        let buf_out = Buffer::new(fd, BUFFER_SIZE, &file);
+        ptr::write_bytes(buf_out.host_ptr, 0x5A, BUFFER_SIZE);
+
+        let gather = build_plane_gather_regcmd(
+            channels,
+            POOLED_SURFACE_PIXELS,
+            PlaneElement::Fp32,
+            pooled.dma_address,
+            plane.dma_address,
+        );
+        let consume = build_bn_plane_regcmd(
+            &case.shape(),
+            &BnPlaneBuffers {
+                input_addr: buf_in.dma_address,
+                plane_addr: plane.dma_address,
+                output_addr: buf_out.dma_address,
+            },
+        );
+
+        let mut cmd_bufs = Vec::new();
+        for cmds in [&gather, &consume] {
+            let buffer = Buffer::new(
+                fd,
+                (cmds.len() * mem::size_of::<u64>()).next_multiple_of(4096),
+                &file,
+            );
+            let slots = std::slice::from_raw_parts_mut(buffer.host_ptr as *mut u64, cmds.len());
+            for (slot, cmd) in slots.iter_mut().zip(cmds.iter()) {
+                *slot = cmd.0;
+            }
+            cmd_bufs.push((buffer, cmds.len() as u32));
+        }
+
+        for handle in [pooled.handle, plane.handle, buf_in.handle, buf_out.handle] {
+            fini_bo(fd, handle).ok();
+        }
+        for (buffer, _) in &cmd_bufs {
+            fini_bo(fd, buffer.handle).ok();
+        }
+
+        // Both tasks in one job: the plane buffer is written by task 1 and
+        // read by task 2, and the kernel dispatches task 2 only after task
+        // 1's completion IRQ, so nothing waits on the host.
+        let tasks: Vec<(u32, u32)> = cmd_bufs
+            .iter()
+            .map(|(buffer, count)| (buffer.dma_address, *count))
+            .collect();
+        let in_handles = [
+            cmd_bufs[0].0.handle,
+            cmd_bufs[1].0.handle,
+            pooled.handle,
+            buf_in.handle,
+        ];
+        let out_handles = [buf_out.handle];
+
+        let started = Instant::now();
+        submit_tasks(fd, &tasks, &in_handles, &out_handles).expect("SUBMIT ioctl failed");
+        prep_bo(fd, buf_out.handle, 2_000_000_000)
+            .unwrap_or_else(|e| panic!("the gather-then-consume job did not complete: {e}"));
+        let elapsed = started.elapsed();
+
+        let out: Vec<f32> = (0..channels as usize)
+            .flat_map(|channel| {
+                (0..pixels).map(move |pixel| {
+                    f16_to_f32(ptr::read_unaligned(
+                        buf_out.host_ptr.add(nc1hwc2_offset(channel, pixel, pixels)) as *const u16,
+                    ))
+                })
+            })
+            .collect();
+
+        for handle in [pooled.handle, plane.handle, buf_in.handle, buf_out.handle] {
+            close_bo(fd, handle).ok();
+        }
+        for (buffer, _) in &cmd_bufs {
+            close_bo(fd, buffer.handle).ok();
+        }
+
+        if dispatch::is_device_timeout(elapsed) {
+            let strict = dispatch::report("gather then consume", elapsed);
+            assert!(!strict, "killed dispatch under ROCKET_STRICT_DISPATCH");
+            return;
+        }
+
+        for channel in 0..channels as usize {
+            for pixel in 0..pixels {
+                let got = out[channel * pixels + pixel];
+                let want = input_value(channel, pixel) - alu_value(channel);
+                assert!(
+                    (got - want).abs() <= TOLERANCE,
+                    "channel {channel} pixel {pixel}: {got}, wanted {want}. Both halves pass \
+                     on their own if the two tests above are green, so a failure here is the \
+                     edge between them -- the plane the gather wrote is not what the BN stage \
+                     read."
+                );
+            }
+        }
+        println!("  a gathered f32 plane feeds the BN ALU stage in one job, no host write");
     }
 }

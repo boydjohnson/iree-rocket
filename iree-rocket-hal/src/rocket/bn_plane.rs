@@ -588,6 +588,300 @@ pub fn build_bn_plane_regcmd(shape: &BnPlaneShape, bufs: &BnPlaneBuffers) -> Vec
     cmds
 }
 
+/// Element type [`build_plane_gather_regcmd`] writes.
+///
+/// The ALU plane wants `f32` and the MUL plane `fp16`
+/// ([`bn_plane_bytes`], [`bn_mul_plane_bytes`]), so the gather has to be
+/// able to produce either.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum PlaneElement {
+    /// `out_precision = 2`, narrowed by `fp32tofp16_en`. Two bytes per
+    /// channel, four channels short of an atom's worth.
+    Fp16,
+    /// `out_precision = 5`, with `fp32tofp16_en` cleared and the 4-byte
+    /// writer's own `(mc_surf_out, size_e, surf_add)` triple.
+    ///
+    /// **Measured** (`the_fp32_writer_triple_probe`, RK3588 2026-11-24):
+    /// `(0, 1, dst_surf_stride * 2)`. Reading
+    /// `Precision::Fp16Accumulator`'s recipe off `conv.rs` gave `size_e =
+    /// 3` -- its "float rule, size_e = output bytes - 1" -- and that hangs
+    /// the job at the watchdog, as does 7; `surf_add` at twice or half the
+    /// right value writes every other surface or stops after the first.
+    ///
+    /// `conv.rs` is explicit about why one field at a time reads as
+    /// "nothing helps": the three are one writer configuration and "move
+    /// together or not at all". It records two known-good int32 triples --
+    /// `(0, 7, dst_surf_stride * 8)` and `(1, 1, 16)` -- and notes that the
+    /// 8 is the integer-output quirk, "not the float path's natural 1 and
+    /// 2x". This is that 2x, confirmed: the multiplier is 2 and `size_e` is
+    /// 1, with the OW stage bypassed.
+    Fp32,
+}
+
+/// Turns a *strided* width-1 cube into a dense per-channel plane operand.
+///
+/// SOFTMAX.md section 7's bridge, probe S2a. The row maximum is produced by
+/// the PPU, whose writer rounds both cube strides up to four pixels, so a
+/// width-1 pooling output puts channel `c` at `(c / 8) * 64 + (c % 8) * 2`
+/// -- 48 bytes of nothing between consecutive surfaces
+/// (`reduce_width_hw.rs`'s `the_reduced_vector_is_four_pixel_strided_not_dense`).
+/// The BN ALU plane wants a dense `f32` at `channel * 4`. This task is one
+/// DPU pass-through that closes both gaps at once: it reads the strided
+/// cube and writes a dense one, converting the element type on the way.
+///
+/// The two mechanisms it leans on, both **unconfirmed here** before S2a:
+///
+/// * `RDMA_SURF_NOTCH.surf_notch_addr`, "number of pixels from the end of
+///   this process's feature map to the end of the underlying shape's
+///   feature map" -- `input_surface_pixels - 1` of slack per surface. The
+///   register is zero in every other builder in this crate.
+/// * `PlaneElement::Fp32`'s writer, above.
+///
+/// Why a width-1 *output* cube is dense, which is the half that needs no
+/// probe: `DST_SURF_STRIDE` and `SURFACE_ADD` count 16-byte atoms, so at
+/// width 1 each surface is exactly one atom and surfaces are consecutive.
+/// Channel `c` then lands at `(c / lanes) * 16 + (c % lanes) * bytes`,
+/// which is `c * bytes` for both lane counts -- 8 lanes at fp16, 4 at fp32.
+// Straight-line hardware register program; hand-transcribing it into a
+// `vec![]` literal risks a copy/reorder mistake silently miscoding a register.
+#[allow(clippy::vec_init_then_push)]
+pub fn build_plane_gather_regcmd(
+    channels: u32,
+    input_surface_pixels: u32,
+    element: PlaneElement,
+    input_addr: u32,
+    output_addr: u32,
+) -> Vec<RegCmd> {
+    assert!(
+        channels > 0,
+        "build_plane_gather_regcmd: channels must be nonzero"
+    );
+    assert!(
+        input_surface_pixels > 0,
+        "build_plane_gather_regcmd: a surface holds at least the one pixel being read"
+    );
+    let task_channels = channels
+        .max(FEATURE_ATOMIC_SIZE)
+        .next_multiple_of(FEATURE_ATOMIC_SIZE);
+    let fp32 = element == PlaneElement::Fp32;
+    // The 4-byte writer's triple, measured rather than derived -- see
+    // `PlaneElement::Fp32`. At width 1 the surface stride is one atom, so
+    // the fp32 multiplier of 2 makes `surf_add` 2. The fp16 pass-throughs
+    // in this crate leave both at their one-atom values.
+    let size_e = if fp32 { 1 } else { 0 };
+    let dst_surf_stride = 1;
+    let surf_add = if fp32 {
+        dst_surf_stride * 2
+    } else {
+        dst_surf_stride
+    };
+
+    let mut cmds: Vec<RegCmd> = Vec::new();
+
+    cmds.push(
+        Register::<DpuSPointer>::new()
+            .pointer_pp_mode(Bits::new(1))
+            .executer_pp_en(Bits::new(1))
+            .pointer_pp_en(Bits::new(1))
+            .build(),
+    );
+    cmds.push(
+        Register::<DpuRdmaSPointer>::new()
+            .pointer_pp_mode(Bits::new(1))
+            .executer_pp_en(Bits::new(1))
+            .pointer_pp_en(Bits::new(1))
+            .build(),
+    );
+
+    cmds.push(
+        Register::<DpuFeatureModeCfg>::new()
+            .flying_mode(Bits::new(1))
+            .output_mode(Bits::new(2))
+            .burst_len(Bits::new(15))
+            .build(),
+    );
+    cmds.push(
+        Register::<DpuDataFormat>::new()
+            .in_precision(Bits::new(2))
+            .out_precision(Bits::new(if fp32 { 5 } else { 2 }))
+            .proc_precision(Bits::new(2))
+            // The parallel writer, not the serial one: `(1, 1, 16)` is a
+            // different writer and hangs here.
+            .mc_surf_out(Bits::new(0))
+            .build(),
+    );
+
+    cmds.push(zero::<DpuOffsetPend>());
+    cmds.push(
+        Register::<DpuDstBaseAddr>::new()
+            .dst_base_addr(Bits::new(output_addr))
+            .build(),
+    );
+    // Width 1, height 1: one atom per surface, surfaces consecutive.
+    cmds.push(
+        Register::<DpuDstSurfStride>::new()
+            .dst_surf_stride(Bits::new(dst_surf_stride))
+            .build(),
+    );
+    cmds.push(zero::<DpuDataCubeWidth>());
+    cmds.push(zero::<DpuDataCubeHeight>());
+    cmds.push(zero::<DpuDataCubeNotchAddr>());
+    cmds.push(
+        Register::<DpuDataCubeChannel>::new()
+            .orig_channel(Bits::new(channels - 1))
+            .channel(Bits::new(task_channels - 1))
+            .build(),
+    );
+
+    cmds.push(
+        Register::<DpuBsCfg>::new()
+            .bs_bypass(Bits::new(1))
+            .bs_alu_bypass(Bits::new(1))
+            .bs_mul_bypass(Bits::new(1))
+            .bs_relu_bypass(Bits::new(1))
+            .build(),
+    );
+    cmds.push(zero::<DpuBsAluCfg>());
+    cmds.push(zero::<DpuBsMulCfg>());
+    cmds.push(zero::<DpuBsReluxCmpValue>());
+    cmds.push(
+        Register::<DpuBsOwCfg>::new()
+            .size_e_0(Bits::new(size_e))
+            .size_e_1(Bits::new(size_e))
+            .size_e_2(Bits::new(size_e))
+            .od_bypass(Bits::new(1))
+            .build(),
+    );
+    cmds.push(zero::<DpuBsOwOp>());
+    cmds.push(
+        Register::<DpuWdmaSize0>::new()
+            .channel_wdma(Bits::new(task_channels - 1))
+            .build(),
+    );
+    cmds.push(zero::<DpuWdmaSize1>());
+
+    cmds.push(
+        Register::<DpuBnCfg>::new()
+            .bn_bypass(Bits::new(1))
+            .bn_alu_bypass(Bits::new(1))
+            .bn_mul_bypass(Bits::new(1))
+            .bn_relu_bypass(Bits::new(1))
+            .build(),
+    );
+    cmds.push(zero::<DpuBnAluCfg>());
+    cmds.push(zero::<DpuBnMulCfg>());
+    cmds.push(zero::<DpuBnReluxCmpValue>());
+
+    cmds.push(
+        Register::<DpuEwCfg>::new()
+            .ew_bypass(Bits::new(1))
+            .ew_op_bypass(Bits::new(1))
+            .ew_op_cvt_bypass(Bits::new(1))
+            .ew_lut_bypass(Bits::new(1))
+            .ew_relu_bypass(Bits::new(1))
+            .build(),
+    );
+    cmds.push(zero::<DpuEwCvtOffsetValue>());
+    cmds.push(
+        Register::<DpuEwCvtScaleValue>::new()
+            .ew_op_cvt_scale(Bits::new(1))
+            .build(),
+    );
+    cmds.push(zero::<DpuEwReluxCmpValue>());
+
+    cmds.push(zero::<DpuOutCvtOffset>());
+    cmds.push(
+        Register::<DpuOutCvtScale>::new()
+            .fp32tofp16_en(Bits::new(u32::from(!fp32)))
+            .out_cvt_scale(Bits::new(1))
+            .build(),
+    );
+    cmds.push(zero::<DpuOutCvtShift>());
+
+    cmds.push(zero::<DpuEwOpValue0>());
+    cmds.push(zero::<DpuEwOpValue1>());
+    cmds.push(zero::<DpuEwOpValue2>());
+    cmds.push(zero::<DpuEwOpValue3>());
+    cmds.push(zero::<DpuEwOpValue4>());
+    cmds.push(zero::<DpuEwOpValue5>());
+    cmds.push(zero::<DpuEwOpValue6>());
+    cmds.push(zero::<DpuEwOpValue7>());
+    cmds.push(
+        Register::<DpuSurfaceAdd>::new()
+            .surf_add(Bits::new(surf_add))
+            .build(),
+    );
+    cmds.push(zero::<DpuReserved40c4>());
+
+    cmds.push(zero::<DpuLutAccessCfg>());
+    cmds.push(zero::<DpuLutAccessData>());
+    cmds.push(zero::<DpuLutCfg>());
+    cmds.push(zero::<DpuLutInfo>());
+    cmds.push(zero::<DpuLutLeStart>());
+    cmds.push(zero::<DpuLutLeEnd>());
+    cmds.push(zero::<DpuLutLoStart>());
+    cmds.push(zero::<DpuLutLoEnd>());
+    cmds.push(zero::<DpuLutLeSlopeScale>());
+    cmds.push(zero::<DpuLutLeSlopeShift>());
+    cmds.push(zero::<DpuLutLoSlopeScale>());
+    cmds.push(zero::<DpuLutLoSlopeShift>());
+
+    cmds.push(zero::<DpuRdmaDataCubeWidth>());
+    cmds.push(zero::<DpuRdmaDataCubeHeight>());
+    cmds.push(
+        Register::<DpuRdmaDataCubeChannel>::new()
+            .channel(Bits::new(task_channels - 1))
+            .build(),
+    );
+    cmds.push(
+        Register::<DpuRdmaSrcBaseAddr>::new()
+            .src_base_addr(Bits::new(input_addr))
+            .build(),
+    );
+    cmds.push(zero::<DpuRdmaBrdmaCfg>());
+    cmds.push(zero::<DpuRdmaBsBaseAddr>());
+    cmds.push(zero::<DpuRdmaNrdmaCfg>());
+    cmds.push(zero::<DpuRdmaBnBaseAddr>());
+    cmds.push(
+        Register::<DpuRdmaErdmaCfg>::new()
+            .erdma_disable(Bits::new(1))
+            .build(),
+    );
+    cmds.push(zero::<DpuRdmaEwBaseAddr>());
+    cmds.push(zero::<DpuRdmaEwSurfStride>());
+
+    cmds.push(
+        Register::<DpuRdmaFeatureModeCfg>::new()
+            .flying_mode(Bits::new(1))
+            .burst_len(Bits::new(15))
+            .in_precision(Bits::new(2))
+            .proc_precision(Bits::new(2))
+            .mrdma_fp16tofp32_en(Bits::new(1))
+            .build(),
+    );
+    cmds.push(zero::<DpuRdmaSrcDmaCfg>());
+    // The slack this task exists for: the pixels between the one being
+    // read and the end of the underlying surface.
+    cmds.push(
+        Register::<DpuRdmaSurfNotch>::new()
+            .surf_notch_addr(Bits::new(input_surface_pixels - 1))
+            .build(),
+    );
+    cmds.push(zero::<DpuRdmaPadCfg>());
+    cmds.push(
+        Register::<DpuRdmaWeight>::new()
+            .e_weight(Bits::new(1))
+            .n_weight(Bits::new(1))
+            .b_weight(Bits::new(1))
+            .m_weight(Bits::new(1))
+            .build(),
+    );
+    cmds.push(zero::<DpuRdmaEwSurfNotch>());
+
+    push_kick(&mut cmds, KICK_DPU | KICK_DPU_RDMA);
+    cmds
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -742,6 +1036,51 @@ mod tests {
             buffer[12..].iter().all(|&b| b == 0),
             "padded tail must be zeroed: NRDMA fetches all 16 programmed channels"
         );
+    }
+
+    /// The 4-byte writer's measured triple, pinned so a regression shows
+    /// up here rather than as a watchdog kill on the board. Three of the
+    /// four neighbouring values hang the job and the fourth writes every
+    /// other surface, so these are not free choices -- see
+    /// `PlaneElement::Fp32`.
+    #[test]
+    fn the_fp32_gather_programs_the_measured_writer_triple() {
+        let cmds = build_plane_gather_regcmd(32, 4, PlaneElement::Fp32, 0x1000, 0x2000);
+        // DATA_FORMAT: out_precision 5 at bits 31:29, mc_surf_out 0 at bit 3.
+        let format = value_of::<DpuDataFormat>(&cmds);
+        assert_eq!(format >> 29, 5, "out_precision");
+        assert_eq!((format >> 3) & 1, 0, "mc_surf_out: the parallel writer");
+        // BS_OW_CFG: size_e_0 sits at bits 4:2.
+        let ow = value_of::<DpuBsOwCfg>(&cmds);
+        assert_eq!((ow >> 2) & 0x7, 1, "size_e_0");
+        // SURFACE_ADD is twice DST_SURF_STRIDE on the float path. Both
+        // fields sit at bit 4 of their registers.
+        assert_eq!(value_of::<DpuSurfaceAdd>(&cmds) >> 4, 2);
+        assert_eq!(value_of::<DpuDstSurfStride>(&cmds) >> 4, 1);
+        // And the narrowing bit is what distinguishes it from the fp16 arm.
+        assert_eq!(
+            value_of::<DpuOutCvtScale>(&cmds) >> 16 & 1,
+            0,
+            "fp32tofp16_en"
+        );
+
+        let fp16 = build_plane_gather_regcmd(32, 4, PlaneElement::Fp16, 0x1000, 0x2000);
+        assert_eq!(value_of::<DpuDataFormat>(&fp16) >> 29, 2);
+        assert_eq!((value_of::<DpuBsOwCfg>(&fp16) >> 2) & 0x7, 0);
+        assert_eq!(value_of::<DpuSurfaceAdd>(&fp16) >> 4, 1);
+    }
+
+    /// The slack the gather exists to skip.
+    #[test]
+    fn the_gather_programs_the_input_surface_slack() {
+        for pixels in [1u32, 4] {
+            let cmds = build_plane_gather_regcmd(8, pixels, PlaneElement::Fp32, 0x1000, 0x2000);
+            assert_eq!(
+                value_of::<DpuRdmaSurfNotch>(&cmds) >> 4,
+                pixels - 1,
+                "surf_notch_addr is bits 31:4, in pixels"
+            );
+        }
     }
 
     #[test]
