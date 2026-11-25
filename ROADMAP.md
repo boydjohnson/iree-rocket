@@ -876,18 +876,72 @@ tasks rather than twelve times that. It needs no new mechanism: only
 the widest per-channel operand plane any probe had driven, validated
 upward.
 
-**2. Let the two matmuls absorb the softmax's epilogue.** A fused SDPA has
-strictly fewer tasks than its parts, using fusions this repo already has
-from Phase 3 and ISSUES P2:
+**2. Let the two matmuls absorb the softmax's epilogue -- TRIED. The
+mechanism is free; the gate is the coefficient packer** (SOFTMAX.md §11).
+Of the four claims below, the one that matters is hardware-confirmed, one
+contradicts it, and the lever as a whole turns out to be gated by host
+packing rather than by anything on the device.
 
-* the `1/sqrt(d)` scale folds into the QK^T matmul's output converter;
-* the denominator comes free from an all-ones column appended to `V^T`
-  (SOFTMAX.md §1.1), which deletes the five-task sum tree outright;
-* the normalising multiply folds into the PV matmul's BN plane;
-* and if the probabilities stay Q15 with an `int16` PV matmul, both bridge
+* the `1/sqrt(d)` scale folds into the QK^T matmul's output converter.
+  Untested, and worth no softmax task -- it removes a CPU scale. At a head
+  width that is a power of four it should be a pure shift.
+* **the denominator comes free from an all-ones column appended to `V^T`
+  (SOFTMAX.md §1.1). Confirmed on hardware**: worst error 2.44e-3 over 64
+  real ViT-B/16 queries -- five times tighter than the op's own 1.12% --
+  for **no extra job and no extra tile**. It deletes the sum tree, which
+  the per-stage census puts at **11 of 19 tasks at 1792 rows**, about 0.11
+  ms a head, and the 1792-row ceiling with it. Lever 1's batching survives:
+  the max tree and `exp` stay row-parallel, and only the sum moves.
+* ~~the normalising multiply folds into the PV matmul's BN plane~~ --
+  **this contradicts the item above**. If the PV matmul *produces* the
+  denominator, that same matmul's BN plane cannot already carry its
+  reciprocal. The two are alternatives, and at 11 tasks against 1 the
+  all-ones column wins; drop this one.
+* if the probabilities stay Q15 with an `int16` PV matmul, both bridge
   tasks disappear and the `2^-15` folds into that matmul's requant scale.
+  Untested, worth 2 tasks of 19, and SOFTMAX.md §4.2's datapath rule is
+  what decides it.
 
-Projection: about 5 tasks a head where the softmax alone is 13.
+**The gate, now measured.** Every claim needs `P^T` down the *weight* path,
+and `pack_hwcf_to_rocket_weights` runs at **214 MB/s** on the board -- 139x
+slower than `memcpy` of the same bytes. `P^T` costs 0.363 ms a head against
+the 0.11 ms of sum tree it replaces (**3.2x the saving**), or 69 ms of pure
+host permutation per ViT-B/16 inference, none of it cacheable because these
+coefficients are activations. On those numbers lever 2 loses.
+
+**But that is the packer, not the design.** The same byte order written as
+strided runs -- checked byte-identical against the real packer at eight
+shapes, still safe Rust -- runs at **1,602 MB/s**, 7.5x faster, which puts
+`P^T` at 0.42x the sum tree and turns the loss into a win by better than
+two to one. So:
+
+> the mechanism is confirmed and free, the lever is viable, and it is gated
+> entirely on a packer that is 7.5x off its own achievable speed.
+
+**That gate is worth more than this lever is**, and ISSUES C15 had already
+found it: "288 fresh packs per inference, ~0.16 ms each, ~45 ms", for
+exactly the reason that attention's right-hand operands are activations and
+can never hit the weight cache. C15's attention arm cost 95 ms more than
+its default; at 7.5x, packing's ~45 ms of that becomes ~6 ms, recovering
+**39 ms, or 41% of the loss**. That does not flip C15 by itself -- `record`
+(+41.7), `wait.npu` (+33.0) and `compact` (+35.6) are the rest, and C15's
+conclusion that the *shape* has to improve still stands -- but it is the
+largest single nameable piece and the only one a local fix reaches.
+`weight_cache.rs` records the same packer at 99 ms of a 321 ms MobileNetV2
+run, and §6.3 hoisted constants to compile time for -37 ms cold on
+MobileNetV2 and 1290 -> 551 ms on Wide ResNet50; both of those *avoid* the
+packer rather than fix it, and neither is available to activations. The
+ordering is the packer first, then lever 2 on top of it.
+
+One cost of this lever that SOFTMAX.md §1.2 did not price: the transposed
+form makes the PV weight operand `P^T` (`N x M`) where the untransposed one
+is `V` (`N x d_v`) -- at ViT-B/16, **3.08x the coefficients**, 0.363 ms a
+head against 0.115. The transpose it avoids and the plane tricks it enables
+are real, but they are bought.
+
+Original projection, for the record: about 5 tasks a head where the softmax
+alone is 13. Post-lever-1 the honest form is 8 of 19 tasks per 9-head
+batch, which is what §11.1 measures.
 
 **3. Replace the max reduction with a calibrated bound.** Softmax is
 shift-invariant, so the subtrahend need only be a true *upper bound*, not
@@ -926,8 +980,15 @@ contraction axis is always the input-channel axis. Feeding `P^T` as the
 second matmul's *weights* avoids a transpose -- SOFTMAX.md §1.1 -- but
 means runtime coefficient packing of `N x M` values a head, where packing
 is otherwise a cold-start cost (COMPILER_ROADMAP.md §6.3). A GPU has no
-weight-versus-activation asymmetry and so no equivalent problem. This is
-probably the real gate on a fused SDPA, and it is **unmeasured**.
+weight-versus-activation asymmetry and so no equivalent problem.
+
+**Measured, and it is the real gate** -- lever 2 above and SOFTMAX.md §11.
+0.363 ms a head for `P^T` at 197x197 fp16, 214 MB/s, 69 ms an inference for
+ViT-B/16, none of it cacheable. The asymmetry is real and it costs what it
+looks like it costs. What the measurement also found is that 214 MB/s is
+139x off `memcpy` and 7.5x off the same byte order written as strided runs,
+so the gate is the packer's implementation rather than the asymmetry
+itself.
 
 ### The baseline to beat
 
@@ -940,8 +1001,13 @@ attention matmuls already run at about 43% of f32 peak, which is not a
 number an offload beats easily. P10 also has 1.39x still to collect from a
 wider vector tile, so the CPU target moves before any of this lands.
 
-Levers 1 and 2 are the ones worth trying, and C15 is worth re-measuring
-before trusting any projection above.
+Levers 1 and 2 were the ones worth trying, and both have been. Lever 1
+flipped the sign (1.7x faster at 1792 rows). Lever 2's mechanism is
+confirmed and free, and measuring it turned the coefficient packer into the
+next piece of work -- for C15 as much as for attention, since 69 ms an
+inference of uncacheable packing is a plausible share of C15's own loss.
+C15 is still worth re-measuring, and now there is a specific reason to
+expect a different answer afterwards.
 
 ---
 
