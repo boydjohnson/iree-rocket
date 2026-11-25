@@ -150,7 +150,7 @@ and its output has the same shape as its input.
 | row max | PPU max pool, kernel `k x 1`, stride `k x 1` | **exists**, and exact at atol 0 over `N` 8..512 as a tree in one job, probe S2 (`reduce_width_hw.rs`) |
 | max over tiles | `EwBinaryOp::Max` on two width-1 cubes | **exists**; oracle-checked on `planck` by `ew_binary_hw.rs:346` and again across ViT's shapes at `:421`. The `EwBinaryOp::Max` doc comment still says "not measured here yet" -- that comment is stale and worth deleting. Needed only for §6's fused form; §5.1's combine does not use it |
 | subtract the max | BN ALU operand from NRDMA, per channel | **exists**, as of probe S1: flat IEEE `f32` at `channel * 4`, broadcast over the cube, `bn_plane_probe_hw.rs` |
-| `exp` | DPU LUT, `LutTable::exp()` | **exists**, `lut_exp_hw.rs` against an oracle; domain needs §3's `input_scale` choice |
+| `exp` | DPU LUT, `LutTable::exp()` | **int8 only**, probe S3: the LUT block's output converter is an integer multiply-shift, so a Q15 table entry cannot leave the task as a fraction. The fp16 task runs and `exp(0)` is exact; everything else needs §3.1's Q15 plan |
 | square (range extension) | `EwBinaryOp::Mul` with both operands the same buffer | **exists**, `ew_binary_hw.rs`, `ew_square_hw.rs` |
 | row sum | depthwise all-ones **3x3 at stride 3** on a height-1 cube; or the all-ones column on the second matmul (§1.1) | **exists**, and exact at atol 0 over `N` 9..512 as a tree in one job, probe S2 (`reduce_width_hw.rs`). The window is 3x3 and not `1 x k` for the reason in §2.2. The avg-pool route is gone at fp16, §2.1 |
 | reciprocal | `LutTable::reciprocal()` + one Newton step | **exists**, `lut_reciprocal_hw.rs`; domain needs §4 |
@@ -238,7 +238,7 @@ since the channel count and kernel do not change
 
 ---
 
-## 3. `exp`: the domain is already a free parameter
+## 3. `exp`: an int8 block, and the domain is not the problem
 
 `LutTable::exp()` carries the real captured vendor `EXP_LE` table and
 `EXP_LUT_BN_SCALE_K = 3276.7184`, fit against that table's own content
@@ -253,6 +253,56 @@ is not fixable in the Q15 entry encoding, because `exp(x) > 1` for any
 > something greater than 1. The error does not announce itself and the later
 > rescale cannot correct it. Every "cheap approximate max" shortcut is
 > therefore closed. Use a real reduction.
+
+### 3.1 What probe S3 found, and what it overturns
+
+The rest of this section was written before the `exp` step had been run on
+anything but int8, and S3 overturned most of it. Two measured facts, the
+second decisive:
+
+**The LUT block is int8, and this repo's build of it is int8 everywhere.**
+`build_lut_regcmd` programs neither `in_precision`, `out_precision`,
+`proc_precision` nor `mrdma_fp16tofp32_en` anywhere, so all four sit at 0 --
+"Integer 8bit" -- and [`LutShape`][act] carries int8 zero points and
+quantization scales to match. Every table in `activation.rs` has only ever
+run that way, `exp` included. Softmax's `exp` consumes a matmul's **fp16**
+score cube, so `build_lut_fp16_regcmd` sets those four fields the way
+`build_unary_regcmd` sets them for its own fp16 datapath. The task runs, in
+milliseconds, and `exp(0)` comes back exactly 1.0 -- so the fp16 cube does
+reach the table.
+
+**But `OUT_CVT` is an integer multiply-shift, so a Q15 table entry cannot
+leave the task as a fraction.** The entries are `real_value * 32768`, a
+fixed-point encoding independent of any op's quantization, and recovering a
+real number means multiplying by `1/32768`. At `(scale 1, shift 15)` the
+entry for `exp(0)`, 32768, comes out as exactly 1.0 while the LE table's
+edge entry, 221, comes out as exactly **0** -- `221 >> 15` in integer
+arithmetic, against 0.00674 in real arithmetic. That is decisive on its own
+and independent of everything below
+(`out_cvt_cannot_turn_a_q15_entry_into_a_fraction`).
+
+So **the `exp` step's output is a fixed-point Q15 integer, not an fp16
+probability**, and §7 has to deal with that. The promising direction is to
+carry it: softmax is a ratio, so a constant factor of 32768 in both the
+numerator and the denominator cancels, and the sum reduction of §2.2 could
+run on the Q15 values as well. What that costs is the design's remaining
+open question -- it is now the first thing S5 has to answer, ahead of §4's
+reciprocal.
+
+A second problem is recorded but not diagnosed: at `input_scale = 1` the
+index reaches the table's edge by `x` of about `-1.2e-4`, where the
+multiplier below predicts `-5.0`, so the effective multiplier is four
+orders of magnitude too large. Two mechanisms were tried and neither fits
+(see `the_fp16_index_does_not_track_the_real_value`). It is not on the
+critical path while the converter finding stands, since both would have to
+be solved to keep `exp` in fp16 and only one of them has to be solved to
+move to Q15.
+
+### 3.2 The domain arithmetic, corrected
+
+Everything here still describes the table; what has changed is that the
+"stored value" is an int8 code rather than an fp16 number, and that the
+conclusion at the end was wrong.
 
 The table is indexed in a fixed-point domain `[-16384, 0)` for the `LE` half,
 and the hardware maps a stored element to that domain by `index = x *
@@ -273,14 +323,20 @@ mass against a denominator of at least 1. **The default configuration is
 unusable for softmax**, which is worth saying out loud because `exp()` reads
 as ready.
 
-`input_scale = 1/2` plus one squaring is the right choice, and the reason it
-is *exactly* right is that it also fixes the output side. A table entry is
-Q15 (`32767` = 1.0), so the smallest nonzero `exp` the table can return is
-`3.05e-5` -- the useful input range is bounded by the output encoding at
-about `x = -10.4`, not by the input domain. Squaring `exp(x/2)` pushes the
-representable floor to `exp(-20.8) = 9e-10` and the clamp edge to `-20`,
-which reach the same place. Going to `input_scale = 1/4` buys domain the
-output encoding cannot express.
+`input_scale = 1/2` plus one squaring remains the right choice, but the
+reason given here was wrong and worth correcting rather than deleting. The
+claim was that the useful range is bounded by the Q15 *output* encoding at
+about `x = -10.4` rather than by the input domain, so a wider domain buys
+nothing. Arithmetic alone refutes it: the table's edge entry is
+`round(exp(-5) * 32768) = 221`, nowhere near the Q15 floor of 1, so nothing
+inside the table underflows and **the domain edge binds first at every
+scale**. Below the edge the output is a flat clamp at that edge entry,
+`exp(-5) = 6.74e-3`, not a decay toward zero -- which is what makes the
+domain worth buying: at `input_scale = 1/2` with one squaring the clamp
+becomes `(6.74e-3)^2 = 4.54e-5`, which over 384 keys is 0.017 of spurious
+mass against a denominator of at least 1. `input_scale = 1/4` with two
+squarings would take it to `2.1e-9`, and that is real accuracy rather than
+domain the output cannot express.
 
 Accuracy: entry spacing is `32 / K_EXP` in fixed-point domain units, so at
 `input_scale = 1/2` the real-x step is `0.0195` and the 513-entry
@@ -288,8 +344,9 @@ Accuracy: entry spacing is `32 / K_EXP` in fixed-point domain units, so at
 doubles it to `1e-4`. fp16's own epsilon is `9.8e-4`, so the LUT is not the
 limiting term.
 
-**No table regeneration is needed.** This is a `LutShape` field and one
-existing EW task. (If a later pass wants to avoid the squaring dispatch, a
+**No table regeneration is needed for the domain.** It is a `LutShape`
+field and one existing EW task -- though §3.1 means neither is reachable at
+fp16 as things stand. (If a later pass wants to avoid the squaring dispatch, a
 self-derived `EXP_LE` over `[-11, 0]` is the move -- the `LE` half has no
 encoding obstacle at all, unlike `LO`, and `square()`/`erf()`/`sqrt()`
 established the methodology. It is an optimisation, not a prerequisite.)
@@ -514,7 +571,7 @@ the whole of this is **one job's ordered task array** under structure A
 pass 1   PPU max pool, kernel k x 1, per tile  [N, M] -> [tiles, M]
            tiles write disjoint width slices of one shared cube (§5.1)
          PPU max pool, kernel tiles x 1        [tiles, M] -> [1, M]    m
-pass 2   DPU LUT task, flying mode:
+pass 2   DPU LUT task, flying mode:            <-- see §3.1: Q15 output
            BN ALU operand <- NRDMA, -m per channel
            input_scale = 1/2, LutTable::exp()
            -> u = exp((x - m)/2)               [N, M] -> [N, M]
@@ -714,10 +771,36 @@ halves were tested separately so a failure would localise:
   pass-2 edge, and it is the claim S2a exists to support rather than either
   half on its own.
 
-**S3 -- `exp` over the real domain.** Extend `lut_exp_hw.rs` with
-`input_scale = 1/2` plus `EwBinaryOp::Mul(u, u)`, oracle-checked across
-`x - m` in `[-21, 0]`, and assert the clamp edge and the Q15 floor land where
-§3 says. This is a test, not new code.
+**S3 -- `exp` over the real domain. DONE 2026-11-24, and it is the one
+probe that came back negative** (`activation::build_lut_fp16_regcmd`,
+`lut_exp_fp16_hw.rs`). This step was written as "a test, not new code",
+which was wrong twice over.
+
+The first surprise cost nothing: the LUT path in this crate is **int8**, on
+both the DPU and the RDMA side, and none of its six tables has ever run
+otherwise. So the probe had to build the fp16 variant before it could
+measure anything. That variant works as far as the table: the job completes
+in milliseconds and `exp(0)` is exactly 1.0.
+
+The second is the finding. **`OUT_CVT` is an integer multiply-shift**, so
+the table's `real_value * 32768` entries cannot be divided back down inside
+the task: at `(1, 15)` the entry for `exp(0)` survives as 1.0 while the LE
+edge entry, 221, becomes exactly 0. The `exp` step's output is a Q15
+integer, not an fp16 probability. §3.1 has the consequence and the
+direction out of it -- softmax is a ratio, so a constant 32768 cancels --
+and §9 carries it as the design's open question.
+
+A separate mis-indexing was measured and deliberately not diagnosed: the
+index reaches the table edge four orders of magnitude earlier than the
+multiplier predicts. Both would have to be solved to keep `exp` in fp16;
+only the converter has to be solved to move to Q15, so that is where the
+effort belongs.
+
+What S3 did confirm from §3 is the *shape* of the domain argument, and it
+corrected its conclusion: the clamp below the edge is the table's edge
+entry, `exp(-5)`, not a decay to zero and not the Q15 floor, so buying
+domain with `input_scale` buys real accuracy. §3.2 has the corrected
+numbers.
 
 **S4 -- the reciprocal.** `softmax_reciprocal_hw.rs`: widened table, Newton
 step, oracle across `d` in `[1, 512]`. Pick option 2 from §4 first; fall back
@@ -756,9 +839,20 @@ precisely the form this hardware cannot run.
   sub-stage per task and does not need it; a fused op that wanted
   `relu(a * x + b)` in one pass would, and should start from
   `bn_plane_add_then_mul_fit`'s dump rather than a fresh sweep.
-* **The Q15 `exp` floor is not where §3 computes it.** The `out_cvt` scalar
-  scale may interact with the entry encoding in a way the existing tests do
-  not pin down. S3 settles it.
+* ~~**The Q15 `exp` floor is not where §3 computes it.**~~ Settled by S3,
+  against the design: the floor is not the binding constraint at all, and
+  the real one is worse. `OUT_CVT` is an integer multiply-shift, so the
+  `exp` step cannot emit a fractional value -- its output is a Q15 integer.
+* **Whether §7 can run on Q15 probabilities is now the open question**, and
+  the biggest one left. Softmax is a ratio, so a constant 32768 cancels
+  between the numerator and the denominator, and §2.2's sum reduction is a
+  convolution that could run on the integers. What has to be checked is the
+  dynamic range -- a Q15 probability has 15 bits and the sum of up to `N`
+  of them needs `log2(N)` more, which the DPU's int32 accumulator has --
+  and what the BN MUL plane wants for the final divide, since S1 measured
+  that operand as fp16 rather than fixed point. If it does not work, the
+  `exp` step needs a quantize/dequantize pair around it and §7 grows two
+  passes.
 * **The fused-attention win does not survive measurement.** C15 measured
   unbatched attention at 1.16x (ViT-B) to 1.41x (BERT-384) *slower*, and the
   CPU spends little on attention. This design removes softmax and the

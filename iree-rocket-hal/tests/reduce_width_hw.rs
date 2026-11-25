@@ -697,8 +697,9 @@ fn run_sum_reduction(stages: &[conv::Shape], channels: u32) -> Option<Vec<f32>> 
         );
     }
     let mut dense = vec![0u8; channels as usize * kh * kw * 2];
-    for slot in dense.chunks_exact_mut(2) {
-        slot.copy_from_slice(&f32_to_f16(1.0).to_le_bytes());
+    let one = f32_to_f16(1.0).to_le_bytes();
+    for slot in dense.chunks_mut(2) {
+        slot.copy_from_slice(&one);
     }
     let mut packed = vec![0u8; weight_bytes];
     pack_depthwise_to_rocket_weights(
