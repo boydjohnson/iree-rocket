@@ -1962,7 +1962,10 @@ point of the table -- `check_binary_is_current` in that harness warns about
 exactly this.
 
 **`ROCKET_PROFILE` at 11 repetitions, same module, same pinning, shows the
-change is confined to one phase** -- which is what makes this a controlled
+change is confined to one phase** -- these are one profile's totals over its
+repetition count, which is fine for a *difference between two packers* on one
+arm and not fine for attributing the arm's own cost, which is done further
+down -- which is what makes this a controlled
 result rather than two walls that happened to differ:
 
 | phase, ms an inference | per-coefficient | strided | delta |
@@ -2024,18 +2027,54 @@ case.**
 the loss** -- SOFTMAX.md section 11.4 predicted 39 ms and 41% from the
 prototype at one shape, so the projection was good to within the in-situ
 factor. It is still the largest single nameable piece of the delta and still
-not enough to flip the sign. What is left, per inference: `record` +22.8,
-`compact` +25.0, `wait.npu` +17.8, `pack.input` +8.9 -- none of which the
-packer touches.
+not enough to flip the sign.
 
-And the benefit side is unchanged, which is the real verdict. Moving the
-*entire* attention core onto the NPU takes `outside` from 108.2 ms to 106.0:
-**about 2 ms of CPU time bought for 61 ms spent.** The f32 ViT measurement
-above bought 3 ms for 125; the shapes, the precision, the board and nine
-weeks of per-dispatch work have all changed, and the answer has not. The
-conclusion stands as written: attention offload needs a better *shape* -- a
-batched descriptor, or fusing the pair so the intermediate never lands -- not
-a cheaper tax.
+**Where the remaining 61 ms sits, taken as marginal cost rather than from one
+profile.** Section 4 of COMPILER_ROADMAP.md retracted its own `record`
+numbers for a reason that applies here: `record` is mostly `CREATE_BO`, the
+`mmap` and the first-touch page faults, paid once per buffer rather than once
+per dispatch, so dividing one profile's total by its repetition count charges
+a per-process cost to every inference. Taking the difference between 11 and
+31 repetitions removes it:
+
+| phase, ms an inference | default | `--batch-matmul` | marginal delta | naive at 11 reps |
+|---|---:|---:|---:|---:|
+| `outside` | 108.32 | 108.31 | **-0.02** | -2.31 |
+| `compact` | 3.05 | 27.58 | +24.52 | +24.98 |
+| `record` | 3.20 | 21.94 | **+18.74** | +22.74 |
+| `wait.npu` | 83.82 | 101.10 | +17.28 | +17.87 |
+| `pack.weights` | 0 | 11.10 | +11.10 | +10.86 |
+| `pack.input` | 3.27 | 12.32 | +9.05 | +9.85 |
+| everything else | 2.74 | 7.72 | +4.99 | +4.96 |
+
+Two of those columns differ in ways worth naming. `record` is 18.7 marginal
+against 22.7 naive, so about 4 ms an inference of what the first table read
+as a per-dispatch tax was section 4's amortizing allocation -- the trap is
+real, and on this arm it is modest. `pack.weights`, by contrast, is 11.10
+marginal against 10.86 naive: it does **not** amortize, which is the direct
+confirmation that attention's packs are per-inference work and the central
+claim of this entry.
+
+**The phase deltas are an upper bound, because instrumenting them costs
+something.** They sum to +85.7 ms against a profiled wall delta of +87.3,
+so the table is internally consistent -- but the *un*-profiled warm median
+delta is 61 ms. The default arm's profiled marginal wall is 205.3 ms against
+a 205 ms median, i.e. free; the offloaded arm's is 292.7 against 266, because
+`ROCKET_PROFILE` times ten phases per dispatch and this arm has 338 of them
+rather than 50. So scale the column by 61/87 for each phase's real share:
+`compact` ~17, `record` ~13, `wait.npu` ~12, `pack.weights` ~8,
+`pack.input` ~6. The ordering is what matters and it does not change --
+`compact` and `record` lead, and packing is now third.
+
+And the benefit side is the real verdict, which this sharpens rather than
+softens. Moving the *entire* attention core onto the NPU changes `outside`
+by **-0.02 ms an inference**: not the ~2 ms the single-profile reading
+suggested, but **nothing measurable at all, for 61 ms spent.** The f32 ViT
+measurement above bought 3 ms for 125; the shapes, the precision, the board
+and nine weeks of per-dispatch work have all changed, and the answer has
+only got cleaner. The conclusion stands as written: attention offload needs
+a better *shape* -- a batched descriptor, or fusing the pair so the
+intermediate never lands -- not a cheaper tax.
 
 ## P10 (S3) — IREE compiles the CPU softmax with a 4-wide vector tile; a 16-wide tile is bit-identical and 1.39x faster, and nothing in this stack can set it
 
