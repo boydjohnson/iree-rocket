@@ -865,15 +865,15 @@ from being a verdict: the CPU arm is one core where IREE would thread it,
 and it is scalar Rust rather than IREE's codegen -- SOFTMAX.md §10.4 has
 both. The rest of this bullet is the original reasoning.
 
-This is the inversion, and the largest factor available. Cost is per task and arithmetic is free, so
-each task should be as *large* as the planner allows rather than as small
-as a cache. SOFTMAX.md §1.1 puts queries on the channel axis, so a ViT
+This is the inversion, and the largest factor available. Cost is per
+task and arithmetic is free, so each task should be as *large* as the
+planner allows rather than as small as a cache. SOFTMAX.md §1.1 puts queries on the channel axis, so a ViT
 layer's twelve heads is `12 x 197 = 2364` channels -- inside the 13-bit
 `DPU_DATA_CUBE_CHANNEL` and `PPU` extent fields, and inside the 3584-to-4096
 ceilings this file's own section records. A layer's softmax would be ~13
 tasks rather than twelve times that. It needs no new mechanism: only
-`rocket_core::softmax`'s `rows` refusal, which stands at 64 because 64 is
-the widest per-channel operand plane any probe has driven, validated
+`rocket_core::softmax`'s `rows` refusal, which stood at 64 because 64 was
+the widest per-channel operand plane any probe had driven, validated
 upward.
 
 **2. Let the two matmuls absorb the softmax's epilogue.** A fused SDPA has
