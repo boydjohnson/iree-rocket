@@ -1083,18 +1083,8 @@ precisely the form this hardware cannot run.
 
 ## 9. What would falsify this
 
-* **Nothing here is a performance measurement.** Every number in this
-  document is accuracy or task count; no arm of it has been timed against
-  anything. That is the largest gap, and ISSUES.md's **P10** now gives the
-  figure to beat: on BLIP fp16 the f32 CPU softmax is **24% of the A76
-  cycles**, and a 16-wide vector tile is bit-identical and 1.39x faster on
-  the standalone kernel, worth about 33 ms per inference. So the CPU side
-  is both a real cost *and* about to get cheaper, and an NPU softmax has to
-  beat the improved one. The pieces to price are already measured: 13
-  device tasks, two host boundaries at 0.037 to 0.059 ms each, and ISSUES
-  P8's flat 1.6 to 7.4 ms per *dispatch* -- which, if a softmax is one
-  dispatch, is the term that decides it. §5's structure A exists to keep
-  that count at one.
+* ~~**Nothing here is a performance measurement.**~~ Measured now, and
+  **it is about 4.4x slower than the CPU** -- §10.
 
 * ~~**S1 comes back dead or fixed-point-only.**~~ Answered 2026-11-24: the
   plane carries a per-channel float on both sub-stages. The fallback this
@@ -1149,3 +1139,78 @@ precisely the form this hardware cannot run.
 [dpu]: iree-rocket-hal/src/rocket/builders/dpu.rs
 [conv]: iree-rocket-hal/src/rocket/conv.rs
 [bn]: iree-rocket-hal/src/rocket/bn_plane.rs
+
+---
+
+## 10. What it costs, measured
+
+The accuracy question is settled and the performance one is not close.
+`performance` governor, A76 at 2.4 GHz, `rocket_npu_clk_hz` at 600 MHz,
+pinned to the big cluster, 20 iterations after 3 warm-ups per sample,
+buffers and programs built once outside the loop, five samples
+(`softmax_wall_time_against_the_cpu`).
+
+| | ms per softmax, `[64 rows, 197 keys]` |
+|---|---|
+| **NPU, the whole op** | **0.46 - 0.51**, median 0.49 |
+| &nbsp;&nbsp;max tree, 3 tasks | 0.134 |
+| &nbsp;&nbsp;host: maximum into the plane | 0.003 |
+| &nbsp;&nbsp;`exp` + 2 bridge + sum tree, 8 tasks | 0.258 |
+| &nbsp;&nbsp;host: `1/d` | 0.006 |
+| &nbsp;&nbsp;normalise, 1 task | 0.061 |
+| **CPU, plain scalar Rust, same shape** | **0.108 - 0.111** |
+
+The NPU arm varies about 10% run to run; the CPU arm is stable to 3%. The
+breakdown is one representative sample rather than a median of each row.
+
+**The op is 4.1 to 4.7x the CPU's time**, median **4.4x** -- and the CPU
+arm is a scalar Rust loop rather than IREE's codegen, which ISSUES P10
+profiled and which gets a further 1.39x from a wider vector tile. So the
+real gap is larger than 4.4x, not smaller.
+
+**The cost is the task count, not the arithmetic.** 0.49 ms over 13 tasks
+is **35 to 39 microseconds a task**, and S4 measured a bare
+submit-and-wait on the smallest possible job at 0.037 to 0.059 ms. So each
+task costs about what an *empty* one does: the op spends its time on
+completion IRQs, and §5.3's note that "every task boundary costs a
+completion IRQ" turns out to be the whole story rather than a caveat. The
+two host steps, which §4 argued about at length, come to **0.009 ms of
+0.49** -- under 2%, and S4's conclusion was right for a reason that barely
+matters.
+
+### 10.1 Which levers are left
+
+Not accuracy, and not the host. Task count:
+
+* **Rows per task.** 64 rows is not a hardware bound, it is the widest
+  per-channel plane any probe has driven (§8's S5 refusal). A ViT head is
+  197 rows, so the same three submissions could carry 3x the work for
+  roughly the same 13 IRQs. This is the biggest single lever and it is a
+  measurement, not a mechanism.
+* **A wider sum window.** The sum tree is 5 of the 13 tasks because the
+  planner backs only a 3x3 stride-3 square window (§2.2). An 8x8 at stride
+  8 would reduce a row in two levels instead of five -- three tasks, about
+  0.11 ms --
+  and `only_an_odd_square_window_can_stride` pins the refusal so that a
+  capture which widened it would show up here.
+* **Fusion into attention.** §1.1's whole argument: inside an attention
+  block the comparison is not against a CPU softmax in isolation but
+  against the CPU doing softmax *plus* the round trips an NPU-resident
+  block avoids. ISSUES C15 measured unbatched attention offload as a loss
+  (1.16x to 1.41x slower) before softmax was available at all, so this is
+  a reason to re-measure C15 rather than a reason to expect a win.
+
+### 10.2 What this means for the op
+
+It stays **off by default**, like ROADMAP.md's Phase 1 and 2 matchers and
+for the same reason -- P8's law, which says an operation doing less work
+than its own dispatch costs belongs behind a flag until something moves the
+dispatch cost. Softmax is a very pure case of it: 12,608 exponentials is
+about 25 KB of traffic and 13 IRQs.
+
+That is not an argument against the work. The decomposition is correct,
+exact where it can be and 1.12% where it cannot, and every mechanism in it
+is measured and reusable -- the operand planes, the Q15 bridge, the int16
+read, the tuned `exp` tail and the width-mapped reduction are all general.
+It is an argument about *where* a softmax should run today, and the answer
+is the CPU until the task count comes down.
