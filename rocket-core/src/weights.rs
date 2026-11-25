@@ -283,6 +283,41 @@ pub fn pack_hwcf_to_rocket_weights(
         output_channels,
         element_size,
         None,
+        false,
+        packed,
+    )
+}
+
+/// [`pack_hwcf_to_rocket_weights`] forced down the per-coefficient
+/// reference path, whatever the element width.
+///
+/// Same bytes, about 7x slower: this is the arm that drives
+/// [`WeightLayout::visit_slots`] one coefficient at a time. It exists so the
+/// two arms can be measured against each other inside one binary -- the
+/// board's rate harness
+/// (`iree-rocket-hal/tests/weight_pack_rate_hw.rs`) quotes both -- and so
+/// the equivalence sweep has a reference that is the real fallback code
+/// rather than a restatement of the layout. Production callers want
+/// [`pack_hwcf_to_rocket_weights`], which routes.
+pub fn pack_hwcf_to_rocket_weights_reference(
+    dense: &[u8],
+    filter_height: usize,
+    filter_width: usize,
+    input_channels: usize,
+    output_channels: usize,
+    element_size: usize,
+    packed: &mut [u8],
+) -> Result<usize, &'static str> {
+    pack_hwcf_to_rocket_weights_impl(
+        dense,
+        filter_height,
+        filter_width,
+        input_channels,
+        output_channels,
+        output_channels,
+        element_size,
+        None,
+        true,
         packed,
     )
 }
@@ -321,6 +356,7 @@ pub fn pack_hwcf_to_rocket_weights_padded(
         padded_output_channels,
         element_size,
         None,
+        false,
         packed,
     )
 }
@@ -502,6 +538,7 @@ pub fn pack_hwcf_to_rocket_weights_affine_i8(
         output_channels,
         1,
         Some(weight_zero_points),
+        false,
         packed,
     )
 }
@@ -516,6 +553,7 @@ fn pack_hwcf_to_rocket_weights_impl(
     padded_output_channels: usize,
     element_size: usize,
     weight_zero_points: Option<&[i8]>,
+    force_reference: bool,
     packed: &mut [u8],
 ) -> Result<usize, &'static str> {
     if padded_output_channels < output_channels {
@@ -541,9 +579,83 @@ fn pack_hwcf_to_rocket_weights_impl(
     if packed.len() < packed_len {
         return Err("Rocket weight destination is smaller than its declared shape");
     }
-    packed[..packed_len].fill(0);
 
     let layout = WeightLayout::new(input_channels, padded_output_channels, element_size * 8)?;
+
+    // The strided fast path produces the same bytes as `visit_slots` and is
+    // about 7x quicker, but only for a *symmetric* 1- or 2-byte element: a
+    // nonzero weight zero point writes a per-output-channel value into the
+    // padding lanes, which is not a permutation of the dense filter at all,
+    // and the 4-byte group geometry it would need is untested. All-zero
+    // zero points are symmetric by definition -- the neutral value and the
+    // zero fill coincide -- so the int8 convolution rungs that carry a zero
+    // point of 0 take the fast path too.
+    let symmetric = weight_zero_points.is_none_or(|points| points.iter().all(|&point| point == 0));
+    if symmetric && !force_reference && matches!(element_size, 1 | 2) {
+        let fill = layout.padded_input_channels != input_channels
+            || layout.programmed_output_channels != output_channels;
+        if fill {
+            packed[..packed_len].fill(0);
+        }
+        if element_size == 1 {
+            pack_dense_striped::<1>(
+                dense,
+                filter_height * filter_width,
+                input_channels,
+                output_channels,
+                &layout,
+                packed,
+            );
+        } else {
+            pack_dense_striped::<2>(
+                dense,
+                filter_height * filter_width,
+                input_channels,
+                output_channels,
+                &layout,
+                packed,
+            );
+        }
+        return Ok(packed_len);
+    }
+
+    pack_dense_visited(
+        dense,
+        filter_height,
+        filter_width,
+        input_channels,
+        output_channels,
+        element_size,
+        weight_zero_points,
+        &layout,
+        &mut packed[..packed_len],
+    );
+
+    Ok(packed_len)
+}
+
+/// The original per-coefficient packer: one closure call per destination
+/// slot, driving [`WeightLayout::visit_slots`].
+///
+/// This is the fallback and the reference. It is what every hardware
+/// validation in the tree was taken against, it is the only arm that can
+/// write a nonzero weight zero point into a padding lane, and it is the only
+/// arm that knows tf32's different group geometry -- so it stays, and
+/// `mod tests`'s sweep compares the fast path against it rather than against
+/// a restatement of the layout.
+#[allow(clippy::too_many_arguments)]
+fn pack_dense_visited(
+    dense: &[u8],
+    filter_height: usize,
+    filter_width: usize,
+    input_channels: usize,
+    output_channels: usize,
+    element_size: usize,
+    weight_zero_points: Option<&[i8]>,
+    layout: &WeightLayout,
+    packed: &mut [u8],
+) {
+    packed.fill(0);
     layout.visit_slots(
         filter_height,
         filter_width,
@@ -567,8 +679,79 @@ fn pack_hwcf_to_rocket_weights_impl(
             }
         },
     );
+}
 
-    Ok(packed_len)
+/// [`WeightLayout::visit_slots`]'s coefficient order, written as strided
+/// runs instead of per-element visits.
+///
+/// Why it is faster is the whole point, so it is worth stating: for a fixed
+/// `(output block, input group, filter position, output lane)` the
+/// destination coefficients are **contiguous** -- one run of
+/// `input_group_channels` slots -- and the dense elements that fill them sit
+/// a **constant stride** of `output_channels` apart, because HWCF puts the
+/// output channel last. So the innermost loop becomes one zipped pair of
+/// fixed-size chunk iterators over a pair of slices whose bounds were
+/// checked once, rather than a closure invoked once per coefficient that
+/// recomputes two multiplies and bounds-checks a one-element
+/// `copy_from_slice`. On the board that is 214 MB/s against about 1.6 GB/s
+/// (SOFTMAX.md section 11.3); using `as_chunks` rather than `chunks_exact`
+/// is itself worth 1.6x of it, which is a fair measure of how much of the
+/// original cost was bounds checking.
+///
+/// Callers must have zero-filled `packed` unless the shape has no padding
+/// lane at all: lanes past `input_channels`, and output kernels past
+/// `output_channels` up to the programmed count, are not written here.
+///
+/// `E` is the element size in bytes. Only 1 and 2 are instantiated, which
+/// is int8 and the whole 2-byte family; see
+/// [`pack_hwcf_to_rocket_weights_impl`] for why the others stay on
+/// `visit_slots`.
+fn pack_dense_striped<const E: usize>(
+    dense: &[u8],
+    taps: usize,
+    input_channels: usize,
+    output_channels: usize,
+    layout: &WeightLayout,
+    packed: &mut [u8],
+) {
+    let mut slot = 0usize;
+    for output_block in 0..layout.output_blocks {
+        for input_group in 0..layout.input_groups {
+            let group_base = input_group * layout.input_group_channels;
+            // Slots this group occupies per output lane, and how many of
+            // them the filter actually reaches.
+            let lanes = layout
+                .input_group_channels
+                .min(layout.padded_input_channels - group_base);
+            let live = lanes.min(input_channels.saturating_sub(group_base));
+            for tap in 0..taps {
+                for output_lane in 0..layout.output_block_channels {
+                    let output_channel = output_block * layout.output_block_channels + output_lane;
+                    if output_channel >= layout.programmed_output_channels {
+                        // Past the programmed count: no slot at all, which
+                        // is why `slot` does not advance here.
+                        continue;
+                    }
+                    if output_channel < output_channels && live > 0 {
+                        let source_base = ((tap * input_channels + group_base) * output_channels
+                            + output_channel)
+                            * E;
+                        let destination = &mut packed[slot * E..(slot + live) * E];
+                        let source = &dense[source_base..];
+                        for (out, value) in destination
+                            .as_chunks_mut::<E>()
+                            .0
+                            .iter_mut()
+                            .zip(source.as_chunks::<E>().0.iter().step_by(output_channels))
+                        {
+                            *out = *value;
+                        }
+                    }
+                    slot += lanes;
+                }
+            }
+        }
+    }
 }
 
 /// Packs a depthwise filter into the RK3588 CNA coefficient order.
@@ -996,5 +1179,168 @@ mod tests {
             plan.pack(&dense, &mut packed[..8]).unwrap_err().code(),
             PlanErrorCode::InvalidShape
         );
+    }
+
+    /// The strided fast path and the per-coefficient reference must produce
+    /// the same bytes at every shape the fast path claims.
+    ///
+    /// The sweep is not a sample: it is written to hit each edge the layout
+    /// has, and it *asserts* that it hit them, because every one of them is
+    /// an edge a shape sweep can silently miss (the depthwise grouping bug
+    /// and the int4 N-group trap in this file's own doc comments were both
+    /// missed exactly that way). The four, with the shapes that reach them:
+    ///
+    /// * a partial final input group -- `Cin` not a multiple of 32;
+    /// * the 3-mod-4 input-atom bump, which belongs to the 2-byte family
+    ///   alone -- `Cin` in 33..=48 or 97..=112 at two bytes;
+    /// * a partial final output block -- `Cout` not a multiple of the
+    ///   block's 16 (fp16) or 32 (int8) kernels;
+    /// * `padded_output_channels` strictly greater than `output_channels`,
+    ///   the parity-padded accumulator arm.
+    ///
+    /// Both element widths and kernels 1, 3, 5 and 7 run against all of it.
+    /// Every case here has symmetric coefficients and a 1- or 2-byte
+    /// element, which is exactly the routing condition, so each one does
+    /// drive the fast path.
+    #[test]
+    fn the_striped_packer_is_byte_identical_to_the_visited_one() {
+        let mut saw_partial_input_group = false;
+        let mut saw_input_atom_bump = false;
+        let mut saw_partial_output_block = false;
+        let mut saw_output_padding = false;
+
+        for element_size in [1usize, 2] {
+            for [kh, kw] in [[1usize, 1], [3, 3], [5, 5], [7, 7], [1, 3], [7, 1]] {
+                for cin in [1usize, 3, 8, 17, 20, 32, 33, 40, 48, 64, 97, 112, 129, 256] {
+                    for cout in [1usize, 2, 15, 16, 17, 24, 32, 40, 64, 88] {
+                        for extra in [0usize, 1, 2] {
+                            let padded_cout = cout + extra;
+                            let dense_len = kh * kw * cin * cout * element_size;
+                            let dense: Vec<u8> = (0..dense_len)
+                                .map(|i| ((i * 37 + i / 251) % 251 + 1) as u8)
+                                .collect();
+                            let packed_len =
+                                rocket_weight_storage_size(kh, kw, cin, padded_cout, element_size)
+                                    .unwrap();
+
+                            let layout =
+                                WeightLayout::new(cin, padded_cout, element_size * 8).unwrap();
+                            saw_partial_input_group |= !layout
+                                .padded_input_channels
+                                .is_multiple_of(layout.input_group_channels);
+                            saw_input_atom_bump |= layout.padded_input_channels
+                                > cin.next_multiple_of(
+                                    FEATURE_ATOMIC_BYTES * 8 / (element_size * 8),
+                                );
+                            saw_partial_output_block |= !layout
+                                .programmed_output_channels
+                                .is_multiple_of(layout.output_block_channels);
+                            saw_output_padding |= layout.programmed_output_channels > cout;
+
+                            let mut reference = vec![0xABu8; packed_len];
+                            pack_dense_visited(
+                                &dense,
+                                kh,
+                                kw,
+                                cin,
+                                cout,
+                                element_size,
+                                None,
+                                &layout,
+                                &mut reference,
+                            );
+
+                            let mut fast = vec![0xCDu8; packed_len];
+                            assert_eq!(
+                                pack_hwcf_to_rocket_weights_padded(
+                                    &dense,
+                                    kh,
+                                    kw,
+                                    cin,
+                                    cout,
+                                    padded_cout,
+                                    element_size,
+                                    &mut fast,
+                                )
+                                .unwrap(),
+                                packed_len
+                            );
+
+                            assert!(
+                                fast == reference,
+                                "fast path differs at {kh}x{kw} Cin {cin} Cout {cout} \
+                                 (padded {padded_cout}) element_size {element_size}: \
+                                 first byte {:?}",
+                                fast.iter().zip(reference.iter()).position(|(a, b)| a != b)
+                            );
+                        }
+                    }
+                }
+            }
+        }
+
+        assert!(
+            saw_partial_input_group,
+            "sweep missed a partial input group"
+        );
+        assert!(saw_input_atom_bump, "sweep missed the 3-mod-4 atom bump");
+        assert!(
+            saw_partial_output_block,
+            "sweep missed a partial output block"
+        );
+        assert!(saw_output_padding, "sweep missed programmed output padding");
+    }
+
+    /// An int8 rung whose weight zero point is 0 takes the fast path, and
+    /// the affine packer's output is what it has to match: at a zero point
+    /// of zero the neutral padding value and the zero fill coincide, which
+    /// is the whole argument for routing it.
+    #[test]
+    fn a_zero_weight_zero_point_is_symmetric() {
+        for (cin, cout, k) in [(20usize, 40usize, 1usize), (33, 17, 3), (3, 2, 7)] {
+            let dense: Vec<u8> = (0..k * k * cin * cout)
+                .map(|i| (i % 251 + 1) as u8)
+                .collect();
+            let packed_len = rocket_weight_storage_size(k, k, cin, cout, 1).unwrap();
+
+            let mut affine = vec![0u8; packed_len];
+            pack_hwcf_to_rocket_weights_affine_i8(
+                &dense,
+                k,
+                k,
+                cin,
+                cout,
+                &vec![0i8; cout],
+                &mut affine,
+            )
+            .unwrap();
+
+            let mut fast = vec![0u8; packed_len];
+            pack_hwcf_to_rocket_weights(&dense, k, k, cin, cout, 1, &mut fast).unwrap();
+            assert_eq!(
+                fast, affine,
+                "zero zero point differs at {k}x{k} {cin}->{cout}"
+            );
+
+            // And a nonzero one must *not* be the same bytes, or the
+            // routing condition above is testing nothing.
+            let mut nonzero = vec![0u8; packed_len];
+            pack_hwcf_to_rocket_weights_affine_i8(
+                &dense,
+                k,
+                k,
+                cin,
+                cout,
+                &vec![3i8; cout],
+                &mut nonzero,
+            )
+            .unwrap();
+            if cin % 32 != 0 {
+                assert_ne!(
+                    nonzero, affine,
+                    "a nonzero zero point must reach the padding"
+                );
+            }
+        }
     }
 }
