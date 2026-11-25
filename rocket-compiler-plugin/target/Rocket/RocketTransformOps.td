@@ -68,7 +68,43 @@ def Rocket_MatchAdmittedOp : Op<Transform_Dialect, "rocket.match.admitted",
   let arguments = (ins TransformHandleTypeInterface:$operand_handle,
                        OptionalAttr<StrAttr>:$precision,
                        UnitAttr:$no_offload);
-  let assemblyFormat = "$operand_handle attr-dict `:` type($operand_handle)";
+  let assemblyFormat = "$operand_handle prop-dict attr-dict `:` type($operand_handle)";
+  let extraClassDeclaration = SingleOpMatcher.extraDeclaration;
+
+  let cppNamespace = "mlir::iree_compiler::IREE::HAL::rocket_transform";
+}
+
+def Rocket_MatchElementwiseOp : Op<Transform_Dialect, "rocket.match.elementwise",
+    [IsolatedFromAbove,
+     MatchOpInterface,
+     SingleOpMatcher,
+     DeclareOpInterfaceMethods<MemoryEffectsOpInterface>]> {
+  let summary = [{Succeeds if the operation is a `linalg.elementwise` of the
+                  given kind over identity indexing maps.}];
+  let description = [{
+    IREE 3.14's LLVM removed the named elementwise ops (`linalg.add`,
+    `linalg.sub`, `linalg.mul`, ...); `linalg-specialize-generic-ops` now
+    raises a single-op parallel generic to the category op
+    `linalg.elementwise kind=#linalg.elementwise_kind<...>` instead. The
+    spec's element-wise matchers used to say `operation_name ["linalg.add"]`;
+    this is the same question asked of the category op.
+
+    `kind` is the `ElementwiseKind` spelling (`add`, `sub`, `mul`, ...).
+    Every indexing map must be the identity, which is what the removed named
+    ops implied: the category op can also carry broadcasting maps and a
+    hoisted scalar operand, and the Rocket element-wise kernels have one
+    geometry for every operand.
+
+    #### Return modes
+
+    Succeeds on a match, produces a silenceable failure otherwise, and a
+    definite failure for an unknown `kind` (a typo in the spec would
+    otherwise silently match nothing).
+  }];
+
+  let arguments = (ins TransformHandleTypeInterface:$operand_handle,
+                       StrAttr:$kind);
+  let assemblyFormat = "$operand_handle prop-dict attr-dict `:` type($operand_handle)";
   let extraClassDeclaration = SingleOpMatcher.extraDeclaration;
 
   let cppNamespace = "mlir::iree_compiler::IREE::HAL::rocket_transform";

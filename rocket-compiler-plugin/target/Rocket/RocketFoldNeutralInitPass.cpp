@@ -30,6 +30,18 @@
 //
 // Runs after the match loop, over the whole module, next to
 // rocket-promote-unclaimed-conv-inputs.
+//
+// It also does that last cancellation itself. Until IREE 3.12 arith folded
+// `truncf(extf(x))` to `x` for f16 -> f32 -> f16; the LLVM in IREE 3.14 keeps
+// the pair unless the ops carry `nnan` (APFloat's isLosslesslyConvertibleTo
+// now refuses any IEEE -> IEEE conversion because converting a signaling NaN
+// quiets it). Without the fold every widen/narrow pair became its own CPU
+// dispatch between two Rocket dispatches -- MobileNetV2 fp16 went from 5 to
+// 55 CPU dispatch sites and 9.6 to 33.7 ms. CancelWidenNarrow restores the
+// old result for exactly this shape: a narrowing generic over a widening
+// generic, optionally through one reshape, back to the source type. The
+// only value it changes is a signaling NaN, which keeps its payload instead
+// of coming back quiet; that is what every IREE before 3.14 did too.
 
 #include "mlir/Dialect/Arith/IR/Arith.h"
 #include "mlir/Dialect/Linalg/IR/Linalg.h"
@@ -178,6 +190,86 @@ struct FoldNeutralInit : OpRewritePattern<linalg::GenericOp> {
   }
 };
 
+// The one-input, one-init, identity-map, all-parallel generic whose body is a
+// single `OpTy` of the block argument, or null.
+template <typename OpTy>
+OpTy singleCastBody(linalg::GenericOp generic) {
+  if (!generic || generic.getNumDpsInputs() != 1 ||
+      generic.getNumDpsInits() != 1 || generic.getNumResults() != 1) {
+    return nullptr;
+  }
+  if (!llvm::all_of(generic.getIndexingMapsArray(),
+                    [](AffineMap map) { return map.isIdentity(); }) ||
+      !llvm::all_of(generic.getIteratorTypesArray(), [](utils::IteratorType type) {
+        return type == utils::IteratorType::parallel;
+      })) {
+    return nullptr;
+  }
+  Block &body = generic.getRegion().front();
+  if (body.getOperations().size() != 2) {
+    return nullptr;
+  }
+  auto cast = dyn_cast<OpTy>(&body.front());
+  auto yield = cast_or_null<linalg::YieldOp>(body.getTerminator());
+  if (!cast || cast->getOperand(0) != body.getArgument(0) ||
+      yield.getOperand(0) != cast->getResult(0)) {
+    return nullptr;
+  }
+  return cast;
+}
+
+// `narrow(reshape?(widen(x)))` -> `reshape?(x)` when the narrow lands back on
+// x's element type. See the file comment for why this is no longer left to
+// arith's folder.
+struct CancelWidenNarrow : OpRewritePattern<linalg::GenericOp> {
+  using OpRewritePattern::OpRewritePattern;
+
+  LogicalResult matchAndRewrite(linalg::GenericOp narrow,
+                                PatternRewriter &rewriter) const override {
+    auto truncf = singleCastBody<arith::TruncFOp>(narrow);
+    if (!truncf) {
+      return failure();
+    }
+    Value input = narrow.getDpsInputOperand(0)->get();
+    Operation *reshape = input.getDefiningOp();
+    if (isa_and_nonnull<tensor::ExpandShapeOp, tensor::CollapseShapeOp>(reshape)) {
+      input = reshape->getOperand(0);
+    } else {
+      reshape = nullptr;
+    }
+    auto widen = input.getDefiningOp<linalg::GenericOp>();
+    auto extf = singleCastBody<arith::ExtFOp>(widen);
+    if (!extf) {
+      return failure();
+    }
+    Value source = widen.getDpsInputOperand(0)->get();
+    auto resultType = cast<RankedTensorType>(narrow.getResult(0).getType());
+    auto sourceType = dyn_cast<RankedTensorType>(source.getType());
+    if (!sourceType ||
+        sourceType.getElementType() != resultType.getElementType()) {
+      return failure();
+    }
+    Value replacement;
+    if (!reshape) {
+      if (sourceType != resultType) {
+        return failure();
+      }
+      replacement = source;
+    } else if (auto expand = dyn_cast<tensor::ExpandShapeOp>(reshape)) {
+      replacement = tensor::ExpandShapeOp::create(
+          rewriter, expand.getLoc(), resultType, source,
+          expand.getReassociationIndices(), expand.getMixedOutputShape());
+    } else {
+      auto collapse = cast<tensor::CollapseShapeOp>(reshape);
+      replacement = tensor::CollapseShapeOp::create(
+          rewriter, collapse.getLoc(), resultType, source,
+          collapse.getReassociationIndices());
+    }
+    rewriter.replaceOp(narrow, replacement);
+    return success();
+  }
+};
+
 struct RocketFoldNeutralInitPass
     : public PassWrapper<RocketFoldNeutralInitPass, OperationPass<>> {
   MLIR_DEFINE_EXPLICIT_INTERNAL_INLINE_TYPE_ID(RocketFoldNeutralInitPass)
@@ -186,8 +278,8 @@ struct RocketFoldNeutralInitPass
   StringRef getDescription() const final {
     return "Drops a neutral accumulator initialiser (fill 0 under add, -inf "
            "under max, +inf under min, and the integer minimum/maximum under "
-           "signed max/min) from a widening generic, leaving the bare extf "
-           "the consumer's truncf can cancel.";
+           "signed max/min) from a widening generic, then cancels the bare "
+           "extf against the consumer's truncf.";
   }
 
   void getDependentDialects(DialectRegistry &registry) const final {
@@ -197,7 +289,7 @@ struct RocketFoldNeutralInitPass
 
   void runOnOperation() final {
     RewritePatternSet patterns(&getContext());
-    patterns.add<FoldNeutralInit>(&getContext());
+    patterns.add<FoldNeutralInit, CancelWidenNarrow>(&getContext());
     if (failed(applyPatternsGreedily(getOperation(), std::move(patterns)))) {
       return signalPassFailure();
     }

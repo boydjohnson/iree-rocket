@@ -27,7 +27,8 @@
 // Inputs are written as `linalg.generic`, which is the form an ONNX
 // Add/Mul/Sub actually reaches the pipeline as. `@__transform_main` runs
 // `linalg-specialize-generic-ops` before the match loop and turns them into
-// the named `linalg.add`/`mul`/`sub` the matchers are written against -- so
+// the `linalg.elementwise` <add>/<mul>/<sub> the matchers are written against
+// (the named `linalg.add`/`mul`/`sub` before IREE 3.14 removed them) -- so
 // writing the generic form here exercises that step too, and a change to it
 // shows up as a lost match rather than as a silent CPU fallback.
 //
@@ -41,7 +42,7 @@
 
 // ViT's own attention-block shape: 197 tokens of 768 channels, 96 fp16 surfaces.
 // CHECK-LABEL: util.func public @mul_vit_attention
-// CHECK-NOT: linalg.mul
+// CHECK-NOT: linalg.elementwise <mul>
 // CHECK: flow.dispatch @rocket_elementwise_mul_executable
 util.func public @mul_vit_attention(%lhs: tensor<1x197x768xf32>, %rhs: tensor<1x197x768xf32>) -> tensor<1x197x768xf32> {
   %init = tensor.empty() : tensor<1x197x768xf32>
@@ -61,7 +62,7 @@ util.func public @mul_vit_attention(%lhs: tensor<1x197x768xf32>, %rhs: tensor<1x
 
 // Add at the same shape. ViT carries 123 of these.
 // CHECK-LABEL: util.func public @add_vit_attention
-// CHECK-NOT: linalg.add
+// CHECK-NOT: linalg.elementwise <add>
 // CHECK: flow.dispatch @rocket_elementwise_add_executable
 util.func public @add_vit_attention(%lhs: tensor<1x197x768xf32>, %rhs: tensor<1x197x768xf32>) -> tensor<1x197x768xf32> {
   %init = tensor.empty() : tensor<1x197x768xf32>
@@ -81,7 +82,7 @@ util.func public @add_vit_attention(%lhs: tensor<1x197x768xf32>, %rhs: tensor<1x
 
 // Sub at the same shape.
 // CHECK-LABEL: util.func public @sub_vit_attention
-// CHECK-NOT: linalg.sub
+// CHECK-NOT: linalg.elementwise <sub>
 // CHECK: flow.dispatch @rocket_elementwise_sub_executable
 util.func public @sub_vit_attention(%lhs: tensor<1x197x768xf32>, %rhs: tensor<1x197x768xf32>) -> tensor<1x197x768xf32> {
   %init = tensor.empty() : tensor<1x197x768xf32>
@@ -101,7 +102,7 @@ util.func public @sub_vit_attention(%lhs: tensor<1x197x768xf32>, %rhs: tensor<1x
 
 // The channel ceiling exactly: ViT-base's MLP hidden width, 384 surfaces.
 // CHECK-LABEL: util.func public @mul_vit_mlp
-// CHECK-NOT: linalg.mul
+// CHECK-NOT: linalg.elementwise <mul>
 // CHECK: flow.dispatch @rocket_elementwise_mul_executable
 util.func public @mul_vit_mlp(%lhs: tensor<1x197x3072xf32>, %rhs: tensor<1x197x3072xf32>) -> tensor<1x197x3072xf32> {
   %init = tensor.empty() : tensor<1x197x3072xf32>
@@ -121,7 +122,7 @@ util.func public @mul_vit_mlp(%lhs: tensor<1x197x3072xf32>, %rhs: tensor<1x197x3
 
 // The floor of both bounds -- one pixel, one channel.
 // CHECK-LABEL: util.func public @mul_smallest
-// CHECK-NOT: linalg.mul
+// CHECK-NOT: linalg.elementwise <mul>
 // CHECK: flow.dispatch @rocket_elementwise_mul_executable
 util.func public @mul_smallest(%lhs: tensor<1x1x1xf32>, %rhs: tensor<1x1x1xf32>) -> tensor<1x1x1xf32> {
   %init = tensor.empty() : tensor<1x1x1xf32>
@@ -143,7 +144,7 @@ util.func public @mul_smallest(%lhs: tensor<1x1x1xf32>, %rhs: tensor<1x1x1xf32>)
 
 // One token past the measured 197. Nothing wider has been run on hardware.
 // CHECK-LABEL: util.func public @mul_tokens_over
-// CHECK: linalg.mul
+// CHECK: linalg.elementwise <mul>
 // CHECK-NOT: flow.dispatch @rocket_elementwise_mul_executable
 util.func public @mul_tokens_over(%lhs: tensor<1x198x768xf32>, %rhs: tensor<1x198x768xf32>) -> tensor<1x198x768xf32> {
   %init = tensor.empty() : tensor<1x198x768xf32>
@@ -163,7 +164,7 @@ util.func public @mul_tokens_over(%lhs: tensor<1x198x768xf32>, %rhs: tensor<1x19
 
 // One channel past the measured 3072.
 // CHECK-LABEL: util.func public @mul_channels_over
-// CHECK: linalg.mul
+// CHECK: linalg.elementwise <mul>
 // CHECK-NOT: flow.dispatch @rocket_elementwise_mul_executable
 util.func public @mul_channels_over(%lhs: tensor<1x197x3073xf32>, %rhs: tensor<1x197x3073xf32>) -> tensor<1x197x3073xf32> {
   %init = tensor.empty() : tensor<1x197x3073xf32>
@@ -184,7 +185,7 @@ util.func public @mul_channels_over(%lhs: tensor<1x197x3073xf32>, %rhs: tensor<1
 // A real batch. The cube has three extents and the leading 1 is what makes
 // `width = tokens, height = 1` a sound mapping; batch 2 would need a fourth.
 // CHECK-LABEL: util.func public @mul_batched
-// CHECK: linalg.mul
+// CHECK: linalg.elementwise <mul>
 // CHECK-NOT: flow.dispatch @rocket_elementwise_mul_executable
 util.func public @mul_batched(%lhs: tensor<2x197x768xf32>, %rhs: tensor<2x197x768xf32>) -> tensor<2x197x768xf32> {
   %init = tensor.empty() : tensor<2x197x768xf32>

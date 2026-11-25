@@ -572,6 +572,8 @@ fn recorded_write_extent(
             Some((target.buffer, target.offset, target.length))
         }
         RecordedOp::Copy { target, .. } => Some((target.buffer, target.offset, target.length)),
+        // Cache maintenance moves no bytes.
+        RecordedOp::CacheMaintenance { .. } => None,
         RecordedOp::Dispatch {
             output_compaction, ..
         } => output_compaction.as_ref().map(|oc| {
@@ -1296,6 +1298,15 @@ pub enum RecordedOp {
         source: iree_hal_buffer_ref_t,
         target: iree_hal_buffer_ref_t,
     },
+    /// `flush_buffer` (`flush == true`: make earlier writes visible to an
+    /// external consumer) or `invalidate_buffer` (make external writes
+    /// visible to later commands), added to the HAL in IREE 3.14. Recorded
+    /// rather than done at record time because it must run after the
+    /// commands recorded before it, as everything else here does.
+    CacheMaintenance {
+        target: iree_hal_buffer_ref_t,
+        flush: bool,
+    },
     Dispatch {
         regcmd_tasks: Vec<Vec<RegCmd>>,
         /// The DPU execution mode this dispatch programs. `None` denotes a
@@ -1557,6 +1568,7 @@ pub unsafe fn apply_ops_until_dispatch(
             RecordedOp::Copy { source, target } => {
                 source.buffer.is_null() || target.buffer.is_null()
             }
+            RecordedOp::CacheMaintenance { target, .. } => target.buffer.is_null(),
             RecordedOp::Dispatch { .. } => false, // rejected earlier, in dispatch() itself.
         };
         if indirect_ref {
@@ -1608,6 +1620,11 @@ pub unsafe fn apply_ops_until_dispatch(
                     )
                 };
                 if !st.is_null() {
+                    return Err(st);
+                }
+            }
+            RecordedOp::CacheMaintenance { target, flush } => {
+                if let Err(st) = unsafe { apply_cache_maintenance(target, *flush) } {
                     return Err(st);
                 }
             }
@@ -2080,6 +2097,9 @@ unsafe extern "C" fn destroy(command_buffer: *mut iree_hal_command_buffer_t) {
                     crate::bindings::iree_hal_buffer_release(source.buffer);
                     crate::bindings::iree_hal_buffer_release(target.buffer);
                 }
+                RecordedOp::CacheMaintenance { target, .. } => {
+                    crate::bindings::iree_hal_buffer_release(target.buffer);
+                }
                 RecordedOp::Dispatch {
                     retained_bindings, ..
                 } => {
@@ -2182,6 +2202,97 @@ status_stub!(advise_buffer(
     arg0: u64,
     arg1: u64,
 ) -> iree_status_t);
+
+/// Shared by `flush_buffer` and `invalidate_buffer`. A flush hands the bytes
+/// to a consumer outside this command buffer, so it is a dense read as far as
+/// lazy compaction is concerned: the dispatch that wrote them must not skip
+/// its compaction.
+unsafe fn record_cache_maintenance(
+    command_buffer: *mut iree_hal_command_buffer_t,
+    target_ref: iree_hal_buffer_ref_t,
+    flush: bool,
+) -> iree_status_t {
+    if target_ref.length == 0 {
+        return status::ok();
+    }
+    // See fill_buffer's comment on why this retain is needed.
+    unsafe {
+        crate::bindings::iree_hal_buffer_retain(target_ref.buffer);
+    }
+    let cb = unsafe { &mut *cast(command_buffer) };
+    if flush {
+        unsafe { note_dense_read(cb, &target_ref) };
+    }
+    cb.ops.push(RecordedOp::CacheMaintenance {
+        target: target_ref,
+        flush,
+    });
+    status::ok()
+}
+
+unsafe extern "C" fn flush_buffer(
+    command_buffer: *mut iree_hal_command_buffer_t,
+    target_ref: iree_hal_buffer_ref_t,
+) -> iree_status_t {
+    unsafe { record_cache_maintenance(command_buffer, target_ref, true) }
+}
+
+unsafe extern "C" fn invalidate_buffer(
+    command_buffer: *mut iree_hal_command_buffer_t,
+    target_ref: iree_hal_buffer_ref_t,
+) -> iree_status_t {
+    unsafe { record_cache_maintenance(command_buffer, target_ref, false) }
+}
+
+/// Maps `target` scoped and flushes or invalidates it, which on a
+/// `RocketBuffer` is FINI_BO or PREP_BO. Mirrors IREE's own
+/// `iree_hal_inline_command_buffer_flush_buffer`.
+///
+/// # Safety
+///
+/// `target.buffer` must be a live HAL buffer.
+unsafe fn apply_cache_maintenance(
+    target: &iree_hal_buffer_ref_t,
+    flush: bool,
+) -> Result<(), iree_status_t> {
+    let mut mapping: crate::bindings::iree_hal_buffer_mapping_t = unsafe { std::mem::zeroed() };
+    let access = if flush {
+        crate::bindings::iree_hal_memory_access_bits_t_IREE_HAL_MEMORY_ACCESS_WRITE
+    } else {
+        crate::bindings::iree_hal_memory_access_bits_t_IREE_HAL_MEMORY_ACCESS_READ
+    };
+    let st = unsafe {
+        crate::bindings::iree_hal_buffer_map_range(
+            target.buffer,
+            crate::bindings::iree_hal_mapping_mode_bits_t_IREE_HAL_MAPPING_MODE_SCOPED,
+            access as _,
+            target.offset,
+            target.length,
+            &mut mapping,
+        )
+    };
+    if !st.is_null() {
+        return Err(st);
+    }
+    let st = unsafe {
+        if flush {
+            crate::bindings::iree_hal_buffer_mapping_flush_range(
+                &mut mapping,
+                0,
+                iree_device_size_t::MAX, // IREE_HAL_WHOLE_BUFFER
+            )
+        } else {
+            crate::bindings::iree_hal_buffer_mapping_invalidate_range(
+                &mut mapping,
+                0,
+                iree_device_size_t::MAX, // IREE_HAL_WHOLE_BUFFER
+            )
+        }
+    };
+    let unmapped = unsafe { crate::bindings::iree_hal_buffer_unmap_range(&mut mapping) };
+    let st = unsafe { crate::bindings::iree_status_join(st, unmapped) };
+    if st.is_null() { Ok(()) } else { Err(st) }
+}
 
 #[allow(unused_variables)]
 unsafe extern "C" fn fill_buffer(
@@ -4614,6 +4725,8 @@ pub static VTABLE: iree_hal_command_buffer_vtable_t = iree_hal_command_buffer_vt
     reset_event: Some(reset_event),
     wait_events: Some(wait_events),
     advise_buffer: Some(advise_buffer),
+    flush_buffer: Some(flush_buffer),
+    invalidate_buffer: Some(invalidate_buffer),
     fill_buffer: Some(fill_buffer),
     update_buffer: Some(update_buffer),
     copy_buffer: Some(copy_buffer),

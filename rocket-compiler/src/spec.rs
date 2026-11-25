@@ -304,8 +304,10 @@ pub fn neutralize(spec: &str) -> Result<NeutralizedSpec, Box<dyn Error>> {
 /// Adds the `no_offload` unit attribute to one `transform.rocket.match.admitted`
 /// line, keeping any attribute it already carries.
 ///
-/// The op's assembly is `admitted $handle attr-dict `:` type`, so the
-/// dictionary is optional and sits between the handle and the colon.
+/// The op's assembly is `admitted $handle prop-dict attr-dict `:` type`, so
+/// the property dictionary `<{...}>` is optional and sits between the handle
+/// and the colon. (Before IREE 3.14's strict properties it was a plain
+/// `{...}` attribute dictionary, which the parser now rejects.)
 fn disable_admission(line: &str) -> Option<String> {
     if line.contains(NO_OFFLOAD_ATTR) {
         return Some(line.to_string());
@@ -313,17 +315,17 @@ fn disable_admission(line: &str) -> Option<String> {
     let at = line.find(ADMITTED_OP)?;
     let colon = line[at..].find(" : ").map(|i| at + i)?;
     let middle = &line[at + ADMITTED_OP.len()..colon];
-    let replacement = match middle.trim_end().strip_suffix('}') {
-        // Already has a dictionary: prepend into it.
+    let replacement = match middle.trim_end().strip_suffix("}>") {
+        // Already has a property dictionary: prepend into it.
         Some(head) => {
-            let open = head.rfind('{')?;
+            let open = head.rfind("<{")?;
             format!(
-                "{}{{{NO_OFFLOAD_ATTR}, {}}}",
+                "{}<{{{NO_OFFLOAD_ATTR}, {}}}>",
                 &head[..open],
-                head[open + 1..].trim()
+                head[open + 2..].trim()
             )
         }
-        None => format!("{} {{{NO_OFFLOAD_ATTR}}}", middle.trim_end()),
+        None => format!("{} <{{{NO_OFFLOAD_ATTR}}}>", middle.trim_end()),
     };
     Some(format!(
         "{}{ADMITTED_OP}{replacement}{}",
@@ -507,7 +509,7 @@ mod tests {
     transform.yield %arg : !transform.any_op
   }
   transform.named_sequence @match_admitted_int8(%arg: !transform.any_op) {
-    transform.rocket.match.admitted %arg {precision = "int8_requant"} : !transform.any_op
+    transform.rocket.match.admitted %arg <{precision = "int8_requant"}> : !transform.any_op
     transform.yield %arg : !transform.any_op
   }
   transform.named_sequence @cast_and_call_a(%arg: !transform.any_op) {
@@ -554,7 +556,7 @@ mod tests {
         let out = neutralize(SPEC).expect("spec is well formed");
         assert!(
             out.text
-                .contains("transform.rocket.match.admitted %arg {no_offload} :"),
+                .contains("transform.rocket.match.admitted %arg <{no_offload}> :"),
             "{}",
             out.text
         );
@@ -564,7 +566,7 @@ mod tests {
         // that nothing matches.
         assert!(
             out.text.contains(
-                "transform.rocket.match.admitted %arg {no_offload, precision = \"int8_requant\"} :"
+                "transform.rocket.match.admitted %arg <{no_offload, precision = \"int8_requant\"}> :"
             ),
             "{}",
             out.text
