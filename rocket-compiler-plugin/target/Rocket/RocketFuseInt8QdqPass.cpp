@@ -181,6 +181,23 @@ static std::optional<Dequant> matchDequant(Value value) {
 }
 
 /// `cmpf ugt %x, 0; select %c, %x, 0` -- the importer's ReLU.
+/// An elementwise add whose maps are all identities: what the named
+/// `linalg.add` was until LLVM removed the named elementwise ops (IREE 3.14),
+/// after which `linalg-specialize-generic-ops` produces
+/// `linalg.elementwise kind=#linalg.elementwise_kind<add>` instead. The
+/// identity check keeps the old op's semantics: the category op may also
+/// carry broadcasting maps, which `linalg.add` could not.
+static linalg::ElementwiseOp asIdentityElementwiseAdd(Operation *op) {
+  auto add = dyn_cast_or_null<linalg::ElementwiseOp>(op);
+  if (!add || add.getKind() != linalg::ElementwiseKind::add ||
+      add.getNumDpsInputs() != 2 ||
+      !llvm::all_of(add.getIndexingMapsArray(),
+                    [](AffineMap map) { return map.isIdentity(); })) {
+    return {};
+  }
+  return add;
+}
+
 static bool isRelu(linalg::GenericOp op) {
   if (!isIdentityElementwise(op) || op.getNumDpsInputs() < 1) {
     return false;
@@ -284,7 +301,7 @@ struct FuseInt8ResidualAdd : public OpRewritePattern<linalg::GenericOp> {
     if (!relu || !relu->hasOneUse() || !isRelu(relu)) {
       return failure();
     }
-    auto add = relu.getDpsInputs()[0].getDefiningOp<linalg::AddOp>();
+    auto add = asIdentityElementwiseAdd(relu.getDpsInputs()[0].getDefiningOp());
     if (!add || !add->hasOneUse()) {
       return failure();
     }

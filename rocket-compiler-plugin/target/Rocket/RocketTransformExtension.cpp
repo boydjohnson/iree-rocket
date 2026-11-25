@@ -18,6 +18,7 @@
 #include <array>
 #include <string>
 
+#include "mlir/Dialect/Linalg/IR/Linalg.h"
 #include "mlir/IR/BuiltinAttributes.h"
 #include "mlir/IR/DialectRegistry.h"
 
@@ -139,6 +140,38 @@ DiagnosedSilenceableFailure rocket_transform::MatchAdmittedOp::matchOperation(
 }
 
 void rocket_transform::MatchAdmittedOp::getEffects(
+    SmallVectorImpl<MemoryEffects::EffectInstance> &effects) {
+  transform::onlyReadsHandle(getOperandHandleMutable(), effects);
+  transform::onlyReadsPayload(effects);
+}
+
+DiagnosedSilenceableFailure rocket_transform::MatchElementwiseOp::matchOperation(
+    Operation *current, transform::TransformResults &results,
+    transform::TransformState &state) {
+  std::optional<linalg::ElementwiseKind> want =
+      linalg::symbolizeElementwiseKind(getKind());
+  if (!want) {
+    return emitDefiniteFailure()
+           << "unknown elementwise kind '" << getKind() << "'";
+  }
+  auto elementwise = dyn_cast<linalg::ElementwiseOp>(current);
+  if (!elementwise) {
+    return emitSilenceableError() << "not a linalg.elementwise";
+  }
+  if (elementwise.getKind() != *want) {
+    return emitSilenceableError()
+           << "elementwise kind is "
+           << linalg::stringifyElementwiseKind(elementwise.getKind())
+           << ", not " << getKind();
+  }
+  if (!llvm::all_of(elementwise.getIndexingMapsArray(),
+                    [](AffineMap map) { return map.isIdentity(); })) {
+    return emitSilenceableError() << "a non-identity indexing map";
+  }
+  return DiagnosedSilenceableFailure::success();
+}
+
+void rocket_transform::MatchElementwiseOp::getEffects(
     SmallVectorImpl<MemoryEffects::EffectInstance> &effects) {
   transform::onlyReadsHandle(getOperandHandleMutable(), effects);
   transform::onlyReadsPayload(effects);

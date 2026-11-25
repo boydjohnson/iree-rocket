@@ -6701,12 +6701,13 @@ module attributes {transform.with_named_sequence} {
   // `linalg.generic` with an `arith.addf` body -- but `@__transform_main`
   // runs `linalg-specialize-generic-ops` twice, with canonicalization
   // between, and by the time this loop runs the op has been specialized into
-  // the named `linalg.add`. A matcher written against the generic form
-  // matches nothing and says nothing about why. (It is also not
-  // `linalg.elementwise`, which this build's linalg does define.)
+  // `linalg.elementwise <add>` (the named `linalg.add` until IREE 3.14, whose
+  // LLVM removed the named elementwise ops). A matcher written against the
+  // generic form matches nothing and says nothing about why.
   //
-  // Matching the named op means no `cast_compatible_dag_from_root` is
-  // needed: the operation name already says the body is exactly this
+  // `transform.rocket.match.elementwise` checks the kind and that every map
+  // is the identity, so no `cast_compatible_dag_from_root` is
+  // needed: the kind already says the body is exactly this
   // arithmetic, so there is no subgraph to describe and none of that op's
   // silent-decline traps to fall into.
   // The int8 residual add, in the exact form rocket-fuse-int8-residual-add
@@ -6797,7 +6798,7 @@ module attributes {transform.with_named_sequence} {
 
   transform.named_sequence @match_elementwise_add_f32(
       %root: !transform.any_op {transform.readonly}) -> !transform.any_op {
-    transform.match.operation_name %root ["linalg.add"] : !transform.any_op
+    transform.rocket.match.elementwise %root <{kind = "add"}> : !transform.any_op
 
     %lhs_value = transform.get_operand %root[0] : (!transform.any_op) -> !transform.any_value
     %rhs_value = transform.get_operand %root[1] : (!transform.any_op) -> !transform.any_value
@@ -6834,17 +6835,18 @@ module attributes {transform.with_named_sequence} {
   // `linalg.generic` with an `arith.subf` body -- but `@__transform_main`
   // runs `linalg-specialize-generic-ops` twice, with canonicalization
   // between, and by the time this loop runs the op has been specialized into
-  // the named `linalg.sub`. A matcher written against the generic form
-  // matches nothing and says nothing about why. (It is also not
-  // `linalg.elementwise`, which this build's linalg does define.)
+  // `linalg.elementwise <sub>` (the named `linalg.sub` until IREE 3.14, whose
+  // LLVM removed the named elementwise ops). A matcher written against the
+  // generic form matches nothing and says nothing about why.
   //
-  // Matching the named op means no `cast_compatible_dag_from_root` is
-  // needed: the operation name already says the body is exactly this
+  // `transform.rocket.match.elementwise` checks the kind and that every map
+  // is the identity, so no `cast_compatible_dag_from_root` is
+  // needed: the kind already says the body is exactly this
   // arithmetic, so there is no subgraph to describe and none of that op's
   // silent-decline traps to fall into.
   transform.named_sequence @match_elementwise_sub_f32(
       %root: !transform.any_op {transform.readonly}) -> !transform.any_op {
-    transform.match.operation_name %root ["linalg.sub"] : !transform.any_op
+    transform.rocket.match.elementwise %root <{kind = "sub"}> : !transform.any_op
 
     %lhs_value = transform.get_operand %root[0] : (!transform.any_op) -> !transform.any_value
     %rhs_value = transform.get_operand %root[1] : (!transform.any_op) -> !transform.any_value
@@ -6881,17 +6883,18 @@ module attributes {transform.with_named_sequence} {
   // `linalg.generic` with an `arith.mulf` body -- but `@__transform_main`
   // runs `linalg-specialize-generic-ops` twice, with canonicalization
   // between, and by the time this loop runs the op has been specialized into
-  // the named `linalg.mul`. A matcher written against the generic form
-  // matches nothing and says nothing about why. (It is also not
-  // `linalg.elementwise`, which this build's linalg does define.)
+  // `linalg.elementwise <mul>` (the named `linalg.mul` until IREE 3.14, whose
+  // LLVM removed the named elementwise ops). A matcher written against the
+  // generic form matches nothing and says nothing about why.
   //
-  // Matching the named op means no `cast_compatible_dag_from_root` is
-  // needed: the operation name already says the body is exactly this
+  // `transform.rocket.match.elementwise` checks the kind and that every map
+  // is the identity, so no `cast_compatible_dag_from_root` is
+  // needed: the kind already says the body is exactly this
   // arithmetic, so there is no subgraph to describe and none of that op's
   // silent-decline traps to fall into.
   transform.named_sequence @match_elementwise_mul_f32(
       %root: !transform.any_op {transform.readonly}) -> !transform.any_op {
-    transform.match.operation_name %root ["linalg.mul"] : !transform.any_op
+    transform.rocket.match.elementwise %root <{kind = "mul"}> : !transform.any_op
 
     %lhs_value = transform.get_operand %root[0] : (!transform.any_op) -> !transform.any_value
     %rhs_value = transform.get_operand %root[1] : (!transform.any_op) -> !transform.any_value
@@ -8376,7 +8379,7 @@ module attributes {transform.with_named_sequence} {
 
   transform.named_sequence @match_dynamic_conv2d_int8(%root: !transform.any_op {transform.readonly}) -> !transform.any_op {
     transform.match.operation_name %root ["linalg.conv_2d_nhwc_hwcf"] : !transform.any_op
-    transform.rocket.match.admitted %root {precision = "int8_accumulator"} : !transform.any_op
+    transform.rocket.match.admitted %root <{precision = "int8_accumulator"}> : !transform.any_op
     %batch, %out_img, %out_ch, %filter, %in_ch, %depth, %strides, %dilations =
         transform.iree.match.convolution %root,
           lhs_type = i8, rhs_type = i8, output_type = i32
@@ -8395,7 +8398,7 @@ module attributes {transform.with_named_sequence} {
 
   transform.named_sequence @match_dynamic_conv2d_3x3_int8(%root: !transform.any_op {transform.readonly}) -> !transform.any_op {
     transform.match.operation_name %root ["linalg.conv_2d_nhwc_hwcf"] : !transform.any_op
-    transform.rocket.match.admitted %root {precision = "int8_accumulator"} : !transform.any_op
+    transform.rocket.match.admitted %root <{precision = "int8_accumulator"}> : !transform.any_op
     %batch, %out_img, %out_ch, %filter, %in_ch, %depth, %strides, %dilations =
         transform.iree.match.convolution %root,
           lhs_type = i8, rhs_type = i8, output_type = i32
@@ -8417,7 +8420,7 @@ module attributes {transform.with_named_sequence} {
   // init (a quantized ResNet folds its bias there) back on the CPU.
   transform.named_sequence @match_dynamic_conv2d_7x7_int8_s2(%root: !transform.any_op {transform.readonly}) -> !transform.any_op {
     transform.match.operation_name %root ["linalg.conv_2d_nhwc_hwcf"] : !transform.any_op
-    transform.rocket.match.admitted %root {precision = "int8_accumulator"} : !transform.any_op
+    transform.rocket.match.admitted %root <{precision = "int8_accumulator"}> : !transform.any_op
     %batch, %out_img, %out_ch, %filter, %in_ch, %depth, %strides, %dilations =
         transform.iree.match.convolution %root,
           lhs_type = i8, rhs_type = i8, output_type = i32
@@ -8436,7 +8439,7 @@ module attributes {transform.with_named_sequence} {
 
   transform.named_sequence @match_dynamic_depthwise_conv2d_int8(%root: !transform.any_op {transform.readonly}) -> !transform.any_op {
     transform.match.operation_name %root ["linalg.depthwise_conv_2d_nhwc_hwc"] : !transform.any_op
-    transform.rocket.match.admitted %root {precision = "int8_accumulator"} : !transform.any_op
+    transform.rocket.match.admitted %root <{precision = "int8_accumulator"}> : !transform.any_op
     %batch, %out_img, %out_ch, %filter, %in_ch, %depth, %strides, %dilations =
         transform.iree.match.convolution %root,
           lhs_type = i8, rhs_type = i8, output_type = i32
@@ -8455,7 +8458,7 @@ module attributes {transform.with_named_sequence} {
 
   transform.named_sequence @match_dynamic_depthwise_conv2d_3x3_int8(%root: !transform.any_op {transform.readonly}) -> !transform.any_op {
     transform.match.operation_name %root ["linalg.depthwise_conv_2d_nhwc_hwc"] : !transform.any_op
-    transform.rocket.match.admitted %root {precision = "int8_accumulator"} : !transform.any_op
+    transform.rocket.match.admitted %root <{precision = "int8_accumulator"}> : !transform.any_op
     %batch, %out_img, %out_ch, %filter, %in_ch, %depth, %strides, %dilations =
         transform.iree.match.convolution %root,
           lhs_type = i8, rhs_type = i8, output_type = i32
@@ -8474,7 +8477,7 @@ module attributes {transform.with_named_sequence} {
 
   transform.named_sequence @match_dynamic_depthwise_conv2d_int8_s2(%root: !transform.any_op {transform.readonly}) -> !transform.any_op {
     transform.match.operation_name %root ["linalg.depthwise_conv_2d_nhwc_hwc"] : !transform.any_op
-    transform.rocket.match.admitted %root {precision = "int8_accumulator"} : !transform.any_op
+    transform.rocket.match.admitted %root <{precision = "int8_accumulator"}> : !transform.any_op
     %batch, %out_img, %out_ch, %filter, %in_ch, %depth, %strides, %dilations =
         transform.iree.match.convolution %root,
           lhs_type = i8, rhs_type = i8, output_type = i32
@@ -8493,7 +8496,7 @@ module attributes {transform.with_named_sequence} {
 
   transform.named_sequence @match_dynamic_depthwise_conv2d_3x3_int8_s2(%root: !transform.any_op {transform.readonly}) -> !transform.any_op {
     transform.match.operation_name %root ["linalg.depthwise_conv_2d_nhwc_hwc"] : !transform.any_op
-    transform.rocket.match.admitted %root {precision = "int8_accumulator"} : !transform.any_op
+    transform.rocket.match.admitted %root <{precision = "int8_accumulator"}> : !transform.any_op
     %batch, %out_img, %out_ch, %filter, %in_ch, %depth, %strides, %dilations =
         transform.iree.match.convolution %root,
           lhs_type = i8, rhs_type = i8, output_type = i32
@@ -11291,7 +11294,7 @@ module attributes {transform.with_named_sequence} {
     %conv = transform.get_producer_of_operand %root[0]
         : (!transform.any_op) -> !transform.any_op
     transform.match.operation_name %conv ["linalg.conv_2d_nhwc_hwcf"] : !transform.any_op
-    transform.rocket.match.admitted %conv {precision = "int8_requant"} : !transform.any_op
+    transform.rocket.match.admitted %conv <{precision = "int8_requant"}> : !transform.any_op
     %batch, %out_img, %out_ch, %filter, %in_ch, %depth, %strides, %dilations =
         transform.iree.match.convolution %conv,
           lhs_type = i8, rhs_type = i8, output_type = i32
@@ -11354,7 +11357,7 @@ module attributes {transform.with_named_sequence} {
     %conv = transform.get_producer_of_operand %root[0]
         : (!transform.any_op) -> !transform.any_op
     transform.match.operation_name %conv ["linalg.conv_2d_nhwc_hwcf"] : !transform.any_op
-    transform.rocket.match.admitted %conv {precision = "int8_requant"} : !transform.any_op
+    transform.rocket.match.admitted %conv <{precision = "int8_requant"}> : !transform.any_op
     %batch, %out_img, %out_ch, %filter, %in_ch, %depth, %strides, %dilations =
         transform.iree.match.convolution %conv,
           lhs_type = i8, rhs_type = i8, output_type = i32
@@ -11416,7 +11419,7 @@ module attributes {transform.with_named_sequence} {
     %conv = transform.get_producer_of_operand %root[0]
         : (!transform.any_op) -> !transform.any_op
     transform.match.operation_name %conv ["linalg.conv_2d_nhwc_hwcf"] : !transform.any_op
-    transform.rocket.match.admitted %conv {precision = "int8_requant"} : !transform.any_op
+    transform.rocket.match.admitted %conv <{precision = "int8_requant"}> : !transform.any_op
     %batch, %out_img, %out_ch, %filter, %in_ch, %depth, %strides, %dilations =
         transform.iree.match.convolution %conv,
           lhs_type = i8, rhs_type = i8, output_type = i32
@@ -11479,7 +11482,7 @@ module attributes {transform.with_named_sequence} {
     %conv = transform.get_producer_of_operand %root[0]
         : (!transform.any_op) -> !transform.any_op
     transform.match.operation_name %conv ["linalg.conv_2d_nhwc_hwcf"] : !transform.any_op
-    transform.rocket.match.admitted %conv {precision = "int8_requant"} : !transform.any_op
+    transform.rocket.match.admitted %conv <{precision = "int8_requant"}> : !transform.any_op
     %batch, %out_img, %out_ch, %filter, %in_ch, %depth, %strides, %dilations =
         transform.iree.match.convolution %conv,
           lhs_type = i8, rhs_type = i8, output_type = i32
@@ -11546,7 +11549,7 @@ module attributes {transform.with_named_sequence} {
     %conv = transform.get_producer_of_operand %root[0]
         : (!transform.any_op) -> !transform.any_op
     transform.match.operation_name %conv ["linalg.conv_2d_nhwc_hwcf"] : !transform.any_op
-    transform.rocket.match.admitted %conv {precision = "int8_requant"} : !transform.any_op
+    transform.rocket.match.admitted %conv <{precision = "int8_requant"}> : !transform.any_op
     %batch, %out_img, %out_ch, %filter, %in_ch, %depth, %strides, %dilations =
         transform.iree.match.convolution %conv,
           lhs_type = i8, rhs_type = i8, output_type = i32
@@ -11614,7 +11617,7 @@ module attributes {transform.with_named_sequence} {
     %conv = transform.get_producer_of_operand %root[0]
         : (!transform.any_op) -> !transform.any_op
     transform.match.operation_name %conv ["linalg.conv_2d_nhwc_hwcf"] : !transform.any_op
-    transform.rocket.match.admitted %conv {precision = "int8_requant"} : !transform.any_op
+    transform.rocket.match.admitted %conv <{precision = "int8_requant"}> : !transform.any_op
     %batch, %out_img, %out_ch, %filter, %in_ch, %depth, %strides, %dilations =
         transform.iree.match.convolution %conv,
           lhs_type = i8, rhs_type = i8, output_type = i32
@@ -11683,7 +11686,7 @@ module attributes {transform.with_named_sequence} {
     %conv = transform.get_producer_of_operand %root[0]
         : (!transform.any_op) -> !transform.any_op
     transform.match.operation_name %conv ["linalg.conv_2d_nhwc_hwcf"] : !transform.any_op
-    transform.rocket.match.admitted %conv {precision = "int8_requant"} : !transform.any_op
+    transform.rocket.match.admitted %conv <{precision = "int8_requant"}> : !transform.any_op
     %batch, %out_img, %out_ch, %filter, %in_ch, %depth, %strides, %dilations =
         transform.iree.match.convolution %conv,
           lhs_type = i8, rhs_type = i8, output_type = i32
@@ -11754,7 +11757,7 @@ module attributes {transform.with_named_sequence} {
     %conv = transform.get_producer_of_operand %root[0]
         : (!transform.any_op) -> !transform.any_op
     transform.match.operation_name %conv ["linalg.depthwise_conv_2d_nhwc_hwc"] : !transform.any_op
-    transform.rocket.match.admitted %conv {precision = "int8_requant"} : !transform.any_op
+    transform.rocket.match.admitted %conv <{precision = "int8_requant"}> : !transform.any_op
     %batch, %out_img, %out_ch, %filter, %in_ch, %depth, %strides, %dilations =
         transform.iree.match.convolution %conv,
           lhs_type = i8, rhs_type = i8, output_type = i32
@@ -11833,7 +11836,7 @@ module attributes {transform.with_named_sequence} {
     %conv = transform.get_producer_of_operand %root[0]
         : (!transform.any_op) -> !transform.any_op
     transform.match.operation_name %conv ["linalg.depthwise_conv_2d_nhwc_hwc"] : !transform.any_op
-    transform.rocket.match.admitted %conv {precision = "int8_requant"} : !transform.any_op
+    transform.rocket.match.admitted %conv <{precision = "int8_requant"}> : !transform.any_op
     %batch, %out_img, %out_ch, %filter, %in_ch, %depth, %strides, %dilations =
         transform.iree.match.convolution %conv,
           lhs_type = i8, rhs_type = i8, output_type = i32
@@ -12489,7 +12492,7 @@ module attributes {transform.with_named_sequence} {
         // `deduplicate` keeps a function with several batch matmuls -- every
         // transformer block has one -- from being rewritten once per match.
         %owning_funcs = transform.get_parent_op %generalized_batch_matmuls
-            {deduplicate, op_name = "util.func"}
+            <{deduplicate, op_name = "util.func"}>
           : (!transform.any_op) -> !transform.any_op
         transform.apply_patterns to %owning_funcs {
           transform.apply_patterns.linalg.fold_unit_extent_dims_via_reshapes
@@ -12908,9 +12911,10 @@ module attributes {transform.with_named_sequence} {
     // Now that the shims are inlined, that init is the caller's
     // `linalg.fill` and its constant is visible; when it is the neutral
     // element -- as under every imported convolution, matmul and max pool --
-    // the term is dropped, leaving a bare extf that IREE fuses with the
-    // consumer's truncf and cancels, so two Rocket dispatches end up
-    // adjacent and the driver can chain them. Before inlining the init is a
+    // the term is dropped, leaving a bare extf, and the pass then cancels it
+    // against the consumer's truncf (arith stopped folding that pair in IREE
+    // 3.14), so two Rocket dispatches end up adjacent and the driver can
+    // chain them. Before inlining the init is a
     // function argument and nothing can be proved about it; after IREE's
     // own fusion it is a scalar `+ 0.0` inside a generic, which arith never
     // folds (it would change -0.0). See RocketFoldNeutralInitPass.cpp.

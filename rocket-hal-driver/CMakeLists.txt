@@ -38,6 +38,11 @@ file(GLOB_RECURSE ROCKET_SCHEMA_SOURCES CONFIGURE_DEPENDS
   "${CMAKE_CURRENT_SOURCE_DIR}/../rocket-schema/generated/rust/*.rs"
   "${CMAKE_CURRENT_SOURCE_DIR}/../rocket-schema/schema/*.fbs"
 )
+# build.rs runs bindgen over these, so a re-vendor (an IREE bump) must
+# rebuild the driver even when no .rs file changed.
+file(GLOB_RECURSE ROCKET_VENDORED_IREE_HEADERS CONFIGURE_DEPENDS
+  "${CMAKE_CURRENT_SOURCE_DIR}/vendor/iree-headers/*"
+)
 file(GLOB_RECURSE IREE_ROCKET_HAL_RUST_SOURCES CONFIGURE_DEPENDS
   "${CMAKE_CURRENT_SOURCE_DIR}/../iree-rocket-hal/src/*.rs"
 )
@@ -62,6 +67,7 @@ add_custom_command(
     ${ROCKET_SCHEMA_SOURCES}
     ${IREE_ROCKET_HAL_RUST_SOURCES}
     ${ROCKET_CORE_RUST_SOURCES}
+    ${ROCKET_VENDORED_IREE_HEADERS}
     "${CMAKE_CURRENT_SOURCE_DIR}/Cargo.toml"
     "${CMAKE_CURRENT_SOURCE_DIR}/../iree-rocket-hal/Cargo.toml"
     "${CMAKE_CURRENT_SOURCE_DIR}/../rocket-schema/Cargo.toml"

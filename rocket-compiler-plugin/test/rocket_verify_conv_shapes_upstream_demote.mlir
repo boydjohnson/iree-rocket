@@ -1,4 +1,4 @@
-// RUN: not iree-opt %s --pass-pipeline='builtin.module(rocket-record-conv-attrs,iree-global-opt-demote-contraction-inputs{type=f16 operation=conv},rocket-verify-conv-shapes)' 2>&1 \
+// RUN: iree-opt %s --pass-pipeline='builtin.module(rocket-record-conv-attrs,iree-global-opt-demote-contraction-inputs{type=f16 operation=conv},rocket-verify-conv-shapes)' 2>&1 \
 // RUN:   | FileCheck %s
 
 // The regression the tripwire exists for, on the shape it used to be blind
@@ -9,8 +9,16 @@
 // (RocketDemoteConvInputsPass.cpp). With every extent symbolic there is no
 // output extent to re-derive, so the old arithmetic check would have passed
 // this; the attribute record does not.
+//
+// IREE 3.14 rewrote the demote pass (DemoteContractionInputs.cpp) and it
+// keeps `strides` now, so this test flipped from expecting the tripwire's
+// error to expecting a clean pass: if a later IREE drops the attribute
+// again, the CHECK-NOT below is what turns red. The tripwire itself is
+// covered on a hand-built mismatch by rocket_verify_conv_shapes.mlir.
 
-// CHECK: error: rocket-verify-conv-shapes: linalg.conv_2d_nhwc_hwcf 'strides' changed since rocket-record-conv-attrs: recorded [2, 2], now
+// CHECK-NOT: error
+// CHECK: linalg.conv_2d_nhwc_hwcf {dilations = dense<1> : vector<2xi64>, strides = dense<2> : vector<2xi64>}
+// CHECK-SAME: tensor<1x?x?x3xf16>, tensor<3x3x3x16xf16>
 
 util.func public @dynamic_strided_conv(
     %input: tensor<1x?x?x3xf32>,
