@@ -597,3 +597,261 @@ fn the_fixture_s_shape_plans() {
     );
     let _ = Q15_SCALE;
 }
+
+/// Wall time, against the CPU doing the same softmax -- the measurement
+/// SOFTMAX.md §10 is built from.
+///
+/// ISSUES.md **P10** is the figure to beat: on BLIP fp16 the f32 CPU
+/// softmax is 24% of the A76 cycles, and a 16-wide vector tile is
+/// bit-identical and 1.39x faster on the standalone kernel.
+///
+/// **What this arm is and is not.** The NPU arm is the whole op as §7
+/// defines it: three submissions, 13 tasks, both host steps, buffers and
+/// programs built once outside the loop. The CPU arm is a plain scalar
+/// Rust softmax over the same `[rows, keys]` f32 data in the same process
+/// -- *not* IREE's codegen, which P10 profiled and which gets 1.39x better
+/// with its tile fixed. So the CPU number here is a reference point rather
+/// than the target, and the target is faster than it.
+///
+/// Read the environment before quoting any of it: `performance` governor,
+/// A76 at 2.4 GHz, `rocket_npu_clk_hz` at 600 MHz. Pin to the big cluster
+/// (`taskset -c 4-7`) or the host steps land on an A55.
+#[test]
+#[ignore = "requires an RK3588 NPU at /dev/accel/accel0"]
+fn softmax_wall_time_against_the_cpu() {
+    const WARMUP: usize = 3;
+    const ITERATIONS: usize = 20;
+    let (rows_f32, row_count, keys) = attention_rows();
+    let shape = Shape::new(keys as u32, row_count as u32);
+    let plan = SoftmaxPlan::try_new(shape).unwrap();
+    let input_scale = shape.exp_input_scale;
+    let operand = plan.exp_bn_mul_operand();
+    let physical = shape.physical_keys() as usize;
+
+    let file = OpenOptions::new()
+        .read(true)
+        .write(true)
+        .open(DEVICE_PATH)
+        .expect("failed to open RK3588 NPU device");
+    let fd = file.as_raw_fd();
+
+    unsafe {
+        let mut owned = Owned::new();
+        let scores = owned.add(fd, row_count.div_ceil(16) * physical * 16, &file);
+        let scores_ptr = owned.buffers[0].host_ptr;
+        for row in 0..row_count {
+            for key in 0..physical {
+                let code = if key < keys {
+                    (rows_f32[row * keys + key] / input_scale)
+                        .round()
+                        .clamp(-128.0, 127.0) as i8
+                } else {
+                    rocket_core::softmax::PAD_CODE
+                };
+                ptr::write(
+                    scores_ptr.add(dpu_cube_offset(row, key, physical, 1)),
+                    code as u8,
+                );
+            }
+        }
+        let scratch = owned.add(fd, plan.scratch().bytes(), &file);
+        let scratch_ptr = owned.buffers[1].host_ptr;
+        let alu_plane = owned.add(fd, 4096, &file);
+        let alu_ptr = owned.buffers[2].host_ptr;
+        let const_plane = owned.add(fd, 4096, &file);
+        let const_ptr = owned.buffers[3].host_ptr;
+        let reciprocal_plane = owned.add(fd, 4096, &file);
+        let reciprocal_ptr = owned.buffers[4].host_ptr;
+        let weight_bytes = sum_weight_bytes(row_count as u32).unwrap() as usize;
+        let sum_weights = owned.add(fd, weight_bytes, &file);
+        let weights_ptr = owned.buffers[5].host_ptr;
+        let sum_bias = owned.add(fd, 4096, &file);
+        let output = owned.add(fd, row_count.div_ceil(8) * physical * 16, &file);
+
+        let mut packed = vec![0u8; weight_bytes];
+        pack_sum_weights(row_count as u32, &mut packed).unwrap();
+        ptr::copy_nonoverlapping(packed.as_ptr(), weights_ptr, packed.len());
+        let mut constant = vec![0u8; 4096];
+        write_constant_plane(row_count as u32, &mut constant).unwrap();
+        ptr::copy_nonoverlapping(constant.as_ptr(), const_ptr, constant.len());
+
+        let bufs = SoftmaxBuffers {
+            scores,
+            scratch,
+            alu_plane,
+            const_plane,
+            reciprocal_plane,
+            sum_weights,
+            sum_bias,
+            output,
+        };
+        let handles = owned.handles();
+        for &handle in &handles {
+            fini_bo(fd, handle).ok();
+        }
+        // Built once: a real dispatch would too, and ISSUES P8's
+        // per-dispatch host cost is about exactly this kind of work, so
+        // timing it inside the loop would double-count it.
+        let max_programs = plan.programs_max(&bufs);
+        let exp_programs = plan.programs_exp_and_sum(&bufs);
+        let normalize_programs = plan.programs_normalize(&bufs);
+
+        let mut submit1 = 0.0f64;
+        let mut host1 = 0.0f64;
+        let mut submit2 = 0.0f64;
+        let mut host2 = 0.0f64;
+        let mut submit3 = 0.0f64;
+
+        for iteration in 0..WARMUP + ITERATIONS {
+            let measure = iteration >= WARMUP;
+            let started = Instant::now();
+            if run(
+                fd,
+                &file,
+                &max_programs,
+                &handles,
+                owned.buffers[1].handle,
+                "max tree",
+            )
+            .is_none()
+            {
+                return;
+            }
+            if measure {
+                submit1 += started.elapsed().as_secs_f64();
+            }
+
+            let step = Instant::now();
+            let max_offset = plan.scratch().max_offset().unwrap();
+            for row in 0..row_count {
+                let code =
+                    ptr::read(scratch_ptr.add(max_offset + ppu_cube_offset(row, 0, 1, 1))) as i8;
+                let value = -(i64::from(code)) * i64::from(operand);
+                ptr::write(alu_ptr.add(row * 4) as *mut i32, value as i32);
+            }
+            fini_bo(fd, owned.buffers[2].handle).ok();
+            fini_bo(fd, owned.buffers[1].handle).ok();
+            if measure {
+                host1 += step.elapsed().as_secs_f64();
+            }
+
+            let started = Instant::now();
+            if run(
+                fd,
+                &file,
+                &exp_programs,
+                &handles,
+                owned.buffers[1].handle,
+                "exp and sum",
+            )
+            .is_none()
+            {
+                return;
+            }
+            if measure {
+                submit2 += started.elapsed().as_secs_f64();
+            }
+
+            let step = Instant::now();
+            let sum_offset = plan.scratch().sum_offset().unwrap();
+            let mut reciprocals = Vec::with_capacity(row_count);
+            for row in 0..row_count {
+                let bits = ptr::read_unaligned(
+                    scratch_ptr.add(sum_offset + dpu_cube_offset(row, 0, 1, 2)) as *const u16,
+                );
+                reciprocals.push(1.0 / f16_to_f32(bits));
+            }
+            let mut plane = vec![0u8; 4096];
+            write_bn_mul_plane_fp16(
+                &mut plane,
+                (row_count as u32).max(16).next_multiple_of(16),
+                &reciprocals,
+            )
+            .unwrap();
+            ptr::copy_nonoverlapping(plane.as_ptr(), reciprocal_ptr, plane.len());
+            fini_bo(fd, owned.buffers[4].handle).ok();
+            fini_bo(fd, owned.buffers[1].handle).ok();
+            fini_bo(fd, owned.buffers[7].handle).ok();
+            if measure {
+                host2 += step.elapsed().as_secs_f64();
+            }
+
+            let started = Instant::now();
+            if run(
+                fd,
+                &file,
+                &normalize_programs,
+                &handles,
+                owned.buffers[7].handle,
+                "normalize",
+            )
+            .is_none()
+            {
+                return;
+            }
+            if measure {
+                submit3 += started.elapsed().as_secs_f64();
+            }
+        }
+        for &handle in &handles {
+            close_bo(fd, handle).ok();
+        }
+
+        let each = |total: f64| total / ITERATIONS as f64 * 1e3;
+        let npu = each(submit1 + host1 + submit2 + host2 + submit3);
+        println!(
+            "  NPU, {row_count} rows x {keys} keys, {} tasks: {npu:.3} ms per softmax",
+            plan.device_tasks()
+        );
+        println!(
+            "    max tree {:.3} | host max->plane {:.3} | exp+bridge+sum {:.3} | \
+             host 1/d {:.3} | normalize {:.3}  (ms)",
+            each(submit1),
+            each(host1),
+            each(submit2),
+            each(host2),
+            each(submit3)
+        );
+        println!(
+            "    per task: {:.0} us, against S4's 37-59 us for a bare submit-and-wait",
+            npu * 1e3 / plan.device_tasks() as f64
+        );
+
+        // The CPU arm: a plain scalar softmax over the same data. Not
+        // IREE's codegen -- see this test's doc comment.
+        let mut out = vec![0.0f32; row_count * keys];
+        let started = Instant::now();
+        for _ in 0..ITERATIONS {
+            for row in 0..row_count {
+                let logits = &rows_f32[row * keys..(row + 1) * keys];
+                let mut m = f32::NEG_INFINITY;
+                for &x in logits {
+                    m = m.max(x);
+                }
+                let mut sum = 0.0f32;
+                for (index, &x) in logits.iter().enumerate() {
+                    let e = (x - m).exp();
+                    out[row * keys + index] = e;
+                    sum += e;
+                }
+                let inverse = 1.0 / sum;
+                for value in &mut out[row * keys..(row + 1) * keys] {
+                    *value *= inverse;
+                }
+            }
+        }
+        let cpu = started.elapsed().as_secs_f64() / ITERATIONS as f64 * 1e3;
+        println!("  CPU, scalar Rust, same shape: {cpu:.3} ms per softmax");
+        println!(
+            "  ratio: the NPU op is {:.2}x the CPU's time ({})",
+            npu / cpu,
+            if npu < cpu {
+                "NPU faster"
+            } else {
+                "CPU faster"
+            }
+        );
+        // Keeps the CPU arm from being optimised away.
+        assert!(out.iter().all(|value| value.is_finite()));
+    }
+}
