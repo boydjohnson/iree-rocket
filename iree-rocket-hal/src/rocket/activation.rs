@@ -961,6 +961,17 @@ pub fn build_lut_q15_regcmd(shape: &LutShape, bufs: &LutBuffers, table: LutTable
     );
     let bn_alu_operand = lut_bn_alu(real_zero_point, bn_mul_operand);
     let (out_cvt_scale, out_cvt_shift) = (1, 0);
+    // **The two-byte writer's surface multiplier.** Measured: at 64
+    // channels -- eight int16 surfaces -- `surf_add = surface_stride`
+    // writes only 40 of them, while `surface_stride * 2` writes all 64
+    // (`the_q15_writer_channel_map`). The fp32 plane gather needed the same
+    // 2 (`bn_plane::PlaneElement::Fp32`), and every builder in this crate
+    // that uses a bare `surface_stride` has `fp32tofp16_en` *set*, so the
+    // rule that fits all of them is: the multiplier is 2 when the
+    // narrowing bit is clear and the writer emits the wider datapath
+    // element, and 1 when it is set. `conv.rs`'s int4 note predicted the
+    // pair -- "the float path's natural 1 and 2x".
+    let surf_add_multiplier = 2;
 
     let mut cmds = Vec::new();
 
@@ -1122,7 +1133,7 @@ pub fn build_lut_q15_regcmd(shape: &LutShape, bufs: &LutBuffers, table: LutTable
     cmds.push(zero::<DpuEwOpValue7>());
     cmds.push(
         Register::<DpuSurfaceAdd>::new()
-            .surf_add(Bits::new(surface_stride))
+            .surf_add(Bits::new(surface_stride * surf_add_multiplier))
             .build(),
     );
     cmds.push(zero::<DpuReserved40c4>());

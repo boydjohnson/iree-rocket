@@ -153,7 +153,7 @@ and its output has the same shape as its input.
 | `exp` | DPU LUT, `LutTable::exp_with_decaying_tail(1/20)` into `build_lut_q15_regcmd` | **exists**, int8 in and Q15 `int16` out, measured within **1.12%** total variation of an exact softmax on real ViT-B/16 attention rows (§3.4). The shipped flat tail is 6.69% and unusable |
 | square (range extension) | `EwBinaryOp::Mul` with both operands the same buffer | **exists**, `ew_binary_hw.rs`, `ew_square_hw.rs` |
 | row sum | depthwise all-ones **3x3 at stride 3** on a height-1 cube; or the all-ones column on the second matmul (§1.1) | **exists**, and exact at atol 0 over `N` 9..512 as a tree in one job, probe S2 (`reduce_width_hw.rs`). The window is 3x3 and not `1 x k` for the reason in §2.2. The avg-pool route is gone at fp16, §2.1 |
-| reciprocal | `LutTable::reciprocal()` + one Newton step | **exists**, `lut_reciprocal_hw.rs`; domain needs §4 |
+| reciprocal | the **host**: `M` f32 divides on a width-1 vector | **measured** at 0.006 ms for 64 rows, plus one 0.037-0.059 ms submission boundary (S4). The LUT cannot take `d`'s 200:1 range through an int8 input, §4 |
 | divide by the sum | BN MUL operand from NRDMA, per channel | **exists**, as of probe S1: flat IEEE `fp16` at `channel * 2`, shift 0, same file |
 
 Nothing in that column is a reverse-engineering problem any more. The two
@@ -441,56 +441,86 @@ established the methodology. It is an optimisation, not a prerequisite.)
 
 ---
 
-## 4. Normalisation, and the reciprocal's real difficulty
+## 4. Normalisation: the multiply is free, the reciprocal is the host's
 
 In the §1.1 layout the divide by the row sum is a **per-channel multiply**,
 which is `bn_mul_src = 1` with a `1/d` vector in the NRDMA plane. In fused
 attention it applies to the `[d_v, M]` output; standalone it is one DPU pass
 over `[N, M]` with the LUT bypassed. Either way the multiply itself is free
--- it rides a stage that is otherwise bypassed.
+-- it rides a stage that is otherwise bypassed, and S1 measured the operand
+as a flat fp16 at `channel * 2`.
 
-Producing `1/d` is the awkward part. `d` lies in `[1, N]` when the subtracted
-value is the true max, so its dynamic range is `N`-wide and no static
-prescaling brings it into a fixed window. `LutTable::reciprocal()` holds real
-data only for `|x|` in `[1, 16)` [verified, `activation.rs:291`], which
-covers `N <= 16` and nothing a transformer uses.
+Producing `1/d` is the part this section was written to agonise over, and
+probe **S4 settled it the other way from the ranking below: it runs on the
+host.** Three measurements decide it.
 
-Ranked options:
+**`d`'s real range.** Over the 64 real ViT-B/16 attention rows of §3.4,
+`d = sum(exp(x - m))` runs from 1.03 to 122.8 with a median of 10.8, and
+**44% of rows are at or past 16** -- the edge of `LutTable::reciprocal`'s
+real data. The worst case is `N` itself, since a uniform row sums to `N`.
+So the shipped table covers a bit over half of a real model's rows.
+
+**Why a wider table does not help.** The blocker is the *input*, not the
+table. An int8 code space is 128 linear steps and `d`'s range is 200:1, so
+the step at `d = 1` is worth more than `d` itself, and a Newton iteration
+cannot recover what the input quantization threw away because it multiplies
+by the same quantized `d`. An int16 LUT input would have the codes and a
+self-derived table over `[1, 256]` would have the range -- but the Newton
+step then needs `y0 * d` as a *fraction*, and S3 measured that the LUT's
+output converter is an integer multiply-shift, so a Q15 entry cannot leave
+the task as one. The NPU route therefore needs two unprobed mechanisms and
+a new table.
+
+**What the host costs.** The reciprocal is `M` f32 divides on a width-1
+vector: **0.006 ms** for 64 rows, measured. The one real objection was §5's
+one-job structure -- the reciprocal sits between the sum and the normalize,
+so computing it on the host splits one dispatch into two submissions -- and
+a second submission inside the same dispatch is not a second IREE dispatch,
+just one more `SUBMIT` and one more `PREP_BO` wait: **0.037 to 0.059 ms**
+on the smallest real job (`the_extra_submission_boundary_costs`). Against
+ISSUES P8's 1.6 to 7.4 ms of flat *per-dispatch* host cost, that is a
+rounding error.
+
+**Measured end to end.** §7's passes 2 and 3 on the real rows, with `exp`
+and the normalizing multiply on the device and the reciprocal on the host,
+come to **1.12% mean total variation** against an exact softmax -- the same
+figure as §3.4's `exp` step alone, so the fp16 plane multiply adds nothing
+measurable. Worst row 13.97%, which is §9's spread item rather than a new
+one (`exp_then_a_host_reciprocal_normalizes_real_attention_rows`).
+
+**One thing the plane will not take.** The multiplier has to be `1/d` in
+*real* units, not `1/d_q15`. With `exp` emitting Q15, the summed counts run
+to `32768 * N`, so `1/sum` is `1.5e-7` to `3e-5` -- below fp16's normal
+range of `6.1e-5`, and `write_bn_mul_plane_fp16` refuses it rather than
+silently flushing a channel's multiplier to zero. So the factor of
+`1/32768` has to ride the Q15-to-fp16 conversion instead, where it is exact
+because it is a power of two. That conversion is a pass over the whole
+`[N, M]` cube (0.18 ms on the host for `64 x 197`), and moving it onto the
+device is §9's open item -- not the reciprocal, which is 64 divides.
+
+### 4.1 The routes this replaces
+
+Kept because the reasoning is what a later widening of the LUT's input
+would have to overturn, in the order they were ranked before S4 measured
+anything:
 
 1. **`rsqrt` then square then one Newton step.** `rsqrt` is real on
-   `[1, 16)` too, but `1/sqrt(d)` over `d` in `[1, 384]` has an output range
-   of only 20:1 against the reciprocal's 384:1, so a self-derived `RSQRT_LE`
-   widened to `[1, 512]` keeps about `6e-4` relative accuracy where a
-   widened reciprocal table would give `1.2%`. Square it (`1.2e-3`), then one
-   Newton step `y1 = y0 * (2 - d * y0)` squares the error to `1.4e-6`. Three
-   EW tasks on a length-`M` vector -- tens of microseconds at most. Uses only
-   existing validated primitives plus one self-derived table.
-2. **One Newton step on a widened reciprocal table.** Simpler (one new table,
-   no `rsqrt`), lands at about `1.4e-4` from a `1.2%` seed. Probably good
-   enough at fp16 and the first thing to try.
-3. **Log-domain normalisation**: `softmax(x) = exp(x - m - ln d)`, folding the
-   denominator into the same BN ALU operand as the max. Elegant -- it removes
-   the multiply entirely -- but needs a self-derived `log` table whose output
-   exceeds Q15 for `d > e`, so it needs the `out_cvt` scalar scale to carry a
-   factor, and it makes the exp pass depend on two serial reductions. Note
-   it, do not build it first.
-4. **CPU.** `M` floats across a dispatch boundary. It is the fallback the
-   vendor may well take: the reciprocal step is **not present as any on-chip
-   dispatch** in a complete, self-consistent 36864-byte capture of the
-   vendor's own compiled softmax -- every `BN_CFG`/`BN_ALU_CFG`/`BN_MUL_CFG`/
-   `LUT_CFG` write in the whole buffer is the single confirmed `exp`
-   dispatch, and all five PPU dispatches are max-only with
-   `RECIP_KERNEL = 0` [verified, `rknpu-spelunking/NOTES.md` Follow-up 5, a
-   strong negative result rather than a gap in searching].
+   `[1, 16)` too, but `1/sqrt(d)` over `d` in `[1, 384]` has an output
+   range of only 20:1 against the reciprocal's 384:1, so a widened
+   `RSQRT_LE` keeps about `6e-4` relative accuracy where a widened
+   reciprocal table would give `1.2%`. Square it, then
+   `y1 = y0 * (2 - d * y0)` squares the error to about `1.4e-6`.
+2. **One Newton step on a widened reciprocal table**, landing at about
+   `1.4e-4` from a `1.2%` seed.
+3. **Log-domain normalisation**, `softmax(x) = exp(x - m - ln d)`, folding
+   the denominator into the same BN ALU operand as the max. It removes the
+   multiply entirely but needs a self-derived `log` table whose output
+   exceeds Q15 for `d > e`, and it makes the `exp` pass depend on two
+   serial reductions.
+4. **The host**, which is where S4 put it.
 
-That last point is the one place this design knowingly departs from the
-vendor. The repo's house rule for exactly this situation is on the record:
-diff against the reference emitter, do not obey it -- `rocket-userspace`
-asserts that the EW unit cannot read a second operand without a conv main
-feed, built its entire elementwise runtime around manufacturing one, and is
-simply wrong about this register program (ROADMAP's `mulf` section). The BN
-plane is the same shape of claim: documented in the TRM, absent from the
-vendor's softmax, and cheap to test.
+All four assumed the LUT could take a usable input for `d`. It cannot, and
+that is the finding rather than the ranking.
 
 ---
 
@@ -665,8 +695,9 @@ pass 2   DPU LUT task, flying mode:            <-- see §3.1: Q15 output
            -> u = exp((x - m)/2)               [N, M] -> [N, M]
          EwBinaryOp::Mul(u, u) -> P            [N, M] -> [N, M]
          depthwise all-ones 1 x k conv tree    [N, M] -> [1, M]        d
-pass 3   reciprocal of d (§4)                  [1, M] -> [1, M]
+pass 3   reciprocal of d: HOST (§4)          [1, M] -> [1, M]
          DPU task, BN MUL operand <- NRDMA     [N, M] -> [N, M]        y
+           the operand is 1/d in real units, not 1/d_q15: see §4
 ```
 
 Pass 2's `Mul` and pass 3's multiply are the two dispatches a self-derived
@@ -890,9 +921,37 @@ entry, `exp(-5)`, not a decay to zero and not the Q15 floor, so buying
 domain with `input_scale` buys real accuracy. §3.2 has the corrected
 numbers.
 
-**S4 -- the reciprocal.** `softmax_reciprocal_hw.rs`: widened table, Newton
-step, oracle across `d` in `[1, 512]`. Pick option 2 from §4 first; fall back
-to option 1 if `1.4e-4` is not enough.
+**S4 -- the reciprocal. DONE 2026-11-24, and it inverts §4's own ranking**
+(`reciprocal_route_hw.rs`). The reciprocal runs on the host, for three
+measured reasons: `d` spans 1.03 to 122.8 on real ViT-B/16 rows with 44% at
+or past `LutTable::reciprocal`'s `[1, 16)` edge; the blocker is the int8
+*input*'s 128 linear codes against a 200:1 range, which a wider table does
+not fix and a Newton step cannot recover from; and the host costs 0.006 ms
+for 64 rows plus one 0.037-0.059 ms submission boundary, against ISSUES
+P8's 1.6 to 7.4 ms flat per-dispatch cost. §4 has the detail and keeps the
+four ranked NPU routes, all of which assumed an input the LUT does not
+have.
+
+It also measured §7's passes 2 and 3 end to end on the real rows --
+**1.12% mean total variation**, the same as §3.4's `exp` alone, so the fp16
+plane multiply costs nothing measurable -- and turned up two things on the
+way.
+
+**The two-byte writer's surface multiplier is 2, not 1.** At 64 channels
+the Q15 `int16` output wrote only 40 of them with
+`surf_add = surface_stride`, and all 64 with `* 2`
+(`the_q15_writer_channel_map`). That is the same value the fp32 plane
+gather needed (S2a), and the rule that fits every builder in the crate is
+the narrowing bit: `surf_add` is `surface_stride` when `fp32tofp16_en` is
+*set*, and twice it when the writer emits the wider datapath element.
+`conv.rs`'s int4 note predicted the pair -- "the float path's natural 1 and
+2x". Every earlier Q15 run used one channel, where an output surface stride
+cannot be observed at all, which is why S3 did not catch it.
+
+**The plane will not take `1/d_q15`.** It is `1.5e-7` to `3e-5`, below
+fp16's normal range, and `write_bn_mul_plane_fp16` refuses it rather than
+flushing a channel's multiplier to zero. The `1/32768` rides the
+Q15-to-fp16 conversion instead, exactly, since it is a power of two.
 
 **S5 -- the op.** `softmax.rs` in `iree-rocket-hal/src/rocket`, holding a
 `SoftmaxShape { width, height: 1, channels, precision }` and a
@@ -943,6 +1002,16 @@ precisely the form this hardware cannot run.
   against exact softmax on real ViT-B/16 attention rows, at
   `input_scale = 1/20` with the tuned slope (§3.4). The table does not need
   regenerating.
+* **The Q15-to-fp16 bridge is the last step still on the host**, and the
+  only one in §7 that is a pass over the whole `[N, M]` cube rather than a
+  width-1 vector -- 0.18 ms for `64 x 197`, against the reciprocal's 0.006
+  ms. It has to turn an `int16` Q15 count into an fp16 fraction, which is
+  an integer-to-float conversion plus an exact `2^-15`. `S2a`'s
+  `build_plane_gather_regcmd` already does the first half in the other
+  direction (fp16 in, fp32 out), and `RDMA_SURF_NOTCH` plus the two-byte
+  writer rule are both measured now, so this is a small probe rather than
+  an open question -- but until it is done, §7 has a host pass in the
+  middle that §5's one-job structure does not want.
 * **The worst row is 14%, not 1%.** The mean is good and the spread is not,
   on the same 64 real rows. A model-level gate should report both, and if
   the bad rows turn out to be the ones that matter -- a near-uniform
