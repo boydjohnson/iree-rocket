@@ -853,17 +853,25 @@ which §10 measured as the whole cost. The instinct to take is therefore
 Four levers, ranked by expected payoff. Only the premises are measured; the
 task counts below are projections and are marked as such.
 
-**1. Batch the heads onto the channel axis -- TRIED, and it flips the
-sign** (SOFTMAX.md §10.3). At 1792 rows the op is **1.7x faster** than the
-CPU where at 64 rows it was 4.4x slower, with the crossover at about 400
-rows -- two ViT-B heads. Correctness is unchanged the whole way (1.11% to
-1.15% total variation), so the operand planes index correctly at 28x the
-width any probe had driven, and 28x the rows costs only 1.5x the tasks.
-The ceiling is 1792, which is the *sum tree's* depthwise channel limit
-rather than the plane's, so lever 2 would lift it. Two caveats keep this
-from being a verdict: the CPU arm is one core where IREE would thread it,
-and it is scalar Rust rather than IREE's codegen -- SOFTMAX.md §10.4 has
-both. The rest of this bullet is the original reasoning.
+**1. Batch the heads onto the channel axis -- TRIED. It works, and it is
+still not enough** (SOFTMAX.md §10.3 and **§13**). Batching took the op's
+cost from 7.7 to 1.07 microseconds a row, 28x the rows for 1.5x the tasks,
+with correctness unchanged the whole way (1.11% to 1.15% total variation)
+-- so the operand planes index correctly at 28x the width any probe had
+driven. The ceiling is 1792, the *sum tree's* depthwise channel limit
+rather than the plane's.
+
+**But the 1.7x that first reported was against a single CPU core, and the
+threaded comparison inverts it** (§13). Four A76s scale a row-parallel
+softmax at **4.03x to 4.05x**, so at 1792 rows the op is **2.25x to 2.42x
+slower** than the CPU it is replacing, and it loses to even two threads at
+every row count.
+No shape under the 1792 ceiling closes that. Lever 4 cannot either: it
+would need 2.42x and MULTICORE.md §12 measured 1.22x to 1.34x. Lever 2 plus
+lever 4 together reach roughly parity, which is not worth the accuracy cost
+and the two host boundaries. The rest of this bullet is the original
+reasoning, which still holds -- the *mechanism* was right and the baseline
+was wrong.
 
 This is the inversion, and the largest factor available. Cost is per
 task and arithmetic is free, so each task should be as *large* as the
@@ -1030,16 +1038,21 @@ attention matmuls already run at about 43% of f32 peak, which is not a
 number an offload beats easily. P10 also has 1.39x still to collect from a
 wider vector tile, so the CPU target moves before any of this lands.
 
-Levers 1, 2 and 3 have all been tried. Lever 1 flipped the sign (1.7x
-faster at 1792 rows). Lever 2's mechanism is confirmed and free, and
-measuring it turned the coefficient packer into the next piece of work --
-for C15 as much as for attention, since 69 ms an inference of uncacheable
-packing is a plausible share of C15's own loss. Lever 3 is closed negative:
-the row-max spread it would have to absorb is a property of attention
-rather than of this implementation, and no tuning closes two orders of
-magnitude. **Lever 4 and the packer are what is left.** C15 is still worth
-re-measuring, and now there is a specific reason to expect a different
-answer afterwards.
+Levers 1, 2 and 3 have all been tried, and the fair comparison has now
+been run (SOFTMAX.md §13). Lever 1's mechanism was right -- 7.7 to 1.07
+microseconds a row -- but against four threads rather than one the op is
+**2.42x slower**, so a standalone softmax on this device is underwater at
+every shape that fits. Lever 3 is closed negative, with its stated risk
+falsified into the bargain. Lever 4 is arithmetically incapable of closing
+a 2.42x gap at the 1.22x-1.34x its own path measured.
+
+**What survives is lever 2, and only inside a fused block.** Its all-ones
+denominator column is hardware-confirmed and free, and it pays exactly
+where §13.2's last caveat bites: given a PV matmul already on the NPU the
+epilogue costs nothing and there is no CPU softmax in the loop to beat.
+That is gated on the coefficient packer (69 ms an inference of uncacheable
+packing, 7.5x available) and on re-measuring C15 -- which are the two
+pieces of work left, and neither of them is a softmax problem.
 
 ---
 

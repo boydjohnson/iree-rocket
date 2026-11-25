@@ -866,41 +866,103 @@ fn softmax_wall_time_against_the_cpu() {
             npu * 1e3 / row_count as f64
         );
 
-        // The CPU arm: a plain scalar softmax over the same data. Not
-        // IREE's codegen -- see this test's doc comment.
-        let mut out = vec![0.0f32; row_count * keys];
-        let started = Instant::now();
-        for _ in 0..ITERATIONS {
-            for row in 0..row_count {
-                let logits = &rows_f32[row * keys..(row + 1) * keys];
-                let mut m = f32::NEG_INFINITY;
-                for &x in logits {
-                    m = m.max(x);
-                }
-                let mut sum = 0.0f32;
-                for (index, &x) in logits.iter().enumerate() {
-                    let e = (x - m).exp();
-                    out[row * keys + index] = e;
-                    sum += e;
-                }
-                let inverse = 1.0 / sum;
-                for value in &mut out[row * keys..(row + 1) * keys] {
-                    *value *= inverse;
-                }
+        // The CPU arm, at one thread and at the whole big cluster. §10.4
+        // called the one-thread comparison the reason not to believe lever
+        // 1's 1.7x, because IREE threads a softmax across its workers and
+        // this arm did not; §13 is what the threaded one measures. Still
+        // scalar Rust rather than IREE's codegen -- see this test's doc
+        // comment and ISSUES P10's remaining 1.39x.
+        let mut single = 0.0f64;
+        for threads in cpu_thread_counts() {
+            let cpu = time_cpu_softmax(&rows_f32, row_count, keys, threads, ITERATIONS);
+            if threads == 1 {
+                single = cpu;
             }
+            let speedup = if cpu > 0.0 { single / cpu } else { 0.0 };
+            println!(
+                "  CPU, scalar Rust, {threads} thread(s): {cpu:.3} ms per softmax \
+                 ({speedup:.2}x over one thread, {:.2} us a row)",
+                cpu * 1e3 / row_count as f64
+            );
+            println!(
+                "    ratio: the NPU op is {:.2}x this ({})",
+                npu / cpu,
+                if npu < cpu {
+                    "NPU faster"
+                } else {
+                    "CPU faster"
+                }
+            );
         }
-        let cpu = started.elapsed().as_secs_f64() / ITERATIONS as f64 * 1e3;
-        println!("  CPU, scalar Rust, same shape: {cpu:.3} ms per softmax");
-        println!(
-            "  ratio: the NPU op is {:.2}x the CPU's time ({})",
-            npu / cpu,
-            if npu < cpu {
-                "NPU faster"
-            } else {
-                "CPU faster"
-            }
-        );
-        // Keeps the CPU arm from being optimised away.
-        assert!(out.iter().all(|value| value.is_finite()));
     }
+}
+
+/// Thread counts for the CPU arm, from `PROBE_CPU_THREADS` as a
+/// comma-separated list; the default sweeps one to the big cluster.
+///
+/// RK3588 is four A76s and four A55s, and `taskset -c 4-7` is how every
+/// measurement in SOFTMAX.md pins the big cluster -- so four is the honest
+/// ceiling for a threaded CPU arm on this board, not eight.
+fn cpu_thread_counts() -> Vec<usize> {
+    match std::env::var("PROBE_CPU_THREADS") {
+        Ok(list) => list
+            .split(',')
+            .filter_map(|value| value.trim().parse().ok())
+            .filter(|&threads| threads >= 1usize)
+            .collect(),
+        Err(_) => vec![1, 2, 4],
+    }
+}
+
+/// A scalar softmax over `[row_count, keys]`, split across `threads`, timed
+/// per softmax.
+///
+/// Rows are independent, so the split needs no synchronisation at all and
+/// each thread runs every iteration over its own slice -- a persistent pool
+/// with no per-iteration barrier and no spawn inside the loop. That is
+/// deliberately **optimistic for the CPU**: IREE's task system does pay a
+/// per-dispatch barrier. The question here is whether the NPU still wins
+/// against a fairly-resourced CPU, so the CPU arm should be steelmanned
+/// rather than handicapped.
+fn time_cpu_softmax(
+    rows_f32: &[f32],
+    row_count: usize,
+    keys: usize,
+    threads: usize,
+    iterations: usize,
+) -> f64 {
+    let mut out = vec![0.0f32; row_count * keys];
+    let rows_per_thread = row_count.div_ceil(threads);
+    let started = Instant::now();
+    std::thread::scope(|scope| {
+        for (chunk, slice) in out.chunks_mut(rows_per_thread * keys).enumerate() {
+            let first = chunk * rows_per_thread;
+            let rows_here = slice.len() / keys;
+            scope.spawn(move || {
+                for _ in 0..iterations {
+                    for row in 0..rows_here {
+                        let logits = &rows_f32[(first + row) * keys..(first + row + 1) * keys];
+                        let mut m = f32::NEG_INFINITY;
+                        for &x in logits {
+                            m = m.max(x);
+                        }
+                        let mut sum = 0.0f32;
+                        for (index, &x) in logits.iter().enumerate() {
+                            let e = (x - m).exp();
+                            slice[row * keys + index] = e;
+                            sum += e;
+                        }
+                        let inverse = 1.0 / sum;
+                        for value in &mut slice[row * keys..(row + 1) * keys] {
+                            *value *= inverse;
+                        }
+                    }
+                }
+            });
+        }
+    });
+    let elapsed = started.elapsed().as_secs_f64() / iterations as f64 * 1e3;
+    // Keeps the arm from being optimised away.
+    assert!(out.iter().all(|value| value.is_finite()));
+    elapsed
 }

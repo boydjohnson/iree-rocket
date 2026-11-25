@@ -19,7 +19,13 @@ contradicts ROADMAP.md's "What this roadmap does not propose" entry for
 
 Evidence tags follow ISSUES.md: **[verified]** = read in this tree or in a
 cited capture during this design pass; **[hypothesis]** = inference not
-measured. Nothing below has been run on hardware as part of this document.
+measured. The design sections were written before anything had been run;
+§§7-13 are the hardware that followed, and where the two disagree the
+measurement wins and says so in place.
+
+**If you read one section, read §13.** The op is built, correct and
+measured, and it is 2.4x slower than four A76 cores at the widest shape it
+can run. §10.3's "1.7x faster" was against a single-core baseline.
 
 ---
 
@@ -1179,7 +1185,12 @@ two host steps, which §4 argued about at length, come to **0.009 ms of
 matters.
 
 
-### 10.3 Rows per task, measured: the sign flips at about 400 rows
+### 10.3 Rows per task, measured: the sign flips at about 400 rows -- against one core
+
+> Every ratio in this subsection is **against a single-threaded CPU arm**.
+> §13 ran the threaded one: four A76s scale at 4.05x and the op is 2.42x
+> slower at 1792 rows. The per-row costs below are correct and are the
+> point; the ratios are not the verdict.
 
 ROADMAP's lever 1, and it was the one worth trying. A task's cost is fixed
 and its width is nearly free, so the figure that matters is not the cost of
@@ -1217,7 +1228,7 @@ layer wants two passes -- and 6 + 6 rather than 9 + 3, since both halves
 should sit well past the crossover. §10.1's lever 2 would lift the ceiling
 outright by moving the sum onto the PV matmul, whose dense ceiling is 3584.
 
-### 10.4 Two reasons not to believe the 1.7x yet
+### 10.4 Two reasons not to believe the 1.7x -- the first one held
 
 **The CPU arm is one core.** This is the big one. IREE threads a softmax
 across its workers, and on four A76s the CPU side would be roughly 4x
@@ -1228,6 +1239,11 @@ on a full machine. The NPU has three cores too, so the honest next
 measurement is a threaded CPU arm against a fanned-out NPU arm, and
 MULTICORE.md §12's tile fan-out plus §10.1's lever 4 are how the second
 half of that would work.
+
+**Measured, in §13, and this prediction was right to the decimal.** Four
+threads come in at 4.05x one thread and the op is 2.42x *slower* at 1792
+rows. Everything in §10.3 below the one-core comparison stands as written;
+what it means does not. Read §13 before quoting the 1.7x.
 
 **And the CPU arm is still scalar Rust**, not IREE's codegen. P10 has 1.39x
 in hand from a wider vector tile, which alone moves the crossover from
@@ -1649,3 +1665,117 @@ and saves nothing, while a bound per *tensor* is strictly worse than per
 head. The only way to buy slack back would be a wider output encoding than
 Q15, which is the `int16`-PV-matmul question §11.6 leaves open for lever 2
 rather than anything lever 3 can reach on its own.
+
+---
+
+## 13. The fair comparison: §10.4 was right, and the op is underwater
+
+§10.4 named the one thing that would overturn lever 1's result:
+
+> **The CPU arm is one core.** This is the big one. IREE threads a softmax
+> across its workers, and on four A76s the CPU side would be roughly 4x
+> faster -- which would move the crossover above the 1792 ceiling and make
+> the NPU a loss again at every shape that fits.
+
+Measured. That is what happens.
+
+`softmax_wall_time_against_the_cpu` now runs its CPU arm at one, two and
+four threads (`PROBE_CPU_THREADS`), splitting rows -- which are independent,
+so the split needs no synchronisation and each thread runs every iteration
+over its own slice. That is a persistent pool with *no* per-iteration
+barrier, which is deliberately **optimistic for the CPU**: IREE's task
+system does pay a per-dispatch barrier. The question is whether the NPU
+still wins against a fairly-resourced CPU, so the CPU arm is steelmanned
+rather than handicapped.
+
+Board as always: `performance`, A76 at 2.4 GHz, `rocket_npu_clk_hz` 600
+MHz, `taskset -c 4-7`, 20 iterations after 3 warm-ups.
+
+| rows | NPU, 1 core | CPU, 1 thread | CPU, 2 | CPU, 4 | NPU vs CPU-4 |
+|---|---|---|---|---|---|
+| 197 | 0.566 ms | 0.343 | 0.182 | 0.092 | **6.17x slower** |
+| 788 | 1.033 | 1.366 | 0.679 | 0.349 | **2.96x slower** |
+| 1792 | 1.908 | 3.187 | 1.539 | 0.787 | **2.42x slower** |
+| 1792, repeated | 1.769 | 3.172 | 1.576 | 0.788 | **2.25x slower** |
+
+The NPU arm carries the 10% run-to-run spread §10 recorded, so the 1792
+figure is **2.25x to 2.42x slower**; the CPU arm is stable to under 1%
+(0.787 and 0.788 ms at four threads across the two runs).
+
+**The CPU threads almost perfectly**: 3.73x, 3.91x and 4.03x to 4.05x on
+four cores.
+It should -- softmax over rows is embarrassingly parallel and there is
+nothing to contend on. (The 4.05x is mildly superlinear; at 1792 rows the
+whole working set is 1.4 MB and a quarter of it per thread sits better in
+L2. Cache, not a measurement error.)
+
+So **lever 1's headline inverts**. At 1792 rows the op went from "1.7x
+faster than the CPU" to **2.25x to 2.42x slower**, and against even *two*
+threads it loses at every row count measured (1.12x to 1.24x at 1792). Per row the NPU bottoms out at 1.07
+microseconds where four threads do 0.44 -- and the NPU's figure is falling
+slowly now (1.31 at 788, 1.07 at 1792), so no row count that fits under the
+1792 ceiling closes it.
+
+### 13.1 What it would take, arithmetically
+
+The NPU needs **0.44 microseconds a row** to reach parity with four
+threads. Projecting from the measured per-task cost, labelled as projection:
+
+| | ms at 1792 rows | us a row | vs CPU-4 |
+|---|---|---|---|
+| today | 1.908 | 1.07 | 2.42x slower |
+| + lever 2 (sum tree gone, 8 of 19 tasks) | 0.803 | 0.45 | **1.02x, parity** |
+| + lever 4 at M2's measured 1.28x | 0.627 | 0.35 | 1.25x faster |
+| ...against CPU-4 with P10's 1.39x collected | 0.627 | 0.35 | 1.11x slower |
+
+Two things that falls out of, both worth stating plainly:
+
+**Fan-out alone cannot close this.** Lever 4 would need 2.42x and
+MULTICORE.md §12's tile fan-out measured 1.22x to 1.34x on ViT. So lever 4
+is not the answer to this gap, which is the reason it was not attempted
+here.
+
+**And lever 2 plus lever 4 together land at roughly parity**, because
+ISSUES P10's remaining 1.39x on the CPU side cancels most of what lever 4
+buys. Parity is not worth a 1.12% accuracy cost, three submissions, two
+host boundaries and a calibration surface.
+
+### 13.2 Three caveats, one of which favours the op
+
+**The CPU arm has no per-iteration barrier**, as above -- optimistic for the
+CPU. Real IREE at four workers would be somewhat worse than 0.787 ms.
+Against that, P10's 1.39x vector tile is uncollected and is the larger
+term, so the net still moves away from the NPU.
+
+**The NPU arm is one core**, and §13.1 is a projection from M2's ViT
+numbers rather than a measurement of fan-out on *this* op.
+
+**And the comparison charges the CPU nothing for data residency.** This is
+the real one, and §10.1 raised it before any of these numbers existed:
+inside an attention block the scores are already in device memory, and a
+CPU softmax there pays a round trip this microbenchmark never bills it for.
+A standalone softmax is the case this section measures and the case the op
+loses; a *fused* block is a different comparison that nobody has run. §11's
+all-ones column matters precisely there -- given an offloaded PV matmul the
+epilogue is nearly free, and there is no CPU softmax in the loop to beat.
+
+### 13.3 The verdict on the op
+
+It stays off, and now for a structural reason rather than a provisional
+one. The honest summary of this whole arc:
+
+> A standalone softmax on this NPU is **2.4x slower than four A76s** at the
+> widest shape it can run, and the gap is per-task interrupt cost against
+> work that threads perfectly. Lever 1 was real -- batching rows took the
+> per-row cost from 7.7 to 1.07 microseconds -- but it was racing a
+> one-core baseline. No remaining lever closes the gap against a full
+> machine; levers 2 and 4 together reach parity.
+
+What the work is actually worth is unchanged and is not small: every
+mechanism in it is measured, general and reusable -- the two operand
+planes, the Q15 bridge, the int16 read, `exp` with its tuned tail, the
+width-mapped reduction, the all-ones denominator column -- and §12 closed a
+lever with a falsified premise rather than leaving it open. The one place
+the op itself could still pay is a fused attention block, which is §13.2's
+third caveat and is gated on the coefficient packer and ISSUES C15, not on
+anything softmax can fix from here.
