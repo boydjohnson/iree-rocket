@@ -178,6 +178,12 @@ fn lever_2_round_trip_floor() {
 /// iterator pair rather than an indexed closure. Specialised to the 1x1
 /// fp16 shape a matmul takes -- which is all lever 2 needs -- and checked
 /// byte-for-byte against the real packer before it is timed.
+///
+/// **This generalised and landed on 2026-11-24** (`rocket_core::weights`'
+/// strided arm, COMPILER_ROADMAP.md 6.3), so the comparison below is no
+/// longer prototype-against-production: it is now an independent
+/// restatement of the layout agreeing byte-for-byte with the packer that
+/// ships, which is worth keeping for exactly that reason.
 fn pack_matmul_fp16_striped(k: usize, n: usize, dense: &[u8], packed: &mut [u8]) {
     // The fp16 coefficient layout, restated: 16 output kernels per 32-byte
     // weight atom, 32 input channels per coefficient group, input channels

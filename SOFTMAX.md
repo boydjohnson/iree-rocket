@@ -1476,6 +1476,24 @@ starts cheaper by the same factor.
 So the ordering is: the packer first, then lever 2 on top of it. Lever 2
 needs about 3.2x to break even and has 7.5x available.
 
+**The packer landed, 2026-11-24.** `rocket_core::weights` now packs every
+symmetric 1- and 2-byte filter as strided runs -- generalised past this
+section's 1x1 fp16 prototype to int8 and the whole 2-byte family at every
+kernel size, dense convolutions and matmuls alike -- with the
+per-coefficient arm kept as the fallback for a nonzero weight zero point,
+int4 nibbles and tf32's different group geometry, and as the reference an
+equivalence sweep compares against. `the_striped_packer_is_byte_identical`
+above still passes unchanged, which is now an independent restatement of
+the layout agreeing with the shipped packer rather than with the slow one.
+On the board the measured factor is 5.4-10.7x by shape (`weight_pack_rate_hw`,
+both arms in one process): `P^T` `[197, 197]` fp16 is 0.374-0.409 ms ->
+0.048 ms, so this section's 0.0485 ms and `P^T` at 0.42x the sum tree are
+confirmed on the generalised packer. COMPILER_ROADMAP.md 6.3 carries the
+per-model numbers and the honest negative that goes with them (a hoisted
+`.vmfb` never reaches the runtime packer at all, so an end-to-end model
+measurement shows nothing); ISSUES.md C15's 45 ms becomes about 6, which is
+the 39 ms predicted just above. **Lever 2's gate is open.**
+
 ### 11.6 What is still untested
 
 * **Claim 1**, `1/sqrt(d)` folding into the QK matmul's output converter.

@@ -25,7 +25,9 @@ pub enum Command {
 
 #[derive(Args)]
 pub struct CommonArgs {
-    /// Path to libIREECompiler.so. Falls back to the IREE_COMPILER_LIB env var.
+    /// Path to libIREECompiler.so. Falls back to the IREE_COMPILER_LIB env var,
+    /// then to `../lib/libIREECompiler.so` beside this executable (the
+    /// layout of the nightly `iree-compile-x86_64` tarball).
     #[arg(long)]
     pub iree_compiler_lib: Option<PathBuf>,
 
@@ -33,8 +35,10 @@ pub struct CommonArgs {
     #[arg(long)]
     pub input: PathBuf,
 
-    /// Rocket transform spec .mlir file. Defaults to the one in the sibling
-    /// rocket-compiler-plugin checkout.
+    /// Rocket transform spec .mlir file. Defaults to
+    /// `../share/rocket/rocket_conv2d_transform_spec.mlir` beside this
+    /// executable when that exists (the nightly tarball), else to the one in
+    /// the sibling rocket-compiler-plugin checkout.
     #[arg(long)]
     pub transform_spec: Option<PathBuf>,
 
@@ -135,6 +139,20 @@ pub struct CommonArgs {
     /// by the plugin and are target-independent. Defaults to the host triple.
     #[arg(long)]
     pub llvmcpu_target_triple: Option<String>,
+
+    /// Skip `rocket-pack-weights`, leaving every constant filter in its
+    /// logical HWCF order for the driver to pack at dispatch time.
+    ///
+    /// This exists to measure the runtime packer, which a hoisted module
+    /// never reaches: COMPILER_ROADMAP.md 6.3 moved constant-filter packing
+    /// to compile time, so a current `.vmfb` prints no `pack.weights` phase
+    /// at all and the driver's packer and `weight_cache` are only on the path
+    /// for a filter the hoist cannot reach. A module built with this flag is
+    /// the pre-6.3 configuration, which is the one `weight_cache.rs`'s 99 ms
+    /// and 6.3's own cold-start numbers were measured in. It is slower by
+    /// construction and is not a shipping configuration.
+    #[arg(long)]
+    pub no_pack_weights: bool,
 
     /// An extra IREE compiler flag, passed through verbatim after the ones
     /// this CLI sets, so it wins where they overlap. Repeatable. For

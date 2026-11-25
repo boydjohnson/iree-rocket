@@ -1,8 +1,22 @@
 name: Nightly artifacts
 
-# Builds the three things this repo exists to produce -- iree-compile with the
-# Rocket target plugin, iree-run-module/iree-benchmark-module for the RK3588
+# Builds the three things this repo exists to produce -- the compiler
+# (rocket-compiler plus iree-compile, sharing a libIREECompiler.so with the
+# Rocket target plugin), iree-run-module/iree-benchmark-module for the RK3588
 # board, and the board test binaries -- and attaches them to the run.
+#
+# Artifacts (each a single .tar.gz, so executable bits survive):
+#   iree-compile-x86_64        bin/rocket-compiler, bin/iree-compile,
+#                              bin/iree-lld, lib/libIREECompiler.so,
+#                              share/rocket/<transform spec>; unpack anywhere
+#                              and run bin/rocket-compiler, no env needed.
+#   iree-host-tools            the full host tools/ dir, for the aarch64 job.
+#   iree-runtime-aarch64       iree-run-module, iree-benchmark-module.
+#   rocket-cts-aarch64         rocket HAL CTS binaries.
+#   rocket-rust-tests-aarch64  the crates' libtest binaries.
+# All are built on a pinned runner image and need glibc 2.39 at most (the
+# `runner` / `max-glibc` inputs of iree-build.yml), so they load on both the
+# developer host and the board.
 #
 # Both jobs share iree-build.yml. runtime-aarch64 `needs:` compiler-host
 # because configure-runtime-aarch64.sh imports the host tools from that job's
