@@ -1777,5 +1777,6 @@ planes, the Q15 bridge, the int16 read, `exp` with its tuned tail, the
 width-mapped reduction, the all-ones denominator column -- and §12 closed a
 lever with a falsified premise rather than leaving it open. The one place
 the op itself could still pay is a fused attention block, which is §13.2's
-third caveat and is gated on the coefficient packer and ISSUES C15, not on
-anything softmax can fix from here.
+third caveat. The coefficient packer that gated it landed on 2026-11-24
+(§11.5), so what remains is ISSUES C15 -- not anything softmax can fix from
+here.
