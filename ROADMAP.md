@@ -867,8 +867,8 @@ both. The rest of this bullet is the original reasoning.
 
 This is the inversion, and the largest factor available. Cost is per
 task and arithmetic is free, so each task should be as *large* as the
-planner allows rather than as small as a cache. SOFTMAX.md §1.1 puts queries on the channel axis, so a ViT
-layer's twelve heads is `12 x 197 = 2364` channels -- inside the 13-bit
+planner allows rather than as small as a cache. SOFTMAX.md §1.1 puts
+queries on the channel axis, so a ViT layer's twelve heads is `12 x 197 = 2364` channels -- inside the 13-bit
 `DPU_DATA_CUBE_CHANNEL` and `PPU` extent fields, and inside the 3584-to-4096
 ceilings this file's own section records. A layer's softmax would be ~13
 tasks rather than twelve times that. It needs no new mechanism: only
