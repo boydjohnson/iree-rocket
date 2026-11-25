@@ -2496,9 +2496,9 @@ So the dwell is opt-in (`ROCKET_QUIESCE_DEPTHWISE=1`, which replaces
 `ROCKET_QUIESCE_OFF`). ConvNeXt-T fp16 ABAB on cpu 4-7, same `.vmfb`:
 104/102/103 -> 93.1/93.5/93.8 ms, 0 timeouts. The fp16 MobileNetV2 depthwise
 arm paid the same 17 ms per inference (P7). What stays open is whether a conv
-can retire on a PPU bit (docs/open-questions.md 1.1.2); the campaign shows
-only that no transition this driver makes exhibits the hazard. Gates: the
-campaign (500 rounds by default), compiled e2e 54/54 incl. the `mixed_*`
+can retire on a PPU bit (agent-docs/open-questions.md 1.1.2); the campaign
+shows only that no transition this driver makes exhibits the hazard. Gates:
+the campaign (500 rounds by default), compiled e2e 54/54 incl. the `mixed_*`
 transition cases.
 
 **ConvNeXt's 7x7 depthwise convolutions on the NPU — 2026-11-24.

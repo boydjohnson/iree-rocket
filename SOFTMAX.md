@@ -11,9 +11,9 @@ Read alongside the other four. [LIMITS.md](LIMITS.md) says what the stack is
 [ROADMAP.md](ROADMAP.md) says which operations the hardware could run but the
 compiler cannot reach; [COMPILER_ROADMAP.md](COMPILER_ROADMAP.md) is the
 compiler-side plumbing. This file answers
-[`docs/open-questions.md`](docs/open-questions.md) 4.7.2 -- "which of
-layernorm/GELU/softmax/transposes have a credible NPU path, given that
-softmax's reductions have no PPU path outside a pooling window" -- and
+[`agent-docs/open-questions.md`](agent-docs/open-questions.md) 4.7.2 --
+"which of layernorm/GELU/softmax/transposes have a credible NPU path, given
+that softmax's reductions have no PPU path outside a pooling window" -- and
 contradicts ROADMAP.md's "What this roadmap does not propose" entry for
 `linalg.softmax`, which says to revisit once the pieces exist. They exist.
 
