@@ -17,7 +17,8 @@ the compiler can claim, as opposed to which shapes of them, is
 
 Nothing here is a performance statement. Throughput, the CPU baseline the
 offload has to beat, and where the time actually goes are ISSUES.md P7/P8 and
-the README's "The CPU-only baseline"; a shape being inside every bound below
+[developer-tools.md](agent-docs/developer-tools.md)'s "The CPU-only
+baseline"; a shape being inside every bound below
 says only that it computes the right answer.
 
 ## Where a limit can bind
@@ -554,7 +555,8 @@ Build the arms with `rocket-compiler`, not a bare `iree-compile`: the
 `rocket-pin-unclaimed-dispatches` pass has to run between the `flow` and
 `stream` phases, and without it Stream's affinity analysis places the int8
 epilogue on `@rocket_device` and serialization fails on an op that is not a
-convolution. See the README's "Placement pinning".
+convolution. See
+[developer-tools.md](agent-docs/developer-tools.md)'s "Placement pinning".
 
 The MobileNetV2 fp16 stem carries a known **precision** cost rather than a
 correctness one: Rocket's ABI is f16-in/f32-accumulate, so the f32 stem feeding

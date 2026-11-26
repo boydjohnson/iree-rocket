@@ -4,7 +4,8 @@
 The repository already has a gate for *shapes* (`tools/e2e_conv_regression.py`)
 and one for *matmul geometry* (`tools/e2e_matmul_regression.py`). This is the
 gate for *models*: it takes a whole network, runs it through the product
-pipeline the README documents, and reports three things that only a real model
+pipeline agent-docs/developer-tools.md documents, and reports three things
+that only a real model
 can say.
 
 **Where the model ran**, from `rocket-compiler --report-json`: candidates,

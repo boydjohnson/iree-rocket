@@ -17,7 +17,7 @@ procedure are at the end.
 |---|---|
 | Host | Python with `onnx`, `onnxruntime`, `numpy` (a `uv venv` is enough), and `iree-import-onnx` on `PATH` from IREE's own Python packages. `gh` for the artifacts, `ssh`/`scp` to the board. |
 | Host | x86_64 Linux with glibc 2.39 or newer. The nightly's floor is the runner image's glibc; see `max-glibc` in the CI rundown. |
-| Board | RK3588 with the rocket kernel module loaded and `/dev/accel/accel0` present, reachable over SSH. Debian 13's glibc 2.41 is above the same floor. |
+| Board | RK3588, reachable over SSH, with `/dev/accel/accel0` present and the kernel module carrying the three patches in [`board-setup.md`](board-setup.md) -- on a stock module every pooling job is watchdog-killed and every timing is roughly double. Debian 13's glibc 2.41 is above the same floor. |
 | Neither | A local IREE build. Nothing below runs `cmake`. |
 
 `tools/export_onnx.py` additionally needs `torch` and `torchvision` (and
@@ -222,7 +222,8 @@ median of the rest.
 Board state belongs with the numbers, because it moves them: the `cpufreq`
 governor, the NPU's clock and kernel-module variant, and the NPU IRQ
 affinity. `tools/model_survey.py` reads all of it off the board and records it
-in `result.json`; by hand, record it yourself.
+in `result.json`; by hand, record it yourself, and check it first with the
+probe in [`board-setup.md`](board-setup.md#what-does-this-board-actually-have).
 
 ## 7. Where the time went
 

@@ -21,6 +21,24 @@ is the compiler-side plan those section numbers point into.
 | [Precision-transition probe](#precision-transition-probe) | The C8 int8-then-fp16 hang probe. |
 | [Submodules](#submodules) | Initializing `iree-src`. |
 
+## Repository layout
+
+Every component and what it is responsible for. `README.md` has the short
+version.
+
+| Path | Role |
+|---|---|
+| [`rocket-schema`](../rocket-schema) | Canonical FlatBuffers schema for Rocket executables; shared by the compiler plugin (C++) and the runtime crates (Rust). |
+| [`rocket-plan-ffi`](../rocket-plan-ffi) | Versioned C ABI (`include/rocket_plan.h`) over `rocket-core`'s planner, layout contract and weight packers, built as a host staticlib by the compiler plugin's CMake and linked into `libIREECompiler.so`; how the compiler asks the same planner -- and packs the same coefficient bytes -- the runtime does. |
+| [`rocket-core`](../rocket-core) | Pure, dependency-free Rust crate: convolution/matmul descriptors, hardware limits, layout geometry, CBUF partitioning and tile planning, with fallible `try_*` APIs that return a `PlanError` code instead of panicking. Shared by the runtime and, eventually, the compiler. |
+| [`iree-rocket-hal`](../iree-rocket-hal) | Low-level Rust crate: ioctl/mmap access to the RK3588 NPU and register command building. Consumes `rocket-core`'s plans and re-exports its planner under `rocket::conv`. |
+| [`rocket-hal-driver`](../rocket-hal-driver) | Rust `staticlib` implementing IREE's HAL driver interface, statically linked into IREE via `iree_register_external_hal_driver()`. Depends on `iree-rocket-hal` and `rocket-schema`. Includes HAL CTS wiring under `cts/`. |
+| [`rocket-compiler-plugin`](../rocket-compiler-plugin) | C++ IREE compiler target plugin ("Rocket"), loaded via `IREE_CMAKE_PLUGIN_PATHS`. Serializes executables using `rocket-schema`'s FlatBuffer format. |
+| [`rocket-compiler`](../rocket-compiler) | Rust driver over `libIREECompiler.so`. Applies the Rocket transform spec and the device flags it expects, and can audit why each convolution and matmul is where it is. |
+| [`tools`](../tools) | Python harnesses: ONNX import/export, the board regression gates, the whole-model survey, the precision-transition probe. |
+| `iree-build/iree-src` | `iree-org/iree` as a pinned git submodule. |
+| `iree-build` | CMake configuration used to build IREE with the Rocket driver/plugin. |
+
 ## Building
 
 Each of the three artifacts has its own build directory under `iree-build/`,
@@ -573,7 +591,10 @@ python3 tools/e2e_conv_regression.py --board "<board name>"
 ```
 
 It requires Python with NumPy, `ssh`/`scp` access to the board, the aarch64
-Rust target and cross-linker, and the host/aarch64 IREE builds described above.
+Rust target and cross-linker, and the host/aarch64 IREE builds described
+above. It also requires a board set up as [`board-setup.md`](board-setup.md)
+describes: on a stock kernel module the pooling gate fails on the module
+rather than on this stack.
 The compiled cases include the previously problematic VGG geometry (30x30,
 Cin=512, Cout=512, 3x3) and a 40-channel 3x3 depthwise convolution that crosses
 the driver's 32-channel weight-packing group boundary.

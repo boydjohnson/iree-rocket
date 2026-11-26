@@ -3,162 +3,203 @@
 [![CI](https://github.com/boydjohnson/iree-rocket/actions/workflows/ci.yml/badge.svg?branch=main)](https://github.com/boydjohnson/iree-rocket/actions/workflows/ci.yml)
 [![Nightly artifacts](https://github.com/boydjohnson/iree-rocket/actions/workflows/nightly.yml/badge.svg?branch=main)](https://github.com/boydjohnson/iree-rocket/actions/workflows/nightly.yml)
 
-Mono-repo for building [IREE](https://github.com/iree-org/iree) with support
-for the Rocket NPU backend (RK3588). This repository produces:
+An [IREE](https://github.com/iree-org/iree) backend for the RK3588 NPU, built
+on the **mainline `accel/rocket` kernel driver** -- no RKNN SDK, no vendor
+runtime, no closed blobs anywhere in the path. An ONNX or MLIR model is
+compiled ahead of time into a `.vmfb` and executed by `iree-run-module` with
+the NPU registered as an IREE HAL device, so a model's convolutions and
+matmuls run on the accelerator while everything else runs on IREE's own CPU
+backend in the same process.
 
-- `iree-compile` — with the Rocket compiler target registered.
-- `iree-run-module` / `iree-benchmark-module` — with the Rocket HAL driver
-  statically linked in.
+Apache-2.0 with the LLVM exception, like IREE itself.
 
-## Layout
+## Where the project stands
+
+Ten ONNX models compile, offload and run correctly on an RK3588, each
+measured against a CPU baseline built by the **same compiler pipeline** with
+offload disabled. Medians on four Cortex-A76 cores, NPU at 600 MHz
+([full survey, 2026-11-25](agent-docs/survey-2026-11-25-main.md), including
+the eight-core column and the per-op site counts):
+
+| model | NPU | CPU baseline | |
+|---|---|---|---|
+| mobilenet_v2 fp16 | 9.6 ms | 54.3 ms | 5.6x |
+| resnet50 fp16 | 52.0 ms | 894 ms | 17.2x |
+| resnext50_32x4d fp16 | 55.6 ms | 502 ms | 9.0x |
+| wide_resnet50_2 fp16 | 87.9 ms | 1904 ms | 21.7x |
+| convnext_tiny fp16 | 94.1 ms | 252 ms | 2.7x |
+| vit_b_16 fp16 | 202 ms | 1664 ms | 8.2x |
+| vit_l_16 fp16 | 671 ms | 11430 ms | 17.0x |
+| blip fp16 | 817 ms | 4818 ms | 5.9x |
+| bert_base f32 | 106 ms | 1241 ms | 11.7x |
+| bert_base_384 f32 | 412 ms | 4846 ms | 11.8x |
+
+All twenty arms agreed with an ONNX Runtime oracle on the predicted class,
+with no NPU timeouts. One caveat on the first row, because it is the one most
+often quoted: MobileNetV2's baseline there is the model's fp16 export, and
+IREE's CPU codegen is 1.76x worse at fp16 than f32 on an A76. Against the
+**f32 import** -- the precision-matched comparison -- the same offload is
+10.0 ms against 30.9, i.e. **3.1x**. Both are real; only a labelled one is
+useful.
+
+**On the NPU today:** dense and depthwise 2-D convolution at stride 1 and 2,
+matmul (including `matvec`/`vecmat`), max/min/average pooling, in fp16 and
+int8, with constant filters packed at compile time and NPU-to-NPU dispatch
+chaining that keeps intermediate tensors in the hardware's own layout.
+Two-tensor element-wise and batched attention are implemented and **off by
+default** because they are measured slower -- the flags exist so either arm
+can be measured rather than argued about.
+
+**Not reached yet:** softmax, layernorm, the reductions and transposes around
+them, and element-wise at a profitable cost. [`ROADMAP.md`](ROADMAP.md) is the
+operation-by-operation account of what the hardware could run, what it would
+take, and in what order.
+
+## Try it on a board
+
+The compiler and the board runtime both come prebuilt, so nothing below
+builds IREE. Full version, with the ONNX Runtime oracle and the baseline arm,
+in [`agent-docs/onnx-to-numbers.md`](agent-docs/onnx-to-numbers.md).
+
+> **First, the board.** Every result above was measured on the mainline
+> `rocket` module **plus three out-of-tree patches** (PPU completion, the NPU
+> clock parameters, reset-before-IOMMU-detach). On a stock module, pooling
+> jobs are killed by the watchdog at ~500 ms, timings roughly double, and a
+> job timeout can corrupt the submitting process. The patches are not
+> published yet; [`agent-docs/board-setup.md`](agent-docs/board-setup.md)
+> says what each does, what breaks without it, and how to check what your
+> board has.
+
+```sh
+# 1. The last green nightly: an x86_64 Linux compiler and an aarch64 runtime.
+run=$(gh run list --repo boydjohnson/iree-rocket --workflow=nightly.yml \
+    --status=success --limit=1 --json databaseId -q '.[0].databaseId')
+gh run download --repo boydjohnson/iree-rocket "$run" \
+    -n iree-compile-x86_64 -n iree-runtime-aarch64
+tar -xzf iree-compile-x86_64.tar.gz && tar -xzf iree-runtime-aarch64.tar.gz
+
+# 2. An ONNX model, imported with its shapes pinned and an oracle beside it.
+tools/export_onnx.py mobilenet_v2 --out-dir models
+tools/import_onnx.py models/mobilenet_v2.fp16.onnx --out-dir mnv2
+
+# 3. Compile for the board, and ask where each convolution and matmul went.
+iree-compile-x86_64/bin/rocket-compiler compile \
+    --input mnv2/mobilenet_v2.fp16.mlir --output mnv2/mnv2.npu.vmfb \
+    --llvmcpu-target-triple aarch64-linux-gnu
+iree-compile-x86_64/bin/rocket-compiler audit \
+    --input mnv2/mobilenet_v2.fp16.mlir
+
+# 4. Run it on the board.
+scp iree-runtime-aarch64/bin/iree-run-module mnv2/mnv2.npu.vmfb \
+    mnv2/mobilenet_v2.fp16.input.bin board:~/
+ssh board './iree-run-module --module=mnv2.npu.vmfb --function=main_graph \
+    --device=rocket --device=local-task \
+    --input=1x3x224x224xf16=@mobilenet_v2.fp16.input.bin \
+    --output=@out.npy'
+```
+
+`audit` is the command worth running first on any model of your own: it prints
+one line per convolution and matmul -- shape, precision, where it went, and
+the decisive reason -- then reconciles that against the dispatches the
+compiled module actually contains. A refusal names its class, so `shape` and
+`semantics` are compiler work, `validation` means nobody has measured that
+configuration yet, and `hardware` never closes.
+
+## Known limitations
+
+- **The board needs a patched kernel module**, as above. This is the single
+  biggest obstacle to reproducing anything here, and the patches are not
+  published yet.
+- **There is no code generator for this target.** The NPU runs only the
+  dispatches the transform spec creates, so an operation reaches it only if a
+  matcher claims it; unclaimed work stays on the CPU and still runs correctly.
+- **An offloaded convolution runs its inputs at f16** (the ABI is
+  f16-in/f32-accumulate). Where an f32 stem feeds int8 quantization, as in
+  MobileNetV2, that is ~0.35-0.42 max|err| on the final logits, with the
+  predicted class stable except on near-ties.
+- **Two known-wrong cases are open:** a HuggingFace float16-converted ViT
+  mis-imports through torch-mlir -- on the host CPU, with no NPU involved
+  (ISSUES.md C14) -- and VGG int8 aborts under a repeated benchmark loop
+  (ISSUES.md C11).
+- **[`LIMITS.md`](LIMITS.md) records measurements, not capability.** A shape
+  outside it is untested rather than unsupported; the register fields are
+  almost always wider than the constants.
+- **No tagged release yet**, and nightly artifacts expire after 14 days, so a
+  link to a nightly run is not a durable reference.
+
+## How this fits upstream
+
+Nothing here is a fork. The compiler side is an out-of-tree IREE target
+plugin loaded through `IREE_CMAKE_PLUGIN_PATHS`, and the runtime side is an
+external HAL driver registered through IREE's own
+`iree_register_external_hal_driver()`. IREE itself is a pinned commit of
+`iree-org/iree` as a submodule, with no patches applied by the build.
+
+The kernel side is mainline `accel/rocket` plus three patches that are not
+upstream, and getting them there is the useful next step for anyone working on
+that driver: **unconditional PPU completion** (upstream arms only the DPU
+interrupts, so tiled pooling cannot complete), **NPU clock control** (the SoC
+boots the NPU pinned at 200 MHz with no devfreq -- whether the right upstream
+shape is an OPP table and a governor rather than the module parameters used
+here is an open question), and **reset before IOMMU detach** on a job timeout.
+
+What would help most from the hardware side is evidence for the
+configurations the admission policy currently refuses as *unmeasured* rather
+than *impossible*: register documentation or vendor captures for the shape
+classes listed in [`LIMITS.md`](LIMITS.md), since every bound there is the
+extent of an actual measurement and the register encodings are wider.
+
+## Repository layout
 
 | Path | Role |
 |---|---|
-| [`rocket-schema`](rocket-schema) | Canonical FlatBuffers schema for Rocket executables; shared by the compiler plugin (C++) and the runtime crates (Rust). |
-| [`rocket-plan-ffi`](rocket-plan-ffi) | Versioned C ABI (`include/rocket_plan.h`) over `rocket-core`'s planner, layout contract and weight packers, built as a host staticlib by the compiler plugin's CMake and linked into `libIREECompiler.so`; how the compiler asks the same planner -- and packs the same coefficient bytes -- the runtime does. |
-| [`rocket-core`](rocket-core) | Pure, dependency-free Rust crate: convolution/matmul descriptors, hardware limits, layout geometry, CBUF partitioning and tile planning, with fallible `try_*` APIs that return a `PlanError` code instead of panicking. Shared by the runtime and, eventually, the compiler. |
-| [`iree-rocket-hal`](iree-rocket-hal) | Low-level Rust crate: ioctl/mmap access to the RK3588 NPU and register command building. Consumes `rocket-core`'s plans and re-exports its planner under `rocket::conv`. |
-| [`rocket-hal-driver`](rocket-hal-driver) | Rust `staticlib` implementing IREE's HAL driver interface, statically linked into IREE via `iree_register_external_hal_driver()`. Depends on `iree-rocket-hal` and `rocket-schema`. Includes HAL CTS wiring under `cts/`. |
-| [`rocket-compiler-plugin`](rocket-compiler-plugin) | C++ IREE compiler target plugin ("Rocket"), loaded via `IREE_CMAKE_PLUGIN_PATHS`. Serializes executables using `rocket-schema`'s FlatBuffer format. |
-| [`rocket-compiler`](rocket-compiler) | Rust driver over `libIREECompiler.so`. Applies the Rocket transform spec and the device flags it expects, and can audit why each convolution and matmul is where it is. |
-| [`tools`](tools) | Python harnesses: ONNX import/export, the board regression gates, the whole-model survey, the precision-transition probe. |
-| `iree-build/iree-src` | `iree-org/iree` as a pinned git submodule. |
-| `iree-build` | CMake configuration used to build IREE with the Rocket driver/plugin. |
+| [`rocket-core`](rocket-core) | The planner: convolution/matmul descriptors, hardware limits, layout geometry, CBUF partitioning and tiling. Pure Rust, no dependencies, shared by the compiler and the runtime. |
+| [`rocket-plan-ffi`](rocket-plan-ffi) | A versioned C ABI over that planner, so the compiler asks the same planner -- and packs the same coefficient bytes -- the runtime does. |
+| [`iree-rocket-hal`](iree-rocket-hal) | ioctl/mmap access to the NPU and register command building. |
+| [`rocket-hal-driver`](rocket-hal-driver) | The IREE HAL driver, statically linked into IREE's tools. Includes HAL CTS wiring. |
+| [`rocket-compiler-plugin`](rocket-compiler-plugin) | The IREE compiler target plugin ("Rocket"), in C++, plus the transform spec that matches and rewrites operations. |
+| [`rocket-compiler`](rocket-compiler) | The compiler driver: applies the transform spec and the device flags it expects, and audits where every convolution and matmul went. |
+| [`rocket-schema`](rocket-schema) | The FlatBuffers executable format shared by both sides. |
+| [`tools`](tools) | ONNX import/export, the board regression gates, the model survey, the precision probe. |
+| [`iree-build`](iree-build) | CMake configuration, and `iree-src`, IREE as a pinned submodule. |
 
-## Documents
-
-| Document | What it holds |
-|---|---|
-| [`agent-docs/onnx-to-numbers.md`](agent-docs/onnx-to-numbers.md) | **An ONNX model to numbers on the board, end to end, with no local IREE build** -- the nightly artifacts, pinned import with an oracle, both compile arms, the board run, the timing rules, and ten models' measured results. |
-| [`agent-docs/developer-tools.md`](agent-docs/developer-tools.md) | **Start here to work on the repo.** How to build the three configurations, compile a model with `rocket-compiler`, read an `audit`, every flag that changes placement, `ROCKET_PROFILE` and the runtime's environment knobs, the board regression gates, the model survey and the precision probe. |
-| [`LIMITS.md`](LIMITS.md) | What the stack is *measured* to do: the channel, kernel, stride and precision bounds, and which of them each layer enforces. |
-| [`ISSUES.md`](ISSUES.md) | What is still open, with the measurements behind each entry. |
-| [`ROADMAP.md`](ROADMAP.md) | Which MLIR operations the hardware could run but the compiler cannot yet reach. |
-| [`COMPILER_ROADMAP.md`](COMPILER_ROADMAP.md) | The compiler-side plan; the section numbers other documents cite. |
-| [`DYNAMIC_SHAPES.md`](DYNAMIC_SHAPES.md), [`SOFTMAX.md`](SOFTMAX.md) | Single-topic design notes. |
-| [`rocket-hal-driver/MULTICORE.md`](rocket-hal-driver/MULTICORE.md) | The multi-context worker design and its measurements. |
-| [`rocket-schema/README.md`](rocket-schema/README.md) | The executable format and its compatibility rules. |
-| [`agent-docs/`](agent-docs) | Working notes: open questions, branch audits, dated survey results. |
-
-## Getting started
-
-```sh
-git submodule update --init --recursive   # iree-src and its own submodules
-cargo test --workspace                    # the Rust side, no IREE build needed
-```
-
-The CMake builds, the compiler driver and the board workflow are all in
-[`agent-docs/developer-tools.md`](agent-docs/developer-tools.md).
-
-To go from an ONNX model to a timed, oracle-checked run on the board **without
-building IREE at all**, follow
-[`agent-docs/onnx-to-numbers.md`](agent-docs/onnx-to-numbers.md): it takes the
-`iree-compile-x86_64` and `iree-runtime-aarch64` artifacts from the last green
-[nightly run](https://github.com/boydjohnson/iree-rocket/actions/workflows/nightly.yml),
-which unpack anywhere and need no environment setup, and ends in the measured
-results for ten models.
+Each component's detailed role is in
+[`agent-docs/developer-tools.md`](agent-docs/developer-tools.md#repository-layout).
 
 ## Continuous integration
 
-Three workflows, under [`.github/workflows/`](.github/workflows). The badges
-are live -- each shows its workflow's latest run on `main`; the reusable one
-has none of its own, for the reason in the table.
-
-| Workflow | Status | Trigger | Jobs | Typical runtime |
-|---|---|---|---|---|
-| [`ci.yml`](.github/workflows/ci.yml) -- **CI** | [![CI](https://github.com/boydjohnson/iree-rocket/actions/workflows/ci.yml/badge.svg?branch=main)](https://github.com/boydjohnson/iree-rocket/actions/workflows/ci.yml) | every push to `main`, every pull request | `check, build, test`; `cargo fmt --check` | ~1.5 min |
-| [`nightly.yml`](.github/workflows/nightly.yml) -- **Nightly artifacts** | [![Nightly artifacts](https://github.com/boydjohnson/iree-rocket/actions/workflows/nightly.yml/badge.svg?branch=main)](https://github.com/boydjohnson/iree-rocket/actions/workflows/nightly.yml) | `cron 0 7 * * *` (07:00 UTC), `workflow_dispatch` | `compiler-host`, then `runtime-aarch64` | ~20 min warm ccache, up to ~4 h cold |
-| [`iree-build.yml`](.github/workflows/iree-build.yml) -- **IREE build (reusable)** | no badge: `workflow_call` only, so its runs are attributed to the caller | called by `nightly.yml` | one `build` job per `target` input | see above |
-
-### CI -- `ci.yml`
-
-The gate on every pull request. Rust only: it never configures CMake and never
-builds IREE, so it cannot catch a C++ plugin or CMake break -- that is the
-nightly's job.
-
-- **`check, build, test`** (`ubuntu-latest`) -- `cargo check --workspace
-  --all-targets`, then `cargo build --workspace`, then `cargo test
-  --workspace` over the whole Cargo workspace (`rocket-core`,
-  `rocket-plan-ffi`, `rocket-schema`, `iree-rocket-hal`, `rocket-hal-driver`,
-  `rocket-compiler`). Installs `libclang-dev` first, because
-  `rocket-hal-driver` and `iree-rocket-hal` both run bindgen over C headers
-  (`vendor/iree-headers`, `rkt_registers.h`) from `build.rs`. Stable Rust,
-  with `Swatinem/rust-cache`. The hardware tests -- the ones that open
-  `/dev/accel/accel0` -- are `#[ignore]`d, so this covers the host-safe unit
-  tests only; the real NPU gates are run by hand against a board
-  ([developer tools](agent-docs/developer-tools.md#board-convolution-regression-gate)).
-- **`cargo fmt --check`** (`ubuntu-latest`) -- `cargo fmt --all -- --check` on
-  **nightly** rustfmt, not stable: `rustfmt.toml` sets `imports_granularity`,
-  which is still unstable, and stable rustfmt would silently ignore it and
-  disagree with how the code is actually formatted.
-
-There is no clippy job and no lit-test job.
-
-### Nightly artifacts -- `nightly.yml`
-
-Builds the three things this repo exists to produce and attaches them to the
-run. Both jobs delegate to `iree-build.yml`; `runtime-aarch64` `needs:`
-`compiler-host`, because the aarch64 configuration points `IREE_HOST_BIN_DIR`
-at the host build's `tools/` for the codegen tools IREE runs on the host even
-when cross-compiling. Runs overlapping an earlier nightly cancel it
-(`concurrency: cancel-in-progress`) rather than fight it for the shared
-ccache. `workflow_dispatch` takes a `retention-days` input, default 14.
-
-- **`compiler-host`** -- configures the vendored `iree-src` with the Rocket
-  compiler target plugin (`iree-build/configure-compiler-host.sh`, Release,
-  `IREE_BUILD_TESTS=OFF`), builds it, then builds `rocket-compiler`
-  separately with cargo (it `dlopen`s `libIREECompiler.so` rather than linking
-  it). Packaging rewrites each tool's RUNPATH to `$ORIGIN/../lib` with
-  `patchelf`, so the tarball works unpacked anywhere, and then **smoke-tests
-  the packaged binary the way a user gets it**: untarred in a scratch
-  directory with `env -i`, compiling a model both with and without
-  `--no-offload`, with the checkout's own copy of the transform spec moved
-  aside so a broken packaged lookup cannot hide behind it. Uploads
-  `iree-compile-x86_64` (`bin/rocket-compiler`, `bin/iree-compile`,
-  `bin/iree-lld`, `lib/libIREECompiler.so`, `share/rocket/<spec>`) and
-  `iree-host-tools` (the full host `tools/` dir, for the next job). Default
-  timeout 330 min -- deliberately under GitHub's 6 h ceiling, so a build that
-  runs long still reaches its ccache save step.
-- **`runtime-aarch64`** -- unpacks `iree-host-tools` back into
-  `iree-build/build/`, installs the `gcc`/`g++-aarch64-linux-gnu` cross
-  toolchain, configures with `iree-build/configure-runtime-aarch64.sh`
-  (Release, `IREE_ENABLE_WERROR_FLAG=OFF`, tests **on** -- that is what builds
-  the CTS) and builds `iree-run-module` / `iree-benchmark-module` with the
-  Rocket HAL driver statically linked. Then `cargo test --workspace --release
-  --target aarch64-unknown-linux-gnu --no-run` for the crates' own libtest
-  binaries, which the CMake build never produces. Uploads
-  `iree-runtime-aarch64`, `rocket-cts-aarch64` (the non-executable HAL CTS
-  categories) and `rocket-rust-tests-aarch64`, the last two with a `RUN.md`
-  saying how to run them on the board. Timeout 120 min: no LLVM here.
-
-A nightly that fails with *"the hosted runner lost communication with the
-server"* and no failed step lost its runner mid-build (the LLVM compile is the
-usual place); it is not a repo break. Re-run it -- the retry restores the last
-successful run's ccache, so it is warm.
-
-Every artifact is a single `.tar.gz` -- `actions/upload-artifact` zips its
-input and the zip round-trip drops the executable bit. Each carries a
-`VERSION.txt` naming the repo SHA, the `iree-src` pin and the run URL.
-
-### IREE build (reusable) -- `iree-build.yml`
-
-One `build` job, parameterized by `target` (`compiler-host` or
-`runtime-aarch64`); an unknown value fails the job up front, since every build
-step is gated on it and a typo would otherwise produce a green job that built
-nothing. Inputs worth knowing about:
-
-| Input | Default | Why |
+| Workflow | Status | What it gates |
 |---|---|---|
-| `runner` | `ubuntu-24.04` | Pinned, never `ubuntu-latest`: the image's glibc becomes the floor of every binary built on it, and `ubuntu-latest` moved to 26.04 (glibc 2.43) in November 2026, after which no artifact ran on either consumer. |
-| `max-glibc` | `2.39` | Ceiling on the newest `GLIBC_x.y` symbol a shipped binary may require. `.github/scripts/check-glibc-ceiling.sh` fails the job above it, before upload, rather than letting it fail in a user's shell. At or under both consumers: the developer host (Ubuntu 24.04, 2.39) and the board (Debian 13, 2.41). |
-| `timeout-minutes` | 330 | Under GitHub's hard 6 h ceiling so the ccache save still runs. |
-| `retention-days` | 14 | Artifact retention. |
+| [`ci.yml`](.github/workflows/ci.yml) | [![CI](https://github.com/boydjohnson/iree-rocket/actions/workflows/ci.yml/badge.svg?branch=main)](https://github.com/boydjohnson/iree-rocket/actions/workflows/ci.yml) | Every push and pull request: `cargo check`, `build`, `test` and `fmt` over the Rust workspace. Rust only -- it does not build IREE. |
+| [`nightly.yml`](.github/workflows/nightly.yml) | [![Nightly artifacts](https://github.com/boydjohnson/iree-rocket/actions/workflows/nightly.yml/badge.svg?branch=main)](https://github.com/boydjohnson/iree-rocket/actions/workflows/nightly.yml) | Nightly, and the reason the prebuilt binaries above exist: the compiler with the Rocket plugin, the board runtime with the Rocket driver, the HAL CTS binaries and the crates' board test binaries. |
 
-ccache does the heavy lifting: the key is keyed on the **`iree-src` submodule
-SHA** (not `github.sha`, which would throw away the whole LLVM build on every
-unrelated Rust commit) plus the runner image and the configure scripts, with
-restore-keys that deliberately fall back across IREE bumps. Restore and save
-are separate steps rather than `actions/cache`, so a build that fails or times
-out still banks the objects it did compile. The two targets get separate caches
-(3 GB host, 1 GB aarch64) to stay under the 10 GB per-repo budget -- otherwise
-the two nightly jobs evict each other's LLVM objects every run.
+The hardware tests are `#[ignore]`d in CI -- nothing in GitHub Actions has an
+NPU -- so correctness on the device is gated by three end-to-end regression
+suites (convolution, matmul, pooling) run by hand against a real board, each
+comparing against independently compiled CPU results, most cases exactly
+rather than within a tolerance. Job-by-job detail is in
+[`agent-docs/ci.md`](agent-docs/ci.md).
+
+## Documents
+
+[`LIMITS.md`](LIMITS.md) is what the stack is *measured* to do and which layer
+enforces each bound. [`ISSUES.md`](ISSUES.md) is every open defect with the
+measurements behind it. [`ROADMAP.md`](ROADMAP.md) is which operations the
+hardware could reach and in what order; [`COMPILER_ROADMAP.md`](COMPILER_ROADMAP.md)
+is the compiler-side plan, with [`DYNAMIC_SHAPES.md`](DYNAMIC_SHAPES.md) and
+[`SOFTMAX.md`](SOFTMAX.md) as single-topic notes.
+
+[`agent-docs/`](agent-docs) holds the detailed working documents --
+[board setup](agent-docs/board-setup.md), the
+[ONNX-to-board walkthrough](agent-docs/onnx-to-numbers.md),
+[developer tools](agent-docs/developer-tools.md), [CI](agent-docs/ci.md),
+open questions and dated survey results. They are written for contributors
+rather than for a first read.
+
+## Building from source
+
+Clone with submodules (`git submodule update --init --recursive`), then
+`cargo test --workspace` for the Rust side, which needs no IREE build. The
+three CMake configurations -- the compiler, the host runtime and the aarch64
+runtime -- are in
+[`agent-docs/developer-tools.md`](agent-docs/developer-tools.md#building).
