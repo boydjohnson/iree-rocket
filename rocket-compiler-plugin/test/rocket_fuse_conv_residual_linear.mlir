@@ -19,7 +19,7 @@
 // CHECK-NEXT: arith.addf
 // CHECK-NEXT: linalg.yield
 // CHECK: tensor.expand_shape
-// CHECK-NOT: linalg.add
+// CHECK-NOT: linalg.elementwise <add>
 util.func public @linear_residual_f32_import(%input: tensor<1x14x14x384xf16>,
     %filter: tensor<1x1x384x64xf16>, %bias: tensor<64xf32>, %skip: tensor<1x1x14x14x64xf32>) -> tensor<1x1x14x14x64xf32> {
   %zero = arith.constant 0.000000e+00 : f32
@@ -36,7 +36,7 @@ util.func public @linear_residual_f32_import(%input: tensor<1x14x14x384xf16>,
   %expanded = tensor.expand_shape %conv [[0], [1, 2], [3], [4]] output_shape [1, 1, 14, 14, 64]
       : tensor<1x14x14x64xf32> into tensor<1x1x14x14x64xf32>
   %sum_empty = tensor.empty() : tensor<1x1x14x14x64xf32>
-  %sum = linalg.add ins(%skip, %expanded : tensor<1x1x14x14x64xf32>, tensor<1x1x14x14x64xf32>) outs(%sum_empty : tensor<1x1x14x14x64xf32>) -> tensor<1x1x14x14x64xf32>
+  %sum = linalg.elementwise <add> ins(%skip, %expanded : tensor<1x1x14x14x64xf32>, tensor<1x1x14x14x64xf32>) outs(%sum_empty : tensor<1x1x14x14x64xf32>) -> tensor<1x1x14x14x64xf32>
   util.return %sum : tensor<1x1x14x14x64xf32>
 }
 
@@ -51,7 +51,7 @@ util.func public @linear_residual_f32_import(%input: tensor<1x14x14x384xf16>,
 // CHECK-SAME: ins(%[[CONV]], %{{.+}}, %{{.+}} : tensor<1x28x28x32xf32>, tensor<32xf32>, tensor<1x28x28x32xf32>)
 // CHECK: linalg.transpose ins(%[[EPILOGUE]] : tensor<1x28x28x32xf32>)
 // CHECK-SAME: permutation = [0, 3, 1, 2]
-// CHECK-NOT: linalg.add
+// CHECK-NOT: linalg.elementwise <add>
 util.func public @linear_residual_nchw_f32(%input: tensor<1x28x28x384xf16>,
     %filter: tensor<1x1x384x32xf16>, %bias: tensor<32xf32>, %skip: tensor<1x32x28x28xf32>)
     -> tensor<1x32x28x28xf32> {
@@ -69,7 +69,7 @@ util.func public @linear_residual_nchw_f32(%input: tensor<1x28x28x384xf16>,
   %t = linalg.transpose ins(%conv : tensor<1x28x28x32xf32>)
       outs(%t_empty : tensor<1x32x28x28xf32>) permutation = [0, 3, 1, 2]
   %sum_empty = tensor.empty() : tensor<1x32x28x28xf32>
-  %sum = linalg.add ins(%t, %skip : tensor<1x32x28x28xf32>, tensor<1x32x28x28xf32>)
+  %sum = linalg.elementwise <add> ins(%t, %skip : tensor<1x32x28x28xf32>, tensor<1x32x28x28xf32>)
       outs(%sum_empty : tensor<1x32x28x28xf32>) -> tensor<1x32x28x28xf32>
   util.return %sum : tensor<1x32x28x28xf32>
 }
@@ -78,7 +78,7 @@ util.func public @linear_residual_nchw_f32(%input: tensor<1x28x28x384xf16>,
 // channels, so the add stays where it is.
 //
 // CHECK-LABEL: util.func public @linear_residual_cout24_declines
-// CHECK: linalg.add
+// CHECK: linalg.elementwise <add>
 util.func public @linear_residual_cout24_declines(%input: tensor<1x56x56x384xf16>,
     %filter: tensor<1x1x384x24xf16>, %bias: tensor<24xf32>, %skip: tensor<1x1x56x56x24xf32>) -> tensor<1x1x56x56x24xf32> {
   %zero = arith.constant 0.000000e+00 : f32
@@ -95,7 +95,7 @@ util.func public @linear_residual_cout24_declines(%input: tensor<1x56x56x384xf16
   %expanded = tensor.expand_shape %conv [[0], [1, 2], [3], [4]] output_shape [1, 1, 56, 56, 24]
       : tensor<1x56x56x24xf32> into tensor<1x1x56x56x24xf32>
   %sum_empty = tensor.empty() : tensor<1x1x56x56x24xf32>
-  %sum = linalg.add ins(%skip, %expanded : tensor<1x1x56x56x24xf32>, tensor<1x1x56x56x24xf32>) outs(%sum_empty : tensor<1x1x56x56x24xf32>) -> tensor<1x1x56x56x24xf32>
+  %sum = linalg.elementwise <add> ins(%skip, %expanded : tensor<1x1x56x56x24xf32>, tensor<1x1x56x56x24xf32>) outs(%sum_empty : tensor<1x1x56x56x24xf32>) -> tensor<1x1x56x56x24xf32>
   util.return %sum : tensor<1x1x56x56x24xf32>
 }
 
@@ -103,7 +103,7 @@ util.func public @linear_residual_cout24_declines(%input: tensor<1x56x56x384xf16
 // into an NPU add and a CPU clamp.
 //
 // CHECK-LABEL: util.func public @residual_then_relu_declines_linear
-// CHECK: linalg.add
+// CHECK: linalg.elementwise <add>
 util.func public @residual_then_relu_declines_linear(%input: tensor<1x14x14x384xf16>,
     %filter: tensor<1x1x384x64xf16>, %bias: tensor<64xf32>, %skip: tensor<1x1x14x14x64xf32>) -> tensor<1x1x14x14x64xf32> {
   %zero = arith.constant 0.000000e+00 : f32
@@ -120,7 +120,7 @@ util.func public @residual_then_relu_declines_linear(%input: tensor<1x14x14x384x
   %expanded = tensor.expand_shape %conv [[0], [1, 2], [3], [4]] output_shape [1, 1, 14, 14, 64]
       : tensor<1x14x14x64xf32> into tensor<1x1x14x14x64xf32>
   %sum_empty = tensor.empty() : tensor<1x1x14x14x64xf32>
-  %sum = linalg.add ins(%skip, %expanded : tensor<1x1x14x14x64xf32>, tensor<1x1x14x14x64xf32>) outs(%sum_empty : tensor<1x1x14x14x64xf32>) -> tensor<1x1x14x14x64xf32>
+  %sum = linalg.elementwise <add> ins(%skip, %expanded : tensor<1x1x14x14x64xf32>, tensor<1x1x14x14x64xf32>) outs(%sum_empty : tensor<1x1x14x14x64xf32>) -> tensor<1x1x14x14x64xf32>
   %relu_empty = tensor.empty() : tensor<1x1x14x14x64xf32>
   %relu = linalg.generic {
       indexing_maps = [affine_map<(d0, d1, d2, d3, d4) -> (d0, d1, d2, d3, d4)>,

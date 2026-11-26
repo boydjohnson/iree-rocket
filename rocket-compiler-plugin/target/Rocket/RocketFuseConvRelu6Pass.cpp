@@ -290,6 +290,23 @@ static Value insOperandFor(linalg::GenericOp op, Value blockArg) {
 
 /// Whether every indexing map is an identity or a scalar (zero-result) map
 /// and every loop is parallel -- the shape a clamp arrives in.
+/// An elementwise add whose maps are all identities: what the named
+/// `linalg.add` was until LLVM removed the named elementwise ops (IREE 3.14),
+/// after which `linalg-specialize-generic-ops` produces
+/// `linalg.elementwise kind=#linalg.elementwise_kind<add>` instead. The
+/// identity check keeps the old op's semantics: the category op may also
+/// carry broadcasting maps, which `linalg.add` could not.
+static linalg::ElementwiseOp asIdentityElementwiseAdd(Operation *op) {
+  auto add = dyn_cast_or_null<linalg::ElementwiseOp>(op);
+  if (!add || add.getKind() != linalg::ElementwiseKind::add ||
+      add.getNumDpsInputs() != 2 ||
+      !llvm::all_of(add.getIndexingMapsArray(),
+                    [](AffineMap map) { return map.isIdentity(); })) {
+    return {};
+  }
+  return add;
+}
+
 static bool isElementwiseGeneric(linalg::GenericOp op) {
   if (op.getNumResults() != 1 || !op.isAllParallelLoops()) {
     return false;
@@ -914,16 +931,17 @@ struct FuseConvResidualRelu : public OpRewritePattern<linalg::Conv2DNhwcHwcfOp> 
     if (!narrow || !isTruncfGeneric(narrow)) {
       return failure();
     }
-    // Two spellings of "add the skip, then ReLU": the pipeline's, a named
-    // `linalg.add` whose sole consumer is the ReLU generic (specialisation
-    // runs before this pass, so an ONNX Add arrives named), and the fused
+    // Two spellings of "add the skip, then ReLU": the pipeline's, a
+    // `linalg.elementwise <add>` (the named `linalg.add` before IREE 3.14)
+    // whose sole consumer is the ReLU generic (specialisation runs before
+    // this pass, so an ONNX Add arrives as the category op), and the fused
     // one a later elementwise fusion would produce, one generic with addf /
     // cmpf ugt / select. `replaced` is the op whose result the rewrite
     // takes over; `skip` is the add's other operand.
     Value narrowed = narrow.getResult(0);
     Operation *replaced = nullptr;
     Value skip;
-    if (auto named = dyn_cast_or_null<linalg::AddOp>(soleConsumer(narrowed))) {
+    if (auto named = asIdentityElementwiseAdd(soleConsumer(narrowed))) {
       if (named.getDpsInputs()[0] == narrowed) {
         skip = named.getDpsInputs()[1];
       } else if (named.getDpsInputs()[1] == narrowed) {
@@ -1154,7 +1172,7 @@ struct FuseConvResidualLinear : public OpRewritePattern<linalg::Conv2DNhwcHwcfOp
       }
       return {};
     };
-    if (auto named = dyn_cast_or_null<linalg::AddOp>(add)) {
+    if (auto named = asIdentityElementwiseAdd(add)) {
       skip = otherOperand(named.getDpsInputs());
     } else if (auto generic = dyn_cast_or_null<linalg::GenericOp>(add)) {
       Block &body = generic.getRegion().front();

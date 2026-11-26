@@ -18,10 +18,10 @@
 // for the CPU.
 
 // CHECK-LABEL: util.func public @linear_residual_claimed
-// CHECK-NOT: linalg.add
+// CHECK-NOT: linalg.elementwise <add>
 // CHECK-NOT: linalg.conv_2d_nhwc_hwcf
 // CHECK: flow.dispatch @rocket_dynamic_residual_executable::
-// CHECK-NOT: linalg.add
+// CHECK-NOT: linalg.elementwise <add>
 // CHECK-NOT: linalg.conv_2d_nhwc_hwcf
 // CHECK: util.return
 func.func @linear_residual_claimed(%input: tensor<1x14x14x384xf16>,
@@ -40,6 +40,6 @@ func.func @linear_residual_claimed(%input: tensor<1x14x14x384xf16>,
   %expanded = tensor.expand_shape %conv [[0], [1, 2], [3], [4]] output_shape [1, 1, 14, 14, 64]
       : tensor<1x14x14x64xf32> into tensor<1x1x14x14x64xf32>
   %sum_empty = tensor.empty() : tensor<1x1x14x14x64xf32>
-  %sum = linalg.add ins(%skip, %expanded : tensor<1x1x14x14x64xf32>, tensor<1x1x14x14x64xf32>) outs(%sum_empty : tensor<1x1x14x14x64xf32>) -> tensor<1x1x14x14x64xf32>
+  %sum = linalg.elementwise <add> ins(%skip, %expanded : tensor<1x1x14x14x64xf32>, tensor<1x1x14x14x64xf32>) outs(%sum_empty : tensor<1x1x14x14x64xf32>) -> tensor<1x1x14x14x64xf32>
   return %sum : tensor<1x1x14x14x64xf32>
 }
