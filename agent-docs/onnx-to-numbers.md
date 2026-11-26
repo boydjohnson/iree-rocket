@@ -285,35 +285,29 @@ closes.
 
 ## Measured results
 
-Ten models through exactly this procedure, from
-[`survey-2026-11-25-main.md`](survey-2026-11-25-main.md): `main` at 3d04335,
-board `orangepi` (RK3588), Armbian 7.3.5, `rocket.ko` PPU + 600 MHz clock +
-088, governor `performance`. Medians with the warm-up discarded; `x` is the
-offload arm against its own `--no-offload` baseline at the same allocation.
-All 20 arms agreed with the f32 oracle on argmax, with 0 NPU timeouts.
+Ten models through exactly this procedure, on `orangepi` (RK3588), Armbian
+7.3.5, `rocket.ko` PPU + 600 MHz clock + 088, governor `performance`, IREE
+v3.14.0. Medians with the warm-up discarded, each offload arm against its own
+`--no-offload` baseline at the same allocation. All 20 arms agreed with the
+f32 oracle on argmax, with 0 NPU timeouts.
 
-| model | NPU sites | CPU sites | NPU 4xA76 | CPU 4xA76 | x | NPU 8c | CPU 8c | x |
-|---|---|---|---|---|---|---|---|---|
-| mobilenet_v2 fp16 | 54 | 5 | 9.6 ms | 54.3 ms | 5.64 | 9.8 ms | 57.7 ms | 5.91 |
-| resnet50 fp16 | 56 | 21 | 52.0 ms | 894 ms | 17.2 | 52.6 ms | 1011 ms | 19.2 |
-| resnext50_32x4d fp16 | 56 | 21 | 55.6 ms | 502 ms | 9.03 | 57.3 ms | 685 ms | 12.0 |
-| wide_resnet50_2 fp16 | 55 | 9 | 87.9 ms | 1904 ms | 21.7 | 87.6 ms | 3012 ms | 34.4 |
-| convnext_tiny fp16 | 60 | 216 | 94.1 ms | 252 ms | 2.68 | 98.1 ms | 252 ms | 2.57 |
-| vit_b_16 fp16 | 50 | 249 | 202 ms | 1664 ms | 8.24 | 192 ms | 1327 ms | 6.91 |
-| vit_l_16 fp16 | 98 | 489 | 671 ms | 11430 ms | 17.0 | 686 ms | 13871 ms | 20.2 |
-| blip fp16 | 170 | 621 | 817 ms | 4818 ms | 5.90 | 740 ms | 4005 ms | 5.41 |
-| bert_base f32 import | 72 | 199 | 106 ms | 1241 ms | 11.7 | 105 ms | 1356 ms | 12.9 |
-| bert_base_384 f32 import | 72 | 199 | 412 ms | 4846 ms | 11.8 | 458 ms | 3875 ms | 8.46 |
+**The numbers live in two places and this is not one of them**, so they cannot
+drift apart here: `README.md`'s table is the current ten-model summary, and
+[`iree-3.14-bump.md`](iree-3.14-bump.md#10-model-survey-vs-survey2026-11-25-main-orangepi-600-mhz-performance)
+has the full run -- both core allocations, the per-op CPU site counts, and the
+previous toolchain's figure beside each of today's.
+[`survey-2026-11-25-main.md`](survey-2026-11-25-main.md) is the last run on
+the 3.12 toolchain, kept for the comparison.
 
-Four things to read with that table:
+What to read in them:
 
 **The ratio is against `--no-offload`, and the precision of the baseline is
-part of the claim.** MobileNetV2's 5.64x is against the **fp16 export**
-baseline, which is the arm the survey builds for it. Against the **f32
-import** -- the precision-matched comparison, and the fairer baseline -- the
-same offload is 10.0 ms against 30.9, i.e. **3.1x** (ISSUES.md P7). Both
-numbers are sound; an unlabelled one is not, and this repository has had to
-correct exactly that confusion.
+part of the claim.** MobileNetV2's 4.1x is against the **fp16 export**
+baseline, which is the arm the survey builds for it. The precision-matched
+comparison is against the **f32 import**, and it was 10.0 ms against 30.9,
+i.e. **3.1x** (ISSUES.md P7) -- measured on the 3.12 toolchain and not re-run
+since, so quote it with that date. Both numbers are sound; an unlabelled one
+is not, and this repository has had to correct exactly that confusion.
 
 **Sites, not executables.** The transform spec routes every matched
 convolution through a handful of fixed executables, so an executable count
@@ -321,14 +315,14 @@ understates the NPU badly, while IREE deduplicates identical CPU dispatches,
 which overstates the CPU side.
 
 **A model's CPU column is where the next work is.** The convolution networks
-leave almost nothing behind (mobilenet_v2: 4 element-wise and 1 transpose),
+leave almost nothing behind (mobilenet_v2: four CPU dispatch sites in all),
 while the transformers leave hundreds of element-wise, reduction, `rsqrt`,
 `softmax`, transpose and `batch_matmul` sites -- which is why their ratios are
 large and their absolute times are not. Of every candidate in all ten models,
 exactly one was *declined*: BLIP's 768x30524 LM head, on the Cout cap
 (`unvalidated_configuration`).
 
-**Both allocations, because they disagree.** wide_resnet50_2 goes 21.7x to
-34.4x between four cores and eight, and BLIP's CPU arm is 9% *faster* on
-eight. Quoting one allocation without saying which is how a number becomes
-unreproducible.
+**Both allocations, because they disagree.** wide_resnet50_2 goes 24.2x at
+four cores to 41.6x at eight, and BLIP's CPU arm is ~16% *faster* on eight
+than on four. Quoting one allocation without saying which is how a number
+becomes unreproducible.

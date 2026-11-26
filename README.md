@@ -17,30 +17,41 @@ Apache-2.0 with the LLVM exception, like IREE itself.
 
 Ten ONNX models compile, offload and run correctly on an RK3588, each
 measured against a CPU baseline built by the **same compiler pipeline** with
-offload disabled. Medians on four Cortex-A76 cores, NPU at 600 MHz
-([full survey, 2026-11-25](agent-docs/survey-2026-11-25-main.md), including
-the eight-core column and the per-op site counts):
+offload disabled. Medians on four Cortex-A76 cores, NPU at 600 MHz, on IREE
+v3.14.0 ([the full run](agent-docs/iree-3.14-bump.md#10-model-survey-vs-survey2026-11-25-main-orangepi-600-mhz-performance),
+with the eight-core column, the per-op site counts and the previous
+toolchain's numbers beside each):
 
 | model | NPU | CPU baseline | |
 |---|---|---|---|
-| mobilenet_v2 fp16 | 9.6 ms | 54.3 ms | 5.6x |
-| resnet50 fp16 | 52.0 ms | 894 ms | 17.2x |
-| resnext50_32x4d fp16 | 55.6 ms | 502 ms | 9.0x |
-| wide_resnet50_2 fp16 | 87.9 ms | 1904 ms | 21.7x |
-| convnext_tiny fp16 | 94.1 ms | 252 ms | 2.7x |
-| vit_b_16 fp16 | 202 ms | 1664 ms | 8.2x |
-| vit_l_16 fp16 | 671 ms | 11430 ms | 17.0x |
-| blip fp16 | 817 ms | 4818 ms | 5.9x |
-| bert_base f32 | 106 ms | 1241 ms | 11.7x |
-| bert_base_384 f32 | 412 ms | 4846 ms | 11.8x |
+| mobilenet_v2 fp16 | 10.3 ms | 41.8 ms | 4.1x |
+| resnet50 fp16 | 51.6 ms | 818 ms | 15.9x |
+| resnext50_32x4d fp16 | 59.7 ms | 455 ms | 7.6x |
+| wide_resnet50_2 fp16 | 86.1 ms | 2083 ms | 24.2x |
+| convnext_tiny fp16 | 90.2 ms | 247 ms | 2.7x |
+| vit_b_16 fp16 | 189 ms | 1667 ms | 8.8x |
+| vit_l_16 fp16 | 641 ms | 11385 ms | 17.8x |
+| blip fp16 | 779 ms | 4980 ms | 6.4x |
+| bert_base f32 | 103 ms | 1397 ms | 13.6x |
+| bert_base_384 f32 | 403 ms | 5248 ms | 13.0x |
 
 All twenty arms agreed with an ONNX Runtime oracle on the predicted class,
-with no NPU timeouts. One caveat on the first row, because it is the one most
-often quoted: MobileNetV2's baseline there is the model's fp16 export, and
-IREE's CPU codegen is 1.76x worse at fp16 than f32 on an A76. Against the
-**f32 import** -- the precision-matched comparison -- the same offload is
-10.0 ms against 30.9, i.e. **3.1x**. Both are real; only a labelled one is
-useful.
+with no NPU timeouts, and the candidate, accepted and NPU-site counts are
+identical to the previous toolchain's on all ten models.
+
+Two things to read with that table. **The ratios move when either arm moves,
+and the IREE 3.14 bump moved the CPU arm more than the NPU arm.** Every NPU
+arm is equal or faster than it was on 3.12 (transformers 3-7% faster), while
+the CNN baselines got 9-23% faster on their own, so MobileNetV2's ratio fell
+from 5.6x to 4.1x on a *faster CPU*, not a slower NPU.
+
+**The precision of the baseline is part of the claim.** MobileNetV2's
+baseline above is the model's own fp16 export, and IREE's CPU codegen is
+1.76x worse at fp16 than f32 on an A76. The precision-matched comparison is
+against the f32 import, which was **3.1x** (10.0 ms against 30.9) when it was
+last measured, on the 3.12 toolchain -- it has not been re-run on 3.14, where
+both arms have moved. Quote it with its date, or quote the fp16 row and say
+so.
 
 **On the NPU today:** dense and depthwise 2-D convolution at stride 1 and 2,
 matmul (including `matvec`/`vecmat`), max/min/average pooling, in fp16 and
@@ -192,9 +203,10 @@ is the compiler-side plan, with [`DYNAMIC_SHAPES.md`](DYNAMIC_SHAPES.md) and
 [`agent-docs/`](agent-docs) holds the detailed working documents --
 [board setup](agent-docs/board-setup.md), the
 [ONNX-to-board walkthrough](agent-docs/onnx-to-numbers.md),
-[developer tools](agent-docs/developer-tools.md), [CI](agent-docs/ci.md),
-open questions and dated survey results. They are written for contributors
-rather than for a first read.
+[developer tools](agent-docs/developer-tools.md), [CI](agent-docs/ci.md), the
+[IREE 3.14 bump record](agent-docs/iree-3.14-bump.md) behind the numbers
+above, open questions and dated survey results. They are written for
+contributors rather than for a first read.
 
 ## Building from source
 

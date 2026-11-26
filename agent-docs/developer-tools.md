@@ -201,7 +201,9 @@ build; see ISSUES.md M4 for the bisection.
 
 `--no-offload` builds the baseline correctly. It rewrites every matcher in
 the loop so it declines: the convolution and matmul matchers get a
-`no_offload` attribute on their `transform.rocket.match.admitted` line, and
+`no_offload` attribute on their `transform.rocket.match.admitted` line --
+written into the op's property dict, `<{precision = "...", no_offload}>`,
+since IREE 3.14 made transform-op properties strict -- and
 the pooling and element-wise ones -- which have no planner to ask, so they
 still carry bounds -- get `transform.iree.match.dim_bounds` set to
 `umin = umax = 999999`, a bound no real dimension meets. The passes around
@@ -234,8 +236,14 @@ the offload deficit it reports is roughly double the one a full machine sees
 
 ### Opt-in coverage: `--elementwise`
 
-The two-tensor element-wise matchers (`linalg.add`, `mul`, `sub` on a rank-3
-`1 x tokens x channels` tensor) ship **disabled**. They are written into
+The two-tensor element-wise matchers (add, mul and sub on a rank-3
+`1 x tokens x channels` tensor) ship **disabled**. They match through
+`transform.rocket.match.elementwise %x <{kind = "add"}>`, identity maps only:
+LLVM removed every named element-wise linalg op in the 3.14 cycle, so
+`linalg-specialize-generic-ops` now emits `linalg.elementwise <kind>` and a
+matcher keyed on `linalg.add` would silently match nothing
+([the bump record](iree-3.14-bump.md#what-broke-and-the-fix-for-each),
+break 3). They are written into
 `rocket_conv2d_transform_spec.mlir`'s `foreach_match` list but commented out
 behind a `//@ROCKET_ELEMENTWISE@` marker, so anything that reads the spec
 directly -- a bare `iree-compile` included -- gets the conservative list.
@@ -364,6 +372,13 @@ exists because the upstream pass the transform spec used to call for this,
 `linalg::getPrunedAttributeList`, which elides the op's own declared attribute
 names -- including `strides` and `dilations`. Every strided or dilated
 convolution it touched silently became a stride-1 one.
+
+> Upstream rewrote that pass in the 3.14 cycle and it **keeps `strides`** now,
+> so this pass's original reason no longer applies and it may be redundant;
+> the tripwire test was flipped to assert the fix rather than the bug. Whether
+> to drop it is an open follow-up
+> ([the bump record](iree-3.14-bump.md#what-broke-and-the-fix-for-each),
+> break 5). The `linalg.matmul` reason below is unaffected.
 
 That is a correctness bug independent of Rocket: linalg drives a convolution's
 iteration space from its output, so the rewritten op still verifies and still
@@ -547,7 +562,12 @@ a reader on another command buffer, a CPU reader, or a consumer that could
 not chain all keep the write. Two compiler details make the edges adjacent
 in the first place: each shim widens its f16 result with a plain generic
 whose accumulator-init term `rocket-fold-neutral-init` drops when the init
-is a zero (or -inf) fill, so the consumer's narrow cancels it, and the
+is a zero (or -inf) fill, and that pass also cancels the widen against the
+consumer's narrow itself (`CancelWidenNarrow`) -- `arith` stopped folding
+`truncf(extf(x))` for f16 in IREE 3.14, which cost MobileNetV2 9.6 -> 33.7 ms
+and 50 extra CPU sites before the pass took the job over
+([the bump record](iree-3.14-bump.md#what-broke-and-the-fix-for-each),
+break 4). The
 demote pass narrows an f32 import *through* its zero pads so the pad-folding
 matchers still see `pad -> conv`. The profile's `compaction:` line counts
 the writes skipped; `pack.input` and `compact` are the phases that shrink.
