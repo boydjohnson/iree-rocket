@@ -75,9 +75,10 @@ STAGES = ("export", "import", "compile", "run", "bench")
 
 # An arm is a name and the `rocket-compiler` flags that build it. `cpu` is the
 # only correct baseline: same pipeline, same device topology, same placement
-# pin, every matcher neutralized. The two opt-in arms exist because the README
-# says to measure them rather than argue about them -- both were losses when
-# last measured, on a different per-dispatch cost than today's.
+# pin, every matcher neutralized. The two opt-in arms exist because
+# agent-docs/developer-tools.md says to measure them rather than argue about
+# them -- both were losses when last measured, on a different per-dispatch
+# cost than today's.
 ARMS: dict[str, list[str]] = {
     "npu": [],
     "cpu": ["--no-offload"],

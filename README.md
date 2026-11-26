@@ -29,6 +29,7 @@ for the Rocket NPU backend (RK3588). This repository produces:
 
 | Document | What it holds |
 |---|---|
+| [`agent-docs/onnx-to-numbers.md`](agent-docs/onnx-to-numbers.md) | **An ONNX model to numbers on the board, end to end, with no local IREE build** -- the nightly artifacts, pinned import with an oracle, both compile arms, the board run, the timing rules, and ten models' measured results. |
 | [`agent-docs/developer-tools.md`](agent-docs/developer-tools.md) | **Start here to work on the repo.** How to build the three configurations, compile a model with `rocket-compiler`, read an `audit`, every flag that changes placement, `ROCKET_PROFILE` and the runtime's environment knobs, the board regression gates, the model survey and the precision probe. |
 | [`LIMITS.md`](LIMITS.md) | What the stack is *measured* to do: the channel, kernel, stride and precision bounds, and which of them each layer enforces. |
 | [`ISSUES.md`](ISSUES.md) | What is still open, with the measurements behind each entry. |
@@ -47,11 +48,15 @@ cargo test --workspace                    # the Rust side, no IREE build needed
 ```
 
 The CMake builds, the compiler driver and the board workflow are all in
-[`agent-docs/developer-tools.md`](agent-docs/developer-tools.md). To compile a
-model without building IREE at all, take the `iree-compile-x86_64` artifact
-from the latest [nightly run](https://github.com/boydjohnson/iree-rocket/actions/workflows/nightly.yml)
--- it unpacks anywhere and needs no environment setup
-([details](agent-docs/developer-tools.md#prebuilt-compiler-nightly)).
+[`agent-docs/developer-tools.md`](agent-docs/developer-tools.md).
+
+To go from an ONNX model to a timed, oracle-checked run on the board **without
+building IREE at all**, follow
+[`agent-docs/onnx-to-numbers.md`](agent-docs/onnx-to-numbers.md): it takes the
+`iree-compile-x86_64` and `iree-runtime-aarch64` artifacts from the last green
+[nightly run](https://github.com/boydjohnson/iree-rocket/actions/workflows/nightly.yml),
+which unpack anywhere and need no environment setup, and ends in the measured
+results for ten models.
 
 ## Continuous integration
 
