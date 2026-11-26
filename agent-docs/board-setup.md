@@ -28,16 +28,19 @@ repository has been measured on it.
 
 ## The three kernel patches
 
-They are **not in this repository yet** -- they live on the maintainer's host
-as `~/projects/patches/rocket/*-armbian-7.3.5.patch`, rebased onto Armbian's
-module. Until they are published, a third party cannot reproduce a pooling
-result or a timing at all, which is tracked as
-[`open-questions.md`](open-questions.md) 2.6.
+All three are in [`kernel-patches/`](../kernel-patches) with instructions for
+applying them, and that directory's README is the detailed account --
+including that `081` and `088` are Greg Tomko's, from the external
+[`gregordinary/patches`](https://github.com/gregordinary/patches) series, and
+only rebased here. None of
+them is upstream: the PPU change is patch 1 of a local series on top of
+`drm-misc-next`, and getting it and a devfreq-shaped clock fix upstream is
+the open item -- [`open-questions.md`](open-questions.md) 2.6.
 
 | Patch | What it does | Without it |
 |---|---|---|
-| **Unconditional PPU completion** (`0001`, from `drm-misc-next`) | Arms the PPU *and* DPU interrupts for every job. The flag-gated `PPU_DONE` variant is not enough, because this repo never sets `DRM_ROCKET_JOB_PPU_DONE`. | Armbian's stock module arms only the DPU interrupts, so **every pooling job is watchdog-killed at ~500 ms**. A single-tile pool still returns the right answer; a tiled one fails (`tiled_pooling_matches_oracle`), because only its first task runs before the kill. |
-| **Clock and regulator parameters** (`081`) | `clk_set_rate` plus a coupled `regulator_set_voltage` in runtime-resume, exposed as the module parameters `rocket_npu_clk_hz` and `rocket_npu_uv`. Loaded with `rocket_npu_clk_hz=600000000`. One hunk is hand-merged on Armbian: its suspend path counts clocks with `soc->num_clks`. | `scmi_clk_npu` stays pinned at 200 MHz -- mainline `rocket` has no NPU devfreq and the DT sets `assigned-clock-rates = <200000000>`. ResNet50-224 fp16 is ~105 ms rather than 45, int8 150 rather than 125, MobileNetV2 fp16 63 rather than 55.5. Output is bit-identical at either clock; only the time changes (ISSUES.md M2). |
+| **Unconditional PPU completion** (`0001`, written against `drm-misc-next`) | Arms the PPU *and* DPU interrupts for every job, and accepts the PPU bits in the IRQ handler's raw-status check. The flag-gated `093` variant is not enough, because this repo never sets `DRM_ROCKET_JOB_PPU_DONE`. | Armbian's stock module arms only the DPU interrupts, so **every pooling job is watchdog-killed at ~500 ms**. A single-tile pool still returns the right answer; a tiled one fails (`tiled_pooling_matches_oracle`), because only its first task runs before the kill. |
+| **Clock parameters** (`081`) | `clk_set_rate` on runtime-resume and a park back to 200 MHz on suspend, exposed as the writable module parameters `rocket_npu_clk_hz` (loaded as `600000000`) and `rocket_autosuspend_ms` (1000; stock 50 ms fires *inside* an inference once the park exists). The 7.3.5 rebase carries no voltage parameter -- `rocket_npu_uv` is in the base series' `082`, which is not part of this configuration. One hunk is hand-merged: the suspend path counts clocks with `soc->num_clks`. | `scmi_clk_npu` stays pinned at 200 MHz -- mainline `rocket` has no NPU devfreq and the DT sets `assigned-clock-rates = <200000000>`. ResNet50-224 fp16 is ~105 ms rather than 45, int8 150 rather than 125, MobileNetV2 fp16 63 rather than 55.5. Output is bit-identical at either clock; only the time changes (ISSUES.md M2). |
 | **Reset before IOMMU detach** (`088`) | Resets the core before detaching the IOMMU, instead of after. | Armbian's `rocket_reset` detaches the IOMMU while the core is still running, so the stall handshake times out on every timeout and one burst can be followed by **page-table corruption in the submitting process** (ISSUES.md C17). With it, a timeout recovers with nothing logged but `NPU job timed out`. |
 
 Two traps when installing a module by hand: `updates/` only wins over
@@ -77,7 +80,8 @@ What each line has to say:
   absent or the parameter is unset, and every timing will be roughly double.
 - **`rocket_npu_clk_hz` appears under `/sys/module/rocket/parameters/`.** If the
   file is not there, the module is stock: no clock control, and the pooling
-  behaviour below is what you will see.
+  behaviour below is what you will see. `rocket_autosuspend_ms` should read
+  1000 beside it.
 - **The governors read `performance`.** `ondemand` makes every host-side phase
   noisy; the governor has silently moved between sessions on these boards
   before, which is why the survey records it next to the numbers.

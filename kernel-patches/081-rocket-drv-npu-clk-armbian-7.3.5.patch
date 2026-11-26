@@ -1,0 +1,348 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: gregordinary <33880035+gregordinary@users.noreply.github.com>
+Date: Tue, 30 Jun 2026 12:00:00 +0000
+Subject: [PATCH] rocket: program the NPU compute clock from runtime-resume
+ (clock lever)
+
+Add the rocket_npu_clk_hz module param: when set, (re)program the shared SCMI
+NPU compute clock ("npu") from runtime-resume -- only after the PM core has
+powered the domain, since setting it cold wedges SCMI -- and park it back at the
+vendor 200 MHz POWER_DOWN rate on suspend. 0 leaves the DT default (200 MHz).
+On the RK3588 this takes the NPU from its 200 MHz stock rate to a validated
+600 MHz.
+
+The park is REFCOUNTED, because the compute clock is ONE SCMI clock shared by
+every core ("npu", id 6: clk_summary shows a single scmi_clk_npu rate with
+fdab/fdac/fdad0000.npu all as consumers) while runtime-PM is PER core. Parking
+it from a per-core suspend callback drops the shared rate to 200 MHz out from
+under the cores that are still running -- and it sticks, because a core that is
+still runtime-ACTIVE never re-raises it: pm_runtime_get on an already-active
+device fires no resume callback. So the rate does not dip, it stays down until
+that core happens to suspend and resume. Measured on a Turing RK1 without the
+refcount: a resident-int8 matmul across 3 worker fds at the stock 50 ms
+autosuspend alternated 15 ms / 69 ms run to run, indefinitely -- a 4.8x swing,
+with scmi_clk_npu flapping 200 <-> 600 MHz. Work is fanned across per-fd worker
+queues by default in this stack, so any multi-core NPU workload is exposed.
+
+Hence rocket_clk_users: only the LAST core down parks the clock. It counts cores
+that are runtime-resumed independently of rocket_npu_clk_hz, so that flipping
+that (sysfs-writable) param while cores are active cannot strand the count, and
+the decrement sits after the rocket_job_is_idle() -EBUSY bail, so a core that
+refuses to suspend still holds the rate. A mutex rather than a bare atomic: it
+must serialise the clk_set_rate against a concurrent resume on another core, and
+both callbacks run in process context and may sleep.
+
+The park also needs a DEADLINE that outlives a host-side gap WITHIN one
+inference, so rocket_autosuspend_ms (default 1000 ms) replaces the hardcoded
+50 ms. Upstream's 50 ms is stated as "~3 frames at 60Hz" -- sized for a media
+pipeline that submits one inference per frame, where the only idle gaps that
+matter fall BETWEEN inferences. An LLM/ASR workload breaks that assumption: the
+host packs the operands into the NPU's native tiled layout (the NPU cannot tile
+row-major data on-chip, so the scatter is irreducible host work), and a SINGLE
+inference therefore contains host gaps in which every core goes idle. At 50 ms
+those gaps trip runtime suspend mid-inference: the last core down parks the
+shared clock, and the next submit runs at 200 MHz until it ramps back. The clock
+lever then silently undoes itself on exactly the workloads it exists for. The
+SCMI clock sampled through ONE whisper base.en encode at the stock 50 ms:
+
+    200 200 200 200 200 600 600 600 200 600 600 600 600 600   (MHz)
+
+and that encode is SLOWER than the CPU running the same work. Encode time on a
+Turing RK1 at 600 MHz, 4 reps (CPU reference 1628-1639 ms):
+
+    autosuspend    encode (ms)
+      50           1881 / 1734 / 1884 / 1809     <- variable, slower than CPU
+     100           1275 / 1383 / 1279 / 1286
+     200           1275 / 1272 / 1262 / 1265
+     500           1259 / 1254 / 1263 / 1269
+    1000           1267 / 1253 / 1254 / 1263
+    2000           1273 / 1270 / 1264 / 1256
+
+It saturates by ~200 ms; 1000 ms is that knee plus headroom for a large encoder,
+whose packing gaps are several times longer (they scale with the weight bytes).
+Park-at-idle is preserved -- only its deadline moves -- and 0 restores the PM
+core's own default. Kept in this patch rather than a separate one because the
+park is introduced HERE: stock mainline never re-rates the clock, so without the
+lever there is nothing to park and nothing to fix.
+
+A clk_set_rate failure on resume propagates: undo the bulk-clock enable and
+return the error rather than silently returning 0 with the device half-
+programmed, so the PM core leaves the domain suspended instead of running it at
+an unintended rate.
+
+The "npu" clock handle is acquired ONCE via devm_clk_get_optional() in
+rocket_core_init and stashed in struct rocket_core, rather than a clk_get/clk_put
+on every resume/suspend (a hot path). -EPROBE_DEFER is propagated; an absent
+clock degrades to the stock 200 MHz and never fails probe.
+
+This does not make rates above 600 MHz safe: staggered multi-core resume already
+powers a domain on at a rate a sibling raised, so that exposure is pre-existing,
+and a pinned 900 MHz hard-locks the box. 600 MHz is the only validated operating
+point.
+
+Signed-off-by: gregordinary <33880035+gregordinary@users.noreply.github.com>
+
+[Boyd Johnson: rebased for iree-rocket onto Armbian 7.3.5-edge-rockchip64 and
+ the RK3576 series, 2026-11-23. The suspend hunk is hand-merged: that path
+ counts clocks with soc->num_clks on this base. Original:
+ gregordinary/patches rocket/081-rocket-drv-npu-clk.patch.]
+---
+ drivers/accel/rocket/rocket_core.c |  54 ++++++++++++--
+ drivers/accel/rocket/rocket_core.h |  10 +++
+ drivers/accel/rocket/rocket_drv.c  | 111 +++++++++++++++++++++++++++++
+ 3 files changed, 170 insertions(+), 5 deletions(-)
+
+diff --git a/drivers/accel/rocket/rocket_core.c b/drivers/accel/rocket/rocket_core.c
+index 91f6901..baeb90e 100644
+--- a/drivers/accel/rocket/rocket_core.c
++++ b/drivers/accel/rocket/rocket_core.c
+@@ -7,6 +7,7 @@
+ #include <linux/dma-mapping.h>
+ #include <linux/err.h>
+ #include <linux/iommu.h>
++#include <linux/moduleparam.h>
+ #include <linux/platform_device.h>
+ #include <linux/pm_domain.h>
+ #include <linux/pm_runtime.h>
+@@ -15,6 +16,17 @@
+ #include "rocket_core.h"
+ #include "rocket_job.h"
+ 
++/*
++ * Deadline for the clock park below (see rocket_device_runtime_suspend() in
++ * rocket_drv.c). The stock 50 ms is too eager once the park exists: it fires
++ * INSIDE a single inference, not just between inferences. 0 leaves the PM core's
++ * own default untouched.
++ */
++static unsigned int rocket_autosuspend_ms = 1000;
++module_param(rocket_autosuspend_ms, uint, 0644);
++MODULE_PARM_DESC(rocket_autosuspend_ms,
++	"runtime-PM autosuspend delay in ms (default 1000; 0 = leave the PM core default)");
++
+ int rocket_core_init(struct rocket_core *core)
+ {
+ 	struct device *dev = core->dev;
+@@ -41,6 +53,25 @@ int rocket_core_init(struct rocket_core *core)
+ 	if (err)
+ 		return dev_err_probe(dev, err, "failed to get clocks for core %d\n", core->index);
+ 
++	/*
++	 * Acquire the shared SCMI NPU compute clock ("npu") once, for the device
++	 * lifetime, so the rocket_npu_clk_hz re-rate in runtime-resume/suspend
++	 * needs no per-transition clk_get/clk_put (mirrors the npu_supply
++	 * regulator acquisition). It is only RE-RATED from runtime-resume, never
++	 * set cold (that wedges SCMI). Optional: a board without the clock just
++	 * runs stock 200 MHz and never fails to probe -- the "degrade, don't
++	 * disrupt" rule of the clock lever. -EPROBE_DEFER is propagated so the
++	 * clock is retried once its provider is up.
++	 */
++	core->npu_clk = devm_clk_get_optional(dev, "npu");
++	if (IS_ERR(core->npu_clk)) {
++		if (PTR_ERR(core->npu_clk) == -EPROBE_DEFER)
++			return PTR_ERR(core->npu_clk);
++		dev_info(dev, "rocket: no \"npu\" clock (%ld); NPU clock scaling disabled\n",
++			 PTR_ERR(core->npu_clk));
++		core->npu_clk = NULL;
++	}
++
+ 	core->pc_iomem = devm_platform_ioremap_resource_byname(pdev, "pc");
+ 	if (IS_ERR(core->pc_iomem)) {
+ 		dev_err(dev, "couldn't find PC registers %ld\n", PTR_ERR(core->pc_iomem));
+@@ -92,12 +123,25 @@ int rocket_core_init(struct rocket_core *core)
+ 	pm_runtime_use_autosuspend(dev);
+ 
+ 	/*
+-	 * As this NPU will be most often used as part of a media pipeline that
+-	 * ends presenting in a display, choose 50 ms (~3 frames at 60Hz) as an
+-	 * autosuspend delay as that will keep the device powered up while the
+-	 * pipeline is running.
++	 * The park above needs a deadline that outlives a host-side gap WITHIN one
++	 * inference, not merely the gap between inferences.
++	 *
++	 * Upstream's 50 ms is "~3 frames at 60Hz" -- sized for a media pipeline that
++	 * submits one inference per frame, where the only idle gaps that matter fall
++	 * BETWEEN inferences. An LLM/ASR workload breaks that assumption: the host
++	 * packs the operands into the NPU's native tiled layout (it cannot be done
++	 * on-chip), so a SINGLE inference contains host-side gaps in which every core
++	 * goes idle. At 50 ms those gaps trip runtime suspend mid-inference, the last
++	 * core down parks the shared clock to 200 MHz, and the next submit runs at a
++	 * third of the rate until it ramps back -- so the clock lever silently undoes
++	 * itself on exactly the workloads it exists for.
++	 *
++	 * 1000 ms is past the measured knee (~200 ms on a small encoder) with headroom
++	 * for a large one, whose packing gaps are several times longer (they scale with
++	 * the weight bytes). Park-at-idle is preserved; only its deadline moves.
+ 	 */
+-	pm_runtime_set_autosuspend_delay(dev, 50);
++	if (rocket_autosuspend_ms)
++		pm_runtime_set_autosuspend_delay(dev, rocket_autosuspend_ms);
+ 
+ 	pm_runtime_enable(dev);
+ 
+diff --git a/drivers/accel/rocket/rocket_core.h b/drivers/accel/rocket/rocket_core.h
+index 8c8d1f4..e6f580c 100644
+--- a/drivers/accel/rocket/rocket_core.h
++++ b/drivers/accel/rocket/rocket_core.h
+@@ -48,6 +48,16 @@ struct rocket_core {
+ 	struct clk_bulk_data clks[6];
+ 	struct reset_control_bulk_data resets[2];
+ 
++	/*
++	 * Shared SCMI NPU compute clock ("npu"), acquired once for the device
++	 * lifetime (devm) so runtime-resume/suspend can re-rate it without a
++	 * clk_get/clk_put on every PM transition. NULL when no "npu" clock is
++	 * wired (then the rocket_npu_clk_hz lever is a no-op). Only ever re-rated
++	 * from runtime-resume/suspend, never set cold (that wedges SCMI). See
++	 * rocket_drv.c.
++	 */
++	struct clk *npu_clk;
++
+ 	struct iommu_group *iommu_group;
+ 
+ 	struct mutex job_lock;
+diff --git a/drivers/accel/rocket/rocket_drv.c b/drivers/accel/rocket/rocket_drv.c
+index cc1903b..6bacee1 100644
+--- a/drivers/accel/rocket/rocket_drv.c
++++ b/drivers/accel/rocket/rocket_drv.c
+@@ -9,6 +9,7 @@
+ #include <linux/clk.h>
+ #include <linux/err.h>
+ #include <linux/iommu.h>
++#include <linux/mutex.h>
+ #include <linux/of.h>
+ #include <linux/platform_device.h>
+ #include <linux/pm_runtime.h>
+@@ -25,6 +26,39 @@
+ static struct platform_device *drm_dev;
+ static struct rocket_device *rdev;
+ 
++#define ROCKET_NPU_POWER_DOWN_HZ	200000000UL	/* vendor POWER_DOWN_FREQ */
++
++/*
++ * The compute clock is ONE SCMI clock shared by every core, but runtime-PM is
++ * PER core -- so the park must be refcounted, or one core going idle drops the
++ * rate out from under the cores that are still running.
++ *
++ * The damage is not merely a mid-flight rate cut: a core that is still
++ * runtime-ACTIVE never re-raises the clock (pm_runtime_get on an active device
++ * fires no resume callback), so once a sibling parks the rate that core keeps
++ * running at 200 MHz until it happens to suspend and resume. Only the LAST core
++ * down may park the clock.
++ *
++ * Counts cores that are runtime-resumed, independent of rocket_npu_clk_hz, so
++ * that flipping the (sysfs-writable) param while cores are active cannot strand
++ * the count. Serialised against a concurrent resume on another core -- both
++ * callbacks run in process context and may sleep, so this is a mutex, not an
++ * atomic: it guards the rate change as well as the count.
++ */
++static DEFINE_MUTEX(rocket_clk_lock);
++static unsigned int rocket_clk_users;
++
++/*
++ * If non-zero, program the shared SCMI NPU compute clock ("npu") to this rate
++ * from runtime-resume, i.e. only AFTER the PM core has powered the domain.
++ * 0 leaves the DT default (200 MHz) untouched (stock). Writable via sysfs so
++ * the rate can be swept without rebuilding.
++ */
++static unsigned long rocket_npu_clk_hz;
++module_param(rocket_npu_clk_hz, ulong, 0644);
++MODULE_PARM_DESC(rocket_npu_clk_hz,
++	"NPU compute clock target in Hz applied in runtime-resume (e.g. 600000000); 0 = stock 200 MHz");
++
+ static void
+ rocket_iommu_domain_destroy(struct kref *kref)
+ {
+@@ -279,6 +313,56 @@ static int rocket_device_runtime_resume(struct device *dev)
+ 		return err;
+ 	}
+ 
++	/*
++	 * The power domain for this core is now powered (the PM core resumed the
++	 * genpd before calling us) and the bulk clocks are enabled, so it is safe
++	 * to (re)program the shared SCMI NPU compute clock here. Setting it cold,
++	 * with the domain off (DT of_clk_set_defaults at probe, or an external
++	 * module), wedges the SCMI firmware -- so do it ONLY from here.
++	 *
++	 * Under rocket_clk_lock: the rate is shared, so this must not interleave
++	 * with a sibling core's park in rocket_device_runtime_suspend().
++	 */
++	mutex_lock(&rocket_clk_lock);
++
++	if (rocket_npu_clk_hz) {
++		struct clk *npu_clk = rdev->cores[core].npu_clk;
++
++		if (!npu_clk) {
++			dev_warn(dev, "rocket: no \"npu\" clock; cannot apply %lu Hz\n",
++				 rocket_npu_clk_hz);
++		} else {
++			int r = clk_set_rate(npu_clk, rocket_npu_clk_hz);
++
++			if (r) {
++				/*
++				 * Undo the bulk-clock enable and PROPAGATE the failure: a
++				 * degraded resume must not silently return 0 with the device
++				 * half-programmed. The PM core then leaves the domain
++				 * suspended rather than running at an unintended rate. The
++				 * refcount is NOT taken -- this core never held the rate.
++				 */
++				dev_warn(dev, "rocket: clk_set_rate(npu, %lu Hz) failed: %d (failing resume)\n",
++					 rocket_npu_clk_hz, r);
++				mutex_unlock(&rocket_clk_lock);
++				clk_bulk_disable_unprepare(rdev->cores[core].soc->num_clks,
++							   rdev->cores[core].clks);
++				return r;
++			}
++
++			dev_info(dev, "rocket: core %d NPU clk -> %lu Hz (reads back %lu)\n",
++				 core, rocket_npu_clk_hz, clk_get_rate(npu_clk));
++		}
++	}
++
++	/*
++	 * This core now holds the shared rate. Counted even when rocket_npu_clk_hz
++	 * is 0 (stock), so the count always tracks resumed cores and a runtime flip
++	 * of the param cannot strand it.
++	 */
++	rocket_clk_users++;
++	mutex_unlock(&rocket_clk_lock);
++
+ 	return 0;
+ }
+ 
+@@ -293,6 +377,33 @@ static int rocket_device_runtime_suspend(struct device *dev)
+ 	if (!rocket_job_is_idle(&rdev->cores[core]))
+ 		return -EBUSY;
+ 
++	/*
++	 * Park the compute clock back at the vendor power-down rate (200 MHz)
++	 * while the domain is still powered, so it never powers off (and back on)
++	 * at a raised rate -- mirroring the vendor's POWER_DOWN_FREQ handling.
++	 *
++	 * ONLY when this is the LAST core down. The rate is one shared SCMI clock;
++	 * parking it per-core cuts it out from under siblings that are still
++	 * running, and (worse) they never re-raise it, because an already-active
++	 * device gets no resume callback. See rocket_clk_users.
++	 *
++	 * The decrement sits after the rocket_job_is_idle() -EBUSY bail above: a
++	 * core that refuses to suspend still holds the rate.
++	 */
++	mutex_lock(&rocket_clk_lock);
++
++	if (rocket_clk_users)
++		rocket_clk_users--;
++
++	if (rocket_npu_clk_hz) {
++		struct clk *npu_clk = rdev->cores[core].npu_clk;
++
++		if (npu_clk && rocket_clk_users == 0)
++			clk_set_rate(npu_clk, ROCKET_NPU_POWER_DOWN_HZ);
++	}
++
++	mutex_unlock(&rocket_clk_lock);
++
+ 	clk_bulk_disable_unprepare(rdev->cores[core].soc->num_clks, rdev->cores[core].clks);
+ 
+ 	return 0;
+-- 
+2.43.0
+

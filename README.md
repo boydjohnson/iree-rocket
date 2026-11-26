@@ -65,10 +65,10 @@ in [`agent-docs/onnx-to-numbers.md`](agent-docs/onnx-to-numbers.md).
 > `rocket` module **plus three out-of-tree patches** (PPU completion, the NPU
 > clock parameters, reset-before-IOMMU-detach). On a stock module, pooling
 > jobs are killed by the watchdog at ~500 ms, timings roughly double, and a
-> job timeout can corrupt the submitting process. The patches are not
-> published yet; [`agent-docs/board-setup.md`](agent-docs/board-setup.md)
-> says what each does, what breaks without it, and how to check what your
-> board has.
+> job timeout can corrupt the submitting process. All three are in
+> [`kernel-patches/`](kernel-patches) with instructions;
+> [`agent-docs/board-setup.md`](agent-docs/board-setup.md) says what each
+> does, what breaks without it, and how to check what your board has.
 
 ```sh
 # 1. The last green nightly: an x86_64 Linux compiler and an aarch64 runtime.
@@ -107,9 +107,10 @@ configuration yet, and `hardware` never closes.
 
 ## Known limitations
 
-- **The board needs a patched kernel module**, as above. This is the single
-  biggest obstacle to reproducing anything here, and the patches are not
-  published yet.
+- **The board needs a patched kernel module.** All three changes are in
+  [`kernel-patches/`](kernel-patches), with what each fixes and how to apply
+  it. None is upstream yet, so this remains the biggest obstacle to
+  reproducing anything here.
 - **There is no code generator for this target.** The NPU runs only the
   dispatches the transform spec creates, so an operation reaches it only if a
   matcher claims it; unclaimed work stays on the CPU and still runs correctly.
@@ -136,12 +137,17 @@ external HAL driver registered through IREE's own
 `iree-org/iree` as a submodule, with no patches applied by the build.
 
 The kernel side is mainline `accel/rocket` plus three patches that are not
-upstream, and getting them there is the useful next step for anyone working on
-that driver: **unconditional PPU completion** (upstream arms only the DPU
-interrupts, so tiled pooling cannot complete), **NPU clock control** (the SoC
-boots the NPU pinned at 200 MHz with no devfreq -- whether the right upstream
-shape is an OPP table and a governor rather than the module parameters used
-here is an open question), and **reset before IOMMU detach** on a job timeout.
+upstream, carried in [`kernel-patches/`](kernel-patches) -- two of them Greg
+Tomko's, from the external [`gregordinary/patches`](https://github.com/gregordinary/patches)
+series, rebased onto Armbian 7.3.5. Getting all three upstream is the useful
+next step for anyone working on that driver. **Unconditional
+PPU completion**: upstream arms only the DPU interrupts, so a standalone
+PPU-flying pooling job never reaches the completion path and is retired by
+the watchdog instead. **NPU clock control**: the SoC boots the NPU pinned at
+200 MHz with no devfreq, and whether the right upstream shape is an OPP table
+and a governor rather than the module parameters used here is an open
+question. **Reset before IOMMU detach** on a job timeout, so in-flight DMA
+cannot land in pages userspace has already freed.
 
 What would help most from the hardware side is evidence for the
 configurations the admission policy currently refuses as *unmeasured* rather
@@ -161,6 +167,7 @@ extent of an actual measurement and the register encodings are wider.
 | [`rocket-compiler`](rocket-compiler) | The compiler driver: applies the transform spec and the device flags it expects, and audits where every convolution and matmul went. |
 | [`rocket-schema`](rocket-schema) | The FlatBuffers executable format shared by both sides. |
 | [`tools`](tools) | ONNX import/export, the board regression gates, the model survey, the precision probe. |
+| [`kernel-patches`](kernel-patches) | The out-of-tree `accel/rocket` patches the measured configuration runs, for Armbian 7.3.5. GPL-2.0, unlike the rest of this repository, and two of the three come from [`gregordinary/patches`](https://github.com/gregordinary/patches). |
 | [`iree-build`](iree-build) | CMake configuration, and `iree-src`, IREE as a pinned submodule. |
 
 Each component's detailed role is in

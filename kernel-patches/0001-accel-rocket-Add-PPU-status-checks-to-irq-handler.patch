@@ -1,0 +1,38 @@
+From 6c8d4bcd69e9e686ec1c366651f68310d2f848ba Mon Sep 17 00:00:00 2001
+From: Boyd Johnson <boyd@boundarybit.io>
+Date: Wed, 29 Jul 2026 11:57:11 -0500
+Subject: [PATCH 1/5] accel/rocket: Add PPU status checks to irq handler
+
+---
+ drivers/accel/rocket/rocket_job.c | 8 +++++---
+ 1 file changed, 5 insertions(+), 3 deletions(-)
+
+diff --git a/drivers/accel/rocket/rocket_job.c b/drivers/accel/rocket/rocket_job.c
+index bb77b6bf0f..d3b9a2ed8a 100644
+--- a/drivers/accel/rocket/rocket_job.c
++++ b/drivers/accel/rocket/rocket_job.c
+@@ -139,8 +139,10 @@ static void rocket_job_hw_submit(struct rocket_core *core, struct rocket_job *jo
+ 	rocket_pc_writel(core, REGISTER_AMOUNTS,
+ 			 PC_REGISTER_AMOUNTS_PC_DATA_AMOUNT((task->regcmd_count + 1) / 2 - 1));
+ 
+-	rocket_pc_writel(core, INTERRUPT_MASK, PC_INTERRUPT_MASK_DPU_0 | PC_INTERRUPT_MASK_DPU_1);
+-	rocket_pc_writel(core, INTERRUPT_CLEAR, PC_INTERRUPT_CLEAR_DPU_0 | PC_INTERRUPT_CLEAR_DPU_1);
++	rocket_pc_writel(core, INTERRUPT_MASK, PC_INTERRUPT_MASK_DPU_0 | PC_INTERRUPT_MASK_DPU_1 |
++					       PC_INTERRUPT_MASK_PPU_0 | PC_INTERRUPT_MASK_PPU_1);
++	rocket_pc_writel(core, INTERRUPT_CLEAR, PC_INTERRUPT_CLEAR_DPU_0 | PC_INTERRUPT_CLEAR_DPU_1 |
++						PC_INTERRUPT_CLEAR_PPU_0 | PC_INTERRUPT_CLEAR_PPU_1);
+ 
+ 	rocket_pc_writel(core, TASK_CON, PC_TASK_CON_RESERVED_0(1) |
+ 					 PC_TASK_CON_TASK_COUNT_CLEAR(1) |
+@@ -440,7 +442,7 @@ static irqreturn_t rocket_job_irq_handler(int irq, void *data)
+ 	WARN_ON(raw_status & PC_INTERRUPT_RAW_STATUS_DMA_WRITE_ERROR);
+ 
+ 	if (!(raw_status & PC_INTERRUPT_RAW_STATUS_DPU_0 ||
+-	      raw_status & PC_INTERRUPT_RAW_STATUS_DPU_1))
++	      raw_status & PC_INTERRUPT_RAW_STATUS_DPU_1 || raw_status & PC_INTERRUPT_RAW_STATUS_PPU_0 || raw_status & PC_INTERRUPT_RAW_STATUS_PPU_1))
+ 		return IRQ_NONE;
+ 
+ 	rocket_pc_writel(core, INTERRUPT_MASK, 0x0);
+-- 
+2.43.0
+
