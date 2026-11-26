@@ -35,7 +35,8 @@ domain still matches -- but four extra rewrites are needed, and this script
 applies them automatically when it sees such a node:
 
 1. **`value_info` is pinned, not cleared.** The opposite of what the plain path
-   above does, and the opposite of what README says. ONNX has no schema for
+   above does, and the opposite of what agent-docs/developer-tools.md says.
+   ONNX has no schema for
    ORT's fused ops, so `infer_shapes` cannot recompute their result types;
    clearing drops them, the importer emits `!torch.none` for the result, and
    legalization then refuses the op. ORT also writes *expression* dims into
