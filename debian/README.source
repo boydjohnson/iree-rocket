@@ -145,6 +145,12 @@ What the build checks:
     shared library. A buildd has no NPU.
   - SONAME: matches the library package's name.
 
+The nightly builds all of them: rocket-compiler from both compiler jobs'
+existing IREE builds, the runtime packages in a native arm64 job (see
+agent-docs/ci.md, .github/scripts/build-debs.sh). Each nightly .deb is
+versioned <base>~git<commit time, UTC>.<sha>+iree<IREE version>-1, installed with
+apt on the runner and run through debian/tests.
+
 The autopkgtests (debian/tests) repeat these against the installed packages.
 They also run IREE's own runner and benchmark on the same module, and build
 the shipped C++ sample through both pkg-config files and through
