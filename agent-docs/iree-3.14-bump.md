@@ -8,7 +8,9 @@
 on the known-exposure list, and it is a 3.5x performance cliff that compiles
 and runs correctly**, so a bump that only checked "tests pass" would have
 shipped it. Every model is correct, and every site count is unchanged except
-where 3.14 itself removed CPU glue. int8 is bit-identical to the old compiler.
+where 3.14 itself removed CPU glue. The int8 board set is bit-identical to
+the old compiler; models with an int8 residual skip were not, and that was
+found only afterwards (break 6).
 
 ## What broke, and the fix for each
 
@@ -19,6 +21,7 @@ where 3.14 itself removed CPU glue. int8 is bit-identical to the old compiler.
 | 3 | **LLVM removed every named elementwise linalg op** (`linalg.add/sub/mul/exp/...`, llvm #220905/#220912/#220916) | 3 C++ compile errors (`linalg::AddOp`); 3 spec matchers that keyed on `operation_name ["linalg.add"]` would have silently matched nothing | `linalg-specialize-generic-ops` now emits `linalg.elementwise <kind>`, and it also raises broadcasts, hoisted scalars and ternary `select`. New `transform.rocket.match.elementwise %x <{kind = "add"}>` (identity maps only, which is what the named ops implied). The C++ residual-add matchers use a helper that accepts only an identity-map `ElementwiseOp` of kind add. |
 | 4 | **arith no longer folds `truncf(extf(x))` for f16 -> f32 -> f16.** APFloat's `isLosslesslyConvertibleTo` now refuses any IEEE -> IEEE conversion, because converting a signaling NaN quiets it. The fold survives only under `nnan`. | **Not a compile error.** MobileNetV2 fp16 compiled, ran and was correct, but CPU dispatch sites went 5 -> 55 and the NPU arm went 9.6 -> 33.7 ms. Every Rocket shim widens its f16 result with an `extf`, and the design relied on that cancelling against the consumer's `truncf` so that two Rocket dispatches end up adjacent and chain (ISSUES.md P2). | `rocket-fold-neutral-init` now does the cancellation itself (`CancelWidenNarrow`): a narrowing generic over a widening generic, optionally through one `expand_shape`/`collapse_shape`, back to the source type. The only value that changes is a signaling NaN, which keeps its payload, as every IREE before 3.14 did. 3 lit cases added. |
 | 5 | Upstream `iree-global-opt-demote-contraction-inputs` was rewritten and **keeps `strides`** now | `rocket_verify_conv_shapes_upstream_demote.mlir`, a tripwire expecting the old stride-dropping bug, failed | Test flipped to assert stride 2 survives and the verifier accepts it. Our own `RocketDemoteConvInputsPass` workaround may now be redundant (follow-up). |
+| 6 | **Found 2026-11-27, after landing.** The torch-mlir lowering now spells ONNX `DequantizeLinear` / `QuantizeLinear` as `iree_linalg_ext.dequantize_affine` / `quantize_affine`, not `linalg.generic`s | **Not a compile error.** `rocket-fuse-int8-residual-add` and `rocket-fuse-int8-max-pool` matched only the generic form, so every int8 residual add and the int8 stem max pool fell back to the CPU. ResNet50 built with `--quantize-residual-skip` lost its 27.5 ms (`agent-docs/quantization-byo-measured.md`). The lit cases hand-write the old form, and the int8 check below used the board set, which has no int8 skip, so nothing caught it | `matchDequant` / `matchQuant` accept the affine ops too (per-tensor, identity maps, `ui8`, clamp `[0, 255]`; their rounding is half to even, as before). Lit cases added in the 3.14 form. |
 
 Also fixed in passing: 6 lit files in `rocket-compiler-plugin/test/` were
 never listed in `test/CMakeLists.txt`, so ctest skipped them. Two of them

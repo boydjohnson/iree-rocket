@@ -142,3 +142,31 @@ util.func public @pad2_stays_on_the_cpu(%x: tensor<1x64x16x16xi8>) -> tensor<1x6
   } -> tensor<1x64x9x9xi8>
   util.return %q : tensor<1x64x9x9xi8>
 }
+
+// @stem_max_pool as IREE 3.14's importer spells its DequantizeLinear and
+// QuantizeLinear: `iree_linalg_ext.{de,}quantize_affine`, here with a shared
+// `i64` zero point.
+// CHECK-LABEL: util.func public @stem_max_pool_affine_qdq
+// CHECK-NOT: tensor.pad
+// CHECK: flow.dispatch @rocket_pooling_max_int8_pad1_executable_s2::{{.*}}(%c16_i32, %c16_i32, %c64_i32, %c3_i32, %c3_i32
+// CHECK-NOT: linalg.pooling_nchw_max
+// CHECK-NOT: iree_linalg_ext.quantize_affine
+// CHECK: util.return
+util.func public @stem_max_pool_affine_qdq(%x: tensor<1x64x16x16xi8>) -> tensor<1x64x8x8xi8> {
+  %scale = arith.constant 1.370000e-01 : f32
+  %zp = arith.constant 7 : i64
+  %neg_inf = arith.constant 0xFF800000 : f32
+  %f_empty = tensor.empty() : tensor<1x64x16x16xf32>
+  %f = iree_linalg_ext.dequantize_affine <indexing_maps = [#map, affine_map<(d0, d1, d2, d3) -> ()>, affine_map<(d0, d1, d2, d3) -> ()>, #map], quant_min = 0, quant_max = 255, input_unsigned> ins(%x, %scale, %zp : tensor<1x64x16x16xi8>, f32, i64) outs(%f_empty : tensor<1x64x16x16xf32>) -> tensor<1x64x16x16xf32>
+  %padded = tensor.pad %f low[0, 0, 1, 1] high[0, 0, 1, 1] {
+  ^bb0(%a: index, %b: index, %c: index, %d: index):
+    tensor.yield %neg_inf : f32
+  } : tensor<1x64x16x16xf32> to tensor<1x64x18x18xf32>
+  %p_empty = tensor.empty() : tensor<1x64x8x8xf32>
+  %p_init = linalg.fill ins(%neg_inf : f32) outs(%p_empty : tensor<1x64x8x8xf32>) -> tensor<1x64x8x8xf32>
+  %window = tensor.empty() : tensor<3x3xf32>
+  %pooled = linalg.pooling_nchw_max {dilations = dense<1> : vector<2xi64>, strides = dense<2> : vector<2xi64>} ins(%padded, %window : tensor<1x64x18x18xf32>, tensor<3x3xf32>) outs(%p_init : tensor<1x64x8x8xf32>) -> tensor<1x64x8x8xf32>
+  %q_empty = tensor.empty() : tensor<1x64x8x8xi8>
+  %q = iree_linalg_ext.quantize_affine <indexing_maps = [#map, affine_map<(d0, d1, d2, d3) -> ()>, affine_map<(d0, d1, d2, d3) -> ()>, #map], quant_min = 0, quant_max = 255, storage_unsigned> ins(%pooled, %scale, %zp : tensor<1x64x8x8xf32>, f32, i64) outs(%q_empty : tensor<1x64x8x8xi8>) -> tensor<1x64x8x8xi8>
+  util.return %q : tensor<1x64x8x8xi8>
+}
