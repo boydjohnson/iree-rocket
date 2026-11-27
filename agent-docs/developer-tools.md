@@ -656,6 +656,45 @@ real fault. Averages cannot be exact -- the PPU's average is a multiply by
 `fp16(65536/k)` that the shim multiplies back out -- and take the `--atol`
 /`--rtol` defaults.
 
+## The Mali GPU as a second backend
+
+`--cpu-device-backend` changes which IREE target backend sits behind the
+device every dispatch the Rocket matchers did *not* claim lands on. It
+defaults to `local` (llvm-cpu), which is the only configuration anything in
+this repository has measured a model in; `vulkan` puts that half on the
+RK3588's Mali-G610 through panthor/panvk instead:
+
+```sh
+export IREE_COMPILER_LIB=iree-build/build-vulkan/lib/libIREECompiler.so
+cargo run -p rocket-compiler -- compile --input model.mlir --output model.vmfb \
+  --cpu-device-name=gpu_device --cpu-device-backend=vulkan \
+  --iree-flag=--iree-vulkan-target=valhall3
+```
+
+It needs a compiler built with both target backends registered --
+`iree-build/configure-compiler-vulkan.sh`, a second full build, ~52 minutes --
+and the `--cpu-device-name` rename is what keeps a GPU from being called
+`@cpu_device` all through the IR. The rename works because
+`resolve_transform_spec` rewrites the device symbols the transform spec
+hardcodes (`spec::rename_device`); before that it was rejected, since the
+spec's `#hal.device.affinity<@cpu_device>` would have dangled.
+
+Such a module **compiles with both backends in it and does not run**: IREE
+3.14 allocates each cross-device buffer from one device's allocator and hands
+it to the other unchanged, and neither HAL driver can use the other's
+buffers. `tools/mixed_device_gate.py` builds that arm, asserts its placement,
+and records how its run fails, alongside three arms that do run -- the whole
+model on the NPU, on the Mali, and on the CPU:
+
+```sh
+python3 tools/mixed_device_gate.py --board orangepi
+```
+
+It pins the Mali devfreq (and the CPU governors) for the duration, confirms
+from `trans_stat` that the clock stayed pinned, and refuses to report a
+timing if it could not pin them. `agent-docs/vulkan-panvk-spike.md` sections
+6 to 8 are the full account, the numbers, and what is missing.
+
 ## Whole-model survey
 
 `tools/model_survey.py` runs one model end to end -- export, import, both

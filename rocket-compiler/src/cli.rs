@@ -90,11 +90,41 @@ pub struct CommonArgs {
     #[arg(long)]
     pub batch_matmul: bool,
 
+    /// Name of the `!hal.device` global the NPU half of the module is placed
+    /// on, and of the CPU (or GPU -- see `--cpu-device-backend`) half.
+    ///
+    /// The shipped transform spec hardcodes `@rocket_device` and
+    /// `@cpu_device` in its `#hal.device.affinity` and
+    /// `#hal.device.topology` attributes, so renaming either one has to reach
+    /// the spec as well; `resolve_transform_spec` rewrites a copy of it
+    /// (`spec::rename_device`) and says how many references it moved. A
+    /// spec given with `--transform-spec` that names some *third* device is
+    /// still rejected up front, because those references live in attributes,
+    /// attributes are not symbol-verified, and a dangling one segfaults the
+    /// compiler much later instead of reporting an error.
     #[arg(long, default_value = "rocket_device")]
     pub rocket_device_name: String,
 
     #[arg(long, default_value = "cpu_device")]
     pub cpu_device_name: String,
+
+    /// The IREE target-device backend behind `--cpu-device-name`: the device
+    /// every dispatch the Rocket matchers did *not* claim is placed on.
+    ///
+    /// `local` (the default) is IREE's llvm-cpu backend and is the only
+    /// configuration anything in this repository has measured. `vulkan`
+    /// puts that half of the module on a Vulkan device instead -- on the
+    /// RK3588 that is the Mali-G610 through panthor/panvk
+    /// (agent-docs/vulkan-panvk-spike.md) -- and needs an `iree-compile`
+    /// built with the `vulkan-spirv` target registered alongside `rocket`,
+    /// plus `--iree-flag=--iree-vulkan-target=valhall3`.
+    ///
+    /// Anything other than `local` drops the llvm-cpu flags this CLI would
+    /// otherwise set, since no llvm-cpu executable is produced; rename the
+    /// device with `--cpu-device-name` so the IR does not call a GPU
+    /// `@cpu_device`.
+    #[arg(long, default_value = "local")]
+    pub cpu_device_backend: String,
 
     #[arg(long, default_value = "generic")]
     pub llvmcpu_target_cpu: String,
