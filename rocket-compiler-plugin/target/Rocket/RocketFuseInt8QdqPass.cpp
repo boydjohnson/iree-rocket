@@ -45,8 +45,20 @@
 // reading `%q` starts with `transpose(addi(nchw_u8, -128))`; with this
 // rewrite each pair meets its inverse, and dispatch formation folds them.
 //
-// The trailing ReLU is required: a residual Add with no activation (a
-// MobileNetV2 linear bottleneck's) has no target yet.
+// The ReLU is required, but it may be folded into the QuantizeLinear: ONNX
+// Runtime's `quantize_static` (QDQ) deletes a Relu whose QuantizeLinear has
+// `zero_point == quant_min`, since with that zero point the clamp alone sends
+// every negative value to the code of 0. So `Q(DQ(a) + DQ(b))` whose output
+// zero point equals its `quant_min` is the same tail as `Q(relu(...))`, code
+// for code, and is rewritten the same way. A residual Add with no activation
+// and any other zero point (a MobileNetV2 linear bottleneck's) has no target
+// yet and is declined.
+//
+// Signed codes. ORT's default QDQ (S8S8) stores activations as `i8` in
+// [-128, 127], with the zero point already in that encoding. Such an operand
+// or result is already what the canonical form and the matcher want, so it
+// gets no `addi -128` shift and no zero-point adjustment; each operand and
+// the result is shifted only when its own codes are `ui8`.
 //
 // Since IREE 3.14 the importer no longer spells DequantizeLinear and
 // QuantizeLinear as the `linalg.generic`s drawn above: they arrive as
@@ -136,11 +148,13 @@ static std::optional<unsigned> inputIndex(linalg::GenericOp op, Value value) {
   return arg.getArgNumber();
 }
 
-/// One `ui8` dequantization: the tensor it reads, its scale, its zero point.
+/// One 8-bit dequantization: the tensor it reads, its scale, its zero point
+/// (in the codes' own encoding), and whether those codes are `ui8`.
 struct Dequant {
   Value source;
   double scale = 0.0;
   int64_t zeroPoint = 0;
+  bool isUnsigned = true;
 };
 
 /// A scalar float constant, or a splat of one.
@@ -152,10 +166,12 @@ static std::optional<double> constantFloat(Value value) {
   return result.convertToDouble();
 }
 
-/// A `ui8` zero point given as an affine quantization op's operand: absent
-/// means 0, and `zp_unsigned` says how to read a narrow integer.
-static std::optional<int64_t> affineZeroPoint(Value zeroPoint,
-                                              bool zpUnsigned) {
+/// An 8-bit zero point given as an affine quantization op's operand: absent
+/// means 0, and `zp_unsigned` says how to read a narrow integer. It has to be
+/// a code of the tensor's own encoding: [0, 255] for `ui8` codes, [-128, 127]
+/// for signed ones.
+static std::optional<int64_t> affineZeroPoint(Value zeroPoint, bool zpUnsigned,
+                                              bool codesUnsigned) {
   if (!zeroPoint) {
     return 0;
   }
@@ -165,7 +181,8 @@ static std::optional<int64_t> affineZeroPoint(Value zeroPoint,
   }
   int64_t value = zpUnsigned ? static_cast<int64_t>(result.getZExtValue())
                              : result.getSExtValue();
-  if (value < 0 || value > 255) {
+  int64_t low = codesUnsigned ? 0 : -128;
+  if (value < low || value > low + 255) {
     return std::nullopt;
   }
   return value;
@@ -181,20 +198,19 @@ static bool isPerTensorIdentity(AffineOp op) {
          (!op.getZeroPoint() || op.getZeroPointMap().getNumResults() == 0);
 }
 
-/// `iree_linalg_ext.dequantize_affine` over `ui8` codes, per tensor, into f32:
-/// the form the IREE 3.14 importer gives DequantizeLinear.
+/// `iree_linalg_ext.dequantize_affine` over 8-bit codes, `ui8` or signed, per
+/// tensor, into f32: the form the IREE 3.14 importer gives DequantizeLinear.
 static std::optional<Dequant>
 matchAffineDequant(IREE::LinalgExt::DequantizeAffineOp op, Value value) {
   if (!value.hasOneUse() || !isPerTensorIdentity(op) ||
-      !op.getInputUnsigned() ||
       !op.getInputType().getElementType().isInteger(8) ||
       !op.getOutputType().getElementType().isF32() ||
       !op.getScaleElementType().isF32()) {
     return std::nullopt;
   }
   std::optional<double> scale = constantFloat(op.getScale());
-  std::optional<int64_t> zeroPoint =
-      affineZeroPoint(op.getZeroPoint(), op.getZpUnsigned());
+  std::optional<int64_t> zeroPoint = affineZeroPoint(
+      op.getZeroPoint(), op.getZpUnsigned(), op.getInputUnsigned());
   if (!scale || !zeroPoint) {
     return std::nullopt;
   }
@@ -202,6 +218,7 @@ matchAffineDequant(IREE::LinalgExt::DequantizeAffineOp op, Value value) {
   found.source = op.getInput();
   found.scale = *scale;
   found.zeroPoint = *zeroPoint;
+  found.isUnsigned = op.getInputUnsigned();
   return found;
 }
 
@@ -291,21 +308,30 @@ static bool isRelu(linalg::GenericOp op) {
          *otherwise == 0.0;
 }
 
-/// One `ui8` quantization: the f32 tensor it reads, its scale, its zero point.
+/// One 8-bit quantization: the f32 tensor it reads, its scale, its zero point
+/// (in the codes' own encoding), and whether it writes `ui8` codes. The clamp
+/// is always the encoding's full range, so its floor -- the smallest code --
+/// is 0 for `ui8` and -128 for signed codes.
 struct Quant {
   Value input;
   double scale = 0.0;
   int64_t zeroPoint = 0;
+  bool isUnsigned = true;
+
+  int64_t quantMin() const { return isUnsigned ? 0 : -128; }
 };
 
-/// `iree_linalg_ext.quantize_affine` from f32 to `ui8` codes, per tensor,
-/// clamped to the full [0, 255]: the form the IREE 3.14 importer gives
-/// QuantizeLinear. Its rounding is half to even, as the generic form's
-/// `roundeven` is.
+/// `iree_linalg_ext.quantize_affine` from f32 to 8-bit codes, per tensor,
+/// clamped to the encoding's full range -- [0, 255] for `ui8`, [-128, 127]
+/// for signed: the form the IREE 3.14 importer gives QuantizeLinear. Its
+/// rounding is half to even, as the generic form's `roundeven` is. A narrower
+/// clamp (a 7-bit `reduce_range`, or symmetric [-127, 127]) is declined.
 static std::optional<Quant>
 matchAffineQuant(IREE::LinalgExt::QuantizeAffineOp op) {
-  if (!isPerTensorIdentity(op) || !op.getStorageUnsigned() ||
-      op.getQuantMin() != 0 || op.getQuantMax() != 255 ||
+  bool isUnsigned = op.getStorageUnsigned();
+  int64_t low = isUnsigned ? 0 : -128;
+  if (!isPerTensorIdentity(op) || op.getQuantMin() != low ||
+      op.getQuantMax() != low + 255 ||
       !op.getInputType().getElementType().isF32() ||
       !op.getOutputType().getElementType().isInteger(8) ||
       !op.getScaleElementType().isF32() ||
@@ -314,11 +340,11 @@ matchAffineQuant(IREE::LinalgExt::QuantizeAffineOp op) {
   }
   std::optional<double> scale = constantFloat(op.getScale());
   std::optional<int64_t> zeroPoint =
-      affineZeroPoint(op.getZeroPoint(), op.getZpUnsigned());
+      affineZeroPoint(op.getZeroPoint(), op.getZpUnsigned(), isUnsigned);
   if (!scale || !zeroPoint) {
     return std::nullopt;
   }
-  return Quant{op.getInput(), *scale, *zeroPoint};
+  return Quant{op.getInput(), *scale, *zeroPoint, isUnsigned};
 }
 
 /// `divf so; roundeven; addf zo; maximumf 0; minimumf 255; fptoui` -- the
@@ -357,7 +383,7 @@ static std::optional<Quant> matchQuant(Operation *root) {
     return std::nullopt;
   }
   return Quant{op.getDpsInputs()[0], *divisor,
-               static_cast<int64_t>(*zeroPoint)};
+               static_cast<int64_t>(*zeroPoint), /*isUnsigned=*/true};
 }
 
 static Value emitShift(PatternRewriter &rewriter, Location loc, Value source) {
@@ -380,6 +406,19 @@ static Value emitShift(PatternRewriter &rewriter, Location loc, Value source) {
                linalg::YieldOp::create(b, nested, shifted);
              })
       .getResult(0);
+}
+
+/// `source` in the signed encoding: shifted by -128 when its codes are `ui8`,
+/// as it is otherwise. Also the inverse direction, since `addi -128` is its
+/// own inverse on 8 bits.
+static Value toSigned(PatternRewriter &rewriter, Location loc, Value source,
+                      bool isUnsigned) {
+  return isUnsigned ? emitShift(rewriter, loc, source) : source;
+}
+
+/// A zero point moved into the signed encoding along with its codes.
+static int64_t signedZeroPoint(int64_t zeroPoint, bool isUnsigned) {
+  return isUnsigned ? zeroPoint + kEncodingShift : zeroPoint;
 }
 
 static Value emitTranspose(PatternRewriter &rewriter, Location loc,
@@ -409,11 +448,17 @@ struct FuseInt8ResidualAdd : public RewritePattern {
     }
     double outputScale = output->scale;
     int64_t outputZeroPoint = output->zeroPoint;
-    auto relu = output->input.getDefiningOp<linalg::GenericOp>();
-    if (!relu || !relu->hasOneUse() || !isRelu(relu)) {
+    // The ReLU, explicit or folded into the quantization's clamp (see the
+    // file comment): with `zo == quant_min` every negative sum quantizes to
+    // the code of 0 already.
+    Value sumValue = output->input;
+    auto relu = sumValue.getDefiningOp<linalg::GenericOp>();
+    if (relu && relu->hasOneUse() && isRelu(relu)) {
+      sumValue = relu.getDpsInputs()[0];
+    } else if (outputZeroPoint != output->quantMin()) {
       return failure();
     }
-    auto add = asIdentityElementwiseAdd(relu.getDpsInputs()[0].getDefiningOp());
+    auto add = asIdentityElementwiseAdd(sumValue.getDefiningOp());
     if (!add || !add->hasOneUse()) {
       return failure();
     }
@@ -439,10 +484,12 @@ struct FuseInt8ResidualAdd : public RewritePattern {
     Location loc = quant->getLoc();
     const int64_t toNhwc[] = {0, 2, 3, 1};
     const int64_t toNchw[] = {0, 3, 1, 2};
-    Value aNhwc = emitTranspose(rewriter, loc,
-                                emitShift(rewriter, loc, a->source), toNhwc);
-    Value bNhwc = emitTranspose(rewriter, loc,
-                                emitShift(rewriter, loc, b->source), toNhwc);
+    Value aNhwc = emitTranspose(
+        rewriter, loc, toSigned(rewriter, loc, a->source, a->isUnsigned),
+        toNhwc);
+    Value bNhwc = emitTranspose(
+        rewriter, loc, toSigned(rewriter, loc, b->source, b->isUnsigned),
+        toNhwc);
     auto nhwcType = cast<RankedTensorType>(aNhwc.getType());
 
     auto f32 = [&](double value) -> Value {
@@ -457,11 +504,11 @@ struct FuseInt8ResidualAdd : public RewritePattern {
         aNhwc,
         bNhwc,
         f32(a->scale),
-        i32(a->zeroPoint + kEncodingShift),
+        i32(signedZeroPoint(a->zeroPoint, a->isUnsigned)),
         f32(b->scale),
-        i32(b->zeroPoint + kEncodingShift),
+        i32(signedZeroPoint(b->zeroPoint, b->isUnsigned)),
         f32(outputScale),
-        i32(outputZeroPoint + kEncodingShift),
+        i32(signedZeroPoint(outputZeroPoint, output->isUnsigned)),
         f32(0.0),
         f32(-128.0),
         f32(127.0),
@@ -510,8 +557,9 @@ struct FuseInt8ResidualAdd : public RewritePattern {
               linalg::YieldOp::create(bld, nested, narrowed);
             })
             .getResult(0);
-    Value back = emitShift(rewriter, loc,
-                           emitTranspose(rewriter, loc, fused, toNchw));
+    Value back =
+        toSigned(rewriter, loc, emitTranspose(rewriter, loc, fused, toNchw),
+                 output->isUnsigned);
     rewriter.replaceOp(quant, back);
     return success();
   }
@@ -533,6 +581,9 @@ struct FuseInt8ResidualAdd : public RewritePattern {
 /// one real element (the pad is narrower than the kernel), so padding with
 /// the smallest code, -128 in the signed encoding, is the same result. And
 /// signed max over `u8 - 128` orders exactly like unsigned max over `u8`.
+///
+/// Signed codes (ORT's default QDQ, S8S8) are already in that encoding: they
+/// get no shifts, and -128 is still the smallest code.
 struct FuseInt8MaxPool : public RewritePattern {
   explicit FuseInt8MaxPool(MLIRContext *context)
       : RewritePattern(MatchAnyOpTypeTag(), /*benefit=*/1, context) {}
@@ -570,7 +621,8 @@ struct FuseInt8MaxPool : public RewritePattern {
     }
     std::optional<Dequant> dequant = matchDequant(pad.getSource());
     if (!dequant || dequant->scale != outputScale ||
-        dequant->zeroPoint != outputZeroPoint) {
+        dequant->zeroPoint != outputZeroPoint ||
+        dequant->isUnsigned != output->isUnsigned) {
       return failure();
     }
     auto sourceType = cast<RankedTensorType>(dequant->source.getType());
@@ -600,9 +652,9 @@ struct FuseInt8MaxPool : public RewritePattern {
     Location loc = quant->getLoc();
     const int64_t toNhwc[] = {0, 2, 3, 1};
     const int64_t toNchw[] = {0, 3, 1, 2};
-    Value nhwc = emitTranspose(rewriter, loc,
-                               emitShift(rewriter, loc, dequant->source),
-                               toNhwc);
+    Value nhwc = emitTranspose(
+        rewriter, loc,
+        toSigned(rewriter, loc, dequant->source, dequant->isUnsigned), toNhwc);
     Type i8 = rewriter.getI8Type();
     Value smallest = arith::ConstantOp::create(
         rewriter, loc, rewriter.getIntegerAttr(i8, -128));
@@ -634,8 +686,9 @@ struct FuseInt8MaxPool : public RewritePattern {
             ValueRange{padded, window}, ValueRange{outInit},
             pool.getStridesAttr(), pool.getDilationsAttr())
             .getResult(0);
-    Value back = emitShift(rewriter, loc,
-                           emitTranspose(rewriter, loc, pooled, toNchw));
+    Value back =
+        toSigned(rewriter, loc, emitTranspose(rewriter, loc, pooled, toNchw),
+                 output->isUnsigned);
     rewriter.replaceOp(quant, back);
     return success();
   }
@@ -650,8 +703,9 @@ struct RocketFuseInt8ResidualAddPass
   }
   StringRef getDescription() const final {
     return "Rewrites a quantized residual tail Q(relu(DQ(a) + DQ(b))) on int8 "
-           "operands into the canonical signed NHWC form the Rocket int8 "
-           "element-wise add matcher claims.";
+           "operands -- the ReLU explicit or folded into Q's zero point -- "
+           "into the canonical signed NHWC form the Rocket int8 element-wise "
+           "add matcher claims.";
   }
 
   void getDependentDialects(DialectRegistry &registry) const final {
