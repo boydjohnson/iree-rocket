@@ -212,7 +212,8 @@ is the compiler-side plan, with [`DYNAMIC_SHAPES.md`](DYNAMIC_SHAPES.md) and
 [ONNX-to-board walkthrough](agent-docs/onnx-to-numbers.md),
 [developer tools](agent-docs/developer-tools.md), [CI](agent-docs/ci.md), the
 [IREE 3.14 bump record](agent-docs/iree-3.14-bump.md) behind the numbers
-above, open questions and dated survey results. They are written for
+above, the [Mali/panvk Vulkan spike](agent-docs/vulkan-panvk-spike.md),
+open questions and dated survey results. They are written for
 contributors rather than for a first read.
 
 ## Building from source
