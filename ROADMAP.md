@@ -60,15 +60,17 @@ table, why the f32 baseline is the fair one, and what is still open about it.
 **What this does not change is the conclusion below, and it matters that the
 conclusion has its own evidence.** Coverage matchers still land behind a
 flag, because the one that was built and measured loses on its own terms:
-ViT with `--elementwise` is **1.17x slower at eight cores**, and no matcher
-cut point rescues it -- even ViT's widest element-wise op is net-negative, so
+ViT with `--elementwise` is **2.0x slower at eight cores** (re-measured
+2026-11-27; it was 1.17x on 2026-09-06), and no matcher cut point rescues it -- even ViT's widest element-wise op is net-negative, so
 it is not a bounds problem. ~~The lever that would change that answer is layout
 propagation, which is P2 and refuted, not a wider matcher.~~ Corrected
 2026-11-27: the lever named is P2's, and P2 is not refuted but **closed**
 (ISSUES.md P2; #39, 2026-09-08, gave every dispatch kind, element-wise
-included, the chain and lazy compaction). The 1.17x is a 2026-09-06,
-pre-#39 measurement and has not been re-run since, so it is the stale half
-of this argument -- see Phase 1's ViT measurement. So read the
+included, the chain and lazy compaction). Re-measured after #39 on
+2026-11-27, the flag costs more, not less: 2.0x slower on ViT-B/16 fp16,
+because the default arm got faster while each element-wise dispatch still
+pays a full NC1HWC2 pack and compact -- see Phase 1's ViT measurement. So
+read the
 ordering below as resting on that measurement rather than on a blanket rule
 about dispatch counts, and judge a new op by the per-op bar the "Recommended
 order" section states: *does this op do more work than its dispatch costs?*
@@ -83,7 +85,7 @@ With that, this roadmap separates two things the repo has previously conflated:
   one, and is the only phase here with a positive performance story.
 
 A phase that ships element-wise coverage matchers switched on by default would
-regress ViT by 1.17x on the measurement above (pre-#39, pending a re-run). That is the failure mode this
+regress ViT by 2.0x on the measurement above (2026-11-27). That is the failure mode this
 ordering exists to prevent -- and it is now a statement about element-wise
 ops specifically, not about offload sites in general.
 
@@ -620,18 +622,63 @@ lazy compaction for every dispatch kind") gave the element-wise kind its
 output cube (`elementwise_output_cube`,
 `rocket-hal-driver/src/command_buffer.rs`). So this section's own
 retirement condition was met on 2026-09-08, two days after the measurement,
-and the 1.17x is **pre-P2 and has not been re-measured**. Re-measuring it
-is pending.
+and the 1.17x above is **pre-P2**.
 
-**Conclusion: `--elementwise` stays off by default** -- pending that
-re-measurement, on a figure that predates #39. It is P8's law confirmed
-on a second model and a second op family, with the mechanism named. The lever
-that would change the answer is layout propagation (P2), not a wider matcher;
-P2 has since closed (ISSUES.md P2), which is why the figure needs re-taking.
+**Re-measured 2026-11-27 at `main` 454fa4e: 2.0x slower.** The model is the
+survey's torchvision ViT-B/16 fp16 export (`tools/model_survey.py --arm npu
+--arm cpu --arm npu-ew`), not the September HuggingFace f32 import, so the
+absolute times are not comparable with the table above; the ratio is the
+point. orangepi on Armbian 7.3.6 with the three `kernel-patches/`, NPU at
+600 MHz, governor `performance`, NPU IRQs on cpu6, medians of 7 with the
+first discarded, 0 NPU timeouts. (A run earlier the same day at 1442ae0, before
+#116 changed the int8 QDQ fusion, gave 187/171 and 363/348 ms: the same
+ratios. The vmfbs differ only in embedded source paths, and #116's pass has
+nothing to match in an fp16 model.)
 
-One incidental finding: 25 of the matched sites are `1x197x1` -- a single
+| arm | NPU / CPU sites | 4xA76 | 8 cores |
+|---|---|---|---|
+| `--no-offload` | 0 / 178 | 1600 ms | 1244 ms |
+| default | 50 / 175 | **191 ms** | **173 ms** |
+| `--elementwise` | 162 / 224 | 359 ms (**1.88x slower**) | 354 ms (**2.05x slower**) |
+
+All three arms agree with the f32 ONNX Runtime oracle on the class and the
+top 5; the `--elementwise` arm's max|err| (0.003655) is the default arm's to
+six places, so the 112 extra sites cost no accuracy. They cost time, and
+`ROCKET_PROFILE=1` (5 iterations each, cpus 4-7) says where, per inference:
+
+| | default | `--elementwise` | delta |
+|---|---|---|---|
+| `compact` | 7.2 ms | 114.5 ms | **+107** |
+| `pack.input` | 7.2 (50 calls) | 50.0 (224 calls) | **+43** |
+| `wait.npu` | 85.2 | 105.8 | +21 |
+| `record` | 10.4 | 27.7 | +17 |
+| `outside` (CPU dispatches) | 95.0 | 107.5 | +13 |
+
+The 112 element-wise dispatches spend 195 ms per inference, of which the
+hardware is 22 ms: **about 1.5 ms of host work around 0.19 ms of NPU time**
+each.
+Three things in the profile say why chaining did not save it. Every
+element-wise output is compacted back to IREE's dense layout (`compact` runs
+once per dispatch, and the arm's compaction averages 679 MB/s against 4.6
+GB/s in the default arm). `pack.input` runs 174 more times per inference for
+the 224 element-wise operands, so at most 50 of them arrive already
+packed. And the shims add 49 CPU dispatch sites (175 -> 224), which sit
+between the element-wise ops and break the chain. Meanwhile the matmuls
+around them read and write row-major (`rm in+out`, compaction 3-13 ms per 60
+calls), so the default arm no longer pays the round trip the element-wise
+kind still does, and the gap is twice as wide as in September.
+
+**Conclusion: `--elementwise` stays off by default**, now on a post-#39
+measurement. The lever is the element-wise dispatch's own layout -- reading
+and writing row-major as the matmuls do, or folding the op into the
+producing matmul's epilogue -- not a wider matcher, and not more chaining of
+the kind #39 already gave it.
+
+One incidental finding from the September measurement (the HuggingFace
+import): 25 of the matched sites are `1x197x1` -- a single
 channel padded to a 16-channel atom. They cost only 7.9 ms in total, but a
-channel floor would skip them for free.
+channel floor would skip them for free. The survey's torchvision export above
+has none: its 112 element-wise sites are all `1x197x768` or `1x197x3072`.
 
 ---
 
@@ -877,8 +924,8 @@ been displaced -- that model is now 10.0 ms offloaded against 30.9 ms
 `--no-offload` at four workers, 3.1x the other way (ISSUES.md P7,
 2026-11-25) -- but the flag does not depend on it. What holds the flag shut
 is the direct measurement of the thing behind it: ViT with `--elementwise`
-is 1.17x slower at eight cores -- a 2026-09-06 figure that predates #39's
-element-wise chain and has not been re-measured since.
+is 2.0x slower at eight cores on ViT-B/16 fp16, re-measured after #39's
+element-wise chain on 2026-11-27 (Phase 1).
 
 Phase 3 moved that reference point and did not remove it. The int8 dispatch
 tax is much lower than it was -- the model beats the CPU now -- but what

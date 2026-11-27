@@ -3742,7 +3742,8 @@ So the bar for a new offload is the one ROADMAP's "Recommended order" already
 states per-op -- *does this op do more work than its dispatch costs* -- and
 not a blanket rule about site counts. That bar still refuses element-wise
 offload, on its own evidence rather than this one: ViT with `--elementwise`
-is 1.17x slower at eight cores and no matcher cut point rescues it.
+is 2.0x slower at eight cores (re-measured 2026-11-27 after P2, ROADMAP.md
+Phase 1; 1.17x before it) and no matcher cut point rescues it.
 
 1. ~~**P3's first half — the whole-BO cache sync, ∝ pages not bytes.**~~
    Done 2026-11-23 (see Resolved): a constant buffer is synced once per

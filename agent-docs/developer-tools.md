@@ -284,6 +284,13 @@ the `truncf`/`extf` CPU dispatches the shims add around each offloaded op
 (ViT's CPU sites go 260 to 553). No matcher bound fixes that; layout
 propagation would. See ROADMAP.md's Phase 1 and ISSUES.md P2/P8.
 
+Re-measured 2026-11-27 at `main`, after P2 gave every dispatch kind the
+chain: still off, and by more. ViT-B/16 fp16 (the survey export) is 173 ms
+by default and 354 ms with `--elementwise` at eight cores (2.05x slower),
+191 against 359 ms at four (1.88x). Each element-wise dispatch spends about
+1.5 ms of host work, mostly `compact` and `pack.input`, around 0.19 ms of
+NPU time. ROADMAP.md Phase 1 has the table and the profile.
+
 The flag composes with `--no-offload`, and only in one order: the entries are
 enabled first and neutralized second, so the element-wise matchers are checked
 for a defeatable predicate and disarmed along with the rest, and the baseline
