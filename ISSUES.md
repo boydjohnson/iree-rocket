@@ -3013,7 +3013,9 @@ kept `mapped_bytes` unslacked: the same 77.5 ms.)
   module that imports `module.main_graph` and calls it three times; one
   `iree-run-module` call reuses only 7 buffers), at one NPU context and at
   three, with 0 timeouts. Rocket CTS identical both ways: the same 8
-  pre-existing queue failures. The `iree-rocket-hal` gate does not link the
+  pre-existing queue failures (all 8 fixed since
+  [#112](https://github.com/boydjohnson/iree-rocket/pull/112): queue is 41
+  passed, 5 skipped, 0 failed). The `iree-rocket-hal` gate does not link the
   HAL driver, so it cannot see this change and was not re-run.
 - **Measured.** 600 MHz, medians of 15 repetitions, ABBA (off on on off):
 
@@ -3234,7 +3236,8 @@ Measured on `planck` re-flashed to 7.3.5 (`ssh orangepi`), NPU at 200 MHz,
 `ondemand`. Outputs bit-identical to `ROCKET_SYNC_CONSTANTS=1` on MobileNetV2
 fp16/int8, ResNet50-224 fp16/int8 and Wide ResNet50 fp16, at one and at three
 NPU contexts; Rocket CTS identical both ways (the same 8 pre-existing queue
-failures).
+failures, all fixed since
+[#112](https://github.com/boydjohnson/iree-rocket/pull/112)).
 
 | model | `sync.inputs` per dispatch | median ms, ABBA |
 |---|---|---|

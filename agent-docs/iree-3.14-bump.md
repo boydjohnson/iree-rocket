@@ -37,7 +37,7 @@ bool` on `TargetRegistryRef`, which we do not use. The removed
 - **Lit:** 55/55, via ctest after registering the six; also `llvm-lit` over the whole directory.
 - **Rust:** `cargo nextest run --workspace` 508/508 on host; `rocket-compiler` 51/51.
 - **Board gate** (`cargo nextest run -p iree-rocket-hal --release --run-ignored all`, built natively on orangepi): 514/514. That crate links no IREE, so it is unaffected by construction. The kernel logged 8 "NPU job timed out" in the window of the `c8_precision_transition_hw` / `c16_pool_sequences` probes, which reproduce core poisoning on purpose.
-- **HAL CTS on the board** (the real ABI check for the driver): core 28, buffer 20, command_buffer 37 and the conv schema harness 10 all pass. queue fails the same **8** it always has (seven explicit-pool `QueueAllocaTest` cases plus `QueueHostCallTest.AsyncCallback`; see `rocket-hal-driver/MULTICORE.md`). 0 timeouts.
+- **HAL CTS on the board** (the real ABI check for the driver): core 28, buffer 20, command_buffer 37 and the conv schema harness 10 all pass. queue fails the same **8** it always has (seven explicit-pool `QueueAllocaTest` cases plus `QueueHostCallTest.AsyncCallback`; see `rocket-hal-driver/MULTICORE.md`). 0 timeouts. (2026-11-27: all 8 fixed in [#112](https://github.com/boydjohnson/iree-rocket/pull/112). The queue suite is 41 passed, 5 skipped, 0 failed, so any queue failure now is a regression.)
 - **Board runtime:** `configure-runtime-aarch64.sh` plus `iree-run-module`/`iree-benchmark-module` built clean (452 targets), with `IREE_HOST_BIN_DIR` pointed at the 3.14 host tools.
 
 ## 10-model survey vs `survey/2026-11-25-main` (orangepi, 600 MHz, performance)
