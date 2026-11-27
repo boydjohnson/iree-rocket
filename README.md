@@ -118,7 +118,8 @@ configuration yet, and `hardware` never closes.
 
 To run models from your own program instead of `iree-run-module`, the
 nightly's `iree-rocket-runtime-aarch64` artifact is the runtime as a C/C++
-library; [`rocket-runtime`](rocket-runtime) has the API and a minimal example.
+library; [`rocket-runtime`](rocket-runtime) has the API and a minimal example,
+and [`rocket-runtime/rust`](rocket-runtime/rust) the Rust bindings.
 
 ## Known limitations
 
@@ -178,7 +179,7 @@ extent of an actual measurement and the register encodings are wider.
 | [`rocket-plan-ffi`](rocket-plan-ffi) | A versioned C ABI over that planner, so the compiler asks the same planner -- and packs the same coefficient bytes -- the runtime does. |
 | [`iree-rocket-hal`](iree-rocket-hal) | ioctl/mmap access to the NPU and register command building. |
 | [`rocket-hal-driver`](rocket-hal-driver) | The IREE HAL driver, statically linked into IREE's tools. Includes HAL CTS wiring. |
-| [`rocket-runtime`](rocket-runtime) | The runtime as a library for C and C++ programs: `rocket/runtime.h`, a session over the NPU+CPU device pair every module needs (IREE's own session API takes one device), packaged as `libiree_rocket_runtime.{so,a}` with pkg-config and CMake files. |
+| [`rocket-runtime`](rocket-runtime) | The runtime as a library for C, C++ and Rust programs: `rocket/runtime.h`, a session over the NPU+CPU device pair every module needs (IREE's own session API takes one device), packaged as `libiree_rocket_runtime.{so,a}` with pkg-config and CMake files, plus Rust bindings in [`rocket-runtime/rust`](rocket-runtime/rust). |
 | [`rocket-compiler-plugin`](rocket-compiler-plugin) | The IREE compiler target plugin ("Rocket"), in C++, plus the transform spec that matches and rewrites operations. |
 | [`rocket-compiler`](rocket-compiler) | The compiler driver: applies the transform spec and the device flags it expects, and audits where every convolution and matmul went. |
 | [`rocket-schema`](rocket-schema) | The FlatBuffers executable format shared by both sides. |

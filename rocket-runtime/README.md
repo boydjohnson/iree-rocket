@@ -1,7 +1,8 @@
 # rocket-runtime
 
-The iree-rocket runtime as a library, for C and C++ programs that run
-rocket-compiler modules themselves rather than through `iree-run-module`.
+The iree-rocket runtime as a library, for C, C++ and Rust programs that run
+rocket-compiler modules themselves rather than through `iree-run-module`. The
+Rust bindings are in [`rust/`](rust).
 
 ## Why it exists
 
@@ -64,8 +65,8 @@ c++ -std=c++17 embed.cc $(pkg-config --cflags --libs iree-rocket-runtime)
 Prefer the shared library. The static archive contains the Rocket driver's own
 copy of the Rust standard library, so a Rust program that links it gets
 duplicate std symbols. The `.so`'s version script ([`src/exports.map`](src/exports.map))
-hides it, which is also what makes the `.so` the one a future Rust crate binds
-to.
+hides it, which is also why the [Rust bindings](rust) link the `.so` and never
+the archive.
 
 ## Compatibility
 
@@ -93,4 +94,6 @@ library.
 On the board with ViT-B/16 fp16 (73 NPU sites), `iree-run-module`,
 `rocket-run-module` (static and shared) and `embed.cc` built from the unpacked
 package (pkg-config shared and static, CMake shared and static) print
-byte-identical logits.
+byte-identical logits. The Rust bindings' example matches `iree-run-module`
+byte for byte on MobileNetV2 and ViT-B/16 with a random input (see
+[`rust/`](rust)).

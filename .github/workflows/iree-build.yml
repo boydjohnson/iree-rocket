@@ -545,7 +545,8 @@ jobs:
           ls -lh ./*.tar.gz
 
       # The package as an outside program sees it: the shipped C++ sample,
-      # cross-compiled from the unpacked tree through each pkg-config file.
+      # cross-compiled from the unpacked tree through each pkg-config file,
+      # and the Rust bindings built against it.
       # Link-only -- the runner cannot execute aarch64, and the board run is
       # what checks results.
       - name: Link-test the runtime package (aarch64)
@@ -562,6 +563,13 @@ jobs:
               $(pkg-config --cflags --libs "${pc}") -o "${PKG}/embed-${pc}"
             echo "linked against ${pc}: $(stat -c %s "${PKG}/embed-${pc}") bytes"
           done
+          # The Rust bindings (rocket-runtime/rust) against the same unpacked
+          # package: bindgen over its headers, every target linked to its .so.
+          ROCKET_RUNTIME_DIR="${ROOT}" \
+          CARGO_TARGET_AARCH64_UNKNOWN_LINUX_GNU_LINKER=aarch64-linux-gnu-gcc \
+            cargo build --release --manifest-path rocket-runtime/rust/Cargo.toml \
+              --target aarch64-unknown-linux-gnu --all-targets \
+              --features rocket-runtime/half
 
       - name: Upload iree runtime (aarch64)
         if: inputs.target == 'runtime-aarch64'

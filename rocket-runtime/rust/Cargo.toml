@@ -1,0 +1,15 @@
+# Rust bindings to libiree_rocket_runtime.so (rocket-runtime/).
+#
+# Its own workspace, excluded from the repository's root one: building these
+# crates needs the installed IreeRocketRuntime package (headers and the .so),
+# which the root workspace's `cargo test --workspace` -- and ci.yml -- do not
+# have. Point ROCKET_RUNTIME_DIR at an unpacked package, or put its
+# lib/pkgconfig on PKG_CONFIG_PATH; see rocket-runtime/README.md.
+[workspace]
+resolver = "2"
+members = ["rocket-runtime-sys", "rocket-runtime"]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2024"
+license = "Apache-2.0 WITH LLVM-exception"
