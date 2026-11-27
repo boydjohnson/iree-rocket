@@ -1136,10 +1136,11 @@
 // depthwise writes 16-byte atoms, not the 256-byte ones the accumulator
 // path's depthwise uses.
 //
-// Stride 1 only, deliberately. That is what the 13 offloaded depthwise
-// convolutions use; the model's stride-2 depthwise layers do not reach a
-// Rocket matcher today at all, so a stride-2 requantized target would be
-// dead weight until they do.
+// Stride 1 only. That is what the 13 offloaded depthwise convolutions used
+// when this was written. Every depthwise layer in MobileNetV2 is padded,
+// and its stride-2 ones now take
+// #rocket_dynamic_depthwise_int8_requant_pad1_s2_target below, so an
+// unpadded stride-2 twin would still claim nothing measured.
 #rocket_dynamic_depthwise_int8_requant_target = #hal.executable.target<"rocket", "rocket-flatbuffer-v1", {
   kernel = "conv2d",
   input_width = 0 : i32, input_height = 0 : i32, input_channels = 0 : i32,
@@ -1152,6 +1153,63 @@
   truncate_bits = 0 : i32,
   activation = "none", activation_cmp = 0 : i32,
   precision = "int8",
+  runtime_dimensions = [
+    "input_width", "input_height", "input_channels",
+    "output_channels", "weights_width", "weights_height"
+  ],
+  runtime_quantization = ["output_scale", "output_zero_point"]
+}>
+
+// Requantized int8 depthwise with the model's "same" padding done by the
+// CNA: the depthwise twin of #rocket_dynamic_int8_requant_pad1_target, at
+// stride 1 and stride 2, baking the same fill. `input_zero_point = -128` is
+// the signed encoding of a `ui8` zero point of 0, which every expand conv's
+// output carries once the quantizer folds its ReLU6 (`Clip`) into the conv,
+// and it reaches the hardware only as `CNA_PAD_CON1.pad_value`.
+//
+// Before these existed every 3x3 depthwise input in an int8 MobileNetV2
+// went through a CPU NCHW pad copy and a transpose, so no expand ->
+// depthwise edge could chain NPU-to-NPU. `rocket-transpose-quantized-conv-
+// to-nhwc` moves the pad to the NHWC side and `rocket-fold-conv-pad` marks
+// it, exactly as for the dense pad1 path.
+//
+// The stride-2 target is also the model's first *requantized* stride-2
+// depthwise: before it, those four layers took the int8 accumulator path
+// (#rocket_dynamic_depthwise_int8_target_s2) and a CPU i32 -> i8
+// requantization behind each.
+#rocket_dynamic_depthwise_int8_requant_pad1_target = #hal.executable.target<"rocket", "rocket-flatbuffer-v1", {
+  kernel = "conv2d",
+  input_width = 0 : i32, input_height = 0 : i32, input_channels = 0 : i32,
+  output_width = 0 : i32, output_height = 0 : i32, output_channels = 0 : i32,
+  weights_width = 0 : i32, weights_height = 0 : i32, stride = 1 : i32,
+  depthwise = true,
+  runtime_layout = true,
+  input_zero_point = -128 : i32, output_zero_point = 0 : i32, weights_zero_point = 0 : i32,
+  input_scale = 1.0 : f32, weights_scale = 1.0 : f32, output_scale = 0.0 : f32,
+  truncate_bits = 0 : i32,
+  activation = "none", activation_cmp = 0 : i32,
+  precision = "int8",
+  pad_top = 1 : i32, pad_left = 1 : i32,
+  runtime_dimensions = [
+    "input_width", "input_height", "input_channels",
+    "output_channels", "weights_width", "weights_height"
+  ],
+  runtime_quantization = ["output_scale", "output_zero_point"]
+}>
+
+#rocket_dynamic_depthwise_int8_requant_pad1_s2_target = #hal.executable.target<"rocket", "rocket-flatbuffer-v1", {
+  kernel = "conv2d",
+  input_width = 0 : i32, input_height = 0 : i32, input_channels = 0 : i32,
+  output_width = 0 : i32, output_height = 0 : i32, output_channels = 0 : i32,
+  weights_width = 0 : i32, weights_height = 0 : i32, stride = 2 : i32,
+  depthwise = true,
+  runtime_layout = true,
+  input_zero_point = -128 : i32, output_zero_point = 0 : i32, weights_zero_point = 0 : i32,
+  input_scale = 1.0 : f32, weights_scale = 1.0 : f32, output_scale = 0.0 : f32,
+  truncate_bits = 0 : i32,
+  activation = "none", activation_cmp = 0 : i32,
+  precision = "int8",
+  pad_top = 1 : i32, pad_left = 1 : i32,
   runtime_dimensions = [
     "input_width", "input_height", "input_channels",
     "output_channels", "weights_width", "weights_height"
@@ -1793,6 +1851,34 @@ module attributes {transform.with_named_sequence} {
 
   hal.executable private @rocket_dynamic_depthwise_int8_requant_executable {
     hal.executable.variant public @rocket_dynamic_depthwise_conv2d_v1 target(#rocket_dynamic_depthwise_int8_requant_target) {
+      hal.executable.export public @rocket_dynamic_depthwise_conv2d ordinal(0) layout(#dynamic_requant_pipeline_layout) count(%device: !hal.device, %workload: index) -> (index, index, index) {
+        %c1 = arith.constant 1 : index
+        hal.return %c1, %c1, %c1 : index, index, index
+      }
+      builtin.module {
+        func.func @rocket_dynamic_depthwise_conv2d() {
+          return
+        }
+      }
+    }
+  }
+
+  hal.executable private @rocket_dynamic_depthwise_int8_requant_pad1_executable {
+    hal.executable.variant public @rocket_dynamic_depthwise_conv2d_v1 target(#rocket_dynamic_depthwise_int8_requant_pad1_target) {
+      hal.executable.export public @rocket_dynamic_depthwise_conv2d ordinal(0) layout(#dynamic_requant_pipeline_layout) count(%device: !hal.device, %workload: index) -> (index, index, index) {
+        %c1 = arith.constant 1 : index
+        hal.return %c1, %c1, %c1 : index, index, index
+      }
+      builtin.module {
+        func.func @rocket_dynamic_depthwise_conv2d() {
+          return
+        }
+      }
+    }
+  }
+
+  hal.executable private @rocket_dynamic_depthwise_int8_requant_pad1_s2_executable {
+    hal.executable.variant public @rocket_dynamic_depthwise_conv2d_v1 target(#rocket_dynamic_depthwise_int8_requant_pad1_s2_target) {
       hal.executable.export public @rocket_dynamic_depthwise_conv2d ordinal(0) layout(#dynamic_requant_pipeline_layout) count(%device: !hal.device, %workload: index) -> (index, index, index) {
         %c1 = arith.constant 1 : index
         hal.return %c1, %c1, %c1 : index, index, index
@@ -6383,6 +6469,136 @@ module attributes {transform.with_named_sequence} {
     %layout_i32 = arith.constant 0 : i32
     %quantized = flow.dispatch
         @rocket_dynamic_depthwise_int8_requant_executable::@rocket_dynamic_depthwise_conv2d_v1::@rocket_dynamic_depthwise_conv2d(
+          %input_width_i32, %input_height_i32, %input_channels_i32,
+          %output_channels_i32, %weights_width_i32, %weights_height_i32,
+          %output_scale_i32, %output_zero_point, %layout_i32,
+          %input, %filter_chw, %bias)
+        {stream.affinity = #hal.device.affinity<@rocket_device>}
+        : (i32, i32, i32, i32, i32, i32, i32, i32, i32,
+           tensor<1x?x?x?xi8>{%input_height, %input_width, %input_channels},
+           tensor<?x?x?xi8>{%input_channels, %weights_height, %weights_width},
+           tensor<?xi32>{%output_channels})
+        -> tensor<1x?x?x?xi8>{%output_height, %output_width, %output_channels}
+
+    util.return %quantized : tensor<1x?x?x?xi8>
+  }
+
+  // @call_rocket_dynamic_depthwise_conv2d_int8_requant against the pad1
+  // executables: `%input` is the *unpadded* tensor the matched `tensor.pad`
+  // read, and the CNA pads it by one on every side with the target's baked
+  // fill. The output extent comes from `%init`, the padded convolution's own,
+  // so nothing here restates the padding arithmetic.
+  util.func private @call_rocket_dynamic_depthwise_conv2d_int8_requant_pad1(
+      %input: tensor<1x?x?x?xi8>,
+      %filter: tensor<?x?x?xi8>,
+      %acc_init: tensor<1x?x?x?xi32>,
+      %bias: tensor<?xi32>,
+      %output_scale: f32,
+      %output_zero_point: i32,
+      %int8_min: f32,
+      %int8_max: f32,
+      %init: tensor<1x?x?x?xi8>) -> tensor<1x?x?x?xi8> {
+    %c0 = arith.constant 0 : index
+    %c1 = arith.constant 1 : index
+    %c2 = arith.constant 2 : index
+    %c3 = arith.constant 3 : index
+
+    %input_height = tensor.dim %input, %c1 : tensor<1x?x?x?xi8>
+    %input_width = tensor.dim %input, %c2 : tensor<1x?x?x?xi8>
+    %input_channels = tensor.dim %input, %c3 : tensor<1x?x?x?xi8>
+    %weights_height = tensor.dim %filter, %c0 : tensor<?x?x?xi8>
+    %weights_width = tensor.dim %filter, %c1 : tensor<?x?x?xi8>
+    %output_height = tensor.dim %init, %c1 : tensor<1x?x?x?xi8>
+    %output_width = tensor.dim %init, %c2 : tensor<1x?x?x?xi8>
+    %output_channels = tensor.dim %init, %c3 : tensor<1x?x?x?xi8>
+
+    %input_width_i32 = arith.index_cast %input_width : index to i32
+    %input_height_i32 = arith.index_cast %input_height : index to i32
+    %input_channels_i32 = arith.index_cast %input_channels : index to i32
+    %output_channels_i32 = arith.index_cast %output_channels : index to i32
+    %weights_width_i32 = arith.index_cast %weights_width : index to i32
+    %weights_height_i32 = arith.index_cast %weights_height : index to i32
+
+    // Same reciprocal convention as the dense requantized shim: the IR keeps
+    // the multiplier a reader of the convolution would write, and the schema
+    // field is the output scale the driver divides into `input_scale *
+    // weights_scale`, both held at 1.0 by the target.
+    %one = arith.constant 1.000000e+00 : f32
+    %schema_output_scale = arith.divf %one, %output_scale : f32
+    %output_scale_i32 = arith.bitcast %schema_output_scale : f32 to i32
+
+    %filter_chw_empty = tensor.empty(%input_channels, %weights_height, %weights_width) : tensor<?x?x?xi8>
+    %filter_chw = linalg.transpose
+        ins(%filter : tensor<?x?x?xi8>)
+        outs(%filter_chw_empty : tensor<?x?x?xi8>)
+        permutation = [2, 0, 1]
+
+    %layout_i32 = arith.constant 0 : i32
+    %quantized = flow.dispatch
+        @rocket_dynamic_depthwise_int8_requant_pad1_executable::@rocket_dynamic_depthwise_conv2d_v1::@rocket_dynamic_depthwise_conv2d(
+          %input_width_i32, %input_height_i32, %input_channels_i32,
+          %output_channels_i32, %weights_width_i32, %weights_height_i32,
+          %output_scale_i32, %output_zero_point, %layout_i32,
+          %input, %filter_chw, %bias)
+        {stream.affinity = #hal.device.affinity<@rocket_device>}
+        : (i32, i32, i32, i32, i32, i32, i32, i32, i32,
+           tensor<1x?x?x?xi8>{%input_height, %input_width, %input_channels},
+           tensor<?x?x?xi8>{%input_channels, %weights_height, %weights_width},
+           tensor<?xi32>{%output_channels})
+        -> tensor<1x?x?x?xi8>{%output_height, %output_width, %output_channels}
+
+    util.return %quantized : tensor<1x?x?x?xi8>
+  }
+
+  // The stride-2 twin.
+  util.func private @call_rocket_dynamic_depthwise_conv2d_int8_requant_pad1_s2(
+      %input: tensor<1x?x?x?xi8>,
+      %filter: tensor<?x?x?xi8>,
+      %acc_init: tensor<1x?x?x?xi32>,
+      %bias: tensor<?xi32>,
+      %output_scale: f32,
+      %output_zero_point: i32,
+      %int8_min: f32,
+      %int8_max: f32,
+      %init: tensor<1x?x?x?xi8>) -> tensor<1x?x?x?xi8> {
+    %c0 = arith.constant 0 : index
+    %c1 = arith.constant 1 : index
+    %c2 = arith.constant 2 : index
+    %c3 = arith.constant 3 : index
+
+    %input_height = tensor.dim %input, %c1 : tensor<1x?x?x?xi8>
+    %input_width = tensor.dim %input, %c2 : tensor<1x?x?x?xi8>
+    %input_channels = tensor.dim %input, %c3 : tensor<1x?x?x?xi8>
+    %weights_height = tensor.dim %filter, %c0 : tensor<?x?x?xi8>
+    %weights_width = tensor.dim %filter, %c1 : tensor<?x?x?xi8>
+    %output_height = tensor.dim %init, %c1 : tensor<1x?x?x?xi8>
+    %output_width = tensor.dim %init, %c2 : tensor<1x?x?x?xi8>
+    %output_channels = tensor.dim %init, %c3 : tensor<1x?x?x?xi8>
+
+    %input_width_i32 = arith.index_cast %input_width : index to i32
+    %input_height_i32 = arith.index_cast %input_height : index to i32
+    %input_channels_i32 = arith.index_cast %input_channels : index to i32
+    %output_channels_i32 = arith.index_cast %output_channels : index to i32
+    %weights_width_i32 = arith.index_cast %weights_width : index to i32
+    %weights_height_i32 = arith.index_cast %weights_height : index to i32
+
+    // Same reciprocal convention as the dense requantized shim: the IR keeps
+    // the multiplier a reader of the convolution would write, and the schema
+    // field is the output scale the driver divides into `input_scale *
+    // weights_scale`, both held at 1.0 by the target.
+    %one = arith.constant 1.000000e+00 : f32
+    %schema_output_scale = arith.divf %one, %output_scale : f32
+    %output_scale_i32 = arith.bitcast %schema_output_scale : f32 to i32
+
+    %filter_chw_empty = tensor.empty(%input_channels, %weights_height, %weights_width) : tensor<?x?x?xi8>
+    %filter_chw = linalg.transpose
+        ins(%filter : tensor<?x?x?xi8>)
+        outs(%filter_chw_empty : tensor<?x?x?xi8>)
+        permutation = [2, 0, 1]
+
+    %layout_i32 = arith.constant 0 : i32
+    %quantized = flow.dispatch
+        @rocket_dynamic_depthwise_int8_requant_pad1_s2_executable::@rocket_dynamic_depthwise_conv2d_v1::@rocket_dynamic_depthwise_conv2d(
           %input_width_i32, %input_height_i32, %input_channels_i32,
           %output_channels_i32, %weights_width_i32, %weights_height_i32,
           %output_scale_i32, %output_zero_point, %layout_i32,
@@ -11891,6 +12107,147 @@ module attributes {transform.with_named_sequence} {
     transform.yield %ins, %outs : !transform.any_value, !transform.any_value
   }
 
+  // The 3x3 requantized depthwise matcher with the `tensor.pad` in front of
+  // the convolution claimed too, once `rocket-fold-conv-pad` has marked the
+  // pair: the depthwise twin of @match_dynamic_conv2d_3x3_pad1_int8_requant.
+  // The template pins the fill to -128 (the region constant) and the amount
+  // to 1 (the pad and the `rocket.pad_*` attributes), which is exactly what
+  // #rocket_dynamic_depthwise_int8_requant_pad1_target bakes.
+  transform.named_sequence @match_dynamic_depthwise_conv2d_3x3_pad1_int8_requant(
+      %root: !transform.any_op {transform.readonly})
+      -> (!transform.any_value, !transform.any_value) {
+    transform.match.operation_name %root ["linalg.generic"] : !transform.any_op
+    %conv = transform.get_producer_of_operand %root[0]
+        : (!transform.any_op) -> !transform.any_op
+    transform.match.operation_name %conv ["linalg.depthwise_conv_2d_nhwc_hwc"] : !transform.any_op
+    transform.rocket.match.admitted %conv <{precision = "int8_requant"}> : !transform.any_op
+    %batch, %out_img, %out_ch, %filter, %in_ch, %depth, %strides, %dilations =
+        transform.iree.match.convolution %conv,
+          lhs_type = i8, rhs_type = i8, output_type = i32
+          : !transform.any_op -> !transform.param<i64>
+    transform.iree.match.dims_equal %batch, [1] : !transform.param<i64>
+    transform.iree.match.dims_equal %out_img, [-1, -1] : !transform.param<i64>
+    transform.iree.match.dims_equal %out_ch, [] : !transform.param<i64>
+    transform.iree.match.dims_equal %filter, [3, 3] : !transform.param<i64>
+    transform.iree.match.dims_equal %in_ch, [] : !transform.param<i64>
+    transform.iree.match.dims_equal %depth, [-1] : !transform.param<i64>
+    transform.iree.match.dims_equal %strides, [1, 1] : !transform.param<i64>
+    transform.iree.match.dims_equal %dilations, [1, 1] : !transform.param<i64>
+
+
+    %ins, %outs = transform.iree.match.cast_compatible_dag_from_root %root {
+      ^bb0(%input: tensor<1x?x?x?xi8>, %weights: tensor<?x?x?xi8>,
+           %acc_init: tensor<1x?x?x?xi32>, %bias: tensor<?xi32>,
+           %output_scale: f32, %output_zero_point: i32,
+           %int8_min: f32, %int8_max: f32,
+           %out_init: tensor<1x?x?x?xi8>):
+        %padded = tensor.pad %input low[0, 1, 1, 0] high[0, 1, 1, 0] {
+          ^bb2(%i0: index, %i1: index, %i2: index, %i3: index):
+            %fill = arith.constant -128 : i8
+            tensor.yield %fill : i8
+        } : tensor<1x?x?x?xi8> to tensor<1x?x?x?xi8>
+        %accumulator = linalg.depthwise_conv_2d_nhwc_hwc
+            {dilations = dense<1> : tensor<2xi64>, rocket.pad_left = 1 : i64, rocket.pad_top = 1 : i64, strides = dense<1> : tensor<2xi64>}
+            ins(%padded, %weights : tensor<1x?x?x?xi8>, tensor<?x?x?xi8>)
+            outs(%acc_init : tensor<1x?x?x?xi32>) -> tensor<1x?x?x?xi32>
+        %quantized = linalg.generic {
+            indexing_maps = [affine_map<(d0, d1, d2, d3) -> (d0, d1, d2, d3)>,
+                             affine_map<(d0, d1, d2, d3) -> (d3)>,
+                             affine_map<(d0, d1, d2, d3) -> ()>,
+                             affine_map<(d0, d1, d2, d3) -> ()>,
+                             affine_map<(d0, d1, d2, d3) -> ()>,
+                             affine_map<(d0, d1, d2, d3) -> ()>,
+                             affine_map<(d0, d1, d2, d3) -> (d0, d1, d2, d3)>],
+            iterator_types = ["parallel", "parallel", "parallel", "parallel"]}
+            ins(%accumulator, %bias, %output_scale, %output_zero_point,
+                %int8_min, %int8_max
+                : tensor<1x?x?x?xi32>, tensor<?xi32>, f32, i32, f32, f32)
+            outs(%out_init : tensor<1x?x?x?xi8>) {
+          ^bb1(%raw: i32, %channel_bias: i32, %scale: f32, %zero_point: i32,
+               %low: f32, %high: f32, %unused: i8):
+            %biased = arith.addi %raw, %channel_bias : i32
+            %real = arith.sitofp %biased : i32 to f32
+            %scaled = arith.mulf %real, %scale : f32
+            %rounded = math.roundeven %scaled : f32
+            %zero_point_f32 = arith.sitofp %zero_point : i32 to f32
+            %offset = arith.addf %rounded, %zero_point_f32 : f32
+            %low_clamped = arith.maximumf %offset, %low : f32
+            %clamped = arith.minimumf %low_clamped, %high : f32
+            %narrowed = arith.fptosi %clamped : f32 to i8
+            linalg.yield %narrowed : i8
+        } -> tensor<1x?x?x?xi8>
+    } : (!transform.any_op) -> (!transform.any_value, !transform.any_value)
+    transform.yield %ins, %outs : !transform.any_value, !transform.any_value
+  }
+
+  // The stride-2 twin of @match_dynamic_depthwise_conv2d_3x3_pad1_int8_requant.
+  transform.named_sequence @match_dynamic_depthwise_conv2d_3x3_pad1_int8_requant_s2(
+      %root: !transform.any_op {transform.readonly})
+      -> (!transform.any_value, !transform.any_value) {
+    transform.match.operation_name %root ["linalg.generic"] : !transform.any_op
+    %conv = transform.get_producer_of_operand %root[0]
+        : (!transform.any_op) -> !transform.any_op
+    transform.match.operation_name %conv ["linalg.depthwise_conv_2d_nhwc_hwc"] : !transform.any_op
+    transform.rocket.match.admitted %conv <{precision = "int8_requant"}> : !transform.any_op
+    %batch, %out_img, %out_ch, %filter, %in_ch, %depth, %strides, %dilations =
+        transform.iree.match.convolution %conv,
+          lhs_type = i8, rhs_type = i8, output_type = i32
+          : !transform.any_op -> !transform.param<i64>
+    transform.iree.match.dims_equal %batch, [1] : !transform.param<i64>
+    transform.iree.match.dims_equal %out_img, [-1, -1] : !transform.param<i64>
+    transform.iree.match.dims_equal %out_ch, [] : !transform.param<i64>
+    transform.iree.match.dims_equal %filter, [3, 3] : !transform.param<i64>
+    transform.iree.match.dims_equal %in_ch, [] : !transform.param<i64>
+    transform.iree.match.dims_equal %depth, [-1] : !transform.param<i64>
+    transform.iree.match.dims_equal %strides, [2, 2] : !transform.param<i64>
+    transform.iree.match.dims_equal %dilations, [1, 1] : !transform.param<i64>
+
+
+    %ins, %outs = transform.iree.match.cast_compatible_dag_from_root %root {
+      ^bb0(%input: tensor<1x?x?x?xi8>, %weights: tensor<?x?x?xi8>,
+           %acc_init: tensor<1x?x?x?xi32>, %bias: tensor<?xi32>,
+           %output_scale: f32, %output_zero_point: i32,
+           %int8_min: f32, %int8_max: f32,
+           %out_init: tensor<1x?x?x?xi8>):
+        %padded = tensor.pad %input low[0, 1, 1, 0] high[0, 1, 1, 0] {
+          ^bb2(%i0: index, %i1: index, %i2: index, %i3: index):
+            %fill = arith.constant -128 : i8
+            tensor.yield %fill : i8
+        } : tensor<1x?x?x?xi8> to tensor<1x?x?x?xi8>
+        %accumulator = linalg.depthwise_conv_2d_nhwc_hwc
+            {dilations = dense<1> : tensor<2xi64>, rocket.pad_left = 1 : i64, rocket.pad_top = 1 : i64, strides = dense<2> : tensor<2xi64>}
+            ins(%padded, %weights : tensor<1x?x?x?xi8>, tensor<?x?x?xi8>)
+            outs(%acc_init : tensor<1x?x?x?xi32>) -> tensor<1x?x?x?xi32>
+        %quantized = linalg.generic {
+            indexing_maps = [affine_map<(d0, d1, d2, d3) -> (d0, d1, d2, d3)>,
+                             affine_map<(d0, d1, d2, d3) -> (d3)>,
+                             affine_map<(d0, d1, d2, d3) -> ()>,
+                             affine_map<(d0, d1, d2, d3) -> ()>,
+                             affine_map<(d0, d1, d2, d3) -> ()>,
+                             affine_map<(d0, d1, d2, d3) -> ()>,
+                             affine_map<(d0, d1, d2, d3) -> (d0, d1, d2, d3)>],
+            iterator_types = ["parallel", "parallel", "parallel", "parallel"]}
+            ins(%accumulator, %bias, %output_scale, %output_zero_point,
+                %int8_min, %int8_max
+                : tensor<1x?x?x?xi32>, tensor<?xi32>, f32, i32, f32, f32)
+            outs(%out_init : tensor<1x?x?x?xi8>) {
+          ^bb1(%raw: i32, %channel_bias: i32, %scale: f32, %zero_point: i32,
+               %low: f32, %high: f32, %unused: i8):
+            %biased = arith.addi %raw, %channel_bias : i32
+            %real = arith.sitofp %biased : i32 to f32
+            %scaled = arith.mulf %real, %scale : f32
+            %rounded = math.roundeven %scaled : f32
+            %zero_point_f32 = arith.sitofp %zero_point : i32 to f32
+            %offset = arith.addf %rounded, %zero_point_f32 : f32
+            %low_clamped = arith.maximumf %offset, %low : f32
+            %clamped = arith.minimumf %low_clamped, %high : f32
+            %narrowed = arith.fptosi %clamped : f32 to i8
+            linalg.yield %narrowed : i8
+        } -> tensor<1x?x?x?xi8>
+    } : (!transform.any_op) -> (!transform.any_value, !transform.any_value)
+    transform.yield %ins, %outs : !transform.any_value, !transform.any_value
+  }
+
   // The depthwise rewriter. Same shape as the dense one, importing the
   // depthwise executable and shim instead.
   transform.named_sequence @cast_and_call_dynamic_depthwise_conv2d_int8_requant(
@@ -11905,6 +12262,42 @@ module attributes {transform.with_named_sequence} {
     transform.annotate %module "stream.topology" = %topology_attr : !transform.any_op, !transform.any_param
     %executable = transform.util.import_symbol @rocket_dynamic_depthwise_int8_requant_executable into %module if undefined : (!transform.any_op) -> !transform.any_op
     %func = transform.util.import_symbol @call_rocket_dynamic_depthwise_conv2d_int8_requant into %module if undefined : (!transform.any_op) -> !transform.any_op
+    transform.util.cast_and_call %func(%ins) -> %out after %root {
+          transform.type_conversion.tensor.cast_shape_dynamic_dims
+      } : (!transform.any_op, !transform.any_value, !transform.any_value, !transform.any_op) -> !transform.any_op
+    transform.yield
+  }
+
+  transform.named_sequence @cast_and_call_dynamic_depthwise_conv2d_int8_requant_pad1(
+      %ins: !transform.any_value {transform.readonly},
+      %out: !transform.any_value {transform.readonly}) {
+    %root = transform.get_defining_op %out : (!transform.any_value) -> !transform.any_op
+    %module = transform.util.get_nearest_symbol_table %root : (!transform.any_op) -> !transform.any_op
+    %topology_attr = transform.param.constant #hal.device.topology<links = [
+        (@rocket_device -> @cpu_device = {transparent_access = true, unified_memory = true}),
+        (@cpu_device -> @rocket_device = {transparent_access = true, unified_memory = true})
+      ]> -> !transform.any_param
+    transform.annotate %module "stream.topology" = %topology_attr : !transform.any_op, !transform.any_param
+    %executable = transform.util.import_symbol @rocket_dynamic_depthwise_int8_requant_pad1_executable into %module if undefined : (!transform.any_op) -> !transform.any_op
+    %func = transform.util.import_symbol @call_rocket_dynamic_depthwise_conv2d_int8_requant_pad1 into %module if undefined : (!transform.any_op) -> !transform.any_op
+    transform.util.cast_and_call %func(%ins) -> %out after %root {
+          transform.type_conversion.tensor.cast_shape_dynamic_dims
+      } : (!transform.any_op, !transform.any_value, !transform.any_value, !transform.any_op) -> !transform.any_op
+    transform.yield
+  }
+
+  transform.named_sequence @cast_and_call_dynamic_depthwise_conv2d_int8_requant_pad1_s2(
+      %ins: !transform.any_value {transform.readonly},
+      %out: !transform.any_value {transform.readonly}) {
+    %root = transform.get_defining_op %out : (!transform.any_value) -> !transform.any_op
+    %module = transform.util.get_nearest_symbol_table %root : (!transform.any_op) -> !transform.any_op
+    %topology_attr = transform.param.constant #hal.device.topology<links = [
+        (@rocket_device -> @cpu_device = {transparent_access = true, unified_memory = true}),
+        (@cpu_device -> @rocket_device = {transparent_access = true, unified_memory = true})
+      ]> -> !transform.any_param
+    transform.annotate %module "stream.topology" = %topology_attr : !transform.any_op, !transform.any_param
+    %executable = transform.util.import_symbol @rocket_dynamic_depthwise_int8_requant_pad1_s2_executable into %module if undefined : (!transform.any_op) -> !transform.any_op
+    %func = transform.util.import_symbol @call_rocket_dynamic_depthwise_conv2d_int8_requant_pad1_s2 into %module if undefined : (!transform.any_op) -> !transform.any_op
     transform.util.cast_and_call %func(%ins) -> %out after %root {
           transform.type_conversion.tensor.cast_shape_dynamic_dims
       } : (!transform.any_op, !transform.any_value, !transform.any_value, !transform.any_op) -> !transform.any_op
@@ -12754,6 +13147,8 @@ module attributes {transform.with_named_sequence} {
             @match_dynamic_conv2d_int8_requant_s2 -> @cast_and_call_dynamic_conv2d_int8_requant_s2,
             @match_dynamic_conv2d_3x3_int8_requant_s2 -> @cast_and_call_dynamic_conv2d_int8_requant_s2,
             @match_dynamic_conv2d_7x7_int8_requant_s2 -> @cast_and_call_dynamic_conv2d_int8_requant_s2,
+            @match_dynamic_depthwise_conv2d_3x3_pad1_int8_requant -> @cast_and_call_dynamic_depthwise_conv2d_int8_requant_pad1,
+            @match_dynamic_depthwise_conv2d_3x3_pad1_int8_requant_s2 -> @cast_and_call_dynamic_depthwise_conv2d_int8_requant_pad1_s2,
             @match_dynamic_depthwise_conv2d_int8_requant -> @cast_and_call_dynamic_depthwise_conv2d_int8_requant,
             @match_dynamic_depthwise_conv2d_3x3_int8_requant -> @cast_and_call_dynamic_depthwise_conv2d_int8_requant
           : (!transform.any_op) -> (!transform.any_op)

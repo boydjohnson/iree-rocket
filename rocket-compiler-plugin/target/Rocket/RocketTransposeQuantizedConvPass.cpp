@@ -42,6 +42,12 @@
 // is the same tensor (a constant pad commutes with a permutation), puts the
 // pad next to the conv where the fold can hand it to the CNA, and leaves the
 // transposes adjacent to the producer's own, where they cancel.
+//
+// **The same move for a quantized depthwise convolution.** The importer
+// emits that op NHWC already, so there is no convolution to transpose, but
+// its pad is still an NCHW one in front of the importer's NCHW->NHWC
+// transpose. `SinkPadBelowQuantizedDepthwiseTranspose` swaps the two, which
+// is what lets an int8 MobileNetV2's depthwise pads reach the CNA.
 
 #include "mlir/Dialect/Linalg/IR/Linalg.h"
 #include "mlir/Dialect/Tensor/IR/Tensor.h"
@@ -151,6 +157,48 @@ struct TransposeQuantizedConvToNhwc
   }
 };
 
+/// The depthwise half of the pad move above. A quantized depthwise
+/// convolution is already NHWC when the importer emits it, so no conv is
+/// rewritten here -- but its "same" padding is still done in NCHW, in front
+/// of the importer's own NCHW->NHWC transpose:
+///
+///   depthwise_conv_2d_nhwc_hwc_q(transpose[0, 2, 3, 1](pad_nchw(x)))
+///
+/// That leaves the transpose between the pad and the convolution, where
+/// `rocket-fold-conv-pad` cannot see the pad, and IREE materializes it as a
+/// CPU NCHW pad copy plus a transpose -- in front of every 3x3 depthwise in
+/// an int8 MobileNetV2, so no expand -> depthwise edge could chain. This
+/// rebuilds the chain as `pad_nhwc(transpose[0, 2, 3, 1](x))` (the same
+/// tensor: a constant pad commutes with a permutation), so the pad is the
+/// convolution's immediate producer and the transpose sits next to the
+/// producer's own, where the pair cancels.
+struct SinkPadBelowQuantizedDepthwiseTranspose
+    : OpRewritePattern<linalg::DepthwiseConv2DNhwcHwcQOp> {
+  using OpRewritePattern::OpRewritePattern;
+
+  LogicalResult matchAndRewrite(linalg::DepthwiseConv2DNhwcHwcQOp convOp,
+                                PatternRewriter &rewriter) const override {
+    if (!convOp.hasPureTensorSemantics()) {
+      return rewriter.notifyMatchFailure(convOp, "expected tensor semantics");
+    }
+    Value input = convOp.getDpsInputs()[0];
+    auto transpose = input.getDefiningOp<linalg::TransposeOp>();
+    if (!transpose || !input.hasOneUse() ||
+        transpose.getPermutation() != ArrayRef<int64_t>{0, 2, 3, 1}) {
+      return rewriter.notifyMatchFailure(convOp,
+                                         "input is not an NCHW->NHWC transpose");
+    }
+    Value nhwcInput = transposePadTo(rewriter, convOp.getLoc(),
+                                     transpose.getInput(), {0, 2, 3, 1});
+    if (!nhwcInput) {
+      return rewriter.notifyMatchFailure(convOp, "no movable pad in front");
+    }
+    rewriter.modifyOpInPlace(convOp,
+                             [&] { convOp->setOperand(0, nhwcInput); });
+    return success();
+  }
+};
+
 struct RocketTransposeQuantizedConvPass
     : public PassWrapper<RocketTransposeQuantizedConvPass, OperationPass<>> {
   MLIR_DEFINE_EXPLICIT_INTERNAL_INLINE_TYPE_ID(RocketTransposeQuantizedConvPass)
@@ -170,7 +218,8 @@ struct RocketTransposeQuantizedConvPass
   void runOnOperation() final {
     MLIRContext *context = &getContext();
     RewritePatternSet patterns(context);
-    patterns.add<TransposeQuantizedConvToNhwc>(context);
+    patterns.add<TransposeQuantizedConvToNhwc,
+                 SinkPadBelowQuantizedDepthwiseTranspose>(context);
     if (failed(applyPatternsGreedily(getOperation(), std::move(patterns)))) {
       return signalPassFailure();
     }
