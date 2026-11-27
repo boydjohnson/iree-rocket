@@ -437,6 +437,70 @@ fn sequence_is_defeatable(spec: &str, name: &str) -> bool {
 mod tests {
     use super::*;
 
+    /// The rename has to reach the attributes the compile actually reads --
+    /// `#hal.device.affinity` and the endpoints of `#hal.device.topology` --
+    /// and must not truncate a longer name that merely starts the same way.
+    #[test]
+    fn renaming_a_device_rewrites_whole_symbols_only() {
+        let spec = concat!(
+            "{stream.affinity = #hal.device.affinity<@cpu_device>}\n",
+            "#hal.device.topology<links = [(@rocket_device -> @cpu_device = {})]>\n",
+            "@cpu_device_spare\n",
+        );
+        let renamed = super::rename_device(spec, SPEC_CPU_DEVICE, "gpu_device")
+            .expect("the spec names @cpu_device");
+        assert_eq!(renamed.renamed, 2);
+        assert!(renamed.text.contains("#hal.device.affinity<@gpu_device>"));
+        assert!(renamed.text.contains("-> @gpu_device ="));
+        assert!(
+            renamed.text.contains("@cpu_device_spare"),
+            "a longer name sharing the prefix must survive: {}",
+            renamed.text
+        );
+    }
+
+    /// A rename that matched nothing means the caller's `--*-device-name` no
+    /// longer corresponds to anything in the spec, and the compile would
+    /// crash on a dangling attribute reference much later rather than report
+    /// an error -- so it fails here instead of quietly doing nothing.
+    #[test]
+    fn renaming_a_device_the_spec_does_not_name_is_an_error() {
+        let err = super::rename_device("nothing here", SPEC_CPU_DEVICE, "gpu_device")
+            .expect_err("no references to rename");
+        assert!(err.to_string().contains("@cpu_device"), "{err}");
+    }
+
+    /// Renaming to the same name is what an unchanged default does on every
+    /// compile, and must be free rather than an error.
+    #[test]
+    fn renaming_a_device_to_itself_is_a_no_op() {
+        let renamed = super::rename_device("@cpu_device", SPEC_CPU_DEVICE, SPEC_CPU_DEVICE)
+            .expect("a no-op rename");
+        assert_eq!(renamed.renamed, 0);
+        assert_eq!(renamed.text, "@cpu_device");
+    }
+
+    /// The shipped spec is what `resolve_transform_spec` renames, so the
+    /// names this module declares have to be the ones actually in it.
+    #[test]
+    fn the_shipped_spec_can_be_renamed_onto_a_gpu_device() {
+        let spec = std::fs::read_to_string(
+            std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+                .join("../rocket-compiler-plugin/target/Rocket/rocket_conv2d_transform_spec.mlir"),
+        )
+        .expect("the checked-in spec is readable");
+        let renamed = super::rename_device(&spec, SPEC_CPU_DEVICE, "gpu_device")
+            .expect("the shipped spec names @cpu_device");
+        assert!(renamed.renamed > 0);
+        assert!(
+            !renamed.text.contains("@cpu_device"),
+            "every reference moved"
+        );
+        assert!(renamed.text.contains("@gpu_device"));
+        super::rename_device(&spec, SPEC_ROCKET_DEVICE, "npu_device")
+            .expect("the shipped spec names @rocket_device");
+    }
+
     /// Both halves of the edit, and the check that catches the half that is
     /// easy to forget: an uncommented pass whose consumer still reads the
     /// old handle runs on nothing, and the transform dialect accepts that
@@ -799,4 +863,69 @@ transform.named_sequence @match_conv(%r: !transform.any_op) -> !transform.any_op
             }
         }
     }
+}
+
+/// The device-global names the shipped transform spec hardcodes. Renaming
+/// either one through `--rocket-device-name` / `--cpu-device-name` leaves the
+/// spec's `#hal.device.affinity<@...>` and `#hal.device.topology<links = ...>`
+/// references dangling, which `check_spec_device_names` refuses -- so the
+/// rename has to reach the spec text too.
+pub const SPEC_ROCKET_DEVICE: &str = "rocket_device";
+pub const SPEC_CPU_DEVICE: &str = "cpu_device";
+
+/// Result of renaming a device global in the spec text.
+#[derive(Debug)]
+pub struct RenamedSpec {
+    pub text: String,
+    /// How many `@<from>` references were rewritten.
+    pub renamed: usize,
+}
+
+/// Returns `spec` with every `@<from>` symbol reference rewritten to
+/// `@<to>`.
+///
+/// Only whole symbols are rewritten: `@cpu_device_2` is left alone, so a
+/// rename cannot silently truncate a longer name that happens to share a
+/// prefix. Fails if nothing matched, because a rename that found no
+/// references means the caller's `--*-device-name` no longer corresponds to
+/// anything in the spec and the compile would crash later on a dangling
+/// attribute reference rather than report an error (see
+/// `check_spec_device_names`).
+pub fn rename_device(spec: &str, from: &str, to: &str) -> Result<RenamedSpec, Box<dyn Error>> {
+    if from == to {
+        return Ok(RenamedSpec {
+            text: spec.to_string(),
+            renamed: 0,
+        });
+    }
+    let needle = format!("@{from}");
+    let mut text = String::with_capacity(spec.len());
+    let mut renamed = 0usize;
+    let mut rest = spec;
+    while let Some(at) = rest.find(&needle) {
+        let after = &rest[at + needle.len()..];
+        let whole_symbol = !after
+            .chars()
+            .next()
+            .is_some_and(|c| c.is_alphanumeric() || c == '_' || c == '$' || c == '.');
+        text.push_str(&rest[..at]);
+        if whole_symbol {
+            text.push('@');
+            text.push_str(to);
+            renamed += 1;
+        } else {
+            text.push_str(&needle);
+        }
+        rest = after;
+    }
+    text.push_str(rest);
+    if renamed == 0 {
+        return Err(format!(
+            "transform spec has no @{from} references to rename to @{to}: the spec this \
+             invocation read does not name that device global, so the rename would leave \
+             the spec pointing at a device that is never created"
+        )
+        .into());
+    }
+    Ok(RenamedSpec { text, renamed })
 }

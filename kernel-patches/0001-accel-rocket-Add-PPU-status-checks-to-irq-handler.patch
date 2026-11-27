@@ -1,17 +1,21 @@
-From 6c8d4bcd69e9e686ec1c366651f68310d2f848ba Mon Sep 17 00:00:00 2001
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
 From: Boyd Johnson <boyd@boundarybit.io>
 Date: Wed, 29 Jul 2026 11:57:11 -0500
-Subject: [PATCH 1/5] accel/rocket: Add PPU status checks to irq handler
+Subject: [PATCH] accel/rocket: Add PPU status checks to irq handler
 
+[Boyd Johnson: rebased for iree-rocket onto Armbian 7.3.6-edge-rockchip64
+ and the RK3576 series, 2026-11-27. Unchanged in substance: the submit
+ hunk's trailing context is the task_con_16bit TASK_CON branch on this
+ base. Original: patch 1 of a local series on drm-misc-next.]
 ---
  drivers/accel/rocket/rocket_job.c | 8 +++++---
  1 file changed, 5 insertions(+), 3 deletions(-)
 
 diff --git a/drivers/accel/rocket/rocket_job.c b/drivers/accel/rocket/rocket_job.c
-index bb77b6bf0f..d3b9a2ed8a 100644
+index a8b9cbd..9864341 100644
 --- a/drivers/accel/rocket/rocket_job.c
 +++ b/drivers/accel/rocket/rocket_job.c
-@@ -139,8 +139,10 @@ static void rocket_job_hw_submit(struct rocket_core *core, struct rocket_job *jo
+@@ -163,8 +163,10 @@ static void rocket_job_hw_submit(struct rocket_core *core, struct rocket_job *jo
  	rocket_pc_writel(core, REGISTER_AMOUNTS,
  			 PC_REGISTER_AMOUNTS_PC_DATA_AMOUNT((task->regcmd_count + 1) / 2 - 1));
  
@@ -22,9 +26,9 @@ index bb77b6bf0f..d3b9a2ed8a 100644
 +	rocket_pc_writel(core, INTERRUPT_CLEAR, PC_INTERRUPT_CLEAR_DPU_0 | PC_INTERRUPT_CLEAR_DPU_1 |
 +						PC_INTERRUPT_CLEAR_PPU_0 | PC_INTERRUPT_CLEAR_PPU_1);
  
- 	rocket_pc_writel(core, TASK_CON, PC_TASK_CON_RESERVED_0(1) |
- 					 PC_TASK_CON_TASK_COUNT_CLEAR(1) |
-@@ -440,7 +442,7 @@ static irqreturn_t rocket_job_irq_handler(int irq, void *data)
+ 	if (core->soc->task_con_16bit)
+ 		rocket_pc_writel(core, TASK_CON,
+@@ -551,7 +553,7 @@ static irqreturn_t rocket_job_irq_handler(int irq, void *data)
  	WARN_ON(raw_status & PC_INTERRUPT_RAW_STATUS_DMA_WRITE_ERROR);
  
  	if (!(raw_status & PC_INTERRUPT_RAW_STATUS_DPU_0 ||

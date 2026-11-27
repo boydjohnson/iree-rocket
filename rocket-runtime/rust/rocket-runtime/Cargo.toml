@@ -1,0 +1,14 @@
+[package]
+name = "rocket-runtime"
+description = "Run rocket-compiler modules on the RK3588 NPU from Rust: a safe wrapper over libiree_rocket_runtime.so"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[features]
+# Element impls for half::f16 / half::bf16, so f16 models take and return typed slices.
+half = ["dep:half"]
+
+[dependencies]
+rocket-runtime-sys = { path = "../rocket-runtime-sys" }
+half = { version = "2", optional = true }

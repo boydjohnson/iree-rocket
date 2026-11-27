@@ -1,0 +1,13 @@
+[package]
+name = "rocket-runtime-sys"
+description = "Raw FFI bindings to libiree_rocket_runtime.so: rocket/runtime.h and IREE's runtime C API"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+# One copy of the native library per build graph, and the channel the safe
+# crate's build script reads the library directory through (DEP_IREE_ROCKET_RUNTIME_LIBDIR).
+links = "iree_rocket_runtime"
+
+[build-dependencies]
+bindgen = "0.72.1"
+pkg-config = "0.3"

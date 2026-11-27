@@ -1,0 +1,36 @@
+.TH IREE-ROCKET-RUN-MODULE 1 "November 2026" "iree-rocket" "User Commands"
+.SH NAME
+iree-rocket-run-module \- IREE's iree-run-module with the Rocket NPU driver
+.SH SYNOPSIS
+.B iree-rocket-run-module
+.BI \-\-module= MODULE.vmfb
+.BI \-\-function= NAME
+.BR \-\-device=rocket " " \-\-device=local\-task
+[\fB\-\-input=\fIINPUT\fR...]
+[\fIOPTION\fR...]
+.SH DESCRIPTION
+IREE's
+.B iree-run-module
+built with the Rocket HAL driver for the RK3588 NPU linked in, and renamed so
+it cannot collide with an upstream IREE installation. It runs one function of
+a .vmfb module and prints its results.
+.PP
+Modules from
+.BR rocket-compiler (1)
+place their work on two devices, so pass both, in this order:
+.B \-\-device=rocket \-\-device=local\-task
+.PP
+Run it with
+.B \-\-help
+for the full list of IREE's options.
+.SH FILES
+.TP
+.I /dev/accel/accel0
+The NPU, through the mainline rocket kernel driver. Opening it needs read and
+write access, which Debian gives the
+.B render
+group.
+.SH SEE ALSO
+.BR rocket-run-module (1),
+.BR iree-rocket-benchmark-module (1),
+.BR rocket-compiler (1)

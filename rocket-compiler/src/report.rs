@@ -1,4 +1,7 @@
-use std::{collections::BTreeMap, fmt};
+use std::{
+    collections::{BTreeMap, BTreeSet},
+    fmt,
+};
 
 /// A placement audit built by scanning the textual IR emitted after running
 /// `rocket-annotate-final-placement`.
@@ -42,6 +45,15 @@ pub struct PlacementExecutable {
 pub struct PlacementReport {
     pub rocket_executables: Vec<PlacementExecutable>,
     pub cpu_executables: Vec<PlacementExecutable>,
+    /// Every IREE target backend the non-Rocket executables were compiled
+    /// for, read off their `hal.executable.variant` lines.
+    ///
+    /// "cpu" is this report's historical name for "not Rocket", and with
+    /// `--cpu-device-backend=vulkan` that half of the module is not on a CPU
+    /// at all -- it is SPIR-V for the Mali. The label is derived rather than
+    /// assumed so a mixed NPU/GPU module does not report its GPU dispatches
+    /// as CPU ones.
+    pub cpu_backends: BTreeSet<String>,
 }
 
 impl PlacementReport {
@@ -84,6 +96,12 @@ impl PlacementReport {
                     dispatches: 0,
                 });
                 current = Some(is_rocket);
+            } else if trimmed.starts_with("hal.executable.variant ") {
+                if current == Some(false)
+                    && let Some(backend) = variant_backend(trimmed)
+                {
+                    report.cpu_backends.insert(backend.to_string());
+                }
             } else if trimmed.starts_with("hal.executable.export ")
                 && let (Some(is_rocket), Some(name)) = (current, extract_symbol_name(line))
             {
@@ -111,6 +129,27 @@ impl PlacementReport {
 
     pub fn rocket_dispatches(&self) -> usize {
         self.rocket_executables.iter().map(|e| e.dispatches).sum()
+    }
+
+    /// What to call the non-Rocket bucket. `cpu` whenever every non-Rocket
+    /// executable really is one of IREE's CPU backends, which is every
+    /// module this repository compiled before the Vulkan spike; otherwise
+    /// the backends themselves, so the label cannot quietly lie.
+    pub fn cpu_label(&self) -> String {
+        let non_cpu: Vec<&str> = self
+            .cpu_backends
+            .iter()
+            .map(String::as_str)
+            .filter(|backend| !matches!(*backend, "llvm-cpu" | "vmvx" | "vmvx-inline"))
+            .collect();
+        if non_cpu.is_empty() {
+            return "cpu".to_string();
+        }
+        self.cpu_backends
+            .iter()
+            .map(String::as_str)
+            .collect::<Vec<&str>>()
+            .join("+")
     }
 
     pub fn cpu_dispatches(&self) -> usize {
@@ -238,6 +277,13 @@ fn export_kind(export: &str) -> Option<String> {
 /// Rocket candidate would have been. Names the classes IREE gives
 /// contraction dispatches; anything else (element-wise, transpose,
 /// reduction, pooling, a memcpy) is not a candidate this report tracks.
+/// The IREE target backend named by a `hal.executable.variant` line:
+/// `... target(<"vulkan-spirv", "vulkan-spirv-fb", {...}>)` -> `vulkan-spirv`.
+fn variant_backend(line: &str) -> Option<&str> {
+    let after = line.split_once("target(<\"")?.1;
+    after.split_once('"').map(|(backend, _)| backend)
+}
+
 fn is_contraction_kind(kind: &str) -> bool {
     matches!(
         kind,
@@ -254,7 +300,12 @@ impl fmt::Display for PlacementReport {
             &self.rocket_executables,
             self.rocket_dispatches(),
         )?;
-        write_bucket(f, "cpu", &self.cpu_executables, self.cpu_dispatches())?;
+        write_bucket(
+            f,
+            &self.cpu_label(),
+            &self.cpu_executables,
+            self.cpu_dispatches(),
+        )?;
         Ok(())
     }
 }

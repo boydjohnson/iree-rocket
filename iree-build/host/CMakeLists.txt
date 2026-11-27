@@ -35,8 +35,10 @@ set(IREE_BUILD_COMPILER OFF CACHE BOOL "" FORCE)
 # ON so the HAL CTS (runtime/src/iree/hal/cts) gets built -- see
 # rocket-hal-driver/cts/ for the "rocket" backend registration linked into
 # it below. Pulls in the rest of IREE's own unit test suite too; that's an
-# accepted cost of using IREE_BUILD_TESTS as the CTS gate.
-set(IREE_BUILD_TESTS ON CACHE BOOL "" FORCE)
+# accepted cost of using IREE_BUILD_TESTS as the CTS gate. OFF builds only the
+# runtime, its tools and rocket-runtime (same switch as host-aarch64).
+option(ROCKET_BUILD_TESTS "Build IREE's runtime tests and the rocket HAL CTS" ON)
+set(IREE_BUILD_TESTS ${ROCKET_BUILD_TESTS} CACHE BOOL "" FORCE)
 set(IREE_BUILD_SAMPLES OFF CACHE BOOL "" FORCE)
 set(IREE_BUILD_DOCS OFF CACHE BOOL "" FORCE)
 set(IREE_HAL_DRIVER_VULKAN OFF CACHE BOOL "" FORCE)
@@ -51,10 +53,23 @@ set(IREE_HAL_DRIVER_VULKAN OFF CACHE BOOL "" FORCE)
 # respect IREE_HAL_DRIVER_VULKAN=OFF above instead of overriding it.
 set(IREE_BUILD_ALL_CHECK_TEST_MODULES OFF CACHE BOOL "" FORCE)
 
+# Default symbol visibility, so rocket-runtime's libiree_rocket_runtime.so can
+# export IREE's C API. IREE builds -fvisibility=hidden by default and its
+# IREE_API_EXPORT is empty in C, which leaves a shared library nothing to
+# export; this is the option IREE provides for re-exporting. The .so's version
+# script (rocket-runtime/src/exports.map) decides what is actually public.
+set(IREE_VISIBILITY_HIDDEN OFF CACHE BOOL "" FORCE)
+
 add_subdirectory("${IREE_SOURCE_DIR}" "${CMAKE_CURRENT_BINARY_DIR}/iree")
 
 # HAL CTS backend registration for "rocket" -- runs the non-executable CTS
 # categories (buffer/command_buffer/core/file/queue) against the real
 # driver. See rocket-hal-driver/cts/backends.cc for why no executable
 # categories are built (no compiler side needed).
-add_subdirectory("${ROCKET_HAL_DRIVER_DIR}/cts" "${CMAKE_CURRENT_BINARY_DIR}/rocket-cts")
+if(ROCKET_BUILD_TESTS)
+  add_subdirectory("${ROCKET_HAL_DRIVER_DIR}/cts" "${CMAKE_CURRENT_BINARY_DIR}/rocket-cts")
+endif()
+
+# The embeddable runtime: rocket/runtime.h, libiree_rocket_runtime.so and the
+# IreeRocketRuntime install component (see rocket-runtime/CMakeLists.txt).
+add_subdirectory("${ROCKET_HAL_DRIVER_DIR}/../rocket-runtime" "${CMAKE_CURRENT_BINARY_DIR}/rocket-runtime")

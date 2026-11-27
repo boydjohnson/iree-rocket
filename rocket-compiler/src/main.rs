@@ -35,13 +35,34 @@ fn main() -> ExitCode {
     }
 }
 
-/// Where a packaged install keeps things, relative to the directory holding
-/// `bin/rocket-compiler`. The nightly `iree-compile-x86_64` tarball is laid
-/// out this way (see `.github/workflows/iree-build.yml`): an unpacked copy
-/// compiles with no `--iree-compiler-lib`, no `IREE_COMPILER_LIB` and no
+/// Where the unpacked nightly tarball keeps things, relative to the
+/// directory holding `bin/rocket-compiler`. The `iree-compile-x86_64` tarball
+/// is laid out this way (see `.github/workflows/iree-build.yml`): an unpacked
+/// copy compiles with no `--iree-compiler-lib`, no `IREE_COMPILER_LIB` and no
 /// `--transform-spec`.
 const PACKAGED_LIB: &str = "../lib/libIREECompiler.so";
 const PACKAGED_SPEC: &str = "../share/rocket/rocket_conv2d_transform_spec.mlir";
+
+const LIB_NAME: &str = "libIREECompiler.so";
+const SPEC_NAME: &str = "rocket_conv2d_transform_spec.mlir";
+
+/// Absolute install directories baked in at build time, for a distribution
+/// package whose files do not sit in the tarball's `bin/ lib/ share/` shape
+/// (debian/rules sets both: the private library under
+/// `/usr/lib/<triplet>/rocket-compiler`, the spec under
+/// `/usr/share/rocket-compiler`). Unset for every other build.
+///
+/// Never in a test binary: the package build runs the tests with these set,
+/// and on a machine that already has the package installed they would
+/// otherwise read the installed spec instead of the checked-in one.
+#[cfg(not(test))]
+const INSTALLED_LIB_DIR: Option<&str> = option_env!("ROCKET_COMPILER_LIBDIR");
+#[cfg(not(test))]
+const INSTALLED_SPEC_DIR: Option<&str> = option_env!("ROCKET_COMPILER_DATADIR");
+#[cfg(test)]
+const INSTALLED_LIB_DIR: Option<&str> = None;
+#[cfg(test)]
+const INSTALLED_SPEC_DIR: Option<&str> = None;
 
 /// The spec in the source checkout this binary was built from. Right for
 /// `cargo run`; meaningless on any machine but the one that built it.
@@ -62,20 +83,35 @@ fn packaged_path(exe: &Path, relative: &str) -> Option<PathBuf> {
     Some(exe.parent()?.join(relative))
 }
 
+/// `name` inside a build-time install directory, if one was configured and
+/// the file is there. A package that lost its library falls through to the
+/// tarball lookup and then to the "nothing to load" error, rather than
+/// failing on a path the user never chose.
+fn installed(dir: Option<&str>, name: &str) -> Option<PathBuf> {
+    Some(Path::new(dir?).join(name)).filter(|path| path.is_file())
+}
+
+/// Where this binary's own copy of the library lives, if it has one: the
+/// distribution install first (so a stray `/usr/lib/libIREECompiler.so`
+/// beside `/usr/bin` can never shadow the package's), then the tarball.
+fn installed_lib_path() -> Option<PathBuf> {
+    installed(INSTALLED_LIB_DIR, LIB_NAME).or_else(|| beside_executable(PACKAGED_LIB))
+}
+
 fn resolve_lib_path(explicit: Option<&Path>) -> Result<PathBuf, Box<dyn Error>> {
     pick_lib_path(
         explicit,
         env::var_os("IREE_COMPILER_LIB").map(PathBuf::from),
-        beside_executable(PACKAGED_LIB),
+        installed_lib_path(),
     )
 }
 
-/// Flag, then environment, then the packaged layout -- an explicit choice
-/// always beats the one the binary happens to sit next to.
+/// Flag, then environment, then the installed copy -- an explicit choice
+/// always beats the one the binary happens to ship with.
 fn pick_lib_path(
     explicit: Option<&Path>,
     from_env: Option<PathBuf>,
-    packaged: Option<PathBuf>,
+    installed: Option<PathBuf>,
 ) -> Result<PathBuf, Box<dyn Error>> {
     if let Some(path) = explicit {
         return Ok(path.to_path_buf());
@@ -83,21 +119,26 @@ fn pick_lib_path(
     if let Some(path) = from_env.filter(|path| !path.as_os_str().is_empty()) {
         return Ok(path);
     }
-    if let Some(path) = packaged {
+    if let Some(path) = installed {
         return Ok(path);
     }
+    let system = INSTALLED_LIB_DIR
+        .map(|dir| format!("{}, nor ", Path::new(dir).join(LIB_NAME).display()))
+        .unwrap_or_default();
     Err(format!(
-        "no --iree-compiler-lib given, IREE_COMPILER_LIB is not set, and there is no \
-         {PACKAGED_LIB} beside this executable"
+        "no --iree-compiler-lib given, IREE_COMPILER_LIB is not set, and there is \
+         no {system}{PACKAGED_LIB} beside this executable"
     )
     .into())
 }
 
-/// The packaged spec when this binary is running from an unpacked release,
-/// else the source checkout's. `--no-offload`, `--elementwise` and
-/// `--batch-matmul` all derive their specs from this one.
+/// The installed spec (distribution package, then unpacked tarball), else the
+/// source checkout's. `--no-offload`, `--elementwise` and `--batch-matmul`
+/// all derive their specs from this one.
 fn default_transform_spec_path() -> PathBuf {
-    beside_executable(PACKAGED_SPEC).unwrap_or_else(source_tree_transform_spec_path)
+    installed(INSTALLED_SPEC_DIR, SPEC_NAME)
+        .or_else(|| beside_executable(PACKAGED_SPEC))
+        .unwrap_or_else(source_tree_transform_spec_path)
 }
 
 fn transform_spec_path(common: &cli::CommonArgs) -> PathBuf {
@@ -134,7 +175,8 @@ impl Drop for SpecFile {
 /// returned handle drops.
 fn resolve_transform_spec(common: &cli::CommonArgs) -> Result<SpecFile, Box<dyn Error>> {
     let source = transform_spec_path(common);
-    if !common.no_offload && !common.elementwise && !common.batch_matmul {
+    let renames = device_renames(common);
+    if !common.no_offload && !common.elementwise && !common.batch_matmul && renames.is_empty() {
         return Ok(SpecFile {
             path: source,
             temporary: false,
@@ -175,7 +217,24 @@ fn resolve_transform_spec(common: &cli::CommonArgs) -> Result<SpecFile, Box<dyn 
         text = enabled.text;
     }
 
-    let mut suffix = if common.batch_matmul {
+    // After the matcher edits and before neutralize's report, so the names
+    // every later message and the compiled module use are the renamed ones.
+    // `check_spec_device_names` runs on the file this writes, so a rename
+    // that missed would be caught there rather than crashing the compiler on
+    // a dangling attribute reference.
+    for (from, to) in &renames {
+        let renamed = spec::rename_device(&text, from, to)?;
+        eprintln!(
+            "--*-device-name: @{from} -> @{to}, {} reference(s) in {}",
+            renamed.renamed,
+            source.display()
+        );
+        text = renamed.text;
+    }
+
+    let mut suffix = if !renames.is_empty() {
+        "renamed"
+    } else if common.batch_matmul {
         "batch-matmul"
     } else {
         "elementwise"
@@ -206,6 +265,19 @@ fn resolve_transform_spec(common: &cli::CommonArgs) -> Result<SpecFile, Box<dyn 
     })
 }
 
+/// The device-global renames this invocation's `--*-device-name` flags ask
+/// for, relative to the names the shipped transform spec hardcodes.
+fn device_renames(common: &cli::CommonArgs) -> Vec<(&'static str, String)> {
+    let mut renames = Vec::new();
+    if common.rocket_device_name != spec::SPEC_ROCKET_DEVICE {
+        renames.push((spec::SPEC_ROCKET_DEVICE, common.rocket_device_name.clone()));
+    }
+    if common.cpu_device_name != spec::SPEC_CPU_DEVICE {
+        renames.push((spec::SPEC_CPU_DEVICE, common.cpu_device_name.clone()));
+    }
+    renames
+}
+
 fn compile_flags(common: &cli::CommonArgs, transform_spec: &Path) -> Vec<String> {
     let mut flags = vec![
         format!(
@@ -216,16 +288,28 @@ fn compile_flags(common: &cli::CommonArgs, transform_spec: &Path) -> Vec<String>
             "--iree-hal-target-device={}=rocket",
             common.rocket_device_name
         ),
-        format!("--iree-hal-target-device={}=local", common.cpu_device_name),
-        "--iree-hal-local-target-device-backends=llvm-cpu".to_string(),
-        format!("--iree-llvmcpu-target-cpu={}", common.llvmcpu_target_cpu),
+        format!(
+            "--iree-hal-target-device={}={}",
+            common.cpu_device_name, common.cpu_device_backend
+        ),
         format!("--iree-hal-default-device={}", common.cpu_device_name),
         "--iree-hal-indirect-command-buffers=false".to_string(),
     ];
-    // Left off entirely when unset so IREE keeps its own host-triple default,
-    // rather than us guessing a spelling for the host here.
-    if let Some(triple) = &common.llvmcpu_target_triple {
-        flags.push(format!("--iree-llvmcpu-target-triple={triple}"));
+    // Only meaningful for IREE's `local` device, which is the only backend
+    // that fans out to llvm-cpu. Setting them for, say, a Vulkan device
+    // would be inert at best -- and `--iree-llvmcpu-target-triple` on a
+    // module with no llvm-cpu executable is a flag that describes nothing.
+    if common.cpu_device_backend == "local" {
+        flags.push("--iree-hal-local-target-device-backends=llvm-cpu".to_string());
+        flags.push(format!(
+            "--iree-llvmcpu-target-cpu={}",
+            common.llvmcpu_target_cpu
+        ));
+        // Left off entirely when unset so IREE keeps its own host-triple
+        // default, rather than us guessing a spelling for the host here.
+        if let Some(triple) = &common.llvmcpu_target_triple {
+            flags.push(format!("--iree-llvmcpu-target-triple={triple}"));
+        }
     }
     flags.extend(common.iree_flags.iter().cloned());
     flags
@@ -235,10 +319,13 @@ fn compile_flags(common: &cli::CommonArgs, transform_spec: &Path) -> Vec<String>
 /// inside a `#hal.device.*` attribute, i.e. `#hal.device.affinity<@d>` and
 /// the endpoints of `#hal.device.topology<links = [(@a -> @b = {...})]>`.
 ///
-/// The spec hardcodes these names, but the device globals themselves are
-/// created from `--iree-hal-target-device=<name>=...`, which this CLI derives
-/// from `--rocket-device-name` / `--cpu-device-name`. Renaming either one
-/// leaves the spec's references dangling.
+/// The shipped spec hardcodes these names, and the device globals themselves
+/// are created from `--iree-hal-target-device=<name>=...`, which this CLI
+/// derives from `--rocket-device-name` / `--cpu-device-name`. A rename of
+/// either is carried into a copy of the spec by `device_renames` +
+/// `spec::rename_device`; what this scan is for is the leftovers -- a spec
+/// supplied with `--transform-spec` that names some third device nothing
+/// will create.
 fn spec_device_symbols(spec: &str) -> BTreeSet<&str> {
     const MARKER: &str = "#hal.device.";
     let mut symbols = BTreeSet::new();
@@ -300,6 +387,10 @@ fn scan_symbol_refs(text: &str) -> impl Iterator<Item = &str> {
 /// references live in attributes, and attributes are not symbol-verified, so
 /// a dangling one survives until a later pass resolves it and dereferences
 /// null -- the compiler segfaults instead of reporting an error.
+///
+/// This runs on the spec file the compile will actually read, which for a
+/// renamed device is the rewritten copy -- so a rename the rewrite handled
+/// passes here, and only a name nothing creates is caught.
 fn check_spec_device_names(
     common: &cli::CommonArgs,
     transform_spec: &Path,
@@ -325,9 +416,10 @@ fn check_spec_device_names(
     Err(format!(
         "transform spec {spec_path} refers to device global(s) {dangling} that this \
          invocation does not create: it declares @{rocket} (--rocket-device-name) and \
-         @{cpu} (--cpu-device-name). The spec hardcodes its device names, so those \
-         flags must match it -- the defaults do. Compiling anyway would crash the \
-         compiler rather than report an error.",
+         @{cpu} (--cpu-device-name). A rename of either of those two is rewritten into \
+         the spec automatically, so this is a third name the spec carries and nothing \
+         will create. Compiling anyway would crash the compiler rather than report an \
+         error.",
         spec_path = transform_spec.display(),
         dangling = named.join(", "),
         rocket = common.rocket_device_name,
@@ -628,6 +720,7 @@ mod tests {
             report_json: None,
             rocket_device_name: rocket.to_string(),
             cpu_device_name: cpu.to_string(),
+            cpu_device_backend: "local".to_string(),
             llvmcpu_target_cpu: "generic".to_string(),
             llvmcpu_target_triple: triple.map(str::to_string),
             iree_flags: Vec::new(),
@@ -700,6 +793,23 @@ mod tests {
                 "/opt/iree-compile-x86_64/share/rocket/rocket_conv2d_transform_spec.mlir"
             )
         );
+    }
+
+    /// A configured install directory counts only when the file is really
+    /// there; otherwise the lookup falls through to the tarball layout.
+    #[test]
+    fn an_install_directory_is_used_only_when_it_holds_the_file() {
+        let dir = env::temp_dir().join(format!("rocket-compiler-installed-{}", std::process::id()));
+        fs::create_dir_all(&dir).unwrap();
+        let dir_str = dir.to_str().unwrap();
+
+        assert_eq!(installed(Some(dir_str), LIB_NAME), None);
+        assert_eq!(installed(None, LIB_NAME), None);
+
+        fs::write(dir.join(LIB_NAME), b"").unwrap();
+        assert_eq!(installed(Some(dir_str), LIB_NAME), Some(dir.join(LIB_NAME)));
+
+        fs::remove_dir_all(&dir).unwrap();
     }
 
     /// A test binary is not in a package, so the default must still be the
@@ -821,19 +931,24 @@ mod tests {
     }
 
     #[test]
-    fn renaming_a_device_is_rejected_rather_than_left_to_segfault() {
+    fn a_spec_naming_an_uncreated_device_is_rejected_rather_than_left_to_segfault() {
+        // The *shipped* spec, read as if no rename had been applied to it --
+        // which is what a `--transform-spec` carrying a third device name
+        // looks like to this check. A rename the CLI asked for is rewritten
+        // into the spec copy before this runs (see `device_renames`), so it
+        // is the uncreated name, not the rename, that has to fail.
         let spec = default_transform_spec_path();
 
         // `--cpu-device-name` is the dangerous one: the spec refers to
         // @cpu_device only from attributes, which are not symbol-verified.
         let err = check_spec_device_names(&common_args("rocket_device", "local", None), &spec)
-            .expect_err("a renamed CPU device must be rejected");
+            .expect_err("a device the invocation will not create must be rejected");
         let message = err.to_string();
         assert!(message.contains("@cpu_device"), "{message}");
         assert!(!message.contains("@rocket_device,"), "{message}");
 
         let err = check_spec_device_names(&common_args("npu", "cpu_device", None), &spec)
-            .expect_err("a renamed Rocket device must be rejected");
+            .expect_err("the same, for the Rocket device");
         assert!(err.to_string().contains("@rocket_device"), "{err}");
     }
 }

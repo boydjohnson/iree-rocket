@@ -1,0 +1,7 @@
+usr/include/iree-rocket-runtime
+usr/lib/*/libiree_rocket_runtime.so
+usr/lib/*/libiree_rocket_runtime.a
+usr/lib/*/pkgconfig/iree-rocket-runtime.pc
+usr/lib/*/pkgconfig/iree-rocket-runtime-static.pc
+usr/lib/*/cmake/IreeRocketRuntime
+usr/share/rocket-runtime
