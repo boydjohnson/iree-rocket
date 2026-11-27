@@ -87,7 +87,10 @@ run=$(gh run list --repo boydjohnson/iree-rocket --workflow=nightly.yml \
     --status=success --limit=1 --json databaseId -q '.[0].databaseId')
 gh run download --repo boydjohnson/iree-rocket "$run" \
     -n iree-compile-x86_64 -n iree-runtime-aarch64
-tar -xzf iree-compile-x86_64.tar.gz && tar -xzf iree-runtime-aarch64.tar.gz
+# Two -n flags put each artifact in its own directory; each tarball unpacks
+# into that same directory name.
+tar -xzf iree-compile-x86_64/iree-compile-x86_64.tar.gz
+tar -xzf iree-runtime-aarch64/iree-runtime-aarch64.tar.gz
 
 # 2. An ONNX model, imported with its shapes pinned and an oracle beside it.
 tools/export_onnx.py mobilenet_v2 --out-dir models
@@ -104,7 +107,7 @@ iree-compile-x86_64/bin/rocket-compiler audit \
 scp iree-runtime-aarch64/bin/iree-run-module mnv2/mnv2.npu.vmfb \
     mnv2/mobilenet_v2.fp16.input.bin board:~/
 ssh board './iree-run-module --module=mnv2.npu.vmfb --function=main_graph \
-    --device=rocket --device=local-task \
+    --device=rocket --device=local-task --task_topology_cpu_ids=4,5,6,7 \
     --input=1x3x224x224xf16=@mobilenet_v2.fp16.input.bin \
     --output=@out.npy'
 ```

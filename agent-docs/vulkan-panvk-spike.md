@@ -103,12 +103,16 @@ a driver bug.
 `ROCKET_WITH_VULKAN` (default **OFF**) gates `IREE_HAL_DRIVER_VULKAN` in the
 aarch64 runtime build. It stays off by default because the host `iree-compile`
 has no vulkan-spirv target, so the Vulkan executable tests cannot be
-generated; build only the tool targets:
+generated; build only the tool targets. Run it from the repository root. The
+toolchain file and host-tools paths must be absolute: CMake resolves a relative
+toolchain file against the build and source directories, not the shell's
+(`configure-runtime-aarch64.sh` does the same with `${ROOT}`, but it hard-codes
+`-B .../build`, so it cannot make this separate tree):
 
-```
+```sh
 cmake -S iree-build/host-aarch64 -B iree-build/host-aarch64/build-vulkan \
-  -G Ninja -DCMAKE_TOOLCHAIN_FILE=iree-build/aarch64_linux_gnu.cmake \
-  -DIREE_HOST_BIN_DIR=iree-build/build/tools -DIREE_BUILD_COMPILER=OFF \
+  -G Ninja -DCMAKE_TOOLCHAIN_FILE="$PWD/iree-build/aarch64_linux_gnu.cmake" \
+  -DIREE_HOST_BIN_DIR="$PWD/iree-build/build/tools" -DIREE_BUILD_COMPILER=OFF \
   -DROCKET_WITH_VULKAN=ON
 ninja -C iree-build/host-aarch64/build-vulkan iree-run-module iree-benchmark-module
 ```

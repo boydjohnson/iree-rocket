@@ -1,6 +1,8 @@
 # Tested limits
 
-What this stack is *measured* to do, as of 2026-09-05. Every number here is
+What this stack is *measured* to do. Started 2026-09-05; sections carry their
+own dates, and the matcher table and model counts were re-checked against
+the code on 2026-11-27. Every number here is
 the extent of an actual measurement -- a vendor capture, a hardware sweep on
 an RK3588, or both -- not the extent of what the register encodings could
 express. The register fields are almost always wider: `CNA_WEIGHT_SIZE2.weight_kernels`
@@ -175,8 +177,10 @@ int8 and, since 2026-09-09, **1536** for fp16 -- raised from 512, which was
 where the fp16 depthwise matchers had been written and never revisited, and
 which left MobileNetV2's own C=576 and C=960 depthwise convolutions on the
 CPU. The raise is gated end to end by `tools/e2e_conv_regression.py`'s
-`depthwise_fp16_c576`/`_c960`/`_c1536`/`_c1536_s2`; it costs 4.6 ms at four
-workers and nothing at eight, see ISSUES.md P7. Depthwise has its own
+`depthwise_fp16_c576`/`_c960`/`_c1536`/`_c1536_s2`. The 4.6 ms it cost at
+four workers when measured (2026-09-09) is history: since 2026-11-24 the
+depthwise demote is on by default and the pads fold, and MobileNetV2 fp16 is
+10.0 ms (ISSUES.md P7). Depthwise has its own
 coefficient grouping and its own output writer, each of which has been wrong at
 a shape the dense path was right at.
 
@@ -390,8 +394,19 @@ is a difference rather than a defect.
 
 ## What a compiled model actually offloads
 
-These are the enabled matchers -- the complete set of shapes that can leave the
-CPU today. Everything else falls back silently and correctly.
+These are the enabled matcher families, by the shapes they admit. Everything
+else falls back silently and correctly. The authority is the two
+`transform.foreach_match` loops at the end of
+`rocket_conv2d_transform_spec.mlir` (the epilogue-rooted loop first, then the
+op-rooted one), and for any one model `rocket-compiler audit` names what each
+op hit; if this section and those disagree, they are right.
+
+Besides the plain rows in the table, the epilogue-rooted loop claims fused
+forms of the same dense fp16 convolutions -- `+ bias`, `+ ReLU`, `+ ReLU6`,
+`+ residual add` (with and without ReLU, and a wide-skip form), each with a
+pad-1 and a stride-2 twin where the plain row has one -- plus the int8
+requantized convolutions and the int8 residual `add + ReLU`. They inherit the
+plain row's channel bounds.
 
 The `conv + ReLU6` rows claim a convolution *and* the clamp that follows it,
 and are the only rows that fuse anything: the clamp runs in the DPU's BN
@@ -405,9 +420,10 @@ on them that are not in the table:
 - **The bias must be a per-channel broadcast.** It moves onto the BS plane,
   which is what puts it before the BN clamp; a convolution whose init is
   anything else is declined and keeps its separate clamp dispatch.
-- **Stride 1 only**, so a strided convolution with a ReLU6 -- MobileNetV2's
-  stem is the one in that model -- offloads through the plain rows and keeps
-  its clamp on the CPU.
+- **Strides.** Dense 1x1 and unpadded 3x3 `+ ReLU6` are stride 1 only. The
+  padded dense 3x3 form and the depthwise NCHW forms (padded and unpadded)
+  have stride-2 twins, which is what claims MobileNetV2's stem and its
+  strided depthwise convolutions with their clamps.
 
 The `conv + pad 1` rows claim a convolution *and* the `tensor.pad` in front of
 it, so the CNA pads instead of IREE materializing a full-tensor copy. Bounds
@@ -419,16 +435,18 @@ that are not in the table:
   against all 150 strided programs in the vendor corpus. There is no
   trailing-pad register, so `low[0] high[1]` -- ONNX's `auto_pad = SAME_UPPER`
   at stride 2 -- stays materialized.
-- **Exactly 1**, spatial axes only, zero fill. Pad 2 and 3 belong to 5x5 and
-  7x7, which no matcher claims.
-- **Not combined with a fused ReLU6.** A convolution with both folds the
-  activation and keeps its pad; no target claims the pair.
+- **Exactly 1**, spatial axes only, zero fill. Pad 2 and 3 (5x5 and 7x7
+  kernels) are not folded by these rows.
+- **Combined with a fused ReLU6** for dense 3x3 and depthwise NCHW
+  (`*_pad1_relu6`, stride 1 and 2): one target claims pad, convolution and
+  clamp together.
 
 Measured on ResNet50 fp16: all 16 pad sites folded, `slow_memcpy` executables
 7 -> 0, 230 -> 223 ms at `taskset -c 4-7` and 203.5 -> 195.5 at `0-7`, with
-output identical to the materialized-pad arm to five decimals. MobileNetV2 has
-almost nothing to give here -- 17 of its 18 pads feed depthwise convolutions
-that stay on the CPU, and the one that does not is asymmetric.
+output identical to the materialized-pad arm to five decimals. (Written 2026-09, when
+MobileNetV2's depthwise convolutions stayed on the CPU and so did 17 of its
+18 pads. Since 2026-11-24 the depthwise pads fold too, through the depthwise
+`pad1` matchers; ISSUES.md P7 has the numbers.)
 
 Measured on MobileNetV2 fp16: 17 of 18 fusable sites, 146 -> 133 ms at
 `taskset -c 4-7` and 122.5 -> 116.5 at `0-7`, with max|diff| against a
@@ -447,37 +465,46 @@ narrowed to f16 for the Conv2D ABI's bias binding.
 | conv + ReLU6 | NHWC HWCF | f16/f16/f32 | 3x3 | 1 | 1..=1152 | 1..=4096 |
 | conv | NHWC HWCF | i8/i8/i32 | 1x1 | 1 | 1..=4096 | 1..=4096 |
 | conv | NHWC HWCF | i8/i8/i32 | 3x3 | 1 | 1..=1152 | 1..=512 |
+| conv (stem) | NHWC HWCF | i8/i8/i32 | 7x7 | 2 | 1..=4 | 1..=128 |
+| conv (stem, space-to-depth) | NHWC HWCF | f16/f16/f32 | 4x4 | 1 | 1..=16 | 1..=128 |
 | depthwise | NHWC HWC | f16/f16/f32 | 1x1, 3x3 | 1 | 1..=1536 | = `Cin` |
 | depthwise | NCHW CHW | f16/f16/f32 | 1x1, 3x3 | 1, 2, 3, 4 | 1..=1536 | = `Cin` |
+| depthwise | NCHW CHW | f16/f16/f32 | 7x7 | 1 | 1..=768 | = `Cin` |
 | depthwise | NHWC HWC | i8/i8/i32 | 1x1, 3x3 | 1, 2 | 1..=1344 | = `Cin` |
 | matmul | -- | f16/f16/f32 | -- | -- | `M` 1..=4096, `K` 1..=4096 | `N` 1..=4096 |
 | matvec | -- | f16/f16/f32 | -- | -- | `M` 1..=4096, `K` 1..=4096 | `N` = 1 |
 | vecmat | -- | f16/f16/f32 | -- | -- | `M` = 1, `K` 1..=4096 | `N` 1..=4096 |
 | avg pool | NCHW sum | f32 | 2x2..=8x8 | 1 | H/W/C 1..=8192 | -- |
+| avg pool | NCHW sum | f16 | 2x2..=8x8 | 1 | H/W/C 1..=8192 | -- |
 | avg pool | NHWC sum | f32 | 2x2..=8x8 | 1 | H/W/C 1..=8192 | -- |
-| max pool | NHWC | f32 | 2x2..=8x8 | 1, 2 | H/W/C 1..=8192 | -- |
+| max pool | NHWC | f32 | 2x2..=8x8 | 1, 2 (2 also with pad 1) | H/W/C 1..=8192 | -- |
+| max pool | NHWC | i8 | 2x2..=3x3 | 2 (also with pad 1) | H/W 1..=114, C 1..=64 | -- |
 | max pool | NCHW | f32 | 2x2..=8x8 | 1, 2 | H/W/C 1..=8192 | -- |
 | min pool | NHWC | f32 | 2x2..=8x8 | 1, 2 | H/W/C 1..=8192 | -- |
 
-All of these additionally require batch 1 and dilation 1.
+All of these additionally require batch 1 and dilation 1. The two-tensor
+element-wise matchers (f32 `add`/`sub`/`mul`) are in the list too but
+commented out behind `//@ROCKET_ELEMENTWISE@`; `rocket-compiler --elementwise`
+enables them.
 
 The conv and matmul channel columns are `rocket-core/src/admission.rs`
 (`conv_ceilings`, `MAX_ADMITTED_MATMUL_M`), which every one of those matchers
 consults through `transform.rocket.match.admitted`; if this table and that
 function disagree, the function is right. The i8 rows are the accumulator
 path. A convolution lowered to the requantized int8 path (`precision = int8`)
-admits less: 1x1 at `Cin` 1344 / `Cout` 2048 (raised from 1792 on
-2026-11-23 for ResNet50 int8), 3x3 at 768 / 768, depthwise at 1344, with
-`Cout` a whole 16-channel atom. Requantized stride 2 has its own matchers
+admits less: 1x1 at `Cin` 2048 / `Cout` 2048 (`Cin` raised from 1344 on
+2026-11-24), 3x3 at 768 / 768, the 7x7 stride-2 stem at `Cin` 4 / `Cout`
+16..=128, depthwise at 1344, with `Cout` a whole 16-channel atom. Requantized stride 2 has its own matchers
 (1x1 and 3x3, 2026-11-23).
 
 All three matmul rows have an end-to-end differential behind them:
-`tools/e2e_matmul_regression.py`, eight cases, all passing on `planck`
-2026-09-05. Seven are compared **exactly** using ternary fixtures -- `{-1, 0,
-1}` entries are exact in f16 and the sums stay inside its integer-exact range
--- which is what lets a contraction be gated bit for bit rather than under a
-tolerance. The eighth is the ViT shape with realistic magnitudes, at
-max|error| 0.0011.
+`tools/e2e_matmul_regression.py`, eleven cases (eight when it was first
+passed on `planck` 2026-09-05; `matmul_m_4096` and `matmul_k_n_4096` are among
+the additions). All but one are compared **exactly** using ternary fixtures --
+`{-1, 0, 1}` entries are exact in f16 and the sums stay inside its
+integer-exact range -- which is what lets a contraction be gated bit for bit
+rather than under a tolerance. The exception, `matmul_vit_dense`, is the ViT
+shape with realistic magnitudes, at max|error| 0.0011.
 
 `matvec` and `vecmat` have no matcher of their own: `rocket-expand-gemv-to-matmul`
 raises them into `linalg.matmul` with a unit extent before the match loop, so
@@ -508,7 +535,8 @@ the isolated version of that cost, at 0.00024 on a 2x2 window.
 
 The pooling rows additionally have an end-to-end differential behind them:
 `tools/e2e_pooling_regression.py` compiles all three methods twice and
-compares on the board -- fourteen cases, all passing on `planck` 2026-09-05.
+compares on the board -- seventeen cases today (fourteen when it first passed
+on `planck` 2026-09-05).
 Max and min are compared **exactly** and measure exact (max|error| 0 across
 both layouts where they exist, both strides, the 8x8 ceiling, a tiled width,
 and pools sharing a command buffer including a min-then-max transition),
@@ -517,22 +545,29 @@ fixtures are f16-exact. The average carries genuine f16 error, 0.0057 worst
 case at 49 taps, because the PPU's average is a multiply by `fp16(65536/k)`
 that the shim multiplies back out.
 
-What that adds up to on a real model, from `rocket-compiler audit` (2026-09-05):
+What that adds up to on a real model, on the IREE 3.14 toolchain
+(`agent-docs/iree-3.14-bump.md`, 2026-11):
 
-| Model | Rocket dispatch sites | Of which convolutions | CPU dispatch sites |
+| Model | Rocket dispatch sites | What they are | CPU dispatch sites |
 |---|---|---|---|
-| `mnv2.fp16.mlir` | 37 | 35 (34 stride-1 dense, 1 stride-2 stem) | 145 |
-| `mnv2.int8.mlir` | 50 | 48 (34 dense, 13 depthwise, 1 stride-2 stem) | 95 |
+| survey `mobilenet_v2` fp16 | 54 | 35 dense conv, 17 depthwise, 1 avg pool, 1 matmul | 4 |
+| board-set `mnv2.int8.mlir` | 54 | -- | 91 |
 
-Both also offload the classifier matmul and the average pool. MobileNetV2 fp16's
-17 depthwise convolutions stay on the CPU by choice, not by a limit -- they are
-correct on the NPU and 26% slower there (ISSUES.md P7).
+Every MobileNetV2 fp16 convolution is on the NPU, the 17 depthwise ones
+included: the depthwise demote has been on by default since 2026-11-24
+(ISSUES.md P7). The 2026-09-05 audit this table replaces had 37 sites and 145
+CPU dispatches for fp16, with the depthwise convolutions kept on the CPU.
 
 ## End-to-end validation
 
-Two models have been run through the whole pipeline: **MobileNetV2** (fp16, and
-int8 via ONNX Runtime `quantize_dynamic` / `onnx.ConvInteger`) and **VGG**
-geometry (30x30, `Cin` 512, `Cout` 512, 3x3).
+Ten ONNX models run through the whole pipeline and agree with an ONNX Runtime
+oracle (MobileNetV2, ResNet50, ResNeXt50, Wide ResNet50, ConvNeXt-T, ViT-B/16,
+ViT-L/16, BLIP, BERT-base at 128 and 384 tokens). [README.md](README.md) has
+the table, and `tools/model_survey.py`, described in
+[onnx-to-numbers.md](agent-docs/onnx-to-numbers.md), reproduces it. The first
+two, before the survey existed, were **MobileNetV2** (fp16, and int8 via ONNX
+Runtime `quantize_dynamic` / `onnx.ConvInteger`) and **VGG** geometry (30x30,
+`Cin` 512, `Cout` 512, 3x3).
 
 The board gate is:
 
@@ -543,11 +578,12 @@ python3 tools/e2e_conv_regression.py --board "<board name>"
 It compiles each case twice -- once for the host CPU, once for Rocket -- runs
 the Rocket build on the RK3588 through `iree-run-module`, and compares. int8
 cases are compared **exactly** (atol = rtol = 0), since the whole path is
-integer arithmetic; fp16 cases use 1e-2. Thirteen cases: dense f16 3x3
+integer arithmetic; fp16 cases use 1e-2. It has 46 cases today. The original
+thirteen were: dense f16 3x3
 `Cin`/`Cout` 512, dense `Cin`=3 ARGB, depthwise 40-channel (crossing the
 driver's 32-channel weight-packing group boundary), five int8 dense variants up
 to `Cout` 768, int8 depthwise at stride 1 and 2, and three two-dispatch cases
-that share one command buffer the way a real model does. All thirteen gate; the
+that share one command buffer the way a real model does. All of them gate; the
 mixed int8-then-fp16-depthwise case was a `known_failure` until 2026-09-05 and
 is now an ordinary one (ISSUES.md C8).
 

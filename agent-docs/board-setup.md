@@ -15,7 +15,7 @@ and all of it looks like a bug in this stack.
 
 | | What was measured |
 |---|---|
-| SoC | RK3588. Two boards: `planck` and `orangepi` (the same host re-flashed; `planck` earlier ran 7.1.0-edge). |
+| SoC | RK3588. One board under two names: `planck` (its name in older measurements, when it ran 7.1.0-edge) is the host now reached as `ssh orangepi`. Only the `orangepi` alias exists, so every command below uses it. |
 | OS | Armbian `7.3.5-edge-rockchip64` for every measurement; the board has run `7.3.6-edge-rockchip64` with the same three patches since 2026-11-27 ([`kernel-patches/`](../kernel-patches) covers both). Debian 13 userland, glibc 2.41, which is above the nightly artifacts' 2.39 floor. |
 | Kernel driver | Mainline `rocket` (`drivers/accel/rocket`), as Armbian ships it -- upstream plus Armbian's RK3576 series -- **plus the three patches below**. |
 | Device node | `/dev/accel/accel0`. The driver opens it once per worker context. |
@@ -61,7 +61,7 @@ One round trip, the same probe `tools/model_survey.py` records into every
 `result.json`, plus the module parameters:
 
 ```sh
-ssh planck 'ls -l /dev/accel/accel0
+ssh orangepi 'ls -l /dev/accel/accel0
   uname -r
   for c in 0 4 6; do printf "cpu%s:%s " $c \
     "$(cat /sys/devices/system/cpu/cpu$c/cpufreq/scaling_governor)"; done; echo
@@ -115,9 +115,9 @@ compiled CPU results, so a pass covers the compiler, the driver and the
 hardware together:
 
 ```sh
-python3 tools/e2e_conv_regression.py    --board planck
-python3 tools/e2e_matmul_regression.py  --board planck
-python3 tools/e2e_pooling_regression.py --board planck
+python3 tools/e2e_conv_regression.py    --board orangepi
+python3 tools/e2e_matmul_regression.py  --board orangepi
+python3 tools/e2e_pooling_regression.py --board orangepi
 ```
 
 The pooling gate is the one that fails loudest on a stock module, since that

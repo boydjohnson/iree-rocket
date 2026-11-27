@@ -43,14 +43,14 @@ of the next run failing for reasons of its own (ISSUES.md, the wedge protocol).
 
 ## Usage
 
-    tools/model_survey.py run --model wide_resnet50_2 --board planck
-    tools/model_survey.py run --model vit_l_16 --board planck --arm npu --arm cpu
+    tools/model_survey.py run --model wide_resnet50_2 --board orangepi
+    tools/model_survey.py run --model vit_l_16 --board orangepi --arm npu --arm cpu
     tools/model_survey.py summarize
 
     # A model that is not in tools/export_onnx.py's registry: bring the .onnx
     # and pin whatever dims it leaves symbolic.
     tools/model_survey.py run --model qwen3 --onnx qwen3.onnx \
-        --dim batch_size=1 --dim sequence_length=128 --board planck
+        --dim batch_size=1 --dim sequence_length=128 --board orangepi
 
 Stages are skipped when their outputs already exist, so an interrupted run
 resumes and a re-timing costs nothing but the timing. `--force STAGE` redoes
@@ -814,7 +814,7 @@ def main() -> None:
     )
     survey.add_argument("--dim", action="append", default=[], metavar="NAME=VALUE")
     survey.add_argument("--arm", action="append", choices=sorted(ARMS), default=[])
-    survey.add_argument("--board", default="planck")
+    survey.add_argument("--board", default="orangepi")
     survey.add_argument("--work-root", type=Path, default=ROOT / "survey")
     survey.add_argument("--remote-root", default="~/survey")
     survey.add_argument(
