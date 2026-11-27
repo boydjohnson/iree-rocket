@@ -93,6 +93,7 @@ set(_ROCKET_SRCS
   "RocketFuseConvRelu6Pass.cpp"
   "RocketFuseInt8RequantEpiloguePass.cpp"
   "RocketFuseInt8QdqPass.cpp"
+  "RocketFuseQdqConvPass.cpp"
   "RocketAssignLayoutPass.cpp"
   "RocketPackWeightsPass.cpp"
   "RocketPinUnclaimedDispatchesPass.cpp"

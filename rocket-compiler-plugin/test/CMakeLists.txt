@@ -6,6 +6,8 @@ iree_lit_test_suite(
     "rocket_conv_layout.mlir"
     "rocket_expand_gemv_to_matmul.mlir"
     "rocket_fuse_int8_requant_epilogue.mlir"
+    "rocket_fuse_qdq_conv.mlir"
+    "rocket_qdq_conv_match.mlir"
     "rocket_expand_onnx_conv_integer.mlir"
     "rocket_elementwise_unary.mlir"
     "rocket_elementwise_binary.mlir"
