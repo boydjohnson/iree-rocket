@@ -150,7 +150,7 @@ external HAL driver registered through IREE's own
 The kernel side is mainline `accel/rocket` plus three patches that are not
 upstream, carried in [`kernel-patches/`](kernel-patches) -- two of them Greg
 Tomko's, from the external [`gregordinary/patches`](https://github.com/gregordinary/patches)
-series, rebased onto Armbian 7.3.5. Getting all three upstream is the useful
+series, rebased onto Armbian 7.3.5 and carried to 7.3.6. Getting all three upstream is the useful
 next step for anyone working on that driver. **Unconditional
 PPU completion**: upstream arms only the DPU interrupts, so a standalone
 PPU-flying pooling job never reaches the completion path and is retired by
@@ -178,7 +178,7 @@ extent of an actual measurement and the register encodings are wider.
 | [`rocket-compiler`](rocket-compiler) | The compiler driver: applies the transform spec and the device flags it expects, and audits where every convolution and matmul went. |
 | [`rocket-schema`](rocket-schema) | The FlatBuffers executable format shared by both sides. |
 | [`tools`](tools) | ONNX import/export, the board regression gates, the model survey, the precision probe. |
-| [`kernel-patches`](kernel-patches) | The out-of-tree `accel/rocket` patches the measured configuration runs, for Armbian 7.3.5. GPL-2.0, unlike the rest of this repository, and two of the three come from [`gregordinary/patches`](https://github.com/gregordinary/patches). |
+| [`kernel-patches`](kernel-patches) | The out-of-tree `accel/rocket` patches the measured configuration runs, for Armbian 7.3.6 (and 7.3.5, unchanged). GPL-2.0, unlike the rest of this repository, and two of the three come from [`gregordinary/patches`](https://github.com/gregordinary/patches). |
 | [`iree-build`](iree-build) | CMake configuration, and `iree-src`, IREE as a pinned submodule. |
 
 Each component's detailed role is in
