@@ -47,15 +47,16 @@ cmake --install iree-build/host-aarch64/build --component IreeRocketRuntime \
 
 | Path | |
 |---|---|
-| `include/rocket/runtime.h`, `include/iree/...` | this API and all of IREE's runtime headers |
-| `lib/libiree_rocket_runtime.so` | IREE's runtime, the Rocket driver and this API in one file; exports only `iree_*` and `rocket_runtime_*` |
+| `include/iree-rocket-runtime/rocket/runtime.h`, `include/iree-rocket-runtime/iree/...` | this API and all of IREE's runtime headers, one directory down so they never collide with another IREE's headers |
+| `lib/libiree_rocket_runtime.so` | IREE's runtime, the Rocket driver and this API in one file; exports only `iree_*` and `rocket_runtime_*`. The SONAME follows IREE (`.so.314` for IREE 3.14), since every IREE bump changes the `iree_*` ABI |
 | `lib/libiree_rocket_runtime.a` | the same contents as one static archive (C and C++ only, see below) |
 | `lib/pkgconfig/iree-rocket-runtime{,-static}.pc` | `pkg-config --cflags --libs iree-rocket-runtime` |
 | `lib/cmake/IreeRocketRuntime/` | `find_package(IreeRocketRuntime)` with `IreeRocket::runtime` and `IreeRocket::runtime_static` |
 | `share/rocket-runtime/samples/` | `embed.cc` (minimal C++) and `run_module.c` (a small `iree-run-module`) |
 
 The package is relocatable. pkg-config and CMake both resolve paths relative to
-where it was unpacked.
+where it was unpacked, at any `CMAKE_INSTALL_LIBDIR` depth (`lib` here,
+`lib/aarch64-linux-gnu` in the Debian packages under [`debian/`](../debian)).
 
 ```sh
 c++ -std=c++17 embed.cc $(pkg-config --cflags --libs iree-rocket-runtime)

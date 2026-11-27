@@ -1,0 +1,20 @@
+#!/bin/sh
+# rocket/runtime.h's session on the CPU device (--cpu-only), and IREE's own
+# runner with the same module: a * b + a for a = 1..4, b = 2.
+set -eu
+VMFB=rocket-runtime/rust/rocket-runtime/tests/data/cpu_ops.vmvx.vmfb
+WORK="${AUTOPKGTEST_TMP:-$(mktemp -d)}"
+
+rocket-run-module --cpu-only "$VMFB" module.mul_add \
+  "4xf32=1 2 3 4" "4xf32=2 2 2 2" | tee "$WORK/rocket.out"
+grep -qx '4xf32=3 6 9 12' "$WORK/rocket.out"
+
+iree-rocket-run-module --device=local-task --module="$VMFB" \
+  --function=mul_add --input="4xf32=1 2 3 4" --input="4xf32=2 2 2 2" \
+  | tee "$WORK/iree.out"
+grep -qx '4xf32=3 6 9 12' "$WORK/iree.out"
+
+iree-rocket-benchmark-module --device=local-task --module="$VMFB" \
+  --function=mul_add --input="4xf32=1 2 3 4" --input="4xf32=2 2 2 2" \
+  --benchmark_min_time=0.01s >/dev/null
+echo "runtime-smoke: ok"

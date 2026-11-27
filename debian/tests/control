@@ -1,4 +1,19 @@
-# Compiling needs no NPU, so this runs on any autopkgtest testbed.
+# None of these needs the NPU, so they run on any autopkgtest testbed of the
+# right architecture. The runtime packages are arm64 only; on other
+# architectures their tests are skipped as not installable.
+
+# Compiling needs no NPU.
 Tests: smoke
 Depends: rocket-compiler
 Restrictions: superficial
+
+# One function of a VMVX module on the CPU device, through both runners.
+Tests: runtime-smoke
+Depends: iree-rocket-tools
+Restrictions: skip-not-installable
+
+# The shipped C++ sample, built through both pkg-config files the way an
+# outside program would be, and the CMake package found by find_package.
+Tests: runtime-link
+Depends: libiree-rocket-runtime-dev, g++, pkgconf, cmake, ninja-build
+Restrictions: skip-not-installable

@@ -1,0 +1,58 @@
+.TH ROCKET-RUN-MODULE 1 "November 2026" "iree-rocket" "User Commands"
+.SH NAME
+rocket-run-module \- run one function of a rocket-compiler module on the RK3588 NPU
+.SH SYNOPSIS
+.B rocket-run-module
+[\fB\-\-cpu\-only\fR]
+[\fB\-\-cpu\-ids=\fILIST\fR | \fB\-\-iree\-cpus\fR]
+[\fB\-\-iterations=\fIN\fR]
+.I MODULE.vmfb FUNCTION
+[\fIINPUT\fR...]
+.SH DESCRIPTION
+Loads
+.I MODULE.vmfb
+(as produced by
+.BR rocket-compiler (1))
+into a libiree_rocket_runtime session over the Rocket NPU and CPU devices
+together, calls
+.I FUNCTION
+(for example
+.BR module.main_graph )
+with the given inputs, and prints each result the way
+.BR iree-rocket-run-module (1)
+prints it, so the two can be compared.
+.PP
+Each
+.I INPUT
+is in IREE's text form, for example
+.BR 1x3x224x224xf32=0.1 .
+.SH OPTIONS
+.TP
+.B \-\-cpu\-only
+Use only the CPU device. Runs modules compiled without NPU work, and works on
+machines with no NPU.
+.TP
+.BI \-\-cpu\-ids= LIST
+Pin the CPU workers to these CPUs, for example
+.BR 4\-7 .
+The default is the fastest CPU cluster.
+.TP
+.B \-\-iree\-cpus
+Use IREE's own worker placement instead.
+.TP
+.BI \-\-iterations= N
+Call the function
+.I N
+times. The time of the first call, and the mean of the rest, go to standard
+error.
+.SH FILES
+.TP
+.I /dev/accel/accel0
+The NPU, through the mainline rocket kernel driver. Opening it needs read and
+write access, which Debian gives the
+.B render
+group.
+.SH SEE ALSO
+.BR rocket-compiler (1),
+.BR iree-rocket-run-module (1),
+.BR iree-rocket-benchmark-module (1)

@@ -6,7 +6,8 @@ name: Nightly artifacts
 # board, the embeddable runtime library for programs that run models
 # themselves, and the board test binaries -- and attaches them to the run.
 #
-# Artifacts (each a single .tar.gz, so executable bits survive):
+# Artifacts (each a single .tar.gz, so executable bits survive, except the
+# .debs, which carry their own permissions):
 #   iree-compile-x86_64        bin/rocket-compiler, bin/iree-compile,
 #                              bin/iree-lld, lib/libIREECompiler.so,
 #                              share/rocket/<transform spec>; unpack anywhere
@@ -20,14 +21,20 @@ name: Nightly artifacts
 #                              CMake package files (rocket-runtime/).
 #   rocket-cts-aarch64         rocket HAL CTS binaries.
 #   rocket-rust-tests-aarch64  the crates' libtest binaries.
+#   rocket-compiler-deb-amd64  the rocket-compiler .deb, from compiler-host's
+#   rocket-compiler-deb-arm64  IREE build; from compiler-aarch64's.
+#   iree-rocket-runtime-debs-arm64  libiree-rocket-runtime<N>, -dev and
+#                              iree-rocket-tools (see debian/README.source).
 # All are built on a pinned runner image and need glibc 2.39 at most (the
 # `runner` / `max-glibc` inputs of iree-build.yml), so they load on both the
-# developer host and the board.
+# developer host and the board. The .debs are built on ubuntu-24.04 too, so
+# their Depends are noble's: they install on noble and on Debian 13, not on
+# older suites (debian/README.source, "One build per suite").
 #
-# All three jobs share iree-build.yml. runtime-aarch64 `needs:` compiler-host
+# All four jobs share iree-build.yml. runtime-aarch64 `needs:` compiler-host
 # because configure-runtime-aarch64.sh imports the host tools from that job's
 # build (IREE_HOST_BIN_DIR); see iree-build.yml for how they are handed over.
-# compiler-aarch64 needs nothing and runs alongside both.
+# compiler-aarch64 and runtime-deb need nothing and run alongside.
 
 on:
   schedule:
@@ -66,6 +73,17 @@ jobs:
     with:
       target: compiler-host
       runner: ubuntu-24.04-arm
+      retention-days: ${{ fromJSON(inputs.retention-days || '14') }}
+
+  # The runtime's .debs, built natively on arm64 with no LLVM (the
+  # pkg.iree-rocket.nocompiler profile), then installed and tested on the
+  # CPU device. Minutes, not hours.
+  runtime-deb:
+    uses: ./.github/workflows/iree-build.yml
+    with:
+      target: runtime-deb
+      runner: ubuntu-24.04-arm
+      timeout-minutes: 60
       retention-days: ${{ fromJSON(inputs.retention-days || '14') }}
 
   runtime-aarch64:

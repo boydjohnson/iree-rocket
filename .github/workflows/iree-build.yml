@@ -11,13 +11,19 @@ name: IREE build (reusable)
 #                    ubuntu-24.04 (iree-compile-x86_64, plus the host tools
 #                    runtime-aarch64 imports), aarch64 on ubuntu-24.04-arm
 #                    (iree-compile-aarch64, a compiler that runs on the board
-#                    itself).
+#                    itself). Each also builds, installs and tests the
+#                    rocket-compiler .deb from that same IREE build.
 #   runtime-aarch64  iree-run-module / iree-benchmark-module cross-compiled for
 #                    the RK3588 board with the Rocket HAL driver statically
 #                    linked -- ../../iree-build/configure-runtime-aarch64.sh --
 #                    plus the embeddable runtime package (rocket-runtime/),
 #                    the rocket HAL CTS binaries and the Rust test binaries,
 #                    all for the board.
+#   runtime-deb      the runtime's Debian packages (libiree-rocket-runtime<N>,
+#                    -dev, iree-rocket-tools), built natively on an arm64
+#                    runner with the pkg.iree-rocket.nocompiler profile -- no
+#                    LLVM, so minutes -- then installed with apt and run
+#                    through debian/tests on the CPU device.
 #
 # runtime-aarch64 is downstream of compiler-host: configure-runtime-aarch64.sh
 # points IREE_HOST_BIN_DIR at iree-build/build/tools, and IREE resolves those
@@ -31,7 +37,7 @@ on:
   workflow_call:
     inputs:
       target:
-        description: "compiler-host or runtime-aarch64"
+        description: "compiler-host, runtime-aarch64 or runtime-deb"
         required: true
         type: string
       timeout-minutes:
@@ -84,10 +90,10 @@ jobs:
       CCACHE_DIR: ${{ github.workspace }}/.ccache
       # Every target/runner pair gets its own cache (different compilers
       # entirely -- x86_64 g++, aarch64 g++, aarch64-linux-gnu-g++), and
-      # their sum (3 + 3 + 1 GB for the three nightly jobs) has to stay well
-      # under GitHub's 10 GB per-repo cache budget or the jobs evict each
-      # other's LLVM objects every run.
-      CCACHE_MAXSIZE: ${{ inputs.target == 'compiler-host' && '3G' || '1G' }}
+      # their sum (3 + 3 + 1 + 0.5 GB for the four nightly jobs) has to stay
+      # well under GitHub's 10 GB per-repo cache budget or the jobs evict
+      # each other's LLVM objects every run.
+      CCACHE_MAXSIZE: ${{ inputs.target == 'compiler-host' && '3G' || inputs.target == 'runtime-aarch64' && '1G' || '500M' }}
       CCACHE_COMPRESS: "1"
       # Rewrite absolute paths under the workspace to relative ones, so objects
       # stay reusable if the checkout ever lands somewhere else.
@@ -106,7 +112,7 @@ jobs:
           TARGET: ${{ inputs.target }}
         run: |
           case "$TARGET" in
-            compiler-host|runtime-aarch64) ;;
+            compiler-host|runtime-aarch64|runtime-deb) ;;
             *) echo "::error::unknown target '$TARGET'"; exit 1 ;;
           esac
           # runtime-aarch64 cross-compiles with aarch64-linux-gnu-g++ and
@@ -115,15 +121,32 @@ jobs:
             echo "::error::runtime-aarch64 needs an x86_64 runner, not ${RUNNER_ARCH}"
             exit 1
           fi
+          # The runtime packages are arm64 only, and built natively.
+          if [ "$TARGET" = runtime-deb ] && [ "${RUNNER_ARCH}" != ARM64 ]; then
+            echo "::error::runtime-deb needs an arm64 runner, not ${RUNNER_ARCH}"
+            exit 1
+          fi
           # compiler-host builds for the runner it is on; the package is named
           # after that architecture (iree-compile-x86_64 / -aarch64).
           echo "COMPILER_PKG=iree-compile-$(uname -m)" >> "$GITHUB_ENV"
 
       - uses: actions/checkout@v4
         with:
-          # iree-src pulls in llvm-project and friends; the build needs all of
-          # them, so this cannot be narrowed to the top-level submodule.
-          submodules: recursive
+          # iree-src pulls in llvm-project and friends; the IREE builds need
+          # all of them, so this cannot be narrowed to the top-level
+          # submodule. runtime-deb is the exception: see the next step.
+          submodules: ${{ inputs.target == 'runtime-deb' && 'false' || 'recursive' }}
+
+      # The runtime build (tests off) reads only three of IREE's submodules,
+      # the same ones debian/make-orig.sh ships for it. Skipping the rest
+      # skips LLVM and torch-mlir's own nested LLVM, most of the checkout.
+      - name: Check out the runtime's submodules
+        if: inputs.target == 'runtime-deb'
+        run: |
+          set -euo pipefail
+          git submodule update --init --depth 1 iree-build/iree-src
+          git -C iree-build/iree-src submodule update --init --depth 1 \
+            third_party/flatcc third_party/benchmark third_party/googletest
 
       # Feeds the ccache key below. iree-src's SHA is what actually decides
       # whether the LLVM objects in the cache are still usable, so it belongs
@@ -162,8 +185,10 @@ jobs:
           # rocket-compiler (host) and iree-rocket-hal / rocket-hal-driver
           # (aarch64); see ci.yml's own note. pkg-config: the runtime package
           # link test (aarch64) resolves the package's .pc files with it.
+          # debhelper, help2man: the .deb builds (debian/rules).
           sudo apt-get install -y --no-install-recommends \
-            ninja-build ccache patchelf libclang-dev pkg-config
+            ninja-build ccache patchelf libclang-dev pkg-config \
+            debhelper help2man
 
       - name: Install aarch64 cross toolchain
         if: inputs.target == 'runtime-aarch64'
@@ -411,6 +436,68 @@ jobs:
           name: iree-host-tools
           path: iree-host-tools.tar.gz
           compression-level: 0
+          retention-days: ${{ inputs.retention-days }}
+
+      # The rocket-compiler .deb, packaging the IREE build above rather than
+      # building another (ROCKET_IREE_BUILD_DIR), so it adds minutes, not
+      # hours. debian/rules runs the unit tests and one compile with the
+      # library it ships.
+      - name: Build the rocket-compiler .deb
+        if: inputs.target == 'compiler-host'
+        run: .github/scripts/build-debs.sh compiler dist-deb
+
+      # Installed the way a user installs it, then debian/tests/smoke: an
+      # empty-environment compile that must find the packaged library and
+      # spec under /usr. The checkout's own spec is still present, so the
+      # test's check that --no-offload derived from /usr/share is what proves
+      # the packaged lookup.
+      - name: Install and test the rocket-compiler .deb
+        if: inputs.target == 'compiler-host'
+        run: |
+          set -euo pipefail
+          sudo apt-get install -y --no-install-recommends ./dist-deb/rocket-compiler_*.deb
+          dpkg -L rocket-compiler
+          AUTOPKGTEST_TMP="$(mktemp -d)" sh debian/tests/smoke
+
+      - name: Upload the rocket-compiler .deb
+        if: inputs.target == 'compiler-host'
+        uses: actions/upload-artifact@v4
+        with:
+          name: rocket-compiler-deb-${{ runner.arch == 'ARM64' && 'arm64' || 'amd64' }}
+          path: dist-deb/*.deb
+          retention-days: ${{ inputs.retention-days }}
+
+      # --------------------------------------------------------- runtime-deb
+
+      - name: Build the runtime .debs
+        if: inputs.target == 'runtime-deb'
+        env:
+          ROCKET_IREE_CMAKE_ARGS: >-
+            -DCMAKE_C_COMPILER_LAUNCHER=ccache
+            -DCMAKE_CXX_COMPILER_LAUNCHER=ccache
+        run: .github/scripts/build-debs.sh runtime dist-deb
+
+      # The arm64 runner has no NPU, so these are the CPU-device and link
+      # halves of the board checks: rocket-run-module and IREE's own runner
+      # on a VMVX module, and the C++ sample built through both .pc files and
+      # find_package(IreeRocketRuntime).
+      - name: Install and test the runtime .debs
+        if: inputs.target == 'runtime-deb'
+        run: |
+          set -euo pipefail
+          sudo apt-get install -y --no-install-recommends \
+            ./dist-deb/libiree-rocket-runtime*.deb ./dist-deb/iree-rocket-tools_*.deb
+          for t in runtime-smoke runtime-link; do
+            echo "== debian/tests/$t"
+            AUTOPKGTEST_TMP="$(mktemp -d)" sh "debian/tests/$t"
+          done
+
+      - name: Upload the runtime .debs
+        if: inputs.target == 'runtime-deb'
+        uses: actions/upload-artifact@v4
+        with:
+          name: iree-rocket-runtime-debs-arm64
+          path: dist-deb/*.deb
           retention-days: ${{ inputs.retention-days }}
 
       # ------------------------------------------------------------- aarch64

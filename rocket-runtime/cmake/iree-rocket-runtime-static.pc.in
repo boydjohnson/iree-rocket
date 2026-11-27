@@ -1,6 +1,6 @@
-prefix=${pcfiledir}/../..
-libdir=${prefix}/lib
-includedir=${prefix}/include
+prefix=${pcfiledir}/@_PC_TO_PREFIX@
+libdir=${prefix}/@CMAKE_INSTALL_LIBDIR@
+includedir=${prefix}/@ROCKET_RUNTIME_INSTALL_INCLUDEDIR@
 
 # C and C++ only: the archive carries the Rocket driver's own Rust standard
 # library. Named by path so the linker cannot pick the .so beside it instead.

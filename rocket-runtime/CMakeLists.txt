@@ -23,11 +23,14 @@
 #
 #   cmake --install <build> --component IreeRocketRuntime --prefix <dir> --strip
 #
-#   <dir>/include/rocket/runtime.h, <dir>/include/iree/...   headers
-#   <dir>/lib/libiree_rocket_runtime.so{,.0,.0.1.0}           shared
-#   <dir>/lib/libiree_rocket_runtime.a                        static
+#   <dir>/include/iree-rocket-runtime/{rocket/runtime.h,iree/...}  headers
+#   <dir>/lib/libiree_rocket_runtime.so{,.314,.314.0.1.0}         shared
+#   <dir>/lib/libiree_rocket_runtime.a                            static
 #   <dir>/lib/pkgconfig/iree-rocket-runtime{,-static}.pc
 #   <dir>/lib/cmake/IreeRocketRuntime/IreeRocketRuntimeConfig.cmake
+#
+# (`lib` is CMAKE_INSTALL_LIBDIR: lib/<triplet> in a Debian build. The .pc and
+# CMake files find the prefix relative to themselves either way.)
 #
 # The static archive is for C and C++ programs only. It contains the Rocket HAL
 # driver's copy of the Rust standard library, so a Rust program that links it
@@ -36,7 +39,25 @@
 cmake_minimum_required(VERSION 3.24)
 
 set(ROCKET_RUNTIME_VERSION "0.1.0")
-set(ROCKET_RUNTIME_SOVERSION "0")
+
+# The SONAME follows IREE: libiree_rocket_runtime.so.<major><minor, 2 digits>,
+# so .so.314 for IREE 3.14. The library exports IREE's whole C API (iree_*),
+# and IREE makes no ABI promise between releases, so an IREE bump is an ABI
+# break whatever this file's own version says. Deriving it means the bump
+# cannot be forgotten. Changes to rocket/runtime.h between IREE bumps must
+# stay additive: they ship under the same SONAME.
+file(READ "${IREE_SOURCE_DIR}/runtime/version.json" _IREE_VERSION_JSON)
+string(JSON _IREE_VERSION GET "${_IREE_VERSION_JSON}" "package-version")
+if(NOT _IREE_VERSION MATCHES "^([0-9]+)\\.([0-9]+)")
+  message(FATAL_ERROR "cannot read an IREE version from '${_IREE_VERSION}'")
+endif()
+math(EXPR _IREE_ABI "${CMAKE_MATCH_1} * 100 + ${CMAKE_MATCH_2}")
+set(ROCKET_RUNTIME_SOVERSION "${_IREE_ABI}")
+
+# Headers go one directory down (include/iree-rocket-runtime/{rocket,iree}),
+# because they include all of IREE's runtime headers: installed straight
+# into /usr/include they would collide file for file with any other IREE.
+set(ROCKET_RUNTIME_INCLUDE_SUBDIR "iree-rocket-runtime")
 
 include(GNUInstallDirs)
 find_package(Threads REQUIRED)
@@ -135,7 +156,7 @@ target_link_options(iree_rocket_runtime PRIVATE
   "LINKER:--no-undefined"
 )
 set_target_properties(iree_rocket_runtime PROPERTIES
-  VERSION "${ROCKET_RUNTIME_VERSION}"
+  VERSION "${ROCKET_RUNTIME_SOVERSION}.${ROCKET_RUNTIME_VERSION}"
   SOVERSION "${ROCKET_RUNTIME_SOVERSION}"
   LINK_DEPENDS "${_ROCKET_EXPORTS_MAP};${_ROCKET_DRIVER_ARCHIVE}"
 )
@@ -204,10 +225,11 @@ install(FILES "${_ARCHIVE}"
   DESTINATION "${CMAKE_INSTALL_LIBDIR}"
 )
 
+set(_INCLUDE_DEST "${CMAKE_INSTALL_INCLUDEDIR}/${ROCKET_RUNTIME_INCLUDE_SUBDIR}")
 install(DIRECTORY include/
   COMPONENT ${_COMPONENT}
   EXCLUDE_FROM_ALL
-  DESTINATION "${CMAKE_INSTALL_INCLUDEDIR}"
+  DESTINATION "${_INCLUDE_DEST}"
 )
 # All of IREE's runtime headers, not only the ones rocket/runtime.h reaches:
 # callers include iree/io, iree/hal/utils and so on directly. Tests and test
@@ -222,7 +244,7 @@ foreach(_root
   install(DIRECTORY "${_root}/"
     COMPONENT ${_COMPONENT}
     EXCLUDE_FROM_ALL
-    DESTINATION "${CMAKE_INSTALL_INCLUDEDIR}/iree"
+    DESTINATION "${_INCLUDE_DEST}/iree"
     FILES_MATCHING
       PATTERN "*.h"
       # Textually included by headers (iree/hal/profile_metrics.h).
@@ -257,7 +279,22 @@ set(_PUBLIC_CFLAGS "-D${ROCKET_RUNTIME_PUBLIC_DEFINES}")
 set(_STATIC_SYSTEM_LIBS "-lpthread -ldl -lm -lrt -lgcc_s")
 
 # pkg-config and CMake package files. Both resolve paths relative to where the
-# package was unpacked, so the tarball is relocatable.
+# package was unpacked, so the tarball is relocatable. The way back up to the
+# prefix depends on how deep CMAKE_INSTALL_LIBDIR is: `lib` for the tarball,
+# `lib/aarch64-linux-gnu` for Debian. A fixed ../.. would put a Debian
+# install's prefix at /usr/lib.
+if(IS_ABSOLUTE "${CMAKE_INSTALL_LIBDIR}" OR IS_ABSOLUTE "${CMAKE_INSTALL_INCLUDEDIR}")
+  message(FATAL_ERROR "rocket-runtime needs a relative CMAKE_INSTALL_LIBDIR and "
+                      "CMAKE_INSTALL_INCLUDEDIR, so its package files stay relocatable")
+endif()
+file(RELATIVE_PATH _PC_TO_PREFIX
+  "/prefix/${CMAKE_INSTALL_LIBDIR}/pkgconfig" "/prefix")
+file(RELATIVE_PATH _CMAKE_TO_PREFIX
+  "/prefix/${CMAKE_INSTALL_LIBDIR}/cmake/IreeRocketRuntime" "/prefix")
+# file(RELATIVE_PATH) can end in a slash; the templates add their own.
+string(REGEX REPLACE "/$" "" _PC_TO_PREFIX "${_PC_TO_PREFIX}")
+string(REGEX REPLACE "/$" "" _CMAKE_TO_PREFIX "${_CMAKE_TO_PREFIX}")
+set(ROCKET_RUNTIME_INSTALL_INCLUDEDIR "${_INCLUDE_DEST}")
 foreach(_pc iree-rocket-runtime iree-rocket-runtime-static)
   configure_file("cmake/${_pc}.pc.in" "${CMAKE_CURRENT_BINARY_DIR}/${_pc}.pc" @ONLY)
   install(FILES "${CMAKE_CURRENT_BINARY_DIR}/${_pc}.pc"

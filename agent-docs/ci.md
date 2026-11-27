@@ -10,7 +10,7 @@ Three workflows, under [`.github/workflows/`](../.github/workflows).
 | Workflow | Trigger | Jobs | Typical runtime |
 |---|---|---|---|
 | `ci.yml` -- CI | every push to `main`, every pull request | `check, build, test`; `cargo fmt --check` | ~1.5 min |
-| `nightly.yml` -- Nightly artifacts | `cron 0 7 * * *` (07:00 UTC), `workflow_dispatch` | `compiler-host`, then `runtime-aarch64`; `compiler-aarch64` alongside | ~20 min warm ccache, up to ~4 h cold |
+| `nightly.yml` -- Nightly artifacts | `cron 0 7 * * *` (07:00 UTC), `workflow_dispatch` | `compiler-host`, then `runtime-aarch64`; `compiler-aarch64` and `runtime-deb` alongside | ~20 min warm ccache, up to ~4 h cold |
 | `iree-build.yml` -- IREE build (reusable) | `workflow_call` only, so its runs are attributed to the caller and it has no badge of its own | one `build` job per `target` input | see above |
 
 ### CI -- `ci.yml`
@@ -62,13 +62,18 @@ ccache. `workflow_dispatch` takes a `retention-days` input, default 14.
   aside so a broken packaged lookup cannot hide behind it. Uploads
   `iree-compile-x86_64` (`bin/rocket-compiler`, `bin/iree-compile`,
   `bin/iree-lld`, `lib/libIREECompiler.so`, `share/rocket/<spec>`) and
-  `iree-host-tools` (the full host `tools/` dir, for the next job). Default
-  timeout 330 min -- deliberately under GitHub's 6 h ceiling, so a build that
+  `iree-host-tools` (the full host `tools/` dir, for the next job). Then
+  builds the `rocket-compiler` .deb from the same IREE build
+  (`.github/scripts/build-debs.sh compiler`: `ROCKET_IREE_BUILD_DIR`, the
+  `pkg.iree-rocket.noruntime` profile, a version naming the commit and the
+  IREE pin), installs it with apt, runs `debian/tests/smoke` against it and
+  uploads `rocket-compiler-deb-amd64`. Default timeout 330 min -- deliberately under GitHub's 6 h ceiling, so a build that
   runs long still reaches its ccache save step.
 - **`compiler-aarch64`** -- the `compiler-host` target again, on
   `ubuntu-24.04-arm`: the same build, packaging and smoke test, natively for
   aarch64. The package is named after `uname -m`, so this one uploads
-  `iree-compile-aarch64`, a compiler that runs on the board itself. It skips
+  `iree-compile-aarch64`, a compiler that runs on the board itself, and
+  `rocket-compiler-deb-arm64`. It skips
   `iree-host-tools`: `runtime-aarch64` runs on x86_64 and could not execute
   them. Its ccache is separate (the key carries the runner) and as large as
   the x86_64 one, so its first run is a cold LLVM build and may hit the
@@ -90,6 +95,16 @@ ccache. `workflow_dispatch` takes a `retention-days` input, default 14.
   (the non-executable HAL CTS categories) and `rocket-rust-tests-aarch64`, the
   last two with a `RUN.md` saying how to run them on the board. Timeout
   120 min: no LLVM here.
+- **`runtime-deb`** (`ubuntu-24.04-arm`) -- the runtime's Debian packages,
+  natively: `.github/scripts/build-debs.sh runtime`, the
+  `pkg.iree-rocket.nocompiler` profile. The checkout takes only the three IREE
+  submodules the runtime reads (flatcc, benchmark, googletest), so no LLVM is
+  cloned or built. debian/rules runs a VMVX function through
+  `rocket-run-module`, static and shared; the job then installs the three
+  packages with apt and runs `debian/tests/runtime-smoke` and
+  `runtime-link`. There is no NPU on the runner, so NPU work is checked on
+  the board, not here. Uploads `iree-rocket-runtime-debs-arm64`. Timeout
+  60 min.
 
 A nightly that fails with *"the hosted runner lost communication with the
 server"* and no failed step lost its runner mid-build (the LLVM compile is the

@@ -1,4 +1,4 @@
-Source: rocket-compiler
+Source: iree-rocket
 Section: devel
 Priority: optional
 Maintainer: Boyd Johnson <boyd@boundarybit.io>
@@ -7,13 +7,13 @@ Build-Depends:
  cargo (>= 1.85),
  rustc (>= 1.85),
  libclang-dev,
- liblzma-dev,
- cmake (>= 3.21),
+ cmake (>= 3.24),
  ninja-build,
  g++,
  python3,
  patchelf,
- help2man,
+ help2man <!pkg.iree-rocket.nocompiler>,
+ liblzma-dev <!pkg.iree-rocket.nocompiler>,
 Standards-Version: 4.7.0
 Homepage: https://github.com/boydjohnson/iree-rocket
 Vcs-Browser: https://github.com/boydjohnson/iree-rocket
@@ -23,9 +23,12 @@ Rules-Requires-Root: no
 Package: rocket-compiler
 Architecture: amd64 arm64
 Multi-Arch: foreign
+Build-Profiles: <!pkg.iree-rocket.nocompiler>
 Depends:
  ${shlibs:Depends},
  ${misc:Depends},
+Suggests:
+ iree-rocket-tools,
 Description: IREE model compiler with the Rockchip RK3588 NPU (Rocket) target
  rocket-compiler compiles ONNX-imported MLIR models into IREE .vmfb modules
  that run convolutions, matmuls, pooling and elementwise work on the RK3588
@@ -39,5 +42,64 @@ Description: IREE model compiler with the Rockchip RK3588 NPU (Rocket) target
  neither conflicts with an upstream IREE installation.
  .
  Compiling does not need the NPU, so the package is useful on a desktop
- that cross-compiles models for the board. Running the modules needs the
- IREE runtime with the Rocket HAL driver, which is not part of this package.
+ that cross-compiles models for the board. Modules run on the IREE runtime
+ of the same version: iree-rocket-tools, or libiree-rocket-runtime314.
+
+# The package name carries the SONAME, which follows IREE's version
+# (rocket-runtime/CMakeLists.txt): libiree_rocket_runtime.so.314 for IREE
+# 3.14. An IREE bump renames this package; debian/rules fails the build if the
+# two disagree.
+Package: libiree-rocket-runtime314
+Section: libs
+Architecture: arm64
+Multi-Arch: same
+Build-Profiles: <!pkg.iree-rocket.noruntime>
+Depends:
+ ${shlibs:Depends},
+ ${misc:Depends},
+Description: IREE runtime with the Rockchip RK3588 NPU (Rocket) HAL driver
+ libiree_rocket_runtime is IREE's runtime, the Rocket HAL driver for the
+ RK3588 NPU (mainline "rocket" accel driver, /dev/accel/accel0) and a small
+ session API (rocket/runtime.h) in one shared library. It runs the .vmfb
+ modules rocket-compiler produces, on the NPU and the CPU together.
+ .
+ Opening the NPU needs read and write access to /dev/accel/accel0, which
+ Debian's udev rules give the "render" group.
+ .
+ This package contains the shared library.
+
+Package: libiree-rocket-runtime-dev
+Section: libdevel
+Architecture: arm64
+Multi-Arch: same
+Build-Profiles: <!pkg.iree-rocket.noruntime>
+Depends:
+ libiree-rocket-runtime314 (= ${binary:Version}),
+ ${misc:Depends},
+Description: IREE runtime with the RK3588 NPU (Rocket) HAL driver - development files
+ libiree_rocket_runtime is IREE's runtime, the Rocket HAL driver for the
+ RK3588 NPU and a small session API (rocket/runtime.h) in one shared library.
+ .
+ This package contains the headers (rocket/runtime.h and IREE's runtime
+ headers, under /usr/include/iree-rocket-runtime), pkg-config files
+ (iree-rocket-runtime, iree-rocket-runtime-static), a CMake package
+ (find_package(IreeRocketRuntime)), the static archive and two samples.
+ The rocket-runtime Rust crate finds the library through pkg-config.
+
+Package: iree-rocket-tools
+Architecture: arm64
+Build-Profiles: <!pkg.iree-rocket.noruntime>
+Depends:
+ ${shlibs:Depends},
+ ${misc:Depends},
+Suggests:
+ rocket-compiler,
+Description: run IREE modules on the Rockchip RK3588 NPU (Rocket)
+ Command-line tools for the .vmfb modules rocket-compiler produces:
+ .
+  * rocket-run-module: runs one function through the libiree-rocket-runtime
+    session API, with the NPU and CPU devices set up the way rocket-compiler
+    expects;
+  * iree-rocket-run-module and iree-rocket-benchmark-module: IREE's
+    iree-run-module and iree-benchmark-module with the Rocket HAL driver
+    linked in, renamed so they never collide with an upstream IREE install.

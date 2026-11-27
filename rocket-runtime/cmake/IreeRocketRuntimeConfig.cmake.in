@@ -5,9 +5,9 @@
 #
 # Relocatable: every path is relative to this file.
 
-get_filename_component(_IREE_ROCKET_PREFIX "${CMAKE_CURRENT_LIST_DIR}/../../.." ABSOLUTE)
-set(_IREE_ROCKET_LIBDIR "${_IREE_ROCKET_PREFIX}/lib")
-set(_IREE_ROCKET_INCLUDEDIR "${_IREE_ROCKET_PREFIX}/include")
+get_filename_component(_IREE_ROCKET_PREFIX "${CMAKE_CURRENT_LIST_DIR}/@_CMAKE_TO_PREFIX@" ABSOLUTE)
+set(_IREE_ROCKET_LIBDIR "${_IREE_ROCKET_PREFIX}/@CMAKE_INSTALL_LIBDIR@")
+set(_IREE_ROCKET_INCLUDEDIR "${_IREE_ROCKET_PREFIX}/@ROCKET_RUNTIME_INSTALL_INCLUDEDIR@")
 
 include(CMakeFindDependencyMacro)
 find_dependency(Threads)

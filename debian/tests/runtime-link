@@ -1,0 +1,25 @@
+#!/bin/sh
+# Link only: embed opens the NPU, which a testbed does not have.
+set -eu
+WORK="${AUTOPKGTEST_TMP:-$(mktemp -d)}"
+SAMPLES=/usr/share/rocket-runtime/samples
+
+for pc in iree-rocket-runtime iree-rocket-runtime-static; do
+  c++ -std=c++17 -O2 "$SAMPLES/embed.cc" $(pkg-config --cflags --libs "$pc") \
+    -o "$WORK/embed-$pc"
+  echo "linked against $pc"
+done
+
+mkdir -p "$WORK/cmake"
+cat > "$WORK/cmake/CMakeLists.txt" <<'CMAKE'
+cmake_minimum_required(VERSION 3.24)
+project(embed CXX)
+find_package(IreeRocketRuntime REQUIRED)
+add_executable(embed /usr/share/rocket-runtime/samples/embed.cc)
+set_target_properties(embed PROPERTIES CXX_STANDARD 17)
+target_link_libraries(embed PRIVATE IreeRocket::runtime)
+CMAKE
+cmake -S "$WORK/cmake" -B "$WORK/cmake/build" -G Ninja >/dev/null
+cmake --build "$WORK/cmake/build" >/dev/null
+echo "linked through find_package(IreeRocketRuntime)"
+echo "runtime-link: ok"
