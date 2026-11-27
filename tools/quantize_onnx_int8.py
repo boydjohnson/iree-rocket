@@ -31,20 +31,24 @@ trusting the flags:
     validated. Activation zero points are free to be non-zero: the compiler
     folds those into a CPU-side correction.
 
-One choice is about speed rather than correctness: Relu is quantized
-alongside Conv (`--quantize-op-types Conv Relu`, the default). For Relu,
-ORT's QOperator quantizer does not emit a quantized op -- it *removes* the
-activation and gives the convolution in front of it the activation's output
-scale and zero point, so the clamp at zero point 0 is the ReLU. (Clip, the
-ReLU6 MobileNetV2 uses, is handled the same way by ORT but has not been
-measured through this stack, so it is not in the default.) Left
-in float, every Conv -> Relu -> Conv edge became QLinearConv -> Dequantize ->
-Relu -> Quantize -> QLinearConv: a CPU requantization pass between every
-pair of offloaded convolutions (33 of them on ResNet50) and no NPU->NPU edge
-anywhere. It also changes the model's numbers (one rounding instead of two),
-so outputs are not comparable with a model quantized without it. A Relu
-whose input is not quantized -- after a residual Add, which stays float --
-is left as it is.
+One choice is about speed rather than correctness: Relu and Clip are
+quantized alongside Conv (`--quantize-op-types Conv Relu Clip`, the
+default). For either, ORT's QOperator quantizer does not emit a quantized op
+-- it *removes* the activation and gives the convolution in front of it the
+activation's output scale and zero point. The uint8 saturation then does
+the clamping: zero point 0 is the ReLU, and for ReLU6 (`Clip(0, 6)`) the top
+of the calibrated range, at most 6, is the upper clamp. Left in float,
+every Conv -> Relu -> Conv edge became QLinearConv -> Dequantize -> Relu ->
+Quantize -> QLinearConv: a CPU requantization pass between every pair of
+offloaded convolutions (33 of them on ResNet50) and no NPU->NPU edge
+anywhere. Folding Relu took ResNet50 from 64.8 to 57.6 ms. Folding Clip
+took MobileNetV2 from 30.0 to 21.0 ms, against 44 ms for its own
+`--no-offload` build (agent-docs/quantization-byo-measured.md). It also
+changes the model's numbers (one rounding instead of two), so outputs are
+not comparable with a model quantized without it. A Relu whose input is not
+quantized -- after a residual Add, which stays float -- is left as it is.
+So is one that ORT's fold would delete without clamping (see
+`unfoldable_activations`).
 
 The batch dimension is pinned to 1 first. Every matcher in the Rocket
 transform spec requires batch 1, so a symbolic-batch model compiles perfectly
@@ -184,6 +188,58 @@ def asymmetric_pad_convs(path: Path) -> list[str]:
                 if pads[:half] != pads[half:]:
                     names.append(node.name)
     return names
+
+
+def unfoldable_activations(path: Path) -> list[tuple[str, str]]:
+    """Conv-fed Relu/Clip nodes that ORT's QOperator fold would silently drop.
+
+    ORT implements the fold in two places that do not check each other.
+    `QLinearActivation` deletes *every* Relu/Clip whose input is a quantized
+    tensor and aliases its output to that input. Only `adjust_tensor_ranges`
+    makes the clamp real, by giving the convolution the activation's
+    calibrated output range so the uint8 saturation does the clamping. And it
+    does that only when the convolution's output has exactly one consumer.
+    Even then, a range always includes 0, so a Clip whose bounds exclude 0
+    (`min > 0` or `max < 0`) loses that bound. In both cases the activation is
+    gone from the model and nothing warns.
+
+    MobileNetV2's ReLU6 is `Clip(0, 6)` on a single-consumer convolution
+    output, so every one of them folds. Returns `(name, reason)` for each node
+    that must stay in float instead.
+    """
+    model = onnx.load(path)
+    initializers = {init.name: init for init in model.graph.initializer}
+    producers = {out: node for node in model.graph.node for out in node.output}
+    consumers: dict[str, int] = {}
+    for node in model.graph.node:
+        for name in node.input:
+            consumers[name] = consumers.get(name, 0) + 1
+
+    def bound(node: onnx.NodeProto, slot: int, attr: str) -> float | None:
+        """A Clip bound as a float, +-inf when absent, None when not constant."""
+        if any(a.name == attr for a in node.attribute):  # opset < 11
+            return next(a.f for a in node.attribute if a.name == attr)
+        if len(node.input) <= slot or not node.input[slot]:
+            return -np.inf if attr == "min" else np.inf
+        init = initializers.get(node.input[slot])
+        return None if init is None else float(numpy_helper.to_array(init))
+
+    unfoldable = []
+    for node in model.graph.node:
+        if node.op_type not in ("Relu", "Clip"):
+            continue
+        producer = producers.get(node.input[0])
+        if producer is None or producer.op_type != "Conv":
+            continue  # input stays float, so ORT keeps the node as it is
+        if consumers.get(node.input[0], 0) != 1:
+            unfoldable.append((node.name, "its input has other consumers"))
+        elif node.op_type == "Clip":
+            low, high = bound(node, 1, "min"), bound(node, 2, "max")
+            if low is None or high is None:
+                unfoldable.append((node.name, "non-constant bounds"))
+            elif low > 0 or high < 0:
+                unfoldable.append((node.name, f"bounds [{low}, {high}] exclude 0"))
+    return unfoldable
 
 
 def share_maxpool_quantization(path: Path) -> int:
@@ -381,10 +437,11 @@ def main() -> None:
     parser.add_argument(
         "--quantize-op-types",
         nargs="+",
-        default=["Conv", "Relu"],
+        default=["Conv", "Relu", "Clip"],
         metavar="OP",
-        help="ONNX op types to quantize (default: Conv Relu). Relu is not a "
-        "quantized op here: ORT folds it into the convolution in front of it, "
+        help="ONNX op types to quantize (default: Conv Relu Clip). Relu and "
+        "Clip (ReLU6) are not quantized ops here: ORT folds each one into the "
+        "convolution in front of it, "
         "which is what lets consecutive offloaded convolutions chain on the "
         "NPU (see the module docstring). Widening further is usually wrong: "
         "QOperator format spells quantized Add/Gemm/pooling as com.microsoft "
@@ -452,6 +509,17 @@ def main() -> None:
             for name in asymmetric:
                 print(f"    {name}")
             excluded.extend(asymmetric)
+
+    if {"Relu", "Clip"} & set(args.quantize_op_types):
+        unfoldable = unfoldable_activations(prepared)
+        if unfoldable:
+            print(
+                f"leaving {len(unfoldable)} activation(s) in float (ORT would "
+                "delete them without applying the clamp):"
+            )
+            for name, reason in unfoldable:
+                print(f"    {name}: {reason}")
+            excluded.extend(name for name, _ in unfoldable)
 
     print(f"quantizing -> {args.output}")
     quantize_static(

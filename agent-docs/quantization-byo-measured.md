@@ -85,6 +85,8 @@ nothing about accuracy.
    its own CPU arm. MobileNetV2 `ours` is only level with its CPU arm, and
    3x slower than fp16. The tool leaves ReLU6 (`Clip`) in float, so every
    MobileNetV2 edge carries a CPU requant. Stock ORT folds `Clip` by itself.
+   (**Since fixed**: `Clip` is in the default now, and MobileNetV2 runs
+   30.0 -> 21.0 ms. See *Folding ReLU6* below.)
 
 5. **Regression found along the way: the int8 residual add no longer reaches
    the NPU.** `ours_skip` gains nothing over `ours`. Recompiling the very
@@ -111,6 +113,89 @@ nothing about accuracy.
      - The Nov-24 model recompiled: 18.9 / 17.8 ms.
      - The `--no-offload` arm is unchanged (1e-7). 0 NPU timeouts.
 
+## Folding ReLU6 (`Clip`) into the conv (2026-11-27, later)
+
+`tools/quantize_onnx_int8.py` now quantizes `Conv Relu Clip` by default, so
+ORT folds MobileNetV2's 35 ReLU6s into the convolutions in front of them,
+just as it already folded `Relu`.
+
+- **How the fold works.** ORT deletes the `Clip` and gives the conv the
+  `Clip`'s calibrated output range. Each of the 35 folded convs gets output
+  zero point 0, and the top of its range is at most 6.0 (4.04 to 6.0 across
+  them). So uint8 saturation does the clamp.
+- **The verify step still passes.** All 52 `QLinearConv`s are per-tensor
+  with zero weight zero points.
+- **The graph after the fold** has 11 `QuantizeLinear` and 16
+  `DequantizeLinear`, down from 45 and 50, and no `Clip`.
+- **ResNet50 is unaffected.** Quantized with the new default, it is
+  byte-identical to the `ours` model above.
+
+**A guard came with it.** ORT's fold is two pieces of code that do not
+check each other:
+
+- `QLinearActivation` deletes *every* Relu or Clip that follows a quantized
+  tensor.
+- `adjust_tensor_ranges` is what makes the clamp real, and it runs only when
+  the conv's output has exactly one consumer.
+- A range always includes 0, so a `Clip` whose bounds exclude 0 also loses
+  that bound.
+
+In both cases the activation is silently gone. `unfoldable_activations`
+leaves such nodes in float. On a three-conv toy (`Clip(1,6)` plus a Relu
+whose input also feeds an Add), ORT alone dropped both clamps, max|err|
+5.33 against float. With the guard, both stay and the error is 0.13.
+MobileNetV2 and ResNet50 have no such node.
+
+**Setup**
+
+- Same source, batch pin and calibration as the table above: 32 synthetic
+  batches, mean 0.45, std 0.225.
+- Compiler: main at `7afc3cd`, using the `libIREECompiler.so` built for #116.
+  Its plugin, `rocket-core` and `rocket-plan-ffi` sources are identical to
+  main's.
+- Board:
+  - governor `performance`, NPU IRQs on cpu6, NPU at 600 MHz;
+  - `--device=rocket --device=local-task --task_topology_cpu_ids=4,5,6,7`;
+  - two interleaved passes, median of 6 repetitions each.
+- **Do not compare these timings with the first table.** That table was
+  measured under `ondemand`.
+- Artifacts: `survey/quant-clip-2026-11-27/` in the main checkout.
+
+| MobileNetV2 int8 | NPU sites / CPU sites | NPU->NPU edges | NPU ms (p1/p2) | own `--no-offload` ms (p1/p2) | top-5 vs ORT | NPU max\|err\| vs ORT |
+|---|---|---|---|---|---|---|
+| `Conv Relu` (old default) | 54 / 91 | 2 | 30.1 / 29.9 | 44.8 / 44.5 | 4 of 5 | 0.093 |
+| `Conv Relu Clip` (new default) | 54 / 78 | 15 | **21.0 / 21.0** | 42.0 / 42.6 | 5 of 5 | 0.050 |
+| fp16 build, for scale | | | 9.8 / 9.4 | | | |
+
+- **Speed.** The fold is 1.43x faster than the old default, and 2.0x faster
+  than its own CPU build (it was 1.5x).
+- **Correctness.**
+  - Both `--no-offload` arms match onnxruntime on their own quantized
+    model exactly (max|err| 0.0000).
+  - The new NPU arm agrees with onnxruntime's top-5 in order.
+  - Its max\|err\| halves, because one rounding is gone from every edge.
+- **The input is synthetic.** Calibration and input are both random, so
+  none of this says anything about accuracy on real images.
+
+**int8 is still 2.2x slower than fp16, and the rest is compiler work.**
+The fold made 13 of the 17 depthwise -> project edges NPU->NPU (the other
+2 of the 15 edges were already there). The remaining edges still run
+through the CPU:
+
+1. **The int8 depthwise pad is not folded.** Each depthwise 3x3 input
+   still goes through a CPU transpose and pad (`transpose_*` plus
+   `slow_memcpy`), so no expand -> depthwise edge chains.
+   - fp16 has this fold (`#rocket_dynamic_depthwise_pad1_relu6_target`,
+     memory `depthwise-pad-fold`: 30.8 -> 13.5 ms).
+   - The int8 requantized depthwise path has no pad-1 target.
+   - This is the biggest remaining item.
+2. **The four stride-2 depthwise convs take the int8 accumulator path**
+   (`rocket_dynamic_depthwise_int8_executable_s2`), so their requantization
+   is a CPU `elementwise_*_i32xi32xi8`. There is no requantized stride-2
+   depthwise target.
+3. **The 10 residual adds stay float.** `--quantize-residual-skip` has not
+   been tried on MobileNetV2.
+
 ## Implications for scope
 
 - **"Bring your own pre-quantized ONNX" does not work today with either
@@ -125,4 +210,5 @@ nothing about accuracy.
 - **The quantizer is part of the product either way.**
   - On both models, its choices (which ops to fold, which scales to share,
     the skip quantization) decide between 65 ms and 245 ms.
-  - Folding `Clip` is a missing default there.
+  - Folding `Clip` was a missing default there. It is the default now:
+    MobileNetV2 runs 30.0 -> 21.0 ms.
