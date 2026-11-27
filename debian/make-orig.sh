@@ -1,13 +1,14 @@
 #!/usr/bin/env bash
-# Builds rocket-compiler_<upstream>.orig.tar.xz from this checkout, for a
-# 3.0 (quilt) source package that builds with no network:
+# Builds <source>_<upstream>.orig.tar.xz (iree-rocket_...) from this checkout,
+# for a 3.0 (quilt) source package that builds with no network:
 #
 #   - this repository at HEAD, minus debian/ (which ships as debian.tar);
 #   - IREE (iree-build/iree-src) at the commit this repository records, with
 #     only the IREE submodules the compiler build reads, each at the commit
 #     IREE records: llvm-project, torch-mlir, flatcc, benchmark, googletest.
-#     The rest (Vulkan, HIP, tracy, stablehlo, ...) are for backends and
-#     tools debian/rules turns off; torch-mlir's own nested externals/ are
+#     The compiler build needs all five and the runtime build (tests off)
+#     the last three. The rest (Vulkan, HIP, tracy, stablehlo, ...) are for
+#     backends and tools debian/rules turns off; torch-mlir's own nested externals/ are
 #     IREE's to replace and are left out too;
 #   - every crate in Cargo.lock, vendored under vendor/ (debian/rules finds
 #     it and builds --offline).
@@ -34,10 +35,11 @@ if [ "${1:-}" = "--stage-only" ]; then
 fi
 OUTDIR="$(realpath -m "${1:-${ROOT}/..}")"
 
+SOURCE="$(dpkg-parsechangelog -S Source)"
 VERSION="$(dpkg-parsechangelog -S Version)"
 UPSTREAM="${VERSION%-*}"
 UPSTREAM="${UPSTREAM#*:}"
-NAME="rocket-compiler-${UPSTREAM}"
+NAME="${SOURCE}-${UPSTREAM}"
 
 IREE_SUBMODULES=(llvm-project torch-mlir flatcc benchmark googletest)
 
@@ -73,7 +75,7 @@ fi
 mkdir -p "${STAGE}"
 
 REV="${REV:-HEAD}"
-echo "rocket-compiler $(git rev-parse --short "${REV}") -> ${STAGE}"
+echo "${SOURCE} $(git rev-parse --short "${REV}") -> ${STAGE}"
 git archive --format=tar "${REV}" -- . ':(exclude)debian' | tar -x -C "${STAGE}"
 
 IREE="iree-build/iree-src"
@@ -106,7 +108,7 @@ if [ -n "${STAGE_ONLY}" ]; then
   exit 0
 fi
 
-TARBALL="${OUTDIR}/rocket-compiler_${UPSTREAM}.orig.tar.xz"
+TARBALL="${OUTDIR}/${SOURCE}_${UPSTREAM}.orig.tar.xz"
 echo "compressing -> ${TARBALL}"
 tar -C "${WORK}" --sort=name --owner=0 --group=0 --numeric-owner \
   --mtime="@$(git log -1 --format=%ct "${REV}")" -cf - "${NAME}" | xz -T0 -6 > "${TARBALL}"
