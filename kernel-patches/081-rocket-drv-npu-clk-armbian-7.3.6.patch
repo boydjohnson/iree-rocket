@@ -86,6 +86,9 @@ Signed-off-by: gregordinary <33880035+gregordinary@users.noreply.github.com>
  the RK3576 series, 2026-11-23. The suspend hunk is hand-merged: that path
  counts clocks with soc->num_clks on this base. Original:
  gregordinary/patches rocket/081-rocket-drv-npu-clk.patch.]
+
+[Boyd Johnson: carried to Armbian 7.3.6-edge-rockchip64, 2026-11-27.
+ The diff is unchanged and applies to 7.3.5 and 7.3.6 alike.]
 ---
  drivers/accel/rocket/rocket_core.c |  54 ++++++++++++--
  drivers/accel/rocket/rocket_core.h |  10 +++
