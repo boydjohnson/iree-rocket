@@ -6,7 +6,10 @@ What it would take to compile a model whose tensor dimensions are symbolic
 2026-09-07 against `main` at `965708a`, which was already three commits behind
 `main` when it was written. Every citation below was re-checked on 2026-09-07
 against `main` at `68f281c` and is given for *that* tree; the review that
-produced the corrections is recorded inline.
+produced the corrections is recorded inline. The line numbers were
+re-pinned on 2026-11-27 against `main` at `ebeb967` (IREE submodule
+`5332c68`, v3.14), with the enclosing function or op named beside each so
+the next drift is easy to repair.
 
 Read alongside the other three. [LIMITS.md](LIMITS.md) says what the stack is
 *measured* to do and which layer enforces each bound; [ISSUES.md](ISSUES.md)
@@ -39,38 +42,42 @@ the executable template and is replaced before validation. `Conv2DDef` adds
 runtime derives them, so no dispatch can state an output shape the register
 program was not built for.
 
-**The serializer** [verified]. [`RocketTarget.cpp:415`](rocket-compiler-plugin/target/Rocket/RocketTarget.cpp:415)
+**The serializer** [verified]. `buildRocketConv2dConfigFromTarget`
+([`RocketTarget.cpp:548`](rocket-compiler-plugin/target/Rocket/RocketTarget.cpp:548))
 parses `runtime_dimensions` off the `#hal.executable.target` config for conv,
-and again at `:732` (pooling), `:840` (element-wise, in the shared
+and so do `buildRocketPoolingConfigFromTarget` (`:865`), the shared
 `parseElementwiseRuntimeDimensions` helper the three element-wise builders
-call) and `:1199` (matmul). It enforces the template contract in both
+call (`:972`) and `buildRocketMatmulConfigFromTarget` (`:1430`). It enforces the template contract in both
 directions: a listed dimension whose
 template value is nonzero is an error, and so is a zero dimension that is not
 listed.
 
 **The transform spec's dispatch helpers** [verified].
-[`@call_rocket_dynamic_conv2d`](rocket-compiler-plugin/target/Rocket/rocket_conv2d_transform_spec.mlir:3279)
+[`@call_rocket_dynamic_conv2d`](rocket-compiler-plugin/target/Rocket/rocket_conv2d_transform_spec.mlir:4618)
 is *already written against* `tensor<1x?x?x?xf16>`. It reads the six settable
 extents with `tensor.dim`, `arith.index_cast`s them to `i32`, and passes them
-as the push constants `#dynamic_pipeline_layout` declares (`constants = 6`).
-Its f32 accumulate epilogue is a properly dynamic `flow.dispatch.workgroups`
-with a three-dimension workload and `iree_tensor_ext.dispatch.workload.ordinal`
-plumbing. The same is true of every other helper: `@call_rocket_matmul` takes
+as the push constants `#dynamic_pipeline_layout` declares (`constants = 7`
+since COMPILER_ROADMAP.md 6.2: the six extents plus the trailing layout
+word). Its f32 accumulate epilogue is a plain `linalg.generic` over the
+dynamic `tensor<1x?x?x?xf32>` -- a `flow.dispatch.workgroups` with
+`dispatch.workload.ordinal` plumbing until ISSUES.md P2 (#39), now left for
+`rocket-pin-unclaimed-dispatches` to keep on the CPU and
+`rocket-fold-neutral-init` to fold. The same is true of every other helper: `@call_rocket_matmul` takes
 `tensor<?x?xf16>` with no static dimension at all, and the pooling and
 element-wise helpers take `tensor<1x?x?x?xf32>` / `tensor<1x?x?xf32>`.
 
 **The runtime** [verified].
-[`Conv2dExecutable::resolve_shape`](rocket-hal-driver/src/executable.rs:237)
+[`Conv2dExecutable::resolve_shape`](rocket-hal-driver/src/executable.rs:319)
 substitutes the push constants into the template per dispatch, derives the
 multiplier from a runtime output scale when one is supplied, and runs
 `validate_conv_shape` on the result. `PoolingExecutable::resolve_shape`
-(`:446`) does the same and derives the output extents with `floor_output_extent`.
+(`:547`) does the same and derives the output extents with `floor_output_extent`.
 Register commands, NC1HWC2 storage sizing and the NHWC pack all happen per
 dispatch in `command_buffer.rs` against the *resolved* shape, not a compiled-in
 one.
 
 **The weight cache does not care** [verified]. `weight_cache::Geometry`
-(`rocket-hal-driver/src/weight_cache.rs:106`) keys on filter height/width,
+(`rocket-hal-driver/src/weight_cache.rs:116`) keys on filter height/width,
 channel counts, element size, depthwise, padded channels, zero point and
 scratch length -- **no spatial extent**. A model whose H/W vary per invocation
 therefore still hits the cache from the second inference onward.
@@ -124,7 +131,7 @@ pooling and element-wise ones. That is not incidental: `spec::neutralize`
 would still fire and quietly corrupt the `--no-offload` baseline.
 
 `MatchDimBoundsOp::matchValue`
-(`iree-build/iree-src/compiler/src/iree/compiler/Preprocessing/TransformExtensions/PreprocessingExtensions.cpp:656`)
+(`iree-build/iree-src/compiler/src/iree/compiler/Preprocessing/TransformExtensions/PreprocessingExtensions.cpp:664`)
 [verified] resolves both ends through
 `ValueBoundsConstraintSet::computeConstantBound`:
 
@@ -192,9 +199,10 @@ Either way the acceptance test is a lit test asserting that a `?`-shaped conv
 
 `transform.iree.match.convolution` builds its dimension params from
 `linalgOp.getStaticLoopRanges()`
-(`PreprocessingExtensions.cpp:562`) [verified], so a dynamic loop range
+(`MatchConvolutionOp::matchOperation`, `PreprocessingExtensions.cpp:570`)
+[verified], so a dynamic loop range
 arrives as `ShapedType::kDynamic` wrapped in an `I64IntegerAttr`.
-`MatchDimsEqualOp` compares with `rhs == -1 || lhs == rhs` (`:614`), which
+`MatchDimsEqualOp::apply` compares with `rhs == -1 || lhs == rhs` (`:622`), which
 means:
 
 - `dims_equal %out_img, [-1, -1]`, `%out_ch, [-1]`, `%in_ch, [-1]` — the `-1`
@@ -238,9 +246,11 @@ it stands rather than a consequence of symbolic shapes.
 
 With symbolic extents there is nothing left to check at compile time. The check
 lands at dispatch, in
-[`validate_conv_shape`](iree-rocket-hal/src/rocket/executable_format.rs:341)
-[verified], which trial-plans the shape under `catch_unwind` and turns a
-planner panic into `Err`. The driver's response is terminal:
+[`validate_conv_shape`](iree-rocket-hal/src/rocket/executable_format.rs:350)
+[verified], which rebuilds the shape through `rocket-core`'s `try_*`
+constructors, trial-plans it with `ConvPlan::try_new` and returns the
+planner's own `PlanError`; `catch_unwind` is kept only as a backstop that
+reports a planner panic as `PlanErrorCode::Internal`. The driver's response is terminal:
 
 ```rust
 let (resolved_shape, kernels) = match executable.resolve_shape(constants) {
@@ -253,7 +263,8 @@ let (resolved_shape, kernels) = match executable.resolve_shape(constants) {
 };
 ```
 
-(`rocket-hal-driver/src/command_buffer.rs:1929`) [verified]. There is **no
+(the `UkernelShape::Conv2d` arm of the dispatch in
+`rocket-hal-driver/src/command_buffer.rs:2508`) [verified]. There is **no
 runtime CPU fallback**. An out-of-envelope invocation is a hard
 `iree-run-module` failure, not a slow success.
 
@@ -339,7 +350,7 @@ if (ShapedType::isDynamic(input) || ShapedType::isDynamic(filter) ||
 }
 ```
 
-([`RocketVerifyConvShapesPass.cpp:110`](rocket-compiler-plugin/target/Rocket/RocketVerifyConvShapesPass.cpp:110))
+([`RocketVerifyConvShapesPass.cpp:299`](rocket-compiler-plugin/target/Rocket/RocketVerifyConvShapesPass.cpp:299))
 [verified] -- and the guard is gone for every op it was written to protect.
 
 The check has to be restated in a shape-independent form: verify that the
@@ -439,7 +450,7 @@ Two smaller consequences of moving the decision to runtime:
 
 ## What this file does not claim
 
-That symbolic shapes are *worth* it. [ISSUES.md P8](ISSUES.md) `:554` measured
+That symbolic shapes are *worth* it. [ISSUES.md P8](ISSUES.md) measured
 the offload's cost as a flat per-dispatch tax *that parallelises*, and its
 constant has moved since: on a full machine the fp16 dense models beat their
 own `--no-offload` baselines, so "more sites is slower" is the starved-core

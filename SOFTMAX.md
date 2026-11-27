@@ -14,8 +14,9 @@ compiler-side plumbing. This file answers
 [`agent-docs/open-questions.md`](agent-docs/open-questions.md) 4.7.2 --
 "which of layernorm/GELU/softmax/transposes have a credible NPU path, given
 that softmax's reductions have no PPU path outside a pooling window" -- and
-contradicts ROADMAP.md's "What this roadmap does not propose" entry for
-`linalg.softmax`, which says to revisit once the pieces exist. They exist.
+contradicted ROADMAP.md's "What this roadmap does not propose" entry for
+`linalg.softmax`, which said to revisit once the pieces exist. They exist,
+and that entry is now struck through as "Revisited and built" (2026-11-27).
 
 Evidence tags follow ISSUES.md: **[verified]** = read in this tree or in a
 cited capture during this design pass; **[hypothesis]** = inference not
@@ -157,7 +158,7 @@ and its output has the same shape as its input.
 | max over tiles | `EwBinaryOp::Max` on two width-1 cubes | **exists**; oracle-checked on `planck` by `ew_binary_hw.rs:346` and again across ViT's shapes at `:421`. The `EwBinaryOp::Max` doc comment still says "not measured here yet" -- that comment is stale and worth deleting. Needed only for §6's fused form; §5.1's combine does not use it |
 | subtract the max | BN ALU operand from NRDMA, per channel | **exists**, as of probe S1: flat IEEE `f32` at `channel * 4`, broadcast over the cube, `bn_plane_probe_hw.rs` |
 | `exp` | DPU LUT, `LutTable::exp_with_decaying_tail(1/20)` into `build_lut_q15_regcmd` | **exists**, int8 in and Q15 `int16` out, measured within **1.12%** total variation of an exact softmax on real ViT-B/16 attention rows (§3.4). The shipped flat tail is 6.69% and unusable |
-| square (range extension) | `EwBinaryOp::Mul` with both operands the same buffer | **exists**, `ew_binary_hw.rs`, `ew_square_hw.rs` |
+| ~~square (range extension)~~ | `EwBinaryOp::Mul` with both operands the same buffer | **exists**, `ew_binary_hw.rs`, `ew_square_hw.rs` -- but no longer a step: §3.2's `1/2`-plus-squaring design was superseded by §3.4's `1/20` with a decaying tail, which needs no squaring (`MEASURED_EXP_INPUT_SCALE`, `rocket-core/src/softmax.rs`) |
 | row sum | depthwise all-ones **3x3 at stride 3** on a height-1 cube; or the all-ones column on the second matmul (§1.1) | **exists**, and exact at atol 0 over `N` 9..512 as a tree in one job, probe S2 (`reduce_width_hw.rs`). The window is 3x3 and not `1 x k` for the reason in §2.2. The avg-pool route is gone at fp16, §2.1 |
 | reciprocal | the **host**: `M` f32 divides on a width-1 vector | **measured** at 0.006 ms for 64 rows, plus one 0.037-0.059 ms submission boundary (S4). The LUT cannot take `d`'s 200:1 range through an int8 input, §4 |
 | divide by the sum | BN MUL operand from NRDMA, per channel | **exists**, as of probe S1: flat IEEE `fp16` at `channel * 2`, shift 0, same file |
@@ -417,7 +418,11 @@ mass against a denominator of at least 1. **The default configuration is
 unusable for softmax**, which is worth saying out loud because `exp()` reads
 as ready.
 
-`input_scale = 1/2` plus one squaring remains the right choice, but the
+~~`input_scale = 1/2` plus one squaring remains the right choice~~
+(**superseded by §3.4**: the op ships `input_scale = 1/20` with
+`exp_with_decaying_tail` and no squaring stage, chosen against real
+attention rows -- `MEASURED_EXP_INPUT_SCALE` in `rocket-core/src/softmax.rs`;
+the arithmetic below stands as a description of the table), but the
 reason given here was wrong and worth correcting rather than deleting. The
 claim was that the useful range is bounded by the Q15 *output* encoding at
 about `x = -10.4` rather than by the input domain, so a wider domain buys
@@ -587,9 +592,17 @@ though, so it is worth being exact about what a `RocketJob` buys.
 has no core field; core assignment is the kernel's, and a file's
 `drm_sched_entity` "picks the least-loaded core only when its own queue is
 empty, so while it has queued jobs it stays put" [verified,
-`submit_jobs`'s doc comment and MULTICORE.md §2]. N tasks in one job buy
-capacity, not parallelism. **N jobs** are what the scheduler can place on
-different cores, and `submit_jobs` exists for exactly that.
+`submit_jobs`'s doc comment and
+[rocket-hal-driver/MULTICORE.md](rocket-hal-driver/MULTICORE.md) §2]. N
+tasks in one job buy capacity, not parallelism. ~~**N jobs** are what the
+scheduler can place on different cores, and `submit_jobs` exists for
+exactly that.~~ Corrected 2026-11-27: N jobs on **one file** still
+serialize onto one core -- one fd is one scheduler entity (ISSUES.md P1),
+and rocket-hal-driver/MULTICORE.md §9's `--shared-fd` control measured 1.00-1.04x for `fc` at
+N=2. What the scheduler places on different cores is **N files**, one
+context each, which is what M0-M2's per-context fan-out does and what
+§5.2's structure B would use. Several jobs on one file buy queue depth on
+that one core, nothing more.
 
 **But intra-job ordering is free, and it is a real dependency edge.** The
 kernel dispatches task `k+1` only after task `k`'s own hardware completion
@@ -604,11 +617,11 @@ hardware-validated instance]. A whole dependent chain is therefore one job.
 file, each file gets a fresh IOMMU domain and `drm_mm`, a BO is mapped into
 exactly one file's domain at `CREATE_BO`, there is no PRIME and no
 `gem_prime_import_sg_table`, and `SUBMIT` resolves handles with
-`drm_gem_objects_lookup(file, ...)` [verified, MULTICORE.md §2 against
+`drm_gem_objects_lookup(file, ...)` [verified, rocket-hal-driver/MULTICORE.md §2 against
 mainline `rocket`]. So the N partial maxima of a fanned-out reduction land in
 N *different* IOVA domains, and no single task can read them. M2 solves the
 same problem for convolution tiles by replicating the inputs per context and
-**gathering on the host** (`compact_atomic_output_rect`, MULTICORE.md §12);
+**gathering on the host** (`compact_atomic_output_rect`, rocket-hal-driver/MULTICORE.md §12);
 there is no device-side alternative.
 
 That rules the plain version of "N buffers, then combine on device" out, and
@@ -676,9 +689,14 @@ different grouping -- and `ROCKET_FANOUT=0` already exists to A/B it.
 
 ### 5.3 The cost of a task is not zero
 
-Every task boundary inside a job costs a completion IRQ, and on `planck` the
+Every task boundary inside a job costs a completion IRQ. ~~On `planck` the
 NPU IRQs land on an A55 while the driver's host work defaults to the slow
-cluster unless pinned (the measurement-environment note in ISSUES.md). A
+cluster unless pinned.~~ Corrected 2026-11-27: the standing board
+configuration puts the NPU IRQs on cpu6, an A76 (ISSUES.md, the measurement-environment entries M1 and M3), the
+driver's host transforms ask for the big cluster by default
+(`rocket-hal-driver/src/cpu_affinity.rs`, opt out with
+`ROCKET_HOST_CPUS=off`), and the M0 pool's workers pin themselves there
+for life (`cpu_affinity::pin_worker`). The IRQ is still paid per task. A
 reduction tree of many tiny tasks pays one IRQ each. Two consequences for
 §7: prefer the widest pooling kernel that the direct path accepts over a
 deeper tree of narrow ones, and prefer the all-ones-column sum of §1.1,
@@ -700,9 +718,14 @@ accumulator.
 
 ```
 M_j = max(M_{j-1}, m_j)                       EwBinaryOp::Max, width-1 cube
-r_j = exp((M_{j-1} - M_j) / 2)^2              EW Sub + LUT + Mul, width-1 cube
+r_j = exp(M_{j-1} - M_j)                      EW Sub + LUT, width-1 cube
 O_j = O_{j-1} * r_j + V_j^T · P_j^T           BN MUL plane on the accumulate
 ```
+
+(`r_j` was first written `exp((M_{j-1} - M_j) / 2)^2`, an EW Sub, LUT and
+`Mul`, for §3.2's halve-then-square design. §3.4 superseded that: the LUT
+runs at `input_scale = 1/20` with a decaying tail and there is no squaring
+step, so the `Mul` is gone. Corrected 2026-11-27.)
 
 with the denominator carried as column `d_v` of `O_j` (§1.1), so the sum
 telescopes through the same recurrence as the output and needs no separate
@@ -758,9 +781,12 @@ pass 3   bridge task 1: int16 -> fp16         [N, M] -> [N, M]
            the operand is 1/d in real units, not 1/d_q15: see §4
 ```
 
-Pass 2's `Mul` and pass 3's multiply are the two dispatches a self-derived
-`EXP_LE` over `[-11, 0]` and a fused epilogue would remove; both are
-optimisations with the primitive set unchanged.
+~~Pass 2's `Mul` and pass 3's multiply are the two dispatches a self-derived
+`EXP_LE` over `[-11, 0]` and a fused epilogue would remove~~ -- pass 2 no
+longer has a `Mul` (2026-11-27): §3.4's `1/20` tail replaced the squaring
+step, so a self-derived `EXP_LE` has nothing left to remove there. Pass 3's
+multiply is the one a fused epilogue would remove, an optimisation with the
+primitive set unchanged.
 
 A note on the plane operands' formats, now measured rather than assumed
 (S1). Pass 2's ALU plane is **one `f32` per programmed channel, dense at
@@ -1036,7 +1062,8 @@ costs §4 and §5 argue about reported before anything runs. Column tiling
 stays with the planners that own it, `PoolingPlan` for a max level and
 `ConvPlan` for a sum level, as `fc` delegates to `conv`. Its refusals mark
 where the *measurement* stops rather than where the hardware does -- an
-`exp_input_scale` other than §3.4's `1/20`, more than 64 rows, more than
+`exp_input_scale` other than §3.4's `1/20`, more than 64 rows (raised to
+1792, `conv::MAX_DEPTHWISE_CHANNELS`, by lever 1 in #88 -- §10.3), more than
 512 keys -- and all three come back `UnvalidatedConfiguration`.
 
 `iree_rocket_hal::rocket::softmax` emits them and owns the two things a
@@ -1226,7 +1253,9 @@ depthwise convolution, so its channel count *is* the row count, and
 `conv::MAX_DEPTHWISE_CHANNELS` is 1792. That is 9 ViT-B heads, so a 12-head
 layer wants two passes -- and 6 + 6 rather than 9 + 3, since both halves
 should sit well past the crossover. §10.1's lever 2 would lift the ceiling
-outright by moving the sum onto the PV matmul, whose dense ceiling is 3584.
+outright by moving the sum onto the PV matmul, whose dense ceiling was 3584
+when this was written and is 4096 now (`MAX_INPUT_CHANNELS`,
+`rocket-core/src/conv.rs`).
 
 ### 10.4 Two reasons not to believe the 1.7x -- the first one held
 
@@ -1237,7 +1266,7 @@ the NPU a loss again at every shape that fits. The comparison measured here
 is *one NPU core against one CPU core*, and nothing in it says what happens
 on a full machine. The NPU has three cores too, so the honest next
 measurement is a threaded CPU arm against a fanned-out NPU arm, and
-MULTICORE.md §12's tile fan-out plus §10.1's lever 4 are how the second
+rocket-hal-driver/MULTICORE.md §12's tile fan-out plus §10.1's lever 4 are how the second
 half of that would work.
 
 **Measured, in §13, and this prediction was right to the decimal.** Four
@@ -1252,8 +1281,9 @@ roughly 1.24x.
 
 So the result is not "softmax belongs on the NPU". It is: **the per-task
 cost was the whole problem, batching rows is the cure, and whether the cure
-is enough depends on a comparison nobody has made yet.** The op still ships
-off by default.
+is enough depends on a comparison nobody has made yet.** §13 has since made
+it: against four threads the cure is not enough. The op still ships off by
+default.
 
 ### 10.1 Which levers are left
 
@@ -1278,7 +1308,8 @@ Not accuracy, and not the host. Task count:
   path, and coefficient packing runs at 214 MB/s, making `P^T` 3.2x the
   saving. §11.4 shows the same byte order written as strided runs at 1,602
   MB/s, which turns the loss into a 0.42x win, so the lever is real and
-  gated on the packer rather than on the hardware. ISSUES C15 is still
+  gated on the packer rather than on the hardware. That gate passed
+  2026-11-24, when the strided packer landed (§11.5). ISSUES C15 is still
   upstream of all of it.
 
 ### 10.2 What this means for the op
@@ -1669,7 +1700,8 @@ The max tree stays, at 4 tasks. Of §10.1's levers:
 
 * lever 1 is done and flipped the sign;
 * lever 2's mechanism is confirmed and free, gated on the coefficient
-  packer (§11);
+  packer (§11) -- a gate that has since passed: the packer landed
+  2026-11-24 (§11.5);
 * **lever 3 is closed negative** -- not "needs calibration work", closed:
   §12.1's spread is a property of attention, not of this implementation,
   and no amount of tuning closes two orders of magnitude;
@@ -1741,21 +1773,40 @@ threads. Projecting from the measured per-task cost, labelled as projection:
 | | ms at 1792 rows | us a row | vs CPU-4 |
 |---|---|---|---|
 | today | 1.908 | 1.07 | 2.42x slower |
-| + lever 2 (sum tree gone, 8 of 19 tasks) | 0.803 | 0.45 | **1.02x, parity** |
-| + lever 4 at M2's measured 1.28x | 0.627 | 0.35 | 1.25x faster |
-| ...against CPU-4 with P10's 1.39x collected | 0.627 | 0.35 | 1.11x slower |
+| ~~+ lever 2 (sum tree gone, 8 of 19 tasks)~~ | ~~0.803~~ | ~~0.45~~ | ~~1.02x, parity~~ |
+| ~~+ lever 4 at M2's measured 1.28x~~ | ~~0.627~~ | ~~0.35~~ | ~~1.25x faster~~ |
+| ~~...against CPU-4 with P10's 1.39x collected~~ | ~~0.627~~ | ~~0.35~~ | ~~1.11x slower~~ |
+| + lever 2, sum tree gone, `P^T` packed at loop rate | 1.240 | 0.69 | 1.58x slower |
+| + lever 2, `P^T` packed at §11.5's in-situ rate | 1.619 | 0.90 | 2.06x slower |
+| + lever 4 at M2's 1.28x, on the loop-rate row | 0.969 | 0.54 | 1.23x slower |
+| ...against CPU-4 with P10's 1.39x collected | 0.969 | 0.54 | 1.71x slower |
+
+**Corrected 2026-11-27: the struck rows omitted lever 2's own cost.** They
+removed the sum tree's 11 of 19 tasks (1.908 x 11/19 = 1.105 ms, about
+0.12 ms a head) and billed nothing for the `P^T` coefficient pack that
+§11.3-§11.5 charge to exactly this lever. At 1792 rows that is 1792 / 197 =
+9.1 heads of `[197, 197]` packs: 9.1 x 0.048 ms = 0.44 ms at
+`weight_pack_rate_hw`'s loop rate, or 9.1 x 0.090 = 0.82 ms at the 4.13x
+§11.5 measured in situ instead of 7.72x. Net, lever 2 saves 0.67 ms at best
+and 0.29 ms at worst, not 1.1. The lever-4 rows divide the whole figure by
+1.28, which flatters them, since the pack is host work no NPU core
+fan-out touches.
 
 Two things that falls out of, both worth stating plainly:
 
 **Fan-out alone cannot close this.** Lever 4 would need 2.42x and
-MULTICORE.md §12's tile fan-out measured 1.22x to 1.34x on ViT. So lever 4
+rocket-hal-driver/MULTICORE.md §12's tile fan-out measured 1.22x to 1.34x on ViT. So lever 4
 is not the answer to this gap, which is the reason it was not attempted
 here.
 
-**And lever 2 plus lever 4 together land at roughly parity**, because
+~~**And lever 2 plus lever 4 together land at roughly parity**, because
 ISSUES P10's remaining 1.39x on the CPU side cancels most of what lever 4
-buys. Parity is not worth a 1.12% accuracy cost, three submissions, two
-host boundaries and a calibration surface.
+buys.~~ **Corrected 2026-11-27: with `P^T`'s pack billed, they do not reach
+parity.** Lever 2 alone lands 1.6x to 2.1x slower than CPU-4, and levers 2
+and 4 together 1.23x slower even at the loop-rate pack with fan-out
+generously applied to host work -- 1.7x slower once P10 is collected. Even
+parity would not have been worth a 1.12% accuracy cost, three submissions,
+two host boundaries and a calibration surface.
 
 ### 13.2 Three caveats, one of which favours the op
 
@@ -1786,7 +1837,9 @@ one. The honest summary of this whole arc:
 > work that threads perfectly. Lever 1 was real -- batching rows took the
 > per-row cost from 7.7 to 1.07 microseconds -- but it was racing a
 > one-core baseline. No remaining lever closes the gap against a full
-> machine; levers 2 and 4 together reach parity.
+> machine; ~~levers 2 and 4 together reach parity~~ levers 2 and 4
+> together still leave it 1.2x to 1.7x slower once lever 2's `P^T` pack is
+> billed (§13.1, corrected 2026-11-27).
 
 What the work is actually worth is unchanged and is not small: every
 mechanism in it is measured, general and reusable -- the two operand
