@@ -315,7 +315,7 @@ between the pad and the conv, so `rocket-fold-conv-pad` never saw the pad.
   format ORT offers.** QOperator fails to build. QDQ builds, then runs
   slower than fp16, and on MobileNetV2 slower than the CPU.
 - **The highest-value compiler item is a QDQ -> requantized-conv
-  rewrite**: `Q(conv(DQ(x), DQ(w)) + b)` into the canonical form
+  rewrite** (done: `rocket-fuse-qdq-conv`, measured in the next section): `Q(conv(DQ(x), DQ(w)) + b)` into the canonical form
   `rocket-fuse-int8-requant-epilogue` already produces. QDQ is ORT's default
   and the common interchange format. Per-channel weight scales come right
   behind: the BS plane can carry them (`iree-rocket-hal/src/rocket/conv.rs`,
@@ -326,3 +326,114 @@ between the pad and the conv, so `rocket-fold-conv-pad` never saw the pad.
   - Folding `Clip` was a missing default there. It is the default now:
     MobileNetV2 runs 30.0 -> 21.0 ms, and 9.1 ms with the int8 depthwise
     pad fold.
+
+## Follow-up: `rocket-fuse-qdq-conv` (2026-11-27)
+
+A plugin pass (`rocket-compiler-plugin/target/Rocket/RocketFuseQdqConvPass.cpp`)
+now rewrites `Q(conv(DQ(x), DQ(w)) + DQ(b))` into the canonical requantized
+int8 form, so the `rocket_dynamic_int8_requant*` matchers claim QDQ
+convolutions the way they claim QOperator ones.
+
+- **Where:** in the spec, right before `rocket-fuse-int8-requant-epilogue`
+  (after the channels-last conversion, before the match loops). It anchors on
+  `iree_linalg_ext.quantize_affine`.
+- **What it emits:** an i8 x i8 -> i32 `conv_2d_nhwc_hwcf` over a zero init,
+  a rank-1 folded bias `bq - zx * sum_k(w)` (constant-evaluated later), and
+  the one canonical requant generic with `scale = sx * sw / sy`.
+  - A padded input pads its codes with `zx`. The channels-last conversion's
+    rank-5 `expand -> pad -> collapse` is rebuilt as one rank-4 NHWC pad,
+    because the int8 pad1 template only claims that form. The first version
+    kept the rank-5 spelling, and every 3x3 fell to `int8_accumulator`.
+  - S8S8 (ORT's default) uses the codes as they are. U8S8 gets the same
+    `addi -128` shifts the QOperator passes use.
+- **Declined, so those convs keep the fp16 path:**
+  - per-channel weight scales (the executable ABI's `output_scale` is one
+    value; see Implications above);
+  - a nonzero weight zero point;
+  - a bias scale that is not `sx * sw` (checked to 2^-20 relative);
+  - any clamp range narrower than the full 8-bit one.
+- **Not covered:** depthwise convolutions. They stay
+  `depthwise_conv_2d_nchw_chw` in f32 after channels-last, and there is no
+  requantized depthwise target for pad 1 or stride 2, which is every
+  MobileNetV2 depthwise conv.
+- **Lit:** `rocket_fuse_qdq_conv.mlir` (the pass alone: S8S8, U8S8 with the
+  rank-5 pad, zero input zero point, and the per-channel and bias-scale
+  declines) and `rocket_qdq_conv_match.mlir` (the importer's NCHW form
+  through the whole spec onto `int8_requant` and `int8_requant_pad1`, plus a
+  per-channel case that stays fp16). All 57 plugin lit tests pass.
+
+### Placement (`rocket-compiler`, same `ort_qdq` imports as above)
+
+| model | conv precision | Rocket sites | CPU sites before -> after |
+|---|---|---|---|
+| ResNet50 | 53/53 dense convs int8, on the 4 requant executables (plain, s2, pad1, pad1_s2), the same set `ours` uses | 56 | 120 -> 25 |
+| MobileNetV2 | 35/35 dense convs int8; the 17 depthwise stay fp16 | 54 | 127 -> 84 |
+
+ResNet50's 25 CPU sites are 20 `elementwise_transpose`, 4 `elementwise` and
+1 `slow_memcpy`. They are mostly the 16 residual adds, which still run as
+`DQ -> add -> Q` in float. `ours` has 27.
+
+### Board timing
+
+Setup:
+- orangepi, 7.3.6, patched `rocket.ko`, NPU at 600 MHz, governor
+  `performance`, NPU IRQs on cpu6, `--task_topology_cpu_ids=4,5,6,7`.
+- `iree-benchmark-module`, 7 repetitions with the first dropped. Two
+  interleaved passes, each run gated on no other `iree-*` process on the
+  board (a survey run had contaminated a first attempt).
+- `old` rows are the modules from the table above, re-timed here under
+  `performance`.
+
+| model | arm | ms (pass 1 / 2) |
+|---|---|---|
+| ResNet50 | `ort_qdq` NPU, **this pass** | **51.2 / 50.7** |
+| ResNet50 | `ort_qdq` NPU, old (fp16 convs) | 136 / 137 |
+| ResNet50 | `ort_qdq` `--no-offload`, this pass | 389 / 391 |
+| ResNet50 | `ours` NPU (`tools/quantize_onnx_int8.py` defaults) | 35.1 / 38.2 |
+| ResNet50 | `ours_skip` NPU (`--quantize-residual-skip`) | 17.1 / 18.8 |
+| MobileNetV2 | `ort_qdq` NPU, **this pass** | **37.6 / 37.9** |
+| MobileNetV2 | `ort_qdq` NPU, old | 50.9 / 50.4 |
+| MobileNetV2 | `ort_qdq` `--no-offload`, this pass | 43.2 / 43.6 |
+| MobileNetV2 | `ours` NPU | 29.4 / 29.9 |
+
+- **ResNet50 QDQ: 2.7x faster than before and 7.6x faster than its own
+  `--no-offload` build.** It is still 1.4x behind `ours` and 2.9x behind
+  `ours_skip`.
+- **MobileNetV2 QDQ now beats its own CPU build** (1.15x; it was 1.45x
+  slower). It is 1.27x behind `ours`.
+- The `--no-offload` arm runs the rewrite too, so it is an int8 CPU
+  baseline. The old fp32-fake-quant CPU arm is not comparable (it was timed
+  under `ondemand`).
+
+### Accuracy
+
+Against onnxruntime on the same QDQ model:
+- the import's own input, plus 4 synthetic inputs (mean 0.45, sd 0.225);
+- NPU and `--no-offload` arms.
+
+Results:
+- **argmax equal on all 10 NPU runs.**
+- ResNet50 max|d| 0.10-0.20 against a logit sd of about 0.95. MobileNetV2
+  max|d| 0.064-0.086 against an sd of about 0.79.
+- That is 1 to 4 steps of the model's own output quantization (about 0.05).
+  The int8 `--no-offload` arm is in the same range: 0.15-0.25 on ResNet50,
+  where it misses one argmax on a near-tie.
+- The old fp16 path scored 0.18 on the import's input; this pass scores 0.20.
+- `ours` recompiled with this pass is bit-identical in output to the #116
+  build, so the QOperator path is untouched.
+
+### What is left, by expected size
+
+1. **QDQ residual add.** ORT folds the ReLU into the add's QuantizeLinear
+   (zero point = quant_min), and the activations are signed. So
+   `rocket-fuse-int8-residual-add`, which wants `ui8` and an explicit ReLU,
+   matches none of ResNet50's 16 adds. `ours` vs `ours_skip` puts this at
+   about 2x on ResNet50.
+2. **QDQ max pool**: the same signedness gap in `rocket-fuse-int8-max-pool`.
+   The stem pool runs fp16 between a CPU Q/DQ pair.
+3. **QDQ depthwise**: needs requantized depthwise targets for pad 1 and
+   stride 2 first. That is MobileNetV2's remaining gap to `ours`, which
+   reaches the depthwise convs through `int8_requant` and
+   `int8_accumulator s2`.
+4. **Per-channel weight scales**: an executable-ABI change (above).
+

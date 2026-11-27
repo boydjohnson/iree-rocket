@@ -12918,8 +12918,17 @@ module attributes {transform.with_named_sequence} {
     // chain) and after the channels-last conversion (it matches
     // `linalg.conv_2d_nhwc_hwcf`, and an NCHW convolution is not that op), and
     // before the match loops that claim convolutions.
+    // An ONNX QDQ convolution -- Q(conv(DQ(x), DQ(w)) + DQ(b)), what ORT's
+    // `quantize_static` writes by default -- straight into the same canonical
+    // form, with per-tensor scales. Same position and the same constraints:
+    // after the channels-last conversion, before the match loops. The two
+    // passes never see the same convolution: this one matches an f32
+    // convolution between affine quantization ops, the next an i32 one.
+    %qdq_fused_funcs = transform.apply_registered_pass
+        "rocket-fuse-qdq-conv" to %canonical_funcs
+      : (!transform.any_op) -> !transform.any_op
     %requant_fused_funcs = transform.apply_registered_pass
-        "rocket-fuse-int8-requant-epilogue" to %canonical_funcs
+        "rocket-fuse-int8-requant-epilogue" to %qdq_fused_funcs
       : (!transform.any_op) -> !transform.any_op
     // A quantized residual tail, Q(relu(DQ(a) + DQ(b))), into the canonical
     // signed NHWC form @match_elementwise_add_int8_relu claims. After the
