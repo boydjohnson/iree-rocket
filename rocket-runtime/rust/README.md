@@ -58,7 +58,7 @@ ROCKET_RUNTIME_DIR=/tmp/pkg cargo test --features half
 
 Linking is dynamic only. The package's static archive carries the Rocket
 driver's own copy of the Rust standard library, which would collide with yours.
-Ship `libiree_rocket_runtime.so.0` beside your binary, with an `$ORIGIN` rpath,
+Ship `libiree_rocket_runtime.so.<N>` (`.so.314` for IREE 3.14) beside your binary, with an `$ORIGIN` rpath,
 or on the loader path. This crate's own tests and examples get an rpath to the
 package automatically.
 

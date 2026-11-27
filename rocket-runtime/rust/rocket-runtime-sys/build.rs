@@ -98,17 +98,18 @@ fn main() {
     .expect("writing allocator_system.rs");
 }
 
-/// An unpacked package: `include/` and `lib/` under one prefix. The
-/// compile definitions come from the package's own .pc file, read directly so
-/// no pkg-config binary or configuration is needed.
+/// An unpacked package: `include/iree-rocket-runtime/` and `lib/` under one
+/// prefix. The compile definitions come from the package's own .pc file, read
+/// directly so no pkg-config binary or configuration is needed.
 fn from_prefix(prefix: &Path) -> Package {
-    let include = prefix.join("include");
+    let include = prefix.join("include/iree-rocket-runtime");
     let lib_dir = prefix.join("lib");
     let pc = lib_dir.join("pkgconfig/iree-rocket-runtime.pc");
     assert!(
         include.join("rocket/runtime.h").is_file(),
-        "ROCKET_RUNTIME_DIR={} has no include/rocket/runtime.h; point it at an \
-         unpacked IreeRocketRuntime package (the directory holding include/ and lib/)",
+        "ROCKET_RUNTIME_DIR={} has no include/iree-rocket-runtime/rocket/runtime.h; \
+         point it at an unpacked IreeRocketRuntime package (the directory holding \
+         include/ and lib/)",
         prefix.display()
     );
     println!("cargo:rerun-if-changed={}", pc.display());

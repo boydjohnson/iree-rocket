@@ -35,8 +35,10 @@ set(IREE_BUILD_COMPILER OFF CACHE BOOL "" FORCE)
 # ON so the HAL CTS (runtime/src/iree/hal/cts) gets built -- see
 # rocket-hal-driver/cts/ for the "rocket" backend registration linked into
 # it below. Pulls in the rest of IREE's own unit test suite too; that's an
-# accepted cost of using IREE_BUILD_TESTS as the CTS gate.
-set(IREE_BUILD_TESTS ON CACHE BOOL "" FORCE)
+# accepted cost of using IREE_BUILD_TESTS as the CTS gate. OFF builds only the
+# runtime, its tools and rocket-runtime (same switch as host-aarch64).
+option(ROCKET_BUILD_TESTS "Build IREE's runtime tests and the rocket HAL CTS" ON)
+set(IREE_BUILD_TESTS ${ROCKET_BUILD_TESTS} CACHE BOOL "" FORCE)
 set(IREE_BUILD_SAMPLES OFF CACHE BOOL "" FORCE)
 set(IREE_BUILD_DOCS OFF CACHE BOOL "" FORCE)
 set(IREE_HAL_DRIVER_VULKAN OFF CACHE BOOL "" FORCE)
@@ -64,7 +66,9 @@ add_subdirectory("${IREE_SOURCE_DIR}" "${CMAKE_CURRENT_BINARY_DIR}/iree")
 # categories (buffer/command_buffer/core/file/queue) against the real
 # driver. See rocket-hal-driver/cts/backends.cc for why no executable
 # categories are built (no compiler side needed).
-add_subdirectory("${ROCKET_HAL_DRIVER_DIR}/cts" "${CMAKE_CURRENT_BINARY_DIR}/rocket-cts")
+if(ROCKET_BUILD_TESTS)
+  add_subdirectory("${ROCKET_HAL_DRIVER_DIR}/cts" "${CMAKE_CURRENT_BINARY_DIR}/rocket-cts")
+endif()
 
 # The embeddable runtime: rocket/runtime.h, libiree_rocket_runtime.so and the
 # IreeRocketRuntime install component (see rocket-runtime/CMakeLists.txt).

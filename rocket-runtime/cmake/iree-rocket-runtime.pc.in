@@ -1,6 +1,6 @@
-prefix=${pcfiledir}/../..
-libdir=${prefix}/lib
-includedir=${prefix}/include
+prefix=${pcfiledir}/@_PC_TO_PREFIX@
+libdir=${prefix}/@CMAKE_INSTALL_LIBDIR@
+includedir=${prefix}/@ROCKET_RUNTIME_INSTALL_INCLUDEDIR@
 
 Name: iree-rocket-runtime
 Description: IREE runtime with the Rocket (RK3588 NPU) HAL driver, shared library
