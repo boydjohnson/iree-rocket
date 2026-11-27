@@ -9,6 +9,7 @@
 /iree-build/build/
 /iree-build/host/build/
 /iree-build/host-aarch64/build/
+/iree-build/host-aarch64/build-vulkan/
 /iree-build/host/build-aarch64/
 
 # lit test run artifacts

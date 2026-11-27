@@ -39,7 +39,12 @@ set(IREE_BUILD_COMPILER OFF CACHE BOOL "" FORCE)
 set(IREE_BUILD_TESTS ON CACHE BOOL "" FORCE)
 set(IREE_BUILD_SAMPLES OFF CACHE BOOL "" FORCE)
 set(IREE_BUILD_DOCS OFF CACHE BOOL "" FORCE)
-set(IREE_HAL_DRIVER_VULKAN OFF CACHE BOOL "" FORCE)
+# Opt-in Vulkan HAL driver, for the Mali-G610 through Mesa panvk. It is OFF by
+# default because the host iree-compile is built without the vulkan-spirv
+# target, so the Vulkan executable tests cannot be generated. Build only the
+# tool targets (iree-run-module, iree-benchmark-module) with it ON.
+option(ROCKET_WITH_VULKAN "Also build IREE's Vulkan HAL driver" OFF)
+set(IREE_HAL_DRIVER_VULKAN ${ROCKET_WITH_VULKAN} CACHE BOOL "" FORCE)
 # iree_check_test_suite() normally skips generating a check-test module for
 # backends whose HAL driver is disabled (see the driver-availability check in
 # build_tools/cmake/iree_check_test.cmake), but this flag (IREE default: ON)
