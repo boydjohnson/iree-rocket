@@ -52,3 +52,9 @@ jobs:
 
       - name: cargo fmt --check
         run: cargo fmt --all -- --check
+
+      # The Rust bindings are their own workspace (they need the installed
+      # runtime package to build, which CI does not have), so the root
+      # workspace's fmt above does not reach them. Formatting needs no package.
+      - name: cargo fmt --check (rocket-runtime/rust)
+        run: cargo fmt --manifest-path rocket-runtime/rust/Cargo.toml --all -- --check

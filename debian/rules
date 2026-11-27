@@ -1,0 +1,135 @@
+#!/usr/bin/make -f
+# rocket-compiler: a Rust executable that dlopens a private, Rocket-enabled
+# build of IREE's libIREECompiler.so. Two builds, one package:
+#
+#   1. IREE (LLVM + MLIR + the rocket-compiler-plugin target) with CMake, for
+#      libIREECompiler.so and iree-lld. Hours on a cold tree. Set
+#      ROCKET_IREE_BUILD_DIR to an existing compiler-host build (the layout
+#      iree-build/configure-compiler-host.sh produces, lib/ and tools/) to
+#      package that instead; see debian/README.source.
+#   2. rocket-compiler with cargo, with the install paths baked in
+#      (ROCKET_COMPILER_LIBDIR / ROCKET_COMPILER_DATADIR, read by
+#      rocket-compiler/src/main.rs), so the installed binary needs no
+#      environment and no flags.
+
+export DH_VERBOSE ?=
+export DEB_BUILD_MAINT_OPTIONS = hardening=+all
+# LLVM built with -g is several GB of DWARF; the -dbgsym package would dwarf
+# the real one and dh_strip takes an age over it. The Rust binary keeps the
+# workspace's `debug = true` and its symbols go to -dbgsym as usual.
+export DEB_CFLAGS_MAINT_STRIP = -g
+export DEB_CXXFLAGS_MAINT_STRIP = -g
+
+include /usr/share/dpkg/architecture.mk
+include /usr/share/dpkg/buildopts.mk
+include /usr/share/dpkg/pkg-info.mk
+
+PKG      := rocket-compiler
+DESTDIR  := $(CURDIR)/debian/$(PKG)
+PRIVLIB  := /usr/lib/$(DEB_HOST_MULTIARCH)/rocket-compiler
+DATADIR  := /usr/share/rocket-compiler
+SPEC_SRC := rocket-compiler-plugin/target/Rocket/rocket_conv2d_transform_spec.mlir
+
+# Use a prebuilt IREE tree when one is given, else build our own beside the
+# usual debhelper obj- directory (never iree-build/build, which is the
+# developer's).
+ifneq ($(ROCKET_IREE_BUILD_DIR),)
+IREE_BUILD    := $(abspath $(ROCKET_IREE_BUILD_DIR))
+IREE_PREBUILT := yes
+else
+IREE_BUILD    := $(CURDIR)/obj-$(DEB_HOST_GNU_TYPE)
+IREE_PREBUILT :=
+endif
+
+JOBS := $(if $(DEB_BUILD_OPTION_PARALLEL),-j$(DEB_BUILD_OPTION_PARALLEL),)
+
+# Cargo: private home and target dir, so a build never touches ~/.cargo or
+# the checkout's target/. The orig tarball carries vendor/ (see
+# debian/make-orig.sh); a plain git checkout has none and fetches instead.
+export CARGO_HOME       := $(CURDIR)/debian/cargo-home
+export CARGO_TARGET_DIR := $(CURDIR)/debian/cargo-target
+CARGO_OFFLINE := $(if $(wildcard $(CURDIR)/vendor/.),--offline,)
+export RUSTFLAGS := -C link-arg=-Wl,-z,relro,-z,now
+export ROCKET_COMPILER_LIBDIR  := $(PRIVLIB)
+export ROCKET_COMPILER_DATADIR := $(DATADIR)
+RC_BIN := $(CARGO_TARGET_DIR)/release/rocket-compiler
+
+%:
+	dh $@
+
+override_dh_auto_configure:
+ifeq ($(IREE_PREBUILT),)
+	IREE_BUILD_DIR=$(IREE_BUILD) ./iree-build/configure-compiler-host.sh \
+	  -DCMAKE_BUILD_TYPE=Release \
+	  -DIREE_BUILD_TESTS=OFF \
+	  -DIREE_BUILD_SAMPLES=OFF \
+	  -DIREE_BUILD_DOCS=OFF \
+	  -DIREE_ERROR_ON_MISSING_SUBMODULES=OFF \
+	  $(ROCKET_IREE_CMAKE_ARGS)
+endif
+	mkdir -p $(CARGO_HOME)
+ifneq ($(CARGO_OFFLINE),)
+	printf '[source.crates-io]\nreplace-with = "vendored-sources"\n\n[source.vendored-sources]\ndirectory = "%s"\n' \
+	  "$(CURDIR)/vendor" > $(CARGO_HOME)/config.toml
+endif
+
+override_dh_auto_build:
+ifeq ($(IREE_PREBUILT),)
+	cmake --build $(IREE_BUILD) $(JOBS) --target iree-compile iree-lld
+endif
+	cargo build -p rocket-compiler --release --locked $(CARGO_OFFLINE) $(JOBS)
+	help2man --no-info --no-discard-stderr --version-string=$(DEB_VERSION_UPSTREAM) \
+	  --name="compile models for the RK3588 NPU with IREE" \
+	  --output=debian/rocket-compiler.1 $(RC_BIN)
+
+# The unit tests, then one real compile through the library this package
+# ships: a spec the library cannot parse (the IREE 3.14 bump broke exactly
+# this) fails the build rather than the user's first model.
+override_dh_auto_test:
+ifeq ($(filter nocheck,$(DEB_BUILD_OPTIONS)),)
+	cargo test -p rocket-compiler --release --locked $(CARGO_OFFLINE) $(JOBS)
+	$(RC_BIN) compile \
+	  --iree-compiler-lib $(IREE_BUILD)/lib/libIREECompiler.so \
+	  --transform-spec $(SPEC_SRC) \
+	  --input rocket-compiler-plugin/test/rocket_conv_layout.mlir \
+	  --output $(CARGO_TARGET_DIR)/smoke.vmfb \
+	  --llvmcpu-target-triple aarch64-linux-gnu
+	test -s $(CARGO_TARGET_DIR)/smoke.vmfb
+endif
+
+# Every path here is read by something at run time:
+#   PRIVLIB/libIREECompiler.so  rocket-compiler (ROCKET_COMPILER_LIBDIR)
+#   PRIVLIB/iree-lld            libIREECompiler.so looks beside itself first
+#                               (IREE's findToolFromDylibDir); RUNPATH
+#                               rewritten from the build tree to $ORIGIN
+#   DATADIR/<spec>              rocket-compiler (ROCKET_COMPILER_DATADIR)
+override_dh_auto_install:
+	install -D -m 0755 $(RC_BIN) $(DESTDIR)/usr/bin/rocket-compiler
+	install -D -m 0644 $(IREE_BUILD)/lib/libIREECompiler.so \
+	  $(DESTDIR)$(PRIVLIB)/libIREECompiler.so
+	install -D -m 0755 $(IREE_BUILD)/tools/iree-lld $(DESTDIR)$(PRIVLIB)/iree-lld
+	patchelf --set-rpath '$$ORIGIN' $(DESTDIR)$(PRIVLIB)/iree-lld
+	install -D -m 0644 $(SPEC_SRC) $(DESTDIR)$(DATADIR)/rocket_conv2d_transform_spec.mlir
+
+# The library is private, so dpkg-shlibdeps has to be told where iree-lld's
+# NEEDED libIREECompiler.so lives; it then resolves the library's own
+# dependencies (libstdc++, libc) like any other.
+override_dh_shlibdeps:
+	dh_shlibdeps -l$(DESTDIR)$(PRIVLIB)
+
+# dwz runs out of memory or gives up on the Rust binary's DWARF; it would
+# save little on a package dominated by a stripped 300 MB library anyway.
+override_dh_dwz:
+
+# dh_clean deletes every *.orig in the tree, and cargo checksums each vendored
+# crate's Cargo.toml.orig: losing them breaks the next --offline build.
+override_dh_clean:
+	dh_clean -XCargo.toml.orig
+
+# There is no autotools build here, but LLVM and IREE carry config.guess and
+# config.sub files that these would otherwise rewrite in place.
+override_dh_update_autotools_config override_dh_autoreconf:
+
+override_dh_auto_clean:
+	rm -rf $(CURDIR)/obj-$(DEB_HOST_GNU_TYPE) $(CARGO_HOME) $(CARGO_TARGET_DIR) \
+	  debian/rocket-compiler.1

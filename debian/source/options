@@ -1,0 +1,8 @@
+# Build trees a developer checkout may hold; never part of the source package.
+tar-ignore = target
+tar-ignore = iree-build/build
+tar-ignore = iree-build/host/build
+tar-ignore = iree-build/host-aarch64/build
+tar-ignore = iree-build/host-aarch64/build-vulkan
+tar-ignore = iree-build/host/build-aarch64
+extend-diff-ignore = "^(target|iree-build/(build|host/build|host/build-aarch64|host-aarch64/build|host-aarch64/build-vulkan))/"

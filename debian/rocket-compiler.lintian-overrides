@@ -1,0 +1,5 @@
+# Typos in LLVM's and IREE's own diagnostic strings; upstream's to fix.
+spelling-error-in-binary * [usr/lib/*/rocket-compiler/libIREECompiler.so]
+# A private helper beside the private library it links: libIREECompiler.so
+# looks for iree-lld in its own directory first (IREE's findToolFromDylibDir).
+executable-in-usr-lib [usr/lib/*/rocket-compiler/iree-lld]

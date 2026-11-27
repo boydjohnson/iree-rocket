@@ -35,13 +35,34 @@ fn main() -> ExitCode {
     }
 }
 
-/// Where a packaged install keeps things, relative to the directory holding
-/// `bin/rocket-compiler`. The nightly `iree-compile-x86_64` tarball is laid
-/// out this way (see `.github/workflows/iree-build.yml`): an unpacked copy
-/// compiles with no `--iree-compiler-lib`, no `IREE_COMPILER_LIB` and no
+/// Where the unpacked nightly tarball keeps things, relative to the
+/// directory holding `bin/rocket-compiler`. The `iree-compile-x86_64` tarball
+/// is laid out this way (see `.github/workflows/iree-build.yml`): an unpacked
+/// copy compiles with no `--iree-compiler-lib`, no `IREE_COMPILER_LIB` and no
 /// `--transform-spec`.
 const PACKAGED_LIB: &str = "../lib/libIREECompiler.so";
 const PACKAGED_SPEC: &str = "../share/rocket/rocket_conv2d_transform_spec.mlir";
+
+const LIB_NAME: &str = "libIREECompiler.so";
+const SPEC_NAME: &str = "rocket_conv2d_transform_spec.mlir";
+
+/// Absolute install directories baked in at build time, for a distribution
+/// package whose files do not sit in the tarball's `bin/ lib/ share/` shape
+/// (debian/rules sets both: the private library under
+/// `/usr/lib/<triplet>/rocket-compiler`, the spec under
+/// `/usr/share/rocket-compiler`). Unset for every other build.
+///
+/// Never in a test binary: the package build runs the tests with these set,
+/// and on a machine that already has the package installed they would
+/// otherwise read the installed spec instead of the checked-in one.
+#[cfg(not(test))]
+const INSTALLED_LIB_DIR: Option<&str> = option_env!("ROCKET_COMPILER_LIBDIR");
+#[cfg(not(test))]
+const INSTALLED_SPEC_DIR: Option<&str> = option_env!("ROCKET_COMPILER_DATADIR");
+#[cfg(test)]
+const INSTALLED_LIB_DIR: Option<&str> = None;
+#[cfg(test)]
+const INSTALLED_SPEC_DIR: Option<&str> = None;
 
 /// The spec in the source checkout this binary was built from. Right for
 /// `cargo run`; meaningless on any machine but the one that built it.
@@ -62,20 +83,35 @@ fn packaged_path(exe: &Path, relative: &str) -> Option<PathBuf> {
     Some(exe.parent()?.join(relative))
 }
 
+/// `name` inside a build-time install directory, if one was configured and
+/// the file is there. A package that lost its library falls through to the
+/// tarball lookup and then to the "nothing to load" error, rather than
+/// failing on a path the user never chose.
+fn installed(dir: Option<&str>, name: &str) -> Option<PathBuf> {
+    Some(Path::new(dir?).join(name)).filter(|path| path.is_file())
+}
+
+/// Where this binary's own copy of the library lives, if it has one: the
+/// distribution install first (so a stray `/usr/lib/libIREECompiler.so`
+/// beside `/usr/bin` can never shadow the package's), then the tarball.
+fn installed_lib_path() -> Option<PathBuf> {
+    installed(INSTALLED_LIB_DIR, LIB_NAME).or_else(|| beside_executable(PACKAGED_LIB))
+}
+
 fn resolve_lib_path(explicit: Option<&Path>) -> Result<PathBuf, Box<dyn Error>> {
     pick_lib_path(
         explicit,
         env::var_os("IREE_COMPILER_LIB").map(PathBuf::from),
-        beside_executable(PACKAGED_LIB),
+        installed_lib_path(),
     )
 }
 
-/// Flag, then environment, then the packaged layout -- an explicit choice
-/// always beats the one the binary happens to sit next to.
+/// Flag, then environment, then the installed copy -- an explicit choice
+/// always beats the one the binary happens to ship with.
 fn pick_lib_path(
     explicit: Option<&Path>,
     from_env: Option<PathBuf>,
-    packaged: Option<PathBuf>,
+    installed: Option<PathBuf>,
 ) -> Result<PathBuf, Box<dyn Error>> {
     if let Some(path) = explicit {
         return Ok(path.to_path_buf());
@@ -83,21 +119,26 @@ fn pick_lib_path(
     if let Some(path) = from_env.filter(|path| !path.as_os_str().is_empty()) {
         return Ok(path);
     }
-    if let Some(path) = packaged {
+    if let Some(path) = installed {
         return Ok(path);
     }
+    let system = INSTALLED_LIB_DIR
+        .map(|dir| format!("{}, nor ", Path::new(dir).join(LIB_NAME).display()))
+        .unwrap_or_default();
     Err(format!(
-        "no --iree-compiler-lib given, IREE_COMPILER_LIB is not set, and there is no \
-         {PACKAGED_LIB} beside this executable"
+        "no --iree-compiler-lib given, IREE_COMPILER_LIB is not set, and there is \
+         no {system}{PACKAGED_LIB} beside this executable"
     )
     .into())
 }
 
-/// The packaged spec when this binary is running from an unpacked release,
-/// else the source checkout's. `--no-offload`, `--elementwise` and
-/// `--batch-matmul` all derive their specs from this one.
+/// The installed spec (distribution package, then unpacked tarball), else the
+/// source checkout's. `--no-offload`, `--elementwise` and `--batch-matmul`
+/// all derive their specs from this one.
 fn default_transform_spec_path() -> PathBuf {
-    beside_executable(PACKAGED_SPEC).unwrap_or_else(source_tree_transform_spec_path)
+    installed(INSTALLED_SPEC_DIR, SPEC_NAME)
+        .or_else(|| beside_executable(PACKAGED_SPEC))
+        .unwrap_or_else(source_tree_transform_spec_path)
 }
 
 fn transform_spec_path(common: &cli::CommonArgs) -> PathBuf {
@@ -700,6 +741,23 @@ mod tests {
                 "/opt/iree-compile-x86_64/share/rocket/rocket_conv2d_transform_spec.mlir"
             )
         );
+    }
+
+    /// A configured install directory counts only when the file is really
+    /// there; otherwise the lookup falls through to the tarball layout.
+    #[test]
+    fn an_install_directory_is_used_only_when_it_holds_the_file() {
+        let dir = env::temp_dir().join(format!("rocket-compiler-installed-{}", std::process::id()));
+        fs::create_dir_all(&dir).unwrap();
+        let dir_str = dir.to_str().unwrap();
+
+        assert_eq!(installed(Some(dir_str), LIB_NAME), None);
+        assert_eq!(installed(None, LIB_NAME), None);
+
+        fs::write(dir.join(LIB_NAME), b"").unwrap();
+        assert_eq!(installed(Some(dir_str), LIB_NAME), Some(dir.join(LIB_NAME)));
+
+        fs::remove_dir_all(&dir).unwrap();
     }
 
     /// A test binary is not in a package, so the default must still be the
