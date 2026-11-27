@@ -1,0 +1,8 @@
+rocket-compiler (0.1.0~git20261127.6d4cca2+iree3.14.0-1) UNRELEASED; urgency=medium
+
+  * Initial packaging: rocket-compiler with a private libIREECompiler.so
+    (IREE v3.14.0 plus the Rocket target plugin) and iree-lld under
+    /usr/lib/<triplet>/rocket-compiler, and the transform spec under
+    /usr/share/rocket-compiler.
+
+ -- Boyd Johnson <boyd@boundarybit.io>  Fri, 27 Nov 2026 11:33:07 -0600

@@ -15,8 +15,10 @@
 set -euo pipefail
 
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+# debian/rules builds out of the developer's way, in its own obj- directory.
+BUILD_DIR="${IREE_BUILD_DIR:-${ROOT}/build}"
 
-cmake -S "${ROOT}/iree-src" -B "${ROOT}/build" -G Ninja \
+cmake -S "${ROOT}/iree-src" -B "${BUILD_DIR}" -G Ninja \
   -DIREE_BUILD_COMPILER=ON \
   -DIREE_CMAKE_PLUGIN_PATHS="${ROOT}/../rocket-compiler-plugin" \
   -DIREE_HAL_DRIVER_AMDGPU=OFF \

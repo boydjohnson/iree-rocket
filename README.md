@@ -103,10 +103,12 @@ iree-compile-x86_64/bin/rocket-compiler compile --input model.mlir \
 ```
 
 `rocket-compiler` looks for `libIREECompiler.so` as `--iree-compiler-lib`,
-then `IREE_COMPILER_LIB`, then `../lib/` beside its own executable; and for the
-spec as `--transform-spec`, then `../share/rocket/` beside it, then the source
-checkout it was built from. `libIREECompiler.so` finds `iree-lld` in `../bin/`
-on its own. The board-side `iree-run-module` is the `iree-runtime-aarch64`
+then `IREE_COMPILER_LIB`, then the Debian package's private directory (when
+built with `ROCKET_COMPILER_LIBDIR`, see [debian/README.source](debian/README.source)),
+then `../lib/` beside its own executable; and for the spec as
+`--transform-spec`, then the package's `ROCKET_COMPILER_DATADIR`, then
+`../share/rocket/` beside it, then the source checkout it was built from.
+`libIREECompiler.so` finds `iree-lld` beside itself or in `../bin/` on its own. The board-side `iree-run-module` is the `iree-runtime-aarch64`
 artifact of the same run.
 
 `audit` answers "why is this operation where it is". It prints one line per
