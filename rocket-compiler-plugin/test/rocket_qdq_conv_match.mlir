@@ -121,3 +121,67 @@ func.func @qdq_1x1_per_channel_stays_fp16(%x: tensor<1x64x8x8xi8>) -> tensor<1x6
       ins(%acc, %sy, %zy : tensor<1x64x8x8xf32>, f32, i64) outs(%e8 : tensor<1x64x8x8xi8>) -> tensor<1x64x8x8xi8>
   return %q : tensor<1x64x8x8xi8>
 }
+
+// A 3x3 depthwise at stride 1 and 2 with pad 1 after a ReLU, as in every
+// MobileNetV2 depthwise layer: the pad goes to the CNA on the depthwise
+// requantized pad1 targets.
+// CHECK-LABEL: util.func public @qdq_depthwise_pad1
+// CHECK-NOT:   tensor.pad
+// CHECK:       flow.dispatch @rocket_dynamic_depthwise_int8_requant_pad1_executable
+// CHECK-NOT:   tensor.pad
+// CHECK:       flow.dispatch @rocket_dynamic_depthwise_int8_requant_pad1_s2_executable
+// CHECK-NOT:   iree_linalg_ext.quantize_affine
+// CHECK:       util.return
+func.func @qdq_depthwise_pad1(%x: tensor<1x64x8x8xi8>) -> tensor<1x64x4x4xi8> {
+  %wq = arith.constant dense<5> : tensor<64x1x3x3xi8>
+  %bq = arith.constant dense<-300> : tensor<64xi32>
+  %sx = arith.constant 2.000000e-02 : f32
+  %sw = arith.constant 4.000000e-03 : f32
+  %sb = arith.constant 8.000000e-05 : f32
+  %sy = arith.constant 5.000000e-02 : f32
+  %zx = arith.constant -128 : i64
+  %zero = arith.constant 0.000000e+00 : f32
+  %e0 = tensor.empty() : tensor<1x64x8x8xf32>
+  %e1 = tensor.empty() : tensor<64x1x3x3xf32>
+  %wf = iree_linalg_ext.dequantize_affine <indexing_maps = [#map4, #scalar4, #map4], quant_min = -128, quant_max = 127>
+      ins(%wq, %sw : tensor<64x1x3x3xi8>, f32) outs(%e1 : tensor<64x1x3x3xf32>) -> tensor<64x1x3x3xf32>
+  %wc = tensor.collapse_shape %wf [[0, 1], [2], [3]] : tensor<64x1x3x3xf32> into tensor<64x3x3xf32>
+  %e2 = tensor.empty() : tensor<64xf32>
+  %bf = iree_linalg_ext.dequantize_affine <indexing_maps = [#map1, #scalar1, #map1], quant_min = -2147483648, quant_max = 2147483647>
+      ins(%bq, %sb : tensor<64xi32>, f32) outs(%e2 : tensor<64xf32>) -> tensor<64xf32>
+
+  // Stride 1.
+  %xf = iree_linalg_ext.dequantize_affine <indexing_maps = [#map4, #scalar4, #scalar4, #map4], quant_min = -128, quant_max = 127>
+      ins(%x, %sx, %zx : tensor<1x64x8x8xi8>, f32, i64) outs(%e0 : tensor<1x64x8x8xf32>) -> tensor<1x64x8x8xf32>
+  %xp = tensor.pad %xf low[0, 0, 1, 1] high[0, 0, 1, 1] {
+  ^bb0(%a: index, %b: index, %c: index, %d: index):
+    tensor.yield %zero : f32
+  } : tensor<1x64x8x8xf32> to tensor<1x64x10x10xf32>
+  %bb = linalg.broadcast ins(%bf : tensor<64xf32>) outs(%e0 : tensor<1x64x8x8xf32>) dimensions = [0, 2, 3]
+  %acc = linalg.depthwise_conv_2d_nchw_chw {dilations = dense<1> : vector<2xi64>, strides = dense<1> : vector<2xi64>}
+      ins(%xp, %wc : tensor<1x64x10x10xf32>, tensor<64x3x3xf32>) outs(%bb : tensor<1x64x8x8xf32>) -> tensor<1x64x8x8xf32>
+  %e8 = tensor.empty() : tensor<1x64x8x8xi8>
+  %q = iree_linalg_ext.quantize_affine <indexing_maps = [#map4, #scalar4, #scalar4, #map4], quant_min = -128, quant_max = 127>
+      ins(%acc, %sy, %zx : tensor<1x64x8x8xf32>, f32, i64) outs(%e8 : tensor<1x64x8x8xi8>) -> tensor<1x64x8x8xi8>
+
+  // Stride 2, reading the first one's codes.
+  %yf = iree_linalg_ext.dequantize_affine <indexing_maps = [#map4, #scalar4, #scalar4, #map4], quant_min = -128, quant_max = 127>
+      ins(%q, %sy, %zx : tensor<1x64x8x8xi8>, f32, i64) outs(%e0 : tensor<1x64x8x8xf32>) -> tensor<1x64x8x8xf32>
+  %yp = tensor.pad %yf low[0, 0, 1, 1] high[0, 0, 1, 1] {
+  ^bb0(%a: index, %b: index, %c: index, %d: index):
+    tensor.yield %zero : f32
+  } : tensor<1x64x8x8xf32> to tensor<1x64x10x10xf32>
+  %e3 = tensor.empty() : tensor<1x64x4x4xf32>
+  %bb2 = linalg.broadcast ins(%bf : tensor<64xf32>) outs(%e3 : tensor<1x64x4x4xf32>) dimensions = [0, 2, 3]
+  %sb2 = arith.constant 2.000000e-04 : f32
+  %bf2 = iree_linalg_ext.dequantize_affine <indexing_maps = [#map1, #scalar1, #map1], quant_min = -2147483648, quant_max = 2147483647>
+      ins(%bq, %sb2 : tensor<64xi32>, f32) outs(%e2 : tensor<64xf32>) -> tensor<64xf32>
+  %bb3 = linalg.broadcast ins(%bf2 : tensor<64xf32>) outs(%e3 : tensor<1x64x4x4xf32>) dimensions = [0, 2, 3]
+  %acc2 = linalg.depthwise_conv_2d_nchw_chw {dilations = dense<1> : vector<2xi64>, strides = dense<2> : vector<2xi64>}
+      ins(%yp, %wc : tensor<1x64x10x10xf32>, tensor<64x3x3xf32>) outs(%bb3 : tensor<1x64x4x4xf32>) -> tensor<1x64x4x4xf32>
+  %e9 = tensor.empty() : tensor<1x64x4x4xi8>
+  %q2 = iree_linalg_ext.quantize_affine <indexing_maps = [#map4, #scalar4, #scalar4, #map4], quant_min = -128, quant_max = 127>
+      ins(%acc2, %sy, %zx : tensor<1x64x4x4xf32>, f32, i64) outs(%e9 : tensor<1x64x4x4xi8>) -> tensor<1x64x4x4xi8>
+  return %q2 : tensor<1x64x4x4xi8>
+}
+

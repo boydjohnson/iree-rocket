@@ -6,9 +6,11 @@
 //
 // Rewrites an ONNX QDQ-format convolution, `Q(conv(DQ(x), DQ(w)) + DQ(b))`,
 // into the canonical requantized int8 form the `rocket_dynamic_int8_requant*`
-// matchers claim: an i8 x i8 -> i32 `linalg.conv_2d_nhwc_hwcf` over a zero
-// init, then one elementwise generic that adds the per-channel bias, scales,
-// rounds, offsets, clamps and narrows. That is the form
+// (dense) and `rocket_dynamic_depthwise_int8_requant*` matchers claim: an
+// i8 x i8 -> i32 `linalg.conv_2d_nhwc_hwcf` or
+// `linalg.depthwise_conv_2d_nhwc_hwc` over a zero init, then one
+// elementwise generic that adds the per-channel bias, scales, rounds,
+// offsets, clamps and narrows. That is the form
 // `rocket-fuse-int8-requant-epilogue` produces from a QOperator model; this
 // pass is its counterpart for QDQ, the format ONNX Runtime's
 // `quantize_static` writes by default.
@@ -48,6 +50,11 @@
 // with `scale = sx * sw / sy` rounded once to f32, and `zp` the output zero
 // point in the signed encoding.
 //
+// A depthwise convolution is the same rewrite from a different start: the
+// channels-last conversion leaves it as the importer's NCHW
+// `depthwise_conv_2d_nchw_chw`, so `FuseQdqDepthwiseConv` emits the NHWC
+// layout itself (see there).
+//
 // # Why it is exact (up to ties)
 //
 // `DQ(x) = (x - zx) * sx` and `DQ(w) = w * sw`, so the float convolution is
@@ -65,6 +72,11 @@
 // more accurate of the two; the two can differ by one code where a product
 // lands near a rounding tie, which is the difference the requantized path's
 // e2e gate already runs at `atol=1` for.
+//
+// Measured exact: on a QDQ depthwise layer at stride 1 and 2 with random
+// weights, the rewritten form run on the CPU matches a float64 evaluation of
+// the original Q/DQ arithmetic on every code (agent-docs/
+// quantization-byo-measured.md).
 //
 // # Signedness
 //
@@ -453,8 +465,11 @@ static Value emitShift(PatternRewriter &rewriter, Location loc, Value source) {
 /// broadcasts the NCHW bias and the channels-last conversion transposes it
 /// rather than rewriting the broadcast (the same shape
 /// `rocket-fuse-int8-requant-epilogue`'s `matchBiasInit` documents, on f32).
-/// The surviving broadcast dimension has to land last, the NHWC channel.
-static LogicalResult matchBiasInit(Value init, DequantizeAffineOp &bias) {
+/// The surviving broadcast dimension has to land on the accumulator's
+/// channel: last for NHWC, `channel` when given (1 for the NCHW depthwise
+/// convolution, which the channels-last conversion leaves alone).
+static LogicalResult matchBiasInit(Value init, DequantizeAffineOp &bias,
+                                   int64_t channel = -1) {
   bias = nullptr;
   if (auto fill = init.getDefiningOp<linalg::FillOp>()) {
     std::optional<double> value = constantFloat(fill.getInputs()[0]);
@@ -490,7 +505,7 @@ static LogicalResult matchBiasInit(Value init, DequantizeAffineOp &bias) {
     }
   }
   if (channelPosition < 0) {
-    channelPosition = broadcastType.getRank() - 1;
+    channelPosition = channel >= 0 ? channel : broadcastType.getRank() - 1;
   }
   if (!retained || *retained != channelPosition) {
     return failure();
@@ -505,11 +520,13 @@ static LogicalResult matchBiasInit(Value init, DequantizeAffineOp &bias) {
   return success();
 }
 
-/// `sum_k(w)` over an HWCF i8 filter, per output channel, as i32.
+/// `sum_k(w)` per output channel, as i32, over a channels-last i8 filter:
+/// HWCF for a dense convolution, HWC for a depthwise one.
 static Value emitWeightSum(PatternRewriter &rewriter, Location loc,
                            Value filter) {
   auto type = cast<RankedTensorType>(filter.getType());
-  int64_t channels = type.getDimSize(3);
+  int64_t rank = type.getRank();
+  int64_t channels = type.getDimSize(rank - 1);
   Type i32 = rewriter.getI32Type();
   Value zero =
       arith::ConstantOp::create(rewriter, loc, rewriter.getI32IntegerAttr(0));
@@ -518,12 +535,12 @@ static Value emitWeightSum(PatternRewriter &rewriter, Location loc,
                                       ValueRange{empty})
                    .getResult(0);
   MLIRContext *context = rewriter.getContext();
-  AffineMap input = AffineMap::getMultiDimIdentityMap(4, context);
+  AffineMap input = AffineMap::getMultiDimIdentityMap(rank, context);
   AffineMap output =
-      AffineMap::get(4, 0, {rewriter.getAffineDimExpr(3)}, context);
-  SmallVector<utils::IteratorType> iterators{
-      utils::IteratorType::reduction, utils::IteratorType::reduction,
-      utils::IteratorType::reduction, utils::IteratorType::parallel};
+      AffineMap::get(rank, 0, {rewriter.getAffineDimExpr(rank - 1)}, context);
+  SmallVector<utils::IteratorType> iterators(rank - 1,
+                                             utils::IteratorType::reduction);
+  iterators.push_back(utils::IteratorType::parallel);
   return linalg::GenericOp::create(
              rewriter, loc, TypeRange{init.getType()}, ValueRange{filter},
              ValueRange{init}, SmallVector<AffineMap>{input, output},
@@ -581,6 +598,79 @@ static Value emitFoldedBias(PatternRewriter &rewriter, Location loc,
                linalg::YieldOp::create(b, nested, result);
              })
       .getResult(0);
+}
+
+/// The canonical requantization of an i32 channels-last accumulator, then
+/// the shift back to `ui8` when the output is unsigned, then the layout
+/// transpose the model's quantization read through (none when
+/// `permutation` is empty).
+static Value emitRequantTail(PatternRewriter &rewriter, Location loc,
+                             Value integerAcc, Value bias, double ratio,
+                             const Affine8 &output,
+                             ArrayRef<int64_t> permutation) {
+  ArrayRef<int64_t> accShape =
+      cast<RankedTensorType>(integerAcc.getType()).getShape();
+  Type i8 = rewriter.getI8Type();
+  // The canonical requantization; operands, not body constants, for the
+  // reason `rocket_int8_requant_match.mlir` pins.
+  Value scaleValue = arith::ConstantOp::create(
+      rewriter, loc, rewriter.getF32FloatAttr(static_cast<float>(ratio)));
+  Value zeroPointValue = arith::ConstantOp::create(
+      rewriter, loc, rewriter.getI32IntegerAttr(output.zeroPoint));
+  Value lowValue = arith::ConstantOp::create(
+      rewriter, loc, rewriter.getF32FloatAttr(kSignedLow));
+  Value highValue = arith::ConstantOp::create(
+      rewriter, loc, rewriter.getF32FloatAttr(kSignedHigh));
+  auto int8Type = RankedTensorType::get(accShape, i8);
+  Value outEmpty = tensor::EmptyOp::create(rewriter, loc,
+                                           int8Type.getShape(), i8);
+  unsigned rank = static_cast<unsigned>(accShape.size());
+  AffineMap identity = rewriter.getMultiDimIdentityMap(rank);
+  AffineMap channel = AffineMap::get(
+      rank, 0, {rewriter.getAffineDimExpr(rank - 1)}, rewriter.getContext());
+  AffineMap scalar = AffineMap::get(rank, 0, {}, rewriter.getContext());
+  SmallVector<AffineMap> maps{identity, channel, scalar,
+                              scalar,   scalar,  scalar, identity};
+  SmallVector<utils::IteratorType> iterators(rank,
+                                             utils::IteratorType::parallel);
+  Value result =
+      linalg::GenericOp::create(
+          rewriter, loc, TypeRange{int8Type},
+          ValueRange{integerAcc, bias, scaleValue, zeroPointValue, lowValue,
+                     highValue},
+          ValueRange{outEmpty}, maps, iterators,
+          [&](OpBuilder &b, Location nested, ValueRange args) {
+            Value biased = arith::AddIOp::create(b, nested, args[0], args[1]);
+            Value real =
+                arith::SIToFPOp::create(b, nested, b.getF32Type(), biased);
+            Value scaled = arith::MulFOp::create(b, nested, real, args[2]);
+            Value rounded = math::RoundEvenOp::create(b, nested, scaled);
+            Value zeroPointReal =
+                arith::SIToFPOp::create(b, nested, b.getF32Type(), args[3]);
+            Value offset =
+                arith::AddFOp::create(b, nested, rounded, zeroPointReal);
+            Value low = arith::MaximumFOp::create(b, nested, offset, args[4]);
+            Value clamped = arith::MinimumFOp::create(b, nested, low, args[5]);
+            Value narrowed =
+                arith::FPToSIOp::create(b, nested, b.getI8Type(), clamped);
+            linalg::YieldOp::create(b, nested, narrowed);
+          })
+          .getResult(0);
+
+  if (output.isUnsigned) {
+    result = emitShift(rewriter, loc, result);
+  }
+  if (!permutation.empty()) {
+    SmallVector<int64_t> shape;
+    for (int64_t dim : permutation) {
+      shape.push_back(accShape[dim]);
+    }
+    Value empty = tensor::EmptyOp::create(rewriter, loc, shape, i8);
+    result = linalg::TransposeOp::create(rewriter, loc, result, empty,
+                                         permutation)
+                 .getResult()[0];
+  }
+  return result;
 }
 
 /// Anchored on the QuantizeLinear: the rewrite replaces the quantization's
@@ -678,7 +768,6 @@ struct FuseQdqConv : public OpRewritePattern<QuantizeAffineOp> {
     }
 
     Type i32 = rewriter.getI32Type();
-    Type i8 = rewriter.getI8Type();
     auto accI32 = RankedTensorType::get(accType.getShape(), i32);
     Value zero =
         arith::ConstantOp::create(rewriter, loc, rewriter.getI32IntegerAttr(0));
@@ -705,62 +794,183 @@ struct FuseQdqConv : public OpRewritePattern<QuantizeAffineOp> {
                                 biasDequant ? biasDequant.getInput() : Value(),
                                 *convFilter, input->zeroPoint, channels);
 
-    // The canonical requantization; operands, not body constants, for the
-    // reason `rocket_int8_requant_match.mlir` pins.
-    Value scaleValue = arith::ConstantOp::create(
-        rewriter, loc, rewriter.getF32FloatAttr(static_cast<float>(ratio)));
-    Value zeroPointValue = arith::ConstantOp::create(
-        rewriter, loc, rewriter.getI32IntegerAttr(output->zeroPoint));
-    Value lowValue = arith::ConstantOp::create(
-        rewriter, loc, rewriter.getF32FloatAttr(kSignedLow));
-    Value highValue = arith::ConstantOp::create(
-        rewriter, loc, rewriter.getF32FloatAttr(kSignedHigh));
-    auto int8Type = RankedTensorType::get(accType.getShape(), i8);
-    Value outEmpty = tensor::EmptyOp::create(rewriter, loc,
-                                             int8Type.getShape(), i8);
-    unsigned rank = accType.getRank();
-    AffineMap identity = rewriter.getMultiDimIdentityMap(rank);
-    AffineMap channel = AffineMap::get(
-        rank, 0, {rewriter.getAffineDimExpr(rank - 1)}, rewriter.getContext());
-    AffineMap scalar = AffineMap::get(rank, 0, {}, rewriter.getContext());
-    SmallVector<AffineMap> maps{identity, channel, scalar,
-                                scalar,   scalar,  scalar, identity};
-    SmallVector<utils::IteratorType> iterators(rank,
-                                               utils::IteratorType::parallel);
-    Value result =
-        linalg::GenericOp::create(
-            rewriter, loc, TypeRange{int8Type},
-            ValueRange{integerAcc, bias, scaleValue, zeroPointValue, lowValue,
-                       highValue},
-            ValueRange{outEmpty}, maps, iterators,
-            [&](OpBuilder &b, Location nested, ValueRange args) {
-              Value biased = arith::AddIOp::create(b, nested, args[0], args[1]);
-              Value real =
-                  arith::SIToFPOp::create(b, nested, b.getF32Type(), biased);
-              Value scaled = arith::MulFOp::create(b, nested, real, args[2]);
-              Value rounded = math::RoundEvenOp::create(b, nested, scaled);
-              Value zeroPointReal =
-                  arith::SIToFPOp::create(b, nested, b.getF32Type(), args[3]);
-              Value offset =
-                  arith::AddFOp::create(b, nested, rounded, zeroPointReal);
-              Value low = arith::MaximumFOp::create(b, nested, offset, args[4]);
-              Value clamped = arith::MinimumFOp::create(b, nested, low, args[5]);
-              Value narrowed =
-                  arith::FPToSIOp::create(b, nested, b.getI8Type(), clamped);
-              linalg::YieldOp::create(b, nested, narrowed);
-            })
+    Value result = emitRequantTail(
+        rewriter, loc, integerAcc, bias, ratio, *output,
+        outputTranspose ? outputTranspose.getPermutation() : ArrayRef<int64_t>{});
+    if (result.getType() != quant->getResult(0).getType()) {
+      return failure();
+    }
+    rewriter.replaceOp(quant, result);
+    return success();
+  }
+};
+
+static Value emitTranspose(PatternRewriter &rewriter, Location loc,
+                           Value source, ArrayRef<int64_t> permutation) {
+  auto type = cast<RankedTensorType>(source.getType());
+  SmallVector<int64_t> shape;
+  for (int64_t dim : permutation) {
+    shape.push_back(type.getDimSize(dim));
+  }
+  Value empty =
+      tensor::EmptyOp::create(rewriter, loc, shape, type.getElementType());
+  return linalg::TransposeOp::create(rewriter, loc, source, empty, permutation)
+      .getResult()[0];
+}
+
+/// The depthwise twin of `FuseQdqConv`. The channels-last conversion leaves
+/// a depthwise convolution alone, so it arrives in the importer's own NCHW
+/// form,
+///
+///   %acc = depthwise_conv_2d_nchw_chw(pad_nchw?(DQ(x)), collapse(DQ(w)))
+///            outs(broadcast(DQ(b)))
+///   %q   = quantize_affine(%acc)
+///
+/// and this emits the NHWC form the requantized depthwise targets claim:
+/// `transpose(codes)`, then a rank-4 NHWC pad filled with the input zero
+/// point (the order `rocket-transpose-quantized-conv-to-nhwc` gives a
+/// QOperator depthwise, so `rocket-fold-conv-pad` can mark a -128 pad1 for
+/// `@match_dynamic_depthwise_conv2d_3x3_pad1_int8_requant{,_s2}`), an HWC
+/// filter, the same folded bias and requantization as the dense case, and a
+/// transpose back to NCHW. The input transpose meets the producing
+/// convolution's output transpose, and the pair cancels.
+struct FuseQdqDepthwiseConv : public OpRewritePattern<QuantizeAffineOp> {
+  using OpRewritePattern::OpRewritePattern;
+
+  LogicalResult matchAndRewrite(QuantizeAffineOp quant,
+                                PatternRewriter &rewriter) const override {
+    std::optional<Affine8> output = matchOutputQuant(quant);
+    if (!output) {
+      return failure();
+    }
+    Value accumulator = output->codes;
+    auto conv = accumulator.getDefiningOp<linalg::DepthwiseConv2DNchwChwOp>();
+    if (!conv || !accumulator.hasOneUse()) {
+      return rewriter.notifyMatchFailure(quant, "not fed by a NCHW depthwise");
+    }
+    auto accType = cast<RankedTensorType>(conv.getResult(0).getType());
+    if (!accType.getElementType().isF32() || !accType.hasStaticShape() ||
+        accType.getRank() != 4) {
+      return failure();
+    }
+
+    // The activation: DQ, optionally through a zero-filled spatial pad.
+    Value input = conv.getDpsInputs()[0];
+    tensor::PadOp pad = input.getDefiningOp<tensor::PadOp>();
+    if (pad) {
+      std::optional<double> fill = constantFloat(pad.getConstantPaddingValue());
+      ArrayRef<int64_t> low = pad.getStaticLow();
+      ArrayRef<int64_t> high = pad.getStaticHigh();
+      if (!fill || *fill != 0.0 || pad.getNofold() || !pad.getLow().empty() ||
+          !pad.getHigh().empty() || low.size() != 4 || low[0] != 0 ||
+          low[1] != 0 || high[0] != 0 || high[1] != 0) {
+        return failure();
+      }
+      input = pad.getSource();
+    }
+    std::optional<Affine8> activation =
+        matchActivationDequant(input.getDefiningOp<DequantizeAffineOp>());
+    FailureOr<LayoutChain> filterChain = walkToDequant(conv.getDpsInputs()[1]);
+    if (!activation || failed(filterChain)) {
+      return rewriter.notifyMatchFailure(quant, "operands are not DQ'd");
+    }
+    std::optional<Affine8> weights = matchWeightDequant(filterChain->dequant);
+    if (!weights) {
+      return rewriter.notifyMatchFailure(quant, "weight DQ is not per-tensor");
+    }
+    for (Operation *op : filterChain->ops) {
+      if (isa<tensor::PadOp>(op)) {
+        return failure();
+      }
+    }
+
+    DequantizeAffineOp biasDequant;
+    if (failed(matchBiasInit(conv.getDpsInits()[0], biasDequant,
+                             /*channel=*/1))) {
+      return rewriter.notifyMatchFailure(quant, "init is not a DQ'd bias");
+    }
+    int64_t channels = accType.getDimSize(1);
+    double accumulatorScale = activation->scale * weights->scale;
+    if (biasDequant) {
+      std::optional<double> biasScale = constantFloat(biasDequant.getScale());
+      if (biasDequant.getInputType().getDimSize(0) != channels || !biasScale ||
+          std::abs(*biasScale - accumulatorScale) >
+              kBiasScaleTolerance * accumulatorScale) {
+        return rewriter.notifyMatchFailure(quant, "bias scale is not sx * sw");
+      }
+    }
+    double ratio = accumulatorScale / output->scale;
+    if (!std::isfinite(ratio) || !(ratio > 0.0) ||
+        !std::isfinite(static_cast<float>(ratio))) {
+      return failure();
+    }
+
+    Location loc = conv.getLoc();
+    rewriter.setInsertionPoint(quant);
+    Type i8 = rewriter.getI8Type();
+    Type i32 = rewriter.getI32Type();
+    const int64_t toNhwc[] = {0, 2, 3, 1};
+    const int64_t toNchw[] = {0, 3, 1, 2};
+
+    Value codes = activation->codes;
+    if (activation->isUnsigned) {
+      codes = emitShift(rewriter, loc, codes);
+    }
+    Value convInput = emitTranspose(rewriter, loc, codes, toNhwc);
+    if (pad) {
+      ArrayRef<int64_t> low = pad.getStaticLow();
+      ArrayRef<int64_t> high = pad.getStaticHigh();
+      SmallVector<int64_t> padLow = {0, low[2], low[3], 0};
+      SmallVector<int64_t> padHigh = {0, high[2], high[3], 0};
+      auto unpadded = cast<RankedTensorType>(convInput.getType());
+      auto paddedType = RankedTensorType::get(
+          {unpadded.getDimSize(0), unpadded.getDimSize(1) + low[2] + high[2],
+           unpadded.getDimSize(2) + low[3] + high[3], unpadded.getDimSize(3)},
+          i8);
+      Value fillValue = arith::ConstantOp::create(
+          rewriter, loc, rewriter.getIntegerAttr(i8, activation->zeroPoint));
+      convInput = tensor::PadOp::create(
+                      rewriter, loc, paddedType, convInput,
+                      getAsIndexOpFoldResult(rewriter.getContext(), padLow),
+                      getAsIndexOpFoldResult(rewriter.getContext(), padHigh),
+                      fillValue)
+                      .getResult();
+    }
+
+    FailureOr<Value> filterChw = rebuildChain(rewriter, loc, filterChain->ops,
+                                              weights->codes, std::nullopt);
+    if (failed(filterChw) ||
+        cast<RankedTensorType>(filterChw->getType()).getRank() != 3) {
+      return failure();
+    }
+    const int64_t toHwc[] = {1, 2, 0};
+    Value filter = emitTranspose(rewriter, loc, *filterChw, toHwc);
+
+    SmallVector<int64_t> accShape = {accType.getDimSize(0),
+                                     accType.getDimSize(2),
+                                     accType.getDimSize(3), channels};
+    Value zero =
+        arith::ConstantOp::create(rewriter, loc, rewriter.getI32IntegerAttr(0));
+    Value accEmpty = tensor::EmptyOp::create(rewriter, loc, accShape, i32);
+    Value accInit = linalg::FillOp::create(rewriter, loc, ValueRange{zero},
+                                           ValueRange{accEmpty})
+                        .getResult(0);
+    auto attrType = RankedTensorType::get({2}, rewriter.getIntegerType(64));
+    SmallVector<int64_t> strides(conv.getStrides().getValues<int64_t>());
+    SmallVector<int64_t> dilations(conv.getDilations().getValues<int64_t>());
+    Value integerAcc =
+        linalg::DepthwiseConv2DNhwcHwcOp::create(
+            rewriter, loc, TypeRange{accInit.getType()},
+            ValueRange{convInput, filter}, ValueRange{accInit},
+            DenseIntElementsAttr::get(attrType, strides),
+            DenseIntElementsAttr::get(attrType, dilations))
             .getResult(0);
 
-    if (output->isUnsigned) {
-      result = emitShift(rewriter, loc, result);
-    }
-    if (outputTranspose) {
-      auto type = cast<RankedTensorType>(outputTranspose.getResult()[0].getType());
-      Value empty = tensor::EmptyOp::create(rewriter, loc, type.getShape(), i8);
-      result = linalg::TransposeOp::create(rewriter, loc, result, empty,
-                                           outputTranspose.getPermutation())
-                   .getResult()[0];
-    }
+    Value bias = emitFoldedBias(rewriter, loc,
+                                biasDequant ? biasDequant.getInput() : Value(),
+                                filter, activation->zeroPoint, channels);
+    Value result = emitRequantTail(rewriter, loc, integerAcc, bias, ratio,
+                                   *output, toNchw);
     if (result.getType() != quant->getResult(0).getType()) {
       return failure();
     }
@@ -789,7 +999,7 @@ struct RocketFuseQdqConvPass
   void runOnOperation() final {
     MLIRContext *context = &getContext();
     RewritePatternSet patterns(context);
-    patterns.add<FuseQdqConv>(context);
+    patterns.add<FuseQdqConv, FuseQdqDepthwiseConv>(context);
     // No folding, as in the other int8 fusions: the folder would hoist the
     // canonical generic's scalar operands and fold its transposes before
     // the matchers see them.
