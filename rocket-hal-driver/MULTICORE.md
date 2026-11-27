@@ -458,7 +458,10 @@ the command-buffer, core, buffer and file suites pass; the queue suite has
 the same eight failures before and after M0 (seven `QueueAllocaTest`
 explicit-pool cases and `QueueHostCallTest.AsyncCallback`, whose
 `IREE_STATUS_DEFERRED` contract `queue_host_call` has never implemented).
-Not M0's, and not fixed here.
+Not M0's, and not fixed here. (Fixed 2026-11-27: explicit pools are served
+by `src/pool_backend.rs` and a DEFERRED callback is left to signal its own
+list. The queue suite is 41 passed and 5 skipped: four cross-queue cases
+need a second queue, and one is a profiling case.)
 
 The three e2e gates (`tools/e2e_{conv,matmul,pooling}_regression.py
 --board planck`) pass on the M0 runtime, including every mixed

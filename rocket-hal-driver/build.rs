@@ -36,6 +36,16 @@ fn main() {
                 .to_str()
                 .unwrap(),
         )
+        // The slab provider interface `pool_backend.rs` implements, which
+        // iree/hal/api.h does not include. Only its types are used: the
+        // functions live in iree::hal::memory, which not every binary that
+        // links this driver links too.
+        .header(
+            iree_headers
+                .join("iree/hal/memory/slab_provider.h")
+                .to_str()
+                .unwrap(),
+        )
         .clang_arg(format!("-I{}", iree_headers.display()))
         .clang_arg(format!("--target={target}"))
         .allowlist_file(".*/iree/(hal|base|async|io|schemas)/.*")
