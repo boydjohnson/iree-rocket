@@ -69,10 +69,14 @@ ccache. `workflow_dispatch` takes a `retention-days` input, default 14.
   the CTS) and builds `iree-run-module` / `iree-benchmark-module` with the
   Rocket HAL driver statically linked. Then `cargo test --workspace --release
   --target aarch64-unknown-linux-gnu --no-run` for the crates' own libtest
-  binaries, which the CMake build never produces. Uploads
-  `iree-runtime-aarch64`, `rocket-cts-aarch64` (the non-executable HAL CTS
-  categories) and `rocket-rust-tests-aarch64`, the last two with a `RUN.md`
-  saying how to run them on the board. Timeout 120 min: no LLVM here.
+  binaries, which the CMake build never produces. Installs the
+  `IreeRocketRuntime` component (rocket-runtime/: `libiree_rocket_runtime.{so,a}`,
+  headers, pkg-config and CMake files) and link-tests its `embed.cc` sample
+  through both `.pc` files -- link only, the runner cannot run aarch64. Uploads
+  `iree-runtime-aarch64`, `iree-rocket-runtime-aarch64`, `rocket-cts-aarch64`
+  (the non-executable HAL CTS categories) and `rocket-rust-tests-aarch64`, the
+  last two with a `RUN.md` saying how to run them on the board. Timeout
+  120 min: no LLVM here.
 
 A nightly that fails with *"the hosted runner lost communication with the
 server"* and no failed step lost its runner mid-build (the LLVM compile is the
