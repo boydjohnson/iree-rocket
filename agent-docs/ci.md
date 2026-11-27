@@ -10,7 +10,7 @@ Three workflows, under [`.github/workflows/`](../.github/workflows).
 | Workflow | Trigger | Jobs | Typical runtime |
 |---|---|---|---|
 | `ci.yml` -- CI | every push to `main`, every pull request | `check, build, test`; `cargo fmt --check` | ~1.5 min |
-| `nightly.yml` -- Nightly artifacts | `cron 0 7 * * *` (07:00 UTC), `workflow_dispatch` | `compiler-host`, then `runtime-aarch64` | ~20 min warm ccache, up to ~4 h cold |
+| `nightly.yml` -- Nightly artifacts | `cron 0 7 * * *` (07:00 UTC), `workflow_dispatch` | `compiler-host`, then `runtime-aarch64`; `compiler-aarch64` alongside | ~20 min warm ccache, up to ~4 h cold |
 | `iree-build.yml` -- IREE build (reusable) | `workflow_call` only, so its runs are attributed to the caller and it has no badge of its own | one `build` job per `target` input | see above |
 
 ### CI -- `ci.yml`
@@ -62,6 +62,14 @@ ccache. `workflow_dispatch` takes a `retention-days` input, default 14.
   `iree-host-tools` (the full host `tools/` dir, for the next job). Default
   timeout 330 min -- deliberately under GitHub's 6 h ceiling, so a build that
   runs long still reaches its ccache save step.
+- **`compiler-aarch64`** -- the `compiler-host` target again, on
+  `ubuntu-24.04-arm`: the same build, packaging and smoke test, natively for
+  aarch64. The package is named after `uname -m`, so this one uploads
+  `iree-compile-aarch64`, a compiler that runs on the board itself. It skips
+  `iree-host-tools`: `runtime-aarch64` runs on x86_64 and could not execute
+  them. Its ccache is separate (the key carries the runner) and as large as
+  the x86_64 one, so its first run is a cold LLVM build and may hit the
+  330 min timeout; the next run picks up the ccache it banked.
 - **`runtime-aarch64`** -- unpacks `iree-host-tools` back into
   `iree-build/build/`, installs the `gcc`/`g++-aarch64-linux-gnu` cross
   toolchain, configures with `iree-build/configure-runtime-aarch64.sh`
@@ -92,7 +100,8 @@ input and the zip round-trip drops the executable bit. Each carries a
 One `build` job, parameterized by `target` (`compiler-host` or
 `runtime-aarch64`); an unknown value fails the job up front, since every build
 step is gated on it and a typo would otherwise produce a green job that built
-nothing. Inputs worth knowing about:
+nothing. So does `runtime-aarch64` on an arm runner. `compiler-host` builds
+for whatever the `runner` is. Inputs worth knowing about:
 
 | Input | Default | Why |
 |---|---|---|
