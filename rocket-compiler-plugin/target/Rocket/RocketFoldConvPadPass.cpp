@@ -451,16 +451,35 @@ struct MarkPaddedConv : public OpRewritePattern<ConvOp> {
     // matchers are not DAG-based and ignore the mark; a -128-padded 3x3
     // whose bias did not reach the requantized form stays theirs either
     // way.)
+    //
+    // The NHWC depthwise 3x3 is the same case on the depthwise requantized
+    // pad1 targets (`@match_dynamic_depthwise_conv2d_3x3_pad1_int8_requant*`):
+    // every depthwise convolution in an int8 MobileNetV2, once
+    // `rocket-transpose-quantized-conv-to-nhwc` has moved its pad to the NHWC
+    // side. Those matchers exist at stride 1 and 2 only, so nothing else is
+    // marked.
     if (int8Fill) {
-      if (!std::is_same_v<ConvOp, linalg::Conv2DNhwcHwcfOp> ||
-          padHeight != 1 || padWidth != 1) {
+      constexpr bool kNhwcDepthwise =
+          std::is_same_v<ConvOp, linalg::DepthwiseConv2DNhwcHwcOp>;
+      if ((!kNhwcDense && !kNhwcDepthwise) || padHeight != 1 ||
+          padWidth != 1 || shift != 0) {
         return failure();
       }
       auto filterType =
           cast<RankedTensorType>(conv.getDpsInputs()[1].getType());
-      if (filterType.getRank() != 4 || filterType.getDimSize(0) != 3 ||
-          filterType.getDimSize(1) != 3) {
+      if (filterType.getRank() != (kNhwcDepthwise ? 3 : 4) ||
+          filterType.getDimSize(0) != 3 || filterType.getDimSize(1) != 3) {
         return failure();
+      }
+      if constexpr (kNhwcDepthwise) {
+        SmallVector<int64_t> strides(conv.getStrides().template getValues<int64_t>());
+        SmallVector<int64_t> dilations(
+            conv.getDilations().template getValues<int64_t>());
+        if ((strides != SmallVector<int64_t>{1, 1} &&
+             strides != SmallVector<int64_t>{2, 2}) ||
+            dilations != SmallVector<int64_t>{1, 1}) {
+          return failure();
+        }
       }
       if (!feedsRequantEpilogue(conv->getResult(0))) {
         return failure();
@@ -737,7 +756,8 @@ struct RocketFoldConvPadPass
   StringRef getArgument() const final { return "rocket-fold-conv-pad"; }
   StringRef getDescription() const final {
     return "Marks a convolution whose input is a symmetric, zero-filled "
-           "(or, for an int8 3x3, -128-filled), spatial-only tensor.pad "
+           "(or, for an int8 dense or depthwise 3x3, -128-filled), "
+           "spatial-only tensor.pad "
            "with rocket.pad_top/rocket.pad_left, so the matcher can hand the "
            "padding to the CNA instead of leaving it as a materialized copy. "
            "Also marks an int8 max pool reading a -128-filled pad, for the "

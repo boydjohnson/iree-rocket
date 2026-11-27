@@ -1301,6 +1301,37 @@ pub fn conv_2d_tile_2d_with_cbuf_banks(
     )
 }
 
+/// `CNA_PAD_CON1.pad_value`: the fill the CNA gives every out-of-image tap.
+///
+/// fp16 pads with 0. int8 pads with the input zero point, written as the
+/// two's-complement `i32` -- which is what a *dense* convolution wants: it
+/// fills every channel from byte 0.
+///
+/// **An int8 depthwise convolution reads the register per byte lane.**
+/// Channel `2k` takes byte 0 and channel `2k + 1` takes byte 1, so the
+/// sign-extended `-128` (`0xFFFF_FF80`) pads even channels with -128 and odd
+/// channels with -1. Measured on the board (2026-11-27,
+/// `requant_int8_dw3x3_pad1` in `tools/e2e_conv_regression.py`): the
+/// interior bit-exact, every mismatch a border pixel of an odd channel, and
+/// those match a fill of -1 to 99.96% where -128 matches 0. The dense pad1
+/// fixture is exact with the same register value, so this is depthwise-only.
+/// Mesa and rocket-userspace write the dense encoding for both; neither
+/// measured a padded int8 depthwise at a fill whose byte 1 differs.
+///
+/// Byte 1 gets a copy of byte 0, and every other bit keeps the dense
+/// encoding, so a zero point whose two low bytes already agree (0, -1) is
+/// programmed exactly as before.
+fn cna_pad_value(depthwise: bool, quantization: Option<Quantization>) -> u32 {
+    let Some(quantization) = quantization else {
+        return 0;
+    };
+    let dense = quantization.input_zero_point as u32;
+    if !depthwise {
+        return dense;
+    }
+    (dense & !0xff00) | ((dense & 0xff) << 8)
+}
+
 fn conv_2d_tile_program(
     shape: Shape,
     kernels: Kernels,
@@ -1701,9 +1732,7 @@ fn conv_2d_tile_program(
     // capture; int8 pads with the zero point in every capture.
     commands.push(
         Register::<CnaPadCon1>::new()
-            .pad_value(Bits::new(
-                quantization.map_or(0, |q| q.input_zero_point as u32),
-            ))
+            .pad_value(Bits::new(cna_pad_value(shape.depthwise, quantization)))
             .build(),
     );
 
@@ -4577,6 +4606,33 @@ mod tests {
         assert_eq!(value_of::<DpuOutCvtScale>(&program), 19636);
         assert_eq!(value_of::<DpuOutCvtShift>(&program), 24);
         assert_eq!(value_of::<DpuOutCvtOffset>(&program), (-3i32) as u32);
+    }
+
+    /// The depthwise CNA reads `pad_value` per byte lane (channel parity
+    /// picks byte 0 or 1), so its fill is replicated into byte 1; the dense
+    /// encoding is untouched. See [`cna_pad_value`].
+    #[test]
+    fn int8_depthwise_pad_value_fills_both_byte_lanes() {
+        let at = |input_zero_point: i32| Quantization {
+            input_zero_point,
+            ..quantization()
+        };
+        let program = |zp: i32, depthwise: bool| {
+            let mut shape = Shape::with_precision(34, 34, 1, 32, 32, Precision::Int8(at(zp)))
+                .with_padding([1, 1]);
+            if depthwise {
+                shape = shape.with_depthwise();
+            }
+            value_of::<CnaPadCon1>(&conv_2d_tile(shape, [3, 3], &Tile::whole(shape, [3, 3])))
+        };
+        assert_eq!(program(-128, false), 0xffff_ff80);
+        assert_eq!(program(-128, true), 0xffff_8080);
+        assert_eq!(program(-2, true), 0xffff_fefe);
+        assert_eq!(program(5, true), 0x0000_0505);
+        // Zero points whose two low bytes already agree are unchanged.
+        assert_eq!(program(0, true), 0);
+        assert_eq!(program(-1, true), u32::MAX);
+        assert_eq!(cna_pad_value(true, None), 0);
     }
 
     #[test]
