@@ -1,0 +1,13 @@
+/* Symbols libiree_rocket_runtime.so exports: IREE's C API and ours.
+ *
+ * Everything else is local, which matters for one reason above the rest: the
+ * library carries the Rocket HAL driver's Rust standard library. Left visible,
+ * it would collide with (or worse, silently interpose on) the std of any Rust
+ * program that loads this library. */
+{
+  global:
+    iree_*;
+    rocket_runtime_*;
+  local:
+    *;
+};

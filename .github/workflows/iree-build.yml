@@ -10,8 +10,9 @@ name: IREE build (reusable)
 #   runtime-aarch64  iree-run-module / iree-benchmark-module cross-compiled for
 #                    the RK3588 board with the Rocket HAL driver statically
 #                    linked -- ../../iree-build/configure-runtime-aarch64.sh --
-#                    plus the rocket HAL CTS binaries and the Rust test
-#                    binaries, all for the board.
+#                    plus the embeddable runtime package (rocket-runtime/),
+#                    the rocket HAL CTS binaries and the Rust test binaries,
+#                    all for the board.
 #
 # runtime-aarch64 is downstream of compiler-host: configure-runtime-aarch64.sh
 # points IREE_HOST_BIN_DIR at iree-build/build/tools, and IREE resolves those
@@ -144,9 +145,10 @@ jobs:
           # time; the packaging step below rewrites it to $ORIGIN/../lib.
           # libclang-dev: bindgen runs from build.rs on both sides --
           # rocket-compiler (host) and iree-rocket-hal / rocket-hal-driver
-          # (aarch64); see ci.yml's own note.
+          # (aarch64); see ci.yml's own note. pkg-config: the runtime package
+          # link test (aarch64) resolves the package's .pc files with it.
           sudo apt-get install -y --no-install-recommends \
-            ninja-build ccache patchelf libclang-dev
+            ninja-build ccache patchelf libclang-dev pkg-config
 
       - name: Install aarch64 cross toolchain
         if: inputs.target == 'runtime-aarch64'
@@ -526,12 +528,40 @@ jobs:
           EOF
           tar -C dist -czf rocket-rust-tests-aarch64.tar.gz rocket-rust-tests-aarch64
 
+          # 4. The embeddable runtime: rocket/runtime.h, IREE's headers,
+          # libiree_rocket_runtime.{so,a}, pkg-config and CMake package files
+          # (rocket-runtime/CMakeLists.txt). --strip only touches the .so; the
+          # archive's debug info was already dropped when it was merged.
+          cmake --install "${BUILD}" --component IreeRocketRuntime \
+            --prefix dist/iree-rocket-runtime-aarch64 --strip
+          write_version dist/iree-rocket-runtime-aarch64/VERSION.txt
+          tar -C dist -czf iree-rocket-runtime-aarch64.tar.gz iree-rocket-runtime-aarch64
+
           # Same guard as compiler-host's: the board's glibc is the ceiling.
           .github/scripts/check-glibc-ceiling.sh "${MAX_GLIBC}" \
             dist/iree-runtime-aarch64 dist/rocket-cts-aarch64 \
-            dist/rocket-rust-tests-aarch64
+            dist/rocket-rust-tests-aarch64 dist/iree-rocket-runtime-aarch64
 
           ls -lh ./*.tar.gz
+
+      # The package as an outside program sees it: the shipped C++ sample,
+      # cross-compiled from the unpacked tree through each pkg-config file.
+      # Link-only -- the runner cannot execute aarch64, and the board run is
+      # what checks results.
+      - name: Link-test the runtime package (aarch64)
+        if: inputs.target == 'runtime-aarch64'
+        run: |
+          set -euo pipefail
+          PKG="$(mktemp -d)"
+          tar -xzf iree-rocket-runtime-aarch64.tar.gz -C "${PKG}"
+          ROOT="${PKG}/iree-rocket-runtime-aarch64"
+          export PKG_CONFIG_LIBDIR="${ROOT}/lib/pkgconfig" PKG_CONFIG_PATH=
+          for pc in iree-rocket-runtime iree-rocket-runtime-static; do
+            aarch64-linux-gnu-g++ -std=c++17 -O2 \
+              "${ROOT}/share/rocket-runtime/samples/embed.cc" \
+              $(pkg-config --cflags --libs "${pc}") -o "${PKG}/embed-${pc}"
+            echo "linked against ${pc}: $(stat -c %s "${PKG}/embed-${pc}") bytes"
+          done
 
       - name: Upload iree runtime (aarch64)
         if: inputs.target == 'runtime-aarch64'
@@ -539,6 +569,15 @@ jobs:
         with:
           name: iree-runtime-aarch64
           path: iree-runtime-aarch64.tar.gz
+          compression-level: 0
+          retention-days: ${{ inputs.retention-days }}
+
+      - name: Upload embeddable runtime package (aarch64)
+        if: inputs.target == 'runtime-aarch64'
+        uses: actions/upload-artifact@v4
+        with:
+          name: iree-rocket-runtime-aarch64
+          path: iree-rocket-runtime-aarch64.tar.gz
           compression-level: 0
           retention-days: ${{ inputs.retention-days }}
 
