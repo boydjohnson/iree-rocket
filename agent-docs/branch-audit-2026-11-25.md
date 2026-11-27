@@ -169,6 +169,20 @@ checked out in another worktree and in use, `claude/iree-rocket-online-softmax-f
 `feature/cpu-profiling` and `section2-planner-gate`, which track
 `origin/main` rather than a deleted branch and so were never in scope.
 
+**Update 2026-11-27.** Four of those "live remote" branches no longer have
+one: `git ls-remote origin` lists no `claude/c15-remeasure-packer`,
+`fix/int8-stem-hang`, `perf/int8-maxpool-pad` or
+`perf/patchify-conv-as-matmul`, though the local branches still name them as
+upstream. All four were squash-merged, so `git branch --merged` cannot see it
+and their own commit subjects do not appear on `main` verbatim. Compared by
+content instead (every file each branch touches, at its tip, against the
+squash commit), each landed whole: `fix/int8-stem-hang` as `7dba5df` (#62),
+`perf/int8-maxpool-pad` as `db6882a` (#69), `perf/patchify-conv-as-matmul`
+as `853b2a0` (#72), `claude/c15-remeasure-packer` as `ff07c7d` (#94), with
+#96 editing the same ISSUES.md text further. None holds anything `main`
+lacks; none is checked out in a worktree any more. The two softmax branches
+still have their remotes.
+
 ## The one thing worth doing next
 
 Nothing here was salvaged *into* `main`, deliberately. The code on the

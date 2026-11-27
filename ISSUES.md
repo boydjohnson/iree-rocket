@@ -46,9 +46,14 @@ live in P8.
 
 ---
 
-## C6 (S4) — `DPU_BS_OW_OP` is always zero, including depthwise
+## C6 (S4) — `DPU_BS_OW_OP` ships as zero, including depthwise, where Mesa sets `0x80`
 
-`conv.rs:3838` [verified]: `commands.push(zero::<DpuBsOwOp>())`, unconditionally.
+When this was filed the register was pushed as `zero::<DpuBsOwOp>()`,
+unconditionally. It now comes from `bs_ow_op_value` (`iree-rocket-hal/src/rocket/conv.rs`),
+which still returns 0 by default -- this crate feeds the CPEND operand from
+BRDMA (`ow_src = 1`), so the register field is not the operand -- but takes
+`ROCKET_BS_OW_OP=<value>`, or `ROCKET_CPEND=mesa` for Mesa's
+`0x80 - weight_zero_point` together with `ow_src = 0` (62056c1, #21).
 
 `depthwise-conv.md` [notes, source-confirmed against Mesa `rkt_regcmd.c` and
 HW-swept] lists it as one of six fields that must differ for depthwise:
@@ -60,13 +65,22 @@ HW-swept] lists it as one of six fields that must differ for depthwise:
 This repo's fp16 depthwise is board-validated exact (`fp16-depthwise-exact-coverage`),
 so this is a **recorded divergence, not a known defect** — the two derivations
 came from different sources (RKNN captures here, Mesa there) and this one has HW
-backing. Two reasons to keep it on the list anyway:
+backing. `ROCKET_CPEND=mesa` is the switch that tests one against the other,
+and the `cpend_from_configuration` doc comment records the 2026-09-05 board
+run: Mesa's wiring passes the int8 and depthwise int8 gates and depthwise fp16
+with or without `od_bypass` cleared, and fails only affine int8, where a
+per-channel weight zero point needs five operands and the register holds one.
+So both wirings are exact where Mesa's applies, and this crate's is the more
+general one.
 
-- It is one of the last un-reconciled register deltas between the two stacks on
-  the depthwise path, and `fp16-depthwise-int8-mix-corrupts` is still open.
-- The repo also sets `od_bypass = 1` for fp16 where Mesa sets it to 0 for
-  depthwise — the same divergence in the same register. Both are the BS/OW
-  stage. If the mix bug is ever traced to BS state, this is where to look.
+What kept this on the list is gone: it was one of the last un-reconciled
+register deltas on the depthwise path while `fp16-depthwise-int8-mix-corrupts`
+was open, and that bug was resolved as C8 (see **Resolved**): `brdma_data_use`
+left set on the int32-accumulator path, not anything on the depthwise
+program. The same holds for the companion
+divergence in the same register, `od_bypass = 1` for fp16 where Mesa sets 0
+for depthwise. Kept as a record of the divergence and the knob that measures
+it; nothing here is waiting on work.
 
 ---
 
@@ -77,16 +91,18 @@ backing. Two reasons to keep it on the list anyway:
 `ROCKET_DUMP_PRECISION`, `accumulator_written_lanes_probe`,
 `accumulator_written_region_map`, `accumulator_per_channel_threshold_probe`.
 (`MAX_ACCUMULATOR_COEFFICIENT_BYTES_PER_CHANNEL` was on this list; it has
-since been removed with the coefficient limit C1 retracted, and only a stale
-doc link in `iree-rocket-hal/src/rocket/conv.rs` names it.)
+since been removed with the coefficient limit C1 retracted. The stale doc
+link in `iree-rocket-hal/src/rocket/conv.rs` that still named it is gone too
+-- re-checked 2026-11-27, this file is the only remaining mention.)
 
 Also present, and I initially got this wrong: **`ROCKET_PAD_INPUT` / `_WEIGHTS` /
 `_BIAS` and `ROCKET_POISON_*` do exist.** They are built with
-`format!("ROCKET_PAD_{which}")` (`conv2d_oracle_hw.rs:83`), so a literal grep
+`format!("ROCKET_PAD_{which}")` (`conv2d_oracle_hw.rs`, ~:93), so a literal grep
 for the full name finds nothing. Corrected after using them during the C1 work.
 Worth remembering as a search hazard in this file generally.
 
-Genuinely absent:
+Named in a memory as built, and absent when this was filed -- two rows have
+since been built ("yes"), the rest are still absent:
 
 | named in a memory as built | actually in tree |
 |---|---|
@@ -119,7 +135,8 @@ the memories that made load-bearing claims.
 ## P1 (S3) — one fd is one scheduler entity is one core
 
 `rocket-hal-driver` opens `/dev/accel/accel0` exactly once
-(`device.rs:335`) [verified], and `iree-rocket-hal`'s `submit_jobs` documents
+(`DEVICE_PATH` in `device.rs`'s `create`; since M2 below, context 0 is that
+fd and contexts 1..N are fresh opens) [verified], and `iree-rocket-hal`'s `submit_jobs` documents
 the intent as:
 
 > N *jobs* are independent work items the kernel scheduler can place on
@@ -172,9 +189,10 @@ whenever N > 1), bit-exact, with ViT 1.22x faster at four CPU cores and 1.34x
 at eight at `ROCKET_NPU_CORES=3`. The default stays N=1, because
 MobileNetV2's sub-millisecond dispatches gain only noise. (This M2 is
 `MULTICORE.md`'s, not this file's 200 MHz-clock M2; see the naming hazard
-under Suggested order.) What is still open under P1 is small: the
-`submit_jobs` doc comment still says jobs spread across cores, which this
-entry shows they do not; and kernel-side placement (M3, `MULTICORE.md` §7).
+under Suggested order.) The `submit_jobs` doc comment that said jobs spread
+across cores was corrected 2026-11-27: it now says jobs on one fd serialize
+and the lever is N fds. What is still open under P1 is kernel-side placement
+(M3, `MULTICORE.md` §7).
 
 ---
 
@@ -191,8 +209,8 @@ entry shows they do not; and kernel-side placement (M3, `MULTICORE.md` §7).
 They measured an oversized, repeatedly-synced output BO at ~20% of wall, and
 right-sizing it at +11%.
 
-In `device.rs:1570` [verified] the dispatch loop is, per tile:
-`submit(...)` then `for out_handle in job.out_bo_handles { prep_bo(...) }`. So an
+In `device.rs`'s `queue_execute` [verified] the dispatch loop was, per tile
+(until C4; see below): `submit(...)` then `for out_handle in job.out_bo_handles { prep_bo(...) }`. So an
 N-tile dispatch syncs **the whole output BO N times**, even though each tile
 writes a disjoint slice of it. The repo's own comment notes that IREE packs
 multiple bindings into one combined transient buffer — which makes the synced BO
@@ -201,7 +219,8 @@ says the sync bills the whole thing.
 
 Separately, the same loop does a fresh `OwnedBuffer::new` (CREATE_BO + mmap,
 rounded up to 4096) plus a `fini_bo` for **each tile's regcmd**, on every
-dispatch, on every inference (`device.rs:1509`). `regcmd-task-model.md` [notes]
+dispatch, on every inference (also `queue_execute`; now a
+`scratch_pool::ScratchBuffer`, see the progress note below). `regcmd-task-model.md` [notes]
 recommends the opposite: cache the full regcmd per
 `(tile geometry, precision, accumulate)` and patch only the address fields,
 since the program is self-contained and address-only-different between tiles.
@@ -963,7 +982,9 @@ Single `iree-run-module` invocations are clean and produce correct logits, so
 the discriminator is repeated invocation in one process -- the same shape as
 C8, but **not the same cause**: C8's `ROCKET_PM_DWELL=suspend
 ROCKET_PM_DWELL_AT=transition` workaround does not clear this (still 1 hang,
-both arms), and C8 itself is resolved.
+both arms), and C8 itself is resolved. (Neither knob is in the tree any more:
+the `ROCKET_PM_DWELL` family was removed with C8's fix, 62056c1, and
+`ROCKET_PM_DWELL_AT` survives only in docs.)
 
 VGG's int8 convolutions reach the NPU through the same `int8_accumulator`
 path MobileNetV2 uses, and MobileNetV2's int8 arm no longer hangs, so
@@ -1041,7 +1062,7 @@ sites is the open half of this issue.
 `cbuf-bank-slack.md` [notes] prescribes `data_bank = min(fd_banks + 1, 11)` for
 the int8 feature cube, from a `(Mtile, Ktile)` resonance with no closed form.
 
-`Shape::data_bank_demand` (`conv.rs:1498`) [verified] arrives somewhere similar
+`Shape::data_bank_demand` (now `rocket-core/src/conv.rs`, ~:2541) [verified] arrives somewhere similar
 by a different route: it bills the *rounded* `cbuf_atoms` rather than the exact
 int8 channel count, with its own doc comment recording that billing the exact
 count under-grants a bank at Cin 33..48, 97..112, 225..240 and every 64
@@ -1234,8 +1255,9 @@ is bit-exact to the host round-trip.
 
 **This repo is already in that configuration** [verified]:
 `DpuOutCvtScale.fp32tofp16_en` is set whenever `quantization.is_none()`
-(`conv.rs:3912`), and `Precision::Fp16::output_element_bytes()` is 2
-(`conv.rs:476`), so C2 = 16/2 = 8 on both the input and the output side. The
+(the `DpuOutCvtScale` push in `iree-rocket-hal/src/rocket/conv.rs`, ~:1916;
+now also gated on `!writes_fp32_result()`), and
+`Precision::Fp16::output_element_bytes()` is 2 (`rocket-core/src/conv.rs`), so C2 = 16/2 = 8 on both the input and the output side. The
 aliasing precondition holds today, for free.
 
 It is fp16-only, and the notes tabulate why: int8 (int32 C2=4 out vs int8 C2=16
@@ -1500,7 +1522,9 @@ command buffer, because IREE also allocas a result consumed by a later
 execute region.
 
 `planck`, `taskset -c 4-7`, medians of 4 interleaved passes, same binary
-and same `.vmfb`, `ROCKET_LAZY_COMPACT=1` against `=0`:
+and same `.vmfb`, `ROCKET_LAZY_COMPACT=1` against `=0` (the knob was retired
+in #52, when the compiler started declaring each dispatch's layout; the
+table is the measurement from before that):
 
 | model | kept / skipped per inference | off | on | |
 |---|---|---:|---:|---:|
@@ -1586,8 +1610,10 @@ in `PREP_BO`, uninterruptible); it did not reproduce after a reboot in six
 further runs of both arms and is recorded rather than explained.
 
 What is left is coverage, not chaining: VGG19's torchvision export pools in
-f16 and the pooling matchers are f32-only, so its five pools stay on the
-CPU (and break the chain between blocks); ViT/Qwen3's matmul edges chain
+f16 and the pooling matchers were f32-only, so its five pools stay on the
+CPU (and break the chain between blocks) -- since #49 the f16 NCHW average
+pool is matched (`@match_pooling_nchw_sum_avg_f16`), but max pooling, which
+is what VGG's pools are, is still matched only at f32 and int8; ViT/Qwen3's matmul edges chain
 where the M/K/N caps admit both sides; and a matmul or pool whose consumer
 is the CPU (every classifier) keeps its dense write, as it must.
 
@@ -3118,7 +3144,10 @@ in its kernel log; nobody had checked.
   needed"). That arm freed every data buffer after each dispatch, so the
   probable route is in-flight DMA landing in freed pages. Patch `088`
   (reset, then detach) ported to that module
-  (`~/projects/patches/rocket/088-rocket-drv-reset-before-iommu-detach-armbian-7.3.5.patch`):
+  (`~/projects/patches/rocket/088-rocket-drv-reset-before-iommu-detach-armbian-7.3.5.patch`
+  at the time; the repo now carries it, carried to 7.3.6, as
+  [`kernel-patches/088-rocket-drv-reset-before-iommu-detach-armbian-7.3.6.patch`](kernel-patches/088-rocket-drv-reset-before-iommu-detach-armbian-7.3.6.patch),
+  #103, #108):
   dozens of deliberate hangs afterwards, every one recovered with a bare
   `NPU job timed out` and nothing else.
 - C11 (VGG int8 aborting under a benchmark loop) is probably this bug; see
@@ -3323,7 +3352,7 @@ need an uninterrupted job.
 lever was a driver patch that was already built.** `scmi_clk_npu` boots pinned
 at 200 MHz (the vendor's idle `POWER_DOWN_FREQ`) because mainline `rocket` has
 no NPU devfreq and the DT sets `assigned-clock-rates = <200000000>`. A patched
-`rocket.ko` — `clk_set_rate` plus a coupled `regulator_set_voltage` in
+`rocket.ko` ([`kernel-patches/081-rocket-drv-npu-clk-armbian-7.3.6.patch`](kernel-patches/081-rocket-drv-npu-clk-armbian-7.3.6.patch)) — `clk_set_rate` plus a coupled `regulator_set_voltage` in
 runtime-resume, exposed as the module parameters `rocket_npu_clk_hz` and
 `rocket_npu_uv` — is installed on `planck` and the board now defaults to
 600 MHz at 0.80 V. Measured, bit-identical output, zero faults:
@@ -3730,7 +3759,8 @@ is 1.17x slower at eight cores and no matcher cut point rescues it.
    What replaced it as the largest host term is the NC1HWC2 round trip:
    C15's marginal attribution puts `compact` first on a 338-site arm, ahead
    of `record`.
-3. **P2's remaining matcher coverage** — f16 pooling and the classifier
+3. **P2's remaining matcher coverage** — f16 max pooling (and f16 NHWC
+   average and min; the f16 NCHW average landed in #49) and the classifier
    matmuls past the caps. P2 itself is closed; steps 2, 4 and 5 landed
    2026-09-08 and take ResNet50 169 -> 114 ms bit-identically.
 4. **~~P7~~ — re-measured 2026-09-09 and closed as "not the deciding term".**
@@ -3745,13 +3775,20 @@ is 1.17x slower at eight cores and no matcher cut point rescues it.
    order of work.
 6. **C11** — VGG int8 aborts under a repeated benchmark loop. C16, its
    ResNet50 twin, is resolved as a pooling bug (see Resolved); VGG's main arm
-   offloads no pooling, so start C11 with `ROCKET_DISPATCH_TIMES` (which now
-   prints each job's core) rather than assuming the same cause.
+   offloads no pooling, so that is not the cause. The entry's own later note
+   says it is probably C17 (a `Cin` 3 input read past its buffer, fixed
+   2026-11-23), not yet re-run: the first step is re-running VGG int8 under
+   the benchmark loop, with `ROCKET_DISPATCH_TIMES` (which prints each job's
+   core) if it still hangs.
 7. **C6, C7, D1, D2** — limitations, hygiene and reconciliation.
 
 Done and in **Resolved**: the requantized int8 path (2026-09-06), C2
 (2026-09-07), P6 (2026-09-07), C9 (2026-09-07), C12 and C13 (2026-09-08),
-M2 (2026-09-09).
+M2 (2026-09-09); then C4, P3's constant half, C16, C17 and P9 (2026-11-23),
+alongside the int8 stem, downsample and conv -> conv chaining (2026-11-23)
+and the 2026-11-24 int8 max pool, int8 residual add, row-major matmul
+operands, grouped and patchify convolutions, depthwise demotion and pad fold,
+the retired quiescence dwell and MobileNetV2's residual adds.
 
 **Naming hazard.** Two different things in this repo are called M2: this
 file's M2 was the 200 MHz clock (now resolved), and `MULTICORE.md`'s M2 is the

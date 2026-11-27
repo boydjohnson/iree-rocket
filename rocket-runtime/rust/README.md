@@ -52,6 +52,7 @@ CARGO_TARGET_AARCH64_UNKNOWN_LINUX_GNU_LINKER=aarch64-linux-gnu-gcc \
   cargo build --release --target aarch64-unknown-linux-gnu --example run
 
 # Tests run anywhere, CPU-only, against a host build of the package:
+cmake --build iree-build/host/build --target rocket_runtime_package
 cmake --install iree-build/host/build --component IreeRocketRuntime --prefix /tmp/pkg
 ROCKET_RUNTIME_DIR=/tmp/pkg cargo test --features half
 ```

@@ -231,16 +231,21 @@ pub struct JobDesc<'a> {
 
 /// Submits several independent jobs in one SUBMIT ioctl.
 ///
-/// This is the difference that matters for multi-core execution. Tasks
-/// within one job run sequentially on a single core (see [`submit_tasks`]),
-/// so N tasks buy capacity, not parallelism. N *jobs* are independent work
-/// items the kernel scheduler can place on different cores -- that is the
-/// only lever userspace has, because `drm_rocket_job` has no core field and
-/// core assignment is entirely the kernel's.
+/// This does not spread work across cores. Tasks within one job run
+/// sequentially on a single core (see [`submit_tasks`]), and so, in
+/// practice, do the jobs of one submit: the mainline driver has one
+/// `drm_sched` per core but one scheduling *entity* per file descriptor,
+/// and an entity stays pinned to one core while it has queued work. Every
+/// job submitted on one `fd` therefore serializes onto one core.
+/// `drm_rocket_job` has no core field, so the lever userspace has is N file
+/// descriptors, one entity each: `rocket-hal-driver`'s worker pool opens one
+/// per context. Measured in `rocket-hal-driver/MULTICORE.md` §9: N opens
+/// scale ~3x on three cores, while N threads on dups of one `open()` get
+/// 1.00x on a matmul (ISSUES.md P1).
 ///
-/// Whether the scheduler actually spreads them is not observable from
-/// userspace: a successful submit says nothing about placement. Confirming
-/// it needs the out-of-tree kprobe tracer's per-core operation counts.
+/// What several jobs in one submit do buy is queue depth on that one core:
+/// a non-empty entity queue removes the per-tile submit -> IRQ -> submit
+/// bubble (the 1.3x on a conv in the same §9 control).
 ///
 /// Jobs submitted together have no ordering guarantee relative to each
 /// other, so they must not depend on each other's output. For height-tiled

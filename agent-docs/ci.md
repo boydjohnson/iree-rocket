@@ -43,7 +43,7 @@ There is no clippy job and no lit-test job.
 ### Nightly artifacts -- `nightly.yml`
 
 Builds the three things this repo exists to produce and attaches them to the
-run. Both jobs delegate to `iree-build.yml`; `runtime-aarch64` `needs:`
+run. All four jobs delegate to `iree-build.yml`; `runtime-aarch64` `needs:`
 `compiler-host`, because the aarch64 configuration points `IREE_HOST_BIN_DIR`
 at the host build's `tools/` for the codegen tools IREE runs on the host even
 when cross-compiling. Runs overlapping an earlier nightly cancel it
@@ -117,11 +117,12 @@ input and the zip round-trip drops the executable bit. Each carries a
 
 ### IREE build (reusable) -- `iree-build.yml`
 
-One `build` job, parameterized by `target` (`compiler-host` or
-`runtime-aarch64`); an unknown value fails the job up front, since every build
-step is gated on it and a typo would otherwise produce a green job that built
-nothing. So does `runtime-aarch64` on an arm runner. `compiler-host` builds
-for whatever the `runner` is. Inputs worth knowing about:
+One `build` job, parameterized by `target` (`compiler-host`,
+`runtime-aarch64` or `runtime-deb`); an unknown value fails the job up front,
+since every build step is gated on it and a typo would otherwise produce a
+green job that built nothing. So does `runtime-aarch64` on an arm runner, and
+`runtime-deb` on anything but one. `compiler-host` builds for whatever the
+`runner` is. Inputs worth knowing about:
 
 | Input | Default | Why |
 |---|---|---|
@@ -130,11 +131,13 @@ for whatever the `runner` is. Inputs worth knowing about:
 | `timeout-minutes` | 330 | Under GitHub's hard 6 h ceiling so the ccache save still runs. |
 | `retention-days` | 14 | Artifact retention. |
 
-ccache does the heavy lifting: the key is keyed on the **`iree-src` submodule
-SHA** (not `github.sha`, which would throw away the whole LLVM build on every
-unrelated Rust commit) plus the runner image and the configure scripts, with
+ccache does the heavy lifting: the key is per target and runner, then keyed on
+the **`iree-src` submodule SHA** (not `github.sha`, which would throw away the whole LLVM build on every
+unrelated Rust commit) plus the configure scripts, with
 restore-keys that deliberately fall back across IREE bumps. Restore and save
 are separate steps rather than `actions/cache`, so a build that fails or times
-out still banks the objects it did compile. The two targets get separate caches
-(3 GB host, 1 GB aarch64) to stay under the 10 GB per-repo budget -- otherwise
-the two nightly jobs evict each other's LLVM objects every run.
+out still banks the objects it did compile. Each target/runner pair gets its
+own cache (3 GB per `compiler-host` runner, 1 GB `runtime-aarch64`, 500 MB
+`runtime-deb`; 7.5 GB for the four nightly jobs) to stay under the 10 GB
+per-repo budget -- otherwise the jobs evict each other's LLVM objects every
+run.

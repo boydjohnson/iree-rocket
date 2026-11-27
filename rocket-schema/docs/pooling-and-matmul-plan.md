@@ -157,6 +157,11 @@ than passing while measuring its own geometry.
 `M` bound is the open one: 32 is the widest measured, and nothing says the
 next value fails -- it is simply where the ladder stops.
 
+> **Historical (2026-09-04), superseded.** These bounds were this plan's
+> starting point, not today's limits: `M`, `K` and `N` are all admitted to
+> 4096 now (`MAX_ADMITTED_MATMUL_M` in `rocket-core/src/admission.rs`).
+> [`LIMITS.md`](../../LIMITS.md) has the current matcher table.
+
 ## Schema changes
 
 All of these are compatible within `RKT1` by `docs/compatibility.md`'s own

@@ -97,14 +97,24 @@ int8 subtraction as `algo = 2` (Add) with a negated scale rather than
 `algo = 4`, so the register value is not a function of the logical operation
 alone. `elementwise_op_values_are_stable` pins the wire values.
 
-`ElementwiseBinaryDef` also has no precision field, but for a narrower reason
-than the unary table's. `iree-rocket-hal`'s `EwAddShape` *does* carry an int8
-branch; what it does not carry is confirmation. Its `EW_CVT_SCALE` and
-`OUT_CVT_SCALE` ratio semantics are inferred from register shape rather than
-checked against a known value -- the builder's own doc comments say so -- and
-`MUL` has no int8 recipe in any capture at all. Putting `precision` and the
-int8 scale fields on the wire would ship that inference as an ABI. Appending
-them once a capture confirms them is the compatible move.
+`ElementwiseBinaryDef` first shipped with no precision field, for a
+narrower reason than the unary table's. `iree-rocket-hal`'s `EwAddShape`
+*did* carry an int8 branch; what it did not carry was confirmation. Its
+`EW_CVT_SCALE` and `OUT_CVT_SCALE` ratio semantics were inferred from
+register shape rather than checked against a known value, and putting
+`precision` and the int8 scale fields on the wire then would have shipped
+that inference as an ABI. The policy was to append them once the int8 ADD
+was confirmed, and that is what happened: with the int8 residual add
+measured on the board (2026-11-24, #66), `ElementwiseBinaryDef.precision`,
+`relu` and `runtime_quantization` were added compatibly, defaulting to
+`FP16`, `false` and empty, so an older `RKT1` executable is the fp16 op it
+always was. With `precision = INT8` (ADD only -- `MUL` still has no int8
+recipe in any capture) the six `ElementwiseQuantParam` fields arrive as push
+constants after the runtime dimensions and before the trailing layout word.
+An older runtime does not know these fields and would run an int8
+executable as fp16 with its push-constant count off by six; it refuses the
+dispatch on that count, which is the failure a new vmfb on an old runtime
+should produce.
 
 `ElementwiseBinaryDef` does not broadcast. Both operands and the result share
 the one width/height/channels, which is why there is no per-operand shape; a
@@ -202,15 +212,6 @@ Rust layouts. `RKT1` replaces that payload; it is not byte-compatible with it.
 During migration, use a distinct HAL executable format string so the driver
 can route old and new payloads explicitly. Remove the legacy decoder only
 after old VMFB artifacts are no longer supported.
-
-`ElementwiseBinaryDef.precision`, `relu` and `runtime_quantization` were
-added compatibly, defaulting to `FP16`, `false` and empty: an older `RKT1`
-executable is the fp16 op it always was. With `precision = INT8` (ADD only)
-the six `ElementwiseQuantParam` fields arrive as push constants after the
-runtime dimensions and before the trailing layout word. An older runtime
-does not know these fields and would run an int8 executable as fp16 with its
-push-constant count off by six; it refuses the dispatch on that count, which
-is the failure a new vmfb on an old runtime should produce.
 
 ## Required tests
 

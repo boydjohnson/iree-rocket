@@ -1,7 +1,19 @@
 # Rocket compiler roadmap: shared planning and compile-time tiling
 
-Status: proposed, grounded in the checkout on 2026-09-08. This document
-describes future work; it does not change compiler or runtime behavior.
+Status 2026-11-27: mostly landed. Written as a proposal against the checkout
+of 2026-09-08; each section now opens with its own dated status. Landed:
+section 1 (`rocket-core`, `try_*` constructors and `PlanError`, #41),
+section 2 (`rocket-plan-ffi`, `rocket-plan-candidates` and admission through
+`transform.rocket.match.admitted` against `rocket-core/src/admission.rs`,
+#44), section 3 (`rocket-compiler audit` and `--strict-offload`, #45), and
+section 6's steps 1 to 3 (the layout contract 6.1, #50; prepacked weights
+6.3, #51; the declared layout's first form 6.2, #52). Open: section 4
+(serialized tile plans, not started and argued down in its own status),
+section 6.6 step 4 (packed IREE buffers, waiting on the multicore ownership
+decision); section 5's premise was wrong and its coverage came from raised
+ceilings instead. `rocket-plan-ffi` is at ABI 6 (`ROCKET_PLAN_ABI_VERSION` in
+`rocket_plan.h`); the versions 1 to 5 named below are the ones each step
+landed at.
 
 ## Direction
 
@@ -34,16 +46,19 @@ CPU fallback after an NPU dispatch has already been selected.
 
 ## Current implementation and the gaps
 
-| Area | Current code | Consequence |
-|---|---|---|
-| Convolution planning | `iree-rocket-hal/src/rocket/conv.rs`: `Shape`, `ConvPlan`, `Tile2D`, CBUF allocation, row/column partitions, accumulator staging | Tiling already exists, but pure planning is mixed with register emission and many unsupported cases panic. |
-| Matmul planning | `iree-rocket-hal/src/rocket/fc.rs`: `Shape`, `Plan` | `[M,K] × [K,N]` maps to width M, height 1, Cin K, Cout N in a 1×1 convolution. Column tiles split M; this does not split K or N. |
-| Runtime validation | `iree-rocket-hal/src/rocket/executable_format.rs`: `validate_conv_shape` | Rebuilds and parity-pads the shape, trial-plans under `catch_unwind`, then returns a generic `&'static str`, losing the actual refusal. |
-| Dispatch execution | `rocket-hal-driver/src/executable.rs`, `command_buffer.rs` | Resolves runtime dimensions and plans execution; conv and matmul command recording also catch planning panics. |
-| Compiler selection | `rocket-compiler-plugin/target/Rocket/rocket_conv2d_transform_spec.mlir` | Shape bounds and semantic matchers decide offload separately from the planner. The matmul matcher currently bounds M at 2047 and K/N at 3584. |
-| Placement report | `rocket-compiler/src/report.rs` | Reports final executables and dispatch sites, but lacks reliable per-original-op rejection reasons. Its comments document original attributes being lost during optimization. |
-| Compiler integration | C++ MLIR plugin plus Rust `rocket-compiler` embedding wrapper | Adding a Rust dependency to the wrapper is insufficient: the plugin must call the shared planner where the IR is inspected. |
-| Wire format | `rocket-schema/schema/rocket_executable_def.fbs` | Conv and matmul definitions support runtime dimensions; there is no complete serialized compile-time tile-plan contract. |
+As of 2026-09-08, before section 1. The table is kept as the starting point;
+the last column says where each row stands on 2026-11-27.
+
+| Area | Code on 2026-09-08 | Consequence | Now |
+|---|---|---|---|
+| Convolution planning | `iree-rocket-hal/src/rocket/conv.rs`: `Shape`, `ConvPlan`, `Tile2D`, CBUF allocation, row/column partitions, accumulator staging | Tiling already exists, but pure planning is mixed with register emission and many unsupported cases panic. | Pure planning is `rocket-core/src/conv.rs` with `try_*` constructors; the HAL's `ConvPlan` is a newtype that adds emission (section 1). |
+| Matmul planning | `iree-rocket-hal/src/rocket/fc.rs`: `Shape`, `Plan` | `[M,K] × [K,N]` maps to width M, height 1, Cin K, Cout N in a 1×1 convolution. Column tiles split M; this does not split K or N. | Moved to `rocket-core/src/fc.rs`; section 5 found `ConvPlan` already splits `M`. |
+| Runtime validation | `iree-rocket-hal/src/rocket/executable_format.rs`: `validate_conv_shape` | Rebuilds and parity-pads the shape, trial-plans under `catch_unwind`, then returns a generic `&'static str`, losing the actual refusal. | Returns the planner's own `PlanError`; `catch_unwind` is kept only as an `Internal` backstop. |
+| Dispatch execution | `rocket-hal-driver/src/executable.rs`, `command_buffer.rs` | Resolves runtime dimensions and plans execution; conv and matmul command recording also catch planning panics. | Unchanged in shape; command recording still keeps a `catch_unwind` backstop. |
+| Compiler selection | `rocket-compiler-plugin/target/Rocket/rocket_conv2d_transform_spec.mlir` | Shape bounds and semantic matchers decide offload separately from the planner. The matmul matcher currently bounds M at 2047 and K/N at 3584. | The matchers ask `transform.rocket.match.admitted`; the ceilings live in `rocket-core/src/admission.rs` (matmul `M` 4096 as `MAX_ADMITTED_MATMUL_M`, `K`/`N` 4096 via the dense channel ceilings). |
+| Placement report | `rocket-compiler/src/report.rs` | Reports final executables and dispatch sites, but lacks reliable per-original-op rejection reasons. Its comments document original attributes being lost during optimization. | `rocket-compiler audit` prints a per-candidate decision and reconciles it with the sites; `--strict-offload` (section 3). |
+| Compiler integration | C++ MLIR plugin plus Rust `rocket-compiler` embedding wrapper | Adding a Rust dependency to the wrapper is insufficient: the plugin must call the shared planner where the IR is inspected. | `rocket-plan-ffi` is linked into `libIREECompiler.so` and called from the plugin's passes (section 2). |
+| Wire format | `rocket-schema/schema/rocket_executable_def.fbs` | Conv and matmul definitions support runtime dimensions; there is no complete serialized compile-time tile-plan contract. | Still no serialized tile plan (section 4 not started); the layout word and `weights_packed` are on the wire (6.2, 6.3). |
 
 Preserve `RocketVerifyConvShapesPass.cpp` as an early semantic tripwire. An
 inconsistent convolution extent is a compilation error even if CPU fallback is
@@ -391,7 +406,7 @@ measurable additional time. All of it is one-time.
 `ROCKET_SCRATCH_POOL=0` at reps=20 pins the cause directly: `record` goes
 from 0.029 to **0.321 ms per dispatch**, so roughly 91% of the per-dispatch
 term is buffer allocation at 0.1 to 0.35 ms per `CREATE_BO` plus `mmap`.
-That the scratch pool (MULTICORE.md 12) already removes most of it is why
+That the scratch pool (`rocket-hal-driver/MULTICORE.md` 12) already removes most of it is why
 the steady-state figure is as small as it is.
 
 **What this section is therefore worth.** Serializing the tile plan removes
@@ -595,7 +610,14 @@ by inspection, and the argument of section 2 -- ask one planner, once,
 at compile time, and let the runtime check rather than rediscover -- is
 exactly the argument here.
 
-### What the runtime does today, and why it is discovery rather than knowledge
+### What the runtime did before 6.2, and why it was discovery rather than knowledge
+
+This subsection describes the driver as section 6 found it on 2026-09-10.
+6.2's first form (#52) replaced the pieces it names: `rocket-assign-layout`
+took `rocket-mark-dense-readers`' slot, the layout word took
+`runtime_dense_readers`' place on the wire, `ROCKET_CHAIN` and
+`ROCKET_LAZY_COMPACT` are gone, and the audit now prints every NPU -> NPU
+edge. See 6.2 for what is true now; the text below is kept as the argument.
 
 The driver already achieves item 4 on most edges, by proving at record time
 an identity the compiler could have stated. `chainable_cube`
@@ -635,7 +657,10 @@ consumer's own `truncf` folds against it and the edge becomes direct
 (P2 step 5, `rocket-fold-neutral-init`). That works, and it is what made
 chaining reach VGG's plain convolutions -- but it is IREE's canonicalizer
 being relied on to discover that the two dispatches agree on an element
-type. An encoding on the edge would state it.
+type. An encoding on the edge would state it. Since the IREE 3.14 bump
+(b37a044) the canonicalizer no longer folds that `truncf(extf(x))` pair at
+all; `CancelWidenNarrow` in `RocketFoldNeutralInitPass.cpp` cancels it
+instead.
 
 ### 6.1 The layout contract
 
@@ -659,7 +684,7 @@ freedom today and becomes a constraint:
 - **Tiling.** A multi-tile conv writes one cube; `Tile2D`'s row and column
   partitions are internal to it. This holds today and section 4's serialized
   plan does not change it.
-- **Fan-out** (MULTICORE.md M2). A fanned-out dispatch writes per-context
+- **Fan-out** (`rocket-hal-driver/MULTICORE.md` M2). A fanned-out dispatch writes per-context
   tiles and publishes no cube. Under a compile-time layout a fanned-out
   dispatch must either assemble one cube or be declared dense-out; "declines
   to chain" is no longer an available answer.
@@ -1114,7 +1139,7 @@ dense, reported.
   runtime validates -- and should share a version field and a target/policy
   identity. Whichever lands first defines the versioning; the other reuses
   it.
-- **MULTICORE.md M2 and P1.** See 6.1: fan-out and packed IREE buffers are
+- **`rocket-hal-driver/MULTICORE.md` M2 and P1.** See 6.1: fan-out and packed IREE buffers are
   in tension, and the second form of 6.2 cannot be designed without settling
   which context owns a packed tensor.
 - **The chain gate.** `fp16_conv_pool_conv_chain`, `fp16_matmul_chain`,
@@ -1156,11 +1181,11 @@ the whole model.
 
 | Milestone | Required evidence |
 |---|---|
-| A: core extraction and fallible APIs | Host boundary/refusal tests; existing vendor fixtures and register hashes unchanged; checked overflow and malformed-descriptor tests. |
-| B: compiler planning and explanations | MLIR tests for accepted/tiled/rejected candidates, unsupported semantics, dynamic policy, strict mode, provenance, and `--no-offload`; ABI ownership/error tests. |
-| C: serialized static plans | Schema compatibility and malformed-plan tests; compile/runtime plan equivalence; no repeated search for static dispatches. |
-| D: expanded spatial/M and N tiling | Tail/halo/coverage and scratch tests; CPU-reference comparisons and RK3588 execution on both sides of each newly admitted boundary. |
-| E: reduction tiling and tuning | Nonzero initial accumulators, bias/activation/quantization tests; precision/overflow tests; full-model correctness and end-to-end performance measurements. |
+| A: core extraction and fallible APIs | **Met 2026-09-09** (section 1). Host boundary/refusal tests; existing vendor fixtures and register hashes unchanged; checked overflow and malformed-descriptor tests. |
+| B: compiler planning and explanations | **Met 2026-09-09** (sections 2 and 3). MLIR tests for accepted/tiled/rejected candidates, unsupported semantics, dynamic policy, strict mode, provenance, and `--no-offload`; ABI ownership/error tests. |
+| C: serialized static plans | **Not started** (section 4). Schema compatibility and malformed-plan tests; compile/runtime plan equivalence; no repeated search for static dispatches. |
+| D: expanded spatial/M and N tiling | **Not started**; section 5 found the planner already covers these axes and raised the ceilings instead. Tail/halo/coverage and scratch tests; CPU-reference comparisons and RK3588 execution on both sides of each newly admitted boundary. |
+| E: reduction tiling and tuning | **Not started** (section 5). Nonzero initial accumulators, bias/activation/quantization tests; precision/overflow tests; full-model correctness and end-to-end performance measurements. |
 | F: layout contract and prepacked weights (6.1, 6.3) | **Met 2026-09-10.** `OutputCube` computed through `rocket-core::layout` with the driver bit-identical on every surveyed model; packed weight bytes byte-identical to the driver packer on every conv fixture; first-inference latency and `.vmfb` size before and after (6.3). |
 | G: compiler-declared layout (6.2) | **First form met 2026-09-10** (6.2). Per-binding encoding on the wire; driver checks and never repacks a declared-packed input on the same command buffer; the chain fixtures bit-exact with `ROCKET_CHAIN`/`ROCKET_LAZY_COMPACT` removed; the audit names every NPU -> NPU edge packed or dense with a reason; `--strict-layout`. |
 
@@ -1177,7 +1202,8 @@ Record correctness, total latency, host packing/compaction, hardware jobs,
 scratch peak, executable size, and compile time. Expand default admission only
 with supporting evidence; keep speculative tiling policies opt-in.
 
-The first implementation PR should deliver milestone A without widening any
+As planned on 2026-09-08 (both steps have since landed, as #41 and #44/#45):
+the first implementation PR should deliver milestone A without widening any
 limits. The next should connect the planner to compiler selection and reporting.
 That provides useful diagnostics early and establishes a trustworthy foundation
 for compile-time plan serialization and new tiling strategies.

@@ -27,12 +27,19 @@ kernel definition. Version 1 supports:
   `docs/compatibility.md`.
 - **`MatmulDef`** -- a row-major `[M,K] x [K,N]` matmul, which the runtime
   lowers to the 1x1-convolution path. This is what `linalg.matmul` becomes.
+- **`ElementwiseUnaryDef`** -- a standalone fp16 EW ALU job on one tensor:
+  `ABS`, `NEG`, `FLOOR`, `CEIL`, or `ADD_SCALAR` with a scalar operand.
+- **`ElementwiseBinaryDef`** -- a two-tensor EW ALU job (`ADD`, `SUB`, `MUL`,
+  `MAX`, `MIN`) on operands of one shared shape, fp16 or (ADD only) int8,
+  with an optional ReLU.
+- **`ElementwiseLutDef`** -- an int8 lookup-table activation (sigmoid, tanh,
+  exp and the other `LutFn` curves) as its own DPU job.
 - **`FullyConnectedDef`** -- deprecated, never emitted, retained so union
   tags do not move.
 
-All three kernel kinds support `runtime_dimensions`, the optional mapping
-from dispatch push constants to shape fields that lets one executable serve
-many shapes.
+Every kind except `FullyConnectedDef` supports `runtime_dimensions`, the
+optional mapping from dispatch push constants to shape fields that lets one
+executable serve many shapes.
 
 The convolution fields intentionally mirror the current Rust `ConvShape`.
 FlatBuffers verifies the wire structure. The Rocket runtime must still reject
@@ -69,8 +76,10 @@ To parse a compiler-produced executable in the IREE HAL driver:
 1. Call `iree_hal_read_executable_flatbuffer_header` with `RKT1`.
 2. Verify the remaining bytes as an `ExecutableDef` root.
 3. Require the export count to match the IREE executable layout.
-4. Select the export by ordinal and require `KernelDef::Conv2DDef`.
-5. Map the table to `ConvShape` and run the existing semantic validation.
+4. Select the export by ordinal and switch on its `KernelDef` type.
+5. Map the table to that kind's runtime shape (`ConvShape` for `Conv2DDef`,
+   and so on) and run its semantic validation.
+   `rocket-hal-driver/src/executable_cache.rs` is the reference decoder.
 
 The compiler should build the FlatBuffer with IREE's `FlatbufferBuilder` and
 emit it using:
@@ -81,9 +90,10 @@ builder.getHeaderPrefixedBufferAttr(
     /*version=*/0);
 ```
 
-The HAL executable format string should change when migrating from the current
-manual 85-byte format, for example from `rocket-conv2d-v1` to
-`rocket-flatbuffer-v1`.
+The HAL executable format string for this format is `rocket-flatbuffer-v1`.
+The manual 85-byte format it replaced keeps its own string,
+`rocket-conv2d-v1`, which the driver still accepts as a legacy format while
+old test inputs are migrated.
 
 ## Rust
 

@@ -19,9 +19,11 @@ there is wrong, and two of them below are gated on open issues by name.
 
 Nothing here is a throughput proposal, with one marked exception. The
 distinction matters more in this document than anywhere else in the repo,
-because most of the work below buys **coverage** and P8 has already measured
-that coverage of this particular shape buys **negative** throughput. See the
-next section before reading the phases. The exception is
+because most of the work below buys **coverage**, and P8 once measured that
+coverage buys **negative** throughput -- a verdict retired
+2026-11-25 (next section; ISSUES.md P8 is marked superseded), though the
+element-wise flag still rests on its own measurement. See the next section
+before reading the phases. The exception is
 [Attention](#attention-and-which-flashattention-ideas-transfer) near the end,
 which is a throughput proposal and says so: it exists because
 [SOFTMAX.md](SOFTMAX.md) §10 measured where attention's time actually goes,
@@ -60,8 +62,13 @@ conclusion has its own evidence.** Coverage matchers still land behind a
 flag, because the one that was built and measured loses on its own terms:
 ViT with `--elementwise` is **1.17x slower at eight cores**, and no matcher
 cut point rescues it -- even ViT's widest element-wise op is net-negative, so
-it is not a bounds problem. The lever that would change that answer is layout
-propagation, which is P2 and refuted, not a wider matcher. So read the
+it is not a bounds problem. ~~The lever that would change that answer is layout
+propagation, which is P2 and refuted, not a wider matcher.~~ Corrected
+2026-11-27: the lever named is P2's, and P2 is not refuted but **closed**
+(ISSUES.md P2; #39, 2026-09-08, gave every dispatch kind, element-wise
+included, the chain and lazy compaction). The 1.17x is a 2026-09-06,
+pre-#39 measurement and has not been re-run since, so it is the stale half
+of this argument -- see Phase 1's ViT measurement. So read the
 ordering below as resting on that measurement rather than on a blanket rule
 about dispatch counts, and judge a new op by the per-op bar the "Recommended
 order" section states: *does this op do more work than its dispatch costs?*
@@ -76,7 +83,7 @@ With that, this roadmap separates two things the repo has previously conflated:
   one, and is the only phase here with a positive performance story.
 
 A phase that ships element-wise coverage matchers switched on by default would
-regress ViT by 1.17x on the measurement above. That is the failure mode this
+regress ViT by 1.17x on the measurement above (pre-#39, pending a re-run). That is the failure mode this
 ordering exists to prevent -- and it is now a statement about element-wise
 ops specifically, not about offload sites in general.
 
@@ -108,8 +115,10 @@ of the element-wise or LUT work above is expressible.**~~
 `rocket-hal-driver` and serializer arms in `RocketTarget.cpp`. The two-tensor
 form is reachable from a compiled model behind `--elementwise`; the other two
 are expressible but no measured model contains an op that would use them (see
-Phase 1's op census). Chained conv->LUT and conv->EW as one job remain
-unexpressible: the wire format has no way to say "two tasks, one job".
+Phase 1's op census). ~~Chained conv->LUT and conv->EW as one job remain
+unexpressible: the wire format has no way to say "two tasks, one job".~~
+Conv->EW add has been expressible since 2026-09-08 (#38) as
+`Conv2DDef.epilogue_add`; conv->LUT still has no wire form.
 
 ### Gap 2 -- matchers
 
@@ -156,8 +165,8 @@ matcher fall back to the CPU silently rather than panic.
 | Capability | Where it lives | What the wire has instead |
 |---|---|---|
 | Five of the eight conv datatypes: bf16, int16, fp16 with fp32 accumulator, tf32, int4 -- all board-validated | `Precision` in [`conv.rs`](iree-rocket-hal/src/rocket/conv.rs); ladders in `conv2d_oracle_hw` | `Precision` has `INT8`, `FP16`, `INT8_ACCUMULATOR`. The driver's precision decode errors on anything else; the only place it names the other five is the profiler's label table |
-| conv → LUT and conv → EW add as two tasks in one job | `build_conv_then_lut_regcmd`, `build_conv_then_add_regcmd`; `conv_then_lut_hw`, `conv_with_add_hw` | No way to say "two tasks, one job". Every LUT or EW op is its own dispatch with its own NC1HWC2 round trip |
-| int8 two-tensor element-wise, with output zero point, conversion offset and two scale ratios | `EwAddShape` with `EwPrecision::Int8` in [`elementwise.rs`](iree-rocket-hal/src/rocket/elementwise.rs) | `ElementwiseBinaryDef` is fp16 only, deliberately: the ratio semantics are inferred from register shape, not confirmed by a capture, and MUL has no int8 recipe at all (`docs/compatibility.md`) |
+| conv → LUT ~~and conv → EW add~~ as two tasks in one job | `build_conv_then_lut_regcmd`, `build_conv_then_add_regcmd`; `conv_then_lut_hw`, `conv_with_add_hw` | ~~No way to say "two tasks, one job". Every LUT or EW op is its own dispatch with its own NC1HWC2 round trip~~ **The add landed 2026-09-08 (#38)**: `Conv2DDef.epilogue_add` / `epilogue_activation` run it as an EW task after the conv's tiles (see Phase 3). Conv → LUT still has no wire form |
+| ~~int8 two-tensor element-wise, with output zero point, conversion offset and two scale ratios~~ | `EwAddShape` with `EwPrecision::Int8` in [`elementwise.rs`](iree-rocket-hal/src/rocket/elementwise.rs) | ~~`ElementwiseBinaryDef` is fp16 only, deliberately: the ratio semantics are inferred from register shape, not confirmed by a capture, and MUL has no int8 recipe at all (`docs/compatibility.md`)~~ **Landed 2026-11-24 (#66)** for the add: `ElementwiseBinaryDef.precision` and `relu` were appended, and `#rocket_elementwise_add_int8_relu_target` runs ResNet50's residual adds with an int8 skip (lossy, opt-in). MUL still has no int8 recipe |
 | Per-output-channel weight zero points | `pack_hwcf_to_rocket_weights_affine_i8` takes one zero point per `Cout` | One scalar `weights_zero_point`; the driver broadcasts it across every channel |
 | Explicit CBUF plans and bank overrides for kernels above 3x3 | `ConvPlan` with an override; fp16 measured to 11x11 and int8 to 7x7 (LIMITS.md) | `weights_width`/`height` can name any extent, but automatic planning covers 1x1 and 3x3 only and no wire field can ask for an override |
 
@@ -175,15 +184,15 @@ max pooling, which closed with six matchers and no change below the compiler.
 
 | Capability | Plumbed through | What the spec does today |
 |---|---|---|
-| ~~Fused activation on a conv (`RELU`, `RELUX`)~~ | schema `Activation`; serializer parses `relu`/`relux`; driver `decode_activation`; HAL `Activation::{Relu, Clamped}`; `conv_activation_fused_hw`, `conv_fp16_bias_activation_hw` | **Done 2026-09-07 for fp16 ReLU6**, 17 of MobileNetV2's 18 fusable sites, 146 -> 133 ms at four cores. **Done 2026-09-08 for fp16 ReLU and for the bias alone**, on the f16-import chain too: ResNet50 230 -> 162 ms at four cores, 130 -> 22 CPU dispatch sites, and 32 of its 53 NPU results now feed another NPU dispatch directly (ISSUES.md P2). Still open: ReLU6 on an f16 import, the stride-2 stem, and the int8 form -- see below |
+| ~~Fused activation on a conv (`RELU`, `RELUX`)~~ | schema `Activation`; serializer parses `relu`/`relux`; driver `decode_activation`; HAL `Activation::{Relu, Clamped}`; `conv_activation_fused_hw`, `conv_fp16_bias_activation_hw` | **Done 2026-09-07 for fp16 ReLU6**, 17 of MobileNetV2's 18 fusable sites, 146 -> 133 ms at four cores. **Done 2026-09-08 for fp16 ReLU and for the bias alone**, on the f16-import chain too: ResNet50 230 -> 162 ms at four cores, 130 -> 22 CPU dispatch sites, and 32 of its 53 NPU results now feed another NPU dispatch directly (ISSUES.md P2). ~~Still open: ReLU6 on an f16 import, the stride-2 stem, and the int8 form~~ -- since landed: ReLU6 on an f16 import 2026-09-10 (#49), int8 ReLU folded into the quantizer 2026-11-23 (#64), the stride-2 stem's pad and ReLU6 2026-11-24 (#80). See below |
 | ~~Conv padding~~ | schema `pad_top`/`pad_left`; driver decode; serializer; `rocket-fold-conv-pad`; `#rocket_dynamic_pad1_target` and its stride-2 twin | **Done 2026-09-07, symmetric pad 1.** ResNet50 fp16 folds all 16 of its pad sites into the CNA: `slow_memcpy` executables 7 -> 0, CPU dispatch sites 186 -> 170, 230 -> 223 ms at four cores and 203.5 -> 195.5 at eight, output identical to the materialized-pad arm. MobileNetV2 is unchanged, and that is the point of the sizing note below -- it was the wrong model to measure this on. Asymmetric padding remains impossible: it is a hardware limit, not a wire one. **Depthwise, 2026-11-24:** `#rocket_dynamic_depthwise_pad1_relu6_target` (+ `_s2`) and the fold pass moving the pad below the NCHW transpose fold all 17 of MobileNetV2's depthwise pads -- 30.8 -> 13.5 ms, 2.3x faster than `--no-offload`, bit-identical (ISSUES.md Resolved). **Dense ReLU6, same day:** `#rocket_dynamic_pad1_relu6_target` (+ `_s2`) folds the stem's pad and clamp -- 13.4 -> 12.2 ms |
 | Unary EW: abs, neg, floor, ceil, add-with-scalar (fp16) | `ElementwiseUnaryDef` (tag 5), driver, serializer, `ew_unary_hw` | No matcher. No measured model contains one of these ops |
 | The nine LUT curves (int8) | `ElementwiseLutDef` (tag 6), driver, serializer, `lut_zero_join_hw` | No matcher. The LUT path is int8 by construction and the models' `sqrt`/`erf` are f32 |
 | EW `MAX` and `MIN` | `EwBinaryOp`, driver, serializer, `ew_binary_hw` (bit-exact) | Only `add`/`sub`/`mul` have matchers, and those sit behind `--elementwise` |
 | Dense conv at stride 3 and 4 | `Conv2DDef.stride`; HAL `Shape::with_stride` | Executables *and* matchers are written in the spec but are not in the `foreach_match` list. Depthwise NHWC fp16 has no strided matcher at all, though NCHW does |
-| Kernels other than 1x1 and 3x3 | `weights_width`/`height`; HAL fp16 to 11x11 with the `Cin` cliffs in LIMITS.md | No matcher claims one |
-| int8 matmul and int8 pooling | `MatmulDef.precision`, `PoolingDef.precision`; driver maps `INT8` for both; `fc::Shape` takes any `Precision`, `PoolingPrecision::Int8` | Every matmul and pooling target is fp16. The serializer refuses only `int8_accumulator` for matmul |
-| Pooling padding and unequal per-axis stride | four pad fields, `stride_x`/`stride_y`; HAL pads 0..=7 | Matchers bake zero padding and equal strides of 1 or 2, so model-level pooling pads also run on the CPU |
+| ~~Kernels other than 1x1 and 3x3~~ | `weights_width`/`height`; HAL fp16 to 11x11 with the `Cin` cliffs in LIMITS.md | ~~No matcher claims one~~ **Partly landed 2026-11-23/24**: int8 7x7 stride-2 stem (#61), fp16 4x4 for the space-to-depth stem (#73) and the 7x7 depthwise convs (#76) are in `foreach_match`. Other sizes still have no matcher |
+| int8 matmul and ~~int8 pooling~~ | `MatmulDef.precision`, `PoolingDef.precision`; driver maps `INT8` for both; `fc::Shape` takes any `Precision`, `PoolingPrecision::Int8` | ~~Every matmul and pooling target is fp16.~~ Every matmul target is fp16. The serializer refuses only `int8_accumulator` for matmul. int8 max pooling landed 2026-11-24 (#67, `#rocket_pooling_max_int8_target_s2`) |
+| Pooling padding and unequal per-axis stride | four pad fields, `stride_x`/`stride_y`; HAL pads 0..=7 | ~~Matchers bake zero padding~~ Max pooling pads 1 at stride 2 since 2026-11-24 (`#rocket_pooling_max_int8_pad1_target_s2`, #69; fp16 `#rocket_pooling_max_pad1_target_s2`, #73); other pads and unequal strides are still baked out, so those model-level pooling pads run on the CPU. Strides are equal, 1 or 2 |
 | Runtime input zero point | `Conv2DQuantParam::INPUT_ZERO_POINT` | The requant targets push only `output_scale` and `output_zero_point` |
 
 The two rows at the top of that table were called the cheapest throughput
@@ -234,7 +243,9 @@ stack supports at a *shape* the measurement has not reached. Every dense
 channel ceiling in [`conv.rs`](rocket-core/src/conv.rs) (then in the HAL) moved from
 1792 (fp16 family), 1344/1792 (int8, int4) and 1024/1792 (tf32) to a uniform
 **3584** on `Cin` and `Cout`, with the k=1 matchers and the matmul matcher
-following. [LIMITS.md](LIMITS.md#convolution-channel-limits) carries the sweep;
+following. (Since 2026-09-09, #46, the dense ceiling is **4096** --
+`MAX_INPUT_CHANNELS` in `rocket-core/src/conv.rs`; the 3584 figures below
+are the record of this raise.) [LIMITS.md](LIMITS.md#convolution-channel-limits) carries the sweep;
 the short version is that at k=1 the binding quantity is not CBUF feature
 residency, so every rung reaches the same ceiling, and 4096 measured clean
 everywhere while 8192 did at fp16.
@@ -602,13 +613,21 @@ nothing propagates a packed layout between dispatches. **No cut point in the
 shape distribution rescues it** -- even the widest op ViT has is net-negative
 -- so this is not a bounds-tuning problem. Since 2026-09-08 a *convolution*
 that reads another dispatch's output skips its half of that round trip
-(ISSUES.md P2 step 2, `ROCKET_CHAIN`); the element-wise dispatch kind records
+(ISSUES.md P2 step 2); ~~the element-wise dispatch kind records
 no output cube yet and still pays both halves, so this measurement stands
-until it does.
+until it does~~. **It does, since the same day**: #39 ("Finish P2: chain and
+lazy compaction for every dispatch kind") gave the element-wise kind its
+output cube (`elementwise_output_cube`,
+`rocket-hal-driver/src/command_buffer.rs`). So this section's own
+retirement condition was met on 2026-09-08, two days after the measurement,
+and the 1.17x is **pre-P2 and has not been re-measured**. Re-measuring it
+is pending.
 
-**Conclusion: `--elementwise` stays off by default.** It is P8's law confirmed
+**Conclusion: `--elementwise` stays off by default** -- pending that
+re-measurement, on a figure that predates #39. It is P8's law confirmed
 on a second model and a second op family, with the mechanism named. The lever
-that would change the answer is layout propagation (P2), not a wider matcher.
+that would change the answer is layout propagation (P2), not a wider matcher;
+P2 has since closed (ISSUES.md P2), which is why the figure needs re-taking.
 
 One incidental finding: 25 of the matched sites are `1x197x1` -- a single
 channel padded to a 16-channel atom. They cost only 7.9 ms in total, but a
@@ -858,7 +877,8 @@ been displaced -- that model is now 10.0 ms offloaded against 30.9 ms
 `--no-offload` at four workers, 3.1x the other way (ISSUES.md P7,
 2026-11-25) -- but the flag does not depend on it. What holds the flag shut
 is the direct measurement of the thing behind it: ViT with `--elementwise`
-is 1.17x slower at eight cores.
+is 1.17x slower at eight cores -- a 2026-09-06 figure that predates #39's
+element-wise chain and has not been re-measured since.
 
 Phase 3 moved that reference point and did not remove it. The int8 dispatch
 tax is much lower than it was -- the model beats the CPU now -- but what
@@ -910,9 +930,14 @@ softmax at **4.03x to 4.05x**, so at 1792 rows the op is **2.25x to 2.42x
 slower** than the CPU it is replacing, and it loses to even two threads at
 every row count.
 No shape under the 1792 ceiling closes that. Lever 4 cannot either: it
-would need 2.42x and MULTICORE.md §12 measured 1.22x to 1.34x. Lever 2 plus
-lever 4 together reach roughly parity, which is not worth the accuracy cost
-and the two host boundaries. The rest of this bullet is the original
+would need 2.42x and rocket-hal-driver/MULTICORE.md §12 measured 1.22x to
+1.34x. ~~Lever 2 plus lever 4 together reach roughly parity~~ -- corrected
+2026-11-27 with SOFTMAX.md §13.1: that projection deleted the sum tree and
+billed nothing for the `P^T` pack lever 2 needs (9.1 heads x 0.048 ms at
+1792 rows, about twice that in situ). Billed, lever 2 alone is 1.6x to 2.1x
+slower than four threads and levers 2 and 4 together 1.2x to 1.7x slower,
+and even parity would not have been worth the accuracy cost and the two
+host boundaries. The rest of this bullet is the original
 reasoning, which still holds -- the *mechanism* was right and the baseline
 was wrong.
 
@@ -1047,7 +1072,7 @@ maximum that is too small, the op degrades rather than explodes.
 
 **4. Split the keys across cores -- the one place the online recurrence
 earns its keep.** FlashDecoding's split over the KV axis maps onto M2's
-job fan-out (MULTICORE.md §12), and combining partial `(m, d, O)` triples
+job fan-out (rocket-hal-driver/MULTICORE.md §12), and combining partial `(m, d, O)` triples
 is exactly the online-softmax merge. It is also the *only* way to get more
 than one core onto a single attention head, because mainline `rocket` has
 no cross-fd BO sharing, so the merge has to be host-side -- on width-1

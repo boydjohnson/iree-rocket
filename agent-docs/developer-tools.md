@@ -35,13 +35,18 @@ version.
 | [`rocket-hal-driver`](../rocket-hal-driver) | Rust `staticlib` implementing IREE's HAL driver interface, statically linked into IREE via `iree_register_external_hal_driver()`. Depends on `iree-rocket-hal` and `rocket-schema`. Includes HAL CTS wiring under `cts/`. |
 | [`rocket-compiler-plugin`](../rocket-compiler-plugin) | C++ IREE compiler target plugin ("Rocket"), loaded via `IREE_CMAKE_PLUGIN_PATHS`. Serializes executables using `rocket-schema`'s FlatBuffer format. |
 | [`rocket-compiler`](../rocket-compiler) | Rust driver over `libIREECompiler.so`. Applies the Rocket transform spec and the device flags it expects, and can audit why each convolution and matmul is where it is. |
+| [`rocket-runtime`](../rocket-runtime) | The runtime as one library, `libiree_rocket_runtime.so`/`.a`, with `rocket_runtime_session_create()` setting up the NPU + CPU device group every rocket-compiler module needs; built in `iree-build/host-aarch64`. [`rocket-runtime/rust`](../rocket-runtime/rust) holds the Rust bindings (`rocket-runtime-sys`, `rocket-runtime`) as a separate Cargo workspace. |
+| [`debian`](../debian) | Packaging for one source, four binaries: `rocket-compiler`, `libiree-rocket-runtime314`, `libiree-rocket-runtime-dev`, `iree-rocket-tools`. |
+| [`kernel-patches`](../kernel-patches) | The three out-of-tree `accel/rocket` changes every measurement assumes (PPU IRQ status checks, NPU clock, reset before IOMMU detach) and how to rebuild the module. |
 | [`tools`](../tools) | Python harnesses: ONNX import/export, the board regression gates, the whole-model survey, the precision-transition probe. |
 | `iree-build/iree-src` | `iree-org/iree` as a pinned git submodule. |
 | `iree-build` | CMake configuration used to build IREE with the Rocket driver/plugin. |
 
 ## Building
 
-Each of the three artifacts has its own build directory under `iree-build/`,
+Each of the three everyday artifacts has its own build directory under
+`iree-build/` (a fourth, the Vulkan-capable compiler in `build-vulkan`, is
+optional; see [the Mali GPU as a second backend](#the-mali-gpu-as-a-second-backend)),
 since each configures a different CMake source root (the vendored `iree-src`
 directly, vs. one of two small wrapper projects that register the Rocket HAL
 driver before IREE's own `add_subdirectory` runs):
@@ -72,14 +77,25 @@ single repo-root `CMakePresets.json` can't span these plus the vendored
 of the aarch64 configure preset, while `configure-compiler-host.sh` covers the
 compiler case, which has no wrapper project at all.
 
-The Rust crates (`rocket-core`, `rocket-plan-ffi`, `rocket-schema`, `iree-rocket-hal`, `rocket-hal-driver`) form
-a single Cargo workspace and can be built/checked independently of the CMake
-builds above:
+The Rust crates (`rocket-core`, `rocket-plan-ffi`, `rocket-schema`,
+`iree-rocket-hal`, `rocket-hal-driver`, `rocket-compiler`) form a single Cargo
+workspace and can be built/checked independently of the CMake builds above
+(`rocket-runtime/rust` is excluded: it needs the installed runtime package):
 
 ```sh
 cargo build --workspace
 cargo test --workspace
 ```
+
+### Packages and the runtime library
+
+The runtime library is the `rocket_runtime_package` target of the aarch64
+build; [rocket-runtime/README.md](../rocket-runtime/README.md) has the install
+command and the API. The Debian packages are built by
+[`.github/scripts/build-debs.sh`](../.github/scripts/build-debs.sh) in CI
+(`compiler` or `runtime` half), and locally with `dpkg-buildpackage` as
+[debian/README.source](../debian/README.source) describes, including the
+runtime-only and cross-built profiles.
 
 ## Compiling a model
 
@@ -135,9 +151,9 @@ Placement decisions (2 candidate(s) at selection time):
       nhwc 14x14 Cin 88 Cout 528 k1x1 s1
       cbuf 2/10
   dense_conv2d at model.mlir:13:12 -> CPU [unvalidated_configuration] [fp16]
-      nhwc 7x7 Cin 3585 Cout 64 k1x1 s1
+      nhwc 7x7 Cin 4097 Cout 64 k1x1 s1
       validation policy: register-representable, not measured
-      input channels must be 1..=3584; beyond that the channel padding has no
+      input channels must be 1..=4096; beyond that the channel padding has no
       capture backing at this precision
   1 direct, 0 tiled, 1 cpu, 0 deferred; 1 hardware job(s) planned
   ...
@@ -222,9 +238,10 @@ cargo run -p rocket-compiler -- compile --input mnv2.int8.mlir --no-offload \
     --output mnv2.int8.cpu.vmfb --llvmcpu-target-triple aarch64-linux-gnu
 ```
 
-On `mnv2.int8.mlir` that is 50 Rocket dispatch sites against 0, and 95 CPU
-sites against 64 -- the offload's own overhead, visible in `audit` before
-anything runs. Confirm it with `audit --no-offload`, which must report
+On `mnv2.int8.mlir` under IREE 3.14 (the board set, 2026-11-25; see
+[iree-3.14-bump.md](iree-3.14-bump.md#int8-not-in-the-survey-board-set-old-vs-new-compiler))
+that is 54 Rocket dispatch sites against 0, and 91 CPU sites against 72 --
+the offload's own overhead, visible in `audit` before anything runs. Confirm it with `audit --no-offload`, which must report
 `0 dispatch site(s) -> rocket`.
 
 The flag refuses to produce a spec it cannot vouch for: if a matcher in the
@@ -551,6 +568,19 @@ its own at one context.
 | `ROCKET_SCRATCH_POOL=0` | Allocate and free every scratch buffer instead of pooling. |
 | `ROCKET_SCRATCH_POOL_MB=N` | Bytes the scratch free lists may hold, default 256 per context. |
 
+IREE's own transient buffers (`queue_alloca`/`queue_dealloca`, ~85 a run on
+ResNet50-224 int8) are recycled the same way: a freed buffer keeps its GEM
+object, mapping and IOVA on a free list keyed on its exact page-rounded size,
+so a static-shape program reuses its whole transient set after the first
+invocation. `rocket-hal-driver/src/buffer_cache.rs` documents the cost it
+removes (~15 ms of `CREATE_BO` and ~20 ms of frees per inference on that
+model) and why a reused buffer leaks nothing through IREE.
+
+| Variable | Effect |
+|---|---|
+| `ROCKET_BUFFER_CACHE=0` | Allocate and free every IREE buffer instead of caching it. |
+| `ROCKET_BUFFER_CACHE_MB=N` | Bytes the buffer free lists may hold, default 256 per allocator. |
+
 Two dispatches on one command buffer that share a tensor do not go through
 the dense buffer between them. The consumer reads the producer's NC1HWC2
 output cube in place instead of repacking (the *chain*), and the producer
@@ -560,7 +590,7 @@ compaction*). Every dispatch kind takes part -- convolution, matmul, pooling
 and element-wise -- with one geometric caveat: the PPU strides its surfaces
 by the pixel count rounded up to four, so a pool only chains at a multiple
 of four pixels. The count travels as the dispatch's last push constant
-(`rocket-mark-dense-readers`, run by `rocket-compiler` at the flow phase);
+(`rocket-assign-layout`, run by `rocket-compiler` at the flow phase);
 a reader on another command buffer, a CPU reader, or a consumer that could
 not chain all keep the write. Two compiler details make the edges adjacent
 in the first place: each shim widens its f16 result with a plain generic
@@ -631,16 +661,18 @@ python3 tools/e2e_matmul_regression.py --board "<board name>"
 
 Its raw half runs the FC oracle tests from both `fc_hw` and `fc_phase3_hw`;
 its compiled half covers the ViT projection shape, MobileNetV2's classifier,
-the `K`/`N` channel ceilings at 3584, ViT-B/16's `197x768x3072` MLP
-projection, `M` at the matcher's 2047, `linalg.matvec` and `vecmat` through
-the GEMV raising, and two matmuls sharing a command buffer. **Eight of its
-nine cases are compared exactly.** A contraction can be gated exactly if its
+the `K`/`N` channel ceilings at 3584 and at today's 4096, ViT-B/16's
+`197x768x3072` MLP projection, `M` at the old 2047 and today's 4096 row
+ceiling, `linalg.matvec` and `vecmat` through the GEMV raising, and two
+matmuls sharing a command buffer. **Ten of its eleven cases are compared
+exactly.** A contraction can be gated exactly if its
 fixtures are ternary -- entries from `{-1, 0, 1}` are exact in f16, every
 product is, and the sums stay far inside f16's integer-exact range (measured
 |C|max 79 at `K` 768, 118 at 1792, against a ceiling of 2048; a ternary sum
-grows as the square root of `K`, so `K` 3584 stays well under it). The ninth
-case is the same shape with realistic magnitudes and a tolerance, since
-ternary data never rounds and so cannot see a precision fault.
+grows as the square root of `K`, so `K` 4096 stays well under it). The
+remaining case, `matmul_vit_dense`, is the ViT projection shape with realistic
+magnitudes and a tolerance, since ternary data never rounds and so cannot see
+a precision fault.
 
 `tools/e2e_pooling_regression.py` is the same gate for pooling, with the same
 flags:
