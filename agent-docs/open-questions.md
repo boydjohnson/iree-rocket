@@ -165,11 +165,6 @@ divergence matter for int8 depthwise with nonzero weight zero points?
 that every vendor and Mesa program writes as zero? [`builders/core.rs`,
 `builders/dpu.rs`]
 
-1.5.8 Is the EW unary `Add`'s scalar operand (`EW_OP_VALUE_0`, "from
-configure register") read as a raw IEEE fp32? No capture uses that operand
-source, and the encoding is marked UNCONFIRMED. Has `ew_round_hw.rs` settled
-it? [`iree-rocket-hal/src/rocket/elementwise.rs`]
-
 ### 1.6 Capability that has never been measured
 
 1.6.1 Does the hardware support stride above 1 at kernels above 3x3 beyond
@@ -231,8 +226,13 @@ still does is the output `PREP_BO` and a fanned-out replica's staged input.
 2.5 Could `SUBMIT` return an out-fence (sync_file or syncobj)? Today it is
 fire-and-forget, `PREP_BO` is the only completion primitive, and there is no
 status ioctl or register read. That rules out a userspace drain check (1.1.1)
-and makes IREE semaphore integration thread-per-wait. [`device.rs` dwell
-comment, ISSUES P8 "284 threads per inference"]
+and forces a thread to block on every wait. Since M0 that is one worker
+per NPU context for `queue_execute` (`rocket-hal-driver/src/pool.rs`), not
+a thread per op; but alloca/dealloca and the host-memcpy queue ops (fill,
+update, copy, read, write) still spawn a thread per call whose wait is not
+already satisfied (`run_after_wait` in `rocket-hal-driver/src/device.rs`).
+[`device.rs` dwell comment, ISSUES P8 "284 threads per inference",
+MULTICORE §5.3]
 
 2.6 What is the upstream status of the two out-of-tree changes `planck` has
 run: PPU completion and the `rocket_npu_clk_hz`/`rocket_npu_uv` clock and
@@ -255,8 +255,9 @@ with `soc->num_clks`) and loaded with `rocket_npu_clk_hz=600000000`; so is
 `088` (reset before IOMMU detach, see 2.7). At 600 MHz: gate 409/409,
 every board model bit-identical to its 200 MHz output, ResNet50-224 fp16
 ~105 -> 45 ms and int8 150 -> 125 ms (cpu 4-7, `#60` build), MobileNetV2
-fp16 63 -> 55.5 ms. The rebased patches are in `~/projects/patches/rocket/`
-with an `-armbian-7.3.5` suffix.
+fp16 63 -> 55.5 ms. The rebased patches are vendored in
+[`kernel-patches/`](../kernel-patches/README.md), carried to Armbian 7.3.6
+(the board's kernel since 2026-11-27).
 
 - 2.6.1 Is NPU devfreq (OPP table plus governor) the right upstream shape for
   the clock fix, in place of module parameters? [ISSUES M2]
@@ -301,14 +302,6 @@ per-dispatch model still describe it? [ISSUES P7 2026-11-25, C15, P8]
 3.1.3 Would pre-warming the scratch pool at executable load, from sizes the
 compiler already knows, remove the 15 to 45 ms per-process cold `record`
 cost? [COMPILER_ROADMAP 4]
-
-3.1.4 Is the depthwise dwell (1.1.1) the whole remaining cost of offloading
-fp16 depthwise? With the dwell off (the default since 2026-11-24) the
-depthwise arm landed within 1 to 2.5% of the arm that leaves depthwise on
-the CPU. Re-measured 2026-11-24: the demote (on by default now) ties
-`--no-offload` on MobileNetV2 fp16, 30.8 ms each, base 35.3; what is left is
-the CPU pad in front of each depthwise. [ISSUES Resolved]
-[`device.rs` `depthwise_quiesce_enabled`]
 
 ### 3.2 Multicore
 
@@ -391,34 +384,20 @@ worth its per-dispatch cost? [ISSUES Suggested order 3, COMPILER_ROADMAP 5]
 pools in f16, so its five pools stay on the CPU and break the chain between
 blocks. [ISSUES P2 step 5]
 
-4.2.3 Which stems should be claimed, and how? ResNet50's 7x7 stride-2 stem is
-claimed at int8 (2026-11-23) and left on the CPU at fp16, where the NPU was
-slower at 200 MHz -- should it be admitted at 600 MHz? (Re-measured
-2026-11-23 at 600 MHz: slower on cpu 4-7, 53.6/48.8 vs 45.0/44.4 ms, faster
-on all eight, 45.7/44.4 vs 47.4/50.4 -- still mixed, still out.) ViT's 16x16 stride-16
-patch embedding and ResNet50 fp16's padded max pool still have no matcher.
-[LIMITS ViT-L/16, ISSUES P2, C15, Resolved stem]
-
-4.2.4 Should MobileNetV2's linear-bottleneck residual adds get a
-`NONE`-activation twin of the epilogue-add target? It is described as "one
-matcher away". [ISSUES P2 step 3]
-
 4.2.5 Why are the stride-3 and stride-4 dense fp16 matchers written but not
 in `foreach_match`, and why does depthwise NHWC fp16 have no strided matcher
 when NCHW does? [LIMITS "What a compiled model actually offloads", ROADMAP
 ledger]
 
-4.2.6 When should int8 matmul, int8 pooling, pooling padding, unequal pooling
-strides, average pooling at stride 2, and the runtime input zero point be
-lowered? Each is already plumbed below the compiler. [ROADMAP "Expressible
-and decoded, but not lowered"]
+4.2.6 When should int8 matmul, int8 average pooling, pooling padding beyond
+the pad-1 max pool, unequal pooling strides, average pooling at stride 2, and
+the runtime input zero point be lowered? Each is already plumbed below the
+compiler. (int8 max pooling and pad-1 max pooling are lowered: #67, #69,
+#73.) [ROADMAP "Expressible and decoded, but not lowered"]
 
 4.2.7 Should the compiler handle the N-K matmul form, so that transpose
 propagation stops costing the classifier its offload? [ISSUES P8 "The
 transposes are free"]
-
-4.2.8 Does the canonical requant form need to accept `arith.fptoui` as well
-as `arith.fptosi`? The model narrows with the former. [ROADMAP Phase 3]
 
 ### 4.3 Wire format
 
@@ -495,9 +474,11 @@ would make attention worth offloading? Unbatching is correct and 1.16x
 [ISSUES C15]
 
 4.7.2 On BERT, 48% of the wall is `outside` (layernorm, GELU, softmax,
-transposes). Which of these have a credible NPU path, given that softmax's
-reductions have no PPU path outside a pooling window? [ISSUES C15, ROADMAP
-"What this roadmap does not propose"]
+transposes). Which of these have a credible NPU path? Softmax has been built
+on the NPU and measured: it loses to four CPU threads by 2.25-6.2x at every
+shape that fits ([SOFTMAX.md](../SOFTMAX.md) §13), so the question is now
+about the other three. [ISSUES C15, ROADMAP "What this roadmap does not
+propose", SOFTMAX §13]
 
 4.7.3 Would the tall `1 x M` matmul geometry be faster than this repo's
 height-1/width-`M` mapping for `M` above 32? Both are exact, and the tall
@@ -541,10 +522,14 @@ inflated `wait.npu`. This question named **P8's law** as its first
 candidate, and that one has now been collected: the law's MobileNetV2
 measurement is overturned at 600 MHz *and* a fair allocation (ISSUES P7,
 2026-11-25), though the clock is not what did it -- P2, P3 and the pad fold
-are. **P1's "buys nothing yet" and the D1 geometry question are still
-uncollected**, and so is every profile *share* quoted in this file from
-before 2026-09-09, since raising the clock shrinks `wait.npu` by 1.5-2.9x
-and leaves host terms untouched. [ISSUES header, Suggested order]
+are. P1's "buys nothing yet" was M1's dispatch-level placement, and P1
+now records M2's tile fan-out beating it the same day (ViT 1.22x at four
+CPU cores, 1.34x at eight, `ROCKET_NPU_CORES=3`) -- but that is a
+2026-09-07, 200 MHz number too, and whether it survives at 600 MHz is 3.2.1.
+**It and the D1 geometry question are still uncollected**, and so is every
+profile *share* quoted in this file from before 2026-09-09, since raising
+the clock shrinks `wait.npu` by 1.5-2.9x and leaves host terms untouched.
+[ISSUES header, P1, Suggested order]
 
 5.1.2 Which numbers were taken under `ondemand` before the method note
 existed? [ISSUES "Method note"]

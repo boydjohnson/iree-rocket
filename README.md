@@ -42,8 +42,10 @@ identical to the previous toolchain's on all ten models.
 Two things to read with that table. **The ratios move when either arm moves,
 and the IREE 3.14 bump moved the CPU arm more than the NPU arm.** Every NPU
 arm is equal or faster than it was on 3.12 (transformers 3-7% faster), while
-the CNN baselines got 9-23% faster on their own, so MobileNetV2's ratio fell
-from 5.6x to 4.1x on a *faster CPU*, not a slower NPU.
+most CNN baselines got 9-23% faster on their own, so MobileNetV2's ratio fell
+from 5.6x to 4.1x on a *faster CPU*, not a slower NPU. The exception is
+Wide ResNet50-2, whose CPU arm got slower (1904 -> 2083 ms at four A76s), as
+did BERT's and BLIP's -- their ratios rose for the same reason.
 
 **The precision of the baseline is part of the claim.** MobileNetV2's
 baseline above is the model's own fp16 export, and IREE's CPU codegen is
@@ -53,16 +55,20 @@ last measured, on the 3.12 toolchain -- it has not been re-run on 3.14, where
 both arms have moved. Quote it with its date, or quote the fp16 row and say
 so.
 
-**On the NPU today:** dense and depthwise 2-D convolution at stride 1 and 2,
-matmul (including `matvec`/`vecmat`), max/min/average pooling, in fp16 and
-int8, with constant filters packed at compile time and NPU-to-NPU dispatch
+**On the NPU today:** dense 2-D convolution at stride 1 and 2 and depthwise
+at stride 1 to 4, in fp16 and (a narrower set) int8; matmul (including
+`matvec`/`vecmat`) in fp16; max, min and average pooling in fp16, plus int8
+max pooling at stride 2 ([`LIMITS.md`](LIMITS.md) has the per-matcher
+table); with constant filters packed at compile time and NPU-to-NPU dispatch
 chaining that keeps intermediate tensors in the hardware's own layout.
 Two-tensor element-wise and batched attention are implemented and **off by
 default** because they are measured slower -- the flags exist so either arm
-can be measured rather than argued about.
+can be measured rather than argued about. Softmax is built too and off by
+default for the same reason: 2.4x slower than four A76 cores at the widest
+shape it can run ([`SOFTMAX.md`](SOFTMAX.md) §13).
 
-**Not reached yet:** softmax, layernorm, the reductions and transposes around
-them, and element-wise at a profitable cost. [`ROADMAP.md`](ROADMAP.md) is the
+**Not reached yet:** layernorm, the reductions and transposes around it,
+and element-wise at a profitable cost. [`ROADMAP.md`](ROADMAP.md) is the
 operation-by-operation account of what the hardware could run, what it would
 take, and in what order.
 

@@ -7,7 +7,7 @@ starts where this page ends.
 
 **Read the kernel section first.** The measured results in this repository were
 taken on a `rocket` module carrying three out-of-tree patches. On a stock
-module, pooling jobs are killed by the watchdog, every time is roughly double,
+module, pooling jobs are killed by the watchdog, NPU-bound times roughly double,
 and a job timeout can corrupt the submitting process. None of that is subtle
 and all of it looks like a bug in this stack.
 
@@ -19,7 +19,7 @@ and all of it looks like a bug in this stack.
 | OS | Armbian `7.3.5-edge-rockchip64` for every measurement; the board has run `7.3.6-edge-rockchip64` with the same three patches since 2026-11-27 ([`kernel-patches/`](../kernel-patches) covers both). Debian 13 userland, glibc 2.41, which is above the nightly artifacts' 2.39 floor. |
 | Kernel driver | Mainline `rocket` (`drivers/accel/rocket`), as Armbian ships it -- upstream plus Armbian's RK3576 series -- **plus the three patches below**. |
 | Device node | `/dev/accel/accel0`. The driver opens it once per worker context. |
-| NPU clock | 600 MHz at 0.80 V, set through the patched module's parameters. Mainline boots it pinned at 200 MHz. |
+| NPU clock | 600 MHz, set through the patched module's `rocket_npu_clk_hz` parameter. Mainline boots it pinned at 200 MHz. The module sets no voltage (see `081` below); the "600 MHz at 0.80 V" in ISSUES.md M2 was the earlier `planck` build, whose patch also carried `rocket_npu_uv`. |
 | Governor | `performance` on all three CPU clusters. |
 
 Anything else is untested rather than unsupported. Armbian's module carries
@@ -40,12 +40,16 @@ the open item -- [`open-questions.md`](open-questions.md) 2.6.
 | Patch | What it does | Without it |
 |---|---|---|
 | **Unconditional PPU completion** (`0001`, written against `drm-misc-next`, rebased onto Armbian) | Arms the PPU *and* DPU interrupts for every job, and accepts the PPU bits in the IRQ handler's raw-status check. The flag-gated `093` variant is not enough, because this repo never sets `DRM_ROCKET_JOB_PPU_DONE`. | Armbian's stock module arms only the DPU interrupts, so **every pooling job is watchdog-killed at ~500 ms**. A single-tile pool still returns the right answer; a tiled one fails (`tiled_pooling_matches_oracle`), because only its first task runs before the kill. |
-| **Clock parameters** (`081`) | `clk_set_rate` on runtime-resume and a park back to 200 MHz on suspend, exposed as the writable module parameters `rocket_npu_clk_hz` (loaded as `600000000`) and `rocket_autosuspend_ms` (1000; stock 50 ms fires *inside* an inference once the park exists). The Armbian rebase carries no voltage parameter -- `rocket_npu_uv` is in the base series' `082`, which is not part of this configuration. One hunk is hand-merged: the suspend path counts clocks with `soc->num_clks`. | `scmi_clk_npu` stays pinned at 200 MHz -- mainline `rocket` has no NPU devfreq and the DT sets `assigned-clock-rates = <200000000>`. ResNet50-224 fp16 is ~105 ms rather than 45, int8 150 rather than 125, MobileNetV2 fp16 63 rather than 55.5. Output is bit-identical at either clock; only the time changes (ISSUES.md M2). |
+| **Clock parameters** (`081`) | `clk_set_rate` on runtime-resume and a park back to 200 MHz on suspend, exposed as the writable module parameters `rocket_npu_clk_hz` (loaded as `600000000`) and `rocket_autosuspend_ms` (1000; stock 50 ms fires *inside* an inference once the park exists). The Armbian rebase carries no voltage parameter -- `rocket_npu_uv` is in the base series' `082`, which is not part of this configuration. One hunk is hand-merged: the suspend path counts clocks with `soc->num_clks`. | `scmi_clk_npu` stays pinned at 200 MHz -- mainline `rocket` has no NPU devfreq and the DT sets `assigned-clock-rates = <200000000>`. Only large dispatches scale with the clock: on 2026-11-23 (7.3.5, `#60` build, cpu 4-7; [`open-questions.md`](open-questions.md) 2.6) ResNet50-224 fp16 was ~105 ms rather than 45 (2.3x), int8 150 rather than 125, MobileNetV2 fp16 63 rather than 55.5 (1.14x); ISSUES.md M2 (2026-09-09) measured the same shape, 2.06x and 1.12x. Those are that day's harness numbers, not README's (51.6 and 10.3 ms under IREE 3.14), so compare the ratio. Output is bit-identical at either clock; only the time changes. |
 | **Reset before IOMMU detach** (`088`) | Resets the core before detaching the IOMMU, instead of after. | Armbian's `rocket_reset` detaches the IOMMU while the core is still running, so the stall handshake times out on every timeout and one burst can be followed by **page-table corruption in the submitting process** (ISSUES.md C17). With it, a timeout recovers with nothing logged but `NPU job timed out`. |
 
-Two traps when installing a module by hand: `updates/` only wins over
+Three traps when installing a module by hand: `updates/` only wins over
 `kernel/drivers/` after `depmod -a`, so a `.ko` dropped there without it is
-inert; and the suspend-time park is itself gated on `rocket_npu_clk_hz != 0`,
+inert; an Armbian kernel bump installs a fresh `/lib/modules/<version>/` with
+**no `updates/`**, so the board silently boots the stock module again -- how
+7.3.6 was found on 2026-11-27 (rebuild it for the new kernel:
+[`kernel-patches/README.md`](../kernel-patches/README.md#when-armbian-bumps-the-kernel));
+and the suspend-time park is itself gated on `rocket_npu_clk_hz != 0`,
 so writing `0` while the clock is raised **strands it at 600 MHz** and a
 "stock" comparison silently runs fast. To really restore stock: write
 `200000000`, wait for every core to read `suspended`, then write `0`.
@@ -77,7 +81,7 @@ What each line has to say:
 - **`/dev/accel/accel0` exists.** If not, the module is not loaded (or `depmod`
   was never run after dropping it into `updates/`).
 - **`clk_npu/clk_rate` reads 600000000.** 200000000 means the clock patch is
-  absent or the parameter is unset, and every timing will be roughly double.
+  absent or the parameter is unset, and NPU-bound timings will be roughly double.
 - **`rocket_npu_clk_hz` appears under `/sys/module/rocket/parameters/`.** If the
   file is not there, the module is stock: no clock control, and the pooling
   behaviour below is what you will see. `rocket_autosuspend_ms` should read
@@ -121,7 +125,7 @@ python3 tools/e2e_pooling_regression.py --board orangepi
 ```
 
 The pooling gate is the one that fails loudest on a stock module, since that
-is where the PPU interrupt matters. Eight of the matmul gate's nine cases and
+is where the PPU interrupt matters. Ten of the matmul gate's eleven cases and
 every max-pool case are compared **exactly**, not within a tolerance ---
 details in [`developer-tools.md`](developer-tools.md#board-convolution-regression-gate).
 
@@ -129,11 +133,11 @@ details in [`developer-tools.md`](developer-tools.md#board-convolution-regressio
 
 | What you see | What it is |
 |---|---|
-| Any pooling job dies at ~500 ms; `iree-run-module` hangs then reports a timeout | The PPU patch is missing. Single-tile pools still return correct results, which makes this easy to misread as a tiling bug. |
-| Everything runs, every time is ~2x the published one | The NPU is at 200 MHz. Check `clk_npu/clk_rate`, not just the module parameter. |
+| Every pooling dispatch takes ~500 ms (`NPU job timed out` in dmesg) and the HAL refuses it at its 250 ms hung-job floor: `iree-run-module` fails `DEADLINE_EXCEEDED` with a "hung-job floor" message, so a model with NPU pooling (MobileNetV2) fails while one without (ViT-B/16) runs | The PPU patch is missing -- or a kernel bump booted the stock module (no `updates/` for the new version). In the raw hardware tests a single-tile pool still returns the right answer, which makes this easy to misread as a tiling bug. |
+| Everything runs, but ResNet50-224 fp16 is ~2x README's 51.6 ms (MobileNetV2 only ~1.1x slower) | The NPU is at 200 MHz. Check `clk_npu/clk_rate`, not just the module parameter. |
 | One process times out once, then every later job in **that** process times out; kernel log shows IOMMU faults | C17 with the stock reset path. `088` is the kernel half; the userspace half (sizing the dense feature read) is already in `rocket-core`. |
 | A benchmark is wildly slower than a single run of the same module | The device may still be sick from an earlier hang, or the governor is not `performance`. Check `runtime_status` first. |
-| A module you just installed has no effect | `depmod -a` was not run, so `kernel/drivers/` still wins over `updates/`. |
+| A module you just installed has no effect | `depmod -a` was not run, so `kernel/drivers/` still wins over `updates/` -- or it went into the old kernel's `/lib/modules/<version>/`. |
 | `iree-run-module` runs but nothing lands on the NPU | Not a board problem: ask the compiler. `rocket-compiler audit` names the reason per candidate, and `--no-offload` is what a genuinely empty arm looks like. |
 
 ## Conditions belong with every number

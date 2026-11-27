@@ -297,9 +297,11 @@ totals and the fraction of wall during which >= 2 jobs were in flight
 
 ## 7. The alternative: a 30-line kernel patch
 
-planck already runs an out-of-tree `rocket.ko` (memory
-`planck-measurement-environment`: `/lib/modules/7.1.0-edge-rockchip64/updates/rocket.ko`,
-built from `../linux/drivers/accel/rocket` plus the PPU_DONE patch). If a
+planck already runs an out-of-tree `rocket.ko`. (When this was written it
+was `/lib/modules/7.1.0-edge-rockchip64/updates/rocket.ko`, built from
+`../linux/drivers/accel/rocket` plus the PPU_DONE patch; that kernel is
+gone. The board now runs Armbian `7.3.6-edge-rockchip64` with the three
+patches vendored in [`kernel-patches/`](../kernel-patches/README.md).) If a
 local uAPI extension is acceptable, the per-file memory constraint
 disappears:
 
@@ -318,7 +320,7 @@ above keeps `Placement` as a trait precisely so this becomes a third
 implementation rather than a rewrite. It is not the recommended first step
 only because it forks the uAPI; it is the better end state.
 
-## 8. Measurement plan (before M1 is judged) -- steps 1 and 2 done, see §9
+## 8. Measurement plan (before M1 is judged) -- steps 1 and 2 in §9, step 3 by the M1 and M2 gates in §11-12
 
 1. `iree-rocket-hal/examples/multicore_bench`: one multi-task conv shape
    (e.g. the requant model's `112x112x24->144 k1x1`) and one ViT matmul,

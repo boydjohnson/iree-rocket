@@ -1,5 +1,11 @@
 # Model survey, main 3d04335 (2026-11-25)
 
+> **Superseded: this is the last run on the IREE 3.12 toolchain**
+> (`a869dc3c`), kept as the "before" for the bump. `main` is on IREE 3.14 since
+> b37a044; the current numbers for the same ten models, and why they moved
+> (mostly faster `--no-offload` CPU baselines, not slower NPU arms), are in
+> [`iree-3.14-bump.md`](iree-3.14-bump.md#10-model-survey-vs-survey2026-11-25-main-orangepi-600-mhz-performance).
+
 Board: orangepi (RK3588), Armbian 7.3.5, rocket.ko PPU + 600 MHz clock + 088, governor `performance`.
 Built from a clean worktree at 3d04335 (the main checkout's staged edits excluded). Inputs/oracles
 hardlinked from the 2026-11-24 run; compile, run, and bench were all redone. Artifacts, logs and
