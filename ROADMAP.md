@@ -6,7 +6,10 @@ would cost to reach each one, and the order that keeps the work honest. Written
 under
 [`iree-build/iree-src/third_party/llvm-project/mlir/include/mlir/Dialect/`](iree-build/iree-src/third_party/llvm-project/mlir/include/mlir/Dialect/):
 46 `math` ops, 55 `arith` ops, and `linalg`'s 23 named element-wise ops
-alongside its convolution, pooling, contraction and structured sets.
+alongside its convolution, pooling, contraction and structured sets. (That
+was IREE 3.12's LLVM. Since the 3.14 bump the element-wise set is the
+`ElementwiseKind` cases of the single `linalg.elementwise` op, and only `copy`
+survives as a named op; see correction 2 under Phase 1.)
 
 Read alongside its two neighbours. [LIMITS.md](LIMITS.md) says what the stack is
 *measured* to do and which layer enforces each bound; [ISSUES.md](ISSUES.md)
@@ -327,7 +330,11 @@ The honest framing: `arith` ops are not tensor ops. They arrive inside
 | Already handled elsewhere | `constant` → `RecordedOp::Fill`; `extf`/`truncf` → the packer's job, fold into an adjacent dispatch rather than offload | No new work |
 | No hardware path | ~35 integer and predicate ops: `andi` `ori` `xori` `shli` `shrsi` `shrui` `divsi` `divui` `remsi` `remui` `cmpi` `cmpf` `select` `extui` `extsi` `sitofp` `fptosi` `index_cast` `bitcast` … | Refuse; document |
 
-### `linalg` -- 19 of 23 named element-wise ops reachable
+### `linalg` -- 19 of 23 element-wise ops reachable
+
+(Named ops when this was written. On 3.14 the same list is the
+`ElementwiseKind` cases of `linalg.elementwise`, so read each name below as
+`linalg.elementwise <name>`.)
 
 This is the striking result of the survey: **`linalg`'s named unary and binary
 element-wise set is very nearly a one-to-one match for the HAL's existing
@@ -514,7 +521,7 @@ inline.
 |---|---|---|---|---|
 | `ElementwiseUnaryDef` (abs/neg/floor/ceil/add_scalar, fp16) | 5 | yes | yes | none -- no model uses these ops |
 | `ElementwiseLutDef` (9 curves, int8) | 6 | yes | yes | none -- the crate's LUT path is int8 and ViT's 61 `sqrt` are f32 |
-| `ElementwiseBinaryDef` (add/sub/mul/max/min, fp16) | 7 | yes | yes | `linalg.add`/`mul`/`sub` rank 3, behind `--elementwise` |
+| `ElementwiseBinaryDef` (add/sub/mul/max/min, fp16) | 7 | yes | yes | `linalg.elementwise` add/mul/sub rank 3 (the named `linalg.add`/`mul`/`sub` before 3.14), behind `--elementwise` |
 
 **Two things the plan got wrong, both found by checking rather than
 assuming.**
@@ -537,6 +544,15 @@ assuming.**
    written against `linalg.elementwise` or against the generic form matches
    nothing silently. Established with a torch-onnx probe compiled through
    this spec.
+
+   **Reversed by the IREE 3.14 bump.** 3.14's LLVM removed the named
+   element-wise ops (`LinalgNamedStructuredOps.yaml` keeps only `copy`), so
+   `linalg-specialize-generic-ops` now produces `linalg.elementwise <add>`.
+   The matchers were rewritten to `transform.rocket.match.elementwise`,
+   which checks the kind and the maps (see the comment above
+   `@match_elementwise_add_f32` in the spec). The lesson that survives is the
+   method: re-run the probe through the spec after any toolchain bump rather
+   than trusting the dialect or this paragraph.
 
 **A third correction, to the ordering rather than the content.** The plan put
 `ElementwiseBinaryDef` last. An op census says it is the only one of the three
@@ -646,10 +662,10 @@ only a multi-surface cube could see, and both unary builders needed a
 multi-surface gate before anything could rely on them.
 
 **[`rocket-compiler-plugin`](rocket-compiler-plugin/)** -- matchers for the
-`linalg` named element-wise ops, ~~plus `linalg.elementwise` and
-`linalg.map`~~, behind a flag. See correction 2: the named ops are what
-arrives, but only because `linalg-specialize-generic-ops` runs first, and
-`linalg.elementwise` is not produced by this pipeline at all.
+element-wise ops, behind a flag. See correction 2: on 3.12 the named
+`linalg.add`/`mul`/`sub` arrived (only because `linalg-specialize-generic-ops`
+runs first); since 3.14 it is `linalg.elementwise` with the kind, matched by
+`transform.rocket.match.elementwise`.
 
 There was no "Phase 0 flag" to put them behind -- Phase 0 introduced none --
 so `--elementwise` is it. The entries ship commented out in the spec with a
@@ -833,7 +849,7 @@ back on the wrong side, which is what P8 lever #3 was really saying.
 | ~~`mulf`~~ | Done 2026-09-06. It was bounded, and it was one register field: `EwBinaryOp::Mul` is bit-exact on `planck`, as are `Max` and `Min`. It changes the scope of Phases 1 and 2 by *removing* their only hardware unknown -- what is left there is matcher and wire-format work, not RE |
 | ~~Phase 3~~ | Done 2026-09-06 (#26), and it delivered the throughput story it was ranked for: MobileNetV2-static-int8 is **1.80x faster** than a like-for-like CPU build on a full machine and level with it at two cores, from 1.5x slower. The one prediction here that was wrong is "needs no new schema breadth" -- carrying per-convolution calibration to a shared executable took a new `Conv2DQuantParam` enum and a `runtime_quantization` vector on `Conv2DDef` |
 | ~~C5~~ | Done 2026-09-06. It blocked both remaining phases by its own stated action item; `lut_zero_join_hw.rs` discharges it and both LUT quirks are shown not to reach this stack. It cost the phases nothing -- no table or register changed. Its one real finding was a wrong domain in `LutTable::log`'s doc comment, which is a standard Phase 2 should hold itself to |
-| ~~Phase 1~~ | Done 2026-09-06. All four layers, three kernel kinds, and `linalg.add`/`mul`/`sub` reachable from a compiled model behind `--elementwise`. It cost two HAL fixes the plan said would not be needed and one wrong assumption about the op form -- see the phase for both. ViT goes 12 -> 184 offloaded sites with the flag; the throughput question is open and is why the flag exists |
+| ~~Phase 1~~ | Done 2026-09-06. All four layers, three kernel kinds, and element-wise add/mul/sub (the named `linalg.add`/`mul`/`sub` then, `linalg.elementwise` kinds since 3.14) reachable from a compiled model behind `--elementwise`. It cost two HAL fixes the plan said would not be needed and one wrong assumption about the op form -- see the phase for both. ViT goes 12 -> 184 offloaded sites with the flag; the throughput question is open and is why the flag exists |
 | Phase 2 | Breadth: new curves, the most additive and least urgent work here |
 
 Phases 1 and 2 land their matchers **behind a flag**, with the `--no-offload`

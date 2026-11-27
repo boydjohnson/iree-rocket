@@ -34,8 +34,10 @@ run=$(gh run list --repo boydjohnson/iree-rocket --workflow=nightly.yml \
     --status=success --limit=1 --json databaseId -q '.[0].databaseId')
 gh run download --repo boydjohnson/iree-rocket "$run" \
     -n iree-compile-x86_64 -n iree-runtime-aarch64
-tar -xzf iree-compile-x86_64.tar.gz
-tar -xzf iree-runtime-aarch64.tar.gz
+# Two -n flags put each artifact in its own directory; each tarball unpacks
+# into that same directory name.
+tar -xzf iree-compile-x86_64/iree-compile-x86_64.tar.gz
+tar -xzf iree-runtime-aarch64/iree-runtime-aarch64.tar.gz
 ```
 
 That is ~99 MB and ~9 MB respectively. `iree-compile-x86_64/` holds
@@ -148,10 +150,11 @@ Sanity check worth running once per model: `audit --input "$M.mlir"
 
 ```sh
 scp iree-runtime-aarch64/bin/iree-run-module "$M".{npu,cpu}.vmfb \
-    "$M.input.bin" planck:~/mnv2/
-ssh planck 'cd mnv2 && chmod +x iree-run-module && for arm in npu cpu; do
+    "$M.input.bin" orangepi:~/mnv2/
+ssh orangepi 'cd mnv2 && chmod +x iree-run-module && for arm in npu cpu; do
     ./iree-run-module --module=mobilenet_v2.fp16.$arm.vmfb \
       --function=main_graph --device=rocket --device=local-task \
+      --task_topology_cpu_ids=4,5,6,7 \
       --input=1x3x224x224xf16=@mobilenet_v2.fp16.input.bin \
       --output=@mobilenet_v2.fp16.$arm.out.npy
 done'
@@ -170,7 +173,7 @@ Then score each arm against the oracle, not against zero and not against each
 other:
 
 ```sh
-scp planck:~/mnv2/'*.out.npy' mnv2/
+scp orangepi:~/mnv2/'*.out.npy' mnv2/
 python3 - <<'PY'
 import numpy as np
 ref = np.load("mnv2/mobilenet_v2.fp16.oracle.npy").astype(np.float32).ravel()
@@ -192,8 +195,8 @@ a fault; the first thing to check either way is that the argmax agrees.
 optional:
 
 ```sh
-scp iree-runtime-aarch64/bin/iree-benchmark-module planck:~/mnv2/
-ssh planck 'cd mnv2 && chmod +x iree-benchmark-module && for arm in npu cpu; do
+scp iree-runtime-aarch64/bin/iree-benchmark-module orangepi:~/mnv2/
+ssh orangepi 'cd mnv2 && chmod +x iree-benchmark-module && for arm in npu cpu; do
     ./iree-benchmark-module --module=mobilenet_v2.fp16.$arm.vmfb \
       --function=main_graph --device=rocket --device=local-task \
       --task_topology_cpu_ids=4,5,6,7 \
@@ -228,7 +231,7 @@ probe in [`board-setup.md`](board-setup.md#what-does-this-board-actually-have).
 ## 7. Where the time went
 
 ```sh
-ssh planck 'cd mnv2 && ROCKET_PROFILE=1 ./iree-run-module \
+ssh orangepi 'cd mnv2 && ROCKET_PROFILE=1 ./iree-run-module \
     --module=mobilenet_v2.fp16.npu.vmfb --function=main_graph \
     --device=rocket --device=local-task \
     --input=1x3x224x224xf16=@mobilenet_v2.fp16.input.bin'
@@ -260,7 +263,7 @@ Point its four tool paths at the unpacked nightly and it needs no local build
 either:
 
 ```sh
-tools/model_survey.py run --model mobilenet_v2 --board planck \
+tools/model_survey.py run --model mobilenet_v2 --board orangepi \
     --rocket-compiler "$PWD/iree-compile-x86_64/bin/rocket-compiler" \
     --compiler-lib "$PWD/iree-compile-x86_64/lib/libIREECompiler.so" \
     --board-runtime "$PWD/iree-runtime-aarch64/bin/iree-run-module" \

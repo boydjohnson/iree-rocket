@@ -37,7 +37,9 @@ share; see **Suggested order** for what that reranks.
 
 Trimmed 2026-09-05: issues that are settled were cut down to one entry each
 in **Resolved** at the end, which keeps their IDs resolvable without keeping
-their narratives. Everything above that section is open. Evidence a resolved
+their narratives. Everything above **Closed, narratives kept** is open;
+that section holds three closed issues whose full text other files still
+cite. Evidence a resolved
 issue produced that open work still depends on was moved into the open issue
 that needs it, not deleted -- M4's phase profile and dispatch-family counts now
 live in P8.
@@ -161,386 +163,18 @@ orders command buffers on one device timeline and the two-device
 partitioning gives this device one dispatch per command buffer, so `overlap`
 is 0.0 % on ViT at N=3. Dispatch-level placement is therefore not the lever
 on these programs; the notes' "multicore only helps a multi-tile conv" above
-is exactly right, and the remaining work is M2, splitting one dispatch's CBUF
-tiles across contexts. Still open.
+is exactly right, and the remaining work was M2, splitting one dispatch's
+CBUF tiles across contexts.
 
----
-
-## P2 (S3) — cross-op chaining is HW-proven for fp16, and this repo's fp16 output cube is already the right layout
-
-`rocket-layout-repack-per-dispatch` records the per-dispatch NC1HWC2 pack/unpack
-as debt with no mechanism to avoid it, and correctly says no scaffolding exists.
-`encodings/cross-op-chaining.md` [notes] supplies the hardware fact that makes
-the fix legal:
-
-> For an fp16 matmul whose output is the default fp16-narrowed cube
-> (`fp32tofp16=1`), the **output cube and the input feature cube are the same
-> layout**: both `feat_idx`, channel atom C2=8. ... The host does not need to
-> de-tile `C1` to row-major and re-scatter it; the second matmul can read the
-> first's output BO at the same IOVA.
-
-proven two ways: A's raw output BO is byte-identical to `C1` de-tiled then
-re-packed (`memcmp`, 0/4096 lanes differ), and B reading A's output BO directly
-is bit-exact to the host round-trip.
-
-**This repo is already in that configuration** [verified]:
-`DpuOutCvtScale.fp32tofp16_en` is set whenever `quantization.is_none()`
-(`conv.rs:3912`), and `Precision::Fp16::output_element_bytes()` is 2
-(`conv.rs:476`), so C2 = 16/2 = 8 on both the input and the output side. The
-aliasing precondition holds today, for free.
-
-It is fp16-only, and the notes tabulate why: int8 (int32 C2=4 out vs int8 C2=16
-in) and the fp32-accumulator fp16 output (C2=4) both mismatch. Element-wise ops
-preserve the cube, so a `conv → activation → conv` run chains too.
-
-Also carry the two costs the notes measured, so this is not oversold: matched
-tiling pins the consumer's K-tile to the producer's N-tile, which fragments the
-consumer's K-accumulation (they measured pack −30% but wait +14%); and the whole
-chain is single-fd, so it forfeits P1. On their transform-bound encoder it was
-net-positive; on compute-bound LLM prefill the ceiling was 2–3% and not worth
-building. Which regime MobileNetV2's back-to-back 1x1 convs sit in is the thing
-to measure first — and measure it under a pinned governor (M1), because the term
-being removed is exactly the host-side term the governor penalizes.
-
-**Resized 2026-09-04.** The round trip was 53 ms per inference when this was
-written; P6 item 3 found that most of that was the transforms running on the
-little cluster plus a redundant zero pass, and it is now 26 ms (`compact` 18,
-`pack.input` 8.4) against a 146 ms model. Still the largest thing in the
-driver, and still worth doing — but the "measure the regime first" advice
-above now has a second half: measure it *after* P6 item 3, or the case for
-chaining will look twice as strong as it is. MobileNetV2 fp16 does have
-adjacent NPU dispatch pairs (roughly 15 of 37 dispatches follow another NPU
-dispatch immediately), so the mechanism has somewhere to apply here.
-
-**Resized again 2026-09-07.** 24.4 ms (`compact` 17.7, `pack.input` 6.7)
-against a **127 ms** model — 19% of wall, and the second-largest term after
-P7's `outside`. See P7 for the profile. Two things to carry into any attempt:
-
-- **The cost is concentrated, not spread.** One convolution,
-  `112x112x24->144 k1x1`, is 5.4 ms of compaction per inference on its own —
-  30% of the whole `compact` budget. P8's lever 3 said this and the current
-  profile confirms it: the lever is shape-selective, and a chaining
-  implementation that pays a fixed cost per dispatch to save an average one
-  will lose.
-- **The reach is gated on P7.** Chaining needs producer *and* consumer on the
-  NPU, and this model alternates dense (NPU) with depthwise (CPU). The
-  biggest compaction, the one above, feeds a *depthwise* convolution — so it
-  is not chainable at all until P7 moves. Sizing P2 against the whole 24.4 ms
-  overstates what it can reach today.
-
----
-
-**Sized on ResNet50 fp16, 2026-09-08 -- the model where the NPU wins.**
-The reach of chaining is the set of edges where one NPU dispatch feeds
-another with nothing between them, and on the current ResNet50 build that
-set is **empty**: all 51 NPU results feed the plain fp16 shim's CPU epilogue
-(`extf` + bias add against a full-size hoisted f32 bias tensor), then a
-second CPU dispatch (ReLU + `truncf`) before the next convolution, and the
-bottleneck outputs go through a CPU residual add as well. Measured from the
-per-op profile (`taskset -c 4-7`, rebuilt runtime, 245 ms/inference:
-`outside` 100.1, `wait.npu` 79.2, `compact` 28.6, `pack.input` 15.7) and
-split by the role each shape plays in a bottleneck:
-
-| edge class | calls/inf | `pack.input` | `compact` | `npu` |
-|---|---:|---:|---:|---:|
-| conv1 (1x1 in, reads the block input) | 16 | 8.6 | 4.1 | 23.8 |
-| conv2 (3x3) | 16 | 3.5 | 2.1 | 33.2 |
-| conv3 (1x1 out, feeds the residual add) | 13 | 1.3 | 8.9 | 10.7 |
-| conv3 + downsample at 56x56x64->256 | 4 | 1.1 | 12.6 | 6.0 |
-| downsample 56x56x256->512 s2 | 1 | 1.2 | 0.9 | 4.0 |
-
-So the order of work, with what each step is worth per inference:
-
-1. **Fuse the fp16 epilogue into the dispatch** -- bias on the BS plane for
-   every convolution and ReLU on the BN stage where the model has one. This
-   is the ReLU6 machinery generalised to `relu` and to bias-only, on the
-   f16-import chain (`truncf` then a `cmpf ugt`/`select` clamp) rather than
-   the demoted one. It is not chaining, but it is the prerequisite for it
-   *and* the larger lever: it removes two full-tensor CPU passes behind each
-   of 51 convolutions, most of the 100 ms `outside`, and leaves conv1 ->
-   conv2 -> conv3 as direct NPU -> NPU edges once the shim's `extf` and the
-   graph's `truncf` cancel.
-2. **Chaining on those edges** (the driver keeps conv1's and conv2's output
-   cube and conv2 and conv3 read it): `pack.input` 4.7 + `compact` 6.2 =
-   **10.9 ms**, 4.5 % of wall. Bounded by the fact that the *wide* tensors
-   (conv3's Cout 256..2048 outputs, 21.5 of the 28.6 ms of compaction) all
-   cross the residual add.
-3. **Residual add on the NPU** (`build_conv_then_add_regcmd`, ROADMAP Phase
-   3's epilogue field) makes every edge direct: the whole `pack.input` +
-   `compact` term, **~44 ms**, 18 % of wall, plus the 16 CPU adds.
-
-Nothing in this list is worth building before step 1, and step 1 pays on
-its own.
-
-**Step 1 landed 2026-09-08.** `rocket-fuse-conv-relu6` gained two patterns:
-bias-only (every dense fp16 1x1/3x3 convolution seeded with a per-channel
-bias now hands it to the BS plane through the plain executables' bias
-binding, which had only ever carried zeros) and bias + ReLU on the
-f16-import chain (`truncf` then `cmpf ugt`/`select`, the clamp moving onto
-the BN stage through four new `relu` targets: stride 1 and 2, with and
-without the folded pad 1). The shims widen with a `linalg.generic` rather
-than a pre-formed dispatch, so the widen and the model's own narrow cancel
-once the wrapper is inlined -- that is what makes the edge direct. Two
-match-loop facts fell out: an epilogue-rooted matcher must live in the
-first loop, and a conv-rooted one in the second, because the walk reaches
-the convolution before its epilogue and a conv-rooted matcher in the first
-loop pre-empts everything behind it (the pad-1 matchers moved for this).
-
-ResNet50 fp16 on `planck`, `taskset -c 4-7`, 3 repetitions, medians:
-
-| | dispatches (NPU / CPU) | NPU results feeding an NPU dispatch | ms |
-|---|---|---|---:|
-| before | 51 / 130 | 0 of 51 | 230 |
-| after | 53 / 22 | **32 of 53** | **162** |
-
-1.42x on the model, max|diff| 0.0116 against onnxruntime (the CPU arm is
-0.0151), same argmax and top-5; the CPU arm is 1035 ms. MobileNetV2 fp16
-(f32 import, the demoted spelling) is unchanged in placement at 37 sites,
-129 ms, max|diff| 0.028 against onnxruntime with the same top-5. Every
-conv1 -> conv2 -> conv3 edge is now NPU -> NPU with nothing between, which
-is exactly the set step 2 chains; what still crosses the CPU is the 16
-residual adds, the 7x7 stem, the padded max pool and the head.
-
-**Re-sized after step 1** (`ROCKET_PROFILE`, same build, per inference;
-the profiler inflates wall to 237 ms, composition only): `wait.npu` 108.2
-(46 %), `outside` 47.9, `compact` 37.0, `pack.input` 20.6. By role, the
-edges step 2 can chain are conv1 -> conv2 and conv2 -> conv3:
-
-| edge class | `pack.input` | `compact` |
-|---|---:|---:|
-| conv1 (reads the block input, from the CPU add) | 9.2 | 3.7 |
-| conv2 | 3.2 | 3.9 |
-| conv3 (feeds the CPU residual add) | 1.6 | 9.7 |
-| conv3 + downsample at 56x56x64->256 | 1.5 | 15.0 |
-
-So **step 2 is worth 12.4 ms**, 5 % of the profiled wall and at most 7 % of
-the real one: conv2's and conv3's packing plus conv1's and conv2's
-compaction. Three quarters of the remaining `compact` is conv3 writing the
-wide block output for the residual add, and half of `pack.input` is conv1
-reading it back, so **step 3 (the residual add on the NPU) is now the
-larger lever by four to one**: it unlocks ~57 ms of pack and compact plus
-the 16 CPU adds, against step 2's 12. Build step 3 first, and step 2 on
-the edges it leaves.
-
-**Step 3 landed 2026-09-08.** `Conv2DDef.epilogue_add` and
-`epilogue_activation` put the residual add and its ReLU in the DPU's EW
-core after the convolution's own tiles, inside the same dispatch, with the
-skip as a fourth binding; the driver runs the tiles, then one EW task on
-the same in-order queue (no fan-out for such a dispatch), and compacts the
-sum. `conv_residual_add_hw` validated the multi-tile cube handoff and the
-EW-stage ReLU exactly before any wire or compiler work. The pass rewrites
-the f16-import chain `conv -> truncf -> linalg.add(skip) -> relu` (a named
-`linalg.add`, since specialisation runs first) into one epilogue generic
-over the accumulator, with the skip collapsed to the convolution's rank.
-
-ResNet50 fp16 on `planck`, `taskset -c 4-7`, medians:
-
-| | dispatches (NPU / CPU) | NPU results feeding an NPU dispatch | ms |
-|---|---|---|---:|
-| after step 1 | 53 / 22 | 32 of 53 | 162 |
-| after step 3 | 53 / 8 | **51 of 53** | 164 |
-
-Correctness is unchanged (max|diff| 0.0116 against onnxruntime, same top-5)
-and the wall is flat, and the profile says exactly why: `outside` fell
-47.9 -> 26.4 ms (the sixteen CPU adds), but each residual dispatch now
-packs its skip tensor (`pack.input` 20.6 -> 29.5) and its EW task is
-hardware time (`wait.npu` 108 -> 131). An even trade on its own. What it
-buys is the reach of step 2: `pack.input` + `compact` is now **61.5 ms**
-per inference and 51 of the 53 edges it sits on are NPU -> NPU, so the
-driver chain -- consumer reads the producer's cube, no compaction, no
-repack, the skip too -- is worth up to 37 % of the model. That is the next
-thing to build, and it is what P2 always was.
-
-What stays on the CPU: the 7x7 stem, the padded max pool, the head's
-pooling transpose and the classifier epilogue. MobileNetV2's residual adds
-have no ReLU after them (linear bottlenecks) and are not claimed; a
-`NONE`-activation twin of the target is one matcher away. **(Done
-2026-11-24 -- and it was a pattern and a driver fix away too; see Resolved,
-"MobileNetV2's residual adds run on the NPU".)**
-
-**Step 2 landed 2026-09-08 -- the input half.** A dispatch whose input was
-written by an earlier dispatch on the same command buffer now reads that
-dispatch's output cube in place (`OutputCube`, `chainable_cube`,
-`ROCKET_CHAIN=0` to turn it off, `=debug` to trace every edge -- both
-switches retired 2026-09-10 when the decision moved to the compiler,
-COMPILER_ROADMAP.md 6.2; `ROCKET_LAYOUT=debug` traces the declarations
-now). No wire or
-compiler change: the producer already writes feature-atomic NC1HWC2 surfaces
-into scratch, and the repack the consumer used to do reproduces those exact
-bytes, so the consumer simply points its regcmd at the producer's scratch BO
-and the pack is skipped. This is the aliasing `encodings/cross-op-chaining.md`
-proved legal and the section above has carried since.
-
-The claim is `pack(compact(cube)) == cube`, and it holds when the two
-dispatches name the identical device byte range, the pixel counts are equal
-(surfaces are `pixels * 16` apart, so a producer with physical height padding
-strides differently), the logical pixel widths are equal with no channel
-padding beyond them, and the pixel is a whole number of 16-byte atoms -- the
-last two because a repack zeroes padding lanes where a producer leaves its
-padding channels. Fanned-out and accumulator dispatches offer no cube: the
-first has no single scratch (each context wrote its own tiles), the second
-writes 128-byte blocks. `tensor_layout.rs`'s `chain_identity_tests` pins the
-identity and each way it fails, since nothing at runtime can check it. Since
-2026-09-10 the identity is a pure function, `rocket_core::layout::
-chain_identity` over `CubeGeometry` (COMPILER_ROADMAP.md 6.1): the driver's
-`OutputCube` and every consumer geometry are built through it, those tests
-assert its verdict beside each byte-level case, and the compiler can ask it
-over `rocket-plan-ffi` ABI 4.
-
-ResNet50 fp16 on `planck`, `taskset -c 4-7`, medians of 3, same
-`resnet50.res.vmfb` with the feature only turned off and on:
-
-| | `pack.input` | `compact` | ms |
-|---|---:|---:|---:|
-| chaining off | 24.0 | 26.0 | 169 |
-| chaining on | **0.6** | 25.6 | **145** |
-
-**1.17x**, and the output is bit-identical to the same build with chaining
-off and to the step-3 reference -- byte for byte, not within a tolerance,
-which is the point of the identity above. 66 of the 68 conv operand repacks
-are gone: all 50 feature inputs and all 16 residual skips. The 2 that remain
-have no NPU producer on their command buffer (the stem, behind the CPU max
-pool). MobileNetV2 fp16 is 134 -> 132 ms and bit-identical, with 1 of 34
-edges chained -- its depthwise convolutions sit on the CPU between every pair
-of dense ones, so its reach is gated on P7, exactly as the 2026-09-07 sizing
-above said. **Corrected 2026-09-08 by measuring it** (P7): with the seven
-admissible depthwise offloaded the chain still takes that same one edge.
-The model's edges are behind the CPU residual add (10), the explicit pad
-in front of every depthwise (7) and the whole-atom rule (8 of the 14 direct
-NPU -> NPU edges, at 88/136/24 channels); P7 alone opens nothing.
-
-~~**What is left of P2 is the compaction, and it needs something this layer
-does not have.**~~ `compact` was unmoved at 25.6 ms, 18% of wall, because the
-producer still wrote the dense IREE buffer: nothing in a command buffer can
-prove that buffer has no other reader -- a later CPU dispatch, a later
-submission, or the model's own output -- and eliding the write on a guess is
-silent corruption. **Landed 2026-09-08 as step 4 below**, with the signal
-coming from the compiler. The other open edges are the elementwise, pooling
-and matmul dispatch kinds, which record no cube yet: on a matmul-heavy model
-(ViT, Qwen3) that is where the same lever would apply.
-
-**A trap worth keeping.** The first cut matched producers by
-`iree_hal_buffer_t` pointer alone and chained **zero** residual skips: IREE
-packs neighbouring transients into one allocation, so the most recent write
-to that buffer is usually a different tensor at a different offset, and every
-skip -- the wide tensors, `Cout` 512..2048 -- was declined as if blocked. The
-fix is to compare device byte *ranges* and skip writes that miss: 0 of 16
-skips became 16 of 16. `ROCKET_CHAIN=debug` printed the offsets that said so.
-
-**Step 4 landed 2026-09-08 -- the compaction half.** A dispatch skips
-writing its dense output buffer when every reader of its result took the
-output cube in place. The proof that there is no other reader is a count,
-not a flag, and it comes from the compiler: `rocket-mark-dense-readers`
-(run by `rocket-compiler` at the flow phase, next to the placement pin)
-walks each Rocket convolution's result once dispatch regions are final and
-counts the Rocket dispatches that read it, through `flow.tensor.reshape`;
-any other reader -- a CPU dispatch, `util.return`, a tied operand -- makes
-the count 0. The count rides as one more push constant
-(`Conv2DDef.runtime_dense_readers`, the trailing constant of every
-convolution target, literal 0 in every shim). The driver tallies, per
-recorded dispatch, how many later dispatches on the same command buffer
-chained to its cube and whether anything read its dense bytes instead (a
-consumer that declined, a kind that records no cube, a copy), and
-`apply_ops` drops the compaction iff `chained == count > 0` and no dense
-read was seen (`compaction_elidable`). Every failure mode keeps the write:
-a reader on a *later* command buffer leaves the tally short, which is why a
-count survives IREE's partitioning where a boolean would not; an executable
-compiled without the constant says 0. A driver-only version was considered
-and rejected: a transient from `queue_alloca` is not proof of a single
-command buffer, because IREE also allocas a result consumed by a later
-execute region.
-
-`planck`, `taskset -c 4-7`, medians of 4 interleaved passes, same binary
-and same `.vmfb`, `ROCKET_LAZY_COMPACT=1` against `=0`:
-
-| model | kept / skipped per inference | off | on | |
-|---|---|---:|---:|---:|
-| ResNet50 fp16, 224x224 | 2 / 51 | 142 ms | **114 ms** | **1.25x** |
-| ResNet50 fp16, 512x512 | 2 / 51 | 858 ms | **626 ms** | **1.37x** |
-| VGG19 fp16 | 5 / 11 | 533 ms | 502 ms | 1.06x |
-| MobileNetV2 fp16 (f16 import) | 45 / 2 | 87 ms | 88 ms | noise |
-
-Output bit-identical on and off for all four, and identical to the same
-model compiled before this change. ResNet50-224's profile: `compact` 0.45
-ms x 2650 calls -> 0.26 ms x 118 over the run, `wait.npu` share 62 -> 74 %.
-The compiler's own census matches the driver's: 51 of ResNet50's 52
-convolutions are read only by Rocket dispatches (66 reader edges, the 16
-residual skips counted twice), VGG19 11 of 16 (the other five feed max
-pools, which are Rocket dispatches that cannot chain), MobileNetV2 2 of 46.
-The two kept on ResNet50 are the stem (read by the CPU max pool) and the
-last conv (read by the head).
-
-With step 2 and step 4 together, ResNet50-224 is 169 -> 114 ms, and what
-the driver still does on the host for it is ~10 % of wall (`outside` is the
-CPU stem/pool/head). ~~What is left of P2 is breadth, not depth: the
-elementwise, pooling and matmul kinds publish no cube, so nothing chains
-through them and nothing feeding them elides.~~ Step 5, below.
-
-**Step 5 landed 2026-09-08 -- breadth.** Matmul, pooling and element-wise
-dispatches now publish an output cube, take a producer's cube for their
-inputs, and carry the reader count (`runtime_dense_readers` on
-`MatmulDef`, `PoolingDef` and the three `Elementwise*Def`s; every shim
-passes it). `OutputCube` grew a `surface_pixel_count`: the PPU strides its
-surfaces by the pixel count rounded up to four, so a pool's cube matches a
-conv's only when the count is a multiple of four (VGG's 224/112/56/28
-images all are; a 7x7 is not), and `chain_identity_tests` pins the
-mismatch. Matmul's cube is width M, height 1, no row padding; the `[K,N]`
-operand is a coefficient stream and never chains.
-
-That was the smaller half. The larger one was that on every plain-conv,
-pool and matmul edge nothing could have chained anyway, because the shims
-widened their f16 result inside a `flow.dispatch.workgroups` that also
-folded in linalg's accumulator init -- opaque to fusion, so a CPU dispatch
-sat between the two Rocket dispatches on every such edge. Only the fused
-bias/ReLU shims (ResNet50's) used a plain generic, which is why ResNet50
-chained and MobileNetV2's f32 import did not. Two compiler changes fix it:
-every shim's widen is a plain `linalg.generic` (the placement pin, which
-postdates the workgroups form, keeps it off the NPU), and
-`rocket-fold-neutral-init`, run after inlining, drops the `+ init` /
-`max(.., init)` term when the init is a `linalg.fill` of the neutral element
--- which arith itself never does, since `x + 0.0` is not `x` at `-0.0` --
-leaving a bare `extf` that the consumer's `truncf` cancels. And on an f32
-import the demote pass now narrows *through* a zero `tensor.pad`
-(`pad(truncf(x))`, not `truncf(pad(x))`), so `rocket-fold-conv-pad` and
-the pad-1 matchers see the same `pad -> conv` an f16 import gives them; the
-promote pass rebuilds the f32 pad for anything left unclaimed.
-
-Two chain fixtures joined the conv gate, both bit-exact and both chaining
-end to end with the middle compaction skipped: `fp16_conv_pool_conv_chain`
-(pool reads conv A's cube, conv B reads the pool's) and
-`fp16_matmul_chain`. On the models, `planck`, `taskset -c 4-7`, chain on
-vs `ROCKET_CHAIN=0`, medians:
-
-| model | NPU -> NPU edges chained | compactions skipped | chain off | on | |
-|---|---|---|---:|---:|---:|
-| VGG (f32 import, 16 conv + 5 pool), 10 s runs x3 | **20 of 20** (11 conv, 5 conv->pool, 4 pool->conv) | 20 of 21 | 676 ms | **617 ms** | **1.10x** |
-| VGG19 (f16 import, 16 conv; pools on CPU), 10 s x3 | 11 of 16 | 11 of 16 | 544 | **498** | 1.09x |
-| ResNet50 fp16 224x224 | 66 of 68 (unchanged) | 51 of 53 | 142 | 115 | 1.24x |
-| MobileNetV2 fp16 (f16 import) | 1 -> 6 of 47 | 2 | 87 | 88 | noise |
-
-All bit-identical chain on/off and against the earlier builds. The first
-row is the one this step is about: before it, the same model had 50 CPU
-dispatch sites (15 explicit pads, 16 widens, the rest shims' narrows) and
-5 chained edges; it now has 4 CPU sites, all of them the classifier, whose
-K = 25088 is past the matmul caps -- that is the `outside` 195 ms per
-inference in its profile and the whole reason the model is not faster.
-`pack.input` and `compact` are 0.0 and 0.1 ms per inference on it.
-
-Two things measured on the way that are not wins: a 3 s
-`--benchmark_min_time` on a 600 ms model is six iterations and the arms
-overlap by 15 % run to run -- the 10 s runs above are what settled both
-VGGs -- and the CNA padding the input itself was not faster than IREE's CPU
-pad plus a repack on this VGG (617 ms either way); it is the chaining the
-fold enables that pays, not the pad itself. Once during these measurements
-the board wedged (a benchmark left the NPU busy and the next process hung
-in `PREP_BO`, uninterruptible); it did not reproduce after a reboot in six
-further runs of both arms and is recorded rather than explained.
-
-What is left is coverage, not chaining: VGG19's torchvision export pools in
-f16 and the pooling matchers are f32-only, so its five pools stay on the
-CPU (and break the chain between blocks); ViT/Qwen3's matmul edges chain
-where the M/K/N caps admit both sides; and a matmul or pool whose consumer
-is the CPU (every classifier) keeps its dense write, as it must.
+**M2 landed the same day** (`MULTICORE.md` §12, 2026-09-07): a multi-tile
+conv or matmul fans its tiles out over sibling contexts (`ROCKET_FANOUT`, on
+whenever N > 1), bit-exact, with ViT 1.22x faster at four CPU cores and 1.34x
+at eight at `ROCKET_NPU_CORES=3`. The default stays N=1, because
+MobileNetV2's sub-millisecond dispatches gain only noise. (This M2 is
+`MULTICORE.md`'s, not this file's 200 MHz-clock M2; see the naming hazard
+under Suggested order.) What is still open under P1 is small: the
+`submit_jobs` doc comment still says jobs spread across cores, which this
+entry shows they do not; and kernel-side placement (M3, `MULTICORE.md` §7).
 
 ---
 
@@ -689,473 +323,15 @@ correct, and worth not touching.
 
 ---
 
-## P7 (S2) — CLOSED: the depthwise demote is on by default and the pads fold into the CNA, and MobileNetV2 is 10.0 ms against a four-worker `--no-offload` arm of 30.9 (f32 import) or 54.2 (fp16 export) — so the "whole fp16 offload loses to a fair CPU baseline" verdict this entry carried is overturned, 3.1x precision-matched, with the NPU arm itself down 7.3x from 73.1 (2026-11-25)
-
-**Superseded 2026-11-24: the depthwise demote is on by default, and
-MobileNetV2 fp16 ties `--no-offload` (30.8 ms each, base 35.3).** Everything
-below predates removing the quiescence dwell, which was the whole deficit;
-see the Resolved entry. What is left of P7 is host work around the 17 CPU pad
-copies (`pack.input`, `compact`), i.e. conv padding, not the demote.
-**And that is resolved too (2026-11-24): the pads fold into the CNA and
-MobileNetV2 fp16 is 13.5 ms, 2.3x faster than `--no-offload`.** See the
-Resolved entry "Depthwise padding folds into the CNA".
-
-> **The 30.8 ms `--no-offload` arm behind both figures in this note is the
-> f32 import**, not the fp16 export the survey builds for this model -- which
-> is 54.2 ms at the same allocation and clock. Both claims are sound; the
-> precision just was not labelled. The f32 arm is the fairer baseline, and
-> the last subsection of this entry has why, plus the one thing about it that
-> is still open.
-
-They are the whole of the `outside` term (70.9 ms of a 127 ms model; see
-the profile below): ten executables over 17 dispatch
-sites, `112x112x48` down to `7x7x1344`, all `linalg.depthwise_conv_2d_nhwc_hwc`
-at f32. They stay on the CPU for one reason —
-`RocketDemoteConvInputsPass` deliberately excludes depthwise, so an f32
-depthwise never becomes the f16/f16/f32 the matchers require and no depthwise
-matcher can ever fire.
-
-### The fp16 depthwise channel ceiling moved 512 -> 1536 (2026-09-09), and this verdict did not
-
-Separate from the demote gate above, and worth keeping apart from it. The
-*already-f16* MobileNetV2 import needs no demotion, so its depthwise
-convolutions reach the matchers directly -- and six of the seventeen were
-still on the CPU, because the fp16 depthwise admission ceiling was 512 while
-the model's own widest are C=576 and C=960. That 512 was where the depthwise
-matchers were first written and nothing had gone back to it: `ConvPlan`
-plans fp16 depthwise to `MAX_DEPTHWISE_CHANNELS` (1792), and the int8
-depthwise rung had already moved to 1344.
-
-Raised to 1536 in `rocket-core`'s `admission` table, backed end to end:
-`tools/e2e_conv_regression.py` gained `depthwise_fp16_c576`, `_c960`,
-`_c1536` and `_c1536_s2` (the last NCHW, the only layout the stride-2 fp16
-depthwise matcher exists in), each compiled to a Rocket and a CPU module from
-the same MLIR and compared on `planck`: max|error| 1.6e-4 to 2.4e-4, 0
-mismatches, at atol 1e-3.
-
-MobileNetV2 fp16 goes 47 -> 53 dispatch sites, all 17 depthwise convolutions
-now offloaded, max|diff| 0.0156 against its own `--no-offload` arm with top-1
-and top-5 unchanged. The wall time says the same thing this section already
-said, on `planck` at 600 MHz, `performance` governor, medians of three:
-
-| arm | sites | 4 A76 workers | all 8 cores |
-|---|---|---|---|
-| NPU, depthwise <= 512 | 47 | 58.9 ms | 77.5 ms |
-| NPU, depthwise <= 1536 | 53 | 63.5 ms | 77.3 ms |
-| `--no-offload` | 0 | **47.0 ms** | 81.4 ms |
-
-The six extra sites cost 4.6 ms at four workers and nothing at eight. A
-depthwise convolution here is still the cheapest op in the model and still
-does not pay for its own dispatch, which is what the rest of this section is
-about; the raise changes what is *admissible*, not that verdict. It is kept
-because admission is a statement about what has been measured, and because a
-model whose depthwise convolutions are not this cheap -- a wide MobileNetV3
-or EfficientNet stage -- can now reach the NPU at all. Nothing in that class
-has been measured here.
-
-### The recorded reason for that exclusion does not apply to this model
-
-The pass's scope comment, and `depthwise-f16-demote-breaks-model`, say
-demoting depthwise makes MobileNetV2 wrong: max|err| 3.5 on the logits, top-1
-incorrect on every input, with every isolation passing. That was measured on
-**static-int8** — a command buffer mixing fp16 depthwise with int8 dispatches,
-which is C8's territory, not a statement about depthwise.
-
-Measured on the plain fp16 model, 2026-09-04, against a CPU-only aarch64 f32
-build of the same MLIR:
-
-```text
-  37 sites (today)          max|err| 0.0192   top-1 and top-5 stable
-  44 sites (+7 depthwise)   max|err| 0.0500   top-1 and top-5 stable
-```
-
-against a top-2 logit gap of 0.257, and byte-identical across five consecutive
-single-shot runs with no hang. **Correctness is not the blocker for fp16.**
-
-### It is slower
-
-```text
-  147/149 ms   37 sites
-  185/188 ms   44 sites
-```
-
-Only 7 of the 17 match at all: the fp16 depthwise matchers cap at `Cin <= 512`
-and ten of these are 528, 816 or 1344 (the HAL itself is exact to 1536, see
-`depthwise-channel-ceiling-split`). Those seven cost 32.7 ms of driver time per
-inference, of which 9.6 ms is the NPU:
-
-```text
-  op                                     total   rec  pk.in   npu  cmpct
-  113x113x144->144 k3x3 s2 dw            10.13  2.46   3.19  2.85   1.22
-  114x114x48->48   k3x3 s1 dw             6.12  1.76   1.26  2.04   0.90
-  58x58x192->192   k3x3 s1 dw             6.10  1.37   1.11  1.71   1.72
-  30x30x288->288   k3x3 s1 dw (x2)        5.08  1.13   0.97  1.52   1.19
-  57x57x192->192   k3x3 s2 dw             3.70  0.86   1.11  1.03   0.51
-  29x29x288->288   k3x3 s2 dw             1.54  0.38   0.44  0.45   0.15
-```
-
-Two costs on top of that, both of which only exist because these are the ops
-being moved:
-
-- **`quiesce` 7.4 ms per inference**, 1.06 ms x 7. That is
-  `DEPTHWISE_TO_DENSE_QUIESCENCE`, the dwell after a depthwise completion and
-  before a dense submit. A model whose depthwise and dense convolutions
-  alternate pays it at every boundary.
-- **`outside` *rises* 88 -> 118 ms.** Offloading these does not remove CPU
-  work, it adds some: the matched depthwise needs explicit padding
-  (`112x112 -> 114x114`), which IREE forms as its own CPU dispatch. The
-  padding is why the shapes above read 113/114/58/30 rather than
-  112/56/28.
-
-So the arithmetic is: 9.6 ms of NPU work bought with 23 ms of driver host
-time, 7.4 ms of hardware dwell and 30 ms of extra CPU padding. The
-depthwise convolutions are the cheapest ops in the model per byte moved —
-one filter per channel, no Cout reduction — which is exactly the profile that
-loses to a per-dispatch layout round trip.
-
-### Re-measured 2026-09-07 with depthwise ReLU6 fused: the verdict holds, at a quarter of the cost
-
-This is item 0 below, done. The hypothesis was right in direction and too
-small to change the answer.
-
-|   | ms | vs 37 sites |
-|---|---:|---:|
-| 37 sites (dense ReLU6 fused) | 133.0 | — |
-| 44 sites, depthwise clamps on the CPU | 142.5 | 1.071x slower |
-| 44 sites, depthwise ReLU6 fused into BN | **140.0** | **1.053x slower** |
-
-Six interleaved passes each, `taskset -c 4-7`, governor `performance`,
-medians. Accuracy at 44 sites is max|diff| 0.0320 against a `--no-offload`
-CPU arm (0.0184 at 37 sites), top-1 and top-5 stable.
-
-**So the 26% is now 5.3%**, and two separate things did that. Most of it is
-M2's scratch pool, which removed the per-dispatch allocation the seven extra
-depthwise dispatches were each paying -- the 186-vs-148 above predates it.
-The rest, 2.5 ms of the 9.5 ms gap, is the depthwise clamps: the section
-below was right that offloading un-fuses them and that the recorded
-`outside` rise contains them, but they are a fifth of the gap, not the bulk
-of it.
-
-**What is in the tree.** All of the depthwise fusion machinery, and it is
-hardware-validated: `rocket-fuse-conv-relu6` handles
-`DepthwiseConv2DNchwChwOp` (the NCHW chain is
-`conv -> transpose -> expand_shape -> clamp`, and the bias broadcast retains
-dimension 1, so the canonical clamp is NCHW with a `(d1)` bias map),
-`#rocket_dynamic_depthwise_relu6_target` and its stride-2 twin exist with
-their shims and matchers, and `conv_fp16_bias_activation_hw` runs bias alone,
-bias + ReLU and bias + ReLU6 under the depthwise register program as well as
-the dense one -- all six exact. What is *not* in the tree is the demote,
-which stays off: `RocketDemoteConvInputsPass`'s scope comment carries the two
-lines that turn it on and this table.
-
-**What is left of the gap** is items 2-4 below, unchanged: the explicit pad
-IREE materializes as its own dispatch, the `DEPTHWISE_TO_DENSE_QUIESCENCE`
-dwell, and the `Cin` 512 matcher cap. Item 1, P2's chaining, is the one that
-would move it most and is also the one gated on this item -- see P2.
-
-### The 2026-09-07 profile, and why the earlier accounting understated the clamps
-
-Two things happened after the measurement above, and both move it.
-
-**The `outside` rise has a second cause the measurement never named.** It is
-attributed entirely to the explicit padding IREE materializes. But IREE
-currently fuses each depthwise convolution's ReLU6 **into the depthwise
-dispatch itself** — read the flow IR and one dispatch does depthwise + bias +
-clamp + `truncf` to f16 in a single pass. Offloading the depthwise breaks
-that fusion and hands back 17 more standalone CPU clamp dispatches. Those are
-inside the 88 -> 118 ms rise and were paid but not attributed. The mechanism
-to fuse them into the NPU instead now exists for dense convolutions
-(`rocket-fuse-conv-relu6`, `#rocket_dynamic_relu6_target`); extending it to
-depthwise is an increment on work that has landed, not new ground —
-though it does need a depthwise arm of `conv_fp16_bias_activation_hw` first,
-because that test covers the dense path only.
-
-**The denominator moved.** The 147/149 ms baseline is now 133 ms (the dense
-ReLU6 fusion), so the same absolute cost is a larger fraction, and P6's
-`record` term — which is 2.46 + 1.76 + 1.37 + ... of the per-op table above —
-has largely gone with the M2 scratch pool.
-
-### The current profile, 2026-09-07
-
-`ROCKET_PROFILE=1`, `taskset -c 4-7`, m2 driver, ~39 inferences, per
-inference. Both arms are the same binary and the same input; the fused arm is
-the ReLU6 build.
-
-| phase | 37 sites, unfused | 37 sites, ReLU6 fused |
-|---|---:|---:|
-| `outside` | 79.6 | **70.9** |
-| `wait.npu` | 25.9 | 25.4 |
-| `compact` | 17.7 | 17.7 |
-| `pack.input` | 6.6 | 6.7 |
-| `record` | 1.6 | 1.5 |
-| wall | 136.7 | 127.2 |
-
-The whole 9.4 ms is `outside` and every driver phase is flat, which is what
-removing a CPU dispatch should look like — and it is also the evidence that
-moving the bias onto the BS plane and turning BN on costs the hardware
-nothing (`wait.npu` -0.6 ms, noise).
-
-**What this profile says about where to spend.** `outside` is **54% of the
-model** and P7 is what it is made of: these 17 convolutions. `compact` plus
-`pack.input` is 24.4 ms, 19%, and that is P2 — but P2's cross-op chaining
-only pays between *adjacent* NPU dispatches, and this model alternates dense
-(NPU) with depthwise (CPU), so P2's reach is itself gated on this item. The
-knot is P7 -> P2 -> ROADMAP's conv padding row, and P7 is the end to pull.
-
-### Re-measured 2026-09-08 with the driver chain on: chaining reaches nothing here, and the verdict holds
-
-P2 step 2 landed (the consumer reads its NPU producer's output cube in
-place), and item 1 below said that was the lever that would move this most.
-Measured, it moves it by nothing, and the reason is structural rather than a
-tuning.
-
-Same two-line demote (`DemoteInputsToF16<linalg::DepthwiseConv2D{NhwcHwc,
-NchwChw}Op>` and the promote twins), same source model rebuilt for the run
-(`mnv2.fp16.mlir` is no longer on disk; the width-1.4 f32-constant form is
-the fp16 export widened with `widen_to_f32.py`, batch pinned, imported at
-opset 20 -- 37 sites, and 44 with the demote, exactly the 2026-09-07
-placement). `planck`, six interleaved passes, medians, governor
-`performance`, NPU IRQs on cpu6. All three arms are the same binary; the
-third is the 44-site build with `ROCKET_CHAIN=0`.
-
-|   | `taskset -c 4-7` | + `--task_topology_cpu_ids=4,5,6,7` |
-|---|---:|---:|
-| 37 sites | **130.5** ms | **108** ms |
-| 44 sites, chain on | 137.0 (1.050x slower) | 127.5 (**1.18x slower**) |
-| 44 sites, chain off | 136.5 | 126.5 |
-
-Correctness is unchanged: max|diff| 0.0078 against the `--no-offload` arm
-at 44 sites (0.0073 at 37), same top-5, and chain on/off are bit-identical.
-
-**Chaining took one edge in both arms -- the same one.** `ROCKET_CHAIN=debug`
-on the 44-site build: 1 taken (the 7x7x448 -> 1792 head), 32 declined for
-*no producer on this command buffer*, 8 declined because the consumer's
-pixel is not a whole number of 32-byte atoms (88-, 136- and 24-channel
-project outputs, which pack 176 -> 192, 272 -> 288 and 48 -> 64 bytes).
-Classifying every Rocket call's input operand in the post-match IR says what
-the 32 are:
-
-| Rocket conv inputs (44-site build) | fed by | chainable today |
-|---|---|---|
-| 10 expand 1x1 | `linalg.add` -- the residual add, on the CPU | no |
-| 10 project 1x1 | the CPU clamp after a still-unclaimed wide depthwise | no |
-| 7 depthwise 3x3 | `tensor.pad` -- the explicit pad, on the CPU | no |
-| 7 project 1x1 | the offloaded depthwise, directly | only if whole-atom |
-| 7 expand 1x1 | a project conv, directly (no residual) | only if whole-atom |
-
-So the reach was never "17 depthwise convolutions sitting between NPU pairs".
-Offloading the seven admissible ones opens at most 14 direct NPU -> NPU
-edges, 8 of which the whole-atom rule declines, and every other edge on the
-model is behind one of three CPU ops: the residual add (10 edges), the pad
-(7), and the clamps of the depthwise the `Cin` 512 cap leaves behind (10).
-On this model P2's reach is gated on those three, not on P7 alone; the
-2026-09-07 statement above that "P2's reach is itself gated on this item"
-was the right direction and too small a claim.
-
-**The hardware term is the binding one, and chaining cannot touch it.**
-Whole-run profile, 37 vs 44 sites at `taskset -c 4-7`: `outside` -1030 ms
-(the CPU depthwise and their clamps, gone), against `wait.npu` **+633**,
-`pack.input` +354, `compact` +265, `record` +47. The seven depthwise
-convolutions cost 60 % of the CPU time they replace *in NPU time alone*, at
-the 200 MHz M2 leaves the clock at; the layout round trip is the other 600.
-A perfect chain -- every pack and compact on those seven edges free -- would
-leave 44 sites at roughly 125 ms against 130, a 4 % win at best, and the
-four-worker column says the CPU side has more headroom than that
-(108 -> ~127 is the CPU depthwise getting four workers while the NPU path
-gains nothing).
-
-What this changes in the list below: item 1 is done and worth ~0 until the
-pad, the residual add and the whole-atom rule move; item 2 (the pad) is now
-also a P2 blocker and the first thing to build; and M2 is the only lever
-that touches the term that actually binds. The demote stays off.
-
-### Re-measured 2026-09-09 at 600 MHz: the clock is worth 8-10 points, and it is not the thing that decides this
-
-M2 is resolved (see **Resolved**), and it was the term this issue named as
-binding. Governor `performance`, four interleaved passes, medians,
-`mnv2_14.f32.mlir`, against a `--no-offload` arm from the same pipeline:
-
-| allocation | clk | base (37) | dw (44) | nooff | dw vs base |
-|---|---|---:|---:|---:|---|
-| default topology | 200 MHz | 99.4 | 99.8 | 108.0 | 1.004x slower |
-| default topology | 600 MHz | 87.5 | **81.0** | 108.0 | **1.080x faster** |
-| four workers | 200 MHz | 83.1 | 93.2 | **54.5** | 1.122x slower |
-| four workers | 600 MHz | 73.1 | 74.7 | **54.5** | 1.022x slower |
-
-The clock moves the depthwise arm 8-10 points relative to the baseline in
-*both* allocations, enough to flip the sign at the default one. That is what
-this issue predicted, and the prediction was the reason it ranked the clock
-first. `max|diff|` vs `--no-offload` is 0.0051 (dw) and 0.0050 (base), top-1
-stable at both clocks, zero faults in ~60 runs.
-
-> **Superseded 2026-11-25 — read the note at the end of this entry first.**
-> The paragraph below concluded that MobileNetV2 fp16's offload is underwater
-> at a fair allocation. It is not: the same comparison, precision-matched to
-> this one's f32 import, is now 10.0 ms offloaded against 30.9 ms
-> `--no-offload` -- 3.1x the other way. The table above is kept as the
-> 2026-09-09 record.
-
-**The verdict holds anyway, and the reason has moved.** At four workers
-`--no-offload` is **54.5 ms** against a best NPU arm of 73.1 — the CPU is
-**1.34x faster**, at either clock. The CPU baseline nearly doubles from four
-workers (108.0 → 54.5, 1.98x) while every NPU arm gains 8-14%. So this is no
-longer "depthwise loses to the layout round trip"; the whole fp16 offload on
-this model is underwater once the CPU is allocated fairly, and whether the
-depthwise demote is on is a detail inside a losing trade. The 81.0-vs-108.0
-row is the only arm here that beats its CPU baseline and it does so only at an
-allocation that starves the CPU of workers — `taskset` does not set IREE's
-worker count. This is M4's baseline trap and P8's "what moves it: CPU slots"
-arriving together.
-
-**Two corrections to the 2026-09-08 entry above.** Its edge census is stale:
-compaction now skips 67 dense output writes in the 37-site build against
-**464** in the 44-site one, because the residual-add-on-NPU and lazy-compaction
-work landed the same day it was taken. And **governor `ondemand` cannot
-measure this**: it read the four-worker control at 1.078x against the
-documented 1.18x and gave the default-topology control the wrong *sign*. Under
-`performance` both controls reproduce. See the method note.
-
-**Reproducing it is now one compiler build.** `ROCKET_DEMOTE_DEPTHWISE=1`
-gates the demote in `RocketDemoteConvInputsPass`; the `PromoteInputsToF32`
-twins are registered unconditionally because they only fire on ops carrying
-`kDemotedAttrName`. Verify by dispatch-site count (37 off, 44 on) rather than
-by trusting the variable, and pass
-`--llvmcpu-target-triple aarch64-linux-gnu` or the vmfb is x86. Board script:
-`planck:~/p7ab.sh`.
-
----
-
-### What would change the verdict, in order
-
-0. ~~**Re-measure the 44-site arm with depthwise ReLU6 fused**~~ — done
-   2026-09-07, see above. Worth 2.5 ms of the 9.5 ms gap; the verdict holds
-   at 1.053x rather than 1.26x.
-1. ~~**P2's cross-op chaining.**~~ Built (P2 step 2) and measured
-   2026-09-08 above: it takes the same single edge with or without the
-   depthwise offloaded, because every depthwise input sits behind the
-   explicit pad and 8 of the 14 direct edges fail the whole-atom rule. It
-   cannot reach the `wait.npu` term, which is the one that binds.
-2. **The pad.** Folding it into the dispatch (the driver already pads on the
-   input packing path) removes the added CPU dispatch and its buffer -- and,
-   since 2026-09-08, it is what stands between every offloaded depthwise and
-   its producer's cube, so it is a P2 blocker on this model too.
-3. **The quiesce dwell.** 7.4 ms is pure empirical caution; it is C8's
-   neighbour and should be re-derived rather than kept at a millisecond.
-   (Off by default since 2026-11-24; see Resolved.)
-4. **The `Cin <= 512` matcher cap**, last, because raising it only adds more
-   of a currently-losing trade until the three above land. The HAL is exact
-   to 1536.
-
-To reproduce the 44-site build: add
-`DemoteInputsToF16<linalg::DepthwiseConv2DNhwcHwcOp>` and
-`...<linalg::DepthwiseConv2DNchwChwOp>` to `RocketDemoteConvInputsPass`, and
-the `PromoteInputsToF32` counterparts to the promote pass. Two lines each, and
-nothing else in the tree needs to change — the matchers, the executables, the
-weight packing and the HAL are all already there and all already correct.
-
----
-
-### Overturned 2026-11-25: the four-worker verdict has inverted, and the NPU arm fell 7.3x
-
-The paragraph above -- "the whole fp16 offload on this model is underwater
-once the CPU is allocated fairly" -- was the number this file's **Suggested
-order** told readers to rank work against. It is no longer true, on either
-CPU baseline. `orangepi`, governor `performance`, NPU 600 MHz, cpu 4-7,
-medians of 5 warm repetitions:
-
-| arm | 2026-09-09 | now | source |
-|---|---:|---:|---|
-| NPU, best arm | 73.1 ms | **10.0 ms** (9.90-10.2) | measured 2026-11-25 |
-| `--no-offload`, f32 import | 54.5 ms | **30.9 ms** | #81, 2026-11-24 |
-| `--no-offload`, fp16 export | — | **54.2 ms** (54.1-54.2) | measured 2026-11-25 |
-| verdict | CPU 1.34x faster | **NPU 3.1x faster** | precision-matched |
-
-**The NPU arm fell 7.3x, from 73.1 to 10.0, and that is the whole of the
-change.** The verdict flips on either baseline: 3.1x against the f32 CPU arm
-and 5.4x against the fp16 one.
-
-**3.1x is the figure to quote.** The 2026-09-09 claim was f32 on both sides,
-so the precision-matched successor is the f32 CPU arm, and the f32 arm is
-1.76x faster than the fp16 one because IREE's CPU codegen is good at f32 on
-an A76 and poor at fp16. The subsection below has the evidence and what is
-still open about it; **the first version of this note got that wrong**, taking
-54.5 and 54.2 for the same measurement and calling the CPU arm unmoved. It
-is not unmoved -- those are two different baselines, and the f32 one halved.
-
-What moved it is not one thing, which is why no single entry claimed it: the
-depthwise pad fold (item 2 of the list just above, now done), the fp16
-epilogue fusion and residual-add-on-NPU of P2, lazy compaction, and P3's
-sized constant sync. Each was recorded against its own baseline and none
-went back to this row.
-
-**Two caveats, stated because they are the reason to re-run rather than
-trust this table.** The 2026-09-09 arm is `mnv2_14.f32.mlir`, an f32 import
-with per-op demotion at 37 or 44 NPU sites; the 2026-11-25 arm is
-`mobilenet_v2.fp16.npu.vmfb` from `tools/model_survey.py`, an fp16 export at
-54 NPU sites and 5 CPU ones. Those are different pipelines, and the matching
-`--no-offload` arms are the evidence that they are nonetheless the same
-comparison. And a single model is a single model -- but the 2026-11-24
-ten-model survey has every one of them beating its own `--no-offload` arm by
-2.6x to 35x, so this is not a MobileNetV2 artefact.
-
-**What this does to P7 itself.** Nothing directly: the depthwise demote
-question is still decided by the rows above it, and the demote is on by
-default since 2026-11-24. What changes is the frame -- "a detail inside a
-losing trade" was the reason this entry gave for not caring which way the
-demote went, and the trade is not losing any more. The three remaining items
-in the list above are worth re-pricing against a 10.0 ms model rather than a
-73.1 ms one, where a 7.4 ms dwell or a CPU pad is a far larger share.
-
-### The 30.8 ms baseline is the f32 import, and it is the fairer one
-
-The first pass at this reconciliation flagged the 30.8 ms `--no-offload` arm
-behind "ties `--no-offload`" and "2.3x faster" as unattributable, because no
-core allocation reproduces it. Measured 2026-11-25 on
-`mobilenet_v2.fp16.cpu.vmfb`, medians of 5 warm repetitions:
-
-| `--task_topology_cpu_ids` | ms |
-|---|---:|
-| `4,5,6,7` | 54.4 |
-| `0,...,7` | 57.8 |
-| omitted (default topology) | 181 |
-
-So allocation is not it, and the default topology is 3.3x *slower* rather
-than faster. **The answer is in #81's own commit body**, which says it in one
-line: *"The survey mnv2 is an f32 import"*. The 30.8/30.9 ms arm is
-`--no-offload` on the **f32** import; the 54.2 ms arm is `--no-offload` on
-the **fp16** export, which is what `tools/model_survey.py` builds for this
-model. Both are real, neither is wrong, and nothing labelled which.
-
-**The fp16 CPU arm is 1.76x slower than the f32 one, so a precision-matched
-comparison is the honest one.** IREE's CPU codegen is good at f32 on an A76
-and poor at fp16, so quoting an fp16 NPU arm against an fp16 CPU arm flatters
-the offload by that factor. Both multiples, same conditions (cpu 4-7,
-600 MHz):
-
-| baseline | `--no-offload` | NPU | ratio |
-|---|---:|---:|---|
-| f32 import (#81, 2026-11-24) | 30.9 ms | 10.0 ms | **3.1x faster** |
-| fp16 export (survey, 2026-11-25) | 54.2 ms | 10.0 ms | 5.4x faster |
-
-**3.1x is the number to quote**, because it is precision-matched and because
-the 2026-09-09 claim it overturns was f32 on both sides. The verdict does not
-depend on the choice -- the old claim was that the CPU is 1.34x *faster*, and
-on either baseline the NPU now wins -- but the magnitude does, and 5.4x
-overstates it.
-
-**Still open: the f32 arm reads 54.5 in September and 30.9 in November.** The
-2026-09-09 four-worker row is `mnv2_14.f32.mlir` at 54.5; #81's f32 arm is
-30.9 at the same allocation and clock. That is another 1.76x, and it is
-either a different model file or eleven weeks of CPU-side change in IREE and
-the spec. Settling it needs an f32 `--no-offload` build from current `main`
-measured beside the fp16 one, which this pass could not do: no host
-`libIREECompiler.so` newer than the pad fold exists in this checkout. Until
-then the September row and the November row should not be subtracted from
-each other.
-
----
-
 ## P8 (S2) — the offload's cost is a flat per-dispatch tax that *parallelises*; the dispatches the offload adds are not it, and `taskset -c 4,5` doubles the deficit it reports
+
+**Superseded 2026-11-25 as a verdict; the mechanism stands.** The
+re-measurement in Suggested order item 2 found the offload faster than a
+fair, like-for-like CPU build on all ten surveyed models (P7 has
+MobileNetV2 at 3.1x precision-matched). Read "no configuration beats the CPU"
+and "more sites make the model slower" below as the starved-core int8
+reading of 2026-09, not a current law. What still holds is the cost model:
+a flat per-dispatch tax that parallelises.
 
 Measured on `planck` 2026-09-05 [verified], one MobileNetV2 int8 model
 (`mnv2.int8.mlir`) through the rocket-compiler pipeline, governor
@@ -1922,6 +1098,966 @@ converter did not corrupt the model here, the importer mishandled what it
 produced. Root cause not yet localized -- the next step is a layer-wise
 comparison to find where the two imports first diverge.
 
+## P10 (S3) — IREE compiles the CPU softmax with a 4-wide vector tile; a 16-wide tile is bit-identical and 1.39x faster, and nothing in this stack can set it
+
+Found 2026-11-24 profiling BLIP fp16 at `main` `74787f0` on `orangepi`
+(governor `performance`, NPU 600 MHz, `--task_topology_cpu_ids=4,5,6,7`).
+BLIP runs 825 ms against 5305 ms `--no-offload`, and its CPU half is now the
+larger half: **[verified]** `ROCKET_PROFILE` puts `outside` (CPU dispatches) at
+~512 ms per inference against `wait.npu` 283, `record` 46, `pack.input` 26,
+`compact` 27.
+
+**Where the CPU time is.** **[verified]** `perf record -e cycles:u
+--user-callchains` on a system-linked build (the recipe in the `rocket-compiler
+compile --iree-flag` help), A76 counter only:
+
+| CPU dispatch group | share of A76 cycles |
+|---|---|
+| vision self-attention, 577 tokens | ~70% |
+| ↳ `softmax_12x577x577xf32` | **24.0%** |
+| ↳ `batch_matmul_12x577x577x64` (QKᵀ) | 19.5% |
+| ↳ `batch_matmul_12x577x64x577` (AV) | 18.7% |
+| ↳ head split / broadcast reshapes | ~8% |
+| vision GELU (the f32 `erf` alone 7.5%) | 13.5% |
+| LM head `16x30524x768` (refused, `N` > 4096) | 3.2% |
+| cross-attention | ~2.7% |
+| every LayerNorm (252 of the 621 CPU sites) | ~2.6% |
+| the whole 16-token text side | ~0.3% |
+
+Site counts mislead here: LayerNorm is 40% of the CPU *sites* and 3% of the
+CPU *time*.
+
+**Why the softmax is slow.** **[verified]** The dispatch reads f16 scores,
+scales by 1/8, runs `linalg.softmax` in f32 along the 577-wide row, and
+truncates to f16. IREE (`a869dc3`, unpatched) configures the decomposition
+with `vector_inner_parallel = [0, 0, 4]` and `vector_reduction = [0, 0, 4]`
+(8 for the sum): one 4-wide f32 vector per loop iteration. The `exp` is a
+vectorized `fmla` polynomial, not a libm call, but one vector per iteration
+makes every iteration one long dependent chain. `perf annotate` on the
+standalone kernel shows IPC below 1, about 44 cycles per 4 elements. Three
+further costs, read off the assembly:
+
+- `exp` is computed **twice**, once in the sum pass and again in the
+  normalize pass (45% and 48% of the kernel's cycles; the max pass is 6%).
+- The normalize pass divides with a vector `fdiv` per element instead of
+  multiplying by a reciprocal.
+- With FP reassociation off (IREE's global default is `O0`), the sum is 8
+  dependent scalar `fadd`s per iteration.
+
+**Standalone kernel, `12x577x577`.** **[verified]** Median ms, 4×A76 / 1×A76.
+The lowering config was edited between `--compile-to=executable-configurations`
+and `--compile-from=executable-configurations`. Every variant has the same
+4.1e-05 error against an f64 reference.
+
+| variant | 4×A76 | 1×A76 | output vs default |
+|---|---|---|---|
+| IREE default (tile 4) | 9.96 | 38.2 | — |
+| tile 8 | 8.98 | 34.9 | bit-identical |
+| **tile 16** | **7.23** | **27.5** | **bit-identical** |
+| tile 32 | 6.93 | 26.3 | bit-identical |
+| tile 32 + reassociated sum | 6.31 | 23.6 | 1.5e-05 (one f16 ulp) |
+
+**Flags that do not fix it.** **[verified]**
+`--iree-llvmcpu-use-decompose-softmax-fuse=false` produces a byte-identical
+binary (codegen's tile-and-fuse recomputes the `exp` anyway).
+`--iree-llvmcpu-target-cpu=cortex-a76` changes nothing.
+`--iree-llvmcpu-reassociate-fp-reductions=true` (the same binary as
+`--iree-opt-level=O2` for this dispatch) is 7% on the kernel and **826 -> 817
+ms on BLIP end to end** (the `--no-offload` arm 4990 -> 5006), so not worth
+taking alone.
+
+**The attention matmuls do not share the problem.** **[verified]** QKᵀ and AV
+(f16 in, f32 accumulate) under IREE's default (`DoubleTilingExpert`, 8×8
+register tile, K step 4) run 8.16 / 8.24 ms at 4×A76 and 31.1 / 29.7 ms on
+one core: ~16.4 GFLOP/s, about 43% of the A76's f32 NEON peak, scaling 3.8x.
+That default beat every alternative tried. Data tiling is +32%, and data
+tiling with microkernels is +35% (QK) / +88% (AV): this A76 has `asimdhp` and
+`asimddp` but **not `fhm`**, so there is no f16→f32 widening-FMA microkernel
+to win with. Tiles 4×16, 16×4, 8×8 k1/k8 and 6×16 were all slower, and 8×12
+was 5x slower (register spill). The fused `iree_linalg_ext.attention` op is
+correct (4.8e-4 vs f64) but **1902 ms** at 4×A76 against ~26 ms for QKᵀ +
+softmax + AV unfused, and nothing in this IREE raises the three ops into it
+anyway. So the softmax tile is the only CPU code-generation lever found in
+BLIP's attention. Offloading attention is C15's question, and it lost there.
+
+**What a fix is worth.** Tile 16 saves ~2.7 ms per call × 12 vision layers ≈
+**33 ms per BLIP inference (~4%)**. The same dispatch shape appears in every
+transformer in the survey (ViT-B/16, ViT-L/16, BERT at 128 and 384), whose
+softmax shares have not been measured.
+
+**Ways to land it, none built:**
+
+1. A compiler hook that pins the softmax dispatch's lowering config: IREE's
+   tuning-spec mechanism (`--iree-codegen-tuning-spec-path`) or a
+   `compilation_info` attribute attached before configuration. Nothing in
+   `rocket-compiler` or the plugin sets CPU lowering configs today, so this
+   would be the first. Wherever it lands, it must apply to both arms: the
+   `--no-offload` baseline must get the same CPU softmax, or the survey ratio
+   stops being like-for-like.
+2. Upstream: change IREE's CPU heuristic so the softmax decomposition's
+   parallel vector size is not the native vector width. That benefits every
+   CPU target, at the cost of carrying the change until a rebase.
+
+**To reproduce:** the standalone MLIR is one `linalg.softmax` between an
+`extf`/`mulf` generic and a `truncf` generic, which is exactly the source
+`--iree-hal-dump-executable-sources-to` shows for BLIP's
+`main_graph$async_dispatch_27`. Benchmark it with `iree-benchmark-module
+--device=local-task --task_topology_cpu_ids=4,5,6,7`.
+
+---
+
+## Closed, narratives kept
+
+These three are closed, but code comments, tests and the other docs cite
+their measurements and method notes, so their full text is kept here rather
+than cut to a Resolved entry. Moved out of the open section 2026-11-27,
+verbatim apart from P2's header. Read each one's header for its outcome.
+
+---
+
+## P2 (S3) — CLOSED 2026-09-08 (steps 2, 4 and 5 landed; ResNet50 169 -> 114 ms bit-identically): cross-op chaining is HW-proven for fp16, and this repo's fp16 output cube is already the right layout
+
+`rocket-layout-repack-per-dispatch` records the per-dispatch NC1HWC2 pack/unpack
+as debt with no mechanism to avoid it, and correctly says no scaffolding exists.
+`encodings/cross-op-chaining.md` [notes] supplies the hardware fact that makes
+the fix legal:
+
+> For an fp16 matmul whose output is the default fp16-narrowed cube
+> (`fp32tofp16=1`), the **output cube and the input feature cube are the same
+> layout**: both `feat_idx`, channel atom C2=8. ... The host does not need to
+> de-tile `C1` to row-major and re-scatter it; the second matmul can read the
+> first's output BO at the same IOVA.
+
+proven two ways: A's raw output BO is byte-identical to `C1` de-tiled then
+re-packed (`memcmp`, 0/4096 lanes differ), and B reading A's output BO directly
+is bit-exact to the host round-trip.
+
+**This repo is already in that configuration** [verified]:
+`DpuOutCvtScale.fp32tofp16_en` is set whenever `quantization.is_none()`
+(`conv.rs:3912`), and `Precision::Fp16::output_element_bytes()` is 2
+(`conv.rs:476`), so C2 = 16/2 = 8 on both the input and the output side. The
+aliasing precondition holds today, for free.
+
+It is fp16-only, and the notes tabulate why: int8 (int32 C2=4 out vs int8 C2=16
+in) and the fp32-accumulator fp16 output (C2=4) both mismatch. Element-wise ops
+preserve the cube, so a `conv → activation → conv` run chains too.
+
+Also carry the two costs the notes measured, so this is not oversold: matched
+tiling pins the consumer's K-tile to the producer's N-tile, which fragments the
+consumer's K-accumulation (they measured pack −30% but wait +14%); and the whole
+chain is single-fd, so it forfeits P1. On their transform-bound encoder it was
+net-positive; on compute-bound LLM prefill the ceiling was 2–3% and not worth
+building. Which regime MobileNetV2's back-to-back 1x1 convs sit in is the thing
+to measure first — and measure it under a pinned governor (M1), because the term
+being removed is exactly the host-side term the governor penalizes.
+
+**Resized 2026-09-04.** The round trip was 53 ms per inference when this was
+written; P6 item 3 found that most of that was the transforms running on the
+little cluster plus a redundant zero pass, and it is now 26 ms (`compact` 18,
+`pack.input` 8.4) against a 146 ms model. Still the largest thing in the
+driver, and still worth doing — but the "measure the regime first" advice
+above now has a second half: measure it *after* P6 item 3, or the case for
+chaining will look twice as strong as it is. MobileNetV2 fp16 does have
+adjacent NPU dispatch pairs (roughly 15 of 37 dispatches follow another NPU
+dispatch immediately), so the mechanism has somewhere to apply here.
+
+**Resized again 2026-09-07.** 24.4 ms (`compact` 17.7, `pack.input` 6.7)
+against a **127 ms** model — 19% of wall, and the second-largest term after
+P7's `outside`. See P7 for the profile. Two things to carry into any attempt:
+
+- **The cost is concentrated, not spread.** One convolution,
+  `112x112x24->144 k1x1`, is 5.4 ms of compaction per inference on its own —
+  30% of the whole `compact` budget. P8's lever 3 said this and the current
+  profile confirms it: the lever is shape-selective, and a chaining
+  implementation that pays a fixed cost per dispatch to save an average one
+  will lose.
+- **The reach is gated on P7.** Chaining needs producer *and* consumer on the
+  NPU, and this model alternates dense (NPU) with depthwise (CPU). The
+  biggest compaction, the one above, feeds a *depthwise* convolution — so it
+  is not chainable at all until P7 moves. Sizing P2 against the whole 24.4 ms
+  overstates what it can reach today.
+
+---
+
+**Sized on ResNet50 fp16, 2026-09-08 -- the model where the NPU wins.**
+The reach of chaining is the set of edges where one NPU dispatch feeds
+another with nothing between them, and on the current ResNet50 build that
+set is **empty**: all 51 NPU results feed the plain fp16 shim's CPU epilogue
+(`extf` + bias add against a full-size hoisted f32 bias tensor), then a
+second CPU dispatch (ReLU + `truncf`) before the next convolution, and the
+bottleneck outputs go through a CPU residual add as well. Measured from the
+per-op profile (`taskset -c 4-7`, rebuilt runtime, 245 ms/inference:
+`outside` 100.1, `wait.npu` 79.2, `compact` 28.6, `pack.input` 15.7) and
+split by the role each shape plays in a bottleneck:
+
+| edge class | calls/inf | `pack.input` | `compact` | `npu` |
+|---|---:|---:|---:|---:|
+| conv1 (1x1 in, reads the block input) | 16 | 8.6 | 4.1 | 23.8 |
+| conv2 (3x3) | 16 | 3.5 | 2.1 | 33.2 |
+| conv3 (1x1 out, feeds the residual add) | 13 | 1.3 | 8.9 | 10.7 |
+| conv3 + downsample at 56x56x64->256 | 4 | 1.1 | 12.6 | 6.0 |
+| downsample 56x56x256->512 s2 | 1 | 1.2 | 0.9 | 4.0 |
+
+So the order of work, with what each step is worth per inference:
+
+1. **Fuse the fp16 epilogue into the dispatch** -- bias on the BS plane for
+   every convolution and ReLU on the BN stage where the model has one. This
+   is the ReLU6 machinery generalised to `relu` and to bias-only, on the
+   f16-import chain (`truncf` then a `cmpf ugt`/`select` clamp) rather than
+   the demoted one. It is not chaining, but it is the prerequisite for it
+   *and* the larger lever: it removes two full-tensor CPU passes behind each
+   of 51 convolutions, most of the 100 ms `outside`, and leaves conv1 ->
+   conv2 -> conv3 as direct NPU -> NPU edges once the shim's `extf` and the
+   graph's `truncf` cancel.
+2. **Chaining on those edges** (the driver keeps conv1's and conv2's output
+   cube and conv2 and conv3 read it): `pack.input` 4.7 + `compact` 6.2 =
+   **10.9 ms**, 4.5 % of wall. Bounded by the fact that the *wide* tensors
+   (conv3's Cout 256..2048 outputs, 21.5 of the 28.6 ms of compaction) all
+   cross the residual add.
+3. **Residual add on the NPU** (`build_conv_then_add_regcmd`, ROADMAP Phase
+   3's epilogue field) makes every edge direct: the whole `pack.input` +
+   `compact` term, **~44 ms**, 18 % of wall, plus the 16 CPU adds.
+
+Nothing in this list is worth building before step 1, and step 1 pays on
+its own.
+
+**Step 1 landed 2026-09-08.** `rocket-fuse-conv-relu6` gained two patterns:
+bias-only (every dense fp16 1x1/3x3 convolution seeded with a per-channel
+bias now hands it to the BS plane through the plain executables' bias
+binding, which had only ever carried zeros) and bias + ReLU on the
+f16-import chain (`truncf` then `cmpf ugt`/`select`, the clamp moving onto
+the BN stage through four new `relu` targets: stride 1 and 2, with and
+without the folded pad 1). The shims widen with a `linalg.generic` rather
+than a pre-formed dispatch, so the widen and the model's own narrow cancel
+once the wrapper is inlined -- that is what makes the edge direct. Two
+match-loop facts fell out: an epilogue-rooted matcher must live in the
+first loop, and a conv-rooted one in the second, because the walk reaches
+the convolution before its epilogue and a conv-rooted matcher in the first
+loop pre-empts everything behind it (the pad-1 matchers moved for this).
+
+ResNet50 fp16 on `planck`, `taskset -c 4-7`, 3 repetitions, medians:
+
+| | dispatches (NPU / CPU) | NPU results feeding an NPU dispatch | ms |
+|---|---|---|---:|
+| before | 51 / 130 | 0 of 51 | 230 |
+| after | 53 / 22 | **32 of 53** | **162** |
+
+1.42x on the model, max|diff| 0.0116 against onnxruntime (the CPU arm is
+0.0151), same argmax and top-5; the CPU arm is 1035 ms. MobileNetV2 fp16
+(f32 import, the demoted spelling) is unchanged in placement at 37 sites,
+129 ms, max|diff| 0.028 against onnxruntime with the same top-5. Every
+conv1 -> conv2 -> conv3 edge is now NPU -> NPU with nothing between, which
+is exactly the set step 2 chains; what still crosses the CPU is the 16
+residual adds, the 7x7 stem, the padded max pool and the head.
+
+**Re-sized after step 1** (`ROCKET_PROFILE`, same build, per inference;
+the profiler inflates wall to 237 ms, composition only): `wait.npu` 108.2
+(46 %), `outside` 47.9, `compact` 37.0, `pack.input` 20.6. By role, the
+edges step 2 can chain are conv1 -> conv2 and conv2 -> conv3:
+
+| edge class | `pack.input` | `compact` |
+|---|---:|---:|
+| conv1 (reads the block input, from the CPU add) | 9.2 | 3.7 |
+| conv2 | 3.2 | 3.9 |
+| conv3 (feeds the CPU residual add) | 1.6 | 9.7 |
+| conv3 + downsample at 56x56x64->256 | 1.5 | 15.0 |
+
+So **step 2 is worth 12.4 ms**, 5 % of the profiled wall and at most 7 % of
+the real one: conv2's and conv3's packing plus conv1's and conv2's
+compaction. Three quarters of the remaining `compact` is conv3 writing the
+wide block output for the residual add, and half of `pack.input` is conv1
+reading it back, so **step 3 (the residual add on the NPU) is now the
+larger lever by four to one**: it unlocks ~57 ms of pack and compact plus
+the 16 CPU adds, against step 2's 12. Build step 3 first, and step 2 on
+the edges it leaves.
+
+**Step 3 landed 2026-09-08.** `Conv2DDef.epilogue_add` and
+`epilogue_activation` put the residual add and its ReLU in the DPU's EW
+core after the convolution's own tiles, inside the same dispatch, with the
+skip as a fourth binding; the driver runs the tiles, then one EW task on
+the same in-order queue (no fan-out for such a dispatch), and compacts the
+sum. `conv_residual_add_hw` validated the multi-tile cube handoff and the
+EW-stage ReLU exactly before any wire or compiler work. The pass rewrites
+the f16-import chain `conv -> truncf -> linalg.add(skip) -> relu` (a named
+`linalg.add`, since specialisation runs first) into one epilogue generic
+over the accumulator, with the skip collapsed to the convolution's rank.
+
+ResNet50 fp16 on `planck`, `taskset -c 4-7`, medians:
+
+| | dispatches (NPU / CPU) | NPU results feeding an NPU dispatch | ms |
+|---|---|---|---:|
+| after step 1 | 53 / 22 | 32 of 53 | 162 |
+| after step 3 | 53 / 8 | **51 of 53** | 164 |
+
+Correctness is unchanged (max|diff| 0.0116 against onnxruntime, same top-5)
+and the wall is flat, and the profile says exactly why: `outside` fell
+47.9 -> 26.4 ms (the sixteen CPU adds), but each residual dispatch now
+packs its skip tensor (`pack.input` 20.6 -> 29.5) and its EW task is
+hardware time (`wait.npu` 108 -> 131). An even trade on its own. What it
+buys is the reach of step 2: `pack.input` + `compact` is now **61.5 ms**
+per inference and 51 of the 53 edges it sits on are NPU -> NPU, so the
+driver chain -- consumer reads the producer's cube, no compaction, no
+repack, the skip too -- is worth up to 37 % of the model. That is the next
+thing to build, and it is what P2 always was.
+
+What stays on the CPU: the 7x7 stem, the padded max pool, the head's
+pooling transpose and the classifier epilogue. MobileNetV2's residual adds
+have no ReLU after them (linear bottlenecks) and are not claimed; a
+`NONE`-activation twin of the target is one matcher away. **(Done
+2026-11-24 -- and it was a pattern and a driver fix away too; see Resolved,
+"MobileNetV2's residual adds run on the NPU".)**
+
+**Step 2 landed 2026-09-08 -- the input half.** A dispatch whose input was
+written by an earlier dispatch on the same command buffer now reads that
+dispatch's output cube in place (`OutputCube`, `chainable_cube`,
+`ROCKET_CHAIN=0` to turn it off, `=debug` to trace every edge -- both
+switches retired 2026-09-10 when the decision moved to the compiler,
+COMPILER_ROADMAP.md 6.2; `ROCKET_LAYOUT=debug` traces the declarations
+now). No wire or
+compiler change: the producer already writes feature-atomic NC1HWC2 surfaces
+into scratch, and the repack the consumer used to do reproduces those exact
+bytes, so the consumer simply points its regcmd at the producer's scratch BO
+and the pack is skipped. This is the aliasing `encodings/cross-op-chaining.md`
+proved legal and the section above has carried since.
+
+The claim is `pack(compact(cube)) == cube`, and it holds when the two
+dispatches name the identical device byte range, the pixel counts are equal
+(surfaces are `pixels * 16` apart, so a producer with physical height padding
+strides differently), the logical pixel widths are equal with no channel
+padding beyond them, and the pixel is a whole number of 16-byte atoms -- the
+last two because a repack zeroes padding lanes where a producer leaves its
+padding channels. Fanned-out and accumulator dispatches offer no cube: the
+first has no single scratch (each context wrote its own tiles), the second
+writes 128-byte blocks. `tensor_layout.rs`'s `chain_identity_tests` pins the
+identity and each way it fails, since nothing at runtime can check it. Since
+2026-09-10 the identity is a pure function, `rocket_core::layout::
+chain_identity` over `CubeGeometry` (COMPILER_ROADMAP.md 6.1): the driver's
+`OutputCube` and every consumer geometry are built through it, those tests
+assert its verdict beside each byte-level case, and the compiler can ask it
+over `rocket-plan-ffi` ABI 4.
+
+ResNet50 fp16 on `planck`, `taskset -c 4-7`, medians of 3, same
+`resnet50.res.vmfb` with the feature only turned off and on:
+
+| | `pack.input` | `compact` | ms |
+|---|---:|---:|---:|
+| chaining off | 24.0 | 26.0 | 169 |
+| chaining on | **0.6** | 25.6 | **145** |
+
+**1.17x**, and the output is bit-identical to the same build with chaining
+off and to the step-3 reference -- byte for byte, not within a tolerance,
+which is the point of the identity above. 66 of the 68 conv operand repacks
+are gone: all 50 feature inputs and all 16 residual skips. The 2 that remain
+have no NPU producer on their command buffer (the stem, behind the CPU max
+pool). MobileNetV2 fp16 is 134 -> 132 ms and bit-identical, with 1 of 34
+edges chained -- its depthwise convolutions sit on the CPU between every pair
+of dense ones, so its reach is gated on P7, exactly as the 2026-09-07 sizing
+above said. **Corrected 2026-09-08 by measuring it** (P7): with the seven
+admissible depthwise offloaded the chain still takes that same one edge.
+The model's edges are behind the CPU residual add (10), the explicit pad
+in front of every depthwise (7) and the whole-atom rule (8 of the 14 direct
+NPU -> NPU edges, at 88/136/24 channels); P7 alone opens nothing.
+
+~~**What is left of P2 is the compaction, and it needs something this layer
+does not have.**~~ `compact` was unmoved at 25.6 ms, 18% of wall, because the
+producer still wrote the dense IREE buffer: nothing in a command buffer can
+prove that buffer has no other reader -- a later CPU dispatch, a later
+submission, or the model's own output -- and eliding the write on a guess is
+silent corruption. **Landed 2026-09-08 as step 4 below**, with the signal
+coming from the compiler. The other open edges are the elementwise, pooling
+and matmul dispatch kinds, which record no cube yet: on a matmul-heavy model
+(ViT, Qwen3) that is where the same lever would apply.
+
+**A trap worth keeping.** The first cut matched producers by
+`iree_hal_buffer_t` pointer alone and chained **zero** residual skips: IREE
+packs neighbouring transients into one allocation, so the most recent write
+to that buffer is usually a different tensor at a different offset, and every
+skip -- the wide tensors, `Cout` 512..2048 -- was declined as if blocked. The
+fix is to compare device byte *ranges* and skip writes that miss: 0 of 16
+skips became 16 of 16. `ROCKET_CHAIN=debug` printed the offsets that said so.
+
+**Step 4 landed 2026-09-08 -- the compaction half.** A dispatch skips
+writing its dense output buffer when every reader of its result took the
+output cube in place. The proof that there is no other reader is a count,
+not a flag, and it comes from the compiler: `rocket-mark-dense-readers`
+(run by `rocket-compiler` at the flow phase, next to the placement pin)
+walks each Rocket convolution's result once dispatch regions are final and
+counts the Rocket dispatches that read it, through `flow.tensor.reshape`;
+any other reader -- a CPU dispatch, `util.return`, a tied operand -- makes
+the count 0. The count rides as one more push constant
+(`Conv2DDef.runtime_dense_readers`, the trailing constant of every
+convolution target, literal 0 in every shim). The driver tallies, per
+recorded dispatch, how many later dispatches on the same command buffer
+chained to its cube and whether anything read its dense bytes instead (a
+consumer that declined, a kind that records no cube, a copy), and
+`apply_ops` drops the compaction iff `chained == count > 0` and no dense
+read was seen (`compaction_elidable`). Every failure mode keeps the write:
+a reader on a *later* command buffer leaves the tally short, which is why a
+count survives IREE's partitioning where a boolean would not; an executable
+compiled without the constant says 0. A driver-only version was considered
+and rejected: a transient from `queue_alloca` is not proof of a single
+command buffer, because IREE also allocas a result consumed by a later
+execute region.
+
+`planck`, `taskset -c 4-7`, medians of 4 interleaved passes, same binary
+and same `.vmfb`, `ROCKET_LAZY_COMPACT=1` against `=0`:
+
+| model | kept / skipped per inference | off | on | |
+|---|---|---:|---:|---:|
+| ResNet50 fp16, 224x224 | 2 / 51 | 142 ms | **114 ms** | **1.25x** |
+| ResNet50 fp16, 512x512 | 2 / 51 | 858 ms | **626 ms** | **1.37x** |
+| VGG19 fp16 | 5 / 11 | 533 ms | 502 ms | 1.06x |
+| MobileNetV2 fp16 (f16 import) | 45 / 2 | 87 ms | 88 ms | noise |
+
+Output bit-identical on and off for all four, and identical to the same
+model compiled before this change. ResNet50-224's profile: `compact` 0.45
+ms x 2650 calls -> 0.26 ms x 118 over the run, `wait.npu` share 62 -> 74 %.
+The compiler's own census matches the driver's: 51 of ResNet50's 52
+convolutions are read only by Rocket dispatches (66 reader edges, the 16
+residual skips counted twice), VGG19 11 of 16 (the other five feed max
+pools, which are Rocket dispatches that cannot chain), MobileNetV2 2 of 46.
+The two kept on ResNet50 are the stem (read by the CPU max pool) and the
+last conv (read by the head).
+
+With step 2 and step 4 together, ResNet50-224 is 169 -> 114 ms, and what
+the driver still does on the host for it is ~10 % of wall (`outside` is the
+CPU stem/pool/head). ~~What is left of P2 is breadth, not depth: the
+elementwise, pooling and matmul kinds publish no cube, so nothing chains
+through them and nothing feeding them elides.~~ Step 5, below.
+
+**Step 5 landed 2026-09-08 -- breadth.** Matmul, pooling and element-wise
+dispatches now publish an output cube, take a producer's cube for their
+inputs, and carry the reader count (`runtime_dense_readers` on
+`MatmulDef`, `PoolingDef` and the three `Elementwise*Def`s; every shim
+passes it). `OutputCube` grew a `surface_pixel_count`: the PPU strides its
+surfaces by the pixel count rounded up to four, so a pool's cube matches a
+conv's only when the count is a multiple of four (VGG's 224/112/56/28
+images all are; a 7x7 is not), and `chain_identity_tests` pins the
+mismatch. Matmul's cube is width M, height 1, no row padding; the `[K,N]`
+operand is a coefficient stream and never chains.
+
+That was the smaller half. The larger one was that on every plain-conv,
+pool and matmul edge nothing could have chained anyway, because the shims
+widened their f16 result inside a `flow.dispatch.workgroups` that also
+folded in linalg's accumulator init -- opaque to fusion, so a CPU dispatch
+sat between the two Rocket dispatches on every such edge. Only the fused
+bias/ReLU shims (ResNet50's) used a plain generic, which is why ResNet50
+chained and MobileNetV2's f32 import did not. Two compiler changes fix it:
+every shim's widen is a plain `linalg.generic` (the placement pin, which
+postdates the workgroups form, keeps it off the NPU), and
+`rocket-fold-neutral-init`, run after inlining, drops the `+ init` /
+`max(.., init)` term when the init is a `linalg.fill` of the neutral element
+-- which arith itself never does, since `x + 0.0` is not `x` at `-0.0` --
+leaving a bare `extf` that the consumer's `truncf` cancels. And on an f32
+import the demote pass now narrows *through* a zero `tensor.pad`
+(`pad(truncf(x))`, not `truncf(pad(x))`), so `rocket-fold-conv-pad` and
+the pad-1 matchers see the same `pad -> conv` an f16 import gives them; the
+promote pass rebuilds the f32 pad for anything left unclaimed.
+
+Two chain fixtures joined the conv gate, both bit-exact and both chaining
+end to end with the middle compaction skipped: `fp16_conv_pool_conv_chain`
+(pool reads conv A's cube, conv B reads the pool's) and
+`fp16_matmul_chain`. On the models, `planck`, `taskset -c 4-7`, chain on
+vs `ROCKET_CHAIN=0`, medians:
+
+| model | NPU -> NPU edges chained | compactions skipped | chain off | on | |
+|---|---|---|---:|---:|---:|
+| VGG (f32 import, 16 conv + 5 pool), 10 s runs x3 | **20 of 20** (11 conv, 5 conv->pool, 4 pool->conv) | 20 of 21 | 676 ms | **617 ms** | **1.10x** |
+| VGG19 (f16 import, 16 conv; pools on CPU), 10 s x3 | 11 of 16 | 11 of 16 | 544 | **498** | 1.09x |
+| ResNet50 fp16 224x224 | 66 of 68 (unchanged) | 51 of 53 | 142 | 115 | 1.24x |
+| MobileNetV2 fp16 (f16 import) | 1 -> 6 of 47 | 2 | 87 | 88 | noise |
+
+All bit-identical chain on/off and against the earlier builds. The first
+row is the one this step is about: before it, the same model had 50 CPU
+dispatch sites (15 explicit pads, 16 widens, the rest shims' narrows) and
+5 chained edges; it now has 4 CPU sites, all of them the classifier, whose
+K = 25088 is past the matmul caps -- that is the `outside` 195 ms per
+inference in its profile and the whole reason the model is not faster.
+`pack.input` and `compact` are 0.0 and 0.1 ms per inference on it.
+
+Two things measured on the way that are not wins: a 3 s
+`--benchmark_min_time` on a 600 ms model is six iterations and the arms
+overlap by 15 % run to run -- the 10 s runs above are what settled both
+VGGs -- and the CNA padding the input itself was not faster than IREE's CPU
+pad plus a repack on this VGG (617 ms either way); it is the chaining the
+fold enables that pays, not the pad itself. Once during these measurements
+the board wedged (a benchmark left the NPU busy and the next process hung
+in `PREP_BO`, uninterruptible); it did not reproduce after a reboot in six
+further runs of both arms and is recorded rather than explained.
+
+What is left is coverage, not chaining: VGG19's torchvision export pools in
+f16 and the pooling matchers are f32-only, so its five pools stay on the
+CPU (and break the chain between blocks); ViT/Qwen3's matmul edges chain
+where the M/K/N caps admit both sides; and a matmul or pool whose consumer
+is the CPU (every classifier) keeps its dense write, as it must.
+
+---
+
+## P7 (S2) — CLOSED: the depthwise demote is on by default and the pads fold into the CNA, and MobileNetV2 is 10.0 ms against a four-worker `--no-offload` arm of 30.9 (f32 import) or 54.2 (fp16 export) — so the "whole fp16 offload loses to a fair CPU baseline" verdict this entry carried is overturned, 3.1x precision-matched, with the NPU arm itself down 7.3x from 73.1 (2026-11-25)
+
+**Superseded 2026-11-24: the depthwise demote is on by default, and
+MobileNetV2 fp16 ties `--no-offload` (30.8 ms each, base 35.3).** Everything
+below predates removing the quiescence dwell, which was the whole deficit;
+see the Resolved entry. What is left of P7 is host work around the 17 CPU pad
+copies (`pack.input`, `compact`), i.e. conv padding, not the demote.
+**And that is resolved too (2026-11-24): the pads fold into the CNA and
+MobileNetV2 fp16 is 13.5 ms, 2.3x faster than `--no-offload`.** See the
+Resolved entry "Depthwise padding folds into the CNA".
+
+> **The 30.8 ms `--no-offload` arm behind both figures in this note is the
+> f32 import**, not the fp16 export the survey builds for this model -- which
+> is 54.2 ms at the same allocation and clock. Both claims are sound; the
+> precision just was not labelled. The f32 arm is the fairer baseline, and
+> the last subsection of this entry has why, plus the one thing about it that
+> is still open.
+
+They are the whole of the `outside` term (70.9 ms of a 127 ms model; see
+the profile below): ten executables over 17 dispatch
+sites, `112x112x48` down to `7x7x1344`, all `linalg.depthwise_conv_2d_nhwc_hwc`
+at f32. They stay on the CPU for one reason —
+`RocketDemoteConvInputsPass` deliberately excludes depthwise, so an f32
+depthwise never becomes the f16/f16/f32 the matchers require and no depthwise
+matcher can ever fire.
+
+### The fp16 depthwise channel ceiling moved 512 -> 1536 (2026-09-09), and this verdict did not
+
+Separate from the demote gate above, and worth keeping apart from it. The
+*already-f16* MobileNetV2 import needs no demotion, so its depthwise
+convolutions reach the matchers directly -- and six of the seventeen were
+still on the CPU, because the fp16 depthwise admission ceiling was 512 while
+the model's own widest are C=576 and C=960. That 512 was where the depthwise
+matchers were first written and nothing had gone back to it: `ConvPlan`
+plans fp16 depthwise to `MAX_DEPTHWISE_CHANNELS` (1792), and the int8
+depthwise rung had already moved to 1344.
+
+Raised to 1536 in `rocket-core`'s `admission` table, backed end to end:
+`tools/e2e_conv_regression.py` gained `depthwise_fp16_c576`, `_c960`,
+`_c1536` and `_c1536_s2` (the last NCHW, the only layout the stride-2 fp16
+depthwise matcher exists in), each compiled to a Rocket and a CPU module from
+the same MLIR and compared on `planck`: max|error| 1.6e-4 to 2.4e-4, 0
+mismatches, at atol 1e-3.
+
+MobileNetV2 fp16 goes 47 -> 53 dispatch sites, all 17 depthwise convolutions
+now offloaded, max|diff| 0.0156 against its own `--no-offload` arm with top-1
+and top-5 unchanged. The wall time says the same thing this section already
+said, on `planck` at 600 MHz, `performance` governor, medians of three:
+
+| arm | sites | 4 A76 workers | all 8 cores |
+|---|---|---|---|
+| NPU, depthwise <= 512 | 47 | 58.9 ms | 77.5 ms |
+| NPU, depthwise <= 1536 | 53 | 63.5 ms | 77.3 ms |
+| `--no-offload` | 0 | **47.0 ms** | 81.4 ms |
+
+The six extra sites cost 4.6 ms at four workers and nothing at eight. A
+depthwise convolution here is still the cheapest op in the model and still
+does not pay for its own dispatch, which is what the rest of this section is
+about; the raise changes what is *admissible*, not that verdict. It is kept
+because admission is a statement about what has been measured, and because a
+model whose depthwise convolutions are not this cheap -- a wide MobileNetV3
+or EfficientNet stage -- can now reach the NPU at all. Nothing in that class
+has been measured here.
+
+### The recorded reason for that exclusion does not apply to this model
+
+The pass's scope comment, and `depthwise-f16-demote-breaks-model`, say
+demoting depthwise makes MobileNetV2 wrong: max|err| 3.5 on the logits, top-1
+incorrect on every input, with every isolation passing. That was measured on
+**static-int8** — a command buffer mixing fp16 depthwise with int8 dispatches,
+which is C8's territory, not a statement about depthwise.
+
+Measured on the plain fp16 model, 2026-09-04, against a CPU-only aarch64 f32
+build of the same MLIR:
+
+```text
+  37 sites (today)          max|err| 0.0192   top-1 and top-5 stable
+  44 sites (+7 depthwise)   max|err| 0.0500   top-1 and top-5 stable
+```
+
+against a top-2 logit gap of 0.257, and byte-identical across five consecutive
+single-shot runs with no hang. **Correctness is not the blocker for fp16.**
+
+### It is slower
+
+```text
+  147/149 ms   37 sites
+  185/188 ms   44 sites
+```
+
+Only 7 of the 17 match at all: the fp16 depthwise matchers cap at `Cin <= 512`
+and ten of these are 528, 816 or 1344 (the HAL itself is exact to 1536, see
+`depthwise-channel-ceiling-split`). Those seven cost 32.7 ms of driver time per
+inference, of which 9.6 ms is the NPU:
+
+```text
+  op                                     total   rec  pk.in   npu  cmpct
+  113x113x144->144 k3x3 s2 dw            10.13  2.46   3.19  2.85   1.22
+  114x114x48->48   k3x3 s1 dw             6.12  1.76   1.26  2.04   0.90
+  58x58x192->192   k3x3 s1 dw             6.10  1.37   1.11  1.71   1.72
+  30x30x288->288   k3x3 s1 dw (x2)        5.08  1.13   0.97  1.52   1.19
+  57x57x192->192   k3x3 s2 dw             3.70  0.86   1.11  1.03   0.51
+  29x29x288->288   k3x3 s2 dw             1.54  0.38   0.44  0.45   0.15
+```
+
+Two costs on top of that, both of which only exist because these are the ops
+being moved:
+
+- **`quiesce` 7.4 ms per inference**, 1.06 ms x 7. That is
+  `DEPTHWISE_TO_DENSE_QUIESCENCE`, the dwell after a depthwise completion and
+  before a dense submit. A model whose depthwise and dense convolutions
+  alternate pays it at every boundary.
+- **`outside` *rises* 88 -> 118 ms.** Offloading these does not remove CPU
+  work, it adds some: the matched depthwise needs explicit padding
+  (`112x112 -> 114x114`), which IREE forms as its own CPU dispatch. The
+  padding is why the shapes above read 113/114/58/30 rather than
+  112/56/28.
+
+So the arithmetic is: 9.6 ms of NPU work bought with 23 ms of driver host
+time, 7.4 ms of hardware dwell and 30 ms of extra CPU padding. The
+depthwise convolutions are the cheapest ops in the model per byte moved —
+one filter per channel, no Cout reduction — which is exactly the profile that
+loses to a per-dispatch layout round trip.
+
+### Re-measured 2026-09-07 with depthwise ReLU6 fused: the verdict holds, at a quarter of the cost
+
+This is item 0 below, done. The hypothesis was right in direction and too
+small to change the answer.
+
+|   | ms | vs 37 sites |
+|---|---:|---:|
+| 37 sites (dense ReLU6 fused) | 133.0 | — |
+| 44 sites, depthwise clamps on the CPU | 142.5 | 1.071x slower |
+| 44 sites, depthwise ReLU6 fused into BN | **140.0** | **1.053x slower** |
+
+Six interleaved passes each, `taskset -c 4-7`, governor `performance`,
+medians. Accuracy at 44 sites is max|diff| 0.0320 against a `--no-offload`
+CPU arm (0.0184 at 37 sites), top-1 and top-5 stable.
+
+**So the 26% is now 5.3%**, and two separate things did that. Most of it is
+M2's scratch pool, which removed the per-dispatch allocation the seven extra
+depthwise dispatches were each paying -- the 186-vs-148 above predates it.
+The rest, 2.5 ms of the 9.5 ms gap, is the depthwise clamps: the section
+below was right that offloading un-fuses them and that the recorded
+`outside` rise contains them, but they are a fifth of the gap, not the bulk
+of it.
+
+**What is in the tree.** All of the depthwise fusion machinery, and it is
+hardware-validated: `rocket-fuse-conv-relu6` handles
+`DepthwiseConv2DNchwChwOp` (the NCHW chain is
+`conv -> transpose -> expand_shape -> clamp`, and the bias broadcast retains
+dimension 1, so the canonical clamp is NCHW with a `(d1)` bias map),
+`#rocket_dynamic_depthwise_relu6_target` and its stride-2 twin exist with
+their shims and matchers, and `conv_fp16_bias_activation_hw` runs bias alone,
+bias + ReLU and bias + ReLU6 under the depthwise register program as well as
+the dense one -- all six exact. What was *not* in the tree then is the demote,
+which stayed off until 2026-11-24 (it is on by default now;
+`ROCKET_DEMOTE_DEPTHWISE=0` turns it off -- see Resolved).
+
+**What is left of the gap** is items 2-4 below, unchanged: the explicit pad
+IREE materializes as its own dispatch, the `DEPTHWISE_TO_DENSE_QUIESCENCE`
+dwell, and the `Cin` 512 matcher cap. Item 1, P2's chaining, is the one that
+would move it most and is also the one gated on this item -- see P2.
+
+### The 2026-09-07 profile, and why the earlier accounting understated the clamps
+
+Two things happened after the measurement above, and both move it.
+
+**The `outside` rise has a second cause the measurement never named.** It is
+attributed entirely to the explicit padding IREE materializes. But IREE
+currently fuses each depthwise convolution's ReLU6 **into the depthwise
+dispatch itself** — read the flow IR and one dispatch does depthwise + bias +
+clamp + `truncf` to f16 in a single pass. Offloading the depthwise breaks
+that fusion and hands back 17 more standalone CPU clamp dispatches. Those are
+inside the 88 -> 118 ms rise and were paid but not attributed. The mechanism
+to fuse them into the NPU instead now exists for dense convolutions
+(`rocket-fuse-conv-relu6`, `#rocket_dynamic_relu6_target`); extending it to
+depthwise is an increment on work that has landed, not new ground —
+though it does need a depthwise arm of `conv_fp16_bias_activation_hw` first,
+because that test covers the dense path only.
+
+**The denominator moved.** The 147/149 ms baseline is now 133 ms (the dense
+ReLU6 fusion), so the same absolute cost is a larger fraction, and P6's
+`record` term — which is 2.46 + 1.76 + 1.37 + ... of the per-op table above —
+has largely gone with the M2 scratch pool.
+
+### The current profile, 2026-09-07
+
+`ROCKET_PROFILE=1`, `taskset -c 4-7`, m2 driver, ~39 inferences, per
+inference. Both arms are the same binary and the same input; the fused arm is
+the ReLU6 build.
+
+| phase | 37 sites, unfused | 37 sites, ReLU6 fused |
+|---|---:|---:|
+| `outside` | 79.6 | **70.9** |
+| `wait.npu` | 25.9 | 25.4 |
+| `compact` | 17.7 | 17.7 |
+| `pack.input` | 6.6 | 6.7 |
+| `record` | 1.6 | 1.5 |
+| wall | 136.7 | 127.2 |
+
+The whole 9.4 ms is `outside` and every driver phase is flat, which is what
+removing a CPU dispatch should look like — and it is also the evidence that
+moving the bias onto the BS plane and turning BN on costs the hardware
+nothing (`wait.npu` -0.6 ms, noise).
+
+**What this profile says about where to spend.** `outside` is **54% of the
+model** and P7 is what it is made of: these 17 convolutions. `compact` plus
+`pack.input` is 24.4 ms, 19%, and that is P2 — but P2's cross-op chaining
+only pays between *adjacent* NPU dispatches, and this model alternates dense
+(NPU) with depthwise (CPU), so P2's reach is itself gated on this item. The
+knot is P7 -> P2 -> ROADMAP's conv padding row, and P7 is the end to pull.
+
+### Re-measured 2026-09-08 with the driver chain on: chaining reaches nothing here, and the verdict holds
+
+P2 step 2 landed (the consumer reads its NPU producer's output cube in
+place), and item 1 below said that was the lever that would move this most.
+Measured, it moves it by nothing, and the reason is structural rather than a
+tuning.
+
+Same two-line demote (`DemoteInputsToF16<linalg::DepthwiseConv2D{NhwcHwc,
+NchwChw}Op>` and the promote twins), same source model rebuilt for the run
+(`mnv2.fp16.mlir` is no longer on disk; the width-1.4 f32-constant form is
+the fp16 export widened with `widen_to_f32.py`, batch pinned, imported at
+opset 20 -- 37 sites, and 44 with the demote, exactly the 2026-09-07
+placement). `planck`, six interleaved passes, medians, governor
+`performance`, NPU IRQs on cpu6. All three arms are the same binary; the
+third is the 44-site build with `ROCKET_CHAIN=0`.
+
+|   | `taskset -c 4-7` | + `--task_topology_cpu_ids=4,5,6,7` |
+|---|---:|---:|
+| 37 sites | **130.5** ms | **108** ms |
+| 44 sites, chain on | 137.0 (1.050x slower) | 127.5 (**1.18x slower**) |
+| 44 sites, chain off | 136.5 | 126.5 |
+
+Correctness is unchanged: max|diff| 0.0078 against the `--no-offload` arm
+at 44 sites (0.0073 at 37), same top-5, and chain on/off are bit-identical.
+
+**Chaining took one edge in both arms -- the same one.** `ROCKET_CHAIN=debug`
+on the 44-site build: 1 taken (the 7x7x448 -> 1792 head), 32 declined for
+*no producer on this command buffer*, 8 declined because the consumer's
+pixel is not a whole number of 32-byte atoms (88-, 136- and 24-channel
+project outputs, which pack 176 -> 192, 272 -> 288 and 48 -> 64 bytes).
+Classifying every Rocket call's input operand in the post-match IR says what
+the 32 are:
+
+| Rocket conv inputs (44-site build) | fed by | chainable today |
+|---|---|---|
+| 10 expand 1x1 | `linalg.add` -- the residual add, on the CPU | no |
+| 10 project 1x1 | the CPU clamp after a still-unclaimed wide depthwise | no |
+| 7 depthwise 3x3 | `tensor.pad` -- the explicit pad, on the CPU | no |
+| 7 project 1x1 | the offloaded depthwise, directly | only if whole-atom |
+| 7 expand 1x1 | a project conv, directly (no residual) | only if whole-atom |
+
+So the reach was never "17 depthwise convolutions sitting between NPU pairs".
+Offloading the seven admissible ones opens at most 14 direct NPU -> NPU
+edges, 8 of which the whole-atom rule declines, and every other edge on the
+model is behind one of three CPU ops: the residual add (10 edges), the pad
+(7), and the clamps of the depthwise the `Cin` 512 cap leaves behind (10).
+On this model P2's reach is gated on those three, not on P7 alone; the
+2026-09-07 statement above that "P2's reach is itself gated on this item"
+was the right direction and too small a claim.
+
+**The hardware term is the binding one, and chaining cannot touch it.**
+Whole-run profile, 37 vs 44 sites at `taskset -c 4-7`: `outside` -1030 ms
+(the CPU depthwise and their clamps, gone), against `wait.npu` **+633**,
+`pack.input` +354, `compact` +265, `record` +47. The seven depthwise
+convolutions cost 60 % of the CPU time they replace *in NPU time alone*, at
+the 200 MHz M2 leaves the clock at; the layout round trip is the other 600.
+A perfect chain -- every pack and compact on those seven edges free -- would
+leave 44 sites at roughly 125 ms against 130, a 4 % win at best, and the
+four-worker column says the CPU side has more headroom than that
+(108 -> ~127 is the CPU depthwise getting four workers while the NPU path
+gains nothing).
+
+What this changes in the list below: item 1 is done and worth ~0 until the
+pad, the residual add and the whole-atom rule move; item 2 (the pad) is now
+also a P2 blocker and the first thing to build; and M2 is the only lever
+that touches the term that actually binds. The demote stays off.
+
+### Re-measured 2026-09-09 at 600 MHz: the clock is worth 8-10 points, and it is not the thing that decides this
+
+M2 is resolved (see **Resolved**), and it was the term this issue named as
+binding. Governor `performance`, four interleaved passes, medians,
+`mnv2_14.f32.mlir`, against a `--no-offload` arm from the same pipeline:
+
+| allocation | clk | base (37) | dw (44) | nooff | dw vs base |
+|---|---|---:|---:|---:|---|
+| default topology | 200 MHz | 99.4 | 99.8 | 108.0 | 1.004x slower |
+| default topology | 600 MHz | 87.5 | **81.0** | 108.0 | **1.080x faster** |
+| four workers | 200 MHz | 83.1 | 93.2 | **54.5** | 1.122x slower |
+| four workers | 600 MHz | 73.1 | 74.7 | **54.5** | 1.022x slower |
+
+The clock moves the depthwise arm 8-10 points relative to the baseline in
+*both* allocations, enough to flip the sign at the default one. That is what
+this issue predicted, and the prediction was the reason it ranked the clock
+first. `max|diff|` vs `--no-offload` is 0.0051 (dw) and 0.0050 (base), top-1
+stable at both clocks, zero faults in ~60 runs.
+
+> **Superseded 2026-11-25 — read the note at the end of this entry first.**
+> The paragraph below concluded that MobileNetV2 fp16's offload is underwater
+> at a fair allocation. It is not: the same comparison, precision-matched to
+> this one's f32 import, is now 10.0 ms offloaded against 30.9 ms
+> `--no-offload` -- 3.1x the other way. The table above is kept as the
+> 2026-09-09 record.
+
+**The verdict holds anyway, and the reason has moved.** At four workers
+`--no-offload` is **54.5 ms** against a best NPU arm of 73.1 — the CPU is
+**1.34x faster**, at either clock. The CPU baseline nearly doubles from four
+workers (108.0 → 54.5, 1.98x) while every NPU arm gains 8-14%. So this is no
+longer "depthwise loses to the layout round trip"; the whole fp16 offload on
+this model is underwater once the CPU is allocated fairly, and whether the
+depthwise demote is on is a detail inside a losing trade. The 81.0-vs-108.0
+row is the only arm here that beats its CPU baseline and it does so only at an
+allocation that starves the CPU of workers — `taskset` does not set IREE's
+worker count. This is M4's baseline trap and P8's "what moves it: CPU slots"
+arriving together.
+
+**Two corrections to the 2026-09-08 entry above.** Its edge census is stale:
+compaction now skips 67 dense output writes in the 37-site build against
+**464** in the 44-site one, because the residual-add-on-NPU and lazy-compaction
+work landed the same day it was taken. And **governor `ondemand` cannot
+measure this**: it read the four-worker control at 1.078x against the
+documented 1.18x and gave the default-topology control the wrong *sign*. Under
+`performance` both controls reproduce. See the method note.
+
+**Reproducing it is one compiler build.** Since 2026-11-24 the demote is **on
+by default**: `rocketDemoteDepthwiseEnabled()` in `RocketDemoteConvInputsPass`
+reads `ROCKET_DEMOTE_DEPTHWISE` and only `=0` turns it off; unset or any other
+value leaves it on. The `PromoteInputsToF32` twins are registered
+unconditionally because they only fire on ops carrying `kDemotedAttrName`.
+Verify by dispatch-site count rather than by trusting the variable (37 off and
+44 on when this entry was measured; 54 on and 37 off at main, per Resolved), and pass
+`--llvmcpu-target-triple aarch64-linux-gnu` or the vmfb is x86. Board script:
+`planck:~/p7ab.sh`.
+
+---
+
+### What would change the verdict, in order
+
+0. ~~**Re-measure the 44-site arm with depthwise ReLU6 fused**~~ — done
+   2026-09-07, see above. Worth 2.5 ms of the 9.5 ms gap; the verdict holds
+   at 1.053x rather than 1.26x.
+1. ~~**P2's cross-op chaining.**~~ Built (P2 step 2) and measured
+   2026-09-08 above: it takes the same single edge with or without the
+   depthwise offloaded, because every depthwise input sits behind the
+   explicit pad and 8 of the 14 direct edges fail the whole-atom rule. It
+   cannot reach the `wait.npu` term, which is the one that binds.
+2. **The pad.** Folding it into the dispatch (the driver already pads on the
+   input packing path) removes the added CPU dispatch and its buffer -- and,
+   since 2026-09-08, it is what stands between every offloaded depthwise and
+   its producer's cube, so it is a P2 blocker on this model too.
+3. **The quiesce dwell.** 7.4 ms is pure empirical caution; it is C8's
+   neighbour and should be re-derived rather than kept at a millisecond.
+   (Off by default since 2026-11-24; see Resolved.)
+4. **The `Cin <= 512` matcher cap**, last, because raising it only adds more
+   of a currently-losing trade until the three above land. The HAL is exact
+   to 1536.
+
+Reproducing either arm needs no source edit now: the default build demotes
+every depthwise (the 54-site arm at main), and `ROCKET_DEMOTE_DEPTHWISE=0`
+builds the arm that keeps them f32.
+
+---
+
+### Overturned 2026-11-25: the four-worker verdict has inverted, and the NPU arm fell 7.3x
+
+The paragraph above -- "the whole fp16 offload on this model is underwater
+once the CPU is allocated fairly" -- was the number this file's **Suggested
+order** told readers to rank work against. It is no longer true, on either
+CPU baseline. `orangepi`, governor `performance`, NPU 600 MHz, cpu 4-7,
+medians of 5 warm repetitions:
+
+| arm | 2026-09-09 | now | source |
+|---|---:|---:|---|
+| NPU, best arm | 73.1 ms | **10.0 ms** (9.90-10.2) | measured 2026-11-25 |
+| `--no-offload`, f32 import | 54.5 ms | **30.9 ms** | #81, 2026-11-24 |
+| `--no-offload`, fp16 export | — | **54.2 ms** (54.1-54.2) | measured 2026-11-25 |
+| verdict | CPU 1.34x faster | **NPU 3.1x faster** | precision-matched |
+
+**The NPU arm fell 7.3x, from 73.1 to 10.0, and that is the whole of the
+change.** The verdict flips on either baseline: 3.1x against the f32 CPU arm
+and 5.4x against the fp16 one.
+
+**3.1x is the figure to quote.** The 2026-09-09 claim was f32 on both sides,
+so the precision-matched successor is the f32 CPU arm, and the f32 arm is
+1.76x faster than the fp16 one because IREE's CPU codegen is good at f32 on
+an A76 and poor at fp16. The subsection below has the evidence and what is
+still open about it; **the first version of this note got that wrong**, taking
+54.5 and 54.2 for the same measurement and calling the CPU arm unmoved. It
+is not unmoved -- those are two different baselines, and the f32 one halved.
+
+What moved it is not one thing, which is why no single entry claimed it: the
+depthwise pad fold (item 2 of the list just above, now done), the fp16
+epilogue fusion and residual-add-on-NPU of P2, lazy compaction, and P3's
+sized constant sync. Each was recorded against its own baseline and none
+went back to this row.
+
+**Two caveats, stated because they are the reason to re-run rather than
+trust this table.** The 2026-09-09 arm is `mnv2_14.f32.mlir`, an f32 import
+with per-op demotion at 37 or 44 NPU sites; the 2026-11-25 arm is
+`mobilenet_v2.fp16.npu.vmfb` from `tools/model_survey.py`, an fp16 export at
+54 NPU sites and 5 CPU ones. Those are different pipelines, and the matching
+`--no-offload` arms are the evidence that they are nonetheless the same
+comparison. And a single model is a single model -- but the 2026-11-24
+ten-model survey has every one of them beating its own `--no-offload` arm by
+2.6x to 35x, so this is not a MobileNetV2 artefact.
+
+**What this does to P7 itself.** Nothing directly: the depthwise demote
+question is still decided by the rows above it, and the demote is on by
+default since 2026-11-24. What changes is the frame -- "a detail inside a
+losing trade" was the reason this entry gave for not caring which way the
+demote went, and the trade is not losing any more. The three remaining items
+in the list above are worth re-pricing against a 10.0 ms model rather than a
+73.1 ms one, where a 7.4 ms dwell or a CPU pad is a far larger share.
+
+### The 30.8 ms baseline is the f32 import, and it is the fairer one
+
+The first pass at this reconciliation flagged the 30.8 ms `--no-offload` arm
+behind "ties `--no-offload`" and "2.3x faster" as unattributable, because no
+core allocation reproduces it. Measured 2026-11-25 on
+`mobilenet_v2.fp16.cpu.vmfb`, medians of 5 warm repetitions:
+
+| `--task_topology_cpu_ids` | ms |
+|---|---:|
+| `4,5,6,7` | 54.4 |
+| `0,...,7` | 57.8 |
+| omitted (default topology) | 181 |
+
+So allocation is not it, and the default topology is 3.3x *slower* rather
+than faster. **The answer is in #81's own commit body**, which says it in one
+line: *"The survey mnv2 is an f32 import"*. The 30.8/30.9 ms arm is
+`--no-offload` on the **f32** import; the 54.2 ms arm is `--no-offload` on
+the **fp16** export, which is what `tools/model_survey.py` builds for this
+model. Both are real, neither is wrong, and nothing labelled which.
+
+**The fp16 CPU arm is 1.76x slower than the f32 one, so a precision-matched
+comparison is the honest one.** IREE's CPU codegen is good at f32 on an A76
+and poor at fp16, so quoting an fp16 NPU arm against an fp16 CPU arm flatters
+the offload by that factor. Both multiples, same conditions (cpu 4-7,
+600 MHz):
+
+| baseline | `--no-offload` | NPU | ratio |
+|---|---:|---:|---|
+| f32 import (#81, 2026-11-24) | 30.9 ms | 10.0 ms | **3.1x faster** |
+| fp16 export (survey, 2026-11-25) | 54.2 ms | 10.0 ms | 5.4x faster |
+
+**3.1x is the number to quote**, because it is precision-matched and because
+the 2026-09-09 claim it overturns was f32 on both sides. The verdict does not
+depend on the choice -- the old claim was that the CPU is 1.34x *faster*, and
+on either baseline the NPU now wins -- but the magnitude does, and 5.4x
+overstates it.
+
+**Still open: the f32 arm reads 54.5 in September and 30.9 in November.** The
+2026-09-09 four-worker row is `mnv2_14.f32.mlir` at 54.5; #81's f32 arm is
+30.9 at the same allocation and clock. That is another 1.76x, and it is
+either a different model file or eleven weeks of CPU-side change in IREE and
+the spec. Settling it needs an f32 `--no-offload` build from current `main`
+measured beside the fp16 one, which this pass could not do: no host
+`libIREECompiler.so` newer than the pad fold exists in this checkout. Until
+then the September row and the November row should not be subtracted from
+each other.
+
+---
+
 ## C15 (S3) — RESOLVED as *implemented and off by default*: attention offloads correctly and is slower on every arm measured (ViT-B f32 1.16x, BERT-384 1.41x, ViT-B fp16 1.30x on the strided packer); the CPU was barely spending anything on it, and re-measuring on a 4.1x faster coefficient packer moved that by 36 ms of 97 and did not change the sign
 
 **[verified]** `rocket-compiler audit` on ViT-B/16 (f32 import) reports 74
@@ -2191,111 +2327,7 @@ only got cleaner. The conclusion stands as written: attention offload needs
 a better *shape* -- a batched descriptor, or fusing the pair so the
 intermediate never lands -- not a cheaper tax.
 
-## P10 (S3) — IREE compiles the CPU softmax with a 4-wide vector tile; a 16-wide tile is bit-identical and 1.39x faster, and nothing in this stack can set it
-
-Found 2026-11-24 profiling BLIP fp16 at `main` `74787f0` on `orangepi`
-(governor `performance`, NPU 600 MHz, `--task_topology_cpu_ids=4,5,6,7`).
-BLIP runs 825 ms against 5305 ms `--no-offload`, and its CPU half is now the
-larger half: **[verified]** `ROCKET_PROFILE` puts `outside` (CPU dispatches) at
-~512 ms per inference against `wait.npu` 283, `record` 46, `pack.input` 26,
-`compact` 27.
-
-**Where the CPU time is.** **[verified]** `perf record -e cycles:u
---user-callchains` on a system-linked build (the recipe in the `rocket-compiler
-compile --iree-flag` help), A76 counter only:
-
-| CPU dispatch group | share of A76 cycles |
-|---|---|
-| vision self-attention, 577 tokens | ~70% |
-| ↳ `softmax_12x577x577xf32` | **24.0%** |
-| ↳ `batch_matmul_12x577x577x64` (QKᵀ) | 19.5% |
-| ↳ `batch_matmul_12x577x64x577` (AV) | 18.7% |
-| ↳ head split / broadcast reshapes | ~8% |
-| vision GELU (the f32 `erf` alone 7.5%) | 13.5% |
-| LM head `16x30524x768` (refused, `N` > 4096) | 3.2% |
-| cross-attention | ~2.7% |
-| every LayerNorm (252 of the 621 CPU sites) | ~2.6% |
-| the whole 16-token text side | ~0.3% |
-
-Site counts mislead here: LayerNorm is 40% of the CPU *sites* and 3% of the
-CPU *time*.
-
-**Why the softmax is slow.** **[verified]** The dispatch reads f16 scores,
-scales by 1/8, runs `linalg.softmax` in f32 along the 577-wide row, and
-truncates to f16. IREE (`a869dc3`, unpatched) configures the decomposition
-with `vector_inner_parallel = [0, 0, 4]` and `vector_reduction = [0, 0, 4]`
-(8 for the sum): one 4-wide f32 vector per loop iteration. The `exp` is a
-vectorized `fmla` polynomial, not a libm call, but one vector per iteration
-makes every iteration one long dependent chain. `perf annotate` on the
-standalone kernel shows IPC below 1, about 44 cycles per 4 elements. Three
-further costs, read off the assembly:
-
-- `exp` is computed **twice**, once in the sum pass and again in the
-  normalize pass (45% and 48% of the kernel's cycles; the max pass is 6%).
-- The normalize pass divides with a vector `fdiv` per element instead of
-  multiplying by a reciprocal.
-- With FP reassociation off (IREE's global default is `O0`), the sum is 8
-  dependent scalar `fadd`s per iteration.
-
-**Standalone kernel, `12x577x577`.** **[verified]** Median ms, 4×A76 / 1×A76.
-The lowering config was edited between `--compile-to=executable-configurations`
-and `--compile-from=executable-configurations`. Every variant has the same
-4.1e-05 error against an f64 reference.
-
-| variant | 4×A76 | 1×A76 | output vs default |
-|---|---|---|---|
-| IREE default (tile 4) | 9.96 | 38.2 | — |
-| tile 8 | 8.98 | 34.9 | bit-identical |
-| **tile 16** | **7.23** | **27.5** | **bit-identical** |
-| tile 32 | 6.93 | 26.3 | bit-identical |
-| tile 32 + reassociated sum | 6.31 | 23.6 | 1.5e-05 (one f16 ulp) |
-
-**Flags that do not fix it.** **[verified]**
-`--iree-llvmcpu-use-decompose-softmax-fuse=false` produces a byte-identical
-binary (codegen's tile-and-fuse recomputes the `exp` anyway).
-`--iree-llvmcpu-target-cpu=cortex-a76` changes nothing.
-`--iree-llvmcpu-reassociate-fp-reductions=true` (the same binary as
-`--iree-opt-level=O2` for this dispatch) is 7% on the kernel and **826 -> 817
-ms on BLIP end to end** (the `--no-offload` arm 4990 -> 5006), so not worth
-taking alone.
-
-**The attention matmuls do not share the problem.** **[verified]** QKᵀ and AV
-(f16 in, f32 accumulate) under IREE's default (`DoubleTilingExpert`, 8×8
-register tile, K step 4) run 8.16 / 8.24 ms at 4×A76 and 31.1 / 29.7 ms on
-one core: ~16.4 GFLOP/s, about 43% of the A76's f32 NEON peak, scaling 3.8x.
-That default beat every alternative tried. Data tiling is +32%, and data
-tiling with microkernels is +35% (QK) / +88% (AV): this A76 has `asimdhp` and
-`asimddp` but **not `fhm`**, so there is no f16→f32 widening-FMA microkernel
-to win with. Tiles 4×16, 16×4, 8×8 k1/k8 and 6×16 were all slower, and 8×12
-was 5x slower (register spill). The fused `iree_linalg_ext.attention` op is
-correct (4.8e-4 vs f64) but **1902 ms** at 4×A76 against ~26 ms for QKᵀ +
-softmax + AV unfused, and nothing in this IREE raises the three ops into it
-anyway. So the softmax tile is the only CPU code-generation lever found in
-BLIP's attention. Offloading attention is C15's question, and it lost there.
-
-**What a fix is worth.** Tile 16 saves ~2.7 ms per call × 12 vision layers ≈
-**33 ms per BLIP inference (~4%)**. The same dispatch shape appears in every
-transformer in the survey (ViT-B/16, ViT-L/16, BERT at 128 and 384), whose
-softmax shares have not been measured.
-
-**Ways to land it, none built:**
-
-1. A compiler hook that pins the softmax dispatch's lowering config: IREE's
-   tuning-spec mechanism (`--iree-codegen-tuning-spec-path`) or a
-   `compilation_info` attribute attached before configuration. Nothing in
-   `rocket-compiler` or the plugin sets CPU lowering configs today, so this
-   would be the first. Wherever it lands, it must apply to both arms: the
-   `--no-offload` baseline must get the same CPU softmax, or the survey ratio
-   stops being like-for-like.
-2. Upstream: change IREE's CPU heuristic so the softmax decomposition's
-   parallel vector size is not the native vector width. That benefits every
-   CPU target, at the cost of carrying the change until a rebase.
-
-**To reproduce:** the standalone MLIR is one `linalg.softmax` between an
-`extf`/`mulf` generic and a `truncf` generic, which is exactly the source
-`--iree-hal-dump-executable-sources-to` shows for BLIP's
-`main_graph$async_dispatch_27`. Benchmark it with `iree-benchmark-module
---device=local-task --task_topology_cpu_ids=4,5,6,7`.
+---
 
 ## Resolved
 
@@ -2505,8 +2537,9 @@ transition cases.
 **ConvNeXt's 7x7 depthwise convolutions on the NPU — 2026-11-24.
 ConvNeXt-T fp16 113 -> 103 ms.** The four-model survey left ConvNeXt's 18
 depthwise convolutions (all 7x7, stride 1) on the CPU in f32. Two things
-held them there: the depthwise demotion is an experiment gate
-(`ROCKET_DEMOTE_DEPTHWISE`), off because MobileNetV2's small 3x3 depthwise
+held them there: the depthwise demotion was then an experiment gate
+(`ROCKET_DEMOTE_DEPTHWISE`; on by default since later that day, see the entry
+above), off because MobileNetV2's small 3x3 depthwise
 convolutions lose on the NPU; and depthwise admission stopped at 3x3, with
 the planner applying the *dense* 7x7 `Cin` ceiling (208) to depthwise too.
 
@@ -3704,9 +3737,10 @@ is 1.17x slower at eight cores and no matcher cut point rescues it.
    The clock was worth the 8-10 points it was predicted to be worth, and flips
    the sign at the default allocation (1.080x faster at 600 MHz). It does not
    change the verdict, because the verdict is now set by item 2 rather than by
-   anything about depthwise. `ROCKET_DEMOTE_DEPTHWISE=1` keeps the arm one
-   compiler build away. Revisit when the offload is competitive at four
-   workers.
+   anything about depthwise. **Since 2026-11-24 the demote is on by default**
+   (`ROCKET_DEMOTE_DEPTHWISE=0` builds the old arm) and MobileNetV2 is 10.0 ms
+   against a precision-matched four-worker `--no-offload` of 30.9, so there
+   is nothing left to revisit here.
 5. **P4 → P1** — the rest of the dispatch-path stack, in increasing
    order of work.
 6. **C11** — VGG int8 aborts under a repeated benchmark loop. C16, its

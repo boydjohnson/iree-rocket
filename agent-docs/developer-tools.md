@@ -597,8 +597,8 @@ hypothesis about either than a model run:
 CARGO_TARGET_AARCH64_UNKNOWN_LINUX_GNU_LINKER=aarch64-linux-gnu-gcc \
   cargo build -p iree-rocket-hal --release \
   --target aarch64-unknown-linux-gnu --example layout_bench
-scp target/aarch64-unknown-linux-gnu/release/examples/layout_bench planck:/tmp/
-ssh planck '/tmp/layout_bench 20 cold'
+scp target/aarch64-unknown-linux-gnu/release/examples/layout_bench orangepi:/tmp/
+ssh orangepi '/tmp/layout_bench 20 cold'
 ```
 
 ## Board convolution regression gate
@@ -707,8 +707,8 @@ board -- and writes a machine-readable `result.json` next to the artifacts.
 reproducible rather than remembered.
 
 ```sh
-tools/model_survey.py run --model wide_resnet50_2 --board planck
-tools/model_survey.py run --model vit_l_16 --board planck --repetitions 7
+tools/model_survey.py run --model wide_resnet50_2 --board orangepi
+tools/model_survey.py run --model vit_l_16 --board orangepi --repetitions 7
 tools/model_survey.py summarize
 ```
 
@@ -767,8 +767,8 @@ cases, each a `func.func` whose Rocket dispatches run in the order listed, and
 runs each case in its own process on the board with a quiet gap and a canary.
 
 ```sh
-python3 tools/c8_precision_transition_probe.py --board planck
-python3 tools/c8_precision_transition_probe.py --board planck --repeat 3 \
+python3 tools/c8_precision_transition_probe.py --board orangepi
+python3 tools/c8_precision_transition_probe.py --board orangepi --repeat 3 \
     --only int8_then_k1 --only int8_then_k3
 ```
 

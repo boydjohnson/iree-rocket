@@ -1,7 +1,14 @@
 # Multicore: choosing the NPU core count at runtime
 
-Design note, 2026-09-06. Status: proposal, nothing implemented. Resolves
-ISSUES.md P1 ("one fd is one scheduler entity is one core").
+Design note, 2026-09-06; built 2026-09-07. Status: **M0, M1 and M2 are
+implemented** (§10-§12: the worker pool in `src/pool.rs`, per-context scratch
+in `src/scratch_pool.rs`, tile fan-out in `src/command_buffer.rs`). The
+default is still one context, `ROCKET_NPU_CORES=1`; set `3` for a ViT-shaped
+model, where fan-out measured 1.22x/1.34x at four/eight CPU cores (§12).
+`ROCKET_FANOUT=0` turns fan-out off at N>1. Only M3, kernel-side placement
+(§7), is open. Resolves ISSUES.md P1 ("one fd is one scheduler entity is one
+core"). Sections 2-9 are the original proposal and its measurements, kept
+as the design record.
 
 ## 1. What the driver did before M0 (historical)
 

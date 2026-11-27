@@ -362,13 +362,15 @@ Two smaller consequences of moving the decision to runtime:
 - **`spec::neutralize`** adds `no_offload` to every
   `transform.rocket.match.admitted` and rewrites every remaining
   `dim_bounds` interval to
-  `umin = umax = 999999` to build the CPU baseline. If DS1 is solved by
-  re-spelling the matchers away from `dim_bounds` (option 2), that mechanism
-  stops working and `--no-offload` silently starts offloading -- the precise
-  failure ISSUES.md M4 exists to prevent. `neutralize` already refuses a
-  matcher with no `dim_bounds`, so it would fail loudly rather than lie
-  [verified] -- but it would fail, and the neutralization has to be ported to
-  whatever the new spelling is. Option 1 leaves it untouched. Since
+  `umin = umax = 999999` to build the CPU baseline. The port this bullet
+  used to warn about has already happened: when the conv and matmul
+  matchers moved off `dim_bounds` onto `match.admitted` (DS1's option 2,
+  2026-09-09), `neutralize` learned to add `no_offload` to that predicate
+  (`rocket-compiler/src/spec.rs`), and it still refuses a matcher that
+  carries neither predicate, so a new spelling fails loudly rather than
+  lies [verified]. What remains is the same rule for whatever comes next:
+  any new admission spelling needs its `no_offload` twin in `neutralize`
+  before it lands. Since
   2026-09-09 there is a second, mechanism-independent guard:
   `rocket-compiler compile --no-offload` checks the placed module for Rocket
   executables and refuses to write one that has any, so a port that misses a
@@ -413,16 +415,23 @@ Two smaller consequences of moving the decision to runtime:
    refusal: re-measured exact at every extent under the current planner's
    grant, and the original observation was a watchdog-killed job (ISSUES.md
    C12). Nothing on this list is S1 any more.
-2. **DS1**, preferring the `tie_shape` external model (option 1) over
-   re-spelling the matchers, because it leaves `spec::neutralize` and the
-   `--no-offload` baseline intact (DS5). Acceptance is a lit test that a
-   `?`-shaped conv matches, plus an end-to-end run on the board.
+2. **DS1: give the admission query a channel bound.** Option 2 already
+   landed (2026-09-09; conv and matmul admission is
+   `transform.rocket.match.admitted`, and `neutralize` was ported with it),
+   so the conv path no longer needs the `tie_shape` external model. What is
+   left is a bound for `match.admitted` to check in place of a static
+   channel count -- an assumed range from the frontend, or an explicit
+   compile-time channel bound. Acceptance is a lit test that a
+   `?`-channel conv matches, plus an end-to-end run on the board. Option 1
+   (`tie_shape` bounds) is now only for the pooling and element-wise
+   matchers, which still use `dim_bounds`.
 3. **DS3's policy decision**, which falls out of (2): make the assumed `umax`
    reproduce the matcher envelope so the compile-time decision stays
    compile-time.
 4. ~~**DS4**, restating the verify pass on attributes rather than extents.~~
    -- done 2026-09-09; see the section.
-5. **DS5**, whichever half (1) turned out to need.
+5. **DS5**: the audit wording. The `neutralize` half was done with
+   option 2 (see DS5).
 6. **DS2 last, separately.** It is a wire-format change and a `conv::Shape`
    change, and `N == 1` covers every model this repo currently measures.
 
