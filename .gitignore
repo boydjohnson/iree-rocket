@@ -1,5 +1,6 @@
 # Cargo (workspace-wide; Cargo.lock is committed for reproducible cross-builds)
 /target/
+/rocket-runtime/rust/target/
 
 # rocket-schema build artifacts (generated/rust is checked in; generated/c and build/ are not)
 /rocket-schema/build/
