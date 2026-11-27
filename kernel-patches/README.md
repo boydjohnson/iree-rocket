@@ -152,6 +152,16 @@ load at all. A reboot is the reliable reload.
 | sha256 | `5d07d3cfa2a0c8159dccbfcb795c17311363321fcbe1fba42cd4ba56b71afb6e` |
 | Loaded with | `rocket_npu_clk_hz` = `600000000` |
 
+Rebuilt from these files on 2026-11-27 (the stock 7.3.6 driver plus the
+three patches, `git apply -p4`, then the `make` line above), the module
+compiles cleanly. It matches the installed one in every section except the
+debug info and `.note.gnu.build-id`. Those two differ only because the build
+directory's path is baked into the debug info, and the build-id is a hash
+over all of it. **So a rebuild's sha256 never matches the installed
+module's, even when the code is the same.** Compare code, not files:
+`readelf -sW` FUNC sizes (48 here), or every non-`.debug*` section with
+`objcopy -O binary --only-section=<s>`.
+
 ## When Armbian bumps the kernel
 
 Each new Armbian kernel package installs a fresh `/lib/modules/<version>/`
@@ -193,9 +203,11 @@ apply to both.
 4. **Apply the three patches** with the loop above. If a patch stops applying,
    rebase it, add a bracketed note recording the new kernel, and rename the
    file's suffix to match.
-5. **Build, install to `updates/`, `depmod -a`, reboot** -- as above, never
+5. **Build the patched module.** When checking it against an earlier build,
+   compare sections or FUNC sizes, not sha256 (see above).
+6. **Install to `updates/`, `depmod -a`, reboot** -- as above, never
    `modprobe -r`.
-6. **Check it took**, below, then run a pooling model end to end on the NPU.
+7. **Check it took**, below, then run a pooling model end to end on the NPU.
 
 ## Checking the module
 
