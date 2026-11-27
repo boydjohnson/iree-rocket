@@ -1,0 +1,43 @@
+Source: rocket-compiler
+Section: devel
+Priority: optional
+Maintainer: Boyd Johnson <boyd@boundarybit.io>
+Build-Depends:
+ debhelper-compat (= 13),
+ cargo (>= 1.85),
+ rustc (>= 1.85),
+ libclang-dev,
+ liblzma-dev,
+ cmake (>= 3.21),
+ ninja-build,
+ g++,
+ python3,
+ patchelf,
+ help2man,
+Standards-Version: 4.7.0
+Homepage: https://github.com/boydjohnson/iree-rocket
+Vcs-Browser: https://github.com/boydjohnson/iree-rocket
+Vcs-Git: https://github.com/boydjohnson/iree-rocket.git
+Rules-Requires-Root: no
+
+Package: rocket-compiler
+Architecture: amd64 arm64
+Multi-Arch: foreign
+Depends:
+ ${shlibs:Depends},
+ ${misc:Depends},
+Description: IREE model compiler with the Rockchip RK3588 NPU (Rocket) target
+ rocket-compiler compiles ONNX-imported MLIR models into IREE .vmfb modules
+ that run convolutions, matmuls, pooling and elementwise work on the RK3588
+ NPU through the mainline "rocket" accel driver, and everything else on the
+ CPU. It also explains, per operation, why each candidate did or did not
+ offload (the "audit" subcommand).
+ .
+ The package carries its own build of IREE's libIREECompiler.so with the
+ Rocket target plugin compiled in, plus the iree-lld linker it needs, in a
+ private directory. Neither is meant to be used by anything else, and
+ neither conflicts with an upstream IREE installation.
+ .
+ Compiling does not need the NPU, so the package is useful on a desktop
+ that cross-compiles models for the board. Running the modules needs the
+ IREE runtime with the Rocket HAL driver, which is not part of this package.

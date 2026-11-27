@@ -1,0 +1,9 @@
+/.debhelper/
+/cargo-home/
+/cargo-target/
+/debhelper-build-stamp
+/files
+/rocket-compiler/
+/rocket-compiler.1
+/*.substvars
+/*.debhelper.log
