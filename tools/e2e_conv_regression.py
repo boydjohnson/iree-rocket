@@ -1911,8 +1911,8 @@ def compile_modules(
 
     # Three stages, not one, because `rocket-pin-unclaimed-dispatches` has to
     # run between the flow and stream phases and no plugin hook exists that
-    # late -- exactly what `rocket-compiler` does for a model (see README,
-    # "Placement pinning"). A single `iree-compile` skips it, and since the
+    # late -- exactly what `rocket-compiler` does for a model (see
+    # agent-docs/developer-tools.md, "Placement pinning"). A single `iree-compile` skips it, and since the
     # transform spec's int8 epilogue became a fusible `linalg.generic` that is
     # no longer safe even for one convolution: the epilogue dispatch's only
     # producer is the Rocket dispatch, so Stream's affinity analysis places it
