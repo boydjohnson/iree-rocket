@@ -121,6 +121,7 @@ set(_ROCKET_DEPS
   iree::compiler::Dialect::Flow::IR
   iree::compiler::Dialect::HAL::IR
   iree::compiler::Dialect::HAL::Target
+  iree::compiler::Dialect::LinalgExt::IR
   iree::compiler::Dialect::Stream::IR
   iree::compiler::PluginAPI
   iree::compiler::Utils

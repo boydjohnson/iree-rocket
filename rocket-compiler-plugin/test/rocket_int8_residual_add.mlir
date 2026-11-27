@@ -117,3 +117,35 @@ util.func public @residual_add_no_relu_declines(%a: tensor<1x64x8x8xi8>, %b: ten
   } -> tensor<1x64x8x8xi8>
   util.return %q : tensor<1x64x8x8xi8>
 }
+
+// The same tail as IREE 3.14's importer spells it: DequantizeLinear and
+// QuantizeLinear as `iree_linalg_ext.{de,}quantize_affine` (an `i64` zero
+// point for `a`, none -- symmetric -- for `b` and the output) and the add as
+// `linalg.elementwise <add>`. Before the pass accepted this form, every int8
+// residual add in a real model silently stayed on the CPU.
+// CHECK-LABEL: util.func public @residual_add_relu_affine_qdq
+// CHECK: flow.dispatch @rocket_elementwise_add_int8_relu_executable::
+// CHECK-SAME: %c35_i32
+// CHECK-SAME: %c-128_i32
+// CHECK-NOT: iree_linalg_ext.quantize_affine
+// CHECK: util.return
+util.func public @residual_add_relu_affine_qdq(%a: tensor<1x64x8x8xi8>, %b: tensor<1x64x8x8xi8>) -> tensor<1x64x8x8xi8> {
+  %a_scale = arith.constant 3.500000e-02 : f32
+  %b_scale = arith.constant 4.200000e-02 : f32
+  %out_scale = arith.constant 7.000000e-02 : f32
+  %a_zp = arith.constant 163 : i64
+  %zero = arith.constant 0.000000e+00 : f32
+  %f_empty = tensor.empty() : tensor<1x64x8x8xf32>
+  %fa = iree_linalg_ext.dequantize_affine <indexing_maps = [#map, affine_map<(d0, d1, d2, d3) -> ()>, affine_map<(d0, d1, d2, d3) -> ()>, #map], quant_min = 0, quant_max = 255, input_unsigned> ins(%a, %a_scale, %a_zp : tensor<1x64x8x8xi8>, f32, i64) outs(%f_empty : tensor<1x64x8x8xf32>) -> tensor<1x64x8x8xf32>
+  %fb = iree_linalg_ext.dequantize_affine <indexing_maps = [#map, affine_map<(d0, d1, d2, d3) -> ()>, #map], quant_min = 0, quant_max = 255, input_unsigned> ins(%b, %b_scale : tensor<1x64x8x8xi8>, f32) outs(%f_empty : tensor<1x64x8x8xf32>) -> tensor<1x64x8x8xf32>
+  %sum = linalg.elementwise <add> ins(%fa, %fb : tensor<1x64x8x8xf32>, tensor<1x64x8x8xf32>) outs(%f_empty : tensor<1x64x8x8xf32>) -> tensor<1x64x8x8xf32>
+  %relu = linalg.generic {indexing_maps = [#map, #map], iterator_types = ["parallel", "parallel", "parallel", "parallel"]} ins(%sum : tensor<1x64x8x8xf32>) outs(%f_empty : tensor<1x64x8x8xf32>) {
+  ^bb0(%in: f32, %out: f32):
+    %p = arith.cmpf ugt, %in, %zero : f32
+    %r = arith.select %p, %in, %zero : f32
+    linalg.yield %r : f32
+  } -> tensor<1x64x8x8xf32>
+  %q_empty = tensor.empty() : tensor<1x64x8x8xi8>
+  %q = iree_linalg_ext.quantize_affine <indexing_maps = [#map, affine_map<(d0, d1, d2, d3) -> ()>, #map], quant_min = 0, quant_max = 255, storage_unsigned> ins(%relu, %out_scale : tensor<1x64x8x8xf32>, f32) outs(%q_empty : tensor<1x64x8x8xi8>) -> tensor<1x64x8x8xi8>
+  util.return %q : tensor<1x64x8x8xi8>
+}

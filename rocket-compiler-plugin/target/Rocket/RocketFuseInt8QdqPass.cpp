@@ -47,7 +47,15 @@
 //
 // The trailing ReLU is required: a residual Add with no activation (a
 // MobileNetV2 linear bottleneck's) has no target yet.
+//
+// Since IREE 3.14 the importer no longer spells DequantizeLinear and
+// QuantizeLinear as the `linalg.generic`s drawn above: they arrive as
+// `iree_linalg_ext.dequantize_affine` and `iree_linalg_ext.quantize_affine`.
+// Both forms are accepted (`matchDequant`, `matchQuant`). The affine ops
+// state the same arithmetic -- round half to even, clamp to
+// `[quant_min, quant_max]` -- so the rewrite is unchanged.
 
+#include "iree/compiler/Dialect/LinalgExt/IR/LinalgExtOps.h"
 #include "mlir/Dialect/Arith/IR/Arith.h"
 #include "mlir/Dialect/Linalg/IR/Linalg.h"
 #include "mlir/Dialect/Math/IR/Math.h"
@@ -135,7 +143,73 @@ struct Dequant {
   int64_t zeroPoint = 0;
 };
 
+/// A scalar float constant, or a splat of one.
+static std::optional<double> constantFloat(Value value) {
+  APFloat result(0.0f);
+  if (!value || !matchPattern(value, m_ConstantFloat(&result))) {
+    return std::nullopt;
+  }
+  return result.convertToDouble();
+}
+
+/// A `ui8` zero point given as an affine quantization op's operand: absent
+/// means 0, and `zp_unsigned` says how to read a narrow integer.
+static std::optional<int64_t> affineZeroPoint(Value zeroPoint,
+                                              bool zpUnsigned) {
+  if (!zeroPoint) {
+    return 0;
+  }
+  APInt result;
+  if (!matchPattern(zeroPoint, m_ConstantInt(&result))) {
+    return std::nullopt;
+  }
+  int64_t value = zpUnsigned ? static_cast<int64_t>(result.getZExtValue())
+                             : result.getSExtValue();
+  if (value < 0 || value > 255) {
+    return std::nullopt;
+  }
+  return value;
+}
+
+/// The maps of a per-tensor affine quantization op over an identity
+/// elementwise loop: identity input and output, scalar scale and zero point.
+template <typename AffineOp>
+static bool isPerTensorIdentity(AffineOp op) {
+  return op->getNumResults() == 1 && op.getInputMap().isIdentity() &&
+         op.getOutputMap().isIdentity() &&
+         op.getScaleMap().getNumResults() == 0 &&
+         (!op.getZeroPoint() || op.getZeroPointMap().getNumResults() == 0);
+}
+
+/// `iree_linalg_ext.dequantize_affine` over `ui8` codes, per tensor, into f32:
+/// the form the IREE 3.14 importer gives DequantizeLinear.
+static std::optional<Dequant>
+matchAffineDequant(IREE::LinalgExt::DequantizeAffineOp op, Value value) {
+  if (!value.hasOneUse() || !isPerTensorIdentity(op) ||
+      !op.getInputUnsigned() ||
+      !op.getInputType().getElementType().isInteger(8) ||
+      !op.getOutputType().getElementType().isF32() ||
+      !op.getScaleElementType().isF32()) {
+    return std::nullopt;
+  }
+  std::optional<double> scale = constantFloat(op.getScale());
+  std::optional<int64_t> zeroPoint =
+      affineZeroPoint(op.getZeroPoint(), op.getZpUnsigned());
+  if (!scale || !zeroPoint) {
+    return std::nullopt;
+  }
+  Dequant found;
+  found.source = op.getInput();
+  found.scale = *scale;
+  found.zeroPoint = *zeroPoint;
+  return found;
+}
+
 static std::optional<Dequant> matchDequant(Value value) {
+  if (auto affine =
+          value.getDefiningOp<IREE::LinalgExt::DequantizeAffineOp>()) {
+    return matchAffineDequant(affine, value);
+  }
   auto op = value.getDefiningOp<linalg::GenericOp>();
   if (!op || !value.hasOneUse() || !isIdentityElementwise(op)) {
     return std::nullopt;
@@ -217,25 +291,60 @@ static bool isRelu(linalg::GenericOp op) {
          *otherwise == 0.0;
 }
 
+/// One `ui8` quantization: the f32 tensor it reads, its scale, its zero point.
+struct Quant {
+  Value input;
+  double scale = 0.0;
+  int64_t zeroPoint = 0;
+};
+
+/// `iree_linalg_ext.quantize_affine` from f32 to `ui8` codes, per tensor,
+/// clamped to the full [0, 255]: the form the IREE 3.14 importer gives
+/// QuantizeLinear. Its rounding is half to even, as the generic form's
+/// `roundeven` is.
+static std::optional<Quant>
+matchAffineQuant(IREE::LinalgExt::QuantizeAffineOp op) {
+  if (!isPerTensorIdentity(op) || !op.getStorageUnsigned() ||
+      op.getQuantMin() != 0 || op.getQuantMax() != 255 ||
+      !op.getInputType().getElementType().isF32() ||
+      !op.getOutputType().getElementType().isInteger(8) ||
+      !op.getScaleElementType().isF32() ||
+      !isa<RankedTensorType>(op->getResult(0).getType())) {
+    return std::nullopt;
+  }
+  std::optional<double> scale = constantFloat(op.getScale());
+  std::optional<int64_t> zeroPoint =
+      affineZeroPoint(op.getZeroPoint(), op.getZpUnsigned());
+  if (!scale || !zeroPoint) {
+    return std::nullopt;
+  }
+  return Quant{op.getInput(), *scale, *zeroPoint};
+}
+
 /// `divf so; roundeven; addf zo; maximumf 0; minimumf 255; fptoui` -- the
-/// importer's `ui8` QuantizeLinear.
-static bool matchQuant(linalg::GenericOp op, double &scale, int64_t &zero) {
-  if (!isIdentityElementwise(op)) {
-    return false;
+/// importer's `ui8` QuantizeLinear before IREE 3.14 -- or its
+/// `quantize_affine` spelling since.
+static std::optional<Quant> matchQuant(Operation *root) {
+  if (auto affine = dyn_cast<IREE::LinalgExt::QuantizeAffineOp>(root)) {
+    return matchAffineQuant(affine);
+  }
+  auto op = dyn_cast<linalg::GenericOp>(root);
+  if (!op || !isIdentityElementwise(op)) {
+    return std::nullopt;
   }
   auto resultType = dyn_cast<RankedTensorType>(op.getResult(0).getType());
   if (!resultType || !resultType.getElementType().isInteger(8)) {
-    return false;
+    return std::nullopt;
   }
   auto ops = matchBody(op, {"arith.divf", "math.roundeven", "arith.addf",
                             "arith.maximumf", "arith.minimumf",
                             "arith.fptoui"});
   if (ops.empty() || inputIndex(op, ops[0]->getOperand(0)) != 0u) {
-    return false;
+    return std::nullopt;
   }
   for (size_t i = 1; i < ops.size(); ++i) {
     if (ops[i]->getOperand(0) != ops[i - 1]->getResult(0)) {
-      return false;
+      return std::nullopt;
     }
   }
   std::optional<double> divisor = constantFloat(op, ops[0]->getOperand(1));
@@ -245,11 +354,10 @@ static bool matchQuant(linalg::GenericOp op, double &scale, int64_t &zero) {
   if (!divisor || !zeroPoint || !low || !high || *low != 0.0 ||
       *high != 255.0 || *zeroPoint != std::floor(*zeroPoint) ||
       *zeroPoint < 0.0 || *zeroPoint > 255.0) {
-    return false;
+    return std::nullopt;
   }
-  scale = *divisor;
-  zero = static_cast<int64_t>(*zeroPoint);
-  return true;
+  return Quant{op.getDpsInputs()[0], *divisor,
+               static_cast<int64_t>(*zeroPoint)};
 }
 
 static Value emitShift(PatternRewriter &rewriter, Location loc, Value source) {
@@ -287,17 +395,21 @@ static Value emitTranspose(PatternRewriter &rewriter, Location loc,
       .getResult()[0];
 }
 
-struct FuseInt8ResidualAdd : public OpRewritePattern<linalg::GenericOp> {
-  using OpRewritePattern::OpRewritePattern;
+/// Anchored on any op because the QuantizeLinear at the root is a
+/// `linalg.generic` or an `iree_linalg_ext.quantize_affine`.
+struct FuseInt8ResidualAdd : public RewritePattern {
+  explicit FuseInt8ResidualAdd(MLIRContext *context)
+      : RewritePattern(MatchAnyOpTypeTag(), /*benefit=*/1, context) {}
 
-  LogicalResult matchAndRewrite(linalg::GenericOp quant,
+  LogicalResult matchAndRewrite(Operation *quant,
                                 PatternRewriter &rewriter) const override {
-    double outputScale = 0.0;
-    int64_t outputZeroPoint = 0;
-    if (!matchQuant(quant, outputScale, outputZeroPoint)) {
+    std::optional<Quant> output = matchQuant(quant);
+    if (!output) {
       return failure();
     }
-    auto relu = quant.getDpsInputs()[0].getDefiningOp<linalg::GenericOp>();
+    double outputScale = output->scale;
+    int64_t outputZeroPoint = output->zeroPoint;
+    auto relu = output->input.getDefiningOp<linalg::GenericOp>();
     if (!relu || !relu->hasOneUse() || !isRelu(relu)) {
       return failure();
     }
@@ -312,7 +424,7 @@ struct FuseInt8ResidualAdd : public OpRewritePattern<linalg::GenericOp> {
     }
     // NCHW in, as every residual from the importer is; the transposes below
     // assume it.
-    auto type = cast<RankedTensorType>(quant.getResult(0).getType());
+    auto type = cast<RankedTensorType>(quant->getResult(0).getType());
     if (type.getRank() != 4 || !type.hasStaticShape() ||
         type.getDimSize(0) != 1 || a->source.getType() != type ||
         b->source.getType() != type) {
@@ -324,7 +436,7 @@ struct FuseInt8ResidualAdd : public OpRewritePattern<linalg::GenericOp> {
       }
     }
 
-    Location loc = quant.getLoc();
+    Location loc = quant->getLoc();
     const int64_t toNhwc[] = {0, 2, 3, 1};
     const int64_t toNchw[] = {0, 3, 1, 2};
     Value aNhwc = emitTranspose(rewriter, loc,
@@ -421,18 +533,19 @@ struct FuseInt8ResidualAdd : public OpRewritePattern<linalg::GenericOp> {
 /// one real element (the pad is narrower than the kernel), so padding with
 /// the smallest code, -128 in the signed encoding, is the same result. And
 /// signed max over `u8 - 128` orders exactly like unsigned max over `u8`.
-struct FuseInt8MaxPool : public OpRewritePattern<linalg::GenericOp> {
-  using OpRewritePattern::OpRewritePattern;
+struct FuseInt8MaxPool : public RewritePattern {
+  explicit FuseInt8MaxPool(MLIRContext *context)
+      : RewritePattern(MatchAnyOpTypeTag(), /*benefit=*/1, context) {}
 
-  LogicalResult matchAndRewrite(linalg::GenericOp quant,
+  LogicalResult matchAndRewrite(Operation *quant,
                                 PatternRewriter &rewriter) const override {
-    double outputScale = 0.0;
-    int64_t outputZeroPoint = 0;
-    if (!matchQuant(quant, outputScale, outputZeroPoint)) {
+    std::optional<Quant> output = matchQuant(quant);
+    if (!output) {
       return failure();
     }
-    auto pool =
-        quant.getDpsInputs()[0].getDefiningOp<linalg::PoolingNchwMaxOp>();
+    double outputScale = output->scale;
+    int64_t outputZeroPoint = output->zeroPoint;
+    auto pool = output->input.getDefiningOp<linalg::PoolingNchwMaxOp>();
     if (!pool || !pool->hasOneUse()) {
       return failure();
     }
@@ -461,7 +574,7 @@ struct FuseInt8MaxPool : public OpRewritePattern<linalg::GenericOp> {
       return failure();
     }
     auto sourceType = cast<RankedTensorType>(dequant->source.getType());
-    auto resultType = cast<RankedTensorType>(quant.getResult(0).getType());
+    auto resultType = cast<RankedTensorType>(quant->getResult(0).getType());
     if (sourceType.getRank() != 4 || !sourceType.hasStaticShape() ||
         sourceType.getDimSize(0) != 1 || !resultType.hasStaticShape()) {
       return failure();
@@ -484,7 +597,7 @@ struct FuseInt8MaxPool : public OpRewritePattern<linalg::GenericOp> {
       }
     }
 
-    Location loc = quant.getLoc();
+    Location loc = quant->getLoc();
     const int64_t toNhwc[] = {0, 2, 3, 1};
     const int64_t toNchw[] = {0, 3, 1, 2};
     Value nhwc = emitTranspose(rewriter, loc,
