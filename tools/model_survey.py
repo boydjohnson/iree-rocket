@@ -154,7 +154,9 @@ def board_conditions(host: str) -> dict[str, str]:
             'echo "governor=$(for c in 0 4 6; do printf "cpu%s:%s/%s " $c '
             '"$(cat /sys/devices/system/cpu/cpu$c/cpufreq/scaling_governor)" '
             '"$(cat /sys/devices/system/cpu/cpu$c/cpufreq/scaling_min_freq)"; done)"',
-            'echo "npu_irq=$(for i in 82 83 84; do printf "%s:%s " $i '
+            # By name: the numbers moved from 82-84 to 85-87 between kernels.
+            'echo "npu_irq=$(for i in $(grep -E "\\.npu$" /proc/interrupts '
+            '| cut -d: -f1 | tr -d " "); do printf "%s:%s " $i '
             '"$(cat /proc/irq/$i/smp_affinity_list 2>/dev/null)"; done)"',
             'echo "npu_status=$(cat /sys/devices/platform/*.npu/power/runtime_status '
             '2>/dev/null | tr "\\n" " ")"',
