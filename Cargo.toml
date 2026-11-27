@@ -7,6 +7,9 @@ members = [
     "iree-rocket-hal",
     "rocket-hal-driver", "rocket-compiler",
 ]
+# Its own workspace: building it needs the installed IreeRocketRuntime package,
+# which `cargo test --workspace` here (and ci.yml) does not have.
+exclude = ["rocket-runtime/rust"]
 
 [profile.release]
 # Keep full optimization but retain DWARF debug info (Cargo's release

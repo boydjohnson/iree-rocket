@@ -33,7 +33,10 @@ nightly's job.
 - **`cargo fmt --check`** (`ubuntu-latest`) -- `cargo fmt --all -- --check` on
   **nightly** rustfmt, not stable: `rustfmt.toml` sets `imports_granularity`,
   which is still unstable, and stable rustfmt would silently ignore it and
-  disagree with how the code is actually formatted.
+  disagree with how the code is actually formatted. A second step checks the
+  Rust bindings in `rocket-runtime/rust`, their own workspace (building them
+  needs the installed runtime package, which CI does not have; formatting
+  does not).
 
 There is no clippy job and no lit-test job.
 
@@ -79,8 +82,10 @@ ccache. `workflow_dispatch` takes a `retention-days` input, default 14.
   --target aarch64-unknown-linux-gnu --no-run` for the crates' own libtest
   binaries, which the CMake build never produces. Installs the
   `IreeRocketRuntime` component (rocket-runtime/: `libiree_rocket_runtime.{so,a}`,
-  headers, pkg-config and CMake files) and link-tests its `embed.cc` sample
-  through both `.pc` files -- link only, the runner cannot run aarch64. Uploads
+  headers, pkg-config and CMake files), link-tests its `embed.cc` sample
+  through both `.pc` files and builds the Rust bindings (`rocket-runtime/rust`,
+  every target) against the unpacked package -- link only, the runner cannot
+  run aarch64. Uploads
   `iree-runtime-aarch64`, `iree-rocket-runtime-aarch64`, `rocket-cts-aarch64`
   (the non-executable HAL CTS categories) and `rocket-rust-tests-aarch64`, the
   last two with a `RUN.md` saying how to run them on the board. Timeout
