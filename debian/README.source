@@ -1,0 +1,104 @@
+rocket-compiler for Debian and Armbian
+======================================
+
+What the package is
+-------------------
+
+One binary package, rocket-compiler (amd64, arm64):
+
+  /usr/bin/rocket-compiler                                    Rust, dlopens:
+  /usr/lib/<triplet>/rocket-compiler/libIREECompiler.so       IREE + LLVM +
+                                                              the Rocket plugin
+  /usr/lib/<triplet>/rocket-compiler/iree-lld                 RUNPATH $ORIGIN
+  /usr/share/rocket-compiler/rocket_conv2d_transform_spec.mlir
+
+libIREECompiler.so is a private library on purpose. Its SONAME is bare
+(`libIREECompiler.so`, no version), it is a custom build carrying this
+project's target plugin, and the transform spec only parses with the IREE
+it was written against. So it lives in the package's own directory, not in
+a public library package, and the binary, library and spec always ship and
+upgrade together. It cannot clash with an upstream IREE install.
+
+rocket-compiler finds the library and spec through absolute paths baked in
+at build time: debian/rules exports ROCKET_COMPILER_LIBDIR and
+ROCKET_COMPILER_DATADIR, which rocket-compiler/src/main.rs reads with
+option_env!. The lookup order is --iree-compiler-lib, then
+IREE_COMPILER_LIB, then those paths, then the nightly tarball's relative
+layout. No environment, wrapper script or symlink is needed.
+
+The orig tarball
+----------------
+
+debian/make-orig.sh builds rocket-compiler_<upstream>.orig.tar.xz (about
+3 GB unpacked) from git objects. It contains:
+
+  - this repository without debian/;
+  - IREE at the recorded submodule commit, with only the five IREE
+    submodules the compiler build reads: llvm-project, torch-mlir (without
+    its nested externals/), flatcc, benchmark and googletest;
+  - every crate in Cargo.lock, vendored under vendor/.
+
+debian/rules builds with `cargo --offline` whenever vendor/ is present, so
+the build works with no network, as sbuild and Armbian's builders require.
+
+  git submodule update --init iree-build/iree-src
+  git -C iree-build/iree-src submodule update --init \
+      third_party/{llvm-project,torch-mlir,flatcc,benchmark,googletest}
+  debian/make-orig.sh                    # writes ../rocket-compiler_*.orig.tar.xz
+
+In a git worktree whose submodules are not initialized, point it at another
+checkout with IREE_REPO=/path/to/iree-src. REV=$(git stash create) packages
+uncommitted edits for a trial build.
+
+Building
+--------
+
+A full build compiles LLVM and takes hours on a cold tree, and longer on an
+arm64 board. Two shortcuts that do not change the package's contents:
+
+  ROCKET_IREE_BUILD_DIR=/path/to/iree-build/build
+      Package an existing compiler-host build (lib/libIREECompiler.so and
+      tools/iree-lld) instead of building IREE. This is the nightly CI's
+      build, so a .deb job can reuse it.
+
+  ROCKET_IREE_CMAKE_ARGS="-DCMAKE_C_COMPILER_LAUNCHER=ccache ..."
+      Extra CMake arguments for the IREE configure step.
+
+  dpkg-buildpackage -b -us -uc
+
+The build runs the unit tests and then compiles one model
+(rocket-compiler-plugin/test/rocket_conv_layout.mlir) with the library being
+packaged. A spec the library cannot parse fails the build, not the user's
+first compile. debian/tests/smoke repeats that against the installed package
+with an empty environment, as an autopkgtest.
+
+The Rust toolchain
+------------------
+
+The crates use edition 2024, so the build needs rustc >= 1.85. trixie has it.
+bookworm, jammy and noble do not have one that new as their default rustc
+(Ubuntu has versioned rustc-1.xx packages, which do not satisfy the
+Build-Depends as written). On those, install Rust
+with rustup and build with `dpkg-buildpackage -d` to skip the build-dependency
+check.
+
+One build per suite
+-------------------
+
+The binaries require the glibc and libstdc++ of the suite they were built
+on. A build on noble (glibc 2.39) will not load on bookworm (2.36) or jammy
+(2.35). Build once per target suite, in a container or chroot of that suite,
+and publish each .deb to that suite's component of the apt repository.
+
+Known lintian tags
+------------------
+
+  spelling-error-in-binary (libIREECompiler.so)   LLVM and IREE's strings;
+                                                  overridden
+  executable-in-usr-lib (iree-lld)                private helper; overridden
+  hardening-no-fortify-functions (rocket-compiler) usual for Rust binaries
+  debug-file-with-no-debug-symbols (iree-lld)     a 16 KB wrapper with
+                                                  nothing to keep
+  initial-upload-closes-no-bugs                   not aimed at Debian proper
+
+ -- Boyd Johnson <boyd@boundarybit.io>, Fri, 27 Nov 2026

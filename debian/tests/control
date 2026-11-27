@@ -1,0 +1,4 @@
+# Compiling needs no NPU, so this runs on any autopkgtest testbed.
+Tests: smoke
+Depends: rocket-compiler
+Restrictions: superficial

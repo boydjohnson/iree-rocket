@@ -116,6 +116,11 @@ compiled module actually contains. A refusal names its class, so `shape` and
 `semantics` are compiler work, `validation` means nobody has measured that
 configuration yet, and `hardware` never closes.
 
+To run models from your own program instead of `iree-run-module`, the
+nightly's `iree-rocket-runtime-aarch64` artifact is the runtime as a C/C++
+library; [`rocket-runtime`](rocket-runtime) has the API and a minimal example,
+and [`rocket-runtime/rust`](rocket-runtime/rust) the Rust bindings.
+
 ## Known limitations
 
 - **The board needs a patched kernel module.** All three changes are in
@@ -150,7 +155,7 @@ external HAL driver registered through IREE's own
 The kernel side is mainline `accel/rocket` plus three patches that are not
 upstream, carried in [`kernel-patches/`](kernel-patches) -- two of them Greg
 Tomko's, from the external [`gregordinary/patches`](https://github.com/gregordinary/patches)
-series, rebased onto Armbian 7.3.5. Getting all three upstream is the useful
+series, rebased onto Armbian 7.3.5 and carried to 7.3.6. Getting all three upstream is the useful
 next step for anyone working on that driver. **Unconditional
 PPU completion**: upstream arms only the DPU interrupts, so a standalone
 PPU-flying pooling job never reaches the completion path and is retired by
@@ -174,11 +179,12 @@ extent of an actual measurement and the register encodings are wider.
 | [`rocket-plan-ffi`](rocket-plan-ffi) | A versioned C ABI over that planner, so the compiler asks the same planner -- and packs the same coefficient bytes -- the runtime does. |
 | [`iree-rocket-hal`](iree-rocket-hal) | ioctl/mmap access to the NPU and register command building. |
 | [`rocket-hal-driver`](rocket-hal-driver) | The IREE HAL driver, statically linked into IREE's tools. Includes HAL CTS wiring. |
+| [`rocket-runtime`](rocket-runtime) | The runtime as a library for C, C++ and Rust programs: `rocket/runtime.h`, a session over the NPU+CPU device pair every module needs (IREE's own session API takes one device), packaged as `libiree_rocket_runtime.{so,a}` with pkg-config and CMake files, plus Rust bindings in [`rocket-runtime/rust`](rocket-runtime/rust). |
 | [`rocket-compiler-plugin`](rocket-compiler-plugin) | The IREE compiler target plugin ("Rocket"), in C++, plus the transform spec that matches and rewrites operations. |
 | [`rocket-compiler`](rocket-compiler) | The compiler driver: applies the transform spec and the device flags it expects, and audits where every convolution and matmul went. |
 | [`rocket-schema`](rocket-schema) | The FlatBuffers executable format shared by both sides. |
 | [`tools`](tools) | ONNX import/export, the board regression gates, the model survey, the precision probe. |
-| [`kernel-patches`](kernel-patches) | The out-of-tree `accel/rocket` patches the measured configuration runs, for Armbian 7.3.5. GPL-2.0, unlike the rest of this repository, and two of the three come from [`gregordinary/patches`](https://github.com/gregordinary/patches). |
+| [`kernel-patches`](kernel-patches) | The out-of-tree `accel/rocket` patches the measured configuration runs, for Armbian 7.3.6 (and 7.3.5, unchanged). GPL-2.0, unlike the rest of this repository, and two of the three come from [`gregordinary/patches`](https://github.com/gregordinary/patches). |
 | [`iree-build`](iree-build) | CMake configuration, and `iree-src`, IREE as a pinned submodule. |
 
 Each component's detailed role is in
@@ -189,7 +195,7 @@ Each component's detailed role is in
 | Workflow | Status | What it gates |
 |---|---|---|
 | [`ci.yml`](.github/workflows/ci.yml) | [![CI](https://github.com/boydjohnson/iree-rocket/actions/workflows/ci.yml/badge.svg?branch=main)](https://github.com/boydjohnson/iree-rocket/actions/workflows/ci.yml) | Every push and pull request: `cargo check`, `build`, `test` and `fmt` over the Rust workspace. Rust only -- it does not build IREE. |
-| [`nightly.yml`](.github/workflows/nightly.yml) | [![Nightly artifacts](https://github.com/boydjohnson/iree-rocket/actions/workflows/nightly.yml/badge.svg?branch=main)](https://github.com/boydjohnson/iree-rocket/actions/workflows/nightly.yml) | Nightly, and the reason the prebuilt binaries above exist: the compiler with the Rocket plugin, the board runtime with the Rocket driver, the HAL CTS binaries and the crates' board test binaries. |
+| [`nightly.yml`](.github/workflows/nightly.yml) | [![Nightly artifacts](https://github.com/boydjohnson/iree-rocket/actions/workflows/nightly.yml/badge.svg?branch=main)](https://github.com/boydjohnson/iree-rocket/actions/workflows/nightly.yml) | Nightly, and the reason the prebuilt binaries above exist: the compiler with the Rocket plugin, the board runtime with the Rocket driver, the embeddable runtime library, the HAL CTS binaries and the crates' board test binaries. |
 
 The hardware tests are `#[ignore]`d in CI -- nothing in GitHub Actions has an
 NPU -- so correctness on the device is gated by three end-to-end regression

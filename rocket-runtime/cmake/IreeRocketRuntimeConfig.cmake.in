@@ -1,0 +1,39 @@
+# find_package(IreeRocketRuntime) for the unpacked iree-rocket runtime package.
+#
+#   IreeRocket::runtime          libiree_rocket_runtime.so (recommended)
+#   IreeRocket::runtime_static   libiree_rocket_runtime.a, for C and C++ only
+#
+# Relocatable: every path is relative to this file.
+
+get_filename_component(_IREE_ROCKET_PREFIX "${CMAKE_CURRENT_LIST_DIR}/../../.." ABSOLUTE)
+set(_IREE_ROCKET_LIBDIR "${_IREE_ROCKET_PREFIX}/lib")
+set(_IREE_ROCKET_INCLUDEDIR "${_IREE_ROCKET_PREFIX}/include")
+
+include(CMakeFindDependencyMacro)
+find_dependency(Threads)
+
+if(NOT TARGET IreeRocket::runtime)
+  add_library(IreeRocket::runtime SHARED IMPORTED)
+  set_target_properties(IreeRocket::runtime PROPERTIES
+    IMPORTED_LOCATION "${_IREE_ROCKET_LIBDIR}/libiree_rocket_runtime.so.@ROCKET_RUNTIME_SOVERSION@"
+    IMPORTED_SONAME "libiree_rocket_runtime.so.@ROCKET_RUNTIME_SOVERSION@"
+    INTERFACE_INCLUDE_DIRECTORIES "${_IREE_ROCKET_INCLUDEDIR}"
+    INTERFACE_COMPILE_DEFINITIONS "@ROCKET_RUNTIME_PUBLIC_DEFINES@"
+  )
+endif()
+
+if(NOT TARGET IreeRocket::runtime_static)
+  add_library(IreeRocket::runtime_static STATIC IMPORTED)
+  set_target_properties(IreeRocket::runtime_static PROPERTIES
+    IMPORTED_LOCATION "${_IREE_ROCKET_LIBDIR}/libiree_rocket_runtime.a"
+    IMPORTED_LINK_INTERFACE_LANGUAGES "C"
+    INTERFACE_INCLUDE_DIRECTORIES "${_IREE_ROCKET_INCLUDEDIR}"
+    INTERFACE_COMPILE_DEFINITIONS "@ROCKET_RUNTIME_PUBLIC_DEFINES@"
+    # libgcc_s: the unwinder the Rust standard library inside calls.
+    INTERFACE_LINK_LIBRARIES "Threads::Threads;${CMAKE_DL_LIBS};m;rt;gcc_s"
+  )
+endif()
+
+unset(_IREE_ROCKET_PREFIX)
+unset(_IREE_ROCKET_LIBDIR)
+unset(_IREE_ROCKET_INCLUDEDIR)

@@ -2,16 +2,22 @@ name: IREE build (reusable)
 
 # Builds one of the two CMake/Ninja configurations this repo produces:
 #
-#   compiler-host    iree-compile (x86_64) with the Rocket compiler target
-#                    plugin registered -- ../../iree-build/configure-compiler-host.sh
+#   compiler-host    iree-compile with the Rocket compiler target plugin
+#                    registered -- ../../iree-build/configure-compiler-host.sh
 #                    -- plus rocket-compiler, the Rust driver over the same
 #                    libIREECompiler.so, packaged so an unpacked tarball
-#                    compiles a model with no environment setup.
+#                    compiles a model with no environment setup. Built
+#                    natively for whatever the runner is: x86_64 on
+#                    ubuntu-24.04 (iree-compile-x86_64, plus the host tools
+#                    runtime-aarch64 imports), aarch64 on ubuntu-24.04-arm
+#                    (iree-compile-aarch64, a compiler that runs on the board
+#                    itself).
 #   runtime-aarch64  iree-run-module / iree-benchmark-module cross-compiled for
 #                    the RK3588 board with the Rocket HAL driver statically
 #                    linked -- ../../iree-build/configure-runtime-aarch64.sh --
-#                    plus the rocket HAL CTS binaries and the Rust test
-#                    binaries, all for the board.
+#                    plus the embeddable runtime package (rocket-runtime/),
+#                    the rocket HAL CTS binaries and the Rust test binaries,
+#                    all for the board.
 #
 # runtime-aarch64 is downstream of compiler-host: configure-runtime-aarch64.sh
 # points IREE_HOST_BIN_DIR at iree-build/build/tools, and IREE resolves those
@@ -70,16 +76,17 @@ permissions:
 
 jobs:
   build:
-    name: ${{ inputs.target }}
+    name: ${{ inputs.target }} (${{ inputs.runner }})
     runs-on: ${{ inputs.runner }}
     timeout-minutes: ${{ inputs.timeout-minutes }}
 
     env:
       CCACHE_DIR: ${{ github.workspace }}/.ccache
-      # The two targets get separate caches (different compilers entirely --
-      # host g++ vs. aarch64-linux-gnu-g++), and their sum has to stay well
-      # under GitHub's 10 GB per-repo cache budget or the two nightly jobs
-      # evict each other's LLVM objects every run.
+      # Every target/runner pair gets its own cache (different compilers
+      # entirely -- x86_64 g++, aarch64 g++, aarch64-linux-gnu-g++), and
+      # their sum (3 + 3 + 1 GB for the three nightly jobs) has to stay well
+      # under GitHub's 10 GB per-repo cache budget or the jobs evict each
+      # other's LLVM objects every run.
       CCACHE_MAXSIZE: ${{ inputs.target == 'compiler-host' && '3G' || '1G' }}
       CCACHE_COMPRESS: "1"
       # Rewrite absolute paths under the workspace to relative ones, so objects
@@ -102,6 +109,15 @@ jobs:
             compiler-host|runtime-aarch64) ;;
             *) echo "::error::unknown target '$TARGET'"; exit 1 ;;
           esac
+          # runtime-aarch64 cross-compiles with aarch64-linux-gnu-g++ and
+          # imports x86_64 host tools; on an arm runner neither holds.
+          if [ "$TARGET" = runtime-aarch64 ] && [ "${RUNNER_ARCH}" != X64 ]; then
+            echo "::error::runtime-aarch64 needs an x86_64 runner, not ${RUNNER_ARCH}"
+            exit 1
+          fi
+          # compiler-host builds for the runner it is on; the package is named
+          # after that architecture (iree-compile-x86_64 / -aarch64).
+          echo "COMPILER_PKG=iree-compile-$(uname -m)" >> "$GITHUB_ENV"
 
       - uses: actions/checkout@v4
         with:
@@ -144,9 +160,10 @@ jobs:
           # time; the packaging step below rewrites it to $ORIGIN/../lib.
           # libclang-dev: bindgen runs from build.rs on both sides --
           # rocket-compiler (host) and iree-rocket-hal / rocket-hal-driver
-          # (aarch64); see ci.yml's own note.
+          # (aarch64); see ci.yml's own note. pkg-config: the runtime package
+          # link test (aarch64) resolves the package's .pc files with it.
           sudo apt-get install -y --no-install-recommends \
-            ninja-build ccache patchelf libclang-dev
+            ninja-build ccache patchelf libclang-dev pkg-config
 
       - name: Install aarch64 cross toolchain
         if: inputs.target == 'runtime-aarch64'
@@ -225,7 +242,7 @@ jobs:
       # Not through CMake: rocket-compiler dlopens libIREECompiler.so at run
       # time rather than linking it, so it builds independently of the tree
       # above and only has to be packaged next to it.
-      - name: Build rocket-compiler (x86_64)
+      - name: Build rocket-compiler
         if: inputs.target == 'compiler-host'
         run: cargo build -p rocket-compiler --release --locked
 
@@ -277,7 +294,7 @@ jobs:
           #                            embedded CPU link fails unless one is
           #                            on PATH. RUNPATH already rewritten by
           #                            the loop above.
-          OUT=dist/iree-compile-x86_64
+          OUT="dist/${COMPILER_PKG}"
           mkdir -p "${OUT}/bin" "${OUT}/lib" "${OUT}/share/rocket"
           cp "${BUILD}/tools/iree-compile" "${BUILD}/tools/iree-lld" "${OUT}/bin/"
           cp target/release/rocket-compiler "${OUT}/bin/"
@@ -286,8 +303,9 @@ jobs:
              "${OUT}/share/rocket/"
           cp "${BUILD}/tools/build_config.txt" "${OUT}/"
           write_version "${OUT}/VERSION.txt"
-          cat > "${OUT}/RUN.md" <<'EOF'
-          # rocket-compiler / iree-compile (x86_64)
+          {
+          echo "# rocket-compiler / iree-compile (${COMPILER_PKG#iree-compile-})"
+          cat <<'EOF'
 
           Unpack anywhere; nothing needs to be set in the environment.
 
@@ -308,24 +326,30 @@ jobs:
           `iree-compile`, for models: it pins placement between two pipeline
           stages, which a single `iree-compile` invocation cannot do.
           EOF
-          tar -C dist -czf iree-compile-x86_64.tar.gz iree-compile-x86_64
+          } > "${OUT}/RUN.md"
+          tar -C dist -czf "${COMPILER_PKG}.tar.gz" "${COMPILER_PKG}"
+          CHECK=("dist/${COMPILER_PKG}")
 
           # 2. The full tools/ directory, in the exact layout
           #    IREE_HOST_BIN_DIR expects, for the aarch64 job to restore.
           #    lib/ rides along because iree-compile is imported from here and
           #    the check-test modules in the aarch64 tree actually run it.
-          mkdir -p dist/iree-host-tools/tools dist/iree-host-tools/lib
-          find "${BUILD}/tools" -maxdepth 1 -type f -executable \
-            -exec cp {} dist/iree-host-tools/tools/ \;
-          cp "${BUILD}/tools/build_config.txt" dist/iree-host-tools/tools/
-          cp "${BUILD}/lib/libIREECompiler.so" dist/iree-host-tools/lib/
-          write_version dist/iree-host-tools/VERSION.txt
-          tar -C dist -czf iree-host-tools.tar.gz iree-host-tools
+          #    x86_64 only: runtime-aarch64 runs on an x86_64 runner, so these
+          #    are the only host tools it can execute.
+          if [ "${RUNNER_ARCH}" = X64 ]; then
+            mkdir -p dist/iree-host-tools/tools dist/iree-host-tools/lib
+            find "${BUILD}/tools" -maxdepth 1 -type f -executable \
+              -exec cp {} dist/iree-host-tools/tools/ \;
+            cp "${BUILD}/tools/build_config.txt" dist/iree-host-tools/tools/
+            cp "${BUILD}/lib/libIREECompiler.so" dist/iree-host-tools/lib/
+            write_version dist/iree-host-tools/VERSION.txt
+            tar -C dist -czf iree-host-tools.tar.gz iree-host-tools
+            CHECK+=(dist/iree-host-tools)
+          fi
 
           # Before upload: a binary the host cannot load fails the job here
           # rather than in a user's shell (see the `runner` input).
-          .github/scripts/check-glibc-ceiling.sh "${MAX_GLIBC}" \
-            dist/iree-compile-x86_64 dist/iree-host-tools
+          .github/scripts/check-glibc-ceiling.sh "${MAX_GLIBC}" "${CHECK[@]}"
 
           ls -lh ./*.tar.gz
 
@@ -342,7 +366,7 @@ jobs:
           set -euo pipefail
           SMOKE="${RUNNER_TEMP}/rocket-compiler-smoke"
           rm -rf "${SMOKE}" && mkdir -p "${SMOKE}"
-          tar -xzf iree-compile-x86_64.tar.gz -C "${SMOKE}"
+          tar -xzf "${COMPILER_PKG}.tar.gz" -C "${SMOKE}"
           cp rocket-compiler-plugin/test/rocket_conv_layout.mlir "${SMOKE}/model.mlir"
 
           SPEC=rocket-compiler-plugin/target/Rocket/rocket_conv2d_transform_spec.mlir
@@ -352,12 +376,12 @@ jobs:
           cd "${SMOKE}"
           run() { env -i PATH=/usr/bin:/bin HOME="${HOME}" "$@"; }
 
-          run iree-compile-x86_64/bin/rocket-compiler compile \
+          run "${COMPILER_PKG}/bin/rocket-compiler" compile \
             --input model.mlir --output offload.vmfb \
             --llvmcpu-target-triple aarch64-linux-gnu
           test -s offload.vmfb
 
-          run iree-compile-x86_64/bin/rocket-compiler compile \
+          run "${COMPILER_PKG}/bin/rocket-compiler" compile \
             --input model.mlir --output no-offload.vmfb \
             --llvmcpu-target-triple aarch64-linux-gnu --no-offload 2>&1 \
             | tee no-offload.log
@@ -371,17 +395,17 @@ jobs:
       # actions/upload-artifact zips its input and the zip round-trip drops the
       # executable bit, which would make every one of these downloads useless.
       # compression-level 0 because the tarballs are already gzipped.
-      - name: Upload iree-compile + rocket-compiler (x86_64)
+      - name: Upload iree-compile + rocket-compiler
         if: inputs.target == 'compiler-host'
         uses: actions/upload-artifact@v4
         with:
-          name: iree-compile-x86_64
-          path: iree-compile-x86_64.tar.gz
+          name: ${{ env.COMPILER_PKG }}
+          path: ${{ env.COMPILER_PKG }}.tar.gz
           compression-level: 0
           retention-days: ${{ inputs.retention-days }}
 
       - name: Upload host tools
-        if: inputs.target == 'compiler-host'
+        if: inputs.target == 'compiler-host' && runner.arch == 'X64'
         uses: actions/upload-artifact@v4
         with:
           name: iree-host-tools
@@ -526,12 +550,48 @@ jobs:
           EOF
           tar -C dist -czf rocket-rust-tests-aarch64.tar.gz rocket-rust-tests-aarch64
 
+          # 4. The embeddable runtime: rocket/runtime.h, IREE's headers,
+          # libiree_rocket_runtime.{so,a}, pkg-config and CMake package files
+          # (rocket-runtime/CMakeLists.txt). --strip only touches the .so; the
+          # archive's debug info was already dropped when it was merged.
+          cmake --install "${BUILD}" --component IreeRocketRuntime \
+            --prefix dist/iree-rocket-runtime-aarch64 --strip
+          write_version dist/iree-rocket-runtime-aarch64/VERSION.txt
+          tar -C dist -czf iree-rocket-runtime-aarch64.tar.gz iree-rocket-runtime-aarch64
+
           # Same guard as compiler-host's: the board's glibc is the ceiling.
           .github/scripts/check-glibc-ceiling.sh "${MAX_GLIBC}" \
             dist/iree-runtime-aarch64 dist/rocket-cts-aarch64 \
-            dist/rocket-rust-tests-aarch64
+            dist/rocket-rust-tests-aarch64 dist/iree-rocket-runtime-aarch64
 
           ls -lh ./*.tar.gz
+
+      # The package as an outside program sees it: the shipped C++ sample,
+      # cross-compiled from the unpacked tree through each pkg-config file,
+      # and the Rust bindings built against it.
+      # Link-only -- the runner cannot execute aarch64, and the board run is
+      # what checks results.
+      - name: Link-test the runtime package (aarch64)
+        if: inputs.target == 'runtime-aarch64'
+        run: |
+          set -euo pipefail
+          PKG="$(mktemp -d)"
+          tar -xzf iree-rocket-runtime-aarch64.tar.gz -C "${PKG}"
+          ROOT="${PKG}/iree-rocket-runtime-aarch64"
+          export PKG_CONFIG_LIBDIR="${ROOT}/lib/pkgconfig" PKG_CONFIG_PATH=
+          for pc in iree-rocket-runtime iree-rocket-runtime-static; do
+            aarch64-linux-gnu-g++ -std=c++17 -O2 \
+              "${ROOT}/share/rocket-runtime/samples/embed.cc" \
+              $(pkg-config --cflags --libs "${pc}") -o "${PKG}/embed-${pc}"
+            echo "linked against ${pc}: $(stat -c %s "${PKG}/embed-${pc}") bytes"
+          done
+          # The Rust bindings (rocket-runtime/rust) against the same unpacked
+          # package: bindgen over its headers, every target linked to its .so.
+          ROCKET_RUNTIME_DIR="${ROOT}" \
+          CARGO_TARGET_AARCH64_UNKNOWN_LINUX_GNU_LINKER=aarch64-linux-gnu-gcc \
+            cargo build --release --manifest-path rocket-runtime/rust/Cargo.toml \
+              --target aarch64-unknown-linux-gnu --all-targets \
+              --features rocket-runtime/half
 
       - name: Upload iree runtime (aarch64)
         if: inputs.target == 'runtime-aarch64'
@@ -539,6 +599,15 @@ jobs:
         with:
           name: iree-runtime-aarch64
           path: iree-runtime-aarch64.tar.gz
+          compression-level: 0
+          retention-days: ${{ inputs.retention-days }}
+
+      - name: Upload embeddable runtime package (aarch64)
+        if: inputs.target == 'runtime-aarch64'
+        uses: actions/upload-artifact@v4
+        with:
+          name: iree-rocket-runtime-aarch64
+          path: iree-rocket-runtime-aarch64.tar.gz
           compression-level: 0
           retention-days: ${{ inputs.retention-days }}
 
