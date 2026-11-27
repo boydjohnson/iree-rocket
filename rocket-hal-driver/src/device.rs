@@ -147,8 +147,8 @@ fn quiesce_all_enabled() -> bool {
 ///
 /// With the earlier campaigns (~2020 transitions, 2026-09-05 and -10) that is
 /// ~71000 without a failure: the rule of three bounds the rate at ~0.004%
-/// per transition, against the ~0.15% the dwell was kept for. Whether a
-/// conv can retire on a PPU bit (docs/open-questions.md 1.1.2) is still not
+/// per transition, against the ~0.15% the dwell was kept for. Whether a conv
+/// can retire on a PPU bit (agent-docs/open-questions.md 1.1.2) is still not
 /// known; the campaign says only that no transition this driver makes shows
 /// the hazard.
 ///

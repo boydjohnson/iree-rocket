@@ -627,8 +627,8 @@ def compile_modules(
 
     # Three stages, not one, because `rocket-pin-unclaimed-dispatches` has to
     # run between the flow and stream phases and no plugin hook exists that
-    # late -- exactly what `rocket-compiler` does for a model (see README,
-    # "Placement pinning"). This matters more for pooling than for
+    # late -- exactly what `rocket-compiler` does for a model (see
+    # agent-docs/developer-tools.md, "Placement pinning"). This matters more for pooling than for
     # convolution: every pooling shim ends in a CPU epilogue whose only
     # producer is the Rocket dispatch, so without the pin, Stream's affinity
     # analysis places that epilogue on @rocket_device and serialization dies
