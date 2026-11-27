@@ -5,16 +5,19 @@ and can that coexist with iree-rocket? The board is the same one the NPU work
 uses, so a second accelerator backend is either a comparison baseline or a
 fallback for ops the NPU refuses.
 
-**Verdict so far: yes for IREE, and the blocker was ours, not ARM's.** panvk
-compute is correct and now exposes `shaderFloat16`; the thing that produced
-wrong answers was a cache-maintenance bug in *IREE's* Vulkan HAL, fixed by a
-local patch. The iree-rocket half is not answered yet: nothing has compiled a
-module targeting both backends, and there are **no performance numbers at
-all** -- every result below is a correctness result.
+**Verdict: yes for IREE, and the blocker was ours, not ARM's.** panvk compute
+is correct and now exposes `shaderFloat16`; the thing that produced wrong
+answers was a cache-maintenance bug in *IREE's* Vulkan HAL, fixed by a local
+patch. One compiler now carries both `vulkan-spirv` and `rocket`, and its
+Vulkan output is bit-identical to the stock wheel's. The iree-rocket half is
+**still not answered**: a module that actually places work on both backends
+needs device affinities plus rocket-compiler's conv dispatches, and there are
+**no performance numbers at all** -- every result here is a correctness
+result.
 
-Status marker: written 2026-11-27 against `claude/mali-vulkan` at `6d4cca2`,
-with the combined-backend compiler build still running. Section 5 is the open
-part. Related: [open-questions.md](open-questions.md) for what the stack does
+Status marker: written 2026-11-27 against `claude/mali-vulkan`. Section 5 is
+the combined compiler, which landed the same day; section 6 is what remains
+open. Related: [open-questions.md](open-questions.md) for what the stack does
 not know, [../LIMITS.md](../LIMITS.md) for what is measured to work.
 
 ## 1. The stack, and one trap
@@ -132,39 +135,88 @@ Select the Mali by UUID; the second Vulkan device is llvmpipe. Compile with
 `--iree-hal-target-device=vulkan --iree-vulkan-target=valhall3` (G610 is in the
 G710 family).
 
-## 5. What is still open
+## 5. The combined compiler (landed 2026-11-27)
 
-**The compiler split is the blocker.** Our own `libIREECompiler.so` carries the
-rocket plugin but is configured `IREE_TARGET_BACKEND_VULKAN_SPIRV=OFF`; the
-official `iree-base-compiler==3.14.0` wheel -- the *same* IREE commit as our
-pin -- has vulkan-spirv but no rocket plugin. Every vmfb on the board so far
-came from the wheel. So no single compiler can yet emit a module naming both
-backends.
-
-There is no shortcut through dynamic plugins: the rocket plugin is registered
-as a *static* CMake plugin, and IREE's dynamically-loaded-plugin mechanism is
-experimental and off in our build (`IREE_EXPERIMENTAL_COMPILER_DYNAMIC_PLUGINS=OFF`).
-Whether the wheel was built with it on has not been checked, but the plugin
-would need a dynamic build either way. One combined compiler is the route.
-
-That build is in progress (scratchpad, not `iree-build/build`, which is stale
-against its own sources and would trigger a ~7400-step rebuild of the compiler
-everything else depends on). Its configure already settles the structural
-question -- both register side by side:
+The split was only ever our build configuration. Configuring `iree-src` with
+`IREE_TARGET_BACKEND_VULKAN_SPIRV=ON` alongside
+`IREE_CMAKE_PLUGIN_PATHS=<worktree>/rocket-compiler-plugin` registers both as
+static plugins, and the build (8144 steps, 51m35s on 16 cores, no ccache)
+yields one `libIREECompiler.so` plus `iree-compile` that reports:
 
 ```
--- Registering static linked compiler plugin 'hal_target_vulkan_spirv' (...VulkanSPIRV::VulkanSPIRV)
--- Registering static linked compiler plugin 'hal_target_rocket'       (...target::Rocket::Rocket)
+Registered target backends:
+  llvm-cpu   rocket   vmvx   vmvx-inline   vulkan-spirv
 ```
 
-Still unanswered after it lands:
+Built into a scratch tree, **not** `iree-build/build`, which is stale against
+its own sources and would trigger a ~7400-step rebuild of the compiler
+everything else depends on. There is no shortcut through dynamic plugins: the
+rocket plugin is registered statically, and IREE's dynamically-loaded-plugin
+mechanism is experimental and off in our build
+(`IREE_EXPERIMENTAL_COMPILER_DYNAMIC_PLUGINS=OFF`), so the stock wheel cannot
+be taught the rocket target. One combined build is the route.
 
-1. **A genuinely mixed module.** Having both backends available is not the same
-   as targeting both: that needs IREE multi-device targeting and device
-   affinities, which is separate work.
-2. **Any performance number.** The spike has measured correctness only, on an
-   add and one matmul shape. No GPU-vs-NPU-vs-CPU comparison exists, and the
-   devfreq must be pinned before one is quoted.
+### It is a drop-in for the wheel on the Vulkan side
+
+`smoke.mlir` compiled by *our* build, run on the Mali through the patched
+runtime, against the CPU references and against the wheel-compiled vmfbs:
+
+| Case | vs CPU | vs wheel-compiled vmfb |
+|---|---|---|
+| `@add`, 1048576 f32 | 0 elements over 1e-5, 0 stale inputs, max\|err\| 9.54e-7 | -- |
+| `@mm`, f32 | **bit-identical** (0 of 98304 differ) | **bit-identical** |
+| `@mm16`, f16 | not bit-exact: 5415 of 98304 differ (5.5%), max\|err\| 2^-10 | **bit-identical** |
+
+Both matmuls match the wheel bit for bit, so adding the rocket plugin
+perturbs vulkan-spirv codegen not at all.
+
+> **Correction to an earlier shorthand.** "f16 matmul within 1 ulp of the CPU"
+> is loose and should not be used as a gate. All values lie in [0, 1.006], and
+> the worst absolute disagreement is 2^-10 -- one f16 step at the *top* of that
+> range. But 3394 elements differ by more than one step at their *own*
+> magnitude, concentrated where the 512-long dot product cancels toward zero.
+> That is a different accumulation order, not a defect, and since our output is
+> bit-identical to the wheel's it is inherent to the vulkan-spirv lowering
+> rather than to this build. f32 *is* bit-exact; do not expect it at f16.
+
+### The rocket backend is reached, and refuses this module by design
+
+`--iree-hal-target-device=rocket` on `smoke.mlir` exits 74 with the backend's
+own diagnostic:
+
+```
+'hal.executable.variant' op rocket backend v1 only supports hand-spliced
+conv2d dispatches; executable target config is missing required key 'input_width'
+```
+
+That is the expected refusal, and it confirms the plugin is registered and
+reached: the NPU path is driven by rocket-compiler's two-stage pin/claim flow
+over conv dispatches, not by handing arbitrary elementwise or matmul IR to the
+backend.
+
+### Trap: a two-device compile can be silently single-device
+
+```
+--iree-hal-target-device=gpu=vulkan --iree-hal-target-device=npu=rocket
+```
+
+**exits 0** -- and produces a module with no rocket in it whatsoever.
+`--compile-to=hal` shows one device global (`@gpu`), zero occurrences of
+`rocket`, and only `vulkan-spirv` executable targets: with no affinities every
+dispatch goes to the first device and the second is dropped silently. So exit 0
+from a multi-device flag line is **not** evidence of a mixed module.
+
+(A second false friend while checking this: grepping the IR for `npu` matches
+inside `input`. Grep for the backend name, not the device name.)
+
+## 6. What is still open
+
+1. **A genuinely mixed module.** Needs explicit device affinities *and*
+   rocket-compiler's hand-spliced conv dispatches -- both, per the two findings
+   above. Having the backends in one compiler was the cheap half.
+2. **Any performance number.** Correctness only, on an add and one matmul
+   shape. No GPU-vs-NPU-vs-CPU comparison exists, and the devfreq must be
+   pinned before one is quoted.
 3. **Whether the GPU is worth it for what the NPU refuses.** The actual payoff
    question, and entirely untouched.
 4. `iree-lld` is absent from a fresh build tree, so an LLVMCPU arm needs
@@ -175,9 +227,14 @@ Still unanswered after it lands:
 The original smoke MLIR was lost with an ephemeral scratchpad. The shapes were
 recovered from the `.bin` files still in `~/vk`: solving the three file sizes
 gives 256x512 * 512x384 for the matmuls and 1048576 elements for the add, and
-`cmp.py`'s reference is `a*b+a`. A rebuilt `smoke.mlir` with `@add`, `@mm` and
-`@mm16` therefore compares against the identical reference the wheel-compiled
-vmfbs were judged by.
+`cmp.py`'s reference is `a*b+a`. The rebuilt `smoke.mlir` with `@add`, `@mm`
+and `@mm16` therefore compares against the identical reference the
+wheel-compiled vmfbs were judged by -- which is what makes the "bit-identical
+to the wheel" rows in section 5 meaningful.
+
+It has now been lost once; **the rebuilt module and the compiler configure line
+belong in the repo** rather than in a scratch directory, if this spike goes any
+further.
 
 Pass inputs as raw `.bin` with an explicit type (`--input=1048576xf32=@a.bin`),
 never `@x.npy` -- IREE reads an npy as raw bytes and shifts the tensor.
