@@ -38,8 +38,8 @@ use crate::{
         iree_hal_semaphore_compatibility_t, iree_hal_semaphore_flags_t, iree_hal_semaphore_list_t,
         iree_hal_semaphore_t, iree_hal_topology_edge_t, iree_hal_update_flags_t,
         iree_hal_write_flags_t, iree_host_size_t, iree_io_file_handle_t,
-        iree_status_code_e_IREE_STATUS_DEADLINE_EXCEEDED, iree_status_code_e_IREE_STATUS_INTERNAL,
-        iree_status_code_e_IREE_STATUS_INVALID_ARGUMENT,
+        iree_status_code_e_IREE_STATUS_DEADLINE_EXCEEDED, iree_status_code_e_IREE_STATUS_DEFERRED,
+        iree_status_code_e_IREE_STATUS_INTERNAL, iree_status_code_e_IREE_STATUS_INVALID_ARGUMENT,
         iree_status_code_e_IREE_STATUS_UNAVAILABLE, iree_status_t, iree_string_view_t,
         iree_timeout_t, iree_timeout_type_e_IREE_TIMEOUT_ABSOLUTE,
     },
@@ -368,6 +368,9 @@ pub struct RocketDevice {
     /// The NPU worker threads every `queue_execute` hands its command buffer
     /// to. Context 0 is a dup of `file`; see `pool.rs`.
     pool: crate::pool::WorkerPool,
+    /// The slab provider and notification explicit `iree_hal_pool_t`s are
+    /// built from, created by the first `query_queue_pool_backend`.
+    pool_backend: Mutex<Option<crate::pool_backend::PoolBackend>>,
 }
 
 // The dwell once kept between a depthwise completion and the next dense
@@ -677,6 +680,7 @@ pub unsafe fn create(
         topology_info: unsafe { std::mem::zeroed() },
         dpu_hazard: Mutex::new(DpuHazard::default()),
         pool,
+        pool_backend: Mutex::new(None),
     });
     let device_ptr = Box::into_raw(device) as *mut iree_hal_device_t;
     // Chicken-and-egg: the allocator needs to know its owning device (see
@@ -708,6 +712,9 @@ unsafe extern "C" fn destroy(device: *mut iree_hal_device_t) {
     crate::weight_cache::clear();
     unsafe {
         let d = &*cast(device);
+        // Pools hold their own references; this drops the device's, while
+        // the proactor the notification was created on is still alive.
+        drop(d.pool_backend.lock().unwrap().take());
         crate::bindings::iree_hal_allocator_release(d.device_allocator);
         crate::bindings::iree_async_proactor_pool_release(d.proactor_pool);
         drop(Box::from_raw(cast(device)));
@@ -956,11 +963,40 @@ unsafe extern "C" fn query_semaphore_compatibility(
     iree_hal_semaphore_compatibility_bits_t_IREE_HAL_SEMAPHORE_COMPATIBILITY_ALL
 }
 
-status_stub!(query_queue_pool_backend(
+/// The backend explicit pools are built from (`pool_backend.rs`). The device
+/// has one queue, bit 0; an affinity naming none of it is a queue that does
+/// not exist, which callers detect by this `INVALID_ARGUMENT`.
+unsafe extern "C" fn query_queue_pool_backend(
     device: *mut iree_hal_device_t,
     queue_affinity: iree_hal_queue_affinity_t,
     out_backend: *mut iree_hal_queue_pool_backend_t,
-) -> iree_status_t);
+) -> iree_status_t {
+    if queue_affinity & 1 == 0 {
+        return status::from_code(iree_status_code_e_IREE_STATUS_INVALID_ARGUMENT);
+    }
+    let d = unsafe { &*cast(device) };
+    let mut backend = d.pool_backend.lock().unwrap();
+    if backend.is_none() {
+        match unsafe { crate::pool_backend::PoolBackend::create(d.device_allocator, d.proactor) } {
+            Ok(created) => *backend = Some(created),
+            Err(st) => return st,
+        }
+    }
+    let backend = backend.as_ref().unwrap();
+    unsafe {
+        *out_backend = iree_hal_queue_pool_backend_t {
+            slab_provider: backend.slab_provider,
+            notification: backend.notification,
+            // Every reservation is released with a null death frontier
+            // (`pool_backend.rs`), so there is no epoch to ask about.
+            epoch_query: crate::bindings::iree_hal_pool_epoch_query_t {
+                fn_: None,
+                user_data: std::ptr::null_mut(),
+            },
+        };
+    }
+    status::ok()
+}
 
 #[allow(unused_variables)]
 unsafe extern "C" fn queue_alloca(
@@ -974,14 +1010,38 @@ unsafe extern "C" fn queue_alloca(
     flags: iree_hal_alloca_flags_t,
     out_buffer: *mut *mut iree_hal_buffer_t,
 ) -> iree_status_t {
-    if !pool.is_null() {
-        // Real pooling (TLSF/FixedBlock/Passthrough pool backends, cross-
-        // queue wait-frontier semantics, ...) isn't implemented -- every
-        // direct (pool=NULL) allocation below is. See device.rs's task
-        // list.
-        return status::unimplemented();
-    }
     let d = unsafe { &*cast(device) };
+    if !pool.is_null() && allocation_size != 0 {
+        // From the caller's pool (`pool_backend.rs`). The storage may come
+        // later than this call when the pool is exhausted; the signal waits
+        // for both it and wait_semaphore_list. A zero-byte request has
+        // nothing to reserve and takes the direct path below.
+        let mut params = params;
+        if params.queue_affinity == 0 {
+            params.queue_affinity = 1;
+        }
+        let mut owned_wait = unsafe { OwnedSemaphoreList::new(wait_semaphore_list) };
+        let mut owned_signal = unsafe { OwnedSemaphoreList::new(signal_semaphore_list) };
+        return unsafe {
+            crate::pool_backend::alloca(
+                device,
+                d.device_allocator,
+                pool,
+                params,
+                allocation_size,
+                out_buffer,
+                move |_buffer, committed| {
+                    if !committed.is_null() {
+                        fail_all(owned_signal.as_list(), committed);
+                        return status::ok();
+                    }
+                    run_after_wait(owned_wait.as_list(), owned_signal.as_list(), |_sig| {
+                        status::ok()
+                    })
+                },
+            )
+        };
+    }
     // The real allocation has no data dependency on wait_semaphore_list
     // (nothing has read/written through the new buffer yet), so unlike
     // every other queue_* op here it's safe -- and necessary -- to do
@@ -1027,6 +1087,12 @@ unsafe extern "C" fn queue_dealloca(
             // responsible for eventually releasing `buffer`; this only
             // makes further queue ops against it correctly fail.
             crate::buffer::mark_deallocated(buffer);
+            // A pooled buffer's bytes go back to its pool now, not at
+            // destroy: the caller may hold the buffer long after, and a
+            // queue_alloca parked on the exhausted pool is waiting for them.
+            // Every op that used them is done -- they were all in this
+            // dealloca's wait list.
+            crate::pool_backend::release_reservation(buffer);
             crate::bindings::iree_hal_buffer_release(buffer);
             status::ok()
         })
@@ -1258,11 +1324,13 @@ unsafe extern "C" fn queue_write(
     }
 }
 
-// Blocking mode only (IREE_HAL_HOST_CALL_FLAG_NONE) -- deferred/async
-// callbacks (a callback returning IREE_STATUS_DEFERRED and signaling the
-// cloned signal_semaphore_list itself later) aren't implemented. Neither
-// mode may block on wait_semaphore_list itself (see run_after_wait's doc
-// comment) -- deferred here too, when the wait isn't already satisfied.
+// A callback may return IREE_STATUS_DEFERRED: it has cloned the context's
+// signal_semaphore_list and will signal it itself, so this driver leaves the
+// list alone. Neither mode may block on wait_semaphore_list itself (see
+// run_after_wait's doc comment) -- deferred here too, when the wait isn't
+// already satisfied. On the deferred path the list the callback sees is this
+// driver's owned copy, whose semaphores stay retained until the callback
+// returns; a DEFERRED callback must retain what it keeps, as CTS's does.
 #[allow(unused_variables)]
 unsafe extern "C" fn queue_host_call(
     device: *mut iree_hal_device_t,
@@ -1358,6 +1426,12 @@ unsafe extern "C" fn queue_host_call(
             unsafe { (f.into_inner())(user_data.into_inner(), args_buf.as_ptr(), &mut context) };
         if result.is_null() {
             unsafe { signal_all(sig) }
+        } else if status::code(result) == iree_status_code_e_IREE_STATUS_DEFERRED {
+            // An asynchronous callback: it has taken (retained) the signal
+            // list from its context and signals it itself, later. Ours is
+            // done -- signaling or failing here would race it.
+            unsafe { crate::bindings::iree_status_free(result) };
+            status::ok()
         } else {
             unsafe { fail_all(sig, result) };
             status::ok()

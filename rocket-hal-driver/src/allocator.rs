@@ -178,6 +178,29 @@ unsafe extern "C" fn query_buffer_compatibility(
         | iree_hal_buffer_compatibility_bits_t_IREE_HAL_BUFFER_COMPATIBILITY_QUEUE_DISPATCH
 }
 
+/// The memory type every buffer this driver hands out really has: a CREATE_BO
+/// allocation is host-mapped and NPU-visible, whatever was asked for. See
+/// `allocate_buffer` for why the OPTIMAL placeholder must not survive.
+pub(crate) fn host_mapped_memory_type(
+    requested: crate::bindings::iree_hal_memory_type_t,
+) -> crate::bindings::iree_hal_memory_type_t {
+    (requested & !iree_hal_memory_type_bits_t_IREE_HAL_MEMORY_TYPE_OPTIMAL)
+        | iree_hal_memory_type_bits_t_IREE_HAL_MEMORY_TYPE_HOST_VISIBLE
+        | iree_hal_memory_type_bits_t_IREE_HAL_MEMORY_TYPE_DEVICE_VISIBLE
+}
+
+/// The usage every buffer this driver hands out can honour: the requested
+/// bits plus every host-mapping mode, since the BO is permanently mmap'd.
+/// See `allocate_buffer`.
+pub(crate) fn host_mapped_usage(
+    requested: crate::bindings::iree_hal_buffer_usage_t,
+) -> crate::bindings::iree_hal_buffer_usage_t {
+    requested
+        | iree_hal_buffer_usage_bits_t_IREE_HAL_BUFFER_USAGE_MAPPING_SCOPED
+        | iree_hal_buffer_usage_bits_t_IREE_HAL_BUFFER_USAGE_MAPPING_PERSISTENT
+        | iree_hal_buffer_usage_bits_t_IREE_HAL_BUFFER_USAGE_MAPPING_ACCESS_RANDOM
+}
+
 unsafe extern "C" fn allocate_buffer(
     allocator: *mut iree_hal_allocator_t,
     params: *const iree_hal_buffer_params_t,
@@ -202,10 +225,7 @@ unsafe extern "C" fn allocate_buffer(
     // DEVICE_VISIBLE" (PERMISSION_DENIED) the first time a real workgroup
     // count made it reach validation at all. Canonicalize here too, same
     // concrete bits query_buffer_compatibility above now sets.
-    let mut memory_type = params.type_;
-    memory_type &= !iree_hal_memory_type_bits_t_IREE_HAL_MEMORY_TYPE_OPTIMAL;
-    memory_type |= iree_hal_memory_type_bits_t_IREE_HAL_MEMORY_TYPE_HOST_VISIBLE
-        | iree_hal_memory_type_bits_t_IREE_HAL_MEMORY_TYPE_DEVICE_VISIBLE;
+    let memory_type = host_mapped_memory_type(params.type_);
 
     // Same real-hardware truth as query_buffer_compatibility above (and this
     // function's own memory_type canonicalization just above): every buffer
@@ -223,10 +243,7 @@ unsafe extern "C" fn allocate_buffer(
     // requires MAPPING_PERSISTENT" -- because this allocator never granted
     // it, unlike every other local device's heap allocator (allocator_heap.c)
     // already does automatically.
-    let usage = params.usage
-        | iree_hal_buffer_usage_bits_t_IREE_HAL_BUFFER_USAGE_MAPPING_SCOPED
-        | iree_hal_buffer_usage_bits_t_IREE_HAL_BUFFER_USAGE_MAPPING_PERSISTENT
-        | iree_hal_buffer_usage_bits_t_IREE_HAL_BUFFER_USAGE_MAPPING_ACCESS_RANDOM;
+    let usage = host_mapped_usage(params.usage);
 
     // Same 0-byte guard as query_buffer_compatibility (real apps -- and
     // CTS's AllocatorTest.AllocateEmptyBuffer -- hit this): unlike that
@@ -258,6 +275,7 @@ unsafe extern "C" fn allocate_buffer(
         // `BufferCache::take` allocates and maps whole pages.
         mapped_bytes: raw.size,
         cache: std::sync::Arc::clone(&alloc.cache),
+        backing: crate::buffer::Backing::Owned,
     });
     let buffer_ptr = Box::into_raw(buffer);
 

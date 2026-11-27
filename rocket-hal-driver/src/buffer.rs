@@ -70,10 +70,56 @@ pub struct RocketBuffer {
     pub mapped_bytes: usize,
     /// Where `destroy` returns the GEM object (`buffer_cache.rs`).
     pub cache: std::sync::Arc<crate::buffer_cache::BufferCache>,
+    /// Who owns the GEM object behind `handle` -- see [`Backing`].
+    pub backing: Backing,
+}
+
+/// Who owns the GEM object a `RocketBuffer` names, which decides what
+/// `destroy` does with it.
+///
+/// Every buffer the allocator hands out owns its own BO. The other two exist
+/// for explicit `iree_hal_pool_t`s (`pool_backend.rs`): a pool carves its
+/// reservations out of slabs, each slab one owned BO, and both kinds below
+/// are windows into a slab -- `handle` is the slab's, `dma_address` and
+/// `host_ptr` are offset into it. They stay `RocketBuffer`s, not IREE
+/// subspans, because the dispatch path casts a binding's buffer straight to
+/// `RocketBuffer` to read its DMA address.
+pub enum Backing {
+    /// The allocator's: `destroy` returns the BO to `cache`.
+    Owned,
+    /// A slab provider's `wrap_buffer` result: `parent` is the slab's own
+    /// (retained) buffer, `release` the pool's callback, run on destroy.
+    SlabView {
+        parent: *mut iree_hal_buffer_t,
+        release: crate::bindings::iree_hal_buffer_release_callback_t,
+    },
+    /// What `queue_alloca` returns for an explicit pool. The pool may be
+    /// exhausted when the call is made, so the storage can arrive later --
+    /// see [`crate::pool_backend::Pooled`].
+    Pooled(Box<crate::pool_backend::Pooled>),
 }
 
 unsafe fn cast(buffer: *mut iree_hal_buffer_t) -> *mut RocketBuffer {
     buffer as *mut RocketBuffer
+}
+
+/// Whether `buffer` is a pooled allocation whose storage has not arrived yet
+/// -- a `queue_alloca` against an exhausted pool that is still waiting for a
+/// reservation. Such a buffer has no address: nothing may record it into a
+/// dispatch or map it until its alloca signal fires.
+///
+/// # Safety
+///
+/// `buffer` must be a valid, non-null pointer to a live `RocketBuffer`.
+pub unsafe fn is_pending(buffer: *mut iree_hal_buffer_t) -> bool {
+    match unsafe { &(*cast(buffer)).backing } {
+        Backing::Pooled(pooled) => !pooled.is_committed(),
+        _ => false,
+    }
+}
+
+fn pending_status() -> iree_status_t {
+    status::from_code(crate::bindings::iree_status_code_e_IREE_STATUS_FAILED_PRECONDITION)
 }
 
 /// Not part of the vtable -- `device::queue_dealloca`/`queue_fill`/
@@ -216,20 +262,41 @@ unsafe extern "C" fn destroy(buffer: *mut iree_hal_buffer_t) {
     // Before the allocation goes away, so no later buffer landing on this
     // address can inherit its packed coefficients -- see `weight_cache`.
     crate::weight_cache::forget(buffer);
-    let buffer = unsafe { Box::from_raw(cast(buffer)) };
-    // The GEM object goes back to the allocator's cache, which keeps it for
-    // the next allocation of its size or releases both of its references
-    // (the mapping and the handle) -- by the mapping's real length, which
-    // `allocation_size` is not: munmapping that leaves the tail page mapped,
-    // and the VMA alone keeps the GEM object and its IOVA alive.
-    unsafe {
-        buffer.cache.give(device::Buffer {
-            handle: buffer.handle,
-            dma_address: buffer.dma_address,
-            size: buffer.mapped_bytes,
-            host_ptr: buffer.host_ptr,
-        })
-    };
+    let rb = unsafe { Box::from_raw(cast(buffer)) };
+    let RocketBuffer {
+        handle,
+        dma_address,
+        host_ptr,
+        mapped_bytes,
+        cache,
+        backing,
+        ..
+    } = *rb;
+    match backing {
+        // The GEM object goes back to the allocator's cache, which keeps it
+        // for the next allocation of its size or releases both of its
+        // references (the mapping and the handle) -- by the mapping's real
+        // length, which `allocation_size` is not: munmapping that leaves the
+        // tail page mapped, and the VMA alone keeps the GEM object and its
+        // IOVA alive.
+        Backing::Owned => unsafe {
+            cache.give(device::Buffer {
+                handle,
+                dma_address,
+                size: mapped_bytes,
+                host_ptr,
+            })
+        },
+        // The slab owns the BO. The pool's callback returns the
+        // reservation, then the slab loses this view's reference.
+        Backing::SlabView { parent, release } => unsafe {
+            if let Some(f) = release.fn_ {
+                f(release.user_data, buffer);
+            }
+            crate::bindings::iree_hal_buffer_release(parent);
+        },
+        Backing::Pooled(pooled) => unsafe { (*pooled).destroy() },
+    }
 }
 
 #[allow(unused_variables)]
@@ -241,6 +308,9 @@ unsafe extern "C" fn map_range(
     local_byte_length: iree_device_size_t,
     mapping: *mut iree_hal_buffer_mapping_t,
 ) -> iree_status_t {
+    if unsafe { is_pending(buffer) } {
+        return pending_status();
+    }
     let rb = unsafe { &*cast(buffer) };
     unsafe {
         (*mapping).contents = iree_byte_span_t {
@@ -309,6 +379,9 @@ unsafe extern "C" fn invalidate_range(
     local_byte_offset: iree_device_size_t,
     local_byte_length: iree_device_size_t,
 ) -> iree_status_t {
+    if unsafe { is_pending(buffer) } {
+        return pending_status();
+    }
     let rb = unsafe { &*cast(buffer) };
     // "Writes on the device are expected to be visible to the host after
     // this returns" -- PREP_BO's real semantics (rocket_gem.c waits on
@@ -332,6 +405,9 @@ unsafe extern "C" fn flush_range(
     local_byte_offset: iree_device_size_t,
     local_byte_length: iree_device_size_t,
 ) -> iree_status_t {
+    if unsafe { is_pending(buffer) } {
+        return pending_status();
+    }
     let rb = unsafe { &*cast(buffer) };
     // "Writes on the host are expected to be visible to the device after
     // this returns" -- FINI_BO's real semantics (signals CPU access is

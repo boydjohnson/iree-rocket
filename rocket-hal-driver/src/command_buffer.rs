@@ -2472,6 +2472,18 @@ unsafe extern "C" fn dispatch_impl(
         let _ = r;
         return status::from_code(crate::bindings::iree_status_code_e_IREE_STATUS_UNIMPLEMENTED);
     }
+    // A queue_alloca from an exhausted explicit pool hands back its buffer
+    // before the storage exists (`pool_backend.rs`); its address is not
+    // known yet, and the regcmd is built now, so it cannot be recorded until
+    // its alloca has signaled.
+    if refs
+        .iter()
+        .any(|r| unsafe { crate::buffer::is_pending(r.buffer) })
+    {
+        return status::from_code(
+            crate::bindings::iree_status_code_e_IREE_STATUS_FAILED_PRECONDITION,
+        );
+    }
 
     // `r.offset` is the byte offset of this binding WITHIN its underlying
     // buffer -- always 0 in every hand-driven CTS test so far (each of
