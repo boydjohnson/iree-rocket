@@ -1898,7 +1898,8 @@ model (ORT computes it correctly) and not in this backend (the NPU is not in
 the picture; with offload on, the NPU arm is bit-identical to this same wrong
 CPU arm, which is how the fault was isolated).
 
-Both graphs were preprocessed identically per README "ONNX models": all four
+Both graphs were preprocessed identically per developer-tools.md "ONNX
+models": all four
 `dim_param`s pinned (`batch_size` 1, `num_channels` 3, `height`/`width` 224 --
 ViT is unusual in leaving all four symbolic, not just batch), `value_info`
 cleared, `shape_inference.infer_shapes` re-run, `checker.check_model` clean.
@@ -2496,9 +2497,9 @@ So the dwell is opt-in (`ROCKET_QUIESCE_DEPTHWISE=1`, which replaces
 `ROCKET_QUIESCE_OFF`). ConvNeXt-T fp16 ABAB on cpu 4-7, same `.vmfb`:
 104/102/103 -> 93.1/93.5/93.8 ms, 0 timeouts. The fp16 MobileNetV2 depthwise
 arm paid the same 17 ms per inference (P7). What stays open is whether a conv
-can retire on a PPU bit (docs/open-questions.md 1.1.2); the campaign shows
-only that no transition this driver makes exhibits the hazard. Gates: the
-campaign (500 rounds by default), compiled e2e 54/54 incl. the `mixed_*`
+can retire on a PPU bit (agent-docs/open-questions.md 1.1.2); the campaign
+shows only that no transition this driver makes exhibits the hazard. Gates:
+the campaign (500 rounds by default), compiled e2e 54/54 incl. the `mixed_*`
 transition cases.
 
 **ConvNeXt's 7x7 depthwise convolutions on the NPU — 2026-11-24.
@@ -3586,7 +3587,7 @@ bisection (10.94 -> 3.94 items/s on deleting just those two
 `apply_registered_pass` lines). `rocket-compiler --no-offload` now builds the
 like-for-like arm and refuses to emit a spec that would offload anyway; its
 output is bit-identical to the hand-edited builds it replaces. Commits
-`411b7cc`, `df07d56`; README "The CPU-only baseline"; memory
+`411b7cc`, `df07d56`; developer-tools.md "The CPU-only baseline"; memory
 `nhwc-cpu-baseline-trap`. The numbers it produced are in P8.
 
 **C8 (S1) — 2026-09-05. An int8 dispatch hung the next fp16 one.** The cause

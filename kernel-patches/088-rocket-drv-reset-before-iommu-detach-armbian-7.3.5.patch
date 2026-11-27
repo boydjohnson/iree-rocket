@@ -1,0 +1,114 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: gregordinary <33880035+gregordinary@users.noreply.github.com>
+Date: Fri, 31 Jul 2026 08:00:00 +0000
+Subject: [PATCH] rocket: reset the NPU before detaching its IOMMU domain
+
+rocket_reset() detaches the core's IOMMU group and only then asserts the
+core's resets.  It is entered because the core is wedged -- the one
+caller that a client can reach is rocket_job_timedout() -- so the detach
+runs against an NPU that is still mid-DMA, with an unacknowledged fault
+sitting in its MMU.
+
+rk_iommu cannot stall a bank in that state.  Detaching therefore ends in
+
+  rk_iommu fdab9000.iommu: Enable stall request timed out, status: 0x00001d
+  rk_iommu fdab9000.iommu: Enable stall request timed out, status: 0x00018b
+
+one dev_err per MMU bank, on every faulting job.  Those come from
+rk_iommu_disable(), which ignores the error and carries on -- but the
+same handshake runs again inside rk_iommu_enable() when the IOMMU core
+puts the group back on its default domain, and there its failure is
+returned.  __iommu_group_set_core_domain() turns that into
+
+  WARNING: drivers/iommu/iommu.c at __iommu_group_set_core_domain
+   iommu_detach_group / rocket_reset.part.0 [rocket] / rocket_job_timedout
+
+which is a taint and a backtrace, and a panic on a kernel booted with
+panic_on_warn.  drm_rocket_task.regcmd is a raw NPU IOVA that
+rocket_job_hw_submit() writes into the PC block unvalidated, and
+/dev/accel/accel0 is group `render`, so an unprivileged client reaches
+this by pointing one field at an unmapped address.
+
+Reset the core first.  The reset quiesces the master and wipes the MMU
+page-table base -- which is already why the domain has to be dropped at
+all -- so by the time the group is detached the handshake has something
+it can stall, and it completes.
+
+The detach moves out of the job_lock scope with it.  That lock covers
+in_flight_job, which the IRQ path also touches; core->attached_domain is
+written only from the drm_sched run/reset path, and drm_sched_stop()
+above has already fenced off run_job for this core (the serialisation
+083 documents at the other write site).
+
+VERIFIED ON RK3588 SILICON (Turing RK1, 7.1.1, rocket 081-087 built
+out-of-tree).  Thirty client-requested DMA faults per arm --
+tests/uapi_regcmd_fault_rocket in both its read and write modes, fifteen
+rounds each, over two independent A/B rounds -- give thirty "NPU job
+timed out" on either module.  On the unpatched one they also give **60
+stall timeouts**, exactly two per fault, one per MMU bank; on the
+patched one, **zero**, with the thirty job timeouts unchanged.  83 of 83
+ctest entries pass on the patched module and the taint word does not
+move.
+
+The WARN itself is intermittent -- it needs the second handshake, the
+one behind the default domain, to fail as well -- and it did not fire in
+either arm of this A/B.  What is measured here is the failing handshake
+it is downstream of, which this removes outright.
+
+rocket_core_fini() detaches without a reset too, but that path tears the
+core down after rocket_job_fini() has drained the scheduler, so there is
+no wedged job to stall behind and it is left alone.
+
+This is mainline code.  The RK3576 reaches the same detach and produces
+the same rk_iommu stall lines, but not the WARNING -- the two parts
+differ in the consequence rather than in the trigger -- so this is
+carried as an RK3588 patch and the RK3576 series does not need it.
+
+Signed-off-by: gregordinary <33880035+gregordinary@users.noreply.github.com>
+
+[Boyd Johnson: rebased for iree-rocket onto Armbian 7.3.5-edge-rockchip64,
+ 2026-11-23. Original: gregordinary/patches
+ rocket/088-rocket-drv-reset-before-iommu-detach.patch.]
+---
+ drivers/accel/rocket/rocket_job.c | 20 +++++++++++++++++---
+ 1 file changed, 17 insertions(+), 3 deletions(-)
+
+diff --git a/drivers/accel/rocket/rocket_job.c b/drivers/accel/rocket/rocket_job.c
+index c354217..2fc74e7 100644
+--- a/drivers/accel/rocket/rocket_job.c
++++ b/drivers/accel/rocket/rocket_job.c
+@@ -492,14 +492,28 @@ rocket_reset(struct rocket_core *core, struct drm_sched_job *bad)
+ 		if (core->in_flight_job)
+ 			pm_runtime_put_autosuspend(core->dev);
+ 
+-		iommu_detach_group(NULL, core->iommu_group);
+-
+ 		core->in_flight_job = NULL;
+ 	}
+ 
+-	/* Proceed with reset now. */
++	/*
++	 * Reset the NPU before touching its IOMMU (088). A reset is entered
++	 * because the core is wedged -- typically mid-DMA -- and detaching the
++	 * group while it still is makes the rk_iommu stall handshake time out
++	 * ("Enable stall request timed out" / "Disable paging request timed
++	 * out", then a WARN in the IOMMU core). The likely worse half: the
++	 * failed detach can leave paging live on the old page table while the
++	 * job's fence signals and userspace frees the job's buffers, so DMA
++	 * still in flight can land in pages the kernel has reused. Seen on
++	 * 7.3.5 as page-table corruption in the submitting process right after
++	 * a burst of these timeouts (free_pgtables WARN, then an Oops in
++	 * exit_mmap).
++	 */
+ 	rocket_core_reset(core);
+ 
++	/* The reset wiped the IOMMU page-table base; detach to force re-attach. */
++	scoped_guard(mutex, &core->job_lock)
++		iommu_detach_group(NULL, core->iommu_group);
++
+ 	/* NPU has been reset, we can clear the reset pending bit. */
+ 	atomic_set(&core->reset.pending, 0);
+ 
+-- 
+2.43.0
+
