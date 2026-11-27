@@ -1,0 +1,372 @@
+Format: https://www.debian.org/doc/packaging-manuals/copyright-format/1.0/
+Upstream-Name: iree-rocket
+Upstream-Contact: Boyd Johnson <boyd@boundarybit.io>
+Source: https://github.com/boydjohnson/iree-rocket
+Comment:
+ The orig tarball is assembled by debian/make-orig.sh: this repository, the
+ IREE submodule (iree-build/iree-src) with only the five of its own
+ submodules the compiler build uses (llvm-project, torch-mlir without its
+ nested externals, flatcc, benchmark, googletest), and the Rust crates
+ vendored under vendor/. The stanzas below cover the top-level license of
+ each of those trees. LLVM and IREE carry a few further files under other
+ permissive licenses (see their own LICENSE and NOTICE files); run
+ licensecheck over the unpacked orig tarball before submitting this
+ anywhere that audits it file by file.
+
+Files: *
+Copyright: 2025-2026 Boyd Johnson <boyd@boundarybit.io>
+License: Apache-2.0 with LLVM exception
+
+Files: rocket-compiler/vendor/iree-headers/*
+ iree-build/iree-src/*
+Copyright: The IREE Authors
+License: Apache-2.0 with LLVM exception
+
+Files: iree-build/iree-src/third_party/llvm-project/*
+Copyright: LLVM Project contributors
+License: Apache-2.0 with LLVM exception
+
+Files: iree-build/iree-src/third_party/torch-mlir/*
+Copyright: Torch-MLIR Project contributors
+License: Apache-2.0 with LLVM exception
+
+Files: iree-build/iree-src/third_party/flatcc/*
+Copyright: 2015 Mikkel F. Jørgensen, dvide.com
+License: Apache-2.0
+
+Files: iree-build/iree-src/third_party/benchmark/*
+Copyright: 2015 Google Inc.
+License: Apache-2.0
+
+Files: iree-build/iree-src/third_party/googletest/*
+Copyright: 2008 Google Inc.
+License: BSD-3-clause
+
+Files: iree-build/iree-src/third_party/dlmalloc/*
+Copyright: 2023 Doug Lea
+License: MIT-0
+
+Files: iree-build/iree-src/third_party/nccl/*
+Copyright: 2015-2020 NVIDIA CORPORATION
+License: BSD-3-clause
+
+Files: iree-build/iree-src/third_party/rccl/*
+Copyright: 2015-2020 NVIDIA CORPORATION
+ 2019-2023 Advanced Micro Devices, Inc.
+ Microsoft Corporation
+License: BSD-3-clause and Expat
+
+Files: iree-build/iree-src/third_party/nvidia_sdk_download/*
+Copyright: 2021 NVIDIA Corporation
+License: Expat
+
+Files: iree-build/iree-src/third_party/renderdoc/*
+Copyright: 2015-2022 Baldur Karlsson
+ 2014 Crytek
+License: Expat
+
+Files: debian/*
+Copyright: 2026 Boyd Johnson <boyd@boundarybit.io>
+License: Apache-2.0 with LLVM exception
+
+Files:
+ vendor/anstream
+ vendor/anstream-*
+ vendor/anstyle
+ vendor/anstyle-*
+ vendor/anstyle-parse
+ vendor/anstyle-parse-*
+ vendor/anstyle-query
+ vendor/anstyle-query-*
+ vendor/anstyle-wincon
+ vendor/anstyle-wincon-*
+ vendor/bitflags
+ vendor/bitflags-*
+ vendor/cc
+ vendor/cc-*
+ vendor/cexpr
+ vendor/cexpr-*
+ vendor/cfg-if
+ vendor/cfg-if-*
+ vendor/clap
+ vendor/clap-*
+ vendor/clap_builder
+ vendor/clap_builder-*
+ vendor/clap_derive
+ vendor/clap_derive-*
+ vendor/clap_lex
+ vendor/clap_lex-*
+ vendor/colorchoice
+ vendor/colorchoice-*
+ vendor/either
+ vendor/either-*
+ vendor/find-msvc-tools
+ vendor/find-msvc-tools-*
+ vendor/glob
+ vendor/glob-*
+ vendor/heck
+ vendor/heck-*
+ vendor/is_terminal_polyfill
+ vendor/is_terminal_polyfill-*
+ vendor/itertools
+ vendor/itertools-*
+ vendor/itoa
+ vendor/itoa-*
+ vendor/libc
+ vendor/libc-*
+ vendor/log
+ vendor/log-*
+ vendor/minimal-lexical
+ vendor/minimal-lexical-*
+ vendor/once_cell_polyfill
+ vendor/once_cell_polyfill-*
+ vendor/prettyplease
+ vendor/prettyplease-*
+ vendor/proc-macro2
+ vendor/proc-macro2-*
+ vendor/quote
+ vendor/quote-*
+ vendor/regex
+ vendor/regex-*
+ vendor/regex-automata
+ vendor/regex-automata-*
+ vendor/regex-syntax
+ vendor/regex-syntax-*
+ vendor/rustc-hash
+ vendor/rustc-hash-*
+ vendor/serde
+ vendor/serde-*
+ vendor/serde_core
+ vendor/serde_core-*
+ vendor/serde_derive
+ vendor/serde_derive-*
+ vendor/serde_json
+ vendor/serde_json-*
+ vendor/shlex
+ vendor/shlex-*
+ vendor/smallvec
+ vendor/smallvec-*
+ vendor/syn
+ vendor/syn-*
+ vendor/thiserror
+ vendor/thiserror-*
+ vendor/thiserror-impl
+ vendor/thiserror-impl-*
+ vendor/utf8parse
+ vendor/utf8parse-*
+ vendor/windows-link
+ vendor/windows-link-*
+ vendor/windows-sys
+ vendor/windows-sys-*
+Copyright: the authors of each crate, as listed in its Cargo.toml
+License: Apache-2.0 or Expat
+
+Files:
+ vendor/cfg_aliases
+ vendor/cfg_aliases-*
+ vendor/nix
+ vendor/nix-*
+ vendor/nom
+ vendor/nom-*
+ vendor/strsim
+ vendor/strsim-*
+ vendor/zmij
+ vendor/zmij-*
+Copyright: the authors of each crate, as listed in its Cargo.toml
+License: Expat
+
+Files:
+ vendor/aho-corasick
+ vendor/aho-corasick-*
+ vendor/memchr
+ vendor/memchr-*
+Copyright: the authors of each crate, as listed in its Cargo.toml
+License: Unlicense or Expat
+
+Files:
+ vendor/clang-sys
+ vendor/clang-sys-*
+ vendor/flatbuffers
+ vendor/flatbuffers-*
+Copyright: the authors of each crate, as listed in its Cargo.toml
+License: Apache-2.0
+
+Files:
+ vendor/bindgen
+ vendor/bindgen-*
+Copyright: the authors of each crate, as listed in its Cargo.toml
+License: BSD-3-Clause
+
+Files:
+ vendor/libloading
+ vendor/libloading-*
+Copyright: the authors of each crate, as listed in its Cargo.toml
+License: ISC
+
+Files:
+ vendor/unicode-ident
+ vendor/unicode-ident-*
+Copyright: the authors of each crate, as listed in its Cargo.toml
+License: (Apache-2.0 or Expat) and Unicode-3.0
+
+License: Apache-2.0
+ Licensed under the Apache License, Version 2.0 (the "License"); you may not
+ use this file except in compliance with the License. You may obtain a copy
+ of the License at http://www.apache.org/licenses/LICENSE-2.0
+ .
+ Unless required by applicable law or agreed to in writing, software
+ distributed under the License is distributed on an "AS IS" BASIS, WITHOUT
+ WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied. See the
+ License for the specific language governing permissions and limitations
+ under the License.
+ .
+ On Debian systems, the complete text of the Apache License, Version 2.0 can
+ be found in "/usr/share/common-licenses/Apache-2.0".
+
+License: Apache-2.0 with LLVM exception
+ Licensed under the Apache License, Version 2.0 (the "License"); you may not
+ use this file except in compliance with the License. On Debian systems, the
+ complete text of the Apache License, Version 2.0 can be found in
+ "/usr/share/common-licenses/Apache-2.0".
+ .
+ ---- LLVM Exceptions to the Apache 2.0 License ----
+ .
+ As an exception, if, as a result of your compiling your source code,
+ portions of this Software are embedded into an Object form of such source
+ code, you may redistribute such embedded portions in such Object form
+ without complying with the conditions of Sections 4(a), 4(b) and 4(d) of
+ the License.
+ .
+ In addition, if you combine or link compiled forms of this Software with
+ software that is licensed under the GPLv2 ("Combined Software") and if a
+ court of competent jurisdiction determines that the patent provision
+ (Section 3), the indemnity provision (Section 9) or other Section of the
+ License conflicts with the conditions of the GPLv2, you may retroactively
+ and prospectively choose to deem waived or otherwise exclude such
+ Section(s) of the License, but only in their entirety and only with respect
+ to the Combined Software.
+
+License: BSD-3-clause
+ Redistribution and use in source and binary forms, with or without
+ modification, are permitted provided that the following conditions are met:
+ .
+ 1. Redistributions of source code must retain the above copyright notice,
+    this list of conditions and the following disclaimer.
+ 2. Redistributions in binary form must reproduce the above copyright
+    notice, this list of conditions and the following disclaimer in the
+    documentation and/or other materials provided with the distribution.
+ 3. Neither the name of the copyright holder nor the names of its
+    contributors may be used to endorse or promote products derived from
+    this software without specific prior written permission.
+ .
+ THIS SOFTWARE IS PROVIDED BY THE COPYRIGHT HOLDERS AND CONTRIBUTORS "AS IS"
+ AND ANY EXPRESS OR IMPLIED WARRANTIES, INCLUDING, BUT NOT LIMITED TO, THE
+ IMPLIED WARRANTIES OF MERCHANTABILITY AND FITNESS FOR A PARTICULAR PURPOSE
+ ARE DISCLAIMED. IN NO EVENT SHALL THE COPYRIGHT HOLDER OR CONTRIBUTORS BE
+ LIABLE FOR ANY DIRECT, INDIRECT, INCIDENTAL, SPECIAL, EXEMPLARY, OR
+ CONSEQUENTIAL DAMAGES (INCLUDING, BUT NOT LIMITED TO, PROCUREMENT OF
+ SUBSTITUTE GOODS OR SERVICES; LOSS OF USE, DATA, OR PROFITS; OR BUSINESS
+ INTERRUPTION) HOWEVER CAUSED AND ON ANY THEORY OF LIABILITY, WHETHER IN
+ CONTRACT, STRICT LIABILITY, OR TORT (INCLUDING NEGLIGENCE OR OTHERWISE)
+ ARISING IN ANY WAY OUT OF THE USE OF THIS SOFTWARE, EVEN IF ADVISED OF THE
+ POSSIBILITY OF SUCH DAMAGE.
+
+License: Expat
+ Permission is hereby granted, free of charge, to any person obtaining a
+ copy of this software and associated documentation files (the "Software"),
+ to deal in the Software without restriction, including without limitation
+ the rights to use, copy, modify, merge, publish, distribute, sublicense,
+ and/or sell copies of the Software, and to permit persons to whom the
+ Software is furnished to do so, subject to the following conditions:
+ .
+ The above copyright notice and this permission notice shall be included in
+ all copies or substantial portions of the Software.
+ .
+ THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+ IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+ FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+ AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+ LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING
+ FROM, OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER
+ DEALINGS IN THE SOFTWARE.
+
+License: MIT-0
+ Permission is hereby granted, free of charge, to any person obtaining a
+ copy of this software and associated documentation files (the "Software"),
+ to deal in the Software without restriction, including without limitation
+ the rights to use, copy, modify, merge, publish, distribute, sublicense,
+ and/or sell copies of the Software, and to permit persons to whom the
+ Software is furnished to do so.
+ .
+ THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+ IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+ FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+ AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+ LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING
+ FROM, OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER
+ DEALINGS IN THE SOFTWARE.
+
+License: ISC
+ Permission to use, copy, modify, and/or distribute this software for any
+ purpose with or without fee is hereby granted, provided that the above
+ copyright notice and this permission notice appear in all copies.
+ .
+ THE SOFTWARE IS PROVIDED "AS IS" AND THE AUTHOR DISCLAIMS ALL WARRANTIES
+ WITH REGARD TO THIS SOFTWARE INCLUDING ALL IMPLIED WARRANTIES OF
+ MERCHANTABILITY AND FITNESS. IN NO EVENT SHALL THE AUTHOR BE LIABLE FOR ANY
+ SPECIAL, DIRECT, INDIRECT, OR CONSEQUENTIAL DAMAGES OR ANY DAMAGES
+ WHATSOEVER RESULTING FROM LOSS OF USE, DATA OR PROFITS, WHETHER IN AN
+ ACTION OF CONTRACT, NEGLIGENCE OR OTHER TORTIOUS ACTION, ARISING OUT OF OR
+ IN CONNECTION WITH THE USE OR PERFORMANCE OF THIS SOFTWARE.
+
+License: Unlicense
+ This is free and unencumbered software released into the public domain.
+ .
+ Anyone is free to copy, modify, publish, use, compile, sell, or distribute
+ this software, either in source code form or as a compiled binary, for any
+ purpose, commercial or non-commercial, and by any means.
+ .
+ In jurisdictions that recognize copyright laws, the author or authors of
+ this software dedicate any and all copyright interest in the software to
+ the public domain. We make this dedication for the benefit of the public at
+ large and to the detriment of our heirs and successors. We intend this
+ dedication to be an overt act of relinquishment in perpetuity of all
+ present and future rights to this software under copyright law.
+ .
+ THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+ IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+ FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+ AUTHORS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER LIABILITY, WHETHER IN AN
+ ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM, OUT OF OR IN
+ CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE SOFTWARE.
+ .
+ For more information, please refer to <https://unlicense.org/>
+
+License: Unicode-3.0
+ UNICODE LICENSE V3
+ .
+ Permission is hereby granted, free of charge, to any person obtaining a
+ copy of data files and any associated documentation (the "Data Files") or
+ software and any associated documentation (the "Software") to deal in the
+ Data Files or Software without restriction, including without limitation
+ the rights to use, copy, modify, merge, publish, distribute, and/or sell
+ copies of the Data Files or Software, and to permit persons to whom the
+ Data Files or Software are furnished to do so, provided that either (a)
+ this copyright and permission notice appear with all copies of the Data
+ Files or Software, or (b) this copyright and permission notice appear in
+ associated Documentation.
+ .
+ THE DATA FILES AND SOFTWARE ARE PROVIDED "AS IS", WITHOUT WARRANTY OF ANY
+ KIND, EXPRESS OR IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF
+ MERCHANTABILITY, FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT OF
+ THIRD PARTY RIGHTS. IN NO EVENT SHALL THE COPYRIGHT HOLDER OR HOLDERS
+ INCLUDED IN THIS NOTICE BE LIABLE FOR ANY CLAIM, OR ANY SPECIAL INDIRECT OR
+ CONSEQUENTIAL DAMAGES, OR ANY DAMAGES WHATSOEVER RESULTING FROM LOSS OF
+ USE, DATA OR PROFITS, WHETHER IN AN ACTION OF CONTRACT, NEGLIGENCE OR OTHER
+ TORTIOUS ACTION, ARISING OUT OF OR IN CONNECTION WITH THE USE OR
+ PERFORMANCE OF THE DATA FILES OR SOFTWARE.
+ .
+ Except as contained in this notice, the name of a copyright holder shall
+ not be used in advertising or otherwise to promote the sale, use or other
+ dealings in these Data Files or Software without prior written
+ authorization of the copyright holder.

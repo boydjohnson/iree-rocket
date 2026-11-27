@@ -1,0 +1,3 @@
+debian/rocket-run-module.1
+debian/iree-rocket-run-module.1
+debian/iree-rocket-benchmark-module.1

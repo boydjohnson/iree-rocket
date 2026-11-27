@@ -1,0 +1,194 @@
+iree-rocket for Debian and Armbian
+==================================
+
+What the packages are
+---------------------
+
+One source package, iree-rocket, and four binary packages:
+
+  rocket-compiler (amd64, arm64)
+    /usr/bin/rocket-compiler                                Rust, dlopens:
+    /usr/lib/<triplet>/rocket-compiler/libIREECompiler.so   IREE + LLVM +
+                                                            the Rocket plugin
+    /usr/lib/<triplet>/rocket-compiler/iree-lld             RUNPATH $ORIGIN
+    /usr/share/rocket-compiler/rocket_conv2d_transform_spec.mlir
+
+  libiree-rocket-runtime314 (arm64)
+    /usr/lib/aarch64-linux-gnu/libiree_rocket_runtime.so.314*
+
+  libiree-rocket-runtime-dev (arm64)
+    /usr/include/iree-rocket-runtime/{rocket,iree}/...
+    /usr/lib/aarch64-linux-gnu/libiree_rocket_runtime.{so,a}
+    /usr/lib/aarch64-linux-gnu/pkgconfig/iree-rocket-runtime{,-static}.pc
+    /usr/lib/aarch64-linux-gnu/cmake/IreeRocketRuntime/
+    /usr/share/rocket-runtime/samples/{embed.cc,run_module.c}
+
+  iree-rocket-tools (arm64)
+    /usr/bin/rocket-run-module                links libiree-rocket-runtime314
+    /usr/bin/iree-rocket-run-module           IREE's tools, Rocket driver
+    /usr/bin/iree-rocket-benchmark-module     linked in statically
+
+Why one source: a .vmfb only runs on a runtime with the IREE version and
+rocket-schema it was compiled against, so the compiler and the runtime ship
+from one upstream version.
+
+The compiler's libIREECompiler.so is a private library on purpose. Its
+SONAME is bare (`libIREECompiler.so`), it is a custom build carrying this
+project's target plugin, and the transform spec only parses with the IREE it
+was written against. So it lives in the package's own directory, and the
+binary, library and spec always ship and upgrade together. rocket-compiler
+finds them through absolute paths baked in at build time
+(ROCKET_COMPILER_LIBDIR / ROCKET_COMPILER_DATADIR, read with option_env! in
+rocket-compiler/src/main.rs).
+
+The runtime library is public, and its SONAME follows IREE:
+libiree_rocket_runtime.so.<major><minor, two digits>, so .so.314 for IREE
+3.14. rocket-runtime/CMakeLists.txt derives it from IREE's
+runtime/version.json. It exports IREE's whole C API (iree_*), which IREE does
+not keep stable between releases, so every IREE bump is an ABI break and
+renames the package. debian/rules fails the build when the SONAME and the
+package name in debian/control disagree. Rename libiree-rocket-runtime<N> and
+its .install file then. Within one SONAME, rocket/runtime.h only grows, so the
+shlibs dependency is >= the upstream version and there is no symbols file.
+
+The headers sit one directory down, under /usr/include/iree-rocket-runtime/,
+because they include all of IREE's runtime headers. In /usr/include they
+would collide file for file with any other IREE. pkg-config and the CMake
+package add the right -I.
+
+The Rust crates in rocket-runtime/rust are not packaged. rocket-runtime-sys
+finds the system library through pkg-config, so `cargo build` against an
+installed libiree-rocket-runtime-dev needs no configuration.
+
+Not packaged here, on purpose
+-----------------------------
+
+  - Device access. Debian 13's systemd already gives /dev/accel/* to group
+    render, mode 0660 (50-udev-default.rules), so no udev rule is shipped.
+    Users who run models on the NPU need to be in the render group.
+
+  - The kernel side. The measured results need three patches to the rocket
+    module (kernel-patches/), and the 600 MHz NPU clock is a module option
+    (options rocket rocket_npu_clk_hz=600000000) that only exists with patch
+    081. Both belong in the kernel build (for Armbian, its kernel patch
+    series), not in a userspace package. Stock modules still work, but
+    pooling jobs are killed by the watchdog: see agent-docs/board-setup.md.
+
+The orig tarball
+----------------
+
+debian/make-orig.sh builds iree-rocket_<upstream>.orig.tar.xz (about 3 GB
+unpacked) from git objects. It contains:
+
+  - this repository without debian/;
+  - IREE at the recorded submodule commit, with only the five IREE
+    submodules the builds read: llvm-project, torch-mlir (without its nested
+    externals/), flatcc, benchmark and googletest. The runtime build needs
+    only the last three;
+  - every crate in Cargo.lock, vendored under vendor/.
+
+debian/rules builds with `cargo --offline` whenever vendor/ is present, so
+the build works with no network, as sbuild and Armbian's builders require.
+
+  git submodule update --init iree-build/iree-src
+  git -C iree-build/iree-src submodule update --init \
+      third_party/{llvm-project,torch-mlir,flatcc,benchmark,googletest}
+  debian/make-orig.sh                    # writes ../iree-rocket_*.orig.tar.xz
+
+In a git worktree whose submodules are not initialized, point it at another
+checkout with IREE_REPO=/path/to/iree-src. REV=$(git stash create) packages
+uncommitted edits for a trial build.
+
+Building
+--------
+
+The two halves build independently, and two build profiles pick one:
+
+  pkg.iree-rocket.nocompiler   runtime packages only. No LLVM: minutes, not
+                               hours. Armbian's arm64 builders want this.
+  pkg.iree-rocket.noruntime    rocket-compiler only. The runtime is also
+                               skipped automatically off arm64.
+
+  dpkg-buildpackage -b                                       # everything
+  dpkg-buildpackage -b -Ppkg.iree-rocket.nocompiler         # runtime only
+
+A runtime-only build can also be cross-built from amd64. It needs a
+build-arch IREE tools/ directory for the code generators (iree-flatcc-cli,
+iree-c-embed-data) that the cross build cannot run, which any compiler-host
+build has:
+
+  IREE_HOST_BIN_DIR=/path/to/iree-build/build/tools \
+    dpkg-buildpackage -a arm64 -b -Ppkg.iree-rocket.nocompiler,nocheck
+
+The compiler cannot be cross-built (that would mean cross-building LLVM);
+rules refuses to try.
+
+Two shortcuts for the compiler that do not change the package's contents:
+
+  ROCKET_IREE_BUILD_DIR=/path/to/iree-build/build
+      Package an existing compiler-host build (lib/libIREECompiler.so and
+      tools/iree-lld) instead of building IREE. This is the nightly CI's
+      build. In a cross runtime build it also stands in for
+      IREE_HOST_BIN_DIR.
+
+  ROCKET_IREE_CMAKE_ARGS="-DCMAKE_C_COMPILER_LAUNCHER=ccache ..."
+      Extra CMake arguments for the IREE configure steps.
+
+What the build checks:
+
+  - compiler: the unit tests, then one model compiled with the library being
+    packaged. A spec the library cannot parse fails the build, not the user's
+    first compile.
+  - runtime (native builds only): a VMVX function
+    (rocket-runtime/rust/rocket-runtime/tests/data/cpu_ops.vmvx.vmfb) run on
+    the CPU device through rocket-run-module, statically and against the
+    shared library. A buildd has no NPU.
+  - SONAME: matches the library package's name.
+
+The nightly builds all of them: rocket-compiler from both compiler jobs'
+existing IREE builds, the runtime packages in a native arm64 job (see
+agent-docs/ci.md, .github/scripts/build-debs.sh). Each nightly .deb is
+versioned <base>~git<commit time, UTC>.<sha>+iree<IREE version>-1, installed with
+apt on the runner and run through debian/tests.
+
+The autopkgtests (debian/tests) repeat these against the installed packages.
+They also run IREE's own runner and benchmark on the same module, and build
+the shipped C++ sample through both pkg-config files and through
+find_package(IreeRocketRuntime).
+
+The Rust toolchain
+------------------
+
+The crates use edition 2024, so the build needs rustc >= 1.85. trixie has it.
+bookworm, jammy and noble do not have one that new as their default rustc
+(Ubuntu has versioned rustc-1.xx packages, which do not satisfy the
+Build-Depends as written). On those, install Rust with rustup and build with
+`dpkg-buildpackage -d` to skip the build-dependency check. A cross build
+also needs the aarch64-unknown-linux-gnu Rust target.
+
+One build per suite
+-------------------
+
+The binaries require the glibc and libstdc++ of the suite they were built
+on. A build on noble (glibc 2.39) will not load on bookworm (2.36) or jammy
+(2.35). Build once per target suite, in a container or chroot of that suite,
+and publish each .deb to that suite's component of the apt repository.
+
+Known lintian tags
+------------------
+
+  spelling-error-in-binary (libIREECompiler.so)    LLVM and IREE's strings;
+                                                   overridden
+  executable-in-usr-lib (iree-lld)                 private helper; overridden
+  hardening-no-fortify-functions                   usual for Rust code
+  debug-file-with-no-debug-symbols                 iree-lld (a 16 KB wrapper)
+                                                   and rocket-run-module (C,
+                                                   built without -g like all
+                                                   the C and C++ here)
+  package-has-long-file-name                       the snapshot version
+                                                   string (git date, commit,
+                                                   IREE version)
+  no-symbols-control-file (libiree-rocket-runtime) deliberate; see above
+  initial-upload-closes-no-bugs                    not aimed at Debian proper
+
+ -- Boyd Johnson <boyd@boundarybit.io>, Fri, 27 Nov 2026

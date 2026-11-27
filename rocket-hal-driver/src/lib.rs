@@ -48,6 +48,7 @@ pub mod executable;
 pub mod executable_cache;
 pub mod file;
 pub mod pool;
+pub mod pool_backend;
 pub mod profile;
 pub mod scratch_pool;
 pub mod semaphore;

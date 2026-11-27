@@ -22,3 +22,9 @@ pub fn ok() -> iree_status_t {
 pub fn unimplemented() -> iree_status_t {
     from_code(iree_status_code_e_IREE_STATUS_UNIMPLEMENTED)
 }
+
+/// The code of `status`, without consuming it -- `iree_status_code`, a C
+/// macro, reads the same low bits.
+pub fn code(status: iree_status_t) -> u32 {
+    ((status as usize) & IREE_STATUS_CODE_MASK) as u32
+}

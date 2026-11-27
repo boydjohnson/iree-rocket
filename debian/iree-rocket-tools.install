@@ -1,0 +1,3 @@
+usr/bin/rocket-run-module
+usr/bin/iree-rocket-run-module
+usr/bin/iree-rocket-benchmark-module

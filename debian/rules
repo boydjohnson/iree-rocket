@@ -1,0 +1,237 @@
+#!/usr/bin/make -f
+# iree-rocket: one source, two independent CMake builds.
+#
+#   compiler  rocket-compiler (amd64, arm64). IREE + LLVM + the Rocket target
+#             plugin for libIREECompiler.so and iree-lld, then the Rust driver
+#             with its install paths baked in (ROCKET_COMPILER_LIBDIR /
+#             ROCKET_COMPILER_DATADIR, read by rocket-compiler/src/main.rs).
+#             Hours on a cold tree. Skipped with the build profile
+#             pkg.iree-rocket.nocompiler; ROCKET_IREE_BUILD_DIR packages an
+#             existing compiler-host build instead of building one.
+#   runtime   libiree-rocket-runtime<N>, -dev, iree-rocket-tools (arm64).
+#             IREE's runtime with the Rocket HAL driver, through
+#             iree-build/host-aarch64 with tests off, so it needs no LLVM and
+#             no host iree-compile: minutes. Skipped with
+#             pkg.iree-rocket.noruntime, and on any other architecture.
+#
+# A runtime-only cross build from amd64 works:
+#   dpkg-buildpackage -a arm64 -Ppkg.iree-rocket.nocompiler,nocheck -b
+# with IREE_HOST_BIN_DIR (or ROCKET_IREE_BUILD_DIR) naming an amd64 build's
+# tools/, which supplies the code generators the cross build cannot run.
+# See debian/README.source.
+
+export DH_VERBOSE ?=
+export DEB_BUILD_MAINT_OPTIONS = hardening=+all
+# LLVM built with -g is several GB of DWARF; the -dbgsym package would dwarf
+# the real one and dh_strip takes an age over it. The Rust code keeps the
+# workspace's `debug = true` and its symbols go to -dbgsym as usual.
+export DEB_CFLAGS_MAINT_STRIP = -g
+export DEB_CXXFLAGS_MAINT_STRIP = -g
+
+include /usr/share/dpkg/architecture.mk
+include /usr/share/dpkg/buildopts.mk
+include /usr/share/dpkg/pkg-info.mk
+
+PROFILE_OFF = $(filter pkg.iree-rocket.no$(1),$(DEB_BUILD_PROFILES))
+CROSS := $(if $(filter $(DEB_BUILD_ARCH),$(DEB_HOST_ARCH)),,yes)
+
+BUILD_COMPILER := $(if $(call PROFILE_OFF,compiler),,yes)
+BUILD_RUNTIME  := $(if $(or $(call PROFILE_OFF,runtime),$(filter-out arm64,$(DEB_HOST_ARCH))),,yes)
+
+ifneq ($(and $(CROSS),$(BUILD_COMPILER)),)
+$(error rocket-compiler cannot be cross-built (it would cross-build LLVM); add the pkg.iree-rocket.nocompiler profile)
+endif
+
+JOBS := $(if $(DEB_BUILD_OPTION_PARALLEL),-j$(DEB_BUILD_OPTION_PARALLEL),)
+SPEC_SRC := rocket-compiler-plugin/target/Rocket/rocket_conv2d_transform_spec.mlir
+SMOKE_VMFB := rocket-runtime/rust/rocket-runtime/tests/data/cpu_ops.vmvx.vmfb
+
+#------------------------------------------------------------------- compiler
+
+RC_PKG     := rocket-compiler
+RC_DEST    := $(CURDIR)/debian/$(RC_PKG)
+RC_PRIVLIB := /usr/lib/$(DEB_HOST_MULTIARCH)/rocket-compiler
+RC_DATADIR := /usr/share/rocket-compiler
+
+# Use a prebuilt IREE compiler tree when one is given, else build our own
+# beside the usual debhelper obj- directory (never iree-build/build, which is
+# the developer's).
+ifneq ($(ROCKET_IREE_BUILD_DIR),)
+IREE_BUILD    := $(abspath $(ROCKET_IREE_BUILD_DIR))
+IREE_PREBUILT := yes
+else
+IREE_BUILD    := $(CURDIR)/obj-$(DEB_HOST_GNU_TYPE)
+IREE_PREBUILT :=
+endif
+
+# Cargo: private home and target dir, so a build never touches ~/.cargo or
+# the checkout's target/. The orig tarball carries vendor/ (see
+# debian/make-orig.sh); a plain git checkout has none and fetches instead.
+# CARGO_HOME also reaches the cargo the runtime's CMake runs for the HAL
+# driver.
+export CARGO_HOME       := $(CURDIR)/debian/cargo-home
+export CARGO_TARGET_DIR := $(CURDIR)/debian/cargo-target
+CARGO_OFFLINE := $(if $(wildcard $(CURDIR)/vendor/.),--offline,)
+export RUSTFLAGS := -C link-arg=-Wl,-z,relro,-z,now
+export ROCKET_COMPILER_LIBDIR  := $(RC_PRIVLIB)
+export ROCKET_COMPILER_DATADIR := $(RC_DATADIR)
+RC_BIN := $(CARGO_TARGET_DIR)/release/rocket-compiler
+
+#-------------------------------------------------------------------- runtime
+
+RT_BUILD := $(CURDIR)/obj-runtime-$(DEB_HOST_GNU_TYPE)
+RT_TMP   := $(CURDIR)/debian/tmp
+# The SONAME is derived from IREE's version at configure time; the package
+# name has to carry the same number.
+RT_LIBPKG    := $(shell dh_listpackages 2>/dev/null | grep -E '^libiree-rocket-runtime[0-9]+$$')
+RT_SOVERSION := $(patsubst libiree-rocket-runtime%,%,$(RT_LIBPKG))
+
+RT_CMAKE_ARGS := \
+  -DCMAKE_BUILD_TYPE=Release \
+  -DCMAKE_INSTALL_PREFIX=/usr \
+  -DCMAKE_INSTALL_LIBDIR=lib/$(DEB_HOST_MULTIARCH) \
+  -DROCKET_BUILD_TESTS=OFF \
+  -DIREE_ERROR_ON_MISSING_SUBMODULES=OFF \
+  -DIREE_ENABLE_WERROR_FLAG=OFF
+ifneq ($(CROSS),)
+RT_HOST_BIN := $(or $(IREE_HOST_BIN_DIR),$(if $(ROCKET_IREE_BUILD_DIR),$(IREE_BUILD)/tools))
+RT_CMAKE_ARGS += \
+  -DCMAKE_TOOLCHAIN_FILE=$(CURDIR)/iree-build/aarch64_linux_gnu.cmake \
+  -DIREE_HOST_BIN_DIR=$(RT_HOST_BIN)
+endif
+
+#---------------------------------------------------------------------- steps
+
+%:
+	dh $@
+
+override_dh_auto_configure:
+	mkdir -p $(CARGO_HOME)
+ifneq ($(CARGO_OFFLINE),)
+	printf '[source.crates-io]\nreplace-with = "vendored-sources"\n\n[source.vendored-sources]\ndirectory = "%s"\n' \
+	  "$(CURDIR)/vendor" > $(CARGO_HOME)/config.toml
+endif
+ifneq ($(BUILD_COMPILER),)
+ifeq ($(IREE_PREBUILT),)
+	IREE_BUILD_DIR=$(IREE_BUILD) ./iree-build/configure-compiler-host.sh \
+	  -DCMAKE_BUILD_TYPE=Release \
+	  -DIREE_BUILD_TESTS=OFF \
+	  -DIREE_BUILD_SAMPLES=OFF \
+	  -DIREE_BUILD_DOCS=OFF \
+	  -DIREE_ERROR_ON_MISSING_SUBMODULES=OFF \
+	  $(ROCKET_IREE_CMAKE_ARGS)
+endif
+endif
+ifneq ($(BUILD_RUNTIME),)
+ifneq ($(CROSS),)
+	@test -x "$(RT_HOST_BIN)/iree-flatcc-cli" || { echo "cross-building the runtime needs IREE_HOST_BIN_DIR (or ROCKET_IREE_BUILD_DIR) naming a build-arch IREE tools/ directory" >&2; exit 1; }
+endif
+	cmake -S iree-build/host-aarch64 -B $(RT_BUILD) -G Ninja $(RT_CMAKE_ARGS) \
+	  $(ROCKET_IREE_CMAKE_ARGS)
+endif
+
+override_dh_auto_build:
+ifneq ($(BUILD_COMPILER),)
+ifeq ($(IREE_PREBUILT),)
+	cmake --build $(IREE_BUILD) $(JOBS) --target iree-compile iree-lld
+endif
+	cargo build -p rocket-compiler --release --locked $(CARGO_OFFLINE) $(JOBS)
+	help2man --no-info --no-discard-stderr --version-string=$(DEB_VERSION_UPSTREAM) \
+	  --name="compile models for the RK3588 NPU with IREE" \
+	  --output=debian/rocket-compiler.1 $(RC_BIN)
+endif
+ifneq ($(BUILD_RUNTIME),)
+	cmake --build $(RT_BUILD) $(JOBS) \
+	  --target rocket_runtime_package iree-run-module iree-benchmark-module
+endif
+
+# Compiler: the unit tests, then one real compile through the library this
+# package ships (a spec the library cannot parse fails the build, not the
+# user's first model). Runtime: one function through rocket-run-module on the
+# CPU device (no NPU on a buildd), static and shared; skipped when cross.
+override_dh_auto_test:
+ifeq ($(filter nocheck,$(DEB_BUILD_OPTIONS)),)
+ifneq ($(BUILD_COMPILER),)
+	cargo test -p rocket-compiler --release --locked $(CARGO_OFFLINE) $(JOBS)
+	$(RC_BIN) compile \
+	  --iree-compiler-lib $(IREE_BUILD)/lib/libIREECompiler.so \
+	  --transform-spec $(SPEC_SRC) \
+	  --input rocket-compiler-plugin/test/rocket_conv_layout.mlir \
+	  --output $(CARGO_TARGET_DIR)/smoke.vmfb \
+	  --llvmcpu-target-triple aarch64-linux-gnu
+	test -s $(CARGO_TARGET_DIR)/smoke.vmfb
+endif
+ifneq ($(and $(BUILD_RUNTIME),$(if $(CROSS),,yes)),)
+	for bin in rocket-run-module rocket-run-module-shared; do \
+	  LD_LIBRARY_PATH=$(RT_BUILD)/rocket-runtime \
+	    $(RT_BUILD)/rocket-runtime/samples/$$bin --cpu-only $(SMOKE_VMFB) \
+	    module.mul_add "4xf32=1 2 3 4" "4xf32=2 2 2 2" | tee $(RT_BUILD)/smoke.out; \
+	  grep -qx '4xf32=3 6 9 12' $(RT_BUILD)/smoke.out || exit 1; \
+	done
+endif
+endif
+
+override_dh_auto_install:
+ifneq ($(BUILD_COMPILER),)
+# Every path here is read by something at run time:
+#   RC_PRIVLIB/libIREECompiler.so  rocket-compiler (ROCKET_COMPILER_LIBDIR)
+#   RC_PRIVLIB/iree-lld            libIREECompiler.so looks beside itself
+#                                  first (IREE's findToolFromDylibDir);
+#                                  RUNPATH rewritten to $ORIGIN
+#   RC_DATADIR/<spec>              rocket-compiler (ROCKET_COMPILER_DATADIR)
+	install -D -m 0755 $(RC_BIN) $(RC_DEST)/usr/bin/rocket-compiler
+	install -D -m 0644 $(IREE_BUILD)/lib/libIREECompiler.so \
+	  $(RC_DEST)$(RC_PRIVLIB)/libIREECompiler.so
+	install -D -m 0755 $(IREE_BUILD)/tools/iree-lld $(RC_DEST)$(RC_PRIVLIB)/iree-lld
+	patchelf --set-rpath '$$ORIGIN' $(RC_DEST)$(RC_PRIVLIB)/iree-lld
+	install -D -m 0644 $(SPEC_SRC) $(RC_DEST)$(RC_DATADIR)/rocket_conv2d_transform_spec.mlir
+endif
+ifneq ($(BUILD_RUNTIME),)
+	DESTDIR=$(RT_TMP) cmake --install $(RT_BUILD) --component IreeRocketRuntime
+# IREE's header tree is installed through a *.h filter, which keeps the
+# directories of everything it filtered out (tests, disabled drivers' sources).
+	find $(RT_TMP)/usr/include -type d -empty -delete
+	@test -e $(RT_TMP)/usr/lib/$(DEB_HOST_MULTIARCH)/libiree_rocket_runtime.so.$(RT_SOVERSION) || \
+	  { echo "the library's SONAME is not .so.$(RT_SOVERSION), so $(RT_LIBPKG) is misnamed:" >&2; \
+	    ls $(RT_TMP)/usr/lib/$(DEB_HOST_MULTIARCH)/libiree_rocket_runtime.so.* >&2; \
+	    echo "rename it in debian/control (and its .install file) to match" >&2; exit 1; }
+# Tools. rocket-run-module is the samples' shared-library build; its $ORIGIN
+# RUNPATH is for the build tree only. The two IREE tools link the driver
+# statically and are renamed so they cannot collide with upstream IREE's.
+	install -D -m 0755 $(RT_BUILD)/rocket-runtime/samples/rocket-run-module-shared \
+	  $(RT_TMP)/usr/bin/rocket-run-module
+	patchelf --remove-rpath $(RT_TMP)/usr/bin/rocket-run-module
+	install -D -m 0755 $(RT_BUILD)/iree/tools/iree-run-module \
+	  $(RT_TMP)/usr/bin/iree-rocket-run-module
+	install -D -m 0755 $(RT_BUILD)/iree/tools/iree-benchmark-module \
+	  $(RT_TMP)/usr/bin/iree-rocket-benchmark-module
+endif
+
+# The compiler's library is private, so dpkg-shlibdeps has to be told where
+# iree-lld's NEEDED libIREECompiler.so lives.
+override_dh_shlibdeps:
+	dh_shlibdeps -l$(RC_DEST)$(RC_PRIVLIB)
+
+# Every IREE bump renames the library package (the SONAME follows IREE), so
+# within one SONAME the ABI only grows: depend on at least this upstream
+# version. A symbols file would track thousands of iree_* symbols that IREE
+# itself treats as unstable.
+override_dh_makeshlibs:
+	dh_makeshlibs -N$(RC_PKG) $(if $(RT_LIBPKG),-V '$(RT_LIBPKG) (>= $(DEB_VERSION_UPSTREAM))')
+
+# dwz runs out of memory or gives up on the Rust code's DWARF; it would save
+# little on packages dominated by stripped IREE code anyway.
+override_dh_dwz:
+
+# dh_clean deletes every *.orig in the tree, and cargo checksums each vendored
+# crate's Cargo.toml.orig: losing them breaks the next --offline build.
+override_dh_clean:
+	dh_clean -XCargo.toml.orig
+
+# There is no autotools build here, but LLVM and IREE carry config.guess and
+# config.sub files that these would otherwise rewrite in place.
+override_dh_update_autotools_config override_dh_autoreconf:
+
+override_dh_auto_clean:
+	rm -rf $(CURDIR)/obj-$(DEB_HOST_GNU_TYPE) $(RT_BUILD) $(CARGO_HOME) \
+	  $(CARGO_TARGET_DIR) debian/rocket-compiler.1

@@ -1,0 +1,22 @@
+#!/bin/sh
+# The installed rocket-compiler, with an empty environment, must find its own
+# library and spec: no --iree-compiler-lib, no IREE_COMPILER_LIB, no
+# --transform-spec. --no-offload prints the spec it derived from, which must
+# be the packaged one.
+set -eu
+WORK="${AUTOPKGTEST_TMP:-$(mktemp -d)}"
+cp rocket-compiler-plugin/test/rocket_conv_layout.mlir "$WORK/model.mlir"
+cd "$WORK"
+run() { env -i PATH=/usr/bin:/bin HOME="$WORK" "$@"; }
+
+run rocket-compiler compile --input model.mlir --output offload.vmfb \
+  --llvmcpu-target-triple aarch64-linux-gnu
+test -s offload.vmfb
+
+run rocket-compiler compile --input model.mlir --output cpu.vmfb \
+  --llvmcpu-target-triple aarch64-linux-gnu --no-offload 2>&1 | tee no-offload.log
+test -s cpu.vmfb
+grep -q /usr/share/rocket-compiler/rocket_conv2d_transform_spec.mlir no-offload.log
+
+run rocket-compiler audit --input model.mlir >/dev/null
+echo "smoke: ok"

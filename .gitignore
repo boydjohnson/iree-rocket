@@ -1,5 +1,6 @@
 # Cargo (workspace-wide; Cargo.lock is committed for reproducible cross-builds)
 /target/
+/rocket-runtime/rust/target/
 
 # rocket-schema build artifacts (generated/rust is checked in; generated/c and build/ are not)
 /rocket-schema/build/
@@ -23,3 +24,7 @@ __pycache__/
 # tools/model_survey.py rebuilds it from tools/export_onnx.py's registry.
 /survey/
 /.venv/
+
+# debian/rules' own IREE build, and crates vendored by debian/make-orig.sh
+/obj-*/
+/vendor/

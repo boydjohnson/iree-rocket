@@ -1,0 +1,15 @@
+iree-rocket (0.1.0~git20261127.1726aaa+iree3.14.0-1) UNRELEASED; urgency=medium
+
+  * Initial packaging, as one source for the compiler and the runtime:
+    - rocket-compiler, with a private libIREECompiler.so (IREE v3.14.0 plus
+      the Rocket target plugin) and iree-lld under
+      /usr/lib/<triplet>/rocket-compiler, and the transform spec under
+      /usr/share/rocket-compiler;
+    - libiree-rocket-runtime314 and libiree-rocket-runtime-dev, the runtime
+      library with the Rocket HAL driver (SONAME follows IREE: .so.314);
+    - iree-rocket-tools: rocket-run-module, iree-rocket-run-module and
+      iree-rocket-benchmark-module.
+    Build profiles pkg.iree-rocket.nocompiler and pkg.iree-rocket.noruntime
+    build either half alone.
+
+ -- Boyd Johnson <boyd@boundarybit.io>  Fri, 27 Nov 2026 12:57:22 -0600
