@@ -11,6 +11,8 @@ name: Nightly artifacts
 #                              bin/iree-lld, lib/libIREECompiler.so,
 #                              share/rocket/<transform spec>; unpack anywhere
 #                              and run bin/rocket-compiler, no env needed.
+#   iree-compile-aarch64       the same, built natively on an arm64 runner:
+#                              a compiler that runs on the board itself.
 #   iree-host-tools            the full host tools/ dir, for the aarch64 job.
 #   iree-runtime-aarch64       iree-run-module, iree-benchmark-module.
 #   iree-rocket-runtime-aarch64  the embeddable runtime: rocket/runtime.h,
@@ -22,9 +24,10 @@ name: Nightly artifacts
 # `runner` / `max-glibc` inputs of iree-build.yml), so they load on both the
 # developer host and the board.
 #
-# Both jobs share iree-build.yml. runtime-aarch64 `needs:` compiler-host
+# All three jobs share iree-build.yml. runtime-aarch64 `needs:` compiler-host
 # because configure-runtime-aarch64.sh imports the host tools from that job's
 # build (IREE_HOST_BIN_DIR); see iree-build.yml for how they are handed over.
+# compiler-aarch64 needs nothing and runs alongside both.
 
 on:
   schedule:
@@ -53,6 +56,16 @@ jobs:
     uses: ./.github/workflows/iree-build.yml
     with:
       target: compiler-host
+      retention-days: ${{ fromJSON(inputs.retention-days || '14') }}
+
+  # The compiler-host target on an arm64 runner: the same configure, build,
+  # packaging and smoke test, natively for aarch64. ubuntu-24.04-arm has
+  # ubuntu-24.04's glibc (2.39), so the max-glibc ceiling holds unchanged.
+  compiler-aarch64:
+    uses: ./.github/workflows/iree-build.yml
+    with:
+      target: compiler-host
+      runner: ubuntu-24.04-arm
       retention-days: ${{ fromJSON(inputs.retention-days || '14') }}
 
   runtime-aarch64:

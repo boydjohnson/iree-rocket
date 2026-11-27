@@ -100,7 +100,8 @@ cargo run -p rocket-compiler -- audit --input model.mlir
 ### Prebuilt compiler (nightly)
 
 The `Nightly artifacts` workflow ships `rocket-compiler` ready to run, in the
-`iree-compile-x86_64` artifact (x86_64 Linux): `bin/rocket-compiler`,
+`iree-compile-x86_64` artifact (x86_64 Linux), and in `iree-compile-aarch64`
+for running on the board itself: `bin/rocket-compiler`,
 `bin/iree-compile`, `bin/iree-lld`, `lib/libIREECompiler.so` and the transform
 spec under `share/rocket/`. Every nightly binary is built on ubuntu-24.04 and
 needs glibc 2.39 or newer (the job fails if one needs more), which covers both
