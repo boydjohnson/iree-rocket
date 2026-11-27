@@ -175,7 +175,8 @@ impl Drop for SpecFile {
 /// returned handle drops.
 fn resolve_transform_spec(common: &cli::CommonArgs) -> Result<SpecFile, Box<dyn Error>> {
     let source = transform_spec_path(common);
-    if !common.no_offload && !common.elementwise && !common.batch_matmul {
+    let renames = device_renames(common);
+    if !common.no_offload && !common.elementwise && !common.batch_matmul && renames.is_empty() {
         return Ok(SpecFile {
             path: source,
             temporary: false,
@@ -216,7 +217,24 @@ fn resolve_transform_spec(common: &cli::CommonArgs) -> Result<SpecFile, Box<dyn 
         text = enabled.text;
     }
 
-    let mut suffix = if common.batch_matmul {
+    // After the matcher edits and before neutralize's report, so the names
+    // every later message and the compiled module use are the renamed ones.
+    // `check_spec_device_names` runs on the file this writes, so a rename
+    // that missed would be caught there rather than crashing the compiler on
+    // a dangling attribute reference.
+    for (from, to) in &renames {
+        let renamed = spec::rename_device(&text, from, to)?;
+        eprintln!(
+            "--*-device-name: @{from} -> @{to}, {} reference(s) in {}",
+            renamed.renamed,
+            source.display()
+        );
+        text = renamed.text;
+    }
+
+    let mut suffix = if !renames.is_empty() {
+        "renamed"
+    } else if common.batch_matmul {
         "batch-matmul"
     } else {
         "elementwise"
@@ -247,6 +265,19 @@ fn resolve_transform_spec(common: &cli::CommonArgs) -> Result<SpecFile, Box<dyn 
     })
 }
 
+/// The device-global renames this invocation's `--*-device-name` flags ask
+/// for, relative to the names the shipped transform spec hardcodes.
+fn device_renames(common: &cli::CommonArgs) -> Vec<(&'static str, String)> {
+    let mut renames = Vec::new();
+    if common.rocket_device_name != spec::SPEC_ROCKET_DEVICE {
+        renames.push((spec::SPEC_ROCKET_DEVICE, common.rocket_device_name.clone()));
+    }
+    if common.cpu_device_name != spec::SPEC_CPU_DEVICE {
+        renames.push((spec::SPEC_CPU_DEVICE, common.cpu_device_name.clone()));
+    }
+    renames
+}
+
 fn compile_flags(common: &cli::CommonArgs, transform_spec: &Path) -> Vec<String> {
     let mut flags = vec![
         format!(
@@ -257,16 +288,28 @@ fn compile_flags(common: &cli::CommonArgs, transform_spec: &Path) -> Vec<String>
             "--iree-hal-target-device={}=rocket",
             common.rocket_device_name
         ),
-        format!("--iree-hal-target-device={}=local", common.cpu_device_name),
-        "--iree-hal-local-target-device-backends=llvm-cpu".to_string(),
-        format!("--iree-llvmcpu-target-cpu={}", common.llvmcpu_target_cpu),
+        format!(
+            "--iree-hal-target-device={}={}",
+            common.cpu_device_name, common.cpu_device_backend
+        ),
         format!("--iree-hal-default-device={}", common.cpu_device_name),
         "--iree-hal-indirect-command-buffers=false".to_string(),
     ];
-    // Left off entirely when unset so IREE keeps its own host-triple default,
-    // rather than us guessing a spelling for the host here.
-    if let Some(triple) = &common.llvmcpu_target_triple {
-        flags.push(format!("--iree-llvmcpu-target-triple={triple}"));
+    // Only meaningful for IREE's `local` device, which is the only backend
+    // that fans out to llvm-cpu. Setting them for, say, a Vulkan device
+    // would be inert at best -- and `--iree-llvmcpu-target-triple` on a
+    // module with no llvm-cpu executable is a flag that describes nothing.
+    if common.cpu_device_backend == "local" {
+        flags.push("--iree-hal-local-target-device-backends=llvm-cpu".to_string());
+        flags.push(format!(
+            "--iree-llvmcpu-target-cpu={}",
+            common.llvmcpu_target_cpu
+        ));
+        // Left off entirely when unset so IREE keeps its own host-triple
+        // default, rather than us guessing a spelling for the host here.
+        if let Some(triple) = &common.llvmcpu_target_triple {
+            flags.push(format!("--iree-llvmcpu-target-triple={triple}"));
+        }
     }
     flags.extend(common.iree_flags.iter().cloned());
     flags
@@ -276,10 +319,13 @@ fn compile_flags(common: &cli::CommonArgs, transform_spec: &Path) -> Vec<String>
 /// inside a `#hal.device.*` attribute, i.e. `#hal.device.affinity<@d>` and
 /// the endpoints of `#hal.device.topology<links = [(@a -> @b = {...})]>`.
 ///
-/// The spec hardcodes these names, but the device globals themselves are
-/// created from `--iree-hal-target-device=<name>=...`, which this CLI derives
-/// from `--rocket-device-name` / `--cpu-device-name`. Renaming either one
-/// leaves the spec's references dangling.
+/// The shipped spec hardcodes these names, and the device globals themselves
+/// are created from `--iree-hal-target-device=<name>=...`, which this CLI
+/// derives from `--rocket-device-name` / `--cpu-device-name`. A rename of
+/// either is carried into a copy of the spec by `device_renames` +
+/// `spec::rename_device`; what this scan is for is the leftovers -- a spec
+/// supplied with `--transform-spec` that names some third device nothing
+/// will create.
 fn spec_device_symbols(spec: &str) -> BTreeSet<&str> {
     const MARKER: &str = "#hal.device.";
     let mut symbols = BTreeSet::new();
@@ -341,6 +387,10 @@ fn scan_symbol_refs(text: &str) -> impl Iterator<Item = &str> {
 /// references live in attributes, and attributes are not symbol-verified, so
 /// a dangling one survives until a later pass resolves it and dereferences
 /// null -- the compiler segfaults instead of reporting an error.
+///
+/// This runs on the spec file the compile will actually read, which for a
+/// renamed device is the rewritten copy -- so a rename the rewrite handled
+/// passes here, and only a name nothing creates is caught.
 fn check_spec_device_names(
     common: &cli::CommonArgs,
     transform_spec: &Path,
@@ -366,9 +416,10 @@ fn check_spec_device_names(
     Err(format!(
         "transform spec {spec_path} refers to device global(s) {dangling} that this \
          invocation does not create: it declares @{rocket} (--rocket-device-name) and \
-         @{cpu} (--cpu-device-name). The spec hardcodes its device names, so those \
-         flags must match it -- the defaults do. Compiling anyway would crash the \
-         compiler rather than report an error.",
+         @{cpu} (--cpu-device-name). A rename of either of those two is rewritten into \
+         the spec automatically, so this is a third name the spec carries and nothing \
+         will create. Compiling anyway would crash the compiler rather than report an \
+         error.",
         spec_path = transform_spec.display(),
         dangling = named.join(", "),
         rocket = common.rocket_device_name,
@@ -669,6 +720,7 @@ mod tests {
             report_json: None,
             rocket_device_name: rocket.to_string(),
             cpu_device_name: cpu.to_string(),
+            cpu_device_backend: "local".to_string(),
             llvmcpu_target_cpu: "generic".to_string(),
             llvmcpu_target_triple: triple.map(str::to_string),
             iree_flags: Vec::new(),
@@ -879,19 +931,24 @@ mod tests {
     }
 
     #[test]
-    fn renaming_a_device_is_rejected_rather_than_left_to_segfault() {
+    fn a_spec_naming_an_uncreated_device_is_rejected_rather_than_left_to_segfault() {
+        // The *shipped* spec, read as if no rename had been applied to it --
+        // which is what a `--transform-spec` carrying a third device name
+        // looks like to this check. A rename the CLI asked for is rewritten
+        // into the spec copy before this runs (see `device_renames`), so it
+        // is the uncreated name, not the rename, that has to fail.
         let spec = default_transform_spec_path();
 
         // `--cpu-device-name` is the dangerous one: the spec refers to
         // @cpu_device only from attributes, which are not symbol-verified.
         let err = check_spec_device_names(&common_args("rocket_device", "local", None), &spec)
-            .expect_err("a renamed CPU device must be rejected");
+            .expect_err("a device the invocation will not create must be rejected");
         let message = err.to_string();
         assert!(message.contains("@cpu_device"), "{message}");
         assert!(!message.contains("@rocket_device,"), "{message}");
 
         let err = check_spec_device_names(&common_args("npu", "cpu_device", None), &spec)
-            .expect_err("a renamed Rocket device must be rejected");
+            .expect_err("the same, for the Rocket device");
         assert!(err.to_string().contains("@rocket_device"), "{err}");
     }
 }
