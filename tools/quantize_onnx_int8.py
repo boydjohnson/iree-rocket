@@ -343,6 +343,78 @@ def quantize_residual_skips(path: Path) -> int:
     return rewritten
 
 
+def split_gemms_for_quantization(path: Path) -> list[str]:
+    """Rewrite each classifier `Gemm` as `MatMul` + `Add`, in place.
+
+    QOperator format quantizes a `Gemm` as com.microsoft `QGemm`, which
+    torch-mlir cannot lower, but a `MatMul` as the standard `QLinearMatMul`,
+    which it lowers to `linalg.quantized_matmul` -- and Rocket runs that as
+    the int8 1x1 convolution `fc.rs` lowers an FC to. So the Gemm is split
+    first: `MatMul(x, transpose(B))` with the weight transposed once at
+    quantization time, then the bias `Add`, which stays float after the
+    `QLinearMatMul`'s DequantizeLinear.
+
+    Only the plain classifier form is split: `alpha = beta = 1`, no `transA`,
+    a constant 2-D `B` and a constant 1-D `C` (or none). Returns the names of
+    the new MatMul nodes, so the caller quantizes those and no other MatMul.
+    It must run after `quant_pre_process`, whose optimizer fuses a MatMul and
+    an Add straight back into a Gemm.
+    """
+    model = onnx.load(path)
+    graph = model.graph
+    initializers = {init.name: init for init in graph.initializer}
+    matmuls: list[str] = []
+    new_nodes: list[onnx.NodeProto] = []
+    for node in graph.node:
+        if node.op_type != "Gemm" or node.domain not in ("", "ai.onnx"):
+            new_nodes.append(node)
+            continue
+        attrs = {a.name: onnx.helper.get_attribute_value(a) for a in node.attribute}
+        weight = initializers.get(node.input[1])
+        bias = initializers.get(node.input[2]) if len(node.input) > 2 and node.input[2] else None
+        plain = (
+            attrs.get("alpha", 1.0) == 1.0
+            and attrs.get("beta", 1.0) == 1.0
+            and attrs.get("transA", 0) == 0
+            and weight is not None
+            and len(weight.dims) == 2
+            and (bias is None or len(bias.dims) == 1)
+            and (len(node.input) < 3 or not node.input[2] or bias is not None)
+        )
+        if not plain:
+            new_nodes.append(node)
+            continue
+        w = numpy_helper.to_array(weight)
+        if attrs.get("transB", 0):
+            w = w.T
+        name = node.name or node.output[0]
+        weight_name = f"{node.input[1]}_matmul"
+        graph.initializer.append(numpy_helper.from_array(np.ascontiguousarray(w), weight_name))
+        product = node.output[0] if bias is None else f"{node.output[0]}_matmul"
+        new_nodes.append(
+            onnx.helper.make_node(
+                "MatMul", [node.input[0], weight_name], [product], name=f"{name}_MatMul"
+            )
+        )
+        if bias is not None:
+            new_nodes.append(
+                onnx.helper.make_node(
+                    "Add", [product, node.input[2]], [node.output[0]], name=f"{name}_bias_Add"
+                )
+            )
+        matmuls.append(f"{name}_MatMul")
+    del graph.node[:]
+    graph.node.extend(new_nodes)
+    # The original weights are now unused; drop them rather than ship both.
+    used = {name for node in graph.node for name in node.input}
+    kept = [init for init in graph.initializer if init.name in used]
+    del graph.initializer[:]
+    graph.initializer.extend(kept)
+    onnx.checker.check_model(model)
+    onnx.save(model, path)
+    return matmuls
+
+
 def verify_quantized_model(path: Path) -> int:
     """Re-check on the output the three properties the Rocket path depends on.
 
@@ -388,6 +460,9 @@ def verify_quantized_model(path: Path) -> int:
             )
 
     print(f"  QLinearConv nodes (offloadable): {len(qlinear)}")
+    matmuls = sum(1 for n in model.graph.node if n.op_type == "QLinearMatMul")
+    if matmuls:
+        print(f"  QLinearMatMul nodes (offloadable as 1x1 convolutions): {matmuls}")
     print(f"  Conv nodes left in float (fp16 path): {len(leftover)}")
     if problems:
         print("\nverification failed:", file=sys.stderr)
@@ -445,8 +520,8 @@ def main() -> None:
         "which is what lets consecutive offloaded convolutions chain on the "
         "NPU (see the module docstring). Widening further is usually wrong: "
         "QOperator format spells quantized Add/Gemm/pooling as com.microsoft "
-        "ops that torch-mlir cannot lower at all, and Conv is the only thing "
-        "Rocket offloads anyway. Everything left in float is demoted to f16 "
+        "ops that torch-mlir cannot lower at all (for a classifier Gemm, use "
+        "--quantize-gemm instead). Everything left in float is demoted to f16 "
         "and can still take the Rocket fp16 path.",
     )
     parser.add_argument(
@@ -455,6 +530,15 @@ def main() -> None:
         help="read every residual Add's float skip back through its own int8 "
         "quantization, so both Add operands are int8 and the NPU can run the "
         "add. Lossy and a model change; off by default.",
+    )
+    parser.add_argument(
+        "--quantize-gemm",
+        action="store_true",
+        help="quantize each classifier Gemm too, as a QLinearMatMul plus a "
+        "float bias Add (QOperator's own QGemm is com.microsoft and cannot be "
+        "imported). Rocket runs it as an int8 1x1 convolution instead of an "
+        "fp16 matmul. Lossy -- the product is rounded to 8 bits before the "
+        "bias -- and a model change; off by default.",
     )
     parser.add_argument(
         "--quantize-asymmetric-pads",
@@ -521,6 +605,20 @@ def main() -> None:
                 print(f"    {name}: {reason}")
             excluded.extend(name for name, _ in unfoldable)
 
+    op_types = list(args.quantize_op_types)
+    if args.quantize_gemm:
+        split = split_gemms_for_quantization(prepared)
+        print(f"split {len(split)} Gemm(s) into MatMul + Add for QLinearMatMul")
+        if "MatMul" not in op_types:
+            op_types.append("MatMul")
+            # Only the MatMuls the split made: a model's own MatMuls were not
+            # asked for.
+            excluded.extend(
+                node.name
+                for node in onnx.load(prepared).graph.node
+                if node.op_type == "MatMul" and node.name not in split
+            )
+
     print(f"quantizing -> {args.output}")
     quantize_static(
         str(prepared),
@@ -530,7 +628,7 @@ def main() -> None:
         per_channel=False,
         activation_type=QuantType.QUInt8,
         weight_type=QuantType.QInt8,
-        op_types_to_quantize=args.quantize_op_types,
+        op_types_to_quantize=op_types,
         nodes_to_exclude=excluded,
     )
 

@@ -225,6 +225,10 @@ struct RequantEpilogue {
   /// The NHWC -> NCHW transpose between the correction and the scaling, when
   /// the model has one. Re-emitted after the fused generic, on `i8`.
   linalg::TransposeOp transpose;
+  /// The collapse back to `[M, N]` behind a quantized matmul rewritten as a
+  /// 1x1 convolution (`rocket-transpose-quantized-conv-to-nhwc`), when there
+  /// is one. Re-emitted after the fused generic, on `i8`.
+  tensor::CollapseShapeOp collapse;
   /// The op whose result the fused chain replaces.
   linalg::GenericOp narrow;
 };
@@ -389,6 +393,18 @@ static std::optional<RequantEpilogue> matchEpilogue(ConvOp convOp) {
             dyn_cast<linalg::TransposeOp>(*scaled.getUsers().begin())) {
       found.transpose = transpose;
       scaled = transpose.getResult()[0];
+    }
+  }
+
+  // Or the collapse a quantized matmul's convolution form ends in. The
+  // epilogue is elementwise, so it commutes with the reshape: the fused
+  // generic runs on the convolution's own shape, where the channel is the
+  // last dimension its bias map reads, and the collapse follows it.
+  if (!found.transpose && scaled.hasOneUse()) {
+    if (auto collapse =
+            dyn_cast<tensor::CollapseShapeOp>(*scaled.getUsers().begin())) {
+      found.collapse = collapse;
+      scaled = collapse.getResult();
     }
   }
 
@@ -676,6 +692,15 @@ struct FuseInt8RequantEpilogue : public OpRewritePattern<ConvOp> {
                    rewriter, loc, result, transposeEmpty,
                    epilogue->transpose.getPermutation())
                    .getResult()[0];
+    }
+
+    if (epilogue->collapse) {
+      auto collapsedType = RankedTensorType::get(
+          epilogue->collapse.getResultType().getShape(), rewriter.getI8Type());
+      result = tensor::CollapseShapeOp::create(
+                   rewriter, loc, collapsedType, result,
+                   epilogue->collapse.getReassociationIndices())
+                   .getResult();
     }
 
     rewriter.replaceOp(epilogue->narrow, result);
