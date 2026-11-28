@@ -692,3 +692,136 @@ func.func @qdq_depthwise_dead_channel_folded(%x: tensor<1x32x8x8xi8>) -> tensor<
       ins(%acc, %sy, %zy : tensor<1x32x4x4xf32>, f32, i64) outs(%e8 : tensor<1x32x4x4xi8>) -> tensor<1x32x4x4xi8>
   return %q : tensor<1x32x4x4xi8>
 }
+
+// -----
+
+// A QDQ fully-connected layer as stock `quantize_static` ResNet50's
+// classifier arrives: `Gemm(transB = 1)` is a matmul of the DQ'd activation
+// against the transposed DQ'd [N, K] weight, then a broadcast bias add.
+// Per-channel weight scales 4e-3 to 1.6e-2 against sx 0.25 and sy 1 give
+// ratios 1e-3 to 4e-3: scale 4e-3, factors 1/4 to 1. The layer becomes the
+// 1x1 convolution `fc.rs` lowers an FC to -- [1, 1, M, K] image, [1, 1, K, N]
+// filter -- with the canonical requantization, collapsed back to [M, N].
+
+#map2 = affine_map<(d0, d1) -> (d0, d1)>
+#scalar2 = affine_map<(d0, d1) -> ()>
+#row2 = affine_map<(d0, d1) -> (d0)>
+#col2 = affine_map<(d0, d1) -> (d1)>
+#map1 = affine_map<(d0) -> (d0)>
+
+// CHECK-LABEL: func.func @qdq_fc_per_channel
+// CHECK-DAG:   %[[SCALE:.+]] = arith.constant 4.000000e-03 : f32
+// CHECK-DAG:   %[[CS:.+]] = arith.constant dense<[2.500000e-01, 5.000000e-01, 7.500000e-01, 1.000000e+00, 2.500000e-01, {{.*}}]> : tensor<8xf32>
+// CHECK:       %[[IMAGE:.+]] = tensor.expand_shape %{{.+}} {{\[}}[0, 1, 2], [3]] output_shape [1, 1, 1, 16] : tensor<1x16xi8> into tensor<1x1x1x16xi8>
+// CHECK:       %[[T:.+]] = linalg.transpose ins(%{{.+}} : tensor<8x16xi8>) outs(%{{.+}} : tensor<16x8xi8>) permutation = [1, 0]
+// CHECK:       %[[FILTER:.+]] = tensor.expand_shape %[[T]] {{\[}}[0, 1, 2], [3]] output_shape [1, 1, 16, 8] : tensor<16x8xi8> into tensor<1x1x16x8xi8>
+// CHECK:       %[[ACC:.+]] = linalg.conv_2d_nhwc_hwcf {{.*}} ins(%[[IMAGE]], %[[FILTER]] : tensor<1x1x1x16xi8>, tensor<1x1x16x8xi8>) {{.*}} -> tensor<1x1x1x8xi32>
+// CHECK:       %[[Q:.+]] = linalg.generic {{.*}}ins(%[[ACC]], %{{.+}}, %[[CS]], %[[SCALE]], %{{.+}}, %{{.+}}, %{{.+}} : tensor<1x1x1x8xi32>, tensor<8xi32>, tensor<8xf32>, f32, i32, f32, f32)
+// CHECK:       %[[OUT:.+]] = tensor.collapse_shape %[[Q]] {{\[}}[0, 1, 2], [3]] : tensor<1x1x1x8xi8> into tensor<1x8xi8>
+// CHECK-NOT:   linalg.matmul
+// CHECK-NOT:   iree_linalg_ext.quantize_affine
+// CHECK:       return %[[OUT]]
+func.func @qdq_fc_per_channel(%x: tensor<1x16xi8>) -> tensor<1x8xi8> {
+  %wq = arith.constant dense<3> : tensor<8x16xi8>
+  %sw = arith.constant dense<[4.000000e-03, 8.000000e-03, 1.200000e-02, 1.600000e-02, 4.000000e-03, 8.000000e-03, 1.200000e-02, 1.600000e-02]> : tensor<8xf32>
+  %bq = arith.constant dense<[100, -100, 7, 0, 1000, -1000, 3, 50]> : tensor<8xi32>
+  %sb = arith.constant dense<[1.000000e-03, 2.000000e-03, 3.000000e-03, 4.000000e-03, 1.000000e-03, 2.000000e-03, 3.000000e-03, 4.000000e-03]> : tensor<8xf32>
+  %sx = arith.constant 2.500000e-01 : f32
+  %sy = arith.constant 1.000000e+00 : f32
+  %zx = arith.constant -128 : i64
+  %zy = arith.constant -70 : i64
+  %zero = arith.constant 0.000000e+00 : f32
+  %e0 = tensor.empty() : tensor<1x16xf32>
+  %xf = iree_linalg_ext.dequantize_affine <indexing_maps = [#map2, #scalar2, #scalar2, #map2], quant_min = -128, quant_max = 127>
+      ins(%x, %sx, %zx : tensor<1x16xi8>, f32, i64) outs(%e0 : tensor<1x16xf32>) -> tensor<1x16xf32>
+  %e1 = tensor.empty() : tensor<8x16xf32>
+  %wf = iree_linalg_ext.dequantize_affine <indexing_maps = [#map2, #row2, #map2], quant_min = -128, quant_max = 127>
+      ins(%wq, %sw : tensor<8x16xi8>, tensor<8xf32>) outs(%e1 : tensor<8x16xf32>) -> tensor<8x16xf32>
+  %e2 = tensor.empty() : tensor<16x8xf32>
+  %wt = linalg.transpose ins(%wf : tensor<8x16xf32>) outs(%e2 : tensor<16x8xf32>) permutation = [1, 0]
+  %e3 = tensor.empty() : tensor<1x8xf32>
+  %init = linalg.fill ins(%zero : f32) outs(%e3 : tensor<1x8xf32>) -> tensor<1x8xf32>
+  %y = linalg.matmul ins(%xf, %wt : tensor<1x16xf32>, tensor<16x8xf32>) outs(%init : tensor<1x8xf32>) -> tensor<1x8xf32>
+  %e4 = tensor.empty() : tensor<8xf32>
+  %bf = iree_linalg_ext.dequantize_affine <indexing_maps = [#map1, #map1, #map1], quant_min = -2147483648, quant_max = 2147483647>
+      ins(%bq, %sb : tensor<8xi32>, tensor<8xf32>) outs(%e4 : tensor<8xf32>) -> tensor<8xf32>
+  %yb = linalg.elementwise <add> indexing_maps = [#map2, #col2, #map2] ins(%y, %bf : tensor<1x8xf32>, tensor<8xf32>) outs(%e3 : tensor<1x8xf32>) -> tensor<1x8xf32>
+  %e5 = tensor.empty() : tensor<1x8xi8>
+  %q = iree_linalg_ext.quantize_affine <indexing_maps = [#map2, #scalar2, #scalar2, #map2], quant_min = -128, quant_max = 127>
+      ins(%yb, %sy, %zy : tensor<1x8xf32>, f32, i64) outs(%e5 : tensor<1x8xi8>) -> tensor<1x8xi8>
+  return %q : tensor<1x8xi8>
+}
+
+// -----
+
+// The same layer without a bias and with a per-tensor weight scale: the
+// matmul feeds the quantization directly, the factors are all 1, and the
+// input zero point alone makes the folded bias (`-zx * sum_k(w)`).
+
+#map2 = affine_map<(d0, d1) -> (d0, d1)>
+#scalar2 = affine_map<(d0, d1) -> ()>
+
+// CHECK-LABEL: func.func @qdq_fc_per_tensor_no_bias
+// CHECK-DAG:   arith.constant dense<1.000000e+00> : tensor<8xf32>
+// CHECK:       linalg.conv_2d_nhwc_hwcf {{.*}} -> tensor<1x1x1x8xi32>
+// CHECK:       tensor.collapse_shape {{.*}} : tensor<1x1x1x8xi8> into tensor<1x8xi8>
+// CHECK-NOT:   iree_linalg_ext.quantize_affine
+func.func @qdq_fc_per_tensor_no_bias(%x: tensor<1x16xi8>) -> tensor<1x8xi8> {
+  %wq = arith.constant dense<3> : tensor<8x16xi8>
+  %sw = arith.constant 4.000000e-03 : f32
+  %sx = arith.constant 2.500000e-01 : f32
+  %sy = arith.constant 1.000000e+00 : f32
+  %zx = arith.constant -128 : i64
+  %zy = arith.constant -70 : i64
+  %zero = arith.constant 0.000000e+00 : f32
+  %e0 = tensor.empty() : tensor<1x16xf32>
+  %xf = iree_linalg_ext.dequantize_affine <indexing_maps = [#map2, #scalar2, #scalar2, #map2], quant_min = -128, quant_max = 127>
+      ins(%x, %sx, %zx : tensor<1x16xi8>, f32, i64) outs(%e0 : tensor<1x16xf32>) -> tensor<1x16xf32>
+  %e1 = tensor.empty() : tensor<8x16xf32>
+  %wf = iree_linalg_ext.dequantize_affine <indexing_maps = [#map2, #scalar2, #map2], quant_min = -128, quant_max = 127>
+      ins(%wq, %sw : tensor<8x16xi8>, f32) outs(%e1 : tensor<8x16xf32>) -> tensor<8x16xf32>
+  %e2 = tensor.empty() : tensor<16x8xf32>
+  %wt = linalg.transpose ins(%wf : tensor<8x16xf32>) outs(%e2 : tensor<16x8xf32>) permutation = [1, 0]
+  %e3 = tensor.empty() : tensor<1x8xf32>
+  %init = linalg.fill ins(%zero : f32) outs(%e3 : tensor<1x8xf32>) -> tensor<1x8xf32>
+  %y = linalg.matmul ins(%xf, %wt : tensor<1x16xf32>, tensor<16x8xf32>) outs(%init : tensor<1x8xf32>) -> tensor<1x8xf32>
+  %e5 = tensor.empty() : tensor<1x8xi8>
+  %q = iree_linalg_ext.quantize_affine <indexing_maps = [#map2, #scalar2, #scalar2, #map2], quant_min = -128, quant_max = 127>
+      ins(%y, %sy, %zy : tensor<1x8xf32>, f32, i64) outs(%e5 : tensor<1x8xi8>) -> tensor<1x8xi8>
+  return %q : tensor<1x8xi8>
+}
+
+// -----
+
+// Declined: a [K, N] weight used as it is, with no transpose. Its scales
+// would index K, not the output column, so it keeps its float form.
+
+#map2 = affine_map<(d0, d1) -> (d0, d1)>
+#scalar2 = affine_map<(d0, d1) -> ()>
+#row2 = affine_map<(d0, d1) -> (d0)>
+
+// CHECK-LABEL: func.func @qdq_fc_untransposed_weight_declined
+// CHECK:       linalg.matmul
+// CHECK:       iree_linalg_ext.quantize_affine
+func.func @qdq_fc_untransposed_weight_declined(%x: tensor<1x16xi8>) -> tensor<1x8xi8> {
+  %wq = arith.constant dense<3> : tensor<16x8xi8>
+  %sw = arith.constant dense<4.000000e-03> : tensor<16xf32>
+  %sx = arith.constant 2.500000e-01 : f32
+  %sy = arith.constant 1.000000e+00 : f32
+  %zx = arith.constant -128 : i64
+  %zy = arith.constant -70 : i64
+  %zero = arith.constant 0.000000e+00 : f32
+  %e0 = tensor.empty() : tensor<1x16xf32>
+  %xf = iree_linalg_ext.dequantize_affine <indexing_maps = [#map2, #scalar2, #scalar2, #map2], quant_min = -128, quant_max = 127>
+      ins(%x, %sx, %zx : tensor<1x16xi8>, f32, i64) outs(%e0 : tensor<1x16xf32>) -> tensor<1x16xf32>
+  %e1 = tensor.empty() : tensor<16x8xf32>
+  %wf = iree_linalg_ext.dequantize_affine <indexing_maps = [#map2, #row2, #map2], quant_min = -128, quant_max = 127>
+      ins(%wq, %sw : tensor<16x8xi8>, tensor<16xf32>) outs(%e1 : tensor<16x8xf32>) -> tensor<16x8xf32>
+  %e3 = tensor.empty() : tensor<1x8xf32>
+  %init = linalg.fill ins(%zero : f32) outs(%e3 : tensor<1x8xf32>) -> tensor<1x8xf32>
+  %y = linalg.matmul ins(%xf, %wf : tensor<1x16xf32>, tensor<16x8xf32>) outs(%init : tensor<1x8xf32>) -> tensor<1x8xf32>
+  %e5 = tensor.empty() : tensor<1x8xi8>
+  %q = iree_linalg_ext.quantize_affine <indexing_maps = [#map2, #scalar2, #scalar2, #map2], quant_min = -128, quant_max = 127>
+      ins(%y, %sy, %zy : tensor<1x8xf32>, f32, i64) outs(%e5 : tensor<1x8xi8>) -> tensor<1x8xi8>
+  return %q : tensor<1x8xi8>
+}

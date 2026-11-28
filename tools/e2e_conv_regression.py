@@ -1810,7 +1810,7 @@ def run_raw_gate(host: str, remote_dir: str, linker: str) -> None:
 
 def write_compiled_fixture(work_dir: Path) -> None:
     (work_dir / "conv.mlir").write_text(
-        CONV_MLIR + packed_weight_fixtures() + grouped_conv_fixture() + shift_lane_fixtures()
+        CONV_MLIR + packed_weight_fixtures() + grouped_conv_fixture() + shift_lane_fixtures() + fc_fixture()
     )
     rng = np.random.default_rng(20260830)
     weights = rng.uniform(-0.5, 0.5, size=(3, 3, 512, 512)).astype(np.float16)
@@ -2003,6 +2003,9 @@ def write_compiled_fixture(work_dir: Path) -> None:
     # within a few steps of the zero point).
     # Full-range input and filter: the accumulators are large too, |acc| up
     # to 64 * 128 * 128 (dense) and 9 * 128 * 128 (depthwise).
+    np.save(work_dir / "requant_int8_fc_2048x1000_input.npy", i8(1, 1, 1, 2048))
+    np.save(work_dir / "requant_int8_fc_2048x1000_kernel.npy", i8_small(1, 1, 2048, 1000))
+    np.save(work_dir / "requant_int8_fc_2048x1000_bias.npy", bias_i32(1000))
     np.save(work_dir / "requant_int8_1x1_shift_lanes_input.npy", i8(1, 16, 16, 64))
     np.save(work_dir / "requant_int8_1x1_shift_lanes_kernel.npy", i8(1, 1, 64, 64))
     np.save(work_dir / "requant_int8_1x1_shift_lanes_bias.npy", shift_lane_bias(64 * 128 * 128))
@@ -2322,6 +2325,7 @@ def compile_modules(
         # The BS shift lanes: factors down to 2^-48, both on a `_per_channel`
         # clone since the unit-factor cases share their executables.
         ("requant_int8_1x1_shift_lanes", "rocket_dynamic_int8_requant_executable_per_channel"),
+        ("requant_int8_fc_2048x1000", "rocket_dynamic_int8_requant_executable_per_channel"),
         (
             "requant_int8_dw3x3_shift_lanes",
             "rocket_dynamic_depthwise_int8_requant_pad1_executable_per_channel",
@@ -2527,6 +2531,61 @@ def shift_lane_bias(acc_bound: int) -> np.ndarray:
     raw = targets / (SHIFT_LANE_SCALE * SHIFT_LANE_FACTORS.astype(np.float64))
     limit = float(2**31 - 1 - acc_bound)
     return np.clip(np.round(raw), -limit, limit).astype(np.int32)
+
+
+def fc_fixture() -> str:
+    """ResNet50's classifier as `rocket-fuse-qdq-conv` lowers a QDQ Gemm: a
+    1x1 image of 2048 channels into 1000, per-channel factors 1/4 to 1.
+
+    A 1x1 image is geometry no other requantized fixture has; every other
+    one is at least 7x7.
+    """
+    factors = ", ".join(f"{0.25 + 0.75 * ((c * 7) % 16) / 15:.8e}" for c in range(1000))
+    return f"""
+// ---- a QDQ classifier on the requantized path ----
+func.func @requant_int8_fc_2048x1000(%input: tensor<1x1x1x2048xi8>, %filter: tensor<1x1x2048x1000xi8>, %bias: tensor<1000xi32>) -> tensor<1x1x1x1000xi8> {{
+  %c_zero = arith.constant 0 : i32
+  %c_acc_empty = tensor.empty() : tensor<1x1x1x1000xi32>
+  %c_acc_init = linalg.fill ins(%c_zero : i32) outs(%c_acc_empty : tensor<1x1x1x1000xi32>) -> tensor<1x1x1x1000xi32>
+  %c_acc = linalg.conv_2d_nhwc_hwcf
+      {{dilations = dense<1> : tensor<2xi64>, strides = dense<1> : tensor<2xi64>}}
+      ins(%input, %filter : tensor<1x1x1x2048xi8>, tensor<1x1x2048x1000xi8>)
+      outs(%c_acc_init : tensor<1x1x1x1000xi32>) -> tensor<1x1x1x1000xi32>
+  %out_scale = arith.constant 4.000000e-03 : f32
+  %out_zp = arith.constant -70 : i32
+  %out_min = arith.constant -1.280000e+02 : f32
+  %out_max = arith.constant 1.270000e+02 : f32
+  %out_empty = tensor.empty() : tensor<1x1x1x1000xi8>
+  %factors = arith.constant dense<[{factors}]> : tensor<1000xf32>
+  %out = linalg.generic {{
+      indexing_maps = [affine_map<(d0, d1, d2, d3) -> (d0, d1, d2, d3)>,
+                       affine_map<(d0, d1, d2, d3) -> (d3)>,
+                       affine_map<(d0, d1, d2, d3) -> (d3)>,
+                       affine_map<(d0, d1, d2, d3) -> ()>,
+                       affine_map<(d0, d1, d2, d3) -> ()>,
+                       affine_map<(d0, d1, d2, d3) -> ()>,
+                       affine_map<(d0, d1, d2, d3) -> ()>,
+                       affine_map<(d0, d1, d2, d3) -> (d0, d1, d2, d3)>],
+      iterator_types = ["parallel", "parallel", "parallel", "parallel"]}}
+      ins(%c_acc, %bias, %factors, %out_scale, %out_zp, %out_min, %out_max
+          : tensor<1x1x1x1000xi32>, tensor<1000xi32>, tensor<1000xf32>, f32, i32, f32, f32)
+      outs(%out_empty : tensor<1x1x1x1000xi8>) {{
+    ^bb0(%raw: i32, %channel_bias: i32, %channel_mul: f32, %sc: f32, %zpv: i32, %low: f32, %high: f32, %unused: i8):
+      %biased = arith.addi %raw, %channel_bias : i32
+      %real = arith.sitofp %biased : i32 to f32
+      %channel_scaled = arith.mulf %real, %channel_mul : f32
+      %scaled = arith.mulf %channel_scaled, %sc : f32
+      %rounded = math.roundeven %scaled : f32
+      %zpf = arith.sitofp %zpv : i32 to f32
+      %offset = arith.addf %rounded, %zpf : f32
+      %low_clamped = arith.maximumf %offset, %low : f32
+      %clamped = arith.minimumf %low_clamped, %high : f32
+      %narrowed = arith.fptosi %clamped : f32 to i8
+      linalg.yield %narrowed : i8
+  }} -> tensor<1x1x1x1000xi8>
+  return %out : tensor<1x1x1x1000xi8>
+}}
+"""
 
 
 def shift_lane_fixtures() -> str:
@@ -2977,6 +3036,17 @@ def run_compiled_gate(
                 "requant_int8_1x1_then_pad1_b2.npy",
             ),
             ("requant_int8_1x1_then_pad1_out_rocket.npy",),
+            1.0,
+            0.0,
+        ),
+        Case(
+            "requant_int8_fc_2048x1000",
+            (
+                "requant_int8_fc_2048x1000_input.npy",
+                "requant_int8_fc_2048x1000_kernel.npy",
+                "requant_int8_fc_2048x1000_bias.npy",
+            ),
+            ("requant_int8_fc_2048x1000_out_rocket.npy",),
             1.0,
             0.0,
         ),

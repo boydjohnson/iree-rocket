@@ -55,6 +55,10 @@
 // multiplier and shift lanes and `scale` in the per-tensor output
 // conversion.
 //
+// A QDQ fully-connected layer (`Gemm` with `transB = 1`) is the same
+// rewrite again: `FuseQdqMatmul` writes it as the 1x1 convolution of height
+// one that iree-rocket-hal's FC lowering already is (see there).
+//
 // A depthwise convolution is the same rewrite from a different start: the
 // channels-last conversion leaves it as the importer's NCHW
 // `depthwise_conv_2d_nchw_chw`, so `FuseQdqDepthwiseConv` emits the NHWC
@@ -1323,13 +1327,195 @@ struct FuseQdqDepthwiseConv : public OpRewritePattern<QuantizeAffineOp> {
   }
 };
 
+/// A QDQ fully-connected layer, `Q(DQ(x) @ transpose(DQ(w)) + DQ(b))` --
+/// ONNX `Gemm` with `transB = 1`, as ORT's `quantize_static` writes the
+/// classifier of every model it quantizes -- rewritten into the requantized
+/// int8 path as the 1x1 convolution `iree-rocket-hal`'s FC lowering
+/// (`fc.rs`) already is: `[M, K]` activation codes as the NHWC image
+/// `[1, 1, M, K]`, the `[N, K]` weight codes transposed to the HWCF filter
+/// `[1, 1, K, N]`, then the same canonical requantization a convolution
+/// gets, collapsed back to `[M, N]`. The `rocket_dynamic_int8_requant`
+/// matcher claims it like any 1x1, per-channel factors included, so the
+/// classifier no longer runs in fp16 between a CPU dequantization and a
+/// CPU quantization.
+///
+/// What arrives (IREE 3.14, stock ResNet50 and MobileNetV2):
+///
+///   %x  = dequantize_affine(%codes : [M, K] i8, sx, zx)
+///   %wt = transpose(dequantize_affine(%wq : [N, K] i8 const, sw), [1, 0])
+///   %y  = matmul(%x, %wt) outs(fill 0.0)
+///   %yb = elementwise <add>(%y, dequantize_affine(%bq : [N] i32, sb))
+///                                         // (d0, d1) -> (d1); optional
+///   %q  = quantize_affine(%yb, sy, zy)
+///
+/// The arithmetic is the convolution's (see the file comment): the bias
+/// scale is `sx * sw[n]`, the input zero point folds into the bias, and the
+/// factors split as `scale * m[n]`.
+struct FuseQdqMatmul : public OpRewritePattern<QuantizeAffineOp> {
+  using OpRewritePattern::OpRewritePattern;
+
+  LogicalResult matchAndRewrite(QuantizeAffineOp quant,
+                                PatternRewriter &rewriter) const override {
+    std::optional<Affine8> output = matchOutputQuant(quant);
+    if (!output) {
+      return failure();
+    }
+    Value value = output->codes;
+    auto resultType = dyn_cast<RankedTensorType>(value.getType());
+    if (!resultType || resultType.getRank() != 2 ||
+        !resultType.hasStaticShape() || !resultType.getElementType().isF32()) {
+      return failure();
+    }
+
+    // The optional bias add: the matmul result plus a rank-1 DQ'd bias
+    // broadcast over rows.
+    DequantizeAffineOp biasDequant;
+    if (auto add = value.getDefiningOp<linalg::ElementwiseOp>()) {
+      SmallVector<AffineMap> maps = add.getIndexingMapsArray();
+      MLIRContext *context = rewriter.getContext();
+      AffineMap identity = AffineMap::getMultiDimIdentityMap(2, context);
+      AffineMap row = AffineMap::get(2, 0, {getAffineDimExpr(1, context)},
+                                     context);
+      if (add.getKind() != linalg::ElementwiseKind::add ||
+          add.getNumDpsInputs() != 2 || maps.size() != 3 ||
+          maps[0] != identity || maps[1] != row || maps[2] != identity ||
+          !value.hasOneUse()) {
+        return rewriter.notifyMatchFailure(quant, "not a matmul + bias");
+      }
+      biasDequant = add.getDpsInputs()[1].getDefiningOp<DequantizeAffineOp>();
+      if (!biasDequant || !(isPerTensor(biasDequant) || isPerChannel(biasDequant)) ||
+          zeroPointOf(biasDequant) != 0 ||
+          biasDequant.getInputType().getRank() != 1 ||
+          !biasDequant.getInputType().getElementType().isSignlessInteger(32) ||
+          !biasDequant.getOutputType().getElementType().isF32()) {
+        return rewriter.notifyMatchFailure(quant, "bias is not a DQ'd i32");
+      }
+      value = add.getDpsInputs()[0];
+    }
+    auto matmul = value.getDefiningOp<linalg::MatmulOp>();
+    if (!matmul || !value.hasOneUse() ||
+        matmul.getDpsInits().size() != 1) {
+      return rewriter.notifyMatchFailure(quant, "not fed by a matmul");
+    }
+    // Plain row-major [M, K] x [K, N]: the default maps, no broadcast or
+    // transpose folded into the op itself.
+    if (matmul.hasUserDefinedMaps()) {
+      return failure();
+    }
+    auto init = matmul.getDpsInits()[0].getDefiningOp<linalg::FillOp>();
+    std::optional<double> initValue =
+        init ? constantFloat(init.getInputs()[0]) : std::nullopt;
+    if (!initValue || *initValue != 0.0) {
+      return rewriter.notifyMatchFailure(quant, "matmul init is not zero");
+    }
+
+    auto lhsDequant = matmul.getDpsInputs()[0].getDefiningOp<DequantizeAffineOp>();
+    FailureOr<LayoutChain> filterChain = walkToDequant(matmul.getDpsInputs()[1]);
+    std::optional<Affine8> input = matchActivationDequant(lhsDequant);
+    if (!input || failed(filterChain)) {
+      return rewriter.notifyMatchFailure(quant, "operands are not DQ'd");
+    }
+    // The weight is the ONNX [N, K] tensor behind one [1, 0] transpose, so
+    // its per-channel scales index the output column, as a filter's do.
+    if (filterChain->ops.size() != 1) {
+      return failure();
+    }
+    auto transpose = dyn_cast<linalg::TransposeOp>(filterChain->ops[0]);
+    if (!transpose || transpose.getPermutation() != ArrayRef<int64_t>{1, 0}) {
+      return failure();
+    }
+    std::optional<WeightDequant> weights =
+        matchWeightDequant(filterChain->dequant);
+    if (!weights) {
+      return rewriter.notifyMatchFailure(quant, "weight DQ is not supported");
+    }
+    int64_t rows = resultType.getDimSize(0);
+    int64_t channels = resultType.getDimSize(1);
+    auto codesType = cast<RankedTensorType>(input->codes.getType());
+    auto weightType = cast<RankedTensorType>(weights->codes.getType());
+    if (codesType.getRank() != 2 || !codesType.hasStaticShape() ||
+        codesType.getDimSize(0) != rows ||
+        weightType.getDimSize(0) != channels ||
+        weightType.getDimSize(1) != codesType.getDimSize(1)) {
+      return failure();
+    }
+    int64_t depth = codesType.getDimSize(1);
+    if (biasDequant &&
+        (biasDequant.getInputType().getDimSize(0) != channels ||
+         !biasScaleMatches(biasDequant, input->scale, *weights, channels))) {
+      return rewriter.notifyMatchFailure(quant, "bias scale is not sx * sw");
+    }
+    std::optional<RequantScales> scales = computeRequantScales(
+        *input, *weights, biasDequant, output->scale, channels);
+    if (!scales) {
+      return rewriter.notifyMatchFailure(
+          quant, "requantization ratio out of range, or a live channel's "
+                 "factor below what the BS lanes carry");
+    }
+
+    Location loc = matmul.getLoc();
+    rewriter.setInsertionPoint(quant);
+    auto [filterCodes, biasCodes] = foldDeadChannels(
+        rewriter, loc, *scales, weights->codes,
+        biasDequant ? biasDequant.getInput() : Value(), channels);
+    Type i8 = rewriter.getI8Type();
+    Type i32 = rewriter.getI32Type();
+
+    // [M, K] -> NHWC [1, 1, M, K].
+    Value codes = input->codes;
+    if (input->isUnsigned) {
+      codes = emitShift(rewriter, loc, codes);
+    }
+    SmallVector<ReassociationIndices> toImage = {{0, 1, 2}, {3}};
+    Value image = tensor::ExpandShapeOp::create(
+        rewriter, loc, RankedTensorType::get({1, 1, rows, depth}, i8), codes,
+        toImage);
+    // [N, K] -> [K, N] -> HWCF [1, 1, K, N].
+    Value weightEmpty = tensor::EmptyOp::create(rewriter, loc, {depth, channels}, i8);
+    Value transposed =
+        linalg::TransposeOp::create(rewriter, loc, filterCodes, weightEmpty,
+                                    ArrayRef<int64_t>{1, 0})
+            .getResult()[0];
+    SmallVector<ReassociationIndices> toFilter = {{0, 1, 2}, {3}};
+    Value filter = tensor::ExpandShapeOp::create(
+        rewriter, loc, RankedTensorType::get({1, 1, depth, channels}, i8),
+        transposed, toFilter);
+
+    Value zero =
+        arith::ConstantOp::create(rewriter, loc, rewriter.getI32IntegerAttr(0));
+    SmallVector<int64_t> accShape = {1, 1, rows, channels};
+    Value accEmpty = tensor::EmptyOp::create(rewriter, loc, accShape, i32);
+    Value accInit = linalg::FillOp::create(rewriter, loc, ValueRange{zero},
+                                           ValueRange{accEmpty})
+                        .getResult(0);
+    auto attrType = RankedTensorType::get({2}, rewriter.getIntegerType(64));
+    Value integerAcc =
+        linalg::Conv2DNhwcHwcfOp::create(
+            rewriter, loc, TypeRange{accInit.getType()},
+            ValueRange{image, filter}, ValueRange{accInit},
+            DenseIntElementsAttr::get(attrType, ArrayRef<int64_t>{1, 1}),
+            DenseIntElementsAttr::get(attrType, ArrayRef<int64_t>{1, 1}))
+            .getResult(0);
+    Value bias = emitFoldedBias(rewriter, loc, biasCodes, filter,
+                                input->zeroPoint, channels);
+    Value result = emitRequantTail(rewriter, loc, integerAcc, bias, *scales,
+                                   *output, ArrayRef<int64_t>{});
+    SmallVector<ReassociationIndices> toMatrix = {{0, 1, 2}, {3}};
+    result = tensor::CollapseShapeOp::create(
+        rewriter, loc, quant->getResult(0).getType(), result, toMatrix);
+    rewriter.replaceOp(quant, result);
+    return success();
+  }
+};
+
 struct RocketFuseQdqConvPass
     : public PassWrapper<RocketFuseQdqConvPass, OperationPass<>> {
   MLIR_DEFINE_EXPLICIT_INTERNAL_INLINE_TYPE_ID(RocketFuseQdqConvPass)
 
   StringRef getArgument() const final { return "rocket-fuse-qdq-conv"; }
   StringRef getDescription() const final {
-    return "Rewrites an ONNX QDQ convolution, Q(conv(DQ(x), DQ(w)) + DQ(b)) "
+    return "Rewrites an ONNX QDQ convolution, Q(conv(DQ(x), DQ(w)) + DQ(b)), "
+           "or fully-connected layer as a 1x1 convolution, "
            "with per-tensor or per-channel weight scales, into the canonical "
            "requantized int8 form "
            "the Rocket int8_requant matchers claim, folding the input zero "
@@ -1344,7 +1530,7 @@ struct RocketFuseQdqConvPass
   void runOnOperation() final {
     MLIRContext *context = &getContext();
     RewritePatternSet patterns(context);
-    patterns.add<FuseQdqConv, FuseQdqDepthwiseConv>(context);
+    patterns.add<FuseQdqConv, FuseQdqDepthwiseConv, FuseQdqMatmul>(context);
     // No folding, as in the other int8 fusions: the folder would hoist the
     // canonical generic's scalar operands and fold its transposes before
     // the matchers see them.
