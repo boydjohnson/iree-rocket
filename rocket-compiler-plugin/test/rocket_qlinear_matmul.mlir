@@ -11,7 +11,7 @@
 // RUN:   --mlir-print-op-generic=false \
 // RUN:   -o - | FileCheck %s --check-prefix=SPEC
 
-// An ONNX QLinearMatMul, as `tools/quantize_onnx_int8.py --quantize-gemm`
+// An ONNX QLinearMatMul, as `tools/quantize_onnx_int8.py --quantize-classifier`
 // writes ResNet50's classifier and torch-mlir imports it: the `ui8`
 // activation shifted to signed, a `linalg.quantized_matmul` against the
 // constant `[K, N]` weight with the shifted zero point -128, then the same

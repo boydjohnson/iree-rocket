@@ -50,7 +50,7 @@
 // is what lets an int8 MobileNetV2's depthwise pads reach the CNA.
 //
 // **And a quantized matmul becomes a 1x1 convolution.** An ONNX
-// `QLinearMatMul` (what `tools/quantize_onnx_int8.py --quantize-gemm` turns a
+// `QLinearMatMul` (what `tools/quantize_onnx_int8.py --quantize-classifier` turns a
 // classifier `Gemm` into) imports as `linalg.quantized_matmul` with the same
 // scalar zero points and the same five-op requantization epilogue as a
 // QLinearConv, and nothing downstream claims it: `quantized-conv-to-conv` has
