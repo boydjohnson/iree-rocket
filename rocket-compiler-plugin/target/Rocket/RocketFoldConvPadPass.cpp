@@ -193,12 +193,13 @@ static Operation *soleUser(Value value) {
 
 /// Whether `accumulator` is read only by the canonical requantization
 /// epilogue: one `linalg.generic` taking the i32 accumulator, the per-channel
-/// bias, and the scale, zero point and two clamp bounds as scalars, and
-/// writing i8. That is the shape `rocket-fuse-int8-requant-epilogue` emits
-/// and the only one the requantized pad1 matchers claim.
+/// bias and requantization factor, and the scale, zero point and two clamp
+/// bounds as scalars, and writing i8. That is the shape
+/// `rocket-fuse-int8-requant-epilogue` and `rocket-fuse-qdq-conv` emit and
+/// the only one the requantized pad1 matchers claim.
 static bool feedsRequantEpilogue(Value accumulator) {
   auto epilogue = dyn_cast_or_null<linalg::GenericOp>(soleUser(accumulator));
-  if (!epilogue || epilogue.getNumDpsInputs() != 6 ||
+  if (!epilogue || epilogue.getNumDpsInputs() != 7 ||
       epilogue.getNumDpsInits() != 1) {
     return false;
   }

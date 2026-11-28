@@ -126,6 +126,9 @@ bool describe(Site &site) {
     }
     bool depthwise = boolFlag(config, "depthwise");
     bool epilogueAdd = boolFlag(config, "epilogue_add");
+    // Conv2DDef.per_channel_scale: a fourth input, the f32 factors, always
+    // read dense.
+    bool perChannelScale = boolFlag(config, "per_channel_scale");
     // The output extents the runtime derives: ask the planner, which is what
     // the driver's `Shape::output_width` is, rather than restate the
     // formula. Padding is the def's explicit pair, defaulting to zero.
@@ -155,7 +158,7 @@ bool describe(Site &site) {
     }
     size_t inElem = inputElementBytes(*precision);
     size_t outElem = outputElementBytes(*precision);
-    site.inputs.assign(epilogueAdd ? 4 : 3, std::nullopt);
+    site.inputs.assign(epilogueAdd || perChannelScale ? 4 : 3, std::nullopt);
     if (*cin > ROCKET_PLAN_MAX_DENSE_CHANNELS) {
       site.inputs[0] = cube(ROCKET_PLAN_CUBE_CONV, inElem, *width, *height, *cin);
     }

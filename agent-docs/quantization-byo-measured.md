@@ -684,9 +684,154 @@ Against onnxruntime (`*.oracle.npy`):
 ### What is left
 
 1. **Per-channel weight scales** on the int8 path, as before: the ABI
-   change. It is now the whole gap on `ort_qdq_pc`.
+   change. It is now the whole gap on `ort_qdq_pc`. *Done for most layers:
+   next section.*
 2. **Linear int8 residual add** (MobileNetV2).
 3. **A folded weight the planner then refuses** stays on the CPU as an f32
    constant in an offloading build, because the fold runs before
    placement. No current model has one: all four QDQ imports pack every
    weight.
+
+## Follow-up: per-channel weight scales on the requantized path (2026-11-27)
+
+ORT's `quantize_static(per_channel=True)` gives each output channel its own
+weight scale, so the requantization ratio `sx * sw[c] / sy` is per channel.
+The DPU already has a per-channel multiplier: each BS entry carries a 16-bit
+`multiplier` lane next to its bias, read from memory (`bs_mul_src = 1`)
+whenever the conv is quantized. Until now every lane held the unit value
+`2^14`. The vendor uses it for exactly this
+(`bs_buffer_matches_the_converted_models`: lanes `1024 * (c + 1)` for weight
+scales `0.01 * (c + 1)`). What was missing was a way to carry the factors
+from the compiler to the driver.
+
+### The ABI
+
+- **Canonical form.** The requantization generic takes one more operand,
+  `channel_scale: tensor<Cout x f32>` indexed by the channel, and multiplies
+  by it before the per-tensor scale. So channel `c` is requantized by
+  `m[c] * scale`.
+  - `rocket-fuse-qdq-conv` writes `scale = max_c(sx * sw[c] / sy)` and
+    `m[c] = ratio[c] / scale`, in (0, 1].
+  - Per-tensor weights, and every QOperator convolution
+    (`rocket-fuse-int8-requant-epilogue`), get `m = 1` on every channel:
+    exact in f32, and the unit lane they always had.
+- **`Conv2DDef.per_channel_scale`.** This adds a fifth binding after the
+  bias: `Cout` f32 factors. The bindings are then input, weights, bias,
+  scales, output. The driver writes `round(2^14 * m[c])` into each
+  multiplier lane (`pack_int8_bias_to_bs_per_channel`) and refuses a factor
+  that rounds to 0 or passes the signed lane. The flag excludes
+  `epilogue_add`. An executable without it reads `m = 1`, so an older module
+  runs unchanged: #122's modules give bit-identical output on the new
+  runtime.
+- **Why a separate binding, not the factors after the biases in one
+  binding.** That was the first version. Concatenating in the shim needs a
+  `tensor.concat` on dynamic types. IREE does not constant-fold it, and its
+  tensor-to-flow conversion replaces the value with a static
+  `flow.tensor.update` without fixing the dispatch's dims (`value set has 7
+  dynamic dimensions but only 8 dimension values`). A separate binding
+  needs no op in the shim at all.
+- **`rocket-drop-unit-channel-scales`.** This pass runs at the end of
+  preprocessing. IREE does not store a splat `dense<1.0>` in the module; it
+  materializes it with a fill on every call, between the Rocket dispatches
+  it feeds. So for a per-tensor convolution the new binding costs:
+  - ResNet50 `ours_skip`: 4 -> 5 NPU submissions and 4 -> 6 compactions per
+    call;
+  - same-session A/B: 17.8 -> 18.6 ms, `ort_qdq` 17.5 -> 17.8 ms.
+
+  The pass rewrites the spec's executable in place for its unit-factor
+  dispatches: no flag, four bindings. Dispatches with real factors move to
+  a `_per_channel` clone when both kinds share the executable. **Every survey
+  model and every per-tensor quantized model now compiles to executables and
+  constants byte-identical to #122's.** Only `module.fb` differs, in 21 bytes
+  of debug line numbers into the spec.
+
+### The precision gate
+
+The lane resolves `m` to `2^-14`, a relative error of at most `2^-15 / m`.
+`rocket-fuse-qdq-conv` therefore declines a convolution when any channel's
+`m` is below `kMinChannelScale = 1/128`. There the error is half a code on
+the widest unclamped output, which keeps the path's one-code tolerance.
+Measured on the stock per-channel models, before compiling:
+
+| model | layers whose smallest `m` >= 1/128 | with near-dead channels |
+|---|---|---|
+| ResNet50 `ort_qdq_pc` | 37 / 53 | 16 (smallest `m` 9e-8) |
+| MobileNetV2 `ort_qdq_pc` | 39 / 52 | 13 (smallest `m` 7e-8) |
+
+The compiled placement agrees: ResNet50 37 int8 and 17 fp16 candidates (16
+convolutions plus the FC), MobileNetV2 39 int8 and 14 fp16. The declined
+layers keep #122's fp16 path. A "dead" channel has a scale around `1e-7` of
+the layer's largest. If its whole conv term is below a fraction of a code,
+the channel could be folded into its bias with unit `m`. That would admit
+1 more ResNet50 layer and 10 more MobileNetV2 layers (by the bound
+`sum|w| * 128 * ratio < 1/256`). The other 15 ResNet50 layers have small-`m`
+channels whose conv term reaches 3 to 65 codes, which one 16-bit lane cannot
+carry.
+
+### Lit
+
+- `rocket_fuse_qdq_conv.mlir`:
+  - per-channel dense with a per-channel bias scale (output scale 0.004,
+    factors 1/4 to 1);
+  - per-channel depthwise on the `[C, 1, kh, kw]` filter;
+  - a factor-below-1/128 decline;
+  - the per-tensor case checks its `dense<1.0>` factors;
+  - a non-constant per-channel scale still declines.
+- `rocket_qdq_conv_match.mlir` (whole spec): the per-channel convolution
+  lands on `rocket_dynamic_int8_requant_executable_per_channel` with its
+  factors binding. The per-tensor ones land on the spec's own executable,
+  without `per_channel_scale` and with four bindings. The tiny-factor case
+  stays fp16.
+- `rocket_int8_requant_match.mlir`: the canonical form with the factor
+  operand. One case is non-unit and keeps the binding.
+- `rocket-fold-conv-pad` counts the epilogue's seven inputs.
+- 59/59 plugin lit, iree-rocket-hal 208 (two new: lanes and refusals),
+  rocket-hal-driver 67 (`decodes_per_channel_scale`), rocket-compiler 56.
+
+### Board
+
+orangepi, 7.3.6, NPU at its 600 MHz default, governor `performance`,
+`--task_topology_cpu_ids=4,5,6,7`, the runtime from this branch.
+`bench_board.sh` as before: 6 kept repetitions, median ms, each run gated on
+30 s with no other `iree-*` process.
+
+| NPU arm | #122 | this change |
+|---|---|---|
+| ResNet50 `ort_qdq_pc` | 79 / 79.8 | **54.7 / 55.15**, final build 58.55 / 54.65 |
+| MobileNetV2 `ort_qdq_pc` | 44.4 / 47.95 | **21.25 / 20.15**, final build 20.4 / 20.95 |
+| ResNet50 `ours_skip`, same-session A/B | 18 / 17 / 17 / 16.85 | 17 / 17.25 / 17.6 / 17.3 |
+
+- The per-tensor models' executables are byte-identical to #122's, so they
+  were not re-timed beyond the `ours_skip` A/B.
+- Per-channel ResNet50 is still 3x the per-tensor build. `ROCKET_PROFILE`:
+  the 16 fp16 convolutions pay a dense pack of their int8-sourced input
+  (11 ms/call) and an output compaction (21 ms/call) at each int8/fp16
+  boundary. The dead-channel fold above is the next lever.
+
+**e2e gate** (`tools/e2e_conv_regression.py --skip-raw`, every `requant_*`
+fixture, all now in the new canonical form): 21/21 pass, max|error| <= 1, 0
+mismatches past atol 1. `requant_int8_1x1_cin512` now carries factors 1/4
+to 1 and checks the BS lane against the CPU reference: max|error| 1, 0/65536.
+
+### Accuracy (against onnxruntime, the import's input)
+
+| arm | argmax | top-5 | max\|d\| |
+|---|---|---|---|
+| ResNet50 `ort_qdq_pc` NPU | equal | 5/5 | 0.151 (#122: 0.101) |
+| MobileNetV2 `ort_qdq_pc` NPU | equal | 5/5 | 0.064 (#122: 0.064) |
+| ResNet50 `ort_qdq_pc` `--no-offload` | equal | 5/5 | 0.101 |
+| MobileNetV2 `ort_qdq_pc` `--no-offload` | equal | 4/5 | 0.043 |
+
+- **Per-tensor models:** bit-identical to #122 (ResNet50 `ort_qdq` on all
+  five inputs, MobileNetV2 `ort_qdq`).
+- **Per-channel `--no-offload` arms:** these change, because the integer
+  rewrite runs there too, as it does for per-tensor QDQ since #120.
+
+### What is left
+
+1. **Dead-channel fold** (above): 1 more ResNet50 layer and 10 more
+   MobileNetV2 layers onto int8.
+2. **The 15 ResNet50 layers no 16-bit lane can carry:** a second
+   per-channel multiply (the BN plane) or a split of the layer by channel
+   magnitude.
+3. **Linear int8 residual add** (MobileNetV2), as before.

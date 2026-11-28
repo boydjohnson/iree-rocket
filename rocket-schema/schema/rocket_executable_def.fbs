@@ -301,6 +301,17 @@ table Conv2DDef {
   // means. Set by rocket-pack-weights when the constant filter is block-
   // diagonal.
   groups:uint32 = 1;
+
+  // Per-output-channel requantization (int8 with runtime_quantization
+  // output_scale only): one more input binding, after the bias, of
+  // output_channels float32 factors m[c] in (0, 2), applied ahead of the
+  // per-tensor output multiplier, so channel c is requantized by
+  // m[c] * input_scale * weights_scale / output_scale. The bindings are then
+  // input, weights, bias, scales, output; epilogue_add is excluded. The
+  // runtime writes each m[c] into the BS plane's per-channel multiplier
+  // lane. False (or absent, in an older executable) is m[c] = 1 for every
+  // channel. Appended last, for the vtable reason above.
+  per_channel_scale:bool = false;
 }
 
 // DEPRECATED: superseded by MatmulDef. Retained because union tags are

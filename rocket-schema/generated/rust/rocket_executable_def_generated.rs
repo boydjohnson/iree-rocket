@@ -1365,6 +1365,7 @@ impl<'a> Conv2DDef<'a> {
   pub const VT_WEIGHTS_PACKED: flatbuffers::VOffsetT = 58;
   pub const VT_RUNTIME_LAYOUT: flatbuffers::VOffsetT = 60;
   pub const VT_GROUPS: flatbuffers::VOffsetT = 62;
+  pub const VT_PER_CHANNEL_SCALE: flatbuffers::VOffsetT = 64;
 
   #[inline]
   pub fn init_from_table(table: flatbuffers::Table<'a>) -> Self {
@@ -1398,6 +1399,7 @@ impl<'a> Conv2DDef<'a> {
     builder.add_input_channels(args.input_channels);
     builder.add_input_height(args.input_height);
     builder.add_input_width(args.input_width);
+    builder.add_per_channel_scale(args.per_channel_scale);
     builder.add_runtime_layout(args.runtime_layout);
     builder.add_weights_packed(args.weights_packed);
     builder.add_runtime_dense_readers(args.runtime_dense_readers);
@@ -1530,6 +1532,10 @@ impl<'a> Conv2DDef<'a> {
   pub fn groups(&self) -> u32 {
     self._tab.get::<u32>(Conv2DDef::VT_GROUPS, Some(1)).unwrap()
   }
+  #[inline]
+  pub fn per_channel_scale(&self) -> bool {
+    self._tab.get::<bool>(Conv2DDef::VT_PER_CHANNEL_SCALE, Some(false)).unwrap()
+  }
 }
 
 impl flatbuffers::Verifiable for Conv2DDef<'_> {
@@ -1569,6 +1575,7 @@ impl flatbuffers::Verifiable for Conv2DDef<'_> {
      .visit_field::<bool>("weights_packed", Self::VT_WEIGHTS_PACKED, false)?
      .visit_field::<bool>("runtime_layout", Self::VT_RUNTIME_LAYOUT, false)?
      .visit_field::<u32>("groups", Self::VT_GROUPS, false)?
+     .visit_field::<bool>("per_channel_scale", Self::VT_PER_CHANNEL_SCALE, false)?
      .finish();
     Ok(())
   }
@@ -1604,6 +1611,7 @@ pub struct Conv2DDefArgs<'a> {
     pub weights_packed: bool,
     pub runtime_layout: bool,
     pub groups: u32,
+    pub per_channel_scale: bool,
 }
 impl<'a> Default for Conv2DDefArgs<'a> {
   #[inline]
@@ -1639,6 +1647,7 @@ impl<'a> Default for Conv2DDefArgs<'a> {
       weights_packed: false,
       runtime_layout: false,
       groups: 1,
+      per_channel_scale: false,
     }
   }
 }
@@ -1769,6 +1778,10 @@ impl<'a: 'b, 'b> Conv2DDefBuilder<'a, 'b> {
     self.fbb_.push_slot::<u32>(Conv2DDef::VT_GROUPS, groups, 1);
   }
   #[inline]
+  pub fn add_per_channel_scale(&mut self, per_channel_scale: bool) {
+    self.fbb_.push_slot::<bool>(Conv2DDef::VT_PER_CHANNEL_SCALE, per_channel_scale, false);
+  }
+  #[inline]
   pub fn new(_fbb: &'b mut flatbuffers::FlatBufferBuilder<'a>) -> Conv2DDefBuilder<'a, 'b> {
     let start = _fbb.start_table();
     Conv2DDefBuilder {
@@ -1816,6 +1829,7 @@ impl core::fmt::Debug for Conv2DDef<'_> {
       ds.field("weights_packed", &self.weights_packed());
       ds.field("runtime_layout", &self.runtime_layout());
       ds.field("groups", &self.groups());
+      ds.field("per_channel_scale", &self.per_channel_scale());
       ds.finish()
   }
 }

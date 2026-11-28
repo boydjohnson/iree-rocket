@@ -217,6 +217,11 @@ pub struct Conv2dExecutable {
     /// tasks (`rocket_core::grouped::GroupedConv`), its weights binding the
     /// grouped packed stream. 1 is dense.
     pub groups: u32,
+    /// `Conv2DDef.per_channel_scale`: a binding after the bias of `Cout` f32
+    /// requantization factors, which the BS plane multiplies by ahead of the
+    /// per-tensor output conversion; the bindings are then input, weights,
+    /// bias, scales, output. Int8 with runtime quantization only.
+    pub per_channel_scale: bool,
 }
 
 impl Conv2dExecutable {
@@ -232,6 +237,7 @@ impl Conv2dExecutable {
             runtime_layout: false,
             weights_packed: false,
             groups: 1,
+            per_channel_scale: false,
         }
     }
 
@@ -288,6 +294,18 @@ impl Conv2dExecutable {
                     return Err("runtime Conv2D quantization parameters require int8 precision");
                 }
             }
+        }
+
+        // The per-channel factors ride on the requantized path's BS plane:
+        // no other precision multiplies there, and without a runtime output
+        // scale nothing pairs them with the dispatch's own multiplier.
+        if self.per_channel_scale
+            && (!matches!(self.shape_template.precision, Precision::Int8(_))
+                || !self
+                    .runtime_quantization
+                    .contains(&RuntimeConv2dQuantParam::OutputScale))
+        {
+            return Err("per-channel Conv2D scales require int8 runtime quantization");
         }
 
         if self.runtime_dimensions.is_empty() && self.runtime_quantization.is_empty() {
@@ -1373,6 +1391,7 @@ mod tests {
             runtime_layout: false,
             weights_packed: false,
             groups: 1,
+            per_channel_scale: false,
         }
     }
 
@@ -1441,6 +1460,7 @@ mod tests {
             runtime_layout: false,
             weights_packed: false,
             groups: 1,
+            per_channel_scale: false,
         };
         assert!(executable.resolve_shape(&constants(&[99, 99])).is_err());
     }

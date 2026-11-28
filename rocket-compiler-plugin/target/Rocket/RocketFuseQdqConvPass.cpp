@@ -44,11 +44,15 @@
 //   %acc  = conv_2d_nhwc_hwcf(%xt, %wt) outs(fill 0) : i32
 //   %sumw = reduce(%wt) over (kh, kw, cin)        // rank 1
 //   %bias = %bq - zx * %sumw                      // rank 1, folds
-//   %s8   = generic(%acc, %bias, scale, zp, -128, 127)   // canonical
+//   %s8   = generic(%acc, %bias, m, scale, zp, -128, 127)  // canonical
 //   %q'   = transpose((addi -128)? (%s8)) to NCHW  // replaces %q
 //
-// with `scale = sx * sw / sy` rounded once to f32, and `zp` the output zero
-// point in the signed encoding.
+// with `zp` the output zero point in the signed encoding. Per-tensor weights
+// give `scale = sx * sw / sy`, rounded once to f32, and a per-channel
+// factor `m` of exactly 1 on every channel. Per-channel weights give
+// `scale = max_c(sx * sw[c] / sy)` and `m[c] = (sx * sw[c] / sy) / scale`,
+// in (0, 1]: the hardware applies `m[c]` on the BS plane's per-channel
+// multiplier lane and `scale` in the per-tensor output conversion.
 //
 // A depthwise convolution is the same rewrite from a different start: the
 // channels-last conversion leaves it as the importer's NCHW
@@ -88,14 +92,16 @@
 //
 // # Scope
 //
-// Per-tensor weight scales only. A per-channel weight scale makes the
-// requantization ratio per channel, which the BS plane can carry
-// (iree-rocket-hal `pack_int8_bias_to_bs`) but the executable ABI cannot yet:
-// its `output_scale` push constant is one value. Those convolutions are
-// declined and keep the fp16 path. So are a nonzero weight zero point (its
-// correction term depends on the activation, not just the filter), a bias
-// whose scale is not `sx * sw`, and any clamp range narrower than the full
-// 8-bit one.
+// Per-tensor or per-channel weight scales (one per output channel, ORT's
+// `per_channel=True`). A per-channel convolution is declined when one of its
+// channels' factors `m[c]` is below `kMinChannelScale`: the BS multiplier
+// lane is `round(2^14 * m)`, too coarse there for the one-code tolerance.
+// Measured on stock `quantize_static` per-channel models, that keeps 37 of
+// ResNet50's 53 convolutions and 39 of MobileNetV2's 52; the rest carry
+// near-dead channels (scales around 1e-7 of the layer's largest) and keep
+// the fp16 path. So does a nonzero weight zero point (its correction term
+// depends on the activation, not just the filter), a bias whose scale is not
+// `sx * sw[c]`, and any clamp range narrower than the full 8-bit one.
 
 #include "iree/compiler/Dialect/LinalgExt/IR/LinalgExtOps.h"
 #include "mlir/Dialect/Arith/IR/Arith.h"
@@ -104,6 +110,7 @@
 #include "mlir/Dialect/Tensor/IR/Tensor.h"
 #include "mlir/Dialect/Utils/StaticValueUtils.h"
 #include "mlir/IR/BuiltinTypes.h"
+#include "mlir/IR/DialectResourceBlobManager.h"
 #include "mlir/IR/Matchers.h"
 #include "mlir/IR/PatternMatch.h"
 #include "mlir/Pass/Pass.h"
@@ -111,7 +118,9 @@
 #include "llvm/ADT/DenseSet.h"
 #include "llvm/ADT/SmallVector.h"
 
+#include <algorithm>
 #include <cmath>
+#include <cstring>
 
 namespace mlir::iree_compiler::IREE::HAL {
 namespace {
@@ -130,6 +139,13 @@ constexpr double kBiasScaleTolerance = 1.0 / (1 << 20);
 /// convolution operand it feeds. The padded activation is the longest, at
 /// four (transpose, expand_shape, pad, collapse_shape).
 constexpr int kMaxChain = 6;
+/// The smallest per-channel requantization factor, relative to the layer's
+/// largest, that the per-channel path admits. The BS plane's multiplier lane
+/// holds `round(2^14 * m)`, so its relative error is at most `2^-15 / m`;
+/// at `m = 2^-7` that is `2^-8`, half a code on the widest unclamped output
+/// (|y| <= 128). Below it a channel can be off by more than the one code the
+/// requantized path's e2e gate allows, so the convolution keeps fp16.
+constexpr double kMinChannelScale = 1.0 / 128.0;
 
 static std::optional<double> constantFloat(Value value) {
   APFloat result(0.0f);
@@ -207,23 +223,168 @@ static std::optional<Affine8> matchActivationDequant(DequantizeAffineOp op) {
   return found;
 }
 
-/// A weight dequantization: constant signed `i8`, per tensor, symmetric.
-static std::optional<Affine8> matchWeightDequant(DequantizeAffineOp op) {
-  if (!op || !isPerTensor(op) || op.getInputUnsigned() ||
+/// The values of a constant rank-1 f32 tensor of `size` elements, dense
+/// (splat included) or `dense_resource`.
+static std::optional<SmallVector<double>> constantF32Vector(Value value,
+                                                            int64_t size) {
+  auto type = dyn_cast<RankedTensorType>(value.getType());
+  Attribute attr;
+  if (!type || type.getRank() != 1 || type.getDimSize(0) != size ||
+      !type.getElementType().isF32() || !matchPattern(value, m_Constant(&attr))) {
+    return std::nullopt;
+  }
+  SmallVector<double> result;
+  if (auto dense = dyn_cast<DenseFPElementsAttr>(attr)) {
+    for (APFloat element : dense.getValues<APFloat>()) {
+      result.push_back(element.convertToDouble());
+    }
+  } else if (auto resource = dyn_cast<DenseResourceElementsAttr>(attr)) {
+    AsmResourceBlob *blob = resource.getRawHandle().getBlob();
+    if (!blob) {
+      return std::nullopt;
+    }
+    ArrayRef<char> bytes = blob->getData();
+    if (bytes.size() != static_cast<size_t>(size) * sizeof(float)) {
+      return std::nullopt;
+    }
+    for (int64_t i = 0; i < size; ++i) {
+      float element;
+      std::memcpy(&element, bytes.data() + i * sizeof(float), sizeof(float));
+      result.push_back(element);
+    }
+  } else {
+    return std::nullopt;
+  }
+  if (static_cast<int64_t>(result.size()) != size) {
+    return std::nullopt;
+  }
+  return result;
+}
+
+/// Identity-mapped input and output, and an f32 scale indexed by the first
+/// loop alone: one scale per entry of dimension 0. For a filter that is the
+/// output channel (FCHW, and the depthwise C11HW); for a rank-1 bias, the
+/// channel itself.
+template <typename AffineOp>
+static bool isPerChannel(AffineOp op) {
+  AffineMap scaleMap = op.getScaleMap();
+  return op->getNumResults() == 1 && op.getInputMap().isIdentity() &&
+         op.getOutputMap().isIdentity() && scaleMap.getNumResults() == 1 &&
+         scaleMap.getResult(0) == getAffineDimExpr(0, op.getContext()) &&
+         op.getScaleElementType().isF32();
+}
+
+/// A constant weight dequantization: signed `i8`, symmetric, with one scale
+/// for the tensor or one per output channel.
+struct WeightDequant {
+  Value codes;
+  /// One entry, or one per output channel.
+  SmallVector<double> scales;
+};
+
+static std::optional<WeightDequant> matchWeightDequant(DequantizeAffineOp op) {
+  if (!op || op.getInputUnsigned() ||
       !op.getInputType().getElementType().isInteger(8) ||
       !op.getOutputType().getElementType().isF32() ||
-      !matchPattern(op.getInput(), m_Constant())) {
+      !matchPattern(op.getInput(), m_Constant()) || zeroPointOf(op) != 0) {
     return std::nullopt;
   }
-  std::optional<double> scale = constantFloat(op.getScale());
-  std::optional<int64_t> zeroPoint = zeroPointOf(op);
-  if (!scale || !isPositiveFinite(*scale) || zeroPoint != 0) {
-    return std::nullopt;
-  }
-  Affine8 found;
+  WeightDequant found;
   found.codes = op.getInput();
-  found.scale = *scale;
+  if (isPerTensor(op)) {
+    std::optional<double> scale = constantFloat(op.getScale());
+    if (!scale) {
+      return std::nullopt;
+    }
+    found.scales.push_back(*scale);
+  } else if (isPerChannel(op) && op.getInputType().hasStaticShape()) {
+    std::optional<SmallVector<double>> scales =
+        constantF32Vector(op.getScale(), op.getInputType().getDimSize(0));
+    if (!scales) {
+      return std::nullopt;
+    }
+    found.scales = std::move(*scales);
+  } else {
+    return std::nullopt;
+  }
+  if (!llvm::all_of(found.scales, isPositiveFinite)) {
+    return std::nullopt;
+  }
   return found;
+}
+
+/// `sw[c]`, whichever granularity the weights have.
+static double weightScaleOf(const WeightDequant &weights, int64_t channel) {
+  return weights.scales.size() == 1 ? weights.scales.front()
+                                    : weights.scales[channel];
+}
+
+/// Whether a bias dequantization's scale is `sx * sw[c]` on every channel,
+/// as `quantize_static` writes it: the precondition for adding the bias to
+/// the integer accumulator as it stands.
+static bool biasScaleMatches(DequantizeAffineOp bias, double inputScale,
+                             const WeightDequant &weights, int64_t channels) {
+  SmallVector<double> biasScales;
+  if (isPerTensor(bias)) {
+    std::optional<double> scale = constantFloat(bias.getScale());
+    if (!scale) {
+      return false;
+    }
+    biasScales.assign(channels, *scale);
+  } else {
+    std::optional<SmallVector<double>> scales =
+        constantF32Vector(bias.getScale(), channels);
+    if (!scales) {
+      return false;
+    }
+    biasScales = std::move(*scales);
+  }
+  for (int64_t c = 0; c < channels; ++c) {
+    double expected = inputScale * weightScaleOf(weights, c);
+    if (std::abs(biasScales[c] - expected) > kBiasScaleTolerance * expected) {
+      return false;
+    }
+  }
+  return true;
+}
+
+/// The canonical form's two multipliers: the per-tensor `output_scale` and
+/// a per-channel factor ahead of it, with `ratio[c] = sx * sw[c] / sy`
+/// split as `max(ratio) * (ratio[c] / max(ratio))`. Per-tensor weights give
+/// the ratio and factors of exactly 1, so that form is the one this pass
+/// always wrote. Fails on a ratio f32 cannot carry, or a factor below
+/// `kMinChannelScale`.
+struct RequantScales {
+  float outputScale = 0.0f;
+  SmallVector<float> channelScales;
+};
+
+static std::optional<RequantScales>
+computeRequantScales(double inputScale, const WeightDequant &weights,
+                     double outputScale, int64_t channels) {
+  if (weights.scales.size() != 1 &&
+      static_cast<int64_t>(weights.scales.size()) != channels) {
+    return std::nullopt;
+  }
+  SmallVector<double> ratios;
+  for (int64_t c = 0; c < channels; ++c) {
+    ratios.push_back(inputScale * weightScaleOf(weights, c) / outputScale);
+  }
+  double largest = *std::max_element(ratios.begin(), ratios.end());
+  if (!std::isfinite(largest) || !(largest > 0.0) ||
+      !std::isfinite(static_cast<float>(largest))) {
+    return std::nullopt;
+  }
+  RequantScales result;
+  result.outputScale = static_cast<float>(largest);
+  for (double ratio : ratios) {
+    double factor = weights.scales.size() == 1 ? 1.0 : ratio / largest;
+    if (!(factor >= kMinChannelScale)) {
+      return std::nullopt;
+    }
+    result.channelScales.push_back(static_cast<float>(factor));
+  }
+  return result;
 }
 
 /// The output quantization: f32 to `i8` or `ui8`, per tensor, over the
@@ -511,7 +672,8 @@ static LogicalResult matchBiasInit(Value init, DequantizeAffineOp &bias,
     return failure();
   }
   bias = broadcast.getInput().getDefiningOp<DequantizeAffineOp>();
-  if (!bias || !isPerTensor(bias) || zeroPointOf(bias) != 0 ||
+  if (!bias || !(isPerTensor(bias) || isPerChannel(bias)) ||
+      zeroPointOf(bias) != 0 ||
       bias.getInputType().getRank() != 1 ||
       !bias.getInputType().getElementType().isSignlessInteger(32) ||
       !bias.getOutputType().getElementType().isF32()) {
@@ -605,7 +767,8 @@ static Value emitFoldedBias(PatternRewriter &rewriter, Location loc,
 /// transpose the model's quantization read through (none when
 /// `permutation` is empty).
 static Value emitRequantTail(PatternRewriter &rewriter, Location loc,
-                             Value integerAcc, Value bias, double ratio,
+                             Value integerAcc, Value bias,
+                             const RequantScales &scales,
                              const Affine8 &output,
                              ArrayRef<int64_t> permutation) {
   ArrayRef<int64_t> accShape =
@@ -613,8 +776,15 @@ static Value emitRequantTail(PatternRewriter &rewriter, Location loc,
   Type i8 = rewriter.getI8Type();
   // The canonical requantization; operands, not body constants, for the
   // reason `rocket_int8_requant_match.mlir` pins.
+  auto channelScaleType = RankedTensorType::get(
+      {static_cast<int64_t>(scales.channelScales.size())},
+      rewriter.getF32Type());
+  Value channelScaleValue = arith::ConstantOp::create(
+      rewriter, loc,
+      DenseElementsAttr::get(channelScaleType,
+                             ArrayRef<float>(scales.channelScales)));
   Value scaleValue = arith::ConstantOp::create(
-      rewriter, loc, rewriter.getF32FloatAttr(static_cast<float>(ratio)));
+      rewriter, loc, rewriter.getF32FloatAttr(scales.outputScale));
   Value zeroPointValue = arith::ConstantOp::create(
       rewriter, loc, rewriter.getI32IntegerAttr(output.zeroPoint));
   Value lowValue = arith::ConstantOp::create(
@@ -629,28 +799,31 @@ static Value emitRequantTail(PatternRewriter &rewriter, Location loc,
   AffineMap channel = AffineMap::get(
       rank, 0, {rewriter.getAffineDimExpr(rank - 1)}, rewriter.getContext());
   AffineMap scalar = AffineMap::get(rank, 0, {}, rewriter.getContext());
-  SmallVector<AffineMap> maps{identity, channel, scalar,
-                              scalar,   scalar,  scalar, identity};
+  SmallVector<AffineMap> maps{identity, channel, channel, scalar,
+                              scalar,   scalar,  scalar,  identity};
   SmallVector<utils::IteratorType> iterators(rank,
                                              utils::IteratorType::parallel);
   Value result =
       linalg::GenericOp::create(
           rewriter, loc, TypeRange{int8Type},
-          ValueRange{integerAcc, bias, scaleValue, zeroPointValue, lowValue,
-                     highValue},
+          ValueRange{integerAcc, bias, channelScaleValue, scaleValue,
+                     zeroPointValue, lowValue, highValue},
           ValueRange{outEmpty}, maps, iterators,
           [&](OpBuilder &b, Location nested, ValueRange args) {
             Value biased = arith::AddIOp::create(b, nested, args[0], args[1]);
             Value real =
                 arith::SIToFPOp::create(b, nested, b.getF32Type(), biased);
-            Value scaled = arith::MulFOp::create(b, nested, real, args[2]);
+            Value channelScaled =
+                arith::MulFOp::create(b, nested, real, args[2]);
+            Value scaled =
+                arith::MulFOp::create(b, nested, channelScaled, args[3]);
             Value rounded = math::RoundEvenOp::create(b, nested, scaled);
             Value zeroPointReal =
-                arith::SIToFPOp::create(b, nested, b.getF32Type(), args[3]);
+                arith::SIToFPOp::create(b, nested, b.getF32Type(), args[4]);
             Value offset =
                 arith::AddFOp::create(b, nested, rounded, zeroPointReal);
-            Value low = arith::MaximumFOp::create(b, nested, offset, args[4]);
-            Value clamped = arith::MinimumFOp::create(b, nested, low, args[5]);
+            Value low = arith::MaximumFOp::create(b, nested, offset, args[5]);
+            Value clamped = arith::MinimumFOp::create(b, nested, low, args[6]);
             Value narrowed =
                 arith::FPToSIOp::create(b, nested, b.getI8Type(), clamped);
             linalg::YieldOp::create(b, nested, narrowed);
@@ -713,10 +886,11 @@ struct FuseQdqConv : public OpRewritePattern<QuantizeAffineOp> {
       return rewriter.notifyMatchFailure(quant, "operands are not DQ'd");
     }
     std::optional<Affine8> input = matchActivationDequant(inputChain->dequant);
-    std::optional<Affine8> weights = matchWeightDequant(filterChain->dequant);
+    std::optional<WeightDequant> weights =
+        matchWeightDequant(filterChain->dequant);
     if (!input || !weights) {
       return rewriter.notifyMatchFailure(
-          quant, "activation or weight DQ is not per-tensor 8-bit");
+          quant, "activation or weight DQ is not a supported 8-bit one");
     }
     // The filter chain is layout only; a pad there is not a convolution.
     for (Operation *op : filterChain->ops) {
@@ -729,23 +903,20 @@ struct FuseQdqConv : public OpRewritePattern<QuantizeAffineOp> {
     if (failed(matchBiasInit(conv.getDpsInits()[0], biasDequant))) {
       return rewriter.notifyMatchFailure(quant, "init is not a DQ'd bias");
     }
-    double accumulatorScale = input->scale * weights->scale;
+    int64_t channels = accType.getShape().back();
+    if (biasDequant && biasDequant.getInputType().getDimSize(0) != channels) {
+      return failure();
+    }
     if (biasDequant &&
-        biasDequant.getInputType().getDimSize(0) != accType.getShape().back()) {
-      return failure();
+        !biasScaleMatches(biasDequant, input->scale, *weights, channels)) {
+      return rewriter.notifyMatchFailure(quant, "bias scale is not sx * sw");
     }
-    if (biasDequant) {
-      std::optional<double> biasScale = constantFloat(biasDequant.getScale());
-      if (!biasScale ||
-          std::abs(*biasScale - accumulatorScale) >
-              kBiasScaleTolerance * accumulatorScale) {
-        return rewriter.notifyMatchFailure(quant, "bias scale is not sx * sw");
-      }
-    }
-    double ratio = accumulatorScale / output->scale;
-    if (!std::isfinite(ratio) || !(ratio > 0.0) ||
-        !std::isfinite(static_cast<float>(ratio))) {
-      return failure();
+    std::optional<RequantScales> scales =
+        computeRequantScales(input->scale, *weights, output->scale, channels);
+    if (!scales) {
+      return rewriter.notifyMatchFailure(
+          quant, "requantization ratio out of range, or a channel's factor "
+                 "below what the BS multiplier resolves");
     }
 
     Location loc = conv.getLoc();
@@ -789,13 +960,12 @@ struct FuseQdqConv : public OpRewritePattern<QuantizeAffineOp> {
             DenseIntElementsAttr::get(attrType, dilations))
             .getResult(0);
 
-    int64_t channels = accType.getShape().back();
     Value bias = emitFoldedBias(rewriter, loc,
                                 biasDequant ? biasDequant.getInput() : Value(),
                                 *convFilter, input->zeroPoint, channels);
 
     Value result = emitRequantTail(
-        rewriter, loc, integerAcc, bias, ratio, *output,
+        rewriter, loc, integerAcc, bias, *scales, *output,
         outputTranspose ? outputTranspose.getPermutation() : ArrayRef<int64_t>{});
     if (result.getType() != quant->getResult(0).getType()) {
       return failure();
@@ -874,9 +1044,10 @@ struct FuseQdqDepthwiseConv : public OpRewritePattern<QuantizeAffineOp> {
     if (!activation || failed(filterChain)) {
       return rewriter.notifyMatchFailure(quant, "operands are not DQ'd");
     }
-    std::optional<Affine8> weights = matchWeightDequant(filterChain->dequant);
+    std::optional<WeightDequant> weights =
+        matchWeightDequant(filterChain->dequant);
     if (!weights) {
-      return rewriter.notifyMatchFailure(quant, "weight DQ is not per-tensor");
+      return rewriter.notifyMatchFailure(quant, "weight DQ is not supported");
     }
     for (Operation *op : filterChain->ops) {
       if (isa<tensor::PadOp>(op)) {
@@ -890,19 +1061,18 @@ struct FuseQdqDepthwiseConv : public OpRewritePattern<QuantizeAffineOp> {
       return rewriter.notifyMatchFailure(quant, "init is not a DQ'd bias");
     }
     int64_t channels = accType.getDimSize(1);
-    double accumulatorScale = activation->scale * weights->scale;
-    if (biasDequant) {
-      std::optional<double> biasScale = constantFloat(biasDequant.getScale());
-      if (biasDequant.getInputType().getDimSize(0) != channels || !biasScale ||
-          std::abs(*biasScale - accumulatorScale) >
-              kBiasScaleTolerance * accumulatorScale) {
-        return rewriter.notifyMatchFailure(quant, "bias scale is not sx * sw");
-      }
+    if (biasDequant &&
+        (biasDequant.getInputType().getDimSize(0) != channels ||
+         !biasScaleMatches(biasDequant, activation->scale, *weights,
+                           channels))) {
+      return rewriter.notifyMatchFailure(quant, "bias scale is not sx * sw");
     }
-    double ratio = accumulatorScale / output->scale;
-    if (!std::isfinite(ratio) || !(ratio > 0.0) ||
-        !std::isfinite(static_cast<float>(ratio))) {
-      return failure();
+    std::optional<RequantScales> scales = computeRequantScales(
+        activation->scale, *weights, output->scale, channels);
+    if (!scales) {
+      return rewriter.notifyMatchFailure(
+          quant, "requantization ratio out of range, or a channel's factor "
+                 "below what the BS multiplier resolves");
     }
 
     Location loc = conv.getLoc();
@@ -969,7 +1139,7 @@ struct FuseQdqDepthwiseConv : public OpRewritePattern<QuantizeAffineOp> {
     Value bias = emitFoldedBias(rewriter, loc,
                                 biasDequant ? biasDequant.getInput() : Value(),
                                 filter, activation->zeroPoint, channels);
-    Value result = emitRequantTail(rewriter, loc, integerAcc, bias, ratio,
+    Value result = emitRequantTail(rewriter, loc, integerAcc, bias, *scales,
                                    *output, toNchw);
     if (result.getType() != quant->getResult(0).getType()) {
       return failure();
@@ -986,7 +1156,8 @@ struct RocketFuseQdqConvPass
   StringRef getArgument() const final { return "rocket-fuse-qdq-conv"; }
   StringRef getDescription() const final {
     return "Rewrites an ONNX QDQ convolution, Q(conv(DQ(x), DQ(w)) + DQ(b)) "
-           "with per-tensor scales, into the canonical requantized int8 form "
+           "with per-tensor or per-channel weight scales, into the canonical "
+           "requantized int8 form "
            "the Rocket int8_requant matchers claim, folding the input zero "
            "point into the bias.";
   }
