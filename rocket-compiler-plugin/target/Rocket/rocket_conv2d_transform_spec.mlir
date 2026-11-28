@@ -12932,12 +12932,15 @@ module attributes {transform.with_named_sequence} {
       : (!transform.any_op) -> !transform.any_op
     // A quantized residual tail, Q(relu(DQ(a) + DQ(b))), into the canonical
     // signed NHWC form @match_elementwise_add_int8_relu claims. After the
-    // requant fusion, whose conv outputs are this pattern's operands.
+    // requant fusion, whose conv outputs are this pattern's operands. Also
+    // ONNX Runtime's QDQ spelling: signed codes, and the ReLU folded into a
+    // QuantizeLinear whose zero point is quant_min.
     %residual_funcs = transform.apply_registered_pass
         "rocket-fuse-int8-residual-add" to %requant_fused_funcs
       : (!transform.any_op) -> !transform.any_op
     // The max pool between a DequantizeLinear and a QuantizeLinear that share
-    // their parameters, into an int8 NHWC max pool on the codes, which
+    // their parameters (and signedness: `ui8` or ORT QDQ's signed codes),
+    // into an int8 NHWC max pool on the codes, which
     // @match_pooling_nhwc_max_s2_i8 claims. Exact.
     %max_pool_funcs = transform.apply_registered_pass
         "rocket-fuse-int8-max-pool" to %residual_funcs

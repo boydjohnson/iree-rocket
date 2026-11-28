@@ -456,8 +456,8 @@ import's own input plus 4 synthetic inputs (mean 0.45, sd 0.225):
 
 ### What is left, by expected size
 
-1. **QDQ residual add.** None of ResNet50's 16 adds or MobileNetV2's 10 is
-   rewritten.
+1. **QDQ residual add** (done for ResNet50, see the next section). None of
+   ResNet50's 16 adds or MobileNetV2's 10 is rewritten.
    - ORT folds the ReLU into the add's QuantizeLinear (the zero point
      equals quant_min), and the activations are signed.
      `rocket-fuse-int8-residual-add` wants `ui8` and an explicit ReLU, so it
@@ -465,6 +465,104 @@ import's own input plus 4 synthetic inputs (mean 0.45, sd 0.225):
    - `ours` vs `ours_skip` puts this at about 2x on ResNet50.
    - MobileNetV2's adds carry no ReLU at all, and there is no target for
      them yet in either path.
-2. **QDQ max pool**: the same signedness gap in `rocket-fuse-int8-max-pool`.
+2. **QDQ max pool** (done, next section): the same signedness gap in
+   `rocket-fuse-int8-max-pool`.
    ResNet50's stem pool runs fp16 between a CPU Q/DQ pair.
 3. **Per-channel weight scales**: an executable-ABI change (above).
+
+## Follow-up: signed QDQ residual add and max pool (2026-11-27)
+
+`rocket-fuse-int8-residual-add` and `rocket-fuse-int8-max-pool`
+(`RocketFuseInt8QdqPass.cpp`) now take the form ORT's default
+`quantize_static` (QDQ, S8S8) writes. Two changes:
+
+- **Signed codes.** The affine `dequantize_affine` / `quantize_affine`
+  matchers accept signed `i8` as well as `ui8`. A signed operand or result
+  gets no `addi -128` shift and keeps its zero point as is; each operand and
+  the result is shifted only when its own codes are `ui8`. The clamp has to be
+  the encoding's full range, [0, 255] or [-128, 127]. A symmetric [-127, 127]
+  or 7-bit `reduce_range` clamp is declined.
+- **The folded ReLU.** ORT deletes the Relu after a residual Add and gives
+  the Add's QuantizeLinear `zero_point == quant_min` (-128). With that zero
+  point the clamp sends every negative sum to the code of 0, so
+  `Q(DQ(a) + DQ(b))` equals `Q(relu(DQ(a) + DQ(b)))` code for code, and the
+  pass rewrites it into the same canonical add+ReLU generic. Without that
+  equality (a linear add, MobileNetV2's) it still declines.
+  - The same rule covers a `ui8` QuantizeLinear with zero point 0. The
+    existing lit case that called such an add "linear" was a ReLU all along.
+    It now uses zero point 128.
+- **Max pool:** the DequantizeLinear and QuantizeLinear must also share
+  signedness, besides scale and zero point.
+
+**Lit.**
+- `rocket_int8_residual_add.mlir`: S8S8 folded-ReLU (zero points -29, 5 and
+  -128 reach the dispatch unchanged), S8S8 explicit ReLU, and two declines:
+  S8S8 linear and a [-127, 127] clamp.
+- `rocket_int8_max_pool.mlir`: the S8S8 stem pool onto
+  `rocket_pooling_max_int8_pad1_executable_s2`, and a mixed-signedness
+  decline.
+- 58/58 plugin lit pass. The new positive cases fail on #120's compiler.
+
+### Placement (the same `ort_qdq` imports)
+
+| model | before (#120) | after |
+|---|---|---|
+| ResNet50 | 25 CPU sites; adds `DQ -> add -> Q` in float; stem pool fp16 | **6 CPU sites**; 16/16 adds on `rocket_elementwise_add_int8_relu`, pool on `rocket_pooling_max_int8_pad1_s2`; 85 NPU->NPU edges packed, 0 dense |
+| MobileNetV2 | 16 CPU sites | unchanged (its 10 adds are linear) |
+
+- The QOperator `ours_skip` ResNet50 recompiled with this pass has
+  identical placement: 15 adds on the NPU, 5 CPU sites.
+
+### Board timing
+
+Same setup as the previous section: orangepi, 7.3.6, NPU at 600 MHz,
+governor `performance`, `--task_topology_cpu_ids=4,5,6,7`, the runtime from
+#120. `iree-benchmark-module`, 7 repetitions with the first dropped, every run
+gated on no other `iree-*` process. Two runs of two passes each.
+
+| ResNet50 arm | ms (run A pass 1 / 2; run B pass 1 / 2) |
+|---|---|
+| `ort_qdq` NPU, #120 | 49.8 / 52.6 |
+| `ort_qdq` NPU, **this change** | 29.1 / 27.8; 27.3 / 26.8 |
+| `ort_qdq` NPU, this change + `--iree-opt-const-expr-max-size-increase-threshold=67108864` | **17.2 / 16.8** |
+| `ours_skip` NPU (`--quantize-residual-skip`) | 17.4 / 18.8; 17.1 / 17.6 |
+| `ort_qdq` `--no-offload`, this change | 287.5 / 280 (#120: 389) |
+
+- **The residual adds and the pool closed most of the gap:** 50 -> 27 ms.
+- **The last ~10 ms was the FC layer, not the adds.** `ROCKET_PROFILE=1`
+  per call:
+  - the fp16 matmul is 7.8 ms here against 0.47 in `ours_skip`, of which
+    5.3 ms is `pack.weights`;
+  - `outside` (the CPU dispatches) is 5.4 ms against 2.0. Almost all of it
+    is an `elementwise_transpose_2048x1000_i8xf16` dispatch.
+- **Why the FC costs that much.** The Gemm's weight is `DQ(w_i8)`, and IREE's
+  const-expr hoisting declines to precompute it: widening 2 MB of `i8` to
+  `f16` grows it past the default 1 MiB size-increase threshold. So the
+  weight is dequantized and transposed on the CPU every call, and the matmul
+  sees a non-constant weight that it has to re-pack every call
+  (`rocket-pack-weights: 1 with non-constant weights`).
+- **Raising the threshold puts QDQ level with `ours_skip`:** 16.8 to 17.2 ms.
+  The DQ dispatch disappears, all 54 weights are packed at compile time, and
+  the output is bit-identical to the build without the flag. It is not a
+  `rocket-compiler` default yet: the threshold applies to every model, and
+  its effect on module size elsewhere is unmeasured.
+
+### Accuracy
+
+Against onnxruntime on the import's input plus the 4 synthetic inputs:
+- **NPU: argmax equal on 5/5**, top-5 overlap 5/5 on all five, max|d| 0.10
+  to 0.23, mean|d| about 0.022. #120's NPU build had max|d| 0.10 to 0.20 and
+  top-5 4 or 5 of 5.
+- **`--no-offload`: output bit-identical to #120's** on all five inputs. The
+  integer rewrite of the add, the folded ReLU included, is exact. It keeps
+  #120's one near-tie argmax miss on input 1.
+
+### What is left
+
+1. **FC weight hoisting:** decide whether `rocket-compiler` should raise
+   `--iree-opt-const-expr-max-size-increase-threshold`, or fold the QDQ
+   Gemm's `DQ(w)` itself. That is worth 10 ms on ResNet50 QDQ.
+2. **Linear int8 residual add** (MobileNetV2): needs a target without the
+   ReLU.
+3. **Per-channel weight scales:** the executable-ABI change above.
+
