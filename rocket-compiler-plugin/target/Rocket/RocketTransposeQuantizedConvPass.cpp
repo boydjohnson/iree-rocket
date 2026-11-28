@@ -48,6 +48,17 @@
 // its pad is still an NCHW one in front of the importer's NCHW->NHWC
 // transpose. `SinkPadBelowQuantizedDepthwiseTranspose` swaps the two, which
 // is what lets an int8 MobileNetV2's depthwise pads reach the CNA.
+//
+// **And a quantized matmul becomes a 1x1 convolution.** An ONNX
+// `QLinearMatMul` (what `tools/quantize_onnx_int8.py --quantize-classifier` turns a
+// classifier `Gemm` into) imports as `linalg.quantized_matmul` with the same
+// scalar zero points and the same five-op requantization epilogue as a
+// QLinearConv, and nothing downstream claims it: `quantized-conv-to-conv` has
+// no matmul pattern and the int8 matchers are all convolutions. The `[M, K]`
+// codes as the NHWC image `[1, 1, M, K]` and the `[K, N]` weight as the HWCF
+// filter `[1, 1, K, N]` is exactly the convolution `fc.rs` lowers an FC to,
+// so `QuantizedMatmulToConv` writes that, with a collapse back to `[M, N]`
+// that `rocket-fuse-int8-requant-epilogue` looks through.
 
 #include "mlir/Dialect/Linalg/IR/Linalg.h"
 #include "mlir/Dialect/Tensor/IR/Tensor.h"
@@ -199,6 +210,66 @@ struct SinkPadBelowQuantizedDepthwiseTranspose
   }
 };
 
+/// `quantized_matmul(a[M, K], b[K, N], za, zb)` as
+/// `collapse(conv_2d_nhwc_hwcf_q(a[1, 1, M, K], b[1, 1, K, N], za, zb))`.
+///
+/// Pure metadata on every operand -- each expand adds two leading unit
+/// dimensions -- and the same i32 contraction, so the zero points pass
+/// through untouched and `quantized-conv-to-conv` folds them as it does a
+/// convolution's. Static shapes only: every Rocket matcher wants them, and a
+/// dynamic `M` would need an `output_shape` for nothing.
+struct QuantizedMatmulToConv : OpRewritePattern<linalg::QuantizedMatmulOp> {
+  using OpRewritePattern::OpRewritePattern;
+
+  LogicalResult matchAndRewrite(linalg::QuantizedMatmulOp matmulOp,
+                                PatternRewriter &rewriter) const override {
+    if (!matmulOp.hasPureTensorSemantics()) {
+      return rewriter.notifyMatchFailure(matmulOp, "expected tensor semantics");
+    }
+    Value lhs = matmulOp.getDpsInputs()[0];
+    Value rhs = matmulOp.getDpsInputs()[1];
+    Value lhsZeroPoint = matmulOp.getDpsInputs()[2];
+    Value rhsZeroPoint = matmulOp.getDpsInputs()[3];
+    Value init = matmulOp.getDpsInits()[0];
+    auto lhsType = dyn_cast<RankedTensorType>(lhs.getType());
+    auto rhsType = dyn_cast<RankedTensorType>(rhs.getType());
+    auto initType = dyn_cast<RankedTensorType>(init.getType());
+    if (!lhsType || !rhsType || !initType || !lhsType.hasStaticShape() ||
+        !rhsType.hasStaticShape() || !initType.hasStaticShape()) {
+      return rewriter.notifyMatchFailure(matmulOp, "expected static shapes");
+    }
+    if (!lhsType.getElementType().isSignlessInteger(8) ||
+        !rhsType.getElementType().isSignlessInteger(8) ||
+        !initType.getElementType().isSignlessInteger(32)) {
+      return rewriter.notifyMatchFailure(matmulOp, "not i8 x i8 -> i32");
+    }
+
+    Location loc = matmulOp.getLoc();
+    SmallVector<ReassociationIndices> leadingUnits{{0, 1, 2}, {3}};
+    auto expand = [&](Value value, RankedTensorType type) -> Value {
+      auto expanded = RankedTensorType::get(
+          {1, 1, type.getDimSize(0), type.getDimSize(1)},
+          type.getElementType());
+      return tensor::ExpandShapeOp::create(rewriter, loc, expanded, value,
+                                           leadingUnits)
+          .getResult();
+    };
+    Value image = expand(lhs, lhsType);
+    Value filter = expand(rhs, rhsType);
+    Value accInit = expand(init, initType);
+
+    auto unit = RankedTensorType::get({2}, rewriter.getIntegerType(64));
+    auto ones = DenseIntElementsAttr::get(unit, ArrayRef<int64_t>{1, 1});
+    auto conv = linalg::Conv2DNhwcHwcfQOp::create(
+        rewriter, loc, accInit.getType(),
+        ValueRange{image, filter, lhsZeroPoint, rhsZeroPoint},
+        ValueRange{accInit}, ones, ones);
+    rewriter.replaceOpWithNewOp<tensor::CollapseShapeOp>(
+        matmulOp, initType, conv.getResult(0), leadingUnits);
+    return success();
+  }
+};
+
 struct RocketTransposeQuantizedConvPass
     : public PassWrapper<RocketTransposeQuantizedConvPass, OperationPass<>> {
   MLIR_DEFINE_EXPLICIT_INTERNAL_INLINE_TYPE_ID(RocketTransposeQuantizedConvPass)
@@ -207,8 +278,9 @@ struct RocketTransposeQuantizedConvPass
     return "rocket-transpose-quantized-conv-to-nhwc";
   }
   StringRef getDescription() const final {
-    return "Rewrites linalg.conv_2d_nchw_fchw_q as linalg.conv_2d_nhwc_hwcf_q "
-           "so the upstream quantized-conv-to-conv fold can reach it.";
+    return "Rewrites linalg.conv_2d_nchw_fchw_q, and linalg.quantized_matmul "
+           "as a 1x1 convolution, into linalg.conv_2d_nhwc_hwcf_q so the "
+           "upstream quantized-conv-to-conv fold can reach them.";
   }
 
   void getDependentDialects(DialectRegistry &registry) const final {
@@ -219,7 +291,8 @@ struct RocketTransposeQuantizedConvPass
     MLIRContext *context = &getContext();
     RewritePatternSet patterns(context);
     patterns.add<TransposeQuantizedConvToNhwc,
-                 SinkPadBelowQuantizedDepthwiseTranspose>(context);
+                 SinkPadBelowQuantizedDepthwiseTranspose,
+                 QuantizedMatmulToConv>(context);
     if (failed(applyPatternsGreedily(getOperation(), std::move(patterns)))) {
       return signalPassFailure();
     }

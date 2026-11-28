@@ -1107,6 +1107,7 @@ equal, top-5 5/5, and max|d| exactly what it was before the change
    through fp16: a CPU `i8 -> f16` of the 7x7 cube, an fp16 NPU pool, a
    CPU `f16 -> i8`. *Done: next section.*
 2. **The QOperator FC** (`ours_skip`, `QGemm`/`MatMulInteger` forms).
+   *Done: the section after next.*
 
 ## Follow-up: the global average pool on integers (2026-11-28)
 
@@ -1162,3 +1163,100 @@ the fp16 NPU pool.
 of an NHWC tensor (the transpose gone, `-49 * zx` and `sx / (49 * sy)`
 checked), and two declines: a 3x3 window over a 7x7 image, and a global sum
 divided by something other than the window size. 60/60 plugin lit.
+
+## Follow-up: the QOperator classifier (2026-11-28)
+
+In the QOperator builds (`ours`, `ours_skip`) the classifier was never
+quantized: `tools/quantize_onnx_int8.py` quantizes `Conv Relu Clip`, so the
+Gemm and the global average pool in front of it stayed float -- an fp16 NPU
+pool and an fp16 NPU matmul, each between CPU conversions. Asking ORT's
+QOperator quantizer for them writes com.microsoft `QGemm`,
+`QLinearGlobalAveragePool` and `QLinearAdd`, which torch-mlir cannot import.
+
+**`--quantize-classifier`** (opt-in) quantizes the tail in standard ops:
+
+- **The FC.** Each plain Gemm (`alpha = beta = 1`, no `transA`, constant
+  `B` and `C`) is split into `MatMul` (weight transposed once) plus the bias
+  `Add`, and just those MatMuls are quantized: ORT writes the standard
+  `QLinearMatMul`, a DequantizeLinear, and the float bias Add. The split
+  must come *after* `quant_pre_process`, whose optimizer fuses a MatMul and
+  an Add straight back into a Gemm.
+- **The pool.** `GlobalAveragePool` and `Flatten` are quantized too. ORT
+  quantizes a pool only when its input is already quantized, and ResNet's
+  input is `Relu(Add(conv, skip))` with the Add float, so the tool also
+  quantizes an Add whose single-consumer ReLU only a global pool reads.
+  That is the case where ORT's `adjust_tensor_ranges` gives the Add the
+  ReLU's range (zero point 0) before `QLinearActivation` deletes the ReLU,
+  so the uint8 clamp is the ReLU. Flatten becomes an 8-bit passthrough.
+- **Expansion.** The `QLinearAdd` / `QLinearGlobalAveragePool` ORT writes
+  are expanded into `DQ -> Add / GlobalAveragePool -> Q` with the same
+  parameters: the forms `rocket-fuse-int8-residual-add` and
+  `rocket-fuse-int8-global-avg-pool` (#128) already claim.
+
+It is lossy (the FC product is rounded to 8 bits before the bias; the
+pool's input and output are rounded) and a model change, so it is off by
+default. Without the flag the tool reproduces the survey's ResNet50
+`ours_skip` graph exactly, and its module is byte-identical to #127's. The
+survey's MobileNetV2 `ours` predates the Clip fold (35 float Clips), so its
+baseline here is a fresh no-flag build of the current tool (`ours_repro`).
+
+**Compiler.** `QLinearMatMul` imports as `linalg.quantized_matmul`, with the
+same scalar zero points and five-op epilogue as a QLinearConv.
+`rocket-transpose-quantized-conv-to-nhwc` rewrites it as the 1x1
+`conv_2d_nhwc_hwcf_q` of height one that `fc.rs` lowers an FC to, with a
+collapse back to `[M, N]`; `quantized-conv-to-conv` folds the zero points as
+for a convolution, `rocket-fuse-int8-requant-epilogue` looks through the
+collapse, and the existing `rocket_dynamic_int8_requant` 1x1 executable
+claims it. Nothing else changed: no new executable, ABI or driver change.
+
+Placement (no flag -> FC only -> `--quantize-classifier`):
+
+| model | Rocket executables | CPU dispatch sites | fp16 candidates |
+|---|---|---|---|
+| ResNet50 `ours_skip` | 8 -> 7 -> 6 | 5 -> 5 -> 4 | 1 -> 0 -> 0 |
+| MobileNetV2 `ours` | 6 -> 5 -> 4 | 23 -> 23 -> 22 | 1 -> 0 -> 0 |
+
+ResNet50's last residual add joins the other fifteen on the NPU's int8 add,
+the pool is #128's one integer CPU reduction, and no fp16 dispatch is left
+in either model.
+
+### Board
+
+Gated, ResNet50 median of 6, MobileNetV2 of 24, two passes, all arms in one
+session:
+
+| arm | no flag | FC only | `--quantize-classifier` |
+|---|---|---|---|
+| ResNet50 `ours_skip` NPU | 17.9 / 17.55 | 17.45 / 17.35 | **16.65 / 16.85** |
+| MobileNetV2 `ours` NPU | 8.92 / 8.815 | 11.0 / 8.365 | **8.265 / 8.1** |
+| ResNet50 `ours_skip` `--no-offload` | 273 / 273 | | **266 / 266** |
+| MobileNetV2 `ours` `--no-offload` | 30.55 / 30.6 | | **28.5 / 28.5** |
+
+- **The FC alone is not measurable**: an earlier session had it at 17.05 /
+  17.65 -> 17.65 / 17.25 on ResNet50. The fp16 FC was already ~0.5 ms.
+- **The pool is the lever**: ResNet50 NPU -0.9 ms (5%), MobileNetV2 NPU
+  -0.5 to -0.7 ms; the CPU arms -2.6% and -7%.
+- MobileNetV2's NPU arms show the usual +2.5 ms stretches (no flag 6/24 per
+  pass, FC only 20/24 in pass 1); the full flag had none in 48 reps. Its
+  fast-mode reps alone still move 8.66 / 8.68 -> 8.265 / 8.1.
+
+### Accuracy (each against its own model's onnxruntime oracle)
+
+| arm | argmax | top-5 | max\|d\| (no flag) |
+|---|---|---|---|
+| ResNet50 `ours_skip` NPU | equal | 5/5 | 0.101 (0.115) |
+| ResNet50 `ours_skip` `--no-offload` | equal | 5/5 | 0.126 (0.085) |
+| MobileNetV2 `ours` NPU | equal | 5/5 | 0.063 (0.069) |
+| MobileNetV2 `ours` `--no-offload` | equal | 5/5 | 0 (0) |
+
+The quantized tail itself moves the model's own output: between the ORT
+oracles with and without the flag, top-1 holds, top-5 overlaps 4/5
+(ResNet50) and 3/5 (MobileNetV2), max|d| 0.32 and 0.41, on synthetic
+calibration. Almost all of that is the FC: the pool adds 0.025 on ResNet50
+and nothing on MobileNetV2.
+
+### Lit
+
+`rocket_qlinear_matmul.mlir`: the pass-level rewrite, a dynamic-`M`
+decline, and the whole spec taking a QLinearMatMul to
+`rocket_dynamic_int8_requant_executable`. 61/61 plugin lit.

@@ -343,6 +343,171 @@ def quantize_residual_skips(path: Path) -> int:
     return rewritten
 
 
+def split_gemms_for_quantization(path: Path) -> list[str]:
+    """Rewrite each classifier `Gemm` as `MatMul` + `Add`, in place.
+
+    QOperator format quantizes a `Gemm` as com.microsoft `QGemm`, which
+    torch-mlir cannot lower, but a `MatMul` as the standard `QLinearMatMul`,
+    which it lowers to `linalg.quantized_matmul` -- and Rocket runs that as
+    the int8 1x1 convolution `fc.rs` lowers an FC to. So the Gemm is split
+    first: `MatMul(x, transpose(B))` with the weight transposed once at
+    quantization time, then the bias `Add`, which stays float after the
+    `QLinearMatMul`'s DequantizeLinear.
+
+    Only the plain classifier form is split: `alpha = beta = 1`, no `transA`,
+    a constant 2-D `B` and a constant 1-D `C` (or none). Returns the names of
+    the new MatMul nodes, so the caller quantizes those and no other MatMul.
+    It must run after `quant_pre_process`, whose optimizer fuses a MatMul and
+    an Add straight back into a Gemm.
+    """
+    model = onnx.load(path)
+    graph = model.graph
+    initializers = {init.name: init for init in graph.initializer}
+    matmuls: list[str] = []
+    new_nodes: list[onnx.NodeProto] = []
+    for node in graph.node:
+        if node.op_type != "Gemm" or node.domain not in ("", "ai.onnx"):
+            new_nodes.append(node)
+            continue
+        attrs = {a.name: onnx.helper.get_attribute_value(a) for a in node.attribute}
+        weight = initializers.get(node.input[1])
+        bias = initializers.get(node.input[2]) if len(node.input) > 2 and node.input[2] else None
+        plain = (
+            attrs.get("alpha", 1.0) == 1.0
+            and attrs.get("beta", 1.0) == 1.0
+            and attrs.get("transA", 0) == 0
+            and weight is not None
+            and len(weight.dims) == 2
+            and (bias is None or len(bias.dims) == 1)
+            and (len(node.input) < 3 or not node.input[2] or bias is not None)
+        )
+        if not plain:
+            new_nodes.append(node)
+            continue
+        w = numpy_helper.to_array(weight)
+        if attrs.get("transB", 0):
+            w = w.T
+        name = node.name or node.output[0]
+        weight_name = f"{node.input[1]}_matmul"
+        graph.initializer.append(numpy_helper.from_array(np.ascontiguousarray(w), weight_name))
+        product = node.output[0] if bias is None else f"{node.output[0]}_matmul"
+        new_nodes.append(
+            onnx.helper.make_node(
+                "MatMul", [node.input[0], weight_name], [product], name=f"{name}_MatMul"
+            )
+        )
+        if bias is not None:
+            new_nodes.append(
+                onnx.helper.make_node(
+                    "Add", [product, node.input[2]], [node.output[0]], name=f"{name}_bias_Add"
+                )
+            )
+        matmuls.append(f"{name}_MatMul")
+    del graph.node[:]
+    graph.node.extend(new_nodes)
+    # The original weights are now unused; drop them rather than ship both.
+    used = {name for node in graph.node for name in node.input}
+    kept = [init for init in graph.initializer if init.name in used]
+    del graph.initializer[:]
+    graph.initializer.extend(kept)
+    onnx.checker.check_model(model)
+    onnx.save(model, path)
+    return matmuls
+
+
+def classifier_pool_adds(path: Path) -> list[str]:
+    """The residual Adds whose (ReLU'd) output only a GlobalAveragePool reads.
+
+    ResNet's last block ends `Relu(Add(conv, skip)) -> GlobalAveragePool`, and
+    QOperator quantizes a pool only when its input is already quantized, so
+    with that Add left float the whole classifier tail stays float. Each Add
+    returned here is quantized too. Only a single-consumer Add -> Relu edge
+    qualifies: that is when ORT's `adjust_tensor_ranges` gives the Add the
+    Relu's range, so the uint8 saturation does the ReLU that
+    `QLinearActivation` then deletes (see `unfoldable_activations`).
+    """
+    model = onnx.load(path)
+    producers = {out: node for node in model.graph.node for out in node.output}
+    consumers: dict[str, int] = {}
+    for node in model.graph.node:
+        for name in node.input:
+            consumers[name] = consumers.get(name, 0) + 1
+    adds = []
+    for node in model.graph.node:
+        if node.op_type != "GlobalAveragePool":
+            continue
+        relu = producers.get(node.input[0])
+        if relu is None or relu.op_type != "Relu" or consumers.get(relu.output[0], 0) != 1:
+            continue
+        add = producers.get(relu.input[0])
+        if add is not None and add.op_type == "Add" and consumers.get(add.output[0], 0) == 1:
+            adds.append(add.name)
+    return adds
+
+
+def expand_contrib_qlinear_ops(path: Path) -> int:
+    """Spell com.microsoft QLinearAdd / QLinearGlobalAveragePool in standard ops.
+
+    QOperator writes a quantized Add or GlobalAveragePool as those two
+    contrib ops, which torch-mlir cannot lower. Each becomes the
+    DequantizeLinear -> float op -> QuantizeLinear it computes, with the same
+    scales and zero points: the form Rocket's int8 residual-add and integer
+    global-pool rewrites claim. Returns the number of nodes expanded.
+    """
+    model = onnx.load(path)
+    new_nodes: list[onnx.NodeProto] = []
+    expanded = 0
+
+    def dequantize(name: str, scale: str, zero_point: str, base: str) -> str:
+        out = f"{name}_dequantized"
+        new_nodes.append(
+            onnx.helper.make_node(
+                "DequantizeLinear", [name, scale, zero_point], [out], name=f"{base}_{len(new_nodes)}_DequantizeLinear"
+            )
+        )
+        return out
+
+    for node in model.graph.node:
+        base = node.name or node.output[0]
+        if node.domain == "com.microsoft" and node.op_type == "QLinearGlobalAveragePool":
+            attrs = {a.name: onnx.helper.get_attribute_value(a) for a in node.attribute}
+            if attrs.get("channels_last", 0) != 0:
+                new_nodes.append(node)
+                continue
+            x, xs, xz, ys, yz = node.input
+            pooled = f"{node.output[0]}_float"
+            new_nodes.append(
+                onnx.helper.make_node(
+                    "GlobalAveragePool", [dequantize(x, xs, xz, base)], [pooled], name=f"{base}_float"
+                )
+            )
+        elif node.domain == "com.microsoft" and node.op_type == "QLinearAdd":
+            a, as_, az, b, bs, bz, ys, yz = node.input
+            pooled = f"{node.output[0]}_float"
+            new_nodes.append(
+                onnx.helper.make_node(
+                    "Add",
+                    [dequantize(a, as_, az, base), dequantize(b, bs, bz, base)],
+                    [pooled],
+                    name=f"{base}_float",
+                )
+            )
+        else:
+            new_nodes.append(node)
+            continue
+        new_nodes.append(
+            onnx.helper.make_node(
+                "QuantizeLinear", [pooled, ys, yz], [node.output[0]], name=f"{base}_QuantizeLinear"
+            )
+        )
+        expanded += 1
+    del model.graph.node[:]
+    model.graph.node.extend(new_nodes)
+    onnx.checker.check_model(model)
+    onnx.save(model, path)
+    return expanded
+
+
 def verify_quantized_model(path: Path) -> int:
     """Re-check on the output the three properties the Rocket path depends on.
 
@@ -388,6 +553,9 @@ def verify_quantized_model(path: Path) -> int:
             )
 
     print(f"  QLinearConv nodes (offloadable): {len(qlinear)}")
+    matmuls = sum(1 for n in model.graph.node if n.op_type == "QLinearMatMul")
+    if matmuls:
+        print(f"  QLinearMatMul nodes (offloadable as 1x1 convolutions): {matmuls}")
     print(f"  Conv nodes left in float (fp16 path): {len(leftover)}")
     if problems:
         print("\nverification failed:", file=sys.stderr)
@@ -445,8 +613,8 @@ def main() -> None:
         "which is what lets consecutive offloaded convolutions chain on the "
         "NPU (see the module docstring). Widening further is usually wrong: "
         "QOperator format spells quantized Add/Gemm/pooling as com.microsoft "
-        "ops that torch-mlir cannot lower at all, and Conv is the only thing "
-        "Rocket offloads anyway. Everything left in float is demoted to f16 "
+        "ops that torch-mlir cannot lower at all (for a classifier Gemm, use "
+        "--quantize-classifier instead). Everything left in float is demoted to f16 "
         "and can still take the Rocket fp16 path.",
     )
     parser.add_argument(
@@ -455,6 +623,18 @@ def main() -> None:
         help="read every residual Add's float skip back through its own int8 "
         "quantization, so both Add operands are int8 and the NPU can run the "
         "add. Lossy and a model change; off by default.",
+    )
+    parser.add_argument(
+        "--quantize-classifier",
+        action="store_true",
+        help="quantize the classifier tail too: each Gemm as a QLinearMatMul "
+        "plus a float bias Add (QOperator's own QGemm is com.microsoft and "
+        "cannot be imported), the GlobalAveragePool and Flatten in front of "
+        "it, and a residual Add whose ReLU only that pool reads. Rocket then "
+        "runs the FC as an int8 1x1 convolution and the pool as an integer "
+        "sum instead of fp16. Lossy -- the FC product is rounded to 8 bits "
+        "before the bias, the pool input and output are rounded -- and a "
+        "model change; off by default.",
     )
     parser.add_argument(
         "--quantize-asymmetric-pads",
@@ -521,6 +701,28 @@ def main() -> None:
                 print(f"    {name}: {reason}")
             excluded.extend(name for name, _ in unfoldable)
 
+    op_types = list(args.quantize_op_types)
+    if args.quantize_classifier:
+        split = split_gemms_for_quantization(prepared)
+        print(f"split {len(split)} Gemm(s) into MatMul + Add for QLinearMatMul")
+        pool_adds = classifier_pool_adds(prepared)
+        print(f"quantizing {len(pool_adds)} residual Add(s) feeding a global pool")
+        # Only the nodes asked for: a model's own MatMuls, and every other Add
+        # (the residual adds, and the bias Adds the split just wrote), keep
+        # whatever the other flags give them.
+        for op_type, wanted in (("MatMul", set(split)), ("Add", set(pool_adds))):
+            if op_type in op_types:
+                continue
+            op_types.append(op_type)
+            excluded.extend(
+                node.name
+                for node in onnx.load(prepared).graph.node
+                if node.op_type == op_type and node.name not in wanted
+            )
+        for op_type in ("GlobalAveragePool", "Flatten"):
+            if op_type not in op_types:
+                op_types.append(op_type)
+
     print(f"quantizing -> {args.output}")
     quantize_static(
         str(prepared),
@@ -530,9 +732,13 @@ def main() -> None:
         per_channel=False,
         activation_type=QuantType.QUInt8,
         weight_type=QuantType.QInt8,
-        op_types_to_quantize=args.quantize_op_types,
+        op_types_to_quantize=op_types,
         nodes_to_exclude=excluded,
     )
+
+    if args.quantize_classifier:
+        expanded = expand_contrib_qlinear_ops(args.output)
+        print(f"expanded {expanded} com.microsoft QLinear op(s) into DQ -> op -> Q")
 
     shared = share_maxpool_quantization(args.output)
     if shared:
