@@ -830,8 +830,90 @@ to 1 and checks the BS lane against the CPU reference: max|error| 1, 0/65536.
 ### What is left
 
 1. **Dead-channel fold** (above): 1 more ResNet50 layer and 10 more
-   MobileNetV2 layers onto int8.
+   MobileNetV2 layers onto int8. Done: see the next section.
 2. **The 15 ResNet50 layers no 16-bit lane can carry:** a second
    per-channel multiply (the BN plane) or a split of the layer by channel
    magnitude.
 3. **Linear int8 residual add** (MobileNetV2), as before.
+
+## Follow-up: the dead-channel fold (2026-11-28)
+
+The per-channel path declines a layer whose smallest factor `m[c]` is below
+1/128. On the stock per-channel models most such channels are dead: their
+weight scale is around 1e-7 of the layer's largest, so the whole conv term
+is a tiny fraction of a code and the channel's output is its bias.
+`rocket-fuse-qdq-conv` now folds those instead of declining the layer.
+
+### The rule
+
+For a channel with `m[c] < 1/128`, with `ratio[c] = sx * sw[c] / sy`:
+
+- **Dead** when `ratio[c] * sum_k|w[c, k]| * D < 1/256` (`kDeadChannelTerm`).
+  `D = max(127 - zx, zx + 128)` is the widest `|x - zx|` an 8-bit activation
+  reaches (255 at `zx = -128`); a padded tap contributes `zx - zx = 0`. The
+  folded output is then off from the exact one by at most one code, and
+  only next to a rounding tie.
+- **Folded** as the canonical form already computes it: the channel's
+  filter is zeroed (a new constant), its factor is 1, and its bias becomes
+  `b' = round(v / scale)`, with `v = round(ratio[c] * b[c])` (clamped to
+  +-256) and `scale` the per-tensor scale. The zero filter also zeroes the
+  channel's input-zero-point correction, so the bias reaches the generic as
+  `b'`. The pass checks `|b' * scale - v| <= 1/4` (`kDeadBiasSlack`), well
+  inside half a code, so neither rounding rule nor the hardware's scale
+  representation moves the result.
+- **Declined**, as before, when any small-factor channel is not dead.
+
+Per-tensor weights never have a factor below 1, so per-tensor and QOperator
+models are untouched by construction.
+
+### Placement (compiled, stock `quantize_static` per-channel models)
+
+| model | int8 layers, #123 | with the fold | fp16 candidates left |
+|---|---|---|---|
+| ResNet50 `ort_qdq_pc` | 37 / 53 | **38** | 16 (15 convs + FC) |
+| MobileNetV2 `ort_qdq_pc` | 39 / 52 | **49** | 4 (3 convs + FC) |
+
+That is exactly the prediction from the `sum|w| * 128 * ratio < 1/256`
+survey in the section above. Hardware jobs: ResNet50 90 -> 88, MobileNetV2
+68 -> 63.
+
+### Board
+
+orangepi, 7.3.6, NPU 600 MHz, governor `performance`,
+`--task_topology_cpu_ids=4,5,6,7`, the runtime from main (unchanged by
+this). `bench_board.sh`: 6 kept repetitions, median ms, two passes, each
+run gated on 30 s with no other `iree-*` process.
+
+| NPU arm | #123 | the fold |
+|---|---|---|
+| MobileNetV2 `ort_qdq_pc` | 20.35 / 20.35 | **10.6 / 10.4** |
+| ResNet50 `ort_qdq_pc` | 55.05 / 53.8 | 54.8 / 53.4 |
+
+MobileNetV2 per-channel is now within ~1.3 ms of its per-tensor build
+(9.15 ms). ResNet50 moves one layer and is level; its remaining 15 fp16
+layers have small-factor channels whose conv term reaches 3 to 65 codes.
+
+### Accuracy (against onnxruntime)
+
+| arm | argmax | top-5 | max\|d\| (#123) |
+|---|---|---|---|
+| ResNet50 `ort_qdq_pc` NPU | equal | 5/5 | 0.202 (0.151) |
+| MobileNetV2 `ort_qdq_pc` NPU | equal | 5/5 | 0.086 (0.064) |
+| ResNet50 `ort_qdq_pc` `--no-offload`, x86 host | equal | 5/5 | 0.101 (0.101) |
+| MobileNetV2 `ort_qdq_pc` `--no-offload`, x86 host | equal | 5/5 | 0.043 (0.043) |
+
+The `--no-offload` arms run the same rewrite, fold included, and their
+error does not move. So the fold's arithmetic is faithful, and the NPU
+arms' larger max|d| is the requantized hardware path's one-code tie
+differences (it rounds ties away from zero) spread over more layers.
+
+### Lit
+
+`rocket_fuse_qdq_conv.mlir`:
+- a dense dead channel folded: factor 1, filter bytes zeroed, bias 750;
+- a depthwise dead channel folded with input zero point -128 (`D = 255`):
+  bias -313, because the f32 scale sits just under 0.0064;
+- the factor-below-1/128 decline now uses a channel that is not dead (term
+  0.01 codes).
+
+59/59 plugin lit.
