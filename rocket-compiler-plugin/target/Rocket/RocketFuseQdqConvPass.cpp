@@ -52,7 +52,8 @@
 // factor `m` of exactly 1 on every channel. Per-channel weights give
 // `scale = max_c(sx * sw[c] / sy)` and `m[c] = (sx * sw[c] / sy) / scale`,
 // in (0, 1]: the hardware applies `m[c]` on the BS plane's per-channel
-// multiplier lane and `scale` in the per-tensor output conversion.
+// multiplier and shift lanes and `scale` in the per-tensor output
+// conversion.
 //
 // A depthwise convolution is the same rewrite from a different start: the
 // channels-last conversion leaves it as the importer's NCHW
@@ -93,15 +94,14 @@
 // # Scope
 //
 // Per-tensor or per-channel weight scales (one per output channel, ORT's
-// `per_channel=True`). A channel whose factor `m[c]` is below
-// `kMinChannelScale` is too fine for the BS multiplier lane, which holds
-// `round(2^14 * m)`. If its whole conv term stays under `kDeadChannelTerm`
-// it is dead -- its output is its bias -- and is folded into the bias with
-// its filter zeroed (`computeRequantScales`); otherwise the convolution is
-// declined. Measured on stock `quantize_static` per-channel models, that
-// keeps 38 of ResNet50's 53 convolutions and 49 of MobileNetV2's 52 (37 and
-// 39 without the fold); the rest have small-factor channels whose conv term
-// reaches several codes, and keep the fp16 path. So does a nonzero weight
+// `per_channel=True`). The BS plane carries each factor as a 16-bit
+// mantissa and a 6-bit shift, so every factor down to `kMinChannelScale`
+// (2^-49) keeps 15 bits of precision; that is every channel of the stock
+// `quantize_static` per-channel ResNet50 and MobileNetV2 (smallest live
+// factor 5e-7). A channel below it is folded into the bias with its filter
+// zeroed when its whole conv term stays under `kDeadChannelTerm` -- its
+// output is then its bias -- and otherwise declines the convolution, which
+// keeps the fp16 path (`computeRequantScales`). So does a nonzero weight
 // zero point (its correction term
 // depends on the activation, not just the filter), a bias whose scale is not
 // `sx * sw[c]`, and any clamp range narrower than the full 8-bit one.
@@ -143,17 +143,18 @@ constexpr double kBiasScaleTolerance = 1.0 / (1 << 20);
 /// four (transpose, expand_shape, pad, collapse_shape).
 constexpr int kMaxChain = 6;
 /// The smallest per-channel requantization factor, relative to the layer's
-/// largest, that the per-channel path admits. The BS plane's multiplier lane
-/// holds `round(2^14 * m)`, so its relative error is at most `2^-15 / m`;
-/// at `m = 2^-7` that is `2^-8`, half a code on the widest unclamped output
-/// (|y| <= 128). Below it a channel can be off by more than the one code the
-/// requantized path's e2e gate allows, so the convolution keeps fp16.
-constexpr double kMinChannelScale = 1.0 / 128.0;
+/// largest, that the per-channel path admits. The BS plane holds a factor
+/// as a mantissa in `[2^14, 2^15)` and a shift of at most 63
+/// (`bs_channel_multiplier_and_shift` in iree-rocket-hal), which reaches
+/// `2^-49`; down to there its relative error is at most `2^-15`, 1/256 of a
+/// code on the widest unclamped output. (Before the shift lane, a lone
+/// `round(2^14 * m)` multiplier limited this to 1/128.)
+constexpr double kMinChannelScale = 0x1p-49;
 /// The largest output a channel's whole convolution term may reach, in
 /// output codes, for the channel to count as dead. A dead channel's output
 /// is its bias alone to within this, so it is folded into the bias (its
 /// weights zeroed, its factor 1) instead of declining the layer over a
-/// factor the multiplier lane cannot carry. The folded output then differs
+/// factor the BS lanes cannot carry. The folded output then differs
 /// from the exact one by at most one code, and only next to a rounding tie.
 constexpr double kDeadChannelTerm = 1.0 / 256.0;
 /// How far a dead channel's refolded bias may land from its output code,
@@ -424,9 +425,10 @@ static std::optional<SmallVector<int64_t>> constantIntValues(Value value) {
 /// Its output is then `round(ratio[c] * b[c]) + zy` to within that, a
 /// constant, which the canonical form produces from a zero filter and a
 /// bias `b'[c] = round(round(ratio[c] * b[c]) / scale)` at a factor of 1
-/// (`deadChannels` holds each such channel and its `b'`). That is how the
-/// stock per-channel models' near-dead channels -- scales around 1e-7 of
-/// the layer's largest -- stop costing their layer the int8 path.
+/// (`deadChannels` holds each such channel and its `b'`). No channel of the
+/// stock per-channel models needs it since the BS shift lane; it keeps a
+/// channel past even that lane's reach from costing its layer the int8
+/// path.
 ///
 /// Fails on a ratio f32 cannot carry, or a factor below `kMinChannelScale`
 /// on a channel that is not dead, or whose refolded bias does not land on

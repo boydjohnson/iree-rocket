@@ -114,6 +114,7 @@ fn check_requantized_depthwise(channels: usize) {
         input_scale: 1.0,
         weights_scale: 1.0,
         multiplier,
+        per_channel_shift: false,
     });
     let shape = Shape::with_precision(
         W as u32,

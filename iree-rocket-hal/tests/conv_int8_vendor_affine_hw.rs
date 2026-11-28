@@ -230,6 +230,7 @@ fn shape_for(case: VendorCase) -> Shape {
             input_scale: 1.0,
             weights_scale: 1.0,
             multiplier: Multiplier::from_ratio(1.0 / f64::from(case.divisor)),
+            per_channel_shift: false,
         }),
     )
     .with_padding([0, 0])

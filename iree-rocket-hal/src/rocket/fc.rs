@@ -340,6 +340,7 @@ mod tests {
             input_scale: 1.0,
             weights_scale: 1.0,
             multiplier: Multiplier::for_unit_bs(1.0),
+            per_channel_shift: false,
         })
     }
 

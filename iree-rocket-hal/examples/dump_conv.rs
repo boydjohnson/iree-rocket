@@ -27,6 +27,7 @@ fn main() {
                 scale: value(9),
                 shift: value(10),
             },
+            per_channel_shift: false,
         })
     } else {
         Precision::Fp16

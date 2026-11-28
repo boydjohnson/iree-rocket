@@ -254,6 +254,7 @@ impl Conv2dCase {
                     input_scale: 1.0,
                     weights_scale: 1.0,
                     multiplier,
+                    per_channel_shift: false,
                 })
             }
             OraclePrecision::Int8Accumulator => Precision::Int8Accumulator(Quantization {
@@ -263,6 +264,7 @@ impl Conv2dCase {
                 input_scale: 1.0,
                 weights_scale: 1.0,
                 multiplier: Multiplier::from_ratio(1.0),
+                per_channel_shift: false,
             }),
         };
         Shape::with_precision(

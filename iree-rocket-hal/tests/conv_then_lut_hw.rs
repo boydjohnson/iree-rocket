@@ -63,6 +63,7 @@ fn conv_shape() -> conv::Shape {
             input_scale: 1.0,
             weights_scale: 1.0,
             multiplier: Multiplier::from_ratio(1.0),
+            per_channel_shift: false,
         }),
         padding: Some([0, 0]),
         activation: conv::Activation::None,

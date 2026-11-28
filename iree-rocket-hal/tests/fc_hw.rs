@@ -53,6 +53,7 @@ fn int8_shape(m: u32, k: u32, n: u32) -> Shape {
             input_scale: 1.0,
             weights_scale: 1.0,
             multiplier: Multiplier::for_unit_bs(1.0),
+            per_channel_shift: false,
         }),
     )
 }

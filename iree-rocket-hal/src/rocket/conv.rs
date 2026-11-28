@@ -479,6 +479,11 @@ const BRDMA_DATA_USE_BIAS: u32 = 1;
 /// scale and shift operands.
 const BRDMA_DATA_USE_QUANTIZED: u32 = 7;
 
+/// [`BRDMA_DATA_USE_QUANTIZED`] plus the `TRT` operand: BRDMA also fetches
+/// each channel's shift ([`Quantization::per_channel_shift`]), which
+/// `bs_truncate_src` makes the BS MUL stage use.
+const BRDMA_DATA_USE_QUANTIZED_SHIFT: u32 = 15;
+
 /// ARGB input mode for a dense feature map.
 ///
 /// Only reachable for `Cin` 1..=4, since wider pixels use surfaces. The
@@ -603,28 +608,90 @@ pub fn pack_int8_bias_to_bs(
     )
 }
 
-/// The BS plane's multiplier lane for a per-channel requantization factor
-/// `m`: `round(BS_UNIT_MULTIPLIER * m)`, so `m = 1` is exactly the unit
-/// entry every per-tensor convolution writes. The lane is a signed 16-bit
-/// operand, which bounds `m` below 2 and resolves it to 2^-14; a factor that
-/// rounds to zero or past the lane is refused, never wrapped.
-pub fn bs_channel_multiplier(m: f32) -> Result<i16, &'static str> {
+/// `bs_mul_shift_value` in the per-channel shift lanes for a unit factor:
+/// the shift every per-tensor convolution programs in the register.
+const BS_UNIT_SHIFT: u32 = BS_MUL_SHIFT_VALUE;
+
+/// The largest per-channel shift the 6-bit lane holds.
+const BS_MAX_SHIFT: u32 = 63;
+
+/// The BS plane's multiplier and shift lanes for a per-channel
+/// requantization factor `m` ([`Quantization::per_channel_shift`]).
+///
+/// The stage scales a channel by `multiplier * 2^(14 - shift) / 2^14`
+/// (measured: the per-channel shift lane at 14 reproduces the register's
+/// 14 exactly), so `m = 1` is the unit pair `(2^14, 14)` and a smaller
+/// factor raises the shift until the multiplier sits in `[2^14, 2^15)`:
+/// 15 bits of mantissa at every magnitude down to `2^-49`, where a lone
+/// multiplier lane resolved `m` to `2^-14` absolute. A factor that is not
+/// finite and positive, at or past 2, or below the shift's reach is
+/// refused, never wrapped.
+pub fn bs_channel_multiplier_and_shift(m: f32) -> Result<(i16, u8), &'static str> {
     if !m.is_finite() || m <= 0.0 {
         return Err("per-channel scale must be finite and positive");
     }
-    let lane = (f64::from(BS_UNIT_MULTIPLIER) * f64::from(m)).round();
-    if lane < 1.0 || lane > f64::from(i16::MAX) {
+    let unit = f64::from(BS_UNIT_MULTIPLIER);
+    let mut shift = BS_UNIT_SHIFT;
+    let mut scaled = f64::from(m) * unit;
+    while scaled < unit {
+        scaled *= 2.0;
+        shift += 1;
+        if shift > BS_MAX_SHIFT {
+            return Err("per-channel scale is below the BS shift lane's reach");
+        }
+    }
+    let mut lane = scaled.round();
+    // Rounding can carry a normalized mantissa out of the lane at the top.
+    if lane > f64::from(i16::MAX) && shift > BS_UNIT_SHIFT {
+        lane = (scaled / 2.0).round();
+        shift -= 1;
+    }
+    if lane > f64::from(i16::MAX) {
         return Err("per-channel scale does not fit the BS multiplier lane");
     }
-    Ok(lane as i16)
+    Ok((lane as i16, shift as u8))
 }
 
-/// [`pack_int8_bias_to_bs`] with an optional per-channel multiplier:
+/// Writes a BS buffer with per-channel shift lanes
+/// ([`Quantization::per_channel_shift`]): [`write_bs_buffer`]'s three
+/// planes in each [`BS_SHIFT_BLOCK_BYTES`]-byte block, then `shifts[c]` in
+/// both the positive-data lane at `+64` and the negative-data lane at
+/// `+72`. Layout measured on RK3588
+/// (`tests/conv_int8_second_multiply_probe_hw.rs`).
+pub fn write_bs_buffer_with_shifts(buffer: &mut [u8], entries: &[BsEntry], shifts: &[u8]) {
+    assert_eq!(entries.len(), shifts.len(), "one shift per BS entry");
+    let needed = bs_shift_buffer_bytes(entries.len() as u32);
+    assert!(
+        buffer.len() >= needed,
+        "BS buffer is {} bytes, needs {needed} for {} channels",
+        buffer.len(),
+        entries.len()
+    );
+    buffer[..needed].fill(0);
+    for (index, (entry, &shift)) in entries.iter().zip(shifts).enumerate() {
+        let block = index / BS_CHANNELS_PER_BLOCK;
+        let lane = index % BS_CHANNELS_PER_BLOCK;
+        let base = block * BS_SHIFT_BLOCK_BYTES;
+        let bias = base + lane * 4;
+        buffer[bias..bias + 4].copy_from_slice(&entry.bias.to_le_bytes());
+        let constant = base + 32 + lane * 2;
+        buffer[constant..constant + 2].copy_from_slice(&entry.constant.to_le_bytes());
+        let multiplier = base + 48 + lane * 2;
+        buffer[multiplier..multiplier + 2].copy_from_slice(&entry.multiplier.to_le_bytes());
+        buffer[base + 64 + lane] = shift;
+        buffer[base + 72 + lane] = shift;
+    }
+}
+
+/// [`pack_int8_bias_to_bs`] with an optional per-channel factor:
 /// `channel_scales`, when given, is `output_channels` little-endian `f32`
-/// factors, each written into its channel's multiplier lane through
-/// [`bs_channel_multiplier`]. The BS stage multiplies the biased accumulator
-/// by that lane ahead of the per-tensor output conversion, so channel `c` is
-/// requantized by `channel_scales[c]` times the dispatch's multiplier.
+/// factors, each written into its channel's multiplier and shift lanes
+/// through [`bs_channel_multiplier_and_shift`], in the
+/// [`write_bs_buffer_with_shifts`] layout a
+/// [`Quantization::per_channel_shift`] program reads. The BS stage scales
+/// the biased accumulator by that pair ahead of the per-tensor output
+/// conversion, so channel `c` is requantized by `channel_scales[c]` times
+/// the dispatch's multiplier.
 #[allow(clippy::too_many_arguments)]
 pub fn pack_int8_bias_to_bs_per_channel(
     dense: &[u8],
@@ -651,11 +718,16 @@ pub fn pack_int8_bias_to_bs_per_channel(
     if !scale.is_finite() || scale <= 0.0 {
         return Err("int8 bias scales must be finite and positive");
     }
-    let needed = bs_buffer_bytes(padded_output_channels as u32);
+    let needed = if channel_scales.is_some() {
+        bs_shift_buffer_bytes(padded_output_channels as u32)
+    } else {
+        bs_buffer_bytes(padded_output_channels as u32)
+    };
     if packed.len() < needed {
         return Err("Rocket int8 BS destination is smaller than its declared shape");
     }
     let mut entries = vec![BsEntry::default(); padded_output_channels];
+    let mut shifts = vec![BS_UNIT_SHIFT as u8; padded_output_channels];
     for (channel, entry) in entries.iter_mut().take(output_channels).enumerate() {
         let offset = channel * 4;
         let bias = i32::from_le_bytes(dense[offset..offset + 4].try_into().unwrap());
@@ -667,10 +739,14 @@ pub fn pack_int8_bias_to_bs_per_channel(
         entry.constant = -(i16::from(weight_zero_point));
         if let Some(scales) = channel_scales {
             let m = f32::from_le_bytes(scales[offset..offset + 4].try_into().unwrap());
-            entry.multiplier = bs_channel_multiplier(m)?;
+            (entry.multiplier, shifts[channel]) = bs_channel_multiplier_and_shift(m)?;
         }
     }
-    write_bs_buffer(&mut packed[..needed], &entries);
+    if channel_scales.is_some() {
+        write_bs_buffer_with_shifts(&mut packed[..needed], &entries, &shifts);
+    } else {
+        write_bs_buffer(&mut packed[..needed], &entries);
+    }
     Ok(needed)
 }
 
@@ -1446,8 +1522,13 @@ fn conv_2d_tile_program(
     // non-address fields the two emitters disagree on, this one alone accounts
     // for it. `ROCKET_ACC_BRDMA=1` restores the old value, which is how the
     // hardware test still reproduces the hang on demand.
+    // The per-channel shift rides on the requantized path's BS plane only:
+    // the accumulator path bypasses BS.
+    let per_channel_shift = shape.per_channel_shift() && !accumulator_output;
     let brdma_data_use = if accumulator_output && !acc_brdma_restore() {
         BRDMA_DATA_USE_NONE
+    } else if per_channel_shift {
+        BRDMA_DATA_USE_QUANTIZED_SHIFT
     } else if quantization.is_some() {
         BRDMA_DATA_USE_QUANTIZED
     } else {
@@ -1897,6 +1978,7 @@ fn conv_2d_tile_program(
         Register::<DpuBsMulCfg>::new()
             .bs_mul_shift_value(Bits::new(bs_mul_shift))
             .bs_mul_src(Bits::new(u32::from(quantization.is_some() && !bs_vendor)))
+            .bs_truncate_src(Bits::new(u32::from(per_channel_shift)))
             .build(),
     );
     commands.push(zero::<DpuBsReluxCmpValue>());
@@ -2380,6 +2462,7 @@ mod tests {
                 input_scale: 1.0,
                 weights_scale: 1.0,
                 multiplier: Multiplier::from_ratio(1.0),
+                per_channel_shift: false,
             }),
         );
         let fp16 = Shape::with_precision(16, 16, 1, 64, 64, Precision::Fp16);
@@ -2421,6 +2504,7 @@ mod tests {
             input_scale: 1.0,
             weights_scale: 1.0,
             multiplier: Multiplier::from_ratio(1.0),
+            per_channel_shift: false,
         };
         let _ = Shape::with_precision(34, 34, 1, 32, 32, Precision::Int8(quantization))
             .with_depthwise();
@@ -4509,6 +4593,7 @@ mod tests {
                 scale: 19636,
                 shift: 24,
             },
+            per_channel_shift: false,
         })
     }
 
@@ -4624,6 +4709,55 @@ mod tests {
                 );
             }
         }
+    }
+
+    #[test]
+    fn per_channel_shift_engages_the_trt_operand_and_nothing_else() {
+        let plain = Shape::with_precision(32, 32, 1, 16, 24, captured_int8());
+        let shifted = Shape::with_precision(
+            32,
+            32,
+            1,
+            16,
+            24,
+            Precision::Int8(Quantization {
+                per_channel_shift: true,
+                ..quantization()
+            }),
+        );
+        // Int8 pads Cout 24 to 32: four blocks either way.
+        assert_eq!(plain.bs_buffer_bytes(), 4 * BS_BLOCK_BYTES);
+        assert_eq!(shifted.bs_buffer_bytes(), 4 * BS_SHIFT_BLOCK_BYTES);
+
+        let before = conv_2d_tile(plain, [1, 1], &Tile::whole(plain, [1, 1]));
+        let after = conv_2d_tile(shifted, [1, 1], &Tile::whole(shifted, [1, 1]));
+        assert_eq!(before.len(), after.len());
+        let changed: Vec<(u32, u32)> = before
+            .iter()
+            .zip(&after)
+            .filter(|(a, b)| a.0 != b.0)
+            .map(|(_, b)| ((b.0 >> 48) as u32, b.0 as u32 & 0xffff))
+            .collect();
+        assert_eq!(
+            changed,
+            vec![
+                (DpuBsMulCfg::DOMAIN, DpuBsMulCfg::OFFSET),
+                (DpuRdmaBrdmaCfg::DOMAIN, DpuRdmaBrdmaCfg::OFFSET),
+            ]
+        );
+        assert_eq!(
+            value_of::<DpuBsMulCfg>(&after),
+            value_of::<DpuBsMulCfg>(&before)
+                | (Register::<DpuBsMulCfg>::new()
+                    .bs_truncate_src(Bits::new(1))
+                    .build()
+                    .0
+                    >> 16) as u32
+        );
+        assert_eq!(
+            value_of::<DpuRdmaBrdmaCfg>(&before) | (8 << 1),
+            value_of::<DpuRdmaBrdmaCfg>(&after)
+        );
     }
 
     #[test]
@@ -4983,7 +5117,7 @@ mod tests {
     }
 
     #[test]
-    fn per_channel_scales_fill_the_multiplier_lanes() {
+    fn per_channel_scales_fill_the_multiplier_and_shift_lanes() {
         let logical = [200i32, -100, 7]
             .into_iter()
             .flat_map(i32::to_le_bytes)
@@ -4992,7 +5126,7 @@ mod tests {
             .into_iter()
             .flat_map(f32::to_le_bytes)
             .collect::<Vec<_>>();
-        let mut packed = vec![0xa5; bs_buffer_bytes(8)];
+        let mut packed = vec![0xa5; bs_shift_buffer_bytes(16)];
         let written = pack_int8_bias_to_bs_per_channel(
             &logical,
             Some(&scales),
@@ -5004,63 +5138,78 @@ mod tests {
             &mut packed,
         )
         .unwrap();
-        assert_eq!(written, bs_buffer_bytes(8));
+        assert_eq!(written, bs_shift_buffer_bytes(8));
+        assert_eq!(written, BS_SHIFT_BLOCK_BYTES);
         // Biases unchanged, in accumulator units.
         assert_eq!(i32::from_le_bytes(packed[0..4].try_into().unwrap()), 200);
         assert_eq!(i32::from_le_bytes(packed[8..12].try_into().unwrap()), 7);
-        // Multiplier lanes at 48: unit, half, a sixteenth; a padding channel
-        // keeps the default unit entry.
+        // Every factor is a power of two, so each multiplier is the unit
+        // mantissa and the shift carries the factor: 14, 15, 18. A padding
+        // channel keeps the unit pair.
         let lane =
             |c: usize| i16::from_le_bytes(packed[48 + 2 * c..50 + 2 * c].try_into().unwrap());
         assert_eq!(
-            (lane(0), lane(1), lane(2)),
-            (BS_UNIT_MULTIPLIER, 8192, 1024)
+            (lane(0), lane(1), lane(2), lane(3)),
+            (
+                BS_UNIT_MULTIPLIER,
+                BS_UNIT_MULTIPLIER,
+                BS_UNIT_MULTIPLIER,
+                BS_UNIT_MULTIPLIER
+            )
         );
-        assert_eq!(lane(3), BS_UNIT_MULTIPLIER);
+        assert_eq!(&packed[64..68], &[14, 15, 18, 14], "positive-data shifts");
+        assert_eq!(&packed[72..76], &[14, 15, 18, 14], "negative-data shifts");
+        // Nothing past the block is touched.
+        assert!(packed[written..].iter().all(|&b| b == 0xa5));
 
-        // A unit scale on every channel is byte-identical to the per-tensor
-        // packer: the per-tensor executables lose nothing to this path.
+        // Unit factors are the unit pair on every channel, so the stage is
+        // the per-tensor one in the wider layout.
         let ones = [1.0f32; 3]
             .into_iter()
             .flat_map(f32::to_le_bytes)
             .collect::<Vec<_>>();
-        let mut unit = vec![0u8; bs_buffer_bytes(8)];
+        let mut unit = vec![0u8; bs_shift_buffer_bytes(8)];
         let mut plain = vec![0u8; bs_buffer_bytes(8)];
         pack_int8_bias_to_bs_per_channel(&logical, Some(&ones), 3, 8, 0.5, 0.25, 7, &mut unit)
             .unwrap();
         pack_int8_bias_to_bs(&logical, 3, 8, 0.5, 0.25, 7, &mut plain).unwrap();
-        assert_eq!(unit, plain);
+        assert_eq!(&unit[..BS_BLOCK_BYTES], &plain[..]);
+        assert!(unit[64..80].iter().all(|&shift| shift == 14));
     }
 
     #[test]
-    fn per_channel_scales_outside_the_lane_are_refused() {
-        assert_eq!(bs_channel_multiplier(1.0), Ok(BS_UNIT_MULTIPLIER));
-        assert_eq!(bs_channel_multiplier(1.999), Ok(32752));
-        assert_eq!(bs_channel_multiplier(1.0 / 16384.0), Ok(1));
-        assert!(
-            bs_channel_multiplier(1.0 / 65536.0).is_err(),
-            "rounds to zero"
+    fn per_channel_factors_normalize_into_the_multiplier_lane() {
+        assert_eq!(
+            bs_channel_multiplier_and_shift(1.0),
+            Ok((BS_UNIT_MULTIPLIER, 14))
         );
-        assert!(bs_channel_multiplier(2.0).is_err(), "past the signed lane");
-        assert!(bs_channel_multiplier(0.0).is_err());
-        assert!(bs_channel_multiplier(-0.5).is_err());
-        assert!(bs_channel_multiplier(f32::NAN).is_err());
-        let logical = 5i32.to_le_bytes();
-        let short = 1.0f32.to_le_bytes();
-        let mut packed = vec![0u8; bs_buffer_bytes(2)];
-        assert!(
-            pack_int8_bias_to_bs_per_channel(
-                &logical,
-                Some(&short[..2]),
-                1,
-                2,
-                1.0,
-                1.0,
-                0,
-                &mut packed
-            )
-            .is_err()
+        assert_eq!(bs_channel_multiplier_and_shift(1.999), Ok((32752, 14)));
+        assert_eq!(bs_channel_multiplier_and_shift(0.75), Ok((24576, 15)));
+        // A near-dead channel of a stock per-channel ResNet50, 5e-7 of the
+        // layer's largest: a lone multiplier lane rounded it to zero.
+        let (multiplier, shift) = bs_channel_multiplier_and_shift(5e-7).unwrap();
+        assert!((16384..=32767).contains(&multiplier));
+        let factor = f64::from(multiplier) / 2f64.powi(i32::from(shift));
+        assert!((factor - 5e-7).abs() / 5e-7 < 1.0 / 32768.0, "{factor}");
+        // Just under a power of two rounds up into the next shift's mantissa
+        // floor rather than past the lane.
+        let (multiplier, shift) = bs_channel_multiplier_and_shift(0.499_999_9).unwrap();
+        assert_eq!((multiplier, shift), (BS_UNIT_MULTIPLIER, 15));
+        assert_eq!(
+            bs_channel_multiplier_and_shift(2f32.powi(-49)),
+            Ok((BS_UNIT_MULTIPLIER, 63))
         );
+        assert!(
+            bs_channel_multiplier_and_shift(2f32.powi(-51)).is_err(),
+            "past the shift lane"
+        );
+        assert!(
+            bs_channel_multiplier_and_shift(2.0).is_err(),
+            "past the signed lane"
+        );
+        assert!(bs_channel_multiplier_and_shift(0.0).is_err());
+        assert!(bs_channel_multiplier_and_shift(-0.5).is_err());
+        assert!(bs_channel_multiplier_and_shift(f32::NAN).is_err());
     }
 
     #[test]

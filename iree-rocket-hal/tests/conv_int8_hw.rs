@@ -407,6 +407,7 @@ fn attempt(
         // is the residual the output stage adds, which is why the check
         // below allows one LSB.
         multiplier: Multiplier::for_unit_bs(1.0 / f64::from(1u32 << shift)),
+        per_channel_shift: false,
     });
     let shape = Shape::with_precision(width, 32, 1, in_channels, out_channels, precision);
     let label = format!(
@@ -454,6 +455,7 @@ fn int8_channel_matrix_tiles_fit_their_data_banks() {
                 input_scale: 1.0,
                 weights_scale: 1.0,
                 multiplier: Multiplier::for_unit_bs(1.0 / f64::from(1u32 << shift)),
+                per_channel_shift: false,
             });
             let shape = Shape::with_precision(64, 32, 1, in_channels, 8, precision);
             let capacity = shape.max_tile_input_rows(kernels);
@@ -567,6 +569,7 @@ fn int8_single_output_channel_probe() {
                 input_scale: 1.0,
                 weights_scale: 1.0,
                 multiplier: Multiplier::for_unit_bs(1.0 / f64::from(1u32 << shift)),
+                per_channel_shift: false,
             });
             let shape = Shape::with_precision(64, 32, 1, 16, out_channels, precision);
             let mut observed = Vec::new();
@@ -602,6 +605,7 @@ fn int8_single_output_channel_probe() {
             input_scale: 1.0,
             weights_scale: 1.0,
             multiplier: Multiplier::for_unit_bs(1.0 / f64::from(1u32 << shift)),
+            per_channel_shift: false,
         }),
     );
     println!(
@@ -654,6 +658,7 @@ fn int8_bs_read_extent_probe() {
                 input_scale: 1.0,
                 weights_scale: 1.0,
                 multiplier: Multiplier::for_unit_bs(1.0 / f64::from(1u32 << shift)),
+                per_channel_shift: false,
             });
             let shape = Shape::with_precision(64, 32, 1, 16, out_channels, precision);
             let tails = Tails {

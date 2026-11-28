@@ -68,6 +68,7 @@ fn int8_convolution_can_write_exact_i32_accumulators() {
         input_scale: 1.0,
         weights_scale: 1.0,
         multiplier: Multiplier::from_ratio(1.0),
+        per_channel_shift: false,
     });
     let shape = Shape::with_precision(WIDTH, HEIGHT, 1, IN_CHANNELS, OUT_CHANNELS, precision);
     let input_values: Vec<u8> = (1..=OUTPUT_PIXELS as u8)
