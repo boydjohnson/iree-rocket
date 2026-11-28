@@ -12927,8 +12927,22 @@ module attributes {transform.with_named_sequence} {
     %qdq_fused_funcs = transform.apply_registered_pass
         "rocket-fuse-qdq-conv" to %canonical_funcs
       : (!transform.any_op) -> !transform.any_op
+    // What `rocket-fuse-qdq-conv` leaves of a QDQ model's weights -- a
+    // Gemm/MatMul's `DQ(w)` and a per-channel convolution's -- folded into
+    // the f32 constants they compute. IREE's const-expr hoisting refuses
+    // them, since widening i8 grows them past its 1 MiB size-increase
+    // threshold, so each would be dequantized on the CPU and re-packed by
+    // the driver on every call. Only a dequantization whose every use is a
+    // weight operand is folded. After the QDQ convolution rewrite, which
+    // reads the weights it claims as codes. Offload-only, like the grouped
+    // rewrite: in `--no-offload` every weight stays on the CPU, which reads
+    // the i8 codes with the dequantization fused faster than it reads the
+    // f32 constant (per-channel ResNet50: 1512 vs 2034 ms).
+    %dequant_folded_funcs = transform.apply_registered_pass
+        "rocket-fold-constant-dequant" with options = {"offload" = true} to %qdq_fused_funcs
+      : (!transform.any_op) -> !transform.any_op
     %requant_fused_funcs = transform.apply_registered_pass
-        "rocket-fuse-int8-requant-epilogue" to %qdq_fused_funcs
+        "rocket-fuse-int8-requant-epilogue" to %dequant_folded_funcs
       : (!transform.any_op) -> !transform.any_op
     // A quantized residual tail, Q(relu(DQ(a) + DQ(b))), into the canonical
     // signed NHWC form @match_elementwise_add_int8_relu claims. After the

@@ -185,9 +185,10 @@ const DIM_BOUNDS_OP: &str = "transform.iree.match.dim_bounds";
 const ADMITTED_OP: &str = "transform.rocket.match.admitted";
 
 /// The pass option an offload-only preprocessing rewrite carries in the spec
-/// (`rocket-block-diagonal-grouped-conv`): a rewrite that only pays when the
-/// NPU claims its result. [`neutralize`] turns it off, so the CPU baseline
-/// is not charged for work the offload exists to move.
+/// (`rocket-block-diagonal-grouped-conv`, `rocket-fold-constant-dequant`): a
+/// rewrite that only pays when the NPU claims its result. [`neutralize`]
+/// turns it off, so the CPU baseline is not charged for work the offload
+/// exists to move.
 const OFFLOAD_ONLY_ON: &str = r#"with options = {"offload" = true}"#;
 const OFFLOAD_ONLY_OFF: &str = r#"with options = {"offload" = false}"#;
 const NO_OFFLOAD_ATTR: &str = "no_offload";
@@ -839,11 +840,12 @@ transform.named_sequence @match_conv(%r: !transform.any_op) -> !transform.any_op
         // pass while only half the loop was disarmed.
         assert!(op_lines(&spec, ADMITTED_OP) >= 60);
         assert!(op_lines(&spec, DIM_BOUNDS_OP) >= 40);
-        // The block-diagonal grouped-conv rewrite runs only when offloading:
-        // the shipped spec turns it on and the no-offload spec turns it off.
-        assert_eq!(op_lines(&spec, OFFLOAD_ONLY_ON), 1);
+        // The block-diagonal grouped-conv rewrite and the constant-dequant
+        // fold run only when offloading: the shipped spec turns them on and
+        // the no-offload spec turns them off.
+        assert_eq!(op_lines(&spec, OFFLOAD_ONLY_ON), 2);
         assert_eq!(op_lines(&out.text, OFFLOAD_ONLY_ON), 0);
-        assert_eq!(op_lines(&out.text, OFFLOAD_ONLY_OFF), 1);
+        assert_eq!(op_lines(&out.text, OFFLOAD_ONLY_OFF), 2);
         for line in out
             .text
             .lines()
