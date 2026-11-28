@@ -1105,5 +1105,60 @@ equal, top-5 5/5, and max|d| exactly what it was before the change
 
 1. **The global average pool** before the classifier still round-trips
    through fp16: a CPU `i8 -> f16` of the 7x7 cube, an fp16 NPU pool, a
-   CPU `f16 -> i8`.
+   CPU `f16 -> i8`. *Done: next section.*
 2. **The QOperator FC** (`ours_skip`, `QGemm`/`MatMulInteger` forms).
+
+## Follow-up: the global average pool on integers (2026-11-28)
+
+The classifier's input is a QDQ `GlobalAveragePool`: `Q(pooling_nchw_sum(
+DQ(x)) / 49)`. After #127 it was the last float stage in a QDQ ResNet50 or
+MobileNetV2, and it cost three dispatches: a CPU `i8 -> f16` of the whole
+7x7x2048 cube, an fp16 NPU pool, and a CPU `f16 -> i8`.
+
+`rocket-fuse-int8-global-avg-pool` (in `RocketFuseInt8QdqPass.cpp`, right
+after the max pool in the spec) rewrites a global pool -- window equal to
+the unpadded image, batch 1 -- into an `i32` sum of the codes and one
+requantization, `round((sum - k * zx) * sx / (k * sy)) + zy`, and leaves it
+on the CPU on purpose: 100K additions are a few tens of microseconds, less
+than a flat NPU dispatch. The sum reads through the NHWC -> NCHW transpose
+of its producer (every Rocket dispatch writes NHWC), so no CPU transpose of
+the cube survives.
+
+ResNet50's tail goes from six dispatches (#127) to four: the NPU residual
+add, **one** CPU reduction reading the int8 cube, the NPU classifier, and
+the output dequantization. NPU placement is unchanged. `ours_skip`
+(QOperator) compiles byte-identical.
+
+### Board
+
+Same setup (gated; ResNet50 median of 6, MobileNetV2 of 24, two passes):
+
+| arm | #127 | integer pool |
+|---|---|---|
+| ResNet50 `ort_qdq_pc` NPU | 17.95 / 17.45 | **17.5 / 16.85** |
+| ResNet50 `ort_qdq` NPU | 17.6 / 16.8 | **15.95 / 16.7** |
+| MobileNetV2 `ort_qdq_pc` NPU | 8.815 / 8.825 | **8.525 / 8.745** |
+| MobileNetV2 `ort_qdq` NPU | 10.6 / 8.8 | **8.315 / 8.39** |
+| MobileNetV2 `ort_qdq_pc` `--no-offload` | 30.7 / 30.8 | **28.5 / 28.5** |
+| MobileNetV2 `ort_qdq` `--no-offload` | 30.4 / 30.4 | **28.2 / 28.2** |
+| ResNet50 `ort_qdq_pc` `--no-offload` | 274 / 274 | 276 / 278 |
+| ResNet50 `ort_qdq` `--no-offload` | 273 / 272 | 272 / 275 |
+
+The rewrite stays on in both arms: MobileNetV2's CPU arm is 7% faster, and
+ResNet50's is ~1% slower (2-4 ms of 275), not investigated.
+
+### Accuracy
+
+Every arm matches onnxruntime's argmax with top-5 5/5 and the same max|d|
+as #127. Six of the eight are bit-identical to #127 -- all four
+`--no-offload` arms among them, so the integer sum reproduces the CPU's
+float pool exactly on these inputs. The two NPU arms that move (ResNet50
+`_pc`, MobileNetV2 `ort_qdq`) were the ones whose pooled codes came from
+the fp16 NPU pool.
+
+### Lit
+
+`rocket_fuse_int8_global_avg_pool.mlir`: the rewrite on an NCHW transpose
+of an NHWC tensor (the transpose gone, `-49 * zx` and `sx / (49 * sy)`
+checked), and two declines: a 3x3 window over a 7x7 image, and a global sum
+divided by something other than the window size. 60/60 plugin lit.

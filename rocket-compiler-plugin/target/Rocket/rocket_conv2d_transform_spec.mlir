@@ -13022,6 +13022,14 @@ module attributes {transform.with_named_sequence} {
     %max_pool_funcs = transform.apply_registered_pass
         "rocket-fuse-int8-max-pool" to %residual_funcs
       : (!transform.any_op) -> !transform.any_op
+    // A global average pool between a DequantizeLinear and a QuantizeLinear,
+    // the step before a ResNet or MobileNet classifier, as an integer sum of
+    // the codes and one requantization: left on the CPU, where it is a few
+    // tens of microseconds, instead of an fp16 NPU pool between a CPU i8 ->
+    // f16 conversion of the whole cube and a CPU quantization.
+    %avg_pool_funcs = transform.apply_registered_pass
+        "rocket-fuse-int8-global-avg-pool" to %max_pool_funcs
+      : (!transform.any_op) -> !transform.any_op
     // A convolution whose stride equals its kernel -- a patch embedding
     // (ViT/BLIP 16x16 s16) or ConvNeXt's 4x4 s4 stem and 2x2 s2
     // downsamples -- is a space-to-depth transpose and a matmul, which the
@@ -13029,7 +13037,7 @@ module attributes {transform.with_named_sequence} {
     // convolution (kernel above 11, or an even kernel at stride > 1). Before
     // the record/demote/plan trio, so the matmul is planned like any other.
     %patchified_funcs = transform.apply_registered_pass
-        "rocket-patchify-conv-to-matmul" to %max_pool_funcs
+        "rocket-patchify-conv-to-matmul" to %avg_pool_funcs
       : (!transform.any_op) -> !transform.any_op
     // The fp16 7x7 stride-2 image stem at `Cin` <= 4 runs slowly on the
     // CNA's dense image path (~4 ms vs ~2 ms on the CPU); folded 2x2 into
