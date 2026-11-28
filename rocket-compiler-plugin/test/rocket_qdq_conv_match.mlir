@@ -260,3 +260,47 @@ func.func @qdq_depthwise_pad1(%x: tensor<1x64x8x8xi8>) -> tensor<1x64x4x4xi8> {
   return %q2 : tensor<1x64x4x4xi8>
 }
 
+
+// A QDQ classifier, `Gemm(transB = 1)` with per-channel weight scales, as the
+// importer writes it (the bias add still a `linalg.generic`): it runs as the
+// int8 1x1 convolution on the requantized executable, keeping its factors.
+// CHECK-LABEL: util.func public @qdq_fc_per_channel
+// CHECK-NOT:   linalg.matmul
+// CHECK:       flow.dispatch @rocket_dynamic_int8_requant_executable_per_channel::
+// CHECK-NOT:   iree_linalg_ext.quantize_affine
+// CHECK:       util.return
+func.func @qdq_fc_per_channel(%x: tensor<1x64xi8>) -> tensor<1x32xi8> {
+  %wq = arith.constant dense<3> : tensor<32x64xi8>
+  %sw = arith.constant dense<[4.000000e-03, 8.000000e-03, 1.200000e-02, 1.600000e-02, 4.000000e-03, 8.000000e-03, 1.200000e-02, 1.600000e-02, 4.000000e-03, 8.000000e-03, 1.200000e-02, 1.600000e-02, 4.000000e-03, 8.000000e-03, 1.200000e-02, 1.600000e-02, 4.000000e-03, 8.000000e-03, 1.200000e-02, 1.600000e-02, 4.000000e-03, 8.000000e-03, 1.200000e-02, 1.600000e-02, 4.000000e-03, 8.000000e-03, 1.200000e-02, 1.600000e-02, 4.000000e-03, 8.000000e-03, 1.200000e-02, 1.600000e-02]> : tensor<32xf32>
+  %bq = arith.constant dense<100> : tensor<32xi32>
+  %sb = arith.constant dense<[1.000000e-03, 2.000000e-03, 3.000000e-03, 4.000000e-03, 1.000000e-03, 2.000000e-03, 3.000000e-03, 4.000000e-03, 1.000000e-03, 2.000000e-03, 3.000000e-03, 4.000000e-03, 1.000000e-03, 2.000000e-03, 3.000000e-03, 4.000000e-03, 1.000000e-03, 2.000000e-03, 3.000000e-03, 4.000000e-03, 1.000000e-03, 2.000000e-03, 3.000000e-03, 4.000000e-03, 1.000000e-03, 2.000000e-03, 3.000000e-03, 4.000000e-03, 1.000000e-03, 2.000000e-03, 3.000000e-03, 4.000000e-03]> : tensor<32xf32>
+  %sx = arith.constant 2.500000e-01 : f32
+  %sy = arith.constant 1.000000e+00 : f32
+  %zx = arith.constant -128 : i64
+  %zy = arith.constant -70 : i64
+  %zero = arith.constant 0.000000e+00 : f32
+  %e0 = tensor.empty() : tensor<1x64xf32>
+  %xf = iree_linalg_ext.dequantize_affine <indexing_maps = [affine_map<(d0, d1) -> (d0, d1)>, affine_map<(d0, d1) -> ()>, affine_map<(d0, d1) -> ()>, affine_map<(d0, d1) -> (d0, d1)>], quant_min = -128, quant_max = 127>
+      ins(%x, %sx, %zx : tensor<1x64xi8>, f32, i64) outs(%e0 : tensor<1x64xf32>) -> tensor<1x64xf32>
+  %e1 = tensor.empty() : tensor<32x64xf32>
+  %wf = iree_linalg_ext.dequantize_affine <indexing_maps = [affine_map<(d0, d1) -> (d0, d1)>, affine_map<(d0, d1) -> (d0)>, affine_map<(d0, d1) -> (d0, d1)>], quant_min = -128, quant_max = 127>
+      ins(%wq, %sw : tensor<32x64xi8>, tensor<32xf32>) outs(%e1 : tensor<32x64xf32>) -> tensor<32x64xf32>
+  %e2 = tensor.empty() : tensor<64x32xf32>
+  %wt = linalg.transpose ins(%wf : tensor<32x64xf32>) outs(%e2 : tensor<64x32xf32>) permutation = [1, 0]
+  %e3 = tensor.empty() : tensor<1x32xf32>
+  %init = linalg.fill ins(%zero : f32) outs(%e3 : tensor<1x32xf32>) -> tensor<1x32xf32>
+  %y = linalg.matmul ins(%xf, %wt : tensor<1x64xf32>, tensor<64x32xf32>) outs(%init : tensor<1x32xf32>) -> tensor<1x32xf32>
+  %e4 = tensor.empty() : tensor<32xf32>
+  %bf = iree_linalg_ext.dequantize_affine <indexing_maps = [affine_map<(d0) -> (d0)>, affine_map<(d0) -> (d0)>, affine_map<(d0) -> (d0)>], quant_min = -2147483648, quant_max = 2147483647>
+      ins(%bq, %sb : tensor<32xi32>, tensor<32xf32>) outs(%e4 : tensor<32xf32>) -> tensor<32xf32>
+  %yb = linalg.generic {indexing_maps = [affine_map<(d0, d1) -> (d0, d1)>, affine_map<(d0, d1) -> (d1)>, affine_map<(d0, d1) -> (d0, d1)>], iterator_types = ["parallel", "parallel"]}
+      ins(%y, %bf : tensor<1x32xf32>, tensor<32xf32>) outs(%e3 : tensor<1x32xf32>) {
+  ^bb0(%a: f32, %b: f32, %o: f32):
+    %s = arith.addf %a, %b : f32
+    linalg.yield %s : f32
+  } -> tensor<1x32xf32>
+  %e5 = tensor.empty() : tensor<1x32xi8>
+  %q = iree_linalg_ext.quantize_affine <indexing_maps = [affine_map<(d0, d1) -> (d0, d1)>, affine_map<(d0, d1) -> ()>, affine_map<(d0, d1) -> ()>, affine_map<(d0, d1) -> (d0, d1)>], quant_min = -128, quant_max = 127>
+      ins(%yb, %sy, %zy : tensor<1x32xf32>, f32, i64) outs(%e5 : tensor<1x32xi8>) -> tensor<1x32xi8>
+  return %q : tensor<1x32xi8>
+}

@@ -1034,7 +1034,76 @@ cause of #124's rise is not isolated.
 
 ### What is left
 
-1. **The FC** is the one fp16 candidate in both models.
+1. **The FC** is the one fp16 candidate in both models. *Done: next
+   section.*
 2. **BN MUL in int8 mode** is measured (fixed point under
    `bn_mul_shift_value`) but unused; it is the second per-channel stage if
    one is ever needed on top of the shift lanes.
+
+## Follow-up: the classifier on the int8 path (2026-11-28)
+
+The FC was the last fp16 NPU dispatch in every QDQ build, per-tensor and
+per-channel. As the pass sees it, a QDQ `Gemm(transB = 1)` is:
+
+    %x  = dequantize_affine(%codes : [M, K] i8, sx, zx)
+    %wt = transpose(dequantize_affine(%wq : [N, K] i8, sw[n]), [1, 0])
+    %y  = matmul(%x, %wt) outs(fill 0.0)
+    %yb = elementwise <add>(%y, dequantize_affine(%bq : [N] i32, sb[n]))
+    %q  = quantize_affine(%yb, sy, zy)
+
+`fc.rs` already runs an FC as a 1x1 convolution of height one, so
+`rocket-fuse-qdq-conv` gains a third pattern, `FuseQdqMatmul`, that writes
+exactly that: the `[M, K]` codes as the NHWC image `[1, 1, M, K]`, the
+weight codes transposed to the HWCF filter `[1, 1, K, N]`, the integer
+convolution, and the same canonical requantization a convolution gets
+(per-channel factors, dead-channel fold, input zero point folded into the
+bias), collapsed back to `[M, N]`. The existing
+`rocket_dynamic_int8_requant` 1x1 matcher claims it: no new executable,
+ABI or driver change. A weight used without the transpose declines (its
+scales would index `K`).
+
+Placement: all four QDQ builds go from one fp16 candidate to none
+(ResNet50 `1x1 Cin 2048 Cout 1000`, MobileNetV2 `Cin 1280 Cout 1000`).
+ResNet50's tail loses a CPU dispatch: the bias add and quantization that
+followed the fp16 matmul are now the convolution's own. The QOperator
+import (`ours_skip`) is unchanged; its FC arrives in a different form.
+
+**e2e:** a new fixture, `requant_int8_fc_2048x1000`, is ResNet50's
+classifier in canonical form. A 1x1 image is geometry no other requantized
+fixture had (every other one is at least 7x7). The requant gate is 24/24;
+the new case is at max|error| 1, 0/1000 past atol 1.
+
+### Board
+
+Same setup as above (gated, median of 6, two passes; MobileNetV2 again at
+24 repetitions):
+
+| NPU arm | before (#126, per-tensor #123) | int8 FC |
+|---|---|---|
+| ResNet50 `ort_qdq_pc` | 17.3 / 17.45 | 17.3 / 17.15 |
+| ResNet50 `ort_qdq` | 18.3 / 18.15 | **16.35 / 17.15** |
+| MobileNetV2 `ort_qdq_pc` (24 reps) | 8.915 / 8.89 | **8.64 / 8.81** |
+| MobileNetV2 `ort_qdq` (24 reps) | 9.405 / 9.425 | **8.47 / 8.62** |
+
+- At 7 repetitions the MobileNetV2 int8-FC arms looked bimodal (8.2-8.9 ms
+  with stretches of 3-5 consecutive repetitions at 10.5-11.4 ms). At 24
+  repetitions the medians are the ones above; such a stretch showed once
+  more in an int8-FC run, and the baseline had a 13.0 ms outlier. Not
+  explained.
+- `--no-offload` arms are level: ResNet50 per-channel 276/277.5 ->
+  275/276 ms, per-tensor 281/277 -> 273/272; MobileNetV2 per-channel
+  30.4 -> 30.75, per-tensor 30.4 (no earlier build to compare).
+
+### Accuracy (against onnxruntime)
+
+Every arm, NPU and `--no-offload`, both models, both quantizations: argmax
+equal, top-5 5/5, and max|d| exactly what it was before the change
+(ResNet50 `ort_qdq` 0.1514, `_pc` 0.126; MobileNetV2 `ort_qdq` 0.128,
+`_pc` 0.064 on the NPU).
+
+### What is left
+
+1. **The global average pool** before the classifier still round-trips
+   through fp16: a CPU `i8 -> f16` of the 7x7 cube, an fp16 NPU pool, a
+   CPU `f16 -> i8`.
+2. **The QOperator FC** (`ours_skip`, `QGemm`/`MatMulInteger` forms).
