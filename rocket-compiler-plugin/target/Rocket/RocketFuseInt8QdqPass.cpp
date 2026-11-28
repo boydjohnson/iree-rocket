@@ -694,6 +694,184 @@ struct FuseInt8MaxPool : public RewritePattern {
   }
 };
 
+/// A global average pool between a DequantizeLinear and a QuantizeLinear,
+/// `Q(pooling_nchw_sum(DQ(x)) / k)` over the whole `H x W` image -- ONNX
+/// `GlobalAveragePool`, the step before every ResNet and MobileNet
+/// classifier -- rewritten to integer arithmetic on the codes:
+///
+///   %sum = generic(reduce over h, w)(extsi(%x)) : [N, C] i32
+///   %q'  = generic(%sum)(clamp(roundeven(sitofp(%sum - k * zx) * r) + zy))
+///
+/// with `r = sx / (k * sy)`, rounded once to f32. That is ORT's
+/// `round((mean(x) - zx) * sx / sy) + zy` in exact integer sums, where the
+/// float graph sums dequantized values in f32; the two can differ by a code
+/// only next to a rounding tie.
+///
+/// This leaves the pool on the CPU deliberately. A 7x7x2048 average is
+/// 100K additions, a few tens of microseconds on one core, against a flat
+/// per-dispatch NPU cost several times that (agent-docs/
+/// offload-cost-is-flat-per-dispatch); what it removes is the float form's
+/// glue -- a CPU i8 -> f16 conversion of the whole cube before an fp16 NPU
+/// pool, and a CPU f16 -> i8 quantization after it -- so the integer sum
+/// reads the codes once and fuses with its quantization into one dispatch.
+///
+/// Only a global pool (an `H x W` window over an unpadded image, so one
+/// output pixel) with a batch of 1: no window arithmetic to rebuild.
+struct FuseInt8GlobalAvgPool : public RewritePattern {
+  explicit FuseInt8GlobalAvgPool(MLIRContext *context)
+      : RewritePattern(MatchAnyOpTypeTag(), /*benefit=*/1, context) {}
+
+  LogicalResult matchAndRewrite(Operation *quant,
+                                PatternRewriter &rewriter) const override {
+    std::optional<Quant> output = matchQuant(quant);
+    if (!output) {
+      return failure();
+    }
+    // The divide by the window size: an elementwise divide by a scalar
+    // constant, as `linalg-specialize-generic-ops` leaves it.
+    auto divide = output->input.getDefiningOp<linalg::ElementwiseOp>();
+    if (!divide || divide.getKind() != linalg::ElementwiseKind::div ||
+        divide.getNumDpsInputs() != 2 || !output->input.hasOneUse()) {
+      return failure();
+    }
+    std::optional<double> divisor;
+    {
+      APFloat value(0.0f);
+      if (matchPattern(divide.getDpsInputs()[1], m_ConstantFloat(&value))) {
+        divisor = value.convertToDouble();
+      }
+    }
+    auto pool =
+        divide.getDpsInputs()[0].getDefiningOp<linalg::PoolingNchwSumOp>();
+    if (!divisor || !pool || !pool->hasOneUse()) {
+      return failure();
+    }
+    auto initFill = pool.getDpsInits()[0].getDefiningOp<linalg::FillOp>();
+    APFloat initValue(1.0f);
+    if (!initFill ||
+        !matchPattern(initFill.getInputs()[0], m_ConstantFloat(&initValue)) ||
+        !initValue.isZero()) {
+      return failure();
+    }
+    std::optional<Dequant> dequant = matchDequant(pool.getDpsInputs()[0]);
+    if (!dequant) {
+      return failure();
+    }
+    auto sourceType = cast<RankedTensorType>(dequant->source.getType());
+    auto windowType = cast<RankedTensorType>(pool.getDpsInputs()[1].getType());
+    auto resultType =
+        dyn_cast<RankedTensorType>(quant->getResult(0).getType());
+    if (sourceType.getRank() != 4 || !sourceType.hasStaticShape() ||
+        sourceType.getDimSize(0) != 1 || !resultType ||
+        resultType.getShape() !=
+            ArrayRef<int64_t>{1, sourceType.getDimSize(1), 1, 1} ||
+        windowType.getRank() != 2 || !windowType.hasStaticShape() ||
+        windowType.getDimSize(0) != sourceType.getDimSize(2) ||
+        windowType.getDimSize(1) != sourceType.getDimSize(3)) {
+      return failure();
+    }
+    int64_t count = sourceType.getDimSize(2) * sourceType.getDimSize(3);
+    // The float graph divides by the window size; anything else is not an
+    // average.
+    if (*divisor != static_cast<double>(count)) {
+      return failure();
+    }
+    double ratio = dequant->scale / (static_cast<double>(count) * output->scale);
+    if (!std::isfinite(ratio) || !(ratio > 0.0) ||
+        !std::isfinite(static_cast<float>(ratio))) {
+      return failure();
+    }
+
+    Location loc = quant->getLoc();
+    Type i8 = rewriter.getI8Type();
+    Type i32 = rewriter.getI32Type();
+    Type f32 = rewriter.getF32Type();
+    MLIRContext *context = rewriter.getContext();
+    int64_t channels = sourceType.getDimSize(1);
+    // The codes usually arrive as the NCHW transpose of an NHWC producer's
+    // output (every Rocket dispatch writes NHWC). The sum reads through it
+    // rather than keeping a CPU transpose of the whole cube alive.
+    Value source = dequant->source;
+    AffineMap image = AffineMap::getMultiDimIdentityMap(4, context);
+    if (auto transpose = source.getDefiningOp<linalg::TransposeOp>()) {
+      if (transpose.getPermutation() == ArrayRef<int64_t>{0, 3, 1, 2}) {
+        source = transpose.getInput();
+        image = AffineMap::get(
+            4, 0,
+            {getAffineDimExpr(0, context), getAffineDimExpr(2, context),
+             getAffineDimExpr(3, context), getAffineDimExpr(1, context)},
+            context);
+      }
+    }
+    Value codes = toSigned(rewriter, loc, source, dequant->isUnsigned);
+    int64_t inputZeroPoint =
+        signedZeroPoint(dequant->zeroPoint, dequant->isUnsigned);
+    int64_t outputZeroPoint =
+        signedZeroPoint(output->zeroPoint, output->isUnsigned);
+
+    Value zero =
+        arith::ConstantOp::create(rewriter, loc, rewriter.getI32IntegerAttr(0));
+    Value sumEmpty = tensor::EmptyOp::create(rewriter, loc, {1, channels}, i32);
+    Value sumInit =
+        linalg::FillOp::create(rewriter, loc, zero, sumEmpty).getResult(0);
+    AffineMap channel = AffineMap::get(
+        4, 0, {getAffineDimExpr(0, context), getAffineDimExpr(1, context)},
+        context);
+    Value sum =
+        linalg::GenericOp::create(
+            rewriter, loc, TypeRange{sumInit.getType()}, ValueRange{codes},
+            ValueRange{sumInit}, SmallVector<AffineMap>{image, channel},
+            SmallVector<utils::IteratorType>{
+                utils::IteratorType::parallel, utils::IteratorType::parallel,
+                utils::IteratorType::reduction,
+                utils::IteratorType::reduction},
+            [&](OpBuilder &b, Location nested, ValueRange args) {
+              Value wide = arith::ExtSIOp::create(b, nested, i32, args[0]);
+              Value total = arith::AddIOp::create(b, nested, wide, args[1]);
+              linalg::YieldOp::create(b, nested, total);
+            })
+            .getResult(0);
+
+    Value outEmpty = tensor::EmptyOp::create(rewriter, loc, {1, channels}, i8);
+    AffineMap identity2 = AffineMap::getMultiDimIdentityMap(2, context);
+    Value requantized =
+        linalg::GenericOp::create(
+            rewriter, loc, TypeRange{outEmpty.getType()}, ValueRange{sum},
+            ValueRange{outEmpty}, SmallVector<AffineMap>{identity2, identity2},
+            SmallVector<utils::IteratorType>(2, utils::IteratorType::parallel),
+            [&](OpBuilder &b, Location nested, ValueRange args) {
+              Value offset = arith::ConstantOp::create(
+                  b, nested, b.getI32IntegerAttr(count * inputZeroPoint));
+              Value centred = arith::SubIOp::create(b, nested, args[0], offset);
+              Value real = arith::SIToFPOp::create(b, nested, f32, centred);
+              Value scale = arith::ConstantOp::create(
+                  b, nested, b.getF32FloatAttr(static_cast<float>(ratio)));
+              Value scaled = arith::MulFOp::create(b, nested, real, scale);
+              Value rounded = math::RoundEvenOp::create(b, nested, scaled);
+              Value zp = arith::ConstantOp::create(
+                  b, nested, b.getF32FloatAttr(static_cast<float>(outputZeroPoint)));
+              Value shifted = arith::AddFOp::create(b, nested, rounded, zp);
+              Value low = arith::ConstantOp::create(b, nested, b.getF32FloatAttr(-128.0f));
+              Value high = arith::ConstantOp::create(b, nested, b.getF32FloatAttr(127.0f));
+              Value clamped = arith::MinimumFOp::create(
+                  b, nested, arith::MaximumFOp::create(b, nested, shifted, low),
+                  high);
+              Value narrowed = arith::FPToSIOp::create(b, nested, i8, clamped);
+              linalg::YieldOp::create(b, nested, narrowed);
+            })
+            .getResult(0);
+    Value expanded = tensor::ExpandShapeOp::create(
+        rewriter, loc, RankedTensorType::get({1, channels, 1, 1}, i8),
+        requantized, SmallVector<ReassociationIndices>{{0}, {1, 2, 3}});
+    Value back = toSigned(rewriter, loc, expanded, output->isUnsigned);
+    if (back.getType() != quant->getResult(0).getType()) {
+      return failure();
+    }
+    rewriter.replaceOp(quant, back);
+    return success();
+  }
+};
+
 struct RocketFuseInt8ResidualAddPass
     : public PassWrapper<RocketFuseInt8ResidualAddPass, OperationPass<>> {
   MLIR_DEFINE_EXPLICIT_INTERNAL_INLINE_TYPE_ID(RocketFuseInt8ResidualAddPass)
@@ -761,6 +939,39 @@ struct RocketFuseInt8MaxPoolPass
 };
 
 static PassRegistration<RocketFuseInt8MaxPoolPass> maxPoolReg;
+
+struct RocketFuseInt8GlobalAvgPoolPass
+    : public PassWrapper<RocketFuseInt8GlobalAvgPoolPass, OperationPass<>> {
+  MLIR_DEFINE_EXPLICIT_INTERNAL_INLINE_TYPE_ID(RocketFuseInt8GlobalAvgPoolPass)
+
+  StringRef getArgument() const final {
+    return "rocket-fuse-int8-global-avg-pool";
+  }
+  StringRef getDescription() const final {
+    return "Rewrites a quantized global average pool, Q(sum_pool(DQ(x)) / k) "
+           "over the whole image, into an integer sum of the codes and one "
+           "requantization, left on the CPU.";
+  }
+
+  void getDependentDialects(DialectRegistry &registry) const final {
+    registry.insert<arith::ArithDialect, linalg::LinalgDialect,
+                    math::MathDialect, tensor::TensorDialect>();
+  }
+
+  void runOnOperation() final {
+    MLIRContext *context = &getContext();
+    RewritePatternSet patterns(context);
+    patterns.add<FuseInt8GlobalAvgPool>(context);
+    GreedyRewriteConfig config;
+    config.enableFolding(false);
+    if (failed(applyPatternsGreedily(getOperation(), std::move(patterns),
+                                     config))) {
+      return signalPassFailure();
+    }
+  }
+};
+
+static PassRegistration<RocketFuseInt8GlobalAvgPoolPass> globalAvgPoolReg;
 
 } // namespace
 } // namespace mlir::iree_compiler::IREE::HAL
