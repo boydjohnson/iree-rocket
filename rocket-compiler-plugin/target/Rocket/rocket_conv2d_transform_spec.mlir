@@ -1037,7 +1037,8 @@
     "input_width", "input_height", "input_channels",
     "output_channels", "weights_width", "weights_height"
   ],
-  runtime_quantization = ["output_scale", "output_zero_point"]
+  runtime_quantization = ["output_scale", "output_zero_point"],
+  per_channel_scale = true
 }>
 
 // The stride-2 twin of the requantized dense target. Stride is a static
@@ -1062,7 +1063,8 @@
     "input_width", "input_height", "input_channels",
     "output_channels", "weights_width", "weights_height"
   ],
-  runtime_quantization = ["output_scale", "output_zero_point"]
+  runtime_quantization = ["output_scale", "output_zero_point"],
+  per_channel_scale = true
 }>
 
 // Requantized int8 with the model's "same" padding done by the CNA: the
@@ -1099,7 +1101,8 @@
     "input_width", "input_height", "input_channels",
     "output_channels", "weights_width", "weights_height"
   ],
-  runtime_quantization = ["output_scale", "output_zero_point"]
+  runtime_quantization = ["output_scale", "output_zero_point"],
+  per_channel_scale = true
 }>
 
 #rocket_dynamic_int8_requant_pad1_s2_target = #hal.executable.target<"rocket", "rocket-flatbuffer-v1", {
@@ -1119,7 +1122,8 @@
     "input_width", "input_height", "input_channels",
     "output_channels", "weights_width", "weights_height"
   ],
-  runtime_quantization = ["output_scale", "output_zero_point"]
+  runtime_quantization = ["output_scale", "output_zero_point"],
+  per_channel_scale = true
 }>
 
 // Requantized int8 depthwise: the same trade the dense requantized target
@@ -1157,7 +1161,8 @@
     "input_width", "input_height", "input_channels",
     "output_channels", "weights_width", "weights_height"
   ],
-  runtime_quantization = ["output_scale", "output_zero_point"]
+  runtime_quantization = ["output_scale", "output_zero_point"],
+  per_channel_scale = true
 }>
 
 // Requantized int8 depthwise with the model's "same" padding done by the
@@ -1194,7 +1199,8 @@
     "input_width", "input_height", "input_channels",
     "output_channels", "weights_width", "weights_height"
   ],
-  runtime_quantization = ["output_scale", "output_zero_point"]
+  runtime_quantization = ["output_scale", "output_zero_point"],
+  per_channel_scale = true
 }>
 
 #rocket_dynamic_depthwise_int8_requant_pad1_s2_target = #hal.executable.target<"rocket", "rocket-flatbuffer-v1", {
@@ -1214,7 +1220,8 @@
     "input_width", "input_height", "input_channels",
     "output_channels", "weights_width", "weights_height"
   ],
-  runtime_quantization = ["output_scale", "output_zero_point"]
+  runtime_quantization = ["output_scale", "output_zero_point"],
+  per_channel_scale = true
 }>
 
 #dynamic_pipeline_layout = #hal.pipeline.layout<constants = 7, bindings = [
@@ -1251,7 +1258,10 @@
   #hal.pipeline.binding<storage_buffer>
 ]>
 
+// Input, weights, bias, the per-channel requantization factors
+// (Conv2DDef.per_channel_scale), output.
 #dynamic_requant_pipeline_layout = #hal.pipeline.layout<constants = 9, bindings = [
+  #hal.pipeline.binding<storage_buffer, ReadOnly>,
   #hal.pipeline.binding<storage_buffer, ReadOnly>,
   #hal.pipeline.binding<storage_buffer, ReadOnly>,
   #hal.pipeline.binding<storage_buffer, ReadOnly>,
@@ -6165,6 +6175,12 @@ module attributes {transform.with_named_sequence} {
   // Conv2DQuantParam in rocket_executable_def.fbs, which is where that
   // convention is written down.
   //
+  // `%channel_scale` is its own binding after the bias
+  // (Conv2DDef.per_channel_scale): one f32 factor per output channel, which
+  // the runtime writes into the BS plane's multiplier lanes, so channel c is
+  // requantized by `channel_scale[c] * output_scale`. A per-tensor
+  // convolution passes 1 on every channel, the unit lane it always had.
+  //
   // The bias binding is i32 and, unlike the accumulator adapter's, it is not
   // zero: this is the real per-output-channel bias, already in accumulator
   // units (`bias / (input_scale * weights_scale)`, which is what a
@@ -6180,6 +6196,7 @@ module attributes {transform.with_named_sequence} {
       %filter: tensor<?x?x?x?xi8>,
       %acc_init: tensor<1x?x?x?xi32>,
       %bias: tensor<?xi32>,
+      %channel_scale: tensor<?xf32>,
       %output_scale: f32,
       %output_zero_point: i32,
       %int8_min: f32,
@@ -6221,12 +6238,13 @@ module attributes {transform.with_named_sequence} {
           %input_width_i32, %input_height_i32, %input_channels_i32,
           %output_channels_i32, %weights_width_i32, %weights_height_i32,
           %output_scale_i32, %output_zero_point, %layout_i32,
-          %input, %filter, %bias)
+          %input, %filter, %bias, %channel_scale)
         {stream.affinity = #hal.device.affinity<@rocket_device>}
         : (i32, i32, i32, i32, i32, i32, i32, i32, i32,
            tensor<1x?x?x?xi8>{%input_height, %input_width, %input_channels},
            tensor<?x?x?x?xi8>{%weights_height, %weights_width, %input_channels, %output_channels},
-           tensor<?xi32>{%output_channels})
+           tensor<?xi32>{%output_channels},
+           tensor<?xf32>{%output_channels})
         -> tensor<1x?x?x?xi8>{%output_height, %output_width, %output_channels}
 
     util.return %quantized : tensor<1x?x?x?xi8>
@@ -6238,6 +6256,7 @@ module attributes {transform.with_named_sequence} {
       %filter: tensor<?x?x?x?xi8>,
       %acc_init: tensor<1x?x?x?xi32>,
       %bias: tensor<?xi32>,
+      %channel_scale: tensor<?xf32>,
       %output_scale: f32,
       %output_zero_point: i32,
       %int8_min: f32,
@@ -6279,12 +6298,13 @@ module attributes {transform.with_named_sequence} {
           %input_width_i32, %input_height_i32, %input_channels_i32,
           %output_channels_i32, %weights_width_i32, %weights_height_i32,
           %output_scale_i32, %output_zero_point, %layout_i32,
-          %input, %filter, %bias)
+          %input, %filter, %bias, %channel_scale)
         {stream.affinity = #hal.device.affinity<@rocket_device>}
         : (i32, i32, i32, i32, i32, i32, i32, i32, i32,
            tensor<1x?x?x?xi8>{%input_height, %input_width, %input_channels},
            tensor<?x?x?x?xi8>{%weights_height, %weights_width, %input_channels, %output_channels},
-           tensor<?xi32>{%output_channels})
+           tensor<?xi32>{%output_channels},
+           tensor<?xf32>{%output_channels})
         -> tensor<1x?x?x?xi8>{%output_height, %output_width, %output_channels}
 
     util.return %quantized : tensor<1x?x?x?xi8>
@@ -6300,6 +6320,7 @@ module attributes {transform.with_named_sequence} {
       %filter: tensor<?x?x?x?xi8>,
       %acc_init: tensor<1x?x?x?xi32>,
       %bias: tensor<?xi32>,
+      %channel_scale: tensor<?xf32>,
       %output_scale: f32,
       %output_zero_point: i32,
       %int8_min: f32,
@@ -6341,12 +6362,13 @@ module attributes {transform.with_named_sequence} {
           %input_width_i32, %input_height_i32, %input_channels_i32,
           %output_channels_i32, %weights_width_i32, %weights_height_i32,
           %output_scale_i32, %output_zero_point, %layout_i32,
-          %input, %filter, %bias)
+          %input, %filter, %bias, %channel_scale)
         {stream.affinity = #hal.device.affinity<@rocket_device>}
         : (i32, i32, i32, i32, i32, i32, i32, i32, i32,
            tensor<1x?x?x?xi8>{%input_height, %input_width, %input_channels},
            tensor<?x?x?x?xi8>{%weights_height, %weights_width, %input_channels, %output_channels},
-           tensor<?xi32>{%output_channels})
+           tensor<?xi32>{%output_channels},
+           tensor<?xf32>{%output_channels})
         -> tensor<1x?x?x?xi8>{%output_height, %output_width, %output_channels}
 
     util.return %quantized : tensor<1x?x?x?xi8>
@@ -6359,6 +6381,7 @@ module attributes {transform.with_named_sequence} {
       %filter: tensor<?x?x?x?xi8>,
       %acc_init: tensor<1x?x?x?xi32>,
       %bias: tensor<?xi32>,
+      %channel_scale: tensor<?xf32>,
       %output_scale: f32,
       %output_zero_point: i32,
       %int8_min: f32,
@@ -6400,12 +6423,13 @@ module attributes {transform.with_named_sequence} {
           %input_width_i32, %input_height_i32, %input_channels_i32,
           %output_channels_i32, %weights_width_i32, %weights_height_i32,
           %output_scale_i32, %output_zero_point, %layout_i32,
-          %input, %filter, %bias)
+          %input, %filter, %bias, %channel_scale)
         {stream.affinity = #hal.device.affinity<@rocket_device>}
         : (i32, i32, i32, i32, i32, i32, i32, i32, i32,
            tensor<1x?x?x?xi8>{%input_height, %input_width, %input_channels},
            tensor<?x?x?x?xi8>{%weights_height, %weights_width, %input_channels, %output_channels},
-           tensor<?xi32>{%output_channels})
+           tensor<?xi32>{%output_channels},
+           tensor<?xf32>{%output_channels})
         -> tensor<1x?x?x?xi8>{%output_height, %output_width, %output_channels}
 
     util.return %quantized : tensor<1x?x?x?xi8>
@@ -6426,6 +6450,7 @@ module attributes {transform.with_named_sequence} {
       %filter: tensor<?x?x?xi8>,
       %acc_init: tensor<1x?x?x?xi32>,
       %bias: tensor<?xi32>,
+      %channel_scale: tensor<?xf32>,
       %output_scale: f32,
       %output_zero_point: i32,
       %int8_min: f32,
@@ -6472,12 +6497,13 @@ module attributes {transform.with_named_sequence} {
           %input_width_i32, %input_height_i32, %input_channels_i32,
           %output_channels_i32, %weights_width_i32, %weights_height_i32,
           %output_scale_i32, %output_zero_point, %layout_i32,
-          %input, %filter_chw, %bias)
+          %input, %filter_chw, %bias, %channel_scale)
         {stream.affinity = #hal.device.affinity<@rocket_device>}
         : (i32, i32, i32, i32, i32, i32, i32, i32, i32,
            tensor<1x?x?x?xi8>{%input_height, %input_width, %input_channels},
            tensor<?x?x?xi8>{%input_channels, %weights_height, %weights_width},
-           tensor<?xi32>{%output_channels})
+           tensor<?xi32>{%output_channels},
+           tensor<?xf32>{%output_channels})
         -> tensor<1x?x?x?xi8>{%output_height, %output_width, %output_channels}
 
     util.return %quantized : tensor<1x?x?x?xi8>
@@ -6493,6 +6519,7 @@ module attributes {transform.with_named_sequence} {
       %filter: tensor<?x?x?xi8>,
       %acc_init: tensor<1x?x?x?xi32>,
       %bias: tensor<?xi32>,
+      %channel_scale: tensor<?xf32>,
       %output_scale: f32,
       %output_zero_point: i32,
       %int8_min: f32,
@@ -6539,12 +6566,13 @@ module attributes {transform.with_named_sequence} {
           %input_width_i32, %input_height_i32, %input_channels_i32,
           %output_channels_i32, %weights_width_i32, %weights_height_i32,
           %output_scale_i32, %output_zero_point, %layout_i32,
-          %input, %filter_chw, %bias)
+          %input, %filter_chw, %bias, %channel_scale)
         {stream.affinity = #hal.device.affinity<@rocket_device>}
         : (i32, i32, i32, i32, i32, i32, i32, i32, i32,
            tensor<1x?x?x?xi8>{%input_height, %input_width, %input_channels},
            tensor<?x?x?xi8>{%input_channels, %weights_height, %weights_width},
-           tensor<?xi32>{%output_channels})
+           tensor<?xi32>{%output_channels},
+           tensor<?xf32>{%output_channels})
         -> tensor<1x?x?x?xi8>{%output_height, %output_width, %output_channels}
 
     util.return %quantized : tensor<1x?x?x?xi8>
@@ -6556,6 +6584,7 @@ module attributes {transform.with_named_sequence} {
       %filter: tensor<?x?x?xi8>,
       %acc_init: tensor<1x?x?x?xi32>,
       %bias: tensor<?xi32>,
+      %channel_scale: tensor<?xf32>,
       %output_scale: f32,
       %output_zero_point: i32,
       %int8_min: f32,
@@ -6602,12 +6631,13 @@ module attributes {transform.with_named_sequence} {
           %input_width_i32, %input_height_i32, %input_channels_i32,
           %output_channels_i32, %weights_width_i32, %weights_height_i32,
           %output_scale_i32, %output_zero_point, %layout_i32,
-          %input, %filter_chw, %bias)
+          %input, %filter_chw, %bias, %channel_scale)
         {stream.affinity = #hal.device.affinity<@rocket_device>}
         : (i32, i32, i32, i32, i32, i32, i32, i32, i32,
            tensor<1x?x?x?xi8>{%input_height, %input_width, %input_channels},
            tensor<?x?x?xi8>{%input_channels, %weights_height, %weights_width},
-           tensor<?xi32>{%output_channels})
+           tensor<?xi32>{%output_channels},
+           tensor<?xf32>{%output_channels})
         -> tensor<1x?x?x?xi8>{%output_height, %output_width, %output_channels}
 
     util.return %quantized : tensor<1x?x?x?xi8>
@@ -11528,6 +11558,7 @@ module attributes {transform.with_named_sequence} {
     %ins, %outs = transform.iree.match.cast_compatible_dag_from_root %root {
       ^bb0(%input: tensor<1x?x?x?xi8>, %weights: tensor<?x?x?x?xi8>,
            %acc_init: tensor<1x?x?x?xi32>, %bias: tensor<?xi32>,
+           %channel_scale: tensor<?xf32>,
            %output_scale: f32, %output_zero_point: i32,
            %int8_min: f32, %int8_max: f32,
            %out_init: tensor<1x?x?x?xi8>):
@@ -11538,21 +11569,23 @@ module attributes {transform.with_named_sequence} {
         %quantized = linalg.generic {
             indexing_maps = [affine_map<(d0, d1, d2, d3) -> (d0, d1, d2, d3)>,
                              affine_map<(d0, d1, d2, d3) -> (d3)>,
+                             affine_map<(d0, d1, d2, d3) -> (d3)>,
                              affine_map<(d0, d1, d2, d3) -> ()>,
                              affine_map<(d0, d1, d2, d3) -> ()>,
                              affine_map<(d0, d1, d2, d3) -> ()>,
                              affine_map<(d0, d1, d2, d3) -> ()>,
                              affine_map<(d0, d1, d2, d3) -> (d0, d1, d2, d3)>],
             iterator_types = ["parallel", "parallel", "parallel", "parallel"]}
-            ins(%accumulator, %bias, %output_scale, %output_zero_point,
+            ins(%accumulator, %bias, %channel_scale, %output_scale, %output_zero_point,
                 %int8_min, %int8_max
-                : tensor<1x?x?x?xi32>, tensor<?xi32>, f32, i32, f32, f32)
+                : tensor<1x?x?x?xi32>, tensor<?xi32>, tensor<?xf32>, f32, i32, f32, f32)
             outs(%out_init : tensor<1x?x?x?xi8>) {
-          ^bb1(%raw: i32, %channel_bias: i32, %scale: f32, %zero_point: i32,
+          ^bb1(%raw: i32, %channel_bias: i32, %channel_mul: f32, %scale: f32, %zero_point: i32,
                %low: f32, %high: f32, %unused: i8):
             %biased = arith.addi %raw, %channel_bias : i32
             %real = arith.sitofp %biased : i32 to f32
-            %scaled = arith.mulf %real, %scale : f32
+            %channel_scaled = arith.mulf %real, %channel_mul : f32
+            %scaled = arith.mulf %channel_scaled, %scale : f32
             %rounded = math.roundeven %scaled : f32
             %zero_point_f32 = arith.sitofp %zero_point : i32 to f32
             %offset = arith.addf %rounded, %zero_point_f32 : f32
@@ -11591,6 +11624,7 @@ module attributes {transform.with_named_sequence} {
     %ins, %outs = transform.iree.match.cast_compatible_dag_from_root %root {
       ^bb0(%input: tensor<1x?x?x?xi8>, %weights: tensor<?x?x?x?xi8>,
            %acc_init: tensor<1x?x?x?xi32>, %bias: tensor<?xi32>,
+           %channel_scale: tensor<?xf32>,
            %output_scale: f32, %output_zero_point: i32,
            %int8_min: f32, %int8_max: f32,
            %out_init: tensor<1x?x?x?xi8>):
@@ -11601,21 +11635,23 @@ module attributes {transform.with_named_sequence} {
         %quantized = linalg.generic {
             indexing_maps = [affine_map<(d0, d1, d2, d3) -> (d0, d1, d2, d3)>,
                              affine_map<(d0, d1, d2, d3) -> (d3)>,
+                             affine_map<(d0, d1, d2, d3) -> (d3)>,
                              affine_map<(d0, d1, d2, d3) -> ()>,
                              affine_map<(d0, d1, d2, d3) -> ()>,
                              affine_map<(d0, d1, d2, d3) -> ()>,
                              affine_map<(d0, d1, d2, d3) -> ()>,
                              affine_map<(d0, d1, d2, d3) -> (d0, d1, d2, d3)>],
             iterator_types = ["parallel", "parallel", "parallel", "parallel"]}
-            ins(%accumulator, %bias, %output_scale, %output_zero_point,
+            ins(%accumulator, %bias, %channel_scale, %output_scale, %output_zero_point,
                 %int8_min, %int8_max
-                : tensor<1x?x?x?xi32>, tensor<?xi32>, f32, i32, f32, f32)
+                : tensor<1x?x?x?xi32>, tensor<?xi32>, tensor<?xf32>, f32, i32, f32, f32)
             outs(%out_init : tensor<1x?x?x?xi8>) {
-          ^bb1(%raw: i32, %channel_bias: i32, %scale: f32, %zero_point: i32,
+          ^bb1(%raw: i32, %channel_bias: i32, %channel_mul: f32, %scale: f32, %zero_point: i32,
                %low: f32, %high: f32, %unused: i8):
             %biased = arith.addi %raw, %channel_bias : i32
             %real = arith.sitofp %biased : i32 to f32
-            %scaled = arith.mulf %real, %scale : f32
+            %channel_scaled = arith.mulf %real, %channel_mul : f32
+            %scaled = arith.mulf %channel_scaled, %scale : f32
             %rounded = math.roundeven %scaled : f32
             %zero_point_f32 = arith.sitofp %zero_point : i32 to f32
             %offset = arith.addf %rounded, %zero_point_f32 : f32
@@ -11653,6 +11689,7 @@ module attributes {transform.with_named_sequence} {
     %ins, %outs = transform.iree.match.cast_compatible_dag_from_root %root {
       ^bb0(%input: tensor<1x?x?x?xi8>, %weights: tensor<?x?x?x?xi8>,
            %acc_init: tensor<1x?x?x?xi32>, %bias: tensor<?xi32>,
+           %channel_scale: tensor<?xf32>,
            %output_scale: f32, %output_zero_point: i32,
            %int8_min: f32, %int8_max: f32,
            %out_init: tensor<1x?x?x?xi8>):
@@ -11663,21 +11700,23 @@ module attributes {transform.with_named_sequence} {
         %quantized = linalg.generic {
             indexing_maps = [affine_map<(d0, d1, d2, d3) -> (d0, d1, d2, d3)>,
                              affine_map<(d0, d1, d2, d3) -> (d3)>,
+                             affine_map<(d0, d1, d2, d3) -> (d3)>,
                              affine_map<(d0, d1, d2, d3) -> ()>,
                              affine_map<(d0, d1, d2, d3) -> ()>,
                              affine_map<(d0, d1, d2, d3) -> ()>,
                              affine_map<(d0, d1, d2, d3) -> ()>,
                              affine_map<(d0, d1, d2, d3) -> (d0, d1, d2, d3)>],
             iterator_types = ["parallel", "parallel", "parallel", "parallel"]}
-            ins(%accumulator, %bias, %output_scale, %output_zero_point,
+            ins(%accumulator, %bias, %channel_scale, %output_scale, %output_zero_point,
                 %int8_min, %int8_max
-                : tensor<1x?x?x?xi32>, tensor<?xi32>, f32, i32, f32, f32)
+                : tensor<1x?x?x?xi32>, tensor<?xi32>, tensor<?xf32>, f32, i32, f32, f32)
             outs(%out_init : tensor<1x?x?x?xi8>) {
-          ^bb1(%raw: i32, %channel_bias: i32, %scale: f32, %zero_point: i32,
+          ^bb1(%raw: i32, %channel_bias: i32, %channel_mul: f32, %scale: f32, %zero_point: i32,
                %low: f32, %high: f32, %unused: i8):
             %biased = arith.addi %raw, %channel_bias : i32
             %real = arith.sitofp %biased : i32 to f32
-            %scaled = arith.mulf %real, %scale : f32
+            %channel_scaled = arith.mulf %real, %channel_mul : f32
+            %scaled = arith.mulf %channel_scaled, %scale : f32
             %rounded = math.roundeven %scaled : f32
             %zero_point_f32 = arith.sitofp %zero_point : i32 to f32
             %offset = arith.addf %rounded, %zero_point_f32 : f32
@@ -11716,6 +11755,7 @@ module attributes {transform.with_named_sequence} {
     %ins, %outs = transform.iree.match.cast_compatible_dag_from_root %root {
       ^bb0(%input: tensor<1x?x?x?xi8>, %weights: tensor<?x?x?x?xi8>,
            %acc_init: tensor<1x?x?x?xi32>, %bias: tensor<?xi32>,
+           %channel_scale: tensor<?xf32>,
            %output_scale: f32, %output_zero_point: i32,
            %int8_min: f32, %int8_max: f32,
            %out_init: tensor<1x?x?x?xi8>):
@@ -11726,21 +11766,23 @@ module attributes {transform.with_named_sequence} {
         %quantized = linalg.generic {
             indexing_maps = [affine_map<(d0, d1, d2, d3) -> (d0, d1, d2, d3)>,
                              affine_map<(d0, d1, d2, d3) -> (d3)>,
+                             affine_map<(d0, d1, d2, d3) -> (d3)>,
                              affine_map<(d0, d1, d2, d3) -> ()>,
                              affine_map<(d0, d1, d2, d3) -> ()>,
                              affine_map<(d0, d1, d2, d3) -> ()>,
                              affine_map<(d0, d1, d2, d3) -> ()>,
                              affine_map<(d0, d1, d2, d3) -> (d0, d1, d2, d3)>],
             iterator_types = ["parallel", "parallel", "parallel", "parallel"]}
-            ins(%accumulator, %bias, %output_scale, %output_zero_point,
+            ins(%accumulator, %bias, %channel_scale, %output_scale, %output_zero_point,
                 %int8_min, %int8_max
-                : tensor<1x?x?x?xi32>, tensor<?xi32>, f32, i32, f32, f32)
+                : tensor<1x?x?x?xi32>, tensor<?xi32>, tensor<?xf32>, f32, i32, f32, f32)
             outs(%out_init : tensor<1x?x?x?xi8>) {
-          ^bb1(%raw: i32, %channel_bias: i32, %scale: f32, %zero_point: i32,
+          ^bb1(%raw: i32, %channel_bias: i32, %channel_mul: f32, %scale: f32, %zero_point: i32,
                %low: f32, %high: f32, %unused: i8):
             %biased = arith.addi %raw, %channel_bias : i32
             %real = arith.sitofp %biased : i32 to f32
-            %scaled = arith.mulf %real, %scale : f32
+            %channel_scaled = arith.mulf %real, %channel_mul : f32
+            %scaled = arith.mulf %channel_scaled, %scale : f32
             %rounded = math.roundeven %scaled : f32
             %zero_point_f32 = arith.sitofp %zero_point : i32 to f32
             %offset = arith.addf %rounded, %zero_point_f32 : f32
@@ -11783,6 +11825,7 @@ module attributes {transform.with_named_sequence} {
     %ins, %outs = transform.iree.match.cast_compatible_dag_from_root %root {
       ^bb0(%input: tensor<1x?x?x?xi8>, %weights: tensor<?x?x?x?xi8>,
            %acc_init: tensor<1x?x?x?xi32>, %bias: tensor<?xi32>,
+           %channel_scale: tensor<?xf32>,
            %output_scale: f32, %output_zero_point: i32,
            %int8_min: f32, %int8_max: f32,
            %out_init: tensor<1x?x?x?xi8>):
@@ -11798,21 +11841,23 @@ module attributes {transform.with_named_sequence} {
         %quantized = linalg.generic {
             indexing_maps = [affine_map<(d0, d1, d2, d3) -> (d0, d1, d2, d3)>,
                              affine_map<(d0, d1, d2, d3) -> (d3)>,
+                             affine_map<(d0, d1, d2, d3) -> (d3)>,
                              affine_map<(d0, d1, d2, d3) -> ()>,
                              affine_map<(d0, d1, d2, d3) -> ()>,
                              affine_map<(d0, d1, d2, d3) -> ()>,
                              affine_map<(d0, d1, d2, d3) -> ()>,
                              affine_map<(d0, d1, d2, d3) -> (d0, d1, d2, d3)>],
             iterator_types = ["parallel", "parallel", "parallel", "parallel"]}
-            ins(%accumulator, %bias, %output_scale, %output_zero_point,
+            ins(%accumulator, %bias, %channel_scale, %output_scale, %output_zero_point,
                 %int8_min, %int8_max
-                : tensor<1x?x?x?xi32>, tensor<?xi32>, f32, i32, f32, f32)
+                : tensor<1x?x?x?xi32>, tensor<?xi32>, tensor<?xf32>, f32, i32, f32, f32)
             outs(%out_init : tensor<1x?x?x?xi8>) {
-          ^bb1(%raw: i32, %channel_bias: i32, %scale: f32, %zero_point: i32,
+          ^bb1(%raw: i32, %channel_bias: i32, %channel_mul: f32, %scale: f32, %zero_point: i32,
                %low: f32, %high: f32, %unused: i8):
             %biased = arith.addi %raw, %channel_bias : i32
             %real = arith.sitofp %biased : i32 to f32
-            %scaled = arith.mulf %real, %scale : f32
+            %channel_scaled = arith.mulf %real, %channel_mul : f32
+            %scaled = arith.mulf %channel_scaled, %scale : f32
             %rounded = math.roundeven %scaled : f32
             %zero_point_f32 = arith.sitofp %zero_point : i32 to f32
             %offset = arith.addf %rounded, %zero_point_f32 : f32
@@ -11851,6 +11896,7 @@ module attributes {transform.with_named_sequence} {
     %ins, %outs = transform.iree.match.cast_compatible_dag_from_root %root {
       ^bb0(%input: tensor<1x?x?x?xi8>, %weights: tensor<?x?x?x?xi8>,
            %acc_init: tensor<1x?x?x?xi32>, %bias: tensor<?xi32>,
+           %channel_scale: tensor<?xf32>,
            %output_scale: f32, %output_zero_point: i32,
            %int8_min: f32, %int8_max: f32,
            %out_init: tensor<1x?x?x?xi8>):
@@ -11866,21 +11912,23 @@ module attributes {transform.with_named_sequence} {
         %quantized = linalg.generic {
             indexing_maps = [affine_map<(d0, d1, d2, d3) -> (d0, d1, d2, d3)>,
                              affine_map<(d0, d1, d2, d3) -> (d3)>,
+                             affine_map<(d0, d1, d2, d3) -> (d3)>,
                              affine_map<(d0, d1, d2, d3) -> ()>,
                              affine_map<(d0, d1, d2, d3) -> ()>,
                              affine_map<(d0, d1, d2, d3) -> ()>,
                              affine_map<(d0, d1, d2, d3) -> ()>,
                              affine_map<(d0, d1, d2, d3) -> (d0, d1, d2, d3)>],
             iterator_types = ["parallel", "parallel", "parallel", "parallel"]}
-            ins(%accumulator, %bias, %output_scale, %output_zero_point,
+            ins(%accumulator, %bias, %channel_scale, %output_scale, %output_zero_point,
                 %int8_min, %int8_max
-                : tensor<1x?x?x?xi32>, tensor<?xi32>, f32, i32, f32, f32)
+                : tensor<1x?x?x?xi32>, tensor<?xi32>, tensor<?xf32>, f32, i32, f32, f32)
             outs(%out_init : tensor<1x?x?x?xi8>) {
-          ^bb1(%raw: i32, %channel_bias: i32, %scale: f32, %zero_point: i32,
+          ^bb1(%raw: i32, %channel_bias: i32, %channel_mul: f32, %scale: f32, %zero_point: i32,
                %low: f32, %high: f32, %unused: i8):
             %biased = arith.addi %raw, %channel_bias : i32
             %real = arith.sitofp %biased : i32 to f32
-            %scaled = arith.mulf %real, %scale : f32
+            %channel_scaled = arith.mulf %real, %channel_mul : f32
+            %scaled = arith.mulf %channel_scaled, %scale : f32
             %rounded = math.roundeven %scaled : f32
             %zero_point_f32 = arith.sitofp %zero_point : i32 to f32
             %offset = arith.addf %rounded, %zero_point_f32 : f32
@@ -11920,6 +11968,7 @@ module attributes {transform.with_named_sequence} {
     %ins, %outs = transform.iree.match.cast_compatible_dag_from_root %root {
       ^bb0(%input: tensor<1x?x?x?xi8>, %weights: tensor<?x?x?x?xi8>,
            %acc_init: tensor<1x?x?x?xi32>, %bias: tensor<?xi32>,
+           %channel_scale: tensor<?xf32>,
            %output_scale: f32, %output_zero_point: i32,
            %int8_min: f32, %int8_max: f32,
            %out_init: tensor<1x?x?x?xi8>):
@@ -11930,21 +11979,23 @@ module attributes {transform.with_named_sequence} {
         %quantized = linalg.generic {
             indexing_maps = [affine_map<(d0, d1, d2, d3) -> (d0, d1, d2, d3)>,
                              affine_map<(d0, d1, d2, d3) -> (d3)>,
+                             affine_map<(d0, d1, d2, d3) -> (d3)>,
                              affine_map<(d0, d1, d2, d3) -> ()>,
                              affine_map<(d0, d1, d2, d3) -> ()>,
                              affine_map<(d0, d1, d2, d3) -> ()>,
                              affine_map<(d0, d1, d2, d3) -> ()>,
                              affine_map<(d0, d1, d2, d3) -> (d0, d1, d2, d3)>],
             iterator_types = ["parallel", "parallel", "parallel", "parallel"]}
-            ins(%accumulator, %bias, %output_scale, %output_zero_point,
+            ins(%accumulator, %bias, %channel_scale, %output_scale, %output_zero_point,
                 %int8_min, %int8_max
-                : tensor<1x?x?x?xi32>, tensor<?xi32>, f32, i32, f32, f32)
+                : tensor<1x?x?x?xi32>, tensor<?xi32>, tensor<?xf32>, f32, i32, f32, f32)
             outs(%out_init : tensor<1x?x?x?xi8>) {
-          ^bb1(%raw: i32, %channel_bias: i32, %scale: f32, %zero_point: i32,
+          ^bb1(%raw: i32, %channel_bias: i32, %channel_mul: f32, %scale: f32, %zero_point: i32,
                %low: f32, %high: f32, %unused: i8):
             %biased = arith.addi %raw, %channel_bias : i32
             %real = arith.sitofp %biased : i32 to f32
-            %scaled = arith.mulf %real, %scale : f32
+            %channel_scaled = arith.mulf %real, %channel_mul : f32
+            %scaled = arith.mulf %channel_scaled, %scale : f32
             %rounded = math.roundeven %scaled : f32
             %zero_point_f32 = arith.sitofp %zero_point : i32 to f32
             %offset = arith.addf %rounded, %zero_point_f32 : f32
@@ -11991,6 +12042,7 @@ module attributes {transform.with_named_sequence} {
     %ins, %outs = transform.iree.match.cast_compatible_dag_from_root %root {
       ^bb0(%input: tensor<1x?x?x?xi8>, %weights: tensor<?x?x?xi8>,
            %acc_init: tensor<1x?x?x?xi32>, %bias: tensor<?xi32>,
+           %channel_scale: tensor<?xf32>,
            %output_scale: f32, %output_zero_point: i32,
            %int8_min: f32, %int8_max: f32,
            %out_init: tensor<1x?x?x?xi8>):
@@ -12001,21 +12053,23 @@ module attributes {transform.with_named_sequence} {
         %quantized = linalg.generic {
             indexing_maps = [affine_map<(d0, d1, d2, d3) -> (d0, d1, d2, d3)>,
                              affine_map<(d0, d1, d2, d3) -> (d3)>,
+                             affine_map<(d0, d1, d2, d3) -> (d3)>,
                              affine_map<(d0, d1, d2, d3) -> ()>,
                              affine_map<(d0, d1, d2, d3) -> ()>,
                              affine_map<(d0, d1, d2, d3) -> ()>,
                              affine_map<(d0, d1, d2, d3) -> ()>,
                              affine_map<(d0, d1, d2, d3) -> (d0, d1, d2, d3)>],
             iterator_types = ["parallel", "parallel", "parallel", "parallel"]}
-            ins(%accumulator, %bias, %output_scale, %output_zero_point,
+            ins(%accumulator, %bias, %channel_scale, %output_scale, %output_zero_point,
                 %int8_min, %int8_max
-                : tensor<1x?x?x?xi32>, tensor<?xi32>, f32, i32, f32, f32)
+                : tensor<1x?x?x?xi32>, tensor<?xi32>, tensor<?xf32>, f32, i32, f32, f32)
             outs(%out_init : tensor<1x?x?x?xi8>) {
-          ^bb1(%raw: i32, %channel_bias: i32, %scale: f32, %zero_point: i32,
+          ^bb1(%raw: i32, %channel_bias: i32, %channel_mul: f32, %scale: f32, %zero_point: i32,
                %low: f32, %high: f32, %unused: i8):
             %biased = arith.addi %raw, %channel_bias : i32
             %real = arith.sitofp %biased : i32 to f32
-            %scaled = arith.mulf %real, %scale : f32
+            %channel_scaled = arith.mulf %real, %channel_mul : f32
+            %scaled = arith.mulf %channel_scaled, %scale : f32
             %rounded = math.roundeven %scaled : f32
             %zero_point_f32 = arith.sitofp %zero_point : i32 to f32
             %offset = arith.addf %rounded, %zero_point_f32 : f32
@@ -12070,6 +12124,7 @@ module attributes {transform.with_named_sequence} {
     %ins, %outs = transform.iree.match.cast_compatible_dag_from_root %root {
       ^bb0(%input: tensor<1x?x?x?xi8>, %weights: tensor<?x?x?xi8>,
            %acc_init: tensor<1x?x?x?xi32>, %bias: tensor<?xi32>,
+           %channel_scale: tensor<?xf32>,
            %output_scale: f32, %output_zero_point: i32,
            %int8_min: f32, %int8_max: f32,
            %out_init: tensor<1x?x?x?xi8>):
@@ -12080,21 +12135,23 @@ module attributes {transform.with_named_sequence} {
         %quantized = linalg.generic {
             indexing_maps = [affine_map<(d0, d1, d2, d3) -> (d0, d1, d2, d3)>,
                              affine_map<(d0, d1, d2, d3) -> (d3)>,
+                             affine_map<(d0, d1, d2, d3) -> (d3)>,
                              affine_map<(d0, d1, d2, d3) -> ()>,
                              affine_map<(d0, d1, d2, d3) -> ()>,
                              affine_map<(d0, d1, d2, d3) -> ()>,
                              affine_map<(d0, d1, d2, d3) -> ()>,
                              affine_map<(d0, d1, d2, d3) -> (d0, d1, d2, d3)>],
             iterator_types = ["parallel", "parallel", "parallel", "parallel"]}
-            ins(%accumulator, %bias, %output_scale, %output_zero_point,
+            ins(%accumulator, %bias, %channel_scale, %output_scale, %output_zero_point,
                 %int8_min, %int8_max
-                : tensor<1x?x?x?xi32>, tensor<?xi32>, f32, i32, f32, f32)
+                : tensor<1x?x?x?xi32>, tensor<?xi32>, tensor<?xf32>, f32, i32, f32, f32)
             outs(%out_init : tensor<1x?x?x?xi8>) {
-          ^bb1(%raw: i32, %channel_bias: i32, %scale: f32, %zero_point: i32,
+          ^bb1(%raw: i32, %channel_bias: i32, %channel_mul: f32, %scale: f32, %zero_point: i32,
                %low: f32, %high: f32, %unused: i8):
             %biased = arith.addi %raw, %channel_bias : i32
             %real = arith.sitofp %biased : i32 to f32
-            %scaled = arith.mulf %real, %scale : f32
+            %channel_scaled = arith.mulf %real, %channel_mul : f32
+            %scaled = arith.mulf %channel_scaled, %scale : f32
             %rounded = math.roundeven %scaled : f32
             %zero_point_f32 = arith.sitofp %zero_point : i32 to f32
             %offset = arith.addf %rounded, %zero_point_f32 : f32
@@ -12138,6 +12195,7 @@ module attributes {transform.with_named_sequence} {
     %ins, %outs = transform.iree.match.cast_compatible_dag_from_root %root {
       ^bb0(%input: tensor<1x?x?x?xi8>, %weights: tensor<?x?x?xi8>,
            %acc_init: tensor<1x?x?x?xi32>, %bias: tensor<?xi32>,
+           %channel_scale: tensor<?xf32>,
            %output_scale: f32, %output_zero_point: i32,
            %int8_min: f32, %int8_max: f32,
            %out_init: tensor<1x?x?x?xi8>):
@@ -12153,21 +12211,23 @@ module attributes {transform.with_named_sequence} {
         %quantized = linalg.generic {
             indexing_maps = [affine_map<(d0, d1, d2, d3) -> (d0, d1, d2, d3)>,
                              affine_map<(d0, d1, d2, d3) -> (d3)>,
+                             affine_map<(d0, d1, d2, d3) -> (d3)>,
                              affine_map<(d0, d1, d2, d3) -> ()>,
                              affine_map<(d0, d1, d2, d3) -> ()>,
                              affine_map<(d0, d1, d2, d3) -> ()>,
                              affine_map<(d0, d1, d2, d3) -> ()>,
                              affine_map<(d0, d1, d2, d3) -> (d0, d1, d2, d3)>],
             iterator_types = ["parallel", "parallel", "parallel", "parallel"]}
-            ins(%accumulator, %bias, %output_scale, %output_zero_point,
+            ins(%accumulator, %bias, %channel_scale, %output_scale, %output_zero_point,
                 %int8_min, %int8_max
-                : tensor<1x?x?x?xi32>, tensor<?xi32>, f32, i32, f32, f32)
+                : tensor<1x?x?x?xi32>, tensor<?xi32>, tensor<?xf32>, f32, i32, f32, f32)
             outs(%out_init : tensor<1x?x?x?xi8>) {
-          ^bb1(%raw: i32, %channel_bias: i32, %scale: f32, %zero_point: i32,
+          ^bb1(%raw: i32, %channel_bias: i32, %channel_mul: f32, %scale: f32, %zero_point: i32,
                %low: f32, %high: f32, %unused: i8):
             %biased = arith.addi %raw, %channel_bias : i32
             %real = arith.sitofp %biased : i32 to f32
-            %scaled = arith.mulf %real, %scale : f32
+            %channel_scaled = arith.mulf %real, %channel_mul : f32
+            %scaled = arith.mulf %channel_scaled, %scale : f32
             %rounded = math.roundeven %scaled : f32
             %zero_point_f32 = arith.sitofp %zero_point : i32 to f32
             %offset = arith.addf %rounded, %zero_point_f32 : f32
@@ -12206,6 +12266,7 @@ module attributes {transform.with_named_sequence} {
     %ins, %outs = transform.iree.match.cast_compatible_dag_from_root %root {
       ^bb0(%input: tensor<1x?x?x?xi8>, %weights: tensor<?x?x?xi8>,
            %acc_init: tensor<1x?x?x?xi32>, %bias: tensor<?xi32>,
+           %channel_scale: tensor<?xf32>,
            %output_scale: f32, %output_zero_point: i32,
            %int8_min: f32, %int8_max: f32,
            %out_init: tensor<1x?x?x?xi8>):
@@ -12221,21 +12282,23 @@ module attributes {transform.with_named_sequence} {
         %quantized = linalg.generic {
             indexing_maps = [affine_map<(d0, d1, d2, d3) -> (d0, d1, d2, d3)>,
                              affine_map<(d0, d1, d2, d3) -> (d3)>,
+                             affine_map<(d0, d1, d2, d3) -> (d3)>,
                              affine_map<(d0, d1, d2, d3) -> ()>,
                              affine_map<(d0, d1, d2, d3) -> ()>,
                              affine_map<(d0, d1, d2, d3) -> ()>,
                              affine_map<(d0, d1, d2, d3) -> ()>,
                              affine_map<(d0, d1, d2, d3) -> (d0, d1, d2, d3)>],
             iterator_types = ["parallel", "parallel", "parallel", "parallel"]}
-            ins(%accumulator, %bias, %output_scale, %output_zero_point,
+            ins(%accumulator, %bias, %channel_scale, %output_scale, %output_zero_point,
                 %int8_min, %int8_max
-                : tensor<1x?x?x?xi32>, tensor<?xi32>, f32, i32, f32, f32)
+                : tensor<1x?x?x?xi32>, tensor<?xi32>, tensor<?xf32>, f32, i32, f32, f32)
             outs(%out_init : tensor<1x?x?x?xi8>) {
-          ^bb1(%raw: i32, %channel_bias: i32, %scale: f32, %zero_point: i32,
+          ^bb1(%raw: i32, %channel_bias: i32, %channel_mul: f32, %scale: f32, %zero_point: i32,
                %low: f32, %high: f32, %unused: i8):
             %biased = arith.addi %raw, %channel_bias : i32
             %real = arith.sitofp %biased : i32 to f32
-            %scaled = arith.mulf %real, %scale : f32
+            %channel_scaled = arith.mulf %real, %channel_mul : f32
+            %scaled = arith.mulf %channel_scaled, %scale : f32
             %rounded = math.roundeven %scaled : f32
             %zero_point_f32 = arith.sitofp %zero_point : i32 to f32
             %offset = arith.addf %rounded, %zero_point_f32 : f32
@@ -13343,7 +13406,18 @@ module attributes {transform.with_named_sequence} {
         "rocket-fold-neutral-init" to %inlined_module
       : (!transform.any_op) -> !transform.any_op
 
-    transform.apply_dce to %folded_module : !transform.any_op
+    // A requantized dispatch whose per-channel factors are all 1 -- every
+    // per-tensor convolution -- goes back to the four-binding executable
+    // without `per_channel_scale`. IREE would materialize that splat with a
+    // fill on every call, between the Rocket dispatches it feeds (ResNet50
+    // `ours_skip`: one more NPU submission and two more compactions per
+    // call, 17.8 -> 18.6 ms). After the inline, where the factors are the
+    // producer's constant.
+    %unit_scale_module = transform.apply_registered_pass
+        "rocket-drop-unit-channel-scales" to %folded_module
+      : (!transform.any_op) -> !transform.any_op
+
+    transform.apply_dce to %unit_scale_module : !transform.any_op
     transform.yield
   }
 }

@@ -1185,6 +1185,11 @@ pub struct BiasPacking {
     pub output_channels: usize,
     pub padded_output_channels: usize,
     pub int8: bool,
+    /// `Conv2DDef.per_channel_scale`: the binding of `output_channels` f32
+    /// requantization factors, one per BS multiplier lane; null without it.
+    pub scales_buffer: *mut iree_hal_buffer_t,
+    pub scales_offset: iree_device_size_t,
+    pub scales_length: iree_device_size_t,
     pub input_scale: f32,
     pub weights_scale: f32,
     pub weight_zero_point: i8,
@@ -1811,8 +1816,20 @@ pub unsafe fn apply_ops_until_dispatch(
                         std::slice::from_raw_parts_mut(packing.scratch_ptr, packing.scratch_length)
                     };
                     if packing.int8 {
-                        if iree_rocket_hal::rocket::conv::pack_int8_bias_to_bs(
+                        // Validated against the binding at record time.
+                        let channel_scales = (!packing.scales_buffer.is_null()).then(|| {
+                            let scales =
+                                unsafe { &*(packing.scales_buffer as *const RocketBuffer) };
+                            unsafe {
+                                std::slice::from_raw_parts(
+                                    scales.host_ptr.add(packing.scales_offset as usize),
+                                    packing.output_channels * 4,
+                                )
+                            }
+                        });
+                        if iree_rocket_hal::rocket::conv::pack_int8_bias_to_bs_per_channel(
                             dense,
+                            channel_scales,
                             packing.output_channels,
                             packing.padded_output_channels,
                             packing.input_scale,
@@ -2558,8 +2575,18 @@ unsafe extern "C" fn dispatch_impl(
                 }
             };
             // With a residual epilogue the bindings are input, weights, bias,
-            // residual, output; otherwise input, weights, bias, output.
-            let output_index = if executable.epilogue_add { 4 } else { 3 };
+            // residual, output; with per-channel scales input, weights,
+            // bias, scales, output; otherwise input, weights, bias, output.
+            if executable.epilogue_add && executable.per_channel_scale {
+                return status::from_code(
+                    crate::bindings::iree_status_code_e_IREE_STATUS_INVALID_ARGUMENT,
+                );
+            }
+            let output_index = if executable.epilogue_add || executable.per_channel_scale {
+                4
+            } else {
+                3
+            };
             if bindings.count < output_index + 1 {
                 return status::from_code(
                     crate::bindings::iree_status_code_e_IREE_STATUS_INVALID_ARGUMENT,
@@ -2637,6 +2664,9 @@ unsafe extern "C" fn dispatch_impl(
             unsafe {
                 note_dense_read(cb, &refs[1]);
                 note_dense_read(cb, &refs[2]);
+                if executable.per_channel_scale {
+                    note_dense_read(cb, &refs[3]);
+                }
             }
             // Bytes the dense feature DMA reads from the input binding; zero
             // when the input is read through a packed or chained cube.
@@ -2879,6 +2909,9 @@ unsafe extern "C" fn dispatch_impl(
                         output_channels,
                         padded_output_channels,
                         int8: false,
+                        scales_buffer: std::ptr::null_mut(),
+                        scales_offset: 0,
+                        scales_length: 0,
                         input_scale: 1.0,
                         weights_scale: 1.0,
                         weight_zero_point: 0,
@@ -2889,9 +2922,13 @@ unsafe extern "C" fn dispatch_impl(
             } else if let Precision::Int8(q) | Precision::Int8Accumulator(q) = shape.precision {
                 let output_channels = shape.out_channels as usize;
                 let padded_output_channels = programmed_shape.padded_out_channels() as usize;
+                // per_channel_scale: one f32 factor per channel, in its own
+                // binding after the bias.
+                let scales_ref = executable.per_channel_scale.then_some(&refs[3]);
                 if output_channels
                     .checked_mul(4)
                     .is_none_or(|value| value as u64 > refs[2].length as u64)
+                    || scales_ref.is_some_and(|scales| output_channels * 4 > scales.length as usize)
                 {
                     return status::from_code(
                         crate::bindings::iree_status_code_e_IREE_STATUS_INVALID_ARGUMENT,
@@ -2918,6 +2955,9 @@ unsafe extern "C" fn dispatch_impl(
                         output_channels,
                         padded_output_channels,
                         int8: true,
+                        scales_buffer: scales_ref.map_or(std::ptr::null_mut(), |r| r.buffer),
+                        scales_offset: scales_ref.map_or(0, |r| r.offset),
+                        scales_length: scales_ref.map_or(0, |r| r.length),
                         input_scale: q.input_scale,
                         weights_scale: q.weights_scale,
                         weight_zero_point: q.weight_zero_point as i8,
@@ -3635,6 +3675,9 @@ unsafe extern "C" fn dispatch_impl(
                     output_channels: n,
                     padded_output_channels,
                     int8: false,
+                    scales_buffer: std::ptr::null_mut(),
+                    scales_offset: 0,
+                    scales_length: 0,
                     input_scale: 1.0,
                     weights_scale: 1.0,
                     weight_zero_point: 0,

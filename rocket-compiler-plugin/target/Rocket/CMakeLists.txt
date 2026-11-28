@@ -83,6 +83,7 @@ set(_ROCKET_SRCS
   "RocketAnnotateFinalPlacementPass.cpp"
   "RocketAnnotateOriginalPlacementPass.cpp"
   "RocketDemoteConvInputsPass.cpp"
+  "RocketDropUnitChannelScalesPass.cpp"
   "RocketExpandGemvToMatmulPass.cpp"
   "RocketBlockDiagonalGroupedConvPass.cpp"
   "RocketPatchifyConvPass.cpp"

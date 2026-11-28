@@ -579,9 +579,9 @@ pub fn write_bs_buffer(buffer: &mut [u8], entries: &[BsEntry]) {
 ///
 /// The logical ABI is little-endian `i32` bias values in accumulator units.
 /// Rocket's BS bias plane is normalized by the input and weight scales, while
-/// its constant plane supplies the affine weight correction. Weight scales
-/// are currently per-tensor in the executable ABI; per-channel scales can be
-/// added without changing the physical writer.
+/// its constant plane supplies the affine weight correction. Every channel
+/// gets the unit multiplier; [`pack_int8_bias_to_bs_per_channel`] is the
+/// form with a per-channel one (`Conv2DDef.per_channel_scale`).
 pub fn pack_int8_bias_to_bs(
     dense: &[u8],
     output_channels: usize,
@@ -591,6 +591,56 @@ pub fn pack_int8_bias_to_bs(
     weight_zero_point: i8,
     packed: &mut [u8],
 ) -> Result<usize, &'static str> {
+    pack_int8_bias_to_bs_per_channel(
+        dense,
+        None,
+        output_channels,
+        padded_output_channels,
+        input_scale,
+        weights_scale,
+        weight_zero_point,
+        packed,
+    )
+}
+
+/// The BS plane's multiplier lane for a per-channel requantization factor
+/// `m`: `round(BS_UNIT_MULTIPLIER * m)`, so `m = 1` is exactly the unit
+/// entry every per-tensor convolution writes. The lane is a signed 16-bit
+/// operand, which bounds `m` below 2 and resolves it to 2^-14; a factor that
+/// rounds to zero or past the lane is refused, never wrapped.
+pub fn bs_channel_multiplier(m: f32) -> Result<i16, &'static str> {
+    if !m.is_finite() || m <= 0.0 {
+        return Err("per-channel scale must be finite and positive");
+    }
+    let lane = (f64::from(BS_UNIT_MULTIPLIER) * f64::from(m)).round();
+    if lane < 1.0 || lane > f64::from(i16::MAX) {
+        return Err("per-channel scale does not fit the BS multiplier lane");
+    }
+    Ok(lane as i16)
+}
+
+/// [`pack_int8_bias_to_bs`] with an optional per-channel multiplier:
+/// `channel_scales`, when given, is `output_channels` little-endian `f32`
+/// factors, each written into its channel's multiplier lane through
+/// [`bs_channel_multiplier`]. The BS stage multiplies the biased accumulator
+/// by that lane ahead of the per-tensor output conversion, so channel `c` is
+/// requantized by `channel_scales[c]` times the dispatch's multiplier.
+#[allow(clippy::too_many_arguments)]
+pub fn pack_int8_bias_to_bs_per_channel(
+    dense: &[u8],
+    channel_scales: Option<&[u8]>,
+    output_channels: usize,
+    padded_output_channels: usize,
+    input_scale: f32,
+    weights_scale: f32,
+    weight_zero_point: i8,
+    packed: &mut [u8],
+) -> Result<usize, &'static str> {
+    if let Some(scales) = channel_scales {
+        if scales.len() < output_channels.saturating_mul(4) {
+            return Err("per-channel scales are smaller than their declared shape");
+        }
+    }
     if dense.len() < output_channels.saturating_mul(4) {
         return Err("int8 bias is smaller than its declared shape");
     }
@@ -615,6 +665,10 @@ pub fn pack_int8_bias_to_bs(
         }
         entry.bias = normalized as i32;
         entry.constant = -(i16::from(weight_zero_point));
+        if let Some(scales) = channel_scales {
+            let m = f32::from_le_bytes(scales[offset..offset + 4].try_into().unwrap());
+            entry.multiplier = bs_channel_multiplier(m)?;
+        }
     }
     write_bs_buffer(&mut packed[..needed], &entries);
     Ok(needed)
@@ -4926,6 +4980,87 @@ mod tests {
         assert_eq!(i16::from_le_bytes(packed[32..34].try_into().unwrap()), -7);
         assert_eq!(i16::from_le_bytes(packed[34..36].try_into().unwrap()), -7);
         assert!(packed[8..32].iter().all(|&byte| byte == 0));
+    }
+
+    #[test]
+    fn per_channel_scales_fill_the_multiplier_lanes() {
+        let logical = [200i32, -100, 7]
+            .into_iter()
+            .flat_map(i32::to_le_bytes)
+            .collect::<Vec<_>>();
+        let scales = [1.0f32, 0.5, 0.0625]
+            .into_iter()
+            .flat_map(f32::to_le_bytes)
+            .collect::<Vec<_>>();
+        let mut packed = vec![0xa5; bs_buffer_bytes(8)];
+        let written = pack_int8_bias_to_bs_per_channel(
+            &logical,
+            Some(&scales),
+            3,
+            8,
+            1.0,
+            1.0,
+            0,
+            &mut packed,
+        )
+        .unwrap();
+        assert_eq!(written, bs_buffer_bytes(8));
+        // Biases unchanged, in accumulator units.
+        assert_eq!(i32::from_le_bytes(packed[0..4].try_into().unwrap()), 200);
+        assert_eq!(i32::from_le_bytes(packed[8..12].try_into().unwrap()), 7);
+        // Multiplier lanes at 48: unit, half, a sixteenth; a padding channel
+        // keeps the default unit entry.
+        let lane =
+            |c: usize| i16::from_le_bytes(packed[48 + 2 * c..50 + 2 * c].try_into().unwrap());
+        assert_eq!(
+            (lane(0), lane(1), lane(2)),
+            (BS_UNIT_MULTIPLIER, 8192, 1024)
+        );
+        assert_eq!(lane(3), BS_UNIT_MULTIPLIER);
+
+        // A unit scale on every channel is byte-identical to the per-tensor
+        // packer: the per-tensor executables lose nothing to this path.
+        let ones = [1.0f32; 3]
+            .into_iter()
+            .flat_map(f32::to_le_bytes)
+            .collect::<Vec<_>>();
+        let mut unit = vec![0u8; bs_buffer_bytes(8)];
+        let mut plain = vec![0u8; bs_buffer_bytes(8)];
+        pack_int8_bias_to_bs_per_channel(&logical, Some(&ones), 3, 8, 0.5, 0.25, 7, &mut unit)
+            .unwrap();
+        pack_int8_bias_to_bs(&logical, 3, 8, 0.5, 0.25, 7, &mut plain).unwrap();
+        assert_eq!(unit, plain);
+    }
+
+    #[test]
+    fn per_channel_scales_outside_the_lane_are_refused() {
+        assert_eq!(bs_channel_multiplier(1.0), Ok(BS_UNIT_MULTIPLIER));
+        assert_eq!(bs_channel_multiplier(1.999), Ok(32752));
+        assert_eq!(bs_channel_multiplier(1.0 / 16384.0), Ok(1));
+        assert!(
+            bs_channel_multiplier(1.0 / 65536.0).is_err(),
+            "rounds to zero"
+        );
+        assert!(bs_channel_multiplier(2.0).is_err(), "past the signed lane");
+        assert!(bs_channel_multiplier(0.0).is_err());
+        assert!(bs_channel_multiplier(-0.5).is_err());
+        assert!(bs_channel_multiplier(f32::NAN).is_err());
+        let logical = 5i32.to_le_bytes();
+        let short = 1.0f32.to_le_bytes();
+        let mut packed = vec![0u8; bs_buffer_bytes(2)];
+        assert!(
+            pack_int8_bias_to_bs_per_channel(
+                &logical,
+                Some(&short[..2]),
+                1,
+                2,
+                1.0,
+                1.0,
+                0,
+                &mut packed
+            )
+            .is_err()
+        );
     }
 
     #[test]

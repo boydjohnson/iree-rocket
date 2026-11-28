@@ -220,6 +220,11 @@ struct RocketConv2dConfig {
   // stream, on the clone of an executable whose constant filter is
   // block-diagonal. 1 is dense.
   uint32_t groups = 1;
+  // Conv2DDef.per_channel_scale: a binding after the bias carries one f32
+  // requantization factor per output channel, which the runtime writes into
+  // the BS plane's multiplier lanes. Requantized int8 with a runtime output
+  // scale only.
+  bool perChannelScale = false;
 };
 
 struct RocketFullyConnectedConfig {
@@ -703,6 +708,25 @@ std::optional<RocketConv2dConfig> buildRocketConv2dConfigFromTarget(
       isRuntimeQuantParam[paramIndex] = true;
       shape.runtimeQuantization.push_back(*param);
     }
+  }
+
+  if (!parseOptionalBool(config, "per_channel_scale", shape.perChannelScale,
+                         diagFn)) {
+    return std::nullopt;
+  }
+  if (shape.perChannelScale &&
+      (shape.precision != iree_hal_rocket_Precision_INT8 ||
+       !isRuntimeQuantParam[static_cast<size_t>(
+           iree_hal_rocket_Conv2DQuantParam_OUTPUT_SCALE)])) {
+    diagFn() << "rocket backend: 'per_channel_scale' needs requantized int8 "
+                "with a runtime 'output_scale': the per-channel factors are "
+                "applied ahead of that multiplier, on the BS plane";
+    return std::nullopt;
+  }
+  if (shape.perChannelScale && shape.epilogueAdd) {
+    diagFn() << "rocket backend: 'per_channel_scale' and 'epilogue_add' each "
+                "take the fourth binding";
+    return std::nullopt;
   }
 
   // The same template obligation the dimensions carry: a field a dispatch
@@ -2019,7 +2043,9 @@ public:
               builder, convShape->runtimeLayout) ||
           iree_hal_rocket_Conv2DDef_weights_packed_add(
               builder, convShape->weightsPacked) ||
-          iree_hal_rocket_Conv2DDef_groups_add(builder, convShape->groups)) {
+          iree_hal_rocket_Conv2DDef_groups_add(builder, convShape->groups) ||
+          iree_hal_rocket_Conv2DDef_per_channel_scale_add(
+              builder, convShape->perChannelScale)) {
         return variantOp.emitOpError()
                << "failed to populate Rocket convolution definition";
       }

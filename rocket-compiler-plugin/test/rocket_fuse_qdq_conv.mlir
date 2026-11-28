@@ -20,6 +20,8 @@
 // CHECK-DAG:   %[[LO:.+]] = arith.constant -1.280000e+02 : f32
 // CHECK-DAG:   %[[SCALE:.+]] = arith.constant 1.600000e-03 : f32
 // CHECK-DAG:   %[[ZP:.+]] = arith.constant -128 : i32
+//   Per-tensor weights: a per-channel factor of exactly 1 everywhere.
+// CHECK-DAG:   %[[CS:.+]] = arith.constant dense<1.000000e+00> : tensor<32xf32>
 //   The convolution reads the activation's codes, transposed on i8, and the
 //   weight codes, over a zero init.
 // CHECK:       %[[XT:.+]] = linalg.transpose ins(%[[X:.+]] : tensor<1x64x8x8xi8>)
@@ -39,9 +41,10 @@
 // CHECK:         arith.subi
 //   The canonical requantization.
 // CHECK:       %[[Q:.+]] = linalg.generic
-// CHECK-SAME:      ins(%[[ACC]], %[[BIAS]], %[[SCALE]], %[[ZP]], %[[LO]], %[[HI]] : tensor<1x8x8x32xi32>, tensor<32xi32>, f32, i32, f32, f32)
+// CHECK-SAME:      ins(%[[ACC]], %[[BIAS]], %[[CS]], %[[SCALE]], %[[ZP]], %[[LO]], %[[HI]] : tensor<1x8x8x32xi32>, tensor<32xi32>, tensor<32xf32>, f32, i32, f32, f32)
 // CHECK:         arith.addi
 // CHECK:         arith.sitofp
+// CHECK:         arith.mulf
 // CHECK:         arith.mulf
 // CHECK:         math.roundeven
 // CHECK:         arith.addf
@@ -126,7 +129,7 @@ func.func @qdq_conv_s8s8(%x: tensor<1x64x8x8xi8>) -> tensor<1x32x8x8xi8> {
 // CHECK:       %[[BIAS:.+]] = linalg.generic
 // CHECK-SAME:      ins(%[[SUM]] : tensor<16xi32>)
 // CHECK:       %[[Q:.+]] = linalg.generic
-// CHECK-SAME:      ins(%[[ACC]], %[[BIAS]], %{{.+}}, %[[ZP]]
+// CHECK-SAME:      ins(%[[ACC]], %[[BIAS]], %{{.+}}, %{{.+}}, %[[ZP]]
 // CHECK:       %[[QS:.+]] = linalg.generic
 // CHECK-SAME:      ins(%[[Q]] : tensor<1x8x8x16xi8>)
 // CHECK:         arith.addi %{{.+}}, %[[SHIFT]]
@@ -221,8 +224,9 @@ func.func @qdq_conv_zero_input_zero_point(%x: tensor<1x8x4x4xi8>) -> tensor<1x16
 
 // -----
 
-// Declined: per-channel weight scales. The requantization ratio would be
-// per channel, and the executable ABI carries one `output_scale`.
+// Declined: per-channel weight scales that are not constants (a function
+// argument here). The per-channel factors are compile-time data: the
+// per-tensor `output_scale` is their maximum.
 
 #map4 = affine_map<(d0, d1, d2, d3) -> (d0, d1, d2, d3)>
 #scalar4 = affine_map<(d0, d1, d2, d3) -> ()>
@@ -233,6 +237,102 @@ func.func @qdq_conv_zero_input_zero_point(%x: tensor<1x8x4x4xi8>) -> tensor<1x16
 // CHECK:       iree_linalg_ext.quantize_affine
 func.func @qdq_conv_per_channel_declined(%x: tensor<1x8x4x4xi8>, %sw: tensor<16xf32>) -> tensor<1x16x4x4xi8> {
   %wq = arith.constant dense<1> : tensor<16x8x1x1xi8>
+  %sx = arith.constant 2.500000e-01 : f32
+  %sy = arith.constant 1.000000e+00 : f32
+  %zero = arith.constant 0.000000e+00 : f32
+  %e0 = tensor.empty() : tensor<1x8x4x4xf32>
+  %xf = iree_linalg_ext.dequantize_affine <indexing_maps = [#map4, #scalar4, #map4], quant_min = -128, quant_max = 127>
+      ins(%x, %sx : tensor<1x8x4x4xi8>, f32) outs(%e0 : tensor<1x8x4x4xf32>) -> tensor<1x8x4x4xf32>
+  %e1 = tensor.empty() : tensor<16x8x1x1xf32>
+  %wf = iree_linalg_ext.dequantize_affine <indexing_maps = [#map4, #chan4, #map4], quant_min = -128, quant_max = 127>
+      ins(%wq, %sw : tensor<16x8x1x1xi8>, tensor<16xf32>) outs(%e1 : tensor<16x8x1x1xf32>) -> tensor<16x8x1x1xf32>
+  %e4 = tensor.empty() : tensor<1x4x4x8xf32>
+  %xt = linalg.transpose ins(%xf : tensor<1x8x4x4xf32>) outs(%e4 : tensor<1x4x4x8xf32>) permutation = [0, 2, 3, 1]
+  %e5 = tensor.empty() : tensor<1x1x8x16xf32>
+  %wt = linalg.transpose ins(%wf : tensor<16x8x1x1xf32>) outs(%e5 : tensor<1x1x8x16xf32>) permutation = [2, 3, 1, 0]
+  %e6 = tensor.empty() : tensor<1x4x4x16xf32>
+  %init = linalg.fill ins(%zero : f32) outs(%e6 : tensor<1x4x4x16xf32>) -> tensor<1x4x4x16xf32>
+  %acc = linalg.conv_2d_nhwc_hwcf {dilations = dense<1> : vector<2xi64>, strides = dense<1> : vector<2xi64>}
+      ins(%xt, %wt : tensor<1x4x4x8xf32>, tensor<1x1x8x16xf32>) outs(%init : tensor<1x4x4x16xf32>) -> tensor<1x4x4x16xf32>
+  %e7 = tensor.empty() : tensor<1x16x4x4xf32>
+  %nchw = linalg.transpose ins(%acc : tensor<1x4x4x16xf32>) outs(%e7 : tensor<1x16x4x4xf32>) permutation = [0, 3, 1, 2]
+  %e8 = tensor.empty() : tensor<1x16x4x4xi8>
+  %q = iree_linalg_ext.quantize_affine <indexing_maps = [#map4, #scalar4, #map4], quant_min = -128, quant_max = 127>
+      ins(%nchw, %sy : tensor<1x16x4x4xf32>, f32) outs(%e8 : tensor<1x16x4x4xi8>) -> tensor<1x16x4x4xi8>
+  return %q : tensor<1x16x4x4xi8>
+}
+
+// -----
+
+// Per-channel weight scales (ORT's per_channel=True) and the per-channel
+// bias scale `sx * sw[c]` that goes with them. The ratios `sx * sw[c] / sy`
+// are 0.001 to 0.004; the per-tensor scale is the largest, 0.004, and each
+// channel's factor is its ratio over that, 1/4 to 1.
+
+#map4 = affine_map<(d0, d1, d2, d3) -> (d0, d1, d2, d3)>
+#scalar4 = affine_map<(d0, d1, d2, d3) -> ()>
+#chan4 = affine_map<(d0, d1, d2, d3) -> (d0)>
+#map1 = affine_map<(d0) -> (d0)>
+
+// CHECK-LABEL: func.func @qdq_conv_per_channel
+// CHECK-DAG:   %[[SCALE:.+]] = arith.constant 4.000000e-03 : f32
+// CHECK-DAG:   %[[CS:.+]] = arith.constant dense<[2.500000e-01, 5.000000e-01, 7.500000e-01, 1.000000e+00, 2.500000e-01, {{.*}}]> : tensor<16xf32>
+// CHECK:       %[[ACC:.+]] = linalg.conv_2d_nhwc_hwcf
+// CHECK-SAME:      ins(%{{.+}}, %{{.+}} : tensor<1x4x4x8xi8>, tensor<1x1x8x16xi8>)
+// CHECK:       linalg.generic
+// CHECK-SAME:      ins(%[[ACC]], %{{.+}}, %[[CS]], %[[SCALE]], %{{.+}}, %{{.+}}, %{{.+}} : tensor<1x4x4x16xi32>, tensor<16xi32>, tensor<16xf32>, f32, i32, f32, f32)
+// CHECK-NOT:   iree_linalg_ext.quantize_affine
+func.func @qdq_conv_per_channel(%x: tensor<1x8x4x4xi8>) -> tensor<1x16x4x4xi8> {
+  %wq = arith.constant dense<1> : tensor<16x8x1x1xi8>
+  %sw = arith.constant dense<[4.000000e-03, 8.000000e-03, 1.200000e-02, 1.600000e-02, 4.000000e-03, 8.000000e-03, 1.200000e-02, 1.600000e-02, 4.000000e-03, 8.000000e-03, 1.200000e-02, 1.600000e-02, 4.000000e-03, 8.000000e-03, 1.200000e-02, 1.600000e-02]> : tensor<16xf32>
+  %bq = arith.constant dense<100> : tensor<16xi32>
+  %sb = arith.constant dense<[1.000000e-03, 2.000000e-03, 3.000000e-03, 4.000000e-03, 1.000000e-03, 2.000000e-03, 3.000000e-03, 4.000000e-03, 1.000000e-03, 2.000000e-03, 3.000000e-03, 4.000000e-03, 1.000000e-03, 2.000000e-03, 3.000000e-03, 4.000000e-03]> : tensor<16xf32>
+  %sx = arith.constant 2.500000e-01 : f32
+  %sy = arith.constant 1.000000e+00 : f32
+  %zero = arith.constant 0.000000e+00 : f32
+  %e0 = tensor.empty() : tensor<1x8x4x4xf32>
+  %xf = iree_linalg_ext.dequantize_affine <indexing_maps = [#map4, #scalar4, #map4], quant_min = -128, quant_max = 127>
+      ins(%x, %sx : tensor<1x8x4x4xi8>, f32) outs(%e0 : tensor<1x8x4x4xf32>) -> tensor<1x8x4x4xf32>
+  %e1 = tensor.empty() : tensor<16x8x1x1xf32>
+  %wf = iree_linalg_ext.dequantize_affine <indexing_maps = [#map4, #chan4, #map4], quant_min = -128, quant_max = 127>
+      ins(%wq, %sw : tensor<16x8x1x1xi8>, tensor<16xf32>) outs(%e1 : tensor<16x8x1x1xf32>) -> tensor<16x8x1x1xf32>
+  %e4 = tensor.empty() : tensor<1x4x4x8xf32>
+  %xt = linalg.transpose ins(%xf : tensor<1x8x4x4xf32>) outs(%e4 : tensor<1x4x4x8xf32>) permutation = [0, 2, 3, 1]
+  %e5 = tensor.empty() : tensor<1x1x8x16xf32>
+  %wt = linalg.transpose ins(%wf : tensor<16x8x1x1xf32>) outs(%e5 : tensor<1x1x8x16xf32>) permutation = [2, 3, 1, 0]
+  %e6 = tensor.empty() : tensor<1x4x4x16xf32>
+  %e2 = tensor.empty() : tensor<16xf32>
+  %bf = iree_linalg_ext.dequantize_affine <indexing_maps = [#map1, #map1, #map1], quant_min = -2147483648, quant_max = 2147483647>
+      ins(%bq, %sb : tensor<16xi32>, tensor<16xf32>) outs(%e2 : tensor<16xf32>) -> tensor<16xf32>
+  %e3 = tensor.empty() : tensor<1x16x4x4xf32>
+  %bb = linalg.broadcast ins(%bf : tensor<16xf32>) outs(%e3 : tensor<1x16x4x4xf32>) dimensions = [0, 2, 3]
+  %init = linalg.transpose ins(%bb : tensor<1x16x4x4xf32>) outs(%e6 : tensor<1x4x4x16xf32>) permutation = [0, 2, 3, 1]
+  %acc = linalg.conv_2d_nhwc_hwcf {dilations = dense<1> : vector<2xi64>, strides = dense<1> : vector<2xi64>}
+      ins(%xt, %wt : tensor<1x4x4x8xf32>, tensor<1x1x8x16xf32>) outs(%init : tensor<1x4x4x16xf32>) -> tensor<1x4x4x16xf32>
+  %e7 = tensor.empty() : tensor<1x16x4x4xf32>
+  %nchw = linalg.transpose ins(%acc : tensor<1x4x4x16xf32>) outs(%e7 : tensor<1x16x4x4xf32>) permutation = [0, 3, 1, 2]
+  %e8 = tensor.empty() : tensor<1x16x4x4xi8>
+  %q = iree_linalg_ext.quantize_affine <indexing_maps = [#map4, #scalar4, #map4], quant_min = -128, quant_max = 127>
+      ins(%nchw, %sy : tensor<1x16x4x4xf32>, f32) outs(%e8 : tensor<1x16x4x4xi8>) -> tensor<1x16x4x4xi8>
+  return %q : tensor<1x16x4x4xi8>
+}
+
+// -----
+
+// Declined: one channel's factor is 1/4000 of the largest, below
+// `kMinChannelScale` (1/128): the BS multiplier lane would carry it to no
+// better than a few codes. The convolution keeps its float form.
+
+#map4 = affine_map<(d0, d1, d2, d3) -> (d0, d1, d2, d3)>
+#scalar4 = affine_map<(d0, d1, d2, d3) -> ()>
+#chan4 = affine_map<(d0, d1, d2, d3) -> (d0)>
+
+// CHECK-LABEL: func.func @qdq_conv_per_channel_tiny_factor_declined
+// CHECK:       linalg.conv_2d_nhwc_hwcf {{.*}} -> tensor<1x4x4x16xf32>
+// CHECK:       iree_linalg_ext.quantize_affine
+func.func @qdq_conv_per_channel_tiny_factor_declined(%x: tensor<1x8x4x4xi8>) -> tensor<1x16x4x4xi8> {
+  %wq = arith.constant dense<1> : tensor<16x8x1x1xi8>
+  %sw = arith.constant dense<[4.000000e-03, 8.000000e-03, 1.200000e-02, 4.000000e-06, 4.000000e-03, 8.000000e-03, 1.200000e-02, 1.600000e-02, 4.000000e-03, 8.000000e-03, 1.200000e-02, 1.600000e-02, 4.000000e-03, 8.000000e-03, 1.200000e-02, 1.600000e-02]> : tensor<16xf32>
   %sx = arith.constant 2.500000e-01 : f32
   %sy = arith.constant 1.000000e+00 : f32
   %zero = arith.constant 0.000000e+00 : f32
@@ -368,6 +468,59 @@ func.func @qdq_depthwise_s2_pad1(%x: tensor<1x32x8x8xi8>) -> tensor<1x32x4x4xi8>
   %e2 = tensor.empty() : tensor<32xf32>
   %bf = iree_linalg_ext.dequantize_affine <indexing_maps = [#map1, #scalar1, #map1], quant_min = -2147483648, quant_max = 2147483647>
       ins(%bq, %sb : tensor<32xi32>, f32) outs(%e2 : tensor<32xf32>) -> tensor<32xf32>
+  %e3 = tensor.empty() : tensor<1x32x4x4xf32>
+  %bb = linalg.broadcast ins(%bf : tensor<32xf32>) outs(%e3 : tensor<1x32x4x4xf32>) dimensions = [0, 2, 3]
+  %acc = linalg.depthwise_conv_2d_nchw_chw {dilations = dense<1> : vector<2xi64>, strides = dense<2> : vector<2xi64>}
+      ins(%xp, %wc : tensor<1x32x10x10xf32>, tensor<32x3x3xf32>) outs(%bb : tensor<1x32x4x4xf32>) -> tensor<1x32x4x4xf32>
+  %e8 = tensor.empty() : tensor<1x32x4x4xi8>
+  %q = iree_linalg_ext.quantize_affine <indexing_maps = [#map4, #scalar4, #scalar4, #map4], quant_min = -128, quant_max = 127>
+      ins(%acc, %sy, %zy : tensor<1x32x4x4xf32>, f32, i64) outs(%e8 : tensor<1x32x4x4xi8>) -> tensor<1x32x4x4xi8>
+  return %q : tensor<1x32x4x4xi8>
+}
+
+// -----
+
+// The depthwise twin of @qdq_conv_per_channel: one weight scale per channel
+// on the [C, 1, kh, kw] filter, which the collapse to [C, kh, kw] keeps on
+// dimension 0, and a per-channel bias scale. Ratios 0.0016 to 0.0064, so
+// the per-tensor scale is 0.0064 and the factors are 1/4 to 1.
+
+#map4 = affine_map<(d0, d1, d2, d3) -> (d0, d1, d2, d3)>
+#scalar4 = affine_map<(d0, d1, d2, d3) -> ()>
+#map1 = affine_map<(d0) -> (d0)>
+#scalar1 = affine_map<(d0) -> ()>
+#chan4 = affine_map<(d0, d1, d2, d3) -> (d0)>
+
+// CHECK-LABEL: func.func @qdq_depthwise_per_channel
+// CHECK-DAG:   %[[SCALE:.+]] = arith.constant 6.400000e-03 : f32
+// CHECK-DAG:   %[[CS:.+]] = arith.constant dense<[2.500000e-01, 5.000000e-01, 7.500000e-01, 1.000000e+00, {{.*}}]> : tensor<32xf32>
+// CHECK:       %[[ACC:.+]] = linalg.depthwise_conv_2d_nhwc_hwc
+// CHECK:       linalg.generic {{.*}}ins(%[[ACC]], %{{.+}}, %[[CS]], %[[SCALE]], %{{.+}}, %{{.+}}, %{{.+}} : tensor<1x4x4x32xi32>, tensor<32xi32>, tensor<32xf32>, f32, i32, f32, f32)
+// CHECK-NOT:   iree_linalg_ext.quantize_affine
+func.func @qdq_depthwise_per_channel(%x: tensor<1x32x8x8xi8>) -> tensor<1x32x4x4xi8> {
+  %wq = arith.constant dense<5> : tensor<32x1x3x3xi8>
+  %bq = arith.constant dense<-300> : tensor<32xi32>
+  %sx = arith.constant 2.000000e-02 : f32
+  %sw = arith.constant dense<[4.000000e-03, 8.000000e-03, 1.200000e-02, 1.600000e-02, 4.000000e-03, 8.000000e-03, 1.200000e-02, 1.600000e-02, 4.000000e-03, 8.000000e-03, 1.200000e-02, 1.600000e-02, 4.000000e-03, 8.000000e-03, 1.200000e-02, 1.600000e-02, 4.000000e-03, 8.000000e-03, 1.200000e-02, 1.600000e-02, 4.000000e-03, 8.000000e-03, 1.200000e-02, 1.600000e-02, 4.000000e-03, 8.000000e-03, 1.200000e-02, 1.600000e-02, 4.000000e-03, 8.000000e-03, 1.200000e-02, 1.600000e-02]> : tensor<32xf32>
+  %sb = arith.constant dense<[8.000000e-05, 1.600000e-04, 2.400000e-04, 3.200000e-04, 8.000000e-05, 1.600000e-04, 2.400000e-04, 3.200000e-04, 8.000000e-05, 1.600000e-04, 2.400000e-04, 3.200000e-04, 8.000000e-05, 1.600000e-04, 2.400000e-04, 3.200000e-04, 8.000000e-05, 1.600000e-04, 2.400000e-04, 3.200000e-04, 8.000000e-05, 1.600000e-04, 2.400000e-04, 3.200000e-04, 8.000000e-05, 1.600000e-04, 2.400000e-04, 3.200000e-04, 8.000000e-05, 1.600000e-04, 2.400000e-04, 3.200000e-04]> : tensor<32xf32>
+  %sy = arith.constant 5.000000e-02 : f32
+  %zx = arith.constant -128 : i64
+  %zy = arith.constant -128 : i64
+  %zero = arith.constant 0.000000e+00 : f32
+  %e0 = tensor.empty() : tensor<1x32x8x8xf32>
+  %xf = iree_linalg_ext.dequantize_affine <indexing_maps = [#map4, #scalar4, #scalar4, #map4], quant_min = -128, quant_max = 127>
+      ins(%x, %sx, %zx : tensor<1x32x8x8xi8>, f32, i64) outs(%e0 : tensor<1x32x8x8xf32>) -> tensor<1x32x8x8xf32>
+  %xp = tensor.pad %xf low[0, 0, 1, 1] high[0, 0, 1, 1] {
+  ^bb0(%a: index, %b: index, %c: index, %d: index):
+    tensor.yield %zero : f32
+  } : tensor<1x32x8x8xf32> to tensor<1x32x10x10xf32>
+  %e1 = tensor.empty() : tensor<32x1x3x3xf32>
+  %wf = iree_linalg_ext.dequantize_affine <indexing_maps = [#map4, #chan4, #map4], quant_min = -128, quant_max = 127>
+      ins(%wq, %sw : tensor<32x1x3x3xi8>, tensor<32xf32>) outs(%e1 : tensor<32x1x3x3xf32>) -> tensor<32x1x3x3xf32>
+  %wc = tensor.collapse_shape %wf [[0, 1], [2], [3]] : tensor<32x1x3x3xf32> into tensor<32x3x3xf32>
+  %e2 = tensor.empty() : tensor<32xf32>
+  %bf = iree_linalg_ext.dequantize_affine <indexing_maps = [#map1, #map1, #map1], quant_min = -2147483648, quant_max = 2147483647>
+      ins(%bq, %sb : tensor<32xi32>, tensor<32xf32>) outs(%e2 : tensor<32xf32>) -> tensor<32xf32>
   %e3 = tensor.empty() : tensor<1x32x4x4xf32>
   %bb = linalg.broadcast ins(%bf : tensor<32xf32>) outs(%e3 : tensor<1x32x4x4xf32>) dimensions = [0, 2, 3]
   %acc = linalg.depthwise_conv_2d_nchw_chw {dilations = dense<1> : vector<2xi64>, strides = dense<2> : vector<2xi64>}

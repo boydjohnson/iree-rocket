@@ -519,6 +519,10 @@ struct FuseInt8RequantEpilogue : public OpRewritePattern<ConvOp> {
     if (!accType || !accType.getElementType().isSignlessInteger(32)) {
       return rewriter.notifyMatchFailure(convOp, "not an i32 convolution");
     }
+    // The per-channel factor operand is a constant of the channel extent.
+    if (ShapedType::isDynamic(accType.getShape().back())) {
+      return rewriter.notifyMatchFailure(convOp, "dynamic output channels");
+    }
     for (Value input : convOp.getDpsInputs()) {
       auto type = dyn_cast<RankedTensorType>(input.getType());
       if (!type || !type.getElementType().isSignlessInteger(8)) {
@@ -595,6 +599,15 @@ struct FuseInt8RequantEpilogue : public OpRewritePattern<ConvOp> {
         rewriter, loc, rewriter.getF32FloatAttr(kSignedLow));
     Value highValue = arith::ConstantOp::create(
         rewriter, loc, rewriter.getF32FloatAttr(kSignedHigh));
+    // The canonical form's per-channel factor, applied ahead of `scale`. A
+    // QLinearConv's weight scale is per tensor here, so every channel's is
+    // exactly 1, which leaves the f32 product -- and the BS plane's unit
+    // multiplier lane -- unchanged.
+    auto channelScaleType = RankedTensorType::get(
+        {accType.getShape().back()}, rewriter.getF32Type());
+    Value channelScaleValue = arith::ConstantOp::create(
+        rewriter, loc,
+        DenseElementsAttr::get(channelScaleType, rewriter.getF32FloatAttr(1.0)));
 
     auto int8Type =
         RankedTensorType::get(accType.getShape(), rewriter.getI8Type());
@@ -606,29 +619,32 @@ struct FuseInt8RequantEpilogue : public OpRewritePattern<ConvOp> {
     AffineMap channel = AffineMap::get(
         rank, 0, {rewriter.getAffineDimExpr(rank - 1)}, rewriter.getContext());
     AffineMap scalar = AffineMap::get(rank, 0, {}, rewriter.getContext());
-    SmallVector<AffineMap> maps{identity, channel, scalar,
-                                scalar,   scalar,  scalar, identity};
+    SmallVector<AffineMap> maps{identity, channel, channel, scalar,
+                                scalar,   scalar,  scalar,  identity};
     SmallVector<utils::IteratorType> iterators(rank,
                                                utils::IteratorType::parallel);
 
     auto requant = linalg::GenericOp::create(
         rewriter, loc, TypeRange{int8Type},
-        ValueRange{fusedConv.getResult(0), foldedBias, scaleValue,
-                   zeroPointValue, lowValue, highValue},
+        ValueRange{fusedConv.getResult(0), foldedBias, channelScaleValue,
+                   scaleValue, zeroPointValue, lowValue, highValue},
         ValueRange{outEmpty}, maps, iterators,
         [&](OpBuilder &builder, Location nested, ValueRange args) {
           Value biased = arith::AddIOp::create(builder, nested, args[0], args[1]);
           Value real = arith::SIToFPOp::create(builder, nested,
                                                builder.getF32Type(), biased);
-          Value scaled = arith::MulFOp::create(builder, nested, real, args[2]);
+          Value channelScaled =
+              arith::MulFOp::create(builder, nested, real, args[2]);
+          Value scaled =
+              arith::MulFOp::create(builder, nested, channelScaled, args[3]);
           Value rounded = math::RoundEvenOp::create(builder, nested, scaled);
           Value zeroPointReal = arith::SIToFPOp::create(
-              builder, nested, builder.getF32Type(), args[3]);
+              builder, nested, builder.getF32Type(), args[4]);
           Value offset =
               arith::AddFOp::create(builder, nested, rounded, zeroPointReal);
-          Value low = arith::MaximumFOp::create(builder, nested, offset, args[4]);
+          Value low = arith::MaximumFOp::create(builder, nested, offset, args[5]);
           Value clamped =
-              arith::MinimumFOp::create(builder, nested, low, args[5]);
+              arith::MinimumFOp::create(builder, nested, low, args[6]);
           Value narrowed = arith::FPToSIOp::create(builder, nested,
                                                    builder.getI8Type(), clamped);
           linalg::YieldOp::create(builder, nested, narrowed);

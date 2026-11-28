@@ -21,6 +21,10 @@
 // Two details of that form are load-bearing rather than stylistic, and the
 // negative cases below are what stop them regressing silently:
 //
+//   * The per-channel requantization factor is a rank-1 operand indexed by
+//     the channel, multiplied in ahead of the per-tensor scale; the
+//     hardware applies it on the BS plane's multiplier lane. A per-tensor
+//     convolution carries a factor of 1 on every channel.
 //   * The scale, the zero point and the int8 clamp bounds are *operands* of
 //     the generic. `transform.iree.match.cast_compatible_dag_from_root`
 //     compares regions under a value mapping built only from the ops it
@@ -34,13 +38,17 @@
 
 // CHECK-LABEL: util.func public @requant_1x1_cin512_matched
 // CHECK-NOT: linalg.conv_2d_nhwc_hwcf
+//   The 64 per-channel factors are their own binding after the bias
+//   (Conv2DDef.per_channel_scale).
 // CHECK: flow.dispatch @rocket_dynamic_int8_requant_executable
+// CHECK-SAME: tensor<?xi32>{%c64}, tensor<?xf32>{%c64})
 func.func @requant_1x1_cin512_matched(
     %input: tensor<1x4x4x512xi8>,
     %filter: tensor<1x1x512x64xi8>,
     %bias: tensor<64xi32>) -> tensor<1x4x4x64xi8> {
   %zero = arith.constant 0 : i32
   %scale = arith.constant 1.500000e-03 : f32
+  %cscale = arith.constant dense<5.000000e-01> : tensor<64xf32>
   %zp = arith.constant -6 : i32
   %int8_min = arith.constant -1.280000e+02 : f32
   %int8_max = arith.constant 1.270000e+02 : f32
@@ -54,19 +62,21 @@ func.func @requant_1x1_cin512_matched(
   %out = linalg.generic {
       indexing_maps = [affine_map<(d0, d1, d2, d3) -> (d0, d1, d2, d3)>,
                        affine_map<(d0, d1, d2, d3) -> (d3)>,
+                       affine_map<(d0, d1, d2, d3) -> (d3)>,
                        affine_map<(d0, d1, d2, d3) -> ()>,
                        affine_map<(d0, d1, d2, d3) -> ()>,
                        affine_map<(d0, d1, d2, d3) -> ()>,
                        affine_map<(d0, d1, d2, d3) -> ()>,
                        affine_map<(d0, d1, d2, d3) -> (d0, d1, d2, d3)>],
       iterator_types = ["parallel", "parallel", "parallel", "parallel"]}
-      ins(%acc, %bias, %scale, %zp, %int8_min, %int8_max
-          : tensor<1x4x4x64xi32>, tensor<64xi32>, f32, i32, f32, f32)
+      ins(%acc, %bias, %cscale, %scale, %zp, %int8_min, %int8_max
+          : tensor<1x4x4x64xi32>, tensor<64xi32>, tensor<64xf32>, f32, i32, f32, f32)
       outs(%out_empty : tensor<1x4x4x64xi8>) {
-    ^bb0(%raw: i32, %channel_bias: i32, %s: f32, %z: i32, %low: f32, %high: f32, %unused: i8):
+    ^bb0(%raw: i32, %channel_bias: i32, %m: f32, %s: f32, %z: i32, %low: f32, %high: f32, %unused: i8):
       %biased = arith.addi %raw, %channel_bias : i32
       %real = arith.sitofp %biased : i32 to f32
-      %scaled = arith.mulf %real, %s : f32
+      %channel_scaled = arith.mulf %real, %m : f32
+      %scaled = arith.mulf %channel_scaled, %s : f32
       %rounded = math.roundeven %scaled : f32
       %zf = arith.sitofp %z : i32 to f32
       %offset = arith.addf %rounded, %zf : f32
@@ -87,6 +97,7 @@ func.func @requant_3x3_cin512_matched(
     %bias: tensor<64xi32>) -> tensor<1x4x4x64xi8> {
   %zero = arith.constant 0 : i32
   %scale = arith.constant 5.000000e-04 : f32
+  %cscale = arith.constant dense<1.000000e+00> : tensor<64xf32>
   %zp = arith.constant 0 : i32
   %int8_min = arith.constant -1.280000e+02 : f32
   %int8_max = arith.constant 1.270000e+02 : f32
@@ -100,19 +111,21 @@ func.func @requant_3x3_cin512_matched(
   %out = linalg.generic {
       indexing_maps = [affine_map<(d0, d1, d2, d3) -> (d0, d1, d2, d3)>,
                        affine_map<(d0, d1, d2, d3) -> (d3)>,
+                       affine_map<(d0, d1, d2, d3) -> (d3)>,
                        affine_map<(d0, d1, d2, d3) -> ()>,
                        affine_map<(d0, d1, d2, d3) -> ()>,
                        affine_map<(d0, d1, d2, d3) -> ()>,
                        affine_map<(d0, d1, d2, d3) -> ()>,
                        affine_map<(d0, d1, d2, d3) -> (d0, d1, d2, d3)>],
       iterator_types = ["parallel", "parallel", "parallel", "parallel"]}
-      ins(%acc, %bias, %scale, %zp, %int8_min, %int8_max
-          : tensor<1x4x4x64xi32>, tensor<64xi32>, f32, i32, f32, f32)
+      ins(%acc, %bias, %cscale, %scale, %zp, %int8_min, %int8_max
+          : tensor<1x4x4x64xi32>, tensor<64xi32>, tensor<64xf32>, f32, i32, f32, f32)
       outs(%out_empty : tensor<1x4x4x64xi8>) {
-    ^bb0(%raw: i32, %channel_bias: i32, %s: f32, %z: i32, %low: f32, %high: f32, %unused: i8):
+    ^bb0(%raw: i32, %channel_bias: i32, %m: f32, %s: f32, %z: i32, %low: f32, %high: f32, %unused: i8):
       %biased = arith.addi %raw, %channel_bias : i32
       %real = arith.sitofp %biased : i32 to f32
-      %scaled = arith.mulf %real, %s : f32
+      %channel_scaled = arith.mulf %real, %m : f32
+      %scaled = arith.mulf %channel_scaled, %s : f32
       %rounded = math.roundeven %scaled : f32
       %zf = arith.sitofp %z : i32 to f32
       %offset = arith.addf %rounded, %zf : f32
@@ -136,6 +149,7 @@ func.func @requant_1x1_s2_matched(
     %bias: tensor<64xi32>) -> tensor<1x4x4x64xi8> {
   %zero = arith.constant 0 : i32
   %scale = arith.constant 1.500000e-03 : f32
+  %cscale = arith.constant dense<1.000000e+00> : tensor<64xf32>
   %zp = arith.constant -6 : i32
   %int8_min = arith.constant -1.280000e+02 : f32
   %int8_max = arith.constant 1.270000e+02 : f32
@@ -149,19 +163,21 @@ func.func @requant_1x1_s2_matched(
   %out = linalg.generic {
       indexing_maps = [affine_map<(d0, d1, d2, d3) -> (d0, d1, d2, d3)>,
                        affine_map<(d0, d1, d2, d3) -> (d3)>,
+                       affine_map<(d0, d1, d2, d3) -> (d3)>,
                        affine_map<(d0, d1, d2, d3) -> ()>,
                        affine_map<(d0, d1, d2, d3) -> ()>,
                        affine_map<(d0, d1, d2, d3) -> ()>,
                        affine_map<(d0, d1, d2, d3) -> ()>,
                        affine_map<(d0, d1, d2, d3) -> (d0, d1, d2, d3)>],
       iterator_types = ["parallel", "parallel", "parallel", "parallel"]}
-      ins(%acc, %bias, %scale, %zp, %int8_min, %int8_max
-          : tensor<1x4x4x64xi32>, tensor<64xi32>, f32, i32, f32, f32)
+      ins(%acc, %bias, %cscale, %scale, %zp, %int8_min, %int8_max
+          : tensor<1x4x4x64xi32>, tensor<64xi32>, tensor<64xf32>, f32, i32, f32, f32)
       outs(%out_empty : tensor<1x4x4x64xi8>) {
-    ^bb0(%raw: i32, %channel_bias: i32, %s: f32, %z: i32, %low: f32, %high: f32, %unused: i8):
+    ^bb0(%raw: i32, %channel_bias: i32, %m: f32, %s: f32, %z: i32, %low: f32, %high: f32, %unused: i8):
       %biased = arith.addi %raw, %channel_bias : i32
       %real = arith.sitofp %biased : i32 to f32
-      %scaled = arith.mulf %real, %s : f32
+      %channel_scaled = arith.mulf %real, %m : f32
+      %scaled = arith.mulf %channel_scaled, %s : f32
       %rounded = math.roundeven %scaled : f32
       %zf = arith.sitofp %z : i32 to f32
       %offset = arith.addf %rounded, %zf : f32
@@ -183,6 +199,7 @@ func.func @requant_3x3_s2_matched(
     %bias: tensor<64xi32>) -> tensor<1x4x4x64xi8> {
   %zero = arith.constant 0 : i32
   %scale = arith.constant 5.000000e-04 : f32
+  %cscale = arith.constant dense<1.000000e+00> : tensor<64xf32>
   %zp = arith.constant 0 : i32
   %int8_min = arith.constant -1.280000e+02 : f32
   %int8_max = arith.constant 1.270000e+02 : f32
@@ -196,19 +213,21 @@ func.func @requant_3x3_s2_matched(
   %out = linalg.generic {
       indexing_maps = [affine_map<(d0, d1, d2, d3) -> (d0, d1, d2, d3)>,
                        affine_map<(d0, d1, d2, d3) -> (d3)>,
+                       affine_map<(d0, d1, d2, d3) -> (d3)>,
                        affine_map<(d0, d1, d2, d3) -> ()>,
                        affine_map<(d0, d1, d2, d3) -> ()>,
                        affine_map<(d0, d1, d2, d3) -> ()>,
                        affine_map<(d0, d1, d2, d3) -> ()>,
                        affine_map<(d0, d1, d2, d3) -> (d0, d1, d2, d3)>],
       iterator_types = ["parallel", "parallel", "parallel", "parallel"]}
-      ins(%acc, %bias, %scale, %zp, %int8_min, %int8_max
-          : tensor<1x4x4x64xi32>, tensor<64xi32>, f32, i32, f32, f32)
+      ins(%acc, %bias, %cscale, %scale, %zp, %int8_min, %int8_max
+          : tensor<1x4x4x64xi32>, tensor<64xi32>, tensor<64xf32>, f32, i32, f32, f32)
       outs(%out_empty : tensor<1x4x4x64xi8>) {
-    ^bb0(%raw: i32, %channel_bias: i32, %s: f32, %z: i32, %low: f32, %high: f32, %unused: i8):
+    ^bb0(%raw: i32, %channel_bias: i32, %m: f32, %s: f32, %z: i32, %low: f32, %high: f32, %unused: i8):
       %biased = arith.addi %raw, %channel_bias : i32
       %real = arith.sitofp %biased : i32 to f32
-      %scaled = arith.mulf %real, %s : f32
+      %channel_scaled = arith.mulf %real, %m : f32
+      %scaled = arith.mulf %channel_scaled, %s : f32
       %rounded = math.roundeven %scaled : f32
       %zf = arith.sitofp %z : i32 to f32
       %offset = arith.addf %rounded, %zf : f32
@@ -252,6 +271,7 @@ func.func @requant_1x1_cin2064_declined(
     %bias: tensor<64xi32>) -> tensor<1x4x4x64xi8> {
   %zero = arith.constant 0 : i32
   %scale = arith.constant 1.500000e-03 : f32
+  %cscale = arith.constant dense<1.000000e+00> : tensor<64xf32>
   %zp = arith.constant 0 : i32
   %int8_min = arith.constant -1.280000e+02 : f32
   %int8_max = arith.constant 1.270000e+02 : f32
@@ -265,19 +285,21 @@ func.func @requant_1x1_cin2064_declined(
   %out = linalg.generic {
       indexing_maps = [affine_map<(d0, d1, d2, d3) -> (d0, d1, d2, d3)>,
                        affine_map<(d0, d1, d2, d3) -> (d3)>,
+                       affine_map<(d0, d1, d2, d3) -> (d3)>,
                        affine_map<(d0, d1, d2, d3) -> ()>,
                        affine_map<(d0, d1, d2, d3) -> ()>,
                        affine_map<(d0, d1, d2, d3) -> ()>,
                        affine_map<(d0, d1, d2, d3) -> ()>,
                        affine_map<(d0, d1, d2, d3) -> (d0, d1, d2, d3)>],
       iterator_types = ["parallel", "parallel", "parallel", "parallel"]}
-      ins(%acc, %bias, %scale, %zp, %int8_min, %int8_max
-          : tensor<1x4x4x64xi32>, tensor<64xi32>, f32, i32, f32, f32)
+      ins(%acc, %bias, %cscale, %scale, %zp, %int8_min, %int8_max
+          : tensor<1x4x4x64xi32>, tensor<64xi32>, tensor<64xf32>, f32, i32, f32, f32)
       outs(%out_empty : tensor<1x4x4x64xi8>) {
-    ^bb0(%raw: i32, %channel_bias: i32, %s: f32, %z: i32, %low: f32, %high: f32, %unused: i8):
+    ^bb0(%raw: i32, %channel_bias: i32, %m: f32, %s: f32, %z: i32, %low: f32, %high: f32, %unused: i8):
       %biased = arith.addi %raw, %channel_bias : i32
       %real = arith.sitofp %biased : i32 to f32
-      %scaled = arith.mulf %real, %s : f32
+      %channel_scaled = arith.mulf %real, %m : f32
+      %scaled = arith.mulf %channel_scaled, %s : f32
       %rounded = math.roundeven %scaled : f32
       %zf = arith.sitofp %z : i32 to f32
       %offset = arith.addf %rounded, %zf : f32
@@ -309,6 +331,7 @@ func.func @requant_depthwise_3x3_matched(
     %bias: tensor<48xi32>) -> tensor<1x4x4x48xi8> {
   %zero = arith.constant 0 : i32
   %scale = arith.constant 1.500000e-03 : f32
+  %cscale = arith.constant dense<1.000000e+00> : tensor<48xf32>
   %zp = arith.constant -6 : i32
   %int8_min = arith.constant -1.280000e+02 : f32
   %int8_max = arith.constant 1.270000e+02 : f32
@@ -322,19 +345,21 @@ func.func @requant_depthwise_3x3_matched(
   %out = linalg.generic {
       indexing_maps = [affine_map<(d0, d1, d2, d3) -> (d0, d1, d2, d3)>,
                        affine_map<(d0, d1, d2, d3) -> (d3)>,
+                       affine_map<(d0, d1, d2, d3) -> (d3)>,
                        affine_map<(d0, d1, d2, d3) -> ()>,
                        affine_map<(d0, d1, d2, d3) -> ()>,
                        affine_map<(d0, d1, d2, d3) -> ()>,
                        affine_map<(d0, d1, d2, d3) -> ()>,
                        affine_map<(d0, d1, d2, d3) -> (d0, d1, d2, d3)>],
       iterator_types = ["parallel", "parallel", "parallel", "parallel"]}
-      ins(%acc, %bias, %scale, %zp, %int8_min, %int8_max
-          : tensor<1x4x4x48xi32>, tensor<48xi32>, f32, i32, f32, f32)
+      ins(%acc, %bias, %cscale, %scale, %zp, %int8_min, %int8_max
+          : tensor<1x4x4x48xi32>, tensor<48xi32>, tensor<48xf32>, f32, i32, f32, f32)
       outs(%out_empty : tensor<1x4x4x48xi8>) {
-    ^bb0(%raw: i32, %channel_bias: i32, %s: f32, %z: i32, %low: f32, %high: f32, %unused: i8):
+    ^bb0(%raw: i32, %channel_bias: i32, %m: f32, %s: f32, %z: i32, %low: f32, %high: f32, %unused: i8):
       %biased = arith.addi %raw, %channel_bias : i32
       %real = arith.sitofp %biased : i32 to f32
-      %scaled = arith.mulf %real, %s : f32
+      %channel_scaled = arith.mulf %real, %m : f32
+      %scaled = arith.mulf %channel_scaled, %s : f32
       %rounded = math.roundeven %scaled : f32
       %zf = arith.sitofp %z : i32 to f32
       %offset = arith.addf %rounded, %zf : f32

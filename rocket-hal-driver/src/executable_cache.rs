@@ -284,6 +284,7 @@ fn decode_flatbuffer_shape(data: &[u8]) -> Result<UkernelShape, ()> {
                 runtime_layout: conv_def.runtime_layout(),
                 weights_packed: conv_def.weights_packed(),
                 groups: conv_def.groups(),
+                per_channel_scale: conv_def.per_channel_scale(),
             };
             executable.validate_template().map_err(|_| ())?;
             Ok(UkernelShape::Conv2d(executable))
@@ -1031,6 +1032,23 @@ mod tests {
         input_zero_point: u32,
         output_zero_point: u32,
     ) -> Vec<u8> {
+        encode_requantized_conv_executable_with_scales(
+            params,
+            output_scale,
+            input_zero_point,
+            output_zero_point,
+            false,
+        )
+    }
+
+    /// [`encode_requantized_conv_executable`] with `Conv2DDef.per_channel_scale`.
+    fn encode_requantized_conv_executable_with_scales(
+        params: &[schema::Conv2DQuantParam],
+        output_scale: f32,
+        input_zero_point: u32,
+        output_zero_point: u32,
+        per_channel_scale: bool,
+    ) -> Vec<u8> {
         let mut builder = flatbuffers::FlatBufferBuilder::new();
         let runtime_dimensions = builder.create_vector(&[
             schema::Conv2DDimension::INPUT_WIDTH,
@@ -1056,6 +1074,7 @@ mod tests {
                 output_zero_point,
                 runtime_dimensions: Some(runtime_dimensions),
                 runtime_quantization: Some(runtime_quantization),
+                per_channel_scale,
                 ..Default::default()
             },
         );
@@ -1131,6 +1150,33 @@ mod tests {
         // input_scale * weights_scale / output_scale = 1 * 1 / 0.25 = 4.
         assert_eq!(quantization.multiplier, Multiplier::from_ratio(4.0));
         assert_eq!((shape.width, shape.height), (32, 32));
+    }
+
+    #[test]
+    fn decodes_per_channel_scale() {
+        let plain = encode_requantized_conv_executable(&REQUANT_PARAMS, 0.0, 0, 0);
+        let UkernelShape::Conv2d(executable) = decode_flatbuffer_shape(&plain).unwrap() else {
+            panic!("expected Conv2d");
+        };
+        assert!(!executable.per_channel_scale, "absent means unit factors");
+
+        let scaled =
+            encode_requantized_conv_executable_with_scales(&REQUANT_PARAMS, 0.0, 0, 0, true);
+        let UkernelShape::Conv2d(executable) = decode_flatbuffer_shape(&scaled).unwrap() else {
+            panic!("expected Conv2d");
+        };
+        assert!(executable.per_channel_scale);
+
+        // The factors are applied ahead of the runtime output scale; without
+        // one there is nothing to pair them with.
+        let no_output_scale = encode_requantized_conv_executable_with_scales(
+            &[schema::Conv2DQuantParam::OUTPUT_ZERO_POINT],
+            1.0,
+            0,
+            0,
+            true,
+        );
+        assert!(decode_flatbuffer_shape(&no_output_scale).is_err());
     }
 
     #[test]
