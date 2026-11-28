@@ -561,8 +561,132 @@ Against onnxruntime on the import's input plus the 4 synthetic inputs:
 
 1. **FC weight hoisting:** decide whether `rocket-compiler` should raise
    `--iree-opt-const-expr-max-size-increase-threshold`, or fold the QDQ
-   Gemm's `DQ(w)` itself. That is worth 10 ms on ResNet50 QDQ.
+   Gemm's `DQ(w)` itself. That is worth 10 ms on ResNet50 QDQ. *Done: the
+   targeted fold, next section.*
 2. **Linear int8 residual add** (MobileNetV2): needs a target without the
    ReLU.
 3. **Per-channel weight scales:** the executable-ABI change above.
 
+
+## Follow-up: folding a QDQ weight's `DQ(constant)` (2026-11-27)
+
+`rocket-fold-constant-dequant` (`RocketFoldConstantDequantPass.cpp`) folds
+an `iree_linalg_ext.dequantize_affine` of a constant into the f32 constant
+it computes, when every use of its result is operand 1 of a contraction or a
+convolution (B of a matmul, a filter), through at most six
+transpose/reshape/cast ops. It runs in the spec right after
+`rocket-fuse-qdq-conv`, which needs the per-tensor convolution weights as
+codes, so what it sees is a Gemm/MatMul's weight and a per-channel
+convolution's. After it the weight is an ordinary float constant, and the
+transpose and f16 demote downstream shrink it, so IREE's hoisting and
+const-eval take it as they take a float model's weights.
+
+**Why a fold, not the threshold.** Option (a) was to make `rocket-compiler`
+pass `--iree-opt-const-expr-max-size-increase-threshold=67108864`. That
+applies to every const-expr in every model. The fold touches only a
+dequantization whose every use is a weight, and the result could be checked
+module by module: every survey model is byte-identical (below).
+
+**Offload-only.** The first version also ran in `--no-offload`, and that
+arm regressed on the per-channel models (median ms, two passes):
+
+| `--no-offload` arm | #121 | folding in the CPU arm too |
+|---|---|---|
+| ResNet50 `ort_qdq_pc` | 1511.5 / 1512.5 | 2032 / 2036.5 |
+| MobileNetV2 `ort_qdq_pc` | 50.2 / 49.9 | 57.9 / 57.9 |
+| ResNet50 `ort_qdq` | 287.5 / 280 | 279 / 282 |
+| MobileNetV2 `ort_qdq` | 30.05 / 30.4 | 30.3 / 30.6 |
+
+A CPU convolution reads the i8 codes with the dequantization fused. The
+folded f32 constant is four times the bytes (the per-channel ResNet50 CPU
+module went from 26 to 102 MB). So the pass carries
+`with options = {"offload" = true}`, which `rocket-compiler --no-offload`
+flips to false, as it already does for
+`rocket-block-diagonal-grouped-conv`. Every `--no-offload` module is now
+byte-identical to #121's.
+
+**Exactness.** The fold evaluates `DequantizeAffineOp::decomposeOperation`
+element by element: extend, subtract the zero point in
+`getZeroPointDifferenceType`, `sitofp`, multiply in the scale's type, then
+convert to the result type, each rounded to nearest-even. Per-tensor and
+per-channel scales, scalar or tensor zero points, `input_unsigned` /
+`zp_unsigned`, `dense` and `dense_resource` codes. The NPU ResNet50 `ort_qdq`
+module is byte-identical to #121's threshold-raised build except for the
+spec path string embedded in `module.fb`.
+
+**Lit.** `rocket_fold_constant_dequant.mlir`: the ResNet50-shaped Gemm
+weight (transpose into B), a `dense_resource` weight, unsigned codes with an
+unsigned zero point, a per-channel FCHW filter into
+`conv_2d_nhwc_hwcf`, and an f16 result (f32 product, then f16). It also
+covers three declines: the matmul's A operand, a second non-weight use, and
+non-constant codes. A second RUN line with `offload=false` checks the
+dequantization survives. 59/59 plugin lit pass. `cargo test -p
+rocket-compiler` passes with the offload-only count raised to 2.
+
+### Placement and module size (NPU arm)
+
+| import | non-constant weights in `rocket-pack-weights` | vmfb MB | compile s |
+|---|---|---|---|
+| ResNet50 `ort_qdq` | 1 -> **0** | 25.7 -> 27.7 | 4.7 -> 5.0 |
+| ResNet50 `ort_qdq_pc` | 5 -> **0** | 40.1 -> 51.3 | 7.3 -> 8.6 |
+| MobileNetV2 `ort_qdq` | 1 -> **0** | 3.6 -> 4.9 | 4.1 -> 4.0 |
+| MobileNetV2 `ort_qdq_pc` | 1 -> **0** | 5.9 -> 7.2 | 6.2 -> 5.6 |
+
+- ResNet50 `ort_qdq` loses its `elementwise_transpose_2048x1000_i8xf16` CPU
+  dispatch.
+- The size growth is the weights now stored as packed f16 instead of i8.
+- Compile times are single runs, three compiles in parallel on laplace.
+
+**Unchanged, byte for byte** (old = #121's compiler and spec, new = this
+change, both arms each):
+- the 10 survey models (`survey/2026-11-27-main` imports): mobilenet_v2,
+  resnet50, resnext50_32x4d, convnext_tiny, wide_resnet50_2, vit_b_16,
+  blip, vit_l_16, bert_base, bert_base_384. None contains a
+  quantize/dequantize op.
+- the QOperator imports: ResNet50 `ours` and `ours_skip`, MobileNetV2
+  `ours`.
+
+### Board timing
+
+orangepi, 7.3.6, NPU at its 600 MHz default (not re-read: the clock is only in debugfs, which needs a sudo password), governor `performance`,
+`--task_topology_cpu_ids=4,5,6,7`, the #120 runtime. `bench_board.sh` from
+the previous section: 7 repetitions with the first dropped, each run gated
+on 30 s with no other `iree-*` process, from a script file whose command
+line names no module. Median ms, two passes.
+
+| NPU arm | #121 | this change |
+|---|---|---|
+| ResNet50 `ort_qdq` | 26.9 / 27.7 | **17.35 / 18.7** |
+| ResNet50 `ours_skip` (QOperator, reference) | 17.6 / 17.7 | (unchanged module) |
+| ResNet50 `ort_qdq_pc` | 134.5 / 135.5 | **76.85 / 77.35** |
+| MobileNetV2 `ort_qdq` | 14.6 / 14.85 | **9.15 / 9.155** |
+| MobileNetV2 `ort_qdq_pc` | 49.9 / 49.65 | **43.5 / 43.5** |
+
+- ResNet50 QDQ is now level with the QOperator `ours_skip` build.
+- `ROCKET_PROFILE=1` on ResNet50 `ort_qdq`, per call: the FC
+  `matmul fp16 1x2048x1000` is 0.47 ms, down from 7.8, and there is no
+  `pack.weights` phase. `outside` (the CPU dispatches) is 1.26 ms, down from
+  5.4.
+- Per-channel ResNet50 is still 77 ms because its convolutions stay fp16:
+  the executable ABI carries one `output_scale` (section above).
+
+### Accuracy
+
+Against onnxruntime (`*.oracle.npy`):
+- **ResNet50 `ort_qdq` NPU:** argmax equal on 5/5 (the import's input plus
+  the 4 synthetic), top-5 overlap 5/5. The output is bit-identical to #121's
+  threshold-raised build on all five.
+- **The other three NPU arms:** argmax equal, on the import's input. The
+  output is bit-identical to #121's.
+- **`--no-offload`:** the module is unchanged, and so is the output. That
+  includes #120's near-tie argmax miss on ResNet50 input 1.
+
+### What is left
+
+1. **Per-channel weight scales** on the int8 path, as before: the ABI
+   change. It is now the whole gap on `ort_qdq_pc`.
+2. **Linear int8 residual add** (MobileNetV2).
+3. **A folded weight the planner then refuses** stays on the CPU as an f32
+   constant in an offloading build, because the fold runs before
+   placement. No current model has one: all four QDQ imports pack every
+   weight.
