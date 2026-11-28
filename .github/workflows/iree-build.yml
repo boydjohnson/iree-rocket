@@ -10,8 +10,8 @@ name: IREE build (reusable)
 #                    natively for whatever the runner is: x86_64 on
 #                    ubuntu-24.04 (iree-compile-x86_64, plus the host tools
 #                    runtime-aarch64 imports), aarch64 on ubuntu-24.04-arm
-#                    (iree-compile-aarch64, a compiler that runs on the board
-#                    itself). Each also builds, installs and tests the
+#                    (iree-compile-aarch64; the nightly no longer runs it, see
+#                    nightly.yml). Each also builds, installs and tests the
 #                    rocket-compiler .deb from that same IREE build.
 #   runtime-aarch64  iree-run-module / iree-benchmark-module cross-compiled for
 #                    the RK3588 board with the Rocket HAL driver statically

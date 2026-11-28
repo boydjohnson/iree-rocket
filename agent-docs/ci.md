@@ -10,7 +10,7 @@ Three workflows, under [`.github/workflows/`](../.github/workflows).
 | Workflow | Trigger | Jobs | Typical runtime |
 |---|---|---|---|
 | `ci.yml` -- CI | every push to `main`, every pull request | `check, build, test`; `cargo fmt --check` | ~1.5 min |
-| `nightly.yml` -- Nightly artifacts | `cron 0 7 * * *` (07:00 UTC), `workflow_dispatch` | `compiler-host`, then `runtime-aarch64`; `compiler-aarch64` and `runtime-deb` alongside | ~20 min warm ccache, up to ~4 h cold |
+| `nightly.yml` -- Nightly artifacts | `cron 0 7 * * *` (07:00 UTC), `workflow_dispatch` | `compiler-host`, then `runtime-aarch64`; `runtime-deb` alongside | ~20 min warm ccache, up to ~3 h cold |
 | `iree-build.yml` -- IREE build (reusable) | `workflow_call` only, so its runs are attributed to the caller and it has no badge of its own | one `build` job per `target` input | see above |
 
 ### CI -- `ci.yml`
@@ -69,15 +69,13 @@ ccache. `workflow_dispatch` takes a `retention-days` input, default 14.
   IREE pin), installs it with apt, runs `debian/tests/smoke` against it and
   uploads `rocket-compiler-deb-amd64`. Default timeout 330 min -- deliberately under GitHub's 6 h ceiling, so a build that
   runs long still reaches its ccache save step.
-- **`compiler-aarch64`** -- the `compiler-host` target again, on
-  `ubuntu-24.04-arm`: the same build, packaging and smoke test, natively for
-  aarch64. The package is named after `uname -m`, so this one uploads
-  `iree-compile-aarch64`, a compiler that runs on the board itself, and
-  `rocket-compiler-deb-arm64`. It skips
-  `iree-host-tools`: `runtime-aarch64` runs on x86_64 and could not execute
-  them. Its ccache is separate (the key carries the runner) and as large as
-  the x86_64 one, so its first run is a cold LLVM build and may hit the
-  330 min timeout; the next run picks up the ccache it banked.
+- **No `compiler-aarch64`.** A native arm64 compiler job
+  (`iree-compile-aarch64`, `rocket-compiler-deb-arm64`) ran briefly in
+  2026-11 and was dropped: its cold LLVM build on `ubuntu-24.04-arm` took
+  2h40m+, the runner died near the end in two of three runs (likely memory
+  starvation, not the 330 min timeout), and a dead runner never reaches the
+  ccache save, so it never warmed up. `iree-build.yml` still takes
+  `target: compiler-host` with `runner: ubuntu-24.04-arm` if one is needed.
 - **`runtime-aarch64`** -- unpacks `iree-host-tools` back into
   `iree-build/build/`, installs the `gcc`/`g++-aarch64-linux-gnu` cross
   toolchain, configures with `iree-build/configure-runtime-aarch64.sh`
