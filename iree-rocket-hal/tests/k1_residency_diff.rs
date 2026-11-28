@@ -118,6 +118,7 @@ fn k1_residency_fields_match_vendor() {
             scale: 19636,
             shift: 24,
         },
+        per_channel_shift: false,
     });
     diff(K1_INT8, int8, "int8 dense 1x1, 32x32 Cout 64");
 }

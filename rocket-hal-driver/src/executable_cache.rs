@@ -143,6 +143,7 @@ fn decode_precision(
                 input_scale,
                 weights_scale,
                 multiplier,
+                per_channel_shift: false,
             };
             if precision == schema::Precision::INT8_ACCUMULATOR {
                 if input_zero_point != 0 || output_zero_point != 0 || weights_zero_point != 0 {
@@ -220,6 +221,16 @@ fn decode_flatbuffer_shape(data: &[u8]) -> Result<UkernelShape, ()> {
                 conv_def.output_scale(),
                 runtime_quantization.contains(&RuntimeConv2dQuantParam::OutputScale),
             )?;
+            // Per-channel factors ride on the BS plane's multiplier and shift
+            // lanes, so the program reads the per-channel shift too.
+            // `validate_template` refuses the flag on any other precision.
+            let precision = match precision {
+                Precision::Int8(mut quantization) if conv_def.per_channel_scale() => {
+                    quantization.per_channel_shift = true;
+                    Precision::Int8(quantization)
+                }
+                other => other,
+            };
             let shape_template = conv::Shape {
                 width: conv_def.input_width(),
                 height: conv_def.input_height(),
@@ -805,6 +816,7 @@ unsafe extern "C" fn prepare_executable(
                     input_scale: 1.0,
                     weights_scale: 1.0,
                     multiplier: Multiplier::from_ratio(1.0),
+                    per_channel_shift: false,
                 }),
                 padding: Some([0, 0]),
                 activation: Activation::None,
@@ -1166,6 +1178,10 @@ mod tests {
             panic!("expected Conv2d");
         };
         assert!(executable.per_channel_scale);
+        assert!(
+            executable.shape_template.per_channel_shift(),
+            "the factors' program reads the BS shift lanes"
+        );
 
         // The factors are applied ahead of the runtime output scale; without
         // one there is nothing to pair them with.

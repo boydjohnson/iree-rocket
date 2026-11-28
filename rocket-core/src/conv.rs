@@ -1064,6 +1064,19 @@ pub struct Quantization {
     pub weights_scale: f32,
     /// Requantization multiplier, `input_scale * weight_scale / output_scale`.
     pub multiplier: Multiplier,
+    /// Whether the BS plane carries a per-channel shift beside its
+    /// per-channel multiplier (`Conv2DDef.per_channel_scale`).
+    ///
+    /// Set, BRDMA also fetches the `TRT` operand (`brdma_data_use` 15) and
+    /// `bs_truncate_src` takes the BS shift from it, so each 8-channel BS
+    /// block grows from [`BS_BLOCK_BYTES`] to [`BS_SHIFT_BLOCK_BYTES`]: a
+    /// positive-data and a negative-data shift byte per channel after the
+    /// multiplier lane. A channel then scales by `m * 2^(14 - s)` for a
+    /// 16-bit `m` and a 6-bit `s`, which carries the near-dead channels of
+    /// a stock per-channel model that a single `round(2^14 * m)` lane
+    /// cannot. Measured on RK3588 by
+    /// `iree-rocket-hal/tests/conv_int8_second_multiply_probe_hw.rs`.
+    pub per_channel_shift: bool,
 }
 
 // Calibration data is validated as finite before it reaches the hardware
@@ -1880,7 +1893,18 @@ impl Shape {
     /// `int8_bs_read_extent_probe` re-run against the corrected kernel count
     /// would say whether even that is necessary.
     pub fn bs_buffer_bytes(&self) -> usize {
-        bs_buffer_bytes(self.padded_out_channels())
+        if self.per_channel_shift() {
+            bs_shift_buffer_bytes(self.padded_out_channels())
+        } else {
+            bs_buffer_bytes(self.padded_out_channels())
+        }
+    }
+
+    /// [`Quantization::per_channel_shift`] of this shape's precision.
+    pub fn per_channel_shift(&self) -> bool {
+        self.precision
+            .quantization()
+            .is_some_and(|quantization| quantization.per_channel_shift)
     }
 
     /// Output channel count the DPU is programmed with, rounded up to a
@@ -4252,6 +4276,11 @@ pub const BS_CHANNELS_PER_BLOCK: usize = 8;
 /// channels whether or not they are all used.
 pub const BS_BLOCK_BYTES: usize = 64;
 
+/// [`BS_BLOCK_BYTES`] once the block also carries its per-channel shifts
+/// ([`Quantization::per_channel_shift`]): eight positive-data shift bytes
+/// at `+64` and eight negative-data ones at `+72`.
+pub const BS_SHIFT_BLOCK_BYTES: usize = 80;
+
 /// The `i16` plane between the biases and the multipliers.
 ///
 /// Constant at 128 in every model measured -- across `Cout` 4, 8 and 16,
@@ -4299,6 +4328,12 @@ pub fn bs_buffer_bytes(out_channels: u32) -> usize {
     (out_channels as usize).div_ceil(BS_CHANNELS_PER_BLOCK) * BS_BLOCK_BYTES
 }
 
+/// [`bs_buffer_bytes`] for a BS buffer with per-channel shift lanes
+/// ([`Quantization::per_channel_shift`]).
+pub fn bs_shift_buffer_bytes(out_channels: u32) -> usize {
+    (out_channels as usize).div_ceil(BS_CHANNELS_PER_BLOCK) * BS_SHIFT_BLOCK_BYTES
+}
+
 /// The `CNA_CONV_CON2.feature_grains` value this module programs.
 ///
 /// Feature rows the CNA buffers before the convolution starts. A shape sweep
@@ -4331,6 +4366,7 @@ mod tests {
             input_scale: 1.0,
             weights_scale: 1.0,
             multiplier: Multiplier::for_unit_bs(1.0),
+            per_channel_shift: false,
         })
     }
 
@@ -4383,6 +4419,7 @@ mod tests {
             input_scale: 1.0,
             weights_scale: 1.0,
             multiplier: Multiplier::for_unit_bs(1.0),
+            per_channel_shift: false,
         });
         for precision in [Precision::Fp16, requant, int8_accumulator(0)] {
             for (cin, cout) in [

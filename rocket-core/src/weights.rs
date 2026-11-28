@@ -1092,6 +1092,7 @@ mod tests {
             input_scale: 1.0,
             weights_scale: 1.0,
             multiplier: Multiplier::try_from_ratio(1.0).unwrap(),
+            per_channel_shift: false,
         })
     }
 

@@ -158,6 +158,7 @@ fn score_cbuf_split_against_corpus() {
             scale: 19636,
             shift: 24,
         },
+        per_channel_shift: false,
     });
     score(INT8_FIXTURES, int8, "int8 12x12 channel grid");
     score(BASE_INT8_FIXTURES, int8, "int8 base corpus (k=1,3,5,7)");

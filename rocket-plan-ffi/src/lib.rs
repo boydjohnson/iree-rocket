@@ -243,6 +243,7 @@ fn quantization(q: &rocket_plan_quantization_t) -> Result<Quantization, Refusal>
         input_scale: q.input_scale,
         weights_scale: q.weights_scale,
         multiplier,
+        per_channel_shift: false,
     })
 }
 

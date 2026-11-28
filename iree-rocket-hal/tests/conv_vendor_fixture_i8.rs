@@ -126,6 +126,7 @@ fn vendor_fixture_plans_cover_convplan_shapes_i8() {
                         scale: 19636,
                         shift: 24,
                     },
+                    per_channel_shift: false,
                 },
             ),
         )

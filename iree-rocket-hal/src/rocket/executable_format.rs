@@ -175,6 +175,7 @@ pub fn encode_conv_shape_v1(shape: &conv::Shape, kernels: Kernels) -> Vec<u8> {
             input_scale,
             weights_scale,
             multiplier,
+            ..
         }) => (
             0u32,
             input_zero_point,
@@ -191,6 +192,7 @@ pub fn encode_conv_shape_v1(shape: &conv::Shape, kernels: Kernels) -> Vec<u8> {
             input_scale,
             weights_scale,
             multiplier,
+            ..
         }) => (
             2u32,
             input_zero_point,
@@ -294,6 +296,7 @@ pub fn decode_conv_shape_v1(payload: &[u8]) -> Result<(conv::Shape, Kernels), De
                 scale: multiplier_scale,
                 shift: multiplier_shift,
             },
+            per_channel_shift: false,
         }),
         1 => Precision::Fp16,
         3 => Precision::Bf16,
@@ -311,6 +314,7 @@ pub fn decode_conv_shape_v1(payload: &[u8]) -> Result<(conv::Shape, Kernels), De
                 scale: multiplier_scale,
                 shift: multiplier_shift,
             },
+            per_channel_shift: false,
         }),
         other => return Err(DecodeError::InvalidPrecisionTag(other)),
     };
@@ -410,6 +414,7 @@ mod tests {
                     input_scale: 1.0,
                     weights_scale: 1.0,
                     multiplier: Multiplier::from_ratio(1.0),
+                    per_channel_shift: false,
                 }),
                 padding: Some([0, 0]),
                 activation: Activation::None,
@@ -460,6 +465,7 @@ mod tests {
                 input_scale: 0.5,
                 weights_scale: 0.25,
                 multiplier: Multiplier::from_ratio(0.25),
+                per_channel_shift: false,
             }),
             Precision::Int8Accumulator(Quantization {
                 input_zero_point: 0,
@@ -468,6 +474,7 @@ mod tests {
                 input_scale: 0.125,
                 weights_scale: 0.75,
                 multiplier: Multiplier::from_ratio(1.0),
+                per_channel_shift: false,
             }),
         ] {
             let shape = conv::Shape { precision, ..base };
@@ -561,6 +568,7 @@ mod tests {
             input_scale: 1.0,
             weights_scale: 1.0,
             multiplier: Multiplier::from_ratio(1.0),
+            per_channel_shift: false,
         };
         // Formerly refused: a 3x3 accumulator output extent with a 3x3
         // kernel. That refusal described the serial output writer, which the
@@ -596,6 +604,7 @@ mod tests {
             input_scale: 1.0,
             weights_scale: 1.0,
             multiplier: Multiplier::from_ratio(1.0),
+            per_channel_shift: false,
         };
         let cin_384 = conv::Shape::with_precision(
             32,
@@ -732,6 +741,7 @@ mod tests {
                 input_scale: 1.0,
                 weights_scale: 1.0,
                 multiplier: Multiplier::from_ratio(1.0),
+                per_channel_shift: false,
             }),
             ..base
         };

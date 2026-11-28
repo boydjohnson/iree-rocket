@@ -917,3 +917,124 @@ differences (it rounds ties away from zero) spread over more layers.
   0.01 codes).
 
 59/59 plugin lit.
+
+## Follow-up: a per-channel shift on the BS plane (2026-11-28)
+
+After the dead-channel fold, ResNet50 `ort_qdq_pc` still had 15 convolutions
+on fp16, and they cost it 3x its per-tensor build. Their small-factor
+channels are live (conv term 3 to 65 codes), so no fold reaches them; the
+16-bit BS multiplier lane `round(2^14 * m)` simply has too little range.
+Measured over the stock ONNX before building anything:
+
+| per-channel model | int8 convs (#124) | one lane, tight per-channel error bound | two lanes in series |
+|---|---|---|---|
+| ResNet50 | 38/53 | 43 | 53/53, worst error 0.009 codes |
+| MobileNetV2 | 49/52 | 48 | 52/52 |
+
+So the lever is a second per-channel scaling stage, not a better gate.
+
+### The probe
+
+`iree-rocket-hal/tests/conv_int8_second_multiply_probe_hw.rs`
+(`hardware-characterization`, one test per process). A 1x1 `Cin` 1 int8
+convolution with unit coefficients makes each pixel's accumulator its input
+byte, so one 16x16 job sweeps -128..127 on 16 channels; each arm patches the
+program, fits a per-channel gain, and prints it beside each hypothesis.
+
+- **Control (unpatched).** Gain 1, but large negative accumulators come back
+  one code low (`acc - 1` from about -104 down) and the ties at +-1 go to
+  0. That is the shipped path's own behaviour, inside the e2e gate's
+  one-code tolerance; every arm below carries the same pattern.
+- **BN MUL from NRDMA inside an int8 conv** (`bn_mul_src = 1`,
+  `nrdma_data_use = 0b0100`, BN stage un-bypassed): the operand is a
+  fixed-point `i16 >> bn_mul_shift_value`, **not** the fp16 the standalone
+  fp16 probe (`bn_plane.rs`) found. Shift 14 gives `R / 2^14`; shift 0
+  saturates every channel.
+- **A per-channel BS shift** (`brdma_data_use` bit 3 `TRT`,
+  `bs_truncate_src = 1`): **works.** The TRM lists it;
+  `rockchip-npu-notes/encodings/out-cvt-converter.md` reads Mesa's register
+  file as "one shift per stage", which is wrong for RK3588. The layout,
+  decoded from three candidate layouts and confirmed by a fourth with
+  different positive and negative shifts:
+  - each 8-channel BS block grows from 64 to **80** bytes;
+  - `+0` bias `i32 x 8`, `+32` constant `i16 x 8`, `+48` multiplier
+    `i16 x 8`, **`+64` positive-data shift `u8 x 8`**, **`+72` negative-data
+    shift `u8 x 8`**;
+  - a shift of 14 reproduces the register's 14 exactly.
+
+The shift lane gives every channel its own exponent, so one BS lane carries
+`m = M * 2^(14 - s) / 2^14` with a 15-bit `M` and `s` up to 63: down to
+`2^-49` at full precision. That makes the BN stage unnecessary. No NRDMA, no
+second operand plane, no new binding.
+
+### What changed
+
+- **`Quantization::per_channel_shift`** (rocket-core). Set, the program sets
+  `brdma_data_use = 15` and `bs_truncate_src = 1` (those two register writes
+  and nothing else -- `per_channel_shift_engages_the_trt_operand_and_nothing_else`),
+  and `Shape::bs_buffer_bytes` sizes 80-byte blocks.
+- **The driver** sets it from `Conv2DDef.per_channel_scale`, so every
+  per-channel dispatch uses the shift lanes and every other program is
+  untouched. `pack_int8_bias_to_bs_per_channel` writes each factor through
+  `bs_channel_multiplier_and_shift` (mantissa in `[2^14, 2^15)`) into
+  `write_bs_buffer_with_shifts`' layout.
+- **`rocket-fuse-qdq-conv`**: `kMinChannelScale` drops from 1/128 to
+  `2^-49`. The dead-channel fold stays for anything below that; no stock
+  model reaches it now.
+- No ABI change: a #123/#124 module's `per_channel_scale` dispatches simply
+  pack through the shift lanes on this runtime.
+
+### e2e
+
+Two new fixtures, `requant_int8_1x1_shift_lanes` and
+`requant_int8_dw3x3_shift_lanes`: factors from 1 down to `2^-48`
+(`SHIFT_LANE_FACTORS`, shifts 14 to 62), with biases `t / (scale * m)` that
+keep each channel's output mid-range however small its factor. Channels
+16-31 (shifts 26 to 37) therefore check the mantissa and shift exactly, and
+put biases up to `2^31` times a 15-bit multiplier through the BS stage;
+channels past what an `i32` bias can reach must come back as the zero point.
+**23/23 requant cases pass**, both new ones at max|error| 1, 0/16384 past
+atol 1.
+
+### Board
+
+orangepi, 7.3.6, NPU 600 MHz, `--task_topology_cpu_ids=4,5,6,7`, the
+runtime from this branch for every arm. `bench_board.sh`: median of 6, two
+passes, each run gated on 30 s with no other `iree-*` process.
+
+| arm | before | shift lanes |
+|---|---|---|
+| ResNet50 `ort_qdq_pc` NPU (#124 module) | 53.25 / 53.9 ms | **17.1 / 17.4** |
+| MobileNetV2 `ort_qdq_pc` NPU (#124 module) | 10.75 / 10.7 ms | **8.96 / 8.9** |
+| ResNet50 `ort_qdq_pc` `--no-offload` (#123 module) | 677 / 674.5 ms | **282.5 / 281** |
+| MobileNetV2 `ort_qdq_pc` `--no-offload` (#123 module) | 41.45 / 41.1 ms | **30.7 / 30.4** |
+
+- Per-channel ResNet50 is now level with its per-tensor build (`ort_qdq`
+  17.4 ms), and per-channel MobileNetV2 is under its per-tensor 9.15 ms.
+- Placement: ResNet50 53/53 convolutions int8 (was 38), MobileNetV2 52/52
+  (was 49); the one fp16 candidate left in each is the FC.
+- The `--no-offload` arms run the same integer rewrite, now on every
+  convolution, and get faster, so it stays on in both arms.
+- A per-tensor model is bit-identical on the new runtime (ResNet50
+  `ours_skip`, against its output on #124's runtime).
+
+### Accuracy (against onnxruntime)
+
+| arm | argmax | top-5 | max\|d\| (#124) |
+|---|---|---|---|
+| ResNet50 `ort_qdq_pc` NPU | equal | 5/5 | 0.126 (0.202) |
+| MobileNetV2 `ort_qdq_pc` NPU | equal | 5/5 | 0.064 (0.086) |
+| ResNet50 `ort_qdq_pc` `--no-offload` | equal | 5/5 | 0.076 |
+| MobileNetV2 `ort_qdq_pc` `--no-offload` | equal | 5/5 | 0.043 |
+
+The NPU error *fell* with every convolution on int8. The dead-channel
+section above attributed its rise to the int8 path's tie differences
+spreading over more layers; this run does not support that reading. The
+cause of #124's rise is not isolated.
+
+### What is left
+
+1. **The FC** is the one fp16 candidate in both models.
+2. **BN MUL in int8 mode** is measured (fixed point under
+   `bn_mul_shift_value`) but unused; it is the second per-channel stage if
+   one is ever needed on top of the shift lanes.

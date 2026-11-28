@@ -134,16 +134,49 @@ func.func @qdq_1x1_per_channel(%x: tensor<1x64x8x8xi8>) -> tensor<1x64x8x8xi8> {
   return %q : tensor<1x64x8x8xi8>
 }
 
-// One channel's factor is 1/1000 of the largest, below what the BS
-// multiplier lane resolves within a code (kMinChannelScale), so this keeps
-// the fp16 path: an f16 Rocket convolution with the quantization on the CPU.
+// One channel's factor is 1/1000 of the largest. A lone 16-bit multiplier
+// lane could not carry that within a code; with the BS shift lane it is
+// mantissa 16384 at shift 24, so the convolution stays on int8.
+// CHECK-LABEL: util.func public @qdq_1x1_per_channel_small_factor_int8
+// CHECK-NOT:   iree_linalg_ext.quantize_affine
+// CHECK:       flow.dispatch @rocket_dynamic_int8_requant_executable_per_channel::
+// CHECK-NOT:   iree_linalg_ext.quantize_affine
+// CHECK:       util.return
+func.func @qdq_1x1_per_channel_small_factor_int8(%x: tensor<1x64x8x8xi8>) -> tensor<1x64x8x8xi8> {
+  %wq = arith.constant dense<3> : tensor<64x64x1x1xi8>
+  %sw = arith.constant dense<[4.000000e-03, 4.000000e-03, 4.000000e-03, 4.000000e-03, 4.000000e-03, 4.000000e-06, 4.000000e-03, 4.000000e-03, 4.000000e-03, 4.000000e-03, 4.000000e-03, 4.000000e-03, 4.000000e-03, 4.000000e-03, 4.000000e-03, 4.000000e-03, 4.000000e-03, 4.000000e-03, 4.000000e-03, 4.000000e-03, 4.000000e-03, 4.000000e-03, 4.000000e-03, 4.000000e-03, 4.000000e-03, 4.000000e-03, 4.000000e-03, 4.000000e-03, 4.000000e-03, 4.000000e-03, 4.000000e-03, 4.000000e-03, 4.000000e-03, 4.000000e-03, 4.000000e-03, 4.000000e-03, 4.000000e-03, 4.000000e-03, 4.000000e-03, 4.000000e-03, 4.000000e-03, 4.000000e-03, 4.000000e-03, 4.000000e-03, 4.000000e-03, 4.000000e-03, 4.000000e-03, 4.000000e-03, 4.000000e-03, 4.000000e-03, 4.000000e-03, 4.000000e-03, 4.000000e-03, 4.000000e-03, 4.000000e-03, 4.000000e-03, 4.000000e-03, 4.000000e-03, 4.000000e-03, 4.000000e-03, 4.000000e-03, 4.000000e-03, 4.000000e-03, 4.000000e-03]> : tensor<64xf32>
+  %sx = arith.constant 2.000000e-02 : f32
+  %sy = arith.constant 5.000000e-02 : f32
+  %zx = arith.constant -128 : i64
+  %zy = arith.constant -128 : i64
+  %zero = arith.constant 0.000000e+00 : f32
+  %e0 = tensor.empty() : tensor<1x64x8x8xf32>
+  %xf = iree_linalg_ext.dequantize_affine <indexing_maps = [#map4, #scalar4, #scalar4, #map4], quant_min = -128, quant_max = 127>
+      ins(%x, %sx, %zx : tensor<1x64x8x8xi8>, f32, i64) outs(%e0 : tensor<1x64x8x8xf32>) -> tensor<1x64x8x8xf32>
+  %e1 = tensor.empty() : tensor<64x64x1x1xf32>
+  %wf = iree_linalg_ext.dequantize_affine <indexing_maps = [#map4, affine_map<(d0, d1, d2, d3) -> (d0)>, #map4], quant_min = -128, quant_max = 127>
+      ins(%wq, %sw : tensor<64x64x1x1xi8>, tensor<64xf32>) outs(%e1 : tensor<64x64x1x1xf32>) -> tensor<64x64x1x1xf32>
+  %init = linalg.fill ins(%zero : f32) outs(%e0 : tensor<1x64x8x8xf32>) -> tensor<1x64x8x8xf32>
+  %acc = linalg.conv_2d_nchw_fchw {dilations = dense<1> : vector<2xi64>, strides = dense<1> : vector<2xi64>}
+      ins(%xf, %wf : tensor<1x64x8x8xf32>, tensor<64x64x1x1xf32>) outs(%init : tensor<1x64x8x8xf32>) -> tensor<1x64x8x8xf32>
+  %e8 = tensor.empty() : tensor<1x64x8x8xi8>
+  %q = iree_linalg_ext.quantize_affine <indexing_maps = [#map4, #scalar4, #scalar4, #map4], quant_min = -128, quant_max = 127>
+      ins(%acc, %sy, %zy : tensor<1x64x8x8xf32>, f32, i64) outs(%e8 : tensor<1x64x8x8xi8>) -> tensor<1x64x8x8xi8>
+  return %q : tensor<1x64x8x8xi8>
+}
+
+// One channel's factor is 1e-15 of the largest, past even the BS shift
+// lane's reach (kMinChannelScale, 2^-49), and the channel is not dead: its
+// conv term reaches 0.4 * 4e-7 * 192 * 255 = 0.008 codes, over
+// kDeadChannelTerm. So this keeps the fp16 path: an f16 Rocket convolution
+// with the quantization on the CPU.
 // CHECK-LABEL: util.func public @qdq_1x1_per_channel_tiny_factor_stays_fp16
 // CHECK-NOT:   int8_requant
 // CHECK:       iree_linalg_ext.quantize_affine
 // CHECK:       util.return
 func.func @qdq_1x1_per_channel_tiny_factor_stays_fp16(%x: tensor<1x64x8x8xi8>) -> tensor<1x64x8x8xi8> {
   %wq = arith.constant dense<3> : tensor<64x64x1x1xi8>
-  %sw = arith.constant dense<[4.000000e-03, 4.000000e-03, 4.000000e-03, 4.000000e-03, 4.000000e-03, 4.000000e-06, 4.000000e-03, 4.000000e-03, 4.000000e-03, 4.000000e-03, 4.000000e-03, 4.000000e-03, 4.000000e-03, 4.000000e-03, 4.000000e-03, 4.000000e-03, 4.000000e-03, 4.000000e-03, 4.000000e-03, 4.000000e-03, 4.000000e-03, 4.000000e-03, 4.000000e-03, 4.000000e-03, 4.000000e-03, 4.000000e-03, 4.000000e-03, 4.000000e-03, 4.000000e-03, 4.000000e-03, 4.000000e-03, 4.000000e-03, 4.000000e-03, 4.000000e-03, 4.000000e-03, 4.000000e-03, 4.000000e-03, 4.000000e-03, 4.000000e-03, 4.000000e-03, 4.000000e-03, 4.000000e-03, 4.000000e-03, 4.000000e-03, 4.000000e-03, 4.000000e-03, 4.000000e-03, 4.000000e-03, 4.000000e-03, 4.000000e-03, 4.000000e-03, 4.000000e-03, 4.000000e-03, 4.000000e-03, 4.000000e-03, 4.000000e-03, 4.000000e-03, 4.000000e-03, 4.000000e-03, 4.000000e-03, 4.000000e-03, 4.000000e-03, 4.000000e-03, 4.000000e-03]> : tensor<64xf32>
+  %sw = arith.constant dense<[4.000000e+08, 4.000000e+08, 4.000000e+08, 4.000000e+08, 4.000000e+08, 4.000000e-07, 4.000000e+08, 4.000000e+08, 4.000000e+08, 4.000000e+08, 4.000000e+08, 4.000000e+08, 4.000000e+08, 4.000000e+08, 4.000000e+08, 4.000000e+08, 4.000000e+08, 4.000000e+08, 4.000000e+08, 4.000000e+08, 4.000000e+08, 4.000000e+08, 4.000000e+08, 4.000000e+08, 4.000000e+08, 4.000000e+08, 4.000000e+08, 4.000000e+08, 4.000000e+08, 4.000000e+08, 4.000000e+08, 4.000000e+08, 4.000000e+08, 4.000000e+08, 4.000000e+08, 4.000000e+08, 4.000000e+08, 4.000000e+08, 4.000000e+08, 4.000000e+08, 4.000000e+08, 4.000000e+08, 4.000000e+08, 4.000000e+08, 4.000000e+08, 4.000000e+08, 4.000000e+08, 4.000000e+08, 4.000000e+08, 4.000000e+08, 4.000000e+08, 4.000000e+08, 4.000000e+08, 4.000000e+08, 4.000000e+08, 4.000000e+08, 4.000000e+08, 4.000000e+08, 4.000000e+08, 4.000000e+08, 4.000000e+08, 4.000000e+08, 4.000000e+08, 4.000000e+08]> : tensor<64xf32>
   %sx = arith.constant 2.000000e-02 : f32
   %sy = arith.constant 5.000000e-02 : f32
   %zx = arith.constant -128 : i64

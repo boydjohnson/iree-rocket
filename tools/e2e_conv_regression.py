@@ -1810,7 +1810,7 @@ def run_raw_gate(host: str, remote_dir: str, linker: str) -> None:
 
 def write_compiled_fixture(work_dir: Path) -> None:
     (work_dir / "conv.mlir").write_text(
-        CONV_MLIR + packed_weight_fixtures() + grouped_conv_fixture()
+        CONV_MLIR + packed_weight_fixtures() + grouped_conv_fixture() + shift_lane_fixtures()
     )
     rng = np.random.default_rng(20260830)
     weights = rng.uniform(-0.5, 0.5, size=(3, 3, 512, 512)).astype(np.float16)
@@ -2001,6 +2001,15 @@ def write_compiled_fixture(work_dir: Path) -> None:
     # Depthwise: nine taps per output instead of 9*Cin, so the filter spans the
     # full range (the dense cases' narrow filter would leave every output
     # within a few steps of the zero point).
+    # Full-range input and filter: the accumulators are large too, |acc| up
+    # to 64 * 128 * 128 (dense) and 9 * 128 * 128 (depthwise).
+    np.save(work_dir / "requant_int8_1x1_shift_lanes_input.npy", i8(1, 16, 16, 64))
+    np.save(work_dir / "requant_int8_1x1_shift_lanes_kernel.npy", i8(1, 1, 64, 64))
+    np.save(work_dir / "requant_int8_1x1_shift_lanes_bias.npy", shift_lane_bias(64 * 128 * 128))
+    np.save(work_dir / "requant_int8_dw3x3_shift_lanes_input.npy", i8(1, 16, 16, 64))
+    np.save(work_dir / "requant_int8_dw3x3_shift_lanes_kernel.npy", i8(3, 3, 64))
+    np.save(work_dir / "requant_int8_dw3x3_shift_lanes_bias.npy", shift_lane_bias(9 * 128 * 128))
+
     np.save(work_dir / "requant_int8_dw3x3_pad1_input.npy", i8(1, 56, 56, 144))
     np.save(work_dir / "requant_int8_dw3x3_pad1_kernel.npy", i8(3, 3, 144))
     np.save(work_dir / "requant_int8_dw3x3_pad1_bias.npy", bias_i32(144))
@@ -2310,6 +2319,13 @@ def compile_modules(
         ("requant_int8_3x3_pad1_s2", "rocket_dynamic_int8_requant_pad1_s2_executable"),
         ("requant_int8_1x1_then_pad1", "rocket_dynamic_int8_requant_pad1_executable"),
         ("requant_int8_dw3x3_pad1", "rocket_dynamic_depthwise_int8_requant_pad1_executable"),
+        # The BS shift lanes: factors down to 2^-48, both on a `_per_channel`
+        # clone since the unit-factor cases share their executables.
+        ("requant_int8_1x1_shift_lanes", "rocket_dynamic_int8_requant_executable_per_channel"),
+        (
+            "requant_int8_dw3x3_shift_lanes",
+            "rocket_dynamic_depthwise_int8_requant_pad1_executable_per_channel",
+        ),
         ("requant_int8_dw3x3_pad1_s2", "rocket_dynamic_depthwise_int8_requant_pad1_s2_executable"),
         ("requant_int8_1x1_then_dw_pad1", "rocket_dynamic_depthwise_int8_requant_pad1_executable"),
         # The fp16 depthwise widths the 2026-09-09 admission raise added. If
@@ -2480,6 +2496,107 @@ PACKED_WEIGHT_CASES = (
 def hex_constant(values: np.ndarray) -> str:
     """An MLIR `dense<"0x...">` literal: the array's bytes, element order."""
     return '"0x' + np.ascontiguousarray(values).tobytes().hex() + '"'
+
+
+# The per-channel factors of the two shift-lane cases: 64 channels from 1
+# down to ~2^-48, an irregular mantissa on each so no factor is a bare power
+# of two. Each is written to the BS plane as a 15-bit mantissa and a
+# per-channel shift (`bs_channel_multiplier_and_shift`); the shifts run 14
+# to 62.
+SHIFT_LANE_FACTORS = np.array(
+    [2.0 ** (-0.75 * c) * (1.0 - 0.4 * ((c * 5) % 7) / 6.0) for c in range(64)],
+    dtype=np.float32,
+)
+SHIFT_LANE_SCALE = 2.0e-3
+SHIFT_LANE_ZP = 3
+
+
+def shift_lane_bias(acc_bound: int) -> np.ndarray:
+    """Biases that put each shift-lane channel mid-range despite its factor.
+
+    The bias is added before the factor, so `b = t / (scale * m)` makes a
+    channel's output about `t` codes however small `m` is -- which is what
+    tests the mantissa and the shift exactly rather than watching every
+    small-factor channel round to 0. It also puts a near-full-scale `i32`
+    through the BS multiply, as a stock per-channel model's near-dead
+    channels do. Past where an `i32` can reach, the bias saturates and the
+    channel's output does go to ~0; the gate then checks that a deep shift
+    is a 0 and not garbage.
+    """
+    targets = np.array([((c * 37) % 161) - 80 for c in range(64)], dtype=np.float64)
+    raw = targets / (SHIFT_LANE_SCALE * SHIFT_LANE_FACTORS.astype(np.float64))
+    limit = float(2**31 - 1 - acc_bound)
+    return np.clip(np.round(raw), -limit, limit).astype(np.int32)
+
+
+def shift_lane_fixtures() -> str:
+    """A dense and a depthwise requantized case on the BS shift lanes."""
+    factors = ", ".join(f"{float(m):.8e}" for m in SHIFT_LANE_FACTORS)
+    body = f"""
+  %out_scale = arith.constant {SHIFT_LANE_SCALE:.6e} : f32
+  %out_zp = arith.constant {SHIFT_LANE_ZP} : i32
+  %out_min = arith.constant -1.280000e+02 : f32
+  %out_max = arith.constant 1.270000e+02 : f32
+  %out_empty = tensor.empty() : tensor<1x16x16x64xi8>
+  %factors = arith.constant dense<[{factors}]> : tensor<64xf32>
+  %out = linalg.generic {{
+      indexing_maps = [affine_map<(d0, d1, d2, d3) -> (d0, d1, d2, d3)>,
+                       affine_map<(d0, d1, d2, d3) -> (d3)>,
+                       affine_map<(d0, d1, d2, d3) -> (d3)>,
+                       affine_map<(d0, d1, d2, d3) -> ()>,
+                       affine_map<(d0, d1, d2, d3) -> ()>,
+                       affine_map<(d0, d1, d2, d3) -> ()>,
+                       affine_map<(d0, d1, d2, d3) -> ()>,
+                       affine_map<(d0, d1, d2, d3) -> (d0, d1, d2, d3)>],
+      iterator_types = ["parallel", "parallel", "parallel", "parallel"]}}
+      ins(%c_acc, %bias, %factors, %out_scale, %out_zp, %out_min, %out_max
+          : tensor<1x16x16x64xi32>, tensor<64xi32>, tensor<64xf32>, f32, i32, f32, f32)
+      outs(%out_empty : tensor<1x16x16x64xi8>) {{
+    ^bb0(%raw: i32, %channel_bias: i32, %channel_mul: f32, %sc: f32, %zpv: i32, %low: f32, %high: f32, %unused: i8):
+      %biased = arith.addi %raw, %channel_bias : i32
+      %real = arith.sitofp %biased : i32 to f32
+      %channel_scaled = arith.mulf %real, %channel_mul : f32
+      %scaled = arith.mulf %channel_scaled, %sc : f32
+      %rounded = math.roundeven %scaled : f32
+      %zpf = arith.sitofp %zpv : i32 to f32
+      %offset = arith.addf %rounded, %zpf : f32
+      %low_clamped = arith.maximumf %offset, %low : f32
+      %clamped = arith.minimumf %low_clamped, %high : f32
+      %narrowed = arith.fptosi %clamped : f32 to i8
+      linalg.yield %narrowed : i8
+  }} -> tensor<1x16x16x64xi8>
+  return %out : tensor<1x16x16x64xi8>
+}}
+"""
+    return f"""
+// ---- per-channel factors on the BS shift lanes ----
+// Factors from 1 down to ~2^-48 (SHIFT_LANE_FACTORS), with biases that keep
+// each channel's output mid-range (shift_lane_bias). A lone 16-bit BS
+// multiplier lane resolves a factor to 2^-14; these need its per-channel
+// shift. The dense case is a 1x1, the depthwise one a 3x3 with the -128
+// pad fill of #rocket_dynamic_depthwise_int8_requant_pad1_target.
+
+func.func @requant_int8_1x1_shift_lanes(%input: tensor<1x16x16x64xi8>, %filter: tensor<1x1x64x64xi8>, %bias: tensor<64xi32>) -> tensor<1x16x16x64xi8> {{
+  %c_zero = arith.constant 0 : i32
+  %c_acc_empty = tensor.empty() : tensor<1x16x16x64xi32>
+  %c_acc_init = linalg.fill ins(%c_zero : i32) outs(%c_acc_empty : tensor<1x16x16x64xi32>) -> tensor<1x16x16x64xi32>
+  %c_acc = linalg.conv_2d_nhwc_hwcf
+      {{dilations = dense<1> : tensor<2xi64>, strides = dense<1> : tensor<2xi64>}}
+      ins(%input, %filter : tensor<1x16x16x64xi8>, tensor<1x1x64x64xi8>)
+      outs(%c_acc_init : tensor<1x16x16x64xi32>) -> tensor<1x16x16x64xi32>{body}
+func.func @requant_int8_dw3x3_shift_lanes(%input: tensor<1x16x16x64xi8>, %filter: tensor<3x3x64xi8>, %bias: tensor<64xi32>) -> tensor<1x16x16x64xi8> {{
+  %c_fill = arith.constant -128 : i8
+  %c_padded = tensor.pad %input low[0, 1, 1, 0] high[0, 1, 1, 0] {{
+  ^bb0(%i0: index, %i1: index, %i2: index, %i3: index):
+    tensor.yield %c_fill : i8
+  }} : tensor<1x16x16x64xi8> to tensor<1x18x18x64xi8>
+  %c_zero = arith.constant 0 : i32
+  %c_acc_empty = tensor.empty() : tensor<1x16x16x64xi32>
+  %c_acc_init = linalg.fill ins(%c_zero : i32) outs(%c_acc_empty : tensor<1x16x16x64xi32>) -> tensor<1x16x16x64xi32>
+  %c_acc = linalg.depthwise_conv_2d_nhwc_hwc
+      {{dilations = dense<1> : tensor<2xi64>, strides = dense<1> : tensor<2xi64>}}
+      ins(%c_padded, %filter : tensor<1x18x18x64xi8>, tensor<3x3x64xi8>)
+      outs(%c_acc_init : tensor<1x16x16x64xi32>) -> tensor<1x16x16x64xi32>{body}"""
 
 
 def packed_weight_fixtures() -> str:
@@ -2860,6 +2977,28 @@ def run_compiled_gate(
                 "requant_int8_1x1_then_pad1_b2.npy",
             ),
             ("requant_int8_1x1_then_pad1_out_rocket.npy",),
+            1.0,
+            0.0,
+        ),
+        Case(
+            "requant_int8_1x1_shift_lanes",
+            (
+                "requant_int8_1x1_shift_lanes_input.npy",
+                "requant_int8_1x1_shift_lanes_kernel.npy",
+                "requant_int8_1x1_shift_lanes_bias.npy",
+            ),
+            ("requant_int8_1x1_shift_lanes_out_rocket.npy",),
+            1.0,
+            0.0,
+        ),
+        Case(
+            "requant_int8_dw3x3_shift_lanes",
+            (
+                "requant_int8_dw3x3_shift_lanes_input.npy",
+                "requant_int8_dw3x3_shift_lanes_kernel.npy",
+                "requant_int8_dw3x3_shift_lanes_bias.npy",
+            ),
+            ("requant_int8_dw3x3_shift_lanes_out_rocket.npy",),
             1.0,
             0.0,
         ),

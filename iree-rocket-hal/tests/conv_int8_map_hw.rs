@@ -84,6 +84,7 @@ fn map_with(
         input_scale: 1.0,
         weights_scale: 1.0,
         multiplier: cvt,
+        per_channel_shift: false,
     });
     let shape = Shape::with_precision(WIDTH, HEIGHT, 1, in_channels, out_channels, precision);
     let width = WIDTH as usize;

@@ -44,6 +44,7 @@ impl FixturePrecision {
                     scale: 19636,
                     shift: 24,
                 },
+                per_channel_shift: false,
             }),
         }
     }

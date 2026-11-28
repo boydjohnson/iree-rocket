@@ -71,6 +71,7 @@ fn probe(bs_multiplier: i16, cvt_scale: u32, cvt_shift: u32) -> i32 {
             scale: cvt_scale,
             shift: cvt_shift,
         },
+        per_channel_shift: false,
     });
     let shape = Shape::with_precision(WIDTH, HEIGHT, 1, 1, OUT_CHANNELS, precision);
     let width = WIDTH as usize;

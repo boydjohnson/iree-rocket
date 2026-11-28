@@ -55,6 +55,7 @@ fn main() {
             input_scale: 1.0,
             weights_scale: 1.0,
             multiplier: Multiplier { scale: 1, shift: 0 },
+            per_channel_shift: false,
         }),
         Ok("int8") => Precision::Int8(Quantization {
             input_zero_point: 0,
@@ -63,6 +64,7 @@ fn main() {
             input_scale: 1.0,
             weights_scale: 1.0,
             multiplier: Multiplier { scale: 1, shift: 0 },
+            per_channel_shift: false,
         }),
         Ok("fp16acc") => Precision::Fp16Accumulator,
         Ok("int4") => Precision::Int4,

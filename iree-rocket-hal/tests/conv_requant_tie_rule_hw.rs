@@ -165,6 +165,7 @@ fn run(shift: u32, cvt_round: bool, accumulators: &[i32]) -> Vec<i32> {
         input_scale: 1.0,
         weights_scale: 1.0,
         multiplier: Multiplier::for_unit_bs(1.0 / f64::from(1u32 << shift)),
+        per_channel_shift: false,
     });
     let shape = Shape::with_precision(WIDTH, HEIGHT, 1, IN_CHANNELS, OUT_CHANNELS, precision);
     let width = WIDTH as usize;

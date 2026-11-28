@@ -50,6 +50,7 @@ fn int8_depthwise_raw_accumulator_layout() {
         input_scale: 1.0,
         weights_scale: 1.0,
         multiplier: Multiplier::from_ratio(1.0),
+        per_channel_shift: false,
     });
     let shape = Shape::with_precision(
         WIDTH as u32,

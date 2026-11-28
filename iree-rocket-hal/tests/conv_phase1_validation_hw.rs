@@ -155,6 +155,7 @@ fn int8_quantization() -> Precision {
         input_scale: 1.0,
         weights_scale: 1.0,
         multiplier: Multiplier::for_unit_bs(1.0),
+        per_channel_shift: false,
     })
 }
 
@@ -166,6 +167,7 @@ fn int8_identity_precision() -> Precision {
         input_scale: 1.0,
         weights_scale: 1.0,
         multiplier: Multiplier::from_ratio(1.0),
+        per_channel_shift: false,
     })
 }
 
@@ -180,6 +182,7 @@ fn int8_depthwise_quantization() -> Precision {
         input_scale: 1.0,
         weights_scale: 1.0,
         multiplier: Multiplier::for_unit_bs(INT8_DEPTHWISE_GAIN_CORRECTION),
+        per_channel_shift: false,
     })
 }
 
